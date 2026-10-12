@@ -529,19 +529,129 @@ fn copy_cost(b: *ir.Block) i32 {
     return n;
 }
 
-// Threads one edge in f; true if it did.
+// One analysis of the CFG (dominators) serves several threadings: after
+// the edge from P into B is threaded to S, the blocks whose dominators can
+// change are in the dominator subtree of r = nca(idom(B), P, S) (deleting
+// an edge (P, B) affects only the subtree of nca(P, B) = idom(B), inserting
+// one (N, S), N new after P, that of nca(P, S)), and so are all the blocks
+// the threading changed (P's terminator, B, S, the repair's phis in blocks
+// B dominates). That subtree is marked dirty, and later blocks in the order
+// are threaded only where nothing the threading reads is dirty: the block,
+// its predecessors, the blocks it dominates, and their predecessors and
+// successors.
+let mut dirty: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
+
+// A block whose analysis still holds: in the order (blocks made by threading
+// are not), and not dirty. (Blocks that were unreachable stay unreachable.)
+fn clean(order: *u.List.[*mut ir.Block], x: *mut ir.Block) bool {
+    if x.rpo < 0 {
+        return true;
+    }
+    let k = @int_cast(usize, x.rpo);
+    return (k < order.len) and (order.get(k) == x) and not dirty.get(k);
+}
+
+// Is everything threading b reads clean?
+fn region_clean(order: *u.List.[*mut ir.Block], b: *mut ir.Block) bool {
+    if b.rpo < 0 {
+        return false;
+    }
+    let mut work = u.List.[*mut ir.Block].empty();
+    work.push(b);
+    let mut ok = true;
+    while ok and (work.len > 0) {
+        let x = work.pop();
+        if not clean(order, x) {
+            ok = false;
+            break;
+        }
+        for k in 0..x.preds.len {
+            if not clean(order, x.preds.get(k)) {
+                ok = false;
+            }
+        }
+        let t = ir.terminator(x);
+        for j in 0..ir.succ_count(t) {
+            if not clean(order, ir.succ(t, j)) {
+                ok = false;
+            }
+        }
+        for k in 0..x.dom_kids.len {
+            work.push(x.dom_kids.get(k));
+        }
+    }
+    work.deinit();
+    return ok;
+}
+
+fn nca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
+    let mut a = a0;
+    let mut b = b0;
+    while a.depth > b.depth {
+        a = a.idom;
+    }
+    while b.depth > a.depth {
+        b = b.idom;
+    }
+    while a != b {
+        a = a.idom;
+        b = b.idom;
+    }
+    return a;
+}
+
+// Threads the edge from p into b (to s, or to b's successors through a copy
+// of b's branch if cond), and marks what may have changed dirty.
+fn thread_marked(f: *mut ir.Func, order: *u.List.[*mut ir.Block], b: *mut ir.Block, p: *mut ir.Block, s: *mut ir.Block,
+                 cond: bool) void {
+    let mut r = nca(b.idom, p);
+    if cond {
+        let t = ir.terminator(b);
+        r = nca(nca(r, t.t1), t.t2);
+    } else {
+        r = nca(r, s);
+    }
+    outside_uses(b);
+    thread(f, b, p, s, cond);
+    let mut work = u.List.[*mut ir.Block].empty();
+    work.push(r);
+    while work.len > 0 {
+        let x = work.pop();
+        let k = @int_cast(usize, x.rpo);
+        if dirty.get(k) {
+            continue;  // (and so is its subtree)
+        }
+        dirty.set(k, true);
+        for j in 0..x.dom_kids.len {
+            work.push(x.dom_kids.get(j));
+        }
+    }
+    work.deinit();
+}
+
+// Threads edges in f, at most max; how many.
 // (preds_ok: f's predecessor lists are up to date)
-fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
+fn thread_some(f: *mut ir.Func, preds_ok: bool, max: i32) i32 {
     if not preds_ok {
         opt.compute_preds(f);
     }
     let order = opt.dominators(f);
-    let mut done = false;
+    dirty.clear();
+    for _k in 0..order.len {
+        dirty.push(false);
+    }
+    let mut done: i32 = 0;
     for bi in 1..order.len {
+        if done >= max {
+            break;
+        }
         let b = order.get(bi);
+        if dirty.get(bi) {
+            continue;
+        }
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_SWITCH) and (b.preds.len >= 2) and (t.a.kind == ir.V_INST) and
-           (copy_cost(b) <= MAX_COPY) and not opt.is_loop_header(b) {
+           (copy_cost(b) <= MAX_COPY) and ((done == 0) or region_clean(&order, b)) and not opt.is_loop_header(b) {
             // a switch on a value known on the edge from P: P goes to the case
             for k in 0..b.preds.len {
                 let p = b.preds.get(k);
@@ -556,12 +666,8 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
                 if s == b {
                     continue;
                 }
-                outside_uses(b);
-                thread(f, b, p, s, false);
-                done = true;
-                break;
-            }
-            if done {
+                thread_marked(f, &order, b, p, s, false);
+                done += 1;
                 break;
             }
             continue;
@@ -570,6 +676,9 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
             continue;
         }
         if (t.a.kind != ir.V_INST) or (copy_cost(b) > MAX_COPY) {
+            continue;
+        }
+        if (done > 0) and not region_clean(&order, b) {
             continue;
         }
         // not through a loop header: that would peel iterations, one per round
@@ -584,9 +693,8 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
             let c = known_on_edge(t.a, b, p);
             if u.isnil(c) {
                 if phi_branch(b, t, p) {
-                    outside_uses(b);
-                    thread(f, b, p, u.nil.[ir.Block](), true);
-                    done = true;
+                    thread_marked(f, &order, b, p, u.nil.[ir.Block](), true);
+                    done += 1;
                     break;
                 }
                 continue;
@@ -598,12 +706,8 @@ fn thread_one(f: *mut ir.Func, preds_ok: bool) bool {
             if s == b {
                 continue;
             }
-            outside_uses(b);
-            thread(f, b, p, s, false);
-            done = true;
-            break;
-        }
-        if done {
+            thread_marked(f, &order, b, p, s, false);
+            done += 1;
             break;
         }
     }
@@ -701,8 +805,14 @@ pub fn jump_thread(f: *mut ir.Func) bool {
     // uses that keep blocks from being threaded)
     opt.dce(f);
     let mut n: i32 = 0;
-    while (n < 256) and thread_one(f, n == 0) {
-        n += 1;
+    let mut first = true;
+    while n < 256 {
+        let k = thread_some(f, first, 256 - n);
+        if k == 0 {
+            break;
+        }
+        n += k;
+        first = false;
     }
     if n > 0 {
         ir.remove_unreachable(f);
