@@ -981,9 +981,11 @@ pub struct Func {
     src: u32,  // its declaration's source location (src_loc)
     aux: i64,
     auxp: *mut void,
-    fwd_seen: u64,       // fwd_epoch when apply_forwarding last rewrote f
-    features: u64,       // the processor extensions its code may use (set when has_features)
-    has_features: bool,  // otherwise: the target's (--cpu, --features)
+    fwd_seen: u64,                 // fwd_epoch when apply_forwarding last rewrote f
+    features: u64,                 // the processor extensions its code may use (set when has_features)
+    has_features: bool,            // otherwise: the target's (--cpu, --features)
+    graves: u.List.[*mut Value],   // values put in the graveyard under it (some since moved on)
+    bgraves: u.List.[*mut Block],  // its blocks put there
 }
 
 pub struct Global {
@@ -1092,12 +1094,17 @@ fn bury_block(b: *mut Block) void {
 // of blocks, before it dies).
 fn to_grave(v: *mut Value, f: *mut Func) void {
     if v.grave != 0 {
-        grave_vf.set(@as(usize, v.grave - 1), f);
+        let k = @as(usize, v.grave - 1);
+        if grave_vf.get(k) != f {
+            grave_vf.set(k, f);
+            f.graves.push(v);
+        }
         return;
     }
     grave_v.push(v);
     grave_vf.push(f);
     v.grave = @truncate(u32, grave_v.len);
+    f.graves.push(v);
 }
 
 fn block_to_grave(b: *mut Block) void {
@@ -1106,22 +1113,68 @@ fn block_to_grave(b: *mut Block) void {
     }
     grave_b.push(b);
     b.grave = @truncate(u32, grave_b.len);
+    b.fnp.bgraves.push(b);
 }
 
+fn cmp_usize(a: usize, b: usize) i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+// The places in the graveyard of f's entries (from f's lists, which may
+// name entries that have since moved on or gone), in order.
+fn grave_places(vs: *mut u.List.[*mut Value], bs: *mut u.List.[*mut Block], f: *mut Func) u.List.[usize] {
+    let mut pos = u.List.[usize].empty();
+    for k in 0..vs.len {
+        let v = vs.get(k);
+        let x = @as(usize, v.grave) -% 1;  // (a buried value may be poison)
+        if (x < grave_v.len) and (grave_v.get(x) == v) and (grave_vf.get(x) == f) {
+            pos.push(x);
+        }
+    }
+    for k in 0..bs.len {
+        let b = bs.get(k);
+        let x = @as(usize, b.grave) -% 1;
+        if (x < grave_b.len) and (grave_b.get(x) == b) and (b.fnp == f) {
+            pos.push(x);
+        }
+    }
+    vs.clear();
+    bs.clear();
+    u.sort.[usize](pos.items(), cmp_usize);
+    let mut n: usize = 0;
+    for k in 0..pos.len {
+        if (n == 0) or (pos.get(n - 1) != pos.get(k)) {
+            pos.set(n, pos.get(k));
+            n += 1;
+        }
+    }
+    pos.len = n;
+    return pos;
+}
+
+// Takes f's entries out of the graveyard in the order a scan from the start
+// would (each taken out with the last entry moved into its place, which is
+// looked at again), going only to the places of f's entries.
 pub fn recycle(f: *mut Func) void {
     // (operands still reaching a dead value through its fwd go straight on)
     apply_forwarding(f);
-    let mut k: usize = 0;
-    while k < grave_v.len {
+    let mut nob = u.List.[*mut Block].empty();
+    let pv = grave_places(&mut f.graves, &mut nob, f);
+    let mut i: usize = 0;
+    let mut j: usize = pv.len;  // pv[i..j]: the places still holding f's entries
+    while i < j {
+        let k = pv.get(i);
         let v = grave_v.get(k);
-        if grave_vf.get(k) != f {
-            k += 1;
-            continue;
-        }
-        // take the entry out (the last one moves into its place)
-        let last = grave_v.get(grave_v.len - 1);
+        let lastk = grave_v.len - 1;
+        let last = grave_v.get(lastk);
         grave_v.set(k, last);
-        grave_vf.set(k, grave_vf.get(grave_vf.len - 1));
+        grave_vf.set(k, grave_vf.get(lastk));
         last.grave = @truncate(u32, k + 1);
         grave_v.len -= 1;
         grave_vf.len -= 1;
@@ -1129,15 +1182,23 @@ pub fn recycle(f: *mut Func) void {
         if u.isnil(v.blk) {
             bury_value(v);
         }
-    }
-    k = 0;
-    while k < grave_b.len {
-        let b = grave_b.get(k);
-        if b.fnp != f {
-            k += 1;
-            continue;
+        if pv.get(j - 1) == lastk {
+            // (f's last entry, now at k: next; or the one just taken out)
+            j -= 1;
+        } else {
+            i += 1;
         }
-        let last = grave_b.get(grave_b.len - 1);
+    }
+    pv.deinit();
+    let mut nov = u.List.[*mut Value].empty();
+    let pb = grave_places(&mut nov, &mut f.bgraves, f);
+    i = 0;
+    j = pb.len;
+    while i < j {
+        let k = pb.get(i);
+        let b = grave_b.get(k);
+        let lastk = grave_b.len - 1;
+        let last = grave_b.get(lastk);
         grave_b.set(k, last);
         last.grave = @truncate(u32, k + 1);
         grave_b.len -= 1;
@@ -1145,7 +1206,13 @@ pub fn recycle(f: *mut Func) void {
         if u.isnil(b.prev) and u.isnil(b.next) and (f.first != b) {
             bury_block(b);
         }
+        if pb.get(j - 1) == lastk {
+            j -= 1;
+        } else {
+            i += 1;
+        }
     }
+    pb.deinit();
 }
 
 // -----------------------------------------------------------------------------
