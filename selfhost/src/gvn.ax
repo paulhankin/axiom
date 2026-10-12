@@ -383,6 +383,9 @@ fn may_alias(x: *Loc, w: *Write) bool {
     if x.base == w.base {
         return overlap(x.off, x.size, w.off, w.size);
     }
+    if (x.size >= 0) and (w.size >= 0) and apart_mod(x, w) {
+        return false;
+    }
     if u.notnil(x.obj) and (x.obj == w.obj) and x.rok and w.rok and (x.size >= 0) and (w.size >= 0) {
         return overlap(x.rlo, (x.rhi - x.rlo) + x.size, w.rlo, (w.rhi - w.rlo) + w.size);
     }
@@ -402,6 +405,179 @@ fn may_alias(x: *Loc, w: *Write) bool {
         return false;
     }
     return true;
+}
+
+// -----------------------------------------------------------------------------
+// Addresses as a root plus an offset modulo a stride: p = root + off + k * m
+// for some integer k (m == 0: exactly root + off). Constant offsets add to
+// off; an offset that is a multiple of a constant, and a phi stepping by one
+// from its start (an induction pointer), make m the gcd. Two addresses from
+// one root whose offsets differ, modulo the stride, by more than their sizes
+// cannot overlap: the fields of elements of one array of structs.
+// -----------------------------------------------------------------------------
+struct Strided {
+    root: *mut ir.Value,
+    off: i64,
+    m: i64,
+}
+
+fn gcd(a0: i64, b0: i64) i64 {
+    let mut a = a0;
+    let mut b = b0;
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+// A constant c such that v is always a multiple of it (0: none known; 1 is
+// as good as none).
+fn multiple_of(v: *ir.Value, depth: i32) i64 {
+    if ir.is_cint(v) {
+        let x = ir.sval(v);
+        if (x < 0) or (x > RLIM) {
+            return 0;
+        }
+        return x;
+    }
+    if (depth > 4) or (v.kind != ir.V_INST) {
+        return 0;
+    }
+    let op = v.op;
+    if (op == ir.OP_MUL) and ir.is_cint(v.b) {
+        let c = ir.sval(v.b);
+        if (c > 0) and (c <= RLIM) {
+            return c;
+        }
+        return 0;
+    }
+    if (op == ir.OP_SHL) and ir.is_cint(v.b) and (ir.cint_val(v.b) < 30) {
+        return @as(i64, 1) << @truncate(u32, ir.cint_val(v.b));
+    }
+    if (op == ir.OP_ADD) or (op == ir.OP_SUB) {
+        let a = multiple_of(v.a, depth + 1);
+        let b = multiple_of(v.b, depth + 1);
+        if (a > 0) and (b > 0) {
+            return gcd(a, b);
+        }
+        if (a > 0) and ir.is_cint(v.b) and (ir.sval(v.b) == 0) {
+            return a;
+        }
+        return 0;
+    }
+    if op == ir.OP_SEXT {
+        return multiple_of(v.a, depth + 1);
+    }
+    return 0;
+}
+
+// The modulus with which p advances from phi ph back to itself through
+// ptradds (-1: it does not lead back to ph).
+fn step_to(p0: *ir.Value, ph: *ir.Value) i64 {
+    let mut p = p0;
+    let mut m: i64 = 0;
+    let mut n: i32 = 0;
+    while n < 8 {
+        if p == ph {
+            return m;
+        }
+        if not ir.is_op(p, ir.OP_PTRADD) {
+            return -1;
+        }
+        if ir.is_cint(p.b) {
+            let c = ir.sval(p.b);
+            if (c < -RLIM) or (c > RLIM) {
+                return -1;
+            }
+            m = gcd(m, @abs(c));
+        } else {
+            let k = multiple_of(p.b, 0);
+            if k <= 0 {
+                return -1;
+            }
+            m = gcd(m, k);
+        }
+        p = p.a;
+        n += 1;
+    }
+    return -1;
+}
+
+fn strided_form(p0: *mut ir.Value, depth: i32) Strided {
+    let mut p = p0;
+    let mut off: i64 = 0;
+    let mut m: i64 = 0;
+    let mut n: i32 = 0;
+    while n < 16 {
+        n += 1;
+        if ir.is_op(p, ir.OP_PTRADD) {
+            if ir.is_cint(p.b) {
+                let c = ir.sval(p.b);
+                if (c < -RLIM) or (c > RLIM) {
+                    break;
+                }
+                off += c;
+            } else {
+                let k = multiple_of(p.b, 0);
+                if k <= 0 {
+                    break;
+                }
+                m = gcd(m, k);
+            }
+            p = p.a;
+            continue;
+        }
+        // an induction pointer: phi [start, ...], [step back to it, ...]
+        if ir.is_op(p, ir.OP_PHI) and (p.xs.len == 2) and (depth < 3) {
+            let mut start = vnil();
+            let mut st: i64 = -1;
+            for k in @as(usize, 0)..2 {
+                let d = step_to(ir.resolve(p.xs.get(k)), p);
+                if d > 0 {
+                    st = d;
+                    start = ir.resolve(p.xs.get(1 - k));
+                }
+            }
+            if (st > 0) and u.notnil(start) and (start != p) {
+                let s = strided_form(start, depth + 1);
+                return Strided.{ root: s.root, off: s.off + off, m: gcd(gcd(m, s.m), st) };
+            }
+        }
+        break;
+    }
+    return Strided.{ root: p, off: off, m: m };
+}
+
+// Can x and w be told apart as offsets from one root modulo a stride?
+fn apart_mod(x: *Loc, w: *Write) bool {
+    if u.isnil(x.base) or u.isnil(w.base) {
+        return false;
+    }
+    if not ir.is_op(x.base, ir.OP_PTRADD) and not ir.is_op(x.base, ir.OP_PHI) and not ir.is_op(w.base, ir.OP_PTRADD) and
+       not ir.is_op(w.base, ir.OP_PHI) {
+        return false;
+    }
+    let a = strided_form(x.base, 0);
+    let b = strided_form(w.base, 0);
+    if a.root != b.root {
+        return false;
+    }
+    let m = gcd(a.m, b.m);
+    let xo = a.off + x.off;
+    let wo = b.off + w.off;
+    if m == 0 {
+        return not overlap(xo, x.size, wo, w.size);
+    }
+    if (x.size + w.size) > m {
+        return false;
+    }
+    let mut d = (wo - xo) % m;
+    if d < 0 {
+        d += m;
+    }
+    return (d >= x.size) and ((d + w.size) <= m);
 }
 
 // Is p a parameter, or computed from one by offsets?
@@ -3528,6 +3704,24 @@ pub fn licm(f: *mut ir.Func) bool {
         hs = opt.loop_headers(&order);
     }
     escapes(f);
+    // loops entered through a guard, whose first body block then runs
+    // whenever the preheader does (its loads hoisted like the header's)
+    guarded.clear();
+    let mut gd = false;
+    for k in 0..hs.len {
+        loop_mark += 1;
+        opt.members_of(hs.get(k), loop_mark, &mut members);
+        if guard_loop(f, hs.get(k), loop_mark, &members) {
+            gd = true;
+        }
+    }
+    if gd {
+        order.deinit();
+        hs.deinit();
+        opt.compute_preds(f);
+        order = opt.dominators(f);
+        hs = opt.loop_headers(&order);
+    }
     // inner loops first
     for i in 1..hs.len {
         let mut j = i;
@@ -3567,12 +3761,13 @@ pub fn licm(f: *mut ir.Func) bool {
         if members.len > 2 {
             u.sort.[*mut ir.Block](members.items()[1..members.len], by_rpo);
         }
+        let first = first_body(h, tag);
         for k in 0..members.len {
             let b = members.get(k);
             let mut i = b.first;
             while u.notnil(i) {
                 let next = i.next;
-                if hoist_ok(i, tag, b == h) {
+                if hoist_ok(i, tag, (b == h) or (b == first)) {
                     ir.remove_inst(i);
                     ir.insert_before(at, i);
                     any = true;
@@ -3585,6 +3780,213 @@ pub fn licm(f: *mut ir.Func) bool {
     order.deinit();
     hs.deinit();
     return any or made;
+}
+
+// -----------------------------------------------------------------------------
+// Loop guards. A loop whose header only computes its exit test (phis, pure
+// arithmetic, a branch out or into the body's first block S, entered only
+// from the header) and whose values are not used outside it can be entered
+// through a copy of the test: P -> G (the test on the entry values) -> P2 ->
+// H, G going straight to the exit when it fails. Then S runs whenever P2
+// does, and the loads of S that the loop does not write can move to P2
+// although nothing else shows their addresses are readable. Only for loops
+// with such a load.
+// -----------------------------------------------------------------------------
+let mut guarded: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                   cap: 0 };
+
+// The body's first block of a guarded loop with header h (nil otherwise).
+fn first_body(h: *mut ir.Block, tag: i64) *mut ir.Block {
+    let mut g = false;
+    for k in 0..guarded.len {
+        if guarded.get(k) == h {
+            g = true;
+        }
+    }
+    if not g {
+        return ir.bnil();
+    }
+    let t = ir.terminator(h);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) {
+        return ir.bnil();
+    }
+    let mut s = t.t1;
+    if s.mark != tag {
+        s = t.t2;
+    }
+    if (s.mark != tag) or (s == h) or (s.preds.len != 1) {
+        return ir.bnil();
+    }
+    return s;
+}
+
+fn guard_map(v: *mut ir.Value, h: *mut ir.Block, pre: *mut ir.Block) *mut ir.Value {
+    if u.notnil(v) and (v.kind == ir.V_INST) and (v.blk == h) {
+        if v.op == ir.OP_PHI {
+            return ir.incoming(v, pre);
+        }
+        return @ptr_cast(*mut ir.Value, v.auxp);
+    }
+    return v;
+}
+
+fn defined_in(v: *ir.Value, h: *mut ir.Block) bool {
+    return u.notnil(v) and (v.kind == ir.V_INST) and (v.blk == h);
+}
+
+fn guard_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    let mut pre = ir.bnil();
+    for k in 0..h.preds.len {
+        if h.preds.get(k).mark != tag {
+            if u.notnil(pre) {
+                return false;
+            }
+            pre = h.preds.get(k);
+        }
+    }
+    if u.isnil(pre) or (ir.succ_count(ir.terminator(pre)) != 1) {
+        return false;
+    }
+    let t = ir.terminator(h);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+        return false;
+    }
+    let mut s = t.t1;
+    let mut x = t.t2;
+    if s.mark != tag {
+        s = t.t2;
+        x = t.t1;
+    }
+    if (s.mark != tag) or (x.mark == tag) or (s == h) or (s.preds.len != 1) {
+        return false;
+    }
+    // the header: a test of no effect, cheap to copy
+    let mut n: i32 = 0;
+    let mut i = h.first;
+    while u.notnil(i) and (i != t) {
+        if i.op != ir.OP_PHI {
+            if ir.has_effects(i) or (i.op == ir.OP_LOAD) or (i.op == ir.OP_CALL) or (i.op == ir.OP_ALLOCA) or
+               (i.op == ir.OP_INTR) {
+                return false;
+            }
+            n += 1;
+        }
+        i = i.next;
+    }
+    if n > 8 {
+        return false;
+    }
+    // a load of S to hoist that only the guard makes safe
+    writes.clear();
+    for k in 0..members.len {
+        let mut w = members.get(k).first;
+        while u.notnil(w) {
+            note_writes(w);
+            w = w.next;
+        }
+    }
+    let mut want = false;
+    i = s.first;
+    while u.notnil(i) and not want {
+        if (i.op == ir.OP_LOAD) and hoist_ok(i, tag, true) and not hoist_ok(i, tag, false) {
+            want = true;
+        }
+        i = i.next;
+    }
+    if not want {
+        return false;
+    }
+    // the header's values used only in the loop (and by the exit's phis on
+    // the edge from the header)
+    let mut b = f.first;
+    while u.notnil(b) {
+        if b.mark != tag {
+            let mut y = b.first;
+            while u.notnil(y) {
+                if y.op == ir.OP_PHI {
+                    for k in 0..y.xs.len {
+                        let from = y.bs.get(k);
+                        if defined_in(ir.resolve(y.xs.get(k)), h) and (from.mark != tag) {
+                            return false;
+                        }
+                    }
+                } else if defined_in(y.a, h) or defined_in(y.b, h) or defined_in(y.c, h) {
+                    return false;
+                } else {
+                    for k in 0..y.xs.len {
+                        if defined_in(y.xs.get(k), h) {
+                            return false;
+                        }
+                    }
+                }
+                y = y.next;
+            }
+        }
+        b = b.next;
+    }
+    // P -> G -> P2 -> H
+    let g = ir.append_block(f, "guard");
+    ir.move_block_after(g, pre);
+    let p2 = ir.append_block(f, "preheader");
+    ir.move_block_after(p2, g);
+    i = h.first;
+    while u.notnil(i) and (i != t) {
+        if i.op != ir.OP_PHI {
+            let y = ir.copy_inst(f, i);
+            y.a = guard_map(y.a, h, pre);
+            y.b = guard_map(y.b, h, pre);
+            y.c = guard_map(y.c, h, pre);
+            for k in 0..y.xs.len {
+                y.xs.set(k, guard_map(y.xs.get(k), h, pre));
+            }
+            i.auxp = @ptr_cast(*mut void, y);
+            ir.append_inst(g, y);
+        }
+        i = i.next;
+    }
+    let gb = ir.new_builder();
+    ir.at_end(gb, g);
+    let c = guard_map(t.a, h, pre);
+    if t.t1 == s {
+        ir.condbr(gb, c, p2, x);
+    } else {
+        ir.condbr(gb, c, x, p2);
+    }
+    ir.at_end(gb, p2);
+    ir.br(gb, h);
+    // the exit's phis: on the way from G, the header's values as G has them
+    let mut q = x.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        let v = ir.incoming(q, h);
+        if u.notnil(v) {
+            ir.add_incoming(q, guard_map(ir.resolve(v), h, pre), g);
+        }
+        q = q.next;
+    }
+    ir.retarget(pre, h, g);
+    q = h.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for k in 0..q.bs.len {
+            if q.bs.get(k) == pre {
+                q.bs.set(k, p2);
+            }
+        }
+        q = q.next;
+    }
+    // (the predecessor lists and loop marks as they now are, for the loops
+    // looked at next)
+    g.preds.push(pre);
+    p2.preds.push(g);
+    for k in 0..h.preds.len {
+        if h.preds.get(k) == pre {
+            h.preds.set(k, p2);
+        }
+    }
+    x.preds.push(g);
+    g.mark = pre.mark;
+    p2.mark = pre.mark;
+    guarded.push(h);
+    return true;
 }
 
 fn by_rpo(a: *mut ir.Block, b: *mut ir.Block) i32 {
