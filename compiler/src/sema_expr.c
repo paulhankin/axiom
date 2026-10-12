@@ -385,7 +385,8 @@ static bool check_arith_op(int op, Type *t, Span sp) {
     case TK_MINUS:
     case TK_STAR:
     case TK_SLASH:
-        if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM)) return true;
+        if (ty_is_num(t) || ty_is_untyped(t) || ty_is_vec_float(t) || param_has(t, C_NUM) || param_has(t, C_FLOAT_VEC))
+            return true;
         if (ty_is_vec_int(t)) {
             // lane-wise and wrapping, in every overflow mode (§13.1)
             if (op == TK_SLASH) diag_error(sp, "E0811", "integer vectors do not support '/'");
@@ -646,7 +647,7 @@ static Type *check_unary(Expr *e, Type *expected) {
             return e->type = t_invalid;
         }
         if ((t->kind == TY_INT) || t->kind == TY_FLOAT || ty_is_vec_float(t) || param_has(t, C_SIGNED) ||
-            param_has(t, C_FLOAT) || t->kind == TY_INVALID) {
+            param_has(t, C_FLOAT) || param_has(t, C_FLOAT_VEC) || t->kind == TY_INVALID) {
             if (e->a->is_const && t->kind == TY_INT) {
                 if (!fits_type(-e->a->cval, t)) diag_error(e->span, "E0530", "overflow in constant expression");
                 e->cval = -e->a->cval;

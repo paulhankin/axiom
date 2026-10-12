@@ -402,7 +402,7 @@ fn ensure_gparams(d: *mut ast.Decl) void {
             let mut cc = ty.constraint_from_name(g.constraint);
             if cc < 0 {
                 _ = dg.err(g.constraint_span, "E0470",
-                           u.f1("unknown constraint '%s' (expected Eq, Ord, Num, Int, SignedInt, UnsignedInt or Float)",
+                           u.f1("unknown constraint '%s' (expected Eq, Ord, Num, Int, SignedInt, UnsignedInt, Float or FloatVector)",
                                 g.constraint));
                 cc = ast.C_NONE;
             }
@@ -1583,7 +1583,8 @@ fn check_arith_op(op: i32, t: *mut ast.Type, sp: u.Span) bool {
     }
     let opn = lx.tok_kind_name(op);
     if (op == lx.TK_PLUS) or (op == lx.TK_MINUS) or (op == lx.TK_STAR) or (op == lx.TK_SLASH) {
-        if ty.is_num(t) or ty.is_untyped(t) or ty.is_vec_float(t) or param_has(t, ast.C_NUM) {
+        if ty.is_num(t) or ty.is_untyped(t) or ty.is_vec_float(t) or param_has(t, ast.C_NUM) or
+           param_has(t, ast.C_FLOAT_VEC) {
             return true;
         }
         if ty.is_vec_int(t) {
@@ -1950,7 +1951,7 @@ fn check_unary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             return set_ty(e, ty.t_invalid);
         }
         if (t.kind == ast.TY_INT) or (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t) or param_has(t, ast.C_SIGNED) or
-           param_has(t, ast.C_FLOAT) or (t.kind == ast.TY_INVALID) {
+           param_has(t, ast.C_FLOAT) or param_has(t, ast.C_FLOAT_VEC) or (t.kind == ast.TY_INVALID) {
             if e.a.is_const and (t.kind == ast.TY_INT) {
                 if not fits_type(e.a.cval.neg(), t) {
                     _ = dg.err(e.span, "E0530", "overflow in constant expression");
@@ -3205,6 +3206,15 @@ fn is_float_like(t: *ast.Type) bool {
            (t.kind == ast.TY_INVALID);
 }
 
+// A float vector, or a parameter constrained to be one (FloatVector).
+fn is_float_vec(t: *ast.Type) bool {
+    return ty.is_vec_float(t) or is_fvec_param(t);
+}
+
+fn is_fvec_param(t: *ast.Type) bool {
+    return (t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_FLOAT_VEC);
+}
+
 // Check an operand; if it is an untyped literal, give it `hint` (or report).
 fn operand(pe: *mut *mut ast.Expr, hint: *mut ast.Type) *mut ast.Type {
     let t = check_expr(pe.*, hint);
@@ -3786,7 +3796,7 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     }
     if (id == ast.BI_MIN) or (id == ast.BI_MAX) {
         let t = pair(e, x);
-        let mut ok = ty.is_num(t) or ty.is_vec_float(t) or ty.is_vec_int(t) or (t.kind == ast.TY_INVALID) or
+        let mut ok = ty.is_num(t) or is_float_vec(t) or ty.is_vec_int(t) or (t.kind == ast.TY_INVALID) or
                      ((t.kind == ast.TY_PARAM) and ty.satisfies(t, ast.C_ORD));
         if ty.is_vec_int(t) and (t.elem.bits == 64) {
             ok = false;
@@ -3798,7 +3808,7 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     }
     if id == ast.BI_ABS {
         let t = operand(earg(e, 0), x);
-        let ok = ((t.kind == ast.TY_INT) and t.is_signed) or (t.kind == ast.TY_FLOAT) or ty.is_vec_float(t) or
+        let ok = ((t.kind == ast.TY_INT) and t.is_signed) or (t.kind == ast.TY_FLOAT) or is_float_vec(t) or
                  (ty.is_vec_int(t) and t.elem.is_signed) or (t.kind == ast.TY_INVALID) or
                  ((t.kind == ast.TY_PARAM) and (ty.satisfies(t, ast.C_SIGNED) or ty.satisfies(t, ast.C_FLOAT)));
         if not ok {
@@ -3813,7 +3823,7 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
             h = x;
         }
         let t = operand(earg(e, 0), h);
-        if not is_float_like(t) and not ty.is_vec_float(t) {
+        if not is_float_like(t) and not is_float_vec(t) {
             _ = dg.err(e.span, "E0822", u.f2("@%s requires a float, found %s", e.name, tstr(t)));
         }
         return set_ty(e, t);
@@ -3821,7 +3831,7 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_FMA {
         let t = pair(e, x);
         _ = check_expr_to(earg(e, 2), t);
-        if not is_float_like(t) and not ty.is_vec_float(t) {
+        if not is_float_like(t) and not is_float_vec(t) {
             _ = dg.err(e.span, "E0822", u.f1("@fma requires floats, found %s", tstr(t)));
         }
         return set_ty(e, t);
@@ -3840,6 +3850,18 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
 fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     let id = e.builtin;
     if id == ast.BI_SPLAT {
+        if u.notnil(x) and is_fvec_param(x) {
+            // the lane type is not known: a float literal, converted to it
+            // when instantiated
+            let at = check_expr(barg(e, 0), tnil());
+            if (at.kind != ast.TY_UNTYPED_FLOAT) and (at.kind != ast.TY_UNTYPED_INT) and (at.kind != ast.TY_INVALID) {
+                _ = dg.err(barg(e, 0).span, "E0461",
+                           u.f1("@splat of a value to a FloatVector parameter '%s' needs a float literal", x.name));
+            } else {
+                _ = check_expr_to(earg(e, 0), ty.t_f64);
+            }
+            return set_ty(e, x);
+        }
         if u.isnil(x) or ((x.kind != ast.TY_VEC) and (x.kind != ast.TY_INVALID)) {
             _ = dg.err(e.span, "E0820", "@splat needs a vector type from context, e.g. let v: f32x4 = @splat(x);");
             _ = check_expr(barg(e, 0), tnil());
@@ -3894,7 +3916,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     if id == ast.BI_LOAD {
         let v = targ(e, 0);
         e.tval = v;
-        if not ty.is_simd(v) and (v.kind != ast.TY_INVALID) {
+        if not ty.is_simd(v) and not is_fvec_param(v) and (v.kind != ast.TY_INVALID) {
             _ = dg.err(e.span, "E0812", "@load requires a vector type");
         }
         let s = check_expr(barg(e, 1), tnil());
@@ -3909,7 +3931,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
             _ = dg.err(barg(e, 0).span, "E0822", u.f1("@store writes to a []mut slice, found %s", tstr(s)));
         }
         let v = check_expr(barg(e, 1), tnil());
-        if not ty.is_simd(v) and (v.kind != ast.TY_INVALID) {
+        if not ty.is_simd(v) and not is_fvec_param(v) and (v.kind != ast.TY_INVALID) {
             _ = dg.err(barg(e, 1).span, "E0812", "@store requires a vector value");
         }
         return set_ty(e, ty.t_void);

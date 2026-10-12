@@ -33,6 +33,11 @@ static bool is_int_like(Type *t) {
 static bool is_float_like(Type *t) {
     return t->kind == TY_FLOAT || (t->kind == TY_PARAM && type_satisfies(t, C_FLOAT)) || t->kind == TY_INVALID;
 }
+// A float vector, or a parameter constrained to be one (FloatVector).
+static bool is_float_vec(Type *t) {
+    return ty_is_vec_float(t) || (t->kind == TY_PARAM && type_satisfies(t, C_FLOAT_VEC));
+}
+static bool is_fvec_param(Type *t) { return t->kind == TY_PARAM && type_satisfies(t, C_FLOAT_VEC); }
 
 // Check an operand; if it is an untyped literal, give it `hint` (or report).
 static Type *operand(Expr **pe, Type *hint) {
@@ -541,7 +546,7 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_MIN:
     case BI_MAX: {
         Type *t = pair(e, x);
-        bool ok = ty_is_num(t) || ty_is_vec_float(t) || ty_is_vec_int(t) || t->kind == TY_INVALID ||
+        bool ok = ty_is_num(t) || is_float_vec(t) || ty_is_vec_int(t) || t->kind == TY_INVALID ||
                   (t->kind == TY_PARAM && type_satisfies(t, C_ORD));
         if (ty_is_vec_int(t) && t->elem->bits == 64) ok = false;
         if (!ok) diag_error(e->span, "E0822", "@%s cannot be applied to %s", e->name, type_str(t));
@@ -549,7 +554,7 @@ Type *builtin_check(Expr *e, Type *expected) {
     }
     case BI_ABS: {
         Type *t = operand(earg(e, 0), x);
-        bool ok = (t->kind == TY_INT && t->is_signed) || t->kind == TY_FLOAT || ty_is_vec_float(t) ||
+        bool ok = (t->kind == TY_INT && t->is_signed) || t->kind == TY_FLOAT || is_float_vec(t) ||
                   (ty_is_vec_int(t) && t->elem->is_signed) || t->kind == TY_INVALID ||
                   (t->kind == TY_PARAM && (type_satisfies(t, C_SIGNED) || type_satisfies(t, C_FLOAT)));
         if (!ok) diag_error(e->span, "E0822", "@abs requires a signed integer or float, found %s", type_str(t));
@@ -561,14 +566,14 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_TRUNC:
     case BI_NEAREST: {
         Type *t = operand(earg(e, 0), x && (x->kind == TY_FLOAT || x->kind == TY_PARAM) ? x : t_f64);
-        if (!is_float_like(t) && !ty_is_vec_float(t))
+        if (!is_float_like(t) && !is_float_vec(t))
             diag_error(e->span, "E0822", "@%s requires a float, found %s", e->name, type_str(t));
         return e->type = t;
     }
     case BI_FMA: {
         Type *t = pair(e, x);
         check_expr_to(earg(e, 2), t);
-        if (!is_float_like(t) && !ty_is_vec_float(t))
+        if (!is_float_like(t) && !is_float_vec(t))
             diag_error(e->span, "E0822", "@fma requires floats, found %s", type_str(t));
         return e->type = t;
     }
@@ -579,6 +584,17 @@ Type *builtin_check(Expr *e, Type *expected) {
         return e->type = t;
     }
     case BI_SPLAT: {
+        if (x && is_fvec_param(x)) {
+            // the lane type is not known: a float literal, converted to it
+            // when instantiated
+            Expr *a = *earg(e, 0);
+            Type *at = check_expr(a, NULL);
+            if (at->kind != TY_UNTYPED_FLOAT && at->kind != TY_UNTYPED_INT && at->kind != TY_INVALID)
+                diag_error(a->span, "E0461", "@splat of a value to a FloatVector parameter '%s' needs a float literal",
+                           x->name);
+            else check_expr_to(earg(e, 0), t_f64);
+            return e->type = x;
+        }
         if (!x || (x->kind != TY_VEC && x->kind != TY_INVALID)) {
             diag_error(e->span, "E0820", "@splat needs a vector type from context, e.g. let v: f32x4 = @splat(x);");
             check_expr(*earg(e, 0), NULL);
@@ -628,7 +644,8 @@ Type *builtin_check(Expr *e, Type *expected) {
     case BI_LOAD: {
         Type *v = targ(e, 0);
         e->tval = v;
-        if (!ty_is_simd(v) && v->kind != TY_INVALID) diag_error(e->span, "E0812", "@load requires a vector type");
+        if (!ty_is_simd(v) && !is_fvec_param(v) && v->kind != TY_INVALID)
+            diag_error(e->span, "E0812", "@load requires a vector type");
         Type *s = check_expr(*earg(e, 1), NULL);
         if (s->kind != TY_SLICE && s->kind != TY_INVALID)
             diag_error((*earg(e, 1))->span, "E0822", "@load reads from a slice, found %s", type_str(s));
@@ -639,7 +656,8 @@ Type *builtin_check(Expr *e, Type *expected) {
         if ((s->kind != TY_SLICE || !s->mut) && s->kind != TY_INVALID)
             diag_error((*earg(e, 0))->span, "E0822", "@store writes to a []mut slice, found %s", type_str(s));
         Type *v = check_expr(*earg(e, 1), NULL);
-        if (!ty_is_simd(v) && v->kind != TY_INVALID) diag_error((*earg(e, 1))->span, "E0812", "@store requires a vector value");
+        if (!ty_is_simd(v) && !is_fvec_param(v) && v->kind != TY_INVALID)
+            diag_error((*earg(e, 1))->span, "E0812", "@store requires a vector value");
         return e->type = t_void;
     }
     case BI_SHUFFLE: {

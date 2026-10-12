@@ -29,7 +29,7 @@ typedef enum TypeKind {
     TY_NEVER,  // expression that never produces a value (@trap(), return in catch)
 } TypeKind;
 
-typedef enum Constraint { C_NONE, C_EQ, C_ORD, C_NUM, C_INT, C_SIGNED, C_UNSIGNED, C_FLOAT } Constraint;
+typedef enum Constraint { C_NONE, C_EQ, C_ORD, C_NUM, C_INT, C_SIGNED, C_UNSIGNED, C_FLOAT, C_FLOAT_VEC } Constraint;
 
 struct Type {
     TypeKind kind;

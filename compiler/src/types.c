@@ -562,11 +562,12 @@ Constraint constraint_from_name(Sym s) {
     if (!strcmp(s, "SignedInt")) return C_SIGNED;
     if (!strcmp(s, "UnsignedInt")) return C_UNSIGNED;
     if (!strcmp(s, "Float")) return C_FLOAT;
+    if (!strcmp(s, "FloatVector")) return C_FLOAT_VEC;
     return (Constraint)-1;
 }
 
 const char *constraint_name(Constraint c) {
-    static const char *n[] = {"(none)", "Eq", "Ord", "Num", "Int", "SignedInt", "UnsignedInt", "Float"};
+    static const char *n[] = {"(none)", "Eq", "Ord", "Num", "Int", "SignedInt", "UnsignedInt", "Float", "FloatVector"};
     return n[c];
 }
 
@@ -598,6 +599,7 @@ bool type_satisfies(Type *t, Constraint c) {
     case C_SIGNED: return t->kind == TY_INT && t->is_signed;
     case C_UNSIGNED: return t->kind == TY_INT && !t->is_signed;
     case C_FLOAT: return t->kind == TY_FLOAT;
+    case C_FLOAT_VEC: return ty_is_vec_float(t);
     }
     return false;
 }

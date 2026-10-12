@@ -234,7 +234,7 @@ static void ensure_gparams(Decl *d) {
             int cc = (int)constraint_from_name(g->constraint);
             if (cc < 0 || !g->constraint) {
                 diag_error(g->constraint_span, "E0470",
-                           "unknown constraint '%s' (expected Eq, Ord, Num, Int, SignedInt, UnsignedInt or Float)",
+                           "unknown constraint '%s' (expected Eq, Ord, Num, Int, SignedInt, UnsignedInt, Float or FloatVector)",
                            g->constraint);
                 cc = C_NONE;
             }

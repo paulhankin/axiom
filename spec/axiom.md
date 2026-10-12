@@ -129,7 +129,7 @@ i8x64  u8x64  i16x32  u16x32  i32x16  u32x16  i64x8  u64x8  f32x16  f64x8  v512
 ```
 
 **Reserved constraint names** (§10.5): `Eq`, `Ord`, `Num`, `Int`, `SignedInt`,
-`UnsignedInt`, `Float`. These may not be declared as identifiers.
+`UnsignedInt`, `Float`, `FloatVector`. These may not be declared as identifiers.
 
 **Reserved for future use:** `async`, `await`, `comptime`, `impl`, `interface`,
 `null`, `trait`, `type`, `unsafe`, `yield`.
@@ -233,7 +233,7 @@ Param         ::= IDENT ":" Type
 
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
 GenericParam  ::= IDENT ( ":" Constraint )? | "const" IDENT ":" Type
-Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
+Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float" | "FloatVector"
 ```
 
 The trailing-comma forms are LL(1). After a `,`, an `IDENT` begins another element, and
@@ -1263,7 +1263,7 @@ fn demo() !void {
 GenericParams ::= "[" GenericParam ( "," GenericParam )* ","? "]"
 GenericParam  ::= IDENT ( ":" Constraint )?        (* type parameter *)
                 | "const" IDENT ":" Type           (* integer constant parameter *)
-Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float"
+Constraint    ::= "Eq" | "Ord" | "Num" | "Int" | "SignedInt" | "UnsignedInt" | "Float" | "FloatVector"
 ```
 
 A parameter list may follow the name of a `fn`, a `struct` or a `union`. The parameters
@@ -1355,6 +1355,7 @@ v0.1 has a closed set of builtin constraints. User-defined constraints are futur
 | `SignedInt` | `i8` … `i64`, `isize` | everything `Int` permits; unary `-`; `@abs` |
 | `UnsignedInt` | `u8` … `u64`, `usize` | everything `Int` permits |
 | `Float` | `f32`, `f64` | everything `Num` permits; unary `-`; `@sqrt`, `@floor` and the other float builtins |
+| `FloatVector` | the float vector types (`f32x4` … `f32x16`, `f64x2` … `f64x8`) | binary `+` `-` `*` `/`; unary `-`; `@min`, `@max`, `@abs`, `@sqrt`, `@fma`; `@load(T, s)` and `@store(s, v)`; `@splat(lit)` of a float literal (see below) |
 
 **Literals in generic code.** An untyped literal is accepted as a value of type `T` only if
 it is representable in **every** type that satisfies `T`'s constraint:
@@ -1365,6 +1366,20 @@ it is representable in **every** type that satisfies `T`'s constraint:
 | `SignedInt` | integers `-128` … `127` |
 | `UnsignedInt` | integers `0` … `255` |
 | `Float` | any float literal, and integers exactly representable in `f32` |
+| `FloatVector` | none; `@splat` takes a float or integer literal, converted to the lane type when instantiated |
+
+A `FloatVector` parameter's lane count and lane type are not known in the body, so
+operations that depend on them (lane access, shuffles, comparisons, reductions) are not
+permitted; `@size_of(T)` gives the width. For example, the same code at any width:
+
+```axiom
+fn scale[V: FloatVector](xs: []mut V, k: V) void {
+    let half: V = @splat(0.5);
+    for i in 0..xs.len {
+        xs[i] = xs[i] * k * half;
+    }
+}
+```
 
 For other values, convert explicitly, for example `@int_cast(T, @as(u32, 1000))`. This
 conversion traps at run time if `T` cannot hold the value.

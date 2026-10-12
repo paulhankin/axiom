@@ -3197,7 +3197,13 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef x = gen(a[0].e), y = gen(a[1].e);
         return intr2("llvm.copysign", x, y);
     }
-    case BI_SPLAT: return splat(lty(rt), gen(a[0].e), (unsigned)rt->lanes);
+    case BI_SPLAT: {
+        LLVMValueRef x = gen(a[0].e);
+        // a literal splatted to a FloatVector parameter is an f64
+        Type *xt = ct(a[0].e->type);
+        if (xt->kind == TY_FLOAT && xt != rt->elem) x = LLVMBuildFPCast(B, x, lty(rt->elem), "");
+        return splat(lty(rt), x, (unsigned)rt->lanes);
+    }
     case BI_VEC: {
         LLVMValueRef v = LLVMGetUndef(lty(rt));
         for (int i = 1; i < e->bargs.len; i++)
