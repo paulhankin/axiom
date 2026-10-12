@@ -1022,7 +1022,7 @@ fn const_global(p: *mut ir.Value, off: *mut u64) *mut ir.Value {
 
 // The load v is computed from by extensions, truncations and operations
 // with a constant (`T[i] << k`, `zext(T[i])`), or nil.
-fn leaf_load(v: *mut ir.Value, depth: i32) *mut ir.Value {
+pub fn leaf_load(v: *mut ir.Value, depth: i32) *mut ir.Value {
     if ir.is_op(v, ir.OP_LOAD) {
         return v;
     }
@@ -1062,7 +1062,7 @@ fn sext_bits(x: u64, bits: i32) u64 {
 }
 
 // The value of v (a leaf_load chain) when its load reads k.
-fn leaf_value(v: *mut ir.Value, ld: *mut ir.Value, k: u64) u64 {
+pub fn leaf_value(v: *mut ir.Value, ld: *mut ir.Value, k: u64) u64 {
     if v == ld {
         return k & ir.mask_bits(v.ty.bits);
     }
@@ -1121,7 +1121,7 @@ fn leaf_with(B: *mut ir.Builder, v: *mut ir.Value, ld: *mut ir.Value, r: *mut ir
 
 // The element of type t at byte offset `at` of constant global g, if it is
 // an integer constant (ok false otherwise).
-fn table_int(g: *mut ir.Value, at: u64, t: *mut ir.Ty, ok: *mut bool) u64 {
+pub fn table_int(g: *mut ir.Value, at: u64, t: *mut ir.Ty, ok: *mut bool) u64 {
     ok.* = false;
     if (at >= g.gv.ty.size) or ((at + t.size) > g.gv.ty.size) {
         return 0;
@@ -1504,8 +1504,68 @@ fn simplify_load(i: *mut ir.Value) *mut ir.Value {
 }
 
 // The value i can be replaced by, or nil (i may have been rewritten in place).
+// An operation with a constant on a phi (in its block, its only use) whose
+// inputs are constants but one: done on that input, at the end of the block
+// it comes from, and on the constants now (`(c ? 0 : T[i]) & 8 != 0` is
+// `c ? false : (T[i] & 8 != 0)`, which branches on c can then skip).
+fn into_phi(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
+    let op = i.op;
+    let ph = i.a;
+    if (op != ir.OP_ICMP) and (not ir.is_int_binop(op) or ir.is_int_div(op)) {
+        return vnil();
+    }
+    if not ir.is_op(ph, ir.OP_PHI) or (ph.blk != i.blk) or not ir.is_cint(i.b) or not small_int(ph.ty) or
+       not small_int(i.ty) or (uses_of(ph) != 1) {
+        return vnil();
+    }
+    let mut var: i64 = -1;
+    for k in 0..ph.xs.len {
+        let x = ir.resolve(ph.xs.get(k));
+        if not ir.is_cint(x) {
+            if var >= 0 {
+                return vnil();
+            }
+            var = @int_cast(i64, k);
+        }
+    }
+    if var < 0 {
+        return vnil();  // (constants only: folding does it)
+    }
+    let p = ph.bs.get(@int_cast(usize, var));
+    let pt = ir.terminator(p);
+    if u.isnil(pt) or (pt.op != ir.OP_BR) {
+        return vnil();
+    }
+    let x = ir.resolve(ph.xs.get(@int_cast(usize, var)));
+    ir.at_before(B, pt);
+    let mut y = vnil();
+    if op == ir.OP_ICMP {
+        y = ir.icmp(B, ir.pred_of(i), x, i.b);
+    } else {
+        y = ir.binop(B, op, x, i.b);
+    }
+    ir.at_before(B, ph);
+    let np = ir.phi(B, i.ty);
+    for k in 0..ph.xs.len {
+        let from = ph.bs.get(k);
+        if k == @int_cast(usize, var) {
+            ir.add_incoming(np, y, from);
+        } else if op == ir.OP_ICMP {
+            ir.add_incoming(np, ir.fold_icmp(ir.pred_of(i), ir.resolve(ph.xs.get(k)), i.b), from);
+        } else {
+            ir.add_incoming(np, ir.fold_int_bin(op, i.ty, ir.resolve(ph.xs.get(k)), i.b), from);
+        }
+    }
+    ir.at_before(B, i);
+    return np;
+}
+
 pub fn simplify(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
+    let fp = into_phi(B, i);
+    if u.notnil(fp) {
+        return fp;
+    }
     ir.at_before(B, i);
     if ir.is_int_binop(op) {
         if small_int(i.ty) {
