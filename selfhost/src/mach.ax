@@ -1568,6 +1568,8 @@ struct Cfg {
     nsucc: []mut i32,
     simple: []mut bool,  // the block's jumps all come at its end (spill code can go before them)
     endok: []mut bool,   // every predecessor is simple and has the block as its only successor
+    label: []mut bool,   // the block has a label
+    near: []mut bool,    // the vreg being split is live into or out of the block, or named in it
 }
 
 fn find(p: *mut u.List.[i32], x: i32) i32 {
@@ -1654,12 +1656,15 @@ fn edge_cut(f: *MFunc, g: *Cfg, allin: []bool, memtail: []bool, cl: []i32, mode:
 // The clusters of vreg v's uses (see SPLIT_GAPS): uses in blocks laid out
 // in order, at most SPLIT_GAP instructions apart, are one cluster, which the
 // blocks between them also belong to; the other blocks belong to none (-1).
-fn use_clusters(f: *MFunc, v: i32, cl: []mut i32) void {
+fn use_clusters(f: *MFunc, g: *Cfg, v: i32, cl: []mut i32) void {
     let mut n: i32 = -1;
     let mut prev_last: i32 = -1;  // the last use in the last block with one (-1: none yet)
     let mut prev: usize = 0;
     for bi in 0..f.blocks.len {
         cl[bi] = -1;
+        if not g.near[bi] {
+            continue;
+        }
         let mut first: i32 = -1;
         let mut last: i32 = -1;
         let mut i = f.blocks.get(bi).first;
@@ -1702,7 +1707,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
     let nb = f.blocks.len;
     let cl = u.newn.[i32](nb + 1);
     if mode == SPLIT_GAPS {
-        use_clusters(f, v, cl[0..nb]);
+        use_clusters(f, g, v, cl[0..nb]);
     }
     let head = u.newn.[i32](nb + 1);
     let tail = u.newn.[i32](nb + 1);
@@ -1721,6 +1726,19 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
     // segments: the stretches of each block between the calls it is live across
     for bi in 0..nb {
         let b = f.blocks.get(bi);
+        if not g.near[bi] {
+            // (neither live nor named there: one segment that is not relevant)
+            let seg = @int_cast(i32, par.len);
+            par.push(seg);
+            occ.push(false);
+            rel.push(false);
+            defc.push(0.0);
+            nrd.push(0);
+            deep.push(false);
+            head[bi] = seg;
+            tail[bi] = seg;
+            continue;
+        }
         let fq = b.freq;
         arr.clear();
         la.clear();
@@ -2032,16 +2050,13 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
     // rewrite
     let mut ck: usize = 0;
     for bi in 0..nb {
+        if not g.near[bi] {
+            continue;  // (nothing to rewrite: see the segments)
+        }
         let b = f.blocks.get(bi);
         let mut seg = head[bi];
-        let mut lbl = false;
+        let lbl = g.label[bi];
         let mut i = b.first;
-        while u.notnil(i) {
-            if t.is_label(i) {
-                lbl = true;
-            }
-            i = i.next;
-        }
         let mut pend: i32 = sload[bi];  // a region to reload before the next use
         if (pend >= 0) and not g.simple[bi] {
             insert_start(b, sreload(f, t, rd, v, wreg[@int_cast(usize, pend)], c, slot));
@@ -2187,6 +2202,21 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8) boo
     nrd.deinit();
     deep.deinit();
     return true;
+}
+
+// Notes that block bi names r, if r is a spilled vreg of this round.
+fn note_named(iv: []Interval, named: []mut u.List.[i32], r: i32, bi: usize) void {
+    if not is_vreg(r) {
+        return;
+    }
+    let x = @int_cast(usize, r - VREG0);
+    if (x >= iv.len) or not iv[x].spilled {
+        return;
+    }
+    let l = &mut named[x];
+    if (l.len == 0) or (l.get(l.len - 1) != @int_cast(i32, bi)) {
+        l.push(@int_cast(i32, bi));
+    }
 }
 
 // Is r a vreg (of this round) spilled everywhere?
@@ -2508,9 +2538,10 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
     let nv = iv.len;
     let nb = f.blocks.len;
     let g = Cfg.{ npred: u.newn.[i32](nb + 1), nsucc: u.newn.[i32](nb + 1), simple: u.newn.[bool](nb + 1),
-                  endok: u.newn.[bool](nb + 1) };
+                  endok: u.newn.[bool](nb + 1), label: u.newn.[bool](nb + 1), near: u.newn.[bool](nb + 1) };
     for bi in 0..nb {
         g.npred[bi] = 0;
+        g.label[bi] = false;
         // simple: no labels, and nothing but jumps after the first jump
         let b = f.blocks.get(bi);
         let mut ok = true;
@@ -2519,6 +2550,7 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
         while u.notnil(i) {
             if t.is_label(i) {
                 ok = false;
+                g.label[bi] = true;
             }
             if is_jump(i) {
                 jumped = true;
@@ -2547,6 +2579,31 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             g.npred[@int_cast(usize, b.succs.get(k))] += 1;
         }
     }
+    // the blocks naming each spilled vreg (splitting one adds no mention of
+    // another: its spill code names only its own pieces), so that split
+    // looks only at the blocks where the vreg is live or named
+    let named = u.newn.[u.List.[i32]](nv + 1);
+    for k in 0..nv {
+        named[k] = u.List.[i32].empty();
+    }
+    for bi in 0..nb {
+        let mut i = f.blocks.get(bi).first;
+        while u.notnil(i) {
+            for k in 0..i.ops.len {
+                let o = i.ops[k];
+                if o.kind == K_REG {
+                    note_named(iv, named, o.reg, bi);
+                } else if o.kind == K_MEM {
+                    note_named(iv, named, o.base, bi);
+                    note_named(iv, named, o.index, bi);
+                }
+            }
+            i = i.next;
+        }
+    }
+    for bi in 0..nb {
+        g.near[bi] = false;
+    }
     let every = u.newn.[bool](nv + 1);
     let rm = u.newn.[bool](nv + 1);
     for k in 0..nv {
@@ -2554,6 +2611,13 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
         rm[k] = false;
         if not iv[k].spilled {
             continue;
+        }
+        for bi in 0..nb {
+            let b = f.blocks.get(bi);
+            g.near[bi] = bget(b.live_in, k) or bget(b.live_out, k);
+        }
+        for bi in named[k].items() {
+            g.near[@int_cast(usize, bi)] = true;
         }
         let lv = f.level.get(k);
         if u.notnil(f.remat.get(k)) {
