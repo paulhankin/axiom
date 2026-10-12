@@ -1606,11 +1606,12 @@ fn call_cut(t: *Target, c: u8, i: *MInst) bool {
 struct Cfg {
     npred: []mut i32,
     nsucc: []mut i32,
-    simple: []mut bool,  // the block's jumps all come at its end (spill code can go before them)
-    endok: []mut bool,   // every predecessor is simple and has the block as its only successor
-    label: []mut bool,   // the block has a label
-    near: []mut bool,    // the block is in the nl of the vreg being split
-    cidx: []mut i32,     // ... at this index
+    simple: []mut bool,             // the block's jumps all come at its end (spill code can go before them)
+    endok: []mut bool,              // every predecessor is simple and has the block as its only successor
+    label: []mut bool,              // the block has a label
+    near: []mut bool,               // the block is in the nl of the vreg being split
+    cidx: []mut i32,                // ... at this index
+    ev: []mut u.List.[*mut MInst],  // the block's calls (clobbering registers) and jumps, in order
 }
 
 fn find(p: *mut u.List.[i32], x: i32) i32 {
@@ -1706,12 +1707,15 @@ fn edge_cut(f: *MFunc, g: *Cfg, ms: *Split, p: usize, s: usize) bool {
 // The clusters of vreg v's uses (see SPLIT_GAPS): uses in blocks laid out
 // in order, at most SPLIT_GAP instructions apart, are one cluster, which the
 // blocks between them also belong to; the other blocks belong to none (-1).
-fn use_clusters(f: *MFunc, v: i32, nl: []i32, cl: []mut i32) void {
+fn use_clusters(f: *MFunc, v: i32, nl: []i32, nm: []bool, cl: []mut i32) void {
     let mut n: i32 = -1;
     let mut prev_last: i32 = -1;  // the last use in the last block with one (-1: none yet)
     let mut prev: usize = 0;
     for bj in 0..nl.len {
         cl[bj] = -1;
+        if not nm[bj] {
+            continue;
+        }
         let mut first: i32 = -1;
         let mut last: i32 = -1;
         let mut i = f.blocks.get(@int_cast(usize, nl[bj])).first;
@@ -1743,7 +1747,9 @@ fn use_clusters(f: *MFunc, v: i32, nl: []i32, cl: []mut i32) void {
 // Splits vreg x into regions (see above), where mode says (SPLIT_LOOPS,
 // SPLIT_GAPS, SPLIT_ALL). Returns false, changing nothing, if there is
 // nothing to split.
-fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8, nl: []i32) bool {
+// (nm: whether each block of nl names the vreg; where it does not, the vreg
+// is live through it, and only its calls and jumps matter)
+fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8, nl: []i32, nm: []bool) bool {
     let v = VREG0 + @int_cast(i32, x);
     let c = f.vclass.get(x);
     let mut rd = f.remat.get(x);
@@ -1755,7 +1761,7 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8, nl:
     let m = nl.len;
     let cl = u.newn.[i32](m + 1);
     if mode == SPLIT_GAPS {
-        use_clusters(f, v, nl, cl[0..m]);
+        use_clusters(f, v, nl, nm, cl[0..m]);
     }
     let head = u.newn.[i32](m + 1);
     let tail = u.newn.[i32](m + 1);
@@ -1776,6 +1782,39 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8, nl:
         let bi = @int_cast(usize, nl[bj]);
         let b = f.blocks.get(bi);
         let fq = b.freq;
+        if not nm[bj] {
+            // (live through it: segments between the calls it is live across)
+            let mut seg = @int_cast(i32, par.len);
+            par.push(seg);
+            occ.push(false);
+            rel.push(bget(b.live_in, x));
+            defc.push(0.0);
+            nrd.push(0);
+            deep.push(false);
+            head[bj] = seg;
+            if g.simple[bi] and bget(b.live_out, x) {
+                for j in g.ev[bi].items() {
+                    if call_cut(t, c, j) {
+                        cuts.push(j);
+                        cut_seg.push(seg);
+                        cut_fq.push(fq);
+                        rel.set(@int_cast(usize, seg), true);
+                        seg = @int_cast(i32, par.len);
+                        par.push(seg);
+                        occ.push(false);
+                        rel.push(true);
+                        defc.push(0.0);
+                        nrd.push(0);
+                        deep.push(false);
+                    }
+                }
+            }
+            if bget(b.live_out, x) {
+                rel.set(@int_cast(usize, seg), true);
+            }
+            tail[bj] = seg;
+            continue;
+        }
         arr.clear();
         la.clear();
         let mut i = b.first;
@@ -2107,9 +2146,25 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8, nl:
             insert_start(b, sreload(f, t, rd, v, wreg[@int_cast(usize, pend)], c, slot));
             pend = -1;
         }
+        // (where it is not named, only the calls and jumps)
+        let evs = g.ev[bi].items();
+        let mut ek: usize = 0;
         i = b.first;
+        if not nm[bj] {
+            i = u.nil.[MInst]();
+            if evs.len > 0 {
+                i = evs[0];
+            }
+        }
         while u.notnil(i) {
-            let next = i.next;
+            let mut next = i.next;
+            if not nm[bj] {
+                ek += 1;
+                next = u.nil.[MInst]();
+                if ek < evs.len {
+                    next = evs[ek];
+                }
+            }
             let r = @int_cast(usize, find(&mut par, seg));
             if (pend >= 0) and is_jump(i) and not mentions(i, v) {
                 insert_before(b, i, sreload(f, t, rd, v, wreg[@int_cast(usize, pend)], c, slot));
@@ -2251,8 +2306,10 @@ fn split(f: *mut MFunc, t: *Target, g: *Cfg, x: usize, mode: i32, level: u8, nl:
     return true;
 }
 
-// Notes block bi in r's nl, if r is a spilled vreg of this round.
-fn note_near(iv: []Interval, named: []mut u.List.[i32], r: i32, bi: usize) void {
+// Notes block bi in r's nl (and that bi names it), if r is a spilled vreg
+// of this round.
+fn note_near(iv: []Interval, near: []mut u.List.[i32], named: []mut u.List.[bool], r: i32, bi: usize,
+             names: bool) void {
     if not is_vreg(r) {
         return;
     }
@@ -2260,9 +2317,12 @@ fn note_near(iv: []Interval, named: []mut u.List.[i32], r: i32, bi: usize) void 
     if (x >= iv.len) or not iv[x].spilled {
         return;
     }
-    let l = &mut named[x];
+    let l = &mut near[x];
     if (l.len == 0) or (l.get(l.len - 1) != @int_cast(i32, bi)) {
         l.push(@int_cast(i32, bi));
+        named[x].push(names);
+    } else if names {
+        named[x].set(named[x].len - 1, true);
     }
 }
 
@@ -2586,10 +2646,11 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
     let nb = f.blocks.len;
     let g = Cfg.{ npred: u.newn.[i32](nb + 1), nsucc: u.newn.[i32](nb + 1), simple: u.newn.[bool](nb + 1),
                   endok: u.newn.[bool](nb + 1), label: u.newn.[bool](nb + 1), near: u.newn.[bool](nb + 1),
-                  cidx: u.newn.[i32](nb + 1) };
+                  cidx: u.newn.[i32](nb + 1), ev: u.newn.[u.List.[*mut MInst]](nb + 1) };
     for bi in 0..nb {
         g.npred[bi] = 0;
         g.label[bi] = false;
+        g.ev[bi] = u.List.[*mut MInst].empty();
         // simple: no labels, and nothing but jumps after the first jump
         let b = f.blocks.get(bi);
         let mut ok = true;
@@ -2604,6 +2665,9 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
                 jumped = true;
             } else if jumped {
                 ok = false;
+            }
+            if jumped or (i.clobber != 0) {
+                g.ev[bi].push(i);
             }
             i = i.next;
         }
@@ -2631,8 +2695,10 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
     // order (splitting one adds no mention of another: its spill code names
     // only its own pieces): split looks at no other block
     let near = u.newn.[u.List.[i32]](nv + 1);
+    let named = u.newn.[u.List.[bool]](nv + 1);  // ... whether it names it
     for k in 0..nv {
         near[k] = u.List.[i32].empty();
+        named[k] = u.List.[bool].empty();
     }
     for bi in 0..nb {
         let b = f.blocks.get(bi);
@@ -2642,7 +2708,7 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             while bits != 0 {
                 let x = (w * 64) + @int_cast(usize, @ctz(bits));
                 bits = bits & (bits - 1);
-                note_near(iv, near, VREG0 + @int_cast(i32, x), bi);
+                note_near(iv, near, named, VREG0 + @int_cast(i32, x), bi, false);
             }
         }
         let mut i = b.first;
@@ -2650,10 +2716,10 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             for k in 0..i.ops.len {
                 let o = i.ops[k];
                 if o.kind == K_REG {
-                    note_near(iv, near, o.reg, bi);
+                    note_near(iv, near, named, o.reg, bi, true);
                 } else if o.kind == K_MEM {
-                    note_near(iv, near, o.base, bi);
-                    note_near(iv, near, o.index, bi);
+                    note_near(iv, near, named, o.base, bi, true);
+                    note_near(iv, near, named, o.index, bi, true);
                 }
             }
             i = i.next;
@@ -2671,6 +2737,7 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             continue;
         }
         let nl = near[k].items();
+        let nm = named[k].items();
         for j in 0..nl.len {
             g.near[@int_cast(usize, nl[j])] = true;
             g.cidx[@int_cast(usize, nl[j])] = @int_cast(i32, j);
@@ -2681,10 +2748,10 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
             // code that use it; then built again in each block reading it
             let mut sp = false;
             if lv == 0 {
-                sp = split(f, t, &g, k, SPLIT_LOOPS, 1, nl);
+                sp = split(f, t, &g, k, SPLIT_LOOPS, 1, nl, nm);
             }
             if not sp and (lv <= 1) {
-                sp = split(f, t, &g, k, SPLIT_GAPS, 2, nl);
+                sp = split(f, t, &g, k, SPLIT_GAPS, 2, nl, nm);
             }
             rm[k] = not sp;
             for j in 0..nl.len {
@@ -2694,13 +2761,13 @@ fn rewrite_spills(f: *mut MFunc, t: *Target, iv: []mut Interval) void {
         }
         let mut done = false;
         if lv == 0 {
-            done = split(f, t, &g, k, SPLIT_LOOPS, 1, nl);
+            done = split(f, t, &g, k, SPLIT_LOOPS, 1, nl, nm);
         }
         if not done and (lv <= 1) {
-            done = split(f, t, &g, k, SPLIT_GAPS, 2, nl);
+            done = split(f, t, &g, k, SPLIT_GAPS, 2, nl, nm);
         }
         if not done and (lv <= 2) {
-            done = split(f, t, &g, k, SPLIT_ALL, 3, nl);
+            done = split(f, t, &g, k, SPLIT_ALL, 3, nl, nm);
         }
         every[k] = not done;
         for j in 0..nl.len {
