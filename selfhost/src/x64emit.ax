@@ -28,6 +28,7 @@ pub let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0)
 pub let mut errors: bool = false;
 pub let mut AVX: bool = false;
 pub let mut UPPER: bool = false;  // the function uses ymm or zmm registers (vzeroupper before calls and returns)
+let mut DIRTY: bool = true;       // ... and may have written one since it was entered or last made a call
 pub let mut WIN: bool = false;    // Windows x64: its calling convention, and thread-locals through the TEB
 pub let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 pub let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
@@ -204,6 +205,52 @@ fn enc_imm(x: i64, n: i64) void {
 
 // After code with ymm or zmm registers, before code that may use the
 // legacy SSE encoding (which would otherwise pay to preserve the upper halves).
+// An instruction on 256 or 512 bits, which leaves the upper halves of the
+// vector registers in use.
+fn writes_wide(i: *mc.MInst) bool {
+    return (i.op == xe.SSE) and (i.sz >= 32);
+}
+
+// For each block: may the upper halves be in use on entry (vzeroupper
+// before a call or return only then)? The function is entered with them
+// clear, and a call returns with them clear.
+fn upper_dirty() []mut bool {
+    let nb = MF.blocks.len;
+    let din = u.newn.[bool](nb + 1);
+    let dout = u.newn.[bool](nb + 1);
+    if not UPPER {
+        return din;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in 0..nb {
+            let b = MF.blocks.get(bi);
+            let mut d = din[bi];
+            let mut i = b.first;
+            while u.notnil(i) {
+                if writes_wide(i) {
+                    d = true;
+                } else if i.op == xe.CALL {
+                    d = false;
+                }
+                i = i.next;
+            }
+            if d and not dout[bi] {
+                dout[bi] = true;
+                for k in 0..b.succs.len {
+                    let si = @int_cast(usize, b.succs.get(k));
+                    if not din[si] {
+                        din[si] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    return din;
+}
+
 fn vzeroupper() void {
     b8(0xc5);
     b8(0xf8);
@@ -1196,9 +1243,10 @@ fn enc_inst(i: *mut mc.MInst) void {
     }
     if op == xe.CALL {
         let t = i.ops[0];
-        if UPPER {
+        if UPPER and DIRTY {
             vzeroupper();
         }
+        DIRTY = false;  // (the callee returns with the upper halves clear)
         if frameless or in_noframe {
             // sub rsp, 8: the call (which does not return) needs rsp aligned
             b8(0x48);
@@ -1216,7 +1264,7 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.RET {
-        if UPPER {
+        if UPPER and DIRTY {
             vzeroupper();
         }
         epilogue();
@@ -2477,6 +2525,7 @@ pub fn encode_func(f: *mut ir.Func) void {
     let text = OBJ.secs.get(@int_cast(usize, TEXT));
     FBASE = (@as(u64, text.data.len()) + @as(u64, FPAD) + FALIGN - 1) & ~(FALIGN - 1);
     let lal = loop_aligned(skip);
+    let dirty_in = upper_dirty();
     // again if relax_jumps finds jumps that take a rel8, and after that while
     // unrelax_jumps finds that padding left some of them out of reach
     let mut pass: i32 = 0;
@@ -2516,8 +2565,12 @@ pub fn encode_func(f: *mut ir.Func) void {
                 noframe.push(@as(u64, E.b.len()));
                 in_noframe = b.noframe;
             }
+            DIRTY = dirty_in[bi];
             let mut i = b.first;
             while u.notnil(i) {
+                if writes_wide(i) {
+                    DIRTY = true;  // (no call or return writes a vector register)
+                }
                 if WIN and (i.src != 0) and (i.src != last_src) {
                     rows.push((@as(u64, E.b.len()) << 32) | @as(u64, i.src));
                     last_src = i.src;
