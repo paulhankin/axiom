@@ -535,11 +535,13 @@ fn copy_cost(b: *ir.Block) i32 {
 // an edge (P, B) affects only the subtree of nca(P, B) = idom(B), inserting
 // one (N, S), N new after P, that of nca(P, S)), and so are all the blocks
 // the threading changed (P's terminator, B, S, the repair's phis in blocks
-// B dominates). That subtree is marked dirty, and later blocks in the order
-// are threaded only where nothing the threading reads is dirty: the block,
-// its predecessors, the blocks it dominates, and their predecessors and
-// successors.
+// B dominates). That subtree is marked dirty (and its root's dominators as
+// dominating something dirty), and later blocks in the order are threaded
+// only where nothing the threading reads is dirty: the block, the blocks it
+// dominates (and so their predecessors, but for the block's own), its
+// predecessors and its successors.
 let mut dirty: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
+let mut above: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
 
 // A block whose analysis still holds: in the order (blocks made by threading
 // are not), and not dirty. (Blocks that were unreachable stay unreachable.)
@@ -553,35 +555,21 @@ fn clean(order: *u.List.[*mut ir.Block], x: *mut ir.Block) bool {
 
 // Is everything threading b reads clean?
 fn region_clean(order: *u.List.[*mut ir.Block], b: *mut ir.Block) bool {
-    if b.rpo < 0 {
+    if (b.rpo < 0) or not clean(order, b) or above.get(@int_cast(usize, b.rpo)) {
         return false;
     }
-    let mut work = u.List.[*mut ir.Block].empty();
-    work.push(b);
-    let mut ok = true;
-    while ok and (work.len > 0) {
-        let x = work.pop();
-        if not clean(order, x) {
-            ok = false;
-            break;
-        }
-        for k in 0..x.preds.len {
-            if not clean(order, x.preds.get(k)) {
-                ok = false;
-            }
-        }
-        let t = ir.terminator(x);
-        for j in 0..ir.succ_count(t) {
-            if not clean(order, ir.succ(t, j)) {
-                ok = false;
-            }
-        }
-        for k in 0..x.dom_kids.len {
-            work.push(x.dom_kids.get(k));
+    for k in 0..b.preds.len {
+        if not clean(order, b.preds.get(k)) {
+            return false;
         }
     }
-    work.deinit();
-    return ok;
+    let t = ir.terminator(b);
+    for j in 0..ir.succ_count(t) {
+        if not clean(order, ir.succ(t, j)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn nca(a0: *mut ir.Block, b0: *mut ir.Block) *mut ir.Block {
@@ -613,6 +601,14 @@ fn thread_marked(f: *mut ir.Func, order: *u.List.[*mut ir.Block], b: *mut ir.Blo
     }
     outside_uses(b);
     thread(f, b, p, s, cond);
+    let mut d = r.idom;
+    while (d != r) and not above.get(@int_cast(usize, d.rpo)) {
+        above.set(@int_cast(usize, d.rpo), true);
+        if d == d.idom {
+            break;  // (the entry)
+        }
+        d = d.idom;
+    }
     let mut work = u.List.[*mut ir.Block].empty();
     work.push(r);
     while work.len > 0 {
@@ -637,8 +633,10 @@ fn thread_some(f: *mut ir.Func, preds_ok: bool, max: i32) i32 {
     }
     let order = opt.dominators(f);
     dirty.clear();
+    above.clear();
     for _k in 0..order.len {
         dirty.push(false);
+        above.push(false);
     }
     let mut done: i32 = 0;
     for bi in 1..order.len {
