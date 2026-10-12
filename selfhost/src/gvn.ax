@@ -238,6 +238,14 @@ fn mem_hash(base: *ir.Value, off: i64, ty: *ir.Ty) u64 {
 // -----------------------------------------------------------------------------
 // Alias analysis
 // -----------------------------------------------------------------------------
+// The result of a call of the allocator: an object of its own.
+fn fresh(v: *ir.Value) bool {
+    if not ir.is_op(v, ir.OP_CALL) or (v.a.kind != ir.V_FUNC) {
+        return false;
+    }
+    return v.a.fnp.allocator;
+}
+
 fn is_obj(v: *ir.Value) bool {
     return ir.is_op(v, ir.OP_ALLOCA) or (v.kind == ir.V_GLOBAL);
 }
@@ -327,6 +335,8 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
     let mut obj = vnil();
     if is_obj(p) {
         obj = p;
+    } else if ir.is_op(p, ir.OP_INTTOPTR) and fresh(ir.resolve(p.a)) {
+        obj = ir.resolve(p.a);
     } else if ir.is_op(p, ir.OP_SELECT) and noalias_global(p.b) {
         // wasm: the thread's shadow stack record, or the main thread's
         obj = p.b;
@@ -405,6 +415,23 @@ fn may_alias(x: *Loc, w: *Write) bool {
         return false;
     }
     return true;
+}
+
+// Can the store st not write what the load ld reads? (Their objects differ,
+// or the same address with offsets that do not overlap; what holds without
+// the facts the passes record.)
+pub fn store_apart(st: *mut ir.Value, ld: *mut ir.Value) bool {
+    if (st.op != ir.OP_STORE) or (st.flags != 0) or (ld.op != ir.OP_LOAD) or (ld.flags != 0) {
+        return false;
+    }
+    let l = loc_of(ld.a, @bit_cast(i64, ld.ty.size));
+    let w = loc_of(st.b, @bit_cast(i64, st.a.ty.size));
+    // (not the shadow stack's object, which loc_of takes from a select)
+    if u.notnil(l.obj) and u.notnil(w.obj) and (l.obj != w.obj) and not noalias_global(l.obj) and
+       not noalias_global(w.obj) {
+        return true;
+    }
+    return (l.base == w.base) and not overlap(l.off, l.size, w.off, w.size);
 }
 
 // -----------------------------------------------------------------------------

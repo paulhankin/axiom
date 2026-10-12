@@ -23,6 +23,7 @@
 // (unless the exit only traps: then the header's values may be used after
 // the loop).
 // =============================================================================
+import "gvn.ax" as gvn;
 import "ir.ax" as ir;
 import "opt.ax" as opt;
 import "util.ax" as u;
@@ -746,6 +747,302 @@ pub fn full_unroll(f: *mut ir.Func) bool {
     }
     members.deinit();
     order.deinit();
+    return did;
+}
+
+// -----------------------------------------------------------------------------
+// Loop fusion: two loops in a row with the same constant trip count,
+//
+//   for k in 0..n { s += a[k] * b[k * n + j] }      r[j] = s
+//   for k in 0..n { t += a[k] * b[k * n + j + 1] }  r[j + 1] = t
+//
+// (an outer loop unrolled partially) become one loop running both bodies,
+// where the chains of dependent operations (the two sums, each in its own
+// order still) overlap. Neither loop writes memory or leaves other than at
+// its header; the second uses nothing the first or the code between them
+// computes, and reads nothing that code writes, so the code between runs
+// after the fused loop.
+// -----------------------------------------------------------------------------
+const JAM_SIZE: i64 = 160;
+
+// Is the loop at h (members marked tag) one fusion takes: entered at h,
+// leaving only from h's test, one latch, no loop inside, writing nothing?
+// Sets *latch and *exit (h's successor outside), and *stay.
+fn jam_shape(h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block], latch: *mut *mut ir.Block,
+             exit: *mut *mut ir.Block, stay: *mut *mut ir.Block) bool {
+    let t = ir.terminator(h);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) {
+        return false;
+    }
+    if (t.t1.mark == tag) and (t.t2.mark != tag) {
+        stay.* = t.t1;
+        exit.* = t.t2;
+    } else if (t.t2.mark == tag) and (t.t1.mark != tag) {
+        stay.* = t.t2;
+        exit.* = t.t1;
+    } else {
+        return false;
+    }
+    let mut l = ir.bnil();
+    for k in 0..h.preds.len {
+        let p = h.preds.get(k);
+        if p.mark == tag {
+            if u.notnil(l) {
+                return false;
+            }
+            l = p;
+        }
+    }
+    if u.isnil(l) or has_side_exits(h, tag, members, true) {
+        return false;
+    }
+    latch.* = l;
+    for k in 0..members.len {
+        let x = members.get(k);
+        if x != h {
+            for j in 0..x.preds.len {
+                let p = x.preds.get(j);
+                if (p.mark == tag) and opt.is_back_edge(p, x) {
+                    return false;  // a loop inside
+                }
+            }
+        }
+        let mut i = x.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_ALLOCA) or (ir.has_effects(i) and not ir.is_term(i.op)) {
+                return false;
+            }
+            i = i.next;
+        }
+    }
+    return true;
+}
+
+// Is v defined in block b or in the loop marked tag?
+fn from_either(v: *mut ir.Value, b: *mut ir.Block, tag: i64) bool {
+    return u.notnil(v) and (v.kind == ir.V_INST) and u.notnil(v.blk) and ((v.blk == b) or (v.blk.mark == tag));
+}
+
+fn takes_from(i: *mut ir.Value, b: *mut ir.Block, tag: i64) bool {
+    if from_either(ir.resolve(i.a), b, tag) or from_either(ir.resolve(i.b), b, tag) or
+       from_either(ir.resolve(i.c), b, tag) {
+        return true;
+    }
+    for k in 0..i.xs.len {
+        if from_either(ir.resolve(i.xs.get(k)), b, tag) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn detach(v: *mut ir.Value) void {
+    let b = v.blk;
+    if u.notnil(v.prev) {
+        v.prev.next = v.next;
+    } else {
+        b.first = v.next;
+    }
+    if u.notnil(v.next) {
+        v.next.prev = v.prev;
+    } else {
+        b.last = v.prev;
+    }
+    v.prev = vnil();
+    v.next = vnil();
+}
+
+fn try_jam(f: *mut ir.Func, h1: *mut ir.Block, tag1: i64, m1: *u.List.[*mut ir.Block],
+           m2: *mut u.List.[*mut ir.Block]) bool {
+    let mut l1 = ir.bnil();
+    let mut e1 = ir.bnil();
+    let mut s1 = ir.bnil();
+    if not jam_shape(h1, tag1, m1, &mut l1, &mut e1, &mut s1) or (e1.preds.len != 1) or (e1.first.op == ir.OP_PHI) {
+        return false;
+    }
+    let t = ir.terminator(e1);
+    if u.isnil(t) or (t.op != ir.OP_BR) {
+        return false;
+    }
+    let h2 = t.t1;
+    if (h2 == h1) or (h2.mark == tag1) or (h2.preds.len != 2) or not opt.is_loop_header(h2) {
+        return false;
+    }
+    unroll_mark += 1;
+    let tag2 = unroll_mark;
+    opt.members_of(h2, tag2, m2);
+    let mut l2 = ir.bnil();
+    let mut e2 = ir.bnil();
+    let mut s2 = ir.bnil();
+    if not jam_shape(h2, tag2, m2, &mut l2, &mut e2, &mut s2) {
+        return false;
+    }
+    if (loop_size(m1) + loop_size(m2)) > JAM_SIZE {
+        return false;
+    }
+    let mut st = ir.bnil();
+    let n1 = trip_count(h1, tag1, &mut st);
+    let n2 = trip_count(h2, tag2, &mut st);
+    if (n1 < 1) or (n1 != n2) {
+        return false;
+    }
+    // the code between: it may only store, where the second loop reads nothing
+    let mut i = e1.first;
+    while u.notnil(i) {
+        if ir.has_effects(i) and not ir.is_term(i.op) and ((i.op != ir.OP_STORE) or (i.flags != 0)) {
+            return false;
+        }
+        i = i.next;
+    }
+    for k in 0..m2.len {
+        let x = m2.get(k);
+        i = x.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_PHI) and (x == h2) {
+                // (its start, along the edge from e1)
+                for j in 0..i.xs.len {
+                    if from_either(ir.resolve(i.xs.get(j)), e1, tag1) {
+                        return false;
+                    }
+                }
+            } else if takes_from(i, e1, tag1) {
+                return false;
+            }
+            if i.op == ir.OP_LOAD {
+                let mut w = e1.first;
+                while u.notnil(w) {
+                    if (w.op == ir.OP_STORE) and not gvn.store_apart(w, i) {
+                        return false;
+                    }
+                    w = w.next;
+                }
+            }
+            i = i.next;
+        }
+    }
+    // values of h2 used past the loop: only its phis (which become h1's)
+    let mut b = f.first;
+    while u.notnil(b) {
+        if b.mark != tag2 {
+            i = b.first;
+            while u.notnil(i) {
+                if takes_from(i, h2, -1) {
+                    let mut ok = true;
+                    let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+                    for k in @as(usize, 0)..3 {
+                        let o = ir.resolve(ops[k]);
+                        if u.notnil(o) and (o.blk == h2) and (o.op != ir.OP_PHI) {
+                            ok = false;
+                        }
+                    }
+                    for k in 0..i.xs.len {
+                        let o = ir.resolve(i.xs.get(k));
+                        if (o.kind == ir.V_INST) and (o.blk == h2) and (o.op != ir.OP_PHI) {
+                            ok = false;
+                        }
+                    }
+                    if not ok {
+                        return false;
+                    }
+                }
+                i = i.next;
+            }
+        }
+        b = b.next;
+    }
+    // h1's back edge comes from l2 now
+    let mut p = h1.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        for j in 0..p.bs.len {
+            if p.bs.get(j) == l1 {
+                p.bs.set(j, l2);
+            }
+        }
+        p = p.next;
+    }
+    // h2's phis into h1: their start along h1's edges from outside
+    let first = h1.first;
+    while h2.first.op == ir.OP_PHI {
+        let q = h2.first;
+        let mut start = vnil();
+        let mut back = vnil();
+        for j in 0..q.bs.len {
+            if q.bs.get(j) == e1 {
+                start = q.xs.get(j);
+            } else {
+                back = q.xs.get(j);
+            }
+        }
+        detach(q);
+        q.xs.clear();
+        q.bs.clear();
+        for k in 0..h1.preds.len {
+            let o = h1.preds.get(k);
+            if o == l1 {
+                q.xs.push(back);
+                q.bs.push(l2);
+            } else {
+                q.xs.push(start);
+                q.bs.push(o);
+            }
+        }
+        ir.insert_before(first, q);
+    }
+    let t2 = ir.terminator(h2);
+    t2.op = ir.OP_BR;
+    t2.a = vnil();
+    t2.t1 = s2;
+    t2.t2 = ir.bnil();
+    ir.retarget(l1, h1, h2);
+    ir.retarget(l2, h2, h1);
+    ir.retarget(e1, h2, e2);
+    p = e2.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        for j in 0..p.bs.len {
+            if p.bs.get(j) == h2 {
+                p.bs.set(j, e1);
+            }
+        }
+        p = p.next;
+    }
+    return true;
+}
+
+// Fuses one pair of loops of f; true if it did (the caller simplifies f and
+// calls again, for a third loop after the two).
+pub fn jam_loops(f: *mut ir.Func) bool {
+    if u.isnil(f.first) {
+        return false;
+    }
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) and not any {
+        any = maybe_header(b);
+        b = b.next;
+    }
+    if not any {
+        return false;
+    }
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    let mut m1 = u.List.[*mut ir.Block].empty();
+    let mut m2 = u.List.[*mut ir.Block].empty();
+    let mut did = false;
+    for k in 1..order.len {
+        let h = order.get(k);
+        if did or not opt.is_loop_header(h) {
+            continue;
+        }
+        unroll_mark += 1;
+        opt.members_of(h, unroll_mark, &mut m1);
+        did = try_jam(f, h, unroll_mark, &m1, &mut m2);
+    }
+    m1.deinit();
+    m2.deinit();
+    order.deinit();
+    if did {
+        opt.compute_preds(f);
+    }
     return did;
 }
 
