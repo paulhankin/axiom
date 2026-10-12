@@ -324,11 +324,25 @@ struct Slp {
     ok: bool,
     cost: i32,                     // vector instructions
     first: *mut ir.Value,          // the chunk's first store (vector loads go before it)
+    last: *mut ir.Value,           // ... and its last
+    sts: []mut *mut ir.Value,      // its stores
+    skip: i32,                     // the depth at which vec_of is weighing its lanes' operations
     tree: u.List.[*mut ir.Value],  // the scalar instructions done in vector lanes
 }
 
 fn new_lanes(n: usize) []mut *mut ir.Value {
     return u.calloc_slice.[*mut ir.Value](n);
+}
+
+// Are all the lanes instructions with uses besides this one (which the
+// scalar code keeps)?
+fn all_shared(xs: []mut *mut ir.Value) bool {
+    for k in 0..xs.len {
+        if (xs[k].kind != ir.V_INST) or (xs[k].uses < 2) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn lane_const(v: *ir.Value) bool {
@@ -678,7 +692,10 @@ fn neighbour_loads(s: *mut Slp, xs: []mut *mut ir.Value) bool {
     let mut off0: i64 = 0;
     for k in 0..xs.len {
         let ld = xs[k];
-        if (ld.flags != 0) or (ld.ty != t) or (ld.blk != s.first.blk) or not before(ld, s.first) {
+        if (ld.flags != 0) or (ld.ty != t) or (ld.blk != s.first.blk) {
+            return false;
+        }
+        if not before(ld, s.first) and (not before(ld, s.last) or stored_before(ld, s.first, s.sts)) {
             return false;
         }
         let mut p = ir.resolve(ld.a);
@@ -735,7 +752,28 @@ fn vec_of(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32) *mut
         return ir.splat(s.B, vt, xs[0]);
     }
     let x0 = xs[0];
-    let gather = (depth >= SLP_DEPTH) or (x0.kind != ir.V_INST) or (x0.blk != s.first.blk) or not all_op(xs, x0.op);
+    let mut gather = (depth >= SLP_DEPTH) or (x0.kind != ir.V_INST) or (x0.blk != s.first.blk) or not all_op(xs, x0.op);
+    if not gather and (s.skip != depth) and all_shared(xs) {
+        // lanes the scalar code keeps computing: put them together if that
+        // is cheaper than doing their operations in vector lanes too
+        let c0 = s.cost;
+        let t0 = s.tree.len;
+        let e0 = s.emit;
+        let k0 = s.skip;
+        s.emit = false;
+        s.skip = depth;
+        _ = vec_of(s, xs, vt, depth);
+        let vcost = s.cost - c0;
+        let vok = s.ok;
+        s.cost = c0;
+        s.tree.len = t0;
+        s.emit = e0;
+        s.skip = k0;
+        s.ok = true;
+        if not vok or (vcost >= @as(i32, @int_cast(i32, n))) {
+            gather = true;
+        }
+    }
     if not gather {
         let op = x0.op;
         if op == ir.OP_SELECT {
@@ -942,13 +980,46 @@ fn dead_cost(s: *mut Slp, sts: []mut *mut ir.Value) i32 {
     return c;
 }
 
+// Might a store of sts from first up to load ld write what it reads? (true
+// unless it reads from the stores' base, outside the stores before it)
+fn stored_before(ld: *mut ir.Value, first: *mut ir.Value, sts: []mut *mut ir.Value) bool {
+    let mut base = vnil();
+    let mut o: i64 = 0;
+    if not store_parts(sts[0], &mut base, &mut o) {
+        return true;
+    }
+    let mut lo: i64 = 0;
+    if not load_parts(ld, base, &mut lo) {
+        return true;
+    }
+    let ls = @bit_cast(i64, ld.ty.size);
+    let mut x = first;
+    while u.notnil(x) and (x != ld) {
+        for k in 0..sts.len {
+            if sts[k] == x {
+                let mut sb = vnil();
+                let mut so: i64 = 0;
+                _ = store_parts(x, &mut sb, &mut so);
+                let ss = @bit_cast(i64, ir.resolve(x.a).ty.size);
+                if (so < (lo + ls)) and (lo < (so + ss)) {
+                    return true;
+                }
+            }
+        }
+        x = x.next;
+    }
+    return false;
+}
+
 // Is anything but the stores sts reading or writing memory from the first
 // of them to the last (which the vector store replaces)?
 fn others_between(first: *mut ir.Value, last: *mut ir.Value, sts: []mut *mut ir.Value) bool {
     let mut i = first;
     while u.notnil(i) and (i != last) {
         let op = i.op;
-        if op == ir.OP_STORE {
+        if (op == ir.OP_LOAD) and not stored_before(i, first, sts) {
+            // (a load the stores before it do not write: they may move past it)
+        } else if op == ir.OP_STORE {
             let mut mine = false;
             for k in 0..sts.len {
                 if sts[k] == i {
@@ -995,7 +1066,7 @@ fn store_chunk(f: *mut ir.Func, sts: []mut *mut ir.Value, nbytes: i64) bool {
         lanes[k] = ir.resolve(sts[k % n].a);
     }
     let vt = ir.t_vec(et, @int_cast(u32, n * reps));
-    let mut s = Slp.{ B: ir.new_builder(), emit: false, ok: true, cost: 1, first: first,
+    let mut s = Slp.{ B: ir.new_builder(), emit: false, ok: true, cost: 1, first: first, last: last, sts: sts, skip: -1,
                       tree: u.List.[*mut ir.Value].empty() };
     ir.at_before(s.B, last);
     _ = vec_of(&mut s, lanes, vt, 0);
@@ -1027,6 +1098,24 @@ fn store_chunk(f: *mut ir.Func, sts: []mut *mut ir.Value, nbytes: i64) bool {
     s.tree.deinit();
     _ = f;
     return done;
+}
+
+// A plain load of a scalar from base + a constant (its offset in off).
+fn load_parts(ld: *mut ir.Value, base: *mut ir.Value, off: *mut i64) bool {
+    if (ld.op != ir.OP_LOAD) or (ld.flags != 0) or (ld.ty.kind == ir.T_VEC) or (ld.ty.size == 0) or (ld.ty.size > 64) {
+        return false;
+    }
+    let mut p = ir.resolve(ld.a);
+    let mut o: i64 = 0;
+    if ir.is_op(p, ir.OP_PTRADD) and ir.is_cint(ir.resolve(p.b)) {
+        o = ir.sval(ir.resolve(p.b));
+        p = ir.resolve(p.a);
+    }
+    if p != base {
+        return false;
+    }
+    off.* = o;
+    return true;
 }
 
 // A store this pass may combine: of a scalar, plain, at base + a constant.
@@ -1069,9 +1158,12 @@ fn block_stores(f: *mut ir.Func, b: *mut ir.Block, vbytes: i64) bool {
         let t = ir.resolve(i.a).ty;
         let size = @bit_cast(i64, t.size);
         // the stores of the same type to base + off + k * size before i in
-        // b, back to the first other access to memory
+        // b, back to the first other access to memory (but loads from base
+        // that the stores before them do not overlap: the vector store
+        // moves those stores past them)
         let mut sts = u.List.[*mut ir.Value].empty();
         let mut offs = u.List.[i64].empty();
+        let mut lds = u.List.[i64].empty();  // (offset, size) of the loads passed
         let mut j = i;
         while u.notnil(j) {
             let mut jb = vnil();
@@ -1084,6 +1176,13 @@ fn block_stores(f: *mut ir.Func, b: *mut ir.Block, vbytes: i64) bool {
                             dup = true;
                         }
                     }
+                    let mut k2: usize = 0;
+                    while k2 < lds.len {
+                        if (jo < (lds.get(k2) + lds.get(k2 + 1))) and (lds.get(k2) < (jo + size)) {
+                            dup = true;  // (read after it: it cannot move)
+                        }
+                        k2 += 2;
+                    }
                     if dup {
                         break;
                     }
@@ -1091,11 +1190,15 @@ fn block_stores(f: *mut ir.Func, b: *mut ir.Block, vbytes: i64) bool {
                     offs.push(jo);
                     j.aux = slp_gen;
                 }
+            } else if load_parts(j, base, &mut jo) {
+                lds.push(jo);
+                lds.push(@bit_cast(i64, j.ty.size));
             } else if ir.op_accesses_mem(j.op) or (j.op == ir.OP_INTR) {
                 break;
             }
             j = j.prev;
         }
+        lds.deinit();
         // sorted by offset (insertion: runs are short)
         let m = sts.len;
         for a in 1..m {
@@ -1345,8 +1448,8 @@ fn splat_group(f: *mut ir.Func, b: *mut ir.Block, xs: []mut *mut ir.Value) bool 
         if not ok {
             break;
         }
-        let mut s = Slp.{ B: ir.new_builder(), emit: false, ok: true, cost: 0, first: first,
-                          tree: u.List.[*mut ir.Value].empty() };
+        let mut s = Slp.{ B: ir.new_builder(), emit: false, ok: true, cost: 0, first: first, last: first,
+                          sts: u.nil_slice.[*mut ir.Value](), skip: -1, tree: u.List.[*mut ir.Value].empty() };
         ir.at_before(s.B, first);
         _ = vec_of(&mut s, lanes, vt, 0);
         ok = s.ok;
@@ -1379,8 +1482,8 @@ fn splat_group(f: *mut ir.Func, b: *mut ir.Block, xs: []mut *mut ir.Value) bool 
                 lanes[k] = ir.resolve(ir.incoming(xs[k], b.preds.get(w)));
             }
         }
-        let mut s = Slp.{ B: ir.new_builder(), emit: true, ok: true, cost: 0, first: first,
-                          tree: u.List.[*mut ir.Value].empty() };
+        let mut s = Slp.{ B: ir.new_builder(), emit: true, ok: true, cost: 0, first: first, last: first,
+                          sts: u.nil_slice.[*mut ir.Value](), skip: -1, tree: u.List.[*mut ir.Value].empty() };
         ir.at_before(s.B, first);
         let x = vec_of(&mut s, lanes, vt, 0);
         if phis {
