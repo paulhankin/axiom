@@ -737,6 +737,10 @@ fn vsrc(x: *mut ir.Value) mc.MOp {
     if em.AVX and (x.ty.kind == ir.T_VEC) and ir.is_op(x, ir.OP_LOAD) and ((x.flag & 8) != 0) {
         return addr(x.a);
     }
+    // (a scalar's memory operand takes any alignment, with or without VEX)
+    if (x.ty.kind == ir.T_FLOAT) and ir.is_op(x, ir.OP_LOAD) and ((x.flag & 8) != 0) {
+        return addr(x.a);
+    }
     return R(reg(x));
 }
 
@@ -2446,7 +2450,8 @@ fn commutes(o: i32) bool {
 // v's operands as a vector instruction reads them: the first a register,
 // the second its r/m operand (a load folded into it goes there).
 fn vsrc_of(v: *mut ir.Value, a: *mut i32) mc.MOp {
-    if commutes(v.op) and (v.ty.kind == ir.T_VEC) and ir.is_op(v.a, ir.OP_LOAD) and ((v.a.flag & 8) != 0) {
+    if commutes(v.op) and ((v.ty.kind == ir.T_VEC) or (v.ty.kind == ir.T_FLOAT)) and ir.is_op(v.a, ir.OP_LOAD) and
+       ((v.a.flag & 8) != 0) {
         a.* = reg(v.b);
         return vsrc(v.a);
     }
@@ -4493,6 +4498,15 @@ fn insert_lane(d: i32, a: i32, x: i32, t: *ir.Ty, lane: i64) void {
         }
         return;
     }
+    if is.lane_float(t) and (b == 64) and (lane < 2) {
+        // shufpd: [x0, a1] or [a0, x0] (not through memory)
+        if lane == 0 {
+            sse3_i(xe.SHUFPD, d, x, R(a), 2);
+        } else {
+            sse3_i(xe.SHUFPD, d, a, R(x), 0);
+        }
+        return;
+    }
     if not is.lane_float(t) and ((b == 64) or ((b == 32) and (lane < 4))) {
         // the integer into an xmm register (movd / movq), then into its lane
         // as a float lane would be (shuffles of bits: no arithmetic)
@@ -6167,6 +6181,14 @@ fn mark_fused_vectors(f: *mut ir.Func) void {
                quiet_between(i, i.user) {
                 i.flag = i.flag | 8;
             }
+            // a scalar float load that is the r/m operand of its only user,
+            // an arithmetic operation (addsd xmm, [m])
+            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_FLOAT) and
+               ((i.ty.bits == 32) or (i.ty.bits == 64)) and u.notnil(i.user) and (i.user.blk == b) and
+               (i.user.ty == i.ty) and (i.user.op >= ir.OP_FADD) and (i.user.op <= ir.OP_FDIV) and
+               (i.user.flag == 0) and scalar_rm(i.user, i) and quiet_between(i, i.user) {
+                i.flag = i.flag | 8;
+            }
             // a scalar load only splatted: a broadcast from memory
             if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and
                ((i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
@@ -6220,6 +6242,18 @@ fn fuse_masked(x: *mut ir.Value, us: *mut ir.Value) void {
     }
     o.flag = o.flag | 256;
     x.flag = x.flag | 256;
+}
+
+// Does scalar float operation us read x (only) as its r/m operand, through
+// vsrc_of (one memory operand)?
+fn scalar_rm(us: *ir.Value, x: *mut ir.Value) bool {
+    if us.a == us.b {
+        return false;
+    }
+    if us.b == x {
+        return not folded_load(us.a);
+    }
+    return commutes(us.op) and (us.a == x) and not folded_load(us.b) and not ir.is_op(us.b, ir.OP_LOAD);
 }
 
 // Does vector instruction us read x (only) as its r/m operand, through vsrc?
