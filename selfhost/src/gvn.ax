@@ -4459,15 +4459,55 @@ fn trap_exit(x: *mut ir.Block, tag: i64) bool {
     return true;
 }
 
-// The bound L of a check i < L ending block x (trapping otherwise), or nil.
-fn check_bound(x: *mut ir.Block, i: *mut ir.Value, tag: i64) *mut ir.Value {
+// The invariant terms of the sum v of i and them, in split_terms; the
+// number of times i is a term (-1: v is not such a sum).
+let mut split_terms: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                       len: 0, cap: 0 };
+
+fn sum_terms(v0: *mut ir.Value, i: *mut ir.Value, tag: i64, depth: i32) i32 {
+    let v = ir.resolve(v0);
+    if v == i {
+        return 1;
+    }
+    if invariant(v, tag) {
+        split_terms.push(v);
+        return 0;
+    }
+    if (depth > 4) or not ir.is_op(v, ir.OP_ADD) or (v.ty != i.ty) {
+        return -1;
+    }
+    let a = sum_terms(v.a, i, tag, depth + 1);
+    if a < 0 {
+        return -1;
+    }
+    let b = sum_terms(v.b, i, tag, depth + 1);
+    if b < 0 {
+        return -1;
+    }
+    return a + b;
+}
+
+// The bound L of a check i < L ending block x (trapping otherwise), or nil;
+// of a check i + d < L (d invariant: an index from a base, `a[base + i]`),
+// L with *off set to d.
+fn check_bound(x: *mut ir.Block, i: *mut ir.Value, tag: i64, off: *mut *mut ir.Value) *mut ir.Value {
+    off.* = vnil();
     let t = ir.terminator(x);
     if u.isnil(t) or (t.op != ir.OP_CONDBR) {
         return vnil();
     }
     let c = ir.resolve(t.a);
-    if not ir.is_op(c, ir.OP_ICMP) or (ir.resolve(c.a) != i) {
+    if not ir.is_op(c, ir.OP_ICMP) {
         return vnil();
+    }
+    let ca = ir.resolve(c.a);
+    if ca != i {
+        // a sum of i and invariant terms (copies of an unrolled body add 1, 2, ...)
+        split_terms.clear();
+        if not ir.is_op(ca, ir.OP_ADD) or (ca.ty != i.ty) or (sum_terms(ca, i, tag, 0) != 1) {
+            return vnil();
+        }
+        off.* = ca;
     }
     let l = ir.resolve(c.b);
     if (l.ty != i.ty) or not invariant(l, tag) {
@@ -4510,6 +4550,8 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     }
     // the checks, the other exits, the size
     let mut bounds = u.List.[*mut ir.Value].empty();
+    let mut offs = u.List.[*mut ir.Value].empty();
+    let mut checked = u.List.[*mut ir.Block].empty();  // blocks of i + d < L checks
     let mut n: i32 = 0;
     let mut ok = true;
     for k in 0..members.len {
@@ -4530,22 +4572,29 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
             }
         }
         if x != h {
-            let l = check_bound(x, i, tag);
+            let mut d = vnil();
+            let l = check_bound(x, i, tag, &mut d);
             if u.notnil(l) {
                 let mut seen = false;
                 for j in 0..bounds.len {
-                    if bounds.get(j) == l {
+                    if (bounds.get(j) == l) and (offs.get(j) == d) {
                         seen = true;
                     }
                 }
                 if not seen {
                     bounds.push(l);
+                    offs.push(d);
+                }
+                if u.notnil(d) {
+                    checked.push(x);
                 }
             }
         }
     }
     if not ok or (n > SPLIT_MAX) or (bounds.len == 0) {
         bounds.deinit();
+        offs.deinit();
+        checked.deinit();
         return false;
     }
     _ = make_preheader(f, h, tag);
@@ -4561,12 +4610,38 @@ fn try_split(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut
     ir.at_before(bld, pt);
     let mut m = end;
     for k in 0..bounds.len {
-        let l = bounds.get(k);
+        let mut l = bounds.get(k);
+        let x = offs.get(k);
+        if u.notnil(x) {
+            // x = i + d (the sum of d's terms) < L holds for i < L - d
+            // (none when d > L)
+            split_terms.clear();
+            _ = sum_terms(x, i, tag, 0);
+            let mut d = split_terms.get(0);
+            for j in 1..split_terms.len {
+                d = ir.binop(bld, ir.OP_ADD, d, split_terms.get(j));
+            }
+            l = ir.select(bld, ir.icmp(bld, ir.IntULE, d, l), ir.binop(bld, ir.OP_SUB, l, d), ir.cint(l.ty, 0));
+        }
         m = ir.select(bld, ir.icmp(bld, ir.IntULT, m, l), m, l);
     }
     bounds.deinit();
+    offs.deinit();
     // the copy
     opt.clone_members(f, members, tag);
+    // (its checks of i + d < L pass: they go straight on)
+    for k in 0..checked.len {
+        let ct = ir.terminator(@ptr_cast(*mut ir.Block, checked.get(k).auxp));
+        if ir.pred_of(ir.resolve(ct.a)) == ir.IntULT {
+            ct.t2 = ir.bnil();
+        } else {
+            ct.t1 = ct.t2;
+            ct.t2 = ir.bnil();
+        }
+        ct.op = ir.OP_BR;
+        ct.a = vnil();
+    }
+    checked.deinit();
     // the copy leaves at i >= m for mid, which enters the loop
     let h2 = @ptr_cast(*mut ir.Block, h.auxp);
     let ht2 = ir.terminator(h2);
