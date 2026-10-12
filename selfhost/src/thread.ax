@@ -1332,6 +1332,313 @@ fn sink_stores(d: *mut ir.Block) bool {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Two ways from a test of loaded data to a join, each a few speculatable
+// instructions and one store to the same address (the merge step of a merge
+// sort: tmp[k] = xs[a]; a += 1, or tmp[k] = xs[b]; b += 1), become selects
+// and one store before the test, which then goes straight to the join: no
+// branch to mispredict on data. The ways may pass tests that the branches
+// into the test decide (the bounds check of xs[b] after b < n), and blocks
+// that other ways also reach (their instructions are copied). Their loads
+// read what the test's block loads already.
+// -----------------------------------------------------------------------------
+const WAY_BLOCKS: usize = 4;
+const WAY_COST: i32 = 8;
+
+// The condition `cond` on the way out of d to the side `side` of its
+// branch on c: true, false (constants) or nil.
+fn way_decides(cond: *mut ir.Value, c: *mut ir.Value, side: bool, d: *mut ir.Block) *mut ir.Value {
+    if cond == c {
+        return ir.kbool(side);
+    }
+    if not ir.is_op(cond, ir.OP_ICMP) or (d.preds.len != 1) {
+        return vnil();
+    }
+    // a test of the same operands on the way into d
+    let mut to = d;
+    let mut from = d.preds.get(0);
+    for _depth in @as(i32, 0)..4 {
+        let t = ir.terminator(from);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and ((t.t1 == to) or (t.t2 == to)) {
+            let x = ir.resolve(t.a);
+            let taken = t.t1 == to;
+            if x == cond {
+                return ir.kbool(taken);
+            }
+            if ir.is_op(x, ir.OP_ICMP) {
+                let mut p = ir.pred_of(x);
+                if (ir.resolve(x.a) == ir.resolve(cond.b)) and (ir.resolve(x.b) == ir.resolve(cond.a)) {
+                    p = ir.swap_pred(p);
+                } else if (ir.resolve(x.a) != ir.resolve(cond.a)) or (ir.resolve(x.b) != ir.resolve(cond.b)) {
+                    p = -1;
+                }
+                if p >= 0 {
+                    if p == ir.pred_of(cond) {
+                        return ir.kbool(taken);
+                    }
+                    if p == ir.inv_pred(ir.pred_of(cond)) {
+                        return ir.kbool(not taken);
+                    }
+                }
+            }
+        }
+        if (from.preds.len != 1) or (from.rpo < 0) {
+            break;
+        }
+        to = from;
+        from = from.preds.get(0);
+    }
+    return vnil();
+}
+
+// Are a and b the same computation (instructions of the same operation on
+// the same operands, a few levels deep)?
+fn same_expr(a0: *mut ir.Value, b0: *mut ir.Value, depth: i32) bool {
+    let a = ir.resolve(a0);
+    let b = ir.resolve(b0);
+    if a == b {
+        return true;
+    }
+    if u.isnil(a) or u.isnil(b) {
+        return false;
+    }
+    if (a.kind == ir.V_CINT) and (b.kind == ir.V_CINT) {
+        return (a.ty == b.ty) and (a.cv == b.cv);
+    }
+    if (depth <= 0) or (a.kind != ir.V_INST) or (b.kind != ir.V_INST) or (a.op != b.op) or (a.ty != b.ty) or
+       (a.cv != b.cv) or (a.xs.len != 0) or (b.xs.len != 0) or not speculatable(a) {
+        return false;
+    }
+    return same_expr(a.a, b.a, depth - 1) and same_expr(a.b, b.b, depth - 1) and same_expr(a.c, b.c, depth - 1);
+}
+
+// Does d load from the address p already?
+fn loaded_in(d: *mut ir.Block, p: *mut ir.Value, t: *mut ir.Ty) bool {
+    let mut i = d.first;
+    while u.notnil(i) {
+        if (i.op == ir.OP_LOAD) and (i.flags == 0) and (i.ty == t) and same_expr(i.a, p, 4) {
+            return true;
+        }
+        i = i.next;
+    }
+    return false;
+}
+
+// Does d load what each load on the way loads?
+fn loads_done(d: *mut ir.Block, way: *u.List.[*mut ir.Block]) bool {
+    for k in 0..way.len {
+        let mut i = way.get(k).first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_LOAD) and not loaded_in(d, i.a, i.ty) {
+                return false;
+            }
+            i = i.next;
+        }
+    }
+    return true;
+}
+
+// The way from d's successor x (the side `side` of its branch on c) to the
+// first block with phis: its blocks into *way, and that block; nil when the
+// way is not one select_ways takes. *st: the way's store.
+fn walk_way(d: *mut ir.Block, x0: *mut ir.Block, c: *mut ir.Value, side: bool, way: *mut u.List.[*mut ir.Block],
+            st: *mut *mut ir.Value) *mut ir.Block {
+    way.clear();
+    st.* = vnil();
+    let mut x = x0;
+    let mut cost: i32 = 0;
+    for _k in 0..WAY_BLOCKS {
+        if (x == d) or (x.first.op == ir.OP_PHI) {
+            return ir.bnil();
+        }
+        way.push(x);
+        let t = ir.terminator(x);
+        if u.isnil(t) {
+            return ir.bnil();
+        }
+        let mut i = x.first;
+        while i != t {
+            if i.op == ir.OP_STORE {
+                if u.notnil(st.*) or (i.flags != 0) or
+                   ((i.a.ty.kind != ir.T_INT) and (i.a.ty.kind != ir.T_FLOAT) and (i.a.ty.kind != ir.T_PTR)) {
+                    return ir.bnil();
+                }
+                st.* = i;
+            } else if i.op == ir.OP_LOAD {
+                // (none after the store; each of what d loads, checked last)
+                if u.notnil(st.*) or (i.flags != 0) {
+                    return ir.bnil();
+                }
+            } else if not speculatable(i) {
+                return ir.bnil();
+            }
+            if i.op != ir.OP_PTRADD {
+                cost += 1;
+            }
+            i = i.next;
+        }
+        if cost > WAY_COST {
+            return ir.bnil();
+        }
+        let mut next = ir.bnil();
+        if t.op == ir.OP_BR {
+            next = t.t1;
+        } else if t.op == ir.OP_CONDBR {
+            let k = way_decides(ir.resolve(t.a), c, side, d);
+            if u.isnil(k) {
+                return ir.bnil();
+            }
+            next = t.t2;
+            if k.cv != 0 {
+                next = t.t1;
+            }
+        } else {
+            return ir.bnil();
+        }
+        if next.first.op == ir.OP_PHI {
+            if u.isnil(st.*) or not loads_done(d, way) {
+                return ir.bnil();
+            }
+            return next;
+        }
+        x = next;
+    }
+    return ir.bnil();
+}
+
+// v on the way copied into d (aux: the copy of each instruction of the way,
+// tagged by its block's mark).
+fn way_value(v: *mut ir.Value, tag: i64) *mut ir.Value {
+    let r = ir.resolve(v);
+    if u.notnil(r) and (r.kind == ir.V_INST) and u.notnil(r.blk) and (r.blk.mark == tag) {
+        return @ptr_cast(*mut ir.Value, r.auxp);
+    }
+    return r;
+}
+
+let mut way_mark: i64 = 0x6000_0000_0000;
+let mut way_t: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                 cap: 0 };
+let mut way_e: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                 cap: 0 };
+
+// The way's instructions (but its store) copied before d's branch; returns
+// the copy of the store's value.
+fn copy_way(f: *mut ir.Func, d: *mut ir.Block, way: *u.List.[*mut ir.Block], st: *mut ir.Value) *mut ir.Value {
+    way_mark += 1;
+    for k in 0..way.len {
+        way.get(k).mark = way_mark;
+    }
+    let br = ir.terminator(d);
+    let mut stv = vnil();
+    for k in 0..way.len {
+        let x = way.get(k);
+        let t = ir.terminator(x);
+        let mut i = x.first;
+        while i != t {
+            if i == st {
+                stv = way_value(i.a, way_mark);
+            } else {
+                let y = ir.copy_inst(f, i);
+                if u.notnil(y.a) {
+                    y.a = way_value(y.a, way_mark);
+                }
+                if u.notnil(y.b) {
+                    y.b = way_value(y.b, way_mark);
+                }
+                if u.notnil(y.c) {
+                    y.c = way_value(y.c, way_mark);
+                }
+                for m in 0..y.xs.len {
+                    y.xs.set(m, way_value(y.xs.get(m), way_mark));
+                }
+                ir.insert_before(br, y);
+                i.auxp = @ptr_cast(*mut void, y);
+            }
+            i = i.next;
+        }
+    }
+    return stv;
+}
+
+fn select_ways(f: *mut ir.Func, d: *mut ir.Block) bool {
+    let br = ir.terminator(d);
+    let c = ir.resolve(br.a);
+    if (br.t1 == br.t2) or not (ir.is_op(c, ir.OP_ICMP) or ir.is_op(c, ir.OP_FCMP)) or
+       not (ir.is_op(ir.resolve(c.a), ir.OP_LOAD) or ir.is_op(ir.resolve(c.b), ir.OP_LOAD)) {
+        return false;
+    }
+    let wt = &mut way_t;
+    let we = &mut way_e;
+    let mut st = vnil();
+    let mut se = vnil();
+    let j = walk_way(d, br.t1, c, true, wt, &mut st);
+    let mut ok = u.notnil(j) and (j == walk_way(d, br.t2, c, false, we, &mut se)) and (j != d) and
+                 (st.a.ty == se.a.ty) and same_expr(st.b, se.b, 4);
+    if ok {
+        // (a block on both ways is copied for each)
+        for k in 0..wt.len {
+            for m in 0..we.len {
+                if wt.get(k) == we.get(m) {
+                    ok = false;
+                }
+            }
+        }
+    }
+    if not ok {
+        return false;
+    }
+    let lt = wt.get(wt.len - 1);
+    let le = we.get(we.len - 1);
+    // (each phi of j takes a value from both ways)
+    let mut q = j.first;
+    while q.op == ir.OP_PHI {
+        let mut nt: i32 = 0;
+        let mut ne: i32 = 0;
+        for k in 0..q.bs.len {
+            if q.bs.get(k) == lt {
+                nt += 1;
+            }
+            if q.bs.get(k) == le {
+                ne += 1;
+            }
+        }
+        if (nt != 1) or (ne != 1) {
+            return false;
+        }
+        q = q.next;
+    }
+    let tag_t = way_mark + 1;
+    let vt = copy_way(f, d, wt, st);
+    let at = way_value(st.b, tag_t);
+    let tag_e = way_mark + 1;
+    let ve = copy_way(f, d, we, se);
+    let bld = ir.new_builder();
+    ir.at_before(bld, br);
+    let s = ir.store(bld, ir.select(bld, c, vt, ve), at);
+    s.align = st.align;
+    let mut p = j.first;
+    while p.op == ir.OP_PHI {
+        let mut xt = vnil();
+        let mut xe = vnil();
+        for k in 0..p.bs.len {
+            if p.bs.get(k) == lt {
+                xt = way_value(p.xs.get(k), tag_t);
+            }
+            if p.bs.get(k) == le {
+                xe = way_value(p.xs.get(k), tag_e);
+            }
+        }
+        ir.add_incoming(p, ir.select(bld, c, xt, xe), d);
+        p = p.next;
+    }
+    br.op = ir.OP_BR;
+    br.a = vnil();
+    br.t1 = j;
+    br.t2 = ir.bnil();
+    return true;
+}
+
 // d: condbr c1 -> x, y with x (reached only from d) computing at most a
 // couple of speculatable values and testing c2 -> t, m, where y is m or an
 // empty block going to m, and m's phis get the same value from x as from
@@ -1575,7 +1882,10 @@ pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
             if sink_stores(b) {
                 any = true;
             }
-            if convert(f, b) {
+            if select_ways(f, b) {
+                any = true;
+                opt.compute_preds(f);
+            } else if convert(f, b) {
                 any = true;
                 opt.compute_preds(f);
             }
