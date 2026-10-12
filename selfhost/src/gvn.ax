@@ -864,6 +864,40 @@ fn compose_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
 // size (the bytes of a board loaded to compare them and again as 64-bit
 // words to add them up), or a scalar load of what is known there as an
 // integer or float of its size: that, bitcast; or nil.
+// An integer loaded from within a wider integer stored before (a field of
+// a small struct copied through the stack as one word): that value's bytes,
+// shifted down and truncated (the targets are little-endian).
+fn narrowed_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
+    let size = @bit_cast(i64, i.ty.size);
+    if (i.ty.kind != ir.T_INT) or (size >= 8) or (@as(i64, i.ty.bits) != (size * 8)) {
+        return vnil();
+    }
+    let mut w: i64 = size * 2;
+    while w <= 8 {
+        // (the wider value starting at a multiple of the load's size before it)
+        let mut d: i64 = 0;
+        while (d + size) <= w {
+            let wl = Loc.{ base: l.base, obj: l.obj, off: l.off - d, size: w, rok: l.rok, rlo: l.rlo - d,
+                           rhi: l.rhi - d };
+            let x = find_mem(&wl, ir.t_int(@truncate(i32, w * 8)));
+            if u.notnil(x) {
+                if u.isnil(B) {
+                    B = ir.new_builder();
+                }
+                ir.at_before(B, i);
+                let mut v = x;
+                if d > 0 {
+                    v = ir.binop(B, ir.OP_LSHR, v, ir.cint(x.ty, @bit_cast(u64, d * 8)));
+                }
+                return ir.trunc(B, v, i.ty);
+            }
+            d += size;
+        }
+        w = w * 2;
+    }
+    return vnil();
+}
+
 fn punned_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
     let size = i.ty.size;
     if i.ty.kind != ir.T_VEC {
@@ -2716,6 +2750,9 @@ fn visit_block(b: *mut ir.Block) void {
                 }
                 if u.isnil(r) and ((i.ty.kind == ir.T_VEC) or (i.ty.kind == ir.T_INT) or (i.ty.kind == ir.T_FLOAT)) {
                     r = punned_load(i, &l);
+                }
+                if u.isnil(r) {
+                    r = narrowed_load(i, &l);
                 }
                 if u.notnil(r) {
                     replace(i, r);
