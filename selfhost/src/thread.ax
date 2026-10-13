@@ -1384,6 +1384,17 @@ fn set_test_of(b: *mut ir.Block, x: *mut *mut ir.Value, k: *mut u64, n: *mut u64
     } else {
         return false;
     }
+    // a test of an extension of y, of small values: a test of y
+    if (ir.is_op(v, ir.OP_SEXT) or ir.is_op(v, ir.OP_ZEXT)) and (ir.resolve(v.a).ty.kind == ir.T_INT) {
+        let y = ir.resolve(v.a);
+        let mut lim = width_mask(y.ty.bits);
+        if v.op == ir.OP_SEXT {
+            lim = lim >> 1;
+        }
+        if (k.* <= lim) and ((n.* - 1) <= (lim - k.*)) {
+            v = y;
+        }
+    }
     if (p == ir.IntEQ) or (p == ir.IntULT) {
         on_in.* = t.t1;
         other.* = t.t2;
@@ -1525,24 +1536,7 @@ fn eq_chain(d: *mut ir.Block) bool {
         q = q.next;
     }
     let br = ir.terminator(d);
-    let bld = ir.new_builder();
-    ir.at_before(bld, br);
-    let w = x.ty;
-    let mut off = x;
-    if lo != 0 {
-        off = ir.binop(bld, ir.OP_SUB, x, ir.cint(w, lo));
-    }
-    let mut c = ir.icmp(bld, ir.IntULT, off, ir.cint(w, span));
-    if not contiguous {
-        let t64 = ir.t_int(64);
-        let mut o64 = off;
-        if x.ty.bits < 64 {
-            o64 = ir.cast(bld, ir.OP_ZEXT, off, t64);
-        }
-        let sh = ir.binop(bld, ir.OP_LSHR, ir.cint(t64, mask), ir.binop(bld, ir.OP_AND, o64, ir.cint(t64, 63)));
-        let bit = ir.icmp(bld, ir.IntNE, ir.binop(bld, ir.OP_AND, sh, ir.cint(t64, 1)), ir.cint(t64, 0));
-        c = ir.binop(bld, ir.OP_AND, c, bit);
-    }
+    let c = set_cond(br, x, lo, hi, mask, contiguous);
     q = cur.first;
     while u.notnil(q) and (q.op == ir.OP_PHI) {
         for j in 0..q.bs.len {
@@ -1555,6 +1549,143 @@ fn eq_chain(d: *mut ir.Block) bool {
     br.a = c;
     br.t1 = t;
     br.t2 = cur;
+    return true;
+}
+
+// The test of x against the constants lo + j for the bits j of mask (all
+// of them from lo to hi when contiguous), before br.
+fn set_cond(br: *mut ir.Value, x: *mut ir.Value, lo0: u64, hi: u64, mask0: u64, contiguous: bool) *mut ir.Value {
+    let bld = ir.new_builder();
+    ir.at_before(bld, br);
+    let w = x.ty;
+    let mut lo = lo0;
+    let mut mask = mask0;
+    if not contiguous and (hi < 64) {
+        // (from 0: no subtraction)
+        mask = mask << @truncate(u32, lo);
+        lo = 0;
+    }
+    if contiguous and (lo == hi) {
+        return ir.icmp(bld, ir.IntEQ, x, ir.cint(w, lo));
+    }
+    let span = (hi - lo) + 1;
+    let mut off = x;
+    if lo != 0 {
+        off = ir.binop(bld, ir.OP_SUB, x, ir.cint(w, lo));
+    }
+    let mut c = ir.icmp(bld, ir.IntULT, off, ir.cint(w, span));
+    if not contiguous {
+        // mask & (1 << off) != 0: bt (the IR's shifts take the count modulo
+        // the width; off < span on the way the bit counts)
+        let mut tw = ir.t_int(64);
+        if (hi - lo) < 32 {
+            tw = ir.t_int(32);
+        }
+        let mut ow = off;
+        if x.ty.bits < tw.bits {
+            ow = ir.cast(bld, ir.OP_ZEXT, off, tw);
+        } else if x.ty.bits > tw.bits {
+            ow = ir.cast(bld, ir.OP_TRUNC, off, tw);
+        }
+        let one = ir.binop(bld, ir.OP_SHL, ir.cint(tw, 1), ow);
+        let bit = ir.icmp(bld, ir.IntNE, ir.binop(bld, ir.OP_AND, ir.cint(tw, mask), one), ir.cint(tw, 0));
+        c = ir.binop(bld, ir.OP_AND, c, bit);
+    }
+    return c;
+}
+
+// x in [k, k + n) and x in [k2, k2 + n2) and ... (each test's way in the
+// next test, every way out to one block): x in their intersection.
+fn and_chain(d: *mut ir.Block) bool {
+    let mut x = vnil();
+    let mut k: u64 = 0;
+    let mut kn: u64 = 0;
+    let mut t = ir.bnil();
+    let mut e = ir.bnil();
+    let mut ni: i32 = 0;
+    if not set_test_of(d, &mut x, &mut k, &mut kn, &mut t, &mut e, &mut ni) {
+        return false;
+    }
+    // (from the chain's first test only)
+    if d.preds.len == 1 {
+        let p = d.preds.get(0);
+        let mut px = vnil();
+        let mut pk: u64 = 0;
+        let mut pn: u64 = 0;
+        let mut pt = ir.bnil();
+        let mut pe = ir.bnil();
+        let mut pi: i32 = 0;
+        if (p != d) and set_test_of(p, &mut px, &mut pk, &mut pn, &mut pt, &mut pe, &mut pi) and (px == x) and
+           (pe == e) and (pt == d) and only_test(d, ni) {
+            return false;
+        }
+    }
+    let wm = width_mask(x.ty.bits);
+    if (kn == 0) or (k > (wm - (kn - 1))) {
+        return false;
+    }
+    let mut lo = k;
+    let mut hi = k + (kn - 1);
+    let mut chain: [32]*mut ir.Block = [d; 32];
+    let mut n: i32 = 1;
+    let mut cur = t;
+    let mut last = d;
+    let mut way = ir.bnil();
+    while n < 32 {
+        let mut x2 = vnil();
+        let mut k2: u64 = 0;
+        let mut n2: u64 = 0;
+        let mut t2 = ir.bnil();
+        let mut e2 = ir.bnil();
+        let mut i2: i32 = 0;
+        if (cur == d) or (cur.preds.len != 1) or (cur.preds.get(0) != last) or
+           not set_test_of(cur, &mut x2, &mut k2, &mut n2, &mut t2, &mut e2, &mut i2) or (x2 != x) or (e2 != e) or
+           (t2 == cur) or not only_test(cur, i2) or not same_inputs(e, d, cur) or (n2 == 0) or (k2 > (wm - (n2 - 1))) {
+            break;
+        }
+        lo = @max(lo, k2);
+        hi = @min(hi, k2 + (n2 - 1));
+        chain[@int_cast(usize, n)] = cur;
+        n += 1;
+        last = cur;
+        cur = t2;
+        way = t2;
+    }
+    if n < 2 {
+        return false;
+    }
+    // (the way in takes from d what it took from last)
+    let mut q = way.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for j in 0..q.bs.len {
+            if q.bs.get(j) == last {
+                let v = ir.resolve(q.xs.get(j));
+                for m in 1..@int_cast(usize, n) {
+                    if (v.kind == ir.V_INST) and (v.blk == chain[m]) {
+                        return false;  // (computed in the chain)
+                    }
+                }
+            }
+        }
+        q = q.next;
+    }
+    q = way.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for j in 0..q.bs.len {
+            if q.bs.get(j) == last {
+                q.bs.set(j, d);
+            }
+        }
+        q = q.next;
+    }
+    let br = ir.terminator(d);
+    if lo > hi {
+        br.a = ir.kbool(false);
+    } else {
+        br.a = set_cond(br, x, lo, hi, 0, true);
+    }
+    br.t1 = way;
+    br.t2 = e;
     return true;
 }
 
@@ -2117,7 +2248,7 @@ pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
     while u.notnil(b) {
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a.ty.kind == ir.T_INT) {
-            if eq_chain(b) {
+            if eq_chain(b) or and_chain(b) {
                 any = true;
                 opt.compute_preds(f);
             }
