@@ -1333,6 +1333,248 @@ fn sink_stores(d: *mut ir.Block) bool {
 }
 
 // -----------------------------------------------------------------------------
+// A chain of tests of one value against constants that all go to one block,
+//
+//   if (op == A) or (op == B) or (op == C) { t } else { e }
+//
+// (each test after the first alone in a block reached only from the one
+// before) becomes one test: of a range when the constants are consecutive,
+// else of a bit of a mask of them (within 64 of the least).
+// -----------------------------------------------------------------------------
+const CHAIN_MAX: usize = 32;
+
+// b's condition when it tests x against a set of consecutive constants:
+// x == k, x != k, or x - k <u n (and their negations); x, the least
+// constant k (as an unsigned value of x's width), the count n, the
+// successor taken when x is one of them and the other; and how many
+// instructions the test takes in b.
+fn set_test_of(b: *mut ir.Block, x: *mut *mut ir.Value, k: *mut u64, n: *mut u64, on_in: *mut *mut ir.Block,
+               other: *mut *mut ir.Block, insts: *mut i32) bool {
+    let t = ir.terminator(b);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) {
+        return false;
+    }
+    let c = ir.resolve(t.a);
+    if not ir.is_op(c, ir.OP_ICMP) or not ir.is_cint(ir.resolve(c.b)) {
+        return false;
+    }
+    let mut v = ir.resolve(c.a);
+    if (v.ty.kind != ir.T_INT) or (v.ty.bits > 64) {
+        return false;
+    }
+    let wm = width_mask(v.ty.bits);
+    let p = ir.pred_of(c);
+    let kc = ir.cint_val(ir.resolve(c.b)) & wm;
+    insts.* = 1;
+    if (p == ir.IntEQ) or (p == ir.IntNE) {
+        k.* = kc;
+        n.* = 1;
+    } else if (p == ir.IntULT) or (p == ir.IntUGE) {
+        if (kc == 0) or (kc > 64) {
+            return false;
+        }
+        n.* = kc;
+        k.* = 0;
+        if ir.is_op(v, ir.OP_ADD) and ir.is_cint(ir.resolve(v.b)) {
+            // x - k <u n (as x + (-k))
+            k.* = (0 -% ir.cint_val(ir.resolve(v.b))) & wm;
+            v = ir.resolve(v.a);
+            insts.* = 2;
+        }
+    } else {
+        return false;
+    }
+    if (p == ir.IntEQ) or (p == ir.IntULT) {
+        on_in.* = t.t1;
+        other.* = t.t2;
+    } else {
+        on_in.* = t.t2;
+        other.* = t.t1;
+    }
+    x.* = v;
+    return true;
+}
+
+// Do the phis of m take the same value from a as from b?
+fn same_inputs(m: *mut ir.Block, a: *mut ir.Block, b: *mut ir.Block) bool {
+    let mut p = m.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let mut va = vnil();
+        let mut vb = vnil();
+        for k in 0..p.bs.len {
+            if p.bs.get(k) == a {
+                va = ir.resolve(p.xs.get(k));
+            }
+            if p.bs.get(k) == b {
+                vb = ir.resolve(p.xs.get(k));
+            }
+        }
+        if va != vb {
+            return false;
+        }
+        p = p.next;
+    }
+    return true;
+}
+
+fn width_mask(bits: i32) u64 {
+    if bits >= 64 {
+        return ~@as(u64, 0);
+    }
+    return (@as(u64, 1) << @as(u32, @bit_cast(u32, bits))) - 1;
+}
+
+fn eq_chain(d: *mut ir.Block) bool {
+    let mut x = vnil();
+    let mut k: u64 = 0;
+    let mut kn: u64 = 0;
+    let mut t = ir.bnil();
+    let mut e = ir.bnil();
+    let mut ni: i32 = 0;
+    if not set_test_of(d, &mut x, &mut k, &mut kn, &mut t, &mut e, &mut ni) {
+        return false;
+    }
+    // (from the chain's first test only)
+    if d.preds.len == 1 {
+        let p = d.preds.get(0);
+        let mut px = vnil();
+        let mut pk: u64 = 0;
+        let mut pn: u64 = 0;
+        let mut pt = ir.bnil();
+        let mut pe = ir.bnil();
+        let mut pi: i32 = 0;
+        if (p != d) and set_test_of(p, &mut px, &mut pk, &mut pn, &mut pt, &mut pe, &mut pi) and (px == x) and
+           (pt == t) and (pe == d) and only_test(d, ni) {
+            return false;
+        }
+    }
+    let wm = width_mask(x.ty.bits);
+    let mut ks: [CHAIN_MAX]u64 = [0; CHAIN_MAX];
+    let mut ns: [CHAIN_MAX]u64 = [0; CHAIN_MAX];
+    let mut chain: [CHAIN_MAX]*mut ir.Block = [d; CHAIN_MAX];
+    ks[0] = k;
+    ns[0] = kn;
+    let mut n: usize = 1;
+    let mut last = d;
+    let mut cur = e;
+    while (n < CHAIN_MAX) and (cur != d) {
+        // cur: the test and the branch alone, entered only from last
+        let mut x2 = vnil();
+        let mut k2: u64 = 0;
+        let mut n2: u64 = 0;
+        let mut t2 = ir.bnil();
+        let mut e2 = ir.bnil();
+        let mut i2: i32 = 0;
+        if (cur.preds.len != 1) or (cur.preds.get(0) != last) or
+           not set_test_of(cur, &mut x2, &mut k2, &mut n2, &mut t2, &mut e2, &mut i2) or (x2 != x) or (t2 != t) or
+           (e2 == cur) or not only_test(cur, i2) or not same_inputs(t, d, cur) {
+            break;
+        }
+        ks[n] = k2;
+        ns[n] = n2;
+        chain[n] = cur;
+        n += 1;
+        last = cur;
+        cur = e2;
+    }
+    if n < 2 {
+        return false;
+    }
+    // the constants as unsigned values of x's width, within 64 of the least
+    let mut lo = ks[0];
+    let mut hi = ks[0];
+    for j in 0..n {
+        if (ns[j] == 0) or (ks[j] > (wm - (ns[j] - 1))) {
+            return false;  // (a range wrapping around)
+        }
+        lo = @min(lo, ks[j]);
+        hi = @max(hi, ks[j] + (ns[j] - 1));
+    }
+    if (hi < lo) or ((hi - lo) >= 64) {
+        return false;
+    }
+    let span = (hi - lo) + 1;
+    let mut mask: u64 = 0;
+    let mut count: u64 = 0;
+    for j in 0..n {
+        for q in 0..ns[j] {
+            let bitv = @as(u64, 1) << @truncate(u32, (ks[j] - lo) + q);
+            if (mask & bitv) == 0 {
+                count += 1;
+            }
+            mask = mask | bitv;
+        }
+    }
+    let contiguous = count == span;
+    if not contiguous and (n < 3) {
+        return false;  // (two tests are no worse than a bit test)
+    }
+    // the final way out takes from d what it took from last
+    let mut q = cur.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for j in 0..q.bs.len {
+            if q.bs.get(j) == last {
+                let v = ir.resolve(q.xs.get(j));
+                for m in 1..n {
+                    if (v.kind == ir.V_INST) and (v.blk == chain[m]) {
+                        return false;  // (computed in the chain)
+                    }
+                }
+            }
+        }
+        q = q.next;
+    }
+    let br = ir.terminator(d);
+    let bld = ir.new_builder();
+    ir.at_before(bld, br);
+    let w = x.ty;
+    let mut off = x;
+    if lo != 0 {
+        off = ir.binop(bld, ir.OP_SUB, x, ir.cint(w, lo));
+    }
+    let mut c = ir.icmp(bld, ir.IntULT, off, ir.cint(w, span));
+    if not contiguous {
+        let t64 = ir.t_int(64);
+        let mut o64 = off;
+        if x.ty.bits < 64 {
+            o64 = ir.cast(bld, ir.OP_ZEXT, off, t64);
+        }
+        let sh = ir.binop(bld, ir.OP_LSHR, ir.cint(t64, mask), ir.binop(bld, ir.OP_AND, o64, ir.cint(t64, 63)));
+        let bit = ir.icmp(bld, ir.IntNE, ir.binop(bld, ir.OP_AND, sh, ir.cint(t64, 1)), ir.cint(t64, 0));
+        c = ir.binop(bld, ir.OP_AND, c, bit);
+    }
+    q = cur.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for j in 0..q.bs.len {
+            if q.bs.get(j) == last {
+                q.bs.set(j, d);
+            }
+        }
+        q = q.next;
+    }
+    br.a = c;
+    br.t1 = t;
+    br.t2 = cur;
+    return true;
+}
+
+// Is b's code only its test (ni instructions) and its branch?
+fn only_test(b: *mut ir.Block, ni: i32) bool {
+    let t = ir.terminator(b);
+    let c = ir.resolve(t.a);
+    let mut m: i32 = 0;
+    let mut i = b.first;
+    while u.notnil(i) and (i != t) {
+        if (i != c) and (i != ir.resolve(c.a)) {
+            return false;
+        }
+        m += 1;
+        i = i.next;
+    }
+    return m == ni;
+}
+
+// -----------------------------------------------------------------------------
 // Two ways from a test of loaded data to a join, each a few speculatable
 // instructions and one store to the same address (the merge step of a merge
 // sort: tmp[k] = xs[a]; a += 1, or tmp[k] = xs[b]; b += 1), become selects
@@ -1875,6 +2117,10 @@ pub fn if_convert(f: *mut ir.Func, preds_ok: bool) bool {
     while u.notnil(b) {
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.a.ty.kind == ir.T_INT) {
+            if eq_chain(b) {
+                any = true;
+                opt.compute_preds(f);
+            }
             if merge_conds(f, b) {
                 any = true;
                 opt.compute_preds(f);
