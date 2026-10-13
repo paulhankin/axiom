@@ -12,7 +12,8 @@
 // pieces are joined or taken apart with shuffles of the forms
 //     shuffle(lo, hi, [0, 1, ..., 2n-1])     two halves joined
 //     shuffle(v, v, [k*n, ..., k*n+n-1])     part k of a wider value
-// which a target with wide registers can always select (no other target
+// which a target with wide registers can always select as wide as those
+// registers (wider ones are pieces themselves; no other target
 // sees them: there, everything splits to 128 bits). Such conversions are
 // made right after the value's definition, so they serve every use.
 //
@@ -345,13 +346,18 @@ fn keep(i: *mut ir.Value) void {
 fn kept(i: *mut ir.Value) bool {
     let w = width(i);
     // (a program's shuffle may look like plumbing too: only a target with
-    // wide registers selects those)
-    return (w <= 128) or ((MAXB > 128) and plumbing(i)) or ((w <= MAXB) and LEGAL(i));
+    // wide registers selects those, and only as wide as its registers;
+    // wider ones are pieces, split_plumbing)
+    return (w <= 128) or ((w <= MAXB) and (plumbing(i) or LEGAL(i)));
 }
 
 fn process(i: *mut ir.Value) void {
     if kept(i) {
         keep(i);
+        return;
+    }
+    if (MAXB > 128) and plumbing(i) {
+        split_plumbing(i);
         return;
     }
     let w = width(i);
@@ -587,6 +593,44 @@ fn split_inst(i: *mut ir.Value, pb: u64) void {
     }
     rep_of(i).split = r;
     dead.push(i);
+}
+
+// A join or part shuffle wider than the target's vectors: no instruction,
+// only pieces. A part is the pieces of its width (taken from the operand's
+// own pieces), a join the pieces of both halves. (Kept, it would need the
+// operand whole in a register the target lacks: a 512-bit one with AVX2.)
+fn split_plumbing(i: *mut ir.Value) void {
+    let a = ir.resolve(i.a);
+    let w = vbits(i.ty);
+    if lanes_of(i.ty) < lanes_of(a.ty) {
+        let k = @as(usize, @bit_cast(u32, i.mask[0])) / lanes_of(i.ty);
+        ir.forward(i, as_pieces(a, w).ps[k]);
+        dead.push(i);
+        return;
+    }
+    let mut pb = vbits(a.ty);
+    if pb > MAXB {
+        pb = MAXB;
+    }
+    let pa = halves_of(a, pb);
+    let pz = halves_of(ir.resolve(i.b), pb);
+    let r = new_pieces(pa.n + pz.n, pb);
+    for k in 0..pa.n {
+        r.ps[k] = pa.ps[k];
+        r.ps[pa.n + k] = pz.ps[k];
+    }
+    rep_of(i).split = r;
+    dead.push(i);
+}
+
+// x's pieces of `bits` width, or x as one piece when it is that wide.
+fn halves_of(x: *mut ir.Value, bits: u64) *mut Pieces {
+    if vbits(x.ty) > bits {
+        return as_pieces(x, bits);
+    }
+    let p = new_pieces(1, bits);
+    p.ps[0] = as_whole(x);
+    return p;
 }
 
 const SEEN: i64 = 0x7651_7651;
@@ -827,6 +871,8 @@ pub fn split_wide(f: *mut ir.Func, max_bits: u64, legal: fn(*mut ir.Value) bool)
             ir.remove_inst(d);
         }
     }
+    ir.apply_forwarding(f);
+    opt.dce(f);  // (pieces made and not read: the low parts of split_plumbing's operands)
     let mut bb = f.first;
     while u.notnil(bb) {
         let mut i = bb.first;
@@ -837,7 +883,6 @@ pub fn split_wide(f: *mut ir.Func, max_bits: u64, legal: fn(*mut ir.Value) bool)
         }
         bb = bb.next;
     }
-    ir.apply_forwarding(f);
     todo.deinit();
     order.deinit();
 }

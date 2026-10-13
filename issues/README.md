@@ -63,6 +63,7 @@ they travel with the code they describe.
 | [0118](0118-selfhost-float-to-int-branches.md) | feature | compiler (selfhost: x64) | Self-hosted x86-64: saturating float -> int conversions branch three times (fixed in a92501d) |
 | [0119](0119-selfhost-byte-sums.md) | feature | compiler (selfhost: slp, x64) | Self-hosted x86-64: sums of neighbouring bytes are scalar loads and adds (fixed in 93d01de) |
 | [0120](0120-selfhost-evex-disp8.md) | bug | compiler (selfhost: x64enc) | Self-hosted x86-64: EVEX 8-bit displacements scaled by the vector, not the memory operand (fixed in 27f8a8a) |
+| [0121](0121-selfhost-avx2-joins-in-zmm.md) | bug | compiler (selfhost: vsplit) | Self-hosted x86-64: with AVX2 only, a 512-bit vector's halves are joined in a zmm register (fixed) |
 | [0104](0104-vdso-clock.md) | feature | runtime | Native Linux programs read the clock with a system call, not the vDSO |
 | [0001](0001-wasm-one-local-per-value.md) | bug | compiler: wasm backend | Every value gets its own wasm local; deep recursion exhausts the stack at -O2 |
 | [0002](0002-o2-std-not-tested.md) | bug | tests | The test suite never builds `std` at -O2 |
