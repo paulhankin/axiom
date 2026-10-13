@@ -2237,6 +2237,9 @@ fn common_op(p: *ir.Value) i64 {
         return -1;
     }
     let i0 = ir.resolve(p.xs.get(0));
+    if same_op_inputs(p) {
+        return -2;
+    }
     if not sinkable_op(i0) or (i0.uses != 1) {
         return -1;
     }
@@ -2272,6 +2275,33 @@ fn common_op(p: *ir.Value) i64 {
         }
     }
     return diff;
+}
+
+// Are p's inputs all one operation of the same operands (an address
+// computed on each way in)? Then p is that operation, once.
+fn same_op_inputs(p: *ir.Value) bool {
+    let i0 = ir.resolve(p.xs.get(0));
+    if not sinkable_op(i0) or (i0.xs.len != 0) {
+        return false;
+    }
+    for j in 1..p.xs.len {
+        let ij = ir.resolve(p.xs.get(j));
+        if (ij.kind != ir.V_INST) or (ij.op != i0.op) or (ij.ty != i0.ty) or (ij.cv != i0.cv) or (ij.flags != 0) or
+           (ij.xs.len != 0) {
+            return false;
+        }
+        for k in @as(usize, 0)..3 {
+            let x = operand(i0, k);
+            let y = operand(ij, k);
+            if u.isnil(x) != u.isnil(y) {
+                return false;
+            }
+            if u.notnil(x) and not same_operand(ir.resolve(x), ir.resolve(y)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 // Might common_op find anything in f (before uses are counted)?
@@ -2312,16 +2342,32 @@ pub fn sink_phi_ops(f: *mut ir.Func) bool {
             let mut p = b.first;
             while u.notnil(p) and (p.op == ir.OP_PHI) {
                 let d = common_op(p);
-                if d < 0 {
+                if d == -1 {
                     p = p.next;
                     continue;
                 }
-                let k = @int_cast(usize, d);
                 let i0 = ir.resolve(p.xs.get(0));
                 let mut at = b.first;
                 while u.notnil(at) and (at.op == ir.OP_PHI) {
                     at = at.next;
                 }
+                if d == -2 {
+                    // one copy here; the inputs stay for their other users
+                    let y = ir.copy_inst(f, i0);
+                    if u.notnil(at) {
+                        ir.insert_before(at, y);
+                    } else {
+                        ir.append_inst(b, y);
+                    }
+                    ir.forward(p, y);
+                    ir.remove_inst(p);
+                    ir.apply_forwarding(f);
+                    ir.count_uses(f);
+                    changed = true;
+                    any = true;
+                    break;
+                }
+                let k = @int_cast(usize, d);
                 if k < (3 + i0.xs.len) {
                     // the differing operands through a phi of their own
                     ir.at_before(B, p);
