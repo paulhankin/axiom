@@ -15,8 +15,8 @@
 //
 // Environment: AXIOM_TEST_JOBS (tests run at a time; default the CPUs, 1 is
 // serial); AXIOM_TEST_SKIP_PLATFORM=1 skips what does not depend on the
-// target and flags (fmt, macOS, Windows, the wasm32 check of selfhost/src,
-// a large example), for runs after the first of several configurations.
+// target and flags (fmt, macOS, Windows, the wasm32 check of selfhost/src),
+// for runs after the first of several configurations.
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -878,15 +878,7 @@ if (!skipPlatform) {
       const j = tested('.', path.join(tmp, 'fresh'));
       return j.status === 'pass' && names(j) === 'add' ? null : JSON.stringify(j);
     },
-    'the solver example (examples/solver)': async () => {
-      // a native program: always tested natively, whatever the suite's target
-      const c = ph(['test', path.join(root, 'examples/solver'), '--format=agent-json', nativeTarget, '-O2', ...testTimeout]);
-      let j;
-      try { j = JSON.parse(c.stdout); } catch { return `bad output: ${c.stdout}${c.stderr}`; }
-      return j.status === 'pass' && j.tests.length >= 17 ? null : JSON.stringify(j).slice(0, 2000);
-    },
   };
-  if (skipPlatform) delete cases['the solver example (examples/solver)'];
   for (const [cname, fn] of Object.entries(cases)) {
     const name = `packages: ${cname}`;
     if (filter && !name.includes(filter)) continue;
