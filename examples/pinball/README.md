@@ -5,8 +5,8 @@ usual things on it, its rules and display, its sounds, and Metal rendering with
 physically based shading, HDR, bloom and shadows.
 
 ```
-axiom build pinball --target=aarch64-macos -O2 -o pinball/pinball
-pinball/pinball
+axiom build examples/pinball --target=aarch64-macos -O2 -o examples/pinball/pinball
+examples/pinball/pinball
 ```
 
 | Key | |

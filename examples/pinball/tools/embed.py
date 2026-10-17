@@ -2,7 +2,7 @@
 """Writes src/shaders.ax from src/shaders.metal: the Metal source as an
 array of lines, which the program joins and compiles at run time.
 
-    python3 pinball/tools/embed.py
+    python3 examples/pinball/tools/embed.py
 """
 import os
 
