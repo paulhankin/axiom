@@ -2,8 +2,8 @@
 
 **Version:** 0.1-draft.9
 **File extension:** `.ax`
-**Status:** Working draft. Everything here may change. Unresolved questions are in
-[Appendix C](#appendix-c-open-questions).
+**Status:** Working draft. Everything here may change. Open questions are
+[GitHub issues](https://github.com/paulhankin/axiom/issues).
 
 ---
 
@@ -30,7 +30,6 @@
 18. [Complete Example](#18-complete-example)
 - [Appendix A: Builtin Functions](#appendix-a-builtin-functions)
 - [Appendix B: Trap Conditions](#appendix-b-trap-conditions)
-- [Appendix C: Open Questions](#appendix-c-open-questions)
 
 ---
 
@@ -499,7 +498,7 @@ cycle between their modules is still `E0210`.
   run; its dependencies' tests don't (§17).
 - Modules, not packages, are the unit of compilation, and they are compiled and cached
   separately (§16.7). Generics monomorphize across packages as they do within one.
-  Distributing precompiled packages is future work (Appendix C).
+  Distributing precompiled packages is future work ([#36](https://github.com/paulhankin/axiom/issues/36)).
 
 ---
 
@@ -869,7 +868,7 @@ If neither holds, the program is rejected with `E0150`.
 | `x & mask == 0` | `(x & mask) == 0`. Unlike C, `&` binds tighter than `==`, so the classic C bug cannot occur |
 | `a << 2 + 1` | **E0150**: `<<` and `+` are unordered |
 | `a or b == c` | `a or (b == c)` |
-| `a and b or c` | **E0150**: `and` and `or` are unordered (Appendix C, Q2) |
+| `a and b or c` | **E0150**: `and` and `or` are unordered ([#22](https://github.com/paulhankin/axiom/issues/22)) |
 | `a < b == c` | **E0150** |
 
 Unary operators bind tighter than all binary operators. Postfix operators bind tighter
@@ -920,7 +919,16 @@ In every mode, the `%`-suffixed operators, the `@atomic_*` arithmetic and intege
 arithmetic (§13.1) wrap, and the `_sat` and `_checked` builtins behave as their names say.
 The overflow mode is the **only** way build configuration can change a program's meaning,
 and only for a program whose arithmetic overflows. Optimization level (`-O0`…`-O3`) MUST
-NOT change observable behavior. (See Appendix C, Q1.)
+NOT change observable behavior.
+
+Why wrap by default rather than trap: a check on every operation was the largest
+remaining cost of compute-heavy code against the same code built without checks, and it
+kept the optimizer from vectorizing reductions (WebAssembly has no overflow flag, so each
+check is an extra compare and branch, and a checked multiply needs a wider one). Trapping
+in debug builds and saturating in release builds was rejected because tested and shipped
+programs would differ, and a saturated length silently gives wrong answers. Overflow
+bugs are still caught by bounds checks where they would matter for memory, by
+`--overflow=trap` in tests, and by `@*_checked` where a program must handle them.
 
 **Division.** `/` truncates toward zero. `%` gives a result with the sign of the dividend,
 so `a == (a / b) * b + (a % b)` (with wrapping arithmetic, this holds for `MIN / -1` too).
@@ -1350,7 +1358,7 @@ argument a caller chose. This is a key property for agents: the error is always 
 the line the agent wrote.
 
 v0.1 has a closed set of builtin constraints. User-defined constraints are future work
-(Appendix C).
+([#25](https://github.com/paulhankin/axiom/issues/25)).
 
 | Constraint | Satisfied by | Additionally permits on values of `T` |
 |---|---|---|
@@ -1561,7 +1569,7 @@ This section defines shared-memory concurrency. The design follows from three fa
 |---|---|---|
 | 1 | **Threads are a library, not syntax.** `std/thread` creates threads through the host ABI (§12.8.5). The language adds only atomic builtins. | Matches WebAssembly, where thread creation is a host operation. Keeps the language small. |
 | 2 | **A data race is not undefined behavior.** A read that races with a write returns, for each byte, a value some store wrote to that byte. Tearing is permitted (§12.8.2). | Keeps the zero-UB rule without a borrow checker or `Send`/`Sync` traits. This is WebAssembly's memory model, applied everywhere, just as §12.1 applies WebAssembly's bounds model. A race, like a dangling pointer, is a logic bug with a defined outcome. |
-| 3 | **Only sequentially consistent atomics.** There are no memory-order parameters. | Every WebAssembly atomic is sequentially consistent. SC is the model people and agents reason about correctly, and weaker orderings are a common source of subtle bugs. The cost is some performance on weakly ordered native CPUs. Relaxed orderings may come later (Appendix C). |
+| 3 | **Only sequentially consistent atomics.** There are no memory-order parameters. | Every WebAssembly atomic is sequentially consistent. SC is the model people and agents reason about correctly, and weaker orderings are a common source of subtle bugs. The cost is some performance on weakly ordered native CPUs. Relaxed orderings may come later ([#27](https://github.com/paulhankin/axiom/issues/27)). |
 | 4 | **Atomics are builtins on pointers to integers** (`@atomic_add(&mut x, 1)`), not special types. | Any integer in memory can be accessed atomically, as in WebAssembly. `std/sync.Atomic[T]` wraps them for convenience. |
 | 5 | **`wait`/`notify` operate on 32-bit integers only.** | Linux futexes, the native implementation, are 32-bit, and WebAssembly has `wait32`. 64-bit waiting would behave differently on different targets. |
 | 6 | **No `async`/`await`, no coroutines.** | An `await` is a suspension point that looks like an ordinary expression, which is hidden control flow. Blocking calls on threads are explicit. |
@@ -2974,83 +2982,3 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0013` | A function compiled for processor extensions the running processor lacks (`@features`, §13.4) |
 
 Nothing else traps, and nothing is undefined.
-
----
-
-## Appendix C: Open Questions
-
-Each question is followed by the options and the current leaning.
-
-1. **Integer overflow.** *Resolved* (2026-10-04, issue 0047): option (c). Overflow wraps
-   in every build mode (§7.6); `--overflow=trap` remains as an opt-in
-   debugging mode and `--overflow=saturate` as before. The options were:
-
-   | Option | Pros | Cons |
-   |---|---|---|
-   | **(a)** Trap in debug, saturate in release (the draft's rule until 2026-10) | Release builds never trap on overflow | Tested and shipped programs can differ. Saturation silently gives wrong answers (for example, a length stuck at `MAX`) |
-   | **(b)** Trap in every mode, plus explicit `+\|` `-\|` `*\|` saturating operators next to `+%` | One meaning everywhere. Bugs are loud. The chosen behavior is visible at each use | A check on every operation. WASM has no overflow flag, so a check costs an extra compare and branch, and multiplication needs a wider multiply |
-   | **(c)** Wrap in every mode (Go, Java): **chosen** | Cheapest. Deterministic | Overflow bugs are silent. `+%` becomes redundant |
-   | **(d)** Trap in every mode, with a per-module or per-function attribute to opt into wrapping | Keeps (b)'s semantics with a performance escape hatch | Adds an attribute syntax that v0.1 otherwise does not have |
-
-   The leaning had been (b). Measuring settled it the other way: in compute-heavy code the
-   checks were the largest remaining cost against Rust's release build (which wraps), and
-   they blocked vectorization. Overflow bugs are caught by bounds checks where they would
-   matter for memory, by `--overflow=trap` in tests, and by `@*_checked` where a program
-   must handle them.
-
-2. **`and`/`or` mixing.** Should `a and b or c` be allowed as `(a and b) or c`? *Leaning:*
-   no, keep requiring parentheses.
-3. **Optionals.** This is undecided. Generics make an optional type possible as a library
-   type, so the question is how much language support it gets:
-
-   | Option | Notes |
-   |---|---|
-   | **(a)** Library only: `union Option[T] { Some: T, None }` | No new syntax. Unwrapping is a `match`. `Option.[*T]` is 8 bytes on wasm32 (tag plus pointer), where a nullable pointer would be 4 |
-   | **(b)** `?T` sugar for `Option.[T]` with an `orelse` operator | Shorter to write. Could use a niche layout for `?*T` (address 0 means "none"), but that needs address 0 to be reserved and `@ptr_from_int(0)` to be banned for `*T` |
-   | **(c)** No optionals; use sentinel values or `!T` | Simplest, but makes "absent" and "failed" look alike |
-
-   *Leaning:* (a) now, then revisit (b) once there is real code to measure against.
-4. **Error sets.** A single program-wide error set is simple, but it does not let a function
-   say *which* errors it can return. Consider `fn f() FileError!T` with an inferred or
-   declared set, and exhaustive `match` over it.
-5. ~~**Float literal exactness.**~~ Resolved: float literals round to nearest (§6.1).
-6. **`errdefer`.** Useful for cleaning up partial allocations when a function fails.
-   *Leaning:* add it.
-7. **User-defined constraints.** v0.1 constraints are a closed builtin set (§10.5). Generic
-   containers such as a hash map currently need their hash and equality functions passed
-   as function pointers, which costs an indirect call. Options include static interfaces,
-   meaning named sets of required functions resolved at monomorphization time (not
-   vtables), or passing functions as `const` generic parameters.
-8. **Generics over SIMD.** Should there be constraints like `FloatVec` or `IntVec`, or a
-   `Vec[T, const N]` family, so that kernels can be written once for `f32x4` and `f64x2`?
-9. ~~**Threads and atomics.**~~ Resolved: see §12.8. New questions that follow from it:
-   - **Relaxed and acquire/release orderings**, for performance on ARM. They would be
-     added as extra builtins (`@atomic_load_acquire`, ...), never as defaults.
-   - **Static race prevention.** A lightweight rule could forbid passing `*mut`/`[]mut`
-     to `spawn` except through `std/sync` types or `parallel_for` ranges. It would be
-     advisory at first, as a lint.
-   - **Thread-local storage.** It needs a TLS base per WebAssembly instance.
-   - **64-bit `wait`/`notify`.**
-10. **FFI follow-ups** (the FFI itself is §14.5):
-    - **Structs by value.** This needs each platform's C calling convention (x86-64
-      SysV, AArch64, the wasm C ABI) implemented in the compiler.
-    - **Native memory sandboxing vs. FFI.** A bounds-checked linear-memory region on
-      native targets (§12.1) would make Axiom pointers offsets rather than
-      addresses, which C can't use directly. Marshalling at the `extern` boundary
-      would then be needed.
-    - **Importing C headers** (`import c "stdio.h"`). This would need a C parser, which
-      conflicts with "context-compact". Generating `extern` blocks with a separate
-      tool is the likelier path.
-11. ~~**Test blocks.**~~ Resolved: §17. Follow-ups: property-based tests (a
-    `std/testing` generator module), and benchmarks (`bench "name" { … }` with
-    `axiom test --bench`).
-12. **Loop labels.** v0.1 has none.
-13. **Relaxed SIMD.** Offer relaxed-SIMD builtins with implementation-defined results, or
-    not (the current rule)?
-14. **Separate compilation follow-ups** (§16.7):
-    - distributing precompiled packages (objects plus an interface, instead of sources);
-    - cross-module inlining at `-O2` with separate units (ThinLTO, or exporting small
-      function bodies in the interface);
-    - cache eviction;
-    - finer invalidation, where a module's dependents are recompiled only when its
-      public interface changes, not when any part of it does.

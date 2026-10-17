@@ -44,7 +44,7 @@ Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` from Homebrew, with
 
 | Path | What |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft). [Appendix C](docs/spec.md#appendix-c-open-questions) lists the open questions |
+| [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/security.md`](docs/security.md) | A security review of the standard library: findings, fixes and what is open |
 | [`docs/performance.md`](docs/performance.md) | A performance review of the standard library, with comparisons to C libraries |
