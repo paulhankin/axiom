@@ -213,10 +213,9 @@ Not yet implemented (reported with a diagnostic where relevant):
 - The debug trap map (`axiom.traps` custom section) and error-return traces
   (spec §16.4). Traps are plain `unreachable`, so the trap code isn't reported yet.
 - Global initializers containing union values with a payload (`E0353`).
-- **Native targets use real addresses for raw pointers.** Slices, arrays and all
-  checked operations behave as on wasm, but a raw pointer that points outside mapped
-  memory crashes with a signal instead of trapping deterministically. The
-  bounds-checked linear-memory region of spec §12.1 is future work.
+- **Native targets use machine addresses for raw pointers**, as spec §12.1 describes:
+  slices, arrays and all checked operations behave as on wasm, and a raw pointer that
+  points outside mapped memory crashes with a signal.
   On native targets linear memory is a region of address space reserved at the first
   `@memory_grow` (up to 1 TiB) and committed 64 KiB page at a time (std/internal/runtime/native_host.c).
 - **Data races at -O1 and above.** The spec (§12.8.2) forbids optimizations that are

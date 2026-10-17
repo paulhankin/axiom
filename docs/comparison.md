@@ -16,8 +16,8 @@ Axiom's choices differ and what each choice costs.
 | | Axiom | Zig | Rust | C++ | C |
 |---|---|---|---|---|---|
 | **Primary aim** | Code that agents can write and check locally | A better C: explicit, simple, fast to compile | Memory and thread safety without a garbage collector | Zero-cost abstraction on top of C | A portable assembler |
-| **Undefined behavior** | None: every operation has a defined result or traps | "Illegal behavior": checked in Debug/ReleaseSafe, undefined in ReleaseFast/ReleaseSmall | None in safe code; possible in `unsafe` | Pervasive | Pervasive |
-| **Memory safety** | Bounds-checked slices and linear memory; a dangling pointer reads defined but stale bytes | Checked slices in safe modes; lifetimes are up to you | Ownership and borrow checking | Up to you (RAII, smart pointers, optional hardening) | Up to you |
+| **Undefined behavior** | None in checked code. A raw-pointer access outside its object is confined to the module's memory on WebAssembly, and undefined natively (spec §12.1) | "Illegal behavior": checked in Debug/ReleaseSafe, undefined in ReleaseFast/ReleaseSmall | None in safe code; possible in `unsafe` | Pervasive | Pervasive |
+| **Memory safety** | Bounds-checked slices and arrays; raw pointers unchecked, and dangling pointers not prevented (`--sanitize=address` finds them) | Checked slices in safe modes; lifetimes are up to you | Ownership and borrow checking | Up to you (RAII, smart pointers, optional hardening) | Up to you |
 | **Allocation** | One global allocator (`std/mem`, written in Axiom), always called explicitly | Allocators passed explicitly; no global one | Global allocator, implicit in `Box`/`Vec`/`String` | Global `new`, implicit in containers | `malloc` |
 | **Cleanup** | `defer` | `defer`, `errdefer` | Destructors (`Drop`) | Destructors (RAII) | By hand (or compiler extensions) |
 | **Errors** | `!T` with one program-wide error set; postfix `!` propagates; `catch` | Error unions with per-function error sets; `try`; `catch` | `Result<T, E>` and `?`; panics | Exceptions; `std::expected` (C++23) | Return codes, `errno` |
@@ -27,9 +27,9 @@ Axiom's choices differ and what each choice costs.
 | **Hidden control flow** | None: no exceptions, destructors, overloading or implicit calls | None (by design) | Destructors, `Deref`, overloading, panics | Destructors, overloading, conversions, exceptions | Almost none (`setjmp`/`longjmp` aside) |
 | **Integer overflow** | Wraps in every build (`--overflow=trap` checks, for debugging); `+%` says so explicitly; `@add_checked`, `@add_sat` | Checked in safe modes; `+%` wraps, `+\|` saturates | Panics in debug, wraps in release | Signed: undefined; unsigned: wraps | Signed: undefined; unsigned: wraps |
 | **Data races** | Defined (each byte reads some written value); sequentially consistent atomics only | Undefined; atomics with orderings | Prevented by `Send`/`Sync` in safe code | Undefined; atomics with orderings | Undefined; atomics with orderings |
-| **SIMD** | 128-bit vector primitives (`f32x4`, `i8x16`, …) with WebAssembly semantics everywhere | `@Vector(N, T)` of any width | Intrinsics (`core::arch`); portable `std::simd` is unstable | Intrinsics, vector extensions; `std::simd` in C++26 | Intrinsics, vector extensions |
+| **SIMD** | Vector primitives of 128, 256 and 512 bits (`f32x4`, `i8x32`, `f32x16`, …) with the same results on every target; processor extensions chosen at build or run time | `@Vector(N, T)` of any width | Intrinsics (`core::arch`); portable `std::simd` is unstable | Intrinsics, vector extensions; `std::simd` in C++26 | Intrinsics, vector extensions |
 | **Grammar** | LL(1), context-free, no macros; operator precedence is a partial order | Simple, no macros | Large; macros | Very large, context-sensitive | Small, but the preprocessor sits on top |
-| **Standard library** | Small: containers, strings and Unicode (normalization, segmentation, case, line breaking, bidi), files and paths, structured logging, `{}` formatting, time, threads, TCP, an HTTP/1.1 server and client, TLS 1.3 and the cryptography under it, big integers, gzip/zlib compression, colour models, image codecs (PNG, JPEG, BMP, QOI, PNM, Radiance HDR, OpenEXR), anti-aliased 2D drawing, TrueType/OpenType fonts and rich bidirectional text layout, PDF (writing with embedded fonts, and reading with text extraction), sound files (WAV, AIFF and FLAC read and written; Ogg Vorbis and MP3 read) and resampling, JSON, Markdown (CommonMark and GFM to HTML), linear-time regular expressions | Broad (containers, formatting, JSON, an HTTP client with TLS and a server, crypto); no regular expressions | Deliberately small (no JSON, HTTP or regex: crates) | Large (containers, algorithms, `std::format`, `<regex>`, `<chrono>`); no JSON or HTTP | Minimal (`stdio`, `string.h`, `time.h`) |
+| **Standard library** | Large, and written in Axiom: containers, strings and Unicode, files and processes, threads, TCP/UDP, DNS, HTTP/1.1 and HTTP/2 servers and clients, WebSocket, TLS 1.3 and the cryptography under it, time zones, compression (deflate, brotli, zstd, xz, bzip2, lz4, snappy), archives, JSON, TOML, YAML, XML, CBOR, MessagePack and protobuf, regular expressions, HTML and Markdown, image codecs (PNG, JPEG, GIF, TIFF, WebP, AVIF and more), fonts and text shaping, 2D drawing, PDF and SVG, sound files and audio output, windows and GPU graphics on macOS and Windows ([std/README.md](../std/README.md)) | Broad (containers, formatting, JSON, an HTTP client with TLS and a server, crypto); no regular expressions | Deliberately small (no JSON, HTTP or regex: crates) | Large (containers, algorithms, `std::format`, `<regex>`, `<chrono>`); no JSON or HTTP | Minimal (`stdio`, `string.h`, `time.h`) |
 | **Formatter** | `axiom fmt` (one canonical layout, imports tidied) | `zig fmt` | `rustfmt` | `clang-format` (configurable) | `clang-format` (configurable) |
 | **Toolchain** | One binary: build, check, test, profile, fmt, packages, C headers | One binary: build system, tests, fmt, C compiler | `cargo` and friends | Many tools, no standard build or package system | Many tools, no standard build or package system |
 | **Diagnostics** | Stable codes; `--format=agent-json` with machine-applicable fixes | Human-readable | Human-readable; JSON with suggestions | Human-readable; SARIF in some compilers | Human-readable; SARIF in some compilers |
@@ -172,20 +172,23 @@ one-token way to pass an error up. The differences show up at the edges:
 | **Division by zero** | Trap `T0003` | Panic / undefined | Panic | Undefined | Undefined |
 | **Shift by ≥ the width** | Defined: the mathematical result (`0`, or `-1` for a negative `>>`) | Rejected by the shift-amount type unless cast | Panic in debug, count masked in release | Undefined | Undefined |
 | **A read of uninitialized memory** | Defined: a `let mut x: T = undefined` local, like allocator memory, holds unspecified bytes, never poison | Allowed through `undefined`; reading it is illegal behavior, mostly unchecked | Rejected at compile time | Undefined (erroneous behavior in C++26) | Undefined |
-| **A null pointer is used** | There is no null. Address 0 is ordinary memory | Only `?*T` (or `allowzero`) can be null; making a null `*T` is illegal behavior | No null in safe code | Undefined | Undefined |
-| **Use after free** | Reads whatever bytes are there now: a logic bug with defined behavior (`--sanitize=address` traps on it) | Undefined | Rejected at compile time | Undefined | Undefined |
+| **A null pointer is used** | There is no null. Address 0 is not an object: natively an access there crashes with a report; on WebAssembly it reads the bottom of the stack | Only `?*T` (or `allowzero`) can be null; making a null `*T` is illegal behavior | No null in safe code | Undefined | Undefined |
+| **Use after free** | On WebAssembly, unspecified bytes, never outside the module's memory; natively, undefined (spec §12.1). `--sanitize=address` traps on it | Undefined | Rejected at compile time | Undefined | Undefined |
 | **A data race** | Each byte reads a value some store wrote (tearing allowed) | Undefined | Rejected at compile time | Undefined | Undefined |
 | **An invalid union tag** | Trap `T0007` at `match` | Panic / undefined | Cannot happen in safe code | Undefined (`std::variant` is safe) | Undefined |
 | **A floating-point expression** | Evaluated as written: no FMA contraction, no fast-math | As written unless `@setFloatMode(.optimized)` | As written | Contraction is allowed and some compilers do it by default | The same as C++ (`FP_CONTRACT`) |
 
-Rust and Axiom both remove undefined behavior, but in opposite ways. Rust **rejects**
+Rust and Axiom both shrink undefined behavior, but in different ways. Rust **rejects**
 programs whose memory use it cannot prove sound, and gives an escape hatch (`unsafe`) in
-which UB is back. Axiom **defines** what every operation does, WebAssembly-style: memory
-is one bounds-checked byte array, so a dangling pointer, a race or a type pun gives a wrong
-answer, never a license for the optimizer. The compiler may not optimize on the assumption
-that UB is absent, because there is none. Axiom catches fewer bugs at compile time than
-Rust. In exchange its programs are simpler (no lifetimes, no borrow checker), and a bug
-has one reproducible outcome instead of whatever the optimizer made of it.
+which UB is back. Axiom **defines** what every checked operation does: an index out of
+bounds, an overflow, a shift, a race or a type pun gives a trap or a defined answer, never
+a license for the optimizer. What it does not check is raw pointers. An access through a
+pointer must stay inside the object the pointer came from; on WebAssembly a program that
+breaks that rule can only corrupt its own memory, but natively it is undefined behavior,
+as in C, and the compiler relies on the rule (and on no other). Axiom catches fewer bugs
+at compile time than Rust. In exchange its programs are simpler (no lifetimes, no borrow
+checker), and code that keeps to slices has one reproducible outcome instead of whatever
+the optimizer made of it.
 
 Zig sits between them. It has UB, but its safe build modes check most of it at run time.
 C and C++ leave most mistakes undefined. Sanitizers and hardened library modes help, but
@@ -223,7 +226,7 @@ line of Axiom does what its tokens say.
 | Propagate | `f()!` | `try f()` | `f()?` | Automatic (exceptions) or by hand | By hand |
 | Handle | `catch`, `catch \|e\|` | `catch`, `catch \|e\|` | `match`, combinators | `try`/`catch`, or by hand | By hand |
 | Payload | None: the error is its name | None | Any value | Any value | None |
-| Traces | Error return traces in debug builds (§16.4) | Error return traces in safe builds | Backtraces on panic; errors carry none | Stack traces through `std::stacktrace` (C++23), by hand | None |
+| Traces | Error return traces: where each error started and the path it took (§17.4.2) | Error return traces in safe builds | Backtraces on panic; errors carry none | Stack traces through `std::stacktrace` (C++23), by hand | None |
 | Unrecoverable | Trap: the program stops, `defer` does not run | Panic | Panic (unwinds or aborts) | `std::terminate` | `abort` |
 
 Axiom's error names form **one set for the whole program**. Any function can return any
@@ -237,8 +240,8 @@ report context returns a struct or writes to a caller's buffer.
 
 - **Axiom** generics are monomorphized. A type parameter has at most one constraint
   from a closed, builtin set (`Eq`, `Ord`, `Num`, `Int`, `SignedInt`, `UnsignedInt`,
-  `Float`), and a generic body is **type-checked once, at its definition**, against that
-  constraint. An error therefore never appears inside a library generic because of a type
+  `Float`, `FloatVector`), and a generic body is **type-checked once, at its
+  definition**, against that constraint. An error therefore never appears inside a library generic because of a type
   argument a caller chose: it is reported at the line the caller wrote. There is no
   specialization, overloading, variadic generics, compile-time execution or dynamic
   dispatch. Behavior varies through function pointers or tagged unions.
@@ -287,8 +290,7 @@ small, but real code relies on the preprocessor.
 
 ## Numbers and SIMD
 
-- **Integers.** Integer arithmetic wraps by default in every build, as in Go and Java
-  (issue 0047). A build can opt into checking (`--overflow=trap`, which traps with
+- **Integers.** Integer arithmetic wraps by default in every build, as in Go and Java. A build can opt into checking (`--overflow=trap`, which traps with
   `T0002`) or saturation (`--overflow=saturate`); the overflow mode is the only build
   setting that can change what a program means, and optimization levels must not. The
   wrapping operators (`+%`, `-%`, `*%`) remain as explicit spellings, and
@@ -299,12 +301,15 @@ small, but real code relies on the preprocessor.
   (`ckd_add`), but plain signed overflow stays undefined.
 - **Floating point.** IEEE 754 with no contraction, no reassociation and no fast-math
   flag in Axiom. Rust behaves the same by default. C and C++ allow contraction.
-- **SIMD.** Axiom's vector types are primitives of exactly 128 bits (`i8x16` …
-  `f64x2`, `v128`). Their semantics are WebAssembly's on every target, so a vector program
-  gives the same bits on wasm, x86-64 and AArch64. Zig's `@Vector` has any width and
-  lowers to the target's best instructions. Rust has per-architecture intrinsics (stable)
-  and portable `std::simd` (unstable). C and C++ use intrinsics or compiler extensions
-  (C++26 adds `std::simd`). Axiom trades 256- and 512-bit AVX width for portability.
+- **SIMD.** Axiom's vector types are primitives of 128, 256 and 512 bits (`i8x16` …
+  `f64x8`, `v128` … `v512`). Their semantics are WebAssembly's on every target, so a
+  vector program gives the same bits on wasm, x86-64 and AArch64; where the target is
+  narrower, the compiler splits wide vectors. Target conditions and `@multiversion`
+  choose AVX2, AVX-512 or other extensions at build or run time. Zig's `@Vector` has any
+  width and lowers to the target's best instructions. Rust has per-architecture
+  intrinsics (stable) and portable `std::simd` (unstable). C and C++ use intrinsics or
+  compiler extensions (C++26 adds `std::simd`). Axiom has no scalable vectors (SVE) or
+  mask types yet.
 
 ## Concurrency
 
@@ -325,9 +330,10 @@ weakly ordered CPUs such as ARM.
 
 - **Axiom** targets x86-64 and AArch64 natively (Linux, macOS on Apple silicon, Windows)
   and WebAssembly (`wasm32`, `wasm64`, freestanding or WASI). `extern "C"` blocks call
-  C, `export fn` exposes functions, and the compiler generates a C header for them. The self-hosted compiler has
-  its own backends and linkers. Programs it builds make Linux system calls directly and
-  are static executables with no C library, unless they link C code (as Zig's do).
+  C, `export fn` exposes functions, and the compiler generates a C header for them. The
+  compiler has its own backends and linkers. On Linux the programs it builds make system
+  calls directly and are static executables with no C library, unless they link C code
+  (as Zig's do); on macOS they use libSystem, and on Windows the system DLLs.
 - **Zig** cross-compiles to almost anything, imports C headers directly (`@cImport`) and
   is also a C compiler (`zig cc`).
 - **Rust** targets everything LLVM does (and wasm well), with C interop through `extern`
@@ -336,10 +342,11 @@ weakly ordered CPUs such as ARM.
 
 ## What Axiom costs you
 
-- **No compile-time memory safety.** Use-after-free and races are defined but not
-  prevented. Rust prevents them; Axiom only makes their effects reproducible, and
-  finds lifetime errors at run time with `--sanitize=address` (use after free, double
-  free, leaks) when you ask. There is no race detector.
+- **No compile-time memory safety, and unchecked raw pointers.** Use after free is not
+  prevented, and natively a raw pointer outside its object is undefined behavior, as in
+  C. Rust prevents both. Axiom finds lifetime errors at run time with
+  `--sanitize=address` (use after free, double free, leaks) when you ask. Races are
+  defined but not prevented, and there is no race detector.
 - **Bounds checks and SC atomics cost speed.** The optimizer removes many checks, but not
   all.
 - **Less abstraction.** No traits or interfaces, no closures, no macros, no compile-time
@@ -347,20 +354,17 @@ weakly ordered CPUs such as ARM.
   in Rust or C++, which is deliberate: it is easier to read one line at a time.
 - **One error set and no error payloads.** Less type information about failures than
   Zig or Rust.
-- **Only 128-bit SIMD.**
-- **Young.** Axiom is a v0.1 draft with a small standard library (no time
-  zones, no locale-aware formatting) and no third-party ecosystem. On native targets, the linear-memory bounds model of §12.1 is not yet
-  implemented: a raw pointer outside mapped memory crashes with a signal instead of a
-  deterministic trap (slices, arrays and the other checks behave as on wasm). On this
-  repository's benchmarks, the self-hosted compiler's own backend produces code that takes
-  between 0.8 and 1.6 times as long as the LLVM-built code from the C compiler
-  (`cmd/axiom/bench.sh`).
+- **Young.** Axiom is a v0.1 draft with no third-party ecosystem, and its standard
+  library has no locale-aware formatting. On this repository's benchmarks
+  (`cmd/axiom/bench.sh`), the compiler's own backend produces code that takes between
+  0.7 and 1.05 times as long as the LLVM-built code of the bootstrap compiler, and the
+  compiler it builds compiles about twice as fast as the LLVM-built one.
 
 ## Choosing
 
 - **Axiom**: code that agents generate and maintain, WebAssembly modules, programs
-  where "the same answer every time, or a precise trap" matters more than peak speed or
-  abstraction.
+  where "the same answer every time, or a precise trap" (in code that keeps to slices)
+  matters more than peak speed or abstraction.
 - **Zig**: C's domain with better defaults, cross-compilation and C interop, and
   `comptime` when you need generation.
 - **Rust**: large programs where memory and thread safety must be proven, and where a

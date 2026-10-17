@@ -6,8 +6,9 @@ WebAssembly. Its design mandate is:
 
 - **zero hidden control flow**: no exceptions, destructors, operator overloading, or implicit allocation
 - **context-compact grammar**: LL(1), context-free, no macros, one canonical form
-- **zero undefined behavior**: every operation has a defined result or a deterministic trap
-- **first-class SIMD**: 128-bit vector primitives, with the same (WebAssembly's) semantics on every target
+- **no undefined behavior outside raw pointers**: arithmetic, slices, arrays and every other checked
+  operation have a defined result or a deterministic trap; a raw pointer must stay inside its object (spec §12.1)
+- **first-class SIMD**: vector primitives of 128, 256 and 512 bits, with the same (WebAssembly's) semantics on every target
 - **explicit allocation**: one global allocator (`std/mem`, written in Axiom), called explicitly; no language construct allocates
 
 ## Quick start
@@ -47,7 +48,6 @@ Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` from Homebrew, with
 | [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/security.md`](docs/security.md) | A security review of the standard library: findings, fixes and what is open |
-| [`docs/performance.md`](docs/performance.md) | A performance review of the standard library, with comparisons to C libraries |
 | [`cmd/axiom/`](cmd/axiom/README.md) | The compiler, written in Axiom: its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers; no LLVM, no C toolchain |
 | [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 with LLVM, used only to bootstrap the one above (to a fixed point) |
 | [`cmd/axiom/internal/tests/`](cmd/axiom/internal/tests/run.mjs) | The test suite: run-and-compare programs, expected compile errors, `axiom test`, packages; its `tools/` generates test data and holds the std fuzzer and benchmark |

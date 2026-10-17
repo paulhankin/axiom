@@ -66,8 +66,8 @@ Each principle below is paired with the concrete rules that enforce it.
 |---|---|
 | **Zero hidden control flow** | No exceptions, destructors, operator overloading, implicit calls, getters, or implicit allocation. The only non-local exits are `return`, `break`, `continue`, postfix `!`, `catch … return`, and traps. `defer` is written out at the point where it is registered. |
 | **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `axiom fmt`. |
-| **Zero undefined behavior** | Arithmetic, shifts, casts, and memory access all have defined results or traps. Memory is an abstract, bounds-checked linear byte array (§12). Compilers MUST NOT optimize on assumptions that the absence of UB would otherwise justify. |
-| **First-class SIMD** | 128-bit vector types are primitives. WASM semantics are the reference semantics, on every target. |
+| **No undefined behavior outside raw pointers** | Arithmetic, shifts, casts, slices, arrays and every other checked operation have defined results or trap. The one rule a program can break unchecked is that an access through a raw pointer stays inside the object the pointer came from (§12.1): on WebAssembly the damage stays inside the module's memory, and on native targets it is undefined behavior. Compilers MUST NOT optimize on any other assumption. |
+| **First-class SIMD** | Vector types of 128, 256 and 512 bits are primitives. WebAssembly's semantics are the reference semantics, on every target. |
 | **Explicit allocation** | No language construct allocates. Heap memory comes from one global allocator, `std/mem` (§15.1), through calls you can see (`mem.alloc`, `mem.free`); `defer` releases it. |
 
 A secondary principle is **locality of reasoning**. The meaning of a line of code should
@@ -550,7 +550,7 @@ Through a `[]mut T`, they are readable and writable.
 
 ### 5.7 Raw pointers: `*T` and `*mut T`
 
-A raw pointer is an address in linear memory (§12). It has the same size as `usize`.
+A raw pointer is the address of a byte in memory (§12.1). It has the same size as `usize`.
 Pointers are **non-nullable in the type system**: the language has no `null` literal. The
 only operations on pointers are:
 
@@ -573,9 +573,8 @@ allocator), or just past its end. Compilers rely on the promise to fold constant
 into addressing (on WebAssembly, `v128.load offset=16` rather than an add and an overflow
 check). The promise is not checked. A result outside the object is a logic bug, like a
 wrong `@ptr_from_int` address, but with a weaker guarantee: code compiled on the promise
-may have moved or merged the accesses, so loads and stores through it reach unspecified
-addresses (still checked against linear memory where §12.1 applies) and comparisons
-with it give unspecified results.
+may have moved or merged the accesses, so loads and stores through it break the access
+rule (§12.1) and comparisons with it give unspecified results.
 
 ```axiom
 let row = @ptr_add(base, r * 8);          // base: *f32x4, after checking the matrix's length
@@ -764,7 +763,7 @@ All other conversions use builtins (Appendix A):
 | `@int_from_enum(x)` | An enum member's value, in the representation type (§5.14) | Never fails |
 | `@enum_from_int(E, n)` | The member of enum `E` whose value is `n` | Traps if there is none (`T0007`) |
 | `@int_from_ptr(p)` | Address as `usize` | Never fails |
-| `@ptr_from_int(P, n)` | `usize` to pointer type `P` | Never fails. Any address is valid to form |
+| `@ptr_from_int(P, n)` | `usize` to pointer type `P` | Never fails. Any address is valid to form; what it may access is §12.1's rule |
 | `@ptr_cast(P, p)` | Changes the pointee type | Never fails. Alignment is not semantic (§12.5) |
 
 ---
@@ -1469,44 +1468,81 @@ does not capture stack traces implicitly. (Debug builds MAY record error return 
 
 ## 12. Memory Model
 
-### 12.1 Abstract linear memory
+### 12.1 Objects, pointers and the access rule
 
-All addressable data lives in a single **linear memory**: a byte array `M[0 .. size)` whose
-size may grow at run time (`@memory_grow`). A pointer is an index into `M`. This is the
-WebAssembly memory model, adopted as the semantics on **every** target.
+Memory holds **objects**: globals and string literals, locals whose address is taken,
+blocks from the allocator (§12.4), pages from `@memory_grow`, and memory that C code or the
+host hands over. Within an object, memory is plain bytes:
 
-- A **load** of `k` bytes at address `a` traps (`T0005`) if `a + k > size`. Otherwise it
-  reads `M[a .. a+k)` as little-endian.
-- A **store** is defined in the same way.
-- Every address in bounds is readable and writable. Nothing is "invalid" beyond the bounds
-  check.
+- A load of `k` bytes at address `a` reads the bytes from `a` up to `a + k` as
+  little-endian, and a store writes them. Any type may be read from any bytes: **type punning** through
+  `@ptr_cast` is defined. Loads of `bool` normalize (§5.3), and invalid union tags trap at
+  `match` (§5.10).
+- Misaligned accesses are defined (§12.5).
+- There is no strict-aliasing rule: compilers MUST NOT assume that two pointers do not
+  alias because of their types, and two pointers into one object may alias freely.
 
-Because of this:
+A pointer is the address of a byte, the size of `usize`. It **comes from** an object
+when it is made from that object: by `&` (or a slice of it), as a slice's `.ptr`, from
+the allocator, or from such a pointer by `@ptr_add`, `@ptr_sub` or `@ptr_cast`. A
+pointer made from an integer (`@ptr_from_int`) comes from any object whose address the
+program has **exposed**: stored in memory, passed to or returned from a function, or
+converted to an integer with `@int_from_ptr`.
 
-- A **dangling pointer** (use after free) reads whatever bytes
-  are currently at that address. The value is unspecified, but the behavior is defined.
-  It is a logic bug, not UB.
-- **Type punning** through `@ptr_cast` is defined: it reads the bytes as the new type.
-  Loads of `bool` normalize (§5.3), and invalid union tags trap at `match` (§5.10).
-- **Aliasing**: compilers MUST NOT assume that two pointers do not alias, whatever their
-  types. There is no strict-aliasing rule and no implicit `restrict`.
+**The access rule.** A load or store through a pointer touches only the object the
+pointer comes from, and only while that object exists: a global or string literal
+always, a local until its function returns, an allocator block until it is freed. Nothing
+writes a `let` global (one without `mut`) or a string literal.
+
+Compilers rely on the rule, and on nothing else. They may assume that accesses through
+pointers from different objects do not overlap, that a local whose address is never
+exposed is reached only through the function's own pointers to it, that what the
+allocator returns is a new object no earlier pointer points into, and that constant data
+does not change.
+
+The checked operations never break the rule: indexing and slicing (§7.8), `@load` and
+`@store` on slices, `@mem_copy`, `@mem_set` and `@mem_eq`, and `for` over a slice all trap
+first. Only a raw pointer can break it: one that dangles (its object freed, or its
+function returned), one moved outside its object by `@ptr_add` (§5.7) or made from a
+wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code in C
+(§14.5.5) can break it too. What happens then depends on the target:
+
+- **WebAssembly.** All memory is the module's one linear memory, `M[0 .. size)`. An
+  access that reaches past `size` traps (`T0005`). Any other access reads or writes
+  whatever bytes are at that address, which may belong to another object, the stack or
+  the allocator: the results are unspecified from then on, and since the compiler relied
+  on the rule they need not match a naive reading of the code. But the damage stays in
+  linear memory. Code, return addresses and the host are outside it, and calls through
+  function pointers are checked, so control flow is never hijacked.
+- **Native targets.** Pointers are machine addresses (§14.5.5), and accesses through
+  them are not checked. Breaking the rule is **undefined behavior**: an access may reach
+  another object, the allocator's own data, or the native stack with its return
+  addresses, and so may change anything the process does. An access to unmapped memory
+  (address 0 among it) stops the program with a crash report and a stack trace (§16.4);
+  in a test binary it is reported as `T0005`.
+
+There is no null: address 0 is not an object on any target. A pointer from C that may be
+NULL is checked with `std/c.is_null` (§14.5.4). `--sanitize=address` (§16.8) finds the
+commonest breaches of the rule, use after free and accesses outside a heap block, and
+traps on them with `T0012`.
 
 ### 12.2 Where values live
 
-- **Globals** (`let`, `let mut` at module level) and **string literals** are in static
-  regions of linear memory.
-- **Locals whose address is never taken** have no address. They may live in WASM locals or
-  registers, and no pointer can reach them.
-- **Locals whose address is taken** (`&x`, `&mut x`, a slice of an array local, or an
-  implicit `&` in a method call) live in a **shadow stack** in linear memory. After the
-  function returns, their bytes may be reused. A pointer to them then reads unspecified
-  bytes (defined, per §12.1). The compiler SHOULD warn when such a pointer escapes
-  (`W0710`).
+| | WebAssembly | Native targets |
+|---|---|---|
+| Globals and string literals | data segments of linear memory, all of them writable | the executable's data sections. `let` globals and string literals are read-only (a write faults), except, on Linux and macOS, constants that hold addresses, which the loader relocates |
+| Locals whose address is never taken | WebAssembly locals or registers; no pointer reaches them | registers or the stack frame; no pointer reaches them |
+| Locals whose address is taken (`&x`, `&mut x`, a slice of an array local, an implicit `&` in a method call) | the thread's stack in linear memory (the main thread's is the lowest 1 MiB) | the native stack frame |
+| Allocator blocks and `@memory_grow` pages | linear memory | one region of address space, reserved at the first `@memory_grow` (up to 1 TiB) |
+| Memory from C or the host | linear memory, which C code linked into the module shares | anywhere in the process |
+
+After a function returns, its locals' storage is reused, and a pointer to one of them
+dangles. The compiler SHOULD warn when such a pointer escapes (`W0710`).
 
 ### 12.3 No uninitialized values
 
 Every local and global has an initializer. Memory obtained from the allocator, and a
-local initialized with `undefined` (§8.1), has unspecified contents (§12.1) but is never
+local initialized with `undefined` (§8.1), has unspecified contents but is never
 "poison".
 
 ### 12.4 Allocation
@@ -1538,7 +1574,7 @@ on alignment. `@align_of(T)` reports the natural alignment used for layout.
 
 ### 12.6 Concurrency
 
-Programs may run several threads over the one linear memory. §12.8 defines threads,
+Programs may run several threads over the same memory. §12.8 defines threads,
 the memory model, and atomics.
 
 ### 12.7 Traps
@@ -1579,7 +1615,7 @@ This section defines shared-memory concurrency. The design follows from three fa
 
 #### 12.8.2 Memory model
 
-- All threads share the whole linear memory (§12.1). Each thread has its own stack.
+- All threads share all memory (§12.1, §12.2). Each thread has its own stack.
   Locals whose address is never taken are private to their thread.
 - **Atomic operations** (§12.8.3) on the same location are *sequentially consistent*.
   All threads observe them in a single total order that is consistent with each
@@ -1675,8 +1711,8 @@ copy starts with the initializer's value, whatever other threads have done to th
 and lives as long as the thread. The main thread's copy is the one it starts with.
 Otherwise a thread-local is an ordinary global: it is read, assigned and passed by
 address (`&mut calls`) in the same way, and a pointer to it may be given to another
-thread, which then accesses the first thread's copy (a pointer is just an address,
-§12.1). Such a pointer dangles once its thread has ended.
+thread, which then accesses the first thread's copy. Such a pointer dangles once its
+thread has ended (§12.1).
 
 A thread-local must be `mut` (E0354). `threadlocal` is recognized only before a
 module-level `let` and is otherwise an ordinary identifier.
@@ -1937,7 +1973,7 @@ std/hash/crc, with the portable code where they are absent.
 | `wasm32-freestanding` | 32 | No WASI and no imports except those declared |
 | `wasm32-wasi` | 32 | Standard library may use WASI imports |
 | `wasm64-freestanding` | 64 | memory64 |
-| native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Bounds checks against it (§12.1) are future work |
+| native (`x86_64-*`, `aarch64-*`) | 64 | Allocator memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Pointers are machine addresses, and accesses through them are not checked (§12.1) |
 | `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; self-hosted compiler only. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
 | `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; self-hosted compiler only. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Debug symbols (function names and line tables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. Not yet supported: linking C code or `-l` libraries |
 
@@ -2083,8 +2119,9 @@ twice can corrupt the Axiom program, just as it could corrupt any C program. The
 
 - On WebAssembly, the damage is confined to the module's linear memory, like
   everything else.
-- On native targets, Axiom's pointers are real addresses (see the compiler README),
-  which is what makes pointers interchangeable with C at no cost.
+- On native targets, Axiom's pointers are machine addresses, which is what makes them
+  interchangeable with C at no cost, and C code can damage anything in the process, as
+  an Axiom access that breaks §12.1's rule can.
 
 ## 15. Standard Library Core
 
@@ -2119,7 +2156,8 @@ These are ordinary functions (§10), not builtins. The rules:
   allocator knows the size without storing it. Freeing memory that did not come from the
   allocator, or with the wrong size, traps (`T0000`) where the allocator can tell: always
   for an address outside its spans and blocks, and for a large block freed twice. Other
-  double frees are logic bugs with defined behavior (§12.1).
+  double frees corrupt its state, so that later blocks may overlap, and break the access
+  rule (§12.1).
 - **Failure.** `alloc`, `realloc`, `dup`, `new` and `create` return `error.OutOfMemory` when the
   system has no more memory or the byte count overflows. `realloc` leaves the old slice
   valid when it fails.
@@ -2874,7 +2912,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | Builtin | Signature | Notes |
 |---|---|---|
 | `@ptr_add(p, n)` / `@ptr_sub(p, n)` | `*T, usize → *T` (`*mut T → *mut T`) | `n` elements of `T` past (before) `p`. Never traps; the result must stay in `p`'s object (§5.7) |
-| `@slice_from_ptr(p, n)` | `*T, usize → []T` (`*mut T → []mut T`) | No check at creation. Accesses are bounds-checked against linear memory |
+| `@slice_from_ptr(p, n)` | `*T, usize → []T` (`*mut T → []mut T`) | No check at creation. The slice's accesses are bounds-checked against `n`, so `p` and `n` must describe memory of one object (§12.1) |
 | `@prefetch(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be read soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
 | `@prefetch_write(p)` | `*T → void` (or `*mut T`) | A hint that `p`'s memory will be written soon; no other effect, never traps (§5.7). Nothing on WebAssembly |
 | `@cast_slice(T, s)` | `[]U → []T` (keeps mutability) | Traps `T0006` if `s.len * size_of(U)` is not a multiple of `size_of(T)` |
@@ -2981,4 +3019,5 @@ This is the complete list of runtime traps. Each has a stable code.
 | `T0012` | Memory error found by the address sanitizer (§16.8) |
 | `T0013` | A function compiled for processor extensions the running processor lacks (`@features`, §13.4) |
 
-Nothing else traps, and nothing is undefined.
+Nothing else traps. The only undefined behavior is an access that breaks the rule of §12.1
+on a native target.
