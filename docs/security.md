@@ -1,112 +1,99 @@
-# Security review of the standard library
+# Security of the standard library
 
-This is a record of a review of `std/` for problems with untrusted input,
-what was found, and what was changed. It also says what is still open and
-how to go on checking.
+How `std/` is meant to behave on untrusted input, the defences it has, and how to
+check them. To report a vulnerability, see [`SECURITY.md`](../SECURITY.md).
 
 ## What "safe" means here
 
-Axiom checks bounds, so bad input can't corrupt memory. Integer overflow
-wraps (spec §7.6; until issue 0047 it trapped): sizes computed from input
-use `@mul_checked`/`@add_checked`, and a wrapped index still meets a
-bounds check. Input can still cause harm in four ways:
+Checked code cannot corrupt memory: indexing and slicing are bounds-checked, and
+integer overflow wraps (spec §7.6), so sizes computed from input use
+`@mul_checked`/`@add_checked` and a wrapped index still meets a bounds check. Where
+std uses raw pointers (the allocator, the runtime, codecs' inner loops), it keeps to
+the access rule of spec §12.1. Input can still cause harm in four ways:
 
-- **Traps.** An out-of-bounds index (or an overflow, in an
-  `--overflow=trap` build) that input can reach kills the process. For a
-  server, that is a denial of service.
-- **Resource exhaustion.** Input can make the program allocate without
-  limit, or do work that grows faster than linearly: nested structures,
-  backtracking, quadratic loops, decompression bombs.
-- **Protocol bugs.** Some inputs are accepted that should be refused:
-  request smuggling, certificate-checking gaps, TLS state-machine holes.
-- **Environment problems.** Files, paths, symbolic links, permissions and
-  terminal output are all places where input can do damage.
+- **Traps.** An out-of-bounds index (or an overflow, in an `--overflow=trap` build) that
+  input can reach kills the process. For a server, that is a denial of service.
+- **Resource exhaustion.** Input can make the program allocate without limit, or do
+  work that grows faster than linearly: nested structures, backtracking, quadratic
+  loops, decompression bombs.
+- **Protocol bugs.** Some inputs are accepted that should be refused: request
+  smuggling, certificate-checking gaps, TLS state-machine holes.
+- **Environment problems.** Files, paths, symbolic links, permissions and terminal
+  output are all places where input can do damage.
 
-The rule the library now follows is: **for any input, a parser returns an
-error, and work and memory are bounded by a small multiple of the input's
-size** (or by a documented limit).
+The rule every parser follows: **for any input, it returns an error, and its work and
+memory are bounded by a small multiple of the input's size** (or by a documented
+limit).
 
-## How the review was done
+## Checking
 
-1. Each module was read with the four questions above in mind. Five review
-   passes covered: media codecs, network/TLS/X.509, memory and runtime,
-   text formats, and the filesystem.
-2. Mutation fuzzing: `cmd/axiom/internal/tests/tools/fuzz.py`, which drives `cmd/axiom/internal/tests/fuzz/fuzz.ax`.
-   Seeds come from std's own encoders, plus ffmpeg/sox sounds, system
-   fonts and CA certificates. Mutated inputs run through every parser
-   target, and a trap, a signal or a hang (10 s) is saved as a failure.
-3. Every fix has a regression test beside the code, usually a hostile
-   input that has to fail quickly or produce a bounded result.
+- **Regression tests.** Every defence below has a test beside the code, usually a
+  hostile input that has to fail quickly or produce a bounded result.
+- **Fuzzing.** `cmd/axiom/internal/tests/tools/fuzz.py` mutates seed inputs (made by
+  std's own encoders, plus sounds from ffmpeg and sox, system fonts and CA
+  certificates) and runs them through every parser target of
+  `cmd/axiom/internal/tests/fuzz/fuzz.ax`; a trap, a signal or a hang (10 s) is saved as
+  a failure:
 
-To run the fuzzer:
+      cmd/axiom/internal/tests/tools/fuzz.py --runs 5000            # all targets
+      cmd/axiom/internal/tests/tools/fuzz.py --runs 20000 pdf font  # some of them
 
-    cmd/axiom/internal/tests/tools/fuzz.py --runs 5000            # all targets
-    cmd/axiom/internal/tests/tools/fuzz.py --runs 20000 pdf font  # some of them
+- **The address sanitizer.** `axiom test --sanitize=address` (spec §16.8) traps on use
+  after free, double frees and out-of-block accesses in the heap, and reports leaks.
 
-## Findings and fixes
+Known gaps are GitHub issues: [#37](https://github.com/paulhankin/axiom/issues/37)
+(symbolic links under the node host), [#38](https://github.com/paulhankin/axiom/issues/38)
+(regex `find_all`), [#39](https://github.com/paulhankin/axiom/issues/39) (X.509 name
+constraints), [#40](https://github.com/paulhankin/axiom/issues/40) (deep directory
+trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer fuzzing).
 
-### Media (images, audio, fonts, compression)
+## Defences
 
-| Where | Problem | Fix |
-|---|---|---|
-| JPEG | fractional chroma sampling indexed past the MCU; unbounded progressive scans; a small file could claim huge dimensions | reject fractional sampling; at most 256 scans; stop early on fake bytes; require `pixels / 512 <= data.len` |
-| EXR | 32-bit size products overflowed; tile/line sizes unchecked; duplicate blocks; a huge alpha fill (found by fuzzing) | 64-bit checked sizes, clamped tiles, a seen-block bitmap, `raw / 2048 <= data.len`, shared PIZ scratch space |
-| FLAC | block size and preallocation taken from the header | `MAX_BLOCK = 65536`; preallocation capped at 1 MiB |
-| Vorbis | codebook sort was quadratic | heapsort on packed keys |
-| font | GPOS kerning rescanned every subtable per pair (found by fuzzing); cmap 12 overflowed and could return glyphs past `numGlyphs`; CFF INDEX offSize unchecked | kerning subtables precomputed (at most 32); wrapping cmap arithmetic with a `gid < num_glyphs` check; offSize must be 1..4, with saturating offsets |
+### Media: images, audio, fonts, compression
+
+| Where | What std does |
+|---|---|
+| JPEG | refuses fractional chroma sampling; at most 256 progressive scans; stops early on filler bytes; a file must be at least `pixels / 512` bytes for the size it claims |
+| EXR | 64-bit checked size products; tiles clamped to the image; each block decoded once (a seen-block bitmap); `raw / 2048 <= data.len`; shared PIZ scratch space |
+| FLAC | block size at most `MAX_BLOCK` (65536); preallocation from the header capped at 1 MiB |
+| Vorbis | codebooks sorted in O(n log n) (heapsort on packed keys) |
+| fonts | GPOS kerning subtables precomputed (at most 32), never rescanned per pair; cmap format 12 arithmetic wraps and every glyph id is checked against `numGlyphs`; CFF INDEX `offSize` must be 1 to 4, with saturating offsets |
 
 ### Network, TLS and X.509
 
-| Where | Problem | Fix |
-|---|---|---|
-| http | request smuggling (duplicate or odd `Content-Length`, `Transfer-Encoding` on HTTP/1.0, loose chunk sizes), header injection, slowloris | strict Content-Length and Transfer-Encoding parsing; exactly one Host; control characters rejected; strict chunk sizes; at most 100 trailers; a request deadline (`Options.request_timeout_ms`) |
-| http client | CR/LF and spaces in methods, headers and URLs | validated; hosts limited to letters, digits, `-` and `.` |
-| http router | `..`, `/` and NUL in parameters | rejected (except for `*`), so `/files/:name` can't escape |
-| tls | unbounded post-handshake messages; ChangeCipherSpec accepted at any time; no handshake timeout; ALPN not checked against the offer; leftover handshake bytes across a key change | 64 KiB cap; ChangeCipherSpec only as a single `0x01` before the handshake completes; a 20 s handshake deadline; ALPN must be one that was offered; `RecordOverflow` on inner plaintext; KeyUpdate validated; NewSessionTicket only accepted by clients |
-| tls client | the server's session id echo and the HelloRetryRequest's choices were not checked | the echo must match; the ServerHello after a retry must keep its suite and group |
-| x509 | unbounded signature checks while building a path; name constraints bypassed by a trailing dot or a wildcard; trailing data and duplicate extensions accepted | at most 64 signature checks; names are trimmed and a wildcard is checked as a representative name; both are rejected |
-| rsa, der, base64, hmac, aes-gcm, chacha | huge public exponents; non-minimal integers; loose padding; HKDF output past `255 * n`; messages past the AEAD limits | each rejected, or a trap for a programming error |
-| hash maps | the hash was unkeyed, so collisions could be precomputed (hash flooding) | SipHash-1-3 with a per-process random key |
-| DNS (native) | fixed query id, unconnected socket, answers not matched to the question | random id, connected socket, question checked |
+| Where | What std does |
+|---|---|
+| http server | strict `Content-Length` and `Transfer-Encoding` parsing (no duplicates, no `Transfer-Encoding` on HTTP/1.0, strict chunk sizes) against request smuggling; exactly one `Host`; control characters refused in headers; at most 100 trailers; a request deadline (`Options.request_timeout_ms`) against slowloris |
+| http client | methods, headers and URLs validated (no CR, LF or spaces); host names limited to letters, digits, `-` and `.` |
+| http router | `..`, `/` and NUL refused in path parameters (except `*`), so `/files/:name` cannot escape |
+| tls | post-handshake messages capped at 64 KiB; ChangeCipherSpec accepted only as a single `0x01` before the handshake completes; a 20 s handshake deadline; ALPN must be one that was offered; `RecordOverflow` on oversized inner plaintext; no handshake bytes carried across a key change; KeyUpdate validated; NewSessionTicket accepted by clients only |
+| tls client | the server's session id echo must match; the ServerHello after a HelloRetryRequest must keep its suite and group |
+| x509 | at most 64 signature checks while building a path; names trimmed of a trailing dot and wildcards checked as a representative name against name constraints; trailing data and duplicate extensions refused |
+| rsa, der, base64, hmac, aes-gcm, chacha20-poly1305 | huge public exponents, non-minimal integers, loose padding, HKDF output past `255 * n` and messages past the AEAD limits are refused (or trap, where they are programming errors) |
+| hash maps | SipHash-1-3 with a per-process random key, against hash flooding |
+| dns | a random query id, a connected socket, and answers matched to the question |
 
 ### Memory and runtime
 
-| Where | Problem | Fix |
-|---|---|---|
-| mem | enormous size requests overflowed size arithmetic; freeing an interior pointer or freeing twice went undetected | a 1 TiB cap (`too_big`); small frees check that the pointer starts an object (a modular-inverse test) and trap on an immediate double free |
-| json | the arena chunk size could be smaller than the allocation | `size = max(chunk, n)` |
-| vec, str | `v.extend(v.items())` and `s.push_str(s.bytes())` read freed memory after growing | the source is handled when it aliases |
-| c | `to_cstr` silently truncated at an interior NUL | rejected; the size is stored in a header |
-| fs | NUL in paths; mtime overflow; temporary directories created 0755; `remove_all` and `walk` followed a symbolic link swapped in for a directory | NUL rejected by every runtime; saturating times; 0700; directories opened relative to their parents with `O_NOFOLLOW` (`ax_dir_*`) |
-| threads | signal alternate stacks and thread stacks leaked | freed on exit |
-| log | CR, LF, C1 controls, U+2028/U+2029 and invalid UTF-8 in messages or keys could forge log lines; failed rotation lost the file | all escaped; the sink reopens in append mode |
+| Where | What std does |
+|---|---|
+| mem | requests over 1 TiB fail (`too_big`) before any size arithmetic; a small free checks that the pointer starts an object (a modular-inverse test) and traps on an immediate double free |
+| json | arena chunks at least as large as the allocation |
+| vec, str | `v.extend(v.items())` and `s.push_str(s.bytes())` work when the source aliases the destination |
+| c | `to_cstr` refuses an interior NUL |
+| fs | NUL refused in paths by every runtime; saturating times; temporary directories created 0700; `remove_all` and `walk` open directories relative to their parents with `O_NOFOLLOW` (`ax_dir_*`), so a symbolic link swapped in for a directory is not followed |
+| threads | signal alternate stacks and thread stacks freed when a thread exits |
+| log | CR, LF, C1 controls, U+2028/U+2029 and invalid UTF-8 escaped in messages and keys, so input cannot forge log lines; a failed rotation reopens the file in append mode |
 
 ### Text formats
 
-| Where | Problem | Fix |
-|---|---|---|
-| regex | patterns like `((a{100}){100}){100}` compiled for a long time and nested deeply; the DFA cache could grow without limit | a compile work budget (4 × `MAX_PROGRAM`), depth < 1000, and a cap on the DFA cache (`DFA_MAX_PCS`) |
-| markdown | the usual CommonMark pathological inputs (nested brackets, emphasis, backticks, list tightness, link reference expansion) | linear-time structures and an expansion budget; safe HTML by default |
-| unicode | reordering, word boundaries after long runs of regional indicators, and sentence boundaries were quadratic | a counting sort, a capped RI count, and a memoized sentence suffix scan |
-| bidi | isolate matching recursed | an explicit stack |
-| path | glob `**` backtracked exponentially | single-backtrack matching |
-| draw | the edge sort was quadratic; hostile dash arrays created millions of segments | an O(n log n) sort for more than 32 crossings; bad or tiny dash patterns fall back to a solid line |
-| text | `fit` measured the whole prefix for every character | incremental width |
-| time | far-away times overflowed | saturating arithmetic |
-
-## What is still open
-
-- **The JavaScript host and symbolic links.** Node has no `openat`, so
-  `remove_all` and `walk` under `std/internal/runtime/host.mjs` still follow a link
-  that is swapped in between checking and opening. Native programs are
-  safe.
-- **Regex `find_all` and `replace_all`** can take quadratic time for some
-  patterns, the same as RE2's. Each search is linear, but they search again
-  after every match.
-- **X.509 name constraints** are checked against the leaf certificate's
-  names only, not the names of intermediate certificates.
-- **Deep directory trees:** `remove_all` and `walk` keep one descriptor
-  open per level, so a tree deeper than the descriptor limit fails with an
-  error.
-- **Fuzzing** has been run for thousands, not millions, of inputs per
-  target. Longer runs are worthwhile after changes to a parser.
+| Where | What std does |
+|---|---|
+| regex | linear-time matching; a compile work budget (4 × `MAX_PROGRAM`); nesting depth below 1000; a bounded DFA cache (`DFA_MAX_PCS`) |
+| markdown | linear-time structures for the known CommonMark pathological inputs (nested brackets, emphasis, backticks, list tightness); a budget on link reference expansion; safe HTML by default |
+| unicode | linear-time reordering (a counting sort), word boundaries (a capped regional-indicator count) and sentence boundaries (a memoized suffix scan) |
+| bidi | isolates matched with an explicit stack, not recursion |
+| path | glob `**` matched with single backtracking, not exponentially |
+| draw | edges sorted in O(n log n) above 32 crossings; bad or tiny dash patterns fall back to a solid line |
+| text | `fit` measures widths incrementally |
+| time | saturating arithmetic for far-away times |
