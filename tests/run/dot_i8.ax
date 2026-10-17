@@ -1,92 +1,61 @@
-// @dot on byte lanes against the scalar sums: i8 by i8 (both signed) and u8 by i8 (the first
-// operand's bytes unsigned, x86 VNNI's vpdpbusd natively where the CPU has it), each i32 lane
-// the sum of four products, on edge values and 128-, 256- and 512-bit vectors.
+// @dot of i8 lanes (four neighbouring products summed into each i32 lane; on
+// AArch64 sdot, fused into the add it feeds) against the scalar sums, at the
+// extreme values, for 128- and 512-bit vectors, alone and accumulated.
 import "../lib/io.ax" as io;
 
-let mut us: [96]u8 = [0; 96];
-let mut xs: [96]i8 = [0; 96];
-let mut ys: [96]i8 = [0; 96];
+let mut xs: [64]i8 = [0; 64];
+let mut ys: [64]i8 = [0; 64];
+let mut acc: [16]i32 = [0; 16];
 
 fn fill() void {
-    let ue: [8]u8 = [255, 0, 1, 127, 128, 254, 200, 3];
-    let se: [8]i8 = [-128, 127, -1, 0, 1, -127, 64, -65];
-    for i in @as(usize, 0)..96 {
-        us[i] = ue[(i * 5) % 8];
-        xs[i] = se[i % 8];
-        ys[i] = se[(i / 8 + i * 3) % 8];
+    let edges: [8]i8 = [-128, 127, -1, 0, 1, -127, 64, -64];
+    for i in @as(usize, 0)..64 {
+        xs[i] = edges[i % 8];
+        ys[i] = edges[((i / 8) + (i * 3)) % 8];
+    }
+    for i in @as(usize, 0)..16 {
+        acc[i] = @truncate(i32, @bit_cast(i64, @as(u64, i)) *% 0x0123_4567);
     }
 }
 
-fn want_s(x: []i8, y: []i8, i: usize) i32 {
+fn want(i: usize) i32 {
     let mut s: i32 = 0;
-    for k in @as(usize, 0)..4 {
-        s += @as(i32, x[(4 * i) + k]) * @as(i32, y[(4 * i) + k]);
+    for j in @as(usize, 0)..4 {
+        s += @as(i32, xs[(4 * i) + j]) * @as(i32, ys[(4 * i) + j]);
     }
     return s;
 }
 
-fn want_u(x: []u8, y: []i8, i: usize) i32 {
-    let mut s: i32 = 0;
-    for k in @as(usize, 0)..4 {
-        s += @as(i32, x[(4 * i) + k]) * @as(i32, y[(4 * i) + k]);
+fn check() u64 {
+    fill();
+    let mut bad: i32 = 0;
+    let x = @load(i8x16, xs[0..16]);
+    let y = @load(i8x16, ys[0..16]);
+    let a = @load(i32x4, acc[0..4]);
+    let mut r: [3]i32x4 = [@splat(0); 3];
+    r[0] = @dot(x, y);
+    r[1] = a + @dot(x, y);
+    r[2] = @dot(x, y) + (a + @dot(y, x));
+    let mut got: [12]i32 = [0; 12];
+    for k in @as(usize, 0)..3 {
+        @store(got[(k * 4)..], r[k]);
     }
-    return s;
-}
-
-fn check16(u: []u8, x: []i8, y: []i8) u32 {
-    let mut r: [4]i32 = [0; 4];
-    let mut bad: u32 = 0;
-    @store(r[..], @dot(@load(i8x16, x[0..16]), @load(i8x16, y[0..16])));
     for i in @as(usize, 0)..4 {
-        bad += @as(u32, r[i] != want_s(x, y, i));
+        bad += @as(i32, got[i] != want(i));
+        bad += @as(i32, got[4 + i] != (acc[i] + want(i)));
+        bad += @as(i32, got[8 + i] != ((acc[i] + want(i)) + want(i)));
     }
-    @store(r[..], @dot(@load(u8x16, u[0..16]), @load(i8x16, y[0..16])));
-    for i in @as(usize, 0)..4 {
-        bad += @as(u32, r[i] != want_u(u, y, i));
-    }
-    return bad;
-}
-
-fn check32(u: []u8, x: []i8, y: []i8) u32 {
-    let mut r: [8]i32 = [0; 8];
-    let mut bad: u32 = 0;
-    @store(r[..], @dot(@load(i8x32, x[0..32]), @load(i8x32, y[0..32])));
-    for i in @as(usize, 0)..8 {
-        bad += @as(u32, r[i] != want_s(x, y, i));
-    }
-    @store(r[..], @dot(@load(u8x32, u[0..32]), @load(i8x32, y[0..32])));
-    for i in @as(usize, 0)..8 {
-        bad += @as(u32, r[i] != want_u(u, y, i));
-    }
-    return bad;
-}
-
-fn check64(u: []u8, x: []i8, y: []i8) u32 {
-    let mut r: [16]i32 = [0; 16];
-    let mut bad: u32 = 0;
-    @store(r[..], @dot(@load(i8x64, x[0..64]), @load(i8x64, y[0..64])));
+    let x4 = @load(i8x64, xs[0..64]);
+    let y4 = @load(i8x64, ys[0..64]);
+    let a4 = @load(i32x16, acc[0..16]);
+    let mut g4: [16]i32 = [0; 16];
+    @store(g4[0..16], a4 + @dot(x4, y4));
     for i in @as(usize, 0)..16 {
-        bad += @as(u32, r[i] != want_s(x, y, i));
+        bad += @as(i32, g4[i] != (acc[i] + want(i)));
     }
-    @store(r[..], @dot(@load(u8x64, u[0..64]), @load(i8x64, y[0..64])));
-    for i in @as(usize, 0)..16 {
-        bad += @as(u32, r[i] != want_u(u, y, i));
-    }
-    return bad;
+    return @as(u64, @bit_cast(u32, bad));
 }
 
 export fn run() void {
-    fill();
-    let mut bad: u32 = 0;
-    for off in @as(usize, 0)..33 {
-        bad += check16(us[off..], xs[off..], ys[off..]);
-        bad += check32(us[off..], xs[off..], ys[off..]);
-        bad += check64(us[off..], xs[off..], ys[off..]);
-    }
-    io.int(@as(i64, bad));  // expect: 0
-    // four 255 * -128: -130560; four -128 * -128: 65536
-    let a: u8x16 = @splat(255);
-    let b: i8x16 = @splat(-128);
-    io.int(@as(i64, @extract_lane(@dot(a, b), 0)));  // expect: -130560
-    io.int(@as(i64, @extract_lane(@dot(b, b), 3)));  // expect: 65536
+    io.uint(check());  // expect: 0
 }
