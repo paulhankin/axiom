@@ -61,16 +61,16 @@ zero or more, `+` means one or more, `( )` groups, and `"x"` is a literal token.
 
 ## 1. Design Mandate
 
-Axiom is a systems language whose main target is WebAssembly. It is designed for programs
-that machine agents write, read and repair. Each principle below is paired with the
-concrete rules that enforce it.
+Axiom is a systems language that compiles to native code (x86-64 and AArch64) and to
+WebAssembly. It is designed for programs that machine agents write, read and repair.
+Each principle below is paired with the concrete rules that enforce it.
 
 | Principle | Enforced by |
 |---|---|
 | **Zero hidden control flow** | No exceptions, destructors, operator overloading, implicit calls, getters, or implicit allocation. The only non-local exits are `return`, `break`, `continue`, postfix `!`, `catch … return`, and traps. `defer` is written out at the point where it is registered. |
 | **Context-compact grammar** | The grammar is LL(1) and context-free. Parsing never needs a symbol table. There are no macros, no preprocessor, and no user-defined operators. Each construct has exactly one canonical surface form, enforced by `axiom fmt`. |
 | **Zero undefined behavior** | Arithmetic, shifts, casts, and memory access all have defined results or traps. Memory is an abstract, bounds-checked linear byte array (§12). Compilers MUST NOT optimize on assumptions that the absence of UB would otherwise justify. |
-| **First-class WASM/SIMD** | 128-bit vector types are primitives. WASM semantics are the reference semantics, on every target. |
+| **First-class SIMD** | 128-bit vector types are primitives. WASM semantics are the reference semantics, on every target. |
 | **Explicit allocation** | No language construct allocates. Heap memory comes from one global allocator, `std/mem` (§15.1), through calls you can see (`mem.alloc`, `mem.free`); `defer` releases it. |
 
 A secondary principle is **locality of reasoning**. The meaning of a line of code should
@@ -1914,7 +1914,7 @@ std/hash/crc, with the portable code where they are absent.
 
 | Target | `usize` | Notes |
 |---|---|---|
-| `wasm32-freestanding` | 32 | Primary target. No WASI and no imports except those declared |
+| `wasm32-freestanding` | 32 | No WASI and no imports except those declared |
 | `wasm32-wasi` | 32 | Standard library may use WASI imports |
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Linear memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Bounds checks against it (§12.1) are future work |

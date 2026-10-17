@@ -1,8 +1,8 @@
 # axiom — the Axiom compiler
 
 A small, fast compiler for [Axiom](../spec/axiom.md), written in C11 with an LLVM
-backend. It compiles `.ax` programs to WebAssembly modules (the primary target) or to
-native executables.
+backend. It compiles `.ax` programs to native executables or to
+WebAssembly modules.
 
 [`selfhost/`](../selfhost/README.md) has a port of this compiler to Axiom, which this
 one bootstraps. The port has the same front end (identical diagnostics, so a change to

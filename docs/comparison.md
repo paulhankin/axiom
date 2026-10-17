@@ -1,12 +1,12 @@
 # Axiom compared with Zig, Rust, C++ and C
 
 Axiom is a systems language meant to be written, read and repaired by machine agents,
-and its main target is WebAssembly. This document puts its design next to the four
-languages it is most often weighed against. It compares **languages**, not ecosystems. The
-other four are described as they are in their current standards and releases (C23, C++23
-with notes on C++26, Rust 2024 edition, Zig 0.15). Axiom is described by its
-[specification](../spec/axiom.md) (v0.1 draft), with notes where the implementation
-does not match it yet.
+compiling to native code and to WebAssembly. This document puts its design next to the
+four languages it is most often weighed against. It compares **languages**, not
+ecosystems. The other four are described as they are in their current standards and
+releases (C23, C++23 with notes on C++26, Rust 2024 edition, Zig 0.15). Axiom is
+described by its [specification](../spec/axiom.md) (v0.1 draft), with notes where the
+implementation does not match it yet.
 
 Every language here is a sensible choice for some job. The point is to show where
 Axiom's choices differ and what each choice costs.
@@ -15,7 +15,7 @@ Axiom's choices differ and what each choice costs.
 
 | | Axiom | Zig | Rust | C++ | C |
 |---|---|---|---|---|---|
-| **Primary aim** | Code that agents can write and check locally; WebAssembly first | A better C: explicit, simple, fast to compile | Memory and thread safety without a garbage collector | Zero-cost abstraction on top of C | A portable assembler |
+| **Primary aim** | Code that agents can write and check locally | A better C: explicit, simple, fast to compile | Memory and thread safety without a garbage collector | Zero-cost abstraction on top of C | A portable assembler |
 | **Undefined behavior** | None: every operation has a defined result or traps | "Illegal behavior": checked in Debug/ReleaseSafe, undefined in ReleaseFast/ReleaseSmall | None in safe code; possible in `unsafe` | Pervasive | Pervasive |
 | **Memory safety** | Bounds-checked slices and linear memory; a dangling pointer reads defined but stale bytes | Checked slices in safe modes; lifetimes are up to you | Ownership and borrow checking | Up to you (RAII, smart pointers, optional hardening) | Up to you |
 | **Allocation** | One global allocator (`std/mem`, written in Axiom), always called explicitly | Allocators passed explicitly; no global one | Global allocator, implicit in `Box`/`Vec`/`String` | Global `new`, implicit in containers | `malloc` |
@@ -323,9 +323,9 @@ weakly ordered CPUs such as ARM.
 
 ## Interoperability and targets
 
-- **Axiom** targets WebAssembly first (`wasm32`, `wasm64`, freestanding or WASI), and
-  x86-64 and AArch64 Linux natively. `extern "C"` blocks call C, `export fn` exposes
-  functions, and the compiler generates a C header for them. The self-hosted compiler has
+- **Axiom** targets x86-64 and AArch64 natively (Linux, macOS on Apple silicon, Windows)
+  and WebAssembly (`wasm32`, `wasm64`, freestanding or WASI). `extern "C"` blocks call
+  C, `export fn` exposes functions, and the compiler generates a C header for them. The self-hosted compiler has
   its own backends and linkers. Programs it builds make Linux system calls directly and
   are static executables with no C library, unless they link C code (as Zig's do).
 - **Zig** cross-compiles to almost anything, imports C headers directly (`@cImport`) and

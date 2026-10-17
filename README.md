@@ -1,12 +1,13 @@
 # Axiom (`.ax`)
 
 Axiom is a systems language designed to be written, read, and repaired by machine agents.
-Its main target is WebAssembly. Its design mandate is:
+It compiles to native code for x86-64 and AArch64 (Linux, macOS and Windows) and to
+WebAssembly. Its design mandate is:
 
 - **zero hidden control flow**: no exceptions, destructors, operator overloading, or implicit allocation
 - **context-compact grammar**: LL(1), context-free, no macros, one canonical form
 - **zero undefined behavior**: every operation has a defined result or a deterministic trap
-- **first-class WASM/SIMD**: 128-bit vector primitives with WebAssembly semantics
+- **first-class SIMD**: 128-bit vector primitives, with the same (WebAssembly's) semantics on every target
 - **explicit allocation**: one global allocator (`std/mem`, written in Axiom), called explicitly; no language construct allocates
 
 ## Quick start
