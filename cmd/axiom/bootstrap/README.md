@@ -137,17 +137,17 @@ becomes an out-of-bounds trap instead of corrupting data.
 ## Tests
 
 ```
-$ node tests/run.mjs              # wasm32, -O0
-$ node tests/run.mjs -O2
-$ node tests/run.mjs --native     # native target (links tests/native_rt.c)
-$ make -C cmd/axiom/bootstrap asan && AXIOM=cmd/axiom/bootstrap/build-asan/axiom node tests/run.mjs
-$ node tests/std_opt.mjs          # std's tests at -O2, wasm32 and native, in parallel
+$ node cmd/axiom/internal/tests/run.mjs              # wasm32, -O0
+$ node cmd/axiom/internal/tests/run.mjs -O2
+$ node cmd/axiom/internal/tests/run.mjs --native     # native target (links cmd/axiom/internal/tests/native_rt.c)
+$ make -C cmd/axiom/bootstrap asan && AXIOM=cmd/axiom/bootstrap/build-asan/axiom node cmd/axiom/internal/tests/run.mjs
+$ node cmd/axiom/internal/tests/std_opt.mjs          # std's tests at -O2, wasm32 and native, in parallel
 ```
 
-`tests/run/*.ax` are run-and-compare tests. `// expect:` lines give the expected output,
+`cmd/axiom/internal/tests/run/*.ax` are run-and-compare tests. `// expect:` lines give the expected output,
 `// expect-trap` means `run` must trap, and `// flags:` adds compiler options.
-`tests/errors/*.ax` must fail to compile with the `// expect-error:` codes.
-`tests/lowering/*.ax` check instruction selection: each `// lower: <flags> | <regex> | <count>`
+`cmd/axiom/internal/tests/errors/*.ax` must fail to compile with the `// expect-error:` codes.
+`cmd/axiom/internal/tests/lowering/*.ax` check instruction selection: each `// lower: <flags> | <regex> | <count>`
 line builds the file with `--emit=asm` and counts the regex's matches (for example, one
 `vpmaddwd` per `@dot` of `i16x32` with AVX-512, issue 0036). The suite
 passes on wasm32 and native at every optimization level, and under ASan/UBSan.

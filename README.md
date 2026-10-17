@@ -27,7 +27,7 @@ axiom build prog.ax --target=native -O2 -g   # DWARF line tables, for perf annot
 axiom build app --verbose          # modules compile separately and are cached (spec §16.7)
 axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
 axiom fmt src/                     # canonical layout, imports tidied (spec §16.5)
-node tests/run.mjs                    # run the test suite
+node cmd/axiom/internal/tests/run.mjs                    # run the test suite
 ```
 
 The compiler (`cmd/axiom/build/axiom`) is written in Axiom and has its own backends for
@@ -65,7 +65,8 @@ On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 | [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 + LLVM, used only to bootstrap the one in `cmd/axiom/` (to a fixed point) |
 | [`std/`](std/README.md) | Standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |
 | [`std/internal/runtime/`](std/internal/runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ax` and `linux.ax`, libc-free, for the self-hosted compiler; `darwin.ax` for macOS (Apple silicon), `windows.ax` for Windows; `native_host.c` for the C one); test runners; the profiler |
-| [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `axiom test`, packages |
+| [`cmd/axiom/internal/tests/`](cmd/axiom/internal/tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `axiom test`, packages |
+| [`tools/`](tools/editors/vscode/README.md) | Editor support: a VS Code extension (syntax highlighting, and diagnostics and navigation through `axiom lsp`) |
 
 The spec's [Appendix C](docs/spec.md#appendix-c-changes-from-the-design-notes) lists the
 decisions that differ from the original design notes.

@@ -31,7 +31,7 @@ size** (or by a documented limit).
 1. Each module was read with the four questions above in mind. Five review
    passes covered: media codecs, network/TLS/X.509, memory and runtime,
    text formats, and the filesystem.
-2. Mutation fuzzing: `tests/internal/tools/fuzz.py`, which drives `tests/fuzz/fuzz.ax`.
+2. Mutation fuzzing: `cmd/axiom/internal/tests/tools/fuzz.py`, which drives `cmd/axiom/internal/tests/fuzz/fuzz.ax`.
    Seeds come from std's own encoders, plus ffmpeg/sox sounds, system
    fonts and CA certificates. Mutated inputs run through every parser
    target, and a trap, a signal or a hang (10 s) is saved as a failure.
@@ -40,8 +40,8 @@ size** (or by a documented limit).
 
 To run the fuzzer:
 
-    tests/internal/tools/fuzz.py --runs 5000            # all targets
-    tests/internal/tools/fuzz.py --runs 20000 pdf font  # some of them
+    cmd/axiom/internal/tests/tools/fuzz.py --runs 5000            # all targets
+    cmd/axiom/internal/tests/tools/fuzz.py --runs 20000 pdf font  # some of them
 
 ## Findings and fixes
 

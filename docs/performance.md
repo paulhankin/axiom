@@ -5,14 +5,14 @@ was slow, and what changed.
 
 ## How to measure
 
-    axiom build --target=native -O2 tests/bench/std.ax -o build/bench/std
+    axiom build --target=native -O2 cmd/axiom/internal/tests/bench/std.ax -o build/bench/std
     build/bench/std [filter]      # Axiom; also writes the inputs to build/bench/
-    tests/internal/tools/bench_std.py [filter]   # the same work in zlib, OpenSSL, libjpeg, Pillow, ...
+    cmd/axiom/internal/tests/tools/bench_std.py [filter]   # the same work in zlib, OpenSSL, libjpeg, Pillow, ...
 
-`tests/bench/std.ax` times the standard library's heavy operations on
+`cmd/axiom/internal/tests/bench/std.ax` times the standard library's heavy operations on
 generated inputs (4 MB of English-like text, a 4 MB JSON document, a
 1024×768 image, a 2 MB Markdown document, and so on). It saves those inputs so
-that `tests/internal/tools/bench_std.py` can run the same work through Python's bindings
+that `cmd/axiom/internal/tests/tools/bench_std.py` can run the same work through Python's bindings
 to the usual C libraries. Those libraries do the work, so Python's own
 overhead hardly counts for these bulk operations.
 
@@ -124,7 +124,7 @@ Measured on a 32-thread x86-64 machine with AVX-512, SHA-NI and VAES
 (Linux under WSL 2), `-O2`, with the self-hosted compiler; the C compiler's
 numbers are in parentheses where they differ by more than 10%. "Portable"
 is the code before the change on the same machine. The reference is
-`tests/internal/tools/bench_std.py` (Python's `hashlib`, `zlib` and `cryptography`, which
+`cmd/axiom/internal/tests/tools/bench_std.py` (Python's `hashlib`, `zlib` and `cryptography`, which
 use OpenSSL and zlib).
 
 | Operation | Portable | Hardware | Reference |

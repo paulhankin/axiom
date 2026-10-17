@@ -24,7 +24,7 @@ them), and a standard library module used as `name.x` but never imported is adde
 there are any. `--stdout` prints the result instead. A file with a syntax error is
 reported and left alone, and so is one whose formatted text would not lex to the same
 tokens and comments (an internal error). The repository's sources are kept canonical
-(`tests/run.mjs` checks them, and the examples in `tests/fmt`).
+(`cmd/axiom/internal/tests/run.mjs` checks them, and the examples in `cmd/axiom/internal/tests/fmt`).
 
 ## Bootstrapping
 
@@ -175,7 +175,7 @@ under Wine (`wine64` on the `PATH`), and so does the test suite:
 
 ```
 $ WINEDEBUG=-all AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=x86_64-windows \
-  AXIOM_NATIVE_EXEC=wine64 node tests/run.mjs --native
+  AXIOM_NATIVE_EXEC=wine64 node cmd/axiom/internal/tests/run.mjs --native
 ```
 
 Not yet: linking C code or `-l` libraries (issue #7).
@@ -239,8 +239,8 @@ program; both test runners share `std/internal/runtime/test_report.ax`.
 ## Testing
 
 ```
-$ AXIOM=cmd/axiom/build/axiom node tests/run.mjs     # the whole suite, any options
-$ node tests/std_opt.mjs                             # std's tests at -O2 on both targets, with checks
+$ AXIOM=cmd/axiom/build/axiom node cmd/axiom/internal/tests/run.mjs     # the whole suite, any options
+$ node cmd/axiom/internal/tests/std_opt.mjs                             # std's tests at -O2 on both targets, with checks
 $ cmd/axiom/difftest.sh                                    # compare with the C compiler
 $ cmd/axiom/fuzz/run.sh 1 20                               # backends vs LLVM on random programs
 $ cmd/axiom/build/axiom test cmd/axiom/src/util.ax --target=native
@@ -254,7 +254,7 @@ suite has. With `--sanitize=address` (and a longer `--test-timeout=ms`: the
 sanitizer makes code 3–4 times slower) it also checks every std test for memory errors
 and leaks.
 
-`difftest.sh` checks every `.ax` file under `tests/`, `std/`, `examples/` and
+`difftest.sh` checks every `.ax` file under `cmd/axiom/internal/tests/`, `std/`, `examples/` and
 `cmd/axiom/src/` for identical diagnostics (`check --format=agent-json`) and exit status,
 runs the test suite for wasm32 and native code at `-O0` and `-O2` and in whole-program
 mode (and for AArch64 under qemu when available), and fuzzes the backends. The fuzzer
@@ -267,7 +267,7 @@ The test suite can run AArch64 code on an x86-64 machine:
 
 ```
 $ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64 \
-  AXIOM_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu" node tests/run.mjs --native
+  AXIOM_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu" node cmd/axiom/internal/tests/run.mjs --native
 ```
 
 (`apt install qemu-user libc6-arm64-cross gcc-aarch64-linux-gnu`; the C compiler is for
@@ -310,7 +310,7 @@ call leaves its depth as it found it. A call site's record is written just
 before the calls and traps that can read it, so the common path of an
 inlined function with a slow path writes none. Traps, stack traces and
 error return traces are the same at every optimization level
-(tests/traces).
+(cmd/axiom/internal/tests/traces).
 
 `cmd/axiom/bench.sh` compares the code with LLVM's: the compiler built by
 LLVM against the compiler built by itself on the same job, and the programs
@@ -339,7 +339,7 @@ types share a module.
 | `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`, `ide`, `lsp`; linking |
 | `fmt.ax` | | `axiom fmt`: canonical layout from the token stream, imports tidied |
 | `ide.ax` | | `axiom ide`: answers an editor's questions (diagnostics, hover, definitions, references, rename, completion, signatures, outline, formatting) from the checked tree, with unsaved buffers on stdin |
-| `lsp.ax` | | `axiom lsp`: the Language Server Protocol over stdio, one `axiom ide` process per request (VS Code client in [`editors/vscode`](../../editors/vscode/README.md)) |
+| `lsp.ax` | | `axiom lsp`: the Language Server Protocol over stdio, one `axiom ide` process per request (VS Code client in [`tools/editors/vscode`](../../tools/editors/vscode/README.md)) |
 
 ## How C idioms map to Axiom
 

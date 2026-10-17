@@ -16,7 +16,7 @@ NEW=${NEW:-cmd/axiom/build/axiom}
 OLD=${OLD:-cmd/axiom/bootstrap/build/axiom}
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
-RT=tests/native_rt.c
+RT=cmd/axiom/internal/tests/native_rt.c
 fail=0
 arm=0
 if command -v qemu-aarch64 >/dev/null && [ -d /usr/aarch64-linux-gnu ] && command -v aarch64-linux-gnu-gcc >/dev/null; then

@@ -1,8 +1,8 @@
 #!/bin/sh
 # Differential test of the self-hosted compiler against the C compiler:
-#   - for every .ax file under tests/, std/, examples/ and cmd/axiom/src/, both
+#   - for every .ax file under cmd/axiom/internal/tests/, std/, examples/ and cmd/axiom/src/, both
 #     must print the same diagnostics (agent-json) with the same exit status;
-#   - the test suite (tests/run.mjs, which checks the programs' output) must
+#   - the test suite (cmd/axiom/internal/tests/run.mjs, which checks the programs' output) must
 #     pass for WebAssembly and native code in several configurations;
 #   - the backends must agree with the C compiler's LLVM-generated code on
 #     programs exercising every operation on edge values (fuzz/run.sh).
@@ -17,7 +17,7 @@ fail=0
 
 # Each file's verdict ("same f" or "DIFF check f"), several files at a time.
 export OLD NEW
-out=$(find tests std examples cmd/axiom/src -name '*.ax' | sort |
+out=$(find cmd/axiom/internal/tests std examples cmd/axiom/src -name '*.ax' | sort |
     xargs -P "$(nproc 2>/dev/null || echo 4)" -n 16 sh -c '
         for f; do
             a=$($OLD check "$f" --format=agent-json 2>&1; echo "status $?")
@@ -33,7 +33,7 @@ echo "diagnostics: $pass identical, $fail different"
 skip_platform=
 suite() {
     echo "suite: $*"
-    if ! AXIOM=$NEW AXIOM_TEST_SKIP_PLATFORM=$skip_platform node tests/run.mjs "$@" > /tmp/axiom-difftest.$$ 2>&1; then
+    if ! AXIOM=$NEW AXIOM_TEST_SKIP_PLATFORM=$skip_platform node cmd/axiom/internal/tests/run.mjs "$@" > /tmp/axiom-difftest.$$ 2>&1; then
         grep -v '^ok' /tmp/axiom-difftest.$$
         fail=$((fail + 1))
     else

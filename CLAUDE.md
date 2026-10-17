@@ -29,18 +29,21 @@ messages or issues; describe the code shape or the measurement in general terms.
 - `std/`: the standard library; `std/internal/runtime/` is the runtime. Modules under
   an `internal/` directory may be imported only from its parent's tree (spec §4.1).
 - `docs/spec.md`: the language specification. `examples/`: example programs and
-  packages. `tests/`: the test suite.
+  packages. `tools/`: editor support (`tools/editors/vscode/`).
+- `cmd/axiom/internal/tests/`: the test suite (`run.mjs`). Its `tools/` holds the
+  generators of test data, the std fuzzer (`fuzz.py`) and the C-library benchmark
+  (`bench_std.py`).
 - `cmd/internal/tools/`: generators of std's checked-in tables (Unicode, codecs, ...).
-  `tests/internal/tools/`: generators of test data, the std fuzzer (`fuzz.py`) and the
-  C-library benchmark (`bench_std.py`). Run by hand; each says how in its docstring.
+  The generators are run by hand; each says how in its docstring.
 
 ## Checks
 
 ```
-cmd/axiom/bootstrap.sh                        # build; stage 2 and 3 must be identical
-node tests/run.mjs                            # the suite with the C compiler
-AXIOM=cmd/axiom/build/axiom node tests/run.mjs   # with the compiler (includes axiom fmt --check)
-cmd/axiom/difftest.sh                         # both compilers agree (diagnostics, suites, fuzzing)
+cmd/axiom/bootstrap.sh       # build; stage 2 and 3 must be identical
+node cmd/axiom/internal/tests/run.mjs       # the suite with the C compiler
+AXIOM=cmd/axiom/build/axiom node cmd/axiom/internal/tests/run.mjs
+                             # with the compiler (includes axiom fmt --check)
+cmd/axiom/difftest.sh        # both compilers agree (diagnostics, suites, fuzzing)
 ```
 
 A change to the front end belongs in both compilers, with identical diagnostics.
