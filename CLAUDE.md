@@ -29,8 +29,10 @@ messages or issues; describe the code shape or the measurement in general terms.
 - `std/`: the standard library; `std/internal/runtime/` is the runtime. Modules under
   an `internal/` directory may be imported only from its parent's tree (spec §4.1).
 - `docs/spec.md`: the language specification. `examples/`: example programs and
-  packages. `tests/`: the test suite. `tools/`: generators of checked-in tables and
-  test data.
+  packages. `tests/`: the test suite.
+- `cmd/internal/tools/`: generators of std's checked-in tables (Unicode, codecs, ...).
+  `tests/internal/tools/`: generators of test data, the std fuzzer (`fuzz.py`) and the
+  C-library benchmark (`bench_std.py`). Run by hand; each says how in its docstring.
 
 ## Checks
 
