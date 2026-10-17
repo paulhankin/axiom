@@ -48,6 +48,18 @@ static bool relative_import(const char *ip) {
     return strchr(ip, '\\') == NULL;
 }
 
+// A module under a directory named `internal` may be imported only from the
+// tree rooted at that directory's parent (as in Go): std/internal/... only
+// from std. Returns the length of the parent's path in `target` when
+// `importer` is outside it, else 0.
+static size_t internal_violation(const char *importer, const char *target) {
+    const char *last = NULL;
+    for (const char *p = target; (p = strstr(p, "/internal/")); p++) last = p;
+    if (!last) return 0;
+    size_t k = (size_t)(last - target);
+    return strncmp(importer, target, k) == 0 && importer[k] == '/' ? 0 : k;
+}
+
 static Module *load_module(const char *fs_path, Span *from) {
     char rp[PATH_MAX];
     if (!realpath(fs_path, rp)) {
@@ -89,6 +101,13 @@ static Module *load_module(const char *fs_path, Span *from) {
             continue;
         } else {
             snprintf(path, sizeof path, "%s/%s%s", dir, ip, has_ext(ip) ? "" : ".ax");
+        }
+        char tp[PATH_MAX];
+        size_t k = realpath(path, tp) ? internal_violation(rp, tp) : 0;
+        if (k) {
+            diag_error(d->import_path_span, "E0219", "'%s' is internal: only modules under '%s' may import it",
+                       display_path(tp), arena_strndup(display_path(tp), strlen(display_path(tp)) - strlen(tp + k)));
+            continue;
         }
         d->imported = load_module(path, &d->import_path_span);
     }

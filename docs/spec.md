@@ -379,6 +379,12 @@ A path beginning with `std/` resolves to the standard library, for example
 (§4.6). The `.ax` extension may be left out. A path that doesn't resolve to a readable file
 is `E0211`.
 
+A module in a directory named `internal`, or below one, may be imported only by modules in
+the tree rooted at that directory's parent, as in Go: `a/b/internal/c.ax` by `a/b/x.ax` or
+`a/b/d/y.ax`, not by `a/z.ax`. Any other import of it is `E0219`. The rule applies to the
+standard library too, so `std/internal/...` (the runtime among it) can be imported only from
+`std`.
+
 Import cycles are a compile error (`E0210`) in v0.1.
 
 ### 4.2 Visibility
@@ -2292,6 +2298,8 @@ Initial registry, not exhaustive:
 | E0215 | Invalid `axiom.toml` |
 | E0216 | Git dependency can't be fetched |
 | E0217 | Package directory or manifest missing |
+| E0218 | Import path absolute or containing `\` |
+| E0219 | Import of an `internal` module from outside its parent's tree (§4.1) |
 | E0410 | Struct literal fields missing or out of order |
 | E0413 | `undefined` initializer on an immutable `let` |
 | E0414 | `undefined` initializer without a type annotation |

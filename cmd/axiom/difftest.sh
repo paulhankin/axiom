@@ -10,7 +10,7 @@
 #   cmd/axiom/difftest.sh [compiler]     (default: cmd/axiom/build/axiom)
 set -u
 cd "$(dirname "$0")/../.."
-NEW=${1:-selfhost/build/axiom}
+NEW=${1:-cmd/axiom/build/axiom}
 OLD=cmd/axiom/bootstrap/build/axiom
 pass=0
 fail=0

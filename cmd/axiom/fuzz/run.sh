@@ -12,8 +12,8 @@
 # C host functions); they are skipped otherwise.
 set -u
 cd "$(dirname "$0")/../../.."
-NEW=${NEW:-selfhost/build/axiom}
-OLD=${OLD:-compiler/build/axiom}
+NEW=${NEW:-cmd/axiom/build/axiom}
+OLD=${OLD:-cmd/axiom/bootstrap/build/axiom}
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 RT=tests/native_rt.c
