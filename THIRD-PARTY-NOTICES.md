@@ -18,8 +18,9 @@ GNU Lesser General Public License, version 2.1 or (at your option) any later ver
 FFmpeg is; the text is in [`std/audio/aac/LICENSE`](std/audio/aac/LICENSE). FFmpeg is
 Copyright (c) the FFmpeg developers.
 
-Only `std/audio/aac.ax` and `std/audio/formats.ax` (which reads any supported format)
-import these files; a program that imports neither does not include them. A program that does is a work that uses the
+Only `std/audio/aac.ax` imports these files, and nothing else in the repository imports it
+(`std/audio/formats.ax` reads AAC only when a program adds `aac.DECODER` to it); a program
+that does not import `std/audio/aac` does not include them. A program that does is a work that uses the
 library under the LGPL's terms: whoever distributes it must also offer the LGPL-covered
 source and let recipients relink the program with a modified version of it (LGPL-2.1
 section 6), which for a statically compiled Axiom program means providing the program's

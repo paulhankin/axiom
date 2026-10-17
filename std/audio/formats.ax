@@ -11,8 +11,12 @@
 //     let out = formats.encode(&s, formats.Format.FLAC)!;
 //     formats.encode_to(w, &s, formats.Format.WAV)!;   // to an io.Writer
 //
-// Formats: WAV, AIFF, FLAC and Ogg Opus (read and write), Ogg Vorbis, MP3
-// and AAC (ADTS and MP4; read).
+// Formats: WAV, AIFF, FLAC and Ogg Opus (read and write), Ogg Vorbis and MP3
+// (read). Other decoders can be added with add(): AAC, whose decoder is
+// licensed differently from the rest of std (std/audio/aac.ax), is read only
+// by a program that adds it:
+//
+//     formats.add(aac.DECODER);                         // AAC: ADTS and MP4
 // Encoding converts as the format needs (FLAC holds integers of up to 32
 // bits: float sounds become S24; Opus is lossy, at OPUS_BITRATE per
 // channel, resampled to 48 kHz; use std/audio/opus for another bit-rate).
@@ -23,7 +27,6 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
-import "aac.ax" as aac;
 import "aiff.ax" as aiff;
 import "flac.ax" as flac;
 import "mp3.ax" as mp3;
@@ -45,7 +48,61 @@ pub enum Format: u8 {
     VORBIS,
     MP3,
     OPUS,
-    AAC,
+    AAC,  // read once std/audio/aac's DECODER is added
+}
+
+/// A decoder for a format this module does not read itself, added with
+/// add(): the format detect() and from_extension() give for it, its file
+/// name extensions (lower case, separated by spaces), whether data is in it,
+/// and how to decode it.
+pub struct Decoder {
+    format: Format,
+    extensions: []u8,
+    is: fn([]u8) bool,
+    decode: fn([]u8) !audio.Sound,
+}
+
+fn never(data: []u8) bool {
+    return false;
+}
+
+fn unsupported(data: []u8) !audio.Sound {
+    return error.Unsupported;
+}
+
+const MAX_ADDED: usize = 8;
+let mut added: [MAX_ADDED]Decoder = [Decoder.{ format: Format.UNKNOWN, extensions: "", is: never,
+                                               decode: unsupported }; MAX_ADDED];
+let mut n_added: usize = 0;
+
+/// Adds a decoder, for detect(), from_extension(), decode() and load(). Adding
+/// one for a format already added does nothing. Not safe to call while other
+/// threads use this module: add decoders at startup.
+pub fn add(d: Decoder) void {
+    for i in @as(usize, 0)..n_added {
+        if added[i].format == d.format {
+            return;
+        }
+    }
+    if n_added == MAX_ADDED {
+        @trap();  // more decoders than any program needs
+    }
+    added[n_added] = d;
+    n_added += 1;
+}
+
+// Whether ext (lower case) is one of a space-separated list.
+fn has_extension(list: []u8, ext: []u8) bool {
+    let mut start: usize = 0;
+    for i in @as(usize, 0)..list.len + 1 {
+        if (i == list.len) or (list[i] == ' ') {
+            if @mem_eq(list[start..i], ext) {
+                return true;
+            }
+            start = i + 1;
+        }
+    }
+    return false;
 }
 
 /// The format of encoded data, from its first bytes.
@@ -65,8 +122,10 @@ pub fn detect(data: []u8) Format {
     if opus.is_opus(data) {
         return Format.OPUS;
     }
-    if aac.is_aac(data) {
-        return Format.AAC;
+    for i in @as(usize, 0)..n_added {
+        if added[i].is(data) {
+            return added[i].format;
+        }
     }
     if mp3.is_mp3(data) {
         return Format.MP3;  // last: its test is the loosest
@@ -104,8 +163,10 @@ pub fn from_extension(path: []u8) Format {
     if @mem_eq(e, "opus") {
         return Format.OPUS;
     }
-    if @mem_eq(e, "aac") or @mem_eq(e, "adts") or @mem_eq(e, "m4a") or @mem_eq(e, "m4b") or @mem_eq(e, "mp4") {
-        return Format.AAC;
+    for i in @as(usize, 0)..n_added {
+        if has_extension(added[i].extensions, e) {
+            return added[i].format;
+        }
     }
     return Format.UNKNOWN;
 }
@@ -131,8 +192,10 @@ pub fn decode(data: []u8) !audio.Sound {
     if f == Format.OPUS {
         return opus.decode(data);
     }
-    if f == Format.AAC {
-        return aac.decode(data);
+    for i in @as(usize, 0)..n_added {
+        if added[i].format == f {
+            return added[i].decode(data);
+        }
     }
     return error.Unsupported;
 }
@@ -251,7 +314,7 @@ test "every writable format" {
     @expect(from_extension("x.ogg") == Format.VORBIS);
     @expect(from_extension("x.MP3") == Format.MP3);
     @expect(from_extension("x.opus") == Format.OPUS);
-    @expect(from_extension("x.m4a") == Format.AAC);
+    @expect(from_extension("x.m4a") == Format.UNKNOWN);  // until std/audio/aac's decoder is added
     @expect(from_extension("noext") == Format.UNKNOWN);
 }
 
