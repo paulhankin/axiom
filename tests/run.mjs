@@ -23,7 +23,7 @@ import path from 'path';
 import zlib from 'zlib';
 import os from 'os';
 import { Worker } from 'worker_threads';
-import { createHost } from '../runtime/host.mjs';
+import { createHost } from '../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
@@ -275,7 +275,7 @@ await inOrder([...stdFiles, ...files(path.join(root, 'tests/testing'))], async (
     if (!problem) {
       // (a timeout: a recursion turned into a loop never overflows, issue 0051)
       const r = native ? spawnExe(out, [], { encoding: 'utf8', timeout: 60000 })
-        : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8', timeout: 60000 });
+        : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8', timeout: 60000 });
       const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \((?:\S*\/)?tests\/traces\/crash\.ax:4:12\)/,
         /the frame above repeats 255 more times/, /\.\.\. \d+ more frames/];
       for (const w of want) if (!w.test(r.stderr)) { problem = `stderr lacks ${w}:\n${r.stderr}`; break; }
@@ -302,7 +302,7 @@ await inOrder(files(path.join(root, 'tests/sanitize')), async (f) => {
   let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
   if (!problem) {
     const r = native ? await spawnExeAsync(out, [], { encoding: 'utf8' })
-      : await spawnAsync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      : await spawnAsync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
     if (st === 'trap') {
       if (r.status === 0 || !/trap T0012 \(memory error\)/.test(r.stderr)) problem = `expected trap T0012, got status ${r.status}:\n${r.stderr}`;
     } else if (r.status !== Number(st)) {
@@ -409,7 +409,7 @@ await inOrder(files(path.join(root, 'tests/lowering')), async (f) => {
       const m = /(\d+) modules, (\d+) compiled/.exec(c.stderr);
       if (c.status !== 0 || !m) { problem = `${what}: build failed:\n${c.stdout}${c.stderr}`; break; }
       if (!ok(Number(m[2]), Number(m[1]))) { problem = `${what}: ${m[0]}`; break; }
-      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
       if (r.stdout.trim() !== want) { problem = `${what}: output\n${r.stdout}${r.stderr}`; break; }
     }
     if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
@@ -453,7 +453,7 @@ if (!skipPlatform) {
       ...(native ? [nativeTarget] : [])], { encoding: 'utf8', cwd: dir, env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'stdcopy-cache') } });
     let problem = c.status !== 0 ? `build failed:\n${c.stdout}${c.stderr}` : null;
     if (!problem) {
-      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'runtime/host.mjs'), out], { encoding: 'utf8' });
+      const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
       if (r.status !== 0) problem = `exit status ${r.status}:\n${r.stderr}`;
     }
     if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
@@ -500,7 +500,7 @@ if (!skipPlatform) {
     return fs.readFileSync(f, 'utf8') === src ? null : 'the file was changed';
   };
   cases['the repository is canonical'] = () => {
-    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'runtime', 'tests/run', 'tests/units',
+    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'tests/run', 'tests/units',
       'tests/lib', 'tests/packages', 'tests/profile']);
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
@@ -890,11 +890,11 @@ if (!skipPlatform) {
   }
 }
 
-// The node host itself (runtime/host.mjs), driven without a program.
+// The node host itself (std/internal/runtime/host.mjs), driven without a program.
 if (!native) {
   const cases = {
     // A socket request completes with a store and then a notify (see
-    // runtime/net_worker.mjs). A thread that sees the store before it sleeps
+    // std/internal/runtime/net_worker.mjs). A thread that sees the store before it sleeps
     // returns at once, and that request's notify comes later: it must not
     // complete the thread's next request, which would return the previous
     // result (a read returning a write's count, with stale data).

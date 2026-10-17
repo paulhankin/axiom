@@ -16,7 +16,7 @@ WebAssembly. Its design mandate is:
 cmd/axiom/bootstrap.sh                # build the compiler (needs llvm-18-dev and lld, for the bootstrap)
 export PATH=$PWD/cmd/axiom/build:$PATH
 axiom build examples/dot_product.ax -O2 -o engine.wasm
-node runtime/host.mjs engine.wasm     # run a program (calls its `main` export)
+node std/internal/runtime/host.mjs engine.wasm     # run a program (calls its `main` export)
 axiom build examples/wordcount.ax --target=native -O2 -o wc
 axiom test mylib.ax                # run a file's `test` blocks
 axiom new geometry                 # a package: axiom.toml + src/lib.ax (spec §4.6)
@@ -64,7 +64,7 @@ On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 | [`cmd/axiom/`](cmd/axiom/README.md) | The compiler, written in Axiom, with its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers: no LLVM, no C toolchain |
 | [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 + LLVM, used only to bootstrap the one in `cmd/axiom/` (to a fixed point) |
 | [`std/`](std/README.md) | Standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |
-| [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ax` and `linux.ax`, libc-free, for the self-hosted compiler; `darwin.ax` for macOS (Apple silicon), `windows.ax` for Windows; `native_host.c` for the C one); test runners; the profiler |
+| [`std/internal/runtime/`](std/internal/runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ax` and `linux.ax`, libc-free, for the self-hosted compiler; `darwin.ax` for macOS (Apple silicon), `windows.ax` for Windows; `native_host.c` for the C one); test runners; the profiler |
 | [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `axiom test`, packages |
 
 The spec's [Appendix C](docs/spec.md#appendix-c-changes-from-the-design-notes) lists the

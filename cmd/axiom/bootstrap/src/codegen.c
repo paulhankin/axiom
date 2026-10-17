@@ -505,7 +505,7 @@ static bool stack_traces_on(void) { return O && O->stack_traces; }
 // Native x86-64 Linux keeps stack traces without a shadow stack (issue
 // 0037): code keeps frame pointers, and a table maps the return address of
 // each call to its call-site records (see frame_tables_emit); a trap or crash
-// walks the frames (runtime/native_host.c: ax_stack_walk). Profile builds,
+// walks the frames (std/internal/runtime/native_host.c: ax_stack_walk). Profile builds,
 // which sample the stack from a signal handler, and --sanitize=address, which
 // records allocation sites, keep the shadow stack, as does WebAssembly,
 // whose stack cannot be walked.
@@ -635,7 +635,7 @@ static void ss_pop(SsFrame f) {
 // the call's site record (none for a trap) and then those of the inline calls
 // that led to it, innermost first, null-terminated (empty for calls that
 // record nothing). The label is the return address or a few bytes after it
-// (copies of the result may come first); runtime/native_host.c looks a
+// (copies of the result may come first); std/internal/runtime/native_host.c looks a
 // return address up as the first label at or after it.
 // ---------------------------------------------------------------------------
 static Sym ptr_key(void *p) { return intern_cstr(arena_printf("%p", p)); }
@@ -834,7 +834,7 @@ static void call_trap_site(LLVMValueRef site) {
         LLVMValueRef sp = LLVMGetParam(fn, 0);
         LLVMBuildStore(B, LLVMBuildZExt(B, LLVMBuildPtrToInt(B, sp, T_isz, ""), T_i64, ""), trap_info_slot(0));
         if (!g_target.wasm) {
-            // Optional host hook (runtime/native_host.c, runtime/test_main.c).
+            // Optional host hook (std/internal/runtime/native_host.c, std/internal/runtime/test_main.c).
             LLVMTypeRef ps[3] = {T_ptr, T_ptr, T_ptr};
             LLVMTypeRef hty = LLVMFunctionType(T_void, ps, 3, false);
             trap_hook = LLVMAddFunction(mod, "ax_on_trap", hty);
@@ -2130,7 +2130,7 @@ static LLVMValueRef emit_call(LLVMTypeRef fty, LLVMValueRef fn, Type *fnty, bool
     return r;
 }
 
-// A function of runtime/rt.ax, which is loaded into every WebAssembly build:
+// A function of std/internal/runtime/rt.ax, which is loaded into every WebAssembly build:
 // software versions of the operations WebAssembly has no instruction for
 // (@rem, and @fma, whose libm calls would have nothing to link against).
 static FnInst *rt_fn(const char *name) {
@@ -2138,10 +2138,9 @@ static FnInst *rt_fn(const char *name) {
         Decl *d = g_prog.fns.data[i];
         if (strcmp(d->name, name) != 0 || !d->module) continue;
         const char *f = g_files.data[d->module->file->id]->display;
-        size_t n = strlen(f);
-        if (n >= 13 && !strcmp(f + n - 13, "runtime/rt.ax")) return get_inst(d, NULL, 0);
+        if (!strcmp(f, "std/internal/runtime/rt.ax")) return get_inst(d, NULL, 0);
     }
-    fprintf(stderr, "axiom: internal error: runtime function %s not found (is runtime/rt.ax missing?)\n", name);
+    fprintf(stderr, "axiom: internal error: runtime function %s not found (is std/internal/runtime/rt.ax missing?)\n", name);
     exit(3);
 }
 
@@ -2157,7 +2156,7 @@ static bool is_f32_type(LLVMTypeRef t) {
 static bool asan_on(void) {
     if (!O->sanitize_address || !F || !F->decl || !F->decl->module) return false;
     const char *f = g_files.data[F->decl->module->file->id]->display;
-    return strcmp(f, "std/mem.ax") != 0 && strncmp(f, "runtime/", 8) != 0;
+    return strcmp(f, "std/mem.ax") != 0 && strncmp(f, "std/internal/runtime/", 21) != 0;
 }
 
 static FnInst *mem_fn(const char *name) {

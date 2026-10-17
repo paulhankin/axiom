@@ -215,7 +215,7 @@ bool build_units(CgOptions *base, const char *link_obj, UnitObjs *objs, UnitStat
     return codegen_program(&co);
 }
 
-// The toolchain's own C runtime (runtime/*.c) is compiled once per content
+// The toolchain's own C runtime (std/internal/runtime/*.c) is compiled once per content
 // and compiler, like modules. Returns the object, or NULL to compile it
 // in the link step instead.
 const char *cached_runtime_object(const char *cc, const char *src) {

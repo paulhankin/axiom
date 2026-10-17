@@ -67,14 +67,14 @@ Exit codes: `0` success, `1` the program has errors (or linking failed), `2` bad
 With `--format=agent-json`, stdout holds exactly one JSON object in the spec's
 `axiom-diagnostics/1` schema, including machine-applicable fixes.
 
-Run a wasm program with `node runtime/host.mjs prog.wasm`. This provides the host ABI
+Run a wasm program with `node std/internal/runtime/host.mjs prog.wasm`. This provides the host ABI
 used by `std/io` and `std/net` and calls the `main` export. Native programs that use
-the host ABI get `runtime/native_host.c` linked in automatically.
+the host ABI get `std/internal/runtime/native_host.c` linked in automatically.
 
 **Tests** (spec §17): `test "name" { … }` blocks with `@expect` / `@expect_eq`.
 `axiom test` runs each test isolated, with a timeout and captured output: a fresh
-instance in a node worker (`runtime/test_runner.mjs`) or a forked process
-(`runtime/test_main.c`). It reports human-readable text or `axiom-tests/1` JSON.
+instance in a node worker (`std/internal/runtime/test_runner.mjs`) or a forked process
+(`std/internal/runtime/test_main.c`). It reports human-readable text or `axiom-tests/1` JSON.
 Every trap reports its code, the failing expression and its location, in tests and in
 normal runs.
 
@@ -99,7 +99,7 @@ keep frame pointers, each call gets a lexical-block `DILocation` of its own and
 `nomerge`, and after optimization the inlinedAt chain of each remaining call's
 location gives its records, which an inline-assembly label after the call puts in
 the section `axiom_rets`. A trap or crash walks the frame pointers and fills the
-shadow stack's ring from the table (`ax_stack_walk` in `runtime/native_host.c`), so
+shadow stack's ring from the table (`ax_stack_walk` in `std/internal/runtime/native_host.c`), so
 everything that reads the shadow stack is unchanged. The debug information that
 this needs is stripped after optimization without `-g`.
 
@@ -109,8 +109,8 @@ instruction, through LLVM's DIBuilder; inlined functions appear as
 `DW_TAG_inlined_subroutine`.
 
 **Profiling** (spec §16.6): `axiom profile` samples the shadow stack, using a
-CPU-clock `SIGPROF` natively (`runtime/profile.c`) or a worker reading shared memory
-on wasm (`runtime/profile_worker.mjs`). It reports self and total time per function,
+CPU-clock `SIGPROF` natively (`std/internal/runtime/profile.c`) or a worker reading shared memory
+on wasm (`std/internal/runtime/profile_worker.mjs`). It reports self and total time per function,
 inclusive time per call site, and folded stacks for flame graphs.
 
 **Packages** (spec §4.6, `src/package.c`): a `axiom.toml` manifest (a TOML subset)
@@ -126,7 +126,7 @@ source per package name.
   `examples/c_interop/`.
 
 Programs that use `std/thread` are linked with a shared, imported memory, and export
-`axiom_thread_start`. `runtime/host.mjs` creates the memory and runs each thread as
+`axiom_thread_start`. `std/internal/runtime/host.mjs` creates the memory and runs each thread as
 a node worker. Native builds use pthreads. Atomics are always available.
 
 On wasm, `export fn` functions become WebAssembly exports, `import host "mod" { ... }`
@@ -218,7 +218,7 @@ Not yet implemented (reported with a diagnostic where relevant):
   memory crashes with a signal instead of trapping deterministically. The
   bounds-checked linear-memory region of spec §12.1 is future work.
   On native targets linear memory is a region of address space reserved at the first
-  `@memory_grow` (up to 1 TiB) and committed 64 KiB page at a time (runtime/native_host.c).
+  `@memory_grow` (up to 1 TiB) and committed 64 KiB page at a time (std/internal/runtime/native_host.c).
 - **Data races at -O1 and above.** The spec (§12.8.2) forbids optimizations that are
   valid only for race-free programs. At `-O0` the generated code honors this. At `-O1`
   and above the compiler relies on LLVM, whose IR memory model formally treats a

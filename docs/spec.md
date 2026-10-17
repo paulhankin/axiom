@@ -2128,8 +2128,8 @@ a struct that takes large blocks from `mem.alloc` and hands out pieces of them.
 
 The rest of the standard library, listed in `std/README.md`, is ordinary Axiom code. It adds no language rules. Operating-system
 services are reached through host functions imported from module `"axiom"` (the
-*Axiom host ABI*). Implementations exist for node (`runtime/host.mjs`) and POSIX
-(`runtime/native_host.c` in C, `runtime/native.ax` in Axiom). A program that uses only the language and `std/mem`, `vec`,
+*Axiom host ABI*). Implementations exist for node (`std/internal/runtime/host.mjs`) and POSIX
+(`std/internal/runtime/native_host.c` in C, `std/internal/runtime/native.ax` in Axiom). A program that uses only the language and `std/mem`, `vec`,
 `hash`, `map` and `matrix` needs no host at all.
 
 One host function has no counterpart on WebAssembly: `ax_fork() i32` copies the
@@ -2139,11 +2139,11 @@ original, or a negative error where the host cannot copy a process (node returns
 compiles the program as one unit where it is missing. std does not use it.
 
 The self-hosted compiler itself uses only the host ABI and std, so it builds for every
-target, WebAssembly included: `node runtime/host.mjs axiom.wasm -- build app.ax`
+target, WebAssembly included: `node std/internal/runtime/host.mjs axiom.wasm -- build app.ax`
 produces the same bytes as the native compiler.
 
 The Axiom runtime uses no C library. It reaches the kernel through system calls
-(`runtime/linux.ax`), starts threads with `clone` and sets up their thread-local
+(`std/internal/runtime/linux.ax`), starts threads with `clone` and sets up their thread-local
 storage itself, starts processes with `fork` and `execve` (searching `PATH` itself), and resolves host names from `/etc/hosts` and by DNS queries to the
 servers in `/etc/resolv.conf`. So a native program built by the self-hosted toolchain
 is a static executable with no dynamic loader, unless it links C code or libraries,
@@ -2546,9 +2546,9 @@ How samples are taken:
 
 | Target | Clock | Mechanism | Threads |
 |---|---|---|---|
-| native | process CPU time | a POSIX CPU-clock timer delivers `SIGPROF`, and the handler copies the interrupted thread's shadow stack (`runtime/profile.c`). Timer overruns weight each sample, so coarse kernel ticks don't skew totals | all threads |
-| x86_64-windows | process CPU time | a sampler thread credits each thread the cycles it ran (`QueryThreadCycleTime`) at every tick; a thread with a period's worth is suspended and its shadow stack copied (`runtime/profile_windows.ax`). Each sample is weighted by the periods it stands for, and waiting threads are not sampled | all threads |
-| wasm32 | wall-clock time | the program runs on a shared memory, and a worker thread reads the main thread's shadow stack while it runs (`runtime/profile_worker.mjs`) | main thread only |
+| native | process CPU time | a POSIX CPU-clock timer delivers `SIGPROF`, and the handler copies the interrupted thread's shadow stack (`std/internal/runtime/profile.c`). Timer overruns weight each sample, so coarse kernel ticks don't skew totals | all threads |
+| x86_64-windows | process CPU time | a sampler thread credits each thread the cycles it ran (`QueryThreadCycleTime`) at every tick; a thread with a period's worth is suspended and its shadow stack copied (`std/internal/runtime/profile_windows.ax`). Each sample is weighted by the periods it stands for, and waiting threads are not sampled | all threads |
+| wasm32 | wall-clock time | the program runs on a shared memory, and a worker thread reads the main thread's shadow stack while it runs (`std/internal/runtime/profile_worker.mjs`) | main thread only |
 
 Profile builds are otherwise identical to ordinary builds with stack traces on (the
 default), except that they always use the shadow stack (also where ordinary builds use
@@ -2592,7 +2592,7 @@ object depends on:
 
 Editing a module recompiles it and every module that imports it, directly or
 indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
-toolchain's C runtime (`runtime/*.c`) is compiled once per content and cached the
+toolchain's C runtime (`std/internal/runtime/*.c`) is compiled once per content and cached the
 same way. `axiom cache clean` empties the cache, which is never evicted
 automatically in v0.1. `--verbose` reports how many modules were compiled and how
 many came from the cache.

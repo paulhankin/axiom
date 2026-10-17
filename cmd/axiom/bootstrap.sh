@@ -41,7 +41,7 @@ if [ "$(uname -s)" = Darwin ]; then
     # shellcheck disable=SC2086
     cmd/axiom/bootstrap/build/axiom build cmd/axiom/src/main.ax --target=wasm32 $OPT -o $B/axiom1.wasm
     # shellcheck disable=SC2086
-    node runtime/host.mjs $B/axiom1.wasm -- build cmd/axiom/src/main.ax --target=aarch64-macos $OPT -o $B/axiom1
+    node std/internal/runtime/host.mjs $B/axiom1.wasm -- build cmd/axiom/src/main.ax --target=aarch64-macos $OPT -o $B/axiom1
     echo "         $(($(date +%s) - start)) s, $(wc -c < "$B/axiom1") bytes"
 else
     stage cmd/axiom/bootstrap/build/axiom $B/axiom1 1 "$OPT1"

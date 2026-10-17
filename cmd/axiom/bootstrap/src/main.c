@@ -190,7 +190,7 @@ static int file_from_key(const char *text) {
     return -1;
 }
 
-// Stack frames from the test runner (see runtime/test_main.c: encode_stack).
+// Stack frames from the test runner (see std/internal/runtime/test_main.c: encode_stack).
 typedef struct TFrame {
     char kind;  // T trap site, C call, U innermost function (no location), E error return, R repeat, O omitted
     long count;
@@ -288,7 +288,7 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
             return 2;
         }
         vec_push(av, (char *)node);
-        vec_push(av, arena_printf("%s/../runtime/test_runner.mjs", std_dir));
+        vec_push(av, arena_printf("%s/internal/runtime/test_runner.mjs", std_dir));
     }
     vec_push(av, (char *)bin);
     if (filter) vec_push(av, (char *)filter);
@@ -458,7 +458,7 @@ static int run_profile(const char *bin, char **prog_args, int nprog_args, const 
             return 2;
         }
         vec_push(av, (char *)node);
-        vec_push(av, arena_printf("%s/../runtime/host.mjs", std_dir));
+        vec_push(av, arena_printf("%s/internal/runtime/host.mjs", std_dir));
         vec_push(av, arena_printf("--profile=%s", raw));
         vec_push(av, arena_printf("--profile-hz=%d", hz));
     } else {
@@ -812,9 +812,9 @@ int main(int argc, char **argv) {
     }
     types_init();
     const char *std_path = std_dir ? std_dir : find_std(argv[0]);
-    // WebAssembly builds include runtime/rt.ax: software @fma and @rem.
+    // WebAssembly builds include std/internal/runtime/rt.ax: software @fma and @rem.
     if (g_target.wasm && strcmp(cmd, "check") != 0) {
-        const char *rtp = arena_printf("%s/../runtime/rt.ax", std_path);
+        const char *rtp = arena_printf("%s/internal/runtime/rt.ax", std_path);
         if (file_exists(rtp)) vec_push(pkg_files, (char *)rtp);
     }
     // std/os/cpu.ax: @cpu_has, @features and @multiversion ask it about the
@@ -881,7 +881,7 @@ int main(int argc, char **argv) {
                  g_target.wasm ? ".wasm" : "");
         out = test_bin;
         if (!g_target.wasm) {
-            const char *pr = arena_printf("%s/../runtime/profile.c", so.std_dir);
+            const char *pr = arena_printf("%s/internal/runtime/profile.c", so.std_dir);
             if (!file_exists(pr)) {
                 diag_emit_fatal(json, "E9003", arena_printf("cannot find the profiler runtime (%s)", pr));
                 return 2;
@@ -899,7 +899,7 @@ int main(int argc, char **argv) {
                  g_target.wasm ? ".wasm" : "");
         out = test_bin;
         if (!g_target.wasm) {
-            const char *tm = arena_printf("%s/../runtime/test_main.c", so.std_dir);
+            const char *tm = arena_printf("%s/internal/runtime/test_main.c", so.std_dir);
             if (!file_exists(tm)) {
                 diag_emit_fatal(json, "E9003", arena_printf("cannot find the test runtime (%s)", tm));
                 return 2;
@@ -1027,7 +1027,7 @@ int main(int argc, char **argv) {
             // Every native executable gets the native runtime: the host ABI
             // (std/io, std/net, threads) and crash reporting (spec §16.4).
             {
-                const char *rt = arena_printf("%s/../runtime/native_host.c", so.std_dir);
+                const char *rt = arena_printf("%s/internal/runtime/native_host.c", so.std_dir);
                 if (!file_exists(rt)) {
                     unlink(objpath);
                     diag_emit_fatal(json, "E9003", arena_printf("cannot find the native runtime (%s)", rt));
@@ -1043,7 +1043,7 @@ int main(int argc, char **argv) {
                 return 2;
             }
             // The toolchain's runtime sources are compiled once and cached.
-            const char *rtdir = arena_printf("%s/../runtime/", so.std_dir);
+            const char *rtdir = arena_printf("%s/internal/runtime/", so.std_dir);
             for (int i = 0; i < link_inputs.len; i++) {
                 const char *in = link_inputs.data[i];
                 if (!strncmp(in, rtdir, strlen(rtdir))) {

@@ -336,13 +336,13 @@ with more room.
 
 Two implementations are provided:
 
-- **[`runtime/host.mjs`](../runtime/host.mjs)** for node, usable as a runner:
-  `node runtime/host.mjs prog.wasm`. Node sockets are asynchronous, so they live in
+- **[`std/internal/runtime/host.mjs`](internal/runtime/host.mjs)** for node, usable as a runner:
+  `node std/internal/runtime/host.mjs prog.wasm`. Node sockets are asynchronous, so they live in
   a worker thread, and the wasm thread blocks on `Atomics.wait` until each
   operation completes.
-- **[`runtime/native_host.c`](../runtime/native_host.c)** for POSIX. The C compiler
+- **[`std/internal/runtime/native_host.c`](internal/runtime/native_host.c)** for POSIX. The C compiler
   links it automatically when a native program uses the host ABI. The self-hosted
   compiler builds the same host ABI written in Axiom,
-  [`runtime/native.ax`](../runtime/native.ax), into every native program. It makes
-  Linux system calls directly ([`runtime/linux.ax`](../runtime/linux.ax)) and needs no
+  [`std/internal/runtime/native.ax`](internal/runtime/native.ax), into every native program. It makes
+  Linux system calls directly ([`std/internal/runtime/linux.ax`](internal/runtime/linux.ax)) and needs no
   C library, so those programs are static executables.

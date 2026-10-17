@@ -139,7 +139,7 @@ from the wasm32 build under node) and the test suite passes there natively. `axi
 test` runs each test in a new process of the test binary (forked, then exec'd: macOS's
 system services do not work in a forked process that has not exec'd); `axiom profile`
 samples with a thread that meters each thread's CPU time through Mach
-(`runtime/profile_darwin.ax`; `setitimer` fires at a third of the rate asked for).
+(`std/internal/runtime/profile_darwin.ax`; `setitimer` fires at a third of the rate asked for).
 
 An `extern "C" "name"` block names the library its functions come from: a framework
 (`"AppKit"`, `"Metal"`, `"AudioToolbox"`, ...), `"objc"`, `"System"` (libSystem), a
@@ -218,23 +218,23 @@ Not yet: linking C code or `-l` libraries (issue 0012).
 | `backend.ax` | Lowering, optimization and the target's code generator |
 
 Native programs include the runtime written in Axiom, which uses no C library:
-`runtime/linux.ax` (system calls on x86-64 and AArch64), `runtime/native.ax` (the host
+`std/internal/runtime/linux.ax` (system calls on x86-64 and AArch64), `std/internal/runtime/native.ax` (the host
 ABI used by `std/io`, `std/net` and threads, a DNS resolver, crash reports with stack
 traces),
-`runtime/test_main.ax` (the forking test runner of `axiom test`),
-`runtime/profile.ax` (the sampling profiler of `axiom profile`) and `runtime/rt.ax`
+`std/internal/runtime/test_main.ax` (the forking test runner of `axiom test`),
+`std/internal/runtime/profile.ax` (the sampling profiler of `axiom profile`) and `std/internal/runtime/rt.ax`
 (software `fmod` and `fma` where the target has no instruction).
-On macOS `runtime/darwin.ax` replaces `linux.ax` and `native.ax`: the same host ABI over
+On macOS `std/internal/runtime/darwin.ax` replaces `linux.ax` and `native.ax`: the same host ABI over
 `libSystem` (whose system call numbers are private), translating error and signal
 numbers to the Linux values the ABI uses, with `kqueue` for file watching and
 `__ulock_wait2`/`__ulock_wake` for `wait`/`notify`. Thread-local blocks are found
 through a pthread key, since the linker does not emit Mach-O thread-local variables.
-On Windows `runtime/windows.ax` does the same over the Win32 API: UTF-16 paths, a
+On Windows `std/internal/runtime/windows.ax` does the same over the Win32 API: UTF-16 paths, a
 table from the ABI's small handles to Windows handles and sockets, `CreateProcessW`
 with C-runtime quoting, `ReadDirectoryChangesW` for watching, `RtlWaitOnAddress` for
 `wait`/`notify`, and a vectored exception handler for crash reports. Windows cannot
-fork, so `runtime/test_main_windows.ax` runs each test in a new process of the test
-program; both test runners share `runtime/test_report.ax`.
+fork, so `std/internal/runtime/test_main_windows.ax` runs each test in a new process of the test
+program; both test runners share `std/internal/runtime/test_report.ax`.
 
 ## Testing
 
@@ -300,7 +300,7 @@ inlines), and the backends follow each call with an entry in the section
 `axiom_rets` (`ftab.ax`) that the linkers place together. A trap
 (`axiom.trap` calls the runtime's `ax_stack_walk` with its own frame) or a
 crash (from the signal's context) walks the frame pointers and fills the
-thread's shadow stack as the calls would have (`runtime/trap_format.ax`,
+thread's shadow stack as the calls would have (`std/internal/runtime/trap_format.ax`,
 `walk_frames`). Profile builds, `--sanitize=address` and WebAssembly keep
 the shadow stack.
 
@@ -374,7 +374,7 @@ types share a module.
 
   ```
   cmd/axiom/build/axiom build cmd/axiom/src/main.ax --target=wasm32 -O2 -o axiom.wasm
-  node runtime/host.mjs axiom.wasm -- build app.ax --std=std -o app.wasm
+  node std/internal/runtime/host.mjs axiom.wasm -- build app.ax --std=std -o app.wasm
   ```
 
   It produces the same bytes on either host. Where the host cannot fork (node), it

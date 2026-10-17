@@ -53,7 +53,7 @@ extern SymVec g_link_libs;
 extern bool g_threads;
 // Build a test binary (axiom test): tests become roots and are exported.
 extern bool g_test_mode;
-// Set by codegen: the output calls into runtime/native_host.c.
+// Set by codegen: the output calls into std/internal/runtime/native_host.c.
 extern bool g_needs_native_runtime;
 
 #endif

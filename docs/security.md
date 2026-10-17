@@ -97,7 +97,7 @@ To run the fuzzer:
 ## What is still open
 
 - **The JavaScript host and symbolic links.** Node has no `openat`, so
-  `remove_all` and `walk` under `runtime/host.mjs` still follow a link
+  `remove_all` and `walk` under `std/internal/runtime/host.mjs` still follow a link
   that is swapped in between checking and opening. Native programs are
   safe.
 - **Regex `find_all` and `replace_all`** can take quadratic time for some
