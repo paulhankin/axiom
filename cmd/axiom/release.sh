@@ -84,7 +84,7 @@ for t in "linux-x86_64 x86_64 axiom" "linux-aarch64 aarch64 axiom" "macos-aarch6
     done
     cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md "$d/"
     cp "docs/releases/$v.md" "$d/RELEASE-NOTES.md"
-    printf 'Axiom %s (%s), built from commit %s.\n\nPut bin/ on the PATH; the compiler finds std/ next to it. See RELEASE-NOTES.md\nand https://github.com/paulhankin/axiom.\n' \
+    printf 'Axiom %s (%s), built from commit %s.\n\nPut bin/ on the PATH; the compiler finds std/ next to it. See RELEASE-NOTES.md\nand https://github.com/paulhankin/axiom.\n\nAxiom is experimental software, provided "as is", without warranty of any kind.\nUse it at your own risk; see LICENSE-MIT and LICENSE-APACHE for the full terms.\n' \
         "$v" "$1" "$commit" > "$d/README.txt"
     python3 - "$R" "$R/stage" "$name" "$mtime" <<'EOF'
 import gzip, io, os, sys, tarfile, zipfile, time

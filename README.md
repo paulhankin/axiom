@@ -86,6 +86,16 @@ replaced, in the git history.
 | [`examples/pdfview/`](examples/pdfview/src/main.ax) | A PDF viewer on macOS (a package): continuous scrolling, a thumbnail sidebar, zoom from 10% to 800% that stays sharp (the part of a page in the window drawn again at full detail), rotated pages; Core Graphics draws the pages, the window is Quartz over Metal |
 | [`examples/pinball/`](examples/pinball/README.md) | A pinball table in 3D on macOS (a package): the ball's physics at 2400 steps a second (spin, friction, rolling; solenoid flippers with inertia), a ramp onto a six-wire habitrail, bumpers, slingshots, drop and standup targets, a spinner, an orbit, a lock and three-ball multiball; Metal with PBR shading, HDR, bloom, shadows and a chrome ball reflecting the playfield; a dot-matrix display; synthesized sound |
 
+## Disclaimer
+
+Axiom is experimental software, provided "as is", without warranty of any kind, express
+or implied. Use it at your own risk. The language, the compiler and the standard library
+are young, change without notice (releases make no compatibility promise), and have not
+been audited: they may contain bugs that produce wrong programs, wrong results or
+security vulnerabilities. Do not rely on them where failure could cause harm, loss of
+data or money, or injury. The authors are not liable for any damage arising from their
+use; see the licenses below for the full terms.
+
 ## License
 
 Axiom is licensed under either of the [MIT license](LICENSE-MIT) or the
