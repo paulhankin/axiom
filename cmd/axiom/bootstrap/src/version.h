@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define AXIOM_VERSION "0.1.0"
+#define AXIOM_VERSION "0.2.0"
 
 // The numbers of a version "a", "a.b" or "a.b.c" (missing ones are 0), or
 // false if it is not one.
