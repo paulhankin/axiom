@@ -21,6 +21,13 @@ Everything here is about Axiom itself. Don't mention outside projects (programs 
 to Axiom, benchmarks from other repositories) in code, comments, tests, docs, commit
 messages or issues; describe the code shape or the measurement in general terms.
 
+## Licensing
+
+The repository is MIT OR Apache-2.0. Code or data ported, translated or generated from
+another project (rather than written from a specification) needs that project's license
+to allow it and an entry in `THIRD-PARTY-NOTICES.md`; don't add anything under a
+copyleft license.
+
 ## Layout
 
 - `cmd/axiom/`: the compiler, written in Axiom. `cmd/axiom/bootstrap.sh` builds it

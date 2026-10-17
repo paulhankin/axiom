@@ -83,3 +83,13 @@ replaced, in the git history.
 | [`examples/drumkin/`](examples/drumkin/src/main.ax) | A drum machine on macOS (a package): eight drums of FM and noise through a morphing state-variable filter and ADSR envelopes, two settings of each blended between, a 16-step sequencer with swing and accents, knobs drawn with Quartz over Metal, sound through Core Audio from a thread of its own |
 | [`examples/pdfview/`](examples/pdfview/src/main.ax) | A PDF viewer on macOS (a package): continuous scrolling, a thumbnail sidebar, zoom from 10% to 800% that stays sharp (the part of a page in the window drawn again at full detail), rotated pages; Core Graphics draws the pages, the window is Quartz over Metal |
 | [`examples/pinball/`](examples/pinball/README.md) | A pinball table in 3D on macOS (a package): the ball's physics at 2400 steps a second (spin, friction, rolling; solenoid flippers with inertia), a ramp onto a six-wire habitrail, bumpers, slingshots, drop and standup targets, a spinner, an orbit, a lock and three-ball multiball; Metal with PBR shading, HDR, bloom, shadows and a chrome ball reflecting the playfield; a dot-matrix display; synthesized sound |
+
+## License
+
+Axiom is licensed under either of the [MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option. Contributions are accepted
+under the same terms, unless stated otherwise.
+
+Some of the standard library is derived from other projects and keeps their terms; see
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). In particular the AAC decoder
+(`std/audio/aac/`) follows FFmpeg's and is licensed under the LGPL 2.1 or later.
