@@ -58,6 +58,7 @@ Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` from Homebrew, with
 | [`tools/`](tools/editors/vscode/README.md) | Editor support: a VS Code extension (highlighting, and diagnostics and navigation through `axiom lsp`) |
 
 Known bugs and feature requests are [GitHub issues](https://github.com/paulhankin/axiom/issues).
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 Four-digit issue numbers in the code ("issue 0047") refer to the `issues/` directory they
 replaced, in the git history.
 
