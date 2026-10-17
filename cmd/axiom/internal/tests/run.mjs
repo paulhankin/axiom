@@ -500,8 +500,12 @@ if (!skipPlatform) {
     return fs.readFileSync(f, 'utf8') === src ? null : 'the file was changed';
   };
   cases['the repository is canonical'] = () => {
-    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'cmd/axiom/internal/tests/run', 'cmd/axiom/internal/tests/units',
-      'cmd/axiom/internal/tests/lib', 'cmd/axiom/internal/tests/packages', 'cmd/axiom/internal/tests/profile']);
+    // everything but tests/errors and tests/fmt, whose files are not canonical on purpose
+    const tests = fs.readdirSync(path.join(root, 'cmd/axiom/internal/tests'))
+      .filter((n) => n !== 'errors' && n !== 'fmt' && (n.endsWith('.ax') ||
+        fs.statSync(path.join(root, 'cmd/axiom/internal/tests', n)).isDirectory()))
+      .map((n) => `cmd/axiom/internal/tests/${n}`);
+    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', ...tests]);
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
   for (const [cname, fn] of Object.entries(cases)) {
