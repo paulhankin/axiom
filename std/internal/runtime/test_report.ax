@@ -1,0 +1,414 @@
+// =============================================================================
+// std/internal/runtime/test_report.ax - what the native test runners (test_main.ax on
+// Linux, test_main_windows.ax on Windows) share: the records a test's
+// process writes about how it ended (DONE, TRAP, CRASH), and the AXT line
+// the runner prints for each test from that record, the test's output and
+// how its process ended. Output protocol: see std/internal/runtime/test_runner.mjs.
+// =============================================================================
+import "trap_format.ax" as tf;
+
+extern "C" {
+    fn axiom_error_name(code: u32) *u8;
+}
+
+// Stack frames in the AXT protocol: frames separated by \x1e, fields by \x1f:
+// kind (T trap site, C call, E error return, R repeat, O omitted), file id,
+// start, end, function.
+fn put_frame(o: *mut tf.Fmt, kind: u8, s: *tf.Site) void {
+    o.c(kind);
+    o.c(0x1f);
+    o.u(@as(u64, s.file_id));
+    o.c(0x1f);
+    o.u(@as(u64, s.start));
+    o.c(0x1f);
+    o.u(@as(u64, s.end));
+    o.c(0x1f);
+    o.s(tf.cstr(s.fn_));
+    o.c(0x1e);
+}
+
+fn put_count(o: *mut tf.Fmt, kind: u8, count: i64) void {
+    o.c(kind);
+    o.c(0x1f);
+    o.i(count);
+    o.c(0x1f);
+    o.c('0');
+    o.c(0x1f);
+    o.c('0');
+    o.c(0x1f);
+    o.c(0x1e);
+}
+
+fn encode_stack(o: *mut tf.Fmt, top: *tf.Site, ss: *tf.ShadowStack) void {
+    let start = o.n;
+    let has_top = not tf.is_null(@ptr_cast(*void, top));
+    if has_top {
+        put_frame(o, 'T', top);
+    }
+    if tf.is_null(@ptr_cast(*void, ss)) {
+        return;
+    }
+    let depth = @as(i64, ss.depth);
+    let cap = @as(i64, tf.SS_CAP);
+    let mut shown: u32 = 0;
+    let mut i = depth - 1;
+    while (i >= 0) and (i >= (depth - cap)) {
+        let c = tf.call_at(ss, @truncate(u32, @bit_cast(u64, i)));
+        if tf.is_null(@ptr_cast(*void, c)) {
+            i -= 1;
+            continue;
+        }
+        if not has_top and (o.n == start) {
+            put_frame(o, 'U', c);  // innermost function, location unknown
+        }
+        if shown >= 40 {
+            put_count(o, 'O', i + 1);
+            return;
+        }
+        let mut j = i;
+        while ((j - 1) >= 0) and ((j - 1) >= (depth - cap)) and
+              (tf.call_at(ss, @truncate(u32, @bit_cast(u64, j - 1))) == c) {
+            j -= 1;
+        }
+        put_frame(o, 'C', c);
+        shown += 1;
+        if j < i {
+            put_count(o, 'R', i - j);
+            i = j;
+        }
+        i -= 1;
+    }
+    if depth > cap {
+        put_count(o, 'O', depth - cap);
+    }
+}
+
+fn encode_errors(o: *mut tf.Fmt, ss: *tf.ShadowStack) void {
+    if tf.is_null(@ptr_cast(*void, ss)) {
+        return;
+    }
+    let mut first: u32 = 0;
+    if ss.errors > tf.ET_CAP {
+        first = ss.errors - tf.ET_CAP;
+    }
+    for i in first..ss.errors {
+        let e = ss.error_returns[@as(usize, i & (tf.ET_CAP - 1))];
+        if not tf.is_null(@ptr_cast(*void, e)) {
+            put_frame(o, 'E', e);
+        }
+    }
+}
+
+// The record of a test that trapped (written before its process dies).
+pub fn trap_record(o: *mut tf.Fmt, site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {
+    o.s("TRAP\t");
+    o.u(@as(u64, site.code));
+    o.c('\t');
+    o.u(@as(u64, site.file_id));
+    o.c('\t');
+    o.u(@as(u64, site.start));
+    o.c('\t');
+    o.u(@as(u64, site.end));
+    o.c('\t');
+    let mut msg: [1024]u8 = [0; 1024];
+    let mut m = tf.fmt(msg[..]);
+    tf.format_trap(&mut m, site, info);
+    o.s(m.text());
+    o.c('\t');
+    encode_stack(o, site, ss);
+}
+
+// The record of a crash other than a trap (code 8: the stack ran out; 5: a
+// bad memory access).
+pub fn crash_record(o: *mut tf.Fmt, code: u64, ss: *tf.ShadowStack) void {
+    o.s("CRASH\t");
+    o.u(code);
+    o.c('\t');
+    encode_stack(o, @ptr_from_int(*tf.Site, 0), ss);
+}
+
+// The record of a test that returned: its error code (0: none) and error
+// return trace, or the allocations it leaked.
+pub fn done_record(o: *mut tf.Fmt, code: u32, ss: *tf.ShadowStack, leaks: u32) void {
+    if code != 0 {
+        o.s("DONE\t");
+        o.u(@as(u64, code));
+        o.c('\t');
+        encode_errors(o, ss);
+    } else {
+        o.s("DONE\t0\t");
+        o.u(@as(u64, leaks));
+    }
+}
+
+// A growable byte buffer, in memory from the platform's runner.
+pub struct Buf {
+    p: *mut u8,
+    n: usize,
+    cap: usize,
+    alloc: fn(usize) usize,
+    release: fn(usize, usize) void,
+}
+
+pub fn buf(alloc: fn(usize) usize, release: fn(usize, usize) void) Buf {
+    return Buf.{ p: @ptr_from_int(*mut u8, 0), n: 0, cap: 0, alloc: alloc, release: release };
+}
+
+pub fn buf_add(b: *mut Buf, x: []u8) void {
+    if (b.n + x.len + 1) > b.cap {
+        let mut cap = @max(b.cap * 2, 65536);
+        while cap < (b.n + x.len + 1) {
+            cap *= 2;
+        }
+        let q = b.alloc(cap);
+        if q == 0 {
+            return;
+        }
+        if b.n > 0 {
+            @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, q), b.n), @slice_from_ptr(b.p, b.n));
+        }
+        if b.cap > 0 {
+            b.release(@int_from_ptr(b.p), b.cap);
+        }
+        b.p = @ptr_from_int(*mut u8, q);
+        b.cap = cap;
+    }
+    let d = @slice_from_ptr(b.p, b.n + x.len + 1);
+    for k in 0..x.len {
+        d[b.n + k] = x[k];
+    }
+    b.n += x.len;
+    d[b.n] = 0;
+}
+
+pub fn buf_free(b: *mut Buf) void {
+    if b.cap > 0 {
+        b.release(@int_from_ptr(b.p), b.cap);
+    }
+}
+
+pub fn buf_text(b: *Buf) []u8 {
+    if @int_from_ptr(b.p) == 0 {
+        return "";
+    }
+    return @slice_from_ptr(b.p, b.n);
+}
+
+fn put_escaped(o: *mut Buf, s: []u8) void {
+    for c in s {
+        if c == '\\' {
+            buf_add(o, "\\\\");
+        } else if c == '\t' {
+            buf_add(o, "\\t");
+        } else if c == '\n' {
+            buf_add(o, "\\n");
+        } else if c == '\r' {
+            buf_add(o, "\\r");
+        } else {
+            let one: [1]u8 = [c];
+            buf_add(o, one[..]);
+        }
+    }
+}
+
+pub fn starts(s: []u8, p: []u8) bool {
+    if s.len < p.len {
+        return false;
+    }
+    for i in 0..p.len {
+        if s[i] != p[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn contains(s: []u8, p: []u8) bool {
+    if p.len > s.len {
+        return false;
+    }
+    for i in 0..(s.len - p.len) + 1 {
+        if starts(s[i..], p) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Parses a decimal number at s[*at..], advancing *at.
+pub fn num(s: []u8, at: *mut usize) u64 {
+    let mut v: u64 = 0;
+    while (at.* < s.len) and (s[at.*] >= '0') and (s[at.*] <= '9') {
+        v = (v *% 10) +% @as(u64, s[at.*] - '0');
+        at.* += 1;
+    }
+    return v;
+}
+
+// The text after the k-th tab of s.
+fn after_tab(s: []u8, k: u32) []u8 {
+    let mut seen: u32 = 0;
+    for i in 0..s.len {
+        if s[i] == '\t' {
+            seen += 1;
+            if seen == k {
+                return s[i + 1..];
+            }
+        }
+    }
+    return "";
+}
+
+// The field between the k-th and (k+1)-th tab.
+fn field(s: []u8, k: u32) []u8 {
+    let rest = after_tab(s, k);
+    for i in 0..rest.len {
+        if rest[i] == '\t' {
+            return rest[0..i];
+        }
+    }
+    return rest;
+}
+
+// How a test's process ended.
+pub const ENDED: u8 = 0;     // it exited
+pub const SIGNALED: u8 = 1;  // a signal (or exception) ended it
+pub const TIMEOUT: u8 = 2;   // the runner ended it
+
+// Appends test i's AXT line to `line`: from the record r its process wrote,
+// its output, how it ended (`how`; the signal, as Linux numbers it, when
+// SIGNALED), its running time.
+pub fn report(line: *mut Buf, i: u32, expect: i32, r: []u8, out: []u8, how: u8, sig: i32, ms: f64,
+              timeout_ms: i64) void {
+    let mut st: []u8 = "pass";
+    let mut code: []u8 = "";
+    let mut stack: []u8 = "";
+    let mut msgbuf: [1500]u8 = [0; 1500];
+    let mut msg = tf.fmt(msgbuf[..]);
+    let mut codebuf: [8]u8 = [0; 8];
+    let mut cb = tf.fmt(codebuf[..]);
+    let mut file_id: i64 = -1;
+    let mut start: u64 = 0;
+    let mut end: u64 = 0;
+    if how == TIMEOUT {
+        st = "fail";
+        code = "timeout";
+        msg.s("test did not finish within ");
+        msg.i(timeout_ms);
+        msg.s(" ms");
+    } else if starts(r, "DONE\t") {
+        let mut at: usize = 5;
+        let ec = num(r, &mut at);
+        if ec != 0 {
+            st = "fail";
+            code = "error";
+            stack = after_tab(r, 2);
+            msg.s("test returned error.");
+            msg.s(tf.cstr(axiom_error_name(@truncate(u32, ec))));
+        } else if expect != -1 {
+            st = "fail";
+            code = "no_trap";
+            if expect == -2 {
+                msg.s("expected a trap, but the test completed");
+            } else {
+                msg.s("expected trap ");
+                msg.code(@bit_cast(u32, expect));
+                msg.s(", but the test completed");
+            }
+        } else {
+            at += 1;
+            let leaks = num(r, &mut at);
+            if leaks != 0 {
+                st = "fail";
+                code = "leak";
+                msg.s("the test leaked ");
+                msg.u(leaks);
+                if leaks == 1 {
+                    msg.s(" allocation (--sanitize=address)");
+                } else {
+                    msg.s(" allocations (--sanitize=address)");
+                }
+            }
+        }
+    } else if starts(r, "TRAP\t") {
+        let mut at: usize = 5;
+        let tc = num(r, &mut at);
+        at += 1;
+        file_id = @bit_cast(i64, num(r, &mut at));
+        at += 1;
+        start = num(r, &mut at);
+        at += 1;
+        end = num(r, &mut at);
+        let text = field(r, 5);
+        stack = after_tab(r, 6);
+        if (expect == -2) or (@as(i64, expect) == @bit_cast(i64, tc)) {
+            file_id = -1;
+        } else {
+            cb.code(@truncate(u32, tc));
+            st = "fail";
+            code = cb.text();
+            if expect >= 0 {
+                msg.s("expected trap ");
+                msg.code(@bit_cast(u32, expect));
+                msg.s(", got ");
+            }
+            msg.s(text);
+        }
+    } else if how == SIGNALED {
+        let mut tc: u32 = 0;
+        if (sig == 11) or (sig == 7) {  // SIGSEGV, SIGBUS
+            tc = 5;
+        }
+        if starts(r, "CRASH\t") {
+            let mut at: usize = 6;
+            tc = @truncate(u32, num(r, &mut at));
+            stack = after_tab(r, 2);
+        }
+        if (expect == -2) or (expect == @bit_cast(i32, tc)) {
+            // pass
+        } else {
+            cb.code(tc);
+            st = "fail";
+            code = cb.text();
+            msg.s("trap ");
+            msg.code(tc);
+            msg.s(" (");
+            msg.s(tf.trap_name(tc));
+            msg.s(", signal ");
+            msg.i(@as(i64, sig));
+            msg.s(")");
+        }
+    } else {
+        st = "fail";
+        code = "T0000";
+        msg.s("test process exited unexpectedly (status ");
+        msg.i(@as(i64, sig));
+        msg.s(")");
+    }
+    let mut hb: [256]u8 = [0; 256];
+    let mut h = tf.fmt(hb[..]);
+    h.s("AXT\t");
+    h.u(@as(u64, i));
+    h.c('\t');
+    h.s(st);
+    h.c('\t');
+    h.s(code);
+    h.c('\t');
+    h.i(file_id);
+    h.c('\t');
+    h.u(start);
+    h.c('\t');
+    h.u(end);
+    h.c('\t');
+    h.u(@int_from_float(u64, ms + 0.5));
+    h.c('\t');
+    buf_add(line, h.text());
+    put_escaped(line, msg.text());
+    buf_add(line, "\t");
+    put_escaped(line, out);
+    buf_add(line, "\t");
+    if not starts(st, "pass") {
+        put_escaped(line, stack);
+    }
+    buf_add(line, "\n");
+}

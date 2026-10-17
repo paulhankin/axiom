@@ -1,0 +1,2707 @@
+// =============================================================================
+// std/internal/runtime/darwin.ax - the Axiom host ABI (import module "axiom") on macOS
+// (Apple silicon), and crash reporting (trap messages and stack traces, spec
+// §16.4). The self-hosted compiler builds it into every program for
+// --target=aarch64-macos in place of std/internal/runtime/native.ax; ax_rt_args and
+// ax_rt_init run before `main`, ax_rt_fini after it.
+//
+// macOS has no stable system call interface: everything goes through
+// libSystem (cmd/axiom/src/mlink.ax binds these extern "C" functions to it).
+// The host ABI's numbers are Linux's (error codes, signal numbers, inotify
+// events), as on every other host; this file translates.
+//
+// Thread-locals: each thread has a block, a copy of the program's template,
+// whose address is in the TSD slot of a pthread key (the code generator
+// reads it through TPIDRRO_EL0; see cmd/axiom/src/a64.ax). ax_rt_args makes
+// the main thread's block before any Axiom code that uses one runs, and
+// thread_main each new thread's.
+// =============================================================================
+import "trap_format.ax" as tf;
+
+pub extern "C" {
+    fn axiom_shadow_stack() *tf.ShadowStack;
+    fn axiom_frame_table() *usize;
+    fn axiom_frame_address() *usize;
+    fn ax_tls_info() *mut TlsInfo;  // the linker's record (cmd/axiom/src/mlink.ax)
+
+    fn __error() *mut i32;
+    fn write(fd: i32, p: *u8, n: usize) isize;
+    fn read(fd: i32, p: *mut u8, n: usize) isize;
+    fn open(path: *u8, flags: i32, ...) i32;
+    fn openat(dir: i32, path: *u8, flags: i32, ...) i32;
+    fn close(fd: i32) i32;
+    fn dup(fd: i32) i32;
+    fn dup2(fd: i32, to: i32) i32;
+    fn fcntl(fd: i32, cmd: i32, ...) i32;
+    fn lseek(fd: i32, off: i64, whence: i32) i64;
+    fn stat(path: *u8, st: *mut u8) i32;
+    fn lstat(path: *u8, st: *mut u8) i32;
+    fn fstat(fd: i32, st: *mut u8) i32;
+    fn mkdir(path: *u8, mode: u16) i32;
+    fn rmdir(path: *u8) i32;
+    fn unlink(path: *u8) i32;
+    fn unlinkat(dir: i32, path: *u8, flags: i32) i32;
+    fn rename(from: *u8, to: *u8) i32;
+    fn opendir(path: *u8) *mut void;
+    fn fdopendir(fd: i32) *mut void;
+    fn readdir(d: *mut void) *mut u8;
+    fn rewinddir(d: *mut void) void;
+    fn closedir(d: *mut void) i32;
+    fn getcwd(buf: *mut u8, n: usize) *mut u8;
+    fn chdir(path: *u8) i32;
+    fn chmod(path: *u8, mode: u16) i32;
+    fn symlink(target: *u8, path: *u8) i32;
+    fn link(from: *u8, to: *u8) i32;
+    fn readlink(path: *u8, buf: *mut u8, n: usize) isize;
+    fn utimensat(dir: i32, path: *u8, ts: *Timespec, flags: i32) i32;
+    fn ftruncate(fd: i32, size: i64) i32;
+    fn fsync(fd: i32) i32;
+    fn flock(fd: i32, op: i32) i32;
+    fn mmap(addr: *mut void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) *mut void;
+    fn munmap(addr: *mut void, len: usize) i32;
+    fn msync(addr: *mut void, len: usize, flags: i32) i32;
+    fn getenv(name: *u8) *u8;
+    fn setenv(name: *u8, value: *u8, overwrite: i32) i32;
+    fn unsetenv(name: *u8) i32;
+    fn _NSGetEnviron() *mut *mut *mut u8;
+    fn exit(code: i32) void;
+    fn getpid() i32;
+    fn fork() i32;
+    fn kill(pid: i32, sig: i32) i32;
+    fn raise(sig: i32) i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) i32;
+    fn pipe(fds: *mut i32) i32;
+    fn posix_spawn(pid: *mut i32, path: *u8, fa: *usize, attr: *usize, argv: *mut *mut u8, envp: *mut *mut u8) i32;
+    fn posix_spawn_file_actions_init(fa: *mut usize) i32;
+    fn posix_spawn_file_actions_destroy(fa: *mut usize) i32;
+    fn posix_spawn_file_actions_adddup2(fa: *mut usize, fd: i32, to: i32) i32;
+    fn posix_spawn_file_actions_addopen(fa: *mut usize, fd: i32, path: *u8, flags: i32, mode: u16) i32;
+    fn posix_spawn_file_actions_addchdir_np(fa: *mut usize, path: *u8) i32;
+    fn posix_spawnattr_init(attr: *mut usize) i32;
+    fn posix_spawnattr_destroy(attr: *mut usize) i32;
+    fn posix_spawnattr_setsigdefault(attr: *mut usize, set: *u32) i32;
+    fn posix_spawnattr_setflags(attr: *mut usize, flags: i16) i32;
+    fn sigaction(sig: i32, act: *void, old: *mut void) i32;
+    fn sigaltstack(ss: *StackT, old: *mut StackT) i32;
+    fn setitimer(which: i32, value: *void, old: *mut void) i32;
+    fn setrlimit(resource: i32, rl: *void) i32;
+    fn malloc(n: usize) *mut void;
+    fn calloc(n: usize, size: usize) *mut void;
+    fn free(p: *mut void) void;
+    fn posix_memalign(p: *mut *mut void, align: usize, size: usize) i32;
+    fn sysconf(name: i32) isize;
+    fn sysctlbyname(name: *u8, old: *mut void, oldlen: *mut usize, new: *void, newlen: usize) i32;
+    fn nanosleep(ts: *Timespec, rem: *mut Timespec) i32;
+    fn clock_gettime(clock: u32, ts: *mut Timespec) i32;
+    fn clock_gettime_nsec_np(clock: u32) u64;
+    fn getentropy(p: *mut u8, n: usize) i32;
+    fn __ulock_wait2(op: u32, addr: *mut void, value: u64, timeout_ns: u64, value2: u64) i32;
+    fn __ulock_wake(op: u32, addr: *mut void, wake_value: u64) i32;
+    fn pthread_create(t: *mut usize, attr: *void, f: fn(*mut void) *mut void, arg: *mut void) i32;
+    fn pthread_attr_init(a: *mut void) i32;
+    fn pthread_attr_setdetachstate(a: *mut void, s: i32) i32;
+    fn pthread_attr_setstacksize(a: *mut void, size: usize) i32;
+    fn pthread_attr_destroy(a: *mut void) i32;
+    fn pthread_key_create(key: *mut u64, destructor: fn(*mut void) void) i32;
+    fn pthread_setspecific(key: u64, value: *void) i32;
+    fn pthread_getspecific(key: u64) *mut void;
+    fn pthread_self() *mut void;
+    fn pthread_get_stackaddr_np(t: *mut void) *mut void;
+    fn pthread_get_stacksize_np(t: *mut void) usize;
+    fn socket(domain: i32, ty: i32, proto: i32) i32;
+    fn connect(fd: i32, addr: *u8, len: u32) i32;
+    fn bind(fd: i32, addr: *u8, len: u32) i32;
+    fn listen(fd: i32, backlog: i32) i32;
+    fn accept(fd: i32, addr: *mut u8, len: *mut u32) i32;
+    fn shutdown(fd: i32, how: i32) i32;
+    fn setsockopt(fd: i32, level: i32, name: i32, val: *void, len: u32) i32;
+    fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) i32;
+    fn getpeername(fd: i32, addr: *mut u8, len: *mut u32) i32;
+    fn recv(fd: i32, p: *mut u8, n: usize, flags: i32) isize;
+    fn send(fd: i32, p: *u8, n: usize, flags: i32) isize;
+    fn sendto(fd: i32, p: *u8, n: usize, flags: i32, addr: *u8, len: u32) isize;
+    fn recvfrom(fd: i32, p: *mut u8, n: usize, flags: i32, addr: *mut u8, len: *mut u32) isize;
+    fn getaddrinfo(node: *u8, serv: *u8, hints: *u8, res: *mut *mut u8) i32;
+    fn freeaddrinfo(res: *mut u8) void;
+    fn poll(fds: *mut u8, n: u32, timeout: i32) i32;
+    fn kqueue() i32;
+    fn kevent(kq: i32, changes: *u8, nchanges: i32, events: *mut u8, nevents: i32, timeout: *Timespec) i32;
+    fn isatty(fd: i32) i32;
+    fn ioctl(fd: i32, req: u64, ...) i32;
+    fn tcgetattr(fd: i32, t: *mut u8) i32;
+    fn tcsetattr(fd: i32, when: i32, t: *u8) i32;
+    fn cfmakeraw(t: *mut u8) void;
+}
+
+pub struct TlsInfo {
+    key_off: u64,     // the TSD slot's byte offset (axiom.tls_key)
+    template: usize,  // the initialized part
+    filesz: usize,
+    memsz: usize,  // a thread's block
+    align: usize,
+}
+
+pub struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+
+// struct sigaction: the handler (a function, SIG_DFL 0 or SIG_IGN 1), the
+// signals blocked while it runs, flags
+pub struct SigAction {
+    handler: usize,
+    mask: u32,
+    flags: i32,
+}
+
+pub struct SigActionFn {
+    handler: fn(i32) void,
+    mask: u32,
+    flags: i32,
+}
+
+pub struct SigActionInfo {
+    handler: fn(i32, *mut void, *mut void) void,
+    mask: u32,
+    flags: i32,
+}
+
+pub fn set_action(sig: i32, sa: *void) i32 {
+    return sigaction(sig, sa, vnull());
+}
+
+pub struct StackT {
+    sp: usize,
+    size: usize,
+    flags: i32,
+}
+
+// Error codes shared with std/internal/runtime/host.mjs and std/net.ax.
+const AX_ERR: i32 = -1;
+const AX_REFUSED: i32 = -2;
+const AX_ADDR_IN_USE: i32 = -3;
+const AX_BAD_ADDRESS: i32 = -4;
+const AX_TIMED_OUT: i32 = -5;
+
+// errno values (Darwin's)
+const EPERM: i32 = 1;
+const ENOENT: i32 = 2;
+const EINTR: i32 = 4;
+const EACCES: i32 = 13;
+const EEXIST: i32 = 17;
+const ENOTDIR: i32 = 20;
+const EISDIR: i32 = 21;
+const EAGAIN: i32 = 35;  // also EWOULDBLOCK
+const EADDRINUSE: i32 = 48;
+const ETIMEDOUT: i32 = 60;
+const ECONNREFUSED: i32 = 61;
+const ELOOP: i32 = 62;
+const ENOTEMPTY: i32 = 66;
+
+// open(2)
+const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
+const O_APPEND: i32 = 0x8;
+const O_NOFOLLOW: i32 = 0x100;
+const O_CREAT: i32 = 0x200;
+const O_TRUNC: i32 = 0x400;
+const O_EVTONLY: i32 = 0x8000;
+const O_DIRECTORY: i32 = 0x10_0000;
+const O_CLOEXEC: i32 = 0x100_0000;
+const AT_FDCWD: i32 = -2;
+
+const F_SETFD: i32 = 2;
+const FD_CLOEXEC: i32 = 1;
+
+// signals (Darwin's)
+const SIGFPE: i32 = 8;
+const SIGBUS: i32 = 10;
+const SIGSEGV: i32 = 11;
+const SIGPIPE: i32 = 13;
+
+fn errno() i32 {
+    return __error().*;
+}
+
+fn nil_ptr[T]() *mut T {
+    return @ptr_from_int(*mut T, 0);
+}
+
+fn vnull() *mut void {
+    return @ptr_from_int(*mut void, 0);
+}
+
+fn align_up(x: usize, a: usize) usize {
+    return (x + (a - 1)) & ~(a - 1);
+}
+
+// A NUL-terminated copy of s in buf (false if it does not fit).
+fn copy_cstr(buf: []mut u8, s: *u8, n: usize) bool {
+    if (n + 1) > buf.len {
+        return false;
+    }
+    if n > 0 {
+        @mem_copy(buf[0..n], @slice_from_ptr(s, n));
+    }
+    // a NUL would silently cut the name short
+    for i in @as(usize, 0)..n {
+        if buf[i] == 0 {
+            return false;
+        }
+    }
+    buf[n] = 0;
+    return true;
+}
+
+fn cstr_len(p: *u8) usize {
+    let mut n: usize = 0;
+    while @ptr_from_int(*u8, @int_from_ptr(p) + n).* != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+fn cloexec(fd: i32) void {
+    _ = fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
+// The host ABI's code for a failed call's errno.
+fn fs_err() i32 {
+    let e = errno();
+    if e == ENOENT {
+        return -2;
+    }
+    if (e == EACCES) or (e == EPERM) {
+        return -13;
+    }
+    if e == EEXIST {
+        return -17;
+    }
+    if e == ENOTDIR {
+        return -20;
+    }
+    if e == EISDIR {
+        return -21;
+    }
+    if e == ENOTEMPTY {
+        return -39;
+    }
+    if e == ELOOP {
+        return -40;
+    }
+    return AX_ERR;
+}
+
+// Signal numbers: the host ABI's (Linux's) and Darwin's, for 1..31.
+let SIG_ABI_TO_DARWIN: [32]i32 = [0, 1, 2, 3, 4, 5, 6, 10, 8, 9, 30, 11, 31, 13, 14, 15, 0, 20, 19, 17, 18, 21, 22, 16,
+                                  24, 25, 26, 27, 28, 23, 0, 12];
+
+pub fn darwin_sig(abi: i32) i32 {
+    if (abi < 1) or (abi > 31) {
+        return 0;
+    }
+    return SIG_ABI_TO_DARWIN[@as(usize, @bit_cast(u32, abi))];
+}
+
+pub fn abi_sig(d: i32) i32 {
+    for i in @as(usize, 1)..32 {
+        if SIG_ABI_TO_DARWIN[i] == d {
+            return @truncate(i32, @bit_cast(isize, i));
+        }
+    }
+    return d;
+}
+
+// -----------------------------------------------------------------------------
+// Files, directories and the process
+// -----------------------------------------------------------------------------
+export fn ax_write(fd: i32, p: *u8, n: usize) isize {
+    loop {
+        let r = write(fd, p, n);
+        if (r < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if r < 0 {
+            return -1;
+        }
+        return r;
+    }
+}
+
+export fn ax_read(fd: i32, p: *mut u8, n: usize) isize {
+    loop {
+        let r = read(fd, p, n);
+        if (r < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if r < 0 {
+            return -1;
+        }
+        return r;
+    }
+}
+
+export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return AX_ERR;
+    }
+    let mut f: i32 = 0;  // O_RDONLY
+    if flags == 1 {
+        f = (O_WRONLY | O_CREAT) | O_TRUNC;
+    } else if flags == 2 {
+        f = (O_WRONLY | O_CREAT) | O_APPEND;
+    } else if flags == 3 {
+        f = O_RDWR;
+    }
+    let fd = open(&buf[0], f | O_CLOEXEC, @as(i32, 0o644));
+    if fd >= 0 {
+        return fd;
+    }
+    let e = errno();
+    if e == ENOENT {
+        return -2;
+    }
+    if e == EACCES {
+        return -13;
+    }
+    if e == EISDIR {
+        return -21;
+    }
+    return AX_ERR;
+}
+
+export fn ax_close(fd: i32) void {
+    _ = close(fd);
+}
+
+export fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return AX_ERR;
+    }
+    // struct stat: st_mode (u16) at 4, st_mtimespec at 48, st_size at 96
+    let mut st: [144]u8 = [0; 144];
+    let mut r: i32 = 0;
+    if follow != 0 {
+        r = stat(&buf[0], &mut st[0]);
+    } else {
+        r = lstat(&buf[0], &mut st[0]);
+    }
+    if r != 0 {
+        return fs_err();
+    }
+    let mode = @as(u32, st[4]) | (@as(u32, st[5]) << 8);
+    let o = @slice_from_ptr(out, 4);
+    let fmt = mode & 0o170000;
+    if fmt == 0o100000 {
+        o[0] = 1;
+    } else if fmt == 0o040000 {
+        o[0] = 2;
+    } else if fmt == 0o120000 {
+        o[0] = 3;
+    } else {
+        o[0] = 4;
+    }
+    o[1] = le64(st[..], 96);
+    // (nanoseconds overflow 64 bits for times past 2262: clamp)
+    let mut sec = le64(st[..], 48);
+    if sec > 9223372035 {
+        sec = 9223372035;
+    }
+    if sec < -9223372035 {
+        sec = -9223372035;
+    }
+    o[2] = (sec * 1000000000) + le64(st[..], 56);
+    o[3] = @as(i64, mode & 0o7777);
+    return 0;
+}
+
+fn le64(b: []u8, at: usize) i64 {
+    let mut v: u64 = 0;
+    for k in @as(usize, 0)..8 {
+        v = v | (@as(u64, b[at + k]) << @as(u64, k * 8));
+    }
+    return @bit_cast(i64, v);
+}
+
+export fn ax_mkdir(path: *u8, len: usize, mode: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return AX_ERR;
+    }
+    if mkdir(&buf[0], @truncate(u16, mode & 0o7777)) == 0 {
+        return 0;
+    }
+    return fs_err();
+}
+
+export fn ax_remove(path: *u8, len: usize, dir: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return AX_ERR;
+    }
+    let mut r: i32 = 0;
+    if dir != 0 {
+        r = rmdir(&buf[0]);
+    } else {
+        r = unlink(&buf[0]);
+    }
+    if r == 0 {
+        return 0;
+    }
+    return fs_err();
+}
+
+export fn ax_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32 {
+    let mut a: [4096]u8 = [0; 4096];
+    let mut b: [4096]u8 = [0; 4096];
+    if not copy_cstr(a[..], from, flen) or not copy_cstr(b[..], to, tlen) {
+        return AX_ERR;
+    }
+    if rename(&a[0], &b[0]) == 0 {
+        return 0;
+    }
+    return fs_err();
+}
+
+// Writes the directory's entries (not . and ..) to buf as a kind byte and
+// the name with a NUL; returns the bytes needed (more than cap: retry).
+fn read_entries(d: *mut void, buf: *mut u8, cap: usize) isize {
+    let out = @slice_from_ptr(buf, cap);
+    let mut need: usize = 0;
+    loop {
+        let e = readdir(d);
+        if @int_from_ptr(e) == 0 {
+            break;
+        }
+        // struct dirent: d_namlen (u16) at 18, d_type at 20, d_name at 21
+        let ent = @slice_from_ptr(e, 21);
+        let n = @as(usize, ent[18]) | (@as(usize, ent[19]) << 8);
+        let name = @slice_from_ptr(@ptr_from_int(*u8, @int_from_ptr(e) + 21), n);
+        if ((n == 1) and (name[0] == '.')) or ((n == 2) and (name[0] == '.') and (name[1] == '.')) {
+            continue;
+        }
+        let ty = ent[20];
+        let mut kind: u8 = 4;
+        if ty == 8 {
+            kind = 1;  // DT_REG
+        } else if ty == 4 {
+            kind = 2;  // DT_DIR
+        } else if ty == 10 {
+            kind = 3;  // DT_LNK
+        } else if ty == 0 {
+            kind = 0;  // DT_UNKNOWN
+        }
+        if (need + n + 2) <= cap {
+            out[need] = kind;
+            @mem_copy(out[need + 1..need + 1 + n], name);
+            out[need + 1 + n] = 0;
+        }
+        need += n + 2;
+    }
+    return @bit_cast(isize, need);
+}
+
+export fn ax_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut name: [4096]u8 = [0; 4096];
+    if not copy_cstr(name[..], path, len) {
+        return @as(isize, AX_ERR);
+    }
+    let d = opendir(&name[0]);
+    if @int_from_ptr(d) == 0 {
+        return @as(isize, fs_err());
+    }
+    let r = read_entries(d, buf, cap);
+    _ = closedir(d);
+    return r;
+}
+
+// Opens a directory, failing with -40 if name is a symbolic link and -20 if
+// it is not a directory.
+export fn ax_dir_open(dir: i32, name: *u8, len: usize) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], name, len) {
+        return AX_ERR;
+    }
+    let mut at = dir;
+    if dir < 0 {
+        at = AT_FDCWD;
+    }
+    let fd = openat(at, &buf[0], ((O_DIRECTORY | O_NOFOLLOW) | O_CLOEXEC), @as(i32, 0));
+    if fd < 0 {
+        return fs_err();
+    }
+    return fd;
+}
+
+export fn ax_dir_read(dir: i32, buf: *mut u8, cap: usize) isize {
+    let fd = dup(dir);
+    if fd < 0 {
+        return @as(isize, fs_err());
+    }
+    let d = fdopendir(fd);
+    if @int_from_ptr(d) == 0 {
+        _ = close(fd);
+        return @as(isize, fs_err());
+    }
+    rewinddir(d);
+    let r = read_entries(d, buf, cap);
+    _ = closedir(d);
+    return r;
+}
+
+export fn ax_dir_remove(dir: i32, name: *u8, len: usize, isdir: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], name, len) {
+        return AX_ERR;
+    }
+    let mut at = dir;
+    if dir < 0 {
+        at = AT_FDCWD;
+    }
+    let mut flags: i32 = 0;
+    if isdir != 0 {
+        flags = 0x80;  // AT_REMOVEDIR
+    }
+    if unlinkat(at, &buf[0], flags) == 0 {
+        return 0;
+    }
+    return fs_err();
+}
+
+export fn ax_dir_close(dir: i32) void {
+    _ = close(dir);
+}
+
+export fn ax_getcwd(buf: *mut u8, cap: usize) isize {
+    let mut tmp: [4096]u8 = [0; 4096];
+    if @int_from_ptr(getcwd(&mut tmp[0], 4096)) == 0 {
+        return @as(isize, fs_err());
+    }
+    let n = cstr_len(&tmp[0]);
+    if n <= cap {
+        @mem_copy(@slice_from_ptr(buf, n), tmp[0..n]);
+    }
+    return @bit_cast(isize, n);
+}
+
+export fn ax_seek(fd: i32, off: i64, whence: u32) i64 {
+    let r = lseek(fd, off, @bit_cast(i32, whence));
+    if r < 0 {
+        return @as(i64, fs_err());
+    }
+    return r;
+}
+
+// main's arguments
+let mut main_argc: i32 = 0;
+let mut main_argv: usize = 0;
+
+export fn ax_argc() i32 {
+    return main_argc;
+}
+
+// Copies argument i to buf; returns its length (-1 if there is none).
+export fn ax_arg(i: i32, buf: *mut u8, cap: usize) isize {
+    if (i < 0) or (i >= main_argc) or (main_argv == 0) {
+        return @as(isize, AX_ERR);
+    }
+    let p = @ptr_from_int(*usize, main_argv + (@as(usize, @bit_cast(u32, i)) * 8)).*;
+    let s = @ptr_from_int(*u8, p);
+    let n = cstr_len(s);
+    if n <= cap {
+        @mem_copy(@slice_from_ptr(buf, n), @slice_from_ptr(s, n));
+    }
+    return @bit_cast(isize, n);
+}
+
+// Copies environment variable name's value to buf; returns its length (-2
+// if it is not set).
+export fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut k: [1024]u8 = [0; 1024];
+    if not copy_cstr(k[..], name, len) {
+        return -2;
+    }
+    let v = getenv(&k[0]);
+    if @int_from_ptr(v) == 0 {
+        return -2;
+    }
+    let n = cstr_len(v);
+    if n <= cap {
+        @mem_copy(@slice_from_ptr(buf, n), @slice_from_ptr(v, n));
+    }
+    return @bit_cast(isize, n);
+}
+
+export fn ax_exit(code: i32) void {
+    ax_rt_fini();
+    exit(code);
+}
+
+// -----------------------------------------------------------------------------
+// Processes, the environment and signals
+// -----------------------------------------------------------------------------
+export fn ax_getpid() i32 {
+    return getpid();
+}
+
+// A copy of this process: 0 in the copy, its handle (for ax_proc_wait) in
+// this one; negative if it cannot be made.
+export fn ax_fork() i32 {
+    let pid = fork();
+    if pid < 0 {
+        return AX_ERR;
+    }
+    if pid == 0 {
+        install_crash_stack();  // a forked child has no signal stack on macOS
+    }
+    return pid;
+}
+
+export fn ax_chdir(path: *u8, len: usize) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return AX_ERR;
+    }
+    if chdir(&buf[0]) == 0 {
+        return 0;
+    }
+    return fs_err();
+}
+
+fn env_name_ok(k: []u8) bool {
+    if k.len == 0 {
+        return false;
+    }
+    for c in k {
+        if (c == '=') or (c == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+export fn ax_setenv(k: *u8, kn: usize, v: *u8, vn: usize) i32 {
+    let mut name: [1024]u8 = [0; 1024];
+    if not env_name_ok(@slice_from_ptr(k, kn)) or not copy_cstr(name[..], k, kn) {
+        return AX_ERR;
+    }
+    let value = @ptr_cast(*mut u8, malloc(vn + 1));
+    if @int_from_ptr(value) == 0 {
+        return AX_ERR;
+    }
+    if not copy_cstr(@slice_from_ptr(value, vn + 1), v, vn) {
+        free(@ptr_cast(*mut void, value));
+        return AX_ERR;
+    }
+    let r = setenv(&name[0], value, 1);
+    free(@ptr_cast(*mut void, value));
+    if r == 0 {
+        return 0;
+    }
+    return AX_ERR;
+}
+
+export fn ax_unsetenv(k: *u8, kn: usize) i32 {
+    let mut name: [1024]u8 = [0; 1024];
+    if not env_name_ok(@slice_from_ptr(k, kn)) or not copy_cstr(name[..], k, kn) {
+        return AX_ERR;
+    }
+    if unsetenv(&name[0]) == 0 {
+        return 0;
+    }
+    return AX_ERR;
+}
+
+// The whole environment, as "K=V\0" entries; returns its length.
+export fn ax_environ(buf: *mut u8, cap: usize) isize {
+    let mut n: usize = 0;
+    let out = @slice_from_ptr(buf, cap);
+    let mut e = _NSGetEnviron().*;
+    if @int_from_ptr(e) == 0 {
+        return 0;
+    }
+    loop {
+        let s = e.*;
+        if @int_from_ptr(s) == 0 {
+            break;
+        }
+        let l = cstr_len(s) + 1;
+        if (n + l) <= cap {
+            @mem_copy(out[n..n + l], @slice_from_ptr(s, l));
+        }
+        n += l;
+        e = @ptr_from_int(*mut *mut u8, @int_from_ptr(e) + 8);
+    }
+    return @bit_cast(isize, n);
+}
+
+// Signals the program asked for (host ABI numbers) and their actions.
+let mut sig_actions: [32]u8 = [0; 32];
+let mut sigpipe_ignored: u32 = 0;
+
+// Writing to a pipe or socket whose reader has gone should fail, not kill
+// the program.
+fn ignore_sigpipe() void {
+    if (@atomic_xchg(&mut sigpipe_ignored, 1) == 0) and (sig_actions[13] != 2) {
+        let sa = SigAction.{ handler: 1, mask: 0, flags: 0 };  // SIG_IGN
+        _ = set_action(SIGPIPE, @ptr_cast(*void, &sa));
+    }
+}
+
+// Splits spec's strings (each ending in 0, the list ending in an empty one)
+// from i into list; returns the index after the list.
+fn split_list(s: []u8, i0: usize, list: *mut *mut u8, base: *u8) usize {
+    let mut i = i0;
+    let mut k: usize = 0;
+    while (i < s.len) and (s[i] != 0) {
+        @ptr_from_int(*mut *u8, @int_from_ptr(list) + (k * 8)).* = @ptr_from_int(*u8, @int_from_ptr(base) + i);
+        k += 1;
+        while (i < s.len) and (s[i] != 0) {
+            i += 1;
+        }
+        i += 1;
+    }
+    return i + 1;
+}
+
+fn count_list(s: []u8, i0: usize) usize {
+    let mut i = i0;
+    let mut n: usize = 0;
+    while (i < s.len) and (s[i] != 0) {
+        while (i < s.len) and (s[i] != 0) {
+            i += 1;
+        }
+        i += 1;
+        n += 1;
+    }
+    return n;
+}
+
+fn starts_with(p: *u8, prefix: []u8) bool {
+    for k in 0..prefix.len {
+        if @ptr_from_int(*u8, @int_from_ptr(p) + k).* != prefix[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The spec: argv strings, each ending in 0, then a 0; the environment
+// ("K=V" strings, each ending in 0), then a 0; then the directory to run in
+// (empty: this one). stdio[i] is 0 to inherit stream i, 1 for a pipe, 2 for
+// /dev/null; it is replaced by the pipe's handle, or -1.
+export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
+    // a copy that ends in a NUL (the directory's terminator)
+    let sp = @ptr_cast(*mut u8, malloc(len + 1));
+    if @int_from_ptr(sp) == 0 {
+        return AX_ERR;
+    }
+    let s = @slice_from_ptr(sp, len + 1);
+    @mem_copy(s[0..len], @slice_from_ptr(spec, len));
+    s[len] = 0;
+    let body = s[0..len];
+    let modes = @slice_from_ptr(stdio, 3);
+    let argc = count_list(body, 0);
+    let argv = @ptr_cast(*mut *mut u8, calloc(argc + 1, 8));
+    // the environment starts after argv's list
+    let mut i: usize = 0;
+    for _k in 0..argc {
+        while (i < body.len) and (body[i] != 0) {
+            i += 1;
+        }
+        i += 1;
+    }
+    i += 1;
+    let env_at = i;
+    let envc = count_list(body, env_at);
+    let envp = @ptr_cast(*mut *mut u8, calloc(envc + 1, 8));
+    let cwd_at = split_list(body, env_at, envp, sp);
+    _ = split_list(body, 0, argv, sp);
+    let mut result: i32 = AX_ERR;
+    let mut fds: [6]i32 = [-1, -1, -1, -1, -1, -1];
+    let mut fa: usize = 0;
+    let mut attr: usize = 0;
+    _ = posix_spawn_file_actions_init(&mut fa);
+    _ = posix_spawnattr_init(&mut attr);
+    let mut ok = (argc > 0) and (@int_from_ptr(argv) != 0) and (@int_from_ptr(envp) != 0) and (cwd_at <= (len + 1));
+    let mut path_var = @ptr_from_int(*u8, 0);
+    if ok {
+        for k in 0..envc {
+            let e = @ptr_from_int(*mut *u8, @int_from_ptr(envp) + (k * 8)).*;
+            if starts_with(e, "PATH=") {
+                path_var = @ptr_from_int(*u8, @int_from_ptr(e) + 5);
+            }
+        }
+        for k in @as(usize, 0)..3 {
+            if modes[k] == 1 {
+                let mut p: [2]i32 = [-1, -1];
+                if pipe(&mut p[0]) != 0 {
+                    ok = false;
+                    break;
+                }
+                cloexec(p[0]);
+                cloexec(p[1]);
+                if k == 0 {
+                    fds[0] = p[1];
+                    fds[1] = p[0];
+                } else {
+                    fds[2 * k] = p[0];
+                    fds[(2 * k) + 1] = p[1];
+                }
+                _ = posix_spawn_file_actions_adddup2(&mut fa, fds[(2 * k) + 1], @truncate(i32, @bit_cast(isize, k)));
+            } else if modes[k] == 2 {
+                _ = posix_spawn_file_actions_addopen(&mut fa, @truncate(i32, @bit_cast(isize, k)), "/dev/null".ptr,
+                                                     O_RDWR, 0);
+            }
+        }
+    }
+    if ok {
+        if (cwd_at < len) and (s[cwd_at] != 0) {
+            _ = posix_spawn_file_actions_addchdir_np(&mut fa, &s[cwd_at]);
+        }
+        let def: u32 = @as(u32, 1) << 12;  // SIGPIPE's bit
+        _ = posix_spawnattr_setsigdefault(&mut attr, &def);
+        _ = posix_spawnattr_setflags(&mut attr, 0x04);  // POSIX_SPAWN_SETSIGDEF
+        let mut pid: i32 = -1;
+        let mut err = ENOENT;
+        let a0 = argv.*;
+        let a0s = @slice_from_ptr(a0, cstr_len(a0));
+        let mut has_slash = false;
+        for c in a0s {
+            if c == '/' {
+                has_slash = true;
+            }
+        }
+        if has_slash {
+            err = posix_spawn(&mut pid, a0, &fa, &attr, argv, envp);
+        } else {
+            // each directory of the child's PATH in turn
+            let mut pv: []u8 = "/usr/local/bin:/usr/bin:/bin";
+            if (@int_from_ptr(path_var) != 0) and (path_var.* != 0) {
+                pv = @slice_from_ptr(path_var, cstr_len(path_var));
+            }
+            let mut cand: [4096]u8 = [0; 4096];
+            let mut a: usize = 0;
+            loop {
+                let mut b = a;
+                while (b < pv.len) and (pv[b] != ':') {
+                    b += 1;
+                }
+                let mut dir = pv[a..b];
+                if dir.len == 0 {
+                    dir = ".";
+                }
+                let n = dir.len + 1 + a0s.len;
+                if (n + 1) <= cand.len {
+                    @mem_copy(cand[0..dir.len], dir);
+                    cand[dir.len] = '/';
+                    @mem_copy(cand[dir.len + 1..n], a0s);
+                    cand[n] = 0;
+                    let e = posix_spawn(&mut pid, &cand[0], &fa, &attr, argv, envp);
+                    if e == 0 {
+                        err = 0;
+                        break;
+                    }
+                    if (e != ENOENT) and (e != ENOTDIR) {
+                        err = e;
+                    }
+                }
+                if b >= pv.len {
+                    break;
+                }
+                a = b + 1;
+            }
+        }
+        if err == 0 {
+            result = pid;
+        } else if err == ENOENT {
+            result = -2;
+        } else if (err == EACCES) or (err == EPERM) {
+            result = -13;
+        }
+    }
+    for k in @as(usize, 0)..3 {
+        if fds[(2 * k) + 1] >= 0 {
+            _ = close(fds[(2 * k) + 1]);
+        }
+        if (result >= 0) and (modes[k] == 1) {
+            modes[k] = fds[2 * k];
+        } else {
+            if fds[2 * k] >= 0 {
+                _ = close(fds[2 * k]);
+            }
+            modes[k] = -1;
+        }
+    }
+    _ = posix_spawn_file_actions_destroy(&mut fa);
+    _ = posix_spawnattr_destroy(&mut attr);
+    free(@ptr_cast(*mut void, argv));
+    free(@ptr_cast(*mut void, envp));
+    free(@ptr_cast(*mut void, sp));
+    return result;
+}
+
+// 0: still running (block 0); 1: exited, with *status its code; 2: killed
+// by signal *status.
+export fn ax_proc_wait(h: i32, block: u32, status: *mut i32) i32 {
+    let mut st: i32 = 0;
+    let mut opts: i32 = 1;  // WNOHANG
+    if block != 0 {
+        opts = 0;
+    }
+    loop {
+        let r = waitpid(h, &mut st, opts);
+        if (r < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if r < 0 {
+            return AX_ERR;
+        }
+        if r == 0 {
+            return 0;
+        }
+        break;
+    }
+    if (st & 0x7f) == 0 {
+        status.* = (st >> 8) & 0xff;
+        return 1;
+    }
+    status.* = abi_sig(st & 0x7f);
+    return 2;
+}
+
+export fn ax_proc_kill(h: i32, sig: i32) i32 {
+    let d = darwin_sig(sig);
+    if (d == 0) or (kill(h, d) < 0) {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+export fn ax_pipe_read(h: i32, p: *mut u8, n: usize) isize {
+    return ax_read(h, p, n);
+}
+
+export fn ax_pipe_write(h: i32, p: *u8, n: usize) isize {
+    ignore_sigpipe();
+    return ax_write(h, p, n);
+}
+
+export fn ax_pipe_close(h: i32) void {
+    _ = close(h);
+}
+
+// Signals the program catches: their bits (host ABI numbers), set by the
+// handler; sig_seq is what ax_signal_take waits on.
+let mut sig_pending: u64 = 0;
+let mut sig_seq: u32 = 0;
+
+fn on_signal(sig: i32) void {
+    _ = @atomic_or(&mut sig_pending, @as(u64, 1) << @as(u64, @bit_cast(u32, abi_sig(sig))));
+    _ = @atomic_add(&mut sig_seq, 1);
+    _ = __ulock_wake(0x0100_0101, @ptr_cast(*mut void, &mut sig_seq), 0);  // wake all, no errno
+}
+
+export fn ax_signal(sig: i32, action: u32) i32 {
+    // not KILL, STOP, SEGV, BUS or FPE (host ABI numbers)
+    if (sig < 1) or (sig > 31) or (sig == 9) or (sig == 19) or (sig == 11) or (sig == 7) or (sig == 8) {
+        return AX_ERR;
+    }
+    let d = darwin_sig(sig);
+    if d == 0 {
+        return AX_ERR;
+    }
+    let mut r: i32 = 0;
+    if action == 2 {
+        let sa = SigActionFn.{ handler: on_signal, mask: 0, flags: 0x2 };  // SA_RESTART
+        r = set_action(d, @ptr_cast(*void, &sa));
+    } else if action <= 1 {
+        let sa = SigAction.{ handler: @as(usize, action), mask: 0, flags: 0 };  // SIG_DFL, SIG_IGN
+        r = set_action(d, @ptr_cast(*void, &sa));
+    } else {
+        return AX_ERR;
+    }
+    if r != 0 {
+        return AX_ERR;
+    }
+    sig_actions[@as(usize, @bit_cast(u32, sig))] = @truncate(u8, action);
+    return 0;
+}
+
+// The signals caught since the last call, as bits; waits up to timeout_ns
+// (-1: for ever) for one.
+export fn ax_signal_take(timeout_ns: i64) i64 {
+    loop {
+        let seq = @atomic_load(&sig_seq);
+        let got = @atomic_xchg(&mut sig_pending, 0);
+        if (got != 0) or (timeout_ns == 0) {
+            return @bit_cast(i64, got);
+        }
+        let mut t: u64 = 0;  // for ever
+        if timeout_ns > 0 {
+            t = @bit_cast(u64, timeout_ns);
+        }
+        let r = __ulock_wait2(0x0100_0001, @ptr_cast(*mut void, &mut sig_seq), @as(u64, seq), t, 0);
+        if r == -ETIMEDOUT {
+            return @bit_cast(i64, @atomic_xchg(&mut sig_pending, 0));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sockets. An address record is 24 bytes: [0] the family (4 or 6), [2..4]
+// the port (network order), [4..8] an IPv4 or [4..20] an IPv6 address,
+// [20..24] the IPv6 scope. Darwin's sockaddrs start with a length byte;
+// AF_INET is 2, AF_INET6 30.
+// -----------------------------------------------------------------------------
+const AF_UNIX: i32 = 1;
+const AF_INET: i32 = 2;
+const AF_INET6: i32 = 30;
+const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
+const SOL_SOCKET: i32 = 0xffff;
+const SO_REUSEADDR: i32 = 0x4;
+const SO_SNDTIMEO: i32 = 0x1005;
+const SO_RCVTIMEO: i32 = 0x1006;
+const SO_NOSIGPIPE: i32 = 0x1022;
+
+// The record as a struct sockaddr in ss (128 bytes); its length (0: bad family).
+fn rec_sockaddr(r: *u8, ss: []mut u8) u32 {
+    let rec = @slice_from_ptr(r, 24);
+    @mem_set(ss[0..128], 0);
+    if rec[0] == 4 {
+        ss[0] = 16;
+        ss[1] = 2;
+        @mem_copy(ss[2..4], rec[2..4]);
+        @mem_copy(ss[4..8], rec[4..8]);
+        return 16;
+    }
+    if rec[0] == 6 {
+        ss[0] = 28;
+        ss[1] = 30;
+        @mem_copy(ss[2..4], rec[2..4]);
+        @mem_copy(ss[8..24], rec[4..20]);
+        @mem_copy(ss[24..28], rec[20..24]);
+        return 28;
+    }
+    return 0;
+}
+
+fn sockaddr_rec(sa: *u8, r: *mut u8) bool {
+    let a = @slice_from_ptr(sa, 28);
+    let rec = @slice_from_ptr(r, 24);
+    @mem_set(rec, 0);
+    if a[1] == 2 {
+        rec[0] = 4;
+        @mem_copy(rec[2..4], a[2..4]);
+        @mem_copy(rec[4..8], a[4..8]);
+        return true;
+    }
+    if a[1] == 30 {
+        rec[0] = 6;
+        @mem_copy(rec[2..4], a[2..4]);
+        @mem_copy(rec[4..20], a[8..24]);
+        @mem_copy(rec[20..24], a[24..28]);
+        return true;
+    }
+    return false;
+}
+
+fn set_int_opt(fd: i32, name: i32, v: i32) void {
+    let x = v;
+    _ = setsockopt(fd, SOL_SOCKET, name, @ptr_cast(*void, &x), 4);
+}
+
+// A socket that is closed on exec and does not raise SIGPIPE.
+fn new_socket(family: i32, ty: i32, proto: i32) i32 {
+    let fd = socket(family, ty, proto);
+    if fd >= 0 {
+        cloexec(fd);
+        set_int_opt(fd, SO_NOSIGPIPE, 1);
+    }
+    return fd;
+}
+
+// struct addrinfo: ai_family at 4, ai_socktype at 8, ai_protocol at 12,
+// ai_addrlen at 16, ai_addr at 32, ai_next at 40.
+fn ai_i32(a: *mut u8, off: usize) i32 {
+    return @ptr_from_int(*i32, @int_from_ptr(a) + off).*;
+}
+
+fn ai_ptr(a: *mut u8, off: usize) *mut u8 {
+    return @ptr_from_int(*mut *mut u8, @int_from_ptr(a) + off).*;
+}
+
+// getaddrinfo for a host (len 0: none) and a numeric port (0: none).
+fn lookup(name: *u8, len: usize, port: u32, passive: bool, res: *mut *mut u8) i32 {
+    let mut hostname: [256]u8 = [0; 256];
+    if not copy_cstr(hostname[..], name, len) {
+        return AX_BAD_ADDRESS;
+    }
+    let mut serv: [16]u8 = [0; 16];
+    let mut digits: [10]u8 = [0; 10];
+    let mut nd: usize = 0;
+    let mut v = port;
+    loop {
+        digits[nd] = '0' + @truncate(u8, v % 10);
+        nd += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for k in 0..nd {
+        serv[k] = digits[nd - 1 - k];
+    }
+    let mut hints: [48]u8 = [0; 48];
+    let h = @ptr_cast(*mut i32, &mut hints[0]);
+    if passive {
+        h.* = 1;  // AI_PASSIVE
+    }
+    @ptr_from_int(*mut i32, @int_from_ptr(h) + 8).* = SOCK_STREAM;
+    let mut hp = @ptr_cast(*u8, &hostname[0]);
+    if len == 0 {
+        hp = @ptr_from_int(*u8, 0);
+    }
+    let mut sp = @ptr_cast(*u8, &serv[0]);
+    if port == 0 {
+        sp = @ptr_from_int(*u8, 0);
+    }
+    if getaddrinfo(hp, sp, &hints[0], res) != 0 {
+        return AX_BAD_ADDRESS;
+    }
+    return 0;
+}
+
+export fn ax_resolve(name: *u8, len: usize, out: *mut u8, max: u32) i32 {
+    if len == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let mut res = nil_ptr.[u8]();
+    if lookup(name, len, 0, false, &mut res) != 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let mut n: u32 = 0;
+    let mut a = res;
+    while (@int_from_ptr(a) != 0) and (n < max) {
+        if sockaddr_rec(ai_ptr(a, 32), @ptr_from_int(*mut u8, @int_from_ptr(out) + (@as(usize, n) * 24))) {
+            n += 1;
+        }
+        a = ai_ptr(a, 40);
+    }
+    freeaddrinfo(res);
+    if n == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    return @bit_cast(i32, n);
+}
+
+export fn ax_tcp_connect(name: *u8, len: usize, port: u32) i32 {
+    let mut res = nil_ptr.[u8]();
+    let rc = lookup(name, len, port, false, &mut res);
+    if rc != 0 {
+        return rc;
+    }
+    let mut result = AX_ERR;
+    let mut a = res;
+    while @int_from_ptr(a) != 0 {
+        let fd = new_socket(ai_i32(a, 4), ai_i32(a, 8), ai_i32(a, 12));
+        if fd >= 0 {
+            if connect(fd, ai_ptr(a, 32), @bit_cast(u32, ai_i32(a, 16))) == 0 {
+                result = fd;
+                break;
+            }
+            result = AX_ERR;
+            if errno() == ECONNREFUSED {
+                result = AX_REFUSED;
+            }
+            _ = close(fd);
+        }
+        a = ai_ptr(a, 40);
+    }
+    freeaddrinfo(res);
+    return result;
+}
+
+export fn ax_tcp_listen(name: *u8, len: usize, port: u32) i32 {
+    let mut res = nil_ptr.[u8]();
+    let rc = lookup(name, len, port, true, &mut res);
+    if rc != 0 {
+        return rc;
+    }
+    let mut result = AX_ERR;
+    let mut a = res;
+    while @int_from_ptr(a) != 0 {
+        let fd = new_socket(ai_i32(a, 4), ai_i32(a, 8), ai_i32(a, 12));
+        if fd >= 0 {
+            set_int_opt(fd, SO_REUSEADDR, 1);
+            if (bind(fd, ai_ptr(a, 32), @bit_cast(u32, ai_i32(a, 16))) == 0) and (listen(fd, 128) == 0) {
+                result = fd;
+                break;
+            }
+            result = AX_ERR;
+            if errno() == EADDRINUSE {
+                result = AX_ADDR_IN_USE;
+            }
+            _ = close(fd);
+        }
+        a = ai_ptr(a, 40);
+    }
+    freeaddrinfo(res);
+    return result;
+}
+
+export fn ax_tcp_accept(listener: i32) i32 {
+    loop {
+        let fd = accept(listener, nil_ptr.[u8](), nil_ptr.[u32]());
+        if (fd < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if fd < 0 {
+            return AX_ERR;
+        }
+        cloexec(fd);
+        set_int_opt(fd, SO_NOSIGPIPE, 1);
+        return fd;
+    }
+}
+
+export fn ax_tcp_local_port(h: i32) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let mut sl: u32 = 128;
+    if getsockname(h, &mut ss[0], &mut sl) != 0 {
+        return AX_ERR;
+    }
+    if (ss[1] == 2) or (ss[1] == 30) {
+        return (@as(i32, ss[2]) << 8) | @as(i32, ss[3]);
+    }
+    return AX_ERR;
+}
+
+fn sock_err() isize {
+    if errno() == EAGAIN {
+        return @as(isize, AX_TIMED_OUT);
+    }
+    return @as(isize, AX_ERR);
+}
+
+export fn ax_sock_read(h: i32, p: *mut u8, n: usize) isize {
+    loop {
+        let r = recv(h, p, n, 0);
+        if (r < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if r < 0 {
+            return sock_err();
+        }
+        return r;
+    }
+}
+
+export fn ax_sock_write(h: i32, p: *u8, n: usize) isize {
+    loop {
+        let r = send(h, p, n, 0);
+        if (r < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if r < 0 {
+            return sock_err();
+        }
+        return r;
+    }
+}
+
+// Reads and writes on h fail with AX_TIMED_OUT after ms milliseconds (0:
+// never). (struct timeval: tv_sec i64, tv_usec i32.)
+export fn ax_sock_timeout(h: i32, ms: u32) i32 {
+    let mut tv: [2]i64 = [@as(i64, ms / 1000), @as(i64, (ms % 1000) * 1000)];
+    if setsockopt(h, SOL_SOCKET, SO_RCVTIMEO, @ptr_cast(*void, &tv[0]), 16) != 0 {
+        return AX_ERR;
+    }
+    if setsockopt(h, SOL_SOCKET, SO_SNDTIMEO, @ptr_cast(*void, &tv[0]), 16) != 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+// Shutting the socket down first wakes a thread blocked in accept on it.
+export fn ax_sock_close(h: i32) void {
+    _ = shutdown(h, 2);  // SHUT_RDWR
+    _ = close(h);
+}
+
+export fn ax_tcp_connect_addr(r: *u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let fd = new_socket(@as(i32, ss[1]), SOCK_STREAM, 0);
+    if fd < 0 {
+        return AX_ERR;
+    }
+    loop {
+        let c = connect(fd, &ss[0], sl);
+        if c == 0 {
+            return fd;
+        }
+        if errno() != EINTR {
+            break;
+        }
+    }
+    let e = errno();
+    _ = close(fd);
+    if e == ECONNREFUSED {
+        return AX_REFUSED;
+    }
+    return AX_ERR;
+}
+
+export fn ax_tcp_listen_addr(r: *u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let fd = new_socket(@as(i32, ss[1]), SOCK_STREAM, 0);
+    if fd < 0 {
+        return AX_ERR;
+    }
+    set_int_opt(fd, SO_REUSEADDR, 1);
+    if (bind(fd, &ss[0], sl) == 0) and (listen(fd, 128) == 0) {
+        return fd;
+    }
+    let e = errno();
+    _ = close(fd);
+    if e == EADDRINUSE {
+        return AX_ADDR_IN_USE;
+    }
+    return AX_ERR;
+}
+
+export fn ax_sock_addr(h: i32, peer: u32, out: *mut u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let mut sl: u32 = 128;
+    let mut r: i32 = 0;
+    if peer != 0 {
+        r = getpeername(h, &mut ss[0], &mut sl);
+    } else {
+        r = getsockname(h, &mut ss[0], &mut sl);
+    }
+    if (r != 0) or not sockaddr_rec(&ss[0], out) {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+export fn ax_udp_open(r: *u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let fd = new_socket(@as(i32, ss[1]), SOCK_DGRAM, 0);
+    if fd < 0 {
+        return AX_ERR;
+    }
+    if bind(fd, &ss[0], sl) == 0 {
+        return fd;
+    }
+    let e = errno();
+    _ = close(fd);
+    if e == EADDRINUSE {
+        return AX_ADDR_IN_USE;
+    }
+    return AX_ERR;
+}
+
+export fn ax_udp_send(h: i32, p: *u8, n: usize, r: *u8) isize {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return @as(isize, AX_BAD_ADDRESS);
+    }
+    loop {
+        let k = sendto(h, p, n, 0, &ss[0], sl);
+        if (k < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if k < 0 {
+            return sock_err();
+        }
+        return k;
+    }
+}
+
+export fn ax_udp_recv(h: i32, p: *mut u8, n: usize, from: *mut u8) isize {
+    let mut ss: [128]u8 = [0; 128];
+    loop {
+        let mut sl: u32 = 128;
+        let k = recvfrom(h, p, n, 0, &mut ss[0], &mut sl);
+        if (k < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if k < 0 {
+            return sock_err();
+        }
+        _ = sockaddr_rec(&ss[0], from);
+        return k;
+    }
+}
+
+// struct sockaddr_un: sun_len, sun_family, sun_path[104]
+fn unix_addr(path: *u8, len: usize, a: []mut u8) bool {
+    if (len == 0) or (len >= 104) {
+        return false;
+    }
+    @mem_set(a[0..106], 0);
+    if not copy_cstr(a[2..106], path, len) {
+        return false;
+    }
+    a[0] = 106;
+    a[1] = 1;
+    return true;
+}
+
+export fn ax_unix_connect(path: *u8, len: usize) i32 {
+    let mut a: [106]u8 = [0; 106];
+    if not unix_addr(path, len, a[..]) {
+        return AX_BAD_ADDRESS;
+    }
+    let fd = new_socket(AF_UNIX, SOCK_STREAM, 0);
+    if fd < 0 {
+        return AX_ERR;
+    }
+    if connect(fd, &a[0], 106) == 0 {
+        return fd;
+    }
+    let e = errno();
+    _ = close(fd);
+    if (e == ECONNREFUSED) or (e == ENOENT) {
+        return AX_REFUSED;
+    }
+    return AX_ERR;
+}
+
+export fn ax_unix_listen(path: *u8, len: usize) i32 {
+    let mut a: [106]u8 = [0; 106];
+    if not unix_addr(path, len, a[..]) {
+        return AX_BAD_ADDRESS;
+    }
+    let fd = new_socket(AF_UNIX, SOCK_STREAM, 0);
+    if fd < 0 {
+        return AX_ERR;
+    }
+    if (bind(fd, &a[0], 106) == 0) and (listen(fd, 128) == 0) {
+        return fd;
+    }
+    let e = errno();
+    _ = close(fd);
+    if e == EADDRINUSE {
+        return AX_ADDR_IN_USE;
+    }
+    return AX_ERR;
+}
+
+// entries are struct pollfd (as on Linux)
+export fn ax_poll(entries: *mut u8, n: u32, timeout_ms: i32) i32 {
+    loop {
+        let r = poll(entries, n, timeout_ms);
+        if (r < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if r < 0 {
+            return AX_ERR;
+        }
+        return r;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// More of the file system
+// -----------------------------------------------------------------------------
+export fn ax_chmod(path: *u8, len: usize, mode: u32) i32 {
+    let mut b: [4096]u8 = [0; 4096];
+    if not copy_cstr(b[..], path, len) {
+        return AX_ERR;
+    }
+    if chmod(&b[0], @truncate(u16, mode & 0o7777)) != 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+export fn ax_symlink(target: *u8, tlen: usize, link_: *u8, llen: usize) i32 {
+    let mut a: [4096]u8 = [0; 4096];
+    let mut b: [4096]u8 = [0; 4096];
+    if not copy_cstr(a[..], target, tlen) or not copy_cstr(b[..], link_, llen) {
+        return AX_ERR;
+    }
+    if symlink(&a[0], &b[0]) != 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+export fn ax_link(from: *u8, flen: usize, to: *u8, tlen: usize) i32 {
+    let mut a: [4096]u8 = [0; 4096];
+    let mut b: [4096]u8 = [0; 4096];
+    if not copy_cstr(a[..], from, flen) or not copy_cstr(b[..], to, tlen) {
+        return AX_ERR;
+    }
+    if link(&a[0], &b[0]) != 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+// The target of a symbolic link; returns its length.
+export fn ax_readlink(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut p: [4096]u8 = [0; 4096];
+    let mut tmp: [4096]u8 = [0; 4096];
+    if not copy_cstr(p[..], path, len) {
+        return @as(isize, AX_ERR);
+    }
+    let n = readlink(&p[0], &mut tmp[0], 4096);
+    if n < 0 {
+        return @as(isize, fs_err());
+    }
+    let k = @bit_cast(usize, n);
+    if k <= cap {
+        @mem_copy(@slice_from_ptr(buf, k), tmp[0..k]);
+    }
+    return n;
+}
+
+fn split_ns(ns: i64) Timespec {
+    let mut s = ns / 1000000000;
+    let mut n = ns % 1000000000;
+    if n < 0 {
+        n += 1000000000;
+        s -= 1;
+    }
+    return Timespec.{ sec: s, nsec: n };
+}
+
+// Sets the access and modification times (nanoseconds since 1970).
+export fn ax_utimes(path: *u8, len: usize, atime_ns: i64, mtime_ns: i64) i32 {
+    let mut p: [4096]u8 = [0; 4096];
+    if not copy_cstr(p[..], path, len) {
+        return AX_ERR;
+    }
+    let ts: [2]Timespec = [split_ns(atime_ns), split_ns(mtime_ns)];
+    if utimensat(AT_FDCWD, &p[0], &ts[0], 0) != 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+export fn ax_ftruncate(fd: i32, size: i64) i32 {
+    if ftruncate(fd, size) != 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+export fn ax_fsync(fd: i32) i32 {
+    if fsync(fd) != 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+export fn ax_flock(fd: i32, op: u32) i32 {
+    loop {
+        let r = flock(fd, @bit_cast(i32, op));
+        if (r < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if r < 0 {
+            if errno() == EAGAIN {
+                return -11;
+            }
+            return AX_ERR;
+        }
+        return 0;
+    }
+}
+
+// A shared mapping of len bytes of the file at off; 0 if it cannot be made.
+export fn ax_mmap(fd: i32, off: i64, len: usize, writable: u32) usize {
+    let mut prot: i32 = 1;  // PROT_READ
+    if writable != 0 {
+        prot = 3;
+    }
+    let p = mmap(vnull(), len, prot, 1, fd, off);  // MAP_SHARED
+    let a = @int_from_ptr(p);
+    if a == ~@as(usize, 0) {
+        return 0;
+    }
+    return a;
+}
+
+export fn ax_munmap(addr: usize, len: usize) i32 {
+    if munmap(@ptr_from_int(*mut void, addr), len) != 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+export fn ax_msync(addr: usize, len: usize) i32 {
+    if msync(@ptr_from_int(*mut void, addr), len, 0x10) != 0 {  // MS_SYNC
+        return AX_ERR;
+    }
+    return 0;
+}
+
+// Watching: a kqueue, with a descriptor per path (the watch's number) and
+// EVFILT_VNODE events, reported as inotify's records (as std/os/fs reads
+// them). kqueue says only that a directory changed, not which entries did,
+// and nothing when a file in it is written; so each watched directory keeps
+// a snapshot of its entries. When it changes it is read again and the
+// difference reported (IN_CREATE, IN_DELETE with the entry's name), and
+// each regular file in it has a kqueue watch of its own (IN_MODIFY,
+// IN_ATTRIB with its name). A rescan whose records do not fit in the
+// caller's buffer stays pending, and the next read finishes it.
+struct WEnt {
+    name: usize,  // malloc'd, NUL-terminated; 0 for a free slot
+    len: usize,
+    isdir: bool,
+    fd: i32,     // the entry's own watch, -1 for none
+    seen: bool,  // in the latest scan
+}
+
+struct WDir {
+    kq: i32,  // the Watcher's kqueue; -1 for a free slot
+    fd: i32,  // the descriptor kqueue watches: the watch's number
+    isdir: bool,
+    dirty: bool,  // changed since the last complete rescan
+    path: usize,  // malloc'd, NUL-terminated
+    ents: usize,  // *mut WEnt
+    n: usize,
+    cap: usize,
+}
+
+let mut wdirs: usize = 0;  // *mut WDir
+let mut nwdirs: usize = 0;
+let mut capwdirs: usize = 0;
+let mut watch_lock: u32 = 0;
+
+const IN_MODIFY: u32 = 0x2;
+const IN_ATTRIB: u32 = 0x4;
+const IN_CREATE: u32 = 0x100;
+const IN_DELETE: u32 = 0x200;
+const IN_DELETE_SELF: u32 = 0x400;
+const IN_MOVE_SELF: u32 = 0x800;
+const IN_ISDIR: u32 = 0x4000_0000;
+const O_NONBLOCK: i32 = 0x4;
+
+fn lock_watches() void {
+    while @atomic_xchg(&mut watch_lock, 1) != 0 {}
+}
+
+fn unlock_watches() void {
+    _ = @atomic_xchg(&mut watch_lock, 0);
+}
+
+fn wdir(i: usize) *mut WDir {
+    return @ptr_from_int(*mut WDir, wdirs + (i * @size_of(WDir)));
+}
+
+fn went(w: *WDir, i: usize) *mut WEnt {
+    return @ptr_from_int(*mut WEnt, w.ents + (i * @size_of(WEnt)));
+}
+
+fn went_name(e: *WEnt) []u8 {
+    return @slice_from_ptr(@ptr_from_int(*u8, e.name), e.len);
+}
+
+// A larger copy of an array of n items of size sz (the old one freed);
+// 0 if there is no memory.
+fn grow(p: usize, n: usize, sz: usize, cap: usize) usize {
+    let q = @int_from_ptr(calloc(cap, sz));
+    if (q != 0) and (n > 0) {
+        @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, q), n * sz), @slice_from_ptr(@ptr_from_int(*u8, p), n * sz));
+    }
+    if (q != 0) and (p != 0) {
+        free(@ptr_from_int(*mut void, p));
+    }
+    return q;
+}
+
+// struct kevent: ident u64, filter i16, flags u16, fflags u32, data i64, udata
+fn kev(b: []mut u8, ident: u64, filter: i16, flags: u16, fflags: u32, udata: u64) void {
+    @mem_set(b[0..32], 0);
+    @ptr_cast(*mut u64, &mut b[0]).* = ident;
+    @ptr_cast(*mut i16, &mut b[8]).* = filter;
+    @ptr_cast(*mut u16, &mut b[10]).* = flags;
+    @ptr_cast(*mut u32, &mut b[12]).* = fflags;
+    @ptr_cast(*mut u64, &mut b[24]).* = udata;
+}
+
+// Adds a vnode watch for fd to kq (EV_ADD | EV_CLEAR; NOTE_DELETE | WRITE |
+// EXTEND | ATTRIB | RENAME), tagged with udata.
+fn kq_watch(kq: i32, fd: i32, udata: u64) bool {
+    let mut ev: [32]u8 = [0; 32];
+    kev(ev[..], @as(u64, @bit_cast(u32, fd)), -4, 0x21, 0x2f, udata);
+    return kevent(kq, &ev[0], 1, nil_ptr.[u8](), 0, @ptr_from_int(*Timespec, 0)) >= 0;
+}
+
+// Appends an inotify record (struct inotify_event: wd, mask, cookie, len,
+// then the name padded with NULs); false if it does not fit.
+fn put_rec(out: []mut u8, at: *mut usize, wd: i32, mask: u32, name: []u8) bool {
+    let mut nl: usize = 0;
+    if name.len > 0 {
+        nl = align_up(name.len + 1, 4);
+    }
+    let w = at.*;
+    if (w + 16 + nl) > out.len {
+        return false;
+    }
+    @ptr_cast(*mut i32, &mut out[w]).* = wd;
+    @ptr_cast(*mut u32, &mut out[w + 4]).* = mask;
+    @ptr_cast(*mut u32, &mut out[w + 8]).* = 0;
+    @ptr_cast(*mut u32, &mut out[w + 12]).* = @truncate(u32, nl);
+    if nl > 0 {
+        @mem_set(out[w + 16..w + 16 + nl], 0);
+        @mem_copy(out[w + 16..w + 16 + name.len], name);
+    }
+    at.* = w + 16 + nl;
+    return true;
+}
+
+fn ent_release(e: *mut WEnt) void {
+    if e.fd >= 0 {
+        _ = close(e.fd);  // (its events go with it)
+        e.fd = -1;
+    }
+    if e.name != 0 {
+        free(@ptr_from_int(*mut void, e.name));
+    }
+    e.name = 0;
+    e.len = 0;
+}
+
+// Records entry `name` in w's snapshot, with a watch of its own if it is a
+// regular file; false if there is no memory.
+fn ent_add(w: *mut WDir, slot: usize, name: []u8, ty: u8) bool {
+    let mut k = w.n;
+    for i in @as(usize, 0)..w.n {
+        if went(w, i).name == 0 {
+            k = i;
+            break;
+        }
+    }
+    if k == w.n {
+        if w.n == w.cap {
+            let nc = (w.cap * 2) + 16;
+            let q = grow(w.ents, w.n, @size_of(WEnt), nc);
+            if q == 0 {
+                return false;
+            }
+            w.ents = q;
+            w.cap = nc;
+        }
+        w.n += 1;
+    }
+    let p = @int_from_ptr(malloc(name.len + 1));
+    if p == 0 {
+        return false;
+    }
+    let dst = @slice_from_ptr(@ptr_from_int(*mut u8, p), name.len + 1);
+    @mem_copy(dst[0..name.len], name);
+    dst[name.len] = 0;
+    let e = went(w, k);
+    e.name = p;
+    e.len = name.len;
+    e.isdir = ty == 4;  // DT_DIR
+    e.fd = -1;
+    e.seen = true;
+    if ty == 8 {  // DT_REG: a watch of its own (it may fail: too many open files)
+        let mut full: [4096]u8 = [0; 4096];
+        let dir = @slice_from_ptr(@ptr_from_int(*u8, w.path), cstr_len(@ptr_from_int(*u8, w.path)));
+        if (dir.len + name.len + 2) <= full.len {
+            @mem_copy(full[0..dir.len], dir);
+            full[dir.len] = '/';
+            @mem_copy(full[dir.len + 1..dir.len + 1 + name.len], name);
+            full[dir.len + 1 + name.len] = 0;
+            let fd = open(&full[0], (O_EVTONLY | O_CLOEXEC) | O_NONBLOCK, @as(i32, 0));
+            if fd >= 0 {
+                let tag = ((@as(u64, slot) + 1) << 32) | (@as(u64, k) + 1);
+                if kq_watch(w.kq, fd, tag) {
+                    e.fd = fd;
+                } else {
+                    _ = close(fd);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Reads w's directory again and reports the difference from its snapshot
+// (when out is given), updating the snapshot as far as the records fit.
+// False if some did not fit: the rest stay for the next rescan.
+fn rescan(w: *mut WDir, slot: usize, out: []mut u8, at: *mut usize, emit: bool) bool {
+    let d = opendir(@ptr_from_int(*u8, w.path));
+    if @int_from_ptr(d) == 0 {
+        return true;  // gone: IN_DELETE_SELF comes from its own watch
+    }
+    for i in @as(usize, 0)..w.n {
+        went(w, i).seen = false;
+    }
+    let mut complete = true;
+    loop {
+        let e = readdir(d);
+        if @int_from_ptr(e) == 0 {
+            break;
+        }
+        // struct dirent: d_namlen (u16) at 18, d_type at 20, d_name at 21
+        let ent = @slice_from_ptr(e, 21);
+        let n = @as(usize, ent[18]) | (@as(usize, ent[19]) << 8);
+        let name = @slice_from_ptr(@ptr_from_int(*u8, @int_from_ptr(e) + 21), n);
+        if ((n == 1) and (name[0] == '.')) or ((n == 2) and (name[0] == '.') and (name[1] == '.')) {
+            continue;
+        }
+        let mut found = false;
+        for i in @as(usize, 0)..w.n {
+            let we = went(w, i);
+            if (we.name != 0) and not we.seen and (we.len == n) and str_eq(went_name(we), name) {
+                we.seen = true;
+                found = true;
+                break;
+            }
+        }
+        if found {
+            continue;
+        }
+        let mut mask = IN_CREATE;
+        if ent[20] == 4 {
+            mask = mask | IN_ISDIR;
+        }
+        if emit and not put_rec(out, at, w.fd, mask, name) {
+            complete = false;  // (not in the snapshot: reported next time)
+            continue;
+        }
+        if not ent_add(w, slot, name, ent[20]) {
+            complete = false;
+        }
+    }
+    _ = closedir(d);
+    for i in @as(usize, 0)..w.n {
+        let we = went(w, i);
+        if (we.name == 0) or we.seen {
+            continue;
+        }
+        let mut mask = IN_DELETE;
+        if we.isdir {
+            mask = mask | IN_ISDIR;
+        }
+        if emit and not put_rec(out, at, w.fd, mask, went_name(we)) {
+            complete = false;
+            continue;
+        }
+        ent_release(we);
+    }
+    return complete;
+}
+
+fn str_eq(a: []u8, b: []u8) bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn wdir_release(w: *mut WDir) void {
+    for i in @as(usize, 0)..w.n {
+        ent_release(went(w, i));
+    }
+    if w.ents != 0 {
+        free(@ptr_from_int(*mut void, w.ents));
+    }
+    if w.path != 0 {
+        free(@ptr_from_int(*mut void, w.path));
+    }
+    _ = close(w.fd);
+    w.kq = -1;
+    w.fd = -1;
+    w.ents = 0;
+    w.path = 0;
+    w.n = 0;
+    w.cap = 0;
+}
+
+export fn ax_watch_open() i32 {
+    let kq = kqueue();
+    if kq < 0 {
+        return AX_ERR;
+    }
+    cloexec(kq);
+    return kq;
+}
+
+export fn ax_watch_add(h: i32, path: *u8, len: usize) i32 {
+    let mut p: [4096]u8 = [0; 4096];
+    if not copy_cstr(p[..], path, len) {
+        return AX_ERR;
+    }
+    let fd = open(&p[0], O_EVTONLY | O_CLOEXEC, @as(i32, 0));
+    if fd < 0 {
+        return fs_err();
+    }
+    let mut st: [144]u8 = [0; 144];
+    if fstat(fd, &mut st[0]) != 0 {
+        _ = close(fd);
+        return AX_ERR;
+    }
+    let mode = @as(u32, st[4]) | (@as(u32, st[5]) << 8);  // st_mode (u16) at 4
+    let pc = @int_from_ptr(malloc(len + 1));
+    if pc == 0 {
+        _ = close(fd);
+        return AX_ERR;
+    }
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, pc), len + 1), p[0..len + 1]);
+    lock_watches();
+    let mut slot = nwdirs;
+    for i in @as(usize, 0)..nwdirs {
+        if wdir(i).kq < 0 {
+            slot = i;
+            break;
+        }
+    }
+    if slot == nwdirs {
+        if nwdirs == capwdirs {
+            let nc = (capwdirs * 2) + 8;
+            let q = grow(wdirs, nwdirs, @size_of(WDir), nc);
+            if q == 0 {
+                unlock_watches();
+                free(@ptr_from_int(*mut void, pc));
+                _ = close(fd);
+                return AX_ERR;
+            }
+            wdirs = q;
+            capwdirs = nc;
+        }
+        nwdirs += 1;
+    }
+    let w = wdir(slot);
+    w.* = WDir.{ kq: h, fd: fd, isdir: (mode & 0o170000) == 0o040000, dirty: false, path: pc, ents: 0, n: 0, cap: 0 };
+    if not kq_watch(h, fd, @as(u64, slot) + 1) {
+        wdir_release(w);
+        unlock_watches();
+        return AX_ERR;
+    }
+    if w.isdir {
+        let mut none: [1]u8 = [0];
+        let mut at: usize = 0;
+        _ = rescan(w, slot, none[..], &mut at, false);
+    }
+    unlock_watches();
+    return fd;
+}
+
+export fn ax_watch_remove(h: i32, wd: i32) i32 {
+    lock_watches();
+    for i in @as(usize, 0)..nwdirs {
+        let w = wdir(i);
+        if (w.kq == h) and (w.fd == wd) {
+            wdir_release(w);
+            unlock_watches();
+            return 0;
+        }
+    }
+    unlock_watches();
+    return AX_ERR;
+}
+
+// Turns kqueue events into records in out from at; returns the new end.
+fn watch_events(h: i32, evs: []u8, n: usize, out: []mut u8, at0: usize) usize {
+    let mut at = at0;
+    for k in 0..n {
+        let e = evs[k * 32..(k + 1) * 32];
+        let ff = @as(u32, e[12]) | (@as(u32, e[13]) << 8);
+        let tag = @bit_cast(u64, le64(e, 24));
+        let hi = tag >> 32;
+        let lo = tag & 0xffff_ffff;
+        if hi != 0 {
+            // a file in a watched directory
+            let slot = @truncate(usize, hi - 1);
+            if slot >= nwdirs {
+                continue;
+            }
+            let w = wdir(slot);
+            let idx = @truncate(usize, lo - 1);
+            if (w.kq != h) or (idx >= w.n) {
+                continue;
+            }
+            let we = went(w, idx);
+            if we.name == 0 {
+                continue;
+            }
+            if (ff & 0x6) != 0 {  // NOTE_WRITE / NOTE_EXTEND
+                _ = put_rec(out, &mut at, w.fd, IN_MODIFY, went_name(we));
+            }
+            if (ff & 0x8) != 0 {  // NOTE_ATTRIB
+                _ = put_rec(out, &mut at, w.fd, IN_ATTRIB, went_name(we));
+            }
+            if (ff & 0x21) != 0 {  // NOTE_DELETE / NOTE_RENAME: the directory knows which
+                w.dirty = true;
+            }
+            continue;
+        }
+        if (lo == 0) or (@truncate(usize, lo - 1) >= nwdirs) {
+            continue;
+        }
+        let slot = @truncate(usize, lo - 1);
+        let w = wdir(slot);
+        if w.kq != h {
+            continue;
+        }
+        if w.isdir {
+            if (ff & 0x6) != 0 {
+                w.dirty = true;  // its entries changed: rescanned below
+            }
+        } else if (ff & 0x6) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_MODIFY, "");
+        }
+        if (ff & 0x8) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_ATTRIB, "");
+        }
+        if (ff & 0x1) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_DELETE_SELF, "");
+        }
+        if (ff & 0x20) != 0 {
+            _ = put_rec(out, &mut at, w.fd, IN_MOVE_SELF, "");
+        }
+    }
+    return at;
+}
+
+// Rescans h's changed directories; returns the new end of the records.
+fn watch_rescans(h: i32, out: []mut u8, at0: usize) usize {
+    let mut at = at0;
+    for i in @as(usize, 0)..nwdirs {
+        let w = wdir(i);
+        if (w.kq == h) and w.dirty {
+            if rescan(w, i, out, &mut at, true) {
+                w.dirty = false;
+            }
+        }
+    }
+    return at;
+}
+
+// Waits up to timeout_ms (-1: for ever) for events; returns the bytes of
+// records written to buf (0: timed out).
+export fn ax_watch_read(h: i32, buf: *mut u8, cap: usize, timeout_ms: i32) isize {
+    let mut evs: [512]u8 = [0; 512];  // 16 events
+    let out = @slice_from_ptr(buf, cap);
+    if cap < 16 {
+        return @as(isize, AX_ERR);
+    }
+    let deadline = ax_clock_ns(1) + (@as(i64, timeout_ms) * 1000000);
+    lock_watches();
+    let mut w = watch_rescans(h, out, 0);  // what did not fit last time
+    unlock_watches();
+    if w > 0 {
+        return @bit_cast(isize, w);
+    }
+    loop {
+        let mut ts = Timespec.{ sec: 0, nsec: 0 };
+        let mut tsp = @ptr_cast(*Timespec, &ts);
+        if timeout_ms < 0 {
+            tsp = @ptr_from_int(*Timespec, 0);
+        } else {
+            let left = deadline - ax_clock_ns(1);
+            if left > 0 {
+                ts = Timespec.{ sec: left / 1000000000, nsec: left % 1000000000 };
+            }
+        }
+        let n = kevent(h, nil_ptr.[u8](), 0, &mut evs[0], 16, tsp);
+        if (n < 0) and (errno() == EINTR) {
+            continue;
+        }
+        if n < 0 {
+            return @as(isize, AX_ERR);
+        }
+        if n == 0 {
+            return 0;
+        }
+        lock_watches();
+        w = watch_events(h, evs[..], @as(usize, @bit_cast(u32, n)), out, 0);
+        w = watch_rescans(h, out, w);
+        unlock_watches();
+        if w > 0 {
+            return @bit_cast(isize, w);
+        }
+        // (nothing to report, e.g. a rescan that found no difference: wait on)
+    }
+}
+
+export fn ax_watch_close(h: i32) void {
+    lock_watches();
+    for i in @as(usize, 0)..nwdirs {
+        let w = wdir(i);
+        if w.kq == h {
+            wdir_release(w);
+        }
+    }
+    unlock_watches();
+    _ = close(h);
+}
+
+// -----------------------------------------------------------------------------
+// Terminals
+// -----------------------------------------------------------------------------
+export fn ax_isatty(fd: i32) i32 {
+    if isatty(fd) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+export fn ax_term_size(fd: i32, out: *mut u32) i32 {
+    let mut ws: [4]u16 = [0; 4];                  // ws_row, ws_col, ws_xpixel, ws_ypixel
+    if ioctl(fd, 0x4008_7468, &mut ws[0]) != 0 {  // TIOCGWINSZ
+        return AX_ERR;
+    }
+    let o = @slice_from_ptr(out, 2);
+    o[0] = @as(u32, ws[1]);
+    o[1] = @as(u32, ws[0]);
+    return 0;
+}
+
+// The terminal settings before raw mode (struct termios: 72 bytes).
+let mut saved_termios: [128]u8 = [0; 128];
+let mut saved_fd: i32 = -1;
+
+export fn ax_term_raw(fd: i32, enable: u32) i32 {
+    if enable == 0 {
+        if saved_fd != fd {
+            return AX_ERR;
+        }
+        saved_fd = -1;
+        if tcsetattr(fd, 1, &saved_termios[0]) != 0 {  // TCSADRAIN
+            return AX_ERR;
+        }
+        return 0;
+    }
+    let mut t: [128]u8 = [0; 128];
+    if tcgetattr(fd, &mut t[0]) != 0 {
+        return AX_ERR;
+    }
+    if saved_fd < 0 {
+        saved_termios = t;
+        saved_fd = fd;
+    }
+    cfmakeraw(&mut t[0]);
+    if tcsetattr(fd, 1, &t[0]) != 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Threads, thread-locals, and wait / notify
+// -----------------------------------------------------------------------------
+let mut tls_key: u64 = 0;
+
+fn tls_free(p: *mut void) void {
+    free(p);
+}
+
+// Gives the calling thread its block of thread-locals (a copy of the
+// template) and its signal stack.
+fn thread_setup() bool {
+    let ti = ax_tls_info();
+    let size = align_up(@max(ti.memsz, 16), 16);
+    let mut p = vnull();
+    if posix_memalign(&mut p, @max(ti.align, 16), size) != 0 {
+        return false;
+    }
+    let b = @slice_from_ptr(@ptr_cast(*mut u8, p), size);
+    @mem_set(b, 0);
+    if ti.filesz > 0 {
+        @mem_copy(b[0..ti.filesz], @slice_from_ptr(@ptr_from_int(*u8, ti.template), ti.filesz));
+    }
+    if pthread_setspecific(tls_key, @ptr_cast(*void, p)) != 0 {
+        return false;
+    }
+    install_crash_stack();
+    return true;
+}
+
+struct ThreadStart {
+    entry: fn(*mut void) void,
+    arg: *mut void,
+    exited: *mut u32,
+}
+
+let mut next_thread_id: i32 = 1;
+
+// Called as each thread starts (true) and ends (false): the profiler
+// (std/internal/runtime/profile_darwin.ax) samples the threads it knows.
+pub let mut thread_hook: fn(bool) void = no_thread_hook;
+pub let mut has_thread_hook: bool = false;
+
+fn no_thread_hook(start: bool) void {}
+
+fn thread_main(p: *mut void) *mut void {
+    let st = @ptr_cast(*mut ThreadStart, p);
+    if not thread_setup() {
+        let msg = "axiom: cannot set up a thread\n";
+        _ = write(2, msg.ptr, msg.len);
+        exit(70);
+    }
+    if has_thread_hook {
+        thread_hook(true);
+    }
+    st.entry(st.arg);
+    if has_thread_hook {
+        thread_hook(false);
+    }
+    @atomic_store(st.exited, 1);
+    _ = ax_notify32(st.exited, 1);
+    // the signal stack goes with the thread (its block goes with its key)
+    let off = StackT.{ sp: 0, size: 0, flags: 4 };  // SS_DISABLE
+    let mut old = StackT.{ sp: 0, size: 0, flags: 0 };
+    if sigaltstack(&off, &mut old) == 0 {
+        free(@ptr_from_int(*mut void, old.sp));
+    }
+    free(p);
+    return vnull();
+}
+
+// stack_top is ignored: native threads get their stack from the system.
+export fn ax_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32 {
+    let st = @ptr_cast(*mut ThreadStart, malloc(@size_of(ThreadStart)));
+    if @int_from_ptr(st) == 0 {
+        return AX_ERR;
+    }
+    st.* = ThreadStart.{ entry: entry, arg: arg, exited: exited };
+    let mut t: usize = 0;
+    let mut attr: [16]u64 = [0; 16];  // pthread_attr_t: 64 bytes
+    let ap = @ptr_cast(*mut void, &mut attr[0]);
+    _ = pthread_attr_init(ap);
+    _ = pthread_attr_setdetachstate(ap, 2);      // PTHREAD_CREATE_DETACHED
+    _ = pthread_attr_setstacksize(ap, 8 << 20);  // as on Linux (macOS gives 512 KiB)
+    let rc = pthread_create(&mut t, @ptr_cast(*void, ap), thread_main, @ptr_cast(*mut void, st));
+    _ = pthread_attr_destroy(ap);
+    if rc != 0 {
+        free(@ptr_cast(*mut void, st));
+        return AX_ERR;
+    }
+    return @atomic_add(&mut next_thread_id, 1);
+}
+
+// Native threads need no stack from the program.
+export fn ax_thread_stack_size() usize {
+    return 0;
+}
+
+// The operating system (macOS).
+export fn ax_os() i32 {
+    return 2;
+}
+
+// The processor's extensions as std/os/cpu.ax's A_* bits, from the
+// hw.optional.arm.FEAT_* (and older hw.optional.*) sysctls.
+export fn ax_cpu_features() u64 {
+    let names = ["hw.optional.arm.FEAT_LSE", "hw.optional.arm.FEAT_LRCPC", "hw.optional.arm.FEAT_DotProd",
+                 "hw.optional.arm.FEAT_CSSC", "hw.optional.arm.FEAT_PMULL", "hw.optional.arm.FEAT_SHA256",
+                 "hw.optional.arm.FEAT_SHA3", "hw.optional.arm.FEAT_SHA512", "hw.optional.arm.FEAT_SM4",
+                 "hw.optional.armv8_crc32", "hw.optional.arm.FEAT_RDM", "hw.optional.arm.FEAT_FP16",
+                 "hw.optional.arm.FEAT_FHM", "hw.optional.arm.FEAT_BF16", "hw.optional.arm.FEAT_I8MM",
+                 "hw.optional.arm.FEAT_SVE", "hw.optional.arm.FEAT_SVE2", "hw.optional.arm.FEAT_DIT",
+                 "hw.optional.arm.FEAT_SME"];
+    let mut f: u64 = 0;
+    for i in 0..names.len {
+        let mut v: i32 = 0;
+        let mut n: usize = 4;
+        let p = @ptr_cast(*mut void, &mut v);
+        if (sysctlbyname(names[i].ptr, p, &mut n, @ptr_from_int(*void, 0), 0) == 0) and (v != 0) {
+            f = f | (@as(u64, 1) << @truncate(u32, i));  // (the A_* bits are in this order)
+        }
+    }
+    return f;
+}
+
+export fn ax_cpu_count() u32 {
+    let n = sysconf(58);  // _SC_NPROCESSORS_ONLN
+    if n > 0 {
+        return @truncate(u32, @bit_cast(usize, n));
+    }
+    return 1;
+}
+
+export fn ax_sleep_ns(ns: u64) void {
+    let mut ts = Timespec.{ sec: @bit_cast(i64, ns / 1000000000), nsec: @bit_cast(i64, ns % 1000000000) };
+    let mut rem = Timespec.{ sec: 0, nsec: 0 };
+    while (nanosleep(&ts, &mut rem) != 0) and (errno() == EINTR) {
+        ts = rem;
+    }
+}
+
+// Fills p[0..n] with cryptographically secure random bytes; 0 on success.
+export fn ax_random(p: *mut u8, n: usize) i32 {
+    let mut done: usize = 0;
+    while done < n {
+        let k = @min(n - done, 256);  // getentropy's limit
+        if getentropy(@ptr_from_int(*mut u8, @int_from_ptr(p) + done), k) != 0 {
+            return AX_ERR;
+        }
+        done += k;
+    }
+    return 0;
+}
+
+// Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+export fn ax_clock_ns(clock: u32) i64 {
+    if clock == 1 {
+        // CLOCK_UPTIME_RAW (8), read in user space from the commpage, as nanoseconds (~8 ns,
+        // where Darwin's CLOCK_MONOTONIC through clock_gettime takes ~18). Like Linux's
+        // CLOCK_MONOTONIC, and Rust's Instant on macOS, it stops while the machine sleeps.
+        return @bit_cast(i64, clock_gettime_nsec_np(8));
+    }
+    let mut ts = Timespec.{ sec: 0, nsec: 0 };
+    _ = clock_gettime(0, &mut ts);  // CLOCK_REALTIME
+    return (ts.sec * 1000000000) + ts.nsec;
+}
+
+// Waiting on an address: __ulock_wait2 / __ulock_wake (UL_COMPARE_AND_WAIT,
+// ULF_NO_ERRNO: errors come back as -errno).
+const UL_WAIT: u32 = 0x0100_0001;
+const UL_WAKE_ONE: u32 = 0x0100_0001;
+const UL_WAKE_ALL: u32 = 0x0100_0101;
+
+// Same results as WebAssembly memory.atomic.wait32: 0 woken, 1 not equal, 2 timed out.
+export fn ax_wait32(p: *mut u32, expected: u32, timeout_ns: i64) i32 {
+    if @atomic_load(p) != expected {
+        return 1;
+    }
+    if timeout_ns == 0 {
+        return 2;
+    }
+    let mut t: u64 = 0;  // for ever
+    if timeout_ns > 0 {
+        t = @bit_cast(u64, timeout_ns);
+    }
+    loop {
+        let r = __ulock_wait2(UL_WAIT, @ptr_cast(*mut void, p), @as(u64, expected), t, 0);
+        if r >= 0 {
+            return 0;
+        }
+        if r == -ETIMEDOUT {
+            return 2;
+        }
+        if r != -EINTR {
+            return 0;
+        }
+    }
+}
+
+export fn ax_notify32(p: *mut u32, count: i32) i32 {
+    let mut op = UL_WAKE_ALL;
+    if count == 1 {
+        op = UL_WAKE_ONE;
+    }
+    if count == 0 {
+        return 0;
+    }
+    if __ulock_wake(op, @ptr_cast(*mut void, p), 0) < 0 {
+        return 0;  // nobody was waiting
+    }
+    return 1;
+}
+
+// -----------------------------------------------------------------------------
+// Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
+// region reserved at the first use. The region is as large as the system
+// allows (up to 1 TiB of address space); the kernel supplies physical pages
+// only when they are touched.
+// -----------------------------------------------------------------------------
+let mut mem_base: usize = 0;   // 64 KiB-aligned start of the region
+let mut mem_limit: usize = 0;  // its size in pages
+let mut mem_pages: usize = 0;  // pages handed out
+let mut mem_state: u32 = 0;    // 0: not reserved, 1: reserving, 2: ready, 3: failed
+
+fn map_anon(addr: usize, size: usize, fixed: bool) usize {
+    let mut flags: i32 = 0x1002;  // MAP_PRIVATE | MAP_ANON
+    if fixed {
+        flags = flags | 0x10;  // MAP_FIXED
+    }
+    let p = mmap(@ptr_from_int(*mut void, addr), size, 3, flags, -1, 0);
+    let a = @int_from_ptr(p);
+    if a == ~@as(usize, 0) {
+        return 0;
+    }
+    return a;
+}
+
+fn mem_reserve() void {
+    if @atomic_cas(&mut mem_state, 0, 1) == 0 {
+        let mut size: usize = 1 << 40;
+        while size >= (1 << 28) {
+            let p = map_anon(0, size + 65536, false);
+            if p != 0 {
+                mem_base = (p + 65535) & ~@as(usize, 65535);
+                mem_limit = size / 65536;
+                @atomic_store(&mut mem_state, 2);
+                return;
+            }
+            size /= 2;
+        }
+        @atomic_store(&mut mem_state, 3);
+        return;
+    }
+    while @atomic_load(&mem_state) == 1 {
+        ax_sleep_ns(1000);
+    }
+}
+
+export fn ax_memory_size() isize {
+    if @atomic_load(&mem_state) != 2 {
+        mem_reserve();
+    }
+    return @bit_cast(isize, (mem_base / 65536) + @atomic_load(&mem_pages));
+}
+
+// The previous size in pages (as ax_memory_size counts them), or -1.
+export fn ax_memory_grow(n: isize) isize {
+    if @atomic_load(&mem_state) != 2 {
+        mem_reserve();
+    }
+    if (@atomic_load(&mem_state) != 2) or (n < 0) {
+        return -1;
+    }
+    let k = @bit_cast(usize, n);
+    loop {
+        let old = @atomic_load(&mem_pages);
+        if k > (mem_limit - old) {
+            return -1;
+        }
+        if @atomic_cas(&mut mem_pages, old, old + k) == old {
+            return @bit_cast(isize, (mem_base / 65536) + old);
+        }
+    }
+}
+
+// @memory_discard: the whole 64 KiB pages in the range go back to the system
+// and read as zero when next touched (fresh pages mapped over them: macOS's
+// madvise does not promise zeros).
+export fn ax_memory_discard(addr: usize, len: usize) void {
+    let a = (addr + 65535) & ~@as(usize, 65535);
+    let b = (addr + len) & ~@as(usize, 65535);
+    if a < b {
+        _ = map_anon(a, b - a, true);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Traps and crashes
+// -----------------------------------------------------------------------------
+let mut report: [16384]u8 = [0; 16384];
+
+pub fn write_all(fd: i32, s: []u8) void {
+    let mut off: usize = 0;
+    while off < s.len {
+        let n = ax_write(fd, &s[off], s.len - off);
+        if n <= 0 {
+            return;
+        }
+        off += @bit_cast(usize, n);
+    }
+}
+
+// Called by code for `axiom profile` builds to write the samples so far
+// (std/internal/runtime/profile_darwin.ax).
+pub let mut profile_flush: fn() void = no_flush;
+pub let mut has_profile: bool = false;
+// Replaces the default trap report (std/internal/runtime/test_main_darwin.ax).
+pub let mut trap_hook: fn(*tf.Site, *tf.TrapInfo, *tf.ShadowStack) void = no_hook;
+pub let mut has_trap_hook: bool = false;
+// Replaces the default crash report: called with the crash code (5 memory,
+// 3 arithmetic, 8 stack exhausted) before the signal is re-raised.
+pub let mut crash_hook: fn(u64) void = no_crash_hook;
+pub let mut has_crash_hook: bool = false;
+
+fn no_flush() void {}
+
+fn no_hook(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {}
+
+fn no_crash_hook(code: u64) void {}
+
+fn flush_profile() void {
+    if has_profile {
+        profile_flush();
+    }
+}
+
+// Functions of another system's libraries (an extern block naming a Windows DLL)
+// are linked to this, so that a program can support several systems and
+// choose at run time; calling one is a crash with a stack trace.
+export fn ax_unavailable() void {
+    let mut o = tf.fmt(report[..]);
+    o.s("axiom: crash: called a function from another system's library (not available on macOS)\n");
+    let fp = axiom_frame_address().*;  // this function's frame
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, false);
+    tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    write_all(2, o.text());
+    flush_profile();
+    exit(134);
+}
+
+// Stack traces from frame pointers (trap_format.ax: walk_frames), within
+// the thread's stack.
+fn thread_stack_top() usize {
+    return @int_from_ptr(pthread_get_stackaddr_np(pthread_self()));
+}
+
+fn shadow_stack() *mut tf.ShadowStack {
+    return @ptr_from_int(*mut tf.ShadowStack, @int_from_ptr(axiom_shadow_stack()));
+}
+
+// From axiom.trap (codegen), with its own frame.
+export fn ax_stack_walk(fp: *void) void {
+    let f = @int_from_ptr(fp);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, false);
+}
+
+// From a signal handler: the frames of the code it interrupted (the
+// ucontext's uc_mcontext: __es, then __ss: x0-x28, fp, lr, sp, pc).
+fn stack_walk_signal(uc: *mut void) void {
+    let tab = axiom_frame_table();
+    if tf.is_null(@ptr_cast(*void, tab)) {
+        return;
+    }
+    let m = @ptr_from_int(*usize, @int_from_ptr(uc) + 48).*;
+    let fp = @ptr_from_int(*usize, m + 248).*;
+    let sp = @ptr_from_int(*usize, m + 264).*;
+    let pc = @ptr_from_int(*usize, m + 272).*;
+    let mut leaf: usize = 0;
+    if tf.frameless_at(tab, pc) {
+        leaf = @ptr_from_int(*usize, m + 256).*;  // the link register
+    }
+    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, false);
+}
+
+// Every trap calls this (see codegen: axiom.trap).
+export fn ax_on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {
+    if has_trap_hook {
+        trap_hook(site, info, ss);
+        return;
+    }
+    let mut o = tf.fmt(report[..]);
+    o.s("axiom: ");
+    tf.format_trap(&mut o, site, info);
+    o.s(" at ");
+    o.s(tf.cstr(site.file));
+    o.c(':');
+    o.u(@as(u64, site.line));
+    o.c(':');
+    o.u(@as(u64, site.col));
+    o.c('\n');
+    tf.format_stack(&mut o, site, ss);
+    write_all(2, o.text());
+    flush_profile();
+}
+
+// Was a fault at addr a stack overflow: an access near the end of the
+// thread's stack (its guard page)?
+pub fn at_stack_limit(addr: usize) bool {
+    let t = pthread_self();
+    let top = @int_from_ptr(pthread_get_stackaddr_np(t));
+    let bottom = top - pthread_get_stacksize_np(t);
+    return ((addr + 65536) >= bottom) and (addr < (bottom + 65536));
+}
+
+// Crashes that are not Axiom traps (a stack overflow, or a fault in C code)
+// are reported with the shadow stack, then the signal is re-raised.
+fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
+    let addr = @ptr_from_int(*usize, @int_from_ptr(si) + 24).*;  // si_addr
+    stack_walk_signal(uc);
+    let mut code: u32 = 5;
+    if sig == SIGFPE {
+        code = 3;
+    } else if at_stack_limit(addr) {
+        code = 8;
+    }
+    if has_crash_hook {
+        crash_hook(@as(u64, code));
+        let dfl = SigAction.{ handler: 0, mask: 0, flags: 0 };  // SIG_DFL
+        _ = set_action(sig, @ptr_cast(*void, &dfl));
+        _ = raise(sig);
+        return;
+    }
+    let mut o = tf.fmt(report[..]);
+    if code == 8 {
+        o.s("axiom: trap T0008 (stack exhausted)\n");
+    } else {
+        o.s("axiom: crash: ");
+        if sig == SIGSEGV {
+            o.s("segmentation fault");
+        } else if sig == SIGBUS {
+            o.s("bus error");
+        } else {
+            o.s("arithmetic fault");
+        }
+        o.s(" (address 0x");
+        o.hex(@as(u64, addr));
+        o.s(")\n");
+    }
+    tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    write_all(2, o.text());
+    flush_profile();
+    let sa = SigAction.{ handler: 0, mask: 0, flags: 0 };  // SIG_DFL
+    _ = set_action(sig, @ptr_cast(*void, &sa));
+    _ = raise(sig);
+}
+
+// The calling thread's signal stack, for reporting its stack overflow.
+pub fn install_crash_stack() void {
+    let p = malloc(65536);
+    if @int_from_ptr(p) != 0 {
+        let ss = StackT.{ sp: @int_from_ptr(p), size: 65536, flags: 0 };
+        _ = sigaltstack(&ss, nil_ptr.[StackT]());
+    }
+}
+
+// main's arguments; the main thread's thread-locals (before any Axiom code
+// that uses them runs).
+export fn ax_rt_args(argc: i32, argv: *mut *mut u8) void {
+    main_argc = argc;
+    main_argv = @int_from_ptr(argv);
+    let ti = ax_tls_info();
+    if pthread_key_create(&mut tls_key, tls_free) != 0 {
+        let msg = "axiom: cannot create a pthread key\n";
+        _ = write(2, msg.ptr, msg.len);
+        exit(70);
+    }
+    ti.key_off = tls_key * 8;
+    if not thread_setup() {
+        let msg = "axiom: cannot set up the main thread\n";
+        _ = write(2, msg.ptr, msg.len);
+        exit(70);
+    }
+}
+
+// Runs before main.
+export fn ax_rt_init() void {
+    let sa = SigActionInfo.{ handler: on_crash, mask: 0, flags: 0x41 };  // SA_SIGINFO | SA_ONSTACK
+    _ = set_action(SIGSEGV, @ptr_cast(*void, &sa));
+    _ = set_action(SIGBUS, @ptr_cast(*void, &sa));
+    _ = set_action(SIGFPE, @ptr_cast(*void, &sa));
+}
+
+// Runs after main returns (and at exit).
+export fn ax_rt_fini() void {
+    flush_profile();
+}

@@ -1,0 +1,3523 @@
+// =============================================================================
+// std/internal/runtime/windows.ax - the Axiom host ABI (import module "axiom") on Windows
+// (x86-64), and crash reporting (trap messages and stack traces, spec
+// §16.4). The self-hosted compiler builds it into every program for
+// --target=x86_64-windows in place of std/internal/runtime/native.ax; ax_rt_args and
+// ax_rt_init run before `main`, ax_rt_fini after it.
+//
+// Everything goes through the Win32 API (cmd/axiom/src/plink.ax imports
+// these functions from kernel32, ntdll, ws2_32 and bcrypt by name). The host
+// ABI's numbers are Linux's (error codes, signal numbers, inotify events,
+// struct pollfd), as on every other host; this file translates.
+//
+// Handles: the ABI's handles are small integers. 0, 1 and 2 are the standard
+// streams; the rest index a table of Windows handles (files, pipes,
+// sockets, processes, directories, watchers). Paths are UTF-8 with / or \
+// separators, converted to UTF-16 at each call.
+//
+// Thread-locals need nothing here: the loader gives every thread its copy
+// (the image's TLS directory, plink.ax).
+// =============================================================================
+import "trap_format.ax" as tf;
+
+pub extern "C" {
+    fn axiom_shadow_stack() *tf.ShadowStack;
+    fn axiom_frame_table() *usize;
+    fn axiom_frame_address() *usize;
+
+    // kernel32
+    fn GetLastError() u32;
+    fn SetLastError(e: u32) void;
+    fn GetStdHandle(which: u32) usize;
+    fn CreateFileW(path: *u16, access: u32, share: u32, sa: *void, disposition: u32, flags: u32, template: usize) usize;
+    fn ReadFile(h: usize, p: *mut u8, n: u32, got: *mut u32, ov: *mut void) i32;
+    fn WriteFile(h: usize, p: *u8, n: u32, put: *mut u32, ov: *mut void) i32;
+    fn CloseHandle(h: usize) i32;
+    fn GetFileType(h: usize) u32;
+    fn GetFileAttributesW(path: *u16) u32;
+    fn GetFileAttributesExW(path: *u16, level: u32, out: *mut u8) i32;
+    fn SetFileAttributesW(path: *u16, attrs: u32) i32;
+    fn GetFileInformationByHandle(h: usize, out: *mut u8) i32;
+    fn SetFileInformationByHandle(h: usize, class: u32, info: *void, size: u32) i32;
+    fn SetFilePointerEx(h: usize, off: i64, newpos: *mut i64, whence: u32) i32;
+    fn FlushFileBuffers(h: usize) i32;
+    fn LockFileEx(h: usize, flags: u32, reserved: u32, low: u32, high: u32, ov: *mut u8) i32;
+    fn UnlockFileEx(h: usize, reserved: u32, low: u32, high: u32, ov: *mut u8) i32;
+    fn SetFileTime(h: usize, created: *u64, accessed: *u64, written: *u64) i32;
+    fn CreateDirectoryW(path: *u16, sa: *void) i32;
+    fn RemoveDirectoryW(path: *u16) i32;
+    fn DeleteFileW(path: *u16) i32;
+    fn MoveFileExW(from: *u16, to: *u16, flags: u32) i32;
+    fn CreateHardLinkW(link: *u16, existing: *u16, sa: *void) i32;
+    fn CreateSymbolicLinkW(link: *u16, target: *u16, flags: u32) u8;
+    fn DeviceIoControl(h: usize, code: u32, inp: *void, inn: u32, out: *mut u8, outn: u32, got: *mut u32,
+                       ov: *mut void) i32;
+    fn FindFirstFileW(pattern: *u16, data: *mut u8) usize;
+    fn FindNextFileW(h: usize, data: *mut u8) i32;
+    fn FindClose(h: usize) i32;
+    fn GetCurrentDirectoryW(n: u32, buf: *mut u16) u32;
+    fn SetCurrentDirectoryW(path: *u16) i32;
+    fn GetFullPathNameW(path: *u16, n: u32, buf: *mut u16, file: *mut usize) u32;
+    fn GetCommandLineW() *u16;
+    fn GetEnvironmentVariableW(name: *u16, buf: *mut u16, n: u32) u32;
+    fn SetEnvironmentVariableW(name: *u16, value: *u16) i32;
+    fn GetEnvironmentStringsW() *mut u16;
+    fn FreeEnvironmentStringsW(p: *mut u16) i32;
+    fn ExitProcess(code: u32) void;
+    fn TerminateProcess(h: usize, code: u32) i32;
+    fn GetCurrentProcess() usize;
+    fn GetCurrentProcessId() u32;
+    fn CreateProcessW(app: *u16, cmd: *mut u16, psa: *void, tsa: *void, inherit: i32, flags: u32, env: *void, cwd: *u16,
+                      si: *u8, pi: *mut u8) i32;
+    fn GetExitCodeProcess(h: usize, code: *mut u32) i32;
+    fn WaitForSingleObject(h: usize, ms: u32) u32;
+    fn WaitForMultipleObjects(n: u32, hs: *usize, all: i32, ms: u32) u32;
+    fn CreatePipe(r: *mut usize, w: *mut usize, sa: *void, size: u32) i32;
+    fn SetHandleInformation(h: usize, mask: u32, flags: u32) i32;
+    fn DuplicateHandle(sp: usize, h: usize, tp: usize, out: *mut usize, access: u32, inherit: i32, opts: u32) i32;
+    fn SetConsoleCtrlHandler(handler: fn(u32) i32, add: i32) i32;
+    fn GetConsoleMode(h: usize, mode: *mut u32) i32;
+    fn SetConsoleMode(h: usize, mode: u32) i32;
+    fn GetConsoleScreenBufferInfo(h: usize, info: *mut u8) i32;
+    fn SetConsoleOutputCP(cp: u32) i32;
+    fn MultiByteToWideChar(cp: u32, flags: u32, s: *u8, n: i32, out: *mut u16, cap: i32) i32;
+    fn WideCharToMultiByte(cp: u32, flags: u32, s: *u16, n: i32, out: *mut u8, cap: i32, def: *void, used: *void) i32;
+    fn GetProcessHeap() usize;
+    fn HeapAlloc(heap: usize, flags: u32, n: usize) *mut void;
+    fn HeapFree(heap: usize, flags: u32, p: *mut void) i32;
+    fn VirtualAlloc(addr: usize, size: usize, ty: u32, prot: u32) usize;
+    fn VirtualFree(addr: usize, size: usize, ty: u32) i32;
+    fn CreateFileMappingW(h: usize, sa: *void, prot: u32, high: u32, low: u32, name: *u16) usize;
+    fn MapViewOfFile(m: usize, access: u32, high: u32, low: u32, n: usize) usize;
+    fn UnmapViewOfFile(p: usize) i32;
+    fn FlushViewOfFile(p: usize, n: usize) i32;
+    fn CreateThread(sa: *void, stack: usize, start: fn(*mut void) u32, arg: *mut void, flags: u32, id: *mut u32) usize;
+    fn SetThreadStackGuarantee(size: *mut u32) i32;
+    fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize) void;
+    fn GetSystemInfo(info: *mut u8) void;
+    fn GetSystemTimePreciseAsFileTime(ft: *mut u64) void;
+    fn QueryPerformanceCounter(c: *mut i64) i32;
+    fn QueryPerformanceFrequency(f: *mut i64) i32;
+    fn CreateEventW(sa: *void, manual: i32, initial: i32, name: *u16) usize;
+    fn ResetEvent(h: usize) i32;
+    fn ReadDirectoryChangesW(h: usize, buf: *mut u8, n: u32, subtree: i32, filter: u32, got: *mut u32, ov: *mut u8,
+                             done: *void) i32;
+    fn GetOverlappedResult(h: usize, ov: *mut u8, got: *mut u32, wait: i32) i32;
+    fn CancelIoEx(h: usize, ov: *mut u8) i32;
+    fn AddVectoredExceptionHandler(first: u32, handler: fn(*mut usize) i32) *mut void;
+    fn SetUnhandledExceptionFilter(filter: fn(*mut usize) i32) usize;
+    fn RtlCaptureStackBackTrace(skip: u32, n: u32, frames: *mut usize, hash: *mut u32) u16;
+    fn GetModuleHandleExW(flags: u32, addr: usize, module: *mut usize) i32;
+    fn GetModuleHandleW(name: *u16) usize;
+    fn GetModuleFileNameW(module: usize, buf: *mut u16, n: u32) u32;
+    fn SetErrorMode(mode: u32) u32;
+    fn AcquireSRWLockExclusive(l: *mut usize) void;
+    fn ReleaseSRWLockExclusive(l: *mut usize) void;
+
+    // ntdll
+    fn RtlWaitOnAddress(addr: *void, compare: *void, size: usize, timeout: *i64) u32;
+    fn RtlWakeAddressSingle(addr: *void) void;
+    fn RtlWakeAddressAll(addr: *void) void;
+    fn NtDelayExecution(alertable: u8, interval: *i64) u32;
+
+    // bcrypt
+    fn BCryptGenRandom(alg: usize, p: *mut u8, n: u32, flags: u32) u32;
+
+    // ws2_32
+    fn WSAStartup(version: u16, data: *mut u8) i32;
+    fn WSAGetLastError() i32;
+    fn WSASocketW(af: i32, ty: i32, proto: i32, info: *void, group: u32, flags: u32) usize;
+    fn WSAPoll(fds: *mut u8, n: u32, timeout: i32) i32;
+    fn connect(s: usize, addr: *u8, len: i32) i32;
+    fn bind(s: usize, addr: *u8, len: i32) i32;
+    fn listen(s: usize, backlog: i32) i32;
+    fn accept(s: usize, addr: *mut u8, len: *mut i32) usize;
+    fn shutdown(s: usize, how: i32) i32;
+    fn closesocket(s: usize) i32;
+    fn setsockopt(s: usize, level: i32, name: i32, val: *void, len: i32) i32;
+    fn getsockopt(s: usize, level: i32, name: i32, val: *mut u8, len: *mut i32) i32;
+    fn ioctlsocket(s: usize, cmd: u32, arg: *mut u32) i32;
+    fn select(n: i32, r: *mut u8, w: *mut u8, x: *mut u8, timeout: *u8) i32;
+    fn getsockname(s: usize, addr: *mut u8, len: *mut i32) i32;
+    fn getpeername(s: usize, addr: *mut u8, len: *mut i32) i32;
+    fn recv(s: usize, p: *mut u8, n: i32, flags: i32) i32;
+    fn send(s: usize, p: *u8, n: i32, flags: i32) i32;
+    fn sendto(s: usize, p: *u8, n: i32, flags: i32, addr: *u8, len: i32) i32;
+    fn recvfrom(s: usize, p: *mut u8, n: i32, flags: i32, addr: *mut u8, len: *mut i32) i32;
+    fn getaddrinfo(node: *u8, serv: *u8, hints: *u8, res: *mut *mut u8) i32;
+    fn freeaddrinfo(res: *mut u8) void;
+}
+
+// Error codes shared with std/internal/runtime/host.mjs and std/net.ax.
+const AX_ERR: i32 = -1;
+const AX_REFUSED: i32 = -2;
+const AX_ADDR_IN_USE: i32 = -3;
+const AX_BAD_ADDRESS: i32 = -4;
+const AX_TIMED_OUT: i32 = -5;
+
+const INVALID: usize = ~@as(usize, 0);  // INVALID_HANDLE_VALUE, INVALID_SOCKET
+const INFINITE: u32 = 0xffff_ffff;
+const CP_UTF8: u32 = 65001;
+
+// Windows error codes
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_INVALID_DRIVE: u32 = 15;
+const ERROR_SHARING_VIOLATION: u32 = 32;
+const ERROR_LOCK_VIOLATION: u32 = 33;
+const ERROR_HANDLE_EOF: u32 = 38;
+const ERROR_FILE_EXISTS: u32 = 80;
+const ERROR_BROKEN_PIPE: u32 = 109;
+const ERROR_INVALID_NAME: u32 = 123;
+const ERROR_DIR_NOT_EMPTY: u32 = 145;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+const ERROR_DIRECTORY: u32 = 267;
+const ERROR_IO_PENDING: u32 = 997;
+const ERROR_CANT_RESOLVE_FILENAME: u32 = 1921;
+
+// file attributes
+const FA_READONLY: u32 = 0x1;
+const FA_DIRECTORY: u32 = 0x10;
+const FA_NORMAL: u32 = 0x80;
+const FA_REPARSE: u32 = 0x400;
+const NO_ATTRS: u32 = 0xffff_ffff;  // INVALID_FILE_ATTRIBUTES
+
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const SHARE_ALL: u32 = 7;  // FILE_SHARE_READ | WRITE | DELETE
+const CREATE_ALWAYS: u32 = 2;
+const OPEN_EXISTING: u32 = 3;
+const OPEN_ALWAYS: u32 = 4;
+const FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;  // (opens directories)
+const FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+// 100 ns intervals from 1601 to 1970
+const EPOCH_DIFF: i64 = 116444736000000000;
+
+fn vnull() *mut void {
+    return @ptr_from_int(*mut void, 0);
+}
+
+fn align_up(x: usize, a: usize) usize {
+    return (x + (a - 1)) & ~(a - 1);
+}
+
+pub fn malloc(n: usize) *mut void {
+    return HeapAlloc(GetProcessHeap(), 0, n);
+}
+
+fn calloc(n: usize) *mut void {
+    return HeapAlloc(GetProcessHeap(), 8, n);  // HEAP_ZERO_MEMORY
+}
+
+pub fn free(p: *mut void) void {
+    if @int_from_ptr(p) != 0 {
+        _ = HeapFree(GetProcessHeap(), 0, p);
+    }
+}
+
+fn le32(b: []u8, at: usize) u32 {
+    return ((@as(u32, b[at]) | (@as(u32, b[at + 1]) << 8)) | (@as(u32, b[at + 2]) << 16)) | (@as(u32, b[at + 3]) << 24);
+}
+
+fn le64(b: []u8, at: usize) u64 {
+    return @as(u64, le32(b, at)) | (@as(u64, le32(b, at + 4)) << 32);
+}
+
+fn put32(b: []mut u8, at: usize, x: u32) void {
+    for k in @as(usize, 0)..4 {
+        b[at + k] = @truncate(u8, x >> @as(u32, @truncate(u32, k * 8)));
+    }
+}
+
+fn put64(b: []mut u8, at: usize, x: u64) void {
+    put32(b, at, @truncate(u32, x));
+    put32(b, at + 4, @truncate(u32, x >> 32));
+}
+
+// -----------------------------------------------------------------------------
+// Strings: UTF-8 <-> UTF-16
+// -----------------------------------------------------------------------------
+
+// s as NUL-terminated UTF-16 in out (false if it does not fit, or holds a NUL).
+fn wide(s: []u8, out: []mut u16) bool {
+    for c in s {
+        if c == 0 {
+            return false;
+        }
+    }
+    if s.len == 0 {
+        out[0] = 0;
+        return true;
+    }
+    if s.len >= out.len {
+        return false;
+    }
+    let n = MultiByteToWideChar(CP_UTF8, 0, s.ptr, @truncate(i32, @bit_cast(isize, s.len)), &mut out[0],
+                                @truncate(i32, @bit_cast(isize, out.len - 1)));
+    if n <= 0 {
+        return false;
+    }
+    out[@as(usize, @bit_cast(u32, n))] = 0;
+    return true;
+}
+
+fn wpath(p: *u8, n: usize, out: []mut u16) bool {
+    return wide(@slice_from_ptr(p, n), out);
+}
+
+fn wlen(p: *u16) usize {
+    let mut n: usize = 0;
+    while @ptr_from_int(*u16, @int_from_ptr(p) + (n * 2)).* != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+// UTF-16 (n units) as UTF-8 in out; returns the bytes needed (written only
+// if they fit). Backslashes become slashes when `slashes`.
+fn narrow(w: *u16, n: usize, out: []mut u8, slashes: bool) usize {
+    if n == 0 {
+        return 0;
+    }
+    let need = WideCharToMultiByte(CP_UTF8, 0, w, @truncate(i32, @bit_cast(isize, n)), @ptr_from_int(*mut u8, 0), 0,
+                                   @ptr_from_int(*void, 0), @ptr_from_int(*void, 0));
+    if need <= 0 {
+        return 0;
+    }
+    let k = @as(usize, @bit_cast(u32, need));
+    if k <= out.len {
+        _ = WideCharToMultiByte(CP_UTF8, 0, w, @truncate(i32, @bit_cast(isize, n)), out.ptr, need,
+                                @ptr_from_int(*void, 0), @ptr_from_int(*void, 0));
+        if slashes {
+            for i in 0..k {
+                if out[i] == '\\' {
+                    out[i] = '/';
+                }
+            }
+        }
+    }
+    return k;
+}
+
+// Copies UTF-16 to buf as UTF-8; returns the length (the ABI's convention:
+// the full length, written only if it fits).
+fn to_abi(w: *u16, n: usize, buf: *mut u8, cap: usize, slashes: bool) isize {
+    return @bit_cast(isize, narrow(w, n, @slice_from_ptr(buf, cap), slashes));
+}
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+// The host ABI's code for a Windows error.
+fn err_code(e: u32) i32 {
+    if (e == ERROR_FILE_NOT_FOUND) or (e == ERROR_PATH_NOT_FOUND) or (e == ERROR_INVALID_DRIVE) or
+       (e == ERROR_INVALID_NAME) {
+        return -2;
+    }
+    if (e == ERROR_ACCESS_DENIED) or (e == ERROR_SHARING_VIOLATION) {
+        return -13;
+    }
+    if (e == ERROR_FILE_EXISTS) or (e == ERROR_ALREADY_EXISTS) {
+        return -17;
+    }
+    if e == ERROR_DIRECTORY {
+        return -20;
+    }
+    if e == ERROR_DIR_NOT_EMPTY {
+        return -39;
+    }
+    if e == ERROR_CANT_RESOLVE_FILENAME {
+        return -40;
+    }
+    return AX_ERR;
+}
+
+fn fs_err() i32 {
+    return err_code(GetLastError());
+}
+
+// -----------------------------------------------------------------------------
+// The handle table
+// -----------------------------------------------------------------------------
+const K_FREE: u32 = 0;
+const K_FILE: u32 = 1;  // a file or a pipe
+const K_DIR: u32 = 2;   // a directory: its path (aux, UTF-16)
+const K_SOCK: u32 = 3;
+const K_PROC: u32 = 4;   // a process; sig: the signal it was killed with
+const K_WATCH: u32 = 5;  // a watcher (aux: *Watcher)
+
+struct Entry {
+    kind: u32,
+    sig: i32,  // a process: the signal it was killed with; a socket: its timeout (ms)
+    h: usize,
+    aux: usize,
+}
+
+const NHANDLES: usize = 16384;
+let mut table: [16384]Entry = [Entry.{ kind: 0, sig: 0, h: 0, aux: 0 }; 16384];
+let mut table_lock: usize = 0;
+let mut table_next: usize = 3;
+
+fn lock(l: *mut usize) void {
+    AcquireSRWLockExclusive(l);
+}
+
+fn unlock(l: *mut usize) void {
+    ReleaseSRWLockExclusive(l);
+}
+
+// A new entry's handle, or -1 when the table is full.
+fn new_handle(kind: u32, h: usize, aux: usize) i32 {
+    lock(&mut table_lock);
+    let mut i = table_next;
+    let mut tries: usize = 0;
+    while tries < NHANDLES {
+        if i >= NHANDLES {
+            i = 3;
+        }
+        if table[i].kind == K_FREE {
+            table[i] = Entry.{ kind: kind, sig: 0, h: h, aux: aux };
+            table_next = i + 1;
+            unlock(&mut table_lock);
+            return @truncate(i32, @bit_cast(isize, i));
+        }
+        i += 1;
+        tries += 1;
+    }
+    unlock(&mut table_lock);
+    return AX_ERR;
+}
+
+fn entry(fd: i32, kind: u32) *mut Entry {
+    if (fd < 3) or (@as(usize, @bit_cast(u32, fd)) >= NHANDLES) {
+        return @ptr_from_int(*mut Entry, 0);
+    }
+    let e = &mut table[@as(usize, @bit_cast(u32, fd))];
+    if e.kind != kind {
+        return @ptr_from_int(*mut Entry, 0);
+    }
+    return e;
+}
+
+fn release(fd: i32) void {
+    lock(&mut table_lock);
+    table[@as(usize, @bit_cast(u32, fd))] = Entry.{ kind: K_FREE, sig: 0, h: 0, aux: 0 };
+    unlock(&mut table_lock);
+}
+
+// The Windows handle of a file, pipe or standard stream (INVALID if none).
+fn file_handle(fd: i32) usize {
+    if fd == 0 {
+        return GetStdHandle(0xffff_fff6);  // STD_INPUT_HANDLE
+    }
+    if fd == 1 {
+        return GetStdHandle(0xffff_fff5);
+    }
+    if fd == 2 {
+        return GetStdHandle(0xffff_fff4);
+    }
+    let e = entry(fd, K_FILE);
+    if @int_from_ptr(e) == 0 {
+        return INVALID;
+    }
+    return e.h;
+}
+
+fn sock_handle(fd: i32) usize {
+    let e = entry(fd, K_SOCK);
+    if @int_from_ptr(e) == 0 {
+        return INVALID;
+    }
+    return e.h;
+}
+
+// -----------------------------------------------------------------------------
+// Files, directories and the process
+// -----------------------------------------------------------------------------
+export fn ax_write(fd: i32, p: *u8, n: usize) isize {
+    let h = file_handle(fd);
+    if h == INVALID {
+        return -1;
+    }
+    let mut put: u32 = 0;
+    let k = @truncate(u32, @min(n, 0x4000_0000));
+    if WriteFile(h, p, k, &mut put, vnull()) == 0 {
+        return -1;
+    }
+    return @bit_cast(isize, @as(usize, put));
+}
+
+export fn ax_read(fd: i32, p: *mut u8, n: usize) isize {
+    let h = file_handle(fd);
+    if h == INVALID {
+        return -1;
+    }
+    let mut got: u32 = 0;
+    let k = @truncate(u32, @min(n, 0x4000_0000));
+    if ReadFile(h, p, k, &mut got, vnull()) == 0 {
+        let e = GetLastError();
+        if (e == ERROR_BROKEN_PIPE) or (e == ERROR_HANDLE_EOF) {
+            return 0;  // the writer has gone: end of file
+        }
+        return -1;
+    }
+    return @bit_cast(isize, @as(usize, got));
+}
+
+export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return AX_ERR;
+    }
+    let attrs = GetFileAttributesW(&w[0]);
+    if (attrs != NO_ATTRS) and ((attrs & FA_DIRECTORY) != 0) {
+        return -21;
+    }
+    let mut access = GENERIC_READ;
+    let mut disp = OPEN_EXISTING;
+    if flags == 1 {
+        access = GENERIC_WRITE;
+        disp = CREATE_ALWAYS;
+    } else if flags == 2 {
+        access = 0x0010_0004;  // FILE_APPEND_DATA | SYNCHRONIZE: every write at the end
+        disp = OPEN_ALWAYS;
+    } else if flags == 3 {
+        access = GENERIC_READ | GENERIC_WRITE;
+    }
+    let h = CreateFileW(&w[0], access, SHARE_ALL, @ptr_from_int(*void, 0), disp, FA_NORMAL, 0);
+    if h == INVALID {
+        return fs_err();
+    }
+    let fd = new_handle(K_FILE, h, 0);
+    if fd < 0 {
+        _ = CloseHandle(h);
+    }
+    return fd;
+}
+
+export fn ax_close(fd: i32) void {
+    let e = entry(fd, K_FILE);
+    if @int_from_ptr(e) != 0 {
+        _ = CloseHandle(e.h);
+        release(fd);
+        return;
+    }
+    let s = entry(fd, K_SOCK);
+    if @int_from_ptr(s) != 0 {
+        _ = closesocket(s.h);
+        release(fd);
+        return;
+    }
+    let d = entry(fd, K_DIR);
+    if @int_from_ptr(d) != 0 {
+        free(@ptr_from_int(*mut void, d.aux));
+        release(fd);
+    }
+}
+
+fn ft_ns(ft: u64) i64 {
+    let t = @bit_cast(i64, ft) - EPOCH_DIFF;
+    // (nanoseconds overflow 64 bits for times past 2262: clamp)
+    if t > 92233720368547758 {
+        return 9223372036854775800;
+    }
+    if t < -92233720368547758 {
+        return -9223372036854775800;
+    }
+    return t * 100;
+}
+
+fn ns_ft(ns: i64) u64 {
+    return @bit_cast(u64, (ns / 100) + EPOCH_DIFF);
+}
+
+// out: kind (1 file, 2 directory, 3 link, 4 other), size, mtime (ns), mode
+export fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return AX_ERR;
+    }
+    // WIN32_FILE_ATTRIBUTE_DATA: attributes, creation, access, write
+    // times, size (high, low)
+    let mut d: [36]u8 = [0; 36];
+    if GetFileAttributesExW(&w[0], 0, &mut d[0]) == 0 {
+        return fs_err();
+    }
+    let mut attrs = le32(d[..], 0);
+    let mut size = (@as(u64, le32(d[..], 28)) << 32) | @as(u64, le32(d[..], 32));
+    let mut mtime = le64(d[..], 20);
+    if ((attrs & FA_REPARSE) != 0) and (follow != 0) {
+        // what the link leads to
+        let h = CreateFileW(&w[0], 0, SHARE_ALL, @ptr_from_int(*void, 0), OPEN_EXISTING, FLAG_BACKUP_SEMANTICS, 0);
+        if h == INVALID {
+            return fs_err();
+        }
+        // BY_HANDLE_FILE_INFORMATION: attributes, three times, volume,
+        // size (high, low), links, index
+        let mut bi: [52]u8 = [0; 52];
+        let ok = GetFileInformationByHandle(h, &mut bi[0]);
+        _ = CloseHandle(h);
+        if ok == 0 {
+            return fs_err();
+        }
+        attrs = le32(bi[..], 0);
+        size = (@as(u64, le32(bi[..], 32)) << 32) | @as(u64, le32(bi[..], 36));
+        mtime = le64(bi[..], 20);
+    }
+    let o = @slice_from_ptr(out, 4);
+    let mut mode: i64 = 0o644;
+    if (attrs & FA_REPARSE) != 0 and (follow == 0) {
+        o[0] = 3;
+        mode = 0o777;
+    } else if (attrs & FA_DIRECTORY) != 0 {
+        o[0] = 2;
+        mode = 0o755;
+        size = 0;
+    } else {
+        o[0] = 1;
+    }
+    if ((attrs & FA_READONLY) != 0) and (o[0] != 3) {
+        mode = mode & 0o555;
+    }
+    o[1] = @bit_cast(i64, size);
+    o[2] = ft_ns(mtime);
+    o[3] = mode;
+    return 0;
+}
+
+export fn ax_mkdir(path: *u8, len: usize, mode: u32) i32 {
+    _ = mode;
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return AX_ERR;
+    }
+    if CreateDirectoryW(&w[0], @ptr_from_int(*void, 0)) != 0 {
+        return 0;
+    }
+    return fs_err();
+}
+
+// Removes a file (clearing the read-only attribute, which POSIX does not
+// have) or an empty directory.
+fn remove_w(w: *u16, dir: bool) i32 {
+    let attrs = GetFileAttributesW(w);
+    if attrs == NO_ATTRS {
+        return fs_err();
+    }
+    let is_dir = ((attrs & FA_DIRECTORY) != 0) and ((attrs & FA_REPARSE) == 0);
+    if dir and not is_dir and ((attrs & FA_DIRECTORY) == 0) {
+        return -20;
+    }
+    if not dir and is_dir {
+        return -21;
+    }
+    if (attrs & FA_READONLY) != 0 {
+        _ = SetFileAttributesW(w, attrs & ~FA_READONLY);
+    }
+    let mut ok: i32 = 0;
+    if (attrs & FA_DIRECTORY) != 0 {
+        ok = RemoveDirectoryW(w);  // (a directory link too)
+    } else {
+        ok = DeleteFileW(w);
+    }
+    if ok != 0 {
+        return 0;
+    }
+    let r = fs_err();
+    if (attrs & FA_READONLY) != 0 {
+        _ = SetFileAttributesW(w, attrs);
+    }
+    return r;
+}
+
+export fn ax_remove(path: *u8, len: usize, dir: u32) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return AX_ERR;
+    }
+    return remove_w(&w[0], dir != 0);
+}
+
+export fn ax_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32 {
+    let mut a: [4096]u16 = [0; 4096];
+    let mut b: [4096]u16 = [0; 4096];
+    if not wpath(from, flen, a[..]) or not wpath(to, tlen, b[..]) {
+        return AX_ERR;
+    }
+    if MoveFileExW(&a[0], &b[0], 1) != 0 {  // MOVEFILE_REPLACE_EXISTING
+        return 0;
+    }
+    let e = GetLastError();
+    if e == ERROR_ACCESS_DENIED {
+        // POSIX replaces an empty directory
+        let ta = GetFileAttributesW(&b[0]);
+        if (ta != NO_ATTRS) and ((ta & FA_DIRECTORY) != 0) and (RemoveDirectoryW(&b[0]) != 0) and
+           (MoveFileExW(&a[0], &b[0], 1) != 0) {
+            return 0;
+        }
+    }
+    return err_code(e);
+}
+
+// Writes the entries of directory w (not . and ..) to buf as a kind byte
+// and the name with a NUL; returns the bytes needed (more than cap: retry).
+fn read_entries(w: *u16, buf: *mut u8, cap: usize) isize {
+    let attrs = GetFileAttributesW(w);
+    if attrs == NO_ATTRS {
+        return @as(isize, fs_err());
+    }
+    if (attrs & FA_DIRECTORY) == 0 {
+        return -20;
+    }
+    let n = wlen(w);
+    if (n + 3) > 4096 {
+        return @as(isize, AX_ERR);
+    }
+    let mut pat: [4096]u16 = [0; 4096];
+    @mem_copy(pat[0..n], @slice_from_ptr(w, n));
+    let mut k = n;
+    if (k > 0) and (pat[k - 1] != '/') and (pat[k - 1] != '\\') {
+        pat[k] = '\\';
+        k += 1;
+    }
+    pat[k] = '*';
+    pat[k + 1] = 0;
+    // WIN32_FIND_DATAW: attributes at 0, the name (260 units) at 44
+    let mut fd: [592]u8 = [0; 592];
+    let fh = FindFirstFileW(&pat[0], &mut fd[0]);
+    if fh == INVALID {
+        if GetLastError() == ERROR_FILE_NOT_FOUND {
+            return 0;
+        }
+        return @as(isize, fs_err());
+    }
+    let out = @slice_from_ptr(buf, cap);
+    let mut need: usize = 0;
+    let mut name: [1024]u8 = [0; 1024];
+    loop {
+        let wn = @ptr_cast(*u16, &fd[44]);
+        let nl = wlen(wn);
+        let skip = ((nl == 1) and (fd[44] == '.')) or ((nl == 2) and (fd[44] == '.') and (fd[46] == '.'));
+        if not skip {
+            let m = narrow(wn, nl, name[..], false);
+            if m <= name.len {
+                let a = le32(fd[..], 0);
+                let mut kind: u8 = 1;
+                if (a & FA_REPARSE) != 0 {
+                    kind = 3;
+                } else if (a & FA_DIRECTORY) != 0 {
+                    kind = 2;
+                }
+                if (need + m + 2) <= cap {
+                    out[need] = kind;
+                    @mem_copy(out[need + 1..need + 1 + m], name[0..m]);
+                    out[need + 1 + m] = 0;
+                }
+                need += m + 2;
+            }
+        }
+        if FindNextFileW(fh, &mut fd[0]) == 0 {
+            break;
+        }
+    }
+    _ = FindClose(fh);
+    return @bit_cast(isize, need);
+}
+
+export fn ax_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return @as(isize, AX_ERR);
+    }
+    return read_entries(&w[0], buf, cap);
+}
+
+// dir's path joined with name (UTF-16, in out); dir < 0: the current directory.
+fn join_dir(dir: i32, name: *u8, len: usize, out: []mut u16) bool {
+    if dir < 0 {
+        return wpath(name, len, out);
+    }
+    let e = entry(dir, K_DIR);
+    if @int_from_ptr(e) == 0 {
+        return false;
+    }
+    let base = @ptr_from_int(*u16, e.aux);
+    let n = wlen(base);
+    if (n + 2) >= out.len {
+        return false;
+    }
+    @mem_copy(out[0..n], @slice_from_ptr(base, n));
+    out[n] = '\\';
+    return wpath(name, len, out[n + 1..]);
+}
+
+// Opens a directory, failing with -40 if name is a symbolic link and -20 if
+// it is not a directory.
+export fn ax_dir_open(dir: i32, name: *u8, len: usize) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not join_dir(dir, name, len, w[..]) {
+        return AX_ERR;
+    }
+    let attrs = GetFileAttributesW(&w[0]);
+    if attrs == NO_ATTRS {
+        return fs_err();
+    }
+    if (attrs & FA_REPARSE) != 0 {
+        return -40;
+    }
+    if (attrs & FA_DIRECTORY) == 0 {
+        return -20;
+    }
+    // the absolute path, so that changing directory does not move it
+    let mut full: [4096]u16 = [0; 4096];
+    let n = GetFullPathNameW(&w[0], 4096, &mut full[0], @ptr_from_int(*mut usize, 0));
+    if (n == 0) or (n >= 4096) {
+        return AX_ERR;
+    }
+    let k = @as(usize, n);
+    let p = @ptr_cast(*mut u16, malloc((k + 1) * 2));
+    if @int_from_ptr(p) == 0 {
+        return AX_ERR;
+    }
+    @mem_copy(@slice_from_ptr(p, k + 1), full[0..k + 1]);
+    let fd = new_handle(K_DIR, 0, @int_from_ptr(p));
+    if fd < 0 {
+        free(@ptr_cast(*mut void, p));
+    }
+    return fd;
+}
+
+export fn ax_dir_read(dir: i32, buf: *mut u8, cap: usize) isize {
+    let e = entry(dir, K_DIR);
+    if @int_from_ptr(e) == 0 {
+        return @as(isize, AX_ERR);
+    }
+    return read_entries(@ptr_from_int(*u16, e.aux), buf, cap);
+}
+
+export fn ax_dir_remove(dir: i32, name: *u8, len: usize, isdir: u32) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not join_dir(dir, name, len, w[..]) {
+        return AX_ERR;
+    }
+    return remove_w(&w[0], isdir != 0);
+}
+
+export fn ax_dir_close(dir: i32) void {
+    let e = entry(dir, K_DIR);
+    if @int_from_ptr(e) != 0 {
+        free(@ptr_from_int(*mut void, e.aux));
+        release(dir);
+    }
+}
+
+export fn ax_getcwd(buf: *mut u8, cap: usize) isize {
+    let mut w: [4096]u16 = [0; 4096];
+    let n = GetCurrentDirectoryW(4096, &mut w[0]);
+    if (n == 0) or (n >= 4096) {
+        return @as(isize, AX_ERR);
+    }
+    return to_abi(&w[0], @as(usize, n), buf, cap, true);
+}
+
+export fn ax_seek(fd: i32, off: i64, whence: u32) i64 {
+    let h = file_handle(fd);
+    let mut pos: i64 = 0;
+    if (h == INVALID) or (SetFilePointerEx(h, off, &mut pos, whence) == 0) {
+        return @as(i64, AX_ERR);
+    }
+    return pos;
+}
+
+// -----------------------------------------------------------------------------
+// The command line
+// -----------------------------------------------------------------------------
+
+// The arguments, as UTF-8 strings each ending in 0 (args_at: their starts).
+let mut args_buf: *mut u8 = @ptr_from_int(*mut u8, 0);
+let mut args_at: *mut usize = @ptr_from_int(*mut usize, 0);
+let mut args_n: i32 = 0;
+
+fn wch(p: *u16, i: usize) u16 {
+    return @ptr_from_int(*u16, @int_from_ptr(p) + (i * 2)).*;
+}
+
+fn is_space(c: u16) bool {
+    return (c == ' ') or (c == '\t');
+}
+
+// Splits the command line the way the C runtime does: the program name up
+// to a space (or between quotes); then arguments separated by spaces, where
+// "..." quotes, \" is a quote, and 2n backslashes before a quote are n.
+// Writes the UTF-16 arguments to out (each ending in 0); returns how many.
+fn split_cmdline(c: *u16, out: *mut u16) i32 {
+    let mut i: usize = 0;
+    let mut o: usize = 0;
+    let mut n: i32 = 0;
+    let put = @slice_from_ptr(out, (wlen(c) * 2) + 2);
+    // the program
+    if wch(c, 0) == '"' {
+        i = 1;
+        while (wch(c, i) != 0) and (wch(c, i) != '"') {
+            put[o] = wch(c, i);
+            o += 1;
+            i += 1;
+        }
+        if wch(c, i) == '"' {
+            i += 1;
+        }
+    } else {
+        while (wch(c, i) != 0) and not is_space(wch(c, i)) {
+            put[o] = wch(c, i);
+            o += 1;
+            i += 1;
+        }
+    }
+    put[o] = 0;
+    o += 1;
+    n += 1;
+    loop {
+        while is_space(wch(c, i)) {
+            i += 1;
+        }
+        if wch(c, i) == 0 {
+            break;
+        }
+        let mut quoted = false;
+        loop {
+            let ch = wch(c, i);
+            if (ch == 0) or (is_space(ch) and not quoted) {
+                break;
+            }
+            if ch == '\\' {
+                let mut nb: usize = 0;
+                while wch(c, i) == '\\' {
+                    nb += 1;
+                    i += 1;
+                }
+                if wch(c, i) == '"' {
+                    for _k in 0..nb / 2 {
+                        put[o] = '\\';
+                        o += 1;
+                    }
+                    if (nb % 2) == 1 {
+                        put[o] = '"';
+                        o += 1;
+                        i += 1;
+                    }
+                } else {
+                    for _k in 0..nb {
+                        put[o] = '\\';
+                        o += 1;
+                    }
+                }
+                continue;
+            }
+            if ch == '"' {
+                if quoted and (wch(c, i + 1) == '"') {
+                    put[o] = '"';  // "" inside quotes
+                    o += 1;
+                    i += 2;
+                    continue;
+                }
+                quoted = not quoted;
+                i += 1;
+                continue;
+            }
+            put[o] = ch;
+            o += 1;
+            i += 1;
+        }
+        put[o] = 0;
+        o += 1;
+        n += 1;
+    }
+    return n;
+}
+
+fn load_args() void {
+    let c = GetCommandLineW();
+    let cl = wlen(c);
+    let w = @ptr_cast(*mut u16, malloc((cl * 2) + 4));
+    if @int_from_ptr(w) == 0 {
+        return;
+    }
+    let n = split_cmdline(c, w);
+    let total = (cl * 2) + 2;
+    let ws = @slice_from_ptr(w, total);
+    // UTF-8: at most 3 bytes per unit
+    let cap = (total * 3) + 8;
+    let b = @ptr_cast(*mut u8, malloc(cap));
+    let at = @ptr_cast(*mut usize, malloc((@as(usize, @bit_cast(u32, n)) + 1) * 8));
+    if (@int_from_ptr(b) == 0) or (@int_from_ptr(at) == 0) {
+        return;
+    }
+    let bs = @slice_from_ptr(b, cap);
+    let ats = @slice_from_ptr(at, @as(usize, @bit_cast(u32, n)) + 1);
+    let mut i: usize = 0;
+    let mut o: usize = 0;
+    for k in 0..@as(usize, @bit_cast(u32, n)) {
+        let l = wlen(&ws[i]);
+        ats[k] = o;
+        o += narrow(&ws[i], l, bs[o..], false);
+        bs[o] = 0;
+        o += 1;
+        i += l + 1;
+    }
+    free(@ptr_cast(*mut void, w));
+    args_buf = b;
+    args_at = at;
+    args_n = n;
+}
+
+export fn ax_argc() i32 {
+    return args_n;
+}
+
+// Copies argument i to buf; returns its length (-1 if there is none).
+export fn ax_arg(i: i32, buf: *mut u8, cap: usize) isize {
+    if (i < 0) or (i >= args_n) {
+        return @as(isize, AX_ERR);
+    }
+    let s = @ptr_from_int(*u8,
+                          @int_from_ptr(args_buf) + @ptr_from_int(
+                              *usize, @int_from_ptr(args_at) + (@as(usize, @bit_cast(u32, i)) * 8)).*);
+    let mut n: usize = 0;
+    while @ptr_from_int(*u8, @int_from_ptr(s) + n).* != 0 {
+        n += 1;
+    }
+    if n <= cap {
+        @mem_copy(@slice_from_ptr(buf, n), @slice_from_ptr(s, n));
+    }
+    return @bit_cast(isize, n);
+}
+
+// -----------------------------------------------------------------------------
+// The environment and the process
+// -----------------------------------------------------------------------------
+fn env_name_ok(k: []u8) bool {
+    if k.len == 0 {
+        return false;
+    }
+    for c in k {
+        if (c == '=') or (c == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Copies environment variable name's value to buf; returns its length (-2
+// if it is not set).
+export fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut k: [1024]u16 = [0; 1024];
+    if not env_name_ok(@slice_from_ptr(name, len)) or not wpath(name, len, k[..]) {
+        return -2;
+    }
+    let mut v: [32768]u16 = [0; 32768];
+    SetLastError(0);
+    let n = GetEnvironmentVariableW(&k[0], &mut v[0], 32768);
+    if (n == 0) and (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+        return -2;
+    }
+    if n >= 32768 {
+        return -2;
+    }
+    return to_abi(&v[0], @as(usize, n), buf, cap, false);
+}
+
+export fn ax_setenv(k: *u8, kn: usize, v: *u8, vn: usize) i32 {
+    let mut name: [1024]u16 = [0; 1024];
+    if not env_name_ok(@slice_from_ptr(k, kn)) or not wpath(k, kn, name[..]) {
+        return AX_ERR;
+    }
+    let value = @ptr_cast(*mut u16, malloc((vn + 1) * 2));
+    if @int_from_ptr(value) == 0 {
+        return AX_ERR;
+    }
+    let mut r: i32 = 0;
+    if wpath(v, vn, @slice_from_ptr(value, vn + 1)) {
+        r = SetEnvironmentVariableW(&name[0], value);
+    }
+    free(@ptr_cast(*mut void, value));
+    if r != 0 {
+        return 0;
+    }
+    return AX_ERR;
+}
+
+export fn ax_unsetenv(k: *u8, kn: usize) i32 {
+    let mut name: [1024]u16 = [0; 1024];
+    if not env_name_ok(@slice_from_ptr(k, kn)) or not wpath(k, kn, name[..]) {
+        return AX_ERR;
+    }
+    if SetEnvironmentVariableW(&name[0], @ptr_from_int(*u16, 0)) != 0 {
+        return 0;
+    }
+    if GetLastError() == ERROR_ENVVAR_NOT_FOUND {
+        return 0;
+    }
+    return AX_ERR;
+}
+
+// The whole environment, as "K=V\0" entries; returns its length. (Windows'
+// hidden per-drive "=C:=..." entries are left out.)
+export fn ax_environ(buf: *mut u8, cap: usize) isize {
+    let e = GetEnvironmentStringsW();
+    if @int_from_ptr(e) == 0 {
+        return 0;
+    }
+    let out = @slice_from_ptr(buf, cap);
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    loop {
+        let p = @ptr_from_int(*u16, @int_from_ptr(e) + (i * 2));
+        let l = wlen(p);
+        if l == 0 {
+            break;
+        }
+        if p.* != '=' {
+            let m = narrow(p, l, out[0..0], false);
+            if (n + m + 1) <= cap {
+                _ = narrow(p, l, out[n..n + m], false);
+                out[n + m] = 0;
+            }
+            n += m + 1;
+        }
+        i += l + 1;
+    }
+    _ = FreeEnvironmentStringsW(e);
+    return @bit_cast(isize, n);
+}
+
+export fn ax_exit(code: i32) void {
+    ax_rt_fini();
+    ExitProcess(@bit_cast(u32, code));
+}
+
+export fn ax_getpid() i32 {
+    return @bit_cast(i32, GetCurrentProcessId());
+}
+
+// Windows cannot copy a process.
+export fn ax_fork() i32 {
+    return AX_ERR;
+}
+
+export fn ax_chdir(path: *u8, len: usize) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return AX_ERR;
+    }
+    if SetCurrentDirectoryW(&w[0]) != 0 {
+        return 0;
+    }
+    let attrs = GetFileAttributesW(&w[0]);
+    if (attrs != NO_ATTRS) and ((attrs & FA_DIRECTORY) == 0) {
+        return -20;
+    }
+    return fs_err();
+}
+
+// -----------------------------------------------------------------------------
+// Processes
+// -----------------------------------------------------------------------------
+
+// A growing UTF-16 buffer.
+struct WBuf {
+    p: *mut u16,
+    len: usize,
+    cap: usize,
+    ok: bool,
+}
+
+fn wbuf() WBuf {
+    return WBuf.{ p: @ptr_from_int(*mut u16, 0), len: 0, cap: 0, ok: true };
+}
+
+fn wb_unit(b: *mut WBuf, c: u16) void {
+    if b.len >= b.cap {
+        let nc = @max(b.cap * 2, 256);
+        let np = @ptr_cast(*mut u16, malloc(nc * 2));
+        if @int_from_ptr(np) == 0 {
+            b.ok = false;
+            return;
+        }
+        if b.len > 0 {
+            @mem_copy(@slice_from_ptr(np, b.len), @slice_from_ptr(b.p, b.len));
+        }
+        free(@ptr_cast(*mut void, b.p));
+        b.p = np;
+        b.cap = nc;
+    }
+    @ptr_from_int(*mut u16, @int_from_ptr(b.p) + (b.len * 2)).* = c;
+    b.len += 1;
+}
+
+fn wb_utf8(b: *mut WBuf, s: []u8) void {
+    if s.len == 0 {
+        return;
+    }
+    let mut tmp: [4096]u16 = [0; 4096];
+    let mut i: usize = 0;
+    while i < s.len {
+        // whole UTF-8 sequences per chunk
+        let mut j = @min(s.len, i + 2048);
+        while (j < s.len) and ((s[j] & 0xc0) == 0x80) {
+            j -= 1;
+        }
+        let n = MultiByteToWideChar(CP_UTF8, 0, &s[i], @truncate(i32, @bit_cast(isize, j - i)), &mut tmp[0], 4096);
+        for k in 0..@as(usize, @bit_cast(u32, @max(n, 0))) {
+            wb_unit(b, tmp[k]);
+        }
+        i = j;
+    }
+}
+
+// An argument quoted for the command line (the inverse of split_cmdline).
+fn wb_arg(b: *mut WBuf, a: []u8) void {
+    let mut plain = a.len > 0;
+    for c in a {
+        if (c == ' ') or (c == '\t') or (c == '"') or (c == '\n') or (c == 0x0b) {
+            plain = false;
+        }
+    }
+    if plain {
+        wb_utf8(b, a);
+        return;
+    }
+    wb_unit(b, '"');
+    let mut i: usize = 0;
+    while i < a.len {
+        let mut nb: usize = 0;
+        while (i < a.len) and (a[i] == '\\') {
+            nb += 1;
+            i += 1;
+        }
+        if i == a.len {
+            for _k in 0..nb * 2 {
+                wb_unit(b, '\\');
+            }
+            break;
+        }
+        if a[i] == '"' {
+            for _k in 0..(nb * 2) + 1 {
+                wb_unit(b, '\\');
+            }
+            wb_unit(b, '"');
+            i += 1;
+            continue;
+        }
+        for _k in 0..nb {
+            wb_unit(b, '\\');
+        }
+        let mut j = i;
+        while (j < a.len) and (a[j] != '\\') and (a[j] != '"') {
+            j += 1;
+        }
+        wb_utf8(b, a[i..j]);
+        i = j;
+    }
+    wb_unit(b, '"');
+}
+
+fn cstr_at(s: []u8, i: usize) []u8 {
+    let mut j = i;
+    while (j < s.len) and (s[j] != 0) {
+        j += 1;
+    }
+    return s[i..j];
+}
+
+// Finds a program on the PATH in env (the child's environment, "K=V\0"
+// entries from env_at): tries name and name.exe in each directory. Writes
+// the full path to out.
+fn search_path(body: []u8, env_at: usize, name: []u8, out: []mut u16) bool {
+    let mut pv: []u8 = "";
+    let mut i = env_at;
+    while (i < body.len) and (body[i] != 0) {
+        let e = cstr_at(body, i);
+        if (e.len > 5) and ((e[0] | 0x20) == 'p') and ((e[1] | 0x20) == 'a') and ((e[2] | 0x20) == 't') and
+           ((e[3] | 0x20) == 'h') and (e[4] == '=') {
+            pv = e[5..];
+        }
+        i += e.len + 1;
+    }
+    let mut cand: [2048]u8 = [0; 2048];
+    let mut a: usize = 0;
+    while a <= pv.len {
+        let mut b = a;
+        while (b < pv.len) and (pv[b] != ';') {
+            b += 1;
+        }
+        let dir = pv[a..b];
+        if (dir.len > 0) and ((dir.len + name.len + 6) < cand.len) {
+            for ext in @as(usize, 0)..2 {
+                @mem_copy(cand[0..dir.len], dir);
+                cand[dir.len] = '\\';
+                @mem_copy(cand[dir.len + 1..dir.len + 1 + name.len], name);
+                let mut n = dir.len + 1 + name.len;
+                if ext == 1 {
+                    @mem_copy(cand[n..n + 4], ".exe");
+                    n += 4;
+                }
+                if wide(cand[0..n], out) {
+                    let at = GetFileAttributesW(&out[0]);
+                    if (at != NO_ATTRS) and ((at & FA_DIRECTORY) == 0) {
+                        return true;
+                    }
+                }
+            }
+        }
+        a = b + 1;
+    }
+    return false;
+}
+
+let mut spawn_lock: usize = 0;
+
+// An inheritable copy of h for a child (0 on failure).
+fn inheritable(h: usize) usize {
+    let mut d: usize = 0;
+    let me = GetCurrentProcess();
+    if DuplicateHandle(me, h, me, &mut d, 0, 1, 2) == 0 {  // DUPLICATE_SAME_ACCESS
+        return 0;
+    }
+    return d;
+}
+
+// The spec: argv strings, each ending in 0, then a 0; the environment
+// ("K=V" strings, each ending in 0), then a 0; then the directory to run in
+// (empty: this one). stdio[i] is 0 to inherit stream i, 1 for a pipe, 2 for
+// the null device; it is replaced by the pipe's handle, or -1.
+export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
+    let body = @slice_from_ptr(spec, len);
+    let modes = @slice_from_ptr(stdio, 3);
+    // the command line
+    let mut cmd = wbuf();
+    let mut i: usize = 0;
+    let mut argc: usize = 0;
+    while (i < len) and (body[i] != 0) {
+        let a = cstr_at(body, i);
+        if argc > 0 {
+            wb_unit(&mut cmd, ' ');
+        }
+        wb_arg(&mut cmd, a);
+        argc += 1;
+        i += a.len + 1;
+    }
+    wb_unit(&mut cmd, 0);
+    i += 1;
+    let env_at = i;
+    // the environment block: "K=V\0" entries, then a 0
+    let mut env = wbuf();
+    while (i < len) and (body[i] != 0) {
+        let e = cstr_at(body, i);
+        wb_utf8(&mut env, e);
+        wb_unit(&mut env, 0);
+        i += e.len + 1;
+    }
+    wb_unit(&mut env, 0);
+    wb_unit(&mut env, 0);
+    i += 1;
+    let mut cwd: [4096]u16 = [0; 4096];
+    let mut has_cwd = false;
+    if i < len {
+        let d = cstr_at(body, i);
+        if d.len > 0 {
+            has_cwd = wide(d, cwd[..]);
+        }
+    }
+    if (argc == 0) or not cmd.ok or not env.ok {
+        free(@ptr_cast(*mut void, cmd.p));
+        free(@ptr_cast(*mut void, env.p));
+        return AX_ERR;
+    }
+    // the program: a path, or found on the child's PATH
+    let prog = cstr_at(body, 0);
+    let mut app: [4096]u16 = [0; 4096];
+    let mut has_app = false;
+    let mut has_sep = false;
+    for c in prog {
+        if (c == '/') or (c == '\\') or (c == ':') {
+            has_sep = true;
+        }
+    }
+    if not has_sep {
+        has_app = search_path(body, env_at, prog, app[..]);
+    }
+    lock(&mut spawn_lock);
+    // the standard streams
+    let mut parent: [3]usize = [0, 0, 0];  // our ends of pipes
+    let mut child: [3]usize = [0, 0, 0];
+    let mut ok = true;
+    let sa: [3]u64 = [24, 0, 1];  // SECURITY_ATTRIBUTES, inheritable
+    for k in @as(usize, 0)..3 {
+        if modes[k] == 1 {
+            let mut r: usize = 0;
+            let mut w: usize = 0;
+            if CreatePipe(&mut r, &mut w, @ptr_cast(*void, &sa[0]), 0) == 0 {
+                ok = false;
+                break;
+            }
+            if k == 0 {
+                parent[k] = w;
+                child[k] = r;
+            } else {
+                parent[k] = r;
+                child[k] = w;
+            }
+            _ = SetHandleInformation(parent[k], 1, 0);  // HANDLE_FLAG_INHERIT: not ours
+        } else if modes[k] == 2 {
+            let nul: [4]u16 = ['N', 'U', 'L', 0];
+            let h = CreateFileW(&nul[0], GENERIC_READ | GENERIC_WRITE, SHARE_ALL, @ptr_cast(*void, &sa[0]),
+                                OPEN_EXISTING, 0, 0);
+            if h == INVALID {
+                ok = false;
+                break;
+            }
+            child[k] = h;
+        } else {
+            child[k] = inheritable(file_handle(@truncate(i32, @bit_cast(isize, k))));
+        }
+    }
+    let mut result: i32 = AX_ERR;
+    if ok {
+        // STARTUPINFOW (104 bytes): cb, dwFlags at 60, the handles at 80
+        let mut si: [104]u8 = [0; 104];
+        put32(si[..], 0, 104);
+        put32(si[..], 60, 0x100);  // STARTF_USESTDHANDLES
+        put64(si[..], 80, @as(u64, child[0]));
+        put64(si[..], 88, @as(u64, child[1]));
+        put64(si[..], 96, @as(u64, child[2]));
+        let mut pi: [24]u8 = [0; 24];
+        let mut appp = @ptr_from_int(*u16, 0);
+        if has_app {
+            appp = &app[0];
+        }
+        let mut cwdp = @ptr_from_int(*u16, 0);
+        if has_cwd {
+            cwdp = &cwd[0];
+        }
+        // CREATE_UNICODE_ENVIRONMENT
+        if CreateProcessW(appp, cmd.p, @ptr_from_int(*void, 0), @ptr_from_int(*void, 0), 1, 0x400,
+                          @ptr_cast(*void, env.p), cwdp, &si[0], &mut pi[0]) != 0 {
+            _ = CloseHandle(@truncate(usize, le64(pi[..], 8)));
+            let ph = @truncate(usize, le64(pi[..], 0));
+            result = new_handle(K_PROC, ph, 0);
+            if result < 0 {
+                _ = CloseHandle(ph);
+            }
+        } else {
+            let e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND) or (e == ERROR_PATH_NOT_FOUND) {
+                result = -2;
+            } else if e == ERROR_ACCESS_DENIED {
+                result = -13;
+            }
+        }
+    }
+    for k in @as(usize, 0)..3 {
+        if child[k] != 0 {
+            _ = CloseHandle(child[k]);
+        }
+    }
+    unlock(&mut spawn_lock);
+    for k in @as(usize, 0)..3 {
+        if (result >= 0) and (modes[k] == 1) {
+            modes[k] = new_handle(K_FILE, parent[k], 0);
+        } else {
+            if parent[k] != 0 {
+                _ = CloseHandle(parent[k]);
+            }
+            modes[k] = -1;
+        }
+    }
+    free(@ptr_cast(*mut void, cmd.p));
+    free(@ptr_cast(*mut void, env.p));
+    return result;
+}
+
+// The ABI's signal number for a process that ended with an exception code
+// (0 if it exited normally).
+pub fn exception_sig(code: u32) i32 {
+    if (code == 0xc000_0005) or (code == 0xc000_00fd) {
+        return 11;  // access violation, stack overflow: SIGSEGV
+    }
+    if code == 0xc000_001d {
+        return 4;  // illegal instruction (a trap): SIGILL
+    }
+    if (code == 0xc000_0094) or (code == 0xc000_0095) {
+        return 8;  // SIGFPE
+    }
+    if code == 0xc000_013a {
+        return 2;  // STATUS_CONTROL_C_EXIT: SIGINT
+    }
+    if code == 0x8000_0003 {
+        return 5;  // a breakpoint: SIGTRAP
+    }
+    return 0;
+}
+
+// 0: still running (block 0); 1: exited, with *status its code; 2: killed
+// by signal *status.
+export fn ax_proc_wait(h: i32, block: u32, status: *mut i32) i32 {
+    let e = entry(h, K_PROC);
+    if @int_from_ptr(e) == 0 {
+        return AX_ERR;
+    }
+    let mut ms: u32 = 0;
+    if block != 0 {
+        ms = INFINITE;
+    }
+    let w = WaitForSingleObject(e.h, ms);
+    if w == 0x102 {  // WAIT_TIMEOUT
+        return 0;
+    }
+    if w != 0 {
+        return AX_ERR;
+    }
+    let mut code: u32 = 0;
+    if GetExitCodeProcess(e.h, &mut code) == 0 {
+        return AX_ERR;
+    }
+    let sig = e.sig;
+    _ = CloseHandle(e.h);
+    release(h);
+    if sig != 0 {
+        status.* = sig;
+        return 2;
+    }
+    let s = exception_sig(code);
+    if s != 0 {
+        status.* = s;
+        return 2;
+    }
+    status.* = @bit_cast(i32, code);
+    return 1;
+}
+
+// Windows has no signals to send: every one ends the process.
+export fn ax_proc_kill(h: i32, sig: i32) i32 {
+    let e = entry(h, K_PROC);
+    if (@int_from_ptr(e) == 0) or (sig < 1) or (sig > 31) {
+        return AX_ERR;
+    }
+    if TerminateProcess(e.h, 128 + @bit_cast(u32, sig)) == 0 {
+        return AX_ERR;
+    }
+    e.sig = sig;
+    return 0;
+}
+
+export fn ax_pipe_read(h: i32, p: *mut u8, n: usize) isize {
+    return ax_read(h, p, n);
+}
+
+export fn ax_pipe_write(h: i32, p: *u8, n: usize) isize {
+    return ax_write(h, p, n);
+}
+
+export fn ax_pipe_close(h: i32) void {
+    ax_close(h);
+}
+
+// -----------------------------------------------------------------------------
+// Signals: the console's control events, as SIGINT (Ctrl+C, Ctrl+Break) and
+// SIGTERM (the console closing, logoff, shutdown).
+// -----------------------------------------------------------------------------
+let mut sig_actions: [32]u8 = [0; 32];
+let mut sig_pending: u64 = 0;
+let mut sig_seq: u32 = 0;
+let mut ctrl_installed: u32 = 0;
+
+fn on_ctrl(ev: u32) i32 {
+    let mut sig: i32 = 15;
+    if ev <= 1 {
+        sig = 2;
+    }
+    let a = sig_actions[@as(usize, @bit_cast(u32, sig))];
+    if a == 1 {
+        return 1;  // ignored
+    }
+    if a != 2 {
+        return 0;  // the default: the process ends
+    }
+    _ = @atomic_or(&mut sig_pending, @as(u64, 1) << @as(u64, @bit_cast(u32, sig)));
+    _ = @atomic_add(&mut sig_seq, 1);
+    RtlWakeAddressAll(@ptr_cast(*void, &sig_seq));
+    return 1;
+}
+
+export fn ax_signal(sig: i32, action: u32) i32 {
+    // not KILL, STOP, SEGV, BUS or FPE (host ABI numbers)
+    if (sig < 1) or (sig > 31) or (sig == 9) or (sig == 19) or (sig == 11) or (sig == 7) or (sig == 8) or (action > 2) {
+        return AX_ERR;
+    }
+    if (sig != 2) and (sig != 15) {
+        return -2;  // unsupported: the console has no other events
+    }
+    if @atomic_xchg(&mut ctrl_installed, 1) == 0 {
+        _ = SetConsoleCtrlHandler(on_ctrl, 1);
+    }
+    sig_actions[@as(usize, @bit_cast(u32, sig))] = @truncate(u8, action);
+    return 0;
+}
+
+// A relative timeout for the Rtl and Nt functions: 100 ns units, negative.
+fn rel_timeout(ns: i64) i64 {
+    let mut t = ns / 100;
+    if t < 1 {
+        t = 1;
+    }
+    return -t;
+}
+
+// The signals caught since the last call, as bits; waits up to timeout_ns
+// (-1: for ever) for one.
+export fn ax_signal_take(timeout_ns: i64) i64 {
+    loop {
+        let seq = @atomic_load(&sig_seq);
+        let got = @atomic_xchg(&mut sig_pending, 0);
+        if (got != 0) or (timeout_ns == 0) {
+            return @bit_cast(i64, got);
+        }
+        let t = rel_timeout(timeout_ns);
+        let mut tp = &t;
+        if timeout_ns < 0 {
+            tp = @ptr_from_int(*i64, 0);
+        }
+        let r = RtlWaitOnAddress(@ptr_cast(*void, &sig_seq), @ptr_cast(*void, &seq), 4, tp);
+        if r == 0x102 {  // STATUS_TIMEOUT
+            return @bit_cast(i64, @atomic_xchg(&mut sig_pending, 0));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Sockets. An address record is 24 bytes: [0] the family (4 or 6), [2..4]
+// the port (network order), [4..8] an IPv4 or [4..20] an IPv6 address,
+// [20..24] the IPv6 scope. Winsock's sockaddrs are BSD's without a length
+// byte; AF_INET is 2, AF_INET6 23.
+// -----------------------------------------------------------------------------
+const AF_UNIX: i32 = 1;
+const AF_INET: i32 = 2;
+const AF_INET6: i32 = 23;
+const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
+const SOL_SOCKET: i32 = 0xffff;
+const SO_ERROR: i32 = 0x1007;
+const FIONBIO: u32 = 0x8004_667e;
+const WSAEINTR: i32 = 10004;
+const WSAEWOULDBLOCK: i32 = 10035;
+const WSAEADDRINUSE: i32 = 10048;
+const WSAETIMEDOUT: i32 = 10060;
+const WSAECONNREFUSED: i32 = 10061;
+
+let mut wsa_state: u32 = 0;
+
+fn wsa_init() void {
+    if @atomic_load(&wsa_state) == 2 {
+        return;
+    }
+    if @atomic_cas(&mut wsa_state, 0, 1) == 0 {
+        let mut data: [512]u8 = [0; 512];
+        _ = WSAStartup(0x0202, &mut data[0]);
+        @atomic_store(&mut wsa_state, 2);
+        return;
+    }
+    while @atomic_load(&wsa_state) != 2 {
+        ax_sleep_ns(1000);
+    }
+}
+
+fn rec_sockaddr(r: *u8, ss: []mut u8) i32 {
+    let rec = @slice_from_ptr(r, 24);
+    @mem_set(ss[0..128], 0);
+    if rec[0] == 4 {
+        ss[0] = 2;
+        @mem_copy(ss[2..4], rec[2..4]);
+        @mem_copy(ss[4..8], rec[4..8]);
+        return 16;
+    }
+    if rec[0] == 6 {
+        ss[0] = 23;
+        @mem_copy(ss[2..4], rec[2..4]);
+        @mem_copy(ss[8..24], rec[4..20]);
+        @mem_copy(ss[24..28], rec[20..24]);
+        return 28;
+    }
+    return 0;
+}
+
+fn sockaddr_rec(sa: *u8, r: *mut u8) bool {
+    let a = @slice_from_ptr(sa, 28);
+    let rec = @slice_from_ptr(r, 24);
+    @mem_set(rec, 0);
+    if a[0] == 2 {
+        rec[0] = 4;
+        @mem_copy(rec[2..4], a[2..4]);
+        @mem_copy(rec[4..8], a[4..8]);
+        return true;
+    }
+    if a[0] == 23 {
+        rec[0] = 6;
+        @mem_copy(rec[2..4], a[2..4]);
+        @mem_copy(rec[4..20], a[8..24]);
+        @mem_copy(rec[20..24], a[24..28]);
+        return true;
+    }
+    return false;
+}
+
+// A socket that children do not inherit, in the table.
+// WSA_FLAG_OVERLAPPED as socket() makes them (blocking calls still block):
+// Windows serializes all requests on a handle for synchronous I/O, so
+// without it getsockname, or the shutdown that ax_sock_close does, waits
+// for another thread's accept or recv on the socket to finish (Wine does
+// not); WSA_FLAG_NO_HANDLE_INHERIT.
+fn new_socket(family: i32, ty: i32, proto: i32) usize {
+    wsa_init();
+    return WSASocketW(family, ty, proto, @ptr_from_int(*void, 0), 0, 0x01 | 0x80);
+}
+
+fn sock_fd(s: usize) i32 {
+    let fd = new_handle(K_SOCK, s, 0);
+    if fd < 0 {
+        _ = closesocket(s);
+    }
+    return fd;
+}
+
+// struct addrinfo: ai_family at 4, ai_socktype at 8, ai_protocol at 12,
+// ai_addrlen at 16, ai_addr at 32, ai_next at 40.
+fn ai_i32(a: *mut u8, off: usize) i32 {
+    return @ptr_from_int(*i32, @int_from_ptr(a) + off).*;
+}
+
+fn ai_ptr(a: *mut u8, off: usize) *mut u8 {
+    return @ptr_from_int(*mut *mut u8, @int_from_ptr(a) + off).*;
+}
+
+// getaddrinfo for a host (len 0: none) and a numeric port (0: none).
+fn lookup(name: *u8, len: usize, port: u32, passive: bool, res: *mut *mut u8) i32 {
+    wsa_init();
+    let mut hostname: [256]u8 = [0; 256];
+    if (len + 1) > hostname.len {
+        return AX_BAD_ADDRESS;
+    }
+    let hs = @slice_from_ptr(name, len);
+    for k in 0..len {
+        if hs[k] == 0 {
+            return AX_BAD_ADDRESS;
+        }
+        hostname[k] = hs[k];
+    }
+    let mut serv: [16]u8 = [0; 16];
+    let mut digits: [10]u8 = [0; 10];
+    let mut nd: usize = 0;
+    let mut v = port;
+    loop {
+        digits[nd] = '0' + @truncate(u8, v % 10);
+        nd += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for k in 0..nd {
+        serv[k] = digits[nd - 1 - k];
+    }
+    let mut hints: [48]u8 = [0; 48];
+    if passive {
+        put32(hints[..], 0, 1);  // AI_PASSIVE
+    }
+    put32(hints[..], 8, @bit_cast(u32, SOCK_STREAM));
+    let mut hp = @ptr_cast(*u8, &hostname[0]);
+    if len == 0 {
+        hp = @ptr_from_int(*u8, 0);
+    }
+    let mut sp = @ptr_cast(*u8, &serv[0]);
+    if port == 0 {
+        sp = @ptr_from_int(*u8, 0);
+    }
+    if getaddrinfo(hp, sp, &hints[0], res) != 0 {
+        return AX_BAD_ADDRESS;
+    }
+    return 0;
+}
+
+export fn ax_resolve(name: *u8, len: usize, out: *mut u8, max: u32) i32 {
+    if len == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let mut res = @ptr_from_int(*mut u8, 0);
+    if lookup(name, len, 0, false, &mut res) != 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let mut n: u32 = 0;
+    let mut a = res;
+    while (@int_from_ptr(a) != 0) and (n < max) {
+        if sockaddr_rec(ai_ptr(a, 32), @ptr_from_int(*mut u8, @int_from_ptr(out) + (@as(usize, n) * 24))) {
+            n += 1;
+        }
+        a = ai_ptr(a, 40);
+    }
+    freeaddrinfo(res);
+    if n == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    return @bit_cast(i32, n);
+}
+
+// Connects to a host's addresses in turn, as RFC 8305 does: when an attempt
+// has not finished after a delay the next one starts, and the first to
+// connect wins. Windows takes two seconds to give up on a refused
+// connection (it retries the SYN), so trying them one after another would
+// make "localhost" (::1, then 127.0.0.1) slow for a server on 127.0.0.1.
+export fn ax_tcp_connect(name: *u8, len: usize, port: u32) i32 {
+    let mut res = @ptr_from_int(*mut u8, 0);
+    let rc = lookup(name, len, port, false, &mut res);
+    if rc != 0 {
+        return rc;
+    }
+    let mut socks: [16]usize = [0; 16];  // the attempts in progress
+    let mut n: usize = 0;
+    let mut refused = false;
+    let mut won = INVALID;
+    let mut delay_ms: u32 = 0;
+    let mut a = res;
+    loop {
+        if (@int_from_ptr(a) != 0) and (n < socks.len) {
+            let s = new_socket(ai_i32(a, 4), ai_i32(a, 8), ai_i32(a, 12));
+            if s != INVALID {
+                let mut nb: u32 = 1;
+                _ = ioctlsocket(s, FIONBIO, &mut nb);
+                if connect(s, ai_ptr(a, 32), ai_i32(a, 16)) == 0 {
+                    won = s;
+                    break;
+                }
+                let e = WSAGetLastError();
+                if e == WSAEWOULDBLOCK {
+                    socks[n] = s;
+                    n += 1;
+                } else {
+                    refused = refused or (e == WSAECONNREFUSED);
+                    _ = closesocket(s);
+                }
+            }
+            // (a loopback connection is made at once)
+            delay_ms = 250;
+            if is_loopback(ai_ptr(a, 32)) {
+                delay_ms = 10;
+            }
+            a = ai_ptr(a, 40);
+        }
+        if n == 0 {
+            if @int_from_ptr(a) == 0 {
+                break;
+            }
+            continue;
+        }
+        // fd_sets: a count (padded to 8 bytes), then the sockets
+        let mut wset: [65]u64 = [0; 65];
+        let mut xset: [65]u64 = [0; 65];
+        wset[0] = @as(u64, n);
+        xset[0] = @as(u64, n);
+        for k in 0..n {
+            wset[k + 1] = @as(u64, socks[k]);
+            xset[k + 1] = @as(u64, socks[k]);
+        }
+        let mut tv: [2]i32 = [0, @bit_cast(i32, delay_ms * 1000)];
+        let mut tvp = @ptr_cast(*u8, &tv[0]);
+        if (@int_from_ptr(a) == 0) or (n == socks.len) {
+            tvp = @ptr_from_int(*u8, 0);  // nothing more to start: wait for these
+        }
+        let r = select(0, @ptr_from_int(*mut u8, 0), @ptr_cast(*mut u8, &mut wset[0]), @ptr_cast(*mut u8, &mut xset[0]),
+                       tvp);
+        if r < 0 {
+            break;
+        }
+        // the first in order that connected wins; drop those that failed
+        let mut kept: usize = 0;
+        for k in 0..n {
+            let s = socks[k];
+            if (won == INVALID) and in_fdset(wset[..], s) {
+                won = s;
+                continue;
+            }
+            if in_fdset(xset[..], s) {
+                let mut err: i32 = 0;
+                let mut el: i32 = 4;
+                _ = getsockopt(s, SOL_SOCKET, SO_ERROR, @ptr_cast(*mut u8, &mut err), &mut el);
+                refused = refused or (err == WSAECONNREFUSED);
+                _ = closesocket(s);
+                continue;
+            }
+            socks[kept] = s;
+            kept += 1;
+        }
+        n = kept;
+        if won != INVALID {
+            break;
+        }
+    }
+    for k in 0..n {
+        _ = closesocket(socks[k]);
+    }
+    freeaddrinfo(res);
+    if won == INVALID {
+        if refused {
+            return AX_REFUSED;
+        }
+        return AX_ERR;
+    }
+    let mut nb: u32 = 0;
+    _ = ioctlsocket(won, FIONBIO, &mut nb);
+    return sock_fd(won);
+}
+
+fn in_fdset(set: []u64, s: usize) bool {
+    for k in 0..@truncate(usize, set[0]) {
+        if set[k + 1] == @as(u64, s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a sockaddr is 127.x.x.x or ::1.
+fn is_loopback(sa: *mut u8) bool {
+    let b = @slice_from_ptr(@ptr_cast(*u8, sa), 24);
+    if b[0] == 2 {
+        return b[4] == 127;
+    }
+    if b[0] == 23 {
+        for k in @as(usize, 8)..23 {
+            if b[k] != 0 {
+                return false;
+            }
+        }
+        return b[23] == 1;
+    }
+    return false;
+}
+
+export fn ax_tcp_listen(name: *u8, len: usize, port: u32) i32 {
+    let mut res = @ptr_from_int(*mut u8, 0);
+    let rc = lookup(name, len, port, true, &mut res);
+    if rc != 0 {
+        return rc;
+    }
+    let mut result = AX_ERR;
+    let mut a = res;
+    while @int_from_ptr(a) != 0 {
+        let s = new_socket(ai_i32(a, 4), ai_i32(a, 8), ai_i32(a, 12));
+        if s != INVALID {
+            if (bind(s, ai_ptr(a, 32), ai_i32(a, 16)) == 0) and (listen(s, 128) == 0) {
+                result = sock_fd(s);
+                break;
+            }
+            result = AX_ERR;
+            if WSAGetLastError() == WSAEADDRINUSE {
+                result = AX_ADDR_IN_USE;
+            }
+            _ = closesocket(s);
+        }
+        a = ai_ptr(a, 40);
+    }
+    freeaddrinfo(res);
+    return result;
+}
+
+export fn ax_tcp_accept(listener: i32) i32 {
+    let l = sock_handle(listener);
+    if l == INVALID {
+        return AX_ERR;
+    }
+    loop {
+        let s = accept(l, @ptr_from_int(*mut u8, 0), @ptr_from_int(*mut i32, 0));
+        if s == INVALID {
+            if WSAGetLastError() == WSAEINTR {
+                continue;
+            }
+            return AX_ERR;
+        }
+        return sock_fd(s);
+    }
+}
+
+export fn ax_tcp_local_port(h: i32) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let mut sl: i32 = 128;
+    if getsockname(sock_handle(h), &mut ss[0], &mut sl) != 0 {
+        return AX_ERR;
+    }
+    if (ss[0] == 2) or (ss[0] == 23) {
+        return (@as(i32, ss[2]) << 8) | @as(i32, ss[3]);
+    }
+    return AX_ERR;
+}
+
+// Waits until socket h is readable (or writable) for at most its timeout
+// (none set: true at once); false if it timed out.
+fn sock_ready(h: i32, write: bool) bool {
+    let e = entry(h, K_SOCK);
+    if (@int_from_ptr(e) == 0) or (e.sig <= 0) {
+        return true;
+    }
+    let mut fd: [16]u8 = [0; 16];  // WSAPOLLFD
+    put64(fd[..], 0, @as(u64, e.h));
+    if write {
+        fd[8] = 0x10;  // POLLWRNORM
+    } else {
+        fd[9] = 0x1;  // POLLRDNORM (0x100)
+    }
+    return WSAPoll(&mut fd[0], 1, e.sig) != 0;
+}
+
+fn sock_err() isize {
+    if WSAGetLastError() == WSAETIMEDOUT {
+        return @as(isize, AX_TIMED_OUT);
+    }
+    return @as(isize, AX_ERR);
+}
+
+export fn ax_sock_read(h: i32, p: *mut u8, n: usize) isize {
+    let s = sock_handle(h);
+    if not sock_ready(h, false) {
+        return @as(isize, AX_TIMED_OUT);
+    }
+    let r = recv(s, p, @truncate(i32, @bit_cast(isize, @min(n, 0x4000_0000))), 0);
+    if r < 0 {
+        return sock_err();
+    }
+    return @as(isize, r);
+}
+
+export fn ax_sock_write(h: i32, p: *u8, n: usize) isize {
+    let s = sock_handle(h);
+    if not sock_ready(h, true) {
+        return @as(isize, AX_TIMED_OUT);
+    }
+    let r = send(s, p, @truncate(i32, @bit_cast(isize, @min(n, 0x4000_0000))), 0);
+    if r < 0 {
+        return sock_err();
+    }
+    return @as(isize, r);
+}
+
+// Reads and writes on h fail with AX_TIMED_OUT after ms milliseconds (0:
+// never): each waits for the socket with WSAPoll first (SO_RCVTIMEO does
+// not reliably end a wait for a datagram).
+export fn ax_sock_timeout(h: i32, ms: u32) i32 {
+    let e = entry(h, K_SOCK);
+    if @int_from_ptr(e) == 0 {
+        return AX_ERR;
+    }
+    e.sig = @bit_cast(i32, @min(ms, 0x7fff_ffff));
+    return 0;
+}
+
+// Closes gracefully: Windows resets a connection closed with received data
+// unread, and the peer then loses what it had not read yet; so the end is
+// sent first and what has arrived is drained. (Shutting the socket down
+// also wakes a thread blocked in accept on it.)
+export fn ax_sock_close(h: i32) void {
+    let e = entry(h, K_SOCK);
+    if @int_from_ptr(e) == 0 {
+        return;
+    }
+    _ = shutdown(e.h, 1);          // SD_SEND
+    let mut fd: [16]u8 = [0; 16];  // WSAPOLLFD
+    let mut junk: [4096]u8 = [0; 4096];
+    for _k in @as(usize, 0)..64 {
+        put64(fd[..], 0, @as(u64, e.h));
+        fd[8] = 0;
+        fd[9] = 0x1;  // POLLRDNORM
+        fd[10] = 0;
+        fd[11] = 0;
+        if (WSAPoll(&mut fd[0], 1, 0) <= 0) or (recv(e.h, &mut junk[0], 4096, 0) <= 0) {
+            break;
+        }
+    }
+    _ = shutdown(e.h, 2);  // SD_BOTH
+    _ = closesocket(e.h);
+    release(h);
+}
+
+export fn ax_tcp_connect_addr(r: *u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let s = new_socket(@as(i32, ss[0]), SOCK_STREAM, 0);
+    if s == INVALID {
+        return AX_ERR;
+    }
+    if connect(s, &ss[0], sl) == 0 {
+        return sock_fd(s);
+    }
+    let e = WSAGetLastError();
+    _ = closesocket(s);
+    if e == WSAECONNREFUSED {
+        return AX_REFUSED;
+    }
+    return AX_ERR;
+}
+
+export fn ax_tcp_listen_addr(r: *u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let s = new_socket(@as(i32, ss[0]), SOCK_STREAM, 0);
+    if s == INVALID {
+        return AX_ERR;
+    }
+    if (bind(s, &ss[0], sl) == 0) and (listen(s, 128) == 0) {
+        return sock_fd(s);
+    }
+    let e = WSAGetLastError();
+    _ = closesocket(s);
+    if e == WSAEADDRINUSE {
+        return AX_ADDR_IN_USE;
+    }
+    return AX_ERR;
+}
+
+export fn ax_sock_addr(h: i32, peer: u32, out: *mut u8) i32 {
+    let s = sock_handle(h);
+    let mut ss: [128]u8 = [0; 128];
+    let mut sl: i32 = 128;
+    let mut r: i32 = 0;
+    if peer != 0 {
+        r = getpeername(s, &mut ss[0], &mut sl);
+    } else {
+        r = getsockname(s, &mut ss[0], &mut sl);
+    }
+    if (r != 0) or not sockaddr_rec(&ss[0], out) {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+export fn ax_udp_open(r: *u8) i32 {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return AX_BAD_ADDRESS;
+    }
+    let s = new_socket(@as(i32, ss[0]), SOCK_DGRAM, 0);
+    if s == INVALID {
+        return AX_ERR;
+    }
+    if bind(s, &ss[0], sl) == 0 {
+        return sock_fd(s);
+    }
+    let e = WSAGetLastError();
+    _ = closesocket(s);
+    if e == WSAEADDRINUSE {
+        return AX_ADDR_IN_USE;
+    }
+    return AX_ERR;
+}
+
+export fn ax_udp_send(h: i32, p: *u8, n: usize, r: *u8) isize {
+    let mut ss: [128]u8 = [0; 128];
+    let sl = rec_sockaddr(r, ss[..]);
+    if sl == 0 {
+        return @as(isize, AX_BAD_ADDRESS);
+    }
+    if not sock_ready(h, true) {
+        return @as(isize, AX_TIMED_OUT);
+    }
+    let k = sendto(sock_handle(h), p, @truncate(i32, @bit_cast(isize, @min(n, 0x4000_0000))), 0, &ss[0], sl);
+    if k < 0 {
+        return sock_err();
+    }
+    return @as(isize, k);
+}
+
+export fn ax_udp_recv(h: i32, p: *mut u8, n: usize, from: *mut u8) isize {
+    let mut ss: [128]u8 = [0; 128];
+    let mut sl: i32 = 128;
+    if not sock_ready(h, false) {
+        return @as(isize, AX_TIMED_OUT);
+    }
+    let k = recvfrom(sock_handle(h), p, @truncate(i32, @bit_cast(isize, @min(n, 0x4000_0000))), 0, &mut ss[0], &mut sl);
+    if k < 0 {
+        return sock_err();
+    }
+    _ = sockaddr_rec(&ss[0], from);
+    return @as(isize, k);
+}
+
+// struct sockaddr_un: sun_family (u16), sun_path[108]
+fn unix_addr(path: *u8, len: usize, a: []mut u8) bool {
+    if (len == 0) or (len >= 108) {
+        return false;
+    }
+    @mem_set(a[0..110], 0);
+    let p = @slice_from_ptr(path, len);
+    for k in 0..len {
+        if p[k] == 0 {
+            return false;
+        }
+        a[2 + k] = p[k];
+    }
+    a[0] = 1;
+    return true;
+}
+
+export fn ax_unix_connect(path: *u8, len: usize) i32 {
+    let mut a: [110]u8 = [0; 110];
+    if not unix_addr(path, len, a[..]) {
+        return AX_BAD_ADDRESS;
+    }
+    let s = new_socket(AF_UNIX, SOCK_STREAM, 0);
+    if s == INVALID {
+        return AX_ERR;
+    }
+    if connect(s, &a[0], 110) == 0 {
+        return sock_fd(s);
+    }
+    let e = WSAGetLastError();
+    _ = closesocket(s);
+    // (WSAEADDRNOTAVAIL, ENOENT: no such socket file; WSAENETDOWN: no such
+    // directory, on Windows 11)
+    if (e == WSAECONNREFUSED) or (e == 10049) or (e == 2) or (e == 10050) {
+        return AX_REFUSED;
+    }
+    return AX_ERR;
+}
+
+export fn ax_unix_listen(path: *u8, len: usize) i32 {
+    let mut a: [110]u8 = [0; 110];
+    if not unix_addr(path, len, a[..]) {
+        return AX_BAD_ADDRESS;
+    }
+    let s = new_socket(AF_UNIX, SOCK_STREAM, 0);
+    if s == INVALID {
+        return AX_ERR;
+    }
+    if (bind(s, &a[0], 110) == 0) and (listen(s, 128) == 0) {
+        return sock_fd(s);
+    }
+    let e = WSAGetLastError();
+    _ = closesocket(s);
+    if e == WSAEADDRINUSE {
+        return AX_ADDR_IN_USE;
+    }
+    return AX_ERR;
+}
+
+// entries are Linux's struct pollfd (handle i32, events i16, revents i16);
+// sockets are polled with WSAPoll, anything else reads as invalid.
+export fn ax_poll(entries: *mut u8, n: u32, timeout_ms: i32) i32 {
+    let es = @slice_from_ptr(entries, @as(usize, n) * 8);
+    let mut small: [64]u64 = [0; 64];  // 32 WSAPOLLFDs
+    let mut fds = @ptr_cast(*mut u8, &mut small[0]);
+    let mut heap = false;
+    if n > 32 {
+        fds = @ptr_cast(*mut u8, calloc(@as(usize, n) * 16));
+        if @int_from_ptr(fds) == 0 {
+            return AX_ERR;
+        }
+        heap = true;
+    }
+    let ws = @slice_from_ptr(fds, @as(usize, n) * 16);
+    let mut invalid: i32 = 0;
+    for k in 0..@as(usize, n) {
+        let fd = @bit_cast(i32, le32(es, k * 8));
+        let ev = @as(u32, es[(k * 8) + 4]) | (@as(u32, es[(k * 8) + 5]) << 8);
+        let s = sock_handle(fd);
+        let mut wev: u32 = 0;
+        if (ev & 1) != 0 {
+            wev = wev | 0x100;  // POLLIN -> POLLRDNORM
+        }
+        if (ev & 4) != 0 {
+            wev = wev | 0x10;  // POLLOUT -> POLLWRNORM
+        }
+        if (fd < 0) or (s == INVALID) {
+            put64(ws, k * 16, ~@as(u64, 0));  // (negative: ignored by WSAPoll)
+            if fd >= 0 {
+                invalid += 1;
+            }
+        } else {
+            put64(ws, k * 16, @as(u64, s));
+        }
+        ws[(k * 16) + 8] = @truncate(u8, wev);
+        ws[(k * 16) + 9] = @truncate(u8, wev >> 8);
+        ws[(k * 16) + 10] = 0;
+        ws[(k * 16) + 11] = 0;
+    }
+    let mut r: i32 = 0;
+    if invalid > 0 {
+        r = WSAPoll(fds, n, 0);
+    } else {
+        r = WSAPoll(fds, n, timeout_ms);
+    }
+    if r < 0 {
+        if heap {
+            free(@ptr_cast(*mut void, fds));
+        }
+        return AX_ERR;
+    }
+    let mut count: i32 = 0;
+    for k in 0..@as(usize, n) {
+        let fd = @bit_cast(i32, le32(es, k * 8));
+        let wr = @as(u32, ws[(k * 16) + 10]) | (@as(u32, ws[(k * 16) + 11]) << 8);
+        let mut rev: u32 = 0;
+        if (fd >= 0) and (sock_handle(fd) == INVALID) {
+            rev = 0x20;  // POLLNVAL
+        } else {
+            if (wr & 0x300) != 0 {
+                rev = rev | 1;
+            }
+            if (wr & 0x10) != 0 {
+                rev = rev | 4;
+            }
+            if (wr & 1) != 0 {
+                rev = rev | 8;  // POLLERR
+            }
+            if (wr & 2) != 0 {
+                rev = rev | 0x10;  // POLLHUP
+            }
+            if (wr & 4) != 0 {
+                rev = rev | 0x20;  // POLLNVAL
+            }
+        }
+        es[(k * 8) + 6] = @truncate(u8, rev);
+        es[(k * 8) + 7] = 0;
+        if rev != 0 {
+            count += 1;
+        }
+    }
+    if heap {
+        free(@ptr_cast(*mut void, fds));
+    }
+    return count;
+}
+
+// -----------------------------------------------------------------------------
+// More of the file system
+// -----------------------------------------------------------------------------
+
+// Windows has one permission bit: read-only (no write bits).
+export fn ax_chmod(path: *u8, len: usize, mode: u32) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return AX_ERR;
+    }
+    let attrs = GetFileAttributesW(&w[0]);
+    if attrs == NO_ATTRS {
+        return fs_err();
+    }
+    let mut na = attrs & ~FA_READONLY;
+    if (mode & 0o222) == 0 {
+        na = na | FA_READONLY;
+    }
+    if (na & 0xffff_ff7f) == 0 {
+        na = FA_NORMAL;
+    }
+    if SetFileAttributesW(&w[0], na) == 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+// A path with backslashes (which symbolic links need on Windows).
+fn backslashes(w: []mut u16) void {
+    for i in 0..w.len {
+        if w[i] == 0 {
+            return;
+        }
+        if w[i] == '/' {
+            w[i] = '\\';
+        }
+    }
+}
+
+export fn ax_symlink(target: *u8, tlen: usize, link_: *u8, llen: usize) i32 {
+    let mut t: [4096]u16 = [0; 4096];
+    let mut l: [4096]u16 = [0; 4096];
+    if not wpath(target, tlen, t[..]) or not wpath(link_, llen, l[..]) {
+        return AX_ERR;
+    }
+    backslashes(t[..]);
+    // a link to a directory must say so: look the target up from the link's directory
+    let mut flags: u32 = 2;  // SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+    let mut probe: [8192]u16 = [0; 8192];
+    let ln = wlen(&l[0]);
+    let tn = wlen(&t[0]);
+    let absolute = (tn > 0) and ((t[0] == '\\') or ((tn > 1) and (t[1] == ':')));
+    let mut cut: usize = 0;
+    if not absolute {
+        for i in 0..ln {
+            if (l[i] == '/') or (l[i] == '\\') {
+                cut = i + 1;
+            }
+        }
+    }
+    @mem_copy(probe[0..cut], l[0..cut]);
+    @mem_copy(probe[cut..cut + tn + 1], t[0..tn + 1]);
+    let pa = GetFileAttributesW(&probe[0]);
+    if (pa != NO_ATTRS) and ((pa & FA_DIRECTORY) != 0) {
+        flags = flags | 1;
+    }
+    if CreateSymbolicLinkW(&l[0], &t[0], flags) == 0 {
+        if GetLastError() == 1314 {  // ERROR_PRIVILEGE_NOT_HELD (no Developer Mode)
+            return -13;
+        }
+        return fs_err();
+    }
+    if GetFileAttributesW(&l[0]) == NO_ATTRS {
+        return -13;  // (Wine reports success and makes nothing)
+    }
+    return 0;
+}
+
+export fn ax_link(from: *u8, flen: usize, to: *u8, tlen: usize) i32 {
+    let mut a: [4096]u16 = [0; 4096];
+    let mut b: [4096]u16 = [0; 4096];
+    if not wpath(from, flen, a[..]) or not wpath(to, tlen, b[..]) {
+        return AX_ERR;
+    }
+    if CreateHardLinkW(&b[0], &a[0], @ptr_from_int(*void, 0)) == 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+// The target of a symbolic link; returns its length.
+export fn ax_readlink(path: *u8, len: usize, buf: *mut u8, cap: usize) isize {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return @as(isize, AX_ERR);
+    }
+    let h = CreateFileW(&w[0], 0, SHARE_ALL, @ptr_from_int(*void, 0), OPEN_EXISTING,
+                        FLAG_BACKUP_SEMANTICS | FLAG_OPEN_REPARSE_POINT, 0);
+    if h == INVALID {
+        return @as(isize, fs_err());
+    }
+    // REPARSE_DATA_BUFFER: the tag, then for a symbolic link the substitute
+    // and print names' offsets and lengths, flags, the names at 20 (16 for a
+    // junction)
+    let mut rb: [16384]u8 = [0; 16384];
+    let mut got: u32 = 0;
+    let ok = DeviceIoControl(h, 0x0009_00a8, @ptr_from_int(*void, 0), 0, &mut rb[0], 16384, &mut got, vnull());  // FSCTL_GET_REPARSE_POINT
+    _ = CloseHandle(h);
+    if ok == 0 {
+        return @as(isize, AX_ERR);
+    }
+    let tag = le32(rb[..], 0);
+    let mut names: usize = 20;
+    if tag == 0xa000_0003 {
+        names = 16;  // IO_REPARSE_TAG_MOUNT_POINT
+    } else if tag != 0xa000_000c {
+        return @as(isize, AX_ERR);
+    }
+    let sub_off = @as(usize, rb[8]) | (@as(usize, rb[9]) << 8);
+    let sub_len = @as(usize, rb[10]) | (@as(usize, rb[11]) << 8);
+    let pr_off = @as(usize, rb[12]) | (@as(usize, rb[13]) << 8);
+    let pr_len = @as(usize, rb[14]) | (@as(usize, rb[15]) << 8);
+    let mut off = names + pr_off;
+    let mut n = pr_len / 2;
+    if pr_len == 0 {
+        off = names + sub_off;
+        n = sub_len / 2;
+    }
+    if (off + (n * 2)) > rb.len {
+        return @as(isize, AX_ERR);
+    }
+    return to_abi(@ptr_cast(*u16, &rb[off]), n, buf, cap, true);
+}
+
+// Sets the access and modification times (nanoseconds since 1970).
+export fn ax_utimes(path: *u8, len: usize, atime_ns: i64, mtime_ns: i64) i32 {
+    let mut w: [4096]u16 = [0; 4096];
+    if not wpath(path, len, w[..]) {
+        return AX_ERR;
+    }
+    let h = CreateFileW(&w[0], 0x100, SHARE_ALL, @ptr_from_int(*void, 0), OPEN_EXISTING, FLAG_BACKUP_SEMANTICS, 0);  // FILE_WRITE_ATTRIBUTES
+    if h == INVALID {
+        return fs_err();
+    }
+    let a = ns_ft(atime_ns);
+    let m = ns_ft(mtime_ns);
+    let ok = SetFileTime(h, @ptr_from_int(*u64, 0), &a, &m);
+    _ = CloseHandle(h);
+    if ok == 0 {
+        return fs_err();
+    }
+    return 0;
+}
+
+export fn ax_ftruncate(fd: i32, size: i64) i32 {
+    let s = size;
+    if SetFileInformationByHandle(file_handle(fd), 6, @ptr_cast(*void, &s), 8) == 0 {  // FileEndOfFileInfo
+        return fs_err();
+    }
+    return 0;
+}
+
+export fn ax_fsync(fd: i32) i32 {
+    if FlushFileBuffers(file_handle(fd)) == 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+// flock: LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8. Windows' locks are
+// mandatory byte ranges, so the lock is on a byte far past any data
+// (advisory, as flock's are).
+export fn ax_flock(fd: i32, op: u32) i32 {
+    let h = file_handle(fd);
+    let mut ov: [32]u8 = [0; 32];  // OVERLAPPED: Offset at 8, OffsetHigh at 12
+    put32(ov[..], 8, 0xffff_fffe);
+    put32(ov[..], 12, 0x7fff_ffff);
+    if (op & 8) != 0 {
+        if UnlockFileEx(h, 0, 1, 0, &mut ov[0]) == 0 {
+            return AX_ERR;
+        }
+        return 0;
+    }
+    let mut flags: u32 = 0;
+    if (op & 2) != 0 {
+        flags = 2;  // LOCKFILE_EXCLUSIVE_LOCK
+    }
+    if (op & 4) != 0 {
+        flags = flags | 1;  // LOCKFILE_FAIL_IMMEDIATELY
+    }
+    if LockFileEx(h, flags, 0, 1, 0, &mut ov[0]) == 0 {
+        let e = GetLastError();
+        if (e == ERROR_LOCK_VIOLATION) or (e == ERROR_IO_PENDING) {
+            return -11;
+        }
+        return AX_ERR;
+    }
+    return 0;
+}
+
+// A shared mapping of len bytes of the file at off; 0 if it cannot be made.
+// (Views start at 64 KiB boundaries: the address returned is inside one.)
+export fn ax_mmap(fd: i32, off: i64, len: usize, writable: u32) usize {
+    let h = file_handle(fd);
+    let mut prot: u32 = 2;    // PAGE_READONLY
+    let mut access: u32 = 4;  // FILE_MAP_READ
+    if writable != 0 {
+        prot = 4;    // PAGE_READWRITE
+        access = 2;  // FILE_MAP_WRITE
+    }
+    let m = CreateFileMappingW(h, @ptr_from_int(*void, 0), prot, 0, 0, @ptr_from_int(*u16, 0));
+    if m == 0 {
+        return 0;
+    }
+    let o = @bit_cast(u64, off);
+    let base = o & ~@as(u64, 0xffff);
+    let delta = @truncate(usize, o - base);
+    let v = MapViewOfFile(m, access, @truncate(u32, base >> 32), @truncate(u32, base), len + delta);
+    _ = CloseHandle(m);
+    if v == 0 {
+        return 0;
+    }
+    return v + delta;
+}
+
+export fn ax_munmap(addr: usize, len: usize) i32 {
+    _ = len;
+    if UnmapViewOfFile(addr & ~@as(usize, 0xffff)) == 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+export fn ax_msync(addr: usize, len: usize) i32 {
+    if FlushViewOfFile(addr, len) == 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Watching: ReadDirectoryChangesW on each watched directory (a watched file's
+// directory, keeping its events), reported as inotify's records (as
+// std/os/fs reads them).
+// -----------------------------------------------------------------------------
+const MAX_WATCHES: usize = 64;
+const WBUF: usize = 16384;
+
+struct Watch {
+    wd: i32,
+    dir: usize,      // the directory's handle (0: free)
+    event: usize,    // signalled when changes arrive
+    ov: [32]u8,      // OVERLAPPED (hEvent at 24)
+    file: [260]u16,  // a watched file's name (empty: the whole directory)
+    buf: [16384]u8,
+}
+
+struct Watcher {
+    next_wd: i32,
+    w: [64]*mut Watch,
+}
+
+fn watch_arm(w: *mut Watch) bool {
+    @mem_set(w.ov[..], 0);
+    put64(w.ov[..], 24, @as(u64, w.event));
+    _ = ResetEvent(w.event);
+    // FILE_NOTIFY_CHANGE_FILE_NAME | DIR_NAME | ATTRIBUTES | SIZE | LAST_WRITE
+    return ReadDirectoryChangesW(w.dir, &mut w.buf[0], @truncate(u32, WBUF), 0, 0x1f, @ptr_from_int(*mut u32, 0),
+                                 &mut w.ov[0], @ptr_from_int(*void, 0)) != 0;
+}
+
+fn watch_free(w: *mut Watch) void {
+    _ = CancelIoEx(w.dir, &mut w.ov[0]);
+    let mut got: u32 = 0;
+    _ = GetOverlappedResult(w.dir, &mut w.ov[0], &mut got, 1);
+    _ = CloseHandle(w.dir);
+    _ = CloseHandle(w.event);
+    free(@ptr_cast(*mut void, w));
+}
+
+export fn ax_watch_open() i32 {
+    let p = @ptr_cast(*mut Watcher, calloc(@size_of(Watcher)));
+    if @int_from_ptr(p) == 0 {
+        return AX_ERR;
+    }
+    p.next_wd = 1;
+    let fd = new_handle(K_WATCH, 0, @int_from_ptr(p));
+    if fd < 0 {
+        free(@ptr_cast(*mut void, p));
+    }
+    return fd;
+}
+
+fn watcher(h: i32) *mut Watcher {
+    let e = entry(h, K_WATCH);
+    if @int_from_ptr(e) == 0 {
+        return @ptr_from_int(*mut Watcher, 0);
+    }
+    return @ptr_from_int(*mut Watcher, e.aux);
+}
+
+export fn ax_watch_add(h: i32, path: *u8, len: usize) i32 {
+    let wr = watcher(h);
+    if @int_from_ptr(wr) == 0 {
+        return AX_ERR;
+    }
+    let mut slot: usize = MAX_WATCHES;
+    for k in 0..MAX_WATCHES {
+        if @int_from_ptr(wr.w[k]) == 0 {
+            slot = k;
+            break;
+        }
+    }
+    if slot == MAX_WATCHES {
+        return AX_ERR;
+    }
+    let mut p: [4096]u16 = [0; 4096];
+    if not wpath(path, len, p[..]) {
+        return AX_ERR;
+    }
+    let attrs = GetFileAttributesW(&p[0]);
+    if attrs == NO_ATTRS {
+        return fs_err();
+    }
+    let w = @ptr_cast(*mut Watch, calloc(@size_of(Watch)));
+    if @int_from_ptr(w) == 0 {
+        return AX_ERR;
+    }
+    if (attrs & FA_DIRECTORY) == 0 {
+        // a file: watch its directory for its name
+        let n = wlen(&p[0]);
+        let mut cut: usize = 0;
+        for i in 0..n {
+            if (p[i] == '/') or (p[i] == '\\') {
+                cut = i + 1;
+            }
+        }
+        if (n - cut) >= 260 {
+            free(@ptr_cast(*mut void, w));
+            return AX_ERR;
+        }
+        @mem_copy(w.file[0..n - cut + 1], p[cut..n + 1]);
+        if cut == 0 {
+            p[0] = '.';
+            p[1] = 0;
+        } else {
+            p[cut] = 0;
+        }
+    }
+    // FILE_LIST_DIRECTORY
+    w.dir = CreateFileW(&p[0], 1, SHARE_ALL, @ptr_from_int(*void, 0), OPEN_EXISTING,
+                        FLAG_BACKUP_SEMANTICS | FLAG_OVERLAPPED, 0);
+    if w.dir == INVALID {
+        let r = fs_err();
+        free(@ptr_cast(*mut void, w));
+        return r;
+    }
+    w.event = CreateEventW(@ptr_from_int(*void, 0), 1, 0, @ptr_from_int(*u16, 0));
+    if not watch_arm(w) {
+        _ = CloseHandle(w.dir);
+        _ = CloseHandle(w.event);
+        free(@ptr_cast(*mut void, w));
+        return AX_ERR;
+    }
+    w.wd = wr.next_wd;
+    wr.next_wd += 1;
+    wr.w[slot] = w;
+    return w.wd;
+}
+
+export fn ax_watch_remove(h: i32, wd: i32) i32 {
+    let wr = watcher(h);
+    if @int_from_ptr(wr) == 0 {
+        return AX_ERR;
+    }
+    for k in 0..MAX_WATCHES {
+        let w = wr.w[k];
+        if (@int_from_ptr(w) != 0) and (w.wd == wd) {
+            watch_free(w);
+            wr.w[k] = @ptr_from_int(*mut Watch, 0);
+            return 0;
+        }
+    }
+    return AX_ERR;
+}
+
+fn wname_eq(a: *u16, an: usize, b: []u16) bool {
+    let bn = wlen(&b[0]);
+    if an != bn {
+        return false;
+    }
+    for i in 0..an {
+        let mut x = wch(a, i);
+        let mut y = b[i];
+        if (x >= 'A') and (x <= 'Z') {
+            x += 32;
+        }
+        if (y >= 'A') and (y <= 'Z') {
+            y += 32;
+        }
+        if x != y {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Turns a watch's FILE_NOTIFY_INFORMATION records (got bytes) into inotify
+// records in out from w; returns the new end.
+fn watch_records(wt: *mut Watch, got: usize, out: []mut u8, at: usize) usize {
+    let mut w = at;
+    let mut i: usize = 0;
+    let file = wt.file[0] != 0;
+    while (got > 0) and ((i + 12) <= got) {
+        let next = @as(usize, le32(wt.buf[..], i));
+        let action = le32(wt.buf[..], i + 4);
+        let nlen = @as(usize, le32(wt.buf[..], i + 8)) / 2;
+        let name = @ptr_cast(*u16, &wt.buf[i + 12]);
+        let mut mask: u32 = 0;
+        if action == 1 {
+            mask = 0x100;  // FILE_ACTION_ADDED: IN_CREATE
+        } else if action == 2 {
+            mask = 0x200;  // REMOVED: IN_DELETE
+        } else if action == 3 {
+            mask = 0x2;  // MODIFIED: IN_MODIFY
+        } else if action == 4 {
+            mask = 0x40;  // RENAMED_OLD_NAME: IN_MOVED_FROM
+        } else if action == 5 {
+            mask = 0x80;  // RENAMED_NEW_NAME: IN_MOVED_TO
+        }
+        let mut keep = mask != 0;
+        let mut with_name = true;
+        if file {
+            keep = keep and wname_eq(name, nlen, wt.file[..]);
+            with_name = false;
+            if mask == 0x200 {
+                mask = 0x400;  // IN_DELETE_SELF
+            } else if mask == 0x40 {
+                mask = 0x800;  // IN_MOVE_SELF
+            } else if (mask == 0x100) or (mask == 0x80) {
+                mask = 0x2;  // (the file is back: modified)
+            }
+        }
+        if keep {
+            let mut nb: [1024]u8 = [0; 1024];
+            let mut m: usize = 0;
+            if with_name {
+                m = narrow(name, nlen, nb[..], false);
+                if m > nb.len {
+                    m = 0;
+                }
+            }
+            let rl = align_up(m + 1, 4);
+            if not with_name {
+                // no name
+                if (w + 16) <= out.len {
+                    put32(out, w, @bit_cast(u32, wt.wd));
+                    put32(out, w + 4, mask);
+                    put32(out, w + 8, 0);
+                    put32(out, w + 12, 0);
+                    w += 16;
+                }
+            } else if (w + 16 + rl) <= out.len {
+                put32(out, w, @bit_cast(u32, wt.wd));
+                put32(out, w + 4, mask);
+                put32(out, w + 8, 0);
+                put32(out, w + 12, @truncate(u32, rl));
+                @mem_set(out[w + 16..w + 16 + rl], 0);
+                @mem_copy(out[w + 16..w + 16 + m], nb[0..m]);
+                w += 16 + rl;
+            }
+        }
+        if next == 0 {
+            break;
+        }
+        i += next;
+    }
+    return w;
+}
+
+// Waits up to timeout_ms (-1: for ever) for events; returns the bytes of
+// records written to buf (0: timed out).
+export fn ax_watch_read(h: i32, buf: *mut u8, cap: usize, timeout_ms: i32) isize {
+    let wr = watcher(h);
+    if @int_from_ptr(wr) == 0 {
+        return @as(isize, AX_ERR);
+    }
+    let mut evs: [64]usize = [0; 64];
+    let mut which: [64]usize = [0; 64];
+    let mut n: usize = 0;
+    for k in 0..MAX_WATCHES {
+        if @int_from_ptr(wr.w[k]) != 0 {
+            evs[n] = wr.w[k].event;
+            which[n] = k;
+            n += 1;
+        }
+    }
+    let mut ms = INFINITE;
+    if timeout_ms >= 0 {
+        ms = @bit_cast(u32, timeout_ms);
+    }
+    let out = @slice_from_ptr(buf, cap);
+    if n == 0 {
+        if timeout_ms != 0 {
+            ax_sleep_ns(@as(u64, ms) * 1000000);
+        }
+        return 0;
+    }
+    let r = WaitForMultipleObjects(@truncate(u32, n), &evs[0], 0, ms);
+    if r == 0x102 {
+        return 0;
+    }
+    if r >= @truncate(u32, n) {
+        return @as(isize, AX_ERR);
+    }
+    // every watch with changes, starting with the one that woke us
+    let mut w: usize = 0;
+    for k in 0..n {
+        let wt = wr.w[which[k]];
+        if WaitForSingleObject(wt.event, 0) != 0 {
+            continue;
+        }
+        let mut got: u32 = 0;
+        if GetOverlappedResult(wt.dir, &mut wt.ov[0], &mut got, 0) != 0 {
+            w = watch_records(wt, @as(usize, got), out, w);
+        }
+        _ = watch_arm(wt);
+    }
+    return @bit_cast(isize, w);
+}
+
+export fn ax_watch_close(h: i32) void {
+    let wr = watcher(h);
+    if @int_from_ptr(wr) == 0 {
+        return;
+    }
+    for k in 0..MAX_WATCHES {
+        if @int_from_ptr(wr.w[k]) != 0 {
+            watch_free(wr.w[k]);
+        }
+    }
+    free(@ptr_cast(*mut void, wr));
+    release(h);
+}
+
+// -----------------------------------------------------------------------------
+// Terminals (consoles)
+// -----------------------------------------------------------------------------
+export fn ax_isatty(fd: i32) i32 {
+    let h = file_handle(fd);
+    let mut m: u32 = 0;
+    if (h != INVALID) and (GetFileType(h) == 2) and (GetConsoleMode(h, &mut m) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// out: columns, rows
+export fn ax_term_size(fd: i32, out: *mut u32) i32 {
+    let mut h = file_handle(fd);
+    if fd == 0 {
+        h = file_handle(1);  // (the size is the screen buffer's)
+    }
+    // CONSOLE_SCREEN_BUFFER_INFO: the window (left, top, right, bottom) at 10
+    let mut ci: [22]u8 = [0; 22];
+    if GetConsoleScreenBufferInfo(h, &mut ci[0]) == 0 {
+        return AX_ERR;
+    }
+    let left = @as(i32, @bit_cast(i16, @as(u16, ci[10]) | (@as(u16, ci[11]) << 8)));
+    let top = @as(i32, @bit_cast(i16, @as(u16, ci[12]) | (@as(u16, ci[13]) << 8)));
+    let right = @as(i32, @bit_cast(i16, @as(u16, ci[14]) | (@as(u16, ci[15]) << 8)));
+    let bottom = @as(i32, @bit_cast(i16, @as(u16, ci[16]) | (@as(u16, ci[17]) << 8)));
+    let o = @slice_from_ptr(out, 2);
+    o[0] = @bit_cast(u32, right - left + 1);
+    o[1] = @bit_cast(u32, bottom - top + 1);
+    return 0;
+}
+
+// The console mode before raw mode.
+let mut saved_mode: u32 = 0;
+let mut saved_fd: i32 = -1;
+
+// Raw input: no line editing, echo or Ctrl+C processing; keys arrive as
+// terminal escape sequences.
+export fn ax_term_raw(fd: i32, enable: u32) i32 {
+    let h = file_handle(fd);
+    if enable == 0 {
+        if saved_fd != fd {
+            return AX_ERR;
+        }
+        saved_fd = -1;
+        if SetConsoleMode(h, saved_mode) == 0 {
+            return AX_ERR;
+        }
+        return 0;
+    }
+    let mut m: u32 = 0;
+    if GetConsoleMode(h, &mut m) == 0 {
+        return AX_ERR;
+    }
+    if saved_fd < 0 {
+        saved_mode = m;
+        saved_fd = fd;
+    }
+    // not ENABLE_PROCESSED_INPUT, LINE_INPUT, ECHO_INPUT; ENABLE_VIRTUAL_TERMINAL_INPUT
+    if SetConsoleMode(h, (m & ~@as(u32, 0x7)) | 0x200) == 0 {
+        return AX_ERR;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Threads and wait / notify
+// -----------------------------------------------------------------------------
+struct ThreadStart {
+    entry: fn(*mut void) void,
+    arg: *mut void,
+    exited: *mut u32,
+}
+
+let mut next_thread_id: i32 = 1;
+
+// Called as each thread starts (true) and ends (false): the profiler
+// (std/internal/runtime/profile_windows.ax) samples the threads it knows.
+pub let mut thread_hook: fn(bool) void = no_thread_hook;
+pub let mut has_thread_hook: bool = false;
+
+fn no_thread_hook(start: bool) void {}
+
+// Room to report a stack overflow in (the exception handler runs on the
+// overflowing stack).
+fn guarantee_stack() void {
+    let mut g: u32 = 65536;
+    _ = SetThreadStackGuarantee(&mut g);
+}
+
+fn thread_main(p: *mut void) u32 {
+    guarantee_stack();
+    let st = @ptr_cast(*mut ThreadStart, p);
+    if has_thread_hook {
+        thread_hook(true);
+    }
+    st.entry(st.arg);
+    if has_thread_hook {
+        thread_hook(false);
+    }
+    @atomic_store(st.exited, 1);
+    _ = ax_notify32(st.exited, 1);
+    free(p);
+    return 0;
+}
+
+// stack_top is ignored: native threads get their stack from the system.
+export fn ax_thread_spawn(entry_: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32 {
+    _ = stack_top;
+    let st = @ptr_cast(*mut ThreadStart, malloc(@size_of(ThreadStart)));
+    if @int_from_ptr(st) == 0 {
+        return AX_ERR;
+    }
+    st.* = ThreadStart.{ entry: entry_, arg: arg, exited: exited };
+    // 8 MiB of address space, as on Linux (STACK_SIZE_PARAM_IS_A_RESERVATION)
+    let t = CreateThread(@ptr_from_int(*void, 0), 8 << 20, thread_main, @ptr_cast(*mut void, st), 0x1_0000,
+                         @ptr_from_int(*mut u32, 0));
+    if t == 0 {
+        free(@ptr_cast(*mut void, st));
+        return AX_ERR;
+    }
+    _ = CloseHandle(t);
+    return @atomic_add(&mut next_thread_id, 1);
+}
+
+// Native threads need no stack from the program.
+export fn ax_thread_stack_size() usize {
+    return 0;
+}
+
+// The operating system (Windows).
+export fn ax_os() i32 {
+    return 3;
+}
+
+// x86-64 programs ask the processor (cpuid) for its extensions.
+export fn ax_cpu_features() u64 {
+    return 0;
+}
+
+export fn ax_cpu_count() u32 {
+    // SYSTEM_INFO: dwNumberOfProcessors at 32
+    let mut si: [64]u8 = [0; 64];
+    GetSystemInfo(&mut si[0]);
+    let n = le32(si[..], 32);
+    if n > 0 {
+        return n;
+    }
+    return 1;
+}
+
+export fn ax_sleep_ns(ns: u64) void {
+    let t = rel_timeout(@bit_cast(i64, @min(ns, 0x7fff_ffff_ffff_ff00)));
+    _ = NtDelayExecution(0, &t);
+}
+
+// Fills p[0..n] with cryptographically secure random bytes; 0 on success.
+export fn ax_random(p: *mut u8, n: usize) i32 {
+    let mut done: usize = 0;
+    while done < n {
+        let k = @min(n - done, 1 << 30);
+        // BCRYPT_USE_SYSTEM_PREFERRED_RNG
+        if BCryptGenRandom(0, @ptr_from_int(*mut u8, @int_from_ptr(p) + done), @truncate(u32, k), 2) != 0 {
+            return AX_ERR;
+        }
+        done += k;
+    }
+    return 0;
+}
+
+let mut qpc_freq: i64 = 0;
+
+// Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+export fn ax_clock_ns(clock: u32) i64 {
+    if clock == 1 {
+        if qpc_freq == 0 {
+            let mut f: i64 = 0;
+            _ = QueryPerformanceFrequency(&mut f);
+            @atomic_store(&mut qpc_freq, f);
+        }
+        let f = @atomic_load(&qpc_freq);
+        let mut c: i64 = 0;
+        _ = QueryPerformanceCounter(&mut c);
+        return ((c / f) * 1000000000) + (((c % f) * 1000000000) / f);
+    }
+    let mut ft: u64 = 0;
+    GetSystemTimePreciseAsFileTime(&mut ft);
+    return ft_ns(ft);
+}
+
+// Same results as WebAssembly memory.atomic.wait32: 0 woken, 1 not equal, 2 timed out.
+export fn ax_wait32(p: *mut u32, expected: u32, timeout_ns: i64) i32 {
+    if @atomic_load(p) != expected {
+        return 1;
+    }
+    if timeout_ns == 0 {
+        return 2;
+    }
+    let t = rel_timeout(timeout_ns);
+    let mut tp = &t;
+    if timeout_ns < 0 {
+        tp = @ptr_from_int(*i64, 0);
+    }
+    let e = expected;
+    let r = RtlWaitOnAddress(@ptr_cast(*void, p), @ptr_cast(*void, &e), 4, tp);
+    if r == 0x102 {  // STATUS_TIMEOUT
+        return 2;
+    }
+    return 0;
+}
+
+export fn ax_notify32(p: *mut u32, count: i32) i32 {
+    if count == 0 {
+        return 0;
+    }
+    if count == 1 {
+        RtlWakeAddressSingle(@ptr_cast(*void, p));
+    } else {
+        RtlWakeAddressAll(@ptr_cast(*void, p));
+    }
+    return 1;
+}
+
+// -----------------------------------------------------------------------------
+// Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
+// region reserved at the first use (up to 1 TiB of address space).
+// -----------------------------------------------------------------------------
+let mut mem_base: usize = 0;   // 64 KiB-aligned start of the region
+let mut mem_limit: usize = 0;  // its size in pages
+let mut mem_pages: usize = 0;  // pages handed out
+let mut mem_state: u32 = 0;    // 0: not reserved, 1: reserving, 2: ready, 3: failed
+let mut mem_lock: usize = 0;
+
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_DECOMMIT: u32 = 0x4000;
+const PAGE_NOACCESS: u32 = 1;
+const PAGE_READWRITE: u32 = 4;
+
+fn mem_reserve() void {
+    if @atomic_cas(&mut mem_state, 0, 1) == 0 {
+        let mut size: usize = 1 << 40;
+        while size >= (1 << 28) {
+            let p = VirtualAlloc(0, size, MEM_RESERVE, PAGE_NOACCESS);  // (64 KiB-aligned)
+            if p != 0 {
+                mem_base = p;
+                mem_limit = size / 65536;
+                @atomic_store(&mut mem_state, 2);
+                return;
+            }
+            size /= 2;
+        }
+        @atomic_store(&mut mem_state, 3);
+        return;
+    }
+    while @atomic_load(&mem_state) == 1 {
+        ax_sleep_ns(1000);
+    }
+}
+
+export fn ax_memory_size() isize {
+    if @atomic_load(&mem_state) != 2 {
+        mem_reserve();
+    }
+    return @bit_cast(isize, (mem_base / 65536) + @atomic_load(&mem_pages));
+}
+
+// The previous size in pages (as ax_memory_size counts them), or -1.
+export fn ax_memory_grow(n: isize) isize {
+    if @atomic_load(&mem_state) != 2 {
+        mem_reserve();
+    }
+    if (@atomic_load(&mem_state) != 2) or (n < 0) {
+        return -1;
+    }
+    let k = @bit_cast(usize, n);
+    lock(&mut mem_lock);
+    let old = mem_pages;
+    if k > (mem_limit - old) {
+        unlock(&mut mem_lock);
+        return -1;
+    }
+    if (k > 0) and (VirtualAlloc(mem_base + (old * 65536), k * 65536, MEM_COMMIT, PAGE_READWRITE) == 0) {
+        unlock(&mut mem_lock);
+        return -1;
+    }
+    @atomic_store(&mut mem_pages, old + k);
+    unlock(&mut mem_lock);
+    return @bit_cast(isize, (mem_base / 65536) + old);
+}
+
+// @memory_discard: the whole 64 KiB pages in the range go back to the system
+// and read as zero when next touched.
+export fn ax_memory_discard(addr: usize, len: usize) void {
+    let a = (addr + 65535) & ~@as(usize, 65535);
+    let b = (addr + len) & ~@as(usize, 65535);
+    if a < b {
+        _ = VirtualFree(a, b - a, MEM_DECOMMIT);
+        _ = VirtualAlloc(a, b - a, MEM_COMMIT, PAGE_READWRITE);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Traps and crashes
+// -----------------------------------------------------------------------------
+let mut report: [16384]u8 = [0; 16384];
+
+// Replace the default reports (std/internal/runtime/test_main_windows.ax). The crash
+// hook gets the trap code: 8 for a stack overflow, 5 for a bad access.
+pub let mut trap_hook: fn(*tf.Site, *tf.TrapInfo, *tf.ShadowStack) void = no_hook;
+pub let mut has_trap_hook: bool = false;
+pub let mut crash_hook: fn(u64) void = no_crash_hook;
+pub let mut has_crash_hook: bool = false;
+// Called by code for `axiom profile` builds to write the samples so far.
+pub let mut profile_flush: fn() void = no_flush;
+pub let mut has_profile: bool = false;
+
+fn no_flush() void {}
+
+fn flush_profile() void {
+    if has_profile {
+        profile_flush();
+    }
+}
+
+fn no_hook(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {}
+
+fn no_crash_hook(code: u64) void {}
+
+fn write_all(fd: i32, s: []u8) void {
+    let mut off: usize = 0;
+    while off < s.len {
+        let n = ax_write(fd, &s[off], s.len - off);
+        if n <= 0 {
+            return;
+        }
+        off += @bit_cast(usize, n);
+    }
+}
+
+// Functions of another system's libraries (an extern block naming a macOS framework or dylib)
+// are linked to this, so that a program can support several systems and
+// choose at run time; calling one is a crash with a stack trace.
+export fn ax_unavailable() void {
+    let mut o = tf.fmt(report[..]);
+    o.s("axiom: crash: called a function from another system's library (not available on Windows)\n");
+    let fp = axiom_frame_address().*;  // this function's frame
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, true);
+    tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    write_all(2, o.text());
+    flush_profile();
+    ExitProcess(134);
+}
+
+// Stack traces from frame pointers (trap_format.ax: walk_frames), within
+// the thread's stack.
+fn thread_stack_top() usize {
+    let mut low: usize = 0;
+    let mut high: usize = 0;
+    GetCurrentThreadStackLimits(&mut low, &mut high);
+    return high;
+}
+
+fn shadow_stack() *mut tf.ShadowStack {
+    return @ptr_from_int(*mut tf.ShadowStack, @int_from_ptr(axiom_shadow_stack()));
+}
+
+// From axiom.trap (codegen), with its own frame.
+export fn ax_stack_walk(fp: *void) void {
+    let f = @int_from_ptr(fp);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, true);
+}
+
+// From the exception handler: the frames of the code that faulted (its
+// CONTEXT: Rsp, Rbp, Rip).
+fn stack_walk_context(ctx: usize) void {
+    let tab = axiom_frame_table();
+    if tf.is_null(@ptr_cast(*void, tab)) {
+        return;
+    }
+    let sp = @ptr_from_int(*usize, ctx + 0x98).*;
+    let fp = @ptr_from_int(*usize, ctx + 0xa0).*;
+    let pc = @ptr_from_int(*usize, ctx + 0xf8).*;
+    let mut leaf: usize = 0;
+    if tf.frameless_at(tab, pc) {
+        leaf = @ptr_from_int(*usize, sp).*;
+    }
+    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, true);
+}
+
+// Every trap calls this (see codegen: axiom.trap); the trap instruction
+// after it ends the process (on_exception).
+export fn ax_on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {
+    if has_trap_hook {
+        trap_hook(site, info, ss);
+        return;
+    }
+    let mut o = tf.fmt(report[..]);
+    o.s("axiom: ");
+    tf.format_trap(&mut o, site, info);
+    o.s(" at ");
+    o.s(tf.cstr(site.file));
+    o.c(':');
+    o.u(@as(u64, site.line));
+    o.c(':');
+    o.u(@as(u64, site.col));
+    o.c('\n');
+    tf.format_stack(&mut o, site, ss);
+    write_all(2, o.text());
+    flush_profile();
+}
+
+// Was a fault at addr a stack overflow: an access near the end of the
+// thread's stack?
+fn at_stack_limit(addr: usize) bool {
+    let mut low: usize = 0;
+    let mut high: usize = 0;
+    GetCurrentThreadStackLimits(&mut low, &mut high);
+    let from = low - @min(low, 65536);
+    return (addr >= from) and (addr < (low + 131072));
+}
+
+// This program's image: base to base + SizeOfImage (from its PE header, at
+// startup). The exception handler must not call into the loader (to ask
+// which module an address is in): exceptions are raised and handled inside
+// the loader while it loads DLLs, and calling it back then makes loads fail.
+let mut image_lo: usize = 0;
+let mut image_hi: usize = 0;
+
+fn find_image() void {
+    let base = GetModuleHandleW(@ptr_from_int(*u16, 0));
+    if base == 0 {
+        return;
+    }
+    let pe = base + @as(usize, @ptr_from_int(*u32, base + 0x3c).*);
+    image_lo = base;
+    image_hi = base + @as(usize, @ptr_from_int(*u32, pe + 24 + 56).*);  // OptionalHeader.SizeOfImage
+}
+
+// " (the program +0x...)" for an address in our image: its offset from the
+// image's start, which the linker's layout (or a disassembler) relates to
+// code. Nothing for other addresses.
+fn image_offset(o: *mut tf.Fmt, addr: usize) void {
+    if in_image(addr) {
+        o.s(" (the program +0x");
+        o.hex(@as(u64, addr - image_lo));
+        o.s(")");
+    }
+}
+
+// Is addr in this program's own code (not a DLL's)?
+fn in_image(addr: usize) bool {
+    return (addr >= image_lo) and (addr < image_hi);
+}
+
+// Exceptions in our code that are not Axiom traps (a stack overflow, an
+// access violation, a division fault) are reported with the shadow stack;
+// the process ends with the exception's code, as it would unhandled (but
+// with no error dialog). Stack overflows are ours wherever they happen. The
+// rest, and anything raised in a DLL, goes on to other handlers: DLLs fault
+// on purpose and catch it themselves (probing memory, an instruction), and
+// this handler runs before theirs. What nothing handles reaches on_unhandled.
+fn on_exception(ep: *mut usize) i32 {
+    let rec = @ptr_from_int(*u8, ep.*);
+    let r = @slice_from_ptr(rec, 48);
+    let code = le32(r, 0);
+    let ours = in_image(@truncate(usize, le64(r, 16)));  // ExceptionAddress
+    if reporting and ours {
+        nested_fault(@truncate(usize, le64(r, 16)));
+    }
+    if (code == 0xc000_001d) and ours {
+        // the trap instruction after ax_on_trap's report
+        _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+    let av = code == 0xc000_0005;
+    let so = code == 0xc000_00fd;
+    let div = (code == 0xc000_0094) or (code == 0xc000_0095);
+    if not so and (not ours or (not av and not div)) {
+        return 0;  // EXCEPTION_CONTINUE_SEARCH
+    }
+    let mut addr: usize = 0;
+    if av {
+        addr = @truncate(usize, le64(r, 40));  // ExceptionInformation[1]
+    }
+    let overflow = so or (av and at_stack_limit(addr));
+    stack_walk_context(@ptr_from_int(*usize, @int_from_ptr(ep) + 8).*);
+    if has_crash_hook {
+        if overflow {
+            crash_hook(8);
+        } else {
+            crash_hook(5);
+        }
+        _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+    reporting = true;
+    report_code = code;
+    let mut o = tf.fmt(report[..]);
+    if overflow {
+        o.s("axiom: trap T0008 (stack exhausted)\n");
+        write_all(2, o.text());
+    } else {
+        o.s("axiom: crash: ");
+        if av {
+            o.s("access violation");
+        } else {
+            o.s("arithmetic fault");
+        }
+        o.s(" (address 0x");
+        o.hex(@as(u64, addr));
+        o.s(") at 0x");
+        o.hex(le64(r, 16));  // ExceptionAddress
+        image_offset(&mut o, @truncate(usize, le64(r, 16)));
+        o.c('\n');
+        write_all(2, o.text());  // first, in case what follows fails
+    }
+    let mut more = tf.fmt(report[..]);
+    tf.format_stack(&mut more, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    if not overflow {
+        native_stack(&mut more);
+    }
+    write_all(2, more.text());
+    flush_profile();
+    _ = TerminateProcess(GetCurrentProcess(), code);
+    return 0;
+}
+
+// While reporting a crash (on_exception, on_unhandled): if reporting it
+// faults too, end at once with the first exception's code.
+let mut reporting: bool = false;
+let mut report_code: u32 = 0;
+
+fn nested_fault(at: usize) void {
+    let mut o = tf.fmt(report[..]);
+    o.s("axiom: (and a fault while reporting it, at 0x");
+    o.hex(@as(u64, at));
+    image_offset(&mut o, at);
+    o.s(")\n");
+    write_all(2, o.text());
+    _ = TerminateProcess(GetCurrentProcess(), report_code);
+}
+
+// Any other exception nothing handled: one a DLL raised (a C++ exception, a
+// failed security check) or anything else that would end the process. It
+// is reported with its code and where it was raised, then the process ends
+// with the code, as it would have, but not silently.
+fn on_unhandled(ep: *mut usize) i32 {
+    let rec = @ptr_from_int(*u8, ep.*);
+    let r = @slice_from_ptr(rec, 48);
+    let code = le32(r, 0);
+    if has_crash_hook {
+        crash_hook(5);
+        _ = TerminateProcess(GetCurrentProcess(), code);
+    }
+    if reporting {
+        nested_fault(@truncate(usize, le64(r, 16)));
+    }
+    reporting = true;
+    report_code = code;
+    let mut first = tf.fmt(report[..]);
+    first.s("axiom: crash: unhandled exception 0x");
+    first.hex(@as(u64, code));
+    first.s(" at 0x");
+    first.hex(le64(r, 16));
+    first.c('\n');
+    write_all(2, first.text());  // (in case what follows fails too)
+    let mut o = tf.fmt(report[..]);
+    o.s(" ");
+    where(&mut o, @truncate(usize, le64(r, 16)));
+    if ((code == 0xc06d_007e) or (code == 0xc06d_007f)) and (le32(r, 24) >= 1) {
+        // a DLL loaded on first use was not found (7e), or lacked the
+        // function (7f): ExceptionInformation[0] is the DelayLoadInfo, its
+        // DLL's name at 24
+        let info = @truncate(usize, le64(r, 32));
+        if info != 0 {
+            let name = @ptr_from_int(*usize, info + 24).*;
+            if name != 0 {
+                o.s(" (loading ");
+                o.s(tf.cstr(@ptr_from_int(*u8, name)));
+                o.s(")");
+            }
+        }
+    }
+    o.c('\n');
+    tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
+    native_stack(&mut o);
+    write_all(2, o.text());
+    flush_profile();
+    _ = TerminateProcess(GetCurrentProcess(), code);
+    return 1;  // EXCEPTION_EXECUTE_HANDLER
+}
+
+// The native frames (our code's and the system's, which the shadow stack
+// does not show), innermost first, from where this is called: in an
+// exception handler, through the dispatcher to where it was raised.
+fn native_stack(o: *mut tf.Fmt) void {
+    let mut frames: [48]usize = [0; 48];
+    let n = @as(usize, RtlCaptureStackBackTrace(1, 48, &mut frames[0], @ptr_from_int(*mut u32, 0)));
+    if n == 0 {
+        return;
+    }
+    o.s("native frames (innermost first):\n");
+    for i in 0..n {
+        o.s(" ");
+        where(o, frames[i]);
+        o.c('\n');
+    }
+}
+
+// " at 0x... in module.dll+0x..." for a code address.
+fn where(o: *mut tf.Fmt, addr: usize) void {
+    o.s(" at 0x");
+    o.hex(@as(u64, addr));
+    let mut module: usize = 0;
+    // FROM_ADDRESS | UNCHANGED_REFCOUNT
+    if (addr == 0) or (GetModuleHandleExW(0x6, addr, &mut module) == 0) {
+        return;
+    }
+    let mut w: [260]u16 = [0; 260];
+    let n = @as(usize, GetModuleFileNameW(module, &mut w[0], 260));
+    if (n == 0) or (n >= 260) {
+        return;
+    }
+    let mut start: usize = 0;
+    for i in 0..n {
+        if (w[i] == '\\') or (w[i] == '/') {
+            start = i + 1;
+        }
+    }
+    let mut name: [260]u8 = [0; 260];
+    let k = narrow(&w[start], n - start, name[..], false);
+    if k > name.len {
+        return;
+    }
+    o.s(" in ");
+    o.s(name[0..k]);
+    o.s("+0x");
+    o.hex(@as(u64, addr - module));
+}
+
+// main's arguments come from the command line (main gets none).
+export fn ax_rt_args(argc: i32, argv: *mut *mut u8) void {
+    _ = argc;
+    _ = argv;
+    load_args();
+}
+
+// Runs before main.
+export fn ax_rt_init() void {
+    _ = SetErrorMode(0x8003);  // no error dialogs
+    find_image();
+    _ = AddVectoredExceptionHandler(1, on_exception);
+    _ = SetUnhandledExceptionFilter(on_unhandled);
+    guarantee_stack();
+    // UTF-8 output; terminal escape sequences on consoles
+    _ = SetConsoleOutputCP(CP_UTF8);
+    for fd in @as(i32, 1)..3 {
+        let h = file_handle(fd);
+        let mut m: u32 = 0;
+        if GetConsoleMode(h, &mut m) != 0 {
+            _ = SetConsoleMode(h, m | 0x4);  // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        }
+    }
+}
+
+// Runs after main returns.
+export fn ax_rt_fini() void {
+    flush_profile();
+}

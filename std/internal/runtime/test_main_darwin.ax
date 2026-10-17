@@ -1,0 +1,270 @@
+// =============================================================================
+// std/internal/runtime/test_main_darwin.ax - runs the tests of a native Axiom test binary
+// on macOS. As on Linux (std/internal/runtime/test_main.ax), each test runs in a child
+// process: isolation from traps and crashes, a timeout, and its own captured
+// output. The forked child execs the test binary again
+// (--axiom-test-child=<i> --axiom-result=<fd>): macOS's system services
+// (XPC: the Metal shader compiler, audio, the window server) do not work in
+// a forked process that has not exec'd. Output protocol: see
+// std/internal/runtime/test_runner.mjs; the records and lines are std/internal/runtime/test_report.ax's.
+// Everything goes through libSystem (std/internal/runtime/darwin.ax), whose signal
+// numbers are translated to Linux's for the report.
+// =============================================================================
+import "darwin.ax" as rt;
+import "test_report.ax" as rep;
+import "trap_format.ax" as tf;
+
+extern "C" {
+    fn axiom_test_count() u32;
+    fn axiom_test_name(i: u32) *u8;
+    fn axiom_test_expect(i: u32) i32;
+    fn axiom_test_run(i: u32) u32;
+    fn axiom_test_leaks() u32;
+    fn ax_clock_ns(clock: u32) i64;
+    fn execv(path: *u8, argv: *mut *mut u8) i32;
+    fn _NSGetExecutablePath(buf: *mut u8, size: *mut u32) i32;
+    fn _exit(code: i32) void;
+}
+
+// struct itimerval: two struct timevals (a 64-bit tv_sec, a 32-bit tv_usec
+// padded to 8 bytes)
+struct ITimerVal {
+    interval_sec: i64,
+    interval_usec: i64,
+    value_sec: i64,
+    value_usec: i64,
+}
+
+struct RLimit {
+    cur: u64,
+    max: u64,
+}
+
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const SIGALRM: i32 = 14;  // the same on Darwin and Linux
+const RLIMIT_CORE: i32 = 4;
+const EINTR: i32 = 4;
+const POLLIN: i16 = 1;
+const POLLERR: i16 = 8;
+const POLLHUP: i16 = 16;
+
+let mut result_fd: i32 = -1;
+let mut rec: [32768]u8 = [0; 32768];
+
+fn emit(o: *tf.Fmt) void {
+    if result_fd >= 0 {
+        rt.write_all(result_fd, o.text());
+    }
+}
+
+// Called by the trapping test (in the child) before it dies.
+fn on_trap(site: *tf.Site, info: *tf.TrapInfo, ss: *tf.ShadowStack) void {
+    let mut o = tf.fmt(rec[..]);
+    rep.trap_record(&mut o, site, info, ss);
+    emit(&o);
+}
+
+// Crashes other than traps (stack overflow, faults in C code): the shadow
+// stack is reported; darwin.ax then re-raises the signal.
+fn on_crash(code: u64) void {
+    let mut o = tf.fmt(rec[..]);
+    rep.crash_record(&mut o, code, rt.axiom_shadow_stack());
+    emit(&o);
+}
+
+fn heap(n: usize) usize {
+    return @int_from_ptr(rt.malloc(n));
+}
+
+fn unheap(p: usize, n: usize) void {
+    _ = n;
+    rt.free(@ptr_from_int(*mut void, p));
+}
+
+fn new_buf() rep.Buf {
+    return rep.buf(heap, unheap);
+}
+
+fn errno() i32 {
+    return rt.__error().*;
+}
+
+fn drain(outfd: i32, resfd: i32, out: *mut rep.Buf, res: *mut rep.Buf) void {
+    let mut pf: [2]PollFd = [
+        PollFd.{ fd: outfd, events: POLLIN, revents: 0 }, PollFd.{ fd: resfd, events: POLLIN, revents: 0 }];
+    let mut open_fds: i32 = 2;
+    let mut chunk: [4096]u8 = [0; 4096];
+    while open_fds > 0 {
+        let pr = rt.poll(@ptr_cast(*mut u8, &mut pf[0]), 2, -1);
+        if (pr < 0) and (errno() != EINTR) {
+            break;
+        }
+        for k in @as(usize, 0)..2 {
+            if (pf[k].fd < 0) or ((pf[k].revents & ((POLLIN | POLLHUP) | POLLERR)) == 0) {
+                continue;
+            }
+            let r = rt.read(pf[k].fd, &mut chunk[0], 4096);
+            if r <= 0 {
+                if (r < 0) and (errno() == EINTR) {
+                    continue;
+                }
+                _ = rt.close(pf[k].fd);
+                pf[k].fd = -1;
+                open_fds -= 1;
+                continue;
+            }
+            if k == 0 {
+                rep.buf_add(out, chunk[0..@int_cast(usize, r)]);
+            } else {
+                rep.buf_add(res, chunk[0..@int_cast(usize, r)]);
+            }
+        }
+    }
+}
+
+// Writes the decimal digits of x at buf[at..]; returns the end.
+fn put_dec(buf: []mut u8, at0: usize, x: u64) usize {
+    let mut d: [20]u8 = [0; 20];
+    let mut n: usize = 0;
+    let mut v = x;
+    loop {
+        d[n] = '0' + @truncate(u8, v % 10);
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let mut at = at0;
+    while n > 0 {
+        n -= 1;
+        buf[at] = d[n];
+        at += 1;
+    }
+    return at;
+}
+
+fn put_str(buf: []mut u8, at: usize, s: []u8) usize {
+    @mem_copy(buf[at..at + s.len], s);
+    return at + s.len;
+}
+
+// The test process: runs test i, writing its record to resw.
+fn run_child(i: u32, resw: i32, timeout_ms: i64) void {
+    result_fd = resw;
+    rt.trap_hook = on_trap;
+    rt.has_trap_hook = true;
+    rt.crash_hook = on_crash;
+    rt.has_crash_hook = true;
+    let nocore = RLimit.{ cur: 0, max: 0 };  // a trap or crash ends the child without a core dump
+    _ = rt.setrlimit(RLIMIT_CORE, @ptr_cast(*void, &nocore));
+    let it = ITimerVal.{ interval_sec: 0, interval_usec: 0, value_sec: timeout_ms / 1000,
+                         value_usec: (timeout_ms % 1000) * 1000 };
+    _ = rt.setitimer(0, @ptr_cast(*void, &it), @ptr_from_int(*mut void, 0));  // ITIMER_REAL
+    let code = axiom_test_run(i);
+    let mut o = tf.fmt(rec[..]);
+    rep.done_record(&mut o, code, rt.axiom_shadow_stack(), axiom_test_leaks());
+    emit(&o);
+    rt.exit(0);
+}
+
+export fn ax_test_main(argc: i32, argv: *mut *mut u8) i32 {
+    let mut filter: []u8 = "";
+    let mut timeout_ms: i64 = 10000;
+    let mut child: i64 = -1;
+    let mut resfd: i64 = -1;
+    let args = @slice_from_ptr(argv, @int_cast(usize, argc));
+    for k in 1..args.len {
+        let a = tf.cstr(args[k]);
+        if rep.starts(a, "--filter=") {
+            filter = a[9..];
+        } else if rep.starts(a, "--timeout=") {
+            let mut at: usize = 10;
+            timeout_ms = @bit_cast(i64, rep.num(a, &mut at));
+        } else if rep.starts(a, "--axiom-test-child=") {
+            let mut at: usize = 19;
+            child = @bit_cast(i64, rep.num(a, &mut at));
+        } else if rep.starts(a, "--axiom-result=") {
+            let mut at: usize = 15;
+            resfd = @bit_cast(i64, rep.num(a, &mut at));
+        }
+    }
+    if child >= 0 {
+        run_child(@truncate(u32, @bit_cast(u64, child)), @truncate(i32, resfd), timeout_ms);
+    }
+    let mut exe: [4096]u8 = [0; 4096];
+    let mut exe_size: u32 = 4096;
+    if _NSGetExecutablePath(&mut exe[0], &mut exe_size) != 0 {
+        return 2;
+    }
+    let n = axiom_test_count();
+    for i in 0..n {
+        if (filter.len > 0) and not rep.contains(tf.cstr(axiom_test_name(i)), filter) {
+            continue;
+        }
+        let expect = axiom_test_expect(i);
+        let mut res: [2]i32 = [0, 0];
+        let mut outp: [2]i32 = [0, 0];
+        if (rt.pipe(&mut res[0]) != 0) or (rt.pipe(&mut outp[0]) != 0) {
+            return 2;
+        }
+        let t0 = ax_clock_ns(1);
+        let pid = rt.fork();
+        if pid == 0 {
+            // the child: its output to the pipe, then the test binary again
+            // for test i (only async-signal-safe calls until exec)
+            _ = rt.close(res[0]);
+            _ = rt.close(outp[0]);
+            _ = rt.dup2(outp[1], 1);
+            _ = rt.dup2(outp[1], 2);
+            let mut a1: [64]u8 = [0; 64];
+            let mut e = put_dec(a1[..], put_str(a1[..], 0, "--axiom-test-child="), @as(u64, i));
+            a1[e] = 0;
+            let mut a2: [64]u8 = [0; 64];
+            e = put_dec(a2[..], put_str(a2[..], 0, "--axiom-result="), @as(u64, @bit_cast(u32, res[1])));
+            a2[e] = 0;
+            let mut a3: [64]u8 = [0; 64];
+            e = put_dec(a3[..], put_str(a3[..], 0, "--timeout="), @bit_cast(u64, timeout_ms));
+            a3[e] = 0;
+            let mut av: [5]*mut u8 = [&mut exe[0], &mut a1[0], &mut a2[0], &mut a3[0], @ptr_from_int(*mut u8, 0)];
+            _ = execv(&exe[0], &mut av[0]);
+            _exit(127);
+        }
+        _ = rt.close(res[1]);
+        _ = rt.close(outp[1]);
+        if pid < 0 {
+            _ = rt.close(res[0]);
+            _ = rt.close(outp[0]);
+            return 2;
+        }
+        let mut outb = new_buf();
+        let mut resb = new_buf();
+        drain(outp[0], res[0], &mut outb, &mut resb);
+        let mut status: i32 = 0;
+        while (rt.waitpid(pid, &mut status, 0) < 0) and (errno() == EINTR) {}
+        let ms = @float_from_int(f64, ax_clock_ns(1) - t0) / 1e6;
+
+        let signaled = ((status & 0x7f) != 0) and ((status & 0x7f) != 0x7f);
+        let sig = status & 0x7f;
+        let mut how = rep.ENDED;
+        let mut code = status;
+        if signaled and (sig == SIGALRM) {
+            how = rep.TIMEOUT;
+        } else if signaled {
+            how = rep.SIGNALED;
+            code = rt.abi_sig(sig);
+        }
+        let mut line = new_buf();
+        rep.report(&mut line, i, expect, rep.buf_text(&resb), rep.buf_text(&outb), how, code, ms, timeout_ms);
+        rt.write_all(1, rep.buf_text(&line));
+        rep.buf_free(&mut line);
+        rep.buf_free(&mut outb);
+        rep.buf_free(&mut resb);
+    }
+    return 0;
+}
