@@ -1403,8 +1403,8 @@ static void add_str_fn_attr(LLVMValueRef fn, const char *k, const char *v) {
 // LLVM 18 takes gathers as fast on every AVX-512 processor and vectorizes
 // loops of table loads with them, but Skylake-SP to Tiger Lake run them in
 // microcode (the Gather Data Sampling mitigation, which a guest cannot see):
-// 25-31 cycles a gather against about one a load. the benchmark's move generation
-// hashes its board with twelve (issue 0091). LLVM itself marks no processor
+// 25-31 cycles a gather against about one a load: a Zobrist hash of twelve
+// table loads becomes slower vectorized than scalar (issue 0091). LLVM itself marks no processor
 // so, not even LLVM 21 (rustc 1.94 with target-cpu=cascadelake still gathers
 // in an indexed loop, and only +prefer-no-gather stops it); its newer cost
 // model merely keeps that hash scalar. So the processors with the
