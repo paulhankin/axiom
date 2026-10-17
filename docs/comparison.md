@@ -203,7 +203,8 @@ they are not part of the language's meaning.
 - **Zig** is also explicit, but threads allocator values through every API instead of
   having a global one: flexible (arenas, fixed buffers, testing allocators), at the cost
   of an extra parameter on everything that allocates. Zig has `errdefer`; Axiom does
-  not yet (it is an open question in Appendix D).
+  not yet (it is an open question in the spec's
+  [Appendix C](spec.md#appendix-c-open-questions)).
 - **Rust** ties resources to ownership. `Drop` runs automatically at the end of a scope,
   which removes leaks and double frees but makes some calls invisible. Most standard
   containers use the global allocator (allocator parameters are still unstable).

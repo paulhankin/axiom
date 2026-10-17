@@ -2,9 +2,8 @@
 
 **Version:** 0.1-draft.9
 **File extension:** `.ax`
-**Status:** Working draft. Everything here may change. Decisions that differ from the
-original design notes are listed in [Appendix C](#appendix-c-changes-from-the-design-notes),
-and unresolved questions are in [Appendix D](#appendix-d-open-questions).
+**Status:** Working draft. Everything here may change. Unresolved questions are in
+[Appendix C](#appendix-c-open-questions).
 
 ---
 
@@ -31,8 +30,7 @@ and unresolved questions are in [Appendix D](#appendix-d-open-questions).
 18. [Complete Example](#18-complete-example)
 - [Appendix A: Builtin Functions](#appendix-a-builtin-functions)
 - [Appendix B: Trap Conditions](#appendix-b-trap-conditions)
-- [Appendix C: Changes from the Design Notes](#appendix-c-changes-from-the-design-notes)
-- [Appendix D: Open Questions](#appendix-d-open-questions)
+- [Appendix C: Open Questions](#appendix-c-open-questions)
 
 ---
 
@@ -501,7 +499,7 @@ cycle between their modules is still `E0210`.
   run; its dependencies' tests don't (§17).
 - Modules, not packages, are the unit of compilation, and they are compiled and cached
   separately (§16.7). Generics monomorphize across packages as they do within one.
-  Distributing precompiled packages is future work (Appendix D).
+  Distributing precompiled packages is future work (Appendix C).
 
 ---
 
@@ -818,6 +816,9 @@ The left-hand side of an assignment must be a mutable place (`E0701`).
 | Logical-**and** | `and` | bool | short-circuit |
 | Logical-**or** | `or` | bool | short-circuit |
 
+The logical operators are the keywords `and`, `or` and `not`. That leaves `!` to error
+propagation (`e!`) and error-union types (`!T`), with no lexical ambiguity between them.
+
 Both operands of a binary operator must have the **same type**, after literal typing
 (`E0412` otherwise). Axiom has no implicit widening, and mixed `u32 + u64` is an error.
 
@@ -868,7 +869,7 @@ If neither holds, the program is rejected with `E0150`.
 | `x & mask == 0` | `(x & mask) == 0`. Unlike C, `&` binds tighter than `==`, so the classic C bug cannot occur |
 | `a << 2 + 1` | **E0150**: `<<` and `+` are unordered |
 | `a or b == c` | `a or (b == c)` |
-| `a and b or c` | **E0150**: `and` and `or` are unordered (Appendix D, Q2) |
+| `a and b or c` | **E0150**: `and` and `or` are unordered (Appendix C, Q2) |
 | `a < b == c` | **E0150** |
 
 Unary operators bind tighter than all binary operators. Postfix operators bind tighter
@@ -919,7 +920,7 @@ In every mode, the `%`-suffixed operators, the `@atomic_*` arithmetic and intege
 arithmetic (§13.1) wrap, and the `_sat` and `_checked` builtins behave as their names say.
 The overflow mode is the **only** way build configuration can change a program's meaning,
 and only for a program whose arithmetic overflows. Optimization level (`-O0`…`-O3`) MUST
-NOT change observable behavior. (See Appendix D, Q1, and Appendix C, C43.)
+NOT change observable behavior. (See Appendix C, Q1.)
 
 **Division.** `/` truncates toward zero. `%` gives a result with the sign of the dividend,
 so `a == (a / b) * b + (a % b)` (with wrapping arithmetic, this holds for `MIN / -1` too).
@@ -1349,7 +1350,7 @@ argument a caller chose. This is a key property for agents: the error is always 
 the line the agent wrote.
 
 v0.1 has a closed set of builtin constraints. User-defined constraints are future work
-(Appendix D).
+(Appendix C).
 
 | Constraint | Satisfied by | Additionally permits on values of `T` |
 |---|---|---|
@@ -1516,6 +1517,11 @@ The allocator takes memory from the system with `@memory_grow` and can give it b
 `@memory_discard` (Appendix A). Code that calls `@memory_grow` itself gets pages the
 allocator never touches.
 
+There is one allocator rather than an allocator parameter on every container and every
+function that allocates. Such a parameter spreads through every API, and choosing among
+allocators is a decision agents get wrong more often than they gain from it. Allocation
+still stays explicit: it is always a call, never a language construct.
+
 ### 12.5 Alignment
 
 Alignment affects **layout only**. Misaligned loads and stores are defined, as in
@@ -1555,7 +1561,7 @@ This section defines shared-memory concurrency. The design follows from three fa
 |---|---|---|
 | 1 | **Threads are a library, not syntax.** `std/thread` creates threads through the host ABI (§12.8.5). The language adds only atomic builtins. | Matches WebAssembly, where thread creation is a host operation. Keeps the language small. |
 | 2 | **A data race is not undefined behavior.** A read that races with a write returns, for each byte, a value some store wrote to that byte. Tearing is permitted (§12.8.2). | Keeps the zero-UB rule without a borrow checker or `Send`/`Sync` traits. This is WebAssembly's memory model, applied everywhere, just as §12.1 applies WebAssembly's bounds model. A race, like a dangling pointer, is a logic bug with a defined outcome. |
-| 3 | **Only sequentially consistent atomics.** There are no memory-order parameters. | Every WebAssembly atomic is sequentially consistent. SC is the model people and agents reason about correctly, and weaker orderings are a common source of subtle bugs. The cost is some performance on weakly ordered native CPUs. Relaxed orderings may come later (Appendix D). |
+| 3 | **Only sequentially consistent atomics.** There are no memory-order parameters. | Every WebAssembly atomic is sequentially consistent. SC is the model people and agents reason about correctly, and weaker orderings are a common source of subtle bugs. The cost is some performance on weakly ordered native CPUs. Relaxed orderings may come later (Appendix C). |
 | 4 | **Atomics are builtins on pointers to integers** (`@atomic_add(&mut x, 1)`), not special types. | Any integer in memory can be accessed atomically, as in WebAssembly. `std/sync.Atomic[T]` wraps them for convenience. |
 | 5 | **`wait`/`notify` operate on 32-bit integers only.** | Linux futexes, the native implementation, are 32-bit, and WebAssembly has `wait32`. 64-bit waiting would behave differently on different targets. |
 | 6 | **No `async`/`await`, no coroutines.** | An `await` is a suspension point that looks like an ordinary expression, which is hidden control flow. Blocking calls on threads are explicit. |
@@ -2756,7 +2762,7 @@ precise location.
 
 ## 18. Complete Example
 
-`examples/dot_product/dot_product.ax`, the design-notes example updated to this specification:
+`examples/dot_product/dot_product.ax`:
 
 ```axiom
 // =============================================================================
@@ -2830,6 +2836,11 @@ export fn compute(length: usize) f32 {
 ---
 
 ## Appendix A: Builtin Functions
+
+Builtins are how Axiom reaches what other languages leave to inline assembly. There is no
+inline assembly, nor inline WebAssembly: an escape hatch into one instruction set weakens
+every guarantee around it and has to be translated on every other target, while a builtin
+is portable and type-checked.
 
 In the table, `T` and `V` denote **type** arguments. `S` denotes any integer type and `F`
 any float type. `Vec` denotes any SIMD type. A **const** argument must be a constant
@@ -2966,68 +2977,12 @@ Nothing else traps, and nothing is undefined.
 
 ---
 
-## Appendix C: Changes from the Design Notes
-
-These are the places where this draft departs from, or tightens, the original design notes.
-Each change was made to resolve an inconsistency or to make a principle enforceable.
-
-| # | Change | Reason |
-|---|---|---|
-| C1 | Struct literals are written `T.{ … }` and `.{ … }`, not `T { … }` | `IDENT {` is not LL(1) after `if`/`while`/`match` conditions |
-| C2 | Operator precedence is a **partial order**. Mixing unordered operators needs parentheses (§7.4) | The notes say both "no precedence ambiguity" and use a flat `PrimaryExpr (BinaryOp PrimaryExpr)*`. The notes' own code (`aligned + size > len`, `i < chunks * 4`) needs *some* precedence. The partial order gives the unambiguous cases and rejects the rest |
-| C3 | Logical operators are the keywords `and`/`or`/`not` | Frees `!` for error propagation (`e!`) and error-union types (`!T`) without lexical ambiguity |
-| C4 | Assignment and expression statements are merged into one production | `AssignStmt` and `ExprStmt` share a FIRST set, so they are not LL(1) as written |
-| C5 | Return types are mandatory (`void` for none) | One canonical form. The notes' examples already wrote `void` |
-| C6 | Function-pointer types list parameter types only: `fn(*mut void, usize) T` | `fn(ctx: …)` needs two-token lookahead to tell `name:` from a type name |
-| C7 | The notes' inline WebAssembly (`wasm { … }` blocks) is not part of the language | Builtins (Appendix A) cover what it was used for (`@clz`, SIMD), portably and type-checked; an escape hatch into another instruction set weakens every guarantee around it, and every target but one had to translate it |
-| C8 | `@load_unaligned(f32x4, &a[i])` became `@load(f32x4, a[i..i + 4])` | The original only bounds-checked element `i` and then read 16 bytes, which is a bounds-check hole. Alignment is not semantic (§12.5), so `_unaligned` is redundant |
-| C9 | `arena.allocator().alloc(u32, 1024)` became `arena.allocator().alloc.[u32](1024)` | Type arguments are written `.[…]` (§10.3). A type passed as an ordinary argument would need types to be parseable as expressions |
-| C10 | `&mut HEAP_BYTES` passed as a slice became `HEAP_BYTES[..]` | Array-pointer-to-slice would be an implicit conversion |
-| C11 | `pub` (module visibility) and `export` (WASM export) are distinct. Top-level `let`/`let mut` globals and `error { }` declarations were added to the grammar | The notes used these without grammar support |
-| C12 | Integer SIMD vectors require `+%`/`-%`/`*%`. Bare `+` is float-only. *Superseded by C43*: `+`, `-`, `*` wrap on integer vectors | Keeps §7.6 consistent. Lane-wise overflow trapping is impractical |
-| C13 | Raw pointers are fully defined through the linear-memory model (§12) | "Zero UB" and "raw pointers" conflict unless memory itself has defined semantics. WASM's model provides this, and it is adopted on all targets |
-| C14 | The notes' arena-centric memory (no global allocator; every allocation names an `Allocator`; `Arena`, `FixedBuffer`, `page_allocator`) was replaced by one global allocator, `std/mem` (§12.4, §15.1) | An allocator parameter on every container and every function that allocates spread through all APIs, and choosing among allocators was a decision agents got wrong more often than they gained from it. Allocation stays explicit: a call, never a language construct |
-| C14 | Error names must be declared (`error { … }`) | Prevents typos in `error.X` from silently creating new errors |
-| C15 | Added `for`, `loop`, compound assignment, `_ =` discards, and a no-shadowing rule | Needed by the notes' examples, or by the agent-ergonomics goal |
-| C16 | The diagnostic `suggested_fix.confidence` float became `fixes[].applicability` (an enum) plus byte-range `edits` | A float confidence is hard to act on. Byte-range edits can be applied mechanically |
-| C17 | Horizontal float reductions have a fixed association order: folding the halves (§13.2). Until issue 0028 the order was pairwise over neighbours, `(l0 + l1) + (l2 + l3)`; the change alters float results of `@reduce_add` and `@dot` by rounding | Determinism across WASM and native. Folding the halves is the order of x86's reductions and most SIMD code, and the cheapest one with wide registers |
-| C18 | Shift counts are **not** clamped. `x << k` and `x >> k` have their mathematical meaning for every `k`, so `k ≥ width` gives `0` or sign fill | Design review, draft 2. `x << 40` has a clear meaning, and clamping it to `x << 31` would be surprising |
-| C19 | Added monomorphized generics with builtin constraints (§10) | Design review, draft 2 |
-| C20 | The language was briefly renamed Phalange (source files `.ph`); it is Axiom again, with the extension `.ax` | Design review, draft 2; the original name was preferred |
-| C21 | Float literals round to the nearest value of their target type (formerly open question Q5) | The spec's own examples (`3.14159265` as `f32`) need it; found while implementing the compiler |
-| C22 | For `!void`, a `catch` block may complete normally ("handle and continue") | Found while writing the standard library: without it, `f() catch \|e\| { log(e); }` could not be written |
-| C23 | Shared-memory threads (library-level), a race-tolerant memory model, and sequentially consistent atomic builtins (§12.8) | The user asked for threads and concurrency. §12.8.1 gives the reasoning |
-| C24 | Function pointers are allowed across the export/import boundary | Needed by `ax_thread_spawn`. On WebAssembly they are table indices |
-| C25 | C FFI: `extern "C"` blocks with varargs and libraries; `export fn` is C-callable; generated headers (§14.5) | The user asked for a C FFI in both directions |
-| C26 | A NUL byte follows every string literal (not part of the slice) | Found while testing the FFI: passing `"%s".ptr` to C read past the end of the literal |
-| C27 | `test` blocks, `@expect`/`@expect_eq`, `axiom test`, and trap site records (§16.4, §17) | The user asked for testing support (formerly open question Q11) |
-| C28 | Packages: `axiom.toml`, `pkg:` imports, path and pinned-git dependencies, one source per name (§4.6) | The user asked for packages |
-| C29 | Stack traces from a per-thread shadow stack, and error return traces (§16.4) | The user asked for stack traces on crashes. Engine stack walking is neither portable nor source-exact |
-| C30 | `axiom profile`: a sampling profiler over the shadow stack (§16.6) | The user asked for profiling support |
-| C31 | Separate compilation of modules with a content-addressed object cache. Error codes are resolved at link time (§16.7) | The user asked for independent compilation units |
-| C32 | Enums: distinct types over an integer representation, with members, methods, exhaustive `match`, `==`/`!=` and checked conversions (§5.14); `enum` is no longer reserved | The standard library passed alignments, modes and kinds as bare `u8`/`u32` constants, which any integer could be confused with |
-| C33 | Thread-local globals: `threadlocal let mut` (§12.8.6). This replaces the earlier "no thread-local storage" decision | The user asked for thread-locals. WebAssembly needed a per-instance block, set up by the thread start export |
-| C34 | Processor extensions in the language: target conditions (`@target_has`, `@target_arch`, `@target_os`) that select what is compiled, `@cpu_has`, and functions compiled for more extensions (`@features`, `@multiversion`) (§13.4) | Issue 0015: wider instruction sets need a way to choose between a fast path and a portable one, at build time or at run time. The dead branch is still type-checked, so it cannot rot unnoticed |
-| C35 | 256- and 512-bit vector types (`f32x8`, `i32x16`, `v512`, ...), with every operator and builtin of the 128-bit ones; passed in memory between functions (§5.8, §13.3) | Issue 0015: AVX2 and AVX-512 process 32 and 64 bytes at a time. On narrower targets the compiler splits them, so code written for the wide types is portable |
-| C36 | Builtins for the processors' cryptographic instructions: AES, carry-less multiplication, SHA-1, SHA-256, SHA-512, SHA-3 and CRC (`@x86_*`, `@arm_*`, §13.5) | Issue 0016: AES-GCM, SHA-2 and CRC run several times faster with them, and std chooses them at run time with `@multiversion` |
-| C37 | Vectors gained per-lane shift counts, lane-wise `@clz`/`@ctz`/`@popcount` and int/float conversions, `@swizzle` of any lane type and `@swizzle2`, and `@load_partial`/`@store_partial` (§13.1, §13.2) | Issues 0024 to 0027, from writing AVX-512 kernels: each is one instruction on x86 (and mostly on Arm and WebAssembly), and without them such kernels had to fall back to scalar code |
-| C38 | `inline fn`: functions that are always inlined, never recursive, whose calls record no stack-trace site unless a trap or call needs it (§9.5). `inline` is a keyword only before `fn` | Issue 0032: Axiom has no macros, and code ported from Rust's `macro_rules!` and `#[inline(always)]` became calls (with the shadow-stack record making them look bigger to LLVM's inliner) |
-| C39 | `@widen_low`, `@widen_high` and `@narrow` are specified (§13.2: lane types decide the sign, the result type of `@narrow` is given) and implemented; until then Appendix A listed them "per WASM" but no compiler had them. `@as(T, b)` converts a `bool` to any integer type (§6.2) | Issue 0035. Branch-free counting (`n += @as(u32, x > 0)`, Rust's `b as i32`) needed a helper function. `@as`, not a new builtin: the conversion is lossless and names its type |
-| C40 | `-g` / `--debug-info=lines`: DWARF line tables (§16.1) | Issue 0034: native profilers and debuggers could not map code back to Axiom source, and after inlining one symbol holds many functions |
-| C41 | `@ptr_add(p, n)` and `@ptr_sub(p, n)`: pointers moved by whole elements, which the program promises stay inside their object (§5.7). This is the one unchecked promise beside C13's defined memory: breaking it gives unspecified addresses, not a trap | Issue 0038: `@ptr_from_int(*T, @int_from_ptr(p) + 16)` is either an overflow check per access (`+`) or, wrapping (`+%`), an address WebAssembly cannot fold into the load's offset. Kernels reading rows of weights ran 1.15–1.25x slower than the same code in Rust with `p.add(n)`. `@ptr_sub` because walking back from an end pointer is as common; no signed variant, since the name gives the direction and `n` stays `usize` like every length |
-| C42 | Native x86-64 Linux builds of the C compiler find stack-trace frames by walking frame pointers, through a table from return addresses to call-site records, instead of a shadow stack written on every call (§16.4.1). Profile and sanitizer builds, WebAssembly and the self-hosted compiler keep the shadow stack | Issue 0037: the stores cost 15% in a recursive move generator, and about double the time of a recursive Fibonacci. Traces are on by default, so their cost should be nothing on the hot path |
-| C43 | Integer overflow **wraps** in every build mode by default: `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs(MIN)` compute modulo 2ⁿ (§7.6). Trapping (`T0002`) is the opt-in `--overflow=trap`; `--overflow=saturate` stays; `--release` no longer changes semantics. Integer vectors take `+`, `-`, `*` and unary `-` (wrapping). `+%`, `-%`, `*%` stay, as explicit spellings. Constant evaluation keeps `E0530` | Issue 0047, the owner's decision on Appendix D, Q1 (option (c)). Checks were the largest remaining cost of compute-heavy code against the same code in Rust's release build: a move generator's core function had 85 branches and 30 trap sites in WebAssembly where Rust's has 40 and 13, programs sprinkled `+%`/`*%` through hot paths, and the checks kept LLVM from vectorizing reductions (issue 0029). Bounds checks keep memory safe whatever an index computation does |
-| C44 | `@prefetch(p)`: a cache hint with no semantics, which never traps (§5.7) | Issue 0041: an evaluator that prefetches the cache bucket of each item of a batch before evaluating it (`_mm_prefetch` in C) had no way to say so. One form (read, all cache levels): the one such code needs, and what `_mm_prefetch(.., _MM_HINT_T0)` and Rust's `prefetch_read_data(p, 3)` mean |
-| C45 | `@prefetch_write(p)`: the cache hint for memory about to be written (§5.7); the x86-64 extension `prfchw` (`prefetchw`, §13.4) | Issue 0093: a cache that prefetches each bucket of a batch, then locks and updates it, asks for the lines with `_MM_HINT_ET0` (`prefetchw`, Arm `prfm pstl1keep`), so a later write needs no second coherence transaction. A separate builtin rather than a second argument to `@prefetch`: every builtin has a fixed arity and no options argument (the atomics, `@widen_low`/`@widen_high`, the `_last` AES rounds are separate names), and a constant selector would be one more thing to check |
-
----
-
-## Appendix D: Open Questions
+## Appendix C: Open Questions
 
 Each question is followed by the options and the current leaning.
 
 1. **Integer overflow.** *Resolved* (2026-10-04, issue 0047): option (c). Overflow wraps
-   in every build mode (§7.6, Appendix C, C43); `--overflow=trap` remains as an opt-in
+   in every build mode (§7.6); `--overflow=trap` remains as an opt-in
    debugging mode and `--overflow=saturate` as before. The options were:
 
    | Option | Pros | Cons |
@@ -3058,7 +3013,7 @@ Each question is followed by the options and the current leaning.
 4. **Error sets.** A single program-wide error set is simple, but it does not let a function
    say *which* errors it can return. Consider `fn f() FileError!T` with an inferred or
    declared set, and exhaustive `match` over it.
-5. ~~**Float literal exactness.**~~ Resolved: float literals round to nearest (§6.1, C21).
+5. ~~**Float literal exactness.**~~ Resolved: float literals round to nearest (§6.1).
 6. **`errdefer`.** Useful for cleaning up partial allocations when a function fails.
    *Leaning:* add it.
 7. **User-defined constraints.** v0.1 constraints are a closed builtin set (§10.5). Generic
