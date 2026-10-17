@@ -2657,6 +2657,57 @@ static LLVMValueRef const_lanes(LLVMTypeRef lane, unsigned n, unsigned long long
 // in i32, which wraps only for (-32768 * -32768) * 2, as both instructions
 // do. NULL where there is none (other architectures, or odd widths), for
 // the generic IR. Pieces of the operands, then the pieces of the result joined.
+// @dot of byte lanes: each i32 lane the sum of four products, x's bytes unsigned when `ux`
+// (by y's signed: x86 VNNI's vpdpbusd where the target has it), else both signed; otherwise
+// widened (LLVM may still pick a dot-product instruction).
+static LLVMValueRef dot_i8(LLVMValueRef x, LLVMValueRef y, unsigned nl, bool ux) {
+    unsigned no = nl / 4;
+    if (ux && g_arch == ARCH_X64 && !g_target.wasm) {
+        // vpdpbusd on each register's worth (a power of two of them), the results concatenated
+        bool vl = (g_features & feature_bit("avxvnni")) ||
+                  ((g_features & feature_bit("avx512vnni")) && (g_features & feature_bit("avx512vl")));
+        unsigned per = 0;  // bytes per instruction
+        const char *name = NULL;
+        if (nl >= 64 && (g_features & feature_bit("avx512vnni"))) per = 64, name = "llvm.x86.avx512.vpdpbusd.512";
+        else if (nl >= 32 && vl) per = 32, name = "llvm.x86.avx512.vpdpbusd.256";
+        else if (nl >= 16 && vl) per = 16, name = "llvm.x86.avx512.vpdpbusd.128";
+        if (name && nl % per == 0 && !((nl / per) & (nl / per - 1))) {
+            unsigned np = nl / per;
+            LLVMTypeRef it = LLVMVectorType(T_i32, per / 4);
+            LLVMValueRef *ps = NEWN(LLVMValueRef, np), *m = NEWN(LLVMValueRef, nl);
+            for (unsigned k = 0; k < np; k++) {
+                LLVMValueRef a = x, b = y;
+                if (np > 1) {
+                    for (unsigned i = 0; i < per; i++) m[i] = LLVMConstInt(T_i32, k * per + i, false);
+                    LLVMValueRef mask = LLVMConstVector(m, per);
+                    a = LLVMBuildShuffleVector(B, x, LLVMGetUndef(LLVMTypeOf(x)), mask, "");
+                    b = LLVMBuildShuffleVector(B, y, LLVMGetUndef(LLVMTypeOf(y)), mask, "");
+                }
+                LLVMValueRef args[3] = {LLVMConstNull(it), LLVMBuildBitCast(B, a, it, ""), LLVMBuildBitCast(B, b, it, "")};
+                ps[k] = intrinsic(name, NULL, 0, args, 3);
+            }
+            for (unsigned w = per / 4; np > 1; np /= 2, w *= 2) {
+                for (unsigned i = 0; i < 2 * w; i++) m[i] = LLVMConstInt(T_i32, i, false);
+                for (unsigned k = 0; k < np / 2; k++)
+                    ps[k] = LLVMBuildShuffleVector(B, ps[2 * k], ps[2 * k + 1], LLVMConstVector(m, 2 * w), "");
+            }
+            return ps[0];
+        }
+    }
+    // widened: the products of the bytes extended to i32, then each four summed
+    LLVMTypeRef w = LLVMVectorType(T_i32, nl);
+    LLVMValueRef xe = ux ? LLVMBuildZExt(B, x, w, "") : LLVMBuildSExt(B, x, w, "");
+    LLVMValueRef p = LLVMBuildMul(B, xe, LLVMBuildSExt(B, y, w, ""), "");
+    LLVMValueRef r = NULL;
+    LLVMValueRef *m = NEWN(LLVMValueRef, no);
+    for (unsigned j = 0; j < 4; j++) {
+        for (unsigned i = 0; i < no; i++) m[i] = LLVMConstInt(T_i32, 4 * i + j, false);
+        LLVMValueRef q = LLVMBuildShuffleVector(B, p, LLVMGetUndef(w), LLVMConstVector(m, no), "");
+        r = r ? LLVMBuildAdd(B, r, q, "") : q;
+    }
+    return r;
+}
+
 static LLVMValueRef dot_i16_native(LLVMValueRef x, LLVMValueRef y, unsigned nl) {
     unsigned per;  // i16 lanes per instruction
     const char *name;
@@ -3328,6 +3379,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef x = gen(a[0].e), y = gen(a[1].e);
         if (vt->elem->kind == TY_FLOAT) return reduce_add(vt, LLVMBuildFMul(B, x, y, ""));
         unsigned nl = (unsigned)vt->lanes;
+        if (vt->elem->bits == 8) return dot_i8(x, y, nl, !vt->elem->is_signed);
         LLVMValueRef d = dot_i16_native(x, y, nl);
         if (d) return d;
         LLVMTypeRef w = LLVMVectorType(T_i32, nl);

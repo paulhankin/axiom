@@ -759,11 +759,45 @@ Type *builtin_check(Expr *e, Type *expected) {
         return e->type = t->elem;
     }
     case BI_DOT: {
-        Type *t = pair(e, NULL);
-        if (t->kind == TY_INVALID) return e->type = t_invalid;
+        // u8 lanes by i8 lanes: each i32 lane the sum of four products, the first operand's
+        // bytes unsigned (x86's VNNI vpdpbusd)
+        Type *a0 = check_expr(*earg(e, 0), NULL);
+        if (a0->kind == TY_VEC && a0->elem == t_u8) {
+            Type *b0 = check_expr(*earg(e, 1), type_vec(t_i8, a0->lanes));
+            if (ty_is_untyped(b0)) {
+                coerce(earg(e, 1), type_vec(t_i8, a0->lanes));
+                b0 = type_vec(t_i8, a0->lanes);
+            }
+            if (b0->kind == TY_INVALID) return e->type = t_invalid;
+            if (b0->kind != TY_VEC || b0->elem != t_i8 || b0->lanes != a0->lanes || a0->lanes % 4) {
+                diag_error(e->span, "E0812", "@dot of u8 lanes requires i8 lanes as many (a multiple of 4), found %s and %s",
+                           type_str(a0), type_str(b0));
+                return e->type = t_invalid;
+            }
+            return e->type = type_vec(t_i32, a0->lanes / 4);
+        }
+        Type *b0 = check_expr(*earg(e, 1), ty_is_untyped(a0) ? NULL : a0);
+        Type *t = a0;
+        if (ty_is_untyped(a0) && !ty_is_untyped(b0)) {
+            coerce(earg(e, 0), b0);
+            t = b0;
+        } else if (ty_is_untyped(b0) && !ty_is_untyped(a0)) {
+            coerce(earg(e, 1), a0);
+        } else if (ty_is_untyped(a0) && ty_is_untyped(b0)) {
+            finalize_untyped(earg(e, 0));
+            return e->type = t_invalid;
+        } else if (a0 != b0 && a0->kind != TY_INVALID && b0->kind != TY_INVALID) {
+            Diag *d = diag_error(e->span, "E0412", "@%s operands have different types: %s and %s", e->name, type_str(a0),
+                                 type_str(b0));
+            diag_types(d, type_str(a0), type_str(b0));
+            return e->type = t_invalid;
+        }
+        if (t->kind == TY_INVALID || b0->kind == TY_INVALID) return e->type = t_invalid;
         if (ty_is_vec_float(t)) return e->type = t->elem;
         if (t->kind == TY_VEC && t->elem == t_i16) return e->type = type_vec(t_i32, t->lanes / 2);
-        diag_error(e->span, "E0812", "@dot requires float vectors or i16 lanes, found %s", type_str(t));
+        // i8 lanes: each i32 lane the sum of four signed products (Arm's SDOT)
+        if (t->kind == TY_VEC && t->elem == t_i8 && t->lanes % 4 == 0) return e->type = type_vec(t_i32, t->lanes / 4);
+        diag_error(e->span, "E0812", "@dot requires float vectors, i16 or i8 lanes, or u8 by i8 lanes, found %s", type_str(t));
         return e->type = t_invalid;
     }
     case BI_WIDEN_LOW:

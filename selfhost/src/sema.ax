@@ -3261,6 +3261,32 @@ fn pair(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     return a;
 }
 
+/// `pair` with the first operand already checked as `a` (without an expected type).
+fn pair_checked(e: *mut ast.Expr, a0: *mut ast.Type) *mut ast.Type {
+    let mut a = a0;
+    let mut h2 = a;
+    if ty.is_untyped(a) {
+        h2 = tnil();
+    }
+    let mut b = check_expr(barg(e, 1), h2);
+    if ty.is_untyped(a) and not ty.is_untyped(b) {
+        coerce(earg(e, 0), b);
+        a = b;
+    } else if ty.is_untyped(b) and not ty.is_untyped(a) {
+        coerce(earg(e, 1), a);
+        b = a;
+    } else if ty.is_untyped(a) and ty.is_untyped(b) {
+        _ = finalize_untyped(earg(e, 0));
+        return ty.t_invalid;
+    }
+    if (a != b) and (a.kind != ast.TY_INVALID) and (b.kind != ast.TY_INVALID) {
+        let d = dg.err(e.span, "E0412", u.f3("@%s operands have different types: %s and %s", e.name, tstr(a), tstr(b)));
+        dg.set_types(d, tstr(a), tstr(b));
+        return ty.t_invalid;
+    }
+    return a;
+}
+
 fn mask_type(v: *mut ast.Type) *mut ast.Type {
     if v.kind != ast.TY_VEC {
         return ty.t_invalid;
@@ -4069,7 +4095,27 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
         return set_ty(e, t.elem);
     }
     if id == ast.BI_DOT {
-        let t = pair(e, tnil());
+        // u8 lanes by i8 lanes: each i32 lane the sum of four products, the first operand's
+        // bytes unsigned (x86's VNNI vpdpbusd)
+        let a0 = check_expr(barg(e, 0), tnil());
+        if (a0.kind == ast.TY_VEC) and (a0.elem == ty.t_u8) {
+            let want = ty.type_vec(ty.t_i8, a0.lanes);
+            let mut b0 = check_expr(barg(e, 1), want);
+            if ty.is_untyped(b0) {
+                coerce(earg(e, 1), want);
+                b0 = want;
+            }
+            if b0.kind == ast.TY_INVALID {
+                return set_ty(e, ty.t_invalid);
+            }
+            if (b0.kind != ast.TY_VEC) or (b0.elem != ty.t_i8) or (b0.lanes != a0.lanes) or ((a0.lanes % 4) != 0) {
+                _ = dg.err(e.span, "E0812",
+                           u.f2("@dot of u8 lanes requires i8 lanes as many (a multiple of 4), found %s and %s", tstr(a0), tstr(b0)));
+                return set_ty(e, ty.t_invalid);
+            }
+            return set_ty(e, ty.type_vec(ty.t_i32, a0.lanes / 4));
+        }
+        let t = pair_checked(e, a0);
         if t.kind == ast.TY_INVALID {
             return set_ty(e, ty.t_invalid);
         }
@@ -4083,7 +4129,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
             return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 4));
         }
         _ = dg.err(e.span, "E0812",
-                   u.f1("@dot requires float vectors, i16 lanes or i8 lanes (a multiple of 4), found %s", tstr(t)));
+                   u.f1("@dot requires float vectors, i16 lanes, i8 lanes or u8 by i8 lanes (a multiple of 4), found %s", tstr(t)));
         return set_ty(e, ty.t_invalid);
     }
     if (id == ast.BI_WIDEN_LOW) or (id == ast.BI_WIDEN_HIGH) {
