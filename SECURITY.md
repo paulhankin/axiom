@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-Axiom is a v0.1 draft with no releases yet. Only the current `main` branch is
-supported: fixes land there, and nothing is backported.
+Fixes land on `main`, and the latest release (`0.N.M`) gets them in a fix release
+from its `release-0.N` branch (see [`docs/releasing.md`](docs/releasing.md)). Older
+releases are not supported.
 
 ## Reporting a vulnerability
 

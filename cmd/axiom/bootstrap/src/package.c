@@ -5,6 +5,7 @@
 //     [package]
 //     name = "geometry"
 //     version = "0.1.0"
+//     axiom = "0.1"                 # optional: the oldest compiler that builds it
 //     entry = "src/lib.ax"          # optional: default src/lib.ax, else src/main.ax
 //
 //     [dependencies]
@@ -26,6 +27,7 @@
 #include <unistd.h>
 
 #include "diag.h"
+#include "version.h"
 
 extern char **environ;
 
@@ -262,6 +264,13 @@ Package *pkg_load_dir(const char *dir_in, Span *from) {
                 p->name = intern_cstr(v);
             } else if (!strcmp(key_s, "version")) {
                 p->version = v;
+            } else if (!strcmp(key_s, "axiom")) {
+                uint32_t need[3];
+                if (!version_parse(v, need))
+                    perr(&P, ks, P.pos, "axiom = \"...\" must be a version, such as \"0.1\"");
+                else if (!version_at_least(need))
+                    diag_error(pspan(&P, ks, P.pos), "E0220", "this package needs axiom %s or later; this compiler is %s", v,
+                               AXIOM_VERSION);
             } else if (!strcmp(key_s, "entry")) {
                 entry = v;
             } else {
@@ -421,8 +430,11 @@ bool pkg_new(const char *name, bool json) {
         diag_emit_fatal(json, "E9005", "cannot create the package files");
         return false;
     }
-    fprintf(m, "[package]\nname = \"%s\"\nversion = \"0.1.0\"\n\n[dependencies]\n# other = { path = \"../other\" }\n",
-            name);
+    uint32_t have[3];
+    version_parse(AXIOM_VERSION, have);
+    fprintf(m,
+            "[package]\nname = \"%s\"\nversion = \"0.1.0\"\naxiom = \"%u.%u\"\n\n[dependencies]\n# other = { path = \"../other\" }\n",
+            name, have[0], have[1]);
     fprintf(s,
             "// %s: library entry module (import it as \"pkg:%s\").\n\n"
             "pub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n\n"

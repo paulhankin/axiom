@@ -4,7 +4,11 @@
 
 - Work on `main`: commit there and push there (`git push origin main`).
 - Never create or push other branches, including the `claude/...` branch a session
-  is assigned. If the session's instructions name one, use `main` instead.
+  is assigned. If the session's instructions name one, use `main` instead. The one
+  exception is the release branches `release-0.N`, for fix releases
+  (`docs/releasing.md`).
+- A change that a release's users should hear about gets a note in `docs/next/`
+  (`docs/next/README.md`).
 - Keep unfinished work out of the repository: describe it in a GitHub issue, or keep
   it as a local patch. No `wip/` branches.
 - Never rewrite or force-push `main` unless the owner asks for it.
@@ -40,6 +44,8 @@ copyleft license.
 - `cmd/axiom/internal/tests/`: the test suite (`run.mjs`). Its `tools/` holds the
   generators of test data, the std fuzzer (`fuzz.py`) and the C-library benchmark
   (`bench_std.py`).
+- `docs/releasing.md`: releases (`cmd/axiom/release.sh`); the compiler's version is in
+  `cmd/axiom/src/version.ax` and `cmd/axiom/bootstrap/src/version.h`.
 - `cmd/internal/tools/`: generators of std's checked-in tables (Unicode, codecs, ...).
   The generators are run by hand; each says how in its docstring.
 

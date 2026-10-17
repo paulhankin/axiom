@@ -30,6 +30,7 @@
 #include "units.h"
 #include "sema.h"
 #include "target.h"
+#include "version.h"
 
 const char *LLVMGetDefaultTargetTriple_wrapper(void);
 const char *LLVMGetHostCPUFeatures_wrapper(void);
@@ -667,6 +668,10 @@ int main(int argc, char **argv) {
             return 2;
         }
         printf("%s\n", dir);
+        return 0;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "version")) {
+        printf("axiom %s (bootstrap compiler)\n", AXIOM_VERSION);
         return 0;
     }
     if (argc >= 2 && !strcmp(argv[1], "new")) {

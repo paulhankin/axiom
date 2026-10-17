@@ -445,7 +445,8 @@ is accepted.
 ```toml
 [package]
 name = "geometry"          # required: lower-case letters, digits and '_', not starting with a digit
-version = "0.1.0"          # optional; informational in v0.1
+version = "0.1.0"          # optional; informational
+axiom = "0.1"              # optional: the oldest compiler that builds the package
 entry = "src/lib.ax"       # optional; default src/lib.ax if it exists, otherwise src/main.ax
 
 [dependencies]
@@ -455,6 +456,9 @@ json = { git = "https://example.com/json.git", rev = "3f1c2a9d0e5b7c4a8f6e2d1b0c
 
 - An unknown section, an unknown key, a malformed line, an invalid name, or a duplicate
   dependency is `E0215`.
+- `axiom` names the oldest compiler version that builds the package (`a`, `a.b` or
+  `a.b.c`; a value that is not a version is `E0215`). A compiler older than that
+  (`axiom version`) refuses the package with `E0220`.
 - A dependency's key is the name it is imported by. It MUST equal the `name` in the
   dependency's own manifest (`E0215`). Packages can't be renamed on import.
 - A **path** dependency is a directory, relative to the manifest's directory. A missing
@@ -2352,6 +2356,7 @@ Initial registry, not exhaustive:
 | E0217 | Package directory or manifest missing |
 | E0218 | Import path absolute or containing `\` |
 | E0219 | Import of an `internal` module from outside its parent's tree (§4.1) |
+| E0220 | A package needs a newer compiler (`axiom` in its manifest, §4.6) |
 | E0410 | Struct literal fields missing or out of order |
 | E0413 | `undefined` initializer on an immutable `let` |
 | E0414 | `undefined` initializer without a type annotation |

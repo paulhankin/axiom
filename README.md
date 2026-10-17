@@ -47,6 +47,7 @@ Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` from Homebrew, with
 |---|---|
 | [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
+| [`docs/releasing.md`](docs/releasing.md) | How releases are made, versioned and packaged; their notes are in [`docs/releases/`](docs/releases) |
 | [`docs/security.md`](docs/security.md) | How the standard library behaves on untrusted input: its rules, defences and checks |
 | [`cmd/axiom/`](cmd/axiom/README.md) | The compiler, written in Axiom: its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers; no LLVM, no C toolchain |
 | [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 with LLVM, used only to bootstrap the one above (to a fixed point) |

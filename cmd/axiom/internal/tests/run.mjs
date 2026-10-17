@@ -847,7 +847,11 @@ if (!skipPlatform) {
     'package name conflict': async () => (errorCodes(path.join(pk, 'errors/conflict')).includes('E0213') ? null : 'no E0213'),
     'invalid manifest': async () => {
       const c = errorCodes(path.join(pk, 'errors/badmanifest'));
-      return c.length === 3 && c.every((x) => x === 'E0215') ? null : c.join();
+      return c.length === 4 && c.every((x) => x === 'E0215') ? null : c.join();
+    },
+    'a package that needs a newer compiler': async () => {
+      const c = errorCodes(path.join(pk, 'errors/newer'));
+      return c.length === 1 && c[0] === 'E0220' ? null : c.join();
     },
     'git dependency': async () => {
       const repo = path.join(tmp, 'gitutil');
