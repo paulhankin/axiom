@@ -13,43 +13,65 @@ WebAssembly. Its design mandate is:
 ## Quick start
 
 ```
-cmd/axiom/bootstrap.sh                # build the compiler (needs llvm-18-dev and lld, for the bootstrap)
+cmd/axiom/bootstrap.sh                       # build the compiler (the bootstrap needs llvm-18-dev and lld)
 export PATH=$PWD/cmd/axiom/build:$PATH
-axiom build examples/dot_product.ax -O2 -o engine.wasm
-node std/internal/runtime/host.mjs engine.wasm     # run a program (calls its `main` export)
+
 axiom build examples/wordcount.ax --target=native -O2 -o wc
-axiom test mylib.ax                # run a file's `test` blocks
-axiom new geometry                 # a package: axiom.toml + src/lib.ax (spec §4.6)
-axiom test geometry                # build/check/test also take a package directory
-axiom profile prog.ax              # sampling profiler: hot functions, call sites, flame graph input
-axiom build prog.ax --sanitize=address   # trap on use after free, double free, overflows; report leaks
-axiom build prog.ax --target=native -O2 -g   # DWARF line tables, for perf annotate, gdb, addr2line -i
-axiom build app --verbose          # modules compile separately and are cached (spec §16.7)
+axiom build examples/dot_product.ax -O2 -o engine.wasm
+node std/internal/runtime/host.mjs engine.wasm   # run a WebAssembly program (calls its `main` export)
 axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
-axiom fmt src/                     # canonical layout, imports tidied (spec §16.5)
-node cmd/axiom/internal/tests/run.mjs                    # run the test suite
+
+axiom test mylib.ax                          # run a file's `test` blocks
+axiom new geometry                           # a package: axiom.toml + src/lib.ax (spec §4.6)
+axiom test geometry                          # build, check and test also take a package directory
+axiom fmt src/                               # canonical layout, imports tidied (spec §16.5)
+axiom profile prog.ax                        # sampling profiler: hot functions, call sites, flame graphs
+axiom build prog.ax --sanitize=address       # trap on use after free, double free, overflows; report leaks
+axiom build prog.ax --target=native -O2 -g   # DWARF line tables, for perf, gdb, addr2line
+axiom build app --verbose                    # modules compile separately and are cached (spec §16.7)
+
+node cmd/axiom/internal/tests/run.mjs        # the test suite
 ```
 
-The compiler (`cmd/axiom/build/axiom`) is written in Axiom and has its own backends for
-WebAssembly, x86-64 and AArch64 and its own linkers: it needs only the C library.
-It builds native programs for Linux, Windows and macOS (Apple silicon, where it also
-runs, tests and profiles them, and links system frameworks: AppKit, Metal, Core Audio).
-On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
+The compiler is written in Axiom and has its own backends (WebAssembly, x86-64, AArch64)
+and linkers, so it and the programs it builds need only the C library. It builds native
+programs for Linux, Windows and macOS on Apple silicon (where it also runs, tests and
+profiles them, and links system frameworks such as AppKit, Metal and Core Audio). On a
+Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` from Homebrew, with
 `llvm-config` on the `PATH`.
 
-## Contents
+## Repository
 
 | Path | What |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | Language specification (v0.1 working draft) |
+| [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft). [Appendix C](docs/spec.md#appendix-c-changes-from-the-design-notes) lists the decisions that differ from the original design notes, [Appendix D](docs/spec.md#appendix-d-open-questions) the open questions |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/security.md`](docs/security.md) | A security review of the standard library: findings, fixes and what is open |
 | [`docs/performance.md`](docs/performance.md) | A performance review of the standard library, with comparisons to C libraries |
-| [Issues](https://github.com/paulhankin/axiom/issues) | Known bugs and feature requests, on GitHub. Four-digit issue numbers in the code ("issue 0047") refer to the issues/ directory this replaced (in the git history) |
+| [`cmd/axiom/`](cmd/axiom/README.md) | The compiler, written in Axiom: its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers; no LLVM, no C toolchain |
+| [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 with LLVM, used only to bootstrap the one above (to a fixed point) |
+| [`cmd/axiom/internal/tests/`](cmd/axiom/internal/tests/run.mjs) | The test suite: run-and-compare programs, expected compile errors, `axiom test`, packages; its `tools/` generates test data and holds the std fuzzer and benchmark |
+| [`cmd/internal/tools/`](cmd/internal/tools) | Generators of the standard library's checked-in tables (Unicode, codecs, fonts) |
+| [`std/`](std/README.md) | The standard library. Standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |
+| [`std/internal/runtime/`](std/internal/runtime/host.mjs) | The runtime: the host ABI for node (`host.mjs`, also a runner), Linux (`native.ax`, `linux.ax`, no libc), macOS (`darwin.ax`) and Windows (`windows.ax`); test runners; the profiler |
+| [`examples/`](examples) | Example programs and packages (below) |
+| [`tools/`](tools/editors/vscode/README.md) | Editor support: a VS Code extension (highlighting, and diagnostics and navigation through `axiom lsp`) |
+
+Known bugs and feature requests are [GitHub issues](https://github.com/paulhankin/axiom/issues).
+Four-digit issue numbers in the code ("issue 0047") refer to the `issues/` directory they
+replaced, in the git history.
+
+## Examples
+
+| Path | What |
+|---|---|
 | [`examples/dot_product.ax`](examples/dot_product.ax) | SIMD dot product with the global allocator and WASM exports |
 | [`examples/shapes.ax`](examples/shapes.ax) | Tagged unions, `match`, errors |
 | [`examples/generics.ax`](examples/generics.ax) | Generic functions and types, constraints, const parameters |
 | [`examples/c_interop/`](examples/c_interop/stats.ax) | An Axiom library called from C through a generated header |
+| [`examples/wordcount.ax`](examples/wordcount.ax) | Word frequencies of stdin, for WebAssembly or native |
+| [`examples/http_server.ax`](examples/http_server.ax) | A small JSON API over HTTP (std/net/http): notes listed, added, read and deleted |
+| [`examples/texmath.ax`](examples/texmath.ax) | TeX math typeset as SVG, PNG or PDF with a math font, or as MathML or Unicode text |
 | [`examples/pi.ax`](examples/pi.ax) | π to 2000 places (Machin's formula in big integers) on an A4 PDF page with typeset mathematics |
 | [`examples/charts.ax`](examples/charts.ax) | Bar, line, scatter, stacked-area and donut charts (std/graphics/chart) drawn as one PNG, one SVG and a four-page PDF |
 | [`examples/md2pdf.ax`](examples/md2pdf.ax) | Markdown to PDF (std/text/markdown/pdf): headings in the outline, lists, tables, code, links, TeX math and images |
@@ -61,14 +83,3 @@ On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 | [`examples/drumkin/`](examples/drumkin/src/main.ax) | A drum machine on macOS (a package): eight drums of FM and noise through a morphing state-variable filter and ADSR envelopes, two settings of each blended between, a 16-step sequencer with swing and accents, knobs drawn with Quartz over Metal, sound through Core Audio from a thread of its own |
 | [`examples/pdfview/`](examples/pdfview/src/main.ax) | A PDF viewer on macOS (a package): continuous scrolling, a thumbnail sidebar, zoom from 10% to 800% that stays sharp (the part of a page in the window drawn again at full detail), rotated pages; Core Graphics draws the pages, the window is Quartz over Metal |
 | [`examples/pinball/`](examples/pinball/README.md) | A pinball table in 3D on macOS (a package): the ball's physics at 2400 steps a second (spin, friction, rolling; solenoid flippers with inertia), a ramp onto a six-wire habitrail, bumpers, slingshots, drop and standup targets, a spinner, an orbit, a lock and three-ball multiball; Metal with PBR shading, HDR, bloom, shadows and a chrome ball reflecting the playfield; a dot-matrix display; synthesized sound |
-| [`cmd/axiom/`](cmd/axiom/README.md) | The compiler, written in Axiom, with its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers: no LLVM, no C toolchain |
-| [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 + LLVM, used only to bootstrap the one in `cmd/axiom/` (to a fixed point) |
-| [`std/`](std/README.md) | Standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |
-| [`std/internal/runtime/`](std/internal/runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ax` and `linux.ax`, libc-free, for the self-hosted compiler; `darwin.ax` for macOS (Apple silicon), `windows.ax` for Windows; `native_host.c` for the C one); test runners; the profiler |
-| [`cmd/axiom/internal/tests/`](cmd/axiom/internal/tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `axiom test`, packages |
-| [`tools/`](tools/editors/vscode/README.md) | Editor support: a VS Code extension (syntax highlighting, and diagnostics and navigation through `axiom lsp`) |
-
-The spec's [Appendix C](docs/spec.md#appendix-c-changes-from-the-design-notes) lists the
-decisions that differ from the original design notes.
-[Appendix D](docs/spec.md#appendix-d-open-questions) lists open questions for the next
-iteration.
