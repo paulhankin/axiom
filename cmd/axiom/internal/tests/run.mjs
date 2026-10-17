@@ -524,7 +524,7 @@ if (!skipPlatform) {
   const out = (n) => path.join(tmp, 'macos-' + n);
   const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=aarch64-macos', '-o', out(n), ...extra],
     { encoding: 'utf8', cwd: root, env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'macos-cache') } });
-  const supported = !/unknown target/.test(build(path.join(root, 'examples/wordcount.ax'), 'probe').stderr);
+  const supported = !/unknown target/.test(build(path.join(root, 'examples/wordcount/wordcount.ax'), 'probe').stderr);
   const check = (src, n, extra) => {
     const c = build(src, n, extra);
     if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
@@ -544,7 +544,7 @@ if (!skipPlatform) {
     },
     'examples': () => {
       for (const e of ['wordcount', 'http_server', 'texmath']) {
-        const p = check(path.join(root, `examples/${e}.ax`), e);
+        const p = check(path.join(root, `examples/${e}/${e}.ax`), e);
         if (p) return `${e}: ${p}`;
       }
       return null;
@@ -575,7 +575,7 @@ if (!skipPlatform) {
     },
     'examples on Metal: metal, game, trench, swarm': () => {
       for (const e of ['metal', 'game', 'trench', 'swarm']) {
-        const p = check(path.join(root, `examples/${e}.ax`), e, ['-O2']);
+        const p = check(path.join(root, `examples/${e}/${e}.ax`), e, ['-O2']);
         if (p) return `${e}: ${p}`;
         if (!onMac) continue;
         // a frame offscreen (the games play a while by themselves first)
@@ -613,7 +613,7 @@ if (!skipPlatform) {
   const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'windows-cache'), WINEDEBUG: process.env.WINEDEBUG || '-all' };
   const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=x86_64-windows', '-o', out(n), ...extra],
     { encoding: 'utf8', cwd: root, env });
-  const supported = !/unknown target/.test(build(path.join(root, 'examples/wordcount.ax'), 'probe').stderr);
+  const supported = !/unknown target/.test(build(path.join(root, 'examples/wordcount/wordcount.ax'), 'probe').stderr);
   const wine = ['wine64', 'wine', '/usr/lib/wine/wine64'].find((w) => spawnSync(w, ['--version'], { encoding: 'utf8' }).status === 0);
   // The headers: MZ, PE, x86-64, a console program with ASLR, and its sections.
   const checkPE = (f) => {
@@ -668,7 +668,7 @@ if (!skipPlatform) {
       return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
     'debug symbols (a PDB)': () => {
-      const c = build(path.join(root, 'examples/pi.ax'), 'pdb', ['-O2']);
+      const c = build(path.join(root, 'examples/pi/pi.ax'), 'pdb', ['-O2']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
       const exe = fs.readFileSync(out('pdb'));
       const pdbFile = out('pdb').replace(/\.exe$/, '.pdb');
@@ -703,10 +703,10 @@ if (!skipPlatform) {
       if (p.readUInt32LE(info + 8) !== exe.readUInt32LE(rsds + 20)) return 'the ages differ';
       // the functions' names are in it (the publics), and their files (/names)
       const text = p.toString('latin1');
-      return text.includes('examples/pi.pi_digits') && /examples[\\/]pi\.ax/.test(text) ? null : 'names or files missing';
+      return text.includes('examples/pi/pi.pi_digits') && /examples[\\/]pi[\\/]pi\.ax/.test(text) ? null : 'names or files missing';
     },
     'pi to 2000 places': () => {
-      const c = build(path.join(root, 'examples/pi.ax'), 'pi', ['-O2']);
+      const c = build(path.join(root, 'examples/pi/pi.ax'), 'pi', ['-O2']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
       const p = checkPE(out('pi'));
       if (p || !wine) return p;
@@ -716,7 +716,7 @@ if (!skipPlatform) {
       return fs.readFileSync(path.join(tmp, 'windows-pi.pdf')).subarray(0, 5).toString() === '%PDF-' ? null : 'no PDF';
     },
     'Direct3D 11 and Direct2D': () => {
-      const c = build(path.join(root, 'examples/directx.ax'), 'directx', ['-O2']);
+      const c = build(path.join(root, 'examples/directx/directx.ax'), 'directx', ['-O2']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
       const p = checkPE(out('directx'));
       if (p || !wine || !xvfb) return p;
@@ -739,7 +739,7 @@ if (!skipPlatform) {
       return white > 40 ? null : `caption text: ${white} white pixels`;
     },
     'Direct3D 12, XInput and XAudio2': () => {
-      const c = build(path.join(root, 'examples/game.ax'), 'game', ['-O2']);
+      const c = build(path.join(root, 'examples/game/game.ax'), 'game', ['-O2']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
       const p = checkPE(out('game'));
       // under Wine, Direct3D 12 is vkd3d over Vulkan (Mesa's lavapipe will do)
@@ -788,7 +788,7 @@ if (!skipPlatform) {
       const p = checkPE(out('axiom'));
       if (p || !wine) return p;
       // it builds a program that runs
-      const b = run('axiom', ['build', 'examples/wordcount.ax', '--std=std', '--target=x86_64-windows', '-o', out('wc')]);
+      const b = run('axiom', ['build', 'examples/wordcount/wordcount.ax', '--std=std', '--target=x86_64-windows', '-o', out('wc')]);
       if (b.status !== 0) return `the Windows compiler failed: ${b.stdout}${b.stderr}`;
       const r = run('wc', ['README.md']);
       return r.status === 0 ? null : `wordcount: status ${r.status}: ${r.stdout}${r.stderr}`;

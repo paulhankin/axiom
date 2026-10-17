@@ -2756,7 +2756,7 @@ precise location.
 
 ## 18. Complete Example
 
-`examples/dot_product.ax`, the design-notes example updated to this specification:
+`examples/dot_product/dot_product.ax`, the design-notes example updated to this specification:
 
 ```axiom
 // =============================================================================

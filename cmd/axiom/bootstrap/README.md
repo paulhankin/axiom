@@ -12,8 +12,8 @@ with either compiler. `cmd/axiom/difftest.sh` compares them.
 
 ```
 $ make -C cmd/axiom/bootstrap
-$ cmd/axiom/bootstrap/build/axiom build examples/dot_product.ax -O2 -o engine.wasm
-$ cmd/axiom/bootstrap/build/axiom check examples/shapes.ax --format=agent-json
+$ cmd/axiom/bootstrap/build/axiom build examples/dot_product/dot_product.ax -O2 -o engine.wasm
+$ cmd/axiom/bootstrap/build/axiom check examples/shapes/shapes.ax --format=agent-json
 ```
 
 ## Requirements

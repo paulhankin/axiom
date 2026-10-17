@@ -16,8 +16,8 @@ WebAssembly. Its design mandate is:
 cmd/axiom/bootstrap.sh                       # build the compiler (the bootstrap needs llvm-18-dev and lld)
 export PATH=$PWD/cmd/axiom/build:$PATH
 
-axiom build examples/wordcount.ax --target=native -O2 -o wc
-axiom build examples/dot_product.ax -O2 -o engine.wasm
+axiom build examples/wordcount/wordcount.ax --target=native -O2 -o wc
+axiom build examples/dot_product/dot_product.ax -O2 -o engine.wasm
 node std/internal/runtime/host.mjs engine.wasm   # run a WebAssembly program (calls its `main` export)
 axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
 
@@ -65,21 +65,21 @@ replaced, in the git history.
 
 | Path | What |
 |---|---|
-| [`examples/dot_product.ax`](examples/dot_product.ax) | SIMD dot product with the global allocator and WASM exports |
-| [`examples/shapes.ax`](examples/shapes.ax) | Tagged unions, `match`, errors |
-| [`examples/generics.ax`](examples/generics.ax) | Generic functions and types, constraints, const parameters |
+| [`examples/dot_product/dot_product.ax`](examples/dot_product/dot_product.ax) | SIMD dot product with the global allocator and WASM exports |
+| [`examples/shapes/shapes.ax`](examples/shapes/shapes.ax) | Tagged unions, `match`, errors |
+| [`examples/generics/generics.ax`](examples/generics/generics.ax) | Generic functions and types, constraints, const parameters |
 | [`examples/c_interop/`](examples/c_interop/stats.ax) | An Axiom library called from C through a generated header |
-| [`examples/wordcount.ax`](examples/wordcount.ax) | Word frequencies of stdin, for WebAssembly or native |
-| [`examples/http_server.ax`](examples/http_server.ax) | A small JSON API over HTTP (std/net/http): notes listed, added, read and deleted |
-| [`examples/texmath.ax`](examples/texmath.ax) | TeX math typeset as SVG, PNG or PDF with a math font, or as MathML or Unicode text |
-| [`examples/pi.ax`](examples/pi.ax) | π to 2000 places (Machin's formula in big integers) on an A4 PDF page with typeset mathematics |
-| [`examples/charts.ax`](examples/charts.ax) | Bar, line, scatter, stacked-area and donut charts (std/graphics/chart) drawn as one PNG, one SVG and a four-page PDF |
-| [`examples/md2pdf.ax`](examples/md2pdf.ax) | Markdown to PDF (std/text/markdown/pdf): headings in the outline, lists, tables, code, links, TeX math and images |
-| [`examples/metal.ax`](examples/metal.ax) | Metal on macOS: a window with a spinning triangle drawn by MSL shaders and a Core Text caption (std/os/cocoa, std/graphics/metal, std/graphics/quartz) |
-| [`examples/directx.ax`](examples/directx.ax) | Direct3D 11 on Windows: a window with a spinning triangle drawn by HLSL shaders and a Direct2D caption (std/os/win32, std/graphics/d3d11, std/graphics/d2d) |
-| [`examples/game.ax`](examples/game.ax) | A small game on Windows and macOS: Direct3D 12 or Metal graphics, keyboard and controllers (with rumble), sound effects and music (std/graphics/gpu, std/os/window, std/os/gamepad, std/audio/output) |
-| [`examples/trench.ax`](examples/trench.ax) | A trench run in 3D on Windows and macOS, after the vector arcade games of the early 1980s: Direct3D 12 or Metal with a depth buffer, culling, additive glows, sun shadows from a shadow map and dynamic point lights, surfaces textured in the pixel shader, an autopilot |
-| [`examples/swarm.ax`](examples/swarm.ax) | A 3D formation shooter on Windows and macOS in which everything is made of small cubes: voxel aliens with flashing lights, anything destroyed breaking into its cubes, shadows and point lights from shots and explosions, screen shake; one vertex buffer of cubes written in place each frame |
+| [`examples/wordcount/wordcount.ax`](examples/wordcount/wordcount.ax) | Word frequencies of stdin, for WebAssembly or native |
+| [`examples/http_server/http_server.ax`](examples/http_server/http_server.ax) | A small JSON API over HTTP (std/net/http): notes listed, added, read and deleted |
+| [`examples/texmath/texmath.ax`](examples/texmath/texmath.ax) | TeX math typeset as SVG, PNG or PDF with a math font, or as MathML or Unicode text |
+| [`examples/pi/pi.ax`](examples/pi/pi.ax) | π to 2000 places (Machin's formula in big integers) on an A4 PDF page with typeset mathematics |
+| [`examples/charts/charts.ax`](examples/charts/charts.ax) | Bar, line, scatter, stacked-area and donut charts (std/graphics/chart) drawn as one PNG, one SVG and a four-page PDF |
+| [`examples/md2pdf/md2pdf.ax`](examples/md2pdf/md2pdf.ax) | Markdown to PDF (std/text/markdown/pdf): headings in the outline, lists, tables, code, links, TeX math and images |
+| [`examples/metal/metal.ax`](examples/metal/metal.ax) | Metal on macOS: a window with a spinning triangle drawn by MSL shaders and a Core Text caption (std/os/cocoa, std/graphics/metal, std/graphics/quartz) |
+| [`examples/directx/directx.ax`](examples/directx/directx.ax) | Direct3D 11 on Windows: a window with a spinning triangle drawn by HLSL shaders and a Direct2D caption (std/os/win32, std/graphics/d3d11, std/graphics/d2d) |
+| [`examples/game/game.ax`](examples/game/game.ax) | A small game on Windows and macOS: Direct3D 12 or Metal graphics, keyboard and controllers (with rumble), sound effects and music (std/graphics/gpu, std/os/window, std/os/gamepad, std/audio/output) |
+| [`examples/trench/trench.ax`](examples/trench/trench.ax) | A trench run in 3D on Windows and macOS, after the vector arcade games of the early 1980s: Direct3D 12 or Metal with a depth buffer, culling, additive glows, sun shadows from a shadow map and dynamic point lights, surfaces textured in the pixel shader, an autopilot |
+| [`examples/swarm/swarm.ax`](examples/swarm/swarm.ax) | A 3D formation shooter on Windows and macOS in which everything is made of small cubes: voxel aliens with flashing lights, anything destroyed breaking into its cubes, shadows and point lights from shots and explosions, screen shake; one vertex buffer of cubes written in place each frame |
 | [`examples/drumkin/`](examples/drumkin/src/main.ax) | A drum machine on macOS (a package): eight drums of FM and noise through a morphing state-variable filter and ADSR envelopes, two settings of each blended between, a 16-step sequencer with swing and accents, knobs drawn with Quartz over Metal, sound through Core Audio from a thread of its own |
 | [`examples/pdfview/`](examples/pdfview/src/main.ax) | A PDF viewer on macOS (a package): continuous scrolling, a thumbnail sidebar, zoom from 10% to 800% that stays sharp (the part of a page in the window drawn again at full detail), rotated pages; Core Graphics draws the pages, the window is Quartz over Metal |
 | [`examples/pinball/`](examples/pinball/README.md) | A pinball table in 3D on macOS (a package): the ball's physics at 2400 steps a second (spin, friction, rolling; solenoid flippers with inertia), a ramp onto a six-wire habitrail, bumpers, slingshots, drop and standup targets, a spinner, an orbit, a lock and three-ball multiball; Metal with PBR shading, HDR, bloom, shadows and a chrome ball reflecting the playfield; a dot-matrix display; synthesized sound |
