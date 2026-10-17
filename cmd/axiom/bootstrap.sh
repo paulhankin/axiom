@@ -32,7 +32,7 @@ stage() {
 make -C cmd/axiom/bootstrap --no-print-directory
 mkdir -p $B
 if [ "$(uname -s)" = Darwin ]; then
-    # The C compiler does not build native Mac programs (issues/0013), but it
+    # The C compiler does not build native Mac programs (issue 0013), but it
     # builds WebAssembly: stage 1 is the self-hosted compiler for wasm32,
     # run under node, building itself for the Mac (by name: under node it
     # cannot tell that it is on one).

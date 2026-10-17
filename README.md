@@ -45,7 +45,7 @@ On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/security.md`](docs/security.md) | A security review of the standard library: findings, fixes and what is open |
 | [`docs/performance.md`](docs/performance.md) | A performance review of the standard library, with comparisons to C libraries |
-| [`issues/`](issues/README.md) | Known bugs and feature requests, one file each |
+| [Issues](https://github.com/paulhankin/axiom/issues) | Known bugs and feature requests, on GitHub. Four-digit issue numbers in the code ("issue 0047") refer to the issues/ directory this replaced, which is in [the history](https://github.com/paulhankin/axiom/tree/0289be3/issues) |
 | [`examples/dot_product.ax`](examples/dot_product.ax) | SIMD dot product with the global allocator and WASM exports |
 | [`examples/shapes.ax`](examples/shapes.ax) | Tagged unions, `match`, errors |
 | [`examples/generics.ax`](examples/generics.ax) | Generic functions and types, constraints, const parameters |
