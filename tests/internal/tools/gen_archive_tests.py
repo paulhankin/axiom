@@ -41,7 +41,7 @@ for name, method, z64 in [('stored', zipfile.ZIP_STORED, False), ('deflated', zi
     buf = io.BytesIO()
     lines = []
     with zipfile.ZipFile(buf, 'w', compression=method) as z:
-        z.comment = b'made by tools/gen_archive_tests.py'
+        z.comment = b'made by tests/internal/tools/gen_archive_tests.py'
         di = zipfile.ZipInfo('dir/', date_time=time.gmtime(MTIME)[:6])
         di.external_attr = (0o40755 << 16) | 0x10
         z.writestr(di, b'')
