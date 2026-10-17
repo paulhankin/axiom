@@ -86,7 +86,7 @@ about 60-90 ns summed over the kernels.
 
 ## Resolution
 
-Fixed in 0dd4738 and b18d0de. `selfhost/src/unroll.ax` unrolls, after inlining
+Fixed in 0dd4738 and b18d0de. `cmd/axiom/src/unroll.ax` unrolls, after inlining
 (`passes.ax`, the last per-function phase, before loop splitting), every loop whose header
 tests its induction variable against a constant: the trip count is found by simulating the
 variable (start a constant on every way in, the same step on every back edge), and the loop

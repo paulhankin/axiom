@@ -17,7 +17,7 @@ hardware help:
 - **CRC32** (`std/hash/crc.ax`): table-driven.
 
 The compiler has no intrinsics for these instructions. The CPU features it
-knows (selfhost/src/target.ax) do not include them.
+knows (cmd/axiom/src/target.ax) do not include them.
 
 ## Wanted
 

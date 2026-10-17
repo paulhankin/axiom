@@ -5,11 +5,11 @@
 - Area: compiler (selfhost)
 
 ```
-$ selfhost/build/axiom check selfhost/src/main.ax --target=wasm32
-selfhost/src/gvn.ax:2701:17: error[E0512]: @bit_cast size mismatch: i64 is 8 bytes, usize is 4 bytes
+$ cmd/axiom/build/axiom check cmd/axiom/src/main.ax --target=wasm32
+cmd/axiom/src/gvn.ax:2701:17: error[E0512]: @bit_cast size mismatch: i64 is 8 bytes, usize is 4 bytes
     uses.at(@bit_cast(usize, o.aux)).push(x);
-selfhost/src/gvn.ax:2751:43: error[E0512]: ...
-selfhost/src/wlink.ax:213:24: error[E0512]: ...
+cmd/axiom/src/gvn.ax:2751:43: error[E0512]: ...
+cmd/axiom/src/wlink.ax:213:24: error[E0512]: ...
 ```
 
 The compiler assumes 64-bit `usize` in a few places (`@bit_cast` between
@@ -35,7 +35,7 @@ compilation uses to compile modules in parallel: a new host function,
 as one unit. One more 64-bit assumption turned up at run time
 (`@int_cast(usize, a.cv)` on a non-parameter in `ipcp`).
 
-Result: `node runtime/host.mjs axiom.wasm -- build selfhost/src/main.ax`
+Result: `node runtime/host.mjs axiom.wasm -- build cmd/axiom/src/main.ax`
 produces byte-identical output to the native compiler, for native and wasm32
 targets. Natively the compiler is now a static executable with no C library;
 self-build speed and memory are unchanged within noise.

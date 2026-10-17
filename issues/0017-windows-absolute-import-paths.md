@@ -22,7 +22,7 @@ error[E0211]: cannot find module 'C:/Users/me/scratch/C:/Users/me/axiom/std/os/f
 
 ## Cause
 
-`load_module` in selfhost/src/sema.ax treats an import path as absolute
+`load_module` in cmd/axiom/src/sema.ax treats an import path as absolute
 only if it starts with '/':
 
 ```

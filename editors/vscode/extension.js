@@ -259,7 +259,7 @@ function findAxiom() {
     }
     const exe = process.platform === 'win32' ? 'axiom.exe' : 'axiom';
     for (const f of vscode.workspace.workspaceFolders || []) {
-        const p = path.join(f.uri.fsPath, 'selfhost', 'build', exe);
+        const p = path.join(f.uri.fsPath, 'cmd', 'axiom', 'build', exe);
         if (exists(p)) {
             return p;
         }

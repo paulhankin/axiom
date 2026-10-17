@@ -9,7 +9,7 @@
 - SIMD types are 128-bit only (`i8x16` ... `f64x2`, `v128`; spec §5.8, §13).
   They map to SSE/AVX on x86-64, NEON on AArch64 and simd128 on wasm.
 - Processor extensions are chosen at build time (`--cpu`, `--features`;
-  selfhost/README.md). x86-64 knows SSE3 to AVX2, FMA, BMI and the like. AArch64
+  cmd/axiom/README.md). x86-64 knows SSE3 to AVX2, FMA, BMI and the like. AArch64
   knows LSE, RCPC, DOTPROD and CSSC; NEON is its baseline. An extension only
   changes how the backend lowers an operation, never what the program can
   express.
@@ -88,7 +88,7 @@ Done in 5f8febd (the language and both compilers) and f67d888 (x86-64
 code generation at 256 and 512 bits):
 
 - **Extensions.** The table in `std/os/cpu.ax` (mirrored in
-  `compiler/src/target.c`) adds AES, PCLMUL, SHA, the AVX-512 family, GFNI,
+  `cmd/axiom/bootstrap/src/target.c`) adds AES, PCLMUL, SHA, the AVX-512 family, GFNI,
   VAES, VPCLMULQDQ, AVX-VNNI, SHA512, SM3/SM4 and AVX10.1 on x86-64, and
   AES, SHA2/3/512, SM4, CRC, RDM, FP16, FHM, BF16, I8MM, SVE, SVE2, DIT and
   SME on AArch64, with implications and `--cpu` presets (x86-64-v4,
@@ -97,7 +97,7 @@ code generation at 256 and 512 bits):
   `i8x64` ... `f64x8`, `v512`, with every 128-bit operator and builtin.
   The self-hosted compiler computes them in ymm/zmm registers where the
   function's extensions allow (VEX.L, EVEX, k1 for compare masks) and
-  splits the rest down to 128 bits (`selfhost/src/vsplit.ax`); AArch64 and
+  splits the rest down to 128 bits (`cmd/axiom/src/vsplit.ax`); AArch64 and
   wasm split everything.
 - **Conditional compilation** (spec §13.4): `@target_has`, `@target_arch`,
   `@target_os` are constants; an `if` on them compiles one branch, and the

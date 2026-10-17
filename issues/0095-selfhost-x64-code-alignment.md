@@ -35,7 +35,7 @@ To do:
 
 ## Outcome
 
-The self-hosted backend now has (selfhost/src/x64.ax, read from the environment and
+The self-hosted backend now has (cmd/axiom/src/x64.ax, read from the environment and
 part of the object cache's key):
 
 - `AXIOM_X64_FPAD=n`: n bytes in front of every function, for item 1. Building one

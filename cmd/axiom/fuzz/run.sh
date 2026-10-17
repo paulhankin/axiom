@@ -4,14 +4,14 @@
 # integer, float and SIMD operation to edge values and prints the results;
 # each backend's output must match the reference native build exactly.
 #
-#   selfhost/fuzz/run.sh [first seed] [last seed]    (default 1 5)
+#   cmd/axiom/fuzz/run.sh [first seed] [last seed]    (default 1 5)
 #
-# Environment: NEW (default selfhost/build/axiom), OLD (default
-# compiler/build/axiom). AArch64 runs need qemu-aarch64, the AArch64 C
+# Environment: NEW (default cmd/axiom/build/axiom), OLD (default
+# cmd/axiom/bootstrap/build/axiom). AArch64 runs need qemu-aarch64, the AArch64 C
 # library in /usr/aarch64-linux-gnu and aarch64-linux-gnu-gcc (for the test's
 # C host functions); they are skipped otherwise.
 set -u
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 NEW=${NEW:-selfhost/build/axiom}
 OLD=${OLD:-compiler/build/axiom}
 T=$(mktemp -d)
@@ -37,11 +37,11 @@ last=${2:-5}
 while [ "$seed" -le "$last" ]; do
     echo "seed $seed"
     f=$T/f$seed.ax
-    python3 selfhost/fuzz/gen.py "$seed" > "$f"
+    python3 cmd/axiom/fuzz/gen.py "$seed" > "$f"
     $OLD build "$f" --target=native --link=$RT -o "$T/ref" >/dev/null 2>&1 || { echo "  reference build failed"; exit 1; }
     "$T/ref" > "$T/ref.txt" 2>&1
     if $NEW build "$f" -o "$T/w.wasm" > "$T/log" 2>&1; then
-        node selfhost/fuzz/runw.mjs "$T/w.wasm" > "$T/w.txt" 2>&1
+        node cmd/axiom/fuzz/runw.mjs "$T/w.wasm" > "$T/w.txt" 2>&1
         check wasm32 "$T/w.txt"
     else
         echo "  wasm32: build failed"; fail=$((fail + 1))

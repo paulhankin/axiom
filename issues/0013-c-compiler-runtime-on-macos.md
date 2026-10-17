@@ -4,7 +4,7 @@
 - Status: won't fix (not wanted)
 - Area: runtime: `runtime/native_host.c`; compiler (C)
 
-The C compiler (`compiler/`) emits code through LLVM for the host's default
+The C compiler (`cmd/axiom/bootstrap/`) emits code through LLVM for the host's default
 target, so on a Mac it would produce Mach-O objects and link them with the
 system C compiler. What stops it is `runtime/native_host.c`, the host ABI's
 C implementation, which is Linux-specific:
@@ -18,7 +18,7 @@ C implementation, which is Linux-specific:
   `accept` plus `fcntl(FD_CLOEXEC)`, and `SO_NOSIGPIPE`.
 - `ax_cpu_count`, `ax_term_size` and similar: check each against Darwin.
 
-`compiler/src` itself may assume ELF in places (section names for the trap
+`cmd/axiom/bootstrap/src` itself may assume ELF in places (section names for the trap
 site records, `axiom.ss` thread-local model, symbol names without the
 leading underscore) and its Makefile assumes a Linux LLVM install.
 

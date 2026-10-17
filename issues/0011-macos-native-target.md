@@ -11,7 +11,7 @@ Mac since 2023 and macOS 26 is the last release for them, so
 ## Done
 
 `--target=aarch64-macos` (also `aarch64-apple-darwin`, `macos`) builds a Mach-O
-executable from any host (spec §14.1, selfhost/README.md):
+executable from any host (spec §14.1, cmd/axiom/README.md):
 
 - **Targets.** `target.ax` has an operating system beside the architecture;
   host detection reads the compiler's own executable (Mach-O magic means a

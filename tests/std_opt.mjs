@@ -12,8 +12,8 @@
 //                               [--jobs=N] [--filter=substr] [--timeout=seconds]
 //                               [--sanitize=address] [--test-timeout=ms]
 //
-// The compiler is $AXIOM, else selfhost/build/axiom when built, else
-// compiler/build/axiom. AXIOM_NATIVE_TARGET and AXIOM_NATIVE_EXEC work as in
+// The compiler is $AXIOM, else cmd/axiom/build/axiom when built, else
+// cmd/axiom/bootstrap/build/axiom. AXIOM_NATIVE_TARGET and AXIOM_NATIVE_EXEC work as in
 // tests/run.mjs.
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -21,8 +21,8 @@ import path from 'path';
 import os from 'os';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const selfhost = path.join(root, 'selfhost/build/axiom');
-const compiler = path.resolve(process.env.AXIOM || (fs.existsSync(selfhost) ? selfhost : path.join(root, 'compiler/build/axiom')));
+const selfhost = path.join(root, 'cmd/axiom/build/axiom');
+const compiler = path.resolve(process.env.AXIOM || (fs.existsSync(selfhost) ? selfhost : path.join(root, 'cmd/axiom/bootstrap/build/axiom')));
 const argv = process.argv.slice(2);
 const opt = argv.find((a) => /^-O[0-3]$/.test(a)) || '-O2';
 const arg = (name, dflt) => (argv.find((a) => a.startsWith(`--${name}=`)) || `=${dflt}`).split('=').slice(1).join('=');

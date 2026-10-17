@@ -1,18 +1,19 @@
-# axiom — the Axiom compiler
+# The bootstrap compiler
 
-A small, fast compiler for [Axiom](../spec/axiom.md), written in C11 with an LLVM
-backend. It compiles `.ax` programs to native executables or to
-WebAssembly modules.
+A compiler for [Axiom](../../../spec/axiom.md) written in C11 with an LLVM backend. Its
+job is to build the Axiom compiler in [`cmd/axiom/`](../README.md) (see
+`cmd/axiom/bootstrap.sh`); use that one for everything else. It compiles `.ax` programs
+to native executables or to WebAssembly modules.
 
-[`selfhost/`](../selfhost/README.md) has a port of this compiler to Axiom, which this
+[`cmd/axiom/`](../README.md) is the same compiler written in Axiom, which this
 one bootstraps. The port has the same front end (identical diagnostics, so a change to
 one belongs in both) and its own backends instead of LLVM; programs must behave the same
-with either compiler. `selfhost/difftest.sh` compares them.
+with either compiler. `cmd/axiom/difftest.sh` compares them.
 
 ```
-$ make -C compiler
-$ ./compiler/build/axiom build examples/dot_product.ax -O2 -o engine.wasm
-$ ./compiler/build/axiom check examples/shapes.ax --format=agent-json
+$ make -C cmd/axiom/bootstrap
+$ cmd/axiom/bootstrap/build/axiom build examples/dot_product.ax -O2 -o engine.wasm
+$ cmd/axiom/bootstrap/build/axiom check examples/shapes.ax --format=agent-json
 ```
 
 ## Requirements
@@ -41,7 +42,7 @@ current directory (spec §4.6).
 
   --target=wasm32|wasm64|native   default wasm32 (alias: wasm32-freestanding)
   --cpu=<preset>                  processor extensions: native (the default for native), a baseline, or a
-                                  preset of selfhost/README.md (spec §13.4)
+                                  preset of cmd/axiom/README.md (spec §13.4)
   --features=+ext,-ext            add or remove extensions
   -O0 | -O1 | -O2 | -O3           optimization level; never changes program behavior
   --overflow=wrap|trap|saturate   integer overflow (spec §7.6): wraps by default; trap (T0002) is
@@ -139,7 +140,7 @@ becomes an out-of-bounds trap instead of corrupting data.
 $ node tests/run.mjs              # wasm32, -O0
 $ node tests/run.mjs -O2
 $ node tests/run.mjs --native     # native target (links tests/native_rt.c)
-$ make -C compiler asan && AXIOM=compiler/build-asan/axiom node tests/run.mjs
+$ make -C cmd/axiom/bootstrap asan && AXIOM=cmd/axiom/bootstrap/build-asan/axiom node tests/run.mjs
 $ node tests/std_opt.mjs          # std's tests at -O2, wasm32 and native, in parallel
 ```
 
@@ -207,7 +208,7 @@ Implemented: the whole language described in spec v0.1-draft.3:
 
 Not yet implemented (reported with a diagnostic where relevant):
 
-- `axiom fmt` (only the self-hosted compiler has it: [`selfhost/`](../selfhost/README.md)),
+- `axiom fmt` (only the self-hosted compiler has it: [`cmd/axiom/`](../README.md)),
   `axiom run` and `axiom explain` (spec §16.1).
 - The debug trap map (`axiom.traps` custom section) and error-return traces
   (spec §16.4). Traps are plain `unreachable`, so the trap code isn't reported yet.

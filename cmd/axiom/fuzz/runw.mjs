@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { createHost } from '../../runtime/host.mjs';
+import { createHost } from '../../../runtime/host.mjs';
 const f = process.argv[2];
 let out = []; let mem;
 const dec = new TextDecoder();

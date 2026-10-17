@@ -4,15 +4,15 @@
 #   - the compiler built by LLVM (stage 1) and the compiler built by itself
 #     (stage 2) have the same source, so the ratio of their running times on
 #     the same job is the speed of our code relative to LLVM's;
-#   - the programs in selfhost/bench/ (loops over arrays, hashing, sorting,
+#   - the programs in cmd/axiom/bench/ (loops over arrays, hashing, sorting,
 #     floating point) built by the C compiler (LLVM) and by stage 2, -O2.
-# Needs selfhost/bootstrap.sh.
+# Needs cmd/axiom/bootstrap.sh.
 #
-#   selfhost/bench.sh [runs]      (default 3; the best run counts)
+#   cmd/axiom/bench.sh [runs]      (default 3; the best run counts)
 set -eu
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 RUNS=${1:-3}
-B=selfhost/build
+B=cmd/axiom/build
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
@@ -31,17 +31,17 @@ best() {
 
 for job in "-O0 --units=program" "-O2"; do
     # shellcheck disable=SC2086
-    a=$(best $B/axiom1 build selfhost/src/main.ax --target=native $job -o $T/x)
+    a=$(best $B/axiom1 build cmd/axiom/src/main.ax --target=native $job -o $T/x)
     # shellcheck disable=SC2086
-    b=$(best $B/axiom2 build selfhost/src/main.ax --target=native $job -o $T/y)
+    b=$(best $B/axiom2 build cmd/axiom/src/main.ax --target=native $job -o $T/y)
     echo "compile selfhost $job: llvm-built ${a} ms, self-built ${b} ms, ratio $(echo "scale=2; $b / $a" | bc)"
 done
 echo "size: llvm-built $(wc -c < $B/axiom1) bytes, self-built $(wc -c < $B/axiom2) bytes"
 
-for f in selfhost/bench/*.ax; do
+for f in cmd/axiom/bench/*.ax; do
     n=$(basename "$f" .ax)
     [ "$n" = common ] && continue
-    compiler/build/axiom build "$f" --target=native -O2 -o "$T/llvm_$n"
+    cmd/axiom/bootstrap/build/axiom build "$f" --target=native -O2 -o "$T/llvm_$n"
     $B/axiom2 build "$f" --target=native -O2 -o "$T/self_$n"
     if [ "$("$T/llvm_$n")" != "$("$T/self_$n")" ]; then
         echo "$n: DIFFERENT OUTPUT" >&2

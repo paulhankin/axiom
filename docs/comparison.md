@@ -354,7 +354,7 @@ weakly ordered CPUs such as ARM.
   deterministic trap (slices, arrays and the other checks behave as on wasm). On this
   repository's benchmarks, the self-hosted compiler's own backend produces code that takes
   between 0.8 and 1.6 times as long as the LLVM-built code from the C compiler
-  (`selfhost/bench.sh`).
+  (`cmd/axiom/bench.sh`).
 
 ## Choosing
 

@@ -138,7 +138,7 @@ def main():
         f.write(arr('IMPLICIT_BASE', 'u32', [x[2] for x in implicit]) + '\n\n')
         f.write(arr('IDEO_CORE', 'u32', [v for r in core for v in r]) + '\n\n')
         f.write(arr('IDEO_OTHER', 'u32', [v for r in other for v in r]) + '\n')
-    axiom = os.path.join(os.path.dirname(OUT), '..', '..', '..', 'selfhost', 'build', 'axiom')
+    axiom = os.path.join(os.path.dirname(OUT), '..', '..', '..', 'cmd', 'axiom', 'build', 'axiom')
     if os.path.exists(axiom):
         subprocess.run([axiom, 'fmt', OUT], check=True)
     else:

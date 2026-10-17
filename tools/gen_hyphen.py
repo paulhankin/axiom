@@ -53,7 +53,7 @@ with open(os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ax'), 'w') as f:
     f.write('pub let EXCEPTIONS: []u8 = "%s";\n\n' % ' '.join(exc))
     f.write('/// The fewest letters to leave before and after a hyphen.\n')
     f.write('pub const LEFT_MIN: usize = 2;\npub const RIGHT_MIN: usize = 3;\n')
-exe = os.path.join(root, 'selfhost', 'build', 'axiom')
+exe = os.path.join(root, 'cmd', 'axiom', 'build', 'axiom')
 if os.path.exists(exe):
     subprocess.run([exe, 'fmt', os.path.join(root, 'std', 'text', 'hyphen', 'en_us.ax')], check=False)
 

@@ -71,7 +71,7 @@ static const char *find_std(const char *argv0) {
     char *slash = strrchr(exe, '/');
     if (slash) *slash = 0;
     static char buf[PATH_MAX + 32];
-    const char *cands[] = {"/../../std", "/../std", "/std", "/../share/axiom/std"};
+    const char *cands[] = {"/../../std", "/../std", "/std", "/../share/axiom/std", "/../../../std", "/../../../../std"};
     for (size_t i = 0; i < sizeof cands / sizeof *cands; i++) {
         snprintf(buf, sizeof buf, "%s%s/mem.ax", exe, cands[i]);
         if (file_exists(buf)) {

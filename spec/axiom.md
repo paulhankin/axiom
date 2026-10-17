@@ -2508,7 +2508,7 @@ axiom profile <file.ax> | <package dir> [--target=wasm32|native] [-O0..-O3]
 
 `axiom profile` builds the program, runs its `main`, and reports where the time went.
 Arguments after `--` are passed to the program, and its standard input is the
-profiler's (so `axiom profile selfhost/src/main.ax -- build app.ax -O2` profiles the
+profiler's (so `axiom profile cmd/axiom/src/main.ax -- build app.ax -O2` profiles the
 compiler).
 It is a **sampling profiler**. About `--rate` times a second (default 999) it copies the
 running thread's shadow stack (§16.4.1), so every sample is an exact source-level call

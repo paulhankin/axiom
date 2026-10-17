@@ -7,7 +7,7 @@
 ## Done
 
 `--target=x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) builds a
-PE32+ console executable from any host (spec §14.1, selfhost/README.md):
+PE32+ console executable from any host (spec §14.1, cmd/axiom/README.md):
 
 - **Calling convention.** On Windows every function uses the Windows x64
   convention, so Windows can call back into Axiom code (threads, the

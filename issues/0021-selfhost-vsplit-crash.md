@@ -11,14 +11,14 @@ crashes; the C compiler builds the same program, and the self-hosted one
 builds it for wasm32:
 
 ```
-$ selfhost/build/axiom build src/bin/bench_kernels.ax --target=native -O2 -o bk
+$ cmd/axiom/build/axiom build src/bin/bench_kernels.ax --target=native -O2 -o bk
 axiom: crash: segmentation fault (address 0x3500000008)
 stack trace (innermost first):
   at List.[*mut Value].get
-  at fill_phis (selfhost/src/vsplit.ax:699:39)
-  at split_wide (selfhost/src/vsplit.ax:790:5)
-  at emit_module (selfhost/src/backend.ax:46:29)
-  at codegen_program (selfhost/src/codegen.ax:4747:12)
+  at fill_phis (cmd/axiom/src/vsplit.ax:699:39)
+  at split_wide (cmd/axiom/src/vsplit.ax:790:5)
+  at emit_module (cmd/axiom/src/backend.ax:46:29)
+  at codegen_program (cmd/axiom/src/codegen.ax:4747:12)
 ```
 
 (at b6f5443; run from the benchmark's `axiom/` directory). The program's hot

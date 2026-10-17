@@ -333,11 +333,11 @@ with open(OUT, 'w') as f:
     f.write('\n\n'.join(parts) + '\n')
 # in axiom fmt's canonical layout (the repository is kept formatted)
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-for exe in ('selfhost/build/axiom', 'selfhost/build/good'):
+for exe in ('cmd/axiom/build/axiom', 'cmd/axiom/build/good'):
     if os.path.exists(os.path.join(root, exe)):
         import subprocess
         subprocess.run([os.path.join(root, exe), 'fmt', OUT], check=True)
         break
 else:
-    print('note: build selfhost/build/axiom and run `axiom fmt` on the output')
+    print('note: build cmd/axiom/build/axiom and run `axiom fmt` on the output')
 print('records %d, runs %d, compositions %d -> %s' % (len(recs), len(run_start), len(compose), OUT))

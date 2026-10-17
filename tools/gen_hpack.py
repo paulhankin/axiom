@@ -35,7 +35,7 @@ with open(os.path.join(root, 'std', 'net', 'hpack', 'tables.ax'), 'w') as f:
     f.write('/// The Huffman code of each byte, and of the end of string (256).\n')
     f.write('pub let HUFF_CODES: [257]u32 = [%s];\n' % ', '.join(str(c) for c in REQUEST_CODES))
     f.write('pub let HUFF_LENS: [257]u8 = [%s];\n' % ', '.join(str(c) for c in REQUEST_CODES_LENGTH))
-exe = os.path.join(root, 'selfhost', 'build', 'axiom')
+exe = os.path.join(root, 'cmd', 'axiom', 'build', 'axiom')
 if os.path.exists(exe):
     subprocess.run([exe, 'fmt', os.path.join(root, 'std', 'net', 'hpack', 'tables.ax')], check=False)
 

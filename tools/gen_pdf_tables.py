@@ -78,7 +78,7 @@ os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, 'w') as f:
     f.write('\n\n'.join(parts) + '\n')
 root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
-exe = os.path.join(root, 'selfhost/build/axiom')
+exe = os.path.join(root, 'cmd/axiom/build/axiom')
 if os.path.exists(exe):
     subprocess.run([exe, 'fmt', OUT], check=True)
 print('%d glyph names -> %s' % (len(names), OUT))

@@ -7,7 +7,7 @@
 ## Today
 
 - At -O0/-O1, executables are compiled module by module in forked worker
-  processes (`selfhost/src/units.ax`), up to one per CPU, with a cache of
+  processes (`cmd/axiom/src/units.ax`), up to one per CPU, with a cache of
   module objects: the self-hosted compiler builds in 1.7 s cold, 0.4 s warm.
 - At -O2/-O3 the whole program is one unit (cross-module inlining), compiled
   by one process: about 8 s for the self-hosted compiler, of which the

@@ -13,9 +13,11 @@ WebAssembly. Its design mandate is:
 ## Quick start
 
 ```
-make -C compiler                      # needs llvm-18-dev, lld
-./compiler/build/axiom build examples/dot_product.ax -O2 -o engine.wasm
+cmd/axiom/bootstrap.sh                # build the compiler (needs llvm-18-dev and lld, for the bootstrap)
+export PATH=$PWD/cmd/axiom/build:$PATH
+axiom build examples/dot_product.ax -O2 -o engine.wasm
 node runtime/host.mjs engine.wasm     # run a program (calls its `main` export)
+axiom build examples/wordcount.ax --target=native -O2 -o wc
 axiom test mylib.ax                # run a file's `test` blocks
 axiom new geometry                 # a package: axiom.toml + src/lib.ax (spec §4.6)
 axiom test geometry                # build/check/test also take a package directory
@@ -23,17 +25,16 @@ axiom profile prog.ax              # sampling profiler: hot functions, call site
 axiom build prog.ax --sanitize=address   # trap on use after free, double free, overflows; report leaks
 axiom build prog.ax --target=native -O2 -g   # DWARF line tables, for perf annotate, gdb, addr2line -i
 axiom build app --verbose          # modules compile separately and are cached (spec §16.7)
+axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
+axiom fmt src/                     # canonical layout, imports tidied (spec §16.5)
 node tests/run.mjs                    # run the test suite
-selfhost/bootstrap.sh                 # build the self-hosted compiler (stage 1, 2, 3)
-selfhost/build/axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
-selfhost/build/axiom fmt src/      # canonical layout, imports tidied (spec §16.5)
 ```
 
-The self-hosted compiler (`selfhost/build/axiom`) has its own backends for
+The compiler (`cmd/axiom/build/axiom`) is written in Axiom and has its own backends for
 WebAssembly, x86-64 and AArch64 and its own linkers: it needs only the C library.
 It builds native programs for Linux, Windows and macOS (Apple silicon, where it also
 runs, tests and profiles them, and links system frameworks: AppKit, Metal, Core Audio).
-On a Mac, `selfhost/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
+On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 `llvm-config` on the `PATH`.
 
 ## Contents
@@ -60,8 +61,8 @@ On a Mac, `selfhost/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 | [`examples/drumkin/`](examples/drumkin/src/main.ax) | A drum machine on macOS (a package): eight drums of FM and noise through a morphing state-variable filter and ADSR envelopes, two settings of each blended between, a 16-step sequencer with swing and accents, knobs drawn with Quartz over Metal, sound through Core Audio from a thread of its own |
 | [`examples/pdfview/`](examples/pdfview/src/main.ax) | A PDF viewer on macOS (a package): continuous scrolling, a thumbnail sidebar, zoom from 10% to 800% that stays sharp (the part of a page in the window drawn again at full detail), rotated pages; Core Graphics draws the pages, the window is Quartz over Metal |
 | [`examples/pinball/`](examples/pinball/README.md) | A pinball table in 3D on macOS (a package): the ball's physics at 2400 steps a second (spin, friction, rolling; solenoid flippers with inertia), a ramp onto a six-wire habitrail, bumpers, slingshots, drop and standup targets, a spinner, an orbit, a lock and three-ball multiball; Metal with PBR shading, HDR, bloom, shadows and a chrome ball reflecting the playfield; a dot-matrix display; synthesized sound |
-| [`compiler/`](compiler/README.md) | The compiler: C11 + LLVM, targets wasm32 and native |
-| [`selfhost/`](selfhost/README.md) | The same compiler written in Axiom, bootstrapped from the C one to a fixed point, with its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers: no LLVM, no C toolchain |
+| [`cmd/axiom/`](cmd/axiom/README.md) | The compiler, written in Axiom, with its own SSA IR, backends (wasm32/wasm64, x86-64, AArch64) and linkers: no LLVM, no C toolchain |
+| [`cmd/axiom/bootstrap/`](cmd/axiom/bootstrap/README.md) | A compiler in C11 + LLVM, used only to bootstrap the one in `cmd/axiom/` (to a fixed point) |
 | [`std/`](std/README.md) | Standard library. At the top: `mem`, `str`, `fmt`, `io`, `os`, `hash`, `unicode`, `math`, `time`, `thread`, `sync`, `net`, `audio` (WAV, AIFF, FLAC, Ogg Vorbis, Opus, MP3, AAC). Grouped: `collections/` (`vec`, `map`, `set`, …), `os/` (`fs`, `path`, `process`, …), `net/` (`http`, `http2`, `websocket`, `tls`, `dns`), `encoding/` (`json`, `toml`, `yaml`, `xml`, `cbor`, …), `text/` (`regex`, `html`, `markdown`, …), `compress/`, `archive/`, `math/`, `graphics/` (`image`, `draw`, `font`, `shape`, `text`, `pdf`, `svg`, `chart`), `crypto/` |
 | [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ax` and `linux.ax`, libc-free, for the self-hosted compiler; `darwin.ax` for macOS (Apple silicon), `windows.ax` for Windows; `native_host.c` for the C one); test runners; the profiler |
 | [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `axiom test`, packages |

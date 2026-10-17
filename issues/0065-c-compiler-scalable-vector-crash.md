@@ -5,7 +5,7 @@
 - Area: compiler (C)
 
 Found while writing `tests/run/simd_masks.ax` (0058, 0062). This program, built by the C
-compiler for x86-64 at `-O2` (`compiler/build/axiom build f.ax --target=native -O2`),
+compiler for x86-64 at `-O2` (`cmd/axiom/bootstrap/build/axiom build f.ax --target=native -O2`),
 aborts inside LLVM:
 
 ```

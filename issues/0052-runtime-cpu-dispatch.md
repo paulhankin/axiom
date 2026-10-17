@@ -54,7 +54,7 @@ fixed in a749803:
   answered for the build (and in the C compiler, lowering that depends on extensions, such
   as `@dot` and permutes, chose the build's sequences). Now a direct call compiles the
   inline function with its caller's extensions: one instance per set it is called with
-  (`get_callee` in compiler/src/codegen.c and selfhost/src/codegen.ax; spec §9.5, §13.4).
+  (`get_callee` in cmd/axiom/bootstrap/src/codegen.c and cmd/axiom/src/codegen.ax; spec §9.5, §13.4).
 - **A function first reached from a version took the version's extensions.** Instances
   took their extensions from the current ones (`g_features`), which are the version's
   while its body is generated, so a function that is not inline, first called from an

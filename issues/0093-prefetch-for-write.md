@@ -45,7 +45,7 @@ is unchanged.
 0x80000001 ECX bit 8, so `--cpu=native` has it on every AMD64 processor and Intel from
 Broadwell). The `skylake` preset gained it (so `icelake-server`, `sapphirerapids`, `alderlake`,
 `arrowlake` and the `znver*` presets, built on it, have it too); `haswell` and the
-`x86-64-v*` levels do not, as in LLVM. Listed in §13.4 and selfhost/README.md.
+`x86-64-v*` levels do not, as in LLVM. Listed in §13.4 and cmd/axiom/README.md.
 
 **C compiler**: `llvm.prefetch(p, 1, 3, 1)` (write, locality 3, data); with `+prfchw` in the
 function's target features LLVM selects `prefetchw`, otherwise `prefetcht0`; Arm `prfm pstl1keep`;

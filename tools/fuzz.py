@@ -152,7 +152,7 @@ def main():
     ap.add_argument('--timeout', type=float, default=10.0)
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--seed', type=int, default=1)
-    ap.add_argument('--compiler', default=os.environ.get('AXIOM', os.path.join(ROOT, 'compiler', 'build', 'axiom')))
+    ap.add_argument('--compiler', default=os.environ.get('AXIOM', os.path.join(ROOT, 'cmd', 'axiom', 'bootstrap', 'build', 'axiom')))
     ap.add_argument('targets', nargs='*')
     a = ap.parse_args()
     targets = a.targets or TARGETS

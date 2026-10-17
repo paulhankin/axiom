@@ -101,7 +101,7 @@ store above is dead), and keep the ring offset in one slot instead of three.
 ## Resolution
 
 0037's design, in the self-hosted compiler for every native target: x86-64 and AArch64
-Linux, `aarch64-macos` and `x86_64-windows` (spec §17.4.1, "Frame tables"; selfhost/README.md).
+Linux, `aarch64-macos` and `x86_64-windows` (spec §17.4.1, "Frame tables"; cmd/axiom/README.md).
 Calls no longer touch the shadow stack:
 
 - `codegen.ax` (`frame_tables`: native, traces on, not `axiom profile` and not

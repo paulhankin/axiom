@@ -14,7 +14,7 @@ export fn main() i32 {
 }
 ```
 
-`compiler/build/axiom build t.ax --target=native -O2` stops with
+`cmd/axiom/bootstrap/build/axiom build t.ax --target=native -O2` stops with
 `internal compiler error: invalid LLVM IR generated: Invalid bitcast %1 = bitcast ptr %0 to
 i64` (and `i64 to ptr`). On native targets a function pointer is a `ptr`, so the conversion
 to or from an integer must be `ptrtoint`/`inttoptr`, not `bitcast`. The self-hosted

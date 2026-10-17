@@ -85,7 +85,7 @@ with open(out, 'w') as f:
     f.write('/// Literal context lookup (section 7.1): for context mode m, the context\n'
             '/// of bytes p1, p2 is LUT[m * 512 + p1] | LUT[m * 512 + 256 + p2].\n' +
             arr('CONTEXT_LUT', 'u8', lut, 16) + '\n')
-exe = os.path.join(os.path.dirname(out), '..', '..', 'selfhost', 'build', 'axiom')
+exe = os.path.join(os.path.dirname(out), '..', '..', 'cmd', 'axiom', 'build', 'axiom')
 if os.path.exists(exe):
     subprocess.run([exe, 'fmt', out], check=False)
 print(out, len(dic), len(ps), len(tr) // 3)

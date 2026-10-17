@@ -54,7 +54,7 @@ except the cleanup schedule (output 0.005% smaller, same speed):
 - `Value`'s hot fields share its first two cache lines.
 
 Measured on the -O2 self-build: 24.9 G → 21.5 G instructions (valgrind),
-about 7.4 s → 5.8 s wall. Use `axiom profile selfhost/src/main.ax -- build
+about 7.4 s → 5.8 s wall. Use `axiom profile cmd/axiom/src/main.ax -- build
 ...` (issue 0007), callgrind (self costs are reliable; its caller tree is
 confused by tail jumps), or `valgrind --tool=lackey --basic-counts=yes` for
 noise-free comparisons. Wall-clock timing on a shared machine varies ±5%.

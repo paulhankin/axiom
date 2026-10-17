@@ -15,7 +15,7 @@
 //
 // Environment: AXIOM_TEST_JOBS (tests run at a time; default the CPUs, 1 is
 // serial); AXIOM_TEST_SKIP_PLATFORM=1 skips what does not depend on the
-// target and flags (fmt, macOS, Windows, the wasm32 check of selfhost/src),
+// target and flags (fmt, macOS, Windows, the wasm32 check of cmd/axiom/src),
 // for runs after the first of several configurations.
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
@@ -27,7 +27,7 @@ import { createHost } from '../runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-const compiler = path.resolve(process.env.AXIOM || path.join(root, 'compiler/build/axiom'));
+const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
 const argv = process.argv.slice(2);
 const native = argv.includes('--native');
 // Cross testing: AXIOM_NATIVE_TARGET=aarch64 AXIOM_NATIVE_EXEC="qemu-aarch64 -L /usr/aarch64-linux-gnu"
@@ -421,9 +421,9 @@ await inOrder(files(path.join(root, 'tests/lowering')), async (f) => {
 // it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
 // usize assumptions.
 if (!skipPlatform) {
-  const name = 'selfhost/src checks for wasm32';
+  const name = 'cmd/axiom/src checks for wasm32';
   if (!filter || name.includes(filter)) {
-    const c = spawnSync(compiler, ['check', path.join(root, 'selfhost/src/main.ax'), '--target=wasm32'], { encoding: 'utf8' });
+    const c = spawnSync(compiler, ['check', path.join(root, 'cmd/axiom/src/main.ax'), '--target=wasm32'], { encoding: 'utf8' });
     if (c.status !== 0) { fail++; failures.push(`FAIL ${name}:\n${c.stdout}${c.stderr}`); console.log(`FAIL ${name}`); }
     else { pass++; console.log(`ok   ${name}`); }
   }
@@ -500,7 +500,7 @@ if (!skipPlatform) {
     return fs.readFileSync(f, 'utf8') === src ? null : 'the file was changed';
   };
   cases['the repository is canonical'] = () => {
-    const r = fmt(['--check', 'selfhost/src', 'selfhost/bench', 'std', 'examples', 'runtime', 'tests/run', 'tests/units',
+    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'runtime', 'tests/run', 'tests/units',
       'tests/lib', 'tests/packages', 'tests/profile']);
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
@@ -550,7 +550,7 @@ if (!skipPlatform) {
       return null;
     },
     'the compiler': () => {
-      const p = check(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']);
+      const p = check(path.join(root, 'cmd/axiom/src/main.ax'), 'axiom', ['-O1']);
       if (p || !onMac) return p;
       // the Mac-built compiler builds a program that runs
       const src = path.join(tmp, 'macos-hello.ax');
@@ -783,7 +783,7 @@ if (!skipPlatform) {
       return null;
     },
     'the compiler': () => {
-      const c = build(path.join(root, 'selfhost/src/main.ax'), 'axiom', ['-O1']);
+      const c = build(path.join(root, 'cmd/axiom/src/main.ax'), 'axiom', ['-O1']);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
       const p = checkPE(out('axiom'));
       if (p || !wine) return p;

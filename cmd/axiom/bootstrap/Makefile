@@ -27,7 +27,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 test: $(BUILD)/axiom
-	node ../tests/run.mjs
+	node ../../../tests/run.mjs
 
 asan:
 	$(MAKE) BUILD=build-asan CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \

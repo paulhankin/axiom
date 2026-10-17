@@ -1,5 +1,5 @@
 // target.h - architectures, CPU presets and processor extensions, with the
-// names and bits of std/os/cpu.ax (selfhost/src/target.ax is the same).
+// names and bits of std/os/cpu.ax (cmd/axiom/src/target.ax is the same).
 #ifndef AX_TARGET_H
 #define AX_TARGET_H
 

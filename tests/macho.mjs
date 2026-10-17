@@ -1,5 +1,5 @@
 // Structural checks of a Mach-O executable written by the self-hosted
-// linker for --target=aarch64-macos (selfhost/src/mlink.ax). Nothing here
+// linker for --target=aarch64-macos (cmd/axiom/src/mlink.ax). Nothing here
 // can run the program, so this checks what dyld and the kernel check:
 // load commands, segment and section layout, the rebase and bind opcode
 // streams, the symbol table, the entry point and the ad-hoc code signature.

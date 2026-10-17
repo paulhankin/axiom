@@ -12,7 +12,7 @@ available either, so investigating the compiler's own speed needed ad-hoc
 timers.
 
 Suggested: everything after `--` goes to the program
-(`axiom profile selfhost/src/main.ax -- build x.ax -O2`), and stdin is
+(`axiom profile cmd/axiom/src/main.ax -- build x.ax -O2`), and stdin is
 passed through.
 
 Fixed: arguments after `--` go to the program; stdin is inherited.

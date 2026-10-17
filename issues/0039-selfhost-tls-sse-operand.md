@@ -9,7 +9,7 @@
 Building the benchmark's Axiom port natively with the self-hosted compiler fails:
 
 ```
-$ selfhost/build/axiom build src/bin/bench_kernels.ax --target=native -O2 -o bk
+$ cmd/axiom/build/axiom build src/bin/bench_kernels.ax --target=native -O2 -o bk
 axiom: x86-64 code generation: TLS operand in an SSE instruction (in src/eval/net.collect_nonzero)
 ```
 
