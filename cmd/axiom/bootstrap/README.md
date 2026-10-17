@@ -1,6 +1,6 @@
 # The bootstrap compiler
 
-A compiler for [Axiom](../../../spec/axiom.md) written in C11 with an LLVM backend. Its
+A compiler for [Axiom](../../../docs/spec.md) written in C11 with an LLVM backend. Its
 job is to build the Axiom compiler in [`cmd/axiom/`](../README.md) (see
 `cmd/axiom/bootstrap.sh`); use that one for everything else. It compiles `.ax` programs
 to native executables or to WebAssembly modules.

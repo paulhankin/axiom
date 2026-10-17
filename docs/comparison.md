@@ -5,7 +5,7 @@ compiling to native code and to WebAssembly. This document puts its design next 
 four languages it is most often weighed against. It compares **languages**, not
 ecosystems. The other four are described as they are in their current standards and
 releases (C23, C++23 with notes on C++26, Rust 2024 edition, Zig 0.15). Axiom is
-described by its [specification](../spec/axiom.md) (v0.1 draft), with notes where the
+described by its [specification](spec.md) (v0.1 draft), with notes where the
 implementation does not match it yet.
 
 Every language here is a sensible choice for some job. The point is to show where

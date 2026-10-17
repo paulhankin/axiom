@@ -41,7 +41,7 @@ On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 
 | Path | What |
 |---|---|
-| [`spec/axiom.md`](spec/axiom.md) | Language specification (v0.1 working draft) |
+| [`docs/spec.md`](docs/spec.md) | Language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/security.md`](docs/security.md) | A security review of the standard library: findings, fixes and what is open |
 | [`docs/performance.md`](docs/performance.md) | A performance review of the standard library, with comparisons to C libraries |
@@ -67,7 +67,7 @@ On a Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` (Homebrew), with
 | [`runtime/`](runtime/host.mjs) | Host ABI implementations: node (`host.mjs`, also a runner) and POSIX (`native.ax` and `linux.ax`, libc-free, for the self-hosted compiler; `darwin.ax` for macOS (Apple silicon), `windows.ax` for Windows; `native_host.c` for the C one); test runners; the profiler |
 | [`tests/`](tests/run.mjs) | Test suite: run-and-compare programs, expected compile errors, `axiom test`, packages |
 
-The spec's [Appendix C](spec/axiom.md#appendix-c-changes-from-the-design-notes) lists the
+The spec's [Appendix C](docs/spec.md#appendix-c-changes-from-the-design-notes) lists the
 decisions that differ from the original design notes.
-[Appendix D](spec/axiom.md#appendix-d-open-questions) lists open questions for the next
+[Appendix D](docs/spec.md#appendix-d-open-questions) lists open questions for the next
 iteration.
