@@ -36,7 +36,7 @@ import "../../mem.ax" as mem;
 import "../../str.ax" as strs;
 import "tables.ax" as tb;
 
-error { Malformed, Encrypted, NotFound, WrongType, TooLarge, Unsupported, OutOfMemory }
+error { Corrupt, Encrypted, NotFound, WrongType, TooLarge, Unsupported, OutOfMemory }
 
 /// Arrays and dictionaries nested deeper than this are malformed.
 pub const MAX_DEPTH: u32 = 64;
@@ -340,7 +340,7 @@ pub struct Reader {
 
     fn load(self: *mut Reader) !void {
         if not strs.contains(self.data[..@min(self.data.len, 1024)], "%PDF-") {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let ok = self.read_xref_chain() catch false;
         if not ok or (self.trailer.get("Root").is_null()) {
@@ -450,12 +450,12 @@ pub struct Reader {
             let mut isint = false;
             let a = scan_number(d, i, &mut start, &mut fv, &mut isint);
             if a == i {
-                return error.Malformed;
+                return error.Corrupt;
             }
             let b0 = skip_white(d, a);
             let b = scan_number(d, b0, &mut count, &mut fv, &mut isint);
             if (b == b0) or (start < 0) or (count < 0) or (count > (1 << 23)) {
-                return error.Malformed;
+                return error.Corrupt;
             }
             i = b;
             for k in 0..@truncate(usize, @bit_cast(u64, count)) {
@@ -467,7 +467,7 @@ pub struct Reader {
                 let e2 = scan_number(d, g0, &mut gen, &mut fv, &mut isint);
                 let t0 = skip_white(d, e2);
                 if (e1 == i) or (e2 == g0) or (t0 >= d.len) {
-                    return error.Malformed;
+                    return error.Corrupt;
                 }
                 let kind = d[t0];
                 i = t0 + 1;
@@ -479,7 +479,7 @@ pub struct Reader {
                 }
             }
         }
-        return error.Malformed;
+        return error.Corrupt;
     }
 
     fn xref_stream(self: *mut Reader, p: usize, seen: *mut vec.Vec.[u8]) !Dict {
@@ -489,19 +489,19 @@ pub struct Reader {
         let data = self.decode(st)!;
         let w = st.dict.get("W").as_array()!;
         if w.len < 3 {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let mut ws: [3]usize = [0, 0, 0];
         for k in @as(usize, 0)..3 {
             let v = w[k].as_int()!;
             if (v < 0) or (v > 8) {
-                return error.Malformed;
+                return error.Corrupt;
             }
             ws[k] = @truncate(usize, @bit_cast(u64, v));
         }
         let row = ws[0] + ws[1] + ws[2];
         if row == 0 {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let size = st.dict.get("Size").as_int() catch 0;
         let idx = st.dict.get("Index");
@@ -524,7 +524,7 @@ pub struct Reader {
             let start = ranges.get(k);
             let count = ranges.get(k + 1);
             if (start < 0) or (count < 0) or (count > (1 << 23)) {
-                return error.Malformed;
+                return error.Corrupt;
             }
             for j in 0..@truncate(usize, @bit_cast(u64, count)) {
                 if pos + row > data.len {
@@ -635,7 +635,7 @@ pub struct Reader {
             }
         }
         if self.trailer.get("Root").is_null() {
-            return error.Malformed;
+            return error.Corrupt;
         }
     }
 
@@ -703,7 +703,7 @@ pub struct Reader {
             oi = self.objstm.get(stm)!;
         } else {
             if stm >= (1 << 23) {
-                return error.Malformed;
+                return error.Corrupt;
             }
             let so = self.object(@truncate(u32, stm))!;
             let st = so.as_stream()!;
@@ -711,7 +711,7 @@ pub struct Reader {
             let n = st.dict.get("N").as_int()!;
             let first = st.dict.get("First").as_int()!;
             if (n < 0) or (first < 0) or (n > @as(i64, @bit_cast(i64, @as(u64, data.len)))) {
-                return error.Malformed;
+                return error.Corrupt;
             }
             // the header: pairs of object number and offset
             let mut offs = vec.Vec.[u64].init();
@@ -743,11 +743,11 @@ pub struct Reader {
         }
         let os = self.streams.get(oi);
         if @as(usize, index) >= os.offsets.len {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let at_ = os.offsets.get(@as(usize, index));
         if at_ >= @as(u64, os.data.len) {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let mut lx2 = Lexer.{ s: os.data, pos: @truncate(usize, at_) };
         return self.parse(&mut lx2, 0);
@@ -761,16 +761,16 @@ pub struct Reader {
         lx.pos = skip_white(lx.s, lx.pos);
         let a = scan_number(lx.s, lx.pos, &mut iv, &mut fv, &mut isint);
         if a == lx.pos {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let b0 = skip_white(lx.s, a);
         let b = scan_number(lx.s, b0, &mut iv, &mut fv, &mut isint);
         if b == b0 {
-            return error.Malformed;
+            return error.Corrupt;
         }
         lx.pos = skip_white(lx.s, b);
         if not strs.starts_with(lx.s[lx.pos..], "obj") {
-            return error.Malformed;
+            return error.Corrupt;
         }
         lx.pos += 3;
         let o = self.parse(lx, 0)!;
@@ -826,12 +826,12 @@ pub struct Reader {
     /// One object from the lexer.
     fn parse(self: *mut Reader, lx: *mut Lexer, depth: u32) !Object {
         if depth > MAX_DEPTH {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let s = lx.s;
         lx.pos = skip_white(s, lx.pos);
         if lx.pos >= s.len {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let c = s[lx.pos];
         if c == '/' {
@@ -850,7 +850,7 @@ pub struct Reader {
                 while true {
                     lx.pos = skip_white(s, lx.pos);
                     if lx.pos >= s.len {
-                        return error.Malformed;
+                        return error.Corrupt;
                     }
                     if (s[lx.pos] == '>') and (at(s, lx.pos + 1) == '>') {
                         lx.pos += 2;
@@ -883,7 +883,7 @@ pub struct Reader {
             while true {
                 lx.pos = skip_white(s, lx.pos);
                 if lx.pos >= s.len {
-                    return error.Malformed;
+                    return error.Corrupt;
                 }
                 if s[lx.pos] == ']' {
                     lx.pos += 1;
@@ -1031,7 +1031,7 @@ pub struct Reader {
 
     fn decode(self: *mut Reader, st: Stream) ![]u8 {
         if (st.start > self.data.len) or (st.len > self.data.len - st.start) {
-            return error.Malformed;
+            return error.Corrupt;
         }
         let raw = self.data[st.start..st.start + st.len];
         let filters = self.resolve(st.dict.get("Filter"))!;
@@ -1151,9 +1151,9 @@ pub struct Reader {
 
     fn load_pages(self: *mut Reader) !void {
         let root = self.get(self.trailer, "Root")!;
-        let cat = root.as_dict() catch return error.Malformed;
+        let cat = root.as_dict() catch return error.Corrupt;
         let top = self.get(cat, "Pages")!;
-        let top_d = top.as_dict() catch return error.Malformed;
+        let top_d = top.as_dict() catch return error.Corrupt;
         // depth first, with inherited attributes copied into each page
         let mut stack = vec.Vec.[Dict].init();
         defer stack.deinit();
@@ -1167,7 +1167,7 @@ pub struct Reader {
         while stack.len > 0 {
             steps += 1;
             if steps > (1 << 22) {
-                return error.Malformed;
+                return error.Corrupt;
             }
             let d = stack.pop()!;
             let kids = self.get(d, "Kids")!;

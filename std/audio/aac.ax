@@ -31,7 +31,7 @@ import "formats.ax" as formats;
 import "internal/aac/bits.ax" as bitio;
 import "internal/aac/decoder.ax" as dec;
 
-error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
+error { Corrupt, Unsupported, OutOfMemory, TooLarge }
 
 fn id3_skip(data: []u8) usize {
     if (data.len >= 10) and @mem_eq(data[..3], "ID3") {
@@ -131,7 +131,7 @@ fn adts_frame(data: []u8, o: usize, started: bool) !AdtsFrame {
         if started {
             return f;  // trailing junk (an ID3v1 tag, say)
         }
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let h = data[o..];
     let protection_absent = (h[1] & 1) != 0;
@@ -144,7 +144,7 @@ fn adts_frame(data: []u8, o: usize, started: bool) !AdtsFrame {
         if started and ((o + f.len) > data.len) {
             return f;  // a truncated last frame
         }
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     if not protection_absent {
         if f.nblocks > 1 {
@@ -153,7 +153,7 @@ fn adts_frame(data: []u8, o: usize, started: bool) !AdtsFrame {
         f.hl = 9;
     }
     if f.hl > f.len {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     f.end = false;
     return f;
@@ -164,7 +164,7 @@ fn decode_adts(data: []u8) !audio.Sound {
     // the first frame sets the format
     let first = adts_frame(data, o, false)!;
     if first.end {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut cfg = dec.empty_config();
     cfg.object_type = first.profile + 1;
@@ -210,7 +210,7 @@ fn decode_adts(data: []u8) !audio.Sound {
         o += f.len;
     }
     if out.channels == 0 {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let total = out.frames;
     return finish(&mut out, dec.output_rate(d), 0, total);
@@ -315,7 +315,7 @@ fn esds_asc(data: []u8, bx: *Box) ![]u8 {
         let len = desc_len(data, &mut o, end);
         if tag == 3 {
             if (o + 3) > end {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             let flags = data[o + 2];
             o += 3;
@@ -324,7 +324,7 @@ fn esds_asc(data: []u8, bx: *Box) ![]u8 {
             }
             if (flags & 0x40) != 0 {
                 if o >= end {
-                    return error.InvalidAudio;
+                    return error.Corrupt;
                 }
                 o += 1 + @as(usize, data[o]);
             }
@@ -333,7 +333,7 @@ fn esds_asc(data: []u8, bx: *Box) ![]u8 {
             }
         } else if tag == 4 {
             if (o + 13) > end {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             let oti = data[o];
             if (oti != 0x40) and (oti != 0x66) and (oti != 0x67) and (oti != 0x68) {
@@ -342,14 +342,14 @@ fn esds_asc(data: []u8, bx: *Box) ![]u8 {
             o += 13;
         } else if tag == 5 {
             if (o + len) > end {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             return data[o..o + len];
         } else {
             o += len;
         }
     }
-    return error.InvalidAudio;
+    return error.Corrupt;
 }
 
 fn read_track(data: []u8, trak: *Box, movie_scale: u32, tr: *mut Track) !bool {
@@ -361,11 +361,11 @@ fn read_track(data: []u8, trak: *Box, movie_scale: u32, tr: *mut Track) !bool {
     }
     let mp: [2][]u8 = ["mdia", "mdhd"];
     if not find_path(data, trak.body, trak.end, mp[..], &mut bx) or ((bx.body + 24) > bx.end) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     if data[bx.body] == 1 {
         if (bx.body + 32) > bx.end {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         tr.timescale = binary.u32_be(data[bx.body + 20..]);
         tr.duration = binary.u64_be(data[bx.body + 24..]);
@@ -375,12 +375,12 @@ fn read_track(data: []u8, trak: *Box, movie_scale: u32, tr: *mut Track) !bool {
     }
     let sp: [5][]u8 = ["mdia", "minf", "stbl", "stsd", "mp4a"];
     if not find_path(data, trak.body, trak.end, sp[..4], &mut bx) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     // stsd: version/flags, count, then the sample entries
     let mut entry = Box.{ typ: [0; 4], body: 0, end: 0 };
     if not box_at(data, bx.body + 8, bx.end, &mut entry) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     if not @mem_eq(entry.typ[..], "mp4a") {
         return error.Unsupported;
@@ -401,7 +401,7 @@ fn read_track(data: []u8, trak: *Box, movie_scale: u32, tr: *mut Track) !bool {
         let mut wave = Box.{ typ: [0; 4], body: 0, end: 0 };
         if not find(data, children, entry.end, "wave", &mut wave) or
            not find(data, wave.body, wave.end, "esds", &mut esds) {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
     }
     tr.asc = esds_asc(data, &esds)!;
@@ -410,12 +410,12 @@ fn read_track(data: []u8, trak: *Box, movie_scale: u32, tr: *mut Track) !bool {
     _ = find_path(data, trak.body, trak.end, st[..], &mut stbl);
     if not find(data, stbl.body, stbl.end, "stsz", &mut tr.stsz) or
        not find(data, stbl.body, stbl.end, "stsc", &mut tr.stsc) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     tr.co64 = false;
     if not find(data, stbl.body, stbl.end, "stco", &mut tr.stco) {
         if not find(data, stbl.body, stbl.end, "co64", &mut tr.stco) {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         tr.co64 = true;
     }
@@ -513,7 +513,7 @@ fn itunsmpb(data: []u8, moov: *Box, priming: *mut u64, length: *mut u64) bool {
 fn decode_mp4(data: []u8) !audio.Sound {
     let mut moov = Box.{ typ: [0; 4], body: 0, end: 0 };
     if not find(data, 0, data.len, "moov", &mut moov) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut movie_scale: u32 = 0;
     let mut bx = Box.{ typ: [0; 4], body: 0, end: 0 };
@@ -538,7 +538,7 @@ fn decode_mp4(data: []u8) !audio.Sound {
         o = trak.end;
     }
     if not found {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut cfg = dec.empty_config();
     dec.parse_asc(tr.asc, &mut cfg)!;
@@ -553,12 +553,12 @@ fn decode_mp4(data: []u8) !audio.Sound {
     defer out.v.deinit();
     // the samples: chunks (stco) of runs of samples (stsc) of sizes (stsz)
     if ((tr.stsz.body + 12) > tr.stsz.end) or ((tr.stsc.body + 8) > tr.stsc.end) or ((tr.stco.body + 8) > tr.stco.end) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let fixed = binary.u32_be(data[tr.stsz.body + 4..]);
     let nsamples = @as(usize, binary.u32_be(data[tr.stsz.body + 8..]));
     if (fixed == 0) and ((tr.stsz.body + 12 + (4 * nsamples)) > tr.stsz.end) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let nchunks = @as(usize, binary.u32_be(data[tr.stco.body + 4..]));
     let mut csize: usize = 4;
@@ -566,11 +566,11 @@ fn decode_mp4(data: []u8) !audio.Sound {
         csize = 8;
     }
     if (tr.stco.body + 8 + (csize * nchunks)) > tr.stco.end {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let nruns = @as(usize, binary.u32_be(data[tr.stsc.body + 4..]));
     if (tr.stsc.body + 8 + (12 * nruns)) > tr.stsc.end {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut sample: usize = 0;
     let mut run: usize = 0;
@@ -599,7 +599,7 @@ fn decode_mp4(data: []u8) !audio.Sound {
                 size = @as(usize, binary.u32_be(data[tr.stsz.body + 12 + (4 * sample)..]));
             }
             if (pos > data.len) or (size > (data.len - pos)) {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             let mut b = bitio.Bits.init(data[pos..pos + size]);
             let got = dec.decode_block(d, &mut b, block)!;
@@ -616,7 +616,7 @@ fn decode_mp4(data: []u8) !audio.Sound {
         }
     }
     if out.channels == 0 {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     // trimming: the edit list, else iTunes' gapless information
     let orate = dec.output_rate(d);

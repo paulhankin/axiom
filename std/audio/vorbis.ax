@@ -20,7 +20,7 @@ import "../str.ax" as strs;
 import "../sync.ax" as sync;
 import "ogg.ax" as ogg;
 
-error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
+error { Corrupt, Unsupported, OutOfMemory, TooLarge }
 
 pub fn is_vorbis(data: []u8) bool {
     if not ogg.is_ogg(data) {
@@ -201,12 +201,12 @@ fn pow_le(r: usize, dims: usize, limit: usize) bool {
 
 fn read_book(b: *mut Bits) !Book {
     if b.read(24) != 0x564342 {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let dims = @as(usize, b.read(16));
     let entries = @as(usize, b.read(24));
     if (dims == 0) or (entries == 0) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let lengths = mem.alloc_zeroed.[u8](entries)!;
     defer mem.free(lengths);
@@ -217,13 +217,13 @@ fn read_book(b: *mut Bits) !Book {
         while cur < entries {
             let num = @as(usize, b.read(ilog(@truncate(u32, entries - cur))));
             if ((cur + num) > entries) or (len > 32) {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             @mem_set(lengths[cur..cur + num], @truncate(u8, len));
             cur += num;
             len += 1;
             if b.eop {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
         }
     } else {
@@ -287,7 +287,7 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) !void {
             }
             let mut entry = marker[@as(usize, len)];
             if (len < 32) and ((entry >> len) != 0) {
-                return error.InvalidAudio;  // over-specified
+                return error.Corrupt;  // over-specified
             }
             book.keys[k] = entry << (32 - len);
             if len == 32 {
@@ -388,7 +388,7 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) !void {
         return;
     }
     if lookup > 2 {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let minv = float32_unpack(b.read(32));
     let delta = float32_unpack(b.read(32));
@@ -399,10 +399,10 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) !void {
     if lookup == 1 {
         nvals = lookup1_values(entries, dims);
     } else {
-        nvals = @mul_checked(entries, dims) catch return error.InvalidAudio;
+        nvals = @mul_checked(entries, dims) catch return error.Corrupt;
     }
     if (nvals > 65536 * 16) or ((@as(usize, vbits) * nvals) > b.left()) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mults = mem.alloc.[u32](@max(nvals, 1))!;
     defer mem.free(mults);
@@ -410,11 +410,11 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) !void {
         mults[i] = b.read(vbits);
     }
     if b.eop {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
-    let total = @mul_checked(entries, dims) catch return error.InvalidAudio;
+    let total = @mul_checked(entries, dims) catch return error.Corrupt;
     if total > (1 << 24) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     mem.free(book.vq);
     book.vq = mem.alloc.[f32](total)!;
@@ -511,7 +511,7 @@ struct Setup {
 
 fn read_ident(p: []u8, s: *mut Setup) !void {
     if (p.len < 30) or (p[0] != 1) or not @mem_eq(p[1..7], "vorbis") {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut b = Bits.{ d: p[7..], pos: 0, eop: false };
     if b.read(32) != 0 {
@@ -525,14 +525,14 @@ fn read_ident(p: []u8, s: *mut Setup) !void {
     let b0 = b.read(4);
     let b1 = b.read(4);
     if (s.channels == 0) or (s.rate == 0) or (b0 < 6) or (b1 < b0) or (b1 > 13) or not b.flag() {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     s.bs = [@as(usize, 1) << @as(usize, b0), @as(usize, 1) << @as(usize, b1)];
 }
 
 fn read_setup(p: []u8, s: *mut Setup) !void {
     if (p.len < 7) or (p[0] != 5) or not @mem_eq(p[1..7], "vorbis") {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut b = Bits.{ d: p[7..], pos: 0, eop: false };
     // codebooks
@@ -547,7 +547,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
     let nt = b.read(6) + 1;
     for _i in @as(u32, 0)..nt {
         if b.read(16) != 0 {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
     }
     // floors
@@ -560,7 +560,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
             return error.Unsupported;
         }
         if kind != 1 {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         read_floor1(&mut b, &mut s.floors[i], nb)!;
         s.nfloors = i + 1;
@@ -573,7 +573,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
         let r = &mut s.residues[i];
         r.kind = b.read(16);
         if r.kind > 2 {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         r.begin = @as(usize, b.read(24));
         r.end = @as(usize, b.read(24));
@@ -581,7 +581,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
         r.classes = @as(usize, b.read(6)) + 1;
         r.classbook = @as(usize, b.read(8));
         if r.classbook >= nb {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         let mut cascade: [64]u32 = [0; 64];
         for c in @as(usize, 0)..r.classes {
@@ -597,7 +597,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
                 if (cascade[c] & (@as(u32, 1) << @as(u32, @truncate(u8, k)))) != 0 {
                     let bk = @as(usize, b.read(8));
                     if (bk >= nb) or not s.books[bk].has_vq {
-                        return error.InvalidAudio;
+                        return error.Corrupt;
                     }
                     r.books[c][k] = @bit_cast(i32, @truncate(u32, bk));
                 }
@@ -613,7 +613,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
     for i in @as(usize, 0)..nm {
         let m = &mut s.maps[i];
         if b.read(16) != 0 {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         m.submaps = 1;
         if b.flag() {
@@ -627,14 +627,14 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
                 let mg = @as(usize, b.read(bits));
                 let an = @as(usize, b.read(bits));
                 if (mg == an) or (mg >= s.channels) or (an >= s.channels) {
-                    return error.InvalidAudio;
+                    return error.Corrupt;
                 }
                 m.mag[k] = @truncate(u8, mg);
                 m.ang[k] = @truncate(u8, an);
             }
         }
         if b.read(2) != 0 {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         for c in @as(usize, 0)..s.channels {
             m.mux[c] = 0;
@@ -643,7 +643,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
             for c in @as(usize, 0)..s.channels {
                 let x = b.read(4);
                 if @as(usize, x) >= m.submaps {
-                    return error.InvalidAudio;
+                    return error.Corrupt;
                 }
                 m.mux[c] = @truncate(u8, x);
             }
@@ -653,7 +653,7 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
             let fl = @as(usize, b.read(8));
             let re = @as(usize, b.read(8));
             if (fl >= nf) or (re >= nr) {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             m.floor[k] = @truncate(u8, fl);
             m.residue[k] = @truncate(u8, re);
@@ -668,13 +668,13 @@ fn read_setup(p: []u8, s: *mut Setup) !void {
         let tt = b.read(16);
         let mp = @as(usize, b.read(8));
         if (wt != 0) or (tt != 0) or (mp >= nm) {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         s.modes[i] = Mode.{ long: long, mapping: mp };
     }
     s.nmodes = nmo;
     if not b.flag() or b.eop {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
 }
 
@@ -693,14 +693,14 @@ fn read_floor1(b: *mut Bits, f: *mut Floor1, nb: usize) !void {
         if f.subs[c] > 0 {
             let m = b.read(8);
             if @as(usize, m) >= nb {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             f.master[c] = @bit_cast(i32, m);
         }
         for k in @as(usize, 0)..(@as(usize, 1) << @as(usize, f.subs[c])) {
             let bk = @bit_cast(i32, b.read(8)) - 1;
             if bk >= @bit_cast(i32, @truncate(u32, nb)) {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             f.books[c][k] = bk;
         }
@@ -714,7 +714,7 @@ fn read_floor1(b: *mut Bits, f: *mut Floor1, nb: usize) !void {
         let c = @as(usize, f.class_of[i]);
         for _k in @as(usize, 0)..@as(usize, f.dims[c]) {
             if f.n >= 65 {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             f.xs[f.n] = b.read(rbits);
             f.n += 1;
@@ -740,7 +740,7 @@ fn set_neighbours(f: *mut Floor1) !void {
     }
     for i in @as(usize, 1)..f.n {
         if f.xs[@as(usize, f.order[i])] == f.xs[@as(usize, f.order[i - 1])] {
-            return error.InvalidAudio;  // repeated X
+            return error.Corrupt;  // repeated X
         }
     }
     for i in @as(usize, 2)..f.n {
@@ -1220,7 +1220,7 @@ pub fn decode(data: []u8) !audio.Sound {
     defer ps.deinit();
     let pk = ps.items.items();
     if pk.len < 3 {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut s = Setup.{
         channels: 0,
@@ -1240,7 +1240,7 @@ pub fn decode(data: []u8) !audio.Sound {
     defer s.free();
     read_ident(pk[0].data, &mut s)!;
     if (pk[1].data.len < 7) or (pk[1].data[0] != 3) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     read_setup(pk[2].data, &mut s)!;
     return decode_audio(&s, pk[3..]);

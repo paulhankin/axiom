@@ -23,7 +23,7 @@ import "../../str.ax" as strs;
 import "../color.ax" as color;
 import "../image.ax" as image;
 
-error { InvalidImage, Unsupported, ChecksumMismatch, OutOfMemory }
+error { Corrupt, Unsupported, ChecksumMismatch, OutOfMemory }
 
 /// Compression levels (as std/compress/deflate's).
 pub const FAST: u32 = 1;
@@ -58,7 +58,7 @@ struct Header {
 
 pub fn decode(data: []u8) !image.Image {
     if not is_png(data) {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     let mut pos: usize = 8;
     let mut hdr = Header.{ width: 0, height: 0, depth: 0, color_type: 0, interlaced: false, samples: 0 };
@@ -72,11 +72,11 @@ pub fn decode(data: []u8) !image.Image {
     defer idat.deinit();
     loop {
         if (pos + 12) > data.len {
-            return error.InvalidImage;  // no IEND
+            return error.Corrupt;  // no IEND
         }
         let len = @as(usize, binary.u32_be(data[pos..]));
         if len > (data.len - pos - 12) {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         let kind = data[pos + 4..pos + 8];
         let body = data[pos + 8..pos + 8 + len];
@@ -87,15 +87,15 @@ pub fn decode(data: []u8) !image.Image {
         pos += len + 12;
         if @mem_eq(kind, "IHDR") {
             if have_header or (len != 13) {
-                return error.InvalidImage;
+                return error.Corrupt;
             }
             hdr = parse_header(body)!;
             have_header = true;
         } else if not have_header {
-            return error.InvalidImage;
+            return error.Corrupt;
         } else if @mem_eq(kind, "PLTE") {
             if ((len % 3) != 0) or (len > 768) or (len == 0) {
-                return error.InvalidImage;
+                return error.Corrupt;
             }
             @mem_copy(palette[..len], body);
             npalette = len / 3;
@@ -103,7 +103,7 @@ pub fn decode(data: []u8) !image.Image {
             has_trns = true;
             if hdr.color_type == 3 {
                 if len > 256 {
-                    return error.InvalidImage;
+                    return error.Corrupt;
                 }
                 @mem_copy(palpha[..len], body);
             } else if (hdr.color_type == 0) and (len == 2) {
@@ -113,7 +113,7 @@ pub fn decode(data: []u8) !image.Image {
                     key[i] = @truncate(u16, (@as(u32, body[2 * i]) << 8) | @as(u32, body[(2 * i) + 1]));
                 }
             } else {
-                return error.InvalidImage;
+                return error.Corrupt;
             }
         } else if @mem_eq(kind, "IDAT") {
             idat.push_str(body)!;
@@ -124,7 +124,7 @@ pub fn decode(data: []u8) !image.Image {
         }
     }
     if (hdr.color_type == 3) and (npalette == 0) {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     // the filtered scanlines of all passes
     let mut expected: usize = 0;
@@ -139,13 +139,13 @@ pub fn decode(data: []u8) !image.Image {
     }
     let raw = deflate.decompress(idat.bytes(), deflate.Format.ZLIB, expected) catch |e| {
         if e == error.TooLarge {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         return e;
     };
     defer mem.free(raw);
     if raw.len < expected {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     // output layout
     let mut channels = hdr.samples;
@@ -214,10 +214,10 @@ fn parse_header(b: []u8) !Header {
     let depth = @as(usize, b[8]);
     let ct = b[9];
     if (w == 0) or (h == 0) or (b[10] != 0) or (b[11] != 0) or (b[12] > 1) {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
-    if (@mul_checked(w, h) catch return error.InvalidImage) > image.MAX_PIXELS {
-        return error.InvalidImage;
+    if (@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS {
+        return error.Corrupt;
     }
     let mut samples: usize = 0;
     let mut ok = false;
@@ -238,7 +238,7 @@ fn parse_header(b: []u8) !Header {
         ok = (depth == 8) or (depth == 16);
     }
     if not ok {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     return Header.{ width: w, height: h, depth: depth, color_type: ct, interlaced: b[12] == 1, samples: samples };
 }
@@ -306,7 +306,7 @@ fn unfilter(f: u8, row: []mut u8, prev: []u8, bpp: usize) !void {
             row[i] = row[i] +% paeth(left, prev[i], ul);
         }
     } else {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
 }
 

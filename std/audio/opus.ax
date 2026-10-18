@@ -30,7 +30,7 @@ import "internal/opus/celt.ax" as celt;
 import "internal/opus/decoder.ax" as dec;
 import "ogg.ax" as ogg;
 
-error { InvalidAudio, Unsupported, OutOfMemory, TooLarge }
+error { Corrupt, Unsupported, OutOfMemory, TooLarge }
 
 /// Whether data is an Ogg stream holding Opus.
 pub fn is_opus(data: []u8) bool {
@@ -53,18 +53,18 @@ struct Head {
 
 fn read_head(p: []u8) !Head {
     if (p.len < 19) or not @mem_eq(p[..8], "OpusHead") or ((p[8] >> 4) != 0) {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let mut h = Head.{ channels: @as(usize, p[9]), pre_skip: @as(usize, p[10]) | (@as(usize, p[11]) << 8),
                        gain: @as(i32, @bit_cast(i16, @as(u16, p[16]) | (@as(u16, p[17]) << 8))), streams: 1, coupled: 0,
                        mapping: [0; 255] };
     if h.channels == 0 {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let family = p[18];
     if family == 0 {
         if h.channels > 2 {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         h.coupled = h.channels - 1;
         for i in @as(usize, 0)..h.channels {
@@ -72,18 +72,18 @@ fn read_head(p: []u8) !Head {
         }
     } else {
         if p.len < (21 + h.channels) {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         h.streams = @as(usize, p[19]);
         h.coupled = @as(usize, p[20]);
         if (h.streams == 0) or (h.coupled > h.streams) or ((h.streams + h.coupled) > 255) {
-            return error.InvalidAudio;
+            return error.Corrupt;
         }
         for i in @as(usize, 0)..h.channels {
             h.mapping[i] = p[21 + i];
             let m = @as(usize, p[21 + i]);
             if (m != 255) and (m >= (h.streams + h.coupled)) {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
         }
     }
@@ -109,11 +109,11 @@ pub fn decode(data: []u8) !audio.Sound {
     defer ps.deinit();
     let pk = ps.items.items();
     if pk.len < 2 {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let h = read_head(pk[0].data)!;
     if (pk[1].data.len < 8) or not @mem_eq(pk[1].data[..8], "OpusTags") {
-        return error.InvalidAudio;
+        return error.Corrupt;
     }
     let nch = h.channels;
     let mut st = Streams.{ s: vec.Vec.[*mut dec.Stream].init() };
@@ -151,14 +151,14 @@ pub fn decode(data: []u8) !audio.Sound {
         let start = frames;
         for s in @as(usize, 0)..h.streams {
             if o >= p.len {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             let last = s == (h.streams - 1);
             let mut used: usize = 0;
             let sd = st.s.items()[s];
             let got = dec.decode_packet(sd, p[o..], not last, buf, &mut used);
             if (got <= 0) or ((n >= 0) and (got != n)) {
-                return error.InvalidAudio;
+                return error.Corrupt;
             }
             if n < 0 {
                 n = got;
@@ -367,7 +367,7 @@ pub fn encode_to(w: io.Writer, s: *audio.Sound, bitrate: u32) !void {
             }
         }
         if not celt.encode(st, pcm[..celt.ENC_FRAME * ch], packet[1..packet_bytes]) {
-            return error.InvalidAudio;  // (cannot happen: the frame always fits)
+            return error.Corrupt;  // (cannot happen: the frame always fits)
         }
         o.add(packet[..packet_bytes])!;
         let last = f == (nframes - 1);

@@ -31,7 +31,7 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "../time.ax" as time;
 
-error { UnknownZone, InvalidZone, NonExistent, Ambiguous, OutOfMemory }
+error { UnknownZone, Corrupt, NonExistent, Ambiguous, OutOfMemory }
 
 /// What a zone says of an instant.
 pub struct Info {
@@ -102,7 +102,7 @@ pub struct Zone {
     }
 
     /// The zone of that name in the system's database ("America/New_York",
-    /// "UTC"). UnknownZone if there is none; InvalidZone if its file is bad.
+    /// "UTC"). UnknownZone if there is none; Corrupt if its file is bad.
     pub fn load(name: []u8) !Zone {
         if not valid_name(name) {
             return error.UnknownZone;
@@ -360,17 +360,17 @@ struct Header {
 
 fn header(d: []u8, at: usize, h: *mut Header) !void {
     if ((at + 44) > d.len) or not strs.eq(d[at..at + 4], "TZif") {
-        return error.InvalidZone;
+        return error.Corrupt;
     }
     h.version = d[at + 4];
     if (h.version != 0) and ((h.version < '2') or (h.version > '4')) {
-        return error.InvalidZone;
+        return error.Corrupt;
     }
     let counts: [6]u32 = [binary.u32_be(d[at + 20..]), binary.u32_be(d[at + 24..]), binary.u32_be(d[at + 28..]),
                           binary.u32_be(d[at + 32..]), binary.u32_be(d[at + 36..]), binary.u32_be(d[at + 40..])];
     for c in counts {
         if c > 1000000 {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
     }
     h.isutcnt = @as(usize, counts[0]);
@@ -380,10 +380,10 @@ fn header(d: []u8, at: usize, h: *mut Header) !void {
     h.typecnt = @as(usize, counts[4]);
     h.charcnt = @as(usize, counts[5]);
     if ((h.typecnt == 0) or (h.typecnt > 256)) or (h.charcnt == 0) {
-        return error.InvalidZone;
+        return error.Corrupt;
     }
     if ((h.isutcnt != 0) and (h.isutcnt != h.typecnt)) or ((h.isstdcnt != 0) and (h.isstdcnt != h.typecnt)) {
-        return error.InvalidZone;
+        return error.Corrupt;
     }
 }
 
@@ -405,7 +405,7 @@ fn read_tzif(d: []u8, z: *mut Zone) !void {
         tsize = 8;
     }
     if (at + block_size(&h, tsize)) > d.len {
-        return error.InvalidZone;
+        return error.Corrupt;
     }
     mem.free(z.trans);
     z.trans = mem.alloc.[i64](h.timecnt)!;
@@ -420,13 +420,13 @@ fn read_tzif(d: []u8, z: *mut Zone) !void {
             z.trans[k] = @as(i64, @bit_cast(i32, binary.u32_be(d[at + (k * 4)..])));
         }
         if (k > 0) and (z.trans[k] <= z.trans[k - 1]) {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
     }
     at += h.timecnt * tsize;
     for k in @as(usize, 0)..h.timecnt {
         if @as(usize, d[at + k]) >= h.typecnt {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         z.idx[k] = d[at + k];
     }
@@ -443,11 +443,11 @@ fn read_tzif(d: []u8, z: *mut Zone) !void {
         let p = types_at + (k * 6);
         let off = @bit_cast(i32, binary.u32_be(d[p..]));
         if (off < -89999) or (off > 93599) {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         let di = @as(usize, d[p + 5]);
         if di >= h.charcnt {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         let mut e = di;
         while (e < h.charcnt) and (chars[e] != 0) {
@@ -461,10 +461,10 @@ fn read_tzif(d: []u8, z: *mut Zone) !void {
     if (h.version != 0) and (at < d.len) {
         // the footer: "\n" rule "\n"
         if d[at] != '\n' {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         let rest = d[at + 1..];
-        let nl = strs.index_of_byte(rest, '\n') catch return error.InvalidZone;
+        let nl = strs.index_of_byte(rest, '\n') catch return error.Corrupt;
         let s = rest[..nl];
         if s.len > 0 {
             let mut used = h.charcnt;
@@ -503,12 +503,12 @@ struct Cursor {
         while strs.is_digit(self.peek()) {
             v = (v * 10) + @as(u32, self.peek() - '0');
             if v > max {
-                return error.InvalidZone;
+                return error.Corrupt;
             }
             self.i += 1;
         }
         if self.i == j {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         return v;
     }
@@ -544,13 +544,13 @@ struct Cursor {
             while (self.peek() != '>') and (self.peek() != 0) {
                 let c = self.peek();
                 if not ((strs.is_alnum(c) or (c == '+')) or (c == '-')) {
-                    return error.InvalidZone;
+                    return error.Corrupt;
                 }
                 self.i += 1;
             }
             b = self.i;
             if not self.eat('>') {
-                return error.InvalidZone;
+                return error.Corrupt;
             }
         } else {
             while strs.is_alpha(self.peek()) {
@@ -559,10 +559,10 @@ struct Cursor {
             b = self.i;
         }
         if (b - a) < 3 {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         if ((used.* + b) - a) > names.len {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         let at = used.*;
         @mem_copy(names[at..(at + b) - a], self.s[a..b]);
@@ -576,17 +576,17 @@ struct Cursor {
             w.kind = 'J';
             w.n = self.num(365)!;
             if w.n == 0 {
-                return error.InvalidZone;
+                return error.Corrupt;
             }
         } else if self.eat('M') {
             w.kind = 'M';
             w.m = self.num(12)!;
             if (w.m == 0) or not self.eat('.') {
-                return error.InvalidZone;
+                return error.Corrupt;
             }
             w.w = self.num(5)!;
             if (w.w == 0) or not self.eat('.') {
-                return error.InvalidZone;
+                return error.Corrupt;
             }
             w.d = self.num(6)!;
         } else {
@@ -620,7 +620,7 @@ fn parse_rule(s: []u8, names: []mut u8, used: *mut usize, r: *mut Rule) !void {
     if c.eat(',') {
         r.start = c.when()!;
         if not c.eat(',') {
-            return error.InvalidZone;
+            return error.Corrupt;
         }
         r.end = c.when()!;
     } else {
@@ -629,7 +629,7 @@ fn parse_rule(s: []u8, names: []mut u8, used: *mut usize, r: *mut Rule) !void {
         r.end = When.{ kind: 'M', n: 0, m: 11, w: 1, d: 0, time: 7200 };
     }
     if c.i != s.len {
-        return error.InvalidZone;
+        return error.Corrupt;
     }
 }
 
@@ -794,7 +794,7 @@ test "rules, names and the system database" {
 }
 
 fn invalid(r: !Zone) bool {
-    let mut z = r catch |e| return e == error.InvalidZone;
+    let mut z = r catch |e| return e == error.Corrupt;
     z.deinit();
     return false;
 }

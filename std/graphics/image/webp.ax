@@ -30,7 +30,7 @@ import "../image.ax" as image;
 import "internal/webp/vp8.ax" as vp8;
 import "png.ax" as png;
 
-error { InvalidImage, TooLarge, Unsupported, OutOfMemory }
+error { Corrupt, TooLarge, Unsupported, OutOfMemory }
 
 pub fn is_webp(data: []u8) bool {
     return (data.len >= 16) and strs.eq(data[..4], "RIFF") and strs.eq(data[8..12], "WEBP");
@@ -134,7 +134,7 @@ struct Codes {
             }
         }
         if used == 0 {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         if used == 1 {
             tr.single = @as(i32, @truncate(u16, last));
@@ -145,7 +145,7 @@ struct Codes {
         for l in @as(usize, 1)..16 {
             left = (left * 2) - @as(i32, tr.counts[l]);
             if left < 0 {
-                return error.InvalidImage;
+                return error.Corrupt;
             }
         }
         let mut offs: [16]usize = [0; 16];
@@ -224,7 +224,7 @@ struct Codes {
             first <<= 1;
             code <<= 1;
         }
-        return error.InvalidImage;
+        return error.Corrupt;
     }
 }
 
@@ -238,13 +238,13 @@ fn read_code(b: *mut Bits, codes: *mut Codes, alphabet: usize, lens: []mut u8) !
         let first8 = b.read(1);
         let s0 = @as(usize, b.read(1 + (7 * @as(u64, first8))));
         if s0 >= alphabet {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         lens[s0] = 1;
         if n == 2 {
             let s1 = @as(usize, b.read(8));
             if s1 >= alphabet {
-                return error.InvalidImage;
+                return error.Corrupt;
             }
             lens[s1] = 1;
         }
@@ -264,7 +264,7 @@ fn read_code(b: *mut Bits, codes: *mut Codes, alphabet: usize, lens: []mut u8) !
         let nb = 2 + (2 * @as(u64, b.read(3)));
         max = @as(usize, b.read(nb)) + 2;
         if max > alphabet {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
     }
     let mut prev: u8 = 8;
@@ -294,12 +294,12 @@ fn read_code(b: *mut Bits, codes: *mut Codes, alphabet: usize, lens: []mut u8) !
             rep = 11 + @as(usize, b.read(7));
         }
         if (s + rep) > alphabet {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         @mem_set(lens[s..s + rep], v);
         s += rep;
         if b.overrun() {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
     }
     codes.add(lens[..alphabet])!;
@@ -349,7 +349,7 @@ fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
     if b.read(1) == 1 {
         cache_bits = b.read(4);
         if (cache_bits < 1) or (cache_bits > 11) {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
     }
     let mut meta_bits: u32 = 0;
@@ -383,7 +383,7 @@ fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
         read_code(b, &mut codes, 256, lens)!;
         read_code(b, &mut codes, 40, lens)!;
         if b.overrun() {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
     }
     _ = cache_size;
@@ -439,7 +439,7 @@ fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
             let dist = plane_distance(w, copy_value(b, ds));
             if (dist > pos) or (len > (total - pos)) {
                 mem.free(px);
-                return error.InvalidImage;
+                return error.Corrupt;
             }
             for k in @as(usize, 0)..len {
                 px[pos + k] = px[(pos + k) - dist];
@@ -454,7 +454,7 @@ fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
             let key = @as(usize, green - 280);
             if (cache_bits == 0) or (key >= cache.len) {
                 mem.free(px);
-                return error.InvalidImage;
+                return error.Corrupt;
             }
             while cached < pos {
                 cache[@as(usize, (px[cached] *% 0x1e35a7bd) >> shift)] = px[cached];
@@ -476,7 +476,7 @@ fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
         }
         if b.overrun() {
             mem.free(px);
-            return error.InvalidImage;
+            return error.Corrupt;
         }
     }
     return px;
@@ -505,7 +505,7 @@ fn read_image(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
         while b.read(1) == 1 {
             let kind = b.read(2);
             if (seen & (@as(u32, 1) << kind)) != 0 {
-                return error.InvalidImage;
+                return error.Corrupt;
             }
             seen |= @as(u32, 1) << kind;
             let mut tr = Transform.{
@@ -720,7 +720,7 @@ fn uncolor(px: []mut u32, w: usize, h: usize, bits: u32, elems: []u32) void {
 // a whole VP8L bitstream (after its chunk header)
 fn decode_vp8l(data: []u8, w: *mut usize, h: *mut usize, alpha: *mut bool) ![]mut u32 {
     if (data.len < 5) or (data[0] != 0x2f) {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     let mut b = Bits.{ data: data[1..], pos: 0, acc: 0, n: 0 };
     w.* = @as(usize, b.read(14)) + 1;
@@ -748,13 +748,13 @@ struct Pic {
 
 fn decode_alpha(data: []u8, w: usize, h: usize, out: []mut u8) !void {
     if data.len < 1 {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     let method = data[0] & 3;
     let filter = (data[0] >> 2) & 3;
     if method == 0 {
         if (data.len - 1) < (w * h) {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         @mem_copy(out[..w * h], data[1..1 + (w * h)]);
     } else if method == 1 {
@@ -765,7 +765,7 @@ fn decode_alpha(data: []u8, w: usize, h: usize, out: []mut u8) !void {
         }
         mem.free(px);
     } else {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     if filter == 0 {
         return;
@@ -804,14 +804,14 @@ fn decode_pic(data: []u8) !Pic {
         let tag = data[p..p + 4];
         let size = @as(usize, binary.u32_le(data[p + 4..]));
         if size > (data.len - (p + 8)) {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         let body = data[p + 8..p + 8 + size];
         if strs.eq(tag, "ALPH") {
             alph = body;
             have_alph = true;
         } else if strs.eq(tag, "VP8 ") {
-            let hd = vp8.header(body) catch return error.InvalidImage;
+            let hd = vp8.header(body) catch return error.Corrupt;
             if (hd.width * hd.height) > image.MAX_PIXELS {
                 return error.TooLarge;
             }
@@ -821,7 +821,7 @@ fn decode_pic(data: []u8) !Pic {
                 if e == error.OutOfMemory {
                     return e;
                 }
-                return error.InvalidImage;
+                return error.Corrupt;
             };
             if have_alph {
                 let am = mem.alloc.[u8](hd.width * hd.height) catch |e| {
@@ -856,7 +856,7 @@ fn decode_pic(data: []u8) !Pic {
         }
         p += 8 + size + (size & 1);
     }
-    return error.InvalidImage;
+    return error.Corrupt;
 }
 
 // -----------------------------------------------------------------------------
@@ -936,7 +936,7 @@ struct Rect {
 
 fn decode_frames(data: []u8, first_only: bool) !Animation {
     if not is_webp(data) {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     let end = @min(data.len, @as(usize, binary.u32_le(data[4..])) + 8);
     let body = data[12..end];
@@ -959,7 +959,7 @@ fn decode_frames(data: []u8, first_only: bool) !Animation {
         return anim;
     }
     if not strs.eq(first, "VP8X") or (body.len < 18) {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     let flags = body[8];
     let cw = le24(body, 12) + 1;
@@ -1027,7 +1027,7 @@ fn decode_frames(data: []u8, first_only: bool) !Animation {
         let delay = @truncate(u32, le24(c, 12));
         if ((r.x + r.w) > cw) or ((r.y + r.h) > chh) or (r.w != pic.width) or (r.h != pic.height) {
             anim.deinit();
-            return error.InvalidImage;
+            return error.Corrupt;
         }
         let full = (r.w == cw) and (r.h == chh);
         let mut key = count == 0;
@@ -1090,7 +1090,7 @@ fn decode_frames(data: []u8, first_only: bool) !Animation {
     }
     if count == 0 {
         anim.deinit();
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     return anim;
 }
@@ -1801,14 +1801,14 @@ fn free_all(xs: []mut []mut u8) void {
 // without encoding again (the output is going to memory anyway)
 fn write_animation(w: io.Writer, frames: []*image.Image, delays_ms: []u32, loops: u16, keep: bool) !void {
     if (frames.len == 0) or (delays_ms.len != frames.len) {
-        return error.InvalidImage;
+        return error.Corrupt;
     }
     let wd = frames[0].width;
     let h = frames[0].height;
     check_size(frames[0])!;
     for f in frames {
         if (f.width != wd) or (f.height != h) {
-            return error.InvalidImage;
+            return error.Corrupt;
         }
     }
     // each frame's VP8L size
@@ -1874,7 +1874,7 @@ fn write_animation(w: io.Writer, frames: []*image.Image, delays_ms: []u32, loops
             let mut cw = io.CountingWriter.init(w);
             encode_vp8l(px, wd, h, cw.writer())!;
             if cw.count != @as(u64, n) {
-                return error.InvalidImage;  // (cannot happen: the encoding is deterministic)
+                return error.Corrupt;  // (cannot happen: the encoding is deterministic)
             }
         }
         if (n & 1) != 0 {
