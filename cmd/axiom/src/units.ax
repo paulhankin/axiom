@@ -145,11 +145,75 @@ fn module_key(m: *mut ast.Module, opts: []u8) []u8 {
     for i in 0..m.decls.len {
         let d = m.decls.get(i);
         if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) {
-            hash_str(&mut h, module_key(d.imported, opts));
+            hash_str(&mut h, interface_key(d.imported, opts));
         }
     }
     let key = hex_key(&h);
     key_memo.put(mk, key);
+    return key;
+}
+
+let mut iface_memo: u.SymMap.[[]u8] = u.SymMap.[[]u8].{ keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut []u8, 0), cap: 0, len: 0 };
+
+// A function whose body no other module's object depends on: not generic
+// (instances are compiled where they are used), not inline (inlined there),
+// not a test. Callers reach it by name, through its signature.
+fn body_private(d: *ast.Decl) bool {
+    return (d.kind == ast.D_FN) and u.notnil(d.body) and (d.gparams.len == 0) and not d.is_inline;
+}
+
+fn hash_blanked(h: *mut Hasher, text: []u8, from: *mut usize, body: *ast.Stmt) void {
+    let a = @as(usize, body.span.start);
+    let b = @as(usize, body.span.end);
+    if (a < from.*) or (b > text.len) or (a > b) {
+        return;
+    }
+    hash_bytes(h, text[from.*..a]);
+    hash_str(h, "{}");
+    from.* = b;
+}
+
+// What a module's importers depend on: its source without the bodies of
+// the functions they never see (body_private), its path, and the interface
+// keys of its imports in turn. A change inside such a body changes the
+// module's own key alone, so only the module is recompiled.
+fn interface_key(m: *mut ast.Module, opts: []u8) []u8 {
+    let mk = u.intern(m.path);
+    let k = iface_memo.get(mk);
+    if not u.isnos(k) {
+        return k;
+    }
+    let mut h = hasher();
+    hash_str(&mut h, compiler_id());
+    hash_str(&mut h, opts);
+    let f = u.file_of(m.file.id);
+    hash_str(&mut h, f.display);
+    let text = f.text;
+    let mut from: usize = 0;
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if body_private(d) {
+            hash_blanked(&mut h, text, &mut from, d.body);
+        } else if ((d.kind == ast.D_STRUCT) or (d.kind == ast.D_UNION) or (d.kind == ast.D_ENUM)) and
+                  (d.gparams.len == 0) {
+            for j in 0..d.methods.len {
+                let md = d.methods.get(j);
+                if body_private(md) {
+                    hash_blanked(&mut h, text, &mut from, md.body);
+                }
+            }
+        }
+    }
+    hash_bytes(&mut h, text[from..]);
+    for i in 0..m.decls.len {
+        let d = m.decls.get(i);
+        if (d.kind == ast.D_IMPORT) and u.notnil(d.imported) {
+            hash_str(&mut h, interface_key(d.imported, opts));
+        }
+    }
+    let key = hex_key(&h);
+    iface_memo.put(mk, key);
     return key;
 }
 

@@ -423,15 +423,31 @@ await section('cmd/axiom/internal/tests/units', {
     const dir = unitsCopy('units');
     const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'units-cache') };
     const out = path.join(tmp, 'units-prog' + (native ? '' : '.wasm'));
-    const want = ['42', '3', '9', 'too big', 'TooBig', '5'].join('\n');
+    let want = ['42', '3', '9', 'too big', 'TooBig', '5'].join('\n');
+    const lib = path.join(dir, 'lib.ax');
+    const replace = (from, to) => {
+      const t = fs.readFileSync(lib, 'utf8');
+      if (!t.includes(from)) throw new Error(`units test: lib.ax lacks ${from}`);
+      fs.writeFileSync(lib, t.replace(from, to));
+    };
+    // each step: an edit, the modules it should recompile (of t), the output
     const steps = [
       ['cold build', () => {}, (n, t) => n === t],
       ['no change', () => {}, (n) => n === 0],
       ['new error name renumbers all codes', () => fs.appendFileSync(path.join(dir, 'main.ax'), '\nerror { Aardvark }\n'), (n) => n === 1],
-      ['library edit', () => fs.appendFileSync(path.join(dir, 'lib.ax'), '\n// edited\n'), (n) => n === 2],
+      ['library edit outside a body', () => fs.appendFileSync(lib, '\n// edited\n'), (n) => n === 2],
+      // importers depend on a module's interface: the body of a function
+      // that is neither generic nor inline is the module's own business
+      ['library function body edit', () => replace('    calls += 1;\n', '    calls += 1;\n    _ = xs.len;\n'), (n) => n === 1],
+      ['library function body edit seen in the output', () => {
+        replace('return "too big";', 'return "too large";');
+        want = want.replace('too big', 'too large');
+      }, (n) => n === 1],
+      ['generic method body edit', () => replace('        return self.b;\n', '        _ = self.a;\n        return self.b;\n'), (n) => n === 2],
+      ['library signature edit', () => fs.appendFileSync(lib, '\npub fn more() u32 {\n    return 1;\n}\n'), (n) => n === 2],
       // on wasm the thread-locals of the whole program share one block whose
       // layout every module's code uses, so a new one recompiles everything
-      ['new thread-local', () => fs.appendFileSync(path.join(dir, 'lib.ax'), '\nthreadlocal let mut more: u8 = 0;\n'),
+      ['new thread-local', () => fs.appendFileSync(lib, '\nthreadlocal let mut more2: u8 = 0;\n'),
         (n, t) => native ? n === 2 : n === t],
     ];
     for (const [what, edit, ok] of steps) {

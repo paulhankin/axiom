@@ -2741,12 +2741,16 @@ object depends on:
 - the code-generation options (target, `-O`, overflow mode, stack traces, profiling,
   test mode);
 - the module's source and path;
-- recursively, the keys of the modules it imports;
+- recursively, the **interface keys** of the modules it imports: a module's source
+  without the bodies of its non-generic, non-inline functions and methods (which
+  importers reach by name, through their signatures), its path, and its imports'
+  interface keys in turn;
 - on WebAssembly, the layout of the program's thread-locals (§12.8.6): their order,
   sizes and alignments.
 
-Editing a module recompiles it and every module that imports it, directly or
-indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
+Editing a module recompiles it; editing its interface (anything but the body of a
+non-generic, non-inline function) also recompiles every module that imports it,
+directly or indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
 toolchain's C runtime (`std/internal/runtime/*.c`) is compiled once per content and cached the
 same way. `--verbose` reports how many modules were compiled and how many came from
 the cache.

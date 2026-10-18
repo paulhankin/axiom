@@ -73,7 +73,57 @@ typedef struct Unit {
     bool cached;
 } Unit;
 
-static SymMap key_memo;
+static SymMap key_memo, iface_memo;
+
+/* A function whose body no other module's object depends on: not generic
+   (instances are compiled where they are used), not inline (inlined there),
+   not a test. Callers reach it by name, through its signature. */
+static bool body_private(Decl *d) {
+    return d->kind == D_FN && d->body && d->gparams.len == 0 && !d->is_inline;
+}
+
+static void hash_blanked(Hasher *h, const char *text, size_t len, size_t *from, Stmt *body) {
+    size_t a = body->span.start, b = body->span.end;
+    if (a < *from || b > len || a > b) return;
+    hash_bytes(h, text + *from, a - *from);
+    hash_str(h, "{}");
+    *from = b;
+}
+
+/* What a module's importers depend on: its source without the bodies of the
+   functions they never see (body_private), its path, and the interface keys
+   of its imports in turn. A change inside such a body changes the module's
+   own key alone, so only the module is recompiled. */
+static const char *interface_key(Module *m, const char *opts) {
+    Sym mk = intern_cstr(m->path);
+    const char *k = symmap_get(&iface_memo, mk);
+    if (k) return k;
+    Hasher h = hasher();
+    hash_str(&h, compiler_id());
+    hash_str(&h, opts);
+    SourceFile *f = g_files.data[m->file->id];
+    hash_str(&h, f->display);
+    size_t from = 0;
+    for (int i = 0; i < m->decls.len; i++) {
+        Decl *d = m->decls.data[i];
+        if (body_private(d)) {
+            hash_blanked(&h, f->text, f->len, &from, d->body);
+        } else if ((d->kind == D_STRUCT || d->kind == D_UNION || d->kind == D_ENUM) && d->gparams.len == 0) {
+            for (int j = 0; j < d->methods.len; j++) {
+                Decl *md = d->methods.data[j];
+                if (body_private(md)) hash_blanked(&h, f->text, f->len, &from, md->body);
+            }
+        }
+    }
+    hash_bytes(&h, f->text + from, f->len - from);
+    for (int i = 0; i < m->decls.len; i++) {
+        Decl *d = m->decls.data[i];
+        if (d->kind == D_IMPORT && d->imported) hash_str(&h, interface_key(d->imported, opts));
+    }
+    k = hex_key(&h);
+    symmap_put(&iface_memo, mk, (void *)k);
+    return k;
+}
 
 static const char *module_key(Module *m, const char *opts) {
     Sym mk = intern_cstr(m->path);
@@ -91,7 +141,7 @@ static const char *module_key(Module *m, const char *opts) {
     hash_str(&h, has_tests ? "tests" : "no-tests");
     for (int i = 0; i < m->decls.len; i++) {
         Decl *d = m->decls.data[i];
-        if (d->kind == D_IMPORT && d->imported) hash_str(&h, module_key(d->imported, opts));
+        if (d->kind == D_IMPORT && d->imported) hash_str(&h, interface_key(d->imported, opts));
     }
     k = hex_key(&h);
     symmap_put(&key_memo, mk, (void *)k);
