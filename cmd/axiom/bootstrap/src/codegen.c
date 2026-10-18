@@ -56,6 +56,7 @@ typedef struct FnInst {
     bool dispatch;   // @features / @multiversion: chooses a version and calls it
     Sym key;
     int ninl;           // inline fn: trailing parameters for its callers' call sites (INL_SITES or 0)
+    int depth;          // instantiation nesting: one more than the instance whose body asked for it
     LLVMTypeRef ref_llty;  // its type without them
     LLVMValueRef ref;   // inline fn used as a value: a function without them that calls it
 } FnInst;
@@ -1473,6 +1474,12 @@ static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats) {
     fi->key = k;
     fi->feats = feats;
     fi->dispatch = d->kind == D_FN && d->attr != ATTR_NONE;
+    fi->depth = F ? F->inst->depth + 1 : 0;
+    if (fi->depth > 64) {
+        // (an instance that instantiates its function again with a larger type never ends)
+        diag_error(d->name_span, "E0465",
+                   "generic instantiation nested deeper than 64 levels: an instance of '%s' instantiates it again", d->name);
+    }
     for (int i = 0; i < n; i++)
         if (gargs[i]->has_params) internal_error("generic instance with unsubstituted arguments");
     fi->fnty = n ? type_subst(d->type, d->all_gparams, gargs, n) : d->type;
@@ -1566,7 +1573,7 @@ static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats) {
         // module's unit and only declared elsewhere; generic instances are
         // defined link-once by every unit that uses them.
         // Inline functions are defined (internal) by every unit that calls them.
-        bool define = true;
+        bool define = fi->depth <= 64;
         if (O->unit == CG_LINK) define = false;
         else if (O->unit == CG_MODULE && n == 0) define = d->module == O->module || d->is_inline;
         if ((O->unit == CG_WHOLE && !d->is_export) || d->is_inline) LLVMSetLinkage(fi->fn, LLVMInternalLinkage);

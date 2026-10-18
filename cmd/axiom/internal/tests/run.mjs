@@ -584,6 +584,117 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async
   }
 }
 
+// Diagnostic codes (spec §16.3): the table lists exactly the codes the two
+// compilers emit, and every emitted code is asserted by some test. A code
+// that no test can reach is listed here with the reason.
+{
+  const name = 'spec §16.3: diagnostic codes, both compilers and the tests agree';
+  if (!filter || name.includes(filter)) {
+    const codesIn = (text) => new Set([...text.matchAll(/"(E\d{4})"/g)].map((m) => m[1]));
+    const readAll = (dir, ext) => fs.readdirSync(dir).filter((f) => f.endsWith(ext)).map((f) => fs.readFileSync(path.join(dir, f), 'utf8')).join('\n');
+    const emittedAx = codesIn(readAll(path.join(root, 'cmd/axiom/src'), '.ax'));
+    const emittedC = codesIn(readAll(path.join(root, 'cmd/axiom/bootstrap/src'), '.c'));
+    const spec = fs.readFileSync(path.join(root, 'docs/spec.md'), 'utf8');
+    const tableText = spec.slice(spec.indexOf('### 16.3 Diagnostic codes'), spec.indexOf('### 16.4 '));
+    const table = new Set([...tableText.matchAll(/^\| (E\d{4}) \|/gm)].map((m) => m[1]));
+    // codes a test asserts: expect-error directives, and codes named in the suite's own checks
+    const asserted = new Set();
+    const walk = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (/\.(ax|mjs|toml)$/.test(e.name)) for (const m of fs.readFileSync(p, 'utf8').matchAll(/\bE\d{4}\b/g)) asserted.add(m[0]);
+      }
+    };
+    walk(path.join(root, 'cmd/axiom/internal/tests'));
+    const unreachable = {
+      E0651: 'needs 65535 error names',
+      E9003: 'a tool the command needs is missing (node, cc)',
+      E9004: 'the system linker failed',
+      E9006: 'the test runner itself failed',
+      E9007: 'an internal failure of code generation or formatting',
+    };
+    const problems = [];
+    const diff = (a, b) => [...a].filter((x) => !b.has(x)).sort();
+    const onlyAx = diff(emittedAx, emittedC), onlyC = diff(emittedC, emittedAx);
+    if (onlyAx.length) problems.push(`emitted only by the compiler: ${onlyAx.join(' ')}`);
+    if (onlyC.length) problems.push(`emitted only by the bootstrap compiler: ${onlyC.join(' ')}`);
+    const notInTable = diff(emittedAx, table), notEmitted = diff(table, emittedAx);
+    if (notInTable.length) problems.push(`emitted but not in the spec's table: ${notInTable.join(' ')}`);
+    if (notEmitted.length) problems.push(`in the spec's table but emitted by no compiler: ${notEmitted.join(' ')}`);
+    const untested = diff(emittedAx, asserted).filter((c) => !(c in unreachable));
+    if (untested.length) problems.push(`emitted but asserted by no test: ${untested.join(' ')}`);
+    if (problems.length) { fail++; failures.push(`FAIL ${name}:\n  ${problems.join('\n  ')}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name} (${emittedAx.size} codes)`); }
+  }
+}
+
+// Flags with no other assertion: each builds a program that then runs, or
+// produces the text asked for; `axiom version`; the version module's tests.
+{
+  const dir = path.join(tmp, 'flags');
+  fs.mkdirSync(dir, { recursive: true });
+  const src = path.join(dir, 'p.ax');
+  fs.writeFileSync(src, 'import "std/io" as io;\n\nexport fn main() i32 {\n    io.stdout().write_all("flag ok\\n") catch return 1;\n    return 0;\n}\n');
+  const isBootstrap = /bootstrap/.test(spawnSync(compiler, ['version'], { encoding: 'utf8' }).stdout);
+  const runs = (out) => {
+    const r = native ? spawnExe(out, [], { encoding: 'utf8' }) : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
+    return r.status === 0 && r.stdout === 'flag ok\n' ? null : `ran wrong: ${r.status}\n${r.stdout}${r.stderr}`;
+  };
+  const cases = {
+    '--stack-traces=off': () => { const o = path.join(dir, 'st' + (native ? '' : '.wasm')); const c = spawnSync(compiler, ['build', src, '--stack-traces=off', '-o', o, ...(native ? [nativeTarget] : [])], { encoding: 'utf8' }); return c.status ? c.stderr : runs(o); },
+    '--overflow=wrap': () => { const o = path.join(dir, 'ow' + (native ? '' : '.wasm')); const c = spawnSync(compiler, ['build', src, '--overflow=wrap', '-o', o, ...(native ? [nativeTarget] : [])], { encoding: 'utf8' }); return c.status ? c.stderr : runs(o); },
+    '--units=program': () => { const o = path.join(dir, 'up' + (native ? '' : '.wasm')); const c = spawnSync(compiler, ['build', src, '--units=program', '-o', o, ...(native ? [nativeTarget] : [])], { encoding: 'utf8' }); return c.status ? c.stderr : runs(o); },
+    '-g': () => { const o = path.join(dir, 'g' + (native ? '' : '.wasm')); const c = spawnSync(compiler, ['build', src, '-g', '-o', o, ...(native ? [nativeTarget] : [])], { encoding: 'utf8' }); return c.status ? c.stderr : runs(o); },
+    '--emit=asm (the bootstrap compiler) or --emit=obj': () => {
+      if (!native) return { skip: true };
+      // the compiler's native backends write objects, not assembly
+      const asm = isBootstrap;
+      const o = path.join(dir, asm ? 'p.s' : 'p.o');
+      const c = spawnSync(compiler, ['build', src, asm ? '--emit=asm' : '--emit=obj', '-o', o, nativeTarget], { encoding: 'utf8' });
+      if (c.status) return c.stderr;
+      if (asm) {
+        const text = fs.readFileSync(o, 'utf8');
+        return /main/.test(text) && text.length > 100 ? null : `assembly without main:\n${text.slice(0, 200)}`;
+      }
+      return fs.statSync(o).size > 100 ? null : 'an empty object file';
+    },
+    '--emit=ir': () => {
+      if (isBootstrap) return { skip: true };  // the bootstrap compiler has --emit=llvm instead
+      const o = path.join(dir, 'p.ir');
+      const c = spawnSync(compiler, ['build', src, '--emit=ir', '-o', o, ...(native ? [nativeTarget] : [])], { encoding: 'utf8' });
+      if (c.status) return c.stderr;
+      const text = fs.readFileSync(o, 'utf8');
+      return /main/.test(text) && /global/.test(text) ? null : `IR without main:\n${text.slice(0, 200)}`;
+    },
+    'axiom version': () => {
+      const v = /pub let VERSION: \[\]u8 = "([^"]+)"/.exec(fs.readFileSync(path.join(root, 'cmd/axiom/src/version.ax'), 'utf8'))[1];
+      const c = spawnSync(compiler, ['version'], { encoding: 'utf8' });
+      return c.status === 0 && c.stdout.startsWith(`axiom ${v}`) ? null : `version: ${c.stdout}${c.stderr}`;
+    },
+    'cmd/axiom/src/version.ax tests': () => {
+      const c = spawnSync(compiler, ['test', path.join(root, 'cmd/axiom/src/version.ax'), ...(native ? [nativeTarget] : [])], { encoding: 'utf8' });
+      return c.status === 0 && /\n\d+ passed, 0 failed/.test(c.stdout) ? null : `${c.stdout}${c.stderr}`;
+    },
+    'unknown target is E9002': () => {
+      const c = spawnSync(compiler, ['build', src, '--target=vax', '--format=agent-json', '-o', path.join(dir, 'x')], { encoding: 'utf8' });
+      return c.status === 2 && /"E9002"/.test(c.stdout) ? null : `${c.status}: ${c.stdout}${c.stderr}`;
+    },
+    'axiom new over an existing directory is E9005': () => {
+      const c = spawnSync(compiler, ['new', 'flags', '--format=agent-json'], { encoding: 'utf8', cwd: tmp });
+      return c.status !== 0 && /"E9005"/.test(c.stdout) ? null : `${c.status}: ${c.stdout}${c.stderr}`;
+    },
+  };
+  for (const [what, run] of Object.entries(cases)) {
+    const name = `flags: ${what}`;
+    if (filter && !name.includes(filter)) continue;
+    const r = run();
+    if (r && r.skip) { skip++; continue; }
+    if (r) { fail++; failures.push(`FAIL ${name}: ${r}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // The compiler reaches the system only through the host ABI, so
 // it must stay buildable for WebAssembly: no libc, no 64-bit
 // usize assumptions.
@@ -1016,6 +1127,7 @@ if (!skipPlatform) {
     },
     'undeclared dependency': async () => (errorCodes(path.join(pk, 'errors/undeclared')).includes('E0214') ? null : errorCodes(path.join(pk, 'errors/undeclared')).join()),
     'package name conflict': async () => (errorCodes(path.join(pk, 'errors/conflict')).includes('E0213') ? null : 'no E0213'),
+    'missing path dependency': async () => (errorCodes(path.join(pk, 'errors/missingdep')).includes('E0217') ? null : 'no E0217'),
     'invalid manifest': async () => {
       const c = errorCodes(path.join(pk, 'errors/badmanifest'));
       return c.length === 4 && c.every((x) => x === 'E0215') ? null : c.join();

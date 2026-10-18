@@ -2356,18 +2356,30 @@ Codes are stable. A code's meaning is never reused for something else.
 | `E06xx` | Control flow, returns, errors, discards |
 | `E07xx` | Places, mutability, pointers |
 | `E08xx` | ABI, exports, imports, SIMD, builtins |
-| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges |
+| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else`; `W0710` (a pointer to a local that escapes) is permitted, not yet emitted |
 | `Txxxx` | Runtime traps (Appendix B) |
 
-Initial registry, not exhaustive:
+The registry. It lists every code the compilers emit, and the test suite checks that
+it does (and that both compilers emit the same codes, each asserted by a test):
 
 | Code | Meaning |
 |---|---|
 | E0001 | Byte-order mark in source |
+| E0002 | Unexpected character, or `@` not followed by a builtin name |
+| E0003 | Reserved word used |
 | E0004 | Invalid character literal |
+| E0005 | Malformed number literal, or one that does not fit in 64 bits |
+| E0006 | Malformed escape sequence in a string or character literal |
+| E0100 | Syntax error: unexpected token |
+| E0104 | A reserved name (a keyword or primitive type name) used as a name |
 | E0120 | Unknown builtin |
 | E0150 | Operators require parentheses (§7.4) |
+| E0201 | Name already declared in this module |
+| E0202 | Unknown module, type or name |
+| E0203 | Item is not public |
 | E0204 | Shadowing |
+| E0205 | `Self` outside a struct or union |
+| E0206 | A reserved constraint name (`Ord`, `Num`, …) used as a generic parameter |
 | E0210 | Import cycle |
 | E0211 | Imported module not found |
 | E0213 | Two different packages with the same name in one build |
@@ -2378,42 +2390,9 @@ Initial registry, not exhaustive:
 | E0218 | Import path absolute or containing `\` |
 | E0219 | Import of an `internal` module from outside its parent's tree (§4.1) |
 | E0220 | A package needs a newer compiler (`axiom` in its manifest, §4.6) |
-| E0410 | Struct literal fields missing or out of order |
-| E0413 | `undefined` initializer on an immutable `let` |
-| E0414 | `undefined` initializer without a type annotation |
-| E0412 | Type mismatch |
-| E0460 | Generic type used without arguments |
-| E0461 | Operation not permitted by the parameter's constraint |
-| E0462 | Generic argument does not satisfy the constraint |
-| E0463 | Cannot deduce generic argument (only literals, or not in any parameter type) |
-| E0464 | Conflicting deductions for a generic parameter |
-| E0465 | Instantiation depth limit exceeded |
-| E0466 | Generic used where a concrete function is required (value, `export`, import) |
-| E0502 | Cannot infer type of literal |
-| E0503 | Literal out of range for type, or untyped `.{}` with no context |
-| E0510 | `@as` conversion is lossy |
-| E0512 | `@bit_cast` size mismatch |
-| E0520 | Unary `-` on unsigned type |
-| E0525 | Signed shift count |
-| E0530 | Overflow in constant evaluation |
-| E0540 | Index is not `usize` |
-| E0601 | Missing return |
-| E0604 | `break` or `continue` outside of a loop |
-| E0605 | `break` or `continue` names a label of no enclosing loop |
-| E0610 | `!` used in a function that does not return `!T` |
-| E0612 | `catch` block completes normally |
-| E0620 | Non-`void` result discarded |
-| E0621 | Error union discarded with `_ =` |
-| E0630 | Non-exhaustive `match` |
-| E0631 | Duplicate `match` pattern |
-| E0635 | A `match` arm with several patterns binds a payload |
-| E0640 | Control flow leaves a `defer` |
-| E0641 | `errdefer` in a function that cannot return an error |
-| E0650 | Undeclared error name |
-| E0701 | Assignment to an immutable place |
-| E0702 | `*mut Self` method called through `*T` |
-| E0703 | Mutable address of a temporary (`&mut`, or a `*mut Self` method on one) |
+| E0301 | Missing return type |
 | E0304 | Union or enum without variants (members) |
+| E0305 | `self` parameter with a type other than `Self`, `*Self` or `*mut Self` |
 | E0306 | Unknown ABI in `extern` (only `"C"`) |
 | E0307 | `...` outside `extern "C"`, or with no fixed parameter |
 | E0308 | Enum representation is not an integer type |
@@ -2422,8 +2401,87 @@ Initial registry, not exhaustive:
 | E0312 | Duplicate test name in a module |
 | E0313 | `inline` on an exported function, or with `@features` / `@multiversion` (§9.5) |
 | E0314 | Recursion through inline functions (§9.5) |
+| E0350 | A `const`, global or array-repeat count that is not a constant expression |
+| E0351 | A `const` whose value depends on itself |
+| E0352 | A `const` of a type other than integer, float, bool or enum |
+| E0353 | A `const` union value with a payload (not supported yet) |
 | E0354 | Thread-local global without `mut` |
+| E0400 | A type expected, found an integer, an expression or a constant |
+| E0401 | Nested error union `!!T` |
+| E0403 | A struct or union that contains itself by value |
+| E0404 | An element, parameter or field of type `void` |
+| E0405 | A value expected, found a type, module or function |
+| E0406 | Calling something that is not a function |
+| E0407 | Indexing a value that is not an array, slice or pointer to array |
+| E0408 | Struct literal of a non-struct type |
+| E0409 | A variable or binding of type `void` |
+| E0410 | Struct literal fields missing or out of order |
+| E0412 | Type mismatch |
+| E0413 | `undefined` initializer on an immutable `let` |
+| E0414 | `undefined` initializer without a type annotation |
+| E0420 | Wrong number of arguments |
+| E0421 | Method call on a function without a `self` parameter |
+| E0460 | Generic type used without arguments |
+| E0461 | Operation not permitted by the parameter's constraint |
+| E0462 | Generic argument does not satisfy the constraint |
+| E0463 | Cannot deduce generic argument (only literals, or not in any parameter type) |
+| E0464 | Conflicting deductions for a generic parameter |
+| E0465 | Instantiation depth limit exceeded |
+| E0466 | Generic used where a concrete function is required (value, `export`, import) |
+| E0467 | Wrong number of generic arguments |
+| E0468 | Generic arguments given to something that is not generic |
+| E0469 | Generic arguments given twice |
+| E0470 | Unknown constraint |
+| E0471 | A `const` generic parameter of a non-integer type |
+| E0472 | Array length or `const` argument that is not a non-negative integer constant |
+| E0502 | Cannot infer type of literal |
+| E0503 | Literal out of range for type, or untyped `.{}` with no context |
+| E0510 | `@as` conversion is lossy |
+| E0512 | `@bit_cast` size mismatch |
+| E0513 | Operator applied to an operand of the wrong type |
+| E0520 | Unary `-` on unsigned type |
+| E0521 | `%` on floats (use `@rem`) |
+| E0525 | Signed shift count |
+| E0530 | Overflow in constant evaluation |
+| E0531 | Division by zero in a constant expression |
+| E0540 | Index is not `usize` |
+| E0541 | A constant index out of bounds |
+| E0601 | Missing return |
+| E0602 | `return` without a value in a function that returns one |
+| E0603 | `return` with a value in a `void` function |
+| E0604 | `break` or `continue` outside of a loop |
+| E0605 | `break` or `continue` names a label of no enclosing loop |
+| E0610 | `!` used in a function that does not return `!T` |
+| E0611 | `!` or `catch` on a value that is not an error union |
+| E0612 | `catch` block completes normally |
+| E0613 | `catch <value>` on `!void` |
+| E0620 | Non-`void` result discarded |
+| E0621 | Error union discarded with `_ =` |
+| E0622 | Discarding a `void` expression |
+| E0630 | Non-exhaustive `match` |
+| E0631 | Duplicate `match` pattern |
+| E0632 | Unknown field, variant or member |
+| E0633 | Binding a payload from a variant or enum member that has none |
+| E0634 | A pattern that cannot match the scrutinee's type |
+| E0635 | A `match` arm with several patterns binds a payload |
+| E0640 | Control flow leaves a `defer` |
+| E0641 | `errdefer` in a function that cannot return an error |
+| E0650 | Undeclared error name |
+| E0651 | Too many error names (more than 65535) |
+| E0701 | Assignment to an immutable place |
+| E0702 | `*mut Self` method called through `*T` |
+| E0703 | Mutable address of a temporary (`&mut`, or a `*mut Self` method on one) |
+| E0704 | Slicing a temporary array |
+| E0705 | Dereferencing `*void` or a non-pointer |
+| E0706 | A pointer operation that needs `*mut`, or assignment to a non-place |
 | E0801 | Type not allowed at the export or import boundary |
+| E0802 | Export name used more than once |
+| E0810 | Comparing vectors with `==` or `<` (use `@lanes_eq`, …) |
+| E0811 | Division of integer vectors, or multiplication of 8-bit lanes |
+| E0812 | A vector builtin applied to a non-vector |
+| E0820 | A lane index that is not constant or out of range, or `@splat` without a type from context |
+| E0821 | `@offset_of` misuse |
+| E0822 | An enum or integer builtin applied to the wrong type |
 | E0823 | Invalid atomic operand (not a pointer to an integer, or not 32-bit for wait/notify) |
 | E0824 | C variadic argument without a promoted type |
 | E0825 | `@expect_eq` operand type cannot be compared |
@@ -2431,6 +2489,13 @@ Initial registry, not exhaustive:
 | E0827 | Unknown processor extension, architecture or operating system name (§13.4) |
 | E0828 | Builtin used in code not compiled for the architecture or extensions it needs (§13.4) |
 | E0829 | Invalid function attribute (`@features`, `@multiversion`) |
+| E9001 | Invalid invocation: unknown option, unexpected argument, missing input |
+| E9002 | Unknown target, processor or extension |
+| E9003 | A tool the command needs is missing (node, cc, the native runtime) |
+| E9004 | Linking failed, or is not supported for the target |
+| E9005 | Cannot create the output or package files |
+| E9006 | The test runner or profiler failed |
+| E9007 | Internal failure: code generation or formatting |
 
 ### 16.4 Runtime trap reporting and stack traces
 
