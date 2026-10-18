@@ -266,6 +266,10 @@ has not been audited: review it before relying on it.
   pointer to shared data and protect it with `std/sync`, or use `parallel_for`, which
   hands each thread a disjoint range. The allocator is thread-safe; `Vec` and `Map`
   are not.
+- **Byte order comes from `std/encoding/binary`.** A module that reads or writes
+  little- or big-endian integers uses `binary.u32_le(b[i..])`, `binary.put_u16_be(...)`
+  and the rest (inline functions, so they cost nothing) rather than its own helpers;
+  only the runtime, which `binary` sits above, keeps its own.
 - **Implementation modules live under `internal/`.** A module's parts that are not
   for programs (`graphics/internal/shape/`, `audio/internal/opus/`,
   `audio/internal/aac/`, `graphics/image/internal/av1/`, `text/internal/html/`, …) sit

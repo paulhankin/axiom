@@ -44,6 +44,7 @@ import "../crypto/kdf.ax" as kdf;
 import "../crypto/random.ax" as random;
 import "../crypto/sha2.ax" as sha2;
 import "../crypto/subtle.ax" as subtle;
+import "../encoding/binary.ax" as binary;
 import "../fmt.ax" as fmt;
 import "../io.ax" as io;
 import "../mem.ax" as mem;
@@ -104,18 +105,6 @@ pub struct Entry {
     }
 }
 
-fn le16(b: []u8, at: usize) u16 {
-    return @as(u16, b[at]) | (@as(u16, b[at + 1]) << 8);
-}
-
-fn le32(b: []u8, at: usize) u32 {
-    return @as(u32, le16(b, at)) | (@as(u32, le16(b, at + 2)) << 16);
-}
-
-fn le64(b: []u8, at: usize) u64 {
-    return @as(u64, le32(b, at)) | (@as(u64, le32(b, at + 4)) << 32);
-}
-
 /// A zip archive in memory (the bytes must outlive it).
 pub struct Archive {
     data: []u8,
@@ -149,7 +138,7 @@ pub struct Archive {
         let mut e = d.len - 22;
         let lowest = d.len - @min(d.len, 22 + 65535);
         loop {
-            if (le32(d, e) == SIG_END) and ((e + 22 + @as(usize, le16(d, e + 20))) <= d.len) {
+            if (binary.u32_le(d[e..]) == SIG_END) and ((e + 22 + @as(usize, binary.u16_le(d[e + 20..]))) <= d.len) {
                 break;
             }
             if e == lowest {
@@ -157,21 +146,21 @@ pub struct Archive {
             }
             e -= 1;
         }
-        let clen = @as(usize, le16(d, e + 20));
+        let clen = @as(usize, binary.u16_le(d[e + 20..]));
         self.comment = d[e + 22..e + 22 + clen];
-        let mut count = @as(u64, le16(d, e + 10));
-        let mut cd_size = @as(u64, le32(d, e + 12));
-        let mut cd_off = @as(u64, le32(d, e + 16));
+        let mut count = @as(u64, binary.u16_le(d[e + 10..]));
+        let mut cd_size = @as(u64, binary.u32_le(d[e + 12..]));
+        let mut cd_off = @as(u64, binary.u32_le(d[e + 16..]));
         // ZIP64: a locator just before the record points to the real numbers
-        if (e >= 20) and (le32(d, e - 20) == SIG_LOC64) {
-            let r = le64(d, e - 12);
-            if (r > @as(u64, d.len - 56)) or (le32(d, @truncate(usize, r)) != SIG_END64) {
+        if (e >= 20) and (binary.u32_le(d[e - 20..]) == SIG_LOC64) {
+            let r = binary.u64_le(d[e - 12..]);
+            if (r > @as(u64, d.len - 56)) or (binary.u32_le(d[@truncate(usize, r)..]) != SIG_END64) {
                 return error.Corrupt;
             }
             let ri = @truncate(usize, r);
-            count = le64(d, ri + 32);
-            cd_size = le64(d, ri + 40);
-            cd_off = le64(d, ri + 48);
+            count = binary.u64_le(d[ri + 32..]);
+            cd_size = binary.u64_le(d[ri + 40..]);
+            cd_off = binary.u64_le(d[ri + 48..]);
         }
         if (cd_off > @as(u64, d.len)) or (cd_size > (@as(u64, d.len) - cd_off)) {
             return error.Corrupt;
@@ -183,24 +172,26 @@ pub struct Archive {
         let end = p + @truncate(usize, cd_size);
         self.list.reserve(@truncate(usize, count))!;
         for _k in @as(u64, 0)..count {
-            if ((p + 46) > end) or (le32(d, p) != SIG_CENTRAL) {
+            if ((p + 46) > end) or (binary.u32_le(d[p..]) != SIG_CENTRAL) {
                 return error.Corrupt;
             }
-            let nlen = @as(usize, le16(d, p + 28));
-            let xlen = @as(usize, le16(d, p + 30));
-            let klen = @as(usize, le16(d, p + 32));
+            let nlen = @as(usize, binary.u16_le(d[p + 28..]));
+            let xlen = @as(usize, binary.u16_le(d[p + 30..]));
+            let klen = @as(usize, binary.u16_le(d[p + 32..]));
             if (p + 46 + nlen + xlen + klen) > end {
                 return error.Corrupt;
             }
-            let made_by = le16(d, p + 4) >> 8;
-            let mut ent = Entry.{ name: d[p + 46..p + 46 + nlen], method: le16(d, p + 10), flags: le16(d, p + 8),
-                                  crc: le32(d, p + 16), csize: @as(u64, le32(d, p + 20)),
-                                  size: @as(u64, le32(d, p + 24)), offset: @as(u64, le32(d, p + 42)),
-                                  mtime: dos_time(le16(d, p + 12), le16(d, p + 14)), mode: 0,
+            let made_by = binary.u16_le(d[p + 4..]) >> 8;
+            let mut ent = Entry.{ name: d[p + 46..p + 46 + nlen], method: binary.u16_le(d[p + 10..]),
+                                  flags: binary.u16_le(d[p + 8..]), crc: binary.u32_le(d[p + 16..]),
+                                  csize: @as(u64, binary.u32_le(d[p + 20..])),
+                                  size: @as(u64, binary.u32_le(d[p + 24..])),
+                                  offset: @as(u64, binary.u32_le(d[p + 42..])),
+                                  mtime: dos_time(binary.u16_le(d[p + 12..]), binary.u16_le(d[p + 14..])), mode: 0,
                                   comment: d[p + 46 + nlen + xlen..p + 46 + nlen + xlen + klen], aes_strength: 0,
                                   aes_version: 0, aes_method: 0 };
             if made_by == 3 {
-                ent.mode = le32(d, p + 38) >> 16;  // made on Unix: the mode is in the high bits
+                ent.mode = binary.u32_le(d[p + 38..]) >> 16;  // made on Unix: the mode is in the high bits
             }
             extra_fields(d[p + 46 + nlen..p + 46 + nlen + xlen], &mut ent)!;
             self.list.push(ent)!;
@@ -221,11 +212,12 @@ pub struct Archive {
     /// An entry's compressed bytes (as stored in the archive).
     pub fn raw(self: *Archive, e: Entry) ![]u8 {
         let d = self.data;
-        if (e.offset > @as(u64, d.len - @min(d.len, 30))) or (le32(d, @truncate(usize, e.offset)) != SIG_LOCAL) {
+        if (e.offset > @as(u64, d.len - @min(d.len, 30))) or
+           (binary.u32_le(d[@truncate(usize, e.offset)..]) != SIG_LOCAL) {
             return error.Corrupt;
         }
         let o = @truncate(usize, e.offset);
-        let st = o + 30 + @as(usize, le16(d, o + 26)) + @as(usize, le16(d, o + 28));
+        let st = o + 30 + @as(usize, binary.u16_le(d[o + 26..])) + @as(usize, binary.u16_le(d[o + 28..]));
         if (st > d.len) or (e.csize > @as(u64, d.len - st)) {
             return error.Corrupt;
         }
@@ -262,7 +254,7 @@ pub struct Archive {
         let mut check = @truncate(u8, e.crc >> 24);
         if (e.flags & 8) != 0 {
             let o = @truncate(usize, e.offset);
-            check = @truncate(u8, le16(self.data, o + 10) >> 8);
+            check = @truncate(u8, binary.u16_le(self.data[o + 10..]) >> 8);
         }
         let plain = zipcrypto_open(src, password, check)!;
         defer mem.free(plain);
@@ -530,8 +522,8 @@ pub fn safe_name(name: []u8) bool {
 fn extra_fields(x: []u8, e: *mut Entry) !void {
     let mut i: usize = 0;
     while (i + 4) <= x.len {
-        let id = le16(x, i);
-        let n = @as(usize, le16(x, i + 2));
+        let id = binary.u16_le(x[i..]);
+        let n = @as(usize, binary.u16_le(x[i + 2..]));
         if (i + 4 + n) > x.len {
             return error.Corrupt;
         }
@@ -543,28 +535,28 @@ fn extra_fields(x: []u8, e: *mut Entry) !void {
                 if (j + 8) > f.len {
                     return error.Corrupt;
                 }
-                e.size = le64(f, j);
+                e.size = binary.u64_le(f[j..]);
                 j += 8;
             }
             if e.csize == 0xffffffff {
                 if (j + 8) > f.len {
                     return error.Corrupt;
                 }
-                e.csize = le64(f, j);
+                e.csize = binary.u64_le(f[j..]);
                 j += 8;
             }
             if e.offset == 0xffffffff {
                 if (j + 8) > f.len {
                     return error.Corrupt;
                 }
-                e.offset = le64(f, j);
+                e.offset = binary.u64_le(f[j..]);
             }
         } else if (id == 0x9901) and (n >= 7) and (f[2] == 'A') and (f[3] == 'E') {
-            e.aes_version = le16(f, 0);
+            e.aes_version = binary.u16_le(f[0..]);
             e.aes_strength = f[4];
-            e.aes_method = le16(f, 5);
+            e.aes_method = binary.u16_le(f[5..]);
         } else if (id == 0x5455) and (n >= 5) and ((f[0] & 1) != 0) {
-            e.mtime = @as(i64, @bit_cast(i32, le32(f, 1)));
+            e.mtime = @as(i64, @bit_cast(i32, binary.u32_le(f[1..])));
         }
         i += 4 + n;
     }

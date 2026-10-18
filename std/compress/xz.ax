@@ -24,6 +24,7 @@
 
 import "../collections/vec.ax" as vec;
 import "../crypto/sha2.ax" as sha2;
+import "../encoding/binary.ax" as binary;
 import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
@@ -307,14 +308,6 @@ pub fn crc64(crc: u64, data: []u8) u64 {
         c = CRC64_TABLE[@as(usize, @truncate(u8, c) ^ b)] ^ (c >> 8);
     }
     return ~c;
-}
-
-fn le32(b: []u8, i: usize) u32 {
-    return @as(u32, b[i]) | (@as(u32, b[i + 1]) << 8) | (@as(u32, b[i + 2]) << 16) | (@as(u32, b[i + 3]) << 24);
-}
-
-fn le64(b: []u8, i: usize) u64 {
-    return @as(u64, le32(b, i)) | (@as(u64, le32(b, i + 4)) << 32);
 }
 
 // -----------------------------------------------------------------------------
@@ -811,7 +804,7 @@ pub fn decompress_lzma(src: []u8, max_size: usize) ![]mut u8 {
     if p >= (9 * 5 * 5) {
         return error.Corrupt;
     }
-    let size = le64(src, 5);
+    let size = binary.u64_le(src[5..]);
     let known = size != 0xffffffffffffffff;
     if known and (size > @as(u64, max_size)) {
         return error.TooLarge;
@@ -900,7 +893,7 @@ fn x86_decode(b: []mut u8, start: u32) void {
         have_prev = true;
         let b4 = b[i + 4];
         if (b4 == 0) or (b4 == 0xff) {
-            let mut src = le32(b, i + 1);
+            let mut src = binary.u32_le(b[i + 1..]);
             let now = start +% @truncate(u32, i + 5);
             let mut dest: u32 = 0;
             loop {
@@ -970,12 +963,12 @@ fn arm64_decode(b: []mut u8, start: u32) void {
     let mut i: usize = 0;
     while (i + 4) <= b.len {
         let pc = start +% @truncate(u32, i);
-        let mut ins = le32(b, i);
+        let mut ins = binary.u32_le(b[i..]);
         if (ins >> 26) == 0x25 {
             // BL
             let src = ins;
             ins = 0x94000000 | (((src & 0x03ffffff) -% (pc >> 2)) & 0x03ffffff);
-            put_le32(b, i, ins);
+            binary.put_u32_le(b[i..], ins);
         } else if (ins & 0x9f000000) == 0x90000000 {
             // ADRP
             let src = ((ins >> 29) & 3) | ((ins >> 3) & 0x001ffffc);
@@ -985,7 +978,7 @@ fn arm64_decode(b: []mut u8, start: u32) void {
                 ins |= (dest & 3) << 29;
                 ins |= (dest & 0x0003fffc) << 3;
                 ins |= (0 -% (dest & 0x00020000)) & 0x00e00000;
-                put_le32(b, i, ins);
+                binary.put_u32_le(b[i..], ins);
             }
         }
         i += 4;
@@ -1025,13 +1018,6 @@ fn sparc_decode(b: []mut u8, start: u32) void {
         }
         i += 4;
     }
-}
-
-fn put_le32(b: []mut u8, i: usize, v: u32) void {
-    b[i] = @truncate(u8, v);
-    b[i + 1] = @truncate(u8, v >> 8);
-    b[i + 2] = @truncate(u8, v >> 16);
-    b[i + 3] = @truncate(u8, v >> 24);
 }
 
 // -----------------------------------------------------------------------------
@@ -1096,7 +1082,7 @@ fn decode_streams(d: []u8, out: *mut strs.String, max_size: usize) !void {
     while i < d.len {
         // stream padding: zeros in groups of four
         if (streams > 0) and (d[i] == 0) {
-            if ((d.len - i) < 4) or (le32(d, i) != 0) {
+            if ((d.len - i) < 4) or (binary.u32_le(d[i..]) != 0) {
                 return error.Corrupt;
             }
             i += 4;
@@ -1114,7 +1100,7 @@ fn stream(d: []u8, at: usize, out: *mut strs.String, max_size: usize) !usize {
     if ((d.len - at) < 24) or not strs.eq(d[at..at + 6], HEADER_MAGIC) {
         return error.Corrupt;
     }
-    if deflate.crc32(0, d[at + 6..at + 8]) != le32(d, at + 8) {
+    if deflate.crc32(0, d[at + 6..at + 8]) != binary.u32_le(d[at + 8..]) {
         return error.ChecksumMismatch;
     }
     if (d[at + 6] != 0) or (d[at + 7] > 15) {
@@ -1157,7 +1143,7 @@ fn stream(d: []u8, at: usize, out: *mut strs.String, max_size: usize) !usize {
         }
         i += 1;
     }
-    if ((d.len - i) < 4) or (deflate.crc32(0, d[ix..i]) != le32(d, i)) {
+    if ((d.len - i) < 4) or (deflate.crc32(0, d[ix..i]) != binary.u32_le(d[i..])) {
         return error.ChecksumMismatch;
     }
     i += 4;
@@ -1165,10 +1151,10 @@ fn stream(d: []u8, at: usize, out: *mut strs.String, max_size: usize) !usize {
     if (d.len - i) < 12 {
         return error.Corrupt;
     }
-    if deflate.crc32(0, d[i + 4..i + 10]) != le32(d, i) {
+    if deflate.crc32(0, d[i + 4..i + 10]) != binary.u32_le(d[i..]) {
         return error.ChecksumMismatch;
     }
-    let backward = (@as(u64, le32(d, i + 4)) + 1) * 4;
+    let backward = (@as(u64, binary.u32_le(d[i + 4..])) + 1) * 4;
     if (backward != @as(u64, i - ix)) or (d[i + 8] != 0) or (d[i + 9] != check) or (d[i + 10] != 'Y') or
        (d[i + 11] != 'Z') {
         return error.Corrupt;
@@ -1182,7 +1168,7 @@ fn block(d: []u8, at: usize, check: u8, csize: usize, out: *mut strs.String, max
     if (d.len - at) < hsize {
         return error.Corrupt;
     }
-    if deflate.crc32(0, d[at..at + hsize - 4]) != le32(d, at + hsize - 4) {
+    if deflate.crc32(0, d[at..at + hsize - 4]) != binary.u32_le(d[at + hsize - 4..]) {
         return error.ChecksumMismatch;
     }
     let flags = d[at + 1];
@@ -1238,7 +1224,7 @@ fn block(d: []u8, at: usize, check: u8, csize: usize, out: *mut strs.String, max
         let buf = out.buf[start..out.len];
         let mut offset: u32 = 0;
         if (f.id != F_DELTA) and (f.props.len == 4) {
-            offset = le32(f.props, 0);
+            offset = binary.u32_le(f.props[0..]);
         } else if (f.id != F_DELTA) and (f.props.len != 0) {
             return error.Corrupt;
         }
@@ -1276,11 +1262,11 @@ fn block(d: []u8, at: usize, check: u8, csize: usize, out: *mut strs.String, max
     }
     let body = out.buf[start..out.len];
     if check == @int_from_enum(Check.CRC32) {
-        if deflate.crc32(0, body) != le32(d, e) {
+        if deflate.crc32(0, body) != binary.u32_le(d[e..]) {
             return error.ChecksumMismatch;
         }
     } else if check == @int_from_enum(Check.CRC64) {
-        if crc64(0, body) != le64(d, e) {
+        if crc64(0, body) != binary.u64_le(d[e..]) {
             return error.ChecksumMismatch;
         }
     } else if check == @int_from_enum(Check.SHA256) {
