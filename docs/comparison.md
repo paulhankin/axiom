@@ -329,7 +329,7 @@ weakly ordered CPUs such as ARM.
 ## Interoperability and targets
 
 - **Axiom** targets x86-64 and AArch64 natively (Linux, macOS on Apple silicon, Windows)
-  and WebAssembly (`wasm32`, `wasm64`, freestanding or WASI). `extern "C"` blocks call
+  and WebAssembly (`wasm32`, `wasm64`). `extern "C"` blocks call
   C, `export fn` exposes functions, and the compiler generates a C header for them. The
   compiler has its own backends and linkers. On Linux the programs it builds make system
   calls directly and are static executables with no C library, unless they link C code
@@ -357,8 +357,7 @@ weakly ordered CPUs such as ARM.
 - **Young.** Axiom is a v0.1 draft with no third-party ecosystem, and its standard
   library has no locale-aware formatting. On this repository's benchmarks
   (`cmd/axiom/bench.sh`), the compiler's own backend produces code that takes between
-  0.7 and 1.05 times as long as the LLVM-built code of the bootstrap compiler, and the
-  compiler it builds compiles about twice as fast as the LLVM-built one.
+  0.7 and 1.05 times as long as the LLVM-built code of the bootstrap compiler.
 
 ## Choosing
 

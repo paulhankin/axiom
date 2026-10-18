@@ -50,6 +50,12 @@ while [ "$seed" -le "$last" ]; do
                "x86-64-v4:--cpu=x86-64-v4" "x86-64-v4-O2:--cpu=x86-64-v4 -O2" \
                "avx512bw:--cpu=x86-64-v3 --features=+avx512bw"; do
         name=${cfg%%:*}
+        # only what this processor runs: the x86-64 configurations on an x86-64
+        # host, and the AVX-512 ones where it has AVX-512BW
+        [ "$(uname -m)" = x86_64 ] || continue
+        case $name in
+            x86-64-v4* | avx512bw) grep -q avx512bw /proc/cpuinfo 2>/dev/null || { echo "  $name: skipped (no AVX-512 here)"; continue; } ;;
+        esac
         # shellcheck disable=SC2086
         if $NEW build "$f" --target=x86_64 ${cfg#*:} --link=$RT -o "$T/x" > "$T/log" 2>&1; then
             "$T/x" > "$T/x.txt" 2>&1

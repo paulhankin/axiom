@@ -41,11 +41,20 @@ const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
 const extraFlags = argv.filter(a => /^-O[0-3]$/.test(a) || /^--units=(module|program)$/.test(a) || a === '-g');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'axiom-tests-'));
+// the temporary directory goes whatever ends the run: the summary, an
+// uncaught error, or Ctrl-C
+process.on('exit', () => fs.rmSync(tmp, { recursive: true, force: true }));
+process.on('SIGINT', () => process.exit(130));
+process.on('SIGTERM', () => process.exit(143));
+// No build or run may hang the suite: a compile gets five minutes, a program
+// two (more when emulated), and an `axiom test` run a minute per test.
+const compileTimeout = 300000;
+const runTimeout = (process.env.AXIOM_NATIVE_EXEC ? 4 : 1) * 120000;
 const jobs = Math.max(1, Number(process.env.AXIOM_TEST_JOBS) || os.availableParallelism());
 const skipPlatform = !!process.env.AXIOM_TEST_SKIP_PLATFORM && process.env.AXIOM_TEST_SKIP_PLATFORM !== '0';
 // Emulated tests run several times slower, and tests sharing the CPUs
 // slower too: give each test a minute.
-const testTimeout = execWrap.length || jobs > 1 ? ['--timeout=60000'] : [];
+const testTimeout = ['--timeout=60000'];
 
 // spawnSync's result ({ status, signal, stdout, stderr, error }; text), as a
 // promise. Honors cwd, env and timeout.
@@ -149,12 +158,14 @@ async function runWasm(file) {
 }
 
 async function runNative(exe) {
-  const r = await spawnExeAsync(exe, [], { encoding: 'utf8' });
+  const r = await spawnExeAsync(exe, [], { encoding: 'utf8', timeout: runTimeout });
+  if (r.error && r.error.code === 'ETIMEDOUT') return { out: [], trapped: true, msg: `timed out after ${runTimeout / 1000} s` };
   const out = r.stdout.split('\n');
   if (out[out.length - 1] === '') out.pop();
   return { out, trapped: r.status !== 0, msg: r.signal || `exit ${r.status}` };
 }
 
+console.log(`compiler ${path.relative(root, compiler)}, ${native ? `native (${nativeTarget || 'this machine'}${execWrap.length ? `, run with ${execWrap.join(' ')}` : ''})` : 'wasm32'}${extraFlags.length ? `, ${extraFlags.join(' ')}` : ''}, ${jobs} jobs`);
 let pass = 0, fail = 0, skip = 0;
 const failures = [];
 // A result: null (filtered out), { skip: true }, or { name, problem, ms, stderr }.
@@ -183,12 +194,14 @@ await inOrder([...files(path.join(root, 'cmd/axiom/internal/tests/run')), ...fil
   for (const l of d.links) args.push(`--link=${path.join(path.dirname(f), l)}`);
   if (d.header) args.push(`--emit-header=${path.join(dir, d.header)}`);
   const t0 = process.hrtime.bigint();
-  const c = await spawnAsync(compiler, args, { encoding: 'utf8' });
+  const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   let problem = null, stderr = '';
   let json = null;
   try { json = JSON.parse(c.stdout); } catch { json = null; }
-  if (d.errors.length) {
+  if (c.error && c.error.code === 'ETIMEDOUT') {
+    problem = `the compiler did not finish in ${compileTimeout / 1000} s`;
+  } else if (d.errors.length) {
     const codes = json ? json.diagnostics.filter(x => x.severity === 'error').map(x => x.code) : [];
     if (c.status === 0) problem = `expected errors ${d.errors.join(', ')}, but compilation succeeded`;
     else for (const e of d.errors) if (!codes.includes(e)) problem = `expected ${e}, got [${codes.join(', ')}]:\n${c.stdout}${c.stderr}`;
@@ -954,5 +967,4 @@ if (!native) {
 
 for (const f of failures) console.log('\n' + f);
 console.log(`\n${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
-fs.rmSync(tmp, { recursive: true, force: true });
 process.exit(fail ? 1 : 0);

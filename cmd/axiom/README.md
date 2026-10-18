@@ -293,7 +293,7 @@ a load (a heap or tree walk), where a predicted branch lets the load start
 early.
 
 Native code keeps stack traces without the shadow stack's call records (spec
-§17.4.1, "Frame tables"): every function that makes a call keeps a frame
+§16.4.1, "Frame tables"): every function that makes a call keeps a frame
 pointer, each call carries its chain of site records (`ir.Chain`: its own,
 then those of the calls inlined around it, which the inliner appends as it
 inlines), and the backends follow each call with an entry in the section

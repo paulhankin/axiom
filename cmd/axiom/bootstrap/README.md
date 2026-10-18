@@ -191,7 +191,7 @@ full `-O0` build of 2,000 functions takes about 0.8–1.5 s, which is as fast as
 
 ## Status against the specification
 
-Implemented: the whole language described in spec v0.1-draft.3:
+Implemented: the whole language described in spec v0.1-draft.9:
 - lexical structure, grammar, operator partial order
 - modules and imports, `pub` / `export`, the no-shadowing rule
 - all primitive, pointer, slice, array, struct, union, error-union and function-pointer
@@ -208,16 +208,10 @@ Implemented: the whole language described in spec v0.1-draft.3:
 
 Not yet implemented (reported with a diagnostic where relevant):
 
-- `axiom fmt` (only the self-hosted compiler has it: [`cmd/axiom/`](../README.md)),
-  `axiom run` and `axiom explain` (spec §16.1).
-- The debug trap map (`axiom.traps` custom section) and error-return traces
-  (spec §16.4). Traps are plain `unreachable`, so the trap code isn't reported yet.
+- `axiom fmt`, `axiom lsp`, `axiom ide`, `--link=<file.ax>` and the native backends for
+  macOS and Windows (only the compiler, [`cmd/axiom/`](../README.md), has them).
+- The debug trap map (`axiom.traps` custom section, spec §16.4).
 - Global initializers containing union values with a payload (`E0353`).
-- **Native targets use machine addresses for raw pointers**, as spec §12.1 describes:
-  slices, arrays and all checked operations behave as on wasm, and a raw pointer that
-  points outside mapped memory crashes with a signal.
-  On native targets linear memory is a region of address space reserved at the first
-  `@memory_grow` (up to 1 TiB) and committed 64 KiB page at a time (std/internal/runtime/native_host.c).
 - **Data races at -O1 and above.** The spec (§12.8.2) forbids optimizations that are
   valid only for race-free programs. At `-O0` the generated code honors this. At `-O1`
   and above the compiler relies on LLVM, whose IR memory model formally treats a

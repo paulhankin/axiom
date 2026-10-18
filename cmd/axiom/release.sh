@@ -61,8 +61,11 @@ mtime=$(git log -1 --format=%ct)
 cmd/axiom/bootstrap.sh
 A=cmd/axiom/build/axiom
 if [ "${SKIP_TESTS:-0}" != 1 ]; then
+    # the suite with both compilers, and with the compiler as the archives
+    # have it: native code at -O2
     node cmd/axiom/internal/tests/run.mjs
     AXIOM=$A node cmd/axiom/internal/tests/run.mjs
+    AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 node cmd/axiom/internal/tests/run.mjs --native -O2
 fi
 
 R=build/release
@@ -116,6 +119,25 @@ else:
 EOF
 done
 
+# Every archive holds the compiler, the library and the runtime, and no test data.
+for f in "$R"/axiom-"$v"-*; do
+    case $f in
+        *.zip) list=$(unzip -Z1 "$f") ;;
+        *) list=$(tar -tzf "$f") ;;
+    esac
+    for want in bin/axiom std/mem.ax std/internal/runtime/host.mjs std/internal/runtime/rt.ax LICENSE-MIT RELEASE-NOTES.md; do
+        echo "$list" | grep -q "/$want" || echo "$list" | grep -q "/${want}.exe" ||
+            { echo "release: $(basename "$f") lacks $want" >&2; exit 1; }
+    done
+    echo "$list" | grep -q testdata && { echo "release: $(basename "$f") holds test data" >&2; exit 1; }
+done
+# The AArch64 compiler reports its version under qemu, where qemu is.
+if command -v qemu-aarch64 >/dev/null && [ "$(uname -m)" = x86_64 ]; then
+    mkdir -p "$R/stage/qa"
+    tar -xzf "$R/axiom-$v-linux-aarch64.tar.gz" -C "$R/stage/qa"
+    [ "$(qemu-aarch64 "$R/stage/qa/axiom-$v-linux-aarch64/bin/axiom" version)" = "axiom $v" ] ||
+        { echo "release: the AArch64 compiler does not run under qemu" >&2; exit 1; }
+fi
 # The Linux x86-64 archive, unpacked, builds and runs a program.
 if [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ]; then
     T=$R/stage/check

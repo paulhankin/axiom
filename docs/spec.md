@@ -1745,8 +1745,8 @@ every module's cache key.
 
 Integer vector arithmetic wraps, like scalar arithmetic by default (§7.6). It wraps under
 `--overflow=trap` and `--overflow=saturate` too: checking every lane would be expensive,
-and WebAssembly and most processors have no lane-wise overflow flags. (Until issue 0047,
-when scalars trapped by default, integer vectors required `+%`; it remains valid.)
+and WebAssembly and most processors have no lane-wise overflow flags. `+%`, `-%` and
+`*%` on integer vectors mean the same as `+`, `-` and `*`.
 
 Scalars are **never** broadcast implicitly. Write `@splat(x)`.
 
@@ -1975,7 +1975,6 @@ std/hash/crc, with the portable code where they are absent.
 | Target | `usize` | Notes |
 |---|---|---|
 | `wasm32-freestanding` | 32 | No WASI and no imports except those declared |
-| `wasm32-wasi` | 32 | Standard library may use WASI imports |
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Allocator memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Pointers are machine addresses, and accesses through them are not checked (§12.1) |
 | `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; self-hosted compiler only. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
@@ -2224,12 +2223,12 @@ axiom build <file.ax> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate] -o
                           [-g | --debug-info=lines|none]            # DWARF line tables (below)
 axiom check <file.ax>                  # parse and type-check only; no codegen
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
-axiom run   <file.ax> [--export=name]  # build for wasm32 and execute in the reference runtime
-axiom explain <CODE>                   # long-form documentation for a diagnostic code
 axiom test  <file.ax> [--filter=text] [--timeout=ms]   # run test blocks (§17)
 axiom new   <name>                     # create a package skeleton (§4.6)
 axiom profile <file.ax> [-- args]      # sampling profiler (§16.6)
 axiom cache [path|clean]               # the compiled-module cache (§16.7)
+axiom lsp                              # the language server, over standard input and output
+axiom version                          # the compiler's version
 ```
 
 `build`, `check` and `test` also accept a package directory, or no path at all for the
@@ -2241,7 +2240,7 @@ Every command accepts `--format=human` (the default) or `--format=agent-json`.
 the language's meaning; `trap` checks every `+`, `-`, `*`, unary `-`, `MIN / -1` and
 `@abs` on integers and traps (`T0002`) on overflow, to find unintended overflows; `saturate`
 clamps. `build`, `test` and `profile` accept it. `--release` is accepted for
-compatibility and changes nothing (it selected `saturate` until issue 0047).
+compatibility and changes nothing.
 
 `-g` (or `--debug-info=lines`) adds DWARF line tables to the output: a compile unit per
 object, a subprogram per function and a source line and column for each instruction,
@@ -2250,9 +2249,8 @@ so that native profilers (`perf annotate`, `perf report --sort srcline`), debugg
 (`DW_TAG_inlined_subroutine`). It is off by default (`--debug-info=none`), at every
 optimization level: stack traces (§16.4) need no debug information, and outputs
 stay small and independent of the directory they were built in. It does not change
-the generated instructions. `build`, `test` and `profile` accept it; the C compiler emits line tables
-for native and WebAssembly targets, and the self-hosted compiler accepts the option and
-emits none.
+the generated instructions. `build`, `test` and `profile` accept it. Today only the
+bootstrap compiler emits line tables; the compiler accepts the option and emits none.
 
 - Compiler output is **deterministic**. The same inputs and flags produce byte-identical
   `.wasm` files and diagnostics.
@@ -2421,7 +2419,7 @@ Traps raised by the engine or the OS rather than by a check are mapped to their 
 out-of-bounds memory is `T0005`, stack exhaustion `T0008`, and a bad `call_indirect`
 `T0009`.
 
-#### 17.4.1 Stack traces
+#### 16.4.1 Stack traces
 
 Every trap and crash is reported with a **stack trace**:
 
@@ -2484,7 +2482,7 @@ build the same records without a shadow stack, and calls cost nothing:
   interrupted one, and looks each return address up. The frames fill the thread's
   shadow-stack record (its calls and depth) as the stores would have, so the report,
   `ax_on_trap`'s third argument and the test runner's frames are the same. Error-return
-  traces (§17.4.2) still use the record's ring.
+  traces (§16.4.2) still use the record's ring.
 - The differences: a fault that is not a check (a raw pointer access, say) inside a
   function the optimizer inlined is reported in the function it was inlined into, and
   frames outside a callback from C code compiled without frame pointers can be missing
@@ -2499,7 +2497,7 @@ build the same records without a shadow stack, and calls cost nothing:
 Traces are diagnostics only: whether they are on never changes a program's
 behavior. Record contents and layouts are toolchain ABI, not language semantics.
 
-#### 17.4.2 Error return traces
+#### 16.4.2 Error return traces
 
 Every `return` of an error value and every `!` that propagates an error appends a
 site to the thread's error-return ring. A `catch` that handles an error clears the
@@ -2678,7 +2676,7 @@ What makes modules independent:
 `-O1`. Those are the edit–build–test builds, where only changed modules are recompiled.
 At `-O2` and `-O3` the default is still one whole-program unit, so functions can be
 inlined across modules. `--units=module|program` overrides the default. Emitting a
-single object, IR or assembly file (`--emit=obj|llvm|asm`) always uses one unit.
+single object or IR file (`--emit=obj|ir`) always uses one unit.
 
 A program means the same whatever the unit mode. The test suite runs in both modes.
 

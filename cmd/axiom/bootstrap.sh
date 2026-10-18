@@ -11,6 +11,10 @@
 #   OPT     optimization level for stages 2 and 3 (default: -O2)
 #   OPT1    optimization level for stage 1 (default: -O0: LLVM takes a
 #           minute at -O2, and stage 2 comes out the same either way)
+#   TARGET  the compiler's target (default: the generic processor of this
+#           machine's architecture, so the binary runs on any machine of its
+#           kind; TARGET=native tunes it to this processor's extensions, and
+#           it then runs only where they exist)
 #   CROSS   1: also check that stage 2 built for the other architecture (run
 #           with qemu) generates the same code as stage 2 itself
 set -eu
@@ -20,19 +24,30 @@ OPT=${OPT:--O2}
 OPT1=${OPT1:--O0}
 CROSS=${CROSS:-0}
 B=cmd/axiom/build
+if [ -z "${TARGET:-}" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-*) TARGET=aarch64-macos ;;
+        *-x86_64) TARGET=x86_64 ;;
+        *-aarch64 | *-arm64) TARGET=aarch64 ;;
+        *) TARGET=native ;;
+    esac
+fi
 
 stage() {
     echo "stage $3: $1 -> $2"
     start=$(date +%s)
+    # (stage 1 is built by the bootstrap compiler, which knows only --target=native)
+    target=$TARGET
+    [ "$3" = 1 ] && target=native
     # shellcheck disable=SC2086
-    "$1" build cmd/axiom/src/main.ax --target=native ${4:-$OPT} -o "$2"
+    "$1" build cmd/axiom/src/main.ax --target="$target" ${4:-$OPT} -o "$2"
     echo "         $(($(date +%s) - start)) s, $(wc -c < "$2") bytes"
 }
 
 make -C cmd/axiom/bootstrap --no-print-directory
 mkdir -p $B
 if [ "$(uname -s)" = Darwin ]; then
-    # The C compiler does not build native Mac programs (issue 0013), but it
+    # The bootstrap compiler does not build native Mac programs, but it
     # builds WebAssembly: stage 1 is the self-hosted compiler for wasm32,
     # run under node, building itself for the Mac (by name: under node it
     # cannot tell that it is on one).
@@ -81,4 +96,4 @@ fi
 
 # The compiler's own unit tests.
 $B/axiom test cmd/axiom/src/util.ax --target=native
-echo "built $B/axiom"
+echo "built $B/axiom (--target=$TARGET)"

@@ -11,40 +11,64 @@ WebAssembly. Its design mandate is:
 - **first-class SIMD**: vector primitives of 128, 256 and 512 bits, with the same (WebAssembly's) semantics on every target
 - **explicit allocation**: one global allocator (`std/mem`, written in Axiom), called explicitly; no language construct allocates
 
-## Quick start
+## Install
+
+Download the archive for your platform from the
+[releases page](https://github.com/paulhankin/axiom/releases), unpack it and put its
+`bin/` on the `PATH`; [`docs/install.md`](docs/install.md) has the details, the platform
+notes and how to build from source.
+
+```sh
+tar -xzf axiom-0.1.0-linux-x86_64.tar.gz
+export PATH="$PWD/axiom-0.1.0-linux-x86_64/bin:$PATH"
+axiom version
+```
+
+## A first program
+
+```axiom
+import "std/io" as io;
+
+export fn main() i32 {
+    io.stdout().write_all("hello, world\n") catch return 1;
+    return 0;
+}
+```
+
+```sh
+axiom build hello.ax --target=native -o hello && ./hello
+axiom build hello.ax -o hello.wasm                 # WebAssembly; run it with node and std/internal/runtime/host.mjs
+```
+
+## Commands
 
 ```
-cmd/axiom/bootstrap.sh                       # build the compiler (the bootstrap needs llvm-18-dev and lld)
-export PATH=$PWD/cmd/axiom/build:$PATH
-
-axiom build examples/wordcount/wordcount.ax --target=native -O2 -o wc
-axiom build examples/dot_product/dot_product.ax -O2 -o engine.wasm
-node std/internal/runtime/host.mjs engine.wasm   # run a WebAssembly program (calls its `main` export)
+axiom build prog.ax --target=native -O2 -o prog   # native code for this machine (also x86_64, aarch64, aarch64-macos, x86_64-windows)
+axiom build prog.ax -O2 -o prog.wasm              # WebAssembly (wasm32; also wasm64)
 axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
-
-axiom test mylib.ax                          # run a file's `test` blocks
-axiom new geometry                           # a package: axiom.toml + src/lib.ax (spec §4.6)
-axiom test geometry                          # build, check and test also take a package directory
-axiom fmt src/                               # canonical layout, imports tidied (spec §16.5)
-axiom profile prog.ax                        # sampling profiler: hot functions, call sites, flame graphs
-axiom build prog.ax --sanitize=address       # trap on use after free, double free, overflows; report leaks
-axiom build prog.ax --target=native -O2 -g   # DWARF line tables, for perf, gdb, addr2line
-axiom build app --verbose                    # modules compile separately and are cached (spec §16.7)
-
-node cmd/axiom/internal/tests/run.mjs        # the test suite
+axiom test mylib.ax                               # run a file's `test` blocks
+axiom new geometry                                # a package: axiom.toml + src/lib.ax (spec §4.6)
+axiom test geometry                               # build, check and test also take a package directory
+axiom fmt src/                                    # canonical layout, imports tidied (spec §16.5)
+axiom profile prog.ax                             # sampling profiler: hot functions, call sites, flame graphs
+axiom build prog.ax --sanitize=address            # trap on use after free, double free, overflows; report leaks
+axiom build app --verbose                         # modules compile separately and are cached (spec §16.7)
+axiom lsp                                         # the language server, for editors (tools/editors/vscode)
 ```
 
 The compiler is written in Axiom and has its own backends (WebAssembly, x86-64, AArch64)
 and linkers, so it and the programs it builds need only the C library. It builds native
 programs for Linux, Windows and macOS on Apple silicon (where it also runs, tests and
-profiles them, and links system frameworks such as AppKit, Metal and Core Audio). On a
-Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` from Homebrew, with
-`llvm-config` on the `PATH`.
+profiles them, and links system frameworks such as AppKit, Metal and Core Audio).
+Building it from source takes the bootstrap compiler, which needs LLVM 18
+([`docs/install.md`](docs/install.md)); `node cmd/axiom/internal/tests/run.mjs` runs
+the test suite.
 
 ## Repository
 
 | Path | What |
 |---|---|
+| [`docs/install.md`](docs/install.md) | Installing a release, a first program, building from source |
 | [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/releasing.md`](docs/releasing.md) | How releases are made, versioned and packaged; their notes are in [`docs/releases/`](docs/releases) |
@@ -60,8 +84,6 @@ Mac, `cmd/axiom/bootstrap.sh` needs `llvm@18` and `node` from Homebrew, with
 
 Known bugs and feature requests are [GitHub issues](https://github.com/paulhankin/axiom/issues).
 To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
-Four-digit issue numbers in the code ("issue 0047") refer to the `issues/` directory they
-replaced, in the git history.
 
 ## Examples
 
