@@ -1,10 +1,10 @@
 #!/bin/sh
-# Differential test of the self-hosted compiler against the C compiler:
+# Differential test of the compiler against the bootstrap compiler:
 #   - for every .ax file under cmd/axiom/internal/tests/, std/, examples/ and cmd/axiom/src/, both
 #     must print the same diagnostics (agent-json) with the same exit status;
 #   - the test suite (cmd/axiom/internal/tests/run.mjs, which checks the programs' output) must
 #     pass for WebAssembly and native code in several configurations;
-#   - the backends must agree with the C compiler's LLVM-generated code on
+#   - the backends must agree with the bootstrap compiler's LLVM-generated code on
 #     programs exercising every operation on edge values (fuzz/run.sh).
 #
 #   cmd/axiom/difftest.sh [compiler]     (default: cmd/axiom/build/axiom)

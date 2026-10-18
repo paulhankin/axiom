@@ -94,7 +94,7 @@ load; `--stack-traces=off` removes them. A call to an `inline fn` (always inline
 `alwaysinline`) passes its call-site record as an extra argument instead, which the
 inlined body pushes only before a trap or a call that is not inline (`INL_SITES` in
 `codegen.c`). On x86-64 Linux, except in profile and `--sanitize=address` builds,
-calls cost nothing instead (issue 0037, `frame_tables_emit` in `codegen.c`): functions
+calls cost nothing instead (`frame_tables_emit` in `codegen.c`): functions
 keep frame pointers, each call gets a lexical-block `DILocation` of its own and
 `nomerge`, and after optimization the inlinedAt chain of each remaining call's
 location gives its records, which an inline-assembly label after the call puts in
@@ -149,7 +149,7 @@ $ node cmd/axiom/internal/tests/std_opt.mjs          # std's tests at -O2, wasm3
 `cmd/axiom/internal/tests/errors/*.ax` must fail to compile with the `// expect-error:` codes.
 `cmd/axiom/internal/tests/lowering/*.ax` check instruction selection: each `// lower: <flags> | <regex> | <count>`
 line builds the file with `--emit=asm` and counts the regex's matches (for example, one
-`vpmaddwd` per `@dot` of `i16x32` with AVX-512, issue 0036). The suite
+`vpmaddwd` per `@dot` of `i16x32` with AVX-512). The suite
 passes on wasm32 and native at every optimization level, and under ASan/UBSan.
 
 ## Architecture

@@ -345,9 +345,9 @@ The implementations:
   `node std/internal/runtime/host.mjs prog.wasm`. Node sockets are asynchronous, so they live in
   a worker thread, and the wasm thread blocks on `Atomics.wait` until each
   operation completes.
-- **[`std/internal/runtime/native_host.c`](internal/runtime/native_host.c)** for POSIX. The C compiler
-  links it automatically when a native program uses the host ABI. The self-hosted
-  compiler builds the same host ABI written in Axiom,
+- **[`std/internal/runtime/native_host.c`](internal/runtime/native_host.c)** for POSIX. The bootstrap compiler
+  links it automatically when a native program uses the host ABI. The compiler
+  builds the same host ABI written in Axiom,
   [`std/internal/runtime/native.ax`](internal/runtime/native.ax), into every Linux program. It makes
   Linux system calls directly ([`std/internal/runtime/linux.ax`](internal/runtime/linux.ax)) and needs no
   C library, so those programs are static executables (unless they link C code).

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Differential fuzzing of the self-hosted compiler's backends against the C
+# Differential fuzzing of the compiler's backends against the bootstrap
 # compiler (stage 0, LLVM): gen.py writes a program that applies every
 # integer, float and SIMD operation to edge values and prints the results;
 # each backend's output must match the reference native build exactly.

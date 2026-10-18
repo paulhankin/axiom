@@ -1031,7 +1031,7 @@ void ax_memory_discard(uintptr_t addr, size_t len) {
     if (a < b) madvise((void *)a, b - a, MADV_DONTNEED);
 }
 
-// --- Stack traces from frame pointers (issue 0037) ---------------------------
+// --- Stack traces from frame pointers --------------------------------------
 // On x86-64 Linux the compiler keeps frame pointers instead of maintaining the
 // shadow stack's call records, and puts an entry for each call in the section
 // axiom_rets: the label just after the call (at its return address, or a

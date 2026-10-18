@@ -286,7 +286,7 @@ await inOrder([...stdFiles, ...files(path.join(root, 'cmd/axiom/internal/tests/t
     const b = spawnSync(compiler, ['build', path.join(root, 'cmd/axiom/internal/tests/traces/crash.ax'), '-o', out, ...(native ? [nativeTarget] : []), ...extraFlags], { encoding: 'utf8' });
     let problem = b.status !== 0 ? `build failed: ${b.stdout}${b.stderr}` : null;
     if (!problem) {
-      // (a timeout: a recursion turned into a loop never overflows, issue 0051)
+      // (a timeout: a recursion turned into a loop never overflows)
       const r = native ? spawnExe(out, [], { encoding: 'utf8', timeout: 60000 })
         : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8', timeout: 60000 });
       const want = [/trap T0008 \(stack exhausted\)/, /stack trace \(innermost first\):/, /at forever \((?:\S*\/)?tests\/traces\/crash\.ax:4:12\)/,
@@ -331,10 +331,10 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/sanitize')), async
 // of cmd/axiom/internal/tests/lowering/*.ax builds the file with --emit=asm and those flags,
 // and the regex must match exactly <count> times. x86-64 lines run only on
 // x86-64 hosts (--target=native is the host). A compiler without
-// --emit=asm (the self-hosted one) is checked on its object file as
+// --emit=asm (the compiler) is checked on its object file as
 // objdump disassembles it (AT&T syntax, as LLVM's): its x86-64 lines, where
 // objdump is installed; it skips the others. "// lower-selfhost:" lines
-// check selection only the self-hosted backends make (LLVM's differs).
+// check selection only the compiler's backends make (LLVM's differs).
 await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async (f) => {
   const name = path.relative(root, f) + ' [instruction selection]';
   if (filter && !name.includes(filter)) return null;
@@ -356,7 +356,7 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async
     } else if (c.status !== 0) {
       problem = `${flags}: build failed:\n${c.stdout}${c.stderr}`; break;
     } else if (only) {
-      continue;  // (a compiler with --emit=asm: the C compiler's LLVM)
+      continue;  // (a compiler with --emit=asm: the bootstrap compiler's LLVM)
     } else {
       text = fs.readFileSync(out, 'utf8');
     }
@@ -584,8 +584,8 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async
   }
 }
 
-// The self-hosted compiler reaches the system only through the host ABI, so
-// it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
+// The compiler reaches the system only through the host ABI, so
+// it must stay buildable for WebAssembly: no libc, no 64-bit
 // usize assumptions.
 if (!skipPlatform) {
   const name = 'cmd/axiom/src checks for wasm32';
@@ -628,7 +628,7 @@ if (!skipPlatform) {
   }
 }
 
-// `axiom fmt` (spec §16.5; the self-hosted compiler only). Each
+// `axiom fmt` (spec §16.5; the compiler only, not the bootstrap one). Each
 // cmd/axiom/internal/tests/fmt/<name>.ax formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left
 // alone; the repository's own sources are canonical.
@@ -685,7 +685,7 @@ if (!skipPlatform) {
   }
 }
 
-// macOS (spec §14.1; the self-hosted compiler only). cmd/axiom/internal/tests/macho.mjs checks
+// macOS (spec §14.1; the compiler only, not the bootstrap one). cmd/axiom/internal/tests/macho.mjs checks
 // the executables built for --target=aarch64-macos the way dyld and the
 // kernel would; the compiler itself is among them. On a Mac they also run
 // (and the whole suite runs natively with AXIOM_NATIVE_TARGET=aarch64-macos);
@@ -775,7 +775,7 @@ if (!skipPlatform) {
   }
 }
 
-// Windows (spec §14.1; the self-hosted compiler only). Programs and the
+// Windows (spec §14.1; the compiler only, not the bootstrap one). Programs and the
 // compiler itself are cross-built for --target=x86_64-windows and their PE
 // headers checked; with Wine installed they also run (the whole suite runs
 // on Windows with AXIOM_NATIVE_TARGET=x86_64-windows AXIOM_NATIVE_EXEC=wine64).

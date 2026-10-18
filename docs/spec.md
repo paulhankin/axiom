@@ -1255,7 +1255,7 @@ and stack traces are the same.
   access, say) inside an inlined body is reported as if it were in the caller.
 - With separate compilation (§16.7), every module that calls an inline function compiles
   its own copy.
-- The self-hosted compiler inlines such calls wherever its inliner can (at `-O1` and
+- The compiler inlines such calls wherever its inliner can (at `-O1` and
   above), and keeps ordinary call-site records.
 
 ---
@@ -2010,8 +2010,8 @@ std/hash/crc, with the portable code where they are absent.
 | `wasm32-freestanding` | 32 | No WASI and no imports except those declared |
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Allocator memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB), whose 64 KiB pages are committed as it grows. Pointers are machine addresses, and accesses through them are not checked (§12.1) |
-| `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; self-hosted compiler only. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
-| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; self-hosted compiler only. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Debug symbols (function names and line tables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. Not yet supported: linking C code or `-l` libraries |
+| `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; not the bootstrap compiler. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
+| `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; not the bootstrap compiler. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Debug symbols (function names and line tables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. Not yet supported: linking C code or `-l` libraries |
 
 Linux is the native operating system. `--target=native` on a Mac means
 `aarch64-macos`, and on Windows `x86_64-windows`; elsewhere they are cross targets,
@@ -2086,7 +2086,7 @@ extern "C" "m" {          // optional second string: a library to link (-lm)
   modules.
 - On **native targets** they link against object files, libraries and libc as usual.
   A native program that declares no C functions of its own needs no C library: the
-  self-hosted toolchain then links a static executable that makes system calls
+  toolchain then links a static executable that makes system calls
   directly (§15.2).
 - On **WebAssembly** they link against C compiled for the same wasm target. C code
   and Axiom code share the linear memory, the stack and the function table, so
@@ -2229,17 +2229,17 @@ services are reached through host functions imported from module `"axiom"` (the
 One host function has no counterpart on WebAssembly: `ax_fork() i32` copies the
 process, returning 0 in the copy and the copy's handle (for `ax_proc_wait`) in the
 original, or a negative error where the host cannot copy a process (node returns
-`-38`). The self-hosted compiler uses it to compile modules in parallel (§16.7), and
+`-38`). The compiler uses it to compile modules in parallel (§16.7), and
 compiles the program as one unit where it is missing. std does not use it.
 
-The self-hosted compiler itself uses only the host ABI and std, so it builds for every
+The compiler itself uses only the host ABI and std, so it builds for every
 target, WebAssembly included: `node std/internal/runtime/host.mjs axiom.wasm -- build app.ax`
 produces the same bytes as the native compiler.
 
 The Axiom runtime uses no C library. It reaches the kernel through system calls
 (`std/internal/runtime/linux.ax`), starts threads with `clone` and sets up their thread-local
 storage itself, starts processes with `fork` and `execve` (searching `PATH` itself), and resolves host names from `/etc/hosts` and by DNS queries to the
-servers in `/etc/resolv.conf`. So a native program built by the self-hosted toolchain
+servers in `/etc/resolv.conf`. So a native program built by the toolchain
 is a static executable with no dynamic loader, unless it links C code or libraries,
 in which case it is linked against the C library as before.
 
@@ -2492,17 +2492,17 @@ example, a naive recursive Fibonacci) it roughly doubles run time. On typical co
 is within measurement noise. Stack traces are on by default, and
 `--stack-traces=off` removes the instrumentation.
 
-**Frame tables.** Native code can be walked, so on x86-64 Linux the C compiler, and on
-every native target (x86-64 and AArch64 Linux, macOS, Windows) the self-hosted one,
-build the same records without a shadow stack, and calls cost nothing:
+**Frame tables.** Native code can be walked, so on every native target (x86-64 and
+AArch64 Linux, macOS, Windows) the compiler, and on x86-64 Linux the bootstrap
+compiler, build the same records without a shadow stack, and calls cost nothing:
 
 - Every function keeps a frame pointer, and the executable has a table (the section
   `axiom_rets`) that maps the return address of each call to its call-site record,
   followed by the records of the calls inlined around it: calls to `inline` functions
-  and the ones the optimizer inlined. The C compiler takes these from the inlining
-  information LLVM keeps in its debug locations, and drops the debug information
-  afterwards unless `-g` asks for it; the self-hosted one keeps them with each call
-  as it inlines. (Its x86-64 code gives a leaf function, whose only calls are traps,
+  and the ones the optimizer inlined. The compiler keeps them with each call as it
+  inlines; the bootstrap compiler takes them from the inlining information LLVM
+  keeps in its debug locations, and drops the debug information afterwards unless
+  `-g` asks for it. (Its x86-64 code gives a leaf function, whose only calls are traps,
   no frame: the table marks such functions, and the walk finds their return
   addresses on the stack.)
 - A trap walks the frame-pointer chain from the trap's own frame, a crash from the
@@ -2519,7 +2519,7 @@ build the same records without a shadow stack, and calls cost nothing:
   takes with the shadow stack, the same as with `--stack-traces=off` to within noise.
 - `axiom profile` (§16.6) and `--sanitize=address` (§16.8) builds, which read the
   records while the program runs, keep the shadow stack, as do WebAssembly and, with
-  the C compiler, other native targets.
+  the bootstrap compiler, other native targets.
 
 Traces are diagnostics only: whether they are on never changes a program's
 behavior. Record contents and layouts are toolchain ABI, not language semantics.

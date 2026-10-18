@@ -1,5 +1,5 @@
 #!/bin/sh
-# Measures the quality of the self-hosted compiler's generated code against
+# Measures the quality of the compiler's generated code against
 # LLVM's:
 #   - the compiler built by the bootstrap compiler (LLVM, -O2) and the compiler
 #     built by itself (stage 2) have the same source, so the ratio of their

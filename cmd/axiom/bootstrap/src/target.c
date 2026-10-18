@@ -1,6 +1,6 @@
 // target.c - architectures, CPU presets and processor extensions. The table
-// is std/os/cpu.ax's (names, bits and implications), which the self-hosted
-// compiler uses directly; here each extension also has its LLVM name.
+// is std/os/cpu.ax's (names, bits and implications), which the compiler
+// uses directly; here each extension also has its LLVM name.
 #include "target.h"
 
 #include <stdio.h>

@@ -6,7 +6,7 @@
 // the compiler's own consistency checks on:
 //   AXIOM_CHECK_CINTS=1  shared constants are never changed by a pass
 //   AXIOM_POISON=1       released memory is poisoned and never reused
-// (both checked by the self-hosted compiler; the C one ignores them).
+// (both checked by the compiler; the bootstrap compiler ignores them).
 //
 // Usage: node cmd/axiom/internal/tests/std_opt.mjs [-O1|-O2|-O3] [--target=wasm32|native|both]
 //                               [--jobs=N] [--filter=substr] [--timeout=seconds]
@@ -21,8 +21,8 @@ import path from 'path';
 import os from 'os';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
-const selfhost = path.join(root, 'cmd/axiom/build/axiom');
-const compiler = path.resolve(process.env.AXIOM || (fs.existsSync(selfhost) ? selfhost : path.join(root, 'cmd/axiom/bootstrap/build/axiom')));
+const built = path.join(root, 'cmd/axiom/build/axiom');
+const compiler = path.resolve(process.env.AXIOM || (fs.existsSync(built) ? built : path.join(root, 'cmd/axiom/bootstrap/build/axiom')));
 const argv = process.argv.slice(2);
 const opt = argv.find((a) => /^-O[0-3]$/.test(a)) || '-O2';
 const arg = (name, dflt) => (argv.find((a) => a.startsWith(`--${name}=`)) || `=${dflt}`).split('=').slice(1).join('=');

@@ -927,7 +927,7 @@ static LLVMValueRef from_mem(Type *t, LLVMValueRef v) {
     return v;
 }
 
-// Aggregates larger than two registers are never SSA values (issue 0040):
+// Aggregates larger than two registers are never SSA values:
 // LLVM's instruction selection takes a load, store or insertvalue chain of
 // one apart into a node per scalar, and its combiner is quadratic in them
 // (a 20k-line program took minutes at -O2). Such a value is instead the
@@ -1404,7 +1404,7 @@ static void add_str_fn_attr(LLVMValueRef fn, const char *k, const char *v) {
 // loops of table loads with them, but Skylake-SP to Tiger Lake run them in
 // microcode (the Gather Data Sampling mitigation, which a guest cannot see):
 // 25-31 cycles a gather against about one a load: a Zobrist hash of twelve
-// table loads becomes slower vectorized than scalar (issue 0091). LLVM itself marks no processor
+// table loads becomes slower vectorized than scalar. LLVM itself marks no processor
 // so, not even LLVM 21 (rustc 1.94 with target-cpu=cascadelake still gathers
 // in an indexed loop, and only +prefer-no-gather stops it); its newer cost
 // model merely keeps that hash scalar. So the processors with the
@@ -2459,7 +2459,7 @@ static LLVMValueRef reduce_add(Type *vt, LLVMValueRef v) {
 // targets, those lanes zero-extended to f times their width. Built so:
 // LLVM 18's x86 DAG combine can abort on the shuffle followed by a
 // bit_cast to the wider lanes ("Invalid size request on a scalable
-// vector", issue 0065). NULL for any other shuffle.
+// vector"). NULL for any other shuffle.
 static LLVMValueRef shuffle_as_zext(LLVMValueRef x, LLVMValueRef y, Expr *idx) {
     if (g_target.wasm || !LLVMIsConstant(y) || !LLVMIsNull(y)) return NULL;
     LLVMTypeRef xt = LLVMTypeOf(x), lane = LLVMGetElementType(xt);
@@ -2531,7 +2531,7 @@ static LLVMValueRef swizzle16(LLVMValueRef x, LLVMValueRef idx) {
 // @int_from_float on vectors (spec §13.2: truncate, saturate, NaN to 0)
 // from operations x86 lowers to vector instructions (vcvttps2dq/udq, vmaxps,
 // compares and blends); LLVM 18 splits the vector fptosi.sat/fptoui.sat into
-// one scalar conversion per lane there (issue 0030). wasm keeps the
+// one scalar conversion per lane there. wasm keeps the
 // intrinsics, which are its trunc_sat instructions.
 // x86's truncating conversion of a whole vector of floats to integers of
 // the same lane count, where the function's extensions have one (NULL
@@ -2588,7 +2588,7 @@ static LLVMValueRef vec_int_from_float(Type *rt, Type *ft, LLVMValueRef v) {
     LLVMValueRef top = LLVMConstVector(cz, n);
     LLVMValueRef x = x86_cvtt(rt, ft, v);
     if (x && !rt->elem->is_signed) {
-        // (issue 0089) the rest saturate already: lanes not >= 0 (ordered:
+        // the rest saturate already: lanes not >= 0 (ordered:
         // NaN too) are 0, which zero-masks the conversion
         return LLVMBuildSelect(B, LLVMBuildFCmp(B, LLVMRealOGE, v, vz, ""), x, LLVMConstNull(iv), "");
     }
@@ -2676,7 +2676,7 @@ static LLVMValueRef const_lanes(LLVMTypeRef lane, unsigned n, unsigned long long
     return LLVMConstVector(c, n);
 }
 
-// @dot on i16 lanes as the target's instruction (issue 0036): pmaddwd on
+// @dot on i16 lanes as the target's instruction: pmaddwd on
 // x86 (one per register of the widest width the function's extensions
 // have), i32x4.dot_i16x8_s on wasm. Pairs of lanes are multiplied and added
 // in i32, which wraps only for (-32768 * -32768) * 2, as both instructions
@@ -2775,7 +2775,7 @@ static const char *x86_permute(Type *t, bool two) {
     bool f = (g_features & feature_bit("avx512f")) != 0;
     if (t->elem->kind == TY_FLOAT) {
         // the floating-point forms (vpermps, vpermt2ps, ...), so that the
-        // lanes stay in that domain (issue 0089)
+        // lanes stay in that domain
         if (bytes == 64 && w == 32 && f) return two ? "llvm.x86.avx512.vpermi2var.ps.512" : "llvm.x86.avx512.permvar.sf.512";
         if (bytes == 64 && w == 64 && f) return two ? "llvm.x86.avx512.vpermi2var.pd.512" : "llvm.x86.avx512.permvar.df.512";
         if (!two && bytes == 32 && w == 32 && (g_features & feature_bit("avx2"))) return "llvm.x86.avx2.permps";
@@ -3367,7 +3367,7 @@ static LLVMValueRef gen_builtin(Expr *e) {
         LLVMValueRef m = gen(a[0].e), x = gen(a[1].e), y = gen(a[2].e);
         LLVMTypeRef mt = LLVMTypeOf(m);
         // a mask of lane comparisons: a select on its i1 lanes is the same bit
-        // for bit, and becomes a blend (issue 0031)
+        // for bit, and becomes a blend
         Type *mty = ct(a[0].e->type);
         if (rt->kind == TY_VEC && mty->kind == TY_VEC && mty->lanes == rt->lanes && is_mask(a[0].e, 0))
             return LLVMBuildSelect(B, LLVMBuildICmp(B, LLVMIntSLT, m, LLVMConstNull(mt), ""), x, y, "");
@@ -4192,7 +4192,7 @@ static LLVMValueRef gen_inner(Expr *e) {
 // Statements
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Accumulations that cannot overflow (issue 0029). In a loop with a known
+// Accumulations that cannot overflow. In a loop with a known
 // trip count, `acc += x` with x of a bounded, non-negative range (a narrower
 // integer widened with @as, a constant), where acc is a local set to a
 // constant just before the loop and changed nowhere else in it, cannot
@@ -4488,7 +4488,7 @@ static void gen_stmt_inner(Stmt *s) {
     case S_LET: {
         Type *lt = ct(s->local->type);
         if (s->undef) {
-            // left unspecified (§8.1): zeroed here, as good a value as any (the self-hosted
+            // left unspecified (§8.1): zeroed here, as good a value as any (the
             // compiler leaves a large one's bytes as they are)
             store(lt, LLVMConstNull(lty(lt)), local_ptr(s->local), false);
             return;
@@ -4689,7 +4689,7 @@ static bool promotable(LLVMValueRef a) {
 static void check_stack(Decl *d, LLVMBasicBlockRef entry, LLVMBasicBlockRef start) {
     unsigned long long frame = 0;
     // a leaf whose locals all become registers has no frame on the stack
-    // (issue 0029: the check was most of the cost of small hot functions)
+    // (the check was most of the cost of small hot functions)
     // (an inline function cannot recurse either: its calls are its callers')
     bool leaf = d->is_inline || is_leaf(LLVMGetBasicBlockParent(entry));
     for (LLVMValueRef i = LLVMGetFirstInstruction(entry); i; i = LLVMGetNextInstruction(i)) {
@@ -4937,7 +4937,7 @@ static bool setup_target(void) {
         // LLVM 18's loop strength reduction rewrites element addresses
         // without `inbounds`, after which a constant offset can no longer
         // fold into a load or store (offset=); wasm has no addressing modes
-        // for it to improve (issue 0029)
+        // for it to improve
         static bool parsed;
         if (!parsed) {
             const char *argv[] = {"axiom", "-disable-lsr"};

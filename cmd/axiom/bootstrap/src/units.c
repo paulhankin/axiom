@@ -328,7 +328,7 @@ const char *cached_runtime_object(const char *cc, const char *src) {
     const char *tmp = arena_printf("%s.tmp%d", obj, (int)getpid());
     pid_t pid = fork();
     if (pid == 0) {
-        // frame pointers: stack traces walk through these frames (issue 0037)
+        // frame pointers: stack traces walk through these frames
         execlp(cc, cc, "-O2", "-fno-omit-frame-pointer", "-c", "-pthread", src, "-o", tmp, (char *)NULL);
         _exit(127);
     }
