@@ -310,6 +310,29 @@ static Decl *resolve_named_decl(TypeExpr *te, TypeCtx *tc, bool report) {
     return d;
 }
 
+// The value of a constant expression written as an array length (checked
+// in a constant context, as a const initializer is); -1 after an error.
+static int64_t const_array_len(Expr *ce, TypeCtx *tc) {
+    FnCtx ctx = {.tc = *tc, .const_ctx = true};
+    FnCtx *saved = C;
+    C = &ctx;
+    Type *t = check_expr(ce, t_usize);
+    C = saved;
+    if (ce->is_const && (t->kind == TY_INT || t->kind == TY_UNTYPED_INT || t->kind == TY_CONSTINT)) {
+        if (ce->cval < 0) {
+            diag_error(ce->span, "E0472", "array length must not be negative");
+            return -1;
+        }
+        if (ce->cval > INT64_MAX) {
+            diag_error(ce->span, "E0472", "array length is too large");
+            return -1;
+        }
+        return (int64_t)ce->cval;
+    }
+    if (t->kind != TY_INVALID) diag_error(ce->span, "E0472", "array length must be an integer constant");
+    return -1;
+}
+
 // A generic argument: a type, an integer literal, or a const name.
 static Type *resolve_generic_arg(TypeExpr *te, TypeCtx *tc) {
     if (te->kind == TE_INTLIT) return type_constint((int64_t)te->ival);
@@ -381,6 +404,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         }
         return tc->self;
     case TE_INTLIT: diag_error(te->span, "E0400", "expected a type, found an integer"); return t_invalid;
+    case TE_CONSTEXPR: diag_error(te->span, "E0400", "expected a type, found an expression"); return t_invalid;
     case TE_ERRUNION: {
         Type *e = resolve_type(te->elem, tc);
         if (e->kind == TY_ERRUNION) {
@@ -401,6 +425,10 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         TypeExpr *l = te->len;
         if (!l) return t_invalid;
         if (l->kind == TE_INTLIT) return type_array(e, (int64_t)l->ival);
+        if (l->kind == TE_CONSTEXPR) {
+            int64_t n = const_array_len(l->expr, tc);
+            return n < 0 ? t_invalid : type_array(e, n);
+        }
         Type *a = resolve_generic_arg(l, tc);
         if (a->kind == TY_CONSTINT) {
             if (a->cval < 0) diag_error(l->span, "E0472", "array length must not be negative");

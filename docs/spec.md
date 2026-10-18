@@ -258,7 +258,7 @@ GenericArgs   ::= "." "[" GenericArgList "]"
 GenericArgList::= GenericArg ( "," GenericArg )* ","?
 GenericArg    ::= Type | INT_LIT
 
-ArrayLen      ::= INT_LIT | IDENT ( "." IDENT )?    (* must name a const *)
+ArrayLen      ::= Expr                              (* a constant expression, §5.5 *)
 TypeList      ::= Type ( "," Type )* ","?
 PrimType      ::= (any reserved type name, §2.4)
 ```
@@ -540,8 +540,10 @@ dereferenced. `void` cannot be the type of a local, field or array element.
 
 ### 5.5 Arrays: `[N]T`
 
-An array holds `N` contiguous `T` values. `N` is an integer literal or a `const` of an
-integer type, and `N` ≥ 0. Arrays are **value types**: assignment and argument passing copy
+An array holds `N` contiguous `T` values. `N` is a constant expression of an integer type,
+evaluated by the compiler (§7.6): an integer literal, a `const`, or an expression of
+those such as `[MAX_DEPTH + 1]u64`; or a `const` generic parameter by itself (§10.2).
+`N` ≥ 0. Arrays are **value types**: assignment and argument passing copy
 all elements. Size is `N * size_of(T)` and alignment is `align_of(T)`. `a.len` is the
 constant `N` (type `usize`).
 

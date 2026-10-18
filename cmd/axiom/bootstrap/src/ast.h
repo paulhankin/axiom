@@ -26,7 +26,8 @@ typedef enum TEKind {
     TE_ERRUNION,
     TE_ERROR,
     TE_SELF,
-    TE_INTLIT,  // generic const argument
+    TE_INTLIT,     // generic const argument, or an array length
+    TE_CONSTEXPR,  // an array length that is a constant expression
 } TEKind;
 
 typedef struct Field {
@@ -50,9 +51,10 @@ struct TypeExpr {
     bool has_args;
     TypeExpr *elem;  // PTR, SLICE, ARRAY, ERRUNION; TE_FN: return type
     bool mut;
-    TypeExpr *len;  // ARRAY: TE_INTLIT or TE_NAMED
+    TypeExpr *len;  // ARRAY: TE_INTLIT, TE_NAMED (a const or a const parameter) or TE_CONSTEXPR
     FieldVec fields;
     uint64_t ival;
+    Expr *expr;  // TE_CONSTEXPR
 };
 
 // ---------------------------------------------------------------------------

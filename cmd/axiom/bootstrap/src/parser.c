@@ -28,6 +28,7 @@ typedef struct Parser {
 
 static Token *peek(Parser *P) { return &P->t[P->pos]; }
 static Token *peek2(Parser *P) { return &P->t[P->pos + 1 < P->n ? P->pos + 1 : P->n - 1]; }
+static Token *peek3(Parser *P) { return &P->t[P->pos + 2 < P->n ? P->pos + 2 : P->n - 1]; }
 static TokKind pk(Parser *P) { return P->t[P->pos].kind; }
 // `inline` is a keyword only before `fn` (spec §9.5)
 static bool at_inline(Parser *P) {
@@ -182,17 +183,21 @@ static TypeExpr *parse_type(Parser *P) {
             te->span = sp_from(P, start);
             return te;
         }
+        // the length: an integer literal, a name (a const or a const
+        // parameter, perhaps qualified), or any other constant expression
         TypeExpr *te = new_te(TE_ARRAY, start);
-        if (pk(P) == TK_INT) {
+        bool qualified = pk(P) == TK_IDENT && peek2(P)->kind == TK_DOT && peek3(P)->kind == TK_IDENT;
+        if (pk(P) == TK_INT && peek2(P)->kind == TK_RBRACKET) {
             Token *n = advance(P);
             te->len = new_te(TE_INTLIT, n->span);
             te->len->ival = n->ival;
-        } else if (pk(P) == TK_IDENT) {
+        } else if (pk(P) == TK_IDENT && (peek2(P)->kind == TK_RBRACKET || qualified)) {
+            int save = P->pos;
             Token *n = advance(P);
             te->len = new_te(TE_NAMED, n->span);
             te->len->name = n->name;
             te->len->name_span = n->span;
-            if (pk(P) == TK_DOT && peek2(P)->kind == TK_IDENT) {
+            if (qualified) {
                 advance(P);
                 Token *m = advance(P);
                 te->len->qual = te->len->name;
@@ -200,8 +205,19 @@ static TypeExpr *parse_type(Parser *P) {
                 te->len->name_span = m->span;
                 te->len->span = span_join(n->span, m->span);
             }
-        } else {
-            syntax_error(P, "array length");
+            if (pk(P) != TK_RBRACKET) {  // an expression after all
+                P->pos = save;
+                te->len = NULL;
+            }
+        }
+        if (!te->len) {
+            if (pk(P) == TK_RBRACKET) {
+                syntax_error(P, "array length");
+            } else {
+                Expr *e = parse_expr(P);
+                te->len = new_te(TE_CONSTEXPR, e->span);
+                te->len->expr = e;
+            }
         }
         expect(P, TK_RBRACKET);
         te->elem = parse_type(P);
