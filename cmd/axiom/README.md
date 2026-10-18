@@ -353,7 +353,7 @@ types share a module.
 
 | Module | C source | What |
 |---|---|---|
-| `util.ax` | `util.c` | the system (host ABI and std: memory, files, processes), arenas (permanent, and per-function scratch the backends release), `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
+| `util.ax` | `util.c` | the system (host ABI and std: memory, files, processes, tools in PATH), arenas (permanent, and per-function scratch the backends release), `List[T]`, interned strings, `SymMap[V]`, `I128`, formatting, merge sort, files, spans |
 | `diag.ax` | `diag.c` | diagnostics, human and agent-json output |
 | `lexer.ax` | `lexer.c` | tokens |
 | `ast.ax` | `ast.h`, `types.h`, `builtins.h` | syntax tree, semantic types, builtin table |
@@ -367,7 +367,9 @@ types share a module.
 | `version.ax` | `version.h` | the compiler's version (`docs/releasing.md`) |
 | `bin.ax` | | byte buffers for object files (little-endian integers, LEB128) and a reader for them |
 | `pdb.ax` | | the program database (`<out>.pdb`) of a Windows executable: symbols and line tables for debuggers |
-| `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`, `ide`, `lsp`; linking |
+| `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`, `ide`, `lsp`; argument parsing, target resolution, separate compilation, linking |
+| `tester.ax` | `main.c` | `axiom test`: runs the test binary and reports its results, humanly or as agent-json |
+| `profiler.ax` | `main.c` | `axiom profile`: runs a program under the sampling profiler and reports hot functions, call sites and folded stacks |
 | `fmt.ax` | | `axiom fmt`: canonical layout from the token stream, imports tidied |
 | `ide.ax` | | `axiom ide`: answers an editor's questions (diagnostics, hover, definitions, references, rename, completion, signatures, outline, formatting) from the checked tree, with unsaved buffers on stdin |
 | `lsp.ax` | | `axiom lsp`: the Language Server Protocol over stdio, one `axiom ide` process per request (VS Code client in [`tools/editors/vscode`](../../tools/editors/vscode/README.md)) |

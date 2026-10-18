@@ -1023,6 +1023,27 @@ pub fn parse_f64(s: []u8) f64 {
     return sfmt.parse_float(s) catch 0.0;
 }
 
+// Splits s at sep into at most `max` pieces (the last keeps the rest).
+pub fn split(s: []u8, sep: u8, max: usize) List.[[]u8] {
+    let mut out = List.[[]u8].empty();
+    let mut rest = s;
+    while out.len < max {
+        let t = find(rest, sep);
+        if (t < 0) or ((out.len + 1) == max) {
+            out.push(rest);
+            break;
+        }
+        out.push(rest[0..@int_cast(usize, t)]);
+        rest = rest[@int_cast(usize, t) + 1..];
+    }
+    return out;
+}
+
+// The decimal in s as a u32 (0 if none).
+pub fn to_u32(s: []u8) u32 {
+    return @truncate(u32, @bit_cast(u64, atol(s)));
+}
+
 // -----------------------------------------------------------------------------
 // Interned strings: equal contents => the same pointer. A Sym is a []u8 whose
 // bytes are followed by a NUL; the absent Sym (C's NULL) has a 0 pointer.
@@ -1834,6 +1855,18 @@ pub fn cwd() []u8 {
     return dup(buf[0..@int_cast(usize, n)]);
 }
 
+// The temporary directory: $TMPDIR, $TEMP or $TMP, else /tmp.
+pub fn tmp_dir() []u8 {
+    let mut names = ["TMPDIR", "TEMP", "TMP"];  // (the last two Windows's)
+    for nm in names {
+        let t = env(nm);
+        if not isnos(t) and (t.len > 0) {
+            return t;
+        }
+    }
+    return "/tmp";
+}
+
 pub fn env(name: []u8) []u8 {
     let n = ax_getenv(name.ptr, name.len, nil.[u8](), 0);
     if n < 0 {
@@ -1898,6 +1931,40 @@ pub const OUT_NULL: i32 = 3;     // standard output and error to /dev/null
 pub struct Ran {
     status: i32,  // the exit status; 128 + the signal; 127 if it could not run
     out: []u8,
+}
+
+// The first of `names` that is an executable file (a name with a "/" as it
+// is, others looked for in PATH), or nosym().
+pub fn find_tool(names: [][]u8) []u8 {
+    for name in names {
+        if find(name, '/') >= 0 {
+            if is_executable(name) {
+                return name;
+            }
+            continue;
+        }
+        let path = env("PATH");
+        if isnos(path) {
+            continue;
+        }
+        let mut p: usize = 0;
+        while p < path.len {
+            let rest = path[p..];
+            let e = find(rest, ':');
+            let mut len = rest.len;
+            if e >= 0 {
+                len = @int_cast(usize, e);
+            }
+            if is_executable(f2("%s/%s", rest[0..len], name)) {
+                return name;
+            }
+            if e < 0 {
+                break;
+            }
+            p += len + 1;
+        }
+    }
+    return nosym();
 }
 
 // Runs args (a program without a "/" is looked for in PATH), with env_sets
@@ -1981,6 +2048,24 @@ pub let mut g_files: List.[*mut SourceFile] = List.[*mut SourceFile].{
 
 pub fn file_of(id: i32) *mut SourceFile {
     return g_files.get(@int_cast(usize, id));
+}
+
+// The text of the line a span starts on, without its indentation.
+pub fn source_line(sp: Span) []u8 {
+    let f = file_of(sp.file);
+    let t = f.text;
+    let mut a = @as(usize, sp.start);
+    let mut b = @as(usize, sp.start);
+    while (a > 0) and (t[a - 1] != '\n') {
+        a -= 1;
+    }
+    while (b < t.len) and (t[b] != '\n') {
+        b += 1;
+    }
+    while (a < b) and ((t[a] == ' ') or (t[a] == '\t')) {
+        a += 1;
+    }
+    return dup(t[a..b]);
 }
 
 pub fn mkspan(file: i32, a: u32, b: u32) Span {

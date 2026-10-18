@@ -1,0 +1,340 @@
+// =============================================================================
+// profiler.ax - `axiom profile`: runs a program under the sampling profiler
+// of std/internal/runtime and reports where its time goes: hot functions,
+// call sites, folded stacks for flame graphs (spec §16.6).
+// =============================================================================
+import "codegen.ax" as cg;
+import "diag.ax" as dg;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+struct ProfFn {
+    name: []u8,
+    self_: i64,
+    total: i64,
+    stamp: i64,
+}
+
+struct ProfSite {
+    sp: u.Span,
+    caller: []u8,
+    callee: []u8,
+    total: i64,
+    stamp: i64,
+}
+
+struct ProfStack {
+    key: []u8,
+    count: i64,
+}
+
+fn cmp_fn(x: *mut ProfFn, y: *mut ProfFn) i32 {
+    if x.self_ != y.self_ {
+        if x.self_ < y.self_ {
+            return 1;
+        }
+        return -1;
+    }
+    if x.total != y.total {
+        if x.total < y.total {
+            return 1;
+        }
+        return -1;
+    }
+    return u.str_cmp(x.name, y.name);
+}
+
+fn cmp_site(x: *mut ProfSite, y: *mut ProfSite) i32 {
+    if x.total != y.total {
+        if x.total < y.total {
+            return 1;
+        }
+        return -1;
+    }
+    if x.sp.file != y.sp.file {
+        return x.sp.file - y.sp.file;
+    }
+    return @bit_cast(i32, x.sp.start) - @bit_cast(i32, y.sp.start);
+}
+
+fn cmp_stack(x: *mut ProfStack, y: *mut ProfStack) i32 {
+    return u.str_cmp(x.key, y.key);
+}
+
+// Runs a program with extra environment variables; its exit status.
+fn spawn_program(args: [][]u8, env: [][]u8, out_to_err: bool) i32 {
+    let mut mode = u.OUT_INHERIT;
+    if out_to_err {
+        mode = u.OUT_STDERR;
+    }
+    return u.run_process(args, env, mode).status;
+}
+
+fn pct(a: i64, n: f64) f64 {
+    return (100.0 * @float_from_int(f64, a)) / n;
+}
+
+pub fn run_profile(bin: []u8, prog_args: [][]u8, std_dir: []u8, folded_path: []u8, hz0: i32, json: bool) i32 {
+    let mut hz = hz0;
+    let raw = u.f2("%s/axiom-profile-%s.raw", u.tmp_dir(), u.idec(u.getpid()));
+    _ = u.unlink(u.cz(raw));
+    let mut av = u.List.[[]u8].empty();
+    let mut env = u.List.[[]u8].empty();
+    if ty.g_target.is_wasm {
+        let names = ["node"];
+        let node = u.find_tool(names[..]);
+        if u.isnos(node) {
+            dg.emit_fatal(json, "E9003",
+                          "axiom profile needs node to run WebAssembly programs (or use --target=native)");
+            return 2;
+        }
+        av.push(node);
+        av.push(u.f1("%s/internal/runtime/host.mjs", std_dir));
+        av.push(u.f1("--profile=%s", raw));
+        av.push(u.f1("--profile-hz=%s", u.idec(hz)));
+    } else {
+        tg.push_emulator(&mut av);
+        env.push(u.f1("AXIOM_PROFILE=%s", raw));
+        env.push(u.f1("AXIOM_PROFILE_HZ=%s", u.idec(hz)));
+    }
+    av.push(bin);
+    if ty.g_target.is_wasm and (prog_args.len > 0) {
+        av.push("--");  // host.mjs: the program's arguments follow
+    }
+    for a in prog_args {
+        av.push(a);
+    }
+    let status = spawn_program(av.items(), env.items(), json);
+    let text = u.read_file(raw);
+    _ = u.unlink(u.cz(raw));
+    if u.isnos(text) {
+        dg.emit_fatal(json, "E9006", u.f1("no profile was recorded (the program exited with status %s)",
+                                          u.idec(status)));
+        return 2;
+    }
+
+    // Aggregate.
+    let mut fns = u.SymMap.[*mut ProfFn].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfFn](), cap: 0, len: 0 };
+    let mut sites = u.SymMap.[*mut ProfSite].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfSite](), cap: 0, len: 0 };
+    let mut stacks = u.SymMap.[*mut ProfStack].{ keys: u.nil.[usize](), vals: u.nil.[*mut ProfStack](), cap: 0,
+                                                 len: 0 };
+    let mut fnv = u.List.[*mut ProfFn].empty();
+    let mut sitev = u.List.[*mut ProfSite].empty();
+    let mut stackv = u.List.[*mut ProfStack].empty();
+    let mut nsamples: i64 = 0;
+    let mut dropped: i64 = 0;
+    let mut stamp: i64 = 0;
+    let mut truncated: i64 = 0;
+    let mut clock: []u8 = "cpu";
+    let lines = u.split(text, '\n', 0xFFFF_FFFF);
+    for li in 0..lines.len {
+        let line = lines.get(li);
+        if line.len == 0 {
+            continue;
+        }
+        if u.starts(line, "hz ") {
+            hz = @truncate(i32, u.atol(line[3..]));
+        } else if u.starts(line, "clock ") {
+            clock = u.dup(line[6..]);
+        } else if u.starts(line, "dropped ") {
+            dropped = u.atol(line[8..]);
+        } else if u.starts(line, "S\t") {
+            let f = u.split(line[2..], '\t', 4 + 256);
+            if f.len < 3 {
+                continue;
+            }
+            let count = u.atol(f.get(0));
+            let depth = u.atol(f.get(1));
+            let ns = f.len - 3;
+            let leaf = u.intern(f.get(2));
+            // Functions root first: the callers of each site, then the leaf.
+            let chain = u.newn.[[]u8](ns + 2);
+            let spans = u.newn.[u.Span](ns + 1);
+            let mut nc: usize = 0;
+            let mut ok = true;
+            let mut k = ns;
+            while k > 0 {
+                k -= 1;
+                let g = u.split(f.get(3 + k), 0x1f, 4);
+                if g.len < 4 {
+                    ok = false;
+                    break;
+                }
+                let fid = cg.file_from_key(g.get(0));
+                let mut sf: i32 = -1;
+                if (fid >= 0) and (@int_cast(usize, fid) < u.g_files.len) {
+                    sf = fid;
+                }
+                spans[nc] = u.mkspan(sf, u.to_u32(g.get(1)), u.to_u32(g.get(2)));
+                chain[nc] = u.intern(g.get(3));
+                nc += 1;
+            }
+            if not ok {
+                continue;
+            }
+            chain[nc] = leaf;
+            nsamples += count;
+            if depth > @int_cast(i64, ns) {
+                truncated += count;
+            }
+            stamp += 1;
+            for kk in 0..nc + 1 {
+                let mut pf = fns.get(chain[kk]);
+                if u.isnil(pf) {
+                    pf = u.new.[ProfFn]();
+                    pf.name = chain[kk];
+                    fns.put(chain[kk], pf);
+                    fnv.push(pf);
+                }
+                if pf.stamp != stamp {  // once per sample, even under recursion
+                    pf.stamp = stamp;
+                    pf.total += count;
+                }
+                if kk == nc {
+                    pf.self_ += count;
+                }
+            }
+            for kk in 0..nc {
+                if spans[kk].file < 0 {
+                    continue;
+                }
+                let key = u.intern(u.f4("%s:%s:%s:%s", u.idec(spans[kk].file), u.udec(@as(u64, spans[kk].start)),
+                                        u.udec(@as(u64, spans[kk].end)), chain[kk]));
+                let mut ps = sites.get(key);
+                if u.isnil(ps) {
+                    ps = u.new.[ProfSite]();
+                    ps.sp = spans[kk];
+                    ps.caller = chain[kk];
+                    ps.callee = chain[kk + 1];
+                    sites.put(key, ps);
+                    sitev.push(ps);
+                }
+                if ps.stamp != stamp {
+                    ps.stamp = stamp;
+                    ps.total += count;
+                }
+            }
+            let mut fk = u.Buf.init();
+            if depth > @int_cast(i64, ns) {
+                fk.s("[truncated];");
+            }
+            for kk in 0..nc + 1 {
+                for c in chain[kk] {
+                    if c == ';' {
+                        fk.c(':');
+                    } else {
+                        fk.c(c);
+                    }
+                }
+                if kk < nc {
+                    fk.c(';');
+                }
+            }
+            let skey = u.intern(fk.done());
+            let mut stk = stacks.get(skey);
+            if u.isnil(stk) {
+                stk = u.new.[ProfStack]();
+                stk.key = skey;
+                stacks.put(skey, stk);
+                stackv.push(stk);
+            }
+            stk.count += count;
+        }
+    }
+    u.sort(fnv.items(), cmp_fn);
+    u.sort(sitev.items(), cmp_site);
+    u.sort(stackv.items(), cmp_stack);
+    let mut fb = u.Buf.init();
+    for i in 0..stackv.len {
+        fb.s(u.f2("%s %s\n", stackv.get(i).key, u.dec(stackv.get(i).count)));
+    }
+    let wrote = u.write_file(folded_path, fb.done());
+    let mut n: f64 = 1.0;
+    if nsamples != 0 {
+        n = @float_from_int(f64, nsamples);
+    }
+    let mut nfn = fnv.len;
+    if nfn > 25 {
+        nfn = 25;
+    }
+    let mut nsite = sitev.len;
+    if nsite > 15 {
+        nsite = 15;
+    }
+    let secs = @float_from_int(f64, nsamples) / @float_from_int(f64, hz);
+    if json {
+        u.print(u.f2("{\"schema\":\"axiom-profile/1\",\"samples\":%s,\"hz\":%s,\"clock\":", u.dec(nsamples),
+                     u.idec(hz)));
+        dg.json_str_out(clock);
+        u.print(
+            u.f4(",\"seconds\":%s,\"dropped\":%s,\"truncated\":%s,\"exit_status\":%s,\"folded\":", u.ffmt("%.3f", secs),
+                 u.dec(dropped), u.dec(truncated), u.idec(status)));
+        dg.json_str_out(u.pick(wrote, folded_path, ""));
+        u.print(",\"functions\":[");
+        for i in 0..fnv.len {
+            let pf = fnv.get(i);
+            u.print(u.pick(i != 0, ",", ""));
+            u.print("\n  {\"name\":");
+            dg.json_str_out(pf.name);
+            u.print(u.f4(",\"self\":%s,\"total\":%s,\"self_pct\":%s,\"total_pct\":%s}", u.dec(pf.self_),
+                         u.dec(pf.total), u.ffmt("%.1f", pct(pf.self_, n)), u.ffmt("%.1f", pct(pf.total, n))));
+        }
+        u.print("],\"call_sites\":[");
+        for i in 0..sitev.len {
+            let ps = sitev.get(i);
+            let lc = u.span_linecol(ps.sp);
+            u.print(u.pick(i != 0, ",", ""));
+            u.print("\n  {\"file\":");
+            dg.json_str_out(u.file_of(ps.sp.file).display);
+            u.print(u.f2(",\"line\":%s,\"col\":%s,\"caller\":", u.idec(lc.sl), u.idec(lc.sc)));
+            dg.json_str_out(ps.caller);
+            u.print(",\"callee\":");
+            dg.json_str_out(ps.callee);
+            u.print(
+                u.f2(",\"total\":%s,\"total_pct\":%s,\"context\":", u.dec(ps.total), u.ffmt("%.1f", pct(ps.total, n))));
+            dg.json_str_out(u.source_line(ps.sp));
+            u.print("}");
+        }
+        u.print("]}\n");
+    } else {
+        u.print(
+            u.f4(
+                "profile: %s samples at %s Hz (%s time, %s s)", u.dec(nsamples), u.idec(hz), clock,
+                u.ffmt("%.2f", secs)));
+        if status != 0 {
+            u.print(u.f1("; the program exited with status %s", u.idec(status)));
+        }
+        u.print("\n\n  self%  total%  function\n");
+        for i in 0..nfn {
+            let pf = fnv.get(i);
+            u.print(u.f3("%s %s  %s\n", u.ffmt("%7.1f", pct(pf.self_, n)), u.ffmt("%7.1f", pct(pf.total, n)), pf.name));
+        }
+        if fnv.len > nfn {
+            u.print(u.f1("  ... %s more functions\n", u.zdec(fnv.len - nfn)));
+        }
+        if nsite != 0 {
+            u.print("\n total%  call site\n");
+        }
+        for i in 0..nsite {
+            let ps = sitev.get(i);
+            let lc = u.span_linecol(ps.sp);
+            u.print(u.f6("%s  %s:%s:%s  %s -> %s\n", u.ffmt("%7.1f", pct(ps.total, n)), u.file_of(ps.sp.file).display,
+                         u.idec(lc.sl), u.idec(lc.sc), ps.caller, ps.callee));
+        }
+        if truncated != 0 {
+            u.print(u.f1("\n%s samples were deeper than 256 calls; their outer frames are not known\n",
+                         u.dec(truncated)));
+        }
+        if dropped != 0 {
+            u.print(u.f1("%s samples were dropped (sample buffer full)\n", u.dec(dropped)));
+        }
+        if wrote {
+            u.print(u.f1("\nfolded stacks: %s (for flamegraph.pl, inferno or speedscope)\n", folded_path));
+        }
+    }
+    if status == 0 {
+        return 0;
+    }
+    return 1;
+}

@@ -84,7 +84,7 @@ a `run/` test and, for its diagnostics, an `errors/` test.
 
 | Path | |
 |---|---|
-| `cmd/axiom/src/` | The compiler: `lexer.ax`, `parser.ax`, `sema.ax`, `codegen.ax` (to its IR), the backends (`wasm.ax`, `x64*.ax`, `arm64*.ax`), the linkers, `main.ax` (the driver), `lsp.ax` and `ide.ax`. `cmd/axiom/README.md` describes the design. |
+| `cmd/axiom/src/` | The compiler: `lexer.ax`, `parser.ax`, `sema.ax`, `codegen.ax` (to its IR), the backends (`wasm.ax`, `x64*.ax`, `a64*.ax`), the linkers, `main.ax` (the driver), `tester.ax` and `profiler.ax` (`axiom test` and `axiom profile`), `lsp.ax` and `ide.ax`. `cmd/axiom/README.md` describes the design. |
 | `cmd/axiom/bootstrap/src/` | The bootstrap compiler, in C11 on LLVM. |
 | `std/` | The standard library; `std/internal/runtime/` is the runtime (the host ABI for node, Linux, macOS and Windows). |
 | `docs/` | The spec, this page's companions ([`cli.md`](docs/cli.md), [`tour.md`](docs/tour.md), [`editors.md`](docs/editors.md), [`install.md`](docs/install.md), [`releasing.md`](docs/releasing.md), [`security.md`](docs/security.md)). |

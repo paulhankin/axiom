@@ -1,0 +1,282 @@
+// =============================================================================
+// tester.ax - `axiom test`: runs the test binary the driver built (with the
+// forking test runner of std/internal/runtime) and reports its results,
+// humanly or as agent-json (spec §17).
+// =============================================================================
+import "codegen.ax" as cg;
+import "diag.ax" as dg;
+import "sema.ax" as sema;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+struct Captured {
+    status: i32,
+    out: []u8,
+}
+
+fn run_capture(args: [][]u8) Captured {
+    let r = u.run_process(args, u.no_strs(), u.OUT_CAPTURE);
+    return Captured.{ status: r.status, out: r.out };
+}
+
+fn unescape(s: []u8) []u8 {
+    let mut b = u.Buf.init();
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if (c == '\\') and ((i + 1) < s.len) {
+            i += 1;
+            let d = s[i];
+            if d == 't' {
+                b.c('\t');
+            } else if d == 'n' {
+                b.c('\n');
+            } else if d == 'r' {
+                b.c('\r');
+            } else {
+                b.c(d);
+            }
+        } else {
+            b.c(c);
+        }
+        i += 1;
+    }
+    return b.done();
+}
+
+// Site records name files by a stable key (codegen: file_key); -1 if none.
+// Splits `s` at `sep`, into at most `max` fields (the last keeps the rest).
+// Stack frames from the test runner (see std/internal/runtime/test_main.c: encode_stack).
+struct TFrame {
+    kind: u8,  // T trap site, C call, U innermost function (no location), E error return, R repeat, O omitted
+    count: i64,
+    sp: u.Span,
+    has_span: bool,
+    fname: []u8,
+}
+
+fn parse_frames(s: []u8, out: *mut u.List.[TFrame]) void {
+    let parts = u.split(s, 0x1e, 0xFFFF_FFFF);
+    for i in 0..parts.len {
+        if out.len >= 128 {
+            break;
+        }
+        let p = parts.get(i);
+        if (p.len == 0) and ((i + 1) == parts.len) {
+            break;
+        }
+        let f = u.split(p, 0x1f, 5);
+        if f.len != 5 {
+            continue;
+        }
+        let mut fr = TFrame.{ kind: 0, count: 0, sp: u.mkspan(0, 0, 0), has_span: false, fname: f.get(4) };
+        if f.get(0).len > 0 {
+            fr.kind = f.get(0)[0];
+        }
+        if (fr.kind == 'R') or (fr.kind == 'O') {
+            fr.count = u.atol(f.get(1));
+        } else {
+            let fid = cg.file_from_key(f.get(1));
+            if fid >= 0 {
+                fr.sp = u.mkspan(fid, u.to_u32(f.get(2)), u.to_u32(f.get(3)));
+                fr.has_span = fr.kind != 'U';
+            }
+        }
+        out.push(fr);
+    }
+}
+
+fn print_frames_human(fr: *u.List.[TFrame], errors: bool) void {
+    if fr.len == 0 {
+        return;
+    }
+    u.print(u.pick(errors, "     error return trace (oldest first):\n", "     stack trace (innermost first):\n"));
+    for i in 0..fr.len {
+        let f = fr.at(i);
+        if f.kind == 'R' {
+            u.print(
+                u.f2(
+                    "       ... the frame above repeats %s more time%s\n", u.dec(f.count),
+                    u.pick(f.count == 1, "", "s")));
+        } else if f.kind == 'O' {
+            u.print(u.f1("       ... %s more frames\n", u.dec(f.count)));
+        } else if not f.has_span {
+            u.print(u.f1("       at %s\n", f.fname));
+        } else {
+            let lc = u.span_linecol(f.sp);
+            if errors {
+                u.print(u.f5("       %s:%s:%s in %s: %s\n", u.file_of(f.sp.file).display, u.idec(lc.sl), u.idec(lc.sc),
+                             f.fname, u.source_line(f.sp)));
+            } else {
+                u.print(u.f4("       at %s (%s:%s:%s)\n", f.fname, u.file_of(f.sp.file).display, u.idec(lc.sl),
+                             u.idec(lc.sc)));
+            }
+        }
+    }
+}
+
+fn print_frames_json(fr: *u.List.[TFrame]) void {
+    u.print("[");
+    for i in 0..fr.len {
+        let f = fr.at(i);
+        if i != 0 {
+            u.print(",");
+        }
+        if f.kind == 'R' {
+            u.print(u.f1("{\"repeat\":%s}", u.dec(f.count)));
+            continue;
+        }
+        if f.kind == 'O' {
+            u.print(u.f1("{\"omitted\":%s}", u.dec(f.count)));
+            continue;
+        }
+        u.print("{\"function\":");
+        dg.json_str_out(f.fname);
+        if f.has_span {
+            let lc = u.span_linecol(f.sp);
+            u.print(",\"file\":");
+            dg.json_str_out(u.file_of(f.sp.file).display);
+            u.print(u.f2(",\"line\":%s,\"col\":%s,\"context\":", u.idec(lc.sl), u.idec(lc.sc)));
+            dg.json_str_out(u.source_line(f.sp));
+        }
+        u.print("}");
+    }
+    u.print("]");
+}
+
+// Native programs for another architecture run under qemu's user mode
+// emulation (with the target's libraries from /usr/<triple>).
+pub fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bool, show_output: bool) i32 {
+    let mut av = u.List.[[]u8].empty();
+    tg.push_emulator(&mut av);
+    if ty.g_target.is_wasm {
+        let names = ["node"];
+        let node = u.find_tool(names[..]);
+        if u.isnos(node) {
+            dg.emit_fatal(json, "E9003", "axiom test needs node to run WebAssembly tests (or use --target=native)");
+            return 2;
+        }
+        av.push(node);
+        av.push(u.f1("%s/internal/runtime/test_runner.mjs", std_dir));
+    }
+    av.push(bin);
+    if not u.isnos(filter) {
+        av.push(filter);
+    }
+    if not u.isnos(timeout) {
+        av.push(timeout);
+    }
+    let cap = run_capture(av.items());
+    if cap.status != 0 {
+        u.eprint(cap.out);
+        dg.emit_fatal(json, "E9006", "the test runner failed");
+        return 2;
+    }
+    let mut passed: i32 = 0;
+    let mut failed: i32 = 0;
+    if json {
+        u.print("{\"schema\":\"axiom-tests/1\",\"tests\":[");
+    }
+    let mut nres: i32 = 0;
+    let tests = sema.g_prog.tests;
+    let lines = u.split(cap.out, '\n', 0xFFFF_FFFF);
+    for li in 0..lines.len {
+        let line = lines.get(li);
+        if (line.len == 0) and ((li + 1) == lines.len) {
+            break;
+        }
+        if not u.starts(line, "AXT\t") {  // stray output
+            u.eprint(u.cat2(line, "\n"));
+            continue;
+        }
+        let f = u.split(line, '\t', 12);
+        if f.len < 10 {
+            continue;
+        }
+        let idx = u.atol(f.get(1));
+        if (idx < 0) or (idx >= @int_cast(i64, tests.len)) {
+            continue;
+        }
+        let d = tests.get(@int_cast(usize, idx));
+        let pass = u.str_eq(f.get(2), "pass");
+        let code = f.get(3);
+        let file_id = cg.file_from_key(f.get(4));
+        let mut sp = d.name_span;
+        if (file_id >= 0) and (@int_cast(usize, file_id) < u.g_files.len) {
+            sp = u.mkspan(file_id, u.to_u32(f.get(5)), u.to_u32(f.get(6)));
+        }
+        let ms = f.get(7);
+        let msg = unescape(f.get(8));
+        let output = unescape(f.get(9));
+        let mut frames = u.List.[TFrame].empty();
+        if f.len > 10 {
+            parse_frames(unescape(f.get(10)), &mut frames);
+        }
+        let etrace = (frames.len > 0) and (frames.get(0).kind == 'E');
+        let tfile = u.file_of(d.name_span.file).display;
+        let lc = u.span_linecol(sp);
+        if pass {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
+        if json {
+            u.print(u.pick(nres != 0, ",", ""));
+            nres += 1;
+            u.print("\n  {\"name\":");
+            dg.json_str_out(d.test_name);
+            u.print(",\"file\":");
+            dg.json_str_out(tfile);
+            u.print(u.f2(",\"status\":\"%s\",\"duration_ms\":%s", u.pick(pass, "pass", "fail"), ms));
+            if not pass {
+                u.print(",\"failure\":{\"code\":");
+                dg.json_str_out(code);
+                u.print(",\"message\":");
+                dg.json_str_out(msg);
+                u.print(",\"file\":");
+                dg.json_str_out(u.file_of(sp.file).display);
+                u.print(u.f6(",\"span\":{\"start_line\":%s,\"start_col\":%s,\"end_line\":%s,\"end_col\":%s,\"start_byte\":%s,\"end_byte\":%s},\"context\":",
+                             u.idec(lc.sl), u.idec(lc.sc), u.idec(lc.el), u.idec(lc.ec), u.udec(@as(u64, sp.start)),
+                             u.udec(@as(u64, sp.end))));
+                dg.json_str_out(u.source_line(sp));
+                if frames.len > 0 {
+                    u.print(u.pick(etrace, ",\"error_trace\":", ",\"stack\":"));
+                    print_frames_json(&frames);
+                }
+                u.print("}");
+            }
+            u.print(",\"output\":");
+            dg.json_str_out(output);
+            u.print("}");
+        } else {
+            u.print(u.f3("%s %s (%s ms)\n", u.pick(pass, "ok  ", "FAIL"), d.test_name, ms));
+            if not pass {
+                u.print(u.f5("     %s:%s:%s: %s %s\n", u.file_of(sp.file).display, u.idec(lc.sl), u.idec(lc.sc), code,
+                             msg));
+                u.print(u.f1("         %s\n", u.source_line(sp)));
+                print_frames_human(&frames, etrace);
+            }
+            if (output.len > 0) and (show_output or not pass) {
+                u.print("     output:\n");
+                let ol = u.split(output, '\n', 0xFFFF_FFFF);
+                for k in 0..ol.len {
+                    if ((k + 1) == ol.len) and (ol.get(k).len == 0) {
+                        break;
+                    }
+                    u.print(u.f1("       | %s\n", ol.get(k)));
+                }
+            }
+        }
+    }
+    if json {
+        u.print(u.f4("%s],\"passed\":%s,\"failed\":%s,\"status\":\"%s\"}\n", u.pick(nres != 0, "\n", ""),
+                     u.idec(passed), u.idec(failed), u.pick(failed != 0, "fail", "pass")));
+    } else {
+        u.print(u.f2("\n%s passed, %s failed\n", u.idec(passed), u.idec(failed)));
+    }
+    if failed != 0 {
+        return 1;
+    }
+    return 0;
+}
