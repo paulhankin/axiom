@@ -43,8 +43,7 @@ limit).
 
 Known gaps are GitHub issues: [#37](https://github.com/paulhankin/axiom/issues/37)
 (symbolic links under the node host), [#38](https://github.com/paulhankin/axiom/issues/38)
-(regex `find_all`), [#39](https://github.com/paulhankin/axiom/issues/39) (X.509 name
-constraints), [#40](https://github.com/paulhankin/axiom/issues/40) (deep directory
+(regex `find_all`), [#40](https://github.com/paulhankin/axiom/issues/40) (deep directory
 trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer fuzzing).
 
 ## Defences
@@ -68,7 +67,7 @@ trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer fuzzing)
 | http router | `..`, `/` and NUL refused in path parameters (except `*`), so `/files/:name` cannot escape |
 | tls | post-handshake messages capped at 64 KiB; ChangeCipherSpec accepted only as a single `0x01` before the handshake completes; a 20 s handshake deadline; ALPN must be one that was offered; `RecordOverflow` on oversized inner plaintext; no handshake bytes carried across a key change; KeyUpdate validated; NewSessionTicket accepted by clients only |
 | tls client | the server's session id echo must match; the ServerHello after a HelloRetryRequest must keep its suite and group |
-| x509 | at most 64 signature checks while building a path; names trimmed of a trailing dot and wildcards checked as a representative name against name constraints; trailing data and duplicate extensions refused |
+| x509 | at most 64 signature checks while building a path; a CA's name constraints checked against every certificate below it in the path (the leaf and the intermediates, not self-issued ones), names trimmed of a trailing dot and wildcards checked as a representative name; trailing data and duplicate extensions refused |
 | rsa, der, base64, hmac, aes-gcm, chacha20-poly1305 | huge public exponents, non-minimal integers, loose padding, HKDF output past `255 * n` and messages past the AEAD limits are refused (or trap, where they are programming errors) |
 | hash maps | SipHash-1-3 with a per-process random key, against hash flooding |
 | dns | a random query id, a connected socket, and answers matched to the question |

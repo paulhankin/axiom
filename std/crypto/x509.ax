@@ -603,12 +603,38 @@ fn within_ip(ip: []u8, base: []u8) bool {
     return true;
 }
 
-/// Whether leaf's names satisfy ca's name constraints.
-fn names_allowed(ca: *Certificate, leaf: *Certificate) bool {
+/// Whether ca's name constraints hold for every certificate below it in the
+/// path being built: the leaf (chain[0]) and the intermediates in use. A
+/// self-issued intermediate (its subject is its issuer) is exempt, as RFC
+/// 5280 (6.1.4) has it; the leaf never is.
+fn path_names_allowed(ca: *Certificate, chain: []Certificate, used: *[16]bool) bool {
     if not ca.has_constraints {
         return true;
     }
-    for n0 in leaf.dns_names.items() {
+    if not names_allowed(ca, &chain[0]) {
+        return false;
+    }
+    for i in 1..chain.len {
+        if (i >= 16) or not used[i] {
+            continue;
+        }
+        let c = &chain[i];
+        if @mem_eq(c.subject, c.issuer) {
+            continue;
+        }
+        if not names_allowed(ca, c) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether cert's names satisfy ca's name constraints.
+fn names_allowed(ca: *Certificate, cert: *Certificate) bool {
+    if not ca.has_constraints {
+        return true;
+    }
+    for n0 in cert.dns_names.items() {
         // names as matches_host sees them ("a.example." is "a.example"); a
         // wildcard "*.d" is judged by a name it matches ("a.d"), and is
         // excluded if any name it could match is
@@ -643,7 +669,7 @@ fn names_allowed(ca: *Certificate, leaf: *Certificate) bool {
             }
         }
     }
-    for a in leaf.ip_addrs.items() {
+    for a in cert.ip_addrs.items() {
         let mut permitted_any = false;
         let mut has_ip_permits = false;
         for p in ca.permitted.items() {
@@ -958,7 +984,6 @@ fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.
     if depth > 8 {
         return error.PathTooLong;
     }
-    let leaf = &chain[0];
     let mut last = error.UnknownAuthority;
     for r in roots.certs.items() {
         if not @mem_eq(r.subject, cert.issuer) {
@@ -969,7 +994,7 @@ fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.
             continue;
         }
         let rr = &r;
-        if not names_allowed(rr, leaf) {
+        if not path_names_allowed(rr, chain, used) {
             last = error.NameConstraint;
             continue;
         }
@@ -1007,7 +1032,7 @@ fn extend(chain: []Certificate, cert: *Certificate, roots: *CertPool, now: time.
             last = error.PathTooLong;
             continue;
         }
-        if not names_allowed(ca, leaf) {
+        if not path_names_allowed(ca, chain, used) {
             last = error.NameConstraint;
             continue;
         }
@@ -1289,6 +1314,95 @@ test "parse certificates" {
     @expect(ed.signed_by(&root));
 }
 
+// A constrained CA (permitted DNS good.test) that signs two sub-CAs, one with
+// a name outside its constraints (ca.evil.test) and one within (ca.good.test),
+// each signing www.good.test: the constraints apply to the sub-CAs too.
+let NC2_ROOT_PEM: [11][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBizCCATGgAwIBAgIUEubAsRycAWI2fl4Bi6gVrj0YnoswCgYIKoZIzj0EAwIw\n",
+    "EzERMA8GA1UEAwwITkMyIFJvb3QwHhcNMjYxMDE4MDgzNDQ3WhcNMzYxMDE1MDgz\n",
+    "NDQ3WjATMREwDwYDVQQDDAhOQzIgUm9vdDBZMBMGByqGSM49AgEGCCqGSM49AwEH\n",
+    "A0IABEVLgY5NFUrQUfNObKpsw/DA4RVYM+eC3YLm03K9wgB1pSgSWo2AlV8zLWXS\n",
+    "qamfU8hDDlxhx+PEEqm96Z7awIajYzBhMB0GA1UdDgQWBBT7hw8mdmovPZlXT5Vc\n",
+    "qVwOGY0hDjAfBgNVHSMEGDAWgBT7hw8mdmovPZlXT5VcqVwOGY0hDjAPBgNVHRMB\n",
+    "Af8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNIADBFAiBRAyYi\n",
+    "BsZv61MfaLgEpi/noF5mTPLeT47tvyeWrvWMNgIhAJ5ti9kvOfKlSLgkDP616Ga0\n",
+    "g0X0nTQTCtPP69yIjzlp\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let NC2_CON_PEM: [11][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBnjCCAUSgAwIBAgICA+kwCgYIKoZIzj0EAwIwEzERMA8GA1UEAwwITkMyIFJv\n",
+    "b3QwHhcNMjYxMDE4MDgzNDQ3WhcNMzYxMDE1MDgzNDQ3WjAaMRgwFgYDVQQDDA9O\n",
+    "QzIgQ29uc3RyYWluZWQwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASRVg8r2dPu\n",
+    "DZJtTqHK/eNgtWwq58StPoybOSHGcamutT5wEu/WO2O5L4bFzKDIdb9/RuGvWbE6\n",
+    "eDPTBsCR/825o4GAMH4wDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYw\n",
+    "GwYDVR0eAQH/BBEwD6ANMAuCCWdvb2QudGVzdDAdBgNVHQ4EFgQUsSUm76tiRFOO\n",
+    "O3fGKAEbuuIMuIswHwYDVR0jBBgwFoAU+4cPJnZqLz2ZV0+VXKlcDhmNIQ4wCgYI\n",
+    "KoZIzj0EAwIDSAAwRQIgev+We+SJaI1wmOhTWrUJYjBAhT+oIuhdsUyk4nfbt+0C\n",
+    "IQC9KRfysiWilUlxAmRa40/BqMvg7eYwbP22lFwBmjjsoQ==\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let NC2_SUB_EVIL_PEM: [11][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBnDCCAUOgAwIBAgICA+owCgYIKoZIzj0EAwIwGjEYMBYGA1UEAwwPTkMyIENv\n",
+    "bnN0cmFpbmVkMB4XDTI2MTAxODA4MzQ0N1oXDTM2MTAxNTA4MzQ0N1owFzEVMBMG\n",
+    "A1UEAwwMTkMyIFN1YiBFdmlsMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECrWN\n",
+    "54lv2XW8donavVqRLip790IS/AyinKf1v7f+7SdnfM5uCdVe+poxzCdOXT8MTLXb\n",
+    "VvJGkergmJ4jLWrz46N8MHowDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC\n",
+    "AQYwFwYDVR0RBBAwDoIMY2EuZXZpbC50ZXN0MB0GA1UdDgQWBBSVdGqN+3+gvT6Y\n",
+    "v1/KQgkWJPC0YTAfBgNVHSMEGDAWgBSxJSbvq2JEU447d8YoARu64gy4izAKBggq\n",
+    "hkjOPQQDAgNHADBEAiAthxDVSyxYOsT4TIZJPID3iVmJ+xFrf0fxRvUgl/hHowIg\n",
+    "S8bXuuwLloTA795+azBa+KusRqs44K6RUJBg2n8Gh0U=\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let NC2_SUB_GOOD_PEM: [11][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBnTCCAUOgAwIBAgICA+swCgYIKoZIzj0EAwIwGjEYMBYGA1UEAwwPTkMyIENv\n",
+    "bnN0cmFpbmVkMB4XDTI2MTAxODA4MzQ0OFoXDTM2MTAxNTA4MzQ0OFowFzEVMBMG\n",
+    "A1UEAwwMTkMyIFN1YiBHb29kMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEbgCO\n",
+    "WgxnSUtnTtiXelR00hQOzxXwqiVMjlLC7lSppNblxLZK40fty9zpQ207iU6nps1g\n",
+    "MmvZ8cioX1rlwDd1r6N8MHowDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC\n",
+    "AQYwFwYDVR0RBBAwDoIMY2EuZ29vZC50ZXN0MB0GA1UdDgQWBBSutk93UuZXTqcS\n",
+    "Biw86jsBmCRG9TAfBgNVHSMEGDAWgBSxJSbvq2JEU447d8YoARu64gy4izAKBggq\n",
+    "hkjOPQQDAgNIADBFAiAiHab3fx7Cs11Kuys7hpve1ykuUxJjORTgLAqN8ayOGAIh\n",
+    "AIdQuQrA8FMvEaSdCFkAGWZzY6032AQPmyFRchBCNBFF\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let NC2_LEAF_EVIL_PEM: [12][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBrTCCAVOgAwIBAgICA+wwCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMTkMyIFN1\n",
+    "YiBFdmlsMB4XDTI2MTAxODA4MzQ0OFoXDTM2MTAxNTA4MzQ0OFowGDEWMBQGA1UE\n",
+    "AwwNd3d3Lmdvb2QudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEY2oDw5\n",
+    "2deUEz+kqVEXl5y3dp+sxCyFLEUp6graTMEyYi8RYrGv0w9ywL5igUqTi4r42uuN\n",
+    "pgb474uN4OJwEb6jgY0wgYowCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwEwYD\n",
+    "VR0lBAwwCgYIKwYBBQUHAwEwGAYDVR0RBBEwD4INd3d3Lmdvb2QudGVzdDAdBgNV\n",
+    "HQ4EFgQUbvi5cYgjFF0gpGDxnJ8J9ysWc84wHwYDVR0jBBgwFoAUlXRqjft/oL0+\n",
+    "mL9fykIJFiTwtGEwCgYIKoZIzj0EAwIDSAAwRQIhAM6incGzzVi+ru3TUlQq8K/T\n",
+    "TF0+p+NwF6WQOAMMrz9uAiAEGofKdvhqQ5MkWtTDOCqaXlB3YTdGtmLtZOs0GYJU\n",
+    "bQ==\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+let NC2_LEAF_GOOD_PEM: [12][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBrTCCAVOgAwIBAgICA+0wCgYIKoZIzj0EAwIwFzEVMBMGA1UEAwwMTkMyIFN1\n",
+    "YiBHb29kMB4XDTI2MTAxODA4MzQ0OFoXDTM2MTAxNTA4MzQ0OFowGDEWMBQGA1UE\n",
+    "AwwNd3d3Lmdvb2QudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD1QmaAr\n",
+    "lo3Yyuz5ZEQkFbkNqa0qHOAwGNtSFCQ3MXBM1ktWIzqAeTZtqCDgygxfvq1a8QyC\n",
+    "jHClZrDuF5pSGOWjgY0wgYowCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwEwYD\n",
+    "VR0lBAwwCgYIKwYBBQUHAwEwGAYDVR0RBBEwD4INd3d3Lmdvb2QudGVzdDAdBgNV\n",
+    "HQ4EFgQUGct+FHoLHoYHpyTYF9zx7xCO0k0wHwYDVR0jBBgwFoAUrrZPd1LmV06n\n",
+    "EgYsPOo7AZgkRvUwCgYIKoZIzj0EAwIDSAAwRQIgDNqLsuL2PvLyM4T0s6N062+R\n",
+    "292P9LeBV3YQ/uNUBGoCIQCmUpRmDuGkPoKipup6MXFiGrQOC5aQ+CPct/m0OAyv\n",
+    "uQ==\n",
+    "-----END CERTIFICATE-----\n",
+];
+
 test "verify chains" {
     let mut roots = CertPool.init();
     defer roots.deinit();
@@ -1328,6 +1442,24 @@ test "verify chains" {
     defer dot[0].deinit();
     @expect(fails_with(verify_chain(dot[..], &nroots, "evil.test", time.date(2027, 1, 1, 0, 0, 0)!),
                        error.NameConstraint));
+    // a constrained CA's constraints bind the sub-CAs under it, not only the leaf
+    let mut r2 = CertPool.init();
+    defer r2.deinit();
+    let nr2 = join(NC2_ROOT_PEM[..])!;
+    defer mem.free(nr2);
+    @expect_eq(r2.add_pem(nr2)!, 1);
+    let mut evil: [3]Certificate = [cert_of(NC2_LEAF_EVIL_PEM[..])!, cert_of(NC2_SUB_EVIL_PEM[..])!,
+                                    cert_of(NC2_CON_PEM[..])!];
+    defer evil[0].deinit();
+    defer evil[1].deinit();
+    defer evil[2].deinit();
+    @expect(fails_with(verify_chain(evil[..], &r2, "www.good.test", now), error.NameConstraint));
+    let mut fine: [3]Certificate = [cert_of(NC2_LEAF_GOOD_PEM[..])!, cert_of(NC2_SUB_GOOD_PEM[..])!,
+                                    cert_of(NC2_CON_PEM[..])!];
+    defer fine[0].deinit();
+    defer fine[1].deinit();
+    defer fine[2].deinit();
+    verify_chain(fine[..], &r2, "www.good.test", now)!;
     @expect_eq(one_label_under("www.x.test", "x.test"), true);
     @expect_eq(one_label_under("a.www.x.test", "x.test"), false);
     @expect_eq(one_label_under("x.test", "x.test"), false);
