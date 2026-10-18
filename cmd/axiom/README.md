@@ -223,7 +223,8 @@ Native programs include the runtime written in Axiom, which uses no C library:
 ABI used by `std/io`, `std/net` and threads, a DNS resolver, crash reports with stack
 traces),
 `std/internal/runtime/test_main.ax` (the forking test runner of `axiom test`),
-`std/internal/runtime/profile.ax` (the sampling profiler of `axiom profile`) and `std/internal/runtime/rt.ax`
+`std/internal/runtime/profile.ax` (the sampling profiler of `axiom profile`; its raw output, shared with the
+macOS and Windows profilers, is `profile_out.ax`) and `std/internal/runtime/rt.ax`
 (software `fmod` and `fma` where the target has no instruction).
 On macOS `std/internal/runtime/darwin.ax` replaces `linux.ax` and `native.ax`: the same host ABI over
 `libSystem` (whose system call numbers are private), translating error and signal

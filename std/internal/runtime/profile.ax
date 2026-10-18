@@ -17,6 +17,7 @@
 // =============================================================================
 import "linux.ax" as sys;
 import "native.ax" as rt;
+import "profile_out.ax" as po;
 import "trap_format.ax" as tf;
 
 struct SigEvent {
@@ -33,14 +34,7 @@ struct ITimerSpec {
     value_nsec: i64,
 }
 
-struct Entry {
-    at: usize,  // offset of the sample in buf
-    count: u64,
-}
-
 const SIGPROF: i32 = 27;
-const BUF_WORDS: usize = 32 << 20;  // 256 MiB of address space, touched only as used
-const THREAD_BIT: u64 = 1 << 63;
 
 let mut buf: *mut u64 = @ptr_from_int(*mut u64, 0);
 let mut buf_pos: usize = 0;
@@ -52,7 +46,7 @@ let mut timer_ok: bool = false;
 let mut written: bool = false;
 
 fn words() []mut u64 {
-    return @slice_from_ptr(buf, BUF_WORDS);
+    return @slice_from_ptr(buf, po.BUF_WORDS);
 }
 
 // Each sample: [depth (top bit: not the main thread), weight, frames...].
@@ -70,14 +64,14 @@ fn on_prof(sig: i32, si: *mut void, uc: *mut void) void {
         n = tf.SS_CAP;
     }
     let at = @atomic_add(&mut buf_pos, @as(usize, n) + 2);
-    if (at + @as(usize, n) + 2) > BUF_WORDS {
+    if (at + @as(usize, n) + 2) > po.BUF_WORDS {
         _ = @atomic_add(&mut dropped, 1);
         return;
     }
     let w = words();
     w[at] = @as(u64, depth);
     if sys.gettid() != sys.getpid() {
-        w[at] = w[at] | THREAD_BIT;
+        w[at] = w[at] | po.THREAD_BIT;
     }
     // siginfo: si_code at 8; for timers si_overrun at 20
     let base = @int_from_ptr(si);
@@ -92,80 +86,15 @@ fn on_prof(sig: i32, si: *mut void, uc: *mut void) void {
     }
 }
 
-fn hash_words(s: []u64) u64 {
-    let mut h: u64 = 1469598103934665603;
-    for x in s {
-        h = (h ^ x) *% 1099511628211;
-    }
-    return h;
-}
-
-fn sample_len(at: usize) usize {
-    let d = words()[at] & ~THREAD_BIT;
-    if d < @as(u64, tf.SS_CAP) {
-        return 2 + @truncate(usize, d);
-    }
-    return 2 + @as(usize, tf.SS_CAP);
-}
-
-// Buffered output to a file descriptor.
-struct Out {
-    fd: i32,
-    n: usize,
-    b: [8192]u8,
-}
-
-fn out_flush(o: *mut Out) void {
+fn write_fd(fd: usize, s: []u8) void {
     let mut off: usize = 0;
-    while off < o.n {
-        let w = sys.write(o.fd, &o.b[off], o.n - off);
+    while off < s.len {
+        let w = sys.write(@truncate(i32, fd), &s[off], s.len - off);
         if w <= 0 {
             break;
         }
         off += @int_cast(usize, w);
     }
-    o.n = 0;
-}
-
-fn out_s(o: *mut Out, s: []u8) void {
-    for c in s {
-        if o.n == 8192 {
-            out_flush(o);
-        }
-        o.b[o.n] = c;
-        o.n += 1;
-    }
-}
-
-fn out_u(o: *mut Out, v: u64) void {
-    let mut tmp: [24]u8 = [0; 24];
-    let mut f = tf.fmt(tmp[..]);
-    f.u(v);
-    out_s(o, f.text());
-}
-
-fn put_site(o: *mut Out, s: *tf.Site) void {
-    out_s(o, "\t");
-    out_u(o, @as(u64, s.file_id));
-    out_s(o, "\x1f");
-    out_u(o, @as(u64, s.start));
-    out_s(o, "\x1f");
-    out_u(o, @as(u64, s.end));
-    out_s(o, "\x1f");
-    out_s(o, tf.cstr(s.fn_));
-}
-
-fn same_sample(a: usize, b: usize, n: usize) bool {
-    let w = words();
-    if (sample_len(a) != n) or (w[a] != w[b]) {
-        return false;
-    }
-    for k in 2..n {
-        if w[a + k] != w[b + k] {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn write_profile() void {
@@ -178,90 +107,28 @@ fn write_profile() void {
     }
     _ = sys.sigignore(SIGPROF);
     let mut end = @atomic_load(&buf_pos);
-    if end > BUF_WORDS {
-        end = BUF_WORDS;
+    if end > po.BUF_WORDS {
+        end = po.BUF_WORDS;
     }
     let fd0 = sys.open(out_path, 0x80241, 0o644);  // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
     if fd0 < 0 {
         return;
     }
     let fd = @truncate(i32, fd0);
-    let o = @ptr_from_int(*mut Out, sys.mmap_anon(@size_of(Out)));
-    o.fd = fd;
-    o.n = 0;
-    out_s(o, "# axiom-profile-raw 1\nhz ");
-    out_u(o, @as(u64, @bit_cast(u32, hz)));
-    out_s(o, "\nclock cpu\n");
-    if dropped != 0 {
-        out_s(o, "dropped ");
-        out_u(o, dropped);
-        out_s(o, "\n");
+    let o = @ptr_from_int(*mut po.Out, sys.mmap_anon(@size_of(po.Out)));
+    po.init(o, @int_cast(usize, fd), write_fd);
+    let cap = po.table_cap(end);
+    let tp = sys.mmap_anon(cap * @size_of(po.Entry));  // (zeroed)
+    let mut tab = @slice_from_ptr(@ptr_from_int(*mut po.Entry, 8), 0);
+    if tp != 0 {
+        tab = @slice_from_ptr(@ptr_from_int(*mut po.Entry, tp), cap);
     }
-    let mut cap: usize = 1024;
-    while cap < (end / 4) {
-        cap = cap << 1;
-    }
-    let tp = @ptr_from_int(*mut Entry, sys.mmap_anon(cap * @size_of(Entry)));  // (zeroed)
-    if @int_from_ptr(tp) == 0 {
-        out_flush(o);
-        _ = sys.close(fd);
-        return;
-    }
-    let tab = @slice_from_ptr(tp, cap);
-    let w = words();
-    let mut at: usize = 0;
-    while at < end {
-        let n = sample_len(at);
-        if (at + n) > end {
-            break;
-        }
-        let wt = w[at + 1];
-        let mut h = @truncate(usize, hash_words(w[at..at + 1]) ^ hash_words(w[at + 2..at + n])) & (cap - 1);
-        loop {
-            if tab[h].count == 0 {
-                tab[h].at = at;
-                tab[h].count = wt;
-                break;
-            }
-            if same_sample(tab[h].at, at, n) {
-                tab[h].count += wt;
-                break;
-            }
-            h = (h + 1) & (cap - 1);
-        }
-        at += n;
-    }
-    for i in 0..cap {
-        if tab[i].count == 0 {
-            continue;
-        }
-        let s = tab[i].at;
-        let n = sample_len(s) - 2;
-        let mut leaf: []u8 = "main";
-        if n > 0 {
-            let inner = @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2]));
-            leaf = tf.cstr(inner.callee);
-            if leaf.len == 0 {
-                leaf = "<indirect call>";
-            }
-        } else if (w[s] & THREAD_BIT) != 0 {
-            leaf = "<thread entry>";
-        }
-        out_s(o, "S\t");
-        out_u(o, tab[i].count);
-        out_s(o, "\t");
-        out_u(o, w[s] & ~THREAD_BIT);
-        out_s(o, "\t");
-        out_s(o, leaf);
-        for k in 0..n {
-            put_site(o, @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2 + k])));
-        }
-        out_s(o, "\n");
-    }
-    out_flush(o);
+    po.write(o, words(), end, hz, dropped, tab);
     _ = sys.close(fd);
-    _ = sys.munmap(@int_from_ptr(tp), cap * @size_of(Entry));
-    _ = sys.munmap(@int_from_ptr(o), @size_of(Out));
+    if tp != 0 {
+        _ = sys.munmap(tp, cap * @size_of(po.Entry));
+    }
+    _ = sys.munmap(@int_from_ptr(o), @size_of(po.Out));
 }
 
 export fn ax_profile_start() void {
@@ -281,7 +148,7 @@ export fn ax_profile_start() void {
     if v > 0 {
         hz = v;
     }
-    let p = sys.mmap_anon(BUF_WORDS * 8);
+    let p = sys.mmap_anon(po.BUF_WORDS * 8);
     if p == 0 {
         return;
     }

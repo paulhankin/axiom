@@ -21,6 +21,7 @@
 // allocates while a thread is suspended (that thread may hold the heap's
 // lock).
 // =============================================================================
+import "profile_out.ax" as po;
 import "trap_format.ax" as tf;
 import "windows.ax" as rt;
 
@@ -39,11 +40,6 @@ extern "C" {
     fn ax_sleep_ns(ns: u64) void;
 }
 
-struct Entry {
-    at: usize,  // offset of the sample in buf
-    count: u64,
-}
-
 // A registered thread.
 struct Slot {
     tid: u32,
@@ -54,9 +50,7 @@ struct Slot {
     main: bool,
 }
 
-const BUF_WORDS: usize = 32 << 20;  // 256 MiB of address space, committed as used
-const COMMIT: usize = 1 << 20;      // bytes committed at a time
-const THREAD_BIT: u64 = 1 << 63;
+const COMMIT: usize = 1 << 20;  // bytes committed at a time
 const NSLOTS: usize = 1024;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -79,7 +73,7 @@ let mut nslots: usize = 0;
 let mut ctx: usize = 0;  // a CONTEXT (16-byte aligned) for GetThreadContext
 
 fn words() []mut u64 {
-    return @slice_from_ptr(buf, BUF_WORDS);
+    return @slice_from_ptr(buf, po.BUF_WORDS);
 }
 
 fn cycles(h: usize) u64 {
@@ -154,7 +148,7 @@ fn register(start: bool) void {
 // Room for n more words of samples; false when the buffer is full.
 fn reserve(n: usize) bool {
     let end = buf_pos + n;
-    if end > BUF_WORDS {
+    if end > po.BUF_WORDS {
         return false;
     }
     while (end * 8) > committed {
@@ -185,7 +179,7 @@ fn sample(s: *mut Slot, weight: u64) void {
         let at = buf_pos;
         w[at] = @as(u64, depth);
         if not s.main {
-            w[at] = w[at] | THREAD_BIT;
+            w[at] = w[at] | po.THREAD_BIT;
         }
         w[at + 1] = weight;
         for i in 0..n {
@@ -247,84 +241,19 @@ fn thread_event(start: bool) void {
     register(start);
 }
 
-fn hash_words(s: []u64) u64 {
-    let mut h: u64 = 1469598103934665603;
-    for x in s {
-        h = (h ^ x) *% 1099511628211;
-    }
-    return h;
+fn alloc(n: usize) usize {
+    return rt.VirtualAlloc(0, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 }
 
-fn sample_len(at: usize) usize {
-    let d = words()[at] & ~THREAD_BIT;
-    if d < @as(u64, tf.SS_CAP) {
-        return 2 + @truncate(usize, d);
-    }
-    return 2 + @as(usize, tf.SS_CAP);
-}
-
-// Buffered output to a file.
-struct Out {
-    h: usize,
-    n: usize,
-    b: [8192]u8,
-}
-
-fn out_flush(o: *mut Out) void {
+fn write_h(h: usize, s: []u8) void {
     let mut off: usize = 0;
-    while off < o.n {
+    while off < s.len {
         let mut put: u32 = 0;
-        if rt.WriteFile(o.h, &o.b[off], @truncate(u32, o.n - off), &mut put, @ptr_from_int(*mut void, 0)) == 0 {
+        if rt.WriteFile(h, &s[off], @truncate(u32, s.len - off), &mut put, @ptr_from_int(*mut void, 0)) == 0 {
             break;
         }
         off += @as(usize, put);
     }
-    o.n = 0;
-}
-
-fn out_s(o: *mut Out, s: []u8) void {
-    for c in s {
-        if o.n == 8192 {
-            out_flush(o);
-        }
-        o.b[o.n] = c;
-        o.n += 1;
-    }
-}
-
-fn out_u(o: *mut Out, v: u64) void {
-    let mut tmp: [24]u8 = [0; 24];
-    let mut f = tf.fmt(tmp[..]);
-    f.u(v);
-    out_s(o, f.text());
-}
-
-fn put_site(o: *mut Out, s: *tf.Site) void {
-    out_s(o, "\t");
-    out_u(o, @as(u64, s.file_id));
-    out_s(o, "\x1f");
-    out_u(o, @as(u64, s.start));
-    out_s(o, "\x1f");
-    out_u(o, @as(u64, s.end));
-    out_s(o, "\x1f");
-    out_s(o, tf.cstr(s.fn_));
-}
-
-fn same_sample(a: usize, b: usize, n: usize) bool {
-    let w = words();
-    if (sample_len(a) != n) or (w[a] != w[b]) {
-        return false;
-    }
-    for k in 2..n {
-        if w[a + k] != w[b + k] {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn alloc(n: usize) usize {
-    return rt.VirtualAlloc(0, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 }
 
 fn write_profile() void {
@@ -343,83 +272,19 @@ fn write_profile() void {
     if h == ~@as(usize, 0) {
         return;
     }
-    let o = @ptr_from_int(*mut Out, alloc(@size_of(Out)));
+    let o = @ptr_from_int(*mut po.Out, alloc(@size_of(po.Out)));
     if @int_from_ptr(o) == 0 {
         _ = rt.CloseHandle(h);
         return;
     }
-    o.h = h;
-    o.n = 0;
-    out_s(o, "# axiom-profile-raw 1\nhz ");
-    out_u(o, @as(u64, @bit_cast(u32, hz)));
-    out_s(o, "\nclock cpu\n");
-    if dropped != 0 {
-        out_s(o, "dropped ");
-        out_u(o, dropped);
-        out_s(o, "\n");
+    po.init(o, h, write_h);
+    let cap = po.table_cap(end);
+    let tp = alloc(cap * @size_of(po.Entry));  // (zeroed)
+    let mut tab = @slice_from_ptr(@ptr_from_int(*mut po.Entry, 8), 0);
+    if tp != 0 {
+        tab = @slice_from_ptr(@ptr_from_int(*mut po.Entry, tp), cap);
     }
-    let mut cap: usize = 1024;
-    while cap < (end / 4) {
-        cap = cap << 1;
-    }
-    let tp = @ptr_from_int(*mut Entry, alloc(cap * @size_of(Entry)));  // (zeroed)
-    if @int_from_ptr(tp) == 0 {
-        out_flush(o);
-        _ = rt.CloseHandle(h);
-        return;
-    }
-    let tab = @slice_from_ptr(tp, cap);
-    let w = words();
-    let mut at: usize = 0;
-    while at < end {
-        let n = sample_len(at);
-        if (at + n) > end {
-            break;
-        }
-        let wt = w[at + 1];
-        let mut k = @truncate(usize, hash_words(w[at..at + 1]) ^ hash_words(w[at + 2..at + n])) & (cap - 1);
-        loop {
-            if tab[k].count == 0 {
-                tab[k].at = at;
-                tab[k].count = wt;
-                break;
-            }
-            if same_sample(tab[k].at, at, n) {
-                tab[k].count += wt;
-                break;
-            }
-            k = (k + 1) & (cap - 1);
-        }
-        at += n;
-    }
-    for i in 0..cap {
-        if tab[i].count == 0 {
-            continue;
-        }
-        let s = tab[i].at;
-        let n = sample_len(s) - 2;
-        let mut leaf: []u8 = "main";
-        if n > 0 {
-            let inner = @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2]));
-            leaf = tf.cstr(inner.callee);
-            if leaf.len == 0 {
-                leaf = "<indirect call>";
-            }
-        } else if (w[s] & THREAD_BIT) != 0 {
-            leaf = "<thread entry>";
-        }
-        out_s(o, "S\t");
-        out_u(o, tab[i].count);
-        out_s(o, "\t");
-        out_u(o, w[s] & ~THREAD_BIT);
-        out_s(o, "\t");
-        out_s(o, leaf);
-        for j in 0..n {
-            put_site(o, @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2 + j])));
-        }
-        out_s(o, "\n");
-    }
-    out_flush(o);
+    po.write(o, words(), end, hz, dropped, tab);
     _ = rt.CloseHandle(h);
 }
 
@@ -452,7 +317,7 @@ export fn ax_profile_start() void {
     if period <= 0 {
         return;
     }
-    let p = rt.VirtualAlloc(0, BUF_WORDS * 8, MEM_RESERVE, PAGE_READWRITE);
+    let p = rt.VirtualAlloc(0, po.BUF_WORDS * 8, MEM_RESERVE, PAGE_READWRITE);
     ctx = alloc(4096);
     if (p == 0) or (ctx == 0) {
         return;

@@ -1,0 +1,181 @@
+// =============================================================================
+// std/internal/runtime/profile_out.ax - what the sampling profilers (profile.ax on
+// Linux, profile_darwin.ax, profile_windows.ax) share: the layout of the
+// sample buffer, and the raw output `axiom profile` reads:
+//
+//   # axiom-profile-raw 1
+//   hz <rate>
+//   clock cpu
+//   S <count> <depth> <leaf> <site>...        (tab-separated, sites innermost first)
+//
+// where each <site> is <file id>\x1f<start>\x1f<end>\x1f<function>.
+// =============================================================================
+import "trap_format.ax" as tf;
+
+// The sample buffer holds BUF_WORDS words; each sample is [depth (top bit: not
+// the main thread), weight, frames...].
+pub const BUF_WORDS: usize = 32 << 20;  // 256 MiB of address space, touched only as used
+pub const THREAD_BIT: u64 = 1 << 63;
+
+// An aggregated sample: where its first copy is in the buffer, and the
+// weights of all its copies.
+pub struct Entry {
+    at: usize,
+    count: u64,
+}
+
+pub fn hash_words(s: []u64) u64 {
+    let mut h: u64 = 1469598103934665603;
+    for x in s {
+        h = (h ^ x) *% 1099511628211;
+    }
+    return h;
+}
+
+// The words of the sample at `at` of w.
+pub fn sample_len(w: []u64, at: usize) usize {
+    let d = w[at] & ~THREAD_BIT;
+    if d < @as(u64, tf.SS_CAP) {
+        return 2 + @truncate(usize, d);
+    }
+    return 2 + @as(usize, tf.SS_CAP);
+}
+
+fn same_sample(w: []u64, a: usize, b: usize, n: usize) bool {
+    if (sample_len(w, a) != n) or (w[a] != w[b]) {
+        return false;
+    }
+    for k in 2..n {
+        if w[a + k] != w[b + k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Buffered output: `write` sends bytes to the file `file` names (a descriptor
+// or a handle).
+pub struct Out {
+    file: usize,
+    write: fn(usize, []u8) void,
+    n: usize,
+    b: [8192]u8,
+}
+
+pub fn init(o: *mut Out, file: usize, put: fn(usize, []u8) void) void {
+    o.file = file;
+    o.write = put;
+    o.n = 0;
+}
+
+pub fn flush(o: *mut Out) void {
+    if o.n > 0 {
+        o.write(o.file, o.b[0..o.n]);
+    }
+    o.n = 0;
+}
+
+fn out_s(o: *mut Out, s: []u8) void {
+    for c in s {
+        if o.n == 8192 {
+            flush(o);
+        }
+        o.b[o.n] = c;
+        o.n += 1;
+    }
+}
+
+fn out_u(o: *mut Out, v: u64) void {
+    let mut tmp: [24]u8 = [0; 24];
+    let mut f = tf.fmt(tmp[..]);
+    f.u(v);
+    out_s(o, f.text());
+}
+
+fn put_site(o: *mut Out, s: *tf.Site) void {
+    out_s(o, "\t");
+    out_u(o, @as(u64, s.file_id));
+    out_s(o, "\x1f");
+    out_u(o, @as(u64, s.start));
+    out_s(o, "\x1f");
+    out_u(o, @as(u64, s.end));
+    out_s(o, "\x1f");
+    out_s(o, tf.cstr(s.fn_));
+}
+
+// The entries of the table that aggregates `end` words of samples.
+pub fn table_cap(end: usize) usize {
+    let mut cap: usize = 1024;
+    while cap < (end / 4) {
+        cap = cap << 1;
+    }
+    return cap;
+}
+
+// Writes the header, then the samples in w[..end] aggregated through tab
+// (zeroed, table_cap(end) entries; empty: the header alone), and flushes o.
+pub fn write(o: *mut Out, w: []u64, end: usize, hz: i32, dropped: u64, tab: []mut Entry) void {
+    out_s(o, "# axiom-profile-raw 1\nhz ");
+    out_u(o, @as(u64, @bit_cast(u32, hz)));
+    out_s(o, "\nclock cpu\n");
+    if dropped != 0 {
+        out_s(o, "dropped ");
+        out_u(o, dropped);
+        out_s(o, "\n");
+    }
+    let cap = tab.len;
+    if cap == 0 {
+        flush(o);
+        return;
+    }
+    let mut at: usize = 0;
+    while at < end {
+        let n = sample_len(w, at);
+        if (at + n) > end {
+            break;
+        }
+        let wt = w[at + 1];
+        let mut h = @truncate(usize, hash_words(w[at..at + 1]) ^ hash_words(w[at + 2..at + n])) & (cap - 1);
+        loop {
+            if tab[h].count == 0 {
+                tab[h].at = at;
+                tab[h].count = wt;
+                break;
+            }
+            if same_sample(w, tab[h].at, at, n) {
+                tab[h].count += wt;
+                break;
+            }
+            h = (h + 1) & (cap - 1);
+        }
+        at += n;
+    }
+    for i in 0..cap {
+        if tab[i].count == 0 {
+            continue;
+        }
+        let s = tab[i].at;
+        let n = sample_len(w, s) - 2;
+        let mut leaf: []u8 = "main";
+        if n > 0 {
+            let inner = @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2]));
+            leaf = tf.cstr(inner.callee);
+            if leaf.len == 0 {
+                leaf = "<indirect call>";
+            }
+        } else if (w[s] & THREAD_BIT) != 0 {
+            leaf = "<thread entry>";
+        }
+        out_s(o, "S\t");
+        out_u(o, tab[i].count);
+        out_s(o, "\t");
+        out_u(o, w[s] & ~THREAD_BIT);
+        out_s(o, "\t");
+        out_s(o, leaf);
+        for k in 0..n {
+            put_site(o, @ptr_from_int(*tf.Site, @truncate(usize, w[s + 2 + k])));
+        }
+        out_s(o, "\n");
+    }
+    flush(o);
+}
