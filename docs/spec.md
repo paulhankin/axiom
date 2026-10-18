@@ -106,10 +106,10 @@ A lone `_` is the **discard token** (§8.2). It is not an identifier.
 
 ```
 and       as        break     catch     const     continue  defer     else
-enum      error     export    extern    false     fn        for       host
-if        import    in        let       loop      match     mut       not
-or        pub       return    Self      struct    test      true      union
-while
+enum      errdefer  error     export    extern    false     fn        for
+host      if        import    in        let       loop      match     mut
+not       or        pub       return    Self      struct    test      true
+union     while
 ```
 
 `threadlocal` is not a keyword. It is an identifier that has its special meaning
@@ -299,7 +299,7 @@ Pattern       ::= "." IDENT ( "(" IDENT ")" )?      (* union variant *)
 ReturnStmt    ::= "return" Expr? ";"
 BreakStmt     ::= "break" IDENT? ";"
 ContinueStmt  ::= "continue" IDENT? ";"
-DeferStmt     ::= "defer" ( Block | ExprStmt )
+DeferStmt     ::= ( "defer" | "errdefer" ) ( Block | ExprStmt )
 ```
 
 Assignment and expression statements share one production because both begin with an
@@ -1160,6 +1160,25 @@ normal completion, `return`, `break`, `continue`, `e!` propagation, and `catch r
   a leaving handler (`E0640`). A deferred statement cannot change where control goes.
 - A `defer` inside a loop body runs at the end of **each** iteration.
 - On a **trap**, deferred statements do **not** run.
+
+`errdefer S` registers `S` to run only when control leaves the enclosing block **by
+returning an error** from the function: `e!` propagation, `catch return`, or a `return`
+whose value is an error, which is decided at run time. Normal completion, `break`,
+`continue` and a successful `return` skip it. It is for undoing partial work when a
+function fails partway:
+
+```axiom
+fn make() !*Pair {
+    let p = mem.alloc.[Pair](1)!;
+    errdefer mem.free(p);          // only if the next line fails
+    p[0].buf = mem.alloc.[u8](64)!;
+    return &p[0];
+}
+```
+
+`errdefer` and `defer` statements run in one reverse sequence, and the rules above
+apply to both. `errdefer` is a compile error in a function whose return type is not an
+error union (`E0641`).
 
 ---
 
@@ -2399,6 +2418,7 @@ Initial registry, not exhaustive:
 | E0631 | Duplicate `match` pattern |
 | E0635 | A `match` arm with several patterns binds a payload |
 | E0640 | Control flow leaves a `defer` |
+| E0641 | `errdefer` in a function that cannot return an error |
 | E0650 | Undeclared error name |
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |

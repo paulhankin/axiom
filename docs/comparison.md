@@ -19,7 +19,7 @@ Axiom's choices differ and what each choice costs.
 | **Undefined behavior** | None in checked code. A raw-pointer access outside its object is confined to the module's memory on WebAssembly, and undefined natively (spec §12.1) | "Illegal behavior": checked in Debug/ReleaseSafe, undefined in ReleaseFast/ReleaseSmall | None in safe code; possible in `unsafe` | Pervasive | Pervasive |
 | **Memory safety** | Bounds-checked slices and arrays; raw pointers unchecked, and dangling pointers not prevented (`--sanitize=address` finds them) | Checked slices in safe modes; lifetimes are up to you | Ownership and borrow checking | Up to you (RAII, smart pointers, optional hardening) | Up to you |
 | **Allocation** | One global allocator (`std/mem`, written in Axiom), always called explicitly | Allocators passed explicitly; no global one | Global allocator, implicit in `Box`/`Vec`/`String` | Global `new`, implicit in containers | `malloc` |
-| **Cleanup** | `defer` | `defer`, `errdefer` | Destructors (`Drop`) | Destructors (RAII) | By hand (or compiler extensions) |
+| **Cleanup** | `defer`, `errdefer` | `defer`, `errdefer` | Destructors (`Drop`) | Destructors (RAII) | By hand (or compiler extensions) |
 | **Errors** | `!T` with one program-wide error set; postfix `!` propagates; `catch` | Error unions with per-function error sets; `try`; `catch` | `Result<T, E>` and `?`; panics | Exceptions; `std::expected` (C++23) | Return codes, `errno` |
 | **Null** | No null; pointers are never optional | Non-null pointers; `?T` optionals | No null; `Option<T>` | `nullptr` | `NULL` (`nullptr` in C23) |
 | **Generics** | Monomorphized; a closed set of builtin constraints; bodies checked at the definition | `comptime` parameters; checked at each instantiation | Traits; checked at the definition | Templates, concepts; checked at each instantiation | Macros, `_Generic`, `void *` |
@@ -205,8 +205,8 @@ they are not part of the language's meaning.
   starts), and `free` takes the slice, so objects carry no size header.
 - **Zig** is also explicit, but threads allocator values through every API instead of
   having a global one: flexible (arenas, fixed buffers, testing allocators), at the cost
-  of an extra parameter on everything that allocates. Zig has `errdefer`; Axiom does
-  not yet ([#24](https://github.com/paulhankin/axiom/issues/24)).
+  of an extra parameter on everything that allocates. Both have `errdefer` for undoing
+  partial work when a function fails.
 - **Rust** ties resources to ownership. `Drop` runs automatically at the end of a scope,
   which removes leaks and double frees but makes some calls invisible. Most standard
   containers use the global allocator (allocator parameters are still unstable).

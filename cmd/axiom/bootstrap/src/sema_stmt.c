@@ -493,6 +493,8 @@ bool check_stmt(Stmt *s) {
         break;
     }
     case S_DEFER: {
+        if (s->on_error && (!C->ret || C->ret->kind != TY_ERRUNION))
+            diag_error(s->span, "E0641", "errdefer needs a function that returns an error union (!T)");
         int saved_base = C->defer_loop_base;
         C->defer_depth++;
         C->defer_loop_base = C->loop_depth;

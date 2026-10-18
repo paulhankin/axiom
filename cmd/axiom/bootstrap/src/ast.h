@@ -227,6 +227,7 @@ struct Stmt {
     Vec(MatchArm) arms;
     Sym label;  // a loop's label; break / continue: the label named, if any
     Span label_span;
+    bool on_error;  // defer: an errdefer, run only when the function returns an error
     // sema
     Local *local;
     bool diverges;    // block never completes normally

@@ -2014,7 +2014,12 @@ fn subst_gargs(g: []mut *mut ast.Type) []mut *mut ast.Type {
 // ---------------------------------------------------------------------------
 // Defers and control flow
 // ---------------------------------------------------------------------------
-fn emit_defers(down_to: usize) void {
+// Runs the pending deferred statements above `down_to`, innermost first.
+// `err` says whether control is leaving by returning an error: nil where it
+// is not (a block's end, break, continue, so errdefers are skipped), an i1
+// where the return value decides at run time, or `always` where it is
+// known (`e!`).
+fn emit_defers(down_to: usize, err: *mut ir.Value, always: bool) void {
     let mut i = F.defers.len;
     while i > down_to {
         i -= 1;
@@ -2022,9 +2027,24 @@ fn emit_defers(down_to: usize) void {
             return;
         }
         let s = F.defers.get(i);
+        if s.on_error and u.isnil(err) and not always {
+            continue;
+        }
         let saved = F.defers.len;
         F.defers.len = i;  // a deferred statement runs with only the outer defers pending
-        gen_stmt(s);
+        if s.on_error and not always {
+            let run = new_bb("errdefer".ptr);
+            let skip = new_bb("errdefer.end".ptr);
+            condbr(err, run, skip);
+            at_end(run);
+            gen_stmt(s.body);
+            if not terminated() {
+                br(skip);
+            }
+            at_end(skip);
+        } else {
+            gen_stmt(s.body);
+        }
         F.defers.len = saved;
     }
 }
@@ -2056,18 +2076,21 @@ fn errunion_value(eu: *mut ast.Type, code: *mut ir.Value, payload: *mut ir.Value
 
 fn gen_return(e: *mut ast.Expr) void {
     let mut v = vnil();
+    let mut err = vnil();  // returning an error? (for the errdefers)
     if u.notnil(e) {
         v = gen(e);
         if terminated() {
             return;
         }
         if F.ret.kind == ast.TY_ERRUNION {
-            etrace_push(extract(v, 0));
+            let code = extract(v, 0);
+            etrace_push(code);
+            err = icmp(ir.IntNE, code, ir.cint(T_i16, 0));
         }
     } else if F.ret.kind == ast.TY_ERRUNION {
         v = errunion_value(F.ret, ir.cint(T_i16, 0), vnil());
     }
-    emit_defers(0);
+    emit_defers(0, err, false);
     if terminated() {
         return;
     }
@@ -2087,7 +2110,7 @@ fn gen_break(is_break: bool, depth: i32) void {
         i = 0;
     }
     let lc = F.loops.get(i);
-    emit_defers(lc.defer_height);
+    emit_defers(lc.defer_height, vnil(), false);
     if is_break {
         br(lc.brk);
     } else {
@@ -2677,7 +2700,7 @@ fn gen_try(e: *mut ast.Expr) *mut ir.Value {
     at_end(err_bb);
     etrace_push(code);
     let rv = errunion_value(F.ret, code, vnil());
-    emit_defers(0);
+    emit_defers(0, vnil(), true);
     if not terminated() {
         emit_ret(rv);
     }
@@ -4554,7 +4577,7 @@ fn gen_block(b: *mut ast.Stmt) void {
         gen_stmt(b.stmts.get(i));
     }
     if not terminated() {
-        emit_defers(height);
+        emit_defers(height, vnil(), false);
     }
     F.defers.len = height;
 }
@@ -4889,7 +4912,7 @@ fn gen_stmt_inner(s: *mut ast.Stmt) void {
     } else if k == ast.S_CONTINUE {
         gen_break(false, s.jump_depth);
     } else if k == ast.S_DEFER {
-        F.defers.push(s.body);
+        F.defers.push(s);
     } else if k == ast.S_BLOCK {
         gen_block(s);
     }

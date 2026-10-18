@@ -1646,13 +1646,28 @@ static Type **subst_gargs(Type **g, int n) {
 // ---------------------------------------------------------------------------
 // Defers and control flow
 // ---------------------------------------------------------------------------
-static void emit_defers(int down_to) {
+// Runs the pending deferred statements above `down_to`, innermost first.
+// `err` says whether control is leaving by returning an error: NULL where
+// it is not (a block's end, break, continue, so errdefers are skipped), an
+// i1 where the return value decides at run time, or `always` where it is
+// known (`e!`).
+static void emit_defers(int down_to, LLVMValueRef err, bool always) {
     for (int i = F->defers.len - 1; i >= down_to; i--) {
         if (terminated()) return;
         Stmt *s = F->defers.data[i];
+        if (s->on_error && !err && !always) continue;
         int saved = F->defers.len;
         F->defers.len = i;  // a deferred statement runs with only the outer defers pending
-        gen_stmt(s);
+        if (s->on_error && !always) {
+            LLVMBasicBlockRef run = new_bb("errdefer"), skip = new_bb("errdefer.end");
+            LLVMBuildCondBr(B, err, run, skip);
+            LLVMPositionBuilderAtEnd(B, run);
+            gen_stmt(s->body);
+            if (!terminated()) LLVMBuildBr(B, skip);
+            LLVMPositionBuilderAtEnd(B, skip);
+        } else {
+            gen_stmt(s->body);
+        }
         F->defers.len = saved;
     }
 }
@@ -1692,21 +1707,30 @@ static void gen_into(Expr *e, LLVMValueRef dest, bool fresh, bool unaligned);
 
 static void gen_return(Expr *e) {
     LLVMValueRef v = NULL;
+    LLVMValueRef err = NULL;  // returning an error? (for the errdefers)
     if (e && F->sret_ptr) {
         // straight into the caller's result slot, which nothing here can
         // read (before the defers run)
         gen_into(e, F->sret_ptr, true, false);
         if (terminated()) return;
-        if (F->ret->kind == TY_ERRUNION) etrace_push(errunion_code(F->ret, F->sret_ptr));
+        if (F->ret->kind == TY_ERRUNION) {
+            LLVMValueRef code = errunion_code(F->ret, F->sret_ptr);
+            etrace_push(code);
+            err = LLVMBuildICmp(B, LLVMIntNE, code, LLVMConstInt(T_i16, 0, false), "");
+        }
     } else if (e) {
         v = gen(e);
         if (terminated()) return;
         if (in_mem(F->ret)) v = as_val(F->ret, v);  // (before the defers run)
-        if (F->ret->kind == TY_ERRUNION) etrace_push(errunion_code(F->ret, v));
+        if (F->ret->kind == TY_ERRUNION) {
+            LLVMValueRef code = errunion_code(F->ret, v);
+            etrace_push(code);
+            err = LLVMBuildICmp(B, LLVMIntNE, code, LLVMConstInt(T_i16, 0, false), "");
+        }
     } else if (F->ret->kind == TY_ERRUNION) {
         v = errunion_value(F->ret, LLVMConstInt(T_i16, 0, false), NULL);
     }
-    emit_defers(0);
+    emit_defers(0, err, false);
     if (terminated()) return;
     emit_ret(v);
     dead_block();
@@ -1717,7 +1741,7 @@ static void gen_break(bool is_break, int depth) {
     if (!F->loops.len) return;
     int i = F->loops.len - 1 - depth;
     LoopCtx *lc = &F->loops.data[i < 0 ? 0 : i];
-    emit_defers(lc->defer_height);
+    emit_defers(lc->defer_height, NULL, false);
     LLVMBuildBr(B, is_break ? lc->brk : lc->cont);
     dead_block();
 }
@@ -2349,7 +2373,7 @@ static LLVMValueRef gen_try(Expr *e) {
     LLVMPositionBuilderAtEnd(B, err_bb);
     etrace_push(code);
     LLVMValueRef rv = errunion_value(F->ret, code, NULL);
-    emit_defers(0);
+    emit_defers(0, NULL, true);
     if (!terminated()) emit_ret(rv);
     LLVMPositionBuilderAtEnd(B, ok_bb);
     if (eu->elem->kind == TY_VOID) return NULL;
@@ -4283,7 +4307,7 @@ static void gen_block(Stmt *b) {
         if (b->stmts.data[i]->kind == S_FOR && O->opt_level > 0) mark_bounded_sums(b, i);
         gen_stmt(b->stmts.data[i]);
     }
-    if (!terminated()) emit_defers(height);
+    if (!terminated()) emit_defers(height, NULL, false);
     F->defers.len = height;
 }
 
@@ -4535,7 +4559,7 @@ static void gen_stmt_inner(Stmt *s) {
     case S_RETURN: gen_return(s->e); return;
     case S_BREAK: gen_break(true, s->jump_depth); return;
     case S_CONTINUE: gen_break(false, s->jump_depth); return;
-    case S_DEFER: vec_push(F->defers, s->body); return;
+    case S_DEFER: vec_push(F->defers, s); return;
     case S_BLOCK: gen_block(s); return;
     }
 }

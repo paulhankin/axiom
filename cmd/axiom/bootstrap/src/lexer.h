@@ -14,6 +14,7 @@
     X(DEFER, "defer")        \
     X(ELSE, "else")          \
     X(ENUM, "enum")          \
+    X(ERRDEFER, "errdefer")  \
     X(ERROR, "error")        \
     X(EXPORT, "export")      \
     X(EXTERN, "extern")      \

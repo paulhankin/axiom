@@ -928,9 +928,10 @@ static Stmt *parse_stmt(Parser *P) {
         s->span = sp_from(P, start);
         return s;
     }
-    case KW_DEFER: {
-        advance(P);
+    case KW_DEFER:
+    case KW_ERRDEFER: {
         Stmt *s = new_stmt(S_DEFER, start);
+        s->on_error = advance(P)->kind == KW_ERRDEFER;
         s->body = pk(P) == TK_LBRACE ? parse_block(P) : parse_expr_stmt(P);
         s->span = sp_from(P, start);
         return s;
