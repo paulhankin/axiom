@@ -45,7 +45,7 @@ struct Type {
     Type **params;   // FN
     int nparams;
     Type *ret;
-    Decl *decl;      // STRUCT, UNION, ENUM
+    Decl *decl;      // STRUCT, UNION, ENUM; ERROR, ERRUNION: the error set (NULL: any error)
     Type **args;
     int nargs;
     // PARAM
@@ -90,6 +90,8 @@ Type *type_fn(Type **params, int n, Type *ret);
 Type *type_named(Decl *d, Type **args, int n);  // struct or union instance
 Type *type_enum(Decl *d, Type *repr);
 Type *type_errunion(Type *elem);
+Type *type_errunion_set(Type *elem, Decl *set);
+Type *type_errset(Decl *set);
 Type *type_constint(int64_t v);
 Type *type_param(Decl *owner, int index, Sym name, Constraint c, bool is_const, Type *const_type);
 Decl *anon_struct_decl(Module *m, FieldVec fields, Span sp);  // interned by field list

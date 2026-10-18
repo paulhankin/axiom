@@ -1213,8 +1213,22 @@ static void mangle_type_into(CharVec *b, Type *t) {
         mangle_type_into(b, t->elem);
         break;
     case TY_ERRUNION:
+        if (t->decl) {
+            MPUT(mangle_prefix(t->decl));
+            MPUT(".");
+            MPUT(t->decl->name);
+        }
         MPUT("!");
         mangle_type_into(b, t->elem);
+        break;
+    case TY_ERROR:
+        if (t->decl) {
+            MPUT(mangle_prefix(t->decl));
+            MPUT(".");
+            MPUT(t->decl->name);
+        } else {
+            MPUT("error");
+        }
         break;
     case TY_FN:
         MPUT("fn(");

@@ -68,12 +68,13 @@ struct El {
     xcomma: bool,  // a comma between those items
     eol: bool,     // the '}' that ends an error declaration
     comma: bool,   // a comma is added after it (the last struct member)
+    setb: bool,    // the '!' of Set!T: no space on either side
 }
 
 fn mk_el(kind: i32, text: []u8, nl: i32, col: i32) El {
     return El.{ kind: kind, text: text, nl: nl, col: col, sp: false, opnd: false, unary: false, binop: false, brace: 0,
                 empty: false, fnsig: false, pfx: false, cap: 0, trail: false, x: false, xcomma: false, eol: false,
-                comma: false };
+                comma: false, setb: false };
 }
 
 fn el_list() u.List.[El] {
@@ -618,7 +619,7 @@ fn space_before(p: *El, c: *El) bool {
     if ck == lx.TK_DOT {
         return not p.opnd;
     }
-    if (ck == lx.TK_BANG) and c.opnd {
+    if (ck == lx.TK_BANG) and (c.opnd or c.setb) {
         return false;
     }
     if ck == lx.TK_LPAREN {
@@ -628,6 +629,31 @@ fn space_before(p: *El, c: *El) bool {
         return not p.opnd;
     }
     return true;
+}
+
+// Whether the '!' after els[prev] makes Set!T, an error union of a named
+// error set: after a name, and before what only a type starts with (a
+// postfix '!' is never followed by a name), or before '*' or '[' where the
+// name follows ':' or ')' (a parameter's, field's or result's type).
+fn set_bang(els: []mut El, prev: usize, nk: i32) bool {
+    if (prev == NONE) or (els[prev].kind != lx.TK_IDENT) {
+        return false;
+    }
+    if (nk == lx.TK_IDENT) or (nk == lx.TK_PRIM) or (nk == lx.KW_FN) or (nk == lx.KW_STRUCT) or (nk == lx.KW_ERROR) or
+       (nk == lx.KW_SELF) {
+        return true;
+    }
+    if (nk != lx.TK_STAR) and (nk != lx.TK_LBRACKET) {
+        return false;
+    }
+    let mut j = prev_tok(els, prev);
+    if (j != NONE) and (els[j].kind == lx.TK_DOT) {
+        j = prev_tok(els, j);
+        if (j != NONE) and (els[j].kind == lx.TK_IDENT) {
+            j = prev_tok(els, j);
+        }
+    }
+    return (j != NONE) and ((els[j].kind == lx.TK_COLON) or (els[j].kind == lx.TK_RPAREN));
 }
 
 // Brackets, brace kinds, operators and spacing.
@@ -646,6 +672,7 @@ fn classify(els: []mut El) void {
         }
     }
     let mut pending: i32 = 0;
+    let mut err_union = false;  // in `error S = A | { B };`: its braces are inline
     let mut prev = NONE;
     for i in 0..els.len {
         if is_cmt(&els[i]) {
@@ -669,6 +696,22 @@ fn classify(els: []mut El) void {
             pending = BR_INLINE;
         } else if (k == lx.KW_UNION) or (k == lx.KW_ENUM) {
             pending = BR_FIELDS;
+        } else if (k == lx.KW_ERROR) and (nk == lx.TK_IDENT) and
+                  ((pk == -1) or (pk == lx.TK_SEMI) or (pk == lx.TK_RBRACE) or (pk == lx.TK_LBRACE) or
+                   (pk == lx.KW_PUB)) {
+            // a named error set: `error S { A, B }` or `error S = A | { B };`
+            let n2 = next_tok(els, nt);
+            if (n2 != NONE) and (els[n2].kind == lx.TK_LBRACE) {
+                pending = BR_INLINE;
+                let m = mate[n2];
+                if m != NONE {
+                    els[m].eol = true;
+                }
+            } else {
+                err_union = true;
+            }
+        } else if (k == lx.TK_SEMI) and err_union {
+            err_union = false;
         } else if (k == lx.KW_ERROR) and (nk == lx.TK_LBRACE) and
                   ((pk == -1) or (pk == lx.TK_SEMI) or (pk == lx.TK_RBRACE) or (pk == lx.TK_LBRACE) or
                    (pk == lx.KW_PUB)) {
@@ -684,7 +727,7 @@ fn classify(els: []mut El) void {
             pending = BR_DECLS;
         } else if k == lx.TK_LBRACE {
             let mut br = BR_BLOCK;
-            if pk == lx.TK_DOT {
+            if (pk == lx.TK_DOT) or err_union {
                 br = BR_INLINE;
             } else if pending != 0 {
                 br = pending;
@@ -742,6 +785,9 @@ fn classify(els: []mut El) void {
             els[i].opnd = not els[i].pfx;
         } else if k == lx.TK_RBRACE {
             els[i].opnd = els[i].brace == BR_INLINE;
+        } else if (k == lx.TK_BANG) and set_bang(els, prev, nk) {
+            els[i].setb = true;
+            els[i].unary = true;
         } else if k == lx.TK_BANG {
             els[i].opnd = popnd;
             els[i].unary = not popnd;

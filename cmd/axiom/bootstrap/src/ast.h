@@ -50,6 +50,7 @@ struct TypeExpr {
     TypeExprVec args;  // TE_NAMED generic args; TE_FN params
     bool has_args;
     TypeExpr *elem;  // PTR, SLICE, ARRAY, ERRUNION; TE_FN: return type
+    TypeExpr *set;   // ERRUNION: the error set named (Set!T), or NULL (!T: any error)
     bool mut;
     TypeExpr *len;  // ARRAY: TE_INTLIT, TE_NAMED (a const or a const parameter) or TE_CONSTEXPR
     FieldVec fields;
@@ -318,6 +319,8 @@ struct Decl {
     Span abi_span;
     Vec(Sym) error_names;
     Vec(Span) error_spans;
+    TypeExprVec error_refs;  // D_ERROR: the sets a named set includes (error S = A | B;)
+    Vec(Sym) set_names;      // D_ERROR with a name: every name of the set (sema)
     // fn attribute: @features("a,b") or @multiversion("a,b", "c") after the return type
     int attr;  // ATTR_*
     Span attr_span;

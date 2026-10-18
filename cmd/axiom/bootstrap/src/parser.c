@@ -282,6 +282,15 @@ static TypeExpr *parse_type(Parser *P) {
             }
         }
         te->span = sp_from(P, start);
+        // Set!T: an error union of the error set named
+        if (pk(P) == TK_BANG) {
+            advance(P);
+            TypeExpr *eu = new_te(TE_ERRUNION, start);
+            eu->set = te;
+            eu->elem = parse_type(P);
+            eu->span = sp_from(P, start);
+            return eu;
+        }
         return te;
     }
     default:
@@ -961,6 +970,56 @@ static Decl *new_decl(Parser *P, DeclKind k, Span sp) {
     return d;
 }
 
+// "{" IDENT ( "," IDENT )* ","? "}"
+static void parse_error_names(Parser *P, Decl *d) {
+    expect(P, TK_LBRACE);
+    while (pk(P) == TK_IDENT) {
+        Span sp;
+        Sym n = expect_ident(P, &sp);
+        vec_push(d->error_names, n);
+        vec_push(d->error_spans, sp);
+        if (!accept(P, TK_COMMA)) break;
+    }
+    expect(P, TK_RBRACE);
+}
+
+// ErrorDecl ::= "pub"? "error" ( "{" ErrorNames "}"
+//                              | IDENT "{" ErrorNames "}"
+//                              | IDENT "=" ErrorTerm ( "|" ErrorTerm )* ";" )
+// ErrorTerm ::= "{" ErrorNames "}" | IDENT ( "." IDENT )?
+static Decl *parse_error_decl(Parser *P, Span start, bool is_pub) {
+    expect(P, KW_ERROR);
+    Decl *d = new_decl(P, D_ERROR, start);
+    d->is_pub = is_pub;
+    if (pk(P) == TK_IDENT) {
+        d->name = expect_ident(P, &d->name_span);
+        if (accept(P, TK_EQ)) {
+            for (;;) {
+                if (pk(P) == TK_LBRACE) {
+                    parse_error_names(P, d);
+                } else {
+                    Span ns = peek(P)->span;
+                    TypeExpr *te = new_te(TE_NAMED, ns);
+                    te->name = expect_ident(P, &te->name_span);
+                    if (accept(P, TK_DOT)) {
+                        te->qual = te->name;
+                        te->name = expect_ident(P, &te->name_span);
+                    }
+                    te->span = sp_from(P, ns);
+                    vec_push(d->error_refs, te);
+                }
+                if (!accept(P, TK_PIPE)) break;
+            }
+            expect(P, TK_SEMI);
+            d->span = sp_from(P, start);
+            return d;
+        }
+    }
+    parse_error_names(P, d);
+    d->span = sp_from(P, start);
+    return d;
+}
+
 static void parse_generic_params(Parser *P, Decl *d) {
     if (!accept(P, TK_LBRACKET)) return;
     while (pk(P) != TK_RBRACKET && pk(P) != TK_EOF) {
@@ -1109,19 +1168,7 @@ static void parse_top(Parser *P) {
         return;
     }
     if (t->kind == KW_ERROR) {
-        advance(P);
-        Decl *d = new_decl(P, D_ERROR, start);
-        expect(P, TK_LBRACE);
-        while (pk(P) == TK_IDENT) {
-            Span sp;
-            Sym n = expect_ident(P, &sp);
-            vec_push(d->error_names, n);
-            vec_push(d->error_spans, sp);
-            if (!accept(P, TK_COMMA)) break;
-        }
-        expect(P, TK_RBRACE);
-        d->span = sp_from(P, start);
-        vec_push(P->mod->decls, d);
+        vec_push(P->mod->decls, parse_error_decl(P, start, false));
         return;
     }
     if (t->kind == KW_TEST) {
@@ -1182,6 +1229,10 @@ static void parse_top(Parser *P) {
         return;
     }
     bool is_pub = accept(P, KW_PUB);
+    if (pk(P) == KW_ERROR) {
+        vec_push(P->mod->decls, parse_error_decl(P, start, is_pub));
+        return;
+    }
     if (pk(P) == KW_EXTERN) {
         // ExternDecl ::= "pub"? "extern" STRING_LIT STRING_LIT? "{" ExternFn* "}"
         advance(P);

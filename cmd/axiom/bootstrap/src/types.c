@@ -148,8 +148,16 @@ Type *type_enum(Decl *d, Type *repr) {
     Type p = {.kind = TY_ENUM, .decl = d, .elem = repr};
     return intern_type(&p);
 }
-Type *type_errunion(Type *elem) {
-    Type p = {.kind = TY_ERRUNION, .elem = elem};
+Type *type_errunion(Type *elem) { return type_errunion_set(elem, NULL); }
+// set!T for the error set declared by set (NULL: any error).
+Type *type_errunion_set(Type *elem, Decl *set) {
+    Type p = {.kind = TY_ERRUNION, .elem = elem, .decl = set};
+    return intern_type(&p);
+}
+// The error type of the set declared by set (NULL: error, any error).
+Type *type_errset(Decl *set) {
+    if (!set) return t_error;
+    Type p = {.kind = TY_ERROR, .decl = set};
     return intern_type(&p);
 }
 Type *type_constint(int64_t v) {
@@ -290,7 +298,7 @@ Type *type_subst(Type *t, Type **from, Type **to, int n) {
         return t;
     case TY_PTR: return type_ptr(type_subst(t->elem, from, to, n), t->mut);
     case TY_SLICE: return type_slice(type_subst(t->elem, from, to, n), t->mut);
-    case TY_ERRUNION: return type_errunion(type_subst(t->elem, from, to, n));
+    case TY_ERRUNION: return type_errunion_set(type_subst(t->elem, from, to, n), t->decl);
     case TY_ARRAY: {
         Type *e = type_subst(t->elem, from, to, n);
         if (t->len_param) {
@@ -322,7 +330,7 @@ Type *type_lower_enums(Type *t) {
     case TY_ENUM: return t->elem;
     case TY_PTR: return type_ptr(type_lower_enums(t->elem), t->mut);
     case TY_SLICE: return type_slice(type_lower_enums(t->elem), t->mut);
-    case TY_ERRUNION: return type_errunion(type_lower_enums(t->elem));
+    case TY_ERRUNION: return type_errunion_set(type_lower_enums(t->elem), t->decl);
     case TY_ARRAY:
         if (t->len_param) return type_array_param(type_lower_enums(t->elem), t->len_param);
         return type_array(type_lower_enums(t->elem), t->len);
@@ -430,8 +438,12 @@ static void tstr(CharVec *b, Type *t) {
         }
         return;
     case TY_ENUM: puts_b(b, t->decl->name); return;
-    case TY_ERRUNION: puts_b(b, "!"); tstr(b, t->elem); return;
-    case TY_ERROR: puts_b(b, "error"); return;
+    case TY_ERRUNION:
+        if (t->decl) puts_b(b, t->decl->name);
+        puts_b(b, "!");
+        tstr(b, t->elem);
+        return;
+    case TY_ERROR: puts_b(b, t->decl ? t->decl->name : "error"); return;
     case TY_PARAM: puts_b(b, t->name); return;
     case TY_CONSTINT: snprintf(tmp, sizeof tmp, "%lld", (long long)t->cval); puts_b(b, tmp); return;
     case TY_UNTYPED_INT: puts_b(b, "integer literal"); return;

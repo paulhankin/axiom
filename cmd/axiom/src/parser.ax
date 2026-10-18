@@ -225,7 +225,8 @@ fn parse_type(P: *mut Parser) *mut ast.TypeExpr {
     if k == lx.TK_BANG {
         _ = advance(P);
         let elem = parse_type(P);
-        return ast.new_te(ast.TypeShape.ErrUnion(elem), sp_from(P, start));
+        let eu = ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: elem };
+        return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
     }
     if k == lx.TK_STAR {
         _ = advance(P);
@@ -304,7 +305,14 @@ fn parse_type(P: *mut Parser) *mut ast.TypeExpr {
                 parse_generic_arg_list(P, &mut nt.args);
             }
         }
-        return ast.new_te(ast.TypeShape.Named(nt), sp_from(P, start));
+        let named = ast.new_te(ast.TypeShape.Named(nt), sp_from(P, start));
+        // Set!T: an error union of the error set named
+        if pk(P) == lx.TK_BANG {
+            _ = advance(P);
+            let eu = ast.ErrUnionType.{ set: named, elem: parse_type(P) };
+            return ast.new_te(ast.TypeShape.ErrUnion(eu), sp_from(P, start));
+        }
+        return named;
     }
     syntax_error(P, "type");
     return ast.new_te(ast.TypeShape.Error, start);
@@ -1092,6 +1100,63 @@ fn parse_stmt(P: *mut Parser) *mut ast.Stmt {
 // ---------------------------------------------------------------------------
 // Declarations
 // ---------------------------------------------------------------------------
+// ErrorDecl ::= "pub"? "error" ( "{" ErrorNames "}"
+//                              | IDENT "{" ErrorNames "}"
+//                              | IDENT "=" ErrorTerm ( "|" ErrorTerm )* ";" )
+// ErrorTerm ::= "{" ErrorNames "}" | IDENT ( "." IDENT )?
+fn parse_error_decl(P: *mut Parser, start: u.Span, is_pub: bool) *mut ast.Decl {
+    _ = expect(P, lx.KW_ERROR);
+    let d = new_decl(P, ast.D_ERROR, start);
+    d.is_pub = is_pub;
+    if pk(P) == lx.TK_IDENT {
+        let id = expect_ident(P);
+        d.name = id.name;
+        d.name_span = id.span;
+        if accept(P, lx.TK_EQ) {
+            loop {
+                if pk(P) == lx.TK_LBRACE {
+                    parse_error_names(P, d);
+                } else {
+                    let n = peek(P);
+                    let rid = expect_ident(P);
+                    let mut nt = ast.NamedType.{ qual: u.nosym(), name: rid.name, name_span: rid.span,
+                                                 args: u.List.[*mut ast.TypeExpr].empty(), has_args: false };
+                    if accept(P, lx.TK_DOT) {
+                        let m = expect_ident(P);
+                        nt.qual = nt.name;
+                        nt.name = m.name;
+                        nt.name_span = m.span;
+                    }
+                    d.error_refs.push(ast.new_te(ast.TypeShape.Named(nt), sp_from(P, n.span)));
+                }
+                if not accept(P, lx.TK_PIPE) {
+                    break;
+                }
+            }
+            _ = expect(P, lx.TK_SEMI);
+            d.span = sp_from(P, start);
+            return d;
+        }
+    }
+    parse_error_names(P, d);
+    d.span = sp_from(P, start);
+    return d;
+}
+
+// "{" IDENT ( "," IDENT )* ","? "}"
+fn parse_error_names(P: *mut Parser, d: *mut ast.Decl) void {
+    _ = expect(P, lx.TK_LBRACE);
+    while pk(P) == lx.TK_IDENT {
+        let id = expect_ident(P);
+        d.error_names.push(id.name);
+        d.error_spans.push(id.span);
+        if not accept(P, lx.TK_COMMA) {
+            break;
+        }
+    }
+    _ = expect(P, lx.TK_RBRACE);
+}
+
 fn new_decl(P: *Parser, k: ast.DeclKind, sp: u.Span) *mut ast.Decl {
     let d = u.new.[ast.Decl]();
     d.kind = k;
@@ -1293,20 +1358,7 @@ fn parse_top(P: *mut Parser) void {
         return;
     }
     if t.kind == lx.KW_ERROR {
-        _ = advance(P);
-        let d = new_decl(P, ast.D_ERROR, start);
-        _ = expect(P, lx.TK_LBRACE);
-        while pk(P) == lx.TK_IDENT {
-            let id = expect_ident(P);
-            d.error_names.push(id.name);
-            d.error_spans.push(id.span);
-            if not accept(P, lx.TK_COMMA) {
-                break;
-            }
-        }
-        _ = expect(P, lx.TK_RBRACE);
-        d.span = sp_from(P, start);
-        mdecls.push(d);
+        mdecls.push(parse_error_decl(P, start, false));
         return;
     }
     if t.kind == lx.KW_TEST {
@@ -1354,7 +1406,7 @@ fn parse_top(P: *mut Parser) void {
             }
         }
         let v = ast.new_te(ast.TypeShape.Prim(lx.PRIM_VOID), start);
-        d.ret_te = ast.new_te(ast.TypeShape.ErrUnion(v), start);
+        d.ret_te = ast.new_te(ast.TypeShape.ErrUnion(ast.ErrUnionType.{ set: u.nil.[ast.TypeExpr](), elem: v }), start);
         d.body = parse_block(P);
         d.span = sp_from(P, start);
         mdecls.push(d);
@@ -1371,6 +1423,10 @@ fn parse_top(P: *mut Parser) void {
         return;
     }
     let is_pub = accept(P, lx.KW_PUB);
+    if pk(P) == lx.KW_ERROR {
+        mdecls.push(parse_error_decl(P, start, is_pub));
+        return;
+    }
     if pk(P) == lx.KW_EXTERN {
         // ExternDecl ::= "pub"? "extern" STRING_LIT STRING_LIT? "{" ExternFn* "}"
         _ = advance(P);

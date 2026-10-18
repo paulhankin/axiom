@@ -275,6 +275,7 @@ static void check_match(Stmt *s, bool *diverges) {
             free(missing.data);
         }
     } else if (t->kind == TY_INT || t->kind == TY_BOOL || t->kind == TY_ERROR) {
+        Vec(Sym) seen_names = {0};
         Vec(i128) seenv = {0};
         bool seen_true = false, seen_false = false;
         for (int i = 0; i < narms; i++) {
@@ -296,6 +297,9 @@ static void check_match(Stmt *s, bool *diverges) {
             } else if (a->kind == P_ERROR && t->kind == TY_ERROR) {
                 uint32_t code = error_code_of(a->name);
                 if (!code) diag_error(a->span, "E0650", "'error.%s' is not declared", a->name);
+                else if (!set_has(t->decl, a->name))
+                    diag_error(a->span, "E0652", "'error.%s' is not in error set %s", a->name, t->decl->name);
+                vec_push(seen_names, a->name);
                 a->error_code = code;
                 key = code;
                 keyed = true;
@@ -312,7 +316,30 @@ static void check_match(Stmt *s, bool *diverges) {
         }
         free(seenv.data);
         bool exhaustive = has_else || (t->kind == TY_BOOL && seen_true && seen_false);
-        if (!exhaustive) diag_error(s->span, "E0630", "non-exhaustive match: add an 'else' arm");
+        if (!exhaustive && t->kind == TY_ERROR && t->decl) {
+            // a named error set: every error it holds, or else
+            CharVec missing = {0};
+            int nm = 0;
+            for (int v = 0; v < t->decl->set_names.len; v++) {
+                Sym n = t->decl->set_names.data[v];
+                bool hit = false;
+                for (int k = 0; k < seen_names.len; k++)
+                    if (seen_names.data[k] == n) hit = true;
+                if (hit) continue;
+                if (nm++) {
+                    vec_push(missing, ',');
+                    vec_push(missing, ' ');
+                }
+                for (const char *c = "error."; *c; c++) vec_push(missing, *c);
+                while (*n) vec_push(missing, *n++);
+            }
+            vec_push(missing, 0);
+            if (nm) diag_error(s->span, "E0630", "non-exhaustive match: missing %s", missing.data);
+            free(missing.data);
+        } else if (!exhaustive) {
+            diag_error(s->span, "E0630", "non-exhaustive match: add an 'else' arm");
+        }
+        free(seen_names.data);
     } else {
         if (t->kind != TY_INVALID)
             diag_error(s->e->span, "E0634",

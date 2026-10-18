@@ -257,6 +257,75 @@ instead of wrapping.
 `defer S` runs `S` when the enclosing block ends, however it ends; `errdefer S` runs
 only when the function returns an error, to undo partial work (spec §8.8).
 
+A **named error set** says which errors a function can return. `error ParseError { … }`
+declares the names and a set holding them; `error ConfigError = ParseError | { Missing };`
+combines sets. `ParseError!u32` returns only those errors, `!` passes them on only into a
+set that holds them (or into a plain `!T`), and a `match` that lists every error of a set
+needs no `else`:
+
+```axiom
+import "std/fmt" as fmt;
+
+error ParseError { Empty, NotANumber, TooBig }
+error ConfigError = ParseError | { Missing };
+
+// ParseError!u32: a u32, or one of the errors of ParseError
+fn parse(s: []u8) ParseError!u32 {
+    if s.len == 0 {
+        return error.Empty;
+    }
+    let mut v: u32 = 0;
+    for c in s {
+        if (c < '0') or (c > '9') {
+            return error.NotANumber;
+        }
+        v = @mul_checked(v, 10) catch return error.TooBig;
+        v = @add_checked(v, @as(u32, c - '0')) catch return error.TooBig;
+    }
+    return v;
+}
+
+fn setting(key: []u8, value: []u8) ConfigError!u32 {
+    if key.len == 0 {
+        return error.Missing;
+    }
+    return parse(value)!;  // every ParseError is a ConfigError
+}
+
+// Every error of the set, so no else: a new error added to it later
+// is a compile error here until it is handled.
+fn advice(e: ConfigError) []u8 {
+    match e {
+        error.Empty      => { return "give a value"; }
+        error.NotANumber => { return "use digits"; }
+        error.TooBig     => { return "use a smaller number"; }
+        error.Missing    => { return "name the setting"; }
+    }
+}
+
+export fn main() i32 {
+    let pairs: [3][2][]u8 = [["width", "640"], ["height", "tall"], ["", "1"]];
+    for p in pairs {
+        let v = setting(p[0], p[1]) catch |e| {
+            fmt.print("{}: {}\n", [fmt.str(p[1]), fmt.str(advice(e))]) catch return 1;
+            continue;
+        };
+        fmt.print("{} = {}\n", [fmt.str(p[0]), fmt.int(v)]) catch return 1;
+    }
+    return 0;
+}
+```
+
+```
+width = 640
+tall: use digits
+1: name the setting
+```
+
+Sets change nothing at run time: `S!T` is laid out as `!T`. They do not convert as types,
+though: an `S!T` is not a `!T`, so a value moves between them through `!`, `catch` or
+`return`, which check the sets (spec §11.3).
+
 ## Memory
 
 ```axiom

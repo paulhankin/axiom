@@ -202,7 +202,11 @@ ExternDecl    ::= "extern" STRING_LIT STRING_LIT? "{" ExternFnDecl* "}"   (* §1
 ExternFnDecl  ::= "fn" IDENT "(" ExternParams? ")" Type ";"
 ExternParams  ::= Param ( "," Param )* ( "," "..." )?
 
-ErrorDecl     ::= "error" "{" IDENT ( "," IDENT )* ","? "}"
+ErrorDecl     ::= "error" "{" ErrorNames "}"                       (* names, §11.1 *)
+                | "error" IDENT "{" ErrorNames "}"                 (* a named error set, §11.3 *)
+                | "error" IDENT "=" ErrorTerm ( "|" ErrorTerm )* ";"
+ErrorNames    ::= IDENT ( "," IDENT )* ","?
+ErrorTerm     ::= "{" ErrorNames "}" | IDENT ( "." IDENT )?
 
 ConstDecl     ::= "const" IDENT ":" Type "=" Expr ";"
 GlobalDecl    ::= "threadlocal"? "let" "mut"? IDENT ":" Type "=" Expr ";"
@@ -243,6 +247,7 @@ does).
 
 ```ebnf
 Type          ::= "!" Type                          (* error union *)
+                | NamedType "!" Type                (* error union of a named error set, §11.3 *)
                 | "*" "mut"? Type                   (* raw pointer *)
                 | "[" "]" "mut"? Type               (* slice *)
                 | "[" ArrayLen "]" Type             (* array *)
@@ -685,12 +690,14 @@ pointer traps (`T0009`), which follows WASM `call_indirect` semantics.
 
 `!T` holds either a value of type `T` or a value of type `error` (§11). Its layout is exactly
 `struct { code: u16, value: T }`. `code == 0` means success. When `code ≠ 0`, the contents
-of `value` are unspecified.
+of `value` are unspecified. `S!T`, for a named error set `S` (§11.3), has the same layout
+and holds only the errors of `S`.
 
 ### 5.13 The `error` type
 
 `error` is a 16-bit code. Code 0 is reserved and never names an error. Every name declared
 in any `error { … }` block in the program is assigned a distinct non-zero code (§11.1).
+A named error set `S` (§11.3) is also a type: an `error` that holds only the errors of `S`.
 
 ### 5.14 Enums
 
@@ -1128,7 +1135,8 @@ allowed for `u8`), `bool`, or `error`.
   `else` stands alone.
 - Arms are tested in order. Each pattern may appear at most once (`E0631`).
 - The match must be **exhaustive** (`E0630`). A union or enum match must list every variant
-  (member) or end with `else`. Integer and `error` matches always need `else`.
+  (member) or end with `else`, and so must a match on a named error set (§11.3): every
+  error of the set. Integer and `error` matches always need `else`.
 - An arm body is a block. Axiom has no fall-through.
 
 ```axiom
@@ -1500,6 +1508,50 @@ fn sum_digits(s: []u8) !u32 {
 Errors are ordinary values. Axiom has no stack unwinding and no exception tables, and it
 does not capture stack traces implicitly. (Debug builds MAY record error return traces,
 §16.4.)
+
+### 11.3 Error sets
+
+A **named error set** says which errors a function can return, so that its callers can
+handle each one:
+
+```axiom
+pub error FileError { NotFound, PermissionDenied }
+error ConfigError = FileError | { SyntaxError };   // the union of sets and names
+
+fn open(path: []u8) FileError!File { … }
+
+fn load(path: []u8) ConfigError!Config {
+    let f = open(path)!;   // every FileError is a ConfigError
+    …
+}
+
+fn describe(e: ConfigError) []u8 {
+    match e {                                    // no else: every error of the set
+        error.NotFound         => { return "missing"; }
+        error.PermissionDenied => { return "not allowed"; }
+        error.SyntaxError      => { return "malformed"; }
+    }
+}
+```
+
+- `error S { A, B }` declares the error names `A` and `B` (as `error { A, B }` does) and a
+  set `S` holding them. `error S = T | U | { C };` declares a set holding the errors of the
+  sets `T` and `U` and the names in braces. A set is a name of its module, visible to
+  importers when `pub` (`mod.S`). A set that includes itself, directly or not, or a name
+  that is not an error set, is `E0654`.
+- `S` is a type: an `error` holding only the errors of `S`. `S!T` is an error union of `S`
+  (§5.12); it has the same representation as `!T`, so sets cost nothing at run time.
+- `error.X` where a value of `S` or `S!T` is expected must name an error of `S` (`E0652`).
+  So must each `error.X` arm of a `match` on an `S`, and each comparison with one.
+- An error of set `A` may be used where one of set `B` is expected when `B` holds every
+  error of `A`, and anywhere an `error` is expected. An `error` (any error) cannot become
+  an `S`: `match` on it to choose (`E0653`).
+- `x!` on an `A!T` in a function returning `B!U` needs `B` to hold every error of `A`; on a
+  `!T`, the function must return `!U` (`E0653`). `catch |e|` on an `S!T` binds `e` as an `S`.
+- Error union types do not convert: `S!T` and `!T` are different types, and so are
+  `fn() S!T` and `fn() !T` (`E0412`). Values cross between them through `!`, `catch` and
+  `return`, which check the sets as above.
+- Errors of different sets compare with `==` and `!=` by their codes.
 
 ---
 
@@ -2468,6 +2520,9 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0641 | `errdefer` in a function that cannot return an error |
 | E0650 | Undeclared error name |
 | E0651 | Too many error names (more than 65535) |
+| E0652 | `error.X` is not in the error set expected (§11.3) |
+| E0653 | An error that may not be in the error set expected, or `!` that could pass one on (§11.3) |
+| E0654 | An error set that includes itself, or a name used as an error set that is not one (§11.3) |
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |
 | E0703 | Mutable address of a temporary (`&mut`, or a `*mut Self` method on one) |

@@ -267,9 +267,6 @@ fn dup_error(sp: u.Span, name: []u8, prev: u.Span) void {
 fn register_module(m: *mut ast.Module) void {
     for i in 0..m.decls.len {
         let d = m.decls.get(i);
-        if d.kind == ast.D_ERROR {
-            continue;
-        }
         if u.isnos(d.name) {
             continue;
         }
@@ -605,13 +602,17 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
             _ = dg.err(te.span, "E0400", "expected a type, found an expression");
             return ty.t_invalid;
         }
-        .ErrUnion(elem) => {
-            let e = resolve_type(elem, tc);
+        .ErrUnion(eu) => {
+            let mut set = dnil();
+            if u.notnil(eu.set) {
+                set = resolve_set_te(eu.set, tc);
+            }
+            let e = resolve_type(eu.elem, tc);
             if e.kind == ast.TY_ERRUNION {
                 _ = dg.err(te.span, "E0401", "nested error unions (!!T) are not allowed");
                 return e;
             }
-            return ty.type_errunion(e);
+            return ty.type_errunion_set(e, set);
         }
         .Ptr(pt) => { return ty.type_ptr(resolve_type(pt.elem, tc), pt.is_mut); }
         .Slice(pt) => {
@@ -728,6 +729,13 @@ fn resolve_named_type(te: *mut ast.TypeExpr, nt: ast.NamedType, tc: *mut TypeCtx
     let d = resolve_named_decl(nt, te.span, tc, true);
     if u.isnil(d) {
         return ty.t_invalid;
+    }
+    if (d.kind == ast.D_ERROR) and not u.isnos(d.name) {
+        if nt.has_args {
+            _ = dg.err(te.span, "E0468", u.f1("'%s' is not generic", nt.name));
+        }
+        resolve_decl(d);
+        return ty.type_errset(d);
     }
     if (d.kind != ast.D_STRUCT) and (d.kind != ast.D_UNION) and (d.kind != ast.D_ENUM) {
         _ = dg.err(nt.name_span, "E0400", u.f1("'%s' is not a type", nt.name));
@@ -982,6 +990,108 @@ fn resolve_enum(d: *mut ast.Decl) void {
     d.ty = ty.type_enum(d, repr);
 }
 
+// ---------------------------------------------------------------------------
+// Error sets (spec §11.3)
+// ---------------------------------------------------------------------------
+// The names of a named error set: its own, and those of the sets it includes.
+fn resolve_error_set(d: *mut ast.Decl) void {
+    for i in 0..d.error_names.len {
+        add_set_name(d, d.error_names.get(i));
+    }
+    let mut tc = type_ctx(d.module, dnil(), dnil(), tnil());
+    for i in 0..d.error_refs.len {
+        let s = resolve_set_te(d.error_refs.get(i), &mut tc);
+        if u.notnil(s) {
+            resolve_decl(s);
+            for j in 0..s.set_names.len {
+                add_set_name(d, s.set_names.get(j));
+            }
+        }
+    }
+}
+
+fn add_set_name(d: *mut ast.Decl, n: []u8) void {
+    for i in 0..d.set_names.len {
+        if u.same(d.set_names.get(i), n) {
+            return;
+        }
+    }
+    d.set_names.push(n);
+}
+
+// The error set a type expression names, or nil (after an error).
+fn resolve_set_te(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Decl {
+    match te.shape {
+        .Named(nt) => {
+            let d = resolve_named_decl(nt, te.span, tc, true);
+            if u.isnil(d) {
+                return dnil();
+            }
+            if (d.kind != ast.D_ERROR) or nt.has_args {
+                _ = dg.err(nt.name_span, "E0654", u.f1("'%s' is not an error set", nt.name));
+                return dnil();
+            }
+            return d;
+        }
+        else => {}
+    }
+    _ = dg.err(te.span, "E0654", "expected the name of an error set");
+    return dnil();
+}
+
+// Whether the error set `set` (nil: any error) holds the error `name`.
+fn set_has(set: *mut ast.Decl, name: []u8) bool {
+    if u.isnil(set) {
+        return true;
+    }
+    resolve_decl(set);
+    for i in 0..set.set_names.len {
+        if u.same(set.set_names.get(i), name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The first error of set a that set b does not hold, or no string (both
+// named sets).
+fn set_missing(a: *mut ast.Decl, b: *mut ast.Decl) []u8 {
+    resolve_decl(a);
+    for i in 0..a.set_names.len {
+        if not set_has(b, a.set_names.get(i)) {
+            return a.set_names.get(i);
+        }
+    }
+    return u.nosym();
+}
+
+// An error of set a (nil: any) where one of set b (nil: any) is needed.
+fn error_fits(sp: u.Span, a: *mut ast.Decl, b: *mut ast.Decl) bool {
+    if u.isnil(b) or (a == b) {
+        return true;
+    }
+    if u.isnil(a) {
+        _ = dg.err(sp, "E0653",
+                   u.f1("a value of type error can hold any error, but %s holds only its own; match on it to choose",
+                        b.name));
+        return false;
+    }
+    let m = set_missing(a, b);
+    if not u.isnos(m) {
+        _ = dg.err(sp, "E0653", u.f3("%s can hold error.%s, which %s does not", a.name, m, b.name));
+        return false;
+    }
+    return true;
+}
+
+// The error set an expected type asks for (nil: none, or any error).
+fn expected_set(t: *mut ast.Type) *mut ast.Decl {
+    if u.notnil(t) and ((t.kind == ast.TY_ERROR) or (t.kind == ast.TY_ERRUNION)) {
+        return t.decl;
+    }
+    return dnil();
+}
+
 fn resolve_decl(d: *mut ast.Decl) void {
     if d.state == 2 {
         return;
@@ -989,6 +1099,8 @@ fn resolve_decl(d: *mut ast.Decl) void {
     if d.state == 1 {
         if d.kind == ast.D_CONST {
             _ = dg.err(d.name_span, "E0351", u.f1("constant '%s' depends on itself", d.name));
+        } else if d.kind == ast.D_ERROR {
+            _ = dg.err(d.name_span, "E0654", u.f1("error set '%s' includes itself", d.name));
         }
         return;
     }
@@ -1049,6 +1161,8 @@ fn resolve_decl(d: *mut ast.Decl) void {
            (d.init.ty.kind != ast.TY_INVALID) {
             _ = dg.err(d.init.span, "E0350", "constant initializer must be a constant expression");
         }
+    } else if (k == ast.D_ERROR) and not u.isnos(d.name) {
+        resolve_error_set(d);
     } else if k == ast.D_GLOBAL {
         let mut tc = type_ctx(d.module, dnil(), dnil(), tnil());
         d.ty = resolve_type(d.te, &mut tc);
@@ -1304,9 +1418,18 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
         pe.* = mkconv(e, ast.CONV_NOOP, target);
         return;
     }
+    // an error of one set where one of another (or any error) is needed
+    if (s.kind == ast.TY_ERROR) and (target.kind == ast.TY_ERROR) {
+        if error_fits(e.span, s.decl, target.decl) {
+            pe.* = mkconv(e, ast.CONV_NOOP, target);
+        }
+        return;
+    }
     if target.kind == ast.TY_ERRUNION {
-        if s == ty.t_error {
-            pe.* = mkconv(e, ast.CONV_WRAP_ERR, target);
+        if s.kind == ast.TY_ERROR {
+            if error_fits(e.span, s.decl, target.decl) {
+                pe.* = mkconv(e, ast.CONV_WRAP_ERR, target);
+            }
             return;
         }
         if (s.kind != ast.TY_ERRUNION) and (target.elem.kind != ast.TY_VOID) {
@@ -1849,7 +1972,7 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     } else {
         t = l;
         if (l != r) and (l.kind != ast.TY_INVALID) and (r.kind != ast.TY_INVALID) and (l.kind != ast.TY_NEVER) and
-           (r.kind != ast.TY_NEVER) {
+           (r.kind != ast.TY_NEVER) and not ((l.kind == ast.TY_ERROR) and (r.kind == ast.TY_ERROR)) {
             let d = dg.err(e.span, "E0412", u.f3("operands of '%s' have different types: %s and %s",
                                                  lx.tok_kind_name(op), tstr(l), tstr(r)));
             dg.set_types(d, tstr(l), tstr(r));
@@ -2994,14 +3117,16 @@ fn check_return_value(pe: *mut *mut ast.Expr, sp: u.Span) void {
 fn check_catch(e: *mut ast.Expr) *mut ast.Type {
     let t = check_expr(e.a, tnil());
     let mut vt = ty.t_invalid;
+    let mut et = ty.t_error;
     if t.kind == ast.TY_ERRUNION {
         vt = t.elem;
+        et = ty.type_errset(t.decl);
     } else if t.kind != ast.TY_INVALID {
         _ = dg.err(e.a.span, "E0611", u.f1("'catch' requires an error union (!T), found %s", tstr(t)));
     }
     scope_push();
     if not u.isnos(e.capture) {
-        e.capture_local = declare_local(e.capture, e.capture_span, ty.t_error, false, false);
+        e.capture_local = declare_local(e.capture, e.capture_span, et, false, false);
     }
     match e.handler {
         .Value(h) => {
@@ -3069,9 +3194,26 @@ fn check_try(e: *mut ast.Expr) *mut ast.Type {
         }
     } else {
         _ = check_leave_ok(e.span, false);
+        try_fits(e.span, t.decl, C.ret.decl);
     }
     e.ty = t.elem;
     return e.ty;
+}
+
+// '!' on an error union of set a (nil: any) in a function returning set b.
+fn try_fits(sp: u.Span, a: *mut ast.Decl, b: *mut ast.Decl) void {
+    if u.isnil(b) or (a == b) {
+        return;
+    }
+    if u.isnil(a) {
+        _ = dg.err(sp, "E0653", u.f1("this '!' can pass on any error, but this function returns only those of %s",
+                                     b.name));
+        return;
+    }
+    let m = set_missing(a, b);
+    if not u.isnos(m) {
+        _ = dg.err(sp, "E0653", u.f2("this '!' can pass on error.%s, which %s does not hold", m, b.name));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3189,7 +3331,11 @@ fn check_operand(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                                                       e.name));
             }
             e.cval = u.I128.ofu(@as(u64, code));
-            return set_ty(e, ty.t_error);
+            let set = expected_set(expected);
+            if (code != 0) and not set_has(set, e.name) {
+                _ = dg.err(e.name_span, "E0652", u.f2("'error.%s' is not in error set %s", e.name, set.name));
+            }
+            return set_ty(e, ty.type_errset(set));
         }
         .BUILTIN => { return builtin_check(e, expected); }
         .UNARY   => { return check_unary(e, expected); }
@@ -4702,6 +4848,7 @@ fn check_match(s: *mut ast.Stmt) bool {
             }
         }
     } else if (t.kind == ast.TY_INT) or (t.kind == ast.TY_BOOL) or (t.kind == ast.TY_ERROR) {
+        let mut seen_names = u.List.[[]u8].empty();
         let mut seenv = u.List.[u.I128].empty();
         let mut seen_true = false;
         let mut seen_false = false;
@@ -4748,7 +4895,10 @@ fn check_match(s: *mut ast.Stmt) bool {
                         let code = error_code_of(name);
                         if code == 0 {
                             _ = dg.err(a.span, "E0650", u.f1("'error.%s' is not declared", name));
+                        } else if not set_has(t.decl, name) {
+                            _ = dg.err(a.span, "E0652", u.f2("'error.%s' is not in error set %s", name, t.decl.name));
                         }
+                        seen_names.push(name);
                         a.error_code = code;
                         key = u.I128.ofu(@as(u64, code));
                         keyed = true;
@@ -4775,9 +4925,36 @@ fn check_match(s: *mut ast.Stmt) bool {
         }
         seenv.deinit();
         let exhaustive = has_else or ((t.kind == ast.TY_BOOL) and seen_true and seen_false);
-        if not exhaustive {
+        if not exhaustive and (t.kind == ast.TY_ERROR) and u.notnil(t.decl) {
+            // a named error set: every error it holds, or else
+            let mut missing = u.Buf.init();
+            let mut nm: i32 = 0;
+            for v in 0..t.decl.set_names.len {
+                let n = t.decl.set_names.get(v);
+                let mut hit = false;
+                for k in 0..seen_names.len {
+                    if u.same(seen_names.get(k), n) {
+                        hit = true;
+                    }
+                }
+                if hit {
+                    continue;
+                }
+                if nm != 0 {
+                    missing.s(", ");
+                }
+                nm += 1;
+                missing.s("error.");
+                missing.s(n);
+            }
+            let ms = missing.done();
+            if nm != 0 {
+                _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
+            }
+        } else if not exhaustive {
             _ = dg.err(s.span, "E0630", "non-exhaustive match: add an 'else' arm");
         }
+        seen_names.deinit();
     } else {
         if t.kind != ast.TY_INVALID {
             _ = dg.err(s.e.span, "E0634",
@@ -5604,7 +5781,7 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
         let m = g_prog.modules.get(mi);
         for i in 0..m.decls.len {
             let d = m.decls.get(i);
-            if (d.kind == ast.D_IMPORT) or (d.kind == ast.D_ERROR) {
+            if (d.kind == ast.D_IMPORT) or ((d.kind == ast.D_ERROR) and u.isnos(d.name)) {
                 continue;
             }
             resolve_decl(d);

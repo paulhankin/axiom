@@ -129,7 +129,6 @@ static void dup_error(Span sp, Sym name, Span prev) {
 static void register_module(Module *m) {
     for (int i = 0; i < m->decls.len; i++) {
         Decl *d = m->decls.data[i];
-        if (d->kind == D_ERROR) continue;
         if (!d->name) continue;
         if (d->is_test) {  // tests are not names; their descriptions must be unique per module
             for (int j = 0; j < i; j++) {
@@ -406,12 +405,13 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
     case TE_INTLIT: diag_error(te->span, "E0400", "expected a type, found an integer"); return t_invalid;
     case TE_CONSTEXPR: diag_error(te->span, "E0400", "expected a type, found an expression"); return t_invalid;
     case TE_ERRUNION: {
+        Decl *set = te->set ? resolve_set_te(te->set, tc) : NULL;
         Type *e = resolve_type(te->elem, tc);
         if (e->kind == TY_ERRUNION) {
             diag_error(te->span, "E0401", "nested error unions (!!T) are not allowed");
             return e;
         }
-        return type_errunion(e);
+        return type_errunion_set(e, set);
     }
     case TE_PTR: return type_ptr(resolve_type(te->elem, tc), te->mut);
     case TE_SLICE: {
@@ -469,6 +469,11 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         }
         Decl *d = resolve_named_decl(te, tc, true);
         if (!d) return t_invalid;
+        if (d->kind == D_ERROR && d->name) {
+            if (te->has_args) diag_error(te->span, "E0468", "'%s' is not generic", te->name);
+            resolve_decl(d);
+            return type_errset(d);
+        }
         if (d->kind != D_STRUCT && d->kind != D_UNION && d->kind != D_ENUM) {
             diag_error(te->name_span, "E0400", "'%s' is not a type", te->name);
             return t_invalid;
@@ -633,11 +638,101 @@ static void resolve_enum(Decl *d) {
     d->type = type_enum(d, repr);
 }
 
+// ---------------------------------------------------------------------------
+// Error sets (spec §11.3)
+// ---------------------------------------------------------------------------
+static void add_set_name(Decl *d, Sym n) {
+    for (int i = 0; i < d->set_names.len; i++)
+        if (d->set_names.data[i] == n) return;
+    vec_push(d->set_names, n);
+}
+
+// The error set a type expression names, or NULL (after an error).
+Decl *resolve_set_te(TypeExpr *te, TypeCtx *tc) {
+    if (te->kind != TE_NAMED) {
+        diag_error(te->span, "E0654", "expected the name of an error set");
+        return NULL;
+    }
+    Decl *d = resolve_named_decl(te, tc, true);
+    if (!d) return NULL;
+    if (d->kind != D_ERROR || te->has_args) {
+        diag_error(te->name_span, "E0654", "'%s' is not an error set", te->name);
+        return NULL;
+    }
+    return d;
+}
+
+// The names of a named error set: its own, and those of the sets it includes.
+static void resolve_error_set(Decl *d) {
+    for (int i = 0; i < d->error_names.len; i++) add_set_name(d, d->error_names.data[i]);
+    TypeCtx tc = {d->module, NULL, NULL, NULL};
+    for (int i = 0; i < d->error_refs.len; i++) {
+        Decl *s = resolve_set_te(d->error_refs.data[i], &tc);
+        if (!s) continue;
+        resolve_decl(s);
+        for (int j = 0; j < s->set_names.len; j++) add_set_name(d, s->set_names.data[j]);
+    }
+}
+
+// Whether the error set `set` (NULL: any error) holds the error `name`.
+bool set_has(Decl *set, Sym name) {
+    if (!set) return true;
+    resolve_decl(set);
+    for (int i = 0; i < set->set_names.len; i++)
+        if (set->set_names.data[i] == name) return true;
+    return false;
+}
+
+// The first error of set a that set b does not hold, or NULL (both named sets).
+static Sym set_missing(Decl *a, Decl *b) {
+    resolve_decl(a);
+    for (int i = 0; i < a->set_names.len; i++)
+        if (!set_has(b, a->set_names.data[i])) return a->set_names.data[i];
+    return NULL;
+}
+
+// An error of set a (NULL: any) where one of set b (NULL: any) is needed.
+bool error_fits(Span sp, Decl *a, Decl *b) {
+    if (!b || a == b) return true;
+    if (!a) {
+        diag_error(sp, "E0653",
+                   "a value of type error can hold any error, but %s holds only its own; match on it to choose",
+                   b->name);
+        return false;
+    }
+    Sym m = set_missing(a, b);
+    if (m) {
+        diag_error(sp, "E0653", "%s can hold error.%s, which %s does not", a->name, m, b->name);
+        return false;
+    }
+    return true;
+}
+
+// '!' on an error union of set a (NULL: any) in a function returning set b.
+void try_fits(Span sp, Decl *a, Decl *b) {
+    if (!b || a == b) return;
+    if (!a) {
+        diag_error(sp, "E0653", "this '!' can pass on any error, but this function returns only those of %s",
+                   b->name);
+        return;
+    }
+    Sym m = set_missing(a, b);
+    if (m) diag_error(sp, "E0653", "this '!' can pass on error.%s, which %s does not hold", m, b->name);
+}
+
+// The error set an expected type asks for (NULL: none, or any error).
+Decl *expected_set(Type *t) {
+    if (t && (t->kind == TY_ERROR || t->kind == TY_ERRUNION)) return t->decl;
+    return NULL;
+}
+
 void resolve_decl(Decl *d) {
     if (d->state == 2) return;
     if (d->state == 1) {
         if (d->kind == D_CONST)
             diag_error(d->name_span, "E0351", "constant '%s' depends on itself", d->name);
+        else if (d->kind == D_ERROR)
+            diag_error(d->name_span, "E0654", "error set '%s' includes itself", d->name);
         return;
     }
     d->state = 1;
@@ -691,6 +786,9 @@ void resolve_decl(Decl *d) {
             diag_error(d->init->span, "E0350", "constant initializer must be a constant expression");
         break;
     }
+    case D_ERROR:
+        if (d->name) resolve_error_set(d);
+        break;
     case D_GLOBAL: {
         TypeCtx tc = {d->module, NULL, NULL, NULL};
         d->type = resolve_type(d->te, &tc);
@@ -825,7 +923,7 @@ bool sema_run(const char *path, SemaOptions *opts) {
         Module *m = g_prog.modules.data[mi];
         for (int i = 0; i < m->decls.len; i++) {
             Decl *d = m->decls.data[i];
-            if (d->kind == D_IMPORT || d->kind == D_ERROR) continue;
+            if (d->kind == D_IMPORT || (d->kind == D_ERROR && !d->name)) continue;
             resolve_decl(d);
             for (int j = 0; j < d->methods.len; j++) resolve_decl(d->methods.data[j]);
         }

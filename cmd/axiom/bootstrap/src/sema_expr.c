@@ -147,9 +147,14 @@ void coerce(Expr **pe, Type *target) {
         *pe = mkconv(e, CONV_NOOP, target);
         return;
     }
+    // an error of one set where one of another (or any error) is needed
+    if (s->kind == TY_ERROR && target->kind == TY_ERROR) {
+        if (error_fits(e->span, s->decl, target->decl)) *pe = mkconv(e, CONV_NOOP, target);
+        return;
+    }
     if (target->kind == TY_ERRUNION) {
-        if (s == t_error) {
-            *pe = mkconv(e, CONV_WRAP_ERR, target);
+        if (s->kind == TY_ERROR) {
+            if (error_fits(e->span, s->decl, target->decl)) *pe = mkconv(e, CONV_WRAP_ERR, target);
             return;
         }
         if (s->kind != TY_ERRUNION && target->elem->kind != TY_VOID) {
@@ -546,7 +551,8 @@ static Type *check_binary(Expr *e, Type *expected) {
         t = l;
     } else {
         t = l;
-        if (l != r && l->kind != TY_INVALID && r->kind != TY_INVALID && l->kind != TY_NEVER && r->kind != TY_NEVER) {
+        if (l != r && l->kind != TY_INVALID && r->kind != TY_INVALID && l->kind != TY_NEVER && r->kind != TY_NEVER &&
+            !(l->kind == TY_ERROR && r->kind == TY_ERROR)) {
             Diag *d = diag_error(e->span, "E0412", "operands of '%s' have different types: %s and %s",
                                  tok_kind_name((TokKind)op), type_str(l), type_str(r));
             diag_types(d, type_str(l), type_str(r));
@@ -1450,10 +1456,13 @@ void check_return_value_ext(Expr **pe, Span sp) { check_return_value(pe, sp); }
 static Type *check_catch(Expr *e) {
     Type *t = check_expr(e->a, NULL);
     Type *vt = t_invalid;
-    if (t->kind == TY_ERRUNION) vt = t->elem;
-    else if (t->kind != TY_INVALID) diag_error(e->a->span, "E0611", "'catch' requires an error union (!T), found %s", type_str(t));
+    Type *et = t_error;
+    if (t->kind == TY_ERRUNION) {
+        vt = t->elem;
+        et = type_errset(t->decl);
+    } else if (t->kind != TY_INVALID) diag_error(e->a->span, "E0611", "'catch' requires an error union (!T), found %s", type_str(t));
     scope_push();
-    if (e->capture) e->capture_local = declare_local(e->capture, e->capture_span, t_error, false, false);
+    if (e->capture) e->capture_local = declare_local(e->capture, e->capture_span, et, false, false);
     switch (e->hkind) {
     case H_VALUE:
         if (vt->kind == TY_VOID) {
@@ -1503,6 +1512,7 @@ static Type *check_try(Expr *e) {
         }
     } else {
         check_leave_ok(e->span, false);
+        try_fits(e->span, t->decl, C->ret->decl);
     }
     return e->type = t->elem;
 }
@@ -1601,7 +1611,10 @@ static Type *check_operand(Expr *e, Type *expected) {
             (void)d;
         }
         e->cval = code;
-        return e->type = t_error;
+        Decl *set = expected_set(expected);
+        if (code && !set_has(set, e->name))
+            diag_error(e->name_span, "E0652", "'error.%s' is not in error set %s", e->name, set->name);
+        return e->type = type_errset(set);
     }
     case E_BUILTIN: return builtin_check(e, expected);
     case E_UNARY: return check_unary(e, expected);
