@@ -173,6 +173,43 @@ static void check_assign(Stmt *s) {
     check_expr(&probe, NULL);
 }
 
+
+static void enter_loop(Stmt *s) {
+    C->loop_depth++;
+    vec_push(C->loop_breaks, false);
+    vec_push(C->loop_labels, s->label);
+}
+
+// Whether a break targeted the loop.
+static bool leave_loop(void) {
+    C->loop_labels.len--;
+    C->loop_depth--;
+    return vec_pop(C->loop_breaks);
+}
+
+int check_jump_target(Sym label, Span sp, bool is_break) {
+    if (C->loop_depth == 0) {
+        diag_error(sp, "E0604", "'%s' outside of a loop", is_break ? "break" : "continue");
+        return -1;
+    }
+    int d = 0;
+    if (label) {
+        int n = C->loop_labels.len, i = n;
+        while (i > 0 && !(C->loop_labels.data[i - 1] && !strcmp(C->loop_labels.data[i - 1], label))) i--;
+        if (i == 0) {
+            diag_error(sp, "E0605", "no enclosing loop is labeled '%s'", label);
+            return -1;
+        }
+        d = n - i;
+    }
+    if (C->defer_depth > 0 && C->loop_depth - d <= C->defer_loop_base) {
+        diag_error(sp, "E0640", "control flow cannot leave a deferred statement");
+        return -1;
+    }
+    if (is_break) C->loop_breaks.data[C->loop_breaks.len - 1 - d] = true;
+    return d;
+}
+
 static void check_match(Stmt *s, bool *diverges) {
     Type *t = check_expr(s->e, NULL);
     if (ty_is_untyped(t)) t = finalize_untyped(&s->e);
@@ -385,19 +422,14 @@ bool check_stmt(Stmt *s) {
     }
     case S_WHILE:
         check_expr_to(&s->e, t_bool);
-        C->loop_depth++;
-        vec_push(C->loop_breaks, false);
+        enter_loop(s);
         check_block(s->body);
-        C->loop_breaks.len--;
-        C->loop_depth--;
+        leave_loop();
         break;
     case S_LOOP: {
-        C->loop_depth++;
-        vec_push(C->loop_breaks, false);
+        enter_loop(s);
         check_block(s->body);
-        bool broke = vec_pop(C->loop_breaks);
-        C->loop_depth--;
-        div = !broke;
+        div = !leave_loop();
         break;
     }
     case S_FOR: {
@@ -442,11 +474,9 @@ bool check_stmt(Stmt *s) {
         }
         scope_push();
         s->local = declare_local(s->name, s->name_span, vt, false, false);
-        C->loop_depth++;
-        vec_push(C->loop_breaks, false);
+        enter_loop(s);
         check_block(s->body);
-        C->loop_breaks.len--;
-        C->loop_depth--;
+        leave_loop();
         scope_pop();
         break;
     }
@@ -456,15 +486,12 @@ bool check_stmt(Stmt *s) {
         div = true;
         break;
     case S_BREAK:
-    case S_CONTINUE:
-        if (C->loop_depth == 0) {
-            diag_error(s->span, "E0604", "'%s' outside of a loop", s->kind == S_BREAK ? "break" : "continue");
-        } else if (C->defer_depth > 0 && C->loop_depth <= C->defer_loop_base) {
-            diag_error(s->span, "E0640", "control flow cannot leave a deferred statement");
-        }
-        if (s->kind == S_BREAK && C->loop_breaks.len) vec_last(C->loop_breaks) = true;
+    case S_CONTINUE: {
+        int d = check_jump_target(s->label, s->label ? s->label_span : s->span, s->kind == S_BREAK);
+        s->jump_depth = d < 0 ? 0 : d;
         div = true;
         break;
+    }
     case S_DEFER: {
         int saved_base = C->defer_loop_base;
         C->defer_depth++;
@@ -513,6 +540,7 @@ void check_fn_body(Decl *fn) {
     free(ctx.scope.data);
     free(ctx.marks.data);
     free(ctx.loop_breaks.data);
+    free(ctx.loop_labels.data);
     C = saved;
     gate_fn(fn);
 }

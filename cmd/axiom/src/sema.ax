@@ -55,6 +55,7 @@ struct FnCtx {
     defer_depth: i32,
     defer_loop_base: i32,        // loop_depth when the innermost defer began
     loop_breaks: u.List.[bool],  // per enclosing loop: has a break targeting it
+    loop_labels: u.List.[[]u8],  // per enclosing loop: its label, or an empty string
     const_ctx: bool,
 }
 
@@ -88,6 +89,7 @@ fn fn_ctx(tc: TypeCtx) FnCtx {
         defer_depth: 0,
         defer_loop_base: 0,
         loop_breaks: u.List.[bool].empty(),
+        loop_labels: u.List.[[]u8].empty(),
         const_ctx: false,
     };
 }
@@ -3041,16 +3043,13 @@ fn check_catch(e: *mut ast.Expr) *mut ast.Type {
     return e.ty;
 }
 
-// catch break / catch continue
+// catch break / catch continue (the label, if any, is in e.name)
 fn check_catch_jump(e: *mut ast.Expr, is_break: bool) void {
-    if C.loop_depth == 0 {
-        _ = dg.err(e.span, "E0604", u.f1("'%s' outside of a loop", u.pick(is_break, "break", "continue")));
-    } else {
-        _ = check_leave_ok(e.span, true);
+    let mut sp = e.span;
+    if e.name.len > 0 {
+        sp = e.name_span;
     }
-    if is_break and (C.loop_breaks.len > 0) {
-        C.loop_breaks.set(C.loop_breaks.len - 1, true);
-    }
+    e.index = @max(check_jump_target(e.name, sp, is_break), 0);
 }
 
 fn check_try(e: *mut ast.Expr) *mut ast.Type {
@@ -4830,19 +4829,14 @@ fn check_stmt(s: *mut ast.Stmt) bool {
         }
         .WHILE => {
             _ = check_expr_to(&mut s.e, ty.t_bool);
-            C.loop_depth += 1;
-            C.loop_breaks.push(false);
+            enter_loop(s);
             _ = check_block(s.body);
-            C.loop_breaks.len -= 1;
-            C.loop_depth -= 1;
+            _ = leave_loop();
         }
         .LOOP => {
-            C.loop_depth += 1;
-            C.loop_breaks.push(false);
+            enter_loop(s);
             _ = check_block(s.body);
-            let broke = C.loop_breaks.pop();
-            C.loop_depth -= 1;
-            div = not broke;
+            div = not leave_loop();
         }
         .FOR   => { check_for(s); }
         .MATCH => { div = check_match(s); }
@@ -4996,24 +4990,63 @@ fn check_for(s: *mut ast.Stmt) void {
     }
     scope_push();
     s.local = declare_local(s.name, s.name_span, vt, false, false);
+    enter_loop(s);
+    _ = check_block(s.body);
+    _ = leave_loop();
+    scope_pop();
+}
+
+fn enter_loop(s: *mut ast.Stmt) void {
     C.loop_depth += 1;
     C.loop_breaks.push(false);
-    _ = check_block(s.body);
-    C.loop_breaks.len -= 1;
+    C.loop_labels.push(s.label);
+}
+
+// Whether a break targeted the loop.
+fn leave_loop() bool {
+    C.loop_labels.len -= 1;
     C.loop_depth -= 1;
-    scope_pop();
+    return C.loop_breaks.pop();
+}
+
+// A break or continue (statement or catch handler) at `sp`, naming the
+// loop `label` (or none): the number of loops it leaves beyond the
+// innermost, or -1 after an error.
+fn check_jump_target(label: []u8, sp: u.Span, is_break: bool) i32 {
+    if C.loop_depth == 0 {
+        _ = dg.err(sp, "E0604", u.f1("'%s' outside of a loop", u.pick(is_break, "break", "continue")));
+        return -1;
+    }
+    let mut d: i32 = 0;
+    if label.len > 0 {
+        let n = C.loop_labels.len;
+        let mut i = n;
+        while (i > 0) and not u.str_eq(C.loop_labels.get(i - 1), label) {
+            i -= 1;
+        }
+        if i == 0 {
+            _ = dg.err(sp, "E0605", u.f1("no enclosing loop is labeled '%s'", label));
+            return -1;
+        }
+        d = @int_cast(i32, n - i);
+    }
+    if (C.defer_depth > 0) and ((C.loop_depth - d) <= C.defer_loop_base) {
+        _ = dg.err(sp, "E0640", "control flow cannot leave a deferred statement");
+        return -1;
+    }
+    if is_break {
+        C.loop_breaks.set(C.loop_breaks.len - 1 - @int_cast(usize, d), true);
+    }
+    return d;
 }
 
 // break / continue
 fn check_jump(s: *mut ast.Stmt) void {
-    if C.loop_depth == 0 {
-        _ = dg.err(s.span, "E0604", u.f1("'%s' outside of a loop", u.pick(s.kind == ast.S_BREAK, "break", "continue")));
-    } else if (C.defer_depth > 0) and (C.loop_depth <= C.defer_loop_base) {
-        _ = dg.err(s.span, "E0640", "control flow cannot leave a deferred statement");
+    let mut sp = s.span;
+    if s.label.len > 0 {
+        sp = s.label_span;
     }
-    if (s.kind == ast.S_BREAK) and (C.loop_breaks.len > 0) {
-        C.loop_breaks.set(C.loop_breaks.len - 1, true);
-    }
+    s.jump_depth = @max(check_jump_target(s.label, sp, s.kind == ast.S_BREAK), 0);
 }
 
 fn check_defer(s: *mut ast.Stmt) void {

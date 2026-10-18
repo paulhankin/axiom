@@ -30,6 +30,7 @@ typedef struct FnCtx {
     int defer_depth;
     int defer_loop_base;  // loop_depth when the innermost defer began
     Vec(bool) loop_breaks;  // per enclosing loop: has a break targeting it
+    Vec(Sym) loop_labels;   // per enclosing loop: its label, or NULL
     bool const_ctx;
 } FnCtx;
 
@@ -38,6 +39,10 @@ extern FnCtx *C;
 // sema_decl.c
 Type *resolve_type(TypeExpr *te, TypeCtx *tc);
 void resolve_decl(Decl *d);
+
+// sema_stmt.c: a break or continue at `sp` naming the loop `label` (or
+// NULL): the loops it leaves beyond the innermost, or -1 after an error.
+int check_jump_target(Sym label, Span sp, bool is_break);
 Decl *module_lookup(Module *m, Sym name);
 Type *lookup_gparam(TypeCtx *tc, Sym name);
 Decl *find_method(Decl *owner, Sym name);

@@ -1467,11 +1467,12 @@ static Type *check_catch(Expr *e) {
         break;
     case H_RETURN: check_return_value(e->hexpr ? &e->hexpr : NULL, e->span); break;
     case H_BREAK:
-    case H_CONTINUE:
-        if (C->loop_depth == 0) diag_error(e->span, "E0604", "'%s' outside of a loop", e->hkind == H_BREAK ? "break" : "continue");
-        else check_leave_ok(e->span, true);
-        if (e->hkind == H_BREAK && C->loop_breaks.len) vec_last(C->loop_breaks) = true;
+    case H_CONTINUE: {
+        // the label, if any, is in e->name; the loops left in e->index
+        int d = check_jump_target(e->name, e->name ? e->name_span : e->span, e->hkind == H_BREAK);
+        e->index = d < 0 ? 0 : d;
         break;
+    }
     case H_BLOCK:
         // For !void the block may complete normally: execution continues after
         // the expression. For !T there is no value to produce, so it must diverge.

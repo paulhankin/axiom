@@ -285,9 +285,10 @@ AssignOp      ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "+%=" | "-%=" | "*%="
                 | "&=" | "|=" | "^=" | "<<=" | ">>="
 
 IfStmt        ::= "if" ( Expr | "let" Patterns "=" Expr ) Block ( "else" ( IfStmt | Block ) )?
-WhileStmt     ::= "while" Expr Block
-LoopStmt      ::= "loop" Block
-ForStmt       ::= "for" IDENT "in" Expr ( ".." Expr )? Block
+WhileStmt     ::= Label? "while" Expr Block
+LoopStmt      ::= Label? "loop" Block
+ForStmt       ::= Label? "for" IDENT "in" Expr ( ".." Expr )? Block
+Label         ::= IDENT ":"
 MatchStmt     ::= "match" Expr "{" MatchArm* "}"
 MatchArm      ::= ( Patterns | "else" ) "=>" Block
 Patterns      ::= Pattern ( "," Pattern )*
@@ -296,8 +297,8 @@ Pattern       ::= "." IDENT ( "(" IDENT ")" )?      (* union variant *)
                 | "-"? INT_LIT | CHAR_LIT | "true" | "false"
 
 ReturnStmt    ::= "return" Expr? ";"
-BreakStmt     ::= "break" ";"
-ContinueStmt  ::= "continue" ";"
+BreakStmt     ::= "break" IDENT? ";"
+ContinueStmt  ::= "continue" IDENT? ";"
 DeferStmt     ::= "defer" ( Block | ExprStmt )
 ```
 
@@ -310,7 +311,7 @@ is the standard LL(1) factoring.
 ```ebnf
 Expr          ::= BinExpr ( "catch" Handler )?
 Handler       ::= ( "|" IDENT "|" )?
-                  ( "return" Expr? | "break" | "continue" | Block | BinExpr )
+                  ( "return" Expr? | "break" IDENT? | "continue" IDENT? | Block | BinExpr )
 
 BinExpr       ::= UnaryExpr ( BinOp UnaryExpr )*
 BinOp         ::= "*" | "/" | "%" | "*%"
@@ -1106,7 +1107,12 @@ reaches a `break` or `return`.
 2. `for x in s { … }` evaluates `s` (an array place or a slice) once. The body runs with
    `x` bound to a copy of each element in order. No bounds check is emitted.
 
-`break` and `continue` apply to the innermost loop. v0.1 has no loop labels.
+`break` and `continue` apply to the innermost loop, unless they name a label. A loop
+may be labeled, `rows: for r in 0..n { … }`, and `break rows;` or `continue rows;`
+(also after `catch`) leaves or restarts that loop from any loop nested in it,
+running the pending `defer`s of every loop body left on the way (§8.8). A label is
+visible only inside its loop; an inner loop may reuse an enclosing label, and then the
+name means the inner loop. Naming no enclosing loop is `E0605`.
 
 ### 8.6 `match`
 
@@ -2383,6 +2389,8 @@ Initial registry, not exhaustive:
 | E0530 | Overflow in constant evaluation |
 | E0540 | Index is not `usize` |
 | E0601 | Missing return |
+| E0604 | `break` or `continue` outside of a loop |
+| E0605 | `break` or `continue` names a label of no enclosing loop |
 | E0610 | `!` used in a function that does not return `!T` |
 | E0612 | `catch` block completes normally |
 | E0620 | Non-`void` result discarded |

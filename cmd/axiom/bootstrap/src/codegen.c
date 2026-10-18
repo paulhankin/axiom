@@ -1712,9 +1712,11 @@ static void gen_return(Expr *e) {
     dead_block();
 }
 
-static void gen_break(bool is_break) {
+// break / continue, leaving `depth` loops beyond the innermost.
+static void gen_break(bool is_break, int depth) {
     if (!F->loops.len) return;
-    LoopCtx *lc = &vec_last(F->loops);
+    int i = F->loops.len - 1 - depth;
+    LoopCtx *lc = &F->loops.data[i < 0 ? 0 : i];
     emit_defers(lc->defer_height);
     LLVMBuildBr(B, is_break ? lc->brk : lc->cont);
     dead_block();
@@ -2379,8 +2381,8 @@ static LLVMValueRef gen_catch(Expr *e) {
         }
         break;
     case H_RETURN: gen_return(e->hexpr); break;
-    case H_BREAK: gen_break(true); break;
-    case H_CONTINUE: gen_break(false); break;
+    case H_BREAK: gen_break(true, e->index); break;
+    case H_CONTINUE: gen_break(false, e->index); break;
     case H_BLOCK:
         gen_block(e->hblock);
         if (!terminated()) LLVMBuildBr(B, merge);  // only possible for !void
@@ -4531,8 +4533,8 @@ static void gen_stmt_inner(Stmt *s) {
     case S_FOR: gen_for(s); return;
     case S_MATCH: gen_match(s); return;
     case S_RETURN: gen_return(s->e); return;
-    case S_BREAK: gen_break(true); return;
-    case S_CONTINUE: gen_break(false); return;
+    case S_BREAK: gen_break(true, s->jump_depth); return;
+    case S_CONTINUE: gen_break(false, s->jump_depth); return;
     case S_DEFER: vec_push(F->defers, s->body); return;
     case S_BLOCK: gen_block(s); return;
     }

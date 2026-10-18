@@ -643,8 +643,15 @@ static Expr *parse_expr(Parser *P) {
         c->hkind = H_RETURN;
         if (pk(P) != TK_SEMI && pk(P) != TK_RPAREN && pk(P) != TK_COMMA && pk(P) != TK_RBRACE) c->hexpr = parse_expr(P);
         break;
-    case KW_BREAK: advance(P); c->hkind = H_BREAK; break;
-    case KW_CONTINUE: advance(P); c->hkind = H_CONTINUE; break;
+    case KW_BREAK:
+    case KW_CONTINUE:
+        c->hkind = advance(P)->kind == KW_BREAK ? H_BREAK : H_CONTINUE;
+        if (pk(P) == TK_IDENT) {
+            Token *id = advance(P);  // the label of the loop to leave (name, as for an identifier)
+            c->name = id->name;
+            c->name_span = id->span;
+        }
+        break;
     case TK_LBRACE: c->hkind = H_BLOCK; c->hblock = parse_block(P); break;
     default: c->hkind = H_VALUE; c->hexpr = parse_binexpr(P); break;
     }
@@ -823,6 +830,19 @@ static Stmt *parse_if(Parser *P) {
 static Stmt *parse_stmt(Parser *P) {
     Token *t = peek(P);
     Span start = t->span;
+    if (t->kind == TK_IDENT && peek2(P)->kind == TK_COLON) {
+        // a loop label: `name: while|loop|for`
+        int k3 = peek3(P)->kind;
+        if (k3 == KW_WHILE || k3 == KW_LOOP || k3 == KW_FOR) {
+            Token *id = advance(P);
+            advance(P);
+            Stmt *s = parse_stmt(P);
+            s->label = id->name;
+            s->label_span = id->span;
+            s->span = sp_from(P, start);
+            return s;
+        }
+    }
     switch (t->kind) {
     case KW_LET: {
         advance(P);
@@ -899,6 +919,11 @@ static Stmt *parse_stmt(Parser *P) {
     case KW_CONTINUE: {
         advance(P);
         Stmt *s = new_stmt(t->kind == KW_BREAK ? S_BREAK : S_CONTINUE, start);
+        if (pk(P) == TK_IDENT) {
+            Token *id = advance(P);  // the label of the loop to leave
+            s->label = id->name;
+            s->label_span = id->span;
+        }
         expect(P, TK_SEMI);
         s->span = sp_from(P, start);
         return s;

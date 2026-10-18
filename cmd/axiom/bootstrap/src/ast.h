@@ -225,9 +225,12 @@ struct Stmt {
     Stmt *body, *els;
     StmtVec stmts;
     Vec(MatchArm) arms;
+    Sym label;  // a loop's label; break / continue: the label named, if any
+    Span label_span;
     // sema
     Local *local;
-    bool diverges;  // block never completes normally
+    bool diverges;    // block never completes normally
+    int jump_depth;   // break / continue: loops left (0: the innermost)
     // codegen
     bool no_overflow;  // `x += e` that cannot overflow (codegen.c, mark_bounded_sums)
 };
