@@ -262,6 +262,19 @@ has not been audited: review it before relying on it.
 - **Errors, not sentinels.** Lookups that can fail return `!T` (for example
   `error.NotFound`, `error.Empty`). The idiom for "value or default" is
   `m.get(k) catch 0`.
+- **One name for one thing.** Error names are program-wide, so modules share them:
+  input a binary format or archive cannot parse is `Corrupt`, a text format's is
+  `SyntaxError`, a network protocol's is `DecodeError`; a more specific name
+  (`ChecksumMismatch`, `Unsupported`, `TooLarge`) only where a program would act
+  differently. Permission problems are `PermissionDenied`. The end of a sequence is
+  `Done` from an iterator's `next`, `Closed` from a connection or channel, and
+  `EndOfStream` from a reader. A generic `Failed` is a last resort: name the cause
+  where the program could react to it.
+- **Ownership is explicit.** A type that owns memory has `deinit`; new code does not
+  add `release` or `destroy` for the same thing. A function whose result the caller
+  frees says so in its doc comment ("free with mem.free"); an `_alloc` suffix marks the
+  allocating form only where a non-allocating one exists beside it. Options structs are
+  passed by value, named `opts`.
 - **Threads share memory; synchronize it.** `spawn` copies its argument, so pass a
   pointer to shared data and protect it with `std/sync`, or use `parallel_for`, which
   hands each thread a disjoint range. The allocator is thread-safe; `Vec` and `Map`
