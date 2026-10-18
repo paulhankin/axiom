@@ -1548,9 +1548,10 @@ fn describe(e: ConfigError) []u8 {
   an `S`: `match` on it to choose (`E0653`).
 - `x!` on an `A!T` in a function returning `B!U` needs `B` to hold every error of `A`; on a
   `!T`, the function must return `!U` (`E0653`). `catch |e|` on an `S!T` binds `e` as an `S`.
-- Error union types do not convert: `S!T` and `!T` are different types, and so are
-  `fn() S!T` and `fn() !T` (`E0412`). Values cross between them through `!`, `catch` and
-  `return`, which check the sets as above.
+- Error unions widen: an `A!T` converts to `!T`, and to `B!T` where `B` holds every error
+  of `A`; a function pointer `fn(P) A!T` converts so to `fn(P) !T` and `fn(P) B!T`. They do
+  not narrow: a `!T` cannot become an `S!T`, since it may hold any error (`E0653`); handle
+  the others with `catch`.
 - Errors of different sets compare by their codes, with `==`, `!=` and `@expect_eq`.
 
 ---
@@ -2521,7 +2522,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0650 | Undeclared error name |
 | E0651 | Too many error names (more than 65535) |
 | E0652 | `error.X` is not in the error set expected (§11.3) |
-| E0653 | An error that may not be in the error set expected, or `!` that could pass one on (§11.3) |
+| E0653 | An error, or an error union, that may not be in the error set expected, or `!` that could pass one on (§11.3) |
 | E0654 | An error set that includes itself, or a name used as an error set that is not one (§11.3) |
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |

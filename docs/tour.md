@@ -322,9 +322,9 @@ tall: use digits
 1: name the setting
 ```
 
-Sets change nothing at run time: `S!T` is laid out as `!T`. They do not convert as types,
-though: an `S!T` is not a `!T`, so a value moves between them through `!`, `catch` or
-`return`, which check the sets (spec §11.3).
+Sets change nothing at run time: `S!T` is laid out as `!T`, and it widens to `!T` (or to
+a larger set) wherever one is expected, as a function returning it does to a function
+pointer that returns `!T`. Nothing narrows: a `!T` can hold any error (spec §11.3).
 
 ## Memory
 

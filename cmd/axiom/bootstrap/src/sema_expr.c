@@ -152,6 +152,16 @@ void coerce(Expr **pe, Type *target) {
         if (error_fits(e->span, s->decl, target->decl)) *pe = mkconv(e, CONV_NOOP, target);
         return;
     }
+    // a narrower error union where a wider one is expected
+    if (s->kind == TY_ERRUNION && target->kind == TY_ERRUNION && s->elem == target->elem) {
+        if (union_fits(e->span, s, target)) *pe = mkconv(e, CONV_NOOP, target);
+        return;
+    }
+    // a function whose results widen so
+    if (s->kind == TY_FN && target->kind == TY_FN && fn_widens(s, target)) {
+        *pe = mkconv(e, CONV_NOOP, target);
+        return;
+    }
     if (target->kind == TY_ERRUNION) {
         if (s->kind == TY_ERROR) {
             if (error_fits(e->span, s->decl, target->decl)) *pe = mkconv(e, CONV_WRAP_ERR, target);

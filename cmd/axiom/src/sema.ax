@@ -1084,6 +1084,47 @@ fn error_fits(sp: u.Span, a: *mut ast.Decl, b: *mut ast.Decl) bool {
     return true;
 }
 
+// Whether set b (nil: any) holds every error of set a (nil: any), without
+// reporting.
+fn set_within(a: *mut ast.Decl, b: *mut ast.Decl) bool {
+    if u.isnil(b) or (a == b) {
+        return true;
+    }
+    if u.isnil(a) {
+        return false;
+    }
+    return u.isnos(set_missing(a, b));
+}
+
+// An error union s where the wider t is expected: the same value type, and
+// t's set holds every error of s's (spec §11.3).
+fn union_fits(sp: u.Span, s: *mut ast.Type, t: *mut ast.Type) bool {
+    if u.notnil(t.decl) and u.isnil(s.decl) {
+        _ = dg.err(sp, "E0653",
+                   u.f2("%s can hold any error, but %s holds only those of its set; handle the others with catch",
+                        tstr(s), tstr(t)));
+        return false;
+    }
+    return error_fits(sp, s.decl, t.decl);
+}
+
+// A function whose results widen to those of t (an error union of a set
+// within t's), with the same parameters.
+fn fn_widens(s: *mut ast.Type, t: *mut ast.Type) bool {
+    if s.params.len != t.params.len {
+        return false;
+    }
+    for i in 0..s.params.len {
+        if s.params[i] != t.params[i] {
+            return false;
+        }
+    }
+    let a = s.ret;
+    let b = t.ret;
+    return (a.kind == ast.TY_ERRUNION) and (b.kind == ast.TY_ERRUNION) and (a.elem == b.elem) and
+           set_within(a.decl, b.decl);
+}
+
 // The error set an expected type asks for (nil: none, or any error).
 fn expected_set(t: *mut ast.Type) *mut ast.Decl {
     if u.notnil(t) and ((t.kind == ast.TY_ERROR) or (t.kind == ast.TY_ERRUNION)) {
@@ -1423,6 +1464,18 @@ fn coerce(pe: *mut *mut ast.Expr, target: *mut ast.Type) void {
         if error_fits(e.span, s.decl, target.decl) {
             pe.* = mkconv(e, ast.CONV_NOOP, target);
         }
+        return;
+    }
+    // a narrower error union where a wider one is expected
+    if (s.kind == ast.TY_ERRUNION) and (target.kind == ast.TY_ERRUNION) and (s.elem == target.elem) {
+        if union_fits(e.span, s, target) {
+            pe.* = mkconv(e, ast.CONV_NOOP, target);
+        }
+        return;
+    }
+    // a function whose results widen so
+    if (s.kind == ast.TY_FN) and (target.kind == ast.TY_FN) and fn_widens(s, target) {
+        pe.* = mkconv(e, ast.CONV_NOOP, target);
         return;
     }
     if target.kind == ast.TY_ERRUNION {

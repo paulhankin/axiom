@@ -720,6 +720,34 @@ void try_fits(Span sp, Decl *a, Decl *b) {
     if (m) diag_error(sp, "E0653", "this '!' can pass on error.%s, which %s does not hold", m, b->name);
 }
 
+// Whether set b (NULL: any) holds every error of set a (NULL: any), without reporting.
+static bool set_within(Decl *a, Decl *b) {
+    if (!b || a == b) return true;
+    if (!a) return false;
+    return set_missing(a, b) == NULL;
+}
+
+// An error union s where the wider t is expected: the same value type, and t's set holds
+// every error of s's (spec §11.3).
+bool union_fits(Span sp, Type *s, Type *t) {
+    if (t->decl && !s->decl) {
+        diag_error(sp, "E0653", "%s can hold any error, but %s holds only those of its set; handle the others with catch",
+                   type_str(s), type_str(t));
+        return false;
+    }
+    return error_fits(sp, s->decl, t->decl);
+}
+
+// A function whose results widen to those of t (an error union of a set within t's), with
+// the same parameters.
+bool fn_widens(Type *s, Type *t) {
+    if (s->nparams != t->nparams) return false;
+    for (int i = 0; i < s->nparams; i++)
+        if (s->params[i] != t->params[i]) return false;
+    Type *a = s->ret, *b = t->ret;
+    return a->kind == TY_ERRUNION && b->kind == TY_ERRUNION && a->elem == b->elem && set_within(a->decl, b->decl);
+}
+
 // The error set an expected type asks for (NULL: none, or any error).
 Decl *expected_set(Type *t) {
     if (t && (t->kind == TY_ERROR || t->kind == TY_ERRUNION)) return t->decl;

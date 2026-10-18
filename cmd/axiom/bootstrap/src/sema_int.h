@@ -44,6 +44,8 @@ bool set_has(Decl *set, Sym name);
 bool error_fits(Span sp, Decl *a, Decl *b);
 void try_fits(Span sp, Decl *a, Decl *b);
 Decl *expected_set(Type *t);
+bool union_fits(Span sp, Type *s, Type *t);
+bool fn_widens(Type *s, Type *t);
 
 // sema_stmt.c: a break or continue at `sp` naming the loop `label` (or
 // NULL): the loops it leaves beyond the innermost, or -1 after an error.
