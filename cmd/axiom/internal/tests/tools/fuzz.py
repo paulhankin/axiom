@@ -9,7 +9,8 @@ they are around), then runs mutated seeds through each target. Bad input is
 expected to fail with an error; a trap, a signal or a hang is a bug, and
 the input that caused it is saved under build/fuzz/failures/<target>/.
 Targets: image audio deflate json regex markdown pdf font x509 text web
-structured compress archive svg collate opusenc binary math (all by default).
+structured compress archive svg collate opusenc binary math tls http2 hpack
+websocket dns (all by default).
 """
 import argparse
 import concurrent.futures
@@ -23,7 +24,8 @@ import sys
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..'))
 OUT = os.path.join(ROOT, 'build', 'fuzz')
 TARGETS = ['image', 'audio', 'deflate', 'json', 'regex', 'markdown', 'pdf', 'font', 'x509', 'text', 'web', 'structured',
-           'compress', 'archive', 'svg', 'collate', 'opusenc', 'binary', 'math']
+           'compress', 'archive', 'svg', 'collate', 'opusenc', 'binary', 'math', 'tls', 'http2', 'hpack', 'websocket',
+           'dns']
 TOKENS = {
     'json': [b'{', b'}', b'[', b']', b'"', b'\\u', b'\\ud800', b'1e999', b'-', b'[' * 600, b'null', b','],
     'regex': [b'(', b')', b'*', b'+', b'?', b'{', b'}', b'{1000}', b'{2,', b'[', b']', b'\\', b'|', b'(?P<', b'\x00'],
@@ -37,6 +39,17 @@ TOKENS = {
     'structured': [b'[', b']', b'{', b'}', b'<', b'>', b'&', b'"', b"'", b'\n', b'  ', b'- ', b': ', b'*', b'!!', b'<!--',
                 b'\xff', b'\x9f', b'\xbf', b'\x1b'],
     'collate': [b'\xcc\x81', b'\xe0\xbd\xb1', b'\xe0\xbe\x80', b'\xe4\xb8\x80', b'\xff', b'\xed\xa0\x80', b' ', b'-'],
+    'tls': [b'\x03\x03', b'\x03\x04', b'\x13\x01', b'\x13\x02', b'\x00\x2b', b'\x00\x33', b'\x00\x00', b'\x00\x10',
+            b'\x00\x0a', b'\x00\x0d', b'\xff\xff', b'\x00\x20', b'\x02\x00\x00', b'\x01\x00\x00'],
+    'http2': [b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n', b'\x00\x00\x00\x04\x00', b'\x00\x00\x00\x01\x05', b'\x00\x00\x00\x00\x01',
+              b'\x00\x00\x00\x09\x04', b'\x00\x00\x00\x07\x00', b'\x00\x00\x00\x08\x00', b'\x00\x00\x00\x03\x00',
+              b'\x7f\xff\xff\xff', b'\x00\x00\x00\x00', b'\x00\x00\x00\x02\x00', b'\xff\xff\xff'],
+    'hpack': [b'\x82', b'\x86', b'\x84', b'\x41', b'\x40', b'\x00', b'\x10', b'\x3f\xe1\x1f', b'\x80', b'\xff', b'\x0f',
+              b'\x8c', b'\xf1\xe3\xc2\xe5\xf2:k\xa0\xab\x90\xf4\xff', b'\x7f\xff\xff\xff\xff\x7f'],
+    'websocket': [b'\x81', b'\x82', b'\x88', b'\x89', b'\x8a', b'\x00', b'\x80', b'\xfe\x00\x7e', b'\xff\x00\x00\x00\x00\x00\x01\x00\x00',
+                  b'\x7f', b'\x03\xe8', b'\xc3\x28', b'\xed\xa0\x80', b'\x37\xfa\x21\x3d'],
+    'dns': [b'\xc0\x0c', b'\xc0\x00', b'\x00\x01', b'\x00\x05', b'\x00\x1c', b'\x00\x21', b'\x00\x0f', b'\x00\x10', b'\x00\x06',
+            b'\xff\xff', b'\x3f', b'\x00', b'\x81\x80', b'\x81\x83', b'\x00\x04\x7f\x00\x00\x01'],
     'math': [b'{', b'}', b'^', b'_', b'\\frac', b'\\left(', b'\\right)', b'\\middle|', b'\\begin{pmatrix}',
              b'\\end{pmatrix}', b'&', b'\\\\', b'\\sqrt[', b']', b'\\text{', b'\\mathbb{', b'\\not', b'\\over',
              b'\\color{red}', b"'", b'{' * 70, b'\xff'],

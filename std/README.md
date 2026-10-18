@@ -270,6 +270,21 @@ has not been audited: review it before relying on it.
   and similar return values that point at the object they came from, so don't move
   that object while the adapter is in use.
 
+## What the test suite covers
+
+Every module has `test` blocks that the suite runs on WebAssembly and natively, except
+those that need a device: the windows, GPUs, sound output and controllers (`os/window`,
+`os/gamepad`, `audio/output`, `graphics/gpu`) and their backends (`os/win32`,
+`os/cocoa`, `os/objc`, `os/com`, `os/xinput`, `os/gamecontroller`, `graphics/d3d11`,
+`graphics/d3d12`, `graphics/d2d`, `graphics/hlsl`, `graphics/metal`,
+`graphics/quartz`, `audio/xaudio2`, `audio/coreaudio`). The suite's macOS and Windows
+sections build them and the examples that use them for their platforms and inspect the
+binaries; running them is a manual check on a machine with the device. The codec
+internals under `graphics/image/av1`, `graphics/image/webp`, `audio/opus`, `audio/aac`
+and `graphics/shape` are tested through their parents against reference decoders and
+shapers (the generators in `cmd/axiom/internal/tests/tools/` make those tests), and the
+parsers are fuzzed (`docs/security.md`).
+
 ## Example
 
 ```axiom

@@ -32,8 +32,9 @@ limit).
 - **Fuzzing.** `cmd/axiom/internal/tests/tools/fuzz.py` mutates seed inputs (made by
   std's own encoders, plus sounds from ffmpeg and sox, system fonts and CA
   certificates) and runs them through every parser target of
-  `cmd/axiom/internal/tests/fuzz/fuzz.ax`; a trap, a signal or a hang (10 s) is saved as
-  a failure:
+  `cmd/axiom/internal/tests/fuzz/fuzz.ax`, the network parsers among them (TLS hello
+  messages, HTTP/2 frames, HPACK blocks, WebSocket frames, DNS replies, fed as bytes
+  without a socket); a trap, a signal or a hang (10 s) is saved as a failure:
 
       cmd/axiom/internal/tests/tools/fuzz.py --runs 5000            # all targets
       cmd/axiom/internal/tests/tools/fuzz.py --runs 20000 pdf font  # some of them

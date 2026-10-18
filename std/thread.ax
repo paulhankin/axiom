@@ -139,3 +139,96 @@ pub fn parallel_for[C](n: usize, threads: usize, body: fn(*mut C, usize, usize) 
         handles[j].join();
     }
 }
+
+// -----------------------------------------------------------------------------
+// Tests (axiom test std/thread.ax)
+// -----------------------------------------------------------------------------
+
+struct Shared {
+    sum: u64,
+    count: u32,
+}
+
+fn add_to(s: *mut Shared) void {
+    _ = @atomic_add(&mut s.count, 1);
+    for i in @as(u64, 1)..101 {
+        _ = @atomic_add(&mut s.sum, i);
+    }
+}
+
+test "spawn copies its argument; join waits for the thread" {
+    let mut shared = Shared.{ sum: 0, count: 0 };
+    let p = &mut shared;
+    let a = spawn(add_to, p)!;
+    let b = spawn(add_to, p)!;
+    a.join();
+    b.join();
+    @expect_eq(@atomic_load(&shared.count), 2);
+    @expect_eq(@atomic_load(&shared.sum), 2 * 5050);
+}
+
+struct Slot {
+    out: *mut u32,
+    value: u32,
+}
+
+fn write_slot(s: Slot) void {
+    @atomic_store(s.out, s.value);
+}
+
+test "many threads, each with its own copy of a struct argument" {
+    let n: usize = 16;
+    let results = mem.alloc_zeroed.[u32](n)!;
+    defer mem.free(results);
+    let handles = mem.alloc.[Thread.[Slot]](n)!;
+    defer mem.free(handles);
+    for i in 0..n {
+        handles[i] = spawn(write_slot, Slot.{ out: &mut results[i], value: @int_cast(u32, i * i) })!;
+    }
+    for i in 0..n {
+        handles[i].join();
+    }
+    for i in 0..n {
+        @expect_eq(results[i], @int_cast(u32, i * i));
+    }
+}
+
+struct Marks {
+    seen: []mut u32,
+    calls: u32,
+}
+
+fn mark_range(m: *mut Marks, lo: usize, hi: usize) void {
+    _ = @atomic_add(&mut m.calls, 1);
+    for i in lo..hi {
+        _ = @atomic_add(&mut m.seen[i], 1);
+    }
+}
+
+test "parallel_for covers 0..n exactly once, with any thread count" {
+    let n: usize = 64;
+    let seen = mem.alloc_zeroed.[u32](n)!;
+    defer mem.free(seen);
+    let counts: [4]usize = [1, 3, 7, 500];  // more threads than elements too
+    for threads in counts {
+        for i in 0..n {
+            seen[i] = 0;
+        }
+        let mut m = Marks.{ seen: seen, calls: 0 };
+        parallel_for(n, threads, mark_range, &mut m)!;
+        for i in 0..n {
+            @expect_eq(seen[i], 1);
+        }
+        // the calling thread takes the last range; no more ranges than elements
+        @expect(m.calls >= 1);
+        @expect(@as(usize, m.calls) <= @min(threads, n));
+    }
+    let mut empty = Marks.{ seen: seen[..0], calls: 0 };
+    parallel_for(0, 4, mark_range, &mut empty)!;
+    @expect_eq(empty.calls, 1);  // one empty range, run on the calling thread
+}
+
+test "cpu_count and sleep_ms" {
+    @expect(cpu_count() >= 1);
+    sleep_ms(1);
+}
