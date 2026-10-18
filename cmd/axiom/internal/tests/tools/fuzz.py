@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Mutation fuzzing of the standard library's parsers.
 
-    cmd/axiom/internal/tests/tools/fuzz.py [--runs N] [--timeout S] [--jobs J] [--seed K] [target ...]
+    cmd/axiom/internal/tests/tools/fuzz.py [--runs N | --minutes M] [--timeout S] [--jobs J] [--seed K] [target ...]
 
 Builds cmd/axiom/internal/tests/fuzz/fuzz.ax natively, makes seed inputs (with std's own
 encoders, plus sounds from ffmpeg/sox, system fonts and certificates when
 they are around), then runs mutated seeds through each target. Bad input is
 expected to fail with an error; a trap, a signal or a hang is a bug, and
 the input that caused it is saved under build/fuzz/failures/<target>/.
+--runs N mutates each seed set N times (500 by default); --minutes M instead
+spends about M minutes in all, shared out among the targets. --seed 0 picks a
+seed from the clock and prints it, for runs that should differ from the last.
 Targets: image audio deflate json regex markdown pdf font x509 text web
 structured compress archive svg collate opusenc binary math tls http2 hpack
 websocket dns (all by default).
@@ -20,6 +23,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..'))
 OUT = os.path.join(ROOT, 'build', 'fuzz')
@@ -137,7 +141,8 @@ def run_one(exe, target, data, path, timeout):
     return 'crash %d' % r.returncode, r.stderr[-2000:]
 
 
-def fuzz_target(exe, seeds, target, runs, timeout, seed):
+def fuzz_target(exe, seeds, target, runs, budget, timeout, seed):
+    """Runs the target `runs` times, or for `budget` seconds if that is set."""
     rng = random.Random('%d-%s' % (seed, target))
     files = sorted(glob.glob(os.path.join(seeds, target, '*')))
     corpus = [open(f, 'rb').read() for f in files]
@@ -146,7 +151,16 @@ def fuzz_target(exe, seeds, target, runs, timeout, seed):
     fails = os.path.join(OUT, 'failures', target)
     work = os.path.join(OUT, 'work-%s.bin' % target)
     found = []
-    for i in range(runs):
+    deadline = time.monotonic() + budget if budget else None
+    i = -1
+    while True:
+        i += 1
+        if deadline is None:
+            if i >= runs:
+                break
+        elif time.monotonic() >= deadline:
+            runs = i
+            break
         data = mutate(rng.choice(corpus), rng, TOKENS.get(target))
         kind, err = run_one(exe, target, data, work, timeout)
         if kind:
@@ -162,6 +176,7 @@ def fuzz_target(exe, seeds, target, runs, timeout, seed):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--runs', type=int, default=500)
+    ap.add_argument('--minutes', type=float, default=0, help='a time budget for the whole run, in place of --runs')
     ap.add_argument('--timeout', type=float, default=10.0)
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--seed', type=int, default=1)
@@ -169,11 +184,16 @@ def main():
     ap.add_argument('targets', nargs='*')
     a = ap.parse_args()
     targets = a.targets or TARGETS
+    if a.seed == 0:
+        a.seed = int(time.time()) % 1000000
+        print('seed %d' % a.seed)
+    # each target gets its share of the time: the targets run `jobs` at a time
+    budget = a.minutes * 60 * min(a.jobs, len(targets)) / len(targets) if a.minutes else 0
     exe = build(a.compiler)
     seeds = make_seeds(exe)
     total = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        futs = [ex.submit(fuzz_target, exe, seeds, t, a.runs, a.timeout, a.seed) for t in targets]
+        futs = [ex.submit(fuzz_target, exe, seeds, t, a.runs, budget, a.timeout, a.seed) for t in targets]
         for fu in concurrent.futures.as_completed(futs):
             target, runs, bad, found = fu.result()
             total += bad

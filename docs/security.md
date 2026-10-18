@@ -38,13 +38,17 @@ limit).
 
       cmd/axiom/internal/tests/tools/fuzz.py --runs 5000            # all targets
       cmd/axiom/internal/tests/tools/fuzz.py --runs 20000 pdf font  # some of them
+      cmd/axiom/internal/tests/tools/fuzz.py --minutes 30 --seed 0  # half an hour, a fresh seed
+
+  The fuzzer runs for a few minutes in the release steps (`docs/releasing.md`); a
+  longer run with a new seed is worth it after a change to a parser.
 
 - **The address sanitizer.** `axiom test --sanitize=address` (spec §16.8) traps on use
   after free, double frees and out-of-block accesses in the heap, and reports leaks.
 
-Known gaps are GitHub issues: [#40](https://github.com/paulhankin/axiom/issues/40)
-(deep directory trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer
-fuzzing).
+Known gaps are GitHub issues, among them
+[#41](https://github.com/paulhankin/axiom/issues/41) (fuzzing for longer, and on a
+schedule).
 
 ## Defences
 

@@ -66,6 +66,9 @@ if [ "${SKIP_TESTS:-0}" != 1 ]; then
     node cmd/axiom/internal/tests/run.mjs
     AXIOM=$A node cmd/axiom/internal/tests/run.mjs
     AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 node cmd/axiom/internal/tests/run.mjs --native -O2
+    # the standard library's parsers against mutated inputs, with a seed of
+    # this run's own
+    python3 cmd/axiom/internal/tests/tools/fuzz.py --minutes 5 --seed 0 --compiler $A
 fi
 
 R=build/release

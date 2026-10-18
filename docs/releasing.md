@@ -59,7 +59,8 @@ From a clean checkout of `main` (or, for a fix release, of `release-0.N`), with
    `cmd/axiom/bootstrap/src/version.h`, run `cmd/axiom/release.sh notes <version>`,
    edit the notes, and commit.
 2. `cmd/axiom/release.sh build <version>`: bootstraps, runs the test suite with both
-   compilers, and writes the archives and `SHA256SUMS` to `build/release/`.
+   compilers and the standard library's fuzzer for five minutes (`docs/security.md`),
+   and writes the archives and `SHA256SUMS` to `build/release/`.
 3. Tag the commit `v<version>` and push the tag.
 4. Create a GitHub release for the tag with the notes, and attach the files in
    `build/release/`.
