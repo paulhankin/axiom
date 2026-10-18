@@ -40,7 +40,9 @@ the tests whose path contains `text`.
 
 `cmd/axiom/internal/tests/run.mjs` drives everything. Its options: `--native` (build
 and run native code instead of WebAssembly), `-O2`, `--units=module|program`, `-g`,
-`--filter=<text>`. `AXIOM_TEST_JOBS` sets the number of tests run at a time.
+`--filter=<text>`, `--list` (print the names of the tests that would run, without
+running them) and `--verbose` (name the tests skipped, and why). `AXIOM_TEST_JOBS` sets
+the number of tests run at a time.
 
 | Directory | Convention |
 |---|---|
