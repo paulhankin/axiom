@@ -5,7 +5,7 @@
 // with the object as the first argument.
 //
 //     let f = @bit_cast(fn(usize, u32) i32, com.method(obj, 8));  // the 9th method
-//     if f(obj, 0) < 0 { return error.Failed; }                  // an HRESULT
+//     com.check(f(obj, 0))!;                                     // an HRESULT
 //     com.release(obj);
 //
 // Methods are numbered in declaration order, the parent interface's first
@@ -17,10 +17,40 @@
 // Windows only (--target=x86_64-windows).
 // =============================================================================
 
-error { Failed }
+error { OutOfMemory, InvalidArgument, PermissionDenied, Unsupported, DeviceLost, Failed }
 
 extern "C" "ole32" {
     fn CoInitializeEx(reserved: *void, flags: u32) i32;
+}
+
+/// What a failed HRESULT means: OutOfMemory, InvalidArgument,
+/// PermissionDenied, Unsupported, DeviceLost (the graphics or audio device
+/// was removed or reset, or a Direct2D target must be recreated), or Failed
+/// for any other failure. Nothing for success (hr >= 0).
+pub fn check(hr: i32) !void {
+    if hr >= 0 {
+        return;
+    }
+    let h = @bit_cast(u32, hr);
+    if h == 0x8007_000E {  // E_OUTOFMEMORY
+        return error.OutOfMemory;
+    }
+    if h == 0x8007_0057 {  // E_INVALIDARG
+        return error.InvalidArgument;
+    }
+    if h == 0x8007_0005 {  // E_ACCESSDENIED
+        return error.PermissionDenied;
+    }
+    if (h == 0x8000_4001) or (h == 0x8000_4002) or (h == 0x887A_0004) {  // E_NOTIMPL, E_NOINTERFACE, DXGI_ERROR_UNSUPPORTED
+        return error.Unsupported;
+    }
+    // DXGI_ERROR_DEVICE_REMOVED, _HUNG, _RESET, _DRIVER_INTERNAL_ERROR;
+    // D2DERR_RECREATE_TARGET; XAUDIO2_E_DEVICE_INVALIDATED
+    if (h == 0x887A_0005) or (h == 0x887A_0006) or (h == 0x887A_0007) or (h == 0x887A_0020) or (h == 0x8899_000C) or
+       (h == 0x8896_0004) {
+        return error.DeviceLost;
+    }
+    return error.Failed;
 }
 
 /// The address of method i of interface pointer obj.
@@ -41,9 +71,7 @@ pub fn release(obj: usize) void {
 pub fn query(obj: usize, iid: *[16]u8) !usize {
     let mut out: usize = 0;
     let f = @bit_cast(fn(usize, *u8, *mut usize) i32, method(obj, 0));
-    if f(obj, &iid[0], &mut out) < 0 {
-        return error.Failed;
-    }
+    check(f(obj, &iid[0], &mut out))!;
     return out;
 }
 

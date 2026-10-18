@@ -106,7 +106,7 @@ import "color.ax" as color;
 import "hlsl.ax" as hlsl;
 import "image.ax" as image;
 
-error { Unsupported, Failed, OutOfMemory }
+error { Unsupported, OutOfMemory, InvalidArgument, NoSpaceLeft }
 
 extern "C" "d3d12" {
     fn D3D12CreateDevice(adapter: usize, level: u32, riid: *u8, dev: *mut usize) i32;
@@ -309,7 +309,7 @@ pub struct Buffer {
     /// last frame's: frames are waited for).
     pub fn write(self: *mut Buffer, data: []u8) !void {
         if (self.mapped == 0) or (data.len > @as(usize, self.size)) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, self.mapped), data.len), data);
     }
@@ -558,10 +558,10 @@ pub struct Device {
         com.put32(sd[..], 36, 4);  // DXGI_SWAP_EFFECT_FLIP_DISCARD
         let mut sc1: usize = 0;
         let f = @bit_cast(fn(usize, usize, usize, *u8, *void, usize, *mut usize) i32, com.method(d.factory, 15));
-        if f(d.factory, d.queue, hwnd, &sd[0], @ptr_from_int(*void, 0), 0, &mut sc1) < 0 {  // CreateSwapChainForHwnd
+        com.check(f(d.factory, d.queue, hwnd, &sd[0], @ptr_from_int(*void, 0), 0, &mut sc1)) catch |e| {  // CreateSwapChainForHwnd
             d.deinit();
-            return error.Failed;
-        }
+            return e;
+        };
         d.swap = com.query(sc1, &IID_SWAP3) catch |e| {
             com.release(sc1);
             d.deinit();
@@ -594,29 +594,19 @@ pub struct Device {
         }
         let qd: [4]u32 = [0, 0, 0, 0];  // D3D12_COMMAND_QUEUE_DESC: direct
         let cq = @bit_cast(fn(usize, *u32, *u8, *mut usize) i32, com.method(self.dev, 8));
-        if cq(self.dev, &qd[0], &IID_QUEUE[0], &mut self.queue) < 0 {
-            return error.Failed;
-        }
+        com.check(cq(self.dev, &qd[0], &IID_QUEUE[0], &mut self.queue))!;
         let ca = @bit_cast(fn(usize, u32, *u8, *mut usize) i32, com.method(self.dev, 9));
-        if ca(self.dev, 0, &IID_ALLOCATOR[0], &mut self.alloc) < 0 {
-            return error.Failed;
-        }
+        com.check(ca(self.dev, 0, &IID_ALLOCATOR[0], &mut self.alloc))!;
         let cl = @bit_cast(fn(usize, u32, u32, usize, usize, *u8, *mut usize) i32, com.method(self.dev, 12));
-        if cl(self.dev, 0, 0, self.alloc, 0, &IID_LIST[0], &mut self.list) < 0 {
-            return error.Failed;
-        }
+        com.check(cl(self.dev, 0, 0, self.alloc, 0, &IID_LIST[0], &mut self.list))!;
         _ = call0(self.list, 9);  // Close: lists are created open
         let cf = @bit_cast(fn(usize, u64, u32, *u8, *mut usize) i32, com.method(self.dev, 36));
-        if cf(self.dev, 0, 0, &IID_FENCE[0], &mut self.fence) < 0 {
-            return error.Failed;
-        }
+        com.check(cf(self.dev, 0, 0, &IID_FENCE[0], &mut self.fence))!;
         self.event = CreateEventW(@ptr_from_int(*void, 0), 0, 0, @ptr_from_int(*u16, 0));
         // D3D12_DESCRIPTOR_HEAP_DESC: RTV, count, flags, node mask
         let hd: [4]u32 = [2, @truncate(u32, MAX_TARGETS), 0, 0];
         let ch = @bit_cast(fn(usize, *u32, *u8, *mut usize) i32, com.method(self.dev, 14));
-        if ch(self.dev, &hd[0], &IID_HEAP[0], &mut self.rtv_heap) < 0 {
-            return error.Failed;
-        }
+        com.check(ch(self.dev, &hd[0], &IID_HEAP[0], &mut self.rtv_heap))!;
         self.rtv_size = @bit_cast(fn(usize, u32) u32, com.method(self.dev, 15))(self.dev, 2);
         // GetCPUDescriptorHandleForHeapStart returns a struct: through a hidden pointer
         let mut h: usize = 0;
@@ -624,17 +614,13 @@ pub struct Device {
         self.rtv_base = h;
         // and one of depth stencil views
         let dd: [4]u32 = [3, @truncate(u32, MAX_DEPTHS), 0, 0];
-        if ch(self.dev, &dd[0], &IID_HEAP[0], &mut self.dsv_heap) < 0 {
-            return error.Failed;
-        }
+        com.check(ch(self.dev, &dd[0], &IID_HEAP[0], &mut self.dsv_heap))!;
         self.dsv_size = @bit_cast(fn(usize, u32) u32, com.method(self.dev, 15))(self.dev, 3);
         _ = @bit_cast(fn(usize, *mut usize) *mut usize, com.method(self.dsv_heap, 9))(self.dsv_heap, &mut h);
         self.dsv_base = h;
         // and a shader-visible one of shader resource views
         let sd: [4]u32 = [0, @truncate(u32, MAX_VIEWS), 1, 0];
-        if ch(self.dev, &sd[0], &IID_HEAP[0], &mut self.srv_heap) < 0 {
-            return error.Failed;
-        }
+        com.check(ch(self.dev, &sd[0], &IID_HEAP[0], &mut self.srv_heap))!;
         self.srv_size = @bit_cast(fn(usize, u32) u32, com.method(self.dev, 15))(self.dev, 0);
         _ = @bit_cast(fn(usize, *mut usize) *mut usize, com.method(self.srv_heap, 9))(self.srv_heap, &mut h);
         self.srv_cpu = h;
@@ -647,9 +633,7 @@ pub struct Device {
         let gb = @bit_cast(fn(usize, u32, *u8, *mut usize) i32, com.method(self.swap, 9));  // GetBuffer
         for i in @as(usize, 0)..2 {
             let mut res: usize = 0;
-            if gb(self.swap, @truncate(u32, i), &IID_RESOURCE[0], &mut res) < 0 {
-                return error.Failed;
-            }
+            com.check(gb(self.swap, @truncate(u32, i), &IID_RESOURCE[0], &mut res))!;
             let rtv = self.rtv_base + (i * @as(usize, self.rtv_size));
             self.view(res, rtv);
             let mut t = Target.empty();
@@ -723,9 +707,7 @@ pub struct Device {
         self.back[0].deinit();
         self.back[1].deinit();
         let f = @bit_cast(fn(usize, u32, u32, u32, u32, u32) i32, com.method(self.swap, 13));  // ResizeBuffers
-        if f(self.swap, 0, width, height, 0, 0) < 0 {
-            return error.Failed;
-        }
+        com.check(f(self.swap, 0, width, height, 0, 0))!;
         self.back_buffers(width, height)!;
     }
 
@@ -752,7 +734,7 @@ pub struct Device {
         t.srv = take(self.slots.srv[..]);
         if (t.rtv_slot == NO_SLOT) or (t.srv == NO_SLOT) {
             t.deinit();
-            return error.Failed;
+            return error.NoSpaceLeft;
         }
         // D3D12_CLEAR_VALUE: format, colour
         let mut cv: [20]u8 = [0; 20];
@@ -808,7 +790,7 @@ pub struct Device {
         d.slots = self.slots;
         d.dsv_slot = take(self.slots.dsv[..]);
         if d.dsv_slot == NO_SLOT {
-            return error.Failed;
+            return error.NoSpaceLeft;
         }
         d.dsv = self.dsv_base + (@as(usize, d.dsv_slot) * @as(usize, self.dsv_size));
         self.depth_resource(&mut d, width, height) catch |e| {
@@ -830,7 +812,7 @@ pub struct Device {
         d.srv = take(self.slots.srv[..]);
         if (d.dsv_slot == NO_SLOT) or (d.srv == NO_SLOT) {
             d.deinit();
-            return error.Failed;
+            return error.NoSpaceLeft;
         }
         d.dsv = self.dsv_base + (@as(usize, d.dsv_slot) * @as(usize, self.dsv_size));
         self.depth_resource(&mut d, size, size) catch |e| {
@@ -897,9 +879,7 @@ pub struct Device {
         let hp: [5]u32 = [heap, 0, 0, 1, 1];
         let mut res: usize = 0;
         let f = @bit_cast(fn(usize, *u32, u32, *u8, u32, *u8, *u8, *mut usize) i32, com.method(self.dev, 27));
-        if f(self.dev, &hp[0], 0, &desc[0], state, clear, &IID_RESOURCE[0], &mut res) < 0 {
-            return error.Failed;
-        }
+        com.check(f(self.dev, &hp[0], 0, &desc[0], state, clear, &IID_RESOURCE[0], &mut res))!;
         return res;
     }
 
@@ -910,10 +890,11 @@ pub struct Device {
         let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
         let mut p: usize = 0;
         let range: [2]u64 = [0, 0];  // (the CPU reads nothing)
-        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p) < 0 {
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p)) catch |e| {
             com.release(res);
-            return error.Failed;
-        }
+            return e;
+        };
         @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, p), data.len), data);
         @bit_cast(fn(usize, u32, *void) void, com.method(res, 9))(res, 0, @ptr_from_int(*void, 0));  // Unmap
         let gpu = @bit_cast(fn(usize) u64, com.method(res, 11))(res);  // GetGPUVirtualAddress
@@ -937,10 +918,11 @@ pub struct Device {
         let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
         let mut p: usize = 0;
         let range: [2]u64 = [0, 0];
-        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p) < 0 {
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p)) catch |e| {
             com.release(res);
-            return error.Failed;
-        }
+            return e;
+        };
         @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, p), n), 0);
         let gpu = @bit_cast(fn(usize) u64, com.method(res, 11))(res);
         return Buffer.{ p: res, gpu: gpu, size: @truncate(u32, n), mapped: p };
@@ -954,10 +936,11 @@ pub struct Device {
         let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
         let mut p: usize = 0;
         let range: [2]u64 = [0, 0];
-        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p) < 0 {
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(res, 8))(res, 0, &range[0], &mut p)) catch |e| {
             com.release(res);
-            return error.Failed;
-        }
+            return e;
+        };
         for y in 0..rows {
             @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, p + (y * pitch)), row), data[y * row..(y + 1) * row]);
         }
@@ -991,7 +974,7 @@ pub struct Device {
         let w = img.width;
         let h = img.height;
         if (w == 0) or (h == 0) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let levels = mip_levels(w, h);
         let pixels = chain_pixels(w, h, levels);
@@ -1046,13 +1029,13 @@ pub struct Device {
     // least 1; rows packed).
     fn texture_levels(self: *mut Device, w: u32, h: u32, format: u32, bpp: usize, data: []u8, levels: u32) !Texture {
         if self.recording or (levels == 0) or (levels > 16) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let mut t = Texture.empty();
         t.slots = self.slots;
         t.srv = take(self.slots.srv[..]);
         if t.srv == NO_SLOT {
-            return error.Failed;
+            return error.NoSpaceLeft;
         }
         let mut rd: [56]u8 = [0; 56];
         texture_desc_with(rd[..], w, h, format, 0, levels, 1);
@@ -1085,10 +1068,11 @@ pub struct Device {
         defer com.release(up);
         let mut p: usize = 0;
         let range: [2]u64 = [0, 0];
-        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(up, 8))(up, 0, &range[0], &mut p) < 0 {
+        com.check(
+            @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(up, 8))(up, 0, &range[0], &mut p)) catch |e| {
             t.deinit();
-            return error.Failed;
-        }
+            return e;
+        };
         let mut at: usize = 0;
         for k in @as(u32, 0)..levels {
             let lw = level_size(@as(usize, w), k);
@@ -1140,7 +1124,7 @@ pub struct Device {
     /// compute shaders. Made between frames.
     pub fn storage_buffer(self: *mut Device, data: []u8) !StorageBuffer {
         if self.recording or (data.len == 0) or ((data.len % 4) != 0) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let mut rd: [56]u8 = [0; 56];
         buffer_desc(rd[..], @as(u64, data.len));
@@ -1181,9 +1165,7 @@ pub struct Device {
         self.submit()!;
         let mut p: usize = 0;
         let range: [2]u64 = [0, @as(u64, b.size)];
-        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(rb, 8))(rb, 0, &range[0], &mut p) < 0 {
-            return error.Failed;
-        }
+        com.check(@bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(rb, 8))(rb, 0, &range[0], &mut p))!;
         let n = @min(out.len, @as(usize, b.size));
         @mem_copy(out[0..n], @slice_from_ptr(@ptr_from_int(*u8, p), n));
         let none: [2]u64 = [0, 0];
@@ -1194,7 +1176,7 @@ pub struct Device {
     /// b0 (0: none) and `storage` storage buffers at u0, u1, ...
     pub fn compute_signature(self: *mut Device, constants: u32, storage: u32) !RootSignature {
         if storage > 8 {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         // D3D12_ROOT_PARAMETERs: constants (register, space, count at 8, 12,
         // 16); root UAVs (the register at 8)
@@ -1232,9 +1214,7 @@ pub struct Device {
         com.put64(d[..], 16, @as(u64, cb.len));
         let mut p: usize = 0;
         let f = @bit_cast(fn(usize, *u8, *u8, *mut usize) i32, com.method(self.dev, 11));  // CreateComputePipelineState
-        if f(self.dev, &d[0], &IID_PSO[0], &mut p) < 0 {
-            return error.Failed;
-        }
+        com.check(f(self.dev, &d[0], &IID_PSO[0], &mut p))!;
         return Pipeline.{ p: p, root: root.p, topology: 0, buffers: root.buffers, textures: 0 };
     }
 
@@ -1243,17 +1223,13 @@ pub struct Device {
         let mut errs: usize = 0;
         let r = D3D12SerializeRootSignature(&desc[0], 1, &mut blob, &mut errs);
         com.release(errs);
-        if r < 0 {
-            return error.Failed;
-        }
+        com.check(r)!;
         defer com.release(blob);
         let bp = @bit_cast(fn(usize) usize, com.method(blob, 3))(blob);
         let bn = @bit_cast(fn(usize) usize, com.method(blob, 4))(blob);
         let mut p: usize = 0;
         let f = @bit_cast(fn(usize, u32, usize, usize, *u8, *mut usize) i32, com.method(self.dev, 16));
-        if f(self.dev, 0, bp, bn, &IID_ROOT[0], &mut p) < 0 {
-            return error.Failed;
-        }
+        com.check(f(self.dev, 0, bp, bn, &IID_ROOT[0], &mut p))!;
         return p;
     }
 
@@ -1271,7 +1247,7 @@ pub struct Device {
     /// s2 linear and clamped, for targets read by later passes.
     pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32, textures: u32) !RootSignature {
         if (buffers > MAX_ROOT_BUFFERS) or (textures > MAX_ROOT_TEXTURES) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         // D3D12_ROOT_PARAMETERs: type at 0; for constants the register,
         // space and count at 8, 12, 16; for a constant buffer the register
@@ -1360,14 +1336,14 @@ pub struct Device {
                          o: PipelineOptions) !Pipeline {
         let topology = o.topology;
         if attrs.len > 16 {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let mut names: [16][64]u8 = [[0; 64]; 16];
         let mut elems: [512]u8 = [0; 512];
         for k in 0..attrs.len {
             let a = attrs[k];
             if (a.semantic.len + 1) > 64 {
-                return error.Failed;
+                return error.InvalidArgument;
             }
             @mem_copy(names[k][0..a.semantic.len], a.semantic);
             com.ptr(elems[..], k * 32, @int_from_ptr(&names[k][0]));
@@ -1467,9 +1443,7 @@ pub struct Device {
         com.put32(d[..], 616, samples);
         let mut p: usize = 0;
         let f = @bit_cast(fn(usize, *u8, *u8, *mut usize) i32, com.method(self.dev, 10));
-        if f(self.dev, &d[0], &IID_PSO[0], &mut p) < 0 {
-            return error.Failed;
-        }
+        com.check(f(self.dev, &d[0], &IID_PSO[0], &mut p))!;
         return Pipeline.{ p: p, root: root.p, topology: topology, buffers: root.buffers, textures: root.textures };
     }
 
@@ -1492,19 +1466,17 @@ pub struct Device {
         if self.recording {
             return;
         }
-        if (call0(self.alloc, 8) < 0) or  // Reset
-            (@bit_cast(fn(usize, usize, usize) i32, com.method(self.list, 10))(self.list, self.alloc, 0) < 0) {
-            return error.Failed;
-        }
+        com.check(call0(self.alloc, 8))!;  // Reset
+        com.check(@bit_cast(fn(usize, usize, usize) i32, com.method(self.list, 10))(self.list, self.alloc, 0))!;
         self.recording = true;
         self.heaps_set = false;
     }
 
     fn submit(self: *mut Device) !void {
-        if call0(self.list, 9) < 0 {  // Close
+        com.check(call0(self.list, 9)) catch |e| {  // Close
             self.recording = false;
-            return error.Failed;
-        }
+            return e;
+        };
         self.recording = false;
         let lists: [1]usize = [self.list];
         @bit_cast(fn(usize, u32, *usize) void, com.method(self.queue, 10))(self.queue, 1, &lists[0]);
@@ -1520,7 +1492,7 @@ pub struct Device {
     /// (of t's size).
     pub fn begin_depth(self: *mut Device, t: *mut Target, d: *mut DepthBuffer) !void {
         if (d.width != t.width) or (d.height != t.height) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         self.open()!;
         self.barrier(d.res, d.state, DEPTH_WRITE_STATE);
@@ -1782,16 +1754,14 @@ pub struct Device {
             }
         }
         if o.n == o.res.len {
-            return error.Failed;
+            return error.NoSpaceLeft;
         }
         // D3D11_RESOURCE_FLAGS: bind (render target), misc, CPU access, stride;
         // in and out of Direct3D 11 as a render target
         let flags: [4]u32 = [0x20, 0, 0, 0];
         let mut w: usize = 0;
         let f = @bit_cast(fn(usize, usize, *u32, u32, u32, *u8, *mut usize) i32, com.method(o.on12, 3));  // CreateWrappedResource
-        if f(o.on12, t.res, &flags[0], RENDER_TARGET, RENDER_TARGET, &IID_TEXTURE2D[0], &mut w) < 0 {
-            return error.Failed;
-        }
+        com.check(f(o.on12, t.res, &flags[0], RENDER_TARGET, RENDER_TARGET, &IID_TEXTURE2D[0], &mut w))!;
         o.res[o.n] = t.res;
         o.wrapped[o.n] = w;
         o.n += 1;
@@ -1842,9 +1812,7 @@ pub struct Device {
         if vsync {
             sync = 1;
         }
-        if @bit_cast(fn(usize, u32, u32) i32, com.method(self.swap, 8))(self.swap, sync, 0) < 0 {
-            return error.Failed;
-        }
+        com.check(@bit_cast(fn(usize, u32, u32) i32, com.method(self.swap, 8))(self.swap, sync, 0))!;
         self.frame = @bit_cast(fn(usize) u32, com.method(self.swap, 36))(self.swap);
     }
 
@@ -1852,7 +1820,7 @@ pub struct Device {
     /// with deinit).
     pub fn read_pixels(self: *mut Device, t: *mut Target) !image.Image {
         if t.format != TARGET_BGRA8 {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         self.end_pass();
         let pitch = (t.width * 4 + 255) & ~@as(u32, 255);
@@ -1880,9 +1848,7 @@ pub struct Device {
         self.submit()!;
         let mut p: usize = 0;
         let range: [2]u64 = [0, size];
-        if @bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(rb, 8))(rb, 0, &range[0], &mut p) < 0 {
-            return error.Failed;
-        }
+        com.check(@bit_cast(fn(usize, u32, *u64, *mut usize) i32, com.method(rb, 8))(rb, 0, &range[0], &mut p))!;
         let w = @as(usize, t.width);
         let h = @as(usize, t.height);
         let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;

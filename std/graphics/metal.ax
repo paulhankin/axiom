@@ -58,7 +58,8 @@
 import "../os/objc.ax" as objc;
 import "image.ax" as image;
 
-error { Unsupported, Failed, CompileError, OutOfMemory }
+error { Unsupported, Failed, CompileError, OutOfMemory, InvalidArgument, TimedOut, NoSpaceLeft, DeviceLost,
+        PermissionDenied }
 
 extern "C" "Metal" {
     fn MTLCreateSystemDefaultDevice() usize;
@@ -132,6 +133,29 @@ pub struct Attribute {
 }
 
 /// Shaders compiled from MSL source: functions to build pipelines from.
+// The largest texture side (Apple silicon).
+const MAX_TEXTURE: u32 = 16384;
+
+// What a command buffer's error (MTLCommandBufferError) means; nothing for 0.
+fn command_buffer_error(code: usize) !void {
+    if code == 0 {
+        return;
+    }
+    if code == 2 {  // Timeout
+        return error.TimedOut;
+    }
+    if (code == 4) or (code == 11) {  // AccessRevoked, DeviceRemoved
+        return error.DeviceLost;
+    }
+    if code == 7 {  // NotPermitted (in the background)
+        return error.PermissionDenied;
+    }
+    if code == 8 {  // OutOfMemory
+        return error.OutOfMemory;
+    }
+    return error.Failed;
+}
+
 pub struct Library {
     p: usize,  // id<MTLLibrary>
 
@@ -183,7 +207,7 @@ pub struct Buffer {
     /// frame's).
     pub fn write(self: *mut Buffer, data: []u8) !void {
         if (self.mapped == 0) or (data.len > @as(usize, self.size)) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, self.mapped), data.len), data);
     }
@@ -512,20 +536,20 @@ pub struct Device {
         if samples <= 1 {
             return;
         }
-        let m = self.texture_ms(BGRA8, self.back.width, self.back.height, samples, 0x4);
-        if m == 0 {
-            return error.Unsupported;
-        }
+        let m = self.texture_ms(BGRA8, self.back.width, self.back.height, samples, 0x4)!;
         self.back.msaa = m;
         self.back.samples = samples;
     }
 
-    fn texture_2d(self: *mut Device, format: u64, width: u32, height: u32, usage: u64, storage: u64) usize {
+    fn texture_2d(self: *mut Device, format: u64, width: u32, height: u32, usage: u64, storage: u64) !usize {
         return self.texture_mip(format, width, height, usage, storage, false);
     }
 
     fn texture_mip(self: *mut Device, format: u64, width: u32, height: u32, usage: u64, storage: u64,
-                   mipmapped: bool) usize {
+                   mipmapped: bool) !usize {
+        if (width == 0) or (height == 0) or (width > MAX_TEXTURE) or (height > MAX_TEXTURE) {
+            return error.InvalidArgument;
+        }
         let pool = objc.pool_push();
         defer objc.pool_pop(pool);
         let f = @bit_cast(fn(usize, usize, u64, u64, u64, u8) usize, objc.msg_send());
@@ -538,14 +562,21 @@ pub struct Device {
                    @as(u64, height), mips);
         _ = objc.call1(td, "setUsage:", @truncate(usize, usage));
         _ = objc.call1(td, "setStorageMode:", @truncate(usize, storage));
-        return objc.call1(self.dev, "newTextureWithDescriptor:", td);
+        let t = objc.call1(self.dev, "newTextureWithDescriptor:", td);
+        if t == 0 {
+            return error.OutOfMemory;
+        }
+        return t;
     }
 
     // A multisampled texture (private: the GPU's alone).
-    fn texture_ms(self: *mut Device, format: u64, width: u32, height: u32, samples: u32, usage: u64) usize {
+    fn texture_ms(self: *mut Device, format: u64, width: u32, height: u32, samples: u32, usage: u64) !usize {
+        if (width == 0) or (height == 0) or (width > MAX_TEXTURE) or (height > MAX_TEXTURE) {
+            return error.InvalidArgument;
+        }
         let ok = @bit_cast(fn(usize, usize, u64) u8, objc.msg_send());
         if ok(self.dev, objc.sel("supportsTextureSampleCount:"), @as(u64, samples)) == 0 {
-            return 0;
+            return error.Unsupported;
         }
         let pool = objc.pool_push();
         defer objc.pool_pop(pool);
@@ -557,7 +588,11 @@ pub struct Device {
         _ = objc.call1(td, "setSampleCount:", @as(usize, samples));
         _ = objc.call1(td, "setUsage:", @truncate(usize, usage));
         _ = objc.call1(td, "setStorageMode:", 2);  // private
-        return objc.call1(self.dev, "newTextureWithDescriptor:", td);
+        let t = objc.call1(self.dev, "newTextureWithDescriptor:", td);
+        if t == 0 {
+            return error.OutOfMemory;
+        }
+        return t;
     }
 
     /// A texture of width × height pixels to draw into offscreen.
@@ -571,17 +606,13 @@ pub struct Device {
     /// with set_target_texture.
     pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) !Target {
         let pf = pixel_format(format);
-        let t = self.texture_2d(pf, width, height, 0x5, 0);  // render target, shader read; shared
-        if t == 0 {
-            return error.Failed;
-        }
+        let t = self.texture_2d(pf, width, height, 0x5, 0)!;  // render target, shader read; shared
         let mut m: usize = 0;
         if samples > 1 {
-            m = self.texture_ms(pf, width, height, samples, 0x4);
-            if m == 0 {
+            m = self.texture_ms(pf, width, height, samples, 0x4) catch |e| {
                 objc.release(t);
-                return error.Unsupported;
-            }
+                return e;
+            };
         }
         return Target.{ tex: t, width: width, height: height, screen: false, format: format, samples: @max(samples, 1),
                         msaa: m };
@@ -609,12 +640,9 @@ pub struct Device {
     pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) !DepthBuffer {
         let mut t: usize = 0;
         if samples > 1 {
-            t = self.texture_ms(DEPTH32, width, height, samples, 0x4);
+            t = self.texture_ms(DEPTH32, width, height, samples, 0x4)!;
         } else {
-            t = self.texture_2d(DEPTH32, width, height, 0x4, 2);  // render target; private
-        }
-        if t == 0 {
-            return error.Failed;
+            t = self.texture_2d(DEPTH32, width, height, 0x4, 2)!;  // render target; private
         }
         return DepthBuffer.{ tex: t, width: width, height: height, sampled: false, samples: @max(samples, 1) };
     }
@@ -624,10 +652,7 @@ pub struct Device {
     /// sampled with sample_compare through sampler(1) (less or equal;
     /// outside the map, nothing is in shadow).
     pub fn shadow_map(self: *mut Device, size: u32) !DepthBuffer {
-        let t = self.texture_2d(DEPTH32, size, size, 0x5, 2);  // render target, shader read; private
-        if t == 0 {
-            return error.Failed;
-        }
+        let t = self.texture_2d(DEPTH32, size, size, 0x5, 2)!;  // render target, shader read; private
         return DepthBuffer.{ tex: t, width: size, height: size, sampled: true, samples: 1 };
     }
 
@@ -643,12 +668,9 @@ pub struct Device {
         }
         let mut t: usize = 0;
         if d.samples > 1 {
-            t = self.texture_ms(DEPTH32, width, height, d.samples, usage);
+            t = self.texture_ms(DEPTH32, width, height, d.samples, usage)!;
         } else {
-            t = self.texture_2d(DEPTH32, width, height, usage, 2);
-        }
-        if t == 0 {
-            return error.Failed;
+            t = self.texture_2d(DEPTH32, width, height, usage, 2)!;
         }
         objc.release(d.tex);
         d.tex = t;
@@ -659,7 +681,7 @@ pub struct Device {
     /// A buffer holding data (vertices or indexes).
     pub fn buffer(self: *mut Device, data: []u8) !Buffer {
         if data.len == 0 {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let f = @bit_cast(fn(usize, usize, *u8, u64, u64) usize, objc.msg_send());
         let b = f(self.dev, objc.sel("newBufferWithBytes:length:options:"), data.ptr, @as(u64, data.len), 0);
@@ -703,10 +725,7 @@ pub struct Device {
     fn texture_rgba(self: *mut Device, img: *image.Image) !Texture {
         let w = @truncate(u32, img.width);
         let h = @truncate(u32, img.height);
-        let t = self.texture_2d(RGBA8, w, h, 0x1, 0);  // shader read; shared
-        if t == 0 {
-            return error.Failed;
-        }
+        let t = self.texture_2d(RGBA8, w, h, 0x1, 0)!;  // shader read; shared
         replace(t, w, h, img.data, img.width * 4);
         return Texture.{ p: t, width: w, height: h, levels: 1 };
     }
@@ -726,10 +745,7 @@ pub struct Device {
             if srgb {
                 pf = RGBA8_SRGB;
             }
-            t = self.texture_mip(pf, w, h, 0x1, 0, true);
-            if t == 0 {
-                return error.Failed;
-            }
+            t = self.texture_mip(pf, w, h, 0x1, 0, true)!;
             if img.channels == 4 {
                 replace(t, w, h, img.data, img.width * 4);
             } else {
@@ -738,10 +754,7 @@ pub struct Device {
                 replace(t, w, h, conv.data, conv.width * 4);
             }
         } else {
-            t = self.texture_mip(RGBA16F, w, h, 0x1, 0, true);
-            if t == 0 {
-                return error.Failed;
-            }
+            t = self.texture_mip(RGBA16F, w, h, 0x1, 0, true)!;
             self.replace_half(t, img) catch |e| {
                 objc.release(t);
                 return e;
@@ -758,10 +771,7 @@ pub struct Device {
     pub fn texture_hdr(self: *mut Device, img: *image.Image) !Texture {
         let w = @truncate(u32, img.width);
         let h = @truncate(u32, img.height);
-        let t = self.texture_2d(RGBA16F, w, h, 0x1, 0);
-        if t == 0 {
-            return error.Failed;
-        }
+        let t = self.texture_2d(RGBA16F, w, h, 0x1, 0)!;
         self.replace_half(t, img) catch |e| {
             objc.release(t);
             return e;
@@ -804,7 +814,7 @@ pub struct Device {
     /// compute shaders.
     pub fn storage_buffer(self: *mut Device, data: []u8) !StorageBuffer {
         if (data.len == 0) or ((data.len % 4) != 0) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let b = self.buffer(data)!;
         return StorageBuffer.{ p: b.p, size: b.size, mapped: b.mapped };
@@ -853,7 +863,7 @@ pub struct Device {
     pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32, textures: u32) !RootSignature {
         _ = self;
         if @as(usize, constants) > MAX_CONSTANTS {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         return RootSignature.{ constants: constants, buffers: buffers, textures: textures };
     }
@@ -1039,7 +1049,14 @@ pub struct Device {
         self.end_encoder();
         _ = objc.call(self.cmd, "commit");
         _ = objc.call(self.cmd, "waitUntilCompleted");
-        let failed = objc.call(self.cmd, "status") == 5;  // MTLCommandBufferStatusError
+        let mut code: usize = 0;
+        if objc.call(self.cmd, "status") == 5 {  // MTLCommandBufferStatusError
+            code = 1;
+            let err = objc.call(self.cmd, "error");
+            if err != 0 {
+                code = objc.call(err, "code");
+            }
+        }
         self.cmd = 0;
         self.drawable = 0;
         self.back.tex = 0;
@@ -1047,9 +1064,7 @@ pub struct Device {
         self.pass_depth = @ptr_from_int(*mut DepthBuffer, 0);
         objc.pool_pop(self.pool);
         self.pool = 0;
-        if failed {
-            return error.Failed;
-        }
+        return command_buffer_error(code);
     }
 
     // The screen's texture for this frame: the layer's next drawable.
@@ -1058,11 +1073,11 @@ pub struct Device {
             return;
         }
         if self.layer == 0 {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         self.drawable = objc.call(self.layer, "nextDrawable");
         if self.drawable == 0 {
-            return error.Failed;
+            return error.TimedOut;
         }
         t.tex = objc.call(self.drawable, "texture");
     }
@@ -1076,7 +1091,7 @@ pub struct Device {
     /// (of t's size).
     pub fn begin_depth(self: *mut Device, t: *mut Target, d: *mut DepthBuffer) !void {
         if (d.width != t.width) or (d.height != t.height) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         self.begin_pass(t, d)!;
     }
@@ -1390,7 +1405,7 @@ pub struct Device {
     /// the display's next refresh.
     pub fn present(self: *mut Device, vsync: bool) !void {
         if self.layer == 0 {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         if vsync != self.vsync {
             _ = objc.send_b(self.layer, objc.sel("setDisplaySyncEnabled:"), vsync);
@@ -1414,7 +1429,7 @@ pub struct Device {
             self.submit()!;
         }
         if (t.tex == 0) or (t.format != TARGET_BGRA8) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let w = @as(usize, t.width);
         let h = @as(usize, t.height);
@@ -1445,7 +1460,7 @@ pub struct Device {
         let mut n: usize = 0;
         for l in OVERLAY_SHADER {
             if (n + l.len + 1) > src.len {
-                return error.Failed;
+                return error.NoSpaceLeft;
             }
             @mem_copy(src[n..n + l.len], l);
             src[n + l.len] = '\n';
@@ -1495,10 +1510,7 @@ pub struct Device {
         if (width == ov.width) and (height == ov.height) and (ov.tex != 0) {
             return;
         }
-        let t = self.texture_2d(BGRA8, width, height, 0x1, 0);  // shader read; shared
-        if t == 0 {
-            return error.Failed;
-        }
+        let t = self.texture_2d(BGRA8, width, height, 0x1, 0)!;  // shader read; shared
         objc.release(ov.tex);
         ov.tex = t;
         ov.width = width;

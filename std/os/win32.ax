@@ -26,7 +26,7 @@
 import "../encoding/binary.ax" as binary;
 import "../mem.ax" as mem;
 
-error { Unsupported, Failed }
+error { Unsupported, Failed, OutOfMemory, PermissionDenied, InvalidArgument, NoSpaceLeft }
 
 extern "C" "user32" {
     fn RegisterClassExW(wc: *u8) u16;
@@ -70,6 +70,22 @@ extern "C" "comdlg32" {
 
 extern "C" "kernel32" {
     fn GetModuleHandleW(name: *u16) usize;
+    fn GetLastError() u32;
+}
+
+// What the last failed Win32 call's error (GetLastError) means.
+fn last_error() error {
+    let e = GetLastError();
+    if (e == 8) or (e == 14) {  // ERROR_NOT_ENOUGH_MEMORY, ERROR_OUTOFMEMORY
+        return error.OutOfMemory;
+    }
+    if e == 5 {  // ERROR_ACCESS_DENIED
+        return error.PermissionDenied;
+    }
+    if e == 87 {  // ERROR_INVALID_PARAMETER
+        return error.InvalidArgument;
+    }
+    return error.Failed;
 }
 
 /// What happened (EventKind.NONE: nothing is waiting; draw a frame).
@@ -358,11 +374,11 @@ pub struct Window {
         let inst = GetModuleHandleW(@ptr_from_int(*u16, 0));
         let cls: [12]u16 = ['A', 'x', 'i', 'o', 'm', 'W', 'i', 'n', 'd', 'o', 'w', 0];
         if not ensure_class(inst, &cls[0]) {
-            return error.Failed;
+            return last_error();
         }
         let st = state_of(0);
         if @int_from_ptr(st) == 0 {
-            return error.Failed;  // (too many windows)
+            return error.NoSpaceLeft;
         }
         let dpi = GetDpiForSystem();
         let outer = outer_size(width, height, dpi);
@@ -371,7 +387,7 @@ pub struct Window {
         let h = CreateWindowExW(0, &cls[0], &t[0], WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, outer[0],
                                 outer[1], 0, 0, inst, @ptr_from_int(*void, 0));
         if h == 0 {
-            return error.Failed;
+            return last_error();
         }
         // (it may have opened on a screen of another DPI than the system's)
         let own = GetDpiForWindow(h);
@@ -403,17 +419,17 @@ pub struct Window {
     /// shorter: a RESIZE.)
     pub fn add_menu(self: *Window, title: []u8) !u32 {
         if nmenus >= menus.len {
-            return error.Failed;
+            return error.NoSpaceLeft;
         }
         if bar == 0 {
             bar = CreateMenu();
             if bar == 0 {
-                return error.Failed;
+                return last_error();
             }
         }
         let m = CreatePopupMenu();
         if m == 0 {
-            return error.Failed;
+            return last_error();
         }
         let mut t: [256]u16 = [0; 256];
         utf16(title, t[..]);
@@ -431,7 +447,7 @@ pub struct Window {
     /// shortcut with Ctrl ("o", ","; "" for none), shown beside it.
     pub fn add_item(self: *Window, menu: u32, title: []u8, id: u32, key: []u8) !void {
         if (menu == 0) or (@as(usize, menu) > nmenus) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         let mut label: [256]u8 = [0; 256];
         let mut n: usize = 0;
@@ -474,7 +490,7 @@ pub struct Window {
     /// A line between items of `menu`.
     pub fn add_separator(self: *Window, menu: u32) !void {
         if (menu == 0) or (@as(usize, menu) > nmenus) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         _ = AppendMenuW(menus[@as(usize, menu) - 1], MF_SEPARATOR, 0, @ptr_from_int(*u16, 0));
     }
@@ -567,7 +583,7 @@ pub struct Window {
     pub fn set_icon(self: *Window, big: bool, rgba: []u8, width: u32, height: u32) !void {
         let n = @as(usize, width) * @as(usize, height);
         if (n == 0) or (rgba.len < (n * 4)) {
-            return error.Failed;
+            return error.InvalidArgument;
         }
         // BITMAPINFOHEADER: a top-down 32-bit DIB (negative height)
         let mut bi: [44]u8 = [0; 44];
@@ -579,7 +595,7 @@ pub struct Window {
         let mut bits: usize = 0;
         let color = CreateDIBSection(0, &bi[0], 0, &mut bits, 0, 0);
         if (color == 0) or (bits == 0) {
-            return error.Failed;
+            return error.OutOfMemory;
         }
         let px = @slice_from_ptr(@ptr_from_int(*mut u8, bits), n * 4);
         for i in 0..n {
@@ -602,7 +618,7 @@ pub struct Window {
             _ = DeleteObject(mask);
         }
         if icon == 0 {
-            return error.Failed;
+            return last_error();
         }
         let mut which: usize = 0;  // ICON_SMALL
         if big {

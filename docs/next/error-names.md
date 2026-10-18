@@ -15,3 +15,12 @@
   `quartz` and `hlsl` wrappers and the `destroy` of `thread/pool` and the `audio/output`,
   `coreaudio` and `xaudio2` voices are `deinit` (COM's and Objective-C's `release` and the
   semaphore's keep their names: they are not ownership).
+- `error.Failed` now means only that a system call failed without saying why. The
+  OS, graphics and audio modules return the cause where there is one:
+  `InvalidArgument` for a bad argument or a call in the wrong state, `NoSpaceLeft`
+  when a fixed table is full, `OutOfMemory`, `TimedOut` (Metal's `nextDrawable`),
+  `IoError` (process pipes), `NotADirectory` (`os.chdir`), and the new `DeviceLost`
+  for a graphics or audio device that was removed or reset. HRESULTs go through the
+  new `com.check`, Win32 failures through GetLastError, failed Metal command buffers
+  through their error code, and `std/graphics/gpu`, `std/os/window` and
+  `std/audio/output` pass their backend's error on instead of replacing it.

@@ -268,8 +268,12 @@ has not been audited: review it before relying on it.
   (`ChecksumMismatch`, `Unsupported`, `TooLarge`) only where a program would act
   differently. Permission problems are `PermissionDenied`. The end of a sequence is
   `Done` from an iterator's `next`, `Closed` from a connection or channel, and
-  `EndOfStream` from a reader. A generic `Failed` is a last resort: name the cause
-  where the program could react to it.
+  `EndOfStream` from a reader. A call the caller made wrongly (a bad argument, or an
+  object not in the state the call needs) is `InvalidArgument`; a fixed table that is
+  full (windows, voices, descriptor slots) is `NoSpaceLeft`; a graphics or audio
+  device that was removed or reset is `DeviceLost`. A generic `Failed` is a last
+  resort, for a system call that failed without saying why: name the cause wherever
+  the system reports one (`com.check` classifies an HRESULT this way).
 - **Ownership is explicit.** A type that owns memory has `deinit`; new code does not
   add `release` or `destroy` for the same thing. A function whose result the caller
   frees says so in its doc comment ("free with mem.free"); an `_alloc` suffix marks the
