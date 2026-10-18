@@ -38,6 +38,7 @@ import host "axiom" {
     fn ax_dir_read(dir: i32, buf: *mut u8, cap: usize) isize;
     fn ax_dir_remove(dir: i32, name: *u8, len: usize, isdir: u32) i32;
     fn ax_dir_close(dir: i32) void;
+    fn ax_dir_stat(dir: i32, out: *mut i64) i32;
     fn ax_seek(fd: i32, off: i64, whence: u32) i64;
     fn ax_chmod(path: *u8, len: usize, mode: u32) i32;
     fn ax_symlink(target: *u8, tlen: usize, link: *u8, llen: usize) i32;
@@ -276,10 +277,11 @@ pub fn remove_all(p: []u8) !void {
         return e;
     };
     if i.kind == Kind.DIR {
-        let h = ax_dir_open(-1, p.ptr, p.len);
+        let mut h = ax_dir_open(-1, p.ptr, p.len);
         if h >= 0 {
-            defer ax_dir_close(h);
-            empty_dir(h)!;
+            let r = empty_dir(&mut h, 0);
+            ax_dir_close(h);
+            r!;
         } else if (h != -20) and (h != -40) {
             return fail(@as(i64, h));
         }
@@ -292,24 +294,90 @@ pub fn remove_all(p: []u8) !void {
     };
 }
 
-// Removes everything in the open directory h.
-fn empty_dir(h: i32) !void {
-    let mut d = read_dir_at(h)!;
+// remove_all and walk hold one directory handle per level of the tree, so
+// that each directory is opened relative to its parent. From DEEP levels
+// down, the parent's handle is closed while a child's subtree is visited
+// (park) and reopened through the child's ".." afterwards (unpark), checked
+// to be the same directory by device and inode: a tree deeper than the
+// process's descriptor limit still works, and a directory swapped for
+// another meanwhile is noticed (IoError).
+const DEEP: usize = 32;
+
+// A handle while parked: no directory, so that a use by mistake fails
+// (a negative handle would be the working directory).
+const PARKED: i32 = 0x7FFF_FFFF;
+
+struct DirId {
+    dev: i64,
+    ino: i64,
+}
+
+fn dir_id(h: i32) !DirId {
+    let mut out: [2]i64 = [0, 0];
+    let r = ax_dir_stat(h, &mut out[0]);
+    if r < 0 {
+        return fail(@as(i64, r));
+    }
+    return DirId.{ dev: out[0], ino: out[1] };
+}
+
+// Before a child of h.* (at `depth`) is visited: past DEEP levels, closes
+// h.*, keeping its identity in id.
+fn park(h: *mut i32, depth: usize, id: *mut DirId) !void {
+    if depth < DEEP {
+        return;
+    }
+    id.* = dir_id(h.*)!;
+    ax_dir_close(h.*);
+    h.* = PARKED;
+}
+
+// After the child c of h.* was visited: reopens h.* through c's ".." if
+// park closed it, failing if that is not the directory it was.
+fn unpark(h: *mut i32, c: i32, depth: usize, id: DirId) !void {
+    if depth < DEEP {
+        return;
+    }
+    let p = ax_dir_open(c, "..".ptr, 2);
+    if p < 0 {
+        return fail(@as(i64, p));
+    }
+    let now = dir_id(p) catch |err| {
+        ax_dir_close(p);
+        return err;
+    };
+    if (now.dev != id.dev) or (now.ino != id.ino) {
+        ax_dir_close(p);
+        return error.IoError;
+    }
+    h.* = p;
+}
+
+// Removes everything in the open directory h.* (`depth` levels down).
+fn empty_dir(h: *mut i32, depth: usize) !void {
+    let mut d = read_dir_at(h.*)!;
     defer d.deinit();
     for e in d.entries.items() {
-        remove_at(h, e.name, e.kind)!;
+        remove_at(h, e.name, e.kind, depth)!;
     }
 }
 
-// Removes the entry `name` of the open directory h, and what is in it.
-fn remove_at(h: i32, name: []u8, kind: Kind) !void {
+// Removes the entry `name` of the open directory h.*, and what is in it.
+fn remove_at(h: *mut i32, name: []u8, kind: Kind, depth: usize) !void {
     if (kind == Kind.DIR) or (kind == Kind.UNKNOWN) {
-        let c = ax_dir_open(h, name.ptr, name.len);
+        let mut c = ax_dir_open(h.*, name.ptr, name.len);
         if c >= 0 {
-            let r = empty_dir(c);
+            let mut id = DirId.{ dev: 0, ino: 0 };
+            park(h, depth, &mut id) catch |err| {
+                ax_dir_close(c);
+                return err;
+            };
+            let r = empty_dir(&mut c, depth + 1);
+            let u = unpark(h, c, depth, id);
             ax_dir_close(c);
             r!;
-            let q = ax_dir_remove(h, name.ptr, name.len, 1);
+            u!;
+            let q = ax_dir_remove(h.*, name.ptr, name.len, 1);
             if (q < 0) and (q != -2) {
                 return fail(@as(i64, q));
             }
@@ -323,9 +391,9 @@ fn remove_at(h: i32, name: []u8, kind: Kind) !void {
         }
     }
     // a file or link (or a directory that was one a moment ago)
-    let r = ax_dir_remove(h, name.ptr, name.len, 0);
+    let r = ax_dir_remove(h.*, name.ptr, name.len, 0);
     if r == -21 {
-        return remove_at(h, name, Kind.DIR);
+        return remove_at(h, name, Kind.DIR, depth);
     }
     if (r < 0) and (r != -2) {
         return fail(@as(i64, r));
@@ -520,17 +588,18 @@ pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) !void {
     @mem_copy(dot[..root.len], root);
     dot[root.len] = '/';
     dot[root.len + 1] = '.';
-    let h = ax_dir_open(-1, dot.ptr, dot.len);
+    let mut h = ax_dir_open(-1, dot.ptr, dot.len);
     if h < 0 {
         return fail(@as(i64, h));
     }
-    defer ax_dir_close(h);
-    return walk_at(h, root, ctx, visit);
+    let r = walk_at(&mut h, root, ctx, visit, 0);
+    ax_dir_close(h);
+    return r;
 }
 
-// walk, for the open directory h, whose path is `at`.
-fn walk_at[C](h: i32, at: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) !void {
-    let mut d = read_dir_at(h)!;
+// walk, for the open directory h.* (`depth` levels down), whose path is `at`.
+fn walk_at[C](h: *mut i32, at: []u8, ctx: C, visit: fn(C, []u8, Kind) bool, depth: usize) !void {
+    let mut d = read_dir_at(h.*)!;
     defer d.deinit();
     for e in d.entries.items() {
         let child = path.join2(at, e.name)!;
@@ -541,16 +610,23 @@ fn walk_at[C](h: i32, at: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) !void {
             kind = i.kind;
         }
         if visit(ctx, child, kind) and (kind == Kind.DIR) {
-            let c = ax_dir_open(h, e.name.ptr, e.name.len);
+            let mut c = ax_dir_open(h.*, e.name.ptr, e.name.len);
             if c < 0 {
                 if (c == -2) or (c == -20) or (c == -40) {
                     continue;  // gone or replaced meanwhile
                 }
                 return fail(@as(i64, c));
             }
-            let r = walk_at(c, child, ctx, visit);
+            let mut id = DirId.{ dev: 0, ino: 0 };
+            park(h, depth, &mut id) catch |err| {
+                ax_dir_close(c);
+                return err;
+            };
+            let r = walk_at(&mut c, child, ctx, visit, depth + 1);
+            let u = unpark(h, c, depth, id);
             ax_dir_close(c);
             r!;
+            u!;
         }
     }
 }
@@ -1063,6 +1139,33 @@ test "files and directories" {
     defer mem.free(abs);
     @expect(path.is_abs(abs));
     @expect(strs.ends_with(abs, "/y"));
+}
+
+test "walk and remove_all on a tree deeper than the handles they keep open" {
+    let tmp = make_temp_dir("fsdeep")!;
+    defer mem.free(tmp);
+    defer remove_all(tmp) catch {};
+    let levels: usize = (2 * DEEP) + 5;
+    let mut p = strs.String.init();
+    defer p.deinit();
+    p.push_str(tmp)!;
+    for i in 0..levels {
+        _ = i;
+        p.push_str("/d")!;
+        mkdir(p.bytes())!;
+    }
+    p.push_str("/leaf.txt")!;
+    write_file(p.bytes(), "deep")!;
+    let mut n: u32 = 0;
+    walk(tmp, &mut n, count_visit)!;
+    @expect_eq(n, @int_cast(u32, levels + 1));
+    remove_all(tmp)!;
+    let left = stat(tmp) catch |e| {
+        @expect_eq(e, error.NotFound);
+        return;
+    };
+    _ = left;
+    @expect(false);  // the tree is still there
 }
 
 test "temporary directories are private; names cannot hide a NUL" {

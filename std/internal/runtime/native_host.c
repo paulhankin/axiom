@@ -167,6 +167,16 @@ int32_t ax_dir_remove(int32_t dir, const uint8_t *name, size_t len, uint32_t isd
 
 void ax_dir_close(int32_t dir) { close(dir); }
 
+/* out: device, inode -- the identity of an open directory (to check one
+   reopened through a child's "..") */
+int32_t ax_dir_stat(int32_t dir, int64_t *out) {
+    struct stat st;
+    if (fstat(dir, &st) != 0) return fs_err();
+    out[0] = (int64_t)st.st_dev;
+    out[1] = (int64_t)st.st_ino;
+    return 0;
+}
+
 intptr_t ax_getcwd(uint8_t *buf, size_t cap) {
     char tmp[4096];
     if (!getcwd(tmp, sizeof tmp)) return fs_err();

@@ -503,6 +503,21 @@ export function createHost(opts = {}) {
       if (dir && dir.fd >= 0) try { fs.closeSync(dir.fd); } catch {}
       dirs.delete(d);
     },
+    // The identity (device, inode) of an open directory, to check one
+    // reopened through a child's "..".
+    ax_dir_stat(d, out) {
+      const dir = dirs.get(d);
+      if (!dir) return -1;
+      try {
+        const st = dir.fd >= 0 ? fs.fstatSync(dir.fd, { bigint: true }) : fs.lstatSync(dir.path, { bigint: true });
+        const dv = new DataView(memory.buffer);
+        dv.setBigInt64(Number(out), st.dev, true);
+        dv.setBigInt64(Number(out) + 8, st.ino, true);
+        return 0;
+      } catch (e) {
+        return fsErr(e);
+      }
+    },
     ax_getcwd(p, cap) { return give(Buffer.from(process.cwd(), 'utf8'), p, cap); },
     ax_argc: () => programArgs.length,
     ax_arg(i, p, cap) {
