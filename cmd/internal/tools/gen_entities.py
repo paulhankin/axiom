@@ -6,7 +6,7 @@ import html.entities
 import os
 import subprocess
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'text', 'html', 'entities.ax')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'text', 'internal', 'html', 'entities.ax')
 ents = sorted((k[:-1], v) for k, v in html.entities.html5.items() if k.endswith(';'))
 names = ''.join(k for k, _ in ents)
 offs = [0]

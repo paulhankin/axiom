@@ -135,6 +135,6 @@ under the same terms, unless stated otherwise.
 
 Some of the standard library is derived from other projects and keeps their terms; see
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). In particular the AAC decoder
-(`std/audio/aac/`) follows FFmpeg's and is licensed under the LGPL 2.1 or later; a program
+(`std/audio/aac.ax` and `std/audio/internal/aac/`) follows FFmpeg's and is licensed under the LGPL 2.1 or later; a program
 includes it only if it imports `std/audio/aac` (`std/audio/formats` reads AAC only once
 the program adds `aac.DECODER` to it).

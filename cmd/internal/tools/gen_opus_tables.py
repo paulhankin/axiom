@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/audio/opus/tables.ax (CELT's mode tables, PVQ counts and
+"""Generates std/audio/internal/opus/tables.ax (CELT's mode tables, PVQ counts and
 energy models; SILK's codebooks and probability tables) from libopus's
 sources, as the C compiler would store them (float literals rounded to
 float once).
@@ -15,7 +15,7 @@ import sys
 from fractions import Fraction
 
 src = sys.argv[1]
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'audio', 'opus', 'tables.ax')
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'audio', 'internal', 'opus', 'tables.ax')
 
 FALSE = {'FIXED_POINT', 'CUSTOM_MODES', 'ENABLE_HARDENING', 'ENABLE_ASSERTIONS', 'SMALL_FOOTPRINT', 'HAVE_ARM_NE10',
          'OVERRIDE_FFT', 'CUSTOM_MODES_ONLY'}

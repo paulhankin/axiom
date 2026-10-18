@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates std/audio/aac/tables.ax (scalefactor band layouts, the Huffman
+"""Generates std/audio/internal/aac/tables.ax (scalefactor band layouts, the Huffman
 codebooks, dequantisation values, TNS and LTP coefficients and the sine and
 KBD windows) from FFmpeg's AAC decoder, as FFmpeg computes them.
 
@@ -21,7 +21,7 @@ import struct
 import sys
 
 src = sys.argv[1]
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'audio', 'aac', 'tables.ax')
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'audio', 'internal', 'aac', 'tables.ax')
 
 
 def read(path):

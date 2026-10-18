@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generates std/graphics/image/av1/cdf.ax (the AV1 default CDFs, the spec's tables as
-dav1d holds them) and std/graphics/image/av1/tables.ax (scan orders, quantizer
+"""Generates std/graphics/image/internal/av1/cdf.ax (the AV1 default CDFs, the spec's tables as
+dav1d holds them) and std/graphics/image/internal/av1/tables.ax (scan orders, quantizer
 matrices, dequantization and intra/CDEF/restoration tables) from the rav1d
 crate's sources.
 
@@ -160,7 +160,7 @@ lines.append('')
 lines.append('/// Every other CDF')
 lines.append('pub const MODE_SIZE: usize = %d;' % mode_off)
 lines.append(arr('MODE_DEFAULTS', mode_parts))
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'graphics', 'image', 'av1', 'cdf.ax')
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'graphics', 'image', 'internal', 'av1', 'cdf.ax')
 open(out, 'w').write('\n'.join(lines) + '\n')
 print(coef_off, mode_off)
 
@@ -248,6 +248,6 @@ taps = [int(x) for x in re.findall(r'-?\d+', re.sub(r'Align64<\[i8; 64\]>; 5', '
 taps = taps[-(5 * 8 * 7):]
 out.append('/// [mode][output position][7 taps]')
 out.append('pub let FILTER_INTRA_TAPS: [280]i32 = [%s];' % ', '.join(map(str, taps)))
-out2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'graphics', 'image', 'av1', 'tables.ax')
+out2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'std', 'graphics', 'image', 'internal', 'av1', 'tables.ax')
 open(out2, 'w').write('\n'.join(out) + '\n')
 print('tables', len(data), len(qm16), len(qm32), len(dq), len(taps))

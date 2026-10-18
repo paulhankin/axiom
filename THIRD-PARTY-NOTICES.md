@@ -8,14 +8,14 @@ reproducing a notice from this file, as each entry says.
 
 ## Code and data compiled into programs
 
-### FFmpeg (LGPL-2.1-or-later): `std/audio/aac/`
+### FFmpeg (LGPL-2.1-or-later): `std/audio/aac.ax`, `std/audio/internal/aac/`
 
-The AAC decoder (`std/audio/aac/decoder.ax`, `sbr.ax`, `ps.ax`, `bits.ax`) follows
+The AAC decoder (`std/audio/internal/aac/decoder.ax`, `sbr.ax`, `ps.ax`, `bits.ax`) follows
 FFmpeg's float AAC decoder (libavcodec/aacdec_template.c, aacsbr*.c, aacps*.c,
-sbrdsp_template.c) with the same arithmetic, and `std/audio/aac/tables.ax` is generated
+sbrdsp_template.c) with the same arithmetic, and `std/audio/internal/aac/tables.ax` is generated
 from FFmpeg's tables (libavcodec/aactab.c and others). These files are licensed under the
 GNU Lesser General Public License, version 2.1 or (at your option) any later version, as
-FFmpeg is; the text is in [`std/audio/aac/LICENSE`](std/audio/aac/LICENSE). FFmpeg is
+FFmpeg is; the text is in [`std/audio/internal/aac/LICENSE`](std/audio/internal/aac/LICENSE). FFmpeg is
 Copyright (c) the FFmpeg developers.
 
 Only `std/audio/aac.ax` imports these files, and nothing else in the repository imports it
@@ -26,10 +26,10 @@ source and let recipients relink the program with a modified version of it (LGPL
 section 6), which for a statically compiled Axiom program means providing the program's
 object files or source.
 
-### libopus (BSD-3-Clause): `std/audio/opus.ax`, `std/audio/opus/`
+### libopus (BSD-3-Clause): `std/audio/opus.ax`, `std/audio/internal/opus/`
 
 The Opus decoder and encoder are ported from libopus (CELT and SILK), and
-`std/audio/opus/tables.ax` is generated from its tables.
+`std/audio/internal/opus/tables.ax` is generated from its tables.
 
 ```
 Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
@@ -78,10 +78,10 @@ Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
 
-### dav1d and rav1d (BSD-2-Clause): `std/graphics/image/av1/`, `std/graphics/image/avif.ax`
+### dav1d and rav1d (BSD-2-Clause): `std/graphics/image/internal/av1/`, `std/graphics/image/avif.ax`
 
 The AV1 decoder follows dav1d, by way of its Rust port rav1d, so that its output is
-bit-exact; `std/graphics/image/av1/cdf.ax`, `tables.ax` and `itx1d.ax` are generated or
+bit-exact; `std/graphics/image/internal/av1/cdf.ax`, `tables.ax` and `itx1d.ax` are generated or
 translated from rav1d's sources.
 
 ```
@@ -137,7 +137,7 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### libwebp (BSD-3-Clause): `std/graphics/image/webp.ax`, `std/graphics/image/webp/`
+### libwebp (BSD-3-Clause): `std/graphics/image/webp.ax`, `std/graphics/image/internal/webp/`
 
 The VP8 and lossless WebP decoders reproduce libwebp's decoding (its filtering,
 upsampling and fixed-point colour conversion) so that pixels match.
@@ -204,10 +204,10 @@ full responsibility for any undesirable consequences; the authors accept
 NO LIABILITY for damages of any kind.
 ```
 
-### HarfBuzz (Old MIT): `std/graphics/shape.ax`, `std/graphics/shape/`
+### HarfBuzz (Old MIT): `std/graphics/shape.ax`, `std/graphics/internal/shape/`
 
 The text shaper follows HarfBuzz's implementation (buffers, normalization, the Arabic and
-Indic shapers, GSUB/GPOS matching), and `std/graphics/shape/tables.ax` follows HarfBuzz's
+Indic shapers, GSUB/GPOS matching), and `std/graphics/internal/shape/tables.ax` follows HarfBuzz's
 table generators.
 
 ```
@@ -309,7 +309,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Unicode data (Unicode License V3): `std/unicode/tables.ax`, `std/unicode/collate/tables.ax`, `std/graphics/shape/tables.ax`
+### Unicode data (Unicode License V3): `std/unicode/tables.ax`, `std/unicode/collate/tables.ax`, `std/graphics/internal/shape/tables.ax`
 
 Generated from the Unicode Character Database and the Default Unicode Collation Element
 Table.
