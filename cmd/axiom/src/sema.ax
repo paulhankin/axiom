@@ -1971,20 +1971,41 @@ fn check_unary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         return e.ty;
     }
     if op == lx.TK_AMP {
-        _ = check_operand(e.a, tnil());
+        // the pointee type expected, if any, types an untyped temporary
+        let mut hint = tnil();
+        if u.notnil(expected) and (expected.kind == ast.TY_PTR) {
+            hint = expected.elem;
+        }
+        _ = check_operand(e.a, hint);
         check_value(e.a);
+        if ty.is_untyped(e.a.ty) {
+            if u.notnil(hint) {
+                coerce(&mut e.a, hint);
+            } else {
+                _ = finalize_untyped(&mut e.a);
+            }
+        }
         let t = e.a.ty;
         if t.kind == ast.TY_INVALID {
             return set_ty(e, ty.t_invalid);
         }
         if not is_place(e.a) {
-            _ = dg.err(e.a.span, "E0703", "cannot take the address of a temporary value");
-            return set_ty(e, ty.t_invalid);
+            // a temporary: codegen gives it a slot that lives to the end of
+            // the function (spec §7.5); only its immutable address is given
+            if e.bval {
+                _ = dg.err(e.a.span, "E0703", "cannot take a mutable address of a temporary value");
+                return set_ty(e, ty.t_invalid);
+            }
+            if t.kind == ast.TY_VOID {
+                _ = dg.err(e.a.span, "E0703", "cannot take the address of a void value");
+                return set_ty(e, ty.t_invalid);
+            }
+        } else {
+            if e.bval and not is_mut_place(e.a) {
+                not_mutable(e.a, "take a mutable address");
+            }
+            mark_addr_taken(e.a);
         }
-        if e.bval and not is_mut_place(e.a) {
-            not_mutable(e.a, "take a mutable address");
-        }
-        mark_addr_taken(e.a);
         e.ty = ty.type_ptr(t, e.bval);
         return e.ty;
     }
@@ -2670,10 +2691,8 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             } else if sk == ast.SELF_ADDR {
                 if via_ptr {
                     e.self_mode = ast.SELF_PASS;
-                } else if not is_place(recv) {
-                    _ = dg.err(recv.span, "E0703",
-                               u.f1("method '%s' needs the address of its receiver, but it is a temporary", f.name));
                 } else {
+                    // a temporary receiver gets a slot, as &temporary does
                     e.self_mode = ast.SELF_ADDR;
                     mark_addr_taken(recv);
                 }
@@ -2686,7 +2705,8 @@ fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
                     e.self_mode = ast.SELF_PASS;
                 } else if not is_place(recv) {
                     _ = dg.err(recv.span, "E0703",
-                               u.f1("method '%s' needs the address of its receiver, but it is a temporary", f.name));
+                               u.f1("method '%s' needs the mutable address of its receiver, but it is a temporary",
+                                    f.name));
                 } else {
                     if not is_mut_place(recv) {
                         not_mutable(recv, u.f1("call '%s' (it takes *mut Self)", f.name));

@@ -887,11 +887,17 @@ than unary operators: `-a.b` is `-(a.b)`, and `&a[i]` is `&(a[i])`.
 | `-%x` | signed or unsigned int, SIMD int | Wrapping negation, in every overflow mode |
 | `~x` | int, SIMD int, `v128` | Bitwise NOT |
 | `not x` | bool | Logical NOT |
-| `&x` | place | Address, of type `*T` |
+| `&x` | any value | Address, of type `*T` |
 | `&mut x` | mutable place | Address, of type `*mut T` |
 
 Applying `-` to an unsigned type, or a vector of unsigned lanes, is a compile error (`E0520`).
 Use `-%` or subtract from 0.
+
+`&x` of a place is the place's address. `&x` of any other value (a call's result, an
+arithmetic result, a literal) materializes the value in a hidden local of the enclosing
+function, and is that local's address: `f(&cfg.with_threads(2))` passes the builder's
+result by pointer. The local lives until the function returns, so the pointer stays
+valid for the rest of the function. `&mut` of a temporary is a compile error (`E0703`).
 
 ### 7.6 Integer arithmetic semantics
 
@@ -1181,12 +1187,12 @@ parameter of type `P`:
 
 | `x` is | `P` is `Self` | `P` is `*Self` | `P` is `*mut Self` |
 |---|---|---|---|
-| a value `T` | `T.m(x, args)` | `T.m(&x, args)`: `x` must be a place | `T.m(&mut x, args)`: `x` must be a mutable place |
+| a value `T` | `T.m(x, args)` | `T.m(&x, args)` (a temporary `x` gets a hidden local, §7.5) | `T.m(&mut x, args)`: `x` must be a mutable place |
 | `*T` | `T.m(x.*, args)` | `T.m(x, args)` | `E0702` |
 | `*mut T` | `T.m(x.*, args)` | `T.m(x, args)` | `T.m(x, args)` |
 
 This table is the whole of method-call sugar. Axiom has no multi-level auto-deref, no
-auto-ref of temporaries, and no trait lookup.
+`&mut` of temporaries, and no trait lookup.
 
 ### 9.4 Function pointers
 
@@ -2388,6 +2394,7 @@ Initial registry, not exhaustive:
 | E0650 | Undeclared error name |
 | E0701 | Assignment to an immutable place |
 | E0702 | `*mut Self` method called through `*T` |
+| E0703 | Mutable address of a temporary (`&mut`, or a `*mut Self` method on one) |
 | E0304 | Union or enum without variants (members) |
 | E0306 | Unknown ABI in `extern` (only `"C"`) |
 | E0307 | `...` outside `extern "C"`, or with no fixed parameter |

@@ -618,16 +618,31 @@ static Type *check_unary(Expr *e, Type *expected) {
         check_expr_to(&e->a, t_bool);
         return e->type = t_bool;
     case TK_AMP: {
-        check_operand(e->a, NULL);
+        // the pointee type expected, if any, types an untyped temporary
+        Type *hint = expected && expected->kind == TY_PTR ? expected->elem : NULL;
+        check_operand(e->a, hint);
         check_value(e->a);
+        if (ty_is_untyped(e->a->type)) {
+            if (hint) coerce(&e->a, hint);
+            else finalize_untyped(&e->a);
+        }
         Type *t = e->a->type;
         if (t->kind == TY_INVALID) return e->type = t_invalid;
         if (!is_place(e->a)) {
-            diag_error(e->a->span, "E0703", "cannot take the address of a temporary value");
-            return e->type = t_invalid;
+            // a temporary: codegen gives it a slot that lives to the end of
+            // the function (spec §7.5); only its immutable address is given
+            if (e->bval) {
+                diag_error(e->a->span, "E0703", "cannot take a mutable address of a temporary value");
+                return e->type = t_invalid;
+            }
+            if (t->kind == TY_VOID) {
+                diag_error(e->a->span, "E0703", "cannot take the address of a void value");
+                return e->type = t_invalid;
+            }
+        } else {
+            if (e->bval && !is_mut_place(e->a)) not_mutable(e->a, "take a mutable address");
+            mark_addr_taken(e->a);
         }
-        if (e->bval && !is_mut_place(e->a)) not_mutable(e->a, "take a mutable address");
-        mark_addr_taken(e->a);
         return e->type = type_ptr(t, e->bval);
     }
     case TK_MINUS: {
@@ -1182,10 +1197,8 @@ static Type *check_call(Expr *e, Type *expected) {
             case SELF_VALUE: e->self_mode = via_ptr ? SELF_DEREF : SELF_VALUE; break;
             case SELF_ADDR:
                 if (via_ptr) e->self_mode = SELF_PASS;
-                else if (!is_place(recv)) {
-                    diag_error(recv->span, "E0703", "method '%s' needs the address of its receiver, but it is a temporary",
-                               fn->name);
-                } else {
+                else {
+                    // a temporary receiver gets a slot, as &temporary does
                     e->self_mode = SELF_ADDR;
                     mark_addr_taken(recv);
                 }
@@ -1199,8 +1212,8 @@ static Type *check_call(Expr *e, Type *expected) {
                     }
                     e->self_mode = SELF_PASS;
                 } else if (!is_place(recv)) {
-                    diag_error(recv->span, "E0703", "method '%s' needs the address of its receiver, but it is a temporary",
-                               fn->name);
+                    diag_error(recv->span, "E0703",
+                               "method '%s' needs the mutable address of its receiver, but it is a temporary", fn->name);
                 } else {
                     if (!is_mut_place(recv)) not_mutable(recv, arena_printf("call '%s' (it takes *mut Self)", fn->name));
                     e->self_mode = SELF_ADDR;
