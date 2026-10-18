@@ -39,7 +39,9 @@ import "base64.ax" as base64;
 import "hex.ax" as hex;
 import "json.ax" as json;
 
-error { Truncated, Corrupt, TooDeep, TrailingData, WrongType, NotFound, OutOfMemory }
+pub error CborError { Truncated, Corrupt, TooDeep, TrailingData, WrongType, NotFound, OutOfMemory, IoError, BadFormat,
+                      Empty, SyntaxError, InvalidBase64, InvalidHex, Done, NoSpaceLeft, InvalidNumber, BadNesting,
+                      InvalidUtf8, EndOfStream }
 
 /// Nesting deeper than this is refused (error.TooDeep).
 pub const MAX_DEPTH: u32 = 512;
@@ -69,7 +71,7 @@ pub union Value {
     Float: f64,
 
     /// The entry with the text key `key` in a map.
-    pub fn get(self: Value, key: []u8) !Value {
+    pub fn get(self: Value, key: []u8) CborError!Value {
         match self {
             .Map(ps) => {
                 for p in ps {
@@ -88,7 +90,7 @@ pub union Value {
         }
     }
 
-    pub fn at(self: Value, i: usize) !Value {
+    pub fn at(self: Value, i: usize) CborError!Value {
         match self {
             .Array(xs) => {
                 if i >= xs.len {
@@ -110,7 +112,7 @@ pub union Value {
         }
     }
 
-    pub fn as_i64(self: Value) !i64 {
+    pub fn as_i64(self: Value) CborError!i64 {
         match self {
             .Uint(u) => {
                 if (u >> 63) != 0 {
@@ -128,7 +130,7 @@ pub union Value {
         }
     }
 
-    pub fn as_u64(self: Value) !u64 {
+    pub fn as_u64(self: Value) CborError!u64 {
         match self {
             .Uint(u) => { return u; }
             else     => { return error.WrongType; }
@@ -136,7 +138,7 @@ pub union Value {
     }
 
     /// Any number, as an f64.
-    pub fn as_f64(self: Value) !f64 {
+    pub fn as_f64(self: Value) CborError!f64 {
         match self {
             .Float(f) => { return f; }
             .Uint(u)  => { return @float_from_int(f64, u); }
@@ -145,35 +147,35 @@ pub union Value {
         }
     }
 
-    pub fn as_bool(self: Value) !bool {
+    pub fn as_bool(self: Value) CborError!bool {
         match self {
             .Bool(b) => { return b; }
             else     => { return error.WrongType; }
         }
     }
 
-    pub fn as_text(self: Value) ![]u8 {
+    pub fn as_text(self: Value) CborError![]u8 {
         match self {
             .Text(t) => { return t; }
             else     => { return error.WrongType; }
         }
     }
 
-    pub fn as_bytes(self: Value) ![]u8 {
+    pub fn as_bytes(self: Value) CborError![]u8 {
         match self {
             .Bytes(b) => { return b; }
             else      => { return error.WrongType; }
         }
     }
 
-    pub fn as_array(self: Value) ![]Value {
+    pub fn as_array(self: Value) CborError![]Value {
         match self {
             .Array(xs) => { return xs; }
             else       => { return error.WrongType; }
         }
     }
 
-    pub fn as_map(self: Value) ![]Pair {
+    pub fn as_map(self: Value) CborError![]Pair {
         match self {
             .Map(ps) => { return ps; }
             else     => { return error.WrongType; }
@@ -181,7 +183,7 @@ pub union Value {
     }
 
     /// A tagged value's content, if it has this tag.
-    pub fn untag(self: Value, tag: u64) !Value {
+    pub fn untag(self: Value, tag: u64) CborError!Value {
         match self {
             .Tag(t) => {
                 if t.tag == tag {
@@ -384,36 +386,43 @@ pub struct Writer {
 
     pub fn boolean(self: *mut Writer, b: bool) !void {
         if b {
-            return self.out.write_all("\xf5");
+            self.out.write_all("\xf5")!;
+            return;
         }
-        return self.out.write_all("\xf4");
+        self.out.write_all("\xf4")!;
+        return;
     }
 
     pub fn nil(self: *mut Writer) !void {
-        return self.out.write_all("\xf6");
+        self.out.write_all("\xf6")!;
+        return;
     }
 
     pub fn undefined(self: *mut Writer) !void {
-        return self.out.write_all("\xf7");
+        self.out.write_all("\xf7")!;
+        return;
     }
 
     /// A float, as the shortest of half, single and double precision that
     /// holds it exactly (NaN as the half-precision quiet NaN).
     pub fn float(self: *mut Writer, x: f64) !void {
         if x != x {
-            return self.out.write_all("\xf9\x7e\x00");
+            self.out.write_all("\xf9\x7e\x00")!;
+            return;
         }
         let mut h: u16 = 0;
         if f64_to_half(x, &mut h) {
             let b: [3]u8 = [0xf9, @truncate(u8, h >> 8), @truncate(u8, h)];
-            return self.out.write_all(b[..]);
+            self.out.write_all(b[..])!;
+            return;
         }
         let f = @float_cast(f32, x);
         if @as(f64, f) == x {
             let u = @bit_cast(u32, f);
             let b: [5]u8 = [
                 0xfa, @truncate(u8, u >> 24), @truncate(u8, u >> 16), @truncate(u8, u >> 8), @truncate(u8, u)];
-            return self.out.write_all(b[..]);
+            self.out.write_all(b[..])!;
+            return;
         }
         return self.float64(x);
     }
@@ -424,7 +433,8 @@ pub struct Writer {
         for k in @as(usize, 0)..8 {
             b[1 + k] = @truncate(u8, u >> @as(u64, 56 - (8 * k)));
         }
-        return self.out.write_all(b[..]);
+        self.out.write_all(b[..])!;
+        return;
     }
 
     /// Writes a whole value.
@@ -573,7 +583,7 @@ fn encode_with(v: Value, canonical: bool) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes the CBOR encoding of a value (preferred serialization) to w,
@@ -606,7 +616,7 @@ pub fn from_json_text(text: []u8) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 // -----------------------------------------------------------------------------
@@ -625,7 +635,7 @@ pub struct Document {
 }
 
 /// Decodes one data item that fills all of bytes.
-pub fn decode(bytes: []u8) !Document {
+pub fn decode(bytes: []u8) CborError!Document {
     let mut used: usize = 0;
     let mut doc = decode_prefix(bytes, &mut used)!;
     if used != bytes.len {
@@ -637,7 +647,7 @@ pub fn decode(bytes: []u8) !Document {
 
 /// Decodes the data item at the start of bytes (for a sequence of items,
 /// RFC 8742), and sets used to its length.
-pub fn decode_prefix(bytes: []u8, used: *mut usize) !Document {
+pub fn decode_prefix(bytes: []u8, used: *mut usize) CborError!Document {
     let mut d = Decoder.{ s: bytes, i: 0, arena: arena.Arena.init() };
     let v = d.item_tree() catch |e| {
         d.arena.deinit();
@@ -675,7 +685,7 @@ struct Decoder {
     i: usize,
     arena: arena.Arena,
 
-    fn byte(self: *mut Decoder) !u8 {
+    fn byte(self: *mut Decoder) CborError!u8 {
         if self.i >= self.s.len {
             return error.Truncated;
         }
@@ -684,7 +694,7 @@ struct Decoder {
         return b;
     }
 
-    fn take(self: *mut Decoder, n: u64) ![]u8 {
+    fn take(self: *mut Decoder, n: u64) CborError![]u8 {
         if n > @as(u64, self.s.len - self.i) {
             return error.Truncated;
         }
@@ -695,7 +705,7 @@ struct Decoder {
     }
 
     // The argument of a head with additional information ai (< 28).
-    fn arg(self: *mut Decoder, ai: u8) !u64 {
+    fn arg(self: *mut Decoder, ai: u8) CborError!u64 {
         if ai < 24 {
             return @as(u64, ai);
         }
@@ -716,7 +726,7 @@ struct Decoder {
     }
 
     // A string of major type 2 or 3; indefinite ones are joined.
-    fn string(self: *mut Decoder, major: u8, ai: u8) ![]u8 {
+    fn string(self: *mut Decoder, major: u8, ai: u8) CborError![]u8 {
         if ai != 31 {
             let n = self.arg(ai)!;
             let b = self.take(n)!;
@@ -741,12 +751,12 @@ struct Decoder {
             }
             all.push_str(b)!;
         }
-        return self.arena.dup(all.bytes());
+        return self.arena.dup(all.bytes())!;
     }
 
     // Reads one head: a value into v, or a container's header (its length
     // into n, or NONE for indefinite).
-    fn head(self: *mut Decoder, v: *mut Value, n: *mut u64) !Head {
+    fn head(self: *mut Decoder, v: *mut Value, n: *mut u64) CborError!Head {
         let b = self.byte()!;
         let major = b >> 5;
         let ai = b & 31;
@@ -817,7 +827,7 @@ struct Decoder {
     }
 
     // One data item, with its nested items, read with an explicit stack.
-    fn item_tree(self: *mut Decoder) !Value {
+    fn item_tree(self: *mut Decoder) CborError!Value {
         let mut frames = vec.Vec.[Frame].init();
         defer frames.deinit();
         let mut vals = vec.Vec.[Value].init();
@@ -896,7 +906,7 @@ struct Decoder {
     }
 
     // Builds a finished container from its items (removing them).
-    fn close(self: *mut Decoder, f: Frame, vals: *mut vec.Vec.[Value], pairs: *mut vec.Vec.[Pair]) !Value {
+    fn close(self: *mut Decoder, f: Frame, vals: *mut vec.Vec.[Value], pairs: *mut vec.Vec.[Pair]) CborError!Value {
         let items = vals.items()[f.start..];
         let mut v = Value.Null;
         if f.kind == FrameKind.MAP {
@@ -1007,13 +1017,16 @@ struct Item {
 
 fn diag_float(out: io.Writer, f: f64) !void {
     if f != f {
-        return out.write_all("NaN");
+        out.write_all("NaN")!;
+        return;
     }
     if (f - f) != 0.0 {
         if f > 0.0 {
-            return out.write_all("Infinity");
+            out.write_all("Infinity")!;
+            return;
         }
-        return out.write_all("-Infinity");
+        out.write_all("-Infinity")!;
+        return;
     }
     let mut buf = strs.String.init();
     defer buf.deinit();
@@ -1036,7 +1049,7 @@ pub fn diagnostic_alloc(v: Value) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes a value as JSON (RFC 8949 section 6.1): byte strings as base64url,
@@ -1237,7 +1250,7 @@ test "writing" {
     @expect_eq(dd, "[1, -2, 2.5, \"x\", {\"k\": null}]");
 }
 
-fn fails(r: !Document) bool {
+fn fails(r: CborError!Document) bool {
     let mut d = r catch return true;
     d.deinit();
     return false;

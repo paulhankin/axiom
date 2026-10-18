@@ -30,7 +30,8 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "json.ax" as json;
 
-error { SyntaxError, TooDeep, NotFound, WrongType, OutOfMemory }
+pub error TomlError { SyntaxError, TooDeep, NotFound, WrongType, OutOfMemory, IoError, BadFormat, Empty, Done,
+                      InvalidNumber, EndOfStream, InvalidUtf8 }
 
 /// Tables and arrays nested deeper than this are refused.
 pub const MAX_DEPTH: u32 = 256;
@@ -123,7 +124,7 @@ pub union Value {
 
     /// The value of key in a table: NotFound if absent, WrongType if this is
     /// not a table.
-    pub fn get(self: Value, key: []u8) !Value {
+    pub fn get(self: Value, key: []u8) TomlError!Value {
         match self {
             .Table(ms) => {
                 for m in ms {
@@ -138,7 +139,7 @@ pub union Value {
     }
 
     /// Follows a dotted path of bare keys: path("a.b.c").
-    pub fn path(self: Value, p: []u8) !Value {
+    pub fn path(self: Value, p: []u8) TomlError!Value {
         let mut v = self;
         let mut it = strs.split(p, ".");
         while true {
@@ -148,7 +149,7 @@ pub union Value {
         return v;
     }
 
-    pub fn at(self: Value, i: usize) !Value {
+    pub fn at(self: Value, i: usize) TomlError!Value {
         match self {
             .Array(xs) => {
                 if i >= xs.len {
@@ -169,14 +170,14 @@ pub union Value {
         }
     }
 
-    pub fn as_str(self: Value) ![]u8 {
+    pub fn as_str(self: Value) TomlError![]u8 {
         match self {
             .String(s) => { return s; }
             else       => { return error.WrongType; }
         }
     }
 
-    pub fn as_i64(self: Value) !i64 {
+    pub fn as_i64(self: Value) TomlError!i64 {
         match self {
             .Int(x) => { return x; }
             else    => { return error.WrongType; }
@@ -184,7 +185,7 @@ pub union Value {
     }
 
     /// A float, or an integer as a float.
-    pub fn as_f64(self: Value) !f64 {
+    pub fn as_f64(self: Value) TomlError!f64 {
         match self {
             .Float(x) => { return x; }
             .Int(x)   => { return @float_from_int(f64, x); }
@@ -192,28 +193,28 @@ pub union Value {
         }
     }
 
-    pub fn as_bool(self: Value) !bool {
+    pub fn as_bool(self: Value) TomlError!bool {
         match self {
             .Bool(b) => { return b; }
             else     => { return error.WrongType; }
         }
     }
 
-    pub fn as_datetime(self: Value) !DateTime {
+    pub fn as_datetime(self: Value) TomlError!DateTime {
         match self {
             .DateTime(d) => { return d; }
             else         => { return error.WrongType; }
         }
     }
 
-    pub fn as_array(self: Value) ![]Value {
+    pub fn as_array(self: Value) TomlError![]Value {
         match self {
             .Array(xs) => { return xs; }
             else       => { return error.WrongType; }
         }
     }
 
-    pub fn as_table(self: Value) ![]Member {
+    pub fn as_table(self: Value) TomlError![]Member {
         match self {
             .Table(ms) => { return ms; }
             else       => { return error.WrongType; }
@@ -278,7 +279,7 @@ struct Parser {
     scratch: strs.String,
     msg: []u8,
 
-    fn fail(self: *mut Parser, m: []u8) error {
+    fn fail(self: *mut Parser, m: []u8) TomlError {
         if self.msg.len == 0 {
             self.msg = m;
         }
@@ -314,7 +315,7 @@ struct Parser {
         return NIL;
     }
 
-    fn new_node(self: *mut Parser, kind: NodeKind, depth: u32) !u32 {
+    fn new_node(self: *mut Parser, kind: NodeKind, depth: u32) TomlError!u32 {
         if depth > MAX_DEPTH {
             return error.TooDeep;
         }
@@ -326,7 +327,7 @@ struct Parser {
     }
 
     // Links child n under parent with key (for arrays, key is "").
-    fn attach(self: *mut Parser, parent: u32, key: []u8, n: u32) !void {
+    fn attach(self: *mut Parser, parent: u32, key: []u8, n: u32) TomlError!void {
         let pd = self.node(parent).depth;
         self.set_depth(n, pd + 1)!;
         let k = self.arena.dup(key)!;
@@ -355,7 +356,7 @@ struct Parser {
     }
 
     // Inline values are built before they are attached: fix their depths.
-    fn set_depth(self: *mut Parser, n: u32, d: u32) !void {
+    fn set_depth(self: *mut Parser, n: u32, d: u32) TomlError!void {
         if d > MAX_DEPTH {
             return error.TooDeep;
         }
@@ -371,7 +372,7 @@ struct Parser {
         }
     }
 
-    fn table_child(self: *mut Parser, parent: u32, key: []u8) !u32 {
+    fn table_child(self: *mut Parser, parent: u32, key: []u8) TomlError!u32 {
         let pd = self.node(parent).depth;
         let n = self.new_node(NodeKind.TABLE, pd + 1)!;
         self.attach(parent, key, n)!;
@@ -387,7 +388,7 @@ struct Parser {
     }
 
     // A comment, if there is one, up to (not including) the line end.
-    fn skip_comment(self: *mut Parser) !void {
+    fn skip_comment(self: *mut Parser) TomlError!void {
         if self.peek() != '#' {
             return;
         }
@@ -404,7 +405,7 @@ struct Parser {
     }
 
     // A line end (or the end of the input).
-    fn newline(self: *mut Parser) !void {
+    fn newline(self: *mut Parser) TomlError!void {
         if self.at_end() {
             return;
         }
@@ -419,14 +420,14 @@ struct Parser {
         return self.fail("expected the end of the line");
     }
 
-    fn end_of_line(self: *mut Parser) !void {
+    fn end_of_line(self: *mut Parser) TomlError!void {
         self.skip_ws();
         self.skip_comment()!;
         self.newline()!;
     }
 
     // White space, comments and line ends, inside arrays.
-    fn skip_ws_comments_newlines(self: *mut Parser) !void {
+    fn skip_ws_comments_newlines(self: *mut Parser) TomlError!void {
         loop {
             self.skip_ws();
             self.skip_comment()!;
@@ -445,7 +446,7 @@ struct Parser {
     // --- keys -------------------------------------------------------------------
 
     // A dotted key, its parts appended to parts (arena copies).
-    fn key(self: *mut Parser, parts: *mut vec.Vec.[[]u8]) !void {
+    fn key(self: *mut Parser, parts: *mut vec.Vec.[[]u8]) TomlError!void {
         loop {
             self.skip_ws();
             let c = self.peek();
@@ -479,11 +480,11 @@ struct Parser {
 
     // --- strings (into scratch) ---------------------------------------------------
 
-    fn push_char(self: *mut Parser, c: u8) !void {
+    fn push_char(self: *mut Parser, c: u8) TomlError!void {
         self.scratch.push(c)!;
     }
 
-    fn escape(self: *mut Parser) !void {
+    fn escape(self: *mut Parser) TomlError!void {
         // at the backslash
         self.i += 1;
         if self.at_end() {
@@ -505,7 +506,7 @@ struct Parser {
         }
     }
 
-    fn unicode_escape(self: *mut Parser, n: usize) !void {
+    fn unicode_escape(self: *mut Parser, n: usize) TomlError!void {
         if (self.i + n) > self.s.len {
             return self.fail("short unicode escape");
         }
@@ -526,7 +527,7 @@ struct Parser {
     }
 
     // Checks one character of string content (not a quote or backslash).
-    fn content_char(self: *mut Parser, multiline: bool) !void {
+    fn content_char(self: *mut Parser, multiline: bool) TomlError!void {
         let c = self.s[self.i];
         if (c == '\n') and multiline {
             self.push_char('\n')!;
@@ -545,7 +546,7 @@ struct Parser {
         self.i += 1;
     }
 
-    fn basic_string(self: *mut Parser) !void {
+    fn basic_string(self: *mut Parser) TomlError!void {
         self.scratch.clear();
         if ((self.i + 2) < self.s.len) and (self.s[self.i + 1] == '"') and (self.s[self.i + 2] == '"') {
             return self.multiline_basic();
@@ -568,7 +569,7 @@ struct Parser {
         }
     }
 
-    fn multiline_basic(self: *mut Parser) !void {
+    fn multiline_basic(self: *mut Parser) TomlError!void {
         self.i += 3;
         self.first_newline();
         loop {
@@ -623,7 +624,7 @@ struct Parser {
 
     // At a run of quote characters in a multi-line string: whether it closes
     // the string (up to two quotes before the closing three are content).
-    fn closing_quotes(self: *mut Parser, q: u8) !bool {
+    fn closing_quotes(self: *mut Parser, q: u8) TomlError!bool {
         let mut n: usize = 0;
         while ((self.i + n) < self.s.len) and (self.s[self.i + n] == q) {
             n += 1;
@@ -645,7 +646,7 @@ struct Parser {
         return true;
     }
 
-    fn literal_string(self: *mut Parser) !void {
+    fn literal_string(self: *mut Parser) TomlError!void {
         self.scratch.clear();
         if ((self.i + 2) < self.s.len) and (self.s[self.i + 1] == '\'') and (self.s[self.i + 2] == '\'') {
             self.i += 3;
@@ -680,7 +681,7 @@ struct Parser {
 
     // A value: scalars come back as a VALUE node, arrays and inline tables
     // as detached nodes.
-    fn value(self: *mut Parser, depth: u32) !u32 {
+    fn value(self: *mut Parser, depth: u32) TomlError!u32 {
         let c = self.peek();
         if c == '"' {
             self.basic_string()!;
@@ -705,7 +706,7 @@ struct Parser {
         return self.leaf(self.number_or_date()!, depth);
     }
 
-    fn leaf(self: *mut Parser, v: Value, depth: u32) !u32 {
+    fn leaf(self: *mut Parser, v: Value, depth: u32) TomlError!u32 {
         let n = self.new_node(NodeKind.VALUE, depth)!;
         self.node(n).value = v;
         return n;
@@ -724,7 +725,7 @@ struct Parser {
         return false;
     }
 
-    fn array(self: *mut Parser, depth: u32) !u32 {
+    fn array(self: *mut Parser, depth: u32) TomlError!u32 {
         self.i += 1;
         let a = self.new_node(NodeKind.ARRAY, depth)!;
         loop {
@@ -751,7 +752,7 @@ struct Parser {
         return a;
     }
 
-    fn inline_table(self: *mut Parser, depth: u32) !u32 {
+    fn inline_table(self: *mut Parser, depth: u32) TomlError!u32 {
         self.i += 1;
         let t = self.new_node(NodeKind.TABLE, depth)!;
         self.skip_ws();
@@ -790,7 +791,7 @@ struct Parser {
     // key = value under table t (the value is next in the input). In a
     // section (not an inline table), the containers the dotted key passes
     // become explicit at the next header.
-    fn assign(self: *mut Parser, t: u32, parts: [][]u8, section: bool) !void {
+    fn assign(self: *mut Parser, t: u32, parts: [][]u8, section: bool) TomlError!void {
         let mut cur = t;
         for k in @as(usize, 0)..parts.len - 1 {
             let mut n = self.find(cur, parts[k]);
@@ -816,7 +817,7 @@ struct Parser {
     }
 
     // A number, date or time.
-    fn number_or_date(self: *mut Parser) !Value {
+    fn number_or_date(self: *mut Parser) TomlError!Value {
         let st = self.i;
         // dates and times: digits then - or :
         if ((st + 4) < self.s.len) and is_digit4(self.s[st..st + 4]) and (self.s[st + 4] == '-') {
@@ -839,7 +840,7 @@ struct Parser {
         return parse_number(tok) catch return self.fail("invalid number");
     }
 
-    fn digits(self: *mut Parser, n: usize) !u32 {
+    fn digits(self: *mut Parser, n: usize) TomlError!u32 {
         if (self.i + n) > self.s.len {
             return self.fail("invalid date or time");
         }
@@ -855,14 +856,14 @@ struct Parser {
         return v;
     }
 
-    fn expect(self: *mut Parser, c: u8) !void {
+    fn expect(self: *mut Parser, c: u8) TomlError!void {
         if self.peek() != c {
             return self.fail("invalid date or time");
         }
         self.i += 1;
     }
 
-    fn datetime(self: *mut Parser) !DateTime {
+    fn datetime(self: *mut Parser) TomlError!DateTime {
         let mut d = DateTime.{ kind: DateTimeKind.LOCAL_DATE, year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0,
                                nanosecond: 0, offset_minutes: 0 };
         d.year = @truncate(u16, self.digits(4)!);
@@ -906,7 +907,7 @@ struct Parser {
         return d;
     }
 
-    fn time(self: *mut Parser, d: *mut DateTime) !void {
+    fn time(self: *mut Parser, d: *mut DateTime) TomlError!void {
         d.hour = @truncate(u8, self.digits(2)!);
         self.expect(':')!;
         d.minute = @truncate(u8, self.digits(2)!);
@@ -943,7 +944,7 @@ struct Parser {
 
     // --- the document ---------------------------------------------------------------
 
-    fn header_path(self: *mut Parser, parts: [][]u8) !u32 {
+    fn header_path(self: *mut Parser, parts: [][]u8) TomlError!u32 {
         // the containers on the way: create them, or go into them
         let mut cur: u32 = 0;
         for k in @as(usize, 0)..parts.len - 1 {
@@ -964,7 +965,7 @@ struct Parser {
         return cur;
     }
 
-    fn document(self: *mut Parser) !void {
+    fn document(self: *mut Parser) TomlError!void {
         let mut parts = vec.Vec.[[]u8].init();
         defer parts.deinit();
         let mut cur: u32 = 0;
@@ -1032,7 +1033,7 @@ struct Parser {
         }
     }
 
-    fn expect_close(self: *mut Parser, aot: bool) !void {
+    fn expect_close(self: *mut Parser, aot: bool) TomlError!void {
         if self.peek() != ']' {
             return self.fail("expected ] after a table name");
         }
@@ -1047,7 +1048,7 @@ struct Parser {
 
     // --- freezing the tree into Values ------------------------------------------------
 
-    fn build(self: *mut Parser, n: u32) !Value {
+    fn build(self: *mut Parser, n: u32) TomlError!Value {
         let nd = self.node(n).*;
         if nd.kind == NodeKind.VALUE {
             return nd.value;
@@ -1120,7 +1121,7 @@ fn days_in(y: u16, m: u8) u8 {
 }
 
 // Underscores must sit between two digits (of the given base).
-fn strip_underscores(tok: []u8, out: []mut u8, base: u32) ![]u8 {
+fn strip_underscores(tok: []u8, out: []mut u8, base: u32) TomlError![]u8 {
     let mut n: usize = 0;
     for k in @as(usize, 0)..tok.len {
         let c = tok[k];
@@ -1148,7 +1149,7 @@ fn digit_value(c: u8) u32 {
     return @as(u32, v);
 }
 
-fn parse_number(tok: []u8) !Value {
+fn parse_number(tok: []u8) TomlError!Value {
     let mut buf: [128]u8 = [0; 128];
     // special floats
     let mut body = tok;
@@ -1280,13 +1281,13 @@ fn parse_number(tok: []u8) !Value {
 }
 
 /// Parses a TOML document.
-pub fn parse(text: []u8) !Document {
+pub fn parse(text: []u8) TomlError!Document {
     let mut info = ErrorInfo.{ offset: 0, line: 0, column: 0, message: "" };
     return parse_with(text, &mut info);
 }
 
 /// Parses a TOML document; on SyntaxError (or TooDeep) info says where.
-pub fn parse_with(text: []u8, info: *mut ErrorInfo) !Document {
+pub fn parse_with(text: []u8, info: *mut ErrorInfo) TomlError!Document {
     let mut doc = Document.{ root: Value.Bool(false), arena: arena.Arena.init() };
     let r = parse_into(text, &mut doc, info);
     r catch |e| {
@@ -1296,7 +1297,7 @@ pub fn parse_with(text: []u8, info: *mut ErrorInfo) !Document {
     return doc;
 }
 
-fn parse_into(text: []u8, doc: *mut Document, info: *mut ErrorInfo) !void {
+fn parse_into(text: []u8, doc: *mut Document, info: *mut ErrorInfo) TomlError!void {
     let mut p = Parser.{
         s: text,
         i: 0,
@@ -1321,7 +1322,7 @@ fn parse_into(text: []u8, doc: *mut Document, info: *mut ErrorInfo) !void {
     doc.root = p.build(0)!;
 }
 
-fn parse_doc(p: *mut Parser) !void {
+fn parse_doc(p: *mut Parser) TomlError!void {
     if not strs.valid_utf8(p.s) {
         // find the first bad byte, for the message's position
         let mut k: usize = 0;
@@ -1373,7 +1374,7 @@ pub fn stringify(root: Value) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes a table as a TOML document (see stringify) to w, through a 4 KB

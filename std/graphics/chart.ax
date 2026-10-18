@@ -65,7 +65,9 @@ import "pdf.ax" as pdf;
 import "pdf/read.ax" as read;
 import "svg.ax" as svg;
 
-error { OutOfMemory, InvalidSeries, FontNotFound, Unsupported }
+pub error ChartError { OutOfMemory, InvalidSeries, FontNotFound, Unsupported, InvalidPath, Corrupt, IoError,
+                       SyntaxError, Empty, Finished, EndOfStream, NotFound, TooComplex, TooLarge, ChecksumMismatch,
+                       Done, NoSpaceLeft, InvalidBase64, InvalidUtf8, PermissionDenied, Truncated, InvalidFeature }
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -227,7 +229,7 @@ pub fn srgb(rgb: u32) color.Color {
 
 /// A sans-serif font from the system (DejaVu Sans, Liberation Sans or
 /// Arial), or FontNotFound.
-pub fn find_font() !font.Font {
+pub fn find_font() ChartError!font.Font {
     // places they are often found, on Linux, macOS and Windows
     let paths: [9][]u8 = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -641,13 +643,13 @@ pub struct Chart {
         self.has_font = true;
     }
 
-    pub fn set_title(self: *mut Chart, s: []u8) !void {
+    pub fn set_title(self: *mut Chart, s: []u8) ChartError!void {
         let t = mem.dup(s)!;
         mem.free(self.title);
         self.title = t;
     }
 
-    pub fn set_axis_titles(self: *mut Chart, xtitle: []u8, ytitle: []u8) !void {
+    pub fn set_axis_titles(self: *mut Chart, xtitle: []u8, ytitle: []u8) ChartError!void {
         let a = mem.dup(xtitle)!;
         let b = mem.dup(ytitle) catch |e| {
             mem.free(a);
@@ -667,7 +669,7 @@ pub struct Chart {
     }
 
     /// Names for the categories: bars, points without xs, and pie slices.
-    pub fn set_categories(self: *mut Chart, names: [][]u8) !void {
+    pub fn set_categories(self: *mut Chart, names: [][]u8) ChartError!void {
         self.clear_categories();
         for s in names {
             let d = mem.dup(s)!;
@@ -696,7 +698,7 @@ pub struct Chart {
     /// Adds a series, copying its data, and returns its index. xs may be
     /// empty (x is then each point's index: its category); otherwise it is
     /// as long as ys.
-    pub fn add(self: *mut Chart, kind: Kind, name: []u8, xs: []f64, ys: []f64) !usize {
+    pub fn add(self: *mut Chart, kind: Kind, name: []u8, xs: []f64, ys: []f64) ChartError!usize {
         if (xs.len > 0) and (xs.len != ys.len) {
             return error.InvalidSeries;
         }
@@ -736,30 +738,30 @@ pub struct Chart {
         return self.series.len - 1;
     }
 
-    pub fn line(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+    pub fn line(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) ChartError!usize {
         return self.add(Kind.LINE, name, xs, ys);
     }
 
-    pub fn step(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+    pub fn step(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) ChartError!usize {
         return self.add(Kind.STEP, name, xs, ys);
     }
 
-    pub fn scatter(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+    pub fn scatter(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) ChartError!usize {
         return self.add(Kind.SCATTER, name, xs, ys);
     }
 
-    pub fn area(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) !usize {
+    pub fn area(self: *mut Chart, name: []u8, xs: []f64, ys: []f64) ChartError!usize {
         return self.add(Kind.AREA, name, xs, ys);
     }
 
     /// Bars: one value a category.
-    pub fn bar(self: *mut Chart, name: []u8, values: []f64) !usize {
+    pub fn bar(self: *mut Chart, name: []u8, values: []f64) ChartError!usize {
         return self.add(Kind.BAR, name, values[..0], values);
     }
 
     /// A pie of the values (negative ones count as 0), its slices named by
     /// the categories. A chart with a pie draws only the pie.
-    pub fn pie(self: *mut Chart, values: []f64) !usize {
+    pub fn pie(self: *mut Chart, values: []f64) ChartError!usize {
         return self.add(Kind.PIE, "", values[..0], values);
     }
 
@@ -845,7 +847,7 @@ pub struct Chart {
         return true;
     }
 
-    fn pie_index(self: *Chart) !usize {
+    fn pie_index(self: *Chart) ChartError!usize {
         for i in @as(usize, 0)..self.series.len {
             if self.ser(i).kind == Kind.PIE {
                 return i;
@@ -944,7 +946,7 @@ pub struct Chart {
     }
 
     /// The y range of the data, stacked where it stacks.
-    fn y_ticks(self: *Chart, want: usize) !Ticks {
+    fn y_ticks(self: *Chart, want: usize) ChartError!Ticks {
         let log = self.y.scale == Scale.LOG;
         let mut lo = math.inf();
         let mut hi = -math.inf();
@@ -1416,7 +1418,7 @@ pub struct Chart {
 
     /// The points of series i in plot coordinates, skipping what cannot be
     /// shown; a NaN pair marks a break.
-    fn points(self: *Chart, pl: *Plot, i: usize, out: *mut vec.Vec.[f64]) !void {
+    fn points(self: *Chart, pl: *Plot, i: usize, out: *mut vec.Vec.[f64]) ChartError!void {
         let s = self.ser(i);
         out.clear();
         for k in @as(usize, 0)..s.count() {
@@ -1644,7 +1646,7 @@ pub struct Chart {
             s.deinit();
             return e;
         };
-        return s.take();
+        return s.take()!;
     }
 
     /// Draws the chart on its own page (w by h points) of a PDF document.
@@ -1660,7 +1662,7 @@ pub struct Chart {
         let mut doc = pdf.Document.init();
         defer doc.deinit();
         self.add_page(&mut doc, w, h)!;
-        return doc.bytes();
+        return doc.bytes()!;
     }
 
     /// Saves the chart, in the format the file name's extension names:
@@ -1709,7 +1711,7 @@ fn line_stroke(width: f64, dashed: bool) draw.Stroke {
 }
 
 /// Adds a marker of radius r at (x, y) to p.
-fn marker_path(p: *mut draw.Path, m: Marker, x: f64, y: f64, r: f64) !void {
+fn marker_path(p: *mut draw.Path, m: Marker, x: f64, y: f64, r: f64) ChartError!void {
     match m {
         .NONE => {}
         .CIRCLE => { p.circle(x, y, r)!; }

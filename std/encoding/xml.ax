@@ -35,7 +35,8 @@ import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 
-error { SyntaxError, TooDeep, TooLarge, Unsupported, NotFound, OutOfMemory, BadNesting }
+pub error XmlError { SyntaxError, TooDeep, TooLarge, Unsupported, NotFound, OutOfMemory, BadNesting, IoError, Empty,
+                     Done, InvalidUtf8 }
 
 /// Elements nested deeper than this are refused.
 pub const MAX_DEPTH: usize = 1024;
@@ -117,7 +118,7 @@ fn is_nmtoken(s: []u8) bool {
 // -----------------------------------------------------------------------------
 
 // The document as UTF-8 with normalized line ends, in the arena.
-fn decode_input(text: []u8, a: *mut arena.Arena, msg: *mut []u8) ![]u8 {
+fn decode_input(text: []u8, a: *mut arena.Arena, msg: *mut []u8) XmlError![]u8 {
     let mut s = strs.String.init();
     defer s.deinit();
     if (text.len >= 2) and (((text[0] == 0xfe) and (text[1] == 0xff)) or ((text[0] == 0xff) and (text[1] == 0xfe))) {
@@ -323,13 +324,13 @@ pub struct Reader {
     line: u32,
 
     /// A reader over text (copied and decoded, so text may be freed).
-    pub fn init(text: []u8, opts: Options) !Reader {
+    pub fn init(text: []u8, opts: Options) XmlError!Reader {
         let mut m: []u8 = "";
         return Reader.init_info(text, opts, &mut m);
     }
 
     /// As init; on failure, msg says why.
-    pub fn init_info(text: []u8, opts: Options, msg: *mut []u8) !Reader {
+    pub fn init_info(text: []u8, opts: Options, msg: *mut []u8) XmlError!Reader {
         let mut r = Reader.{
             ar: arena.Arena.init(),
             opts: opts,
@@ -400,7 +401,7 @@ pub struct Reader {
         return self.line;
     }
 
-    fn fail(self: *mut Reader, m: []u8) error {
+    fn fail(self: *mut Reader, m: []u8) XmlError {
         if self.msg.len == 0 {
             self.msg = m;
             let doc = self.src.get(0);
@@ -445,7 +446,7 @@ pub struct Reader {
         self.cur().pos += n;
     }
 
-    fn expect(self: *mut Reader, w: []u8, m: []u8) !void {
+    fn expect(self: *mut Reader, w: []u8, m: []u8) XmlError!void {
         if not self.looking_at(w) {
             return self.fail(m);
         }
@@ -461,7 +462,7 @@ pub struct Reader {
         return any;
     }
 
-    fn name(self: *mut Reader) ![]u8 {
+    fn name(self: *mut Reader) XmlError![]u8 {
         let s = self.cur();
         let st = s.pos;
         let mut i = st;
@@ -484,7 +485,7 @@ pub struct Reader {
 
     // --- the XML declaration -----------------------------------------------------------
 
-    fn xml_decl(self: *mut Reader) !void {
+    fn xml_decl(self: *mut Reader) XmlError!void {
         if not (self.looking_at("<?xml") and is_space(self.at(5))) {
             return;
         }
@@ -559,7 +560,7 @@ pub struct Reader {
 
     /// The next token; TokenKind.END_DOCUMENT at the end. Strings live as long as
     /// the Reader.
-    pub fn next(self: *mut Reader) !Token {
+    pub fn next(self: *mut Reader) XmlError!Token {
         if self.pending_end {
             self.pending_end = false;
             self.close_scope(self.pending_depth);
@@ -644,7 +645,7 @@ pub struct Reader {
 
     // Text up to the next markup, with references resolved (entity
     // references with markup push their text as a new source).
-    fn char_data(self: *mut Reader) !Token {
+    fn char_data(self: *mut Reader) XmlError!Token {
         self.buf.clear();
         loop {
             if self.eof() {
@@ -673,7 +674,7 @@ pub struct Reader {
 
     // At '&' in content: appends a character or predefined entity to buf, or
     // pushes an entity's text (returns true).
-    fn reference_in_content(self: *mut Reader) !bool {
+    fn reference_in_content(self: *mut Reader) XmlError!bool {
         if self.at(1) == '#' {
             self.char_ref(&mut self.buf)!;
             return false;
@@ -703,7 +704,7 @@ pub struct Reader {
         return true;
     }
 
-    fn push_entity(self: *mut Reader, name: []u8, value: []u8, in_attr: bool) !void {
+    fn push_entity(self: *mut Reader, name: []u8, value: []u8, in_attr: bool) XmlError!void {
         for s in self.src.items() {
             if strs.eq(s.entity, name) {
                 return self.fail("recursive entity reference");
@@ -719,7 +720,7 @@ pub struct Reader {
         self.src.push(Source.{ text: value, pos: 0, entity: name, in_attr: in_attr })!;
     }
 
-    fn char_ref(self: *mut Reader, out: *mut strs.String) !void {
+    fn char_ref(self: *mut Reader, out: *mut strs.String) XmlError!void {
         self.advance(2);
         let mut v: u32 = 0;
         let mut digits: usize = 0;
@@ -752,7 +753,7 @@ pub struct Reader {
         out.push_str(strs.encode_rune(b[..], v))!;
     }
 
-    fn comment(self: *mut Reader) !Token {
+    fn comment(self: *mut Reader) XmlError!Token {
         self.advance(4);
         let s = self.cur();
         let st = s.pos;
@@ -766,7 +767,7 @@ pub struct Reader {
         return t;
     }
 
-    fn cdata(self: *mut Reader) !Token {
+    fn cdata(self: *mut Reader) XmlError!Token {
         self.advance(9);
         let s = self.cur();
         let st = s.pos;
@@ -777,7 +778,7 @@ pub struct Reader {
         return t;
     }
 
-    fn pi(self: *mut Reader) !Token {
+    fn pi(self: *mut Reader) XmlError!Token {
         self.advance(2);
         let target = self.name()!;
         if (target.len == 3) and ((target[0] | 32) == 'x') and ((target[1] | 32) == 'm') and ((target[2] | 32) == 'l') {
@@ -808,7 +809,7 @@ pub struct Reader {
 
     // --- elements ------------------------------------------------------------------------
 
-    fn start_tag(self: *mut Reader) !Token {
+    fn start_tag(self: *mut Reader) XmlError!Token {
         self.advance(1);
         let qname = self.name()!;
         self.attrs.clear();
@@ -879,7 +880,7 @@ pub struct Reader {
         return t;
     }
 
-    fn end_tag(self: *mut Reader) !Token {
+    fn end_tag(self: *mut Reader) XmlError!Token {
         self.advance(2);
         let n = self.name()!;
         _ = self.skip_space();
@@ -917,7 +918,7 @@ pub struct Reader {
     // A quoted attribute value, normalized (white space to spaces;
     // references resolved; for non-CDATA declared types, trimmed and
     // collapsed).
-    fn attr_value(self: *mut Reader, element: []u8, name: []u8) ![]u8 {
+    fn attr_value(self: *mut Reader, element: []u8, name: []u8) XmlError![]u8 {
         let q = self.at(0);
         if (q != '"') and (q != '\'') {
             return self.fail("expected a quoted attribute value");
@@ -982,7 +983,7 @@ pub struct Reader {
                 break;
             }
         }
-        return self.ar.dup(v);
+        return self.ar.dup(v)!;
     }
 
     // --- namespaces -----------------------------------------------------------------------
@@ -1024,7 +1025,7 @@ pub struct Reader {
     }
 
     // Declares the element's namespaces and resolves its names.
-    fn namespaces(self: *mut Reader, qname: []u8, depth: usize, t: *mut Token) !void {
+    fn namespaces(self: *mut Reader, qname: []u8, depth: usize, t: *mut Token) XmlError!void {
         let attrs = self.attrs.items();
         for i in @as(usize, 0)..attrs.len {
             let a = attrs[i];
@@ -1121,7 +1122,7 @@ pub struct Reader {
 
     // --- the DOCTYPE --------------------------------------------------------------------
 
-    fn doctype(self: *mut Reader) !Token {
+    fn doctype(self: *mut Reader) XmlError!Token {
         self.advance(9);
         if not self.skip_space() {
             return self.fail("expected white space after DOCTYPE");
@@ -1149,7 +1150,7 @@ pub struct Reader {
         return t;
     }
 
-    fn quoted(self: *mut Reader) ![]u8 {
+    fn quoted(self: *mut Reader) XmlError![]u8 {
         let q = self.at(0);
         if (q != '"') and (q != '\'') {
             return self.fail("expected a quoted literal");
@@ -1169,7 +1170,7 @@ pub struct Reader {
     }
 
     // SYSTEM "uri" or PUBLIC "id" "uri" (the URI optional for notations).
-    fn external_id(self: *mut Reader, notation: bool) !void {
+    fn external_id(self: *mut Reader, notation: bool) XmlError!void {
         if self.looking_at("SYSTEM") {
             self.advance(6);
             if not self.skip_space() {
@@ -1200,7 +1201,7 @@ pub struct Reader {
         _ = self.quoted()!;
     }
 
-    fn internal_subset(self: *mut Reader) !void {
+    fn internal_subset(self: *mut Reader) XmlError!void {
         let base = self.src.len;
         loop {
             _ = self.skip_space();
@@ -1258,7 +1259,7 @@ pub struct Reader {
     }
 
     // Skips a declaration to its >, over quoted literals.
-    fn skip_decl(self: *mut Reader) !void {
+    fn skip_decl(self: *mut Reader) XmlError!void {
         let notation = self.looking_at("<!NOTATION");
         self.advance(2);
         let _kw = self.name()!;
@@ -1303,7 +1304,7 @@ pub struct Reader {
 
     // <!ELEMENT name contentspec>: checked, not kept (the parser does not
     // validate).
-    fn element_decl(self: *mut Reader) !void {
+    fn element_decl(self: *mut Reader) XmlError!void {
         self.advance(9);
         if not self.skip_space() {
             return self.fail("expected white space after ELEMENT");
@@ -1356,7 +1357,7 @@ pub struct Reader {
     }
 
     // A choice or sequence (or a name), with an optional ?, * or +.
-    fn content_particle(self: *mut Reader, depth: usize) !void {
+    fn content_particle(self: *mut Reader, depth: usize) XmlError!void {
         if depth > 64 {
             return error.TooDeep;
         }
@@ -1395,7 +1396,7 @@ pub struct Reader {
         }
     }
 
-    fn entity_decl(self: *mut Reader) !void {
+    fn entity_decl(self: *mut Reader) XmlError!void {
         self.advance(8);
         if not self.skip_space() {
             return self.fail("expected white space after ENTITY");
@@ -1455,7 +1456,7 @@ pub struct Reader {
 
     // An entity's literal value: character references expanded, general
     // entity references kept as they are (and checked).
-    fn entity_value(self: *mut Reader) ![]u8 {
+    fn entity_value(self: *mut Reader) XmlError![]u8 {
         let q = self.at(0);
         self.advance(1);
         self.buf2.clear();
@@ -1490,10 +1491,10 @@ pub struct Reader {
             self.buf2.push(c)!;
             self.advance(1);
         }
-        return self.ar.dup(self.buf2.bytes());
+        return self.ar.dup(self.buf2.bytes())!;
     }
 
-    fn attlist_decl(self: *mut Reader) !void {
+    fn attlist_decl(self: *mut Reader) XmlError!void {
         self.advance(9);
         if not self.skip_space() {
             return self.fail("expected white space after ATTLIST");
@@ -1573,7 +1574,7 @@ pub struct Reader {
         }
     }
 
-    fn enumeration(self: *mut Reader) !void {
+    fn enumeration(self: *mut Reader) XmlError!void {
         self.advance(1);
         loop {
             _ = self.skip_space();
@@ -1693,7 +1694,7 @@ pub struct Element {
     children: []Node,
 
     /// An attribute's value by its name as written ("id", "p:x").
-    pub fn attr(self: *Element, name: []u8) ![]u8 {
+    pub fn attr(self: *Element, name: []u8) XmlError![]u8 {
         for a in self.attrs {
             if strs.eq(a.name, name) {
                 return a.value;
@@ -1703,7 +1704,7 @@ pub struct Element {
     }
 
     /// An attribute's value by namespace and local name.
-    pub fn attr_ns(self: *Element, ns: []u8, local: []u8) ![]u8 {
+    pub fn attr_ns(self: *Element, ns: []u8, local: []u8) XmlError![]u8 {
         for a in self.attrs {
             if strs.eq(a.ns, ns) and strs.eq(a.local, local) {
                 return a.value;
@@ -1713,7 +1714,7 @@ pub struct Element {
     }
 
     /// The first child element with this local name.
-    pub fn child(self: *Element, local: []u8) !*Element {
+    pub fn child(self: *Element, local: []u8) XmlError!*Element {
         for c in self.children {
             match c {
                 .Element(e) => {
@@ -1733,17 +1734,17 @@ pub struct Element {
     }
 
     /// All the text inside the element (free it with mem.free).
-    pub fn text_alloc(self: *Element) ![]mut u8 {
+    pub fn text_alloc(self: *Element) XmlError![]mut u8 {
         let mut s = strs.String.init();
         collect_text(self, &mut s, 0) catch |e| {
             s.deinit();
             return e;
         };
-        return s.take();
+        return s.take()!;
     }
 }
 
-fn collect_text(e: *Element, s: *mut strs.String, depth: usize) !void {
+fn collect_text(e: *Element, s: *mut strs.String, depth: usize) XmlError!void {
     if depth > MAX_DEPTH {
         return error.TooDeep;
     }
@@ -1761,7 +1762,7 @@ pub struct Elements {
     i: usize,
 
     /// The next child element, or NotFound.
-    pub fn next(self: *mut Elements) !*Element {
+    pub fn next(self: *mut Elements) XmlError!*Element {
         while self.i < self.e.children.len {
             let c = self.e.children[self.i];
             self.i += 1;
@@ -1798,12 +1799,12 @@ struct Frame {
     kids: vec.Vec.[Node],
 }
 
-pub fn parse(text: []u8) !Document {
+pub fn parse(text: []u8) XmlError!Document {
     let mut info = ErrorInfo.{ line: 0, message: "" };
     return parse_with(text, Options.default(), &mut info);
 }
 
-pub fn parse_with(text: []u8, opts: Options, info: *mut ErrorInfo) !Document {
+pub fn parse_with(text: []u8, opts: Options, info: *mut ErrorInfo) XmlError!Document {
     let mut m: []u8 = "";
     let mut r = Reader.init_info(text, opts, &mut m) catch |e| {
         info.message = m;
@@ -1821,7 +1822,7 @@ pub fn parse_with(text: []u8, opts: Options, info: *mut ErrorInfo) !Document {
     return doc;
 }
 
-fn build(doc: *mut Document) !void {
+fn build(doc: *mut Document) XmlError!void {
     let r = &mut doc.reader;
     let mut frames = vec.Vec.[Frame].init();
     defer {
@@ -1881,7 +1882,7 @@ fn build(doc: *mut Document) !void {
     doc.epilog = all[prolog_len..];
 }
 
-fn add_node(frames: *mut vec.Vec.[Frame], top: *mut vec.Vec.[Node], n: Node) !void {
+fn add_node(frames: *mut vec.Vec.[Frame], top: *mut vec.Vec.[Node], n: Node) XmlError!void {
     if frames.len > 0 {
         frames.get_ptr(frames.len - 1).kids.push(n)!;
     } else {
@@ -2127,7 +2128,7 @@ pub fn canonicalize(doc: *Document) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 fn canon_doc(doc: *Document, w: io.Writer, rendered: *mut vec.Vec.[Binding]) !void {
@@ -2343,7 +2344,7 @@ test "the tree and the reader" {
     }
 }
 
-fn fails_el(r: !*Element) bool {
+fn fails_el(r: XmlError!*Element) bool {
     _ = r catch return true;
     return false;
 }
@@ -2413,7 +2414,7 @@ test "encodings and hostile input" {
     @expect(fails_doc(parse(deep.bytes())));
 }
 
-fn fails_doc(r: !Document) bool {
+fn fails_doc(r: XmlError!Document) bool {
     let mut d = r catch return true;
     d.deinit();
     return false;

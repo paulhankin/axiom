@@ -30,7 +30,7 @@ import "../image.ax" as image;
 import "internal/webp/vp8.ax" as vp8;
 import "png.ax" as png;
 
-error { Corrupt, TooLarge, Unsupported, OutOfMemory }
+pub error WebpError { Corrupt, TooLarge, Unsupported, OutOfMemory, IoError, NotFound, Empty, Done, InvalidUtf8 }
 
 pub fn is_webp(data: []u8) bool {
     return (data.len >= 16) and strs.eq(data[..4], "RIFF") and strs.eq(data[8..12], "WEBP");
@@ -122,7 +122,7 @@ struct Codes {
         self.fast.deinit();
     }
 
-    fn add(self: *mut Codes, lens: []u8) !void {
+    fn add(self: *mut Codes, lens: []u8) WebpError!void {
         let mut tr = Tree.{ single: -1, counts: [0; 16], syms: self.syms.len, fast: self.fast.len };
         let mut used: usize = 0;
         let mut last: usize = 0;
@@ -192,7 +192,7 @@ struct Codes {
         self.trees.push(tr)!;
     }
 
-    fn decode(self: *Codes, t: usize, b: *mut Bits) !u32 {
+    fn decode(self: *Codes, t: usize, b: *mut Bits) WebpError!u32 {
         let tr = self.trees.items()[t];
         if tr.single >= 0 {
             return @bit_cast(u32, tr.single);
@@ -231,7 +231,7 @@ struct Codes {
 let CODE_LENGTH_ORDER: [19]u8 = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 // one prefix code of an alphabet
-fn read_code(b: *mut Bits, codes: *mut Codes, alphabet: usize, lens: []mut u8) !void {
+fn read_code(b: *mut Bits, codes: *mut Codes, alphabet: usize, lens: []mut u8) WebpError!void {
     @mem_set(lens[..alphabet], 0);
     if b.read(1) == 1 {
         let n = b.read(1) + 1;
@@ -344,7 +344,7 @@ fn tiles(n: usize, bits: u32) usize {
 }
 
 // the prefix-coded pixels of one image (after its transforms, if any)
-fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
+fn read_pixels(b: *mut Bits, w: usize, h: usize, level0: bool) WebpError![]mut u32 {
     let mut cache_bits: u32 = 0;
     if b.read(1) == 1 {
         cache_bits = b.read(4);
@@ -490,7 +490,7 @@ struct Transform {
 }
 
 // an image with its transforms (level0: the main image, which may have them)
-fn read_image(b: *mut Bits, w: usize, h: usize, level0: bool) ![]mut u32 {
+fn read_image(b: *mut Bits, w: usize, h: usize, level0: bool) WebpError![]mut u32 {
     let mut ts: [4]Transform = [
         Transform.{ kind: 0, bits: 0, width: 0, data: @slice_from_ptr(@ptr_from_int(*mut u32, 4), 0) }; 4];
     let mut nt: usize = 0;
@@ -718,7 +718,7 @@ fn uncolor(px: []mut u32, w: usize, h: usize, bits: u32, elems: []u32) void {
 }
 
 // a whole VP8L bitstream (after its chunk header)
-fn decode_vp8l(data: []u8, w: *mut usize, h: *mut usize, alpha: *mut bool) ![]mut u32 {
+fn decode_vp8l(data: []u8, w: *mut usize, h: *mut usize, alpha: *mut bool) WebpError![]mut u32 {
     if (data.len < 5) or (data[0] != 0x2f) {
         return error.Corrupt;
     }
@@ -746,7 +746,7 @@ struct Pic {
     alpha: bool,
 }
 
-fn decode_alpha(data: []u8, w: usize, h: usize, out: []mut u8) !void {
+fn decode_alpha(data: []u8, w: usize, h: usize, out: []mut u8) WebpError!void {
     if data.len < 1 {
         return error.Corrupt;
     }
@@ -796,7 +796,7 @@ fn decode_alpha(data: []u8, w: usize, h: usize, out: []mut u8) !void {
 }
 
 // a frame's chunks: [ALPH] then VP8, or VP8L
-fn decode_pic(data: []u8) !Pic {
+fn decode_pic(data: []u8) WebpError!Pic {
     let mut p: usize = 0;
     let mut alph: []u8 = data[..0];
     let mut have_alph = false;
@@ -864,7 +864,7 @@ fn decode_pic(data: []u8) !Pic {
 // -----------------------------------------------------------------------------
 
 /// The first frame: RGB, or RGBA with alpha or for animations.
-pub fn decode(data: []u8) !image.Image {
+pub fn decode(data: []u8) WebpError!image.Image {
     let mut a = decode_frames(data, true)!;
     let f = a.frames.get(0);
     a.frames.clear();
@@ -873,11 +873,11 @@ pub fn decode(data: []u8) !image.Image {
 }
 
 /// Every frame, composited onto the canvas.
-pub fn decode_all(data: []u8) !Animation {
+pub fn decode_all(data: []u8) WebpError!Animation {
     return decode_frames(data, false);
 }
 
-fn to_image(p: *Pic, channels: usize) !image.Image {
+fn to_image(p: *Pic, channels: usize) WebpError!image.Image {
     let mut img = image.Image.init(p.width, p.height, channels, image.Depth.U8)!;
     if channels == 4 {
         @mem_copy(img.data[..p.rgba.len], p.rgba);
@@ -934,7 +934,7 @@ struct Rect {
     alpha: bool,
 }
 
-fn decode_frames(data: []u8, first_only: bool) !Animation {
+fn decode_frames(data: []u8, first_only: bool) WebpError!Animation {
     if not is_webp(data) {
         return error.Corrupt;
     }
@@ -1138,7 +1138,7 @@ struct Writer {
 
 // code lengths of at most max_len bits for the frequencies (0 for unused
 // symbols): Huffman's, with the frequencies flattened until they fit
-fn code_lengths(freq: []u32, lens: []mut u8, max_len: u8) !void {
+fn code_lengths(freq: []u32, lens: []mut u8, max_len: u8) WebpError!void {
     let n = freq.len;
     @mem_set(lens, 0);
     let f = mem.alloc.[u32](n)!;
@@ -1712,7 +1712,7 @@ fn pred_at(px: []u32, w: usize, x: usize, y: usize, m: u32) u32 {
     return predict(m, px[i - 1], px[i - w], px[(i - w) + 1], px[(i - w) - 1]);
 }
 
-fn argb_of(img: *image.Image) ![]mut u32 {
+fn argb_of(img: *image.Image) WebpError![]mut u32 {
     let mut src = img.convert(4, image.Depth.U8)!;
     defer src.deinit();
     let n = img.width * img.height;
@@ -1732,7 +1732,7 @@ fn put_le(o: []mut u8, v: usize, n: usize) void {
     }
 }
 
-fn check_size(img: *image.Image) !void {
+fn check_size(img: *image.Image) WebpError!void {
     if (img.width == 0) or (img.height == 0) or (img.width > 16384) or (img.height > 16384) {
         return error.TooLarge;
     }
@@ -1745,7 +1745,7 @@ pub fn encode(img: *image.Image) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes a lossless WebP of the image to w. The RIFF header holds the
@@ -1777,7 +1777,7 @@ pub fn encode_animation(frames: []*image.Image, delays_ms: []u32, loops: u16) ![
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes a lossless animation as encode_animation does to w, a frame at a
@@ -1932,7 +1932,7 @@ test "files made by libwebp" {
     }
 }
 
-fn test_image(w: usize, h: usize, ch: usize, colours: usize) !image.Image {
+fn test_image(w: usize, h: usize, ch: usize, colours: usize) WebpError!image.Image {
     let mut img = image.Image.init(w, h, ch, image.Depth.U8)!;
     for y in @as(usize, 0)..h {
         for x in @as(usize, 0)..w {

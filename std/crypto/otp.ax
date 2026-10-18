@@ -34,7 +34,8 @@ import "hmac.ax" as hmac;
 import "sha2.ax" as sha2;
 import "subtle.ax" as subtle;
 
-error { InvalidConfig, InvalidTime, NoMatch, InvalidUri, UnsupportedAlgorithm, OutOfMemory }
+pub error OtpError { InvalidConfig, InvalidTime, NoMatch, InvalidUri, UnsupportedAlgorithm, OutOfMemory, NotFound,
+                     InvalidBase32, IoError, Done, NoSpaceLeft, InvalidUtf8 }
 
 /// The parameters shared by both kinds of password.
 pub struct Config {
@@ -68,7 +69,7 @@ fn pow10(n: u32) u32 {
 
 /// The HOTP value for counter: InvalidConfig unless c has 6 to 8 digits and
 /// SHA-1, SHA-256 or SHA-512.
-pub fn hotp(key: []u8, counter: u64, c: Config) !u32 {
+pub fn hotp(key: []u8, counter: u64, c: Config) OtpError!u32 {
     if not c.valid() {
         return error.InvalidConfig;
     }
@@ -88,7 +89,7 @@ pub fn hotp(key: []u8, counter: u64, c: Config) !u32 {
 }
 
 /// The TOTP time step for a Unix time: InvalidTime before c.t0.
-pub fn time_step(unix: i64, c: Config) !u64 {
+pub fn time_step(unix: i64, c: Config) OtpError!u64 {
     if (unix < c.t0) or (c.period == 0) {
         return error.InvalidTime;
     }
@@ -97,7 +98,7 @@ pub fn time_step(unix: i64, c: Config) !u64 {
 }
 
 /// The TOTP value at a Unix time (seconds).
-pub fn totp(key: []u8, unix: i64, c: Config) !u32 {
+pub fn totp(key: []u8, unix: i64, c: Config) OtpError!u32 {
     return hotp(key, time_step(unix, c)!, c);
 }
 
@@ -116,7 +117,7 @@ pub fn format_code(code: u32, c: Config, out: []mut u8) []u8 {
 }
 
 /// Whether code is the right text for counter, in constant time.
-fn matches(key: []u8, counter: u64, code: []u8, c: Config) !bool {
+fn matches(key: []u8, counter: u64, code: []u8, c: Config) OtpError!bool {
     let want = hotp(key, counter, c)!;
     let mut buf: [8]u8 = [0; 8];
     let text = format_code(want, c, buf[..]);
@@ -127,7 +128,7 @@ fn matches(key: []u8, counter: u64, code: []u8, c: Config) !bool {
 /// counter + look_ahead (at most MAX_WINDOW), all of them, so the time
 /// taken does not tell which matched; returns the one that matched (the
 /// next expected counter is that plus one), or fails with NoMatch.
-pub fn hotp_check(key: []u8, counter: u64, code: []u8, look_ahead: u64, c: Config) !u64 {
+pub fn hotp_check(key: []u8, counter: u64, code: []u8, look_ahead: u64, c: Config) OtpError!u64 {
     if look_ahead > MAX_WINDOW {
         return error.InvalidConfig;
     }
@@ -155,7 +156,7 @@ pub fn hotp_check(key: []u8, counter: u64, code: []u8, look_ahead: u64, c: Confi
 /// MAX_WINDOW) of clock drift either way; returns the time step that
 /// matched (remember it, and refuse codes for it or earlier steps
 /// afterwards), or fails with NoMatch.
-pub fn totp_check(key: []u8, unix: i64, code: []u8, window: u64, c: Config) !u64 {
+pub fn totp_check(key: []u8, unix: i64, code: []u8, window: u64, c: Config) OtpError!u64 {
     if window > MAX_WINDOW {
         return error.InvalidConfig;
     }
@@ -300,7 +301,7 @@ pub fn uri(k: *Key) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 fn hexval(c: u8) u8 {
@@ -315,7 +316,7 @@ fn hexval(c: u8) u8 {
 }
 
 /// Percent-decodes s into new memory ('+' is a space when plus_space).
-fn unescape(s: []u8, plus_space: bool) ![]mut u8 {
+fn unescape(s: []u8, plus_space: bool) OtpError![]mut u8 {
     let out = mem.alloc.[u8](s.len)!;
     let mut o: usize = 0;
     let mut i: usize = 0;
@@ -350,7 +351,7 @@ fn unescape(s: []u8, plus_space: bool) ![]mut u8 {
     };
 }
 
-fn parse_uint(s: []u8, max: u64) !u64 {
+fn parse_uint(s: []u8, max: u64) OtpError!u64 {
     if (s.len == 0) or (s.len > 19) {
         return error.InvalidUri;
     }
@@ -370,7 +371,7 @@ fn parse_uint(s: []u8, max: u64) !u64 {
 /// Parses an otpauth:// URI (InvalidUri if malformed, UnsupportedAlgorithm
 /// for an algorithm other than SHA1, SHA256 or SHA512). An issuer
 /// parameter takes precedence over the label's prefix.
-pub fn parse_uri(text: []u8) !Key {
+pub fn parse_uri(text: []u8) OtpError!Key {
     let mut k = Key.init(Kind.TOTP, "", "", "", Config.default());
     parse_into(text, &mut k) catch |e| {
         k.deinit();
@@ -386,7 +387,7 @@ fn empty() []mut u8 {
     return @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
 }
 
-fn parse_into(text: []u8, k: *mut Key) !void {
+fn parse_into(text: []u8, k: *mut Key) OtpError!void {
     let prefix = "otpauth://";
     if (text.len < prefix.len) or not strs.eq_ignore_case(text[..prefix.len], prefix) {
         return error.InvalidUri;
@@ -563,8 +564,8 @@ test "totp rfc 6238" {
     @expect_eq(totp(k1, 1111111109, Config.default())!, 81804);  // "081804", as pyotp
 }
 
-fn join(parts: [2][]u8) ![]mut u8 {
-    return strs.concat(parts[0], parts[1]);
+fn join(parts: [2][]u8) OtpError![]mut u8 {
+    return strs.concat(parts[0], parts[1])!;
 }
 
 test "otpauth uris" {

@@ -1551,7 +1551,7 @@ fn describe(e: ConfigError) []u8 {
 - Error union types do not convert: `S!T` and `!T` are different types, and so are
   `fn() S!T` and `fn() !T` (`E0412`). Values cross between them through `!`, `catch` and
   `return`, which check the sets as above.
-- Errors of different sets compare with `==` and `!=` by their codes.
+- Errors of different sets compare by their codes, with `==`, `!=` and `@expect_eq`.
 
 ---
 

@@ -41,7 +41,8 @@ import "color.ax" as color;
 import "draw.ax" as draw;
 import "image.ax" as image;
 
-error { OutOfMemory, DataTooLong, InvalidSegment, InvalidOption }
+pub error QrError { OutOfMemory, DataTooLong, InvalidSegment, InvalidOption, IoError, Corrupt, Empty, InvalidPath,
+                    NotFound, Unsupported, Done, TooLarge }
 
 /// Error correction level: about 7%, 15%, 25% or 30% of the codewords can
 /// be restored.
@@ -148,7 +149,7 @@ pub struct Code {
     /// Adds the dark modules as rectangles (a run of dark modules in a row
     /// is one rectangle) to a path: the symbol's top left at (x, y),
     /// module by module wide. Fill it with the nonzero rule.
-    pub fn add_to_path(self: *Code, p: *mut draw.Path, x: f64, y: f64, module: f64) !void {
+    pub fn add_to_path(self: *Code, p: *mut draw.Path, x: f64, y: f64, module: f64) QrError!void {
         let n = self.size;
         for r in @as(usize, 0)..n {
             let mut c: usize = 0;
@@ -619,7 +620,7 @@ struct Bits {
     }
 
     /// Appends the low n bits of v, most significant first.
-    fn put(self: *mut Bits, v: u32, n: usize) !void {
+    fn put(self: *mut Bits, v: u32, n: usize) QrError!void {
         let mut i = n;
         while i > 0 {
             i -= 1;
@@ -636,7 +637,7 @@ struct Bits {
 }
 
 /// The bits of a segment's data (without its header); checks the characters.
-fn segment_data_bits(s: Segment) !usize {
+fn segment_data_bits(s: Segment) QrError!usize {
     let n = s.data.len;
     match s.mode {
         .NUMERIC => {
@@ -692,7 +693,7 @@ fn segment_data_bits(s: Segment) !usize {
 
 /// The total bits of segments in a version (0x7fffffff... if a count does
 /// not fit its indicator).
-fn total_bits(segs: []Segment, version: u32) !usize {
+fn total_bits(segs: []Segment, version: u32) QrError!usize {
     let mut t: usize = 0;
     for s in segs {
         let cb = count_bits(s.mode, version);
@@ -704,7 +705,7 @@ fn total_bits(segs: []Segment, version: u32) !usize {
     return t;
 }
 
-fn append_segment(b: *mut Bits, s: Segment, version: u32) !void {
+fn append_segment(b: *mut Bits, s: Segment, version: u32) QrError!void {
     b.put(mode_bits(s.mode), 4)!;
     if s.mode == Mode.ECI {
         if s.eci < 128 {
@@ -771,7 +772,7 @@ fn ceil6(x: usize) usize {
 /// stream (in a version of the given range: 1-9, 10-26 or 27-40, which have
 /// the same count indicator lengths) is as short as possible. The segments'
 /// data points into text.
-pub fn segment_text(text: []u8, version: u32, out: *mut vec.Vec.[Segment]) !void {
+pub fn segment_text(text: []u8, version: u32, out: *mut vec.Vec.[Segment]) QrError!void {
     out.clear();
     let n = text.len;
     if n == 0 {
@@ -858,12 +859,12 @@ pub fn segment_text(text: []u8, version: u32, out: *mut vec.Vec.[Segment]) !void
 // -----------------------------------------------------------------------------
 
 /// Encodes text (UTF-8) at a level, in the smallest version that holds it.
-pub fn encode(text: []u8, ecc: Ecc) !Code {
+pub fn encode(text: []u8, ecc: Ecc) QrError!Code {
     return encode_with(text, Options.init(ecc));
 }
 
 /// Encodes text with options.
-pub fn encode_with(text: []u8, opts: Options) !Code {
+pub fn encode_with(text: []u8, opts: Options) QrError!Code {
     if (opts.min_version < 1) or (opts.max_version > 40) or (opts.min_version > opts.max_version) {
         return error.InvalidOption;
     }
@@ -909,14 +910,14 @@ pub fn encode_with(text: []u8, opts: Options) !Code {
 }
 
 /// Encodes raw bytes (one byte segment, no ECI).
-pub fn encode_binary(data: []u8, ecc: Ecc) !Code {
+pub fn encode_binary(data: []u8, ecc: Ecc) QrError!Code {
     let segs: [1]Segment = [Segment.bytes(data)];
     return encode_segments(segs[..], Options.init(ecc));
 }
 
 /// Encodes segments as given, in the smallest version in the options' range
 /// that holds them.
-pub fn encode_segments(segs: []Segment, opts: Options) !Code {
+pub fn encode_segments(segs: []Segment, opts: Options) QrError!Code {
     if (opts.min_version < 1) or (opts.max_version > 40) or (opts.min_version > opts.max_version) or
        (opts.mask > AUTO_MASK) {
         return error.InvalidOption;
@@ -1019,7 +1020,7 @@ fn rs_remainder(data: []u8, div: []u8, out: []mut u8) void {
 
 /// The codewords to place: the data cut into blocks, each followed by its
 /// error correction, interleaved.
-fn add_ecc(data: []u8, version: u32, e: Ecc) ![]mut u8 {
+fn add_ecc(data: []u8, version: u32, e: Ecc) QrError![]mut u8 {
     let ti = (ecc_index(e) * 40) + @as(usize, version - 1);
     let nblocks = @as(usize, NUM_BLOCKS[ti]);
     let ecl = @as(usize, ECC_PER_BLOCK[ti]);
@@ -1344,7 +1345,7 @@ fn penalty(g: *Grid, col: []mut u8) usize {
     return p;
 }
 
-fn build(cw: []u8, version: u32, ecc: Ecc, mask: u32) !Code {
+fn build(cw: []u8, version: u32, ecc: Ecc, mask: u32) QrError!Code {
     let n = (@as(usize, version) * 4) + 17;
     let m = mem.alloc_zeroed.[u8](n * n)!;
     let func = mem.alloc_zeroed.[u8](n * n) catch |e| {
@@ -1390,12 +1391,13 @@ fn build(cw: []u8, version: u32, ecc: Ecc, mask: u32) !Code {
 /// The symbol as a gray image (one channel, 8 bits): scale pixels a module,
 /// with quiet modules of light margin (the standard asks for 4), dark 0 and
 /// light 255.
-pub fn to_image(code: *Code, scale: usize, quiet: usize) !image.Image {
+pub fn to_image(code: *Code, scale: usize, quiet: usize) QrError!image.Image {
     return to_image_colors(code, scale, quiet, color.Color.rgb(0.0, 0.0, 0.0), color.Color.rgb(1.0, 1.0, 1.0));
 }
 
 /// The symbol as an RGBA image (8 bits) in two colours.
-pub fn to_image_colors(code: *Code, scale: usize, quiet: usize, dark: color.Color, light: color.Color) !image.Image {
+pub fn to_image_colors(code: *Code, scale: usize, quiet: usize, dark: color.Color,
+                       light: color.Color) QrError!image.Image {
     if scale == 0 {
         return error.InvalidOption;
     }
@@ -1479,12 +1481,12 @@ pub fn svg(code: *Code, quiet: usize) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// The symbol as text: a line per row, "#" dark and "." light (for tests and
 /// terminals).
-pub fn to_text(code: *Code) ![]mut u8 {
+pub fn to_text(code: *Code) QrError![]mut u8 {
     let n = code.size;
     let out = mem.alloc.[u8](n * (n + 1))!;
     for y in @as(usize, 0)..n {
@@ -1511,7 +1513,7 @@ fn hex_value(c: u8) u8 {
     return (c - 'a') + 10;
 }
 
-fn fails_with(r: !Code, want: error) bool {
+fn fails_with(r: QrError!Code, want: error) bool {
     let mut c = r catch |e| return e == want;
     c.deinit();
     return false;

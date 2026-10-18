@@ -50,7 +50,8 @@ import "../unicode.ax" as uni;
 import "internal/html/entities.ax" as ent;
 import "math.ax" as tmath;
 
-error { TooLarge, OutOfMemory }
+pub error MarkdownError { TooLarge, OutOfMemory, NoSpaceLeft, IoError, NotFound, InvalidMath, Empty, Done, EndOfStream,
+                          InvalidUtf8, PermissionDenied, Exists }
 
 pub const NONE: u32 = 0xffffffff;
 
@@ -349,13 +350,13 @@ pub struct Document {
 
     /// The text of a node's inline content, without markup (as for an
     /// image's alt text).
-    pub fn plain_text(self: *Document, id: u32) ![]mut u8 {
+    pub fn plain_text(self: *Document, id: u32) MarkdownError![]mut u8 {
         let mut out = strs.String.init();
         plain_into(self, id, &mut out) catch |e| {
             out.deinit();
             return e;
         };
-        return out.take();
+        return out.take()!;
     }
 
     /// Renders the document as HTML.
@@ -365,7 +366,7 @@ pub struct Document {
             out.deinit();
             return e;
         };
-        return out.take();
+        return out.take()!;
     }
 
     /// Renders the document as HTML to a Writer, about 4 KB at a time.
@@ -425,7 +426,7 @@ pub fn has_exit(kind: Kind) bool {
 
 /// Parses Markdown text. The input need not be valid UTF-8 (bad bytes
 /// pass through); NUL bytes become U+FFFD.
-pub fn parse(src: []u8, opts: Options) !Document {
+pub fn parse(src: []u8, opts: Options) MarkdownError!Document {
     if src.len >= 0x40000000 {
         return error.TooLarge;
     }
@@ -438,7 +439,7 @@ pub fn parse(src: []u8, opts: Options) !Document {
     return doc;
 }
 
-fn build(doc: *mut Document, src: []u8, opts: Options) !void {
+fn build(doc: *mut Document, src: []u8, opts: Options) MarkdownError!void {
     doc.raw.reserve(src.len + (src.len / 8) + 16)!;
     let mut p = Parser.init(doc, opts, src.len);
     defer p.deinit();
@@ -664,7 +665,7 @@ struct Parser {
     // --- the tree ---
 
     /// A new node, appended to `parent`'s children.
-    fn append(self: *mut Parser, parent: u32, kind: Kind) !u32 {
+    fn append(self: *mut Parser, parent: u32, kind: Kind) MarkdownError!u32 {
         let id = @truncate(u32, self.doc.nodes.len);
         let mut n = new_node(kind, self.line_number);
         n.parent = parent;
@@ -683,7 +684,7 @@ struct Parser {
     }
 
     /// Adds a block, first closing the open blocks that cannot hold it.
-    fn add_block(self: *mut Parser, parent: u32, kind: Kind) !u32 {
+    fn add_block(self: *mut Parser, parent: u32, kind: Kind) MarkdownError!u32 {
         let mut p = parent;
         while not can_contain(self.kind(p), kind) {
             p = self.finalize(p)!;
@@ -698,7 +699,7 @@ struct Parser {
     }
 
     /// Appends the rest of the line (from offset) to a leaf's contents.
-    fn add_line(self: *mut Parser, id: u32) !void {
+    fn add_line(self: *mut Parser, id: u32) MarkdownError!void {
         let start = self.doc.raw.len;
         if self.partially_consumed_tab {
             self.offset += 1;
@@ -782,7 +783,7 @@ struct Parser {
 
     // --- the document ---
 
-    fn document(self: *mut Parser, src: []u8) !void {
+    fn document(self: *mut Parser, src: []u8) MarkdownError!void {
         let root = self.append(NONE, Kind.DOCUMENT)!;
         _ = root;
         self.current = 0;
@@ -823,7 +824,7 @@ struct Parser {
         }
     }
 
-    fn process_line(self: *mut Parser) !void {
+    fn process_line(self: *mut Parser) MarkdownError!void {
         self.line_number += 1;
         self.offset = 0;
         self.column = 0;
@@ -1056,7 +1057,7 @@ struct Parser {
         self.line.len = n;
     }
 
-    fn list_start(self: *mut Parser, container: *mut u32, interrupts: bool) !bool {
+    fn list_start(self: *mut Parser, container: *mut u32, interrupts: bool) MarkdownError!bool {
         let line = self.line.bytes();
         let pos = self.first_nonspace;
         let c = at(line, pos);
@@ -1147,7 +1148,7 @@ struct Parser {
     // --- closing blocks ---
 
     /// Closes a block; returns its parent.
-    fn finalize(self: *mut Parser, id: u32) !u32 {
+    fn finalize(self: *mut Parser, id: u32) MarkdownError!u32 {
         let n = self.nd(id);
         let parent = n.parent;
         n.open = false;
@@ -1809,7 +1810,7 @@ fn scan_entity(s: []u8, i: usize, cp1: *mut u32, cp2: *mut u32) usize {
 }
 
 /// Appends s with backslash escapes and entities decoded.
-fn unescape_to(out: *mut strs.String, s: []u8) !void {
+fn unescape_to(out: *mut strs.String, s: []u8) MarkdownError!void {
     let mut i: usize = 0;
     let mut run: usize = 0;
     while i < s.len {
@@ -1976,7 +1977,7 @@ fn skip_spnl(s: []u8, p: usize) usize {
 
 /// A reference label, normalized for matching: case-folded, runs of white
 /// space as one space, trimmed. Owned by the caller.
-fn normalize_label(label: []u8) ![]mut u8 {
+fn normalize_label(label: []u8) MarkdownError![]mut u8 {
     let folded = uni.case_fold(label)!;
     defer mem.free(folded);
     let mut out = strs.String.init();
@@ -1992,14 +1993,14 @@ fn normalize_label(label: []u8) ![]mut u8 {
         }
         out.push(c)!;
     }
-    return out.take();
+    return out.take()!;
 }
 
 // -----------------------------------------------------------------------------
 // Link reference definitions and tables (block phase)
 // -----------------------------------------------------------------------------
 
-fn unescape_into_buf(p: *mut Parser, s: []u8) !Ref {
+fn unescape_into_buf(p: *mut Parser, s: []u8) MarkdownError!Ref {
     let off = p.doc.buf.len;
     unescape_to(&mut p.doc.buf, s)!;
     return Ref.{ off: @truncate(u32, off), len: @truncate(u32, p.doc.buf.len - off), raw: false };
@@ -2007,7 +2008,7 @@ fn unescape_into_buf(p: *mut Parser, s: []u8) !Ref {
 
 /// Takes the link reference definitions off the start of a paragraph;
 /// whether anything is left.
-fn resolve_refs(p: *mut Parser, id: u32) !bool {
+fn resolve_refs(p: *mut Parser, id: u32) MarkdownError!bool {
     let c = p.content(id);
     let mut pos: usize = 0;
     while (pos < c.len) and (c[pos] == '[') {
@@ -2029,7 +2030,7 @@ fn resolve_refs(p: *mut Parser, id: u32) !bool {
 }
 
 /// A link reference definition at s[pos]: where it ends, or 0.
-fn parse_ref(p: *mut Parser, s: []u8, pos: usize) !usize {
+fn parse_ref(p: *mut Parser, s: []u8, pos: usize) MarkdownError!usize {
     let mut ls: usize = 0;
     let mut le: usize = 0;
     let mut i = scan_label(s, pos, &mut ls, &mut le);
@@ -2099,7 +2100,7 @@ struct Cell {
 
 /// Splits a table row at unescaped pipes (a leading and a trailing pipe are
 /// optional); the cells are trimmed.
-fn row_cells(s: []u8, out: *mut vec.Vec.[Cell]) !void {
+fn row_cells(s: []u8, out: *mut vec.Vec.[Cell]) MarkdownError!void {
     out.clear();
     let mut i: usize = 0;
     let mut end = s.len;
@@ -2137,7 +2138,7 @@ fn row_cells(s: []u8, out: *mut vec.Vec.[Cell]) !void {
 
 /// A delimiter row under a paragraph whose last line has as many cells
 /// makes that line a table header.
-fn table_start(p: *mut Parser, para: u32) !bool {
+fn table_start(p: *mut Parser, para: u32) MarkdownError!bool {
     let line = p.line.bytes();
     let row = line[p.first_nonspace..line.len - 1];
     let mut cells = vec.Vec.[Cell].init();
@@ -2216,7 +2217,7 @@ fn table_start(p: *mut Parser, para: u32) !bool {
     return true;
 }
 
-fn add_row(p: *mut Parser, table: u32, off: u32, cells: *vec.Vec.[Cell], header: bool) !void {
+fn add_row(p: *mut Parser, table: u32, off: u32, cells: *vec.Vec.[Cell], header: bool) MarkdownError!void {
     let t = p.doc.nodes.get(@as(usize, table));
     let row = p.append(table, Kind.TABLE_ROW)!;
     let rn = p.nd(row);
@@ -2237,7 +2238,7 @@ fn add_row(p: *mut Parser, table: u32, off: u32, cells: *vec.Vec.[Cell], header:
     }
 }
 
-fn table_row(p: *mut Parser, table: u32) !void {
+fn table_row(p: *mut Parser, table: u32) MarkdownError!void {
     let off = p.doc.raw.len;
     let line = p.line.bytes();
     p.doc.raw.push_str(line[p.first_nonspace..line.len - 1])!;
@@ -2314,7 +2315,7 @@ struct Bracket {
 
 pub const MAX_BACKTICKS: usize = 1000;
 
-fn inlines_all(p: *mut Parser) !void {
+fn inlines_all(p: *mut Parser) MarkdownError!void {
     p.ticks.clear();
     for _k in 0..MAX_BACKTICKS + 1 {
         p.ticks.push(0)!;
@@ -2368,7 +2369,7 @@ fn peek(p: *mut Parser) u8 {
     return subject_at(p, p.pos);
 }
 
-fn parse_inlines(p: *mut Parser, block: u32, r: Ref) !void {
+fn parse_inlines(p: *mut Parser, block: u32, r: Ref) MarkdownError!void {
     let mut s = p.doc.str(r);
     while (s.len > 0) and is_ascii_space(s[s.len - 1]) {
         s = s[..s.len - 1];
@@ -2395,19 +2396,19 @@ fn parse_inlines(p: *mut Parser, block: u32, r: Ref) !void {
     process_emphasis(p, 0)!;
 }
 
-fn text_node(p: *mut Parser, a: usize, b: usize) !u32 {
+fn text_node(p: *mut Parser, a: usize, b: usize) MarkdownError!u32 {
     let id = p.append(p.block, Kind.TEXT)!;
     p.nd(id).text = Ref.{ off: p.sbase + @truncate(u32, a), len: @truncate(u32, b - a), raw: true };
     return id;
 }
 
-fn text_node_buf(p: *mut Parser, r: Ref) !u32 {
+fn text_node_buf(p: *mut Parser, r: Ref) MarkdownError!u32 {
     let id = p.append(p.block, Kind.TEXT)!;
     p.nd(id).text = r;
     return id;
 }
 
-fn buf_ref(p: *mut Parser, s: []u8) !Ref {
+fn buf_ref(p: *mut Parser, s: []u8) MarkdownError!Ref {
     let off = p.doc.buf.len;
     p.doc.buf.push_str(s)!;
     return Ref.{ off: @truncate(u32, off), len: @truncate(u32, s.len), raw: false };
@@ -2418,7 +2419,7 @@ fn is_special(c: u8, gfm: bool, math: bool) bool {
            (c == '[') or (c == ']') or (c == '<') or (c == '!') or (gfm and (c == '~')) or (math and (c == '$'));
 }
 
-fn parse_inline(p: *mut Parser) !void {
+fn parse_inline(p: *mut Parser) MarkdownError!void {
     let c = peek(p);
     if (c == '\n') or (c == '\r') {
         let nl = p.pos;
@@ -2524,7 +2525,7 @@ fn parse_inline(p: *mut Parser) !void {
 
 // --- code spans ---
 
-fn handle_backticks(p: *mut Parser) !void {
+fn handle_backticks(p: *mut Parser) MarkdownError!void {
     let start = p.pos;
     while peek(p) == '`' {
         p.pos += 1;
@@ -2571,7 +2572,7 @@ fn handle_backticks(p: *mut Parser) !void {
 
 const NO_CLOSER: usize = 0xffffffff;  // (inputs are under 1 GB)
 
-fn handle_dollars(p: *mut Parser) !void {
+fn handle_dollars(p: *mut Parser) MarkdownError!void {
     let start = p.pos;
     while peek(p) == '$' {
         p.pos += 1;
@@ -2836,7 +2837,7 @@ fn scan_html_other(pr: *mut Parser, p: usize) usize {
     return 0;
 }
 
-fn handle_pointy(p: *mut Parser) !void {
+fn handle_pointy(p: *mut Parser) MarkdownError!void {
     let start = p.pos;
     let mut n = scan_autolink_uri(p.s, start + 1);
     let mut email = false;
@@ -2875,7 +2876,7 @@ fn handle_pointy(p: *mut Parser) !void {
 }
 
 /// Appends s with entities (but not backslash escapes) decoded.
-fn unescape_entities_to(out: *mut strs.String, s: []u8) !void {
+fn unescape_entities_to(out: *mut strs.String, s: []u8) MarkdownError!void {
     let mut i: usize = 0;
     let mut run: usize = 0;
     while i < s.len {
@@ -2920,7 +2921,7 @@ fn char_at(s: []u8, i: usize) u32 {
     return strs.decode_rune(s[i..]).value;
 }
 
-fn handle_delim(p: *mut Parser, c: u8) !void {
+fn handle_delim(p: *mut Parser, c: u8) MarkdownError!void {
     let start = p.pos;
     while peek(p) == c {
         p.pos += 1;
@@ -2990,7 +2991,7 @@ fn bottom_index(d: Delim) usize {
     return k;
 }
 
-fn process_emphasis(p: *mut Parser, stack_bottom: usize) !void {
+fn process_emphasis(p: *mut Parser, stack_bottom: usize) MarkdownError!void {
     let mut bottoms: [13]usize = [stack_bottom; 13];
     // the first delimiter above the bottom
     let mut closer = NONE;
@@ -3041,7 +3042,7 @@ fn process_emphasis(p: *mut Parser, stack_bottom: usize) !void {
     }
 }
 
-fn insert_emph(p: *mut Parser, opener: u32, closer: u32) !u32 {
+fn insert_emph(p: *mut Parser, opener: u32, closer: u32) MarkdownError!u32 {
     let od = p.delims.get(@as(usize, opener));
     let cd = p.delims.get(@as(usize, closer));
     let mut on = @as(usize, p.nd(od.node).text.len);
@@ -3086,7 +3087,7 @@ fn insert_emph(p: *mut Parser, opener: u32, closer: u32) !u32 {
     return closer;
 }
 
-fn insert_strike(p: *mut Parser, opener: u32, closer: u32) !u32 {
+fn insert_strike(p: *mut Parser, opener: u32, closer: u32) MarkdownError!u32 {
     let od = p.delims.get(@as(usize, opener));
     let cd = p.delims.get(@as(usize, closer));
     let res = cd.next;
@@ -3114,14 +3115,14 @@ fn insert_strike(p: *mut Parser, opener: u32, closer: u32) !u32 {
 
 // --- links and images ---
 
-fn push_bracket(p: *mut Parser, node: u32, image: bool) !void {
+fn push_bracket(p: *mut Parser, node: u32, image: bool) MarkdownError!void {
     if p.brackets.len > 0 {
         p.brackets.get_ptr(p.brackets.len - 1).after = true;
     }
     p.brackets.push(Bracket.{ node: node, pos: p.pos, image: image, after: false })!;
 }
 
-fn handle_close_bracket(p: *mut Parser) !void {
+fn handle_close_bracket(p: *mut Parser) MarkdownError!void {
     p.pos += 1;
     let initial = p.pos;
     if p.brackets.len == 0 {
@@ -3236,7 +3237,7 @@ fn pop_bracket(p: *mut Parser) void {
 // --- after the inline parse of a block ---
 
 /// Joins runs of adjacent TEXT nodes (the parser makes many small ones).
-fn merge_text(p: *mut Parser, block: u32, first: u32) !void {
+fn merge_text(p: *mut Parser, block: u32, first: u32) MarkdownError!void {
     merge_children(p, block)!;
     // the inline containers made for this block
     let mut i = @as(usize, first);
@@ -3249,7 +3250,7 @@ fn merge_text(p: *mut Parser, block: u32, first: u32) !void {
     }
 }
 
-fn merge_children(p: *mut Parser, parent: u32) !void {
+fn merge_children(p: *mut Parser, parent: u32) MarkdownError!void {
     let mut c = p.nd(parent).first;
     while c != NONE {
         let n = p.doc.nodes.get(@as(usize, c));
@@ -3472,7 +3473,7 @@ fn find_autolink(s: []u8, text_start: bool, a: *mut usize, b: *mut usize, prefix
     return false;
 }
 
-fn autolink_block(p: *mut Parser, block: u32) !void {
+fn autolink_block(p: *mut Parser, block: u32) MarkdownError!void {
     // depth first through the block's inlines, outside links
     let mut id = p.nd(block).first;
     let mut links: usize = 0;
@@ -3512,7 +3513,7 @@ fn autolink_block(p: *mut Parser, block: u32) !void {
 
 /// Splits a text node around the first extended autolink in it (the
 /// traversal then visits the link and the rest).
-fn autolink_text(p: *mut Parser, id: u32) !void {
+fn autolink_text(p: *mut Parser, id: u32) MarkdownError!void {
     let n = p.doc.nodes.get(@as(usize, id));
     let start_ok = (n.prev == NONE) or (p.kind(n.prev) != Kind.TEXT);
     let s = p.doc.str(n.text);
@@ -3546,7 +3547,7 @@ fn autolink_text(p: *mut Parser, id: u32) !void {
 // HTML
 // -----------------------------------------------------------------------------
 
-fn escape_html(out: *mut strs.String, s: []u8) !void {
+fn escape_html(out: *mut strs.String, s: []u8) MarkdownError!void {
     let mut run: usize = 0;
     for i in 0..s.len {
         let c = s[i];
@@ -3572,7 +3573,7 @@ fn href_safe(c: u8) bool {
 }
 
 /// A URL for an attribute: percent-encodes what is not allowed, escapes & and '.
-fn escape_href(out: *mut strs.String, s: []u8) !void {
+fn escape_href(out: *mut strs.String, s: []u8) MarkdownError!void {
     let hex = "0123456789ABCDEF";
     for c in s {
         if href_safe(c) {
@@ -3602,7 +3603,7 @@ pub let FILTERED_TAGS: [9][]u8 = ["title", "textarea", "style", "xmp", "iframe",
                                   "plaintext"];
 
 /// Raw HTML, with the GFM tag filter: "<script" becomes "&lt;script".
-fn raw_html(out: *mut strs.String, s: []u8, filter: bool) !void {
+fn raw_html(out: *mut strs.String, s: []u8, filter: bool) MarkdownError!void {
     if not filter {
         out.push_str(s)!;
         return;
@@ -3633,13 +3634,13 @@ fn raw_html(out: *mut strs.String, s: []u8, filter: bool) !void {
     out.push_str(s[run..])!;
 }
 
-fn cr(out: *mut strs.String) !void {
+fn cr(out: *mut strs.String) MarkdownError!void {
     if (out.len > 0) and (out.buf[out.len - 1] != '\n') {
         out.push('\n')!;
     }
 }
 
-fn put_uint(out: *mut strs.String, v: u32) !void {
+fn put_uint(out: *mut strs.String, v: u32) MarkdownError!void {
     let mut tmp: [10]u8 = [0; 10];
     let mut n: usize = 0;
     let mut x = v;
@@ -3671,7 +3672,7 @@ fn in_tight_list(doc: *Document, id: u32) bool {
 }
 
 /// The plain text of a node's descendants (for alt text).
-fn plain_into(doc: *Document, id: u32, out: *mut strs.String) !void {
+fn plain_into(doc: *Document, id: u32, out: *mut strs.String) MarkdownError!void {
     let mut w = Walker.{ doc: doc, id: id, entering: true, started: true };
     // walk the subtree of id only
     let n0 = doc.node(id);

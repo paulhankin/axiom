@@ -36,7 +36,8 @@ import "../../mem.ax" as mem;
 import "../../str.ax" as strs;
 import "tables.ax" as tb;
 
-error { Corrupt, Encrypted, NotFound, WrongType, TooLarge, Unsupported, OutOfMemory }
+pub error ReadError { Corrupt, Encrypted, NotFound, WrongType, TooLarge, Unsupported, OutOfMemory, Done, Empty,
+                      ChecksumMismatch, InvalidUtf8, Truncated, IoError }
 
 /// Arrays and dictionaries nested deeper than this are malformed.
 pub const MAX_DEPTH: u32 = 64;
@@ -86,7 +87,7 @@ pub union Object {
         }
     }
 
-    pub fn as_int(self: Object) !i64 {
+    pub fn as_int(self: Object) ReadError!i64 {
         match self {
             .Int(v) => { return v; }
             .Real(v) => {
@@ -99,7 +100,7 @@ pub union Object {
         }
     }
 
-    pub fn as_num(self: Object) !f64 {
+    pub fn as_num(self: Object) ReadError!f64 {
         match self {
             .Int(v)  => { return @float_from_int(f64, v); }
             .Real(v) => { return v; }
@@ -107,21 +108,21 @@ pub union Object {
         }
     }
 
-    pub fn as_name(self: Object) ![]u8 {
+    pub fn as_name(self: Object) ReadError![]u8 {
         match self {
             .Name(v) => { return v; }
             else     => { return error.WrongType; }
         }
     }
 
-    pub fn as_str(self: Object) ![]u8 {
+    pub fn as_str(self: Object) ReadError![]u8 {
         match self {
             .Str(v) => { return v; }
             else    => { return error.WrongType; }
         }
     }
 
-    pub fn as_array(self: Object) ![]Object {
+    pub fn as_array(self: Object) ReadError![]Object {
         match self {
             .Array(v) => { return v; }
             else      => { return error.WrongType; }
@@ -129,7 +130,7 @@ pub union Object {
     }
 
     /// The dictionary of a Dict or a Stream.
-    pub fn as_dict(self: Object) !Dict {
+    pub fn as_dict(self: Object) ReadError!Dict {
         match self {
             .Dict(v)   => { return v; }
             .Stream(s) => { return s.dict; }
@@ -137,7 +138,7 @@ pub union Object {
         }
     }
 
-    pub fn as_stream(self: Object) !Stream {
+    pub fn as_stream(self: Object) ReadError!Stream {
         match self {
             .Stream(s) => { return s; }
             else       => { return error.WrongType; }
@@ -330,7 +331,7 @@ pub struct Reader {
         self.pages.deinit();
     }
 
-    fn keep(self: *mut Reader, b: []mut u8) ![]u8 {
+    fn keep(self: *mut Reader, b: []mut u8) ReadError![]u8 {
         self.bytes.push(b) catch |e| {
             mem.free(b);
             return e;
@@ -360,7 +361,7 @@ pub struct Reader {
         };
     }
 
-    fn set_entry(self: *mut Reader, num: usize, e: Entry) !void {
+    fn set_entry(self: *mut Reader, num: usize, e: Entry) ReadError!void {
         if num >= (1 << 23) {
             return;
         }
@@ -373,7 +374,7 @@ pub struct Reader {
     }
 
     /// Sets an entry unless a newer section already did.
-    fn add_entry(self: *mut Reader, num: usize, e: Entry, seen: *mut vec.Vec.[u8]) !void {
+    fn add_entry(self: *mut Reader, num: usize, e: Entry, seen: *mut vec.Vec.[u8]) ReadError!void {
         if num >= (1 << 23) {
             return;
         }
@@ -434,7 +435,7 @@ pub struct Reader {
         return not first;
     }
 
-    fn xref_table(self: *mut Reader, p: usize, seen: *mut vec.Vec.[u8]) !Dict {
+    fn xref_table(self: *mut Reader, p: usize, seen: *mut vec.Vec.[u8]) ReadError!Dict {
         let d = self.data;
         let mut i = p;
         while true {
@@ -559,7 +560,7 @@ pub struct Reader {
 
     /// Rebuilds the table from "n g obj" markers, and the trailer from the
     /// last trailer dictionary or the catalog.
-    fn reconstruct(self: *mut Reader) !void {
+    fn reconstruct(self: *mut Reader) ReadError!void {
         let d = self.data;
         self.xref.clear();
         self.cache.clear();
@@ -750,11 +751,11 @@ pub struct Reader {
             return error.Corrupt;
         }
         let mut lx2 = Lexer.{ s: os.data, pos: @truncate(usize, at_) };
-        return self.parse(&mut lx2, 0);
+        return self.parse(&mut lx2, 0)!;
     }
 
     /// "n g obj ... endobj" (with stream data).
-    fn parse_indirect(self: *mut Reader, lx: *mut Lexer) !Object {
+    fn parse_indirect(self: *mut Reader, lx: *mut Lexer) ReadError!Object {
         let mut iv: i64 = 0;
         let mut fv: f64 = 0.0;
         let mut isint = false;
@@ -824,7 +825,7 @@ pub struct Reader {
     }
 
     /// One object from the lexer.
-    fn parse(self: *mut Reader, lx: *mut Lexer, depth: u32) !Object {
+    fn parse(self: *mut Reader, lx: *mut Lexer, depth: u32) ReadError!Object {
         if depth > MAX_DEPTH {
             return error.Corrupt;
         }
@@ -946,7 +947,7 @@ pub struct Reader {
         return Object.Null;
     }
 
-    fn make_dict(self: *mut Reader, keys: [][]u8, vals: []Object) !Dict {
+    fn make_dict(self: *mut Reader, keys: [][]u8, vals: []Object) ReadError!Dict {
         let k = mem.alloc.[[]u8](keys.len)!;
         @mem_copy(k, keys);
         self.names.push(k) catch |e| {
@@ -962,7 +963,7 @@ pub struct Reader {
         return Dict.{ keys: k, vals: v };
     }
 
-    fn name(self: *mut Reader, lx: *mut Lexer) ![]u8 {
+    fn name(self: *mut Reader, lx: *mut Lexer) ReadError![]u8 {
         let s = lx.s;
         lx.pos += 1;
         let start = lx.pos;
@@ -998,7 +999,7 @@ pub struct Reader {
         return self.keep(out.take()!);
     }
 
-    fn literal(self: *mut Reader, lx: *mut Lexer) ![]u8 {
+    fn literal(self: *mut Reader, lx: *mut Lexer) ReadError![]u8 {
         let s = lx.s;
         lx.pos += 1;
         let mut out = strs.String.init();
@@ -1010,7 +1011,7 @@ pub struct Reader {
         return self.keep(out.take()!);
     }
 
-    fn hex_string(self: *mut Reader, lx: *mut Lexer) ![]u8 {
+    fn hex_string(self: *mut Reader, lx: *mut Lexer) ReadError![]u8 {
         let s = lx.s;
         lx.pos += 1;
         let mut out = strs.String.init();
@@ -1086,7 +1087,7 @@ pub struct Reader {
             return error.TooLarge;
         }
         self.budget -= cur.len;
-        return self.keep(cur);
+        return self.keep(cur)!;
     }
 
     fn apply_filter(self: *mut Reader, f: []u8, data: []u8, parms: Object) ![]mut u8 {
@@ -1101,11 +1102,11 @@ pub struct Reader {
                     if (e2 == error.OutOfMemory) or (e2 == error.TooLarge) {
                         return e2;
                     }
-                    return mem.alloc.[u8](0);
+                    return mem.alloc.[u8](0)!;
                 };
-                return predict(raw, parms);
+                return predict(raw, parms)!;
             };
-            return predict(out, parms);
+            return predict(out, parms)!;
         }
         if strs.eq(f, "LZWDecode") or strs.eq(f, "LZW") {
             let mut early: i64 = 1;
@@ -1114,7 +1115,7 @@ pub struct Reader {
                 else => {}
             }
             let out = lzw_decode(data, early != 0, limit)!;
-            return predict(out, parms);
+            return predict(out, parms)!;
         }
         if strs.eq(f, "ASCIIHexDecode") or strs.eq(f, "AHx") {
             let mut out = strs.String.init();
@@ -1135,16 +1136,16 @@ pub struct Reader {
                 out.deinit();
                 return e;
             };
-            return out.take();
+            return out.take()!;
         }
         if strs.eq(f, "ASCII85Decode") or strs.eq(f, "A85") {
-            return ascii85(data, limit);
+            return ascii85(data, limit)!;
         }
         if strs.eq(f, "RunLengthDecode") or strs.eq(f, "RL") {
-            return run_length(data, limit);
+            return run_length(data, limit)!;
         }
         // images (DCT, JPX, JBIG2, CCITT) and anything else stay as they are
-        return mem.dup.[u8](data);
+        return mem.dup.[u8](data)!;
     }
 
     // --- pages ---
@@ -1205,7 +1206,7 @@ pub struct Reader {
     }
 
     /// A child with its parent's inheritable attributes where it has none.
-    fn inherit(self: *mut Reader, parent: Dict, kid: Dict) !Dict {
+    fn inherit(self: *mut Reader, parent: Dict, kid: Dict) ReadError!Dict {
         let names: [4][]u8 = ["Resources", "MediaBox", "CropBox", "Rotate"];
         let mut keys = vec.Vec.[[]u8].init();
         defer keys.deinit();
@@ -1232,7 +1233,7 @@ pub struct Reader {
     }
 
     /// A page's dictionary (with inherited attributes).
-    pub fn page(self: *Reader, i: usize) !Dict {
+    pub fn page(self: *Reader, i: usize) ReadError!Dict {
         if i >= self.pages.len {
             return error.NotFound;
         }
@@ -1257,10 +1258,10 @@ pub struct Reader {
     /// A metadata entry (Title, Author, ...) as UTF-8; empty if absent.
     pub fn info(self: *mut Reader, key: []u8) ![]mut u8 {
         let io_ = self.get(self.trailer, "Info")!;
-        let d = io_.as_dict() catch return mem.alloc.[u8](0);
+        let d = io_.as_dict() catch return mem.alloc.[u8](0)!;
         let v = self.get(d, key)!;
-        let s = v.as_str() catch return mem.alloc.[u8](0);
-        return text_string(s);
+        let s = v.as_str() catch return mem.alloc.[u8](0)!;
+        return text_string(s)!;
     }
 
     /// The text of page i, as UTF-8 lines.
@@ -1286,7 +1287,7 @@ pub struct Reader {
             else => {}
         }
         ex.run(data.bytes(), rd, 0)!;
-        return ex.out.take();
+        return ex.out.take()!;
     }
 }
 
@@ -1301,7 +1302,7 @@ struct ObjStm {
 }
 
 /// A literal string's contents from s[pos] (just after the '(').
-fn literal_into(s: []u8, pos: *mut usize, out: *mut strs.String) !void {
+fn literal_into(s: []u8, pos: *mut usize, out: *mut strs.String) ReadError!void {
     let mut depth: usize = 1;
     let mut i = pos.*;
     while i < s.len {
@@ -1358,7 +1359,7 @@ fn literal_into(s: []u8, pos: *mut usize, out: *mut strs.String) !void {
 }
 
 /// A hex string's contents from s[pos] (just after the '<').
-fn hex_into(s: []u8, pos: *mut usize, out: *mut strs.String) !void {
+fn hex_into(s: []u8, pos: *mut usize, out: *mut strs.String) ReadError!void {
     let mut i = pos.*;
     let mut hi: i32 = -1;
     while i < s.len {
@@ -1386,17 +1387,17 @@ fn hex_into(s: []u8, pos: *mut usize, out: *mut strs.String) !void {
 
 /// A text string (UTF-16 with a byte order mark, UTF-8 with one, or
 /// PDFDocEncoding) as UTF-8.
-pub fn text_string(s: []u8) ![]mut u8 {
+pub fn text_string(s: []u8) ReadError![]mut u8 {
     let mut out = strs.String.init();
     let r = text_string_into(s, &mut out);
     r catch |e| {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
-fn text_string_into(s: []u8, out: *mut strs.String) !void {
+fn text_string_into(s: []u8, out: *mut strs.String) ReadError!void {
     if (s.len >= 2) and (((s[0] == 0xfe) and (s[1] == 0xff)) or ((s[0] == 0xff) and (s[1] == 0xfe))) {
         let le = s[0] == 0xff;
         let mut i: usize = 2;
@@ -1440,7 +1441,7 @@ fn text_string_into(s: []u8, out: *mut strs.String) !void {
 // -----------------------------------------------------------------------------
 
 /// PNG (10 and up) and TIFF (2) predictors.
-fn predict(data: []mut u8, parms: Object) ![]mut u8 {
+fn predict(data: []mut u8, parms: Object) ReadError![]mut u8 {
     let d = parms.as_dict() catch return data;
     let pred = d.get("Predictor").as_int() catch 1;
     if pred < 2 {
@@ -1515,7 +1516,7 @@ fn predict(data: []mut u8, parms: Object) ![]mut u8 {
     return out;
 }
 
-fn lzw_decode(data: []u8, early: bool, limit: usize) ![]mut u8 {
+fn lzw_decode(data: []u8, early: bool, limit: usize) ReadError![]mut u8 {
     let mut out = strs.String.init();
     // the table: each entry is a previous entry plus a byte
     let mut prefix = vec.Vec.[u32].init();
@@ -1533,11 +1534,11 @@ fn lzw_decode(data: []u8, early: bool, limit: usize) ![]mut u8 {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 fn lzw_reset(prefix: *mut vec.Vec.[u32], last: *mut vec.Vec.[u8], first: *mut vec.Vec.[u8],
-             lens: *mut vec.Vec.[u32]) !void {
+             lens: *mut vec.Vec.[u32]) ReadError!void {
     prefix.clear();
     last.clear();
     first.clear();
@@ -1551,7 +1552,8 @@ fn lzw_reset(prefix: *mut vec.Vec.[u32], last: *mut vec.Vec.[u8], first: *mut ve
 }
 
 fn lzw_run(data: []u8, early: bool, limit: usize, out: *mut strs.String, prefix: *mut vec.Vec.[u32],
-           last: *mut vec.Vec.[u8], first: *mut vec.Vec.[u8], lens: *mut vec.Vec.[u32], tmp: *mut vec.Vec.[u8]) !void {
+           last: *mut vec.Vec.[u8], first: *mut vec.Vec.[u8], lens: *mut vec.Vec.[u32],
+           tmp: *mut vec.Vec.[u8]) ReadError!void {
     lzw_reset(prefix, last, first, lens)!;
     let mut bits: u32 = 9;
     let mut acc: u64 = 0;
@@ -1639,7 +1641,7 @@ fn if_u32(c: bool, a: u32, b: u32) u32 {
     return b;
 }
 
-fn ascii85(data: []u8, limit: usize) ![]mut u8 {
+fn ascii85(data: []u8, limit: usize) ReadError![]mut u8 {
     let mut out = strs.String.init();
     let mut group: [5]u32 = [0, 0, 0, 0, 0];
     let mut n: usize = 0;
@@ -1703,10 +1705,10 @@ fn ascii85(data: []u8, limit: usize) ![]mut u8 {
             };
         }
     }
-    return out.take();
+    return out.take()!;
 }
 
-fn run_length(data: []u8, limit: usize) ![]mut u8 {
+fn run_length(data: []u8, limit: usize) ReadError![]mut u8 {
     let mut out = strs.String.init();
     let mut i: usize = 0;
     while i < data.len {
@@ -1736,7 +1738,7 @@ fn run_length(data: []u8, limit: usize) ![]mut u8 {
             return error.TooLarge;
         }
     }
-    return out.take();
+    return out.take()!;
 }
 
 // -----------------------------------------------------------------------------
@@ -2063,7 +2065,7 @@ struct Extractor {
     }
 
     /// Shows a string: decodes it to characters, placing each.
-    fn show(self: *mut Extractor, s: []u8) !void {
+    fn show(self: *mut Extractor, s: []u8) ReadError!void {
         if self.font == NO_FONT {
             return;
         }
@@ -2116,7 +2118,7 @@ struct Extractor {
 
     /// Appends a character, with a line break or a space before it when it
     /// is far from the last one.
-    fn place(self: *mut Extractor, fi: usize, code: u32, x: f64, y: f64, size: f64) !void {
+    fn place(self: *mut Extractor, fi: usize, code: u32, x: f64, y: f64, size: f64) ReadError!void {
         let f = self.fonts.get_ptr(fi);
         let mut text: []u8 = "";
         let mut buf: [4]u8 = [0; 4];
@@ -2298,7 +2300,7 @@ struct Extractor {
     }
 
     /// A ToUnicode CMap: codespace ranges, bfchar and bfrange.
-    fn parse_cmap(self: *mut Extractor, m: *mut FontMap, s: []u8) !void {
+    fn parse_cmap(self: *mut Extractor, m: *mut FontMap, s: []u8) ReadError!void {
         let mut i: usize = 0;
         let mut toks = vec.Vec.[Tok].init();
         defer toks.deinit();
@@ -2437,7 +2439,7 @@ struct Extractor {
     }
 
     /// Maps a code to UTF-16BE text (plus `add` to its last unit, for ranges).
-    fn map_code(self: *mut Extractor, m: *mut FontMap, code: u32, dst: []u8, add: u32) !void {
+    fn map_code(self: *mut Extractor, m: *mut FontMap, code: u32, dst: []u8, add: u32) ReadError!void {
         let off = self.pool.len;
         let mut i: usize = 0;
         while i + 1 < dst.len {
@@ -2583,7 +2585,7 @@ pub fn glyph_unicode(name0: []u8) u32 {
 
 /// A PDF from object bodies (object i + 1 is objs[i]), with a
 /// cross-reference table; the catalog is object 1.
-fn build(objs: [][]u8) ![]mut u8 {
+fn build(objs: [][]u8) ReadError![]mut u8 {
     let mut out = strs.String.init();
     out.push_str("%PDF-1.7\n")!;
     let mut offs = vec.Vec.[usize].init();
@@ -2616,17 +2618,17 @@ fn build(objs: [][]u8) ![]mut u8 {
     out.push_str(" /Root 1 0 R /Info << /Title (T\\351st) >> >>\nstartxref\n")!;
     put_dec(&mut out, xref)!;
     out.push_str("\n%%EOF\n")!;
-    return out.take();
+    return out.take()!;
 }
 
-fn put_dec(out: *mut strs.String, v: usize) !void {
+fn put_dec(out: *mut strs.String, v: usize) ReadError!void {
     if v >= 10 {
         put_dec(out, v / 10)!;
     }
     out.push(@truncate(u8, v % 10) + '0')!;
 }
 
-fn stream_obj(dict: []u8, data: []u8) ![]mut u8 {
+fn stream_obj(dict: []u8, data: []u8) ReadError![]mut u8 {
     let mut s = strs.String.init();
     s.push_str("<< ")!;
     s.push_str(dict)!;
@@ -2635,7 +2637,7 @@ fn stream_obj(dict: []u8, data: []u8) ![]mut u8 {
     s.push_str(" >>\nstream\n")!;
     s.push_str(data)!;
     s.push_str("\nendstream")!;
-    return s.take();
+    return s.take()!;
 }
 
 fn page_text_of(pdf: []u8, i: usize) ![]mut u8 {
@@ -2804,13 +2806,13 @@ test "filters" {
     @expect_eq(glyph_unicode("nonsense"), 0);
 }
 
-fn failed(r: ![]mut u8) bool {
+fn failed(r: ReadError![]mut u8) bool {
     let v = r catch return true;
     mem.free(v);
     return false;
 }
 
-fn simple_pdf(content: []u8) ![]mut u8 {
+fn simple_pdf(content: []u8) ReadError![]mut u8 {
     let c = stream_obj("", content)!;
     defer mem.free(c);
     let objs: [5][]u8 = [

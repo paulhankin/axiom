@@ -31,7 +31,8 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "deflate.ax" as deflate;
 
-error { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory }
+pub error XzError { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory, IoError, NotFound, Empty, Done,
+                    InvalidUtf8 }
 
 /// The integrity checks compress can write. (A stream being decompressed
 /// may name others, which are skipped rather than checked.)
@@ -325,7 +326,7 @@ struct Rc {
     code: u32,
     over: bool,  // read past the end (the input is corrupt)
 
-    fn init(s: []u8) !Rc {
+    fn init(s: []u8) XzError!Rc {
         if (s.len < 5) or (s[0] != 0) {
             return error.Corrupt;
         }
@@ -458,7 +459,7 @@ struct Model {
     }
 
     // New properties (lc + lp at most 12); resets the state.
-    fn set_props(self: *mut Model, lc: u32, lp: u32, pb: u32) !void {
+    fn set_props(self: *mut Model, lc: u32, lp: u32, pb: u32) XzError!void {
         if (lc > 8) or (lp > 4) or (pb > 4) {
             return error.Corrupt;
         }
@@ -550,7 +551,7 @@ fn after_short_rep(s: usize) usize {
 // eopm, an end marker). Matches reach back no further than dict_start.
 // Returns whether an end marker was seen.
 fn lzma_decode(m: *mut Model, rc: *mut Rc, out: *mut strs.String, dict_start: usize, want: u64, eopm: bool,
-               max_size: usize) !bool {
+               max_size: usize) XzError!bool {
     let goal = @as(u64, out.len) + want;
     let pb_mask = (@as(usize, 1) << @truncate(u32, m.pb)) - 1;
     let lp_mask = (@as(usize, 1) << @truncate(u32, m.lp)) - 1;
@@ -691,7 +692,7 @@ fn lzma_decode(m: *mut Model, rc: *mut Rc, out: *mut strs.String, dict_start: us
 // -----------------------------------------------------------------------------
 
 // Decodes LZMA2 data onto out; returns how many input bytes it took.
-fn lzma2_decode(src: []u8, out: *mut strs.String, max_size: usize) !usize {
+fn lzma2_decode(src: []u8, out: *mut strs.String, max_size: usize) XzError!usize {
     let mut m = new_model();
     defer m.deinit();
     let mut dict_start = out.len;
@@ -786,17 +787,17 @@ fn lzma2_decode(src: []u8, out: *mut strs.String, max_size: usize) !usize {
 
 /// Decodes a raw LZMA2 stream (as other formats embed it); the caller frees
 /// the result.
-pub fn decompress_lzma2(src: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress_lzma2(src: []u8, max_size: usize) XzError![]mut u8 {
     let mut out = strs.String.init();
     _ = lzma2_decode(src, &mut out, max_size) catch |e| {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 /// Decompresses the legacy .lzma format; the caller frees the result.
-pub fn decompress_lzma(src: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress_lzma(src: []u8, max_size: usize) XzError![]mut u8 {
     if src.len < 13 {
         return error.Corrupt;
     }
@@ -831,7 +832,7 @@ pub fn decompress_lzma(src: []u8, max_size: usize) ![]mut u8 {
         out.deinit();
         return error.Corrupt;
     }
-    return out.take();
+    return out.take()!;
 }
 
 // -----------------------------------------------------------------------------
@@ -1027,7 +1028,7 @@ fn sparc_decode(b: []mut u8, start: u32) void {
 let HEADER_MAGIC: []u8 = "\xfd7zXZ\x00";
 
 // The size of the check with ID `check` in a stream header.
-fn check_size(check: u8) !usize {
+fn check_size(check: u8) XzError!usize {
     if check <= 15 {
         let sizes: [16]usize = [0, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64];
         return sizes[@as(usize, check)];  // (unknown kinds: skipped, not checked)
@@ -1036,7 +1037,7 @@ fn check_size(check: u8) !usize {
 }
 
 // A variable-length integer (7 bits a byte, at most 9 bytes).
-fn varint(b: []u8, at: *mut usize, end: usize) !u64 {
+fn varint(b: []u8, at: *mut usize, end: usize) XzError!u64 {
     let mut v: u64 = 0;
     let mut shift: u64 = 0;
     loop {
@@ -1067,16 +1068,16 @@ struct Record {
 }
 
 /// Decompresses .xz data (one or more streams); the caller frees the result.
-pub fn decompress(data: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress(data: []u8, max_size: usize) XzError![]mut u8 {
     let mut out = strs.String.init();
     decode_streams(data, &mut out, max_size) catch |e| {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
-fn decode_streams(d: []u8, out: *mut strs.String, max_size: usize) !void {
+fn decode_streams(d: []u8, out: *mut strs.String, max_size: usize) XzError!void {
     let mut i: usize = 0;
     let mut streams: usize = 0;
     while i < d.len {
@@ -1096,7 +1097,7 @@ fn decode_streams(d: []u8, out: *mut strs.String, max_size: usize) !void {
     }
 }
 
-fn stream(d: []u8, at: usize, out: *mut strs.String, max_size: usize) !usize {
+fn stream(d: []u8, at: usize, out: *mut strs.String, max_size: usize) XzError!usize {
     if ((d.len - at) < 24) or not strs.eq(d[at..at + 6], HEADER_MAGIC) {
         return error.Corrupt;
     }
@@ -1163,7 +1164,7 @@ fn stream(d: []u8, at: usize, out: *mut strs.String, max_size: usize) !usize {
 }
 
 fn block(d: []u8, at: usize, check: u8, csize: usize, out: *mut strs.String, max_size: usize,
-         unpadded: *mut u64) !usize {
+         unpadded: *mut u64) XzError!usize {
     let hsize = (@as(usize, d[at]) + 1) * 4;
     if (d.len - at) < hsize {
         return error.Corrupt;
@@ -1302,7 +1303,7 @@ struct Re {
         self.cache_size = 1;
     }
 
-    fn shift_low(self: *mut Re) !void {
+    fn shift_low(self: *mut Re) XzError!void {
         if ((self.low & 0xffffffff) < 0xff000000) or ((self.low >> 32) != 0) {
             let carry = @truncate(u8, self.low >> 32);
             let mut temp = self.cache;
@@ -1320,7 +1321,7 @@ struct Re {
         self.low = (self.low & 0x00ffffff) << 8;
     }
 
-    fn bit(self: *mut Re, p: *mut u16, b: u32) !void {
+    fn bit(self: *mut Re, p: *mut u16, b: u32) XzError!void {
         let bound = (self.range >> 11) * @as(u32, p.*);
         if b == 0 {
             self.range = bound;
@@ -1336,7 +1337,7 @@ struct Re {
         }
     }
 
-    fn direct(self: *mut Re, v: u32, n: u32) !void {
+    fn direct(self: *mut Re, v: u32, n: u32) XzError!void {
         let mut k = n;
         while k > 0 {
             k -= 1;
@@ -1351,7 +1352,7 @@ struct Re {
         }
     }
 
-    fn tree(self: *mut Re, probs: []mut u16, bits: u32, v: u32) !void {
+    fn tree(self: *mut Re, probs: []mut u16, bits: u32, v: u32) XzError!void {
         let mut m: u32 = 1;
         let mut k = bits;
         while k > 0 {
@@ -1362,7 +1363,7 @@ struct Re {
         }
     }
 
-    fn reverse(self: *mut Re, probs: []mut u16, bits: u32, v: u32) !void {
+    fn reverse(self: *mut Re, probs: []mut u16, bits: u32, v: u32) XzError!void {
         let mut m: u32 = 1;
         for k in @as(u32, 0)..bits {
             let b = (v >> k) & 1;
@@ -1371,7 +1372,7 @@ struct Re {
         }
     }
 
-    fn flush(self: *mut Re) !void {
+    fn flush(self: *mut Re) XzError!void {
         for _k in @as(usize, 0)..5 {
             self.shift_low()!;
         }
@@ -1383,7 +1384,7 @@ struct Re {
     }
 }
 
-fn enc_len(re: *mut Re, lc: *mut LenCoder, v: u32, ps: usize) !void {
+fn enc_len(re: *mut Re, lc: *mut LenCoder, v: u32, ps: usize) XzError!void {
     if v < 8 {
         re.bit(&mut lc.choice, 0)!;
         re.tree(lc.low[ps * 8..(ps * 8) + 8], 3, v)!;
@@ -1492,7 +1493,7 @@ struct Encoder {
         return @truncate(u32, best_d - 1);
     }
 
-    fn literal(self: *mut Encoder, i: usize, start: usize) !void {
+    fn literal(self: *mut Encoder, i: usize, start: usize) XzError!void {
         let m = &mut self.m;
         let pos = i - start;
         let ps = pos & ((@as(usize, 1) << @truncate(u32, m.pb)) - 1);
@@ -1531,7 +1532,7 @@ struct Encoder {
         m.state = after_literal(st);
     }
 
-    fn rep(self: *mut Encoder, i: usize, start: usize, k: usize, len: usize) !void {
+    fn rep(self: *mut Encoder, i: usize, start: usize, k: usize, len: usize) XzError!void {
         let m = &mut self.m;
         let ps = (i - start) & ((@as(usize, 1) << @truncate(u32, m.pb)) - 1);
         let st = m.state;
@@ -1562,7 +1563,7 @@ struct Encoder {
         m.state = after_rep(st);
     }
 
-    fn match_(self: *mut Encoder, i: usize, start: usize, dist: u32, len: usize) !void {
+    fn match_(self: *mut Encoder, i: usize, start: usize, dist: u32, len: usize) XzError!void {
         let m = &mut self.m;
         let ps = (i - start) & ((@as(usize, 1) << @truncate(u32, m.pb)) - 1);
         let st = m.state;
@@ -1625,7 +1626,7 @@ fn level_dict(level: u32) usize {
     return dicts[@as(usize, @max(@min(level, 9), 1))];
 }
 
-fn new_encoder(data: []u8, level: u32) !Encoder {
+fn new_encoder(data: []u8, level: u32) XzError!Encoder {
     let lv = @max(@min(level, 9), 1);
     let depths: [10]u32 = [0, 4, 8, 16, 24, 32, 48, 96, 192, 384];
     let mut e = Encoder.{ m: new_model(), re: Re.init(), data: data, head: mem.alloc.[u32](HASH_SIZE)!,
@@ -1658,7 +1659,7 @@ fn dict_byte(n: usize) u8 {
 
 // Chooses the next symbol at i and encodes it: returns how many bytes it
 // covers.
-fn step(e: *mut Encoder, i: usize, start: usize) !usize {
+fn step(e: *mut Encoder, i: usize, start: usize) XzError!usize {
     let mut rk: usize = 0;
     let rlen = e.best_rep(i, start, &mut rk);
     let mut mlen: usize = 0;
@@ -1777,15 +1778,15 @@ pub fn compress(data: []u8, opts: Options) ![]mut u8 {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
-fn put32(out: *mut strs.String, v: u32) !void {
+fn put32(out: *mut strs.String, v: u32) XzError!void {
     let b: [4]u8 = [@truncate(u8, v), @truncate(u8, v >> 8), @truncate(u8, v >> 16), @truncate(u8, v >> 24)];
     out.push_str(b[..])!;
 }
 
-fn put_varint(out: *mut strs.String, v: u64) !void {
+fn put_varint(out: *mut strs.String, v: u64) XzError!void {
     let mut x = v;
     while x >= 0x80 {
         out.push(@truncate(u8, x) | 0x80)!;
@@ -1867,7 +1868,7 @@ pub fn compress_lzma(data: []u8, level: u32) ![]mut u8 {
         out.deinit();
         return err;
     };
-    return out.take();
+    return out.take()!;
 }
 
 /// Compresses data in the legacy .lzma format and writes it to w as it is
@@ -1903,7 +1904,7 @@ pub fn compress_lzma_to(w: io.Writer, data: []u8, level: u32) !void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn fails(r: ![]mut u8) bool {
+fn fails(r: XzError![]mut u8) bool {
     let x = r catch return true;
     mem.free(x);
     return false;

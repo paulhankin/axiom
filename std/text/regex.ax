@@ -43,7 +43,7 @@ import "../mem.ax" as mem;
 import "../str.ax" as strs;
 import "../sync.ax" as sync;
 
-error { SyntaxError, TooBig, NotFound, Done, OutOfMemory }
+pub error RegexError { SyntaxError, TooBig, NotFound, Done, OutOfMemory, Empty, InvalidUtf8 }
 
 /// Patterns that would compile to more instructions than this fail with
 /// TooBig (x{1000}{1000} and the like).
@@ -74,11 +74,11 @@ struct Set {
         self.rs.deinit();
     }
 
-    fn add(self: *mut Set, lo: u32, hi: u32) !void {
+    fn add(self: *mut Set, lo: u32, hi: u32) RegexError!void {
         self.rs.push(Range.{ lo: lo, hi: hi })!;
     }
 
-    fn add_set(self: *mut Set, o: *Set) !void {
+    fn add_set(self: *mut Set, o: *Set) RegexError!void {
         self.rs.extend(o.rs.items())!;
     }
 
@@ -102,7 +102,7 @@ struct Set {
     }
 
     /// Replaces the set by its complement in [0, 0x10FFFF].
-    fn negate(self: *mut Set) !void {
+    fn negate(self: *mut Set) RegexError!void {
         self.normalize();
         let mut out = vec.Vec.[Range].init();
         let mut next: u32 = 0;
@@ -126,7 +126,7 @@ struct Set {
     }
 
     /// Adds the other ASCII case of every ASCII letter in the set.
-    fn fold(self: *mut Set) !void {
+    fn fold(self: *mut Set) RegexError!void {
         let n = self.rs.len;
         for i in 0..n {
             let r = self.rs.get(i);
@@ -145,7 +145,7 @@ struct Set {
     }
 }
 
-fn add_perl(s: *mut Set, c: u8) !void {
+fn add_perl(s: *mut Set, c: u8) RegexError!void {
     match c | 0x20 {
         'd' => { s.add('0', '9')!; }
         'w' => {
@@ -233,23 +233,23 @@ struct Parser {
     message: []u8,
     depth: u32,
 
-    fn fail(self: *mut Parser, msg: []u8) error {
+    fn fail(self: *mut Parser, msg: []u8) RegexError {
         if self.message.len == 0 {
             self.message = msg;
         }
         return error.SyntaxError;
     }
 
-    fn node(self: *mut Parser, n: Node) !u32 {
+    fn node(self: *mut Parser, n: Node) RegexError!u32 {
         self.nodes.push(n)!;
         return @int_cast(u32, self.nodes.len - 1);
     }
 
-    fn leaf(self: *mut Parser, kind: NodeKind, a: u32) !u32 {
+    fn leaf(self: *mut Parser, kind: NodeKind, a: u32) RegexError!u32 {
         return self.node(Node.{ kind: kind, greedy: false, a: a, b: 0, min: 0, max: 0, first: 0, count: 0 });
     }
 
-    fn list(self: *mut Parser, kind: NodeKind, items: []u32) !u32 {
+    fn list(self: *mut Parser, kind: NodeKind, items: []u32) RegexError!u32 {
         let first = @int_cast(u32, self.kids.len);
         self.kids.extend(items)!;
         return self.node(Node.{ kind: kind, greedy: false, a: 0, b: 0, min: 0, max: 0, first: first,
@@ -257,7 +257,7 @@ struct Parser {
     }
 
     /// Stores a finished set as a class and returns its index.
-    fn class_of(self: *mut Parser, set: *mut Set) !u32 {
+    fn class_of(self: *mut Parser, set: *mut Set) RegexError!u32 {
         set.normalize();
         let first = @int_cast(u32, self.ranges.len);
         self.ranges.extend(set.rs.items())!;
@@ -283,7 +283,7 @@ struct Parser {
         return r.value;
     }
 
-    fn alternation(self: *mut Parser, f: *mut Flags) !u32 {
+    fn alternation(self: *mut Parser, f: *mut Flags) RegexError!u32 {
         let mut alts = vec.Vec.[u32].init();
         defer alts.deinit();
         alts.push(self.concatenation(f)!)!;
@@ -297,7 +297,7 @@ struct Parser {
         return self.list(NodeKind.ALT, alts.items());
     }
 
-    fn concatenation(self: *mut Parser, f: *mut Flags) !u32 {
+    fn concatenation(self: *mut Parser, f: *mut Flags) RegexError!u32 {
         let mut items = vec.Vec.[u32].init();
         defer items.deinit();
         while self.more() and (self.peek() != '|') and (self.peek() != ')') {
@@ -318,7 +318,7 @@ struct Parser {
         return self.list(NodeKind.CAT, items.items());
     }
 
-    fn number(self: *mut Parser) !u32 {
+    fn number(self: *mut Parser) RegexError!u32 {
         if not strs.is_digit(self.peek()) {
             return self.fail("expected a number");
         }
@@ -333,7 +333,7 @@ struct Parser {
         return v;
     }
 
-    fn repetition(self: *mut Parser, atom: u32, f: *mut Flags, start: usize) !u32 {
+    fn repetition(self: *mut Parser, atom: u32, f: *mut Flags, start: usize) RegexError!u32 {
         let mut a = atom;
         loop {
             let c = self.peek();
@@ -396,7 +396,7 @@ struct Parser {
         }
     }
 
-    fn literal(self: *mut Parser, r: u32, f: *mut Flags) !u32 {
+    fn literal(self: *mut Parser, r: u32, f: *mut Flags) RegexError!u32 {
         if f.fold and (r < 128) and strs.is_alpha(@truncate(u8, r)) {
             let mut set = Set.init();
             defer set.deinit();
@@ -408,7 +408,7 @@ struct Parser {
     }
 
     /// One atom; NONE for a flag group, which matches nothing.
-    fn atom(self: *mut Parser, f: *mut Flags) !u32 {
+    fn atom(self: *mut Parser, f: *mut Flags) RegexError!u32 {
         let c = self.peek();
         match c {
             '(' => { return self.group(f); }
@@ -450,7 +450,7 @@ struct Parser {
         }
     }
 
-    fn escape(self: *mut Parser, f: *mut Flags) !u32 {
+    fn escape(self: *mut Parser, f: *mut Flags) RegexError!u32 {
         self.i += 1;
         if not self.more() {
             return self.fail("trailing backslash");
@@ -491,7 +491,7 @@ struct Parser {
     }
 
     /// The code point of a character escape (after the backslash).
-    fn escaped_rune(self: *mut Parser) !u32 {
+    fn escaped_rune(self: *mut Parser) RegexError!u32 {
         let c = self.peek();
         self.i += 1;
         match c {
@@ -542,7 +542,7 @@ struct Parser {
         }
     }
 
-    fn group(self: *mut Parser, f: *mut Flags) !u32 {
+    fn group(self: *mut Parser, f: *mut Flags) RegexError!u32 {
         let open = self.i;
         self.i += 1;
         self.depth += 1;
@@ -637,7 +637,7 @@ struct Parser {
     }
 
     /// A bracketed class, from '[' to ']'.
-    fn class(self: *mut Parser, set: *mut Set, f: *mut Flags) !void {
+    fn class(self: *mut Parser, set: *mut Set, f: *mut Flags) RegexError!void {
         let open = self.i;
         self.i += 1;
         let mut negated = false;
@@ -695,7 +695,7 @@ struct Parser {
         }
     }
 
-    fn class_rune(self: *mut Parser) !u32 {
+    fn class_rune(self: *mut Parser) RegexError!u32 {
         if self.peek() == '\\' {
             self.i += 1;
             if not self.more() {
@@ -707,7 +707,7 @@ struct Parser {
     }
 
     /// [:name:] inside a class.
-    fn posix(self: *mut Parser, set: *mut Set) !void {
+    fn posix(self: *mut Parser, set: *mut Set) RegexError!void {
         let start = self.i + 2;
         let end = strs.index_of_from(self.s, ":]", start) catch return self.fail("bad POSIX class");
         let raw = self.s[start..end];
@@ -799,7 +799,7 @@ struct Compiler {
     work: usize,
     depth: u32,
 
-    fn emit(self: *mut Compiler, op: Op, a: u32, b: u32) !u32 {
+    fn emit(self: *mut Compiler, op: Op, a: u32, b: u32) RegexError!u32 {
         if self.prog.len >= MAX_PROGRAM {
             return error.TooBig;
         }
@@ -819,7 +819,7 @@ struct Compiler {
         self.prog.get_ptr(@as(usize, at)).a = target;
     }
 
-    fn compile(self: *mut Compiler, ni: u32) !void {
+    fn compile(self: *mut Compiler, ni: u32) RegexError!void {
         self.work += 1;
         if (self.work > (4 * MAX_PROGRAM)) or (self.depth >= 1000) {
             return error.TooBig;
@@ -830,7 +830,7 @@ struct Compiler {
         return r;
     }
 
-    fn compile_node(self: *mut Compiler, ni: u32) !void {
+    fn compile_node(self: *mut Compiler, ni: u32) RegexError!void {
         let n = self.p.nodes.get(@as(usize, ni));
         match n.kind {
             .EMPTY => {}
@@ -883,7 +883,7 @@ struct Compiler {
     }
 
     /// A split whose targets set_split fills in.
-    fn split(self: *mut Compiler) !u32 {
+    fn split(self: *mut Compiler) RegexError!u32 {
         return self.emit(Op.SPLIT, 0, 0);
     }
 
@@ -897,7 +897,7 @@ struct Compiler {
         }
     }
 
-    fn repeat(self: *mut Compiler, n: Node) !void {
+    fn repeat(self: *mut Compiler, n: Node) RegexError!void {
         if n.max == INF {
             if n.min == 0 {
                 // L1: split L2, L3; L2: x; jmp L1; L3:
@@ -991,7 +991,7 @@ pub struct Regex {
     }
 
     /// The index of a named group.
-    pub fn group_index(self: *Regex, name: []u8) !usize {
+    pub fn group_index(self: *Regex, name: []u8) RegexError!usize {
         for nm in self.names.items() {
             if @mem_eq(nm.name, name) {
                 return @as(usize, nm.index);
@@ -1000,7 +1000,7 @@ pub struct Regex {
         return error.NotFound;
     }
 
-    pub fn is_match(self: *Regex, text: []u8) !bool {
+    pub fn is_match(self: *Regex, text: []u8) RegexError!bool {
         let mut m = Match.{ start: 0, end: 0 };
         let r = dfa_find(self, text, 0, &mut m, true);
         if r >= 0 {
@@ -1011,13 +1011,13 @@ pub struct Regex {
     }
 
     /// The leftmost match, or NotFound.
-    pub fn find(self: *Regex, text: []u8) !Match {
+    pub fn find(self: *Regex, text: []u8) RegexError!Match {
         return self.find_at(text, 0);
     }
 
     /// The leftmost match starting at or after byte `pos`. Assertions such
     /// as ^ and \b still see the text before pos.
-    pub fn find_at(self: *Regex, text: []u8, pos: usize) !Match {
+    pub fn find_at(self: *Regex, text: []u8, pos: usize) RegexError!Match {
         let mut m = Match.{ start: 0, end: 0 };
         let r = dfa_find(self, text, pos, &mut m, false);
         if r == 1 {
@@ -1034,11 +1034,11 @@ pub struct Regex {
     }
 
     /// The leftmost match and its groups, or NotFound.
-    pub fn captures(self: *Regex, text: []u8) !Captures {
+    pub fn captures(self: *Regex, text: []u8) RegexError!Captures {
         return self.captures_at(text, 0);
     }
 
-    pub fn captures_at(self: *Regex, text: []u8, pos: usize) !Captures {
+    pub fn captures_at(self: *Regex, text: []u8, pos: usize) RegexError!Captures {
         // the DFA narrows the search down to the match, the VM fills in the
         // groups
         let mut m = Match.{ start: pos, end: text.len };
@@ -1071,7 +1071,7 @@ pub struct Regex {
     /// text with every match replaced by `repl`, in which $1 or ${1} is a
     /// group, $name or ${name} a named group, $0 the whole match and $$ a
     /// dollar sign. Free the result with mem.free.
-    pub fn replace_all(self: *Regex, text: []u8, repl: []u8) ![]mut u8 {
+    pub fn replace_all(self: *Regex, text: []u8, repl: []u8) RegexError![]mut u8 {
         let mut out = strs.String.init();
         let mut it = self.find_all(text);
         let mut last: usize = 0;
@@ -1102,11 +1102,11 @@ pub struct Regex {
             out.deinit();
             return e;
         };
-        return out.take();
+        return out.take()!;
     }
 
     /// text with every match replaced by `repl` taken literally.
-    pub fn replace_all_literal(self: *Regex, text: []u8, repl: []u8) ![]mut u8 {
+    pub fn replace_all_literal(self: *Regex, text: []u8, repl: []u8) RegexError![]mut u8 {
         let mut out = strs.String.init();
         let mut it = self.find_all(text);
         let mut last: usize = 0;
@@ -1132,7 +1132,7 @@ pub struct Regex {
             out.deinit();
             return e;
         };
-        return out.take();
+        return out.take()!;
     }
 }
 
@@ -1154,7 +1154,7 @@ pub struct Captures {
     }
 
     /// Where group i matched; NotFound if it took no part in the match.
-    pub fn span(self: *Captures, i: usize) !Match {
+    pub fn span(self: *Captures, i: usize) RegexError!Match {
         if (i >= self.len()) or (self.slots[2 * i] == NO_POS) or (self.slots[(2 * i) + 1] == NO_POS) {
             return error.NotFound;
         }
@@ -1162,18 +1162,18 @@ pub struct Captures {
     }
 
     /// The text of group i (0 is the whole match).
-    pub fn get(self: *Captures, i: usize) ![]u8 {
+    pub fn get(self: *Captures, i: usize) RegexError![]u8 {
         let m = self.span(i)!;
         return self.text[m.start..m.end];
     }
 
     /// The text of a named group.
-    pub fn name(self: *Captures, n: []u8) ![]u8 {
+    pub fn name(self: *Captures, n: []u8) RegexError![]u8 {
         return self.get(self.re.group_index(n)!);
     }
 }
 
-fn expand(out: *mut strs.String, caps: *Captures, repl: []u8) !void {
+fn expand(out: *mut strs.String, caps: *Captures, repl: []u8) RegexError!void {
     let mut i: usize = 0;
     while i < repl.len {
         let c = repl[i];
@@ -1239,7 +1239,7 @@ pub struct Matches {
     last_end: usize,
     done: bool,
 
-    pub fn next(self: *mut Matches) !Match {
+    pub fn next(self: *mut Matches) RegexError!Match {
         loop {
             if self.done or (self.pos > self.text.len) {
                 self.done = true;
@@ -1275,13 +1275,13 @@ fn char_len(text: []u8, i: usize) usize {
 }
 
 /// Compiles a pattern; see the top of this file for the syntax.
-pub fn compile(pattern: []u8) !Regex {
+pub fn compile(pattern: []u8) RegexError!Regex {
     let mut info = ErrorInfo.{ offset: 0, message: "" };
     return compile_with(pattern, &mut info);
 }
 
 /// Like compile, and on a syntax error fills in where and why.
-pub fn compile_with(pattern: []u8, info: *mut ErrorInfo) !Regex {
+pub fn compile_with(pattern: []u8, info: *mut ErrorInfo) RegexError!Regex {
     let pat = strs.dup(pattern)!;
     let mut p = Parser.{
         s: pat,
@@ -1314,7 +1314,7 @@ pub fn compile_with(pattern: []u8, info: *mut ErrorInfo) !Regex {
     return re;
 }
 
-fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) !Regex {
+fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) RegexError!Regex {
     let mut flags = Flags.{ fold: false, multiline: false, dotall: false, ungreedy: false };
     let root = p.alternation(&mut flags)!;
     if p.more() {
@@ -1382,7 +1382,7 @@ fn unwrap(p: *Parser, ni: u32) Node {
 }
 
 /// The literal text every match must start with (possibly empty).
-fn literal_prefix(p: *Parser, root: u32) ![]mut u8 {
+fn literal_prefix(p: *Parser, root: u32) RegexError![]mut u8 {
     let mut out = strs.String.init();
     let n = unwrap(p, root);
     if n.kind == NodeKind.RUNE {
@@ -1402,7 +1402,7 @@ fn literal_prefix(p: *Parser, root: u32) ![]mut u8 {
             };
         }
     }
-    return out.take();
+    return out.take()!;
 }
 
 /// Whether the pattern starts with \A (or ^ without the m flag).
@@ -1593,7 +1593,7 @@ fn add_thread(vm: *mut Vm, l: *mut List, pc0: u32, i: usize) void {
     }
 }
 
-fn new_list(ninst: usize, ncap: usize) !List {
+fn new_list(ninst: usize, ncap: usize) RegexError!List {
     let pcs = mem.alloc.[u32](ninst)!;
     let caps = mem.alloc.[usize](@max(ninst * ncap, 1)) catch |e| {
         mem.free(pcs);
@@ -1610,7 +1610,7 @@ fn free_list(l: *mut List) void {
 /// Runs the program on text from `pos`. With slots.len > 0, fills in the
 /// capture slots (NO_POS for groups not taking part) of the leftmost-first
 /// match; with `earliest`, stops at the first match found.
-fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool) !bool {
+fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool) RegexError!bool {
     if pos > text.len {
         return false;
     }
@@ -1805,7 +1805,7 @@ struct Dfa {
     /// Appends to `work` the consuming instructions reachable from pc
     /// without consuming input, in priority order. Returns true once a
     /// Match was appended and (leftmost-first) the rest must be cut.
-    fn closure(self: *mut Dfa, prog: []Inst, pc0: u32) !bool {
+    fn closure(self: *mut Dfa, prog: []Inst, pc0: u32) RegexError!bool {
         self.stack.clear();
         self.stack.push(pc0)!;
         loop {
@@ -1836,7 +1836,7 @@ struct Dfa {
     }
 
     /// The state for the list in `work`, added if new.
-    fn intern(self: *mut Dfa, prog: []Inst, matched: bool) !i32 {
+    fn intern(self: *mut Dfa, prog: []Inst, matched: bool) RegexError!i32 {
         let list = self.work.items();
         if list.len == 0 {
             return DEAD;
@@ -1881,7 +1881,7 @@ struct Dfa {
         return @int_cast(i32, idx);
     }
 
-    fn ensure(self: *mut Dfa, ninst: usize) !void {
+    fn ensure(self: *mut Dfa, ninst: usize) RegexError!void {
         if self.stamp.len < ninst {
             mem.free(self.stamp);
             self.stamp = mem.alloc_zeroed.[u32](ninst)!;
@@ -1892,7 +1892,7 @@ struct Dfa {
         }
     }
 
-    fn start_state(self: *mut Dfa, prog: []Inst) !i32 {
+    fn start_state(self: *mut Dfa, prog: []Inst) RegexError!i32 {
         if self.start == UNKNOWN {
             self.gen += 1;
             self.work.clear();
@@ -1903,7 +1903,7 @@ struct Dfa {
     }
 
     /// The state after reading r in state si.
-    fn step(self: *mut Dfa, re: *Regex, prog: []Inst, si: i32, r: u32) !i32 {
+    fn step(self: *mut Dfa, re: *Regex, prog: []Inst, si: i32, r: u32) RegexError!i32 {
         let st = self.states.get(@int_cast(usize, si));
         self.gen += 1;
         self.work.clear();
@@ -1941,7 +1941,7 @@ struct Dfa {
     }
 
     /// step, through the cache for ASCII.
-    fn next(self: *mut Dfa, re: *Regex, prog: []Inst, si: i32, r: u32) !i32 {
+    fn next(self: *mut Dfa, re: *Regex, prog: []Inst, si: i32, r: u32) RegexError!i32 {
         if r < 128 {
             let slot = (@as(usize, @int_cast(u32, si)) * 128) + @as(usize, r);
             let t = self.trans.get(slot);

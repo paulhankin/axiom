@@ -33,24 +33,10 @@ import "ec.ax" as ec;
 import "rsa.ax" as rsa;
 import "sha2.ax" as sha2;
 
-error {
-    InvalidCertificate,
-    InvalidPem,
-    InvalidKey,
-    UnsupportedAlgorithm,
-    UnknownAuthority,
-    Expired,
-    NotYetValid,
-    HostnameMismatch,
-    BadSignature,
-    NotCA,
-    IncompatibleUsage,
-    NameConstraint,
-    UnhandledCriticalExtension,
-    PathTooLong,
-    NotFound,
-    OutOfMemory,
-}
+pub error X509Error { InvalidCertificate, InvalidPem, InvalidKey, UnsupportedAlgorithm, UnknownAuthority, Expired,
+                      NotYetValid, HostnameMismatch, BadSignature, NotCA, IncompatibleUsage, NameConstraint,
+                      UnhandledCriticalExtension, PathTooLong, NotFound, OutOfMemory, Done, IoError, Empty, Corrupt,
+                      InvalidBase64, InvalidUtf8, EndOfStream, UnexpectedTag, NoSpaceLeft }
 
 // -----------------------------------------------------------------------------
 // Object identifiers (DER-encoded contents)
@@ -164,7 +150,7 @@ pub struct PublicKey {
 }
 
 /// Parses a SubjectPublicKeyInfo.
-pub fn parse_spki(spki: []u8) !PublicKey {
+pub fn parse_spki(spki: []u8) X509Error!PublicKey {
     let mut r = der.Reader.init(spki);
     let mut seq = r.sequence()!;
     let mut alg = seq.sequence()!;
@@ -192,7 +178,7 @@ pub fn parse_spki(spki: []u8) !PublicKey {
 
 /// The algorithm and hash of an AlgorithmIdentifier for a signature.
 /// (The hash is SHA-256, and ignored, for Ed25519 and unsupported ones.)
-fn parse_sig_alg(alg_der: []u8, alg: *mut SigAlg, hash: *mut sha2.Algorithm) !void {
+fn parse_sig_alg(alg_der: []u8, alg: *mut SigAlg, hash: *mut sha2.Algorithm) X509Error!void {
     let mut r = der.Reader.init(alg_der);
     let mut seq = r.sequence()!;
     let oid = seq.oid()!;
@@ -272,7 +258,7 @@ pub struct Certificate {
     critical_unknown: bool,
 
     /// Parses a DER certificate (the bytes are copied).
-    pub fn parse(der_bytes: []u8) !Certificate {
+    pub fn parse(der_bytes: []u8) X509Error!Certificate {
         let raw = mem.alloc.[u8](der_bytes.len)!;
         @mem_copy(raw, der_bytes);
         let mut c = Certificate.{
@@ -324,7 +310,7 @@ pub struct Certificate {
         self.excluded.deinit();
     }
 
-    fn parse_fields(self: *mut Certificate) !void {
+    fn parse_fields(self: *mut Certificate) X509Error!void {
         let mut top = der.Reader.init(self.raw);
         let mut cert = top.sequence()!;
         if not top.empty() {
@@ -401,7 +387,7 @@ pub struct Certificate {
     }
 
     /// Handles one extension; false if it is not one this module knows.
-    fn extension(self: *mut Certificate, oid: []u8, value: []u8) !bool {
+    fn extension(self: *mut Certificate, oid: []u8, value: []u8) X509Error!bool {
         let mut r = der.Reader.init(value);
         if @mem_eq(oid, OID_BASIC_CONSTRAINTS) {
             let mut s = r.sequence()!;
@@ -525,7 +511,7 @@ pub struct Certificate {
 
     /// Frees and re-creates the owned parts so that a Certificate can be
     /// copied into a container: returns a deep copy.
-    pub fn clone(self: *Certificate) !Certificate {
+    pub fn clone(self: *Certificate) X509Error!Certificate {
         return Certificate.parse(self.raw);
     }
 }
@@ -707,7 +693,7 @@ pub struct PemIter {
     text: []u8,
     pos: usize,
 
-    pub fn next(self: *mut PemIter) !PemBlock {
+    pub fn next(self: *mut PemIter) X509Error!PemBlock {
         let begin = strs.index_of_from(self.text, "-----BEGIN ", self.pos) catch {
             self.pos = self.text.len;
             return error.NotFound;
@@ -731,7 +717,7 @@ pub fn pem_blocks(text: []u8) PemIter {
 }
 
 /// The DER bytes of a block, in new memory (free them with mem.free).
-pub fn pem_decode(b: PemBlock) ![]mut u8 {
+pub fn pem_decode(b: PemBlock) X509Error![]mut u8 {
     return base64.decode_alloc(b.body, base64.STANDARD) catch |e| {
         if e == error.OutOfMemory {
             return e;
@@ -763,7 +749,7 @@ pub union PrivateKey {
 
 /// Parses a private key: PKCS #8 ("PRIVATE KEY"), PKCS #1 ("RSA PRIVATE
 /// KEY") or SEC 1 ("EC PRIVATE KEY") DER.
-pub fn parse_private_key(label: []u8, d: []u8) !PrivateKey {
+pub fn parse_private_key(label: []u8, d: []u8) X509Error!PrivateKey {
     if @mem_eq(label, "RSA PRIVATE KEY") {
         return parse_pkcs1(d);
     }
@@ -795,7 +781,7 @@ pub fn parse_private_key(label: []u8, d: []u8) !PrivateKey {
     return error.UnsupportedAlgorithm;
 }
 
-fn parse_pkcs1(d: []u8) !PrivateKey {
+fn parse_pkcs1(d: []u8) X509Error!PrivateKey {
     let mut r = der.Reader.init(d);
     let mut s = r.sequence()!;
     _ = s.small_integer()!;
@@ -806,7 +792,7 @@ fn parse_pkcs1(d: []u8) !PrivateKey {
 }
 
 /// ECPrivateKey (SEC 1), with the curve from outside or from [0].
-fn parse_sec1(d: []u8, outer_curve: []u8) !PrivateKey {
+fn parse_sec1(d: []u8, outer_curve: []u8) X509Error!PrivateKey {
     let mut r = der.Reader.init(d);
     let mut s = r.sequence()!;
     _ = s.small_integer()!;
@@ -826,7 +812,7 @@ fn parse_sec1(d: []u8, outer_curve: []u8) !PrivateKey {
 }
 
 /// The first private key in a PEM text.
-pub fn parse_private_key_pem(text: []u8) !PrivateKey {
+pub fn parse_private_key_pem(text: []u8) X509Error!PrivateKey {
     let mut it = pem_blocks(text);
     loop {
         let b = it.next() catch |e| {
@@ -862,7 +848,7 @@ pub struct CertPool {
         self.certs.deinit();
     }
 
-    pub fn add(self: *mut CertPool, der_bytes: []u8) !void {
+    pub fn add(self: *mut CertPool, der_bytes: []u8) X509Error!void {
         let mut c = Certificate.parse(der_bytes)!;
         self.certs.push(c) catch |e| {
             c.deinit();
@@ -872,7 +858,7 @@ pub struct CertPool {
 
     /// Adds every CERTIFICATE block of a PEM text that parses; returns how
     /// many were added.
-    pub fn add_pem(self: *mut CertPool, text: []u8) !usize {
+    pub fn add_pem(self: *mut CertPool, text: []u8) X509Error!usize {
         let mut it = pem_blocks(text);
         let mut n: usize = 0;
         loop {
@@ -904,12 +890,12 @@ pub struct CertPool {
         defer f.close();
         let text = f.reader().read_all()!;
         defer mem.free(text);
-        return self.add_pem(text);
+        return self.add_pem(text)!;
     }
 
     /// Loads the operating system's CA bundle (the first that exists of the
     /// usual Linux locations); returns how many certificates were added.
-    pub fn load_system(self: *mut CertPool) !usize {
+    pub fn load_system(self: *mut CertPool) X509Error!usize {
         let paths: [5][]u8 = [
             "/etc/ssl/certs/ca-certificates.crt",
             "/etc/pki/tls/certs/ca-bundle.crt",
@@ -927,7 +913,7 @@ pub struct CertPool {
     }
 }
 
-fn check_time(c: *Certificate, now: time.Time) !void {
+fn check_time(c: *Certificate, now: time.Time) X509Error!void {
     if now.before(c.not_before) {
         return error.NotYetValid;
     }
@@ -970,7 +956,7 @@ pub fn verify_chain(chain: []Certificate, roots: *CertPool, hostname: []u8, now:
 /// a handful).
 const MAX_SIGNATURE_CHECKS: u32 = 64;
 
-fn check_signature(cert: *Certificate, issuer: *Certificate, budget: *mut u32) !bool {
+fn check_signature(cert: *Certificate, issuer: *Certificate, budget: *mut u32) X509Error!bool {
     if budget.* == 0 {
         return error.PathTooLong;
     }
@@ -1231,16 +1217,16 @@ let ROOT_KEY: [28][]u8 = [
     "-----END PRIVATE KEY-----\n",
 ];
 
-fn join(lines: [][]u8) ![]mut u8 {
+fn join(lines: [][]u8) X509Error![]mut u8 {
     let mut s = strs.String.init();
     for l in lines {
         s.push_str(l)!;
     }
-    return s.take();
+    return s.take()!;
 }
 
 /// Parses the first certificate of a PEM text.
-fn cert_of(lines: [][]u8) !Certificate {
+fn cert_of(lines: [][]u8) X509Error!Certificate {
     let text = join(lines)!;
     defer mem.free(text);
     let mut it = pem_blocks(text);

@@ -40,7 +40,9 @@ import "image.ax" as image;
 import "pdf/read.ax" as read;
 import "text.ax" as text;
 
-error { Corrupt, Finished, OutOfMemory }
+pub error PdfError { Corrupt, Finished, OutOfMemory, NotFound, Empty, Unsupported, Done, InvalidPath, IoError,
+                     ChecksumMismatch, InvalidUtf8, TooLarge, EndOfStream, Truncated, InvalidFeature, NoSpaceLeft,
+                     PermissionDenied, IsDirectory }
 
 pub const A4_WIDTH: f64 = 595.2756;
 pub const A4_HEIGHT: f64 = 841.8898;
@@ -57,7 +59,7 @@ const RESOURCES: u32 = 3;
 // -----------------------------------------------------------------------------
 
 /// A number the way PDF wants it: no exponent, at most 4 decimals.
-fn put_num(out: *mut strs.String, v: f64) !void {
+fn put_num(out: *mut strs.String, v: f64) PdfError!void {
     if (v != v) or (@abs(v) > 1.0e12) {
         out.push('0')!;
         return;
@@ -86,7 +88,7 @@ fn put_num(out: *mut strs.String, v: f64) !void {
     }
 }
 
-fn put_u64(out: *mut strs.String, v: u64) !void {
+fn put_u64(out: *mut strs.String, v: u64) PdfError!void {
     let mut tmp: [20]u8 = [0; 20];
     let mut n: usize = 0;
     let mut x = v;
@@ -104,7 +106,7 @@ fn put_u64(out: *mut strs.String, v: u64) !void {
     }
 }
 
-fn put_int(out: *mut strs.String, v: i64) !void {
+fn put_int(out: *mut strs.String, v: i64) PdfError!void {
     if v < 0 {
         out.push('-')!;
         put_u64(out, @bit_cast(u64, -v))!;
@@ -113,12 +115,12 @@ fn put_int(out: *mut strs.String, v: i64) !void {
     }
 }
 
-fn put_ref(out: *mut strs.String, obj: u32) !void {
+fn put_ref(out: *mut strs.String, obj: u32) PdfError!void {
     put_u64(out, @as(u64, obj))!;
     out.push_str(" 0 R")!;
 }
 
-fn put_hex4(out: *mut strs.String, v: u32) !void {
+fn put_hex4(out: *mut strs.String, v: u32) PdfError!void {
     let hex = "0123456789ABCDEF";
     let mut k: u32 = 16;
     while k > 0 {
@@ -129,7 +131,7 @@ fn put_hex4(out: *mut strs.String, v: u32) !void {
 
 /// A text string (for metadata and bookmarks): plain ASCII as a literal
 /// string, anything else as UTF-16BE in hex.
-fn put_text_string(out: *mut strs.String, s: []u8) !void {
+fn put_text_string(out: *mut strs.String, s: []u8) PdfError!void {
     let mut ascii = true;
     for c in s {
         if (c >= 0x80) or ((c < 32) and (c != '\n')) {
@@ -149,7 +151,7 @@ fn put_text_string(out: *mut strs.String, s: []u8) !void {
     out.push('>')!;
 }
 
-fn put_utf16(out: *mut strs.String, cp: u32) !void {
+fn put_utf16(out: *mut strs.String, cp: u32) PdfError!void {
     if cp >= 0x10000 {
         let v = cp - 0x10000;
         put_hex4(out, 0xd800 + (v >> 10))!;
@@ -160,7 +162,7 @@ fn put_utf16(out: *mut strs.String, cp: u32) !void {
 }
 
 /// A literal string, (...) with \, ( and ) escaped.
-fn put_literal(out: *mut strs.String, s: []u8) !void {
+fn put_literal(out: *mut strs.String, s: []u8) PdfError!void {
     out.push('(')!;
     for c in s {
         if (c == '\\') or (c == '(') or (c == ')') {
@@ -178,7 +180,7 @@ fn put_literal(out: *mut strs.String, s: []u8) !void {
 }
 
 /// A name, /Like#20This.
-fn put_name(out: *mut strs.String, s: []u8) !void {
+fn put_name(out: *mut strs.String, s: []u8) PdfError!void {
     let hex = "0123456789ABCDEF";
     out.push('/')!;
     for c in s {
@@ -277,7 +279,7 @@ pub struct Document {
     }
 
     /// Reserves an object number (its body is set later).
-    fn reserve(self: *mut Document) !u32 {
+    fn reserve(self: *mut Document) PdfError!u32 {
         if self.objs.len == 0 {
             // the catalog, the page tree and the shared resources
             for _k in @as(usize, 0)..3 {
@@ -288,13 +290,13 @@ pub struct Document {
         return @truncate(u32, self.objs.len);
     }
 
-    fn set(self: *mut Document, obj: u32, body: *mut strs.String) !void {
+    fn set(self: *mut Document, obj: u32, body: *mut strs.String) PdfError!void {
         let i = @as(usize, obj) - 1;
         mem.free(self.objs.get(i));
         self.objs.set(i, body.take()!);
     }
 
-    fn add_obj(self: *mut Document, body: *mut strs.String) !u32 {
+    fn add_obj(self: *mut Document, body: *mut strs.String) PdfError!u32 {
         let n = self.reserve()!;
         self.set(n, body)!;
         return n;
@@ -327,18 +329,18 @@ pub struct Document {
         body.push_str(" >>\nstream\n")!;
         body.push_str(payload)!;
         body.push_str("\nendstream")!;
-        return self.add_obj(&mut body);
+        return self.add_obj(&mut body)!;
     }
 
     /// Sets a metadata entry: "Title", "Author", "Subject", "Keywords",
     /// "Creator" or "Producer".
-    pub fn set_info(self: *mut Document, key: []u8, value: []u8) !void {
+    pub fn set_info(self: *mut Document, key: []u8, value: []u8) PdfError!void {
         self.info.push(strs.dup(key)!)!;
         self.info.push(strs.dup(value)!)!;
     }
 
     /// A new page, width by height points; draw on it, then add_page.
-    pub fn page(self: *mut Document, width: f64, height: f64) !Page {
+    pub fn page(self: *mut Document, width: f64, height: f64) PdfError!Page {
         let mut p = Page.{
             doc: self,
             width: width,
@@ -395,7 +397,7 @@ pub struct Document {
 
     /// A bookmark in the outline, at `level` (0 for the top), pointing at
     /// height y (from the top) of page `index`.
-    pub fn bookmark(self: *mut Document, level: u32, title: []u8, index: usize, y: f64) !void {
+    pub fn bookmark(self: *mut Document, level: u32, title: []u8, index: usize, y: f64) PdfError!void {
         if index >= self.pages.len {
             return;
         }
@@ -404,7 +406,7 @@ pub struct Document {
         self.marks.push(Mark.{ level: level, title: strs.dup(title)!, page: obj, y: top })!;
     }
 
-    fn font_use(self: *mut Document, f: *font.Font) !usize {
+    fn font_use(self: *mut Document, f: *font.Font) PdfError!usize {
         for i in 0..self.fonts.len {
             if @int_from_ptr(self.fonts.get(i).font) == @int_from_ptr(f) {
                 return i;
@@ -422,7 +424,7 @@ pub struct Document {
         return self.fonts.len - 1;
     }
 
-    fn gstate(self: *mut Document, fill_alpha: f32, stroke_alpha: f32) !usize {
+    fn gstate(self: *mut Document, fill_alpha: f32, stroke_alpha: f32) PdfError!usize {
         let key = (@as(u32, @int_from_float(u16, @nearest(@min(@max(fill_alpha, 0.0), 1.0) * 1000.0))) << 16) | @as(
             u32, @int_from_float(u16, @nearest(@min(@max(stroke_alpha, 0.0), 1.0) * 1000.0)));
         for i in 0..self.alphas.len {
@@ -469,7 +471,7 @@ pub struct Document {
             out.deinit();
             return e;
         };
-        return out.take();
+        return out.take()!;
     }
 
     fn finish(self: *mut Document) !void {
@@ -651,14 +653,14 @@ struct Sink {
     }
 }
 
-fn put_hex2(out: *mut strs.String, b: u8) !void {
+fn put_hex2(out: *mut strs.String, b: u8) PdfError!void {
     let hex = "0123456789ABCDEF";
     out.push(hex[@as(usize, b >> 4)])!;
     out.push(hex[@as(usize, b & 15)])!;
 }
 
 /// The outline (bookmarks) as a tree by level; its root object, or 0.
-fn write_outline(doc: *mut Document) !u32 {
+fn write_outline(doc: *mut Document) PdfError!u32 {
     let n = doc.marks.len;
     if n == 0 {
         return 0;
@@ -806,18 +808,18 @@ pub struct Page {
     }
 
     /// The page's object number (reserved on first use, for links to it).
-    fn obj(self: *mut Page) !u32 {
+    fn obj(self: *mut Page) PdfError!u32 {
         if self.page_obj == 0 {
             self.page_obj = self.doc.reserve()!;
         }
         return self.page_obj;
     }
 
-    fn op(self: *mut Page, s: []u8) !void {
+    fn op(self: *mut Page, s: []u8) PdfError!void {
         self.content.push_str(s)!;
     }
 
-    fn num(self: *mut Page, v: f64) !void {
+    fn num(self: *mut Page, v: f64) PdfError!void {
         put_num(&mut self.content, v)!;
         self.content.push(' ')!;
     }
@@ -825,19 +827,19 @@ pub struct Page {
     // --- graphics state ---
 
     /// Saves the graphics state (transform, clip, ...) until restore.
-    pub fn save(self: *mut Page) !void {
+    pub fn save(self: *mut Page) PdfError!void {
         self.stack.push(self.ctm)!;
         self.op("q\n")!;
     }
 
-    pub fn restore(self: *mut Page) !void {
+    pub fn restore(self: *mut Page) PdfError!void {
         let t = self.stack.pop() catch return;
         self.ctm = t;
         self.op("Q\n")!;
     }
 
     /// Transforms what follows by t (in user space, before the current transform).
-    pub fn concat(self: *mut Page, t: draw.Affine) !void {
+    pub fn concat(self: *mut Page, t: draw.Affine) PdfError!void {
         self.ctm = t.then(self.ctm);
         self.num(t.a)!;
         self.num(t.b)!;
@@ -848,21 +850,21 @@ pub struct Page {
         self.op("cm\n")!;
     }
 
-    pub fn translate(self: *mut Page, tx: f64, ty: f64) !void {
+    pub fn translate(self: *mut Page, tx: f64, ty: f64) PdfError!void {
         self.concat(draw.Affine.translation(tx, ty))!;
     }
 
-    pub fn scale(self: *mut Page, sx: f64, sy: f64) !void {
+    pub fn scale(self: *mut Page, sx: f64, sy: f64) PdfError!void {
         self.concat(draw.Affine.scaling(sx, sy))!;
     }
 
-    pub fn rotate(self: *mut Page, radians: f64) !void {
+    pub fn rotate(self: *mut Page, radians: f64) PdfError!void {
         self.concat(draw.Affine.rotation(radians))!;
     }
 
     // --- paths ---
 
-    fn path(self: *mut Page, p: *draw.Path) !void {
+    fn path(self: *mut Page, p: *draw.Path) PdfError!void {
         let verbs = p.verbs.items();
         let pts = p.pts.items();
         let mut k: usize = 0;
@@ -914,7 +916,7 @@ pub struct Page {
     }
 
     /// Sets the fill (or stroke) paint; returns false if nothing would show.
-    fn paint(self: *mut Page, p: draw.Paint, stroke: bool) !bool {
+    fn paint(self: *mut Page, p: draw.Paint, stroke: bool) PdfError!bool {
         if p.kind == draw.PaintKind.SOLID {
             let c = p.color;
             if c.a <= 0.0 {
@@ -953,7 +955,7 @@ pub struct Page {
         return false;  // image paints are not supported
     }
 
-    fn alpha(self: *mut Page, a: f32, stroke: bool) !void {
+    fn alpha(self: *mut Page, a: f32, stroke: bool) PdfError!void {
         // one graphics state per alpha; opaque drawing resets it
         let mut fa: f32 = 1.0;
         let mut sa: f32 = 1.0;
@@ -969,7 +971,7 @@ pub struct Page {
     }
 
     /// Fills a path (rule: draw.FillRule.NONZERO or EVEN_ODD).
-    pub fn fill(self: *mut Page, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) !void {
+    pub fn fill(self: *mut Page, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) PdfError!void {
         if not self.paint(paint, false)! {
             return;
         }
@@ -982,7 +984,7 @@ pub struct Page {
     }
 
     /// Strokes a path.
-    pub fn stroke(self: *mut Page, p: *draw.Path, paint: draw.Paint, style: draw.Stroke) !void {
+    pub fn stroke(self: *mut Page, p: *draw.Path, paint: draw.Paint, style: draw.Stroke) PdfError!void {
         if not self.paint(paint, true)! {
             return;
         }
@@ -1004,7 +1006,7 @@ pub struct Page {
         self.op("S\n")!;
     }
 
-    pub fn fill_rect(self: *mut Page, x: f64, y: f64, w: f64, h: f64, paint: draw.Paint) !void {
+    pub fn fill_rect(self: *mut Page, x: f64, y: f64, w: f64, h: f64, paint: draw.Paint) PdfError!void {
         self.path_tmp.clear();
         self.path_tmp.rect(x, y, w, h)!;
         let tmp = self.path_tmp;
@@ -1012,7 +1014,7 @@ pub struct Page {
     }
 
     /// Limits what follows (until restore) to the inside of a path.
-    pub fn clip(self: *mut Page, p: *draw.Path, rule: draw.FillRule) !void {
+    pub fn clip(self: *mut Page, p: *draw.Path, rule: draw.FillRule) PdfError!void {
         self.path(p)!;
         if rule == draw.FillRule.EVEN_ODD {
             self.op("W* n\n")!;
@@ -1025,7 +1027,7 @@ pub struct Page {
 
     /// Draws a line of text with its baseline starting at (x, y), shaped
     /// (std/graphics/shape) and in bidirectional order, as std/graphics/text lays it out.
-    pub fn text(self: *mut Page, f: *font.Font, size: f64, x: f64, y: f64, s: []u8, c: color.Color) !void {
+    pub fn text(self: *mut Page, f: *font.Font, size: f64, x: f64, y: f64, s: []u8, c: color.Color) PdfError!void {
         let st = text.Style.init(f, size, c);
         let sp: [1]text.Span = [text.Span.{ text: s, style: st }];
         let mut l = text.layout(sp[..], text.Options.init(0.0))!;
@@ -1038,7 +1040,7 @@ pub struct Page {
 
     /// Records glyph g of font fi as drawn for the characters of text (its
     /// cluster: one character, or several for a ligature), and writes it.
-    fn glyph(self: *mut Page, fi: usize, g: u32, chars: []u8) !void {
+    fn glyph(self: *mut Page, fi: usize, g: u32, chars: []u8) PdfError!void {
         let fu = self.doc.fonts.get_ptr(fi);
         if @as(usize, g) < fu.used.len {
             fu.used.set(@as(usize, g), 1);
@@ -1067,14 +1069,14 @@ pub struct Page {
     }
 
     /// Draws a std/graphics/text Layout with its top left at (x, y).
-    pub fn draw_layout(self: *mut Page, l: *text.Layout, x: f64, y: f64) !void {
+    pub fn draw_layout(self: *mut Page, l: *text.Layout, x: f64, y: f64) PdfError!void {
         self.draw_layout_lines(l, 0, l.lines.len, x, y)!;
     }
 
     /// Draws lines [first, end) of a Layout, the layout's top left at (x,
     /// y) (so that a paragraph can be split across pages: draw the lines
     /// that fit on this page, then the rest on the next, moved up).
-    pub fn draw_layout_lines(self: *mut Page, l: *text.Layout, first: usize, end: usize, x: f64, y: f64) !void {
+    pub fn draw_layout_lines(self: *mut Page, l: *text.Layout, first: usize, end: usize, x: f64, y: f64) PdfError!void {
         let lines = l.lines.items();
         let last = @min(end, lines.len);
         if first >= last {
@@ -1171,7 +1173,7 @@ pub struct Page {
         self.place_image(idx, x, y, w, h)!;
     }
 
-    fn place_image(self: *mut Page, idx: usize, x: f64, y: f64, w: f64, h: f64) !void {
+    fn place_image(self: *mut Page, idx: usize, x: f64, y: f64, w: f64, h: f64) PdfError!void {
         self.alpha(1.0, false)!;
         self.op("q ")!;
         self.num(w)!;
@@ -1187,7 +1189,7 @@ pub struct Page {
     // --- links ---
 
     /// Makes a rectangle of the page a link to a URL.
-    pub fn link(self: *mut Page, x: f64, y: f64, w: f64, h: f64, url: []u8) !void {
+    pub fn link(self: *mut Page, x: f64, y: f64, w: f64, h: f64, url: []u8) PdfError!void {
         let mut b = strs.String.init();
         defer b.deinit();
         b.push_str("<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [")!;
@@ -1201,7 +1203,7 @@ pub struct Page {
 
     /// Makes a rectangle of the page a link to height y (from the top) of
     /// an earlier page.
-    pub fn link_to_page(self: *mut Page, x: f64, y: f64, w: f64, h: f64, index: usize, target_y: f64) !void {
+    pub fn link_to_page(self: *mut Page, x: f64, y: f64, w: f64, h: f64, index: usize, target_y: f64) PdfError!void {
         if index >= self.doc.pages.len {
             return;
         }
@@ -1219,7 +1221,7 @@ pub struct Page {
     }
 
     /// The bounding box of a user-space rectangle in the page's default space.
-    fn put_rect(self: *mut Page, b: *mut strs.String, x: f64, y: f64, w: f64, h: f64) !void {
+    fn put_rect(self: *mut Page, b: *mut strs.String, x: f64, y: f64, w: f64, h: f64) PdfError!void {
         let p0 = self.ctm.apply(x, y);
         let p1 = self.ctm.apply(x + w, y);
         let p2 = self.ctm.apply(x, y + h);
@@ -1238,7 +1240,7 @@ pub struct Page {
 // Gradients
 // -----------------------------------------------------------------------------
 
-fn put_color_components(b: *mut strs.String, c: color.Color) !void {
+fn put_color_components(b: *mut strs.String, c: color.Color) PdfError!void {
     b.push('[')!;
     put_num(b, @as(f64, color.srgb_encode(@min(@max(c.r, 0.0), 1.0))))!;
     b.push(' ')!;
@@ -1249,7 +1251,7 @@ fn put_color_components(b: *mut strs.String, c: color.Color) !void {
 }
 
 /// A shading pattern for a gradient paint; its index.
-fn gradient(doc: *mut Document, p: draw.Paint, ctm: draw.Affine) !usize {
+fn gradient(doc: *mut Document, p: draw.Paint, ctm: draw.Affine) PdfError!usize {
     let mut b = strs.String.init();
     defer b.deinit();
     // the colour function: stitched linear pieces between the stops
@@ -1488,18 +1490,18 @@ fn sbe16(d: []u8, i: usize) i64 {
     return @as(i64, @bit_cast(i16, @truncate(u16, be16(d, i))));
 }
 
-fn push16(b: *mut strs.String, v: u32) !void {
+fn push16(b: *mut strs.String, v: u32) PdfError!void {
     b.push(@truncate(u8, v >> 8))!;
     b.push(@truncate(u8, v))!;
 }
 
-fn push32(b: *mut strs.String, v: u32) !void {
+fn push32(b: *mut strs.String, v: u32) PdfError!void {
     push16(b, v >> 16)!;
     push16(b, v & 0xffff)!;
 }
 
 /// The font's PostScript name (name ID 6), made safe for a PDF name.
-fn postscript_name(f: *font.Font, out: *mut strs.String) !void {
+fn postscript_name(f: *font.Font, out: *mut strs.String) PdfError!void {
     let t = f.table("name");
     let count = @as(usize, be16(t, 2));
     let strings = @as(usize, be16(t, 4));
@@ -1618,7 +1620,7 @@ struct TableOut {
 
 /// A standalone font file: for TrueType the tables a PDF needs, with the
 /// unused glyphs emptied; for CFF all tables.
-fn build_font_file(f: *font.Font, used: []u8, out: *mut strs.String) !void {
+fn build_font_file(f: *font.Font, used: []u8, out: *mut strs.String) PdfError!void {
     let mut tables = vec.Vec.[TableOut].init();
     defer tables.deinit();
     let mut glyf = strs.String.init();
@@ -1925,13 +1927,13 @@ fn embed_font(doc: *mut Document, i: usize) !void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn num_str(v: f64) ![]mut u8 {
+fn num_str(v: f64) PdfError![]mut u8 {
     let mut s = strs.String.init();
     put_num(&mut s, v)!;
-    return s.take();
+    return s.take()!;
 }
 
-fn expect_num(v: f64, want: []u8) !void {
+fn expect_num(v: f64, want: []u8) PdfError!void {
     let s = num_str(v)!;
     defer mem.free(s);
     @expect(strs.eq(s, want));

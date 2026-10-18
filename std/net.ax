@@ -22,7 +22,8 @@ import "os/fs.ax" as fs;
 import "os/path.ax" as path;
 import "str.ax" as strs;
 
-error { ConnectionRefused, AddressInUse, InvalidAddress, NetError, TimedOut, OutOfMemory }
+pub error NetError { ConnectionRefused, AddressInUse, InvalidAddress, NetError, TimedOut, OutOfMemory, Empty, IoError,
+                     NotFound, Done }
 
 import host "axiom" {
     fn ax_tcp_connect(name: *u8, name_len: usize, port: u32) i32;
@@ -45,7 +46,7 @@ import host "axiom" {
     fn ax_poll(entries: *mut u8, n: u32, timeout_ms: i32) i32;
 }
 
-fn host_error(code: i32) error {
+fn host_error(code: i32) NetError {
     match code {
         -2   => { return error.ConnectionRefused; }
         -3   => { return error.AddressInUse; }
@@ -60,7 +61,7 @@ fn host_error(code: i32) error {
 // -----------------------------------------------------------------------------
 
 /// Parses dotted-quad notation, e.g. "192.168.0.1".
-pub fn parse_ipv4(s: []u8) !u32 {
+pub fn parse_ipv4(s: []u8) NetError!u32 {
     let mut addr: u32 = 0;
     let mut part: u32 = 0;
     let mut digits: u32 = 0;
@@ -121,7 +122,7 @@ pub struct TcpStream {
     handle: i32,
 
     /// Reads some bytes; 0 means the peer closed the connection.
-    pub fn read(self: TcpStream, buf: []mut u8) !usize {
+    pub fn read(self: TcpStream, buf: []mut u8) NetError!usize {
         let n = ax_sock_read(self.handle, buf.ptr, buf.len);
         if n < 0 {
             return host_error(@int_cast(i32, n));
@@ -129,7 +130,7 @@ pub struct TcpStream {
         return @int_cast(usize, n);
     }
 
-    pub fn write(self: TcpStream, bytes: []u8) !usize {
+    pub fn write(self: TcpStream, bytes: []u8) NetError!usize {
         let n = ax_sock_write(self.handle, bytes.ptr, bytes.len);
         if n < 0 {
             return host_error(@int_cast(i32, n));
@@ -151,18 +152,18 @@ pub struct TcpStream {
 
     /// Makes reads and writes that wait longer than `ms` milliseconds fail
     /// with error.TimedOut; 0 means wait forever (the default).
-    pub fn set_timeout(self: TcpStream, ms: u32) !void {
+    pub fn set_timeout(self: TcpStream, ms: u32) NetError!void {
         if ax_sock_timeout(self.handle, ms) < 0 {
             return error.NetError;
         }
     }
 
     /// The addresses of this end and the other (not for Unix sockets).
-    pub fn local_addr(self: TcpStream) !Addr {
+    pub fn local_addr(self: TcpStream) NetError!Addr {
         return sock_addr(self.handle, 0)!;
     }
 
-    pub fn peer_addr(self: TcpStream) !Addr {
+    pub fn peer_addr(self: TcpStream) NetError!Addr {
         return sock_addr(self.handle, 1)!;
     }
 
@@ -179,12 +180,12 @@ pub struct TcpListener {
         return @int_cast(u16, ax_tcp_local_port(self.handle));
     }
 
-    pub fn local_addr(self: TcpListener) !Addr {
+    pub fn local_addr(self: TcpListener) NetError!Addr {
         return sock_addr(self.handle, 0)!;
     }
 
     /// Waits for the next incoming connection.
-    pub fn accept(self: TcpListener) !TcpStream {
+    pub fn accept(self: TcpListener) NetError!TcpStream {
         let h = ax_tcp_accept(self.handle);
         if h < 0 {
             return host_error(h);
@@ -200,7 +201,7 @@ pub struct TcpListener {
 }
 
 /// Connects to hostname:port. `hostname` is a name or a dotted-quad address.
-pub fn connect(hostname: []u8, port: u16) !TcpStream {
+pub fn connect(hostname: []u8, port: u16) NetError!TcpStream {
     let h = ax_tcp_connect(hostname.ptr, hostname.len, @as(u32, port));
     if h < 0 {
         return host_error(h);
@@ -209,7 +210,7 @@ pub fn connect(hostname: []u8, port: u16) !TcpStream {
 }
 
 /// Listens on hostname:port; port 0 picks a free port (see TcpListener.port).
-pub fn listen(hostname: []u8, port: u16) !TcpListener {
+pub fn listen(hostname: []u8, port: u16) NetError!TcpListener {
     let h = ax_tcp_listen(hostname.ptr, hostname.len, @as(u32, port));
     if h < 0 {
         return host_error(h);
@@ -269,7 +270,7 @@ pub struct Addr {
 
     /// Parses "1.2.3.4", "1.2.3.4:80", "::1", "[::1]:80" or "[fe80::1%2]:80"
     /// (a numeric zone); without a port, the port is 0.
-    pub fn parse(s: []u8) !Addr {
+    pub fn parse(s: []u8) NetError!Addr {
         if (s.len > 0) and (s[0] == '[') {
             let close = strs.index_of_byte(s, ']') catch return error.InvalidAddress;
             let mut a = parse_ip6(s[1..close])!;
@@ -455,11 +456,11 @@ fn if_v4(family: Family) usize {
     return 16;
 }
 
-fn parse_port(s: []u8) !u16 {
+fn parse_port(s: []u8) NetError!u16 {
     return fmt.parse_int.[u16](s) catch return error.InvalidAddress;
 }
 
-fn parse_ip4(s: []u8) !Addr {
+fn parse_ip4(s: []u8) NetError!Addr {
     let v = parse_ipv4(s)!;
     return Addr.v4(@truncate(u8, v >> 24), @truncate(u8, v >> 16), @truncate(u8, v >> 8), @truncate(u8, v), 0);
 }
@@ -478,7 +479,7 @@ fn hex_digit(c: u8) i32 {
 }
 
 // "2001:db8::1", "::ffff:1.2.3.4", "fe80::1%3"
-fn parse_ip6(s0: []u8) !Addr {
+fn parse_ip6(s0: []u8) NetError!Addr {
     let mut s = s0;
     let mut scope: u32 = 0;
     let pct = strs.index_of_byte(s, '%') catch s.len;
@@ -562,7 +563,7 @@ fn parse_ip6(s0: []u8) !Addr {
 /// The addresses of a host name (or a literal address), with port 0; the
 /// caller frees them. The system's resolver, or /etc/hosts and DNS for A
 /// records; std/net/dns asks DNS servers for any kind of record.
-pub fn resolve(name: []u8) ![]mut Addr {
+pub fn resolve(name: []u8) NetError![]mut Addr {
     let mut recs: [384]u8 = [0; 384];  // 16 records
     let n = ax_resolve(name.ptr, name.len, &mut recs[0], 16);
     if n < 0 {
@@ -577,7 +578,7 @@ pub fn resolve(name: []u8) ![]mut Addr {
 }
 
 /// Connects to an address.
-pub fn connect_addr(a: Addr) !TcpStream {
+pub fn connect_addr(a: Addr) NetError!TcpStream {
     let r = a.record();
     let h = ax_tcp_connect_addr(&r[0]);
     if h < 0 {
@@ -587,7 +588,7 @@ pub fn connect_addr(a: Addr) !TcpStream {
 }
 
 /// Listens on an address (port 0: any free one).
-pub fn listen_addr(a: Addr) !TcpListener {
+pub fn listen_addr(a: Addr) NetError!TcpListener {
     let r = a.record();
     let h = ax_tcp_listen_addr(&r[0]);
     if h < 0 {
@@ -596,7 +597,7 @@ pub fn listen_addr(a: Addr) !TcpListener {
     return TcpListener.{ handle: h };
 }
 
-fn sock_addr(h: i32, peer: u32) !Addr {
+fn sock_addr(h: i32, peer: u32) NetError!Addr {
     let mut r: [24]u8 = [0; 24];
     if ax_sock_addr(h, peer, &mut r[0]) != 0 {
         return error.NetError;
@@ -605,7 +606,7 @@ fn sock_addr(h: i32, peer: u32) !Addr {
 }
 
 /// Connects to the Unix socket at a path; the stream works as a TCP one.
-pub fn connect_unix(p: []u8) !TcpStream {
+pub fn connect_unix(p: []u8) NetError!TcpStream {
     let h = ax_unix_connect(p.ptr, p.len);
     if h < 0 {
         return host_error(h);
@@ -614,7 +615,7 @@ pub fn connect_unix(p: []u8) !TcpStream {
 }
 
 /// Listens on a Unix socket, made at the path (remove it when done).
-pub fn listen_unix(p: []u8) !TcpListener {
+pub fn listen_unix(p: []u8) NetError!TcpListener {
     let h = ax_unix_listen(p.ptr, p.len);
     if h < 0 {
         return host_error(h);
@@ -631,7 +632,7 @@ pub struct UdpSocket {
 
     /// A socket bound to an address (port 0: any free one; Addr.any for
     /// every interface).
-    pub fn bind(a: Addr) !UdpSocket {
+    pub fn bind(a: Addr) NetError!UdpSocket {
         let r = a.record();
         let h = ax_udp_open(&r[0]);
         if h < 0 {
@@ -641,7 +642,7 @@ pub struct UdpSocket {
     }
 
     /// Sends one datagram.
-    pub fn send_to(self: UdpSocket, bytes: []u8, to: Addr) !void {
+    pub fn send_to(self: UdpSocket, bytes: []u8, to: Addr) NetError!void {
         let r = to.record();
         let n = ax_udp_send(self.handle, bytes.ptr, bytes.len, &r[0]);
         if n < 0 {
@@ -651,7 +652,7 @@ pub struct UdpSocket {
 
     /// Receives one datagram into buf (the rest of a longer one is lost);
     /// its sender goes to from. TimedOut after the timeout.
-    pub fn recv_from(self: UdpSocket, buf: []mut u8, from: *mut Addr) !usize {
+    pub fn recv_from(self: UdpSocket, buf: []mut u8, from: *mut Addr) NetError!usize {
         let mut r: [24]u8 = [0; 24];
         let n = ax_udp_recv(self.handle, buf.ptr, buf.len, &mut r[0]);
         if n < 0 {
@@ -662,13 +663,13 @@ pub struct UdpSocket {
     }
 
     /// Makes recv_from fail with TimedOut after ms milliseconds (0: never).
-    pub fn set_timeout(self: UdpSocket, ms: u32) !void {
+    pub fn set_timeout(self: UdpSocket, ms: u32) NetError!void {
         if ax_sock_timeout(self.handle, ms) < 0 {
             return error.NetError;
         }
     }
 
-    pub fn local_addr(self: UdpSocket) !Addr {
+    pub fn local_addr(self: UdpSocket) NetError!Addr {
         return sock_addr(self.handle, 0)!;
     }
 
@@ -715,7 +716,7 @@ pub struct Poller {
     }
 
     /// Watches a handle for events (READABLE, WRITABLE); returns its index.
-    pub fn add(self: *mut Poller, handle: i32, events: u16) !usize {
+    pub fn add(self: *mut Poller, handle: i32, events: u16) NetError!usize {
         self.entries.push(PollEntry.{ handle: handle, events: events, revents: 0 })!;
         return self.entries.len - 1;
     }
@@ -742,7 +743,7 @@ pub struct Poller {
 
     /// Waits up to timeout_ms milliseconds (-1: for ever) until a handle is
     /// ready; returns how many are.
-    pub fn wait(self: *mut Poller, timeout_ms: i32) !usize {
+    pub fn wait(self: *mut Poller, timeout_ms: i32) NetError!usize {
         let es = self.entries.items();
         for k in @as(usize, 0)..es.len {
             es[k].revents = 0;
@@ -769,12 +770,12 @@ fn handle_ctx(h: i32) *mut void {
 
 fn stream_read(ctx: *mut void, buf: []mut u8) !usize {
     let s = TcpStream.{ handle: @int_cast(i32, @int_from_ptr(ctx)) };
-    return s.read(buf);
+    return s.read(buf)!;
 }
 
 fn stream_write(ctx: *mut void, bytes: []u8) !usize {
     let s = TcpStream.{ handle: @int_cast(i32, @int_from_ptr(ctx)) };
-    return s.write(bytes);
+    return s.write(bytes)!;
 }
 
 // -----------------------------------------------------------------------------
@@ -809,7 +810,7 @@ fn addr_text(a: Addr, with_port: bool) ![]mut u8 {
             return e;
         };
     }
-    return s.take();
+    return s.take()!;
 }
 
 test "addresses" {
@@ -946,12 +947,12 @@ fn unix_sockets(sp: []u8) !void {
     @expect(refused(connect_unix("/surely/no/socket")));
 }
 
-fn timed_out(r: !usize) bool {
+fn timed_out(r: NetError!usize) bool {
     _ = r catch |e| return e == error.TimedOut;
     return false;
 }
 
-fn refused(r: !TcpStream) bool {
+fn refused(r: NetError!TcpStream) bool {
     let s = r catch |e| return e == error.ConnectionRefused;
     s.close();
     return false;

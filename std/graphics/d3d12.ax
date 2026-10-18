@@ -106,7 +106,8 @@ import "color.ax" as color;
 import "hlsl.ax" as hlsl;
 import "image.ax" as image;
 
-error { Unsupported, OutOfMemory, InvalidArgument, NoSpaceLeft }
+pub error D3d12Error { Unsupported, OutOfMemory, InvalidArgument, NoSpaceLeft, Corrupt, PermissionDenied, TooLarge,
+                       DeviceLost, Failed }
 
 extern "C" "d3d12" {
     fn D3D12CreateDevice(adapter: usize, level: u32, riid: *u8, dev: *mut usize) i32;
@@ -307,7 +308,7 @@ pub struct Buffer {
 
     /// Writes a constant buffer's contents (the GPU has finished with the
     /// last frame's: frames are waited for).
-    pub fn write(self: *mut Buffer, data: []u8) !void {
+    pub fn write(self: *mut Buffer, data: []u8) D3d12Error!void {
         if (self.mapped == 0) or (data.len > @as(usize, self.size)) {
             return error.InvalidArgument;
         }
@@ -526,7 +527,7 @@ pub struct Device {
     cur_textures: u32,
 
     /// A device for drawing offscreen (into textures).
-    pub fn init() !Device {
+    pub fn init() D3d12Error!Device {
         let mut d = Device.{ dev: 0, queue: 0, alloc: 0, list: 0, fence: 0, fence_value: 0, event: 0, factory: 0,
                              rtv_heap: 0, rtv_base: 0, rtv_size: 0, dsv_heap: 0, dsv_base: 0, dsv_size: 0, srv_heap: 0,
                              srv_cpu: 0, srv_gpu: 0, srv_size: 0, slots: no_slots(), swap: 0, back: [Target.empty(); 2],
@@ -544,7 +545,7 @@ pub struct Device {
 
     /// A device drawing into a window (its HWND: win32.Window.handle()) of
     /// width × height pixels, through a swap chain of two buffers.
-    pub fn init_window(hwnd: usize, width: u32, height: u32) !Device {
+    pub fn init_window(hwnd: usize, width: u32, height: u32) D3d12Error!Device {
         let mut d = Device.init()!;
         // DXGI_SWAP_CHAIN_DESC1: width, height, format, stereo, samples,
         // usage at 24, buffers at 28, scaling, swap effect at 36
@@ -575,7 +576,7 @@ pub struct Device {
         return d;
     }
 
-    fn create(self: *mut Device) !void {
+    fn create(self: *mut Device) D3d12Error!void {
         if CreateDXGIFactory1(&IID_FACTORY4[0], &mut self.factory) < 0 {
             return error.Unsupported;
         }
@@ -629,7 +630,7 @@ pub struct Device {
         self.srv_gpu = g;
     }
 
-    fn back_buffers(self: *mut Device, width: u32, height: u32) !void {
+    fn back_buffers(self: *mut Device, width: u32, height: u32) D3d12Error!void {
         let gb = @bit_cast(fn(usize, u32, *u8, *mut usize) i32, com.method(self.swap, 9));  // GetBuffer
         for i in @as(usize, 0)..2 {
             let mut res: usize = 0;
@@ -699,7 +700,7 @@ pub struct Device {
     }
 
     /// After the window's client area changed size.
-    pub fn resize(self: *mut Device, width: u32, height: u32) !void {
+    pub fn resize(self: *mut Device, width: u32, height: u32) D3d12Error!void {
         if (self.swap == 0) or (width == 0) or (height == 0) {
             return;
         }
@@ -712,7 +713,7 @@ pub struct Device {
     }
 
     /// A texture of width × height RGBA pixels to draw into offscreen.
-    pub fn target(self: *mut Device, width: u32, height: u32) !Target {
+    pub fn target(self: *mut Device, width: u32, height: u32) D3d12Error!Target {
         return self.target_with(width, height, TARGET_BGRA8, 1);
     }
 
@@ -720,7 +721,7 @@ pub struct Device {
     /// `format` (TARGET_*), drawn with `samples` a pixel (1, or 2, 4, 8:
     /// multisampled, resolved as each pass ends). Later passes read it
     /// with set_target_texture.
-    pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) !Target {
+    pub fn target_with(self: *mut Device, width: u32, height: u32, format: u32, samples: u32) D3d12Error!Target {
         let f = target_format(format);
         let n = @max(samples, 1);
         let mut t = Target.empty();
@@ -766,7 +767,7 @@ pub struct Device {
 
     /// Makes an offscreen target width × height (after the window's size
     /// changed), keeping its format and samples.
-    pub fn resize_target(self: *mut Device, t: *mut Target, width: u32, height: u32) !void {
+    pub fn resize_target(self: *mut Device, t: *mut Target, width: u32, height: u32) D3d12Error!void {
         if not t.owned or (t.rtv_slot == NO_SLOT) or (width == 0) or (height == 0) or
            ((width == t.width) and (height == t.height)) {
             return;
@@ -778,13 +779,13 @@ pub struct Device {
     }
 
     /// A depth buffer of width × height, for a target of that size.
-    pub fn depth_buffer(self: *mut Device, width: u32, height: u32) !DepthBuffer {
+    pub fn depth_buffer(self: *mut Device, width: u32, height: u32) D3d12Error!DepthBuffer {
         return self.depth_buffer_with(width, height, 1);
     }
 
     /// A depth buffer of width × height for a target of that size drawn
     /// with `samples` a pixel.
-    pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) !DepthBuffer {
+    pub fn depth_buffer_with(self: *mut Device, width: u32, height: u32, samples: u32) D3d12Error!DepthBuffer {
         let mut d = DepthBuffer.empty();
         d.samples = @max(samples, 1);
         d.slots = self.slots;
@@ -804,7 +805,7 @@ pub struct Device {
     /// then read in shaders (set_texture): a shadow map. Shaders read it as
     /// a Texture2D<float> through register s1, a comparison sampler
     /// (less or equal; outside the map, nothing is in shadow).
-    pub fn shadow_map(self: *mut Device, size: u32) !DepthBuffer {
+    pub fn shadow_map(self: *mut Device, size: u32) D3d12Error!DepthBuffer {
         let mut d = DepthBuffer.empty();
         d.sampled = true;
         d.slots = self.slots;
@@ -823,7 +824,7 @@ pub struct Device {
     }
 
     /// Makes d width × height (after the window's size changed), in the same view.
-    pub fn resize_depth(self: *mut Device, d: *mut DepthBuffer, width: u32, height: u32) !void {
+    pub fn resize_depth(self: *mut Device, d: *mut DepthBuffer, width: u32, height: u32) D3d12Error!void {
         if (width == 0) or (height == 0) or ((width == d.width) and (height == d.height)) {
             return;
         }
@@ -833,7 +834,7 @@ pub struct Device {
         self.depth_resource(d, width, height)!;
     }
 
-    fn depth_resource(self: *mut Device, d: *mut DepthBuffer, width: u32, height: u32) !void {
+    fn depth_resource(self: *mut Device, d: *mut DepthBuffer, width: u32, height: u32) D3d12Error!void {
         // one that shaders read is typeless: a D32 depth view and an R32 shader view
         let mut format = D32_FLOAT;
         if d.sampled {
@@ -874,7 +875,7 @@ pub struct Device {
         }
     }
 
-    fn committed(self: *mut Device, heap: u32, desc: []mut u8, state: u32, clear: *u8) !usize {
+    fn committed(self: *mut Device, heap: u32, desc: []mut u8, state: u32, clear: *u8) D3d12Error!usize {
         // D3D12_HEAP_PROPERTIES: type, CPU page property, pool, node masks
         let hp: [5]u32 = [heap, 0, 0, 1, 1];
         let mut res: usize = 0;
@@ -884,7 +885,7 @@ pub struct Device {
     }
 
     /// A buffer holding data (vertices or indexes), in memory the GPU reads.
-    pub fn buffer(self: *mut Device, data: []u8) !Buffer {
+    pub fn buffer(self: *mut Device, data: []u8) D3d12Error!Buffer {
         let mut rd: [56]u8 = [0; 56];
         buffer_desc(rd[..], @as(u64, data.len));
         let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
@@ -903,7 +904,7 @@ pub struct Device {
 
     /// A constant buffer of at least `size` bytes for shaders' b1, b2, ...
     /// (set_buffer), its contents written with Buffer.write.
-    pub fn constant_buffer(self: *mut Device, size: usize) !Buffer {
+    pub fn constant_buffer(self: *mut Device, size: usize) D3d12Error!Buffer {
         return self.upload_buffer(size);
     }
 
@@ -911,7 +912,7 @@ pub struct Device {
     /// Buffer.write, or through Buffer.floats): vertices made each frame,
     /// constants. It stays mapped; frames are waited for, so the GPU has
     /// finished reading the last frame's contents.
-    pub fn upload_buffer(self: *mut Device, size: usize) !Buffer {
+    pub fn upload_buffer(self: *mut Device, size: usize) D3d12Error!Buffer {
         let n = (size + 255) & ~@as(usize, 255);  // a multiple of 256 bytes
         let mut rd: [56]u8 = [0; 56];
         buffer_desc(rd[..], @as(u64, n));
@@ -930,7 +931,7 @@ pub struct Device {
 
     // An upload buffer holding `rows` rows of `row` bytes from data, each at a
     // multiple of `pitch` (what a texture copy needs).
-    fn staging(self: *mut Device, data: []u8, row: usize, rows: usize, pitch: usize) !usize {
+    fn staging(self: *mut Device, data: []u8, row: usize, rows: usize, pitch: usize) D3d12Error!usize {
         let mut rd: [56]u8 = [0; 56];
         buffer_desc(rd[..], @as(u64, pitch * rows));
         let res = self.committed(2, rd[..], GENERIC_READ, @ptr_from_int(*u8, 0))!;  // UPLOAD heap
@@ -950,7 +951,7 @@ pub struct Device {
 
     /// A texture holding img (converted to 8-bit RGBA), for shaders to read
     /// (set_image). Made between frames.
-    pub fn texture(self: *mut Device, img: *image.Image) !Texture {
+    pub fn texture(self: *mut Device, img: *image.Image) D3d12Error!Texture {
         if (img.channels == 4) and (img.depth == image.Depth.U8) {
             return self.texture_rgba(img);
         }
@@ -959,7 +960,7 @@ pub struct Device {
         return self.texture_rgba(&conv);
     }
 
-    fn texture_rgba(self: *mut Device, img: *image.Image) !Texture {
+    fn texture_rgba(self: *mut Device, img: *image.Image) D3d12Error!Texture {
         return self.texture_levels(@truncate(u32, img.width), @truncate(u32, img.height), R8G8B8A8_UNORM, 4,
                                    img.data[0..(img.width * img.height) * 4], 1);
     }
@@ -970,7 +971,7 @@ pub struct Device {
     /// read linear light (colours); without, as they are (normals, masks,
     /// heights, distance fields). 16-bit and float images become half-float
     /// RGBA (`srgb` ignored): linear light, HDR. Made between frames.
-    pub fn texture_mipmapped(self: *mut Device, img: *image.Image, srgb: bool) !Texture {
+    pub fn texture_mipmapped(self: *mut Device, img: *image.Image, srgb: bool) D3d12Error!Texture {
         let w = img.width;
         let h = img.height;
         if (w == 0) or (h == 0) {
@@ -1027,7 +1028,8 @@ pub struct Device {
     // A texture of `format`, `bpp` bytes a pixel, from `levels` mip levels
     // one after the other in data (each w × h halved, rounded down, at
     // least 1; rows packed).
-    fn texture_levels(self: *mut Device, w: u32, h: u32, format: u32, bpp: usize, data: []u8, levels: u32) !Texture {
+    fn texture_levels(self: *mut Device, w: u32, h: u32, format: u32, bpp: usize, data: []u8,
+                      levels: u32) D3d12Error!Texture {
         if self.recording or (levels == 0) or (levels > 16) {
             return error.InvalidArgument;
         }
@@ -1122,7 +1124,7 @@ pub struct Device {
 
     /// A storage buffer holding data (its length a multiple of 4), for
     /// compute shaders. Made between frames.
-    pub fn storage_buffer(self: *mut Device, data: []u8) !StorageBuffer {
+    pub fn storage_buffer(self: *mut Device, data: []u8) D3d12Error!StorageBuffer {
         if self.recording or (data.len == 0) or ((data.len % 4) != 0) {
             return error.InvalidArgument;
         }
@@ -1152,7 +1154,7 @@ pub struct Device {
 
     /// Copies a storage buffer's contents into out (as much as fits), after
     /// what was recorded so far has run.
-    pub fn read_buffer(self: *mut Device, b: *mut StorageBuffer, out: []mut u8) !void {
+    pub fn read_buffer(self: *mut Device, b: *mut StorageBuffer, out: []mut u8) D3d12Error!void {
         let mut rd: [56]u8 = [0; 56];
         buffer_desc(rd[..], @as(u64, b.size));
         let rb = self.committed(3, rd[..], COPY_DEST, @ptr_from_int(*u8, 0))!;  // READBACK heap
@@ -1174,7 +1176,7 @@ pub struct Device {
 
     /// A root signature for compute shaders: `constants` 32-bit constants at
     /// b0 (0: none) and `storage` storage buffers at u0, u1, ...
-    pub fn compute_signature(self: *mut Device, constants: u32, storage: u32) !RootSignature {
+    pub fn compute_signature(self: *mut Device, constants: u32, storage: u32) D3d12Error!RootSignature {
         if storage > 8 {
             return error.InvalidArgument;
         }
@@ -1204,7 +1206,7 @@ pub struct Device {
 
     /// A compute pipeline: the compute shader and its root signature
     /// (compute_signature).
-    pub fn compute_pipeline(self: *mut Device, root: *RootSignature, cs: *hlsl.Code) !Pipeline {
+    pub fn compute_pipeline(self: *mut Device, root: *RootSignature, cs: *hlsl.Code) D3d12Error!Pipeline {
         let cb = cs.bytes();
         // D3D12_COMPUTE_PIPELINE_STATE_DESC: root signature, shader, node
         // mask, cached state, flags
@@ -1218,7 +1220,7 @@ pub struct Device {
         return Pipeline.{ p: p, root: root.p, topology: 0, buffers: root.buffers, textures: 0 };
     }
 
-    fn serialize_root(self: *mut Device, desc: []u8) !usize {
+    fn serialize_root(self: *mut Device, desc: []u8) D3d12Error!usize {
         let mut blob: usize = 0;
         let mut errs: usize = 0;
         let r = D3D12SerializeRootSignature(&desc[0], 1, &mut blob, &mut errs);
@@ -1235,7 +1237,7 @@ pub struct Device {
 
     /// A root signature with `constants` 32-bit constants for both shaders
     /// at register b0 (0: none), and vertex input.
-    pub fn root_signature(self: *mut Device, constants: u32) !RootSignature {
+    pub fn root_signature(self: *mut Device, constants: u32) D3d12Error!RootSignature {
         return self.root_signature_with(constants, 0, 0);
     }
 
@@ -1245,7 +1247,8 @@ pub struct Device {
     /// samplers are always there: s0 linear (trilinear) and wrapping, s1 a
     /// comparison (less or equal, linear, white outside) for shadow maps,
     /// s2 linear and clamped, for targets read by later passes.
-    pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32, textures: u32) !RootSignature {
+    pub fn root_signature_with(self: *mut Device, constants: u32, buffers: u32,
+                               textures: u32) D3d12Error!RootSignature {
         if (buffers > MAX_ROOT_BUFFERS) or (textures > MAX_ROOT_TEXTURES) {
             return error.InvalidArgument;
         }
@@ -1317,7 +1320,7 @@ pub struct Device {
     /// A pipeline: the shaders, the vertex layout, the topology; alpha
     /// blending when `blend`. It draws into R8G8B8A8 targets.
     pub fn pipeline(self: *mut Device, root: *RootSignature, vs: *hlsl.Code, ps: *hlsl.Code, attrs: []Attribute,
-                    topology: u32, blend: bool) !Pipeline {
+                    topology: u32, blend: bool) D3d12Error!Pipeline {
         let mut b = BLEND_NONE;
         if blend {
             b = BLEND_ALPHA;
@@ -1333,7 +1336,7 @@ pub struct Device {
     /// begin_shadow), culling, depth bias, into targets of o.format and
     /// o.samples.
     pub fn pipeline_with(self: *mut Device, root: *RootSignature, vs: *hlsl.Code, ps: *hlsl.Code, attrs: []Attribute,
-                         o: PipelineOptions) !Pipeline {
+                         o: PipelineOptions) D3d12Error!Pipeline {
         let topology = o.topology;
         if attrs.len > 16 {
             return error.InvalidArgument;
@@ -1462,7 +1465,7 @@ pub struct Device {
         @bit_cast(fn(usize, u32, *u8) void, com.method(self.list, 26))(self.list, 1, &b[0]);
     }
 
-    fn open(self: *mut Device) !void {
+    fn open(self: *mut Device) D3d12Error!void {
         if self.recording {
             return;
         }
@@ -1472,7 +1475,7 @@ pub struct Device {
         self.heaps_set = false;
     }
 
-    fn submit(self: *mut Device) !void {
+    fn submit(self: *mut Device) D3d12Error!void {
         com.check(call0(self.list, 9)) catch |e| {  // Close
             self.recording = false;
             return e;
@@ -1484,13 +1487,13 @@ pub struct Device {
     }
 
     /// Starts recording a frame that draws into t (over all of it).
-    pub fn begin(self: *mut Device, t: *mut Target) !void {
+    pub fn begin(self: *mut Device, t: *mut Target) D3d12Error!void {
         self.begin_with(t, @ptr_from_int(*usize, 0))!;
     }
 
     /// Starts recording a frame that draws into t, testing depth against d
     /// (of t's size).
-    pub fn begin_depth(self: *mut Device, t: *mut Target, d: *mut DepthBuffer) !void {
+    pub fn begin_depth(self: *mut Device, t: *mut Target, d: *mut DepthBuffer) D3d12Error!void {
         if (d.width != t.width) or (d.height != t.height) {
             return error.InvalidArgument;
         }
@@ -1503,7 +1506,7 @@ pub struct Device {
     /// Starts recording (or goes on recording the frame, before begin or
     /// begin_depth) drawing into d alone, with depth_only pipelines: a
     /// shadow map's pass.
-    pub fn begin_shadow(self: *mut Device, d: *mut DepthBuffer) !void {
+    pub fn begin_shadow(self: *mut Device, d: *mut DepthBuffer) D3d12Error!void {
         self.open()!;
         self.end_pass();
         self.barrier(d.res, d.state, DEPTH_WRITE_STATE);
@@ -1513,7 +1516,7 @@ pub struct Device {
         self.viewport(d.width, d.height);
     }
 
-    fn begin_with(self: *mut Device, t: *mut Target, dsv: *usize) !void {
+    fn begin_with(self: *mut Device, t: *mut Target, dsv: *usize) D3d12Error!void {
         self.open()!;
         self.end_pass();
         if t.msaa == 0 {
@@ -1623,7 +1626,7 @@ pub struct Device {
     /// The compute pipeline to run (compute_pipeline): starts recording, or
     /// goes on recording the frame. Its constants and storage buffers must
     /// be set (again) after it.
-    pub fn set_compute_pipeline(self: *mut Device, p: *Pipeline) !void {
+    pub fn set_compute_pipeline(self: *mut Device, p: *Pipeline) D3d12Error!void {
         self.open()!;
         @bit_cast(fn(usize, usize) void, com.method(self.list, 25))(self.list, p.p);
         @bit_cast(fn(usize, usize) void, com.method(self.list, 29))(self.list, p.root);  // SetComputeRootSignature
@@ -1708,7 +1711,7 @@ pub struct Device {
 
     /// Submits the frame drawn into a texture and waits for it (and for the
     /// overlay's drawing).
-    pub fn finish(self: *mut Device) !void {
+    pub fn finish(self: *mut Device) D3d12Error!void {
         if not self.recording {
             self.wait_idle();
             return;
@@ -1729,7 +1732,7 @@ pub struct Device {
     ///     c.begin(); ... c.end()!;
     ///     gpu.end_overlay(&mut ov, t);
     ///     gpu.present(true)!;                 // or finish(), read_pixels
-    pub fn overlay(self: *mut Device) !Overlay {
+    pub fn overlay(self: *mut Device) D3d12Error!Overlay {
         let mut o = Overlay.{ dev11: 0, ctx: 0, on12: 0, res: [0; 8], wrapped: [0; 8], n: 0 };
         let queues: [1]usize = [self.queue];
         let mut level: u32 = 0;
@@ -1747,7 +1750,7 @@ pub struct Device {
 
     /// t as a Direct3D 11 texture (an ID3D11Texture2D) of the overlay, for
     /// d2d.Canvas.for_texture or retarget; made the first time.
-    pub fn overlay_texture(self: *mut Device, o: *mut Overlay, t: *Target) !usize {
+    pub fn overlay_texture(self: *mut Device, o: *mut Overlay, t: *Target) D3d12Error!usize {
         for k in 0..o.n {
             if o.res[k] == t.res {
                 return o.wrapped[k];
@@ -1770,7 +1773,7 @@ pub struct Device {
 
     /// Submits what was recorded for t, and hands t to the overlay: Direct2D
     /// draws onto it until end_overlay.
-    pub fn begin_overlay(self: *mut Device, o: *mut Overlay, t: *mut Target) !void {
+    pub fn begin_overlay(self: *mut Device, o: *mut Overlay, t: *mut Target) D3d12Error!void {
         let w = self.overlay_texture(o, t)!;
         self.end_pass();
         if self.recording or (t.state != RENDER_TARGET) {
@@ -1799,7 +1802,7 @@ pub struct Device {
 
     /// Submits the frame drawn into screen() and shows it; with vsync, at
     /// the display's next refresh.
-    pub fn present(self: *mut Device, vsync: bool) !void {
+    pub fn present(self: *mut Device, vsync: bool) D3d12Error!void {
         self.end_pass();
         let t = self.screen();
         if self.recording or (t.state != PRESENT) {
@@ -1818,7 +1821,7 @@ pub struct Device {
 
     /// The pixels of a target (after finish()), as an RGBA image (free it
     /// with deinit).
-    pub fn read_pixels(self: *mut Device, t: *mut Target) !image.Image {
+    pub fn read_pixels(self: *mut Device, t: *mut Target) D3d12Error!image.Image {
         if t.format != TARGET_BGRA8 {
             return error.InvalidArgument;
         }

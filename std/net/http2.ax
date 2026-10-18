@@ -29,8 +29,9 @@ import "../net.ax" as net;
 import "../str.ax" as strs;
 import "hpack.ax" as hpack;
 
-error { ProtocolError, FlowControlError, FrameSizeError, CompressionError, StreamClosed, StreamReset, GoAway, TooBig,
-        Closed, NetError, TimedOut, OutOfMemory }
+pub error Http2Error { ProtocolError, FlowControlError, FrameSizeError, CompressionError, StreamClosed, StreamReset,
+                       GoAway, TooBig, Closed, NetError, TimedOut, OutOfMemory, ConnectionRefused, NotFound, Empty,
+                       DecodeError, AddressInUse, Done, ListTooLarge, InvalidUtf8, InvalidAddress, IoError }
 
 /// Frame types.
 pub const DATA: u8 = 0;
@@ -150,7 +151,7 @@ pub struct Conn {
 
     /// A connection over r and w. prefill: bytes already read from it (they
     /// are read first).
-    pub fn init(r: io.Reader, w: io.Writer, server: bool, prefill: []u8) !Conn {
+    pub fn init(r: io.Reader, w: io.Writer, server: bool, prefill: []u8) Http2Error!Conn {
         let buf = mem.alloc.[u8](@max(MAX_FRAME + 9, prefill.len) + 16)!;
         @mem_copy(buf[..prefill.len], prefill);
         let mut next: u32 = 1;
@@ -181,7 +182,7 @@ pub struct Conn {
 
     /// The opening: a client sends the preface; each side its SETTINGS and
     /// a bigger connection window. A server first reads the preface.
-    pub fn handshake(self: *mut Conn) !void {
+    pub fn handshake(self: *mut Conn) Http2Error!void {
         if self.server {
             self.fill(24)!;
             if not strs.eq(self.rbuf[self.start..self.start + 24], PREFACE) {
@@ -207,7 +208,7 @@ pub struct Conn {
         self.recv_window += inc;
     }
 
-    fn fill(self: *mut Conn, n: usize) !void {
+    fn fill(self: *mut Conn, n: usize) Http2Error!void {
         if (self.end - self.start) >= n {
             return;
         }
@@ -233,7 +234,7 @@ pub struct Conn {
         }
     }
 
-    fn write_frame(self: *mut Conn, ty: u8, flags: u8, stream: u32, payload: []u8) !void {
+    fn write_frame(self: *mut Conn, ty: u8, flags: u8, stream: u32, payload: []u8) Http2Error!void {
         self.out.clear();
         let n = payload.len;
         self.out.push(@truncate(u8, n >> 16))!;
@@ -246,14 +247,14 @@ pub struct Conn {
         self.w.write_all(self.out.bytes()) catch return error.NetError;
     }
 
-    fn window_update(self: *mut Conn, stream: u32, inc: u32) !void {
+    fn window_update(self: *mut Conn, stream: u32, inc: u32) Http2Error!void {
         let mut p: [4]u8 = [0; 4];
         binary.put_u32_be(p[..], inc);
         self.write_frame(WINDOW_UPDATE, 0, stream, p[..])!;
     }
 
     /// Resets a stream (CANCEL, REFUSED_STREAM, ...).
-    pub fn reset_stream(self: *mut Conn, id: u32, code: u32) !void {
+    pub fn reset_stream(self: *mut Conn, id: u32, code: u32) Http2Error!void {
         let mut p: [4]u8 = [0; 4];
         binary.put_u32_be(p[..], code);
         self.write_frame(RST_STREAM, 0, id, p[..])!;
@@ -264,7 +265,7 @@ pub struct Conn {
     }
 
     /// Ends the connection: GOAWAY, naming the last stream this side took.
-    pub fn goaway(self: *mut Conn, code: u32) !void {
+    pub fn goaway(self: *mut Conn, code: u32) Http2Error!void {
         if self.sent_goaway {
             return;
         }
@@ -290,7 +291,7 @@ pub struct Conn {
         return false;
     }
 
-    fn find(self: *mut Conn, id: u32) !*mut Stream {
+    fn find(self: *mut Conn, id: u32) Http2Error!*mut Stream {
         for s in self.streams.items() {
             if s.id == id {
                 return s;
@@ -299,7 +300,7 @@ pub struct Conn {
         return error.StreamClosed;
     }
 
-    fn open(self: *mut Conn, id: u32) !*mut Stream {
+    fn open(self: *mut Conn, id: u32) Http2Error!*mut Stream {
         let s = mem.create(Stream.init(id, self.peer_initial_window))!;
         self.streams.push(s) catch |e| {
             mem.destroy(s);
@@ -620,7 +621,7 @@ pub struct Conn {
     }
 
     /// Sends a header block (split into CONTINUATION frames as needed).
-    pub fn send_headers(self: *mut Conn, id: u32, headers: []hpack.Header, end_stream: bool) !void {
+    pub fn send_headers(self: *mut Conn, id: u32, headers: []hpack.Header, end_stream: bool) Http2Error!void {
         let mut b = strs.String.init();
         defer b.deinit();
         self.enc.encode(headers, &mut b)!;
@@ -692,12 +693,12 @@ pub struct Conn {
     }
 
     /// The stream with that id (StreamClosed if there is none).
-    pub fn stream(self: *mut Conn, id: u32) !*mut Stream {
+    pub fn stream(self: *mut Conn, id: u32) Http2Error!*mut Stream {
         return self.find(id)!;
     }
 }
 
-fn unpad(flags: u8, p: []u8) ![]u8 {
+fn unpad(flags: u8, p: []u8) Http2Error![]u8 {
     if (flags & PADDED) == 0 {
         return p;
     }
@@ -711,13 +712,13 @@ fn unpad(flags: u8, p: []u8) ![]u8 {
     return p[1..p.len - pad];
 }
 
-fn put32(s: *mut strs.String, v: u32) !void {
+fn put32(s: *mut strs.String, v: u32) Http2Error!void {
     let mut b: [4]u8 = [0; 4];
     binary.put_u32_be(b[..], v);
     s.push_str(b[..])!;
 }
 
-fn setting(s: *mut strs.String, id: u16, v: u32) !void {
+fn setting(s: *mut strs.String, id: u16, v: u32) Http2Error!void {
     s.push(@truncate(u8, id >> 8))!;
     s.push(@truncate(u8, id))!;
     put32(s, v)!;
@@ -757,7 +758,7 @@ pub struct Client {
     /// A client over a connection (the preface and settings are sent now).
     /// authority is the host (and port) for ":authority", scheme "https" or
     /// "http"; both must outlive the client.
-    pub fn init(r: io.Reader, w: io.Writer, authority: []u8, scheme: []u8) !Client {
+    pub fn init(r: io.Reader, w: io.Writer, authority: []u8, scheme: []u8) Http2Error!Client {
         let mut c = Client.{ conn: Conn.init(r, w, false, "")!, authority: authority, scheme: scheme };
         c.conn.handshake() catch |e| {
             c.conn.deinit();
@@ -851,7 +852,7 @@ fn swrite(ctx: *mut void, bytes: []u8) !usize {
     return t.write(bytes)!;
 }
 
-fn pair(p: *mut Pair) !void {
+fn pair(p: *mut Pair) Http2Error!void {
     let l = net.listen_addr(net.Addr.loopback(net.Family.V4, 0))!;
     defer l.close();
     p.a = net.connect_addr(l.local_addr()!)!;
@@ -859,7 +860,7 @@ fn pair(p: *mut Pair) !void {
     p.b.set_timeout(300)!;
 }
 
-fn frame(out: *mut strs.String, ty: u8, flags: u8, id: u32, payload: []u8) !void {
+fn frame(out: *mut strs.String, ty: u8, flags: u8, id: u32, payload: []u8) Http2Error!void {
     out.push(@truncate(u8, payload.len >> 16))!;
     out.push(@truncate(u8, payload.len >> 8))!;
     out.push(@truncate(u8, payload.len))!;

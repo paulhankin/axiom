@@ -26,8 +26,9 @@ import "../net.ax" as net;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 
-error { NameNotFound, ServerFailure, Refused, FormatError, BadName, BadResponse, TimedOut, NoServers, NetError,
-        OutOfMemory }
+pub error DnsError { NameNotFound, ServerFailure, Refused, FormatError, BadName, BadResponse, TimedOut, NoServers,
+                     NetError, OutOfMemory, ConnectionRefused, NotFound, Empty, AddressInUse, Done, InvalidAddress,
+                     InvalidUtf8, IoError }
 
 /// Record types.
 pub const A: u16 = 1;
@@ -86,7 +87,7 @@ pub struct Resolver {
     attempts: u32,    // per server
 
     /// The name servers of /etc/resolv.conf (NoServers if it names none).
-    pub fn system() !Resolver {
+    pub fn system() DnsError!Resolver {
         let mut r = Resolver.{ servers: [net.Addr.any(net.Family.V4, 0); 4], count: 0, timeout_ms: 2000, attempts: 2 };
         let text = fs.read_file("/etc/resolv.conf") catch return error.NoServers;
         defer mem.free(text);
@@ -155,7 +156,7 @@ pub struct Resolver {
         return last;
     }
 
-    fn ask(self: *Resolver, server: net.Addr, q: []u8, id: u16) !Response {
+    fn ask(self: *Resolver, server: net.Addr, q: []u8, id: u16) DnsError!Response {
         let sock = net.UdpSocket.bind(net.Addr.any(server.family, 0)) catch return error.NetError;
         defer sock.close();
         sock.set_timeout(@max(self.timeout_ms, 1)) catch return error.NetError;
@@ -230,7 +231,7 @@ pub struct Resolver {
 
 /// The name to look up an address's PTR record by: 4.3.2.1.in-addr.arpa,
 /// or the nibbles of an IPv6 address under ip6.arpa.
-pub fn reverse_name(a: net.Addr, out: *mut strs.String) !void {
+pub fn reverse_name(a: net.Addr, out: *mut strs.String) DnsError!void {
     let hex = "0123456789abcdef";
     let mut buf: [4]u8 = [0; 4];
     if a.family == net.Family.V4 {
@@ -274,13 +275,13 @@ fn dec(buf: []mut u8, v: u8) []u8 {
 // The wire format
 // -----------------------------------------------------------------------------
 
-fn put16(s: *mut strs.String, v: u16) !void {
+fn put16(s: *mut strs.String, v: u16) DnsError!void {
     s.push(@truncate(u8, v >> 8))!;
     s.push(@truncate(u8, v))!;
 }
 
 /// Appends a name in wire format (labels; a final "." is optional).
-pub fn encode_name(s: *mut strs.String, name: []u8) !void {
+pub fn encode_name(s: *mut strs.String, name: []u8) DnsError!void {
     let mut n = name;
     if (n.len > 0) and (n[n.len - 1] == '.') {
         n = n[..n.len - 1];
@@ -302,7 +303,7 @@ pub fn encode_name(s: *mut strs.String, name: []u8) !void {
     s.push(0)!;
 }
 
-fn build_query(s: *mut strs.String, id: u16, name: []u8, rtype: u16) !void {
+fn build_query(s: *mut strs.String, id: u16, name: []u8, rtype: u16) DnsError!void {
     put16(s, id)!;
     put16(s, 0x0100)!;  // a query, recursion desired
     put16(s, 1)!;       // one question
@@ -341,7 +342,7 @@ fn matches(r: []u8, q: []u8, id: u16) bool {
 
 // Reads the name at i into out (dotted, without a final dot); returns the
 // position after it where it was read from (not after any pointer).
-fn read_name(b: []u8, i0: usize, out: *mut strs.String) !usize {
+fn read_name(b: []u8, i0: usize, out: *mut strs.String) DnsError!usize {
     let mut i = i0;
     let mut end: usize = 0;
     let mut jumped = false;
@@ -395,7 +396,7 @@ fn read_name(b: []u8, i0: usize, out: *mut strs.String) !usize {
     return end;
 }
 
-fn store_name(b: []u8, i: usize, store: *mut strs.String, at: *mut usize, span: *mut usize) !usize {
+fn store_name(b: []u8, i: usize, store: *mut strs.String, at: *mut usize, span: *mut usize) DnsError!usize {
     let mut tmp = strs.String.init();
     defer tmp.deinit();
     let next = read_name(b, i, &mut tmp)!;
@@ -418,14 +419,14 @@ struct Pending {
 
 /// Parses a reply message (the bytes of a DNS response, as a server sends
 /// them). BadResponse for a malformed one; the rcode errors as for query.
-pub fn parse(reply: []u8) !Response {
+pub fn parse(reply: []u8) DnsError!Response {
     if reply.len < 12 {
         return error.BadResponse;
     }
     return parse_response(reply);
 }
 
-fn parse_response(b: []u8) !Response {
+fn parse_response(b: []u8) DnsError!Response {
     let rcode = b[3] & 15;
     if rcode == 3 {
         return error.NameNotFound;
@@ -451,7 +452,7 @@ fn parse_response(b: []u8) !Response {
     return r;
 }
 
-fn parse_records(r: *mut Response) !void {
+fn parse_records(r: *mut Response) DnsError!void {
     let b = r.packet;
     let qd = binary.u16_be(b[4..]);
     let counts: [3]u16 = [binary.u16_be(b[6..]), binary.u16_be(b[8..]), binary.u16_be(b[10..])];
@@ -546,7 +547,7 @@ fn parse_records(r: *mut Response) !void {
     }
 }
 
-fn tcp_query(server: net.Addr, q: []u8, id: u16, timeout_ms: u32) !Response {
+fn tcp_query(server: net.Addr, q: []u8, id: u16, timeout_ms: u32) DnsError!Response {
     let s = net.connect_addr(server) catch return error.NetError;
     defer s.close();
     s.set_timeout(@max(timeout_ms, 1)) catch return error.NetError;
@@ -581,7 +582,8 @@ struct Server {
 
 // the answer records for a question name and type (the name is at 12:
 // pointer 0xc00c)
-fn answers(qname: []u8, qtype: u16, out: *mut strs.String, count: *mut u16, rcode: *mut u8, tc: *mut bool) !void {
+fn answers(qname: []u8, qtype: u16, out: *mut strs.String, count: *mut u16, rcode: *mut u8,
+           tc: *mut bool) DnsError!void {
     let ptr: [2]u8 = [0xc0, 0x0c];
     if strs.eq(qname, "missing.test") {
         rcode.* = 3;
@@ -678,7 +680,7 @@ fn answers(qname: []u8, qtype: u16, out: *mut strs.String, count: *mut u16, rcod
 }
 
 // The reply to a query (with TC set, or not, and a chosen id).
-fn reply_to(q: []u8, full: bool, id: u16, out: *mut strs.String) !bool {
+fn reply_to(q: []u8, full: bool, id: u16, out: *mut strs.String) DnsError!bool {
     let mut name = strs.String.init();
     defer name.deinit();
     let qend = read_name(q, 12, &mut name)!;
@@ -755,7 +757,7 @@ fn serve(s: *mut Server) void {
 // A server on a free loopback port, over UDP and TCP. (Windows hands out
 // UDP ports in turn, and some of them can be in a range reserved for TCP,
 // as Hyper-V reserves ranges: then the next one.)
-fn new_server() !Server {
+fn new_server() DnsError!Server {
     for _attempt in @as(u32, 0)..100 {
         let udp = net.UdpSocket.bind(net.Addr.loopback(net.Family.V4, 0))!;
         let local = udp.local_addr() catch |e| {
@@ -859,12 +861,12 @@ test "names and hostile replies" {
     good.deinit();
 }
 
-fn bad_name(r: !void) bool {
+fn bad_name(r: DnsError!void) bool {
     r catch |e| return e == error.BadName;
     return false;
 }
 
-fn bad(r: !Response) bool {
+fn bad(r: DnsError!Response) bool {
     let mut x = r catch |e| return e == error.BadResponse;
     x.deinit();
     return false;

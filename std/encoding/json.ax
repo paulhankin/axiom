@@ -39,7 +39,8 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../str.ax" as strs;
 
-error { SyntaxError, TooDeep, NotFound, WrongType, BadNesting, OutOfMemory }
+pub error JsonError { SyntaxError, TooDeep, NotFound, WrongType, BadNesting, OutOfMemory, IoError, BadFormat, Empty,
+                      EndOfStream, Done, InvalidNumber, InvalidUtf8 }
 
 /// Nesting deeper than this is rejected (error.TooDeep) instead of risking
 /// the stack.
@@ -65,7 +66,7 @@ pub union Value {
 
     /// The value of `key` in an object: NotFound if it has no such member,
     /// WrongType if this is not an object.
-    pub fn get(self: Value, key: []u8) !Value {
+    pub fn get(self: Value, key: []u8) JsonError!Value {
         match self {
             .Object(ms) => {
                 let mut i = ms.len;
@@ -83,7 +84,7 @@ pub union Value {
 
     /// Element i of an array: NotFound if out of range, WrongType if this is
     /// not an array.
-    pub fn at(self: Value, i: usize) !Value {
+    pub fn at(self: Value, i: usize) JsonError!Value {
         match self {
             .Array(xs) => {
                 if i >= xs.len {
@@ -113,14 +114,14 @@ pub union Value {
         }
     }
 
-    pub fn as_bool(self: Value) !bool {
+    pub fn as_bool(self: Value) JsonError!bool {
         match self {
             .Bool(b) => { return b; }
             else     => { return error.WrongType; }
         }
     }
 
-    pub fn as_str(self: Value) ![]u8 {
+    pub fn as_str(self: Value) JsonError![]u8 {
         match self {
             .String(s) => { return s; }
             else       => { return error.WrongType; }
@@ -128,7 +129,7 @@ pub union Value {
     }
 
     /// Any number, as an f64.
-    pub fn as_f64(self: Value) !f64 {
+    pub fn as_f64(self: Value) JsonError!f64 {
         match self {
             .Int(x)   => { return @float_from_int(f64, x); }
             .Float(x) => { return x; }
@@ -137,7 +138,7 @@ pub union Value {
     }
 
     /// An integer: an Int, or a Float with no fractional part that fits.
-    pub fn as_i64(self: Value) !i64 {
+    pub fn as_i64(self: Value) JsonError!i64 {
         match self {
             .Int(x) => { return x; }
             .Float(x) => {
@@ -150,14 +151,14 @@ pub union Value {
         }
     }
 
-    pub fn as_array(self: Value) ![]Value {
+    pub fn as_array(self: Value) JsonError![]Value {
         match self {
             .Array(xs) => { return xs; }
             else       => { return error.WrongType; }
         }
     }
 
-    pub fn as_object(self: Value) ![]Member {
+    pub fn as_object(self: Value) JsonError![]Member {
         match self {
             .Object(ms) => { return ms; }
             else        => { return error.WrongType; }
@@ -185,7 +186,7 @@ struct Arena {
         self.chunks.deinit();
     }
 
-    fn bytes(self: *mut Arena, n: usize) ![]mut u8 {
+    fn bytes(self: *mut Arena, n: usize) JsonError![]mut u8 {
         let start = (self.used + 7) & ~@as(usize, 7);
         if (start + n) <= self.cur.len {
             self.used = start + n;
@@ -211,7 +212,7 @@ struct Arena {
         return c[..n];
     }
 
-    fn values(self: *mut Arena, xs: []Value) ![]Value {
+    fn values(self: *mut Arena, xs: []Value) JsonError![]Value {
         if xs.len == 0 {
             return @slice_from_ptr(@ptr_from_int(*Value, 8), 0);
         }
@@ -221,7 +222,7 @@ struct Arena {
         return out;
     }
 
-    fn members(self: *mut Arena, xs: []Member) ![]Member {
+    fn members(self: *mut Arena, xs: []Member) JsonError![]Member {
         if xs.len == 0 {
             return @slice_from_ptr(@ptr_from_int(*Member, 8), 0);
         }
@@ -264,7 +265,7 @@ struct Parser {
     members: vec.Vec.[Member],  // members of the objects being parsed
     message: []u8,
 
-    fn fail(self: *mut Parser, msg: []u8) error {
+    fn fail(self: *mut Parser, msg: []u8) JsonError {
         if self.message.len == 0 {
             self.message = msg;
         }
@@ -281,7 +282,7 @@ struct Parser {
         }
     }
 
-    fn literal(self: *mut Parser, word: []u8, v: Value) !Value {
+    fn literal(self: *mut Parser, word: []u8, v: Value) JsonError!Value {
         if ((self.i + word.len) > self.s.len) or not @mem_eq(self.s[self.i..self.i + word.len], word) {
             return self.fail("invalid literal");
         }
@@ -289,7 +290,7 @@ struct Parser {
         return v;
     }
 
-    fn value(self: *mut Parser) !Value {
+    fn value(self: *mut Parser) JsonError!Value {
         self.skip_ws();
         if self.i >= self.s.len {
             return self.fail("unexpected end of input");
@@ -311,7 +312,7 @@ struct Parser {
         }
     }
 
-    fn enter(self: *mut Parser) !void {
+    fn enter(self: *mut Parser) JsonError!void {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             _ = self.fail("nested too deeply");
@@ -319,7 +320,7 @@ struct Parser {
         }
     }
 
-    fn array(self: *mut Parser) !Value {
+    fn array(self: *mut Parser) JsonError!Value {
         self.enter()!;
         self.i += 1;
         let base = self.values.len;
@@ -350,7 +351,7 @@ struct Parser {
         return Value.Array(xs);
     }
 
-    fn object(self: *mut Parser) !Value {
+    fn object(self: *mut Parser) JsonError!Value {
         self.enter()!;
         self.i += 1;
         let base = self.members.len;
@@ -391,7 +392,7 @@ struct Parser {
         return Value.Object(ms);
     }
 
-    fn hex4(self: *mut Parser) !u32 {
+    fn hex4(self: *mut Parser) JsonError!u32 {
         if (self.i + 4) > self.s.len {
             return self.fail("truncated \\u escape");
         }
@@ -413,7 +414,7 @@ struct Parser {
     }
 
     /// A string starting at the opening quote, unescaped into the arena.
-    fn string(self: *mut Parser) ![]u8 {
+    fn string(self: *mut Parser) JsonError![]u8 {
         self.i += 1;
         let start = self.i;
         // the common case: no escapes
@@ -515,7 +516,7 @@ struct Parser {
 
     /// The offset of the closing quote of the string whose body starts at
     /// `from` (an upper bound on its unescaped length).
-    fn find_end(self: *mut Parser, from: usize) !usize {
+    fn find_end(self: *mut Parser, from: usize) JsonError!usize {
         let mut j = from;
         while j < self.s.len {
             let c = self.s[j];
@@ -530,7 +531,7 @@ struct Parser {
         return self.fail("unterminated string");
     }
 
-    fn number(self: *mut Parser) !Value {
+    fn number(self: *mut Parser) JsonError!Value {
         let start = self.i;
         let s = self.s;
         if s[self.i] == '-' {
@@ -588,13 +589,13 @@ struct Parser {
 
 /// Parses a JSON text (any value, surrounded by optional whitespace).
 /// Fails with SyntaxError, TooDeep or OutOfMemory; see parse_with for where.
-pub fn parse(text: []u8) !Document {
+pub fn parse(text: []u8) JsonError!Document {
     let mut info = ErrorInfo.{ offset: 0, line: 0, column: 0, message: "" };
     return parse_with(text, &mut info);
 }
 
 /// Like parse, and on failure fills `info` with the position and reason.
-pub fn parse_with(text: []u8, info: *mut ErrorInfo) !Document {
+pub fn parse_with(text: []u8, info: *mut ErrorInfo) JsonError!Document {
     let mut arena = Arena.init();
     let mut p = Parser.{
         s: text,
@@ -882,7 +883,7 @@ pub fn stringify(v: Value) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// v as indented JSON text in new memory (free it with mem.free).
@@ -892,7 +893,7 @@ pub fn stringify_pretty(v: Value, indent: u32) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes v as compact JSON text to w (through a 4 KB buffer, flushed before
@@ -929,10 +930,10 @@ test "parse and read" {
     @expect(r.get("ok")!.as_bool()!);
     @expect(r.get("none")!.is_null());
     @expect_eq(r.get("big")!.as_f64()!, 12345678901234567890.0);
-    @expect(fails(r.get("big")!.as_i64(), error.WrongType));
-    @expect(fails(r.get("missing"), error.NotFound));
-    @expect(fails(r.get("langs")!.get("x"), error.WrongType));
-    @expect(fails(r.get("langs")!.at(2), error.NotFound));
+    @expect(fails(widen(r.get("big")!.as_i64()), error.WrongType));
+    @expect(fails(widen(r.get("missing")), error.NotFound));
+    @expect(fails(widen(r.get("langs")!.get("x")), error.WrongType));
+    @expect(fails(widen(r.get("langs")!.at(2)), error.NotFound));
 }
 
 fn fails_void(r: !void, want: error) bool {
@@ -1133,4 +1134,10 @@ test "values of every size" {
         @expect_eq(doc.root.at(0)!.len(), n * 25);
         @expect_eq(doc.root.at(1)!.len(), n * 300);
     }
+}
+
+// A result with this module's errors as one with any error, for the
+// helpers of the tests (error unions do not widen by themselves).
+fn widen[T](r: JsonError!T) !T {
+    return r!;
 }

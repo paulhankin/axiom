@@ -28,7 +28,7 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../str.ax" as strs;
 
-error { InvalidPatch, Conflict, OutOfMemory }
+pub error DiffError { InvalidPatch, Conflict, OutOfMemory, NotFound, IoError, Empty, Done, InvalidUtf8 }
 
 /// Edit operations.
 pub enum Op: u8 {
@@ -53,7 +53,7 @@ pub struct Edit {
 /// The line-by-line differences of two texts, as a list of runs covering
 /// both (so the Op.EQUAL, Op.DELETE and Op.REPLACE runs cover a in order, and the
 /// Op.EQUAL, Op.INSERT and Op.REPLACE runs cover b). The caller frees the result.
-pub fn lines(a: []u8, b: []u8) ![]mut Edit {
+pub fn lines(a: []u8, b: []u8) DiffError![]mut Edit {
     let mut la = split_lines(a)!;
     defer la.deinit();
     let mut lb = split_lines(b)!;
@@ -68,7 +68,7 @@ pub fn lines(a: []u8, b: []u8) ![]mut Edit {
 
 /// The differences of two sequences of tokens (equal tokens are equal
 /// numbers), as for lines.
-pub fn tokens(a: []u32, b: []u32) ![]mut Edit {
+pub fn tokens(a: []u32, b: []u32) DiffError![]mut Edit {
     let ca = mem.alloc.[bool](a.len)!;
     defer mem.free(ca);
     let cb = mem.alloc.[bool](b.len)!;
@@ -80,7 +80,7 @@ pub fn tokens(a: []u32, b: []u32) ![]mut Edit {
 }
 
 // Line boundaries: each line with its "\n" (the last may lack one).
-fn split_lines(s: []u8) !vec.Vec.[[]u8] {
+fn split_lines(s: []u8) DiffError!vec.Vec.[[]u8] {
     let mut v = vec.Vec.[[]u8].init();
     let mut i: usize = 0;
     while i < s.len {
@@ -110,7 +110,7 @@ fn line_less(x: Line, y: Line) bool {
 }
 
 // Numbers the lines, equal lines getting equal numbers.
-fn intern(a: [][]u8, b: [][]u8, ta: []mut u32, tb: []mut u32) !void {
+fn intern(a: [][]u8, b: [][]u8, ta: []mut u32, tb: []mut u32) DiffError!void {
     let n = a.len + b.len;
     let all = mem.alloc.[Line](n)!;
     defer mem.free(all);
@@ -136,7 +136,7 @@ fn intern(a: [][]u8, b: [][]u8, ta: []mut u32, tb: []mut u32) !void {
 }
 
 // The edit runs from the flags of changed elements.
-fn runs(ca: []bool, cb: []bool) ![]mut Edit {
+fn runs(ca: []bool, cb: []bool) DiffError![]mut Edit {
     let mut out = vec.Vec.[Edit].init();
     let mut i: usize = 0;
     let mut j: usize = 0;
@@ -202,7 +202,7 @@ struct Range {
     ylim: i64,
 }
 
-fn compare(a: []u32, b: []u32, ca: []mut bool, cb: []mut bool) !void {
+fn compare(a: []u32, b: []u32, ca: []mut bool, cb: []mut bool) DiffError!void {
     let size = (a.len + b.len) + 3;
     let fd = mem.alloc.[i64](size)!;
     defer mem.free(fd);
@@ -502,7 +502,7 @@ fn put_line(w: io.Writer, tag: []u8, line: []u8) !void {
 /// otherwise): there is no fuzz and no search for moved hunks. Header
 /// lines ("---", "+++", "diff ...", "index ...") are skipped; a patch with
 /// several files is not supported.
-pub fn apply(a: []u8, patch: []u8) ![]mut u8 {
+pub fn apply(a: []u8, patch: []u8) DiffError![]mut u8 {
     let mut la = split_lines(a)!;
     defer la.deinit();
     let al = la.items();
@@ -590,7 +590,7 @@ pub fn apply(a: []u8, patch: []u8) ![]mut u8 {
             return e;
         };
     }
-    return out.take();
+    return out.take()!;
 }
 
 struct Hunk {
@@ -601,7 +601,7 @@ struct Hunk {
 }
 
 // "@@ -l[,s] +l[,s] @@..."
-fn parse_hunk_header(line: []u8, h: *mut Hunk) !void {
+fn parse_hunk_header(line: []u8, h: *mut Hunk) DiffError!void {
     let mut i: usize = 4;
     parse_range(line, &mut i, &mut h.a_start, &mut h.a_count)!;
     if ((i + 1) >= line.len) or (line[i] != ' ') or (line[i + 1] != '+') {
@@ -614,7 +614,7 @@ fn parse_hunk_header(line: []u8, h: *mut Hunk) !void {
     }
 }
 
-fn parse_range(s: []u8, i: *mut usize, start: *mut usize, count: *mut usize) !void {
+fn parse_range(s: []u8, i: *mut usize, start: *mut usize, count: *mut usize) DiffError!void {
     start.* = parse_num(s, i)!;
     count.* = 1;
     if (i.* < s.len) and (s[i.*] == ',') {
@@ -623,7 +623,7 @@ fn parse_range(s: []u8, i: *mut usize, start: *mut usize, count: *mut usize) !vo
     }
 }
 
-fn parse_num(s: []u8, i: *mut usize) !usize {
+fn parse_num(s: []u8, i: *mut usize) DiffError!usize {
     let j0 = i.*;
     let mut v: usize = 0;
     while (i.* < s.len) and strs.is_digit(s[i.*]) {
@@ -649,7 +649,7 @@ fn udiff(a: []u8, b: []u8, ctx: usize) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 test "unified diffs" {
@@ -690,14 +690,14 @@ test "unified diffs" {
     @expect(same.len == 0);
 }
 
-fn conflicts(r: ![]mut u8) bool {
+fn conflicts(r: DiffError![]mut u8) bool {
     let x = r catch |e| return e == error.Conflict;
     mem.free(x);
     return false;
 }
 
 // 1..20, one per line, with lines i and j changed
-fn numbers(i: usize, j: usize) ![]mut u8 {
+fn numbers(i: usize, j: usize) DiffError![]mut u8 {
     let mut s = strs.String.init();
     let mut buf: [24]u8 = [0; 24];
     for k in @as(usize, 1)..21 {
@@ -708,11 +708,11 @@ fn numbers(i: usize, j: usize) ![]mut u8 {
             s.push('\n')!;
         }
     }
-    return s.take();
+    return s.take()!;
 }
 
 // a small generator of related texts
-fn text(seed: *mut u32, n: usize, alphabet: u32, out: *mut strs.String) !void {
+fn text(seed: *mut u32, n: usize, alphabet: u32, out: *mut strs.String) DiffError!void {
     for _k in @as(usize, 0)..n {
         seed.* = (seed.* *% 1103515245) +% 12345;
         let v = (seed.* >> 16) % alphabet;
@@ -722,7 +722,7 @@ fn text(seed: *mut u32, n: usize, alphabet: u32, out: *mut strs.String) !void {
 }
 
 // the length of the longest common subsequence, by dynamic programming
-fn lcs(a: []u32, b: []u32) !usize {
+fn lcs(a: []u32, b: []u32) DiffError!usize {
     let row = mem.alloc.[usize](b.len + 1)!;
     defer mem.free(row);
     @mem_set(row, 0);

@@ -38,7 +38,8 @@ import "io.ax" as io;
 import "mem.ax" as mem;
 import "str.ax" as strs;
 
-error { BadFormat, InvalidNumber, Overflow, NoSpaceLeft, OutOfMemory }
+pub error FmtError { BadFormat, InvalidNumber, Overflow, NoSpaceLeft, OutOfMemory, IoError, NotFound, EndOfStream,
+                     Done }
 
 // -----------------------------------------------------------------------------
 // Arguments
@@ -114,7 +115,7 @@ pub fn alloc[const N: usize](template: []u8, args: [N]Arg) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Formats into buf and returns the part written; NoSpaceLeft if it does
@@ -231,7 +232,7 @@ fn align_of_char(c: u8) u8 {
     }
 }
 
-pub fn parse_spec(s: []u8) !Spec {
+pub fn parse_spec(s: []u8) FmtError!Spec {
     let mut sp = Spec.default();
     let mut i: usize = 0;
     if (s.len >= 2) and (align_of_char(s[1]) != ALIGN_NONE) {
@@ -541,7 +542,7 @@ fn digit_value(c: u8) u32 {
 /// Parses an integer in `base` (2 to 36) with an optional sign. With base 0
 /// the base comes from a prefix: 0x, 0b, 0o, or none for decimal.
 /// Fails with InvalidNumber on bad syntax and Overflow if it does not fit.
-pub fn parse_int_base[T: Int](s: []u8, base: u32) !T {
+pub fn parse_int_base[T: Int](s: []u8, base: u32) FmtError!T {
     let mut i: usize = 0;
     let mut neg = false;
     if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
@@ -608,7 +609,7 @@ pub fn parse_int_base[T: Int](s: []u8, base: u32) !T {
 }
 
 /// Parses a decimal integer with an optional sign.
-pub fn parse_int[T: Int](s: []u8) !T {
+pub fn parse_int[T: Int](s: []u8) FmtError!T {
     return parse_int_base.[T](s, 10);
 }
 
@@ -1581,7 +1582,7 @@ fn write_float(w: io.Writer, bits: u64, k: FloatKind, sp: *Spec) !void {
 }
 
 /// The shortest form of x that reads back as x (32 bytes suffice).
-pub fn format_float(out: []mut u8, x: f64) ![]u8 {
+pub fn format_float(out: []mut u8, x: f64) FmtError![]u8 {
     let mut bw = io.BufferWriter.init(out);
     let sp = Spec.default();
     write_float(bw.writer(), @bit_cast(u64, x), F64, &sp) catch return error.NoSpaceLeft;
@@ -1590,7 +1591,7 @@ pub fn format_float(out: []mut u8, x: f64) ![]u8 {
 
 /// The shortest form of x that reads back as the same f32 (24 bytes
 /// suffice).
-pub fn format_float32(out: []mut u8, x: f32) ![]u8 {
+pub fn format_float32(out: []mut u8, x: f32) FmtError![]u8 {
     let mut bw = io.BufferWriter.init(out);
     let sp = Spec.default();
     write_float(bw.writer(), @as(u64, @bit_cast(u32, x)), F32, &sp) catch return error.NoSpaceLeft;
@@ -1646,7 +1647,7 @@ fn match_word(s: []u8, i: usize, word: []u8) bool {
     return strs.eq_ignore_case(s[i..], word);
 }
 
-fn scan(s: []u8, sc: *mut Scanned) !void {
+fn scan(s: []u8, sc: *mut Scanned) FmtError!void {
     let mut i: usize = 0;
     if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
         sc.neg = s[0] == '-';
@@ -1788,7 +1789,7 @@ fn refine(x: *Decimal, estimate: u64, k: FloatKind) u64 {
     }
 }
 
-fn parse_bits(s: []u8, k: FloatKind) !u64 {
+fn parse_bits(s: []u8, k: FloatKind) FmtError!u64 {
     let mut sc = Scanned.{ neg: false, special: 0, dec: decimal_zero(), lead: 0, nlead: 0 };
     scan(s, &mut sc)!;
     let mut sign_bit: u64 = 0;
@@ -1848,11 +1849,11 @@ fn parse_bits(s: []u8, k: FloatKind) !u64 {
 /// optional point, and an optional exponent (1.5, -2e10, .5, 3.); also
 /// "inf", "infinity" and "nan" in any case. The result is correctly rounded.
 /// No surrounding whitespace is allowed.
-pub fn parse_float(s: []u8) !f64 {
+pub fn parse_float(s: []u8) FmtError!f64 {
     return @bit_cast(f64, parse_bits(s, F64)!);
 }
 
-pub fn parse_float32(s: []u8) !f32 {
+pub fn parse_float32(s: []u8) FmtError!f32 {
     return @bit_cast(f32, @truncate(u32, parse_bits(s, F32)!));
 }
 
@@ -1945,14 +1946,14 @@ test "integers" {
     @expect_eq(parse_int_base.[i32]("-0x10", 0)!, -16);
     @expect_eq(parse_int_base.[u64]("0b101", 0)!, 5);
     @expect_eq(parse_int.[u64]("18446744073709551615")!, 18446744073709551615);
-    @expect(fails_with(parse_int.[u8]("256"), error.Overflow));
-    @expect(fails_with(parse_int.[u64]("18446744073709551616"), error.Overflow));
-    @expect(fails_with(parse_int.[u32]("-1"), error.Overflow));
-    @expect(fails_with(parse_int.[i8]("-129"), error.Overflow));
+    @expect(fails_with(widen(parse_int.[u8]("256")), error.Overflow));
+    @expect(fails_with(widen(parse_int.[u64]("18446744073709551616")), error.Overflow));
+    @expect(fails_with(widen(parse_int.[u32]("-1")), error.Overflow));
+    @expect(fails_with(widen(parse_int.[i8]("-129")), error.Overflow));
     @expect_eq(parse_int.[i8]("-128")!, -128);
-    @expect(fails_with(parse_int.[i32]("12a"), error.InvalidNumber));
-    @expect(fails_with(parse_int.[i32](""), error.InvalidNumber));
-    @expect(fails_with(parse_int.[i32]("-"), error.InvalidNumber));
+    @expect(fails_with(widen(parse_int.[i32]("12a")), error.InvalidNumber));
+    @expect(fails_with(widen(parse_int.[i32]("")), error.InvalidNumber));
+    @expect(fails_with(widen(parse_int.[i32]("-")), error.InvalidNumber));
     let mut b: [40]u8 = [0; 40];
     @expect_eq(format_int(b[..], @as(i8, -128)), "-128");
     @expect_eq(format_int(b[..], @as(u16, 65535)), "65535");
@@ -2017,4 +2018,10 @@ test "templates" {
     let s = alloc("{}-{}", [str("x"), float(0.5)])!;
     defer mem.free(s);
     @expect_eq(s, "x-0.5");
+}
+
+// A result with this module's errors as one with any error, for the
+// helpers of the tests (error unions do not widen by themselves).
+fn widen[T](r: FmtError!T) !T {
+    return r!;
 }

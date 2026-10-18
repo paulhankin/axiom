@@ -47,7 +47,8 @@ import "internal/shape/layout.ax" as layout;
 import "internal/shape/normalize.ax" as norm;
 import "internal/shape/plan.ax" as plan;
 
-error { OutOfMemory, InvalidFeature }
+pub error ShapeError { OutOfMemory, InvalidFeature, NotFound, InvalidPath, Corrupt, Empty, Done, Unsupported,
+                       InvalidUtf8, IoError, EndOfStream }
 
 /// The direction text is shaped in.
 pub enum Direction: u8 {
@@ -100,7 +101,7 @@ pub struct Glyph {
 
 /// Parses a feature setting as HarfBuzz writes them: "kern", "+kern",
 /// "-liga", "liga=0", "aalt=2", "kern[3:5]", "smcp[2:]", "kern=1[3:5]".
-pub fn feature(s: []u8) !Feature {
+pub fn feature(s: []u8) ShapeError!Feature {
     let mut f = Feature.{ tag: 0, value: 1, start: 0, end: ALL };
     let mut i: usize = 0;
     if (i < s.len) and ((s[i] == '+') or (s[i] == '-')) {
@@ -251,15 +252,15 @@ fn decode(s: []u8, i: usize) [2]u32 {
 // Planning
 // -----------------------------------------------------------------------------
 
-fn add(mb: *mut layout.MapBuilder, t: []u8, flags: u32, value: u32) !void {
+fn add(mb: *mut layout.MapBuilder, t: []u8, flags: u32, value: u32) ShapeError!void {
     mb.add_feature(tag(t), flags, value)!;
 }
 
-fn enable(mb: *mut layout.MapBuilder, t: []u8, flags: u32) !void {
+fn enable(mb: *mut layout.MapBuilder, t: []u8, flags: u32) ShapeError!void {
     mb.add_feature(tag(t), flags | layout.F_GLOBAL, 1)!;
 }
 
-fn collect_features(mb: *mut layout.MapBuilder, p: *plan.Plan, feats: []Feature) !void {
+fn collect_features(mb: *mut layout.MapBuilder, p: *plan.Plan, feats: []Feature) ShapeError!void {
     enable(mb, "rvrn", 0)!;
     mb.add_gsub_pause(plan.PAUSE_NONE)!;
     if not p.rtl {
@@ -377,7 +378,7 @@ fn kern_info(d: []u8, k: usize) [3]bool {
     return [n > 0, machine, cross];
 }
 
-fn make_plan(f: *font.Font, script: u32, rtl: bool, language: u32, feats: []Feature) !plan.Plan {
+fn make_plan(f: *font.Font, script: u32, rtl: bool, language: u32, feats: []Feature) ShapeError!plan.Plan {
     let mut p = plan.Plan.{
         f: f,
         face: layout.face_init(f.data, f.table_offset("GDEF"), f.table_offset("GSUB"), f.table_offset("GPOS")),
@@ -1219,7 +1220,7 @@ fn run_props(text: []u8, opts: Options) [2]u32 {
     return [script, r];
 }
 
-fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature) ![]mut Glyph {
+fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature) ShapeError![]mut Glyph {
     let mut b = buf.Buffer.init();
     defer b.deinit();
     b.rtl = p.rtl;
@@ -1252,7 +1253,7 @@ fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature) ![]mut Glyph {
 
 /// Shapes a run of text with a font: the glyphs, in visual order (free
 /// them with mem.free). A Shaper is faster for many runs.
-pub fn shape(f: *font.Font, text: []u8, opts: Options) ![]mut Glyph {
+pub fn shape(f: *font.Font, text: []u8, opts: Options) ShapeError![]mut Glyph {
     let pr = run_props(text, opts);
     let mut p = make_plan(f, pr[0], pr[1] == 1, opts.language, opts.features)!;
     defer p.deinit();
@@ -1292,7 +1293,7 @@ pub struct Shaper {
     }
 
     /// As shape.
-    pub fn shape(self: *mut Shaper, f: *font.Font, text: []u8, opts: Options) ![]mut Glyph {
+    pub fn shape(self: *mut Shaper, f: *font.Font, text: []u8, opts: Options) ShapeError![]mut Glyph {
         let pr = run_props(text, opts);
         let rtl = pr[1] == 1;
         self.clock += 1;
@@ -1359,7 +1360,7 @@ fn same_features(a: []Feature, b: []Feature) bool {
 }
 
 /// The advance width of a line of text at a size (the em in pixels).
-pub fn measure(f: *font.Font, text: []u8, size: f64) !f64 {
+pub fn measure(f: *font.Font, text: []u8, size: f64) ShapeError!f64 {
     let gs = shape(f, text, options())!;
     defer mem.free(gs);
     let mut w: i64 = 0;
@@ -1372,7 +1373,8 @@ pub fn measure(f: *font.Font, text: []u8, size: f64) !f64 {
 /// Draws a line of text, shaped, with its baseline starting at (x, y) (y
 /// down). One run: std/graphics/text lays out paragraphs with mixed directions,
 /// scripts and fonts.
-pub fn draw_text(cv: *mut draw.Canvas, f: *font.Font, text: []u8, x: f64, y: f64, size: f64, paint: draw.Paint) !void {
+pub fn draw_text(cv: *mut draw.Canvas, f: *font.Font, text: []u8, x: f64, y: f64, size: f64,
+                 paint: draw.Paint) ShapeError!void {
     let gs = shape(f, text, options())!;
     defer mem.free(gs);
     let scale = font.scale_for(f, size);
@@ -1413,7 +1415,7 @@ fn field(line: []u8, n: usize) []u8 {
     return line[..0];
 }
 
-fn describe(gs: []Glyph, out: *mut strs.String) !void {
+fn describe(gs: []Glyph, out: *mut strs.String) ShapeError!void {
     for k in @as(usize, 0)..gs.len {
         let g = gs[k];
         if k > 0 {
@@ -1432,7 +1434,7 @@ fn describe(gs: []Glyph, out: *mut strs.String) !void {
 }
 
 /// Shapes the cases of one font; the number that differ from HarfBuzz.
-fn check_font(f: *font.Font, lines: [][]u8) !usize {
+fn check_font(f: *font.Font, lines: [][]u8) ShapeError!usize {
     let mut bad: usize = 0;
     let mut got = strs.String.init();
     defer got.deinit();

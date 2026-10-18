@@ -31,7 +31,7 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "../time.ax" as time;
 
-error { UnknownZone, Corrupt, NonExistent, Ambiguous, OutOfMemory }
+pub error TzError { UnknownZone, Corrupt, NonExistent, Ambiguous, OutOfMemory, NotFound, Done, InvalidUtf8 }
 
 /// What a zone says of an instant.
 pub struct Info {
@@ -86,7 +86,7 @@ pub struct Zone {
     }
 
     /// A zone at a fixed offset (seconds east of UTC), named `name`.
-    pub fn fixed(offset: i32, name: []u8) !Zone {
+    pub fn fixed(offset: i32, name: []u8) TzError!Zone {
         let owned = mem.alloc.[u8](name.len)!;
         @mem_copy(owned, name);
         let mut z = Zone.fixed_static(offset, owned);
@@ -103,7 +103,7 @@ pub struct Zone {
 
     /// The zone of that name in the system's database ("America/New_York",
     /// "UTC"). UnknownZone if there is none; Corrupt if its file is bad.
-    pub fn load(name: []u8) !Zone {
+    pub fn load(name: []u8) TzError!Zone {
         if not valid_name(name) {
             return error.UnknownZone;
         }
@@ -133,7 +133,7 @@ pub struct Zone {
 
     /// The local time zone: from $TZ (":name", "name", "/path" or a POSIX
     /// rule), else /etc/localtime, else UTC.
-    pub fn local() !Zone {
+    pub fn local() TzError!Zone {
         let tzv = os.getenv("TZ") catch {
             let data = fs.read_file("/etc/localtime") catch return Zone.utc();
             defer mem.free(data);
@@ -160,7 +160,7 @@ pub struct Zone {
 
     /// A zone from a POSIX TZ string, such as "EST5EDT,M3.2.0,M11.1.0" or
     /// "<+0530>-5:30" (offsets are hours west of UTC, as POSIX has them).
-    pub fn parse_posix(s: []u8) !Zone {
+    pub fn parse_posix(s: []u8) TzError!Zone {
         let names = mem.alloc.[u8](s.len)!;
         let mut z = Zone.fixed_static(0, "");
         z.names = names;
@@ -173,7 +173,7 @@ pub struct Zone {
     }
 
     /// A zone from the bytes of a TZif file.
-    pub fn parse_tzif(data: []u8) !Zone {
+    pub fn parse_tzif(data: []u8) TzError!Zone {
         let mut z = Zone.fixed_static(0, "");
         z.has_rule = false;
         read_tzif(data, &mut z) catch |e| {
@@ -222,7 +222,7 @@ pub struct Zone {
     /// before the change for fold 0 and after it for fold 1, so fold 0
     /// lands after the gap and fold 1 before it. This is Python's rule
     /// (PEP 495).
-    pub fn from_local(self: *Zone, dt: time.DateTime, fold: u32) !time.Time {
+    pub fn from_local(self: *Zone, dt: time.DateTime, fold: u32) TzError!time.Time {
         let l = local_seconds(dt)!;
         let mut c = Candidates.{ t: [0; 3], n: 0, before: 0, after: 0 };
         self.candidates(l, &mut c);
@@ -244,7 +244,7 @@ pub struct Zone {
 
     /// from_local, failing with NonExistent for a skipped time and
     /// Ambiguous for a repeated one.
-    pub fn from_local_strict(self: *Zone, dt: time.DateTime) !time.Time {
+    pub fn from_local_strict(self: *Zone, dt: time.DateTime) TzError!time.Time {
         let l = local_seconds(dt)!;
         let mut c = Candidates.{ t: [0; 3], n: 0, before: 0, after: 0 };
         self.candidates(l, &mut c);
@@ -317,7 +317,7 @@ fn info(k: Kind) Info {
 }
 
 // Local time as seconds since the epoch, as if it were UTC.
-fn local_seconds(dt: time.DateTime) !i64 {
+fn local_seconds(dt: time.DateTime) TzError!i64 {
     let u = time.DateTime.{ year: dt.year, month: dt.month, day: dt.day, hour: dt.hour, minute: dt.minute,
                             second: dt.second, nanosecond: 0, weekday: time.Weekday.SUNDAY, yearday: 0, offset: 0 };
     let t = u.to_time() catch return error.NonExistent;
@@ -358,7 +358,7 @@ struct Header {
     charcnt: usize,
 }
 
-fn header(d: []u8, at: usize, h: *mut Header) !void {
+fn header(d: []u8, at: usize, h: *mut Header) TzError!void {
     if ((at + 44) > d.len) or not strs.eq(d[at..at + 4], "TZif") {
         return error.Corrupt;
     }
@@ -392,7 +392,7 @@ fn block_size(h: *Header, tsize: usize) usize {
             h.isstdcnt) + h.isutcnt;
 }
 
-fn read_tzif(d: []u8, z: *mut Zone) !void {
+fn read_tzif(d: []u8, z: *mut Zone) TzError!void {
     let mut h = Header.{ version: 0, isutcnt: 0, isstdcnt: 0, leapcnt: 0, timecnt: 0, typecnt: 0, charcnt: 0 };
     header(d, 0, &mut h)!;
     let mut at: usize = 44;
@@ -497,7 +497,7 @@ struct Cursor {
         return false;
     }
 
-    fn num(self: *mut Cursor, max: u32) !u32 {
+    fn num(self: *mut Cursor, max: u32) TzError!u32 {
         let j = self.i;
         let mut v: u32 = 0;
         while strs.is_digit(self.peek()) {
@@ -514,7 +514,7 @@ struct Cursor {
     }
 
     // [+-]hh[:mm[:ss]] as seconds
-    fn hms(self: *mut Cursor, max_hours: u32) !i32 {
+    fn hms(self: *mut Cursor, max_hours: u32) TzError!i32 {
         let mut neg = false;
         if self.eat('-') {
             neg = true;
@@ -536,7 +536,7 @@ struct Cursor {
     }
 
     // a zone name: <...> or letters, copied into names
-    fn name(self: *mut Cursor, names: []mut u8, used: *mut usize) ![]u8 {
+    fn name(self: *mut Cursor, names: []mut u8, used: *mut usize) TzError![]u8 {
         let mut a = self.i;
         let mut b = self.i;
         if self.eat('<') {
@@ -570,7 +570,7 @@ struct Cursor {
         return names[at..used.*];
     }
 
-    fn when(self: *mut Cursor) !When {
+    fn when(self: *mut Cursor) TzError!When {
         let mut w = When.{ kind: 'n', n: 0, m: 0, w: 0, d: 0, time: 7200 };
         if self.eat('J') {
             w.kind = 'J';
@@ -599,7 +599,7 @@ struct Cursor {
     }
 }
 
-fn parse_rule(s: []u8, names: []mut u8, used: *mut usize, r: *mut Rule) !void {
+fn parse_rule(s: []u8, names: []mut u8, used: *mut usize, r: *mut Rule) TzError!void {
     let mut c = Cursor.{ s: s, i: 0 };
     let std_name = c.name(names, used)!;
     // POSIX offsets are west of UTC
@@ -754,7 +754,7 @@ test "rules, names and the system database" {
     // fold 0: read with EST, so 07:30 UTC (03:30 EDT); fold 1: with EDT
     @expect(z.from_local(gap, 0)!.unix() == (t + 1801));
     @expect(z.from_local(gap, 1)!.unix() == ((t + 1801) - 3600));
-    @expect(nonexistent(z.from_local_strict(gap)));
+    @expect(nonexistent(widen(z.from_local_strict(gap))));
     let back = time.DateTime.{ year: 2026, month: 11, day: 1, hour: 1, minute: 30, second: 0, nanosecond: 0,
                                weekday: time.Weekday.SUNDAY, yearday: 0, offset: 0 };
     let first = z.from_local(back, 0)!.unix();
@@ -793,13 +793,13 @@ test "rules, names and the system database" {
     @expect(unknown(Zone.load("No/Such_Zone")));
 }
 
-fn invalid(r: !Zone) bool {
+fn invalid(r: TzError!Zone) bool {
     let mut z = r catch |e| return e == error.Corrupt;
     z.deinit();
     return false;
 }
 
-fn unknown(r: !Zone) bool {
+fn unknown(r: TzError!Zone) bool {
     let mut z = r catch |e| return e == error.UnknownZone;
     z.deinit();
     return false;
@@ -808,4 +808,10 @@ fn unknown(r: !Zone) bool {
 fn nonexistent(r: !time.Time) bool {
     _ = r catch |e| return e == error.NonExistent;
     return false;
+}
+
+// A result with this module's errors as one with any error, for the
+// helpers of the tests (error unions do not widen by themselves).
+fn widen[T](r: TzError!T) !T {
+    return r!;
 }

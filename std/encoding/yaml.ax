@@ -38,8 +38,9 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "json.ax" as json;
 
-error { SyntaxError, TooDeep, TooLarge, DuplicateKey, Unsupported, NotFound, WrongType, OutOfMemory, MultipleDocuments,
-        BadNesting }
+pub error YamlError { SyntaxError, TooDeep, TooLarge, DuplicateKey, Unsupported, NotFound, WrongType, OutOfMemory,
+                      MultipleDocuments, BadNesting, Empty, Done, IoError, BadFormat, InvalidUtf8, InvalidNumber,
+                      EndOfStream, Overflow, NoSpaceLeft }
 
 /// Collections nested deeper than this are refused.
 pub const MAX_DEPTH: usize = 512;
@@ -172,7 +173,7 @@ struct Scanner {
     err: []u8,
     err_mark: Mark,
 
-    fn fail(self: *mut Scanner, msg: []u8) error {
+    fn fail(self: *mut Scanner, msg: []u8) YamlError {
         if self.err.len == 0 {
             self.err = msg;
             self.err_mark = self.m;
@@ -233,14 +234,14 @@ struct Scanner {
     }
 
     // Copies one character to b.
-    fn copy(self: *mut Scanner, b: *mut strs.String) !void {
+    fn copy(self: *mut Scanner, b: *mut strs.String) YamlError!void {
         let st = self.m.index;
         self.skip();
         b.push_str(self.s[st..self.m.index])!;
     }
 
     // A line break into b, as \n.
-    fn read_line(self: *mut Scanner, b: *mut strs.String) !void {
+    fn read_line(self: *mut Scanner, b: *mut strs.String) YamlError!void {
         self.skip_line();
         b.push('\n')!;
     }
@@ -249,7 +250,7 @@ struct Scanner {
         return Token.{ kind: kind, start: start, end: self.m, value: "", handle: "", style: Style.NONE };
     }
 
-    fn push(self: *mut Scanner, t: Token) !void {
+    fn push(self: *mut Scanner, t: Token) YamlError!void {
         self.tokens.push(t)!;
         self.last_kind = t.kind;
         self.last_style = t.style;
@@ -260,7 +261,7 @@ struct Scanner {
     // --- the token queue ---------------------------------------------------------
 
     /// The next token (not consumed).
-    fn peek_token(self: *mut Scanner) !*mut Token {
+    fn peek_token(self: *mut Scanner) YamlError!*mut Token {
         self.fetch_more()!;
         return self.tokens.get_ptr(self.head);
     }
@@ -278,7 +279,7 @@ struct Scanner {
         }
     }
 
-    fn fetch_more(self: *mut Scanner) !void {
+    fn fetch_more(self: *mut Scanner) YamlError!void {
         loop {
             let mut need = self.head >= self.tokens.len;
             if not need {
@@ -301,7 +302,7 @@ struct Scanner {
 
     // --- simple keys ---------------------------------------------------------------
 
-    fn stale_keys(self: *mut Scanner) !void {
+    fn stale_keys(self: *mut Scanner) YamlError!void {
         for i in @as(usize, 0)..self.keys.len {
             let k = self.keys.get_ptr(i);
             let multiline_ok = (i > 0) and (i <= self.flow_maps.len) and self.flow_maps.get(i - 1);
@@ -315,7 +316,7 @@ struct Scanner {
         }
     }
 
-    fn save_key(self: *mut Scanner) !void {
+    fn save_key(self: *mut Scanner) YamlError!void {
         let required = (self.flow == 0) and (self.indent == @bit_cast(i32, self.m.column));
         if self.allowed {
             self.remove_key()!;
@@ -327,7 +328,7 @@ struct Scanner {
         }
     }
 
-    fn remove_key(self: *mut Scanner) !void {
+    fn remove_key(self: *mut Scanner) YamlError!void {
         let k = self.keys.get_ptr(self.keys.len - 1);
         if k.possible and k.required {
             return self.fail("could not find expected ':'");
@@ -335,7 +336,7 @@ struct Scanner {
         k.possible = false;
     }
 
-    fn flow_in(self: *mut Scanner, mapping: bool) !void {
+    fn flow_in(self: *mut Scanner, mapping: bool) YamlError!void {
         if self.keys.len > MAX_DEPTH {
             return error.TooDeep;
         }
@@ -356,7 +357,7 @@ struct Scanner {
 
     // Opens a block collection at column (its start token goes at token
     // number `number`, or at the end).
-    fn roll(self: *mut Scanner, column: i32, number: usize, at_end: bool, kind: TokenKind, mark: Mark) !void {
+    fn roll(self: *mut Scanner, column: i32, number: usize, at_end: bool, kind: TokenKind, mark: Mark) YamlError!void {
         if self.flow > 0 {
             return;
         }
@@ -384,7 +385,7 @@ struct Scanner {
         }
     }
 
-    fn unroll(self: *mut Scanner, column: i32) !void {
+    fn unroll(self: *mut Scanner, column: i32) YamlError!void {
         if self.flow > 0 {
             return;
         }
@@ -396,7 +397,7 @@ struct Scanner {
 
     // --- dispatch --------------------------------------------------------------------------
 
-    fn fetch_next(self: *mut Scanner) !void {
+    fn fetch_next(self: *mut Scanner) YamlError!void {
         if not self.started {
             self.started = true;
             self.indent = -1;
@@ -501,7 +502,7 @@ struct Scanner {
                (k == TokenKind.FLOW_SEQUENCE_END) or (k == TokenKind.FLOW_MAPPING_END);
     }
 
-    fn skip_to_token(self: *mut Scanner) !void {
+    fn skip_to_token(self: *mut Scanner) YamlError!void {
         loop {
             if (self.m.index == 0) and (self.at(0) == 0xef) and (self.at(1) == 0xbb) and (self.at(2) == 0xbf) {
                 self.m.index = 3;
@@ -529,7 +530,7 @@ struct Scanner {
         }
     }
 
-    fn fetch_stream_end(self: *mut Scanner) !void {
+    fn fetch_stream_end(self: *mut Scanner) YamlError!void {
         if self.m.column != 0 {
             self.m.column = 0;
             self.m.line += 1;
@@ -541,7 +542,7 @@ struct Scanner {
         self.ended = true;
     }
 
-    fn fetch_directive(self: *mut Scanner) !void {
+    fn fetch_directive(self: *mut Scanner) YamlError!void {
         self.unroll(-1)!;
         self.remove_key()!;
         self.allowed = false;
@@ -610,7 +611,7 @@ struct Scanner {
         }
     }
 
-    fn directive_end(self: *mut Scanner) !void {
+    fn directive_end(self: *mut Scanner) YamlError!void {
         while is_blank(self.at(0)) {
             self.skip();
         }
@@ -624,7 +625,7 @@ struct Scanner {
         }
     }
 
-    fn fetch_document_indicator(self: *mut Scanner, kind: TokenKind) !void {
+    fn fetch_document_indicator(self: *mut Scanner, kind: TokenKind) YamlError!void {
         self.unroll(-1)!;
         self.remove_key()!;
         self.allowed = false;
@@ -645,7 +646,7 @@ struct Scanner {
         self.push(self.token(kind, start))!;
     }
 
-    fn fetch_flow_start(self: *mut Scanner, kind: TokenKind, mapping: bool) !void {
+    fn fetch_flow_start(self: *mut Scanner, kind: TokenKind, mapping: bool) YamlError!void {
         self.save_key()!;
         self.flow_in(mapping)!;
         self.allowed = true;
@@ -654,7 +655,7 @@ struct Scanner {
         self.push(self.token(kind, start))!;
     }
 
-    fn fetch_flow_end(self: *mut Scanner, kind: TokenKind) !void {
+    fn fetch_flow_end(self: *mut Scanner, kind: TokenKind) YamlError!void {
         self.remove_key()!;
         self.flow_out();
         self.allowed = false;
@@ -663,7 +664,7 @@ struct Scanner {
         self.push(self.token(kind, start))!;
     }
 
-    fn fetch_flow_entry(self: *mut Scanner) !void {
+    fn fetch_flow_entry(self: *mut Scanner) YamlError!void {
         self.remove_key()!;
         self.allowed = true;
         let start = self.m;
@@ -671,7 +672,7 @@ struct Scanner {
         self.push(self.token(TokenKind.FLOW_ENTRY, start))!;
     }
 
-    fn fetch_block_entry(self: *mut Scanner) !void {
+    fn fetch_block_entry(self: *mut Scanner) YamlError!void {
         if self.flow == 0 {
             if not self.allowed {
                 return self.fail("block sequence entries are not allowed in this context");
@@ -685,7 +686,7 @@ struct Scanner {
         self.push(self.token(TokenKind.BLOCK_ENTRY, start))!;
     }
 
-    fn fetch_key(self: *mut Scanner) !void {
+    fn fetch_key(self: *mut Scanner) YamlError!void {
         if self.flow == 0 {
             if not self.allowed {
                 return self.fail("mapping keys are not allowed in this context");
@@ -699,7 +700,7 @@ struct Scanner {
         self.push(self.token(TokenKind.KEY, start))!;
     }
 
-    fn fetch_value(self: *mut Scanner) !void {
+    fn fetch_value(self: *mut Scanner) YamlError!void {
         let k = self.keys.get(self.keys.len - 1);
         if k.possible {
             // the simple key becomes a KEY token (and maybe opens a mapping)
@@ -722,7 +723,7 @@ struct Scanner {
         self.push(self.token(TokenKind.VALUE, start))!;
     }
 
-    fn fetch_anchor(self: *mut Scanner, kind: TokenKind) !void {
+    fn fetch_anchor(self: *mut Scanner, kind: TokenKind) YamlError!void {
         self.save_key()!;
         self.allowed = false;
         let start = self.m;
@@ -739,7 +740,7 @@ struct Scanner {
         self.push(t)!;
     }
 
-    fn fetch_tag(self: *mut Scanner) !void {
+    fn fetch_tag(self: *mut Scanner) YamlError!void {
         self.save_key()!;
         self.allowed = false;
         let start = self.m;
@@ -789,7 +790,7 @@ struct Scanner {
     }
 
     // Tag URI characters into buf (%XX decoded).
-    fn tag_uri(self: *mut Scanner, allow_empty: bool) !void {
+    fn tag_uri(self: *mut Scanner, allow_empty: bool) YamlError!void {
         loop {
             let c = self.at(0);
             if self.eof() {
@@ -821,7 +822,7 @@ struct Scanner {
 
     // --- scalars ------------------------------------------------------------------------
 
-    fn fetch_block_scalar(self: *mut Scanner, literal: bool) !void {
+    fn fetch_block_scalar(self: *mut Scanner, literal: bool) YamlError!void {
         self.remove_key()!;
         self.allowed = true;
         let start = self.m;
@@ -930,7 +931,7 @@ struct Scanner {
     // Empty lines at the start of a block scalar (or between its lines),
     // working out the indentation (from the first line with content) if it
     // is not known yet (-1).
-    fn block_breaks(self: *mut Scanner, indent: *mut i32) !void {
+    fn block_breaks(self: *mut Scanner, indent: *mut i32) YamlError!void {
         let mut empty_max: i32 = 0;
         loop {
             while ((indent.* < 0) or (@bit_cast(i32, self.m.column) < indent.*)) and (self.at(0) == ' ') {
@@ -986,7 +987,7 @@ struct Scanner {
         }
     }
 
-    fn fetch_flow_scalar(self: *mut Scanner, single: bool) !void {
+    fn fetch_flow_scalar(self: *mut Scanner, single: bool) YamlError!void {
         self.save_key()!;
         self.allowed = false;
         let start = self.m;
@@ -1091,7 +1092,7 @@ struct Scanner {
         self.push(t)!;
     }
 
-    fn escape(self: *mut Scanner) !void {
+    fn escape(self: *mut Scanner) YamlError!void {
         let c = self.at(1);
         let mut n: usize = 0;
         let mut out: u32 = 0;
@@ -1140,7 +1141,7 @@ struct Scanner {
         self.buf.push_str(strs.encode_rune(b[..], out))!;
     }
 
-    fn fetch_plain_scalar(self: *mut Scanner) !void {
+    fn fetch_plain_scalar(self: *mut Scanner) YamlError!void {
         self.save_key()!;
         self.allowed = false;
         let start = self.m;
@@ -1369,11 +1370,11 @@ pub struct Events {
         return self.sc.err_mark;
     }
 
-    fn fail(self: *mut Events, msg: []u8) error {
+    fn fail(self: *mut Events, msg: []u8) YamlError {
         return self.sc.fail(msg);
     }
 
-    fn tok(self: *mut Events) !Token {
+    fn tok(self: *mut Events) YamlError!Token {
         return (self.sc.peek_token()!).*;
     }
 
@@ -1381,7 +1382,7 @@ pub struct Events {
         self.sc.take_token();
     }
 
-    fn push_state(self: *mut Events, s: State) !void {
+    fn push_state(self: *mut Events, s: State) YamlError!void {
         if self.states.len > (2 * MAX_DEPTH) {
             return error.TooDeep;
         }
@@ -1404,7 +1405,7 @@ pub struct Events {
     }
 
     /// The next event; EventKind.STREAM_END is the last.
-    pub fn next(self: *mut Events) !Event {
+    pub fn next(self: *mut Events) YamlError!Event {
         match self.state {
             .STREAM_START => {
                 let t = self.tok()!;
@@ -1445,7 +1446,7 @@ pub struct Events {
         }
     }
 
-    fn document_start(self: *mut Events, implicit: bool) !Event {
+    fn document_start(self: *mut Events, implicit: bool) YamlError!Event {
         let mut t = self.tok()!;
         while t.kind == TokenKind.DOCUMENT_END {
             self.skip();
@@ -1513,7 +1514,7 @@ pub struct Events {
         return Events.ev(EventKind.STREAM_END, t.start, t.end);
     }
 
-    fn default_tags(self: *mut Events) !void {
+    fn default_tags(self: *mut Events) YamlError!void {
         let mut have1 = false;
         let mut have2 = false;
         for d in self.tags.items() {
@@ -1532,7 +1533,7 @@ pub struct Events {
         }
     }
 
-    fn document_content(self: *mut Events) !Event {
+    fn document_content(self: *mut Events) YamlError!Event {
         let t = self.tok()!;
         if (t.kind == TokenKind.VERSION_DIRECTIVE) or (t.kind == TokenKind.TAG_DIRECTIVE) or
            (t.kind == TokenKind.DOCUMENT_START) or (t.kind == TokenKind.DOCUMENT_END) or
@@ -1543,7 +1544,7 @@ pub struct Events {
         return self.node(true, false);
     }
 
-    fn document_end(self: *mut Events) !Event {
+    fn document_end(self: *mut Events) YamlError!Event {
         let t = self.tok()!;
         let mut e = Events.ev(EventKind.DOCUMENT_END, t.start, t.start);
         if t.kind == TokenKind.DOCUMENT_END {
@@ -1561,7 +1562,7 @@ pub struct Events {
         return e;
     }
 
-    fn resolve_tag(self: *mut Events, t: Token) ![]u8 {
+    fn resolve_tag(self: *mut Events, t: Token) YamlError![]u8 {
         if t.handle.len == 0 {
             return t.value;  // verbatim, or the non-specific "!"
         }
@@ -1576,7 +1577,7 @@ pub struct Events {
         return self.fail("found undefined tag handle");
     }
 
-    fn node(self: *mut Events, block: bool, indentless: bool) !Event {
+    fn node(self: *mut Events, block: bool, indentless: bool) YamlError!Event {
         let mut t = self.tok()!;
         if t.kind == TokenKind.ALIAS {
             self.state = self.pop_state();
@@ -1655,7 +1656,7 @@ pub struct Events {
         return self.fail("did not find expected node content");
     }
 
-    fn block_sequence_entry(self: *mut Events, first: bool) !Event {
+    fn block_sequence_entry(self: *mut Events, first: bool) YamlError!Event {
         if first {
             self.skip();
         }
@@ -1679,7 +1680,7 @@ pub struct Events {
         return self.fail("did not find expected '-' indicator");
     }
 
-    fn indentless_sequence_entry(self: *mut Events) !Event {
+    fn indentless_sequence_entry(self: *mut Events) YamlError!Event {
         let t = self.tok()!;
         if t.kind == TokenKind.BLOCK_ENTRY {
             let m = t.end;
@@ -1697,7 +1698,7 @@ pub struct Events {
         return Events.ev(EventKind.SEQUENCE_END, t.start, t.start);
     }
 
-    fn block_mapping_key(self: *mut Events, first: bool) !Event {
+    fn block_mapping_key(self: *mut Events, first: bool) YamlError!Event {
         if first {
             self.skip();
         }
@@ -1726,7 +1727,7 @@ pub struct Events {
         return self.fail("did not find expected key");
     }
 
-    fn block_mapping_value(self: *mut Events) !Event {
+    fn block_mapping_value(self: *mut Events) YamlError!Event {
         let t = self.tok()!;
         if t.kind == TokenKind.VALUE {
             let m = t.end;
@@ -1743,7 +1744,7 @@ pub struct Events {
         return self.empty_scalar(t.start);
     }
 
-    fn flow_sequence_entry(self: *mut Events, first: bool) !Event {
+    fn flow_sequence_entry(self: *mut Events, first: bool) YamlError!Event {
         if first {
             self.skip();
         }
@@ -1776,7 +1777,7 @@ pub struct Events {
         return Events.ev(EventKind.SEQUENCE_END, t.start, t.end);
     }
 
-    fn flow_sequence_entry_mapping_key(self: *mut Events) !Event {
+    fn flow_sequence_entry_mapping_key(self: *mut Events) YamlError!Event {
         let t = self.tok()!;
         if (t.kind != TokenKind.VALUE) and (t.kind != TokenKind.FLOW_ENTRY) and
            (t.kind != TokenKind.FLOW_SEQUENCE_END) {
@@ -1787,7 +1788,7 @@ pub struct Events {
         return self.empty_scalar(t.start);
     }
 
-    fn flow_sequence_entry_mapping_value(self: *mut Events) !Event {
+    fn flow_sequence_entry_mapping_value(self: *mut Events) YamlError!Event {
         let t = self.tok()!;
         if t.kind == TokenKind.VALUE {
             self.skip();
@@ -1801,7 +1802,7 @@ pub struct Events {
         return self.empty_scalar(t.start);
     }
 
-    fn flow_mapping_key(self: *mut Events, first: bool) !Event {
+    fn flow_mapping_key(self: *mut Events, first: bool) YamlError!Event {
         if first {
             self.skip();
         }
@@ -1839,7 +1840,7 @@ pub struct Events {
         return Events.ev(EventKind.MAPPING_END, t.start, t.end);
     }
 
-    fn flow_mapping_value(self: *mut Events, empty: bool) !Event {
+    fn flow_mapping_value(self: *mut Events, empty: bool) YamlError!Event {
         let t = self.tok()!;
         if empty {
             self.state = State.FLOW_MAPPING_KEY;
@@ -2030,7 +2031,7 @@ struct Composer {
         return false;
     }
 
-    fn remember(self: *mut Composer, anchor: []u8, v: json.Value, size: u64) !void {
+    fn remember(self: *mut Composer, anchor: []u8, v: json.Value, size: u64) YamlError!void {
         if anchor.len > 0 {
             self.anchors.put(anchor, Anchored.{ value: v, size: size })!;
         }
@@ -2141,11 +2142,11 @@ fn scalar_text(a: *mut arena.Arena, v: json.Value, s: []u8) ![]u8 {
         }
         .Int(i) => {
             let mut buf: [24]u8 = [0; 24];
-            return a.dup(fmt.bufprint(buf[..], "{}", [fmt.int(i)])!);
+            return a.dup(fmt.bufprint(buf[..], "{}", [fmt.int(i)])!)!;
         }
         .Float(x) => {
             let mut buf: [40]u8 = [0; 40];
-            return a.dup(fmt.format_float(buf[..], x)!);
+            return a.dup(fmt.format_float(buf[..], x)!)!;
         }
         else => { return s; }
     }
@@ -2184,7 +2185,7 @@ fn has_duplicates(ms: []json.Member) bool {
 let CORE: []u8 = "tag:yaml.org,2002:";
 
 // A scalar's value under the core schema (or its tag).
-fn resolve(a: *mut arena.Arena, e: Event) !json.Value {
+fn resolve(a: *mut arena.Arena, e: Event) YamlError!json.Value {
     let s = e.value;
     let t = e.tag;
     if strs.starts_with(t, CORE) {
@@ -2447,7 +2448,7 @@ pub fn stringify(v: json.Value) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes a value as block-style YAML (see stringify) to w, through a 4 KB
@@ -2677,7 +2678,7 @@ fn fails(r: !void) bool {
 }
 
 // The top-level JSON values of text (the suite's in.json holds one per document).
-fn json_values(text: []u8, out: *mut vec.Vec.[[]u8]) !void {
+fn json_values(text: []u8, out: *mut vec.Vec.[[]u8]) YamlError!void {
     let mut i: usize = 0;
     while i < text.len {
         while (i < text.len) and ((text[i] == ' ') or (text[i] == '\n') or (text[i] == '\t') or (text[i] == '\r')) {

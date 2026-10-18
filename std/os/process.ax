@@ -36,7 +36,8 @@ import "../os.ax" as os;
 import "../str.ax" as strs;
 import "../thread.ax" as thread;
 
-error { NotFound, PermissionDenied, InvalidArgument, SpawnFailed, Closed, Failed, IoError, OutOfMemory }
+pub error ProcessError { NotFound, PermissionDenied, InvalidArgument, SpawnFailed, Closed, Failed, IoError, OutOfMemory,
+                         Done, NotADirectory, EndOfStream, Empty, InvalidUtf8, Unsupported, NoSpaceLeft, IsDirectory }
 
 import host "axiom" {
     fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32;
@@ -74,7 +75,7 @@ pub struct Pipe {
     }
 
     /// Reads some bytes; 0 at the end.
-    pub fn read(self: Pipe, buf: []mut u8) !usize {
+    pub fn read(self: Pipe, buf: []mut u8) ProcessError!usize {
         if self.h < 0 {
             return error.Closed;
         }
@@ -86,7 +87,7 @@ pub struct Pipe {
     }
 
     /// Writes some of the bytes; Closed if the child no longer reads.
-    pub fn write(self: Pipe, bytes: []u8) !usize {
+    pub fn write(self: Pipe, bytes: []u8) ProcessError!usize {
         if self.h < 0 {
             return error.Closed;
         }
@@ -97,7 +98,7 @@ pub struct Pipe {
         return @bit_cast(usize, n);
     }
 
-    pub fn write_all(self: Pipe, bytes: []u8) !void {
+    pub fn write_all(self: Pipe, bytes: []u8) ProcessError!void {
         let mut rest = bytes;
         while rest.len > 0 {
             let n = self.write(rest)!;
@@ -106,7 +107,7 @@ pub struct Pipe {
     }
 
     /// Everything until the end (free it with mem.free).
-    pub fn read_all(self: Pipe) ![]mut u8 {
+    pub fn read_all(self: Pipe) ProcessError![]mut u8 {
         let mut s = strs.String.init();
         let mut buf: [16384]u8 = [0; 16384];
         loop {
@@ -122,7 +123,7 @@ pub struct Pipe {
                 return e;
             };
         }
-        return s.take();
+        return s.take()!;
     }
 
     pub fn close(self: *mut Pipe) void {
@@ -169,7 +170,7 @@ pub struct Child {
 
     /// Closes stdin (so the child sees its end) and waits for the child to
     /// finish. Then closes the other pipes: read them first.
-    pub fn wait(self: *mut Child) !Status {
+    pub fn wait(self: *mut Child) ProcessError!Status {
         self.stdin.close();
         if not self.done {
             let mut st: i32 = 0;
@@ -186,7 +187,7 @@ pub struct Child {
 
     /// Whether the child has finished (then its status is in `status`),
     /// without waiting.
-    pub fn try_wait(self: *mut Child) !bool {
+    pub fn try_wait(self: *mut Child) ProcessError!bool {
         if self.done {
             return true;
         }
@@ -213,7 +214,7 @@ pub struct Child {
 
     /// Sends a signal (os.SIGTERM, os.SIGKILL, ...); nothing if it has
     /// already finished.
-    pub fn kill(self: *mut Child, sig: i32) !void {
+    pub fn kill(self: *mut Child, sig: i32) ProcessError!void {
         if self.done {
             return;
         }
@@ -258,24 +259,24 @@ pub struct Command {
         self.removes.deinit();
     }
 
-    pub fn arg(self: *mut Command, a: []u8) !void {
+    pub fn arg(self: *mut Command, a: []u8) ProcessError!void {
         self.argv.push(a)!;
     }
 
-    pub fn args(self: *mut Command, xs: [][]u8) !void {
+    pub fn args(self: *mut Command, xs: [][]u8) ProcessError!void {
         for a in xs {
             self.argv.push(a)!;
         }
     }
 
     /// Sets an environment variable for the child.
-    pub fn set_env(self: *mut Command, name: []u8, value: []u8) !void {
+    pub fn set_env(self: *mut Command, name: []u8, value: []u8) ProcessError!void {
         self.sets.push(name)!;
         self.sets.push(value)!;
     }
 
     /// Removes an environment variable for the child.
-    pub fn remove_env(self: *mut Command, name: []u8) !void {
+    pub fn remove_env(self: *mut Command, name: []u8) ProcessError!void {
         self.removes.push(name)!;
     }
 
@@ -302,7 +303,7 @@ pub struct Command {
     }
 
     /// Starts the child.
-    pub fn spawn(self: *Command) !Child {
+    pub fn spawn(self: *Command) ProcessError!Child {
         let mut spec = strs.String.init();
         defer spec.deinit();
         self.build(&mut spec)!;
@@ -328,7 +329,7 @@ pub struct Command {
 
     /// Runs the child to the end, capturing its standard output and error
     /// (whatever those modes were set to; stdin stays as set).
-    pub fn output(self: *mut Command) !Output {
+    pub fn output(self: *mut Command) ProcessError!Output {
         let saved = self.modes;
         self.modes[1] = Stdio.PIPE;
         self.modes[2] = Stdio.PIPE;
@@ -365,13 +366,13 @@ pub struct Command {
     }
 
     /// Runs the child to the end, with its streams as set; its status.
-    pub fn status(self: *mut Command) !Status {
+    pub fn status(self: *mut Command) ProcessError!Status {
         let mut child = self.spawn()!;
         return child.wait()!;
     }
 
     // argv\0...\0 env\0...\0 cwd
-    fn build(self: *Command, spec: *mut strs.String) !void {
+    fn build(self: *Command, spec: *mut strs.String) ProcessError!void {
         let argv = self.argv.items();
         if argv[0].len == 0 {
             return error.InvalidArgument;
@@ -495,7 +496,7 @@ fn valid_env_name(s: []u8) bool {
 }
 
 /// Runs argv[0] with the arguments argv[1..], capturing its output.
-pub fn run(argv: [][]u8) !Output {
+pub fn run(argv: [][]u8) ProcessError!Output {
     if argv.len == 0 {
         return error.InvalidArgument;
     }
@@ -635,7 +636,7 @@ fn running_programs_windows() !void {
     @expect(strs.count(b.stderr, "\n") == 3000);
 }
 
-fn environment_windows() !void {
+fn environment_windows() ProcessError!void {
     let here = os.cwd()!;
     defer mem.free(here);
     let mut c = Command.init("cmd");
@@ -673,7 +674,7 @@ fn environment_windows() !void {
     @expect((st.signal == os.SIGTERM) and not st.success());
 }
 
-fn fails(r: !Output, want: error) bool {
+fn fails(r: ProcessError!Output, want: error) bool {
     let mut o = r catch |e| return e == want;
     o.deinit();
     return false;

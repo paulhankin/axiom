@@ -25,7 +25,7 @@ import "../mem.ax" as mem;
 import "../os/com.ax" as com;
 import "image.ax" as image;
 
-error { Unsupported, OutOfMemory, InvalidArgument }
+pub error D2dError { Unsupported, OutOfMemory, InvalidArgument, PermissionDenied, DeviceLost, Failed }
 
 extern "C" "d2d1" {
     fn D2D1CreateFactory(kind: u32, iid: *u8, options: *void, factory: *mut usize) i32;
@@ -117,7 +117,7 @@ fn point(x: f32, y: f32) usize {
     return @as(usize, @bit_cast(u32, x)) | (@as(usize, @bit_cast(u32, y)) << 32);
 }
 
-fn factories() !Canvas {
+fn factories() D2dError!Canvas {
     com.init();
     let mut c = Canvas.{ factory: 0, dwrite: 0, rt: 0, brush: 0, window: false, width: 0, height: 0 };
     if D2D1CreateFactory(0, &IID_FACTORY[0], @ptr_from_int(*void, 0), &mut c.factory) < 0 {  // single-threaded
@@ -149,7 +149,7 @@ pub struct Canvas {
     width: u32,
     height: u32,
 
-    fn finish(self: *mut Canvas) !void {
+    fn finish(self: *mut Canvas) D2dError!void {
         let black: [4]f32 = [0.0, 0.0, 0.0, 1.0];
         let f = @bit_cast(fn(usize, *f32, *void, *mut usize) i32, com.method(self.rt, 8));  // CreateSolidColorBrush
         com.check(f(self.rt, &black[0], @ptr_from_int(*void, 0), &mut self.brush)) catch |e| {
@@ -160,7 +160,7 @@ pub struct Canvas {
 
     /// Draws into a window (its HWND: win32.Window.handle()) of width ×
     /// height pixels; end() shows what was drawn.
-    pub fn for_window(hwnd: usize, width: u32, height: u32) !Canvas {
+    pub fn for_window(hwnd: usize, width: u32, height: u32) D2dError!Canvas {
         let mut c = factories()!;
         let mut p: [28]u8 = [0; 28];
         props(p[..], 0);
@@ -184,7 +184,7 @@ pub struct Canvas {
     /// Draws onto a Direct3D 11 texture (d3d11.Target.tex, or another
     /// ID3D11Texture2D / IDXGISurface), made by a d3d11.Device or a
     /// d3d12.Overlay (overlay_texture): on top of what Direct3D drew there.
-    pub fn for_texture(tex: usize, width: u32, height: u32) !Canvas {
+    pub fn for_texture(tex: usize, width: u32, height: u32) D2dError!Canvas {
         let mut c = factories()!;
         c.retarget(tex, width, height) catch |e| {
             c.deinit();
@@ -195,7 +195,7 @@ pub struct Canvas {
 
     /// Draws onto another texture from now on (for_texture); fonts and
     /// bitmaps made by the canvas stay usable.
-    pub fn retarget(self: *mut Canvas, tex: usize, width: u32, height: u32) !void {
+    pub fn retarget(self: *mut Canvas, tex: usize, width: u32, height: u32) D2dError!void {
         self.detach();
         let surface = com.query(tex, &IID_SURFACE) catch {
             return error.Unsupported;
@@ -236,7 +236,7 @@ pub struct Canvas {
     }
 
     /// After the window's client area changed size (for_window).
-    pub fn resize(self: *mut Canvas, width: u32, height: u32) !void {
+    pub fn resize(self: *mut Canvas, width: u32, height: u32) D2dError!void {
         if not self.window {
             return error.Unsupported;
         }
@@ -253,7 +253,7 @@ pub struct Canvas {
     }
 
     /// Ends the frame: everything is drawn (and, in a window, shown).
-    pub fn end(self: *mut Canvas) !void {
+    pub fn end(self: *mut Canvas) D2dError!void {
         let f = @bit_cast(fn(usize, *void, *void) i32, com.method(self.rt, 49));
         com.check(f(self.rt, @ptr_from_int(*void, 0), @ptr_from_int(*void, 0)))!;
     }
@@ -315,7 +315,7 @@ pub struct Canvas {
     }
 
     // A path through points (x0, y0, x1, y1, ...): an ID2D1PathGeometry.
-    fn path(self: *mut Canvas, pts: []f32, closed: bool, filled: bool) !usize {
+    fn path(self: *mut Canvas, pts: []f32, closed: bool, filled: bool) D2dError!usize {
         if pts.len < 4 {
             return error.InvalidArgument;
         }
@@ -348,7 +348,7 @@ pub struct Canvas {
     }
 
     /// A filled polygon through points (x0, y0, x1, y1, ...).
-    pub fn fill_polygon(self: *mut Canvas, pts: []f32, c: Color) !void {
+    pub fn fill_polygon(self: *mut Canvas, pts: []f32, c: Color) D2dError!void {
         let g = self.path(pts, true, true)!;
         let b = self.paint(c);
         @bit_cast(fn(usize, usize, usize, usize) void, com.method(self.rt, 23))(self.rt, g, b, 0);  // FillGeometry
@@ -357,7 +357,7 @@ pub struct Canvas {
 
     /// Lines through points (x0, y0, x1, y1, ...), back to the first when
     /// `closed`.
-    pub fn draw_lines(self: *mut Canvas, pts: []f32, closed: bool, c: Color, width: f32) !void {
+    pub fn draw_lines(self: *mut Canvas, pts: []f32, closed: bool, c: Color, width: f32) D2dError!void {
         let g = self.path(pts, closed, false)!;
         let b = self.paint(c);
         @bit_cast(fn(usize, usize, usize, f32, usize) void, com.method(self.rt, 22))(self.rt, g, b, width, 0);
@@ -383,7 +383,7 @@ pub struct Canvas {
     /// A font: a family name ("Segoe UI", "Arial", "Consolas", ...; or
     /// several separated by commas, the first installed one used), a size
     /// in pixels, a weight (NORMAL, BOLD, 100..900) and italic or not.
-    pub fn font(self: *mut Canvas, families: []u8, size: f32, weight: u32, italic: bool) !Font {
+    pub fn font(self: *mut Canvas, families: []u8, size: f32, weight: u32, italic: bool) D2dError!Font {
         // the first installed family, else the last named
         let mut family = families;
         let mut rest = families;
@@ -424,7 +424,7 @@ pub struct Canvas {
 
     /// Draws text (UTF-8) in the box at (x, y) of w × h pixels, wrapping
     /// at its width.
-    pub fn text(self: *mut Canvas, font: *Font, s: []u8, x: f32, y: f32, w: f32, h: f32, c: Color) !void {
+    pub fn text(self: *mut Canvas, font: *Font, s: []u8, x: f32, y: f32, w: f32, h: f32, c: Color) D2dError!void {
         let u = mem.alloc.[u16]((s.len + 2) * 2)!;
         defer mem.free(u);
         let n = com.utf16(s, u);
@@ -437,7 +437,7 @@ pub struct Canvas {
     }
 
     /// The size of text laid out in boxes `max_width` wide.
-    pub fn measure(self: *mut Canvas, font: *Font, s: []u8, max_width: f32) !Size {
+    pub fn measure(self: *mut Canvas, font: *Font, s: []u8, max_width: f32) D2dError!Size {
         let u = mem.alloc.[u16]((s.len + 2) * 2)!;
         defer mem.free(u);
         let n = com.utf16(s, u);
@@ -454,7 +454,7 @@ pub struct Canvas {
     }
 
     /// An image (8-bit gray, gray + alpha, RGB or RGBA) as a Bitmap to draw.
-    pub fn bitmap(self: *mut Canvas, img: *image.Image) !Bitmap {
+    pub fn bitmap(self: *mut Canvas, img: *image.Image) D2dError!Bitmap {
         if img.depth != image.Depth.U8 {
             return error.Unsupported;
         }

@@ -40,7 +40,8 @@ import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 
-error { Corrupt, ChecksumMismatch, TooLarge, OutOfMemory, EndOfStream }
+pub error SnappyError { Corrupt, ChecksumMismatch, TooLarge, OutOfMemory, EndOfStream, NotFound, IoError, Done,
+                        InvalidUtf8 }
 
 const BLOCK: usize = 65536;
 const HASH_BITS: u32 = 14;
@@ -66,7 +67,7 @@ pub fn masked_crc(c: *crc.Crc, data: []u8) u32 {
 // -----------------------------------------------------------------------------
 
 /// Reads the varint preamble: the length and the size of the varint.
-fn preamble(src: []u8, len: *mut u64) !usize {
+fn preamble(src: []u8, len: *mut u64) SnappyError!usize {
     let mut v: u64 = 0;
     for i in @as(usize, 0)..5 {
         if i >= src.len {
@@ -86,7 +87,7 @@ fn preamble(src: []u8, len: *mut u64) !usize {
 }
 
 /// The uncompressed length a raw block declares.
-pub fn decoded_len(src: []u8) !usize {
+pub fn decoded_len(src: []u8) SnappyError!usize {
     let mut n: u64 = 0;
     _ = preamble(src, &mut n)!;
     if n > @as(u64, @max_value(usize)) {
@@ -97,7 +98,7 @@ pub fn decoded_len(src: []u8) !usize {
 
 /// Decompresses a raw block into new memory (the caller frees it); fails
 /// with TooLarge if it declares more than max_size bytes.
-pub fn decompress_raw(src: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress_raw(src: []u8, max_size: usize) SnappyError![]mut u8 {
     let n = decoded_len(src)!;
     if n > max_size {
         return error.TooLarge;
@@ -112,7 +113,7 @@ pub fn decompress_raw(src: []u8, max_size: usize) ![]mut u8 {
 
 /// Decompresses a raw block into out, which must be exactly decoded_len
 /// bytes (Corrupt otherwise).
-pub fn decompress_raw_into(src: []u8, out: []mut u8) !void {
+pub fn decompress_raw_into(src: []u8, out: []mut u8) SnappyError!void {
     let mut n: u64 = 0;
     let start = preamble(src, &mut n)!;
     if n != @as(u64, out.len) {
@@ -122,7 +123,7 @@ pub fn decompress_raw_into(src: []u8, out: []mut u8) !void {
 }
 
 /// The literals and copies of a raw block, which must fill dst exactly.
-fn decode_body(src: []u8, dst: []mut u8) !void {
+fn decode_body(src: []u8, dst: []mut u8) SnappyError!void {
     let mut s: usize = 0;
     let mut d: usize = 0;
     while s < src.len {
@@ -359,7 +360,7 @@ struct Scratch {
     out: []mut u8,
     table: []mut u16,
 
-    fn init() !Scratch {
+    fn init() SnappyError!Scratch {
         let out = mem.alloc.[u8](max_compressed_len(BLOCK))!;
         let table = mem.alloc.[u16](TABLE_SIZE) catch |e| {
             mem.free(out);
@@ -389,7 +390,7 @@ pub fn compress_raw(data: []u8) ![]mut u8 {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 /// Compresses data as one raw block and writes it to w, 64 KiB of input at
@@ -422,7 +423,7 @@ pub fn compress(data: []u8) ![]mut u8 {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 /// Compresses data in the framing format and writes it to w a chunk at a
@@ -464,16 +465,16 @@ fn write_chunk(w: io.Writer, sc: *mut Scratch, c: *crc.Crc, data: []u8) !void {
 
 /// Decompresses a framed stream (or several, concatenated) into new memory
 /// (the caller frees it); fails with TooLarge past max_size bytes.
-pub fn decompress(data: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress(data: []u8, max_size: usize) SnappyError![]mut u8 {
     let mut out = strs.String.init();
     decode_frames(data, &mut out, max_size) catch |e| {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
-fn decode_frames(data: []u8, out: *mut strs.String, max_size: usize) !void {
+fn decode_frames(data: []u8, out: *mut strs.String, max_size: usize) SnappyError!void {
     let c = crc.Crc.init(crc.CRC32C);
     let mut i: usize = 0;
     let mut first = true;
@@ -543,7 +544,7 @@ pub struct Writer {
     buf: [65536]u8,
 
     /// A Writer of the framing format to w.
-    pub fn init(w: io.Writer) !*mut Writer {
+    pub fn init(w: io.Writer) SnappyError!*mut Writer {
         let sc = Scratch.init()!;
         let z = mem.new.[Writer]() catch |e| {
             let mut s2 = sc;
@@ -603,7 +604,7 @@ pub struct Writer {
 
 fn writer_write(ctx: *mut void, bytes: []u8) !usize {
     let z = @ptr_cast(*mut Writer, ctx);
-    return z.write(bytes);
+    return z.write(bytes)!;
 }
 
 /// Reads the framing format from an io.Reader and gives back the data.
@@ -618,7 +619,7 @@ pub struct Reader {
     chunk: [MAX_CHUNK]u8,
 
     /// A Reader of the stream read from r.
-    pub fn init(r: io.Reader) !*mut Reader {
+    pub fn init(r: io.Reader) SnappyError!*mut Reader {
         let z = mem.new.[Reader]()!;
         z.input = r;
         z.started = false;
@@ -730,7 +731,7 @@ pub struct Reader {
 
 fn reader_read(ctx: *mut void, buf: []mut u8) !usize {
     let z = @ptr_cast(*mut Reader, ctx);
-    return z.read(buf);
+    return z.read(buf)!;
 }
 
 // -----------------------------------------------------------------------------
@@ -761,7 +762,7 @@ fn read_stream(data: []u8, step: usize) ![]mut u8 {
         }
         out.push_str(buf[..n])!;
     }
-    return out.take();
+    return out.take()!;
 }
 
 test "files from the reference library and the format description" {
@@ -798,7 +799,7 @@ test "files from the reference library and the format description" {
             defer mem.free(got);
             @expect_eq(got, want);
             if want.len > 0 {
-                @expect(fails(decompress_raw(data, want.len - 1)));
+                @expect(fails(widen(decompress_raw(data, want.len - 1))));
             }
         } else {
             let got = decompress(data, 1 << 24)!;
@@ -808,7 +809,7 @@ test "files from the reference library and the format description" {
             defer mem.free(got2);
             @expect_eq(got2, want);
             if want.len > 0 {
-                @expect(fails(decompress(data, want.len - 1)));
+                @expect(fails(widen(decompress(data, want.len - 1))));
             }
         }
         n += 1;
@@ -931,11 +932,11 @@ test "hostile input fails cleanly" {
     defer mem.free(framed);
     // truncations
     for n in @as(usize, 0)..raw.len {
-        @expect(fails(decompress_raw(raw[..n], 1 << 20)));
+        @expect(fails(widen(decompress_raw(raw[..n], 1 << 20))));
     }
     for n in @as(usize, 1)..framed.len {
         // (all but the stream identifier, which alone is an empty stream)
-        @expect(fails(decompress(framed[..n], 1 << 20)) == (n != 10));
+        @expect(fails(widen(decompress(framed[..n], 1 << 20))) == (n != 10));
     }
     // every byte changed: a failure or some output, never a trap; in the
     // framed form, the CRC catches whatever the decoder does not
@@ -946,7 +947,7 @@ test "hostile input fails cleanly" {
             m.clear();
             m.push_str(raw)!;
             m.bytes()[i] ^= flip;
-            _ = fails(decompress_raw(m.bytes(), 1 << 20));
+            _ = fails(widen(decompress_raw(m.bytes(), 1 << 20)));
         }
     }
     for i in @as(usize, 10)..framed.len {
@@ -970,12 +971,12 @@ test "hostile input fails cleanly" {
         "\x01\x04ab",                // longer than declared
     ];
     for b in bad {
-        @expect(fails(decompress_raw(b, 1 << 20)));
+        @expect(fails(widen(decompress_raw(b, 1 << 20))));
     }
-    @expect(fails(decompress("\x00\x05\x00\x00abcde", 100)));                      // no stream identifier
-    @expect(fails(decompress("\xff\x06\x00\x00sNaPpX", 100)));                     // a wrong one
-    @expect(fails(decompress("\xff\x06\x00\x00sNaPpY\x02\x00\x00\x00", 100)));     // reserved unskippable
-    @expect(fails(decompress("\xff\x06\x00\x00sNaPpY\x01\x03\x00\x00abc", 100)));  // no room for a CRC
+    @expect(fails(widen(decompress("\x00\x05\x00\x00abcde", 100))));                      // no stream identifier
+    @expect(fails(widen(decompress("\xff\x06\x00\x00sNaPpX", 100))));                     // a wrong one
+    @expect(fails(widen(decompress("\xff\x06\x00\x00sNaPpY\x02\x00\x00\x00", 100))));     // reserved unskippable
+    @expect(fails(widen(decompress("\xff\x06\x00\x00sNaPpY\x01\x03\x00\x00abc", 100))));  // no room for a CRC
     @expect(fails(read_stream("\xff\x06\x00\x00sNaPpY\x01\x03\x00\x00abc", 10)));
     @expect(fails(read_stream("\x00\x05\x00\x00abcde", 10)));
     // the largest chunk the Reader takes, and one byte more
@@ -989,6 +990,12 @@ test "hostile input fails cleanly" {
         big[13] = @truncate(u8, n >> 16);
         big[18] = 0xff;  // a varint
         @expect(fails(read_stream(big, 1000)));
-        @expect(fails(decompress(big, 1 << 20)));
+        @expect(fails(widen(decompress(big, 1 << 20))));
     }
+}
+
+// A result with this module's errors as one with any error, for the
+// helpers of the tests (error unions do not widen by themselves).
+fn widen[T](r: SnappyError!T) !T {
+    return r!;
 }

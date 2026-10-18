@@ -72,22 +72,18 @@ import "http2.ax" as http2;
 import "tls.ax" as tls;
 import "url.ax" as urls;
 
-error {
-    InvalidArgument,
-    BadRequest,
-    BadResponse,
-    BadUrl,
-    TooLarge,
-    HeadTooLarge,
-    NotFound,
-    Closed,
-    InvalidHeader,
-    OutOfMemory,
-    NetError,
-    TimedOut,
-    Unsupported,
-    ProxyRefused,
-}
+pub error HttpError { InvalidArgument, BadRequest, BadResponse, BadUrl, TooLarge, HeadTooLarge, NotFound, Closed,
+                      InvalidHeader, OutOfMemory, NetError, TimedOut, Unsupported, ProxyRefused, BadFormat,
+                      ConnectionRefused, Done, HandshakeFailure, InvalidCookie, Empty, InvalidUrl, PermissionDenied,
+                      ProtocolError, StreamReset, AddressInUse, InvalidUtf8, InvalidNumber, DecodeError, IoError,
+                      InvalidEscape, NotADirectory, FlowControlError, Overflow, UnexpectedMessage, InvalidAddress,
+                      NotAbsolute, Failed, FrameSizeError, BadRecordMac, EndOfStream, CompressionError, RecordOverflow,
+                      StreamClosed, ProtocolVersion, GoAway, IllegalParameter, TooBig, AlertReceived, ListTooLarge,
+                      BadCertificate, NoCertificate, RandomFailed, InvalidKey, InvalidPoint, InvalidCertificate,
+                      AuthFailed, InvalidLength, InvalidPem, MessageTooLong, WeakKey, UnsupportedAlgorithm,
+                      DivisionByZero, UnknownAuthority, Expired, NotYetValid, Negative, HostnameMismatch, NotInvertible,
+                      BadSignature, NoSpaceLeft, NotCA, IncompatibleUsage, NameConstraint, UnhandledCriticalExtension,
+                      PathTooLong, Corrupt, InvalidBase64, UnexpectedTag }
 
 pub struct Header {
     name: []u8,
@@ -95,7 +91,7 @@ pub struct Header {
 }
 
 /// Case-insensitive header lookup: the first header called `name`.
-pub fn find_header(headers: []Header, name: []u8) ![]u8 {
+pub fn find_header(headers: []Header, name: []u8) HttpError![]u8 {
     for h in headers {
         if strs.eq_ignore_case(h.name, name) {
             return h.value;
@@ -176,7 +172,7 @@ fn hex_value(c: u8) u32 {
 /// strings) into out, which must be at least as long as s. Fails with
 /// BadRequest on a malformed escape. (std/net/url has the rest of
 /// percent-encoding.)
-pub fn percent_decode(s: []u8, out: []mut u8, plus_space: bool) ![]u8 {
+pub fn percent_decode(s: []u8, out: []mut u8, plus_space: bool) HttpError![]u8 {
     return urls.percent_decode(s, out, plus_space) catch return error.BadRequest;
 }
 
@@ -187,8 +183,8 @@ pub fn percent_encode(w: io.Writer, s: []u8) !void {
 }
 
 /// The value of `name` in a query string ("a=1&b=x%20y"), still encoded.
-pub fn query_raw(query: []u8, name: []u8) ![]u8 {
-    return urls.query_value(query, name);
+pub fn query_raw(query: []u8, name: []u8) HttpError![]u8 {
+    return urls.query_value(query, name)!;
 }
 
 // -----------------------------------------------------------------------------
@@ -213,16 +209,18 @@ pub struct Transport {
 
     pub fn read(self: Transport, buf: []mut u8) !usize {
         if self.secure {
-            return self.tls.read(buf);
+            return self.tls.read(buf)!;
         }
-        return self.tcp.read(buf);
+        return self.tcp.read(buf)!;
     }
 
     pub fn write_all(self: Transport, bytes: []u8) !void {
         if self.secure {
-            return self.tls.write_all(bytes);
+            self.tls.write_all(bytes)!;
+            return;
         }
-        return self.tcp.write_all(bytes);
+        self.tcp.write_all(bytes)!;
+        return;
     }
 
     pub fn close(self: Transport) void {
@@ -244,7 +242,7 @@ struct Conn {
     deadline: i64,  // monotonic ns by which the current message must arrive (0: none)
     h2: bool,       // the client sent HTTP/2's preface
 
-    fn init(stream: Transport, limit: usize) !Conn {
+    fn init(stream: Transport, limit: usize) HttpError!Conn {
         let b = mem.alloc.[u8](@min(16384, limit))!;
         return Conn.{ stream: stream, buf: b, start: 0, end: 0, pin: 0, limit: limit, deadline: 0, h2: false };
     }
@@ -453,7 +451,7 @@ fn is_token_char(c: u8) bool {
 }
 
 /// Parses header lines ("Name: value") into out; returns how many.
-pub fn parse_headers(lines: []u8, out: []mut Header) !usize {
+pub fn parse_headers(lines: []u8, out: []mut Header) HttpError!usize {
     let mut n: usize = 0;
     let mut it = strs.lines(lines);
     loop {
@@ -509,7 +507,7 @@ struct Framing {
     has_length: bool,
 }
 
-fn framing(headers: []Header) !Framing {
+fn framing(headers: []Header) HttpError!Framing {
     let mut f = Framing.{ chunked: false, length: 0, has_length: false };
     for h in headers {
         if strs.eq_ignore_case(h.name, "Transfer-Encoding") {
@@ -564,7 +562,7 @@ struct Scratch {
     params: [8]Param,
     nparams: usize,
 
-    fn alloc(self: *mut Scratch, n: usize) ![]mut u8 {
+    fn alloc(self: *mut Scratch, n: usize) HttpError![]mut u8 {
         let b = mem.alloc.[u8](n)!;
         self.blocks.push(b) catch |e| {
             mem.free(b);
@@ -599,13 +597,13 @@ pub struct Request {
     scratch: *mut Scratch,
 
     /// The first header called `name` (case-insensitive), or NotFound.
-    pub fn header(self: *Request, name: []u8) ![]u8 {
+    pub fn header(self: *Request, name: []u8) HttpError![]u8 {
         return find_header(self.headers, name);
     }
 
     /// A route parameter, such as "id" for the pattern "/users/{id}", or "*"
     /// for the rest of the path after a trailing "/*". Percent-decoded.
-    pub fn param(self: *Request, name: []u8) ![]u8 {
+    pub fn param(self: *Request, name: []u8) HttpError![]u8 {
         let sc = self.scratch;
         for i in 0..sc.nparams {
             if @mem_eq(sc.params[i].name, name) {
@@ -616,14 +614,14 @@ pub struct Request {
     }
 
     /// The decoded value of `name` in the query string, or NotFound.
-    pub fn query_param(self: *Request, name: []u8) ![]u8 {
+    pub fn query_param(self: *Request, name: []u8) HttpError![]u8 {
         let raw = query_raw(self.query, name)!;
         let out = self.scratch.alloc(raw.len)!;
         return percent_decode(raw, out, true);
     }
 
     /// The decoded path.
-    pub fn decoded_path(self: *Request) ![]u8 {
+    pub fn decoded_path(self: *Request) HttpError![]u8 {
         let out = self.scratch.alloc(self.path.len)!;
         return percent_decode(self.path, out, false);
     }
@@ -660,7 +658,7 @@ pub struct Response {
     /// the server; "Connection: close" ends the connection after this
     /// response. Fails if called after the head was sent, or if the name or
     /// value is malformed.
-    pub fn header(self: *mut Response, name: []u8, value: []u8) !void {
+    pub fn header(self: *mut Response, name: []u8, value: []u8) HttpError!void {
         if self.started or (name.len == 0) {
             return error.InvalidHeader;
         }
@@ -808,7 +806,7 @@ pub struct Response {
 
     // HTTP/2: the status and headers as a HEADERS frame (the connection's
     // own headers do not exist in HTTP/2, and names are lower-case)
-    fn h2_head(self: *mut Response, with_length: bool, length: usize, end: bool) !void {
+    fn h2_head(self: *mut Response, with_length: bool, length: usize, end: bool) HttpError!void {
         let mut store = strs.String.init();
         defer store.deinit();
         let mut spans = vec.Vec.[[4]usize].init();
@@ -947,7 +945,7 @@ pub struct Server[C] {
 
     /// Serves connections on Options.threads threads (this one included)
     /// until stop() is called.
-    pub fn run(self: *mut Self) !void {
+    pub fn run(self: *mut Self) HttpError!void {
         let extra = @as(usize, @max(self.opts.threads, 1)) - 1;
         let ts = mem.alloc.[thread.Thread.[*mut Self]](@max(extra, 1))!;
         defer mem.free(ts);
@@ -975,7 +973,7 @@ pub struct Server[C] {
 /// Listens on hostname:port (hostname "" or "0.0.0.0" for every address; port 0
 /// for any free port). Call run() to serve.
 pub fn server[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
-                 opts: Options) !Server.[C] {
+                 opts: Options) HttpError!Server.[C] {
     let l = net.listen(hostname, port)!;
     return Server.[C].{
         listener: l,
@@ -991,7 +989,7 @@ pub fn server[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut R
 /// Like server, but serving HTTPS with the given certificate and key, which
 /// must outlive the server.
 pub fn server_tls[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
-                     opts: Options, cfg: *tls.ServerConfig) !Server.[C] {
+                     opts: Options, cfg: *tls.ServerConfig) HttpError!Server.[C] {
     let mut s = server(hostname, port, handler, ctx, opts)!;
     s.tls_config = cfg;
     s.secure = true;
@@ -1000,7 +998,7 @@ pub fn server_tls[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *m
 
 /// Listens on hostname:port and serves forever.
 pub fn serve[C](hostname: []u8, port: u16, handler: fn(*mut C, *Request, *mut Response) !void, ctx: *mut C,
-                opts: Options) !void {
+                opts: Options) HttpError!void {
     let mut s = server(hostname, port, handler, ctx, opts)!;
     s.run()!;
 }
@@ -1186,7 +1184,7 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
 }
 
 /// Serves one request; false if the connection should close.
-fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, scratch: *mut Scratch) !bool {
+fn serve_request[C](s: *mut Server.[C], c: *mut Conn, body: *mut strs.String, scratch: *mut Scratch) HttpError!bool {
     c.deadline = time.Instant.now().ns + (@as(i64, s.opts.request_timeout_ms) * 1000000);
     let head_len = c.read_head() catch |e| {
         if (e == error.Closed) or (e == error.NetError) {
@@ -1372,23 +1370,24 @@ pub struct Router[C] {
 
     /// Adds a route. The method and pattern must outlive the router (string
     /// literals do).
-    pub fn route(self: *mut Self, method: []u8, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) !void {
+    pub fn route(self: *mut Self, method: []u8, pattern: []u8, h: fn(*mut C, *Request,
+                                                                     *mut Response) !void) HttpError!void {
         self.routes.push(Route.[C].{ method: method, pattern: pattern, handler: h })!;
     }
 
-    pub fn get(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) !void {
+    pub fn get(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
         self.route("GET", pattern, h)!;
     }
 
-    pub fn post(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) !void {
+    pub fn post(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
         self.route("POST", pattern, h)!;
     }
 
-    pub fn put(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) !void {
+    pub fn put(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
         self.route("PUT", pattern, h)!;
     }
 
-    pub fn delete(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) !void {
+    pub fn delete(self: *mut Self, pattern: []u8, h: fn(*mut C, *Request, *mut Response) !void) HttpError!void {
         self.route("DELETE", pattern, h)!;
     }
 
@@ -1420,13 +1419,13 @@ pub struct Router[C] {
     }
 
     /// Listens on hostname:port and serves requests with this router forever.
-    pub fn serve(self: *mut Self, hostname: []u8, port: u16, opts: Options) !void {
+    pub fn serve(self: *mut Self, hostname: []u8, port: u16, opts: Options) HttpError!void {
         let mut s = server(hostname, port, Self.handle, self, opts)!;
         s.run()!;
     }
 
     /// Listens on hostname:port and serves HTTPS with this router forever.
-    pub fn serve_tls(self: *mut Self, hostname: []u8, port: u16, opts: Options, cfg: *tls.ServerConfig) !void {
+    pub fn serve_tls(self: *mut Self, hostname: []u8, port: u16, opts: Options, cfg: *tls.ServerConfig) HttpError!void {
         let mut s = server_tls(hostname, port, Self.handle, self, opts, cfg)!;
         s.run()!;
     }
@@ -1434,7 +1433,7 @@ pub struct Router[C] {
 
 /// Whether path matches pattern; the parameters are stored (decoded) in
 /// the request's scratch.
-fn match_pattern(pattern: []u8, path: []u8, req: *mut Scratch) !bool {
+fn match_pattern(pattern: []u8, path: []u8, req: *mut Scratch) HttpError!bool {
     req.nparams = 0;
     let mut pi = strs.split(pattern, "/");
     let mut si = strs.split(path, "/");
@@ -1465,7 +1464,7 @@ fn match_pattern(pattern: []u8, path: []u8, req: *mut Scratch) !bool {
     }
 }
 
-fn add_param(req: *mut Scratch, name: []u8, raw: []u8) !bool {
+fn add_param(req: *mut Scratch, name: []u8, raw: []u8) HttpError!bool {
     if req.nparams == MAX_PARAMS {
         return false;
     }
@@ -1502,7 +1501,7 @@ pub struct Url {
 
 /// Parses "http[s]://hostname[:port][/path][?query]" (with std/net/url;
 /// no user information or IPv6 addresses, and the scheme in lowercase).
-pub fn parse_url(text: []u8) !Url {
+pub fn parse_url(text: []u8) HttpError!Url {
     let u = urls.parse(text) catch return error.BadUrl;
     let secure = strs.eq(u.scheme, "https");
     if (not secure and not strs.eq(u.scheme, "http")) or not u.has_authority or u.has_userinfo or u.ip_literal {
@@ -1617,7 +1616,7 @@ pub struct ClientResponse {
     header_mem: []mut Header,
     body_mem: strs.String,
 
-    pub fn header(self: *ClientResponse, name: []u8) ![]u8 {
+    pub fn header(self: *ClientResponse, name: []u8) HttpError![]u8 {
         return find_header(self.headers, name);
     }
 
@@ -1724,13 +1723,13 @@ pub struct Proxy {
     }
 
     /// Every request through the proxy at url.
-    pub fn to(url: []u8) !Proxy {
+    pub fn to(url: []u8) HttpError!Proxy {
         return Proxy.init(url, url, "");
     }
 
     /// The proxies for http:// and https:// requests ("" for none) and the
     /// hosts to reach directly, as NO_PROXY lists them.
-    pub fn init(http_url: []u8, https_url: []u8, no_proxy: []u8) !Proxy {
+    pub fn init(http_url: []u8, https_url: []u8, no_proxy: []u8) HttpError!Proxy {
         if http_url.len > 0 {
             _ = parse_proxy_url(http_url)!;
         }
@@ -1759,7 +1758,7 @@ pub struct Proxy {
     /// NO_PROXY (or their lower-case forms). HTTP_PROXY is ignored when
     /// REQUEST_METHOD is set, in a CGI program, where a client's "Proxy:"
     /// header would arrive as HTTP_PROXY ("httpoxy").
-    pub fn from_env() !Proxy {
+    pub fn from_env() HttpError!Proxy {
         let cgi = os.has_env("REQUEST_METHOD");
         let mut h = env_either("HTTP_PROXY", "http_proxy")!;
         defer mem.free(h);
@@ -1791,7 +1790,7 @@ pub struct Proxy {
     }
 }
 
-fn env_either(upper: []u8, lower: []u8) ![]mut u8 {
+fn env_either(upper: []u8, lower: []u8) HttpError![]mut u8 {
     return os.getenv(upper) catch |e| {
         if e != error.NotFound {
             return e;
@@ -1800,7 +1799,7 @@ fn env_either(upper: []u8, lower: []u8) ![]mut u8 {
             if e2 != error.NotFound {
                 return e2;
             }
-            return mem.alloc.[u8](0);
+            return mem.alloc.[u8](0)!;
         };
     };
 }
@@ -1853,7 +1852,7 @@ struct ProxyAddr {
     has_auth: bool,
 }
 
-fn parse_proxy_url(text: []u8) !ProxyAddr {
+fn parse_proxy_url(text: []u8) HttpError!ProxyAddr {
     let t = text;
     if not strs.contains(t, "://") {
         // "[user:password@]host[:port][/]"
@@ -1911,7 +1910,7 @@ fn parse_proxy_url(text: []u8) !ProxyAddr {
 let mut SYSTEM_TLS_LOCK: sync.Mutex = sync.Mutex.{ state: 0 };
 let mut SYSTEM_TLS: usize = 0;
 
-pub fn system_tls() !*tls.ClientConfig {
+pub fn system_tls() HttpError!*tls.ClientConfig {
     SYSTEM_TLS_LOCK.lock();
     defer SYSTEM_TLS_LOCK.unlock();
     if SYSTEM_TLS == 0 {
@@ -2076,7 +2075,7 @@ fn target_path(target: []u8) []u8 {
 }
 
 // "Basic base64(user:password)" for a proxy's credentials, in buf.
-fn proxy_basic_auth(pa: ProxyAddr, buf: []mut u8) ![]u8 {
+fn proxy_basic_auth(pa: ProxyAddr, buf: []mut u8) HttpError![]u8 {
     let mut raw: [384]u8 = [0; 384];
     let user = urls.percent_decode(pa.user, raw[..256], false) catch return error.BadUrl;
     if (user.len + 1) > 256 {
@@ -2285,7 +2284,7 @@ fn read_response_body(c: *mut Conn, headers: []Header, out: *mut strs.String, ma
 }
 
 /// The status code from "HTTP/1.1 200 OK".
-fn parse_status(head: []u8) !u16 {
+fn parse_status(head: []u8) HttpError!u16 {
     if (head.len < 12) or not strs.starts_with(head, "HTTP/1.") or (head[8] != ' ') {
         return error.BadResponse;
     }
@@ -2398,7 +2397,7 @@ fn raw_exchange(port: u16, text: []u8) ![]mut u8 {
     let st = net.connect("127.0.0.1", port)!;
     defer st.close();
     st.write_all(text)!;
-    return st.reader().read_all();
+    return st.reader().read_all()!;
 }
 
 test "server and client" {
@@ -2866,7 +2865,7 @@ fn fake_proxy_run(p: *mut FakeProxy) void {
 
 fn tls_conn_read(ctx: *mut void, buf: []mut u8) !usize {
     let c = @ptr_cast(*mut tls.Conn, ctx);
-    return c.read(buf);
+    return c.read(buf)!;
 }
 
 test "proxies" {
@@ -2886,9 +2885,9 @@ test "proxies" {
     let mut all = Proxy.init("http://px", "", "*")!;
     defer all.deinit();
     @expect_eq(all.url_for(parse_url("http://example.com/")!), "");
-    @expect(fails(Proxy.to("https://secure-proxy:443")));
-    @expect(fails(Proxy.to("http://")));
-    @expect(fails(Proxy.to("bad host:1")));
+    @expect(fails(widen(Proxy.to("https://secure-proxy:443"))));
+    @expect(fails(widen(Proxy.to("http://"))));
+    @expect(fails(widen(Proxy.to("bad host:1"))));
     let a = parse_proxy_url("http://us%40er:p%3Ass@px:3128")!;
     @expect_eq(a.port, 3128);
     let mut ab: [128]u8 = [0; 128];
@@ -2934,4 +2933,10 @@ test "proxies" {
     @expect(strs.starts_with(fp2.head[..fp2.head_len],
                              "CONNECT tunnelled.test:443 HTTP/1.1\r\nHost: tunnelled.test:443\r\n"));
     t.deinit();
+}
+
+// A result with this module's errors as one with any error, for the
+// helpers of the tests (error unions do not widen by themselves).
+fn widen[T](r: HttpError!T) !T {
+    return r!;
 }

@@ -23,7 +23,8 @@ import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 
-error { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory }
+pub error Bzip2Error { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory, Empty, IoError, NotFound, Done,
+                       InvalidUtf8 }
 
 const BLOCK_MAGIC: u64 = 0x314159265359;
 const END_MAGIC: u64 = 0x177245385090;
@@ -306,7 +307,7 @@ struct Bits {
     acc: u64,
     n: u32,  // bits in acc
 
-    fn need(self: *mut Bits, k: u32) !void {
+    fn need(self: *mut Bits, k: u32) Bzip2Error!void {
         while self.n < k {
             if self.i >= self.s.len {
                 return error.Corrupt;
@@ -317,13 +318,13 @@ struct Bits {
         }
     }
 
-    fn bits(self: *mut Bits, k: u32) !u32 {
+    fn bits(self: *mut Bits, k: u32) Bzip2Error!u32 {
         self.need(k)!;
         self.n -= k;
         return @truncate(u32, (self.acc >> @as(u64, self.n)) & ((@as(u64, 1) << @as(u64, k)) - 1));
     }
 
-    fn bit(self: *mut Bits) !bool {
+    fn bit(self: *mut Bits) Bzip2Error!bool {
         return (self.bits(1)!) != 0;
     }
 
@@ -346,7 +347,7 @@ struct Table {
     min_len: u32,
     max_len: u32,
 
-    fn build(self: *mut Table, lens: []u8) !void {
+    fn build(self: *mut Table, lens: []u8) Bzip2Error!void {
         self.min_len = 32;
         self.max_len = 0;
         for l in lens {
@@ -389,7 +390,7 @@ struct Table {
         }
     }
 
-    fn decode(self: *Table, b: *mut Bits) !u16 {
+    fn decode(self: *Table, b: *mut Bits) Bzip2Error!u16 {
         let mut l = self.min_len;
         let mut code = @bit_cast(i32, b.bits(l)!);
         loop {
@@ -415,16 +416,16 @@ struct Table {
 
 /// Decompresses bzip2 streams (one or more, concatenated); the caller frees
 /// the result.
-pub fn decompress(data: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress(data: []u8, max_size: usize) Bzip2Error![]mut u8 {
     let mut out = strs.String.init();
     decode_streams(data, &mut out, max_size) catch |e| {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
-fn decode_streams(data: []u8, out: *mut strs.String, max_size: usize) !void {
+fn decode_streams(data: []u8, out: *mut strs.String, max_size: usize) Bzip2Error!void {
     let mut b = Bits.{ s: data, i: 0, acc: 0, n: 0 };
     let mut tt = vec.Vec.[u32].init();
     defer tt.deinit();
@@ -469,7 +470,8 @@ fn decode_streams(data: []u8, out: *mut strs.String, max_size: usize) !void {
 }
 
 // Decodes one block onto out: returns its CRC.
-fn decode_block(b: *mut Bits, block_max: usize, tt: *mut vec.Vec.[u32], out: *mut strs.String, max_size: usize) !u32 {
+fn decode_block(b: *mut Bits, block_max: usize, tt: *mut vec.Vec.[u32], out: *mut strs.String,
+                max_size: usize) Bzip2Error!u32 {
     if b.bit()! {
         return error.Unsupported;  // randomised
     }
@@ -683,7 +685,7 @@ struct BitWriter {
     acc: u64,
     n: u32,
 
-    fn put(self: *mut BitWriter, k: u32, v: u32) !void {
+    fn put(self: *mut BitWriter, k: u32, v: u32) Bzip2Error!void {
         self.acc = (self.acc << @as(u64, k)) | @as(u64, v & (@truncate(u32, (@as(u64, 1) << @as(u64, k)) - 1)));
         self.n += k;
         while self.n >= 8 {
@@ -692,7 +694,7 @@ struct BitWriter {
         }
     }
 
-    fn flush(self: *mut BitWriter) !void {
+    fn flush(self: *mut BitWriter) Bzip2Error!void {
         if self.n > 0 {
             self.out.push(@truncate(u8, self.acc << @as(u64, 8 - self.n)))!;
             self.n = 0;
@@ -708,7 +710,7 @@ pub fn compress(data: []u8, level: u32) ![]mut u8 {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 /// Compresses data with blocks of level x 100 kB (1 to 9) and writes it
@@ -776,7 +778,7 @@ pub fn compress_to(dst: io.Writer, data: []u8, level0: u32) !void {
 
 // The Burrows-Wheeler transform of s (cyclic rotations, sorted by prefix
 // doubling): fills last with the last column and returns the row of s.
-fn bwt(s: []u8, last: []mut u8) !usize {
+fn bwt(s: []u8, last: []mut u8) Bzip2Error!usize {
     let n = s.len;
     let sa = mem.alloc.[u32](n)!;
     defer mem.free(sa);
@@ -856,7 +858,7 @@ fn bwt(s: []u8, last: []mut u8) !usize {
 
 // Code lengths (at most max_len bits) for the frequencies, as bzip2 does:
 // Huffman, with the frequencies flattened until the longest code fits.
-fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) !void {
+fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) Bzip2Error!void {
     let n = freq.len;
     let w = mem.alloc.[u64](n)!;
     defer mem.free(w);
@@ -879,7 +881,7 @@ fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) !void {
 }
 
 // Huffman code lengths for weights (a simple O(n^2) build: n <= 258).
-fn huffman(w: []u64, lens: []mut u8) !void {
+fn huffman(w: []u64, lens: []mut u8) Bzip2Error!void {
     let n = w.len;
     let total = (2 * n) - 1;
     let weight = mem.alloc.[u64](total)!;
@@ -936,7 +938,7 @@ fn huffman(w: []u64, lens: []mut u8) !void {
 
 const NONE: usize = 0xffffffff;
 
-fn encode_block(w: *mut BitWriter, block: []u8) !void {
+fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
     let n = block.len;
     let last = mem.alloc.[u8](n)!;
     defer mem.free(last);
@@ -1138,7 +1140,7 @@ fn encode_block(w: *mut BitWriter, block: []u8) !void {
 }
 
 // A run of n zeros (MTF index 0) in bijective base 2: RUNA = 1, RUNB = 2.
-fn put_run(syms: *mut vec.Vec.[u16], n: usize) !void {
+fn put_run(syms: *mut vec.Vec.[u16], n: usize) Bzip2Error!void {
     let mut r = n;
     while r > 0 {
         r -= 1;
@@ -1151,7 +1153,7 @@ fn put_run(syms: *mut vec.Vec.[u16], n: usize) !void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn fails(r: ![]mut u8) bool {
+fn fails(r: Bzip2Error![]mut u8) bool {
     let x = r catch return true;
     mem.free(x);
     return false;

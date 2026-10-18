@@ -29,7 +29,8 @@ import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 
-error { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory }
+pub error ZstdError { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory, NotFound, IoError, Empty, Done,
+                      InvalidUtf8 }
 
 const MAGIC: u32 = 0xfd2fb528;
 const BLOCK_MAX: usize = 128 << 10;
@@ -52,7 +53,7 @@ struct Back {
     s: []u8,
     pos: i64,  // bits left above the start (negative: read past it)
 
-    fn init(s: []u8) !Back {
+    fn init(s: []u8) ZstdError!Back {
         if (s.len == 0) or (s[s.len - 1] == 0) {
             return error.Corrupt;
         }
@@ -95,7 +96,7 @@ struct Fwd {
     s: []u8,
     pos: usize,  // in bits
 
-    fn read(self: *mut Fwd, n: u32) !u32 {
+    fn read(self: *mut Fwd, n: u32) ZstdError!u32 {
         let mut v: u32 = 0;
         for k in @as(u32, 0)..n {
             let p = self.pos + @as(usize, k);
@@ -140,7 +141,7 @@ fn empty_fse() Fse {
 }
 
 // Builds a decoding table from normalized counts (-1: "less than one").
-fn fse_build(f: *mut Fse, counts: []i32, log: u32) !void {
+fn fse_build(f: *mut Fse, counts: []i32, log: u32) ZstdError!void {
     let size = @as(usize, 1) << @truncate(u32, log);
     let mut next: [256]u32 = [0; 256];
     let mut high = size - 1;
@@ -198,7 +199,7 @@ fn fse_build(f: *mut Fse, counts: []i32, log: u32) !void {
 // Reads a table description (normalized counts): returns its length in
 // bytes.
 fn read_ncount(src: []u8, counts: []mut i32, max_symbol: usize, max_log: u32, log_out: *mut u32,
-               nsym: *mut usize) !usize {
+               nsym: *mut usize) ZstdError!usize {
     let mut r = Fwd.{ s: src, pos: 0 };
     let log = r.read(4)! + 5;
     if log > max_log {
@@ -281,7 +282,7 @@ struct Huff {
 }
 
 // Builds a decoding table from weights (the last symbol's is implied).
-fn huff_build(h: *mut Huff, weights: []u8) !void {
+fn huff_build(h: *mut Huff, weights: []u8) ZstdError!void {
     if (weights.len == 0) or (weights.len > 255) {
         return error.Corrupt;
     }
@@ -334,7 +335,7 @@ fn huff_build(h: *mut Huff, weights: []u8) !void {
 }
 
 // Reads a Huffman tree description: returns its length.
-fn read_huff(src: []u8, h: *mut Huff) !usize {
+fn read_huff(src: []u8, h: *mut Huff) ZstdError!usize {
     if src.len == 0 {
         return error.Corrupt;
     }
@@ -403,7 +404,7 @@ fn read_huff(src: []u8, h: *mut Huff) !usize {
     return 1 + hb;
 }
 
-fn huff_stream(h: *Huff, src: []u8, out: []mut u8) !void {
+fn huff_stream(h: *Huff, src: []u8, out: []mut u8) ZstdError!void {
     let mut b = Back.init(src)!;
     for k in @as(usize, 0)..out.len {
         out[k] = h.decode(&mut b);
@@ -452,7 +453,7 @@ fn new_frame() Frame {
 
 // Reads a sequence table in one of the four modes: returns its length.
 fn read_table(src: []u8, mode: u32, f: *mut Fse, have: *mut bool, max_symbol: usize, max_log: u32, deflt: []i32,
-              deflt_log: u32) !usize {
+              deflt_log: u32) ZstdError!usize {
     if mode == 0 {
         fse_build(f, deflt, deflt_log)!;
         have.* = true;
@@ -488,7 +489,8 @@ fn read_table(src: []u8, mode: u32, f: *mut Fse, have: *mut bool, max_symbol: us
 
 // Decodes a compressed block onto out (frame_start: where the frame's
 // output began, for checking offsets).
-fn compressed_block(src: []u8, fr: *mut Frame, out: *mut strs.String, frame_start: usize, max_size: usize) !void {
+fn compressed_block(src: []u8, fr: *mut Frame, out: *mut strs.String, frame_start: usize,
+                    max_size: usize) ZstdError!void {
     if src.len == 0 {
         return error.Corrupt;
     }
@@ -734,16 +736,16 @@ fn compressed_block(src: []u8, fr: *mut Frame, out: *mut strs.String, frame_star
 
 /// Decompresses Zstandard frames (skipping skippable ones); the caller frees
 /// the result.
-pub fn decompress(data: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress(data: []u8, max_size: usize) ZstdError![]mut u8 {
     let mut out = strs.String.init();
     decode_frames(data, &mut out, max_size) catch |e| {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
-fn decode_frames(d: []u8, out: *mut strs.String, max_size: usize) !void {
+fn decode_frames(d: []u8, out: *mut strs.String, max_size: usize) ZstdError!void {
     let mut i: usize = 0;
     if d.len == 0 {
         return error.Corrupt;
@@ -773,7 +775,7 @@ fn decode_frames(d: []u8, out: *mut strs.String, max_size: usize) !void {
     }
 }
 
-fn frame(d: []u8, at: usize, fr: *mut Frame, out: *mut strs.String, max_size: usize) !usize {
+fn frame(d: []u8, at: usize, fr: *mut Frame, out: *mut strs.String, max_size: usize) ZstdError!usize {
     let mut i = at;
     if i >= d.len {
         return error.Corrupt;
@@ -918,7 +920,7 @@ struct BitW {
     acc: u64,
     n: u32,
 
-    fn add(self: *mut BitW, v: u64, k: u32) !void {
+    fn add(self: *mut BitW, v: u64, k: u32) ZstdError!void {
         if k == 0 {
             return;
         }
@@ -932,7 +934,7 @@ struct BitW {
     }
 
     // The end marker, and the last partial byte.
-    fn close(self: *mut BitW) !void {
+    fn close(self: *mut BitW) ZstdError!void {
         self.add(1, 1)!;
         if self.n > 0 {
             self.out.push(@truncate(u8, self.acc))!;
@@ -1022,7 +1024,7 @@ fn fse_init(t: *CTable, sym: usize) u32 {
     return @as(u32, t.states[@as(usize, @bit_cast(u32, idx))]);
 }
 
-fn fse_encode(w: *mut BitW, t: *CTable, state: *mut u32, sym: usize) !void {
+fn fse_encode(w: *mut BitW, t: *CTable, state: *mut u32, sym: usize) ZstdError!void {
     let nb = @bit_cast(u32, (@bit_cast(i32, state.*) + t.delta_bits[sym]) >> 16);
     w.add(@as(u64, state.*), nb)!;
     let idx = @bit_cast(i32, state.* >> nb) + t.delta_state[sym];
@@ -1068,7 +1070,7 @@ fn normalize(counts: []u32, total: u32, log: u32, norm: []mut i32) void {
 }
 
 // Writes a table description (normalized counts).
-fn write_ncount(w: *mut BitW, norm: []i32, log: u32) !void {
+fn write_ncount(w: *mut BitW, norm: []i32, log: u32) ZstdError!void {
     let size = @as(i32, 1) << @truncate(u32, log);
     w.add(@as(u64, log - 5), 4)!;
     let mut remaining = size + 1;
@@ -1118,7 +1120,7 @@ fn write_ncount(w: *mut BitW, norm: []i32, log: u32) !void {
 }
 
 // Code lengths of at most max_len bits (Huffman, flattened until it fits).
-fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) !void {
+fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) ZstdError!void {
     let n = freq.len;
     let mut shift: u32 = 0;
     loop {
@@ -1187,7 +1189,7 @@ fn code_lengths(freq: []u32, lens: []mut u8, max_len: u32) !void {
 
 // Huffman-codes literals: the literals section (header included), or
 // nothing (returns false) if raw literals would be as small.
-fn huff_literals(lits: []u8, out: *mut strs.String) !bool {
+fn huff_literals(lits: []u8, out: *mut strs.String) ZstdError!bool {
     let mut freq: [256]u32 = [0; 256];
     for c in lits {
         freq[@as(usize, c)] += 1;
@@ -1384,7 +1386,7 @@ fn huff_literals(lits: []u8, out: *mut strs.String) !bool {
     return true;
 }
 
-fn huff_stream_encode(lits: []u8, lens: []u8, codes: []u32, out: *mut strs.String) !void {
+fn huff_stream_encode(lits: []u8, lens: []u8, codes: []u32, out: *mut strs.String) ZstdError!void {
     let mut w = BitW.{ out: out, acc: 0, n: 0 };
     let mut k = lits.len;
     while k > 0 {
@@ -1533,7 +1535,7 @@ fn offset_value(d: u64, ll: u32, reps: *mut [3]u64) u32 {
 // Chooses the sequences of a block (data[start..end]) with hash chains and
 // one step of lazy matching.
 fn find_sequences(m: *mut Matcher, start: usize, end: usize, reps: *mut [3]u64, seqs: *mut vec.Vec.[Seq],
-                  lits: *mut vec.Vec.[u8], lazy: bool) !void {
+                  lits: *mut vec.Vec.[u8], lazy: bool) ZstdError!void {
     let mut i = start;
     let mut anchor = start;
     let limit = end;
@@ -1592,7 +1594,7 @@ fn find_sequences(m: *mut Matcher, start: usize, end: usize, reps: *mut [3]u64, 
 // Chooses a table for one kind of code: returns its mode, and writes its
 // description.
 fn choose_table(codes: []u8, max_symbol: usize, max_log: u32, deflt: []i32, deflt_log: u32, t: *mut CTable,
-                desc: *mut strs.String) !u32 {
+                desc: *mut strs.String) ZstdError!u32 {
     let mut counts: [64]u32 = [0; 64];
     let mut top: usize = 0;
     let mut distinct: usize = 0;
@@ -1631,7 +1633,7 @@ fn choose_table(codes: []u8, max_symbol: usize, max_log: u32, deflt: []i32, defl
 }
 
 // A compressed block's body, or nothing (false) if it would not be smaller.
-fn compress_block(block: []u8, seqs: []Seq, lits: []u8, out: *mut strs.String) !bool {
+fn compress_block(block: []u8, seqs: []Seq, lits: []u8, out: *mut strs.String) ZstdError!bool {
     // literals
     if not huff_literals(lits, out)! {
         let n = lits.len;
@@ -1728,7 +1730,7 @@ fn compress_block(block: []u8, seqs: []Seq, lits: []u8, out: *mut strs.String) !
     return out.len < block.len;
 }
 
-fn seq_bits(w: *mut BitW, q: Seq, lc: u8, mc: u8, oc: u8) !void {
+fn seq_bits(w: *mut BitW, q: Seq, lc: u8, mc: u8, oc: u8) ZstdError!void {
     w.add(@as(u64, q.ll - LL_BASE[@as(usize, lc)]), @as(u32, LL_BITS[@as(usize, lc)]))!;
     w.add(@as(u64, q.ml - ML_BASE[@as(usize, mc)]), @as(u32, ML_BITS[@as(usize, mc)]))!;
     w.add(@as(u64, q.ofv - (@as(u32, 1) << @as(u32, oc))), @as(u32, oc))!;
@@ -1742,7 +1744,7 @@ pub fn compress(data: []u8, level: u32) ![]mut u8 {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 /// Compresses data as one Zstandard frame (see compress) and writes it to
@@ -1843,7 +1845,7 @@ pub fn compress_to(w: io.Writer, data: []u8, level: u32) !void {
     w.write_all(out.bytes())!;
 }
 
-fn put24(out: *mut strs.String, v: u32) !void {
+fn put24(out: *mut strs.String, v: u32) ZstdError!void {
     out.push(@truncate(u8, v))!;
     out.push(@truncate(u8, v >> 8))!;
     out.push(@truncate(u8, v >> 16))!;
@@ -1853,7 +1855,7 @@ fn put24(out: *mut strs.String, v: u32) !void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn fails(r: ![]mut u8) bool {
+fn fails(r: ZstdError![]mut u8) bool {
     let x = r catch return true;
     mem.free(x);
     return false;

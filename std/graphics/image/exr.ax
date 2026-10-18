@@ -23,7 +23,8 @@ import "../../mem.ax" as mem;
 import "../../str.ax" as strs;
 import "../image.ax" as image;
 
-error { Corrupt, Unsupported, OutOfMemory }
+pub error ExrError { Corrupt, Unsupported, OutOfMemory, IoError, NotFound, ChecksumMismatch, TooLarge, Done, Truncated,
+                     InvalidUtf8 }
 
 /// A compression method (its value as stored in the file).
 pub enum Compression: u8 {
@@ -97,14 +98,14 @@ fn block_lines(c: Compression) usize {
 // Decoding
 // -----------------------------------------------------------------------------
 
-fn cstr(data: []u8, pos: *mut usize) ![]u8 {
+fn cstr(data: []u8, pos: *mut usize) ExrError![]u8 {
     let rest = data[pos.*..];
     let n = strs.index_of_byte(rest, 0) catch return error.Corrupt;
     pos.* += n + 1;
     return rest[..n];
 }
 
-fn parse_header(data: []u8, pos: *mut usize) !Header {
+fn parse_header(data: []u8, pos: *mut usize) ExrError!Header {
     let mut h = Header.{
         channels: [Channel.{ name: "", kind: PixelType.HALF, target: -1 }; 16],
         nch: 0,
@@ -203,7 +204,7 @@ fn parse_header(data: []u8, pos: *mut usize) !Header {
     return h;
 }
 
-pub fn decode(data: []u8) !image.Image {
+pub fn decode(data: []u8) ExrError!image.Image {
     if not is_exr(data) {
         return error.Corrupt;
     }
@@ -287,7 +288,7 @@ fn set_target(h: *mut Header, ch: i32, t: i32) void {
     }
 }
 
-fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !void {
+fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) ExrError!void {
     let mut nblocks: usize = 0;
     let lines = block_lines(h.compression);
     if h.tiled {
@@ -412,7 +413,7 @@ fn read_chunks(data: []u8, start: usize, h: *Header, img: *mut image.Image) !voi
 
 /// Undoes ZIP's and RLE's preprocessing: a byte delta, then splitting
 /// even and odd bytes.
-fn unpredict(buf: []mut u8) !void {
+fn unpredict(buf: []mut u8) ExrError!void {
     let n = buf.len;
     for i in @as(usize, 1)..@max(n, 1) {
         buf[i] = (buf[i - 1] +% buf[i]) -% 128;
@@ -429,7 +430,7 @@ fn unpredict(buf: []mut u8) !void {
     }
 }
 
-fn rle_decode(src: []u8, out: []mut u8) !void {
+fn rle_decode(src: []u8, out: []mut u8) ExrError!void {
     let mut i: usize = 0;
     let mut o: usize = 0;
     while i < src.len {
@@ -458,7 +459,7 @@ fn rle_decode(src: []u8, out: []mut u8) !void {
     }
 }
 
-fn pxr24_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) !void {
+fn pxr24_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize) ExrError!void {
     let n = out.len;
     let z = deflate.decompress(src, deflate.Format.ZLIB, n) catch return error.Corrupt;
     defer mem.free(z);
@@ -549,7 +550,7 @@ struct PizScratch {
     hcode: []mut u64,
     dec: []mut HufDec,
 
-    fn init(needed: bool) !PizScratch {
+    fn init(needed: bool) ExrError!PizScratch {
         let mut p = PizScratch.{
             bitmap: mem.alloc.[u8](0)!,
             lut: mem.alloc.[u16](0)!,
@@ -587,7 +588,7 @@ struct PizScratch {
     }
 }
 
-fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize, sc: *mut PizScratch) !void {
+fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize, sc: *mut PizScratch) ExrError!void {
     if src.len < 4 {
         return error.Corrupt;
     }
@@ -776,7 +777,7 @@ struct BitIn {
         self.lc += 8;
     }
 
-    fn get_bits(self: *mut BitIn, n: u32) !u64 {
+    fn get_bits(self: *mut BitIn, n: u32) ExrError!u64 {
         while self.lc < n {
             if self.pos >= self.d.len {
                 return error.Corrupt;
@@ -788,7 +789,7 @@ struct BitIn {
     }
 }
 
-fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) !void {
+fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) ExrError!void {
     if src.len == 0 {
         if out.len != 0 {
             return error.Corrupt;
@@ -965,7 +966,7 @@ fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) !void {
     }
 }
 
-fn get_code(sym: u32, rlc: u32, inb: *mut BitIn, out: []mut u16, o: usize) !usize {
+fn get_code(sym: u32, rlc: u32, inb: *mut BitIn, out: []mut u16, o: usize) ExrError!usize {
     if sym == rlc {
         if inb.lc < 8 {
             if inb.pos >= inb.d.len {
@@ -995,12 +996,12 @@ fn get_code(sym: u32, rlc: u32, inb: *mut BitIn, out: []mut u16, o: usize) !usiz
 // Encoding
 // -----------------------------------------------------------------------------
 
-fn put32(o: *mut strs.String, v: u32) !void {
+fn put32(o: *mut strs.String, v: u32) ExrError!void {
     let b: [4]u8 = [@truncate(u8, v), @truncate(u8, v >> 8), @truncate(u8, v >> 16), @truncate(u8, v >> 24)];
     o.push_str(b[..])!;
 }
 
-fn attr(o: *mut strs.String, name: []u8, ty: []u8, value: []u8) !void {
+fn attr(o: *mut strs.String, name: []u8, ty: []u8, value: []u8) ExrError!void {
     o.push_str(name)!;
     o.push(0)!;
     o.push_str(ty)!;
@@ -1016,7 +1017,7 @@ pub fn encode(img: *image.Image, opts: Options) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Encodes an image as OpenEXR to w, a block of scanlines at a time. The
@@ -1265,7 +1266,7 @@ fn predict(buf: []mut u8) void {
     }
 }
 
-fn rle_encode(src: []u8) ![]mut u8 {
+fn rle_encode(src: []u8) ExrError![]mut u8 {
     let out = mem.alloc.[u8](((src.len * 3) / 2) + 2)!;
     let mut o: usize = 0;
     let n = src.len;

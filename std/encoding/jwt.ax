@@ -54,20 +54,13 @@ import "../str.ax" as strs;
 import "base64.ax" as base64;
 import "json.ax" as json;
 
-error {
-    InvalidToken,
-    InvalidSignature,
-    AlgorithmMismatch,
-    InvalidKey,
-    InvalidClaim,
-    Expired,
-    NotYetValid,
-    InvalidIssuer,
-    InvalidAudience,
-    MissingClaim,
-    NotFound,
-    OutOfMemory,
-}
+pub error JwtError { InvalidToken, InvalidSignature, AlgorithmMismatch, InvalidKey, InvalidClaim, Expired, NotYetValid,
+                     InvalidIssuer, InvalidAudience, MissingClaim, NotFound, OutOfMemory, Done, SyntaxError,
+                     InvalidBase64, IoError, InvalidCertificate, PermissionDenied, InvalidUtf8, TooDeep, NoSpaceLeft,
+                     InvalidPem, Exists, WrongType, UnsupportedAlgorithm, NotADirectory, BadNesting, UnknownAuthority,
+                     IsDirectory, BadFormat, HostnameMismatch, NotEmpty, Empty, BadSignature, BadPattern, EndOfStream,
+                     NotCA, Unsupported, InvalidNumber, IncompatibleUsage, InvalidArgument, NameConstraint, Failed,
+                     UnhandledCriticalExtension, PathTooLong, Corrupt, UnexpectedTag }
 
 /// The signature algorithms ("none" is deliberately absent).
 pub enum Alg: u8 {
@@ -103,7 +96,7 @@ pub enum Alg: u8 {
     }
 
     /// The algorithm with this "alg" name (exactly; NotFound otherwise).
-    pub fn from_name(s: []u8) !Alg {
+    pub fn from_name(s: []u8) JwtError!Alg {
         let all: [12]Alg = [Alg.HS256, Alg.HS384, Alg.HS512, Alg.RS256, Alg.RS384, Alg.RS512, Alg.PS256, Alg.PS384,
                             Alg.PS512, Alg.ES256, Alg.ES384, Alg.EDDSA];
         for a in all {
@@ -146,7 +139,7 @@ pub struct PublicKey {
     key: x509.PublicKey,
 
     /// The first "PUBLIC KEY" block of a PEM text.
-    pub fn from_pem(text: []u8) !PublicKey {
+    pub fn from_pem(text: []u8) JwtError!PublicKey {
         let mut it = x509.pem_blocks(text);
         loop {
             let b = it.next() catch return error.InvalidKey;
@@ -158,11 +151,11 @@ pub struct PublicKey {
     }
 
     /// A SubjectPublicKeyInfo (copied).
-    pub fn from_der(der: []u8) !PublicKey {
+    pub fn from_der(der: []u8) JwtError!PublicKey {
         return PublicKey.adopt(mem.dup(der)!);
     }
 
-    fn adopt(d: []mut u8) !PublicKey {
+    fn adopt(d: []mut u8) JwtError!PublicKey {
         let k = x509.parse_spki(d) catch {
             mem.free(d);
             return error.InvalidKey;
@@ -205,7 +198,7 @@ fn is_pss(a: Alg) bool {
 const MIN_RSA_BITS: usize = 2048;
 
 /// Signs msg into out (at least 1024 bytes); returns the signature's length.
-fn sign_bytes(alg: Alg, key: SigningKey, msg: []u8, out: []mut u8) !usize {
+fn sign_bytes(alg: Alg, key: SigningKey, msg: []u8, out: []mut u8) JwtError!usize {
     let h = alg.hash();
     let hl = sha2.digest_size(h);
     let mut digest: [64]u8 = [0; 64];
@@ -263,7 +256,7 @@ fn sign_bytes(alg: Alg, key: SigningKey, msg: []u8, out: []mut u8) !usize {
 /// Checks sig over msg: InvalidKey if the key does not suit alg (a secret
 /// for HMAC, an RSA key for RS and PS, a P-256 key for ES256, P-384 for
 /// ES384, Ed25519 for EdDSA), InvalidSignature if it is wrong.
-fn verify_bytes(alg: Alg, key: VerifyingKey, msg: []u8, sig: []u8) !void {
+fn verify_bytes(alg: Alg, key: VerifyingKey, msg: []u8, sig: []u8) JwtError!void {
     let h = alg.hash();
     let hl = sha2.digest_size(h);
     let mut digest: [64]u8 = [0; 64];
@@ -359,7 +352,7 @@ pub fn sign(alg: Alg, key: SigningKey, claims: []u8, kid: []u8) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 // -----------------------------------------------------------------------------
@@ -393,7 +386,7 @@ fn b64url_char(c: u8) bool {
 }
 
 /// Strict base64url (RFC 7515 §2: no padding, no white space) into new memory.
-fn segment(s: []u8) ![]mut u8 {
+fn segment(s: []u8) JwtError![]mut u8 {
     for c in s {
         if not b64url_char(c) {
             return error.InvalidToken;
@@ -413,7 +406,7 @@ fn has(obj: json.Value, name: []u8) bool {
 }
 
 /// A JSON object whose member names are all different.
-fn parse_object(text: []u8) !json.Document {
+fn parse_object(text: []u8) JwtError!json.Document {
     let mut d = json.parse(text) catch |e| {
         if e == error.OutOfMemory {
             return e;
@@ -442,7 +435,7 @@ struct Parts {
     input: []u8,  // header "." payload: what is signed
 }
 
-fn split(token: []u8) !Parts {
+fn split(token: []u8) JwtError!Parts {
     let a = strs.index_of_byte(token, '.') catch return error.InvalidToken;
     let rest = token[a + 1..];
     let b = strs.index_of_byte(rest, '.') catch return error.InvalidToken;
@@ -455,7 +448,7 @@ fn split(token: []u8) !Parts {
 
 /// The header of a token, parsed but NOT verified: for choosing a key by
 /// its "kid" before verifying. The caller frees the Document (deinit).
-pub fn header_unverified(token: []u8) !json.Document {
+pub fn header_unverified(token: []u8) JwtError!json.Document {
     let p = split(token)!;
     let h = segment(p.header)!;
     defer mem.free(h);
@@ -466,7 +459,7 @@ pub fn header_unverified(token: []u8) !json.Document {
 /// see validate and decode). alg is the algorithm the caller expects, and
 /// key must suit it; a header naming another algorithm fails with
 /// AlgorithmMismatch.
-pub fn verify(token: []u8, alg: Alg, key: VerifyingKey) !Token {
+pub fn verify(token: []u8, alg: Alg, key: VerifyingKey) JwtError!Token {
     let p = split(token)!;
     let hb = segment(p.header)!;
     defer mem.free(hb);
@@ -538,7 +531,7 @@ pub struct Validation {
 
 /// A NumericDate claim, truncated to whole seconds as PyJWT does; false if
 /// absent.
-fn numeric(claims: json.Value, name: []u8, required: bool, out: *mut i64) !bool {
+fn numeric(claims: json.Value, name: []u8, required: bool, out: *mut i64) JwtError!bool {
     let v = claims.get(name) catch {
         if required {
             return error.MissingClaim;
@@ -572,7 +565,7 @@ fn empty_aud(v: json.Value) bool {
 }
 
 /// Checks a verified token's claims.
-pub fn validate(t: *Token, v: Validation) !void {
+pub fn validate(t: *Token, v: Validation) JwtError!void {
     let c = t.claims;
     let mut x: i64 = 0;
     if numeric(c, "iat", v.require_iat, &mut x)! and (x > @add_sat(v.now, v.leeway)) {
@@ -624,7 +617,7 @@ pub fn validate(t: *Token, v: Validation) !void {
 }
 
 /// verify, then validate: the token if both pass.
-pub fn decode(token: []u8, alg: Alg, key: VerifyingKey, v: Validation) !Token {
+pub fn decode(token: []u8, alg: Alg, key: VerifyingKey, v: Validation) JwtError!Token {
     let mut t = verify(token, alg, key)!;
     validate(&t, v) catch |e| {
         t.deinit();
@@ -637,16 +630,16 @@ pub fn decode(token: []u8, alg: Alg, key: VerifyingKey, v: Validation) !Token {
 // Tests: tokens and keys from PyJWT (cmd/axiom/internal/tests/tools/gen_jwt_tests.py), and by hand
 // -----------------------------------------------------------------------------
 
-fn read_key_file(name: []u8, suffix: []u8) ![]mut u8 {
+fn read_key_file(name: []u8, suffix: []u8) JwtError![]mut u8 {
     let mut p = strs.String.init();
     defer p.deinit();
     p.push_str("std/encoding/jwt/testdata/")!;
     p.push_str(name)!;
     p.push_str(suffix)!;
-    return fs.read_file(p.bytes());
+    return fs.read_file(p.bytes())!;
 }
 
-fn result_of(r: !Token) []u8 {
+fn result_of(r: JwtError!Token) []u8 {
     let mut t = r catch |e| return @error_name(e);
     t.deinit();
     return "ok";
@@ -843,7 +836,7 @@ test "malformed tokens" {
     @expect_eq(result_of(verify("eyJhbGciOiJIUzM4NCJ9.e30.", Alg.HS256, key)), "AlgorithmMismatch");
     @expect_eq(result_of(verify("eyJhbGciOiJoczI1NiJ9.e30.", Alg.HS256, key)), "AlgorithmMismatch");  // "hs256"
     @expect_eq(result_of(verify("eyJhbGciOiJub25lIn0.e30.", Alg.HS256, key)), "AlgorithmMismatch");   // "none"
-    @expect(fails_header(header_unverified("x.y.z")));
+    @expect(fails_header(widen(header_unverified("x.y.z"))));
     // every byte changed: an error (or, where base64url has slack, the same token), never a trap
     let mut m = strs.String.init();
     defer m.deinit();
@@ -862,4 +855,10 @@ fn fails_header(r: !json.Document) bool {
     let mut d = r catch return true;
     d.deinit();
     return false;
+}
+
+// A result with this module's errors as one with any error, for the
+// helpers of the tests (error unions do not widen by themselves).
+fn widen[T](r: JwtError!T) !T {
+    return r!;
 }

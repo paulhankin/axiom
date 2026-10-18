@@ -895,7 +895,9 @@ Type *builtin_check(Expr *e, Type *expected) {
             t = t_invalid;
         } else {
             t = ta;
-            if (ta != tb && ta->kind != TY_INVALID && tb->kind != TY_INVALID) {
+            // (errors of different sets compare by their codes, as with ==)
+            if (ta != tb && ta->kind != TY_INVALID && tb->kind != TY_INVALID &&
+                !(ta->kind == TY_ERROR && tb->kind == TY_ERROR)) {
                 Diag *d = diag_error(e->span, "E0412", "@expect_eq operands have different types: %s and %s",
                                      type_str(ta), type_str(tb));
                 diag_types(d, type_str(ta), type_str(tb));

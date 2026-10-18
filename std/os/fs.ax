@@ -24,8 +24,8 @@ import "../os.ax" as os;
 import "../str.ax" as strs;
 import "path.ax" as path;
 
-error { NotFound, PermissionDenied, Exists, NotADirectory, IsDirectory, NotEmpty, IoError, OutOfMemory, BadPattern,
-        Unsupported }
+pub error FsError { NotFound, PermissionDenied, Exists, NotADirectory, IsDirectory, NotEmpty, IoError, OutOfMemory,
+                    BadPattern, Unsupported, Empty, Done, InvalidArgument, InvalidUtf8, Failed }
 
 import host "axiom" {
     fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32;
@@ -78,7 +78,7 @@ fn kind_from_host(k: u64) Kind {
     }
 }
 
-fn fail(code: i64) error {
+fn fail(code: i64) FsError {
     if code == -2 {
         return error.NotFound;
     }
@@ -116,7 +116,7 @@ pub struct Info {
     }
 }
 
-fn stat_with(p: []u8, follow: u32) !Info {
+fn stat_with(p: []u8, follow: u32) FsError!Info {
     let mut out: [4]i64 = [0; 4];
     let r = ax_stat(p.ptr, p.len, follow, &mut out[0]);
     if r < 0 {
@@ -131,12 +131,12 @@ fn stat_with(p: []u8, follow: u32) !Info {
 }
 
 /// Information about the file at p (following symbolic links).
-pub fn stat(p: []u8) !Info {
+pub fn stat(p: []u8) FsError!Info {
     return stat_with(p, 1);
 }
 
 /// Information about p itself (a symbolic link is not followed).
-pub fn lstat(p: []u8) !Info {
+pub fn lstat(p: []u8) FsError!Info {
     return stat_with(p, 0);
 }
 
@@ -160,13 +160,13 @@ pub fn is_file(p: []u8) bool {
 // -----------------------------------------------------------------------------
 
 /// The contents of a file (free them with mem.free).
-pub fn read_file(p: []u8) ![]mut u8 {
+pub fn read_file(p: []u8) FsError![]mut u8 {
     let f = io.open(p) catch |e| return map_io(e);
     defer f.close();
     return f.reader().read_all() catch |e| return map_io(e);
 }
 
-fn map_io(e: error) error {
+fn map_io(e: error) FsError {
     if e == error.NotFound {
         return error.NotFound;
     }
@@ -183,21 +183,21 @@ fn map_io(e: error) error {
 }
 
 /// Creates (or truncates) a file holding data.
-pub fn write_file(p: []u8, data: []u8) !void {
+pub fn write_file(p: []u8, data: []u8) FsError!void {
     let f = io.create(p) catch |e| return map_io(e);
     defer f.close();
     f.writer().write_all(data) catch |e| return map_io(e);
 }
 
 /// Adds data to the end of a file, creating it if needed.
-pub fn append_file(p: []u8, data: []u8) !void {
+pub fn append_file(p: []u8, data: []u8) FsError!void {
     let f = io.append(p) catch |e| return map_io(e);
     defer f.close();
     f.writer().write_all(data) catch |e| return map_io(e);
 }
 
 /// Copies a file's contents to another (created or truncated).
-pub fn copy_file(from: []u8, to: []u8) !void {
+pub fn copy_file(from: []u8, to: []u8) FsError!void {
     let src = io.open(from) catch |e| return map_io(e);
     defer src.close();
     let dst = io.create(to) catch |e| return map_io(e);
@@ -218,12 +218,12 @@ pub fn copy_file(from: []u8, to: []u8) !void {
 // -----------------------------------------------------------------------------
 
 /// Creates a directory (error.Exists if there is something at p).
-pub fn mkdir(p: []u8) !void {
+pub fn mkdir(p: []u8) FsError!void {
     mkdir_mode(p, 0o777)!;
 }
 
 /// Creates a directory with the given permissions (less the umask).
-pub fn mkdir_mode(p: []u8, mode: u32) !void {
+pub fn mkdir_mode(p: []u8, mode: u32) FsError!void {
     let r = ax_mkdir(p.ptr, p.len, mode);
     if r < 0 {
         return fail(@as(i64, r));
@@ -231,7 +231,7 @@ pub fn mkdir_mode(p: []u8, mode: u32) !void {
 }
 
 /// Creates a directory and any missing parents; fine if it exists.
-pub fn mkdir_all(p: []u8) !void {
+pub fn mkdir_all(p: []u8) FsError!void {
     if is_dir(p) {
         return;
     }
@@ -248,7 +248,7 @@ pub fn mkdir_all(p: []u8) !void {
 }
 
 /// Removes a file, a symbolic link or an empty directory.
-pub fn remove(p: []u8) !void {
+pub fn remove(p: []u8) FsError!void {
     let i = lstat(p)!;
     let mut dir: u32 = 0;
     if i.kind == Kind.DIR {
@@ -269,7 +269,7 @@ pub fn remove(p: []u8) !void {
 /// pins each directory with a descriptor and, where the system has no path
 /// through a descriptor, checks before each use that the path is still
 /// that directory, which leaves a narrow window.)
-pub fn remove_all(p: []u8) !void {
+pub fn remove_all(p: []u8) FsError!void {
     let i = lstat(p) catch |e| {
         if e == error.NotFound {
             return;
@@ -312,7 +312,7 @@ struct DirId {
     ino: i64,
 }
 
-fn dir_id(h: i32) !DirId {
+fn dir_id(h: i32) FsError!DirId {
     let mut out: [2]i64 = [0, 0];
     let r = ax_dir_stat(h, &mut out[0]);
     if r < 0 {
@@ -323,7 +323,7 @@ fn dir_id(h: i32) !DirId {
 
 // Before a child of h.* (at `depth`) is visited: past DEEP levels, closes
 // h.*, keeping its identity in id.
-fn park(h: *mut i32, depth: usize, id: *mut DirId) !void {
+fn park(h: *mut i32, depth: usize, id: *mut DirId) FsError!void {
     if depth < DEEP {
         return;
     }
@@ -334,7 +334,7 @@ fn park(h: *mut i32, depth: usize, id: *mut DirId) !void {
 
 // After the child c of h.* was visited: reopens h.* through c's ".." if
 // park closed it, failing if that is not the directory it was.
-fn unpark(h: *mut i32, c: i32, depth: usize, id: DirId) !void {
+fn unpark(h: *mut i32, c: i32, depth: usize, id: DirId) FsError!void {
     if depth < DEEP {
         return;
     }
@@ -354,7 +354,7 @@ fn unpark(h: *mut i32, c: i32, depth: usize, id: DirId) !void {
 }
 
 // Removes everything in the open directory h.* (`depth` levels down).
-fn empty_dir(h: *mut i32, depth: usize) !void {
+fn empty_dir(h: *mut i32, depth: usize) FsError!void {
     let mut d = read_dir_at(h.*)!;
     defer d.deinit();
     for e in d.entries.items() {
@@ -363,7 +363,7 @@ fn empty_dir(h: *mut i32, depth: usize) !void {
 }
 
 // Removes the entry `name` of the open directory h.*, and what is in it.
-fn remove_at(h: *mut i32, name: []u8, kind: Kind, depth: usize) !void {
+fn remove_at(h: *mut i32, name: []u8, kind: Kind, depth: usize) FsError!void {
     if (kind == Kind.DIR) or (kind == Kind.UNKNOWN) {
         let mut c = ax_dir_open(h.*, name.ptr, name.len);
         if c >= 0 {
@@ -401,7 +401,7 @@ fn remove_at(h: *mut i32, name: []u8, kind: Kind, depth: usize) !void {
 }
 
 /// Moves (renames) a file or directory, replacing a file at `to`.
-pub fn rename(from: []u8, to: []u8) !void {
+pub fn rename(from: []u8, to: []u8) FsError!void {
     let r = ax_rename(from.ptr, from.len, to.ptr, to.len);
     if r < 0 {
         return fail(@as(i64, r));
@@ -429,16 +429,16 @@ fn entry_less(a: Entry, b: Entry) bool {
 }
 
 /// The entries of the directory at p.
-pub fn read_dir(p: []u8) !Dir {
+pub fn read_dir(p: []u8) FsError!Dir {
     return entries_of(p, -1);
 }
 
 // The entries of the open directory h.
-fn read_dir_at(h: i32) !Dir {
+fn read_dir_at(h: i32) FsError!Dir {
     return entries_of("", h);
 }
 
-fn entries_of(p: []u8, h: i32) !Dir {
+fn entries_of(p: []u8, h: i32) FsError!Dir {
     let mut cap: usize = 4096;
     loop {
         let buf = mem.alloc.[u8](cap)!;
@@ -478,7 +478,7 @@ fn entries_of(p: []u8, h: i32) !Dir {
 }
 
 /// The working directory (free it with mem.free).
-pub fn cwd() ![]mut u8 {
+pub fn cwd() FsError![]mut u8 {
     let mut cap: usize = 256;
     loop {
         let buf = mem.alloc.[u8](cap)!;
@@ -501,19 +501,19 @@ pub fn cwd() ![]mut u8 {
 
 /// p as an absolute, cleaned path (relative paths are taken from the
 /// working directory; symbolic links are not resolved).
-pub fn absolute(p: []u8) ![]mut u8 {
+pub fn absolute(p: []u8) FsError![]mut u8 {
     if path.is_abs(p) {
-        return path.clean(p);
+        return path.clean(p)!;
     }
     let here = cwd()!;
     defer mem.free(here);
-    return path.join2(here, p);
+    return path.join2(here, p)!;
 }
 
 /// The directory for temporary files: $TMPDIR, else /tmp (free it). On
 /// Windows: %TMP%, %TEMP% or %USERPROFILE%, as GetTempPath looks, else
 /// C:\Windows\Temp.
-pub fn temp_dir() ![]mut u8 {
+pub fn temp_dir() FsError![]mut u8 {
     if os.is_windows() {
         for name in ["TMP", "TEMP", "USERPROFILE"] {
             let t = env_dir(name)!;
@@ -521,33 +521,33 @@ pub fn temp_dir() ![]mut u8 {
                 return t;
             }
         }
-        return mem.dup("C:\\Windows\\Temp");
+        return mem.dup("C:\\Windows\\Temp")!;
     }
     let t = env_dir("TMPDIR")!;
     if t.len == 0 {
-        return mem.dup("/tmp");
+        return mem.dup("/tmp")!;
     }
     return t;
 }
 
 // The variable's value, or an empty slice when it is unset or empty.
-fn env_dir(name: []u8) ![]mut u8 {
+fn env_dir(name: []u8) FsError![]mut u8 {
     let t = os.getenv(name) catch |e| {
         if e == error.OutOfMemory {
             return e;
         }
-        return mem.dup("");
+        return mem.dup("")!;
     };
     if t.len == 0 {
         mem.free(t);
-        return mem.dup("");
+        return mem.dup("")!;
     }
     return t;
 }
 
 /// Creates a new directory with a unique name in temp_dir(), starting with
 /// prefix; returns its path (free it; remove it with remove_all).
-pub fn make_temp_dir(prefix: []u8) ![]mut u8 {
+pub fn make_temp_dir(prefix: []u8) FsError![]mut u8 {
     let base = temp_dir()!;
     defer mem.free(base);
     let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
@@ -581,7 +581,7 @@ pub fn make_temp_dir(prefix: []u8) ![]mut u8 {
 /// order: visit(ctx, path, kind) gets each path (valid only during the
 /// call) and returns whether to go into it, if it is a directory.
 /// Symbolic links are reported, not followed.
-pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) !void {
+pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) FsError!void {
     // "root/." so that a root that is a link to a directory is followed
     let mut dot = mem.alloc.[u8](root.len + 2)!;
     defer mem.free(dot);
@@ -598,7 +598,7 @@ pub fn walk[C](root: []u8, ctx: C, visit: fn(C, []u8, Kind) bool) !void {
 }
 
 // walk, for the open directory h.* (`depth` levels down), whose path is `at`.
-fn walk_at[C](h: *mut i32, at: []u8, ctx: C, visit: fn(C, []u8, Kind) bool, depth: usize) !void {
+fn walk_at[C](h: *mut i32, at: []u8, ctx: C, visit: fn(C, []u8, Kind) bool, depth: usize) FsError!void {
     let mut d = read_dir_at(h.*)!;
     defer d.deinit();
     for e in d.entries.items() {
@@ -679,7 +679,7 @@ fn path_less(a: []mut u8, b: []mut u8) bool {
 /// The paths matching a glob pattern (std/os/path's syntax, with "**"),
 /// sorted. The walk starts at the pattern's leading elements that have no
 /// glob characters.
-pub fn glob(pattern: []u8) !Paths {
+pub fn glob(pattern: []u8) FsError!Paths {
     let mut out = Paths.{ items: vec.Vec.[[]mut u8].init() };
     glob_into(pattern, &mut out) catch |e| {
         out.deinit();
@@ -689,7 +689,7 @@ pub fn glob(pattern: []u8) !Paths {
     return out;
 }
 
-fn glob_into(pattern: []u8, out: *mut Paths) !void {
+fn glob_into(pattern: []u8, out: *mut Paths) FsError!void {
     if not path.has_glob(pattern) {
         if exists(pattern) {
             out.items.push(mem.dup(pattern)!)!;
@@ -735,7 +735,7 @@ fn glob_into(pattern: []u8, out: *mut Paths) !void {
 // -----------------------------------------------------------------------------
 
 /// Sets the permission bits (0o644 and so on).
-pub fn chmod(p: []u8, mode: u32) !void {
+pub fn chmod(p: []u8, mode: u32) FsError!void {
     let r = ax_chmod(p.ptr, p.len, mode);
     if r < 0 {
         return fail(@as(i64, r));
@@ -743,7 +743,7 @@ pub fn chmod(p: []u8, mode: u32) !void {
 }
 
 /// Makes link a symbolic link to target (which need not exist).
-pub fn symlink(target: []u8, link: []u8) !void {
+pub fn symlink(target: []u8, link: []u8) FsError!void {
     let r = ax_symlink(target.ptr, target.len, link.ptr, link.len);
     if r < 0 {
         return fail(@as(i64, r));
@@ -751,7 +751,7 @@ pub fn symlink(target: []u8, link: []u8) !void {
 }
 
 /// The target of a symbolic link (free it with mem.free).
-pub fn read_link(p: []u8) ![]mut u8 {
+pub fn read_link(p: []u8) FsError![]mut u8 {
     let mut cap: usize = 256;
     loop {
         let buf = mem.alloc.[u8](cap)!;
@@ -773,7 +773,7 @@ pub fn read_link(p: []u8) ![]mut u8 {
 }
 
 /// Makes `link` another name for the existing file (a hard link).
-pub fn hard_link(existing: []u8, link: []u8) !void {
+pub fn hard_link(existing: []u8, link: []u8) FsError!void {
     let r = ax_link(existing.ptr, existing.len, link.ptr, link.len);
     if r < 0 {
         return fail(@as(i64, r));
@@ -782,7 +782,7 @@ pub fn hard_link(existing: []u8, link: []u8) !void {
 
 /// Sets when a file was last read and modified, in nanoseconds since 1970
 /// (the node host keeps microseconds).
-pub fn set_times(p: []u8, atime_ns: i64, mtime_ns: i64) !void {
+pub fn set_times(p: []u8, atime_ns: i64, mtime_ns: i64) FsError!void {
     let r = ax_utimes(p.ptr, p.len, atime_ns, mtime_ns);
     if r < 0 {
         return fail(@as(i64, r));
@@ -790,7 +790,7 @@ pub fn set_times(p: []u8, atime_ns: i64, mtime_ns: i64) !void {
 }
 
 /// Cuts an open file to `size` bytes, or extends it with zeros.
-pub fn truncate(f: io.File, size: u64) !void {
+pub fn truncate(f: io.File, size: u64) FsError!void {
     let r = ax_ftruncate(f.fd, @bit_cast(i64, size));
     if r < 0 {
         return fail(@as(i64, r));
@@ -798,7 +798,7 @@ pub fn truncate(f: io.File, size: u64) !void {
 }
 
 /// Waits until what was written to the file is on the disk.
-pub fn sync(f: io.File) !void {
+pub fn sync(f: io.File) FsError!void {
     if ax_fsync(f.fd) != 0 {
         return error.IoError;
     }
@@ -812,7 +812,7 @@ pub enum Lock: u8 {
 
 /// Takes an advisory lock on the whole file (flock), waiting while another
 /// process holds a conflicting one. Unsupported on the node host.
-pub fn lock(f: io.File, kind: Lock) !void {
+pub fn lock(f: io.File, kind: Lock) FsError!void {
     let r = ax_flock(f.fd, @as(u32, @int_from_enum(kind)));
     if r == -95 {
         return error.Unsupported;
@@ -823,7 +823,7 @@ pub fn lock(f: io.File, kind: Lock) !void {
 }
 
 /// lock, without waiting: false if another process holds a conflicting one.
-pub fn try_lock(f: io.File, kind: Lock) !bool {
+pub fn try_lock(f: io.File, kind: Lock) FsError!bool {
     let r = ax_flock(f.fd, @as(u32, @int_from_enum(kind)) | 4);
     if r == -95 {
         return error.Unsupported;
@@ -852,7 +852,7 @@ pub struct Mapping {
     writable: bool,
 
     /// Makes the changes reach the file (and the disk).
-    pub fn flush(self: *mut Mapping) !void {
+    pub fn flush(self: *mut Mapping) FsError!void {
         if not self.writable or (self.data.len == 0) {
             return;
         }
@@ -880,7 +880,7 @@ pub struct Mapping {
 }
 
 /// Maps the whole of the file at p (read-only unless writable).
-pub fn map(p: []u8, writable: bool) !Mapping {
+pub fn map(p: []u8, writable: bool) FsError!Mapping {
     let info = stat(p)!;
     if info.kind != Kind.FILE {
         return error.IsDirectory;
@@ -920,7 +920,7 @@ pub fn map(p: []u8, writable: bool) !Mapping {
     return Mapping.{ data: data, file: f, mapped: false, writable: writable };
 }
 
-fn fail_io(e: error) error {
+fn fail_io(e: error) FsError {
     if e == error.NotFound {
         return error.NotFound;
     }
@@ -957,7 +957,7 @@ pub struct Watcher {
     buf: []mut u8,
     events: vec.Vec.[Event],
 
-    pub fn init() !Watcher {
+    pub fn init() FsError!Watcher {
         let h = ax_watch_open();
         if h < 0 {
             return error.IoError;
@@ -977,7 +977,7 @@ pub struct Watcher {
 
     /// Starts watching a file, or a directory's entries (not its
     /// subdirectories'); returns the watch's id.
-    pub fn add(self: *mut Watcher, p: []u8) !i32 {
+    pub fn add(self: *mut Watcher, p: []u8) FsError!i32 {
         let r = ax_watch_add(self.h, p.ptr, p.len);
         if r < 0 {
             return fail(@as(i64, r));
@@ -992,7 +992,7 @@ pub struct Watcher {
     /// Waits up to timeout_ms milliseconds (-1: for ever) for changes;
     /// returns those that came (none if it timed out), valid until the
     /// next call.
-    pub fn wait(self: *mut Watcher, timeout_ms: i32) ![]Event {
+    pub fn wait(self: *mut Watcher, timeout_ms: i32) FsError![]Event {
         self.events.clear();
         let n = ax_watch_read(self.h, self.buf.ptr, self.buf.len, timeout_ms);
         if n < 0 {
@@ -1062,7 +1062,7 @@ fn count_visit(n: *mut u32, p: []u8, kind: Kind) bool {
     return true;
 }
 
-fn failed_with(r: ![]mut u8, want: error) bool {
+fn failed_with(r: FsError![]mut u8, want: error) bool {
     let v = r catch |e| return e == want;
     mem.free(v);
     return false;
@@ -1240,12 +1240,12 @@ test "permissions, links and times" {
     @expect(not_found(read_link("/surely/not/there")));
 }
 
-fn exists_err(r: !void) bool {
+fn exists_err(r: FsError!void) bool {
     r catch |e| return e == error.Exists;
     return false;
 }
 
-fn not_found(r: ![]mut u8) bool {
+fn not_found(r: FsError![]mut u8) bool {
     let x = r catch |e| return e == error.NotFound;
     mem.free(x);
     return false;
@@ -1341,7 +1341,7 @@ test "watching" {
     @expect(not_found_i32(w.add("/surely/not/there")));
 }
 
-fn not_found_i32(r: !i32) bool {
+fn not_found_i32(r: FsError!i32) bool {
     _ = r catch |e| return e == error.NotFound;
     return false;
 }

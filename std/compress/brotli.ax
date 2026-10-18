@@ -29,7 +29,7 @@ import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "brotli/tables.ax" as tables;
 
-error { Corrupt, TooLarge, OutOfMemory }
+pub error BrotliError { Corrupt, TooLarge, OutOfMemory, Empty, IoError, NotFound, Done, InvalidUtf8 }
 
 // -----------------------------------------------------------------------------
 // Bits, least significant first
@@ -49,7 +49,7 @@ struct Bits {
         }
     }
 
-    fn read(self: *mut Bits, k: u32) !u32 {
+    fn read(self: *mut Bits, k: u32) BrotliError!u32 {
         if k == 0 {
             return 0;
         }
@@ -73,7 +73,7 @@ struct Bits {
     }
 
     // To the next byte boundary: the skipped bits must be zero.
-    fn align(self: *mut Bits) !void {
+    fn align(self: *mut Bits) BrotliError!void {
         let r = self.n % 8;
         if self.read(r)! != 0 {
             return error.Corrupt;
@@ -81,7 +81,7 @@ struct Bits {
     }
 
     // Bytes at the byte boundary (after align).
-    fn bytes(self: *mut Bits, k: usize) ![]u8 {
+    fn bytes(self: *mut Bits, k: usize) BrotliError![]u8 {
         // give back whole buffered bytes first
         let buffered = @as(usize, self.n / 8);
         let start = self.i - buffered;
@@ -112,7 +112,7 @@ struct Code {
         }
     }
 
-    fn decode(self: *Code, b: *mut Bits) !u32 {
+    fn decode(self: *Code, b: *mut Bits) BrotliError!u32 {
         if self.single >= 0 {
             return @bit_cast(u32, self.single);
         }
@@ -139,7 +139,7 @@ fn empty_code() Code {
 }
 
 // Builds a code from lengths (0: absent): a complete code, or one symbol.
-fn build_code(c: *mut Code, lens: []u8) !void {
+fn build_code(c: *mut Code, lens: []u8) BrotliError!void {
     c.deinit();
     c.* = empty_code();
     let mut used: usize = 0;
@@ -202,7 +202,7 @@ fn bits_for(n: usize) u32 {
 
 // Reads a prefix code over an alphabet of `size` symbols (size_limit: the
 // largest symbol allowed, for distance alphabets).
-fn read_code(b: *mut Bits, c: *mut Code, size: usize) !void {
+fn read_code(b: *mut Bits, c: *mut Code, size: usize) BrotliError!void {
     let hskip = b.read(2)!;
     let lens = mem.alloc.[u8](size)!;
     defer mem.free(lens);
@@ -348,7 +348,7 @@ let DOFFSET: [25]u32 = [0, 0, 0, 0, 0, 4096, 9216, 21504, 35840, 44032, 53248, 6
                         104704, 106752, 108928, 113536, 115968, 118528, 119872, 121280, 122016];
 
 // A variable-length count, 0 to 255 (block types and trees, less one).
-fn var_uint8(b: *mut Bits) !u32 {
+fn var_uint8(b: *mut Bits) BrotliError!u32 {
     if b.read(1)! == 0 {
         return 0;
     }
@@ -374,7 +374,7 @@ struct Blocks {
         self.counts.deinit();
     }
 
-    fn read_count(self: *mut Blocks, b: *mut Bits) !u32 {
+    fn read_count(self: *mut Blocks, b: *mut Bits) BrotliError!u32 {
         let c = self.counts.decode(b)!;
         if c >= 26 {
             return error.Corrupt;
@@ -382,7 +382,7 @@ struct Blocks {
         return BLEN_BASE[@as(usize, c)] + b.read(BLEN_BITS[@as(usize, c)])!;
     }
 
-    fn setup(self: *mut Blocks, b: *mut Bits) !void {
+    fn setup(self: *mut Blocks, b: *mut Bits) BrotliError!void {
         self.ntypes = var_uint8(b)! + 1;
         self.kind = 0;
         self.last = 0;
@@ -397,7 +397,7 @@ struct Blocks {
     }
 
     // Switches to the next block (when this one is used up).
-    fn next(self: *mut Blocks, b: *mut Bits) !void {
+    fn next(self: *mut Blocks, b: *mut Bits) BrotliError!void {
         if self.left > 0 {
             return;
         }
@@ -428,7 +428,7 @@ fn new_blocks() Blocks {
 }
 
 // Reads a context map of n entries for ntrees trees.
-fn read_context_map(b: *mut Bits, map: []mut u8, ntrees: u32) !void {
+fn read_context_map(b: *mut Bits, map: []mut u8, ntrees: u32) BrotliError!void {
     if ntrees == 1 {
         @mem_set(map, 0);
         return;
@@ -509,14 +509,14 @@ fn to_upper(w: []mut u8, i: usize) usize {
 }
 
 // A prefix or suffix: a length byte, then the bytes.
-fn affix(id: u8, out: *mut strs.String) !void {
+fn affix(id: u8, out: *mut strs.String) BrotliError!void {
     let st = @as(usize, tables.PS_OFFSET[@as(usize, id)]);
     let n = @as(usize, tables.PREFIX_SUFFIX[st]);
     out.push_str(tables.PREFIX_SUFFIX[st + 1..st + 1 + n])!;
 }
 
 // Appends dictionary word `index` of length len under transform t.
-fn word(len: usize, index: usize, t: usize, out: *mut strs.String) !void {
+fn word(len: usize, index: usize, t: usize, out: *mut strs.String) BrotliError!void {
     let off = @as(usize, DOFFSET[len]) + (index * len);
     let src = tables.DICTIONARY[off..off + len];
     let prefix = tables.TRANSFORMS[3 * t];
@@ -550,13 +550,13 @@ fn word(len: usize, index: usize, t: usize, out: *mut strs.String) !void {
 // -----------------------------------------------------------------------------
 
 /// Decompresses a Brotli stream; the caller frees the result.
-pub fn decompress(data: []u8, max_size: usize) ![]mut u8 {
+pub fn decompress(data: []u8, max_size: usize) BrotliError![]mut u8 {
     let mut out = strs.String.init();
     decode(data, &mut out, max_size) catch |e| {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 struct Trees {
@@ -569,7 +569,7 @@ struct Trees {
         self.codes.deinit();
     }
 
-    fn read(self: *mut Trees, b: *mut Bits, n: u32, size: usize) !void {
+    fn read(self: *mut Trees, b: *mut Bits, n: u32, size: usize) BrotliError!void {
         self.deinit();
         self.codes = vec.Vec.[Code].init();
         for _k in @as(u32, 0)..n {
@@ -579,7 +579,7 @@ struct Trees {
     }
 }
 
-fn decode(data: []u8, out: *mut strs.String, max_size: usize) !void {
+fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
     let mut b = Bits.{ s: data, i: 0, acc: 0, n: 0 };
     // the window size
     let mut wbits: u32 = 16;
@@ -836,7 +836,7 @@ struct BitW {
     acc: u64,
     n: u32,
 
-    fn add(self: *mut BitW, v: u32, k: u32) !void {
+    fn add(self: *mut BitW, v: u32, k: u32) BrotliError!void {
         if k == 0 {
             return;
         }
@@ -849,7 +849,7 @@ struct BitW {
         }
     }
 
-    fn align(self: *mut BitW) !void {
+    fn align(self: *mut BitW) BrotliError!void {
         if self.n > 0 {
             self.out.push(@truncate(u8, self.acc))!;
             self.acc = 0;
@@ -868,14 +868,14 @@ struct WCode {
         mem.free(self.codes);
     }
 
-    fn put(self: *WCode, w: *mut BitW, s: u32) !void {
+    fn put(self: *WCode, w: *mut BitW, s: u32) BrotliError!void {
         let i = @as(usize, s);
         return w.add(@as(u32, self.codes[i]), @as(u32, self.lens[i]));
     }
 }
 
 // Huffman lengths of at most max_len bits for the frequencies.
-fn huff_lengths(freq: []u32, lens: []mut u8, max_len: u32) !void {
+fn huff_lengths(freq: []u32, lens: []mut u8, max_len: u32) BrotliError!void {
     let n = freq.len;
     let mut shift: u32 = 0;
     loop {
@@ -984,7 +984,7 @@ fn assign_codes(lens: []u8, codes: []mut u16) void {
 
 // Writes a prefix code for symbol frequencies over `size` symbols and
 // returns it for writing symbols.
-fn write_code(w: *mut BitW, freq: []u32) !WCode {
+fn write_code(w: *mut BitW, freq: []u32) BrotliError!WCode {
     let size = freq.len;
     let lens = mem.alloc.[u8](size)!;
     let codes = mem.alloc.[u16](size)!;
@@ -1195,7 +1195,7 @@ pub fn compress(data: []u8, quality: u32) ![]mut u8 {
         out.deinit();
         return e;
     };
-    return out.take();
+    return out.take()!;
 }
 
 const WBITS: u32 = 22;
@@ -1329,7 +1329,7 @@ fn match_len(d: []u8, i: usize, back: usize, end: usize) usize {
     return l;
 }
 
-fn meta_header(w: *mut BitW, len: usize, stored: bool) !void {
+fn meta_header(w: *mut BitW, len: usize, stored: bool) BrotliError!void {
     w.add(0, 1)!;  // ISLAST
     let m = len - 1;
     let mut nibbles: u32 = 4;
@@ -1347,7 +1347,7 @@ fn meta_header(w: *mut BitW, len: usize, stored: bool) !void {
     }
 }
 
-fn compressed_meta(w: *mut BitW, data: []u8, cmds: []Cmd, ring0: [4]u32) !void {
+fn compressed_meta(w: *mut BitW, data: []u8, cmds: []Cmd, ring0: [4]u32) BrotliError!void {
     // one block type of each kind, no postfix or direct codes, one literal
     // context mode, one tree each
     w.add(0, 1)!;
@@ -1437,7 +1437,7 @@ fn compressed_meta(w: *mut BitW, data: []u8, cmds: []Cmd, ring0: [4]u32) !void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn fails(r: ![]mut u8) bool {
+fn fails(r: BrotliError![]mut u8) bool {
     let x = r catch return true;
     mem.free(x);
     return false;

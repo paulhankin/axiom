@@ -37,7 +37,9 @@ import "binary.ax" as binary;
 import "hex.ax" as hex;
 import "json.ax" as json;
 
-error { Truncated, Corrupt, TooDeep, TrailingData, WrongType, NotFound, OutOfMemory }
+pub error MsgpackError { Truncated, Corrupt, TooDeep, TrailingData, WrongType, NotFound, OutOfMemory, Done, BadFormat,
+                         InvalidHex, IoError, Empty, SyntaxError, InvalidUtf8, InvalidNumber, NoSpaceLeft, BadNesting,
+                         EndOfStream, Overflow }
 
 /// Nesting deeper than this is refused (error.TooDeep).
 pub const MAX_DEPTH: u32 = 512;
@@ -74,7 +76,7 @@ pub union Value {
     Ext: Ext,
 
     /// The value of the entry whose key is the string `key` in a map.
-    pub fn get(self: Value, key: []u8) !Value {
+    pub fn get(self: Value, key: []u8) MsgpackError!Value {
         match self {
             .Map(ps) => {
                 for p in ps {
@@ -94,7 +96,7 @@ pub union Value {
     }
 
     /// Element i of an array.
-    pub fn at(self: Value, i: usize) !Value {
+    pub fn at(self: Value, i: usize) MsgpackError!Value {
         match self {
             .Array(xs) => {
                 if i >= xs.len {
@@ -124,7 +126,7 @@ pub union Value {
         }
     }
 
-    pub fn as_bool(self: Value) !bool {
+    pub fn as_bool(self: Value) MsgpackError!bool {
         match self {
             .Bool(b) => { return b; }
             else     => { return error.WrongType; }
@@ -132,7 +134,7 @@ pub union Value {
     }
 
     /// An integer (or a float with an integral value) that fits in i64.
-    pub fn as_i64(self: Value) !i64 {
+    pub fn as_i64(self: Value) MsgpackError!i64 {
         match self {
             .Int(i) => { return i; }
             .Float(f) => {
@@ -146,7 +148,7 @@ pub union Value {
         }
     }
 
-    pub fn as_u64(self: Value) !u64 {
+    pub fn as_u64(self: Value) MsgpackError!u64 {
         match self {
             .Uint(u) => { return u; }
             .Int(i) => {
@@ -160,7 +162,7 @@ pub union Value {
     }
 
     /// Any number, as an f64.
-    pub fn as_f64(self: Value) !f64 {
+    pub fn as_f64(self: Value) MsgpackError!f64 {
         match self {
             .Float(f) => { return f; }
             .Int(i)   => { return @float_from_int(f64, i); }
@@ -169,28 +171,28 @@ pub union Value {
         }
     }
 
-    pub fn as_str(self: Value) ![]u8 {
+    pub fn as_str(self: Value) MsgpackError![]u8 {
         match self {
             .Str(s) => { return s; }
             else    => { return error.WrongType; }
         }
     }
 
-    pub fn as_bin(self: Value) ![]u8 {
+    pub fn as_bin(self: Value) MsgpackError![]u8 {
         match self {
             .Bin(b) => { return b; }
             else    => { return error.WrongType; }
         }
     }
 
-    pub fn as_array(self: Value) ![]Value {
+    pub fn as_array(self: Value) MsgpackError![]Value {
         match self {
             .Array(xs) => { return xs; }
             else       => { return error.WrongType; }
         }
     }
 
-    pub fn as_map(self: Value) ![]Pair {
+    pub fn as_map(self: Value) MsgpackError![]Pair {
         match self {
             .Map(ps) => { return ps; }
             else     => { return error.WrongType; }
@@ -198,7 +200,7 @@ pub union Value {
     }
 
     /// A timestamp extension value.
-    pub fn as_timestamp(self: Value) !Timestamp {
+    pub fn as_timestamp(self: Value) MsgpackError!Timestamp {
         match self {
             .Ext(e) => { return timestamp_of(e); }
             else    => { return error.WrongType; }
@@ -207,7 +209,7 @@ pub union Value {
 }
 
 /// Decodes the timestamp extension (4, 8 or 12 bytes of data).
-pub fn timestamp_of(e: Ext) !Timestamp {
+pub fn timestamp_of(e: Ext) MsgpackError!Timestamp {
     if e.kind != EXT_TIMESTAMP {
         return error.WrongType;
     }
@@ -499,7 +501,7 @@ pub fn encode(v: Value) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 /// Writes the MessagePack encoding of a value to w, through a 4 KB buffer
@@ -521,7 +523,7 @@ pub fn from_json_text(text: []u8) ![]mut u8 {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
 // -----------------------------------------------------------------------------
@@ -548,11 +550,11 @@ pub struct Options {
 }
 
 /// Decodes one value that fills all of bytes.
-pub fn decode(bytes: []u8) !Document {
+pub fn decode(bytes: []u8) MsgpackError!Document {
     return decode_with(bytes, Options.default());
 }
 
-pub fn decode_with(bytes: []u8, opts: Options) !Document {
+pub fn decode_with(bytes: []u8, opts: Options) MsgpackError!Document {
     let mut used: usize = 0;
     let mut doc = decode_prefix(bytes, opts, &mut used)!;
     if used != bytes.len {
@@ -564,7 +566,7 @@ pub fn decode_with(bytes: []u8, opts: Options) !Document {
 
 /// Decodes the value at the start of bytes (for a stream of values), and
 /// sets used to its length.
-pub fn decode_prefix(bytes: []u8, opts: Options, used: *mut usize) !Document {
+pub fn decode_prefix(bytes: []u8, opts: Options, used: *mut usize) MsgpackError!Document {
     let mut d = Decoder.{ s: bytes, i: 0, opts: opts, arena: arena.Arena.init() };
     let v = d.value(0) catch |e| {
         d.arena.deinit();
@@ -580,7 +582,7 @@ struct Decoder {
     opts: Options,
     arena: arena.Arena,
 
-    fn take(self: *mut Decoder, n: usize) ![]u8 {
+    fn take(self: *mut Decoder, n: usize) MsgpackError![]u8 {
         if n > (self.s.len - self.i) {
             return error.Truncated;
         }
@@ -589,7 +591,7 @@ struct Decoder {
         return b;
     }
 
-    fn uint_n(self: *mut Decoder, n: usize) !u64 {
+    fn uint_n(self: *mut Decoder, n: usize) MsgpackError!u64 {
         let b = self.take(n)!;
         let mut v: u64 = 0;
         for c in b {
@@ -599,7 +601,7 @@ struct Decoder {
     }
 
     // A length of n bytes.
-    fn len_n(self: *mut Decoder, n: usize) !usize {
+    fn len_n(self: *mut Decoder, n: usize) MsgpackError!usize {
         let v = self.uint_n(n)!;
         if v > @as(u64, self.s.len) {
             return error.Truncated;
@@ -607,7 +609,7 @@ struct Decoder {
         return @truncate(usize, v);
     }
 
-    fn string(self: *mut Decoder, n: usize) !Value {
+    fn string(self: *mut Decoder, n: usize) MsgpackError!Value {
         let b = self.take(n)!;
         if self.opts.check_utf8 and not strs.valid_utf8(b) {
             return error.Corrupt;
@@ -615,14 +617,14 @@ struct Decoder {
         return Value.Str(b);
     }
 
-    fn ext(self: *mut Decoder, n: usize) !Value {
+    fn ext(self: *mut Decoder, n: usize) MsgpackError!Value {
         let t = self.take(1)!;
         let d = self.take(n)!;
         return Value.Ext(Ext.{ kind: @bit_cast(i8, t[0]), data: d });
     }
 
     // One value; arrays and maps are read with an explicit stack.
-    fn value(self: *mut Decoder, depth0: u32) !Value {
+    fn value(self: *mut Decoder, depth0: u32) MsgpackError!Value {
         let mut frames = vec.Vec.[Frame].init();
         defer frames.deinit();
         let mut vals = vec.Vec.[Value].init();  // the elements of open arrays and maps
@@ -682,7 +684,7 @@ struct Decoder {
 
     // Reads one item: a scalar into v, or the header of an array or map
     // (its length into n).
-    fn item(self: *mut Decoder, v: *mut Value, n: *mut usize) !ItemKind {
+    fn item(self: *mut Decoder, v: *mut Value, n: *mut usize) MsgpackError!ItemKind {
         let b = self.take(1)![0];
         if b < 0x80 {
             v.* = Value.Int(@as(i64, b));
@@ -727,7 +729,7 @@ struct Decoder {
         return ItemKind.SCALAR;
     }
 
-    fn scalar(self: *mut Decoder, b: u8) !Value {
+    fn scalar(self: *mut Decoder, b: u8) MsgpackError!Value {
         match b {
             0xc0 => { return Value.Nil; }
             0xc2 => { return Value.Bool(false); }
@@ -1077,12 +1079,12 @@ test "writing and reading" {
     @trap();
 }
 
-fn fails(r: !Value) bool {
+fn fails(r: MsgpackError!Value) bool {
     _ = r catch return true;
     return false;
 }
 
-fn fails_doc(r: !Document) bool {
+fn fails_doc(r: MsgpackError!Document) bool {
     let mut d = r catch return true;
     d.deinit();
     return false;

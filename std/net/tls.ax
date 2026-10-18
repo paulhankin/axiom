@@ -51,23 +51,15 @@ import "../str.ax" as strs;
 import "../thread.ax" as thread;
 import "../time.ax" as time;
 
-error {
-    HandshakeFailure,
-    DecodeError,
-    UnexpectedMessage,
-    BadRecordMac,
-    RecordOverflow,
-    ProtocolVersion,
-    IllegalParameter,
-    AlertReceived,
-    BadCertificate,
-    Closed,
-    NoCertificate,
-    InvalidArgument,
-    TimedOut,
-    OutOfMemory,
-    Unsupported,
-}
+pub error TlsError { HandshakeFailure, DecodeError, UnexpectedMessage, BadRecordMac, RecordOverflow, ProtocolVersion,
+                     IllegalParameter, AlertReceived, BadCertificate, Closed, NoCertificate, InvalidArgument, TimedOut,
+                     OutOfMemory, Unsupported, IoError, ConnectionRefused, NotFound, RandomFailed, InvalidKey, Empty,
+                     InvalidPoint, InvalidCertificate, AuthFailed, AddressInUse, Done, InvalidLength, InvalidPem,
+                     InvalidAddress, InvalidUtf8, MessageTooLong, WeakKey, UnsupportedAlgorithm, NetError,
+                     DivisionByZero, UnknownAuthority, InvalidNumber, Expired, Overflow, NotYetValid, Negative,
+                     HostnameMismatch, NotInvertible, BadSignature, NoSpaceLeft, NotCA, IncompatibleUsage,
+                     NameConstraint, UnhandledCriticalExtension, PathTooLong, Corrupt, InvalidBase64, EndOfStream,
+                     UnexpectedTag }
 
 // Record content types
 const CT_CHANGE_CIPHER_SPEC: u8 = 20;
@@ -208,7 +200,7 @@ struct Cur {
     b: []u8,
     i: usize,
 
-    fn get8(self: *mut Cur) !u8 {
+    fn get8(self: *mut Cur) TlsError!u8 {
         if self.i >= self.b.len {
             return error.DecodeError;
         }
@@ -216,19 +208,19 @@ struct Cur {
         return self.b[self.i - 1];
     }
 
-    fn get16(self: *mut Cur) !u16 {
+    fn get16(self: *mut Cur) TlsError!u16 {
         let hi = self.get8()!;
         let lo = self.get8()!;
         return (@as(u16, hi) << 8) | @as(u16, lo);
     }
 
-    fn get24(self: *mut Cur) !usize {
+    fn get24(self: *mut Cur) TlsError!usize {
         let a = self.get8()!;
         let b = self.get16()!;
         return (@as(usize, a) << 16) | @as(usize, b);
     }
 
-    fn bytes(self: *mut Cur, n: usize) ![]u8 {
+    fn bytes(self: *mut Cur, n: usize) TlsError![]u8 {
         if n > (self.b.len - self.i) {
             return error.DecodeError;
         }
@@ -236,17 +228,17 @@ struct Cur {
         return self.b[self.i - n..self.i];
     }
 
-    fn vec8(self: *mut Cur) ![]u8 {
+    fn vec8(self: *mut Cur) TlsError![]u8 {
         let n = @as(usize, self.get8()!);
         return self.bytes(n);
     }
 
-    fn vec16(self: *mut Cur) ![]u8 {
+    fn vec16(self: *mut Cur) TlsError![]u8 {
         let n = @as(usize, self.get16()!);
         return self.bytes(n);
     }
 
-    fn vec24(self: *mut Cur) ![]u8 {
+    fn vec24(self: *mut Cur) TlsError![]u8 {
         let n = self.get24()!;
         return self.bytes(n);
     }
@@ -264,27 +256,27 @@ fn cur(b: []u8) Cur {
 struct Out {
     s: strs.String,
 
-    fn put8(self: *mut Out, v: u8) !void {
+    fn put8(self: *mut Out, v: u8) TlsError!void {
         self.s.push(v)!;
     }
 
-    fn put16(self: *mut Out, v: u16) !void {
+    fn put16(self: *mut Out, v: u16) TlsError!void {
         self.s.push(@truncate(u8, v >> 8))!;
         self.s.push(@truncate(u8, v))!;
     }
 
-    fn put24(self: *mut Out, v: usize) !void {
+    fn put24(self: *mut Out, v: usize) TlsError!void {
         self.s.push(@truncate(u8, v >> 16))!;
         self.s.push(@truncate(u8, v >> 8))!;
         self.s.push(@truncate(u8, v))!;
     }
 
-    fn put(self: *mut Out, b: []u8) !void {
+    fn put(self: *mut Out, b: []u8) TlsError!void {
         self.s.push_str(b)!;
     }
 
     /// Starts a vector with an n-byte length; finish it with close.
-    fn open(self: *mut Out, n: usize) !usize {
+    fn open(self: *mut Out, n: usize) TlsError!usize {
         let at = self.s.len;
         for i in 0..n {
             self.s.push(0)!;
@@ -321,7 +313,7 @@ struct Suite {
     ecdsa: bool,  // (TLS 1.2) the certificate's key: ECDSA or Ed25519, else RSA
 }
 
-fn suite_of(id: u16) !Suite {
+fn suite_of(id: u16) TlsError!Suite {
     let mut s = Suite.{ id: id, hash: sha2.Algorithm.SHA256, key_len: 32, v12: false, ecdsa: false };
     if id == TLS_CHACHA20_POLY1305_SHA256 {
         return s;
@@ -410,7 +402,7 @@ struct Cipher {
     }
 
     /// Keys from a traffic secret.
-    fn set(self: *mut Cipher, s: Suite, secret: []u8) !void {
+    fn set(self: *mut Cipher, s: Suite, secret: []u8) TlsError!void {
         self.suite = s.id;
         self.active = true;
         self.seq = 0;
@@ -424,7 +416,7 @@ struct Cipher {
 
     /// TLS 1.2 keys: the write key and IV (a 4-byte salt for AES-GCM, 12
     /// bytes for ChaCha20-Poly1305).
-    fn set12(self: *mut Cipher, s: Suite, key: []u8, iv: []u8) !void {
+    fn set12(self: *mut Cipher, s: Suite, key: []u8, iv: []u8) TlsError!void {
         self.suite = s.id;
         self.active = true;
         self.seq = 0;
@@ -452,7 +444,7 @@ struct Cipher {
     /// Seals a TLS 1.2 record's content into sealed: the explicit nonce
     /// (the sequence number), ciphertext and tag for AES-GCM, ciphertext
     /// and tag for ChaCha20-Poly1305 (RFC 7905). Returns the length.
-    fn seal12(self: *mut Cipher, ty: u8, plain: []u8, sealed: []mut u8) !usize {
+    fn seal12(self: *mut Cipher, ty: u8, plain: []u8, sealed: []mut u8) TlsError!usize {
         let mut aad: [13]u8 = [0; 13];
         self.aad12(ty, plain.len, aad[..]);
         let mut n: [12]u8 = [0; 12];
@@ -471,7 +463,7 @@ struct Cipher {
     }
 
     /// Opens a TLS 1.2 record's fragment into plain; returns its length.
-    fn open12(self: *mut Cipher, ty: u8, body: []u8, plain: []mut u8) !usize {
+    fn open12(self: *mut Cipher, ty: u8, body: []u8, plain: []mut u8) TlsError!usize {
         let mut overhead: usize = 24;
         if is_chacha(self.suite) {
             overhead = 16;
@@ -502,7 +494,7 @@ struct Cipher {
         }
     }
 
-    fn seal(self: *mut Cipher, aad: []u8, plain: []u8, sealed: []mut u8) !void {
+    fn seal(self: *mut Cipher, aad: []u8, plain: []u8, sealed: []mut u8) TlsError!void {
         let mut n: [12]u8 = [0; 12];
         self.nonce(n[..]);
         if is_chacha(self.suite) {
@@ -513,7 +505,7 @@ struct Cipher {
         self.seq += 1;
     }
 
-    fn open(self: *mut Cipher, aad: []u8, sealed: []u8, plain: []mut u8) !void {
+    fn open(self: *mut Cipher, aad: []u8, sealed: []u8, plain: []mut u8) TlsError!void {
         let mut n: [12]u8 = [0; 12];
         self.nonce(n[..]);
         if is_chacha(self.suite) {
@@ -540,7 +532,7 @@ struct Transcript {
         self.pending.deinit();
     }
 
-    fn add(self: *mut Transcript, msg: []u8) !void {
+    fn add(self: *mut Transcript, msg: []u8) TlsError!void {
         if self.started {
             self.h.update(msg);
         } else {
@@ -575,7 +567,7 @@ pub struct ClientConfig {
     max_version: u16,  // VERSION_1_3 (the default) or VERSION_1_2
 
     /// Trusts the operating system's root certificates.
-    pub fn system() !ClientConfig {
+    pub fn system() TlsError!ClientConfig {
         let mut c = ClientConfig.{ roots: x509.CertPool.init(), verify: true, alpn: no_protocols(),
                                    min_version: VERSION_1_2, max_version: VERSION_1_3 };
         _ = c.roots.load_system() catch |e| {
@@ -586,7 +578,7 @@ pub struct ClientConfig {
     }
 
     /// Trusts the certificates of a PEM text only.
-    pub fn with_roots_pem(pem: []u8) !ClientConfig {
+    pub fn with_roots_pem(pem: []u8) TlsError!ClientConfig {
         let mut c = ClientConfig.{ roots: x509.CertPool.init(), verify: true, alpn: no_protocols(),
                                    min_version: VERSION_1_2, max_version: VERSION_1_3 };
         _ = c.roots.add_pem(pem) catch |e| {
@@ -621,7 +613,7 @@ pub struct ServerConfig {
     min_version: u16,  // VERSION_1_2 (the default): TLS 1.2 clients are served too; or VERSION_1_3
 
     /// From PEM texts: the certificates (leaf first) and the private key.
-    pub fn from_pem(cert_pem: []u8, key_pem: []u8) !ServerConfig {
+    pub fn from_pem(cert_pem: []u8, key_pem: []u8) TlsError!ServerConfig {
         let mut chain = vec.Vec.[[]mut u8].init();
         let mut it = x509.pem_blocks(cert_pem);
         loop {
@@ -834,7 +826,7 @@ pub struct Conn {
     }
 
     /// Reads bytes until inbuf holds at least n.
-    fn fill(self: *mut Conn, n: usize) !void {
+    fn fill(self: *mut Conn, n: usize) TlsError!void {
         while self.inlen < n {
             // (a peer dripping a byte at a time must not hold a handshake open)
             if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
@@ -1087,7 +1079,7 @@ pub struct Conn {
         self.rd.set(self.suite, secret)!;
     }
 
-    fn update_read_key(self: *mut Conn) !void {
+    fn update_read_key(self: *mut Conn) TlsError!void {
         let n = sha2.digest_size(self.suite.hash);
         let mut next: [48]u8 = [0; 48];
         expand_label(self.suite.hash, self.secret_rd[..n], "traffic upd", "", next[..n]);
@@ -1095,7 +1087,7 @@ pub struct Conn {
         self.rd.set(self.suite, self.secret_rd[..n])!;
     }
 
-    fn update_write_key(self: *mut Conn) !void {
+    fn update_write_key(self: *mut Conn) TlsError!void {
         let n = sha2.digest_size(self.suite.hash);
         let mut next: [48]u8 = [0; 48];
         expand_label(self.suite.hash, self.secret_wr[..n], "traffic upd", "", next[..n]);
@@ -1116,15 +1108,15 @@ pub struct Conn {
 
 fn conn_read(ctx: *mut void, buf: []mut u8) !usize {
     let c = @ptr_cast(*mut Conn, ctx);
-    return c.read(buf);
+    return c.read(buf)!;
 }
 
 fn conn_write(ctx: *mut void, bytes: []u8) !usize {
     let c = @ptr_cast(*mut Conn, ctx);
-    return c.write(bytes);
+    return c.write(bytes)!;
 }
 
-fn new_conn(stream: net.TcpStream, is_client: bool) !*mut Conn {
+fn new_conn(stream: net.TcpStream, is_client: bool) TlsError!*mut Conn {
     // most fields are buffers: start from zeros
     let p = mem.new_zeroed.[Conn]()!;
     p.stream = stream;
@@ -1148,14 +1140,14 @@ struct Shares {
     p256_pub: [65]u8,
 }
 
-fn make_shares() !Shares {
+fn make_shares() TlsError!Shares {
     let mut s = Shares.{ x25519: curve25519.x25519_keypair()!, p256: ec.P256.generate()!, p256_pub: [0; 65] };
     s.p256.public_key(s.p256_pub[..]);
     return s;
 }
 
 /// The shared secret with the peer's share in `group`.
-fn agree(s: *Shares, group: u16, peer: []u8, out_buf: []mut u8) ![]u8 {
+fn agree(s: *Shares, group: u16, peer: []u8, out_buf: []mut u8) TlsError![]u8 {
     if group == GROUP_X25519 {
         if peer.len != 32 {
             return error.IllegalParameter;
@@ -1240,7 +1232,7 @@ fn if_u8(b: bool) u8 {
 }
 
 /// Signs content with the server key; returns the scheme and signature.
-fn sign_content(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u8, scheme: *mut u16) ![]u8 {
+fn sign_content(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u8, scheme: *mut u16) TlsError![]u8 {
     match cfg.key {
         .Ed25519(k) => {
             if not scheme_offered(schemes, SIG_ED25519) {
@@ -1338,7 +1330,7 @@ fn is_ip(sni: []u8) bool {
 }
 
 fn client_hello(c: *mut Conn, cfg: *ClientConfig, shares: *Shares, random_bytes: []u8, session_id: []u8,
-                only_group: u16, cookie: []u8) !Out {
+                only_group: u16, cookie: []u8) TlsError!Out {
     let mut o = out();
     o.put8(HS_CLIENT_HELLO)!;
     let body = o.open(3)!;
@@ -1475,7 +1467,7 @@ struct ServerHello {
     alpn: []u8,  // (TLS 1.2) the ALPN extension's data
 }
 
-fn parse_server_hello(msg: []u8) !ServerHello {
+fn parse_server_hello(msg: []u8) TlsError!ServerHello {
     let mut r = cur(msg[4..]);
     let mut sh = ServerHello.{ hrr: false, suite: 0, version: 0, group: 0, share: "", cookie: "", session_id: "",
                                random: "", ems: false, has_reneg: false, reneg_ok: false, alpn: "" };
@@ -1812,7 +1804,7 @@ struct Eph {
     public_len: usize,
 }
 
-fn eph_new(group: u16) !Eph {
+fn eph_new(group: u16) TlsError!Eph {
     let mut one: [48]u8 = [0; 48];
     one[47] = 1;
     let mut e = Eph.{ group: group, x: curve25519.X25519Keypair.{ secret: [0; 32], public: [0; 32] },
@@ -1837,7 +1829,7 @@ fn eph_new(group: u16) !Eph {
 }
 
 /// The premaster secret with the peer's public point.
-fn eph_agree(e: *Eph, peer: []u8, out_buf: []mut u8) ![]u8 {
+fn eph_agree(e: *Eph, peer: []u8, out_buf: []mut u8) TlsError![]u8 {
     if e.group == GROUP_X25519 {
         if peer.len != 32 {
             return error.IllegalParameter;
@@ -1869,7 +1861,7 @@ fn master12(hash: sha2.Algorithm, pms: []u8, ems: bool, session_hash: []u8, cr: 
 
 /// The record keys from the master secret: the client's write cipher in
 /// cw, the server's in sw.
-fn keys12(s: Suite, master: []u8, cr: []u8, sr: []u8, cw: *mut Cipher, sw: *mut Cipher) !void {
+fn keys12(s: Suite, master: []u8, cr: []u8, sr: []u8, cw: *mut Cipher, sw: *mut Cipher) TlsError!void {
     let mut seed: [64]u8 = [0; 64];
     @mem_copy(seed[..32], sr);
     @mem_copy(seed[32..], cr);
@@ -1943,7 +1935,7 @@ fn check_signature12(key: *x509.PublicKey, scheme: u16, content: []u8, sig: []u8
 
 /// Signs a ServerKeyExchange: as sign_content, or with PKCS #1 v1.5 for an
 /// RSA key when the client does not offer PSS.
-fn sign_content12(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u8, scheme: *mut u16) ![]u8 {
+fn sign_content12(cfg: *ServerConfig, schemes: []u8, content: []u8, sig: []mut u8, scheme: *mut u16) TlsError![]u8 {
     match cfg.key {
         .Rsa(k) => {
             if not scheme_offered(schemes, SIG_RSA_PSS_SHA256) and scheme_offered(schemes, SIG_RSA_PKCS1_SHA256) {
@@ -2275,7 +2267,7 @@ pub fn server(stream: net.TcpStream, cfg: *ServerConfig) !*mut Conn {
 /// it), `msg` being the message with its 4-byte header. Fails as the
 /// handshake would on a malformed message. For tests and the fuzzer: no
 /// connection is involved.
-pub fn parse_hello(msg: []u8) !void {
+pub fn parse_hello(msg: []u8) TlsError!void {
     if msg.len < 4 {
         return error.DecodeError;
     }
@@ -2318,7 +2310,7 @@ struct Hello {
     cookie: []u8,
 }
 
-fn parse_client_hello(c: *mut Conn, msg: []u8) !Hello {
+fn parse_client_hello(c: *mut Conn, msg: []u8) TlsError!Hello {
     let mut h = Hello.{ session_id: "", suite: 0, tls13: false, legacy_version: 0, random: "", suites: "",
                         wants_p384: false, ems: false, reneg: false, point_formats: false, fallback: false, group: 0,
                         share: "", wants_x25519: false, wants_p256: false, schemes: "", alpn: "", cookie: "" };
@@ -2420,7 +2412,7 @@ fn parse_client_hello(c: *mut Conn, msg: []u8) !Hello {
     return h;
 }
 
-fn server_hello(sid: []u8, suite: u16, hrr: bool, group: u16, share: []u8) !Out {
+fn server_hello(sid: []u8, suite: u16, hrr: bool, group: u16, share: []u8) TlsError!Out {
     let mut o = out();
     o.put8(HS_SERVER_HELLO)!;
     let body = o.open(3)!;
@@ -2656,23 +2648,23 @@ let TEST_KEY: [5][]u8 = [
     "-----END PRIVATE KEY-----\n",
 ];
 
-fn join(lines: [][]u8) ![]mut u8 {
+fn join(lines: [][]u8) TlsError![]mut u8 {
     let mut s = strs.String.init();
     for l in lines {
         s.push_str(l)!;
     }
-    return s.take();
+    return s.take()!;
 }
 
 /// A self-signed P-256 certificate for localhost and 127.0.0.1, as PEM (free
 /// it with mem.free). Its private key (test_key_pem) is published here, so
 /// it is for tests only.
-pub fn test_certificate_pem() ![]mut u8 {
+pub fn test_certificate_pem() TlsError![]mut u8 {
     return join(TEST_CERT[..]);
 }
 
 /// The private key of test_certificate_pem, as PEM (free it with mem.free).
-pub fn test_key_pem() ![]mut u8 {
+pub fn test_key_pem() TlsError![]mut u8 {
     return join(TEST_KEY[..]);
 }
 
@@ -2821,7 +2813,7 @@ let TEST_RSA_KEY: [28][]u8 = [
     "-----END PRIVATE KEY-----\n",
 ];
 
-fn serve_once_with(cfg: *ServerConfig, port_out: *mut u16) !TestServer {
+fn serve_once_with(cfg: *ServerConfig, port_out: *mut u16) TlsError!TestServer {
     let ts = TestServer.{ listener: net.listen("127.0.0.1", 0)!, cfg: cfg, failures: 0 };
     port_out.* = ts.listener.port();
     return ts;

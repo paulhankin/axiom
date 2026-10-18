@@ -29,7 +29,8 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../str.ax" as strs;
 
-error { NotFound, Done, InvalidMultipart, InvalidEncoding, InvalidArgument, OutOfMemory, Unavailable }
+pub error MimeError { NotFound, Done, InvalidMultipart, InvalidEncoding, InvalidArgument, OutOfMemory, Unavailable,
+                      InvalidUtf8, IoError, RandomFailed }
 
 // -----------------------------------------------------------------------------
 // Media types
@@ -109,7 +110,7 @@ pub fn type_by_extension(ext0: []u8) []u8 {
 }
 
 /// The usual extension (without the dot) for a media type.
-pub fn extension_by_type(t: []u8) ![]u8 {
+pub fn extension_by_type(t: []u8) MimeError![]u8 {
     let essence = parse_media_type(t).essence;
     for e in TYPES {
         if strs.eq_ignore_case(parse_media_type(e[1]).essence, essence) {
@@ -148,7 +149,7 @@ fn is_token_char(c: u8) bool {
 /// `form-data; name="field"; filename*=UTF-8''na%C3%AFve.txt` (free it with
 /// mem.free): quoted strings are unescaped, and the RFC 2231 `name*` form
 /// (UTF-8 or US-ASCII) is decoded and preferred.
-pub fn param_alloc(h: []u8, name: []u8) ![]mut u8 {
+pub fn param_alloc(h: []u8, name: []u8) MimeError![]mut u8 {
     let mut plain = NO_RANGE;
     let mut ext = NO_RANGE;
     let mut i = strs.index_of_byte(h, ';') catch return error.NotFound;
@@ -222,7 +223,7 @@ struct Range {
 
 let NO_RANGE: Range = Range.{ start: @max_value(usize), end: 0 };
 
-fn unquote(v: []u8) ![]mut u8 {
+fn unquote(v: []u8) MimeError![]mut u8 {
     let mut s = strs.String.init();
     if (v.len >= 2) and (v[0] == '"') and (v[v.len - 1] == '"') {
         let mut i: usize = 1;
@@ -242,11 +243,11 @@ fn unquote(v: []u8) ![]mut u8 {
             return e;
         };
     }
-    return s.take();
+    return s.take()!;
 }
 
 // charset'language'percent-encoded
-fn decode_ext_value(v: []u8) ![]mut u8 {
+fn decode_ext_value(v: []u8) MimeError![]mut u8 {
     let q1 = strs.index_of_byte(v, '\'') catch return error.InvalidEncoding;
     let q2 = strs.index_of_from(v, "'", q1 + 1) catch return error.InvalidEncoding;
     let cs = v[..q1];
@@ -295,7 +296,7 @@ fn hexv(c: u8) u8 {
 
 /// The value of header `name` in a block of "Name: value" lines (CRLF or
 /// LF), trimmed; the first one if repeated.
-pub fn header(block: []u8, name: []u8) ![]u8 {
+pub fn header(block: []u8, name: []u8) MimeError![]u8 {
     let mut i: usize = 0;
     while i < block.len {
         let nl = strs.index_of_from(block, "\n", i) catch block.len;
@@ -317,7 +318,7 @@ pub fn header(block: []u8, name: []u8) ![]u8 {
 // -----------------------------------------------------------------------------
 
 /// Decodes quoted-printable text (free it with mem.free).
-pub fn qp_decode_alloc(text: []u8) ![]mut u8 {
+pub fn qp_decode_alloc(text: []u8) MimeError![]mut u8 {
     let out = mem.alloc.[u8](text.len)!;
     let mut o: usize = 0;
     let mut i: usize = 0;
@@ -361,16 +362,16 @@ pub fn qp_decode_alloc(text: []u8) ![]mut u8 {
 
 /// Encodes data as quoted-printable, lines of at most 76 characters, with
 /// the data's line breaks as CRLF (free it with mem.free).
-pub fn qp_encode_alloc(data: []u8) ![]mut u8 {
+pub fn qp_encode_alloc(data: []u8) MimeError![]mut u8 {
     let mut s = strs.String.init();
     qp_encode_into(&mut s, data) catch |e| {
         s.deinit();
         return e;
     };
-    return s.take();
+    return s.take()!;
 }
 
-fn qp_encode_into(s: *mut strs.String, data: []u8) !void {
+fn qp_encode_into(s: *mut strs.String, data: []u8) MimeError!void {
     let digits = "0123456789ABCDEF";
     let mut col: usize = 0;
     let mut i: usize = 0;
@@ -417,12 +418,12 @@ pub struct Part {
     body: []u8,
 
     /// A header of the part (see header()).
-    pub fn header(self: *Part, name: []u8) ![]u8 {
+    pub fn header(self: *Part, name: []u8) MimeError![]u8 {
         return header(self.headers, name);
     }
 
     /// A parameter of one of the part's headers (see param_alloc()).
-    pub fn param_alloc(self: *Part, header_name: []u8, name: []u8) ![]mut u8 {
+    pub fn param_alloc(self: *Part, header_name: []u8, name: []u8) MimeError![]mut u8 {
         return param_alloc(header(self.headers, header_name)!, name);
     }
 }
@@ -436,7 +437,7 @@ pub struct Multipart {
     started: bool,
     done: bool,
 
-    pub fn init(data: []u8, boundary: []u8) !Multipart {
+    pub fn init(data: []u8, boundary: []u8) MimeError!Multipart {
         if (boundary.len == 0) or (boundary.len > 70) {
             return error.InvalidMultipart;
         }
@@ -450,7 +451,7 @@ pub struct Multipart {
 
     // The next delimiter line at or after `from` (at the start of the data
     // or after a line break).
-    fn find(self: *Multipart, from: usize) !usize {
+    fn find(self: *Multipart, from: usize) MimeError!usize {
         let d = self.delim[..self.dlen];
         let mut i = from;
         loop {
@@ -477,7 +478,7 @@ pub struct Multipart {
     }
 
     /// The next part, or Done after the last.
-    pub fn next(self: *mut Multipart) !Part {
+    pub fn next(self: *mut Multipart) MimeError!Part {
         if self.done {
             return error.Done;
         }
@@ -542,7 +543,7 @@ pub struct MultipartWriter {
     boundary: [32]u8,
 
     /// A writer that keeps the body in memory.
-    pub fn init() !MultipartWriter {
+    pub fn init() MimeError!MultipartWriter {
         let mut w = MultipartWriter.{ out: strs.String.init(), sink: io.discard(), streaming: false, parts: 0,
                                       boundary: [0; 32] };
         let mut r: [12]u8 = [0; 12];
@@ -558,7 +559,7 @@ pub struct MultipartWriter {
 
     /// A writer that writes each part to `out` as it is added; end the body
     /// with finish_to(out). Nothing but a part's headers is held in memory.
-    pub fn init_to(out: io.Writer) !MultipartWriter {
+    pub fn init_to(out: io.Writer) MimeError!MultipartWriter {
         let mut w = MultipartWriter.init()!;
         w.sink = out;
         w.streaming = true;
@@ -574,7 +575,7 @@ pub struct MultipartWriter {
     }
 
     /// "multipart/form-data; boundary=..." (free it with mem.free).
-    pub fn content_type_alloc(self: *MultipartWriter) ![]mut u8 {
+    pub fn content_type_alloc(self: *MultipartWriter) MimeError![]mut u8 {
         let mut s = strs.String.init();
         s.push_str("multipart/form-data; boundary=") catch |e| {
             s.deinit();
@@ -584,7 +585,7 @@ pub struct MultipartWriter {
             s.deinit();
             return e;
         };
-        return s.take();
+        return s.take()!;
     }
 
     /// A part with raw header lines (each ending in CRLF) and a body.
@@ -647,13 +648,13 @@ pub struct MultipartWriter {
 
     /// Ends the body and hands it over (free it with mem.free). Only for a
     /// writer made with init (InvalidArgument otherwise: use finish_to).
-    pub fn finish(self: *mut MultipartWriter) ![]mut u8 {
+    pub fn finish(self: *mut MultipartWriter) MimeError![]mut u8 {
         if self.streaming {
             return error.InvalidArgument;
         }
         let mut tail: [40]u8 = [0; 40];
         self.out.push_str(self.tail(tail[..]))!;
-        return self.out.take();
+        return self.out.take()!;
     }
 
     /// Ends the body, writing to w what is left of it: for a writer made
@@ -686,7 +687,7 @@ pub struct MultipartWriter {
 }
 
 // Names in form-data: " and line breaks percent-encoded, as browsers do.
-fn push_escaped(s: *mut strs.String, v: []u8) !void {
+fn push_escaped(s: *mut strs.String, v: []u8) MimeError!void {
     for c in v {
         if c == '"' {
             s.push_str("%22")!;
@@ -726,7 +727,7 @@ test "media types and parameters" {
     @expect_eq(b, "----WebKitFormBoundary7MA4YWxkTrZu0gW");
 }
 
-fn missing(r: ![]mut u8) bool {
+fn missing(r: MimeError![]mut u8) bool {
     _ = r catch return true;
     return false;
 }
@@ -854,13 +855,13 @@ test "multipart writing to an io.Writer" {
     @trap();
 }
 
-fn done_or_ok_bytes(r: ![]mut u8) bool {
+fn done_or_ok_bytes(r: MimeError![]mut u8) bool {
     let b = r catch return false;
     mem.free(b);
     return true;
 }
 
-fn done(r: !Part) bool {
+fn done(r: MimeError!Part) bool {
     _ = r catch |e| {
         return e == error.Done;
     };

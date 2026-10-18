@@ -274,6 +274,13 @@ has not been audited: review it before relying on it.
   device that was removed or reset is `DeviceLost`. A generic `Failed` is a last
   resort, for a system call that failed without saying why: name the cause wherever
   the system reports one (`com.check` classifies an HRESULT this way).
+- **Error sets.** A module that can fail declares one named error set (spec §11.3),
+  named for the module (`FsError`, `JsonError`, `PngError`; the allocator's is
+  `mem.AllocError`), holding its own errors and those it can pass on, and its functions
+  return `FsError!T`, so callers can `match` every case. A function that can pass on an
+  error of no set (from an `io.Reader` or `io.Writer`, a callback, or a function that
+  itself returns `!T`) returns `!T`. Error unions do not widen by themselves: return a
+  set-typed call from a `!T` function as `return f()!;`.
 - **Ownership is explicit.** A type that owns memory has `deinit`; new code does not
   add `release` or `destroy` for the same thing. A function whose result the caller
   frees says so in its doc comment ("free with mem.free"); an `_alloc` suffix marks the

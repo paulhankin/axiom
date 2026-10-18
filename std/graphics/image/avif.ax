@@ -19,7 +19,9 @@ import "../image.ax" as image;
 import "internal/av1/decode.ax" as av1;
 import "internal/av1/obu.ax" as obu;
 
-error { Corrupt, Unsupported, OutOfMemory }
+pub error AvifError { Corrupt, Unsupported, OutOfMemory, ChecksumMismatch, NotFound, TooLarge, Empty, IoError,
+                      PermissionDenied, Truncated, Exists, Done, NotADirectory, InvalidUtf8, IsDirectory, NotEmpty,
+                      BadPattern }
 
 /// Whether data looks like an AVIF file (an ISOBMFF file of the avif or avis
 /// brands).
@@ -58,7 +60,7 @@ struct Box {
 }
 
 // the box at data[o..end]
-fn read_box(d: []u8, o: usize, end: usize) !Box {
+fn read_box(d: []u8, o: usize, end: usize) AvifError!Box {
     if (o + 8) > end {
         return error.Corrupt;
     }
@@ -129,7 +131,7 @@ struct File {
         self.dimg_to.deinit();
     }
 
-    fn find(self: *File, id: u32) !usize {
+    fn find(self: *File, id: u32) AvifError!usize {
         let its = self.items.items();
         for i in @as(usize, 0)..its.len {
             if its[i].id == id {
@@ -139,7 +141,7 @@ struct File {
         return error.Corrupt;
     }
 
-    fn prop(self: *File, it: *Item, t: []u8) ![]u8 {
+    fn prop(self: *File, it: *Item, t: []u8) AvifError![]u8 {
         let ps = self.props.items();
         for k in @as(usize, 0)..it.n_props {
             let idx = @as(usize, it.props[k]);
@@ -151,7 +153,7 @@ struct File {
     }
 }
 
-fn parse(data: []u8) !File {
+fn parse(data: []u8) AvifError!File {
     let mut f = File.{ data: data, primary: 0, items: vec.Vec.[Item].init(), extents: vec.Vec.[Extent].init(),
                        props: vec.Vec.[Prop].init(), dimg_from: vec.Vec.[u32].init(), dimg_to: vec.Vec.[u32].init(),
                        idat: data[..0] };
@@ -162,7 +164,7 @@ fn parse(data: []u8) !File {
     return f;
 }
 
-fn parse_boxes(f: *mut File, data: []u8) !void {
+fn parse_boxes(f: *mut File, data: []u8) AvifError!void {
     let mut o: usize = 0;
     let mut have_meta = false;
     while o < data.len {
@@ -178,7 +180,7 @@ fn parse_boxes(f: *mut File, data: []u8) !void {
     }
 }
 
-fn parse_meta(f: *mut File, m: []u8) !void {
+fn parse_meta(f: *mut File, m: []u8) AvifError!void {
     if m.len < 4 {
         return error.Corrupt;
     }
@@ -222,7 +224,7 @@ fn parse_meta(f: *mut File, m: []u8) !void {
     }
 }
 
-fn parse_iinf(f: *mut File, b: []u8) !void {
+fn parse_iinf(f: *mut File, b: []u8) AvifError!void {
     if b.len < 6 {
         return error.Corrupt;
     }
@@ -258,7 +260,7 @@ fn parse_iinf(f: *mut File, b: []u8) !void {
     }
 }
 
-fn parse_iloc(f: *mut File, b: []u8) !void {
+fn parse_iloc(f: *mut File, b: []u8) AvifError!void {
     if b.len < 8 {
         return error.Corrupt;
     }
@@ -334,7 +336,7 @@ fn parse_iloc(f: *mut File, b: []u8) !void {
     }
 }
 
-fn parse_iprp(f: *mut File, b: []u8) !void {
+fn parse_iprp(f: *mut File, b: []u8) AvifError!void {
     let mut o: usize = 0;
     while o < b.len {
         let x = read_box(b, o, b.len)!;
@@ -401,7 +403,7 @@ fn parse_iprp(f: *mut File, b: []u8) !void {
     }
 }
 
-fn parse_iref(f: *mut File, b: []u8) !void {
+fn parse_iref(f: *mut File, b: []u8) AvifError!void {
     if b.len < 4 {
         return error.Corrupt;
     }
@@ -442,7 +444,7 @@ fn parse_iref(f: *mut File, b: []u8) !void {
 }
 
 // an item's data (freed by the caller)
-fn item_data(f: *File, it: *Item, prefix: []u8) ![]mut u8 {
+fn item_data(f: *File, it: *Item, prefix: []u8) AvifError![]mut u8 {
     let ex = f.extents.items();
     let mut total = prefix.len;
     let mut src = f.data;
@@ -483,7 +485,7 @@ fn item_data(f: *File, it: *Item, prefix: []u8) ![]mut u8 {
 }
 
 // the AV1 planes of an av01 item
-fn decode_item(f: *File, it: *Item) !av1.Frame {
+fn decode_item(f: *File, it: *Item) AvifError!av1.Frame {
     if not @mem_eq(it.typ[..], "av01") {
         return error.Unsupported;
     }
@@ -496,7 +498,7 @@ fn decode_item(f: *File, it: *Item) !av1.Frame {
     }
     let data = item_data(f, it, cfg)!;
     defer mem.free(data);
-    return av1.decode(data);
+    return av1.decode(data)!;
 }
 
 // -----------------------------------------------------------------------------
@@ -681,7 +683,7 @@ struct Grid {
     height: usize,
 }
 
-fn read_grid(f: *File, it: *Item) !Grid {
+fn read_grid(f: *File, it: *Item) AvifError!Grid {
     let d = item_data(f, it, f.data[..0])!;
     defer mem.free(d);
     if d.len < 8 {
@@ -702,7 +704,7 @@ fn read_grid(f: *File, it: *Item) !Grid {
 }
 
 // the ids of a grid's tiles
-fn tiles(f: *File, id: u32, out: *mut vec.Vec.[u32]) !void {
+fn tiles(f: *File, id: u32, out: *mut vec.Vec.[u32]) AvifError!void {
     let fr = f.dimg_from.items();
     let to = f.dimg_to.items();
     for k in @as(usize, 0)..fr.len {
@@ -714,7 +716,7 @@ fn tiles(f: *File, id: u32, out: *mut vec.Vec.[u32]) !void {
 
 // draws an item (a grid of tiles, which are put together first, or an
 // image) as the colour or the alpha of img
-fn draw_item(f: *File, it: *Item, img: *mut image.Image, alpha: bool) !void {
+fn draw_item(f: *File, it: *Item, img: *mut image.Image, alpha: bool) AvifError!void {
     if not @mem_eq(it.typ[..], "grid") {
         let mut p = decode_item(f, it)!;
         defer p.deinit();
@@ -799,7 +801,7 @@ struct Info {
     mono: bool,
 }
 
-fn info_of(f: *File, it: *Item) !Info {
+fn info_of(f: *File, it: *Item) AvifError!Info {
     let mut tile = it.*;
     let mut gw: usize = 0;
     let mut gh: usize = 0;
@@ -845,7 +847,7 @@ fn info_of(f: *File, it: *Item) !Info {
 
 /// Decodes an AVIF file's primary image: gray, gray + alpha, RGB or RGBA; U8
 /// for 8-bit images, else U16.
-pub fn decode(data: []u8) !image.Image {
+pub fn decode(data: []u8) AvifError!image.Image {
     let mut f = parse(data)!;
     defer f.deinit();
     let pi = f.find(f.primary)!;
@@ -895,7 +897,7 @@ pub fn decode(data: []u8) !image.Image {
     return transform(&f, &prim, img);
 }
 
-fn draw(f: *File, prim: *Item, alpha_i: usize, img: *mut image.Image) !void {
+fn draw(f: *File, prim: *Item, alpha_i: usize, img: *mut image.Image) AvifError!void {
     let ch = img.channels;
     if alpha_i != 0xffffffff {
         // opaque until drawn
@@ -915,7 +917,7 @@ fn min_len(a: usize, b: usize) usize {
 }
 
 // applies the clean aperture, rotation and mirroring properties in order
-fn transform(f: *File, it: *Item, img0: image.Image) !image.Image {
+fn transform(f: *File, it: *Item, img0: image.Image) AvifError!image.Image {
     let mut img = img0;
     let ps = f.props.items();
     for k in @as(usize, 0)..it.n_props {
@@ -944,7 +946,7 @@ fn transform(f: *File, it: *Item, img0: image.Image) !image.Image {
     return img;
 }
 
-fn rotate_ccw(img: *image.Image) !image.Image {
+fn rotate_ccw(img: *image.Image) AvifError!image.Image {
     let mut out = image.Image.init(img.height, img.width, img.channels, img.depth)!;
     let bps = image.bytes_per_sample(img.depth) * img.channels;
     for y in @as(usize, 0)..img.height {
@@ -976,14 +978,14 @@ fn mirror(img: *mut image.Image, vertical_flip: bool) void {
     }
 }
 
-fn sdiv(n: u32, d: u32) !i64 {
+fn sdiv(n: u32, d: u32) AvifError!i64 {
     if d == 0 {
         return error.Corrupt;
     }
     return @as(i64, @bit_cast(i32, n)) / @as(i64, d);
 }
 
-fn clap(img: *image.Image, b: []u8) !image.Image {
+fn clap(img: *image.Image, b: []u8) AvifError!image.Image {
     let cw = sdiv(binary.u32_be(b[0..]), binary.u32_be(b[4..]))!;
     let chh = sdiv(binary.u32_be(b[8..]), binary.u32_be(b[12..]))!;
     // the offsets of the centre, as fractions (n / d)
@@ -1003,12 +1005,12 @@ fn clap(img: *image.Image, b: []u8) !image.Image {
         return error.Corrupt;
     }
     return img.crop(@truncate(usize, @bit_cast(u64, left)), @truncate(usize, @bit_cast(u64, top)),
-                    @truncate(usize, @bit_cast(u64, cw)), @truncate(usize, @bit_cast(u64, chh)));
+                    @truncate(usize, @bit_cast(u64, cw)), @truncate(usize, @bit_cast(u64, chh)))!;
 }
 
 /// Decodes the primary image's AV1 planes exactly (not for grids): Y, U and
 /// V (8-bit samples stored in u16s), with their sizes and colour description.
-pub fn decode_yuv(data: []u8) !av1.Frame {
+pub fn decode_yuv(data: []u8) AvifError!av1.Frame {
     let mut f = parse(data)!;
     defer f.deinit();
     let pi = f.find(f.primary)!;
