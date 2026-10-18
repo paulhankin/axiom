@@ -399,7 +399,7 @@ The American English hyphenation patterns and exceptions are from the hyph-utf8 
 (TeX's ushyphmax: Donald Knuth's patterns with Gerard D.C. Kuiken's additions); their
 copyright and permission notice is at the top of the file.
 
-### HTML named character references (CC BY 4.0): `std/text/html/entities.ax`
+### HTML named character references (CC BY 4.0): `std/text/internal/html/entities.ax`
 
 The table of named character references is from the WHATWG HTML Living Standard,
 Copyright © WHATWG (Apple, Google, Mozilla, Microsoft), licensed under the

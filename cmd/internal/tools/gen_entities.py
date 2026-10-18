@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generates std/text/html/entities.ax: the HTML5 named character references
+# Generates std/text/internal/html/entities.ax: the HTML5 named character references
 # (from Python's html.entities.html5, the WHATWG list), for std/text/html and
 # std/text/markdown.
 import html.entities
