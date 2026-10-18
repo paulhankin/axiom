@@ -3860,6 +3860,9 @@ pub fn wide_legal(v: *mut ir.Value) bool {
     if id == ir.IN_DOT_U8I8 {
         return (w < 64) or tg.has(tg.X_AVX512VNNI);
     }
+    if ir.is_widen(id) {
+        return (w < 64) or (b > 8) or tg.has(tg.X_AVX512BW);
+    }
     if (id >= ir.IN_AESENC) and (id <= ir.IN_AESDECLAST) {
         return tg.has(tg.X_VAES);
     }
@@ -3934,6 +3937,9 @@ pub fn legal(v: *mut ir.Value) bool {
         }
         if id == ir.IN_ALLTRUE {
             return true;
+        }
+        if ir.is_widen(id) {
+            return has41();  // (pmovsx, pmovzx)
         }
         if id == ir.IN_SWIZZLE {
             return true;
@@ -5386,6 +5392,10 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         _ = vlz(sse4(xe.VPDPBUSD, 0, RW(d), b, R(a), NONE()));
         return;
     }
+    if ir.is_widen(id) {
+        gen_widen(id, d, reg(a0), at);
+        return;
+    }
     if id == ir.IN_SAD_U8 {
         let z = vxmm();
         vzero(z);
@@ -6378,6 +6388,38 @@ pub fn vnni_ok(lanes: u64) bool {
         return (lanes <= 32) or not tg.has(tg.X_AVX512F) or tg.has(tg.X_AVX512VNNI);
     }
     return (lanes == 64) and tg.has(tg.X_AVX512VNNI) and tg.has(tg.X_AVX512BW);
+}
+
+// Whether @widen_low and @widen_high of a vector of `bits` bits are pmovsx or pmovzx
+// (IN_SWIDEN_LO ... IN_UWIDEN_HI; legal and wide_legal admit them at each width, vsplit.ax
+// splits wider ones): SSE4.1.
+pub fn widen_ok(bits: u64) bool {
+    return ((bits == 128) or (bits == 256) or (bits == 512)) and has41();
+}
+
+// IN_SWIDEN_LO ... IN_UWIDEN_HI: vpmovsx or vpmovzx (bw, wd or dq by a's lanes) of a's low
+// half, or of its high half moved down first (pshufd; vextracti128; vextracti64x4).
+fn gen_widen(id: i32, d: i32, a: i32, at: *ir.Ty) void {
+    let k = lk(at);
+    let mut op = xe.VPMOVSXBW + k;
+    if (id == ir.IN_UWIDEN_LO) or (id == ir.IN_UWIDEN_HI) {
+        op = xe.VPMOVZXBW + k;
+    }
+    let mut src = a;
+    if (id == ir.IN_SWIDEN_HI) or (id == ir.IN_UWIDEN_HI) {
+        if VL == 0 {
+            src = vxmm();
+            _ = sse_i(xe.PSHUFD, W(src), R(a), 0xee);
+        } else if VL == 32 {
+            src = part128(a, 1);
+        } else {
+            VL = 32;
+            src = vxmm();
+            VL = 64;
+            _ = sse4(xe.VEXTRACTI64X4, VL, R(a), W(src), NONE(), I(1));
+        }
+    }
+    _ = sse2(op, W(d), R(src));
 }
 
 // IN_PERM and IN_PERM2 (perm_ok).
