@@ -42,9 +42,9 @@ limit).
   after free, double frees and out-of-block accesses in the heap, and reports leaks.
 
 Known gaps are GitHub issues: [#37](https://github.com/paulhankin/axiom/issues/37)
-(symbolic links under the node host), [#38](https://github.com/paulhankin/axiom/issues/38)
-(regex `find_all`), [#40](https://github.com/paulhankin/axiom/issues/40) (deep directory
-trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer fuzzing).
+(symbolic links under the node host), [#40](https://github.com/paulhankin/axiom/issues/40)
+(deep directory trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer
+fuzzing).
 
 ## Defences
 
@@ -88,7 +88,7 @@ trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer fuzzing)
 
 | Where | What std does |
 |---|---|
-| regex | linear-time matching; a compile work budget (4 × `MAX_PROGRAM`); nesting depth below 1000; a bounded DFA cache (`DFA_MAX_PCS`) |
+| regex | linear-time matching; a compile work budget (4 × `MAX_PROGRAM`); nesting depth below 1000; a bounded DFA cache (`DFA_MAX_PCS`). `find_all` and `replace_all` search again after each match, so a pattern whose higher-priority alternative outlives its match (`a*b\|a` on runs of `a`) takes quadratic time over many matches, as in RE2; an untrusted pattern over a large text needs a bound on one of them |
 | markdown | linear-time structures for the known CommonMark pathological inputs (nested brackets, emphasis, backticks, list tightness); a budget on link reference expansion; safe HTML by default |
 | unicode | linear-time reordering (a counting sort), word boundaries (a capped regional-indicator count) and sentence boundaries (a memoized suffix scan) |
 | bidi | isolates matched with an explicit stack, not recursion |
