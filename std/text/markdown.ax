@@ -24,8 +24,8 @@
 // Options.gfm it also reads the GitHub Flavored Markdown extensions: tables,
 // strikethrough (~~x~~), autolinks without angle brackets (www.x.com,
 // https://..., a@b.com) and task list items ([ ] and [x]). With Options.math
-// it reads TeX math, $...$ and $$...$$ (as MATH and DISPLAY_MATH nodes) and
-// ```math code blocks, and writes it as MathML (std/text/math), or as SVG
+// it reads TeX math, $...$, $`...`$ and $$...$$ (as MATH and DISPLAY_MATH
+// nodes) and ```math code blocks, and writes it as MathML (std/text/math), or as SVG
 // through Options.math_html and std/text/math/typeset.
 //
 // Untrusted input: the HTML output is safe by default. Raw HTML in the input
@@ -80,7 +80,7 @@ pub enum Kind: u8 {
     STRIKETHROUGH,
     LINK,
     IMAGE,
-    /// With Options.math: $...$ and $$...$$ (the TeX source is the text).
+    /// With Options.math: $...$, $`...`$ and $$...$$ (the TeX source is the text).
     MATH,
     DISPLAY_MATH,
 
@@ -150,8 +150,9 @@ pub struct Options {
     /// TeX math (std/text/math) as MathML: $...$ inline, $$...$$ displayed,
     /// and ```math code blocks. A $ needs a non-space after it to open and
     /// before it to close (and no digit after it), so "$5 and $10" stays
-    /// text; \$ is a dollar sign. Math that does not parse is left as its
-    /// source.
+    /// text; \$ is a dollar sign. GitHub's $`...`$ (backticks as in a code
+    /// span, the same number on each side) is inline math too, and avoids
+    /// those rules. Math that does not parse is left as its source.
     math: bool,
     /// How math is written: MathML (MathHtml.mathml(), the default), or
     /// another renderer such as std/text/math/typeset's SVG.
@@ -2590,7 +2591,22 @@ fn handle_dollars(p: *mut Parser) !void {
     let after = p.pos;
     if n == 1 {
         let c = peek(p);
-        if (c != 0) and not is_ascii_space(c) {
+        if c == '`' {
+            // GitHub's $`...`$: the backticks as in a code span (the same
+            // number on each side), then the $ right after them
+            while peek(p) == '`' {
+                p.pos += 1;
+            }
+            let k = p.pos - after;
+            let close = scan_closing_ticks(p, k);
+            if (close != 0) and (at(p.s, close) == '$') {
+                let id = p.append(p.block, Kind.MATH)!;
+                p.nd(id).text = Ref.{
+                    off: p.sbase + @truncate(u32, after + k), len: @truncate(u32, close - k - (after + k)), raw: true };
+                p.pos = close + 1;
+                return;
+            }
+        } else if (c != 0) and not is_ascii_space(c) {
             let close = math_closer1(p, after);
             if close != NO_CLOSER {
                 let id = p.append(p.block, Kind.MATH)!;
@@ -4217,6 +4233,14 @@ test "math" {
     // math that does not parse stays as its source
     expect_html("$\\frac{a}$ and $$x^$$\n", o, "<p>$\\frac{a}$ and $$x^$$</p>\n")!;
     expect_html("```math\n\\foo\n```\n", o, "<pre><code class=\"language-math\">\\foo\n</code></pre>\n")!;
+    // GitHub's $`...`$: the backticks delimit, so the dollar rules do not apply
+    expect_html("Area $`x^2`$ here.\n", o,
+                "<p>Area <math><semantics><msup><mi>x</mi><mn>2</mn></msup><annotation encoding=\"application/x-tex\">x^2</annotation></semantics></math> here.</p>\n")!;
+    expect_html("$`` a`b ``$5\n", o,
+                "<p><math><semantics><mrow><mi>a</mi><mo form=\"prefix\" lspace=\"0\" rspace=\"0\">`</mo><mi>b</mi></mrow><annotation encoding=\"application/x-tex\"> a`b </annotation></semantics></math>5</p>\n")!;
+    // without the closing $ (or with mismatched backticks) it is a code span
+    expect_html("$`x` y\n", o, "<p>$<code>x</code> y</p>\n")!;
+    expect_html("$``x`$\n", o, "<p>$``x`$</p>\n")!;
     // code spans win when they start first; alt text keeps the source
     expect_html("`$x$` and `a $b` c$\n", o, "<p><code>$x$</code> and <code>a $b</code> c$</p>\n")!;
     expect_html("![$x$](i.png)\n", o, "<p><img src=\"i.png\" alt=\"x\" /></p>\n")!;
