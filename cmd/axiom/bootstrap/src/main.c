@@ -43,7 +43,7 @@ static void usage(void) {
             "       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>] [-- <program args>]\n"
             "       axiom new <name>      create a package skeleton\n"
             "       axiom cache [path|size|clean]  the compiled-module cache\n"
-            "  test: --filter=<text> --timeout=<ms>\n"
+            "  test: --filter=<text> --timeout=<ms> --show-output\n"
             "  --target=wasm32|native   -O0..-O3   --overflow=wrap|trap|saturate (default wrap)\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
             "  --stack-traces=on|off    record call sites for crash traces and profiles (default on)\n"
@@ -279,7 +279,8 @@ static void print_frames_json(TFrame *fr, int n) {
     printf("]");
 }
 
-static int run_tests(const char *bin, const char *std_dir, const char *filter, const char *timeout, bool json) {
+static int run_tests(const char *bin, const char *std_dir, const char *filter, const char *timeout, bool json,
+                     bool show_output) {
     Vec(char *) av = {0};
     if (g_target.wasm) {
         const char *names[] = {"node", NULL};
@@ -376,14 +377,14 @@ static int run_tests(const char *bin, const char *std_dir, const char *filter, c
                 printf("     %s:%d:%d: %s %s\n", g_files.data[sp.file]->display, sl, sc, code, msg);
                 printf("         %s\n", source_line(sp));
                 print_frames_human(frames, nframes, etrace);
-                if (*output) {
-                    printf("     output:\n");
-                    for (char *o = output; *o;) {
-                        char *e = strchr(o, '\n');
-                        printf("       | %.*s\n", e ? (int)(e - o) : (int)strlen(o), o);
-                        if (!e) break;
-                        o = e + 1;
-                    }
+            }
+            if (*output && (show_output || !pass)) {
+                printf("     output:\n");
+                for (char *o = output; *o;) {
+                    char *e = strchr(o, '\n');
+                    printf("       | %.*s\n", e ? (int)(e - o) : (int)strlen(o), o);
+                    if (!e) break;
+                    o = e + 1;
                 }
             }
         }
@@ -722,6 +723,7 @@ int main(int argc, char **argv) {
     Vec(char *) inc_flags = {0};   // -I, for C sources
     const char *header_path = NULL;
     const char *test_filter = NULL, *test_timeout = NULL;
+    bool show_output = false;
     int prof_hz = 999;
     int units_mode = -1;  // -1: by optimization level
     bool verbose = false;
@@ -756,6 +758,7 @@ int main(int argc, char **argv) {
         else if (!strncmp(a, "--emit-header=", 14)) header_path = a + 14;
         else if (testing && !strncmp(a, "--filter=", 9)) test_filter = a;
         else if (testing && !strncmp(a, "--timeout=", 10)) test_timeout = a;
+        else if (testing && !strcmp(a, "--show-output")) show_output = true;
         else if (profiling && !strncmp(a, "--rate=", 7) && atoi(a + 7) > 0) prof_hz = atoi(a + 7);
         else if (profiling && !strncmp(a, "--folded=", 9)) folded_path = a + 9;
         else if ((a[1] == 'l' || a[1] == 'L') && a[0] == '-' && a[2]) vec_push(link_flags, (char *)a);
@@ -1097,7 +1100,7 @@ int main(int argc, char **argv) {
         }
     }
     if (testing) {
-        int rc = run_tests(out, so.std_dir, test_filter, test_timeout, json);
+        int rc = run_tests(out, so.std_dir, test_filter, test_timeout, json, show_output);
         unlink(out);
         return rc;
     }

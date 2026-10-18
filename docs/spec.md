@@ -2223,7 +2223,7 @@ axiom build <file.ax> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate] -o
                           [-g | --debug-info=lines|none]            # DWARF line tables (below)
 axiom check <file.ax>                  # parse and type-check only; no codegen
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
-axiom test  <file.ax> [--filter=text] [--timeout=ms]   # run test blocks (§17)
+axiom test  <file.ax> [--filter=text] [--timeout=ms] [--show-output]   # run test blocks (§17)
 axiom new   <name>                     # create a package skeleton (§4.6)
 axiom profile <file.ax> [-- args]      # sampling profiler (§16.6)
 axiom cache [path|clean]               # the compiled-module cache (§16.7)
@@ -2781,7 +2781,7 @@ test "indexing past the end traps" expect trap(T0001) {
 ### 17.2 Running tests
 
 ```
-axiom test file.ax|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--format=agent-json]
+axiom test file.ax|<package dir> [--target=wasm32|native] [--filter=text] [--timeout=ms] [--show-output] [--format=agent-json]
 ```
 
 - **Which tests run.** The tests in `file.ax`, plus those of the modules it imports that
@@ -2793,7 +2793,9 @@ axiom test file.ax|<package dir> [--target=wasm32|native] [--filter=text] [--tim
   worker, or a forked process on native targets. A trap, a hang or corrupted memory
   can't affect other tests. Independent tests run in parallel. A trap in a thread the
   test started ends the test as its own trap would (`expect trap` applies to it).
-- **Output.** Each test's output (stdout and stderr) is captured and reported with it.
+- **Output.** Each test's output (stdout and stderr) is captured and reported with it:
+  under a failing test's report, and under every test's with `--show-output` (the JSON
+  format always has it).
 - **Exit status.** `0` if every selected test passed, `1` if any failed, `2` if the tests
   could not be built or run. Compile errors are reported as diagnostics (§16.2).
 

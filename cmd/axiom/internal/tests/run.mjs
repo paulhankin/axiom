@@ -523,6 +523,31 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async
   }
 }
 
+// axiom test --show-output (spec §17.2): a passing test's output is shown
+// only when asked for.
+{
+  const name = 'axiom test --show-output';
+  if (!filter || name.includes(filter)) {
+    const dir = path.join(tmp, 'showout');
+    fs.mkdirSync(dir, { recursive: true });
+    const src = path.join(dir, 't.ax');
+    fs.writeFileSync(src, [
+      'import "std/io" as io;', '',
+      'test "prints" {',
+      '    io.stdout().write_all("hello from the test\\n")!;',
+      '}', ''].join('\n'));
+    const target = native ? [nativeTarget] : [];
+    const quiet = spawnSync(compiler, ['test', src, ...target], { encoding: 'utf8' });
+    const shown = spawnSync(compiler, ['test', src, '--show-output', ...target], { encoding: 'utf8' });
+    let problem = null;
+    if (quiet.status !== 0 || shown.status !== 0) problem = `tests failed:\n${quiet.stdout}${quiet.stderr}${shown.stdout}${shown.stderr}`;
+    else if (/output:/.test(quiet.stdout)) problem = `output shown without the flag:\n${quiet.stdout}`;
+    else if (!/ok   prints \(\d+ ms\)\n     output:\n       \| hello from the test\n/.test(shown.stdout)) problem = `output not shown:\n${shown.stdout}`;
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // The self-hosted compiler reaches the system only through the host ABI, so
 // it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
 // usize assumptions.
