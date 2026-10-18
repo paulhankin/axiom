@@ -2656,9 +2656,18 @@ object depends on:
 Editing a module recompiles it and every module that imports it, directly or
 indirectly. Nothing else is recompiled. Missing objects are compiled in parallel. The
 toolchain's C runtime (`std/internal/runtime/*.c`) is compiled once per content and cached the
-same way. `axiom cache clean` empties the cache, which is never evicted
-automatically in v0.1. `--verbose` reports how many modules were compiled and how
-many came from the cache.
+same way. `--verbose` reports how many modules were compiled and how many came from
+the cache.
+
+The cache is kept under a size limit, `$AXIOM_CACHE_LIMIT` (a number of bytes, or one
+with a `k`, `m` or `g` suffix; `0` for no limit; 2 GiB by default). A build that
+reuses an object marks it as used (its modification time), and after a build that
+leaves the cache over the limit, the least recently used objects are removed until
+it fits, except objects used or written within the last hour: a build running at
+the same time keeps the objects it found, and a build that loses an object to another
+process recompiles it. `axiom cache size` reports the cache's directory, the number of
+objects, their size and the limit; `axiom cache path` prints the directory; `axiom
+cache clean` empties it.
 
 What makes modules independent:
 

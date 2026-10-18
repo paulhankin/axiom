@@ -53,7 +53,7 @@ fn usage() void {
     u.eprint("       axiom fmt <file.ax | dir>... [--check] [--stdout]   canonical layout, tidy imports\n");
     u.eprint("       axiom new <name>      create a package skeleton\n");
     u.eprint("       axiom lsp [--target=<t>] [--std=<dir>]   language server (stdio) for editors\n");
-    u.eprint("       axiom cache [path|clean]   the compiled-module cache\n");
+    u.eprint("       axiom cache [path|size|clean]  the compiled-module cache\n");
     u.eprint("       axiom version         the compiler's version\n");
     u.eprint("  test: --filter=<text> --timeout=<ms>\n");
     u.eprint("  --target=wasm32|wasm64|x86_64|aarch64|aarch64-macos|x86_64-windows|native   --cpu=<name>   --features=+ext,-ext\n");
@@ -914,10 +914,25 @@ fn link_wasm(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
     return 0;
 }
 
+// A size for people: "1.5 MiB".
+fn human_size(n: i64) []u8 {
+    if n < 1024 {
+        return u.f1("%s B", u.dec(n));
+    }
+    let units_ = ["KiB", "MiB", "GiB", "TiB"];
+    let mut v = @float_from_int(f64, n) / 1024.0;
+    let mut i: usize = 0;
+    while (v >= 1024.0) and (i + 1 < units_.len) {
+        v /= 1024.0;
+        i += 1;
+    }
+    return u.f2("%s %s", u.ffmt("%.1f", v), units_[i]);
+}
+
 fn driver(args: [][]u8) i32 {
     let argc = args.len;
     if (argc >= 2) and u.str_eq(args[1], "cache") {
-        // axiom cache [path|clean]: the object cache of separate compilation
+        // axiom cache [path|size|clean]: the object cache of separate compilation
         let dir = u.cat2(pkg.cache_dir(), "/obj");
         if (argc >= 3) and u.str_eq(args[2], "clean") {
             let rm = ["rm", "-rf", dir];
@@ -927,6 +942,17 @@ fn driver(args: [][]u8) i32 {
                 return 0;
             }
             return 1;
+        }
+        if (argc >= 3) and u.str_eq(args[2], "size") {
+            let mut es = u.List.[units.CacheEntry].empty();
+            let total = units.cache_entries(dir, &mut es);
+            let limit = units.cache_limit();
+            let mut lim: []u8 = "no limit";
+            if limit > 0 {
+                lim = u.cat2("limit ", human_size(limit));
+            }
+            u.print(u.f4("%s: %s objects, %s (%s)\n", dir, u.zdec(es.len), human_size(total), lim));
+            return 0;
         }
         if (argc >= 3) and not u.str_eq(args[2], "path") {
             usage();
@@ -1369,7 +1395,7 @@ fn driver(args: [][]u8) i32 {
     let mut unit_objs = u.List.[[]u8].empty();
     if separate {
         let mut objs = u.List.[[]u8].empty();
-        let mut us = units.UnitStats.{ total: 0, compiled: 0 };
+        let mut us = units.UnitStats.{ total: 0, compiled: 0, evicted: 0, evicted_bytes: 0 };
         let t0 = now_ms();
         let built = units.build_units(co, objpath, &mut objs, &mut us);
         if built < 0 {
@@ -1386,6 +1412,10 @@ fn driver(args: [][]u8) i32 {
         if separate and verbose {
             u.eprint(u.f4("axiom: %s modules, %s compiled, %s cached (%s ms)\n", u.zdec(us.total), u.zdec(us.compiled),
                           u.zdec(us.total - us.compiled), u.ffmt("%.0f", t1 - t0)));
+            if us.evicted > 0 {
+                u.eprint(u.f2("axiom: evicted %s cached objects (%s)\n", u.zdec(us.evicted),
+                              human_size(us.evicted_bytes)));
+            }
         }
         for k in 0..objs.len {
             link_inputs.push(objs.get(k));

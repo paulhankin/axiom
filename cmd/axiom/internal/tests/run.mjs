@@ -430,6 +430,52 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async
   }
 }
 
+// Cache eviction (spec §16.7): after a build, when the cache is over
+// $AXIOM_CACHE_LIMIT, the least recently used objects go, but nothing used
+// or written within the last hour; `axiom cache size` reports the cache.
+{
+  const name = 'cmd/axiom/internal/tests/units [cache eviction]';
+  if (!filter || name.includes(filter)) {
+    const dir = path.join(tmp, 'evict');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of ['lib.ax', 'main.ax']) fs.copyFileSync(path.join(root, 'cmd/axiom/internal/tests/units', f), path.join(dir, f));
+    const cache = path.join(tmp, 'evict-cache');
+    const env = { ...process.env, AXIOM_CACHE: cache, AXIOM_CACHE_LIMIT: '1' };
+    const out = path.join(tmp, 'evict-prog' + (native ? '' : '.wasm'));
+    const build = () => spawnSync(compiler, ['build', path.join(dir, 'main.ax'), '-o', out, '--verbose', '--units=module',
+      ...(native ? [nativeTarget] : [])], { encoding: 'utf8', env });
+    const objs = () => fs.readdirSync(path.join(cache, 'obj')).sort();
+    let problem = null;
+    const c1 = build();
+    const m = /(\d+) modules, (\d+) compiled/.exec(c1.stderr);
+    if (c1.status !== 0 || !m) problem = `cold build failed:\n${c1.stdout}${c1.stderr}`;
+    else if (/evicted/.test(c1.stderr)) problem = `fresh objects evicted: ${c1.stderr}`;
+    const fresh = problem ? [] : objs();
+    if (!problem) {
+      // stale files (objects of old builds, a temporary of an interrupted one)
+      // are over the limit and go; the objects this build uses stay
+      const old = (Date.now() - 3 * 3600 * 1000) / 1000;
+      for (const f of ['stale1.o', 'stale2.o', 'x.o.tmp999']) {
+        const p = path.join(cache, 'obj', f);
+        fs.writeFileSync(p, Buffer.alloc(4096));
+        fs.utimesSync(p, old, old);
+      }
+      const size = spawnSync(compiler, ['cache', 'size'], { encoding: 'utf8', env });
+      if (!new RegExp(`^${cache.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/obj: ${fresh.length + 3} objects, .* \\(limit 1 B\\)\n$`).test(size.stdout))
+        problem = `cache size: ${size.stdout}${size.stderr}`;
+    }
+    if (!problem) {
+      const c2 = build();
+      if (c2.status !== 0) problem = `second build failed:\n${c2.stdout}${c2.stderr}`;
+      else if (!/(\d+) modules, 0 compiled/.test(c2.stderr)) problem = `second build recompiled: ${c2.stderr}`;
+      else if (!/evicted 3 cached objects \(12\.0 KiB\)/.test(c2.stderr)) problem = `eviction not reported: ${c2.stderr}`;
+      else if (objs().join() !== fresh.join()) problem = `objects after eviction: ${objs().join(' ')}`;
+    }
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // The self-hosted compiler reaches the system only through the host ABI, so
 // it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
 // usize assumptions.

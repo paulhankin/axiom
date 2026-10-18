@@ -42,7 +42,7 @@ static void usage(void) {
             "usage: axiom <build|check|test> [<file.ax> | <package dir>] [options]\n"
             "       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>] [-- <program args>]\n"
             "       axiom new <name>      create a package skeleton\n"
-            "       axiom cache [path|clean]   the compiled-module cache\n"
+            "       axiom cache [path|size|clean]  the compiled-module cache\n"
             "  test: --filter=<text> --timeout=<ms>\n"
             "  --target=wasm32|native   -O0..-O3   --overflow=wrap|trap|saturate (default wrap)\n"
             "  --emit=exe|obj|llvm|asm  --format=human|agent-json  --std=<dir>  -o <out>\n"
@@ -653,15 +653,33 @@ static int run_profile(const char *bin, char **prog_args, int nprog_args, const 
     return status == 0 ? 0 : 1;
 }
 
+// A size for people: "1.5 MiB".
+static const char *human_size(int64_t n) {
+    if (n < 1024) return arena_printf("%lld B", (long long)n);
+    static const char *const units[] = {"KiB", "MiB", "GiB", "TiB"};
+    double v = (double)n / 1024.0;
+    int i = 0;
+    while (v >= 1024.0 && i + 1 < 4) v /= 1024.0, i++;
+    return arena_printf("%.1f %s", v, units[i]);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "cache")) {
-        // axiom cache [path|clean]: the object cache of separate compilation
+        // axiom cache [path|size|clean]: the object cache of separate compilation
         const char *dir = arena_printf("%s/obj", pkg_cache_dir());
         if (argc >= 3 && !strcmp(argv[2], "clean")) {
             char *rm[] = {"rm", "-rf", (char *)dir, NULL};
             int rc = run(rm);
             if (rc == 0) printf("removed %s\n", dir);
             return rc == 0 ? 0 : 1;
+        }
+        if (argc >= 3 && !strcmp(argv[2], "size")) {
+            CacheEntries es = {0};
+            int64_t total = cache_entries(dir, &es);
+            int64_t limit = cache_limit();
+            printf("%s: %d objects, %s (%s)\n", dir, es.len, human_size(total),
+                   limit > 0 ? arena_printf("limit %s", human_size(limit)) : "no limit");
+            return 0;
         }
         if (argc >= 3 && strcmp(argv[2], "path")) {
             usage();
@@ -949,9 +967,11 @@ int main(int argc, char **argv) {
             return 1;
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        if (verbose)
+        if (verbose) {
             fprintf(stderr, "axiom: %d modules, %d compiled, %d cached (%.0f ms)\n", us.total, us.compiled,
                     us.total - us.compiled, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+            if (us.evicted) fprintf(stderr, "axiom: evicted %d cached objects (%s)\n", us.evicted, human_size(us.evicted_bytes));
+        }
         for (int i = 0; i < objs.len; i++) vec_push(link_inputs, objs.data[i]);
     } else if (!codegen_program(&co)) {
         diag_emit(json, json ? stdout : stderr);

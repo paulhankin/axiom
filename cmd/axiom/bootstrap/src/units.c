@@ -9,8 +9,13 @@
 // per-program link unit (globals, error codes, runtime state, exports).
 #include "units.h"
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -112,6 +117,83 @@ static const char *tls_layout_id(void) {
     return any ? hex_key(&h) : NULL;
 }
 
+// -----------------------------------------------------------------------------
+// Eviction. The cache is kept under a size limit: after a build, the least
+// recently used objects go until it fits. An object's use is its modification
+// time (build_units touches the objects it reuses), and objects used or
+// written within the last hour stay whatever the size, so that a build
+// running at the same time keeps the objects it found. A build that loses an
+// object to another process recompiles it.
+// -----------------------------------------------------------------------------
+
+#define DEFAULT_CACHE_LIMIT (2LL * 1024 * 1024 * 1024)
+#define EVICT_GRACE_NS (3600LL * 1000000000)
+
+int64_t cache_limit(void) {
+    const char *s = getenv("AXIOM_CACHE_LIMIT");
+    if (!s || !*s) return DEFAULT_CACHE_LIMIT;
+    size_t n = strlen(s);
+    int64_t mul = 1;
+    char c = (char)(s[n - 1] | 0x20);
+    if (c == 'k') mul = 1024, n--;
+    else if (c == 'm') mul = 1024 * 1024, n--;
+    else if (c == 'g') mul = 1024 * 1024 * 1024, n--;
+    if (n == 0 || n > 15) return DEFAULT_CACHE_LIMIT;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] < '0' || s[i] > '9') return DEFAULT_CACHE_LIMIT;
+    return atoll(s) * mul;
+}
+
+static int64_t stat_ns(struct timespec t) { return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec; }
+
+int64_t cache_entries(const char *dir, CacheEntries *out) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int64_t total = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        const char *p = arena_printf("%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        CacheEntry ce = {p, (int64_t)st.st_size, stat_ns(st.st_mtim)};
+        total += ce.size;
+        vec_push(*out, ce);
+    }
+    closedir(d);
+    return total;
+}
+
+static int older_first(const void *a, const void *b) {
+    const CacheEntry *x = a, *y = b;
+    if (x->mtime != y->mtime) return x->mtime < y->mtime ? -1 : 1;
+    return strcmp(x->path, y->path);
+}
+
+static void evict(const char *dir, UnitStats *stats) {
+    int64_t limit = cache_limit();
+    if (limit <= 0) return;
+    CacheEntries es = {0};
+    int64_t total = cache_entries(dir, &es);
+    if (total > limit) {
+        qsort(es.data, (size_t)es.len, sizeof *es.data, older_first);
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        int64_t cutoff = stat_ns(now) - EVICT_GRACE_NS;
+        for (int i = 0; i < es.len && total > limit; i++) {
+            if (es.data[i].mtime >= cutoff) break;  // in use, perhaps; and everything after it is newer
+            if (unlink(es.data[i].path) == 0) {
+                total -= es.data[i].size;
+                if (stats) {
+                    stats->evicted++;
+                    stats->evicted_bytes += es.data[i].size;
+                }
+            }
+        }
+    }
+    free(es.data);
+}
+
 static bool file_ok(const char *p) {
     struct stat st;
     return stat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
@@ -174,7 +256,8 @@ bool build_units(CgOptions *base, const char *link_obj, UnitObjs *objs, UnitStat
         }
         u->obj = arena_printf("%s/%s.o", dir, u->key);
         u->cached = file_ok(u->obj);
-        if (!u->cached) vec_push(todo, u);
+        if (u->cached) utimensat(AT_FDCWD, u->obj, NULL, 0);  // used now (eviction is least recently used)
+        else vec_push(todo, u);
     }
     // Compile what is missing, a few at a time.
     long cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -212,7 +295,9 @@ bool build_units(CgOptions *base, const char *link_obj, UnitObjs *objs, UnitStat
     co.unit = CG_LINK;
     co.module = NULL;
     co.out_path = link_obj;
-    return codegen_program(&co);
+    if (!codegen_program(&co)) return false;
+    evict(dir, stats);
+    return true;
 }
 
 // The toolchain's own C runtime (std/internal/runtime/*.c) is compiled once per content
