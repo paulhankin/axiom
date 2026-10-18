@@ -41,8 +41,7 @@ limit).
 - **The address sanitizer.** `axiom test --sanitize=address` (spec §16.8) traps on use
   after free, double frees and out-of-block accesses in the heap, and reports leaks.
 
-Known gaps are GitHub issues: [#37](https://github.com/paulhankin/axiom/issues/37)
-(symbolic links under the node host), [#40](https://github.com/paulhankin/axiom/issues/40)
+Known gaps are GitHub issues: [#40](https://github.com/paulhankin/axiom/issues/40)
 (deep directory trees) and [#41](https://github.com/paulhankin/axiom/issues/41) (longer
 fuzzing).
 
@@ -80,7 +79,7 @@ fuzzing).
 | json | arena chunks at least as large as the allocation |
 | vec, str | `v.extend(v.items())` and `s.push_str(s.bytes())` work when the source aliases the destination |
 | c | `to_cstr` refuses an interior NUL |
-| fs | NUL refused in paths by every runtime; saturating times; temporary directories created 0700; `remove_all` and `walk` open directories relative to their parents with `O_NOFOLLOW` (`ax_dir_*`), so a symbolic link swapped in for a directory is not followed |
+| fs | NUL refused in paths by every runtime; saturating times; temporary directories created 0700; `remove_all` and `walk` open directories relative to their parents with `O_NOFOLLOW` (`ax_dir_*`), so a symbolic link swapped in for a directory is not followed; the node host pins each directory with a descriptor and resolves names through it (Linux), or checks device and inode before each use |
 | threads | signal alternate stacks and thread stacks freed when a thread exits |
 | log | CR, LF, C1 controls, U+2028/U+2029 and invalid UTF-8 escaped in messages and keys, so input cannot forge log lines; a failed rotation reopens the file in append mode |
 

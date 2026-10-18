@@ -335,11 +335,29 @@ export function createHost(opts = {}) {
   const programArgs = shared.args;
   const pos = new SharedPositions(shared.pos);
   const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39, ELOOP: -40 })[e && e.code] || -1;
-  // Directory handles (see ax_dir_open). Node has no openat, so these hold
-  // paths: a symbolic link swapped in between lstat and use is followed.
+  // Directory handles (see ax_dir_open): a descriptor of the directory,
+  // opened without following links, pins it. Node has no openat, so names
+  // under it are resolved through the descriptor where the system allows
+  // (Linux: /proc/self/fd/N/name) and else by path, after checking that
+  // the path is still the pinned directory (device and inode) -- a narrow
+  // window, where a swapped-in link could still be followed.
   const dirs = new Map();
   let nextDir = 1;
-  const dirPath = (d, name) => (d < 0 ? name : dirs.get(d) + '/' + name);
+  const O = fs.constants;
+  const DIR_FLAGS = O.O_RDONLY | (O.O_DIRECTORY || 0) | (O.O_NOFOLLOW || 0);
+  const PROC_FD = (() => { try { return fs.statSync('/proc/self/fd').isDirectory() ? '/proc/self/fd/' : null; } catch { return null; } })();
+  // The path to use for the directory handle d (its descriptor's, or its
+  // own after a check); throws ELOOP if the path is no longer it.
+  const dirBase = (d) => {
+    const dir = dirs.get(d);
+    if (dir.via) return dir.via;
+    if (dir.fd >= 0) {
+      const st = fs.lstatSync(dir.path);
+      if (!st.isDirectory() || st.dev !== dir.dev || st.ino !== dir.ino) throw Object.assign(new Error('replaced'), { code: 'ELOOP' });
+    }
+    return dir.path;
+  };
+  const dirPath = (d, name) => (d < 0 ? name : dirBase(d) + '/' + name);
   // Copies `buf` to p[0..cap] if it fits; returns its length.
   const give = (buf, p, cap) => {
     if (buf.length <= Number(cap)) bytes(Number(p), buf.length).set(buf);
@@ -445,8 +463,21 @@ export function createHost(opts = {}) {
         const st = fs.lstatSync(full);
         if (st.isSymbolicLink()) return -40;
         if (!st.isDirectory()) return -20;
+        let fd = -1, dev = 0, ino = 0;
+        try {
+          fd = fs.openSync(full, DIR_FLAGS);
+          const fst = fs.fstatSync(fd);
+          if (!fst.isDirectory()) { fs.closeSync(fd); return -20; }
+          dev = fst.dev;
+          ino = fst.ino;
+        } catch (e) {
+          if (fd >= 0) fs.closeSync(fd);
+          if (e.code === 'ELOOP' || e.code === 'ENOTDIR') return fsErr(e);
+          fd = -1;  // directories cannot be opened here: by path, as before
+        }
         const h = nextDir++;
-        dirs.set(h, full);
+        dirs.set(h, { path: full, fd, dev, ino,
+                      via: fd >= 0 && PROC_FD && O.O_DIRECTORY ? PROC_FD + fd : null });
         return h;
       } catch (e) {
         return fsErr(e);
@@ -454,7 +485,7 @@ export function createHost(opts = {}) {
     },
     ax_dir_read(d, out, cap) {
       if (!dirs.has(d)) return -1;
-      return readdirPath(dirs.get(d), out, cap);
+      try { return readdirPath(dirBase(d), out, cap); } catch (e) { return fsErr(e); }
     },
     ax_dir_remove(d, p, n, dir) {
       try {
@@ -467,7 +498,11 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
-    ax_dir_close(d) { dirs.delete(d); },
+    ax_dir_close(d) {
+      const dir = dirs.get(d);
+      if (dir && dir.fd >= 0) try { fs.closeSync(dir.fd); } catch {}
+      dirs.delete(d);
+    },
     ax_getcwd(p, cap) { return give(Buffer.from(process.cwd(), 'utf8'), p, cap); },
     ax_argc: () => programArgs.length,
     ax_arg(i, p, cap) {
@@ -721,6 +756,7 @@ export function createHost(opts = {}) {
     },
   };
   const host = {
+    axiom,  // the host functions themselves, for tests of the host
     imports: { axiom },
     setMemory(m) { memory = m; },
     memory() { return memory; },

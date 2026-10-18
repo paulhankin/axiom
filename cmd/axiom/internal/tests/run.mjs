@@ -476,6 +476,53 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async
   }
 }
 
+// The node host's directory handles (ax_dir_*) pin the directory they
+// opened: a symbolic link swapped in for it afterwards is not followed,
+// so fs.remove_all and fs.walk cannot be led out of their tree.
+{
+  const name = 'std/internal/runtime/host.mjs: directory handles do not follow a swapped-in link';
+  if (!filter || name.includes(filter)) {
+    const dir = path.join(tmp, 'dirswap');
+    fs.mkdirSync(path.join(dir, 'a/sub'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'a/sub/f'), 'x');
+    fs.mkdirSync(path.join(dir, 'victim'));
+    fs.writeFileSync(path.join(dir, 'victim/keep'), 'x');
+    const script = `
+      import fs from 'node:fs';
+      import { createHost } from ${JSON.stringify(path.join(root, 'std/internal/runtime/host.mjs'))};
+      const dir = ${JSON.stringify(dir)};
+      const memory = new WebAssembly.Memory({ initial: 1 });
+      const ax = createHost({ memory }).axiom;
+      const put = (s) => { const b = Buffer.from(s); new Uint8Array(memory.buffer, 0, b.length).set(b); return [0, b.length]; };
+      const da = ax.ax_dir_open(-1, ...put(dir + '/a'));
+      const ds = ax.ax_dir_open(da, ...put('sub'));
+      fs.renameSync(dir + '/a/sub', dir + '/a/sub.old');
+      fs.symlinkSync(dir + '/victim', dir + '/a/sub');
+      const n = ax.ax_dir_read(ds, 1000, 100);
+      const listing = n > 0 ? Buffer.from(new Uint8Array(memory.buffer, 1000, n)).toString('latin1') : String(n);
+      const removed = ax.ax_dir_remove(ds, ...put('keep'), 0);
+      const opened = ax.ax_dir_open(da, ...put('sub'));
+      console.log(JSON.stringify({ da, ds, listing, removed, opened }));
+    `;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+    let problem = null;
+    try {
+      const o = JSON.parse(r.stdout);
+      if (o.da < 0 || o.ds < 0) problem = `could not open: ${r.stdout}`;
+      // through the pinned descriptor (Linux) the handle still lists the old
+      // directory; elsewhere it notices the swap (ELOOP, -40)
+      else if (o.listing !== '\u0001f\u0000' && o.listing !== '-40') problem = `listing after the swap: ${JSON.stringify(o.listing)}`;
+      else if (o.removed !== -2 && o.removed !== -40) problem = `remove through the handle: ${o.removed}`;
+      else if (o.opened !== -40) problem = `opening the link: ${o.opened}`;
+      else if (!fs.existsSync(path.join(dir, 'victim/keep'))) problem = 'victim/keep was removed';
+    } catch (e) {
+      problem = `${e.message}\n${r.stdout}${r.stderr}`;
+    }
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // The self-hosted compiler reaches the system only through the host ABI, so
 // it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
 // usize assumptions.
