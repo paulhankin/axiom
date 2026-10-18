@@ -37,6 +37,9 @@ The extension needs no Node.js or npm: it is plain JavaScript with no dependenci
 
 Commands: **Axiom: Restart Language Server** and **Axiom: Show Language Server Output**.
 
+Other editors: [`docs/editors.md`](../../../docs/editors.md) has `axiom lsp` settings
+for Neovim, Helix and Emacs.
+
 ## How it works
 
 `axiom lsp` (`cmd/axiom/src/lsp.ax`) speaks the Language Server Protocol on standard input

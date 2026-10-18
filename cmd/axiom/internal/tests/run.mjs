@@ -548,6 +548,42 @@ await inOrder(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), async
   }
 }
 
+// The tour (docs/tour.md): each program in docs/tour/ appears verbatim in
+// the page, builds for the suite's target, and prints its .out file;
+// tests.ax's tests pass.
+{
+  const tourDir = path.join(root, 'docs/tour');
+  const page = fs.readFileSync(path.join(root, 'docs/tour.md'), 'utf8');
+  for (const f of files(tourDir)) {
+    const base = path.basename(f, '.ax');
+    const name = `docs/tour/${base}.ax`;
+    if (filter && !name.includes(filter)) continue;
+    const src = fs.readFileSync(f, 'utf8');
+    let problem = null;
+    if (!page.includes('```axiom\n' + src.trimEnd() + '\n```')) problem = 'the program is not in docs/tour.md as written';
+    const dir = path.join(tmp, 'tour-' + base);
+    fs.mkdirSync(dir, { recursive: true });
+    const outFile = path.join(tourDir, base + '.out');
+    if (!problem && fs.existsSync(outFile)) {
+      const out = path.join(dir, base + (native ? '' : '.wasm'));
+      const c = spawnSync(compiler, ['build', f, '-o', out, ...(native ? [nativeTarget] : [])], { encoding: 'utf8' });
+      if (c.status !== 0) problem = `build failed:\n${c.stdout}${c.stderr}`;
+      else {
+        const r = native ? spawnExe(out, [], { encoding: 'utf8' })
+          : spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
+        const want = fs.readFileSync(outFile, 'utf8');
+        if (r.status !== 0) problem = `exit ${r.status}:\n${r.stdout}${r.stderr}`;
+        else if (r.stdout !== want) problem = `output:\n${r.stdout}--- expected:\n${want}`;
+      }
+    } else if (!problem) {
+      const c = spawnSync(compiler, ['test', f, ...(native ? [nativeTarget] : [])], { encoding: 'utf8' });
+      if (c.status !== 0 || !/\n3 passed, 0 failed/.test(c.stdout)) problem = `tests:\n${c.stdout}${c.stderr}`;
+    }
+    if (problem) { fail++; failures.push(`FAIL ${name}: ${problem}`); console.log(`FAIL ${name}`); }
+    else { pass++; console.log(`ok   ${name}`); }
+  }
+}
+
 // The self-hosted compiler reaches the system only through the host ABI, so
 // it must stay buildable for WebAssembly (issue 0006): no libc, no 64-bit
 // usize assumptions.
@@ -636,7 +672,7 @@ if (!skipPlatform) {
       .filter((n) => n !== 'errors' && n !== 'fmt' && (n.endsWith('.ax') ||
         fs.statSync(path.join(root, 'cmd/axiom/internal/tests', n)).isDirectory()))
       .map((n) => `cmd/axiom/internal/tests/${n}`);
-    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', ...tests]);
+    const r = fmt(['--check', 'cmd/axiom/src', 'cmd/axiom/bench', 'std', 'examples', 'docs/tour', ...tests]);
     return r.status === 0 ? null : `not canonical:\n${r.stdout}${r.stderr}`;
   };
   for (const [cname, fn] of Object.entries(cases)) {

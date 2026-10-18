@@ -2250,43 +2250,33 @@ in which case it is linked against the C library as before.
 ### 16.1 Commands
 
 ```
-axiom build <file.ax> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate] -o <out>
-                          [--sanitize=address]    # check heap accesses (§16.8)
-                          [--cpu=<preset>] [--features=+ext,-ext]   # processor extensions (§13.4)
-                          [-g | --debug-info=lines|none]            # DWARF line tables (below)
-axiom check <file.ax>                  # parse and type-check only; no codegen
+axiom build <file.ax | package dir> --target=<t> [-O0..-O3] [--overflow=wrap|trap|saturate] -o <out>
+axiom check <file.ax | package dir>              # parse and type-check only; no codegen
+axiom test  <file.ax | package dir> [--filter=text] [--timeout=ms] [--show-output]   # run test blocks (§17)
 axiom fmt   <file.ax|dir>... [--check] [--stdout]   # canonical layout (§16.5)
-axiom test  <file.ax> [--filter=text] [--timeout=ms] [--show-output]   # run test blocks (§17)
-axiom new   <name>                     # create a package skeleton (§4.6)
-axiom profile <file.ax> [-- args]      # sampling profiler (§16.6)
-axiom cache [path|clean]               # the compiled-module cache (§16.7)
-axiom lsp                              # the language server, over standard input and output
-axiom version                          # the compiler's version
+axiom profile <file.ax | package dir> [-- args]  # sampling profiler (§16.6)
+axiom new   <name>                               # create a package skeleton (§4.6)
+axiom cache [path|size|clean]                    # the compiled-module cache (§16.7)
+axiom lsp                                        # the language server, over standard input and output
+axiom version                                    # the compiler's version
 ```
 
-`build`, `check` and `test` also accept a package directory, or no path at all for the
-package in the current directory (§4.6.4).
-
-Every command accepts `--format=human` (the default) or `--format=agent-json`.
-
-`--overflow=wrap|trap|saturate` selects the overflow mode (§7.6). `wrap`, the default, is
-the language's meaning; `trap` checks every `+`, `-`, `*`, unary `-`, `MIN / -1` and
-`@abs` on integers and traps (`T0002`) on overflow, to find unintended overflows; `saturate`
-clamps. `build`, `test` and `profile` accept it. `--release` is accepted for
-compatibility and changes nothing.
-
-`-g` (or `--debug-info=lines`) adds DWARF line tables to the output: a compile unit per
-object, a subprogram per function and a source line and column for each instruction,
-so that native profilers (`perf annotate`, `perf report --sort srcline`), debuggers and
-`addr2line -i` map machine code back to Axiom source, inlined functions included
-(`DW_TAG_inlined_subroutine`). It is off by default (`--debug-info=none`), at every
-optimization level: stack traces (§16.4) need no debug information, and outputs
-stay small and independent of the directory they were built in. It does not change
-the generated instructions. `build`, `test` and `profile` accept it. Today only the
-bootstrap compiler emits line tables; the compiler accepts the option and emits none.
+Every command accepts `--format=human` (the default) or `--format=agent-json` (§16.2)
+and `--std=<dir>`. `--target` names a target of §14; `--cpu` and `--features` select
+processor extensions (§13.4); `--sanitize=address` is §16.8. `--overflow` selects the
+overflow mode (§7.6): `wrap`, the default, is the language's meaning; `trap` checks
+every `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs` on integers and traps (`T0002`) on
+overflow, to find unintended overflows; `saturate` clamps. The remaining options
+(output kinds, linking with C, Windows subsystems and icons, the module cache's
+settings, environment variables, exit codes) are the compiler's own and are listed in
+[`docs/cli.md`](cli.md); this specification defines the interfaces tools rely on: the
+diagnostics (§16.2, §16.3), the trap reports (§16.4), canonical formatting (§16.5), the
+profiler's output (§16.6), the cache's semantics (§16.7) and the test report (§17.2).
 
 - Compiler output is **deterministic**. The same inputs and flags produce byte-identical
-  `.wasm` files and diagnostics.
+  outputs and diagnostics.
+- Diagnostics go to stderr in human mode, as `file:line:col: error[E0412]: message`,
+  with the source line and a caret, and notes and fixes indented below.
 - Diagnostics are sorted by file, then by start byte, then by code.
 
 ### 16.2 JSON output

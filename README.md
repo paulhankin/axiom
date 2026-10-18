@@ -24,6 +24,9 @@ export PATH="$PWD/axiom-0.1.0-linux-x86_64/bin:$PATH"
 axiom version
 ```
 
+[`docs/tour.md`](docs/tour.md) is a guided tour of the language in a few pages, with
+programs the test suite builds.
+
 ## A first program
 
 ```axiom
@@ -53,8 +56,10 @@ axiom fmt src/                                    # canonical layout, imports ti
 axiom profile prog.ax                             # sampling profiler: hot functions, call sites, flame graphs
 axiom build prog.ax --sanitize=address            # trap on use after free, double free, overflows; report leaks
 axiom build app --verbose                         # modules compile separately and are cached (spec §16.7)
-axiom lsp                                         # the language server, for editors (tools/editors/vscode)
+axiom lsp                                         # the language server, for editors (docs/editors.md)
 ```
+
+[`docs/cli.md`](docs/cli.md) lists every command, flag and environment variable.
 
 The compiler is written in Axiom and has its own backends (WebAssembly, x86-64, AArch64)
 and linkers, so it and the programs it builds need only the C library. It builds native
@@ -69,6 +74,9 @@ the test suite.
 | Path | What |
 |---|---|
 | [`docs/install.md`](docs/install.md) | Installing a release, a first program, building from source |
+| [`docs/tour.md`](docs/tour.md) | A tour of the language: values, slices, structs and unions, errors, memory, generics, tests, SIMD |
+| [`docs/cli.md`](docs/cli.md) | The `axiom` command: every command and flag, environment variables, the cache, exit codes |
+| [`docs/editors.md`](docs/editors.md) | Editor support: the VS Code extension, and `axiom lsp` with Neovim, Helix and Emacs |
 | [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |
 | [`docs/releasing.md`](docs/releasing.md) | How releases are made, versioned and packaged; their notes are in [`docs/releases/`](docs/releases) |
@@ -82,8 +90,9 @@ the test suite.
 | [`examples/`](examples) | Example programs and packages (below) |
 | [`tools/`](tools/editors/vscode/README.md) | Editor support: a VS Code extension (highlighting, and diagnostics and navigation through `axiom lsp`) |
 
-Known bugs and feature requests are [GitHub issues](https://github.com/paulhankin/axiom/issues).
-To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
+Known bugs and feature requests are [GitHub issues](https://github.com/paulhankin/axiom/issues);
+[`CONTRIBUTING.md`](CONTRIBUTING.md) says how the repository is built, tested and
+changed. To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## Examples
 
