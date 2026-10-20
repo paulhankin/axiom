@@ -89,7 +89,7 @@ schedule).
 | rsa, der, base64, hmac, aes-gcm, chacha20-poly1305 | huge public exponents, non-minimal integers, loose padding, HKDF output past `255 * n`, messages past the AEAD limits and a ChaCha20 block counter that would wrap are refused (or trap, where they are programming errors) |
 | argon2 | memory at most `MAX_MEMORY_KIB` (4 GiB) and passes × memory at most `MAX_WORK_KIB` (16 GiB), so a stored or received hash cannot make verification allocate or run without limit (`TooExpensive`) |
 | hash maps | SipHash-1-3 with a per-process random key, against hash flooding |
-| dns | a random query id, a connected socket, and answers matched to the question; labels in names limited to printable ASCII without `.` or `\` |
+| dns | a random query id, a connected socket, and answers matched to the question; a `.`, `\` or byte outside printable ASCII in a label escaped as in a zone file (`\.`, `\\`, `\DDD`), so a name cannot read as another |
 
 ### Memory and runtime
 

@@ -73,8 +73,8 @@
   255 bytes, or holding anything but letters, digits, `-`, `.` and `_`, is now refused
   with an `illegal_parameter` alert, and `tls.client` refuses to send one.
 - DNS replies could give names whose labels held `.`, `\`, CR, LF, NUL or other bytes
-  outside printable ASCII, so a name could read as a different one. Such labels are
-  refused (`BadResponse`).
+  outside printable ASCII, so a name could read as a different one. Such bytes are now
+  escaped as in a zone file (`\.`, `\\`, `\DDD`: `My\032Printer._ipp._tcp.local`).
 - The TLS 1.3 client accepted a TLS 1.2 cipher suite in a TLS 1.3 ServerHello or
   HelloRetryRequest, and a HelloRetryRequest for a group it had already sent a share
   for. Both are refused with `illegal_parameter`.
