@@ -130,3 +130,7 @@
     render.
   - Many tags on one line took quadratic time to compile. Delimiters set with
     `{{=...=}}` are at most `MAX_DELIMITER` (16) bytes.
+- The specification and `SECURITY.md` now say that a data race on a slice, union or
+  error union can tear it into a value no store wrote, and so reach outside an object
+  (§12.8.2). They had said that no race is undefined behavior; that holds for plain
+  data. Share such values between threads only with synchronization.

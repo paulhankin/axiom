@@ -1596,7 +1596,7 @@ does not change.
 
 The checked operations never break the rule: indexing and slicing (§7.8), `@load` and
 `@store` on slices, `@mem_copy`, `@mem_set` and `@mem_eq`, and `for` over a slice all trap
-first. Only a raw pointer can break it: one that dangles (its object freed, or its
+first, given a slice that some operation made (not one torn by a data race, §12.8.2). Only a raw pointer can break it: one that dangles (its object freed, or its
 function returned), one moved outside its object by `@ptr_add` (§5.7) or made from a
 wrong address, or a slice made by `@slice_from_ptr` with the wrong length. Code in C
 (§14.5.5) can break it too. What happens then depends on the target:
@@ -1698,7 +1698,7 @@ This section defines shared-memory concurrency. The design follows from three fa
 | # | Decision | Reason |
 |---|---|---|
 | 1 | **Threads are a library, not syntax.** `std/thread` creates threads through the host ABI (§12.8.5). The language adds only atomic builtins. | Matches WebAssembly, where thread creation is a host operation. Keeps the language small. |
-| 2 | **A data race is not undefined behavior.** A read that races with a write returns, for each byte, a value some store wrote to that byte. Tearing is permitted (§12.8.2). | Keeps the zero-UB rule without a borrow checker or `Send`/`Sync` traits. This is WebAssembly's memory model, applied everywhere, just as §12.1 applies WebAssembly's bounds model. A race, like a dangling pointer, is a logic bug with a defined outcome. |
+| 2 | **A data race on plain data is not undefined behavior.** A read that races with a write returns, for each byte, a value some store wrote to that byte. Tearing is permitted (§12.8.2), so a race on a slice, union or error union can make one no store wrote, and through it reach outside an object. | Keeps the zero-UB rule for numbers without a borrow checker or `Send`/`Sync` traits. This is WebAssembly's memory model, applied everywhere, just as §12.1 applies WebAssembly's bounds model. Making every slice and union access single-copy atomic would cost every program, for programs that share them without synchronization. |
 | 3 | **Only sequentially consistent atomics.** There are no memory-order parameters. | Every WebAssembly atomic is sequentially consistent. SC is the model people and agents reason about correctly, and weaker orderings are a common source of subtle bugs. The cost is some performance on weakly ordered native CPUs. Relaxed orderings may come later ([#27](https://github.com/paulhankin/axiom/issues/27)). |
 | 4 | **Atomics are builtins on pointers to integers** (`@atomic_add(&mut x, 1)`), not special types. | Any integer in memory can be accessed atomically, as in WebAssembly. `std/sync.Atomic[T]` wraps them for convenience. |
 | 5 | **`wait`/`notify` operate on 32-bit integers only.** | Linux futexes, the native implementation, are 32-bit, and WebAssembly has `wait32`. 64-bit waiting would behave differently on different targets. |
@@ -1720,8 +1720,17 @@ This section defines shared-memory concurrency. The design follows from three fa
   the accesses *race*. A racing read returns, for each byte, the value written by some
   store to that byte that does not happen-after the read. Different bytes of one read
   may come from different stores (tearing). A racing write stores its bytes, and
-  bytes of racing writes may interleave. Nothing else is affected, and a race is
-  never undefined behavior. This is the WebAssembly threads memory model.
+  bytes of racing writes may interleave. Nothing else is affected, and a race on
+  plain data (integers, floats, vectors, and arrays and structs of them) is never
+  undefined behavior. This is the WebAssembly threads memory model.
+- **Races on values that hold a slice or a tag.** A slice is two words, and a tagged
+  union or error union is a tag and a payload, so a racing read can tear one into a
+  value no store wrote: one slice's `.ptr` with another's `.len`, or one variant's tag
+  with another's payload. Indexing such a slice is checked against the wrong length,
+  so a race on a slice, union or error union (or an array or struct holding one) can
+  reach memory outside the object, breaking the access rule (§12.1) as a raw pointer
+  can. Share such values between threads only through a lock or other
+  synchronization (std/sync), or as integers updated with atomics.
 - **Implementation obligation.** A conforming implementation MUST NOT perform
   optimizations that are sound only if the program has no races. For example, it MUST
   NOT assume that two reads of a racing location return the same value, or turn a
