@@ -401,10 +401,13 @@ pub struct Reader {
     }
 
     /// Sets an entry unless a newer section already did.
-    fn add_entry(self: *mut Reader, num: usize, e: Entry, seen: *mut vec.Vec.[u8]) ReadError!void {
-        if num >= (1 << 23) {
+    // (num is a u64, so that a subsection starting past 2^32 cannot wrap to
+    // low object numbers where usize is 32 bits)
+    fn add_entry(self: *mut Reader, num64: u64, e: Entry, seen: *mut vec.Vec.[u8]) ReadError!void {
+        if num64 >= (1 << 23) {
             return;
         }
+        let num = @truncate(usize, num64);
         while seen.len <= num {
             seen.push(0)!;
         }
@@ -499,7 +502,7 @@ pub struct Reader {
                 }
                 let kind = d[t0];
                 i = t0 + 1;
-                let num = @truncate(usize, @bit_cast(u64, start)) + k;
+                let num = @bit_cast(u64, start) + @as(u64, k);
                 if (kind == 'n') and (off > 0) {
                     self.add_entry(num, Entry.{ kind: 1, off: @bit_cast(u64, off), index: 0 }, seen)!;
                 } else {
@@ -571,7 +574,7 @@ pub struct Reader {
                     }
                 }
                 pos += row;
-                let num = @truncate(usize, @bit_cast(u64, start)) + j;
+                let num = @bit_cast(u64, start) + @as(u64, j);
                 if f[0] == 1 {
                     self.add_entry(num, Entry.{ kind: 1, off: f[1], index: 0 }, seen)!;
                 } else if f[0] == 2 {
@@ -2960,6 +2963,24 @@ test "hostile structures" {
         }
         rr.deinit();
     }
+}
+
+test "cross-reference subsections past 2^32 are dropped" {
+    let objs: [4][]u8 = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                         "<< /Type /Page /Parent 2 0 R >>", "(four)"];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    // a subsection freeing object 2^32 + 4, ahead of the real one: with a
+    // 32-bit usize it once freed object 4
+    let x = (strs.index_of(pdf, "\nxref\n") catch 0) + 6;
+    let mut s = strs.String.from(pdf[..x])!;
+    defer s.deinit();
+    s.push_str("4294967300 1\n0000000000 65535 f \n")!;
+    s.push_str(pdf[x..])!;
+    let mut r = Reader.open(s.bytes())!;
+    defer r.deinit();
+    @expect_eq(r.page_count(), 1);
+    @expect(not r.resolve(r.object(4)!)!.is_null());
 }
 
 test "objects that fail to parse, used many times" {

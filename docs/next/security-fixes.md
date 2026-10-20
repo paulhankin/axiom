@@ -260,3 +260,17 @@
 - The program's globals together must fit the target's largest object (2^31 - 1 bytes
   on wasm32), else E0473 at the first global that does not fit; more than 4 GiB of
   globals on wasm32 crashed the compiler.
+- `std/os/fs.mkdir_all` recursed once per path element, so `extract_all` in
+  `std/archive/tar` and `std/archive/zip` on an entry named `a/a/…/f` (400000 levels,
+  in a pax header) ran out of stack. It walks the path in a loop, and `zip.safe_name`
+  (used by both archives) refuses names longer than `zip.MAX_NAME` (4096 bytes) with
+  `error.UnsafePath`.
+- `std/audio/aac`: an MP4 edit list with 64-bit times could overflow when scaled to the
+  output rate, trapping in an `--overflow=trap` build; such an edit is clamped to the
+  decoded audio.
+- `std/os/term.decode_key` took a run of ESC bytes as Alt-Alt-…-Escape, recursing once
+  per byte, so a megabyte of them exhausted the stack. ESC before ESC is an Escape key
+  on its own.
+- On wasm32, `std/graphics/pdf` read a cross-reference subsection starting at or past
+  object 2^32 as one for low object numbers, and `std/audio/opus` cut its output short
+  at a final granule position past 2^32; both compare the 64-bit values.

@@ -65,7 +65,7 @@ schedule).
 | Vorbis | codebooks sorted in O(n log n) (heapsort on packed keys); codebook entries plus lookup values at most 2^22 or 64 per byte of the setup header, checked before allocating; no inverse MDCT for a channel without a floor |
 | Ogg | resynchronizing checks the CRCs of at most 4 × the file's size + 1 MiB per scan, then finds no more pages |
 | Opus | output sized once from the packets' tables of contents; the samples decoded by all streams limited like the output |
-| AAC | MP4 samples decoded may total at most the file's size (no shared bytes); table sizes compared by division; no inverse transform for an absent channel that is silent |
+| AAC | MP4 samples decoded may total at most the file's size (no shared bytes); table sizes compared by division; no inverse transform for an absent channel that is silent; edit-list times scaled with checked products and clamped to the audio decoded |
 | fonts | GPOS kerning subtables precomputed (at most 32), never rescanned per pair, from a walk of at most 2^16 lookup indices and subtables that reads a shared feature table once; cmap format 12 arithmetic wraps and every glyph id is checked against `numGlyphs`; CFF INDEX `offSize` must be 1 to 4, with saturating offsets |
 | shaping | per character of text, at most 64 glyphs, 4096 buffer moves and nested lookups, and 1024 matching steps (each glyph examined, subtable, rule and lookup record tried, a pass of a lookup over the buffer), plus one allowance (65536 glyphs and moves, 2^20 steps) shared by all the runs of a `Shaper`, and so of a `text.layout`; past a limit, shaping stops where it is and returns what it has. Lookup digests read at most the font's size plus 65536 subtables and coverage entries per table; cursive chains followed at most 64 links; mark offsets from prefix sums; a text's glyph limit set before it is added, so long texts are shaped whole (or `OutOfMemory`); letter spacing and cluster lengths in `text.layout` by binary search |
 | TIFF | the directories walked may total at most the file's size, so a chain that loops back fails at once; at most 65536 pages |
@@ -73,7 +73,7 @@ schedule).
 | QOI, BMP, PNM, HDR | the size an image claims checked against the data before allocating: at least `pixels / 62` bytes for QOI, `pixels / 128` for RLE BMP and `pixels / 32` for HDR; PNM rasters exactly; an uncompressed BMP at least half its raster |
 | PDF | an object is parsed once (a failure is cached, its partial results freed); parsing limited to 8 × the file plus its object streams; streams decoded once and reused; each use of a form XObject costs 1024 of the text extractor's 2^26 steps |
 | zstd | the compressor's matches end at their block (linear time on repetitive input) |
-| zip | entries' local headers and data may not overlap (no amplification from shared bytes); extraction stops at each entry's declared size, and `extract_all` takes a limit on their sum (`TooLarge`); ZIP64 and end-record offsets checked without wrapping |
+| zip | entries' local headers and data may not overlap (no amplification from shared bytes); extraction stops at each entry's declared size, and `extract_all` takes a limit on their sum (`TooLarge`); ZIP64 and end-record offsets checked without wrapping; entry names (in zip and tar) at most `MAX_NAME` (4096 bytes), so a deep path cannot exhaust the stack |
 
 ### Network, TLS and X.509
 
@@ -100,10 +100,10 @@ schedule).
 | json | arena chunks at least as large as the allocation |
 | vec, str | `v.extend(v.items())` and `s.push_str(s.bytes())` work when the source aliases the destination |
 | c | `to_cstr` refuses an interior NUL |
-| fs | NUL refused in paths by every runtime; saturating times; temporary directories created 0700; `remove_all` and `walk` open directories relative to their parents with `O_NOFOLLOW` (`ax_dir_*`), so a symbolic link swapped in for a directory is not followed (from 32 levels down an ancestor's handle is closed and, when reopened through `..`, checked by device and inode, so a tree deeper than the descriptor limit cannot stop a cleanup); the node host pins each directory with a descriptor and resolves names through it (Linux), or checks device and inode before each use; `copy_file` gives a new file the source's permission bits; `map` sizes the mapping from the file it opened |
+| fs | NUL refused in paths by every runtime; saturating times; `mkdir_all` iterative (no recursion per path element); temporary directories created 0700; `remove_all` and `walk` open directories relative to their parents with `O_NOFOLLOW` (`ax_dir_*`), so a symbolic link swapped in for a directory is not followed (from 32 levels down an ancestor's handle is closed and, when reopened through `..`, checked by device and inode, so a tree deeper than the descriptor limit cannot stop a cleanup); the node host pins each directory with a descriptor and resolves names through it (Linux), or checks device and inode before each use; `copy_file` gives a new file the source's permission bits; `map` sizes the mapping from the file it opened |
 | process | on Windows, batch files refused (cmd.exe would read their arguments as commands) and a bare program name looked for only on the child's `PATH`; on macOS a child gets only its standard streams (`POSIX_SPAWN_CLOEXEC_DEFAULT`) |
 | environment | `unsetenv` removes every entry for a name (the initial environment can hold several); `setenv` leaves one |
-| term | `set_title` leaves out C0, DEL and C1 controls and invalid UTF-8 |
+| term | `set_title` leaves out C0, DEL and C1 controls and invalid UTF-8; `decode_key` reads ESC ESC as two Escapes, without recursion |
 | threads | signal alternate stacks and thread stacks freed when a thread exits |
 | runtime | `@memory_discard` gives back only pages that `@memory_grow` handed out; a range over the stack, globals, code or C's memory, or one that wraps around the address space, is left alone |
 | log | CR, LF, C1 controls, U+2028/U+2029 and invalid UTF-8 escaped in messages and keys, so input cannot forge log lines; a failed rotation reopens the file in append mode |

@@ -657,17 +657,19 @@ fn decode_mp4(data: []u8) AacError!audio.Sound {
     let orate = dec.output_rate(d);
     let rate = @as(u64, @bit_cast(u32, orate));
     let ts = @as(u64, tr.timescale);
-    let mut skip: usize = 0;
-    let mut total = out.frames;
+    let frames = @as(u64, out.frames);
+    let mut skip: u64 = 0;
+    let mut total = frames;
     if (tr.edit_skip >= 0) and (ts > 0) {
-        skip = @truncate(usize, (@bit_cast(u64, tr.edit_skip) * rate) / ts);
+        skip = rescale(@bit_cast(u64, tr.edit_skip), rate, ts);
         if (tr.edit_len > 0) and (movie_scale > 0) {
-            total = @truncate(usize, (tr.edit_len * rate) / @as(u64, movie_scale));
+            total = rescale(tr.edit_len, rate, @as(u64, movie_scale));
             // the media's own length is exact where the movie's timescale is coarse
             if tr.duration > @bit_cast(u64, tr.edit_skip) {
-                let media = @truncate(usize, ((tr.duration - @bit_cast(u64, tr.edit_skip)) * rate) / ts);
+                let media = rescale(tr.duration - @bit_cast(u64, tr.edit_skip), rate, ts);
                 let diff = @max(media, total) - @min(media, total);
-                if (diff * @as(usize, movie_scale)) < @truncate(usize, rate) {
+                let err = @mul_checked(diff, @as(u64, movie_scale)) catch rate;
+                if err < rate {
                     total = media;
                 }
             }
@@ -676,11 +678,18 @@ fn decode_mp4(data: []u8) AacError!audio.Sound {
         let mut priming: u64 = 0;
         let mut length: u64 = 0;
         if itunsmpb(data, &moov, &mut priming, &mut length) {
-            skip = @truncate(usize, priming);
-            total = @truncate(usize, length);
+            skip = priming;
+            total = length;
         }
     }
-    return finish(&mut out, orate, skip, total);
+    return finish(&mut out, orate, @truncate(usize, @min(skip, frames)), @truncate(usize, @min(total, frames)));
+}
+
+// v * by / per for a 32-bit per, or the most a u64 holds if v * by does
+// not fit in one (the quotient is then at least 2^32, past any output).
+fn rescale(v: u64, by: u64, per: u64) u64 {
+    let p = @mul_checked(v, by) catch return @max_value(u64);
+    return p / per;
 }
 
 /// Decodes an ADTS stream or an MP4 file's first AAC track to F32 samples.
@@ -882,4 +891,42 @@ test "absent channels are silent, and output is limited" {
         refused = e == error.TooLarge;
     };
     @expect(refused and (o.frames == 1024));
+}
+
+// main.m4a with its edit list rewritten as one version 1 edit (64-bit
+// fields), the boxes holding it grown to fit.
+fn with_edit(orig: []u8, dur: u64, media_time: u64) ![]mut u8 {
+    let e = strs.index_of(orig, "elst")!;
+    let d = mem.alloc.[u8](orig.len + 8)!;
+    @mem_copy(d[..e + 4], orig[..e + 4]);
+    @mem_copy(d[e + 32..], orig[e + 24..]);
+    binary.put_u32(d[e + 4..], 0x01000000, binary.Endian.BIG);
+    binary.put_u32(d[e + 8..], 1, binary.Endian.BIG);
+    binary.put_u64(d[e + 12..], dur, binary.Endian.BIG);
+    binary.put_u64(d[e + 20..], media_time, binary.Endian.BIG);
+    binary.put_u32(d[e + 28..], 0x00010000, binary.Endian.BIG);
+    for typ in ["moov", "trak", "edts", "elst"] {
+        let at = (strs.index_of(d[..e + 4], typ)!) - 4;
+        binary.put_u32(d[at..], binary.u32_be(d[at..]) + 8, binary.Endian.BIG);
+    }
+    return d;
+}
+
+test "edit lists too long to scale are clamped, not overflowed" {
+    let orig = fs.read_file("std/audio/testdata/aac/main.m4a") catch return;
+    defer mem.free(orig);
+    let mut plain = decode(orig)!;
+    defer plain.deinit();
+    // a long edit: everything decoded is kept
+    let long = with_edit(orig, 1 << 63, 0)!;
+    defer mem.free(long);
+    let mut s = decode(long)!;
+    defer s.deinit();
+    @expect(s.frames >= plain.frames);
+    // a late start: nothing is
+    let late = with_edit(orig, 1 << 62, 1 << 62)!;
+    defer mem.free(late);
+    let mut t = decode(late)!;
+    defer t.deinit();
+    @expect_eq(t.frames, 0);
 }
