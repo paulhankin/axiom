@@ -65,6 +65,8 @@ schedule).
 | GIF, WebP | each frame charged a full canvas of work; all frames together at most `MAX_PIXELS` pixels |
 | QOI, BMP, PNM, HDR | the size an image claims checked against the data before allocating: at least `pixels / 62` bytes for QOI, `pixels / 128` for RLE BMP and `pixels / 32` for HDR; PNM rasters exactly; an uncompressed BMP at least half its raster |
 | PDF | an object is parsed once (a failure is cached, its partial results freed); parsing limited to 8 × the file plus its object streams; streams decoded once and reused; each use of a form XObject costs 1024 of the text extractor's 2^26 steps |
+| zstd | the compressor's matches end at their block (linear time on repetitive input) |
+| zip | entries' local headers and data may not overlap (no amplification from shared bytes); extraction stops at each entry's declared size, and `extract_all` takes a limit on their sum (`TooLarge`); ZIP64 and end-record offsets checked without wrapping |
 
 ### Network, TLS and X.509
 
@@ -103,7 +105,12 @@ schedule).
 | Where | What std does |
 |---|---|
 | regex | linear-time matching; a compile work budget (4 × `MAX_PROGRAM`); nesting depth below 1000; a bounded DFA cache (`DFA_MAX_PCS`). `find_all` and `replace_all` search again after each match, so a pattern whose higher-priority alternative outlives its match (`a*b\|a` on runs of `a`) takes quadratic time over many matches, as in RE2; an untrusted pattern over a large text needs a bound on one of them |
-| markdown | linear-time structures for the known CommonMark pathological inputs (nested brackets, emphasis, backticks, list tightness); a budget on link reference expansion; safe HTML by default |
+| markdown | linear-time structures for the known CommonMark pathological inputs (nested brackets, emphasis, backticks, list tightness); a budget on link reference expansion; a budget on the empty cells that pad short table rows (`max(input size, 65536)`; past it the table ends); safe HTML by default |
+| html | repeated attribute names found with a hash table under std's keyed hash, against collisions |
+| diff | `apply` refuses malformed hunk ranges (`InvalidPatch`) instead of trapping |
+| xml | attribute defaults looked up by element, and what they add (a default's value plus 64 bytes) limited to `MAX_EXPANSION` or four times the document's size; entity expansion limited to `MAX_EXPANSION`; duplicate attributes found with a hash set (past 16) and expanded names by sorting; namespace prefixes looked up in a map, in the parser and in `canonicalize` |
+| yaml | the tree with aliases expanded limited to 100 times the text's size plus 100000, counting each node 1 and each scalar its bytes too |
+| template | sections nest at most `MAX_DEPTH` (100) deep, with partials when rendering; a render budget (`MAX_WORK`: 16 per tag, 1 per byte written, so at most 64 MiB); partials compiled once per render; delimiters at most `MAX_DELIMITER` (16) bytes |
 | unicode | linear-time reordering (a counting sort), word boundaries (a capped regional-indicator count) and sentence boundaries (a memoized suffix scan) |
 | bidi | isolates matched with an explicit stack, not recursion |
 | path | glob `**` matched with single backtracking, not exponentially |

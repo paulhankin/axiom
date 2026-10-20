@@ -91,3 +91,42 @@
   once, and each use of a form XObject counts against the text extractor's step limit,
   so a form that draws itself many times no longer takes seconds and hundreds of
   megabytes.
+- `std/compress/zstd.compress` could take hours on repetitive input longer than one
+  block (128 KiB) at level 3 or above: near a block's end, each position measured its
+  match past the block. It is now linear.
+- `std/archive/zip`:
+  - `Archive.open` refuses, with `error.Corrupt`, archives whose entries share bytes
+    (several central directory entries pointing at one local file), which let an 11 KB
+    archive extract to 200 MB.
+  - `extract_all` and `extract_all_password` take a `max_size` and fail with
+    `error.TooLarge`, before writing anything, if the entries' sizes add up to more.
+    Callers need to pass one.
+  - A ZIP64 locator in an archive shorter than 56 bytes made `Archive.open` trap; it
+    fails with `error.Corrupt`.
+- `std/text/markdown`: a GFM table with a wide header and many short rows padded every
+  row to the header's width, so 18 KB of input took 10 s and 1 GB. Padding has a
+  budget proportional to the input; past it the table ends.
+- `std/text/html`: the table that finds repeated attribute names used an unkeyed hash,
+  so a tag with many chosen names took quadratic time. It uses std's keyed hash.
+- `std/text/diff.apply`: a hunk removing lines from line 0 (`@@ -0,1 ...`) trapped in an
+  `--overflow=trap` build; it fails with `error.InvalidPatch`.
+- `std/encoding/xml`: attribute defaults from the internal DTD subset took cubic time
+  and quadratic memory (a 39 KB document ran for 17 s in 250 MB), and a long default on
+  many elements could multiply a document's size a thousandfold. Defaults are looked up
+  by element, and what they add counts against a limit (`MAX_EXPANSION` or four times
+  the document's size); past it, parsing fails with `error.TooLarge`. Elements with
+  tens of thousands of attributes or namespace declarations, and thousands of
+  namespace bindings in scope, no longer take quadratic time to parse or canonicalize.
+- `std/encoding/yaml`: the alias limit counted a scalar as one node whatever its length,
+  so a 100 KB document aliasing a 50 KB scalar 10000 times expanded to 500 MB in code
+  that walks the tree. A scalar counts its length too, and such documents fail with
+  `error.TooLarge`.
+- `std/text/template` was not safe for untrusted templates, as it claimed:
+  - Deeply nested sections overflowed the stack. Sections nest at most `MAX_DEPTH`
+    (100) deep, together with partials when rendering (`error.TooDeep`).
+  - Nested sections, and partials that include others twice, could write gigabytes or
+    run for ever. A render does at most `MAX_WORK` steps, so it writes at most 64 MiB,
+    else it fails with the new `error.TooLarge`; each partial is compiled once per
+    render.
+  - Many tags on one line took quadratic time to compile. Delimiters set with
+    `{{=...=}}` are at most `MAX_DELIMITER` (16) bytes.

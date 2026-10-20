@@ -5,7 +5,7 @@
 //     defer a.deinit();
 //     for e in a.entries { ... e.name ... e.size ... }
 //     let data = a.extract(a.find("docs/readme.txt")!)!;   // (the caller frees it)
-//     a.extract_all("out/dir")!;                        // to the filesystem
+//     a.extract_all("out/dir", 1 << 30)!;               // to the filesystem (at most 1 GiB)
 //
 //     let mut s = strs.String.init();                   // writing
 //     let mut w = zip.Writer.init(s.writer());
@@ -17,8 +17,10 @@
 // Reading follows the central directory, with ZIP64 for big archives,
 // archive comments and UTF-8 names; entries may be stored or deflated
 // (other methods fail with Unsupported). Every entry's CRC-32 and size are
-// checked, and extraction never produces more than the size an entry
-// declares, so "zip bombs" cannot run away.
+// checked, extraction never produces more than the size an entry
+// declares, entries cannot share their bytes (open fails with Corrupt), and
+// extract_all takes a limit on the sizes' sum, so "zip bombs" cannot run
+// away.
 //
 // Encrypted entries (extract fails with PasswordRequired) are read with
 // extract_password / extract_all_password: WinZip AES (AE-1 and AE-2, 128,
@@ -146,7 +148,9 @@ pub struct Archive {
         // ZIP64: a locator just before the record points to the real numbers
         if (e >= 20) and (binary.u32_le(d[e - 20..]) == SIG_LOC64) {
             let r = binary.u64_le(d[e - 12..]);
-            if (r > @as(u64, d.len - 56)) or (binary.u32_le(d[@truncate(usize, r)..]) != SIG_END64) {
+            // (the 56-byte ZIP64 record comes before the locator)
+            if (e < (20 + 56)) or (r > @as(u64, e - (20 + 56))) or
+               (binary.u32_le(d[@truncate(usize, r)..]) != SIG_END64) {
                 return error.Corrupt;
             }
             let ri = @truncate(usize, r);
@@ -189,6 +193,25 @@ pub struct Archive {
             self.list.push(ent)!;
             p += 46 + nlen + xlen + klen;
         }
+        self.check_spans()!;
+    }
+
+    // Each entry's local header and data must be bytes of its own: entries
+    // sharing them would let a small archive extract to any size.
+    fn check_spans(self: *Archive) ZipError!void {
+        let es = self.list.items();
+        let spans = mem.alloc.[Span](es.len)!;
+        defer mem.free(spans);
+        for k in @as(usize, 0)..es.len {
+            let st = self.data_start(es[k])!;
+            spans[k] = Span.{ lo: @truncate(usize, es[k].offset), hi: st + @truncate(usize, es[k].csize) };
+        }
+        vec.sort(spans, span_less);
+        for k in @as(usize, 1)..spans.len {
+            if spans[k].lo < spans[k - 1].hi {
+                return error.Corrupt;
+            }
+        }
     }
 
     /// The entry with this name.
@@ -203,8 +226,15 @@ pub struct Archive {
 
     /// An entry's compressed bytes (as stored in the archive).
     pub fn raw(self: *Archive, e: Entry) ZipError![]u8 {
+        let st = self.data_start(e)!;
+        return self.data[st..st + @truncate(usize, e.csize)];
+    }
+
+    // Where an entry's compressed bytes start, after its local header (and
+    // checked to fit in the archive).
+    fn data_start(self: *Archive, e: Entry) ZipError!usize {
         let d = self.data;
-        if (e.offset > @as(u64, d.len - @min(d.len, 30))) or
+        if (d.len < 30) or (e.offset > @as(u64, d.len - 30)) or
            (binary.u32_le(d[@truncate(usize, e.offset)..]) != SIG_LOCAL) {
             return error.Corrupt;
         }
@@ -213,7 +243,7 @@ pub struct Archive {
         if (st > d.len) or (e.csize > @as(u64, d.len - st)) {
             return error.Corrupt;
         }
-        return d[st..st + @truncate(usize, e.csize)];
+        return st;
     }
 
     /// An entry's contents, checked against its size and CRC-32; the caller
@@ -254,23 +284,32 @@ pub struct Archive {
     }
 
     /// extract_all, decrypting encrypted entries with password.
-    pub fn extract_all_password(self: *Archive, dir: []u8, password: []u8) !void {
-        self.extract_all_with(dir, password)!;
+    pub fn extract_all_password(self: *Archive, dir: []u8, password: []u8, max_size: usize) !void {
+        self.extract_all_with(dir, password, max_size)!;
     }
 
     /// Extracts every entry under dir (created if need be), refusing names
-    /// that would leave it, and symbolic links.
-    pub fn extract_all(self: *Archive, dir: []u8) !void {
-        self.extract_all_with(dir, "")!;
+    /// that would leave it, and symbolic links. Fails with TooLarge, before
+    /// writing anything, if the entries' sizes add up to more than max_size
+    /// bytes.
+    pub fn extract_all(self: *Archive, dir: []u8, max_size: usize) !void {
+        self.extract_all_with(dir, "", max_size)!;
     }
 
-    fn extract_all_with(self: *Archive, dir: []u8, password: []u8) !void {
-        fs.mkdir_all(dir)!;
+    fn extract_all_with(self: *Archive, dir: []u8, password: []u8, max_size: usize) !void {
+        let mut total: u64 = 0;
         for e in self.entries {
             if not safe_name(e.name) or e.is_symlink() {
                 return error.UnsafePath;
             }
+            if not e.is_dir() {
+                total = @min(total, @as(u64, 1) << 62) + @min(e.size, @as(u64, 1) << 62);
+            }
         }
+        if total > @as(u64, max_size) {
+            return error.TooLarge;
+        }
+        fs.mkdir_all(dir)!;
         for e in self.entries {
             let target = path.join2(dir, e.name)!;
             defer mem.free(target);
@@ -292,6 +331,15 @@ pub struct Archive {
             fs.write_file(target, data)!;
         }
     }
+}
+
+struct Span {
+    lo: usize,
+    hi: usize,
+}
+
+fn span_less(a: Span, b: Span) bool {
+    return a.lo < b.lo;
 }
 
 // An entry's (decrypted) data, decompressed and checked against its size
@@ -1012,6 +1060,73 @@ test "hostile archives" {
         @expect(not safe_name(n));
     }
     @expect(safe_name("a/b..c/d"));
+}
+
+test "entries sharing their bytes, and extract_all's limit" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut w = Writer.init(s.writer());
+    let mut zeros = strs.String.init();
+    defer zeros.deinit();
+    for _k in @as(usize, 0)..100000 {
+        zeros.push(0)!;
+    }
+    w.add("z", zeros.bytes(), Options.default())!;
+    w.finish()!;
+    w.deinit();
+    let good = s.bytes();
+    let mut a = Archive.open(good)!;
+    defer a.deinit();
+    // (fails before it creates the directory)
+    let mut too_large = false;
+    a.extract_all("zip-test-out-never-created", 99999) catch |e| {
+        too_large = e == error.TooLarge;
+    };
+    @expect(too_large);
+    // the central directory entry three times over, for one local file
+    let cd = strs.last_index_of(good, "PK\x01\x02")!;
+    let eocd = strs.last_index_of(good, "PK\x05\x06")!;
+    let mut b = strs.String.from(good[..eocd])!;
+    defer b.deinit();
+    b.push_str(good[cd..eocd])!;
+    b.push_str(good[cd..eocd])!;
+    b.push_str(good[eocd..])!;
+    let n = b.len - 22;
+    let x = b.bytes();
+    binary.put_u16_le(x[n + 8..n + 10], 3);
+    binary.put_u16_le(x[n + 10..n + 12], 3);
+    binary.put_u32_le(x[n + 12..n + 16], @truncate(u32, 3 * (eocd - cd)));
+    @expect(fails_open(x));
+    // the same entries, each with a local file of its own
+    let mut c = strs.String.from(good[..cd])!;
+    defer c.deinit();
+    c.push_str(good[..cd])!;
+    c.push_str(good[cd..eocd])!;
+    c.push_str(good[cd..eocd])!;
+    binary.put_u32_le(c.bytes()[c.len - (eocd - cd) + 42..], @truncate(u32, cd));
+    c.push_str(good[eocd..])!;
+    let m = c.len - 22;
+    let y = c.bytes();
+    binary.put_u16_le(y[m + 8..m + 10], 2);
+    binary.put_u16_le(y[m + 10..m + 12], 2);
+    binary.put_u32_le(y[m + 12..m + 16], @truncate(u32, 2 * (eocd - cd)));
+    binary.put_u32_le(y[m + 16..m + 20], @truncate(u32, 2 * cd));
+    let mut a2 = Archive.open(y)!;
+    defer a2.deinit();
+    @expect_eq(a2.entries.len, 2);
+    let z = a2.extract(a2.entries[1])!;
+    defer mem.free(z);
+    @expect_eq(z, zeros.bytes());
+}
+
+test "a ZIP64 locator in a short archive" {
+    // the locator, pointing at offset 16, and an empty end record: 42 bytes
+    let mut b: [42]u8 = [0; 42];
+    binary.put_u32_le(b[0..4], SIG_LOC64);
+    b[8] = 16;
+    binary.put_u32_le(b[16..20], SIG_END64);
+    binary.put_u32_le(b[20..24], SIG_END);
+    @expect(fails_open(b[..]));
 }
 
 fn fails_extract(a: *Archive, e: Entry) bool {

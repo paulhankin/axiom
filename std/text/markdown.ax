@@ -557,6 +557,8 @@ struct Parser {
     current: u32,
     /// Bytes of destinations and titles that reference links may still expand to.
     ref_budget: usize,
+    /// Empty cells that short table rows may still be padded with.
+    table_budget: usize,
     /// Column alignments (Align values) of the tables (each TABLE's `start` columns from its `fence_offset`).
     aligns: vec.Vec.[Align],
     scratch: strs.String,
@@ -607,6 +609,7 @@ struct Parser {
             partially_consumed_tab: false,
             current: 0,
             ref_budget: @max(size * 10, 100000),
+            table_budget: @max(size, 65536),
             aligns: vec.Vec.[Align].init(),
             scratch: strs.String.init(),
             s: "",
@@ -1014,8 +1017,8 @@ struct Parser {
             }
         } else if self.blank {
             // nothing
-        } else if k == Kind.TABLE {
-            table_row(self, container)!;
+        } else if (k == Kind.TABLE) and table_row(self, container)! {
+            // (a row)
         } else if (k == Kind.PARAGRAPH) or (k == Kind.HEADING) {
             if k == Kind.HEADING {
                 // (a setext heading's underline leaves the line blank, so this is ATX)
@@ -2238,14 +2241,24 @@ fn add_row(p: *mut Parser, table: u32, off: u32, cells: *vec.Vec.[Cell], header:
     }
 }
 
-fn table_row(p: *mut Parser, table: u32) MarkdownError!void {
-    let off = p.doc.raw.len;
+/// Adds the line to a table as a row, unless padding it would take more
+/// empty cells than the budget has left (then the table ends before it).
+fn table_row(p: *mut Parser, table: u32) MarkdownError!bool {
     let line = p.line.bytes();
-    p.doc.raw.push_str(line[p.first_nonspace..line.len - 1])!;
+    let row = line[p.first_nonspace..line.len - 1];
     let mut cells = vec.Vec.[Cell].init();
     defer cells.deinit();
-    row_cells(p.doc.raw.bytes()[off..], &mut cells)!;
+    row_cells(row, &mut cells)!;
+    let ncols = @as(usize, p.nd(table).start);
+    let pad = ncols - @min(ncols, cells.len);
+    if pad > p.table_budget {
+        return false;
+    }
+    p.table_budget -= pad;
+    let off = p.doc.raw.len;
+    p.doc.raw.push_str(row)!;
     add_row(p, table, @truncate(u32, off), &mut cells, false)!;
+    return true;
 }
 
 fn insert_before(doc: *mut Document, at_id: u32, id: u32) void {
@@ -4173,6 +4186,30 @@ test "hostile input stays linear" {
     defer mem.free(h);
     // references expanded at most ~10x the input's size
     @expect(h.len < s.len * 12);
+}
+
+test "short rows of a wide table" {
+    // a 3000-column header and 3000 one-cell rows: padding every row would
+    // make 9 million cells
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push('|')!;
+    for _k in 0..@as(usize, 3000) {
+        s.push_str("a|")!;
+    }
+    s.push_str("\n|")!;
+    for _k in 0..@as(usize, 3000) {
+        s.push_str("-|")!;
+    }
+    s.push('\n')!;
+    for _k in 0..@as(usize, 3000) {
+        s.push_str("x\n")!;
+    }
+    let h = to_html(s.bytes(), Options.init())!;
+    defer mem.free(h);
+    // the rows that fit in the budget, then a paragraph
+    @expect(h.len < (s.len * 200));
+    @expect(strs.ends_with(h, "x\nx</p>\n"));
 }
 
 test "to_html_to streams the same HTML" {

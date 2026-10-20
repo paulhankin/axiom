@@ -17,8 +17,10 @@
 // strings, and the !!str, !!int, !!float, !!bool and !!null tags are
 // honoured. Mapping keys must be scalars (they become strings); duplicate
 // keys are an error. Aliases share the anchored value (the tree is a DAG),
-// and the expanded size is limited so that "billion laughs" documents are
-// refused rather than exploding in code that walks the tree.
+// and the expanded size is limited (to 100 times the text's length plus
+// 100000, counting each node as 1 and each scalar's bytes too), so that
+// "billion laughs" documents are refused rather than exploding in code that
+// walks the tree.
 //
 // For everything the tree can't show (tags, styles, anchors, complex keys)
 // there is the event interface: `Events` gives the stream as libyaml does.
@@ -1998,10 +2000,11 @@ struct Composer {
         return e;
     }
 
-    // Adds a finished value (of `size` nodes) to the current collection,
-    // or returns true when it is the document's root.
+    // Adds a finished value (of `size`: a node counts 1, and a scalar its
+    // length more) to the current collection, or returns true when it is the
+    // document's root.
     fn add(self: *mut Composer, v: json.Value, size: u64, root: *mut json.Value) !bool {
-        self.total +%= size;
+        self.total = @add_checked(self.total, size) catch @max_value(u64);
         if self.total > self.limit {
             return self.fail("aliases expand beyond the size limit", error.TooLarge);
         }
@@ -2010,7 +2013,7 @@ struct Composer {
             return true;
         }
         let f = self.frames.get_ptr(self.frames.len - 1);
-        f.size +%= size;
+        f.size += size;  // (at most total, so this cannot wrap)
         if f.seq {
             f.items.push(v)!;
             return false;
@@ -2067,8 +2070,9 @@ struct Composer {
                     let v = resolve(self.ar, e) catch |err| {
                         return self.fail("a scalar does not match its tag", err);
                     };
-                    self.remember(e.anchor, v, 1)!;
-                    if self.add(v, 1, &mut root)! {
+                    let size = 1 + @as(u64, e.value.len);
+                    self.remember(e.anchor, v, size)!;
+                    if self.add(v, size, &mut root)! {
                         break;
                     }
                 }
@@ -2093,7 +2097,7 @@ struct Composer {
                     f.members.deinit();
                     let v = json.Value.Array(xs);
                     self.remember(f.anchor, v, f.size)!;
-                    self.total -%= f.size - 1;  // (counted as the children were added)
+                    self.total -= f.size - 1;  // (counted as the children were added)
                     if self.add(v, f.size, &mut root)! {
                         break;
                     }
@@ -2113,7 +2117,7 @@ struct Composer {
                     }
                     let v = json.Value.Object(ms);
                     self.remember(f.anchor, v, f.size)!;
-                    self.total -%= f.size - 1;
+                    self.total -= f.size - 1;
                     if self.add(v, f.size, &mut root)! {
                         break;
                     }
@@ -2897,6 +2901,35 @@ test "hostile input" {
             @trap();
         };
         @trap();
+    };
+    @trap();
+}
+
+test "aliases of long scalars count their length" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str("a: &a ")!;
+    for _k in @as(usize, 0)..50000 {
+        s.push('x')!;
+    }
+    s.push_str("\nb: [")!;
+    let base = s.len;
+    for _k in @as(usize, 0)..10 {
+        s.push_str("*a, ")!;
+    }
+    s.push_str("*a]\n")!;
+    let mut doc = parse(s.bytes())!;
+    @expect_eq(doc.root.get("b")!.len(), 11);
+    doc.deinit();
+    // 10000 copies of 50000 bytes: refused
+    s.truncate(base);
+    for _k in @as(usize, 0)..10000 {
+        s.push_str("*a, ")!;
+    }
+    s.push_str("*a]\n")!;
+    _ = parse(s.bytes()) catch |e| {
+        @expect_eq(e, error.TooLarge);
+        return;
     };
     @trap();
 }

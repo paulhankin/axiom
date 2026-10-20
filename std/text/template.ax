@@ -23,24 +23,38 @@
 // interpolation, inverted sections, partials, sections); lambdas and the
 // optional extensions are not supported.
 //
-// Templates run no code, so rendering untrusted templates is safe: the
-// output is bounded by the template and data sizes, and partials may nest
-// only MAX_DEPTH deep.
+// Templates run no code, so rendering untrusted templates is safe: sections
+// and partials may nest only MAX_DEPTH deep (together, when rendering), a
+// render does at most MAX_WORK steps (so writes at most 64 MiB) else
+// TooLarge, each partial is compiled once per render, and delimiters set by
+// {{=...=}} are at most MAX_DELIMITER bytes.
 // =============================================================================
 
+import "../collections/map.ax" as maps;
 import "../collections/vec.ax" as vec;
 import "../encoding/json.ax" as json;
 import "../fmt.ax" as fmt;
+import "../hash.ax" as hash;
 import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 
 pub error TemplateError { InvalidTemplate, TooDeep, OutOfMemory, SyntaxError, Empty, IoError, BadFormat, NotFound,
-                          WrongType, InvalidNumber, Done, BadNesting, InvalidUtf8, EndOfStream }
+                          WrongType, InvalidNumber, Done, BadNesting, InvalidUtf8, EndOfStream, TooLarge }
 
-/// How deeply partials may include one another.
+/// How deeply sections may nest in a template, and sections and partials
+/// together when rendering.
 pub const MAX_DEPTH: u32 = 100;
+
+/// The most work one render may do (else TooLarge): each tag or run of text
+/// counts 16, and each byte written 1 more.
+pub const MAX_WORK: u64 = 64 << 20;
+
+/// The longest delimiter that {{=...=}} may set.
+pub const MAX_DELIMITER: usize = 16;
+
+const NONE: usize = @max_value(usize);
 
 /// A named partial, for {{> name}}.
 pub struct Partial {
@@ -69,7 +83,8 @@ pub struct Template {
     tokens: []mut Token,
 
     /// Parses a template: InvalidTemplate for unclosed tags, unbalanced
-    /// sections and bad delimiters.
+    /// sections and bad delimiters, TooDeep for sections nested more than
+    /// MAX_DEPTH deep.
     pub fn compile(src: []u8) TemplateError!Template {
         let mut toks = vec.Vec.[Token].init();
         parse(src, &mut toks) catch |e| {
@@ -96,8 +111,11 @@ pub struct Template {
 
     /// render, with partials for {{> name}} (missing ones render nothing).
     pub fn render_with(self: *Template, data: json.Value, partials: []Partial, w: io.Writer) !void {
-        let mut r = Renderer.{ stack: vec.Vec.[json.Value].init(), partials: partials, w: w, depth: 0 };
-        defer r.stack.deinit();
+        let mut r = Renderer.{ stack: vec.Vec.[json.Value].init(), partials: partials, w: w, depth: 0, work: 0,
+                               compiled: maps.Map.[[]u8, usize].init(hash.hash_bytes, hash.eq_bytes),
+                               cache: vec.Vec.[Compiled].init(), missing: vec.Vec.[[]mut u8].init(),
+                               key: strs.String.init() };
+        defer r.deinit();
         r.stack.push(data)!;
         r.run(self.tokens, 0, self.tokens.len)!;
     }
@@ -162,6 +180,8 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) TemplateError!void {
     defer open.deinit();
     let mut pos: usize = 0;
     let mut line_tagged: usize = 0;  // where the last tag ended (a line with an earlier tag has no standalone tag)
+    let mut ls: usize = 0;           // where the line of the tag starts,
+    let mut scanned: usize = 0;      // found by scanning src up to here
     while pos < src.len {
         let t = strs.index_of_from(src, otag, pos) catch {
             toks.push(Token.{ kind: Kind.TEXT, text: src[pos..], indent: "", end: 0 })!;
@@ -205,10 +225,12 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) TemplateError!void {
             e = at + close.len;
         }
         // standalone: alone on its line but for blanks
-        let mut ls = t;
-        while (ls > 0) and (src[ls - 1] != '\n') {
-            ls -= 1;
+        for j in scanned..t {
+            if src[j] == '\n' {
+                ls = j + 1;
+            }
         }
+        scanned = t;
         let mut standalone = false;
         let mut after = e;
         if ((((sigil == '#') or (sigil == '^')) or ((sigil == '/') or (sigil == '!'))) or
@@ -256,7 +278,8 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) TemplateError!void {
             let mut f = strs.fields(name);
             let a = f.next() catch return error.InvalidTemplate;
             let b = f.next() catch return error.InvalidTemplate;
-            if not ended(&mut f) or strs.contains(a, "=") or strs.contains(b, "=") {
+            if not ended(&mut f) or strs.contains(a, "=") or strs.contains(b, "=") or (a.len > MAX_DELIMITER) or
+               (b.len > MAX_DELIMITER) {
                 return error.InvalidTemplate;
             }
             otag = a;
@@ -267,6 +290,9 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) TemplateError!void {
             let mut kind = Kind.SECTION;
             if sigil == '^' {
                 kind = Kind.INVERTED;
+            }
+            if open.len >= @as(usize, MAX_DEPTH) {
+                return error.TooDeep;
             }
             open.push(toks.len)!;
             toks.push(Token.{ kind: kind, text: name, indent: "", end: 0 })!;
@@ -302,27 +328,70 @@ fn parse(src: []u8, toks: *mut vec.Vec.[Token]) TemplateError!void {
 // Rendering
 // -----------------------------------------------------------------------------
 
+// A partial, compiled with its indentation.
+struct Compiled {
+    key: []mut u8,   // the partial's name, NUL and the indentation
+    text: []mut u8,  // the indented source, if indented
+    t: Template,
+}
+
 struct Renderer {
     stack: vec.Vec.[json.Value],  // the context, innermost last
     partials: []Partial,
     w: io.Writer,
-    depth: u32,
+    depth: u32,  // sections and partials entered
+    work: u64,
+    compiled: maps.Map.[[]u8, usize],  // a Compiled key -> index in cache (NONE: no such partial)
+    cache: vec.Vec.[Compiled],
+    missing: vec.Vec.[[]mut u8],  // the keys of missing partials
+    key: strs.String,
+
+    fn deinit(self: *mut Renderer) void {
+        for i in @as(usize, 0)..self.cache.len {
+            free_compiled(self.cache.get_ptr(i));
+        }
+        self.cache.deinit();
+        for k in self.missing.items() {
+            mem.free(k);
+        }
+        self.missing.deinit();
+        self.compiled.deinit();
+        self.key.deinit();
+        self.stack.deinit();
+    }
+
+    fn charge(self: *mut Renderer, n: usize) TemplateError!void {
+        let c = @as(u64, n);
+        if (c > MAX_WORK) or ((self.work + 16 + c) > MAX_WORK) {
+            return error.TooLarge;
+        }
+        self.work += 16 + c;
+    }
+
+    fn enter(self: *mut Renderer) TemplateError!void {
+        if self.depth >= MAX_DEPTH {
+            return error.TooDeep;
+        }
+        self.depth += 1;
+    }
 
     fn run(self: *mut Renderer, toks: []Token, from: usize, to: usize) !void {
         let mut k = from;
         while k < to {
             let t = toks[k];
             if t.kind == Kind.TEXT {
+                self.charge(t.text.len)!;
                 self.w.write_all(t.text)!;
                 k += 1;
                 continue;
             }
             if (t.kind == Kind.VAR) or (t.kind == Kind.RAW) {
                 let v = self.lookup(t.text);
-                write_value(self.w, v, t.kind == Kind.VAR)!;
+                self.write_value(v, t.kind == Kind.VAR)!;
                 k += 1;
                 continue;
             }
+            self.charge(0)!;
             if t.kind == Kind.PARTIAL {
                 self.partial(t.text, t.indent)!;
                 k += 1;
@@ -333,27 +402,77 @@ struct Renderer {
             let truthy = is_truthy(v);
             if t.kind == Kind.INVERTED {
                 if not truthy {
-                    self.run(toks, k + 1, t.end)!;
+                    self.enter()!;
+                    let r = self.run(toks, k + 1, t.end);
+                    self.depth -= 1;
+                    r!;
                 }
             } else if truthy {
-                match v {
-                    .Array(xs) => {
-                        for x in xs {
-                            self.stack.push(x)!;
-                            let r = self.run(toks, k + 1, t.end);
-                            _ = self.stack.pop() catch json.Value.Null;
-                            r!;
-                        }
-                    }
-                    else => {
-                        self.stack.push(v)!;
-                        let r = self.run(toks, k + 1, t.end);
-                        _ = self.stack.pop() catch json.Value.Null;
-                        r!;
-                    }
-                }
+                self.enter()!;
+                let r = self.section(toks, k, v);
+                self.depth -= 1;
+                r!;
             }
             k = t.end;
+        }
+    }
+
+    fn section(self: *mut Renderer, toks: []Token, k: usize, v: json.Value) !void {
+        let t = toks[k];
+        match v {
+            .Array(xs) => {
+                for x in xs {
+                    self.charge(0)!;
+                    self.stack.push(x)!;
+                    let r = self.run(toks, k + 1, t.end);
+                    _ = self.stack.pop() catch json.Value.Null;
+                    r!;
+                }
+            }
+            else => {
+                self.stack.push(v)!;
+                let r = self.run(toks, k + 1, t.end);
+                _ = self.stack.pop() catch json.Value.Null;
+                r!;
+            }
+        }
+    }
+
+    // Writes v, charged as the bytes it writes before escaping.
+    fn write_value(self: *mut Renderer, v: json.Value, escape: bool) !void {
+        let w = self.w;
+        let mut buf: [40]u8 = [0; 40];
+        self.charge(0)!;
+        match v {
+            .Null => {}
+            .Bool(b) => {
+                if b {
+                    w.write_all("true")!;
+                } else {
+                    w.write_all("false")!;
+                }
+            }
+            .Int(n)   => { w.write_all(fmt.format_int(buf[..], n))!; }
+            .Float(f) => { w.write_all(fmt.format_float(buf[..], f)!)!; }
+            .String(s) => {
+                self.charge(s.len)!;
+                if escape {
+                    write_escaped(w, s)!;
+                } else {
+                    w.write_all(s)!;
+                }
+            }
+            else => {
+                // arrays and objects as JSON
+                let s = json.stringify(v)!;
+                defer mem.free(s);
+                self.charge(s.len)!;
+                if escape {
+                    write_escaped(w, s)!;
+                } else {
+                    w.write_all(s)!;
+                }
+            }
         }
     }
 
@@ -390,41 +509,91 @@ struct Renderer {
     }
 
     fn partial(self: *mut Renderer, name: []u8, indent: []u8) !void {
-        let mut src: []u8 = "";
+        self.key.clear();
+        self.key.push_str(name)!;
+        self.key.push(0)!;
+        self.key.push_str(indent)!;
+        let i = self.compiled.get(self.key.bytes()) catch self.compile(name, indent)!;
+        if i == NONE {
+            return;
+        }
+        self.enter()!;
+        let toks = self.cache.get(i).t.tokens;
+        let r = self.run(toks, 0, toks.len);
+        self.depth -= 1;
+        r!;
+    }
+
+    // Compiles a partial (its key in self.key) into the cache: its index
+    // there, or NONE (also remembered) if there is no such partial.
+    fn compile(self: *mut Renderer, name: []u8, indent: []u8) !usize {
+        let mut source: []u8 = "";
         let mut found = false;
         for p in self.partials {
             if strs.eq(p.name, name) {
-                src = p.source;
+                source = p.source;
                 found = true;
             }
         }
         if not found {
-            return;
+            let key = mem.dup(self.key.bytes())!;
+            self.missing.push(key) catch |e| {
+                mem.free(key);
+                return e;
+            };
+            self.compiled.put(key, NONE)!;
+            return NONE;
         }
-        if self.depth >= MAX_DEPTH {
-            return error.TooDeep;
+        // (the indented source's length)
+        let mut lines: usize = 1;
+        for ch in source {
+            if ch == '\n' {
+                lines += 1;
+            }
         }
-        // the indentation goes before each line of the partial's source
-        let mut text = strs.String.init();
-        defer text.deinit();
+        self.charge(@add_checked(source.len, @mul_checked(lines,
+                                                          indent.len) catch @max_value(usize)) catch @max_value(usize))!;
+        let mut c = Compiled.{ key: mem.dup(self.key.bytes())!, text: mem.alloc.[u8](0)!,
+                               t: Template.{ tokens: mem.alloc.[Token](0)! } };
+        let r = self.compile_into(&mut c, source, indent);
+        r catch |e| {
+            free_compiled(&mut c);
+            return e;
+        };
+        self.cache.push(c) catch |e| {
+            free_compiled(&mut c);
+            return e;
+        };
+        let i = self.cache.len - 1;
+        self.compiled.put(c.key, i)!;
+        return i;
+    }
+
+    fn compile_into(self: *mut Renderer, c: *mut Compiled, source: []u8, indent: []u8) !void {
+        let mut src = source;
         if indent.len > 0 {
+            // the indentation goes before each line of the partial's source
+            let mut text = strs.String.init();
+            defer text.deinit();
             let mut start = true;
-            for c in src {
+            for ch in source {
                 if start {
                     text.push_str(indent)!;
                 }
-                text.push(c)!;
-                start = c == '\n';
+                text.push(ch)!;
+                start = ch == '\n';
             }
-            src = text.bytes();
+            c.text = text.take()!;
+            src = c.text;
         }
-        let mut t = Template.compile(src)!;
-        defer t.deinit();
-        self.depth += 1;
-        let r = self.run(t.tokens, 0, t.tokens.len);
-        self.depth -= 1;
-        r!;
+        c.t = Template.compile(src)!;
     }
+}
+
+fn free_compiled(c: *mut Compiled) void {
+    mem.free(c.key);
+    mem.free(c.text);
+    c.t.deinit();
 }
 
 fn is_truthy(v: json.Value) bool {
@@ -433,39 +602,6 @@ fn is_truthy(v: json.Value) bool {
         .Bool(b)   => { return b; }
         .Array(xs) => { return xs.len > 0; }
         else       => { return true; }
-    }
-}
-
-fn write_value(w: io.Writer, v: json.Value, escape: bool) !void {
-    let mut buf: [40]u8 = [0; 40];
-    match v {
-        .Null => {}
-        .Bool(b) => {
-            if b {
-                w.write_all("true")!;
-            } else {
-                w.write_all("false")!;
-            }
-        }
-        .Int(n)   => { w.write_all(fmt.format_int(buf[..], n))!; }
-        .Float(f) => { w.write_all(fmt.format_float(buf[..], f)!)!; }
-        .String(s) => {
-            if escape {
-                write_escaped(w, s)!;
-            } else {
-                w.write_all(s)!;
-            }
-        }
-        else => {
-            // arrays and objects as JSON
-            let s = json.stringify(v)!;
-            defer mem.free(s);
-            if escape {
-                write_escaped(w, s)!;
-            } else {
-                w.write_all(s)!;
-            }
-        }
     }
 }
 
@@ -562,6 +698,72 @@ test "examples" {
     let loop_: [1]Partial = [Partial.{ name: "p", source: "x{{>p}}" }];
     let r = render_with_alloc("{{>p}}", doc.root, loop_[..]);
     @expect(too_deep(r));
+}
+
+test "hostile templates fail quickly" {
+    let mut doc = json.parse("{\"a\": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], \"t\": \"x\"}")!;
+    defer doc.deinit();
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // sections nested past MAX_DEPTH
+    for _k in @as(usize, 0)..100000 {
+        s.push_str("{{^x}}")!;
+    }
+    @expect(too_deep(render_alloc(s.bytes(), doc.root)));
+    // 10^9 bytes of output
+    s.clear();
+    for _k in @as(usize, 0)..9 {
+        s.push_str("{{#a}}")!;
+    }
+    s.push_str("x")!;
+    for _k in @as(usize, 0)..9 {
+        s.push_str("{{/a}}")!;
+    }
+    @expect(too_large(render_alloc(s.bytes(), doc.root)));
+    // 2^60 partials: p0 includes p1 twice, p1 includes p2 twice, ...
+    let mut names = vec.Vec.[[]mut u8].init();
+    defer {
+        for n in names.items() {
+            mem.free(n);
+        }
+        names.deinit();
+    }
+    let mut parts = vec.Vec.[Partial].init();
+    defer parts.deinit();
+    for k in @as(usize, 0)..60 {
+        names.push(fmt.alloc("p{}", [fmt.int(k)])!)!;
+        names.push(fmt.alloc("{{{{>p{}}}}}{{{{>p{}}}}}", [fmt.int(k + 1), fmt.int(k + 1)])!)!;
+    }
+    for k in @as(usize, 0)..60 {
+        parts.push(Partial.{ name: names.get(2 * k), source: names.get((2 * k) + 1) })!;
+    }
+    @expect(too_large(render_with_alloc("{{>p0}}", doc.root, parts.items())));
+    // many tags on one line, and long delimiters
+    s.clear();
+    for _k in @as(usize, 0)..100000 {
+        s.push_str("{{t}}")!;
+    }
+    let out = render_alloc(s.bytes(), doc.root)!;
+    @expect_eq(out.len, 100000);
+    mem.free(out);
+    s.clear();
+    s.push_str("{{=")!;
+    for _k in @as(usize, 0)..1000 {
+        s.push('<')!;
+    }
+    s.push_str(" >=}}")!;
+    @expect(invalid(render_alloc(s.bytes(), doc.root)));
+    // a partial is compiled once per indentation, and indented each time
+    let item: [1]Partial = [Partial.{ name: "i", source: "<{{.}}>\n" }];
+    let r = render_with_alloc("{{#a}}\n  {{>i}}\n{{/a}}", doc.root, item[..])!;
+    defer mem.free(r);
+    @expect_eq(r, "  <1>\n  <2>\n  <3>\n  <4>\n  <5>\n  <6>\n  <7>\n  <8>\n  <9>\n  <10>\n");
+}
+
+fn too_large(r: ![]mut u8) bool {
+    let x = r catch |e| return e == error.TooLarge;
+    mem.free(x);
+    return false;
 }
 
 fn too_deep(r: ![]mut u8) bool {

@@ -280,18 +280,80 @@ struct Entity {
     unparsed: bool,  // with NDATA
 }
 
+const NONE: usize = @max_value(usize);
+
+// Elements with more attributes than this check them for duplicates with a
+// hash set, not by comparing pairs.
+const FEW_ATTRS: usize = 16;
+
 struct AttDef {
     element: []u8,
     name: []u8,
     cdata: bool,
     has_default: bool,
     value: []u8,
+    next: usize,  // the element's next default (an index in attdefs), or NONE
+}
+
+// The first and last of an element's attribute defaults.
+struct Defaults {
+    first: usize,
+    last: usize,
 }
 
 struct Binding {
     prefix: []u8,
     uri: []u8,
     depth: usize,  // the element depth that declared it
+    prev: usize,   // the binding of the same prefix it hides, or NONE
+}
+
+// Namespace bindings in scope: a stack, and each prefix's latest binding, so
+// that a lookup does not scan the stack.
+struct Scope {
+    stack: vec.Vec.[Binding],
+    latest: maps.Map.[[]u8, usize],  // prefix -> index in stack
+
+    fn init() Scope {
+        return Scope.{
+            stack: vec.Vec.[Binding].init(), latest: maps.Map.[[]u8, usize].init(hash.hash_bytes, hash.eq_bytes) };
+    }
+
+    fn deinit(self: *mut Scope) void {
+        self.stack.deinit();
+        self.latest.deinit();
+    }
+
+    // The URI bound to prefix, or "" for none.
+    fn uri(self: *Scope, prefix: []u8) []u8 {
+        let i = self.latest.get(prefix) catch return "";
+        return self.stack.get(i).uri;
+    }
+
+    fn push(self: *mut Scope, prefix: []u8, uri: []u8, depth: usize) XmlError!void {
+        let prev = self.latest.get(prefix) catch NONE;
+        self.stack.push(Binding.{ prefix: prefix, uri: uri, depth: depth, prev: prev })!;
+        self.latest.put(prefix, self.stack.len - 1) catch |e| {
+            _ = self.stack.pop() catch self.stack.get(0);
+            return e;
+        };
+    }
+
+    fn pop(self: *mut Scope) void {
+        let b = self.stack.pop() catch return;
+        if b.prev == NONE {
+            _ = self.latest.remove(b.prefix);
+        } else {
+            // (the prefix is in the map, so this does not allocate)
+            self.latest.put(b.prefix, b.prev) catch {};
+        }
+    }
+
+    fn truncate(self: *mut Scope, n: usize) void {
+        while self.stack.len > n {
+            self.pop();
+        }
+    }
 }
 
 /// A streaming parser over a document.
@@ -302,9 +364,14 @@ pub struct Reader {
     general: maps.Map.[[]u8, Entity],
     params: maps.Map.[[]u8, Entity],
     attdefs: vec.Vec.[AttDef],
+    attdef_of: maps.Map.[[]u8, usize],    // "element name" -> index in attdefs
+    defaults: maps.Map.[[]u8, Defaults],  // element -> its attribute defaults
+    seen: maps.Map.[[]u8, usize],         // a start tag's attribute names, past FEW_ATTRS
+    sorted: vec.Vec.[Attr],
+    key: strs.String,
     open: vec.Vec.[[]u8],       // names of open elements
     open_src: vec.Vec.[usize],  // the source depth each was opened in
-    bindings: vec.Vec.[Binding],
+    scope: Scope,
     attrs: vec.Vec.[Attr],
     buf: strs.String,
     buf2: strs.String,
@@ -317,6 +384,8 @@ pub struct Reader {
     seen_doctype: bool,
     done: bool,
     expanded: usize,
+    defaulted: usize,  // what attribute defaults have added
+    default_limit: usize,
     has_external_subset: bool,
     standalone: bool,
     msg: []u8,
@@ -338,9 +407,14 @@ pub struct Reader {
             general: maps.Map.[[]u8, Entity].init(hash.hash_bytes, hash.eq_bytes),
             params: maps.Map.[[]u8, Entity].init(hash.hash_bytes, hash.eq_bytes),
             attdefs: vec.Vec.[AttDef].init(),
+            attdef_of: maps.Map.[[]u8, usize].init(hash.hash_bytes, hash.eq_bytes),
+            defaults: maps.Map.[[]u8, Defaults].init(hash.hash_bytes, hash.eq_bytes),
+            seen: maps.Map.[[]u8, usize].init(hash.hash_bytes, hash.eq_bytes),
+            sorted: vec.Vec.[Attr].init(),
+            key: strs.String.init(),
             open: vec.Vec.[[]u8].init(),
             open_src: vec.Vec.[usize].init(),
-            bindings: vec.Vec.[Binding].init(),
+            scope: Scope.init(),
             attrs: vec.Vec.[Attr].init(),
             buf: strs.String.init(),
             buf2: strs.String.init(),
@@ -353,6 +427,8 @@ pub struct Reader {
             seen_doctype: false,
             done: false,
             expanded: 0,
+            defaulted: 0,
+            default_limit: MAX_EXPANSION,
             has_external_subset: false,
             standalone: false,
             msg: "",
@@ -365,6 +441,7 @@ pub struct Reader {
             r.deinit();
             return e;
         };
+        r.default_limit = @max(MAX_EXPANSION, @mul_checked(t.len, 4) catch @max_value(usize));
         r.src.push(Source.{ text: t, pos: 0, entity: "", in_attr: false }) catch |e| {
             r.deinit();
             return e;
@@ -383,9 +460,14 @@ pub struct Reader {
         self.general.deinit();
         self.params.deinit();
         self.attdefs.deinit();
+        self.attdef_of.deinit();
+        self.defaults.deinit();
+        self.seen.deinit();
+        self.sorted.deinit();
+        self.key.deinit();
         self.open.deinit();
         self.open_src.deinit();
-        self.bindings.deinit();
+        self.scope.deinit();
         self.attrs.deinit();
         self.buf.deinit();
         self.buf2.deinit();
@@ -812,6 +894,11 @@ pub struct Reader {
     fn start_tag(self: *mut Reader) XmlError!Token {
         self.advance(1);
         let qname = self.name()!;
+        if self.seen.len() > 0 {
+            for a in self.attrs.items() {
+                _ = self.seen.remove(a.name);
+            }
+        }
         self.attrs.clear();
         loop {
             let sp = self.skip_space();
@@ -826,10 +913,22 @@ pub struct Reader {
             self.expect("=", "expected = after an attribute name")!;
             _ = self.skip_space();
             let v = self.attr_value(qname, an)!;
-            for a in self.attrs.items() {
-                if strs.eq(a.name, an) {
+            if self.attrs.len < FEW_ATTRS {
+                for a in self.attrs.items() {
+                    if strs.eq(a.name, an) {
+                        return self.fail("duplicate attribute");
+                    }
+                }
+            } else {
+                if self.attrs.len == FEW_ATTRS {
+                    for a in self.attrs.items() {
+                        self.seen.put(a.name, 0)!;
+                    }
+                }
+                if self.seen.contains(an) {
                     return self.fail("duplicate attribute");
                 }
+                self.seen.put(an, 0)!;
             }
             self.attrs.push(Attr.{ name: an, local: an, ns: "", value: v })!;
         }
@@ -839,18 +938,28 @@ pub struct Reader {
         } else {
             self.advance(1);
         }
-        // attribute defaults from the DTD
-        for d in self.attdefs.items() {
-            if d.has_default and strs.eq(d.element, qname) {
-                let mut have = false;
-                for a in self.attrs.items() {
+        // attribute defaults from the DTD, each counted against default_limit
+        let n = self.attrs.len;
+        let mut i = (self.defaults.get(qname) catch Defaults.{ first: NONE, last: NONE }).first;
+        while i != NONE {
+            let d = self.attdefs.get(i);
+            i = d.next;
+            let mut have = false;
+            if n > FEW_ATTRS {
+                have = self.seen.contains(d.name);
+            } else {
+                for a in self.attrs.items()[..n] {
                     if strs.eq(a.name, d.name) {
                         have = true;
                     }
                 }
-                if not have {
-                    self.attrs.push(Attr.{ name: d.name, local: d.name, ns: "", value: d.value })!;
+            }
+            if not have {
+                self.defaulted += d.value.len + @size_of(Attr);
+                if self.defaulted > self.default_limit {
+                    return error.TooLarge;
                 }
+                self.attrs.push(Attr.{ name: d.name, local: d.name, ns: "", value: d.value })!;
             }
         }
         if self.open.len >= MAX_DEPTH {
@@ -977,13 +1086,22 @@ pub struct Reader {
         }
         let mut v: []u8 = self.buf2.bytes();
         // declared non-CDATA types: trim and collapse spaces
-        for d in self.attdefs.items() {
-            if not d.cdata and strs.eq(d.element, element) and strs.eq(d.name, name) {
+        if self.attdefs.len > 0 {
+            let i = self.attdef_of.get(self.attdef_key(element, name)!) catch NONE;
+            if (i != NONE) and not self.attdefs.get(i).cdata {
                 v = collapse(v, &mut self.buf);
-                break;
             }
         }
         return self.ar.dup(v);
+    }
+
+    // "element name" (in self.key) to look an attribute's declaration up by.
+    fn attdef_key(self: *mut Reader, element: []u8, name: []u8) XmlError![]u8 {
+        self.key.clear();
+        self.key.push_str(element)!;
+        self.key.push(' ')!;
+        self.key.push_str(name)!;
+        return self.key.bytes();
     }
 
     // --- namespaces -----------------------------------------------------------------------
@@ -992,35 +1110,19 @@ pub struct Reader {
         if strs.eq(prefix, "xml") {
             return XML_NS;
         }
-        let mut i = self.bindings.len;
-        while i > 0 {
-            i -= 1;
-            let b = self.bindings.get(i);
-            if strs.eq(b.prefix, prefix) {
-                return b.uri;
-            }
-        }
-        return "";
+        return self.scope.uri(prefix);
     }
 
     fn bound(self: *Reader, prefix: []u8) bool {
         if strs.eq(prefix, "xml") {
             return true;
         }
-        let mut i = self.bindings.len;
-        while i > 0 {
-            i -= 1;
-            let b = self.bindings.get(i);
-            if strs.eq(b.prefix, prefix) {
-                return b.uri.len > 0;
-            }
-        }
-        return false;
+        return self.scope.uri(prefix).len > 0;
     }
 
     fn close_scope(self: *mut Reader, depth: usize) void {
-        while (self.bindings.len > 0) and (self.bindings.get(self.bindings.len - 1).depth >= depth) {
-            _ = self.bindings.pop() catch self.bindings.get(0);
+        while (self.scope.stack.len > 0) and (self.scope.stack.get(self.scope.stack.len - 1).depth >= depth) {
+            self.scope.pop();
         }
     }
 
@@ -1058,7 +1160,7 @@ pub struct Reader {
                     return self.fail("a namespace name is not a URI reference");
                 }
             }
-            self.bindings.push(Binding.{ prefix: prefix, uri: a.value, depth: depth })!;
+            self.scope.push(prefix, a.value, depth)!;
         }
         // the element
         let p = qprefix(qname);
@@ -1097,13 +1199,30 @@ pub struct Reader {
             }
             attrs[i].ns = ns;
         }
-        // no two attributes with the same expanded name
-        for i in @as(usize, 0)..attrs.len {
-            for j in i + 1..attrs.len {
-                if (attrs[i].ns.len > 0) and strs.eq(attrs[i].ns, attrs[j].ns) and
-                   strs.eq(attrs[i].local, attrs[j].local) {
-                    return self.fail("two attributes with the same namespace and local name");
+        // no two attributes with the same expanded name (past FEW_ATTRS, found
+        // next to each other once sorted)
+        if attrs.len <= FEW_ATTRS {
+            for i in @as(usize, 0)..attrs.len {
+                for j in i + 1..attrs.len {
+                    if (attrs[i].ns.len > 0) and strs.eq(attrs[i].ns, attrs[j].ns) and
+                       strs.eq(attrs[i].local, attrs[j].local) {
+                        return self.fail("two attributes with the same namespace and local name");
+                    }
                 }
+            }
+            return;
+        }
+        self.sorted.clear();
+        for a in attrs {
+            if a.ns.len > 0 {
+                self.sorted.push(a)!;
+            }
+        }
+        let ss = self.sorted.items();
+        vec.sort(ss, attr_less);
+        for i in @as(usize, 1)..ss.len {
+            if strs.eq(ss[i - 1].ns, ss[i].ns) and strs.eq(ss[i - 1].local, ss[i].local) {
+                return self.fail("two attributes with the same namespace and local name");
             }
         }
     }
@@ -1561,15 +1680,20 @@ pub struct Reader {
                 has_default = true;
             }
             // the first declaration of an attribute counts
-            let mut dup = false;
-            for d in self.attdefs.items() {
-                if strs.eq(d.element, element) and strs.eq(d.name, an) {
-                    dup = true;
-                }
-            }
-            if not dup {
+            let k = self.attdef_key(element, an)!;
+            if not self.attdef_of.contains(k) {
+                let i = self.attdefs.len;
                 self.attdefs.push(AttDef.{ element: element, name: an, cdata: cdata, has_default: has_default,
-                                           value: value })!;
+                                           value: value, next: NONE })!;
+                self.attdef_of.put(self.ar.dup(k)!, i)!;
+                if has_default {
+                    let p = self.defaults.get_ptr(element) catch {
+                        self.defaults.put(element, Defaults.{ first: i, last: i })!;
+                        continue;
+                    };
+                    self.attdefs.get_ptr(p.last).next = i;
+                    p.last = i;
+                }
             }
         }
     }
@@ -2122,7 +2246,7 @@ pub struct Writer {
 /// as start-end pairs, and fixed escaping.
 pub fn canonicalize(doc: *Document) ![]mut u8 {
     let mut s = strs.String.init();
-    let mut rendered = vec.Vec.[Binding].init();
+    let mut rendered = Scope.init();
     defer rendered.deinit();
     canon_doc(doc, s.writer(), &mut rendered) catch |e| {
         s.deinit();
@@ -2131,7 +2255,7 @@ pub fn canonicalize(doc: *Document) ![]mut u8 {
     return s.take();
 }
 
-fn canon_doc(doc: *Document, w: io.Writer, rendered: *mut vec.Vec.[Binding]) !void {
+fn canon_doc(doc: *Document, w: io.Writer, rendered: *mut Scope) !void {
     for n in doc.prolog {
         canon_node(n, w, rendered, 0)!;
         w.write_all("\n")!;
@@ -2143,7 +2267,7 @@ fn canon_doc(doc: *Document, w: io.Writer, rendered: *mut vec.Vec.[Binding]) !vo
     }
 }
 
-fn canon_node(n: Node, w: io.Writer, rendered: *mut vec.Vec.[Binding], depth: usize) !void {
+fn canon_node(n: Node, w: io.Writer, rendered: *mut Scope, depth: usize) !void {
     match n {
         .Element(e) => { canon_element(e, w, rendered, depth + 1)!; }
         .Text(t)    => { escape_text(w, t)!; }
@@ -2162,18 +2286,6 @@ fn canon_node(n: Node, w: io.Writer, rendered: *mut vec.Vec.[Binding], depth: us
             w.write_all("?>")!;
         }
     }
-}
-
-fn rendered_uri(rendered: *vec.Vec.[Binding], prefix: []u8) []u8 {
-    let mut i = rendered.len;
-    while i > 0 {
-        i -= 1;
-        let b = rendered.get(i);
-        if strs.eq(b.prefix, prefix) {
-            return b.uri;
-        }
-    }
-    return "";
 }
 
 fn attr_less(a: Attr, b: Attr) bool {
@@ -2195,11 +2307,11 @@ fn ns_less(a: Attr, b: Attr) bool {
     return strs.compare(a.local, b.local) < 0;
 }
 
-fn canon_element(e: *Element, w: io.Writer, rendered: *mut vec.Vec.[Binding], depth: usize) !void {
+fn canon_element(e: *Element, w: io.Writer, rendered: *mut Scope, depth: usize) !void {
     if depth > (MAX_DEPTH + 1) {
         return error.TooDeep;
     }
-    let mark = rendered.len;
+    let mark = rendered.stack.len;
     let mut decls = vec.Vec.[Attr].init();
     defer decls.deinit();
     let mut plain = vec.Vec.[Attr].init();
@@ -2211,11 +2323,11 @@ fn canon_element(e: *Element, w: io.Writer, rendered: *mut vec.Vec.[Binding], de
                 prefix = "";
             }
             // only what changes the namespaces in effect (xml is always in effect)
-            if strs.eq(rendered_uri(rendered, prefix), a.value) or strs.eq(prefix, "xml") {
+            if strs.eq(rendered.uri(prefix), a.value) or strs.eq(prefix, "xml") {
                 continue;
             }
             decls.push(a)!;
-            rendered.push(Binding.{ prefix: prefix, uri: a.value, depth: depth })!;
+            rendered.push(prefix, a.value, depth)!;
         } else {
             plain.push(a)!;
         }
@@ -2412,6 +2524,94 @@ test "encodings and hostile input" {
         deep.push_str("<a>")!;
     }
     @expect(fails_doc(parse(deep.bytes())));
+}
+
+test "attribute defaults and many attributes" {
+    // defaults by element, the first declaration counting; collapsed non-CDATA values
+    let dtd =
+        "<!DOCTYPE r [<!ATTLIST x a CDATA \"1\" t NMTOKENS #IMPLIED><!ATTLIST x a CDATA \"2\" b CDATA \"3\"><!ATTLIST y a CDATA \"4\">]>";
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str(dtd)!;
+    s.push_str("<r><x t=' p  q '/><x a='5'/><y/></r>")!;
+    let mut doc = parse(s.bytes())!;
+    let c = canonicalize(&doc)!;
+    @expect_eq(c, "<r><x a=\"1\" b=\"3\" t=\"p q\"></x><x a=\"5\" b=\"3\"></x><y a=\"4\"></y></r>");
+    mem.free(c);
+    doc.deinit();
+    // more attributes than FEW_ATTRS: duplicates found, defaults not repeated
+    s.clear();
+    s.push_str("<!DOCTYPE r [<!ATTLIST r a30 CDATA \"d\" z CDATA \"e\">]><r xmlns:p='u'")!;
+    for k in @as(usize, 0)..40 {
+        fmt.write(s.writer(), " a{}='v' p:b{}='w'", [fmt.int(k), fmt.int(k)])!;
+    }
+    let base = s.len;
+    s.push_str("/>")!;
+    doc = parse(s.bytes())!;
+    @expect_eq(doc.root.attr("a30")!, "v");
+    @expect_eq(doc.root.attr("z")!, "e");
+    @expect_eq(doc.root.attrs.len, 82);
+    doc.deinit();
+    s.truncate(base);
+    s.push_str(" a7='x'/>")!;
+    @expect(fails_doc(parse(s.bytes())));
+    s.truncate(base);
+    s.push_str(" xmlns:q='u' q:b9='x'/>")!;
+    @expect(fails_doc(parse(s.bytes())));
+    // namespace scopes: an inner binding hides an outer one until it closes
+    let mut d2 = parse("<p:r xmlns:p='u1'><p:a xmlns:p='u2'><p:b/></p:a><p:c/></p:r>")!;
+    defer d2.deinit();
+    let mut it = d2.root.elements();
+    let a = it.next()!;
+    @expect_eq(a.ns, "u2");
+    let mut ai = a.elements();
+    @expect_eq(ai.next()!.ns, "u2");
+    @expect_eq(it.next()!.ns, "u1");
+}
+
+test "hostile attribute lists stay linear and bounded" {
+    // k defaults on k elements: quadratic in its output, so refused
+    let k: usize = 2000;
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str("<!DOCTYPE r [<!ATTLIST x")!;
+    for i in @as(usize, 0)..k {
+        fmt.write(s.writer(), " a{} CDATA ''", [fmt.int(i)])!;
+    }
+    s.push_str(">]><r>")!;
+    for _i in @as(usize, 0)..k {
+        s.push_str("<x/>")!;
+    }
+    s.push_str("</r>")!;
+    @expect(fails_doc(parse(s.bytes())));
+    // a long default on many elements
+    s.clear();
+    s.push_str("<!DOCTYPE r [<!ATTLIST x a CDATA '")!;
+    for _i in @as(usize, 0)..50000 {
+        s.push('A')!;
+    }
+    s.push_str("'>]><r>")!;
+    for _i in @as(usize, 0)..10000 {
+        s.push_str("<x/>")!;
+    }
+    s.push_str("</r>")!;
+    @expect(fails_doc(parse(s.bytes())));
+    // many attributes, namespace declarations and bindings in scope
+    s.clear();
+    s.push_str("<r xmlns:q='u'")!;
+    for i in @as(usize, 0)..20000 {
+        fmt.write(s.writer(), " a{}='v' q:b{}='v' xmlns:p{}='u{}'", [fmt.int(i), fmt.int(i), fmt.int(i), fmt.int(i)])!;
+    }
+    s.push_str(">")!;
+    for _i in @as(usize, 0)..50000 {
+        s.push_str("<p0:a xmlns:p1='u1'/>")!;
+    }
+    s.push_str("</r>")!;
+    let mut doc = parse(s.bytes())!;
+    defer doc.deinit();
+    let c = canonicalize(&doc)!;
+    defer mem.free(c);
+    @expect(c.len < s.len * 2);
 }
 
 fn fails_doc(r: !Document) bool {
