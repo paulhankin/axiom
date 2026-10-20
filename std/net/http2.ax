@@ -17,8 +17,10 @@
 // reads and handles frames (settings, pings, window updates, resets,
 // goaway) as it goes, and waits for window updates when flow control says
 // so. It checks what the peer sends: frame sizes, stream states, header
-// blocks and their CONTINUATION frames, windows, and limits on concurrent
-// streams, header list size and body size. Server push is refused.
+// blocks and their CONTINUATION frames, header fields (RFC 9113 8.2 and
+// 8.3: a malformed message resets its stream), windows, and limits on
+// concurrent streams, header list size and body size (each stream's, and
+// all of a connection's together). Server push is refused.
 // =============================================================================
 
 import "../collections/vec.ax" as vec;
@@ -27,6 +29,7 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../net.ax" as net;
 import "../str.ax" as strs;
+import "../time.ax" as time;
 import "hpack.ax" as hpack;
 
 pub error Http2Error { ProtocolError, FlowControlError, FrameSizeError, CompressionError, StreamClosed, StreamReset,
@@ -69,6 +72,8 @@ pub let PREFACE: []u8 = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const MAX_FRAME: usize = 16384;  // what this side accepts (the default)
 const WINDOW: i64 = 1048576;     // this side's receive windows
 const MAX_WINDOW: i64 = 2147483647;
+// request bodies a connection may hold at once: max_body and this much more
+const BUFFER_ALLOWANCE: usize = 1048576;
 
 /// A stream: its request or response as it arrives.
 pub struct Stream {
@@ -80,14 +85,15 @@ pub struct Stream {
     local_done: bool,   // END_STREAM sent
     reset: bool,
     reset_code: u32,
-    store: strs.String,  // header names and values
+    content_length: i64,  // (a request's) -1: none
+    store: strs.String,   // header names and values
     spans: vec.Vec.[[4]usize],
     list: vec.Vec.[hpack.Header],
     body: strs.String,
 
     fn init(id: u32, send_window: i64) Stream {
         return Stream.{ id: id, send_window: send_window, recv_window: WINDOW, got_headers: false, remote_done: false,
-                        local_done: false, reset: false, reset_code: 0, store: strs.String.init(),
+                        local_done: false, reset: false, reset_code: 0, content_length: -1, store: strs.String.init(),
                         spans: vec.Vec.[[4]usize].init(), list: vec.Vec.[hpack.Header].init(),
                         body: strs.String.init() };
     }
@@ -148,6 +154,9 @@ pub struct Conn {
     block_end_stream: bool,
     in_block: bool,
     out: strs.String,
+    buffered: usize,      // the bodies of all streams
+    done: vec.Vec.[u32],  // streams send_data saw complete, for take_done
+    deadline: i64,        // monotonic ns after which reads fail with TimedOut (0: none)
 
     /// A connection over r and w. prefill: bytes already read from it (they
     /// are read first).
@@ -164,7 +173,7 @@ pub struct Conn {
                       streams: vec.Vec.[*mut Stream].init(), last_peer_stream: 0, next_stream: next, max_streams: 100,
                       max_body: 16777216, got_goaway: false, goaway_last: 0, sent_goaway: false,
                       block: strs.String.init(), block_stream: 0, block_end_stream: false, in_block: false,
-                      out: strs.String.init() };
+                      out: strs.String.init(), buffered: 0, done: vec.Vec.[u32].init(), deadline: 0 };
     }
 
     pub fn deinit(self: *mut Conn) void {
@@ -178,6 +187,7 @@ pub struct Conn {
         self.dec.deinit();
         self.block.deinit();
         self.out.deinit();
+        self.done.deinit();
     }
 
     /// The opening: a client sends the preface; each side its SETTINGS and
@@ -221,6 +231,10 @@ pub struct Conn {
             self.end = k;
         }
         while self.end < n {
+            // (pings and the like must not keep a connection for ever)
+            if (self.deadline != 0) and (time.Instant.now().ns > self.deadline) {
+                return error.TimedOut;
+            }
             let got = self.r.read(self.rbuf[self.end..]) catch |e| {
                 if e == error.TimedOut {
                     return error.TimedOut;
@@ -316,6 +330,7 @@ pub struct Conn {
             if ss[k].id == id {
                 let s = ss[k];
                 _ = self.streams.remove(k);
+                self.buffered -= s.body.len;
                 s.deinit();
                 mem.destroy(s);
                 return;
@@ -535,21 +550,34 @@ pub struct Conn {
         let s = self.find(sid)!;
         let hs = self.dec.decode(self.block.bytes()) catch return self.fail(COMPRESSION_ERROR, error.CompressionError);
         if s.remote_done {
+            if s.reset {
+                return 0;  // (sent before our RST_STREAM arrived)
+            }
             return self.fail(STREAM_CLOSED, error.StreamClosed);
         }
-        for x in hs {
-            // (lower-case names only, in HTTP/2)
-            for c in x.name {
-                if (c >= 'A') and (c <= 'Z') {
-                    self.reset_stream(sid, PROTOCOL_ERROR)!;
-                    return sid;
-                }
+        // a malformed message resets its stream (RFC 9113 8.1.1); a second
+        // block is trailers, which end the stream
+        let trailers = s.got_headers;
+        if (trailers and not self.block_end_stream) or not check_fields(hs, self.server, trailers) {
+            self.reset_stream(sid, PROTOCOL_ERROR)!;
+            return sid;
+        }
+        if self.server and not trailers {
+            s.content_length = content_length(hs);
+            if s.content_length == -2 {
+                self.reset_stream(sid, PROTOCOL_ERROR)!;
+                return sid;
             }
-            let na = s.store.len;
-            s.store.push_str(x.name)!;
-            let va = s.store.len;
-            s.store.push_str(x.value)!;
-            s.spans.push([na, x.name.len, va, x.value.len])!;
+        }
+        // (a server drops trailers, as HTTP/1 does)
+        if not (trailers and self.server) {
+            for x in hs {
+                let na = s.store.len;
+                s.store.push_str(x.name)!;
+                let va = s.store.len;
+                s.store.push_str(x.value)!;
+                s.spans.push([na, x.name.len, va, x.value.len])!;
+            }
         }
         s.got_headers = true;
         // (a 1xx response is followed by the real one)
@@ -560,6 +588,10 @@ pub struct Conn {
             return 0;
         }
         if self.block_end_stream {
+            if (s.content_length >= 0) and (@as(i64, @bit_cast(i64, @as(u64, s.body.len))) != s.content_length) {
+                self.reset_stream(sid, PROTOCOL_ERROR)!;
+                return sid;
+            }
             s.remote_done = true;
             return sid;
         }
@@ -599,7 +631,20 @@ pub struct Conn {
                 self.reset_stream(sid, CANCEL)!;
                 return sid;
             }
+            // (the streams together hold at most a little more than one
+            // body: past that, a stream is refused)
+            if (self.buffered + p.len) > (self.max_body + BUFFER_ALLOWANCE) {
+                self.reset_stream(sid, REFUSED_STREAM)!;
+                return sid;
+            }
+            let total = @as(i64, @bit_cast(i64, @as(u64, s.body.len + p.len)));
+            if (s.content_length >= 0) and
+               ((total > s.content_length) or (((flags & END_STREAM) != 0) and (total != s.content_length))) {
+                self.reset_stream(sid, PROTOCOL_ERROR)!;
+                return sid;
+            }
             s.body.push_str(p)!;
+            self.buffered += p.len;
             // give the window back at once, once half is used
             if s.recv_window < (WINDOW / 2) {
                 self.window_update(sid, @truncate(u32, @bit_cast(u64, WINDOW - s.recv_window)))!;
@@ -670,7 +715,11 @@ pub struct Conn {
                 @min(s.send_window, self.send_window), @as(i64, @bit_cast(i64, @as(u64, self.peer_max_frame))));
             let left = data.len - at;
             if (left > 0) and (room <= 0) {
-                _ = self.step()!;
+                // (a request completing meanwhile is kept for take_done)
+                let got = self.step()!;
+                if (got != 0) and (got != id) {
+                    self.keep_done(got)!;
+                }
                 continue;
             }
             let n = @min(left, @as(usize, @truncate(usize, @bit_cast(u64, @max(room, 0)))));
@@ -696,6 +745,154 @@ pub struct Conn {
     pub fn stream(self: *mut Conn, id: u32) Http2Error!*mut Stream {
         return self.find(id)!;
     }
+
+    fn keep_done(self: *mut Conn, id: u32) Http2Error!void {
+        for d in self.done.items() {
+            if d == id {
+                return;
+            }
+        }
+        self.done.push(id)!;
+    }
+
+    /// A stream that completed while send_data waited (as step would have
+    /// returned it), or 0.
+    pub fn take_done(self: *mut Conn) u32 {
+        if self.done.len == 0 {
+            return 0;
+        }
+        return self.done.remove(0);
+    }
+}
+
+// Pseudo-headers, as bits.
+const PS_METHOD: u32 = 1;
+const PS_SCHEME: u32 = 2;
+const PS_AUTHORITY: u32 = 4;
+const PS_PATH: u32 = 8;
+const PS_STATUS: u32 = 16;
+
+fn pseudo_bit(name: []u8, request: bool) u32 {
+    if request {
+        if strs.eq(name, ":method") {
+            return PS_METHOD;
+        }
+        if strs.eq(name, ":scheme") {
+            return PS_SCHEME;
+        }
+        if strs.eq(name, ":authority") {
+            return PS_AUTHORITY;
+        }
+        if strs.eq(name, ":path") {
+            return PS_PATH;
+        }
+    } else if strs.eq(name, ":status") {
+        return PS_STATUS;
+    }
+    return 0;
+}
+
+// Whether a header block is well-formed (RFC 9113 8.2 and 8.3): lower-case
+// token names, values without NUL, CR, LF or blanks at the ends, no
+// connection-specific fields, and the pseudo-headers a request (or a
+// response) needs, each once and before the other fields; none in
+// trailers.
+fn check_fields(hs: []hpack.Header, request: bool, trailers: bool) bool {
+    let mut seen: u32 = 0;
+    let mut regular = false;
+    let mut connect = false;
+    for x in hs {
+        let v = x.value;
+        for c in v {
+            if (c == 0) or (c == '\r') or (c == '\n') {
+                return false;
+            }
+        }
+        if (v.len > 0) and (is_blank(v[0]) or is_blank(v[v.len - 1])) {
+            return false;
+        }
+        if (x.name.len > 0) and (x.name[0] == ':') {
+            let bit = pseudo_bit(x.name, request);
+            if trailers or regular or (bit == 0) or ((seen & bit) != 0) {
+                return false;
+            }
+            seen |= bit;
+            if (bit == PS_METHOD) and strs.eq(v, "CONNECT") {
+                connect = true;
+            }
+            if (bit == PS_PATH) and (v.len == 0) {
+                return false;
+            }
+            continue;
+        }
+        regular = true;
+        if x.name.len == 0 {
+            return false;
+        }
+        for c in x.name {
+            if ((c >= 'A') and (c <= 'Z')) or not is_token_char(c) {
+                return false;
+            }
+        }
+        let n = x.name;
+        if strs.eq(n, "connection") or strs.eq(n, "keep-alive") or strs.eq(n, "proxy-connection") or
+           strs.eq(n, "transfer-encoding") or strs.eq(n, "upgrade") or
+           (strs.eq(n, "te") and not strs.eq(v, "trailers")) {
+            return false;
+        }
+    }
+    if trailers {
+        return true;
+    }
+    if not request {
+        return seen == PS_STATUS;
+    }
+    if connect {
+        return seen == (PS_METHOD | PS_AUTHORITY);
+    }
+    return (seen & (PS_METHOD | PS_SCHEME | PS_PATH)) == (PS_METHOD | PS_SCHEME | PS_PATH);
+}
+
+fn is_blank(c: u8) bool {
+    return (c == ' ') or (c == '\t');
+}
+
+fn is_token_char(c: u8) bool {
+    if strs.is_alnum(c) {
+        return true;
+    }
+    for s in "!#$%&'*+-.^_`|~" {
+        if c == s {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A request's content-length: -1 if it has none, -2 if it is not a number
+// or its values differ.
+fn content_length(hs: []hpack.Header) i64 {
+    let mut n: i64 = -1;
+    for x in hs {
+        if not strs.eq(x.name, "content-length") {
+            continue;
+        }
+        if (x.value.len == 0) or (x.value.len > 18) {
+            return -2;
+        }
+        let mut v: i64 = 0;
+        for c in x.value {
+            if (c < '0') or (c > '9') {
+                return -2;
+            }
+            v = (v * 10) + @as(i64, c - '0');
+        }
+        if (n >= 0) and (v != n) {
+            return -2;
+        }
+        n = v;
+    }
+    return n;
 }
 
 fn unpad(flags: u8, p: []u8) Http2Error![]u8 {
@@ -941,4 +1138,270 @@ test "protocol errors" {
     frame(&mut f, PING, 0, 0, "12345678")!;
     frame(&mut f, HEADERS, END_HEADERS | END_STREAM, 1, "\x82\x84\x86\x41\x09localhost")!;
     @expect(against(f.bytes()) == error.TimedOut);
+}
+
+// -----------------------------------------------------------------------------
+// Tests: requests fed to a server Conn from memory
+// -----------------------------------------------------------------------------
+
+// Header fields from "name=value|name=value".
+fn fields(spec: []u8, out: *mut vec.Vec.[hpack.Header]) !void {
+    out.clear();
+    let mut it = strs.split(spec, "|");
+    loop {
+        let f = it.next() catch break;
+        let eq = strs.index_of_byte(f, '=')!;
+        out.push(hpack.Header.{ name: f[..eq], value: f[eq + 1..] })!;
+    }
+}
+
+let GET: []u8 = ":method=GET|:scheme=https|:path=/|:authority=a";
+let POST: []u8 = ":method=POST|:scheme=https|:path=/|:authority=a";
+
+// A request on stream 1: its headers, a body (if any) and trailers (if
+// any, with END_STREAM when trailers_end). Whether the server reset the
+// stream; *probe gets the length of the probe header's value.
+fn reset_by(spec: []u8, body: []u8, trailers: []u8, trailers_end: bool, probe: []u8, got: *mut usize) !bool {
+    let mut enc = hpack.Encoder.init();
+    defer enc.deinit();
+    let mut hs = vec.Vec.[hpack.Header].init();
+    defer hs.deinit();
+    let mut b = strs.String.init();
+    defer b.deinit();
+    let mut d = strs.String.init();
+    defer d.deinit();
+    d.push_str(PREFACE)!;
+    frame(&mut d, SETTINGS, 0, 0, "")!;
+    fields(spec, &mut hs)!;
+    enc.encode(hs.items(), &mut b)!;
+    let mut f = END_HEADERS;
+    if (body.len == 0) and (trailers.len == 0) {
+        f |= END_STREAM;
+    }
+    frame(&mut d, HEADERS, f, 1, b.bytes())!;
+    if body.len > 0 {
+        let mut df: u8 = 0;
+        if trailers.len == 0 {
+            df = END_STREAM;
+        }
+        frame(&mut d, DATA, df, 1, body)!;
+    }
+    if trailers.len > 0 {
+        fields(trailers, &mut hs)!;
+        b.clear();
+        enc.encode(hs.items(), &mut b)!;
+        let mut tf = END_HEADERS;
+        if trailers_end {
+            tf |= END_STREAM;
+        }
+        frame(&mut d, HEADERS, tf, 1, b.bytes())!;
+    }
+    let mut rd = io.SliceReader.init("");
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let mut c = Conn.init(rd.reader(), out.writer(), true, d.bytes())!;
+    defer c.deinit();
+    c.handshake()!;
+    loop {
+        let id = c.step() catch break;  // (Closed at the end)
+        if id == 1 {
+            break;
+        }
+    }
+    let s = c.stream(1)!;
+    got.* = s.header(probe).len;
+    return s.reset;
+}
+
+test "malformed requests reset their streams" {
+    let mut n: usize = 0;
+    let bad: [27][]u8 = [
+        ":method=GET|:scheme=https|:path=/a b\r\nX: y|:authority=a",
+        ":method=GET|:scheme=https|:path=/|:authority=a\r\nb",
+        ":method=GET|:scheme=https|:path=/|:authority=a|x-evil=v\x00",
+        ":method=GET|:scheme=https|:path=/|:authority=a|x-a= v",
+        ":method=GET|:scheme=https|:path=/|:authority=a|x-a=v\t",
+        ":method=GET|:scheme=https|:path=/|:authority=a|bad name:=z",
+        ":method=GET|:scheme=https|:path=/|:authority=a|X-Upper=z",
+        ":method=GET|:scheme=https|:path=/|:authority=a|=z",
+        ":method=GET|:scheme=https|:path=/|:authority=a|transfer-encoding=chunked",
+        ":method=GET|:scheme=https|:path=/|:authority=a|connection=close",
+        ":method=GET|:scheme=https|:path=/|:authority=a|keep-alive=1",
+        ":method=GET|:scheme=https|:path=/|:authority=a|proxy-connection=x",
+        ":method=GET|:scheme=https|:path=/|:authority=a|upgrade=h2c",
+        ":method=GET|:scheme=https|:path=/|:authority=a|te=gzip",
+        ":method=GET|:scheme=https|:path=/|:authority=a|:foo=bar",
+        ":method=GET|:scheme=https|:path=/|:authority=a|:status=200",
+        ":method=GET|:scheme=https|:path=/|:path=/x",
+        ":method=GET|:scheme=https|x-a=b|:path=/",
+        ":scheme=https|:path=/|:authority=a",
+        ":method=GET|:path=/|:authority=a",
+        ":method=GET|:scheme=https|:authority=a",
+        ":method=GET|:scheme=https|:path=|:authority=a",
+        ":method=CONNECT|:authority=a:443|:path=/",
+        ":method=GET|:scheme=https|:path=/|:authority=a|content-length=abc",
+        ":method=GET|:scheme=https|:path=/|:authority=a|content-length=1|content-length=2",
+        ":method=GET|:scheme=https|:path=/|:authority=a|content-length=1",
+        ":method=GET|:scheme=https|:path=/|:authority=a|content-length=-1",
+    ];
+    for k in @as(usize, 0)..bad.len {
+        if not reset_by(bad[k], "", "", true, "", &mut n)! {
+            @expect_eq(k, 99);
+        }
+    }
+    // a body that is not the length announced
+    @expect(reset_by(":method=POST|:scheme=https|:path=/|:authority=a|content-length=5", "abc", "", true, "", &mut n)!);
+    @expect(reset_by(":method=POST|:scheme=https|:path=/|:authority=a|content-length=2", "abc", "", true, "", &mut n)!);
+    // trailers: with pseudo-headers, without END_STREAM
+    @expect(reset_by(POST, "abc", ":path=/x", true, "", &mut n)!);
+    @expect(reset_by(POST, "abc", "x-t=1", false, "", &mut n)!);
+    // and what is well-formed passes (trailers are dropped)
+    @expect(not reset_by(GET, "", "", true, ":path", &mut n)!);
+    @expect(n == 1);
+    @expect(not reset_by(":method=GET|:scheme=https|:path=/|:authority=a|te=trailers|x-a=b c", "", "", true, "x-a",
+                         &mut n)!);
+    @expect(n == 3);
+    @expect(not reset_by(":method=CONNECT|:authority=a:443", "", "", true, "", &mut n)!);
+    @expect(not reset_by(":method=POST|:scheme=https|:path=/|:authority=a|content-length=3", "abc", "x-t=1", true,
+                         "x-t", &mut n)!);
+    @expect(n == 0);
+}
+
+test "a connection's bodies are bounded together" {
+    let max_body: usize = 262144;
+    let mut enc = hpack.Encoder.init();
+    defer enc.deinit();
+    let mut hs = vec.Vec.[hpack.Header].init();
+    defer hs.deinit();
+    fields(POST, &mut hs)!;
+    let mut d = strs.String.init();
+    defer d.deinit();
+    d.push_str(PREFACE)!;
+    frame(&mut d, SETTINGS, 0, 0, "")!;
+    // 50 streams each sending just under max_body, never ending
+    let chunk = mem.alloc.[u8](16384)!;
+    defer mem.free(chunk);
+    @mem_set(chunk, 0x41);
+    let mut b = strs.String.init();
+    defer b.deinit();
+    for k in @as(u32, 0)..50 {
+        b.clear();
+        enc.encode(hs.items(), &mut b)!;
+        frame(&mut d, HEADERS, END_HEADERS, (2 * k) + 1, b.bytes())!;
+        for _j in @as(usize, 0)..((max_body / 16384) - 1) {
+            frame(&mut d, DATA, 0, (2 * k) + 1, chunk)!;
+        }
+    }
+    let mut rd = io.SliceReader.init("");
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let mut c = Conn.init(rd.reader(), out.writer(), true, "")!;
+    defer c.deinit();
+    c.max_body = max_body;
+    let mut src = io.SliceReader.init(d.bytes());
+    c.r = src.reader();
+    c.handshake()!;
+    let mut refused: usize = 0;
+    loop {
+        let id = c.step() catch break;
+        if id != 0 {
+            let s = c.stream(id)!;
+            @expect(s.reset);
+            refused += 1;
+            c.drop_stream(id);
+        }
+    }
+    let mut held: usize = 0;
+    for s in c.streams.items() {
+        held += s.body.len;
+    }
+    @expect(held == c.buffered);
+    @expect(held <= (max_body + BUFFER_ALLOWANCE));
+    @expect((refused > 40) and (c.streams.len == (50 - refused)));
+}
+
+test "a deadline, and requests that complete while a response waits" {
+    // PINGs do not keep a connection past its deadline
+    let mut d = strs.String.init();
+    defer d.deinit();
+    d.push_str(PREFACE)!;
+    frame(&mut d, SETTINGS, 0, 0, "")!;
+    let mut pings = strs.String.init();
+    defer pings.deinit();
+    for _k in @as(usize, 0)..10000 {
+        frame(&mut pings, PING, 0, 0, "12345678")!;
+    }
+    let mut rd = io.SliceReader.init(pings.bytes());
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let mut c = Conn.init(rd.reader(), out.writer(), true, d.bytes())!;
+    defer c.deinit();
+    c.handshake()!;
+    c.deadline = 1;  // (long past)
+    let mut steps: usize = 0;
+    loop {
+        _ = c.step() catch |e| {
+            @expect(e == error.TimedOut);
+            break;
+        };
+        steps += 1;
+    }
+    @expect(steps < 2000);
+    // stream 3 completes while the answer to 1 waits for its window
+    let mut enc = hpack.Encoder.init();
+    defer enc.deinit();
+    let mut hs = vec.Vec.[hpack.Header].init();
+    defer hs.deinit();
+    fields(GET, &mut hs)!;
+    let mut b = strs.String.init();
+    defer b.deinit();
+    enc.encode(hs.items(), &mut b)!;
+    let mut d2 = strs.String.init();
+    defer d2.deinit();
+    d2.push_str(PREFACE)!;
+    frame(&mut d2, SETTINGS, 0, 0, "\x00\x04\x00\x00\x00\x00")!;  // INITIAL_WINDOW_SIZE 0
+    frame(&mut d2, HEADERS, END_HEADERS | END_STREAM, 1, b.bytes())!;
+    b.clear();
+    enc.encode(hs.items(), &mut b)!;
+    frame(&mut d2, HEADERS, END_HEADERS | END_STREAM, 3, b.bytes())!;
+    frame(&mut d2, WINDOW_UPDATE, 0, 1, "\x00\x00\x00\x0a")!;
+    let mut rd2 = io.SliceReader.init("");
+    let mut out2 = strs.String.init();
+    defer out2.deinit();
+    let mut c2 = Conn.init(rd2.reader(), out2.writer(), true, d2.bytes())!;
+    defer c2.deinit();
+    c2.handshake()!;
+    let mut first: u32 = 0;
+    while first == 0 {
+        first = c2.step()!;
+    }
+    @expect(first == 1);
+    @expect(c2.take_done() == 0);
+    c2.send_data(1, "0123456789", true)!;
+    @expect(c2.take_done() == 3);
+    @expect(c2.take_done() == 0);
+}
+
+test "table size settings do not pile up" {
+    let mut p = strs.String.init();
+    defer p.deinit();
+    for k in @as(usize, 0)..2000 {
+        setting(&mut p, 1, @truncate(u32, k & 1))!;
+    }
+    let mut d = strs.String.init();
+    defer d.deinit();
+    d.push_str(PREFACE)!;
+    for _k in @as(usize, 0)..10 {
+        frame(&mut d, SETTINGS, 0, 0, p.bytes())!;
+    }
+    let mut rd = io.SliceReader.init("");
+    let mut out = strs.String.init();
+    defer out.deinit();
+    let mut c = Conn.init(rd.reader(), out.writer(), true, d.bytes())!;
+    defer c.deinit();
+    c.handshake()!;
+    loop {
+        _ = c.step() catch break;
+    }
+    @expect(c.enc.pending.len <= 2);
 }

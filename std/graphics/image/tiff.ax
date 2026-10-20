@@ -189,6 +189,7 @@ struct Page {
     tables: Entry,
     extras: Entry,
     next: u64,  // the next directory's offset, or 0
+    size: u64,  // the directory's own bytes
 }
 
 fn read_page(f: *File, off: u64) TiffError!Page {
@@ -233,6 +234,7 @@ fn read_page(f: *File, off: u64) TiffError!Page {
         tables: no_entry(),
         extras: no_entry(),
         next: 0,
+        size: (csize + (n * esize)) + lsize,
     };
     let start = o + @truncate(usize, csize);
     for k in @as(usize, 0)..@truncate(usize, n) {
@@ -309,39 +311,48 @@ fn read_page(f: *File, off: u64) TiffError!Page {
     return p;
 }
 
-// the directory of page n
-fn page_at(f: *File, n: usize) TiffError!Page {
+// Walks the directories to page n, or to the last page when n is past it,
+// returning that page and counting the pages in *count. The directories of a
+// file don't overlap, so they come to at most data.len bytes: a chain that
+// reads more loops back on itself (or overlaps) and is corrupt.
+fn walk(f: *File, n: usize, count: *mut usize) TiffError!Page {
     let mut off = first_ifd(f);
+    let mut read: u64 = 0;
     let mut k: usize = 0;
     loop {
         let p = read_page(f, off)!;
-        if k == n {
-            return p;
-        }
-        if (p.next == 0) or (k > 65536) {
+        read += p.size;
+        k += 1;
+        if read > @as(u64, f.data.len) {
             return error.Corrupt;
         }
-        off = p.next;
-        k += 1;
-    }
-}
-
-/// The number of pages (images) in the file.
-pub fn page_count(data: []u8) TiffError!usize {
-    let f = open(data)!;
-    let mut off = first_ifd(&f);
-    let mut k: usize = 0;
-    loop {
-        let p = read_page(&f, off)!;
-        k += 1;
-        if p.next == 0 {
-            return k;
+        if (k > n) or (p.next == 0) {
+            count.* = k;
+            return p;
         }
         if k > 65536 {
             return error.Corrupt;
         }
         off = p.next;
     }
+}
+
+// the directory of page n
+fn page_at(f: *File, n: usize) TiffError!Page {
+    let mut k: usize = 0;
+    let p = walk(f, n, &mut k)!;
+    if k != n + 1 {
+        return error.Corrupt;
+    }
+    return p;
+}
+
+/// The number of pages (images) in the file.
+pub fn page_count(data: []u8) TiffError!usize {
+    let f = open(data)!;
+    let mut k: usize = 0;
+    _ = walk(&f, @max_value(usize) - 1, &mut k)!;
+    return k;
 }
 
 /// The first page.
@@ -1876,6 +1887,31 @@ test "pages" {
     defer p1.deinit();
     @expect(strs.eq(p1.data, b.data));
     @expect(fails(decode_page(enc, 2)));
+}
+
+test "directories that loop" {
+    // a directory of 5000 entries whose next directory is itself: once
+    // round the loop, not 65536 times
+    let n: usize = 5000;
+    let mut d = strs.String.init();
+    defer d.deinit();
+    d.push_str("II*\x00\x08\x00\x00\x00")!;
+    d.push(@truncate(u8, n))!;
+    d.push(@truncate(u8, n >> 8))!;
+    for i in @as(usize, 0)..n {
+        d.push_str("\x00\x01\x03\x00\x01\x00\x00\x00\x01\x00\x00\x00")!;
+    }
+    d.push_str("\x08\x00\x00\x00")!;
+    @expect(fails_n(page_count(d.bytes())));
+    @expect(fails(decode_page(d.bytes(), 3)));
+    // two directories pointing at each other
+    let two = "II*\x00\x08\x00\x00\x00\x00\x00\x0e\x00\x00\x00\x00\x00\x08\x00\x00\x00";
+    @expect(fails_n(page_count(two)));
+}
+
+fn fails_n(r: TiffError!usize) bool {
+    _ = r catch return true;
+    return false;
 }
 
 fn fails(r: !image.Image) bool {

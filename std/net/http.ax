@@ -354,18 +354,17 @@ struct Conn {
         }
     }
 
-    /// One line without its line ending (at most a few KiB).
+    /// One line without its CRLF (at most a few KiB; a bare LF is refused).
     fn read_line(self: *mut Conn) ![]u8 {
         loop {
             let data = self.buf[self.start..self.end];
             let nl = strs.index_of_byte(data, '\n') catch data.len;
             if nl < data.len {
-                self.start += nl + 1;
-                let mut line = data[..nl];
-                if (line.len > 0) and (line[line.len - 1] == '\r') {
-                    line = line[..line.len - 1];
+                if (nl == 0) or (data[nl - 1] != '\r') {
+                    return error.BadRequest;
                 }
-                return line;
+                self.start += nl + 1;
+                return data[..nl - 1];
             }
             if data.len > 8192 {
                 return error.BadRequest;
@@ -396,11 +395,14 @@ struct Conn {
     }
 
     /// A chunked body (RFC 9112 section 7.1), appended to out; trailers are
-    /// read and dropped.
+    /// checked as headers are, then dropped. Lines must end in CRLF.
     fn read_chunked(self: *mut Conn, out: *mut strs.String, max: usize) !void {
         loop {
             let line = self.read_line()!;
             let semi = strs.index_of_byte(line, ';') catch line.len;
+            if not valid_chunk_ext(line[semi..]) {
+                return error.BadRequest;
+            }
             // chunk-size = 1*HEXDIG, then optional whitespace before extensions
             let size_text = trim_trailing_blanks(line[..semi]);
             if (size_text.len == 0) or (size_text.len > ((2 * @size_of(usize)) - 1)) {
@@ -421,6 +423,10 @@ struct Conn {
                     if t.len == 0 {
                         return;
                     }
+                    let mut one: [1]Header = [Header.{ name: "", value: "" }];
+                    if parse_headers(t, one[..])! != 1 {
+                        return error.BadRequest;
+                    }
                 }
                 return error.HeadTooLarge;
             }
@@ -428,11 +434,75 @@ struct Conn {
                 return error.TooLarge;
             }
             self.read_into(out, size)!;
-            if self.read_line()!.len != 0 {
+            let mut crlf: [2]u8 = [0; 2];
+            self.read_exact(crlf[..])!;
+            if not @mem_eq(crlf[..], "\r\n") {
                 return error.BadRequest;
             }
         }
     }
+}
+
+// Chunk extensions: *( BWS ";" BWS name [ BWS "=" BWS ( token /
+// quoted-string ) ] ), with no control bytes.
+fn valid_chunk_ext(s: []u8) bool {
+    let mut i: usize = 0;
+    while i < s.len {
+        i = skip_blanks(s, i);
+        if (i == s.len) or (s[i] != ';') {
+            return false;
+        }
+        i = skip_blanks(s, i + 1);
+        let n0 = i;
+        while (i < s.len) and is_token_char(s[i]) {
+            i += 1;
+        }
+        if i == n0 {
+            return false;
+        }
+        i = skip_blanks(s, i);
+        if (i == s.len) or (s[i] != '=') {
+            continue;
+        }
+        i = skip_blanks(s, i + 1);
+        if (i < s.len) and (s[i] == '"') {
+            i += 1;
+            loop {
+                if i == s.len {
+                    return false;
+                }
+                let c = s[i];
+                if c == '"' {
+                    i += 1;
+                    break;
+                }
+                if (c == '\\') and ((i + 1) < s.len) {
+                    i += 1;
+                }
+                if ((s[i] < 0x20) and (s[i] != '\t')) or (s[i] == 0x7f) {
+                    return false;
+                }
+                i += 1;
+            }
+        } else {
+            let v0 = i;
+            while (i < s.len) and is_token_char(s[i]) {
+                i += 1;
+            }
+            if i == v0 {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn skip_blanks(s: []u8, i0: usize) usize {
+    let mut i = i0;
+    while (i < s.len) and ((s[i] == ' ') or (s[i] == '\t')) {
+        i += 1;
+    }
+    return i;
 }
 
 fn is_token_char(c: u8) bool {
@@ -600,7 +670,9 @@ pub struct Request {
     }
 
     /// A route parameter, such as "id" for the pattern "/users/{id}", or "*"
-    /// for the rest of the path after a trailing "/*". Percent-decoded.
+    /// for the rest of the path after a trailing "/*". Percent-decoded; a
+    /// path whose parameter would hold NUL, a ".." segment, "\" or ":" (or,
+    /// except in "*", "/") matches no route.
     pub fn param(self: *Request, name: []u8) HttpError![]u8 {
         let sc = self.scratch;
         for i in 0..sc.nparams {
@@ -1098,8 +1170,43 @@ fn transport_write(ctx: *mut void, bytes: []u8) !usize {
     return bytes.len;
 }
 
+// Whether an HTTP/2 request breaks the rules HTTP/1's do: the method a
+// token, the target without controls or spaces, no control bytes in
+// values, and Host (if any) the same as :authority.
+fn h2_malformed(st: *mut http2.Stream) bool {
+    let method = st.header(":method");
+    let target = st.header(":path");
+    if (method.len == 0) or (target.len == 0) or strs.eq(method, "CONNECT") {
+        return true;
+    }
+    for ch in method {
+        if not is_token_char(ch) {
+            return true;
+        }
+    }
+    for ch in target {
+        if (ch <= 0x20) or (ch == 0x7F) {
+            return true;
+        }
+    }
+    let authority = st.header(":authority");
+    for x in st.headers() {
+        for c in x.value {
+            if ((c < 0x20) and (c != '\t')) or (c == 0x7f) {
+                return true;
+            }
+        }
+        if strs.eq(x.name, "host") and (authority.len > 0) and not strs.eq_ignore_case(x.value, authority) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // HTTP/2: the requests of a connection, one at a time (the others wait,
-// their frames handled meanwhile).
+// their frames handled meanwhile). Like an HTTP/1 request, each must
+// arrive within request_timeout_ms of the last answer (or the start), and
+// its answer be sent within that long.
 fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
     let mut t = stream;
     let r = io.Reader.{ ctx: @ptr_cast(*mut void, &mut t), read_fn: transport_read };
@@ -1107,6 +1214,8 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
     let mut h = http2.Conn.init(r, w, true, prefill) catch return;
     defer h.deinit();
     h.max_body = s.opts.max_body_bytes;
+    let timeout = @as(i64, s.opts.request_timeout_ms) * 1000000;
+    h.deadline = time.Instant.now().ns + timeout;
     h.handshake() catch return;
     let mut scratch = new_scratch();
     defer scratch.blocks.deinit();
@@ -1117,7 +1226,15 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
             h.goaway(http2.NO_ERROR) catch {};
             return;
         }
-        let id = h.step() catch return;
+        let mut id = h.take_done();
+        if id == 0 {
+            id = h.step() catch |e| {
+                if e == error.TimedOut {
+                    h.goaway(http2.NO_ERROR) catch {};
+                }
+                return;
+            };
+        }
         if id == 0 {
             // the client said goodbye, and nothing is left to answer
             if h.got_goaway and (h.streams.len == 0) {
@@ -1130,13 +1247,13 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
             h.drop_stream(id);
             continue;
         }
-        let method = st.header(":method");
-        let target = st.header(":path");
-        if (method.len == 0) or (target.len == 0) or strs.eq(method, "CONNECT") {
+        if h2_malformed(st) {
             h.reset_stream(id, http2.PROTOCOL_ERROR) catch return;
             h.drop_stream(id);
             continue;
         }
+        let method = st.header(":method");
+        let target = st.header(":path");
         // the headers as HTTP/1's (with Host from :authority)
         hs.clear();
         let authority = st.header(":authority");
@@ -1144,7 +1261,7 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
             hs.push(Header.{ name: "host", value: authority }) catch return;
         }
         for x in st.headers() {
-            if (x.name.len > 0) and (x.name[0] != ':') {
+            if (x.name.len > 0) and (x.name[0] != ':') and not ((authority.len > 0) and strs.eq(x.name, "host")) {
                 hs.push(Header.{ name: x.name, value: x.value }) catch return;
             }
         }
@@ -1159,6 +1276,7 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
                                  version: Version.HTTP_1_1, head_only: @mem_eq(method, "HEAD"), keep_alive: true,
                                  started: false, chunked: false, has_type: false, upgraded: false, h2: &mut h,
                                  h2_id: id, is_h2: true };
+        h.deadline = time.Instant.now().ns + timeout;
         s.handler(s.ctx, &req, &mut res) catch {
             if not res.started {
                 res.status = 500;
@@ -1178,6 +1296,7 @@ fn serve_h2[C](s: *mut Server.[C], stream: Transport, prefill: []u8) void {
                 return;
             }
         };
+        h.deadline = time.Instant.now().ns + timeout;
     }
 }
 
@@ -1468,15 +1587,16 @@ fn add_param(req: *mut Scratch, name: []u8, raw: []u8) HttpError!bool {
     }
     let out = req.alloc(raw.len)!;
     let v = percent_decode(raw, out, false) catch return false;
-    // a parameter names something inside its place: no NUL, no "..", and
-    // (except for "*") no "/" smuggled in as %2F
+    // a parameter names something inside its place: no NUL, no "..", no "\"
+    // or ":" (Windows' separator, drive letters and streams), and (except for
+    // "*") no "/" smuggled in as %2F
     if strs.contains(v, "\x00") or (not @mem_eq(name, "*") and strs.contains(v, "/")) {
         return false;
     }
     let mut segs = strs.split(v, "/");
     loop {
         let seg = segs.next() catch break;
-        if @mem_eq(seg, "..") {
+        if @mem_eq(seg, "..") or strs.contains(seg, "\\") or strs.contains(seg, ":") {
             return false;
         }
     }
@@ -2495,7 +2615,7 @@ test "server and client" {
     @expect(strs.starts_with(o7, "HTTP/1.1 400 "));
 
     // framing that a proxy could read differently is refused (request smuggling)
-    let smuggles: [9][]u8 = [
+    let smuggles: [16][]u8 = [
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: +3\r\n\r\nabc",
         "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3 3\r\n\r\nabc",
         "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: \x0bchunked\r\n\r\n0\r\n\r\n",
@@ -2505,12 +2625,25 @@ test "server and client" {
         "GET /hello HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
         "GET /hello HTTP/1.1\r\nHost: x\r\nX-A: a\rb\r\n\r\n",
         "GET /hello HTTP/1.1\r\nHost: x\r\nX-A: a\x00b\r\n\r\n",
+        // chunked lines without their CR, control bytes or bad syntax in a
+        // chunk extension, a trailer that is not a header
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3;x=\x00\rq\r\nabc\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3;x=\"a\x01\"\r\nabc\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3;=1\r\nabc\r\n0\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: \x01\x7f\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nnot a header\r\n\r\n",
     ];
     for sm in smuggles {
         let o = raw_exchange(port, sm)!;
         defer mem.free(o);
         @expect(strs.starts_with(o, "HTTP/1.1 4") or strs.starts_with(o, "HTTP/1.1 501"));
     }
+    let o12 = raw_exchange(port,
+                           "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3 ; a=\"b \\\" c\";d\r\nabc\r\n0\r\nX-T: v\r\n\r\n")!;
+    defer mem.free(o12);
+    @expect(strs.starts_with(o12, "HTTP/1.1 201 ") and strs.ends_with(o12, "abc"));
     // route parameters cannot climb out of their place
     let o8 = raw_exchange(port, "GET /users/..%2Fetc HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")!;
     defer mem.free(o8);
@@ -2518,6 +2651,12 @@ test "server and client" {
     let o9 = raw_exchange(port, "GET /users/%2E%2E HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")!;
     defer mem.free(o9);
     @expect(strs.starts_with(o9, "HTTP/1.1 404 "));
+    let o10 = raw_exchange(port, "GET /users/..%5C..%5Cetc HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")!;
+    defer mem.free(o10);
+    @expect(strs.starts_with(o10, "HTTP/1.1 404 "));
+    let o11 = raw_exchange(port, "GET /users/C%3Asecret HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")!;
+    defer mem.free(o11);
+    @expect(strs.starts_with(o11, "HTTP/1.1 404 "));
     // the client will not send requests its caller could have split
     let bad_url = fmt.bufprint(url[..], "{}/a HTTP/1.1\r\nX: 1\r\n\r\nGET /b", [fmt.str(base)])!;
     @expect(failed(get(bad_url)));

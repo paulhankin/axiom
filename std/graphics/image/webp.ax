@@ -865,7 +865,7 @@ fn decode_pic(data: []u8) WebpError!Pic {
 
 /// The first frame: RGB, or RGBA with alpha or for animations.
 pub fn decode(data: []u8) WebpError!image.Image {
-    let mut a = decode_frames(data, true)!;
+    let mut a = decode_frames(data, true, image.MAX_PIXELS)!;
     let f = a.frames.get(0);
     a.frames.clear();
     a.deinit();
@@ -874,7 +874,7 @@ pub fn decode(data: []u8) WebpError!image.Image {
 
 /// Every frame, composited onto the canvas.
 pub fn decode_all(data: []u8) WebpError!Animation {
-    return decode_frames(data, false);
+    return decode_frames(data, false, image.MAX_PIXELS);
 }
 
 fn to_image(p: *Pic, channels: usize) WebpError!image.Image {
@@ -934,7 +934,8 @@ struct Rect {
     alpha: bool,
 }
 
-fn decode_frames(data: []u8, first_only: bool) WebpError!Animation {
+// limit: the pixels in all the frames
+fn decode_frames(data: []u8, first_only: bool, limit: usize) WebpError!Animation {
     if not is_webp(data) {
         return error.Corrupt;
     }
@@ -1009,6 +1010,11 @@ fn decode_frames(data: []u8, first_only: bool) WebpError!Animation {
         }
         if not strs.eq(tag, "ANMF") or (c.len < 16) {
             continue;
+        }
+        // each frame is a copy of the canvas, made in a few passes over it
+        if (count + 1) > (limit / (cw * chh)) {
+            anim.deinit();
+            return error.TooLarge;
         }
         let mut pic = decode_pic(c[16..]) catch |e| {
             anim.deinit();
@@ -1987,6 +1993,26 @@ test "animation" {
     let mut f0 = back.frames.get(0).image;
     let mut f1 = back.frames.get(1).image;
     @expect(same(&f0, &a) and same(&f1, &b));
+}
+
+test "many frames" {
+    // each frame is a copy of the canvas: the frames are limited by their
+    // pixels, not by the file's size
+    let mut a = test_image(30, 20, 4, 0)!;
+    defer a.deinit();
+    let frames: [40]*image.Image = [&a; 40];
+    let delays: [40]u32 = [10; 40];
+    let enc = encode_animation(frames[..], delays[..], 0)!;
+    defer mem.free(enc);
+    let mut back = decode_frames(enc, false, 30 * 20 * 40)!;
+    @expect_eq(back.frames.len, 40);
+    back.deinit();
+    let mut over = decode_frames(enc, false, 30 * 20 * 39) catch |e| {
+        @expect_eq(e, error.TooLarge);
+        return;
+    };
+    over.deinit();
+    @trap();
 }
 
 fn fails(data: []u8) bool {

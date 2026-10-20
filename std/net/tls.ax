@@ -1309,6 +1309,10 @@ pub fn client(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig) !*mut C
         stream.close();
         return error.InvalidArgument;
     }
+    if (hostname.len > 0) and not is_ip(hostname) and not is_host_name(hostname) {
+        stream.close();
+        return error.InvalidArgument;
+    }
     let c = new_conn(stream, true)!;
     let n = hostname.len;
     @mem_copy(c.sni[..n], hostname[..n]);
@@ -1325,12 +1329,30 @@ pub fn client(stream: net.TcpStream, hostname: []u8, cfg: *ClientConfig) !*mut C
 }
 
 fn is_ip(sni: []u8) bool {
+    if strs.contains(sni, ":") {
+        _ = net.Addr.parse(sni) catch return false;
+        return true;
+    }
     _ = net.parse_ipv4(sni) catch return false;
     return true;
 }
 
+// A name that may go in (or come from) server_name: 1 to 255 letters,
+// digits, '-', '.' and '_'.
+fn is_host_name(n: []u8) bool {
+    if (n.len == 0) or (n.len > 255) {
+        return false;
+    }
+    for ch in n {
+        if not strs.is_alnum(ch) and (ch != '-') and (ch != '.') and (ch != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn client_hello(c: *mut Conn, cfg: *ClientConfig, shares: *Shares, random_bytes: []u8, session_id: []u8,
-                only_group: u16, cookie: []u8) TlsError!Out {
+                cookie: []u8) TlsError!Out {
     let mut o = out();
     o.put8(HS_CLIENT_HELLO)!;
     let body = o.open(3)!;
@@ -1385,7 +1407,7 @@ fn client_hello(c: *mut Conn, cfg: *ClientConfig, shares: *Shares, random_bytes:
     let sgl = o.open(2)!;
     o.put16(GROUP_X25519)!;
     o.put16(GROUP_P256)!;
-    if v12 and (only_group == 0) {
+    if v12 {
         o.put16(GROUP_P384)!;  // for TLS 1.2 ECDHE (a 1.3 share is never P-384)
     }
     o.close(sgl, 2);
@@ -1416,16 +1438,12 @@ fn client_hello(c: *mut Conn, cfg: *ClientConfig, shares: *Shares, random_bytes:
         o.put16(EXT_KEY_SHARE)!;
         let ks = o.open(2)!;
         let kl = o.open(2)!;
-        if (only_group == 0) or (only_group == GROUP_X25519) {
-            o.put16(GROUP_X25519)!;
-            o.put16(32)!;
-            o.put(shares.x25519.public[..])!;
-        }
-        if (only_group == 0) or (only_group == GROUP_P256) {
-            o.put16(GROUP_P256)!;
-            o.put16(65)!;
-            o.put(shares.p256_pub[..])!;
-        }
+        o.put16(GROUP_X25519)!;
+        o.put16(32)!;
+        o.put(shares.x25519.public[..])!;
+        o.put16(GROUP_P256)!;
+        o.put16(65)!;
+        o.put(shares.p256_pub[..])!;
         o.close(kl, 2);
         o.close(ks, 2);
     }
@@ -1516,7 +1534,7 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
     random.fill(sid[..])!;
     let mut tr = Transcript.init();
     defer tr.deinit();
-    let mut ch = client_hello(c, cfg, &shares, rnd[..], sid[..], 0, "")!;
+    let mut ch = client_hello(c, cfg, &shares, rnd[..], sid[..], "")!;
     tr.add(ch.bytes())!;
     c.send_handshake(ch.bytes())!;
     ch.s.deinit();
@@ -1545,10 +1563,16 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
         // HelloRetryRequest: the transcript restarts from a hash of the
         // first ClientHello, and a second ClientHello carries the one share
         // the server asked for
-        if (sh.version != 0x0304) or ((sh.group != GROUP_X25519) and (sh.group != GROUP_P256)) {
-            return c.fail(ALERT_ILLEGAL_PARAMETER, error.HandshakeFailure);
+        // (the first ClientHello has a share for each group we support, so
+        // a retry may not ask for one: that would change nothing, RFC 8446
+        // 4.1.4; it may only send a cookie)
+        if (sh.version != 0x0304) or (sh.group != 0) or (sh.cookie.len == 0) {
+            return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
         }
         let s = suite_of(sh.suite) catch return c.fail(ALERT_HANDSHAKE_FAILURE, error.HandshakeFailure);
+        if s.v12 {
+            return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
+        }
         let mut h1: [48]u8 = [0; 48];
         sha2.hash(s.hash, tr.pending.bytes(), h1[..]);
         let hl = sha2.digest_size(s.hash);
@@ -1560,19 +1584,18 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
         let mut cookie = strs.String.init();
         defer cookie.deinit();
         cookie.push_str(sh.cookie)!;
-        let mut ch2 = client_hello(c, cfg, &shares, rnd[..], sid[..], sh.group, cookie.bytes())!;
+        let mut ch2 = client_hello(c, cfg, &shares, rnd[..], sid[..], cookie.bytes())!;
         tr.add(ch2.bytes())!;
         c.send_handshake(ch2.bytes())!;
         ch2.s.deinit();
         msg = c.expect_message(HS_SERVER_HELLO)!;
         let hrr_suite = sh.suite;
-        let hrr_group = sh.group;
         sh = parse_server_hello(msg)!;
         if sh.hrr {
             return c.fail(ALERT_UNEXPECTED_MESSAGE, error.UnexpectedMessage);
         }
         // the ServerHello must keep what the retry chose
-        if (sh.suite != hrr_suite) or (sh.group != hrr_group) or not @mem_eq(sh.session_id, sid[..]) {
+        if (sh.suite != hrr_suite) or not @mem_eq(sh.session_id, sid[..]) {
             return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
         }
     }
@@ -1580,6 +1603,9 @@ fn client_handshake(c: *mut Conn, cfg: *ClientConfig) !void {
         return c.fail(ALERT_PROTOCOL_VERSION, error.ProtocolVersion);
     }
     c.suite = suite_of(sh.suite) catch return c.fail(ALERT_ILLEGAL_PARAMETER, error.HandshakeFailure);
+    if c.suite.v12 {
+        return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);  // a TLS 1.2 suite in 1.3
+    }
     tr.add(msg)!;
     tr.start(c.suite.hash);
     let hash = c.suite.hash;
@@ -2402,10 +2428,14 @@ fn parse_client_hello(c: *mut Conn, msg: []u8) TlsError!Hello {
         } else if ty == EXT_SERVER_NAME {
             let mut l = cur(d.vec16()!);
             if l.get8()! == 0 {
+                // (the name reaches the program: no control bytes, no
+                // slashes, nothing past 255 bytes)
                 let name = l.vec16()!;
-                let n = @min(name.len, 255);
-                @mem_copy(c.sni[..n], name[..n]);
-                c.sni_len = n;
+                if not is_host_name(name) {
+                    return error.IllegalParameter;
+                }
+                @mem_copy(c.sni[..name.len], name);
+                c.sni_len = name.len;
             }
         }
     }
@@ -2448,12 +2478,23 @@ fn server_hello(sid: []u8, suite: u16, hrr: bool, group: u16, share: []u8) TlsEr
     return o;
 }
 
+// The alert for a ClientHello that parse_client_hello refused.
+fn hello_alert(e: error) u8 {
+    if e == error.IllegalParameter {
+        return ALERT_ILLEGAL_PARAMETER;
+    }
+    if e == error.DecodeError {
+        return ALERT_DECODE_ERROR;
+    }
+    return ALERT_HANDSHAKE_FAILURE;
+}
+
 fn server_handshake(c: *mut Conn, cfg: *ServerConfig) !void {
     let mut tr = Transcript.init();
     defer tr.deinit();
     let mut msg = c.expect_message(HS_CLIENT_HELLO)!;
     let mut hello = parse_client_hello(c, msg) catch |e| {
-        return c.fail(ALERT_HANDSHAKE_FAILURE, e);
+        return c.fail(hello_alert(e), e);
     };
     if not hello.tls13 {
         if cfg.min_version > VERSION_1_2 {
@@ -2498,7 +2539,9 @@ fn server_handshake(c: *mut Conn, cfg: *ServerConfig) !void {
             sent_ccs = true;
         }
         msg = c.expect_message(HS_CLIENT_HELLO)!;
-        hello = parse_client_hello(c, msg)!;
+        hello = parse_client_hello(c, msg) catch |e| {
+            return c.fail(hello_alert(e), e);
+        };
         if (hello.group != g) or (hello.suite != c.suite.id) {
             return c.fail(ALERT_ILLEGAL_PARAMETER, error.IllegalParameter);
         }
@@ -2911,4 +2954,126 @@ test "TLS 1.2 PRF" {
     @expect_eq(o[..16], want[..]);
     let tail: [4]u8 = [0x87, 0x34, 0x7b, 0x66];  // (computed with Python's hmac)
     @expect_eq(o[96..], tail[..]);
+}
+
+// A ClientHello offering one suite, with server_name `name`.
+fn hello_with_name(name: []u8) TlsError!Out {
+    let mut o = out();
+    o.put8(HS_CLIENT_HELLO)!;
+    let body = o.open(3)!;
+    o.put16(0x0303)!;
+    let rnd: [32]u8 = [7; 32];
+    o.put(rnd[..])!;
+    o.put8(0)!;
+    o.put16(2)!;
+    o.put16(TLS_AES_128_GCM_SHA256)!;
+    o.put8(1)!;
+    o.put8(0)!;
+    let exts = o.open(2)!;
+    o.put16(EXT_SERVER_NAME)!;
+    let e = o.open(2)!;
+    let l = o.open(2)!;
+    o.put8(0)!;
+    o.put16(@truncate(u16, name.len))!;
+    o.put(name)!;
+    o.close(l, 2);
+    o.close(e, 2);
+    o.close(exts, 2);
+    o.close(body, 3);
+    return o;
+}
+
+fn name_refused(name: []u8) bool {
+    let mut o = hello_with_name(name) catch return false;
+    defer o.s.deinit();
+    parse_hello(o.s.bytes()) catch |e| return e == error.IllegalParameter;
+    return false;
+}
+
+test "server names" {
+    let long = mem.alloc.[u8](300)!;
+    defer mem.free(long);
+    @mem_set(long, 'a');
+    // control bytes, slashes, spaces, a NUL, an empty name, and one past 255 bytes
+    let bad: [6][]u8 = ["../../etc/passwd", "a\r\nX-Injected: 1", "a\x00b", "a b", "", long];
+    for k in @as(usize, 0)..bad.len {
+        if not name_refused(bad[k]) {
+            @expect_eq(k, 99);
+        }
+    }
+    let mut ok = hello_with_name("_a-b.example.com")!;
+    defer ok.s.deinit();
+    parse_hello(ok.s.bytes())!;
+    @expect(not name_refused(long[..255]));
+    // and the client does not send one
+    let l = net.listen("127.0.0.1", 0)!;
+    defer l.close();
+    let mut insecure = ClientConfig.insecure();
+    defer insecure.deinit();
+    let st = net.connect("127.0.0.1", l.port())!;
+    let r = client(st, "a\r\nb", &insecure);
+    _ = r catch |e| {
+        @expect(e == error.InvalidArgument);
+        return;
+    };
+    @expect(false);
+}
+
+// A server that answers the ClientHello with one ServerHello (or retry).
+struct FakeServer {
+    listener: net.TcpListener,
+    suite: u16,
+    hrr: bool,
+    group: u16,
+}
+
+fn fake_serve(f: *mut FakeServer) void {
+    let s = f.listener.accept() catch return;
+    defer s.close();
+    let mut hdr: [5]u8 = [0; 5];
+    s.reader().read_exact(hdr[..]) catch return;
+    let n = (@as(usize, hdr[3]) << 8) | @as(usize, hdr[4]);
+    let mut body: [4096]u8 = [0; 4096];
+    if (n > body.len) or (n < 40) {
+        return;
+    }
+    s.reader().read_exact(body[..n]) catch return;
+    let sl = @as(usize, body[38]);
+    let share: [32]u8 = [9; 32];
+    let mut sh = server_hello(body[39..39 + sl], f.suite, f.hrr, f.group, share[..]) catch return;
+    defer sh.s.deinit();
+    let rec: [5]u8 = [CT_HANDSHAKE, 3, 3, @truncate(u8, sh.s.len >> 8), @truncate(u8, sh.s.len)];
+    s.write_all(rec[..]) catch return;
+    s.write_all(sh.s.bytes()) catch return;
+    // (until the client's alert and close)
+    let mut buf: [256]u8 = [0; 256];
+    loop {
+        let got = s.read(buf[..]) catch return;
+        if got == 0 {
+            return;
+        }
+    }
+}
+
+fn against_server_hello(suite: u16, hrr: bool, group: u16) error {
+    let mut f = FakeServer.{ listener: net.listen("127.0.0.1", 0) catch |e| return e, suite: suite, hrr: hrr,
+                             group: group };
+    defer f.listener.close();
+    let th = thread.spawn(fake_serve, &mut f) catch |e| return e;
+    defer th.join();
+    let mut insecure = ClientConfig.insecure();
+    defer insecure.deinit();
+    let st = net.connect("127.0.0.1", f.listener.port()) catch |e| return e;
+    let c = client(st, "localhost", &insecure) catch |e| return e;
+    c.close();
+    return error.Closed;
+}
+
+test "a TLS 1.3 client checks the ServerHello" {
+    // a TLS 1.2 suite in a 1.3 ServerHello, and one never offered
+    @expect(against_server_hello(ECDHE_RSA_AES_128_GCM_SHA256, false, GROUP_X25519) == error.IllegalParameter);
+    @expect(against_server_hello(0x1304, false, GROUP_X25519) == error.HandshakeFailure);
+    // a retry asking for a group the first hello already had a share for
+    @expect(against_server_hello(TLS_AES_128_GCM_SHA256, true, GROUP_X25519) == error.IllegalParameter);
+    @expect(against_server_hello(TLS_AES_128_GCM_SHA256, true, GROUP_P256) == error.IllegalParameter);
 }

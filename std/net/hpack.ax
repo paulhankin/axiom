@@ -285,7 +285,17 @@ pub struct Encoder {
             return;
         }
         self.table.resize(n);
-        self.pending.push(n)!;
+        // only the smallest size since the last block and the final one
+        // need announcing (RFC 7541 section 4.2): at most two updates
+        let mut low = n;
+        if self.pending.len > 0 {
+            low = @min(self.pending.items()[0], n);
+        }
+        self.pending.clear();
+        self.pending.push(low)!;
+        if low != n {
+            self.pending.push(n)!;
+        }
     }
 
     /// Appends the block encoding headers to out.
@@ -551,4 +561,31 @@ test "hostile blocks" {
     // a list larger than the limit
     d.max_list_size = 40;
     @expect(bad(&mut d, "\x40\x01a\x0aaaaaaaaaaa"));
+}
+
+test "table size changes between blocks" {
+    let mut enc = Encoder.init();
+    defer enc.deinit();
+    let mut dec = Decoder.init(4096);
+    defer dec.deinit();
+    // many changes: only the smallest and the last are announced
+    for k in @as(usize, 0)..10000 {
+        enc.set_max_size(1000 + (k % 7))!;
+    }
+    enc.set_max_size(0)!;
+    enc.set_max_size(4096)!;
+    enc.set_max_size(2000)!;
+    @expect(enc.pending.len == 2);
+    let hs: [1]Header = [Header.{ name: "x-a", value: "b" }];
+    let mut out = strs.String.init();
+    defer out.deinit();
+    enc.encode(hs[..], &mut out)!;
+    @expect(strs.starts_with(out.bytes(), "\x20\x3f\xb1\x0f"));  // 0, then 2000
+    let got = dec.decode(out.bytes())!;
+    @expect((got.len == 1) and strs.eq(got[0].value, "b"));
+    @expect(dec.table.max == 2000);
+    // a growth and its undoing before a block: one update
+    enc.set_max_size(3000)!;
+    enc.set_max_size(2000)!;
+    @expect(enc.pending.len == 1);
 }

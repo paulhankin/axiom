@@ -277,11 +277,16 @@ pub struct Reader {
     names: vec.Vec.[[]mut []u8],
     objstm: maps.Map.[u64, usize],  // object stream number -> index in `streams`
     streams: vec.Vec.[ObjStm],
+    decoded: maps.Map.[u64, Decoded],  // stream start -> its data, decoded
     pages: vec.Vec.[Dict],
     /// The most a stream may decode to (bytes).
     max_stream: usize,
-    /// Work left (bytes decoded and parsed); a file cannot use more.
+    /// Work left (bytes decoded); a file cannot use more.
     budget: usize,
+    /// Bytes of objects left to parse: a few times the file and its object
+    /// streams (objects that overlap, or many entries for one place, would
+    /// parse the same bytes again and again).
+    parse_budget: usize,
 
     /// Opens a PDF held in memory (which must outlive the Reader).
     pub fn open(data: []u8) !Reader {
@@ -296,9 +301,11 @@ pub struct Reader {
             names: vec.Vec.[[]mut []u8].init(),
             objstm: maps.Map.[u64, usize].init(hash.hash_u64, hash.eq_u64),
             streams: vec.Vec.[ObjStm].init(),
+            decoded: maps.Map.[u64, Decoded].init(hash.hash_u64, hash.eq_u64),
             pages: vec.Vec.[Dict].init(),
             max_stream: 256 * 1024 * 1024,
             budget: (@min(data.len, 1 << 24) * 64) + (1 << 28),
+            parse_budget: (data.len * 8) + (1 << 20),
         };
         r.load() catch |e| {
             r.deinit();
@@ -329,6 +336,7 @@ pub struct Reader {
             offs.deinit();
         }
         self.streams.deinit();
+        self.decoded.deinit();
         self.pages.deinit();
     }
 
@@ -338,6 +346,24 @@ pub struct Reader {
             return e;
         };
         return b;
+    }
+
+    // frees what was kept after these counts (by a parse that failed)
+    fn release(self: *mut Reader, nbytes: usize, nobjects: usize, nnames: usize) void {
+        while self.bytes.len > nbytes {
+            mem.free(self.bytes.pop() catch break);
+        }
+        while self.objects.len > nobjects {
+            mem.free(self.objects.pop() catch break);
+        }
+        while self.names.len > nnames {
+            mem.free(self.names.pop() catch break);
+        }
+    }
+
+    // counts parsing against its budget
+    fn charge(self: *mut Reader, n: usize) void {
+        self.parse_budget -= @min(self.parse_budget, n);
     }
 
     fn load(self: *mut Reader) !void {
@@ -653,25 +679,35 @@ pub struct Reader {
         if st == 2 {
             return self.cache.get(n);
         }
-        if st == 1 {
-            return Object.Null;  // a cycle
+        if (st == 1) or (self.parse_budget == 0) {
+            return Object.Null;  // a cycle, or the work allowed is done
         }
+        // an object is parsed once, the parsing counted against the budget; one
+        // that fails is Null from then on, with what its parse made freed
         self.state.set(n, 1);
+        self.cache.set(n, Object.Null);
         let e = self.xref.get(n);
         let mut o = Object.Null;
         if (e.kind == 1) and (e.off < @as(u64, self.data.len)) {
-            let mut lx = Lexer.{ s: self.data, pos: @truncate(usize, e.off) };
-            o = self.parse_indirect(&mut lx) catch |err| {
-                self.state.set(n, 0);
+            let start = @truncate(usize, e.off);
+            let mut lx = Lexer.{ s: self.data, pos: start };
+            let marks: [3]usize = [self.bytes.len, self.objects.len, self.names.len];
+            let r = self.parse_indirect(&mut lx);
+            self.charge(lx.pos - @min(lx.pos, start));
+            o = r catch |err| {
+                self.release(marks[0], marks[1], marks[2]);
+                self.state.set(n, 2);
                 if err == error.OutOfMemory {
+                    self.state.set(n, 0);
                     return err;
                 }
                 return Object.Null;
             };
         } else if e.kind == 2 {
             o = self.from_objstm(e.off, e.index) catch |err| {
-                self.state.set(n, 0);
+                self.state.set(n, 2);
                 if err == error.OutOfMemory {
+                    self.state.set(n, 0);
                     return err;
                 }
                 return Object.Null;
@@ -742,6 +778,7 @@ pub struct Reader {
             };
             oi = self.streams.len - 1;
             self.objstm.put(stm, oi)!;
+            self.parse_budget = @add_sat(self.parse_budget, data.len * 8);  // (once for each)
         }
         let os = self.streams.get(oi);
         if @as(usize, index) >= os.offsets.len {
@@ -752,7 +789,9 @@ pub struct Reader {
             return error.Corrupt;
         }
         let mut lx2 = Lexer.{ s: os.data, pos: @truncate(usize, at_) };
-        return self.parse(&mut lx2, 0);
+        let r = self.parse(&mut lx2, 0);
+        self.charge(lx2.pos - @min(lx2.pos, @truncate(usize, at_)));
+        return r;
     }
 
     /// "n g obj ... endobj" (with stream data).
@@ -817,6 +856,7 @@ pub struct Reader {
                         }
                         len = @as(i64, @bit_cast(i64, @as(u64, t - s)));
                     }
+                    lx.pos = s + @truncate(usize, @bit_cast(u64, len));  // (the work done)
                     return Object.Stream(Stream.{ dict: dict, start: s, len: @truncate(usize, @bit_cast(u64, len)) });
                 }
             }
@@ -1035,6 +1075,16 @@ pub struct Reader {
         if (st.start > self.data.len) or (st.len > self.data.len - st.start) {
             return error.Corrupt;
         }
+        // a stream is decoded once, however often it is used (a form drawn
+        // many times); the dictionary is the stream object's own
+        let dict = @int_from_ptr(st.dict.vals.ptr);
+        let key = @as(u64, st.start);
+        if self.decoded.contains(key) {
+            let d = self.decoded.get(key)!;
+            if d.dict == dict {
+                return d.data;
+            }
+        }
         let raw = self.data[st.start..st.start + st.len];
         let filters = self.resolve(st.dict.get("Filter"))!;
         let parms = self.resolve(st.dict.get("DecodeParms"))!;
@@ -1074,6 +1124,9 @@ pub struct Reader {
             }
             let next = self.apply_filter(f, cur, pr) catch |e| {
                 mem.free(cur);
+                if e == error.TooLarge {
+                    self.budget -= @min(self.budget, self.max_stream);  // (it decoded that much, or the rest)
+                }
                 return e;
             };
             mem.free(cur);
@@ -1088,7 +1141,9 @@ pub struct Reader {
             return error.TooLarge;
         }
         self.budget -= cur.len;
-        return self.keep(cur);
+        let data = self.keep(cur)!;
+        self.decoded.put(key, Decoded.{ dict: dict, data: data })!;
+        return data;
     }
 
     fn apply_filter(self: *mut Reader, f: []u8, data: []u8, parms: Object) ![]mut u8 {
@@ -1300,6 +1355,11 @@ struct Lexer {
 struct ObjStm {
     data: []u8,
     offsets: vec.Vec.[u64],  // where each object starts in data
+}
+
+struct Decoded {
+    dict: usize,  // the address of the stream's dictionary values
+    data: []u8,
 }
 
 /// A literal string's contents from s[pos] (just after the '(').
@@ -2029,6 +2089,12 @@ struct Extractor {
 
     /// A form XObject: its content, with its own resources.
     fn form(self: *mut Extractor, name: []u8, res: Dict, depth: u32) !void {
+        // each use costs steps of its own, so a form that draws itself many
+        // times over (a tree of uses, 8 deep) cannot run on for long
+        self.steps += 1024;
+        if self.steps > (1 << 26) {
+            return;
+        }
         let xo = self.r.get(res, "XObject")!;
         let xd = xo.as_dict() catch return;
         let f = self.r.get(xd, name)!;
@@ -2894,4 +2960,63 @@ test "hostile structures" {
         }
         rr.deinit();
     }
+}
+
+test "objects that fail to parse, used many times" {
+    // an array that never closes, referred to 2000 times: parsed once, and
+    // what the parse made is freed
+    let mut refs = strs.String.init();
+    defer refs.deinit();
+    refs.push_str("<< /Type /Page /Parent 2 0 R /Contents [")!;
+    for _k in @as(usize, 0)..2000 {
+        refs.push_str("4 0 R ")!;
+    }
+    refs.push_str("] >>")!;
+    let mut bad = strs.String.init();
+    defer bad.deinit();
+    bad.push('[')!;
+    for _k in @as(usize, 0)..2000 {
+        bad.push_str("() [] ")!;
+    }
+    let objs: [4][]u8 = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", refs.bytes(),
+                         bad.bytes()];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    let mut r = Reader.open(pdf)!;
+    defer r.deinit();
+    let before = r.parse_budget;
+    let kept = r.bytes.len;
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect((before - r.parse_budget) < pdf.len);
+    @expect(r.bytes.len < (kept + 10));
+}
+
+test "a form that draws itself many times" {
+    // ten uses of itself, eight deep: decoded once, and the uses limited
+    let mut uses = strs.String.init();
+    defer uses.deinit();
+    for _k in @as(usize, 0)..10 {
+        uses.push_str("BT /F1 9 Tf (x) Tj ET /X Do ")!;
+    }
+    let form = stream_obj("/Type /XObject /Subtype /Form", uses.bytes())!;
+    defer mem.free(form);
+    let content = stream_obj("", "/X Do")!;
+    defer mem.free(content);
+    let objs: [6][]u8 = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /X 4 0 R >> >> >>",
+        form,
+        content,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ];
+    let pdf = build(objs[..])!;
+    defer mem.free(pdf);
+    let mut r = Reader.open(pdf)!;
+    defer r.deinit();
+    let t = r.page_text(0)!;
+    defer mem.free(t);
+    @expect(r.bytes.len < 10);
+    @expect(t.len < (1 << 20));
 }

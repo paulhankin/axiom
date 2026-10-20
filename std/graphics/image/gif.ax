@@ -54,7 +54,7 @@ pub struct Animation {
 
 /// The first frame.
 pub fn decode(data: []u8) GifError!image.Image {
-    let mut a = decode_frames(data, true)!;
+    let mut a = decode_frames(data, true, image.MAX_PIXELS)!;
     let f = a.frames.get(0);
     a.frames.clear();
     a.deinit();
@@ -63,7 +63,7 @@ pub fn decode(data: []u8) GifError!image.Image {
 
 /// Every frame.
 pub fn decode_all(data: []u8) GifError!Animation {
-    return decode_frames(data, false)!;
+    return decode_frames(data, false, image.MAX_PIXELS)!;
 }
 
 // the data sub-blocks from i, joined; i moves past the terminator
@@ -98,7 +98,8 @@ fn skip_blocks(b: []u8, i: *mut usize) GifError!void {
     }
 }
 
-fn decode_frames(b: []u8, first_only: bool) GifError!Animation {
+// limit: the pixels in all the frames
+fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
     if not is_gif(b) or (b.len < 13) {
         return error.Corrupt;
     }
@@ -141,7 +142,8 @@ fn decode_frames(b: []u8, first_only: bool) GifError!Animation {
     // the previous frame's disposal, and where it was
     let mut prev_disposal: u8 = 0;
     let mut prev: [4]usize = [0; 4];
-    let mut work: usize = 0;  // pixels decoded, against hostile files
+    let mut work: usize = 0;  // pixels decoded and copied, against hostile files
+    let mut kept: usize = 0;  // pixels in the frames
     loop {
         if i >= b.len {
             break;
@@ -213,8 +215,11 @@ fn decode_frames(b: []u8, first_only: bool) GifError!Animation {
         i += 1;
         lzw.clear();
         sub_blocks(b, &mut i, &mut lzw) catch break;
-        work = @add_sat(work, fw * fh);  // (many frames could wrap a 32-bit sum)
-        if (work > (image.MAX_PIXELS * 4)) or ((fw * fh) > (w * h * 4) + 65536) {
+        // each frame is decoded, then the whole canvas copied: the work, and
+        // the frames kept, are limited (many frames could wrap a 32-bit sum)
+        work = @add_sat(work, @add_sat(fw * fh, w * h));
+        kept = @add_sat(kept, w * h);
+        if (work > (limit * 4)) or (kept > limit) or ((fw * fh) > (w * h * 4) + 65536) {
             anim.deinit();
             return error.TooLarge;
         }
@@ -950,6 +955,27 @@ test "round trips" {
     // hostile: truncated, and a huge canvas
     @expect(invalid(decode(movie[..20])));
     @expect(invalid(decode("GIF89a\xff\xff\xff\xff\x00\x00\x00;")));
+}
+
+test "many frames" {
+    // 1x1 frames on a 64x64 canvas: each is a copy of the canvas, so the
+    // frames are limited by their pixels, not by the file's size
+    let mut d = strs.String.init();
+    defer d.deinit();
+    d.push_str("GIF89a\x40\x00\x40\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff")!;
+    for k in @as(usize, 0)..100 {
+        d.push_str("\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00")!;
+    }
+    d.push(0x3b)!;
+    let mut a = decode_frames(d.bytes(), false, 64 * 64 * 100)!;
+    @expect_eq(a.frames.len, 100);
+    a.deinit();
+    let mut over = decode_frames(d.bytes(), false, 64 * 64 * 99) catch |e| {
+        @expect_eq(e, error.TooLarge);
+        return;
+    };
+    over.deinit();
+    @trap();
 }
 
 fn invalid(r: !image.Image) bool {

@@ -61,21 +61,27 @@ schedule).
 | FLAC | block size at most `MAX_BLOCK` (65536); preallocation from the header capped at 1 MiB |
 | Vorbis | codebooks sorted in O(n log n) (heapsort on packed keys) |
 | fonts | GPOS kerning subtables precomputed (at most 32), never rescanned per pair; cmap format 12 arithmetic wraps and every glyph id is checked against `numGlyphs`; CFF INDEX `offSize` must be 1 to 4, with saturating offsets |
+| TIFF | the directories walked may total at most the file's size, so a chain that loops back fails at once; at most 65536 pages |
+| GIF, WebP | each frame charged a full canvas of work; all frames together at most `MAX_PIXELS` pixels |
+| QOI, BMP, PNM, HDR | the size an image claims checked against the data before allocating: at least `pixels / 62` bytes for QOI, `pixels / 128` for RLE BMP and `pixels / 32` for HDR; PNM rasters exactly; an uncompressed BMP at least half its raster |
+| PDF | an object is parsed once (a failure is cached, its partial results freed); parsing limited to 8 × the file plus its object streams; streams decoded once and reused; each use of a form XObject costs 1024 of the text extractor's 2^26 steps |
 
 ### Network, TLS and X.509
 
 | Where | What std does |
 |---|---|
-| http server | strict `Content-Length` and `Transfer-Encoding` parsing (no duplicates, no `Transfer-Encoding` on HTTP/1.0, strict chunk sizes) against request smuggling; exactly one `Host`; control characters refused in headers; at most 100 trailers; a request deadline (`Options.request_timeout_ms`) against slowloris |
+| http server | strict `Content-Length` and `Transfer-Encoding` parsing (no duplicates, no `Transfer-Encoding` on HTTP/1.0, strict chunk sizes, CRLF line endings, well-formed chunk extensions) against request smuggling; exactly one `Host`; control characters refused in headers and trailers; at most 100 trailers; a request deadline (`Options.request_timeout_ms`, for HTTP/1 and HTTP/2) against slowloris |
+| http2 | malformed messages reset their stream (RFC 9113 §8.2–8.3: lower-case token names, no NUL, CR, LF or edge blanks in values, no connection-specific headers, the required pseudo-headers once each and first, none in trailers, `content-length` matching the body); a connection's bodies together at most `max_body` + 1 MiB; reads fail past a deadline, so PINGs cannot hold a connection |
+| hpack | at most two table size updates pending (the smallest and the last) |
 | http client | methods, headers and URLs validated (no CR, LF or spaces); host names limited to letters, digits, `-` and `.` |
 | http router | `..`, `\`, `:` and NUL refused in path parameters, and `/` except in `*`, so `/files/:name` cannot escape (nor name a drive or a stream on Windows) |
-| tls | post-handshake messages capped at 64 KiB; ChangeCipherSpec accepted only as a single `0x01` before the handshake completes; a 20 s handshake deadline; ALPN must be one that was offered; `RecordOverflow` on oversized inner plaintext; no handshake bytes carried across a key change; KeyUpdate validated; NewSessionTicket accepted by clients only |
-| tls client | the server's session id echo must match; the ServerHello after a HelloRetryRequest must keep its suite and group |
+| tls | post-handshake messages capped at 64 KiB; ChangeCipherSpec accepted only as a single `0x01` before the handshake completes; a 20 s handshake deadline; ALPN must be one that was offered; `RecordOverflow` on oversized inner plaintext; no handshake bytes carried across a key change; KeyUpdate validated; NewSessionTicket accepted by clients only; a server name (SNI) must be 1–255 letters, digits, `-`, `.` or `_` (refused by the server, never sent by the client) |
+| tls client | the server's session id echo must match; a TLS 1.3 ServerHello must pick a TLS 1.3 suite; a HelloRetryRequest may not ask for a group that already had a share; the ServerHello after a HelloRetryRequest must keep its suite |
 | x509 | at most 64 signature checks while building a path; a CA's name constraints checked against every certificate below it in the path (the leaf and the intermediates, not self-issued ones), names trimmed of a trailing dot, and a wildcard `*.S` permitted only if a permitted subtree covers every name one label under S (and excluded if any such name is); a CA with name constraints of a kind not enforced (anything but DNS and IP, or a minimum or maximum) never accepted in a path; trailing data, duplicate extensions (any number of them) and non-DER KeyUsage bit strings refused |
 | rsa, der, base64, hmac, aes-gcm, chacha20-poly1305 | huge public exponents, non-minimal integers, loose padding, HKDF output past `255 * n`, messages past the AEAD limits and a ChaCha20 block counter that would wrap are refused (or trap, where they are programming errors) |
 | argon2 | memory at most `MAX_MEMORY_KIB` (4 GiB) and passes × memory at most `MAX_WORK_KIB` (16 GiB), so a stored or received hash cannot make verification allocate or run without limit (`TooExpensive`) |
 | hash maps | SipHash-1-3 with a per-process random key, against hash flooding |
-| dns | a random query id, a connected socket, and answers matched to the question |
+| dns | a random query id, a connected socket, and answers matched to the question; labels in names limited to printable ASCII without `.` or `\` |
 
 ### Memory and runtime
 
