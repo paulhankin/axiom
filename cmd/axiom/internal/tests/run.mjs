@@ -4,6 +4,8 @@
 //   // expect: <line>          expected output line (in order)
 //   // expect-trap             `run` must trap
 //   // expect-error: E0412     compilation must fail with this code (repeatable)
+//   // expect-warning: W0710   this warning on this line; with any, the file's
+//                              warnings must be exactly those declared
 //   // flags: --overflow=trap  extra compiler flags
 //   // wasm-only               skip on the native target
 //   // native-only             skip on wasm
@@ -95,10 +97,11 @@ function files(dir) {
 }
 
 function directives(src) {
-  const d = { expect: [], trap: false, errors: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, links: [], header: null };
-  for (const line of src.split('\n')) {
+  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, links: [], header: null };
+  for (const [i, line] of src.split('\n').entries()) {
     let m;
     if ((m = line.match(/\/\/ expect: ?(.*)$/))) d.expect.push(m[1]);
+    else if ((m = line.match(/\/\/ expect-warning: (W\d+)/))) d.warnings.push(`${m[1]} at line ${i + 1}`);
     else if (/\/\/ expect-trap\b/.test(line)) d.trap = true;
     else if ((m = line.match(/\/\/ expect-error: (E\d+)/))) d.errors.push(m[1]);
     else if ((m = line.match(/\/\/ flags: (.*)$/))) d.flags.push(...m[1].trim().split(/\s+/));
@@ -252,6 +255,11 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
     return null;
   }
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+  if (d.warnings.length) {
+    const got = (json ? json.diagnostics : []).filter((x) => x.severity === 'warning' && path.resolve(x.file) === f)
+      .map((x) => `${x.code} at line ${x.span.start_line}`);
+    if (got.sort().join(', ') !== [...d.warnings].sort().join(', ')) return `expected warnings [${d.warnings.join(', ')}], got [${got.join(', ')}]`;
+  }
   const r = native ? await runNative(out) : await runWasm(out);
   let problem = null;
   if (d.trap && !r.trapped) problem = 'expected a trap, but run completed';

@@ -1055,9 +1055,16 @@ intptr_t ax_memory_grow(intptr_t n) {
 }
 
 // @memory_discard: the whole 64 KiB pages in the range go back to the system
-// (they stay mapped, and read as zero when next touched).
+// (they stay mapped, and read as zero when next touched). Only pages of
+// @memory_grow's region: anything else (the stack, globals, code, C's heap)
+// is left alone.
 void ax_memory_discard(uintptr_t addr, size_t len) {
-    uintptr_t a = (addr + 65535) & ~(uintptr_t)65535, b = (addr + len) & ~(uintptr_t)65535;
+    if (__atomic_load_n(&mem_state, __ATOMIC_SEQ_CST) != 2) return;
+    uintptr_t lo = mem_base, hi = mem_base + __atomic_load_n(&mem_pages, __ATOMIC_SEQ_CST) * 65536;
+    uintptr_t end = addr + len < addr ? UINTPTR_MAX : addr + len;
+    if (addr >= hi || end <= lo) return;
+    uintptr_t a = ((addr > lo ? addr : lo) + 65535) & ~(uintptr_t)65535;
+    uintptr_t b = (end < hi ? end : hi) & ~(uintptr_t)65535;
     if (a < b) madvise((void *)a, b - a, MADV_DONTNEED);
 }
 

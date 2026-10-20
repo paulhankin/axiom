@@ -391,6 +391,49 @@ bool check_generic_args(Decl *d, Type **args, int n, Span sp, TypeExprVec *tes) 
     return ok;
 }
 
+// Object sizes (spec §5.5): every array, error union, struct and union type
+// written in the program, and every instance of a generic one, must fit the
+// target's largest object (E0473). The check waits until the end of
+// analysis, when every type it reaches is complete (a struct may name an
+// array of itself behind a pointer while its own fields are resolved).
+typedef struct SizeCheck {
+    Span span;
+    Type *t;
+} SizeCheck;
+static Vec(SizeCheck) size_checks;
+
+static Type *check_size(Span sp, Type *t) {
+    if (!t->has_params && t->kind != TY_INVALID) vec_push(size_checks, ((SizeCheck){sp, t}));
+    return t;
+}
+
+static void check_sizes(void) {
+    int64_t max = max_object_size();
+    Vec(Span) reported = {0};
+    for (int i = 0; i < size_checks.len; i++) {
+        SizeCheck c = size_checks.data[i];
+        const char *msg;
+        if (c.t->kind == TY_ARRAY && c.t->len > max)
+            msg = arena_printf("array length %lld is too large for the target (at most %lld)", (long long)c.t->len,
+                               (long long)max);
+        else if (type_size(c.t) > max)
+            msg = arena_printf("type %s is too large for the target: an object can have at most %lld bytes",
+                               type_str(c.t), (long long)max);
+        else
+            continue;
+        bool seen = false;
+        for (int j = 0; j < reported.len; j++) {
+            Span r = reported.data[j];
+            if (r.file == c.span.file && r.start == c.span.start && r.end == c.span.end) seen = true;
+        }
+        if (!seen) {
+            vec_push(reported, c.span);
+            diag_error(c.span, "E0473", "%s", msg);
+        }
+    }
+    free(reported.data);
+}
+
 Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
     if (!te) return t_invalid;
     switch (te->kind) {
@@ -411,7 +454,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
             diag_error(te->span, "E0401", "nested error unions (!!T) are not allowed");
             return e;
         }
-        return type_errunion_set(e, set);
+        return check_size(te->span, type_errunion_set(e, set));
     }
     case TE_PTR: return type_ptr(resolve_type(te->elem, tc), te->mut);
     case TE_SLICE: {
@@ -424,15 +467,24 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         if (e->kind == TY_VOID) diag_error(te->span, "E0404", "array element type cannot be void");
         TypeExpr *l = te->len;
         if (!l) return t_invalid;
-        if (l->kind == TE_INTLIT) return type_array(e, (int64_t)l->ival);
+        if (l->kind == TE_INTLIT) {
+            if (l->ival > (uint64_t)INT64_MAX) {
+                diag_error(l->span, "E0472", "array length is too large");
+                return t_invalid;
+            }
+            return check_size(te->span, type_array(e, (int64_t)l->ival));
+        }
         if (l->kind == TE_CONSTEXPR) {
             int64_t n = const_array_len(l->expr, tc);
-            return n < 0 ? t_invalid : type_array(e, n);
+            return n < 0 ? t_invalid : check_size(te->span, type_array(e, n));
         }
         Type *a = resolve_generic_arg(l, tc);
         if (a->kind == TY_CONSTINT) {
-            if (a->cval < 0) diag_error(l->span, "E0472", "array length must not be negative");
-            return type_array(e, a->cval < 0 ? 0 : a->cval);
+            if (a->cval < 0) {
+                diag_error(l->span, "E0472", "array length must not be negative");
+                return type_array(e, 0);
+            }
+            return check_size(te->span, type_array(e, a->cval));
         }
         if (a->kind == TY_PARAM && a->is_const) return type_array_param(e, a);
         if (a->kind != TY_INVALID) diag_error(l->span, "E0472", "array length must be an integer constant");
@@ -453,7 +505,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
             vec_push(fv, f);
         }
         Decl *d = anon_struct_decl(tc->mod, fv, te->span);
-        return d->type;
+        return check_size(te->span, d->type);
     }
     case TE_NAMED: {
         if (!te->qual) {
@@ -492,7 +544,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         Type **args = NEWN(Type *, te->args.len + 1);
         for (int i = 0; i < te->args.len; i++) args[i] = resolve_generic_arg(te->args.data[i], tc);
         if (!check_generic_args(d, args, te->args.len, te->span, &te->args)) return t_invalid;
-        return type_named(d, args, te->args.len);
+        return check_size(te->span, type_named(d, args, te->args.len));
     }
     }
     return t_invalid;
@@ -789,6 +841,7 @@ void resolve_decl(Decl *d) {
             diag_error(d->name_span, "E0304", "union '%s' must have at least one variant", d->name);
         if (d->kind == D_UNION && d->variants.len > 65536)
             diag_error(d->name_span, "E0304", "union '%s' has too many variants", d->name);
+        check_size(d->name_span, d->type);
         return;
     }
     case D_ENUM: resolve_enum(d); break;
@@ -1018,5 +1071,6 @@ bool sema_run(const char *path, SemaOptions *opts) {
         }
     }
     check_inline_cycles();
+    check_sizes();
     return diag_error_count() == 0;
 }

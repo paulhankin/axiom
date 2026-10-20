@@ -265,7 +265,23 @@ fn rng(lo: i64, hi: i64) Range {
     return Range.{ ok: true, lo: lo, hi: hi };
 }
 
-// The values an integer offset expression can take (small ranges only).
+// r, if v's own type holds all of it as signed values: an operation in a
+// narrower type wraps around (`x *% 4 +% 0x1000` in u16), and the range of
+// the arithmetic is then not that of its result.
+fn in_type(r: Range, v: *ir.Value) Range {
+    let bits = v.ty.bits;
+    if not r.ok or (bits >= 64) {
+        return r;
+    }
+    let half = @as(i64, 1) << @int_cast(u32, bits - 1);
+    if (r.lo < -half) or (r.hi >= half) {
+        return Range.{ ok: false, lo: 0, hi: 0 };
+    }
+    return r;
+}
+
+// The values an integer offset expression can take (small ranges only), as
+// signed values of its type.
 fn range_of(v: *ir.Value, depth: i32) Range {
     if ir.is_cint(v) {
         let x = ir.sval(v);
@@ -290,7 +306,7 @@ fn range_of(v: *ir.Value, depth: i32) Range {
         let c = ir.sval(v.b);
         let r = range_of(v.a, depth + 1);
         if r.ok and (c >= 0) and (c <= RLIM) {
-            return rng(r.lo * c, r.hi * c);
+            return in_type(rng(r.lo * c, r.hi * c), v);
         }
         return none;
     }
@@ -298,7 +314,7 @@ fn range_of(v: *ir.Value, depth: i32) Range {
         let r = range_of(v.a, depth + 1);
         let k = @truncate(u32, ir.cint_val(v.b));
         if r.ok and (r.lo >= 0) {
-            return rng(r.lo << k, r.hi << k);
+            return in_type(rng(r.lo << k, r.hi << k), v);
         }
         return none;
     }
@@ -306,7 +322,7 @@ fn range_of(v: *ir.Value, depth: i32) Range {
         let x = range_of(v.a, depth + 1);
         let y = range_of(v.b, depth + 1);
         if x.ok and y.ok {
-            return rng(x.lo + y.lo, x.hi + y.hi);
+            return in_type(rng(x.lo + y.lo, x.hi + y.hi), v);
         }
     }
     return none;
@@ -459,6 +475,16 @@ fn gcd(a0: i64, b0: i64) i64 {
     return a;
 }
 
+// m, for the result of an operation in v's type: in a type narrower than
+// addresses, which wraps around a power of two, only m's power-of-two part
+// (`x *% 3` in i8 can be 44).
+fn wrapped(v: *ir.Value, m: i64) i64 {
+    if (m > 0) and (@as(u64, @bit_cast(u32, v.ty.bits)) < (ir.ptr_bytes * 8)) {
+        return m & -m;
+    }
+    return m;
+}
+
 // A constant c such that v is always a multiple of it (0: none known; 1 is
 // as good as none).
 fn multiple_of(v: *ir.Value, depth: i32) i64 {
@@ -476,7 +502,7 @@ fn multiple_of(v: *ir.Value, depth: i32) i64 {
     if (op == ir.OP_MUL) and ir.is_cint(v.b) {
         let c = ir.sval(v.b);
         if (c > 0) and (c <= RLIM) {
-            return c;
+            return wrapped(v, c);
         }
         return 0;
     }
@@ -487,7 +513,7 @@ fn multiple_of(v: *ir.Value, depth: i32) i64 {
         let a = multiple_of(v.a, depth + 1);
         let b = multiple_of(v.b, depth + 1);
         if (a > 0) and (b > 0) {
-            return gcd(a, b);
+            return wrapped(v, gcd(a, b));
         }
         if (a > 0) and ir.is_cint(v.b) and (ir.sval(v.b) == 0) {
             return a;

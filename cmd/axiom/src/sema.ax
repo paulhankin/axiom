@@ -612,7 +612,7 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
                 _ = dg.err(te.span, "E0401", "nested error unions (!!T) are not allowed");
                 return e;
             }
-            return ty.type_errunion_set(e, set);
+            return check_size(te.span, ty.type_errunion_set(e, set));
         }
         .Ptr(pt) => { return ty.type_ptr(resolve_type(pt.elem, tc), pt.is_mut); }
         .Slice(pt) => {
@@ -643,7 +643,7 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
                 fv.push(f);
             }
             let d = ty.anon_struct_decl(tc.mod, fv, te.span);
-            return d.ty;
+            return check_size(te.span, d.ty);
         }
         .Named(nt) => { return resolve_named_type(te, nt, tc); }
     }
@@ -659,13 +659,19 @@ fn resolve_array_type(te: *mut ast.TypeExpr, at: ast.ArrayType, tc: *mut TypeCtx
         return ty.t_invalid;
     }
     match l.shape {
-        .IntLit(n) => { return ty.type_array(e, @bit_cast(i64, n)); }
+        .IntLit(n) => {
+            if n > 0x7fff_ffff_ffff_ffff {
+                _ = dg.err(l.span, "E0472", "array length is too large");
+                return ty.t_invalid;
+            }
+            return check_size(te.span, ty.type_array(e, @bit_cast(i64, n)));
+        }
         .ConstExpr(ce) => {
             let n = const_array_len(ce, tc);
             if n < 0 {
                 return ty.t_invalid;
             }
-            return ty.type_array(e, n);
+            return check_size(te.span, ty.type_array(e, n));
         }
         else => {}
     }
@@ -675,7 +681,7 @@ fn resolve_array_type(te: *mut ast.TypeExpr, at: ast.ArrayType, tc: *mut TypeCtx
             _ = dg.err(l.span, "E0472", "array length must not be negative");
             return ty.type_array(e, 0);
         }
-        return ty.type_array(e, a.cval);
+        return check_size(te.span, ty.type_array(e, a.cval));
     }
     if (a.kind == ast.TY_PARAM) and a.is_const {
         return ty.type_array_param(e, a);
@@ -684,6 +690,54 @@ fn resolve_array_type(te: *mut ast.TypeExpr, at: ast.ArrayType, tc: *mut TypeCtx
         _ = dg.err(l.span, "E0472", "array length must be an integer constant");
     }
     return ty.t_invalid;
+}
+
+// Object sizes (spec §5.5): every array, error union, struct and union type
+// written in the program, and every instance of a generic one, must fit the
+// target's largest object (E0473). The check waits until the end of
+// analysis, when every type it reaches is complete (a struct may name an
+// array of itself behind a pointer while its own fields are resolved).
+struct SizeCheck {
+    span: u.Span,
+    t: *mut ast.Type,
+}
+
+let mut size_checks: u.List.[SizeCheck] = u.List.[SizeCheck].{ data: @ptr_from_int(*mut SizeCheck, 0), len: 0, cap: 0 };
+
+fn check_size(sp: u.Span, t: *mut ast.Type) *mut ast.Type {
+    if not t.has_params and (t.kind != ast.TY_INVALID) {
+        size_checks.push(SizeCheck.{ span: sp, t: t });
+    }
+    return t;
+}
+
+fn check_sizes() void {
+    let max = ty.max_object_size();
+    let mut reported = u.List.[u.Span].empty();
+    for i in 0..size_checks.len {
+        let c = size_checks.get(i);
+        let mut msg: []u8 = "";
+        if (c.t.kind == ast.TY_ARRAY) and (c.t.len > max) {
+            msg = u.f2("array length %s is too large for the target (at most %s)", u.dec(c.t.len), u.dec(max));
+        } else if ty.type_size(c.t) > max {
+            msg = u.f2("type %s is too large for the target: an object can have at most %s bytes", tstr(c.t),
+                       u.dec(max));
+        } else {
+            continue;
+        }
+        let mut seen = false;
+        for j in 0..reported.len {
+            let r = reported.get(j);
+            if (r.file == c.span.file) and (r.start == c.span.start) and (r.end == c.span.end) {
+                seen = true;
+            }
+        }
+        if not seen {
+            reported.push(c.span);
+            _ = dg.err(c.span, "E0473", msg);
+        }
+    }
+    reported.deinit();
 }
 
 // The value of a constant expression written as an array length (checked
@@ -760,7 +814,7 @@ fn resolve_named_type(te: *mut ast.TypeExpr, nt: ast.NamedType, tc: *mut TypeCtx
     if not check_generic_args(d, args, te.span, &nt.args) {
         return ty.t_invalid;
     }
-    return ty.type_named(d, args);
+    return check_size(te.span, ty.type_named(d, args));
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,6 +1228,7 @@ fn resolve_decl(d: *mut ast.Decl) void {
         if (k == ast.D_UNION) and (d.variants.len > 65536) {
             _ = dg.err(d.name_span, "E0304", u.f1("union '%s' has too many variants", d.name));
         }
+        _ = check_size(d.name_span, d.ty);
         return;
     }
     if k == ast.D_ENUM {
@@ -3165,6 +3220,46 @@ fn check_return_value(pe: *mut *mut ast.Expr, sp: u.Span) void {
         return;
     }
     _ = check_expr_to(pe, r);
+    check_escape(pe.*);
+}
+
+// The local whose storage place e is part of (nil: a global, or memory
+// reached through a pointer or a slice).
+fn place_local(e: *mut ast.Expr) *mut ast.Local {
+    let k = e.kind;
+    if k == ast.E_IDENT {
+        return e.local;
+    }
+    if (k == ast.E_FIELD) and (e.field_kind == ast.FK_STRUCT) and (e.self_mode != ast.SELF_DEREF) {
+        return place_local(e.a);
+    }
+    if (k == ast.E_INDEX) and (e.index_kind == ast.IDX_ARRAY) {
+        return place_local(e.a);
+    }
+    return u.nil.[ast.Local]();
+}
+
+// A returned address of a local (`&x`, `&mut x.f`, `&a[i]`) or slice of a
+// local array (`a[..]`, `a[i..j]`) dangles once the function returns (spec
+// §12.2: W0710).
+fn check_escape(e0: *mut ast.Expr) void {
+    let mut e = e0;
+    while e.kind == ast.E_CONV {
+        e = e.a;
+    }
+    if u.isnil(e.ty) or (e.ty.kind == ast.TY_INVALID) {
+        return;
+    }
+    let mut l = u.nil.[ast.Local]();
+    if (e.kind == ast.E_UNARY) and (e.op == lx.TK_AMP) and is_place(e.a) {
+        l = place_local(e.a);
+    } else if (e.kind == ast.E_SLICE) and (e.index_kind == ast.IDX_ARRAY) {
+        l = place_local(e.a);
+    }
+    if u.notnil(l) {
+        _ = dg.warning(e0.span, "W0710",
+                       u.f1("this points into local '%s', whose storage ends when the function returns", l.name));
+    }
 }
 
 fn check_catch(e: *mut ast.Expr) *mut ast.Type {
@@ -5913,6 +6008,7 @@ pub fn run(path: []u8, opts: *SemaOptions) bool {
         }
     }
     check_inline_cycles();
+    check_sizes();
     return dg.error_count() == 0;
 }
 

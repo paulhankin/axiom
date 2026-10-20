@@ -217,3 +217,23 @@
 - Opus: the output is sized once from the packets' tables of contents, halving peak
   memory.
 - AIFF: a sound data offset near 2^32 no longer overflows.
+- Type sizes could wrap around: `[2^61]u64` had size 0, so its frame reserved nothing
+  and checked indexing wrote over other locals, the return address or other globals.
+  Sizes are computed without wrapping, and a type larger than the target's largest
+  object (2^31 - 1 bytes on wasm32, 2^47 on 64-bit targets) is an error (E0473), as is
+  a function whose locals need more than 1 GiB of stack.
+- On WebAssembly, a stack frame of 2 to 4 GiB passed the stack check and landed on the
+  heap; frames are limited and the check cannot wrap. The bootstrap compiler's native
+  code probes large frames page by page, as the compiler's own backends do.
+- An `undefined` local larger than 256 bytes kept the stack's old bytes even when its
+  type held slices, pointers, function pointers, bools, enums or unions, so old data
+  could become a slice the program never made. Such locals are zeroed whatever their
+  size; only plain integer, float and vector data is left unspecified.
+- At `-O2`, the alias analysis took offsets computed in types narrower than addresses
+  (`u16`, `i8`) as if they did not wrap, and could drop a store that did reach the
+  element read.
+- `@memory_discard` gave back any pages in the range it was given, including the stack,
+  globals or (on macOS and Windows) the program's image. It acts only on pages that
+  `@memory_grow` handed out.
+- The compiler warns (W0710) when a function returns the address of a local, or a slice
+  of a local array.

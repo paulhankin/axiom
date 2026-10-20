@@ -127,6 +127,7 @@ struct FnState {
     ss_depth: *mut ir.Value,
     ss_slot: *mut ir.Value,  // where this function's calls record their site
     ss_next: *mut ir.Value,  // the depth during its calls
+    frame: i64,              // the bytes of its locals and temporaries (saturating)
 }
 
 let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
@@ -266,7 +267,8 @@ fn is_const_int(v: *mut ir.Value) bool {
 // The concrete type of t in the function being generated. An enum is its
 // representation from here on: code generation never needs to tell them apart.
 // A variable left `undefined` (§8.1) no larger than this (bytes) is zeroed: SROA may split
-// slots up to this size and promote their parts to SSA values (sroa.MAX_SIZE).
+// slots up to this size and promote their parts to SSA values (sroa.MAX_SIZE). (So is
+// any larger one that is not plain data: plain_data.)
 const UNDEF_ZEROED: u64 = 256;
 
 fn ct(t: *mut ast.Type) *mut ast.Type {
@@ -849,7 +851,10 @@ fn check_stack(d: *mut ast.Decl, entry: *mut ir.Block, start: *mut ir.Block) voi
     let spi = ir.cast(B, ir.OP_PTRTOINT, sp, T_isz);
     let saved = g_cur_span;
     set_span(d.name_span);
-    // signed: a frame reserved below address 0 wraps around
+    // signed: a frame reserved below address 0 wraps around. The difference
+    // itself cannot wrap: the stack pointer was at or above the limit before
+    // the frame, which is less than 2 GiB (ty.MAX_FRAME, E0473, and the
+    // backend's own check), and so are the stacks
     let room = ir.binop(B, ir.OP_SUB, spi, ld(T_isz, stack_limit()));
     condbr(icmp(ir.IntSLT, room, ir.cint(T_isz, 0)), trap_block(T_STACK), start);
     set_span(saved);
@@ -1152,7 +1157,19 @@ fn alloca_in_entry(t: *mut ir.Ty, name: *u8) *mut ir.Value {
     return a;
 }
 
+// Counts an object of type t into the function's frame, which must not pass
+// ty.MAX_FRAME (checked at the end of the function: E0473).
+fn add_frame(t: *mut ast.Type) void {
+    let n = ty.type_size(t);
+    if F.frame >= (ty.SIZE_CAP - n) {
+        F.frame = ty.SIZE_CAP;
+    } else {
+        F.frame += n;
+    }
+}
+
 fn temp_alloca(t: *mut ast.Type) *mut ir.Value {
+    add_frame(t);
     let a = alloca_in_entry(lty(t), "tmp".ptr);
     set_align(a, @int_cast(u32, ty.type_align(t)));
     return a;
@@ -1198,6 +1215,7 @@ fn local_ptr(l: *mut ast.Local) *mut ir.Value {
     let i = @int_cast(usize, l.index);
     if u.isnil(F.locals[i]) {
         let t = ct(l.ty);
+        add_frame(t);
         let a = alloca_in_entry(lty(t), u.cz(l.name));
         set_align(a, @int_cast(u32, ty.type_align(t)));
         F.locals[i] = a;
@@ -4866,15 +4884,43 @@ fn gen_match(s: *mut ast.Stmt) void {
     at_end(end);
 }
 
+// Whether every bit pattern of t's bytes is a value of t: integers, floats
+// and vectors, and arrays and structs of them (padding included).
+fn plain_data(t0: *mut ast.Type) bool {
+    if t0.kind == ast.TY_ENUM {
+        return false;
+    }
+    let t = ct(t0);
+    let k = t.kind;
+    if (k == ast.TY_INT) or (k == ast.TY_FLOAT) or (k == ast.TY_VEC) or (k == ast.TY_V128) {
+        return true;
+    }
+    if k == ast.TY_ARRAY {
+        return plain_data(t.elem);
+    }
+    if k == ast.TY_STRUCT {
+        for i in 0..t.decl.fields.len {
+            if not plain_data(ty.type_field(t, i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 fn gen_stmt_inner(s: *mut ast.Stmt) void {
     let k = s.kind;
     if (k == ast.S_LET) and s.undef {
         // left unspecified (§8.1): a small variable, which the optimizer could keep in
         // registers, is zeroed (as good a value as any, and free); a larger one's bytes are
-        // left as they are in its slot, which is never promoted
+        // left as they are in its slot, which is never promoted, when any bytes make valid
+        // values of its type. Anything else (a slice, pointer or function pointer that
+        // old bytes would forge, a bool, enum, union or error union) is zeroed whatever
+        // its size (§12.3).
         let t = ct(s.local.ty);
         let lt = lty(t);
-        if lt.size <= UNDEF_ZEROED {
+        if (lt.size <= UNDEF_ZEROED) or not plain_data(s.local.ty) {
             store(t, ir.czero(lt), local_ptr(s.local), false);
         } else {
             _ = local_ptr(s.local);
@@ -5043,6 +5089,11 @@ fn gen_fn_body_of(fi: *mut FnInst) void {
         } else {
             ir.unreachable(B);
         }
+    }
+    if stt.frame > ty.MAX_FRAME {
+        _ = dg.err(d.name_span, "E0473",
+                   u.f2("the locals of '%s' need more than %s bytes of stack, the most a function can have", d.name,
+                        u.dec(ty.MAX_FRAME)));
     }
     at_end(stt.entry);
     if ty.g_target.is_wasm {

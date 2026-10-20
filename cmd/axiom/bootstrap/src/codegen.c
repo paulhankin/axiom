@@ -88,6 +88,7 @@ typedef struct FnState {
     int ninl;
     LLVMMetadataRef di_sp;  // -g: the function's DISubprogram
     int di_file;            // and its source file
+    int64_t frame;          // the bytes of its locals and temporaries (saturating)
 } FnState;
 
 static FnState *F;
@@ -912,8 +913,16 @@ static LLVMValueRef alloca_in_entry(LLVMTypeRef t, const char *name) {
     return a;
 }
 
+// Counts an object of type t into the function's frame, which must not pass
+// MAX_FRAME (checked at the end of the function: E0473).
+static void add_frame(Type *t) {
+    int64_t n = type_size(t);
+    F->frame = F->frame >= SIZE_CAP - n ? SIZE_CAP : F->frame + n;
+}
+
 // A temporary only the expression that makes it can reach (see in_mem).
 static LLVMValueRef temp_alloca(Type *t) {
+    add_frame(t);
     LLVMValueRef a = alloca_in_entry(lty(t), "agg.tmp");
     LLVMSetAlignment(a, (unsigned)type_align(t));
     return a;
@@ -1036,6 +1045,7 @@ static LLVMValueRef field_value(Type *st, LLVMValueRef v, unsigned idx, Type *ft
 static LLVMValueRef local_ptr(Local *l) {
     if (!F->locals[l->index]) {
         Type *t = ct(l->type);
+        add_frame(t);
         LLVMValueRef a = alloca_in_entry(lty(t), l->name);
         LLVMSetAlignment(a, (unsigned)type_align(t));
         F->locals[l->index] = a;
@@ -4726,12 +4736,16 @@ static void check_stack(Decl *d, LLVMBasicBlockRef entry, LLVMBasicBlockRef star
     }
     frame = (frame + 15) & ~15ull;
     LLVMValueRef sp = LLVMBuildPtrToInt(B, LLVMBuildLoad2(B, T_ptr, stack_pointer_global(), "sp"), T_isz, "");
-    LLVMValueRef need = LLVMBuildAdd(B, LLVMBuildLoad2(B, T_isz, stack_limit(), "limit"), usz((int64_t)frame), "");
+    LLVMValueRef limit = LLVMBuildLoad2(B, T_isz, stack_limit(), "limit");
     Span saved = g_cur_span;
     g_cur_span = d->name_span;
-    // signed: a stack pointer below address 0 wraps around
-    LLVMValueRef room = LLVMBuildSub(B, sp, need, "");
-    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntSLT, room, usz(0), ""), trap_block(T_STACK), start);
+    // The stack pointer read here may already have the frame reserved by
+    // LLVM's prologue (it then counts twice), and so be below the limit, or
+    // below address 0 and wrapped around: signed. The difference cannot wrap
+    // itself: frames are less than 1 GiB (MAX_FRAME, E0473), and so are the
+    // stacks, and the stack pointer was at or above the limit before.
+    LLVMValueRef room = LLVMBuildSub(B, sp, limit, "");
+    LLVMBuildCondBr(B, LLVMBuildICmp(B, LLVMIntSLT, room, usz((int64_t)frame), ""), trap_block(T_STACK), start);
     g_cur_span = saved;
 }
 
@@ -4908,6 +4922,9 @@ static void gen_fn_body_of(FnInst *fi) {
             emit_ret(errunion_value(st.ret, LLVMConstInt(T_i16, 0, false), NULL));
         else LLVMBuildUnreachable(B);
     }
+    if (st.frame > MAX_FRAME)
+        diag_error(d->name_span, "E0473", "the locals of '%s' need more than %lld bytes of stack, the most a function can have",
+                   d->name, (long long)MAX_FRAME);
     LLVMPositionBuilderAtEnd(B, st.entry);
     if (g_target.wasm) check_stack(d, st.entry, start);
     else LLVMBuildBr(B, start);
@@ -5251,6 +5268,13 @@ bool codegen_program(CgOptions *o) {
             if (LLVMCountBasicBlocks(fn))
                 LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
                                         LLVMCreateStringAttribute(ctx, "frame-pointer", 13, "all", 3));
+    }
+    if (!g_target.wasm) {
+        // a native stack ends at a guard page: a frame of more than a page
+        // touches each of its pages in order, so that it cannot step over the
+        // guard into other memory (as the compiler's own backends do)
+        for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn))
+            if (LLVMCountBasicBlocks(fn)) add_str_fn_attr(fn, "probe-stack", "inline-asm");
     }
 
     char *err = NULL;

@@ -104,6 +104,7 @@ schedule).
 | environment | `unsetenv` removes every entry for a name (the initial environment can hold several); `setenv` leaves one |
 | term | `set_title` leaves out C0, DEL and C1 controls and invalid UTF-8 |
 | threads | signal alternate stacks and thread stacks freed when a thread exits |
+| runtime | `@memory_discard` gives back only pages that `@memory_grow` handed out; a range over the stack, globals, code or C's memory, or one that wraps around the address space, is left alone |
 | log | CR, LF, C1 controls, U+2028/U+2029 and invalid UTF-8 escaped in messages and keys, so input cannot forge log lines; a failed rotation reopens the file in append mode |
 
 ### Text formats

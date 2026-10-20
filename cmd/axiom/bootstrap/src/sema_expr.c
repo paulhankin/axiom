@@ -1437,6 +1437,28 @@ static bool check_leave_ok(Span sp, bool is_loop_exit) {
     return true;
 }
 
+// The local whose storage place e is part of (NULL: a global, or memory
+// reached through a pointer or a slice).
+static Local *place_local(Expr *e) {
+    if (e->kind == E_IDENT) return e->local;
+    if (e->kind == E_FIELD && e->op == FK_STRUCT && e->self_mode != SELF_DEREF) return place_local(e->a);
+    if (e->kind == E_INDEX && e->op == IDX_ARRAY) return place_local(e->a);
+    return NULL;
+}
+
+// A returned address of a local (`&x`, `&mut x.f`, `&a[i]`) or slice of a
+// local array (`a[..]`, `a[i..j]`) dangles once the function returns (spec
+// §12.2: W0710).
+static void check_escape(Expr *e0) {
+    Expr *e = e0;
+    while (e->kind == E_CONV) e = e->a;
+    if (!e->type || e->type->kind == TY_INVALID) return;
+    Local *l = NULL;
+    if (e->kind == E_UNARY && e->op == TK_AMP && is_place(e->a)) l = place_local(e->a);
+    else if (e->kind == E_SLICE && e->op == IDX_ARRAY) l = place_local(e->a);
+    if (l) diag_warning(e0->span, "W0710", "this points into local '%s', whose storage ends when the function returns", l->name);
+}
+
 static void check_return_value(Expr **pe, Span sp) {
     if (!C->fn) {
         diag_error(sp, "E0602", "'return' outside of a function");
@@ -1459,6 +1481,7 @@ static void check_return_value(Expr **pe, Span sp) {
         return;
     }
     check_expr_to(pe, r);
+    check_escape(*pe);
 }
 
 void check_return_value_ext(Expr **pe, Span sp) { check_return_value(pe, sp); }

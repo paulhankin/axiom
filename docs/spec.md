@@ -557,6 +557,14 @@ those such as `[MAX_DEPTH + 1]u64`; or a `const` generic parameter by itself (§
 all elements. Size is `N * size_of(T)` and alignment is `align_of(T)`. `a.len` is the
 constant `N` (type `usize`).
 
+**Largest object.** No type may be larger than the target's largest object:
+2³¹ − 1 bytes on 32-bit targets (`wasm32`) and 2⁴⁷ bytes (128 TiB) on 64-bit ones, so
+that every size and offset fits in an `isize`. An array's length is limited the same
+way. An array, struct, union or error union type that is larger, written anywhere or
+made by instantiating a generic type, is a compile error (`E0473`) at the type or at
+the declaration of the struct or union; so is a function whose locals need more
+stack than a frame may hold (§12.2). Sizes are computed exactly: they never wrap.
+
 ### 5.6 Slices: `[]T` and `[]mut T`
 
 A slice is a fat pointer `{ ptr: *T, len: usize }` with that exact layout (pointer first).
@@ -653,6 +661,7 @@ offset is the previous field's end, rounded up to that field's alignment. The st
 alignment is the largest field alignment, or 1 if there are no fields. Its size is the
 end of the last field rounded up to the struct's alignment. The compiler MUST NOT reorder
 fields or add padding beyond this rule. The contents of padding bytes are unspecified.
+A struct (or union) larger than the target's largest object is rejected (§5.5, `E0473`).
 
 Anonymous struct types `struct { … }` follow the same rules. Two anonymous struct types are
 the same type when their field names and field types match exactly, in the same order.
@@ -1074,9 +1083,14 @@ let mut rows: [64]usize = undefined;   // only rows[0..n] are written, and read
 
 `undefined` is recognised only as the whole initializer of a `let` (elsewhere it is an
 ordinary identifier). The binding must be `let mut` (`E0413`: it could never be written)
-and must have a type annotation (`E0414`). Reading its bytes before they are written gives
-unspecified values, never poison (§12.3); an implementation may give them any values,
-zeroes included (it may zero a variable small enough to be kept in registers).
+and must have a type annotation (`E0414`). Only a variable of **plain data**, integers,
+floats and vectors and arrays and structs of them, is left with unspecified bytes:
+reading them before they are written gives unspecified values, never poison (§12.3);
+an implementation may give them any values, zeroes included (it may zero a variable
+small enough to be kept in registers). A variable whose type holds anything else (a
+slice, pointer or function pointer, a `bool`, enum, union or error union, at any depth)
+is zero-initialized, whatever its size: bytes left on the stack never become a value
+the program did not make.
 
 ### 8.2 Expression statements and discards
 
@@ -1631,13 +1645,23 @@ traps on them with `T0012`.
 | Memory from C or the host | linear memory, which C code linked into the module shares | anywhere in the process |
 
 After a function returns, its locals' storage is reused, and a pointer to one of them
-dangles. The compiler SHOULD warn when such a pointer escapes (`W0710`).
+dangles. The compiler SHOULD warn when such a pointer escapes (`W0710`); the compilers
+warn when a function returns the address of a local or of part of one (`&x`,
+`&mut x.f`, `&a[i]`), or a slice of a local array (`a[..]`, `a[i..j]`), parameters
+included.
+
+A function's frame, its locals and the temporaries the compiler makes for it, may
+take at most 1 GiB (2³⁰ bytes) on every target; a function that needs more is a
+compile error (`E0473`). Each frame is checked against the stack before it is used:
+on native targets its pages are touched in order from the top, so that the guard page
+below the stack is never stepped over; on WebAssembly a frame that would reach below
+the thread's stack limit traps (`T0008`).
 
 ### 12.3 No uninitialized values
 
 Every local and global has an initializer. Memory obtained from the allocator, and a
-local initialized with `undefined` (§8.1), has unspecified contents but is never
-"poison".
+local of plain data initialized with `undefined` (§8.1), has unspecified contents but
+is never "poison". A local of any other type initialized with `undefined` is zeroed.
 
 ### 12.4 Allocation
 
@@ -2422,7 +2446,7 @@ Codes are stable. A code's meaning is never reused for something else.
 | `E06xx` | Control flow, returns, errors, discards |
 | `E07xx` | Places, mutability, pointers |
 | `E08xx` | ABI, exports, imports, SIMD, builtins |
-| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else`; `W0710` (a pointer to a local that escapes) is permitted, not yet emitted |
+| `Wxxxx` | Warnings, with ranges that mirror the `E` ranges: `W0601` unreachable statement, `W0631` unreachable `match` arm after `else`, `W0710` a returned pointer to a local, or slice of a local array (§12.2) |
 | `Txxxx` | Runtime traps (Appendix B) |
 
 The registry. It lists every code the compilers emit, and the test suite checks that
@@ -2500,6 +2524,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0470 | Unknown constraint |
 | E0471 | A `const` generic parameter of a non-integer type |
 | E0472 | Array length or `const` argument that is not a non-negative integer constant |
+| E0473 | Type larger than the target's largest object (§5.5), or a function's locals larger than a frame may be (§12.2) |
 | E0502 | Cannot infer type of literal |
 | E0503 | Literal out of range for type, or untyped `.{}` with no context |
 | E0510 | `@as` conversion is lossy |
@@ -3100,7 +3125,7 @@ See §6.2: `@as`, `@int_cast`, `@truncate`, `@int_from_float`, `@float_from_int`
 | `@mem_eq(a, b)` | `[]T, []T → bool` | Bytewise. Lengths may differ, in which case the result is `false` |
 | `@memory_size()` | `→ usize` | In 64 KiB pages |
 | `@memory_grow(pages)` | `usize → !usize` | Returns the previous size, or `error.OutOfMemory` |
-| `@memory_discard(addr, len)` | `usize, usize → void` | The whole 64 KiB pages in `[addr, addr + len)` may be returned to the system; their bytes become unspecified (on native targets they read as zero). WebAssembly memory cannot shrink, so there it does nothing |
+| `@memory_discard(addr, len)` | `usize, usize → void` | The whole 64 KiB pages in `[addr, addr + len)` that `@memory_grow` handed out may be returned to the system; their bytes become unspecified (on native targets they read as zero). Pages outside that region (the stack, globals, code, memory from C) are left alone, and so is all of a range that misses it. WebAssembly memory cannot shrink, so there it does nothing |
 
 ### A.4 Scalar integer and float
 

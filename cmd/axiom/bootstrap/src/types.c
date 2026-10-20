@@ -465,6 +465,16 @@ const char *type_str(Type *t) {
 // ---------------------------------------------------------------------------
 static int64_t round_up(int64_t x, int64_t a) { return a <= 1 ? x : (x + a - 1) / a * a; }
 
+// Sizes saturate at SIZE_CAP instead of wrapping: a type that large is
+// already past every target's largest object (max_object_size), which sema
+// rejects (E0473), and nothing smaller is ever rounded up to it.
+static int64_t sat_add(int64_t a, int64_t b) { return a >= SIZE_CAP - b ? SIZE_CAP : a + b; }
+static int64_t sat_mul(int64_t n, int64_t s) { return s > 0 && n > SIZE_CAP / s ? SIZE_CAP : n * s; }
+
+// The largest object (and array length) the target allows (spec §5.5): what
+// a signed pointer-sized offset and the address space can always hold.
+int64_t max_object_size(void) { return g_target.ptr_bits == 32 ? INT64_C(0x7fffffff) : INT64_C(0x800000000000); }
+
 static void layout(Type *t);
 
 int64_t type_size(Type *t) {
@@ -504,7 +514,7 @@ int64_t type_field_offset(Type *st, int i) {
         Type *ft = type_field(st, j);
         off = round_up(off, type_align(ft));
         if (j == i) return off;
-        off += type_size(ft);
+        off = sat_add(off, type_size(ft));
     }
     return off;
 }
@@ -525,14 +535,14 @@ static void layout(Type *t) {
     case TY_ENUM: t->size = t->align = t->elem->bits / 8; break;
     case TY_ARRAY:
         t->align = type_align(t->elem);
-        t->size = t->len * type_size(t->elem);
+        t->size = sat_mul(t->len, type_size(t->elem));
         break;
     case TY_ERRUNION: {
         int64_t a = type_align(t->elem);
         if (a < 2) a = 2;
         t->align = t->elem->kind == TY_VOID ? 2 : a;
         int64_t off = round_up(2, t->elem->kind == TY_VOID ? 1 : type_align(t->elem));
-        t->size = round_up(off + (t->elem->kind == TY_VOID ? 0 : type_size(t->elem)), t->align);
+        t->size = round_up(sat_add(off, t->elem->kind == TY_VOID ? 0 : type_size(t->elem)), t->align);
         break;
     }
     case TY_STRUCT: {
@@ -541,7 +551,7 @@ static void layout(Type *t) {
         for (int i = 0; i < t->decl->fields.len; i++) {
             Type *ft = type_field(t, i);
             int64_t fa = type_align(ft);
-            off = round_up(off, fa) + type_size(ft);
+            off = sat_add(round_up(off, fa), type_size(ft));
             if (fa > al) al = fa;
         }
         t->align = al;
@@ -554,7 +564,7 @@ static void layout(Type *t) {
         int64_t pa = union_payload_align(t);
         int64_t al = pa > tag->align ? pa : type_align(tag);
         t->align = al;
-        t->size = round_up(union_payload_offset(t) + union_payload_size(t), al);
+        t->size = round_up(sat_add(union_payload_offset(t), union_payload_size(t)), al);
         break;
     }
     default: t->size = 0; t->align = 1; break;

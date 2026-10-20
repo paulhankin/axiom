@@ -108,6 +108,11 @@ const char *type_str(Type *t);
 
 // Layout (concrete types only).
 int64_t type_size(Type *t);
+// Sizes saturate here (types.c); max_object_size is the target's largest
+// object and MAX_FRAME the largest stack frame (spec §5.5, §12.2).
+#define SIZE_CAP INT64_C(0x4000000000000000)
+#define MAX_FRAME INT64_C(0x40000000)
+int64_t max_object_size(void);
 int64_t type_align(Type *t);
 int64_t type_field_offset(Type *st, int i);
 Type *union_tag_type(Type *ut);
