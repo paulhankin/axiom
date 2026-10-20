@@ -786,7 +786,9 @@ pub struct Stroke {
 
 // What one stroke may make (beyond these, it is drawn more simply): the
 // dashes, and the points of round joins and caps placed finely enough for
-// the tolerance, each a constant plus a multiple of the path's points
+// the tolerance, each a constant plus a multiple of the path's points (and
+// the dashes at least one for every two pixels of the canvas: a dash and a
+// gap of a pixel each along every row)
 const DASHES: f64 = 65536.0;
 const ARC_POINTS: usize = 1 << 18;
 const PER_POINT: usize = 16;
@@ -835,7 +837,8 @@ struct Stroker {
             span: 0.0,
             piece: false,
             full: false,
-            dashes: DASHES + (@float_from_int(f64, points) * @float_from_int(f64, PER_POINT)),
+            dashes: @max(DASHES, (@float_from_int(f64, w) * @float_from_int(f64, h)) / 2.0) + (
+                @float_from_int(f64, points) * @float_from_int(f64, PER_POINT)),
             arc_points: ARC_POINTS + (@min(points, 1 << 26) * PER_POINT),
         };
         // (dashes are cut only between joins, or half a half width past
@@ -1358,28 +1361,69 @@ fn crossing_less(a: Crossing, b: Crossing) bool {
     return a.x < b.x;
 }
 
-/// Splits a polyline into its dashes, stroking each. Only the stretches of
-/// it near the canvas are split: over the rest the pattern just moves on.
-fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) DrawError!void {
-    let dash = sk.style.dash;
-    let mut total: f64 = 0.0;
-    let mut valid = true;
-    for d in dash {
-        // (a negative, infinite or NaN length is not a pattern: solid)
-        if not (d >= 0.0) or not (d < 1.0e300) {
-            valid = false;
-        }
-        total += @max(d, 0.0);
+/// The sums of a dash pattern's lengths before each of its entries, over
+/// two periods (so that a search from any entry need not wrap), and their
+/// total; none if it is not a pattern (it is drawn solid): a negative,
+/// infinite or NaN length, no length at all, or 1e300 or more in all.
+fn dash_sums(dash: []f64, out: *mut vec.Vec.[f64]) DrawError!void {
+    out.clear();
+    if dash.len == 0 {
+        return;
     }
-    if not valid or not (total > 0.0) {
-        return sk.polyline(xs, closed);
+    for d in dash {
+        if not (d >= 0.0) or not (d < 1.0e300) {
+            return;
+        }
     }
     // an odd count of lengths is repeated (so that its first is a gap the second time)
     let mut m = dash.len;
     if (m % 2) == 1 {
         m = 2 * m;
-        total = 2.0 * total;
     }
+    let mut sum: f64 = 0.0;
+    out.push(sum)!;
+    for k in @as(usize, 0)..2 * m {
+        sum += dash[k % dash.len];
+        out.push(sum)!;
+    }
+    if not (sum > 0.0) or not (sum < 1.0e300) {
+        out.clear();
+    }
+}
+
+/// The entry of a dash pattern (sums: from dash_sums; m entries) that lies
+/// s past the start of entry di (s less than a period), and what is left
+/// of it there.
+fn dash_find(sums: []f64, m: usize, di: usize, s: f64, left: *mut f64) usize {
+    let mut at = sums[di] + s;
+    if at >= sums[di + m] {
+        at = sums[di] + (at - sums[di + m]);  // (rounding: a period on)
+    }
+    // the last entry from di that starts at or before it (entries of no
+    // length are passed over)
+    let mut lo = di;
+    let mut hi = di + m;
+    while (hi - lo) > 1 {
+        let mid = lo + ((hi - lo) / 2);
+        if sums[mid] <= at {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    left.* = sums[lo + 1] - at;
+    return lo % m;
+}
+
+/// Splits a polyline into its dashes, stroking each. Only the stretches of
+/// it near the canvas are split: over the rest the pattern just moves on.
+fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, sums: []f64, buf: *mut vec.Vec.[f64]) DrawError!void {
+    let dash = sk.style.dash;
+    if sums.len == 0 {
+        return sk.polyline(xs, closed);
+    }
+    let m = (sums.len - 1) / 2;
+    let total = sums[m];
     let n = xs.len / 2;
     let mut nseg = n - 1;
     if closed {
@@ -1410,12 +1454,8 @@ fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) Dr
     if phase < 0.0 {
         phase += total;
     }
-    let mut di: usize = 0;
-    while phase >= dash[di % dash.len] {
-        phase -= dash[di % dash.len];
-        di = (di + 1) % m;
-    }
-    let mut left = dash[di % dash.len] - phase;  // of the current dash or gap
+    let mut left: f64 = 0.0;  // of the current dash or gap
+    let mut di = dash_find(sums, m, 0, phase, &mut left);
     buf.clear();
     if (di % 2) == 0 {
         dash_point(buf, xs[0], xs[1])!;
@@ -1431,7 +1471,7 @@ fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) Dr
         let mut pos: f64 = 0.0;
         if v[0] > 0.0 {
             pos = v[0] * len;
-            dash_skip(sk, total, m, &mut di, &mut left, buf, ax, ay, bx, by, 0.0, pos, len)!;
+            dash_skip(sk, sums, &mut di, &mut left, buf, ax, ay, bx, by, 0.0, pos, len)!;
         }
         let mut stop = len;
         if v[1] < 1.0 {
@@ -1456,7 +1496,7 @@ fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) Dr
         }
         left -= stop - pos;
         if stop < len {
-            dash_skip(sk, total, m, &mut di, &mut left, buf, ax, ay, bx, by, stop, len, len)!;
+            dash_skip(sk, sums, &mut di, &mut left, buf, ax, ay, bx, by, stop, len, len)!;
         }
         if (di % 2) == 0 {
             dash_point(buf, bx, by)!;
@@ -1471,9 +1511,9 @@ fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) Dr
 /// len (from a to b) where the stroke cannot be seen: a dash under way
 /// ends at `from`, and one under way at `to` starts there. At a or b, they
 /// go on a little way (out of sight) so that the join there is still made.
-fn dash_skip(sk: *mut Stroker, total: f64, m: usize, di: *mut usize, left: *mut f64, buf: *mut vec.Vec.[f64], ax: f64,
-             ay: f64, bx: f64, by: f64, from: f64, to: f64, len: f64) DrawError!void {
-    let dash = sk.style.dash;
+fn dash_skip(sk: *mut Stroker, sums: []f64, di: *mut usize, left: *mut f64, buf: *mut vec.Vec.[f64], ax: f64, ay: f64,
+             bx: f64, by: f64, from: f64, to: f64, len: f64) DrawError!void {
+    let m = (sums.len - 1) / 2;
     let ext = @min(0.5 * sk.hw, to - from);
     if (di.* % 2) == 0 {
         let mut t = from / len;
@@ -1494,15 +1534,9 @@ fn dash_skip(sk: *mut Stroker, total: f64, m: usize, di: *mut usize, left: *mut 
     if s < left.* {
         left.* -= s;
     } else {
-        // whole patterns at once, then entry by entry
+        // whole patterns at once, then the entry by its sums
         s -= left.*;
-        di.* = (di.* + 1) % m;
-        s = @rem(s, total);
-        while s >= dash[di.* % dash.len] {
-            s -= dash[di.* % dash.len];
-            di.* = (di.* + 1) % m;
-        }
-        left.* = dash[di.* % dash.len] - s;
+        di.* = dash_find(sums, m, (di.* + 1) % m, @rem(s, sums[m]), left);
     }
     if (di.* % 2) == 0 {
         let mut t = to / len;
@@ -2106,6 +2140,9 @@ pub struct Canvas {
         self.poly.clear();
         let mut sk = Stroker.init(&mut self.poly, &style, self.transform, self.tolerance / scale, self.img.width,
                                   self.img.height, user.npoints());
+        let mut sums = vec.Vec.[f64].init();
+        defer sums.deinit();
+        dash_sums(style.dash, &mut sums)!;
         for i in @as(usize, 0)..user.starts.len {
             let r = user.range(i);
             dedupe(user.pts.items()[2 * r[0]..2 * r[1]], &mut self.tmp)!;
@@ -2119,7 +2156,7 @@ pub struct Canvas {
                 closed = false;
             }
             if style.dash.len > 0 {
-                dashed(&mut sk, self.tmp.items(), closed, &mut self.tmp2)!;
+                dashed(&mut sk, self.tmp.items(), closed, sums.items(), &mut self.tmp2)!;
             } else {
                 sk.polyline(self.tmp.items(), closed)!;
             }
@@ -2540,6 +2577,79 @@ test "dashes and round pieces off the canvas" {
     caps.dash = dashes[..];
     cv.stroke(&p, white, caps)!;
     @expect(coverage_sum(&img) > (64.0 * 49.0));
+}
+
+test "dashes across a large canvas" {
+    // a full-width line dashed a pixel on and off along every fourth row:
+    // dashed throughout, however many dashes that is
+    let mut img = image.Image.init(2048, 256, 4, image.Depth.F32)!;
+    defer img.deinit();
+    let mut cv = Canvas.init(&mut img);
+    defer cv.deinit();
+    let white = Paint.solid(color.Color.rgb(1.0, 1.0, 1.0));
+    let mut p = Path.init();
+    defer p.deinit();
+    for i in @as(usize, 0)..64 {
+        let y = (@float_from_int(f64, i) * 4.0) + 0.5;
+        p.move_to(0.0, y)!;
+        p.line_to(2048.0, y)!;
+    }
+    let dashes: [2]f64 = [1.0, 1.0];
+    let mut st = Stroke.width(1.0);
+    st.dash = dashes[..];
+    cv.stroke(&p, white, st)!;
+    @expect(@abs(coverage_sum(&img) - (64.0 * 1024.0)) < 1.0e-3);
+    for i in @as(usize, 0)..64 {
+        @expect_eq(img.get(2046, i * 4).a, 1.0);
+        @expect_eq(img.get(2047, i * 4).a, 0.0);
+    }
+}
+
+test "long dash patterns along hidden segments" {
+    // many segments off the canvas, each a little shorter than a pattern
+    // of many entries, then down across it: the pattern is moved on over
+    // each without walking its entries
+    let mut img = image.Image.init(64, 64, 4, image.Depth.F32)!;
+    defer img.deinit();
+    let mut cv = Canvas.init(&mut img);
+    defer cv.deinit();
+    let white = Paint.solid(color.Color.rgb(1.0, 1.0, 1.0));
+    let m: usize = 20000;
+    let dash = mem.alloc.[f64](m)!;
+    defer mem.free(dash);
+    for i in @as(usize, 0)..m {
+        dash[i] = 1.0;
+    }
+    let len = @float_from_int(f64, m) - 0.5;
+    let mut p = Path.init();
+    defer p.deinit();
+    p.move_to(10.5, -1.0e5)!;
+    for i in @as(usize, 0)..20000 {
+        p.line_to(10.5, -1.0e5 + (len * @float_from_int(f64, (i + 1) % 2)))!;
+    }
+    p.line_to(10.5, 64.0)!;
+    // (400,090,000 along at the top: a dash starts there)
+    let mut st = Stroke.width(1.0);
+    st.dash = dash;
+    cv.stroke(&p, white, st)!;
+    @expect(@abs(coverage_sum(&img) - 32.0) < 1.0e-3);
+    @expect_eq(img.get(10, 0).a, 1.0);
+    @expect_eq(img.get(10, 1).a, 0.0);
+    // and an offset far into the pattern, on each of many short subpaths
+    // off the canvas and one across it
+    cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    p.clear();
+    for i in @as(usize, 0)..20000 {
+        p.move_to(-100.0, 0.5)!;
+        p.line_to(-99.9, 0.5)!;
+    }
+    p.move_to(0.0, 5.5)!;
+    p.line_to(64.0, 5.5)!;
+    st.dash_offset = 12345.0;  // (a gap)
+    cv.stroke(&p, white, st)!;
+    @expect(@abs(coverage_sum(&img) - 32.0) < 1.0e-3);
+    @expect_eq(img.get(0, 5).a, 0.0);
+    @expect_eq(img.get(1, 5).a, 1.0);
 }
 
 test "round joins" {
