@@ -513,10 +513,15 @@ fn bounds_of(p: *Poly, w: usize, h: usize) Bounds {
     let mut maxx: f64 = -1.0e300;
     let mut maxy: f64 = -1.0e300;
     for i in @as(usize, 0)..n {
-        minx = @min(minx, p.x(i));
-        maxx = @max(maxx, p.x(i));
-        miny = @min(miny, p.y(i));
-        maxy = @max(maxy, p.y(i));
+        let x = p.x(i);
+        let y = p.y(i);
+        if (x == x) and (y == y) {
+            // (not NaN)
+            minx = @min(minx, x);
+            maxx = @max(maxx, x);
+            miny = @min(miny, y);
+            maxy = @max(maxy, y);
+        }
     }
     let wf = @float_from_int(f64, w);
     let hf = @float_from_int(f64, h);
@@ -646,14 +651,17 @@ fn rasterize[C](
             let mut minx = FAR;  // the columns the spans touch
             let mut maxx = -FAR;
             // one crossing per edge, kept in x order from line to line
-            // (it changes little, so insertion sort is quick); edges a
-            // line misses sort last with no direction
+            // (it changes little, so insertion sort is quick, and it gives
+            // way to a full sort once it has moved crossings 4 times as
+            // often as there are any); edges a line misses sort last with
+            // no direction
             xs.clear();
             for i in @as(usize, 0)..es.len {
                 xs.push(Crossing.{ x: FAR, dir: 0, e: i })!;
             }
             let c = xs.items();
             let mut sorted = false;
+            let limit = 4 * c.len;
             for sub in @as(usize, 0)..SUB {
                 let ys = yrow + ((@float_from_int(f64, sub) + 0.5) / @float_from_int(f64, SUB));
                 let mut active: usize = 0;
@@ -674,14 +682,23 @@ fn rasterize[C](
                 if (not sorted) and (c.len > 32) {
                     vec.sort(c, crossing_less);
                 } else {
+                    let mut moves = limit;
                     for i in @as(usize, 1)..c.len {
                         let v = c[i];
+                        if not (c[i - 1].x > v.x) {
+                            continue;
+                        }
                         let mut k = i;
                         while (k > 0) and (c[k - 1].x > v.x) {
                             c[k] = c[k - 1];
                             k -= 1;
                         }
                         c[k] = v;
+                        if (i - k) > moves {
+                            vec.sort(c, crossing_less);
+                            break;
+                        }
+                        moves -= i - k;
                     }
                 }
                 sorted = true;
@@ -767,17 +784,203 @@ pub struct Stroke {
     }
 }
 
+// What one stroke may make (beyond these, it is drawn more simply): the
+// dashes, and the points of round joins and caps placed finely enough for
+// the tolerance, each a constant plus a multiple of the path's points
+const DASHES: f64 = 65536.0;
+const ARC_POINTS: usize = 1 << 18;
+const PER_POINT: usize = 16;
+
+const COARSE: f64 = math.TAU / 8.0;  // the angle between points of an arc the canvas cannot show
+
 /// The stroke as polygons (all counterclockwise in user space... their
 /// orientation is fixed after transforming), unioned by the nonzero rule.
+///
+/// Its round pieces are placed finely only where the canvas (vx, vy: its
+/// corners, with a margin, in user space) may show them, and dashes are
+/// made only along the stretches of the path near the canvas, so a wide or
+/// finely dashed stroke mostly off the canvas costs little.
 struct Stroker {
     out: *mut Poly,
     hw: f64,
     style: *Stroke,
     t: Affine,
-    tol: f64,  // in user space
+    tol: f64,    // in user space
+    seen: bool,  // vx, vy hold the canvas (false: a singular transform; all of it may show)
+    vx: [4]f64,
+    vy: [4]f64,
+    w: f64,  // the canvas, in pixels
+    h: f64,
+    reach: f64,         // how far a dash's pieces reach from its line, in pixels (inf: unknown)
+    span: f64,          // how many rows a piece may span (the stroke's width, in pixels)
+    piece: bool,        // the last piece is still open
+    full: bool,         // a piece covers the canvas
+    dashes: f64,        // the dashes it may still make
+    arc_points: usize,  // the fine points of arcs it may still place
+
+    fn init(out: *mut Poly, style: *Stroke, t: Affine, tol: f64, w: usize, h: usize, points: usize) Stroker {
+        let hw = style.width / 2.0;
+        let mut sk = Stroker.{
+            out: out,
+            hw: hw,
+            style: style,
+            t: t,
+            tol: tol,
+            seen: false,
+            vx: [0.0; 4],
+            vy: [0.0; 4],
+            w: @float_from_int(f64, w),
+            h: @float_from_int(f64, h),
+            reach: math.inf(),
+            span: 0.0,
+            piece: false,
+            full: false,
+            dashes: DASHES + (@float_from_int(f64, points) * @float_from_int(f64, PER_POINT)),
+            arc_points: ARC_POINTS + (@min(points, 1 << 26) * PER_POINT),
+        };
+        // (dashes are cut only between joins, or half a half width past
+        // one: a piece reaches at most 1.5 half widths from the stretch cut
+        // out; the transform stretches lengths by at most its largest
+        // singular value)
+        let f: f64 = 1.5;
+        let f2 = (((t.a * t.a) + (t.b * t.b)) + (t.c * t.c)) + (t.d * t.d);
+        let det = t.determinant();
+        let stretch = @sqrt((f2 + @sqrt(@max((f2 * f2) - ((4.0 * det) * det), 0.0))) / 2.0);
+        sk.span = @min(style.width * stretch, sk.h);
+        let r = (((hw * f) * stretch) * (1.0 + 1.0e-6)) + 2.0;
+        if r < 1.0e300 {
+            sk.reach = r;
+        }
+        if not (@abs(det) >= 1.0e-12) {
+            return sk;
+        }
+        let inv = t.invert();
+        let m: f64 = 2.0;
+        let cx: [4]f64 = [-m, sk.w + m, sk.w + m, -m];
+        let cy: [4]f64 = [-m, -m, sk.h + m, sk.h + m];
+        for k in @as(usize, 0)..4 {
+            let q = inv.apply(cx[k], cy[k]);
+            if not (@abs(q.x) < 1.0e300) or not (@abs(q.y) < 1.0e300) {
+                return sk;
+            }
+            sk.vx[k] = q.x;
+            sk.vy[k] = q.y;
+        }
+        sk.seen = true;
+        return sk;
+    }
+
+    /// The part [t0, t1] of the segment from a to b (user space) whose
+    /// stroke may reach the canvas ([1, 1]: none).
+    fn visible(self: *Stroker, ax: f64, ay: f64, bx: f64, by: f64) [2]f64 {
+        let all: [2]f64 = [0.0, 1.0];
+        let p = self.t.apply(ax, ay);
+        let q = self.t.apply(bx, by);
+        if not (self.reach < 1.0e300) or not (@abs(p.x) < 1.0e300) or not (@abs(p.y) < 1.0e300) or
+           not (@abs(q.x) < 1.0e300) or not (@abs(q.y) < 1.0e300) {
+            return all;
+        }
+        let r = self.reach;
+        let dx = q.x - p.x;
+        let dy = q.y - p.y;
+        // the box [-r, w + r] x [-r, h + r], one side at a time
+        let ds: [4]f64 = [-dx, dx, -dy, dy];
+        let qs: [4]f64 = [p.x + r, (self.w + r) - p.x, p.y + r, (self.h + r) - p.y];
+        let mut t0: f64 = 0.0;
+        let mut t1: f64 = 1.0;
+        for k in @as(usize, 0)..4 {
+            if ds[k] == 0.0 {
+                if qs[k] < 0.0 {
+                    t1 = 0.0;
+                }
+            } else if ds[k] < 0.0 {
+                t0 = @max(t0, qs[k] / ds[k]);
+            } else {
+                t1 = @min(t1, qs[k] / ds[k]);
+            }
+        }
+        if not (t0 < t1) {
+            return [1.0, 1.0];
+        }
+        return [t0, t1];
+    }
 
     fn piece_begin(self: *mut Stroker) DrawError!void {
+        self.piece_end();
         self.out.begin()!;
+        self.piece = true;
+    }
+
+    /// Done with the last piece: it is dropped if it misses the canvas,
+    /// and noted if it covers it (then the stroke is just the canvas).
+    fn piece_end(self: *mut Stroker) void {
+        if not self.piece {
+            return;
+        }
+        self.piece = false;
+        let out = self.out;
+        let first = out.starts.get(out.starts.len - 1);
+        let n = out.npoints() - first;
+        let ps = out.pts.items()[2 * first..];
+        let mut area: f64 = 0.0;
+        let mut x0 = math.inf();
+        let mut y0 = math.inf();
+        let mut x1 = -math.inf();
+        let mut y1 = -math.inf();
+        for k in @as(usize, 0)..n {
+            let j = (k + 1) % n;
+            area += (ps[2 * k] * ps[(2 * j) + 1]) - (ps[2 * j] * ps[(2 * k) + 1]);
+            x0 = @min(x0, ps[2 * k]);
+            x1 = @max(x1, ps[2 * k]);
+            y0 = @min(y0, ps[(2 * k) + 1]);
+            y1 = @max(y1, ps[(2 * k) + 1]);
+        }
+        // (or if it has next to no area to add to a pixel: one made
+        // degenerate by the transform, or NaN)
+        let mut gone = (x1 <= 0.0) or (x0 >= self.w) or (y1 <= 0.0) or (y0 >= self.h) or not (@abs(area) > 1.0e-9);
+        // a convex piece: its sides' lines may separate it from the
+        // canvas, or have all of the canvas within
+        let mut sgn: f64 = 1.0;
+        if area < 0.0 {
+            sgn = -1.0;
+        }
+        let mut convex = (n >= 3) and (@abs(area) > 0.0) and (@abs(area) < 1.0e300);
+        let mut covers = convex;
+        let cx: [4]f64 = [0.0, self.w, self.w, 0.0];
+        let cy: [4]f64 = [0.0, 0.0, self.h, self.h];
+        for k in @as(usize, 0)..n {
+            if gone or not convex {
+                break;
+            }
+            let j = (k + 1) % n;
+            let ex = ps[2 * j] - ps[2 * k];
+            let ey = ps[(2 * j) + 1] - ps[(2 * k) + 1];
+            let l = (j + 1) % n;
+            let turn = (ex * (ps[(2 * l) + 1] - ps[(2 * j) + 1])) - (ey * (ps[2 * l] - ps[2 * j]));
+            if (sgn * turn) < 0.0 {
+                convex = false;
+                break;
+            }
+            let mut outside: usize = 0;
+            for c in @as(usize, 0)..4 {
+                let cr = (ex * (cy[c] - ps[(2 * k) + 1])) - (ey * (cx[c] - ps[2 * k]));
+                if (sgn * cr) < 0.0 {
+                    outside += 1;
+                }
+            }
+            if outside == 4 {
+                gone = true;
+            } else if outside > 0 {
+                covers = false;
+            }
+        }
+        if gone {
+            out.pts.truncate(2 * first);
+            out.starts.truncate(out.starts.len - 1);
+            out.closed.truncate(out.closed.len - 1);
+        } else if covers and convex {
+            self.full = true;
+        }
     }
 
     fn pt(self: *mut Stroker, x: f64, y: f64) DrawError!void {
@@ -800,7 +1003,53 @@ struct Stroker {
         self.pt(cx, cy)!;
     }
 
+    /// A disc of radius hw about (cx, cy).
     fn disc(self: *mut Stroker, cx: f64, cy: f64) DrawError!void {
+        if not self.near(cx, cy, self.hw) {
+            return;
+        }
+        self.piece_begin()!;
+        self.arc(cx, cy, 0.0, math.TAU, false)!;
+    }
+
+    /// Whether the disc of radius r about (cx, cy) may reach the canvas.
+    fn near(self: *Stroker, cx: f64, cy: f64, r: f64) bool {
+        if not self.seen {
+            return true;
+        }
+        // inside the canvas's parallelogram, or near one of its sides
+        let mut pos: usize = 0;
+        let mut neg: usize = 0;
+        let mut d2 = math.inf();
+        for k in @as(usize, 0)..4 {
+            let j = (k + 1) % 4;
+            let ex = self.vx[j] - self.vx[k];
+            let ey = self.vy[j] - self.vy[k];
+            let px = cx - self.vx[k];
+            let py = cy - self.vy[k];
+            let cr = (ex * py) - (ey * px);
+            if cr > 0.0 {
+                pos += 1;
+            } else if cr < 0.0 {
+                neg += 1;
+            }
+            let l2 = (ex * ex) + (ey * ey);
+            let mut u: f64 = 0.0;
+            if l2 > 0.0 {
+                u = @min(@max(((px * ex) + (py * ey)) / l2, 0.0), 1.0);
+            }
+            let dx = px - (u * ex);
+            let dy = py - (u * ey);
+            d2 = @min(d2, (dx * dx) + (dy * dy));
+        }
+        if (pos == 0) or (neg == 0) {
+            return true;
+        }
+        return not (d2 >= (r * r));  // (NaN: may)
+    }
+
+    /// How many points a whole disc has (hw's tolerance apart, 8 to 1024).
+    fn grid(self: *Stroker) usize {
         let r = self.hw;
         let mut n: usize = 8;
         if r > self.tol {
@@ -808,10 +1057,127 @@ struct Stroker {
             n = @max(@int_from_float(usize, @ceil(math.TAU / step)), 8);
             n = @min(n, 1024);
         }
-        self.piece_begin()!;
-        for i in @as(usize, 0)..n {
-            let sc = math.sincos((math.TAU * @float_from_int(f64, i)) / @float_from_int(f64, n));
+        return n;
+    }
+
+    /// Points on the circle of radius hw about (cx, cy), from angle a0
+    /// through a0 + sweep (|sweep| at most a turn), with the last one if
+    /// `end`. They are hw's tolerance apart (at most 1024 a turn) where the
+    /// canvas may show the circle and an eighth of a turn elsewhere, which
+    /// leaves out only slivers outside the canvas.
+    fn arc(self: *mut Stroker, cx: f64, cy: f64, a0: f64, sweep: f64, end: bool) DrawError!void {
+        let r = self.hw;
+        let nfull = self.grid();
+        let fine = math.TAU / @float_from_int(f64, nfull);
+        // where the canvas is, seen from the centre: everywhere, nowhere
+        // (it is inside the coarse polygon), or the angles from lo to lo + span
+        let mut all = true;
+        let mut none = false;
+        let mut lo: f64 = 0.0;
+        let mut span: f64 = 0.0;
+        if self.seen and not self.near(cx, cy, 0.0) {
+            // the centre is outside it: the corners' directions
+            all = false;
+            let mut dmax: f64 = 0.0;
+            let a = math.atan2(self.vy[0] - cy, self.vx[0] - cx);
+            let mut dlo: f64 = 0.0;
+            let mut dhi: f64 = 0.0;
+            for k in @as(usize, 0)..4 {
+                let dx = self.vx[k] - cx;
+                let dy = self.vy[k] - cy;
+                dmax = @max(dmax, (dx * dx) + (dy * dy));
+                let mut d = math.atan2(dy, dx) - a;
+                if d > math.PI {
+                    d -= math.TAU;
+                } else if d < -math.PI {
+                    d += math.TAU;
+                }
+                dlo = @min(dlo, d);
+                dhi = @max(dhi, d);
+            }
+            let inner = r * math.cos(COARSE / 2.0);
+            if dmax <= (inner * inner) {
+                none = true;
+            }
+            lo = a + dlo;
+            span = dhi - dlo;
+        } else if self.seen {
+            // the centre is inside: unless the canvas is inside the coarse polygon
+            let mut dmax: f64 = 0.0;
+            for k in @as(usize, 0)..4 {
+                let dx = self.vx[k] - cx;
+                let dy = self.vy[k] - cy;
+                dmax = @max(dmax, (dx * dx) + (dy * dy));
+            }
+            let inner = r * math.cos(COARSE / 2.0);
+            if dmax <= (inner * inner) {
+                all = false;
+                none = true;
+            }
+        }
+        let turn = @abs(sweep);
+        if not (turn <= math.TAU) or not (@abs(a0) < 1.0e6) {
+            return;  // (NaN)
+        }
+        let mut sgn: f64 = 1.0;
+        if sweep < 0.0 {
+            sgn = -1.0;
+        }
+        let nf = @float_from_int(f64, nfull);
+        let closed = (not end) and (turn >= math.TAU);
+        let coarse = turn / @max(@ceil((turn / COARSE) * (1.0 - 1.0e-12)), 1.0);
+        let mut u: f64 = 0.0;
+        let mut ang = a0;
+        loop {
+            let sc = math.sincos(ang);
             self.pt(cx + (r * sc.cos), cy + (r * sc.sin))!;
+            if u >= turn {
+                break;
+            }
+            // fine steps go to the angles 1/nfull of a turn apart (those of
+            // a whole disc), coarse ones up to where the canvas's directions begin
+            let mut fine_here = all;
+            let mut step = coarse;
+            if not all and not none {
+                let mut d = @rem(ang - lo, math.TAU);
+                if d < 0.0 {
+                    d += math.TAU;
+                }
+                if d <= span {
+                    fine_here = true;
+                } else {
+                    let mut gap = d - span;
+                    if sgn > 0.0 {
+                        gap = math.TAU - d;
+                    }
+                    if gap <= fine {
+                        fine_here = true;
+                    } else {
+                        step = @min(COARSE, gap);
+                    }
+                }
+            }
+            let mut next = ang + (sgn * step);
+            if fine_here and (self.arc_points > 0) {
+                self.arc_points -= 1;
+                let mut k = @floor((ang / math.TAU) * nf) + 1.0;
+                if sgn < 0.0 {
+                    k = @ceil((ang / math.TAU) * nf) - 1.0;
+                }
+                next = (math.TAU * k) / nf;
+                if @abs(next - ang) < (fine * 1.0e-6) {
+                    next = (math.TAU * (k + sgn)) / nf;
+                }
+            }
+            u = sgn * (next - a0);
+            if u >= turn {
+                if closed {
+                    break;  // back at the first point
+                }
+                u = turn;
+                next = a0 + (sgn * turn);
+            }
+            ang = next;
         }
     }
 
@@ -856,10 +1222,20 @@ struct Stroker {
             first_join = 0;
             last_join = n;
         }
+        // (a round join's whole disc reaches past a butt or square end from
+        // within a half width of it: those joins keep it)
+        let ends = (not closed) and (self.style.join == Join.ROUND) and (self.style.cap != Cap.ROUND);
+        let u0 = unit(xs[0] - xs[2], xs[1] - xs[3]);
+        let u1 = unit(xs[(2 * n) - 2] - xs[(2 * n) - 4], xs[(2 * n) - 1] - xs[(2 * n) - 3]);
         for v in first_join..last_join {
             let prev = (v + n - 1) % n;
             let next = (v + 1) % n;
-            self.join(xs[2 * prev], xs[(2 * prev) + 1], xs[2 * v], xs[(2 * v) + 1], xs[2 * next], xs[(2 * next) + 1])!;
+            let bx = xs[2 * v];
+            let by = xs[(2 * v) + 1];
+            let whole = ends and
+                        (((((bx - xs[0]) * u0.x) + ((by - xs[1]) * u0.y)) > -hw) or
+                         ((((bx - xs[(2 * n) - 2]) * u1.x) + ((by - xs[(2 * n) - 1]) * u1.y)) > -hw));
+            self.join(xs[2 * prev], xs[(2 * prev) + 1], bx, by, xs[2 * next], xs[(2 * next) + 1], whole)!;
         }
         // caps
         if not closed {
@@ -868,8 +1244,9 @@ struct Stroker {
         }
     }
 
-    /// The join at (bx, by) between segments from a and to c.
-    fn join(self: *mut Stroker, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) DrawError!void {
+    /// The join at (bx, by) between segments from a and to c (a round one
+    /// as its whole disc if `whole`).
+    fn join(self: *mut Stroker, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64, whole: bool) DrawError!void {
         let hw = self.hw;
         let d1x = bx - ax;
         let d1y = by - ay;
@@ -886,9 +1263,6 @@ struct Stroker {
         if (@abs(cross) < 1.0e-9) and (dot > 0.0) {
             return;  // straight on
         }
-        if self.style.join == Join.ROUND {
-            return self.disc(bx, by);
-        }
         // the outer side: right of a left turn, left of a right one
         let mut s: f64 = 1.0;
         if cross > 0.0 {
@@ -898,6 +1272,31 @@ struct Stroker {
         let n1y = (u1x * hw) * s;
         let n2x = (-u2y * hw) * s;
         let n2y = (u2x * hw) * s;
+        if self.style.join == Join.ROUND {
+            // the sector between the normals, turning through the
+            // direction the line came in (the segments cover the rest of
+            // a disc, but for what is nearer an end of the line)
+            if whole {
+                return self.disc(bx, by);
+            }
+            if not self.near(bx, by, hw) {
+                return;
+            }
+            // (widened to the whole disc's points either side, so that its
+            // edge is the disc's)
+            let nf = @float_from_int(f64, self.grid());
+            let a1 = (math.atan2(n1y, n1x) / math.TAU) * nf;  // in points of the disc
+            let a2 = a1 - ((s * @abs(math.atan2(cross, dot)) / math.TAU) * nf);
+            let mut g1 = @ceil(a1);
+            let mut g2 = @floor(a2);
+            if s < 0.0 {
+                g1 = @floor(a1);
+                g2 = @ceil(a2);
+            }
+            self.piece_begin()!;
+            self.pt(bx, by)!;
+            return self.arc(bx, by, (math.TAU * g1) / nf, (math.TAU * (g2 - g1)) / nf, true);
+        }
         if self.style.join == Join.MITER {
             let ratio = @sqrt(2.0 / @max(1.0 + dot, 1.0e-12));
             if ratio <= self.style.miter_limit {
@@ -931,6 +1330,12 @@ struct Stroker {
     }
 }
 
+/// The direction of (x, y).
+fn unit(x: f64, y: f64) Point {
+    let len = @sqrt((x * x) + (y * y));
+    return Point.{ x: x / len, y: y / len };
+}
+
 /// Copies a polyline without repeated points (which have no direction).
 fn dedupe(xs: []f64, out: *mut vec.Vec.[f64]) DrawError!void {
     out.clear();
@@ -953,7 +1358,8 @@ fn crossing_less(a: Crossing, b: Crossing) bool {
     return a.x < b.x;
 }
 
-/// Splits a polyline into its dashes, stroking each.
+/// Splits a polyline into its dashes, stroking each. Only the stretches of
+/// it near the canvas are split: over the rest the pattern just moves on.
 fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) DrawError!void {
     let dash = sk.style.dash;
     let mut total: f64 = 0.0;
@@ -968,38 +1374,51 @@ fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) Dr
     if not valid or not (total > 0.0) {
         return sk.polyline(xs, closed);
     }
+    // an odd count of lengths is repeated (so that its first is a gap the second time)
+    let mut m = dash.len;
+    if (m % 2) == 1 {
+        m = 2 * m;
+        total = 2.0 * total;
+    }
     let n = xs.len / 2;
     let mut nseg = n - 1;
     if closed {
         nseg = n;
     }
-    // a pattern too fine for the path (millions of dashes, or lengths that
-    // do not move the position in floating point) is drawn solid
+    // a pattern too fine for the path (more dashes than the stroke may
+    // still make, or lengths that do not move the position in floating
+    // point) is drawn solid
     let mut path_len: f64 = 0.0;
+    let mut seen_len: f64 = 0.0;
     for i in @as(usize, 0)..nseg {
         let j = (i + 1) % n;
         let dx = xs[2 * j] - xs[2 * i];
         let dy = xs[(2 * j) + 1] - xs[(2 * i) + 1];
-        path_len += @sqrt((dx * dx) + (dy * dy));
+        let len = @sqrt((dx * dx) + (dy * dy));
+        let v = sk.visible(xs[2 * i], xs[(2 * i) + 1], xs[2 * j], xs[(2 * j) + 1]);
+        path_len += len;
+        seen_len += len * (v[1] - v[0]);
     }
-    if not ((path_len / total) * @float_from_int(f64, dash.len) < 1.0e6) or (total < (path_len * 1.0e-12)) {
+    // (a dash of a wide stroke counts for the rows it spans)
+    let count = ((seen_len / total) * @float_from_int(f64, m)) * @max(sk.span / 16.0, 1.0);
+    if not (count < sk.dashes) or (total < (path_len * 1.0e-12)) {
         return sk.polyline(xs, closed);
     }
+    sk.dashes -= count;
     // where in the pattern the line starts
     let mut phase = @rem(sk.style.dash_offset, total);
     if phase < 0.0 {
         phase += total;
     }
     let mut di: usize = 0;
-    while phase >= dash[di] {
-        phase -= dash[di];
-        di = (di + 1) % dash.len;
+    while phase >= dash[di % dash.len] {
+        phase -= dash[di % dash.len];
+        di = (di + 1) % m;
     }
-    let mut left = dash[di] - phase;  // of the current dash or gap
+    let mut left = dash[di % dash.len] - phase;  // of the current dash or gap
     buf.clear();
     if (di % 2) == 0 {
-        buf.push(xs[0])!;
-        buf.push(xs[1])!;
+        dash_point(buf, xs[0], xs[1])!;
     }
     for i in @as(usize, 0)..nseg {
         let j = (i + 1) % n;
@@ -1008,35 +1427,101 @@ fn dashed(sk: *mut Stroker, xs: []f64, closed: bool, buf: *mut vec.Vec.[f64]) Dr
         let bx = xs[2 * j];
         let by = xs[(2 * j) + 1];
         let len = @sqrt(((bx - ax) * (bx - ax)) + ((by - ay) * (by - ay)));
+        let v = sk.visible(ax, ay, bx, by);
         let mut pos: f64 = 0.0;
-        while (len - pos) > left {
+        if v[0] > 0.0 {
+            pos = v[0] * len;
+            dash_skip(sk, total, m, &mut di, &mut left, buf, ax, ay, bx, by, 0.0, pos, len)!;
+        }
+        let mut stop = len;
+        if v[1] < 1.0 {
+            stop = @max(v[1] * len, pos);
+        }
+        while (stop - pos) > left {
             pos += left;
             let t = pos / len;
             let px = ax + ((bx - ax) * t);
             let py = ay + ((by - ay) * t);
             if (di % 2) == 0 {
                 // a dash ends
-                buf.push(px)!;
-                buf.push(py)!;
+                dash_point(buf, px, py)!;
                 sk.polyline(buf.items(), false)!;
                 buf.clear();
             } else {
                 // a dash starts
-                buf.push(px)!;
-                buf.push(py)!;
+                dash_point(buf, px, py)!;
             }
-            di = (di + 1) % dash.len;
-            left = dash[di];
+            di = (di + 1) % m;
+            left = dash[di % dash.len];
         }
-        left -= len - pos;
+        left -= stop - pos;
+        if stop < len {
+            dash_skip(sk, total, m, &mut di, &mut left, buf, ax, ay, bx, by, stop, len, len)!;
+        }
         if (di % 2) == 0 {
-            buf.push(bx)!;
-            buf.push(by)!;
+            dash_point(buf, bx, by)!;
         }
     }
     if ((di % 2) == 0) and (buf.len >= 4) {
         sk.polyline(buf.items(), false)!;
     }
+}
+
+/// Moves a dash pattern on from `from` to `to` along a segment of length
+/// len (from a to b) where the stroke cannot be seen: a dash under way
+/// ends at `from`, and one under way at `to` starts there. At a or b, they
+/// go on a little way (out of sight) so that the join there is still made.
+fn dash_skip(sk: *mut Stroker, total: f64, m: usize, di: *mut usize, left: *mut f64, buf: *mut vec.Vec.[f64], ax: f64,
+             ay: f64, bx: f64, by: f64, from: f64, to: f64, len: f64) DrawError!void {
+    let dash = sk.style.dash;
+    let ext = @min(0.5 * sk.hw, to - from);
+    if (di.* % 2) == 0 {
+        let mut t = from / len;
+        if from == 0.0 {
+            t = ext / len;
+        }
+        let px = ax + ((bx - ax) * t);
+        let py = ay + ((by - ay) * t);
+        if buf.len >= 2 {
+            dash_point(buf, px, py)!;
+        }
+        if buf.len >= 4 {
+            sk.polyline(buf.items(), false)!;
+        }
+        buf.clear();
+    }
+    let mut s = to - from;
+    if s < left.* {
+        left.* -= s;
+    } else {
+        // whole patterns at once, then entry by entry
+        s -= left.*;
+        di.* = (di.* + 1) % m;
+        s = @rem(s, total);
+        while s >= dash[di.* % dash.len] {
+            s -= dash[di.* % dash.len];
+            di.* = (di.* + 1) % m;
+        }
+        left.* = dash[di.* % dash.len] - s;
+    }
+    if (di.* % 2) == 0 {
+        let mut t = to / len;
+        if to >= len {
+            t = (len - ext) / len;  // (b follows)
+        }
+        dash_point(buf, ax + ((bx - ax) * t), ay + ((by - ay) * t))!;
+    }
+}
+
+/// Adds a point to a dash, unless it repeats the last one (a segment of no
+/// length has no direction; a dash of no length is a dot).
+fn dash_point(buf: *mut vec.Vec.[f64], x: f64, y: f64) DrawError!void {
+    let k = buf.len;
+    if (k >= 2) and (buf.get(k - 2) == x) and (buf.get(k - 1) == y) {
+        return;
+    }
+    buf.push(x)!;
+    buf.push(y)!;
 }
 
 // -----------------------------------------------------------------------------
@@ -1619,13 +2104,8 @@ pub struct Canvas {
         defer user.deinit();
         flatten(path, Affine.identity(), self.tolerance / scale, &mut user)!;
         self.poly.clear();
-        let mut sk = Stroker.{
-            out: &mut self.poly,
-            hw: style.width / 2.0,
-            style: &style,
-            t: self.transform,
-            tol: self.tolerance / scale,
-        };
+        let mut sk = Stroker.init(&mut self.poly, &style, self.transform, self.tolerance / scale, self.img.width,
+                                  self.img.height, user.npoints());
         for i in @as(usize, 0)..user.starts.len {
             let r = user.range(i);
             dedupe(user.pts.items()[2 * r[0]..2 * r[1]], &mut self.tmp)!;
@@ -1643,6 +2123,17 @@ pub struct Canvas {
             } else {
                 sk.polyline(self.tmp.items(), closed)!;
             }
+        }
+        sk.piece_end();
+        if sk.full {
+            self.poly.clear();
+            self.poly.begin()!;
+            let wf = @float_from_int(f64, self.img.width);
+            let hf = @float_from_int(f64, self.img.height);
+            self.poly.add(-1.0, -1.0)!;
+            self.poly.add(wf + 1.0, -1.0)!;
+            self.poly.add(wf + 1.0, hf + 1.0)!;
+            self.poly.add(-1.0, hf + 1.0)!;
         }
         orient_positive(&mut self.poly);
         self.paint_poly(paint, FillRule.NONZERO)!;
@@ -1946,4 +2437,136 @@ test "paint and compositing" {
     cv.fill_rect(0.0, 0.0, 1.0, 1.0, Paint.solid(color.Color.rgb(1.0, 1.0, 1.0)))!;
     @expect_eq(img.get(11, 3).to_rgba8().to_u32(), 0xffffffff);
     @expect_eq(img.get(14, 6).to_rgba8().to_u32(), 0x000000ff);
+}
+
+test "many crossings in a row" {
+    // a zigzag whose edges all cross each other within one row, and tiny
+    // squares at the top of a row and then at its bottom: the crossings'
+    // order changes wholesale from line to line, which must not take
+    // quadratic time
+    let mut img = image.Image.init(1000, 1, 4, image.Depth.F32)!;
+    defer img.deinit();
+    let mut cv = Canvas.init(&mut img);
+    defer cv.deinit();
+    let white = Paint.solid(color.Color.rgb(1.0, 1.0, 1.0));
+    let n: usize = 32000;
+    let nf = @float_from_int(f64, n);
+    let mut p = Path.init();
+    defer p.deinit();
+    for i in @as(usize, 0)..n {
+        let x = (@float_from_int(f64, i) * 1000.0) / nf;
+        if i == 0 {
+            p.move_to(0.0, 0.0)!;
+        } else {
+            p.line_to(x, 0.0)!;
+        }
+        p.line_to(1000.0 - x, 1.0)!;
+    }
+    p.close()!;
+    cv.fill(&p, white, FillRule.NONZERO)!;
+    @expect(@abs(coverage_sum(&img) - 418.0) < 1.0);
+    cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    p.clear();
+    for k in @as(usize, 0)..2 {
+        let y = 0.1 + (0.5 * @float_from_int(f64, k));
+        for i in @as(usize, 0)..n / 2 {
+            p.rect((@float_from_int(f64, i) * 2000.0) / nf, y, 1000.0 / nf, 0.1)!;
+        }
+    }
+    cv.fill(&p, white, FillRule.NONZERO)!;
+    @expect(@abs(coverage_sum(&img) - 62.5) < 0.5);  // 2 bands, each on 1 of the 16 sample lines, half covered
+}
+
+test "dashes and round pieces off the canvas" {
+    let mut img = image.Image.init(64, 64, 4, image.Depth.F32)!;
+    defer img.deinit();
+    let mut cv = Canvas.init(&mut img);
+    defer cv.deinit();
+    let white = Paint.solid(color.Color.rgb(1.0, 1.0, 1.0));
+    let mut p = Path.init();
+    defer p.deinit();
+    // lines a million long, finely dashed: dashed where the canvas shows
+    // them, without making the dashes beyond it
+    for i in @as(usize, 0)..40 {
+        let y = @float_from_int(f64, i) + 0.5;
+        p.move_to(-1.0e6, y)!;
+        p.line_to(1.0e6, y)!;
+    }
+    let dashes: [2]f64 = [1.0, 1.0];
+    let mut st = Stroke.width(1.0);
+    st.dash = dashes[..];
+    cv.stroke(&p, white, st)!;
+    @expect(@abs(coverage_sum(&img) - (40.0 * 32.0)) < 1.0e-3);
+    @expect_eq(img.get(0, 3).a, 1.0);
+    @expect_eq(img.get(1, 3).a, 0.0);
+    // one far too fine for its length is drawn solid
+    cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    let fine: [2]f64 = [1.0e-4, 1.0e-4];
+    st.dash = fine[..];
+    cv.stroke(&p, white, st)!;
+    @expect(@abs(coverage_sum(&img) - (40.0 * 64.0)) < 1.0e-3);
+    // curves a million wide with round joins (each flattened into many
+    // segments): the stroke covers the canvas
+    cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    p.clear();
+    p.move_to(0.0, 0.0)!;
+    for i in @as(usize, 0)..64 {
+        p.cubic_to(0.0, 1.0e6, 1.0e6, -1.0e6, 1.0e6, 0.0)!;
+    }
+    let mut wide = Stroke.width(1.0e6);
+    wide.join = Join.ROUND;
+    wide.cap = Cap.ROUND;
+    cv.stroke(&p, white, wide)!;
+    @expect_eq(coverage_sum(&img), 64.0 * 64.0);
+    // a dash turning at a corner off the canvas: its miter still shows
+    cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    p.clear();
+    p.move_to(20.0, -200.0)!;
+    p.line_to(30.0, -20.0)!;
+    p.line_to(42.0, -200.0)!;
+    let long: [2]f64 = [30.0, 5.0];
+    let mut miter = Stroke.width(10.0);
+    miter.miter_limit = 40.0;
+    miter.dash = long[..];
+    cv.stroke(&p, white, miter)!;
+    @expect(coverage_sum(&img) > 200.0);
+    // round caps a hundred wide on dashes along the canvas's edge
+    cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    p.clear();
+    p.move_to(-1.0e4, 0.0)!;
+    p.line_to(1.0e4, 0.0)!;
+    let mut caps = Stroke.width(100.0);
+    caps.cap = Cap.ROUND;
+    caps.dash = dashes[..];
+    cv.stroke(&p, white, caps)!;
+    @expect(coverage_sum(&img) > (64.0 * 49.0));
+}
+
+test "round joins" {
+    let mut img = image.Image.init(60, 50, 4, image.Depth.F32)!;
+    defer img.deinit();
+    let mut cv = Canvas.init(&mut img);
+    defer cv.deinit();
+    let white = Paint.solid(color.Color.rgb(1.0, 1.0, 1.0));
+    let mut p = Path.init();
+    defer p.deinit();
+    // a right angle 8 wide: two rectangles and a quarter disc outside the corner
+    p.move_to(10.0, 30.0)!;
+    p.line_to(40.0, 30.0)!;
+    p.line_to(40.0, 10.0)!;
+    let mut st = Stroke.width(8.0);
+    st.join = Join.ROUND;
+    cv.stroke(&p, white, st)!;
+    @expect(@abs(coverage_sum(&img) - (384.0 + (math.PI * 4.0))) < 0.3);  // (chords: within the tolerance)
+    @expect_eq(img.get(9, 30).a, 0.0);  // the butt end
+    // a curve 20 wide with a short first segment: its first join's disc
+    // reaches past the butt end, as it always has
+    cv.clear(color.Color.rgba(0.0, 0.0, 0.0, 0.0));
+    p.clear();
+    p.move_to(20.0, 25.0)!;
+    p.line_to(21.0, 25.0)!;
+    p.line_to(40.0, 40.0)!;
+    st.width = 20.0;
+    cv.stroke(&p, white, st)!;
+    @expect(img.get(12, 25).a > 0.9);
 }

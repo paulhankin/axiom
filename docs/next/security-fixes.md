@@ -280,3 +280,18 @@
   reads are charged to the run's matching steps and the shared allowance; a run without
   the steps left for its plan is shaped without the font's features. A `Shaper` keeps
   32 plans instead of 16.
+- `std/graphics/draw`:
+  - Filling a shape whose edges cross many times within one pixel row took time
+    quadratic in the edges (64,000 such edges took 12 s); crossings are sorted in
+    O(n log n) once insertion sort would move them more than 4 times their count.
+  - A dashed stroke made every dash along the whole path, each with its caps (a
+    173-byte SVG took over 100 s). Dashes are made only near the canvas, and one stroke
+    makes at most 65,536 dashes plus 16 per point of its flattened path; past that,
+    subpaths are drawn solid.
+  - Round joins and caps of a wide stroke along a finely flattened curve each made a
+    disc of up to 1024 points (a 473-byte SVG took 5 s and 880 MB). A round join is the
+    sector outside the corner, arcs are finely spaced only where the canvas can show
+    them, and pieces that miss the canvas are dropped.
+  - A dash ending exactly at a corner made a piece with NaN coordinates, which could
+    make the whole stroke vanish, and an odd count of dash lengths is now repeated, as
+    in SVG and PDF.
