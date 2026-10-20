@@ -5,6 +5,12 @@
 // id and universal selectors, compounds of them, and descendant and child
 // combinators, ordered by specificity. Part of std/graphics/svg.
 //
+// Matching takes time linear in the selector and the element's depth (each
+// compound after a descendant combinator matches at the nearest ancestor
+// that will do, which never needs backtracking), and rules are indexed by
+// their last compound's id, class or type, so an element is tested only
+// against the rules that could match it.
+//
 //     let c = css.parse_color("cornflowerblue")!;          // a color.Color
 //     let mut t = draw.Affine.identity();
 //     css.parse_transform("translate(10 20) rotate(45)", &mut t)!;
@@ -14,7 +20,9 @@
 // Color Module Level 3 (keywords, hsl()).
 // =============================================================================
 
+import "../../collections/map.ax" as maps;
 import "../../collections/vec.ax" as vec;
+import "../../hash.ax" as hash;
 import "../../math.ax" as math;
 import "../../str.ax" as strs;
 import "../color.ax" as color;
@@ -396,22 +404,104 @@ pub struct Elem {
     class: []u8,
 }
 
+/// The most compounds a selector may have (longer ones are skipped).
+pub const MAX_COMPOUNDS: usize = 32;
+
+const NO_RULE: u32 = 0xffffffff;
+
 /// Style sheet rules (their text must outlive the sheet).
 pub struct Sheet {
     compounds: vec.Vec.[Compound],
     rules: vec.Vec.[Rule],
     decls: vec.Vec.[Decl],
+    // the rules by their last compound's id, else its first class, else its
+    // type, else none (universal): the first rule of each list, and each
+    // rule's next
+    by_id: maps.Map.[[]u8, u32],
+    by_class: maps.Map.[[]u8, u32],
+    by_tag: maps.Map.[[]u8, u32],
+    universal: u32,
+    next: vec.Vec.[u32],
 
     /// An empty sheet.
     pub fn init() Sheet {
-        return Sheet.{ compounds: vec.Vec.[Compound].init(), rules: vec.Vec.[Rule].init(),
-                       decls: vec.Vec.[Decl].init() };
+        return Sheet.{
+            compounds: vec.Vec.[Compound].init(),
+            rules: vec.Vec.[Rule].init(),
+            decls: vec.Vec.[Decl].init(),
+            by_id: maps.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes),
+            by_class: maps.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes),
+            by_tag: maps.Map.[[]u8, u32].init(hash.hash_bytes, hash.eq_bytes),
+            universal: NO_RULE,
+            next: vec.Vec.[u32].init(),
+        };
     }
 
     pub fn deinit(self: *mut Sheet) void {
         self.compounds.deinit();
         self.rules.deinit();
         self.decls.deinit();
+        self.by_id.deinit();
+        self.by_class.deinit();
+        self.by_tag.deinit();
+        self.next.deinit();
+    }
+
+    /// Puts the rule just added into its list.
+    fn index_last(self: *mut Sheet) CssError!void {
+        let ri = @truncate(u32, self.rules.len - 1);
+        let r = self.rules.get(self.rules.len - 1);
+        let c = self.compounds.get((r.first + r.count) - 1);
+        let mut head = self.universal;
+        let mut m = &mut self.by_tag;
+        let mut key = c.tag;
+        if c.id.len > 0 {
+            m = &mut self.by_id;
+            key = c.id;
+        } else if c.nclasses > 0 {
+            m = &mut self.by_class;
+            key = c.classes[0];
+        }
+        if key.len > 0 {
+            head = m.get(key) catch NO_RULE;
+            m.put(key, ri)!;
+        } else {
+            self.universal = ri;
+        }
+        self.next.push(head)!;
+    }
+
+    /// Appends to out the rules that may match e (by the index of their last
+    /// compound; a rule appears once for each time e's class list names its
+    /// class); returns the work done, in list entries and classes looked up.
+    pub fn candidates(self: *Sheet, e: Elem, out: *mut vec.Vec.[u32]) CssError!usize {
+        let mut steps: usize = 0;
+        steps += self.push_list(self.universal, out)!;
+        if (e.tag.len > 0) and (self.by_tag.len() > 0) {
+            steps += self.push_list(self.by_tag.get(e.tag) catch NO_RULE, out)!;
+        }
+        if (e.id.len > 0) and (self.by_id.len() > 0) {
+            steps += self.push_list(self.by_id.get(e.id) catch NO_RULE, out)!;
+        }
+        if self.by_class.len() > 0 {
+            let mut f = strs.fields(e.class);
+            loop {
+                let c = f.next() catch break;
+                steps += 1 + self.push_list(self.by_class.get(c) catch NO_RULE, out)!;
+            }
+        }
+        return steps;
+    }
+
+    fn push_list(self: *Sheet, first: u32, out: *mut vec.Vec.[u32]) CssError!usize {
+        let mut n: usize = 0;
+        let mut r = first;
+        while r != NO_RULE {
+            out.push(r)!;
+            n += 1;
+            r = self.next.get(@as(usize, r));
+        }
+        return n;
     }
 
     /// Adds the rules of a style sheet (comments already removed). At-rules
@@ -462,6 +552,7 @@ pub struct Sheet {
                 self.rules.push(Rule.{ first: first, count: self.compounds.len - first, decl_first: decl_first,
                                        decl_count: decl_count, specificity: spec,
                                        order: @truncate(u32, self.rules.len) })!;
+                self.index_last()!;
             }
         }
     }
@@ -493,6 +584,9 @@ pub struct Sheet {
             }
             if (count > 0) and saw_space and (comb == 0) {
                 comb = ' ';
+            }
+            if count >= MAX_COMPOUNDS {
+                return error.InvalidSelector;
             }
             let mut c = Compound.{ tag: "", id: "", classes: [""; 4], nclasses: 0, combinator: comb };
             let start = i;
@@ -546,34 +640,63 @@ pub struct Sheet {
     /// Whether rule r matches the last element of chain (whose ancestors,
     /// outermost first, come before it).
     pub fn matches(self: *Sheet, r: Rule, chain: []Elem) bool {
+        let mut steps: usize = 0;
+        return self.match_steps(r, chain, &mut steps);
+    }
+
+    /// matches, adding the compounds it tested to steps (at most the
+    /// selector's compounds times the chain's length).
+    pub fn match_steps(self: *Sheet, r: Rule, chain: []Elem, steps: *mut usize) bool {
         if (r.count == 0) or (chain.len == 0) {
             return false;
         }
-        return self.match_at(r.first, r.count - 1, chain, chain.len - 1);
-    }
-
-    fn match_at(self: *Sheet, first: usize, ci: usize, chain: []Elem, ei: usize) bool {
-        let c = self.compounds.get(first + ci);
-        if not compound_matches(c, chain[ei]) {
-            return false;
-        }
-        if ci == 0 {
-            return true;
-        }
-        if ei == 0 {
-            return false;
-        }
-        if c.combinator == '>' {
-            return self.match_at(first, ci - 1, chain, ei - 1);
-        }
-        let mut k = ei;
-        while k > 0 {
-            k -= 1;
-            if self.match_at(first, ci - 1, chain, k) {
+        // the selector's runs of compounds joined by child combinators, from
+        // the last: the last run ends at the element itself, and each one
+        // before it at the nearest ancestor above the run after it where it
+        // matches (a nearer one leaves more ancestors for the runs before,
+        // so a farther one is never needed)
+        let mut end = r.count;
+        let mut limit = chain.len;  // the run's last compound matches below this
+        let mut fixed = true;
+        loop {
+            let mut start = end - 1;
+            while (start > 0) and (self.compounds.get(r.first + start).combinator == '>') {
+                start -= 1;
+            }
+            let n = end - start;
+            let mut found = false;
+            let mut at = limit;
+            while at >= n {
+                at -= 1;
+                if self.run_at(r.first + start, n, chain, at, steps) {
+                    found = true;
+                    break;
+                }
+                if fixed {
+                    break;
+                }
+            }
+            if not found {
+                return false;
+            }
+            if start == 0 {
                 return true;
             }
+            limit = (at + 1) - n;
+            end = start;
+            fixed = false;
         }
-        return false;
+    }
+
+    /// Whether the n compounds from first match the elements ending at chain[at].
+    fn run_at(self: *Sheet, first: usize, n: usize, chain: []Elem, at: usize, steps: *mut usize) bool {
+        for k in @as(usize, 0)..n {
+            steps.* += 1;
+            if not compound_matches(self.compounds.get((first + n) - 1 - k), chain[at - k]) {
+                return false;
+            }
+        }
+        return true;
     }
 }
 
@@ -731,4 +854,75 @@ test "declarations and selectors" {
     ];
     @expect(not sh.matches(sh.rules.get(1), chain2[..]));
     @expect(not sh.matches(sh.rules.get(2), chain2[..]));
+}
+
+fn chain_of(tags: []u8, out: *mut vec.Vec.[Elem]) CssError!void {
+    out.clear();
+    for i in @as(usize, 0)..tags.len {
+        out.push(Elem.{ tag: tags[i..i + 1], id: "", class: "" })!;
+    }
+}
+
+test "matching without backtracking" {
+    let mut sh = Sheet.init();
+    defer sh.deinit();
+    sh.add("a > b c {} a b > c {} a > b > c d {} b a {}")!;
+    @expect_eq(sh.rules.len, 4);
+    let mut ch = vec.Vec.[Elem].init();
+    defer ch.deinit();
+    chain_of("abbc", &mut ch)!;
+    @expect(sh.matches(sh.rules.get(0), ch.items()));  // the farther b
+    @expect(sh.matches(sh.rules.get(1), ch.items()));
+    chain_of("axbc", &mut ch)!;
+    @expect(sh.matches(sh.rules.get(1), ch.items()));
+    @expect(not sh.matches(sh.rules.get(0), ch.items()));
+    chain_of("abxc", &mut ch)!;
+    @expect(not sh.matches(sh.rules.get(1), ch.items()));
+    chain_of("abcabxd", &mut ch)!;
+    @expect(sh.matches(sh.rules.get(2), ch.items()));
+    chain_of("abxabxd", &mut ch)!;
+    @expect(not sh.matches(sh.rules.get(2), ch.items()));
+    chain_of("ba", &mut ch)!;
+    @expect(sh.matches(sh.rules.get(3), ch.items()));
+    chain_of("ab", &mut ch)!;
+    @expect(not sh.matches(sh.rules.get(3), ch.items()));
+    // a long selector that fails, over a deep chain: steps linear in each
+    let mut text = strs.String.init();
+    defer text.deinit();
+    text.push_str("a")!;
+    for _i in @as(usize, 0)..(MAX_COMPOUNDS - 2) {
+        text.push_str(" g")!;
+    }
+    text.push_str(" r {} ")!;
+    text.push_str(text.bytes())!;  // one more compound: skipped
+    text.truncate(text.bytes().len - 5);
+    text.push_str(" g r {}")!;
+    let mut long = Sheet.init();
+    defer long.deinit();
+    long.add(text.bytes())!;
+    @expect_eq(long.rules.len, 1);
+    ch.clear();
+    for _i in @as(usize, 0)..500 {
+        ch.push(Elem.{ tag: "g", id: "", class: "" })!;
+    }
+    ch.push(Elem.{ tag: "r", id: "", class: "" })!;
+    let mut steps: usize = 0;
+    @expect(not long.match_steps(long.rules.get(0), ch.items(), &mut steps));
+    @expect(steps <= (MAX_COMPOUNDS * ch.len));
+}
+
+test "rules indexed by their last compound" {
+    let mut sh = Sheet.init();
+    defer sh.deinit();
+    sh.add("#a {} .b {} g .b.c {} rect {} * {} g > * {} .d#e {}")!;
+    let mut out = vec.Vec.[u32].init();
+    defer out.deinit();
+    _ = sh.candidates(Elem.{ tag: "rect", id: "", class: "x b" }, &mut out)!;
+    @expect_eq(out.len, 5);  // .b, .b.c, rect, *, g > *
+    out.clear();
+    _ = sh.candidates(Elem.{ tag: "circle", id: "e", class: "" }, &mut out)!;
+    @expect_eq(out.len, 3);  // *, g > *, .d#e
+    out.clear();
+    _ = sh.candidates(Elem.{ tag: "a", id: "a", class: "b b" }, &mut out)!;
+    @expect_eq(out.len, 7);  // #a, .b and .b.c twice, *, g > *
 }

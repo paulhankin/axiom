@@ -185,3 +185,15 @@
   5 s; a block now uses a table as large as its size pays for, and long codes are found
   by their length rather than by a scan that could take quadratic time. Huffman output
   past a block's lookup table was mapped through stale entries; it decodes as 0.
+- `std/graphics/svg`:
+  - `use` elements that expand to nothing no longer take exponential time, and a `use`
+    no longer copies what it refers to: path data is parsed once per element, identical
+    stops, clip paths and outlines are shared, and an `<image>` is decoded once. Parsing
+    is limited to 16 × the document's size plus 2^21 steps of work, and what it keeps to
+    32 × its size plus 64 MiB; past either it fails with `TooComplex`.
+  - Style sheets match in linear time: descendant combinators no longer backtrack
+    (selectors of more than 32 compounds are skipped), and rules are indexed by their
+    last compound.
+  - A group with an opacity, clip or mask gets a layer only as large as what it draws,
+    not the whole canvas, and at most 8 canvases of layers are live at once; past that
+    a group's opacity applies to what it draws and its mask is ignored.

@@ -56,7 +56,10 @@
 // gradients are opaque and masks are ignored. Corrupt input gives an
 // error or is skipped as SVG renderers do (a path is drawn up to an error
 // in its data); it never traps. Use elements that multiply past MAX_ITEMS
-// items fail with TooComplex.
+// items, or past the work and data limits (WORK_PER_BYTE, DATA_PER_BYTE),
+// fail with TooComplex. A layer covers only what its group draws, and the
+// layers live at once are limited (past it, a group's opacity applies to
+// what it draws and its mask is ignored, as on a PDF page).
 //
 // Sources: Scalable Vector Graphics (SVG) 1.1 (Second Edition), W3C 2011;
 // checked against skia's SVG renderer (std/graphics/svg/testdata, from
@@ -100,6 +103,25 @@ pub let XLINK_NS: []u8 = "http://www.w3.org/1999/xlink";
 /// The most drawing items a document may make (use elements can multiply
 /// them): beyond it, parse fails with TooComplex.
 pub const MAX_ITEMS: usize = 100000;
+
+/// Parsing's work (elements walked and styled, rules and compounds tested,
+/// declarations applied, 16 bytes of attribute values read, items scanned
+/// for a box) is limited to WORK_PER_BYTE times the text's size plus
+/// MIN_WORK steps, and the data a document keeps (paths, gradient stops,
+/// dashes and text, in bytes) to DATA_PER_BYTE times the text's size plus
+/// MIN_DATA, so use elements cannot multiply either without limit: past
+/// them, parse fails with TooComplex. Path data and points are parsed once
+/// per element, and a clip path or a gradient's stops that come out the
+/// same for another use are shared.
+pub const WORK_PER_BYTE: usize = 16;
+pub const MIN_WORK: usize = 1 << 21;
+pub const DATA_PER_BYTE: usize = 32;
+pub const MIN_DATA: usize = 1 << 26;
+
+/// The most pixels a document's images may have together (each image
+/// element is decoded once, however often it is used); images past it are
+/// skipped.
+pub const MAX_IMAGE_PIXELS: usize = 1 << 25;
 
 // -----------------------------------------------------------------------------
 // Path data
@@ -833,6 +855,20 @@ struct Builder {
     masks: vec.Vec.[*xml.Element],  // the masks being expanded
     vw: f64,  // the viewport, for percentages
     vh: f64,
+    candidates: vec.Vec.[u32],       // the sheet's rules that may match an element
+    bounds: vec.Vec.[pathdata.Box],  // each of the document's paths'
+    // by element address: the path of a path, polyline or polygon (NO_PATH:
+    // none), a clipPath's last path, a gradient's last stops, and an image
+    // element's index in Document.images (NO_PATH: none)
+    shape_paths: maps.Map.[usize, usize],
+    clips: maps.Map.[usize, usize],
+    stops: maps.Map.[usize, []draw.Stop],
+    image_index: maps.Map.[usize, usize],
+    work: usize,  // the work done, and its limit (see WORK_PER_BYTE)
+    work_limit: usize,
+    data: usize,  // the data kept, and its limit
+    data_limit: usize,
+    pixels: usize,  // the images' pixels
 
     fn deinit(self: *mut Builder) void {
         self.ids.deinit();
@@ -842,6 +878,44 @@ struct Builder {
         self.rules.deinit();
         self.uses.deinit();
         self.masks.deinit();
+        self.candidates.deinit();
+        self.bounds.deinit();
+        self.shape_paths.deinit();
+        self.clips.deinit();
+        self.stops.deinit();
+        self.image_index.deinit();
+    }
+
+    /// Counts n steps of work against the limit.
+    fn charge(self: *mut Builder, n: usize) SvgError!void {
+        self.work += n;
+        if self.work > self.work_limit {
+            return error.TooComplex;
+        }
+    }
+
+    /// Counts n bytes of data kept against the limit.
+    fn charge_data(self: *mut Builder, n: usize) SvgError!void {
+        self.data += n;
+        if self.data > self.data_limit {
+            return error.TooComplex;
+        }
+    }
+
+    /// Adds a path to the document (taking it), returning its index.
+    fn store_path(self: *mut Builder, p: draw.Path) SvgError!usize {
+        let mut q = p;
+        let r = self.charge_data(((q.pts.len * 8) + q.verbs.len) + 64);
+        let r2 = self.bounds.push(pathdata.bounds(&q));
+        r catch |e| {
+            q.deinit();
+            return e;
+        };
+        r2 catch |e| {
+            q.deinit();
+            return e;
+        };
+        return self.doc.add_path(q);
     }
 
     fn push_item(self: *mut Builder, it: Item) SvgError!void {
@@ -1119,6 +1193,7 @@ struct Builder {
                 vals.push(vals.get(k))!;
             }
         }
+        self.charge_data(vals.len * 8)!;
         return self.doc.arena.copy(vals.items())!;
     }
 
@@ -1126,26 +1201,51 @@ struct Builder {
     /// under parent.
     fn compute_style(self: *mut Builder, e: *xml.Element, parent: *Style) SvgError!Style {
         let mut s = inherit(parent);
+        // (the attributes are read here and by what draws the element: path
+        // data and points, parsed once per element, and an image's data, decoded
+        // once, are not counted)
+        let mut bytes: usize = 0;
+        for a in e.attrs {
+            if not strs.eq(a.local, "d") and not strs.eq(a.local, "points") and
+               not (strs.eq(a.local, "href") and strs.eq(e.local, "image")) {
+                bytes += a.value.len;
+            }
+        }
+        self.charge((1 + e.attrs.len) + (bytes / 16))!;
         for a in e.attrs {
             if (a.ns.len == 0) and is_property(a.local) {
                 self.apply(&mut s, parent, a.local, a.value);
             }
         }
-        // style sheet rules, by specificity and order
+        // style sheet rules, by specificity and order (a rule found twice, for
+        // a class named twice, once)
         self.rules.clear();
-        if self.sheet.rules.len > 0 {
-            for r in self.sheet.rules.items() {
-                if self.sheet.matches(r, self.chain.items()) {
+        if (self.sheet.rules.len > 0) and (self.chain.len > 0) {
+            self.candidates.clear();
+            let mut steps = self.sheet.candidates(self.chain.get(self.chain.len - 1), &mut self.candidates)!;
+            for ri in self.candidates.items() {
+                let r = self.sheet.rules.get(@as(usize, ri));
+                if self.sheet.match_steps(r, self.chain.items(), &mut steps) {
                     self.rules.push(r)!;
                 }
             }
+            self.charge(steps)!;
             vec.sort(self.rules.items(), rule_less);
+            let rs = self.rules.items();
+            let mut n: usize = 0;
+            for k in @as(usize, 0)..rs.len {
+                if (n == 0) or (rs[n - 1].order != rs[k].order) {
+                    rs[n] = rs[k];
+                    n += 1;
+                }
+            }
+            self.rules.truncate(n);
         }
         for r in self.rules.items() {
             for k in r.decl_first..r.decl_first + r.decl_count {
                 let d = self.sheet.decls.get(k);
                 if not d.important {
-                    self.apply(&mut s, parent, d.name, d.value);
+                    self.apply_decl(&mut s, parent, d)!;
                 }
             }
         }
@@ -1153,12 +1253,16 @@ struct Builder {
         self.decls.clear();
         let st = e.attr("style") catch "";
         if st.len > 0 {
-            let buf = self.doc.arena.bytes(st.len)!;
-            let clean = css.strip_comments(st, buf);
+            let mut clean = st;
+            if strs.contains(st, "/*") {
+                self.charge_data(st.len)!;
+                let buf = self.doc.arena.bytes(st.len)!;
+                clean = css.strip_comments(st, buf);
+            }
             css.parse_declarations(clean, &mut self.decls)!;
             for d in self.decls.items() {
                 if not d.important {
-                    self.apply(&mut s, parent, d.name, d.value);
+                    self.apply_decl(&mut s, parent, d)!;
                 }
             }
         }
@@ -1167,16 +1271,21 @@ struct Builder {
             for k in r.decl_first..r.decl_first + r.decl_count {
                 let d = self.sheet.decls.get(k);
                 if d.important {
-                    self.apply(&mut s, parent, d.name, d.value);
+                    self.apply_decl(&mut s, parent, d)!;
                 }
             }
         }
         for d in self.decls.items() {
             if d.important {
-                self.apply(&mut s, parent, d.name, d.value);
+                self.apply_decl(&mut s, parent, d)!;
             }
         }
         return s;
+    }
+
+    fn apply_decl(self: *mut Builder, s: *mut Style, parent: *Style, d: css.Decl) SvgError!void {
+        self.charge(1 + (d.value.len / 16))!;
+        self.apply(s, parent, d.name, d.value);
     }
 
     fn enter(self: *mut Builder, e: *xml.Element) SvgError!void {
@@ -1298,6 +1407,14 @@ struct Builder {
 
     fn gradient(self: *mut Builder, g: *xml.Element, s: *Style, alpha: f32, bbox: pathdata.Box,
                 out: *mut draw.Paint) SvgError!bool {
+        // (its attributes are looked up a dozen times, along its href chain)
+        let mut attrs: usize = 0;
+        let mut cur = g;
+        for _i in @as(usize, 0)..16 {
+            attrs += cur.attrs.len;
+            cur = self.href(cur) catch break;
+        }
+        self.charge(12 * attrs)!;
         // the stops, with their own styles
         let owner = self.gradient_stops_owner(g) catch return false;
         let mut stops = vec.Vec.[draw.Stop].init();
@@ -1353,7 +1470,7 @@ struct Builder {
         } else if strs.eq(sm, "reflect") {
             spread = draw.Spread.REFLECT;
         }
-        let fine = self.doc.arena.copy(stops.items())!;
+        let fine = self.shared_stops(owner, stops.items())!;
         if strs.eq(g.local, "linearGradient") {
             let x1 = self.gradient_length(g, "x1", 'x', user, 0.0);
             let y1 = self.gradient_length(g, "y1", 'y', user, 0.0);
@@ -1386,6 +1503,33 @@ struct Builder {
         let ffy = if_else(no_fy, cy, fy);
         out.* = draw.Paint.radial_focal(cx, cy, r, ffx, ffy, fine).with_spread(spread).with_transform(space);
         return true;
+    }
+
+    /// A copy of a gradient's stops, kept in the document: the copy made
+    /// last time, if they are the same.
+    fn shared_stops(self: *mut Builder, owner: *xml.Element, stops: []draw.Stop) SvgError![]draw.Stop {
+        let key = @int_from_ptr(owner);
+        let last = self.stops.get(key) catch @slice_from_ptr(@ptr_from_int(*draw.Stop, 8), 0);
+        self.charge(stops.len)!;
+        if last.len == stops.len {
+            let mut same = true;
+            for i in @as(usize, 0)..stops.len {
+                let a = last[i];
+                let b = stops[i];
+                if (a.offset != b.offset) or (a.color.r != b.color.r) or (a.color.g != b.color.g) or
+                   (a.color.b != b.color.b) or (a.color.a != b.color.a) {
+                    same = false;
+                    break;
+                }
+            }
+            if same {
+                return last;
+            }
+        }
+        self.charge_data(stops.len * @size_of(draw.Stop))!;
+        let c = self.doc.arena.copy(stops)!;
+        self.stops.put(key, c)!;
+        return c;
     }
 
     /// A gradient coordinate: user units (or a percentage of the viewport),
@@ -1533,6 +1677,7 @@ fn walk(b: *mut Builder, e: *xml.Element, parent: *Style, ctm: draw.Affine, dept
     if depth > MAX_NESTING {
         return error.TooComplex;
     }
+    b.charge(1)!;
     if not is_svg(e) or is_hidden_element(e.local) {
         return;
     }
@@ -1628,7 +1773,7 @@ fn end_group(b: *mut Builder, g: *GroupInfo, depth: usize) !void {
     }
     let mut bbox = g.bbox;
     if bbox.is_empty() and ((g.clip.len > 0) or g.has_mask) {
-        bbox = items_bbox(b, g.begin + 1, g.t);
+        bbox = items_bbox(b, g.begin + 1, g.t)!;
     }
     if g.clip.len > 0 {
         let mut rule = draw.FillRule.NONZERO;
@@ -1649,18 +1794,19 @@ fn close_group(b: *mut Builder) SvgError!void {
 }
 
 /// The box (in t's space) of the shapes and images drawn since item `from`.
-fn items_bbox(b: *Builder, from: usize, t: draw.Affine) pathdata.Box {
+fn items_bbox(b: *mut Builder, from: usize, t: draw.Affine) SvgError!pathdata.Box {
     let mut box = pathdata.Box.empty();
     if @abs(t.determinant()) < 1.0e-12 {
         return box;
     }
     let inv = t.invert();
     let items = b.doc.items.items();
+    b.charge(items.len - from)!;
     for i in from..items.len {
         let it = items[i];
         let mut local = pathdata.Box.empty();
         if it.kind == ItemKind.SHAPE {
-            local = pathdata.bounds(&b.doc.paths.items()[it.path]);
+            local = b.bounds.get(it.path);
         } else if it.kind == ItemKind.IMAGE {
             local = pathdata.Box.{ x0: 0.0, y0: 0.0, x1: it.width, y1: it.height };
         } else {
@@ -1734,7 +1880,7 @@ fn mask_content(b: *mut Builder, m: *xml.Element, t: draw.Affine, bbox: pathdata
         };
         rp.deinit();
         let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
-        it.path = b.doc.add_path(dp)!;
+        it.path = b.store_path(dp)!;
         b.push_item(it)!;
     }
     b.masks.push(m)!;
@@ -1795,7 +1941,37 @@ fn clip_path(b: *mut Builder, id: []u8, t: draw.Affine, bbox: pathdata.Box, rule
             else => {}
         }
     }
-    return b.doc.add_path(out);
+    // the same path as last time (for another use of the element it clips): shared
+    let key = @int_from_ptr(cp);
+    let last = b.clips.get(key) catch NO_PATH;
+    if (last != NO_PATH) and same_path(&b.doc.paths.items()[last], &out) {
+        out.deinit();
+        return last;
+    }
+    let idx = b.store_path(out)!;
+    b.clips.put(key, idx)!;
+    return idx;
+}
+
+fn same_path(a: *draw.Path, b: *draw.Path) bool {
+    if (a.verbs.len != b.verbs.len) or (a.pts.len != b.pts.len) {
+        return false;
+    }
+    let av = a.verbs.items();
+    let bv = b.verbs.items();
+    for i in @as(usize, 0)..av.len {
+        if av[i] != bv[i] {
+            return false;
+        }
+    }
+    let ap = a.pts.items();
+    let bp = b.pts.items();
+    for i in @as(usize, 0)..ap.len {
+        if ap[i] != bp[i] {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn clip_child(b: *mut Builder, x0: *xml.Element, parent: *Style, m: draw.Affine, out: *mut draw.Path,
@@ -1836,16 +2012,17 @@ fn clip_child(b: *mut Builder, x0: *xml.Element, parent: *Style, m: draw.Affine,
     if not s.display or not s.visible {
         return;
     }
-    let mut p = draw.Path.init();
-    defer p.deinit();
-    if not shape_path(b, x, &s, &mut p)! {
+    let pi = element_path(b, x, &s)!;
+    if pi == NO_PATH {
         return;
     }
     if first.* {
         rule.* = s.clip_rule;
         first.* = false;
     }
-    pathdata.append_transformed(out, &p, t)!;
+    let p = &b.doc.paths.items()[pi];
+    b.charge(p.pts.len / 4)!;  // (and as much to compare it with the last)
+    pathdata.append_transformed(out, p, t)!;
 }
 
 fn group(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, depth: usize, only_first: bool) !void {
@@ -1905,7 +2082,7 @@ fn viewport(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, x: f64,
             return er;
         };
         rp.deinit();
-        let idx = b.doc.add_path(dp)!;
+        let idx = b.store_path(dp)!;
         let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
         it.path = idx;
         b.push_item(it)!;
@@ -2074,6 +2251,39 @@ fn shape_path(b: *mut Builder, e: *xml.Element, s: *Style, p: *mut draw.Path) Sv
     return false;
 }
 
+/// The outline of a basic shape or path element as one of the document's
+/// paths (in its user space), or NO_PATH if it has none. Path data and
+/// points depend on nothing else, so each element's are parsed once; the
+/// other shapes (whose lengths can depend on the font size and the
+/// viewport) share the path made last time if it comes out the same.
+fn element_path(b: *mut Builder, e: *xml.Element, s: *Style) SvgError!usize {
+    let key = @int_from_ptr(e);
+    let once = strs.eq(e.local, "path") or strs.eq(e.local, "polyline") or strs.eq(e.local, "polygon");
+    let last = b.shape_paths.get(key) catch NO_PATH;
+    if once and b.shape_paths.contains(key) {
+        return last;
+    }
+    let mut p = draw.Path.init();
+    let ok = shape_path(b, e, s, &mut p) catch |er| {
+        p.deinit();
+        return er;
+    };
+    if not ok {
+        p.deinit();
+        if once {
+            b.shape_paths.put(key, NO_PATH)!;
+        }
+        return NO_PATH;
+    }
+    if (last != NO_PATH) and same_path(&b.doc.paths.items()[last], &p) {
+        p.deinit();
+        return last;
+    }
+    let idx = b.store_path(p)!;
+    b.shape_paths.put(key, idx)!;
+    return idx;
+}
+
 fn stroke_of(s: *Style) draw.Stroke {
     let mut st = draw.Stroke.width(s.stroke_width);
     st.cap = s.cap;
@@ -2090,16 +2300,14 @@ fn shape(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !void {
         // shapes do not have)
         return;
     }
-    let mut p = draw.Path.init();
-    let ok = shape_path(b, e, s, &mut p) catch |er| {
-        p.deinit();
-        return er;
-    };
-    if not ok or not s.visible {
-        p.deinit();
+    if not s.visible {
         return;
     }
-    let bbox = pathdata.bounds(&p);
+    let pi = element_path(b, e, s)!;
+    if pi == NO_PATH {
+        return;
+    }
+    let bbox = b.bounds.get(pi);
     let mut it = blank_item(ItemKind.SHAPE, t);
     let both = (s.fill.kind != PaintKind.NONE) and (s.stroke.kind != PaintKind.NONE) and (s.stroke_width > 0.0);
     // an opacity on one paint can go into it; on two, it needs a group
@@ -2109,29 +2317,23 @@ fn shape(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !void {
         fold = s.opacity;
         gs.opacity = 1.0;
     }
-    it.has_fill = b.make_paint(s.fill, s, s.fill_opacity * fold, bbox, &mut it.fill) catch |er| {
-        p.deinit();
-        return er;
-    };
+    it.has_fill = b.make_paint(s.fill, s, s.fill_opacity * fold, bbox, &mut it.fill)!;
     it.fill_rule = s.fill_rule;
     if s.stroke_width > 0.0 {
-        it.has_stroke = b.make_paint(s.stroke, s, s.stroke_opacity * fold, bbox, &mut it.stroke) catch |er| {
-            p.deinit();
-            return er;
-        };
+        it.has_stroke = b.make_paint(s.stroke, s, s.stroke_opacity * fold, bbox, &mut it.stroke)!;
     }
     it.style = stroke_of(s);
     if not it.has_fill and not it.has_stroke {
-        p.deinit();
         return;
     }
-    it.path = b.doc.add_path(p)!;
+    it.path = pi;
     let mut wrapped = begin_group(b, &gs, t, bbox)!;
     b.push_item(it)!;
     end_group(b, &mut wrapped, 0)!;
 }
 
-fn data_uri_image(v: []u8) !image.Image {
+/// The image of a data URI, if it has at most room pixels (else TooLarge).
+fn data_uri_image(v: []u8, room: usize) !image.Image {
     let t = strs.trim(v);
     if not strs.starts_with(t, "data:") {
         return error.Unsupported;
@@ -2154,26 +2356,75 @@ fn data_uri_image(v: []u8) !image.Image {
     }
     let data = base64.decode_alloc(clean[..n], base64.STANDARD) catch return error.SyntaxError;
     defer mem.free(data);
-    if (data.len >= 8) and (data[0] == 0x89) and (data[1] == 'P') and (data[2] == 'N') and (data[3] == 'G') {
+    let is_png = (data.len >= 8) and (data[0] == 0x89) and (data[1] == 'P') and (data[2] == 'N') and (data[3] == 'G');
+    if not is_png and not ((data.len >= 3) and (data[0] == 0xff) and (data[1] == 0xd8)) {
+        return error.Unsupported;
+    }
+    if is_png and (data.len >= 24) {
+        // the size in its header, before decoding
+        let w = (((@as(u64, data[16]) << 24) | (@as(u64, data[17]) << 16)) | (@as(u64, data[18]) << 8)) | @as(
+            u64, data[19]);
+        let h = (((@as(u64, data[20]) << 24) | (@as(u64, data[21]) << 16)) | (@as(u64, data[22]) << 8)) | @as(
+            u64, data[23]);
+        if (w * h) > @as(u64, room) {
+            return error.TooLarge;
+        }
+    }
+    let mut img = decode_image(data, is_png)!;
+    if (img.width * img.height) > room {
+        img.deinit();
+        return error.TooLarge;
+    }
+    return img;
+}
+
+fn decode_image(data: []u8, is_png: bool) !image.Image {
+    if is_png {
         return png.decode(data);
     }
-    if (data.len >= 3) and (data[0] == 0xff) and (data[1] == 0xd8) {
-        return jpeg.decode(data);
+    return jpeg.decode(data);
+}
+
+/// The index in Document.images of an image element's image (decoded the
+/// first time), or NO_PATH if it has none.
+fn element_image(b: *mut Builder, e: *xml.Element) !usize {
+    let key = @int_from_ptr(e);
+    if b.image_index.contains(key) {
+        return b.image_index.get(key);
     }
-    return error.Unsupported;
+    let mut idx = NO_PATH;
+    let href = href_value(e) catch "";
+    let img = data_uri_image(href, MAX_IMAGE_PIXELS - b.pixels) catch |er| {
+        if er == error.OutOfMemory {
+            return er;
+        }
+        b.image_index.put(key, NO_PATH)!;
+        return NO_PATH;  // unreadable, external or too big: nothing
+    };
+    let mut im = img;
+    if (im.width > 0) and (im.height > 0) {
+        b.doc.images.push(im) catch |er| {
+            im.deinit();
+            return er;
+        };
+        b.pixels += im.width * im.height;
+        idx = b.doc.images.len - 1;
+    } else {
+        im.deinit();
+    }
+    b.image_index.put(key, idx)!;
+    return idx;
 }
 
 fn image_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !void {
     if not s.visible {
         return;
     }
-    let href = href_value(e) catch return;
-    let mut img = data_uri_image(href) catch |er| {
-        if er == error.OutOfMemory {
-            return er;
-        }
-        return;  // unreadable or external: nothing
-    };
+    let index = element_image(b, e)!;
+    if index == NO_PATH {
+        return;
+    }
+    let img = &b.doc.images.items()[index];
     let iw = @float_from_int(f64, img.width);
     let ih = @float_from_int(f64, img.height);
     let fs = s.font_size;
@@ -2181,14 +2432,9 @@ fn image_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !v
     let y = b.attr_length(e, "y", 'y', fs, 0.0);
     let w = b.attr_length(e, "width", 'x', fs, iw);
     let h = b.attr_length(e, "height", 'y', fs, ih);
-    if not (w > 0.0) or not (h > 0.0) or (img.width == 0) or (img.height == 0) {
-        img.deinit();
+    if not (w > 0.0) or not (h > 0.0) {
         return;
     }
-    b.doc.images.push(img) catch |er| {
-        img.deinit();
-        return er;
-    };
     let fit = parse_fit(e.attr("preserveAspectRatio") catch "");
     let place = viewbox_transform([0.0, 0.0, iw, ih], fit, w, h).then(draw.Affine.translation(x, y));
     if fit.slice {
@@ -2201,12 +2447,12 @@ fn image_element(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine) !v
         };
         rp.deinit();
         let mut it = blank_item(ItemKind.BEGIN_GROUP, t);
-        it.path = b.doc.add_path(dp)!;
+        it.path = b.store_path(dp)!;
         b.push_item(it)!;
     }
     let mut g = begin_group(b, s, t, pathdata.Box.{ x0: x, y0: y, x1: x + w, y1: y + h })!;
     let mut it = blank_item(ItemKind.IMAGE, place.then(t));
-    it.image = b.doc.images.len - 1;
+    it.image = index;
     it.width = iw;
     it.height = ih;
     b.push_item(it)!;
@@ -2270,6 +2516,7 @@ fn text_runs(b: *mut Builder, e: *xml.Element, s: *Style, t: draw.Affine, st: *m
         match c {
             .Text(raw) => {
                 // white space: newlines go, tabs become spaces, runs of spaces one
+                b.charge_data(raw.len)!;
                 let buf = b.doc.arena.bytes(raw.len)!;
                 let mut n: usize = 0;
                 for ch in raw {
@@ -2374,6 +2621,17 @@ pub fn parse(text: []u8) !Document {
         masks: vec.Vec.[*xml.Element].init(),
         vw: 300.0,
         vh: 150.0,
+        candidates: vec.Vec.[u32].init(),
+        bounds: vec.Vec.[pathdata.Box].init(),
+        shape_paths: maps.Map.[usize, usize].init(hash.hash_usize, hash.eq_usize),
+        clips: maps.Map.[usize, usize].init(hash.hash_usize, hash.eq_usize),
+        stops: maps.Map.[usize, []draw.Stop].init(hash.hash_usize, hash.eq_usize),
+        image_index: maps.Map.[usize, usize].init(hash.hash_usize, hash.eq_usize),
+        work: 0,
+        work_limit: (WORK_PER_BYTE * text.len) + MIN_WORK,
+        data: 0,
+        data_limit: (DATA_PER_BYTE * text.len) + MIN_DATA,
+        pixels: 0,
     };
     defer b.deinit();
     build(&mut b, root) catch |e| {
@@ -2538,14 +2796,17 @@ fn encoded_paint(p: draw.Paint, scratch: *mut vec.Vec.[draw.Stop]) SvgError!draw
 
 const SUBSTOPS: usize = 16;
 
-/// An offscreen layer (for a group's opacity or mask, or a mask itself).
+/// An offscreen layer (for a group's opacity, clip or mask, or a mask
+/// itself): its pixels are those of the work image from (x, y).
 struct Layer {
     img: *mut image.Image,
     cv: *mut draw.Canvas,
+    x: usize,
+    y: usize,
 }
 
-fn new_layer(w: usize, h: usize, like: *draw.Canvas) SvgError!Layer {
-    let img = mem.create(image.Image.init(w, h, 4, image.Depth.F32)!)!;
+fn new_layer(r: Rect, like: *draw.Canvas) SvgError!Layer {
+    let img = mem.create(image.Image.init(r.x1 - r.x0, r.y1 - r.y0, 4, image.Depth.F32)!)!;
     let cv = mem.create(draw.Canvas.init(img)) catch |e| {
         img.deinit();
         mem.destroy(img);
@@ -2553,7 +2814,7 @@ fn new_layer(w: usize, h: usize, like: *draw.Canvas) SvgError!Layer {
     };
     cv.antialias = like.antialias;
     cv.tolerance = like.tolerance;
-    return Layer.{ img: img, cv: cv };
+    return Layer.{ img: img, cv: cv, x: r.x0, y: r.y0 };
 }
 
 fn free_layer(l: Layer) void {
@@ -2563,12 +2824,58 @@ fn free_layer(l: Layer) void {
     mem.destroy(l.img);
 }
 
+fn layer_rect(l: Layer) Rect {
+    return Rect.{ x0: l.x, y0: l.y, x1: l.x + l.img.width, y1: l.y + l.img.height };
+}
+
+/// Pixels x0..x1 by y0..y1 of the work image.
+struct Rect {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+
+    fn area(self: Rect) usize {
+        if (self.x1 <= self.x0) or (self.y1 <= self.y0) {
+            return 0;
+        }
+        return (self.x1 - self.x0) * (self.y1 - self.y0);
+    }
+
+    fn meet(self: Rect, o: Rect) Rect {
+        return Rect.{
+            x0: @max(self.x0, o.x0), y0: @max(self.y0, o.y0), x1: @min(self.x1, o.x1), y1: @min(self.y1, o.y1) };
+    }
+}
+
+/// What a group needs, found before drawing: the pixels it can change, and
+/// whether its clip changes any of them.
+struct Plan {
+    rect: Rect,
+    clip: bool,
+}
+
 /// What a BEGIN_GROUP (or BEGIN_MASK) started.
 struct Frame {
-    kind: u8,  // 0: a clip only, 1: a layer, 2: a mask's layer
+    kind: u8,
     opacity: f32,
     masked: bool,
+    alpha: f32,  // FOLDED: the canvas's alpha before
 }
+
+const PLAIN: u8 = 0;    // nothing to do (no opacity, no clip that matters)
+const LAYER: u8 = 1;    // drawn on a layer of its box, composited at its end
+const MASK: u8 = 2;     // a mask, drawn on a layer like its group's
+const FOLDED: u8 = 3;   // past the layer limits: its opacity applied to what it draws, its mask ignored
+const HIDDEN: u8 = 4;   // nothing of it shows (or it is clipped, past the layer limits)
+const NO_MASK: u8 = 5;  // a mask not drawn (its group's is ignored or hidden)
+
+/// The layers live at once have at most this many times the work image's
+/// pixels: past it a group's opacity is applied to what it draws and its
+/// mask is ignored (as on a PDF page), and a clipped group is not drawn.
+/// (A layer covers what its group draws, so it costs about what drawing
+/// that does.)
+const LIVE_LAYERS: usize = 8;
 
 /// The state of rendering onto a canvas.
 struct Painter {
@@ -2580,6 +2887,11 @@ struct Painter {
     stops: vec.Vec.[draw.Stop],
     base: draw.Affine,
     opts: RenderOptions,
+    boxes: vec.Vec.[pathdata.Box],  // the document's paths' bounds
+    plans: vec.Vec.[Plan],          // by item (for BEGIN_GROUP items)
+    hidden: usize,                  // the HIDDEN and NO_MASK frames open
+    live: usize,                    // the pixels of the layers
+    live_limit: usize,
 
     fn deinit(self: *mut Painter) void {
         while self.layers.len > 0 {
@@ -2593,14 +2905,28 @@ struct Painter {
         }
         self.images.deinit();
         self.stops.deinit();
+        self.boxes.deinit();
+        self.plans.deinit();
+    }
+
+    /// The layer drawn on now.
+    fn top(self: *Painter) Layer {
+        if self.layers.len > 0 {
+            return self.layers.get(self.layers.len - 1);
+        }
+        return self.work;
     }
 
     /// The canvas drawn on now.
     fn cur(self: *Painter) *mut draw.Canvas {
-        if self.layers.len > 0 {
-            return self.layers.get(self.layers.len - 1).cv;
-        }
-        return self.work.cv;
+        return self.top().cv;
+    }
+
+    /// A transform from the document's space (through t) to the pixels of
+    /// the layer drawn on now.
+    fn at(self: *Painter, t: draw.Affine) draw.Affine {
+        let l = self.top();
+        return t.then(self.base).then(draw.Affine.translation(-@float_from_int(f64, l.x), -@float_from_int(f64, l.y)));
     }
 
     fn fill(self: *mut Painter, p: *draw.Path, paint: draw.Paint, rule: draw.FillRule) SvgError!void {
@@ -2613,31 +2939,273 @@ struct Painter {
         self.cur().stroke(p, q, style)!;
     }
 
+    /// The whole work image, as a box.
+    fn everywhere(self: *Painter) pathdata.Box {
+        return pathdata.Box.{ x0: 0.0, y0: 0.0, x1: @float_from_int(f64, self.work.img.width),
+                              y1: @float_from_int(f64, self.work.img.height) };
+    }
+
+    /// The box of the work image that box b covers through t (the whole
+    /// image if it is not finite).
+    fn device_box(self: *Painter, b: pathdata.Box, t: draw.Affine) pathdata.Box {
+        let mut out = pathdata.Box.empty();
+        let xs: [2]f64 = [b.x0, b.x1];
+        let ys: [2]f64 = [b.y0, b.y1];
+        for xv in xs {
+            for yv in ys {
+                let q = t.apply(xv, yv);
+                if not math.is_finite(q.x) or not math.is_finite(q.y) {
+                    return self.everywhere();
+                }
+                out.add(q.x, q.y);
+            }
+        }
+        return out;
+    }
+
+    /// The box of the work image an item draws in (empty: none; tp holds a
+    /// text item's outline).
+    fn item_box(self: *Painter, it: *Item, tp: *draw.Path) pathdata.Box {
+        let mut local = pathdata.Box.empty();
+        if it.kind == ItemKind.SHAPE {
+            local = self.boxes.get(it.path);
+            if local.is_empty() {
+                return self.everywhere();  // (not finite)
+            }
+            if it.has_stroke {
+                // square caps reach half the width times √2 out, miters up to
+                // the miter limit times it
+                let mut k: f64 = 1.5;
+                if it.style.join == draw.Join.MITER {
+                    k = @max(k, it.style.miter_limit);
+                }
+                let pad = (k * it.style.width) / 2.0;
+                local = pathdata.Box.{ x0: local.x0 - pad, y0: local.y0 - pad, x1: local.x1 + pad, y1: local.y1 + pad };
+            }
+        } else if it.kind == ItemKind.IMAGE {
+            local = pathdata.Box.{ x0: 0.0, y0: 0.0, x1: it.width, y1: it.height };
+        } else if (it.kind == ItemKind.TEXT) and (tp.verbs.len > 0) {
+            local = pathdata.bounds(tp);
+            if local.is_empty() {
+                return self.everywhere();
+            }
+            if it.has_stroke {
+                let pad = (@max(1.5, it.style.miter_limit) * it.style.width) / 2.0;
+                local = pathdata.Box.{ x0: local.x0 - pad, y0: local.y0 - pad, x1: local.x1 + pad, y1: local.y1 + pad };
+            }
+        } else {
+            return local;
+        }
+        return self.device_box(local, it.transform.then(self.base));
+    }
+
+    /// The pixels of the work image that a box can change (with a pixel
+    /// more on each side, for antialiasing).
+    fn pixels(self: *Painter, b: pathdata.Box) Rect {
+        if b.is_empty() {
+            return Rect.{ x0: 0, y0: 0, x1: 0, y1: 0 };
+        }
+        let w = @float_from_int(f64, self.work.img.width);
+        let h = @float_from_int(f64, self.work.img.height);
+        return Rect.{ x0: @int_from_float(usize, low_px(b.x0 - 1.0, w)),
+                      y0: @int_from_float(usize, low_px(b.y0 - 1.0, h)),
+                      x1: @int_from_float(usize, high_px(b.x1 + 1.0, w)),
+                      y1: @int_from_float(usize, high_px(b.y1 + 1.0, h)) };
+    }
+
+    /// Whether clip path p is a rectangle of the work image holding box b
+    /// (so that clipping to it changes nothing b covers).
+    fn rect_holds(self: *Painter, p: *draw.Path, b: pathdata.Box) bool {
+        let v = p.verbs.items();
+        let q = p.pts.items();
+        if (v.len != 5) or (q.len != 8) or (v[0] != draw.Verb.MOVE) or (v[4] != draw.Verb.CLOSE) {
+            return false;
+        }
+        let mut xs: [4]f64 = [0.0; 4];
+        let mut ys: [4]f64 = [0.0; 4];
+        for k in @as(usize, 0)..4 {
+            if (k > 0) and (v[k] != draw.Verb.LINE) {
+                return false;
+            }
+            let d = self.base.apply(q[2 * k], q[(2 * k) + 1]);
+            xs[k] = d.x;
+            ys[k] = d.y;
+        }
+        let along = (ys[0] == ys[1]) and (xs[1] == xs[2]) and (ys[2] == ys[3]) and (xs[3] == xs[0]);
+        let across = (xs[0] == xs[1]) and (ys[1] == ys[2]) and (xs[2] == xs[3]) and (ys[3] == ys[0]);
+        if not along and not across {
+            return false;
+        }
+        return (b.x0 >= @min(xs[0], xs[2])) and (b.x1 <= @max(xs[0], xs[2])) and (b.y0 >= @min(ys[0], ys[2])) and
+               (b.y1 <= @max(ys[0], ys[2]));
+    }
+
+    /// Finds each group's box: the pixels of what it draws (not its mask's
+    /// content) within its clip's.
+    fn plan(self: *mut Painter) SvgError!void {
+        let doc = self.doc;
+        for i in @as(usize, 0)..doc.paths.len {
+            self.boxes.push(pathdata.bounds(&doc.paths.items()[i]))!;
+        }
+        let mut open = vec.Vec.[usize].init();
+        defer open.deinit();
+        let mut acc = vec.Vec.[pathdata.Box].init();
+        defer acc.deinit();
+        let mut pen = Pen.{ x: 0.0, y: 0.0 };
+        let mut tp = draw.Path.init();
+        defer tp.deinit();
+        let items = doc.items.items();
+        let none = Rect.{ x0: 0, y0: 0, x1: 0, y1: 0 };
+        for i in @as(usize, 0)..items.len {
+            let it = &items[i];
+            self.plans.push(Plan.{ rect: none, clip: false })!;
+            if (it.kind == ItemKind.BEGIN_GROUP) or (it.kind == ItemKind.BEGIN_MASK) {
+                open.push(i)!;
+                acc.push(pathdata.Box.empty())!;
+                continue;
+            }
+            let mut b = pathdata.Box.empty();
+            if it.kind == ItemKind.END_GROUP {
+                let mut gi = open.pop() catch continue;
+                b = acc.pop()!;
+                if items[gi].kind == ItemKind.BEGIN_MASK {
+                    gi = open.pop() catch continue;
+                    b = acc.pop()!;
+                }
+                let g = &items[gi];
+                let mut clip = g.path != NO_PATH;
+                if clip and not b.is_empty() {
+                    let cp = &doc.paths.items()[g.path];
+                    let cb = self.device_box(self.boxes.get(g.path), self.base);
+                    if self.rect_holds(cp, b) {
+                        clip = false;
+                    }
+                    b = pathdata.Box.{ x0: @max(b.x0, cb.x0), y0: @max(b.y0, cb.y0), x1: @min(b.x1, cb.x1),
+                                       y1: @min(b.y1, cb.y1) };
+                }
+                self.plans.items()[gi] = Plan.{ rect: self.pixels(b), clip: clip };
+            } else {
+                tp.clear();
+                if (it.kind == ItemKind.TEXT) and self.opts.has_font {
+                    text_item_path(it, self.opts, &mut pen, &mut tp)!;
+                }
+                b = self.item_box(it, &tp);
+            }
+            if (acc.len > 0) and not b.is_empty() {
+                let top = acc.get_ptr(acc.len - 1);
+                top.add(b.x0, b.y0);
+                top.add(b.x1, b.y1);
+            }
+        }
+    }
+
+    /// Whether a layer of px pixels fits the limits.
+    fn room_for(self: *Painter, n: usize) bool {
+        return (self.live + n) <= self.live_limit;
+    }
+
+    fn push_layer(self: *mut Painter, r: Rect) SvgError!Layer {
+        let l = new_layer(r, self.cur())!;
+        self.layers.push(l) catch |e| {
+            free_layer(l);
+            return e;
+        };
+        self.live += r.area();
+        return l;
+    }
+
+    fn begin_group(self: *mut Painter, i: usize, it: *Item) SvgError!Frame {
+        let mut fr = Frame.{ kind: PLAIN, opacity: it.opacity, masked: it.masked, alpha: 1.0 };
+        if self.hidden > 0 {
+            fr.kind = HIDDEN;
+            self.hidden += 1;
+            return fr;
+        }
+        let pl = self.plans.get(i);
+        if not (it.opacity < 1.0) and not it.masked and not pl.clip {
+            return fr;
+        }
+        let r = pl.rect.meet(layer_rect(self.top()));
+        let n = r.area();
+        if (n == 0) or (pl.clip and not self.room_for(n)) {
+            fr.kind = HIDDEN;
+            self.hidden += 1;
+            return fr;
+        }
+        if not self.room_for(n) {
+            let c = self.cur();
+            fr.kind = FOLDED;
+            fr.alpha = c.alpha;
+            c.alpha = c.alpha * it.opacity;
+            return fr;
+        }
+        let l = self.push_layer(r)!;
+        fr.kind = LAYER;
+        if pl.clip {
+            l.cv.transform = self.at(draw.Affine.identity());
+            l.cv.clip_to(&self.doc.paths.items()[it.path], it.fill_rule)!;
+        }
+        return fr;
+    }
+
+    fn begin_mask(self: *mut Painter) SvgError!Frame {
+        let mut fr = Frame.{ kind: NO_MASK, opacity: 1.0, masked: false, alpha: 1.0 };
+        if (self.hidden == 0) and (self.frames.len > 0) and (self.frames.get(self.frames.len - 1).kind == LAYER) {
+            let r = layer_rect(self.top());
+            if self.room_for(r.area()) {
+                _ = self.push_layer(r)!;
+                fr.kind = MASK;
+                return fr;
+            }
+        }
+        self.hidden += 1;
+        return fr;
+    }
+
+    /// Ends a group (unmasked: its mask was not drawn).
+    fn end_group(self: *mut Painter, fr: Frame, unmasked: bool) SvgError!void {
+        if fr.kind == LAYER {
+            if fr.masked and not unmasked {
+                // (a mask that made no BEGIN_MASK: nothing shows)
+                let l = self.layers.pop()!;
+                self.live -= layer_rect(l).area();
+                free_layer(l);
+            } else {
+                self.pop_layer(fr.opacity, self.work.img, false)!;
+            }
+        } else if fr.kind == FOLDED {
+            self.cur().alpha = fr.alpha;
+        } else if fr.kind == HIDDEN {
+            self.hidden -= 1;
+        }
+    }
+
     /// Composites the top layer onto the one below at an opacity, after
-    /// masking it with a mask layer (if masked).
+    /// masking it with a mask layer (if masked; it covers the same pixels).
     fn pop_layer(self: *mut Painter, opacity: f32, mask: *image.Image, masked: bool) SvgError!void {
         let l = self.layers.pop()!;
+        self.live -= layer_rect(l).area();
         if masked {
             // alpha times the mask's luminance (from its sRGB values) and alpha
             let d = l.img.samples32();
             let m = mask.samples32();
             let mut i: usize = 0;
-            while (i + 3) < d.len {
+            while ((i + 3) < d.len) and ((i + 3) < m.len) {
                 let lum = (((0.2125 * m[i]) + (0.7154 * m[i + 1])) + (0.0721 * m[i + 2])) * m[i + 3];
                 d[i + 3] = d[i + 3] * @min(@max(lum, 0.0), 1.0);
                 i += 4;
             }
         }
-        let below = self.cur();
-        below.save() catch |e| {
-            free_layer(l);
-            return e;
-        };
-        below.transform = draw.Affine.identity();
-        below.alpha = below.alpha * opacity;
-        let r = below.draw_image(
-            l.img, 0.0, 0.0, @float_from_int(f64, l.img.width), @float_from_int(f64, l.img.height));
-        below.restore();
+        let below = self.top();
+        let c = below.cv;
+        let saved_t = c.transform;
+        let saved_a = c.alpha;
+        c.transform = draw.Affine.identity();
+        c.alpha = saved_a * opacity;
+        let r = c.draw_image(l.img, @float_from_int(f64, l.x - below.x), @float_from_int(f64, l.y - below.y),
+                             @float_from_int(f64, l.img.width), @float_from_int(f64, l.img.height));
+        c.transform = saved_t;
+        c.alpha = saved_a;
         free_layer(l);
         r!;
     }
@@ -2647,91 +3215,91 @@ struct Painter {
         let mut pen = Pen.{ x: 0.0, y: 0.0 };
         let mut tp = draw.Path.init();
         defer tp.deinit();
-        let w = self.work.img.width;
-        let h = self.work.img.height;
         for i in @as(usize, 0)..doc.items.len {
             let it = &doc.items.items()[i];
             match it.kind {
                 .BEGIN_GROUP => {
-                    let c = self.cur();
-                    c.save()!;
-                    if it.path != NO_PATH {
-                        c.transform = self.base;
-                        c.clip_to(&doc.paths.items()[it.path], it.fill_rule)!;
-                    }
-                    let mut fr = Frame.{ kind: 0, opacity: it.opacity, masked: it.masked };
-                    if (it.opacity < 1.0) or it.masked {
-                        let l = new_layer(w, h, c)!;
-                        self.layers.push(l) catch |e| {
-                            free_layer(l);
-                            return e;
-                        };
-                        fr.kind = 1;
-                    }
+                    let fr = self.begin_group(i, it)!;
                     self.frames.push(fr)!;
                 }
                 .BEGIN_MASK => {
-                    let l = new_layer(w, h, self.cur())!;
-                    self.layers.push(l) catch |e| {
-                        free_layer(l);
-                        return e;
-                    };
-                    self.frames.push(Frame.{ kind: 2, opacity: 1.0, masked: false })!;
+                    let fr = self.begin_mask()!;
+                    self.frames.push(fr)!;
                 }
                 .END_GROUP => {
-                    let mut fr = self.frames.pop() catch continue;
-                    if fr.kind == 2 {
+                    let fr = self.frames.pop() catch continue;
+                    if fr.kind == MASK {
                         // the mask is done: apply it to the group's layer
                         let ml = self.layers.pop()!;
-                        fr = self.frames.pop() catch {
+                        self.live -= layer_rect(ml).area();
+                        let g = self.frames.pop() catch {
                             free_layer(ml);
                             continue;
                         };
-                        let r = self.pop_layer(fr.opacity, ml.img, true);
+                        let r = self.pop_layer(g.opacity, ml.img, true);
                         free_layer(ml);
                         r!;
-                    } else if fr.kind == 1 {
-                        if fr.masked {
-                            // (a mask that made no BEGIN_MASK: nothing shows)
-                            let l = self.layers.pop()!;
-                            free_layer(l);
-                        } else {
-                            self.pop_layer(fr.opacity, self.work.img, false)!;
-                        }
+                    } else if fr.kind == NO_MASK {
+                        self.hidden -= 1;
+                        let g = self.frames.pop() catch continue;
+                        self.end_group(g, true)!;
+                    } else {
+                        self.end_group(fr, false)!;
                     }
-                    self.cur().restore();
                 }
                 .SHAPE => {
-                    self.cur().transform = it.transform.then(self.base);
-                    let p = &doc.paths.items()[it.path];
-                    if it.has_fill {
-                        self.fill(p, it.fill, it.fill_rule)!;
-                    }
-                    if it.has_stroke {
-                        self.stroke(p, it.stroke, it.style)!;
+                    if self.hidden == 0 {
+                        self.cur().transform = self.at(it.transform);
+                        let p = &doc.paths.items()[it.path];
+                        if it.has_fill {
+                            self.fill(p, it.fill, it.fill_rule)!;
+                        }
+                        if it.has_stroke {
+                            self.stroke(p, it.stroke, it.style)!;
+                        }
                     }
                 }
                 .TEXT => {
                     if self.opts.has_font {
                         tp.clear();
-                        text_item_path(it, self.opts, &mut pen, &mut tp)!;
-                        self.cur().transform = it.transform.then(self.base);
-                        if it.has_fill {
-                            self.fill(&tp, it.fill, it.fill_rule)!;
-                        }
-                        if it.has_stroke {
-                            self.stroke(&tp, it.stroke, it.style)!;
+                        text_item_path(it, self.opts, &mut pen, &mut tp)!;  // (moves the pen, drawn or not)
+                        if self.hidden == 0 {
+                            self.cur().transform = self.at(it.transform);
+                            if it.has_fill {
+                                self.fill(&tp, it.fill, it.fill_rule)!;
+                            }
+                            if it.has_stroke {
+                                self.stroke(&tp, it.stroke, it.style)!;
+                            }
                         }
                     }
                 }
                 .IMAGE => {
-                    let c = self.cur();
-                    c.transform = it.transform.then(self.base);
-                    c.draw_image(&self.images.items()[it.image], 0.0, 0.0, it.width, it.height)!;
+                    if self.hidden == 0 {
+                        let c = self.cur();
+                        c.transform = self.at(it.transform);
+                        c.draw_image(&self.images.items()[it.image], 0.0, 0.0, it.width, it.height)!;
+                    }
                 }
             }
         }
     }
+}
+
+/// The first pixel from v (0 if v is not a number, at most hi).
+fn low_px(v: f64, hi: f64) f64 {
+    if v > 0.0 {
+        return @min(@floor(v), hi);
+    }
+    return 0.0;
+}
+
+/// The pixel past v (hi if v is not a number, at least 0).
+fn high_px(v: f64, hi: f64) f64 {
+    if v < hi {
+        return @max(@ceil(v), 0.0);
+    }
+    return hi;
 }
 
 /// Renders the document into the rectangle (x, y, w, h) of a canvas (in its
@@ -2773,7 +3341,7 @@ pub fn render_with(doc: *Document, cv: *mut draw.Canvas, x: f64, y: f64, w: f64,
     let wh = @int_from_float(usize, y1 - y0);
     let shift = draw.Affine.translation(-x0, -y0);
     let local = viewbox_transform(doc.view_box, doc.fit, w, h).then(draw.Affine.translation(x, y));
-    let work = new_layer(ww, wh, cv)!;
+    let work = new_layer(Rect.{ x0: 0, y0: 0, x1: ww, y1: wh }, cv)!;
     let mut pt = Painter.{
         doc: doc,
         work: work,
@@ -2783,6 +3351,11 @@ pub fn render_with(doc: *Document, cv: *mut draw.Canvas, x: f64, y: f64, w: f64,
         stops: vec.Vec.[draw.Stop].init(),
         base: local.then(outer).then(shift),
         opts: opts,
+        boxes: vec.Vec.[pathdata.Box].init(),
+        plans: vec.Vec.[Plan].init(),
+        hidden: 0,
+        live: 0,
+        live_limit: LIVE_LAYERS * (ww * wh),
     };
     let r = paint_document(&mut pt, x, y, w, h, outer.then(shift));
     pt.deinit();
@@ -2828,6 +3401,7 @@ fn paint_document(pt: *mut Painter, x: f64, y: f64, w: f64, h: f64, outer: draw.
         pt.work.cv.transform = outer;
         pt.work.cv.clip_to(&rp, draw.FillRule.NONZERO)!;
     }
+    pt.plan()!;
     pt.run()!;
 }
 
@@ -3590,6 +4164,182 @@ test "limits" {
     defer d.deinit();
     let mut img = render_image(&d, 4, 4)!;
     defer img.deinit();
+}
+
+/// A document whose last use draws leaf 10^levels times (through levels of
+/// groups of 10 uses of the one below).
+fn use_tree(s: *mut strs.String, leaf: []u8, levels: usize) !void {
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='48' height='48'><defs>")!;
+    s.push_str(leaf)!;
+    let digits = "0123456789";
+    for level in @as(usize, 1)..levels + 1 {
+        s.push_str("<g id='g")!;
+        s.push(digits[level])!;
+        s.push_str("'>")!;
+        for _k in @as(usize, 0)..10 {
+            s.push_str("<use href='#g")!;
+            s.push(digits[level - 1])!;
+            s.push_str("'/>")!;
+        }
+        s.push_str("</g>")!;
+    }
+    s.push_str("</defs><use href='#g")!;
+    s.push(digits[levels])!;
+    s.push_str("'/></svg>")!;
+}
+
+test "hostile documents: uses" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // uses that multiply what draws nothing: refused (a work limit), not run for ever
+    use_tree(&mut s, "<path id='g0' d='M0 0L1 1' fill='none' stroke='none'/>", 7)!;
+    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+    // a big path used 10^4 times is parsed once
+    let mut leaf = strs.String.init();
+    defer leaf.deinit();
+    leaf.push_str("<path id='g0' d='M0 0")!;
+    for _k in @as(usize, 0)..2000 {
+        leaf.push_str(" L1 1")!;
+    }
+    leaf.push_str("'/>")!;
+    use_tree(&mut s, leaf.bytes(), 4)!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        @expect_eq(d.items.len, 10000);
+        @expect_eq(d.paths.len, 1);
+    }
+    // a gradient's stops, a clip path and an image, each kept once
+    leaf.clear();
+    leaf.push_str("<linearGradient id='lg'>")!;
+    for k in @as(usize, 0)..20 {
+        leaf.push_str("<stop offset='0.")!;
+        leaf.push('0' + @truncate(u8, k % 10))!;
+        leaf.push_str("' stop-color='red'/>")!;
+    }
+    leaf.push_str("</linearGradient><clipPath id='c'><path d='M0 0")!;
+    for _k in @as(usize, 0)..200 {
+        leaf.push_str(" L1 1")!;
+    }
+    leaf.push_str("'/></clipPath><g id='g0'><rect width='1' height='1' fill='url(#lg)' clip-path='url(#c)'/>")!;
+    leaf.push_str("<image width='1' height='1' href='data:image/png;base64,")!;
+    let mut px1 = image.Image.init(1, 1, 4, image.Depth.U8)!;
+    defer px1.deinit();
+    let png1 = png.encode(&px1, 6)!;
+    defer mem.free(png1);
+    base64.encode_to(leaf.writer(), png1, base64.STANDARD)!;
+    leaf.push_str("'/></g>")!;
+    use_tree(&mut s, leaf.bytes(), 3)!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        @expect_eq(d.images.len, 1);
+        @expect(d.paths.len <= 3);  // the rect, the clip path's path and the clip
+        let mut stops: usize = 0;
+        for it in d.items.items() {
+            if (it.kind == ItemKind.SHAPE) and (it.fill.kind == draw.PaintKind.LINEAR) {
+                if stops == 0 {
+                    stops = @int_from_ptr(it.fill.stops.ptr);
+                }
+                @expect_eq(@int_from_ptr(it.fill.stops.ptr), stops);
+            }
+        }
+        @expect(stops != 0);
+        let mut img = render_image(&d, 16, 16)!;
+        img.deinit();
+    }
+    // clip paths that differ for each use: refused past the data limit
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg'><defs><clipPath id='c'><path d='M0 0")!;
+    for _k in @as(usize, 0)..2000 {
+        s.push_str(" L1 1")!;
+    }
+    s.push_str("'/></clipPath><rect id='r' width='1' height='1' clip-path='url(#c)'/></defs>")!;
+    let mut nb: [24]u8 = [0; 24];
+    for k in @as(usize, 0)..3000 {
+        s.push_str("<use href='#r' x='")!;
+        s.push_str(io.fmt_u64(nb[..], @as(u64, k)))!;
+        s.push_str("'/>")!;
+    }
+    s.push_str("</svg>")!;
+    @expect(fails_doc(parse(s.bytes()), error.TooComplex));
+}
+
+test "hostile documents: style sheets" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // a descendant selector of many compounds over deep groups: no backtracking
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><style>a")!;
+    for _k in @as(usize, 0)..20 {
+        s.push_str(" g")!;
+    }
+    s.push_str(" rect { fill: red } g g > g rect { fill: #00f }</style>")!;
+    for _k in @as(usize, 0)..200 {
+        s.push_str("<g>")!;
+    }
+    s.push_str("<rect width='4' height='4'/>")!;
+    for _k in @as(usize, 0)..200 {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        let mut img = render_image(&d, 4, 4)!;
+        defer img.deinit();
+        @expect(near(&img, 2, 2, 0x0000ffff, 0));
+    }
+    // many rules and many elements: each element tested only against the
+    // rules it could match
+    s.clear();
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><style>")!;
+    let mut nb: [24]u8 = [0; 24];
+    for k in @as(usize, 0)..20000 {
+        s.push_str(".c")!;
+        s.push_str(io.fmt_u64(nb[..], @as(u64, k)))!;
+        s.push_str("{fill:red}")!;
+    }
+    s.push_str(".c7 { fill: #0f0 }</style>")!;
+    for _k in @as(usize, 0)..20000 {
+        s.push_str("<rect width='4' height='4'/>")!;
+    }
+    s.push_str("<rect class='x c7' width='4' height='4'/></svg>")!;
+    {
+        let mut d = parse(s.bytes())!;
+        defer d.deinit();
+        @expect_eq(d.items.len, 20001);
+        let c = d.items.get(20000).fill.color.to_rgba8().to_u32();
+        @expect_eq(c, 0x00ff00ff);
+    }
+}
+
+test "hostile documents: rendering groups" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    // many groups with an opacity: each layer only as big as what it draws
+    s.push_str("<svg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 48 48'>")!;
+    for _k in @as(usize, 0)..3000 {
+        s.push_str("<g opacity='0.5'><rect x='40' y='40' width='1' height='1' fill='#f00'/></g>")!;
+    }
+    // nested ones, as deep as allowed, each covering everything: past a few
+    // canvases of layers, their opacity applies to what they draw
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("<g opacity='0.99'>")!;
+    }
+    s.push_str("<rect width='20' height='20' fill='#00f'/>")!;
+    for _k in @as(usize, 0)..(MAX_NESTING - 2) {
+        s.push_str("</g>")!;
+    }
+    s.push_str("</svg>")!;
+    let mut d = parse(s.bytes())!;
+    defer d.deinit();
+    let mut img = render_image(&d, 480, 480)!;
+    defer img.deinit();
+    @expect(near(&img, 405, 405, 0xff0000ff, 1));  // 3000 halves of red
+    @expect_eq(px(&img, 395, 395), 0);
+    let c = img.get(100, 100);
+    @expect((c.b > 0.9) and (c.a > 0.05) and (c.a < 0.2));  // 0.99^254
 }
 
 fn fails_doc(r: !Document, want: error) bool {
