@@ -362,6 +362,8 @@ signals, terminals, UDP, Unix-domain sockets, polling, name resolution, file wat
 | `ax_open(path, len, flags) i32`, `ax_close(fd)` | `flags`: `0` read, `1` create/truncate, `2` append, `3` read and write |
 | `ax_seek(fd, off, whence) i64` | moves a file's position (`whence`: `0` start, `1` current, `2` end); returns the new position |
 | `ax_stat(path, len, follow, out) i32` | `out[0..4]` (`i64`): kind (`1` file, `2` directory, `3` symbolic link, `4` other), size, modification time in ns, permission bits; `follow = 0` does not follow a final symbolic link |
+| `ax_fstat(fd, out) i32` | `ax_stat` for an open file |
+| `ax_create(path, len, mode) i32` | opens a file for writing, created or truncated; a new file gets the permission bits `mode` (less the umask) |
 | `ax_mkdir(path, len, mode) i32`, `ax_remove(path, len, dir) i32`, `ax_rename(from, flen, to, tlen) i32` | `mode`: permission bits for the new directory; `dir = 1` removes an (empty) directory |
 | `ax_readdir(path, len, buf, cap) isize` | the entries (not `.`, `..`) as a kind byte (`0` unknown), the name and a `0` byte each; returns the bytes needed, which may exceed `cap` |
 | `ax_dir_open(dir, name, len) i32`, `ax_dir_read(dir, buf, cap) isize`, `ax_dir_remove(dir, name, len, isdir) i32`, `ax_dir_close(dir)`, `ax_dir_stat(dir, out) i32` | directory handles (`dir = -1`: the working directory) for walking trees: opening never follows a symbolic link (`-40`) and fails with `-20` on a non-directory; the entries are as `ax_readdir`'s; `ax_dir_stat` gives the identity (device and inode) of an open directory, so that a tree walk can close an ancestor and check it when reopened through `..`. The JavaScript host keeps paths, so it cannot stop a link swapped in meanwhile |

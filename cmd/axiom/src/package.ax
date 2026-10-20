@@ -183,10 +183,36 @@ pub fn cache_dir() []u8 {
     if not u.isnos(h) and (h.len > 0) {
         return u.cat2(h, "/.cache/axiom");
     }
-    return "/tmp/.cache/axiom";
+    // No home: a directory of this run's own, since a shared one in /tmp
+    // could hold another user's objects and checkouts.
+    if g_run_cache.len == 0 {
+        g_run_cache = u.private_tmp_dir("axiom-cache-");
+        if u.isnos(g_run_cache) {
+            u.die("no cache directory: set AXIOM_CACHE or HOME");
+        }
+    }
+    return g_run_cache;
+}
+
+let mut g_run_cache: []u8 = "";
+
+// Is s a full commit hash (SHA-1 or SHA-256)?
+fn is_commit(s: []u8) bool {
+    if (s.len != 40) and (s.len != 64) {
+        return false;
+    }
+    for c in s {
+        if not (u.is_digit(c) or ((c >= 'a') and (c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn fetch_git(url: []u8, rev: []u8, sp: u.Span) []u8 {
+    if not is_commit(rev) or ((url.len > 0) and (url[0] == '-')) {
+        return u.nosym();  // (reported with the manifest)
+    }
     let mut key = u.Buf.init();
     for c in url {
         if key.len() >= 150 {
@@ -204,7 +230,7 @@ fn fetch_git(url: []u8, rev: []u8, sp: u.Span) []u8 {
     }
     u.mkdirs(u.cat2(cache_dir(), "/git"));
     let tmp = u.f2("%s.tmp%s", dir, u.idec(u.getpid()));
-    let clone = ["git", "clone", "--quiet", url, tmp];
+    let clone = ["git", "clone", "--quiet", "--", url, tmp];
     let co = ["git", "-C", tmp, "-c", "advice.detachedHead=false", "checkout", "--quiet", rev];
     let rm = ["rm", "-rf", tmp];
     if (run_quiet(clone[..]) != 0) or (run_quiet(co[..]) != 0) {
@@ -370,6 +396,13 @@ pub fn load_dir(dir_in: []u8, from: *u.Span) *mut Package {
             }
             if not u.isnos(d.git) and u.isnos(d.rev) {
                 perr(&mut P, ks, ke, "git dependencies must pin a commit: rev = \"<full commit hash>\"");
+            } else if not u.isnos(d.git) and not is_commit(d.rev) {
+                // (it names a directory in the cache, and git takes other
+                // revisions, such as ':/text', which may hold '/' and '..')
+                perr(&mut P, ks, ke, "rev must be a full commit hash: 40 or 64 lower-case hex digits");
+            }
+            if not u.isnos(d.git) and (d.git.len > 0) and (d.git[0] == '-') {
+                perr(&mut P, ks, ke, "a git URL cannot start with '-'");
             }
             for i in 0..specs.len {
                 if u.same(specs.get(i).name, d.name) {
@@ -446,6 +479,8 @@ pub fn load_dir(dir_in: []u8, from: *u.Span) *mut Package {
 }
 
 // The package containing `file_path` (nearest axiom.toml above it), or nil.
+// The search stops at a directory anyone may write to, such as /tmp: a
+// manifest there could be anyone's, and its git dependencies are fetched.
 pub fn for_file(file_path: []u8) *mut Package {
     let mut dir = u.real_path(file_path);
     if u.isnos(dir) {
@@ -464,6 +499,10 @@ pub fn for_file(file_path: []u8) *mut Package {
         let p = pkg_by_dir.get(u.intern(dz));
         if u.notnil(p) {
             return p;
+        }
+        let mode = u.file_mode(dz);
+        if (mode < 0) or ((mode & 0o002) != 0) {
+            return u.nil.[Package]();
         }
         if u.is_file(u.cat2(dz, "/axiom.toml")) {
             return load_dir(dz, u.nil.[u.Span]());

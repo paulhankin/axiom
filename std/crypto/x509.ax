@@ -12,9 +12,10 @@
 // Verification builds a path from the leaf through the given intermediates
 // to a root in the pool, checking every signature, validity period, basic
 // constraints, key usage, extended key usage (serverAuth), path length and
-// DNS / IP name constraints, then matches the host name against the leaf's
-// subject alternative names (the subject's common name is not used). A
-// certificate with an unrecognized critical extension is rejected.
+// DNS / IP name constraints (a CA with constraints of any other kind is not
+// accepted in a path), then matches the host name against the leaf's subject
+// alternative names (the subject's common name is not used). A certificate
+// with an unrecognized critical extension is rejected.
 //
 // Signatures: RSA PKCS #1 v1.5 and PSS, ECDSA on P-256 and P-384, Ed25519,
 // with SHA-256, SHA-384 or SHA-512. SHA-1 signatures are refused.
@@ -255,6 +256,7 @@ pub struct Certificate {
     permitted: vec.Vec.[[]mut u8],  // name constraints: DNS names, and IP address+mask (owned)
     excluded: vec.Vec.[[]mut u8],
     has_constraints: bool,
+    constraints_unsupported: bool,  // a name constraint of a kind not enforced here
     critical_unknown: bool,
 
     /// Parses a DER certificate (the bytes are copied).
@@ -284,6 +286,7 @@ pub struct Certificate {
             permitted: vec.Vec.[[]mut u8].init(),
             excluded: vec.Vec.[[]mut u8].init(),
             has_constraints: false,
+            constraints_unsupported: false,
             critical_unknown: false,
         };
         c.parse_fields() catch |e| {
@@ -354,21 +357,18 @@ pub struct Certificate {
         if t.peek_tag() == der.context(3, true) {
             let mut ex = t.nested(der.context(3, true))!;
             let mut exts = ex.sequence()!;
-            let mut seen: [32][]u8 = [""; 32];
-            let mut nseen: usize = 0;
+            let mut seen = vec.Vec.[[]u8].init();
+            defer seen.deinit();
             while not exts.empty() {
                 let mut e = exts.sequence()!;
                 let oid = e.oid()!;
                 // an extension may appear only once (RFC 5280 4.2)
-                for k in @as(usize, 0)..nseen {
-                    if @mem_eq(seen[k], oid) {
+                for k in seen.items() {
+                    if @mem_eq(k, oid) {
                         return error.InvalidCertificate;
                     }
                 }
-                if nseen < 32 {
-                    seen[nseen] = oid;
-                    nseen += 1;
-                }
+                seen.push(oid)!;
                 let mut critical = false;
                 if e.peek_tag() == der.BOOLEAN {
                     critical = e.boolean()!;
@@ -406,7 +406,11 @@ pub struct Certificate {
         if @mem_eq(oid, OID_KEY_USAGE) {
             let e = r.expect(der.BIT_STRING)!;
             let c = e.content;
-            if c.len < 1 {
+            // the first octet counts the unused (zero) bits at the end
+            if (c.len < 1) or (c[0] > 7) or ((c.len == 1) and (c[0] != 0)) {
+                return error.InvalidCertificate;
+            }
+            if (c.len > 1) and ((c[c.len - 1] & @truncate(u8, (@as(u32, 1) << c[0]) - 1)) != 0) {
                 return error.InvalidCertificate;
             }
             let mut ku: u32 = 0;
@@ -458,7 +462,12 @@ pub struct Certificate {
                 while not trees.empty() {
                     let mut tree = trees.sequence()!;
                     let base = tree.next()!;
-                    if (base.tag == 0x82) or (base.tag == 0x87) {
+                    if ((base.tag != 0x82) and (base.tag != 0x87)) or not tree.empty() {
+                        // another kind of name (directoryName, rfc822Name,
+                        // URI, ...) or a minimum or maximum: not enforced,
+                        // so no path through this CA is accepted
+                        self.constraints_unsupported = true;
+                    } else {
                         // tag the entry with its kind: 'd' DNS, 'i' IP
                         let mut kind: []u8 = "d";
                         if base.tag == 0x87 {
@@ -597,6 +606,9 @@ fn path_names_allowed(ca: *Certificate, chain: []Certificate, used: *[16]bool) b
     if not ca.has_constraints {
         return true;
     }
+    if ca.constraints_unsupported {
+        return false;
+    }
     if not names_allowed(ca, &chain[0]) {
         return false;
     }
@@ -622,13 +634,17 @@ fn names_allowed(ca: *Certificate, cert: *Certificate) bool {
     }
     for n0 in cert.dns_names.items() {
         // names as matches_host sees them ("a.example." is "a.example"); a
-        // wildcard "*.d" is judged by a name it matches ("a.d"), and is
-        // excluded if any name it could match is
+        // wildcard "*.d" is permitted only if every name it could match is,
+        // and is excluded if any name it could match is (judged by one of
+        // them, "a.d", and by the excluded names one label under d)
         let n = strs.trim_bytes(n0, ".");
         let mut rep: [260]u8 = [0; 260];
         let mut name = n;
-        let wild = strs.starts_with(n, "*.") and (n.len < 250);
+        let wild = strs.starts_with(n, "*.");
         if wild {
+            if n.len > 253 {
+                return false;  // longer than a DNS name
+            }
             rep[0] = 'a';
             @mem_copy(rep[1..n.len], n[1..]);
             name = rep[..n.len];
@@ -638,7 +654,12 @@ fn names_allowed(ca: *Certificate, cert: *Certificate) bool {
         for p in ca.permitted.items() {
             if p[0] == 'd' {
                 has_dns_permits = true;
-                if within_dns(name, p[1..]) {
+                let b = p[1..];
+                if (not wild) and within_dns(name, b) {
+                    permitted_any = true;
+                } else if wild and
+                          (within_dns(n[2..], b) or
+                           ((b.len > 0) and (b[0] == '.') and strs.eq_ignore_case(n[2..], b[1..]))) {
                     permitted_any = true;
                 }
             }
@@ -1449,6 +1470,193 @@ test "verify chains" {
     @expect_eq(one_label_under("www.x.test", "x.test"), true);
     @expect_eq(one_label_under("a.www.x.test", "x.test"), false);
     @expect_eq(one_label_under("x.test", "x.test"), false);
+}
+
+// A root (WC Root) and four versions of one sub-CA (WC Sub, the same key),
+// permitted a.example.com, a.com, example.com and .example.com, with leaves for
+// *.example.com and *.com: a wildcard is permitted only if every name it could
+// match is.
+let WC_ROOT_PEM: [8][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBCDCBu6ADAgECAhQEapfS4geqth3udcRPDd/mHe53CDAFBgMrZXAwEjEQMA4G\n",
+    "A1UEAwwHV0MgUm9vdDAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMBIx\n",
+    "EDAOBgNVBAMMB1dDIFJvb3QwKjAFBgMrZXADIQBHQfs5CfeG7fMy0vgNxoefCsb8\n",
+    "dQ6EuwISnBQohgBEwaMjMCEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC\n",
+    "AQYwBQYDK2VwA0EAYegEXJZA+Zjfy5fnqCx84NJWGP2Kwf29PnGOEfNKZIJ97+un\n",
+    "V+vb6Vkn7NJfghOxWIfm7x+jxv1sZ3MDmP+8BQ==\n",
+    "-----END CERTIFICATE-----\n",
+];
+let WC_SUB_A_PEM: [9][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBKDCB26ADAgECAhRxL6VWLZOVB7ytRcNXIdY9sP2fjDAFBgMrZXAwEjEQMA4G\n",
+    "A1UEAwwHV0MgUm9vdDAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMBEx\n",
+    "DzANBgNVBAMMBldDIFN1YjAqMAUGAytlcAMhAAlRwqfldkRuE8+UKkFnPp+flj1H\n",
+    "TKVi45d4xx/huhcso0QwQjAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB\n",
+    "BjAfBgNVHR4BAf8EFTAToBEwD4INYS5leGFtcGxlLmNvbTAFBgMrZXADQQCcZCpu\n",
+    "N8cgx6WmFTe3er/wzP1KbnmQmtKF/oG53bPxCEMfbZefr5NYOSaFvimPyfXOjXxq\n",
+    "nqF4zYbtIi32PDUJ\n",
+    "-----END CERTIFICATE-----\n",
+];
+let WC_SUB_COM_PEM: [9][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBIDCB06ADAgECAhQeg5h9XHy18pQIo3AK3oMsJG5oQDAFBgMrZXAwEjEQMA4G\n",
+    "A1UEAwwHV0MgUm9vdDAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMBEx\n",
+    "DzANBgNVBAMMBldDIFN1YjAqMAUGAytlcAMhAAlRwqfldkRuE8+UKkFnPp+flj1H\n",
+    "TKVi45d4xx/huhcsozwwOjAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB\n",
+    "BjAXBgNVHR4BAf8EDTALoAkwB4IFYS5jb20wBQYDK2VwA0EAYkVVB2jRz4SoJpvz\n",
+    "qxN2djRH+heDRaTJ4V7G6LB9FEZAaHAcxpRT+zY1kyimNbOYaDPath2j7n65cW7e\n",
+    "MsznAA==\n",
+    "-----END CERTIFICATE-----\n",
+];
+let WC_SUB_PARENT_PEM: [9][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBJjCB2aADAgECAhR6t7hqvRSl8SgklYjeEufPYzbL4jAFBgMrZXAwEjEQMA4G\n",
+    "A1UEAwwHV0MgUm9vdDAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMBEx\n",
+    "DzANBgNVBAMMBldDIFN1YjAqMAUGAytlcAMhAAlRwqfldkRuE8+UKkFnPp+flj1H\n",
+    "TKVi45d4xx/huhcso0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB\n",
+    "BjAdBgNVHR4BAf8EEzARoA8wDYILZXhhbXBsZS5jb20wBQYDK2VwA0EAAKZPJBUk\n",
+    "XFyID5ex2IAFrj9csqxH5pwlscPKfYcS5oiBE6HmQ2czq/yIBNhnXK8ks3aLmnU1\n",
+    "oQSqiBPP3vU8Dw==\n",
+    "-----END CERTIFICATE-----\n",
+];
+let WC_SUB_DOT_PEM: [9][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBJzCB2qADAgECAhRaq6jQdXNcZO2ehGUzQMkmdjB/NjAFBgMrZXAwEjEQMA4G\n",
+    "A1UEAwwHV0MgUm9vdDAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMBEx\n",
+    "DzANBgNVBAMMBldDIFN1YjAqMAUGAytlcAMhAAlRwqfldkRuE8+UKkFnPp+flj1H\n",
+    "TKVi45d4xx/huhcso0MwQTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB\n",
+    "BjAeBgNVHR4BAf8EFDASoBAwDoIMLmV4YW1wbGUuY29tMAUGAytlcANBABfSJ+08\n",
+    "8Ks5az+cNrwMMMcsaMUoX+rZp8dTXKDPwae5R/aqNEpSZAxMwy1WXA3w/AL1/i6G\n",
+    "yjGIyjd0Qm5Kugo=\n",
+    "-----END CERTIFICATE-----\n",
+];
+let WC_LEAF_PEM: [8][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBFzCByqADAgECAhR4lNjWjd1NkyPNIx3tSIK019ujzTAFBgMrZXAwETEPMA0G\n",
+    "A1UEAwwGV0MgU3ViMB4XDTI2MDEwMTAwMDAwMFoXDTM2MDEwMTAwMDAwMFowGDEW\n",
+    "MBQGA1UEAwwNKi5leGFtcGxlLmNvbTAqMAUGAytlcAMhAKK6QJEyPBjbcusS/nn8\n",
+    "VTuzjHovGEWurCMVm/a8PrxZoy0wKzAMBgNVHRMBAf8EAjAAMBsGA1UdEQEB/wQR\n",
+    "MA+CDSouZXhhbXBsZS5jb20wBQYDK2VwA0EAyF9eXCuFqVGw/WVbzynSKgYEjD09\n",
+    "3Jt98lw8G4mLusYQBYbSuRx6qmGmPqAhx6tLJ2hqq809Un9Y5Kk8ANcRAQ==\n",
+    "-----END CERTIFICATE-----\n",
+];
+let WC_LEAF_COM_PEM: [8][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBBzCBuqADAgECAhQ6i7pCNwZYV+pe3rsJ5I8SF7VUVDAFBgMrZXAwETEPMA0G\n",
+    "A1UEAwwGV0MgU3ViMB4XDTI2MDEwMTAwMDAwMFoXDTM2MDEwMTAwMDAwMFowEDEO\n",
+    "MAwGA1UEAwwFKi5jb20wKjAFBgMrZXADIQCiukCRMjwY23LrEv55/FU7s4x6LxhF\n",
+    "rqwjFZv2vD68WaMlMCMwDAYDVR0TAQH/BAIwADATBgNVHREBAf8ECTAHggUqLmNv\n",
+    "bTAFBgMrZXADQQAPLU0C704x5Ylrg75w4avkKcxAQiyIIeKwkmxNMbmZre9eaQ6J\n",
+    "JYzD9vFWNMTPkGRlITYME1Iz2MV2DB/MAcYO\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+// A root permitted only the directoryName O=Good (a kind of constraint not
+// enforced here), and a leaf for O=Evil it signed.
+let DN_ROOT_PEM: [9][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBSzCB/qADAgECAhR1sXSRBDIJ0OlcD+siFMnWTF5k5DAFBgMrZXAwITENMAsG\n",
+    "A1UECgwER29vZDEQMA4GA1UEAwwHRE4gUm9vdDAeFw0yNjAxMDEwMDAwMDBaFw0z\n",
+    "NjAxMDEwMDAwMDBaMCExDTALBgNVBAoMBEdvb2QxEDAOBgNVBAMMB0ROIFJvb3Qw\n",
+    "KjAFBgMrZXADIQAHOZB7MwZT42ulAt8qjP7BAC2RWF7SwEa3Wgaz4joJFaNIMEYw\n",
+    "DwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwIwYDVR0eAQH/BBkwF6AV\n",
+    "MBOkETAPMQ0wCwYDVQQKDARHb29kMAUGAytlcANBAMqdrpSV9fLPmJoL7QJ7/agM\n",
+    "SVBdF1OxJRLlcaFnYZhzmHUUd8ZS1kH9/DEMyUI023NJ6+rW2/M8Xl6nwpl9UA8=\n",
+    "-----END CERTIFICATE-----\n",
+];
+let DN_LEAF_PEM: [9][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIBLjCB4aADAgECAhRckP1wX4ZqbPZOlYE6sqtY8BctHzAFBgMrZXAwITENMAsG\n",
+    "A1UECgwER29vZDEQMA4GA1UEAwwHRE4gUm9vdDAeFw0yNjAxMDEwMDAwMDBaFw0z\n",
+    "NjAxMDEwMDAwMDBaMCMxDTALBgNVBAoMBEV2aWwxEjAQBgNVBAMMCWV2aWwudGVz\n",
+    "dDAqMAUGAytlcAMhAKK6QJEyPBjbcusS/nn8VTuzjHovGEWurCMVm/a8PrxZoykw\n",
+    "JzAMBgNVHRMBAf8EAjAAMBcGA1UdEQEB/wQNMAuCCWV2aWwudGVzdDAFBgMrZXAD\n",
+    "QQBNQJuKxOs1hcGRqb+F3DJjXThv5460F3xWT8TJ5K5MPFatFaEka5wVTVpkLCR5\n",
+    "cvxMAFzkbsSGOTNWMnWJvJcG\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+// A certificate with 32 extensions and then basicConstraints twice.
+let DUP_EXT_PEM: [20][]u8 = [
+    "-----BEGIN CERTIFICATE-----\n",
+    "MIIDUTCCAvagAwIBAgIBATAKBggqhkjOPQQDAjAMMQowCAYDVQQDDAF0MB4XDTIw\n",
+    "MDEwMTAwMDAwMFoXDTMwMDEwMTAwMDAwMFowDDEKMAgGA1UEAwwBdDBZMBMGByqG\n",
+    "SM49AgEGCCqGSM49AwEHA0IABPqSHKFV7Kd0sLp1V2ibcIxbpOmZjCFtFZtd6vIq\n",
+    "jBf0c5N+//mL8gl2k4++BqDNKiJCHp9bNKQ/wx/NS7N2RJWjggJHMIICQzAPBgkr\n",
+    "BgEEAYaNH2QEAgUAMA8GCSsGAQQBho0fZQQCBQAwDwYJKwYBBAGGjR9mBAIFADAP\n",
+    "BgkrBgEEAYaNH2cEAgUAMA8GCSsGAQQBho0faAQCBQAwDwYJKwYBBAGGjR9pBAIF\n",
+    "ADAPBgkrBgEEAYaNH2oEAgUAMA8GCSsGAQQBho0fawQCBQAwDwYJKwYBBAGGjR9s\n",
+    "BAIFADAPBgkrBgEEAYaNH20EAgUAMA8GCSsGAQQBho0fbgQCBQAwDwYJKwYBBAGG\n",
+    "jR9vBAIFADAPBgkrBgEEAYaNH3AEAgUAMA8GCSsGAQQBho0fcQQCBQAwDwYJKwYB\n",
+    "BAGGjR9yBAIFADAPBgkrBgEEAYaNH3MEAgUAMA8GCSsGAQQBho0fdAQCBQAwDwYJ\n",
+    "KwYBBAGGjR91BAIFADAPBgkrBgEEAYaNH3YEAgUAMA8GCSsGAQQBho0fdwQCBQAw\n",
+    "DwYJKwYBBAGGjR94BAIFADAPBgkrBgEEAYaNH3kEAgUAMA8GCSsGAQQBho0fegQC\n",
+    "BQAwDwYJKwYBBAGGjR97BAIFADAPBgkrBgEEAYaNH3wEAgUAMA8GCSsGAQQBho0f\n",
+    "fQQCBQAwDwYJKwYBBAGGjR9+BAIFADAPBgkrBgEEAYaNH38EAgUAMBAGCisGAQQB\n",
+    "ho0fgQAEAgUAMBAGCisGAQQBho0fgQEEAgUAMBAGCisGAQQBho0fgQIEAgUAMBAG\n",
+    "CisGAQQBho0fgQMEAgUAMAwGA1UdEwEB/wQCMAAwDwYDVR0TAQH/BAUwAwEB/zAK\n",
+    "BggqhkjOPQQDAgNJADBGAiEAqfxK1fTxVvozhiLZjAPaKbGBYyk8gS8zQLz0R39H\n",
+    "AeoCIQDnA20AxAYzY++9l0OBKs34Lzqk25J4ysGtuYwcp+2/5A==\n",
+    "-----END CERTIFICATE-----\n",
+];
+
+fn wildcard_path(sub: [][]u8, leaf: [][]u8, hostname: []u8) !void {
+    let mut roots = CertPool.init();
+    defer roots.deinit();
+    let rt = join(WC_ROOT_PEM[..])!;
+    defer mem.free(rt);
+    _ = roots.add_pem(rt)!;
+    let mut chain: [2]Certificate = [cert_of(leaf)!, cert_of(sub)!];
+    defer chain[0].deinit();
+    defer chain[1].deinit();
+    return verify_chain(chain[..], &roots, hostname, time.date(2030, 1, 1, 0, 0, 0)!);
+}
+
+test "name constraints and wildcards" {
+    @expect(fails_with(wildcard_path(WC_SUB_A_PEM[..], WC_LEAF_PEM[..], "victim.example.com"), error.NameConstraint));
+    @expect(fails_with(wildcard_path(WC_SUB_A_PEM[..], WC_LEAF_PEM[..], "a.example.com"), error.NameConstraint));
+    @expect(fails_with(wildcard_path(WC_SUB_COM_PEM[..], WC_LEAF_COM_PEM[..], "x.com"), error.NameConstraint));
+    wildcard_path(WC_SUB_PARENT_PEM[..], WC_LEAF_PEM[..], "victim.example.com")!;
+    wildcard_path(WC_SUB_DOT_PEM[..], WC_LEAF_PEM[..], "victim.example.com")!;
+    @expect(fails_with(wildcard_path(WC_SUB_DOT_PEM[..], WC_LEAF_COM_PEM[..], "x.com"), error.NameConstraint));
+}
+
+test "unsupported name constraints" {
+    let mut roots = CertPool.init();
+    defer roots.deinit();
+    let rt = join(DN_ROOT_PEM[..])!;
+    defer mem.free(rt);
+    @expect_eq(roots.add_pem(rt)!, 1);
+    @expect(roots.certs.items()[0].constraints_unsupported);
+    let mut chain: [1]Certificate = [cert_of(DN_LEAF_PEM[..])!];
+    defer chain[0].deinit();
+    @expect(fails_with(verify_chain(chain[..], &roots, "evil.test", time.date(2030, 1, 1, 0, 0, 0)!),
+                       error.NameConstraint));
+}
+
+test "duplicate extensions" {
+    let mut c = cert_of(DUP_EXT_PEM[..]) catch |e| {
+        @expect_eq(e, error.InvalidCertificate);
+        return;
+    };
+    c.deinit();
+    @trap();
+}
+
+test "key usage bits" {
+    let mut c = cert_of(LEAF_PEM[..])!;
+    defer c.deinit();
+    // keyCertSign and cRLSign: 1 unused bit
+    @expect(c.extension(OID_KEY_USAGE, "\x03\x02\x01\x06")!);
+    @expect_eq(c.key_usage, KU_KEY_CERT_SIGN | (1 << 6));
+    // digitalSignature, with the unused bits honoured
+    @expect(c.extension(OID_KEY_USAGE, "\x03\x02\x07\x80")!);
+    @expect_eq(c.key_usage, KU_DIGITAL_SIGNATURE);
+    let bad: [4][]u8 = ["\x03\x02\x01\x07", "\x03\x02\x08\x00", "\x03\x01\x01", "\x03\x02\x02\x06"];
+    for b in bad {
+        _ = c.extension(OID_KEY_USAGE, b) catch continue;
+        @trap();
+    }
 }
 
 test "private keys" {

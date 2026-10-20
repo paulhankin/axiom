@@ -29,6 +29,8 @@ pub error FsError { NotFound, PermissionDenied, Exists, NotADirectory, IsDirecto
 
 import host "axiom" {
     fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32;
+    fn ax_fstat(fd: i32, out: *mut i64) i32;
+    fn ax_create(path: *u8, len: usize, mode: u32) i32;
     fn ax_mkdir(path: *u8, len: usize, mode: u32) i32;
     fn ax_remove(path: *u8, len: usize, dir: u32) i32;
     fn ax_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32;
@@ -122,6 +124,20 @@ fn stat_with(p: []u8, follow: u32) FsError!Info {
     if r < 0 {
         return fail(@as(i64, r));
     }
+    return info_from(out);
+}
+
+// Information about an open file.
+fn fstat(f: io.File) FsError!Info {
+    let mut out: [4]i64 = [0; 4];
+    let r = ax_fstat(f.fd, &mut out[0]);
+    if r < 0 {
+        return fail(@as(i64, r));
+    }
+    return info_from(out);
+}
+
+fn info_from(out: [4]i64) Info {
     return Info.{
         kind: kind_from_host(@bit_cast(u64, out[0])),
         size: @bit_cast(u64, out[1]),
@@ -196,11 +212,18 @@ pub fn append_file(p: []u8, data: []u8) FsError!void {
     f.writer().write_all(data) catch |e| return map_io(e);
 }
 
-/// Copies a file's contents to another (created or truncated).
+/// Copies a file's contents to another (created or truncated). A new file
+/// gets the source's permission bits (less the umask); an existing one keeps
+/// its own.
 pub fn copy_file(from: []u8, to: []u8) FsError!void {
     let src = io.open(from) catch |e| return map_io(e);
     defer src.close();
-    let dst = io.create(to) catch |e| return map_io(e);
+    let info = fstat(src)!;
+    let fd = ax_create(to.ptr, to.len, info.mode & 0o777);
+    if fd < 0 {
+        return fail(@as(i64, fd));
+    }
+    let dst = io.File.{ fd: fd };
     defer dst.close();
     let buf = mem.alloc.[u8](1 << 16)!;
     defer mem.free(buf);
@@ -879,16 +902,24 @@ pub struct Mapping {
     }
 }
 
-/// Maps the whole of the file at p (read-only unless writable).
+/// Maps the whole of the regular file at p (read-only unless writable), as
+/// large as it was when opened. Another process that truncates the file
+/// meanwhile makes the mapping fault: touching a page past the new end is a
+/// bus error.
 pub fn map(p: []u8, writable: bool) FsError!Mapping {
-    let info = stat(p)!;
-    if info.kind != Kind.FILE {
+    // (stat first, so as not to open a FIFO, which would wait for a writer;
+    // the size and kind that count are those of the file opened)
+    if stat(p)!.kind != Kind.FILE {
         return error.IsDirectory;
     }
-    let mut f = io.open(p) catch |e| return fail_io(e);
-    if writable {
+    let f = open_for(p, writable) catch |e| return fail_io(e);
+    let info = fstat(f) catch |e| {
         f.close();
-        f = io.open_update(p) catch |e| return fail_io(e);
+        return e;
+    };
+    if info.kind != Kind.FILE {
+        f.close();
+        return error.IsDirectory;
     }
     let n = @truncate(usize, info.size);
     if (n == 0) or (@as(u64, n) != info.size) {
@@ -918,6 +949,13 @@ pub fn map(p: []u8, writable: bool) FsError!Mapping {
         return error.IoError;
     };
     return Mapping.{ data: data, file: f, mapped: false, writable: writable };
+}
+
+fn open_for(p: []u8, writable: bool) io.IoError!io.File {
+    if writable {
+        return io.open_update(p);
+    }
+    return io.open(p);
 }
 
 fn fail_io(e: error) FsError {
@@ -1200,6 +1238,11 @@ test "permissions, links and times" {
         @expect(stat(f)!.mode == 0o400);
         chmod(f, 0o600)!;
         @expect(stat(f)!.mode == 0o600);
+        // a copy of a private file is private too
+        let c = path.join2(dir, "copy.txt")!;
+        defer mem.free(c);
+        copy_file(f, c)!;
+        @expect(stat(c)!.mode == 0o600);
     }
     chmod(f, 0o644)!;
     @expect(stat(f)!.mode == 0o644);
@@ -1297,6 +1340,12 @@ test "locks and mappings" {
     let mut z = map(e, false)!;
     @expect(z.data.len == 0);
     z.deinit();
+    let mut d = map(dir, false) catch |err| {
+        @expect(err == error.IsDirectory);
+        return;
+    };
+    d.deinit();
+    @expect(false);
 }
 
 test "watching" {

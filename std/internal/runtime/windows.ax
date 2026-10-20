@@ -500,6 +500,13 @@ export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
     return fd;
 }
 
+// Creates (or truncates) a file for writing. (Windows has no permission
+// bits: a new file gets its directory's access control list.)
+export fn ax_create(path: *u8, len: usize, mode: u32) i32 {
+    _ = mode;
+    return ax_open(path, len, 1);
+}
+
 export fn ax_close(fd: i32) void {
     let e = entry(fd, K_FILE);
     if @int_from_ptr(e) != 0 {
@@ -586,6 +593,38 @@ export fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32 {
     }
     o[1] = @bit_cast(i64, size);
     o[2] = ft_ns(mtime);
+    o[3] = mode;
+    return 0;
+}
+
+// As ax_stat, for an open file.
+export fn ax_fstat(fd: i32, out: *mut i64) i32 {
+    let h = file_handle(fd);
+    if (h == INVALID) or (h == 0) {
+        return AX_ERR;
+    }
+    // BY_HANDLE_FILE_INFORMATION: attributes, three times, volume, size
+    // (high, low), links, index
+    let mut bi: [52]u8 = [0; 52];
+    if GetFileInformationByHandle(h, &mut bi[0]) == 0 {
+        return fs_err();
+    }
+    let attrs = le32(bi[..], 0);
+    let o = @slice_from_ptr(out, 4);
+    let mut mode: i64 = 0o644;
+    o[0] = 1;
+    o[1] = @bit_cast(i64, (@as(u64, le32(bi[..], 32)) << 32) | @as(u64, le32(bi[..], 36)));
+    if (attrs & FA_DIRECTORY) != 0 {
+        o[0] = 2;
+        o[1] = 0;
+        mode = 0o755;
+    } else if GetFileType(h) != 1 {  // FILE_TYPE_DISK
+        o[0] = 4;
+    }
+    if (attrs & FA_READONLY) != 0 {
+        mode = mode & 0o555;
+    }
+    o[2] = ft_ns(le64(bi[..], 20));
     o[3] = mode;
     return 0;
 }
@@ -1057,9 +1096,28 @@ export fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
     return to_abi(&v[0], @as(usize, n), buf, cap, false);
 }
 
+// Removes every entry for name (the initial environment can hold several, and
+// SetEnvironmentVariableW removes one).
+fn env_unset(name: *u16) bool {
+    for _k in @as(u32, 0)..64 {
+        SetLastError(0);
+        let mut v: [1]u16 = [0];
+        if (GetEnvironmentVariableW(name, &mut v[0], 1) == 0) and (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            return true;
+        }
+        if SetEnvironmentVariableW(name, @ptr_from_int(*u16, 0)) == 0 {
+            return GetLastError() == ERROR_ENVVAR_NOT_FOUND;
+        }
+    }
+    return false;
+}
+
 export fn ax_setenv(k: *u8, kn: usize, v: *u8, vn: usize) i32 {
     let mut name: [1024]u16 = [0; 1024];
     if not env_name_ok(@slice_from_ptr(k, kn)) or not wpath(k, kn, name[..]) {
+        return AX_ERR;
+    }
+    if not env_unset(&name[0]) {
         return AX_ERR;
     }
     let value = @ptr_cast(*mut u16, malloc((vn + 1) * 2));
@@ -1082,10 +1140,7 @@ export fn ax_unsetenv(k: *u8, kn: usize) i32 {
     if not env_name_ok(@slice_from_ptr(k, kn)) or not wpath(k, kn, name[..]) {
         return AX_ERR;
     }
-    if SetEnvironmentVariableW(&name[0], @ptr_from_int(*u16, 0)) != 0 {
-        return 0;
-    }
-    if GetLastError() == ERROR_ENVVAR_NOT_FOUND {
+    if env_unset(&name[0]) {
         return 0;
     }
     return AX_ERR;
@@ -1305,6 +1360,22 @@ fn search_path(body: []u8, env_at: usize, name: []u8, out: []mut u16) bool {
     return false;
 }
 
+// Whether a program name is a batch file: it ends in .bat or .cmd (in any
+// case), ignoring the dots and spaces Windows drops from the end of a name.
+fn is_batch(name: []u8) bool {
+    let mut n = name.len;
+    while (n > 0) and ((name[n - 1] == '.') or (name[n - 1] == ' ')) {
+        n -= 1;
+    }
+    if (n < 4) or (name[n - 4] != '.') {
+        return false;
+    }
+    let a = name[n - 3] | 0x20;
+    let b = name[n - 2] | 0x20;
+    let c = name[n - 1] | 0x20;
+    return ((a == 'b') and (b == 'a') and (c == 't')) or ((a == 'c') and (b == 'm') and (c == 'd'));
+}
+
 let mut spawn_lock: usize = 0;
 
 // An inheritable copy of h for a child (0 on failure).
@@ -1374,8 +1445,22 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
             has_sep = true;
         }
     }
+    // cmd.exe runs a batch file, and would read the arguments as commands
+    // (there is no quoting that is safe for every argument)
+    if is_batch(prog) {
+        free(@ptr_cast(*mut void, cmd.p));
+        free(@ptr_cast(*mut void, env.p));
+        return -22;
+    }
+    // a bare name is found on the PATH or not at all (CreateProcessW would
+    // also look in the current directory)
     if not has_sep {
         has_app = search_path(body, env_at, prog, app[..]);
+        if not has_app {
+            free(@ptr_cast(*mut void, cmd.p));
+            free(@ptr_cast(*mut void, env.p));
+            return -2;
+        }
     }
     lock(&mut spawn_lock);
     // the standard streams

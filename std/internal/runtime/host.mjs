@@ -334,6 +334,16 @@ export function createHost(opts = {}) {
   const shared = opts.shared || { args: opts.args || [], pos: new SharedArrayBuffer(POS_FDS * 8) };
   const programArgs = shared.args;
   const pos = new SharedPositions(shared.pos);
+  // ax_stat's out[0..4]: kind, size, modification time, permission bits
+  const statOut = (st, out) => {
+    const kind = st.isFile() ? 1n : st.isDirectory() ? 2n : st.isSymbolicLink() ? 3n : 4n;
+    const dv = new DataView(memory.buffer);
+    const o = Number(out);
+    dv.setBigInt64(o, kind, true);
+    dv.setBigInt64(o + 8, st.size, true);
+    dv.setBigInt64(o + 16, st.mtimeNs, true);
+    dv.setBigInt64(o + 24, st.mode & 0o7777n, true);
+  };
   const fsErr = (e) => ({ ENOENT: -2, EACCES: -13, EPERM: -13, EEXIST: -17, ENOTDIR: -20, EISDIR: -21, ENOTEMPTY: -39, ELOOP: -40 })[e && e.code] || -1;
   // Directory handles (see ax_dir_open): a descriptor of the directory,
   // opened without following links, pins it. Node has no openat, so names
@@ -406,6 +416,15 @@ export function createHost(opts = {}) {
         return fsErr(e);
       }
     },
+    ax_create(p, n, mode) {
+      try {
+        const fd = fs.openSync(str(p, n), 'w', mode & 0o777);
+        pos.set(fd, 0);
+        return fd;
+      } catch (e) {
+        return fsErr(e);
+      }
+    },
     ax_close(fd) {
       pos.delete(fd);
       try { fs.closeSync(fd); } catch { /* ignore */ }
@@ -427,18 +446,14 @@ export function createHost(opts = {}) {
     ax_stat(p, n, follow, out) {
       try {
         const path = str(p, n);
-        const st = follow ? fs.statSync(path, { bigint: true }) : fs.lstatSync(path, { bigint: true });
-        const kind = st.isFile() ? 1n : st.isDirectory() ? 2n : st.isSymbolicLink() ? 3n : 4n;
-        const dv = new DataView(memory.buffer);
-        const o = Number(out);
-        dv.setBigInt64(o, kind, true);
-        dv.setBigInt64(o + 8, st.size, true);
-        dv.setBigInt64(o + 16, st.mtimeNs, true);
-        dv.setBigInt64(o + 24, st.mode & 0o7777n, true);
+        statOut(follow ? fs.statSync(path, { bigint: true }) : fs.lstatSync(path, { bigint: true }), out);
         return 0;
       } catch (e) {
         return fsErr(e);
       }
+    },
+    ax_fstat(fd, out) {
+      try { statOut(fs.fstatSync(fd, { bigint: true }), out); return 0; } catch (e) { return fsErr(e); }
     },
     ax_mkdir(p, n, mode) {
       try { fs.mkdirSync(str(p, n), { mode: mode & 0o7777 }); return 0; } catch (e) { return fsErr(e); }
@@ -594,6 +609,26 @@ export function createHost(opts = {}) {
         if (k > 0) env[e.slice(0, k)] = e.slice(k + 1);
       }
       const view = new Int32Array(memory.buffer, stdio >>> 0, 3);
+      if (process.platform === 'win32' && argv.length) {
+        // cmd.exe runs a batch file, and would read the arguments as commands
+        if (/\.(bat|cmd)[. ]*$/i.test(argv[0])) {
+          view.fill(-1);
+          return -22;
+        }
+        // a bare name is found on the child's PATH or not at all (node would
+        // also look in the current directory)
+        if (!/[\\/:]/.test(argv[0])) {
+          const pv = Object.entries(env).find(([k]) => k.toUpperCase() === 'PATH');
+          const found = (pv ? pv[1] : '').split(';').filter((d) => d)
+            .flatMap((d) => [`${d}\\${argv[0]}`, `${d}\\${argv[0]}.exe`])
+            .find((f) => { try { return fs.statSync(f).isFile(); } catch { return false; } });
+          if (!found) {
+            view.fill(-1);
+            return -2;
+          }
+          argv[0] = found;
+        }
+      }
       const modes = Array.from(view);
       const c = net();
       const h = c.call('spawn', { argv, env, cwd, modes });

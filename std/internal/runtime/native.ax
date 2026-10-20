@@ -114,6 +114,21 @@ export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
     return AX_ERR;
 }
 
+// Creates (or truncates) a file for writing; a new file gets the permission
+// bits mode (less the umask).
+export fn ax_create(path: *u8, len: usize, mode: u32) i32 {
+    let mut buf: [4096]u8 = [0; 4096];
+    if not copy_cstr(buf[..], path, len) {
+        return AX_ERR;
+    }
+    // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+    let fd = sys.open(&buf[0], ((1 | 0x40) | 0x200) | 0x80000, @bit_cast(i32, mode & 0o777));
+    if fd >= 0 {
+        return @truncate(i32, fd);
+    }
+    return fs_err(fd);
+}
+
 export fn ax_close(fd: i32) void {
     _ = sys.close(fd);
 }
@@ -177,7 +192,24 @@ export fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32 {
     if r < 0 {
         return fs_err(r);
     }
-    let mode = rd16(st[..], 28);
+    stat_out(st[..], out);
+    return 0;
+}
+
+// As ax_stat, for an open file.
+export fn ax_fstat(fd: i32, out: *mut i64) i32 {
+    let mut st: [256]u8 = [0; 256];
+    let r = sys.fstatx(fd, &mut st[0]);
+    if r < 0 {
+        return fs_err(r);
+    }
+    stat_out(st[..], out);
+    return 0;
+}
+
+// ax_stat's out[0..4] from a struct statx.
+fn stat_out(st: []u8, out: *mut i64) void {
+    let mode = rd16(st, 28);
     let fmt = mode & 0o170000;
     let mut kind: i64 = 4;
     if fmt == 0o100000 {
@@ -189,11 +221,10 @@ export fn ax_stat(path: *u8, len: usize, follow: u32, out: *mut i64) i32 {
     }
     let o = @slice_from_ptr(out, 4);
     o[0] = kind;
-    o[1] = @bit_cast(i64, rd64(st[..], 40));
+    o[1] = @bit_cast(i64, rd64(st, 40));
     // (nanoseconds overflow 64 bits for times past 2262: saturate)
-    o[2] = @add_sat(@mul_sat(@bit_cast(i64, rd64(st[..], 112)), 1000000000), @as(i64, rd32(st[..], 120)));
+    o[2] = @add_sat(@mul_sat(@bit_cast(i64, rd64(st, 112)), 1000000000), @as(i64, rd32(st, 120)));
     o[3] = @as(i64, mode & 0o7777);
-    return 0;
 }
 
 export fn ax_mkdir(path: *u8, len: usize, mode: u32) i32 {
@@ -1314,18 +1345,26 @@ fn env_find(name: []u8, start: *mut usize, end: *mut usize) void {
     end.* = 0;
 }
 
+// Removes every entry for name (the initial environment can hold several).
 fn env_remove(name: []u8) void {
-    let mut a: usize = 0;
-    let mut e: usize = 0;
-    env_find(name, &mut a, &mut e);
-    if e > a {
-        let b = env_bytes();
-        let n = env_len - e;
-        for k in @as(usize, 0)..n {
-            b[a + k] = b[e + k];
+    let b = env_bytes();
+    let mut i: usize = 0;
+    let mut n: usize = 0;
+    while i < env_len {
+        let mut j = i;
+        while b[j] != 0 {
+            j += 1;
         }
-        env_len -= e - a;
+        let e = b[i..j];
+        if not ((e.len > name.len) and (e[name.len] == '=') and @mem_eq(e[..name.len], name)) {
+            for k in i..j + 1 {
+                b[n + (k - i)] = b[k];
+            }
+            n += (j + 1) - i;
+        }
+        i = j + 1;
     }
+    env_len = n;
 }
 
 fn env_name_ok(name: []u8) bool {

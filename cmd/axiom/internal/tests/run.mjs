@@ -1133,7 +1133,20 @@ if (!skipPlatform) {
       }
       fs.writeFileSync(path.join(app, 'axiom.toml'), manifest('0'.repeat(40)));
       const codes = errorCodes(app);
-      return codes.includes('E0216') ? null : `bad rev: ${codes.join()}`;
+      if (!codes.includes('E0216')) return `bad rev: ${codes.join()}`;
+      // a revision that is not a full hash names a path in the cache (':/text' picks a commit by its message)
+      fs.writeFileSync(path.join(app, 'axiom.toml'), manifest(':/../../escape'));
+      const short = errorCodes(app);
+      return short.length === 1 && short[0] === 'E0215' ? null : `rev ':/...': ${short.join()}`;
+    },
+    'no manifest from a directory anyone may write to': async () => {
+      const shared = path.join(tmp, 'shared');
+      fs.mkdirSync(path.join(shared, 'work'), { recursive: true });
+      fs.chmodSync(shared, 0o1777);
+      fs.writeFileSync(path.join(shared, 'axiom.toml'), '[package]\nname = "planted"\n\n[dependencies]\nx = { path = "missing" }\n');
+      fs.writeFileSync(path.join(shared, 'work/main.ax'), 'export fn main() i32 {\n    return 0;\n}\n');
+      const codes = errorCodes(path.join(shared, 'work/main.ax'));
+      return codes.length === 0 ? null : codes.join();
     },
     'axiom new': async () => {
       const c = ph(['new', 'fresh'], tmp);

@@ -150,7 +150,20 @@ const char *pkg_cache_dir(void) {
     const char *x = getenv("XDG_CACHE_HOME");
     if (x && *x) return arena_printf("%s/axiom", x);
     const char *h = getenv("HOME");
-    return arena_printf("%s/.cache/axiom", h && *h ? h : "/tmp");
+    if (h && *h) return arena_printf("%s/.cache/axiom", h);
+    // No home: a directory of this run's own, since a shared one in /tmp
+    // could hold another user's objects and checkouts.
+    static const char *run_cache;
+    if (!run_cache) {
+        const char *t = getenv("TMPDIR");
+        char *d = (char *)arena_printf("%s/axiom-cache-XXXXXX", t && *t ? t : "/tmp");
+        if (!mkdtemp(d)) {
+            fprintf(stderr, "axiom: no cache directory: set AXIOM_CACHE or HOME\n");
+            exit(2);
+        }
+        run_cache = d;
+    }
+    return run_cache;
 }
 
 static void mkdirs(const char *path) {
@@ -166,7 +179,17 @@ static void mkdirs(const char *path) {
     mkdir(buf, 0755);
 }
 
+// Is s a full commit hash (SHA-1 or SHA-256)?
+static bool is_commit(const char *s) {
+    size_t n = strlen(s);
+    if (n != 40 && n != 64) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!isdigit((unsigned char)s[i]) && !(s[i] >= 'a' && s[i] <= 'f')) return false;
+    return true;
+}
+
 static const char *fetch_git(const char *url, const char *rev, Span sp) {
+    if (!is_commit(rev) || url[0] == '-') return NULL;  // (reported with the manifest)
     char key[256];
     int k = 0;
     for (const char *p = url; *p && k < 150; p++) key[k++] = isalnum((unsigned char)*p) ? *p : '_';
@@ -175,7 +198,7 @@ static const char *fetch_git(const char *url, const char *rev, Span sp) {
     if (is_file(arena_printf("%s/axiom.toml", dir))) return dir;  // cached
     mkdirs(arena_printf("%s/git", pkg_cache_dir()));
     const char *tmp = arena_printf("%s.tmp%d", dir, (int)getpid());
-    char *clone[] = {"git", "clone", "--quiet", (char *)url, (char *)tmp, NULL};
+    char *clone[] = {"git", "clone", "--quiet", "--", (char *)url, (char *)tmp, NULL};
     char *co[] = {"git", "-C", (char *)tmp, "-c", "advice.detachedHead=false", "checkout", "--quiet", (char *)rev, NULL};
     if (run_quiet(clone) != 0 || run_quiet(co) != 0) {
         char *rm[] = {"rm", "-rf", (char *)tmp, NULL};
@@ -304,6 +327,9 @@ Package *pkg_load_dir(const char *dir_in, Span *from) {
             if (!d.path && !d.git) perr(&P, ks, ke, "a dependency needs path = \"...\" or git = \"...\"");
             if (d.git && !d.rev)
                 perr(&P, ks, ke, "git dependencies must pin a commit: rev = \"<full commit hash>\"");
+            else if (d.git && !is_commit(d.rev))  // (a cache directory's name; git takes ':/text' too)
+                perr(&P, ks, ke, "rev must be a full commit hash: 40 or 64 lower-case hex digits");
+            if (d.git && d.git[0] == '-') perr(&P, ks, ke, "a git URL cannot start with '-'");
             for (int i = 0; i < specs.len; i++)
                 if (specs.data[i].name == d.name) perr(&P, ks, ke, "duplicate dependency");
             vec_push(specs, d);
@@ -352,6 +378,8 @@ Package *pkg_load_dir(const char *dir_in, Span *from) {
     return p;
 }
 
+// The package containing file_path (nearest axiom.toml above it), or NULL.
+// The search stops at a directory anyone may write to.
 Package *pkg_for_file(const char *file_path) {
     char dir[PATH_MAX];
     if (!realpath(file_path, dir)) return NULL;
@@ -362,6 +390,9 @@ Package *pkg_for_file(const char *file_path) {
         if (!dir[0]) return NULL;
         Package *p = symmap_get(&pkg_by_dir, intern_cstr(dir));
         if (p) return p;
+        // (a manifest in a directory anyone may write to, like /tmp, could be anyone's)
+        struct stat st;
+        if (stat(dir, &st) != 0 || (st.st_mode & S_IWOTH)) return NULL;
         if (is_file(arena_printf("%s/axiom.toml", dir))) return pkg_load_dir(dir, NULL);
     }
 }

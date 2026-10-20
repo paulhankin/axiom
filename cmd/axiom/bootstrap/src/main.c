@@ -444,10 +444,18 @@ static int spawn_program(char *const argv[], char *const envp[], bool out_to_err
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
+// A new directory under the temporary directory that only this user can
+// enter, for the programs axiom test and axiom profile build and run: a
+// predictable name in a shared /tmp could be taken over by another user.
+static const char *private_tmp_dir(const char *prefix) {
+    const char *t = getenv("TMPDIR");
+    char *d = (char *)arena_printf("%s/%sXXXXXX", t && *t ? t : "/tmp", prefix);
+    return mkdtemp(d) ? d : NULL;
+}
+
 static int run_profile(const char *bin, char **prog_args, int nprog_args, const char *std_dir, const char *folded_path,
                        int hz, bool json) {
-    const char *tmpdir = getenv("TMPDIR");
-    const char *raw = arena_printf("%s/axiom-profile-%d.raw", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid());
+    const char *raw = arena_printf("%s.raw", bin);  // (in the private directory bin is in)
     unlink(raw);
     Vec(char *) av = {0};
     Vec(char *) env = {0};
@@ -884,6 +892,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     char test_bin[PATH_MAX];
+    const char *run_dir = NULL;  // axiom test and profile: a private directory for the program
     if (profiling) {
         if (!final_link) {
             diag_emit_fatal(json, "E9001", "axiom profile builds and runs the program; --emit is not supported");
@@ -902,9 +911,12 @@ int main(int argc, char **argv) {
                 folded_path = arena_printf("%.*s.folded", (int)n, base);
             }
         }
-        const char *tmpdir = getenv("TMPDIR");
-        snprintf(test_bin, sizeof test_bin, "%s/axiom-profile-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
-                 g_target.wasm ? ".wasm" : "");
+        run_dir = private_tmp_dir("axiom-profile-");
+        if (!run_dir) {
+            diag_emit_fatal(json, "E9001", "cannot make a private directory for the program");
+            return 2;
+        }
+        snprintf(test_bin, sizeof test_bin, "%s/program%s", run_dir, g_target.wasm ? ".wasm" : "");
         out = test_bin;
         if (!g_target.wasm) {
             const char *pr = arena_printf("%s/internal/runtime/profile.c", so.std_dir);
@@ -920,9 +932,12 @@ int main(int argc, char **argv) {
             diag_emit_fatal(json, "E9001", "axiom test builds and runs a test binary; --emit is not supported");
             return 2;
         }
-        const char *tmpdir = getenv("TMPDIR");
-        snprintf(test_bin, sizeof test_bin, "%s/axiom-test-%d%s", tmpdir && *tmpdir ? tmpdir : "/tmp", (int)getpid(),
-                 g_target.wasm ? ".wasm" : "");
+        run_dir = private_tmp_dir("axiom-test-");
+        if (!run_dir) {
+            diag_emit_fatal(json, "E9001", "cannot make a private directory for the program");
+            return 2;
+        }
+        snprintf(test_bin, sizeof test_bin, "%s/tests%s", run_dir, g_target.wasm ? ".wasm" : "");
         out = test_bin;
         if (!g_target.wasm) {
             const char *tm = arena_printf("%s/internal/runtime/test_main.c", so.std_dir);
@@ -1102,11 +1117,13 @@ int main(int argc, char **argv) {
     if (testing) {
         int rc = run_tests(out, so.std_dir, test_filter, test_timeout, json, show_output);
         unlink(out);
+        rmdir(run_dir);
         return rc;
     }
     if (profiling) {
         int rc = run_profile(out, prog_args, nprog_args, so.std_dir, folded_path, prof_hz, json);
         unlink(out);
+        rmdir(run_dir);
         return rc;
     }
     diag_emit(json, json ? stdout : stderr);

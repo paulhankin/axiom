@@ -68,11 +68,12 @@ schedule).
 |---|---|
 | http server | strict `Content-Length` and `Transfer-Encoding` parsing (no duplicates, no `Transfer-Encoding` on HTTP/1.0, strict chunk sizes) against request smuggling; exactly one `Host`; control characters refused in headers; at most 100 trailers; a request deadline (`Options.request_timeout_ms`) against slowloris |
 | http client | methods, headers and URLs validated (no CR, LF or spaces); host names limited to letters, digits, `-` and `.` |
-| http router | `..`, `/` and NUL refused in path parameters (except `*`), so `/files/:name` cannot escape |
+| http router | `..`, `\`, `:` and NUL refused in path parameters, and `/` except in `*`, so `/files/:name` cannot escape (nor name a drive or a stream on Windows) |
 | tls | post-handshake messages capped at 64 KiB; ChangeCipherSpec accepted only as a single `0x01` before the handshake completes; a 20 s handshake deadline; ALPN must be one that was offered; `RecordOverflow` on oversized inner plaintext; no handshake bytes carried across a key change; KeyUpdate validated; NewSessionTicket accepted by clients only |
 | tls client | the server's session id echo must match; the ServerHello after a HelloRetryRequest must keep its suite and group |
-| x509 | at most 64 signature checks while building a path; a CA's name constraints checked against every certificate below it in the path (the leaf and the intermediates, not self-issued ones), names trimmed of a trailing dot and wildcards checked as a representative name; trailing data and duplicate extensions refused |
-| rsa, der, base64, hmac, aes-gcm, chacha20-poly1305 | huge public exponents, non-minimal integers, loose padding, HKDF output past `255 * n` and messages past the AEAD limits are refused (or trap, where they are programming errors) |
+| x509 | at most 64 signature checks while building a path; a CA's name constraints checked against every certificate below it in the path (the leaf and the intermediates, not self-issued ones), names trimmed of a trailing dot, and a wildcard `*.S` permitted only if a permitted subtree covers every name one label under S (and excluded if any such name is); a CA with name constraints of a kind not enforced (anything but DNS and IP, or a minimum or maximum) never accepted in a path; trailing data, duplicate extensions (any number of them) and non-DER KeyUsage bit strings refused |
+| rsa, der, base64, hmac, aes-gcm, chacha20-poly1305 | huge public exponents, non-minimal integers, loose padding, HKDF output past `255 * n`, messages past the AEAD limits and a ChaCha20 block counter that would wrap are refused (or trap, where they are programming errors) |
+| argon2 | memory at most `MAX_MEMORY_KIB` (4 GiB) and passes × memory at most `MAX_WORK_KIB` (16 GiB), so a stored or received hash cannot make verification allocate or run without limit (`TooExpensive`) |
 | hash maps | SipHash-1-3 with a per-process random key, against hash flooding |
 | dns | a random query id, a connected socket, and answers matched to the question |
 
@@ -84,7 +85,10 @@ schedule).
 | json | arena chunks at least as large as the allocation |
 | vec, str | `v.extend(v.items())` and `s.push_str(s.bytes())` work when the source aliases the destination |
 | c | `to_cstr` refuses an interior NUL |
-| fs | NUL refused in paths by every runtime; saturating times; temporary directories created 0700; `remove_all` and `walk` open directories relative to their parents with `O_NOFOLLOW` (`ax_dir_*`), so a symbolic link swapped in for a directory is not followed (from 32 levels down an ancestor's handle is closed and, when reopened through `..`, checked by device and inode, so a tree deeper than the descriptor limit cannot stop a cleanup); the node host pins each directory with a descriptor and resolves names through it (Linux), or checks device and inode before each use |
+| fs | NUL refused in paths by every runtime; saturating times; temporary directories created 0700; `remove_all` and `walk` open directories relative to their parents with `O_NOFOLLOW` (`ax_dir_*`), so a symbolic link swapped in for a directory is not followed (from 32 levels down an ancestor's handle is closed and, when reopened through `..`, checked by device and inode, so a tree deeper than the descriptor limit cannot stop a cleanup); the node host pins each directory with a descriptor and resolves names through it (Linux), or checks device and inode before each use; `copy_file` gives a new file the source's permission bits; `map` sizes the mapping from the file it opened |
+| process | on Windows, batch files refused (cmd.exe would read their arguments as commands) and a bare program name looked for only on the child's `PATH`; on macOS a child gets only its standard streams (`POSIX_SPAWN_CLOEXEC_DEFAULT`) |
+| environment | `unsetenv` removes every entry for a name (the initial environment can hold several); `setenv` leaves one |
+| term | `set_title` leaves out C0, DEL and C1 controls and invalid UTF-8 |
 | threads | signal alternate stacks and thread stacks freed when a thread exits |
 | log | CR, LF, C1 controls, U+2028/U+2029 and invalid UTF-8 escaped in messages and keys, so input cannot forge log lines; a failed rotation reopens the file in append mode |
 

@@ -77,19 +77,37 @@ static int32_t fs_err(void) {
     }
 }
 
+int32_t ax_create(const uint8_t *path, size_t len, uint32_t mode) {
+    char buf[4096];
+    if (copy_cstr(buf, sizeof buf, path, len)) return AX_ERR;
+    int fd = open(buf, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, (mode_t)(mode & 0777));
+    return fd >= 0 ? fd : fs_err();
+}
+
+static void stat_out(const struct stat *st, int64_t *out) {
+    out[0] = S_ISREG(st->st_mode) ? 1 : S_ISDIR(st->st_mode) ? 2 : S_ISLNK(st->st_mode) ? 3 : 4;
+    out[1] = (int64_t)st->st_size;
+    /* (nanoseconds overflow 64 bits for times past 2262: clamp) */
+    int64_t sec = (int64_t)st->st_mtim.tv_sec;
+    if (sec > 9223372035) sec = 9223372035;
+    if (sec < -9223372035) sec = -9223372035;
+    out[2] = sec * 1000000000 + st->st_mtim.tv_nsec;
+    out[3] = st->st_mode & 07777;
+}
+
 int32_t ax_stat(const uint8_t *path, size_t len, uint32_t follow, int64_t *out) {
     char buf[4096];
     if (copy_cstr(buf, sizeof buf, path, len)) return AX_ERR;
     struct stat st;
     if ((follow ? stat(buf, &st) : lstat(buf, &st)) != 0) return fs_err();
-    out[0] = S_ISREG(st.st_mode) ? 1 : S_ISDIR(st.st_mode) ? 2 : S_ISLNK(st.st_mode) ? 3 : 4;
-    out[1] = (int64_t)st.st_size;
-    /* (nanoseconds overflow 64 bits for times past 2262: clamp) */
-    int64_t sec = (int64_t)st.st_mtim.tv_sec;
-    if (sec > 9223372035) sec = 9223372035;
-    if (sec < -9223372035) sec = -9223372035;
-    out[2] = sec * 1000000000 + st.st_mtim.tv_nsec;
-    out[3] = st.st_mode & 07777;
+    stat_out(&st, out);
+    return 0;
+}
+
+int32_t ax_fstat(int32_t fd, int64_t *out) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return fs_err();
+    stat_out(&st, out);
     return 0;
 }
 
@@ -258,7 +276,9 @@ static int env_name_ok(const uint8_t *k, size_t n) {
 int32_t ax_setenv(const uint8_t *k, size_t kn, const uint8_t *v, size_t vn) {
     if (!env_name_ok(k, kn) || memchr(v, 0, vn)) return AX_ERR;
     char *name = strndup((const char *)k, kn), *value = strndup((const char *)v, vn);
-    int r = name && value ? setenv(name, value, 1) : -1;
+    // unsetenv removes every entry for the name (the initial environment can
+    // hold several), setenv only the first
+    int r = name && value && unsetenv(name) == 0 ? setenv(name, value, 1) : -1;
     free(name);
     free(value);
     return r == 0 ? 0 : AX_ERR;

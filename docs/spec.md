@@ -469,11 +469,13 @@ json = { git = "https://example.com/json.git", rev = "3f1c2a9d0e5b7c4a8f6e2d1b0c
   dependency's own manifest (`E0215`). Packages can't be renamed on import.
 - A **path** dependency is a directory, relative to the manifest's directory. A missing
   directory, or one without a manifest, is `E0217`.
-- A **git** dependency MUST pin a commit with `rev` (`E0215`). Branches and version ranges
+- A **git** dependency MUST pin a commit with `rev`, its full hash of 40 or 64 lower-case
+  hex digits (`E0215`). Branches and version ranges
   aren't accepted, so a manifest names exactly one version of each source and builds are
   reproducible without a lock file. The toolchain clones the repository once per
   `(url, rev)` into a cache directory: `$AXIOM_CACHE`, else
-  `$XDG_CACHE_HOME/axiom`, else `~/.cache/axiom`. A clone or checkout that fails is
+  `$XDG_CACHE_HOME/axiom`, else `~/.cache/axiom`, else (with no `HOME`) a new private
+  directory for the run. A clone or checkout that fails is
   `E0216`. A cached checkout is never updated in place, because its `rev` can't change.
 
 #### 4.6.2 Imports and visibility between packages
@@ -486,6 +488,8 @@ json = { git = "https://example.com/json.git", rev = "3f1c2a9d0e5b7c4a8f6e2d1b0c
   that's needed must be listed, so each manifest is a complete list of what the package
   uses.
 - A module belongs to the package whose manifest is in the nearest directory above it.
+  The search stops at a directory that anyone may write to (such as `/tmp`): a manifest
+  there could have been put there by anyone.
 - Relative and `std/` imports work as in §4.1, inside packages too.
 
 #### 4.6.3 One source per name
