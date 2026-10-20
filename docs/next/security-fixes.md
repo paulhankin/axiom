@@ -286,7 +286,7 @@
     O(n log n) once insertion sort would move them more than 4 times their count.
   - A dashed stroke made every dash along the whole path, each with its caps (a
     173-byte SVG took over 100 s). Dashes are made only near the canvas, and one stroke
-    makes at most the larger of 65,536 and half the canvas's pixels, plus 16 per point
+    makes at most the larger of 65,536 and half the canvas's pixels (up to 2^20), plus 16 per point
     of its flattened path; past that, subpaths are drawn solid. A pattern is searched
     by binary search over its running sums, so long patterns over many hidden
     stretches stay fast.
