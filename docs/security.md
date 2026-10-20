@@ -57,7 +57,8 @@ schedule).
 | Where | What std does |
 |---|---|
 | JPEG | refuses fractional chroma sampling; at most 256 progressive scans, which together may visit each block at most 32 times (refinement runs visit only nonzero coefficients); stops early on filler bytes; a file must be at least one bit per block of its frame, padded to whole MCUs and summed over components (`blocks / 8` bytes) |
-| EXR | 64-bit checked size products; tiles clamped to the image; each block decoded once (a seen-block bitmap); `raw / 2048 <= data.len`; shared PIZ scratch space |
+| AVIF | the image allocated only after its frame is decoded, which must cover the size claimed; an AV1 frame, and a grid, at most `MAX_PIXELS` (a frame's data does not bound its size: a flat frame takes a few bits per superblock); an item's extents at most the file's size, and all item data read at most twice it; a grid's tiles just cover it, each used once; items found by id in log time; one rotation, mirroring and clean aperture per item |
+| EXR | 64-bit checked size products; tiles clamped to the image; each block decoded once (a seen-block bitmap); `raw / 2048 <= data.len`; shared PIZ scratch space, of which a block touches only what its size pays for (a Huffman table of 2^8 to 2^14 entries, cleared entry by entry; long codes found by length); Huffman output past the lookup table decodes as 0 |
 | FLAC | block size at most `MAX_BLOCK` (65536); preallocation from the header capped at 1 MiB |
 | Vorbis | codebooks sorted in O(n log n) (heapsort on packed keys) |
 | fonts | GPOS kerning subtables precomputed (at most 32), never rescanned per pair; cmap format 12 arithmetic wraps and every glyph id is checked against `numGlyphs`; CFF INDEX `offSize` must be 1 to 4, with saturating offsets |

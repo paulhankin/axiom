@@ -7,6 +7,7 @@
 // =============================================================================
 
 import "../../../../mem.ax" as mem;
+import "../../../image.ax" as image;
 import "cdf.ax" as c;
 import "itx.ax" as itx;
 import "msac.ax" as ms;
@@ -179,6 +180,7 @@ pub struct Dec {
     qm_on: bool,
     qm: []mut u8,  // [plane][tx] tables, at qm_off
     qm_off: [57]u32,
+    qm_used: usize,
     lflvl: [32]u32,  // [segment][y vertical, y horizontal, u, v]
     // above (frame-wide, in 4x4 units) and left (32 entries) contexts
     a_mode: []mut u8,
@@ -446,6 +448,11 @@ fn build_qm(level: usize, chroma: usize, tx: u32, out: []mut u8) usize {
     return n;
 }
 
+// the quantizer matrices are built when first used (all of them would cost
+// more than a small frame's decoding)
+const QM_NONE: u32 = 0xffffffff;
+const QM_LATER: u32 = 0xfffffffe;
+
 fn init_qm(d: *mut Dec) Av1DecodeError!void {
     let h = &d.hdr;
     d.qm_on = h.qm;
@@ -453,23 +460,33 @@ fn init_qm(d: *mut Dec) Av1DecodeError!void {
         return;
     }
     d.qm = mem.alloc.[u8](3 * 19 * 1024)!;
+    d.qm_used = 0;
     let levels: [3]u32 = [h.qm_y, h.qm_u, h.qm_v];
-    let mut off: usize = 0;
     for p in @as(usize, 0)..3 {
-        for tx in @as(u32, 0)..19 {
-            let i = (p * 19) + @as(usize, tx);
+        for tx in @as(usize, 0)..19 {
+            d.qm_off[(p * 19) + tx] = QM_LATER;
             if levels[p] >= 15 {
-                d.qm_off[i] = 0xffffffff;
-                continue;
+                d.qm_off[(p * 19) + tx] = QM_NONE;
             }
-            let mut ch: usize = 0;
-            if p > 0 {
-                ch = 1;
-            }
-            d.qm_off[i] = @truncate(u32, off);
-            off += build_qm(@as(usize, levels[p]), ch, tx, d.qm[off..]);
         }
     }
+}
+
+// the offset in qm of a plane's matrix for a transform size, or QM_NONE
+fn qm_for(d: *mut Dec, plane: usize, tx: u32) u32 {
+    let i = (plane * 19) + @as(usize, tx);
+    if d.qm_off[i] != QM_LATER {
+        return d.qm_off[i];
+    }
+    let h = &d.hdr;
+    let levels: [3]u32 = [h.qm_y, h.qm_u, h.qm_v];
+    let mut ch: usize = 0;
+    if plane > 0 {
+        ch = 1;
+    }
+    d.qm_off[i] = @truncate(u32, d.qm_used);
+    d.qm_used += build_qm(@as(usize, levels[plane]), ch, tx, d.qm[d.qm_used..]);
+    return d.qm_off[i];
 }
 
 // -----------------------------------------------------------------------------
@@ -1914,8 +1931,8 @@ fn decode_coefs(d: *mut Dec, a: []mut u8, l: []mut u8, tx: u32, b: *Blk, plane: 
     let mut use_qm = false;
     let mut qo: usize = 0;
     if d.qm_on and (txtp < itx.IDTX) {
-        let q = d.qm_off[(plane * 19) + @as(usize, tx)];
-        if q != 0xffffffff {
+        let q = qm_for(d, plane, tx);
+        if q != QM_NONE {
             use_qm = true;
             qo = @as(usize, q);
         }
@@ -2359,6 +2376,11 @@ fn setup(d: *mut Dec) Av1DecodeError!void {
     d.layout = s.layout;
     d.ss_hor = s.ss_hor;
     d.ss_ver = s.ss_ver;
+    // at most MAX_PIXELS: a frame's data does not bound its size (a flat
+    // frame takes a few bits per superblock)
+    if (@as(u64, h.width) * @as(u64, h.height)) > @as(u64, image.MAX_PIXELS) {
+        return error.Unsupported;
+    }
     let width = @bit_cast(i32, h.width);
     let height = @bit_cast(i32, h.height);
     d.w4 = (width + 3) >> 2;

@@ -543,47 +543,64 @@ const USHORT_RANGE: usize = 65536;
 const BITMAP_SIZE: usize = 8192;
 
 /// PIZ's tables, allocated once per image (they are large, and a file can
-/// have many small blocks).
+/// have many small blocks). A block touches only as much of them as its
+/// size pays for, and leaves the decoding table clear.
 struct PizScratch {
-    bitmap: []mut u8,
     lut: []mut u16,
     hcode: []mut u64,
+    syms: []mut u32,   // the symbols with codes, in order
+    order: []mut u32,  // the same, by code
     dec: []mut HufDec,
 
     fn init(needed: bool) ExrError!PizScratch {
         let mut p = PizScratch.{
-            bitmap: mem.alloc.[u8](0)!,
             lut: mem.alloc.[u16](0)!,
             hcode: mem.alloc.[u64](0)!,
+            syms: mem.alloc.[u32](0)!,
+            order: mem.alloc.[u32](0)!,
             dec: mem.alloc.[HufDec](0)!,
         };
         if not needed {
             return p;
         }
-        p.deinit();
-        p.bitmap = mem.alloc.[u8](BITMAP_SIZE)!;
-        p.lut = mem.alloc.[u16](USHORT_RANGE) catch |e| {
-            mem.free(p.bitmap);
+        let lut = mem.alloc.[u16](USHORT_RANGE) catch |e| {
+            p.deinit();
             return e;
         };
-        p.hcode = mem.alloc.[u64](HUF_ENCSIZE) catch |e| {
-            mem.free(p.bitmap);
-            mem.free(p.lut);
+        mem.free(p.lut);
+        p.lut = lut;
+        let hcode = mem.alloc.[u64](HUF_ENCSIZE) catch |e| {
+            p.deinit();
             return e;
         };
-        p.dec = mem.alloc.[HufDec](HUF_DECSIZE) catch |e| {
-            mem.free(p.bitmap);
-            mem.free(p.lut);
-            mem.free(p.hcode);
+        mem.free(p.hcode);
+        p.hcode = hcode;
+        let syms = mem.alloc.[u32](HUF_ENCSIZE) catch |e| {
+            p.deinit();
             return e;
         };
+        mem.free(p.syms);
+        p.syms = syms;
+        let order = mem.alloc.[u32](HUF_ENCSIZE) catch |e| {
+            p.deinit();
+            return e;
+        };
+        mem.free(p.order);
+        p.order = order;
+        let dec = mem.alloc_zeroed.[HufDec](HUF_DECSIZE) catch |e| {
+            p.deinit();
+            return e;
+        };
+        mem.free(p.dec);
+        p.dec = dec;
         return p;
     }
 
     fn deinit(self: *mut PizScratch) void {
-        mem.free(self.bitmap);
         mem.free(self.lut);
         mem.free(self.hcode);
+        mem.free(self.syms);
+        mem.free(self.order);
         mem.free(self.dec);
     }
 }
@@ -595,27 +612,27 @@ fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize, sc: *m
     let min_nz = @as(usize, src[0]) | (@as(usize, src[1]) << 8);
     let max_nz = @as(usize, src[2]) | (@as(usize, src[3]) << 8);
     let mut p: usize = 4;
-    let bitmap = sc.bitmap;
-    @mem_set(bitmap, 0);
     if max_nz >= BITMAP_SIZE {
         return error.Corrupt;
     }
+    // the bitmap of the values used: bytes min_nz to max_nz (the others are
+    // clear)
+    let mut bitmap = src[..0];
     if min_nz <= max_nz {
         let n = (max_nz - min_nz) + 1;
         if (p + n) > src.len {
             return error.Corrupt;
         }
-        @mem_copy(bitmap[min_nz..max_nz + 1], src[p..p + n]);
+        bitmap = src[p..p + n];
         p += n;
     }
-    // the reverse lookup table
+    // the reverse lookup table, lut[..k]
     let lut = sc.lut;
     lut[0] = 0;
     let mut k: usize = 1;
     if min_nz <= max_nz {
-        // (bits outside the bitmap's range are all clear)
         for i in @max(min_nz * 8, 1)..(max_nz + 1) * 8 {
-            if (bitmap[i >> 3] & (@as(u8, 1) << @truncate(u8, i & 7))) != 0 {
+            if (bitmap[(i >> 3) - min_nz] & (@as(u8, 1) << @truncate(u8, i & 7))) != 0 {
                 lut[k] = @truncate(u16, i);
                 k += 1;
             }
@@ -643,8 +660,14 @@ fn piz_decode(src: []u8, out: []mut u8, h: *Header, bw: usize, bh: usize, sc: *m
         }
         at += (bw * bh) * size;
     }
+    // (values past the table's end become 0, as in OpenEXR)
     for i in @as(usize, 0)..nshorts {
-        tmp[i] = lut[@as(usize, tmp[i])];
+        let v = @as(usize, tmp[i]);
+        if v < k {
+            tmp[i] = lut[v];
+        } else {
+            tmp[i] = 0;
+        }
     }
     // planar channels to lines of interleaved channels
     let mut o: usize = 0;
@@ -751,7 +774,8 @@ fn wav2_decode(buf: []mut u16, base: usize, nx: usize, ox: usize, ny: usize, oy:
 }
 
 // OpenEXR's Huffman coding (ImfHuf): code lengths up to 58 bits, a
-// run-length symbol, and a decoding table of 14-bit prefixes.
+// run-length symbol, and a decoding table of prefixes (up to 14 bits; the
+// longer codes are found by their length).
 const HUF_ENCSIZE: usize = 65537;
 const HUF_DECBITS: u32 = 14;
 const HUF_DECSIZE: usize = 16384;
@@ -760,9 +784,17 @@ const LONG_ZEROCODE_RUN: u64 = 63;
 const SHORTEST_LONG_RUN: usize = 6;
 
 struct HufDec {
-    len: u32,    // a short code's length, or 0
-    lit: u32,    // its symbol, or the number of long codes
-    first: u32,  // long codes: index of the first in the long list
+    len: u32,  // the length of the code with this prefix, or 0 (a longer one)
+    lit: u32,  // its symbol
+}
+
+// a block's canonical code
+struct HufCodes {
+    first: [59]u64,  // the first code of each length
+    count: [59]u64,  // the number of codes of each length
+    at: [59]usize,   // where the codes of each length start in order
+    longest: u32,
+    dbits: u32,  // the table's prefixes are this long
 }
 
 struct BitIn {
@@ -805,21 +837,18 @@ fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) ExrError!void 
     if (im >= HUF_ENCSIZE) or (i_m >= HUF_ENCSIZE) or (im > i_m) {
         return error.Corrupt;
     }
-    // (only [im, i_m] is used: every entry there is written below)
+    // the code lengths, kept for the symbols that have codes (syms[..ns])
     let hcode = sc.hcode;
-    // the code lengths
+    let syms = sc.syms;
+    let mut ns: usize = 0;
     let mut bi = BitIn.{ d: src, pos: 20, c: 0, lc: 0 };
     let mut s = im;
     while s <= i_m {
         let l = bi.get_bits(6)!;
-        hcode[s] = l;
         if l == LONG_ZEROCODE_RUN {
             let zerun = @as(usize, @truncate(u32, bi.get_bits(8)!)) + SHORTEST_LONG_RUN;
             if (s + zerun) > (i_m + 1) {
                 return error.Corrupt;
-            }
-            for k in @as(usize, 0)..zerun {
-                hcode[s + k] = 0;
             }
             s += zerun;
         } else if l >= SHORT_ZEROCODE_RUN {
@@ -827,86 +856,95 @@ fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) ExrError!void 
             if (s + zerun) > (i_m + 1) {
                 return error.Corrupt;
             }
-            for k in @as(usize, 0)..zerun {
-                hcode[s + k] = 0;
-            }
             s += zerun;
         } else {
+            if l > 0 {
+                hcode[s] = l;
+                syms[ns] = @truncate(u32, s);
+                ns += 1;
+            }
             s += 1;
         }
     }
     let table_end = bi.pos;
-    // canonical codes: the longest codes are numerically lowest
-    let mut count: [59]u64 = [0; 59];
-    for i in im..i_m + 1 {
-        count[@truncate(usize, hcode[i])] += 1;
+    // canonical codes: the longest codes are numerically lowest. Lengths
+    // that would make one code a prefix of another, or not fit, are refused.
+    let mut hc = HufCodes.{ first: [0; 59], count: [0; 59], at: [0; 59], longest: 0, dbits: 8 };
+    let mut shortest: usize = 59;
+    for q in @as(usize, 0)..ns {
+        let l = @truncate(usize, hcode[@as(usize, syms[q])]);
+        hc.count[l] += 1;
+        shortest = @min(shortest, l);
+        hc.longest = @max(hc.longest, @truncate(u32, l));
     }
     let mut c: u64 = 0;
     let mut i: usize = 58;
     while i > 0 {
-        let nc = (c + count[i]) >> 1;
-        count[i] = c;
-        c = nc;
-        i -= 1;
-    }
-    for j in im..i_m + 1 {
-        let l = hcode[j];
-        if l > 0 {
-            hcode[j] = l | (count[@truncate(usize, l)] << 6);
-            count[@truncate(usize, l)] += 1;
-        }
-    }
-    // the decoding table
-    let dec = sc.dec;
-    @mem_set(@cast_slice(u8, dec), 0);
-    // first pass: count long codes per prefix
-    for sym in im..i_m + 1 {
-        let code = hcode[sym] >> 6;
-        let l = @truncate(u32, hcode[sym] & 63);
-        if (code >> l) != 0 {
+        let t = c + hc.count[i];
+        if ((t & 1) != 0) and (i > shortest) {
             return error.Corrupt;
         }
-        if l > HUF_DECBITS {
-            let e = &mut dec[@truncate(usize, code >> (l - HUF_DECBITS))];
-            if e.len != 0 {
-                return error.Corrupt;
-            }
-            e.lit += 1;
-        } else if l > 0 {
-            let first = @truncate(usize, code << (HUF_DECBITS - l));
-            for k in @as(usize, 0)..(@as(usize, 1) << @truncate(u32, HUF_DECBITS - l)) {
-                let e = &mut dec[first + k];
-                if (e.len != 0) or (e.lit != 0) {
-                    return error.Corrupt;
-                }
-                e.len = l;
-                e.lit = @truncate(u32, sym);
-            }
+        if (hc.count[i] > 0) and (((t - 1) >> @truncate(u32, i)) != 0) {
+            return error.Corrupt;
+        }
+        hc.first[i] = c;
+        c = t >> 1;
+        i -= 1;
+    }
+    let mut next = hc.first;
+    let mut n: usize = 0;
+    for l in @as(usize, 1)..59 {
+        hc.at[l] = n;
+        n += @truncate(usize, hc.count[l]);
+    }
+    let order = sc.order;
+    for q in @as(usize, 0)..ns {
+        let sym = @as(usize, syms[q]);
+        let l = @truncate(usize, hcode[sym]);
+        order[hc.at[l] + @truncate(usize, next[l] - hc.first[l])] = syms[q];
+        hcode[sym] = hcode[sym] | (next[l] << 6);
+        next[l] += 1;
+    }
+    // the decoding table has 2^dbits entries, as many as the block's size
+    // pays for (and at least 2^8, so the last byte's padding is never taken
+    // for a code)
+    while (hc.dbits < HUF_DECBITS) and ((@as(usize, 1) << hc.dbits) < (out.len + src.len)) {
+        hc.dbits += 1;
+    }
+    fill_dec(sc, ns, hc.dbits, true);
+    huf_decode(src[table_end..], nbits, @truncate(u32, i_m), &hc, sc, out) catch |e| {
+        fill_dec(sc, ns, hc.dbits, false);
+        return e;
+    };
+    fill_dec(sc, ns, hc.dbits, false);
+}
+
+// fills the decoding table's entries for the codes up to dbits long, or
+// clears them
+fn fill_dec(sc: *mut PizScratch, ns: usize, dbits: u32, set: bool) void {
+    let dec = sc.dec;
+    for q in @as(usize, 0)..ns {
+        let sym = sc.syms[q];
+        let hc = sc.hcode[@as(usize, sym)];
+        let l = @truncate(u32, hc & 63);
+        if l > dbits {
+            continue;
+        }
+        let mut e = HufDec.{ len: 0, lit: 0 };
+        if set {
+            e = HufDec.{ len: l, lit: sym };
+        }
+        let first = @truncate(usize, (hc >> 6) << (dbits - l));
+        for k in @as(usize, 0)..(@as(usize, 1) << (dbits - l)) {
+            dec[first + k] = e;
         }
     }
-    // second pass: lay out the long code lists
-    let mut total: u32 = 0;
-    for k in @as(usize, 0)..HUF_DECSIZE {
-        if (dec[k].len == 0) and (dec[k].lit > 0) {
-            dec[k].first = total;
-            total += dec[k].lit;
-            dec[k].lit = 0;  // refilled below
-        }
-    }
-    let longs = mem.alloc.[u32](@max(@as(usize, total), 1))!;
-    defer mem.free(longs);
-    for sym in im..i_m + 1 {
-        let code = hcode[sym] >> 6;
-        let l = @truncate(u32, hcode[sym] & 63);
-        if l > HUF_DECBITS {
-            let e = &mut dec[@truncate(usize, code >> (l - HUF_DECBITS))];
-            longs[@as(usize, e.first + e.lit)] = @truncate(u32, sym);
-            e.lit += 1;
-        }
-    }
-    // decode
-    let rlc = @truncate(u32, i_m);
-    let data = src[table_end..];
+}
+
+fn huf_decode(data: []u8, nbits: usize, rlc: u32, hc: *HufCodes, sc: *PizScratch, out: []mut u16) ExrError!void {
+    let dec = sc.dec;
+    let dbits = hc.dbits;
+    let mask = (@as(u64, 1) << dbits) - 1;
     let nbytes = (nbits + 7) / 8;
     if nbytes > data.len {
         return error.Corrupt;
@@ -915,35 +953,15 @@ fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) ExrError!void 
     let mut o: usize = 0;
     while inb.pos < nbytes {
         inb.get_char();
-        while inb.lc >= HUF_DECBITS {
-            let e = dec[@truncate(usize, (inb.c >> (inb.lc - HUF_DECBITS)) & @as(u64, HUF_DECSIZE - 1))];
+        while inb.lc >= dbits {
+            let e = dec[@truncate(usize, (inb.c >> (inb.lc - dbits)) & mask)];
+            let mut sym = e.lit;
             if e.len > 0 {
                 inb.lc -= e.len;
-                o = get_code(e.lit, rlc, &mut inb, out, o)!;
             } else {
-                if e.lit == 0 {
-                    return error.Corrupt;
-                }
-                let mut found = false;
-                for j in @as(usize, 0)..@as(usize, e.lit) {
-                    let sym = @as(usize, longs[@as(usize, e.first) + j]);
-                    let l = @truncate(u32, hcode[sym] & 63);
-                    while (inb.lc < l) and (inb.pos < nbytes) {
-                        inb.get_char();
-                    }
-                    if inb.lc >= l {
-                        if (hcode[sym] >> 6) == ((inb.c >> (inb.lc - l)) & ((@as(u64, 1) << l) - 1)) {
-                            inb.lc -= l;
-                            o = get_code(@truncate(u32, sym), rlc, &mut inb, out, o)!;
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if not found {
-                    return error.Corrupt;
-                }
+                sym = long_code(hc, sc.order, &mut inb)!;
             }
+            o = get_code(sym, rlc, &mut inb, out, o)!;
         }
     }
     // the remaining (short) codes
@@ -954,7 +972,7 @@ fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) ExrError!void 
     }
     inb.lc -= skip;
     while inb.lc > 0 {
-        let e = dec[@truncate(usize, (inb.c << (HUF_DECBITS - inb.lc)) & @as(u64, HUF_DECSIZE - 1))];
+        let e = dec[@truncate(usize, (inb.c << (dbits - inb.lc)) & mask)];
         if (e.len == 0) or (e.len > inb.lc) {
             return error.Corrupt;
         }
@@ -964,6 +982,27 @@ fn huf_uncompress(src: []u8, out: []mut u16, sc: *mut PizScratch) ExrError!void 
     if o != out.len {
         return error.Corrupt;
     }
+}
+
+// the symbol of a code longer than the table's prefixes, found by its length
+fn long_code(hc: *HufCodes, order: []u32, inb: *mut BitIn) ExrError!u32 {
+    let mut l = hc.dbits + 1;
+    while l <= hc.longest {
+        while (inb.lc < l) and (inb.pos < inb.d.len) {
+            inb.get_char();
+        }
+        if inb.lc < l {
+            break;
+        }
+        let li = @as(usize, l);
+        let v = (inb.c >> (inb.lc - l)) & ((@as(u64, 1) << l) - 1);
+        if (v >= hc.first[li]) and ((v - hc.first[li]) < hc.count[li]) {
+            inb.lc -= l;
+            return order[hc.at[li] + @truncate(usize, v - hc.first[li])];
+        }
+        l += 1;
+    }
+    return error.Corrupt;
 }
 
 fn get_code(sym: u32, rlc: u32, inb: *mut BitIn, out: []mut u16, o: usize) ExrError!usize {
@@ -1355,4 +1394,70 @@ test "encode_to" {
         };
         @trap();
     }
+}
+
+// a PIZ file of one HALF channel, Y, 1 pixel wide: a block of 32 lines for
+// each of the n blocks, block i holding blocks[i % blocks.len]
+fn piz_file(o: *mut strs.String, blocks: [][]u8, n: usize) !void {
+    let magic: [8]u8 = [0x76, 0x2f, 0x31, 0x01, 2, 0, 0, 0];
+    o.push_str(magic[..])!;
+    let chl: [18]u8 = ['Y', 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
+    let mut cl = strs.String.init();
+    defer cl.deinit();
+    cl.push_str(chl[..])!;
+    cl.push(0)!;
+    attr(o, "channels", "chlist", cl.bytes())!;
+    let comp: [1]u8 = [4];
+    attr(o, "compression", "compression", comp[..])!;
+    let mut bx = strs.String.init();
+    defer bx.deinit();
+    put32(&mut bx, 0)!;
+    put32(&mut bx, 0)!;
+    put32(&mut bx, 0)!;
+    put32(&mut bx, @truncate(u32, (n * 32) - 1))!;
+    attr(o, "dataWindow", "box2i", bx.bytes())!;
+    o.push(0)!;
+    let mut off = o.bytes().len + (n * 8);
+    for i in @as(usize, 0)..n {
+        put32(o, @truncate(u32, off))!;
+        put32(o, @truncate(u32, off >> 32))!;
+        off += 8 + blocks[i % blocks.len].len;
+    }
+    for i in @as(usize, 0)..n {
+        let b = blocks[i % blocks.len];
+        put32(o, @truncate(u32, i * 32))!;
+        put32(o, @truncate(u32, b.len))!;
+        o.push_str(b)!;
+    }
+}
+
+test "PIZ: many small blocks, and values past the lookup table" {
+    // the Huffman codes 0 (symbol 5) and 1 (6, the run-length symbol): a 5,
+    // then 31 more; with an empty bitmap 5 is past the lookup table
+    let empty: [32]u8 = [1, 0, 0, 0, 24, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0x04,
+                         0x10, 0x47, 0xc0];
+    // the bitmap of the values 1 to 7, which become 1 to 7
+    let full: [33]u8 = [0, 0, 0, 0, 0xfe, 24, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0,
+                        0x04, 0x10, 0x47, 0xc0];
+    let blocks: [2][]u8 = [full[..], empty[..]];
+    let mut s = strs.String.init();
+    defer s.deinit();
+    piz_file(&mut s, blocks[..], 2)!;
+    let mut img = decode(s.bytes())!;
+    defer img.deinit();
+    let px = img.samples32();
+    @expect_eq(px.len, 64);
+    for y in @as(usize, 0)..64 {
+        if y < 32 {
+            @expect_eq(px[y], 5.0 / 16777216.0);
+        } else {
+            @expect_eq(px[y], 0.0);
+        }
+    }
+    // each block costs about its size, not the whole decoding table
+    let mut big = strs.String.init();
+    defer big.deinit();
+    piz_file(&mut big, blocks[1..], 20000)!;
+    let mut img2 = decode(big.bytes())!;
+    img2.deinit();
 }

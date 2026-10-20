@@ -167,3 +167,21 @@
   refinement run visits only the coefficients already nonzero, and a file's scans
   together may visit each block at most 32 times, else it is `Corrupt`. The minimum
   file size for a frame counts the frame padded to whole MCUs over all components.
+- `std/graphics/image/avif`:
+  - A small file could claim a huge image and have it allocated and filled before any
+    AV1 data was read (356 bytes took 2 GB). The image is allocated once its frame is
+    decoded, and the frame must cover the size claimed.
+  - Extents that all covered the same data were copied once each (180 KB took 900 MB).
+    An item's extents may not add up to more than the file, and all the item data read
+    for a file is limited to twice its size.
+  - A grid could repeat one tile thousands of times, with a buffer sized by the tiles
+    rather than the grid. A grid's tiles must just cover it, each tile may appear once,
+    and the grid is at most `MAX_PIXELS`.
+  - Items are indexed rather than searched (60,000 items took 11 s), an AV1 frame may
+    be at most `image.MAX_PIXELS` pixels (`Unsupported`), and only the first rotation,
+    mirroring and clean aperture of an item is applied.
+- `std/graphics/image/exr`: each PIZ block cleared and filled a 16384-entry Huffman
+  table and an 8 KiB bitmap whatever its size, so a 4.8 MB file of tiny blocks took
+  5 s; a block now uses a table as large as its size pays for, and long codes are found
+  by their length rather than by a scan that could take quadratic time. Huffman output
+  past a block's lookup table was mapped through stale entries; it decodes as 0.

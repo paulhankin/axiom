@@ -122,8 +122,11 @@ struct File {
     dimg_from: vec.Vec.[u32],  // grid references: (from, to) pairs in order
     dimg_to: vec.Vec.[u32],
     idat: []u8,
+    index: vec.Vec.[u64],  // (id << 32) | the item's index, sorted
+    budget: u64,           // what item_data may still read
 
     fn deinit(self: *mut File) void {
+        self.index.deinit();
         self.items.deinit();
         self.extents.deinit();
         self.props.deinit();
@@ -131,12 +134,12 @@ struct File {
         self.dimg_to.deinit();
     }
 
+    // the first item with an id
     fn find(self: *File, id: u32) AvifError!usize {
-        let its = self.items.items();
-        for i in @as(usize, 0)..its.len {
-            if its[i].id == id {
-                return i;
-            }
+        let keys = self.index.items();
+        let k = vec.lower_bound(keys, @as(u64, id) << 32, less_u64);
+        if (k < keys.len) and ((keys[k] >> 32) == @as(u64, id)) {
+            return @as(usize, @truncate(u32, keys[k]));
         }
         return error.Corrupt;
     }
@@ -156,7 +159,7 @@ struct File {
 fn parse(data: []u8) AvifError!File {
     let mut f = File.{ data: data, primary: 0, items: vec.Vec.[Item].init(), extents: vec.Vec.[Extent].init(),
                        props: vec.Vec.[Prop].init(), dimg_from: vec.Vec.[u32].init(), dimg_to: vec.Vec.[u32].init(),
-                       idat: data[..0] };
+                       idat: data[..0], index: vec.Vec.[u64].init(), budget: @as(u64, data.len) * 2 };
     parse_boxes(&mut f, data) catch |e| {
         f.deinit();
         return e;
@@ -220,8 +223,25 @@ fn parse_meta(f: *mut File, m: []u8) AvifError!void {
                 f.idat = b.body;
             }
         }
+        if pass == 0 {
+            index_items(f)!;
+        }
         pass += 1;
     }
+}
+
+fn less_u64(a: u64, b: u64) bool {
+    return a < b;
+}
+
+// indexes the items by id, for find
+fn index_items(f: *mut File) AvifError!void {
+    f.index.clear();
+    let its = f.items.items();
+    for i in @as(usize, 0)..its.len {
+        f.index.push((@as(u64, its[i].id) << 32) | @as(u64, i))!;
+    }
+    vec.sort(f.index.items(), less_u64);
 }
 
 fn parse_iinf(f: *mut File, b: []u8) AvifError!void {
@@ -443,37 +463,48 @@ fn parse_iref(f: *mut File, b: []u8) AvifError!void {
     }
 }
 
-// an item's data (freed by the caller)
-fn item_data(f: *File, it: *Item, prefix: []u8) AvifError![]mut u8 {
+// an item's data (freed by the caller). What it reads is charged to the
+// file's budget, twice its size, so items that share their data cannot have
+// it copied over and over.
+fn item_data(f: *mut File, it: *Item, prefix: []u8) AvifError![]mut u8 {
     let ex = f.extents.items();
-    let mut total = prefix.len;
     let mut src = f.data;
     if it.method == 1 {
         src = f.idat;
     } else if it.method != 0 {
         return error.Unsupported;
     }
+    let n = @as(u64, src.len);
+    let mut total: u64 = 0;
     for k in it.ext_start..(it.ext_start + it.ext_count) {
         let e = ex[k];
-        let start = it.base +% e.offset;
+        let start = @add_checked(it.base, e.offset) catch return error.Corrupt;
         let mut len = e.length;
         if (len == 0) and (it.ext_count == 1) {
-            if start > @as(u64, src.len) {
+            if start > n {
                 return error.Corrupt;
             }
-            len = @as(u64, src.len) - start;
+            len = n - start;
         }
-        if (start > @as(u64, src.len)) or (len > (@as(u64, src.len) - start)) {
+        if (start > n) or (len > (n - start)) {
             return error.Corrupt;
         }
-        total += @truncate(usize, len);
+        // (extents overlapping each other cannot add up to more than src)
+        total += len;
+        if total > n {
+            return error.Corrupt;
+        }
     }
-    let out = mem.alloc.[u8](total)!;
+    if total > f.budget {
+        return error.Corrupt;
+    }
+    f.budget -= total;
+    let out = mem.alloc.[u8](prefix.len + @truncate(usize, total))!;
     @mem_copy(out[..prefix.len], prefix);
     let mut p = prefix.len;
     for k in it.ext_start..(it.ext_start + it.ext_count) {
         let e = ex[k];
-        let start = @truncate(usize, it.base +% e.offset);
+        let start = @truncate(usize, it.base + e.offset);
         let mut len = @truncate(usize, e.length);
         if (len == 0) and (it.ext_count == 1) {
             len = src.len - start;
@@ -481,11 +512,11 @@ fn item_data(f: *File, it: *Item, prefix: []u8) AvifError![]mut u8 {
         @mem_copy(out[p..p + len], src[start..start + len]);
         p += len;
     }
-    return out[..total];
+    return out;
 }
 
 // the AV1 planes of an av01 item
-fn decode_item(f: *File, it: *Item) AvifError!av1.Frame {
+fn decode_item(f: *mut File, it: *Item) AvifError!av1.Frame {
     if not @mem_eq(it.typ[..], "av01") {
         return error.Unsupported;
     }
@@ -606,7 +637,8 @@ fn store(img: *mut image.Image, i: usize, v: f32) void {
     }
 }
 
-// writes the planes (as colour, or as alpha) into img at (ox, oy)
+// writes the planes (as colour, or as alpha) into img at (ox, oy); colour
+// leaves the pixels opaque
 fn put_planes(img: *mut image.Image, p: *av1.Frame, col: Colour, ox: usize, oy: usize, alpha: bool) void {
     let maxv = @float_from_int(f32, (@as(u32, 1) << p.bitdepth) - 1);
     let scale = @float_from_int(f32, @as(u32, 1) << (p.bitdepth - 8));
@@ -629,6 +661,9 @@ fn put_planes(img: *mut image.Image, p: *av1.Frame, col: Colour, ox: usize, oy: 
             if alpha {
                 store(img, o + (ch - 1), yn);
                 continue;
+            }
+            if (ch & 1) == 0 {
+                store(img, o + (ch - 1), 1.0);  // opaque until the alpha is drawn
             }
             if mono or (ch <= 2) {
                 store(img, o, yn);
@@ -683,7 +718,7 @@ struct Grid {
     height: usize,
 }
 
-fn read_grid(f: *File, it: *Item) AvifError!Grid {
+fn read_grid(f: *mut File, it: *Item) AvifError!Grid {
     let d = item_data(f, it, f.data[..0])!;
     defer mem.free(d);
     if d.len < 8 {
@@ -714,42 +749,74 @@ fn tiles(f: *File, id: u32, out: *mut vec.Vec.[u32]) AvifError!void {
     }
 }
 
-// draws an item (a grid of tiles, which are put together first, or an
-// image) as the colour or the alpha of img
-fn draw_item(f: *File, it: *Item, img: *mut image.Image, alpha: bool) AvifError!void {
+// an item's planes and colour description
+struct Pic {
+    frame: av1.Frame,
+    col: Colour,
+}
+
+// decodes an item: an image, or a grid of tiles put together
+fn picture(f: *mut File, it: *Item) AvifError!Pic {
     if not @mem_eq(it.typ[..], "grid") {
-        let mut p = decode_item(f, it)!;
-        defer p.deinit();
-        put_planes(img, &p, colour_of(f, it, &p), 0, 0, alpha);
-        return;
+        let p = decode_item(f, it)!;
+        return Pic.{ frame: p, col: colour_of(f, it, &p) };
     }
     let g = read_grid(f, it)!;
+    if (@mul_checked(g.width, g.height) catch return error.Unsupported) > image.MAX_PIXELS {
+        return error.Unsupported;
+    }
     let mut ids = vec.Vec.[u32].init();
     defer ids.deinit();
     tiles(f, it.id, &mut ids)!;
     if ids.items().len != (g.rows * g.cols) {
         return error.Corrupt;
     }
-    let mut all = obu.zeroed.[av1.Frame]()!;
-    defer all.deinit();
-    let mut col = Colour.{ matrix: 0, full: true };
+    // each tile is decoded once: a grid that repeats one is refused
+    let mut sorted = vec.Vec.[u64].init();
+    defer sorted.deinit();
+    for id in ids.items() {
+        sorted.push(@as(u64, id))!;
+    }
+    vec.sort(sorted.items(), less_u64);
+    for k in @as(usize, 1)..sorted.items().len {
+        if sorted.get(k) == sorted.get(k - 1) {
+            return error.Corrupt;
+        }
+    }
+    let mut pic = Pic.{ frame: obu.zeroed.[av1.Frame]()!, col: Colour.{ matrix: 0, full: true } };
+    put_tiles(f, &g, ids.items(), &mut pic) catch |e| {
+        pic.frame.deinit();
+        return e;
+    };
+    return pic;
+}
+
+// puts a grid's tiles together in pic
+fn put_tiles(f: *mut File, g: *Grid, ids: []u32, pic: *mut Pic) AvifError!void {
+    let all = &mut pic.frame;
+    let mut tw: usize = 0;
+    let mut th: usize = 0;
     for r in @as(usize, 0)..g.rows {
         for c in @as(usize, 0)..g.cols {
-            let t = f.items.get(f.find(ids.get((r * g.cols) + c))!);
+            let t = f.items.get(f.find(ids[(r * g.cols) + c])!);
             let mut p = decode_item(f, &t)!;
             defer p.deinit();
             if (r == 0) and (c == 0) {
-                // the whole: the tiles' format, the grid's size
-                if ((p.width * g.cols) < g.width) or ((p.height * g.rows) < g.height) {
+                // the tiles' size: the columns and rows just cover the grid
+                tw = p.width;
+                th = p.height;
+                if ((tw * (g.cols - 1)) >= g.width) or ((tw * g.cols) < g.width) or ((th * (g.rows - 1)) >= g.height) or
+                   ((th * g.rows) < g.height) {
                     return error.Corrupt;
                 }
+                // the whole: the tiles' format, the grid's size
                 all.width = g.width;
                 all.height = g.height;
                 all.bitdepth = p.bitdepth;
                 all.layout = p.layout;
                 all.full_range = p.full_range;
                 all.matrix = p.matrix;
-                col = colour_of(f, &t, &p);
+                pic.col = colour_of(f, &t, &p);
                 for pl in @as(usize, 0)..3 {
                     if p.pw[pl] == 0 {
                         continue;
@@ -764,34 +831,29 @@ fn draw_item(f: *File, it: *Item, img: *mut image.Image, alpha: bool) AvifError!
                     }
                     all.pw[pl] = (g.width + sx - 1) / sx;
                     all.ph[pl] = (g.height + sy - 1) / sy;
-                    all.planes[pl].stride = p.pw[pl] * g.cols;
-                    all.planes[pl].data = mem.alloc_zeroed.[u16](all.planes[pl].stride * p.ph[pl] * g.rows)!;
+                    all.planes[pl].stride = all.pw[pl];
+                    all.planes[pl].data = mem.alloc_zeroed.[u16](all.pw[pl] * all.ph[pl])!;
                 }
             }
-            if (p.bitdepth != all.bitdepth) or (p.layout != all.layout) {
+            if (p.width != tw) or (p.height != th) or (p.bitdepth != all.bitdepth) or (p.layout != all.layout) {
                 return error.Corrupt;
             }
             for pl in @as(usize, 0)..3 {
-                let tw = p.pw[pl];
-                let th = p.ph[pl];
-                if tw == 0 {
-                    continue;
+                let x0 = c * p.pw[pl];
+                let y0 = r * p.ph[pl];
+                let w = @min(p.pw[pl], all.pw[pl] - @min(x0, all.pw[pl]));
+                let h = @min(p.ph[pl], all.ph[pl] - @min(y0, all.ph[pl]));
+                if w == 0 {
+                    continue;  // (x0 may be past the plane's end)
                 }
-                if ((c + 1) * tw) > all.planes[pl].stride {
-                    return error.Corrupt;
-                }
-                for y in @as(usize, 0)..th {
-                    let d = (((r * th) + y) * all.planes[pl].stride) + (c * tw);
-                    if (d + tw) > all.planes[pl].data.len {
-                        return error.Corrupt;
-                    }
+                for y in @as(usize, 0)..h {
+                    let d = ((y0 + y) * all.planes[pl].stride) + x0;
                     let s = y * p.planes[pl].stride;
-                    @mem_copy(all.planes[pl].data[d..d + tw], p.planes[pl].data[s..s + tw]);
+                    @mem_copy(all.planes[pl].data[d..d + w], p.planes[pl].data[s..s + w]);
                 }
             }
         }
     }
-    put_planes(img, &all, col, 0, 0, alpha);
 }
 
 struct Info {
@@ -801,7 +863,7 @@ struct Info {
     mono: bool,
 }
 
-fn info_of(f: *File, it: *Item) AvifError!Info {
+fn info_of(f: *mut File, it: *Item) AvifError!Info {
     let mut tile = it.*;
     let mut gw: usize = 0;
     let mut gh: usize = 0;
@@ -852,7 +914,7 @@ pub fn decode(data: []u8) AvifError!image.Image {
     defer f.deinit();
     let pi = f.find(f.primary)!;
     let prim = f.items.get(pi);
-    let info = info_of(&f, &prim)!;
+    let info = info_of(&mut f, &prim)!;
     // an alpha auxiliary image
     let mut alpha_i: usize = 0xffffffff;
     let its = f.items.items();
@@ -884,32 +946,32 @@ pub fn decode(data: []u8) AvifError!image.Image {
     if info.bitdepth > 8 {
         depth = image.Depth.U16;
     }
+    // the image is allocated once its colour planes are decoded (it is no
+    // bigger than they are)
+    let mut pic = picture(&mut f, &prim)!;
+    if (pic.frame.width < info.width) or (pic.frame.height < info.height) {
+        pic.frame.deinit();
+        return error.Corrupt;
+    }
     let mut img = image.Image.init(info.width, info.height, ch, depth) catch |e| {
+        pic.frame.deinit();
         if e == error.OutOfMemory {
             return error.OutOfMemory;
         }
         return error.Unsupported;
     };
-    draw(&f, &prim, alpha_i, &mut img) catch |e| {
-        img.deinit();
-        return e;
-    };
-    return transform(&f, &prim, img);
-}
-
-fn draw(f: *File, prim: *Item, alpha_i: usize, img: *mut image.Image) AvifError!void {
-    let ch = img.channels;
-    if alpha_i != 0xffffffff {
-        // opaque until drawn
-        for i in @as(usize, 0)..(img.width * img.height) {
-            store(img, (i * ch) + (ch - 1), 1.0);
-        }
-    }
-    draw_item(f, prim, img, false)!;
+    put_planes(&mut img, &pic.frame, pic.col, 0, 0, false);
+    pic.frame.deinit();
     if alpha_i != 0xffffffff {
         let a = f.items.get(alpha_i);
-        draw_item(f, &a, img, true)!;
+        let mut ap = picture(&mut f, &a) catch |e| {
+            img.deinit();
+            return e;
+        };
+        put_planes(&mut img, &ap.frame, ap.col, 0, 0, true);
+        ap.frame.deinit();
     }
+    return transform(&f, &prim, img);
 }
 
 fn min_len(a: usize, b: usize) usize {
@@ -917,15 +979,32 @@ fn min_len(a: usize, b: usize) usize {
 }
 
 // applies the clean aperture, rotation and mirroring properties in order
+// (the first of each: an item has one at most)
 fn transform(f: *File, it: *Item, img0: image.Image) AvifError!image.Image {
     let mut img = img0;
     let ps = f.props.items();
+    let mut seen: [3]bool = [false, false, false];
     for k in @as(usize, 0)..it.n_props {
         let idx = @as(usize, it.props[k]);
         if (idx < 1) or (idx > ps.len) {
             continue;
         }
         let p = ps[idx - 1];
+        let mut kind: usize = 3;
+        if @mem_eq(p.typ[..], "irot") {
+            kind = 0;
+        } else if @mem_eq(p.typ[..], "imir") {
+            kind = 1;
+        } else if @mem_eq(p.typ[..], "clap") {
+            kind = 2;
+        }
+        if kind == 3 {
+            continue;
+        }
+        if seen[kind] {
+            continue;
+        }
+        seen[kind] = true;
         if @mem_eq(p.typ[..], "irot") and (p.body.len >= 1) {
             let n = p.body[0] & 3;
             for _r in @as(u8, 0)..n {
@@ -1015,7 +1094,7 @@ pub fn decode_yuv(data: []u8) AvifError!av1.Frame {
     defer f.deinit();
     let pi = f.find(f.primary)!;
     let prim = f.items.get(pi);
-    return decode_item(&f, &prim);
+    return decode_item(&mut f, &prim);
 }
 
 // -----------------------------------------------------------------------------
@@ -1166,4 +1245,266 @@ test "rejects damaged files" {
         _ = fails(copy);
         copy[i] = old;
     }
+}
+
+// --- Files made here ---------------------------------------------------------
+
+// an item of a file made by make_file: its properties' indices (from 1)
+// and its extents, (offset in mdat, length) pairs
+struct TItem {
+    id: u16,
+    typ: []u8,
+    props: []u8,
+    ext: []u32,
+}
+
+fn put_be(o: *mut strs.String, v: u64, n: usize) !void {
+    for i in @as(usize, 0)..n {
+        o.push(@truncate(u8, v >> @truncate(u64, ((n - 1) - i) * 8)))!;
+    }
+}
+
+fn put_box(o: *mut strs.String, typ: []u8, body: []u8) !void {
+    put_be(o, @as(u64, body.len + 8), 4)!;
+    o.push_str(typ)!;
+    o.push_str(body)!;
+}
+
+// an AVIF file whose primary item is the first: ipco holds the property
+// boxes, iref the reference boxes
+fn make_file(items: []TItem, ipco: []u8, iref: []u8, mdat: []u8) ![]mut u8 {
+    let mut base: usize = 0;
+    let mut o = strs.String.init();
+    for pass in @as(usize, 0)..2 {
+        o.clear();
+        put_box(&mut o, "ftyp", "avif\x00\x00\x00\x00avifmif1miaf")!;
+        let mut iinf = strs.String.init();
+        defer iinf.deinit();
+        let mut iloc = strs.String.init();
+        defer iloc.deinit();
+        let mut ipma = strs.String.init();
+        defer ipma.deinit();
+        put_be(&mut iinf, 0, 4)!;
+        put_be(&mut iinf, @as(u64, items.len), 2)!;
+        put_be(&mut iloc, 0x4400, 6)!;
+        put_be(&mut iloc, @as(u64, items.len), 2)!;
+        put_be(&mut ipma, 0, 4)!;
+        put_be(&mut ipma, @as(u64, items.len), 4)!;
+        for it in items {
+            let mut e = strs.String.init();
+            defer e.deinit();
+            put_be(&mut e, 0x02000000, 4)!;
+            put_be(&mut e, @as(u64, it.id), 2)!;
+            put_be(&mut e, 0, 2)!;
+            e.push_str(it.typ)!;
+            e.push(0)!;
+            put_box(&mut iinf, "infe", e.bytes())!;
+            put_be(&mut iloc, @as(u64, it.id), 2)!;
+            put_be(&mut iloc, 0, 2)!;
+            put_be(&mut iloc, @as(u64, it.ext.len / 2), 2)!;
+            for k in @as(usize, 0)..(it.ext.len / 2) {
+                put_be(&mut iloc, @as(u64, it.ext[k * 2]) + @as(u64, base), 4)!;
+                put_be(&mut iloc, @as(u64, it.ext[(k * 2) + 1]), 4)!;
+            }
+            put_be(&mut ipma, @as(u64, it.id), 2)!;
+            ipma.push(@truncate(u8, it.props.len))!;
+            ipma.push_str(it.props)!;
+        }
+        let mut meta = strs.String.init();
+        defer meta.deinit();
+        put_be(&mut meta, 0, 4)!;
+        put_box(&mut meta, "hdlr",
+                "\x00\x00\x00\x00\x00\x00\x00\x00pict\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")!;
+        let pitm: [6]u8 = [0, 0, 0, 0, @truncate(u8, items[0].id >> 8), @truncate(u8, items[0].id)];
+        put_box(&mut meta, "pitm", pitm[..])!;
+        put_box(&mut meta, "iinf", iinf.bytes())!;
+        put_box(&mut meta, "iloc", iloc.bytes())!;
+        let mut iprp = strs.String.init();
+        defer iprp.deinit();
+        put_box(&mut iprp, "ipco", ipco)!;
+        put_box(&mut iprp, "ipma", ipma.bytes())!;
+        put_box(&mut meta, "iprp", iprp.bytes())!;
+        if iref.len > 0 {
+            let mut r = strs.String.init();
+            defer r.deinit();
+            put_be(&mut r, 0, 4)!;
+            r.push_str(iref)!;
+            put_box(&mut meta, "iref", r.bytes())!;
+        }
+        put_box(&mut o, "meta", meta.bytes())!;
+        if pass == 0 {
+            base = o.bytes().len + 8;
+        }
+    }
+    put_box(&mut o, "mdat", mdat)!;
+    return o.take();
+}
+
+// the av1C property box and the data of a test file's primary item
+fn tile_of(name: []u8, ipco: *mut strs.String, mdat: *mut strs.String) !void {
+    let mut path = strs.String.init();
+    defer path.deinit();
+    path.push_str("std/graphics/image/testdata/avif/")!;
+    path.push_str(name)!;
+    let data = fs.read_file(path.bytes())!;
+    defer mem.free(data);
+    let mut f = parse(data)!;
+    defer f.deinit();
+    let prim = f.items.get(f.find(f.primary)!);
+    put_box(ipco, "av1C", f.prop(&prim, "av1C")!)!;
+    let d = item_data(&mut f, &prim, data[..0])!;
+    defer mem.free(d);
+    mdat.push_str(d)!;
+}
+
+fn ispe_box(o: *mut strs.String, w: u32, h: u32) !void {
+    let mut b = strs.String.init();
+    defer b.deinit();
+    put_be(&mut b, 0, 4)!;
+    put_be(&mut b, @as(u64, w), 4)!;
+    put_be(&mut b, @as(u64, h), 4)!;
+    put_box(o, "ispe", b.bytes())!;
+}
+
+test "small files claiming big images, extents and items" {
+    let mut ipco = strs.String.init();
+    defer ipco.deinit();
+    let mut mdat = strs.String.init();
+    defer mdat.deinit();
+    tile_of("alpha.avif", &mut ipco, &mut mdat) catch return;
+    let n = @truncate(u32, mdat.bytes().len);
+    ispe_box(&mut ipco, 64, 48)!;        // 2
+    ispe_box(&mut ipco, 16384, 16384)!;  // 3
+    let props: [2]u8 = [1, 2];
+    let whole: [2]u32 = [0, n];
+    // the file itself
+    let one: [1]TItem = [TItem.{ id: 1, typ: "av01", props: props[..], ext: whole[..] }];
+    let ok = make_file(one[..], ipco.bytes(), "", mdat.bytes())!;
+    defer mem.free(ok);
+    let mut img = decode(ok)!;
+    @expect_eq(img.width, 64);
+    @expect_eq(img.height, 48);
+    img.deinit();
+    // a huge ispe: the frame is decoded first, and is too small
+    let big_props: [2]u8 = [1, 3];
+    let big: [1]TItem = [TItem.{ id: 1, typ: "av01", props: big_props[..], ext: whole[..] }];
+    let f1 = make_file(big[..], ipco.bytes(), "", mdat.bytes())!;
+    defer mem.free(f1);
+    @expect(fails(f1));
+    // extents that each cover the whole of mdat
+    let mut ext = vec.Vec.[u32].init();
+    defer ext.deinit();
+    for _k in @as(usize, 0)..1000 {
+        ext.push(0)!;
+        ext.push(n)!;
+    }
+    let many: [1]TItem = [TItem.{ id: 1, typ: "av01", props: props[..], ext: ext.items() }];
+    let f2 = make_file(many[..], ipco.bytes(), "", mdat.bytes())!;
+    defer mem.free(f2);
+    @expect(fails(f2));
+    // many items (found by id in log time)
+    let mut its = vec.Vec.[TItem].init();
+    defer its.deinit();
+    its.push(one[0])!;
+    for k in @as(usize, 2)..30000 {
+        its.push(TItem.{ id: @truncate(u16, k), typ: "xxxx", props: props[..1], ext: whole[..0] })!;
+    }
+    let f3 = make_file(its.items(), ipco.bytes(), "", mdat.bytes())!;
+    defer mem.free(f3);
+    let mut img3 = decode(f3)!;
+    @expect_eq(img3.width, 64);
+    img3.deinit();
+    // a frame of 65536 x 65536 in 22 bytes, refused before it is allocated
+    let huge: [22]u8 = [0x0a, 0x09, 0x18, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xda, 0x00, 0x80, 0x32, 0x09, 0x18, 0x00, 0x00,
+                        0x00, 0x50, 0x00, 0x00, 0x09, 0xac];
+    let hext: [2]u32 = [0, 22];
+    let hi: [1]TItem = [TItem.{ id: 1, typ: "av01", props: props[..], ext: hext[..] }];
+    let f4 = make_file(hi[..], ipco.bytes(), "", huge[..])!;
+    defer mem.free(f4);
+    let mut img4 = decode(f4) catch |e| {
+        @expect_eq(e, error.Unsupported);
+        return;
+    };
+    img4.deinit();
+    @expect(false);
+}
+
+// a grid item (1) of rows x cols tiles, the items 2, 3, ... in ids
+fn grid_file(ipco: []u8, tile: []u8, rows: u8, cols: u8, w: u32, h: u32, ids: []u16) ![]mut u8 {
+    let mut mdat = strs.String.init();
+    defer mdat.deinit();
+    mdat.push_str(tile)!;
+    let g: [4]u8 = [0, 1, rows - 1, cols - 1];
+    mdat.push_str(g[..])!;
+    put_be(&mut mdat, @as(u64, w), 4)!;
+    put_be(&mut mdat, @as(u64, h), 4)!;
+    let mut pc = strs.String.init();
+    defer pc.deinit();
+    pc.push_str(ipco)!;
+    ispe_box(&mut pc, w, h)!;  // 3
+    let gprops: [1]u8 = [3];
+    let tprops: [2]u8 = [1, 2];
+    let gext: [2]u32 = [@truncate(u32, tile.len), 12];
+    let text: [2]u32 = [0, @truncate(u32, tile.len)];
+    let mut its = vec.Vec.[TItem].init();
+    defer its.deinit();
+    its.push(TItem.{ id: 1, typ: "grid", props: gprops[..], ext: gext[..] })!;
+    let mut refs = strs.String.init();
+    defer refs.deinit();
+    put_be(&mut refs, 1, 2)!;
+    put_be(&mut refs, @as(u64, ids.len), 2)!;
+    for id in ids {
+        put_be(&mut refs, @as(u64, id), 2)!;
+        if @as(usize, id) > its.items().len {
+            its.push(TItem.{ id: id, typ: "av01", props: tprops[..], ext: text[..] })!;
+        }
+    }
+    let mut iref = strs.String.init();
+    defer iref.deinit();
+    put_box(&mut iref, "dimg", refs.bytes())!;
+    return make_file(its.items(), pc.bytes(), iref.bytes(), mdat.bytes());
+}
+
+test "grids: tiles that cover the grid, each once" {
+    let mut ipco = strs.String.init();
+    defer ipco.deinit();
+    let mut tile = strs.String.init();
+    defer tile.deinit();
+    tile_of("alpha.avif", &mut ipco, &mut tile) catch return;
+    ispe_box(&mut ipco, 64, 48)!;  // 2
+    let two: [2]u16 = [2, 3];
+    let f1 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 120, 48, two[..])!;
+    defer mem.free(f1);
+    let mut img = decode(f1)!;
+    defer img.deinit();
+    @expect_eq(img.width, 120);
+    @expect_eq(img.height, 48);
+    // the tiles are the same picture (but for the chroma filtered at their
+    // edges)
+    for x in @as(usize, 2)..48 {
+        let a = ((10 * 120) + x) * 3;
+        let b = a + (64 * 3);
+        @expect_eq(img.data[a..a + 3], img.data[b..b + 3]);
+    }
+    // a column too few or too many
+    let f2 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 130, 48, two[..])!;
+    defer mem.free(f2);
+    @expect(fails(f2));
+    let f3 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 64, 48, two[..])!;
+    defer mem.free(f3);
+    @expect(fails(f3));
+    // a tile used twice
+    let same: [2]u16 = [2, 2];
+    let f4 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 120, 48, same[..])!;
+    defer mem.free(f4);
+    @expect(fails(f4));
+    // many tiles sharing their data
+    let mut ids = vec.Vec.[u16].init();
+    defer ids.deinit();
+    for k in @as(usize, 0)..256 {
+        ids.push(@truncate(u16, k + 2))!;
+    }
+    let f5 = grid_file(ipco.bytes(), tile.bytes(), 16, 16, 1024, 768, ids.items())!;
+    defer mem.free(f5);
+    @expect(fails(f5));
 }
