@@ -38,7 +38,8 @@ const NS_PER_S: i64 = 1000000000;
 // Duration
 // -----------------------------------------------------------------------------
 
-/// A signed length of time in nanoseconds (about ±292 years).
+/// A signed length of time in nanoseconds (about ±292 years; arithmetic
+/// saturates there).
 pub struct Duration {
     ns: i64,
 
@@ -47,23 +48,23 @@ pub struct Duration {
     }
 
     pub fn microseconds(n: i64) Duration {
-        return Duration.{ ns: n * NS_PER_US };
+        return Duration.{ ns: @mul_sat(n, NS_PER_US) };
     }
 
     pub fn milliseconds(n: i64) Duration {
-        return Duration.{ ns: n * NS_PER_MS };
+        return Duration.{ ns: @mul_sat(n, NS_PER_MS) };
     }
 
     pub fn seconds(n: i64) Duration {
-        return Duration.{ ns: n * NS_PER_S };
+        return Duration.{ ns: @mul_sat(n, NS_PER_S) };
     }
 
     pub fn minutes(n: i64) Duration {
-        return Duration.{ ns: n * (60 * NS_PER_S) };
+        return Duration.{ ns: @mul_sat(n, 60 * NS_PER_S) };
     }
 
     pub fn hours(n: i64) Duration {
-        return Duration.{ ns: n * (3600 * NS_PER_S) };
+        return Duration.{ ns: @mul_sat(n, 3600 * NS_PER_S) };
     }
 
     /// Whole milliseconds (truncated toward zero).
@@ -81,11 +82,11 @@ pub struct Duration {
     }
 
     pub fn add(self: Duration, o: Duration) Duration {
-        return Duration.{ ns: self.ns + o.ns };
+        return Duration.{ ns: @add_sat(self.ns, o.ns) };
     }
 
     pub fn sub(self: Duration, o: Duration) Duration {
-        return Duration.{ ns: self.ns - o.ns };
+        return Duration.{ ns: @sub_sat(self.ns, o.ns) };
     }
 
     /// Like Go's Duration.String: "1h2m3.5s", "1.5s", "250ms", "3µs",
@@ -196,16 +197,16 @@ pub struct Instant {
 
     /// The time since this instant.
     pub fn elapsed(self: Instant) Duration {
-        return Duration.{ ns: ax_clock_ns(CLOCK_MONOTONIC) - self.ns };
+        return Duration.{ ns: @sub_sat(ax_clock_ns(CLOCK_MONOTONIC), self.ns) };
     }
 
     /// self - earlier.
     pub fn since(self: Instant, earlier: Instant) Duration {
-        return Duration.{ ns: self.ns - earlier.ns };
+        return Duration.{ ns: @sub_sat(self.ns, earlier.ns) };
     }
 
     pub fn add(self: Instant, d: Duration) Instant {
-        return Instant.{ ns: self.ns + d.ns };
+        return Instant.{ ns: @add_sat(self.ns, d.ns) };
     }
 }
 
@@ -369,7 +370,11 @@ pub struct Time {
     }
 
     pub fn from_unix_millis(ms: i64) Time {
-        return Time.{ sec: floor_div(ms, 1000), nsec: @int_cast(u32, (ms - (floor_div(ms, 1000) * 1000)) * 1000000) };
+        let mut r = ms % 1000;
+        if r < 0 {
+            r += 1000;
+        }
+        return Time.{ sec: floor_div(ms, 1000), nsec: @int_cast(u32, r * 1000000) };
     }
 
     /// Seconds since the epoch.
@@ -379,21 +384,35 @@ pub struct Time {
 
     /// (Saturates beyond what an i64 holds, about 292 million years.)
     pub fn unix_millis(self: Time) i64 {
+        if self.sec < 0 {
+            // (sec * 1000 alone may not fit when the sum does)
+            return @add_sat(@mul_sat(self.sec + 1, 1000), @as(i64, self.nsec / 1000000) - 1000);
+        }
         return @add_sat(@mul_sat(self.sec, 1000), @as(i64, self.nsec / 1000000));
     }
 
     /// (Saturates beyond what an i64 holds: before 1677 and after 2262.)
     pub fn unix_nanos(self: Time) i64 {
+        if self.sec < 0 {
+            return @add_sat(@mul_sat(self.sec + 1, NS_PER_S), @as(i64, self.nsec) - NS_PER_S);
+        }
         return @add_sat(@mul_sat(self.sec, NS_PER_S), @as(i64, self.nsec));
     }
 
+    /// (Saturates at the first and last instants a Time holds.)
     pub fn add(self: Time, d: Duration) Time {
         let mut sec = @add_sat(self.sec, d.ns / NS_PER_S);
         let mut ns = @as(i64, self.nsec) + (d.ns % NS_PER_S);
         if ns < 0 {
+            if sec == @min_value(i64) {
+                return Time.{ sec: sec, nsec: 0 };
+            }
             ns += NS_PER_S;
             sec -= 1;
         } else if ns >= NS_PER_S {
+            if sec == @max_value(i64) {
+                return Time.{ sec: sec, nsec: 999999999 };
+            }
             ns -= NS_PER_S;
             sec += 1;
         }
@@ -436,11 +455,15 @@ pub struct Time {
         return self.at_offset(0);
     }
 
-    /// The calendar fields at `offset` seconds east of UTC.
+    /// The calendar fields at `offset` seconds east of UTC (saturating, for
+    /// the first and last instants).
     pub fn at_offset(self: Time, offset: i32) DateTime {
-        let s = self.sec + @as(i64, offset);
+        let s = @add_sat(self.sec, @as(i64, offset));
         let days = floor_div(s, 86400);
-        let rem = s - (days * 86400);
+        let mut rem = s % 86400;
+        if rem < 0 {
+            rem += 86400;
+        }
         let c = civil_from_days(days);
         let jan1 = days_from_civil(c.year, 1, 1);
         return DateTime.{
@@ -821,4 +844,24 @@ test "far times saturate instead of trapping" {
     @expect_eq(old.unix_nanos(), @min_value(i64));
     @expect_eq(far.sub(old).ns, @max_value(i64));
     @expect_eq(old.sub(far).ns, @min_value(i64));
+    // at the ends of a Time, and of a Duration
+    let last = Time.from_unix(@max_value(i64), 999999999);
+    @expect_eq(last.add(Duration.nanoseconds(1)).compare(last), 0);
+    @expect_eq(last.add(Duration.seconds(@max_value(i64))).compare(last), 0);
+    let first = Time.from_unix(@min_value(i64), 0);
+    @expect_eq(first.add(Duration.nanoseconds(-1)).compare(first), 0);
+    @expect_eq(first.add(Duration.hours(@min_value(i64))).compare(first), 0);
+    let dt = Time.from_unix(@max_value(i64), 0).at_offset(3600);
+    @expect_eq(dt.year, 292277026596);
+    @expect_eq(Time.from_unix(@min_value(i64), 0).at_offset(-3600).year, -292277022657);
+    @expect_eq(Duration.hours(@max_value(i64) / 1000).ns, @max_value(i64));
+    @expect_eq(Duration.microseconds(@min_value(i64)).ns, @min_value(i64));
+    @expect_eq(Time.from_unix_millis(@min_value(i64)).unix_millis(), @min_value(i64));
+    @expect_eq(Time.from_unix_millis(-1).unix_millis(), -1);
+    @expect_eq(Time.from_unix(-1, 5).unix_nanos(), -999999995);
+    let nmin = Time.from_unix(-9223372037, 145224192);  // the earliest unix_nanos holds
+    @expect_eq(nmin.unix_nanos(), @min_value(i64));
+    @expect_eq(nmin.add(Duration.nanoseconds(1)).unix_nanos(), @min_value(i64) + 1);
+    @expect_eq(Duration.seconds(-1).sub(Duration.nanoseconds(@max_value(i64))).ns, @min_value(i64));
+    @expect_eq(Duration.seconds(1).add(Duration.nanoseconds(@max_value(i64))).ns, @max_value(i64));
 }

@@ -315,12 +315,25 @@ pub fn sort(xs: []mut []u8) CollateError!void {
     c.sort(xs)!;
 }
 
+// Marks a code point taken by a discontiguous contraction (NFD text holds
+// nothing above U+10FFFF).
+const TAKEN: u32 = 0xffffffff;
+
+// How many non-starters after a contraction's start a discontiguous match
+// looks at: the stream-safe bound of UAX #15, so that a long run of
+// combining marks costs linear time.
+const MAX_LOOKAHEAD: usize = 30;
+
 /// The collation elements of NFD text s (S2 of UTS #10). Code points that
-/// take part in a discontiguous contraction are removed from s.
+/// take part in a discontiguous contraction are replaced in s with TAKEN.
 fn elements(s: *mut vec.Vec.[u32], out: *mut vec.Vec.[u32]) CollateError!void {
     let mut i: usize = 0;
     while i < s.len {
         let cp = s.get(i);
+        if cp == TAKEN {
+            i += 1;
+            continue;
+        }
         let e = lookup(cp);
         if e == 0 {
             implicit(cp, out)!;
@@ -332,8 +345,21 @@ fn elements(s: *mut vec.Vec.[u32], out: *mut vec.Vec.[u32]) CollateError!void {
             i += 1;
             continue;
         }
-        // a contraction may start here: the longest contiguous match
-        let items = s.items();
+        // a contraction may start here: the longest contiguous match, over
+        // the code points not yet taken
+        let mut win: [8]u32 = [0; 8];
+        let mut at: [8]usize = [0; 8];
+        let mut wn: usize = 0;
+        let mut p = i;
+        while (p < s.len) and (wn < win.len) {
+            let c = s.get(p);
+            if c != TAKEN {
+                win[wn] = c;
+                at[wn] = p;
+                wn += 1;
+            }
+            p += 1;
+        }
         let mut seq: [8]u32 = [0; 8];
         let mut n: usize = 1;
         seq[0] = cp;
@@ -341,9 +367,9 @@ fn elements(s: *mut vec.Vec.[u32], out: *mut vec.Vec.[u32]) CollateError!void {
         let mut k = contractions_of(cp);
         while (k < t.CONTR_FIRST.len) and (t.CONTR_FIRST[k] == cp) {
             let len = @as(usize, t.CONTR_LEN[k]);
-            if ((i + len) <= items.len) and (pack_seq(items[i..i + len]) == t.CONTR_SEQ[k]) {
+            if (len <= wn) and (pack_seq(win[..len]) == t.CONTR_SEQ[k]) {
                 n = len;
-                @mem_copy(seq[..n], items[i..i + n]);
+                @mem_copy(seq[..n], win[..n]);
                 entry = t.CONTR_CE[k];
                 break;  // (longest first)
             }
@@ -351,15 +377,22 @@ fn elements(s: *mut vec.Vec.[u32], out: *mut vec.Vec.[u32]) CollateError!void {
         }
         let contiguous = n;
         // then unblocked non-starters further on that extend it
-        // (discontiguous matches, S2.1.1-S2.1.3)
-        let mut j = i + n;
+        // (discontiguous matches, S2.1.1-S2.1.3), among the next
+        // MAX_LOOKAHEAD
+        let mut j = at[n - 1] + 1;
         let mut last_ccc: u32 = 0;
-        while (j < s.len) and (n < seq.len) {
+        let mut seen: usize = 0;
+        while (j < s.len) and (n < seq.len) and (seen < MAX_LOOKAHEAD) {
             let c = s.get(j);
+            if c == TAKEN {
+                j += 1;
+                continue;
+            }
             let cc = unicode.combining_class(c);
             if cc == 0 {
                 break;
             }
+            seen += 1;
             if (last_ccc != 0) and (last_ccc >= cc) {
                 j += 1;  // blocked
                 continue;
@@ -369,14 +402,15 @@ fn elements(s: *mut vec.Vec.[u32], out: *mut vec.Vec.[u32]) CollateError!void {
             if found < t.CONTR_FIRST.len {
                 n += 1;
                 entry = t.CONTR_CE[found];
-                _ = s.remove(j);
+                s.set(j, TAKEN);
+                j += 1;
                 continue;
             }
             last_ccc = cc;
             j += 1;
         }
         push_entry(entry, out)!;
-        i += contiguous;  // (the discontiguous ones were removed)
+        i = at[contiguous - 1] + 1;
     }
 }
 
@@ -540,4 +574,32 @@ test "code points beyond Unicode sort as U+FFFD" {
     c.sort_key_cps(bad[..], &mut k1)!;
     c.sort_key_cps(good[..], &mut k2)!;
     @expect_eq(k1.bytes(), k2.bytes());
+}
+
+test "long runs of combining marks take linear time" {
+    let mut c = Collator.init(Options.default());
+    defer c.deinit();
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut key = strs.String.init();
+    defer key.deinit();
+    // U+0F71 starts contractions and blocks itself: each one once looked
+    // through the whole run
+    for k in @as(usize, 0)..50000 {
+        _ = k;
+        s.push_str("\u{f71}")!;
+    }
+    c.sort_key(s.bytes(), &mut key)!;
+    // a discontiguous contraction (и with a breve, over a dot below) each
+    // time: each one once shifted the rest of the text
+    s.clear();
+    for k in @as(usize, 0)..50000 {
+        _ = k;
+        s.push_str("\u{438}\u{323}\u{306}")!;
+    }
+    key.clear();
+    c.sort_key(s.bytes(), &mut key)!;
+    // a mark after one taken by a contraction still counts
+    @expect_eq(compare("\u{438}\u{323}\u{306}", "\u{439}\u{323}")!, 0);
+    @expect_eq(compare("\u{438}\u{323}\u{306}\u{301}", "\u{438}\u{323}\u{306}")!, 1);
 }

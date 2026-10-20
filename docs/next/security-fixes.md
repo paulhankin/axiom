@@ -145,3 +145,20 @@
   quadratic time.
 - `std/text/wrap`: wrapping a very long word, with or without a hyphenator, no longer
   takes quadratic time.
+- `std/unicode/collate`: sort keys took quadratic time on long runs of combining marks.
+  A discontiguous contraction looks at most 30 non-starters past its start (the
+  stream-safe limit of UAX #15), and the marks it takes are no longer removed from the
+  middle of the text.
+- `std/math/decimal`: `normalize` and exact quotients and roots removed trailing zeros
+  one at a time (8 s for `1` and 100000 zeros); they are found by halves. `MAX_DIGITS`,
+  which bounds every number and precision, is now 100000 (it was 1000000, where
+  parsing, formatting and division took seconds to minutes); past it operations fail
+  with `Overflow`.
+- `std/math/bigint`: `parse` and `format` convert by halves, `sqrt` uses Newton's method
+  at doubling precision, and `gcd` uses Lehmer's algorithm. Division is still quadratic.
+- `std/math/rational`: `Rational.parse` accepts at most `MAX_DIGITS` (100000) digits;
+  more fail with `Overflow`.
+- `std/time`: `Time.add`, `at_offset`, `from_unix_millis` and the `Duration`
+  constructors and arithmetic overflowed (and trapped in an `--overflow=trap` build)
+  near the ends of an i64; they saturate. `std/time/tz` rules no longer overflow for
+  far-away instants.

@@ -112,9 +112,10 @@ schedule).
 | xml | attribute defaults looked up by element, and what they add (a default's value plus 64 bytes) limited to `MAX_EXPANSION` or four times the document's size; entity expansion limited to `MAX_EXPANSION`; duplicate attributes found with a hash set (past 16) and expanded names by sorting; namespace prefixes looked up in a map, in the parser and in `canonicalize` |
 | yaml | the tree with aliases expanded limited to 100 times the text's size plus 100000, counting each node 1 and each scalar its bytes too |
 | template | sections nest at most `MAX_DEPTH` (100) deep, with partials when rendering; a render budget (`MAX_WORK`: 16 per tag, 1 per byte written, so at most 64 MiB); partials compiled once per render; delimiters at most `MAX_DELIMITER` (16) bytes |
-| unicode | linear-time reordering (a counting sort), word boundaries (a capped regional-indicator count) and sentence boundaries (a memoized suffix scan) |
+| unicode | linear-time reordering (a counting sort), word boundaries (a capped regional-indicator count) and sentence boundaries (a memoized suffix scan); collation looks at most 30 non-starters ahead for a discontiguous contraction, and marks the ones it takes instead of removing them |
 | bidi | isolates matched with an explicit stack, not recursion |
 | path | glob `**` matched with single backtracking, not exponentially |
 | draw | edges sorted in O(n log n) above 32 crossings; bad or tiny dash patterns fall back to a solid line |
 | text | `fit` measures widths incrementally; `wrap` breaks and hyphenates long words in linear time (the hyphenation search reads at most `hyphen.MAX_WORD` bytes of a word) |
-| time | saturating arithmetic for far-away times |
+| time | saturating arithmetic for far-away times (`Time`, `Duration`, offsets); time zone rules move far instants into a nearer 400-year cycle |
+| decimal, rational, bigint | numbers and precisions at most `MAX_DIGITS` (100000) digits in decimal and in `Rational.parse` (`Overflow` past it); trailing zeros found by halves; radix conversion by halves; Lehmer's gcd; square roots at doubling precision |

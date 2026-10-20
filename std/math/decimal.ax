@@ -25,8 +25,10 @@
 // the operands: z.add(&x, &y). A Decimal owns its memory (deinit frees it).
 //
 // Exponents are limited to +-10^15, and results that would need more than
-// MAX_DIGITS digits (such as 1e1000000 + 1) fail with Overflow, so hostile
-// input cannot make an operation take unbounded time or memory.
+// MAX_DIGITS digits (such as 1e100000 + 1) fail with Overflow, as do
+// precisions above it, so hostile input cannot make an operation take
+// unbounded time or memory: division (quadratic in the digits) is the
+// slowest, a fraction of a second at the limit.
 // =============================================================================
 
 import "../fmt.ax" as fmt;
@@ -50,8 +52,8 @@ pub enum Rounding: u8 {
     CEILING = 6,    // toward plus infinity
 }
 
-/// The most digits a result may have.
-pub const MAX_DIGITS: u64 = 1000000;
+/// The most digits a number (and a precision) may have.
+pub const MAX_DIGITS: u64 = 100000;
 const MAX_EXP: i64 = 1000000000000000;
 
 pub struct Decimal {
@@ -631,7 +633,7 @@ fn mul_pow10(b: *mut bigint.BigInt, k: u64) DecimalError!void {
     if k == 0 {
         return;
     }
-    if k > (MAX_DIGITS * 2) {
+    if k > ((MAX_DIGITS * 2) + 3) {  // (div and sqrt scale to prec + 1 digits and more)
         return error.Overflow;
     }
     let mut p = pow10(k)!;
@@ -723,23 +725,50 @@ fn round_drop(q: *mut bigint.BigInt, k: u64, mode: Rounding) DecimalError!void {
 
 // Removes trailing zeros of q while e < limit.
 fn strip_zeros(q: *mut bigint.BigInt, e: *mut i64, limit: i64) DecimalError!void {
-    if q.is_zero() {
+    if q.is_zero() or (e.* >= limit) {
         return;
     }
-    let mut ten = bigint.BigInt.from_u64(10)!;
-    defer ten.deinit();
+    // 10^k divides q only if 2^k does
+    let m = @min(@as(u64, q.trailing_zeros()), @bit_cast(u64, limit - e.*));
+    let k = zeros_upto(q, m)!;
+    if k > 0 {
+        let mut p = pow10(k)!;
+        defer p.deinit();
+        q.quo(q, &p)!;
+        e.* += @bit_cast(i64, k);
+    }
+}
+
+// The number of trailing decimal zeros of q (nonzero), or m if that is
+// fewer. Each step halves the part of q it looks at.
+fn zeros_upto(q: *bigint.BigInt, m: u64) DecimalError!u64 {
+    if m == 0 {
+        return 0;
+    }
+    let mut p = pow10(m)!;
+    defer p.deinit();
     let mut quo = bigint.BigInt.init();
     defer quo.deinit();
     let mut rem = bigint.BigInt.init();
     defer rem.deinit();
-    while e.* < limit {
-        bigint.BigInt.quo_rem(&mut quo, &mut rem, q, &ten)!;
-        if not rem.is_zero() {
-            break;
-        }
-        q.set(&quo)!;
-        e.* += 1;
+    bigint.BigInt.quo_rem(&mut quo, &mut rem, q, &p)!;
+    if rem.is_zero() {
+        return m;
     }
+    if m == 1 {
+        return 0;
+    }
+    // q mod 10^m has q's zeros, fewer than m: are there h of them?
+    let h = m / 2;
+    let mut ph = pow10(h)!;
+    defer ph.deinit();
+    let mut low = bigint.BigInt.init();
+    defer low.deinit();
+    bigint.BigInt.quo_rem(&mut quo, &mut low, &rem, &ph)!;
+    if not low.is_zero() {
+        return zeros_upto(&low, h - 1)!;
+    }
+    return h + zeros_upto(&quo, (m - h) - 1)!;
 }
 
 // -----------------------------------------------------------------------------
@@ -929,6 +958,59 @@ test "division and roots" {
     let mut neg = dec("-4");
     defer neg.deinit();
     @expect(fails(q.sqrt(&neg, 10)));
+}
+
+test "long numbers stay fast" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str("1")!;
+    for k in @as(u64, 1)..MAX_DIGITS {
+        _ = k;
+        s.push_str("0")!;
+    }
+    let mut d = Decimal.parse(s.bytes())!;
+    defer d.deinit();
+    d.normalize(&d)!;
+    @expect(is(&d, "1E+99999"));
+    s.push_str("0")!;
+    @expect(too_long(s.bytes()));
+    // trailing zeros found by halves, never past the ideal exponent
+    let cases: [7][2][]u8 = [
+        ["1234500", "1.2345E+6"],
+        ["-1.2300", "-1.23"],
+        ["120000000000000000000000000000000000000.000", "1.2E+38"],
+        ["10000000000000000000000000000000000000000000000000001",
+         "10000000000000000000000000000000000000000000000000001"],
+        ["7e-30", "7E-30"],
+        ["0.000", "0"],
+        ["102030400000000000", "1.020304E+17"],
+    ];
+    for k in @as(usize, 0)..7 {
+        let mut x = dec(cases[k][0]);
+        defer x.deinit();
+        x.normalize(&x)!;
+        if not is(&x, cases[k][1]) {
+            @expect_eq(k, 99);
+        }
+    }
+    let mut one = dec("1");
+    defer one.deinit();
+    let mut four = dec("4");
+    defer four.deinit();
+    let mut q = Decimal.init();
+    defer q.deinit();
+    q.div(&one, &one, 20000, Rounding.HALF_EVEN)!;
+    @expect(is(&q, "1"));
+    q.sqrt(&four, 20000)!;
+    @expect(is(&q, "2"));
+    @expect(fails(q.div(&one, &one, @int_cast(u32, MAX_DIGITS + 1), Rounding.HALF_EVEN)));
+    @expect(fails(q.sqrt(&four, @int_cast(u32, MAX_DIGITS + 1))));
+}
+
+fn too_long(s: []u8) bool {
+    let mut d = Decimal.parse(s) catch |e| return e == error.Overflow;
+    d.deinit();
+    return false;
 }
 
 test "rounding" {

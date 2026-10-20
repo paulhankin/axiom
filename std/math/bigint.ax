@@ -21,10 +21,14 @@
 // div_mod is Euclidean (the modulus is never negative). Shifts right round
 // toward minus infinity; the bitwise operations take non-negative values.
 //
-// Multiplication switches to Karatsuba's algorithm for large operands;
-// mod_pow uses Montgomery multiplication for odd moduli. mod_pow_secret
-// runs in time that depends only on the sizes of its operands, for secret
-// exponents such as RSA private keys; everything else takes time that
+// Multiplication switches to Karatsuba's algorithm for large operands,
+// parse converts by halves with it, and gcd uses Lehmer's algorithm.
+// Division is Knuth's algorithm D, so dividing (and formatting, in a base
+// that is not a power of two) takes time quadratic in the size: formatting
+// a million decimal digits takes about ten seconds. mod_pow uses
+// Montgomery multiplication for odd moduli. mod_pow_secret runs in time
+// that depends only on the sizes of its operands, for secret exponents
+// such as RSA private keys; everything else takes time that
 // depends on the values.
 // =============================================================================
 
@@ -871,20 +875,37 @@ pub struct BigInt {
 
     // --- number theory -------------------------------------------------------
 
-    /// self = gcd(|x|, |y|).
+    /// self = gcd(|x|, |y|), by Lehmer's algorithm: Euclid's steps run on
+    /// the top 64 bits and are applied to the whole numbers together, so
+    /// that each pass over them takes about 32 bits off.
     pub fn gcd(self: *mut BigInt, x: *BigInt, y: *BigInt) BigintError!void {
         let mut a = BigInt.init();
         defer a.deinit();
         let mut b = BigInt.init();
         defer b.deinit();
-        a.abs(x)!;
-        b.abs(y)!;
+        if nat_cmp(x.limbs(), y.limbs()) >= 0 {
+            a.abs(x)!;
+            b.abs(y)!;
+        } else {
+            a.abs(y)!;
+            b.abs(x)!;
+        }
         let mut t = BigInt.init();
         defer t.deinit();
-        while not b.is_zero() {
+        while b.n > 2 {
+            lehmer_step(&mut a, &mut b, &mut t)!;
+        }
+        if b.n > 0 {
+            // the rest in 64 bits
             t.rem(&a, &b)!;
-            a.set(&b)!;
-            b.set(&t)!;
+            let mut p = b.to_u64()!;
+            let mut q = t.to_u64()!;
+            while q != 0 {
+                let r = p % q;
+                p = q;
+                q = r;
+            }
+            a.set_u64(p)!;
         }
         self.set(&a)!;
     }
@@ -936,23 +957,35 @@ pub struct BigInt {
             self.neg = false;
             return;
         }
-        // Newton's method from a power of two above the root
-        let mut r = BigInt.from_u64(1)!;
-        defer r.deinit();
-        r.shl(&r, (x.bit_len() / 2) + 1)!;
+        // Newton's method at doubling precision: each step takes the root
+        // of x's top bits to twice as many bits, so the last division,
+        // about half x's size, costs most
+        let c = (x.bit_len() - 1) / 2;
+        let mut steps: usize = 0;
+        while (c >> steps) != 0 {
+            steps += 1;
+        }
+        let mut a = BigInt.from_u64(1)!;
+        defer a.deinit();
         let mut t = BigInt.init();
         defer t.deinit();
-        loop {
-            // t = (r + x / r) / 2
-            t.quo(x, &r)!;
-            t.add(&t, &r)!;
-            t.shr(&t, 1)!;
-            if t.cmp(&r) >= 0 {
-                break;
-            }
-            r.set(&t)!;
+        let mut d: usize = 0;
+        while steps > 0 {
+            steps -= 1;
+            let e = d;
+            d = c >> steps;
+            // a = (a << (d - e - 1)) + (x >> (2c - e - d + 1)) / a
+            t.shr(x, (((2 * c) - e) - d) + 1)!;
+            t.quo(&t, &a)!;
+            a.shl(&a, (d - e) - 1)!;
+            a.add(&a, &t)!;
         }
-        self.set(&r)!;
+        // a is the root or one more
+        t.mul(&a, &a)!;
+        if t.cmp(x) > 0 {
+            a.add_i64(&a, -1)!;
+        }
+        self.set(&a)!;
     }
 
     /// self = x^e mod m (e >= 0, m > 0), with Montgomery multiplication when
@@ -1002,28 +1035,16 @@ pub struct BigInt {
         if (b < 2) or (b > 36) or (i >= s.len) {
             return error.InvalidNumber;
         }
-        // take digits in chunks that fit a limb multiplier
-        let mut chunk: u32 = 1;
-        let mut per: u32 = 0;
-        while (@as(u64, chunk) * @as(u64, b)) <= 0xFFFFFFFF {
-            chunk *= b;
-            per += 1;
-        }
-        let mut z = BigInt.init();
-        z.reserve(((s.len * 6) / 32) + 2) catch |e| {
-            return e;
-        };
-        let mut acc: u32 = 0;
-        let mut mult: u32 = 1;
-        let mut count: u32 = 0;
-        let mut digits: usize = 0;
+        // the digits' values, then the number from them
+        let dv = mem.alloc.[u8](s.len - i)!;
+        defer mem.free(dv);
+        let mut nd: usize = 0;
         let mut last_us = true;
         while i < s.len {
             let c = s[i];
             i += 1;
             if c == '_' {
                 if last_us {
-                    z.deinit();
                     return error.InvalidNumber;
                 }
                 last_us = true;
@@ -1031,34 +1052,16 @@ pub struct BigInt {
             }
             let d = digit_value(c);
             if d >= b {
-                z.deinit();
                 return error.InvalidNumber;
             }
             last_us = false;
-            acc = (acc * b) + d;
-            mult *= b;
-            count += 1;
-            digits += 1;
-            if count == per {
-                z.mul_add_small(mult, acc) catch |e| {
-                    z.deinit();
-                    return e;
-                };
-                acc = 0;
-                mult = 1;
-                count = 0;
-            }
+            dv[nd] = @truncate(u8, d);
+            nd += 1;
         }
-        if (digits == 0) or last_us {
-            z.deinit();
+        if (nd == 0) or last_us {
             return error.InvalidNumber;
         }
-        if count > 0 {
-            z.mul_add_small(mult, acc) catch |e| {
-                z.deinit();
-                return e;
-            };
-        }
+        let mut z = from_digits(dv[..nd], b)!;
         z.neg = neg and (z.n > 0);
         return z;
     }
@@ -1107,42 +1110,11 @@ pub struct BigInt {
             w.write_all(out)!;
             return;
         }
-        // divide repeatedly by the largest power of base that fits a limb
-        let mut chunk: u32 = 1;
-        let mut per: usize = 0;
-        while (@as(u64, chunk) * @as(u64, base)) <= 0xFFFFFFFF {
-            chunk *= base;
-            per += 1;
-        }
-        if base == 10 {
-            chunk = 1_000_000_000;
-            per = 9;
-        }
-        let max_digits = ((self.n * 32) + per) + 2;
-        let out = mem.alloc.[u8](max_digits)!;
+        let out = to_digits(self, base)!;
         defer mem.free(out);
-        let work = mem.alloc.[u32](self.n)!;
-        defer mem.free(work);
-        @mem_copy(work, self.limbs());
-        let mut wn = self.n;
-        let mut at = out.len;
-        while wn > 0 {
-            let mut r: u32 = 0;
-            if base == 10 {
-                r = nat_div_1e9(work[..wn], work[..wn]);
-            } else {
-                r = nat_div_small(work[..wn], work[..wn], chunk);
-            }
-            wn = norm(work[..wn]);
-            let mut rr = r;
-            for k in 0..per {
-                if (wn == 0) and (rr == 0) {
-                    break;
-                }
-                at -= 1;
-                out[at] = digits[@as(usize, rr % base)];
-                rr = rr / base;
-            }
+        let mut at: usize = 0;
+        while out[at] == '0' {
+            at += 1;
         }
         if self.neg {
             w.write_all("-")!;
@@ -1198,6 +1170,271 @@ pub struct BigInt {
             out[(out.len - 1) - i] = b;
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Lehmer's gcd
+// -----------------------------------------------------------------------------
+
+// The 64 bits of x (with n limbs or fewer) below the top h bits of an
+// n-limb number (n >= 2).
+fn top64(x: []u32, n: usize, h: u32) u64 {
+    let mut l: [3]u64 = [0; 3];
+    for k in @as(usize, 0)..3 {
+        if ((k + 1) <= n) and ((n - (k + 1)) < x.len) {
+            l[k] = @as(u64, x[n - (k + 1)]);
+        }
+    }
+    let hi = (l[0] << 32) | l[1];
+    if h == 0 {
+        return hi;
+    }
+    return (hi << h) | (l[2] >> (32 - h));
+}
+
+// z = v, negated if neg.
+fn set_signed(z: *mut BigInt, v: u64, neg: bool) BigintError!void {
+    z.set_u64(v)!;
+    z.neg = neg and (z.n > 0);
+}
+
+// One pass of Lehmer's algorithm on a >= b >= 2^64 (t is scratch): the
+// quotients Euclid would find from the top bits, while Collins' condition
+// shows they are the true ones, give a, b = u0 a + v0 b, u1 a + v1 b
+// (Jebelean, "Improving the multiprecision Euclidean algorithm"); with
+// none, one ordinary step.
+fn lehmer_step(a: *mut BigInt, b: *mut BigInt, t: *mut BigInt) BigintError!void {
+    let n = a.n;
+    let h = @clz(a.d[n - 1]);
+    let mut a1 = top64(a.limbs(), n, h);
+    let mut a2 = top64(b.limbs(), n, h);
+    let mut u0: u64 = 0;
+    let mut u1: u64 = 1;
+    let mut u2: u64 = 0;
+    let mut v0: u64 = 0;
+    let mut v1: u64 = 0;
+    let mut v2: u64 = 1;
+    // the cofactors' signs alternate: u0, v1 >= 0 >= u1, v0 when even
+    let mut even = false;
+    while (a2 >= v2) and ((a1 - a2) >= (v1 + v2)) {
+        let q = a1 / a2;
+        let r = a1 % a2;
+        a1 = a2;
+        a2 = r;
+        let u3 = u1 + (q * u2);
+        u0 = u1;
+        u1 = u2;
+        u2 = u3;
+        let v3 = v1 + (q * v2);
+        v0 = v1;
+        v1 = v2;
+        v2 = v3;
+        even = not even;
+    }
+    if v0 == 0 {
+        t.rem(a, b)!;
+        a.set(b)!;
+        b.set(t)!;
+        return;
+    }
+    let mut c = BigInt.init();
+    defer c.deinit();
+    let mut na = BigInt.init();
+    defer na.deinit();
+    let mut nb = BigInt.init();
+    defer nb.deinit();
+    set_signed(&mut c, u0, not even)!;
+    na.mul(a, &c)!;
+    set_signed(&mut c, v0, even)!;
+    t.mul(b, &c)!;
+    na.add(&na, t)!;
+    set_signed(&mut c, u1, even)!;
+    nb.mul(a, &c)!;
+    set_signed(&mut c, v1, not even)!;
+    t.mul(b, &c)!;
+    nb.add(&nb, t)!;
+    a.set(&na)!;
+    b.set(&nb)!;
+}
+
+// -----------------------------------------------------------------------------
+// Radix conversion
+// -----------------------------------------------------------------------------
+
+// Below this many limbs, numbers are converted a limb-sized chunk of digits
+// at a time (quadratic); above it, by halves, splitting at a power of the
+// base, so that a conversion costs a few multiplications or divisions of
+// the whole number.
+const CONVERT_SPLIT: usize = 48;
+
+// The largest power of base that fits a limb, and its exponent.
+fn chunk_of(base: u32, per: *mut usize) u32 {
+    let mut chunk: u32 = 1;
+    per.* = 0;
+    while (@as(u64, chunk) * @as(u64, base)) <= 0xFFFFFFFF {
+        chunk *= base;
+        per.* += 1;
+    }
+    return chunk;
+}
+
+// pows[k] = chunk^(2^k) for k < n, and zero above.
+fn chunk_powers(chunk: u32, pows: []mut BigInt, n: usize) BigintError!void {
+    for k in 0..pows.len {
+        pows[k] = BigInt.init();
+    }
+    pows[0].set_u64(@as(u64, chunk))!;
+    for k in 1..n {
+        pows[k].mul(&pows[k - 1], &pows[k - 1])!;
+    }
+}
+
+fn free_powers(pows: []mut BigInt) void {
+    for k in 0..pows.len {
+        pows[k].deinit();
+    }
+    mem.free(pows);
+}
+
+/// The number whose digits in base b (most significant first) are dv.
+fn from_digits(dv: []u8, b: u32) BigintError!BigInt {
+    let mut per: usize = 0;
+    let chunk = chunk_of(b, &mut per);
+    let mut levels: usize = 1;
+    while (per << levels) < dv.len {
+        levels += 1;
+    }
+    if dv.len <= (CONVERT_SPLIT * per) {
+        levels = 1;  // (no split)
+    }
+    let pows = mem.alloc.[BigInt](levels)!;
+    chunk_powers(chunk, pows, levels) catch |e| {
+        free_powers(pows);
+        return e;
+    };
+    defer free_powers(pows);
+    let mut z = BigInt.init();
+    digits_to(&mut z, dv, b, per, pows) catch |e| {
+        z.deinit();
+        return e;
+    };
+    return z;
+}
+
+// z = the number with digits dv, with pows[k] = chunk^(2^k) while per * 2^k
+// < dv.len.
+fn digits_to(z: *mut BigInt, dv: []u8, b: u32, per: usize, pows: []BigInt) BigintError!void {
+    if dv.len <= (CONVERT_SPLIT * per) {
+        z.n = 0;
+        z.neg = false;
+        z.reserve(((dv.len * 6) / 32) + 2)!;
+        let mut acc: u32 = 0;
+        let mut mult: u32 = 1;
+        let mut count: usize = 0;
+        for d in dv {
+            acc = (acc * b) + @as(u32, d);
+            mult *= b;
+            count += 1;
+            if count == per {
+                z.mul_add_small(mult, acc)!;
+                acc = 0;
+                mult = 1;
+                count = 0;
+            }
+        }
+        if count > 0 {
+            z.mul_add_small(mult, acc)!;
+        }
+        return;
+    }
+    // the low per * 2^k digits and the rest, at most as many
+    let mut k: usize = 0;
+    while (per << (k + 1)) < dv.len {
+        k += 1;
+    }
+    let lo_len = per << k;
+    let mut hi = BigInt.init();
+    defer hi.deinit();
+    digits_to(&mut hi, dv[..dv.len - lo_len], b, per, pows)!;
+    let mut lo = BigInt.init();
+    defer lo.deinit();
+    digits_to(&mut lo, dv[dv.len - lo_len..], b, per, pows)!;
+    z.mul(&hi, &pows[k])!;
+    z.add(z, &lo)!;
+}
+
+/// The digits of x (> 0) in base (not a power of two), with leading zeros,
+/// in new memory.
+fn to_digits(x: *BigInt, base: u32) ![]mut u8 {
+    let mut per: usize = 0;
+    let chunk = chunk_of(base, &mut per);
+    // chunk^(2^levels) > x (chunk >= 2^26)
+    let mut levels: usize = 1;
+    while (@as(usize, 26) << levels) < (32 * x.n) {
+        levels += 1;
+    }
+    let mut used = levels;
+    if x.n <= CONVERT_SPLIT {
+        used = 1;  // (no split)
+    }
+    let pows = mem.alloc.[BigInt](levels)!;
+    chunk_powers(chunk, pows, used) catch |e| {
+        free_powers(pows);
+        return e;
+    };
+    defer free_powers(pows);
+    let out = mem.alloc.[u8](per << levels)!;
+    write_digits(x, out, base, chunk, per, pows) catch |e| {
+        mem.free(out);
+        return e;
+    };
+    return out;
+}
+
+// Writes x (< base^out.len, out.len a multiple of per) into out with
+// leading zeros.
+fn write_digits(x: *BigInt, out: []mut u8, base: u32, chunk: u32, per: usize, pows: []BigInt) !void {
+    let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+    if (x.n <= CONVERT_SPLIT) or (out.len <= per) {
+        let work = mem.alloc.[u32](x.n)!;
+        defer mem.free(work);
+        @mem_copy(work, x.limbs());
+        let mut wn = x.n;
+        let mut at = out.len;
+        while (wn > 0) and (at > 0) {
+            let mut r: u32 = 0;
+            if chunk == 1_000_000_000 {
+                r = nat_div_1e9(work[..wn], work[..wn]);
+            } else {
+                r = nat_div_small(work[..wn], work[..wn], chunk);
+            }
+            wn = norm(work[..wn]);
+            for k in 0..per {
+                _ = k;
+                if at == 0 {
+                    break;
+                }
+                at -= 1;
+                out[at] = digits[@as(usize, r % base)];
+                r = r / base;
+            }
+        }
+        @mem_set(out[..at], '0');
+        return;
+    }
+    // split at the largest pows[k] with fewer digits than out
+    let mut k: usize = 0;
+    while ((per << (k + 1)) < out.len) and ((k + 1) < pows.len) {
+        k += 1;
+    }
+    let lo_len = per << k;
+    let mut q = BigInt.init();
+    defer q.deinit();
+    let mut r = BigInt.init();
+    defer r.deinit();
+    BigInt.quo_rem(&mut q, &mut r, x, &pows[k])!;
+    write_digits(&q, out[..out.len - lo_len], base, chunk, per, pows)!;
+    write_digits(&r, out[out.len - lo_len..], base, chunk, per, pows)!;
 }
 
 fn digit_value(c: u8) u32 {
@@ -1524,4 +1761,157 @@ test "powers, gcd, inverse, sqrt" {
     defer neg.deinit();
     s.shr(&neg, 1)!;
     @expect_eq(s.to_i64()!, -3);
+}
+
+// x = base^e
+fn power_of(x: *mut BigInt, base: i64, e: u64) void {
+    let mut b = BigInt.from_i64(base) catch @trap();
+    defer b.deinit();
+    x.pow(&b, e) catch @trap();
+}
+
+test "large numbers: conversion by halves, square roots" {
+    // 3^k round trips in several bases, and its low digits are right
+    let mut x = BigInt.init();
+    defer x.deinit();
+    power_of(&mut x, 3, 40000);
+    x.add_i64(&x, 12345)!;
+    let bases: [5]u32 = [3, 7, 10, 16, 36];
+    for b in bases {
+        let s = str_of(&x, b);
+        defer mem.free(s);
+        let mut y = BigInt.parse(s, b)!;
+        defer y.deinit();
+        @expect_eq(y.cmp(&x), 0);
+    }
+    let s = str_of(&x, 10);
+    defer mem.free(s);
+    @expect_eq(s.len, 19085);
+    @expect_eq(s[..20], "70825359317191844040");  // (from Python)
+    @expect_eq(s[9000..9030], "049496295657198532909921343323");
+    let mut m = BigInt.init();
+    defer m.deinit();
+    power_of(&mut m, 10, 18);
+    let mut low = BigInt.init();
+    defer low.deinit();
+    low.mod(&x, &m)!;
+    let ls = str_of(&low, 10);
+    defer mem.free(ls);
+    @expect_eq(s[s.len - ls.len..], ls);
+    // runs of zeros inside: 10^20000 + 7
+    let mut t = BigInt.init();
+    defer t.deinit();
+    power_of(&mut t, 10, 20000);
+    t.add_i64(&t, 7)!;
+    let ts = str_of(&t, 10);
+    defer mem.free(ts);
+    @expect_eq(ts.len, 20001);
+    @expect_eq(ts[0], '1');
+    @expect_eq(ts[20000], '7');
+    for i in @as(usize, 1)..20000 {
+        @expect_eq(ts[i], '0');
+    }
+    let mut u = BigInt.parse(ts, 10)!;
+    defer u.deinit();
+    @expect_eq(u.cmp(&t), 0);
+    // floor square roots, small and large
+    let mut r = BigInt.init();
+    defer r.deinit();
+    let mut v = BigInt.init();
+    defer v.deinit();
+    for n in @as(i64, 0)..2000 {
+        v.set_i64(n)!;
+        r.sqrt(&v)!;
+        let q = r.to_i64()!;
+        @expect(((q * q) <= n) and (((q + 1) * (q + 1)) > n));
+    }
+    let mut sq = BigInt.init();
+    defer sq.deinit();
+    sq.mul(&x, &x)!;
+    r.sqrt(&sq)!;
+    @expect_eq(r.cmp(&x), 0);
+    sq.add_i64(&sq, -1)!;
+    r.sqrt(&sq)!;
+    r.add_i64(&r, 1)!;
+    @expect_eq(r.cmp(&x), 0);
+    r.sqrt(&x)!;
+    sq.mul(&r, &r)!;
+    @expect(sq.cmp(&x) <= 0);
+    r.add_i64(&r, 1)!;
+    sq.mul(&r, &r)!;
+    @expect(sq.cmp(&x) > 0);
+}
+
+// gcd by Euclid's algorithm, to check Lehmer's against
+fn euclid(x: *BigInt, y: *BigInt) BigInt {
+    let mut a = BigInt.init();
+    a.abs(x) catch @trap();
+    let mut b = BigInt.init();
+    defer b.deinit();
+    b.abs(y) catch @trap();
+    let mut t = BigInt.init();
+    defer t.deinit();
+    while not b.is_zero() {
+        t.rem(&a, &b) catch @trap();
+        a.set(&b) catch @trap();
+        b.set(&t) catch @trap();
+    }
+    return a;
+}
+
+test "gcd of large numbers" {
+    let mut g = BigInt.init();
+    defer g.deinit();
+    // consecutive Fibonacci numbers, Euclid's worst case
+    let mut a = BigInt.from_u64(1)!;
+    defer a.deinit();
+    let mut b = BigInt.from_u64(1)!;
+    defer b.deinit();
+    let mut c = BigInt.init();
+    defer c.deinit();
+    for k in @as(usize, 0)..20000 {
+        _ = k;
+        c.add(&a, &b)!;
+        a.set(&b)!;
+        b.set(&c)!;
+    }
+    g.gcd(&a, &b)!;
+    @expect_eq(g.cmp_i64(1), 0);
+    // shared factors, and numbers of many shapes, against Euclid
+    let mut x = BigInt.init();
+    defer x.deinit();
+    let mut y = BigInt.init();
+    defer y.deinit();
+    let mut f = BigInt.init();
+    defer f.deinit();
+    for i in @as(u64, 0)..60 {
+        power_of(&mut x, 3, (i * 37) + 1);
+        x.add_i64(&x, @as(i64, @int_cast(u32, i)) - 30)!;
+        power_of(&mut y, 7, (i * 23) + 5);
+        y.add_i64(&y, -@as(i64, @int_cast(u32, i)))!;
+        power_of(&mut f, 2, i * 5);
+        f.add_i64(&f, 1)!;
+        if (i % 3) == 0 {
+            x.mul(&x, &f)!;
+            y.mul(&y, &f)!;
+        }
+        if (i % 7) == 1 {
+            y.mul(&y, &x)!;
+        }
+        if (i % 5) == 2 {
+            x.neg_of(&x)!;
+        }
+        g.gcd(&x, &y)!;
+        let mut want = euclid(&x, &y);
+        defer want.deinit();
+        @expect_eq(g.cmp(&want), 0);
+        g.gcd(&y, &x)!;
+        @expect_eq(g.cmp(&want), 0);
+    }
+    x.set_i64(0)!;
+    g.gcd(&x, &y)!;
+    y.abs(&y)!;
+    @expect_eq(g.cmp(&y), 0);
+    g.gcd(&x, &x)!;
+    @expect(g.is_zero());
 }

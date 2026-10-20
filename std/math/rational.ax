@@ -32,7 +32,9 @@
 // (std/math/rational/testdata, from cmd/axiom/internal/tests/tools/gen_rational_tests.py).
 //
 // Decimal exponents in parsed strings are limited to +-MAX_EXP, so hostile
-// input cannot ask for 10^(10^9).
+// input cannot ask for 10^(10^9), and numbers to MAX_DIGITS digits, so
+// that reducing a fraction (a gcd, which takes time quadratic in the size)
+// stays fast.
 // =============================================================================
 
 import "../io.ax" as io;
@@ -46,6 +48,11 @@ pub error RationalError { InvalidNumber, DivisionByZero, Overflow, OutOfMemory, 
 
 /// The largest decimal exponent parse accepts ("1e100000").
 pub const MAX_EXP: i64 = 100000;
+
+/// The most digits parse accepts in a number (in the numerator and the
+/// denominator together, or before and after the point), not counting
+/// underscores; more are Overflow.
+pub const MAX_DIGITS: usize = 100000;
 
 pub struct Rational {
     num: bigint.BigInt,  // signed
@@ -219,6 +226,9 @@ pub struct Rational {
             if (den_end == den_start) or (den_end != t.len) {
                 return error.InvalidNumber;
             }
+            if (count_digits(t[int_start..int_end]) + count_digits(t[den_start..den_end])) > MAX_DIGITS {
+                return error.Overflow;
+            }
             n.deinit();
             n = bigint.BigInt.parse(t[int_start..int_end], 10)!;
             d.deinit();
@@ -261,6 +271,9 @@ pub struct Rational {
             }
             if i != t.len {
                 return error.InvalidNumber;
+            }
+            if (count_digits(t[int_start..int_end]) + count_digits(t[frac_start..frac_end])) > MAX_DIGITS {
+                return error.Overflow;
             }
             // n = the digits before and after the point, d = 10^(digits after)
             if int_end > int_start {
@@ -768,6 +781,17 @@ fn scan_digits(s: []u8, i: usize) RationalError!usize {
     return k;
 }
 
+// The digits in s, which holds digits and underscores.
+fn count_digits(s: []u8) usize {
+    let mut n: usize = 0;
+    for c in s {
+        if c != '_' {
+            n += 1;
+        }
+    }
+    return n;
+}
+
 fn pow10(e: i64) RationalError!bigint.BigInt {
     let mut ten = bigint.BigInt.from_i64(10)!;
     defer ten.deinit();
@@ -825,6 +849,58 @@ fn bad(s: []u8, want: error) bool {
     let mut r = Rational.parse(s) catch |e| return e == want;
     r.deinit();
     return false;
+}
+
+test "long numbers: a digit limit, and fast reduction" {
+    // consecutive Fibonacci numbers (coprime: Euclid's worst case), times 6
+    let mut a = bigint.BigInt.from_i64(1)!;
+    defer a.deinit();
+    let mut b = bigint.BigInt.from_i64(1)!;
+    defer b.deinit();
+    let mut c = bigint.BigInt.init();
+    defer c.deinit();
+    for k in @as(usize, 0)..20000 {
+        _ = k;
+        c.add(&a, &b)!;
+        a.set(&b)!;
+        b.set(&c)!;
+    }
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let sa = a.to_string(10)!;
+    defer mem.free(sa);
+    let sb = b.to_string(10)!;
+    defer mem.free(sb);
+    c.mul_i64(&a, 6)!;
+    let sa6 = c.to_string(10)!;
+    defer mem.free(sa6);
+    c.mul_i64(&b, 6)!;
+    let sb6 = c.to_string(10)!;
+    defer mem.free(sb6);
+    s.push_str(sa6)!;
+    s.push_str("/")!;
+    s.push_str(sb6)!;
+    let mut r = Rational.parse(s.bytes())!;
+    defer r.deinit();
+    @expect_eq(r.num.cmp(&a), 0);
+    @expect_eq(r.den.cmp(&b), 0);
+    // past MAX_DIGITS
+    s.clear();
+    for k in @as(usize, 0)..MAX_DIGITS {
+        _ = k;
+        s.push_str("7")!;
+    }
+    let mut ok = Rational.parse(s.bytes())!;
+    ok.deinit();
+    s.push_str("/3")!;
+    @expect(bad(s.bytes(), error.Overflow));
+    s.truncate(MAX_DIGITS - 1);
+    s.push_str(".25")!;
+    @expect(bad(s.bytes(), error.Overflow));
+    s.truncate(MAX_DIGITS - 1);
+    s.push_str("_5e-100000")!;
+    let mut t = Rational.parse(s.bytes())!;
+    t.deinit();
 }
 
 test "arithmetic" {
