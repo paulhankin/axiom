@@ -295,3 +295,8 @@
   - A dash ending exactly at a corner made a piece with NaN coordinates, which could
     make the whole stroke vanish, and an odd count of dash lengths is now repeated, as
     in SVG and PDF.
+- `std/graphics/shape`: a font whose GSUB or GPOS lookup list claimed more lookups than
+  its data holds made each `shape`, `measure` and `draw_text` call allocate about
+  1.6 MB, and a `Shaper` kept that for every font it had seen. Lookup counts are
+  limited to what the data can hold, and a `Shaper` keeps lookup data for its 8 most
+  recently used fonts.

@@ -1350,17 +1350,20 @@ struct FontDigests {
     font: usize,
     data: usize,
     digests: layout.Digests,
+    used: u64,
 }
 
 const MAX_PLANS: usize = 32;
 
+const MAX_FONTS: usize = 8;
+
 /// Shapes many runs, remembering what it works out for each font, script,
 /// direction and set of features (the fonts must outlive it): the lookups
-/// of a font are read once, and the plans of the last MAX_PLANS settings
-/// kept. Its runs share one minimum for the work and glyphs a run may take,
-/// so many short runs cost no more than their text; making a plan is
-/// charged to the run's work, and a run without the work left for its plan
-/// is shaped without the font's features.
+/// of the last MAX_FONTS fonts used are read once, and the plans of the
+/// last MAX_PLANS settings kept. Its runs share one minimum for the work
+/// and glyphs a run may take, so many short runs cost no more than their
+/// text; making a plan is charged to the run's work, and a run without the
+/// work left for its plan is shaped without the font's features.
 pub struct Shaper {
     plans: vec.Vec.[Cached],
     fonts: vec.Vec.[FontDigests],
@@ -1396,14 +1399,28 @@ pub struct Shaper {
         for k in @as(usize, 0)..fd.len {
             if (fd[k].font == @int_from_ptr(f)) and (fd[k].data == @int_from_ptr(f.data.ptr)) {
                 spent.* += @bit_cast(i64, @as(u64, k));
+                fd[k].used = self.clock;
                 return &mut fd[k].digests;
             }
         }
         spent.* += @bit_cast(i64, @as(u64, fd.len));
         let face = font_face(f);
         let mut ds = layout.Digests.init(&face)!;
-        self.fonts.push(FontDigests.{ font: @int_from_ptr(f), data: @int_from_ptr(f.data.ptr),
-                                      digests: ds }) catch |e| {
+        let entry = FontDigests.{ font: @int_from_ptr(f), data: @int_from_ptr(f.data.ptr), digests: ds,
+                                  used: self.clock };
+        if fd.len >= MAX_FONTS {
+            // replace the least recently used
+            let mut old: usize = 0;
+            for k in @as(usize, 1)..fd.len {
+                if fd[k].used < fd[old].used {
+                    old = k;
+                }
+            }
+            fd[old].digests.deinit();
+            fd[old] = entry;
+            return &mut fd[old].digests;
+        }
+        self.fonts.push(entry) catch |e| {
             ds.deinit();
             return e;
         };
@@ -2105,4 +2122,29 @@ test "marks on cursive chains" {
     @expect_eq(ms[1].x_offset, -500);
     @expect_eq(ms[5000].x_offset, ms[1].x_offset);
     @expect_eq(ms[5000].y_offset, ms[1].y_offset);
+}
+
+test "lookup counts past the data" {
+    // a GSUB table whose lookup list claims 65535 lookups
+    let mut gsub = vec.Vec.[u8].init();
+    defer gsub.deinit();
+    put_words(&mut gsub, "1 0 0 0 10 65535")!;
+    let mut data = test_font("GSUB", gsub.items(), "")!;
+    defer data.deinit();
+    let mut faces: [10]font.Font = [font.Font.init(data.items())!; 10];
+    let mut s = Shaper.init();
+    defer s.deinit();
+    for k in @as(usize, 0)..faces.len {
+        let gs = s.shape(&faces[k], "ab", options())!;
+        defer mem.free(gs);
+        @expect_eq(gs[1].id, 2);
+        // the digests are for the lookups the data has room for
+        @expect(s.fonts.items()[0].digests.digests[0].len <= (data.len / 2));
+    }
+    // the digests of the fonts used last are kept
+    @expect_eq(s.fonts.len, MAX_FONTS);
+    let fd = s.fonts.items();
+    for k in @as(usize, 0)..fd.len {
+        @expect(fd[k].font != @int_from_ptr(&faces[0]));
+    }
 }
