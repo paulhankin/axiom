@@ -18,6 +18,9 @@
 #include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#define st_mtim st_mtimespec
+#endif
 
 #include "diag.h"
 #include "package.h"
