@@ -21,6 +21,7 @@
 import "../../io.ax" as io;
 import "../../math.ax" as math;
 import "../../mem.ax" as mem;
+import "../../os/fs.ax" as fs;
 import "../../str.ax" as strs;
 import "../../sync.ax" as sync;
 import "../image.ax" as image;
@@ -133,6 +134,13 @@ const FAST_BITS: u32 = 9;
 /// More scans than this is not a real image (progressive files use a dozen or so).
 const MAX_SCANS: usize = 256;
 
+/// The blocks all of a file's scans may visit, as a multiple of the frame's
+/// blocks. A progressive file's scans visit each block fewer than ten times
+/// (libjpeg's scripts: six); an end-of-band run codes thousands of blocks in
+/// a few bits, so without this limit hostile scans could cost far more than
+/// the file's size.
+const MAX_SCAN_WORK: usize = 32;
+
 struct Huffman {
     fast: [512]u8,  // by the next 9 bits: the code's index, or 255
     code: [256]u16,
@@ -202,6 +210,7 @@ struct Component {
     bw: usize,  // blocks across and down, padded to whole MCUs
     bh: usize,
     coeffs: []mut i16,  // 64 per block, zigzag-free (natural order), not dequantized
+    nz: []mut u64,      // progressive: per block, bit k set if zigzag position k is nonzero
     pixels: []mut u8,   // bw * 8 by bh * 8
     dc_pred: i32,
 }
@@ -216,6 +225,8 @@ struct Decoder {
     nomore: bool,
     fake: usize,  // zero bytes supplied past the end of the scan's data
     scans: usize,
+    work: usize,  // blocks visited by the scans so far
+    work_limit: usize,
     // frame
     width: usize,
     height: usize,
@@ -237,6 +248,7 @@ struct Decoder {
     scan_n: usize,
     spec_start: usize,
     spec_end: usize,
+    band: u64,  // the zigzag positions spec_start..spec_end, as bits
     succ_high: u32,
     succ_low: u32,
     eob_run: i32,
@@ -408,7 +420,7 @@ struct Decoder {
         }
     }
 
-    fn block_prog_ac(self: *mut Decoder, c: usize, data: []mut i16) JpegError!void {
+    fn block_prog_ac(self: *mut Decoder, c: usize, data: []mut i16, nz: *mut u64) JpegError!void {
         if self.spec_start == 0 {
             return error.Corrupt;
         }
@@ -439,6 +451,7 @@ struct Decoder {
                         return error.Corrupt;
                     }
                     data[@as(usize, DEZIGZAG[k])] = sat16(self.receive_extend(s) *% (@as(i32, 1) << self.succ_low));
+                    nz.* = nz.* | (@as(u64, 1) << @as(u64, k));
                     k += 1;
                 }
             }
@@ -447,12 +460,13 @@ struct Decoder {
         // refinement
         let bit = @truncate(i16, @as(i32, 1) << self.succ_low);
         if self.eob_run > 0 {
+            // only the band's nonzero coefficients take a bit each (going
+            // over the band would cost 63 steps a block for no input)
             self.eob_run -= 1;
-            for k in self.spec_start..self.spec_end + 1 {
-                let z = @as(usize, DEZIGZAG[k]);
-                if data[z] != 0 {
-                    refine(self, data, z, bit);
-                }
+            let mut m = nz.* & self.band;
+            while m != 0 {
+                refine(self, data, @as(usize, DEZIGZAG[@truncate(usize, @ctz(m))]), bit);
+                m = m & (m - 1);
             }
             return;
         }
@@ -489,6 +503,9 @@ struct Decoder {
                 } else {
                     if r == 0 {
                         data[z] = s;
+                        if s != 0 {
+                            nz.* = nz.* | (@as(u64, 1) << @as(u64, k - 1));
+                        }
                         break;
                     }
                     r -= 1;
@@ -508,8 +525,7 @@ struct Decoder {
             let h = (self.comp[c].y + 7) / 8;
             for j in @as(usize, 0)..h {
                 for i in @as(usize, 0)..w {
-                    let at = ((j * self.comp[c].bw) + i) * 64;
-                    self.block(c, self.comp[c].coeffs[at..at + 64])!;
+                    self.block(c, (j * self.comp[c].bw) + i)!;
                     if not self.after_mcu()! {
                         return;
                     }
@@ -525,8 +541,7 @@ struct Decoder {
                         for x in @as(usize, 0)..self.comp[c].h {
                             let bx = (i * self.comp[c].h) + x;
                             let by = (j * self.comp[c].v) + y;
-                            let at = ((by * self.comp[c].bw) + bx) * 64;
-                            self.block(c, self.comp[c].coeffs[at..at + 64])!;
+                            self.block(c, (by * self.comp[c].bw) + bx)!;
                         }
                     }
                 }
@@ -537,14 +552,20 @@ struct Decoder {
         }
     }
 
-    fn block(self: *mut Decoder, c: usize, data: []mut i16) JpegError!void {
+    /// Decodes block b of component c.
+    fn block(self: *mut Decoder, c: usize, b: usize) JpegError!void {
+        self.work += 1;
+        if self.work > self.work_limit {
+            return error.Corrupt;
+        }
+        let data = self.comp[c].coeffs[b * 64..(b * 64) + 64];
         if not self.progressive {
             return self.block_baseline(c, data);
         }
         if self.spec_start == 0 {
             return self.block_prog_dc(c, data);
         }
-        return self.block_prog_ac(c, data);
+        return self.block_prog_ac(c, data, &mut self.comp[c].nz[b]);
     }
 
     /// Counts down the restart interval; false once the scan has ended.
@@ -696,18 +717,20 @@ struct Decoder {
                 bw: 0,
                 bh: 0,
                 coeffs: self.comp[i].coeffs,
+                nz: self.comp[i].nz,
                 pixels: self.comp[i].pixels,
                 dc_pred: 0,
             };
             self.hmax = @max(self.hmax, h);
             self.vmax = @max(self.vmax, v);
         }
-        // every block costs at least a bit (its DC code in the first scan), so
-        // a file too small for the frame it declares is broken: stop before
-        // allocating and decoding gigabytes for it
-        let px = @mul_checked(self.width, self.height) catch return error.Corrupt;
-        if (px / 512) > self.data.len {
-            return error.Corrupt;
+        if self.ncomp == 1 {
+            // a single component's scans are not interleaved, so its factors
+            // do not matter (A.2.2): 1x1 keeps its blocks unpadded
+            self.comp[0].h = 1;
+            self.comp[0].v = 1;
+            self.hmax = 1;
+            self.vmax = 1;
         }
         // (as libjpeg: fractional sampling ratios are not supported)
         for i in @as(usize, 0)..self.ncomp {
@@ -717,14 +740,30 @@ struct Decoder {
         }
         self.mcux = (self.width + (8 * self.hmax) - 1) / (8 * self.hmax);
         self.mcuy = (self.height + (8 * self.vmax) - 1) / (8 * self.vmax);
+        // (with width * height at most MAX_PIXELS, none of this overflows)
+        let mut blocks: usize = 0;
         for i in @as(usize, 0)..self.ncomp {
             let c = &mut self.comp[i];
             c.x = ((self.width * c.h) + self.hmax - 1) / self.hmax;
             c.y = ((self.height * c.v) + self.vmax - 1) / self.vmax;
             c.bw = self.mcux * c.h;
             c.bh = self.mcuy * c.v;
+            blocks += c.bw * c.bh;
+        }
+        // every block costs at least a bit (its DC code in the first scan), so
+        // a file too small for the frame it declares is broken: stop before
+        // allocating and decoding gigabytes for it
+        if (blocks / 8) > self.data.len {
+            return error.Corrupt;
+        }
+        self.work_limit = blocks * MAX_SCAN_WORK;
+        for i in @as(usize, 0)..self.ncomp {
+            let c = &mut self.comp[i];
             c.coeffs = mem.alloc_zeroed.[i16]((c.bw * c.bh) * 64)!;
             c.pixels = mem.alloc.[u8]((c.bw * c.bh) * 64)!;
+            if self.progressive {
+                c.nz = mem.alloc_zeroed.[u64](c.bw * c.bh)!;
+            }
         }
         self.got_frame = true;
     }
@@ -767,6 +806,8 @@ struct Decoder {
             if (self.spec_start > 0) and (n != 1) {
                 return error.Corrupt;  // AC scans hold one component
             }
+            self.band = (@as(u64, 0xffffffffffffffff) >> @as(u64, 63 - self.spec_end)) & ~(
+                (@as(u64, 1) << @as(u64, self.spec_start)) - 1);
         } else {
             self.spec_start = 0;
             self.spec_end = 63;
@@ -790,6 +831,9 @@ struct Decoder {
             if self.comp[i].coeffs.len > 0 {
                 mem.free(self.comp[i].coeffs);
                 mem.free(self.comp[i].pixels);
+            }
+            if self.comp[i].nz.len > 0 {
+                mem.free(self.comp[i].nz);
             }
         }
     }
@@ -935,6 +979,7 @@ pub fn decode(data: []u8) JpegError!image.Image {
     defer mem.destroy(d);
     for i in @as(usize, 0)..4 {
         d.comp[i].coeffs = @slice_from_ptr(@ptr_from_int(*mut i16, 2), 0);
+        d.comp[i].nz = @slice_from_ptr(@ptr_from_int(*mut u64, 8), 0);
         d.comp[i].pixels = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
     }
     defer d.free();
@@ -2023,5 +2068,106 @@ test "encode_to" {
         @expect_eq(e, error.NoSpaceLeft);
         return;
     };
+    @trap();
+}
+
+/// FNV-1a of an image's samples.
+fn pixel_hash(img: *image.Image) u64 {
+    let mut h: u64 = 1469598103934665603;
+    for b in img.data {
+        h = (h ^ @as(u64, b)) *% 1099511628211;
+    }
+    return h;
+}
+
+test "progressive files made by Pillow" {
+    // (the hashes are of the pixels libjpeg decodes)
+    let names: [2][]u8 = ["std/graphics/image/testdata/jpeg/progressive.jpg",
+                          "std/graphics/image/testdata/jpeg/progressive_gray.jpg"];
+    let hashes: [2]u64 = [9773376046014354417, 9444540891651353026];
+    for n in @as(usize, 0)..2 {
+        let data = fs.read_file(names[n]) catch return;
+        defer mem.free(data);
+        let mut img = decode(data)!;
+        defer img.deinit();
+        @expect_eq(img.width, 61);
+        @expect_eq(img.height, 43);
+        @expect_eq(pixel_hash(&img), hashes[n]);
+        if n == 1 {
+            // a single component's sampling factors change nothing
+            let copy = strs.dup(data)!;
+            defer mem.free(copy);
+            let mut i: usize = 0;
+            while not ((copy[i] == 0xff) and (copy[i + 1] == 0xc2)) {
+                i += 1;
+            }
+            copy[i + 11] = 0x43;
+            let mut again = decode(copy)!;
+            defer again.deinit();
+            @expect_eq(pixel_hash(&again), hashes[n]);
+        }
+    }
+}
+
+fn put_segment(s: *mut strs.String, m: u8, body: []u8) !void {
+    let n = body.len + 2;
+    let hdr: [4]u8 = [0xff, m, @truncate(u8, n >> 8), @truncate(u8, n)];
+    s.push_str(hdr[..])!;
+    s.push_str(body)!;
+}
+
+/// The start of a 2048x2048 grey progressive JPEG, with an AC
+/// table whose one code (0) is a 32767-block end-of-band run, and a comment
+/// enough to pass the size check.
+fn hostile_start(s: *mut strs.String) !void {
+    s.push_str("\xff\xd8")!;
+    let mut dqt: [65]u8 = [1; 65];
+    dqt[0] = 0;
+    put_segment(s, 0xdb, dqt[..])!;
+    put_segment(s, 0xc2, "\x08\x08\x00\x08\x00\x01\x01\x11\x00")!;
+    put_segment(s, 0xc4, "\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xe0")!;
+    let com: [9000]u8 = [0; 9000];
+    put_segment(s, 0xfe, com[..])!;
+}
+
+test "scans that code no data" {
+    // as many scans as allowed, each one end-of-band run over all 65536
+    // blocks: first passes and refinements must not cost a full walk of
+    // every block per scan
+    let succ: [2]u8 = [0x00, 0x10];
+    for t in succ {
+        let mut s = strs.String.init();
+        defer s.deinit();
+        hostile_start(&mut s)!;
+        let sos: [6]u8 = [1, 1, 0, 1, 63, t];
+        for i in @as(usize, 0)..MAX_SCANS {
+            put_segment(&mut s, 0xda, sos[..])!;
+            s.push_str("\x7f\xfe\xff\x00\xfd\xff\x00\xff\x00")!;
+        }
+        s.push_str("\xff\xd9")!;
+        let mut img = decode(s.bytes()) catch |e| {
+            @expect_eq(e, error.Corrupt);
+            continue;
+        };
+        img.deinit();
+        @trap();
+    }
+}
+
+test "thin frames" {
+    // 1 x 65535 with every component sampled 4x4 pads each to 32 times its
+    // pixels; the size check counts the padded blocks
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str("\xff\xd8")!;
+    put_segment(&mut s, 0xc0, "\x08\xff\xff\x00\x01\x03\x01\x44\x00\x02\x44\x00\x03\x44\x00")!;
+    let com: [200]u8 = [0; 200];
+    put_segment(&mut s, 0xfe, com[..])!;
+    s.push_str("\xff\xd9")!;
+    let mut img = decode(s.bytes()) catch |e| {
+        @expect_eq(e, error.Corrupt);
+        return;
+    };
+    img.deinit();
     @trap();
 }

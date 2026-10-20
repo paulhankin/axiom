@@ -56,7 +56,7 @@ schedule).
 
 | Where | What std does |
 |---|---|
-| JPEG | refuses fractional chroma sampling; at most 256 progressive scans; stops early on filler bytes; a file must be at least `pixels / 512` bytes for the size it claims |
+| JPEG | refuses fractional chroma sampling; at most 256 progressive scans, which together may visit each block at most 32 times (refinement runs visit only nonzero coefficients); stops early on filler bytes; a file must be at least one bit per block of its frame, padded to whole MCUs and summed over components (`blocks / 8` bytes) |
 | EXR | 64-bit checked size products; tiles clamped to the image; each block decoded once (a seen-block bitmap); `raw / 2048 <= data.len`; shared PIZ scratch space |
 | FLAC | block size at most `MAX_BLOCK` (65536); preallocation from the header capped at 1 MiB |
 | Vorbis | codebooks sorted in O(n log n) (heapsort on packed keys) |

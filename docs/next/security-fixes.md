@@ -162,3 +162,8 @@
   constructors and arithmetic overflowed (and trapped in an `--overflow=trap` build)
   near the ends of an i64; they saturate. `std/time/tz` rules no longer overflow for
   far-away instants.
+- `std/graphics/image/jpeg`: progressive scans made of end-of-band runs took time far
+  beyond the file's size (a 512 KB file of 255 such scans took over a minute). A
+  refinement run visits only the coefficients already nonzero, and a file's scans
+  together may visit each block at most 32 times, else it is `Corrupt`. The minimum
+  file size for a frame counts the frame padded to whole MCUs over all components.
