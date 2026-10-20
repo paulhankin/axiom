@@ -92,7 +92,8 @@ struct FnInst {
     dispatch: bool,  // @features / @multiversion: chooses a version (vers) and calls it
     vers: []mut *mut FnInst,
     key: []u8,
-    depth: i32,  // instantiation nesting: one more than the instance whose body asked for it
+    depth: i32,    // instantiation nesting: one more than the instance whose body asked for it
+    site: u.Span,  // where the non-generic code it was instantiated from asked for it (inst_site)
 }
 
 let mut inst_map: u.SymMap.[*mut FnInst] = u.SymMap.[*mut FnInst].{ keys: @ptr_from_int(*mut usize, 0),
@@ -278,7 +279,73 @@ fn ct(t: *mut ast.Type) *mut ast.Type {
     if u.isnil(t) or u.isnil(F) or not t.has_params {
         return t;
     }
-    return ty.subst(t, F.from, F.to);
+    let r = ty.subst(t, F.from, F.to);
+    check_inst_sizes(r, inst_site(g_cur_span));
+    return r;
+}
+
+// Object sizes (spec §5.5): sema checks every type written in the program;
+// the types that instantiating generic code makes of them are checked here,
+// each once, at the instantiation site (E0473, once per site). Only the
+// innermost types too large are reported (not `!G` too when G is).
+fn check_inst_sizes(t: *mut ast.Type, sp: u.Span) void {
+    if u.isnil(t) or t.size_checked or t.has_params {
+        return;
+    }
+    t.size_checked = true;
+    let k = t.kind;
+    let mut inner = false;
+    if (k == ast.TY_PTR) or (k == ast.TY_SLICE) or (k == ast.TY_ARRAY) or (k == ast.TY_ERRUNION) {
+        check_inst_sizes(t.elem, sp);
+        inner = too_large(t.elem);
+    } else if k == ast.TY_FN {
+        for i in 0..t.params.len {
+            check_inst_sizes(t.params[i], sp);
+        }
+        check_inst_sizes(t.ret, sp);
+    } else if (k == ast.TY_STRUCT) or (k == ast.TY_UNION) {
+        for i in 0..t.args.len {
+            check_inst_sizes(t.args[i], sp);
+            if too_large(t.args[i]) {
+                inner = true;
+            }
+        }
+    }
+    if too_large(t) and not inner {
+        for i in 0..size_sites.len {
+            let r = size_sites.get(i);
+            if (r.file == sp.file) and (r.start == sp.start) and (r.end == sp.end) {
+                return;
+            }
+        }
+        size_sites.push(sp);
+        _ = dg.err(sp, "E0473", ty.size_problem(t));
+    }
+}
+
+// The sites check_inst_sizes has reported (one error each, as sema's).
+let mut size_sites: u.List.[u.Span] = u.List.[u.Span].{ data: @ptr_from_int(*mut u.Span, 0), len: 0, cap: 0 };
+
+fn too_large(t: *mut ast.Type) bool {
+    let k = t.kind;
+    if (k != ast.TY_ARRAY) and (k != ast.TY_ERRUNION) and (k != ast.TY_STRUCT) and (k != ast.TY_UNION) {
+        return false;
+    }
+    return not t.has_params and (ty.size_problem(t).len != 0);
+}
+
+// Where the code being generated asks for an instance or makes a type, for
+// diagnostics: in a generic instance, where that instance was asked for (so
+// the non-generic code it all comes from); otherwise the code itself, or
+// `other` outside functions.
+fn inst_site(other: u.Span) u.Span {
+    if u.isnil(F) or u.isnil(F.inst) {
+        return other;
+    }
+    if F.inst.gargs.len != 0 {
+        return F.inst.site;
+    }
+    return g_cur_span;
 }
 
 fn internal_error(msg: []u8) void {
@@ -1758,9 +1825,11 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
             internal_error("generic instance with unsubstituted arguments");
         }
     }
+    fi.site = inst_site(d.name_span);
     fi.fnty = d.ty;
     if n != 0 {
         fi.fnty = ty.subst(d.ty, d.all_gparams, gargs);
+        check_inst_sizes(fi.fnty, fi.site);
     }
     let fl = fn_lty(fi.fnty);
     fi.llty = fl.t;
@@ -3006,7 +3075,12 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     let rt = ct(e.ty);
     let id = e.builtin;
     if id == ast.BI_SIZE_OF {
-        return usz(ty.type_size(ct(e.tval)));
+        let t = ct(e.tval);
+        if (ty.type_size(t) > ty.max_object_size()) and (dg.error_count() == 0) {
+            // (the type would have been E0473: a usize could not hold its size)
+            internal_error(u.f1("the size of %s reached code generation", ty.type_str(t)));
+        }
+        return usz(ty.type_size(t));
     }
     if id == ast.BI_ALIGN_OF {
         return usz(ty.type_align(ct(e.tval)));

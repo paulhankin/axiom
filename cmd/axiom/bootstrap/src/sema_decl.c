@@ -412,15 +412,8 @@ static void check_sizes(void) {
     Vec(Span) reported = {0};
     for (int i = 0; i < size_checks.len; i++) {
         SizeCheck c = size_checks.data[i];
-        const char *msg;
-        if (c.t->kind == TY_ARRAY && c.t->len > max)
-            msg = arena_printf("array length %lld is too large for the target (at most %lld)", (long long)c.t->len,
-                               (long long)max);
-        else if (type_size(c.t) > max)
-            msg = arena_printf("type %s is too large for the target: an object can have at most %lld bytes",
-                               type_str(c.t), (long long)max);
-        else
-            continue;
+        const char *msg = type_size_problem(c.t);
+        if (!msg) continue;
         bool seen = false;
         for (int j = 0; j < reported.len; j++) {
             Span r = reported.data[j];
@@ -432,6 +425,21 @@ static void check_sizes(void) {
         }
     }
     free(reported.data);
+    // The globals together, laid out one after another, must fit too: on
+    // wasm32 they share one 4 GiB memory with the stack and the heap.
+    int64_t total = 0;
+    for (int i = 0; i < g_prog.globals.len; i++) {
+        Decl *d = g_prog.globals.data[i];
+        Type *t = d->type;
+        if (!t || t->has_params || t->kind == TY_INVALID || type_size(t) > max) continue;
+        int64_t a = type_align(t);
+        total = (total + a - 1) / a * a + type_size(t);
+        if (total > max) {
+            diag_error(d->name_span, "E0473", "with '%s', the globals need more than %lld bytes, the most they can have together",
+                       d->name, (long long)max);
+            return;
+        }
+    }
 }
 
 Type *resolve_type(TypeExpr *te, TypeCtx *tc) {

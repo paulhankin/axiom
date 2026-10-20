@@ -57,6 +57,7 @@ typedef struct FnInst {
     Sym key;
     int ninl;           // inline fn: trailing parameters for its callers' call sites (INL_SITES or 0)
     int depth;          // instantiation nesting: one more than the instance whose body asked for it
+    Span site;          // where the non-generic code it was instantiated from asked for it (inst_site)
     LLVMTypeRef ref_llty;  // its type without them
     LLVMValueRef ref;   // inline fn used as a value: a function without them that calls it
 } FnInst;
@@ -92,6 +93,7 @@ typedef struct FnState {
 } FnState;
 
 static FnState *F;
+static Span g_cur_span;  // the code being generated
 
 // ---------------------------------------------------------------------------
 // Line tables (-g, --debug-info=lines): a compile unit per object, a
@@ -184,14 +186,75 @@ static void add_ext_attrs(LLVMValueRef v, Type *fnty, bool sret, bool is_call);
 
 // The concrete type of t in the function being generated. An enum is its
 // representation from here on: code generation never needs to tell them apart.
+static void check_inst_sizes(Type *t, Span sp);
+static Span inst_site(Span other);
+
 static Type *ct(Type *t) {
-    if (t && t->has_params && F) t = type_subst(t, F->from, F->to, F->nsub);
+    if (t && t->has_params && F) {
+        t = type_subst(t, F->from, F->to, F->nsub);
+        check_inst_sizes(t, inst_site(g_cur_span));
+    }
     return type_lower_enums(t);
 }
 
 static void internal_error(const char *msg) {
     fprintf(stderr, "axiom: internal compiler error: %s\n", msg);
     exit(2);
+}
+
+static bool too_large(Type *t) {
+    if (t->kind != TY_ARRAY && t->kind != TY_ERRUNION && t->kind != TY_STRUCT && t->kind != TY_UNION) return false;
+    return !t->has_params && type_size_problem(t);
+}
+
+// Object sizes (spec §5.5): sema checks every type written in the program;
+// the types that instantiating generic code makes of them are checked here,
+// each once, at the instantiation site (E0473, once per site). Only the
+// innermost types too large are reported (not `!G` too when G is).
+static Vec(Span) size_sites;
+
+static void check_inst_sizes(Type *t, Span sp) {
+    if (!t || t->size_checked || t->has_params) return;
+    t->size_checked = true;
+    bool inner = false;
+    switch (t->kind) {
+    case TY_PTR:
+    case TY_SLICE:
+    case TY_ARRAY:
+    case TY_ERRUNION:
+        check_inst_sizes(t->elem, sp);
+        inner = too_large(t->elem);
+        break;
+    case TY_FN:
+        for (int i = 0; i < t->nparams; i++) check_inst_sizes(t->params[i], sp);
+        check_inst_sizes(t->ret, sp);
+        break;
+    case TY_STRUCT:
+    case TY_UNION:
+        for (int i = 0; i < t->nargs; i++) {
+            check_inst_sizes(t->args[i], sp);
+            if (too_large(t->args[i])) inner = true;
+        }
+        break;
+    default: break;
+    }
+    if (!too_large(t) || inner) return;
+    for (int i = 0; i < size_sites.len; i++) {
+        Span r = size_sites.data[i];
+        if (r.file == sp.file && r.start == sp.start && r.end == sp.end) return;
+    }
+    vec_push(size_sites, sp);
+    diag_error(sp, "E0473", "%s", type_size_problem(t));
+}
+
+// Where the code being generated asks for an instance or makes a type, for
+// diagnostics: in a generic instance, where that instance was asked for (so
+// the non-generic code it all comes from); otherwise the code itself, or
+// `other` outside functions.
+static Span inst_site(Span other) {
+    if (!F || !F->inst) return other;
+    if (F->inst->ngargs) return F->inst->site;
+    return g_cur_span;
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +423,6 @@ enum {
 
 static LLVMValueRef string_ptr(const char *bytes, uint32_t len);
 static LLVMBasicBlockRef new_bb(const char *name);
-static Span g_cur_span;
 static LLVMValueRef trap_fn, trap_info, trap_hook;
 static LLVMTypeRef trap_fnty, site_ty;
 static SymMap site_map;
@@ -1506,7 +1568,9 @@ static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats) {
     }
     for (int i = 0; i < n; i++)
         if (gargs[i]->has_params) internal_error("generic instance with unsubstituted arguments");
+    fi->site = inst_site(d->name_span);
     fi->fnty = n ? type_subst(d->type, d->all_gparams, gargs, n) : d->type;
+    if (n) check_inst_sizes(fi->fnty, fi->site);
     fi->llty = fn_lty(fi->fnty, &fi->sret);
     fi->display = fn_display(d, gargs, n);
     const char *name;
@@ -3013,7 +3077,13 @@ static LLVMValueRef gen_builtin(Expr *e) {
     BuiltinArg *a = e->bargs.data;
     Type *rt = ct(e->type);
     switch ((BuiltinId)e->index) {
-    case BI_SIZE_OF: return usz(type_size(ct(e->tval)));
+    case BI_SIZE_OF: {
+        Type *t = ct(e->tval);
+        if (type_size(t) > max_object_size() && diag_error_count() == 0)
+            // (the type would have been E0473: a usize could not hold its size)
+            internal_error(arena_printf("the size of %s reached code generation", type_str(t)));
+        return usz(type_size(t));
+    }
     case BI_ALIGN_OF: return usz(type_align(ct(e->tval)));
     case BI_OFFSET_OF: return usz(type_field_offset(ct(e->tval), a[1].e->index));
     case BI_MIN_VALUE:

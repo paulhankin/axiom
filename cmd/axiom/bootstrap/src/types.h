@@ -61,6 +61,7 @@ struct Type {
     // layout cache
     int64_t size, align;
     bool layout_done;
+    bool size_checked;  // codegen: an instance's type, checked against the largest object
     void *backend;   // codegen type cache
 };
 
@@ -113,6 +114,8 @@ int64_t type_size(Type *t);
 #define SIZE_CAP INT64_C(0x4000000000000000)
 #define MAX_FRAME INT64_C(0x40000000)
 int64_t max_object_size(void);
+// Why t is larger than the target's largest object (E0473), or NULL if it is not.
+const char *type_size_problem(Type *t);
 int64_t type_align(Type *t);
 int64_t type_field_offset(Type *st, int i);
 Type *union_tag_type(Type *ut);

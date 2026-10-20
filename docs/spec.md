@@ -562,8 +562,14 @@ constant `N` (type `usize`).
 that every size and offset fits in an `isize`. An array's length is limited the same
 way. An array, struct, union or error union type that is larger, written anywhere or
 made by instantiating a generic type, is a compile error (`E0473`) at the type or at
-the declaration of the struct or union; so is a function whose locals need more
-stack than a frame may hold (§12.2). Sizes are computed exactly: they never wrap.
+the declaration of the struct or union; one that only instantiating a generic function
+makes (`G.[N]` in the body of `fn f[const N: usize]`) is reported where the non-generic
+code that the instantiation comes from names the instance (`f.[0x2000_0001](…)`).
+The program's globals together, laid out one after another, each at its alignment,
+are limited the same way (`E0473` at the first global that does not fit), so that on
+`wasm32` they leave room in its 4 GiB memory for the stack and the heap. A function
+whose locals need more stack than a frame may hold is `E0473` too (§12.2). Sizes are
+computed exactly: they never wrap.
 
 ### 5.6 Slices: `[]T` and `[]mut T`
 
@@ -2524,7 +2530,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0470 | Unknown constraint |
 | E0471 | A `const` generic parameter of a non-integer type |
 | E0472 | Array length or `const` argument that is not a non-negative integer constant |
-| E0473 | Type larger than the target's largest object (§5.5), or a function's locals larger than a frame may be (§12.2) |
+| E0473 | Type larger than the target's largest object (§5.5), the globals together larger than that, or a function's locals larger than a frame may be (§12.2) |
 | E0502 | Cannot infer type of literal |
 | E0503 | Literal out of range for type, or untyped `.{}` with no context |
 | E0510 | `@as` conversion is lossy |

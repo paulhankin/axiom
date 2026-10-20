@@ -251,3 +251,12 @@
 - `std/graphics/font`: `Font.init` walked every lookup index of every GPOS `kern`
   feature, even when they shared one table; indices count against the walk's budget,
   and shared feature tables are read once.
+- A type larger than the target's largest object that only generic instantiation makes
+  (`G.[N]` inside `fn f[const N: usize]`, or an array, error union or union of a
+  generic type) is now E0473, reported where non-generic code names the instance. On
+  wasm32 such a type's `@size_of` was truncated (2^32 + 8 bytes became 8) while checked
+  indexing still allowed the whole array, so `mem.new.[G.[N]]()` returned 8 bytes that
+  indexing wrote past.
+- The program's globals together must fit the target's largest object (2^31 - 1 bytes
+  on wasm32), else E0473 at the first global that does not fit; more than 4 GiB of
+  globals on wasm32 crashed the compiler.

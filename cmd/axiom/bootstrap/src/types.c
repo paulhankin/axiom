@@ -475,6 +475,17 @@ static int64_t sat_mul(int64_t n, int64_t s) { return s > 0 && n > SIZE_CAP / s 
 // a signed pointer-sized offset and the address space can always hold.
 int64_t max_object_size(void) { return g_target.ptr_bits == 32 ? INT64_C(0x7fffffff) : INT64_C(0x800000000000); }
 
+const char *type_size_problem(Type *t) {
+    int64_t max = max_object_size();
+    if (t->kind == TY_ARRAY && t->len > max)
+        return arena_printf("array length %lld is too large for the target (at most %lld)", (long long)t->len,
+                            (long long)max);
+    if (type_size(t) > max)
+        return arena_printf("type %s is too large for the target: an object can have at most %lld bytes", type_str(t),
+                            (long long)max);
+    return NULL;
+}
+
 static void layout(Type *t);
 
 int64_t type_size(Type *t) {
