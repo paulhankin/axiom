@@ -355,8 +355,8 @@ fn collect_features(mb: *mut layout.MapBuilder, p: *plan.Plan, feats: []Feature)
 }
 
 /// The kern table's kind of subtables: [has any, has non-format-0
-/// (state machine), has cross-stream].
-fn kern_info(d: []u8, k: usize) [3]bool {
+/// (state machine), has cross-stream], each subtable read charged to steps.
+fn kern_info(d: []u8, k: usize, steps: *mut i64) [3]bool {
     if (k == 0) or (layout.u16at(d, k) != 0) {
         return [false, false, false];
     }
@@ -365,6 +365,10 @@ fn kern_info(d: []u8, k: usize) [3]bool {
     let mut cross = false;
     let mut o = k + 4;
     for _i in @as(usize, 0)..n {
+        steps.* -= 1;
+        if steps.* < 0 {
+            return [false, false, false];
+        }
         let len = @as(usize, layout.u16at(d, o + 2));
         let cov = layout.u16at(d, o + 4);
         if (cov >> 8) != 0 {
@@ -381,7 +385,12 @@ fn kern_info(d: []u8, k: usize) [3]bool {
     return [n > 0, machine, cross];
 }
 
-fn make_plan(f: *font.Font, script: u32, rtl: bool, language: u32, feats: []Feature) ShapeError!plan.Plan {
+/// The plan for a font, script, direction, language and features, the
+/// records of the font it reads charged to steps (with digests from ds):
+/// once they are spent, what it has found so far. Steps of -1 make a plan
+/// without the font's features.
+fn make_plan(f: *font.Font, script: u32, rtl: bool, language: u32, feats: []Feature, ds: *mut layout.Digests,
+             steps: *mut i64) ShapeError!plan.Plan {
     let mut p = plan.Plan.{
         f: f,
         face: layout.face_init(f.data, f.table_offset("GDEF"), f.table_offset("GSUB"), f.table_offset("GPOS")),
@@ -417,7 +426,7 @@ fn make_plan(f: *font.Font, script: u32, rtl: bool, language: u32, feats: []Feat
     };
     let mut tags: [3]u32 = [0, 0, 0];
     let nt = plan.script_tags(script, &mut tags);
-    let mut mb = layout.MapBuilder.init(&p.face, tags[..nt], language);
+    let mut mb = layout.MapBuilder.init(&p.face, tags[..nt], language, ds, steps.*);
     p.shaper = plan.shaper_for(script, mb.chosen_script[0]);
     let mut fallback_position = true;
     let mut gpos_tag: u32 = 0;
@@ -436,6 +445,7 @@ fn make_plan(f: *font.Font, script: u32, rtl: bool, language: u32, feats: []Feat
         mb.deinit();
         return e;
     };
+    steps.* = mb.steps;
     mb.deinit();
     let m = &p.map;
     p.frac_mask = m.get_1_mask(tag("frac"));
@@ -449,7 +459,7 @@ fn make_plan(f: *font.Font, script: u32, rtl: bool, language: u32, feats: []Feat
     p.fallback_glyph_classes = not layout.has_glyph_classes(&p.face);
     let has_gpos = not disable_gpos and (p.face.gpos != 0) and (layout.u32at(f.data, p.face.gpos) != 0);
     p.apply_gpos = has_gpos;
-    let ki = kern_info(f.data, p.kern);
+    let ki = kern_info(f.data, p.kern, steps);
     if not has_gpos_kern or not p.apply_gpos {
         if ki[0] {
             p.apply_kern = fallback_position;
@@ -1172,9 +1182,10 @@ fn hide_default_ignorables(p: *plan.Plan, b: *mut buf.Buffer) void {
     }
 }
 
-fn shape_buffer(p: *mut plan.Plan, b: *mut buf.Buffer, feats: []Feature, sp: *mut buf.Spare) void {
+fn shape_buffer(p: *mut plan.Plan, b: *mut buf.Buffer, feats: []Feature, sp: *mut buf.Spare, spent: i64) void {
     let target_rtl = b.rtl;
     b.enter(sp);
+    b.match_ops = @sub_sat(b.match_ops, spent);
     set_unicode_props_all(b, p.map.global_mask);
     insert_dotted_circle(p, b);
     form_clusters(b);
@@ -1227,8 +1238,9 @@ fn run_props(text: []u8, opts: Options) [2]u32 {
     return [script, r];
 }
 
-/// Shapes text with a plan, past the text's own limits using what is spare.
-fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature, sp: *mut buf.Spare) ShapeError![]mut Glyph {
+/// Shapes text with a plan, past the text's own limits using what is spare,
+/// spent steps of its matching having gone to making the plan.
+fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature, sp: *mut buf.Spare, spent: i64) ShapeError![]mut Glyph {
     let mut b = buf.Buffer.init();
     defer b.deinit();
     b.rtl = p.rtl;
@@ -1250,7 +1262,7 @@ fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature, sp: *mut buf.Spar
     if b.oom or (b.len != n) {
         return error.OutOfMemory;
     }
-    shape_buffer(p, &mut b, feats, sp);
+    shape_buffer(p, &mut b, feats, sp, spent);
     b.leave(sp);
     if b.oom {
         return error.OutOfMemory;
@@ -1269,14 +1281,57 @@ fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature, sp: *mut buf.Spar
     return out;
 }
 
+/// The number of characters of text.
+fn char_count(text: []u8) usize {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while i < text.len {
+        i += @as(usize, decode(text, i)[1]);
+        n += 1;
+    }
+    return n;
+}
+
+/// What a run of text may spend on matching, plan included: its own
+/// limit and what is spare.
+fn run_steps(text: []u8, sp: *buf.Spare) i64 {
+    let n = @bit_cast(i64, @as(u64, char_count(text)));
+    return @add_sat(@mul_sat(n, buf.MATCH_OPS_FACTOR), sp.match_ops);
+}
+
+fn font_face(f: *font.Font) layout.Face {
+    return layout.face_init(f.data, f.table_offset("GDEF"), f.table_offset("GSUB"), f.table_offset("GPOS"));
+}
+
+/// Makes the plan for a run, its work charged to the run's matching (the
+/// steps used are in spent): if that runs out, a plan without the font's
+/// features (the run has nothing left for its lookups).
+fn plan_for_run(f: *font.Font, text: []u8, script: u32, rtl: bool, opts: Options, ds: *mut layout.Digests,
+                sp: *buf.Spare, spent: *mut i64) ShapeError!plan.Plan {
+    let total = run_steps(text, sp);
+    let mut steps = @sub_sat(total, spent.*);
+    let mut p = make_plan(f, script, rtl, opts.language, opts.features, ds, &mut steps)!;
+    spent.* = @sub_sat(total, steps);
+    if steps < 0 {
+        p.deinit();
+        let mut none: i64 = -1;
+        p = make_plan(f, script, rtl, opts.language, opts.features, ds, &mut none)!;
+    }
+    return p;
+}
+
 /// Shapes a run of text with a font: the glyphs, in visual order (free
 /// them with mem.free). A Shaper is faster for many runs.
 pub fn shape(f: *font.Font, text: []u8, opts: Options) ShapeError![]mut Glyph {
     let pr = run_props(text, opts);
-    let mut p = make_plan(f, pr[0], pr[1] == 1, opts.language, opts.features)!;
-    defer p.deinit();
+    let face = font_face(f);
+    let mut ds = layout.Digests.init(&face)!;
+    defer ds.deinit();
     let mut sp = buf.spare();
-    return shape_with(&mut p, text, opts.features, &mut sp);
+    let mut spent: i64 = 0;
+    let mut p = plan_for_run(f, text, pr[0], pr[1] == 1, opts, &mut ds, &sp, &mut spent)!;
+    defer p.deinit();
+    return shape_with(&mut p, text, opts.features, &mut sp, spent);
 }
 
 struct Cached {
@@ -1290,19 +1345,35 @@ struct Cached {
     used: u64,
 }
 
-const MAX_PLANS: usize = 16;
+/// The lookup digests of a font, for all its plans.
+struct FontDigests {
+    font: usize,
+    data: usize,
+    digests: layout.Digests,
+}
+
+const MAX_PLANS: usize = 32;
 
 /// Shapes many runs, remembering what it works out for each font, script,
-/// direction and set of features (the fonts must outlive it). Its runs
-/// share one minimum for the work and glyphs a run may take, so many short
-/// runs cost no more than their text.
+/// direction and set of features (the fonts must outlive it): the lookups
+/// of a font are read once, and the plans of the last MAX_PLANS settings
+/// kept. Its runs share one minimum for the work and glyphs a run may take,
+/// so many short runs cost no more than their text; making a plan is
+/// charged to the run's work, and a run without the work left for its plan
+/// is shaped without the font's features.
 pub struct Shaper {
     plans: vec.Vec.[Cached],
+    fonts: vec.Vec.[FontDigests],
     clock: u64,
     spare: buf.Spare,
 
     pub fn init() Shaper {
-        return Shaper.{ plans: vec.Vec.[Cached].init(), clock: 0, spare: buf.spare() };
+        return Shaper.{
+            plans: vec.Vec.[Cached].init(),
+            fonts: vec.Vec.[FontDigests].init(),
+            clock: 0,
+            spare: buf.spare(),
+        };
     }
 
     pub fn deinit(self: *mut Shaper) void {
@@ -1312,6 +1383,31 @@ pub struct Shaper {
             mem.free(ps[k].features);
         }
         self.plans.deinit();
+        let fd = self.fonts.items();
+        for k in @as(usize, 0)..fd.len {
+            fd[k].digests.deinit();
+        }
+        self.fonts.deinit();
+    }
+
+    /// The digests of f's lookups (the fonts searched charged to spent).
+    fn digests_for(self: *mut Shaper, f: *font.Font, spent: *mut i64) ShapeError!*mut layout.Digests {
+        let fd = self.fonts.items();
+        for k in @as(usize, 0)..fd.len {
+            if (fd[k].font == @int_from_ptr(f)) and (fd[k].data == @int_from_ptr(f.data.ptr)) {
+                spent.* += @bit_cast(i64, @as(u64, k));
+                return &mut fd[k].digests;
+            }
+        }
+        spent.* += @bit_cast(i64, @as(u64, fd.len));
+        let face = font_face(f);
+        let mut ds = layout.Digests.init(&face)!;
+        self.fonts.push(FontDigests.{ font: @int_from_ptr(f), data: @int_from_ptr(f.data.ptr),
+                                      digests: ds }) catch |e| {
+            ds.deinit();
+            return e;
+        };
+        return &mut self.fonts.items()[self.fonts.len - 1].digests;
     }
 
     /// As shape.
@@ -1325,10 +1421,17 @@ pub struct Shaper {
             if (c.font == @int_from_ptr(f)) and (c.data == @int_from_ptr(f.data.ptr)) and (c.script == pr[0]) and
                (c.rtl == rtl) and (c.language == opts.language) and same_features(c.features, opts.features) {
                 c.used = self.clock;
-                return shape_with(&mut c.plan, text, opts.features, &mut self.spare);
+                return shape_with(&mut c.plan, text, opts.features, &mut self.spare, 0);
             }
         }
-        let mut p = make_plan(f, pr[0], rtl, opts.language, opts.features)!;
+        let mut spent: i64 = 0;
+        let ds = self.digests_for(f, &mut spent)!;
+        let mut p = plan_for_run(f, text, pr[0], rtl, opts, ds, &self.spare, &mut spent)!;
+        if spent > run_steps(text, &self.spare) {
+            // a plan without features, for this run only
+            defer p.deinit();
+            return shape_with(&mut p, text, opts.features, &mut self.spare, spent);
+        }
         let feats = mem.alloc.[Feature](opts.features.len) catch |e| {
             p.deinit();
             return e;
@@ -1356,7 +1459,7 @@ pub struct Shaper {
             items[old].plan.deinit();
             mem.free(items[old].features);
             items[old] = entry;
-            return shape_with(&mut items[old].plan, text, opts.features, &mut self.spare);
+            return shape_with(&mut items[old].plan, text, opts.features, &mut self.spare, spent);
         }
         self.plans.push(entry) catch |e| {
             p.deinit();
@@ -1364,7 +1467,7 @@ pub struct Shaper {
             return e;
         };
         let last = self.plans.len - 1;
-        return shape_with(&mut self.plans.items()[last].plan, text, opts.features, &mut self.spare);
+        return shape_with(&mut self.plans.items()[last].plan, text, opts.features, &mut self.spare, spent);
     }
 }
 
@@ -1854,6 +1957,104 @@ test "lookup digests of shared subtables" {
     defer mem.free(gs);
     @expect_eq(gs.len, 2);
     @expect_eq(gs[0].id, 1);
+}
+
+/// Options for a made-up script ("Qa" and two letters from k), of the
+/// default shaper.
+fn made_up_script(k: usize) Options {
+    let mut o = options();
+    let name: [4]u8 = ['Q', 'a', 'a' + @truncate(u8, k / 26), 'a' + @truncate(u8, k % 26)];
+    o.script = tag(name[..]);
+    return o;
+}
+
+test "plans for many scripts" {
+    // a Shaper's runs in more scripts than it keeps plans for: the digests
+    // of the font's lookups (10000 subtables with 10000 glyphs) are read once
+    let mut lk = vec.Vec.[u8].init();
+    defer lk.deinit();
+    put_words(&mut lk, "1 0 10000")!;
+    put_n(&mut lk, 20006, 10000)!;
+    put_words(&mut lk, "1 6 1 1 10000")!;
+    for i in @as(usize, 0)..10000 {
+        put(&mut lk, 1 + (2 * i))!;
+    }
+    let lks: [1][]u8 = [lk.items()];
+    let uses: [1]usize = [0];
+    let mut lt = test_layout("ccmp", lks[..], uses[..])!;
+    defer lt.deinit();
+    let mut data = test_font("GSUB", lt.items(), "")!;
+    defer data.deinit();
+    let f = font.Font.init(data.items())!;
+    let mut s = Shaper.init();
+    defer s.deinit();
+    let mut left: i64 = 0;
+    for k in @as(usize, 0)..100 {
+        let gs = s.shape(&f, "a", made_up_script(k))!;
+        defer mem.free(gs);
+        @expect_eq(gs[0].id, 2);
+        if k == 0 {
+            left = s.fonts.items()[0].digests.budget[0];
+        }
+    }
+    @expect_eq(s.fonts.len, 1);
+    @expect_eq(s.plans.len, MAX_PLANS);
+    @expect_eq(s.fonts.items()[0].digests.budget[0], left);
+    @expect_eq(s.spare.match_ops, buf.spare().match_ops);
+
+    // a language system of 5000 features, each searched for every feature a
+    // plan asks for: making plans is charged to the runs' work
+    let n: usize = 5000;
+    let mut gsub = vec.Vec.[u8].init();
+    defer gsub.deinit();
+    put_words(&mut gsub, "1 0 10")!;
+    put(&mut gsub, 28 + (2 * n))!;
+    put(&mut gsub, 36 + (8 * n))!;
+    gsub.extend("\x00\x01DFLT\x00\x08\x00\x04\x00\x00\x00\x00\xff\xff")!;
+    put(&mut gsub, n)!;
+    for i in @as(usize, 0)..n {
+        put(&mut gsub, i)!;
+    }
+    put(&mut gsub, n)!;
+    for i in @as(usize, 0)..n {
+        if i == (n - 1) {
+            gsub.extend("ccmp")!;
+        } else {
+            gsub.extend("zzzz")!;
+        }
+        put(&mut gsub, 2 + (6 * n))!;
+    }
+    put_words(&mut gsub, "0 1 0 1 4 1 0 1 8 1 6 1 1 1 1")!;
+    let mut data2 = test_font("GSUB", gsub.items(), "")!;
+    defer data2.deinit();
+    let f2 = font.Font.init(data2.items())!;
+    let one = shape(&f2, "a", options())!;
+    defer mem.free(one);
+    @expect_eq(one[0].id, 2);
+    let mut s2 = Shaper.init();
+    defer s2.deinit();
+    let mut with: usize = 0;
+    for k in @as(usize, 0)..1000 {
+        let gs = s2.shape(&f2, "a", made_up_script(k))!;
+        defer mem.free(gs);
+        if gs[0].id == 2 {
+            with += 1;
+        } else {
+            @expect_eq(gs[0].id, 1);
+        }
+    }
+    @expect(with > 0);
+    @expect(with < 100);
+    @expect_eq(s2.spare.match_ops, 0);
+    // a plan kept is used again; a long run has the work for its own
+    let again = s2.shape(&f2, "a", made_up_script(0))!;
+    defer mem.free(again);
+    @expect_eq(again[0].id, 2);
+    let text = repeat("a", 1000)!;
+    defer mem.free(text);
+    let long = s2.shape(&f2, text, made_up_script(5000))!;
+    defer mem.free(long);
+    @expect_eq(long[999].id, 2);
 }
 
 test "marks on cursive chains" {

@@ -208,6 +208,63 @@ pub fn digest_budget(f: *Face) i64 {
     return sz(f.d.len) + 65536;
 }
 
+/// The digests of a font's lookups, each worked out when a plan first maps
+/// its lookup and kept for the plans that follow, so the coverage reads of
+/// all of a table's digests are charged to one digest_budget, however many
+/// plans are made.
+pub struct Digests {
+    digests: [2][]mut Digest,
+    known: [2][]mut bool,
+    budget: [2]i64,
+
+    pub fn init(f: *Face) ShapeLayoutError!Digests {
+        let mut ds = Digests.{
+            digests: [
+                @slice_from_ptr(@ptr_from_int(*mut Digest, 8), 0), @slice_from_ptr(@ptr_from_int(*mut Digest, 8), 0)],
+            known: [@slice_from_ptr(@ptr_from_int(*mut bool, 8), 0), @slice_from_ptr(@ptr_from_int(*mut bool, 8), 0)],
+            budget: [digest_budget(f), digest_budget(f)],
+        };
+        for ti in @as(usize, 0)..2 {
+            let n = @as(usize, f.lookup_count[ti]);
+            if n == 0 {
+                continue;
+            }
+            ds.digests[ti] = mem.alloc.[Digest](n) catch {
+                ds.deinit();
+                return error.OutOfMemory;
+            };
+            ds.known[ti] = mem.alloc.[bool](n) catch {
+                mem.free(ds.digests[ti]);
+                ds.deinit();
+                return error.OutOfMemory;
+            };
+            for k in @as(usize, 0)..n {
+                ds.known[ti][k] = false;
+            }
+        }
+        return ds;
+    }
+
+    pub fn deinit(self: *mut Digests) void {
+        for ti in @as(usize, 0)..2 {
+            if self.known[ti].len > 0 {
+                mem.free(self.digests[ti]);
+                mem.free(self.known[ti]);
+            }
+        }
+    }
+
+    /// The digest of lookup li of table ti (li < the table's lookup count).
+    fn get(self: *mut Digests, f: *Face, ti: usize, li: u32) Digest {
+        let k = @as(usize, li);
+        if not self.known[ti][k] {
+            self.digests[ti][k] = lookup_digest(f, ti, li, &mut self.budget[ti]);
+            self.known[ti][k] = true;
+        }
+        return self.digests[ti][k];
+    }
+}
+
 /// The digest of the glyphs lookup li of table ti can start at (each
 /// subtable and coverage entry read charged to budget).
 pub fn lookup_digest(f: *Face, ti: usize, li: u32, budget: *mut i64) Digest {
@@ -2265,14 +2322,25 @@ pub fn tag_of(s: []u8) u32 {
     return t;
 }
 
-/// The index of script tag t in table ti's script list, or NO_INDEX.
-fn find_script(f: *Face, ti: usize, t: u32) u32 {
+/// Charges n steps of working out a plan (a record of the font read) to
+/// steps; false once they are spent.
+fn spend(steps: *mut i64, n: i64) bool {
+    steps.* -= n;
+    return steps.* >= 0;
+}
+
+/// The index of script tag t in table ti's script list, or NO_INDEX (each
+/// record read charged to steps, as in the searches below).
+fn find_script(f: *Face, ti: usize, t: u32, steps: *mut i64) u32 {
     let sl = f.script_list[ti];
     if sl == 0 {
         return NO_INDEX;
     }
     let n = u16at(f.d, sl);
     for i in @as(u32, 0)..n {
+        if not spend(steps, 1) {
+            return NO_INDEX;
+        }
         if u32at(f.d, sl + 2 + (6 * @as(usize, i))) == t {
             return i;
         }
@@ -2288,12 +2356,15 @@ fn script_table(f: *Face, ti: usize, si: u32) usize {
     return off16(f.d, sl, sl + 2 + (6 * @as(usize, si)) + 4);
 }
 
-fn find_lang_sys(f: *Face, s: usize, t: u32) u32 {
+fn find_lang_sys(f: *Face, s: usize, t: u32, steps: *mut i64) u32 {
     if s == 0 {
         return NO_INDEX;
     }
     let n = u16at(f.d, s + 2);
     for i in @as(u32, 0)..n {
+        if not spend(steps, 1) {
+            return NO_INDEX;
+        }
         if u32at(f.d, s + 4 + (6 * @as(usize, i))) == t {
             return i;
         }
@@ -2329,12 +2400,15 @@ fn feature_table(f: *Face, ti: usize, fi: u32) usize {
 }
 
 /// The feature index of tag in a LangSys (the first listed), or NO_INDEX.
-fn langsys_find_feature(f: *Face, ti: usize, ls: usize, t: u32) u32 {
+fn langsys_find_feature(f: *Face, ti: usize, ls: usize, t: u32, steps: *mut i64) u32 {
     if ls == 0 {
         return NO_INDEX;
     }
     let n = @as(usize, u16at(f.d, ls + 4));
     for i in @as(usize, 0)..n {
+        if not spend(steps, 1) {
+            return NO_INDEX;
+        }
         let fi = u16at(f.d, ls + 6 + (2 * i));
         if feature_tag(f, ti, fi) == t {
             return fi;
@@ -2343,12 +2417,15 @@ fn langsys_find_feature(f: *Face, ti: usize, ls: usize, t: u32) u32 {
     return NO_INDEX;
 }
 
-fn table_find_feature(f: *Face, ti: usize, t: u32) u32 {
+fn table_find_feature(f: *Face, ti: usize, t: u32, steps: *mut i64) u32 {
     let fl = f.feature_list[ti];
     if fl == 0 {
         return NO_INDEX;
     }
     for i in @as(u32, 0)..u16at(f.d, fl) {
+        if not spend(steps, 1) {
+            return NO_INDEX;
+        }
         if feature_tag(f, ti, i) == t {
             return i;
         }
@@ -2519,6 +2596,8 @@ pub fn empty_map() Map {
 
 pub struct MapBuilder {
     f: *Face,
+    digests: *mut Digests,
+    steps: i64,  // left for working out the plan; once negative, the map is unfinished
     infos: vec.Vec.[FeatureInfo],
     stages: [2]vec.Vec.[StageInfo],
     current_stage: [2]u32,
@@ -2528,10 +2607,15 @@ pub struct MapBuilder {
     found_script: [2]bool,
 
     /// script_tags are tried in order (then DFLT, dflt, latn); language_tag
-    /// (0 for none) selects a language system.
-    pub fn init(f: *Face, script_tags: []u32, language_tag: u32) MapBuilder {
+    /// (0 for none) selects a language system. The records of the font it
+    /// reads (scripts, language systems, features and lookups searched and
+    /// mapped) are charged to steps, and digests are taken from ds (for
+    /// face f).
+    pub fn init(f: *Face, script_tags: []u32, language_tag: u32, ds: *mut Digests, steps: i64) MapBuilder {
         let mut m = MapBuilder.{
             f: f,
+            digests: ds,
+            steps: steps,
             infos: vec.Vec.[FeatureInfo].init(),
             stages: [vec.Vec.[StageInfo].init(), vec.Vec.[StageInfo].init()],
             current_stage: [0, 0],
@@ -2543,7 +2627,7 @@ pub struct MapBuilder {
         for ti in @as(usize, 0)..2 {
             let mut done = false;
             for t in script_tags {
-                let si = find_script(f, ti, t);
+                let si = find_script(f, ti, t, &mut m.steps);
                 if si != NO_INDEX {
                     m.script_index[ti] = si;
                     m.chosen_script[ti] = t;
@@ -2555,7 +2639,7 @@ pub struct MapBuilder {
             if not done {
                 let fallbacks: [3]u32 = [tag_of("DFLT"), tag_of("dflt"), tag_of("latn")];
                 for t in fallbacks {
-                    let si = find_script(f, ti, t);
+                    let si = find_script(f, ti, t, &mut m.steps);
                     if si != NO_INDEX {
                         m.script_index[ti] = si;
                         m.chosen_script[ti] = t;
@@ -2566,10 +2650,10 @@ pub struct MapBuilder {
             let s = script_table(f, ti, m.script_index[ti]);
             let mut li = NO_INDEX;
             if language_tag != 0 {
-                li = find_lang_sys(f, s, language_tag);
+                li = find_lang_sys(f, s, language_tag, &mut m.steps);
             }
             if li == NO_INDEX {
-                li = find_lang_sys(f, s, tag_of("dflt"));
+                li = find_lang_sys(f, s, tag_of("dflt"), &mut m.steps);
             }
             m.language_index[ti] = li;
         }
@@ -2610,9 +2694,9 @@ pub struct MapBuilder {
         self.add_feature(tag, flags | F_GLOBAL, 1)!;
     }
 
-    pub fn has_feature(self: *MapBuilder, tag: u32) bool {
+    pub fn has_feature(self: *mut MapBuilder, tag: u32) bool {
         for ti in @as(usize, 0)..2 {
-            if langsys_find_feature(self.f, ti, self.lang(ti), tag) != NO_INDEX {
+            if langsys_find_feature(self.f, ti, self.lang(ti), tag, &mut self.steps) != NO_INDEX {
                 return true;
             }
         }
@@ -2632,7 +2716,7 @@ pub struct MapBuilder {
 
     /// Adds the lookups of feature fi of table ti to the stage that starts at
     /// m.lookups[ti][first].
-    fn add_lookups(self: *MapBuilder, m: *mut Map, ti: usize, first: usize, fi: u32, mask: u32, auto_zwnj: bool,
+    fn add_lookups(self: *mut MapBuilder, m: *mut Map, ti: usize, first: usize, fi: u32, mask: u32, auto_zwnj: bool,
                    auto_zwj: bool, random: bool, per_syllable: bool) ShapeLayoutError!void {
         let ft = feature_table(self.f, ti, fi);
         if ft == 0 {
@@ -2641,6 +2725,9 @@ pub struct MapBuilder {
         let d = self.f.d;
         let n = @as(usize, u16at(d, ft + 2));
         for i in @as(usize, 0)..n {
+            if not spend(&mut self.steps, 1) {
+                return;
+            }
             let li = u16at(d, ft + 4 + (2 * i));
             if li >= self.f.lookup_count[ti] {
                 continue;
@@ -2648,6 +2735,7 @@ pub struct MapBuilder {
             // features sharing their lists: merge before the stage holds more
             // than a few times the lookups
             if (m.lookups[ti].len - first) > ((2 * @as(usize, self.f.lookup_count[ti])) + 64) {
+                _ = spend(&mut self.steps, sz(m.lookups[ti].len - first));
                 merge_lookups(m, ti, first);
             }
             m.lookups[ti].push(LookupMap.{
@@ -2719,6 +2807,9 @@ pub struct MapBuilder {
         let infos = self.infos.items();
         let mut next_bit: u32 = 4;
         for info in infos {
+            if self.steps < 0 {
+                break;
+            }
             let mut bits_needed: u32 = 0;
             if not (((info.flags & F_GLOBAL) != 0) and (info.max_value == 1)) {
                 bits_needed = @min(8, 32 - @clz(info.max_value));
@@ -2732,20 +2823,20 @@ pub struct MapBuilder {
                 if req_tag[ti] == info.tag {
                     req_stage[ti] = info.stage[ti];
                 }
-                fidx[ti] = langsys_find_feature(self.f, ti, self.lang(ti), info.tag);
+                fidx[ti] = langsys_find_feature(self.f, ti, self.lang(ti), info.tag, &mut self.steps);
                 if fidx[ti] != NO_INDEX {
                     found = true;
                 }
             }
             if not found and ((info.flags & F_GLOBAL_SEARCH) != 0) {
                 for ti in @as(usize, 0)..2 {
-                    fidx[ti] = table_find_feature(self.f, ti, info.tag);
+                    fidx[ti] = table_find_feature(self.f, ti, info.tag, &mut self.steps);
                     if fidx[ti] != NO_INDEX {
                         found = true;
                     }
                 }
             }
-            if not found and ((info.flags & F_HAS_FALLBACK) == 0) {
+            if (self.steps < 0) or (not found and ((info.flags & F_HAS_FALLBACK) == 0)) {
                 continue;
             }
             let mut fm = FeatureMap.{
@@ -2791,6 +2882,7 @@ pub struct MapBuilder {
                                          fm.per_syllable)!;
                     }
                 }
+                _ = spend(&mut self.steps, sz(m.lookups[ti].len - last_num));
                 merge_lookups(m, ti, last_num);
                 last_num = m.lookups[ti].len;
                 let st = self.stages[ti].items();
@@ -2802,9 +2894,8 @@ pub struct MapBuilder {
                 }
             }
             let lms = m.lookups[ti].items();
-            let mut budget = digest_budget(self.f);
             for k in @as(usize, 0)..lms.len {
-                lms[k].digest = lookup_digest(self.f, ti, lms[k].index, &mut budget);
+                lms[k].digest = self.digests.get(self.f, ti, lms[k].index);
             }
         }
     }

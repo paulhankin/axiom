@@ -274,3 +274,9 @@
 - On wasm32, `std/graphics/pdf` read a cross-reference subsection starting at or past
   object 2^32 as one for low object numbers, and `std/audio/opus` cut its output short
   at a final granule position past 2^32; both compare the 64-bit values.
+- Shaping: a `Shaper` (and so `text.layout`) rebuilt a plan, at a cost of about the
+  font's size, for each run of a text that cycles through more scripts than it keeps
+  plans for. Lookup digests are worked out once per font, and the font records a plan
+  reads are charged to the run's matching steps and the shared allowance; a run without
+  the steps left for its plan is shaped without the font's features. A `Shaper` keeps
+  32 plans instead of 16.
