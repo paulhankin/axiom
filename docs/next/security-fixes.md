@@ -134,3 +134,14 @@
   error union can tear it into a value no store wrote, and so reach outside an object
   (§12.8.2). They had said that no race is undefined behavior; that holds for plain
   data. Share such values between threads only with synchronization.
+- `std/text/math`: commands whose arguments have no braces (`\sqrt\sqrt…x`,
+  `\frac1\frac1…`, `\hat\hat…`) now count toward the 64-level nesting limit, so deeply
+  nested input gives `InvalidMath` instead of overflowing the stack, through
+  `std/text/markdown` with `Options.math` too.
+- `std/text/regex`: `captures` (and `replace_all`) took time proportional to the text
+  times the pattern times its number of groups, without limit. Patterns whose program
+  size times (groups + 1) exceeds `4 × MAX_PROGRAM`, or with more than 1000 groups, now
+  fail with `TooBig`. A `replace_all` template with many `${` and no `}` no longer takes
+  quadratic time.
+- `std/text/wrap`: wrapping a very long word, with or without a hyphenator, no longer
+  takes quadratic time.

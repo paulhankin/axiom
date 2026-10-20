@@ -104,8 +104,9 @@ schedule).
 
 | Where | What std does |
 |---|---|
-| regex | linear-time matching; a compile work budget (4 × `MAX_PROGRAM`); nesting depth below 1000; a bounded DFA cache (`DFA_MAX_PCS`). `find_all` and `replace_all` search again after each match, so a pattern whose higher-priority alternative outlives its match (`a*b\|a` on runs of `a`) takes quadratic time over many matches, as in RE2; an untrusted pattern over a large text needs a bound on one of them |
+| regex | linear-time matching; a compile work budget (4 × `MAX_PROGRAM`); nesting depth below 1000; a bounded DFA cache (`DFA_MAX_PCS`); for captures, the program's size times its groups plus one at most 4 × `MAX_PROGRAM`, and at most 1000 groups (`TooBig`); replacement templates expanded in linear time. `find_all` and `replace_all` search again after each match, so a pattern whose higher-priority alternative outlives its match (`a*b\|a` on runs of `a`) takes quadratic time over many matches, as in RE2; an untrusted pattern over a large text needs a bound on one of them |
 | markdown | linear-time structures for the known CommonMark pathological inputs (nested brackets, emphasis, backticks, list tightness); a budget on link reference expansion; a budget on the empty cells that pad short table rows (`max(input size, 65536)`; past it the table ends); safe HTML by default |
+| math | nesting (groups, and commands whose arguments are not in braces) at most 64 levels, in the parser and so in the tree and its writers |
 | html | repeated attribute names found with a hash table under std's keyed hash, against collisions |
 | diff | `apply` refuses malformed hunk ranges (`InvalidPatch`) instead of trapping |
 | xml | attribute defaults looked up by element, and what they add (a default's value plus 64 bytes) limited to `MAX_EXPANSION` or four times the document's size; entity expansion limited to `MAX_EXPANSION`; duplicate attributes found with a hash set (past 16) and expanded names by sorting; namespace prefixes looked up in a map, in the parser and in `canonicalize` |
@@ -115,5 +116,5 @@ schedule).
 | bidi | isolates matched with an explicit stack, not recursion |
 | path | glob `**` matched with single backtracking, not exponentially |
 | draw | edges sorted in O(n log n) above 32 crossings; bad or tiny dash patterns fall back to a solid line |
-| text | `fit` measures widths incrementally |
+| text | `fit` measures widths incrementally; `wrap` breaks and hyphenates long words in linear time (the hyphenation search reads at most `hyphen.MAX_WORD` bytes of a word) |
 | time | saturating arithmetic for far-away times |

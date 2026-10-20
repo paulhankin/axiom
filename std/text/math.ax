@@ -766,13 +766,20 @@ fn append_child(p: *mut Parser, parent: u32, child: u32, last: *mut u32) void {
     last.* = child;
 }
 
-// A row of atoms, up to '}', '&', '\\', \right, \middle, \end or the end.
-fn row(p: *mut Parser) TexError!u32 {
-    p.depth += 1;
-    defer p.depth -= 1;
-    if p.depth > MAX_DEPTH {
+// One more level of nesting: rows, and commands reached without braces
+// (\sqrt\sqrt x, \sqrt[\sqrt[..]..], \not\not), so that the tree, and
+// the recursion that parses and writes it, stays MAX_DEPTH deep.
+fn enter(p: *mut Parser) TexError!void {
+    if p.depth >= MAX_DEPTH {
         return fail(p, "nested too deeply");
     }
+    p.depth += 1;
+}
+
+// A row of atoms, up to '}', '&', '\\', \right, \middle, \end or the end.
+fn row(p: *mut Parser) TexError!u32 {
+    enter(p)!;
+    defer p.depth -= 1;
     let r = new_node(p, Kind.ROW)!;
     let mut last: u32 = NIL;
     loop {
@@ -952,6 +959,8 @@ fn argument(p: *mut Parser) TexError!u32 {
     if (c == '}') or (c == '^') or (c == '_') or (c == '&') {
         return fail(p, "missing argument");
     }
+    enter(p)!;
+    defer p.depth -= 1;
     let a = primary(p)!;
     if a == NIL {
         return fail(p, "missing argument");
@@ -1165,7 +1174,9 @@ fn command(p: *mut Parser) TexError!u32 {
                 if peek(p) == 0 {
                     return fail(p, "missing ]");
                 }
+                enter(p)!;
                 let a = atom(p)!;
+                p.depth -= 1;
                 if a == NIL {
                     return fail(p, "missing ]");
                 }
@@ -1360,6 +1371,8 @@ fn command(p: *mut Parser) TexError!u32 {
         return l;
     }
     if strs.eq(name, "not") {
+        enter(p)!;
+        defer p.depth -= 1;
         let next = primary(p)!;
         if next == NIL {
             return fail(p, "\\not of nothing");
@@ -2418,15 +2431,20 @@ fn expect_mathml(tex: []u8, want: []u8) !void {
 }
 
 fn expect_error(tex: []u8, offset: usize, message: []u8) void {
+    let info = parse_error(tex);
+    @expect_eq(info.offset, offset);
+    @expect_eq(info.message, message);
+}
+
+// Where parsing tex fails (InvalidMath), or the message "" if it does not.
+fn parse_error(tex: []u8) ErrorInfo {
     let mut info = ErrorInfo.{ offset: 0, message: "" };
     let mut f = parse_with(tex, &mut info) catch |e| {
         @expect(e == error.InvalidMath);
-        @expect_eq(info.offset, offset);
-        @expect_eq(info.message, message);
-        return;
+        return info;
     };
     f.deinit();
-    @expect(false);
+    return ErrorInfo.{ offset: 0, message: "" };
 }
 
 test "math as text" {
@@ -2508,4 +2526,25 @@ test "math errors" {
         deep.push_str("{")!;
     }
     expect_error(deep.bytes(), 64, "nested too deeply");
+    // and so are commands whose arguments have no braces
+    let pieces: [5][]u8 = ["\\sqrt", "\\frac1", "\\sqrt[", "\\not", "\\hat"];
+    for piece in pieces {
+        deep.clear();
+        deep.push_str("x^")!;
+        for k in @as(usize, 0)..10000 {
+            _ = k;
+            deep.push_str(piece)!;
+        }
+        deep.push_str(" x")!;
+        @expect_eq(parse_error(deep.bytes()).message, "nested too deeply");
+    }
+    let mut ok = strs.String.init();
+    defer ok.deinit();
+    for k in @as(usize, 0)..60 {
+        _ = k;
+        ok.push_str("\\sqrt")!;
+    }
+    ok.push_str(" x")!;
+    let t = to_text(ok.bytes())!;
+    mem.free(t);
 }

@@ -29,7 +29,11 @@
 // find first is chosen (leftmost-first, as in Perl, RE2 and Go). The
 // matcher is a lazy DFA built from a Pike VM, which it falls back to when
 // its cache is full: time is proportional to the length of the text
-// times the size of the pattern, whatever either contains. Each search is
+// times the size of the pattern, whatever either contains. captures (and
+// replace_all with groups) carries the group positions along each of the
+// VM's threads, so for it the size of the pattern counts once per group
+// as well; patterns whose program times its groups (plus one) is over
+// 4 * MAX_PROGRAM, or with over 1000 groups, are TooBig. Each search is
 // linear; find_all and replace_all search again after each match, and a
 // search scans past its match while a higher-priority alternative is
 // still alive (`a*b|a` on a long run of a: `a` matches at once, but `a*b`
@@ -48,6 +52,11 @@ pub error RegexError { SyntaxError, TooBig, NotFound, Done, OutOfMemory, Empty, 
 /// Patterns that would compile to more instructions than this fail with
 /// TooBig (x{1000}{1000} and the like).
 pub const MAX_PROGRAM: usize = 100000;
+
+// More capture groups than this are TooBig, which keeps the search for a
+// duplicate name short; the bound on the program's size times its groups
+// (build) is lower still.
+const MAX_GROUPS: u32 = 1000;
 
 // -----------------------------------------------------------------------------
 // Character classes
@@ -572,6 +581,9 @@ struct Parser {
                     return self.fail("bad named group");
                 }
                 self.i += 1;
+                if self.ncap >= MAX_GROUPS {
+                    return error.TooBig;
+                }
                 for nm in self.names.items() {
                     if @mem_eq(nm.name, name) {
                         return self.fail("duplicate group name");
@@ -622,6 +634,9 @@ struct Parser {
                 self.i += 1;
             }
         } else {
+            if self.ncap >= MAX_GROUPS {
+                return error.TooBig;
+            }
             self.ncap += 1;
             cap = self.ncap;
         }
@@ -1007,7 +1022,7 @@ pub struct Regex {
             return r == 1;
         }
         let mut slots: [2]usize = [0; 2];
-        return run(self, text, 0, slots[..0], true);
+        return run(self, text, 0, slots[..0], true, false);
     }
 
     /// The leftmost match, or NotFound.
@@ -1027,7 +1042,7 @@ pub struct Regex {
             return error.NotFound;
         }
         let mut slots: [2]usize = [0; 2];
-        if not run(self, text, pos, slots[..], false)! {
+        if not run(self, text, pos, slots[..], false, false)! {
             return error.NotFound;
         }
         return Match.{ start: slots[0], end: slots[1] };
@@ -1051,7 +1066,7 @@ pub struct Regex {
             from = m.start;
         }
         let slots = mem.alloc.[usize](2 * (self.ngroups + 1))!;
-        let found = run(self, text, from, slots, false) catch |e| {
+        let found = run(self, text, from, slots, false, r == 1) catch |e| {
             mem.free(slots);
             return e;
         };
@@ -1175,9 +1190,10 @@ pub struct Captures {
 
 fn expand(out: *mut strs.String, caps: *Captures, repl: []u8) RegexError!void {
     let mut i: usize = 0;
+    let mut no_close = repl.len + 2;  // no '}' from here on
     while i < repl.len {
         let c = repl[i];
-        if (c != '$') or ((i + 1) >= repl.len) {
+        if (c != '$') or ((i + 1) >= repl.len) or ((repl[i + 1] == '{') and ((i + 2) >= no_close)) {
             out.push(c)!;
             i += 1;
             continue;
@@ -1191,6 +1207,8 @@ fn expand(out: *mut strs.String, caps: *Captures, repl: []u8) RegexError!void {
         let mut name: []u8 = "";
         if d == '{' {
             let close = strs.index_of_from(repl, "}", i + 2) catch {
+                // nor is there one for any later ${
+                no_close = i + 2;
                 out.push(c)!;
                 i += 1;
                 continue;
@@ -1324,6 +1342,10 @@ fn build(p: *mut Parser, c: *mut Compiler, pat: []mut u8) RegexError!Regex {
     c.compile(root)!;
     _ = c.emit(Op.SAVE, 1, 0)!;
     _ = c.emit(Op.MATCH, 0, 0)!;
+    // the VM copies a thread's group positions along with it
+    if (c.prog.len * (@as(usize, p.ncap) + 1)) > (4 * MAX_PROGRAM) {
+        return error.TooBig;
+    }
     let prefix = literal_prefix(p, root)!;
     let mut re = Regex.{
         prog: c.prog,
@@ -1609,8 +1631,9 @@ fn free_list(l: *mut List) void {
 
 /// Runs the program on text from `pos`. With slots.len > 0, fills in the
 /// capture slots (NO_POS for groups not taking part) of the leftmost-first
-/// match; with `earliest`, stops at the first match found.
-fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool) RegexError!bool {
+/// match; with `earliest`, stops at the first match found; with `at_pos`,
+/// looks only for a match starting at pos.
+fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool, at_pos: bool) RegexError!bool {
     if pos > text.len {
         return false;
     }
@@ -1633,8 +1656,8 @@ fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool) R
     let mut i = pos;
     loop {
         // a new thread at the lowest priority, while nothing has matched
-        if not matched {
-            if clist.n == 0 {
+        if (not matched) and ((not at_pos) or (i == pos)) {
+            if (clist.n == 0) and not at_pos {
                 // skip ahead to where a match could start
                 if re.anchored and (i > 0) {
                     break;
@@ -1657,7 +1680,7 @@ fn run(re: *Regex, text: []u8, pos: usize, slots: []mut usize, earliest: bool) R
         }
         if clist.n == 0 {
             // nothing can match from here: try the next position
-            if matched or re.anchored or (i >= text.len) {
+            if matched or re.anchored or at_pos or (i >= text.len) {
                 break;
             }
             i += char_len(text, i);
@@ -2265,4 +2288,63 @@ test "hostile patterns are refused quickly" {
     let mut r2 = compile(deep.bytes()) catch return;
     r2.deinit();
     @expect(false);
+}
+
+fn too_big(pattern: []u8) bool {
+    let mut re = compile(pattern) catch |e| {
+        return e == error.TooBig;
+    };
+    re.deinit();
+    return false;
+}
+
+test "groups and templates cost what they should" {
+    // the VM copies group positions: many groups in a big program are TooBig
+    let mut pat = strs.String.init();
+    defer pat.deinit();
+    let mut txt = strs.String.init();
+    defer txt.deinit();
+    for _k in @as(usize, 0)..1000 {
+        pat.push_str("(a)")!;
+    }
+    @expect(too_big(pat.bytes()));
+    pat.clear();
+    for _k in @as(usize, 0)..200 {
+        pat.push_str("(a)")!;
+        txt.push('a')!;
+    }
+    let mut re = compile(pat.bytes())!;
+    defer re.deinit();
+    let mut c = re.captures(txt.bytes())!;
+    defer c.deinit();
+    @expect_eq(c.span(200)!.start, 199);
+    // and so are many named groups, without comparing every pair of names
+    pat.clear();
+    for k in @as(usize, 0)..20000 {
+        pat.push_str("(?P<g")!;
+        let mut b: [8]u8 = [0; 8];
+        let mut n = k;
+        let mut d: usize = 8;
+        loop {
+            d -= 1;
+            b[d] = '0' + @int_cast(u8, n % 10);
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        pat.push_str(b[d..])!;
+        pat.push_str(">)")!;
+    }
+    @expect(too_big(pat.bytes()));
+    // a template with many ${ and no } is copied as it is
+    pat.clear();
+    for _k in @as(usize, 0)..100000 {
+        pat.push_str("${")!;
+    }
+    let mut a = compile("a")!;
+    defer a.deinit();
+    let out = a.replace_all("a", pat.bytes())!;
+    defer mem.free(out);
+    @expect_eq(out, pat.bytes());
 }

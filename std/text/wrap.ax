@@ -420,7 +420,7 @@ fn long_word(c: *mut Piece, opts: Options, avail: i64, cur: i64, pieces: *mut ve
     // whitespace, so drop_whitespace removes it rather than a space before it
     pieces.push(Piece.{ s: s[..used], width: @int_cast(usize, w), space: c.space or (used == 0), whole: c.whole })!;
     c.s = s[used..];
-    c.width = width(c.s);
+    c.width -= @min(@int_cast(usize, w), c.width);  // widths add up over grapheme clusters
     return c.s.len == 0;
 }
 
@@ -431,9 +431,14 @@ fn try_hyphenate(h: *hyphen.Hyphenator, c: *mut Piece, room: i64, pieces: *mut v
     let s = c.s;
     let whole = c.whole;
     let done = @int_from_ptr(s.ptr) - @int_from_ptr(whole.ptr);  // bytes of whole already set
-    // the letters of the word, without punctuation around them
+    // the letters of the word, without punctuation around them (looking
+    // no further than a word that could be hyphenated, as this is done for
+    // each line a long word takes)
     let mut a: usize = 0;
     while (a < whole.len) and not uni.is_letter(strs.decode_rune(whole[a..]).value) {
+        if a > hyphen.MAX_WORD {
+            return false;
+        }
         a += strs.decode_rune(whole[a..]).len;
     }
     let mut b = a;
@@ -443,8 +448,11 @@ fn try_hyphenate(h: *hyphen.Hyphenator, c: *mut Piece, room: i64, pieces: *mut v
             break;
         }
         b += r.len;
+        if (b - a) > hyphen.MAX_WORD {
+            return false;
+        }
     }
-    if (b - a) > hyphen.MAX_WORD {
+    if b <= done {
         return false;
     }
     let mut at: [256]usize = [0; 256];
@@ -462,7 +470,7 @@ fn try_hyphenate(h: *hyphen.Hyphenator, c: *mut Piece, room: i64, pieces: *mut v
             pieces.push(Piece.{ s: whole[done..p], width: @int_cast(usize, w), space: false, whole: whole })!;
             pieces.push(Piece.{ s: "-", width: 1, space: false, whole: whole })!;
             c.s = whole[p..];
-            c.width = width(c.s);
+            c.width -= @min(@int_cast(usize, w), c.width);
             return true;
         }
     }
@@ -711,6 +719,33 @@ test "hyphenation" {
     // no place fits: as without hyphenation
     o.width = 5;
     check("ab hyphenation", o, "[ab][hy-][phen-][ation]")!;
+}
+
+test "long words take linear time" {
+    // a 256 KB word, with and without hyphenation, and with punctuation first
+    let mut h = hyphen.Hyphenator.en_us()!;
+    defer h.deinit();
+    let mut word = strs.String.init();
+    defer word.deinit();
+    for k in @as(usize, 0)..(1 << 18) {
+        word.push(@int_cast(u8, 'a' + (k % 26)))!;
+    }
+    let mut o = Options.init(64);
+    let lines = wrap(word.bytes(), o)!;
+    @expect_eq(lines.len, (1 << 18) / 64);
+    free_lines(lines);
+    o.hyphenation = Hyphenation.With(&h);
+    let hl = wrap(word.bytes(), o)!;
+    @expect_eq(hl.len, (1 << 18) / 64);
+    free_lines(hl);
+    word.clear();
+    for _k in @as(usize, 0)..(1 << 18) {
+        word.push('.')!;
+    }
+    word.push_str("hyphenation")!;
+    let pl = wrap(word.bytes(), o)!;
+    @expect_eq(pl[pl.len - 1], "hyphenation");
+    free_lines(pl);
 }
 
 test "fill and wrap_to" {
