@@ -386,6 +386,40 @@ fn shape_cells(s: []u8, cs: []Cell, r: Run, a: usize, b: usize, spans: []Span,
     return memo.shaper.shape(c0.font, s[from..to], o);
 }
 
+fn usize_less(a: usize, b: usize) bool {
+    return a < b;
+}
+
+/// The index of the first of the sorted xs that is at least v.
+fn lower_bound(xs: []usize, v: usize) usize {
+    let mut lo: usize = 0;
+    let mut hi = xs.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if xs[mid] < v {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/// How many of cells [a, b) start before byte offset off.
+fn cells_before(cs: []Cell, a: usize, b: usize, off: usize) usize {
+    let mut lo = a;
+    let mut hi = b;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cs[mid].offset < off {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo - a;
+}
+
 /// The cell of cells [a, b) at byte offset off (the last one at or before it).
 fn cell_at(cs: []Cell, a: usize, b: usize, off: usize) usize {
     let mut lo = a;
@@ -713,53 +747,43 @@ fn shape_line(s: []u8, cs: []Cell, runs: []Run, order: []usize, e: usize, spans:
             })!;
         }
         // the text each cluster stands for (from its start to the next
-        // cluster's), given to its first glyph
-        {
+        // cluster's), given to its first glyph; with letter spacing after
+        // each cluster, per character in it
+        if gs.len > 0 {
             let ps = placed.items();
             let first = ps.len - gs.len;
             let seg_end = cs[hi].offset + cs[hi].len;
+            let starts = mem.alloc.[usize](gs.len)!;
+            defer mem.free(starts);
+            let done = mem.alloc.[bool](gs.len)!;
+            defer mem.free(done);
             for m in first..ps.len {
-                let mut seen = false;
-                for q in first..m {
-                    if ps[q].offset == ps[m].offset {
-                        seen = true;
-                    }
-                }
-                if seen {
-                    continue;
-                }
-                let mut next = seg_end;
-                for q in first..ps.len {
-                    if (ps[q].offset > ps[m].offset) and (ps[q].offset < next) {
-                        next = ps[q].offset;
-                    }
-                }
-                ps[m].length = next - ps[m].offset;
+                starts[m - first] = ps[m].offset;
+                done[m - first] = false;
             }
-        }
-        // letter spacing: after each cluster, per character in it
-        if st.letter_spacing != 0.0 {
-            let ps = placed.items();
-            let first = ps.len - gs.len;
-            for m in first..ps.len {
-                let mut last_of_cluster = true;
-                if (m + 1) < ps.len {
-                    last_of_cluster = ps[m + 1].offset != ps[m].offset;
+            vec.sort(starts, usize_less);
+            let mut ns: usize = 0;
+            for v in starts {
+                if (ns == 0) or (starts[ns - 1] != v) {
+                    starts[ns] = v;
+                    ns += 1;
                 }
-                if last_of_cluster {
+            }
+            let sts = starts[..ns];
+            for m in first..ps.len {
+                let o = ps[m].offset;
+                let at = lower_bound(sts, o);
+                let mut next = seg_end;
+                if (at + 1) < ns {
+                    next = @min(sts[at + 1], seg_end);
+                }
+                if not done[at] {
+                    done[at] = true;
+                    ps[m].length = next - o;
+                }
+                if (st.letter_spacing != 0.0) and (((m + 1) == ps.len) or (ps[m + 1].offset != o)) {
                     // the characters from this cluster's start to the next larger cluster start
-                    let mut next = cs[hi].offset + cs[hi].len;
-                    for q in first..ps.len {
-                        if (ps[q].offset > ps[m].offset) and (ps[q].offset < next) {
-                            next = ps[q].offset;
-                        }
-                    }
-                    let mut count: usize = 0;
-                    for q in lo..(hi + 1) {
-                        if (cs[q].offset >= ps[m].offset) and (cs[q].offset < next) {
-                            count += 1;
-                        }
-                    }
+                    let count = cells_before(cs, lo, hi + 1, next) - cells_before(cs, lo, hi + 1, o);
                     ps[m].advance += st.letter_spacing * @float_from_int(f64, count);
                 }
             }
@@ -1091,4 +1115,37 @@ test "Indic reordering" {
     @expect(gs[0].id == f.glyph_index(0x93f));
     @expect(gs[1].id == f.glyph_index(0x915));
     @expect(gs[0].x < gs[1].x);
+}
+
+test "long lines" {
+    let mut f = try_font("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf") catch return;
+    defer f.deinit();
+    let n: usize = 30000;
+    let text = mem.alloc.[u8](n)!;
+    defer mem.free(text);
+    for i in @as(usize, 0)..n {
+        text[i] = "abc"[i % 3];
+    }
+    let st = Style.init(&f, 10.0, color.Color.rgb(0.0, 0.0, 0.0));
+    let sp: [1]Span = [Span.{ text: text, style: st }];
+    let mut l = layout(sp[..], Options.init(0.0))!;
+    defer l.deinit();
+    @expect_eq(l.glyphs.len, n);
+    @expect_eq(l.lines.len, 1);
+    // letter spacing on one line of 30000 clusters
+    let mut spaced = st;
+    spaced.letter_spacing = 1.0;
+    let ss: [1]Span = [Span.{ text: text, style: spaced }];
+    let mut s = layout(ss[..], Options.init(0.0))!;
+    defer s.deinit();
+    let gs = s.glyphs.items();
+    @expect_eq(gs.len, n);
+    @expect_eq(gs[n - 1].offset, n - 1);
+    @expect_eq(gs[n - 1].length, 1);
+    let widen = (s.lines.get(0).right - s.lines.get(0).left) - (l.lines.get(0).right - l.lines.get(0).left);
+    @expect(@abs(widen - @float_from_int(f64, n)) < 0.5);
+    // and wrapped, every character is laid out
+    let mut w = layout(sp[..], Options.init(300.0))!;
+    defer w.deinit();
+    @expect_eq(w.glyphs.len, n);
 }

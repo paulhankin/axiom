@@ -237,3 +237,17 @@
   `@memory_grow` handed out.
 - The compiler warns (W0710) when a function returns the address of a local, or a slice
   of a local array.
+- `std/graphics/shape`: a font could make shaping take minutes on a short text. Rules,
+  subtables and lookups that failed to match, and runs of default-ignorable
+  characters, cost nothing against shaping's work limit (a 2 KB font took 113 s on 1000
+  characters); mark attachment walked whole cursive chains; marks far from their base
+  cost quadratic time; and lookups sharing one large coverage table took minutes to
+  plan. Lookups now have a matching budget of 1024 steps per character; past it,
+  shaping stops where it is and returns what it has.
+- `std/graphics/shape`: texts longer than about 21000 characters lost their end. A text
+  is now shaped whole, or `shape` fails with `error.OutOfMemory`.
+- `std/graphics/text`: letter spacing, and the text each glyph stands for, cost
+  quadratic time in the glyphs of a run; both are now O(n log n).
+- `std/graphics/font`: `Font.init` walked every lookup index of every GPOS `kern`
+  feature, even when they shared one table; indices count against the walk's budget,
+  and shared feature tables are read once.

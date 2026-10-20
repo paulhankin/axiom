@@ -23,6 +23,9 @@
 // came from. Positions are in font units (scale by size / units_per_em).
 // A Shaper remembers the work that depends only on the font and settings,
 // for shaping many runs; draw_text and measure are for single lines.
+// Whatever the font, the glyphs and the work of its lookups are limited
+// per character of text (internal/shape/buffer.ax); past a limit, shaping
+// stops where it is and returns what it has.
 //
 // Shapers: the default one, Arabic (and Syriac), Hebrew, and Indic (Bengali,
 // Devanagari, Gujarati, Gurmukhi, Kannada, Malayalam, Oriya, Tamil,
@@ -762,6 +765,10 @@ fn kern_table(p: *plan.Plan, b: *mut buf.Buffer) void {
     let n = @as(usize, layout.u16at(d, k + 2));
     let mut o = k + 4;
     for _s in @as(usize, 0)..n {
+        // each subtable is a pass over the buffer
+        if not layout.charge(b, @bit_cast(i64, @as(u64, b.len))) {
+            break;
+        }
         let len = @as(usize, layout.u16at(d, o + 2));
         let cov = layout.u16at(d, o + 4);
         if ((cov >> 8) == 0) and ((cov & 0x01) != 0) and ((cov & 0x04) == 0) {
@@ -1165,9 +1172,9 @@ fn hide_default_ignorables(p: *plan.Plan, b: *mut buf.Buffer) void {
     }
 }
 
-fn shape_buffer(p: *mut plan.Plan, b: *mut buf.Buffer, feats: []Feature) void {
+fn shape_buffer(p: *mut plan.Plan, b: *mut buf.Buffer, feats: []Feature, sp: *mut buf.Spare) void {
     let target_rtl = b.rtl;
-    b.enter();
+    b.enter(sp);
     set_unicode_props_all(b, p.map.global_mask);
     insert_dotted_circle(p, b);
     form_clusters(b);
@@ -1220,20 +1227,31 @@ fn run_props(text: []u8, opts: Options) [2]u32 {
     return [script, r];
 }
 
-fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature) ShapeError![]mut Glyph {
+/// Shapes text with a plan, past the text's own limits using what is spare.
+fn shape_with(p: *mut plan.Plan, text: []u8, feats: []Feature, sp: *mut buf.Spare) ShapeError![]mut Glyph {
     let mut b = buf.Buffer.init();
     defer b.deinit();
     b.rtl = p.rtl;
+    let mut n: usize = 0;
     let mut i: usize = 0;
+    while i < text.len {
+        i += @as(usize, decode(text, i)[1]);
+        n += 1;
+    }
+    if not b.reserve_text(n, sp) {
+        return error.OutOfMemory;
+    }
+    i = 0;
     while i < text.len {
         let r = decode(text, i);
         b.add(r[0], @truncate(u32, i));
         i += @as(usize, r[1]);
     }
-    if b.oom {
+    if b.oom or (b.len != n) {
         return error.OutOfMemory;
     }
-    shape_buffer(p, &mut b, feats);
+    shape_buffer(p, &mut b, feats, sp);
+    b.leave(sp);
     if b.oom {
         return error.OutOfMemory;
     }
@@ -1257,7 +1275,8 @@ pub fn shape(f: *font.Font, text: []u8, opts: Options) ShapeError![]mut Glyph {
     let pr = run_props(text, opts);
     let mut p = make_plan(f, pr[0], pr[1] == 1, opts.language, opts.features)!;
     defer p.deinit();
-    return shape_with(&mut p, text, opts.features);
+    let mut sp = buf.spare();
+    return shape_with(&mut p, text, opts.features, &mut sp);
 }
 
 struct Cached {
@@ -1274,13 +1293,16 @@ struct Cached {
 const MAX_PLANS: usize = 16;
 
 /// Shapes many runs, remembering what it works out for each font, script,
-/// direction and set of features (the fonts must outlive it).
+/// direction and set of features (the fonts must outlive it). Its runs
+/// share one minimum for the work and glyphs a run may take, so many short
+/// runs cost no more than their text.
 pub struct Shaper {
     plans: vec.Vec.[Cached],
     clock: u64,
+    spare: buf.Spare,
 
     pub fn init() Shaper {
-        return Shaper.{ plans: vec.Vec.[Cached].init(), clock: 0 };
+        return Shaper.{ plans: vec.Vec.[Cached].init(), clock: 0, spare: buf.spare() };
     }
 
     pub fn deinit(self: *mut Shaper) void {
@@ -1303,7 +1325,7 @@ pub struct Shaper {
             if (c.font == @int_from_ptr(f)) and (c.data == @int_from_ptr(f.data.ptr)) and (c.script == pr[0]) and
                (c.rtl == rtl) and (c.language == opts.language) and same_features(c.features, opts.features) {
                 c.used = self.clock;
-                return shape_with(&mut c.plan, text, opts.features);
+                return shape_with(&mut c.plan, text, opts.features, &mut self.spare);
             }
         }
         let mut p = make_plan(f, pr[0], rtl, opts.language, opts.features)!;
@@ -1334,7 +1356,7 @@ pub struct Shaper {
             items[old].plan.deinit();
             mem.free(items[old].features);
             items[old] = entry;
-            return shape_with(&mut items[old].plan, text, opts.features);
+            return shape_with(&mut items[old].plan, text, opts.features, &mut self.spare);
         }
         self.plans.push(entry) catch |e| {
             p.deinit();
@@ -1342,7 +1364,7 @@ pub struct Shaper {
             return e;
         };
         let last = self.plans.len - 1;
-        return shape_with(&mut self.plans.items()[last].plan, text, opts.features);
+        return shape_with(&mut self.plans.items()[last].plan, text, opts.features, &mut self.spare);
     }
 }
 
@@ -1579,4 +1601,307 @@ test "empty and invalid text" {
     defer mem.free(b);
     @expect_eq(b.len, 4);
     @expect_eq(b[2].cluster, 2);
+}
+
+// -----------------------------------------------------------------------------
+// Hostile fonts, made in the tests: glyphs 1 "a", 2 "b", 3 U+0301, 4 "c",
+// 5 " ", 6 U+2060 (each 500 units wide), and a GSUB or GPOS table
+// -----------------------------------------------------------------------------
+
+fn put(v: *mut vec.Vec.[u8], x: usize) ShapeError!void {
+    v.push(@truncate(u8, x >> 8))!;
+    v.push(@truncate(u8, x))!;
+}
+
+/// Appends the u16 values written (in decimal) in ws, separated by spaces;
+/// "n*x" is n of x.
+fn put_words(v: *mut vec.Vec.[u8], ws: []u8) ShapeError!void {
+    let mut i: usize = 0;
+    while i < ws.len {
+        if ws[i] == ' ' {
+            i += 1;
+            continue;
+        }
+        let mut n: usize = 1;
+        let mut x: usize = 0;
+        while (i < ws.len) and (ws[i] != ' ') {
+            if ws[i] == '*' {
+                n = x;
+                x = 0;
+            } else {
+                x = (x * 10) + @as(usize, ws[i] - '0');
+            }
+            i += 1;
+        }
+        for _k in @as(usize, 0)..n {
+            put(v, x)!;
+        }
+    }
+}
+
+/// A GSUB or GPOS table: feature ft lists every entry of the lookup list,
+/// entry i being lookups[uses[i]].
+fn test_layout(ft: []u8, lookups: [][]u8, uses: []usize) ShapeError!vec.Vec.[u8] {
+    let mut v = vec.Vec.[u8].init();
+    let nl = uses.len;
+    put_words(&mut v, "1 0 10 36")!;
+    put(&mut v, 48 + (2 * nl))!;
+    // DFLT and latn, with a default language system using feature 0
+    put(&mut v, 2)!;
+    v.extend("DFLT")!;
+    put(&mut v, 14)!;
+    v.extend("latn")!;
+    put_words(&mut v, "14 4 0 0 65535 1 0 1")!;
+    v.extend(ft)!;
+    put_words(&mut v, "8 0")!;
+    put(&mut v, nl)!;
+    for i in @as(usize, 0)..nl {
+        put(&mut v, i)!;
+    }
+    put(&mut v, nl)!;
+    let mut at: [8]usize = [0; 8];
+    let mut o = 2 + (2 * nl);
+    for k in @as(usize, 0)..lookups.len {
+        at[k] = o;
+        o += lookups[k].len + (lookups[k].len & 1);
+    }
+    for u in uses {
+        put(&mut v, at[u])!;
+    }
+    for lk in lookups {
+        v.extend(lk)!;
+        if (lk.len & 1) != 0 {
+            v.push(0)!;
+        }
+    }
+    return v;
+}
+
+/// A font with the layout table lt (tag lt_tag) and, unless it is empty, the
+/// GDEF table gdef.
+fn test_font(lt_tag: []u8, lt: []u8, gdef: []u8) ShapeError!vec.Vec.[u8] {
+    let mut cmap = vec.Vec.[u8].init();
+    defer cmap.deinit();
+    // format 4: a segment per character, and the final one
+    put_words(&mut cmap, "0 1 3 1 0 12 4 72 0 14 0 0 0")!;
+    let cps = "32 97 98 99 769 8288 65535";
+    put_words(&mut cmap, cps)!;
+    put(&mut cmap, 0)!;
+    put_words(&mut cmap, cps)!;
+    put_words(&mut cmap, "65509 65440 65440 65441 64770 57254 1 7*0")!;
+    let mut rest = vec.Vec.[u8].init();
+    defer rest.deinit();
+    let mut tabs: [9][]u8 = [""; 9];
+    let mut tags: [9][]u8 = [""; 9];
+    let mut n: usize = 0;
+    if gdef.len > 0 {
+        tags[n] = "GDEF";
+        tabs[n] = gdef;
+        n += 1;
+    }
+    tags[n] = lt_tag;
+    tabs[n] = lt;
+    n += 1;
+    // glyf, loca (long offsets), head (1000 units per em), hhea, hmtx, maxp
+    put_words(&mut rest, "2*0 18*0 1 0 0 0 0 0 24335 15605 0 1000 15*0 1 0 1 0 800 65336 13*0 8")!;
+    put_words(&mut rest, "500 0 500 0 500 0 500 0 500 0 500 0 500 0 500 0 0 20480 8")!;
+    let r = rest.items();
+    let others = "cmap glyf head hhea hmtx loca maxp";
+    let parts: [7][2]usize = [[0, 0], [0, 4], [40, 54], [94, 36], [130, 32], [4, 36], [162, 6]];
+    for k in @as(usize, 0)..7 {
+        tags[n] = others[(5 * k)..((5 * k) + 4)];
+        tabs[n] = r[parts[k][0]..(parts[k][0] + parts[k][1])];
+        if k == 0 {
+            tabs[n] = cmap.items();
+        }
+        n += 1;
+    }
+    let mut v = vec.Vec.[u8].init();
+    put_words(&mut v, "1 0")!;
+    put(&mut v, n)!;
+    put_words(&mut v, "0 0 0")!;
+    let mut off = 12 + (16 * n);
+    for k in @as(usize, 0)..n {
+        v.extend(tags[k])!;
+        put_words(&mut v, "0 0")!;
+        put(&mut v, off >> 16)!;
+        put(&mut v, off & 0xffff)!;
+        put(&mut v, 0)!;
+        put(&mut v, tabs[k].len)!;
+        off += (tabs[k].len + 3) & ~@as(usize, 3);
+    }
+    for k in @as(usize, 0)..n {
+        v.extend(tabs[k])!;
+        while (v.len & 3) != 0 {
+            v.push(0)!;
+        }
+    }
+    return v;
+}
+
+fn repeat(s: []u8, n: usize) ShapeError![]mut u8 {
+    let out = mem.alloc.[u8](s.len * n)!;
+    for i in @as(usize, 0)..n {
+        @mem_copy(out[(i * s.len)..((i + 1) * s.len)], s);
+    }
+    return out;
+}
+
+test "long texts are shaped whole" {
+    let none: [1][]u8 = [""];
+    let uses: [1]usize = [0];
+    let mut lt = test_layout("ccmp", none[..], uses[..0])!;
+    defer lt.deinit();
+    let mut data = test_font("GSUB", lt.items(), "")!;
+    defer data.deinit();
+    let f = font.Font.init(data.items())!;
+    @expect_eq(f.glyph_index('b'), 2);
+    @expect_eq(f.glyph_index(0x2060), 6);
+    let text = repeat("ab", 30000)!;
+    defer mem.free(text);
+    let gs = shape(&f, text, options())!;
+    defer mem.free(gs);
+    @expect_eq(gs.len, 60000);
+    @expect_eq(gs[59999].id, 2);
+    @expect_eq(gs[59999].cluster, 59999);
+    @expect_eq(gs[59999].x_advance, 500);
+}
+
+/// Appends x n times.
+fn put_n(v: *mut vec.Vec.[u8], x: usize, n: usize) ShapeError!void {
+    for _i in @as(usize, 0)..n {
+        put(v, x)!;
+    }
+}
+
+fn shape_test_font(f: *font.Font, text: []u8) ShapeError![]mut Glyph {
+    let gs = shape(f, text, options())!;
+    let mut s = Shaper.init();
+    defer s.deinit();
+    let again = s.shape(f, text, options())!;
+    defer mem.free(again);
+    @expect_eq(again.len, gs.len);
+    return gs;
+}
+
+test "rules that fail to match are charged" {
+    // 300 subtables of 300 rules of 64 glyphs, all failing at the last
+    let mut lk = vec.Vec.[u8].init();
+    defer lk.deinit();
+    put_words(&mut lk, "5 0 300")!;
+    put_n(&mut lk, 606, 300)!;
+    put_words(&mut lk, "1 8 1 14 1 1 1 300")!;
+    put_n(&mut lk, 602, 300)!;
+    put_words(&mut lk, "64 0 62*1 2")!;
+    let lks: [1][]u8 = [lk.items()];
+    let uses: [1]usize = [0];
+    let mut lt = test_layout("ccmp", lks[..], uses[..])!;
+    defer lt.deinit();
+    let mut data = test_font("GSUB", lt.items(), "")!;
+    defer data.deinit();
+    let f = font.Font.init(data.items())!;
+    let text = repeat("a", 300)!;
+    defer mem.free(text);
+    let gs = shape_test_font(&f, text)!;
+    defer mem.free(gs);
+    @expect_eq(gs.len, 300);
+    @expect_eq(gs[299].id, 1);
+}
+
+test "runs of default ignorables" {
+    // 100 ligatures U+2060 "b" -> "c": each U+2060 looks past all that follow
+    let mut lk = vec.Vec.[u8].init();
+    defer lk.deinit();
+    put_words(&mut lk, "4 0 1 8 1 8 1 14 1 1 6 100")!;
+    put_n(&mut lk, 202, 100)!;
+    put_words(&mut lk, "4 2 2")!;
+    let lks: [1][]u8 = [lk.items()];
+    let uses: [1]usize = [0];
+    let mut lt = test_layout("ccmp", lks[..], uses[..])!;
+    defer lt.deinit();
+    let mut data = test_font("GSUB", lt.items(), "")!;
+    defer data.deinit();
+    let f = font.Font.init(data.items())!;
+    let lig = shape_test_font(&f, "\u{2060}b")!;
+    defer mem.free(lig);
+    @expect_eq(lig.len, 1);
+    @expect_eq(lig[0].id, 4);
+    let text = repeat("\u{2060}", 2000)!;
+    defer mem.free(text);
+    let gs = shape_test_font(&f, text)!;
+    defer mem.free(gs);
+    @expect_eq(gs.len, 2000);
+}
+
+test "lookup digests of shared subtables" {
+    // 4 lookups sharing one with 10000 subtables, all one with 10000 glyphs
+    let mut lk = vec.Vec.[u8].init();
+    defer lk.deinit();
+    put_words(&mut lk, "1 0 10000")!;
+    put_n(&mut lk, 20006, 10000)!;
+    put_words(&mut lk, "1 6 0 1 10000")!;
+    for i in @as(usize, 0)..10000 {
+        put(&mut lk, 1 + (2 * i))!;
+    }
+    let lks: [1][]u8 = [lk.items()];
+    let uses: [4]usize = [0, 0, 0, 0];
+    let mut lt = test_layout("ccmp", lks[..], uses[..])!;
+    defer lt.deinit();
+    let mut data = test_font("GSUB", lt.items(), "")!;
+    defer data.deinit();
+    let f = font.Font.init(data.items())!;
+    let gs = shape_test_font(&f, "ab")!;
+    defer mem.free(gs);
+    @expect_eq(gs.len, 2);
+    @expect_eq(gs[0].id, 1);
+}
+
+test "marks on cursive chains" {
+    // a cursive lookup chains each "a" to the one before; 30 lookups attach
+    // U+0301 to "a"
+    let anchor = "1 100 0";
+    let mut curs = vec.Vec.[u8].init();
+    defer curs.deinit();
+    put_words(&mut curs, "3 8 1 8 1 16 1 10 10")!;
+    put_words(&mut curs, anchor)!;
+    put_words(&mut curs, "1 1 1")!;
+    let mut mb = vec.Vec.[u8].init();
+    defer mb.deinit();
+    put_words(&mut mb, "4 0 1 8 1 12 18 1 24 36 1 1 3 1 1 1 1 0 6")!;
+    put_words(&mut mb, anchor)!;
+    put_words(&mut mb, "1 4")!;
+    put_words(&mut mb, anchor)!;
+    let lks: [2][]u8 = [curs.items(), mb.items()];
+    let mut uses: [31]usize = [1; 31];
+    uses[0] = 0;
+    let mut lt = test_layout("mark", lks[..], uses[..])!;
+    defer lt.deinit();
+    let mut gdef = vec.Vec.[u8].init();
+    defer gdef.deinit();
+    put_words(&mut gdef, "1 0 12 0 0 0 1 1 3 1 0 3")!;
+    let mut data = test_font("GPOS", lt.items(), gdef.items())!;
+    defer data.deinit();
+    let f = font.Font.init(data.items())!;
+    let few = shape_test_font(&f, "a\u{301}a\u{301}")!;
+    defer mem.free(few);
+    @expect_eq(few.len, 4);
+    let text = repeat("a\u{301}", 3000)!;
+    defer mem.free(text);
+    let gs = shape_test_font(&f, text)!;
+    defer mem.free(gs);
+    @expect_eq(gs.len, 6000);
+    @expect_eq(gs[1].x_offset, few[1].x_offset);
+    // many marks on one base
+    let marks = repeat("\u{301}", 5000)!;
+    defer mem.free(marks);
+    let mut one = vec.Vec.[u8].init();
+    defer one.deinit();
+    one.extend("a")!;
+    one.extend(marks)!;
+    let ms = shape_test_font(&f, one.items())!;
+    defer mem.free(ms);
+    @expect_eq(ms.len, 5001);
+    @expect_eq(ms[1].x_offset, -500);
+    @expect_eq(ms[5000].x_offset, ms[1].x_offset);
+    @expect_eq(ms[5000].y_offset, ms[1].y_offset);
 }

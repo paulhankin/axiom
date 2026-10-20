@@ -11,9 +11,9 @@ the input that caused it is saved under build/fuzz/failures/<target>/.
 --runs N mutates each seed set N times (500 by default); --minutes M instead
 spends about M minutes in all, shared out among the targets. --seed 0 picks a
 seed from the clock and prints it, for runs that should differ from the last.
-Targets: image audio deflate json regex markdown pdf font x509 text web
-structured compress archive svg collate opusenc binary math tls http2 hpack
-websocket dns (all by default).
+Targets: image audio deflate json regex markdown pdf font shape x509 text
+web structured compress archive svg collate opusenc binary math tls http2
+hpack websocket dns (all by default).
 """
 import argparse
 import concurrent.futures
@@ -27,9 +27,9 @@ import time
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', '..'))
 OUT = os.path.join(ROOT, 'build', 'fuzz')
-TARGETS = ['image', 'audio', 'deflate', 'json', 'regex', 'markdown', 'pdf', 'font', 'x509', 'text', 'web', 'structured',
-           'compress', 'archive', 'svg', 'collate', 'opusenc', 'binary', 'math', 'tls', 'http2', 'hpack', 'websocket',
-           'dns']
+TARGETS = ['image', 'audio', 'deflate', 'json', 'regex', 'markdown', 'pdf', 'font', 'shape', 'x509', 'text', 'web',
+           'structured', 'compress', 'archive', 'svg', 'collate', 'opusenc', 'binary', 'math', 'tls', 'http2', 'hpack',
+           'websocket', 'dns']
 TOKENS = {
     'json': [b'{', b'}', b'[', b']', b'"', b'\\u', b'\\ud800', b'1e999', b'-', b'[' * 600, b'null', b','],
     'regex': [b'(', b')', b'*', b'+', b'?', b'{', b'}', b'{1000}', b'{2,', b'[', b']', b'\\', b'|', b'(?P<', b'\x00'],
@@ -87,6 +87,8 @@ def make_seeds(exe):
         for f in sorted(glob.glob(pat))[:2]:
             if os.path.getsize(f) < 400000:
                 shutil.copy(f, fonts)
+    # the same fonts for shaping
+    shutil.copytree(fonts, os.path.join(seeds, 'shape'), dirs_exist_ok=True)
     arch = os.path.join(seeds, 'archive')
     for f in sorted(glob.glob(os.path.join(ROOT, 'std', 'archive', 'zip', 'testdata', '*.zip')))[:6]:
         if os.path.getsize(f) < 30000:

@@ -40,6 +40,28 @@ pub const SF_ARABIC_HAS_STCH: u32 = 0x10000;
 pub const ATTACH_MARK: u8 = 1;
 pub const ATTACH_CURSIVE: u8 = 2;
 
+// Limits per character of text, which bound what a hostile font can make
+// shaping do: glyphs (MAX_LEN_FACTOR), buffer moves and nested lookups
+// (MAX_OPS_FACTOR), and glyphs examined and subtables, rules and lookup
+// records tried (MATCH_OPS_FACTOR). Past one, shaping stops where it is, with
+// what the lookups so far made. A Spare adds to them.
+pub const MAX_LEN_FACTOR: usize = 64;
+pub const MAX_OPS_FACTOR: i64 = 4096;
+pub const MATCH_OPS_FACTOR: i64 = 1024;
+
+/// What texts may use past their own limits: the minimum for a short text,
+/// shared by all the texts a Shaper shapes, so that many short runs cost no
+/// more than their characters and one minimum.
+pub struct Spare {
+    len: usize,
+    ops: i64,
+    match_ops: i64,
+}
+
+pub fn spare() Spare {
+    return Spare.{ len: 65536, ops: 65536, match_ops: 1048576 };
+}
+
 pub struct Info {
     cp: u32,    // the character, then the glyph
     mask: u32,  // the features that apply
@@ -90,6 +112,7 @@ pub struct Buffer {
     successful: bool,
     oom: bool,
     max_ops: i64,
+    match_ops: i64,  // glyphs examined and rules tried by lookups (layout.charge)
     max_len: usize,
     serial: u8,
     scratch: u32,
@@ -110,6 +133,7 @@ pub struct Buffer {
             successful: true,
             oom: false,
             max_ops: 16384,
+            match_ops: 0,
             max_len: 16384,
             serial: 0,
             scratch: 0,
@@ -126,14 +150,30 @@ pub struct Buffer {
         self.* = Buffer.init();
     }
 
-    /// Sets the operation and length limits from the input length (as
-    /// HarfBuzz does, to bound the work hostile fonts can cause).
-    pub fn enter(self: *mut Buffer) void {
-        self.max_len = @max(self.len * 256, 65536);
-        self.max_ops = @bit_cast(i64, @as(u64, @max(self.len * 4096, 65536)));
+    /// Sets the operation and length limits from the input length and what
+    /// is spare.
+    pub fn enter(self: *mut Buffer, sp: *Spare) void {
+        self.max_len = @add_sat(@mul_sat(self.len, MAX_LEN_FACTOR), sp.len);
+        let n = @bit_cast(i64, @as(u64, self.len));
+        self.max_ops = @add_sat(@mul_sat(n, MAX_OPS_FACTOR), sp.ops);
+        self.match_ops = @add_sat(@mul_sat(n, MATCH_OPS_FACTOR), sp.match_ops);
         self.serial = 0;
         self.scratch = 0;
         self.successful = true;
+    }
+
+    /// Takes what shaping used past the text's own limits from sp.
+    pub fn leave(self: *Buffer, sp: *mut Spare) void {
+        sp.len = @min(sp.len, @sub_sat(self.max_len, self.len));
+        sp.ops = @min(sp.ops, @max(self.max_ops, 0));
+        sp.match_ops = @min(sp.match_ops, @max(self.match_ops, 0));
+    }
+
+    /// Makes room for a text of n characters, with the length limit enter
+    /// will set for it.
+    pub fn reserve_text(self: *mut Buffer, n: usize, sp: *Spare) bool {
+        self.max_len = @add_sat(@mul_sat(n, MAX_LEN_FACTOR), sp.len);
+        return self.ensure(n);
     }
 
     /// Room for size glyphs on both sides.

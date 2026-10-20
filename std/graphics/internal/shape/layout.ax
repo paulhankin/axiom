@@ -8,6 +8,7 @@
 // =============================================================================
 
 import "../../../collections/vec.ax" as vec;
+import "../../../mem.ax" as mem;
 import "buffer.ax" as buf;
 
 pub error ShapeLayoutError { OutOfMemory }
@@ -173,13 +174,17 @@ fn digest_add_range(dg: *mut Digest, a: u32, b: u32) void {
     }
 }
 
-/// Adds the glyphs of a coverage table.
-fn digest_add_coverage(dg: *mut Digest, d: []u8, c: usize) void {
+/// Adds the glyphs of a coverage table, charging its entries to budget.
+fn digest_add_coverage(dg: *mut Digest, d: []u8, c: usize, budget: *mut i64) void {
     if c == 0 {
         return;
     }
     let fmt = u16at(d, c);
     let n = @as(usize, u16at(d, c + 2));
+    budget.* -= sz(n);
+    if budget.* < 0 {
+        return;
+    }
     if fmt == 1 {
         for i in @as(usize, 0)..n {
             let g = u16at(d, c + 4 + (2 * i));
@@ -197,8 +202,15 @@ fn digest_add_coverage(dg: *mut Digest, d: []u8, c: usize) void {
     }
 }
 
-/// The digest of the glyphs lookup li of table ti can start at.
-pub fn lookup_digest(f: *Face, ti: usize, li: u32) Digest {
+/// The budget for reading coverage tables into the digests of a table's
+/// lookups: past it (subtables shared many times), digests are full.
+pub fn digest_budget(f: *Face) i64 {
+    return sz(f.d.len) + 65536;
+}
+
+/// The digest of the glyphs lookup li of table ti can start at (each
+/// subtable and coverage entry read charged to budget).
+pub fn lookup_digest(f: *Face, ti: usize, li: u32, budget: *mut i64) Digest {
     let mut dg = digest_empty();
     let d = f.d;
     let l = lookup_at(f, ti, li);
@@ -207,8 +219,18 @@ pub fn lookup_digest(f: *Face, ti: usize, li: u32) Digest {
     }
     let typ = u16at(d, l);
     let n = @as(usize, u16at(d, l + 4));
+    let mut last: usize = 0;
     for i in @as(usize, 0)..n {
-        let r = resolve_in(f, ti, typ, off16(d, l, l + 6 + (2 * i)));
+        let s = off16(d, l, l + 6 + (2 * i));
+        if s == last {
+            continue;
+        }
+        last = s;
+        budget.* -= 1;
+        if budget.* < 0 {
+            return digest_full();
+        }
+        let r = resolve_in(f, ti, typ, s);
         let st = r[1];
         if st == 0 {
             continue;
@@ -222,7 +244,10 @@ pub fn lookup_digest(f: *Face, ti: usize, li: u32) Digest {
             let nb = @as(usize, u16at(d, st + 2));
             cov = off16(d, st, st + 4 + (2 * nb) + 2);
         }
-        digest_add_coverage(&mut dg, d, cov);
+        digest_add_coverage(&mut dg, d, cov, budget);
+        if budget.* < 0 {
+            return digest_full();
+        }
     }
     return dg;
 }
@@ -521,6 +546,17 @@ pub struct Ctx {
     iter_context: Iter,
 }
 
+/// Charges n steps of matching (a glyph examined, a subtable or rule tried) to
+/// the buffer's budget; false, and the buffer unsuccessful, once it is spent.
+pub fn charge(b: *mut buf.Buffer, n: i64) bool {
+    b.match_ops -= n;
+    if b.match_ops < 0 {
+        b.successful = false;
+        return false;
+    }
+    return true;
+}
+
 fn iter_init(c: *Ctx, context_match: bool) Iter {
     let mut it = Iter.{
         idx: 0,
@@ -708,6 +744,9 @@ fn iter_set(it: *mut Iter, mf: u8, mdata: usize, gd: usize, has_gd: bool) void {
 fn iter_next(c: *Ctx, it: *mut Iter) bool {
     let stop = sz(it.end) - 1;
     while sz(it.idx) < stop {
+        if not charge(c.b, 1) {
+            return false;
+        }
         it.idx += 1;
         let r = iter_match(c, it, &c.b.info[it.idx]);
         if r == MATCH {
@@ -726,6 +765,9 @@ fn iter_next(c: *Ctx, it: *mut Iter) bool {
 fn iter_prev(c: *Ctx, it: *mut Iter) bool {
     let back = c.b.back();
     while it.idx > 0 {
+        if not charge(c.b, 1) {
+            return false;
+        }
         it.idx -= 1;
         let r = iter_match(c, it, &back[it.idx]);
         if r == MATCH {
@@ -814,6 +856,9 @@ fn match_input(c: *mut Ctx, count: usize, gd: usize, mf: u8, mdata: usize, mp: *
                     let out = b.back();
                     let mut j = b.backtrack_len();
                     while (j > 0) and (lig_id(&out[j - 1]) == first_lig_id) {
+                        if not charge(b, 1) {
+                            return false;
+                        }
                         if lig_comp(&out[j - 1]) == 0 {
                             j -= 1;
                             found = true;
@@ -960,7 +1005,7 @@ fn apply_lookup(c: *mut Ctx, count0: usize, mp: *mut [64]u32, nrec: usize, recs:
         }
     }
     for i in @as(usize, 0)..nrec {
-        if not b.successful {
+        if not b.successful or not charge(b, 1) {
             break;
         }
         let idx = @as(usize, u16at(d, recs + (4 * i)));
@@ -1126,6 +1171,9 @@ fn context(c: *mut Ctx, s: usize) bool {
             return false;
         }
         for i in @as(usize, 0)..@as(usize, u16at(d, rs)) {
+            if not charge(c.b, 1) {
+                return false;
+            }
             let r = off16(d, rs, rs + 2 + (2 * i));
             if (r != 0) and context_rule(c, r, MF_GLYPH, 0) {
                 return true;
@@ -1147,6 +1195,9 @@ fn context(c: *mut Ctx, s: usize) bool {
             return false;
         }
         for i in @as(usize, 0)..@as(usize, u16at(d, rs)) {
+            if not charge(c.b, 1) {
+                return false;
+            }
             let r = off16(d, rs, rs + 2 + (2 * i));
             if (r != 0) and context_rule(c, r, MF_CLASS, cd) {
                 return true;
@@ -1193,6 +1244,9 @@ fn chain_context(c: *mut Ctx, s: usize) bool {
             return false;
         }
         for i in @as(usize, 0)..@as(usize, u16at(d, rs)) {
+            if not charge(c.b, 1) {
+                return false;
+            }
             let r = off16(d, rs, rs + 2 + (2 * i));
             if (r != 0) and chain_rule(c, r, MF_GLYPH, 0, 0, 0) {
                 return true;
@@ -1216,6 +1270,9 @@ fn chain_context(c: *mut Ctx, s: usize) bool {
             return false;
         }
         for i in @as(usize, 0)..@as(usize, u16at(d, rs)) {
+            if not charge(c.b, 1) {
+                return false;
+            }
             let r = off16(d, rs, rs + 2 + (2 * i));
             if (r != 0) and chain_rule(c, r, MF_CLASS, bcd, icd, lcd) {
                 return true;
@@ -1379,6 +1436,9 @@ fn ligature_subst(c: *mut Ctx, s: usize) bool {
         return false;
     }
     for i in @as(usize, 0)..@as(usize, u16at(d, set)) {
+        if not charge(b, 1) {
+            return false;
+        }
         let l = off16(d, set, set + 2 + (2 * i));
         if l == 0 {
             continue;
@@ -1666,11 +1726,13 @@ fn cursive_pos(c: *mut Ctx, s: usize) bool {
     return true;
 }
 
+/// The vertical offset of the glyph at gp0 with those of the cursive chain
+/// it hangs from, as far as attachment offsets propagate (MAX_NESTING).
 fn resolve_cross_offset(pos: []buf.Pos, len: usize, gp0: usize) i32 {
     let mut gp = gp0;
     let mut off = pos[gp].yo;
     let mut guard: u32 = 0;
-    while (pos[gp].atype & buf.ATTACH_CURSIVE) != 0 {
+    while ((pos[gp].atype & buf.ATTACH_CURSIVE) != 0) and (guard < MAX_NESTING) {
         let chain = pos[gp].chain;
         if chain == 0 {
             break;
@@ -1682,9 +1744,6 @@ fn resolve_cross_offset(pos: []buf.Pos, len: usize, gp0: usize) i32 {
         gp = us(p);
         off = buf.sat_add(off, pos[gp].yo);
         guard += 1;
-        if guard > 1000000 {
-            break;
-        }
     }
     return off;
 }
@@ -1747,6 +1806,9 @@ fn find_base(c: *mut Ctx, cov: usize, lig: bool) i64 {
     }
     let mut j = b.idx;
     while j > c.last_base_until {
+        if not charge(b, 1) {
+            return -1;
+        }
         let mut m = iter_match(c, &c.iter_input, &b.info[j - 1]);
         if m == MATCH {
             let acc = if_lig_accept(b, j - 1, lig);
@@ -1972,6 +2034,9 @@ fn apply_lookup_subtables(c: *mut Ctx, l: usize) bool {
     let typ = u16at(d, l);
     let n = @as(usize, u16at(d, l + 4));
     for i in @as(usize, 0)..n {
+        if not charge(c.b, 1) {
+            return false;
+        }
         let s = off16(d, l, l + 6 + (2 * i));
         let r = resolve(c, typ, s);
         if apply_subtable(c, r[0], r[1]) {
@@ -2015,7 +2080,7 @@ pub fn apply_string(c: *mut Ctx, lookup_index: u32, dg: *Digest) void {
         return;
     }
     let l = lookup_at(c.f, c.table, lookup_index);
-    if l == 0 {
+    if (l == 0) or not charge(b, sz(b.len)) {
         return;
     }
     c.lookup_index = lookup_index;
@@ -2094,7 +2159,16 @@ pub fn set_lookup(c: *mut Ctx, mask: u32, auto_zwnj: bool, auto_zwj: bool, rando
 // GPOS finishing: attachment offsets
 // -----------------------------------------------------------------------------
 
-fn propagate_attachment_offsets(pos: []mut buf.Pos, len: usize, i: usize, rtl: bool, level: u32) void {
+/// a + d, saturated to i32.
+fn sat_add_wide(a: i32, d: i64) i32 {
+    let v = @as(i64, a) + @max(@min(d, 0x100000000), -0x100000000);
+    return @truncate(i32, @max(@min(v, 0x7fffffff), -0x80000000));
+}
+
+/// Adds the offsets of what glyph i attaches to (the sums of the advances
+/// between them come from the prefix sums px and py).
+fn propagate_attachment_offsets(pos: []mut buf.Pos, len: usize, i: usize, rtl: bool, level: u32, px: []i64,
+                                py: []i64) void {
     let chain = pos[i].chain;
     let typ = pos[i].atype;
     pos[i].chain = 0;
@@ -2107,38 +2181,23 @@ fn propagate_attachment_offsets(pos: []mut buf.Pos, len: usize, i: usize, rtl: b
     }
     let j = us(j64);
     if pos[j].chain != 0 {
-        propagate_attachment_offsets(pos, len, j, rtl, level - 1);
+        propagate_attachment_offsets(pos, len, j, rtl, level - 1, px, py);
     }
     if (typ & buf.ATTACH_CURSIVE) != 0 {
         pos[i].yo = buf.sat_add(pos[i].yo, pos[j].yo);
         return;
     }
     pos[i].xo = buf.sat_add(pos[i].xo, pos[j].xo);
-    if j < i {
-        if not rtl {
-            for k in j..i {
-                pos[i].xo = buf.sat_sub(pos[i].xo, pos[k].xa);
-                pos[i].yo = buf.sat_sub(pos[i].yo, pos[k].ya);
-            }
-        } else {
-            for k in (j + 1)..(i + 1) {
-                pos[i].xo = buf.sat_add(pos[i].xo, pos[k].xa);
-                pos[i].yo = buf.sat_add(pos[i].yo, pos[k].ya);
-            }
-        }
-    } else {
-        if not rtl {
-            for k in i..j {
-                pos[i].xo = buf.sat_add(pos[i].xo, pos[k].xa);
-                pos[i].yo = buf.sat_add(pos[i].yo, pos[k].ya);
-            }
-        } else {
-            for k in (i + 1)..(j + 1) {
-                pos[i].xo = buf.sat_sub(pos[i].xo, pos[k].xa);
-                pos[i].yo = buf.sat_sub(pos[i].yo, pos[k].ya);
-            }
-        }
+    // less the advances from j up to i (left to right; from j + 1 through i
+    // right to left), or plus those from i up to j
+    let mut dx = px[j] - px[i];
+    let mut dy = py[j] - py[i];
+    if rtl {
+        dx = px[i + 1] - px[j + 1];
+        dy = py[i + 1] - py[j + 1];
     }
+    pos[i].xo = sat_add_wide(pos[i].xo, dx);
+    pos[i].yo = sat_add_wide(pos[i].yo, dy);
 }
 
 pub fn position_start(b: *mut buf.Buffer) void {
@@ -2152,10 +2211,29 @@ pub fn position_finish_offsets(b: *mut buf.Buffer) void {
     if (b.scratch & buf.SF_HAS_GPOS_ATTACHMENT) == 0 {
         return;
     }
+    // prefix sums of the advances, so a mark far from its base costs no more
+    let px = mem.alloc.[i64](b.len + 1) catch {
+        b.successful = false;
+        b.oom = true;
+        return;
+    };
+    defer mem.free(px);
+    let py = mem.alloc.[i64](b.len + 1) catch {
+        b.successful = false;
+        b.oom = true;
+        return;
+    };
+    defer mem.free(py);
+    px[0] = 0;
+    py[0] = 0;
+    for k in @as(usize, 0)..b.len {
+        px[k + 1] = px[k] + @as(i64, b.pos[k].xa);
+        py[k + 1] = py[k] + @as(i64, b.pos[k].ya);
+    }
     if not b.rtl {
         for i in @as(usize, 0)..b.len {
             if b.pos[i].chain != 0 {
-                propagate_attachment_offsets(b.pos, b.len, i, false, MAX_NESTING);
+                propagate_attachment_offsets(b.pos, b.len, i, false, MAX_NESTING, px, py);
             }
         }
     } else {
@@ -2163,7 +2241,7 @@ pub fn position_finish_offsets(b: *mut buf.Buffer) void {
         while i > 0 {
             i -= 1;
             if b.pos[i].chain != 0 {
-                propagate_attachment_offsets(b.pos, b.len, i, true, MAX_NESTING);
+                propagate_attachment_offsets(b.pos, b.len, i, true, MAX_NESTING, px, py);
             }
         }
     }
@@ -2552,8 +2630,10 @@ pub struct MapBuilder {
         self.add_pause(0, pause)!;
     }
 
-    fn add_lookups(self: *MapBuilder, m: *mut Map, ti: usize, fi: u32, mask: u32, auto_zwnj: bool, auto_zwj: bool,
-                   random: bool, per_syllable: bool) ShapeLayoutError!void {
+    /// Adds the lookups of feature fi of table ti to the stage that starts at
+    /// m.lookups[ti][first].
+    fn add_lookups(self: *MapBuilder, m: *mut Map, ti: usize, first: usize, fi: u32, mask: u32, auto_zwnj: bool,
+                   auto_zwj: bool, random: bool, per_syllable: bool) ShapeLayoutError!void {
         let ft = feature_table(self.f, ti, fi);
         if ft == 0 {
             return;
@@ -2564,6 +2644,11 @@ pub struct MapBuilder {
             let li = u16at(d, ft + 4 + (2 * i));
             if li >= self.f.lookup_count[ti] {
                 continue;
+            }
+            // features sharing their lists: merge before the stage holds more
+            // than a few times the lookups
+            if (m.lookups[ti].len - first) > ((2 * @as(usize, self.f.lookup_count[ti])) + 64) {
+                merge_lookups(m, ti, first);
             }
             m.lookups[ti].push(LookupMap.{
                 index: li,
@@ -2697,31 +2782,16 @@ pub struct MapBuilder {
             let mut last_num: usize = 0;
             for stage in @as(u32, 0)..self.current_stage[ti] {
                 if (req_index[ti] != NO_INDEX) and (req_stage[ti] == stage) {
-                    self.add_lookups(m, ti, req_index[ti], global_bit, true, true, false, false)!;
+                    self.add_lookups(m, ti, last_num, req_index[ti], global_bit, true, true, false, false)!;
                 }
                 let feats = m.features.items();
                 for fm in feats {
                     if fm.stage[ti] == stage {
-                        self.add_lookups(m, ti, fm.index[ti], fm.mask, fm.auto_zwnj, fm.auto_zwj, fm.random,
+                        self.add_lookups(m, ti, last_num, fm.index[ti], fm.mask, fm.auto_zwnj, fm.auto_zwj, fm.random,
                                          fm.per_syllable)!;
                     }
                 }
-                let ls = m.lookups[ti].items();
-                if (last_num + 1) < ls.len {
-                    vec.sort(ls[last_num..], lookup_less);
-                    let mut k = last_num;
-                    for i in (k + 1)..ls.len {
-                        if ls[i].index != ls[k].index {
-                            k += 1;
-                            ls[k] = ls[i];
-                        } else {
-                            ls[k].mask |= ls[i].mask;
-                            ls[k].auto_zwnj = ls[k].auto_zwnj and ls[i].auto_zwnj;
-                            ls[k].auto_zwj = ls[k].auto_zwj and ls[i].auto_zwj;
-                        }
-                    }
-                    m.lookups[ti].truncate(k + 1);
-                }
+                merge_lookups(m, ti, last_num);
                 last_num = m.lookups[ti].len;
                 let st = self.stages[ti].items();
                 if (stage_index < st.len) and (st[stage_index].index == stage) {
@@ -2732,8 +2802,9 @@ pub struct MapBuilder {
                 }
             }
             let lms = m.lookups[ti].items();
+            let mut budget = digest_budget(self.f);
             for k in @as(usize, 0)..lms.len {
-                lms[k].digest = lookup_digest(self.f, ti, lms[k].index);
+                lms[k].digest = lookup_digest(self.f, ti, lms[k].index, &mut budget);
             }
         }
     }
@@ -2748,6 +2819,27 @@ fn info_less(a: FeatureInfo, b: FeatureInfo) bool {
 
 fn lookup_less(a: LookupMap, b: LookupMap) bool {
     return a.index < b.index;
+}
+
+/// Sorts the lookups of table ti from first on and merges duplicates.
+fn merge_lookups(m: *mut Map, ti: usize, first: usize) void {
+    let ls = m.lookups[ti].items();
+    if (first + 1) >= ls.len {
+        return;
+    }
+    vec.sort(ls[first..], lookup_less);
+    let mut k = first;
+    for i in (k + 1)..ls.len {
+        if ls[i].index != ls[k].index {
+            k += 1;
+            ls[k] = ls[i];
+        } else {
+            ls[k].mask |= ls[i].mask;
+            ls[k].auto_zwnj = ls[k].auto_zwnj and ls[i].auto_zwnj;
+            ls[k].auto_zwj = ls[k].auto_zwj and ls[i].auto_zwj;
+        }
+    }
+    m.lookups[ti].truncate(k + 1);
 }
 
 // -----------------------------------------------------------------------------
@@ -2791,7 +2883,7 @@ fn would_match_input(d: []u8, gs: []u32, count: usize, input: usize, mf: u8, mda
     return true;
 }
 
-fn would_apply_subtable(d: []u8, typ: usize, s: usize, gs: []u32, zero_context: bool) bool {
+fn would_apply_subtable(b: *mut buf.Buffer, d: []u8, typ: usize, s: usize, gs: []u32, zero_context: bool) bool {
     if s == 0 {
         return false;
     }
@@ -2814,6 +2906,9 @@ fn would_apply_subtable(d: []u8, typ: usize, s: usize, gs: []u32, zero_context: 
             return false;
         }
         for i in @as(usize, 0)..@as(usize, u16at(d, set)) {
+            if not charge(b, 1) {
+                return false;
+            }
             let l = off16(d, set, set + 2 + (2 * i));
             if (l != 0) and would_match_input(d, gs, @as(usize, u16at(d, l + 2)), l + 4, MF_GLYPH, 0) {
                 return true;
@@ -2847,6 +2942,9 @@ fn would_apply_subtable(d: []u8, typ: usize, s: usize, gs: []u32, zero_context: 
             return false;
         }
         for i in @as(usize, 0)..@as(usize, u16at(d, rs)) {
+            if not charge(b, 1) {
+                return false;
+            }
             let r = off16(d, rs, rs + 2 + (2 * i));
             if (r != 0) and would_match_input(d, gs, @as(usize, u16at(d, r)), r + 4, mf, mdata) {
                 return true;
@@ -2887,6 +2985,9 @@ fn would_apply_subtable(d: []u8, typ: usize, s: usize, gs: []u32, zero_context: 
             return false;
         }
         for i in @as(usize, 0)..@as(usize, u16at(d, rs)) {
+            if not charge(b, 1) {
+                return false;
+            }
             let r = off16(d, rs, rs + 2 + (2 * i));
             if r == 0 {
                 continue;
@@ -2911,8 +3012,9 @@ fn would_apply_subtable(d: []u8, typ: usize, s: usize, gs: []u32, zero_context: 
 }
 
 /// Whether GSUB lookup li would substitute the glyphs gs (in isolation when
-/// zero_context: rules with backtrack or lookahead do not count).
-pub fn would_substitute(f: *Face, li: u32, gs: []u32, zero_context: bool) bool {
+/// zero_context: rules with backtrack or lookahead do not count), charging
+/// the subtables and rules it reads to b.
+pub fn would_substitute(f: *Face, b: *mut buf.Buffer, li: u32, gs: []u32, zero_context: bool) bool {
     if (gs.len == 0) or (li >= f.lookup_count[0]) {
         return false;
     }
@@ -2975,6 +3077,9 @@ pub fn would_substitute(f: *Face, li: u32, gs: []u32, zero_context: bool) bool {
     // the lookup's glyph digest)
     let mut covered = false;
     for i in @as(usize, 0)..n {
+        if not charge(b, 1) {
+            return false;
+        }
         let r = resolve(&c, typ, off16(d, l, l + 6 + (2 * i)));
         if coverage(d, subtable_coverage(d, r[0], r[1]), gs[0]) != NOT_COVERED {
             covered = true;
@@ -2985,8 +3090,11 @@ pub fn would_substitute(f: *Face, li: u32, gs: []u32, zero_context: bool) bool {
         return false;
     }
     for i in @as(usize, 0)..n {
+        if not charge(b, 1) {
+            return false;
+        }
         let r = resolve(&c, typ, off16(d, l, l + 6 + (2 * i)));
-        if would_apply_subtable(d, r[0], r[1], gs, zero_context) {
+        if would_apply_subtable(b, d, r[0], r[1], gs, zero_context) {
             return true;
         }
     }

@@ -973,7 +973,7 @@ const MAX_KERN_SUBTABLES: usize = 32;
 
 /// The PairPos subtables of the GPOS "kern" feature, in lookup order,
 /// without repeats. Counts are clamped to what fits in the table, and the
-/// walk is bounded, whatever the table says.
+/// walk (lookup indices and subtables) is bounded, whatever the table says.
 fn gpos_kern_subtables(d: []u8, gpos: Table, out: *mut [MAX_KERN_SUBTABLES]usize) usize {
     let t = gpos.off;
     let end = gpos.off + gpos.len;
@@ -983,14 +983,34 @@ fn gpos_kern_subtables(d: []u8, gpos: Table, out: *mut [MAX_KERN_SUBTABLES]usize
     let nl = @min(@as(usize, u16at(d, lookups)), @sub_sat(end, lookups) / 2);
     let mut n: usize = 0;
     let mut budget: usize = 1 << 16;
+    // the feature tables walked (scripts often share one)
+    let mut seen: [MAX_KERN_SUBTABLES]usize = [0; MAX_KERN_SUBTABLES];
+    let mut nseen: usize = 0;
     for fi in @as(usize, 0)..nf {
         let rec = features + 2 + (6 * fi);
         if not tag_is(d, rec, "kern") {
             continue;
         }
         let ft = features + @as(usize, u16at(d, rec + 4));
+        let mut again = false;
+        for j in @as(usize, 0)..nseen {
+            if seen[j] == ft {
+                again = true;
+            }
+        }
+        if again {
+            continue;
+        }
+        if nseen < MAX_KERN_SUBTABLES {
+            seen[nseen] = ft;
+            nseen += 1;
+        }
         let count = @min(@as(usize, u16at(d, ft + 2)), @sub_sat(end, ft) / 2);
         for k in @as(usize, 0)..count {
+            if budget == 0 {
+                return n;
+            }
+            budget -= 1;
             let li = @as(usize, u16at(d, ft + 4 + (2 * k)));
             if li >= nl {
                 continue;
@@ -1880,4 +1900,30 @@ test "cff" {
     defer p.deinit();
     f.glyph_path(g, &mut p, 0.0, 0.0, 1.0)!;
     @expect(p.verbs.len > 5);
+}
+
+test "kerning features sharing a table" {
+    // 10000 "kern" features sharing one table of 65535 lookup indices, all
+    // past the lookup list
+    let nf: usize = 10000;
+    let mut d = vec.Vec.[u8].init();
+    defer d.deinit();
+    let head: [10]u8 = [0, 1, 0, 0, 0, 0, 0, 10, 0, 0];
+    d.extend(head[..])!;
+    d.push(@truncate(u8, nf >> 8))!;
+    d.push(@truncate(u8, nf))!;
+    let rel = 2 + (6 * nf);
+    for _i in @as(usize, 0)..nf {
+        d.extend("kern")!;
+        d.push(@truncate(u8, rel >> 8))!;
+        d.push(@truncate(u8, rel))!;
+    }
+    let ft: [4]u8 = [0, 0, 0xff, 0xff];
+    d.extend(ft[..])!;
+    for _i in @as(usize, 0)..65535 {
+        d.push(0)!;
+        d.push(7)!;
+    }
+    let mut out: [MAX_KERN_SUBTABLES]usize = [0; MAX_KERN_SUBTABLES];
+    @expect_eq(gpos_kern_subtables(d.items(), Table.{ off: 0, len: d.len }, &mut out), 0);
 }
