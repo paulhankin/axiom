@@ -42,6 +42,26 @@ pub enum SampleFormat: u8 {
 /// half of 48 kHz audio in 8 channels.
 pub const MAX_SAMPLES: usize = 1073741824;
 
+/// The samples (frames times channels) a decoder may give whatever its
+/// input's size: 2^24, nearly six minutes of 48 kHz stereo.
+pub const MIN_LIMIT: usize = 16777216;
+
+/// The most samples (frames times channels) a decoder gives for n bytes of
+/// input, when a byte of its format can hold at most per_byte of them
+/// (each decoder documents its ratio, chosen to admit silence, the most
+/// compressible sound): n * per_byte, but at least MIN_LIMIT and at most
+/// MAX_SAMPLES. Past it the decoders fail with TooLarge, so a small
+/// hostile file cannot make them allocate or work without limit.
+pub fn max_samples(n: usize, per_byte: usize) usize {
+    let v = @mul_checked(n, per_byte) catch return MAX_SAMPLES;
+    return @min(@max(v, MIN_LIMIT), MAX_SAMPLES);
+}
+
+/// The bytes n samples of a format take, or TooLarge if that overflows.
+pub fn sample_bytes(n: usize, format: SampleFormat) AudioError!usize {
+    return @mul_checked(n, bytes_per_sample(format)) catch return error.TooLarge;
+}
+
 /// The bytes a sample of a format takes in memory.
 pub fn bytes_per_sample(format: SampleFormat) usize {
     if format == SampleFormat.U8 {
@@ -93,7 +113,7 @@ pub struct Sound {
         if n > MAX_SAMPLES {
             return error.TooLarge;
         }
-        let data = mem.alloc_zeroed.[u8](@max(n * bytes_per_sample(format), 1))!;
+        let data = mem.alloc_zeroed.[u8](@max(sample_bytes(n, format)!, 1))!;
         if format == SampleFormat.U8 {
             @mem_set(data, 128);
         }
@@ -546,4 +566,18 @@ test "resampling keeps tones and removes aliases" {
         m = @max(m, @abs(d.get(i, 0)));
     }
     @expect(m < 1e-4);
+}
+
+test "limits on decoded samples" {
+    @expect_eq(max_samples(0, 32768), MIN_LIMIT);
+    @expect_eq(max_samples(100, 32768), MIN_LIMIT);
+    @expect_eq(max_samples(1000, 32768), 32768000);
+    @expect_eq(max_samples(1000000, 64), 64000000);
+    @expect_eq(max_samples(@max_value(usize), 2), MAX_SAMPLES);  // no wrapping
+    @expect_eq(sample_bytes(10, SampleFormat.F64)!, 80);
+    _ = sample_bytes(@max_value(usize) / 4, SampleFormat.F64) catch |e| {
+        @expect_eq(e, error.TooLarge);
+        return;
+    };
+    @expect(false);
 }

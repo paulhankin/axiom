@@ -197,3 +197,23 @@
   - A group with an opacity, clip or mask gets a layer only as large as what it draws,
     not the whole canvas, and at most 8 canvases of layers are live at once; past that
     a group's opacity applies to what it draws and its mask is ignored.
+- Audio decoders (FLAC, Vorbis, Opus, MP3, AAC) limit the samples they produce to a
+  multiple of the input's size, the most their formats' frames of silence reach
+  (`audio.max_samples`: at least 2^24 samples, at most `audio.MAX_SAMPLES`), and fail
+  with `TooLarge` past it; a file of a few hundred bytes could decode to a gigabyte of
+  silence. Sample buffer sizes are computed with checked arithmetic, so they cannot
+  wrap on 32-bit targets.
+- Vorbis: a setup header whose codebooks declare more than 2^22 entries and lookup
+  values in all (or 64 per byte of the header) is refused before memory is allocated
+  (241 bytes could allocate over 1 GB), and a channel without a floor skips the
+  inverse MDCT.
+- FLAC: prediction work is limited to 1024 sample-taps per byte of input (at least
+  2^26), so a stream of empty residuals cannot take minutes to decode.
+- Ogg: skipping garbage between pages checks the CRCs of at most four times the file
+  plus 1 MiB per scan; a file of overlapping `OggS` headers took quadratic time.
+- AAC in MP4: samples may not share bytes, so chunk tables that all point at the same
+  data no longer take quadratic time, and table sizes are checked without overflow,
+  which trapped on 32-bit targets.
+- Opus: the output is sized once from the packets' tables of contents, halving peak
+  memory.
+- AIFF: a sound data offset near 2^32 no longer overflows.

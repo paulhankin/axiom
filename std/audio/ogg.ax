@@ -8,7 +8,10 @@
 //
 // Pages are checked (their CRC must match); packets are reassembled across
 // pages. A packet's granule is its page's granule position when the packet
-// is the last to end on that page, and -1 otherwise.
+// is the last to end on that page, and -1 otherwise. Garbage between pages
+// is skipped, but a scan checks at most 4 bytes per byte of the data (plus
+// 1 MiB) for CRCs, after which no more pages are found: "OggS" at every
+// position, each claiming a long page, would otherwise take quadratic time.
 // =============================================================================
 
 import "../collections/vec.ax" as vec;
@@ -75,14 +78,15 @@ struct Page {
     len: usize,   // the whole page's length
 }
 
-/// The page at p, checked; or an error.
-fn page_at(d: []u8, p: usize) OggError!Page {
+/// The length of the page at p (header, lacing values and body), or 0 if
+/// there is no page there or it does not fit; its CRC is not checked.
+fn page_len(d: []u8, p: usize) usize {
     if ((p + 27) > d.len) or not @mem_eq(d[p..p + 4], "OggS") or (d[p + 4] != 0) {
-        return error.Corrupt;
+        return 0;
     }
     let nseg = @as(usize, d[p + 26]);
     if (p + 27 + nseg) > d.len {
-        return error.Corrupt;
+        return 0;
     }
     let mut body_len: usize = 0;
     for i in @as(usize, 0)..nseg {
@@ -90,8 +94,18 @@ fn page_at(d: []u8, p: usize) OggError!Page {
     }
     let len = 27 + nseg + body_len;
     if (p + len) > d.len {
+        return 0;
+    }
+    return len;
+}
+
+/// The page at p, checked; or an error.
+fn page_at(d: []u8, p: usize) OggError!Page {
+    let len = page_len(d, p);
+    if len == 0 {
         return error.Corrupt;
     }
+    let nseg = @as(usize, d[p + 26]);
     // the CRC, computed with its own field as zero
     let want = binary.u32_le(d[p + 22..]);
     let mut c = crc32(d[p..p + 22]);
@@ -114,14 +128,29 @@ fn crc_continue(c0: u32, d: []u8) u32 {
     return c;
 }
 
-/// The next valid page at or after p (skipping garbage), or d.len.
-fn next_page(d: []u8, p: usize) usize {
+/// A scan's budget of bytes to check CRCs of (see the top of the file).
+fn scan_budget(d: []u8) usize {
+    let four = @mul_checked(d.len, 4) catch @max_value(usize);
+    return @add_checked(four, 1 << 20) catch @max_value(usize);
+}
+
+/// The next valid page at or after p (skipping garbage), or d.len; or
+/// d.len once the bytes whose CRCs it has checked pass the budget.
+fn next_page(d: []u8, p: usize, budget: *mut usize) usize {
     let mut q = p;
     while (q + 4) <= d.len {
         if (d[q] == 'O') and @mem_eq(d[q..q + 4], "OggS") {
-            let ok = page_at(d, q) catch Page.{ flags: 0, granule: 0, serial: 0, nseg: 0, body: 0, len: 0 };
-            if ok.len > 0 {
-                return q;
+            let len = page_len(d, q);
+            if len > budget.* {
+                budget.* = 0;
+                return d.len;
+            }
+            budget.* -= len;
+            if len > 0 {
+                let ok = page_at(d, q) catch Page.{ flags: 0, granule: 0, serial: 0, nseg: 0, body: 0, len: 0 };
+                if ok.len > 0 {
+                    return q;
+                }
             }
         }
         q += 1;
@@ -136,14 +165,15 @@ pub fn is_ogg(d: []u8) bool {
 /// The serial number of the first logical stream whose first packet
 /// starts with magic.
 pub fn find_stream(d: []u8, magic: []u8) OggError!u32 {
-    let mut p = next_page(d, 0);
+    let mut budget = scan_budget(d);
+    let mut p = next_page(d, 0, &mut budget);
     while p < d.len {
         let pg = page_at(d, p)!;
         if ((pg.flags & 2) != 0) and ((pg.body + magic.len) <= d.len) and
            @mem_eq(d[pg.body..pg.body + magic.len], magic) {
             return pg.serial;
         }
-        p = next_page(d, p + pg.len);
+        p = next_page(d, p + pg.len, &mut budget);
     }
     return error.Corrupt;
 }
@@ -162,10 +192,11 @@ fn collect(d: []u8, serial: u32, out: *mut Packets) OggError!void {
     let mut partial = vec.Vec.[u8].init();  // a packet continuing onto the next page
     defer partial.deinit();
     let mut in_partial = false;
-    let mut p = next_page(d, 0);
+    let mut budget = scan_budget(d);
+    let mut p = next_page(d, 0, &mut budget);
     while p < d.len {
         let pg = page_at(d, p)!;
-        p = next_page(d, p + pg.len);
+        p = next_page(d, p + pg.len, &mut budget);
         if pg.serial != serial {
             continue;
         }
@@ -295,4 +326,30 @@ test "pages and packets" {
     defer ps2.deinit();
     @expect_eq(ps2.items.len, 1);  // "C": the rest of B, whose start was lost, is skipped
     @expect_eq(ps2.items.get(0).data, "C");
+}
+
+test "resynchronizing is linear" {
+    // 256 KiB of "OggS" every 32 bytes, each claiming a page of 255 long
+    // lacing values that does not check: the scan gives up after its
+    // budget, not after a CRC of 64 KiB at each of them
+    let n: usize = 1 << 18;
+    let buf = mem.alloc_zeroed.[u8](n + 64)!;
+    defer mem.free(buf);
+    let mut i: usize = 0;
+    while (i + 32) <= n {
+        @mem_copy(buf[i..i + 4], "OggS");
+        @mem_set(buf[i + 5..i + 32], 0xff);
+        i += 32;
+    }
+    let lace: [1]u8 = [4];
+    let len = write_page(buf[n..], 2, 0, 3, lace[..], "real");
+    let d = buf[..n + len];
+    let mut budget = scan_budget(d);
+    @expect_eq(next_page(d, 0, &mut budget), d.len);
+    @expect_eq(budget, 0);
+    _ = find_stream(d, "real") catch |e| {
+        @expect_eq(e, error.Corrupt);
+        return;
+    };
+    @trap();
 }

@@ -108,6 +108,15 @@ fn bit_reverse(v0: u32) u32 {
 
 const FAST: u32 = 10;
 
+// The codebook entries (and lookup values) a setup header may declare
+// whatever its size (see read_setup).
+const BOOK_BUDGET: usize = 4194304;
+
+// The most samples a byte of Vorbis holds (audio.max_samples): a packet
+// of a long block of 8192 with no floors gives 4096 frames of n channels
+// in 3 + n bits, and takes a lacing value too.
+const PER_BYTE: usize = 32768;
+
 struct Book {
     dims: usize,
     entries: usize,
@@ -199,7 +208,15 @@ fn pow_le(r: usize, dims: usize, limit: usize) bool {
     return true;
 }
 
-fn read_book(b: *mut Bits) VorbisError!Book {
+/// Takes n from a setup's budget of codebook entries (TooLarge once spent).
+fn charge(budget: *mut usize, n: usize) VorbisError!void {
+    if n > budget.* {
+        return error.TooLarge;
+    }
+    budget.* -= n;
+}
+
+fn read_book(b: *mut Bits, budget: *mut usize) VorbisError!Book {
     if b.read(24) != 0x564342 {
         return error.Corrupt;
     }
@@ -208,6 +225,7 @@ fn read_book(b: *mut Bits) VorbisError!Book {
     if (dims == 0) or (entries == 0) {
         return error.Corrupt;
     }
+    charge(budget, entries)!;
     let lengths = mem.alloc_zeroed.[u8](entries)!;
     defer mem.free(lengths);
     if b.flag() {
@@ -247,14 +265,14 @@ fn read_book(b: *mut Bits) VorbisError!Book {
         vq: mem.alloc.[f32](0)!,
         has_vq: false,
     };
-    build_book(b, &mut book, lengths, lookup) catch |e| {
+    build_book(b, &mut book, lengths, lookup, budget) catch |e| {
         book.free();
         return e;
     };
     return book;
 }
 
-fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) VorbisError!void {
+fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32, budget: *mut usize) VorbisError!void {
     let entries = book.entries;
     // assign codewords (the specification's algorithm)
     let mut used: usize = 0;
@@ -416,6 +434,7 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32) VorbisE
     if total > (1 << 24) {
         return error.Corrupt;
     }
+    charge(budget, total)!;
     mem.free(book.vq);
     book.vq = mem.alloc.[f32](total)!;
     book.has_vq = true;
@@ -535,12 +554,15 @@ fn read_setup(p: []u8, s: *mut Setup) VorbisError!void {
         return error.Corrupt;
     }
     let mut b = Bits.{ d: p[7..], pos: 0, eop: false };
-    // codebooks
+    // codebooks: their entries, and the values of those with lookup
+    // tables, may total BOOK_BUDGET or 64 per byte of the packet (an
+    // ordered book can claim 2^24 entries in a few bytes)
     let nb = @as(usize, b.read(8)) + 1;
     mem.free(s.books);
     s.books = mem.alloc.[Book](nb)!;
+    let mut budget = @max(BOOK_BUDGET, @mul_checked(p.len, 64) catch @max_value(usize));
     for i in @as(usize, 0)..nb {
-        s.books[i] = read_book(&mut b)!;
+        s.books[i] = read_book(&mut b, &mut budget)!;
         s.nbooks = i + 1;
     }
     // time-domain transforms: placeholders
@@ -960,6 +982,14 @@ fn residue_decode(b: *mut Bits, s: *Setup, r: *Residue, vecs: [][]mut f32, skip:
     let mut groups = nch;  // how many independent classification streams
     if r.kind == 2 {
         groups = 1;
+    } else {
+        let mut any = false;
+        for j in @as(usize, 0)..nch {
+            any = any or not skip[j];
+        }
+        if not any {
+            return;
+        }
     }
     for pass in @as(usize, 0)..8 {
         let mut part: usize = 0;
@@ -1243,10 +1273,11 @@ pub fn decode(data: []u8) VorbisError!audio.Sound {
         return error.Corrupt;
     }
     read_setup(pk[2].data, &mut s)!;
-    return decode_audio(&s, pk[3..]);
+    return decode_audio(&s, pk[3..], audio.max_samples(data.len, PER_BYTE));
 }
 
-fn decode_audio(s: *Setup, pk: []ogg.Packet) VorbisError!audio.Sound {
+/// Decodes the audio packets, giving at most limit samples.
+fn decode_audio(s: *Setup, pk: []ogg.Packet, limit: usize) VorbisError!audio.Sound {
     let nch = s.channels;
     let bs1 = s.bs[1];
     let n2max = bs1 / 2;
@@ -1389,16 +1420,16 @@ fn decode_audio(s: *Setup, pk: []ogg.Packet) VorbisError!audio.Sound {
         // floors times residues, then the inverse MDCT and the window
         for c in @as(usize, 0)..nch {
             let sp = spec[c * n2max..(c * n2max) + n2];
-            if has_floor[c] {
-                let sub = @as(usize, map.mux[c]);
-                floor1_curve(&s.floors[@as(usize, map.floor[sub])], ys[c * 65..(c * 65) + 65], curve[..n2], ints);
-                for i in @as(usize, 0)..n2 {
-                    sp[i] *= curve[i];
-                }
-            } else {
-                @mem_set(sp, 0);
-            }
             let y = pcm[c * bs1..(c * bs1) + n];
+            if not has_floor[c] {
+                @mem_set(y, 0);  // silence (the transform of zeros, without the work)
+                continue;
+            }
+            let sub = @as(usize, map.mux[c]);
+            floor1_curve(&s.floors[@as(usize, map.floor[sub])], ys[c * 65..(c * 65) + 65], curve[..n2], ints);
+            for i in @as(usize, 0)..n2 {
+                sp[i] *= curve[i];
+            }
             if n == s.bs[0] {
                 m0.inverse(sp, y);
             } else {
@@ -1410,12 +1441,16 @@ fn decode_audio(s: *Setup, pk: []ogg.Packet) VorbisError!audio.Sound {
         if prev_n > 0 {
             let count = (prev_n / 4) + (n / 4);
             if (frames + count) > cap {
-                cap = @max(cap * 2, frames + count + 4096);
-                if (cap * nch) > audio.MAX_SAMPLES {
+                if (frames + count) > (limit / nch) {
                     out.deinit();
                     return error.TooLarge;
                 }
-                out.data = mem.realloc(out.data, cap * nch * 4) catch |e| {
+                cap = @min(@max(cap * 2, frames + count + 4096), limit / nch);
+                let size = audio.sample_bytes(cap * nch, audio.SampleFormat.F32) catch |e| {
+                    out.deinit();
+                    return e;
+                };
+                out.data = mem.realloc(out.data, size) catch |e| {
                     out.deinit();
                     return e;
                 };
@@ -1557,7 +1592,8 @@ test "codeword assignment" {
     };
     defer book.free();
     let mut dummy = Bits.{ d: "", pos: 0, eop: false };
-    build_book(&mut dummy, &mut book, lengths[..], 0)!;
+    let mut budget = BOOK_BUDGET;
+    build_book(&mut dummy, &mut book, lengths[..], 0, &mut budget)!;
     // expected codewords: 00, 0100, 0101, 0110, 0111, 10, 110, 111
     let want: [8]u32 = [0x0, 0x4, 0x5, 0x6, 0x7, 0x2, 0x6, 0x7];
     for e in @as(usize, 0)..8 {
@@ -1597,7 +1633,8 @@ test "long codewords" {
     };
     defer book.free();
     let mut dummy = Bits.{ d: "", pos: 0, eop: false };
-    build_book(&mut dummy, &mut book, lengths[..], 0)!;
+    let mut budget = BOOK_BUDGET;
+    build_book(&mut dummy, &mut book, lengths[..], 0, &mut budget)!;
     // a stream of entries 0..19 and back
     let mut buf: [64]u8 = [0; 64];
     let mut pos: usize = 0;
@@ -1729,4 +1766,52 @@ test "decodes like the reference decoder" {
 
 fn less_u64(a: u64, b: u64) bool {
     return a < b;
+}
+
+/// Hostile streams (for tests): a setup of 8 codebooks of 2^24 - 1 entries each, in 241 bytes;
+/// 20 packets of 4096 silent frames of 255 channels; 2 of 2 channels.
+let BOOKS: [4][]u8 = [
+    "T2dnUwACAAAAAAAAAAABAAAAAAAAAI19FhoBHgF2b3JiaXMAAAAAAoC7AAAAAAAAAAAAAAAAAAC4AU9nZ1MAAAAAAAAAAAAA",
+    "AQAAAAEAAAAi3cLGAhBtA3ZvcmJpcwAAAAAAAAAAAQV2b3JiaXMHQkNWAQD////v//8/CA1ZBQD8//+/////IDRkFQDw////",
+    "/v//g9CQVQDA////+///D0JDVgEA////7///PwgNWQUA/P//v////yA0ZBUA8P////7//4PQkFUAwP////v//w///z9PZ2dT",
+    "AAAAAAAAAAAAAAEAAAACAAAAhGrqVAEBAA==",
+];
+let SILENT_255: [4][]u8 = [
+    "T2dnUwACAAAAAAAAAAABAAAAAAAAANA1M3oBHgF2b3JiaXMAAAAA/4C7AAAAAAAAAAAAAAAAAADYAU9nZ1MAAAAAAAAAAAAA",
+    "AQAAAAEAAADvR/lEAhA0A3ZvcmJpcwAAAAAAAAAAAQV2b3JiaXMAQkNWAQACAAAAAAAAABAAAEAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAIAAAAAAAAFPZ2dTAAD/////////fwEAAAACAAAAn2FnxxQBAQEBAQEBAQEBAQEBAQEBAQEBAQYGBgYGBgYGBgYGBgYG",
+    "BgYGBgYG",
+];
+let SILENT_2: [3][]u8 = [
+    "T2dnUwACAAAAAAAAAAABAAAAAAAAAOcn83sBHgF2b3JiaXMAAAAAAoC7AAAAAAAAAAAAAAAAAADYAU9nZ1MAAAAAAAAAAAAA",
+    "AQAAAAEAAADvR/lEAhA0A3ZvcmJpcwAAAAAAAAAAAQV2b3JiaXMAQkNWAQACAAAAAAAAABAAAEAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAIAAAAAAAAFPZ2dTAAD/////////fwEAAAACAAAAzqZGugMBAQEGBgY=",
+];
+
+fn from_base64(lines: [][]u8) VorbisError![]mut u8 {
+    let mut text = strs.String.init();
+    defer text.deinit();
+    for l in lines {
+        text.push_str(l) catch return error.OutOfMemory;
+    }
+    return base64.decode_alloc(text.bytes(), base64.STANDARD) catch return error.Corrupt;
+}
+
+fn fails_with(lines: [][]u8, want: VorbisError) bool {
+    let data = from_base64(lines) catch return false;
+    defer mem.free(data);
+    let mut s = decode(data) catch |e| return e == want;
+    s.deinit();
+    return false;
+}
+
+test "codebooks and output are limited by the input" {
+    @expect(fails_with(BOOKS[..], error.TooLarge));
+    @expect(fails_with(SILENT_255[..], error.TooLarge));  // 21 million samples from 222 bytes
+    let data = from_base64(SILENT_2[..])!;
+    defer mem.free(data);
+    let mut s = decode(data)!;
+    defer s.deinit();
+    @expect_eq(s.frames, 8192);
+    @expect_eq(s.peak(), 0.0);
 }

@@ -36,6 +36,18 @@ pub const BEST: u32 = 8;
 const MAX_BLOCK: usize = 65536;  // (a frame header can say 65536)
 const MAX_LPC: usize = 32;
 
+// The most samples a byte of FLAC holds (audio.max_samples): eight
+// channels of constant subframes, 65536 samples each, take 22 bytes.
+const PER_BYTE: usize = 32768;
+
+// The prediction work (samples times taps, plus one per sample) allowed
+// for each byte of input, and in any case: residuals take at least a bit
+// a sample (but for escaped partitions of 0-bit values), so 32nd-order
+// prediction costs at most 264 a byte, and only a stream of mostly empty
+// residuals comes near the limit.
+const WORK_PER_BYTE: u64 = 1024;
+const MIN_WORK: u64 = 67108864;
+
 /// Where the "fLaC" marker is (after an ID3v2 tag, if any), or none.
 fn start_of(d: []u8) FlacError!usize {
     let mut p: usize = 0;
@@ -395,7 +407,9 @@ fn residual(b: *mut Bits, block: usize, order: usize, out: []mut i64) FlacError!
     }
 }
 
-fn subframe(b: *mut Bits, block: usize, bps0: u32, out: []mut i64) FlacError!void {
+/// Decodes a subframe into out, charging fixed and linear prediction to the
+/// work budget.
+fn subframe(b: *mut Bits, block: usize, bps0: u32, out: []mut i64, work: *mut u64) FlacError!void {
     if b.read(1) != 0 {
         return error.Corrupt;
     }
@@ -423,6 +437,7 @@ fn subframe(b: *mut Bits, block: usize, bps0: u32, out: []mut i64) FlacError!voi
         if order > block {
             return error.Corrupt;
         }
+        charge(work, block, order)!;
         for i in @as(usize, 0)..order {
             out[i] = b.signed(bps);
         }
@@ -449,6 +464,7 @@ fn subframe(b: *mut Bits, block: usize, bps0: u32, out: []mut i64) FlacError!voi
         if order > block {
             return error.Corrupt;
         }
+        charge(work, block, order)!;
         for i in @as(usize, 0)..order {
             out[i] = b.signed(bps);
         }
@@ -497,6 +513,15 @@ fn subframe(b: *mut Bits, block: usize, bps0: u32, out: []mut i64) FlacError!voi
     }
 }
 
+/// Takes a predicted subframe's work from the budget (TooLarge once spent).
+fn charge(work: *mut u64, block: usize, order: usize) FlacError!void {
+    let cost = @as(u64, block) * @as(u64, order + 1);
+    if cost > work.* {
+        return error.TooLarge;
+    }
+    work.* -= cost;
+}
+
 /// The format samples of bps bits are held in.
 fn format_for(bps: u32) audio.SampleFormat {
     if bps <= 8 {
@@ -528,6 +553,11 @@ fn find_sync(d: []u8, p: usize, info: *Info) usize {
 }
 
 pub fn decode(data: []u8) FlacError!audio.Sound {
+    return decode_limited(data, audio.max_samples(data.len, PER_BYTE));
+}
+
+/// decode, giving at most limit samples (else TooLarge).
+fn decode_limited(data: []u8, limit: usize) FlacError!audio.Sound {
     let start = start_of(data)!;
     let mut p = start + 4;
     let mut info = Info.{ rate: 0, channels: 0, bps: 0, total: 0, max_block: 0, md5: [0; 16] };
@@ -557,10 +587,10 @@ pub fn decode(data: []u8) FlacError!audio.Sound {
     // claim a billion samples (it grows as frames really arrive)
     let mut cap: usize = 4096;
     if (info.total > 0) and (info.total < @as(u64, audio.MAX_SAMPLES)) {
-        cap = @min(@truncate(usize, info.total), 1 << 20);
+        cap = @min(@min(@truncate(usize, info.total), 1 << 20), limit / nch);
     }
     let mut s = audio.Sound.init(cap, nch, info.rate, format)!;
-    decode_frames(data, p, &info, &mut s) catch |e| {
+    decode_frames(data, p, &info, limit, &mut s) catch |e| {
         s.deinit();
         return e;
     };
@@ -586,7 +616,8 @@ fn md5_block(sig: *mut md5.Md5, chans: []i64, stride: usize, block: usize, nch: 
     sig.update(buf[..block * fb]);
 }
 
-fn decode_frames(data: []u8, p0: usize, info: *Info, s: *mut audio.Sound) FlacError!void {
+/// Decodes the frames into s, giving at most limit samples.
+fn decode_frames(data: []u8, p0: usize, info: *Info, limit: usize, s: *mut audio.Sound) FlacError!void {
     let nch = info.channels;
     let chans = mem.alloc.[i64](MAX_BLOCK * 8)!;
     defer mem.free(chans);
@@ -602,6 +633,7 @@ fn decode_frames(data: []u8, p0: usize, info: *Info, s: *mut audio.Sound) FlacEr
     let fmt = s.format;
     let shift = audio.bits(fmt) - info.bps;
     let bpsample = audio.bytes_per_sample(fmt);
+    let mut work = @max(@as(u64, data.len) * WORK_PER_BYTE, MIN_WORK);
     while p < data.len {
         let fr = frame_header(data, p, info) catch {
             let q = find_sync(data, p + 1, info);
@@ -620,7 +652,7 @@ fn decode_frames(data: []u8, p0: usize, info: *Info, s: *mut audio.Sound) FlacEr
             if ((fr.assign == 8) and (c == 1)) or ((fr.assign == 9) and (c == 0)) or ((fr.assign == 10) and (c == 1)) {
                 bps += 1;  // the side channel
             }
-            subframe(&mut b, block, bps, chans[c * MAX_BLOCK..(c * MAX_BLOCK) + block])!;
+            subframe(&mut b, block, bps, chans[c * MAX_BLOCK..(c * MAX_BLOCK) + block], &mut work)!;
         }
         b.align();
         let end = b.byte_pos();
@@ -653,11 +685,11 @@ fn decode_frames(data: []u8, p0: usize, info: *Info, s: *mut audio.Sound) FlacEr
         }
         // store
         if (frames + block) > s.frames {
-            let want = @max(s.frames * 2, frames + block);
-            if (want * nch) > audio.MAX_SAMPLES {
+            if (frames + block) > (limit / nch) {
                 return error.TooLarge;
             }
-            s.data = mem.realloc(s.data, want * nch * bpsample)!;
+            let want = @max(@min(s.frames * 2, limit / nch), frames + block);
+            s.data = mem.realloc(s.data, audio.sample_bytes(want * nch, fmt)!)!;
             s.frames = want;
         }
         if check_md5 {
@@ -1674,4 +1706,53 @@ test "rejects corruption" {
         return;
     };
     @trap();
+}
+
+test "prediction work and output are limited" {
+    // a subframe of 32nd-order prediction from empty residuals: 4096
+    // samples in 79 bytes, charged 4096 * 33 (16-bit warm-up samples,
+    // 1-bit coefficients, an escaped partition of 0-bit residuals)
+    let mut o = Out.init()!;
+    defer mem.free(o.buf);
+    o.bits(0, 1);
+    o.bits(63, 6);
+    o.bits(0, 1);
+    o.zeros(32 * 16);
+    o.bits(0, 4);
+    o.bits(0, 5);
+    o.zeros(32);
+    o.bits(0, 2);
+    o.bits(0, 4);
+    o.bits(15, 4);
+    o.bits(0, 5);
+    o.align();
+    let x = mem.alloc.[i64](4096)!;
+    defer mem.free(x);
+    let mut b = Bits.{ d: o.buf[..o.len], pos: 0, cache: 0, n: 0, over: false };
+    let mut work: u64 = 4096 * 33;
+    subframe(&mut b, 4096, 16, x, &mut work)!;
+    @expect_eq(work, 0);
+    @expect_eq(x[4095], 0);
+    // silence: a sound's samples may number at most the limit
+    let mut z = audio.Sound.init(200000, 1, 8000, audio.SampleFormat.S16)!;
+    defer z.deinit();
+    let ez = encode(&z, DEFAULT)!;
+    defer mem.free(ez);
+    let mut back = decode_limited(ez, 200000)!;
+    defer back.deinit();
+    @expect_eq(back.data[..], z.data[..]);
+    @expect(too_large(ez, 199999));
+    let mut b2 = Bits.{ d: o.buf[..o.len], pos: 0, cache: 0, n: 0, over: false };
+    let mut little: u64 = (4096 * 33) - 1;
+    let mut refused = false;
+    subframe(&mut b2, 4096, 16, x, &mut little) catch |e| {
+        refused = e == error.TooLarge;
+    };
+    @expect(refused);
+}
+
+fn too_large(data: []u8, limit: usize) bool {
+    let mut s = decode_limited(data, limit) catch |e| return e == error.TooLarge;
+    s.deinit();
+    return false;
 }

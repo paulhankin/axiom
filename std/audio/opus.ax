@@ -32,6 +32,11 @@ import "ogg.ax" as ogg;
 
 pub error OpusError { Corrupt, Unsupported, OutOfMemory, TooLarge, NotFound, IoError, Empty, Done, InvalidUtf8 }
 
+// The most samples a byte of Opus holds (audio.max_samples): a packet of
+// 48 empty frames (concealment) gives 120 ms in 2 bytes and a lacing
+// value, and a stream's channels can be mapped to several outputs.
+const PER_BYTE: usize = 16384;
+
 /// Whether data is an Ogg stream holding Opus.
 pub fn is_opus(data: []u8) bool {
     if (data.len < 36) or not ogg.is_ogg(data) {
@@ -131,10 +136,25 @@ pub fn decode(data: []u8) OpusError!audio.Sound {
         };
         s.decode_gain = h.gain;
     }
+    // the length, from the packets' tables of contents, sizes the output
+    // once; the samples decoded, those of every stream, are limited too
+    let mut cap: usize = 0;
+    for pi in @as(usize, 2)..pk.len {
+        let p = pk[pi].data;
+        if p.len == 0 {
+            continue;
+        }
+        let mut f = dec.Frames.{ toc: 0, count: 0, offset: [0; 48], size: [0; 48], packet_len: 0 };
+        dec.parse_packet(p, h.streams > 1, &mut f) catch return error.Corrupt;
+        cap += f.count * @as(usize, @bit_cast(u32, dec.samples_per_frame(p[0])));
+        if cap > (audio.max_samples(data.len, PER_BYTE) / @max(nch, h.streams + h.coupled)) {
+            return error.TooLarge;
+        }
+    }
     let buf = mem.alloc.[f32](5760 * 2)!;
     defer mem.free(buf);
-    let mut out = vec.Vec.[f32].init();
-    defer out.deinit();
+    let mut out = audio.Sound.init(cap, nch, 48000, audio.SampleFormat.F32)!;
+    errdefer out.deinit();
     let mut frames: usize = 0;
     let mut last_granule: i64 = -1;
     for pi in @as(usize, 2)..pk.len {
@@ -162,11 +182,8 @@ pub fn decode(data: []u8) OpusError!audio.Sound {
             }
             if n < 0 {
                 n = got;
-                if ((frames + @as(usize, @bit_cast(u32, n))) * nch) > audio.MAX_SAMPLES {
-                    return error.TooLarge;
-                }
-                for _k in @as(usize, 0)..(@as(usize, @bit_cast(u32, n)) * nch) {
-                    out.push(0.0)!;
+                if (frames + @as(usize, @bit_cast(u32, n))) > cap {
+                    return error.Corrupt;
                 }
                 frames += @as(usize, @bit_cast(u32, n));
             }
@@ -177,7 +194,7 @@ pub fn decode(data: []u8) OpusError!audio.Sound {
             }
             // the stream's channels go where the mapping puts them
             let sc = @as(usize, @bit_cast(u32, sd.channels));
-            let ov = out.items();
+            let ov = out.samples_f32();
             for c in @as(usize, 0)..nch {
                 let m = @as(usize, h.mapping[c]);
                 if m == 255 {
@@ -212,21 +229,20 @@ pub fn decode(data: []u8) OpusError!audio.Sound {
         }
     }
     let total = end - @min(skip, end);
-    let mut s = audio.Sound.init(total, nch, 48000, audio.SampleFormat.F32) catch |e| {
-        if e == error.OutOfMemory {
-            return error.OutOfMemory;
-        }
-        return error.TooLarge;
-    };
-    let dst = s.samples_f32();
-    @mem_copy(dst, out.items()[skip * nch..(skip + total) * nch]);
-    return s;
+    let v = out.samples_f32();
+    for i in @as(usize, 0)..(total * nch) {
+        v[i] = v[(skip * nch) + i];
+    }
+    out.data = mem.realloc(out.data, @max(total * nch * 4, 1))!;
+    out.frames = total;
+    return out;
 }
 
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
+import "../encoding/base64.ax" as base64;
 import "../math.ax" as math;
 import "../os/fs.ax" as fs;
 
@@ -460,6 +476,49 @@ test "survives damaged packets" {
         let mut used: usize = 0;
         _ = dec.decode_packet(st.s.items()[it % 2], pb[..n], false, buf, &mut used);
     }
+}
+
+/// Concealment for tests: 30 packets of 120 ms, each 2 bytes, from one mono stream mapped to 255
+/// channels (44 million samples from 466 bytes); 3 packets in stereo.
+let PLC_255: [7][]u8 = [
+    "T2dnUwACAAAAAAAAAAABAAAAAAAAALNl93YC/xVPcHVzSGVhZAH/AACAuwAAAAABAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAABPZ2dTAAAAAAAAAAAAAAEAAAABAAAAh1hgGgEQT3B1c1RhZ3MAAAAAAAAAAE9nZ1MAAP//////",
+    "//9/AQAAAAIAAAD8tEUmHgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAuMw4zDjMOMw4zDjMOMw4zDjMOMw4zDjMOMw",
+    "4zDjMOMw4zDjMOMw4zDjMOMw4zDjMOMw4zDjMOMw4zDjMA==",
+];
+let PLC_2: [2][]u8 = [
+    "T2dnUwACAAAAAAAAAAABAAAAAAAAAN4DcMkBF09wdXNIZWFkAQIAAIC7AAAAAAEBAAAAT2dnUwAAAAAAAAAAAAABAAAAAQAA",
+    "AIdYYBoBEE9wdXNUYWdzAAAAAAAAAABPZ2dTAAD/////////fwEAAAACAAAAMN4pbwMCAgLjMOMw4zA=",
+];
+
+fn from_base64(lines: [][]u8) OpusError![]mut u8 {
+    let mut text = strs.String.init();
+    defer text.deinit();
+    for l in lines {
+        text.push_str(l)!;
+    }
+    return base64.decode_alloc(text.bytes(), base64.STANDARD) catch return error.Corrupt;
+}
+
+fn too_large(data: []u8) bool {
+    let mut s = decode(data) catch |e| return e == error.TooLarge;
+    s.deinit();
+    return false;
+}
+
+test "output is limited by the input" {
+    let big = from_base64(PLC_255[..])!;
+    defer mem.free(big);
+    @expect(too_large(big));
+    let small = from_base64(PLC_2[..])!;
+    defer mem.free(small);
+    let mut t = decode(small)!;
+    defer t.deinit();
+    @expect_eq(t.frames, 3 * 5760);
+    @expect_eq(t.channels, 2);
 }
 
 fn test_sound(channels: usize, frames: usize, rate: u32) OpusError!audio.Sound {

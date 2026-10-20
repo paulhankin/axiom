@@ -25,7 +25,6 @@
 // =============================================================================
 
 import "../audio.ax" as audio;
-import "../collections/vec.ax" as vec;
 import "../mem.ax" as mem;
 import "formats.ax" as formats;
 import "internal/aac/bits.ax" as bitio;
@@ -75,33 +74,61 @@ pub fn is_aac(data: []u8) bool {
     return false;
 }
 
+// The most samples a byte of AAC holds (audio.max_samples): an empty
+// channel element takes 4 bytes for 1024 frames, which spectral band
+// replication doubles and parametric stereo doubles again.
+const PER_BYTE: usize = 2048;
+
+/// The decoded samples (F32, interleaved), grown as blocks arrive.
 struct Out {
-    v: vec.Vec.[f32],
+    data: []mut u8,
     frames: usize,
     channels: usize,
+    limit: usize,  // the most samples (audio.max_samples)
+
+    fn init(input_len: usize) AacError!Out {
+        return Out.{ data: mem.alloc.[u8](0)!, frames: 0, channels: 0, limit: audio.max_samples(input_len, PER_BYTE) };
+    }
+
+    fn deinit(self: *mut Out) void {
+        mem.free(self.data);
+    }
 }
 
 fn emit(o: *mut Out, block: []f32, n: usize, frames: usize) AacError!void {
-    if ((o.frames + frames) * n) > audio.MAX_SAMPLES {
+    if (o.frames + frames) > (o.limit / n) {
         return error.TooLarge;
     }
-    for i in @as(usize, 0)..(frames * n) {
-        o.v.push(block[i])!;
+    let f32s = audio.SampleFormat.F32;
+    let need = audio.sample_bytes((o.frames + frames) * n, f32s)!;
+    if need > o.data.len {
+        let most = audio.sample_bytes((o.limit / n) * n, f32s)!;
+        o.data = mem.realloc(o.data, @min(@max(o.data.len * 2, need + 65536), most))!;
     }
+    let v = @cast_slice(f32, o.data[..need]);
+    @mem_copy(v[o.frames * n..], block[..frames * n]);
     o.frames += frames;
 }
 
+/// The sound: total frames after the first skip (each clamped to what was
+/// decoded). The samples move to it.
 fn finish(o: *mut Out, rate: i32, skip0: usize, total0: usize) AacError!audio.Sound {
     let skip = @min(skip0, o.frames);
     let total = @min(total0, o.frames - skip);
     let n = o.channels;
-    let mut s = audio.Sound.init(total, n, @bit_cast(u32, rate), audio.SampleFormat.F32) catch |e| {
-        if e == error.OutOfMemory {
-            return error.OutOfMemory;
-        }
-        return error.TooLarge;
+    let v = @cast_slice(f32, o.data[..o.frames * n * 4]);
+    for i in @as(usize, 0)..(total * n) {
+        v[i] = v[(skip * n) + i];
+    }
+    let mut s = audio.Sound.init(0, n, @bit_cast(u32, rate), audio.SampleFormat.F32)!;
+    let data = mem.realloc(o.data, @max(total * n * 4, 1)) catch |e| {
+        s.deinit();
+        return e;
     };
-    @mem_copy(s.samples_f32(), o.v.items()[skip * n..(skip + total) * n]);
+    mem.free(s.data);
+    s.data = data;
+    s.frames = total;
+    o.data = mem.alloc.[u8](0)!;  // (empty: cannot fail)
     return s;
 }
 
@@ -184,8 +211,8 @@ fn decode_adts(data: []u8) AacError!audio.Sound {
     }
     let block = mem.alloc.[f32](2048 * 64)!;
     defer mem.free(block);
-    let mut out = Out.{ v: vec.Vec.[f32].init(), frames: 0, channels: 0 };
-    defer out.v.deinit();
+    let mut out = Out.init(data.len)!;
+    defer out.deinit();
     loop {
         let f = adts_frame(data, o, out.frames > 0)!;
         if f.end {
@@ -549,15 +576,16 @@ fn decode_mp4(data: []u8) AacError!audio.Sound {
     }
     let block = mem.alloc.[f32](2048 * 64)!;
     defer mem.free(block);
-    let mut out = Out.{ v: vec.Vec.[f32].init(), frames: 0, channels: 0 };
-    defer out.v.deinit();
+    let mut out = Out.init(data.len)!;
+    defer out.deinit();
     // the samples: chunks (stco) of runs of samples (stsc) of sizes (stsz)
     if ((tr.stsz.body + 12) > tr.stsz.end) or ((tr.stsc.body + 8) > tr.stsc.end) or ((tr.stco.body + 8) > tr.stco.end) {
         return error.Corrupt;
     }
+    // (the tables' sizes compared by division: a product can wrap)
     let fixed = binary.u32_be(data[tr.stsz.body + 4..]);
     let nsamples = @as(usize, binary.u32_be(data[tr.stsz.body + 8..]));
-    if (fixed == 0) and ((tr.stsz.body + 12 + (4 * nsamples)) > tr.stsz.end) {
+    if (fixed == 0) and (nsamples > ((tr.stsz.end - tr.stsz.body - 12) / 4)) {
         return error.Corrupt;
     }
     let nchunks = @as(usize, binary.u32_be(data[tr.stco.body + 4..]));
@@ -565,13 +593,15 @@ fn decode_mp4(data: []u8) AacError!audio.Sound {
     if tr.co64 {
         csize = 8;
     }
-    if (tr.stco.body + 8 + (csize * nchunks)) > tr.stco.end {
+    if nchunks > ((tr.stco.end - tr.stco.body - 8) / csize) {
         return error.Corrupt;
     }
     let nruns = @as(usize, binary.u32_be(data[tr.stsc.body + 4..]));
-    if (tr.stsc.body + 8 + (12 * nruns)) > tr.stsc.end {
+    if nruns > ((tr.stsc.end - tr.stsc.body - 8) / 12) {
         return error.Corrupt;
     }
+    // samples may not share bytes: those decoded total at most the file
+    let mut left = data.len;
     let mut sample: usize = 0;
     let mut run: usize = 0;
     for chunk in @as(usize, 0)..nchunks {
@@ -586,7 +616,11 @@ fn decode_mp4(data: []u8) AacError!audio.Sound {
         let per = @as(usize, binary.u32_be(data[tr.stsc.body + 8 + (12 * run) + 4..]));
         let mut pos: usize = 0;
         if tr.co64 {
-            pos = @truncate(usize, binary.u64_be(data[tr.stco.body + 8 + (8 * chunk)..]));
+            let p64 = binary.u64_be(data[tr.stco.body + 8 + (8 * chunk)..]);
+            if p64 > @as(u64, data.len) {
+                return error.Corrupt;
+            }
+            pos = @truncate(usize, p64);
         } else {
             pos = @as(usize, binary.u32_be(data[tr.stco.body + 8 + (4 * chunk)..]));
         }
@@ -598,9 +632,10 @@ fn decode_mp4(data: []u8) AacError!audio.Sound {
             if fixed == 0 {
                 size = @as(usize, binary.u32_be(data[tr.stsz.body + 12 + (4 * sample)..]));
             }
-            if (pos > data.len) or (size > (data.len - pos)) {
+            if (pos > data.len) or (size > (data.len - pos)) or (size > left) {
                 return error.Corrupt;
             }
+            left -= size;
             let mut b = bitio.Bits.init(data[pos..pos + size]);
             let got = dec.decode_block(d, &mut b, block)!;
             if got > 0 {
@@ -660,6 +695,7 @@ pub fn decode(data: []u8) AacError!audio.Sound {
 // Tests
 // -----------------------------------------------------------------------------
 
+import "../encoding/base64.ax" as base64;
 import "../encoding/binary.ax" as binary;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
@@ -771,4 +807,79 @@ test "rejects damaged files" {
             s.deinit();
         }
     }
+}
+
+/// Hostile MP4 files (for tests): 64 chunks that all start at the same four samples, and a
+/// sample size table claiming 2^30 + 1 entries (4 times that wraps to 4 in 32 bits).
+let REUSE: [10][]u8 = [
+    "AAAAEGZ0eXBNNEEgAAAAAAAAAmxtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB+HRyYWsAAAHw",
+    "bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAACsRAAAAAAAAAAAAAAAIGhkbHIAAAAAAAAAAHNvdW4AAAAAAAAAAAAAAAAAAAGo",
+    "bWluZgAAAaBzdGJsAAAAWHN0c2QAAAAAAAAAAQAAAEhtcDRhAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACRlc2Rz",
+    "AAAAAAMWAAEABA1AFQAAAAAAAAAAAAAABQISCAAAABRzdHN6AAAAAAAAAAT/////AAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAE",
+    "AAAAAQAAARBzdGNvAAAAAAAAAEAAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKE",
+    "AAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKE",
+    "AAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKE",
+    "AAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAChAAAAoQAAAKEAAAAGG1kYXQAyAAH",
+    "AMgABwDIAAcAyAAH",
+];
+let WRAP: [6][]u8 = [
+    "AAAAEGZ0eXBNNEEgAAAAAAAAAAptZGF04OAAAAF0bW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AQB0cmFrAAAA+G1kaWEAAAAgbWRoZAAAAAAAAAAAAAAAAAAArEQAAAAAAAAAAAAAACBoZGxyAAAAAAAAAABzb3VuAAAAAAAA",
+    "AAAAAAAAAAAAsG1pbmYAAACoc3RibAAAAFhzdHNkAAAAAAAAAAEAAABIbXA0YQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAkZXNkcwAAAAADFgABAAQNQBUAAAAAAAAAAAAAAAUCEhAAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAIAAAABAAAAFHN0",
+    "Y28AAAAAAAAAAQAAABgAAAAYc3RzegAAAAAAAAAAQAAAAQAAAAE=",
+];
+
+fn from_base64(lines: [][]u8) AacError![]mut u8 {
+    let mut text = strs.String.init();
+    defer text.deinit();
+    for l in lines {
+        text.push_str(l) catch return error.OutOfMemory;
+    }
+    return base64.decode_alloc(text.bytes(), base64.STANDARD) catch return error.Corrupt;
+}
+
+fn fails_with(data: []u8, want: AacError) bool {
+    let mut s = decode(data) catch |e| return e == want;
+    s.deinit();
+    return false;
+}
+
+test "samples may not share bytes, and tables are checked without wrapping" {
+    let reuse = from_base64(REUSE[..])!;
+    defer mem.free(reuse);
+    @expect(fails_with(reuse, error.Corrupt));
+    let wrap = from_base64(WRAP[..])!;
+    defer mem.free(wrap);
+    @expect(fails_with(wrap, error.Corrupt));
+}
+
+test "absent channels are silent, and output is limited" {
+    // ADTS frames of 4 blocks in 8 channels (7.1), each block one empty
+    // single channel element: the other seven are absent, and silent
+    let frame: [23]u8 = [0xff, 0xf1, 0x4d, 0xc0, 0x02, 0xff, 0xff, 0x00, 0xc8, 0x00, 0x07, 0x00, 0xc8, 0x00, 0x07, 0x00,
+                         0xc8, 0x00, 0x07, 0x00, 0xc8, 0x00, 0x07];
+    let data = mem.alloc.[u8](20 * frame.len)!;
+    defer mem.free(data);
+    for i in @as(usize, 0)..20 {
+        @mem_copy(data[i * frame.len..(i + 1) * frame.len], frame[..]);
+    }
+    let mut s = decode(data)!;
+    defer s.deinit();
+    @expect_eq(s.channels, 8);
+    @expect_eq(s.frames, 20 * 4 * 1024);
+    @expect_eq(s.peak(), 0.0);
+    let mut o = Out.init(0)!;
+    defer o.deinit();
+    o.limit = 3000;
+    let block = mem.alloc_zeroed.[f32](2048)!;
+    defer mem.free(block);
+    emit(&mut o, block, 2, 1024)!;
+    let mut refused = false;
+    emit(&mut o, block, 2, 1024) catch |e| {
+        refused = e == error.TooLarge;
+    };
+    @expect(refused and (o.frames == 1024));
 }
