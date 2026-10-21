@@ -1,9 +1,33 @@
 #!/bin/sh
-# Release archives of the compiler (docs/releasing.md).
+# Releases of the compiler (docs/releasing.md).
 #
+#   cmd/axiom/release.sh release <version> [options]      a release 0.N.0, from main
+#   cmd/axiom/release.sh fix <version> [<commit>...] [options]
+#                                                          a fix release 0.N.M (M > 0) from
+#                                                          release-0.N, with the commits (from
+#                                                          main) cherry-picked onto it first
 #   cmd/axiom/release.sh notes <version>   gather docs/next/*.md into docs/releases/<version>.md
 #   cmd/axiom/release.sh build <version>   build and check build/release/axiom-<version>-*.{tar.gz,zip}
 #                                          and build/release/SHA256SUMS
+#
+# release and fix do every step of docs/releasing.md: set the version, gather
+# the notes (and open them in $EDITOR, when there is a terminal), commit,
+# build and test, then, once asked, tag the commit, push the branch and the
+# tag, and create the GitHub release with the notes and the archives. After a
+# release 0.N.0 they create release-0.N and set main to the next version;
+# after a fix release they add its notes to main's docs/releases. Each step
+# that is done already is skipped, so after a failure (a cherry-pick that
+# conflicts, a test that fails) fix it, commit, and run the same command
+# again. They need git with push access, gh (logged in, `gh auth login`) and
+# what build needs. Options:
+#   --yes          do not ask before publishing
+#   --dry-run      do the local steps (the commit, the build and tests), then
+#                  print the rest instead of doing it; run again without
+#                  --dry-run to publish what was built
+#   --draft        create the GitHub release as a draft
+#   --advisory <file.json>
+#                  also create a draft security advisory (the JSON body of
+#                  GitHub's "create a repository security advisory" API)
 #
 # build needs a clean tree whose compilers' version (cmd/axiom/src/version.ax,
 # cmd/axiom/bootstrap/src/version.h) is <version>, and docs/releases/<version>.md.
@@ -13,16 +37,200 @@
 # archives are deterministic: the same commit gives the same bytes. Environment:
 #   SKIP_TESTS   1: do not run the test suite (for trying the script out)
 set -eu
-cd "$(dirname "$0")/../.."
+cd "${RELEASE_SH_ROOT:-$(dirname "$0")/../..}"
 
 usage() {
-    echo "usage: cmd/axiom/release.sh notes|build <version>" >&2
+    echo "usage: cmd/axiom/release.sh release|fix|notes|build <version> (see the comment at its top)" >&2
     exit 2
 }
-[ $# -eq 2 ] || usage
+[ $# -ge 2 ] || usage
 cmd=$1
 v=$2
 echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "release: version '$v' is not a.b.c" >&2; exit 2; }
+
+if [ "$cmd" = release ] || [ "$cmd" = fix ]; then
+    # (this checks out other branches, whose copy of this script differs: run
+    # from a copy of it, and run their own notes and build)
+    if [ -z "${RELEASE_SH_COPY:-}" ]; then
+        copy=$(mktemp "${TMPDIR:-/tmp}/release.XXXXXX")
+        cp "$0" "$copy"
+        RELEASE_SH_COPY=$copy RELEASE_SH_ROOT=$(pwd) exec sh "$copy" "$@"
+    fi
+    trap 'rm -f "$RELEASE_SH_COPY"' EXIT
+    shift 2
+    yes=0
+    dry=0
+    draft=""
+    advisory=""
+    picks=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --yes) yes=1 ;;
+            --dry-run) dry=1 ;;
+            --draft) draft=--draft ;;
+            --advisory)
+                [ $# -ge 2 ] || usage
+                advisory=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+                [ -f "$advisory" ] || { echo "release: no advisory file $2" >&2; exit 2; }
+                shift
+                ;;
+            -*) usage ;;
+            *)
+                [ "$cmd" = fix ] || usage
+                picks="$picks $1"
+                ;;
+        esac
+        shift
+    done
+    say() { echo "release: $*"; }
+    die() { echo "release: $*" >&2; exit 1; }
+    commit_all() {
+        git commit -q -m "$1" || die "nothing to commit for '$1'"
+    }
+    set_version() {
+        sed -i.bak "s/pub let VERSION: \[\]u8 = \"[0-9.]*\";/pub let VERSION: []u8 = \"$1\";/" cmd/axiom/src/version.ax
+        sed -i.bak "s/#define AXIOM_VERSION \"[0-9.]*\"/#define AXIOM_VERSION \"$1\"/" cmd/axiom/bootstrap/src/version.h
+        rm -f cmd/axiom/src/version.ax.bak cmd/axiom/bootstrap/src/version.h.bak
+        grep -q "\"$1\"" cmd/axiom/src/version.ax && grep -q "\"$1\"" cmd/axiom/bootstrap/src/version.h ||
+            die "could not set the version to $1"
+        git add cmd/axiom/src/version.ax cmd/axiom/bootstrap/src/version.h
+    }
+    current_version() {
+        sed -n 's/^pub let VERSION: \[\]u8 = "\([0-9.]*\)";/\1/p' cmd/axiom/src/version.ax
+    }
+    major=${v%%.*}
+    rest=${v#*.}
+    minor=${rest%%.*}
+    patch=${rest#*.}
+    series=$major.$minor
+    branch=release-$series
+    tag=v$v
+
+    # Before anything: the tools, the tree, and a release not made already.
+    command -v gh >/dev/null || die "gh is not installed (https://cli.github.com)"
+    if [ "$dry" = 0 ]; then
+        gh auth status >/dev/null 2>&1 || die "gh is not logged in (gh auth login)"
+        if gh release view "$tag" >/dev/null 2>&1; then
+            die "the GitHub release $tag exists already"
+        fi
+    fi
+    [ -z "$(git status --porcelain)" ] || die "the tree has uncommitted changes"
+    git fetch -q origin main
+    start=$(git rev-parse --abbrev-ref HEAD)
+
+    # The branch and the version.
+    if [ "$cmd" = release ]; then
+        [ "$patch" = 0 ] || die "a release is a.b.0; use fix for $v"
+        [ "$start" = main ] || die "a release is made from main (this is $start)"
+        [ "$(git rev-list --count HEAD..origin/main)" = 0 ] || die "main is behind origin/main (git pull)"
+        [ "$(current_version)" = "$v" ] || [ "$(git tag --points-at HEAD)" = "$tag" ] ||
+            die "main is version $(current_version), not $v"
+    else
+        [ "$patch" != 0 ] || die "a fix release is a.b.M with M > 0; use release for $v"
+        if git rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+            git checkout -q "$branch"
+        elif git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch -q origin "$branch"
+            git checkout -q -b "$branch" "origin/$branch"
+        else
+            prev=v$series.$((patch - 1))
+            git rev-parse -q --verify "refs/tags/$prev" >/dev/null || git fetch -q origin "refs/tags/$prev:refs/tags/$prev" ||
+                die "no $branch and no tag $prev to make it from"
+            say "making $branch from $prev"
+            git checkout -q -b "$branch" "$prev"
+        fi
+        for c in $picks; do
+            if git log --format=%B origin/main..HEAD | grep -q "cherry picked from commit $(git rev-parse "$c")"; then
+                say "$c is on $branch already"
+                continue
+            fi
+            say "cherry-picking $c"
+            git cherry-pick -x "$c" ||
+                die "the cherry-pick of $c conflicts: resolve it, git cherry-pick --continue, then run this again (without the commits already picked)"
+        done
+    fi
+
+    # The version and the notes, committed as "Axiom <version>".
+    if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+        if [ "$(current_version)" != "$v" ]; then
+            set_version "$v"
+        fi
+        if [ ! -f "docs/releases/$v.md" ]; then
+            ls docs/next/*.md 2>/dev/null | grep -qv README.md || die "docs/next has no notes for $v"
+            sh cmd/axiom/release.sh notes "$v"
+            if [ -t 0 ] && [ -t 1 ] && [ -n "${EDITOR:-}" ]; then
+                $EDITOR "docs/releases/$v.md"
+            fi
+            git add "docs/releases/$v.md"
+        fi
+        if [ -n "$(git status --porcelain)" ]; then
+            commit_all "Axiom $v"
+        fi
+    fi
+    commit=$(git rev-parse HEAD)
+
+    # Build and test, unless this commit's archives are built already.
+    if [ "$(cat build/release.commit 2>/dev/null)" != "$commit" ] || [ ! -f build/release/SHA256SUMS ]; then
+        sh cmd/axiom/release.sh build "$v"
+        echo "$commit" > build/release.commit
+    fi
+    grep -q "axiom-$v-" build/release/SHA256SUMS || die "build/release holds no archives for $v"
+
+    # Publish.
+    if [ "$dry" = 1 ]; then
+        say "dry run: built $v at $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD); still to do:"
+        say "  tag $tag, push $(git rev-parse --abbrev-ref HEAD) and $tag, create the GitHub release$([ -n "$draft" ] && echo ' (a draft)')"
+        [ -n "$advisory" ] && say "  create the draft security advisory from $advisory"
+        if [ "$cmd" = release ]; then
+            say "  push $branch, set main to $major.$((minor + 1)).0 and push it"
+        else
+            say "  add docs/releases/$v.md to main and push it"
+        fi
+        say "run the same command without --dry-run to do them"
+        git checkout -q "$start"
+        exit 0
+    fi
+    if [ "$yes" = 0 ]; then
+        printf 'release: publish %s (commit %s): push %s and the tag %s, and create the GitHub release? [y/N] ' \
+            "$v" "$(git rev-parse --short HEAD)" "$(git rev-parse --abbrev-ref HEAD)" "$tag"
+        read -r answer
+        [ "$answer" = y ] || [ "$answer" = yes ] || die "not published"
+    fi
+    git rev-parse -q --verify "refs/tags/$tag" >/dev/null || git tag -a "$tag" -m "Axiom $v" "$commit"
+    git push origin "HEAD:refs/heads/$(git rev-parse --abbrev-ref HEAD)"
+    git push origin "refs/tags/$tag"
+    gh release create "$tag" build/release/axiom-"$v"-* build/release/SHA256SUMS --verify-tag \
+        --title "Axiom $v" --notes-file "docs/releases/$v.md" $draft
+    if [ -n "$advisory" ]; then
+        gh api --method POST "repos/{owner}/{repo}/security-advisories" --input "$advisory"
+    fi
+
+    # After it: the branch for fix releases and main's next version, or the
+    # fix release's notes on main.
+    notes=$(cat "docs/releases/$v.md")
+    if [ "$cmd" = release ]; then
+        if ! git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git branch -f "$branch" "$tag"
+            git push origin "refs/heads/$branch"
+        fi
+        set_version "$major.$((minor + 1)).0"
+        commit_all "Version $major.$((minor + 1)).0 on main, after the release of $v"
+        git push origin HEAD:refs/heads/main
+    else
+        git checkout -q main
+        git pull -q --rebase origin main
+        if [ ! -f "docs/releases/$v.md" ]; then
+            printf '%s\n' "$notes" > "docs/releases/$v.md"
+            git add "docs/releases/$v.md"
+            commit_all "docs/releases: $v, released from $branch"
+            git push origin HEAD:refs/heads/main
+        fi
+        git checkout -q "$start"
+    fi
+    say "released $v: $(gh release view "$tag" --json url --jq .url)"
+    exit 0
+fi
+[ $# -eq 2 ] || usage
 
 if [ "$cmd" = notes ]; then
     out=docs/releases/$v.md
@@ -154,4 +362,5 @@ fi
 rm -rf "$R/stage"
 (cd "$R" && sha256sum axiom-"$v"-* > SHA256SUMS)
 cat "$R/SHA256SUMS"
+echo "$commit" > build/release.commit
 echo "built $R for $v (commit $commit)"
