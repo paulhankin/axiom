@@ -273,7 +273,11 @@ if [ "${SKIP_TESTS:-0}" != 1 ]; then
     # have it: native code at -O2
     node cmd/axiom/internal/tests/run.mjs
     AXIOM=$A node cmd/axiom/internal/tests/run.mjs
-    AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 node cmd/axiom/internal/tests/run.mjs --native -O2
+    # (on a Mac, the native suite links cmd/axiom/internal/tests/native_rt.ax, not C)
+    native_target=""
+    [ "$(uname -s)" = Darwin ] && native_target=aarch64-macos
+    AXIOM=$A AXIOM_TEST_SKIP_PLATFORM=1 AXIOM_NATIVE_TARGET=${AXIOM_NATIVE_TARGET:-$native_target} \
+        node cmd/axiom/internal/tests/run.mjs --native -O2
     # the standard library's parsers against mutated inputs, with a seed of
     # this run's own
     python3 cmd/axiom/internal/tests/tools/fuzz.py --minutes 5 --seed 0 --compiler $A
