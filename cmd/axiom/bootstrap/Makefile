@@ -3,7 +3,16 @@
 #   make                 release build -> build/axiom
 #   make test            run the test suite (needs node)
 #   make asan            sanitizer build -> build-asan/axiom
-LLVM_CONFIG ?= llvm-config
+# LLVM 18's llvm-config: as Debian and Ubuntu name it, from Homebrew's llvm@18, or
+# whichever is on the PATH (set LLVM_CONFIG to choose)
+LLVM_CONFIG ?= $(firstword $(foreach c,llvm-config-18 /opt/homebrew/opt/llvm@18/bin/llvm-config \
+                 /usr/local/opt/llvm@18/bin/llvm-config llvm-config,$(shell command -v $(c) 2>/dev/null)))
+ifeq ($(LLVM_CONFIG),)
+$(error no llvm-config: install LLVM 18 (apt install llvm-18-dev lld, or brew install llvm@18), or set LLVM_CONFIG)
+endif
+ifneq ($(firstword $(subst ., ,$(shell $(LLVM_CONFIG) --version))),18)
+$(error $(LLVM_CONFIG) is LLVM $(shell $(LLVM_CONFIG) --version), not 18: install LLVM 18 (apt install llvm-18-dev lld, or brew install llvm@18), or set LLVM_CONFIG)
+endif
 CC ?= cc
 BUILD ?= build
 
