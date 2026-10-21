@@ -368,6 +368,26 @@ export function createHost(opts = {}) {
     return dir.path;
   };
   const dirPath = (d, name) => (d < 0 ? name : dirBase(d) + '/' + name);
+  // The path of d's parent, to open: by path, d's path less its last name
+  // (never a link, see ax_dir_open) rather than d/.., since remove_all
+  // removes the child it reopened its parent through, and d/../.. would
+  // no longer resolve.
+  const parentPath = (d) => {
+    const base = dirBase(d);
+    const slash = base.lastIndexOf('/');
+    const last = base.slice(slash + 1);
+    if (base === dirs.get(d).via || slash <= 0 || last === '' || last === '.' || last === '..') return base + '/..';
+    return base.slice(0, slash);
+  };
+  // Seconds for fs.utimes, never later than the time ns: libuv takes the
+  // nanoseconds back as (s - floor(s)) * 1e9, keeping only microseconds on
+  // Linux but all of them on macOS, where rounding s up set a later time.
+  const utimeSeconds = (ns) => {
+    let s = Number(ns / 1000000000n) + Number(ns % 1000000000n) / 1e9;
+    const back = (x) => BigInt(Math.floor(x)) * 1000000000n + BigInt(Math.trunc((x - Math.floor(x)) * 1e9));
+    while (back(s) > ns) s -= Math.max(Math.abs(s) * Number.EPSILON, Number.MIN_VALUE);
+    return s;
+  };
   // Copies `buf` to p[0..cap] if it fits; returns its length.
   const give = (buf, p, cap) => {
     if (buf.length <= Number(cap)) bytes(Number(p), buf.length).set(buf);
@@ -474,7 +494,8 @@ export function createHost(opts = {}) {
     ax_dir_open(d, p, n) {
       try {
         if (d >= 0 && !dirs.has(d)) return -1;
-        const full = dirPath(d, str(p, n));
+        const name = str(p, n);
+        const full = d >= 0 && name === '..' ? parentPath(d) : dirPath(d, name);
         const st = fs.lstatSync(full);
         if (st.isSymbolicLink()) return -40;
         if (!st.isDirectory()) return -20;
@@ -726,7 +747,7 @@ export function createHost(opts = {}) {
       }
     },
     ax_utimes(p, n, atime, mtime) {
-      try { fs.utimesSync(str(p, n), Number(atime) / 1e9, Number(mtime) / 1e9); return 0; } catch (e) { return fsErr(e); }
+      try { fs.utimesSync(str(p, n), utimeSeconds(atime), utimeSeconds(mtime)); return 0; } catch (e) { return fsErr(e); }
     },
     ax_ftruncate(fd, size) {
       try { fs.ftruncateSync(fd, Number(size)); return 0; } catch (e) { return fsErr(e); }

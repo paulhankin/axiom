@@ -37,7 +37,7 @@ function runOne(index) {
     // thread may be blocked waiting for it).
     const trapChannel = `axiom-test-${process.pid}-${index}`;
     const bc = new BroadcastChannel(trapChannel);
-    const w = new Worker(new URL('./test_worker.mjs', import.meta.url), { workerData: { bytes, index, trapChannel } });
+    const w = new Worker(new URL('./test_worker.mjs', import.meta.url), { workerData: { bytes, index, trapChannel }, resourceLimits: { stackSizeMb: 8 } });
     let done = false;
     const finish = (r) => {
       if (done) return;
