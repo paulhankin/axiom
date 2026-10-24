@@ -352,14 +352,12 @@ pub struct Document {
             path_tmp: draw.Path.init(),
             page_obj: 0,
         };
-        // y down: flip the page
-        p.content.push_str("1 0 0 -1 0 ")!;
-        put_num(&mut p.content, height)!;
-        p.content.push_str(" cm\n")!;
+        p.begin()!;
         return p;
     }
 
-    /// Adds a finished page to the end of the document.
+    /// Adds a finished page to the end of the document. The Page is then
+    /// empty, as from page(), and can be drawn on for the next one.
     pub fn add_page(self: *mut Document, p: *mut Page) !void {
         if self.finished {
             return error.Finished;
@@ -388,7 +386,9 @@ pub struct Document {
         self.heights.push(p.height)!;
         p.content.clear();
         p.annots.clear();
+        p.stack.clear();
         p.page_obj = 0;
+        p.begin()!;
     }
 
     pub fn page_count(self: *Document) usize {
@@ -813,6 +813,14 @@ pub struct Page {
             self.page_obj = self.doc.reserve()!;
         }
         return self.page_obj;
+    }
+
+    /// Starts the content: y down, the transform as page() left it.
+    fn begin(self: *mut Page) PdfError!void {
+        self.ctm = draw.Affine.{ a: 1.0, b: 0.0, c: 0.0, d: -1.0, e: 0.0, f: self.height };
+        self.op("1 0 0 -1 0 ")!;
+        self.num(self.height)!;
+        self.op("cm\n")!;
     }
 
     fn op(self: *mut Page, s: []u8) PdfError!void {
@@ -2000,6 +2008,36 @@ test "documents read back" {
     let mut p3 = doc.page(10.0, 10.0)!;
     defer p3.deinit();
     @expect(failed(doc.add_page(&mut p3)));
+}
+
+test "a page can be reused after add_page" {
+    let mut doc = Document.init();
+    defer doc.deinit();
+    let mut p = doc.page(A4_WIDTH, A4_HEIGHT)!;
+    defer p.deinit();
+    for round in @as(usize, 0)..2 {
+        p.save()!;
+        p.translate(5.0, 7.0)!;
+        p.fill_rect(10.0, 10.0, 100.0, 50.0, draw.Paint.solid(color.Color.rgb(0.0, 0.5, 1.0)))!;
+        p.link(10.0, 10.0, 50.0, 20.0, "https://example.com/")!;
+        doc.add_page(&mut p)!;
+    }
+    let bytes = doc.bytes()!;
+    defer mem.free(bytes);
+    let mut r = read.Reader.open(bytes)!;
+    defer r.deinit();
+    @expect_eq(r.page_count(), 2);
+    // the second page is drawn the same way as the first: y down, from the
+    // page's own transform, with only its own link
+    let mut contents: [2][]u8 = [""; 2];
+    for i in @as(usize, 0)..2 {
+        let pg = r.page(i)!;
+        let st = r.get(pg, "Contents")!.as_stream()!;
+        contents[i] = r.stream_data(st)!;
+        @expect_eq(r.get(pg, "Annots")!.as_array()!.len, 1);
+    }
+    @expect(strs.starts_with(contents[1], "1 0 0 -1 0 841.8898 cm\n"));
+    @expect_eq(contents[0], contents[1]);
 }
 
 fn failed(r: !void) bool {
