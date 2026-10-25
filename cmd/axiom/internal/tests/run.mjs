@@ -669,6 +669,21 @@ await section('spec §16.3', {
       }
       return fs.statSync(o).size > 100 ? null : 'an empty object file';
     },
+    'an --emit=obj object links into a C program (examples/c_interop)': () => {
+      if (!native || isBootstrap() || process.platform !== 'linux') return { skip: true, reason: 'the compiler on Linux only' };
+      if (spawnSync('cc', ['--version']).status !== 0) return { skip: true, reason: 'no C compiler' };
+      const ex = path.join(root, 'examples/c_interop');
+      const o = path.join(dir, 'stats.o');
+      const h = path.join(dir, 'stats.h');
+      const c = spawnSync(compiler, ['build', path.join(ex, 'stats.ax'), '--emit=obj', `--emit-header=${h}`, '-o', o,
+        nativeTarget], { encoding: 'utf8' });
+      if (c.status) return c.stderr;
+      const exe = path.join(dir, 'c_interop');
+      const l = spawnSync('cc', [`-I${dir}`, path.join(ex, 'main.c'), o, '-o', exe], { encoding: 'utf8' });
+      if (l.status) return `cc: ${l.stdout}${l.stderr}`;
+      const r = spawnSync(exe, [], { encoding: 'utf8' });
+      return r.status === 0 && /sorted 5 values/.test(r.stdout) ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
     '--emit=ir': () => {
       if (isBootstrap()) return { skip: true, reason: 'the bootstrap compiler has --emit=llvm instead' };
       prepare();

@@ -2209,6 +2209,10 @@ writes a C header for them with `--emit-header=<path>`. The header contains:
 
 It compiles as C11 and as C++.
 
+On Linux, an object from `--emit=obj` also holds the few machine-code stubs through
+which the runtime makes system calls, which the compiler's own linker otherwise adds,
+so a C program links it with nothing else: `cc main.c lib.o`.
+
 #### 14.5.3 Types at the boundary
 
 | Axiom | C |
