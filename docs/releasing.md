@@ -79,7 +79,9 @@ These are its steps:
    "Axiom <version>".
 3. `cmd/axiom/release.sh build <version>`: bootstraps, runs the test suite with both
    compilers and the standard library's fuzzer for five minutes (`docs/security.md`),
-   and writes the archives and `SHA256SUMS` to `build/release/`.
+   builds every example for the targets it names and runs the ones that can run on
+   the machine (`cmd/axiom/examples.sh`), and writes the archives and `SHA256SUMS` to
+   `build/release/`.
 4. Tag the commit `v<version>`, push the branch and the tag, and create a GitHub
    release for the tag with the notes and the files in `build/release/`.
 5. For a new `0.N`, create the branch `release-0.N` from the tag, and set `main` to the

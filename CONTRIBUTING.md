@@ -25,6 +25,7 @@ cmd/axiom/bootstrap.sh                                   # build the compiler (a
 node cmd/axiom/internal/tests/run.mjs                    # the suite with the bootstrap compiler
 AXIOM=cmd/axiom/build/axiom node cmd/axiom/internal/tests/run.mjs   # with the compiler
 cmd/axiom/difftest.sh                                    # both compilers agree (several suite runs)
+cmd/axiom/examples.sh                                    # the examples build, and run where they can
 ```
 
 `bootstrap.sh` builds the bootstrap compiler (C, LLVM) in `cmd/axiom/bootstrap/build/`,

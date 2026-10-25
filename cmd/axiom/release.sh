@@ -31,7 +31,8 @@
 #
 # build needs a clean tree whose compilers' version (cmd/axiom/src/version.ax,
 # cmd/axiom/bootstrap/src/version.h) is <version>, and docs/releases/<version>.md.
-# It bootstraps, runs the test suite with both compilers, builds the compiler
+# It bootstraps, runs the test suite with both compilers, the fuzzer and the
+# examples (cmd/axiom/examples.sh), builds the compiler
 # for every release target, and packs each with the standard library (its
 # sources, without test data), the licenses and the release notes. The
 # archives are deterministic: the same commit gives the same bytes. Environment:
@@ -281,6 +282,8 @@ if [ "${SKIP_TESTS:-0}" != 1 ]; then
     # the standard library's parsers against mutated inputs, with a seed of
     # this run's own
     python3 cmd/axiom/internal/tests/tools/fuzz.py --minutes 5 --seed 0 --compiler $A
+    # the examples, built for their targets and run where they can be
+    cmd/axiom/examples.sh "$A"
 fi
 
 R=build/release
