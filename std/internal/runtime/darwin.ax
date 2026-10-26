@@ -59,6 +59,7 @@ pub extern "C" {
     fn flock(fd: i32, op: i32) i32;
     fn mmap(addr: *mut void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) *mut void;
     fn munmap(addr: *mut void, len: usize) i32;
+    fn mprotect(addr: *mut void, len: usize, prot: i32) i32;
     fn msync(addr: *mut void, len: usize, flags: i32) i32;
     fn getenv(name: *u8) *u8;
     fn setenv(name: *u8, value: *u8, overwrite: i32) i32;
@@ -2482,13 +2483,15 @@ export fn ax_notify32(p: *mut u32, count: i32) i32 {
 // -----------------------------------------------------------------------------
 // Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
 // region reserved at the first use. The region is as large as the system
-// allows (up to 1 TiB of address space); the kernel supplies physical pages
-// only when they are touched.
+// allows (up to 1 TiB of address space) and has no access, so reserving it
+// costs no memory; @memory_grow makes its next pages read-write, and the
+// kernel supplies physical pages only when they are touched.
 // -----------------------------------------------------------------------------
 let mut mem_base: usize = 0;   // 64 KiB-aligned start of the region
 let mut mem_limit: usize = 0;  // its size in pages
 let mut mem_pages: usize = 0;  // pages handed out
 let mut mem_state: u32 = 0;    // 0: not reserved, 1: reserving, 2: ready, 3: failed
+let mut mem_lock: u32 = 0;     // held while pages are made read-write
 
 fn map_anon(addr: usize, size: usize, fixed: bool) usize {
     let mut flags: i32 = 0x1002;  // MAP_PRIVATE | MAP_ANON
@@ -2507,9 +2510,11 @@ fn mem_reserve() void {
     if @atomic_cas(&mut mem_state, 0, 1) == 0 {
         let mut size: usize = 1 << 40;
         while size >= (1 << 28) {
-            let p = map_anon(0, size + 65536, false);
-            if p != 0 {
-                mem_base = (p + 65535) & ~@as(usize, 65535);
+            // (no access: reserving costs no memory; @memory_grow makes pages read-write)
+            let p = mmap(@ptr_from_int(*mut void, 0), size + 65536, 0, 0x1002, -1, 0);  // MAP_PRIVATE | MAP_ANON
+            let a = @int_from_ptr(p);
+            if a != ~@as(usize, 0) {
+                mem_base = (a + 65535) & ~@as(usize, 65535);
                 mem_limit = size / 65536;
                 @atomic_store(&mut mem_state, 2);
                 return;
@@ -2540,15 +2545,18 @@ export fn ax_memory_grow(n: isize) isize {
         return -1;
     }
     let k = @bit_cast(usize, n);
-    loop {
-        let old = @atomic_load(&mem_pages);
-        if k > (mem_limit - old) {
-            return -1;
-        }
-        if @atomic_cas(&mut mem_pages, old, old + k) == old {
-            return @bit_cast(isize, (mem_base / 65536) + old);
-        }
+    while @atomic_cas(&mut mem_lock, 0, 1) != 0 {
+        ax_sleep_ns(1000);
     }
+    let old = mem_pages;
+    if (k > (mem_limit - old)) or
+       ((k > 0) and (mprotect(@ptr_from_int(*mut void, mem_base + (old * 65536)), k * 65536, 3) != 0)) {
+        @atomic_store(&mut mem_lock, 0);
+        return -1;
+    }
+    @atomic_store(&mut mem_pages, old + k);
+    @atomic_store(&mut mem_lock, 0);
+    return @bit_cast(isize, (mem_base / 65536) + old);
 }
 
 // @memory_discard: the whole 64 KiB pages in the range go back to the system

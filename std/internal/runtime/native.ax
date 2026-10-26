@@ -2538,19 +2538,23 @@ export fn ax_term_raw(fd: i32, enable: u32) i32 {
 // -----------------------------------------------------------------------------
 // Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
 // region reserved at the first use. The region is as large as the system
-// allows (up to 1 TiB of address space); the kernel supplies physical pages
-// only when they are touched.
+// allows (up to 1 TiB of address space) and has no access: reserving it
+// costs no memory, and counts against no limit on memory (overcommit, the
+// data size). @memory_grow makes its next pages read-write, which is when
+// the kernel commits them; it supplies physical pages only when they are
+// touched.
 // -----------------------------------------------------------------------------
 let mut mem_base: usize = 0;   // 64 KiB-aligned start of the region
 let mut mem_limit: usize = 0;  // its size in pages
 let mut mem_pages: usize = 0;  // pages handed out
 let mut mem_state: u32 = 0;    // 0: not reserved, 1: reserving, 2: ready, 3: failed
+let mut mem_lock: u32 = 0;     // held while pages are committed
 
 fn mem_reserve() void {
     if @atomic_cas(&mut mem_state, 0, 1) == 0 {
         let mut size: usize = 1 << 40;
         while size >= (1 << 28) {
-            let p = sys.mmap_anon(size + 65536);
+            let p = sys.mmap_reserve(size + 65536);
             if p != 0 {
                 mem_base = (p + 65535) & ~@as(usize, 65535);
                 mem_limit = size / 65536;
@@ -2583,19 +2587,21 @@ export fn ax_memory_grow(n: isize) isize {
         return -1;
     }
     let k = @bit_cast(usize, n);
-    loop {
-        let old = @atomic_load(&mem_pages);
-        if k > (mem_limit - old) {
-            return -1;
-        }
-        if @atomic_cas(&mut mem_pages, old, old + k) == old {
-            return @bit_cast(isize, (mem_base / 65536) + old);
-        }
+    while @atomic_cas(&mut mem_lock, 0, 1) != 0 {
+        _ = sys.sched_yield();
     }
+    let old = mem_pages;
+    if (k > (mem_limit - old)) or ((k > 0) and (sys.protect_rw(mem_base + (old * 65536), k * 65536) < 0)) {
+        @atomic_store(&mut mem_lock, 0);
+        return -1;
+    }
+    @atomic_store(&mut mem_pages, old + k);
+    @atomic_store(&mut mem_lock, 0);
+    return @bit_cast(isize, (mem_base / 65536) + old);
 }
 
 // @memory_discard: the whole 64 KiB pages in the range go back to the system
-// (they stay mapped, and read as zero when next touched). Only pages of
+// (they stay read-write, and read as zero when next touched). Only pages of
 // @memory_grow's region: anything else (the stack, globals, code, C's heap)
 // is left alone.
 export fn ax_memory_discard(addr: usize, len: usize) void {

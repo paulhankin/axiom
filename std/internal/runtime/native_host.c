@@ -1013,18 +1013,21 @@ int32_t ax_notify32(uint32_t *p, int32_t count) {
 
 // Linear memory (@memory_size, @memory_grow): 64 KiB pages committed from one
 // region reserved at the first use. The region is as large as the system
-// allows (up to 1 TiB of address space); the kernel supplies physical pages
-// only when they are touched.
+// allows (up to 1 TiB of address space) and has no access, so reserving it
+// costs no memory and counts against no limit on memory; @memory_grow makes
+// its next pages read-write, which is when the kernel commits them, and it
+// supplies physical pages only when they are touched.
 static uintptr_t mem_base;       // 64 KiB-aligned start of the region
 static size_t mem_limit;         // its size in pages
 static size_t mem_pages;         // pages handed out
 static uint32_t mem_state;       // 0: not reserved, 1: reserving, 2: ready, 3: failed
+static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;  // held while pages are committed
 
 static void mem_reserve(void) {
     uint32_t zero = 0;
     if (__atomic_compare_exchange_n(&mem_state, &zero, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
         for (size_t size = (size_t)1 << 40; size >= ((size_t)1 << 28); size /= 2) {
-            void *p = mmap(NULL, size + 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            void *p = mmap(NULL, size + 65536, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
             if (p != MAP_FAILED) {
                 mem_base = ((uintptr_t)p + 65535) & ~(uintptr_t)65535;
                 mem_limit = size / 65536;
@@ -1047,15 +1050,20 @@ intptr_t ax_memory_size(void) {
 intptr_t ax_memory_grow(intptr_t n) {
     if (__atomic_load_n(&mem_state, __ATOMIC_SEQ_CST) != 2) mem_reserve();
     if (mem_state != 2 || n < 0) return -1;
-    size_t old = __atomic_load_n(&mem_pages, __ATOMIC_SEQ_CST);
-    do {
-        if ((size_t)n > mem_limit - old) return -1;
-    } while (!__atomic_compare_exchange_n(&mem_pages, &old, old + (size_t)n, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    pthread_mutex_lock(&mem_lock);
+    size_t old = mem_pages;
+    if ((size_t)n > mem_limit - old ||
+        (n > 0 && mprotect((void *)(mem_base + old * 65536), (size_t)n * 65536, PROT_READ | PROT_WRITE) != 0)) {
+        pthread_mutex_unlock(&mem_lock);
+        return -1;
+    }
+    __atomic_store_n(&mem_pages, old + (size_t)n, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&mem_lock);
     return (intptr_t)(mem_base / 65536 + old);
 }
 
 // @memory_discard: the whole 64 KiB pages in the range go back to the system
-// (they stay mapped, and read as zero when next touched). Only pages of
+// (they stay read-write, and read as zero when next touched). Only pages of
 // @memory_grow's region: anything else (the stack, globals, code, C's heap)
 // is left alone.
 void ax_memory_discard(uintptr_t addr, size_t len) {
