@@ -217,8 +217,47 @@ fn add_lib(soname: []u8, file: []u8) *mut Lib {
 // -----------------------------------------------------------------------------
 // Symbols
 // -----------------------------------------------------------------------------
+
+// Functions of another system's libraries (an extern block naming a Windows
+// DLL or a macOS framework): they are the runtime's ax_unavailable, which
+// says so if it is ever called, so that a program can support several
+// systems and choose at run time. (Codegen leaves each function's library
+// in a constant axiom.import.<function>.)
+let mut foreign: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                   cap: 0, len: 0 };
+
+fn is_foreign(name: []u8) bool {
+    return foreign.get(u.intern(name)) != 0;
+}
+
+fn is_foreign_lib(name: []u8) bool {
+    return nl.is_windows_dll(name) or nl.is_apple_lib(name);
+}
+
+fn collect_foreign() void {
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
+        for si in 0..o.syms.len {
+            let s = o.syms.get(si);
+            if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
+                continue;
+            }
+            let d = o.secs.get(@as(usize, @bit_cast(u32, s.sec))).data.view();
+            let mut e = @truncate(usize, s.value);
+            let start = e;
+            while (e < d.len) and (d[e] != 0) {
+                e += 1;
+            }
+            if is_foreign_lib(d[start..e]) {
+                foreign.put(u.intern(s.name[13..]), 1);
+            }
+        }
+    }
+}
+
 fn collect_symbols() void {
     nl.define_globals();
+    nl.use_unavailable(is_foreign);
     // Undefined symbols come from the shared libraries.
     let mut verified = true;
     for i in 0..libs.len {
@@ -544,6 +583,9 @@ fn write_plt(b: []mut u8) void {
 // only when the C library is there.)
 fn needs_nothing(lib_names: [][]u8) bool {
     for name in lib_names {
+        if is_foreign_lib(name) {
+            continue;
+        }
         let builtin = ["c", "m", "pthread", "dl", "rt"];
         let mut known = false;
         for x in builtin {
@@ -573,7 +615,7 @@ fn needs_nothing(lib_names: [][]u8) bool {
                 continue;
             }
             let k = u.intern(sy.name);
-            if not defined.has(k) and not lstub.provides(k, M) and not lstub.libc_only(k) {
+            if not defined.has(k) and not lstub.provides(k, M) and not lstub.libc_only(k) and not is_foreign(sy.name) {
                 return false;
             }
         }
@@ -590,6 +632,7 @@ pub const LINK_FALLBACK: i32 = 2;
 pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) i32 {
     M = machine;
     nl.begin(inputs);
+    collect_foreign();
     static_link = needs_nothing(lib_names);
     nl.objs.push(lstub.build(machine, static_link));
     nl.objs.push(elf.rets_bounds(machine));
@@ -610,7 +653,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
                 skip = true;
             }
         }
-        if skip {
+        if skip or is_foreign_lib(name) {
             continue;
         }
         let file = u.f1("lib%s.so", name);
