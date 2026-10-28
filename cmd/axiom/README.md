@@ -291,6 +291,7 @@ builds with different settings do not share objects.
 | `AXIOM_UNROLL_MAX=<n>` | Unroll only the first `n` loops of the build (bisecting an unrolling bug). |
 | `AXIOM_POISON=1` | Fill dead IR values and blocks with `0xA5` instead of reusing them, so a use after free in a pass is caught. |
 | `AXIOM_CHECK_CINTS=1` | Check after every pass that no shared integer constant was changed in place. |
+| `AXIOM_CHECK_IR=1` | Check after optimizing that each instruction's operands from its own block (but a phi's) come before it, and stop at the first that does not. The test suite sets it. |
 | `AXIOM_X64_FPAD=<bytes>` | Bytes in front of every function (before alignment): builds with different values place code differently, for measuring placement effects. |
 | `AXIOM_X64_FALIGN=<a>` | Functions start at multiples of `a` bytes (default 16). |
 | `AXIOM_X64_LALIGN=<a>`, `AXIOM_X64_LMAX=<n>`, `AXIOM_X64_LMODE=1\|2` | Hot loop tops aligned to `a` bytes (default 0: not aligned) with at most `n` bytes of nops (default 15); mode 1 (default) aligns the targets of backward jumps, 2 any loop block not often fallen into. |

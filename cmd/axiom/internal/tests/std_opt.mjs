@@ -5,6 +5,7 @@
 // and runs every module's tests optimized on both targets, in parallel, with
 // the compiler's own consistency checks on:
 //   AXIOM_CHECK_CINTS=1  shared constants are never changed by a pass
+//   AXIOM_CHECK_IR=1     instructions come after their operands
 //   AXIOM_POISON=1       released memory is poisoned and never reused
 // (both checked by the compiler; the bootstrap compiler ignores them).
 //
@@ -64,7 +65,7 @@ for (const f of dirsUnder(path.join(root, 'std')).flatMap(files)) {
   }
 }
 
-const env = { ...process.env, AXIOM_CHECK_CINTS: '1', AXIOM_POISON: '1' };
+const env = { ...process.env, AXIOM_CHECK_CINTS: '1', AXIOM_CHECK_IR: '1', AXIOM_POISON: '1' };
 
 function run(w) {
   return new Promise((resolve) => {

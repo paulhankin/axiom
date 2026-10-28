@@ -64,6 +64,9 @@ const compileTimeout = 300000;
 const runTimeout = (process.env.AXIOM_NATIVE_EXEC ? 4 : 1) * 120000;
 const jobs = Math.max(1, Number(process.env.AXIOM_TEST_JOBS) || os.availableParallelism());
 const skipPlatform = !!process.env.AXIOM_TEST_SKIP_PLATFORM && process.env.AXIOM_TEST_SKIP_PLATFORM !== '0';
+// The compiler checks that the optimized IR's instructions come after their
+// operands (cmd/axiom/README.md; the bootstrap compiler ignores it).
+process.env.AXIOM_CHECK_IR ??= '1';
 // Emulated tests run several times slower, and tests sharing the CPUs
 // slower too: give each test a minute.
 const testTimeout = ['--timeout=60000'];
