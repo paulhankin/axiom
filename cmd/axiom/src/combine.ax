@@ -418,7 +418,7 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         }
     }
     // Widening multiplication overflow (narrow types): ext(trunc p) != p for
-    // p = mul (ext x) c is a range check on x.
+    // p = mul (ext x) c is a range check on x, when p cannot wrap.
     if ((p == ir.IntEQ) or (p == ir.IntNE)) and (at.kind == ir.T_INT) and (bits <= 64) {
         let mut prod = b;
         let mut back = a;
@@ -443,8 +443,15 @@ fn simplify_icmp(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             let x = prod.a.a;
             let w = x.ty.bits;
             if (w < bits) and (w <= 32) and (w >= 8) {
-                let r = narrow_mul_overflow(B, x, prod.a.op == ir.OP_SEXT, ir.sval(prod.b), ir.cint_val(prod.b));
-                if u.notnil(r) {
+                // p cannot wrap: |c| < 2^(bits - w) signed, c <= 2^(bits - w)
+                // unsigned
+                let signed = prod.a.op == ir.OP_SEXT;
+                let sc = ir.sval(prod.b);
+                let uc = ir.cint_val(prod.b);
+                let lim: u64 = @as(u64, 1) << @int_cast(u32, bits - w);
+                if (signed and (sc > -@bit_cast(i64, lim)) and (sc < @bit_cast(i64, lim))) or
+                   (not signed and (uc <= lim)) {
+                    let r = narrow_mul_overflow(B, x, signed, sc, uc);
                     if p == ir.IntNE {
                         return r;
                     }
@@ -1480,7 +1487,8 @@ fn simplify_ptradd(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
     return vnil();
 }
 
-// Does x * c overflow x's (narrow, w <= 32 bits) type? A comparison, or nil.
+// Does x * c overflow x's (narrow, w <= 32 bits) type? A comparison (c is
+// at most 2^56 in magnitude).
 fn narrow_mul_overflow(B: *mut ir.Builder, x: *mut ir.Value, signed: bool, sc: i64, uc: u64) *mut ir.Value {
     let w = x.ty.bits;
     let t = x.ty;
@@ -1498,9 +1506,6 @@ fn narrow_mul_overflow(B: *mut ir.Builder, x: *mut ir.Value, signed: bool, sc: i
     }
     if sc == -1 {
         return mk_icmp(B, ir.IntEQ, x, kt(t, @bit_cast(u64, min)));
-    }
-    if (sc > 0x7fff_ffff) or (sc < -0x7fff_ffff) {
-        return vnil();
     }
     let hi = max / sc;
     let lo = min / sc;
