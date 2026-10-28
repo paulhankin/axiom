@@ -310,8 +310,10 @@ fn whole(c: *ir.Value, d: *ir.Value) bool {
 // A copy of a copy: c2 copies slot D1, which c1 filled from S just before
 // (in the same block, with nothing between them that writes memory), and
 // nothing else reads D1. c2 can copy S itself (then c1 is dead), even when S
-// may change later: it has not changed yet.
-fn copy_of_copy(c2: *mut ir.Value) *mut ir.Value {
+// may change later: it has not changed yet. Two different objects may still
+// be one (two pointer parameters, a parameter and a global): unless S and
+// c2's destination are known apart, c2 is put in moves, to become a memmove.
+fn copy_of_copy(c2: *mut ir.Value, moves: *mut u.List.[*mut ir.Value]) *mut ir.Value {
     let d1 = c2.b;
     if not whole(c2, d1) {
         return u.nil.[ir.Value]();
@@ -334,6 +336,9 @@ fn copy_of_copy(c2: *mut ir.Value) *mut ir.Value {
             return u.nil.[ir.Value]();
         }
         i = i.next;
+    }
+    if not apart(rs, root(c2.a)) {
+        moves.push(c2);
     }
     return c1;
 }
@@ -1000,6 +1005,7 @@ pub fn forward_copies(f: *mut ir.Func) bool {
         // or (copy into the result, the call that made it)
         let mut pairs = u.List.[*mut ir.Value].empty();
         let mut renames = u.List.[*mut ir.Value].empty();
+        let mut moves = u.List.[*mut ir.Value].empty();
         let mut b = f.first;
         while u.notnil(b) {
             let mut i = b.first;
@@ -1010,7 +1016,7 @@ pub fn forward_copies(f: *mut ir.Func) bool {
                     } else if renamable(i) {
                         renames.push(i);
                     } else {
-                        let mut c1 = copy_of_copy(i);
+                        let mut c1 = copy_of_copy(i, &mut moves);
                         if u.isnil(c1) {
                             c1 = copy_of_fill(i);
                         }
@@ -1044,6 +1050,11 @@ pub fn forward_copies(f: *mut ir.Func) bool {
                 }
                 if x.op == ir.OP_MEMCPY {
                     c.b = x.b;  // copy the source itself; the first copy is dead
+                    for m in moves.items() {
+                        if m == c {
+                            c.op = ir.OP_MEMMOVE;  // (it may overlap)
+                        }
+                    }
                     ir.remove_inst(x);
                 } else if x.op == ir.OP_MEMSET {
                     c.op = ir.OP_MEMSET;  // fill the destination itself; the first fill is dead
@@ -1065,6 +1076,7 @@ pub fn forward_copies(f: *mut ir.Func) bool {
             touched.deinit();
         }
         pairs.deinit();
+        moves.deinit();
         // renames when nothing else is left, one per slot a round (each
         // slot's uses were found before any)
         if (done.len == 0) and not changed {
