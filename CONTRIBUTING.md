@@ -47,7 +47,7 @@ the number of tests run at a time.
 
 | Directory | Convention |
 |---|---|
-| `run/*.ax` | Programs with an `export fn run()`; `// expect: <line>` comments give the output, in order, and `// expect-trap` means the run must trap. `// flags: <options>` adds compiler options; `// wasm-only` and `// native-only` restrict the target. |
+| `run/*.ax` | Programs with an `export fn run()`; `// expect: <line>` comments give the output, in order, and `// expect-trap` means the run must trap. `// flags: <options>` adds compiler options; `// wasm-only` and `// native-only` restrict the target, and `// selfhost-only` skips the test with the bootstrap compiler (whose LLVM optimizer differs). |
 | `errors/*.ax` | Programs that must fail to compile with every `// expect-error: E0nnn` code. |
 | `lowering/*.ax` | Instruction selection: each `// lower: <flags> \| <regex> \| <count>` line builds the file with `--emit=asm` and counts the regex's matches. |
 | `traces/`, `profile/`, `sanitize/`, `units/`, `packages/`, `testing/`, `fmt/` | Stack traces and crash reports, the profiler, the address sanitizer, separate compilation, packages and manifests, `axiom test` itself, canonical formatting. |
