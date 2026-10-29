@@ -683,7 +683,10 @@ await section('spec §16.3', {
     },
     'an --emit=obj object links into a C program (examples/c_interop)': () => {
       if (!native || isBootstrap() || process.platform !== 'linux') return { skip: true, reason: 'the compiler on Linux only' };
+      // (the host's cc links for the host)
+      if (process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'not when cross testing' };
       if (spawnSync('cc', ['--version']).status !== 0) return { skip: true, reason: 'no C compiler' };
+      prepare();
       const ex = path.join(root, 'examples/c_interop');
       const o = path.join(dir, 'stats.o');
       const h = path.join(dir, 'stats.h');
