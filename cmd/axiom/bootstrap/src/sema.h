@@ -31,6 +31,10 @@ bool sema_run(const char *path, SemaOptions *opts);
 
 uint32_t error_code_of(Sym name);  // 0 if undeclared
 
+// The value of a constant float expression of type f32 (or untyped,
+// becoming f32), rounded as f32 literals and operations.
+float const_f32(Expr *e);
+
 // Processor extensions (sema_target.c, spec §13.4)
 #define SEMA_NO_VERSION (~(uint64_t)0)  // a version naming another architecture's extension
 // The value of a target condition in code compiled with extensions `feats`:

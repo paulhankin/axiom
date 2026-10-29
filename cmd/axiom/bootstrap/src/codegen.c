@@ -369,6 +369,13 @@ static LLVMValueRef cint(LLVMTypeRef t, i128 v) {
     return LLVMConstIntOfArbitraryPrecision(t, 2, words);
 }
 
+// The constant float expression e of float type t (an f32 rounded once,
+// even when e is a literal of a type parameter).
+static LLVMValueRef cfloat(Type *t, Expr *e) {
+    if (t->kind == TY_FLOAT && t->bits == 32) return LLVMConstReal(lty(t), (double)const_f32(e));
+    return LLVMConstReal(lty(t), e->fval);
+}
+
 static LLVMValueRef usz(int64_t v) { return LLVMConstInt(T_isz, (unsigned long long)v, false); }
 
 static bool terminated(void) {
@@ -1173,10 +1180,10 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
         }
     }
     if (e->is_const && (t->kind == TY_INT)) return cint(lty(t), e->cval);
-    if (e->is_const && t->kind == TY_FLOAT) return LLVMConstReal(lty(t), e->fval);
+    if (e->is_const && t->kind == TY_FLOAT) return cfloat(t, e);
     if (t->kind == TY_BOOL && (e->kind == E_BOOL || e->is_const)) return LLVMConstInt(T_i8, e->bval ? 1 : 0, false);
     switch (e->kind) {
-    case E_FLOAT: return LLVMConstReal(lty(t), e->fval);
+    case E_FLOAT: return cfloat(t, e);
     case E_STRING: return const_slice(string_ptr(e->str, e->slen), e->slen);
     case E_ERROR_VAL: return LLVMConstInt(T_i16, (unsigned long long)e->cval, false);
     case E_ARRAY_LIT: {
@@ -1216,7 +1223,10 @@ static LLVMValueRef gen_const(Expr *e, Type *t) {
         if (e->index == BI_PTR_FROM_INT) return LLVMConstIntToPtr(gen_const(e->bargs.data[1].e, t_usize), T_ptr);
         break;
     case E_UNARY:
-        if (e->op == TK_MINUS && t->kind == TY_FLOAT) return LLVMConstReal(lty(t), -e->a->fval);
+        if (e->op == TK_MINUS && t->kind == TY_FLOAT) {
+            if (t->bits == 32) return cfloat(t, e);
+            return LLVMConstReal(lty(t), -e->a->fval);
+        }
         break;
     case E_CALL:
         if (e->op == CALLK_VARIANT) {
@@ -4212,7 +4222,7 @@ static LLVMValueRef gen_inner(Expr *e) {
     }
     if (e->is_const && t) {
         if (t->kind == TY_INT) return cint(lty(t), e->cval);
-        if (t->kind == TY_FLOAT) return LLVMConstReal(lty(t), e->fval);
+        if (t->kind == TY_FLOAT) return cfloat(t, e);
         if (t->kind == TY_BOOL) return LLVMConstInt(T_i1, e->bval ? 1 : 0, false);
     }
     switch (e->kind) {
@@ -4237,7 +4247,7 @@ static LLVMValueRef gen_inner(Expr *e) {
     case E_STRING: return const_slice(string_ptr(e->str, e->slen), e->slen);
     case E_BOOL: return LLVMConstInt(T_i1, e->bval ? 1 : 0, false);
     case E_INT: return cint(lty(t), (i128)e->ival);
-    case E_FLOAT: return LLVMConstReal(lty(t), e->fval);
+    case E_FLOAT: return cfloat(t, e);
     case E_STRUCT_LIT: return gen_struct_lit(e);
     case E_ARRAY_LIT:
     case E_ARRAY_REPEAT: return gen_array_lit(e);

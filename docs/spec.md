@@ -771,7 +771,10 @@ The following are the **only** conversions the compiler performs without being a
 1. **Untyped literal typing.** An integer, float or character literal takes the type the
    context expects. An integer literal's value must be exactly representable (`E0503`
    otherwise). A float literal is rounded to the nearest value of the target float type
-   (ties to even), so `let x: f32 = 0.1;` is valid.
+   (ties to even), so `let x: f32 = 0.1;` is valid. An expression of untyped literals takes
+   the type as a whole: its float literals are rounded to it and its operations rounded as
+   at run time (§7.7), so `let y: f32 = 16777216.0 + 1.0 + 1.0;` is 16777216 (an integer
+   part such as `7 / 2` is evaluated exactly, as integers, first).
 2. **Mutability weakening.** `[]mut T → []T` and `*mut T → *T`.
 3. **Error-union wrapping.** A `T` or an `error` converts to `!T` in a `return` statement,
    an assignment, or an argument passed to a `!T` parameter.

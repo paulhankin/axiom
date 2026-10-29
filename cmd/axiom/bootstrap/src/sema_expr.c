@@ -77,6 +77,36 @@ static bool lit_ok_for_param(Expr *e, Type *p) {
     }
 }
 
+// Whether constant e has an integer value: an untyped integer, or one
+// coerced to a type parameter.
+static bool int_valued(Expr *e) {
+    if (e->type && e->type->kind == TY_UNTYPED_INT) return true;
+    if (e->kind == E_INT) return true;
+    if (e->kind == E_UNARY) return int_valued(e->a);
+    if (e->kind == E_BINARY) return int_valued(e->a) && int_valued(e->b);
+    return false;
+}
+
+// The value of a constant float expression of type f32 (or untyped,
+// becoming f32): its literals are rounded to f32, a decimal one directly
+// rather than through f64, and its operations are f32 operations (§6.1).
+float const_f32(Expr *e) {
+    if (int_valued(e)) return (float)e->cval;
+    if (e->kind == E_FLOAT) return strtof(e->float_text, NULL);
+    if (e->kind == E_UNARY && e->op == TK_MINUS && e->a->is_const) return -const_f32(e->a);
+    if (e->kind == E_BINARY && e->a->is_const && e->b->is_const) {
+        float a = const_f32(e->a), b = const_f32(e->b);
+        switch (e->op) {
+        case TK_PLUS: return a + b;
+        case TK_MINUS: return a - b;
+        case TK_STAR: return a * b;
+        case TK_SLASH: return a / b;
+        default: break;
+        }
+    }
+    return (float)e->fval;
+}
+
 void coerce(Expr **pe, Type *target) {
     Expr *e = *pe;
     Type *s = e->type;
@@ -99,6 +129,7 @@ void coerce(Expr **pe, Type *target) {
         }
         if (target->kind == TY_FLOAT) {
             e->fval = (double)e->cval;
+            if (target->bits == 32) e->fval = (double)(float)e->cval;
             e->type = target;
             return;
         }
@@ -122,6 +153,7 @@ void coerce(Expr **pe, Type *target) {
     }
     if (s->kind == TY_UNTYPED_FLOAT) {
         if (target->kind == TY_FLOAT) {
+            if (target->bits == 32 && e->is_const) e->fval = (double)const_f32(e);
             e->type = target;
             return;
         }
