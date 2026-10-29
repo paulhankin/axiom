@@ -257,7 +257,8 @@ PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 
 ### musl (MIT): `std/internal/runtime/rt.ax`
 
-The software `fmod`, `fmodf`, `fma` and `fmaf` are ported from musl.
+The software `fmod`, `fmodf`, `fma` and `fmaf` are ported from musl (`fmaf`
+rounds its halfway and subnormal results to odd before converting them).
 
 ```
 Copyright © 2005-2020 Rich Felker, et al.
