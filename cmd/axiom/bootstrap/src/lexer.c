@@ -161,6 +161,7 @@ static void lex_number(Lexer *L) {
     char buf[128];
     int bl = 0;
     bool is_float = false, bad = false;
+    bool long_ = false;  // (characters past the 120 kept)
     for (;;) {
         if (L->pos >= L->len) break;
         char c = s[L->pos];
@@ -173,12 +174,14 @@ static void lex_number(Lexer *L) {
             if (base == 2 && c > '1') bad = true;
             if (base == 8 && c > '7') bad = true;
             if (bl < 120) buf[bl++] = c;
+            else long_ = true;
             L->pos++;
             continue;
         }
         if (base == 10 && c == '.' && L->pos + 1 < L->len && s[L->pos + 1] >= '0' && s[L->pos + 1] <= '9' && !is_float) {
             is_float = true;
             if (bl < 120) buf[bl++] = c;
+            else long_ = true;
             L->pos++;
             continue;
         }
@@ -188,9 +191,11 @@ static void lex_number(Lexer *L) {
             if (p < L->len && s[p] >= '0' && s[p] <= '9') {
                 is_float = true;
                 if (bl < 120) buf[bl++] = 'e';
+                else long_ = true;
                 L->pos++;
                 if (s[L->pos] == '+' || s[L->pos] == '-') {
                     if (bl < 120) buf[bl++] = s[L->pos];
+                    else long_ = true;
                     L->pos++;
                 }
                 continue;
@@ -207,6 +212,12 @@ static void lex_number(Lexer *L) {
     t.span = mkspan(L, start, L->pos);
     if (bad || bl == 0) {
         diag_error(t.span, "E0005", "malformed number literal");
+        t.kind = TK_INT;
+        push(L, t);
+        return;
+    }
+    if (long_) {
+        diag_error(t.span, "E0005", "number literal longer than 120 characters");
         t.kind = TK_INT;
         push(L, t);
         return;

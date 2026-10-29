@@ -144,6 +144,8 @@ ESCAPE     ::= "\n" | "\r" | "\t" | "\0" | "\\" | "\"" | "\'" | "\x" HEX HEX | "
 
 - A float literal MUST have digits on both sides of the `.`. This means `0..n` lexes as
   `0` `..` `n`, with no special case needed.
+- A number literal has at most 120 characters, not counting `_` separators or a `0x`,
+  `0b` or `0o` prefix (`E0005` otherwise).
 - A character literal has type `u8` and must be ASCII (a `\u{…}` escape above `0x7F` is
   `E0004`).
 - A string literal has type `[]u8`. Its bytes are the UTF-8 encoding of its contents,
@@ -2472,7 +2474,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0002 | Unexpected character, or `@` not followed by a builtin name |
 | E0003 | Reserved word used |
 | E0004 | Invalid character literal |
-| E0005 | Malformed number literal, or one that does not fit in 64 bits |
+| E0005 | Malformed number literal, one longer than 120 characters, or one that does not fit in 64 bits |
 | E0006 | Malformed escape sequence in a string or character literal |
 | E0100 | Syntax error: unexpected token |
 | E0104 | A reserved name (a keyword or primitive type name) used as a name |
