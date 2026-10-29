@@ -106,6 +106,127 @@ pub fn all() []mut *mut Diag {
     return diags.items();
 }
 
+// Diagnostics passed from a child process to its parent (units.ax compiles
+// modules in children, forked after the sources are read, so the file ids
+// are the parent's): numbers as decimals followed by a space, strings as
+// their length, a colon and the bytes, or - for a nil slice.
+fn put_n(b: *mut u.Buf, x: u64) void {
+    b.s(u.udec(x));
+    b.c(' ');
+}
+
+fn put_s(b: *mut u.Buf, s: []u8) void {
+    if u.isnos(s) {
+        b.c('-');
+        return;
+    }
+    b.s(u.udec(@as(u64, s.len)));
+    b.c(':');
+    b.s(s);
+}
+
+fn put_span(b: *mut u.Buf, sp: u.Span) void {
+    put_n(b, @as(u64, @bit_cast(u32, sp.file)));
+    put_n(b, @as(u64, sp.start));
+    put_n(b, @as(u64, sp.end));
+}
+
+// The diagnostics from the from'th reported on, as bytes for load.
+pub fn save(from: usize) []u8 {
+    let mut b = u.Buf.init();
+    for i in from..diags.len {
+        let d = diags.get(i);
+        put_s(&mut b, d.code);
+        put_n(&mut b, @as(u64, @bit_cast(u32, d.severity)));
+        put_s(&mut b, d.msg);
+        put_span(&mut b, d.span);
+        put_s(&mut b, d.expected);
+        put_s(&mut b, d.found);
+        put_n(&mut b, @as(u64, d.notes.len));
+        for j in 0..d.notes.len {
+            let n = d.notes.get(j);
+            put_s(&mut b, n.msg);
+            put_span(&mut b, n.span);
+        }
+        put_n(&mut b, @as(u64, d.fixes.len));
+        for j in 0..d.fixes.len {
+            let f = d.fixes.get(j);
+            put_s(&mut b, f.description);
+            put_s(&mut b, f.applicability);
+            put_n(&mut b, @as(u64, f.edits.len));
+            for k in 0..f.edits.len {
+                let ed = f.edits.get(k);
+                put_span(&mut b, ed.span);
+                put_s(&mut b, ed.replacement);
+            }
+        }
+    }
+    return b.done();
+}
+
+struct Reader {
+    d: []u8,
+    i: usize,
+}
+
+// The number up to the byte `end` (malformed input reads as 0s).
+fn get_n(r: *mut Reader, end: u8) u64 {
+    let mut x: u64 = 0;
+    while (r.i < r.d.len) and (r.d[r.i] != end) {
+        x = (x * 10) + @as(u64, r.d[r.i] -% '0');
+        r.i += 1;
+    }
+    if r.i < r.d.len {
+        r.i += 1;
+    }
+    return x;
+}
+
+fn get_s(r: *mut Reader) []u8 {
+    if (r.i < r.d.len) and (r.d[r.i] == '-') {
+        r.i += 1;
+        return u.nil_slice.[u8]();
+    }
+    let n = @min(@truncate(usize, get_n(r, ':')), r.d.len - r.i);
+    let s = u.dup(r.d[r.i..r.i + n]);
+    r.i += n;
+    return s;
+}
+
+fn get_span(r: *mut Reader) u.Span {
+    let file = @bit_cast(i32, @truncate(u32, get_n(r, ' ')));
+    let start = @truncate(u32, get_n(r, ' '));
+    return u.Span.{ file: file, start: start, end: @truncate(u32, get_n(r, ' ')) };
+}
+
+// Reports the diagnostics that save wrote to `data`.
+pub fn load(data: []u8) void {
+    let mut r = Reader.{ d: data, i: 0 };
+    while r.i < data.len {
+        let code = get_s(&mut r);
+        let sev = @bit_cast(i32, @truncate(u32, get_n(&mut r, ' ')));
+        let msg = get_s(&mut r);
+        let d = diag_new(sev, get_span(&mut r), code, msg);
+        d.expected = get_s(&mut r);
+        d.found = get_s(&mut r);
+        let nn = @truncate(usize, get_n(&mut r, ' '));
+        for j in 0..nn {
+            let m = get_s(&mut r);
+            note(d, get_span(&mut r), m);
+        }
+        let nf = @truncate(usize, get_n(&mut r, ' '));
+        for j in 0..nf {
+            let desc = get_s(&mut r);
+            let f = fix(d, desc, get_s(&mut r));
+            let ne = @truncate(usize, get_n(&mut r, ' '));
+            for k in 0..ne {
+                let sp = get_span(&mut r);
+                edit(f, sp, get_s(&mut r));
+            }
+        }
+    }
+}
+
 fn diag_cmp(x: *mut Diag, y: *mut Diag) i32 {
     let fx = u.file_of(x.span.file).display;
     let fy = u.file_of(y.span.file).display;
