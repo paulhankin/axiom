@@ -39,5 +39,28 @@
   AArch64), in a loop or with the value used elsewhere, compared with 0 instead.
 - Fixed on WebAssembly: a `match` on a 64-bit integer took a case for a value outside the
   range of its cases, or crashed the compiler when its cases were far apart.
+- Fixed at every level on x86-64 and AArch64: a `match` on a `bool` never took its `true`
+  arm; a thread-local's address in a constant aggregate (an array of pointers, a slice
+  passed by value) pointed at its initial image, not the thread's copy. On x86-64 a load
+  could be moved above an earlier `@atomic_load` (breaking acquire ordering), and with
+  AVX2 a vector shift could read a garbage count.
+- Fixed at `-O2`: a loop whose header makes a call or a store (`while next() and i < n`)
+  could run that header twice in one iteration.
+- Fixed on WebAssembly: a value with effects (an atomic operation, a call) computed only
+  for one branch's use; vector shifts by a count shared or moved out of a loop;
+  `@atomic_cas` without the atomics feature; C variadic calls nested in another's
+  arguments; wasm64 without bulk memory; the main thread's stack limit (its lowest KiB is
+  reserved, as documented); linking C code into a wasm64 module; and wrong lines in stack
+  traces at `-O2`.
+- Fixed: `f32` constants were computed in `f64` and rounded once at the end, and decimal
+  literals rounded twice (`const D: f32 = K - 16777216.0` with `K = 16777217.0` was 1);
+  they are now rounded as `f32` values, each operation as at run time. `std/fmt`'s
+  `parse_float` and `parse_float32` gave a result one unit off for some decimals with more
+  than 19 significant digits. `@fma` on `f32` without a hardware FMA (x86-64 before v3,
+  WebAssembly) rounded some subnormal results twice.
+- Fixed on aarch64-macos: stack arguments narrower than 8 bytes are packed at their size,
+  as Apple's ABI (and C code calling or called by Axiom) has them.
+- `--units=module --format=agent-json` reports errors found during code generation in
+  its one JSON document.
 - Fixed: a call through a function pointer cast to another function type crashed the
   compiler at `-O2`, and on WebAssembly stopped trapping (T0009) once optimized.
