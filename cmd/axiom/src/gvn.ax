@@ -3496,8 +3496,9 @@ pub fn dse(f: *mut ir.Func) bool {
 // are never read. So:
 //   - a push (a call-site slot store, or a depth store) is dead when every
 //     path from it overwrites what it wrote (a slot: the depth its index came
-//     from is stored back; the depth: another depth store) before a call, a
-//     trap or a load of the shadow stack (for the depth also a return);
+//     from is stored back, or another store to the slot; the depth: another
+//     depth store) before a call, a trap or a load of the shadow stack (for
+//     the depth also a return);
 //   - storing V to the depth is redundant when on every path back to it the
 //     last depth store stored V too, or V is the value the depth was loaded
 //     as, with only calls in between.
@@ -3558,6 +3559,27 @@ fn push_dead(s: *mut ir.Value, slot: bool) bool {
     return dead_from(s.next, s, slot);
 }
 
+// Does instruction i overwrite what the push s wrote (see above)? (Another
+// store to a slot: the next call site of the same frame, whose sites all
+// use the frame's one slot, also after inlining.)
+fn ss_overwrites(i: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
+    let sf = ss_store_field(i);
+    if sf == 0 {
+        if not slot {
+            return true;
+        }
+        ss_one.clear();
+        ss_one.push(i.a);
+        return uses_any(s.b, &ss_one, 0);
+    }
+    if (sf == 2) and slot and (i != s) {
+        let l = loc_of(s.b, @bit_cast(i64, s.a.ty.size));
+        let w = loc_of(i.b, @bit_cast(i64, i.a.ty.size));
+        return covers(&w, &l);
+    }
+    return false;
+}
+
 // ... over the paths from instruction `from` on.
 fn dead_from(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
     ss_mark += 1;
@@ -3567,17 +3589,8 @@ fn dead_from(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
     while ss_work.len > 0 {
         let mut i = ss_work.pop();
         loop {
-            if ss_store_field(i) == 0 {
-                // a depth store overwrites a depth push; a slot dies with the
-                // store of the depth its index came from
-                if not slot {
-                    break;
-                }
-                ss_one.clear();
-                ss_one.push(i.a);
-                if uses_any(s.b, &ss_one, 0) {
-                    break;
-                }
+            if ss_overwrites(i, s, slot) {
+                break;
             } else if ss_reader(i, not slot) {
                 return false;
             } else if i.op == ir.OP_RET {
@@ -3689,17 +3702,9 @@ fn readers_of(from: *mut ir.Value, s: *mut ir.Value, slot: bool) bool {
     while ss_work.len > 0 {
         let mut i = ss_work.pop();
         loop {
-            if ss_store_field(i) == 0 {
-                let mut over = not slot;
-                if slot {
-                    ss_one.clear();
-                    ss_one.push(i.a);
-                    over = uses_any(s.b, &ss_one, 0);
-                }
-                if over {
-                    ow_found.push(i);
-                    break;
-                }
+            if ss_overwrites(i, s, slot) {
+                ow_found.push(i);
+                break;
             } else if i.op == ir.OP_RET {
                 if not slot {
                     return false;  // (the depth must be restored before)
