@@ -57,6 +57,34 @@ Notes by platform:
 To run WebAssembly output you also need [Node.js](https://nodejs.org) 18 or later:
 `node <std>/internal/runtime/host.mjs program.wasm`.
 
+## Updating
+
+`axiom update` replaces the toolchain with another version:
+
+```sh
+axiom update            # the latest release
+axiom update 0.2.0      # a given release (newer or older)
+axiom update head       # the head of main on GitHub (a source checkout only)
+```
+
+For an install from a release archive, it downloads the archive for this platform from
+the release with `curl`, checks it against the release's `SHA256SUMS`, unpacks it with
+`tar` (which macOS and Windows 10 and later include), checks that its compiler
+runs, and then replaces `bin/axiom`, `std/` and the other files of the archive, where
+they are: the `PATH` stays as it was, though the directory keeps its old name
+(`axiom-0.1.0-linux-x86_64`, say). If a step fails, the old toolchain stays. It needs
+to be able to write to the directory. A release install cannot update to `head`, which
+is not a release: for that, build from source.
+
+For a source checkout (below), it fetches the release's tag, or for `head` (the
+default) the head of `main`, from GitHub into the checkout, and moves the checkout to it:
+a tag is checked out detached, and `head` fast-forwards `main` (checking it out if the
+checkout is at a tag). It refuses a checkout with uncommitted changes, or on another
+branch than `main`. Then it builds the compiler, to `cmd/axiom/build/axiom`: with the
+compiler it replaces, and then with the result, which must build itself to the same
+bytes (the stages of `bootstrap.sh`, without LLVM, in under a minute); if the old
+compiler cannot build the new sources, it runs `cmd/axiom/bootstrap.sh`.
+
 ## A first program
 
 ```sh

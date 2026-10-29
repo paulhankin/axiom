@@ -1,0 +1,544 @@
+// =============================================================================
+// update.ax - axiom update [<version> | latest | head]: replaces this
+// toolchain with another version of it (docs/install.md).
+//
+// A release install (bin/axiom next to std/ and RELEASE-NOTES.md, as the
+// release archives unpack) downloads that release's archive for this
+// platform with curl, checks it against the release's SHA256SUMS, unpacks it
+// with tar, checks that its compiler runs here and is that version, and then
+// swaps it in piece by piece, putting back what it moved if a step fails. The
+// default is the latest release; HEAD is not a release, so it is refused.
+//
+// A source checkout (cmd/axiom/build/axiom in a git clone) fetches the
+// version's tag, or main for HEAD (in any spelling), from GitHub, moves the
+// checkout to it, and builds the compiler there: with this compiler and then
+// with the result, which must rebuild itself to the same bytes (the stages of
+// cmd/axiom/bootstrap.sh), or with bootstrap.sh itself if this compiler
+// cannot build the new sources. The default is HEAD.
+//
+// AXIOM_UPDATE_URL replaces https://github.com/paulhankin/axiom: a mirror
+// (its /releases/download/v<version>/ holds the archives), or for the tests a
+// file:// directory.
+// =============================================================================
+import "diag.ax" as dg;
+import "std/crypto/sha2" as sha2;
+import "target.ax" as tg;
+import "util.ax" as u;
+import "version.ax" as ver;
+
+fn repo_url() []u8 {
+    let e = u.env("AXIOM_UPDATE_URL");
+    if not u.isnos(e) and (e.len > 0) {
+        return e;
+    }
+    return "https://github.com/paulhankin/axiom";
+}
+
+// Reports an error: status 2 for an invalid invocation or a missing tool
+// (docs/cli.md), else 1.
+fn fail(json: bool, code: []u8, msg: []u8) i32 {
+    dg.emit_fatal(json, code, msg);
+    if u.str_eq(code, "E9001") or u.str_eq(code, "E9003") {
+        return 2;
+    }
+    return 1;
+}
+
+// p without its last component ("." if it has one only).
+fn parent(p: []u8) []u8 {
+    let s = u.rfind(p, '/');
+    if s < 0 {
+        return ".";
+    }
+    if s == 0 {
+        return "/";
+    }
+    return p[0..@int_cast(usize, s)];
+}
+
+fn lower(s: []u8) []u8 {
+    let out = u.newn.[u8](s.len);
+    for i in 0..s.len {
+        let mut c = s[i];
+        if (c >= 'A') and (c <= 'Z') {
+            c += 32;
+        }
+        out[i] = c;
+    }
+    return out;
+}
+
+// Where pat starts in s, or -1.
+fn index_of(s: []u8, pat: []u8) i64 {
+    if pat.len > s.len {
+        return -1;
+    }
+    for i in 0..(s.len - pat.len) + 1 {
+        if u.str_eq(s[i..i + pat.len], pat) {
+            return @int_cast(i64, i);
+        }
+    }
+    return -1;
+}
+
+fn trim(s: []u8) []u8 {
+    let mut a: usize = 0;
+    let mut b = s.len;
+    while (a < b) and ((s[a] == ' ') or (s[a] == '\n') or (s[a] == '\r') or (s[a] == '\t')) {
+        a += 1;
+    }
+    while (b > a) and ((s[b - 1] == ' ') or (s[b - 1] == '\n') or (s[b - 1] == '\r') or (s[b - 1] == '\t')) {
+        b -= 1;
+    }
+    return s[a..b];
+}
+
+// A release's version, "0.N.M" (from "0.N.M" or "v0.N.M"), or nosym().
+fn release_version(s: []u8) []u8 {
+    let mut v = s;
+    if (v.len > 0) and ((v[0] == 'v') or (v[0] == 'V')) {
+        v = v[1..];
+    }
+    let mut dots: usize = 0;
+    for c in v {
+        if c == '.' {
+            dots += 1;
+        }
+    }
+    let mut n: [3]u32 = [0; 3];
+    if (dots != 2) or not ver.parse(v, &mut n) {
+        return u.nosym();
+    }
+    return v;
+}
+
+fn capture(args: [][]u8) u.Ran {
+    return u.run_process(args, u.no_strs(), u.OUT_CAPTURE);
+}
+
+fn run(args: [][]u8) i32 {
+    return u.run_process(args, u.no_strs(), u.OUT_INHERIT).status;
+}
+
+fn rename(from: []u8, to: []u8) bool {
+    return u.rename(u.cz(from), u.cz(to)) == 0;
+}
+
+// Removes p and, if it is a directory (not a link to one), everything in it.
+fn rm_tree(p: []u8) void {
+    if u.is_dir(p) and u.isnos(u.readlink(p)) {
+        let mut es = u.List.[[]u8].empty();
+        if u.list_dir(p, &mut es) {
+            for k in 0..es.len {
+                rm_tree(u.f2("%s/%s", p, es.get(k)));
+            }
+        }
+        _ = u.rmdir(p);
+        return;
+    }
+    _ = u.unlink(u.cz(p));
+}
+
+fn hex(b: []u8) []u8 {
+    let digits: []u8 = "0123456789abcdef";
+    let out = u.newn.[u8](b.len * 2);
+    for i in 0..b.len {
+        out[2 * i] = digits[@as(usize, b[i] >> 4)];
+        out[(2 * i) + 1] = digits[@as(usize, b[i] & 15)];
+    }
+    return out;
+}
+
+// name's SHA-256 in a SHA256SUMS file ("<hex>  <name>" lines), or nosym().
+fn listed_sum(sums: []u8, name: []u8) []u8 {
+    let lines = u.split(sums, '\n', sums.len + 1);
+    for k in 0..lines.len {
+        let l = trim(lines.get(k));
+        if (l.len == (64 + 2) + name.len) and u.ends(l, name) and
+           ((l[64] == ' ') and ((l[65] == ' ') or (l[65] == '*'))) {
+            return lower(l[0..64]);
+        }
+    }
+    return u.nosym();
+}
+
+// The release archives' name for this machine.
+fn platform() []u8 {
+    if tg.host_os() == tg.OS_DARWIN {
+        return "macos-aarch64";
+    }
+    if tg.host_os() == tg.OS_WINDOWS {
+        return "windows-x86_64";
+    }
+    if tg.host_arch() == tg.ARCH_A64 {
+        return "linux-aarch64";
+    }
+    return "linux-x86_64";
+}
+
+pub fn run_update(args: [][]u8) i32 {
+    let mut json = false;
+    let mut want = u.nosym();
+    for a in args {
+        if u.str_eq(a, "--format=agent-json") {
+            json = true;
+        } else if u.starts(a, "-") or not u.isnos(want) {
+            return fail(json, "E9001", u.f1("unexpected argument '%s' (axiom update [<version> | latest | head])", a));
+        } else {
+            want = a;
+        }
+    }
+    // (no version: the latest release for a release, HEAD for a checkout)
+    let head = not u.isnos(want) and u.str_eq(lower(want), "head");
+    let latest = not u.isnos(want) and u.str_eq(lower(want), "latest");
+    let given = want;
+    if not u.isnos(want) and not head and not latest {
+        want = release_version(want);
+        if u.isnos(want) {
+            return fail(json, "E9001", u.f1("'%s' is not a version: give 0.N.M, latest or HEAD", given));
+        }
+    }
+    let exe = u.self_path();
+    if u.isnos(exe) {
+        return fail(json, "E9008", "cannot find this compiler's own file");
+    }
+    let bin = parent(exe);
+    let prefix = parent(bin);
+    if u.str_eq(u.basename(bin), "bin") and u.file_exists(u.cat2(prefix, "/std/mem.ax")) and
+       u.file_exists(u.cat2(prefix, "/RELEASE-NOTES.md")) {
+        if head {
+            return fail(json, "E9001",
+                        u.f1("%s is a release, which updates to releases only: HEAD needs a source checkout (docs/install.md)",
+                             prefix));
+        }
+        return update_release(json, prefix, want, latest or u.isnos(want));
+    }
+    let root = parent(parent(parent(bin)));
+    if u.str_eq(u.basename(bin), "build") and u.file_exists(u.cat2(root, "/.git")) and
+       u.file_exists(u.cat2(root, "/cmd/axiom/bootstrap.sh")) {
+        return update_source(json, root, exe, want, head or u.isnos(want), latest);
+    }
+    return fail(json, "E9008",
+                u.f1("cannot tell how %s was installed: axiom update updates a release (bin/ next to std/ and RELEASE-NOTES.md) or a source checkout's cmd/axiom/build/axiom",
+                     exe));
+}
+
+// ---------------------------------------------------------------------------
+// A release install
+// ---------------------------------------------------------------------------
+fn update_release(json: bool, prefix: []u8, want: []u8, latest: bool) i32 {
+    let curls = ["curl"];
+    let tars = ["tar"];
+    let curl = u.find_tool(curls[..]);
+    let tar = u.find_tool(tars[..]);
+    if u.isnos(curl) or u.isnos(tar) {
+        return fail(json, "E9003", "axiom update needs curl and tar");
+    }
+    // A directory in the install, so that the swap only renames, on one file
+    // system; one an earlier update left (Windows cannot remove a running
+    // program, so the old axiom.exe stays behind) goes first.
+    let mut es = u.List.[[]u8].empty();
+    if u.list_dir(prefix, &mut es) {
+        for k in 0..es.len {
+            if u.starts(es.get(k), ".axiom-update-") {
+                rm_tree(u.f2("%s/%s", prefix, es.get(k)));
+            }
+        }
+    }
+    let stage = u.f2("%s/.axiom-update-%s", prefix, u.hex16(@bit_cast(u64, u.now_ns())));
+    u.mkdirs(u.cat2(stage, "/old/bin"));
+    u.mkdirs(u.cat2(stage, "/new"));
+    if not u.is_dir(u.cat2(stage, "/new")) {
+        return fail(json, "E9005", u.f1("cannot write in %s (update it as its owner)", prefix));
+    }
+    let st = fetch_release(json, prefix, want, latest, curl, tar, stage);
+    rm_tree(stage);
+    return st;
+}
+
+fn fetch_release(json: bool, prefix: []u8, want: []u8, latest: bool, curl: []u8, tar: []u8, stage: []u8) i32 {
+    let mut v = want;
+    if latest {
+        // /releases/latest redirects to /releases/tag/v<version>
+        let av = [curl, "-fsSLI", "-o", u.cat2(stage, "/latest"), "-w", "%{url_effective}",
+                  u.cat2(repo_url(), "/releases/latest")];
+        let r = capture(av[..]);
+        let t = index_of(r.out, "/tag/");
+        if t >= 0 {
+            v = release_version(trim(r.out[@int_cast(usize, t) + 5..]));
+        }
+        if (r.status != 0) or u.isnos(v) {
+            return fail(json, "E9008", u.f1("cannot find the latest release at %s/releases", repo_url()));
+        }
+    }
+    if u.str_eq(v, ver.VERSION) {
+        u.print(u.f2("axiom %s is installed already (%s)\n", v, prefix));
+        return 0;
+    }
+    let win = tg.host_os() == tg.OS_WINDOWS;
+    let name = u.f2("axiom-%s-%s", v, platform());
+    let archive = u.cat2(name, u.pick(win, ".zip", ".tar.gz"));
+    let base = u.f2("%s/releases/download/v%s", repo_url(), v);
+    u.print(u.f2("downloading %s/%s\n", base, archive));
+    let local = u.f2("%s/%s", stage, archive);
+    let get = [curl, "-fsSL", "-o", local, u.f2("%s/%s", base, archive)];
+    if run(get[..]) != 0 {
+        return fail(json, "E9008", u.f3("cannot download %s: is %s a release? (they are listed at %s/releases)",
+                                        archive, v, repo_url()));
+    }
+    let get_sums = [curl, "-fsSL", "-o", u.cat2(stage, "/SHA256SUMS"), u.cat2(base, "/SHA256SUMS")];
+    if run(get_sums[..]) != 0 {
+        return fail(json, "E9008", u.f1("cannot download %s/SHA256SUMS", base));
+    }
+    let data = u.read_file(local);
+    let sum = listed_sum(u.read_file(u.cat2(stage, "/SHA256SUMS")), archive);
+    if u.isnos(data) or u.isnos(sum) {
+        return fail(json, "E9008", u.f1("the release's SHA256SUMS does not list %s", archive));
+    }
+    let mut digest: [32]u8 = [0; 32];
+    sha2.sha256(data, digest[..]);
+    if not u.str_eq(hex(digest[..]), sum) {
+        return fail(json, "E9008", u.f1("%s does not match its checksum in SHA256SUMS", archive));
+    }
+    let x = [tar, u.pick(win, "-xf", "-xzf"), local, "-C", u.cat2(stage, "/new")];
+    let tree = u.f2("%s/new/%s", stage, name);
+    let exe_rel = u.pick(win, "bin/axiom.exe", "bin/axiom");
+    let new_exe = u.f2("%s/%s", tree, exe_rel);
+    if (run(x[..]) != 0) or not u.is_file(new_exe) or not u.file_exists(u.cat2(tree, "/std/mem.ax")) {
+        return fail(json, "E9008", u.f1("cannot unpack %s", archive));
+    }
+    let va = [new_exe, "version"];
+    let vr = capture(va[..]);
+    if (vr.status != 0) or not u.str_eq(trim(vr.out), u.cat2("axiom ", v)) {
+        return fail(json, "E9008", u.f2("the compiler of %s does not run here as axiom %s", archive, v));
+    }
+    // The swap: each piece the new release has moves the old one aside, then
+    // takes its place; a failure puts back everything moved so far.
+    let items = [exe_rel, "std", "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", "RELEASE-NOTES.md",
+                 "README.txt"];
+    let mut moved_old: [7]bool = [false; 7];
+    let mut moved_new: [7]bool = [false; 7];
+    let mut ok = true;
+    for k in 0..items.len {
+        let cur = u.f2("%s/%s", prefix, items[k]);
+        let nw = u.f2("%s/%s", tree, items[k]);
+        if not u.file_exists(nw) {
+            continue;
+        }
+        if u.file_exists(cur) {
+            if not rename(cur, u.f2("%s/old/%s", stage, items[k])) {
+                ok = false;
+                break;
+            }
+            moved_old[k] = true;
+        }
+        if not rename(nw, cur) {
+            ok = false;
+            break;
+        }
+        moved_new[k] = true;
+    }
+    if not ok {
+        let mut k = items.len;
+        while k > 0 {
+            k -= 1;
+            let cur = u.f2("%s/%s", prefix, items[k]);
+            if moved_new[k] {
+                _ = rename(cur, u.f2("%s/%s", tree, items[k]));
+            }
+            if moved_old[k] {
+                _ = rename(u.f2("%s/old/%s", stage, items[k]), cur);
+            }
+        }
+        return fail(json, "E9005", u.f1("cannot replace the files in %s (nothing was changed)", prefix));
+    }
+    u.print(u.f3("updated %s from axiom %s to axiom %s\n", prefix, ver.VERSION, v));
+    if index_of(u.basename(prefix), u.f1("axiom-%s-", ver.VERSION)) >= 0 {
+        u.print(u.f1("(the directory's name still says %s)\n", ver.VERSION));
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// A source checkout
+// ---------------------------------------------------------------------------
+// git -C root, the words of `cmd`, then `x` and `y` unless they are nosym().
+fn git_args(git: []u8, root: []u8, cmd: []u8, x: []u8, y: []u8) u.List.[[]u8] {
+    let mut av = u.List.[[]u8].empty();
+    av.push(git);
+    av.push("-C");
+    av.push(root);
+    let ws = u.split(cmd, ' ', cmd.len + 1);
+    for k in 0..ws.len {
+        av.push(ws.get(k));
+    }
+    if not u.isnos(x) {
+        av.push(x);
+    }
+    if not u.isnos(y) {
+        av.push(y);
+    }
+    return av;
+}
+
+fn git_out(git: []u8, root: []u8, cmd: []u8) u.Ran {
+    let av = git_args(git, root, cmd, u.nosym(), u.nosym());
+    let mut r = capture(av.items());
+    r.out = trim(r.out);
+    return r;
+}
+
+fn git_run(git: []u8, root: []u8, cmd: []u8, x: []u8, y: []u8) bool {
+    let av = git_args(git, root, cmd, x, y);
+    return run(av.items()) == 0;
+}
+
+// The newest release tag's version at the repository, or nosym().
+fn latest_tag(git: []u8) []u8 {
+    let av = [git, "ls-remote", "--tags", "--refs", repo_url(), "v*"];
+    let r = capture(av[..]);
+    if r.status != 0 {
+        return u.nosym();
+    }
+    let mut best = u.nosym();
+    let mut bn: [3]u32 = [0; 3];
+    let lines = u.split(r.out, '\n', r.out.len + 1);
+    for k in 0..lines.len {
+        let l = trim(lines.get(k));
+        let t = index_of(l, "refs/tags/");
+        if t < 0 {
+            continue;
+        }
+        let v = release_version(l[@int_cast(usize, t) + 10..]);
+        let mut n: [3]u32 = [0; 3];
+        if u.isnos(v) or not ver.parse(v, &mut n) {
+            continue;
+        }
+        let newer = u.isnos(best) or (n[0] > bn[0]) or ((n[0] == bn[0]) and (n[1] > bn[1])) or
+                    ((n[0] == bn[0]) and (n[1] == bn[1]) and (n[2] > bn[2]));
+        if newer {
+            best = v;
+            bn = n;
+        }
+    }
+    return best;
+}
+
+fn update_source(json: bool, root: []u8, exe: []u8, want: []u8, head: bool, latest: bool) i32 {
+    if tg.host_os() == tg.OS_WINDOWS {
+        return fail(json, "E9008",
+                    "axiom update cannot rebuild a source checkout on Windows: update it with git, and build it as docs/install.md says");
+    }
+    let gits = ["git"];
+    let git = u.find_tool(gits[..]);
+    if u.isnos(git) {
+        return fail(json, "E9003", "axiom update needs git to update a source checkout");
+    }
+    let stat = git_out(git, root, "status --porcelain --untracked-files=no");
+    if stat.status != 0 {
+        return fail(json, "E9008", u.f1("git cannot read the checkout at %s", root));
+    }
+    if stat.out.len > 0 {
+        return fail(json, "E9008", u.f1("%s has uncommitted changes: commit or stash them first", root));
+    }
+    let before = git_out(git, root, "rev-parse HEAD").out;
+    let url = repo_url();
+    let mut label: []u8 = "main";
+    if head {
+        if not git_run(git, root, "fetch --quiet", url, "main") {
+            return fail(json, "E9008", u.f1("cannot fetch main from %s", url));
+        }
+        let br = git_out(git, root, "symbolic-ref --quiet --short HEAD");
+        if br.status != 0 {
+            // detached, at a release: back to main
+            if not git_run(git, root, "checkout --quiet main", u.nosym(), u.nosym()) and
+               not git_run(git, root, "checkout --quiet -b main FETCH_HEAD", u.nosym(), u.nosym()) {
+                return fail(json, "E9008", u.f1("cannot check out main in %s", root));
+            }
+        } else if not u.str_eq(br.out, "main") {
+            return fail(json, "E9008", u.f2("%s is on branch %s: axiom update head moves main, so check out main first",
+                                            root, br.out));
+        }
+        if not git_run(git, root, "merge --ff-only --quiet FETCH_HEAD", u.nosym(), u.nosym()) {
+            return fail(json, "E9008",
+                        u.f1("main has commits that %s's main does not: merge them yourself, then run axiom update head",
+                             url));
+        }
+    } else {
+        let mut v = want;
+        if latest {
+            v = latest_tag(git);
+            if u.isnos(v) {
+                return fail(json, "E9008", u.f1("cannot find the latest release at %s", url));
+            }
+        }
+        label = u.cat2("v", v);
+        let spec = u.f2("+refs/tags/%s:refs/tags/%s", label, label);
+        if not git_run(git, root, "fetch --quiet", url, spec) {
+            return fail(json, "E9008", u.f2("no release %s at %s", v, url));
+        }
+        if not git_run(git, root, "checkout --quiet --detach", label, u.nosym()) {
+            return fail(json, "E9008", u.f2("cannot check out %s in %s", label, root));
+        }
+    }
+    let after = git_out(git, root, "rev-parse --short HEAD").out;
+    if u.str_eq(before, git_out(git, root, "rev-parse HEAD").out) {
+        u.print(u.f3("%s is at %s (%s) already\n", root, label, after));
+        return 0;
+    }
+    u.print(u.f3("%s is now at %s (%s); building the compiler\n", root, label, after));
+    if not self_build(root, exe) {
+        u.print("this compiler cannot build it: bootstrapping (cmd/axiom/bootstrap.sh)\n");
+        let boot = ["sh", u.cat2(root, "/cmd/axiom/bootstrap.sh")];
+        if run(boot[..]) != 0 {
+            return fail(json, "E9008",
+                        u.f2("%s is at %s, but building the compiler failed: fix the build, then run cmd/axiom/bootstrap.sh",
+                             root, label));
+        }
+    }
+    let va = [u.cat2(root, "/cmd/axiom/build/axiom"), "version"];
+    let vr = capture(va[..]);
+    u.print(u.f3("updated %s/cmd/axiom/build/axiom to %s (%s)\n", root, trim(vr.out), label));
+    return 0;
+}
+
+// Builds the checkout's compiler with this one, then with the result, which
+// must build itself to the same bytes, and puts it at cmd/axiom/build/axiom;
+// false (with nothing replaced) if this compiler cannot build the sources.
+fn self_build(root: []u8, exe: []u8) bool {
+    let mut target: []u8 = "x86_64";
+    if tg.host_os() == tg.OS_DARWIN {
+        target = "aarch64-macos";
+    } else if tg.host_arch() == tg.ARCH_A64 {
+        target = "aarch64";
+    }
+    let b = u.cat2(root, "/cmd/axiom/build");
+    let stages = [exe, u.cat2(b, "/axiom-update1"), u.cat2(b, "/axiom-update2"), u.cat2(b, "/axiom-update3")];
+    for k in @as(usize, 1)..stages.len {
+        u.print(u.f3("stage %s: %s -> %s\n", u.zdec(k), u.basename(stages[k - 1]), u.basename(stages[k])));
+        let av = [stages[k - 1], "build", u.cat2(root, "/cmd/axiom/src/main.ax"), u.cat2("--target=", target), "-O2",
+                  u.cat2("--std=", u.cat2(root, "/std")), "-o", stages[k]];
+        // (the old compiler's errors, at stage 1, only mean bootstrapping)
+        let mut mode = u.OUT_INHERIT;
+        if k == 1 {
+            mode = u.OUT_NULL;
+        }
+        let st = u.run_process(av[..], u.no_strs(), mode).status;
+        if st != 0 {
+            for j in @as(usize, 1)..stages.len {
+                _ = u.unlink(u.cz(stages[j]));
+            }
+            return false;
+        }
+    }
+    let s2 = u.read_file(stages[2]);
+    let s3 = u.read_file(stages[3]);
+    let mut same = not u.isnos(s2) and not u.isnos(s3) and u.str_eq(s2, s3);
+    if same {
+        same = rename(stages[2], u.cat2(b, "/axiom"));
+    }
+    for j in @as(usize, 1)..stages.len {
+        _ = u.unlink(u.cz(stages[j]));
+    }
+    return same;
+}

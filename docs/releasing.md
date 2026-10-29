@@ -37,7 +37,8 @@ axiom-<version>-<os>-<arch>/
   RELEASE-NOTES.md  README.txt
 ```
 
-The compiler finds `std/` next to its `bin/`. All four archives are built on one Linux
+The compiler finds `std/` next to its `bin/`, and `axiom update` downloads the archives
+by these names, and checks them against `SHA256SUMS`, so a release keeps them. All four archives are built on one Linux
 machine (the compiler cross-compiles itself), and they are deterministic: building
 the same commit gives the same bytes, which `SHA256SUMS` records, so anyone can check a
 release by building it.

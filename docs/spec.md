@@ -2365,6 +2365,7 @@ axiom new   <name>                               # create a package skeleton (§
 axiom cache [path|size|clean]                    # the compiled-module cache (§16.7)
 axiom lsp                                        # the language server, over standard input and output
 axiom version                                    # the compiler's version
+axiom update [<version> | latest | head]         # replace the toolchain with another version
 ```
 
 Every command accepts `--format=human` (the default) or `--format=agent-json` (§16.2)
@@ -2606,6 +2607,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E9005 | Cannot create the output or package files |
 | E9006 | The test runner or profiler failed |
 | E9007 | Internal failure: code generation or formatting |
+| E9008 | `axiom update` failed: no such release, a download that fails or does not match its checksum, a checkout that cannot be moved or built |
 
 ### 16.4 Runtime trap reporting and stack traces
 

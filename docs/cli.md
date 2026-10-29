@@ -16,6 +16,7 @@ axiom new     <name> [--format=agent-json]
 axiom lsp     [--target=<t>] [--std=<dir>]
 axiom cache   [path | size | clean]
 axiom version
+axiom update  [<version> | latest | head]
 ```
 
 With no arguments, `axiom` prints a summary of this page and exits with status 2.
@@ -93,6 +94,21 @@ The cache of compiled modules (spec §16.7): `path` (the default) prints its dir
 
 Prints `axiom <version>`.
 
+### `axiom update`
+
+Replaces the toolchain it belongs to with another version: `0.N.M` (or `v0.N.M`), the
+`latest` release, or `head` (in any case: `HEAD`), the head of `main` on GitHub.
+[`docs/install.md`](install.md#updating) has the details:
+
+- An install from a release archive updates to a release (the latest by default),
+  downloaded with `curl`, checked against the release's `SHA256SUMS`, unpacked with
+  `tar` and swapped in place of the old one. It cannot update to `head`, which is not
+  a release (`E9001`).
+- A source checkout (the compiler at `cmd/axiom/build/axiom` of a git clone) moves to
+  the version's tag, or to the head of `main` (the default), and rebuilds the compiler.
+
+A failure is `E9008`, and leaves the old toolchain in place.
+
 ## Options
 
 Options take the form `--name=value`; they may come before or after the input. Every
@@ -163,6 +179,7 @@ linkers and are static executables; with C code or `-l` the system's `cc` links 
 |---|---|
 | `AXIOM_STD` | The standard library's directory, when `--std` is not given. |
 | `AXIOM_CACHE` | The cache directory: compiled modules in `<cache>/obj/`, git dependencies in `<cache>/`. Otherwise `$XDG_CACHE_HOME/axiom`, else `~/.cache/axiom`. |
+| `AXIOM_UPDATE_URL` | The repository `axiom update` updates from, instead of `https://github.com/paulhankin/axiom`: a mirror whose `releases/download/v<version>/` holds the release archives and `SHA256SUMS`, and which git can fetch from. |
 | `AXIOM_CACHE_LIMIT` | The size the compiled-module cache is kept under after a build: a number of bytes, or one with a `k`, `m` or `g` suffix; `0` for no limit; 2 GiB by default (spec §16.7). |
 
 The variables that switch on debugging output inside the compiler are listed in

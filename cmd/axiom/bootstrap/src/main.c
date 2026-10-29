@@ -701,6 +701,12 @@ int main(int argc, char **argv) {
         printf("axiom %s (bootstrap compiler)\n", AXIOM_VERSION);
         return 0;
     }
+    if (argc >= 2 && !strcmp(argv[1], "update")) {
+        // (axiom update is the compiler's: this one is only for bootstrapping)
+        bool js = argc >= 3 && !strcmp(argv[argc - 1], "--format=agent-json");
+        diag_emit_fatal(js, "E9008", "the bootstrap compiler does not update itself: run cmd/axiom/bootstrap.sh");
+        return 1;
+    }
     if (argc >= 2 && !strcmp(argv[1], "new")) {
         bool js = argc >= 4 && !strcmp(argv[3], "--format=agent-json");
         if (argc < 3) {

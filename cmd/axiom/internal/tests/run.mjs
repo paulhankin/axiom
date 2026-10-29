@@ -30,6 +30,7 @@
 // at a time with `parallel`; a section whose `supported` check fails is
 // skipped whole, and `note` marks results that were built but not run.
 import { spawn, spawnSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
@@ -726,6 +727,87 @@ await section('spec §16.3', {
       prepare();
       const c = spawnSync(compiler, ['new', 'flags', '--format=agent-json'], { encoding: 'utf8', cwd: tmp });
       return c.status !== 0 && /"E9005"/.test(c.stdout) ? null : `${c.status}: ${c.stdout}${c.stderr}`;
+    },
+  }, { timed: false });
+}
+
+// axiom update, of an install from a release archive: from a mirror in a
+// directory (AXIOM_UPDATE_URL), whose release 9.9.9 is a script that says so.
+{
+  const dir = path.join(tmp, 'update');
+  const isBootstrap = () => /bootstrap/.test(spawnSync(compiler, ['version'], { encoding: 'utf8' }).stdout);
+  const plat = { linux: 'linux', darwin: 'macos' }[process.platform];
+  const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
+  const has = (tool) => spawnSync(tool, ['--version']).status === 0;
+  const update = (exe, ...args) => spawnSync(exe, ['update', ...args, '--format=agent-json'], {
+    encoding: 'utf8', env: { ...process.env, AXIOM_UPDATE_URL: `file://${path.join(dir, 'mirror')}` } });
+  const install = () => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    const inst = path.join(dir, 'inst');
+    fs.mkdirSync(path.join(inst, 'bin'), { recursive: true });
+    fs.copyFileSync(compiler, path.join(inst, 'bin/axiom'));
+    fs.chmodSync(path.join(inst, 'bin/axiom'), 0o755);
+    fs.symlinkSync(path.join(root, 'std'), path.join(inst, 'std'));
+    fs.writeFileSync(path.join(inst, 'RELEASE-NOTES.md'), 'old\n');
+    // the release
+    const name = `axiom-9.9.9-${plat}-${arch}`;
+    const rel = path.join(dir, 'rel', name);
+    fs.mkdirSync(path.join(rel, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(rel, 'std'));
+    fs.writeFileSync(path.join(rel, 'bin/axiom'), '#!/bin/sh\necho "axiom 9.9.9"\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(rel, 'std/mem.ax'), '');
+    fs.writeFileSync(path.join(rel, 'RELEASE-NOTES.md'), 'new\n');
+    const down = path.join(dir, 'mirror/releases/download/v9.9.9');
+    fs.mkdirSync(down, { recursive: true });
+    const archive = path.join(down, `${name}.tar.gz`);
+    const t = spawnSync('tar', ['-czf', archive, '-C', path.join(dir, 'rel'), name], { encoding: 'utf8' });
+    if (t.status) throw new Error(`tar: ${t.stderr}`);
+    const sum = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+    fs.writeFileSync(path.join(down, 'SHA256SUMS'), `${sum}  ${name}.tar.gz\n`);
+    return path.join(inst, 'bin/axiom');
+  };
+  const skip = () => {
+    if (isBootstrap()) return { skip: true, reason: 'the compiler only' };
+    if (!plat || !arch || process.env.AXIOM_NATIVE_TARGET) return { skip: true, reason: 'Linux and macOS hosts' };
+    if (!has('curl') || !has('tar')) return { skip: true, reason: 'no curl or tar' };
+    return null;
+  };
+  const code = (r, status, c) => r.status === status && r.stdout.includes(`"${c}"`) ? null : `${r.status}: ${r.stdout}${r.stderr}`;
+  await section('axiom update', {
+    'the bootstrap compiler does not update (E9008)': () => {
+      if (!isBootstrap()) return { skip: true, reason: 'the bootstrap compiler only' };
+      return code(spawnSync(compiler, ['update', '--format=agent-json'], { encoding: 'utf8' }), 1, 'E9008');
+    },
+    'a release install refuses HEAD, in any case, and a non-version (E9001)': () => {
+      const s = skip();
+      if (s) return s;
+      const exe = install();
+      return code(update(exe, 'HEAD'), 2, 'E9001') ?? code(update(exe, 'Head'), 2, 'E9001') ??
+        code(update(exe, '0.2'), 2, 'E9001');
+    },
+    'a release that does not exist, or does not match its checksum, changes nothing (E9008)': () => {
+      const s = skip();
+      if (s) return s;
+      const exe = install();
+      const sums = path.join(dir, 'mirror/releases/download/v9.9.9/SHA256SUMS');
+      fs.writeFileSync(sums, fs.readFileSync(sums, 'utf8').replace(/^./, (c) => (c === '0' ? '1' : '0')));
+      const e = code(update(exe, '9.9.8'), 1, 'E9008') ?? code(update(exe, 'v9.9.9'), 1, 'E9008');
+      if (e) return e;
+      const v = spawnSync(exe, ['version'], { encoding: 'utf8' }).stdout;
+      return v.startsWith('axiom 9.9.9') || fs.readdirSync(path.join(dir, 'inst')).some((f) => f.startsWith('.axiom-update'))
+        ? `changed the install: ${v}` : null;
+    },
+    'a release install updates to a release': () => {
+      const s = skip();
+      if (s) return s;
+      const exe = install();
+      const r = update(exe, '9.9.9');
+      if (r.status) return `${r.status}: ${r.stdout}${r.stderr}`;
+      const v = spawnSync(exe, ['version'], { encoding: 'utf8' }).stdout;
+      const notes = fs.readFileSync(path.join(dir, 'inst/RELEASE-NOTES.md'), 'utf8');
+      const left = fs.readdirSync(path.join(dir, 'inst')).filter((f) => f.startsWith('.axiom-update'));
+      return v === 'axiom 9.9.9\n' && notes === 'new\n' && !left.length && fs.existsSync(path.join(root, 'std/mem.ax'))
+        ? null : `version ${v}, notes ${notes}, left ${left}`;
     },
   }, { timed: false });
 }
