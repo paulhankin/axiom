@@ -41,6 +41,13 @@ DiagFix *diag_fix(Diag *d, const char *description, const char *applicability);
 void diag_fix_edit(DiagFix *f, Span sp, const char *replacement);
 
 int diag_error_count(void);
+// Diagnostics passed from a child process to its parent (units.c compiles
+// modules in children, forked after the sources are read, so the file ids
+// are the parent's): diag_save writes those from the from'th on, diag_load
+// reports them.
+int diag_count(void);
+void diag_save(int from, FILE *out);
+void diag_load(const char *data, size_t len);
 void diag_emit(bool json, FILE *out);
 // A fatal error unrelated to source (bad invocation, missing file ...).
 void diag_emit_fatal(bool json, const char *code, const char *msg);

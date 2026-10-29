@@ -68,6 +68,122 @@ void diag_fix_edit(DiagFix *f, Span sp, const char *replacement) {
 
 int diag_error_count(void) { return nerrors; }
 
+int diag_count(void) { return diags.len; }
+
+// Numbers as decimals followed by a space, strings as their length, a
+// colon and the bytes, or - for none (as diag.ax's save).
+static void put_n(FILE *out, unsigned long long x) { fprintf(out, "%llu ", x); }
+
+static void put_s(FILE *out, const char *s) {
+    if (!s) {
+        fputc('-', out);
+        return;
+    }
+    fprintf(out, "%zu:", strlen(s));
+    fputs(s, out);
+}
+
+static void put_span(FILE *out, Span sp) {
+    put_n(out, (uint32_t)sp.file);
+    put_n(out, sp.start);
+    put_n(out, sp.end);
+}
+
+void diag_save(int from, FILE *out) {
+    for (int i = from; i < diags.len; i++) {
+        Diag *d = diags.data[i];
+        put_s(out, d->code);
+        put_n(out, (uint32_t)d->severity);
+        put_s(out, d->msg);
+        put_span(out, d->span);
+        put_s(out, d->expected);
+        put_s(out, d->found);
+        put_n(out, (unsigned long long)d->notes.len);
+        for (int j = 0; j < d->notes.len; j++) {
+            put_s(out, d->notes.data[j].msg);
+            put_span(out, d->notes.data[j].span);
+        }
+        put_n(out, (unsigned long long)d->fixes.len);
+        for (int j = 0; j < d->fixes.len; j++) {
+            DiagFix *f = d->fixes.data[j];
+            put_s(out, f->description);
+            put_s(out, f->applicability);
+            put_n(out, (unsigned long long)f->edits.len);
+            for (int k = 0; k < f->edits.len; k++) {
+                put_span(out, f->edits.data[k].span);
+                put_s(out, f->edits.data[k].replacement);
+            }
+        }
+    }
+}
+
+typedef struct {
+    const char *d;
+    size_t len, i;
+} Reader;
+
+// The number up to the byte `end` (malformed input reads as 0s).
+static unsigned long long get_n(Reader *r, char end) {
+    unsigned long long x = 0;
+    while (r->i < r->len && r->d[r->i] != end) x = x * 10 + (unsigned char)(r->d[r->i++] - '0');
+    if (r->i < r->len) r->i++;
+    return x;
+}
+
+static char *get_s(Reader *r) {
+    if (r->i < r->len && r->d[r->i] == '-') {
+        r->i++;
+        return NULL;
+    }
+    size_t n = (size_t)get_n(r, ':');
+    if (n > r->len - r->i) n = r->len - r->i;
+    char *s = arena_strndup(r->d + r->i, n);
+    r->i += n;
+    return s;
+}
+
+static Span get_span(Reader *r) {
+    Span sp;
+    sp.file = (int)(uint32_t)get_n(r, ' ');
+    sp.start = (uint32_t)get_n(r, ' ');
+    sp.end = (uint32_t)get_n(r, ' ');
+    return sp;
+}
+
+void diag_load(const char *data, size_t len) {
+    Reader r = {data, len, 0};
+    while (r.i < r.len) {
+        Diag *d = NEW(Diag);
+        d->code = get_s(&r);
+        d->severity = (int)(uint32_t)get_n(&r, ' ');
+        d->msg = get_s(&r);
+        d->span = get_span(&r);
+        d->expected = get_s(&r);
+        d->found = get_s(&r);
+        d->seq = diags.len;
+        vec_push(diags, d);
+        if (d->severity == SEV_ERROR) nerrors++;
+        size_t nn = (size_t)get_n(&r, ' ');
+        for (size_t j = 0; j < nn && r.i < r.len; j++) {
+            DiagNote n;
+            n.msg = get_s(&r);
+            n.span = get_span(&r);
+            vec_push(d->notes, n);
+        }
+        size_t nf = (size_t)get_n(&r, ' ');
+        for (size_t j = 0; j < nf && r.i < r.len; j++) {
+            const char *desc = get_s(&r);
+            const char *appl = get_s(&r);
+            DiagFix *f = diag_fix(d, desc, appl);
+            size_t ne = (size_t)get_n(&r, ' ');
+            for (size_t k = 0; k < ne && r.i < r.len; k++) {
+                Span sp = get_span(&r);
+                diag_fix_edit(f, sp, get_s(&r));
+            }
+        }
+    }
+}
+
 static int diag_cmp(const void *a, const void *b) {
     const Diag *x = *(Diag *const *)a, *y = *(Diag *const *)b;
     const char *fx = g_files.data[x->span.file]->display, *fy = g_files.data[y->span.file]->display;

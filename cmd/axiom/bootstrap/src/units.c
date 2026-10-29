@@ -265,6 +265,10 @@ static void make_dirs(const char *path) {
     mkdir(buf, 0755);
 }
 
+// The file a child compiling module u (process pid) leaves its
+// diagnostics in when it fails, for the parent to report.
+static const char *diag_file(Unit *u, pid_t pid) { return arena_printf("%s.diag%d", u->obj, (int)pid); }
+
 // Compiles one module in a child process. Returns its pid (or -1).
 static pid_t spawn_unit(CgOptions *base, Unit *u) {
     fflush(stdout);
@@ -276,9 +280,14 @@ static pid_t spawn_unit(CgOptions *base, Unit *u) {
     co.module = u->m;
     const char *tmp = arena_printf("%s.tmp%d", u->obj, (int)getpid());
     co.out_path = tmp;
+    int from = diag_count();
     bool ok = codegen_program(&co);
     if (!ok) {
-        diag_emit(false, stderr);
+        FILE *df = fopen(diag_file(u, getpid()), "wb");
+        if (df) {
+            diag_save(from, df);
+            fclose(df);
+        }
         unlink(tmp);
         _exit(1);
     }
@@ -334,7 +343,19 @@ bool build_units(CgOptions *base, const char *link_obj, UnitObjs *objs, UnitStat
         pid_t done = wait(&status);
         if (done < 0) break;
         running--;
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failed = true;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            failed = true;
+            for (int k = 0; k < next; k++) {
+                if (pids[k] != done) continue;
+                const char *df = diag_file(todo.data[k], done);
+                size_t len = 0;
+                char *saved = read_entire_file(df, &len);
+                if (saved) {
+                    diag_load(saved, len);
+                    unlink(df);
+                }
+            }
+        }
     }
     if (stats) {
         stats->total = n;
