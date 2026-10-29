@@ -1263,11 +1263,12 @@ field access followed by a call, not a method call, because `alloc_fn` is a fiel
 inline fn bit(x: u64, k: u32) u64 { return (x >> k) & 1; }
 ```
 
-A function (or method) declared `inline` is **always inlined**: every direct call is
-replaced by the function's body (at every optimization level), so a small helper called
-with constant arguments costs what the same code written out would, the way macros or
-`#[inline(always)]` are used elsewhere. It changes no behavior: traps, overflow checks
-and stack traces are the same.
+A function (or method) declared `inline` is **always inlined** where the compiler
+inlines at all (at `-O2` and above): every direct call it can see the body of is
+replaced by the function's body, whatever its size, so a small helper called with
+constant arguments costs what the same code written out would, the way macros or
+`#[inline(always)]` are used elsewhere. At `-O0` and `-O1` a call to it is an ordinary
+call. It changes no behavior: traps, overflow checks and stack traces are the same.
 
 - An inline function cannot be recursive, directly or through other inline functions
   (`E0314`, reported at each call on the cycle). Recursion through a function that is not
@@ -1285,10 +1286,10 @@ and stack traces are the same.
   path the call costs nothing. (With frame tables, §16.4.1, nothing is recorded at run
   time at all: the inlined code's frames come from the table.) A fault that is not a check (an out-of-bounds raw pointer
   access, say) inside an inlined body is reported as if it were in the caller.
-- With separate compilation (§16.7), every module that calls an inline function compiles
-  its own copy.
-- The compiler inlines such calls wherever its inliner can (at `-O1` and
-  above), and keeps ordinary call-site records.
+- With separate compilation (§16.7), a call from another module to a non-generic inline
+  function is an ordinary call of its own module's copy (unless the call needs other
+  processor extensions, above, which compiles a copy in the calling module); a generic
+  one is instantiated, and inlined, in every module that uses it.
 
 ---
 
