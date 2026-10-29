@@ -9,8 +9,8 @@
 //   // flags: --overflow=trap  extra compiler flags
 //   // wasm-only               skip on the native target
 //   // native-only             skip on wasm
-//   // selfhost-only           skip with the bootstrap compiler (LLVM's optimizer
-//                              differs, e.g. it folds an integer round trip of a pointer)
+//   // selfhost-only: <why>    skip with the bootstrap compiler (whose LLVM differs:
+//                              it folds an integer round trip of a pointer, say)
 //   // x86-64-flags: --cpu=x86-64  extra flags for a native build on an x86-64 host
 //   // link: file.c            C source (next to the test) compiled and linked in
 //   // header: name.h          generate a C header for the exports (for the C source)
@@ -102,7 +102,7 @@ function files(dir) {
 }
 
 function directives(src) {
-  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, selfhostOnly: false, links: [], header: null };
+  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, selfhostOnly: null, links: [], header: null };
   for (const [i, line] of src.split('\n').entries()) {
     let m;
     if ((m = line.match(/\/\/ expect: ?(.*)$/))) d.expect.push(m[1]);
@@ -113,7 +113,7 @@ function directives(src) {
     else if ((m = line.match(/\/\/ x86-64-flags: (.*)$/))) d.x64Flags.push(...m[1].trim().split(/\s+/));
     else if (/\/\/ wasm-only\b/.test(line)) d.wasmOnly = true;
     else if (/\/\/ native-only\b/.test(line)) d.nativeOnly = true;
-    else if (/\/\/ selfhost-only\b/.test(line)) d.selfhostOnly = true;
+    else if ((m = line.match(/\/\/ selfhost-only\b:? ?(.*)$/))) d.selfhostOnly = m[1] || 'not for the bootstrap compiler';
     else if ((m = line.match(/\/\/ link: (\S+)/))) d.links.push(m[1]);
     else if ((m = line.match(/\/\/ header: (\S+)/))) d.header = m[1];
   }
@@ -246,7 +246,7 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
   if ((native && d.wasmOnly) || (!native && d.nativeOnly)) return { skip: true, reason: native ? 'wasm only' : 'native only' };
-  if (d.selfhostOnly && bootstrapCompiler()) return { skip: true, reason: "the bootstrap compiler's optimizer differs" };
+  if (d.selfhostOnly && bootstrapCompiler()) return { skip: true, reason: d.selfhostOnly };
   if (native && noC && (d.links.length || /extern "C"/.test(src))) return { skip: true, reason: 'links C code' };
   const dir = path.join(tmp, path.basename(path.dirname(f)) + '-' + path.basename(f, '.ax'));
   fs.mkdirSync(dir);
