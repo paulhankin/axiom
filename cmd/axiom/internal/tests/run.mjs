@@ -700,6 +700,31 @@ await section('spec §16.3', {
       const r = spawnSync(exe, [], { encoding: 'utf8' });
       return r.status === 0 && /sorted 5 values/.test(r.stdout) ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
+    'compiled in parts (AXIOM_PARTS=3): runs, its trace names its functions, the same bytes each time': () => {
+      if (!native || isBootstrap()) return { skip: true, reason: 'the compiler, native' };
+      prepare();
+      const f = path.join(dir, 'parts.ax');
+      fs.writeFileSync(f, [
+        'import "std/io" as io;', '',
+        'let mut start: i32 = 3;', '',
+        'fn deep(n: i32) i32 {', '    if n > 3 {', '        @trap();', '    }', '    return n;', '}', '',
+        'fn mid(n: i32) i32 {', '    return deep(n + 1) * 2;', '}', '',
+        'export fn main() i32 {',
+        '    io.stdout().write_all("parts ok\\n") catch return 1;',
+        '    return mid(start);', '}', ''].join('\n'));
+      const env = { ...process.env, AXIOM_PARTS: '3' };
+      const outs = [];
+      for (const n of ['parts1', 'parts2']) {
+        const o = path.join(dir, n);
+        const c = spawnSync(compiler, ['build', f, '-O2', '-o', o, nativeTarget], { encoding: 'utf8', env });
+        if (c.status) return c.stderr;
+        outs.push(fs.readFileSync(o));
+      }
+      if (!outs[0].equals(outs[1])) return 'two builds differ';
+      const r = hostRun(path.join(dir, 'parts1'));
+      return r.status !== 0 && /parts ok/.test(r.stdout) && /at deep/.test(r.stderr) && /at main/.test(r.stderr)
+        ? null : `status ${r.status}:\n${r.stdout}${r.stderr}`;
+    },
     '--emit=ir': () => {
       if (isBootstrap()) return { skip: true, reason: 'the bootstrap compiler has --emit=llvm instead' };
       prepare();

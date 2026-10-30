@@ -354,6 +354,69 @@ pub fn bind_of(l: i32) u8 {
     return elf.B_GLOBAL;
 }
 
+// A module compiled in parts (backend.ax: compile_parts), whose objects
+// refer to each other's internal functions and data: the first
+// g_shared_funcs functions and g_shared_globals globals, which the module had
+// when it was cut (a part's own are added after them). Their symbols are
+// global, under names made unique with their index.
+pub let mut g_shared_funcs: usize = 0;
+pub let mut g_shared_globals: usize = 0;
+
+fn shared(linkage: i32, kind: []u8, i: usize) bool {
+    if linkage != ir.LINK_INTERNAL {
+        return false;
+    }
+    if u.str_eq(kind, "f") {
+        return i < g_shared_funcs;
+    }
+    return i < g_shared_globals;
+}
+
+fn sym_name(name: []u8, linkage: i32, kind: []u8, i: usize) []u8 {
+    if shared(linkage, kind, i) {
+        return u.f3("%s.#%s%s", name, kind, u.zdec(i));
+    }
+    return name;
+}
+
+fn sym_bind(linkage: i32, kind: []u8, i: usize) u8 {
+    if shared(linkage, kind, i) {
+        return elf.B_GLOBAL;
+    }
+    return bind_of(linkage);
+}
+
+// What add_symbols records for a function or global defined elsewhere: its
+// symbol is made when the code first refers to it (fsym_at, gsym_at), so an
+// object (one part of a module compiled in parts) has only those it uses.
+pub const LAZY: u32 = 0xFFFFFFFF;
+
+pub fn fsym_at(obj: *mut elf.Obj, fsym: *mut u.List.[u32], f: *ir.Func) u32 {
+    let k = @int_cast(usize, f.id);
+    let s = fsym.get(k);
+    if s != LAZY {
+        return s;
+    }
+    // (perm: the code that first refers to it is compiled in a scratch scope)
+    let n = elf.ext_sym(obj, u.perm_dup(sym_name(f.name, f.linkage, "f", k)), f.linkage == ir.LINK_EXTWEAK);
+    fsym.set(k, n);
+    return n;
+}
+
+pub fn gsym_at(obj: *mut elf.Obj, gsym: *mut u.List.[u32], g: *ir.Global) u32 {
+    let k = @int_cast(usize, g.id);
+    let s = gsym.get(k);
+    if s != LAZY {
+        return s;
+    }
+    let n = elf.ext_sym(obj, u.perm_dup(sym_name(g.name, g.linkage, "g", k)), g.linkage == ir.LINK_EXTWEAK);
+    if g.tls {
+        obj.syms.at(@as(usize, n)).ty = elf.T_TLS;
+    }
+    gsym.set(k, n);
+    return n;
+}
+
 pub fn extern_global(g: *ir.Global) bool {
     return u.isnil(g.init);
 }
@@ -375,23 +438,24 @@ pub fn has_addresses(x: *ir.Value) bool {
 // The initial value x at offset base of s: its bytes, and for the addresses
 // in it relocations of type abs64 (fsym and gsym: the symbols of the
 // module's functions and globals).
-fn emit_data(s: *mut elf.Sec, base: u64, x: *mut ir.Value, abs64: u32, fsym: *u.List.[u32], gsym: *u.List.[u32]) void {
+fn emit_data(obj: *mut elf.Obj, s: *mut elf.Sec, base: u64, x: *mut ir.Value, abs64: u32, fsym: *mut u.List.[u32],
+             gsym: *mut u.List.[u32]) void {
     let t = x.ty;
     let k = x.kind;
     if k == ir.V_GLOBAL {
         if x.gv.tls {
             u.die(u.f1("internal compiler error: a thread-local's address in data: %s", x.gv.name));
         }
-        s.relocs.push(elf.Rel.{ off: base, ty: abs64, sym: gsym.get(@int_cast(usize, x.gv.id)), addend: 0 });
+        s.relocs.push(elf.Rel.{ off: base, ty: abs64, sym: gsym_at(obj, gsym, x.gv), addend: 0 });
         return;
     }
     if k == ir.V_FUNC {
-        s.relocs.push(elf.Rel.{ off: base, ty: abs64, sym: fsym.get(@int_cast(usize, x.fnp.id)), addend: 0 });
+        s.relocs.push(elf.Rel.{ off: base, ty: abs64, sym: fsym_at(obj, fsym, x.fnp), addend: 0 });
         return;
     }
     if (k == ir.V_CAGG) and (t.kind != ir.T_VEC) {
         for i in 0..x.xs.len {
-            emit_data(s, base + ir.field_off(t, i), x.xs.get(i), abs64, fsym, gsym);
+            emit_data(obj, s, base + ir.field_off(t, i), x.xs.get(i), abs64, fsym, gsym);
         }
         return;
     }
@@ -421,20 +485,17 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if ir.is_decl(f) {
-            fsym.push(elf.ext_sym(obj, f.name, f.linkage == ir.LINK_EXTWEAK));
+            fsym.push(LAZY);
         } else {
-            fsym.push(elf.add_sym(obj, elf.Sym.{ name: f.name, sec: text, value: 0, size: 0, bind: bind_of(f.linkage),
-                                                 ty: elf.T_FUNC, hidden: false }));
+            fsym.push(elf.add_sym(obj, elf.Sym.{ name: sym_name(f.name, f.linkage, "f", i), sec: text, value: 0,
+                                                 size: 0, bind: sym_bind(f.linkage, "f", i), ty: elf.T_FUNC,
+                                                 hidden: false }));
         }
     }
     for i in 0..m.globals.len {
         let g = m.globals.get(i);
         if u.isnil(g.init) {
-            let si = elf.ext_sym(obj, g.name, g.linkage == ir.LINK_EXTWEAK);
-            if g.tls {
-                obj.syms.at(@as(usize, si)).ty = elf.T_TLS;
-            }
-            gsym.push(si);
+            gsym.push(LAZY);
             continue;
         }
         let mut sec = data;
@@ -473,8 +534,9 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         if g.tls {
             ty = elf.T_TLS;
         }
-        gsym.push(elf.add_sym(obj, elf.Sym.{ name: g.name, sec: sec, value: off, size: g.ty.size,
-                                             bind: bind_of(g.linkage), ty: ty, hidden: false }));
+        gsym.push(elf.add_sym(obj, elf.Sym.{ name: sym_name(g.name, g.linkage, "g", i), sec: sec, value: off,
+                                             size: g.ty.size, bind: sym_bind(g.linkage, "g", i), ty: ty,
+                                             hidden: false }));
     }
     for i in 0..m.globals.len {
         let g = m.globals.get(i);
@@ -486,7 +548,7 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         if (sec.kind == elf.S_BSS) or (sec.kind == elf.S_TBSS) {
             continue;
         }
-        emit_data(sec, s.value, g.init, abs64, fsym, gsym);
+        emit_data(obj, sec, s.value, g.init, abs64, fsym, gsym);
     }
     return relro;
 }

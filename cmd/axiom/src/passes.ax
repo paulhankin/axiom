@@ -179,6 +179,7 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
             optimize_func(f, level);
         }
     }
+    u.phase("optimize: functions");
     if level >= 2 {
         // uncommon paths that make calls leave small functions (to inline)
         let mut changed = u.List.[*mut ir.Func].empty();
@@ -188,6 +189,7 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
             }
         }
         changed.deinit();
+        u.phase("optimize: outline");
         // twice: inlining exposes constant arguments (a comparison function
         // passed down through an inlined call), which make new direct calls
         for _round in @as(i32, 0)..2 {
@@ -195,55 +197,75 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
             for i in 0..consts.len {
                 optimize_func(consts.get(i), level);
             }
+            u.phase("optimize: constant arguments");
             inl.inline_module(m, resimplify, split_cold);
-        }
-        for i in 0..m.funcs.len {
-            let f = m.funcs.get(i);
-            if ir.is_decl(f) {
-                continue;
-            }
-            if unroll(f) {
-                optimize_func(f, level);
-            }
-            // loops in a row (an outer loop unrolled) as one
-            let mut jams: i32 = 0;
-            while (jams < 4) and unr.jam_loops(f) {
-                jams += 1;
-            }
-            if jams > 0 {
-                optimize_func(f, level);
-            }
-            let split = gvn.split_loops(f);
-            if split or gvn.reduce_addresses(f, tg.is_wasm()) {
-                gvn_rounds(f, level);
-                licm(f, level);
-                opt.dce(f);
-            }
-            // stores of neighbouring elements as vector stores, once the
-            // scalar passes (store forwarding, dead stores) are done
-            if slp.store_groups(f) {
-                _ = cleanup(f, level);
-                _ = gvn.gvn(f);
-                opt.dce(f);
-            }
-            // and scalars only broadcast, neighbouring lanes, as vectors
-            if slp.splat_groups(f) {
-                _ = cleanup(f, level);
-                opt.dce(f);
-            }
+            u.phase("optimize: inline");
         }
     }
     if level > 0 {
-        // stack slots: copies between them coalesced, and those never
-        // needed at the same time sharing their bytes (once the passes,
-        // which tell slots apart by their allocas, are done)
+        // (before finish_funcs, from the IR all parts of a module compiled in
+        // parts see alike: backend.ax)
         slots.find_kept_params(m);
-        for i in 0..m.funcs.len {
-            let f = m.funcs.get(i);
-            if not ir.is_decl(f) {
-                _ = slots.colour_slots(f);
-            }
+    }
+}
+
+// The passes after inlining, which see one function at a time, over the
+// functions i of m with sel[i] (all of them if sel is empty): small loops
+// unrolled and loops fused, vector stores, and (-O1 and up) stack slots
+// shared. optimize_module comes first.
+pub fn finish_funcs(m: *mut ir.Module, level: i32, sel: []bool) void {
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if ir.is_decl(f) or ((sel.len > 0) and not sel[i]) {
+            continue;
         }
-        slots.forget_kept_params();
+        if level >= 2 {
+            finish_func(f, level);
+        }
+        if level > 0 {
+            // stack slots: copies between them coalesced, and those never
+            // needed at the same time sharing their bytes (once the passes,
+            // which tell slots apart by their allocas, are done)
+            _ = slots.colour_slots(f);
+        }
+    }
+    u.phase("optimize: loops, vectors, stack slots");
+}
+
+// finish_funcs over all of m.
+pub fn finish_module(m: *mut ir.Module, level: i32) void {
+    finish_funcs(m, level, u.nil_slice.[bool]());
+    slots.forget_kept_params();
+}
+
+fn finish_func(f: *mut ir.Func, level: i32) void {
+    if unroll(f) {
+        optimize_func(f, level);
+    }
+    // loops in a row (an outer loop unrolled) as one
+    let mut jams: i32 = 0;
+    while (jams < 4) and unr.jam_loops(f) {
+        jams += 1;
+    }
+    if jams > 0 {
+        optimize_func(f, level);
+    }
+    let split = gvn.split_loops(f);
+    if split or gvn.reduce_addresses(f, tg.is_wasm()) {
+        gvn_rounds(f, level);
+        licm(f, level);
+        opt.dce(f);
+    }
+    // stores of neighbouring elements as vector stores, once the
+    // scalar passes (store forwarding, dead stores) are done
+    if slp.store_groups(f) {
+        _ = cleanup(f, level);
+        _ = gvn.gvn(f);
+        opt.dce(f);
+    }
+    // and scalars only broadcast, neighbouring lanes, as vectors
+    if slp.splat_groups(f) {
+        _ = cleanup(f, level);
+        opt.dce(f);
     }
 }

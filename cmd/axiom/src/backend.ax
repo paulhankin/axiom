@@ -5,6 +5,7 @@
 import "a64.ax" as a64;
 import "elf.ax" as elf;
 import "ir.ax" as ir;
+import "isel.ax" as is;
 import "lower.ax" as lower;
 import "lstub.ax" as lstub;
 import "passes.ax" as passes;
@@ -24,6 +25,12 @@ pub const EMIT_ASM: i32 = 2;
 // adds to its programs.
 pub let mut g_stubs: bool = false;
 
+// A program that axiom's own linker links may have its machine code made in
+// parts, in parallel (compile_parts); main sets g_parts then, and links the
+// objects of the parts after the first, g_part_objs, with it.
+pub let mut g_parts: bool = false;
+pub let mut g_part_objs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
 fn no_wide(v: *mut ir.Value) bool {
     return false;
 }
@@ -34,33 +41,28 @@ pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) boo
     ir.merge_same_named(m);
     if not raw {
         lower.lower_module(m);
+        u.phase("lower");
         passes.optimize_module(m, opt_level);
     }
-    if not u.isnos(u.env("AXIOM_CHECK_CINTS")) {
-        ir.check_cints();
+    let native = (emit != EMIT_IR) and ((tg.g_arch == tg.ARCH_X64) or (tg.g_arch == tg.ARCH_A64));
+    // (the IR dumps are of the whole module, in one process)
+    let dumps = not u.isnos(u.env("AXIOM_DUMP_IR")) or not u.isnos(u.env("AXIOM_DUMP_SPLIT"));
+    if native and g_parts and not raw and not dumps {
+        let st = compile_parts(m, opt_level, path);
+        if st >= 0 {
+            return st == 1;
+        }
     }
-    if not u.isnos(u.env("AXIOM_CHECK_IR")) {
-        ir.check_order(m);
+    if not raw {
+        passes.finish_module(m, opt_level);
     }
+    check_ir(m);
     let dump = u.env("AXIOM_DUMP_IR");  // debugging: the optimized IR of every compilation
     if not u.isnos(dump) {
         _ = u.write_file(dump, ir.module_str(m));
     }
     if emit != EMIT_IR {
-        // vectors wider than the target computes: in pieces (x86-64 with
-        // AVX2 or AVX-512 keeps what it can, in each function's extensions)
-        for i in 0..m.funcs.len {
-            let f = m.funcs.get(i);
-            if not ir.is_decl(f) {
-                let saved = tg.begin_fn(f);
-                if tg.g_arch == tg.ARCH_X64 {
-                    vsplit.split_wide(f, x64.vector_bits(), x64.wide_legal);
-                } else {
-                    vsplit.split_wide(f, 128, no_wide);
-                }
-                tg.end_fn(saved);
-            }
-        }
+        split_vectors(m);
         let sdump = u.env("AXIOM_DUMP_SPLIT");  // debugging: the IR after vectors are split
         if not u.isnos(sdump) {
             _ = u.write_file(sdump, ir.module_str(m));
@@ -90,34 +92,201 @@ pub fn emit_module(m: *mut ir.Module, opt_level: i32, emit: i32, path: []u8) boo
         }
         return true;
     }
-    if tg.g_arch == tg.ARCH_X64 {
-        let o = x64.compile(m);
-        if u.isnil(o) {
-            return false;
-        }
-        if g_stubs {
-            elf.merge(o, lstub.build(o.machine, false));
-        }
-        if not u.write_file(path, elf.write(o)) {
-            u.eprint(u.f1("axiom: cannot write %s\n", path));
-            return false;
-        }
-        return true;
-    }
-    if tg.g_arch == tg.ARCH_A64 {
-        let o = a64.compile(m);
-        if u.isnil(o) {
-            return false;
-        }
-        if g_stubs {
-            elf.merge(o, lstub.build(o.machine, false));
-        }
-        if not u.write_file(path, elf.write(o)) {
-            u.eprint(u.f1("axiom: cannot write %s\n", path));
-            return false;
-        }
-        return true;
+    if native {
+        defer u.phase("machine code");
+        return native_obj(m, path);
     }
     u.eprint("axiom: code generation for this target is not implemented yet\n");
     return false;
+}
+
+// Debugging (AXIOM_CHECK_CINTS, AXIOM_CHECK_IR): the IR's invariants.
+fn check_ir(m: *mut ir.Module) void {
+    if not u.isnos(u.env("AXIOM_CHECK_CINTS")) {
+        ir.check_cints();
+    }
+    if not u.isnos(u.env("AXIOM_CHECK_IR")) {
+        ir.check_order(m);
+    }
+}
+
+// Vectors wider than the target computes: in pieces (x86-64 with AVX2 or
+// AVX-512 keeps what it can, in each function's extensions).
+fn split_vectors(m: *mut ir.Module) void {
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if not ir.is_decl(f) {
+            let saved = tg.begin_fn(f);
+            if tg.g_arch == tg.ARCH_X64 {
+                vsplit.split_wide(f, x64.vector_bits(), x64.wide_legal);
+            } else {
+                vsplit.split_wide(f, 128, no_wide);
+            }
+            tg.end_fn(saved);
+        }
+    }
+    u.phase("split vectors");
+}
+
+// The machine code of m's functions, as an object at path.
+fn native_obj(m: *mut ir.Module, path: []u8) bool {
+    let mut o = u.nil.[elf.Obj]();
+    if tg.g_arch == tg.ARCH_X64 {
+        o = x64.compile(m);
+    } else {
+        o = a64.compile(m);
+    }
+    if u.isnil(o) {
+        return false;
+    }
+    if g_stubs {
+        elf.merge(o, lstub.build(o.machine, false));
+    }
+    if not u.write_file(path, elf.write(o)) {
+        u.eprint(u.f1("axiom: cannot write %s\n", path));
+        return false;
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Machine code in parts
+//
+// After inlining, the functions are dealt out to parts of about PART_SIZE
+// work each (part_weight; at most MAX_PARTS of them), each finished (the
+// passes that see one function at a time: passes.finish_funcs) and compiled
+// in a process of its own, forked, to an object: the first part's at path, with
+// all of the data, the others' at <path>.p<k>.o, with the functions of the
+// other parts and the data as external symbols. So that they can refer to
+// each other, the module's internal functions and data become global
+// symbols, under names made unique (isel.add_symbols: two modules may each
+// have a function of the same name, and string constants share theirs).
+// How the functions are cut depends only on the program, not on the
+// machine's processors, so the executable is the same wherever it is built.
+// -----------------------------------------------------------------------------
+const PART_SIZE: i64 = 200000;
+const MAX_PARTS: i64 = 4;
+const SLICES: i64 = 8;
+
+// 1 if the parts compiled, 0 if one failed (and reported why), -1 if the
+// module is too small to cut or processes cannot be made: then nothing was
+// done.
+fn compile_parts(m: *mut ir.Module, level: i32, path: []u8) i32 {
+    let mut total: i64 = 0;
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if not ir.is_decl(f) {
+            total += part_weight(f);
+        }
+    }
+    let np = u.env_num("AXIOM_PARTS", @min(total / PART_SIZE, MAX_PARTS));
+    if np < 2 {
+        return -1;
+    }
+    // The functions in order, cut into SLICES runs of about the same work
+    // per part, dealt out in turn: part k has runs k, k + np, k + 2np, ...
+    // (so that a few big functions together do not make one part slow).
+    let n = @int_cast(usize, np);
+    let runs = np * SLICES;
+    let owner = u.newn.[usize](m.funcs.len + 1);
+    let mut acc: i64 = 0;
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        let r = @min((acc * runs) / total, runs - 1);
+        owner[i] = @int_cast(usize, r % np);
+        if not ir.is_decl(f) {
+            acc += part_weight(f);
+        }
+    }
+    is.g_shared_funcs = m.funcs.len;
+    is.g_shared_globals = m.globals.len;
+    let width = @min(@max(u.cpu_count(), 1), n);
+    let mut pids = u.List.[i32].empty();
+    let mut first: usize = 0;  // the oldest still running
+    let mut ok = true;
+    while (pids.len < n) or (first < pids.len) {
+        while ok and ((pids.len - first) < width) and (pids.len < n) {
+            let k = pids.len;
+            u.flush_out();
+            let pid = u.fork();
+            if pid == 0 {
+                u._exit(compile_part(m, level, k, owner, part_path(path, k)));
+            }
+            if pid < 0 {
+                if k == 0 {
+                    return -1;
+                }
+                ok = false;
+                break;
+            }
+            pids.push(pid);
+        }
+        if first == pids.len {
+            break;
+        }
+        if u.wait_child(pids.get(first)) != 0 {
+            ok = false;
+        }
+        first += 1;
+    }
+    u.phase("parts: finish, split vectors, machine code");
+    g_part_objs.clear();
+    for k in 1..n {
+        g_part_objs.push(part_path(path, k));
+    }
+    if not ok {
+        for k in 0..n {
+            _ = u.unlink(u.cz(part_path(path, k)));
+        }
+        g_part_objs.clear();
+    }
+    if ok {
+        return 1;
+    }
+    return 0;
+}
+
+// The work f's part takes for it, roughly: more than in proportion to its
+// size, as the passes' work is in big functions.
+fn part_weight(f: *ir.Func) i64 {
+    let n = @as(f64, @float_from_int(f64, f.nvals));
+    return @int_from_float(i64, n * @sqrt(n) / 16.0);
+}
+
+fn part_path(path: []u8, k: usize) []u8 {
+    if k == 0 {
+        return path;
+    }
+    return u.f2("%s.p%s.o", path, u.zdec(k));
+}
+
+// In the process of part k: the functions whose owner is k. Its exit status.
+fn compile_part(m: *mut ir.Module, level: i32, k: usize, owner: []usize, path: []u8) i32 {
+    let mine = u.newn.[bool](m.funcs.len);
+    for i in 0..m.funcs.len {
+        mine[i] = owner[i] == k;
+    }
+    u.phase(u.f1("part %s: start", u.zdec(k)));
+    passes.finish_funcs(m, level, mine);
+    check_ir(m);
+    // the other parts' functions, and (but in the first part) the data the
+    // parts share, are only declared here
+    for i in 0..is.g_shared_funcs {
+        if not mine[i] {
+            let f = m.funcs.get(i);
+            f.first = u.nil.[ir.Block]();
+            f.last = u.nil.[ir.Block]();
+        }
+    }
+    if k > 0 {
+        for i in 0..is.g_shared_globals {
+            m.globals.get(i).init = u.nil.[ir.Value]();
+        }
+    }
+    split_vectors(m);
+    if not native_obj(m, path) {
+        return 1;
+    }
+    u.phase(u.f1("part %s: machine code", u.zdec(k)));
+    return 0;
 }

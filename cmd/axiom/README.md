@@ -216,7 +216,7 @@ Not yet: linking C code or `-l` libraries (issue #7).
 | `plink.ax` | The PE linker for `x86_64-windows`: the same ELF objects in `.text`, `.rdata`, `.idata`, `.data` and `.reloc` sections; the import directory (each Windows function's DLL from its name), thunks, a GOT for our own symbols, base relocations, the TLS directory and the entry point |
 | `lstub.ax` | Machine code the linker supplies: the system call and thread-creation stubs, the signal return trampoline, the static `_start`, and `memcpy`/`memmove`/`memset` on AArch64 |
 | `target.ax` | Architectures, CPU presets, extensions, host detection |
-| `backend.ax` | Lowering, optimization and the target's code generator |
+| `backend.ax` | Lowering, optimization and the target's code generator; a large program (native, linked by our own linker) in parts after inlining: its functions dealt out to a few parts by their size (by the program alone, so the executable is the same on any machine), each part finished and compiled in a forked process to an object of its own, the module's internal symbols global under names made unique (`isel.ax`), which the linkers' symbol tables show without the suffix |
 
 Native programs include the runtime written in Axiom, which uses no C library:
 `std/internal/runtime/linux.ax` (system calls on x86-64 and AArch64), `std/internal/runtime/native.ax` (the host
@@ -296,6 +296,8 @@ builds with different settings do not share objects.
 | `AXIOM_X64_FALIGN=<a>` | Functions start at multiples of `a` bytes (default 16). |
 | `AXIOM_X64_LALIGN=<a>`, `AXIOM_X64_LMAX=<n>`, `AXIOM_X64_LMODE=1\|2` | Hot loop tops aligned to `a` bytes (default 0: not aligned) with at most `n` bytes of nops (default 15); mode 1 (default) aligns the targets of backward jumps, 2 any loop block not often fallen into. |
 | `AXIOM_X64_JCC=1` | No jump, call or return ends within or crosses a 32-byte boundary in a way the compare-and-jump erratum penalizes (see the head of `x64emit.ax`). |
+| `AXIOM_TIMES=1` | Print the time each phase of a build takes (parsing and checking, IR, the optimizer's phases, machine code, linking; each part's, for a program compiled in parts). |
+| `AXIOM_PARTS=<n>` | Compile the program in `n` parts (`backend.ax`), whatever its size; `1` for one. The test suite's stress run of parts sets it. |
 | `AXIOM_PROFILE=<file>`, `AXIOM_PROFILE_HZ=<rate>` | Read by a program built with the profiler: where to write raw samples and how often to take them. `axiom profile` sets them. |
 | `AXIOM_O0_PIPELINE=<passes>` | The bootstrap compiler's LLVM pass pipeline at `-O0` (default `always-inline,function(mem2reg,simplifycfg)`; empty for none). |
 
