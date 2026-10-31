@@ -671,27 +671,47 @@ pub struct BuiltinArg {
     t: *mut TypeExpr,
 }
 
+// An expression. Its fields are in order of size, and what only a few kinds
+// of expression have is in `more` (ext), so that the many identifiers,
+// literals, operators and calls stay small.
 pub struct Expr {
-    kind: ExprKind,
-    span: u.Span,
-    parens: bool,
-    // payload
     name: []u8,
-    name_span: u.Span,
-    ival: u64,
-    fval: f64,
-    float_text: []u8,
-    str: []u8,
-    bval: bool,
-    op: i32,  // E_UNARY, E_BINARY: the operator's token kind
-    conv: Conv,
-    call_kind: CallKind,
-    field_kind: FieldKind,
-    index_kind: IndexKind,
     a: *mut Expr,
     b: *mut Expr,
     c: *mut Expr,
     args: u.List.[*mut Expr],
+    more: *mut ExprMore,  // nil until more(e)
+    ival: u64,
+    fval: f64,
+    // ---- sema annotations ----
+    ty: *mut Type,
+    local: *mut Local,  // ident -> local
+    decl: *mut Decl,    // ident/field -> global/const/fn/type decl; call -> callee fn
+    module: *mut Module,
+    gargs: []mut *mut Type,  // CAT_FUNC / call: generic args (owner args ++ own args)
+    tval: *mut Type,         // CAT_TYPE: the type; E_BUILTIN: type argument
+    cval: u.I128,            // folded integer constant (untyped / const refs)
+    span: u.Span,
+    name_span: u.Span,
+    op: i32,       // E_UNARY, E_BINARY: the operator's token kind
+    index: i32,    // field index / variant index
+    builtin: i32,  // E_BUILTIN: BI_*, or -1 if unknown
+    kind: ExprKind,
+    conv: Conv,
+    call_kind: CallKind,
+    field_kind: FieldKind,
+    index_kind: IndexKind,
+    cat: Cat,
+    self_mode: SelfMode,
+    parens: bool,
+    bval: bool,
+    is_const: bool,  // cval / fval valid
+}
+
+// The fields of an Expr that few kinds of expression have.
+pub struct ExprMore {
+    float_text: []u8,
+    str: []u8,
     inits: u.List.[FieldInit],
     bargs: u.List.[BuiltinArg],
     targs: u.List.[*mut TypeExpr],
@@ -700,20 +720,28 @@ pub struct Expr {
     capture_span: u.Span,
     handler: Handler,
     capture_local: *mut Local,
+}
 
-    // ---- sema annotations ----
-    ty: *mut Type,
-    cat: Cat,
-    local: *mut Local,  // ident -> local
-    decl: *mut Decl,    // ident/field -> global/const/fn/type decl; call -> callee fn
-    module: *mut Module,
-    gargs: []mut *mut Type,  // CAT_FUNC / call: generic args (owner args ++ own args)
-    self_mode: SelfMode,
-    index: i32,       // field index / variant index
-    builtin: i32,     // E_BUILTIN: BI_*, or -1 if unknown
-    tval: *mut Type,  // CAT_TYPE: the type; E_BUILTIN: type argument
-    cval: u.I128,     // folded integer constant (untyped / const refs)
-    is_const: bool,   // cval / fval valid
+// e's ExprMore, to change: made (all zero, as a new Expr's fields are) the
+// first time.
+pub fn ext(e: *mut Expr) *mut ExprMore {
+    if u.isnil(e.more) {
+        e.more = u.new.[ExprMore]();
+    }
+    return e.more;
+}
+
+let mut no_more: *mut ExprMore = @ptr_from_int(*mut ExprMore, 0);
+
+// e's ExprMore, to read: all zero if it has none.
+pub fn more(e: *Expr) *ExprMore {
+    if u.notnil(e.more) {
+        return e.more;
+    }
+    if u.isnil(no_more) {
+        no_more = u.perm_new.[ExprMore]();
+    }
+    return no_more;
 }
 
 // ---------------------------------------------------------------------------
@@ -936,7 +964,7 @@ pub struct Target {
 // A catch's handler value (catch <value>, catch return <value>) or block;
 // nil if it has none.
 pub fn handler_expr(e: *Expr) *mut Expr {
-    match e.handler {
+    match more(e).handler {
         .Value(h)  => { return h; }
         .Return(h) => { return h; }
         else       => { return u.nil.[Expr](); }
@@ -944,7 +972,7 @@ pub fn handler_expr(e: *Expr) *mut Expr {
 }
 
 pub fn handler_block(e: *Expr) *mut Stmt {
-    match e.handler {
+    match more(e).handler {
         .Block(blk) => { return blk; }
         else        => { return u.nil.[Stmt](); }
     }
