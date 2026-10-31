@@ -24,6 +24,8 @@ typedef struct Parser {
     Module *mod;
     int errors_at_pos;  // suppress cascades: last position we reported at
     int ntests;         // test blocks so far (their symbol names are per module)
+    int depth;          // expressions, types and blocks being parsed, one inside another
+    int high;           // the deepest level of the tree reached (see chain_ok)
 } Parser;
 
 static Token *peek(Parser *P) { return &P->t[P->pos]; }
@@ -100,6 +102,47 @@ static void sync_stmt(Parser *P) {
     }
 }
 
+// Expressions, types and blocks nest at most MAX_DEPTH levels deep (spec §3),
+// so that no pass over the tree runs out of stack.
+#define MAX_DEPTH 1000
+
+static void too_deep(Parser *P, Span sp) {
+    if (P->errors_at_pos == P->pos) return;
+    P->errors_at_pos = P->pos;
+    diag_error(sp, "E0110", "nested too deeply: more than 1000 levels of expressions, types and blocks");
+}
+
+// Enters one more level of nesting. If that is too many, reports it, skips
+// the rest of the file and returns false; the caller then gives a
+// placeholder. Either way the caller calls leave().
+static bool enter(Parser *P) {
+    P->depth++;
+    if (P->depth > P->high) P->high = P->depth;
+    if (P->depth <= MAX_DEPTH) return true;
+    too_deep(P, peek(P)->span);
+    P->pos = P->n - 1;
+    P->errors_at_pos = P->pos;
+    return false;
+}
+
+static void leave(Parser *P) { P->depth--; }
+
+// A chain built in a loop (operators, postfix operations) puts its first
+// operand `n` levels below its root: the tree reaches `n` levels deeper than
+// the deepest operand, whose level is P->high (reset to P->depth by the caller
+// before the operands, from `outer`). False, reported at `sp`, if too deep.
+static bool chain_ok(Parser *P, int outer, int n, Span sp) {
+    bool ok = P->high + n <= MAX_DEPTH;
+    if (ok) {
+        P->high += n;
+    } else {
+        too_deep(P, sp);
+        P->high = P->depth + 1;  // the placeholder
+    }
+    if (outer > P->high) P->high = outer;
+    return ok;
+}
+
 static Span sp_from(Parser *P, Span start) {
     Span e = prev_span(P);
     Span r = start;
@@ -155,7 +198,19 @@ static void parse_generic_arg_list(Parser *P, TypeExprVec *out) {
     expect(P, TK_RBRACKET);
 }
 
+static TypeExpr *parse_type_in(Parser *P);
+
 static TypeExpr *parse_type(Parser *P) {
+    if (!enter(P)) {
+        leave(P);
+        return new_te(TE_ERROR, peek(P)->span);
+    }
+    TypeExpr *te = parse_type_in(P);
+    leave(P);
+    return te;
+}
+
+static TypeExpr *parse_type_in(Parser *P) {
     Token *t = peek(P);
     Span start = t->span;
     switch (t->kind) {
@@ -437,9 +492,13 @@ static Expr *parse_primary(Parser *P) {
 }
 
 static Expr *parse_postfix(Parser *P) {
+    int outer = P->high;
+    P->high = P->depth;
     Expr *e = parse_primary(P);
     Span start = e->span;
+    int links = 0;
     for (;;) {
+        links++;
         TokKind k = pk(P);
         if (k == TK_DOT) {
             advance(P);
@@ -470,7 +529,7 @@ static Expr *parse_postfix(Parser *P) {
                 e = ap;
             } else {
                 syntax_error(P, "field name, '*', '{' or '[' after '.'");
-                return e;
+                break;
             }
         } else if (k == TK_LPAREN) {
             advance(P);
@@ -512,10 +571,23 @@ static Expr *parse_postfix(Parser *P) {
         }
         e->span = sp_from(P, start);
     }
+    if (!chain_ok(P, outer, links - 1, e->span)) return new_expr(E_INT, start);
     return e;
 }
 
+static Expr *parse_unary_in(Parser *P);
+
 static Expr *parse_unary(Parser *P) {
+    if (!enter(P)) {
+        leave(P);
+        return new_expr(E_INT, peek(P)->span);
+    }
+    Expr *e = parse_unary_in(P);
+    leave(P);
+    return e;
+}
+
+static Expr *parse_unary_in(Parser *P) {
     Token *t = peek(P);
     Span start = t->span;
     TokKind k = t->kind;
@@ -584,6 +656,8 @@ static void check_mix(Expr *parent, Expr *child, bool is_left) {
 }
 
 static Expr *parse_binexpr(Parser *P) {
+    int outer = P->high;
+    P->high = P->depth;
     Vec(Expr *) operands = {0};
     Vec(TokKind) ops = {0};
     vec_push(operands, parse_unary(P));
@@ -594,6 +668,13 @@ static Expr *parse_binexpr(Parser *P) {
     if (ops.len == 0) {
         Expr *e = operands.data[0];
         free(operands.data);
+        if (outer > P->high) P->high = outer;
+        return e;
+    }
+    if (!chain_ok(P, outer, ops.len, span_join(operands.data[0]->span, vec_last(operands)->span))) {
+        Expr *e = new_expr(E_INT, operands.data[0]->span);
+        free(operands.data);
+        free(ops.data);
         return e;
     }
     // shunting-yard with levels; left-associative within a level
@@ -678,7 +759,19 @@ static Stmt *new_stmt(StmtKind k, Span sp) {
     return s;
 }
 
+static Stmt *parse_block_in(Parser *P);
+
 static Stmt *parse_block(Parser *P) {
+    if (!enter(P)) {
+        leave(P);
+        return new_stmt(S_BLOCK, peek(P)->span);
+    }
+    Stmt *b = parse_block_in(P);
+    leave(P);
+    return b;
+}
+
+static Stmt *parse_block_in(Parser *P) {
     Span start = peek(P)->span;
     Stmt *b = new_stmt(S_BLOCK, start);
     expect(P, TK_LBRACE);

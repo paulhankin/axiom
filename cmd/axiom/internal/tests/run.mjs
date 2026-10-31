@@ -895,6 +895,49 @@ await section('', {
   },
 }, { timed: false });
 
+// Nesting limit (spec §3): expressions, types and blocks nest at most 1000
+// levels deep, counting a chain of operators or of postfix operations as one
+// level for each link. A program 900 levels deep builds and runs; one 1100
+// levels deep is E0110, not a crash.
+{
+  const fn = (body, before = '') => `${before}export fn main() i32 {\n    let x: i32 = 0;\n${body}\n}\n`;
+  const shapes = {
+    parens: (n) => fn(`    return ${'('.repeat(n)}x${')'.repeat(n)};`),
+    'unary operators': (n) => fn(`    return ${'- '.repeat(n & ~1)}x;`),
+    'an operator chain': (n) => fn(`    return ${Array(n).fill('x').join(' + ')};`),
+    'nested operator chains': (n) => {
+      let e = 'x';
+      for (let i = 0; i < n / 10; i++) e = `(${[e, ...Array(9).fill('x')].join(' + ')})`;
+      return fn(`    return ${e};`);
+    },
+    'a postfix chain': (n) => fn(`    let mut a = N.{ n: @ptr_from_int(*N, 8), v: x };\n    a.n = &a;\n    return a${'.n'.repeat(n)}.v;`,
+      'struct N {\n    n: *N,\n    v: i32,\n}\n\n'),
+    blocks: (n) => fn(`    let mut y: i32 = 0;\n    ${'{'.repeat(n)}y += 1;${'}'.repeat(n)}\n    return y - 1;`),
+    types: (n) => fn('    return x;', `fn f(p: ${'*'.repeat(n)}i32) void {\n}\n\n`),
+  };
+  const cases = {};
+  for (const [name, gen] of Object.entries(shapes)) {
+    cases[`${name}, 900 levels deep`] = () => {
+      const f = path.join(tmp, `nest-ok-${name.replace(/ /g, '_')}.ax`);
+      fs.writeFileSync(f, gen(900));
+      const out = f.replace(/\.ax$/, native ? '' : '.wasm');
+      const c = spawnSync(compiler, ['build', f, '-o', out, ...targetFlags, ...extraFlags], { encoding: 'utf8' });
+      if (c.status !== 0) return `build failed (status ${c.status}):\n${c.stdout}${c.stderr}`.slice(0, 2000);
+      const r = hostRun(out);
+      return r.status !== 0 ? `exit status ${r.status}:\n${r.stderr}` : null;
+    };
+    cases[`${name}, 1100 levels deep`] = () => {
+      const f = path.join(tmp, `nest-deep-${name.replace(/ /g, '_')}.ax`);
+      fs.writeFileSync(f, gen(1100));
+      const c = spawnSync(compiler, ['check', f, '--format=agent-json'], { encoding: 'utf8' });
+      let codes = [];
+      try { codes = JSON.parse(c.stdout).diagnostics.map((x) => x.code); } catch { return `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`.slice(0, 2000); }
+      return codes[0] === 'E0110' && codes.filter((x) => x === 'E0110').length === 1 ? null : `diagnostics: ${codes.join(', ')}`;
+    };
+  }
+  await section('nesting limit', cases, { timed: false });
+}
+
 // `axiom fmt` (spec §16.5; the compiler only, not the bootstrap one). Each
 // cmd/axiom/internal/tests/fmt/<name>.ax formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left
@@ -1267,6 +1310,17 @@ if (!skipPlatform) {
     },
     'undeclared dependency': async () => (errorCodes(path.join(pk, 'errors/undeclared')).includes('E0214') ? null : errorCodes(path.join(pk, 'errors/undeclared')).join()),
     'package name conflict': async () => (errorCodes(path.join(pk, 'errors/conflict')).includes('E0213') ? null : 'no E0213'),
+    'package import paths stay in the package': async () => {
+      const c = errorCodes(path.join(pk, 'errors/escape'));
+      return c.length === 2 && c.every((x) => x === 'E0218') ? null : c.join();
+    },
+    'an internal import reported from inside the internal tree': async () => {
+      // the message names the tree that may import the module (here not under the working directory)
+      const lib = fs.realpathSync(path.join(root, 'cmd/axiom/internal/tests/lib'));
+      const c = ph(['check', path.join(root, 'cmd/axiom/internal/tests/errors/import_internal.ax')], path.join(lib, 'internal'));
+      const want = `error[E0219]: 'answer.ax' is internal: only modules under '${lib}' may import it`;
+      return c.status === 1 && (c.stdout + c.stderr).includes(want) ? null : `status ${c.status}:\n${c.stdout}${c.stderr}`;
+    },
     'missing path dependency': async () => (errorCodes(path.join(pk, 'errors/missingdep')).includes('E0217') ? null : 'no E0217'),
     'invalid manifest': async () => {
       const c = errorCodes(path.join(pk, 'errors/badmanifest'));

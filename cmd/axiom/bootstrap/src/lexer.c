@@ -150,6 +150,10 @@ static void lex_escape(Lexer *L, CharVec *out, bool ascii_only) {
     }
 }
 
+// Whether c is a digit in a literal of the base (2 and 8 take any decimal
+// digit here: a digit too large for them is reported separately).
+static bool is_digit_of(char c, int base) { return base == 16 ? hexval(c) >= 0 : c >= '0' && c <= '9'; }
+
 static void lex_number(Lexer *L) {
     uint32_t start = L->pos;
     const char *s = L->s;
@@ -166,6 +170,8 @@ static void lex_number(Lexer *L) {
         if (L->pos >= L->len) break;
         char c = s[L->pos];
         if (c == '_') {
+            // only between two digits (spec §2.5)
+            if (!is_digit_of(s[L->pos - 1], base) || L->pos + 1 == L->len || !is_digit_of(s[L->pos + 1], base)) bad = true;
             L->pos++;
             continue;
         }
@@ -241,12 +247,60 @@ static void lex_number(Lexer *L) {
     push(L, t);
 }
 
+// The length of the well-formed UTF-8 sequence at s[i] (a byte >= 0x80): no
+// overlong forms, surrogates or code points above U+10FFFF. 0 if there is none.
+static uint32_t utf8_len(const unsigned char *s, uint32_t len, uint32_t i) {
+    unsigned char c = s[i], lo = 0x80, hi = 0xBF;
+    uint32_t n;
+    if (c >= 0xC2 && c <= 0xDF) {
+        n = 2;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+        n = 3;
+        if (c == 0xE0) lo = 0xA0;
+        else if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        n = 4;
+        if (c == 0xF0) lo = 0x90;
+        else if (c == 0xF4) hi = 0x8F;
+    } else {
+        return 0;
+    }
+    if (n > len - i) return 0;
+    if (s[i + 1] < lo || s[i + 1] > hi) return 0;
+    for (uint32_t k = 2; k < n; k++)
+        if ((s[i + k] & 0xC0) != 0x80) return 0;
+    return n;
+}
+
+// Source text is UTF-8, with lines ended by \n or \r\n (spec §2.1). Reports
+// the first byte that breaks this.
+static void check_source_text(Lexer *L) {
+    const unsigned char *s = (const unsigned char *)L->s;
+    for (uint32_t i = 0; i < L->len;) {
+        if (s[i] < 0x80) {
+            if (s[i] == '\r' && (i + 1 == L->len || s[i + 1] != '\n')) {
+                diag_error(mkspan(L, i, i + 1), "E0007", "carriage return not followed by a line feed");
+                return;
+            }
+            i++;
+            continue;
+        }
+        uint32_t n = utf8_len(s, L->len, i);
+        if (!n) {
+            diag_error(mkspan(L, i, i + 1), "E0007", "source text is not valid UTF-8");
+            return;
+        }
+        i += n;
+    }
+}
+
 TokenVec lex_file(SourceFile *f) {
     Lexer L = {.f = f, .s = f->text, .len = (uint32_t)f->len};
     if (L.len >= 3 && (unsigned char)L.s[0] == 0xEF && (unsigned char)L.s[1] == 0xBB && (unsigned char)L.s[2] == 0xBF) {
         diag_error(mkspan(&L, 0, 3), "E0001", "source file must not start with a byte-order mark");
         L.pos = 3;
     }
+    check_source_text(&L);
     for (;;) {
         skip_ws(&L);
         if (L.pos >= L.len) break;
@@ -325,7 +379,12 @@ TokenVec lex_file(SourceFile *f) {
             CharVec buf = {0};
             if (L.pos < L.len && L.s[L.pos] == '\\') {
                 lex_escape(&L, &buf, true);
-            } else if (L.pos < L.len && L.s[L.pos] != '\'') {
+            } else if (L.pos < L.len && L.s[L.pos] == '\'') {
+                diag_error(mkspan(&L, start, L.pos + 1), "E0004", "empty character literal");
+                L.pos++;
+                push(&L, (Token){.kind = TK_CHAR, .span = mkspan(&L, start, L.pos)});
+                continue;
+            } else if (L.pos < L.len) {
                 if ((unsigned char)L.s[L.pos] >= 0x80) {
                     diag_error(mkspan(&L, start, L.pos + 1), "E0004", "character literal must be ASCII");
                     while (L.pos < L.len && (unsigned char)L.s[L.pos] >= 0x80) L.pos++;

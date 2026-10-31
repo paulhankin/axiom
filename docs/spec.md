@@ -83,7 +83,8 @@ of implicit conversions in §6.1.
 
 Source files are UTF-8. A byte-order mark is a compile error (`E0001`). Non-ASCII
 characters may appear only inside comments and string literals. Line terminators are
-`\n` or `\r\n`.
+`\n` or `\r\n`. Bytes that are not well-formed UTF-8, and a `\r` not followed by `\n`,
+are `E0007`.
 
 ### 2.2 Whitespace and comments
 
@@ -142,12 +143,14 @@ CHAR_LIT   ::= "'" ( ASCII_CHAR | ESCAPE ) "'"
 ESCAPE     ::= "\n" | "\r" | "\t" | "\0" | "\\" | "\"" | "\'" | "\x" HEX HEX | "\u{" HEX+ "}"
 ```
 
+- A `_` separator stands only between two digits: `1_000` and `0xff_ff`, but not `1__0`,
+  `10_`, `0x_ff`, `1_.5` or `1e_3` (`E0005`).
 - A float literal MUST have digits on both sides of the `.`. This means `0..n` lexes as
   `0` `..` `n`, with no special case needed.
 - A number literal has at most 120 characters, not counting `_` separators or a `0x`,
   `0b` or `0o` prefix (`E0005` otherwise).
-- A character literal has type `u8` and must be ASCII (a `\u{…}` escape above `0x7F` is
-  `E0004`).
+- A character literal has type `u8`, holds exactly one character and must be ASCII (`''`,
+  or a `\u{…}` escape above `0x7F`, is `E0004`).
 - A string literal has type `[]u8`. Its bytes are the UTF-8 encoding of its contents,
   stored in static read-only data. The slice does not include a terminator, but a NUL
   byte always follows the literal in memory, so `"text".ptr` is a valid C string
@@ -182,6 +185,12 @@ one principled exception, which still needs no symbol table: builtin argument li
 (§3.6), where the builtin's fixed signature decides whether an argument position holds a
 type or an expression. Builtins are a closed, language-defined set, so their signatures
 are effectively part of the grammar.
+
+Expressions, types and blocks nest at most 1000 levels deep (`E0110`), so that no
+compiler pass runs out of stack on a program. Each operand, unary operator, pair of
+parentheses, type constructor and block is a level, and a chain built from a sequence
+of binary operators (`a + b + c`) or of postfix operations (`a.b().c[i]`) is one
+level for each operator or operation.
 
 ### 3.1 Module structure
 
@@ -381,7 +390,8 @@ declarations. Paths are relative to the importing file, with `/` between their p
 every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\` is `E0218`.
 A path beginning with `std/` resolves to the standard library, for example
 `import "std/mem" as mem;`. A path beginning with `pkg:` names a module of another package
-(§4.6). The `.ax` extension may be left out. A path that doesn't resolve to a readable file
+(§4.6). The rest of a `std/` path, and of a `pkg:name/` path, may not have a `..` part, so
+that it stays inside the library or the package's `src` (`E0218`). The `.ax` extension may be left out. A path that doesn't resolve to a readable file
 is `E0211`.
 
 A module in a directory named `internal`, or below one, may be imported only by modules in
@@ -2477,8 +2487,10 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0004 | Invalid character literal |
 | E0005 | Malformed number literal, one longer than 120 characters, or one that does not fit in 64 bits |
 | E0006 | Malformed escape sequence in a string or character literal |
+| E0007 | Source text that is not UTF-8, or a `\r` not followed by `\n` |
 | E0100 | Syntax error: unexpected token |
 | E0104 | A reserved name (a keyword or primitive type name) used as a name |
+| E0110 | Expressions, types and blocks nested more than 1000 levels deep (§3) |
 | E0120 | Unknown builtin |
 | E0150 | Operators require parentheses (§7.4) |
 | E0201 | Name already declared in this module |
@@ -2494,7 +2506,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0215 | Invalid `axiom.toml` |
 | E0216 | Git dependency can't be fetched |
 | E0217 | Package directory or manifest missing |
-| E0218 | Import path absolute or containing `\` |
+| E0218 | Import path absolute or containing `\`, or a `std/` or `pkg:` path with a `..` part |
 | E0219 | Import of an `internal` module from outside its parent's tree (§4.1) |
 | E0220 | A package needs a newer compiler (`axiom` in its manifest, §4.6) |
 | E0301 | Missing return type |

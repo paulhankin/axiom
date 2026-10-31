@@ -41,11 +41,33 @@ static const char *display_path(const char *real) {
     return real;
 }
 
+// A directory as display_path shows the files in it: "." for the working
+// directory, "std" for the library's.
+static const char *display_dir(const char *real) {
+    const char *shown = display_path(arena_printf("%s/", real));
+    size_t n = strlen(shown);
+    if (n <= 1) return ".";
+    return arena_strndup(shown, n - 1);
+}
+
 // Whether an import path is relative and uses only '/' between its parts
 // (not "/a", "C:/a" or "a\b"), so that it means the same on every host.
 static bool relative_import(const char *ip) {
     if (!ip[0] || ip[0] == '/' || ip[1] == ':') return false;
     return strchr(ip, '\\') == NULL;
+}
+
+// Whether the part of an import path after "std/" or "pkg:name/" is relative,
+// uses only '/' between its parts and has no ".." part, so that it stays in
+// the library or package.
+static bool library_import(const char *sub) {
+    if (!relative_import(sub)) return false;
+    for (const char *p = sub;;) {
+        const char *e = strchrnul(p, '/');
+        if (e - p == 2 && p[0] == '.' && p[1] == '.') return false;
+        if (!*e) return true;
+        p = e + 1;
+    }
 }
 
 // A module under a directory named `internal` may be imported only from the
@@ -93,8 +115,20 @@ static Module *load_module(const char *fs_path, Span *from) {
         char path[PATH_MAX * 2];
         const char *ip = d->import_path;
         if (strncmp(ip, "pkg:", 4) == 0) {
+            const char *slash = strchr(ip + 4, '/');
+            if (slash && !library_import(slash + 1)) {
+                diag_error(d->import_path_span, "E0218",
+                           "import path '%s' must name a module in package '%.*s', with '/' between its parts", ip,
+                           (int)(slash - (ip + 4)), ip + 4);
+                continue;
+            }
             if (!pkg_resolve_import(m->pkg, ip, d->import_path_span, path, sizeof path)) continue;
         } else if (strncmp(ip, "std/", 4) == 0) {
+            if (!library_import(ip + 4)) {
+                diag_error(d->import_path_span, "E0218",
+                           "import path '%s' must name a module in the standard library, with '/' between its parts", ip);
+                continue;
+            }
             snprintf(path, sizeof path, "%s/%s%s", g_std_dir, ip + 4, has_ext(ip) ? "" : ".ax");
         } else if (!relative_import(ip)) {
             diag_error(d->import_path_span, "E0218", "import path '%s' must be relative, with '/' between its parts", ip);
@@ -106,7 +140,7 @@ static Module *load_module(const char *fs_path, Span *from) {
         size_t k = realpath(path, tp) ? internal_violation(rp, tp) : 0;
         if (k) {
             diag_error(d->import_path_span, "E0219", "'%s' is internal: only modules under '%s' may import it",
-                       display_path(tp), arena_strndup(display_path(tp), strlen(display_path(tp)) - strlen(tp + k)));
+                       display_path(tp), display_dir(arena_strndup(tp, k)));
             continue;
         }
         d->imported = load_module(path, &d->import_path_span);

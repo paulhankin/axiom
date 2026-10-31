@@ -229,8 +229,7 @@ const char *apply_features(const char *spec) {
     while (*p) {
         const char *q = strchr(p, ',');
         size_t n = q ? (size_t)(q - p) : strlen(p);
-        char item[64];
-        snprintf(item, sizeof item, "%.*s", (int)n, p);
+        char *item = arena_strndup(p, n);
         p += n + (q ? 1 : 0);
         if (!*item) continue;
         bool on = true;
@@ -288,8 +287,7 @@ uint64_t parse_feature_set(const char *spec, bool *foreign) {
     while (*p) {
         const char *q = strchr(p, ',');
         size_t n = q ? (size_t)(q - p) : strlen(p);
-        char item[64];
-        snprintf(item, sizeof item, "%.*s", (int)n, p);
+        char *item = arena_strndup(p, n);
         p += n + (q ? 1 : 0);
         const char *name = item;
         while (*name == ' ') name++;

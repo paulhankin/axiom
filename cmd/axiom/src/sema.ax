@@ -147,11 +147,40 @@ fn display_path(real: []u8) []u8 {
 
 // Whether an import path is relative and uses only '/' between its parts
 // (not "/a", "C:/a" or "a\b"), so that it means the same on every host.
+// A directory as display_path shows the files in it: "." for the working
+// directory, "std" for the library's.
+fn display_dir(real: []u8) []u8 {
+    let shown = display_path(u.cat2(real, "/"));
+    if shown.len <= 1 {
+        return ".";
+    }
+    return shown[..shown.len - 1];
+}
+
 fn relative_import(ip: []u8) bool {
     if (ip.len == 0) or (ip[0] == '/') or ((ip.len >= 2) and (ip[1] == ':')) {
         return false;
     }
     return u.find(ip, '\\') < 0;
+}
+
+// Whether the part of an import path after "std/" or "pkg:name/" is relative,
+// uses only '/' between its parts and has no ".." part, so that it stays in
+// the library or package.
+fn library_import(sub: []u8) bool {
+    if not relative_import(sub) {
+        return false;
+    }
+    let mut start: usize = 0;
+    for i in 0..sub.len + 1 {
+        if (i == sub.len) or (sub[i] == '/') {
+            if u.str_eq(sub[start..i], "..") {
+                return false;
+            }
+            start = i + 1;
+        }
+    }
+    return true;
 }
 
 // A module under a directory named `internal` may be imported only from the
@@ -221,11 +250,24 @@ fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
         let ext = u.pick(has_ext(ip), "", ".ax");
         let mut path = u.nosym();
         if u.starts(ip, "pkg:") {
+            let ps = u.find(ip[4..], '/');
+            if (ps >= 0) and not library_import(ip[4 + @int_cast(usize, ps) + 1..]) {
+                _ = dg.err(d.import_path_span, "E0218",
+                           u.f2("import path '%s' must name a module in package '%s', with '/' between its parts", ip,
+                                ip[4..4 + @int_cast(usize, ps)]));
+                continue;
+            }
             path = pkg.resolve_import(m.pkg, ip, d.import_path_span);
             if u.isnos(path) {
                 continue;
             }
         } else if u.starts(ip, "std/") {
+            if not library_import(ip[4..]) {
+                _ = dg.err(d.import_path_span, "E0218",
+                           u.f1("import path '%s' must name a module in the standard library, with '/' between its parts",
+                                ip));
+                continue;
+            }
             path = u.f3("%s/%s%s", g_std_dir, ip[4..], ext);
         } else if not relative_import(ip) {
             _ = dg.err(d.import_path_span, "E0218",
@@ -238,9 +280,8 @@ fn load_module(fs_path: []u8, from: *u.Span) *mut ast.Module {
         if not u.isnos(tp) {
             let k = internal_violation(rp, tp);
             if k > 0 {
-                let shown = display_path(tp);
                 _ = dg.err(d.import_path_span, "E0219", u.f2("'%s' is internal: only modules under '%s' may import it",
-                                                             shown, shown[..shown.len - (tp.len - k)]));
+                                                             display_path(tp), display_dir(tp[..k])));
                 continue;
             }
         }
@@ -2477,6 +2518,15 @@ fn resolve_ident(e: *mut ast.Expr) void {
 // ---------------------------------------------------------------------------
 // Field access
 // ---------------------------------------------------------------------------
+// A method or associated function is visible outside its module only if it is
+// `pub` (spec §4.2).
+fn check_method_visible(e: *mut ast.Expr, m: *mut ast.Decl) void {
+    if not m.is_pub and (m.module != C.tc.mod) {
+        let g = dg.err(ast.name_span_of(e), "E0203", u.f1("'%s' is not public", e.name));
+        dg.note(g, m.name_span, "declared here");
+    }
+}
+
 fn check_field(e: *mut ast.Expr) *mut ast.Type {
     let a = e.a;
     _ = check_operand(a, tnil());
@@ -2513,6 +2563,7 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
         }
         let m = find_method(t.decl, name);
         if u.notnil(m) {
+            check_method_visible(e, m);
             resolve_decl(m);
             e.cat = ast.CAT_FUNC;
             ast.set_field_kind(e, ast.FK_DECL);
@@ -2577,6 +2628,7 @@ fn check_field(e: *mut ast.Expr) *mut ast.Type {
     if (base.kind == ast.TY_STRUCT) or (base.kind == ast.TY_UNION) or (base.kind == ast.TY_ENUM) {
         let m = find_method(base.decl, name);
         if u.notnil(m) {
+            check_method_visible(e, m);
             resolve_decl(m);
             e.cat = ast.CAT_METHOD;
             ast.set_decl(e, m);

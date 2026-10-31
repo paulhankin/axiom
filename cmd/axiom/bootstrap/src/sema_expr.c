@@ -840,6 +840,15 @@ static void resolve_ident(Expr *e) {
 // ---------------------------------------------------------------------------
 // Field access
 // ---------------------------------------------------------------------------
+// A method or associated function is visible outside its module only if it is
+// `pub` (spec §4.2).
+static void check_method_visible(Expr *e, Decl *m) {
+    if (!m->is_pub && m->module != C->tc.mod) {
+        Diag *dg = diag_error(e->name_span, "E0203", "'%s' is not public", e->name);
+        diag_note(dg, m->name_span, "declared here");
+    }
+}
+
 static Type *check_field(Expr *e) {
     Expr *a = e->a;
     check_operand(a, NULL);
@@ -876,6 +885,7 @@ static Type *check_field(Expr *e) {
         }
         Decl *m = find_method(t->decl, name);
         if (m) {
+            check_method_visible(e, m);
             resolve_decl(m);
             e->cat = CAT_FUNC;
             e->op = FK_DECL;
@@ -941,6 +951,7 @@ static Type *check_field(Expr *e) {
     if (base->kind == TY_STRUCT || base->kind == TY_UNION || base->kind == TY_ENUM) {
         Decl *m = find_method(base->decl, name);
         if (m) {
+            check_method_visible(e, m);
             resolve_decl(m);
             e->cat = CAT_METHOD;
             e->decl = m;

@@ -91,8 +91,7 @@ void check_fn_attr(Decl *f) {
         for (;;) {
             const char *q = strchr(p, ',');
             size_t len = q ? (size_t)(q - p) : strlen(p);
-            char item[64];
-            snprintf(item, sizeof item, "%.*s", (int)len, p);
+            char *item = arena_strndup(p, len);
             const char *name = item;
             while (*name == ' ') name++;
             if (*name == '+') name++;

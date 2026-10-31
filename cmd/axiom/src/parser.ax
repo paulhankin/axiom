@@ -14,6 +14,8 @@ struct Parser {
     mod: *mut ast.Module,
     errors_at_pos: i64,  // suppress cascades: last position we reported at
     ntests: i32,         // test blocks so far (their symbol names are per module)
+    depth: usize,        // expressions, types and blocks being parsed, one inside another
+    high: usize,         // the deepest level of the tree reached (see chain_ok)
 }
 
 fn peek(P: *Parser) *mut lx.Token {
@@ -104,6 +106,57 @@ fn expect_ident(P: *mut Parser) Ident {
     }
     syntax_error(P, "identifier");
     return Ident.{ name: u.intern("<error>"), span: sp };
+}
+
+// Expressions, types and blocks nest at most MAX_DEPTH levels deep (spec §3),
+// so that no pass over the tree runs out of stack.
+const MAX_DEPTH: usize = 1000;
+
+fn too_deep(P: *mut Parser, sp: u.Span) void {
+    if P.errors_at_pos == @int_cast(i64, P.pos) {
+        return;
+    }
+    P.errors_at_pos = @int_cast(i64, P.pos);
+    _ = dg.err(sp, "E0110", "nested too deeply: more than 1000 levels of expressions, types and blocks");
+}
+
+// Enters one more level of nesting. If that is too many, reports it, skips
+// the rest of the file and returns false; the caller then gives a
+// placeholder. Either way the caller calls leave().
+fn enter(P: *mut Parser) bool {
+    P.depth += 1;
+    if P.depth > P.high {
+        P.high = P.depth;
+    }
+    if P.depth <= MAX_DEPTH {
+        return true;
+    }
+    too_deep(P, peek(P).span);
+    P.pos = P.n - 1;
+    P.errors_at_pos = @int_cast(i64, P.pos);
+    return false;
+}
+
+fn leave(P: *mut Parser) void {
+    P.depth -= 1;
+}
+
+// A chain built in a loop (operators, postfix operations) puts its first
+// operand `n` levels below its root: the tree reaches `n` levels deeper than
+// the deepest operand, whose level is P.high (reset to P.depth by the caller
+// before the operands, from `outer`). False, reported at `sp`, if too deep.
+fn chain_ok(P: *mut Parser, outer: usize, n: usize, sp: u.Span) bool {
+    let ok = (P.high + n) <= MAX_DEPTH;
+    if ok {
+        P.high += n;
+    } else {
+        too_deep(P, sp);
+        P.high = P.depth + 1;  // the placeholder
+    }
+    if outer > P.high {
+        P.high = outer;
+    }
+    return ok;
 }
 
 // Skip to a plausible statement/declaration boundary after an error.
@@ -219,6 +272,16 @@ fn parse_array_len(P: *mut Parser) *mut ast.TypeExpr {
 }
 
 fn parse_type(P: *mut Parser) *mut ast.TypeExpr {
+    if not enter(P) {
+        leave(P);
+        return ast.new_te(ast.TypeShape.Error, peek(P).span);
+    }
+    let te = parse_type_in(P);
+    leave(P);
+    return te;
+}
+
+fn parse_type_in(P: *mut Parser) *mut ast.TypeExpr {
     let t = peek(P);
     let start = t.span;
     let k = t.kind;
@@ -470,9 +533,13 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
 }
 
 fn parse_postfix(P: *mut Parser) *mut ast.Expr {
+    let outer = P.high;
+    P.high = P.depth;
     let mut e = parse_primary(P);
     let start = e.span;
+    let mut links: usize = 0;
     loop {
+        links += 1;
         let k = pk(P);
         if k == lx.TK_DOT {
             _ = advance(P);
@@ -503,7 +570,7 @@ fn parse_postfix(P: *mut Parser) *mut ast.Expr {
                 e = ap;
             } else {
                 syntax_error(P, "field name, '*', '{' or '[' after '.'");
-                return e;
+                break;
             }
         } else if k == lx.TK_LPAREN {
             _ = advance(P);
@@ -556,10 +623,23 @@ fn parse_postfix(P: *mut Parser) *mut ast.Expr {
         }
         e.span = sp_from(P, start);
     }
+    if not chain_ok(P, outer, links - 1, e.span) {
+        return ast.new_expr(ast.E_INT, start);
+    }
     return e;
 }
 
 fn parse_unary(P: *mut Parser) *mut ast.Expr {
+    if not enter(P) {
+        leave(P);
+        return ast.new_expr(ast.E_INT, peek(P).span);
+    }
+    let e = parse_unary_in(P);
+    leave(P);
+    return e;
+}
+
+fn parse_unary_in(P: *mut Parser) *mut ast.Expr {
     let t = peek(P);
     let start = t.span;
     let k = t.kind;
@@ -691,8 +771,13 @@ fn reduce(out: *mut u.List.[*mut ast.Expr], st: *mut u.List.[i32]) void {
 }
 
 fn parse_binexpr(P: *mut Parser) *mut ast.Expr {
+    let outer = P.high;
+    P.high = P.depth;
     let first = parse_unary(P);
     if op_family(pk(P)) == F_NONE {
+        if outer > P.high {
+            P.high = outer;
+        }
         return first;
     }
     let mut operands = u.List.[*mut ast.Expr].empty();
@@ -701,6 +786,11 @@ fn parse_binexpr(P: *mut Parser) *mut ast.Expr {
     while op_family(pk(P)) != F_NONE {
         ops.push(advance(P).kind);
         operands.push(parse_unary(P));
+    }
+    if not chain_ok(P, outer, ops.len, u.span_join(first.span, operands.last().span)) {
+        operands.deinit();
+        ops.deinit();
+        return ast.new_expr(ast.E_INT, first.span);
     }
     // shunting-yard with levels; left-associative within a level
     let mut out = u.List.[*mut ast.Expr].empty();
@@ -780,6 +870,16 @@ fn parse_expr(P: *mut Parser) *mut ast.Expr {
 // Statements
 // ---------------------------------------------------------------------------
 fn parse_block(P: *mut Parser) *mut ast.Stmt {
+    if not enter(P) {
+        leave(P);
+        return ast.new_stmt(ast.S_BLOCK, peek(P).span);
+    }
+    let b = parse_block_in(P);
+    leave(P);
+    return b;
+}
+
+fn parse_block_in(P: *mut Parser) *mut ast.Stmt {
     let start = peek(P).span;
     let b = ast.new_stmt(ast.S_BLOCK, start);
     _ = expect(P, lx.TK_LBRACE);
@@ -1599,7 +1699,7 @@ fn parse_top(P: *mut Parser) void {
 pub fn parse_module(f: *mut u.SourceFile) *mut ast.Module {
     let toks = lx.lex_file(f);
     let mut P = Parser.{ f: f, t: toks.items(), pos: 0, n: toks.len, mod: u.new.[ast.Module](), errors_at_pos: -1,
-                         ntests: 0 };
+                         ntests: 0, depth: 0, high: 0 };
     P.mod.file = f;
     while pk(&P) != lx.TK_EOF {
         let before = P.pos;
