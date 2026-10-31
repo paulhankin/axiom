@@ -184,7 +184,10 @@ static void gate_expr(Expr *e, uint64_t feats) {
         return;
     }
     gate_expr(e->a, feats);
-    gate_expr(e->b, feats);
+    // A method callee keeps its receiver in b as well as in a, and the call (or
+    // generic application) over it copies that b; walking those again would visit
+    // a receiver chain exponentially often.
+    if (e->b != e->a && !(e->a && e->b == e->a->b)) gate_expr(e->b, feats);
     gate_expr(e->c, feats);
     for (int i = 0; i < e->args.len; i++) gate_expr(e->args.data[i], feats);
     for (int i = 0; i < e->inits.len; i++) gate_expr(e->inits.data[i].value, feats);
