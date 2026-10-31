@@ -343,7 +343,7 @@ fn parse_builtin(P: *mut Parser) *mut ast.Expr {
     if id < 0 {
         _ = dg.err(t.span, "E0120", u.f1("unknown builtin '@%s'", t.name));
     }
-    e.builtin = id;
+    ast.set_builtin(e, id);
     let mut sig: []u8 = "*";
     if id >= 0 {
         sig = ast.builtin_sig(id);
@@ -389,13 +389,13 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
     if (k == lx.TK_INT) or (k == lx.TK_CHAR) {
         _ = advance(P);
         let e = ast.new_expr(ast.E_INT, start);
-        e.ival = t.ival;
+        ast.set_ival(e, t.ival);
         return e;
     }
     if k == lx.TK_FLOAT {
         _ = advance(P);
         let e = ast.new_expr(ast.E_FLOAT, start);
-        e.fval = t.fval;
+        ast.set_fval(e, t.fval);
         ast.ext(e).float_text = t.float_text;
         return e;
     }
@@ -434,15 +434,15 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
         if accept(P, lx.TK_SEMI) {
             e = ast.new_expr(ast.E_ARRAY_REPEAT, start);
             e.a = first;
-            e.b = parse_expr(P);
+            ast.set_b(e, parse_expr(P));
         } else {
             e = ast.new_expr(ast.E_ARRAY_LIT, start);
-            e.args.push(first);
+            ast.args_mut(e).push(first);
             while accept(P, lx.TK_COMMA) {
                 if pk(P) == lx.TK_RBRACKET {
                     break;
                 }
-                e.args.push(parse_expr(P));
+                ast.args_mut(e).push(parse_expr(P));
             }
         }
         _ = expect(P, lx.TK_RBRACKET);
@@ -455,7 +455,7 @@ fn parse_primary(P: *mut Parser) *mut ast.Expr {
         let e = ast.new_expr(ast.E_ERROR_VAL, start);
         let id = expect_ident(P);
         e.name = id.name;
-        e.name_span = id.span;
+        ast.set_name_span(e, id.span);
         e.span = sp_from(P, start);
         return e;
     }
@@ -482,7 +482,7 @@ fn parse_postfix(P: *mut Parser) *mut ast.Expr {
                 let f = ast.new_expr(ast.E_FIELD, start);
                 f.a = e;
                 f.name = n.name;
-                f.name_span = n.span;
+                ast.set_name_span(f, n.span);
                 e = f;
             } else if k2 == lx.TK_STAR {
                 _ = advance(P);
@@ -510,7 +510,7 @@ fn parse_postfix(P: *mut Parser) *mut ast.Expr {
             let c = ast.new_expr(ast.E_CALL, start);
             c.a = e;
             while (pk(P) != lx.TK_RPAREN) and (pk(P) != lx.TK_EOF) {
-                c.args.push(parse_expr(P));
+                ast.args_mut(c).push(parse_expr(P));
                 if not accept(P, lx.TK_COMMA) {
                     break;
                 }
@@ -543,8 +543,8 @@ fn parse_postfix(P: *mut Parser) *mut ast.Expr {
             }
             let x = ast.new_expr(xk, start);
             x.a = e;
-            x.b = lo;
-            x.c = hi;
+            ast.set_b(x, lo);
+            ast.set_c(x, hi);
             e = x;
         } else if k == lx.TK_BANG {
             _ = advance(P);
@@ -566,7 +566,7 @@ fn parse_unary(P: *mut Parser) *mut ast.Expr {
     if (k == lx.TK_MINUS) or (k == lx.TK_MINUS_PCT) or (k == lx.TK_TILDE) or (k == lx.KW_NOT) or (k == lx.TK_AMP) {
         _ = advance(P);
         let e = ast.new_expr(ast.E_UNARY, start);
-        e.op = k;
+        ast.set_op(e, k);
         if (k == lx.TK_AMP) and accept(P, lx.KW_MUT) {
             e.bval = true;  // &mut
         }
@@ -662,8 +662,8 @@ fn check_mix(parent: *mut ast.Expr, child: *mut ast.Expr, is_left: bool) void {
     if (child.kind != ast.E_BINARY) or child.parens {
         return;
     }
-    let pf = op_family(parent.op);
-    let cf = op_family(child.op);
+    let pf = op_family(ast.op_of(parent));
+    let cf = op_family(ast.op_of(child));
     if fam_tighter(cf, pf) {
         return;
     }
@@ -671,7 +671,7 @@ fn check_mix(parent: *mut ast.Expr, child: *mut ast.Expr, is_left: bool) void {
         return;
     }
     let d = dg.err(child.span, "E0150", u.f2("operators '%s' and '%s' cannot be mixed without parentheses",
-                                             lx.tok_kind_name(child.op), lx.tok_kind_name(parent.op)));
+                                             lx.tok_kind_name(ast.op_of(child)), lx.tok_kind_name(ast.op_of(parent))));
     let fx = dg.fix(d, "add parentheses", "machine");
     dg.edit(fx, u.mkspan(child.span.file, child.span.start, child.span.start), "(");
     dg.edit(fx, u.mkspan(child.span.file, child.span.end, child.span.end), ")");
@@ -682,9 +682,9 @@ fn reduce(out: *mut u.List.[*mut ast.Expr], st: *mut u.List.[i32]) void {
     let r = out.pop();
     let l = out.pop();
     let b = ast.new_expr(ast.E_BINARY, u.span_join(l.span, r.span));
-    b.op = op;
+    ast.set_op(b, op);
     b.a = l;
-    b.b = r;
+    ast.set_b(b, r);
     check_mix(b, l, true);
     check_mix(b, r, false);
     out.push(b);
@@ -733,9 +733,9 @@ fn parse_expr(P: *mut Parser) *mut ast.Expr {
     let start = e.span;
     if (e.kind == ast.E_BINARY) and not e.parens {
         let d = dg.err(e.span, "E0150", u.f1("'catch' applies to the whole expression '... %s ...'; add parentheses",
-                                             lx.tok_kind_name(e.op)));
+                                             lx.tok_kind_name(ast.op_of(e))));
         let fx = dg.fix(d, "catch only the right operand", "suggestion");
-        dg.edit(fx, u.mkspan(e.b.span.file, e.b.span.start, e.b.span.start), "(");
+        dg.edit(fx, u.mkspan(ast.b_of(e).span.file, ast.b_of(e).span.start, ast.b_of(e).span.start), "(");
     }
     _ = advance(P);
     let c = ast.new_expr(ast.E_CATCH, start);
@@ -765,7 +765,7 @@ fn parse_expr(P: *mut Parser) *mut ast.Expr {
         if pk(P) == lx.TK_IDENT {
             let id = advance(P);  // the label of the loop to leave (name, as for an identifier)
             c.name = id.name;
-            c.name_span = id.span;
+            ast.set_name_span(c, id.span);
         }
     } else if k == lx.TK_LBRACE {
         ast.ext(c).handler = ast.Handler.Block(parse_block(P));
