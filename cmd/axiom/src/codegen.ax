@@ -664,9 +664,71 @@ let mut trap_info: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 let mut trap_hook: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 let mut trap_fnty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
 let mut site_ty: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
-let mut site_map: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
-                                                                        vals: @ptr_from_int(*mut *mut ir.Value, 0),
-                                                                        cap: 0, len: 0 };
+// The site records made, by what makes them the same (site_slot): a hash
+// table (open addressing), which a lookup does not allocate in.
+struct SiteKey {
+    fname: []u8,
+    callee: []u8,
+    g: *mut ir.Value,  // nil: a free slot
+    code: i32,
+    file: i32,
+    start: u32,
+    end: u32,
+}
+
+let mut site_tab: u.List.[SiteKey] = u.List.[SiteKey].{ data: @ptr_from_int(*mut SiteKey, 0), len: 0, cap: 0 };
+let mut site_count: usize = 0;
+
+fn site_hash(code: i32, sp: u.Span, fname: []u8, callee: []u8) u64 {
+    let mut h = u.hash_fnv(fname) ^ (u.hash_fnv(callee) *% 0x9E3779B97F4A7C15);
+    h = (h ^ @as(u64, @bit_cast(u32, code))) *% 0x100000001b3;
+    h = (h ^ @as(u64, @bit_cast(u32, sp.file))) *% 0x100000001b3;
+    h = (h ^ @as(u64, sp.start)) *% 0x100000001b3;
+    return (h ^ @as(u64, sp.end)) *% 0x100000001b3;
+}
+
+// The slot of the site record for these, which is free (g nil) if there is
+// none yet: the caller then fills it.
+fn site_slot(code: i32, sp: u.Span, fname: []u8, callee: []u8) *mut SiteKey {
+    if (site_count + 1) * 2 > site_tab.len {
+        let old = site_tab;
+        let mut n: usize = 4096;
+        if old.len > 0 {
+            n = old.len * 2;
+        }
+        site_tab = u.List.[SiteKey].empty();
+        site_tab.reserve(n);
+        site_tab.len = n;
+        let t = site_tab.items();
+        @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, t.ptr), n * @size_of(SiteKey)), 0);
+        for k in old.items() {
+            if u.notnil(k.g) {
+                let mut j = @truncate(usize, site_hash(k.code, u.mkspan(k.file, k.start, k.end), k.fname,
+                                                       k.callee)) & (n - 1);
+                while u.notnil(t[j].g) {
+                    j = (j + 1) & (n - 1);
+                }
+                t[j] = k;
+            }
+        }
+        let mut o = old;
+        o.deinit();
+    }
+    let n = site_tab.len;
+    let t = site_tab.items();
+    let mut j = @truncate(usize, site_hash(code, sp, fname, callee)) & (n - 1);
+    loop {
+        let k = &mut t[j];
+        if u.isnil(k.g) {
+            return k;
+        }
+        if (k.code == code) and (k.file == sp.file) and (k.start == sp.start) and (k.end == sp.end) and
+           u.str_eq(k.fname, fname) and u.str_eq(k.callee, callee) {
+            return k;
+        }
+        j = (j + 1) & (n - 1);
+    }
+}
 
 // axiom.trap_info: {site, kind, a, b, alen, blen}, all 64-bit.
 fn trap_info_global() *mut ir.Value {
@@ -806,11 +868,9 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
     if u.isnos(callee) {
         callee = "";
     }
-    let key = u.intern(u.f6("%s:%s:%s:%s:%s:%s", u.idec(code), u.idec(sp.file), u.udec(@as(u64, sp.start)),
-                            u.udec(@as(u64, sp.end)), fname, callee));
-    let found = site_map.get(key);
-    if u.notnil(found) {
-        return found;
+    let slot = site_slot(code, sp, fname, callee);
+    if u.notnil(slot.g) {
+        return slot.g;
     }
     if u.isnil(site_ty) {
         let mut el: [11]*mut ir.Ty = [T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr];
@@ -858,7 +918,14 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
     set_linkage(g, ir.LINK_INTERNAL);
     ir.gv_of(g).is_const = true;
     set_align(g, 8);
-    site_map.put(key, g);
+    slot.code = code;
+    slot.file = sp.file;
+    slot.start = sp.start;
+    slot.end = sp.end;
+    slot.fname = u.intern(fname);  // (kept: the callers' may not be)
+    slot.callee = u.intern(callee);
+    slot.g = g;
+    site_count += 1;
     return g;
 }
 
