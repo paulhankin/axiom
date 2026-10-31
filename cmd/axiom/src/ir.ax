@@ -876,8 +876,8 @@ pub struct Value {
     align: u32,
     t1: *mut Block,
     t2: *mut Block,
-    more: *mut ValueMore,  // what few values have (more, more_mut)
-    aux: i64,              // pass / backend scratch
+    more: usize,  // a record of what few values have (bs_of, ...), or 0
+    aux: i64,     // pass / backend scratch
     aux2: i64,
     auxp: *mut void,
     // backend scratch
@@ -890,40 +890,452 @@ pub struct Value {
 
 // The fields of a Value that few values have: phis' and switches' blocks,
 // calls' signatures, allocas' types, shuffles' masks, and the constants'
-// values and referents. A value has one only once one of them is set
-// (more_mut), which most never are; more(v) reads them, as zero if not.
-pub struct ValueMore {
-    bs: u.List.[*mut Block],
-    fv: f64,
-    aty: *mut Ty,     // ALLOCA: allocated type
-    fty: *mut Ty,     // CALL: signature
-    mask: []mut i32,  // SHUFFLE
-    ext: []mut u8,    // CALL: argument extension (0 none, 1 zext, 2 sext)
-    gv: *mut Global,
-    fnp: *mut Func,
-    name: []u8,
+// values and referents. They are in a record (Value.more) only once one of
+// them is set, which for most values none ever is: a small one with the
+// fields of one group (the blocks of a PHI or SWITCH, a CALL's, an ALLOCA's,
+// a SHUFFLE's mask, a constant's), or, once a value has fields of two
+// groups, a ValueMore with all of them. A record starts with its group (an
+// operation may change in place: the group, not the op, says what the record
+// holds). <field>_of(v) reads one (zero if v has none), set_<field>(v, x)
+// sets it (setting zero where there is none makes no record), and
+// <field>_mut(v) is its address. Records of dead values are reused.
+pub struct VmBlocks {
+    g: u8,
+    bs: u.List.[*mut Block],  // PHI, SWITCH: the blocks
+}
+
+pub struct VmCall {
+    g: u8,
+    fty: *mut Ty,       // CALL: signature
+    ext: []mut u8,      // CALL: argument extension (0 none, 1 zext, 2 sext)
     chain: *mut Chain,  // CALL, native frame tables: the call-site records (see Chain)
+}
+
+pub struct VmAlloca {
+    g: u8,
+    aty: *mut Ty,  // ALLOCA: allocated type
+    name: []u8,    // ALLOCA, PARAM: a name for people
+}
+
+pub struct VmMask {
+    g: u8,
+    mask: []mut i32,  // SHUFFLE
+}
+
+pub struct VmConst {
+    g: u8,
+    fv: f64,          // CFP: the value
+    gv: *mut Global,  // GLOBAL: the global
+    fnp: *mut Func,   // FUNC, PARAM: the function
+    name: []u8,       // ALLOCA, PARAM: a name for people
+}
+
+pub struct ValueMore {
+    g: u8,
+    bs: u.List.[*mut Block],  // PHI, SWITCH: the blocks
+    fv: f64,                  // CFP: the value
+    aty: *mut Ty,             // ALLOCA: allocated type
+    fty: *mut Ty,             // CALL: signature
+    mask: []mut i32,          // SHUFFLE
+    ext: []mut u8,            // CALL: argument extension (0 none, 1 zext, 2 sext)
+    gv: *mut Global,          // GLOBAL: the global
+    fnp: *mut Func,           // FUNC, PARAM: the function
+    name: []u8,               // ALLOCA, PARAM: a name for people
+    chain: *mut Chain,        // CALL, native frame tables: the call-site records (see Chain)
+}
+
+// The group of v's record (0: none).
+fn more_group(v: *Value) u8 {
+    if v.more == 0 {
+        return 0;
+    }
+    return @ptr_from_int(*u8, v.more).*;
 }
 
 let mut no_more: *mut ValueMore = @ptr_from_int(*mut ValueMore, 0);
 
-// v's ValueMore, to read: all zero if it has none.
-pub fn more(v: *Value) *ValueMore {
-    if u.notnil(v.more) {
-        return v.more;
-    }
+fn zero_more() *ValueMore {
     if u.isnil(no_more) {
         no_more = u.perm_new.[ValueMore]();
     }
     return no_more;
 }
 
-// v's ValueMore, to change: made (all zero) the first time.
-pub fn more_mut(v: *mut Value) *mut ValueMore {
-    if u.isnil(v.more) {
-        v.more = u.new.[ValueMore]();
+// Records of dead values, for reuse, by group.
+let mut free_more: [7]u.List.[usize] = [u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 }; 7];
+
+fn new_more(g: u8) usize {
+    let k = @as(usize, g);
+    if free_more[k].len > 0 {
+        let r = free_more[k].pop();
+        @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, r), more_size(g)), 0);
+        @ptr_from_int(*mut u8, r).* = g;
+        return r;
     }
-    return v.more;
+    let mut r: usize = 0;
+    match g {
+        1    => { r = @int_from_ptr(u.new.[VmBlocks]()); }
+        2    => { r = @int_from_ptr(u.new.[VmCall]()); }
+        3    => { r = @int_from_ptr(u.new.[VmAlloca]()); }
+        4    => { r = @int_from_ptr(u.new.[VmMask]()); }
+        5    => { r = @int_from_ptr(u.new.[VmConst]()); }
+        6    => { r = @int_from_ptr(u.new.[ValueMore]()); }
+        else => { u.die("more_new: no such group"); }
+    }
+    @ptr_from_int(*mut u8, r).* = g;
+    return r;
+}
+
+fn more_size(g: u8) usize {
+    match g {
+        1    => { return @size_of(VmBlocks); }
+        2    => { return @size_of(VmCall); }
+        3    => { return @size_of(VmAlloca); }
+        4    => { return @size_of(VmMask); }
+        5    => { return @size_of(VmConst); }
+        6    => { return @size_of(ValueMore); }
+        else => { return 0; }
+    }
+}
+
+// v's record as a ValueMore (with every field), made from the one it has.
+fn more_full(v: *mut Value) *mut ValueMore {
+    let g = more_group(v);
+    if g == 6 {
+        return @ptr_from_int(*mut ValueMore, v.more);
+    }
+    let r = new_more(6);
+    let m = @ptr_from_int(*mut ValueMore, r);
+    match g {
+        1 => {
+            let o = @ptr_from_int(*mut VmBlocks, v.more);
+            m.bs = o.bs;
+        }
+        2 => {
+            let o = @ptr_from_int(*mut VmCall, v.more);
+            m.fty = o.fty;
+            m.ext = o.ext;
+            m.chain = o.chain;
+        }
+        3 => {
+            let o = @ptr_from_int(*mut VmAlloca, v.more);
+            m.aty = o.aty;
+            m.name = o.name;
+        }
+        4 => {
+            let o = @ptr_from_int(*mut VmMask, v.more);
+            m.mask = o.mask;
+        }
+        5 => {
+            let o = @ptr_from_int(*mut VmConst, v.more);
+            m.fv = o.fv;
+            m.gv = o.gv;
+            m.fnp = o.fnp;
+            m.name = o.name;
+        }
+        else => {}
+    }
+    if g != 0 {
+        free_more[@as(usize, g)].push(v.more);
+    }
+    v.more = r;
+    return m;
+}
+
+// Gives back v's record (its block list freed), for reuse.
+fn release_more(v: *mut Value) void {
+    let g = more_group(v);
+    if g == 0 {
+        return;
+    }
+    if g == 1 {
+        @ptr_from_int(*mut VmBlocks, v.more).bs.deinit();
+    } else if g == 6 {
+        @ptr_from_int(*mut ValueMore, v.more).bs.deinit();
+    }
+    if not u.poisoning() {
+        free_more[@as(usize, g)].push(v.more);
+    }
+    v.more = 0;
+}
+
+// y gets a record like v's (with a block list of its own).
+fn copy_more(y: *mut Value, v: *Value) void {
+    let g = more_group(v);
+    if g == 0 {
+        return;
+    }
+    let r = new_more(g);
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, r), more_size(g)),
+              @slice_from_ptr(@ptr_from_int(*u8, v.more), more_size(g)));
+    if g == 1 {
+        @ptr_from_int(*mut VmBlocks, r).bs = u.List.[*mut Block].empty();
+    } else if g == 6 {
+        @ptr_from_int(*mut ValueMore, r).bs = u.List.[*mut Block].empty();
+    }
+    y.more = r;
+}
+
+pub fn bs_of(v: *Value) u.List.[*mut Block] {
+    match more_group(v) {
+        1    => { return @ptr_from_int(*VmBlocks, v.more).bs; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).bs; }
+        else => { return zero_more().bs; }
+    }
+}
+
+pub fn bs_mut(v: *mut Value) *mut u.List.[*mut Block] {
+    if v.more == 0 {
+        v.more = new_more(1);
+    }
+    match more_group(v) {
+        1    => { return &mut @ptr_from_int(*mut VmBlocks, v.more).bs; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).bs; }
+        else => { return &mut more_full(v).bs; }
+    }
+}
+
+pub fn set_bs(v: *mut Value, x: u.List.[*mut Block]) void {
+    if (v.more == 0) and ((x.len == 0) and (x.cap == 0)) {
+        return;
+    }
+    bs_mut(v).* = x;
+}
+
+pub fn fv_of(v: *Value) f64 {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*VmConst, v.more).fv; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).fv; }
+        else => { return zero_more().fv; }
+    }
+}
+
+pub fn fv_mut(v: *mut Value) *mut f64 {
+    if v.more == 0 {
+        v.more = new_more(5);
+    }
+    match more_group(v) {
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).fv; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).fv; }
+        else => { return &mut more_full(v).fv; }
+    }
+}
+
+pub fn set_fv(v: *mut Value, x: f64) void {
+    if (v.more == 0) and (@bit_cast(u64, x) == 0) {
+        return;
+    }
+    fv_mut(v).* = x;
+}
+
+pub fn aty_of(v: *Value) *mut Ty {
+    match more_group(v) {
+        3    => { return @ptr_from_int(*VmAlloca, v.more).aty; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).aty; }
+        else => { return zero_more().aty; }
+    }
+}
+
+pub fn aty_mut(v: *mut Value) *mut *mut Ty {
+    if v.more == 0 {
+        v.more = new_more(3);
+    }
+    match more_group(v) {
+        3    => { return &mut @ptr_from_int(*mut VmAlloca, v.more).aty; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).aty; }
+        else => { return &mut more_full(v).aty; }
+    }
+}
+
+pub fn set_aty(v: *mut Value, x: *mut Ty) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    aty_mut(v).* = x;
+}
+
+pub fn fty_of(v: *Value) *mut Ty {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*VmCall, v.more).fty; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).fty; }
+        else => { return zero_more().fty; }
+    }
+}
+
+pub fn fty_mut(v: *mut Value) *mut *mut Ty {
+    if v.more == 0 {
+        v.more = new_more(2);
+    }
+    match more_group(v) {
+        2    => { return &mut @ptr_from_int(*mut VmCall, v.more).fty; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).fty; }
+        else => { return &mut more_full(v).fty; }
+    }
+}
+
+pub fn set_fty(v: *mut Value, x: *mut Ty) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    fty_mut(v).* = x;
+}
+
+pub fn mask_of(v: *Value) []mut i32 {
+    match more_group(v) {
+        4    => { return @ptr_from_int(*VmMask, v.more).mask; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).mask; }
+        else => { return zero_more().mask; }
+    }
+}
+
+pub fn mask_mut(v: *mut Value) *mut []mut i32 {
+    if v.more == 0 {
+        v.more = new_more(4);
+    }
+    match more_group(v) {
+        4    => { return &mut @ptr_from_int(*mut VmMask, v.more).mask; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).mask; }
+        else => { return &mut more_full(v).mask; }
+    }
+}
+
+pub fn set_mask(v: *mut Value, x: []mut i32) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    mask_mut(v).* = x;
+}
+
+pub fn ext_of(v: *Value) []mut u8 {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*VmCall, v.more).ext; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).ext; }
+        else => { return zero_more().ext; }
+    }
+}
+
+pub fn ext_mut(v: *mut Value) *mut []mut u8 {
+    if v.more == 0 {
+        v.more = new_more(2);
+    }
+    match more_group(v) {
+        2    => { return &mut @ptr_from_int(*mut VmCall, v.more).ext; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).ext; }
+        else => { return &mut more_full(v).ext; }
+    }
+}
+
+pub fn set_ext(v: *mut Value, x: []mut u8) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    ext_mut(v).* = x;
+}
+
+pub fn gv_of(v: *Value) *mut Global {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*VmConst, v.more).gv; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).gv; }
+        else => { return zero_more().gv; }
+    }
+}
+
+pub fn gv_mut(v: *mut Value) *mut *mut Global {
+    if v.more == 0 {
+        v.more = new_more(5);
+    }
+    match more_group(v) {
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).gv; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).gv; }
+        else => { return &mut more_full(v).gv; }
+    }
+}
+
+pub fn set_gv(v: *mut Value, x: *mut Global) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    gv_mut(v).* = x;
+}
+
+pub fn fnp_of(v: *Value) *mut Func {
+    match more_group(v) {
+        5    => { return @ptr_from_int(*VmConst, v.more).fnp; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).fnp; }
+        else => { return zero_more().fnp; }
+    }
+}
+
+pub fn fnp_mut(v: *mut Value) *mut *mut Func {
+    if v.more == 0 {
+        v.more = new_more(5);
+    }
+    match more_group(v) {
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).fnp; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).fnp; }
+        else => { return &mut more_full(v).fnp; }
+    }
+}
+
+pub fn set_fnp(v: *mut Value, x: *mut Func) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    fnp_mut(v).* = x;
+}
+
+pub fn name_of(v: *Value) []u8 {
+    match more_group(v) {
+        3    => { return @ptr_from_int(*VmAlloca, v.more).name; }
+        5    => { return @ptr_from_int(*VmConst, v.more).name; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).name; }
+        else => { return zero_more().name; }
+    }
+}
+
+pub fn name_mut(v: *mut Value) *mut []u8 {
+    if v.more == 0 {
+        v.more = new_more(u.pick(v.kind == V_INST, "\x03", "\x05")[0]);
+    }
+    match more_group(v) {
+        3    => { return &mut @ptr_from_int(*mut VmAlloca, v.more).name; }
+        5    => { return &mut @ptr_from_int(*mut VmConst, v.more).name; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).name; }
+        else => { return &mut more_full(v).name; }
+    }
+}
+
+pub fn set_name(v: *mut Value, x: []u8) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    name_mut(v).* = x;
+}
+
+pub fn chain_of(v: *Value) *mut Chain {
+    match more_group(v) {
+        2    => { return @ptr_from_int(*VmCall, v.more).chain; }
+        6    => { return @ptr_from_int(*ValueMore, v.more).chain; }
+        else => { return zero_more().chain; }
+    }
+}
+
+pub fn chain_mut(v: *mut Value) *mut *mut Chain {
+    if v.more == 0 {
+        v.more = new_more(2);
+    }
+    match more_group(v) {
+        2    => { return &mut @ptr_from_int(*mut VmCall, v.more).chain; }
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).chain; }
+        else => { return &mut more_full(v).chain; }
+    }
+}
+
+pub fn set_chain(v: *mut Value, x: *mut Chain) void {
+    if (v.more == 0) and (u.isnil(x)) {
+        return;
+    }
+    chain_mut(v).* = x;
 }
 
 // Native stack traces from frame tables (codegen.ax: frame_tables): the
@@ -1053,12 +1465,7 @@ fn new_val(k: ValueKind, t: *mut Ty) *mut Value {
     let mut v = vnil();
     if free_vals.len > 0 {
         v = free_vals.pop();
-        let m = v.more;  // (kept, cleared, for the new value)
         @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, v), @size_of(Value)), 0);
-        if u.notnil(m) {
-            @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, m), @size_of(ValueMore)), 0);
-            v.more = m;
-        }
     } else {
         v = u.new.[Value]();
     }
@@ -1098,9 +1505,7 @@ fn bury_value(v: *mut Value) void {
         v.grave = 0;
     }
     v.xs.deinit();
-    if u.notnil(v.more) {
-        v.more.bs.deinit();
-    }
+    release_more(v);
     if u.poisoning() {
         @mem_set(@slice_from_ptr(@ptr_cast(*mut u8, v), @size_of(Value)), 0xA5);
         return;
@@ -1404,9 +1809,9 @@ pub fn ci32(v: u64) *mut Value {
 pub fn cfp(t: *mut Ty, x: f64) *mut Value {
     let c = new_val(V_CFP, t);
     if t.bits == 32 {
-        more_mut(c).fv = @float_cast(f64, @float_cast(f32, x));
+        set_fv(c, @float_cast(f64, @float_cast(f32, x)));
     } else {
-        more_mut(c).fv = x;
+        set_fv(c, x);
     }
     return c;
 }
@@ -1487,7 +1892,7 @@ pub fn is_const(v: *Value) bool {
 // thread's copy), but not one data can hold (a relocation there is to the
 // initial image), so no constant aggregate has one.
 pub fn is_tls_addr(v: *Value) bool {
-    return (v.kind == V_GLOBAL) and more(v).gv.tls;
+    return (v.kind == V_GLOBAL) and gv_of(v).tls;
 }
 
 // An integer (or null pointer) constant.
@@ -1523,7 +1928,7 @@ pub fn is_zero(v: *Value) bool {
         return v.cv == 0;
     }
     if v.kind == V_CFP {
-        return (more(v).fv == 0.0) and (@bit_cast(u64, more(v).fv) == 0);
+        return (fv_of(v) == 0.0) and (@bit_cast(u64, fv_of(v)) == 0);
     }
     if v.kind == V_CAGG {
         for i in 0..v.xs.len {
@@ -1555,12 +1960,12 @@ pub fn add_function(m: *mut Module, name: []u8, fty: *mut Ty) *mut Func {
     for i in 0..n {
         let p = new_val(V_PARAM, fty.params[i]);
         p.cv = @as(u64, i);
-        more_mut(p).fnp = f;
+        set_fnp(p, f);
         f.params[i] = p;
     }
     f.param_ext = u.newn.[u8](n + 1)[0..n];
     let fv = new_val(V_FUNC, t_ptr());
-    more_mut(fv).fnp = f;
+    set_fnp(fv, f);
     f.val = fv;
     m.funcs.push(f);
     if not m.fmap.has(f.name) {
@@ -1572,7 +1977,7 @@ pub fn add_function(m: *mut Module, name: []u8, fty: *mut Ty) *mut Func {
 pub fn new_param(f: *mut Func, t: *mut Ty, idx: usize) *mut Value {
     let p = new_val(V_PARAM, t);
     p.cv = @as(u64, idx);
-    more_mut(p).fnp = f;
+    set_fnp(p, f);
     return p;
 }
 
@@ -1634,7 +2039,7 @@ pub fn add_global(m: *mut Module, t: *mut Ty, name: []u8) *mut Global {
     g.align = t.align;
     g.id = @int_cast(i32, m.globals.len);
     let gv = new_val(V_GLOBAL, t_ptr());
-    more_mut(gv).gv = g;
+    set_gv(gv, g);
     g.val = gv;
     m.globals.push(g);
     if not m.gmap.has(g.name) {
@@ -1735,7 +2140,7 @@ pub fn succ_count(t: *Value) usize {
         return 2;
     }
     if op == OP_SWITCH {
-        return 1 + more(t).bs.len;
+        return 1 + bs_of(t).len;
     }
     return 0;
 }
@@ -1747,7 +2152,7 @@ pub fn succ(t: *Value, i: usize) *mut Block {
     if t.op == OP_CONDBR {
         return t.t2;
     }
-    return more(t).bs.get(i - 1);
+    return bs_of(t).get(i - 1);
 }
 
 pub fn set_succ(t: *mut Value, i: usize, b: *mut Block) void {
@@ -1756,7 +2161,7 @@ pub fn set_succ(t: *mut Value, i: usize, b: *mut Block) void {
     } else if t.op == OP_CONDBR {
         t.t2 = b;
     } else {
-        more(t).bs.set(i - 1, b);
+        bs_of(t).set(i - 1, b);
     }
 }
 
@@ -2012,8 +2417,8 @@ fn use1(o: *mut Value, i: *mut Value) void {
 
 // The value phi p takes over the edge from block `from` (nil: none).
 pub fn incoming(p: *Value, from: *mut Block) *mut Value {
-    for k in 0..more(p).bs.len {
-        if more(p).bs.get(k) == from {
+    for k in 0..bs_of(p).len {
+        if bs_of(p).get(k) == from {
             return p.xs.get(k);
         }
     }
@@ -2022,17 +2427,17 @@ pub fn incoming(p: *Value, from: *mut Block) *mut Value {
 
 // Removes input k of phi p (the last input takes its place).
 pub fn remove_incoming(p: *mut Value, k: usize) void {
-    more(p).bs.set(k, more(p).bs.get(more(p).bs.len - 1));
+    bs_of(p).set(k, bs_of(p).get(bs_of(p).len - 1));
     p.xs.set(k, p.xs.get(p.xs.len - 1));
-    more_mut(p).bs.len -= 1;
+    bs_mut(p).len -= 1;
     p.xs.len -= 1;
 }
 
 // Removes phi p's inputs from block `from`.
 pub fn drop_incoming(p: *mut Value, from: *mut Block) void {
     let mut k: usize = 0;
-    while k < more(p).bs.len {
-        if more(p).bs.get(k) == from {
+    while k < bs_of(p).len {
+        if bs_of(p).get(k) == from {
             remove_incoming(p, k);
         } else {
             k += 1;
@@ -2053,9 +2458,9 @@ pub fn remove_phi_input(s: *mut Block, from: *mut Block) void {
 pub fn replace_phi_block(s: *mut Block, old: *mut Block, new: *mut Block) void {
     let mut p = s.first;
     while u.notnil(p) and (p.op == OP_PHI) {
-        for k in 0..more(p).bs.len {
-            if more(p).bs.get(k) == old {
-                more(p).bs.set(k, new);
+        for k in 0..bs_of(p).len {
+            if bs_of(p).get(k) == old {
+                bs_of(p).set(k, new);
             }
         }
         p = p.next;
@@ -2172,12 +2577,7 @@ pub fn copy_inst(f: *mut Func, v: *Value) *mut Value {
     y.flags = v.flags;
     y.src = v.src;
     y.align = v.align;
-    if u.notnil(v.more) {
-        // (its own: the copy's block list is made below)
-        let m = more_mut(y);
-        m.* = v.more.*;
-        m.bs = u.List.[*mut Block].empty();
-    }
+    copy_more(y, v);  // (with a block list of its own, filled below)
     y.a = v.a;
     y.b = v.b;
     y.c = v.c;
@@ -2186,8 +2586,8 @@ pub fn copy_inst(f: *mut Func, v: *Value) *mut Value {
     for j in 0..v.xs.len {
         y.xs.push(v.xs.get(j));
     }
-    for j in 0..more(v).bs.len {
-        more_mut(y).bs.push(more(v).bs.get(j));
+    for j in 0..bs_of(v).len {
+        bs_mut(y).push(bs_of(v).get(j));
     }
     return y;
 }
@@ -2299,7 +2699,7 @@ pub fn neg(bd: *mut Builder, x: *mut Value) *mut Value {
 
 pub fn fneg(bd: *mut Builder, x: *mut Value) *mut Value {
     if x.kind == V_CFP {
-        return cfp(x.ty, -more(x).fv);
+        return cfp(x.ty, -fv_of(x));
     }
     let v = emit(bd, OP_FNEG, x.ty);
     v.a = x;
@@ -2479,9 +2879,9 @@ pub fn inttoptr(bd: *mut Builder, x: *mut Value) *mut Value {
 
 pub fn alloca(bd: *mut Builder, t: *mut Ty, name: []u8) *mut Value {
     let v = emit(bd, OP_ALLOCA, t_ptr());
-    more_mut(v).aty = t;
+    set_aty(v, t);
     v.align = @int_cast(u32, t.align);
-    more_mut(v).name = name;
+    set_name(v, name);
     return v;
 }
 
@@ -2672,21 +3072,21 @@ pub fn shuffle(bd: *mut Builder, x: *mut Value, y: *mut Value, mask: []i32) *mut
     let v = emit(bd, OP_SHUFFLE, t_vec(x.ty.elem, @int_cast(u32, n)));
     v.a = x;
     v.b = y;
-    more_mut(v).mask = u.newn.[i32](n + 1)[0..n];
+    set_mask(v, u.newn.[i32](n + 1)[0..n]);
     for i in 0..n {
-        more(v).mask[i] = mask[i];
+        mask_of(v)[i] = mask[i];
     }
     return v;
 }
 
 pub fn call(bd: *mut Builder, fty: *mut Ty, callee: *mut Value, args: []mut *mut Value) *mut Value {
     let v = emit(bd, OP_CALL, fty.ret);
-    more_mut(v).fty = fty;
+    set_fty(v, fty);
     v.a = callee;
     for x in args {
         v.xs.push(x);
     }
-    more_mut(v).ext = u.newn.[u8](args.len + 1)[0..args.len + 1];
+    set_ext(v, u.newn.[u8](args.len + 1)[0..args.len + 1]);
     return v;
 }
 
@@ -2699,8 +3099,8 @@ pub fn direct_callee(v: *Value) *mut Func {
     if (v.op != OP_CALL) or (v.a.kind != V_FUNC) {
         return u.nil.[Func]();
     }
-    let f = more(v.a).fnp;
-    let t = more(v).fty;
+    let f = fnp_of(v.a);
+    let t = fty_of(v);
     let ft = f.ty;
     if (t.ret != ft.ret) or (t.vararg != ft.vararg) or (t.params.len != ft.params.len) {
         return u.nil.[Func]();
@@ -2738,7 +3138,7 @@ pub fn phi(bd: *mut Builder, t: *mut Ty) *mut Value {
 
 pub fn add_incoming(p: *mut Value, x: *mut Value, b: *mut Block) void {
     p.xs.push(x);
-    more_mut(p).bs.push(b);
+    bs_mut(p).push(b);
 }
 
 pub fn br(bd: *mut Builder, b: *mut Block) void {
@@ -2770,7 +3170,7 @@ pub fn switch_(bd: *mut Builder, x: *mut Value, dflt: *mut Block) *mut Value {
 
 pub fn add_case(sw: *mut Value, c: *mut Value, b: *mut Block) void {
     sw.xs.push(c);
-    more_mut(sw).bs.push(b);
+    bs_mut(sw).push(b);
 }
 
 pub fn ret(bd: *mut Builder, x: *mut Value) void {
@@ -2817,7 +3217,7 @@ pub fn val_str(v: *Value) []u8 {
         return u.dec(sval(v));
     }
     if k == V_CFP {
-        return u.ffmt("%g", more(v).fv);
+        return u.ffmt("%g", fv_of(v));
     }
     if k == V_ZERO {
         return "zero";
@@ -2826,10 +3226,10 @@ pub fn val_str(v: *Value) []u8 {
         return "undef";
     }
     if k == V_GLOBAL {
-        return u.cat2("@", more(v).gv.name);
+        return u.cat2("@", gv_of(v).name);
     }
     if k == V_FUNC {
-        return u.cat2("@", more(v).fnp.name);
+        return u.cat2("@", fnp_of(v).name);
     }
     let mut b = u.Buf.init();
     b.s("{");
@@ -2869,7 +3269,7 @@ pub fn inst_str(v: *Value) []u8 {
     b.s(ty_str(v.ty));
     if v.op == OP_ALLOCA {
         b.s(" ");
-        b.s(ty_str(more(v).aty));
+        b.s(ty_str(aty_of(v)));
     }
     let ops: [3]*mut Value = [v.a, v.b, v.c];
     for o in ops {
@@ -2881,16 +3281,16 @@ pub fn inst_str(v: *Value) []u8 {
     for i in 0..v.xs.len {
         b.s(", ");
         b.s(val_str(v.xs.get(i)));
-        if (v.op == OP_CALL) and ((i + 1) < more(v).ext.len) {
-            if more(v).ext[i + 1] == EXT_BYVAL {
+        if (v.op == OP_CALL) and ((i + 1) < ext_of(v).len) {
+            if ext_of(v)[i + 1] == EXT_BYVAL {
                 b.s(" byval");
-            } else if more(v).ext[i + 1] == EXT_SRET {
+            } else if ext_of(v)[i + 1] == EXT_SRET {
                 b.s(" sret");
             }
         }
-        if i < more(v).bs.len {
+        if i < bs_of(v).len {
             b.s(" ");
-            b.s(blk_str(more(v).bs.get(i)));
+            b.s(blk_str(bs_of(v).get(i)));
         }
     }
     if u.notnil(v.t1) {
@@ -2901,13 +3301,13 @@ pub fn inst_str(v: *Value) []u8 {
         b.s(", ");
         b.s(blk_str(v.t2));
     }
-    if more(v).mask.len > 0 {
+    if mask_of(v).len > 0 {
         b.s(" [");
-        for i in 0..more(v).mask.len {
+        for i in 0..mask_of(v).len {
             if i != 0 {
                 b.s(",");
             }
-            b.s(u.idec(more(v).mask[i]));
+            b.s(u.idec(mask_of(v)[i]));
         }
         b.s("]");
     }
@@ -3023,8 +3423,8 @@ pub fn remove_unreachable(f: *mut Func) void {
         let mut i = b.first;
         while u.notnil(i) and (i.op == OP_PHI) {
             let mut k: usize = 0;
-            while k < more(i).bs.len {
-                if more(i).bs.get(k).aux == 0 {
+            while k < bs_of(i).len {
+                if bs_of(i).get(k).aux == 0 {
                     remove_incoming(i, k);
                 } else {
                     k += 1;

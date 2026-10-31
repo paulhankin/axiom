@@ -342,7 +342,7 @@ fn reg(v: *mut ir.Value) i32 {
         return vreg(v);
     }
     let t = v.ty;
-    if (k == ir.V_GLOBAL) and not ir.more(v).gv.tls and (gaddr_blk == CB) {
+    if (k == ir.V_GLOBAL) and not ir.gv_of(v).tls and (gaddr_blk == CB) {
         for q in 0..gaddr.len {
             if gaddr.get(q).g == v {
                 return gaddr.get(q).r;  // (built earlier in the block)
@@ -351,7 +351,7 @@ fn reg(v: *mut ir.Value) i32 {
     }
     if k == ir.V_GLOBAL {
         let r = vgpr();
-        let g = ir.more(v).gv;
+        let g = ir.gv_of(v);
         if not g.tls {
             if gaddr_blk != CB {
                 gaddr.clear();
@@ -370,7 +370,7 @@ fn reg(v: *mut ir.Value) i32 {
     }
     if k == ir.V_FUNC {
         let r = vgpr();
-        let f = ir.more(v).fnp;
+        let f = ir.fnp_of(v);
         if ir.is_decl(f) {
             _ = e2(GOT, 8, W(r), mc.symop(func_sym(f), 0));
         } else {
@@ -491,8 +491,8 @@ fn addr(p: *mut ir.Value) mc.MOp {
             return mc.mem(b, reg(off), 1, 0);
         }
     }
-    if (p.kind == ir.V_GLOBAL) and not ir.more(p).gv.tls and not is.extern_global(ir.more(p).gv) {
-        return mem_sym(global_sym(ir.more(p).gv), 0, galign.get(@int_cast(usize, ir.more(p).gv.id)));
+    if (p.kind == ir.V_GLOBAL) and not ir.gv_of(p).tls and not is.extern_global(ir.gv_of(p)) {
+        return mem_sym(global_sym(ir.gv_of(p)), 0, galign.get(@int_cast(usize, ir.gv_of(p).id)));
     }
     return mc.mem(reg(p), -1, 0, 0);
 }
@@ -1511,14 +1511,14 @@ fn stack_arg_size(t: *ir.Ty) u64 {
 }
 
 fn gen_call(v: *mut ir.Value) void {
-    let fty_ = ir.more(v).fty;
+    let fty_ = ir.fty_of(v);
     let n = v.xs.len;
     let regs = u.newn.[i32](n + 1);
     for i in 0..n {
         let x = v.xs.get(i);
         let mut e: u8 = 0;
-        if (i + 1) < ir.more(v).ext.len {
-            e = ir.more(v).ext[i + 1];
+        if (i + 1) < ir.ext_of(v).len {
+            e = ir.ext_of(v)[i + 1];
         }
         let mut r = reg(x);
         if (e != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
@@ -1593,7 +1593,7 @@ fn gen_call(v: *mut ir.Value) void {
     if target >= 0 {
         ops.push(R(target));
     } else {
-        ops.push(mc.symop(func_sym(ir.more(v.a).fnp), 0));
+        ops.push(mc.symop(func_sym(ir.fnp_of(v.a)), 0));
     }
     for k in 0..uses.len {
         ops.push(uses.get(k));
@@ -1610,7 +1610,7 @@ fn gen_call(v: *mut ir.Value) void {
     let ci = emit(CALL, 0, ops.items());
     ci.aux = ft.call_aux(v);  // (frame tables)
     ci.clobber = caller_saved();
-    if (v.a.kind == ir.V_FUNC) and ir.more(v.a).fnp.noreturn {
+    if (v.a.kind == ir.V_FUNC) and ir.fnp_of(v.a).noreturn {
         ci.clobber = 0;  // nothing is live after it
     }
     MF.has_calls = true;
@@ -2396,7 +2396,7 @@ fn perm_lane(op: u64, i: i32, n: i32) i32 {
 // UZP1, ZIP2, TRN1 ... or EXT; or 0 (TBL).
 fn permute_word(v: *mut ir.Value) u64 {
     let t = v.ty;
-    let n = @truncate(i32, @as(u64, ir.more(v).mask.len));
+    let n = @truncate(i32, @as(u64, ir.mask_of(v).len));
     if (t.kind != ir.T_VEC) or ((t.lanes * is.lane_bits(t)) != 128) or (v.a.ty.lanes != t.lanes) or (n != t.lanes) {
         return 0;
     }
@@ -2406,7 +2406,7 @@ fn permute_word(v: *mut ir.Value) u64 {
         let op = ops[c];
         let mut ok = true;
         for i in @as(i32, 0)..n {
-            let m = ir.more(v).mask[@as(usize, @bit_cast(u32, i))];
+            let m = ir.mask_of(v)[@as(usize, @bit_cast(u32, i))];
             let e = perm_lane(op, i, n);
             if (m >= 0) and (m != e) and not (same and ((m % n) == (e % n))) {
                 ok = false;
@@ -2420,7 +2420,7 @@ fn permute_word(v: *mut ir.Value) u64 {
     // EXT: lanes k, k + 1, ... of a, then b (k from the first lane given)
     let mut k: i32 = -1;
     for i in @as(i32, 0)..n {
-        let m = ir.more(v).mask[@as(usize, @bit_cast(u32, i))];
+        let m = ir.mask_of(v)[@as(usize, @bit_cast(u32, i))];
         if m < 0 {
             continue;
         }
@@ -2455,13 +2455,13 @@ fn gen_shuffle(v: *mut ir.Value) void {
         return;
     }
     let lb = @int_cast(u64, is.lane_bits(t) / 8);
-    let n = @as(u64, ir.more(v).mask.len);
+    let n = @as(u64, ir.mask_of(v).len);
     // bytes from a and from b (out of range: zero), or'ed
     let mut ma: [16]u8 = [0xff; 16];
     let mut mb: [16]u8 = [0xff; 16];
     let mut any_b = false;
-    for i in 0..ir.more(v).mask.len {
-        let m = @as(u64, @bit_cast(u32, ir.more(v).mask[i]));
+    for i in 0..ir.mask_of(v).len {
+        let m = @as(u64, @bit_cast(u32, ir.mask_of(v)[i]));
         for k in @as(u64, 0)..lb {
             let dst = @truncate(usize, (@as(u64, i) * lb) + k);
             if m < n {
@@ -2697,7 +2697,7 @@ fn gen_ptradd(v: *mut ir.Value) void {
 }
 
 fn is_tls_global(v: *ir.Value) bool {
-    return (v.kind == ir.V_GLOBAL) and ir.more(v).gv.tls;
+    return (v.kind == ir.V_GLOBAL) and ir.gv_of(v).tls;
 }
 
 // Constants that take instructions to build (worth building once per loop).
@@ -2914,7 +2914,7 @@ fn gen_term(b: *mut ir.Block) void {
                 movi(cr, cv, sf);
                 cmp_reg(sf, tr, cr);
             }
-            bcc(EQ, is.blk(ir.more(t).bs.get(k)));
+            bcc(EQ, is.blk(ir.bs_of(t).get(k)));
         }
         if not is.next_block_is(b, t.t1) {
             jmp(is.blk(t.t1));
@@ -3200,14 +3200,14 @@ fn compile_func(f: *mut ir.Func) void {
         let mut i = b.first;
         while u.notnil(i) {
             if i.op == ir.OP_ALLOCA {
-                let mut al = ir.more(i).aty.align;
+                let mut al = ir.aty_of(i).align;
                 if @as(u64, i.align) > al {
                     al = @as(u64, i.align);
                 }
                 if al == 0 {
                     al = 1;
                 }
-                i.aux = @int_cast(i64, mc.new_slot(MF, ir.more(i).aty.size, al));
+                i.aux = @int_cast(i64, mc.new_slot(MF, ir.aty_of(i).size, al));
             }
             i = i.next;
         }
