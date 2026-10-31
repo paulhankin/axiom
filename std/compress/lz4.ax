@@ -46,6 +46,12 @@ fn put32(out: *mut strs.String, v: u32) Lz4Error!void {
 /// what out already holds (as linked blocks do). Fails with TooLarge if
 /// out would grow past max_size bytes.
 pub fn decompress_block(src: []u8, out: *mut strs.String, max_size: usize) Lz4Error!void {
+    return decode_block(src, out, 0, max_size);
+}
+
+// decompress_block, with matches reaching back no further than out[base..]
+// (a frame's linked blocks: not into the frames before it).
+fn decode_block(src: []u8, out: *mut strs.String, base: usize, max_size: usize) Lz4Error!void {
     let mut i: usize = 0;
     loop {
         if i >= src.len {
@@ -88,7 +94,7 @@ pub fn decompress_block(src: []u8, out: *mut strs.String, max_size: usize) Lz4Er
         }
         let off = @as(usize, src[i]) | (@as(usize, src[i + 1]) << 8);
         i += 2;
-        if (off == 0) or (off > out.len) {
+        if (off == 0) or (off > (out.len - base)) {
             return error.Corrupt;
         }
         let mut ml = @as(usize, token & 15) + MIN_MATCH;
@@ -399,7 +405,7 @@ fn frame(data: []u8, at: usize, out: *mut strs.String, max_size: usize) Lz4Error
         } else if linked {
             // matches may reach into earlier blocks of the frame
             let before = out.len;
-            decompress_block(b, out, @min(max_size, before + max_block))!;
+            decode_block(b, out, start, @min(max_size, before + max_block))!;
             if (out.len - before) > max_block {
                 return error.Corrupt;
             }
@@ -643,6 +649,17 @@ test "damaged input" {
     @expect(fails_block("\x00\x05\x00", &mut out));      // offset 5 into nothing
     @expect(fails_block("\xf0\xff\xff\xff", &mut out));  // literals past the end
     @expect(fails_block("\x1fa\x01\x00\xff\xff\xff\xff\xff\xff\xff\xff", &mut out));  // a huge match
+    // a linked block's match reaching into the frame before
+    let f1 = compress("hello world", Options.default())!;
+    defer mem.free(f1);
+    let mut two = strs.String.from(f1)!;
+    defer two.deinit();
+    // (FLG: version 1, linked; BD: 64 KB blocks; the header checksum; a
+    // block of 4 bytes: a match of 4 at offset 6, then the literal X)
+    two.push_str("\x04\x22\x4d\x18\x40\x40")!;
+    two.push(@truncate(u8, xxhash.xxh32("\x40\x40", 0) >> 8))!;
+    two.push_str("\x05\x00\x00\x00\x00\x06\x00\x10X\x00\x00\x00\x00")!;
+    @expect(fails(decompress(two.bytes(), 1000)));
 }
 
 fn fails_block(b: []u8, out: *mut strs.String) bool {

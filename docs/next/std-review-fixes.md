@@ -27,3 +27,10 @@
   (`? key`), which the parser accepts, and quotes strings with U+FEFF or C1 controls,
   so they read back as written.
 - TOML numbers of any length parse; those over 128 characters were refused.
+- `xz.decompress_lzma` fails with `Corrupt` on a `.lzma` stream that ends before the
+  size its header gives, and reads streams of unknown size with a limit of
+  `@max_value(usize)` (which it refused).
+- `lz4.decompress` refuses a linked block whose match reaches into the frame before
+  its own.
+- `snappy.decompress_raw` refuses a declared length its input cannot hold before
+  allocating it.
