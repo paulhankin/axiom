@@ -1203,7 +1203,7 @@ __attribute__((weak)) void ax_on_trap(const struct ax_trap_site *site, const str
     static char buf[16384];
     char msg[1024];
     ax_format_trap(msg, sizeof msg, site, info);
-    int n = snprintf(buf, sizeof buf, "axiom: %s at %s:%u:%u\n", msg, site->file, site->line, site->col);
+    int n = snprintf(buf, sizeof buf, "axiom: %s at %s:%u:%u\n", msg, ax_site_file(site), site->line, site->col);
     if (n < 0 || (size_t)n >= sizeof buf) n = 0;
     n += (int)ax_format_stack(buf + n, sizeof buf - (size_t)n, site, ss);
     (void)!write(2, buf, (size_t)n);

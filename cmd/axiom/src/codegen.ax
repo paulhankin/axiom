@@ -748,9 +748,58 @@ fn cur_fn_display() []u8 {
     return "";
 }
 
+// The unit's site strings: each string of its site records once, NUL
+// terminated, in one global (.site_strs: offset 0 is ""), made when the unit
+// is done (end_site_strs).
+let mut site_strs_g: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut site_strs: u.Buf = u.Buf.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
+let mut site_str_offs: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+
+// s's offset in the unit's site strings.
+fn site_str(s: []u8) u32 {
+    if u.isnil(site_strs_g) {
+        // (its type and contents are set when the unit is done)
+        site_strs_g = ir.add_global(M, ir.t_array(T_i8, 1), ".site_strs").val;
+        set_linkage(site_strs_g, ir.LINK_INTERNAL);
+        ir.gv_of(site_strs_g).is_const = true;
+        set_align(site_strs_g, 1);
+        site_strs = u.Buf.init();
+        site_strs.c(0);
+        site_str_offs = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    }
+    if s.len == 0 {
+        return 0;
+    }
+    let k = u.intern(s);
+    let at = site_str_offs.get(k);
+    if at != 0 {
+        return at - 1;
+    }
+    let off = @truncate(u32, site_strs.len());
+    site_strs.s(s);
+    site_strs.c(0);
+    site_str_offs.put(k, off + 1);
+    return off;
+}
+
+// The unit's site strings, now that all its site records are made.
+fn end_site_strs() void {
+    if u.isnil(site_strs_g) {
+        return;
+    }
+    let bytes = site_strs.view();
+    let g = ir.gv_of(site_strs_g);
+    g.ty = ir.t_array(T_i8, @as(u64, bytes.len));
+    set_init(site_strs_g, ir.cstring(bytes[0..bytes.len - 1]));  // (cstring adds the last NUL)
+    site_strs_g = u.nil.[ir.Value]();
+}
+
 // A constant site record {code, file id, start, end, line, col, file, text,
-// fn, callee}. `fn` is the enclosing function; `callee` is set for call sites.
-// Codes: a trap code, SITE_CALL for a call, SITE_ERR_RETURN for an error return.
+// fn, callee, strs}: the strings at those offsets in strs, the unit's site
+// strings (spec §16.4; std/internal/runtime/trap_format.ax: Site). `fn` is
+// the enclosing function; `callee` is set for call sites. Codes: a trap code,
+// SITE_CALL for a call, SITE_ERR_RETURN for an error return.
 fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
     let fname = cur_fn_display();
     let mut callee = callee0;
@@ -764,7 +813,7 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
         return found;
     }
     if u.isnil(site_ty) {
-        let mut el: [10]*mut ir.Ty = [T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr, T_ptr, T_ptr];
+        let mut el: [11]*mut ir.Ty = [T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr];
         site_ty = ir.t_struct(el[..]);
     }
     let mut lc = u.LineCol.{ sl: 0, sc: 0, el: 0, ec: 0 };
@@ -789,19 +838,20 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
                 break;
             }
         }
-        text = u.dup(f.text[@as(usize, sp.start)..@as(usize, sp.start + n)]);
+        text = f.text[@as(usize, sp.start)..@as(usize, sp.start + n)];
     }
-    let mut vals: [10]*mut ir.Value = [
+    let mut vals: [11]*mut ir.Value = [
         ci32(@as(u64, @bit_cast(u32, code))),
         ci32(@as(u64, file_key(sp.file))),
         ci32(@as(u64, sp.start)),
         ci32(@as(u64, sp.end)),
         ci32(@as(u64, @bit_cast(u32, lc.sl))),
         ci32(@as(u64, @bit_cast(u32, lc.sc))),
-        string_ptr(cstr_prefix(file)),
-        string_ptr(cstr_prefix(text)),
-        string_ptr(cstr_prefix(fname)),
-        string_ptr(cstr_prefix(callee)),
+        ci32(@as(u64, site_str(cstr_prefix(file)))),
+        ci32(@as(u64, site_str(cstr_prefix(text)))),
+        ci32(@as(u64, site_str(cstr_prefix(fname)))),
+        ci32(@as(u64, site_str(cstr_prefix(callee)))),
+        site_strs_g,
     ];
     let g = ir.add_global(M, site_ty, ".site").val;
     set_init(g, ir.cstruct(vals[..]));
@@ -5519,6 +5569,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         return false;
     }
 
+    end_site_strs();
     u.phase("IR");
     if g_link_libs.len != 0 {
         be.g_parts = false;  // (linked by the system's linker: main.ax)

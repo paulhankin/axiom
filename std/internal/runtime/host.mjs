@@ -61,7 +61,8 @@ export function describeTrap(instance, memory, err) {
 }
 
 // Site records (see codegen: site_record_ex):
-//   {u32 code, file_id, start, end, line, col; ptr file, text, fn, callee}
+//   {u32 code, file_id, start, end, line, col; u32 file, text, fn, callee; ptr strs}
+// the strings NUL-terminated in the unit's string table strs, at those offsets
 function reader(instance, memory) {
   const wide = !!(instance && instance.exports.axiom_wasm64);
   const P = wide ? 8 : 4;
@@ -83,8 +84,10 @@ export function readSite(instance, memory, addr) {
     code: dv.getUint32(addr, true), fileId: dv.getUint32(addr + 4, true),
     start: dv.getUint32(addr + 8, true), end: dv.getUint32(addr + 12, true),
     line: dv.getUint32(addr + 16, true), col: dv.getUint32(addr + 20, true),
-    file: cstr(ptr(addr + 24)), text: cstr(ptr(addr + 24 + P)),
-    fn: cstr(ptr(addr + 24 + 2 * P)), callee: cstr(ptr(addr + 24 + 3 * P)),
+    ...((strs) => ({
+      file: cstr(strs + dv.getUint32(addr + 24, true)), text: cstr(strs + dv.getUint32(addr + 28, true)),
+      fn: cstr(strs + dv.getUint32(addr + 32, true)), callee: cstr(strs + dv.getUint32(addr + 36, true)),
+    }))(ptr(addr + 40)),
   };
 }
 

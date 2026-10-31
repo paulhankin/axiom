@@ -493,11 +493,57 @@ static LLVMValueRef site_record_ex(int code, Span sp, const char *callee) {
     return g;
 }
 
+// The unit's site strings: each string of its site records once, NUL
+// terminated, in one global (.site_strs: offset 0 is ""), made when the
+// unit's code is done (end_site_strs; again for the call-site records the
+// frame tables make after optimization); until then its uses refer to a
+// stand-in.
+static LLVMValueRef site_strs_g;
+static CharVec site_strs;
+static SymMap site_str_offs;  // string -> offset + 1
+
+static uint32_t site_str(const char *s) {
+    if (!site_strs_g) {
+        site_strs_g = LLVMAddGlobal(mod, LLVMArrayType2(T_i8, 1), ".site_strs.0");
+        vec_push(site_strs, 0);
+    }
+    size_t n = strlen(s);
+    if (!n) return 0;
+    Sym k = intern(s, (uint32_t)n);
+    void *at = symmap_get(&site_str_offs, k);
+    if (at) return (uint32_t)((uintptr_t)at - 1);
+    uint32_t off = (uint32_t)site_strs.len;
+    for (size_t i = 0; i < n; i++) vec_push(site_strs, s[i]);
+    vec_push(site_strs, 0);
+    symmap_put(&site_str_offs, k, (void *)(uintptr_t)(off + 1));
+    return off;
+}
+
+// The unit's site strings, now that all its site records are made.
+static void end_site_strs(void) {
+    if (!site_strs_g) return;
+    LLVMValueRef init = LLVMConstStringInContext(ctx, site_strs.data, (unsigned)site_strs.len, true);
+    LLVMValueRef g = LLVMAddGlobal(mod, LLVMTypeOf(init), ".site_strs");
+    LLVMSetInitializer(g, init);
+    LLVMSetLinkage(g, LLVMPrivateLinkage);
+    LLVMSetGlobalConstant(g, true);
+    LLVMSetAlignment(g, 1);
+    LLVMReplaceAllUsesWith(site_strs_g, g);
+    LLVMDeleteGlobal(site_strs_g);
+    // (records made after this, the frame tables', get strings of their own)
+    site_strs_g = NULL;
+    site_strs.len = 0;
+    site_str_offs = (SymMap){0};
+}
+
+// A constant site record {code, file id, start, end, line, col, file, text,
+// fn, callee, strs}: the strings at those offsets in strs, the unit's site
+// strings (spec §16.4; std/internal/runtime/trap_format.h).
 static LLVMValueRef make_site_record(int code, Span sp, const char *fn, const char *callee) {
     LLVMValueRef g;
     if (!site_ty) {
-        LLVMTypeRef el[10] = {T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr, T_ptr, T_ptr, T_ptr};
-        site_ty = LLVMStructTypeInContext(ctx, el, 10, false);
+        LLVMTypeRef el[11] = {T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_i32, T_ptr};
+        site_ty = LLVMStructTypeInContext(ctx, el, 11, false);
     }
     int sl = 0, sc = 0, el_ = 0, ec = 0;
     const char *file = "";
@@ -517,15 +563,17 @@ static LLVMValueRef make_site_record(int code, Span sp, const char *fn, const ch
             }
         text = arena_strndup(f->text + sp.start, n);
     }
-    LLVMValueRef vals[10] = {
-        LLVMConstInt(T_i32, (unsigned)code, false), LLVMConstInt(T_i32, file_key(sp.file), false),
-        LLVMConstInt(T_i32, sp.start, false),       LLVMConstInt(T_i32, sp.end, false),
-        LLVMConstInt(T_i32, (unsigned)sl, false),   LLVMConstInt(T_i32, (unsigned)sc, false),
-        string_ptr(file, (uint32_t)strlen(file)),   string_ptr(text, (uint32_t)strlen(text)),
-        string_ptr(fn, (uint32_t)strlen(fn)),       string_ptr(callee, (uint32_t)strlen(callee)),
+    LLVMValueRef vals[11] = {
+        LLVMConstInt(T_i32, (unsigned)code, false),   LLVMConstInt(T_i32, file_key(sp.file), false),
+        LLVMConstInt(T_i32, sp.start, false),         LLVMConstInt(T_i32, sp.end, false),
+        LLVMConstInt(T_i32, (unsigned)sl, false),     LLVMConstInt(T_i32, (unsigned)sc, false),
+        LLVMConstInt(T_i32, site_str(file), false),   LLVMConstInt(T_i32, site_str(text), false),
+        LLVMConstInt(T_i32, site_str(fn), false),     LLVMConstInt(T_i32, site_str(callee), false),
+        NULL,
     };
+    vals[10] = site_strs_g;
     g = LLVMAddGlobal(mod, site_ty, ".site");
-    LLVMSetInitializer(g, LLVMConstStructInContext(ctx, vals, 10, false));
+    LLVMSetInitializer(g, LLVMConstStructInContext(ctx, vals, 11, false));
     LLVMSetLinkage(g, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(g, true);
     LLVMSetAlignment(g, 8);
@@ -5357,6 +5405,7 @@ bool codegen_program(CgOptions *o) {
             if (LLVMCountBasicBlocks(fn)) add_str_fn_attr(fn, "probe-stack", "inline-asm");
     }
 
+    end_site_strs();
     char *err = NULL;
     if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &err)) {
         fprintf(stderr, "axiom: internal compiler error: invalid LLVM IR generated:\n%s\n", err);
@@ -5387,6 +5436,7 @@ bool codegen_program(CgOptions *o) {
     // made now get their own)
     string_globals = (SymMap){0};
     frame_tables_emit();
+    end_site_strs();
     if (DIB && !O->debug_info) LLVMStripModuleDebugInfo(mod);
     if (O->emit == EMIT_LLVM) {
         if (LLVMPrintModuleToFile(mod, O->out_path, &err)) {

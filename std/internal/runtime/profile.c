@@ -79,7 +79,7 @@ static size_t sample_len(size_t at) {
 }
 
 static void put_site(FILE *f, const struct ax_trap_site *s) {
-    fprintf(f, "\t%u\x1f%u\x1f%u\x1f%s", s->file_id, s->start, s->end, s->fn);
+    fprintf(f, "\t%u\x1f%u\x1f%u\x1f%s", s->file_id, s->start, s->end, ax_site_fn(s));
 }
 
 static void write_profile(void) {
@@ -125,7 +125,7 @@ static void write_profile(void) {
         const uintptr_t *s = buf + tab[i].at;
         size_t n = sample_len(tab[i].at) - 2;
         const struct ax_trap_site *inner = n ? (const struct ax_trap_site *)s[2] : NULL;
-        const char *leaf = inner ? (inner->callee[0] ? inner->callee : "<indirect call>")
+        const char *leaf = inner ? (ax_site_callee(inner)[0] ? ax_site_callee(inner) : "<indirect call>")
                            : s[0] & THREAD_BIT ? "<thread entry>" : "main";
         fprintf(f, "S\t%lu\t%lu\t%s", tab[i].count, (unsigned long)(s[0] & ~THREAD_BIT), leaf);
         for (size_t k = 0; k < n; k++) put_site(f, (const struct ax_trap_site *)s[2 + k]);

@@ -9,11 +9,19 @@
 #include <string.h>
 
 // A site record: a trap site, a call site (code 255) or an error return
-// (code 254). `fn` is the enclosing function, `callee` the called one.
+// (code 254). Its strings are NUL-terminated, in its compilation unit's
+// string table `strs`, at the offsets *_off (ax_site_file, ...): the source
+// file, the code at the site, the enclosing function, the called one.
 struct ax_trap_site {
     uint32_t code, file_id, start, end, line, col;
-    const char *file, *text, *fn, *callee;
+    uint32_t file_off, text_off, fn_off, callee_off;
+    const char *strs;
 };
+
+#define ax_site_file(s) ((s)->strs + (s)->file_off)
+#define ax_site_text(s) ((s)->strs + (s)->text_off)
+#define ax_site_fn(s) ((s)->strs + (s)->fn_off)
+#define ax_site_callee(s) ((s)->strs + (s)->callee_off)
 
 // A thread's shadow stack (spec §16.4); see codegen: ss_ptr.
 #define AX_SS_CAP 256
@@ -56,11 +64,11 @@ static inline void ax_format_trap(char *out, size_t cap, const struct ax_trap_si
         char a[256], b[256];
         ax_format_value(a, sizeof a, info->kind, info->a, info->alen);
         ax_format_value(b, sizeof b, info->kind, info->b, info->blen);
-        snprintf(out, cap, "expected equal values, left: %s, right: %s: %s", a, b, s->text);
+        snprintf(out, cap, "expected equal values, left: %s, right: %s: %s", a, b, ax_site_text(s));
     } else if (s->code == 11) {
-        snprintf(out, cap, "expectation failed: %s", s->text);
+        snprintf(out, cap, "expectation failed: %s", ax_site_text(s));
     } else {
-        snprintf(out, cap, "trap T%04u (%s): %s", s->code, name, s->text);
+        snprintf(out, cap, "trap T%04u (%s): %s", s->code, name, ax_site_text(s));
     }
 }
 
@@ -79,10 +87,10 @@ static inline size_t ax_format_stack(char *out, size_t cap, const struct ax_trap
     uint32_t depth = ss ? ss->depth : 0;
     if (!top && !depth) return 0;
     AX_PUT("stack trace (innermost first):\n");
-    if (top) AX_PUT("  at %s (%s:%u:%u)\n", top->fn, top->file, top->line, top->col);
+    if (top) AX_PUT("  at %s (%s:%u:%u)\n", ax_site_fn(top), ax_site_file(top), top->line, top->col);
     else {
         const struct ax_trap_site *c = ss->calls[(depth - 1) & (AX_SS_CAP - 1)];
-        AX_PUT("  at %s\n", c && c->callee[0] ? c->callee : "<indirect call>");
+        AX_PUT("  at %s\n", c && ax_site_callee(c)[0] ? ax_site_callee(c) : "<indirect call>");
     }
     int shown = 0;
     for (int64_t i = (int64_t)depth - 1; i >= 0 && i >= (int64_t)depth - AX_SS_CAP; i--) {
@@ -94,7 +102,7 @@ static inline size_t ax_format_stack(char *out, size_t cap, const struct ax_trap
         }
         int64_t j = i;
         while (j - 1 >= 0 && j - 1 >= (int64_t)depth - AX_SS_CAP && ss->calls[(j - 1) & (AX_SS_CAP - 1)] == c) j--;
-        AX_PUT("  at %s (%s:%u:%u)\n", c->fn, c->file, c->line, c->col);
+        AX_PUT("  at %s (%s:%u:%u)\n", ax_site_fn(c), ax_site_file(c), c->line, c->col);
         shown++;
         if (j < i) {
             AX_PUT("  ... the frame above repeats %lld more time%s\n", (long long)(i - j), i - j == 1 ? "" : "s");
@@ -113,7 +121,7 @@ static inline size_t ax_format_error_trace(char *out, size_t cap, const struct a
     uint32_t first = ss->errors > AX_ET_CAP ? ss->errors - AX_ET_CAP : 0;
     for (uint32_t i = first; i < ss->errors; i++) {
         const struct ax_trap_site *e = ss->error_returns[i & (AX_ET_CAP - 1)];
-        if (e) AX_PUT("  %s:%u:%u in %s: %s\n", e->file, e->line, e->col, e->fn, e->text);
+        if (e) AX_PUT("  %s:%u:%u in %s: %s\n", ax_site_file(e), e->line, e->col, ax_site_fn(e), ax_site_text(e));
     }
 #undef AX_PUT
     return n;

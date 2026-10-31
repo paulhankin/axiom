@@ -33,7 +33,7 @@ void ax_stack_walk_signal(void *ucontext);  // std/internal/runtime/native_host.
 // kind (T trap site, C call, E error return, R repeat, O omitted), file id,
 // start, end, function.
 static size_t put_frame(char *out, size_t cap, char kind, const struct ax_trap_site *s, long count) {
-    int k = s ? snprintf(out, cap, "%c\x1f%u\x1f%u\x1f%u\x1f%s\x1e", kind, s->file_id, s->start, s->end, s->fn)
+    int k = s ? snprintf(out, cap, "%c\x1f%u\x1f%u\x1f%u\x1f%s\x1e", kind, s->file_id, s->start, s->end, ax_site_fn(s))
               : snprintf(out, cap, "%c\x1f%ld\x1f" "0\x1f" "0\x1f\x1e", kind, count);
     return k > 0 && (size_t)k < cap ? (size_t)k : 0;
 }
