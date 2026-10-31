@@ -19,7 +19,8 @@
 //   emphasis, strong (the family's italic, bold and bold italic faces),
 //   strikethrough, code spans (monospaced on a tint), hard and soft breaks
 // - links: coloured, underlined and clickable (URI annotations; "#..."
-//   links within the document are left as text)
+//   links within the document, and links other than http:, https:, mailto:
+//   and relative ones, are left as text)
 // - headings 1 to 6, kept with what follows, in the PDF's outline
 //   (bookmarks) unless Options.bookmarks is off; the first one is the
 //   document's title unless Options.title gives one
@@ -1316,7 +1317,7 @@ struct R {
                 }
                 if m.link != NONE {
                     let url = self.md.url(m.link);
-                    if (url.len > 0) and (url[0] != '#') {
+                    if (url.len > 0) and (url[0] != '#') and safe_link(url) {
                         self.page.link(x + gx0, (oy + ln.baseline) - ln.ascent, gx1 - gx0, ln.ascent + ln.descent,
                                        url)!;
                     }
@@ -1659,6 +1660,48 @@ fn page_count(bytes: []u8) !usize {
     let mut r = read.Reader.open(bytes)!;
     defer r.deinit();
     return r.page_count();
+}
+
+/// Whether a link's destination may become a URI annotation: an http:,
+/// https: or mailto: URL, or a relative reference (no ":" before the first
+/// "/", "?" or "#"). Anything else (javascript:, file:, ...) stays text.
+fn safe_link(url: []u8) bool {
+    let mut i: usize = 0;
+    while i < url.len {
+        let c = url[i];
+        if (c == '/') or (c == '?') or (c == '#') {
+            return true;
+        }
+        if c == ':' {
+            let scheme = url[..i];
+            return strs.eq_ignore_case(scheme, "http") or strs.eq_ignore_case(scheme, "https") or
+                   strs.eq_ignore_case(scheme, "mailto");
+        }
+        i += 1;
+    }
+    return true;
+}
+
+test "only safe links become annotations" {
+    @expect(safe_link("https://example.org/x"));
+    @expect(safe_link("HTTP://example.org"));
+    @expect(safe_link("mailto:a@example.org"));
+    @expect(safe_link("docs/a.html"));
+    @expect(safe_link("a.html?x=y:z"));
+    @expect(not safe_link("javascript:app.alert(1)"));
+    @expect(not safe_link("JavaScript:x"));
+    @expect(not safe_link("java\tscript:x"));
+    @expect(not safe_link(" javascript:x"));
+    @expect(not safe_link("file://host/x.exe"));
+    @expect(not safe_link("data:text/html,x"));
+    let mut set = FontSet.find() catch return;
+    defer set.deinit();
+    let o = Options.init(set.fonts());
+    let bytes = to_pdf("[c](javascript:app.alert(1)) [f](file://host/x.exe) [ok](https://example.org/y)\n", o)!;
+    defer mem.free(bytes);
+    @expect(not strs.contains(bytes, "/URI (javascript:"));
+    @expect(not strs.contains(bytes, "/URI (file:"));
+    @expect(strs.contains(bytes, "/URI (https://example.org/y)"));
 }
 
 test "paths for images stay in their directory" {

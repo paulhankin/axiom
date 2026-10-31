@@ -21,7 +21,7 @@ import "../fmt.ax" as fmt;
 import "../io.ax" as io;
 import "../str.ax" as strs;
 
-pub error IniError { SyntaxError, NotFound, WrongType, OutOfMemory, IoError, Empty, Done, InvalidUtf8 }
+pub error IniError { SyntaxError, NotFound, WrongType, OutOfMemory, IoError, Empty, Done, InvalidUtf8, InvalidArgument }
 
 pub struct Entry {
     key: []u8,
@@ -207,7 +207,22 @@ fn finish(doc: *mut Document, entries: *mut vec.Vec.[Entry], key: []u8, v: []u8)
     entries.push(Entry.{ key: key, value: doc.arena.dup(unquote(v))! })!;
 }
 
-/// Writes INI text: call section() and entry() in order.
+/// Whether parse reads key back as written: not empty, no line breaks, no
+/// = or :, no spaces at either end, and not starting like a comment or a
+/// section header.
+fn key_ok(key: []u8) bool {
+    return (key.len > 0) and (strs.trim(key).len == key.len) and (key[0] != '[') and (key[0] != ';') and
+           (key[0] != '#') and not has_any(key, "=:\n\r");
+}
+
+fn has_any(s: []u8, set: []u8) bool {
+    _ = strs.index_of_any(s, set) catch return false;
+    return true;
+}
+
+/// Writes INI text: call section() and entry() in order. Names and values
+/// that parse would not read back as written are refused with
+/// InvalidArgument.
 pub struct Writer {
     out: io.Writer,
     started: bool,
@@ -216,7 +231,12 @@ pub struct Writer {
         return Writer.{ out: out, started: false };
     }
 
+    /// [name]; InvalidArgument for a name with a line break or ], or with
+    /// spaces at either end.
     pub fn section(self: *mut Writer, name: []u8) !void {
+        if (strs.trim(name).len != name.len) or has_any(name, "]\n\r") {
+            return error.InvalidArgument;
+        }
         if self.started {
             self.out.write_all("\n")!;
         }
@@ -227,11 +247,39 @@ pub struct Writer {
     }
 
     /// key = value; a value with line breaks is written as continuation
-    /// lines, and one with spaces at either end is quoted.
+    /// lines, and one with spaces at either end, or starting with a quote,
+    /// is quoted. InvalidArgument for a key that would not read back (empty,
+    /// with =, :, a line break or spaces at either end, or starting with [,
+    /// ; or #), and for a value with a line that would not: an empty line or
+    /// one starting with ; or # after the first, or spaces at either end of
+    /// a line other than the value's own ends.
     pub fn entry(self: *mut Writer, key: []u8, value: []u8) !void {
+        if not key_ok(key) {
+            return error.InvalidArgument;
+        }
+        let pad = (value.len > 0) and
+                  (strs.is_space(value[0]) or strs.is_space(value[value.len - 1]) or (value[0] == '"') or
+                   (value[0] == '\''));
+        // each line is trimmed when read, and a continuation line must not
+        // look blank or like a comment; the quotes keep the value's own ends
+        let mut check = strs.split(value, "\n");
+        let mut cont = false;
+        while true {
+            let part = check.next() catch break;
+            let closed = check.done and pad;
+            if cont and (part.len == 0) and not closed {
+                return error.InvalidArgument;
+            }
+            if cont and (part.len > 0) and (strs.is_space(part[0]) or (part[0] == ';') or (part[0] == '#')) {
+                return error.InvalidArgument;
+            }
+            if (part.len > 0) and strs.is_space(part[part.len - 1]) and not closed {
+                return error.InvalidArgument;
+            }
+            cont = true;
+        }
         self.out.write_all(key)!;
         self.out.write_all(" = ")!;
-        let pad = (value.len > 0) and ((value[0] == ' ') or (value[value.len - 1] == ' ') or (value[0] == '"'));
         if pad {
             self.out.write_all("\"")!;
         }
@@ -295,4 +343,46 @@ test "writing" {
     defer doc.deinit();
     @expect_eq(doc.get("main", "lines")!, "x\ny");
     @expect_eq(doc.get("more", "sp")!, " padded ");
+}
+
+test "writing refuses or quotes what would not read back" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    let mut w = Writer.init(s.writer());
+    w.section("user")!;
+    w.entry("name", "'quoted'")!;
+    w.entry("dq", "\"x\"")!;
+    w.entry("tail", "a\n")!;
+    w.entry("lead", "\nb")!;
+    w.entry("ends", " a\nb ")!;
+    let mut doc = parse(s.bytes())!;
+    defer doc.deinit();
+    @expect_eq(doc.get("user", "name")!, "'quoted'");
+    @expect_eq(doc.get("user", "dq")!, "\"x\"");
+    @expect_eq(doc.get("user", "tail")!, "a\n");
+    @expect_eq(doc.get("user", "lead")!, "\nb");
+    @expect_eq(doc.get("user", "ends")!, " a\nb ");
+    let before = s.len;
+    for v in ["hello\n\nadmin = true", "a\n# not a comment", "a\n; no", "a\n  b", "a \nb", "a\n\t\nb", "a\n\n"] {
+        w.entry("v", v) catch |e| {
+            @expect_eq(e, error.InvalidArgument);
+            continue;
+        };
+        @trap();
+    }
+    for k in ["", "a=b", "a:b", "a\nb", " a", "a ", "[x", ";x", "#x", "a\rb"] {
+        w.entry(k, "1") catch |e| {
+            @expect_eq(e, error.InvalidArgument);
+            continue;
+        };
+        @trap();
+    }
+    for n in ["a\nb", "a]b", " a", "a\r"] {
+        w.section(n) catch |e| {
+            @expect_eq(e, error.InvalidArgument);
+            continue;
+        };
+        @trap();
+    }
+    @expect_eq(s.len, before);
 }

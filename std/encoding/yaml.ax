@@ -47,6 +47,9 @@ pub error YamlError { SyntaxError, TooDeep, TooLarge, DuplicateKey, Unsupported,
 /// Collections nested deeper than this are refused.
 pub const MAX_DEPTH: usize = 512;
 
+// The most bytes an implicit key ("key: value") may take (YAML's limit).
+const MAX_IMPLICIT_KEY: usize = 1024;
+
 // -----------------------------------------------------------------------------
 // Marks and tokens
 // -----------------------------------------------------------------------------
@@ -309,7 +312,8 @@ struct Scanner {
             let k = self.keys.get_ptr(i);
             let multiline_ok = (i > 0) and (i <= self.flow_maps.len) and self.flow_maps.get(i - 1);
             if k.possible and
-               (((k.mark.line < self.m.line) and not multiline_ok) or ((self.m.index - k.mark.index) > 1024)) {
+               (((k.mark.line < self.m.line) and not multiline_ok) or
+                ((self.m.index - k.mark.index) > MAX_IMPLICIT_KEY)) {
                 if k.required {
                     return self.fail("could not find expected ':'");
                 }
@@ -2492,8 +2496,7 @@ fn write_block(w: io.Writer, v: json.Value, ind: usize, depth: usize) !void {
                 if k > 0 {
                     indent_to(w, ind)!;
                 }
-                write_scalar_text(w, ms[k].key)!;
-                w.write_all(":")!;
+                write_key(w, ms[k].key, ind)!;
                 let x = ms[k].value;
                 if nonempty_collection(x) {
                     w.write_all("\n")!;
@@ -2551,6 +2554,31 @@ fn write_block(w: io.Writer, v: json.Value, ind: usize, depth: usize) !void {
     }
 }
 
+// A mapping's key and its ":", at column ind: an implicit key ("key:") when
+// it is short enough to be one, an explicit one ("? key" and ":" on the
+// next line) otherwise.
+fn write_key(w: io.Writer, key: []u8, ind: usize) !void {
+    // the text is at most 4 bytes for each of the key's, and 2 quotes
+    if key.len <= ((MAX_IMPLICIT_KEY - 2) / 4) {
+        write_scalar_text(w, key)!;
+        w.write_all(":")!;
+        return;
+    }
+    let mut text = strs.String.init();
+    defer text.deinit();
+    write_scalar_text(text.writer(), key)!;
+    if text.len <= MAX_IMPLICIT_KEY {
+        w.write_all(text.bytes())!;
+        w.write_all(":")!;
+        return;
+    }
+    w.write_all("? ")!;
+    w.write_all(text.bytes())!;
+    w.write_all("\n")!;
+    indent_to(w, ind)!;
+    w.write_all(":")!;
+}
+
 // Whether t can be written plain and read back as the same string.
 fn plain_ok(t: []u8) bool {
     if (t.len == 0) or is_blank(t[0]) or is_blank(t[t.len - 1]) {
@@ -2569,6 +2597,14 @@ fn plain_ok(t: []u8) bool {
         if (c < 0x20) or (c == 0x7f) {
             return false;
         }
+        // U+FEFF (a byte order mark, dropped when read) and the C1 controls
+        // other than U+0085 are not printable
+        if (c == 0xc2) and ((k + 1) < t.len) and (t[k + 1] >= 0x80) and (t[k + 1] <= 0x9f) and (t[k + 1] != 0x85) {
+            return false;
+        }
+        if (c == 0xef) and ((k + 2) < t.len) and (t[k + 1] == 0xbb) and (t[k + 2] == 0xbf) {
+            return false;
+        }
         if ((c == ':') and (((k + 1) == t.len) or (t[k + 1] == ' '))) or ((c == '#') and (t[k - 1] == ' ')) {
             return false;
         }
@@ -2583,8 +2619,19 @@ fn write_scalar_text(w: io.Writer, t: []u8) !void {
     }
     let digits = "0123456789ABCDEF";
     w.write_all("\"")!;
-    for c in t {
-        if c == '"' {
+    let mut i: usize = 0;
+    while i < t.len {
+        let c = t[i];
+        i += 1;
+        if (c == 0xc2) and (i < t.len) and (t[i] >= 0x80) and (t[i] <= 0x9f) and (t[i] != 0x85) {
+            // a C1 control, U+0080 to U+009F
+            let e: [4]u8 = ['\\', 'x', digits[@as(usize, t[i] >> 4)], digits[@as(usize, t[i] & 15)]];
+            w.write_all(e[..])!;
+            i += 1;
+        } else if (c == 0xef) and ((i + 1) < t.len) and (t[i] == 0xbb) and (t[i + 1] == 0xbf) {
+            w.write_all("\\uFEFF")!;
+            i += 2;
+        } else if c == '"' {
             w.write_all("\\\"")!;
         } else if c == '\\' {
             w.write_all("\\\\")!;
@@ -2958,4 +3005,36 @@ test "writing round trips" {
         return;
     };
     @trap();
+}
+
+test "writing long keys, byte order marks and C1 controls" {
+    let mut src = strs.String.init();
+    defer src.deinit();
+    src.push_str("{\"bom\": \"\\uFEFFx\", \"c1\": \"x\\u009Cy\\u0085z\", \"\\uFEFF\": 1, \"outer\": {\"")!;
+    for _i in @as(usize, 0)..1025 {
+        src.push('k')!;
+    }
+    src.push_str("\": {\"a\": [1, 2]}, \"")!;
+    for _i in @as(usize, 0)..1024 {
+        src.push('j')!;
+    }
+    src.push_str("\": null, \"")!;
+    for _i in @as(usize, 0)..600 {
+        src.push_str("\\u00e9")!;
+    }
+    src.push_str("\": \"q\\\"\", \"b\": 2}}")!;
+    let mut d = json.parse(src.bytes())!;
+    defer d.deinit();
+    let out = stringify(d.root)!;
+    defer mem.free(out);
+    let mut back = parse(out)!;
+    defer back.deinit();
+    @expect(same(back.root, d.root));
+    @expect(strs.contains(out, "bom: \"\\uFEFFx\"\n"));
+    @expect(strs.contains(out, "c1: \"x\\x9Cy\u{85}z\"\n"));
+    @expect(strs.contains(out, "  ? kkk"));
+    @expect(strs.contains(out, "k\n  :\n    a:\n"));
+    @expect(strs.contains(out, "  jjj"));
+    @expect(not strs.contains(out, "? jjj"));
+    @expect(strs.contains(out, "  ? \u{e9}"));
 }

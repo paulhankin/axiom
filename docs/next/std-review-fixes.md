@@ -15,3 +15,15 @@
 - An HTTP server response with status 1xx, 204 or 304 that a handler flushes is no
   longer sent chunked (with a `0` terminator that a client on the same connection
   took for the start of the next response); its body is dropped.
+- `markdown.to_pdf` makes link annotations only for `http:`, `https:` and `mailto:`
+  URLs and relative references; other links (`javascript:`, `file:`, ...) are drawn as
+  text without a link.
+- The INI `Writer` quotes values that start with `'` or with or end with whitespace,
+  and refuses, with the new `IniError.InvalidArgument`, values, keys and section names
+  that would not read back as written (a continuation line that is empty or starts
+  with `#` or `;`, a key with `=`, `:` or a line break, ...); such a value could add
+  keys or sections when read.
+- `yaml.stringify` writes mapping keys longer than 1024 bytes as explicit keys
+  (`? key`), which the parser accepts, and quotes strings with U+FEFF or C1 controls,
+  so they read back as written.
+- TOML numbers of any length parse; those over 128 characters were refused.

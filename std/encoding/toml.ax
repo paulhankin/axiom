@@ -1121,24 +1121,15 @@ fn days_in(y: u16, m: u8) u8 {
 }
 
 // Underscores must sit between two digits (of the given base).
-fn strip_underscores(tok: []u8, out: []mut u8, base: u32) TomlError![]u8 {
-    let mut n: usize = 0;
+fn check_underscores(tok: []u8, base: u32) TomlError!void {
     for k in @as(usize, 0)..tok.len {
-        let c = tok[k];
-        if c == '_' {
+        if tok[k] == '_' {
             if (k == 0) or ((k + 1) == tok.len) or (digit_value(tok[k - 1]) >= base) or
                (digit_value(tok[k + 1]) >= base) {
                 return error.SyntaxError;
             }
-            continue;
         }
-        if n >= out.len {
-            return error.SyntaxError;
-        }
-        out[n] = c;
-        n += 1;
     }
-    return out[..n];
 }
 
 fn digit_value(c: u8) u32 {
@@ -1150,7 +1141,6 @@ fn digit_value(c: u8) u32 {
 }
 
 fn parse_number(tok: []u8) TomlError!Value {
-    let mut buf: [128]u8 = [0; 128];
     // special floats
     let mut body = tok;
     let mut sign: u8 = 0;
@@ -1181,12 +1171,16 @@ fn parse_number(tok: []u8) TomlError!Value {
         } else if body[1] == 'b' {
             base = 2;
         }
-        let d = strip_underscores(body[2..], buf[..], base)!;
+        let d = body[2..];
+        check_underscores(d, base)!;
         if d.len == 0 {
             return error.SyntaxError;
         }
         let mut v: u64 = 0;
         for c in d {
+            if c == '_' {
+                continue;
+            }
             let x = digit_value(c);
             if x >= base {
                 return error.SyntaxError;
@@ -1212,9 +1206,12 @@ fn parse_number(tok: []u8) TomlError!Value {
         return error.SyntaxError;
     }
     if k == body.len {
-        let d = strip_underscores(int_part, buf[..], 10)!;
+        check_underscores(int_part, 10)!;
         let mut v: u64 = 0;
-        for c in d {
+        for c in int_part {
+            if c == '_' {
+                continue;
+            }
             v = @mul_checked(v, 10) catch return error.SyntaxError;
             v = @add_checked(v, @as(u64, c - '0')) catch return error.SyntaxError;
         }
@@ -1266,18 +1263,17 @@ fn parse_number(tok: []u8) TomlError!Value {
             }
         }
     }
-    let mut n: usize = 0;
+    if (strs.index_of_byte(tok, '_') catch tok.len) == tok.len {
+        return Value.Float(fmt.parse_float(tok) catch return error.SyntaxError);
+    }
+    let mut digits = strs.String.init();
+    defer digits.deinit();
     for c in tok {
         if c != '_' {
-            if n >= buf.len {
-                return error.SyntaxError;
-            }
-            buf[n] = c;
-            n += 1;
+            digits.push(c)!;
         }
     }
-    let f = fmt.parse_float(buf[..n]) catch return error.SyntaxError;
-    return Value.Float(f);
+    return Value.Float(fmt.parse_float(digits.bytes()) catch return error.SyntaxError);
 }
 
 /// Parses a TOML document.
@@ -1748,4 +1744,35 @@ test "hostile nesting" {
         return;
     };
     @trap();
+}
+
+test "long numbers" {
+    let mut s = strs.String.init();
+    defer s.deinit();
+    s.push_str("f = 0.")!;
+    for _k in @as(usize, 0)..200 {
+        s.push('0')!;
+    }
+    s.push_str("1\nh = 0x")!;
+    for _k in @as(usize, 0)..200 {
+        s.push_str("0_")!;
+    }
+    s.push_str("1f\nu = 1")!;
+    for _k in @as(usize, 0)..100 {
+        s.push_str("_0")!;
+    }
+    s.push_str(".5e-100\nn = 1_2_3\n")!;
+    let mut doc = parse(s.bytes())!;
+    defer doc.deinit();
+    @expect_eq(doc.root.get("f")!.as_f64()!, 1e-201);
+    @expect_eq(doc.root.get("h")!.as_i64()!, 31);
+    @expect_eq(doc.root.get("u")!.as_f64()!, 1.0);
+    @expect_eq(doc.root.get("n")!.as_i64()!, 123);
+    for bad in ["x = 0x_1\n", "x = 0x1_\n", "x = 1__2\n", "x = 01\n", "x = 0b2\n", "x = 1_.5\n", "x = 1._5\n"] {
+        _ = parse(bad) catch |e| {
+            @expect_eq(e, error.SyntaxError);
+            continue;
+        };
+        @trap();
+    }
 }
