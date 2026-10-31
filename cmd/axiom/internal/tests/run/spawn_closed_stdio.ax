@@ -1,0 +1,103 @@
+// std/os/process with standard streams of ours closed: the descriptors made
+// for the child (and for its exec's error) then take 0, 1 or 2, and must
+// survive the child's moving of its streams into place.
+// native-only
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os/process" as process;
+import "std/str" as strs;
+
+extern "C" {
+    fn dup(fd: i32) i32;
+    fn dup2(fd: i32, to: i32) i32;
+    fn close(fd: i32) i32;
+}
+
+// A program that does not exist is not found (with stdin and stderr closed,
+// the pipe for exec's error took 0 and 2, and the child's stderr was moved
+// over its end).
+fn not_found() []u8 {
+    let mut a = process.Command.init("/surely/no/such/program");
+    defer a.deinit();
+    a.stderr(process.Stdio.PIPE);
+    let r = a.spawn();
+    let mut c = r catch |e| return @error_name(e);
+    _ = c.wait() catch return "spawned";
+    return "spawned";
+}
+
+// The child's three pipes all work.
+fn pipes() !bool {
+    let mut b = process.Command.init("sh");
+    defer b.deinit();
+    let script: [2][]u8 = ["-c", "read x; echo \"out $x\"; echo \"err $x\" >&2"];
+    b.args(script[..])!;
+    b.stdin(process.Stdio.PIPE);
+    b.stdout(process.Stdio.PIPE);
+    b.stderr(process.Stdio.PIPE);
+    let mut c = b.spawn()!;
+    c.stdin.write_all("in\n")!;
+    c.stdin.close();
+    let o = c.stdout.read_all()!;
+    defer mem.free(o);
+    let e = c.stderr.read_all()!;
+    defer mem.free(e);
+    _ = c.wait()!;
+    return strs.eq(o, "out in\n") and strs.eq(e, "err in\n");
+}
+
+// /dev/null as the child's stderr (made as 2 itself when all three of ours
+// are closed) is open in the child.
+fn null_stderr() !bool {
+    let mut d = process.Command.init("sh");
+    defer d.deinit();
+    let check: [2][]u8 = ["-c", "echo x >&2"];
+    d.args(check[..])!;
+    d.stderr(process.Stdio.NULL);
+    return d.status()!.success();
+}
+
+// With stdin and stdout closed, the pipe for the child's stderr is made as 0
+// and 1; its end for the child must not be replaced by the child's stdout.
+fn null_stdout() !bool {
+    let mut d = process.Command.init("sh");
+    defer d.deinit();
+    let script: [2][]u8 = ["-c", "echo err >&2"];
+    d.args(script[..])!;
+    d.stdout(process.Stdio.NULL);
+    d.stderr(process.Stdio.PIPE);
+    let mut c = d.spawn()!;
+    let e = c.stderr.read_all()!;
+    defer mem.free(e);
+    _ = c.wait()!;
+    return strs.eq(e, "err\n");
+}
+
+fn show(ok: bool) void {
+    if ok {
+        io.stdout().print("ok\n") catch {};
+    } else {
+        io.stdout().print("failed\n") catch {};
+    }
+}
+
+export fn run() void {
+    let saved: [3]i32 = [dup(0), dup(1), dup(2)];
+    _ = close(0);
+    _ = close(2);
+    let a = not_found();
+    let b = pipes() catch false;
+    _ = close(1);
+    let c = null_stderr() catch false;
+    _ = dup2(saved[2], 2);
+    let d = null_stdout() catch false;
+    for k in @as(usize, 0)..3 {
+        _ = dup2(saved[k], @truncate(i32, @bit_cast(isize, k)));
+        _ = close(saved[k]);
+    }
+    io.stdout().print(a) catch {};
+    io.stdout().print("\n") catch {};  // expect: NotFound
+    show(b);  // expect: ok
+    show(c);  // expect: ok
+    show(d);  // expect: ok
+}

@@ -318,6 +318,16 @@ static void ignore_sigpipe(void) {
     if (!__atomic_exchange_n(&done, 1, __ATOMIC_SEQ_CST) && sig_actions[SIGPIPE] != 2) signal(SIGPIPE, SIG_IGN);
 }
 
+// fd, moved above the standard streams if it is one of them (with ours
+// closed, a new pipe can be 0, 1 or 2): the child's file actions must not
+// overwrite a descriptor they still need. -1 if that fails.
+static int above_std(int fd) {
+    if (fd > 2) return fd;
+    int r = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    close(fd);
+    return r;
+}
+
 int32_t ax_proc_spawn(const uint8_t *spec, size_t len, int32_t *stdio) {
     // argv, then the environment, each a list of 0-terminated strings ending
     // in an empty one; then the directory
@@ -351,7 +361,8 @@ int32_t ax_proc_spawn(const uint8_t *spec, size_t len, int32_t *stdio) {
             int p[2];
             if (pipe2(p, O_CLOEXEC)) goto out;
             fds[2 * k] = k == 0 ? p[1] : p[0];
-            fds[2 * k + 1] = k == 0 ? p[0] : p[1];
+            fds[2 * k + 1] = above_std(k == 0 ? p[0] : p[1]);
+            if (fds[2 * k + 1] < 0) goto out;
             posix_spawn_file_actions_adddup2(&fa, fds[2 * k + 1], k);
         } else if (stdio[k] == 2) {
             posix_spawn_file_actions_addopen(&fa, k, "/dev/null", O_RDWR, 0);

@@ -38,3 +38,11 @@
   for a `usize` (a 60-byte file made it allocate 512 MB and trap), and `Image.init`
   refuses with `TooLarge` an image whose bytes do not fit in one (it made a 1-byte
   image that trapped when written).
+- Spawning a process works when the parent's standard input, output or error is
+  closed: a program that could not be started was reported as started (Linux), and the
+  child could lose a standard stream to the pipe or descriptor that took its number.
+- `math.gamma` and `math.lgamma` are accurate for tiny negative arguments and just
+  above the negative odd integers (`gamma(-1e-17)` was `+inf`), and `lgamma` is finite
+  for subnormal ones.
+- On Windows, `process.Command.set_env` and `remove_env` match variable names without
+  case, as Windows does: `remove_env("PATH")` left `Path` in the child.

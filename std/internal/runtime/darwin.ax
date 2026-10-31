@@ -216,6 +216,7 @@ const AT_FDCWD: i32 = -2;
 const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const FD_CLOEXEC: i32 = 1;
+const F_DUPFD_CLOEXEC: i32 = 67;
 
 // signals (Darwin's)
 const SIGFPE: i32 = 8;
@@ -267,6 +268,19 @@ fn cstr_len(p: *u8) usize {
 
 fn cloexec(fd: i32) void {
     _ = fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
+// fd, moved above the standard streams if it is one of them (with ours
+// closed, a new pipe can be 0, 1 or 2): a spawned child's file actions must
+// not overwrite a descriptor they still need, nor see one of our ends as a
+// stream of ours to inherit. -1 if that fails.
+fn above_std(fd: i32) i32 {
+    if fd > 2 {
+        return fd;
+    }
+    let r = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    _ = close(fd);
+    return r;
 }
 
 // The host ABI's code for a failed call's errno.
@@ -895,12 +909,18 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
                 }
                 cloexec(p[0]);
                 cloexec(p[1]);
+                p[0] = above_std(p[0]);
+                p[1] = above_std(p[1]);
                 if k == 0 {
                     fds[0] = p[1];
                     fds[1] = p[0];
                 } else {
                     fds[2 * k] = p[0];
                     fds[(2 * k) + 1] = p[1];
+                }
+                if (p[0] < 0) or (p[1] < 0) {
+                    ok = false;
+                    break;
                 }
                 _ = posix_spawn_file_actions_adddup2(&mut fa, fds[(2 * k) + 1], @truncate(i32, @bit_cast(isize, k)));
             } else if modes[k] == 2 {

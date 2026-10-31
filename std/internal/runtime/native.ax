@@ -1481,6 +1481,22 @@ export fn ax_chdir(path: *u8, len: usize) i32 {
     return 0;
 }
 
+// fd, moved above the standard streams if it is one of them (with the
+// parent's closed, a new pipe can be 0, 1 or 2): the spawned child's dup2
+// onto 0, 1 and 2 must neither overwrite a descriptor it still needs nor
+// leave one in place still close-on-exec. -1 if that fails.
+fn above_std(fd: i32) i32 {
+    if fd > 2 {
+        return fd;
+    }
+    let r = sys.fcntl(fd, 1030, 3);  // F_DUPFD_CLOEXEC
+    _ = sys.close(fd);
+    if r < 0 {
+        return -1;
+    }
+    return @truncate(i32, r);
+}
+
 // The spec: argv strings, each ending in 0, then a 0; the environment
 // ("K=V" strings, each ending in 0), then a 0; then the directory to run in
 // (empty: this one). stdio[i] is 0 to inherit stream i, 1 for a pipe, 2 for
@@ -1598,6 +1614,10 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
     let mut fds: [6]i32 = [-1, -1, -1, -1, -1, -1];
     let mut err: [2]i32 = [-1, -1];
     let mut ok = sys.pipe2(&mut err[0], 0x80000) >= 0;  // O_CLOEXEC
+    if ok {
+        err[1] = above_std(err[1]);
+        ok = err[1] >= 0;
+    }
     for k in @as(usize, 0)..3 {
         if not ok {
             break;
@@ -1619,6 +1639,10 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
             let fd = sys.open(&dn[0], 2 | 0x80000, 0);  // O_RDWR | O_CLOEXEC
             ok = fd >= 0;
             fds[(2 * k) + 1] = @truncate(i32, fd);
+        }
+        if ok and (fds[(2 * k) + 1] >= 0) {
+            fds[(2 * k) + 1] = above_std(fds[(2 * k) + 1]);
+            ok = fds[(2 * k) + 1] >= 0;
         }
     }
     let mut pid: isize = -1;
