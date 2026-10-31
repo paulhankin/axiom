@@ -10,3 +10,5 @@
 - An IR value is 200 bytes instead of 312: what only calls, phis, switches, allocas,
   shuffles and constants have is in a small record of its own. Building the compiler
   at `-O2` takes at most about 600 MB instead of 688 MB.
+- The syntax tree's memory is given back once the IR is made from it, for the
+  optimizer to use: building the compiler at `-O2` takes at most 488 MB (from 545 MB).
