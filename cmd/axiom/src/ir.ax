@@ -338,6 +338,7 @@ pub enum ValueKind {
     GLOBAL,
     FUNC,
     PARAM,
+    CSTR,
 }
 
 pub const V_INST: ValueKind = ValueKind.INST;
@@ -346,6 +347,7 @@ pub const V_CFP: ValueKind = ValueKind.CFP;    // fv
 pub const V_ZERO: ValueKind = ValueKind.ZERO;  // zero of any type (null pointer, zeroinitializer)
 pub const V_UNDEF: ValueKind = ValueKind.UNDEF;
 pub const V_CAGG: ValueKind = ValueKind.CAGG;      // constant struct / array / vector: xs
+pub const V_CSTR: ValueKind = ValueKind.CSTR;      // constant [n x i8]: bytes_of (cstring)
 pub const V_GLOBAL: ValueKind = ValueKind.GLOBAL;  // address of gv
 pub const V_FUNC: ValueKind = ValueKind.FUNC;      // address of fnp
 pub const V_PARAM: ValueKind = ValueKind.PARAM;    // cv = index
@@ -893,7 +895,7 @@ pub struct Value {
 // values and referents. They are in a record (Value.more) only once one of
 // them is set, which for most values none ever is: a small one with the
 // fields of one group (the blocks of a PHI or SWITCH, a CALL's, an ALLOCA's,
-// a SHUFFLE's mask, a constant's), or, once a value has fields of two
+// a SHUFFLE's mask, a constant's, a string's bytes), or, once a value has fields of two
 // groups, a ValueMore with all of them. A record starts with its group (an
 // operation may change in place: the group, not the op, says what the record
 // holds). <field>_of(v) reads one (zero if v has none), set_<field>(v, x)
@@ -942,6 +944,12 @@ pub struct ValueMore {
     fnp: *mut Func,           // FUNC, PARAM: the function
     name: []u8,               // ALLOCA, PARAM: a name for people
     chain: *mut Chain,        // CALL, native frame tables: the call-site records (see Chain)
+    bytes: []u8,              // CSTR: the bytes (the last a NUL)
+}
+
+pub struct VmBytes {
+    g: u8,
+    bytes: []u8,  // CSTR: the bytes (the last a NUL)
 }
 
 // The group of v's record (0: none).
@@ -962,7 +970,7 @@ fn zero_more() *ValueMore {
 }
 
 // Records of dead values, for reuse, by group.
-let mut free_more: [7]u.List.[usize] = [u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 }; 7];
+let mut free_more: [8]u.List.[usize] = [u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 }; 8];
 
 fn new_more(g: u8) usize {
     let k = @as(usize, g);
@@ -980,6 +988,7 @@ fn new_more(g: u8) usize {
         4    => { r = @int_from_ptr(u.new.[VmMask]()); }
         5    => { r = @int_from_ptr(u.new.[VmConst]()); }
         6    => { r = @int_from_ptr(u.new.[ValueMore]()); }
+        7    => { r = @int_from_ptr(u.new.[VmBytes]()); }
         else => { u.die("more_new: no such group"); }
     }
     @ptr_from_int(*mut u8, r).* = g;
@@ -994,6 +1003,7 @@ fn more_size(g: u8) usize {
         4    => { return @size_of(VmMask); }
         5    => { return @size_of(VmConst); }
         6    => { return @size_of(ValueMore); }
+        7    => { return @size_of(VmBytes); }
         else => { return 0; }
     }
 }
@@ -1032,6 +1042,10 @@ fn more_full(v: *mut Value) *mut ValueMore {
             m.gv = o.gv;
             m.fnp = o.fnp;
             m.name = o.name;
+        }
+        7 => {
+            let o = @ptr_from_int(*mut VmBytes, v.more);
+            m.bytes = o.bytes;
         }
         else => {}
     }
@@ -1336,6 +1350,32 @@ pub fn set_chain(v: *mut Value, x: *mut Chain) void {
         return;
     }
     chain_mut(v).* = x;
+}
+
+pub fn bytes_of(v: *Value) []u8 {
+    match more_group(v) {
+        6    => { return @ptr_from_int(*ValueMore, v.more).bytes; }
+        7    => { return @ptr_from_int(*VmBytes, v.more).bytes; }
+        else => { return zero_more().bytes; }
+    }
+}
+
+pub fn bytes_mut(v: *mut Value) *mut []u8 {
+    if v.more == 0 {
+        v.more = new_more(7);
+    }
+    match more_group(v) {
+        6    => { return &mut @ptr_from_int(*mut ValueMore, v.more).bytes; }
+        7    => { return &mut @ptr_from_int(*mut VmBytes, v.more).bytes; }
+        else => { return &mut more_full(v).bytes; }
+    }
+}
+
+pub fn set_bytes(v: *mut Value, x: []u8) void {
+    if (v.more == 0) and ((x.len == 0) and (@int_from_ptr(x.ptr) == 0)) {
+        return;
+    }
+    bytes_mut(v).* = x;
 }
 
 // Native stack traces from frame tables (codegen.ax: frame_tables): the
@@ -1849,6 +1889,7 @@ pub fn undef(t: *mut Ty) *mut Value {
 
 pub fn cagg(t: *mut Ty, xs: []mut *mut Value) *mut Value {
     let c = new_val(V_CAGG, t);
+    c.xs.reserve(xs.len);
     for x in xs {
         c.xs.push(x);
     }
@@ -1867,15 +1908,37 @@ pub fn carray(el: *mut Ty, xs: []mut *mut Value) *mut Value {
     return cagg(t_array(el, @as(u64, xs.len)), xs);
 }
 
-// The bytes of `s` followed by a NUL, as an [n+1 x i8] constant.
+// The bytes of `s` followed by a NUL, as an [n+1 x i8] constant: a V_CSTR,
+// which holds them as bytes (not as a V_CAGG of byte constants, eight bytes
+// a byte); agg_len and agg_elem read either.
 pub fn cstring(s: []u8) *mut Value {
-    let t8 = t_int(8);
-    let xs = u.newn.[*mut Value](s.len + 1);
-    for i in 0..s.len {
-        xs[i] = cint(t8, @as(u64, s[i]));
+    let c = new_val(V_CSTR, t_array(t_int(8), @as(u64, s.len) + 1));
+    let b = u.newn.[u8](s.len + 1);
+    @mem_copy(b[0..s.len], s);
+    b[s.len] = 0;
+    set_bytes(c, b);
+    return c;
+}
+
+// Is v a constant aggregate whose elements agg_elem reads?
+pub fn is_cagg(v: *Value) bool {
+    return (v.kind == V_CAGG) or (v.kind == V_CSTR);
+}
+
+// The number of elements of a constant aggregate (V_CAGG or V_CSTR).
+pub fn agg_len(v: *Value) usize {
+    if v.kind == V_CSTR {
+        return bytes_of(v).len;
     }
-    xs[s.len] = cint(t8, 0);
-    return cagg(t_array(t8, @as(u64, s.len) + 1), xs);
+    return v.xs.len;
+}
+
+// Element i of a constant aggregate (V_CAGG or V_CSTR).
+pub fn agg_elem(v: *Value, i: usize) *mut Value {
+    if v.kind == V_CSTR {
+        return cint(t_int(8), @as(u64, bytes_of(v)[i]));
+    }
+    return v.xs.get(i);
 }
 
 pub fn cinttoptr(v: *mut Value) *mut Value {
@@ -1934,6 +1997,14 @@ pub fn is_zero(v: *Value) bool {
     if v.kind == V_CAGG {
         for i in 0..v.xs.len {
             if not is_zero(v.xs.get(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if v.kind == V_CSTR {
+        for c in bytes_of(v) {
+            if c != 0 {
                 return false;
             }
         }
@@ -2999,8 +3070,8 @@ pub fn fence(bd: *mut Builder) void {
 
 pub fn extract(bd: *mut Builder, agg: *mut Value, i: u32) *mut Value {
     let ft = field_ty(agg.ty, @as(usize, i));
-    if agg.kind == V_CAGG {
-        return agg.xs.get(@as(usize, i));
+    if is_cagg(agg) {
+        return agg_elem(agg, @as(usize, i));
     }
     if agg.kind == V_ZERO {
         return czero(ft);
@@ -3022,15 +3093,16 @@ pub fn insert(bd: *mut Builder, agg: *mut Value, x: *mut Value, i: u32) *mut Val
     // constants fold (a literal of constants is a constant, and lowering
     // turns a large one into read-only data instead of stores)
     let ak = agg.kind;
-    if is_const(x) and not is_tls_addr(x) and ((ak == V_CAGG) or (ak == V_UNDEF) or (ak == V_ZERO)) and
-       (agg.ty.kind != T_VEC) and (field_count(agg.ty) <= 256) {
+    if is_const(x) and not is_tls_addr(x) and
+       ((ak == V_CAGG) or (ak == V_CSTR) or (ak == V_UNDEF) or (ak == V_ZERO)) and (agg.ty.kind != T_VEC) and
+       (field_count(agg.ty) <= 256) {
         let n = field_count(agg.ty);
         let xs = u.newn.[*mut Value](n + 1);
         for k in 0..n {
             if k == @as(usize, i) {
                 xs[k] = x;
-            } else if ak == V_CAGG {
-                xs[k] = agg.xs.get(k);
+            } else if (ak == V_CAGG) or (ak == V_CSTR) {
+                xs[k] = agg_elem(agg, k);
             } else if ak == V_ZERO {
                 xs[k] = czero(field_ty(agg.ty, k));
             } else {
@@ -3084,6 +3156,7 @@ pub fn call(bd: *mut Builder, fty: *mut Ty, callee: *mut Value, args: []mut *mut
     let v = emit(bd, OP_CALL, fty.ret);
     set_fty(v, fty);
     v.a = callee;
+    v.xs.reserve(args.len);
     for x in args {
         v.xs.push(x);
     }
@@ -3234,11 +3307,11 @@ pub fn val_str(v: *Value) []u8 {
     }
     let mut b = u.Buf.init();
     b.s("{");
-    for i in 0..v.xs.len {
+    for i in 0..agg_len(v) {
         if i != 0 {
             b.s(", ");
         }
-        b.s(val_str(v.xs.get(i)));
+        b.s(val_str(agg_elem(v, i)));
     }
     b.s("}");
     return b.done();
