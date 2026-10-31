@@ -137,7 +137,7 @@ pub struct Resolver {
         let mut q = strs.String.init();
         defer q.deinit();
         let mut idb: [2]u8 = [0; 2];
-        random.fill(idb[..]) catch {};
+        random.fill(idb[..]) catch return error.NetError;  // (not a predictable id)
         let id = (@as(u16, idb[0]) << 8) | @as(u16, idb[1]);
         build_query(&mut q, id, name, rtype)!;
         let mut last: error = error.NoServers;
@@ -199,11 +199,7 @@ pub struct Resolver {
                 return e;
             };
             defer resp.deinit();
-            for rec in resp.answers.items() {
-                if rec.rtype == t {
-                    out.push(rec.addr)!;
-                }
-            }
+            addresses(&resp, name, t, &mut out)!;
         }
         if out.len == 0 {
             return error.NameNotFound;
@@ -227,6 +223,55 @@ pub struct Resolver {
         }
         return error.NameNotFound;
     }
+}
+
+// The longest chain of CNAMEs lookup_ip follows.
+const MAX_CNAMES: usize = 8;
+
+// The addresses of type t in a reply's answers for a name: those of
+// records owned by the name, or by a name its chain of CNAMEs leads to
+// (not of other names the reply puts in its answers).
+fn addresses(resp: *Response, name: []u8, t: u16, out: *mut vec.Vec.[net.Addr]) DnsError!void {
+    let mut chain: [MAX_CNAMES + 1][]u8 = [""; MAX_CNAMES + 1];
+    chain[0] = name;
+    let mut n: usize = 1;
+    while n < chain.len {
+        let mut found = false;
+        for rec in resp.answers.items() {
+            if (rec.rtype == CNAME) and same_name(rec.name, chain[n - 1]) {
+                chain[n] = rec.target;
+                found = true;
+                break;
+            }
+        }
+        if not found {
+            break;
+        }
+        n += 1;
+    }
+    for rec in resp.answers.items() {
+        if rec.rtype != t {
+            continue;
+        }
+        for k in @as(usize, 0)..n {
+            if same_name(rec.name, chain[k]) {
+                out.push(rec.addr)!;
+                break;
+            }
+        }
+    }
+}
+
+// Whether two names are the same, ignoring ASCII case and a final '.'.
+fn same_name(a: []u8, b: []u8) bool {
+    return strs.eq_ignore_case(without_dot(a), without_dot(b));
+}
+
+fn without_dot(s: []u8) []u8 {
+    if (s.len > 1) and (s[s.len - 1] == '.') and (s[s.len - 2] != '\\') {
+        return s[..s.len - 1];
+    }
+    return s;
 }
 
 /// The name to look up an address's PTR record by: 4.3.2.1.in-addr.arpa,
@@ -622,7 +667,33 @@ fn answers(qname: []u8, qtype: u16, out: *mut strs.String, count: *mut u16, rcod
         out.push_str(t.bytes())!;
         count.* += 1;
     }
-    let name_ptr = ptr;
+    if strs.eq(qname, "bank.test") {
+        // first an address of another name, which is not bank.test's
+        let mut t = strs.String.init();
+        defer t.deinit();
+        encode_name(&mut t, "evil.test")!;
+        out.push_str(t.bytes())!;
+        put16(out, qtype)!;
+        put16(out, 1)!;
+        put16(out, 0)!;
+        put16(out, 300)!;
+        if qtype == A {
+            put16(out, 4)!;
+            let ip: [4]u8 = [6, 6, 6, 6];
+            out.push_str(ip[..])!;
+        } else {
+            put16(out, 16)!;
+            let ip: [16]u8 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6];
+            out.push_str(ip[..])!;
+        }
+        count.* += 1;
+    }
+    // (example.test, alias.test's CNAME's data: at 12 + 12 + 4 + 12)
+    let alias_ptr: [2]u8 = [0xc0, 0x28];
+    let mut name_ptr = ptr;
+    if strs.eq(qname, "alias.test") {
+        name_ptr = alias_ptr;
+    }
     if (qtype == A) or ((qtype == AAAA) and not strs.eq(qname, "alias.test")) {
         out.push_str(name_ptr[..])!;
         put16(out, qtype)!;
@@ -818,6 +889,10 @@ test "queries against a server" {
     let both = r.lookup_ip("example.test")!;
     @expect((both.len == 2) and (both[1].family == net.Family.V6));
     mem.free(both);
+    // only the addresses of the name asked about
+    let bank = r.lookup_ip("bank.test")!;
+    @expect((bank.len == 2) and bank[0].eq(net.Addr.v4(93, 184, 216, 34, 0)) and (bank[1].family == net.Family.V6));
+    mem.free(bank);
     @expect(not_found(r.query("missing.test", A)));
     // a truncated answer, then over TCP
     let mut big = r.query("big.test", A)!;
@@ -833,7 +908,111 @@ test "queries against a server" {
     let mut q = r.query("quit.test", A)!;
     q.deinit();
     t.join();
-    @expect(srv.served == 13);
+    @expect(srv.served == 15);
+}
+
+// A reply to `<name> A` holding the given answer records.
+fn reply_with(name: []u8, recs: []u8, count: u16, out: *mut strs.String) DnsError!void {
+    out.clear();
+    put16(out, 1)!;
+    put16(out, 0x8180)!;
+    put16(out, 1)!;
+    put16(out, count)!;
+    put16(out, 0)!;
+    put16(out, 0)!;
+    encode_name(out, name)!;
+    put16(out, A)!;
+    put16(out, 1)!;
+    out.push_str(recs)!;
+}
+
+// An answer record (CNAME data is a name).
+fn record(out: *mut strs.String, owner: []u8, rtype: u16, data: []u8) DnsError!void {
+    encode_name(out, owner)!;
+    put16(out, rtype)!;
+    put16(out, 1)!;
+    put16(out, 0)!;
+    put16(out, 60)!;
+    if rtype == CNAME {
+        let mut t = strs.String.init();
+        defer t.deinit();
+        encode_name(&mut t, data)!;
+        put16(out, @truncate(u16, t.len))!;
+        out.push_str(t.bytes())!;
+    } else {
+        put16(out, @truncate(u16, data.len))!;
+        out.push_str(data)!;
+    }
+}
+
+// Whether addresses() finds the A addresses for a name in a reply, given as
+// their last bytes.
+fn finds(name: []u8, recs: []u8, count: u16, want: []u8) bool {
+    let mut p = strs.String.init();
+    defer p.deinit();
+    reply_with(name, recs, count, &mut p) catch return false;
+    let mut resp = parse_response(p.bytes()) catch return false;
+    defer resp.deinit();
+    let mut out = vec.Vec.[net.Addr].init();
+    defer out.deinit();
+    addresses(&resp, name, A, &mut out) catch return false;
+    if out.len != want.len {
+        return false;
+    }
+    for k in @as(usize, 0)..want.len {
+        if not out.get(k).eq(net.Addr.v4(10, 0, 0, want[k], 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+test "addresses only of the name and its CNAMEs" {
+    let mut r = strs.String.init();
+    defer r.deinit();
+    // another name's address is not the name's
+    record(&mut r, "evil.test", A, "\x0a\x00\x00\x06")!;
+    record(&mut r, "bank.test", A, "\x0a\x00\x00\x01")!;
+    @expect(finds("bank.test", r.bytes(), 2, "\x01"));
+    @expect(finds("BANK.Test.", r.bytes(), 2, "\x01"));
+    r.clear();
+    record(&mut r, "evil.test", A, "\x0a\x00\x00\x06")!;
+    @expect(finds("bank.test", r.bytes(), 1, ""));
+    // a chain of CNAMEs, in any order, with case changing along it
+    r.clear();
+    record(&mut r, "B.test", CNAME, "c.TEST")!;
+    record(&mut r, "c.test", A, "\x0a\x00\x00\x03")!;
+    record(&mut r, "a.test", CNAME, "b.test")!;
+    record(&mut r, "x.test", A, "\x0a\x00\x00\x06")!;
+    record(&mut r, "x.test", CNAME, "c.test")!;
+    @expect(finds("a.test", r.bytes(), 5, "\x03"));
+    // a CNAME of a name not on the chain is not followed
+    r.clear();
+    record(&mut r, "a.test", CNAME, "b.test")!;
+    record(&mut r, "x.test", CNAME, "y.test")!;
+    record(&mut r, "y.test", A, "\x0a\x00\x00\x06")!;
+    @expect(finds("a.test", r.bytes(), 3, ""));
+    // a loop of CNAMEs ends
+    r.clear();
+    record(&mut r, "a.test", CNAME, "b.test")!;
+    record(&mut r, "b.test", CNAME, "a.test")!;
+    record(&mut r, "a.test", A, "\x0a\x00\x00\x01")!;
+    @expect(finds("a.test", r.bytes(), 3, "\x01"));
+    // a chain of MAX_CNAMES is followed, a longer one not to its end
+    let names: [10][]u8 = ["n0.test", "n1.test", "n2.test", "n3.test", "n4.test", "n5.test", "n6.test", "n7.test",
+                           "n8.test", "n9.test"];
+    r.clear();
+    for k in @as(usize, 0)..MAX_CNAMES {
+        record(&mut r, names[k], CNAME, names[k + 1])!;
+    }
+    record(&mut r, names[MAX_CNAMES], A, "\x0a\x00\x00\x08")!;
+    @expect(finds("n0.test", r.bytes(), @truncate(u16, MAX_CNAMES + 1), "\x08"));
+    r.clear();
+    for k in @as(usize, 0)..MAX_CNAMES + 1 {
+        record(&mut r, names[k], CNAME, names[k + 1])!;
+    }
+    record(&mut r, names[MAX_CNAMES + 1], A, "\x0a\x00\x00\x09")!;
+    @expect(finds("n0.test", r.bytes(), @truncate(u16, MAX_CNAMES + 2), ""));
 }
 
 fn not_found(r: !Response) bool {

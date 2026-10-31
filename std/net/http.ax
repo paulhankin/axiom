@@ -786,14 +786,18 @@ pub struct Response {
             if not self.started {
                 self.h2_head(false, 0, false)!;
             }
-            if (self.body.len > 0) and not self.head_only {
+            if (self.body.len > 0) and not self.head_only and not self.no_body() {
                 self.h2.send_data(self.h2_id, self.body.bytes(), false)!;
             }
             self.body.clear();
             return;
         }
+        let no_body = self.no_body();
         if not self.started {
-            if self.version == Version.HTTP_1_0 {
+            if no_body {
+                // (no body, so no framing for one: Content-Length or chunked
+                // would make the client read the next response as a body)
+            } else if self.version == Version.HTTP_1_0 {
                 // no chunked encoding in HTTP/1.0: the body ends at close
                 self.keep_alive = false;
             } else {
@@ -801,7 +805,7 @@ pub struct Response {
             }
             self.send_head(0, false, "")!;
         }
-        if (self.body.len == 0) or self.head_only {
+        if (self.body.len == 0) or self.head_only or no_body {
             self.body.clear();
             return;
         }
@@ -856,8 +860,7 @@ pub struct Response {
         if (not self.has_type) and ((length > 0) or self.chunked) {
             h.push_str("Content-Type: text/plain; charset=utf-8\r\n")!;
         }
-        let no_body = ((self.status >= 100) and (self.status < 200)) or (self.status == 204) or (self.status == 304);
-        if with_length and not no_body {
+        if with_length and not self.no_body() {
             fmt.write(w, "Content-Length: {}\r\n", [fmt.int(length)])!;
         }
         if self.chunked {
@@ -932,10 +935,16 @@ pub struct Response {
         self.started = true;
     }
 
+    // Whether the status is one whose responses have no body (1xx, 204
+    // and 304: RFC 9110 section 6.4.1).
+    fn no_body(self: *Response) bool {
+        return ((self.status >= 100) and (self.status < 200)) or (self.status == 204) or (self.status == 304);
+    }
+
     /// Completes the response after the handler returns.
     fn finish(self: *mut Response) !void {
         if self.is_h2 {
-            let no_body = (self.status == 204) or (self.status == 304) or self.head_only;
+            let no_body = self.no_body() or self.head_only;
             if not self.started {
                 let n = self.body.len;
                 self.h2_head(true, n, no_body or (n == 0))!;
@@ -954,9 +963,8 @@ pub struct Response {
         }
         if not self.started {
             let n = self.body.len;
-            let no_body = (self.status == 204) or (self.status == 304);
             let mut body: []u8 = "";
-            if (not self.head_only) and not no_body {
+            if (not self.head_only) and not self.no_body() {
                 body = self.body.bytes();
             }
             self.send_head(n, true, body)!;
@@ -2502,6 +2510,21 @@ fn t_big(app: *mut TestApp, req: *Request, res: *mut Response) !void {
     }
 }
 
+// a status without a body, and a body written and flushed anyway
+fn t_no_content(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    res.set_status(204);
+    res.write("dropped")!;
+    res.flush()!;
+    res.write("dropped")!;
+}
+
+fn t_not_modified(app: *mut TestApp, req: *Request, res: *mut Response) !void {
+    res.set_status(304);
+    for i in @as(u32, 0)..10000 {
+        fmt.write(res.writer(), "line {:05}\n", [fmt.int(i)])!;
+    }
+}
+
 fn t_fail(app: *mut TestApp, req: *Request, res: *mut Response) !void {
     res.write("partial")!;
     return error.NotFound;
@@ -2528,6 +2551,8 @@ test "server and client" {
     r.post("/echo", t_echo)!;
     r.get("/big", t_big)!;
     r.get("/fail", t_fail)!;
+    r.get("/nocontent", t_no_content)!;
+    r.get("/notmodified", t_not_modified)!;
     let mut opts = Options.default();
     opts.threads = 2;
     opts.max_head_bytes = 4096;
@@ -2586,6 +2611,20 @@ test "server and client" {
     @expect(strs.contains(out, "HTTP/1.1 201 Created"));
     @expect(strs.ends_with(out, "\r\n\r\nabcde"));
     @expect(strs.contains(out, "Connection: close"));
+
+    // a status without a body, flushed or streamed, and HEAD of a streamed
+    // body: heads alone, so keep-alive stays in step
+    let o13 = raw_exchange(port,
+                           "GET /nocontent HTTP/1.1\r\nHost: x\r\n\r\nGET /notmodified HTTP/1.1\r\nHost: x\r\n\r\nHEAD /big HTTP/1.1\r\nHost: x\r\n\r\nGET /users/9 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")!;
+    defer mem.free(o13);
+    @expect(strs.starts_with(o13, "HTTP/1.1 204 No Content\r\n"));
+    @expect(strs.contains(o13, "\r\n\r\nHTTP/1.1 304 "));
+    @expect(strs.contains(o13, "\r\n\r\nHTTP/1.1 200 OK\r\n"));
+    @expect_eq(strs.count(o13, "HTTP/1.1 "), 4);
+    @expect_eq(strs.count(o13, "Transfer-Encoding"), 1);
+    @expect(not strs.contains(o13, "dropped") and not strs.contains(o13, "line ") and
+            not strs.contains(o13, "0\r\n\r\n"));
+    @expect(strs.ends_with(o13, "\r\n\r\n{\"id\":\"9\"}"));
 
     // HTTP/1.0 closes by default
     let o2 = raw_exchange(port, "GET /users/7 HTTP/1.0\r\n\r\n")!;

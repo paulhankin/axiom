@@ -9,3 +9,9 @@
   a stored hash cannot make it run for hours.
 - The WebSocket client fails (`NetError`, `HandshakeFailed`) if the system cannot give
   it random bytes, instead of masking frames with zeros.
+- `dns.Resolver.lookup_ip` returns only the addresses of the name asked about and of
+  the names its CNAMEs lead to (at most 8); a reply could add addresses of any other
+  name. A query fails with `NetError` if the system cannot give it a random id.
+- An HTTP server response with status 1xx, 204 or 304 that a handler flushes is no
+  longer sent chunked (with a `0` terminator that a client on the same connection
+  took for the start of the next response); its body is dropped.
