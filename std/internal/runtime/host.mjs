@@ -740,6 +740,8 @@ export function createHost(opts = {}) {
     ax_link(a, an, b, bn) {
       try { fs.linkSync(str(a, an), str(b, bn)); return 0; } catch (e) { return fsErr(e); }
     },
+    // (none: argument 0 is the module's path)
+    ax_self_path() { return -1; },
     ax_readlink(p, n, buf, cap) {
       try {
         const b = fs.readlinkSync(str(p, n), { encoding: 'buffer' });

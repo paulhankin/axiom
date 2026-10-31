@@ -195,6 +195,15 @@ int32_t ax_dir_stat(int32_t dir, int64_t *out) {
     return 0;
 }
 
+// The running program's own file. Its length.
+intptr_t ax_self_path(uint8_t *buf, size_t cap) {
+    char tmp[4096];
+    ssize_t n = readlink("/proc/self/exe", tmp, sizeof tmp);
+    if (n < 0) return fs_err();
+    if ((size_t)n <= cap) memcpy(buf, tmp, (size_t)n);
+    return (intptr_t)n;
+}
+
 intptr_t ax_getcwd(uint8_t *buf, size_t cap) {
     char tmp[4096];
     if (!getcwd(tmp, sizeof tmp)) return fs_err();

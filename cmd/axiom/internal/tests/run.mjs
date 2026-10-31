@@ -822,6 +822,25 @@ await section('spec §16.3', {
       return v.startsWith('axiom 9.9.9') || fs.readdirSync(path.join(dir, 'inst')).some((f) => f.startsWith('.axiom-update'))
         ? `changed the install: ${v}` : null;
     },
+    'a mirror that would be an option, an update running, or one left unfinished: refused': () => {
+      const s = skip();
+      if (s) return s;
+      const exe = install();
+      const bad = spawnSync(exe, ['update', '9.9.9', '--format=agent-json'], {
+        encoding: 'utf8', env: { ...process.env, AXIOM_UPDATE_URL: '--upload-pack=touch /tmp/x' } });
+      let e = code(bad, 2, 'E9001');
+      if (e) return `mirror: ${e}`;
+      const inst = path.join(dir, 'inst');
+      fs.mkdirSync(path.join(inst, '.axiom-update.lock'));
+      e = code(update(exe, '9.9.9'), 1, 'E9008');
+      if (e) return `lock: ${e}`;
+      fs.rmdirSync(path.join(inst, '.axiom-update.lock'));
+      fs.mkdirSync(path.join(inst, '.axiom-update-0123/old'), { recursive: true });
+      e = code(update(exe, '9.9.9'), 1, 'E9008');
+      if (e) return `unfinished: ${e}`;
+      const v = spawnSync(exe, ['version'], { encoding: 'utf8' }).stdout;
+      return v.startsWith('axiom 9.9.9') ? `updated anyway: ${v}` : null;
+    },
     'a release install updates to a release': () => {
       const s = skip();
       if (s) return s;

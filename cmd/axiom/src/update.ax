@@ -34,6 +34,28 @@ fn repo_url() []u8 {
     return "https://github.com/paulhankin/axiom";
 }
 
+// Is the repository's URL one that curl and git take as a URL (not an
+// option, as "-..." would be)?
+fn url_ok(url: []u8) bool {
+    return u.starts(url, "https://") or u.starts(url, "file://") or u.starts(url, "/");
+}
+
+// curl, fetching url to out (https, or a mirror's file://; a redirect only
+// to https).
+fn curl_args(curl: []u8, out: []u8, url: []u8) u.List.[[]u8] {
+    let mut av = u.List.[[]u8].empty();
+    av.push(curl);
+    av.push("-fsSL");
+    av.push("--proto");
+    av.push("=https,file");
+    av.push("--proto-redir");
+    av.push("=https");
+    av.push("-o");
+    av.push(out);
+    av.push(url);
+    return av;
+}
+
 // Reports an error: status 2 for an invalid invocation or a missing tool
 // (docs/cli.md), else 1.
 fn fail(json: bool, code: []u8, msg: []u8) i32 {
@@ -198,6 +220,9 @@ pub fn run_update(args: [][]u8) i32 {
             return fail(json, "E9001", u.f1("'%s' is not a version: give 0.N.M, latest or HEAD", given));
         }
     }
+    if not url_ok(repo_url()) {
+        return fail(json, "E9001", "AXIOM_UPDATE_URL must be an https:// or file:// URL, or an absolute path");
+    }
     let exe = u.self_path();
     if u.isnos(exe) {
         return fail(json, "E9008", "cannot find this compiler's own file");
@@ -234,34 +259,66 @@ fn update_release(json: bool, prefix: []u8, want: []u8, latest: bool) i32 {
     if u.isnos(curl) or u.isnos(tar) {
         return fail(json, "E9003", "axiom update needs curl and tar");
     }
-    // A directory in the install, so that the swap only renames, on one file
-    // system; one an earlier update left (Windows cannot remove a running
-    // program, so the old axiom.exe stays behind) goes first.
+    // One update of an install at a time (a directory: making it is one
+    // step, which only one of several updates can take).
+    let lock = u.cat2(prefix, "/.axiom-update.lock");
+    if not u.mkdir_new(lock) {
+        if not u.is_dir(lock) {
+            return fail(json, "E9005", u.f1("cannot write in %s (update it as its owner)", prefix));
+        }
+        return fail(json, "E9008",
+                    u.f2("another update of %s is running (if none is, an earlier one was stopped: remove %s)", prefix,
+                         lock));
+    }
+    defer {
+        _ = u.rmdir(lock);
+    }
+    // The swap happens in a directory in the install, so that it only
+    // renames, on one file system. One an earlier update finished with goes
+    // now (Windows cannot remove a running program: the old axiom.exe stays
+    // behind); one it did not finish with holds the files it moved aside.
     let mut es = u.List.[[]u8].empty();
     if u.list_dir(prefix, &mut es) {
         for k in 0..es.len {
-            if u.starts(es.get(k), ".axiom-update-") {
-                rm_tree(u.f2("%s/%s", prefix, es.get(k)));
+            let e = es.get(k);
+            if u.starts(e, ".axiom-update-done-") {
+                rm_tree(u.f2("%s/%s", prefix, e));
+            } else if u.starts(e, ".axiom-update-") and not u.str_eq(e, ".axiom-update.lock") {
+                return fail(json, "E9008",
+                            u.f2("an earlier update of %s did not finish: the files it moved aside are in %s/old; put them back, then remove it",
+                                 prefix, u.f2("%s/%s", prefix, e)));
             }
         }
     }
-    let stage = u.f2("%s/.axiom-update-%s", prefix, u.hex16(@bit_cast(u64, u.now_ns())));
+    let tag = u.hex16(@bit_cast(u64, u.now_ns()));
+    let stage = u.f2("%s/.axiom-update-%s", prefix, tag);
     u.mkdirs(u.cat2(stage, "/old/bin"));
     u.mkdirs(u.cat2(stage, "/new"));
     if not u.is_dir(u.cat2(stage, "/new")) {
         return fail(json, "E9005", u.f1("cannot write in %s (update it as its owner)", prefix));
     }
+    stage_kept = false;
     let st = fetch_release(json, prefix, want, latest, curl, tar, stage);
-    rm_tree(stage);
+    if not stage_kept {
+        // (done with: renamed first, in case some of it cannot be removed)
+        let done = u.f2("%s/.axiom-update-done-%s", prefix, tag);
+        if rename(stage, done) {
+            rm_tree(done);
+        }
+    }
     return st;
 }
+
+// The swap failed, and so did putting back what it moved: the staging
+// directory holds the old files, and stays.
+let mut stage_kept: bool = false;
 
 fn fetch_release(json: bool, prefix: []u8, want: []u8, latest: bool, curl: []u8, tar: []u8, stage: []u8) i32 {
     let mut v = want;
     if latest {
         // /releases/latest redirects to /releases/tag/v<version>
-        let av = [curl, "-fsSLI", "-o", u.cat2(stage, "/latest"), "-w", "%{url_effective}",
-                  u.cat2(repo_url(), "/releases/latest")];
+        let av = [curl, "-fsSLI", "--proto", "=https,file", "--proto-redir", "=https", "-o", u.cat2(stage, "/latest"),
+                  "-w", "%{url_effective}", u.cat2(repo_url(), "/releases/latest")];
         let r = capture(av[..]);
         let t = index_of(r.out, "/tag/");
         if t >= 0 {
@@ -281,13 +338,13 @@ fn fetch_release(json: bool, prefix: []u8, want: []u8, latest: bool, curl: []u8,
     let base = u.f2("%s/releases/download/v%s", repo_url(), v);
     u.print(u.f2("downloading %s/%s\n", base, archive));
     let local = u.f2("%s/%s", stage, archive);
-    let get = [curl, "-fsSL", "-o", local, u.f2("%s/%s", base, archive)];
-    if run(get[..]) != 0 {
+    let get = curl_args(curl, local, u.f2("%s/%s", base, archive));
+    if run(get.items()) != 0 {
         return fail(json, "E9008", u.f3("cannot download %s: is %s a release? (they are listed at %s/releases)",
                                         archive, v, repo_url()));
     }
-    let get_sums = [curl, "-fsSL", "-o", u.cat2(stage, "/SHA256SUMS"), u.cat2(base, "/SHA256SUMS")];
-    if run(get_sums[..]) != 0 {
+    let get_sums = curl_args(curl, u.cat2(stage, "/SHA256SUMS"), u.cat2(base, "/SHA256SUMS"));
+    if run(get_sums.items()) != 0 {
         return fail(json, "E9008", u.f1("cannot download %s/SHA256SUMS", base));
     }
     let data = u.read_file(local);
@@ -339,16 +396,23 @@ fn fetch_release(json: bool, prefix: []u8, want: []u8, latest: bool, curl: []u8,
         moved_new[k] = true;
     }
     if not ok {
+        let mut back = true;
         let mut k = items.len;
         while k > 0 {
             k -= 1;
             let cur = u.f2("%s/%s", prefix, items[k]);
-            if moved_new[k] {
-                _ = rename(cur, u.f2("%s/%s", tree, items[k]));
+            if moved_new[k] and not rename(cur, u.f2("%s/%s", tree, items[k])) {
+                back = false;
             }
-            if moved_old[k] {
-                _ = rename(u.f2("%s/old/%s", stage, items[k]), cur);
+            if moved_old[k] and not rename(u.f2("%s/old/%s", stage, items[k]), cur) {
+                back = false;
             }
+        }
+        if not back {
+            stage_kept = true;
+            return fail(json, "E9005",
+                        u.f2("cannot replace the files in %s, nor put all the old ones back: those not back are in %s/old",
+                             prefix, stage));
         }
         return fail(json, "E9005", u.f1("cannot replace the files in %s (nothing was changed)", prefix));
     }
@@ -477,7 +541,8 @@ fn update_source(json: bool, root: []u8, exe: []u8, want: []u8, head: bool, late
         if not git_run(git, root, "fetch --quiet", url, spec) {
             return fail(json, "E9008", u.f2("no release %s at %s", v, url));
         }
-        if not git_run(git, root, "checkout --quiet --detach", label, u.nosym()) {
+        // (the tag: a branch of that name may exist)
+        if not git_run(git, root, "checkout --quiet --detach", u.cat2("refs/tags/", label), u.nosym()) {
             return fail(json, "E9008", u.f2("cannot check out %s in %s", label, root));
         }
     }

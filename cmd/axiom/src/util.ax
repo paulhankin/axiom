@@ -24,6 +24,7 @@ import host "axiom" {
     fn ax_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32;
     fn ax_readdir(path: *u8, len: usize, buf: *mut u8, cap: usize) isize;
     fn ax_getcwd(buf: *mut u8, cap: usize) isize;
+    fn ax_self_path(buf: *mut u8, cap: usize) isize;
     fn ax_chmod(path: *u8, len: usize, mode: u32) i32;
     fn ax_readlink(path: *u8, len: usize, buf: *mut u8, cap: usize) isize;
     fn ax_utimes(path: *u8, len: usize, atime_ns: i64, mtime_ns: i64) i32;
@@ -175,45 +176,43 @@ pub fn wall_ns() i64 {
     return ax_clock_ns(0);
 }
 
-// The compiler's own file: argument 0 if it names one (as the WebAssembly
-// host passes the module's path), else /proc/self/exe (Linux), else
-// argument 0 found in PATH (macOS, and Windows, where argument 0 is the
-// command as typed, perhaps without its ".exe"); nil if none.
+// The compiler's own file: what the host says it runs (the native
+// runtimes); else, where the host cannot say (WebAssembly's, which passes the
+// module's path), argument 0 if it names a file, or is found in PATH; nil if
+// none. (Not argument 0 first: run as `axiom` from PATH, a file of that name
+// in the current directory is not the compiler.)
 pub fn self_path() []u8 {
+    let mut buf: [4096]u8 = [0; 4096];
+    let n = ax_self_path(&mut buf[0], 4096);
+    if (n > 0) and (n <= 4096) {
+        let p = real_path(buf[0..@int_cast(usize, n)]);
+        if not isnos(p) {
+            return p;
+        }
+    }
     let args = program_args();
-    if (args.len > 0) and is_file(args[0]) {
+    if args.len == 0 {
+        return nosym();
+    }
+    if is_file(args[0]) {
         return real_path(args[0]);
     }
-    let win = on_windows();
-    if (args.len > 0) and win and is_file(cat2(args[0], ".exe")) {
-        return real_path(cat2(args[0], ".exe"));
+    if find(args[0], '/') >= 0 {
+        return nosym();
     }
-    let r = readlink("/proc/self/exe");
-    if not isnos(r) {
-        return r;
-    }
-    if (args.len > 0) and (find(args[0], '/') < 0) and not (win and (find(args[0], '\\') >= 0)) {
-        let path = env("PATH");
-        let mut sep: u8 = ':';
-        if win {
-            sep = ';';
-        }
-        if not isnos(path) {
-            let mut p: usize = 0;
-            while p <= path.len {
-                let mut e = p;
-                while (e < path.len) and (path[e] != sep) {
-                    e += 1;
-                }
-                let cand = cat3(path[p..e], "/", args[0]);
-                if (e > p) and win and is_file(cat2(cand, ".exe")) {
-                    return real_path(cat2(cand, ".exe"));
-                }
-                if (e > p) and (is_executable(cand) or (win and is_file(cand))) {
-                    return real_path(cand);
-                }
-                p = e + 1;
+    let path = env("PATH");
+    if not isnos(path) {
+        let mut p: usize = 0;
+        while p <= path.len {
+            let mut e = p;
+            while (e < path.len) and (path[e] != ':') {
+                e += 1;
             }
+            let cand = cat3(path[p..e], "/", args[0]);
+            if (e > p) and is_executable(cand) {
+                return real_path(cand);
+            }
+            p = e + 1;
         }
     }
     return nosym();
@@ -1985,6 +1984,12 @@ pub fn private_tmp_dir(prefix: []u8) []u8 {
     return nosym();
 }
 
+// Makes the directory path, which must not exist yet: false if it does (or
+// it cannot be made). One process of several racing to make it succeeds.
+pub fn mkdir_new(path: []u8) bool {
+    return ax_mkdir(path.ptr, path.len, 0o755) == 0;
+}
+
 pub fn rmdir(path: []u8) i32 {
     return ax_remove(path.ptr, path.len, 1);
 }
@@ -2076,9 +2081,16 @@ pub struct Ran {
 // The first of `names` that is an executable file (a name with a "/" as it
 // is, others looked for in PATH), or nosym().
 pub fn find_tool(names: [][]u8) []u8 {
+    // (Windows: PATH is ;-separated, a program is a .exe, and files have no
+    // execute permission to look at)
+    let win = on_windows();
+    let mut sep: u8 = ':';
+    if win {
+        sep = ';';
+    }
     for name in names {
         if find(name, '/') >= 0 {
-            if is_executable(name) {
+            if is_executable(name) or (win and is_file(name)) {
                 return name;
             }
             continue;
@@ -2090,12 +2102,16 @@ pub fn find_tool(names: [][]u8) []u8 {
         let mut p: usize = 0;
         while p < path.len {
             let rest = path[p..];
-            let e = find(rest, ':');
+            let e = find(rest, sep);
             let mut len = rest.len;
             if e >= 0 {
                 len = @int_cast(usize, e);
             }
-            if is_executable(f2("%s/%s", rest[0..len], name)) {
+            let cand = f2("%s/%s", rest[0..len], name);
+            if win and is_file(cat2(cand, ".exe")) {
+                return cat2(cand, ".exe");
+            }
+            if is_executable(cand) {
                 return name;
             }
             if e < 0 {
