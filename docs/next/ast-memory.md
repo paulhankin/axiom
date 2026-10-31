@@ -7,3 +7,6 @@
   arguments, `catch` captures and handlers) is kept apart. A statement is 136 bytes
   instead of 200 (`match` arms, loop labels, `errdefer` and compound assignments kept
   apart). Checking the compiler's own sources takes 88 MB instead of 171 MB.
+- An IR value is 200 bytes instead of 312: what only calls, phis, switches, allocas,
+  shuffles and constants have is kept apart. Building the compiler at `-O2` takes at
+  most 641 MB instead of 688 MB.
