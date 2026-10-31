@@ -34,3 +34,7 @@
   its own.
 - `snappy.decompress_raw` refuses a declared length its input cannot hold before
   allocating it.
+- On 32-bit targets (wasm32), `png.decode` refuses an image whose rows are too long
+  for a `usize` (a 60-byte file made it allocate 512 MB and trap), and `Image.init`
+  refuses with `TooLarge` an image whose bytes do not fit in one (it made a 1-byte
+  image that trapped when written).
