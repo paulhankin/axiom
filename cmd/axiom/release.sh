@@ -172,8 +172,7 @@ if [ "$cmd" = release ] || [ "$cmd" = fix ]; then
 
     # Build and test, unless this commit's archives are built already.
     if [ "$(cat build/release.commit 2>/dev/null)" != "$commit" ] || [ ! -f build/release/SHA256SUMS ]; then
-        sh cmd/axiom/release.sh build "$v"
-        echo "$commit" > build/release.commit
+        SKIP_TESTS=0 sh cmd/axiom/release.sh build "$v"
     fi
     grep -q "axiom-$v-" build/release/SHA256SUMS || die "build/release holds no archives for $v"
 
@@ -369,5 +368,10 @@ fi
 rm -rf "$R/stage"
 (cd "$R" && sha256sum axiom-"$v"-* > SHA256SUMS)
 cat "$R/SHA256SUMS"
-echo "$commit" > build/release.commit
+# (archives whose tests were skipped are never taken as built for a release)
+if [ "${SKIP_TESTS:-0}" != 1 ]; then
+    echo "$commit" > build/release.commit
+else
+    rm -f build/release.commit
+fi
 echo "built $R for $v (commit $commit)"

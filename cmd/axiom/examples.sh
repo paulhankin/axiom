@@ -40,11 +40,13 @@ build() {
 check() {
     n=$1
     shift
-    if "$@" > "$O/$n.out" 2>&1; then
+    "$@" > "$O/$n.out" 2>&1
+    st=$?
+    if [ "$st" -eq 0 ]; then
         echo "ok   run   $n"
         return 0
     fi
-    fail "run $n (status $?):"
+    fail "run $n (status $st):"
     sed 's/^/       /' "$O/$n.out" | head -5
     return 1
 }

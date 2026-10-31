@@ -12,6 +12,8 @@ set -u
 cd "$(dirname "$0")/../.."
 NEW=${1:-cmd/axiom/build/axiom}
 OLD=cmd/axiom/bootstrap/build/axiom
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
 pass=0
 fail=0
 
@@ -33,13 +35,12 @@ echo "diagnostics: $pass identical, $fail different"
 skip_platform=
 suite() {
     echo "suite: $*"
-    if ! AXIOM=$NEW AXIOM_TEST_SKIP_PLATFORM=$skip_platform node cmd/axiom/internal/tests/run.mjs "$@" > /tmp/axiom-difftest.$$ 2>&1; then
-        grep -v '^ok' /tmp/axiom-difftest.$$
+    if ! AXIOM=$NEW AXIOM_TEST_SKIP_PLATFORM=$skip_platform node cmd/axiom/internal/tests/run.mjs "$@" > "$T/suite.log" 2>&1; then
+        grep -v '^ok' "$T/suite.log"
         fail=$((fail + 1))
     else
-        tail -1 /tmp/axiom-difftest.$$
+        tail -1 "$T/suite.log"
     fi
-    rm -f /tmp/axiom-difftest.$$
     skip_platform=1
 }
 suite
