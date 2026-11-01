@@ -398,8 +398,23 @@ fn colour(f: *mut ir.Func) bool {
         order.get(k).aux = @int_cast(i64, k);
     }
     let sets = u.calloc_slice.[u64](nb * NSETS * W);
-    // gen and kill (walking each block backwards), writes and escapes
-    for k in 0..nb {
+    block_effects(&order, sets, W);
+    slot_liveness(&order, sets, W);
+    reached_escaped(&order, sets, W);
+    let ig = u.calloc_slice.[u64](n * W);
+    let mut copies = u.List.[*mut ir.Value].empty();
+    interference(&order, sets, W, ig, &mut copies);
+    u.free_slice.[u64](sets);
+    let changed = merge(f, ig, W, &mut copies);
+    u.free_slice.[u64](ig);
+    copies.deinit();
+    order.deinit();
+    return changed;
+}
+
+// Gen and kill of each block (walking it backwards), writes and escapes.
+fn block_effects(order: *u.List.[*mut ir.Block], sets: []mut u64, W: usize) void {
+    for k in 0..order.len {
         let blk = order.get(k);
         let at = k * NSETS * W;
         let mut i = blk.last;
@@ -428,11 +443,14 @@ fn colour(f: *mut ir.Func) bool {
             i = i.prev;
         }
     }
-    // liveness, backwards
+}
+
+// Liveness, backwards: live in and out of each block.
+fn slot_liveness(order: *u.List.[*mut ir.Block], sets: []mut u64, W: usize) void {
     let mut again = true;
     while again {
         again = false;
-        let mut k = nb;
+        let mut k = order.len;
         while k > 0 {
             k -= 1;
             let blk = order.get(k);
@@ -457,11 +475,14 @@ fn colour(f: *mut ir.Func) bool {
             }
         }
     }
-    // reached by a write, and escaped, forwards
-    again = true;
+}
+
+// Reached by a write, and escaped, at the start of each block (forwards).
+fn reached_escaped(order: *u.List.[*mut ir.Block], sets: []mut u64, W: usize) void {
+    let mut again = true;
     while again {
         again = false;
-        for k in 0..nb {
+        for k in 0..order.len {
             let blk = order.get(k);
             let at = k * NSETS * W;
             for p in blk.preds.items() {
@@ -481,16 +502,19 @@ fn colour(f: *mut ir.Func) bool {
             }
         }
     }
-    // interference: a write of X where Y is live after it (or read by it)
-    let ig = u.calloc_slice.[u64](n * W);
+}
+
+// Interference (ig: W words per slot): a write of X where Y is live after
+// it (or read by it). Copies between slots go to copies.
+fn interference(order: *u.List.[*mut ir.Block], sets: []u64, W: usize, ig: []mut u64,
+                copies: *mut u.List.[*mut ir.Value]) void {
     let live = u.calloc_slice.[u64](W);
     let rd = u.calloc_slice.[u64](W);
     let mut snaps = u.List.[u64].empty();
     let mut effd = u.List.[*mut ir.Value].empty();
-    let mut copies = u.List.[*mut ir.Value].empty();
     let r = u.calloc_slice.[u64](W);
     let es = u.calloc_slice.[u64](W);
-    for k in 0..nb {
+    for k in 0..order.len {
         let blk = order.get(k);
         let at = k * NSETS * W;
         // forwards: reached and escaped after each instruction that uses a slot
@@ -532,7 +556,6 @@ fn colour(f: *mut ir.Func) bool {
             j -= 1;
             let x = effd.get(j);
             effects(x);
-            let sat = j * 2 * W;
             for w in 0..W {
                 rd[w] = 0;
             }
@@ -544,38 +567,8 @@ fn colour(f: *mut ir.Func) bool {
             if same_dst > 0 {
                 copies.push(x);
             }
-            for e in effs.items() {
-                if (e & (E_WRITE | E_ESC)) == 0 {
-                    continue;
-                }
-                let s = @truncate(usize, e >> 4);
-                for w in 0..W {
-                    let mut m = (live[w] & snaps.get(sat + w)) | snaps.get(sat + W + w) | rd[w];
-                    if (same_dst == s + 1) and (w == ((same_src - 1) >> 6)) {
-                        // (a copy from the other at the same offset writes
-                        // what that one holds there: nothing, if they share;
-                        // unless the other's address has escaped: what it
-                        // points to may be written later, unseen, and that
-                        // must not change this one)
-                        let sb = @as(u64, 1) << @truncate(u32, (same_src - 1) & 63);
-                        if (snaps.get(sat + W + w) & sb) == 0 {
-                            m &= ~sb;
-                        }
-                    }
-                    if w == (s >> 6) {
-                        m &= ~(@as(u64, 1) << @truncate(u32, s & 63));
-                    }
-                    if m != 0 {
-                        ig[(s * W) + w] |= m;
-                        let mut mm = m;
-                        while mm != 0 {
-                            let y = (w << 6) + @truncate(usize, @ctz(mm));
-                            mm &= mm - 1;
-                            set(ig, y * W, s);
-                        }
-                    }
-                }
-            }
+            let sat = j * 2 * W;
+            interfere_writes(ig, W, live, rd, snaps.items()[sat..(sat + W)], snaps.items()[(sat + W)..(sat + (2 * W))]);
             for e in effs.items() {
                 if (e & E_KILL) != 0 {
                     unset(live, 0, @truncate(usize, e >> 4));
@@ -590,14 +583,46 @@ fn colour(f: *mut ir.Func) bool {
     u.free_slice.[u64](es);
     u.free_slice.[u64](live);
     u.free_slice.[u64](rd);
-    u.free_slice.[u64](sets);
     snaps.deinit();
     effd.deinit();
-    let changed = merge(f, ig, W, &mut copies);
-    u.free_slice.[u64](ig);
-    copies.deinit();
-    order.deinit();
-    return changed;
+}
+
+// The interference of the slots the instruction of effs writes (reached:
+// those reached by a write after it, escaped: escaped after it) with those
+// live after it or read by it (rd).
+fn interfere_writes(ig: []mut u64, W: usize, live: []u64, rd: []u64, reached: []u64, escaped: []u64) void {
+    for e in effs.items() {
+        if (e & (E_WRITE | E_ESC)) == 0 {
+            continue;
+        }
+        let s = @truncate(usize, e >> 4);
+        for w in 0..W {
+            let mut m = (live[w] & reached[w]) | escaped[w] | rd[w];
+            if (same_dst == s + 1) and (w == ((same_src - 1) >> 6)) {
+                // (a copy from the other at the same offset writes
+                // what that one holds there: nothing, if they share;
+                // unless the other's address has escaped: what it
+                // points to may be written later, unseen, and that
+                // must not change this one)
+                let sb = @as(u64, 1) << @truncate(u32, (same_src - 1) & 63);
+                if (escaped[w] & sb) == 0 {
+                    m &= ~sb;
+                }
+            }
+            if w == (s >> 6) {
+                m &= ~(@as(u64, 1) << @truncate(u32, s & 63));
+            }
+            if m != 0 {
+                ig[(s * W) + w] |= m;
+                let mut mm = m;
+                while mm != 0 {
+                    let y = (w << 6) + @truncate(usize, @ctz(mm));
+                    mm &= mm - 1;
+                    set(ig, y * W, s);
+                }
+            }
+        }
+    }
 }
 
 // Group of slot k (union-find over grp).

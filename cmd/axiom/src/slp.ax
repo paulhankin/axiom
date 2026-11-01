@@ -277,6 +277,15 @@ fn vectorize_mask(B: *mut ir.Builder, f: *mut ir.Func, root: *mut ir.Value, avx5
 // Masks of comparisons of neighbouring elements as vector comparisons
 // (x86-64). True if any changed.
 pub fn compare_masks(f: *mut ir.Func) bool {
+    // a root: an `or` of integers not itself part of a larger one
+    return each_tree_root(f, ir.OP_OR, 1, vectorize_mask);
+}
+
+// Calls vectorize on each root of a tree of op (an integer of min_bits to
+// 64 bits, used, but not by another op in its block) on x86-64, bottom up
+// in each block. True if any changed.
+fn each_tree_root(f: *mut ir.Func, op: i32, min_bits: i32,
+                  vectorize: fn(*mut ir.Builder, *mut ir.Func, *mut ir.Value, bool) bool) bool {
     if tg.g_arch != tg.ARCH_X64 {
         return false;
     }
@@ -291,10 +300,9 @@ pub fn compare_masks(f: *mut ir.Func) bool {
         let mut i = b.last;
         while u.notnil(i) {
             let prev = i.prev;
-            // a root: an `or` of integers not itself part of a larger one
-            if ir.is_op(i, ir.OP_OR) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) and (i.uses > 0) and
-               not ((i.uses == 1) and ir.is_op(i.user, ir.OP_OR) and (i.user.blk == b)) {
-                if vectorize_mask(B, f, i, avx512) {
+            if ir.is_op(i, op) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= min_bits) and (i.ty.bits <= 64) and
+               (i.uses > 0) and not ((i.uses == 1) and ir.is_op(i.user, op) and (i.user.blk == b)) {
+                if vectorize(B, f, i, avx512) {
                     any = true;
                     ir.count_uses(f);
                 }
@@ -560,73 +568,14 @@ fn mask_of(s: *mut Slp, cs: []mut *mut ir.Value, ivt: *mut ir.Ty, depth: i32) *m
             // one value against constants: a splat of it, compared with the
             // constants (extended to the lanes' width as the predicates read
             // them), or (several predicates) each lane's interval of values
-            let b = x.ty.bits;
-            let mut ext_op = ir.OP_ZEXT;
-            if sg {
-                ext_op = ir.OP_SEXT;
-            }
             let los = new_lanes(n);
             let spans = new_lanes(n);
-            let mut ok = true;
-            for k in 0..n {
-                let c = cs[k];
-                let p = ir.pred_of(c);
-                let kv = ir.cint_val(ir.resolve(c.b));
-                if same_p {
-                    let mut kx = kv & ir.mask_bits(b);
-                    if sg and (b < 64) {
-                        let sh = @int_cast(u32, 64 - b);
-                        kx = @bit_cast(u64, @bit_cast(i64, kv << sh) >> sh);
-                    }
-                    los[k] = ir.cint(ivt.elem, kx);
-                } else {
-                    let mut lo: i64 = 0;
-                    let mut hi: i64 = 0;
-                    if not interval_of(p, kv, b, sg, &mut lo, &mut hi) {
-                        ok = false;
-                        break;
-                    }
-                    los[k] = ir.cint(ivt.elem, @bit_cast(u64, lo));
-                    spans[k] = ir.cint(ivt.elem, @bit_cast(u64, hi - lo));
-                }
-            }
+            let ok = compare_lanes(cs, ivt, x.ty.bits, sg, same_p, los, spans);
             if ok {
                 for k in 0..n {
                     note_tree(s, cs[k]);
                 }
-                let mut r = vnil();
-                s.cost += 2;  // the splat, the compare
-                if b < w {
-                    s.cost += 1;
-                }
-                if not same_p {
-                    s.cost += 1;  // the subtraction
-                }
-                if s.emit {
-                    let xe = ir.cast(s.B, ext_op, x, ivt.elem);
-                    let v = ir.splat(s.B, ivt, xe);
-                    if same_p {
-                        r = ir.icmp(s.B, p0, v, const_vec(los, ivt));
-                    } else {
-                        // (x - lo < span + 1: without AVX-512 one compare
-                        // after the signs are flipped, where <= is two)
-                        let mut p = ir.IntULE;
-                        let mut wide = true;
-                        for k in 0..n {
-                            if spans[k].cv == ir.mask_bits(w) {
-                                wide = false;
-                            }
-                        }
-                        if wide {
-                            p = ir.IntULT;
-                            for k in 0..n {
-                                spans[k] = ir.cint(ivt.elem, spans[k].cv + 1);
-                            }
-                        }
-                        let d = ir.binop(s.B, ir.OP_SUB, v, const_vec(los, ivt));
-                        r = ir.icmp(s.B, p, d, const_vec(spans, ivt));
-                    }
-                }
+                let r = splat_compare(s, ivt, x, sg, same_p, p0, los, spans);
                 u.free_slice(los);
                 u.free_slice(spans);
                 return r;
@@ -655,36 +604,122 @@ fn mask_of(s: *mut Slp, cs: []mut *mut ir.Value, ivt: *mut ir.Ty, depth: i32) *m
         return vnil();
     }
     if all_op(cs, ir.OP_FCMP) {
-        let p0 = cs[0].cv;
-        let ft = ir.resolve(cs[0].a).ty;
-        for k in 0..n {
-            if (cs[k].cv != p0) or (ir.resolve(cs[k].a).ty != ft) {
-                s.ok = false;
-                return vnil();
-            }
-        }
-        if (ft.kind != ir.T_FLOAT) or (ft.bits != w) {
-            s.ok = false;
-            return vnil();
-        }
-        for k in 0..n {
-            note_tree(s, cs[k]);
-        }
-        let fvt = ir.t_vec(ft, @int_cast(u32, ivt.lanes));
-        let xs = operands(cs, 0);
-        let ys = operands(cs, 1);
-        let a = vec_of(s, xs, fvt, depth + 1);
-        let bb = vec_of(s, ys, fvt, depth + 1);
-        u.free_slice(xs);
-        u.free_slice(ys);
-        s.cost += 1;
-        if not s.emit {
-            return vnil();
-        }
-        return ir.fcmp(s.B, @truncate(i32, @bit_cast(i64, p0)), a, bb);
+        return fcmp_mask(s, cs, ivt, depth);
     }
     s.ok = false;
     return vnil();
+}
+
+// The constants lanes compare x (b bits) with, in cs (as wide as ivt's
+// lanes): with one predicate (same_p), each constant extended as it reads
+// them (los); else each lane's interval of values, from los[k] to los[k] +
+// spans[k]. False if a lane's values are no interval.
+fn compare_lanes(cs: []mut *mut ir.Value, ivt: *mut ir.Ty, b: i32, sg: bool, same_p: bool, los: []mut *mut ir.Value,
+                 spans: []mut *mut ir.Value) bool {
+    let n = cs.len;
+    for k in 0..n {
+        let c = cs[k];
+        let p = ir.pred_of(c);
+        let kv = ir.cint_val(ir.resolve(c.b));
+        if same_p {
+            let mut kx = kv & ir.mask_bits(b);
+            if sg and (b < 64) {
+                let sh = @int_cast(u32, 64 - b);
+                kx = @bit_cast(u64, @bit_cast(i64, kv << sh) >> sh);
+            }
+            los[k] = ir.cint(ivt.elem, kx);
+        } else {
+            let mut lo: i64 = 0;
+            let mut hi: i64 = 0;
+            if not interval_of(p, kv, b, sg, &mut lo, &mut hi) {
+                return false;
+            }
+            los[k] = ir.cint(ivt.elem, @bit_cast(u64, lo));
+            spans[k] = ir.cint(ivt.elem, @bit_cast(u64, hi - lo));
+        }
+    }
+    return true;
+}
+
+// A splat of x (extended to the lanes' width, signed if sg) compared with
+// the constants: with predicate p0 (same_p), else lane by lane against
+// their intervals (see compare_lanes).
+fn splat_compare(s: *mut Slp, ivt: *mut ir.Ty, x: *mut ir.Value, sg: bool, same_p: bool, p0: i32,
+                 los: []mut *mut ir.Value, spans: []mut *mut ir.Value) *mut ir.Value {
+    let n = los.len;
+    let w = ivt.elem.bits;
+    let b = x.ty.bits;
+    let mut ext_op = ir.OP_ZEXT;
+    if sg {
+        ext_op = ir.OP_SEXT;
+    }
+    let mut r = vnil();
+    s.cost += 2;  // the splat, the compare
+    if b < w {
+        s.cost += 1;
+    }
+    if not same_p {
+        s.cost += 1;  // the subtraction
+    }
+    if s.emit {
+        let xe = ir.cast(s.B, ext_op, x, ivt.elem);
+        let v = ir.splat(s.B, ivt, xe);
+        if same_p {
+            r = ir.icmp(s.B, p0, v, const_vec(los, ivt));
+        } else {
+            // (x - lo < span + 1: without AVX-512 one compare
+            // after the signs are flipped, where <= is two)
+            let mut p = ir.IntULE;
+            let mut wide = true;
+            for k in 0..n {
+                if spans[k].cv == ir.mask_bits(w) {
+                    wide = false;
+                }
+            }
+            if wide {
+                p = ir.IntULT;
+                for k in 0..n {
+                    spans[k] = ir.cint(ivt.elem, spans[k].cv + 1);
+                }
+            }
+            let d = ir.binop(s.B, ir.OP_SUB, v, const_vec(los, ivt));
+            r = ir.icmp(s.B, p, d, const_vec(spans, ivt));
+        }
+    }
+    return r;
+}
+
+// Float comparisons, one predicate and type for all lanes, as one.
+fn fcmp_mask(s: *mut Slp, cs: []mut *mut ir.Value, ivt: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let n = cs.len;
+    let w = ivt.elem.bits;
+    let p0 = cs[0].cv;
+    let ft = ir.resolve(cs[0].a).ty;
+    for k in 0..n {
+        if (cs[k].cv != p0) or (ir.resolve(cs[k].a).ty != ft) {
+            s.ok = false;
+            return vnil();
+        }
+    }
+    if (ft.kind != ir.T_FLOAT) or (ft.bits != w) {
+        s.ok = false;
+        return vnil();
+    }
+    for k in 0..n {
+        note_tree(s, cs[k]);
+    }
+    let fvt = ir.t_vec(ft, @int_cast(u32, ivt.lanes));
+    let xs = operands(cs, 0);
+    let ys = operands(cs, 1);
+    let a = vec_of(s, xs, fvt, depth + 1);
+    let bb = vec_of(s, ys, fvt, depth + 1);
+    u.free_slice(xs);
+    u.free_slice(ys);
+    s.cost += 1;
+    if not s.emit {
+        return vnil();
+    }
+    return ir.fcmp(s.B, @truncate(i32, @bit_cast(i64, p0)), a, bb);
 }
 
 // Can a load of lanes xs (in order) be one vector load: neighbouring
@@ -763,93 +798,18 @@ fn vec_of(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32) *mut
     }
     let x0 = xs[0];
     let mut gather = (depth >= SLP_DEPTH) or (x0.kind != ir.V_INST) or (x0.blk != s.first.blk) or not all_op(xs, x0.op);
-    if not gather and (s.skip != depth) and all_shared(xs) {
-        // lanes the scalar code keeps computing: put them together if that
-        // is cheaper than doing their operations in vector lanes too
-        let c0 = s.cost;
-        let t0 = s.tree.len;
-        let e0 = s.emit;
-        let k0 = s.skip;
-        s.emit = false;
-        s.skip = depth;
-        _ = vec_of(s, xs, vt, depth);
-        let vcost = s.cost - c0;
-        let vok = s.ok;
-        s.cost = c0;
-        s.tree.len = t0;
-        s.emit = e0;
-        s.skip = k0;
-        s.ok = true;
-        if not vok or (vcost >= @as(i32, @int_cast(i32, n))) {
-            gather = true;
-        }
+    if not gather and (s.skip != depth) and all_shared(xs) and not lanes_cheaper(s, xs, vt, depth) {
+        gather = true;
     }
     if not gather {
         let op = x0.op;
         if op == ir.OP_SELECT {
-            let mut conds_i1 = true;
-            for k in 0..n {
-                let c = ir.resolve(xs[k].a);
-                if (c.ty.kind != ir.T_INT) or (c.ty.bits != 1) {
-                    conds_i1 = false;
-                }
-            }
-            if conds_i1 {
-                for k in 0..n {
-                    note_tree(s, xs[k]);
-                }
-                let ivt = int_vec(vt);
-                let cs = operands(xs, 0);
-                let ts = operands(xs, 1);
-                let fs = operands(xs, 2);
-                let m = mask_of(s, cs, ivt, depth + 1);
-                let a = vec_of(s, ts, vt, depth + 1);
-                let bb = vec_of(s, fs, vt, depth + 1);
-                u.free_slice(cs);
-                u.free_slice(ts);
-                u.free_slice(fs);
-                if not s.ok {
-                    return vnil();
-                }
-                // x & m (zero elsewhere), or (x & m) | (y & ~m): one blend
-                // (or masked move) with AVX-512, else and, and-not and or
-                let zf = u.notnil(bb) and is_zero_vec(bb);
-                if zf {
-                    s.cost += 1;
-                } else {
-                    s.cost += 3;
-                }
-                if not s.emit {
-                    return vnil();
-                }
-                let xa = as_ty(s, a, ivt);
-                let mut r = ir.binop(s.B, ir.OP_AND, xa, m);
-                if not zf {
-                    let nm = ir.binop(s.B, ir.OP_XOR, m, ir.cones(ivt));
-                    let yb = ir.binop(s.B, ir.OP_AND, as_ty(s, bb, ivt), nm);
-                    r = ir.binop(s.B, ir.OP_OR, r, yb);
-                }
-                return as_ty(s, r, vt);
+            if all_i1(xs) {
+                return vec_select(s, xs, vt, depth);
             }
         } else if ((op == ir.OP_ZEXT) or (op == ir.OP_SEXT)) and (vt.elem.kind == ir.T_INT) and
                   (ir.resolve(x0.a).ty.bits == 1) and all_i1(xs) {
-            // a condition as 0 / 1 (or 0 / -1): its lane mask (and 1)
-            for k in 0..n {
-                note_tree(s, xs[k]);
-            }
-            let cs = operands(xs, 0);
-            let m = mask_of(s, cs, vt, depth + 1);
-            u.free_slice(cs);
-            if op == ir.OP_ZEXT {
-                s.cost += 2;  // (and the constant)
-            }
-            if not s.emit or not s.ok {
-                return vnil();
-            }
-            if op == ir.OP_SEXT {
-                return m;
-            }
-            return ir.binop(s.B, ir.OP_AND, m, ir.splat(s.B, vt, ir.cint(vt.elem, 1)));
+            return vec_bool(s, xs, vt, depth, op);
         } else if ((op >= ir.OP_ADD) and (op <= ir.OP_MUL)) or ((op >= ir.OP_AND) and (op <= ir.OP_XOR)) or
                   ((op >= ir.OP_FADD) and (op <= ir.OP_FDIV)) {
             for k in 0..n {
@@ -876,41 +836,142 @@ fn vec_of(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32) *mut
                 }
             }
             if same_ty and (ft.bits == vt.elem.bits) {
-                for k in 0..n {
-                    note_tree(s, xs[k]);
-                }
-                let svt = ir.t_vec(ft, @int_cast(u32, vt.lanes));
-                let as_ = operands(xs, 0);
-                let a = vec_of(s, as_, svt, depth + 1);
-                u.free_slice(as_);
-                s.cost += 1;
-                if not s.emit or not s.ok {
-                    return vnil();
-                }
-                return ir.cast(s.B, op, a, vt);
+                return vec_convert(s, xs, vt, depth, ft, op);
             }
         } else if (op == ir.OP_LOAD) and neighbour_loads(s, xs) {
-            for k in 0..n {
-                note_tree(s, xs[k]);
-            }
-            s.cost += 1;
-            if not s.emit {
-                return vnil();
-            }
-            // (before the first store, where the scalar loads were read;
-            // lane 0's address computed there when its own comes later)
-            let B2 = ir.new_builder();
-            ir.at_before(B2, s.first);
-            let mut a = ir.resolve(x0.a);
-            if not defined_before(a, s.first) {
-                a = ir.ptradd(B2, ir.resolve(a.a), ir.resolve(a.b));
-            }
-            let ld = ir.load(B2, vt, a);
-            ld.align = 1;
-            return ld;
+            return vec_load(s, xs, vt);
         }
     }
-    // put together: the constants, then each other lane inserted
+    return gather_lanes(s, xs, vt);
+}
+
+// Are lanes the scalar code keeps computing cheaper done in vector lanes too
+// than put together? (A trial run of vec_of that emits nothing.)
+fn lanes_cheaper(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32) bool {
+    let n = xs.len;
+    let c0 = s.cost;
+    let t0 = s.tree.len;
+    let e0 = s.emit;
+    let k0 = s.skip;
+    s.emit = false;
+    s.skip = depth;
+    _ = vec_of(s, xs, vt, depth);
+    let vcost = s.cost - c0;
+    let vok = s.ok;
+    s.cost = c0;
+    s.tree.len = t0;
+    s.emit = e0;
+    s.skip = k0;
+    s.ok = true;
+    return vok and (vcost < @as(i32, @int_cast(i32, n)));
+}
+
+// A select of i1 conditions, lane by lane.
+fn vec_select(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32) *mut ir.Value {
+    let n = xs.len;
+    for k in 0..n {
+        note_tree(s, xs[k]);
+    }
+    let ivt = int_vec(vt);
+    let cs = operands(xs, 0);
+    let ts = operands(xs, 1);
+    let fs = operands(xs, 2);
+    let m = mask_of(s, cs, ivt, depth + 1);
+    let a = vec_of(s, ts, vt, depth + 1);
+    let bb = vec_of(s, fs, vt, depth + 1);
+    u.free_slice(cs);
+    u.free_slice(ts);
+    u.free_slice(fs);
+    if not s.ok {
+        return vnil();
+    }
+    // x & m (zero elsewhere), or (x & m) | (y & ~m): one blend
+    // (or masked move) with AVX-512, else and, and-not and or
+    let zf = u.notnil(bb) and is_zero_vec(bb);
+    if zf {
+        s.cost += 1;
+    } else {
+        s.cost += 3;
+    }
+    if not s.emit {
+        return vnil();
+    }
+    let xa = as_ty(s, a, ivt);
+    let mut r = ir.binop(s.B, ir.OP_AND, xa, m);
+    if not zf {
+        let nm = ir.binop(s.B, ir.OP_XOR, m, ir.cones(ivt));
+        let yb = ir.binop(s.B, ir.OP_AND, as_ty(s, bb, ivt), nm);
+        r = ir.binop(s.B, ir.OP_OR, r, yb);
+    }
+    return as_ty(s, r, vt);
+}
+
+// An i1 condition as 0 / 1 (zext) or 0 / -1 (sext), lane by lane.
+fn vec_bool(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32, op: i32) *mut ir.Value {
+    let n = xs.len;
+    for k in 0..n {
+        note_tree(s, xs[k]);
+    }
+    let cs = operands(xs, 0);
+    let m = mask_of(s, cs, vt, depth + 1);
+    u.free_slice(cs);
+    if op == ir.OP_ZEXT {
+        s.cost += 2;  // (and the constant)
+    }
+    if not s.emit or not s.ok {
+        return vnil();
+    }
+    if op == ir.OP_SEXT {
+        return m;
+    }
+    return ir.binop(s.B, ir.OP_AND, m, ir.splat(s.B, vt, ir.cint(vt.elem, 1)));
+}
+
+// A conversion op of lanes of type ft as wide as vt's, lane by lane.
+fn vec_convert(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty, depth: i32, ft: *mut ir.Ty,
+               op: i32) *mut ir.Value {
+    let n = xs.len;
+    for k in 0..n {
+        note_tree(s, xs[k]);
+    }
+    let svt = ir.t_vec(ft, @int_cast(u32, vt.lanes));
+    let as_ = operands(xs, 0);
+    let a = vec_of(s, as_, svt, depth + 1);
+    u.free_slice(as_);
+    s.cost += 1;
+    if not s.emit or not s.ok {
+        return vnil();
+    }
+    return ir.cast(s.B, op, a, vt);
+}
+
+// Loads of neighbouring elements, as one.
+fn vec_load(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty) *mut ir.Value {
+    let n = xs.len;
+    let x0 = xs[0];
+    for k in 0..n {
+        note_tree(s, xs[k]);
+    }
+    s.cost += 1;
+    if not s.emit {
+        return vnil();
+    }
+    // (before the first store, where the scalar loads were read;
+    // lane 0's address computed there when its own comes later)
+    let B2 = ir.new_builder();
+    ir.at_before(B2, s.first);
+    let mut a = ir.resolve(x0.a);
+    if not defined_before(a, s.first) {
+        a = ir.ptradd(B2, ir.resolve(a.a), ir.resolve(a.b));
+    }
+    let ld = ir.load(B2, vt, a);
+    ld.align = 1;
+    return ld;
+}
+
+// The lanes put together: the constants, then each other lane inserted.
+fn gather_lanes(s: *mut Slp, xs: []mut *mut ir.Value, vt: *mut ir.Ty) *mut ir.Value {
+    let n = xs.len;
     let cs = new_lanes(n);
     for k in 0..n {
         if lane_const(xs[k]) {
@@ -1857,31 +1918,6 @@ fn vectorize_sum(B: *mut ir.Builder, f: *mut ir.Func, root: *mut ir.Value, avx51
 
 // Sums of neighbouring bytes as vector sums (x86-64). True if any changed.
 pub fn byte_sums(f: *mut ir.Func) bool {
-    if tg.g_arch != tg.ARCH_X64 {
-        return false;
-    }
-    let feats = tg.fn_features(f);
-    let need = (tg.X_AVX512F | tg.X_AVX512BW) | tg.X_AVX512VL;
-    let avx512 = (feats & need) == need;
-    ir.count_uses(f);
-    let B = ir.new_builder();
-    let mut any = false;
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.last;
-        while u.notnil(i) {
-            let prev = i.prev;
-            // a root: an `add` of integers not itself part of a larger one
-            if ir.is_op(i, ir.OP_ADD) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= 8) and (i.ty.bits <= 64) and
-               (i.uses > 0) and not ((i.uses == 1) and ir.is_op(i.user, ir.OP_ADD) and (i.user.blk == b)) {
-                if vectorize_sum(B, f, i, avx512) {
-                    any = true;
-                    ir.count_uses(f);
-                }
-            }
-            i = prev;
-        }
-        b = b.next;
-    }
-    return any;
+    // a root: an `add` of integers not itself part of a larger one
+    return each_tree_root(f, ir.OP_ADD, 8, vectorize_sum);
 }

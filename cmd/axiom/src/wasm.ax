@@ -1611,48 +1611,7 @@ pub fn fn_type(t: *ir.Ty) u32 {
 fn gen_intr(v: *mut ir.Value) void {
     let id = @truncate(i32, @bit_cast(i64, v.cv));
     let t = v.ty;
-    let n = v.xs.len;
-    if id == ir.IN_TRAP {
-        op(0x00);
-        return;
-    }
-    if id == ir.IN_MEMSIZE {
-        op(0x3f);
-        op(0);
-        return;
-    }
-    if id == ir.IN_MEMGROW {
-        push(v.xs.get(0));
-        op(0x40);
-        op(0);
-        return;
-    }
-    if id == ir.IN_WAIT32 {
-        push(v.xs.get(0));
-        push(v.xs.get(1));
-        push(v.xs.get(2));
-        op_fe(1);
-        memarg(4, 4, 0);
-        return;
-    }
-    if id == ir.IN_NOTIFY {
-        push(v.xs.get(0));
-        push(v.xs.get(1));
-        op_fe(0);
-        memarg(4, 4, 0);
-        return;
-    }
-    if id == ir.IN_GET_SP {
-        op(0x23);
-        reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
-        C.uleb5(0);
-        return;
-    }
-    if id == ir.IN_SET_SP {
-        push(v.xs.get(0));
-        op(0x24);
-        reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
-        C.uleb5(0);
+    if gen_sys_intr(v, id) {
         return;
     }
     let a = v.xs.get(0);
@@ -1666,49 +1625,11 @@ fn gen_intr(v: *mut ir.Value) void {
         return;
     }
     if t.kind == ir.T_FLOAT {
-        let f64_ = t.bits == 64;
-        let mut base: u8 = 0x8b;
-        if f64_ {
-            base = 0x99;
-        }
-        if id == ir.IN_FABS {
-            push(a);
-            op(base);
-        } else if id == ir.IN_CEIL {
-            push(a);
-            op(base + 2);
-        } else if id == ir.IN_FLOOR {
-            push(a);
-            op(base + 3);
-        } else if id == ir.IN_FTRUNC {
-            push(a);
-            op(base + 4);
-        } else if id == ir.IN_NEAREST {
-            push(a);
-            op(base + 5);
-        } else if id == ir.IN_SQRT {
-            push(a);
-            op(base + 6);
-        } else if id == ir.IN_FMIN {
-            push(a);
-            push(v.xs.get(1));
-            op(base + 11);
-        } else if id == ir.IN_FMAX {
-            push(a);
-            push(v.xs.get(1));
-            op(base + 12);
-        } else if id == ir.IN_COPYSIGN {
-            push(a);
-            push(v.xs.get(1));
-            op(base + 13);
-        } else {
-            fail(u.f1("float intrinsic %s", u.idec(id)));
-        }
+        gen_float_intr(v, id);
         return;
     }
     // integers
     let bits = t.bits;
-    let w = is64(t);
     if id == ir.IN_CTLZ {
         push_ext(a, false);
         iop(t, 0x67, 0x79);
@@ -1733,88 +1654,15 @@ fn gen_intr(v: *mut ir.Value) void {
         return;
     }
     if (id == ir.IN_ROTL) or (id == ir.IN_ROTR) {
-        let k = v.xs.get(1);
-        if bits >= 32 {
-            push(a);
-            push(k);
-            if id == ir.IN_ROTL {
-                iop(t, 0x77, 0x89);
-            } else {
-                iop(t, 0x78, 0x8a);
-            }
-            return;
-        }
-        // narrow: (x << k | x >> (bits - k)) with k taken mod bits
-        let x = new_local(wo.I32);
-        let kk = new_local(wo.I32);
-        push_ext(a, false);
-        local_set(x);
-        push(k);
-        i32c(@as(i64, bits - 1));
-        op(0x71);
-        if id == ir.IN_ROTR {
-            // rotr k = rotl (bits - k) mod bits
-            local_set(kk);
-            i32c(@as(i64, bits));
-            local_get(kk);
-            op(0x6b);
-            i32c(@as(i64, bits - 1));
-            op(0x71);
-        }
-        local_set(kk);
-        local_get(x);
-        local_get(kk);
-        op(0x74);
-        local_get(x);
-        i32c(@as(i64, bits));
-        local_get(kk);
-        op(0x6b);
-        op(0x76);
-        op(0x72);
+        gen_rotate(v, id);
         return;
     }
     if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
-        let sg = (id == ir.IN_SMIN) or (id == ir.IN_SMAX);
-        let x = new_local(vt(t));
-        let y = new_local(vt(t));
-        push_ext(a, sg);
-        local_tee(x);
-        push_ext(v.xs.get(1), sg);
-        local_tee(y);
-        local_get(x);
-        local_get(y);
-        if id == ir.IN_SMIN {
-            icmp_op(ir.IntSLT, w);
-        } else if id == ir.IN_SMAX {
-            icmp_op(ir.IntSGT, w);
-        } else if id == ir.IN_UMIN {
-            icmp_op(ir.IntULT, w);
-        } else {
-            icmp_op(ir.IntUGT, w);
-        }
-        op(0x1b);
+        gen_minmax(v, id);
         return;
     }
     if id == ir.IN_ABS {
-        let x = new_local(vt(t));
-        push_ext(a, true);
-        local_set(x);
-        if w {
-            i64c(0);
-        } else {
-            i32c(0);
-        }
-        local_get(x);
-        iop(t, 0x6b, 0x7d);
-        local_get(x);
-        local_get(x);
-        if w {
-            i64c(0);
-        } else {
-            i32c(0);
-        }
-        icmp_op(ir.IntSLT, w);
-        op(0x1b);
+        gen_abs(v);
         return;
     }
     if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
@@ -1822,6 +1670,193 @@ fn gen_intr(v: *mut ir.Value) void {
         return;
     }
     fail(u.f1("intrinsic %s", u.idec(id)));
+}
+
+// The intrinsics of the machine rather than of values: traps, memory size
+// and growth, atomic waits and notifies, the stack pointer. False if v is
+// not one.
+fn gen_sys_intr(v: *mut ir.Value, id: i32) bool {
+    if id == ir.IN_TRAP {
+        op(0x00);
+        return true;
+    }
+    if id == ir.IN_MEMSIZE {
+        op(0x3f);
+        op(0);
+        return true;
+    }
+    if id == ir.IN_MEMGROW {
+        push(v.xs.get(0));
+        op(0x40);
+        op(0);
+        return true;
+    }
+    if id == ir.IN_WAIT32 {
+        push(v.xs.get(0));
+        push(v.xs.get(1));
+        push(v.xs.get(2));
+        op_fe(1);
+        memarg(4, 4, 0);
+        return true;
+    }
+    if id == ir.IN_NOTIFY {
+        push(v.xs.get(0));
+        push(v.xs.get(1));
+        op_fe(0);
+        memarg(4, 4, 0);
+        return true;
+    }
+    if id == ir.IN_GET_SP {
+        sp_global(0x23);
+        return true;
+    }
+    if id == ir.IN_SET_SP {
+        push(v.xs.get(0));
+        sp_global(0x24);
+        return true;
+    }
+    return false;
+}
+
+// A float intrinsic (f32 or f64 by v's type).
+fn gen_float_intr(v: *mut ir.Value, id: i32) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let f64_ = t.bits == 64;
+    let mut base: u8 = 0x8b;
+    if f64_ {
+        base = 0x99;
+    }
+    if id == ir.IN_FABS {
+        push(a);
+        op(base);
+    } else if id == ir.IN_CEIL {
+        push(a);
+        op(base + 2);
+    } else if id == ir.IN_FLOOR {
+        push(a);
+        op(base + 3);
+    } else if id == ir.IN_FTRUNC {
+        push(a);
+        op(base + 4);
+    } else if id == ir.IN_NEAREST {
+        push(a);
+        op(base + 5);
+    } else if id == ir.IN_SQRT {
+        push(a);
+        op(base + 6);
+    } else if id == ir.IN_FMIN {
+        push(a);
+        push(v.xs.get(1));
+        op(base + 11);
+    } else if id == ir.IN_FMAX {
+        push(a);
+        push(v.xs.get(1));
+        op(base + 12);
+    } else if id == ir.IN_COPYSIGN {
+        push(a);
+        push(v.xs.get(1));
+        op(base + 13);
+    } else {
+        fail(u.f1("float intrinsic %s", u.idec(id)));
+    }
+}
+
+// Rotations: wasm's own for 32 and 64 bits, shifts for narrower ones.
+fn gen_rotate(v: *mut ir.Value, id: i32) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let bits = t.bits;
+    let k = v.xs.get(1);
+    if bits >= 32 {
+        push(a);
+        push(k);
+        if id == ir.IN_ROTL {
+            iop(t, 0x77, 0x89);
+        } else {
+            iop(t, 0x78, 0x8a);
+        }
+        return;
+    }
+    // narrow: (x << k | x >> (bits - k)) with k taken mod bits
+    let x = new_local(wo.I32);
+    let kk = new_local(wo.I32);
+    push_ext(a, false);
+    local_set(x);
+    push(k);
+    i32c(@as(i64, bits - 1));
+    op(0x71);
+    if id == ir.IN_ROTR {
+        // rotr k = rotl (bits - k) mod bits
+        local_set(kk);
+        i32c(@as(i64, bits));
+        local_get(kk);
+        op(0x6b);
+        i32c(@as(i64, bits - 1));
+        op(0x71);
+    }
+    local_set(kk);
+    local_get(x);
+    local_get(kk);
+    op(0x74);
+    local_get(x);
+    i32c(@as(i64, bits));
+    local_get(kk);
+    op(0x6b);
+    op(0x76);
+    op(0x72);
+}
+
+// Integer minimum and maximum: a select on a comparison.
+fn gen_minmax(v: *mut ir.Value, id: i32) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let w = is64(t);
+    let sg = (id == ir.IN_SMIN) or (id == ir.IN_SMAX);
+    let x = new_local(vt(t));
+    let y = new_local(vt(t));
+    push_ext(a, sg);
+    local_tee(x);
+    push_ext(v.xs.get(1), sg);
+    local_tee(y);
+    local_get(x);
+    local_get(y);
+    if id == ir.IN_SMIN {
+        icmp_op(ir.IntSLT, w);
+    } else if id == ir.IN_SMAX {
+        icmp_op(ir.IntSGT, w);
+    } else if id == ir.IN_UMIN {
+        icmp_op(ir.IntULT, w);
+    } else {
+        icmp_op(ir.IntUGT, w);
+    }
+    op(0x1b);
+}
+
+// Absolute value: a select of x and 0 - x.
+fn gen_abs(v: *mut ir.Value) void {
+    let t = v.ty;
+    let a = v.xs.get(0);
+    let w = is64(t);
+    let x = new_local(vt(t));
+    push_ext(a, true);
+    local_set(x);
+    if w {
+        i64c(0);
+    } else {
+        i32c(0);
+    }
+    local_get(x);
+    iop(t, 0x6b, 0x7d);
+    local_get(x);
+    local_get(x);
+    if w {
+        i64c(0);
+    } else {
+        i32c(0);
+    }
+    icmp_op(ir.IntSLT, w);
+    op(0x1b);
 }
 
 // Saturating add / sub on scalars: computed wide (i64 for <= 32 bits) and
@@ -1960,45 +1995,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     let t = v.ty;
     let sh = lane_shape(t);
     if sh >= 4 {
-        let f64_ = sh == 5;
-        if id == ir.IN_FABS {
-            push(a);
-            op_fd(@as(u64, u.pick(f64_, "\xec", "\xe0")[0]));
-        } else if id == ir.IN_SQRT {
-            push(a);
-            op_fd(@as(u64, u.pick(f64_, "\xef", "\xe3")[0]));
-        } else if id == ir.IN_CEIL {
-            push(a);
-            op_fd(@as(u64, u.pick(f64_, "\x74", "\x67")[0]));
-        } else if id == ir.IN_FLOOR {
-            push(a);
-            op_fd(@as(u64, u.pick(f64_, "\x75", "\x68")[0]));
-        } else if id == ir.IN_FTRUNC {
-            push(a);
-            op_fd(@as(u64, u.pick(f64_, "\x7a", "\x69")[0]));
-        } else if id == ir.IN_NEAREST {
-            push(a);
-            if f64_ {
-                op_fd(148);
-            } else {
-                op_fd(106);
-            }
-        } else if (id == ir.IN_FMIN) or (id == ir.IN_FMAX) {
-            push(a);
-            push(v.xs.get(1));
-            let mut c: u64 = 232;
-            if f64_ {
-                c = 244;
-            }
-            if id == ir.IN_FMAX {
-                c += 1;
-            }
-            op_fd(c);
-        } else if id == ir.IN_FMA {
-            vec_fma(v);
-        } else {
-            fail(u.f1("vector float intrinsic %s", u.idec(id)));
-        }
+        gen_vec_float_intr(v, id, sh == 5);
         return;
     }
     if id == ir.IN_ABS {
@@ -2008,42 +2005,7 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if (id == ir.IN_SMIN) or (id == ir.IN_UMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMAX) {
-        if sh == 3 {
-            // i64x2: bitselect(a, b, a < b)
-            let x = new_local(wo.V128);
-            let y = new_local(wo.V128);
-            push(a);
-            local_tee(x);
-            push(v.xs.get(1));
-            local_tee(y);
-            local_get(x);
-            if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
-                flip_i64_signs();
-            }
-            local_get(y);
-            if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
-                flip_i64_signs();
-            }
-            if (id == ir.IN_SMIN) or (id == ir.IN_UMIN) {
-                op_fd(216);  // lt_s
-            } else {
-                op_fd(217);  // gt_s
-            }
-            op_fd(82);
-            return;
-        }
-        push(a);
-        push(v.xs.get(1));
-        let base: [3]u64 = [118, 150, 182];
-        let mut k: u64 = 0;
-        if id == ir.IN_UMIN {
-            k = 1;
-        } else if id == ir.IN_SMAX {
-            k = 2;
-        } else if id == ir.IN_UMAX {
-            k = 3;
-        }
-        op_fd(@as(u64, base[@int_cast(usize, sh)]) + k);
+        gen_vec_minmax(v, id, sh);
         return;
     }
     if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
@@ -2075,6 +2037,90 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         }
     }
     vec_lanewise(v);
+}
+
+// A vector float intrinsic, on f64 lanes or f32 ones.
+fn gen_vec_float_intr(v: *mut ir.Value, id: i32, f64_: bool) void {
+    let a = v.xs.get(0);
+    if id == ir.IN_FABS {
+        push(a);
+        op_fd(@as(u64, u.pick(f64_, "\xec", "\xe0")[0]));
+    } else if id == ir.IN_SQRT {
+        push(a);
+        op_fd(@as(u64, u.pick(f64_, "\xef", "\xe3")[0]));
+    } else if id == ir.IN_CEIL {
+        push(a);
+        op_fd(@as(u64, u.pick(f64_, "\x74", "\x67")[0]));
+    } else if id == ir.IN_FLOOR {
+        push(a);
+        op_fd(@as(u64, u.pick(f64_, "\x75", "\x68")[0]));
+    } else if id == ir.IN_FTRUNC {
+        push(a);
+        op_fd(@as(u64, u.pick(f64_, "\x7a", "\x69")[0]));
+    } else if id == ir.IN_NEAREST {
+        push(a);
+        if f64_ {
+            op_fd(148);
+        } else {
+            op_fd(106);
+        }
+    } else if (id == ir.IN_FMIN) or (id == ir.IN_FMAX) {
+        push(a);
+        push(v.xs.get(1));
+        let mut c: u64 = 232;
+        if f64_ {
+            c = 244;
+        }
+        if id == ir.IN_FMAX {
+            c += 1;
+        }
+        op_fd(c);
+    } else if id == ir.IN_FMA {
+        vec_fma(v);
+    } else {
+        fail(u.f1("vector float intrinsic %s", u.idec(id)));
+    }
+}
+
+// Integer minimum and maximum of vectors with lane shape sh.
+fn gen_vec_minmax(v: *mut ir.Value, id: i32, sh: i32) void {
+    let a = v.xs.get(0);
+    if sh == 3 {
+        // i64x2: bitselect(a, b, a < b)
+        let x = new_local(wo.V128);
+        let y = new_local(wo.V128);
+        push(a);
+        local_tee(x);
+        push(v.xs.get(1));
+        local_tee(y);
+        local_get(x);
+        if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+            flip_i64_signs();
+        }
+        local_get(y);
+        if (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+            flip_i64_signs();
+        }
+        if (id == ir.IN_SMIN) or (id == ir.IN_UMIN) {
+            op_fd(216);  // lt_s
+        } else {
+            op_fd(217);  // gt_s
+        }
+        op_fd(82);
+        return;
+    }
+    push(a);
+    push(v.xs.get(1));
+    let base: [3]u64 = [118, 150, 182];
+    let mut k: u64 = 0;
+    if id == ir.IN_UMIN {
+        k = 1;
+    } else if id == ir.IN_SMAX {
+        k = 2;
+    } else if id == ir.IN_UMAX {
+        k = 3;
+    }
+    op_fd(@as(u64, base[@int_cast(usize, sh)]) + k);
 }
 
 // Per-lane fallback: extract each lane, apply the scalar operation, rebuild.
@@ -2986,37 +3032,29 @@ fn emit_switch(x: *mut ir.Block, t: *mut ir.Value) void {
     }
 }
 
+// global.get (0x23) or global.set (0x24) of the stack pointer.
+fn sp_global(opcode: u8) void {
+    op(opcode);
+    reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
+    C.uleb5(0);
+}
+
 fn epilogue() void {
     if frame_size > 0 {
         local_get(fp_local);
         pconst(frame_size);
         padd_sub(false);
-        op(0x24);
-        reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
-        C.uleb5(0);
+        sp_global(0x24);
     }
 }
 
 // -----------------------------------------------------------------------------
 // Functions
 // -----------------------------------------------------------------------------
-fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
-    F = f;
-    C = bn.new_bytes();
-    set_end = 0xffff_ffff;
-    RL = u.List.[wo.Reloc].empty();
-    LT = u.List.[u8].empty();
-    ctx.clear();
-    nparams = @int_cast(u32, f.params.len);
-    opt.compute_preds(f);
-    let order = opt.dominators(f);
-    let nb = order.len;
-    let merge = u.newn.[bool](nb + 1);
-    let header = u.newn.[bool](nb + 1);
-    merge_p = merge.ptr;
-    header_p = header.ptr;
-    nblocks = nb;
-    for i in 0..nb {
+// Which blocks (in order) are joins of forward edges (merge) and loop
+// headers (header).
+fn mark_joins(order: *u.List.[*mut ir.Block], merge: []mut bool, header: []mut bool) void {
+    for i in 0..order.len {
         let b = order.get(i);
         let mut fwd: usize = 0;
         for k in 0..b.preds.len {
@@ -3040,9 +3078,12 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
         }
         merge[i] = fwd >= 2;
     }
-    count_uses(f);
-    classify(f);
-    // frame: allocas
+}
+
+// The frame: the allocas' offsets in it, and a buffer for the variadic
+// arguments of any call (frame_size, va_off). False (having failed) if it
+// is too large.
+fn lay_out_frame(f: *mut ir.Func) bool {
     frame_size = 0;
     let mut b = f.first;
     while u.notnil(b) {
@@ -3092,44 +3133,13 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     frame_size = (frame_size + 15) & ~@as(u64, 15);
     if frame_size > FRAME_MAX {
         fail("the stack frame is too large");
-        return;
+        return false;
     }
-    if frame_size > 0 {
-        fp_local = new_local(ptr_vt());
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if (i.ty.kind == ir.T_VEC) and not tg.has(tg.W_SIMD128) {
-                fail("vector types need the simd128 extension (--features=+simd128)");
-                return;
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-    // locals for values
-    alloc_locals(f, order);
-    // prologue
-    if frame_size > 0 {
-        op(0x23);
-        reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
-        C.uleb5(0);
-        pconst(frame_size);
-        padd_sub(true);
-        local_tee(fp_local);
-        op(0x24);
-        reloc(wo.R_GLOBAL_INDEX_LEB, sp_sym, 0);
-        C.uleb5(0);
-    }
-    do_tree(order.get(0));
-    if f.ty.ret.kind != ir.T_VOID {
-        op(0x00);
-    }
-    op(0x0b);
-    // body = locals (run-length encoded) + code
-    let mut body = bn.new_bytes();
+    return true;
+}
+
+// The local declarations of the function (LT), run-length encoded.
+fn put_locals(body: *mut bn.Bytes) void {
     let mut groups: u64 = 0;
     let mut k: usize = 0;
     while k < LT.len {
@@ -3151,6 +3161,63 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
         body.u8_(LT.get(k));
         k = j;
     }
+}
+
+fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
+    F = f;
+    C = bn.new_bytes();
+    set_end = 0xffff_ffff;
+    RL = u.List.[wo.Reloc].empty();
+    LT = u.List.[u8].empty();
+    ctx.clear();
+    nparams = @int_cast(u32, f.params.len);
+    opt.compute_preds(f);
+    let order = opt.dominators(f);
+    let nb = order.len;
+    let merge = u.newn.[bool](nb + 1);
+    let header = u.newn.[bool](nb + 1);
+    merge_p = merge.ptr;
+    header_p = header.ptr;
+    nblocks = nb;
+    mark_joins(&order, merge, header);
+    count_uses(f);
+    classify(f);
+    if not lay_out_frame(f) {
+        return;
+    }
+    if frame_size > 0 {
+        fp_local = new_local(ptr_vt());
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.ty.kind == ir.T_VEC) and not tg.has(tg.W_SIMD128) {
+                fail("vector types need the simd128 extension (--features=+simd128)");
+                return;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    // locals for values
+    alloc_locals(f, order);
+    // prologue
+    if frame_size > 0 {
+        sp_global(0x23);
+        pconst(frame_size);
+        padd_sub(true);
+        local_tee(fp_local);
+        sp_global(0x24);
+    }
+    do_tree(order.get(0));
+    if f.ty.ret.kind != ir.T_VOID {
+        op(0x00);
+    }
+    op(0x0b);
+    // body = locals (run-length encoded) + code
+    let mut body = bn.new_bytes();
+    put_locals(&mut body);
     let base = @int_cast(u32, body.len());
     body.put(C.view());
     wf.body = body;
