@@ -1019,14 +1019,13 @@ struct Work {
     xs: []mut f64,
 }
 
-/// The cheapest coding of one channel's block x (samples of bps bits).
-fn plan_channel(x0: []i64, bps0: u32, st: *Settings, w: *mut Work, x: []mut i64) Plan {
-    let n = x0.len;
-    let mut plan = Plan.{
+// A verbatim plan for samples of bps bits (its cost to be filled in).
+fn verbatim_plan(bps: u32) Plan {
+    return Plan.{
         kind: 1,
         order: 0,
         wasted: 0,
-        bps: bps0,
+        bps: bps,
         prec: 0,
         shift: 0,
         coef: [0; 32],
@@ -1035,6 +1034,12 @@ fn plan_channel(x0: []i64, bps0: u32, st: *Settings, w: *mut Work, x: []mut i64)
         wide: false,
         cost: 0,
     };
+}
+
+/// The cheapest coding of one channel's block x (samples of bps bits).
+fn plan_channel(x0: []i64, bps0: u32, st: *Settings, w: *mut Work, x: []mut i64) Plan {
+    let n = x0.len;
+    let mut plan = verbatim_plan(bps0);
     // constant?
     let mut all_same = true;
     let mut or_bits: u64 = 0;
@@ -1090,45 +1095,12 @@ fn plan_channel(x0: []i64, bps0: u32, st: *Settings, w: *mut Work, x: []mut i64)
     if not st.lpc or (n <= st.max_lpc) or (n < 32) {
         return plan;
     }
-    // LPC: Levinson-Durbin on the autocorrelation of the windowed block
+    // LPC
     let maxo = st.max_lpc;
-    for i in @as(usize, 0)..n {
-        w.xs[i] = @float_from_int(f64, xs[i]) * w.win[i];
-    }
-    let mut ac: [33]f64 = [0.0; 33];
-    for lag in @as(usize, 0)..maxo + 1 {
-        let mut s: f64 = 0.0;
-        for i in lag..n {
-            s += w.xs[i] * w.xs[i - lag];
-        }
-        ac[lag] = s;
-    }
-    if ac[0] == 0.0 {
-        return plan;
-    }
-    ac[0] *= 1.0 + 1e-9;  // a touch of white noise for stability
-    let mut a: [33]f64 = [0.0; 33];
-    let mut err = ac[0];
     let mut lpcs: [33][33]f64 = [[0.0; 33]; 33];
     let mut errs: [33]f64 = [0.0; 33];
-    for m in @as(usize, 1)..maxo + 1 {
-        let mut acc = ac[m];
-        for j in @as(usize, 1)..m {
-            acc -= a[j] * ac[m - j];
-        }
-        let k = acc / err;
-        let mut na = a;
-        na[m] = k;
-        for j in @as(usize, 1)..m {
-            na[j] = a[j] - (k * a[m - j]);
-        }
-        a = na;
-        err *= 1.0 - (k * k);
-        lpcs[m] = a;
-        errs[m] = err;
-        if err <= 0.0 {
-            break;
-        }
+    if not lpc_analysis(xs, w, maxo, &mut lpcs, &mut errs) {
+        return plan;
     }
     let mut prec: u32 = 15;
     if bps <= 16 {
@@ -1157,31 +1129,10 @@ fn plan_channel(x0: []i64, bps0: u32, st: *Settings, w: *mut Work, x: []mut i64)
         hi_order = lo_order;
     }
     for m in lo_order..hi_order + 1 {
-        // quantize the coefficients
-        let mut cmax: f64 = 0.0;
-        for j in @as(usize, 1)..m + 1 {
-            cmax = @max(cmax, @abs(lpcs[m][j]));
-        }
-        if (cmax == 0.0) or (cmax != cmax) {
-            continue;
-        }
-        let e = math.frexp(cmax).exponent;
-        let mut sh = @as(i32, @bit_cast(i32, prec)) - 1 - e;
-        if sh > 15 {
-            sh = 15;
-        }
+        let mut q: [32]i64 = [0; 32];
+        let sh = quantize_lpc(lpcs[m][1..m + 1], prec, q[..]);
         if sh < 0 {
             continue;
-        }
-        let limit = @as(i64, 1) << @as(u64, prec - 1);
-        let mut q: [32]i64 = [0; 32];
-        let mut carry: f64 = 0.0;
-        let scale = @float_from_int(f64, @as(i64, 1) << @as(u64, @bit_cast(u32, sh)));
-        for j in @as(usize, 0)..m {
-            carry += lpcs[m][j + 1] * scale;
-            let v = @max(@min(@int_from_float(i64, @nearest(carry)), limit - 1), -limit);
-            q[j] = v;
-            carry -= @float_from_int(f64, v);
         }
         let shift = @bit_cast(u32, sh);
         lpc_residual(xs, m, q[..], shift, w.r);
@@ -1199,6 +1150,81 @@ fn plan_channel(x0: []i64, bps0: u32, st: *Settings, w: *mut Work, x: []mut i64)
         }
     }
     return plan;
+}
+
+// The LPC analysis of a block (windowed by w.win, into w.xs): for each order m to
+// maxo, the coefficients (lpcs[m][1..m + 1]) and prediction error (errs[m]), by
+// Levinson-Durbin on the autocorrelation, until the error is no longer positive.
+// False if the windowed block is silent.
+fn lpc_analysis(xs: []i64, w: *mut Work, maxo: usize, lpcs: *mut [33][33]f64, errs: *mut [33]f64) bool {
+    let n = xs.len;
+    for i in @as(usize, 0)..n {
+        w.xs[i] = @float_from_int(f64, xs[i]) * w.win[i];
+    }
+    let mut ac: [33]f64 = [0.0; 33];
+    for lag in @as(usize, 0)..maxo + 1 {
+        let mut s: f64 = 0.0;
+        for i in lag..n {
+            s += w.xs[i] * w.xs[i - lag];
+        }
+        ac[lag] = s;
+    }
+    if ac[0] == 0.0 {
+        return false;
+    }
+    ac[0] *= 1.0 + 1e-9;  // a touch of white noise for stability
+    let mut a: [33]f64 = [0.0; 33];
+    let mut err = ac[0];
+    for m in @as(usize, 1)..maxo + 1 {
+        let mut acc = ac[m];
+        for j in @as(usize, 1)..m {
+            acc -= a[j] * ac[m - j];
+        }
+        let k = acc / err;
+        let mut na = a;
+        na[m] = k;
+        for j in @as(usize, 1)..m {
+            na[j] = a[j] - (k * a[m - j]);
+        }
+        a = na;
+        err *= 1.0 - (k * k);
+        lpcs.*[m] = a;
+        errs.*[m] = err;
+        if err <= 0.0 {
+            break;
+        }
+    }
+    return true;
+}
+
+// Quantizes the coefficients c to prec bits in q, carrying the rounding errors
+// along; returns the shift, or -1 if they cannot be.
+fn quantize_lpc(c: []f64, prec: u32, q: []mut i64) i32 {
+    let mut cmax: f64 = 0.0;
+    for v in c {
+        cmax = @max(cmax, @abs(v));
+    }
+    if (cmax == 0.0) or (cmax != cmax) {
+        return -1;
+    }
+    let e = math.frexp(cmax).exponent;
+    let mut sh = @as(i32, @bit_cast(i32, prec)) - 1 - e;
+    if sh > 15 {
+        sh = 15;
+    }
+    if sh < 0 {
+        return -1;
+    }
+    let limit = @as(i64, 1) << @as(u64, prec - 1);
+    let mut carry: f64 = 0.0;
+    let scale = @float_from_int(f64, @as(i64, 1) << @as(u64, @bit_cast(u32, sh)));
+    for j in @as(usize, 0)..c.len {
+        carry += c[j] * scale;
+        let v = @max(@min(@int_from_float(i64, @nearest(carry)), limit - 1), -limit);
+        q[j] = v;
+        carry -= @float_from_int(f64, v);
+    }
+    return sh;
 }
 
 fn write_subframe(o: *mut Out, plan: *Plan, x: []i64, res: []i64) void {
@@ -1388,61 +1414,19 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out, mode: u8, sink: io.Writ
     let mut win_n: usize = 0;
     let mut start: usize = 0;
     let mut index: u64 = 0;
-    let mut plans: [8]Plan = [Plan.{
-        kind: 0,
-        order: 0,
-        wasted: 0,
-        bps: 0,
-        prec: 0,
-        shift: 0,
-        coef: [0; 32],
-        porder: 0,
-        params: [0; 256],
-        wide: false,
-        cost: 0,
-    }; 8];
+    let mut plans: [8]Plan = [verbatim_plan(0); 8];
     while start < total {
         let n = @min(block, total - start);
         if n != win_n {
-            // a Tukey(0.5) window
-            for i in @as(usize, 0)..n {
-                let t = @float_from_int(f64, i) / @float_from_int(f64, @max(n, 2) - 1);
-                let mut v: f64 = 1.0;
-                if t < 0.25 {
-                    v = 0.5 * (1.0 - math.cos(4.0 * math.PI * t));
-                } else if t > 0.75 {
-                    v = 0.5 * (1.0 - math.cos(4.0 * math.PI * (1.0 - t)));
-                }
-                win[i] = v;
-            }
+            tukey_window(win[..n]);
             win_n = n;
         }
-        // gather the channels (and the signature)
-        let base = start * nch;
-        for c in @as(usize, 0)..nch {
-            let dst = chans[c * block..(c * block) + n];
-            if s.format == audio.SampleFormat.U8 {
-                for i in @as(usize, 0)..n {
-                    dst[i] = @as(i64, s.data[base + (i * nch) + c]) - 128;
-                }
-            } else if s.format == audio.SampleFormat.S16 {
-                let src = s.samples_i16();
-                for i in @as(usize, 0)..n {
-                    dst[i] = @as(i64, src[base + (i * nch) + c]);
-                }
-            } else {
-                let src = s.samples_i32();
-                for i in @as(usize, 0)..n {
-                    dst[i] = @as(i64, src[base + (i * nch) + c]);
-                }
-            }
-        }
+        gather(s, start, n, chans, block);
         md5_block(&mut sig, chans, block, n, nch, width, mbuf);
         let frame_start = o.len;
         o.reserve(((n * nch) * 8) + 64)!;
         // plan each channel; for stereo, mid and side too
         let stereo = (nch == 2) and st.stereo;
-        let mut assign: u32 = @truncate(u32, nch - 1);
         let mut coded: usize = nch;
         if stereo {
             for i in @as(usize, 0)..n {
@@ -1463,71 +1447,11 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out, mode: u8, sink: io.Writ
                                     shifted[c * block..(c * block) + n]);
         }
         let mut pick: [2]usize = [0, 1];
+        let mut assign: u32 = @truncate(u32, nch - 1);
         if stereo {
-            let lr = plans[0].cost + plans[1].cost;
-            let ls = plans[0].cost + plans[3].cost;
-            let rs = plans[1].cost + plans[3].cost;
-            let ms = plans[2].cost + plans[3].cost;
-            assign = 1;
-            if (ls < lr) and (ls <= rs) and (ls <= ms) {
-                assign = 8;
-                pick = [0, 3];
-            } else if (rs < lr) and (rs <= ms) {
-                assign = 9;
-                pick = [3, 1];
-            } else if ms < lr {
-                assign = 10;
-                pick = [2, 3];
-            }
+            assign = stereo_mode(&plans, &mut pick);
         }
-        // the frame header
-        let hstart = o.len;
-        o.bits(0xfff8, 16);
-        let mut bs_code: u64 = 7;
-        if n == 4096 {
-            bs_code = 12;
-        } else if n == 1152 {
-            bs_code = 3;
-        } else if n <= 256 {
-            bs_code = 6;
-        }
-        let mut sr_code: u64 = 0;
-        for k in @as(usize, 1)..12 {
-            if RATES[k] == s.rate {
-                sr_code = @as(u64, k);
-            }
-        }
-        if sr_code == 0 {
-            if ((s.rate % 1000) == 0) and (s.rate <= 255000) {
-                sr_code = 12;
-            } else if s.rate <= 65535 {
-                sr_code = 13;
-            } else if ((s.rate % 10) == 0) and (s.rate <= 655350) {
-                sr_code = 14;
-            }
-        }
-        o.bits((bs_code << 4) | sr_code, 8);
-        let mut ss_code: u64 = 0;
-        for k in @as(usize, 1)..8 {
-            if SIZES[k] == bps {
-                ss_code = @as(u64, k);
-            }
-        }
-        o.bits((@as(u64, assign) << 4) | (ss_code << 1), 8);
-        utf8_number(o, index);
-        if bs_code == 6 {
-            o.bits(@as(u64, n - 1), 8);
-        } else if bs_code == 7 {
-            o.bits(@as(u64, n - 1), 16);
-        }
-        if sr_code == 12 {
-            o.bits(@as(u64, s.rate / 1000), 8);
-        } else if sr_code == 13 {
-            o.bits(@as(u64, s.rate), 16);
-        } else if sr_code == 14 {
-            o.bits(@as(u64, s.rate / 10), 16);
-        }
-        o.bits(@as(u64, crc8(o.buf[hstart..o.len])), 8);
+        write_frame_header(o, n, s.rate, bps, assign, index);
         // the subframes
         for c in @as(usize, 0)..nch {
             let mut src = c;
@@ -1583,6 +1507,117 @@ fn encode_into(s: *audio.Sound, level: u32, o: *mut Out, mode: u8, sink: io.Writ
         @mem_copy(info[..34], o.buf[..34]);
     }
     o.len = saved_len;
+}
+
+// A Tukey(0.5) window over win.len samples.
+fn tukey_window(win: []mut f64) void {
+    let n = win.len;
+    for i in @as(usize, 0)..n {
+        let t = @float_from_int(f64, i) / @float_from_int(f64, @max(n, 2) - 1);
+        let mut v: f64 = 1.0;
+        if t < 0.25 {
+            v = 0.5 * (1.0 - math.cos(4.0 * math.PI * t));
+        } else if t > 0.75 {
+            v = 0.5 * (1.0 - math.cos(4.0 * math.PI * (1.0 - t)));
+        }
+        win[i] = v;
+    }
+}
+
+// Copies n frames of the sound from frame start to chans, each channel's
+// samples (signed) in a run of its own, stride apart.
+fn gather(s: *audio.Sound, start: usize, n: usize, chans: []mut i64, stride: usize) void {
+    let nch = s.channels;
+    let base = start * nch;
+    for c in @as(usize, 0)..nch {
+        let dst = chans[c * stride..(c * stride) + n];
+        if s.format == audio.SampleFormat.U8 {
+            for i in @as(usize, 0)..n {
+                dst[i] = @as(i64, s.data[base + (i * nch) + c]) - 128;
+            }
+        } else if s.format == audio.SampleFormat.S16 {
+            let src = s.samples_i16();
+            for i in @as(usize, 0)..n {
+                dst[i] = @as(i64, src[base + (i * nch) + c]);
+            }
+        } else {
+            let src = s.samples_i32();
+            for i in @as(usize, 0)..n {
+                dst[i] = @as(i64, src[base + (i * nch) + c]);
+            }
+        }
+    }
+}
+
+// The cheapest stereo coding, from the plans for left, right, mid and side: the
+// channel assignment of the frame header, and in pick the plans to code.
+fn stereo_mode(plans: *[8]Plan, pick: *mut [2]usize) u32 {
+    let lr = plans[0].cost + plans[1].cost;
+    let ls = plans[0].cost + plans[3].cost;
+    let rs = plans[1].cost + plans[3].cost;
+    let ms = plans[2].cost + plans[3].cost;
+    if (ls < lr) and (ls <= rs) and (ls <= ms) {
+        pick.* = [0, 3];
+        return 8;
+    } else if (rs < lr) and (rs <= ms) {
+        pick.* = [3, 1];
+        return 9;
+    } else if ms < lr {
+        pick.* = [2, 3];
+        return 10;
+    }
+    return 1;
+}
+
+// The header of frame index, of n frames.
+fn write_frame_header(o: *mut Out, n: usize, rate: u32, bps: u32, assign: u32, index: u64) void {
+    let hstart = o.len;
+    o.bits(0xfff8, 16);
+    let mut bs_code: u64 = 7;
+    if n == 4096 {
+        bs_code = 12;
+    } else if n == 1152 {
+        bs_code = 3;
+    } else if n <= 256 {
+        bs_code = 6;
+    }
+    let mut sr_code: u64 = 0;
+    for k in @as(usize, 1)..12 {
+        if RATES[k] == rate {
+            sr_code = @as(u64, k);
+        }
+    }
+    if sr_code == 0 {
+        if ((rate % 1000) == 0) and (rate <= 255000) {
+            sr_code = 12;
+        } else if rate <= 65535 {
+            sr_code = 13;
+        } else if ((rate % 10) == 0) and (rate <= 655350) {
+            sr_code = 14;
+        }
+    }
+    o.bits((bs_code << 4) | sr_code, 8);
+    let mut ss_code: u64 = 0;
+    for k in @as(usize, 1)..8 {
+        if SIZES[k] == bps {
+            ss_code = @as(u64, k);
+        }
+    }
+    o.bits((@as(u64, assign) << 4) | (ss_code << 1), 8);
+    utf8_number(o, index);
+    if bs_code == 6 {
+        o.bits(@as(u64, n - 1), 8);
+    } else if bs_code == 7 {
+        o.bits(@as(u64, n - 1), 16);
+    }
+    if sr_code == 12 {
+        o.bits(@as(u64, rate / 1000), 8);
+    } else if sr_code == 13 {
+        o.bits(@as(u64, rate), 16);
+    } else if sr_code == 14 {
+        o.bits(@as(u64, rate / 10), 16);
+    }
+    o.bits(@as(u64, crc8(o.buf[hstart..o.len])), 8);
 }
 
 // -----------------------------------------------------------------------------

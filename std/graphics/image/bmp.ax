@@ -19,6 +19,7 @@ import "../../io.ax" as io;
 import "../../mem.ax" as mem;
 import "../../str.ax" as strs;
 import "../image.ax" as image;
+import "internal/imagetest.ax" as imagetest;
 
 pub error BmpError { Corrupt, Unsupported, OutOfMemory, IoError, NotFound, TooLarge, Done, InvalidUtf8 }
 
@@ -48,6 +49,52 @@ struct Field {
         let v = (px & self.mask) >> self.shift;
         let max = (@as(u32, 1) << self.bits) - 1;
         return @truncate(u8, (((v & max) * 255) + (max / 2)) / max);
+    }
+}
+
+// The channel masks (red, green, blue, alpha) of a header of hsize bytes:
+// given in the header or after it, or implied by the bits per pixel.
+// Unsupported for a compression this decoder does not read.
+fn read_masks(data: []u8, hsize: usize, compression: u32, bpp: u32) BmpError![4]u32 {
+    let mut masks: [4]u32 = [0, 0, 0, 0];
+    if (compression == 3) or (compression == 6) {
+        if hsize >= 52 {
+            masks = [binary.u32_le(data[54..]), binary.u32_le(data[58..]), binary.u32_le(data[62..]), 0];
+            if hsize >= 56 {
+                masks[3] = binary.u32_le(data[66..]);
+            }
+        } else {
+            let n: usize = 3 + @as(usize, @truncate(u8, compression / 6));
+            if (14 + hsize + (4 * n)) > data.len {
+                return error.Corrupt;
+            }
+            for i in @as(usize, 0)..n {
+                masks[i] = binary.u32_le(data[14 + hsize + (4 * i)..]);
+            }
+        }
+    } else if compression == 0 {
+        if bpp == 16 {
+            masks = [0x7c00, 0x03e0, 0x001f, 0];
+        } else if bpp == 32 {
+            masks = [0x00ff0000, 0x0000ff00, 0x000000ff, 0];
+        }
+    } else if ((compression == 1) and (bpp != 8)) or ((compression == 2) and (bpp != 4)) or (compression > 3) {
+        if compression != 6 {
+            return error.Unsupported;  // JPEG or PNG inside, or an unknown kind
+        }
+    }
+    return masks;
+}
+
+// The palette's colours (0xRRGGBB) from pal_at, entries of pal_entry bytes;
+// those past the end of the data stay 0.
+fn read_palette(data: []u8, pal_at: usize, pal_entry: usize, palette: []mut u32) void {
+    for i in @as(usize, 0)..palette.len {
+        let p = pal_at + (i * pal_entry);
+        if (p + 3) > data.len {
+            break;
+        }
+        palette[i] = ((@as(u32, data[p + 2]) << 16) | (@as(u32, data[p + 1]) << 8)) | @as(u32, data[p]);
     }
 }
 
@@ -90,34 +137,7 @@ pub fn decode(data: []u8) BmpError!image.Image {
     if (@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS {
         return error.Corrupt;
     }
-    // channel masks
-    let mut masks: [4]u32 = [0, 0, 0, 0];
-    if (compression == 3) or (compression == 6) {
-        if hsize >= 52 {
-            masks = [binary.u32_le(data[54..]), binary.u32_le(data[58..]), binary.u32_le(data[62..]), 0];
-            if hsize >= 56 {
-                masks[3] = binary.u32_le(data[66..]);
-            }
-        } else {
-            let n: usize = 3 + @as(usize, @truncate(u8, compression / 6));
-            if (14 + hsize + (4 * n)) > data.len {
-                return error.Corrupt;
-            }
-            for i in @as(usize, 0)..n {
-                masks[i] = binary.u32_le(data[14 + hsize + (4 * i)..]);
-            }
-        }
-    } else if compression == 0 {
-        if bpp == 16 {
-            masks = [0x7c00, 0x03e0, 0x001f, 0];
-        } else if bpp == 32 {
-            masks = [0x00ff0000, 0x0000ff00, 0x000000ff, 0];
-        }
-    } else if ((compression == 1) and (bpp != 8)) or ((compression == 2) and (bpp != 4)) or (compression > 3) {
-        if compression != 6 {
-            return error.Unsupported;  // JPEG or PNG inside, or an unknown kind
-        }
-    }
+    let masks = read_masks(data, hsize, compression, bpp)!;
     let fields: [4]Field = [Field.of(masks[0]), Field.of(masks[1]), Field.of(masks[2]), Field.of(masks[3])];
     let has_alpha = (masks[3] != 0) and ((bpp == 16) or (bpp == 32));
     // palette
@@ -134,13 +154,7 @@ pub fn decode(data: []u8) BmpError!image.Image {
         if compression == 3 {
             pal_at += 12;
         }
-        for i in @as(usize, 0)..colors {
-            let p = pal_at + (i * pal_entry);
-            if (p + 3) > data.len {
-                break;
-            }
-            palette[i] = ((@as(u32, data[p + 2]) << 16) | (@as(u32, data[p + 1]) << 8)) | @as(u32, data[p]);
-        }
+        read_palette(data, pal_at, pal_entry, palette[..colors]);
     } else if (bpp != 16) and (bpp != 24) and (bpp != 32) {
         return error.Corrupt;
     }
@@ -494,19 +508,7 @@ test "encode_to" {
     for i in @as(usize, 0)..img.data.len {
         img.data[i] = @truncate(u8, (i * 31) ^ (i / 7));
     }
-    let enc = encode(&img)!;
-    defer mem.free(enc);
-    let mut s = strs.String.init();
-    defer s.deinit();
-    encode_to(s.writer(), &img)!;
-    @expect_eq(s.bytes(), enc[..]);
-    let mut small: [100]u8 = [0; 100];
-    let mut bw = io.BufferWriter.init(small[..]);
-    encode_to(bw.writer(), &img) catch |e| {
-        @expect_eq(e, error.NoSpaceLeft);
-        return;
-    };
-    @trap();
+    imagetest.check_encode_to(&img, encode, encode_to)!;
 }
 
 test "small files claiming big images" {

@@ -339,7 +339,7 @@ pub fn pow(x: f64, y: f64) f64 {
     let lx = low(x);
     let hy = @bit_cast(i32, high(y));
     let ly = low(y);
-    let mut ix = @bit_cast(i32, high(x) & 0x7fffffff);
+    let ix = @bit_cast(i32, high(x) & 0x7fffffff);
     let iy = @bit_cast(i32, high(y) & 0x7fffffff);
     if (iy == 0) and (ly == 0) {
         return 1.0;  // x^0 = 1, even for NaN x
@@ -354,24 +354,7 @@ pub fn pow(x: f64, y: f64) f64 {
     // when x < 0: is y an odd integer (1), an even one (2), or neither (0)?
     let mut yisint: i32 = 0;
     if hx < 0 {
-        if iy >= 0x43400000 {
-            yisint = 2;
-        } else if iy >= 0x3ff00000 {
-            let k = (iy >> 20) - 0x3ff;
-            if k > 20 {
-                let sh = @as(u32, @truncate(u8, 52 - k));
-                let j = ly >> sh;
-                if (j << sh) == ly {
-                    yisint = 2 - @bit_cast(i32, j & 1);
-                }
-            } else if ly == 0 {
-                let sh = @as(u32, @truncate(u8, 20 - k));
-                let j = @bit_cast(u32, iy) >> sh;
-                if (j << sh) == @bit_cast(u32, iy) {
-                    yisint = 2 - @bit_cast(i32, j & 1);
-                }
-            }
-        }
+        yisint = pow_y_parity(iy, ly);
     }
     if ly == 0 {
         if iy == 0x7ff00000 {
@@ -403,7 +386,7 @@ pub fn pow(x: f64, y: f64) f64 {
             return @sqrt(x);
         }
     }
-    let mut ax = @abs(x);
+    let ax = @abs(x);
     if (lx == 0) and ((ix == 0x7ff00000) or (ix == 0) or (ix == 0x3ff00000)) {
         // x is +-0, +-inf or +-1
         let mut z = ax;
@@ -428,8 +411,7 @@ pub fn pow(x: f64, y: f64) f64 {
             s = -1.0;
         }
     }
-    let mut t1: f64 = 0.0;
-    let mut t2: f64 = 0.0;
+    let mut lg = HiLo.{ hi: 0.0, lo: 0.0 };  // log2(|x|)
     if iy > 0x41e00000 {
         // |y| > 2^31
         if iy > 0x43f00000 {
@@ -457,65 +439,16 @@ pub fn pow(x: f64, y: f64) f64 {
             }
             return (s * TINY) * TINY;
         }
-        // |1 - x| <= 2^-20: log(x) by x - x^2/2 + x^3/3 - x^4/4
-        let t = ax - 1.0;
-        let w = (t * t) * (0.5 - (t * (0.3333333333333333333333 - (t * 0.25))));
-        let u = IVLN2_H * t;
-        let v = (t * IVLN2_L) - (w * INV_LN2);
-        t1 = with_low(u + v, 0);
-        t2 = v - (t1 - u);
+        lg = pow_log2_near1(ax);
     } else {
-        let mut n: i32 = 0;
-        if ix < 0x00100000 {
-            // subnormal x
-            ax = ax * TWO53;
-            n -= 53;
-            ix = @bit_cast(i32, high(ax));
-        }
-        n += (ix >> 20) - 0x3ff;
-        let j = ix & 0x000fffff;
-        ix = j | 0x3ff00000;
-        let mut k: usize = 0;
-        if j <= 0x3988e {
-            k = 0;  // |x| < sqrt(3/2)
-        } else if j < 0xbb67a {
-            k = 1;  // |x| < sqrt(3)
-        } else {
-            n += 1;
-            ix -= 0x00100000;
-        }
-        ax = with_high(ax, @bit_cast(u32, ix));
-        // ss = s_h + s_l = (x - 1) / (x + 1) or (x - 1.5) / (x + 1.5)
-        let u = ax - BP[k];
-        let v = 1.0 / (ax + BP[k]);
-        let ss = u * v;
-        let s_h = with_low(ss, 0);
-        let t_h0 = from_words(
-            @bit_cast(u32, (((ix >> 1) | 0x20000000) + 0x00080000) + (@as(i32, @truncate(u8, k)) << 18)), 0);
-        let t_l0 = ax - (t_h0 - BP[k]);
-        let s_l = v * ((u - (s_h * t_h0)) - (s_h * t_l0));
-        // log(ax)
-        let mut s2 = ss * ss;
-        let mut r = (s2 * s2) * (L1 + (s2 * (L2 + (s2 * (L3 + (s2 * (L4 + (s2 * (L5 + (s2 * L6))))))))));
-        r += s_l * (s_h + ss);
-        s2 = s_h * s_h;
-        let t_h = with_low((3.0 + s2) + r, 0);
-        let t_l = r - ((t_h - 3.0) - s2);
-        let uu = s_h * t_h;
-        let vv = (s_l * t_h) + (t_l * ss);
-        let p_h = with_low(uu + vv, 0);
-        let p_l = vv - (p_h - uu);
-        let z_h = CP_H * p_h;
-        let z_l = ((CP_L * p_h) + (p_l * CP)) + DP_L[k];
-        // log2(ax) = n + dp_h + z_h + z_l
-        let t = @float_from_int(f64, n);
-        t1 = with_low(((z_h + z_l) + DP_H[k]) + t, 0);
-        t2 = z_l - (((t1 - t) - DP_H[k]) - z_h);
+        lg = pow_log2(ax, ix);
     }
+    let t1 = lg.hi;
+    let t2 = lg.lo;
     // (y1 + y2) * (t1 + t2)
     let y1 = with_low(y, 0);
     let p_l = ((y - y1) * t1) + (y * t2);
-    let mut p_h = y1 * t1;
+    let p_h = y1 * t1;
     let z = p_l + p_h;
     let j = @bit_cast(i32, high(z));
     let i = @bit_cast(i32, low(z));
@@ -536,7 +469,106 @@ pub fn pow(x: f64, y: f64) f64 {
             return (s * TINY) * TINY;
         }
     }
-    // 2^(p_h + p_l)
+    return s * pow_exp2(p_h, p_l, j);
+}
+
+// A value split in two for extra precision: hi, with its low word zero, plus lo.
+struct HiLo {
+    hi: f64,
+    lo: f64,
+}
+
+// For pow when x < 0: whether y (|y|'s high word iy, and the low word ly) is an odd
+// integer (1), an even one (2), or neither (0).
+fn pow_y_parity(iy: i32, ly: u32) i32 {
+    if iy >= 0x43400000 {
+        return 2;
+    }
+    if iy >= 0x3ff00000 {
+        let k = (iy >> 20) - 0x3ff;
+        if k > 20 {
+            let sh = @as(u32, @truncate(u8, 52 - k));
+            let j = ly >> sh;
+            if (j << sh) == ly {
+                return 2 - @bit_cast(i32, j & 1);
+            }
+        } else if ly == 0 {
+            let sh = @as(u32, @truncate(u8, 20 - k));
+            let j = @bit_cast(u32, iy) >> sh;
+            if (j << sh) == @bit_cast(u32, iy) {
+                return 2 - @bit_cast(i32, j & 1);
+            }
+        }
+    }
+    return 0;
+}
+
+// For pow: log2(ax) for ax within 2^-20 of 1.
+fn pow_log2_near1(ax: f64) HiLo {
+    // log(x) by x - x^2/2 + x^3/3 - x^4/4
+    let t = ax - 1.0;
+    let w = (t * t) * (0.5 - (t * (0.3333333333333333333333 - (t * 0.25))));
+    let u = IVLN2_H * t;
+    let v = (t * IVLN2_L) - (w * INV_LN2);
+    let t1 = with_low(u + v, 0);
+    return HiLo.{ hi: t1, lo: v - (t1 - u) };
+}
+
+// For pow: log2(ax), ax = |x| positive and finite, and ix its high word.
+fn pow_log2(ax0: f64, ix0: i32) HiLo {
+    let mut ax = ax0;
+    let mut ix = ix0;
+    let mut n: i32 = 0;
+    if ix < 0x00100000 {
+        // subnormal x
+        ax = ax * TWO53;
+        n -= 53;
+        ix = @bit_cast(i32, high(ax));
+    }
+    n += (ix >> 20) - 0x3ff;
+    let j = ix & 0x000fffff;
+    ix = j | 0x3ff00000;
+    let mut k: usize = 0;
+    if j <= 0x3988e {
+        k = 0;  // |x| < sqrt(3/2)
+    } else if j < 0xbb67a {
+        k = 1;  // |x| < sqrt(3)
+    } else {
+        n += 1;
+        ix -= 0x00100000;
+    }
+    ax = with_high(ax, @bit_cast(u32, ix));
+    // ss = s_h + s_l = (x - 1) / (x + 1) or (x - 1.5) / (x + 1.5)
+    let u = ax - BP[k];
+    let v = 1.0 / (ax + BP[k]);
+    let ss = u * v;
+    let s_h = with_low(ss, 0);
+    let t_h0 = from_words(@bit_cast(u32, (((ix >> 1) | 0x20000000) + 0x00080000) + (@as(i32, @truncate(u8, k)) << 18)),
+                          0);
+    let t_l0 = ax - (t_h0 - BP[k]);
+    let s_l = v * ((u - (s_h * t_h0)) - (s_h * t_l0));
+    // log(ax)
+    let mut s2 = ss * ss;
+    let mut r = (s2 * s2) * (L1 + (s2 * (L2 + (s2 * (L3 + (s2 * (L4 + (s2 * (L5 + (s2 * L6))))))))));
+    r += s_l * (s_h + ss);
+    s2 = s_h * s_h;
+    let t_h = with_low((3.0 + s2) + r, 0);
+    let t_l = r - ((t_h - 3.0) - s2);
+    let uu = s_h * t_h;
+    let vv = (s_l * t_h) + (t_l * ss);
+    let p_h = with_low(uu + vv, 0);
+    let p_l = vv - (p_h - uu);
+    let z_h = CP_H * p_h;
+    let z_l = ((CP_L * p_h) + (p_l * CP)) + DP_L[k];
+    // log2(ax) = n + dp_h + z_h + z_l
+    let t = @float_from_int(f64, n);
+    let t1 = with_low(((z_h + z_l) + DP_H[k]) + t, 0);
+    return HiLo.{ hi: t1, lo: z_l - (((t1 - t) - DP_H[k]) - z_h) };
+}
+
+// For pow: 2^(p_h + p_l), j being the high word of their sum.
+fn pow_exp2(p_h0: f64, p_l: f64, j: i32) f64 {
+    let mut p_h = p_h0;
     let ii = j & 0x7fffffff;
     let mut k = (ii >> 20) - 0x3ff;
     let mut n: i32 = 0;
@@ -566,7 +598,7 @@ pub fn pow(x: f64, y: f64) f64 {
     } else {
         zz = with_high(zz, @bit_cast(u32, jj));
     }
-    return s * zz;
+    return zz;
 }
 
 // cbrt, after fdlibm's s_cbrt.c

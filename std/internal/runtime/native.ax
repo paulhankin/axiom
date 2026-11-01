@@ -1497,61 +1497,41 @@ fn above_std(fd: i32) i32 {
     return @truncate(i32, r);
 }
 
-// The spec: argv strings, each ending in 0, then a 0; the environment
-// ("K=V" strings, each ending in 0), then a 0; then the directory to run in
-// (empty: this one). stdio[i] is 0 to inherit stream i, 1 for a pipe, 2 for
-// /dev/null; it is replaced by the pipe's handle, or -1.
-export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
-    let s = @slice_from_ptr(spec, len);
-    let modes = @slice_from_ptr(stdio, 3);
-    // count the strings
-    let mut i: usize = 0;
-    let mut argc: usize = 0;
-    while (i < s.len) and (s[i] != 0) {
-        while (i < s.len) and (s[i] != 0) {
-            i += 1;
+// The number of strings in the list at s[*i] (each ending in 0, the list in
+// a further 0); *i moves past the list.
+fn count_strings(s: []u8, i: *mut usize) usize {
+    let mut n: usize = 0;
+    while (i.* < s.len) and (s[i.*] != 0) {
+        while (i.* < s.len) and (s[i.*] != 0) {
+            i.* += 1;
         }
-        i += 1;
-        argc += 1;
+        i.* += 1;
+        n += 1;
     }
-    i += 1;
-    let env_at = i;
-    let mut envc: usize = 0;
-    while (i < s.len) and (s[i] != 0) {
-        while (i < s.len) and (s[i] != 0) {
-            i += 1;
-        }
-        i += 1;
-        envc += 1;
-    }
-    i += 1;
-    if (argc == 0) or (i > s.len) {
-        return AX_ERR;
-    }
-    let cwd = s[i..];
-    // the pointer arrays, and room for the directory and the program's
-    // paths along $PATH, in one mapping
-    let ptrs = (argc + envc + 2) * @size_of(usize);
-    let room = align_up(ptrs + cwd.len + 1 + 65536, 4096);
-    let m = sys.mmap_anon(room);
-    if m == 0 {
-        return AX_ERR;
-    }
-    let argv = m;
-    let envp = m + ((argc + 1) * @size_of(usize));
-    let mut j: usize = 0;
-    for k in @as(usize, 0)..argc {
-        @ptr_from_int(*mut usize, argv + (k * @size_of(usize))).* = @int_from_ptr(spec) + j;
+    i.* += 1;
+    return n;
+}
+
+// Stores at the address arr pointers to the n strings of the list at s[at],
+// then a null one.
+fn put_pointers(s: []u8, at: usize, n: usize, arr: usize) void {
+    let mut j = at;
+    for k in @as(usize, 0)..n {
+        @ptr_from_int(*mut usize, arr + (k * @size_of(usize))).* = @int_from_ptr(s.ptr) + j;
         while s[j] != 0 {
             j += 1;
         }
         j += 1;
     }
-    @ptr_from_int(*mut usize, argv + (argc * @size_of(usize))).* = 0;
-    j = env_at;
+    @ptr_from_int(*mut usize, arr + (n * @size_of(usize))).* = 0;
+}
+
+// The value of PATH in the n "K=V" strings of the list at s[at] (empty if
+// it is not set).
+fn env_path(s: []u8, at: usize, n: usize) []u8 {
     let mut path_var = s[0..0];
-    for k in @as(usize, 0)..envc {
-        @ptr_from_int(*mut usize, envp + (k * @size_of(usize))).* = @int_from_ptr(spec) + j;
+    let mut j = at;
+    for _k in @as(usize, 0)..n {
         let st = j;
         while s[j] != 0 {
             j += 1;
@@ -1561,18 +1541,14 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
         }
         j += 1;
     }
-    @ptr_from_int(*mut usize, envp + (envc * @size_of(usize))).* = 0;
-    let extra = @slice_from_ptr(@ptr_from_int(*mut u8, m + ptrs), room - ptrs);
-    @mem_copy(extra[..cwd.len], cwd);
-    extra[cwd.len] = 0;
-    // the program: as given if it has a "/", else each directory of PATH
-    // in turn ("dir/prog\0" strings, then a 0)
-    let mut plen: usize = 0;
-    while s[plen] != 0 {
-        plen += 1;
-    }
-    let pname = s[..plen];
-    let cands = extra[cwd.len + 1..];
+    return path_var;
+}
+
+// The paths to run the program pname from, into cands ("path\0" strings,
+// then a 0): pname itself if it has a "/", else pname in each directory of
+// path_var (or of a default) in turn, as many as fit.
+fn program_paths(pname: []u8, path_var: []u8, cands: []mut u8) void {
+    let plen = pname.len;
     let mut c: usize = 0;
     let mut has_slash = false;
     for ch in pname {
@@ -1610,9 +1586,13 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
         }
     }
     cands[c] = 0;
-    // the pipes: [ours, theirs] for each stream, and one for exec's error
-    let mut fds: [6]i32 = [-1, -1, -1, -1, -1, -1];
-    let mut err: [2]i32 = [-1, -1];
+}
+
+// Makes the pipe for exec's error (err), and for each stream that has one a
+// pipe or /dev/null (fds: [ours, theirs] for each), all close-on-exec, with
+// the child's ends above the standard streams. False if one cannot be made
+// (what was made is left in err and fds, to be closed).
+fn open_streams(modes: []i32, fds: *mut [6]i32, err: *mut [2]i32) bool {
     let mut ok = sys.pipe2(&mut err[0], 0x80000) >= 0;  // O_CLOEXEC
     if ok {
         err[1] = above_std(err[1]);
@@ -1645,41 +1625,115 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
             ok = fds[(2 * k) + 1] >= 0;
         }
     }
+    return ok;
+}
+
+// The child, after the fork (system calls only): puts its ends of the streams
+// (fds) in place, enters the directory dir (if cd), and runs the first of the
+// candidate paths that it can; failing that, writes the error to errfd and
+// exits.
+fn exec_child(fds: *[6]i32, cd: bool, dir: *u8, cands: []u8, argv: usize, envp: usize, errfd: i32) void {
+    for k in @as(usize, 0)..3 {
+        let fd = fds[(2 * k) + 1];
+        if fd >= 0 {
+            _ = sys.dup2(fd, @truncate(i32, @bit_cast(isize, k)));
+        }
+    }
+    _ = sys.sigdefault(13);  // SIGPIPE, which the parent may ignore
+    let mut e: isize = 0;
+    if cd {
+        e = sys.chdir(dir);
+    }
+    if e >= 0 {
+        e = -sys.ENOENT;
+        let mut a: usize = 0;
+        while cands[a] != 0 {
+            let r = sys.execve(&cands[a], argv, envp);
+            // keep the most telling error (EACCES over ENOENT)
+            if (r != -sys.ENOENT) and (r != -sys.ENOTDIR) {
+                e = r;
+            }
+            while cands[a] != 0 {
+                a += 1;
+            }
+            a += 1;
+        }
+    }
+    let mut code: i32 = @truncate(i32, -e);
+    _ = sys.write(errfd, @ptr_cast(*u8, &code), 4);
+    sys.exit(127);
+}
+
+// Whether the child pid ran its program, from the pipe for exec's error
+// (errfd): its handle if it did, else the error (reaping the child).
+fn exec_result(pid: isize, errfd: i32) i32 {
+    let mut code: i32 = 0;
+    let mut got: isize = 0;
+    loop {
+        got = sys.read(errfd, @ptr_cast(*mut u8, &mut code), 4);
+        if not retry(got) {
+            break;
+        }
+    }
+    if got != 4 {
+        return @truncate(i32, pid);
+    }
+    let mut st: i32 = 0;
+    _ = sys.wait4(@truncate(i32, pid), &mut st, 0);
+    if code == @truncate(i32, sys.ENOENT) {
+        return -2;
+    }
+    if (code == @truncate(i32, sys.EACCES)) or (code == @truncate(i32, sys.EPERM)) {
+        return -13;
+    }
+    return AX_ERR;
+}
+
+// The spec: argv strings, each ending in 0, then a 0; the environment
+// ("K=V" strings, each ending in 0), then a 0; then the directory to run in
+// (empty: this one). stdio[i] is 0 to inherit stream i, 1 for a pipe, 2 for
+// /dev/null; it is replaced by the pipe's handle, or -1.
+export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
+    let s = @slice_from_ptr(spec, len);
+    let modes = @slice_from_ptr(stdio, 3);
+    let mut i: usize = 0;
+    let argc = count_strings(s, &mut i);
+    let env_at = i;
+    let envc = count_strings(s, &mut i);
+    if (argc == 0) or (i > s.len) {
+        return AX_ERR;
+    }
+    let cwd = s[i..];
+    // the pointer arrays, and room for the directory and the program's
+    // paths along $PATH, in one mapping
+    let ptrs = (argc + envc + 2) * @size_of(usize);
+    let room = align_up(ptrs + cwd.len + 1 + 65536, 4096);
+    let m = sys.mmap_anon(room);
+    if m == 0 {
+        return AX_ERR;
+    }
+    let argv = m;
+    let envp = m + ((argc + 1) * @size_of(usize));
+    put_pointers(s, 0, argc, argv);
+    put_pointers(s, env_at, envc, envp);
+    let extra = @slice_from_ptr(@ptr_from_int(*mut u8, m + ptrs), room - ptrs);
+    @mem_copy(extra[..cwd.len], cwd);
+    extra[cwd.len] = 0;
+    let mut plen: usize = 0;
+    while s[plen] != 0 {
+        plen += 1;
+    }
+    let cands = extra[cwd.len + 1..];
+    program_paths(s[..plen], env_path(s, env_at, envc), cands);
+    // the pipes: [ours, theirs] for each stream, and one for exec's error
+    let mut fds: [6]i32 = [-1, -1, -1, -1, -1, -1];
+    let mut err: [2]i32 = [-1, -1];
     let mut pid: isize = -1;
-    if ok {
+    if open_streams(modes, &mut fds, &mut err) {
         pid = sys.fork();
     }
     if pid == 0 {
-        // the child: system calls only
-        for k in @as(usize, 0)..3 {
-            let fd = fds[(2 * k) + 1];
-            if fd >= 0 {
-                _ = sys.dup2(fd, @truncate(i32, @bit_cast(isize, k)));
-            }
-        }
-        _ = sys.sigdefault(13);  // SIGPIPE, which the parent may ignore
-        let mut e: isize = 0;
-        if cwd.len > 0 {
-            e = sys.chdir(&extra[0]);
-        }
-        if e >= 0 {
-            e = -sys.ENOENT;
-            let mut a: usize = 0;
-            while cands[a] != 0 {
-                let r = sys.execve(&cands[a], argv, envp);
-                // keep the most telling error (EACCES over ENOENT)
-                if (r != -sys.ENOENT) and (r != -sys.ENOTDIR) {
-                    e = r;
-                }
-                while cands[a] != 0 {
-                    a += 1;
-                }
-                a += 1;
-            }
-        }
-        let mut code: i32 = @truncate(i32, -e);
-        _ = sys.write(err[1], @ptr_cast(*u8, &code), 4);
-        sys.exit(127);
+        exec_child(&fds, cwd.len > 0, &extra[0], cands, argv, envp, err[1]);
     }
     // the parent: close the child's ends, and learn whether exec worked
     _ = sys.close(err[1]);
@@ -1690,26 +1744,7 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
     }
     let mut result: i32 = AX_ERR;
     if pid > 0 {
-        let mut code: i32 = 0;
-        let mut got: isize = 0;
-        loop {
-            got = sys.read(err[0], @ptr_cast(*mut u8, &mut code), 4);
-            if not retry(got) {
-                break;
-            }
-        }
-        if got == 4 {
-            let mut st: i32 = 0;
-            _ = sys.wait4(@truncate(i32, pid), &mut st, 0);
-            result = AX_ERR;
-            if code == @truncate(i32, sys.ENOENT) {
-                result = -2;
-            } else if (code == @truncate(i32, sys.EACCES)) or (code == @truncate(i32, sys.EPERM)) {
-                result = -13;
-            }
-        } else {
-            result = @truncate(i32, pid);
-        }
+        result = exec_result(pid, err[0]);
     }
     if err[0] >= 0 {
         _ = sys.close(err[0]);

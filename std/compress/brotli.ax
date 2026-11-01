@@ -28,6 +28,7 @@ import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "brotli/tables.ax" as tables;
+import "internal/testdata.ax" as testdata;
 
 pub error BrotliError { Corrupt, TooLarge, OutOfMemory, Empty, IoError, NotFound, Done, InvalidUtf8 }
 
@@ -579,136 +580,131 @@ struct Trees {
     }
 }
 
-fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
-    let mut b = Bits.{ s: data, i: 0, acc: 0, n: 0 };
-    // the window size
-    let mut wbits: u32 = 16;
-    if b.read(1)! == 1 {
-        let n = b.read(3)!;
-        if n != 0 {
-            wbits = 17 + n;
-        } else {
-            let m = b.read(3)!;
-            if m == 1 {
-                return error.Corrupt;  // (large windows are an extension)
-            }
-            if m == 0 {
-                wbits = 17;
-            } else {
-                wbits = 8 + m;
-            }
-        }
+// The window size, from the stream header.
+fn read_wbits(b: *mut Bits) BrotliError!u32 {
+    if b.read(1)! == 0 {
+        return 16;
     }
-    let window = (@as(usize, 1) << wbits) - 16;
-    let mut dist: [4]u64 = [4, 11, 15, 16];  // the last distance first
-    let mut lblocks = new_blocks();
-    defer lblocks.deinit();
-    let mut iblocks = new_blocks();
-    defer iblocks.deinit();
-    let mut dblocks = new_blocks();
-    defer dblocks.deinit();
-    let mut ltrees = Trees.{ codes: vec.Vec.[Code].init() };
-    defer ltrees.deinit();
-    let mut itrees = Trees.{ codes: vec.Vec.[Code].init() };
-    defer itrees.deinit();
-    let mut dtrees = Trees.{ codes: vec.Vec.[Code].init() };
-    defer dtrees.deinit();
-    let mut cmap_l = vec.Vec.[u8].init();
-    defer cmap_l.deinit();
-    let mut cmap_d = vec.Vec.[u8].init();
-    defer cmap_d.deinit();
-    let mut modes = vec.Vec.[u8].init();
-    defer modes.deinit();
-    loop {
-        let islast = b.read(1)! == 1;
-        if islast and (b.read(1)! == 1) {
-            break;  // the last meta-block is empty
+    let n = b.read(3)!;
+    if n != 0 {
+        return 17 + n;
+    }
+    let m = b.read(3)!;
+    if m == 1 {
+        return error.Corrupt;  // (large windows are an extension)
+    }
+    if m == 0 {
+        return 17;
+    }
+    return 8 + m;
+}
+
+// Skips a metadata meta-block (after its MNIBBLES).
+fn skip_metadata(b: *mut Bits) BrotliError!void {
+    if b.read(1)! != 0 {
+        return error.Corrupt;
+    }
+    let nb = b.read(2)!;
+    let mut len: usize = 0;
+    for k in @as(u32, 0)..nb {
+        let v = b.read(8)!;
+        if (k == (nb - 1)) and (nb > 1) and (v == 0) {
+            return error.Corrupt;
         }
-        let mn = b.read(2)!;
-        if mn == 3 {
-            // metadata: skipped
-            if b.read(1)! != 0 {
-                return error.Corrupt;
-            }
-            let nb = b.read(2)!;
-            let mut len: usize = 0;
-            for k in @as(u32, 0)..nb {
-                let v = b.read(8)!;
-                if (k == (nb - 1)) and (nb > 1) and (v == 0) {
-                    return error.Corrupt;
-                }
-                len |= @as(usize, v) << @truncate(u32, 8 * k);
-            }
-            if nb > 0 {
-                len += 1;
-            }
-            b.align()!;
-            _ = b.bytes(len)!;
-            if islast {
-                break;
-            }
-            continue;
+        len |= @as(usize, v) << @truncate(u32, 8 * k);
+    }
+    if nb > 0 {
+        len += 1;
+    }
+    b.align()!;
+    _ = b.bytes(len)!;
+}
+
+// A meta-block's length, in the given number of nibbles.
+fn read_mlen(b: *mut Bits, nibbles: u32) BrotliError!usize {
+    let mut mlen: usize = 0;
+    for k in @as(u32, 0)..nibbles {
+        let v = b.read(4)!;
+        if (k == (nibbles - 1)) and (nibbles > 4) and (v == 0) {
+            return error.Corrupt;
         }
-        let nibbles = mn + 4;
-        let mut mlen: usize = 0;
-        for k in @as(u32, 0)..nibbles {
-            let v = b.read(4)!;
-            if (k == (nibbles - 1)) and (nibbles > 4) and (v == 0) {
-                return error.Corrupt;
-            }
-            mlen |= @as(usize, v) << @truncate(u32, 4 * k);
+        mlen |= @as(usize, v) << @truncate(u32, 4 * k);
+    }
+    return mlen + 1;
+}
+
+// The state of decoding: the window and the last distances, and the block types and
+// counts, distance parameters, context modes and maps, and codes of the current
+// meta-block.
+struct Decoder {
+    window: usize,
+    dist: [4]u64,  // the last distance first
+    lblocks: Blocks,
+    iblocks: Blocks,
+    dblocks: Blocks,
+    ltrees: Trees,
+    itrees: Trees,
+    dtrees: Trees,
+    cmap_l: vec.Vec.[u8],
+    cmap_d: vec.Vec.[u8],
+    modes: vec.Vec.[u8],
+    npostfix: u32,
+    ndirect: u32,
+
+    fn deinit(self: *mut Decoder) void {
+        self.lblocks.deinit();
+        self.iblocks.deinit();
+        self.dblocks.deinit();
+        self.ltrees.deinit();
+        self.itrees.deinit();
+        self.dtrees.deinit();
+        self.cmap_l.deinit();
+        self.cmap_d.deinit();
+        self.modes.deinit();
+    }
+
+    // Reads a compressed meta-block's header, after its length.
+    fn read_header(self: *mut Decoder, b: *mut Bits) BrotliError!void {
+        self.lblocks.deinit();
+        self.lblocks = new_blocks();
+        self.iblocks.deinit();
+        self.iblocks = new_blocks();
+        self.dblocks.deinit();
+        self.dblocks = new_blocks();
+        self.lblocks.setup(b)!;
+        self.iblocks.setup(b)!;
+        self.dblocks.setup(b)!;
+        self.npostfix = b.read(2)!;
+        self.ndirect = b.read(4)! << self.npostfix;
+        self.modes.clear();
+        for _k in @as(u32, 0)..self.lblocks.ntypes {
+            self.modes.push(@truncate(u8, b.read(2)!))!;
         }
-        mlen += 1;
-        if (out.len + mlen) > max_size {
-            return error.TooLarge;
+        let ntrees_l = var_uint8(b)! + 1;
+        self.cmap_l.clear();
+        for _k in @as(u32, 0)..(64 * self.lblocks.ntypes) {
+            self.cmap_l.push(0)!;
         }
-        if not islast {
-            if b.read(1)! == 1 {
-                // uncompressed
-                b.align()!;
-                out.push_str(b.bytes(mlen)!)!;
-                continue;
-            }
+        read_context_map(b, self.cmap_l.items(), ntrees_l)!;
+        let ntrees_d = var_uint8(b)! + 1;
+        self.cmap_d.clear();
+        for _k in @as(u32, 0)..(4 * self.dblocks.ntypes) {
+            self.cmap_d.push(0)!;
         }
-        // block types and counts, distance parameters, context modes and maps, codes
-        lblocks.deinit();
-        lblocks = new_blocks();
-        iblocks.deinit();
-        iblocks = new_blocks();
-        dblocks.deinit();
-        dblocks = new_blocks();
-        lblocks.setup(&mut b)!;
-        iblocks.setup(&mut b)!;
-        dblocks.setup(&mut b)!;
-        let npostfix = b.read(2)!;
-        let ndirect = b.read(4)! << npostfix;
-        modes.clear();
-        for _k in @as(u32, 0)..lblocks.ntypes {
-            modes.push(@truncate(u8, b.read(2)!))!;
-        }
-        let ntrees_l = var_uint8(&mut b)! + 1;
-        cmap_l.clear();
-        for _k in @as(u32, 0)..(64 * lblocks.ntypes) {
-            cmap_l.push(0)!;
-        }
-        read_context_map(&mut b, cmap_l.items(), ntrees_l)!;
-        let ntrees_d = var_uint8(&mut b)! + 1;
-        cmap_d.clear();
-        for _k in @as(u32, 0)..(4 * dblocks.ntypes) {
-            cmap_d.push(0)!;
-        }
-        read_context_map(&mut b, cmap_d.items(), ntrees_d)!;
-        ltrees.read(&mut b, ntrees_l, 256)!;
-        itrees.read(&mut b, iblocks.ntypes, 704)!;
-        let dsize = @as(usize, 16 + ndirect + (48 << npostfix));
-        dtrees.read(&mut b, ntrees_d, dsize)!;
-        // the commands
+        read_context_map(b, self.cmap_d.items(), ntrees_d)!;
+        self.ltrees.read(b, ntrees_l, 256)!;
+        self.itrees.read(b, self.iblocks.ntypes, 704)!;
+        let dsize = @as(usize, 16 + self.ndirect + (48 << self.npostfix));
+        self.dtrees.read(b, ntrees_d, dsize)!;
+    }
+
+    // Decodes the commands of a compressed meta-block of mlen bytes.
+    fn commands(self: *mut Decoder, b: *mut Bits, mlen: usize, out: *mut strs.String) BrotliError!void {
         let mut left = mlen;
-        let pmask = (@as(u64, 1) << @as(u64, npostfix)) - 1;
         while left > 0 {
-            iblocks.next(&mut b)!;
-            iblocks.left -%= 1;
-            let cmd = itrees.codes.items()[@as(usize, iblocks.kind)].decode(&mut b)!;
+            self.iblocks.next(b)!;
+            self.iblocks.left -%= 1;
+            let cmd = self.itrees.codes.items()[@as(usize, self.iblocks.kind)].decode(b)!;
             if cmd >= 704 {
                 return error.Corrupt;
             }
@@ -722,8 +718,8 @@ fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
                 return error.Corrupt;
             }
             for _k in @as(usize, 0)..ins {
-                lblocks.next(&mut b)!;
-                lblocks.left -%= 1;
+                self.lblocks.next(b)!;
+                self.lblocks.left -%= 1;
                 let mut p1: usize = 0;
                 let mut p2: usize = 0;
                 if out.len > 0 {
@@ -732,10 +728,10 @@ fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
                 if out.len > 1 {
                     p2 = @as(usize, out.buf[out.len - 2]);
                 }
-                let m = @as(usize, modes.items()[@as(usize, lblocks.kind)]) * 512;
+                let m = @as(usize, self.modes.items()[@as(usize, self.lblocks.kind)]) * 512;
                 let ctx = @as(usize, tables.CONTEXT_LUT[m + p1] | tables.CONTEXT_LUT[m + 256 + p2]);
-                let tree = @as(usize, cmap_l.items()[(64 * @as(usize, lblocks.kind)) + ctx]);
-                let lit = ltrees.codes.items()[tree].decode(&mut b)!;
+                let tree = @as(usize, self.cmap_l.items()[(64 * @as(usize, self.lblocks.kind)) + ctx]);
+                let lit = self.ltrees.codes.items()[tree].decode(b)!;
                 out.push(@truncate(u8, lit))!;
             }
             left -= ins;
@@ -743,41 +739,9 @@ fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
                 break;  // (the last command's copy is not used)
             }
             // the distance
-            let mut d: u64 = 0;
             let mut ring = true;
-            if cmd < 128 {
-                d = dist[0];
-                ring = false;
-            } else {
-                dblocks.next(&mut b)!;
-                dblocks.left -%= 1;
-                let dctx = @min(copy, 5) - 2;
-                let tree = @as(usize, cmap_d.items()[(4 * @as(usize, dblocks.kind)) + dctx]);
-                let dc = dtrees.codes.items()[tree].decode(&mut b)!;
-                if dc < 16 {
-                    let which: [16]usize = [0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
-                    let delta: [16]i64 = [0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3];
-                    let v = @bit_cast(i64, dist[which[@as(usize, dc)]]) + delta[@as(usize, dc)];
-                    if v <= 0 {
-                        return error.Corrupt;
-                    }
-                    d = @bit_cast(u64, v);
-                    if dc == 0 {
-                        ring = false;
-                    }
-                } else if dc < (16 + ndirect) {
-                    d = @as(u64, dc - 15);
-                } else {
-                    let x = @as(u64, dc - ndirect - 16);
-                    let nbits = 1 + (x >> (@as(u64, npostfix) + 1));
-                    let hcode = x >> @as(u64, npostfix);
-                    let lcode = x & pmask;
-                    let offset = ((2 + (hcode & 1)) << nbits) - 4;
-                    let extra = @as(u64, b.read(@truncate(u32, nbits))!);
-                    d = ((offset + extra) << @as(u64, npostfix)) + lcode + @as(u64, ndirect) + 1;
-                }
-            }
-            let max_dist = @as(u64, @min(out.len, window));
+            let d = self.distance(b, cmd, copy, &mut ring)!;
+            let max_dist = @as(u64, @min(out.len, self.window));
             if d > max_dist {
                 // a dictionary word
                 if (copy < 4) or (copy > 24) {
@@ -800,7 +764,7 @@ fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
                 continue;
             }
             if ring {
-                dist = [d, dist[0], dist[1], dist[2]];
+                self.dist = [d, self.dist[0], self.dist[1], self.dist[2]];
             }
             if copy > left {
                 return error.Corrupt;
@@ -816,6 +780,93 @@ fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
             out.len = at;
             left -= copy;
         }
+    }
+
+    // A command's distance; clears ring when the distance is not to be pushed onto the
+    // last distances.
+    fn distance(self: *mut Decoder, b: *mut Bits, cmd: u32, copy: usize, ring: *mut bool) BrotliError!u64 {
+        if cmd < 128 {
+            ring.* = false;
+            return self.dist[0];
+        }
+        self.dblocks.next(b)!;
+        self.dblocks.left -%= 1;
+        let dctx = @min(copy, 5) - 2;
+        let tree = @as(usize, self.cmap_d.items()[(4 * @as(usize, self.dblocks.kind)) + dctx]);
+        let dc = self.dtrees.codes.items()[tree].decode(b)!;
+        let ndirect = self.ndirect;
+        if dc < 16 {
+            let which: [16]usize = [0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
+            let delta: [16]i64 = [0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3];
+            let v = @bit_cast(i64, self.dist[which[@as(usize, dc)]]) + delta[@as(usize, dc)];
+            if v <= 0 {
+                return error.Corrupt;
+            }
+            if dc == 0 {
+                ring.* = false;
+            }
+            return @bit_cast(u64, v);
+        }
+        if dc < (16 + ndirect) {
+            return @as(u64, dc - 15);
+        }
+        let npostfix = @as(u64, self.npostfix);
+        let x = @as(u64, dc - ndirect - 16);
+        let nbits = 1 + (x >> (npostfix + 1));
+        let hcode = x >> npostfix;
+        let lcode = x & ((@as(u64, 1) << npostfix) - 1);
+        let offset = ((2 + (hcode & 1)) << nbits) - 4;
+        let extra = @as(u64, b.read(@truncate(u32, nbits))!);
+        return ((offset + extra) << npostfix) + lcode + @as(u64, ndirect) + 1;
+    }
+}
+
+fn decode(data: []u8, out: *mut strs.String, max_size: usize) BrotliError!void {
+    let mut b = Bits.{ s: data, i: 0, acc: 0, n: 0 };
+    let wbits = read_wbits(&mut b)!;
+    let mut d = Decoder.{
+        window: (@as(usize, 1) << wbits) - 16,
+        dist: [4, 11, 15, 16],
+        lblocks: new_blocks(),
+        iblocks: new_blocks(),
+        dblocks: new_blocks(),
+        ltrees: Trees.{ codes: vec.Vec.[Code].init() },
+        itrees: Trees.{ codes: vec.Vec.[Code].init() },
+        dtrees: Trees.{ codes: vec.Vec.[Code].init() },
+        cmap_l: vec.Vec.[u8].init(),
+        cmap_d: vec.Vec.[u8].init(),
+        modes: vec.Vec.[u8].init(),
+        npostfix: 0,
+        ndirect: 0,
+    };
+    defer d.deinit();
+    loop {
+        let islast = b.read(1)! == 1;
+        if islast and (b.read(1)! == 1) {
+            break;  // the last meta-block is empty
+        }
+        let mn = b.read(2)!;
+        if mn == 3 {
+            skip_metadata(&mut b)!;
+            if islast {
+                break;
+            }
+            continue;
+        }
+        let mlen = read_mlen(&mut b, mn + 4)!;
+        if (out.len + mlen) > max_size {
+            return error.TooLarge;
+        }
+        if not islast {
+            if b.read(1)! == 1 {
+                // uncompressed
+                b.align()!;
+                out.push_str(b.bytes(mlen)!)!;
+                continue;
+            }
+        }
+        d.read_header(&mut b)!;
+        d.commands(&mut b, mlen, out)!;
         if islast {
             break;
         }
@@ -1437,36 +1488,10 @@ fn compressed_meta(w: *mut BitW, data: []u8, cmds: []Cmd, ring0: [4]u32) BrotliE
 // Tests
 // -----------------------------------------------------------------------------
 
-fn fails(r: ![]mut u8) bool {
-    let x = r catch return true;
-    mem.free(x);
-    return false;
-}
-
 test "files made by the brotli library" {
     let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
     defer mem.free(corpus);
-    let mut dir = fs.read_dir("std/compress/brotli/testdata")!;
-    defer dir.deinit();
-    let mut n: usize = 0;
-    for e in dir.entries.items() {
-        let mut p = strs.String.init();
-        defer p.deinit();
-        p.push_str("std/compress/brotli/testdata/")!;
-        p.push_str(e.name)!;
-        let data = fs.read_file(p.bytes())!;
-        defer mem.free(data);
-        let got = decompress(data, 1 << 24)!;
-        defer mem.free(got);
-        if strs.starts_with(e.name, "corpus") {
-            @expect_eq(got, corpus);
-        } else if strs.starts_with(e.name, "short") {
-            @expect_eq(got, "Hello, Hello, Hello, world!\n");
-        } else {
-            @expect_eq(got.len, 0);
-        }
-        n += 1;
-    }
+    let n = testdata.check_files("std/compress/brotli/testdata", ".br", corpus, decompress)!;
     @expect(n >= 10);
 }
 
@@ -1480,7 +1505,7 @@ test "round trips" {
         let d = decompress(c, corpus.len)!;
         defer mem.free(d);
         @expect_eq(d, corpus);
-        @expect(fails(decompress(c, corpus.len - 1)));
+        @expect(testdata.fails(decompress(c, corpus.len - 1)));
     }
     let mut rnd = strs.String.init();
     defer rnd.deinit();
@@ -1531,7 +1556,7 @@ test "damaged input" {
     let c = compress("hello hello hello hello hello hello, world", 5)!;
     defer mem.free(c);
     for n in @as(usize, 0)..c.len {
-        @expect(fails(decompress(c[..n], 1000)));
+        @expect(testdata.fails(decompress(c[..n], 1000)));
     }
     let mut b = strs.String.from(c)!;
     defer b.deinit();

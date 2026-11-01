@@ -296,111 +296,10 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32, budget:
         book.keys = mem.alloc.[u32](used)!;
         book.ids = mem.alloc.[u32](used)!;
         book.lens = mem.alloc.[u8](used)!;
-        let mut marker: [33]u32 = [0; 33];
-        let mut k: usize = 0;
-        for i in @as(usize, 0)..entries {
-            let len = @as(u32, lengths[i]);
-            if len == 0 {
-                continue;
-            }
-            let mut entry = marker[@as(usize, len)];
-            if (len < 32) and ((entry >> len) != 0) {
-                return error.Corrupt;  // over-specified
-            }
-            book.keys[k] = entry << (32 - len);
-            if len == 32 {
-                book.keys[k] = entry;
-            }
-            book.ids[k] = @truncate(u32, i);
-            book.lens[k] = @truncate(u8, len);
-            k += 1;
-            let mut j = len;
-            while j > 0 {
-                let ju = @as(usize, j);
-                if (marker[ju] & 1) != 0 {
-                    if j == 1 {
-                        marker[1] += 1;
-                    } else {
-                        marker[ju] = marker[ju - 1] << 1;
-                    }
-                    break;
-                }
-                marker[ju] += 1;
-                j -= 1;
-            }
-            let mut jj = @as(usize, len) + 1;
-            while jj < 33 {
-                if (marker[jj] >> 1) == entry {
-                    entry = marker[jj];
-                    marker[jj] = marker[jj - 1] << 1;
-                } else {
-                    break;
-                }
-                jj += 1;
-            }
-        }
-        // the fast table (indexed by the next FAST bits as read)
-        for e in @as(usize, 0)..used {
-            let len = @as(u32, book.lens[e]);
-            if len > FAST {
-                continue;
-            }
-            let rev = bit_reverse(book.keys[e]);  // the codeword in reading order
-            let step = @as(usize, 1) << @as(usize, len);
-            let mut fill = @as(usize, rev);
-            while fill < (@as(usize, 1) << @as(usize, FAST)) {
-                book.fast[fill] = @bit_cast(i32, @truncate(u32, e));
-                fill += step;
-            }
-        }
-        // sort the keys for the slow path (codewords are distinct: prefix-free)
-        let mut sorted = true;
-        for i in @as(usize, 1)..used {
-            if book.keys[i - 1] > book.keys[i] {
-                sorted = false;
-                break;
-            }
-        }
-        if not sorted {
-            // O(n log n) whatever the order: key << 32 | old position
-            let order = mem.alloc.[u64](used)!;
-            defer mem.free(order);
-            for i in @as(usize, 0)..used {
-                order[i] = (@as(u64, book.keys[i]) << 32) | @as(u64, @truncate(u32, i));
-            }
-            vec.sort(order, less_u64);
-            let ids = mem.alloc.[u32](used)!;
-            defer mem.free(ids);
-            let lens = mem.alloc.[u8](used)!;
-            defer mem.free(lens);
-            for i in @as(usize, 0)..used {
-                let at = @truncate(usize, order[i] & 0xffffffff);
-                ids[i] = book.ids[at];
-                lens[i] = book.lens[at];
-            }
-            for i in @as(usize, 0)..used {
-                book.keys[i] = @truncate(u32, order[i] >> 32);
-                book.ids[i] = ids[i];
-                book.lens[i] = lens[i];
-            }
-        }
-        // the fast table holds positions in the sorted arrays
-        for i in @as(usize, 0)..book.fast.len {
-            book.fast[i] = -1;
-        }
-        for e in @as(usize, 0)..used {
-            let len = @as(u32, book.lens[e]);
-            if len > FAST {
-                continue;
-            }
-            let rev = bit_reverse(book.keys[e]);
-            let step = @as(usize, 1) << @as(usize, len);
-            let mut fill = @as(usize, rev);
-            while fill < (@as(usize, 1) << @as(usize, FAST)) {
-                book.fast[fill] = @bit_cast(i32, @truncate(u32, e));
-                fill += step;
-            }
-        }
+        assign_codewords(book, lengths)!;
+        // sorted for the slow path (codewords are distinct: prefix-free)
+        sort_codewords(book)!;
+        fill_fast(book);
     }
     if lookup == 0 {
         return;
@@ -408,6 +307,118 @@ fn build_book(b: *mut Bits, book: *mut Book, lengths: []u8, lookup: u32, budget:
     if lookup > 2 {
         return error.Corrupt;
     }
+    read_lookup(b, book, lookup, budget)!;
+}
+
+// Gives each entry with a length its codeword (in book.keys, book.ids and
+// book.lens, in the order of the entries).
+fn assign_codewords(book: *mut Book, lengths: []u8) VorbisError!void {
+    let entries = book.entries;
+    let mut marker: [33]u32 = [0; 33];
+    let mut k: usize = 0;
+    for i in @as(usize, 0)..entries {
+        let len = @as(u32, lengths[i]);
+        if len == 0 {
+            continue;
+        }
+        let mut entry = marker[@as(usize, len)];
+        if (len < 32) and ((entry >> len) != 0) {
+            return error.Corrupt;  // over-specified
+        }
+        book.keys[k] = entry << (32 - len);
+        if len == 32 {
+            book.keys[k] = entry;
+        }
+        book.ids[k] = @truncate(u32, i);
+        book.lens[k] = @truncate(u8, len);
+        k += 1;
+        let mut j = len;
+        while j > 0 {
+            let ju = @as(usize, j);
+            if (marker[ju] & 1) != 0 {
+                if j == 1 {
+                    marker[1] += 1;
+                } else {
+                    marker[ju] = marker[ju - 1] << 1;
+                }
+                break;
+            }
+            marker[ju] += 1;
+            j -= 1;
+        }
+        let mut jj = @as(usize, len) + 1;
+        while jj < 33 {
+            if (marker[jj] >> 1) == entry {
+                entry = marker[jj];
+                marker[jj] = marker[jj - 1] << 1;
+            } else {
+                break;
+            }
+            jj += 1;
+        }
+    }
+}
+
+// Sorts the codewords by key, in O(n log n) whatever the order.
+fn sort_codewords(book: *mut Book) VorbisError!void {
+    let used = book.keys.len;
+    let mut sorted = true;
+    for i in @as(usize, 1)..used {
+        if book.keys[i - 1] > book.keys[i] {
+            sorted = false;
+            break;
+        }
+    }
+    if sorted {
+        return;
+    }
+    // key << 32 | old position, sorted
+    let order = mem.alloc.[u64](used)!;
+    defer mem.free(order);
+    for i in @as(usize, 0)..used {
+        order[i] = (@as(u64, book.keys[i]) << 32) | @as(u64, @truncate(u32, i));
+    }
+    vec.sort(order, less_u64);
+    let ids = mem.alloc.[u32](used)!;
+    defer mem.free(ids);
+    let lens = mem.alloc.[u8](used)!;
+    defer mem.free(lens);
+    for i in @as(usize, 0)..used {
+        let at = @truncate(usize, order[i] & 0xffffffff);
+        ids[i] = book.ids[at];
+        lens[i] = book.lens[at];
+    }
+    for i in @as(usize, 0)..used {
+        book.keys[i] = @truncate(u32, order[i] >> 32);
+        book.ids[i] = ids[i];
+        book.lens[i] = lens[i];
+    }
+}
+
+// The fast table (indexed by the next FAST bits as read): for each code that
+// short, its position in the sorted codewords; -1 for the rest.
+fn fill_fast(book: *mut Book) void {
+    for i in @as(usize, 0)..book.fast.len {
+        book.fast[i] = -1;
+    }
+    for e in @as(usize, 0)..book.keys.len {
+        let len = @as(u32, book.lens[e]);
+        if len > FAST {
+            continue;
+        }
+        let rev = bit_reverse(book.keys[e]);  // the codeword in reading order
+        let step = @as(usize, 1) << @as(usize, len);
+        let mut fill = @as(usize, rev);
+        while fill < (@as(usize, 1) << @as(usize, FAST)) {
+            book.fast[fill] = @bit_cast(i32, @truncate(u32, e));
+            fill += step;
+        }
+    }
+}
+
+// Reads a book's vector lookup table (type 1 or 2) into book.vq.
+fn read_lookup(b: *mut Bits, book: *mut Book, lookup: u32, budget: *mut usize) VorbisError!void {
+    let entries = book.entries;
     let minv = float32_unpack(b.read(32));
     let delta = float32_unpack(b.read(32));
     let vbits = b.read(4) + 1;
@@ -1276,6 +1287,101 @@ pub fn decode(data: []u8) VorbisError!audio.Sound {
     return decode_audio(&s, pk[3..], audio.max_samples(data.len, PER_BYTE));
 }
 
+// The scratch memory of the residue decoding, for each channel.
+struct ResidueScratch {
+    decode_res: []mut bool,  // whether the channel's residue is decoded
+    skip: []mut bool,        // the same, for the vectors of a submap
+    vecs: []mut []mut f32,   // the vectors of a submap
+    classes: []mut u8,
+
+    // Decodes a packet's residues into spec (each channel's n2 values, stride apart),
+    // zeroing it first, per submap.
+    fn decode(self: *mut ResidueScratch, b: *mut Bits, s: *Setup, map: *Mapping, has_floor: []bool, spec: []mut f32,
+              stride: usize, n2: usize) void {
+        let nch = has_floor.len;
+        let decode_res = self.decode_res;
+        let skip = self.skip;
+        // the residues of coupled channels are decoded if either has a floor
+        for c in @as(usize, 0)..nch {
+            decode_res[c] = has_floor[c];
+        }
+        for k in @as(usize, 0)..map.steps {
+            let mg = @as(usize, map.mag[k]);
+            let an = @as(usize, map.ang[k]);
+            if decode_res[mg] or decode_res[an] {
+                decode_res[mg] = true;
+                decode_res[an] = true;
+            }
+        }
+        for c in @as(usize, 0)..nch {
+            @mem_set(spec[c * stride..(c * stride) + n2], 0);
+        }
+        for sub in @as(usize, 0)..map.submaps {
+            let mut k: usize = 0;
+            for c in @as(usize, 0)..nch {
+                if @as(usize, map.mux[c]) == sub {
+                    self.vecs[k] = spec[c * stride..(c * stride) + n2];
+                    skip[k] = not decode_res[c];
+                    k += 1;
+                }
+            }
+            let r = &s.residues[@as(usize, map.residue[sub])];
+            if r.kind == 2 {
+                // decoded only if some channel is
+                let mut any = false;
+                for j in @as(usize, 0)..k {
+                    if not skip[j] {
+                        any = true;
+                    }
+                }
+                if not any {
+                    continue;
+                }
+            }
+            residue_decode(b, s, r, self.vecs[..k], skip[..k], n2, self.classes);
+        }
+    }
+}
+
+// Undoes a mapping's channel coupling (the last step first) on spec, each
+// channel's n2 values stride apart.
+fn inverse_coupling(map: *Mapping, spec: []mut f32, stride: usize, n2: usize) void {
+    let mut st = map.steps;
+    while st > 0 {
+        st -= 1;
+        let mv = spec[@as(usize, map.mag[st]) * stride..];
+        let av = spec[@as(usize, map.ang[st]) * stride..];
+        for i in @as(usize, 0)..n2 {
+            let m = mv[i];
+            let a = av[i];
+            if m > 0.0 {
+                if a > 0.0 {
+                    av[i] = m - a;
+                } else {
+                    av[i] = m;
+                    mv[i] = m + a;
+                }
+            } else if a > 0.0 {
+                av[i] = m + a;
+            } else {
+                av[i] = m;
+                mv[i] = m - a;
+            }
+        }
+    }
+}
+
+// Grows the output's room (*cap frames) to hold need frames, within limit samples.
+fn grow(out: *mut audio.Sound, cap: *mut usize, need: usize, limit: usize) VorbisError!void {
+    let nch = out.channels;
+    if need > (limit / nch) {
+        return error.TooLarge;
+    }
+    cap.* = @min(@max(cap.* * 2, need + 4096), limit / nch);
+    let size = audio.sample_bytes(cap.* * nch, audio.SampleFormat.F32)!;
+    out.data = mem.realloc(out.data, size)!;
+}
+
 /// Decodes the audio packets, giving at most limit samples.
 fn decode_audio(s: *Setup, pk: []ogg.Packet, limit: usize) VorbisError!audio.Sound {
     let nch = s.channels;
@@ -1304,6 +1410,7 @@ fn decode_audio(s: *Setup, pk: []ogg.Packet, limit: usize) VorbisError!audio.Sou
     defer mem.free(classes);
     let vec_store = mem.alloc.[[]mut f32](nch)!;
     defer mem.free(vec_store);
+    let mut rs = ResidueScratch.{ decode_res: decode_res, skip: skip, vecs: vec_store, classes: classes };
     let w0 = slope_table(s.bs[0] / 2)!;
     defer mem.free(w0);
     let w1 = slope_table(s.bs[1] / 2)!;
@@ -1353,70 +1460,8 @@ fn decode_audio(s: *Setup, pk: []ogg.Packet, limit: usize) VorbisError!audio.Sou
             let fl = &s.floors[@as(usize, map.floor[sub])];
             has_floor[c] = floor1_read(&mut b, s, fl, ys[c * 65..(c * 65) + 65]);
         }
-        // the residues of coupled channels are decoded if either has a floor
-        for c in @as(usize, 0)..nch {
-            decode_res[c] = has_floor[c];
-        }
-        for k in @as(usize, 0)..map.steps {
-            let mg = @as(usize, map.mag[k]);
-            let an = @as(usize, map.ang[k]);
-            if decode_res[mg] or decode_res[an] {
-                decode_res[mg] = true;
-                decode_res[an] = true;
-            }
-        }
-        // residues, per submap
-        for c in @as(usize, 0)..nch {
-            @mem_set(spec[c * n2max..(c * n2max) + n2], 0);
-        }
-        for sub in @as(usize, 0)..map.submaps {
-            let mut k: usize = 0;
-            for c in @as(usize, 0)..nch {
-                if @as(usize, map.mux[c]) == sub {
-                    vec_store[k] = spec[c * n2max..(c * n2max) + n2];
-                    skip[k] = not decode_res[c];
-                    k += 1;
-                }
-            }
-            let r = &s.residues[@as(usize, map.residue[sub])];
-            if r.kind == 2 {
-                // decoded only if some channel is
-                let mut any = false;
-                for j in @as(usize, 0)..k {
-                    if not skip[j] {
-                        any = true;
-                    }
-                }
-                if not any {
-                    continue;
-                }
-            }
-            residue_decode(&mut b, s, r, vec_store[..k], skip[..k], n2, classes);
-        }
-        // inverse coupling, last step first
-        let mut st = map.steps;
-        while st > 0 {
-            st -= 1;
-            let mv = spec[@as(usize, map.mag[st]) * n2max..];
-            let av = spec[@as(usize, map.ang[st]) * n2max..];
-            for i in @as(usize, 0)..n2 {
-                let m = mv[i];
-                let a = av[i];
-                if m > 0.0 {
-                    if a > 0.0 {
-                        av[i] = m - a;
-                    } else {
-                        av[i] = m;
-                        mv[i] = m + a;
-                    }
-                } else if a > 0.0 {
-                    av[i] = m + a;
-                } else {
-                    av[i] = m;
-                    mv[i] = m - a;
-                }
-            }
-        }
+        rs.decode(&mut b, s, map, has_floor, spec, n2max, n2);
+        inverse_coupling(map, spec, n2max, n2);
         // floors times residues, then the inverse MDCT and the window
         for c in @as(usize, 0)..nch {
             let sp = spec[c * n2max..(c * n2max) + n2];
@@ -1441,16 +1486,7 @@ fn decode_audio(s: *Setup, pk: []ogg.Packet, limit: usize) VorbisError!audio.Sou
         if prev_n > 0 {
             let count = (prev_n / 4) + (n / 4);
             if (frames + count) > cap {
-                if (frames + count) > (limit / nch) {
-                    out.deinit();
-                    return error.TooLarge;
-                }
-                cap = @min(@max(cap * 2, frames + count + 4096), limit / nch);
-                let size = audio.sample_bytes(cap * nch, audio.SampleFormat.F32) catch |e| {
-                    out.deinit();
-                    return e;
-                };
-                out.data = mem.realloc(out.data, size) catch |e| {
+                grow(&mut out, &mut cap, frames + count, limit) catch |e| {
                     out.deinit();
                     return e;
                 };

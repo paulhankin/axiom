@@ -22,6 +22,7 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
+import "internal/testdata.ax" as testdata;
 
 pub error Bzip2Error { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory, Empty, IoError, NotFound, Done,
                        InvalidUtf8 }
@@ -957,11 +958,59 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
         }
     }
     let alpha = nused + 2;
-    let eob = @truncate(u16, alpha - 1);
-    // move-to-front, with zero runs as RUNA/RUNB
     let mut syms = vec.Vec.[u16].init();
     defer syms.deinit();
     syms.reserve(n + 1)!;
+    mtf_symbols(last, index[..], nused, &mut syms)!;
+    syms.push(@truncate(u16, alpha - 1))!;  // the end of the block
+    let s = syms.items();
+    // the number of tables
+    let mut ngroups: usize = 6;
+    if s.len < 200 {
+        ngroups = 2;
+    } else if s.len < 600 {
+        ngroups = 3;
+    } else if s.len < 1200 {
+        ngroups = 4;
+    } else if s.len < 2400 {
+        ngroups = 5;
+    }
+    let nsel = (s.len + GROUP_SIZE - 1) / GROUP_SIZE;
+    let mut lens: [6][258]u8 = [[0; 258]; 6];
+    let selectors = mem.alloc.[u8](nsel)!;
+    defer mem.free(selectors);
+    choose_tables(s, alpha, lens[..ngroups], selectors)!;
+    // the header
+    w.put(1, 0)!;
+    w.put(24, @truncate(u32, orig))!;
+    write_inuse(w, inuse[..])!;
+    write_tables(w, lens[..ngroups], alpha, selectors)!;
+    // the symbols, with canonical codes
+    let mut codes: [6][258]u32 = [[0; 258]; 6];
+    for g in @as(usize, 0)..ngroups {
+        let mut code: u32 = 0;
+        for l in @as(u8, 1)..21 {
+            for k in @as(usize, 0)..alpha {
+                if lens[g][k] == l {
+                    codes[g][k] = code;
+                    code += 1;
+                }
+            }
+            code <<= 1;
+        }
+    }
+    for gi in @as(usize, 0)..nsel {
+        let g = @as(usize, selectors[gi]);
+        for x in s[gi * GROUP_SIZE..@min((gi + 1) * GROUP_SIZE, s.len)] {
+            let k = @as(usize, x);
+            w.put(@as(u32, lens[g][k]), codes[g][k])!;
+        }
+    }
+}
+
+// Move-to-front codes the BWT's last column (its bytes mapped by index to the first
+// nused symbols), with zero runs as RUNA/RUNB.
+fn mtf_symbols(last: []u8, index: []u8, nused: usize, syms: *mut vec.Vec.[u16]) Bzip2Error!void {
     let mut mtf: [256]u8 = [0; 256];
     for k in @as(usize, 0)..nused {
         mtf[k] = @truncate(u8, k);
@@ -977,7 +1026,7 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
             zeros += 1;
             continue;
         }
-        put_run(&mut syms, zeros)!;
+        put_run(syms, zeros)!;
         zeros = 0;
         syms.push(@truncate(u16, j + 1))!;
         while j > 0 {
@@ -986,23 +1035,15 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
         }
         mtf[0] = v;
     }
-    put_run(&mut syms, zeros)!;
-    syms.push(eob)!;
-    let s = syms.items();
-    // the number of tables, and a first split of the symbols among them
-    let mut ngroups: usize = 6;
-    if s.len < 200 {
-        ngroups = 2;
-    } else if s.len < 600 {
-        ngroups = 3;
-    } else if s.len < 1200 {
-        ngroups = 4;
-    } else if s.len < 2400 {
-        ngroups = 5;
-    }
-    let nsel = (s.len + GROUP_SIZE - 1) / GROUP_SIZE;
+    put_run(syms, zeros)!;
+}
+
+// Chooses the code lengths of the tables (one per entry of lens) for the symbols s,
+// of an alphabet of alpha, and the table for each group of GROUP_SIZE symbols.
+fn choose_tables(s: []u16, alpha: usize, lens: []mut [258]u8, selectors: []mut u8) Bzip2Error!void {
+    let ngroups = lens.len;
+    let nsel = selectors.len;
     let mut freq: [6][258]u32 = [[0; 258]; 6];
-    let mut lens: [6][258]u8 = [[0; 258]; 6];
     let mut total: [258]u32 = [0; 258];
     for x in s {
         total[@as(usize, x)] += 1;
@@ -1028,8 +1069,6 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
         lo = hi;
         remaining -= @min(acc, remaining);
     }
-    let selectors = mem.alloc.[u8](nsel)!;
-    defer mem.free(selectors);
     // refine: choose the cheapest table for each group, recount, rebuild
     for _iter in @as(usize, 0)..4 {
         for g in @as(usize, 0)..ngroups {
@@ -1058,9 +1097,11 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
             code_lengths(freq[g][..alpha], lens[g][..alpha], 17)!;
         }
     }
-    // the header
-    w.put(1, 0)!;
-    w.put(24, @truncate(u32, orig))!;
+}
+
+// The block header's map of the bytes in use: which of the 16 ranges of 16 hold
+// any, then the bytes of each that does.
+fn write_inuse(w: *mut BitWriter, inuse: []bool) Bzip2Error!void {
     let mut groups16: u32 = 0;
     for i in @as(usize, 0)..16 {
         for j in @as(usize, 0)..16 {
@@ -1081,11 +1122,15 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
             w.put(16, bits16)!;
         }
     }
-    w.put(3, @truncate(u32, ngroups))!;
-    w.put(15, @truncate(u32, nsel))!;
+}
+
+// The block header's tables: their number, the selectors (move-to-front coded, in
+// unary), and each table's code lengths as deltas.
+fn write_tables(w: *mut BitWriter, lens: [][258]u8, alpha: usize, selectors: []u8) Bzip2Error!void {
+    w.put(3, @truncate(u32, lens.len))!;
+    w.put(15, @truncate(u32, selectors.len))!;
     let mut order: [6]u8 = [0, 1, 2, 3, 4, 5];
-    for gi in @as(usize, 0)..nsel {
-        let v = selectors[gi];
+    for v in selectors {
         let mut j: usize = 0;
         while order[j] != v {
             j += 1;
@@ -1100,7 +1145,7 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
         }
         order[0] = v;
     }
-    for g in @as(usize, 0)..ngroups {
+    for g in @as(usize, 0)..lens.len {
         let mut cur = @as(i32, lens[g][0]);
         w.put(5, @bit_cast(u32, cur))!;
         for k in @as(usize, 0)..alpha {
@@ -1114,27 +1159,6 @@ fn encode_block(w: *mut BitWriter, block: []u8) Bzip2Error!void {
                 cur -= 1;
             }
             w.put(1, 0)!;
-        }
-    }
-    // the symbols, with canonical codes
-    let mut codes: [6][258]u32 = [[0; 258]; 6];
-    for g in @as(usize, 0)..ngroups {
-        let mut code: u32 = 0;
-        for l in @as(u8, 1)..21 {
-            for k in @as(usize, 0)..alpha {
-                if lens[g][k] == l {
-                    codes[g][k] = code;
-                    code += 1;
-                }
-            }
-            code <<= 1;
-        }
-    }
-    for gi in @as(usize, 0)..nsel {
-        let g = @as(usize, selectors[gi]);
-        for x in s[gi * GROUP_SIZE..@min((gi + 1) * GROUP_SIZE, s.len)] {
-            let k = @as(usize, x);
-            w.put(@as(u32, lens[g][k]), codes[g][k])!;
         }
     }
 }
@@ -1153,36 +1177,10 @@ fn put_run(syms: *mut vec.Vec.[u16], n: usize) Bzip2Error!void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn fails(r: ![]mut u8) bool {
-    let x = r catch return true;
-    mem.free(x);
-    return false;
-}
-
 test "files made by the bz2 library" {
     let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
     defer mem.free(corpus);
-    let mut dir = fs.read_dir("std/compress/bzip2/testdata")!;
-    defer dir.deinit();
-    let mut n: usize = 0;
-    for e in dir.entries.items() {
-        let mut p = strs.String.init();
-        defer p.deinit();
-        p.push_str("std/compress/bzip2/testdata/")!;
-        p.push_str(e.name)!;
-        let data = fs.read_file(p.bytes())!;
-        defer mem.free(data);
-        let got = decompress(data, 1 << 24)!;
-        defer mem.free(got);
-        if strs.starts_with(e.name, "corpus") {
-            @expect_eq(got, corpus);
-        } else if strs.starts_with(e.name, "short") {
-            @expect_eq(got, "Hello, Hello, Hello, world!\n");
-        } else {
-            @expect_eq(got.len, 0);
-        }
-        n += 1;
-    }
+    let n = testdata.check_files("std/compress/bzip2/testdata", ".bz2", corpus, decompress)!;
     @expect(n >= 5);
 }
 
@@ -1196,7 +1194,7 @@ test "round trips" {
         let d = decompress(c, corpus.len)!;
         defer mem.free(d);
         @expect_eq(d, corpus);
-        @expect(fails(decompress(c, corpus.len - 1)));
+        @expect(testdata.fails(decompress(c, corpus.len - 1)));
     }
     let mut runs = strs.String.init();
     defer runs.deinit();
@@ -1242,7 +1240,7 @@ test "damaged input" {
     let c = compress("hello hello hello hello hello hello, world", 9)!;
     defer mem.free(c);
     for n in @as(usize, 0)..c.len {
-        @expect(fails(decompress(c[..n], 1000)));
+        @expect(testdata.fails(decompress(c[..n], 1000)));
     }
     let mut b = strs.String.from(c)!;
     defer b.deinit();

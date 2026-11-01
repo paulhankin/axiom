@@ -371,16 +371,20 @@ pub fn decode_page(data: []u8, n: usize) !image.Image {
 // Decoding
 // -----------------------------------------------------------------------------
 
-fn decode_ifd(f: *File, p: *Page) !image.Image {
-    if (p.width == 0) or (p.height == 0) or (p.width > 0x10000000) or (p.height > 0x10000000) {
-        return error.Corrupt;
-    }
-    let w = @truncate(usize, p.width);
-    let h = @truncate(usize, p.height);
-    let px = @mul_checked(w, h) catch return error.TooLarge;
-    if px > image.MAX_PIXELS {
-        return error.TooLarge;
-    }
+// What a page's samples are, from its tags.
+struct Samples {
+    spp: usize,  // samples per pixel
+    bps: u64,    // bits per sample
+    float: bool,
+    signed: bool,
+    photo: u64,     // the photometric interpretation (resolved when not given)
+    colors: usize,  // the colour samples of a pixel (the rest are extra)
+    alpha: u64,     // 0 none, 1 associated, 2 unassociated
+}
+
+// The page's samples, if this decoder reads them: their format, colours and
+// alpha, and their compression and predictor.
+fn read_samples(f: *File, p: *Page) TiffError!Samples {
     if (p.spp == 0) or (p.spp > 16) {
         return error.Unsupported;
     }
@@ -424,7 +428,7 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
     if spp < colors {
         return error.Corrupt;
     }
-    let mut alpha: u64 = 0;  // 1 associated, 2 unassociated
+    let mut alpha: u64 = 0;
     if (spp > colors) and (p.extras.count > 0) {
         let e = elem(f, p.extras, 0);
         if (e == 1) or (e == 2) {
@@ -456,6 +460,24 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
     if (pred != 1) and (pred != 2) and (pred != 3) {
         return error.Unsupported;
     }
+    return Samples.{ spp: spp, bps: bps, float: float, signed: signed, photo: photo, colors: colors, alpha: alpha };
+}
+
+fn decode_ifd(f: *File, p: *Page) !image.Image {
+    if (p.width == 0) or (p.height == 0) or (p.width > 0x10000000) or (p.height > 0x10000000) {
+        return error.Corrupt;
+    }
+    let w = @truncate(usize, p.width);
+    let h = @truncate(usize, p.height);
+    let px = @mul_checked(w, h) catch return error.TooLarge;
+    if px > image.MAX_PIXELS {
+        return error.TooLarge;
+    }
+    let sm = read_samples(f, p)!;
+    let spp = sm.spp;
+    let bps = sm.bps;
+    let comp = p.compression;
+    let fax = (comp == 2) or (comp == 3) or (comp == 4);
     // the chunks: strips or tiles
     let tiled = p.tile_w > 0;
     let mut cw = w;
@@ -491,7 +513,7 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
         return error.TooLarge;
     }
     let mut esz: usize = 1;
-    if float {
+    if sm.float {
         esz = 4;
     } else if bps > 8 {
         esz = 2;
@@ -540,35 +562,13 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
             src = s;
         }
         let out = buf[..rowbytes * rows];
-        @mem_set(out, 0);
-        if comp == 1 {
-            let k = @min(src.len, out.len);
-            @mem_copy(out[..k], src[..k]);
-        } else if comp == 32773 {
-            unpackbits(src, out);
-        } else if comp == 5 {
-            _ = lzw_decode(src, out)!;
-        } else if (comp == 8) or (comp == 32946) {
-            let z = deflate.decompress(src, deflate.Format.ZLIB, out.len + 65536) catch |e| {
-                if e == error.OutOfMemory {
-                    return e;
-                }
-                return error.Corrupt;
-            };
-            let k = @min(z.len, out.len);
-            @mem_copy(out[..k], z[..k]);
-            mem.free(z);
-        } else if fax {
-            fx.decode(src, out, cw, rows, rowbytes, comp, p.t4)!;
-        } else {
-            jpeg_chunk(f, p, src, out, cw, rows, spc)!;
-        }
+        decompress_chunk(f, p, &fx, src, out, cw, rows, rowbytes, spc)!;
         for r in @as(usize, 0)..rows {
             let y = y0 + r;
             if y >= h {
                 break;
             }
-            unpack_row(f, out[r * rowbytes..(r + 1) * rowbytes], vals, spc, bps, pred, tmp);
+            unpack_row(f, out[r * rowbytes..(r + 1) * rowbytes], vals, spc, bps, p.predictor, tmp);
             let xn = @min(cw, w - x0);
             for c in @as(usize, 0)..xn {
                 let base = ((y * w) + x0 + c) * spp;
@@ -578,12 +578,42 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
                     if planes > 1 {
                         idx = base + plane;
                     }
-                    put_raw(raw, idx, v, float, signed, bps);
+                    put_raw(raw, idx, v, sm.float, sm.signed, bps);
                 }
             }
         }
     }
-    return finish(f, p, raw, w, h, spp, colors, photo, alpha, float, bps);
+    return finish(f, p, raw, w, h, &sm);
+}
+
+// Decompresses a chunk (rows rows of cw pixels of spc samples, rowbytes to a row)
+// to out, zero filled where src runs short.
+fn decompress_chunk(f: *File, p: *Page, fx: *Fax, src: []u8, out: []mut u8, cw: usize, rows: usize, rowbytes: usize,
+                    spc: usize) !void {
+    let comp = p.compression;
+    @mem_set(out, 0);
+    if comp == 1 {
+        let k = @min(src.len, out.len);
+        @mem_copy(out[..k], src[..k]);
+    } else if comp == 32773 {
+        unpackbits(src, out);
+    } else if comp == 5 {
+        _ = lzw_decode(src, out)!;
+    } else if (comp == 8) or (comp == 32946) {
+        let z = deflate.decompress(src, deflate.Format.ZLIB, out.len + 65536) catch |e| {
+            if e == error.OutOfMemory {
+                return e;
+            }
+            return error.Corrupt;
+        };
+        let k = @min(z.len, out.len);
+        @mem_copy(out[..k], z[..k]);
+        mem.free(z);
+    } else if (comp == 2) or (comp == 3) or (comp == 4) {
+        fx.decode(src, out, cw, rows, rowbytes, comp, p.t4)!;
+    } else {
+        jpeg_chunk(f, p, src, out, cw, rows, spc)!;
+    }
 }
 
 fn reverse_bits(b: u8) u8 {
@@ -684,8 +714,13 @@ fn put_raw(raw: []mut u8, idx: usize, v: u64, float: bool, signed: bool, bps: u6
 
 // raw samples to an image: photometric interpretation, palettes, scaling,
 // alpha
-fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, spp: usize, colors: usize, photo: u64, alpha: u64,
-          float: bool, bps: u64) TiffError!image.Image {
+fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, sm: *Samples) TiffError!image.Image {
+    let spp = sm.spp;
+    let colors = sm.colors;
+    let photo = sm.photo;
+    let alpha = sm.alpha;
+    let float = sm.float;
+    let bps = sm.bps;
     let mut outc: usize = 3;
     if (photo == 0) or (photo == 1) {
         outc = 1;
@@ -1613,9 +1648,6 @@ fn write_pages(w: io.Writer, imgs: []*image.Image, opts: Options, keep: bool) !v
     for pi in @as(usize, 0)..imgs.len {
         let img = imgs[pi];
         let lay = &layouts[pi];
-        let ch = img.channels;
-        let wd = img.width;
-        let h = img.height;
         for si in @as(usize, 0)..lay.nstrips {
             let k = lay.first + si;
             if (at + @as(u64, o.len)) < offs[k] {
@@ -1644,79 +1676,16 @@ fn write_pages(w: io.Writer, imgs: []*image.Image, opts: Options, keep: bool) !v
                 kept[k] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
             }
         }
-        // the arrays too long to go inline
-        if ((at + @as(u64, o.len)) & 1) != 0 {
-            o.push(0)!;
-        }
-        if ch > 2 {
-            for _q in @as(usize, 0)..ch {
-                put16(&mut o, @as(u64, lay.bps))!;
-            }
-            for _q in @as(usize, 0)..ch {
-                put16(&mut o, lay.format)!;
-            }
-        }
-        if lay.nstrips > 1 {
-            for si in @as(usize, 0)..lay.nstrips {
-                put32(&mut o, offs[lay.first + si])!;
-            }
-            for si in @as(usize, 0)..lay.nstrips {
-                put32(&mut o, sizes[lay.first + si])!;
-            }
-        }
+        write_arrays(&mut o, at, img.channels, lay, offs, sizes)!;
         // the directory
         if ((at + @as(u64, o.len)) & 1) != 0 {
             o.push(0)!;
-        }
-        let bps = @as(u64, lay.bps);
-        let format = lay.format;
-        let pred = lay.pred;
-        let nstrips = lay.nstrips;
-        put16(&mut o, lay.nf)!;
-        field(&mut o, 256, 4, 1, @as(u64, wd))!;
-        field(&mut o, 257, 4, 1, @as(u64, h))!;
-        if ch > 2 {
-            field(&mut o, 258, 3, @as(u64, ch), lay.bits_at)!;
-        } else {
-            field(&mut o, 258, 3, @as(u64, ch), (bps << 16) | bps)!;
-        }
-        field(&mut o, 259, 3, 1, @as(u64, @int_from_enum(comp)))!;
-        let mut photo: u64 = 1;
-        if ch >= 3 {
-            photo = 2;
-        }
-        field(&mut o, 262, 3, 1, photo)!;
-        if nstrips > 1 {
-            field(&mut o, 273, 4, @as(u64, nstrips), lay.offsets_at)!;
-        } else {
-            field(&mut o, 273, 4, 1, offs[lay.first])!;
-        }
-        field(&mut o, 277, 3, 1, @as(u64, ch))!;
-        field(&mut o, 278, 4, 1, @as(u64, lay.rps))!;
-        if nstrips > 1 {
-            field(&mut o, 279, 4, @as(u64, nstrips), lay.counts_at)!;
-        } else {
-            field(&mut o, 279, 4, 1, sizes[lay.first])!;
-        }
-        field(&mut o, 284, 3, 1, 1)!;
-        if pred != 1 {
-            field(&mut o, 317, 3, 1, pred)!;
-        }
-        if (ch == 2) or (ch == 4) {
-            field(&mut o, 338, 3, 1, 2)!;
-        }
-        if format != 1 {
-            if ch > 2 {
-                field(&mut o, 339, 3, @as(u64, ch), lay.format_at)!;
-            } else {
-                field(&mut o, 339, 3, @as(u64, ch), (format << 16) | format)!;
-            }
         }
         let mut next: u64 = 0;
         if (pi + 1) < imgs.len {
             next = layouts[pi + 1].ifd_at;
         }
-        put32(&mut o, next)!;
+        write_ifd(&mut o, img, lay, comp, offs, sizes, next)!;
         if o.len >= 16384 {
             w.write_all(o.bytes())!;
             at += @as(u64, o.len);
@@ -1724,6 +1693,82 @@ fn write_pages(w: io.Writer, imgs: []*image.Image, opts: Options, keep: bool) !v
         }
     }
     w.write_all(o.bytes())!;
+}
+
+// A page's arrays too long to go inline in its directory (bits per sample
+// and sample formats of more than two channels, the offsets and sizes of
+// more than one strip), at an even offset (o starts at offset at).
+fn write_arrays(o: *mut strs.String, at: u64, ch: usize, lay: *PageLayout, offs: []u64, sizes: []u64) !void {
+    if ((at + @as(u64, o.len)) & 1) != 0 {
+        o.push(0)!;
+    }
+    if ch > 2 {
+        for _q in @as(usize, 0)..ch {
+            put16(o, @as(u64, lay.bps))!;
+        }
+        for _q in @as(usize, 0)..ch {
+            put16(o, lay.format)!;
+        }
+    }
+    if lay.nstrips > 1 {
+        for si in @as(usize, 0)..lay.nstrips {
+            put32(o, offs[lay.first + si])!;
+        }
+        for si in @as(usize, 0)..lay.nstrips {
+            put32(o, sizes[lay.first + si])!;
+        }
+    }
+}
+
+// A page's directory, next being the offset of the next one (or 0).
+fn write_ifd(o: *mut strs.String, img: *image.Image, lay: *PageLayout, comp: Compression, offs: []u64, sizes: []u64,
+             next: u64) !void {
+    let ch = img.channels;
+    let bps = @as(u64, lay.bps);
+    let format = lay.format;
+    let pred = lay.pred;
+    let nstrips = lay.nstrips;
+    put16(o, lay.nf)!;
+    field(o, 256, 4, 1, @as(u64, img.width))!;
+    field(o, 257, 4, 1, @as(u64, img.height))!;
+    if ch > 2 {
+        field(o, 258, 3, @as(u64, ch), lay.bits_at)!;
+    } else {
+        field(o, 258, 3, @as(u64, ch), (bps << 16) | bps)!;
+    }
+    field(o, 259, 3, 1, @as(u64, @int_from_enum(comp)))!;
+    let mut photo: u64 = 1;
+    if ch >= 3 {
+        photo = 2;
+    }
+    field(o, 262, 3, 1, photo)!;
+    if nstrips > 1 {
+        field(o, 273, 4, @as(u64, nstrips), lay.offsets_at)!;
+    } else {
+        field(o, 273, 4, 1, offs[lay.first])!;
+    }
+    field(o, 277, 3, 1, @as(u64, ch))!;
+    field(o, 278, 4, 1, @as(u64, lay.rps))!;
+    if nstrips > 1 {
+        field(o, 279, 4, @as(u64, nstrips), lay.counts_at)!;
+    } else {
+        field(o, 279, 4, 1, sizes[lay.first])!;
+    }
+    field(o, 284, 3, 1, 1)!;
+    if pred != 1 {
+        field(o, 317, 3, 1, pred)!;
+    }
+    if (ch == 2) or (ch == 4) {
+        field(o, 338, 3, 1, 2)!;
+    }
+    if format != 1 {
+        if ch > 2 {
+            field(o, 339, 3, @as(u64, ch), lay.format_at)!;
+        } else {
+            field(o, 339, 3, @as(u64, ch), (format << 16) | format)!;
+        }
+    }
+    put32(o, next)!;
 }
 
 // differences a row in place: horizontal (pred 2) on samples, or

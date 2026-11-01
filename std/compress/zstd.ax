@@ -28,6 +28,7 @@ import "../io.ax" as io;
 import "../mem.ax" as mem;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
+import "internal/testdata.ax" as testdata;
 
 pub error ZstdError { Corrupt, ChecksumMismatch, TooLarge, Unsupported, OutOfMemory, NotFound, IoError, Empty, Done,
                       InvalidUtf8 }
@@ -1233,83 +1234,19 @@ fn huff_literals(lits: []u8, out: *mut strs.String) ZstdError!bool {
     let mut tree = strs.String.init();
     defer tree.deinit();
     let nw = max_sym;  // (the last symbol's weight is implied)
-    let mut fse_ok = false;
+    let mut tree_ok = false;
     if nw >= 2 {
-        let mut wf: [13]u32 = [0; 13];
-        for k in @as(usize, 0)..nw {
-            wf[@as(usize, weights[k])] += 1;
-        }
-        let mut top: usize = 0;
-        for k in @as(usize, 0)..13 {
-            if wf[k] > 0 {
-                top = k;
-            }
-        }
-        let mut norm: [13]i32 = [0; 13];
-        normalize(wf[..top + 1], @truncate(u32, nw), 6, norm[..top + 1]);
-        let mut ct = empty_ctable();
-        ctable_build(&mut ct, norm[..top + 1], 6);
-        let mut body = strs.String.init();
-        defer body.deinit();
-        let mut w = BitW.{ out: &mut body, acc: 0, n: 0 };
-        write_ncount(&mut w, norm[..top + 1], 6)!;
-        if w.n > 0 {
-            body.push(@truncate(u8, w.acc))!;
-            w.acc = 0;
-            w.n = 0;
-        }
-        // two interleaved states, symbols from the end
-        let mut w2 = BitW.{ out: &mut body, acc: 0, n: 0 };
-        let mut k = nw;
-        let mut s1: u32 = 0;
-        let mut s2: u32 = 0;
-        if (nw % 2) == 1 {
-            k -= 1;
-            s1 = fse_init(&ct, @as(usize, weights[k]));
-            k -= 1;
-            s2 = fse_init(&ct, @as(usize, weights[k]));
-            k -= 1;
-            fse_encode(&mut w2, &ct, &mut s1, @as(usize, weights[k]))!;
-        } else {
-            k -= 1;
-            s2 = fse_init(&ct, @as(usize, weights[k]));
-            k -= 1;
-            s1 = fse_init(&ct, @as(usize, weights[k]));
-        }
-        while k > 0 {
-            k -= 1;
-            fse_encode(&mut w2, &ct, &mut s2, @as(usize, weights[k]))!;
-            k -= 1;
-            fse_encode(&mut w2, &ct, &mut s1, @as(usize, weights[k]))!;
-        }
-        w2.add(@as(u64, s2), 6)!;
-        w2.add(@as(u64, s1), 6)!;
-        w2.close()!;
-        if body.len < 128 {
-            tree.push(@truncate(u8, body.len))!;
-            tree.push_str(body.bytes())!;
-            fse_ok = true;
-        }
+        tree_ok = huff_weights_fse(weights[..nw], &mut tree)!;
     }
     if nw <= 128 {
         let direct = 1 + ((nw + 1) / 2);
-        if not fse_ok or (direct < tree.len) {
+        if not tree_ok or (direct < tree.len) {
             tree.clear();
-            tree.push(@truncate(u8, 127 + nw))!;
-            let mut k: usize = 0;
-            while k < nw {
-                let hi = weights[k];
-                let mut lo: u8 = 0;
-                if (k + 1) < nw {
-                    lo = weights[k + 1];
-                }
-                tree.push((hi << 4) | lo)!;
-                k += 2;
-            }
-            fse_ok = true;
+            huff_weights_direct(weights[..nw], &mut tree)!;
+            tree_ok = true;
         }
     }
-    if not fse_ok {
+    if not tree_ok {
         return false;
     }
     // the streams
@@ -1323,41 +1260,136 @@ fn huff_literals(lits: []u8, out: *mut strs.String) ZstdError!bool {
             streams.clear();
         }
     }
-    if four {
-        let seg = (lits.len + 3) / 4;
-        let mut parts: [4]strs.String = [strs.String.init(), strs.String.init(), strs.String.init(),
-                                         strs.String.init()];
-        defer {
-            for k in @as(usize, 0)..4 {
-                parts[k].deinit();
-            }
-        }
-        for k in @as(usize, 0)..4 {
-            let a = @min(k * seg, lits.len);
-            let b = @min((k + 1) * seg, lits.len);
-            if k == 3 {
-                huff_stream_encode(lits[a..], lens[..], codes[..], &mut parts[k])!;
-            } else {
-                huff_stream_encode(lits[a..b], lens[..], codes[..], &mut parts[k])!;
-            }
-        }
-        for k in @as(usize, 0)..3 {
-            if parts[k].len > 65535 {
-                return false;
-            }
-            streams.push(@truncate(u8, parts[k].len))!;
-            streams.push(@truncate(u8, parts[k].len >> 8))!;
-        }
-        for k in @as(usize, 0)..4 {
-            streams.push_str(parts[k].bytes())!;
-        }
+    if four and not huff_four_streams(lits, lens[..], codes[..], &mut streams)! {
+        return false;
     }
     let csize = tree.len + streams.len;
     if (csize + 5) >= lits.len {
         return false;
     }
-    // the header: type 2, the size format, and the two sizes
-    let regen = @as(u64, lits.len);
+    if not literals_header(lits.len, csize, four, out)! {
+        return false;
+    }
+    out.push_str(tree.bytes())!;
+    out.push_str(streams.bytes())!;
+    return true;
+}
+
+// The FSE-compressed tree description of a Huffman code's weights (all but the last
+// symbol's), appended to tree; false (and nothing appended) if it would not fit.
+fn huff_weights_fse(weights: []u8, tree: *mut strs.String) ZstdError!bool {
+    let nw = weights.len;
+    let mut wf: [13]u32 = [0; 13];
+    for k in @as(usize, 0)..nw {
+        wf[@as(usize, weights[k])] += 1;
+    }
+    let mut top: usize = 0;
+    for k in @as(usize, 0)..13 {
+        if wf[k] > 0 {
+            top = k;
+        }
+    }
+    let mut norm: [13]i32 = [0; 13];
+    normalize(wf[..top + 1], @truncate(u32, nw), 6, norm[..top + 1]);
+    let mut ct = empty_ctable();
+    ctable_build(&mut ct, norm[..top + 1], 6);
+    let mut body = strs.String.init();
+    defer body.deinit();
+    let mut w = BitW.{ out: &mut body, acc: 0, n: 0 };
+    write_ncount(&mut w, norm[..top + 1], 6)!;
+    if w.n > 0 {
+        body.push(@truncate(u8, w.acc))!;
+        w.acc = 0;
+        w.n = 0;
+    }
+    // two interleaved states, symbols from the end
+    let mut w2 = BitW.{ out: &mut body, acc: 0, n: 0 };
+    let mut k = nw;
+    let mut s1: u32 = 0;
+    let mut s2: u32 = 0;
+    if (nw % 2) == 1 {
+        k -= 1;
+        s1 = fse_init(&ct, @as(usize, weights[k]));
+        k -= 1;
+        s2 = fse_init(&ct, @as(usize, weights[k]));
+        k -= 1;
+        fse_encode(&mut w2, &ct, &mut s1, @as(usize, weights[k]))!;
+    } else {
+        k -= 1;
+        s2 = fse_init(&ct, @as(usize, weights[k]));
+        k -= 1;
+        s1 = fse_init(&ct, @as(usize, weights[k]));
+    }
+    while k > 0 {
+        k -= 1;
+        fse_encode(&mut w2, &ct, &mut s2, @as(usize, weights[k]))!;
+        k -= 1;
+        fse_encode(&mut w2, &ct, &mut s1, @as(usize, weights[k]))!;
+    }
+    w2.add(@as(u64, s2), 6)!;
+    w2.add(@as(u64, s1), 6)!;
+    w2.close()!;
+    if body.len >= 128 {
+        return false;
+    }
+    tree.push(@truncate(u8, body.len))!;
+    tree.push_str(body.bytes())!;
+    return true;
+}
+
+// The direct tree description of a Huffman code's weights (all but the last
+// symbol's, at most 128 of them): two to a byte.
+fn huff_weights_direct(weights: []u8, tree: *mut strs.String) ZstdError!void {
+    let nw = weights.len;
+    tree.push(@truncate(u8, 127 + nw))!;
+    let mut k: usize = 0;
+    while k < nw {
+        let hi = weights[k];
+        let mut lo: u8 = 0;
+        if (k + 1) < nw {
+            lo = weights[k + 1];
+        }
+        tree.push((hi << 4) | lo)!;
+        k += 2;
+    }
+}
+
+// Huffman-codes literals as four streams, with the jump table before them; false
+// if a stream is too long for the table.
+fn huff_four_streams(lits: []u8, lens: []u8, codes: []u32, streams: *mut strs.String) ZstdError!bool {
+    let seg = (lits.len + 3) / 4;
+    let mut parts: [4]strs.String = [strs.String.init(), strs.String.init(), strs.String.init(), strs.String.init()];
+    defer {
+        for k in @as(usize, 0)..4 {
+            parts[k].deinit();
+        }
+    }
+    for k in @as(usize, 0)..4 {
+        let a = @min(k * seg, lits.len);
+        let b = @min((k + 1) * seg, lits.len);
+        if k == 3 {
+            huff_stream_encode(lits[a..], lens, codes, &mut parts[k])!;
+        } else {
+            huff_stream_encode(lits[a..b], lens, codes, &mut parts[k])!;
+        }
+    }
+    for k in @as(usize, 0)..3 {
+        if parts[k].len > 65535 {
+            return false;
+        }
+        streams.push(@truncate(u8, parts[k].len))!;
+        streams.push(@truncate(u8, parts[k].len >> 8))!;
+    }
+    for k in @as(usize, 0)..4 {
+        streams.push_str(parts[k].bytes())!;
+    }
+    return true;
+}
+
+// The header of a Huffman-coded literals section: type 2, the size format, and the
+// two sizes; false (and nothing written) if the sizes do not fit.
+fn literals_header(nlits: usize, csize: usize, four: bool, out: *mut strs.String) ZstdError!bool {
+    let regen = @as(u64, nlits);
     let c = @as(u64, csize);
     let mut sf: u64 = 0;
     let mut bits: u64 = 10;
@@ -1381,8 +1413,6 @@ fn huff_literals(lits: []u8, out: *mut strs.String) ZstdError!bool {
     for k in @as(usize, 0)..hsize {
         out.push(@truncate(u8, v >> @as(u64, 8 * k)))!;
     }
-    out.push_str(tree.bytes())!;
-    out.push_str(streams.bytes())!;
     return true;
 }
 
@@ -1855,36 +1885,10 @@ fn put24(out: *mut strs.String, v: u32) ZstdError!void {
 // Tests
 // -----------------------------------------------------------------------------
 
-fn fails(r: ![]mut u8) bool {
-    let x = r catch return true;
-    mem.free(x);
-    return false;
-}
-
 test "files made by the zstd library" {
     let corpus = fs.read_file("std/compress/testdata/corpus.bin") catch return;
     defer mem.free(corpus);
-    let mut dir = fs.read_dir("std/compress/zstd/testdata")!;
-    defer dir.deinit();
-    let mut n: usize = 0;
-    for e in dir.entries.items() {
-        let mut p = strs.String.init();
-        defer p.deinit();
-        p.push_str("std/compress/zstd/testdata/")!;
-        p.push_str(e.name)!;
-        let data = fs.read_file(p.bytes())!;
-        defer mem.free(data);
-        let got = decompress(data, 1 << 24)!;
-        defer mem.free(got);
-        if strs.starts_with(e.name, "corpus") {
-            @expect_eq(got, corpus);
-        } else if strs.starts_with(e.name, "short") {
-            @expect_eq(got, "Hello, Hello, Hello, world!\n");
-        } else {
-            @expect_eq(got.len, 0);
-        }
-        n += 1;
-    }
+    let n = testdata.check_files("std/compress/zstd/testdata", ".zst", corpus, decompress)!;
     @expect(n >= 9);
 }
 
@@ -1898,7 +1902,7 @@ test "round trips" {
         let d = decompress(c, corpus.len)!;
         defer mem.free(d);
         @expect_eq(d, corpus);
-        @expect(fails(decompress(c, corpus.len - 1)));
+        @expect(testdata.fails(decompress(c, corpus.len - 1)));
     }
     let mut big = strs.String.init();
     defer big.deinit();
@@ -1956,7 +1960,7 @@ test "damaged input" {
     let c = compress("hello hello hello hello hello hello, world", 3)!;
     defer mem.free(c);
     for n in @as(usize, 0)..c.len {
-        @expect(fails(decompress(c[..n], 1000)));
+        @expect(testdata.fails(decompress(c[..n], 1000)));
     }
     let mut b = strs.String.from(c)!;
     defer b.deinit();
@@ -1967,7 +1971,7 @@ test "damaged input" {
         // turns the size byte into an equally valid window size; the checksum
         // covers everything else)
         if (k != 36) and (k != 37) {
-            @expect(fails(decompress(b.bytes(), 1000)));
+            @expect(testdata.fails(decompress(b.bytes(), 1000)));
         }
         b.bytes()[k / 8] ^= bit;
     }

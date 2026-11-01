@@ -24,6 +24,7 @@ import "../../mem.ax" as mem;
 import "../../os/fs.ax" as fs;
 import "../../str.ax" as strs;
 import "../image.ax" as image;
+import "internal/imagetest.ax" as imagetest;
 import "png.ax" as png;
 
 pub error GifError { Corrupt, TooLarge, Unsupported, OutOfMemory, IoError, NotFound, Empty, Done, InvalidUtf8 }
@@ -98,6 +99,96 @@ fn skip_blocks(b: []u8, i: *mut usize) GifError!void {
     }
 }
 
+// The graphic control of the next image.
+struct Control {
+    disposal: u8,
+    delay: u32,
+    transparent: i32,  // -1: none
+}
+
+fn no_control() Control {
+    return Control.{ disposal: 0, delay: 0, transparent: -1 };
+}
+
+// The colour table after a descriptor with these flags, if they say there is one
+// (else none); i moves past it.
+fn color_table(b: []u8, i: *mut usize, flags: u8, none: []u8) GifError![]u8 {
+    if (flags & 0x80) == 0 {
+        return none;
+    }
+    let n = 3 * (@as(usize, 2) << @as(usize, flags & 7));
+    if (i.* + n) > b.len {
+        return error.Corrupt;
+    }
+    let ct = b[i.*..i.* + n];
+    i.* += n;
+    return ct;
+}
+
+// An extension (after its introducer): a graphic control sets gc, a looping
+// extension sets loops, and others are skipped. An error ends the file.
+fn extension(b: []u8, i: *mut usize, gc: *mut Control, loops: *mut i32) GifError!void {
+    if i.* >= b.len {
+        return error.Corrupt;
+    }
+    let label = b[i.*];
+    i.* += 1;
+    let at = i.*;
+    if (label == 0xf9) and ((at + 5) < b.len) and (b[at] == 4) {
+        let p = b[at + 1];
+        gc.disposal = (p >> 2) & 7;
+        gc.delay = @as(u32, @truncate(u16, @as(usize, binary.u16_le(b[at + 2..])))) * 10;
+        gc.transparent = -1;
+        if (p & 1) != 0 {
+            gc.transparent = @as(i32, b[at + 4]);
+        }
+        i.* += 5;
+        skip_blocks(b, i)!;
+    } else if (label == 0xff) and ((at + 12) <= b.len) and (b[at] == 11) and
+              (strs.eq(b[at + 1..at + 12], "NETSCAPE2.0") or strs.eq(b[at + 1..at + 12], "ANIMEXTS1.0")) {
+        i.* += 12;
+        let mut ext = strs.String.init();
+        defer ext.deinit();
+        sub_blocks(b, i, &mut ext)!;
+        let e = ext.bytes();
+        if (e.len >= 3) and (e[0] == 1) {
+            loops.* = @as(i32, @truncate(u16, @as(usize, binary.u16_le(e[1..]))));
+        }
+    } else {
+        skip_blocks(b, i)!;
+    }
+}
+
+// Paints a frame's colour indices, in the rectangle r (x, y, width, height), onto
+// the canvas, leaving transparent and out-of-range ones.
+fn paint(canvas: *mut image.Image, idx: []u8, r: [4]usize, interlaced: bool, ct: []u8, transparent: i32) void {
+    let w = canvas.width;
+    let h = canvas.height;
+    let fw = r[2];
+    let ncolors = ct.len / 3;
+    for k in @as(usize, 0)..idx.len {
+        let mut row = k / @max(fw, 1);
+        let col = k - (row * fw);
+        if interlaced {
+            row = interlaced_row(row, r[3]);
+        }
+        let x = r[0] + col;
+        let y = r[1] + row;
+        if (x >= w) or (y >= h) {
+            continue;
+        }
+        let c = idx[k];
+        if (@as(i32, c) == transparent) or (@as(usize, c) >= ncolors) {
+            continue;
+        }
+        let o = ((y * w) + x) * 4;
+        canvas.data[o] = ct[3 * @as(usize, c)];
+        canvas.data[o + 1] = ct[(3 * @as(usize, c)) + 1];
+        canvas.data[o + 2] = ct[(3 * @as(usize, c)) + 2];
+        canvas.data[o + 3] = 255;
+    }
+}
+
 // limit: the pixels in all the frames
 fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
     if not is_gif(b) or (b.len < 13) {
@@ -111,17 +202,8 @@ fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
     if (w * h) > image.MAX_PIXELS {
         return error.TooLarge;
     }
-    let flags = b[10];
     let mut i: usize = 13;
-    let mut gct: []u8 = b[0..0];
-    if (flags & 0x80) != 0 {
-        let n = 3 * (@as(usize, 2) << @as(usize, flags & 7));
-        if (i + n) > b.len {
-            return error.Corrupt;
-        }
-        gct = b[i..i + n];
-        i += n;
-    }
+    let gct = color_table(b, &mut i, b[10], b[0..0])!;
     let mut anim = Animation.{ width: w, height: h, loops: -1, frames: vec.Vec.[Frame].init() };
     let mut canvas = image.Image.init(w, h, 4, image.Depth.U8) catch |e| {
         anim.deinit();
@@ -135,10 +217,7 @@ fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
     defer saved.deinit();
     let mut lzw = strs.String.init();
     defer lzw.deinit();
-    // the graphic control of the next image
-    let mut disposal: u8 = 0;
-    let mut delay: u32 = 0;
-    let mut transparent: i32 = -1;
+    let mut gc = no_control();
     // the previous frame's disposal, and where it was
     let mut prev_disposal: u8 = 0;
     let mut prev: [4]usize = [0; 4];
@@ -154,37 +233,7 @@ fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
             break;
         }
         if tag == 0x21 {
-            if i >= b.len {
-                break;
-            }
-            let label = b[i];
-            i += 1;
-            if (label == 0xf9) and ((i + 5) < b.len) and (b[i] == 4) {
-                let p = b[i + 1];
-                disposal = (p >> 2) & 7;
-                delay = @as(u32, @truncate(u16, @as(usize, binary.u16_le(b[i + 2..])))) * 10;
-                transparent = -1;
-                if (p & 1) != 0 {
-                    transparent = @as(i32, b[i + 4]);
-                }
-                i += 5;
-                skip_blocks(b, &mut i) catch break;
-            } else if (label == 0xff) and ((i + 12) <= b.len) and (b[i] == 11) and
-                      (strs.eq(b[i + 1..i + 12], "NETSCAPE2.0") or strs.eq(b[i + 1..i + 12], "ANIMEXTS1.0")) {
-                i += 12;
-                let mut ext = strs.String.init();
-                sub_blocks(b, &mut i, &mut ext) catch {
-                    ext.deinit();
-                    break;
-                };
-                let e = ext.bytes();
-                if (e.len >= 3) and (e[0] == 1) {
-                    anim.loops = @as(i32, @truncate(u16, @as(usize, binary.u16_le(e[1..]))));
-                }
-                ext.deinit();
-            } else {
-                skip_blocks(b, &mut i) catch break;
-            }
+            extension(b, &mut i, &mut gc, &mut anim.loops) catch break;
             continue;
         }
         if tag != 0x2c {
@@ -199,15 +248,7 @@ fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
         let fh = @as(usize, binary.u16_le(b[i + 6..]));
         let fflags = b[i + 8];
         i += 9;
-        let mut ct = gct;
-        if (fflags & 0x80) != 0 {
-            let n = 3 * (@as(usize, 2) << @as(usize, fflags & 7));
-            if (i + n) > b.len {
-                break;
-            }
-            ct = b[i..i + n];
-            i += n;
-        }
+        let ct = color_table(b, &mut i, fflags, gct) catch break;
         if i >= b.len {
             break;
         }
@@ -231,7 +272,7 @@ fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
                 @mem_copy(canvas.data, saved.data);
             }
         }
-        if disposal == 3 {
+        if gc.disposal == 3 {
             @mem_copy(saved.data, canvas.data);
         }
         // the indices, then onto the canvas
@@ -242,45 +283,21 @@ fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
         };
         @mem_set(idx, 0);
         let got = lzw_decode(lzw.bytes(), min_code, idx[..n]) catch 0;
-        let interlaced = (fflags & 0x40) != 0;
-        let ncolors = ct.len / 3;
-        for k in @as(usize, 0)..@min(got, n) {
-            let mut row = k / @max(fw, 1);
-            let col = k - (row * fw);
-            if interlaced {
-                row = interlaced_row(row, fh);
-            }
-            let x = fx + col;
-            let y = fy + row;
-            if (x >= w) or (y >= h) {
-                continue;
-            }
-            let c = idx[k];
-            if (@as(i32, c) == transparent) or (@as(usize, c) >= ncolors) {
-                continue;
-            }
-            let o = ((y * w) + x) * 4;
-            canvas.data[o] = ct[3 * @as(usize, c)];
-            canvas.data[o + 1] = ct[(3 * @as(usize, c)) + 1];
-            canvas.data[o + 2] = ct[(3 * @as(usize, c)) + 2];
-            canvas.data[o + 3] = 255;
-        }
+        paint(&mut canvas, idx[..@min(got, n)], [fx, fy, fw, fh], (fflags & 0x40) != 0, ct, gc.transparent);
         mem.free(idx);
         let copy = canvas.clone() catch |e| {
             anim.deinit();
             return e;
         };
-        anim.frames.push(Frame.{ image: copy, delay_ms: delay }) catch |e| {
+        anim.frames.push(Frame.{ image: copy, delay_ms: gc.delay }) catch |e| {
             let mut c2 = copy;
             c2.deinit();
             anim.deinit();
             return e;
         };
-        prev_disposal = disposal;
+        prev_disposal = gc.disposal;
         prev = [fx, fy, fw, fh];
-        disposal = 0;
-        delay = 0;
-        transparent = -1;
+        gc = no_control();
         if first_only {
             break;
         }
@@ -993,24 +1010,13 @@ test "encode_to" {
     let mut b = a.clone()!;
     defer b.deinit();
     b.data[5] = 9;
-    let enc = encode(&a)!;
-    defer mem.free(enc);
-    let mut s = strs.String.init();
-    defer s.deinit();
-    encode_to(s.writer(), &a)!;
-    @expect_eq(s.bytes(), enc[..]);
+    imagetest.check_encode_to(&a, encode, encode_to)!;
     let frames: [2]*image.Image = [&a, &b];
     let delays: [2]u32 = [100, 250];
     let movie = encode_animation(frames[..], delays[..], 2)!;
     defer mem.free(movie);
-    s.clear();
+    let mut s = strs.String.init();
+    defer s.deinit();
     encode_animation_to(s.writer(), frames[..], delays[..], 2)!;
     @expect_eq(s.bytes(), movie[..]);
-    let mut small: [100]u8 = [0; 100];
-    let mut bw = io.BufferWriter.init(small[..]);
-    encode_to(bw.writer(), &a) catch |e| {
-        @expect_eq(e, error.NoSpaceLeft);
-        return;
-    };
-    @trap();
 }
