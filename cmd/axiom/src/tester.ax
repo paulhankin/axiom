@@ -3,22 +3,13 @@
 // forking test runner of std/internal/runtime) and reports its results,
 // humanly or as agent-json (spec §17).
 // =============================================================================
+import "ast.ax" as ast;
 import "codegen.ax" as cg;
 import "diag.ax" as dg;
 import "sema.ax" as sema;
 import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
-
-struct Captured {
-    status: i32,
-    out: []u8,
-}
-
-fn run_capture(args: [][]u8) Captured {
-    let r = u.run_process(args, u.no_strs(), u.OUT_CAPTURE);
-    return Captured.{ status: r.status, out: r.out };
-}
 
 fn unescape(s: []u8) []u8 {
     let mut b = u.Buf.init();
@@ -45,8 +36,6 @@ fn unescape(s: []u8) []u8 {
     return b.done();
 }
 
-// Site records name files by a stable key (codegen: file_key); -1 if none.
-// Splits `s` at `sep`, into at most `max` fields (the last keeps the rest).
 // Stack frames from the test runner (see std/internal/runtime/test_main.c: encode_stack).
 struct TFrame {
     kind: u8,  // T trap site, C call, U innermost function (no location), E error return, R repeat, O omitted
@@ -145,8 +134,101 @@ fn print_frames_json(fr: *u.List.[TFrame]) void {
     u.print("]");
 }
 
-// Native programs for another architecture run under qemu's user mode
-// emulation (with the target's libraries from /usr/<triple>).
+// A test's result: a line from the test runner, "AXT\t<index>\t<pass|fail>\t
+// <code>\t<file key>\t<start>\t<end>\t<ms>\t<message>\t<output>[\t<frames>]".
+struct TResult {
+    d: *mut ast.Decl,  // the test
+    pass: bool,
+    code: []u8,
+    sp: u.Span,  // where it failed
+    ms: []u8,
+    msg: []u8,
+    output: []u8,
+    frames: u.List.[TFrame],
+}
+
+// Reads a result line into *r; false if it is not one.
+fn parse_result(line: []u8, r: *mut TResult) bool {
+    let tests = sema.g_prog.tests;
+    let f = u.split(line, '\t', 12);
+    if f.len < 10 {
+        return false;
+    }
+    let idx = u.atol(f.get(1));
+    if (idx < 0) or (idx >= @int_cast(i64, tests.len)) {
+        return false;
+    }
+    r.d = tests.get(@int_cast(usize, idx));
+    r.pass = u.str_eq(f.get(2), "pass");
+    r.code = f.get(3);
+    let file_id = cg.file_from_key(f.get(4));
+    r.sp = r.d.name_span;
+    if (file_id >= 0) and (@int_cast(usize, file_id) < u.g_files.len) {
+        r.sp = u.mkspan(file_id, u.to_u32(f.get(5)), u.to_u32(f.get(6)));
+    }
+    r.ms = f.get(7);
+    r.msg = unescape(f.get(8));
+    r.output = unescape(f.get(9));
+    if f.len > 10 {
+        parse_frames(unescape(f.get(10)), &mut r.frames);
+    }
+    return true;
+}
+
+fn print_result_json(r: *TResult) void {
+    let sp = r.sp;
+    let lc = u.span_linecol(sp);
+    u.print("\n  {\"name\":");
+    dg.json_str_out(r.d.test_name);
+    u.print(",\"file\":");
+    dg.json_str_out(u.file_of(r.d.name_span.file).display);
+    u.print(u.f2(",\"status\":\"%s\",\"duration_ms\":%s", u.pick(r.pass, "pass", "fail"), r.ms));
+    if not r.pass {
+        u.print(",\"failure\":{\"code\":");
+        dg.json_str_out(r.code);
+        u.print(",\"message\":");
+        dg.json_str_out(r.msg);
+        u.print(",\"file\":");
+        dg.json_str_out(u.file_of(sp.file).display);
+        u.print(u.f6(",\"span\":{\"start_line\":%s,\"start_col\":%s,\"end_line\":%s,\"end_col\":%s,\"start_byte\":%s,\"end_byte\":%s},\"context\":",
+                     u.idec(lc.sl), u.idec(lc.sc), u.idec(lc.el), u.idec(lc.ec), u.udec(@as(u64, sp.start)),
+                     u.udec(@as(u64, sp.end))));
+        dg.json_str_out(u.source_line(sp));
+        if r.frames.len > 0 {
+            u.print(u.pick(r.frames.get(0).kind == 'E', ",\"error_trace\":", ",\"stack\":"));
+            print_frames_json(&r.frames);
+        }
+        u.print("}");
+    }
+    u.print(",\"output\":");
+    dg.json_str_out(r.output);
+    u.print("}");
+}
+
+fn print_result_human(r: *TResult, show_output: bool) void {
+    u.print(u.f3("%s %s (%s ms)\n", u.pick(r.pass, "ok  ", "FAIL"), r.d.test_name, r.ms));
+    if not r.pass {
+        let lc = u.span_linecol(r.sp);
+        u.print(u.f5("     %s:%s:%s: %s %s\n", u.file_of(r.sp.file).display, u.idec(lc.sl), u.idec(lc.sc), r.code,
+                     r.msg));
+        u.print(u.f1("         %s\n", u.source_line(r.sp)));
+        print_frames_human(&r.frames, (r.frames.len > 0) and (r.frames.get(0).kind == 'E'));
+    }
+    if (r.output.len > 0) and (show_output or not r.pass) {
+        u.print("     output:\n");
+        let ol = u.split(r.output, '\n', 0xFFFF_FFFF);
+        for k in 0..ol.len {
+            if ((k + 1) == ol.len) and (ol.get(k).len == 0) {
+                break;
+            }
+            u.print(u.f1("       | %s\n", ol.get(k)));
+        }
+    }
+}
+
+// Runs the test binary (wasm under node; native programs for another
+// architecture or OS under an emulator, see tg.push_emulator) and reports its
+// results.
 pub fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bool, show_output: bool) i32 {
     let mut av = u.List.[[]u8].empty();
     tg.push_emulator(&mut av);
@@ -167,7 +249,7 @@ pub fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bo
     if not u.isnos(timeout) {
         av.push(timeout);
     }
-    let cap = run_capture(av.items());
+    let cap = u.run_capture(av.items());
     if cap.status != 0 {
         u.eprint(cap.out);
         dg.emit_fatal(json, "E9006", "the test runner failed");
@@ -178,8 +260,6 @@ pub fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bo
     if json {
         u.print("{\"schema\":\"axiom-tests/1\",\"tests\":[");
     }
-    let mut nres: i32 = 0;
-    let tests = sema.g_prog.tests;
     let lines = u.split(cap.out, '\n', 0xFFFF_FFFF);
     for li in 0..lines.len {
         let line = lines.get(li);
@@ -190,87 +270,25 @@ pub fn run_tests(bin: []u8, std_dir: []u8, filter: []u8, timeout: []u8, json: bo
             u.eprint(u.cat2(line, "\n"));
             continue;
         }
-        let f = u.split(line, '\t', 12);
-        if f.len < 10 {
+        let mut r = TResult.{ d: u.nil.[ast.Decl](), pass: false, code: "", sp: u.mkspan(0, 0, 0), ms: "", msg: "",
+                              output: "", frames: u.List.[TFrame].empty() };
+        if not parse_result(line, &mut r) {
             continue;
         }
-        let idx = u.atol(f.get(1));
-        if (idx < 0) or (idx >= @int_cast(i64, tests.len)) {
-            continue;
+        if json {
+            u.print(u.pick((passed + failed) != 0, ",", ""));
+            print_result_json(&r);
+        } else {
+            print_result_human(&r, show_output);
         }
-        let d = tests.get(@int_cast(usize, idx));
-        let pass = u.str_eq(f.get(2), "pass");
-        let code = f.get(3);
-        let file_id = cg.file_from_key(f.get(4));
-        let mut sp = d.name_span;
-        if (file_id >= 0) and (@int_cast(usize, file_id) < u.g_files.len) {
-            sp = u.mkspan(file_id, u.to_u32(f.get(5)), u.to_u32(f.get(6)));
-        }
-        let ms = f.get(7);
-        let msg = unescape(f.get(8));
-        let output = unescape(f.get(9));
-        let mut frames = u.List.[TFrame].empty();
-        if f.len > 10 {
-            parse_frames(unescape(f.get(10)), &mut frames);
-        }
-        let etrace = (frames.len > 0) and (frames.get(0).kind == 'E');
-        let tfile = u.file_of(d.name_span.file).display;
-        let lc = u.span_linecol(sp);
-        if pass {
+        if r.pass {
             passed += 1;
         } else {
             failed += 1;
         }
-        if json {
-            u.print(u.pick(nres != 0, ",", ""));
-            nres += 1;
-            u.print("\n  {\"name\":");
-            dg.json_str_out(d.test_name);
-            u.print(",\"file\":");
-            dg.json_str_out(tfile);
-            u.print(u.f2(",\"status\":\"%s\",\"duration_ms\":%s", u.pick(pass, "pass", "fail"), ms));
-            if not pass {
-                u.print(",\"failure\":{\"code\":");
-                dg.json_str_out(code);
-                u.print(",\"message\":");
-                dg.json_str_out(msg);
-                u.print(",\"file\":");
-                dg.json_str_out(u.file_of(sp.file).display);
-                u.print(u.f6(",\"span\":{\"start_line\":%s,\"start_col\":%s,\"end_line\":%s,\"end_col\":%s,\"start_byte\":%s,\"end_byte\":%s},\"context\":",
-                             u.idec(lc.sl), u.idec(lc.sc), u.idec(lc.el), u.idec(lc.ec), u.udec(@as(u64, sp.start)),
-                             u.udec(@as(u64, sp.end))));
-                dg.json_str_out(u.source_line(sp));
-                if frames.len > 0 {
-                    u.print(u.pick(etrace, ",\"error_trace\":", ",\"stack\":"));
-                    print_frames_json(&frames);
-                }
-                u.print("}");
-            }
-            u.print(",\"output\":");
-            dg.json_str_out(output);
-            u.print("}");
-        } else {
-            u.print(u.f3("%s %s (%s ms)\n", u.pick(pass, "ok  ", "FAIL"), d.test_name, ms));
-            if not pass {
-                u.print(u.f5("     %s:%s:%s: %s %s\n", u.file_of(sp.file).display, u.idec(lc.sl), u.idec(lc.sc), code,
-                             msg));
-                u.print(u.f1("         %s\n", u.source_line(sp)));
-                print_frames_human(&frames, etrace);
-            }
-            if (output.len > 0) and (show_output or not pass) {
-                u.print("     output:\n");
-                let ol = u.split(output, '\n', 0xFFFF_FFFF);
-                for k in 0..ol.len {
-                    if ((k + 1) == ol.len) and (ol.get(k).len == 0) {
-                        break;
-                    }
-                    u.print(u.f1("       | %s\n", ol.get(k)));
-                }
-            }
-        }
     }
     if json {
-        u.print(u.f4("%s],\"passed\":%s,\"failed\":%s,\"status\":\"%s\"}\n", u.pick(nres != 0, "\n", ""),
+        u.print(u.f4("%s],\"passed\":%s,\"failed\":%s,\"status\":\"%s\"}\n", u.pick((passed + failed) != 0, "\n", ""),
                      u.idec(passed), u.idec(failed), u.pick(failed != 0, "fail", "pass")));
     } else {
         u.print(u.f2("\n%s passed, %s failed\n", u.idec(passed), u.idec(failed)));

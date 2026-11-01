@@ -101,11 +101,6 @@ fn find_std(argv0: []u8) []u8 {
     return "std";
 }
 
-// Runs a command; its exit status (127 if it could not run).
-fn run(args: [][]u8) i32 {
-    return u.run_process(args, u.no_strs(), u.OUT_INHERIT).status;
-}
-
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -197,115 +192,119 @@ fn human_size(n: i64) []u8 {
     return u.f2("%s %s", u.ffmt("%.1f", v), units_[i]);
 }
 
-fn driver(args: [][]u8) i32 {
-    u.phase("start");
-    let argc = args.len;
-    if (argc >= 2) and u.str_eq(args[1], "cache") {
-        // axiom cache [path|size|clean]: the object cache of separate compilation
-        let dir = u.cat2(pkg.cache_dir(), "/obj");
-        if (argc >= 3) and u.str_eq(args[2], "clean") {
-            let rm = ["rm", "-rf", dir];
-            let rc = run(rm[..]);
-            if rc == 0 {
-                u.print(u.f1("removed %s\n", dir));
-                return 0;
-            }
-            return 1;
-        }
-        if (argc >= 3) and u.str_eq(args[2], "size") {
-            let mut es = u.List.[units.CacheEntry].empty();
-            let total = units.cache_entries(dir, &mut es);
-            let limit = units.cache_limit();
-            let mut lim: []u8 = "no limit";
-            if limit > 0 {
-                lim = u.cat2("limit ", human_size(limit));
-            }
-            u.print(u.f4("%s: %s objects, %s (%s)\n", dir, u.zdec(es.len), human_size(total), lim));
-            return 0;
-        }
-        if (argc >= 3) and not u.str_eq(args[2], "path") {
-            usage();
-            return 2;
-        }
-        u.print(u.cat2(dir, "\n"));
-        return 0;
-    }
-    if (argc >= 2) and u.str_eq(args[1], "version") {
-        u.print(u.f1("axiom %s\n", ver.VERSION));
-        return 0;
-    }
-    if (argc >= 2) and u.str_eq(args[1], "update") {
-        return update.run_update(args[2..]);
-    }
-    if (argc >= 2) and u.str_eq(args[1], "lsp") {
-        let mut exe = u.self_path();
-        if u.isnos(exe) {
-            exe = args[0];
-        }
-        return lsp.run(args[2..], exe);
-    }
-    if (argc >= 2) and u.str_eq(args[1], "fmt") {
-        return fmt.run_fmt(args[2..], find_std(args[0]));
-    }
-    if (argc >= 2) and u.str_eq(args[1], "new") {
-        let js = (argc >= 4) and u.str_eq(args[3], "--format=agent-json");
-        if argc < 3 {
-            usage();
-            return 2;
-        }
-        if pkg.new_package(args[2], js) {
+// axiom cache [path|size|clean]: the object cache of separate compilation.
+fn run_cache(args: [][]u8) i32 {
+    let dir = u.cat2(pkg.cache_dir(), "/obj");
+    if (args.len >= 1) and u.str_eq(args[0], "clean") {
+        let rm = ["rm", "-rf", dir];
+        if u.run_status(rm[..], u.OUT_INHERIT) == 0 {
+            u.print(u.f1("removed %s\n", dir));
             return 0;
         }
         return 1;
     }
-    if argc < 2 {
+    if (args.len >= 1) and u.str_eq(args[0], "size") {
+        let mut es = u.List.[units.CacheEntry].empty();
+        let total = units.cache_entries(dir, &mut es);
+        let limit = units.cache_limit();
+        let mut lim: []u8 = "no limit";
+        if limit > 0 {
+            lim = u.cat2("limit ", human_size(limit));
+        }
+        u.print(u.f4("%s: %s objects, %s (%s)\n", dir, u.zdec(es.len), human_size(total), lim));
+        return 0;
+    }
+    if (args.len >= 1) and not u.str_eq(args[0], "path") {
         usage();
         return 2;
     }
-    let cmd = args[1];
+    u.print(u.cat2(dir, "\n"));
+    return 0;
+}
+
+// axiom new <name> [--format=agent-json]
+fn run_new(args: [][]u8) i32 {
+    if args.len < 1 {
+        usage();
+        return 2;
+    }
+    let js = (args.len >= 2) and u.str_eq(args[1], "--format=agent-json");
+    if pkg.new_package(args[0], js) {
+        return 0;
+    }
+    return 1;
+}
+
+// The command line of build, check, test, profile and ide.
+struct Options {
+    cmd: []u8,
+    testing: bool,
+    profiling: bool,
+    build: bool,  // build, test or profile
+    ide_mode: bool,
+    input: []u8,
+    out: []u8,
+    run_dir: []u8,  // axiom test and profile: a private directory for the program
+    std_dir: []u8,
+    target: []u8,
+    emit: []u8,
+    json: bool,
+    co: *mut cg.CgOptions,
+    link_inputs: u.List.[[]u8],
+    ax_links: u.List.[[]u8],  // --link=<file.ax>
+    feature_args: u.List.[[]u8],
+    link_flags: u.List.[[]u8],  // -l / -L
+    inc_flags: u.List.[[]u8],   // -I, for C sources
+    header_path: []u8,
+    test_filter: []u8,
+    test_timeout: []u8,
+    show_output: bool,
+    prof_hz: i32,
+    units_mode: i32,  // -1: by optimization level
+    verbose: bool,
+    folded_path: []u8,
+    prog_args: u.List.[[]u8],  // profile: after `--`
+}
+
+fn new_options(cmd: []u8) Options {
     let testing = u.str_eq(cmd, "test");
     let profiling = u.str_eq(cmd, "profile");
-    let build = u.str_eq(cmd, "build") or testing or profiling;
-    let ide_mode = u.str_eq(cmd, "ide");
-    cg.g_test_mode = testing;
-    if not build and not u.str_eq(cmd, "check") and not ide_mode {
-        usage();
-        return 2;
-    }
-    let mut input = u.nosym();
-    let mut out = u.nosym();
-    let mut run_dir = u.nosym();  // axiom test and profile: a private directory for the program
-    let mut std_dir = u.nosym();
-    let mut target: []u8 = "wasm32";
-    let mut emit: []u8 = "exe";
-    let mut json = false;
     let co = u.new.[cg.CgOptions]();
     co.stack_traces = true;
     co.cpu = u.nosym();
-    let mut link_inputs = u.List.[[]u8].empty();
-    let mut ax_links = u.List.[[]u8].empty();  // --link=<file.ax>
-    let mut feature_args = u.List.[[]u8].empty();
-    let mut link_flags = u.List.[[]u8].empty();  // -l / -L
-    let mut inc_flags = u.List.[[]u8].empty();   // -I, for C sources
-    let mut header_path = u.nosym();
-    let mut test_filter = u.nosym();
-    let mut test_timeout = u.nosym();
-    let mut show_output = false;
-    let mut prof_hz: i32 = 999;
-    let mut units_mode: i32 = -1;  // -1: by optimization level
-    let mut verbose = false;
-    let mut folded_path = u.nosym();
-    let mut prog_args = u.List.[[]u8].empty();  // profile: after `--`
+    let build = u.str_eq(cmd, "build") or testing or profiling;
+    return Options.{ cmd: cmd, testing: testing, profiling: profiling, build: build, ide_mode: u.str_eq(cmd, "ide"),
+                     input: u.nosym(), out: u.nosym(), run_dir: u.nosym(), std_dir: u.nosym(), target: "wasm32",
+                     emit: "exe", json: false, co: co, link_inputs: u.List.[[]u8].empty(),
+                     ax_links: u.List.[[]u8].empty(), feature_args: u.List.[[]u8].empty(),
+                     link_flags: u.List.[[]u8].empty(), inc_flags: u.List.[[]u8].empty(), header_path: u.nosym(),
+                     test_filter: u.nosym(), test_timeout: u.nosym(), show_output: false, prof_hz: 999, units_mode: -1,
+                     verbose: false, folded_path: u.nosym(), prog_args: u.List.[[]u8].empty() };
+}
+
+// A step of the driver returns this to go on, or an exit status.
+const CONTINUE: i32 = -1;
+
+// Reports a fatal error; the exit status for it.
+fn fatal(json: bool, code: []u8, msg: []u8) i32 {
+    dg.emit_fatal(json, code, msg);
+    return 2;
+}
+
+// Reads the options after the command into *o; false on an error (reported).
+fn parse_options(o: *mut Options, args: [][]u8) bool {
+    let co = o.co;
+    let argc = args.len;
     let mut i: usize = 2;
     while i < argc {
         let a = args[i];
-        if ide_mode and ide.option(a) {
+        if o.ide_mode and ide.option(a) {
             // axiom ide's own options
         } else if u.str_eq(a, "-o") and ((i + 1) < argc) {
             i += 1;
-            out = args[i];
+            o.out = args[i];
         } else if u.starts(a, "--target=") {
-            target = a[9..];
+            o.target = a[9..];
         } else if u.str_eq(a, "-O0") or u.str_eq(a, "-O1") or u.str_eq(a, "-O2") or u.str_eq(a, "-O3") {
             co.opt_level = @as(i32, a[2] - '0');
         } else if u.str_eq(a, "--release") {
@@ -317,7 +316,7 @@ fn driver(args: [][]u8) i32 {
         } else if u.str_eq(a, "--overflow=saturate") {
             co.overflow = cg.OVF_SATURATE;
         } else if u.starts(a, "--emit=") {
-            emit = a[7..];
+            o.emit = a[7..];
         } else if u.str_eq(a, "--stack-traces=on") {
             co.stack_traces = true;
         } else if u.str_eq(a, "--stack-traces=off") {
@@ -330,17 +329,17 @@ fn driver(args: [][]u8) i32 {
         } else if u.str_eq(a, "--sanitize=none") {
             co.sanitize_address = false;
         } else if u.str_eq(a, "--units=module") {
-            units_mode = 1;
+            o.units_mode = 1;
         } else if u.str_eq(a, "--units=program") {
-            units_mode = 0;
+            o.units_mode = 0;
         } else if u.str_eq(a, "--verbose") {
-            verbose = true;
+            o.verbose = true;
         } else if u.str_eq(a, "--format=agent-json") {
-            json = true;
+            o.json = true;
         } else if u.str_eq(a, "--format=human") {
-            json = false;
+            o.json = false;
         } else if u.starts(a, "--std=") {
-            std_dir = a[6..];
+            o.std_dir = a[6..];
         } else if u.str_eq(a, "--subsystem=console") {
             pl.g_subsystem = pl.SUBSYSTEM_WINDOWS_CUI;
         } else if u.str_eq(a, "--subsystem=windows") {
@@ -354,78 +353,83 @@ fn driver(args: [][]u8) i32 {
         } else if u.starts(a, "--cpu=") {
             co.cpu = a[6..];
         } else if u.starts(a, "--features=") {
-            feature_args.push(a[11..]);
+            o.feature_args.push(a[11..]);
         } else if u.starts(a, "--link=") and u.ends(a, ".ax") {
-            ax_links.push(a[7..]);  // Axiom source: part of the program
+            o.ax_links.push(a[7..]);  // Axiom source: part of the program
         } else if u.starts(a, "--link=") {
-            link_inputs.push(a[7..]);
+            o.link_inputs.push(a[7..]);
         } else if u.starts(a, "--emit-header=") {
-            header_path = a[14..];
-        } else if testing and u.starts(a, "--filter=") {
-            test_filter = a;
-        } else if testing and u.starts(a, "--timeout=") {
-            test_timeout = a;
-        } else if testing and u.str_eq(a, "--show-output") {
-            show_output = true;
-        } else if profiling and u.starts(a, "--rate=") and (u.atol(a[7..]) > 0) {
-            prof_hz = @truncate(i32, u.atol(a[7..]));
-        } else if profiling and u.starts(a, "--folded=") {
-            folded_path = a[9..];
+            o.header_path = a[14..];
+        } else if o.testing and u.starts(a, "--filter=") {
+            o.test_filter = a;
+        } else if o.testing and u.starts(a, "--timeout=") {
+            o.test_timeout = a;
+        } else if o.testing and u.str_eq(a, "--show-output") {
+            o.show_output = true;
+        } else if o.profiling and u.starts(a, "--rate=") and (u.atol(a[7..]) > 0) {
+            o.prof_hz = @truncate(i32, u.atol(a[7..]));
+        } else if o.profiling and u.starts(a, "--folded=") {
+            o.folded_path = a[9..];
         } else if (a.len > 2) and (a[0] == '-') and ((a[1] == 'l') or (a[1] == 'L')) {
-            link_flags.push(a);
+            o.link_flags.push(a);
         } else if (a.len > 2) and (a[0] == '-') and (a[1] == 'I') {
-            inc_flags.push(a);
-        } else if profiling and u.str_eq(a, "--") {
+            o.inc_flags.push(a);
+        } else if o.profiling and u.str_eq(a, "--") {
             // the rest are the program's arguments
-            i += 1;
-            while i < argc {
-                prog_args.push(args[i]);
-                i += 1;
+            for k in i + 1..argc {
+                o.prog_args.push(args[k]);
             }
             break;
         } else if (a.len > 0) and (a[0] == '-') {
-            dg.emit_fatal(json, "E9001", u.f1("unknown option '%s'", a));
-            return 2;
-        } else if u.isnos(input) {
-            input = a;
+            dg.emit_fatal(o.json, "E9001", u.f1("unknown option '%s'", a));
+            return false;
+        } else if u.isnos(o.input) {
+            o.input = a;
         } else {
-            dg.emit_fatal(json, "E9001", u.f1("unexpected argument '%s'", a));
-            return 2;
+            dg.emit_fatal(o.json, "E9001", u.f1("unexpected argument '%s'", a));
+            return false;
         }
         i += 1;
     }
-    // A package directory (or none: the current directory) builds the
-    // package's entry module; `test` also loads all of its sources.
-    let mut pkg_files = u.List.[[]u8].empty();
-    if u.isnos(input) or u.is_dir(input) {
-        let mut dir: []u8 = ".";
-        if not u.isnos(input) {
-            dir = input;
-        }
-        if not u.file_exists(u.cat2(dir, "/axiom.toml")) {
-            if not u.isnos(input) {
-                dg.emit_fatal(json, "E9001", u.f1("'%s' is a directory without an axiom.toml", input));
-            } else {
-                dg.emit_fatal(json, "E9001", "no input file (and no axiom.toml in the current directory)");
-            }
-            return 2;
-        }
-        let pk = pkg.load_dir(dir, u.nil.[u.Span]());
-        if (dg.error_count() != 0) or u.isnil(pk) {
-            dg.emit(json, json);
-            return 1;
-        }
-        input = pk.entry;
-        if testing {
-            pkg.source_files(pk, &mut pkg_files);
-        }
-        if u.isnos(out) and not testing and not profiling {
-            out = u.cat2(pk.name,
-                         u.pick(
-                             u.starts(target, "wasm"), ".wasm",
-                             u.pick(u.ends(target, "windows") or u.ends(target, "-msvc"), ".exe", "")));
-        }
+    return true;
+}
+
+// A package directory (or none: the current directory) builds the package's
+// entry module; `test` also loads all of its sources, into *files.
+fn package_input(o: *mut Options, files: *mut u.List.[[]u8]) i32 {
+    if not u.isnos(o.input) and not u.is_dir(o.input) {
+        return CONTINUE;
     }
+    let mut dir: []u8 = ".";
+    if not u.isnos(o.input) {
+        dir = o.input;
+    }
+    if not u.file_exists(u.cat2(dir, "/axiom.toml")) {
+        if not u.isnos(o.input) {
+            return fatal(o.json, "E9001", u.f1("'%s' is a directory without an axiom.toml", o.input));
+        }
+        return fatal(o.json, "E9001", "no input file (and no axiom.toml in the current directory)");
+    }
+    let pk = pkg.load_dir(dir, u.nil.[u.Span]());
+    if (dg.error_count() != 0) or u.isnil(pk) {
+        dg.emit(o.json, o.json);
+        return 1;
+    }
+    o.input = pk.entry;
+    if o.testing {
+        pkg.source_files(pk, files);
+    }
+    if u.isnos(o.out) and not o.testing and not o.profiling {
+        let wasm = u.starts(o.target, "wasm");
+        let windows = u.ends(o.target, "windows") or u.ends(o.target, "-msvc");
+        o.out = u.cat2(pk.name, u.pick(wasm, ".wasm", u.pick(windows, ".exe", "")));
+    }
+    return CONTINUE;
+}
+
+// Sets the target (ty.g_target, tg.g_arch, tg.g_os) from --target; false on an
+// error (reported).
+fn set_target(target: []u8, json: bool) bool {
     if u.str_eq(target, "wasm32") or u.str_eq(target, "wasm32-freestanding") {
         ty.g_target = ast.Target.{ ptr_bits: 32, is_wasm: true, triple: "wasm32-unknown-unknown" };
     } else if u.str_eq(target, "wasm64") or u.str_eq(target, "wasm64-freestanding") {
@@ -456,7 +460,7 @@ fn driver(args: [][]u8) i32 {
         dg.emit_fatal(json, "E9002",
                       u.f1("unknown target '%s' (expected wasm32, wasm64, x86_64, aarch64, aarch64-macos, x86_64-windows or native)",
                            target));
-        return 2;
+        return false;
     }
     if ty.g_target.is_wasm {
         tg.g_arch = tg.ARCH_WASM32;
@@ -464,185 +468,238 @@ fn driver(args: [][]u8) i32 {
             tg.g_arch = tg.ARCH_WASM64;
         }
     }
-    // Processor extensions: a --cpu preset (default: the host for
-    // --target=native, a baseline otherwise), then --features edits.
-    let mut cpu = co.cpu;
+    return true;
+}
+
+// Processor extensions: a --cpu preset (default: the host for
+// --target=native, a baseline otherwise), then --features edits. False on an
+// error (reported).
+fn set_cpu(o: *Options) bool {
+    let mut cpu = o.co.cpu;
     if u.isnos(cpu) {
-        cpu = u.pick(u.str_eq(target, "native"), "native", "generic");
+        cpu = u.pick(u.str_eq(o.target, "native"), "native", "generic");
         if tg.is_darwin() {
             cpu = "apple-m1";  // every Mac with Apple silicon has at least its extensions
         }
     }
     let cr = tg.cpu_features(tg.g_arch, cpu);
     if not cr.ok {
-        dg.emit_fatal(json, "E9002", u.f2("unknown --cpu '%s' for target %s", cpu, target));
-        return 2;
+        dg.emit_fatal(o.json, "E9002", u.f2("unknown --cpu '%s' for target %s", cpu, o.target));
+        return false;
     }
     tg.g_cpu = cpu;
     tg.g_features = cr.features;
-    for k in 0..feature_args.len {
-        let bad = tg.apply_features(feature_args.get(k));
+    for k in 0..o.feature_args.len {
+        let bad = tg.apply_features(o.feature_args.get(k));
         if not u.isnos(bad) {
-            dg.emit_fatal(json, "E9002", u.f2("unknown processor extension '%s' (known: %s)", bad, tg.feature_names()));
-            return 2;
+            dg.emit_fatal(o.json, "E9002", u.f2("unknown processor extension '%s' (known: %s)", bad,
+                                                tg.feature_names()));
+            return false;
         }
     }
-    if not u.file_exists(input) {
-        dg.emit_fatal(json, "E0211", u.f1("cannot read '%s'", input));
+    return true;
+}
+
+// The sources a build adds to the program (into *files): --link=<file.ax>
+// and parts of std/internal/runtime. False on an error (reported).
+fn runtime_sources(o: *Options, files: *mut u.List.[[]u8]) bool {
+    for k in 0..o.ax_links.len {
+        files.push(o.ax_links.get(k));
+    }
+    // std/internal/runtime/rt.ax: software versions of operations some
+    // targets lack (@rem, and @fma without hardware fused multiply-add).
+    let rtp = u.f1("%s/internal/runtime/rt.ax", o.std_dir);
+    if u.file_exists(rtp) {
+        files.push(rtp);
+    }
+    // std/os/cpu.ax: @cpu_has, @features and @multiversion ask it about
+    // the processor, and native programs built for more than the
+    // baseline check the processor with it before main.
+    let cpup = u.f1("%s/os/cpu.ax", o.std_dir);
+    if u.file_exists(cpup) {
+        files.push(cpup);
+    }
+    // --sanitize=address checks accesses with std/mem.ax's shadow memory
+    if o.co.sanitize_address {
+        files.push(u.f1("%s/mem.ax", o.std_dir));
+    }
+    // Native programs: the host ABI, crash reports, the test runner and
+    // the profiler are Axiom code too.
+    if tg.is_darwin() and (o.testing or o.profiling) and (tg.host_os() != tg.OS_DARWIN) {
+        dg.emit_fatal(o.json, "E9001", u.f2("axiom %s for --target=%s runs only on a Mac", o.cmd, tg.os_target_name()));
+        return false;
+    }
+    if ty.g_target.is_wasm {
+        return true;
+    }
+    let mut names: [3][]u8 = ["native.ax", "", ""];
+    if tg.is_darwin() {
+        names[0] = "darwin.ax";  // the host ABI over macOS's libSystem
+    } else if tg.is_windows() {
+        names[0] = "windows.ax";  // the host ABI over the Win32 API
+    }
+    if o.testing {
+        names[1] = "test_main.ax";
+        if tg.is_windows() {
+            names[1] = "test_main_windows.ax";  // no fork: a process per test
+        } else if tg.is_darwin() {
+            names[1] = "test_main_darwin.ax";  // fork, over libSystem
+        }
+    }
+    if o.profiling {
+        names[2] = "profile.ax";
+        if tg.is_windows() {
+            names[2] = "profile_windows.ax";  // a sampler thread: no SIGPROF
+        } else if tg.is_darwin() {
+            names[2] = "profile_darwin.ax";  // setitimer: no POSIX CPU-time timers
+        }
+    }
+    for nm in names {
+        if nm.len == 0 {
+            continue;
+        }
+        let p = u.f2("%s/internal/runtime/%s", o.std_dir, nm);
+        if not u.file_exists(p) {
+            dg.emit_fatal(o.json, "E9003", u.f1("cannot find the native runtime (%s)", p));
+            return false;
+        }
+        files.push(p);
+    }
+    return true;
+}
+
+// --emit-header: writes the C header; C sources may include it. False on an
+// error (reported).
+fn write_header(o: *mut Options) bool {
+    if not header.emit_c_header(o.header_path, u.basename(o.input)) {
+        dg.emit_fatal(o.json, "E9005", u.f1("cannot write %s", o.header_path));
+        return false;
+    }
+    let sl = u.rfind(o.header_path, '/');
+    if sl >= 0 {
+        o.inc_flags.push(u.f1("-I%s", o.header_path[0..@int_cast(usize, sl)]));
+    } else {
+        o.inc_flags.push("-I.");
+    }
+    return true;
+}
+
+// The commands that compile: build, check, test, profile and ide.
+fn compile(args: [][]u8) i32 {
+    let mut o = new_options(args[1]);
+    cg.g_test_mode = o.testing;
+    if not o.build and not u.str_eq(o.cmd, "check") and not o.ide_mode {
+        usage();
         return 2;
     }
+    if not parse_options(&mut o, args) {
+        return 2;
+    }
+    let mut pkg_files = u.List.[[]u8].empty();
+    let rc = package_input(&mut o, &mut pkg_files);
+    if rc != CONTINUE {
+        return rc;
+    }
+    if not set_target(o.target, o.json) or not set_cpu(&o) {
+        return 2;
+    }
+    if not u.file_exists(o.input) {
+        return fatal(o.json, "E0211", u.f1("cannot read '%s'", o.input));
+    }
     ty.types_init();
-    if u.isnos(std_dir) {
-        std_dir = find_std(args[0]);
+    if u.isnos(o.std_dir) {
+        o.std_dir = find_std(args[0]);
     }
-    if ide_mode {
-        return ide.run(input, std_dir);
+    if o.ide_mode {
+        return ide.run(o.input, o.std_dir);
     }
-    // Builds include std/internal/runtime/rt.ax: software versions of operations some
-    // targets lack (@rem, and @fma without hardware fused multiply-add).
-    if build {
-        for k in 0..ax_links.len {
-            pkg_files.push(ax_links.get(k));
-        }
-        let rtp = u.f1("%s/internal/runtime/rt.ax", std_dir);
-        if u.file_exists(rtp) {
-            pkg_files.push(rtp);
-        }
-        // std/os/cpu.ax: @cpu_has, @features and @multiversion ask it about
-        // the processor, and native programs built for more than the
-        // baseline check the processor with it before main.
-        let cpup = u.f1("%s/os/cpu.ax", std_dir);
-        if u.file_exists(cpup) {
-            pkg_files.push(cpup);
-        }
-        // --sanitize=address checks accesses with std/mem.ax's shadow memory
-        if co.sanitize_address {
-            pkg_files.push(u.f1("%s/mem.ax", std_dir));
-        }
-        // Native programs: the host ABI, crash reports, the test runner and
-        // the profiler are Axiom code too.
-        if tg.is_darwin() and (testing or profiling) and (tg.host_os() != tg.OS_DARWIN) {
-            dg.emit_fatal(json, "E9001", u.f2("axiom %s for --target=%s runs only on a Mac", cmd, tg.os_target_name()));
-            return 2;
-        }
-        if not ty.g_target.is_wasm {
-            let mut names: [3][]u8 = ["native.ax", "", ""];
-            if tg.is_darwin() {
-                names[0] = "darwin.ax";  // the host ABI over macOS's libSystem
-            } else if tg.is_windows() {
-                names[0] = "windows.ax";  // the host ABI over the Win32 API
-            }
-            if testing {
-                names[1] = "test_main.ax";
-                if tg.is_windows() {
-                    names[1] = "test_main_windows.ax";  // no fork: a process per test
-                } else if tg.is_darwin() {
-                    names[1] = "test_main_darwin.ax";  // fork, over libSystem
-                }
-            }
-            if profiling {
-                names[2] = "profile.ax";
-                if tg.is_windows() {
-                    names[2] = "profile_windows.ax";  // a sampler thread: no SIGPROF
-                } else if tg.is_darwin() {
-                    names[2] = "profile_darwin.ax";  // setitimer: no POSIX CPU-time timers
-                }
-            }
-            for nm in names {
-                if nm.len == 0 {
-                    continue;
-                }
-                let p = u.f2("%s/internal/runtime/%s", std_dir, nm);
-                if not u.file_exists(p) {
-                    dg.emit_fatal(json, "E9003", u.f1("cannot find the native runtime (%s)", p));
-                    return 2;
-                }
-                pkg_files.push(p);
-            }
-        }
+    if o.build and not runtime_sources(&o, &mut pkg_files) {
+        return 2;
     }
-    let so = sema.SemaOptions.{ std_dir: std_dir, extra_files: pkg_files.items() };
-    let ok = sema.run(input, &so);
+    let so = sema.SemaOptions.{ std_dir: o.std_dir, extra_files: pkg_files.items() };
+    let ok = sema.run(o.input, &so);
     u.phase("parse and check");
-    if ok and not u.isnos(header_path) {
-        if not header.emit_c_header(header_path, u.basename(input)) {
-            dg.emit_fatal(json, "E9005", u.f1("cannot write %s", header_path));
-            return 2;
-        }
-        // C sources may include the generated header
-        let sl = u.rfind(header_path, '/');
-        if sl >= 0 {
-            inc_flags.push(u.f1("-I%s", header_path[0..@int_cast(usize, sl)]));
-        } else {
-            inc_flags.push("-I.");
-        }
+    if ok and not u.isnos(o.header_path) and not write_header(&mut o) {
+        return 2;
     }
-    if not ok or not build {
-        dg.emit(json, json);
+    if not ok or not o.build {
+        dg.emit(o.json, o.json);
         if ok {
             return 0;
         }
         return 1;
     }
+    return build_program(&mut o);
+}
 
-    // Decide output kind.
-    let final_link = u.str_eq(emit, "exe");
-    if u.str_eq(emit, "obj") {
+// Sets the output kind from --emit; false on an error (reported).
+fn set_emit(o: *Options, final_link: bool) bool {
+    let co = o.co;
+    if u.str_eq(o.emit, "obj") {
         co.emit = cg.EMIT_OBJ;
         be.g_stubs = not ty.g_target.is_wasm and (tg.g_os == tg.OS_LINUX);
-    } else if u.str_eq(emit, "ir") {
+    } else if u.str_eq(o.emit, "ir") {
         co.emit = cg.EMIT_IR;
-    } else if u.str_eq(emit, "asm") {
-        dg.emit_fatal(json, "E9001", "--emit=asm is not supported: use --emit=obj and a disassembler, or --emit=ir");
-        return 2;
+    } else if u.str_eq(o.emit, "asm") {
+        dg.emit_fatal(o.json, "E9001", "--emit=asm is not supported: use --emit=obj and a disassembler, or --emit=ir");
+        return false;
     } else if final_link {
         co.emit = cg.EMIT_OBJ;
     } else {
-        dg.emit_fatal(json, "E9001", u.f1("unknown --emit kind '%s'", emit));
+        dg.emit_fatal(o.json, "E9001", u.f1("unknown --emit kind '%s'", o.emit));
+        return false;
+    }
+    return true;
+}
+
+// axiom test and profile build the program into a private directory
+// (o.run_dir) and run it. False on an error (reported).
+fn private_output(o: *mut Options, final_link: bool, wext: []u8) bool {
+    if not final_link {
+        let what = u.pick(o.testing, "axiom test builds and runs a test binary",
+                          "axiom profile builds and runs the program");
+        dg.emit_fatal(o.json, "E9001", u.cat2(what, "; --emit is not supported"));
+        return false;
+    }
+    if o.profiling {
+        o.co.stack_traces = true;  // the profiler samples the shadow stack
+        o.co.profile = true;
+        if u.isnos(o.folded_path) {
+            if not u.isnos(o.out) {  // -o names the folded output too
+                o.folded_path = o.out;
+            } else {
+                o.folded_path = u.cat2(strip_ph(u.basename(o.input)), ".folded");
+            }
+        }
+    }
+    o.run_dir = u.private_tmp_dir(u.pick(o.testing, "axiom-test-", "axiom-profile-"));
+    if u.isnos(o.run_dir) {
+        dg.emit_fatal(o.json, "E9001", "cannot make a private directory for the program");
+        return false;
+    }
+    o.out = u.f3("%s/%s%s", o.run_dir, u.pick(o.testing, "tests", "program"), wext);
+    pl.g_pdb = false;  // (a temporary executable)
+    return true;
+}
+
+// Builds the checked program: code generation, linking, and for test and
+// profile running it.
+fn build_program(o: *mut Options) i32 {
+    let co = o.co;
+    let final_link = u.str_eq(o.emit, "exe");
+    if not set_emit(o, final_link) {
         return 2;
     }
     let wext = u.pick(ty.g_target.is_wasm, ".wasm", "");
-    if profiling {
-        if not final_link {
-            dg.emit_fatal(json, "E9001", "axiom profile builds and runs the program; --emit is not supported");
-            return 2;
-        }
-        co.stack_traces = true;  // the profiler samples the shadow stack
-        co.profile = true;
-        if u.isnos(folded_path) {
-            if not u.isnos(out) {  // -o names the folded output too
-                folded_path = out;
-            } else {
-                folded_path = u.cat2(strip_ph(u.basename(input)), ".folded");
-            }
-        }
-        run_dir = u.private_tmp_dir("axiom-profile-");
-        if u.isnos(run_dir) {
-            dg.emit_fatal(json, "E9001", "cannot make a private directory for the program");
-            return 2;
-        }
-        out = u.f2("%s/program%s", run_dir, wext);
-        pl.g_pdb = false;  // (a temporary executable)
-    }
-    if testing {
-        if not final_link {
-            dg.emit_fatal(json, "E9001", "axiom test builds and runs a test binary; --emit is not supported");
-            return 2;
-        }
-        run_dir = u.private_tmp_dir("axiom-test-");
-        if u.isnos(run_dir) {
-            dg.emit_fatal(json, "E9001", "cannot make a private directory for the program");
-            return 2;
-        }
-        out = u.f2("%s/tests%s", run_dir, wext);
-        pl.g_pdb = false;
+    if (o.testing or o.profiling) and not private_output(o, final_link, wext) {
+        return 2;
     }
     defer {
-        if not u.isnos(run_dir) {
-            _ = u.rmdir(run_dir);
+        if not u.isnos(o.run_dir) {
+            _ = u.rmdir(o.run_dir);
         }
     }
-    if u.isnos(out) {
+    if u.isnos(o.out) {
         let mut ext: []u8 = "";
         if co.emit == cg.EMIT_IR {
             ext = ".ir";
@@ -653,7 +710,7 @@ fn driver(args: [][]u8) i32 {
         } else {
             ext = wext;
         }
-        out = u.cat2(strip_ph(u.basename(input)), ext);
+        o.out = u.cat2(strip_ph(u.basename(o.input)), ext);
     }
     let host_fns = sema.g_prog.host_fns;
     for k in 0..host_fns.len {
@@ -663,29 +720,58 @@ fn driver(args: [][]u8) i32 {
     }
     // The wasm profiler reads the shadow stack from another thread, so the
     // program runs on a shared memory.
-    if profiling and ty.g_target.is_wasm {
+    if o.profiling and ty.g_target.is_wasm {
         cg.g_threads = true;
     }
     if cg.g_threads and ty.g_target.is_wasm and not tg.has(tg.W_ATOMICS) {
-        dg.emit_fatal(json, "E9002", "threads on WebAssembly need the atomics extension (--features=+atomics)");
-        return 2;
+        return fatal(o.json, "E9002", "threads on WebAssembly need the atomics extension (--features=+atomics)");
     }
-    let mut objpath = out;
+    let mut objpath = o.out;
     if final_link {
-        objpath = u.f2("%s.tmp%s.o", out, u.idec(u.getpid()));
+        objpath = u.f2("%s.tmp%s.o", o.out, u.idec(u.getpid()));
         co.out_path = objpath;
     } else {
-        co.out_path = out;
+        co.out_path = o.out;
     }
     cg.collect_link_names(co);
+    let n_user_inputs = o.link_inputs.len;
+    let mut unit_objs = u.List.[[]u8].empty();
+    let mut rc = generate(o, objpath, final_link, &mut unit_objs);
+    if rc != CONTINUE {
+        return rc;
+    }
+    if final_link {
+        rc = link(o, objpath, n_user_inputs, unit_objs.items());
+        if rc != CONTINUE {
+            return rc;
+        }
+    }
+    if o.testing {
+        let trc = tester.run_tests(o.out, o.std_dir, o.test_filter, o.test_timeout, o.json, o.show_output);
+        _ = u.unlink(u.cz(o.out));
+        return trc;
+    }
+    if o.profiling {
+        let prc = profiler.run_profile(o.out, o.prog_args.items(), o.std_dir, o.folded_path, o.prof_hz, o.json);
+        _ = u.unlink(u.cz(o.out));
+        return prc;
+    }
+    dg.emit(o.json, o.json);
+    return 0;
+}
+
+// Code generation, into objpath, or into a cached object per module (separate
+// compilation) or into parts; those objects are added to o.link_inputs and
+// *unit_objs.
+fn generate(o: *mut Options, objpath: []u8, final_link: bool, unit_objs: *mut u.List.[[]u8]) i32 {
+    let co = o.co;
     // Separate compilation (spec §16.7) applies to executables; --emit of a
     // single object/IR/assembly file is always one unit.
     let mut separate = final_link and (co.opt_level <= 1);
-    if units_mode >= 0 {
-        separate = final_link and (units_mode == 1);
+    if o.units_mode >= 0 {
+        separate = final_link and (o.units_mode == 1);
     }
-    let n_user_inputs = link_inputs.len;
-    let mut unit_objs = u.List.[[]u8].empty();
+    let n_user_inputs = o.link_inputs.len;
     if separate {
         let mut objs = u.List.[[]u8].empty();
         let mut us = units.UnitStats.{ total: 0, compiled: 0, evicted: 0, evicted_bytes: 0 };
@@ -694,15 +780,15 @@ fn driver(args: [][]u8) i32 {
         if built < 0 {
             separate = false;  // no processes to compile units in: one unit
         } else if built == 0 {
-            dg.emit(json, json);
+            dg.emit(o.json, o.json);
             if dg.error_count() == 0 {
-                dg.emit_fatal(json, "E9007", "code generation failed");
+                dg.emit_fatal(o.json, "E9007", "code generation failed");
             }
             _ = u.unlink(u.cz(objpath));
             return 1;
         }
         let t1 = now_ms();
-        if separate and verbose {
+        if separate and o.verbose {
             u.eprint(u.f4("axiom: %s modules, %s compiled, %s cached (%s ms)\n", u.zdec(us.total), u.zdec(us.compiled),
                           u.zdec(us.total - us.compiled), u.ffmt("%.0f", t1 - t0)));
             if us.evicted > 0 {
@@ -711,221 +797,265 @@ fn driver(args: [][]u8) i32 {
             }
         }
         for k in 0..objs.len {
-            link_inputs.push(objs.get(k));
+            o.link_inputs.push(objs.get(k));
             unit_objs.push(objs.get(k));
         }
     }
     // (C code and libraries are linked by the system's linker, which would
     // see the internal symbols of the parts' objects as global)
-    be.g_parts = final_link and not separate and (n_user_inputs == 0) and (link_flags.len == 0);
+    be.g_parts = final_link and not separate and (n_user_inputs == 0) and (o.link_flags.len == 0);
     if not separate and not cg.codegen_program(co) {
-        dg.emit(json, json);
+        dg.emit(o.json, o.json);
         if final_link {
             _ = u.unlink(u.cz(objpath));
         }
         return 1;
     }
     for k in 0..be.g_part_objs.len {
-        link_inputs.push(be.g_part_objs.get(k));
+        o.link_inputs.push(be.g_part_objs.get(k));
         unit_objs.push(be.g_part_objs.get(k));
     }
-    if final_link {
-        let mut rc: i32 = 0;
-        let own_link = (n_user_inputs == 0) and (link_flags.len == 0) and (cg.g_link_libs.len == 0);
-        let mut native_own = false;
-        if tg.g_os != tg.OS_LINUX {
-            // (extern "C" "name" blocks name DLLs on Windows, which plink.ax
-            // imports from, and dylibs or frameworks on macOS, which mlink.ax
-            // loads)
-            if (n_user_inputs != 0) or (link_flags.len != 0) {
-                dg.emit_fatal(json, "E9004", u.f1("linking C code or libraries for %s is not supported yet",
-                                                  tg.os_target_name()));
-                _ = u.unlink(u.cz(objpath));
-                return 1;
-            }
-            // our own Mach-O or PE linker, against libSystem or the Windows DLLs
-            rc = link_native(objpath, unit_objs.items(), out);
-            native_own = true;
-        } else if not ty.g_target.is_wasm and (n_user_inputs == 0) and (link_flags.len == 0) {
-            // our own linker; a C toolchain is only needed to link C code
-            rc = link_native(objpath, unit_objs.items(), out);
-            native_own = rc != el.LINK_FALLBACK;
-        }
-        if ty.g_target.is_wasm and own_link {
-            // our own linker; wasm-ld is only needed to link C code
-            rc = link_wasm(objpath, unit_objs.items(), out);
-        } else if native_own {
-            // linked
-        } else if ty.g_target.is_wasm {
-            let names = ["wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld", "rust-lld"];
-            let ld = u.find_tool(names[..]);
-            if u.isnos(ld) {
-                _ = u.unlink(u.cz(objpath));
-                dg.emit_fatal(json, "E9003", "cannot find wasm-ld (install lld)");
-                return 2;
-            }
-            let mut av = u.List.[[]u8].empty();
-            av.push(ld);
-            if u.str_eq(ld, "rust-lld") {
-                av.push("-flavor");
-                av.push("wasm");
-            }
-            if ty.g_target.ptr_bits == 64 {
-                av.push("-mwasm64");
-            }
-            av.push("--no-entry");
-            av.push("--stack-first");
-            av.push("-z");
-            av.push("stack-size=1048576");
-            av.push("--export-memory");
-            if cg.g_threads {
-                // Threads are instances sharing one memory, which the host creates.
-                av.push("--shared-memory");
-                av.push("--import-memory");
-                av.push("--max-memory=1073741824");
-            }
-            for k in 0..cg.g_export_names.len {
-                av.push(u.f1("--export=%s", cg.g_export_names.get(k)));
-            }
-            av.push(objpath);
-            // C sources are compiled for wasm and linked into the same module
-            // (they share the linear memory and the stack).
-            let mut c_objs = u.List.[[]u8].empty();
-            for k in 0..link_inputs.len {
-                if rc != 0 {
-                    break;
-                }
-                let inp = link_inputs.get(k);
-                if (inp.len > 2) and u.ends(inp, ".c") {
-                    let cc_names = ["clang", "clang-18", "/usr/lib/llvm-18/bin/clang"];
-                    let clang = u.find_tool(cc_names[..]);
-                    if u.isnos(clang) {
-                        _ = u.unlink(u.cz(objpath));
-                        dg.emit_fatal(json, "E9003", "cannot find clang to compile C sources for wasm");
-                        return 2;
-                    }
-                    let cobj = u.f3("%s.c%s.%s.o", out, u.zdec(k), u.idec(u.getpid()));
-                    let mut cv = u.List.[[]u8].empty();
-                    cv.push(clang);
-                    cv.push(u.pick(ty.g_target.ptr_bits == 64, "--target=wasm64-unknown-unknown",
-                                   "--target=wasm32-unknown-unknown"));
-                    let copts = ["-O2", "-c", "-ffreestanding", "-mbulk-memory", "-msimd128", "-matomics",
-                                 "-mnontrapping-fptoint", "-msign-ext", "-mmutable-globals"];
-                    for c in copts {
-                        cv.push(c);
-                    }
-                    for j in 0..inc_flags.len {
-                        cv.push(inc_flags.get(j));
-                    }
-                    cv.push(inp);
-                    cv.push("-o");
-                    cv.push(cobj);
-                    rc = run(cv.items());
-                    c_objs.push(cobj);
-                    av.push(cobj);
-                } else {
-                    av.push(inp);
-                }
-            }
-            for k in 0..link_flags.len {
-                av.push(link_flags.get(k));
-            }
-            for k in 0..cg.g_link_libs.len {
-                av.push(u.f1("-l%s", cg.g_link_libs.get(k)));
-            }
-            av.push("-o");
-            av.push(out);
-            if rc == 0 {
-                rc = run(av.items());
-            }
-            for k in 0..c_objs.len {
-                _ = u.unlink(u.cz(c_objs.get(k)));
-            }
-        } else {
-            let mut names = ["cc", "clang", "gcc"];
-            if tg.g_arch != tg.host_arch() {
-                // a cross compiler for the target
-                if tg.g_arch == tg.ARCH_A64 {
-                    names = ["aarch64-linux-gnu-gcc", "aarch64-linux-gnu-cc", "aarch64-linux-gnu-gcc-13"];
-                } else {
-                    names = ["x86_64-linux-gnu-gcc", "x86_64-linux-gnu-cc", "x86_64-linux-gnu-gcc-13"];
-                }
-            }
-            let cc = u.find_tool(names[..]);
-            if u.isnos(cc) {
-                _ = u.unlink(u.cz(objpath));
-                dg.emit_fatal(json, "E9003", "cannot find a C compiler to link with");
-                return 2;
-            }
-            // The toolchain's runtime sources are compiled once and cached.
-            let rtdir = u.f1("%s/internal/runtime/", std_dir);
-            for k in 0..link_inputs.len {
-                let inp = link_inputs.get(k);
-                if u.starts(inp, rtdir) {
-                    let o = units.cached_runtime_object(cc, inp);
-                    if not u.isnos(o) {
-                        link_inputs.set(k, o);
-                    }
-                }
-            }
-            let mut av = u.List.[[]u8].empty();
-            av.push(cc);
-            // C code keeps frame pointers: stack traces walk through it
-            // (codegen.ax: frame_tables)
-            av.push("-fno-omit-frame-pointer");
-            av.push(objpath);
-            // the system call stubs the runtime uses (cmd/axiom/src/lstub.ax)
-            let mut machine = elf.EM_X86_64;
-            if tg.g_arch == tg.ARCH_A64 {
-                machine = elf.EM_AARCH64;
-            }
-            let stub_path = u.cat2(objpath, ".stubs.o");
-            if not u.write_file(stub_path, elf.write(lstub.build(machine, false))) {
-                dg.emit_fatal(json, "E9004", u.f1("cannot write %s", stub_path));
-                return 1;
-            }
-            av.push(stub_path);
-            for k in 0..inc_flags.len {
-                av.push(inc_flags.get(k));
-            }
-            for k in 0..link_inputs.len {
-                av.push(link_inputs.get(k));
-            }
-            for k in 0..link_flags.len {
-                av.push(link_flags.get(k));
-            }
-            for k in 0..cg.g_link_libs.len {
-                av.push(u.f1("-l%s", cg.g_link_libs.get(k)));
-            }
-            av.push("-o");
-            av.push(out);
-            av.push("-lm");
-            av.push("-pthread");
-            rc = run(av.items());
-            _ = u.unlink(u.cz(stub_path));
-        }
-        u.phase("link");
-        _ = u.unlink(u.cz(objpath));
-        for k in 0..be.g_part_objs.len {
-            _ = u.unlink(u.cz(be.g_part_objs.get(k)));
-        }
-        if rc != 0 {
-            dg.emit_fatal(json, "E9004", "linking failed");
+    return CONTINUE;
+}
+
+// Links objpath, the units' objects and the user's inputs into o.out: with our
+// own linkers where they can, else with wasm-ld or the C compiler.
+fn link(o: *mut Options, objpath: []u8, n_user_inputs: usize, unit_objs: [][]u8) i32 {
+    let mut rc: i32 = 0;
+    let no_c = (n_user_inputs == 0) and (o.link_flags.len == 0);
+    let own_link = no_c and (cg.g_link_libs.len == 0);
+    let mut native_own = false;
+    if tg.g_os != tg.OS_LINUX {
+        // (extern "C" "name" blocks name DLLs on Windows, which plink.ax
+        // imports from, and dylibs or frameworks on macOS, which mlink.ax
+        // loads)
+        if not no_c {
+            dg.emit_fatal(o.json, "E9004", u.f1("linking C code or libraries for %s is not supported yet",
+                                                tg.os_target_name()));
+            _ = u.unlink(u.cz(objpath));
             return 1;
         }
+        // our own Mach-O or PE linker, against libSystem or the Windows DLLs
+        rc = link_native(objpath, unit_objs, o.out);
+        native_own = true;
+    } else if not ty.g_target.is_wasm and no_c {
+        // our own linker; a C toolchain is only needed to link C code
+        rc = link_native(objpath, unit_objs, o.out);
+        native_own = rc != el.LINK_FALLBACK;
     }
-    if testing {
-        let rc = tester.run_tests(out, std_dir, test_filter, test_timeout, json, show_output);
-        _ = u.unlink(u.cz(out));
-        return rc;
+    if ty.g_target.is_wasm and own_link {
+        // our own linker; wasm-ld is only needed to link C code
+        rc = link_wasm(objpath, unit_objs, o.out);
+    } else if native_own {
+        // linked
+    } else {
+        let mut exit = CONTINUE;
+        if ty.g_target.is_wasm {
+            exit = link_wasm_ld(o, objpath, &mut rc);
+        } else {
+            exit = link_cc(o, objpath, &mut rc);
+        }
+        if exit != CONTINUE {
+            return exit;
+        }
     }
-    if profiling {
-        let rc = profiler.run_profile(out, prog_args.items(), std_dir, folded_path, prof_hz, json);
-        _ = u.unlink(u.cz(out));
-        return rc;
+    u.phase("link");
+    _ = u.unlink(u.cz(objpath));
+    for k in 0..be.g_part_objs.len {
+        _ = u.unlink(u.cz(be.g_part_objs.get(k)));
     }
-    dg.emit(json, json);
-    return 0;
+    if rc != 0 {
+        dg.emit_fatal(o.json, "E9004", "linking failed");
+        return 1;
+    }
+    return CONTINUE;
+}
+
+// Pushes the -l and -L flags, the extern "C" libraries and "-o <out>".
+fn push_libs(o: *Options, av: *mut u.List.[[]u8]) void {
+    for k in 0..o.link_flags.len {
+        av.push(o.link_flags.get(k));
+    }
+    for k in 0..cg.g_link_libs.len {
+        av.push(u.f1("-l%s", cg.g_link_libs.get(k)));
+    }
+    av.push("-o");
+    av.push(o.out);
+}
+
+// Links a wasm module with wasm-ld, compiling C sources with clang first. The
+// linker's status goes into *rc (the status so far); returns CONTINUE, or an
+// exit status after a fatal error (reported).
+fn link_wasm_ld(o: *mut Options, objpath: []u8, rc: *mut i32) i32 {
+    let names = ["wasm-ld", "wasm-ld-18", "/usr/lib/llvm-18/bin/wasm-ld", "rust-lld"];
+    let ld = u.find_tool(names[..]);
+    if u.isnos(ld) {
+        _ = u.unlink(u.cz(objpath));
+        return fatal(o.json, "E9003", "cannot find wasm-ld (install lld)");
+    }
+    let mut av = u.List.[[]u8].empty();
+    av.push(ld);
+    if u.str_eq(ld, "rust-lld") {
+        av.push("-flavor");
+        av.push("wasm");
+    }
+    if ty.g_target.ptr_bits == 64 {
+        av.push("-mwasm64");
+    }
+    av.push("--no-entry");
+    av.push("--stack-first");
+    av.push("-z");
+    av.push("stack-size=1048576");
+    av.push("--export-memory");
+    if cg.g_threads {
+        // Threads are instances sharing one memory, which the host creates.
+        av.push("--shared-memory");
+        av.push("--import-memory");
+        av.push("--max-memory=1073741824");
+    }
+    for k in 0..cg.g_export_names.len {
+        av.push(u.f1("--export=%s", cg.g_export_names.get(k)));
+    }
+    av.push(objpath);
+    // C sources are compiled for wasm and linked into the same module
+    // (they share the linear memory and the stack).
+    let mut c_objs = u.List.[[]u8].empty();
+    for k in 0..o.link_inputs.len {
+        if rc.* != 0 {
+            break;
+        }
+        let inp = o.link_inputs.get(k);
+        if (inp.len > 2) and u.ends(inp, ".c") {
+            let cc_names = ["clang", "clang-18", "/usr/lib/llvm-18/bin/clang"];
+            let clang = u.find_tool(cc_names[..]);
+            if u.isnos(clang) {
+                _ = u.unlink(u.cz(objpath));
+                return fatal(o.json, "E9003", "cannot find clang to compile C sources for wasm");
+            }
+            let cobj = u.f3("%s.c%s.%s.o", o.out, u.zdec(k), u.idec(u.getpid()));
+            let mut cv = u.List.[[]u8].empty();
+            cv.push(clang);
+            cv.push(u.pick(ty.g_target.ptr_bits == 64, "--target=wasm64-unknown-unknown",
+                           "--target=wasm32-unknown-unknown"));
+            let copts = ["-O2", "-c", "-ffreestanding", "-mbulk-memory", "-msimd128", "-matomics",
+                         "-mnontrapping-fptoint", "-msign-ext", "-mmutable-globals"];
+            for c in copts {
+                cv.push(c);
+            }
+            for j in 0..o.inc_flags.len {
+                cv.push(o.inc_flags.get(j));
+            }
+            cv.push(inp);
+            cv.push("-o");
+            cv.push(cobj);
+            rc.* = u.run_status(cv.items(), u.OUT_INHERIT);
+            c_objs.push(cobj);
+            av.push(cobj);
+        } else {
+            av.push(inp);
+        }
+    }
+    push_libs(o, &mut av);
+    if rc.* == 0 {
+        rc.* = u.run_status(av.items(), u.OUT_INHERIT);
+    }
+    for k in 0..c_objs.len {
+        _ = u.unlink(u.cz(c_objs.get(k)));
+    }
+    return CONTINUE;
+}
+
+// Links a native executable with the C compiler (for C code and libraries).
+// The linker's status goes into *rc; returns CONTINUE, or an exit status
+// after a fatal error (reported).
+fn link_cc(o: *mut Options, objpath: []u8, rc: *mut i32) i32 {
+    let mut names = ["cc", "clang", "gcc"];
+    if tg.g_arch != tg.host_arch() {
+        // a cross compiler for the target
+        if tg.g_arch == tg.ARCH_A64 {
+            names = ["aarch64-linux-gnu-gcc", "aarch64-linux-gnu-cc", "aarch64-linux-gnu-gcc-13"];
+        } else {
+            names = ["x86_64-linux-gnu-gcc", "x86_64-linux-gnu-cc", "x86_64-linux-gnu-gcc-13"];
+        }
+    }
+    let cc = u.find_tool(names[..]);
+    if u.isnos(cc) {
+        _ = u.unlink(u.cz(objpath));
+        return fatal(o.json, "E9003", "cannot find a C compiler to link with");
+    }
+    // The toolchain's runtime sources are compiled once and cached.
+    let rtdir = u.f1("%s/internal/runtime/", o.std_dir);
+    for k in 0..o.link_inputs.len {
+        let inp = o.link_inputs.get(k);
+        if u.starts(inp, rtdir) {
+            let obj = units.cached_runtime_object(cc, inp);
+            if not u.isnos(obj) {
+                o.link_inputs.set(k, obj);
+            }
+        }
+    }
+    let mut av = u.List.[[]u8].empty();
+    av.push(cc);
+    // C code keeps frame pointers: stack traces walk through it
+    // (codegen.ax: frame_tables)
+    av.push("-fno-omit-frame-pointer");
+    av.push(objpath);
+    // the system call stubs the runtime uses (cmd/axiom/src/lstub.ax)
+    let mut machine = elf.EM_X86_64;
+    if tg.g_arch == tg.ARCH_A64 {
+        machine = elf.EM_AARCH64;
+    }
+    let stub_path = u.cat2(objpath, ".stubs.o");
+    if not u.write_file(stub_path, elf.write(lstub.build(machine, false))) {
+        dg.emit_fatal(o.json, "E9004", u.f1("cannot write %s", stub_path));
+        return 1;
+    }
+    av.push(stub_path);
+    for k in 0..o.inc_flags.len {
+        av.push(o.inc_flags.get(k));
+    }
+    for k in 0..o.link_inputs.len {
+        av.push(o.link_inputs.get(k));
+    }
+    push_libs(o, &mut av);
+    av.push("-lm");
+    av.push("-pthread");
+    rc.* = u.run_status(av.items(), u.OUT_INHERIT);
+    _ = u.unlink(u.cz(stub_path));
+    return CONTINUE;
+}
+
+fn driver(args: [][]u8) i32 {
+    u.phase("start");
+    if args.len < 2 {
+        usage();
+        return 2;
+    }
+    let cmd = args[1];
+    if u.str_eq(cmd, "cache") {
+        return run_cache(args[2..]);
+    }
+    if u.str_eq(cmd, "version") {
+        u.print(u.f1("axiom %s\n", ver.VERSION));
+        return 0;
+    }
+    if u.str_eq(cmd, "update") {
+        return update.run_update(args[2..]);
+    }
+    if u.str_eq(cmd, "lsp") {
+        let mut exe = u.self_path();
+        if u.isnos(exe) {
+            exe = args[0];
+        }
+        return lsp.run(args[2..], exe);
+    }
+    if u.str_eq(cmd, "fmt") {
+        return fmt.run_fmt(args[2..], find_std(args[0]));
+    }
+    if u.str_eq(cmd, "new") {
+        return run_new(args[2..]);
+    }
+    return compile(args);
 }
 
 export fn main() i32 {
