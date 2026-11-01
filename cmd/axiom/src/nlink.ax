@@ -54,6 +54,9 @@ pub let mut local_got: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from
 pub let mut got_obj: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 pub let mut got_sym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 pub let mut got_dyn: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+// functions of another system's libraries (extern_fns)
+let mut foreign: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                   cap: 0, len: 0 };
 // per object: each symbol's global (global_of) + 1, once found
 let mut gidx: u.List.[[]mut i32] = u.List.[[]mut i32].{ data: @ptr_from_int(*mut []mut i32, 0), len: 0, cap: 0 };
 pub let mut errors: u32 = 0;
@@ -81,6 +84,7 @@ pub fn begin(inputs: []*mut elf.Obj) void {
     got_obj = u.List.[u32].empty();
     got_sym = u.List.[u32].empty();
     got_dyn = u.List.[u32].empty();
+    foreign = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     gidx = u.List.[[]mut i32].empty();
     errors = 0;
     for i in 0..inputs.len {
@@ -173,11 +177,51 @@ pub fn is_apple_lib(name: []u8) bool {
     return false;
 }
 
+// A function an extern block names a library for (codegen leaves the
+// library's name in a constant axiom.import.<function>).
+pub struct ExternFn {
+    name: []u8,
+    lib: []u8,
+}
+
+// The functions extern blocks name libraries for, but those from another
+// system's libraries (by is_foreign_lib), which are noted for
+// use_unavailable.
+pub fn extern_fns(is_foreign_lib: fn([]u8) bool) u.List.[ExternFn] {
+    let mut fns = u.List.[ExternFn].empty();
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let s = o.syms.get(si);
+            if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
+                continue;
+            }
+            let d = o.secs.get(@as(usize, @bit_cast(u32, s.sec))).data.view();
+            let start = @truncate(usize, s.value);
+            let mut e = start;
+            while (e < d.len) and (d[e] != 0) {
+                e += 1;
+            }
+            if is_foreign_lib(d[start..e]) {
+                foreign.put(u.intern(s.name[13..]), 1);
+            } else {
+                fns.push(ExternFn.{ name: s.name[13..], lib: d[start..e] });
+            }
+        }
+    }
+    return fns;
+}
+
+// Is a function from another system's library (by extern_fns)?
+pub fn is_foreign(name: []u8) bool {
+    return foreign.get(u.intern(name)) != 0;
+}
+
 // Functions of another system's libraries (a Windows DLL on macOS, a macOS
 // framework on Windows) are the runtime's ax_unavailable, which says so if it
 // is ever called: a program can support several systems and choose at run
 // time.
-pub fn use_unavailable(is_foreign: fn([]u8) bool) void {
+pub fn use_unavailable() void {
     let un = gsym_index("ax_unavailable");
     for gi in 0..gsyms.len {
         let g = gsyms.at(gi);

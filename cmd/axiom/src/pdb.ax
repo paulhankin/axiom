@@ -246,6 +246,15 @@ fn gsi_hash(es: []mut HashEntry) bn.Bytes {
 // -----------------------------------------------------------------------------
 // The MSF container
 // -----------------------------------------------------------------------------
+// The first block from b on that is not a free block map's.
+fn past_fpm(b: u64) u64 {
+    let mut next = b;
+    while ((next % BS) == 1) or ((next % BS) == 2) {
+        next += 1;
+    }
+    return next;
+}
+
 fn msf(streams: []bn.Bytes) bn.Bytes {
     let mut next: u64 = 3;
     let nstreams = streams.len;
@@ -261,9 +270,7 @@ fn msf(streams: []bn.Bytes) bn.Bytes {
     for si in 0..nstreams {
         let n = (@as(u64, streams[si].len()) + BS - 1) / BS;
         for k in @as(u64, 0)..n {
-            while ((next % BS) == 1) or ((next % BS) == 2) {
-                next += 1;
-            }
+            next = past_fpm(next);
             if k == 0 {
                 firsts[si] = next;
             }
@@ -278,15 +285,11 @@ fn msf(streams: []bn.Bytes) bn.Bytes {
     let ndir = (@as(u64, dir.len()) + BS - 1) / BS;
     let mut dir_blocks = bn.new_bytes();
     for _k in @as(u64, 0)..ndir {
-        while ((next % BS) == 1) or ((next % BS) == 2) {
-            next += 1;
-        }
+        next = past_fpm(next);
         dir_blocks.u32_(next);
         next += 1;
     }
-    while ((next % BS) == 1) or ((next % BS) == 2) {
-        next += 1;
-    }
+    next = past_fpm(next);
     let map_block = next;
     next += 1;
     let nblocks = next;
@@ -404,9 +407,36 @@ fn types_stream() bn.Bytes {
 /// image's section headers (40 bytes each); files: the source files lines
 /// refer to; module: the program's name.
 pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, funcs: []Func, module: []u8) bool {
-    let nsec = sections.len / 40;
     let mut names = names_new();
-    // the module's symbols: an object name, then each procedure
+    let md = module_stream(funcs, files, &mut names, module);
+    let mut ps = public_symbols(funcs, md.proc_at);
+    let mut secs = bn.new_bytes();
+    secs.put(sections);
+    let mut streams: [11]bn.Bytes = [bn.new_bytes(); 11];
+    streams[1] = info_stream(guid, age);
+    streams[2] = types_stream();
+    streams[3] = dbi_stream(age, sections, files, &md, module);
+    streams[4] = types_stream();  // IPI: the same, empty
+    streams[5] = names_stream(&mut names);
+    streams[6] = md.b;
+    streams[7] = ps.publics;
+    streams[8] = ps.globals;
+    streams[9] = ps.recs;
+    streams[10] = secs;
+    let mut f = msf(streams[..]);
+    return u.write_file(path, f.view());
+}
+
+// The module's stream: its symbols, then its line information.
+struct Module {
+    b: bn.Bytes,
+    proc_at: []mut u32,  // each function's S_GPROC32
+    sym_size: usize,
+    c13_size: usize,
+}
+
+fn module_stream(funcs: []Func, files: [][]u8, names: *mut Names, module: []u8) Module {
+    // the symbols: an object name, then each procedure
     let mut m = bn.new_bytes();
     m.u32_(4);  // CV_SIGNATURE_C13
     let r0 = rec_begin(&mut m, 0x1101);  // S_OBJNAME
@@ -443,13 +473,13 @@ pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, fu
     }
     let sym_size = m.len();
     // line information (C13): the files' checksum entries (no checksums),
-    // then each function's lines, in runs of one file
+    // then each function's lines
     let file_entry = u.newn.[u32](files.len + 1);
     if files.len > 0 {
         let mut c = bn.new_bytes();
         for k in 0..files.len {
             file_entry[k] = @truncate(u32, c.len());
-            c.u32_(@as(u64, names_add(&mut names, files[k])));
+            c.u32_(@as(u64, names_add(names, files[k])));
             c.u8_(0);  // checksum size
             c.u8_(0);  // kind: none
             c.align(4);
@@ -462,34 +492,51 @@ pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, fu
         if f.lines.len == 0 {
             continue;
         }
-        let mut l = bn.new_bytes();
-        l.u32_(@as(u64, f.off));
-        l.u16_(@as(u64, f.sec));
-        l.u16_(0);  // flags: no columns
-        l.u32_(@as(u64, f.size));
-        let mut i: usize = 0;
-        while i < f.lines.len {
-            let mut j = i;
-            while (j < f.lines.len) and (f.lines[j].file == f.lines[i].file) {
-                j += 1;
-            }
-            l.u32_(@as(u64, file_entry[@as(usize, f.lines[i].file)]));
-            l.u32_(@as(u64, j - i));
-            l.u32_(12 + (@as(u64, j - i) * 8));
-            for k in i..j {
-                l.u32_(@as(u64, f.lines[k].off));
-                l.u32_(@as(u64, f.lines[k].line & 0xff_ffff) | 0x8000_0000);  // a statement
-            }
-            i = j;
-        }
+        let l = line_table(&f, file_entry);
         m.u32_(0xf2);  // DEBUG_S_LINES
         m.u32_(@as(u64, l.len()));
         m.put(l.view());
     }
     let c13_size = m.len() - sym_size;
     m.u32_(0);  // global references: none
+    return Module.{ b: m, proc_at: proc_at, sym_size: sym_size, c13_size: c13_size };
+}
 
-    // publics and globals, in the symbol record stream
+// A function's lines, in runs of one file (file_entry: each file's
+// checksum entry).
+fn line_table(f: *Func, file_entry: []u32) bn.Bytes {
+    let mut l = bn.new_bytes();
+    l.u32_(@as(u64, f.off));
+    l.u16_(@as(u64, f.sec));
+    l.u16_(0);  // flags: no columns
+    l.u32_(@as(u64, f.size));
+    let mut i: usize = 0;
+    while i < f.lines.len {
+        let mut j = i;
+        while (j < f.lines.len) and (f.lines[j].file == f.lines[i].file) {
+            j += 1;
+        }
+        l.u32_(@as(u64, file_entry[@as(usize, f.lines[i].file)]));
+        l.u32_(@as(u64, j - i));
+        l.u32_(12 + (@as(u64, j - i) * 8));
+        for k in i..j {
+            l.u32_(@as(u64, f.lines[k].off));
+            l.u32_(@as(u64, f.lines[k].line & 0xff_ffff) | 0x8000_0000);  // a statement
+        }
+        i = j;
+    }
+    return l;
+}
+
+// The symbol record stream (a public symbol and a procedure reference per
+// function) and its two hash streams.
+struct Publics {
+    recs: bn.Bytes,
+    publics: bn.Bytes,
+    globals: bn.Bytes,
+}
+
+fn public_symbols(funcs: []Func, proc_at: []u32) Publics {
     let mut recs = bn.new_bytes();
     let pubs = u.newn.[HashEntry](funcs.len + 1);
     let globs = u.newn.[HashEntry](funcs.len + 1);
@@ -512,7 +559,7 @@ pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, fu
         rec_end(&mut recs, g);
         globs[fi] = HashEntry.{ name: f.name, off: @truncate(u32, g), bucket: 0 };
     }
-    let mut globals = gsi_hash(globs[0..funcs.len]);
+    let globals = gsi_hash(globs[0..funcs.len]);
     // the publics: header, hash, then the address map (the records by
     // section and offset)
     let order = u.newn.[usize](funcs.len + 1);
@@ -520,7 +567,7 @@ pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, fu
         order[k] = k;
     }
     sort_by_address(order[0..funcs.len], funcs);
-    let mut ph = gsi_hash(pubs[0..funcs.len]);
+    let ph = gsi_hash(pubs[0..funcs.len]);
     let mut publics = bn.new_bytes();
     publics.u32_(@as(u64, ph.len()));
     publics.u32_(@as(u64, funcs.len) * 4);
@@ -529,16 +576,19 @@ pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, fu
     for k in 0..funcs.len {
         publics.u32_(@as(u64, pub_off[order[k]]));
     }
+    return Publics.{ recs: recs, publics: publics, globals: globals };
+}
 
-    // DBI: modules, section contributions and map, files, optional streams
+// DBI: modules, section contributions and map, files, optional streams.
+fn dbi_stream(age: u32, sections: []u8, files: [][]u8, md: *Module, module: []u8) bn.Bytes {
     let mut mi = bn.new_bytes();
     mi.u32_(0);
     section_contribution(&mut mi, 1, 0, text_size(sections), 0x6000_0020);
     mi.u16_(0);  // flags
     mi.u16_(S_MODULE);
-    mi.u32_(@as(u64, sym_size));
+    mi.u32_(@as(u64, md.sym_size));
     mi.u32_(0);  // C11 lines
-    mi.u32_(@as(u64, c13_size));
+    mi.u32_(@as(u64, md.c13_size));
     mi.u16_(@as(u64, @min(files.len, 0xffff)));
     mi.u16_(0);
     mi.u32_(0);
@@ -550,38 +600,7 @@ pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, fu
     let mut sc = bn.new_bytes();
     sc.u32_(0xeffe_0000 + 19970605);  // version 6.0
     section_contribution(&mut sc, 1, 0, text_size(sections), 0x6000_0020);
-    let mut sm = bn.new_bytes();
-    sm.u16_(@as(u64, nsec) + 1);
-    sm.u16_(@as(u64, nsec) + 1);
-    for k in 0..nsec {
-        let fl = bn.rd32(sections, (k * 40) + 36);
-        let mut flags: u64 = 0x108;  // a selector, 32-bit addresses
-        if (fl & 0x4000_0000) != 0 {
-            flags = flags | 1;  // read
-        }
-        if (fl & 0x8000_0000) != 0 {
-            flags = flags | 2;  // write
-        }
-        if (fl & 0x2000_0000) != 0 {
-            flags = flags | 4;  // execute
-        }
-        sm.u16_(flags);
-        sm.u16_(0);
-        sm.u16_(0);
-        sm.u16_(@as(u64, k) + 1);  // frame: the section's number
-        sm.u16_(0xffff);
-        sm.u16_(0xffff);
-        sm.u32_(0);
-        sm.u32_(bn.rd32(sections, (k * 40) + 8));  // virtual size
-    }
-    sm.u16_(0x208);  // absolute addresses
-    sm.u16_(0);
-    sm.u16_(0);
-    sm.u16_(@as(u64, nsec) + 1);
-    sm.u16_(0xffff);
-    sm.u16_(0xffff);
-    sm.u32_(0);
-    sm.u32_(0xffff_ffff);
+    let sm = section_map(sections);
     let mut fi_ = bn.new_bytes();
     fi_.u16_(1);  // modules
     fi_.u16_(@as(u64, @min(files.len, 0xffff)));
@@ -637,22 +656,46 @@ pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, fu
     dbi.put(fi_.view());
     dbi.put(ec.view());
     dbi.put(dbg.view());
+    return dbi;
+}
 
-    let mut secs = bn.new_bytes();
-    secs.put(sections);
-    let mut streams: [11]bn.Bytes = [bn.new_bytes(); 11];
-    streams[1] = info_stream(guid, age);
-    streams[2] = types_stream();
-    streams[3] = dbi;
-    streams[4] = types_stream();  // IPI: the same, empty
-    streams[5] = names_stream(&mut names);
-    streams[6] = m;
-    streams[7] = publics;
-    streams[8] = globals;
-    streams[9] = recs;
-    streams[10] = secs;
-    let mut f = msf(streams[..]);
-    return u.write_file(path, f.view());
+// The section map: an entry per section header, then one for absolute
+// addresses.
+fn section_map(sections: []u8) bn.Bytes {
+    let nsec = sections.len / 40;
+    let mut sm = bn.new_bytes();
+    sm.u16_(@as(u64, nsec) + 1);
+    sm.u16_(@as(u64, nsec) + 1);
+    for k in 0..nsec {
+        let fl = bn.rd32(sections, (k * 40) + 36);
+        let mut flags: u64 = 0x108;  // a selector, 32-bit addresses
+        if (fl & 0x4000_0000) != 0 {
+            flags = flags | 1;  // read
+        }
+        if (fl & 0x8000_0000) != 0 {
+            flags = flags | 2;  // write
+        }
+        if (fl & 0x2000_0000) != 0 {
+            flags = flags | 4;  // execute
+        }
+        sm.u16_(flags);
+        sm.u16_(0);
+        sm.u16_(0);
+        sm.u16_(@as(u64, k) + 1);  // frame: the section's number
+        sm.u16_(0xffff);
+        sm.u16_(0xffff);
+        sm.u32_(0);
+        sm.u32_(bn.rd32(sections, (k * 40) + 8));  // virtual size
+    }
+    sm.u16_(0x208);  // absolute addresses
+    sm.u16_(0);
+    sm.u16_(0);
+    sm.u16_(@as(u64, nsec) + 1);
+    sm.u16_(0xffff);
+    sm.u16_(0xffff);
+    sm.u32_(0);
+    sm.u32_(0xffff_ffff);
+    return sm;
 }
 
 // A section contribution: section, offset, size, characteristics, module.

@@ -178,22 +178,111 @@ fn write_relocs(r: *mut bn.Bytes, rs: *u.List.[Reloc], base: u32) void {
     }
 }
 
+// An object file being written, and its number of (non-custom) sections.
+struct Writer {
+    out: bn.Bytes,
+    nsec: u32,
+}
+
+// Adds a section (and frees its content).
+fn add_section(w: *mut Writer, id: u8, content: *mut bn.Bytes) void {
+    section(&mut w.out, id, content);
+    w.nsec += 1;
+    content.free();
+}
+
+// Adds a custom section (and frees its content).
+fn add_custom(w: *mut Writer, name: []u8, content: *mut bn.Bytes) void {
+    custom(&mut w.out, name, content);
+    content.free();
+}
+
 pub fn write_object(un: *mut Unit) []u8 {
-    let mut out = bn.new_bytes();
-    out.put("\x00asm");
-    out.u32_(1);
-    let mut nsec: u32 = 0;
+    let mut w = Writer.{ out: bn.new_bytes(), nsec: 0 };
+    w.out.put("\x00asm");
+    w.out.u32_(1);
     // type
     let mut c = bn.new_bytes();
     c.uleb(@as(u64, un.types.len));
     for i in 0..un.types.len {
         c.put(un.types.get(i));
     }
-    section(&mut out, 1, &c);
-    nsec += 1;
-    c.free();
-    // import: memory, table, globals, functions
+    add_section(&mut w, 1, &mut c);
+    c = import_section(un);
+    add_section(&mut w, 2, &mut c);
+    // function
     c = bn.new_bytes();
+    c.uleb(@as(u64, un.funcs.len));
+    for i in 0..un.funcs.len {
+        c.uleb(@as(u64, un.funcs.get(i).ty));
+    }
+    add_section(&mut w, 3, &mut c);
+    // global
+    if un.globals.len > 0 {
+        c = bn.new_bytes();
+        c.uleb(@as(u64, un.globals.len));
+        for i in 0..un.globals.len {
+            let g = un.globals.get(i);
+            c.u8_(g.vt);
+            c.u8_(u.pick(g.mutable, "\x01", "\x00")[0]);
+            if g.vt == I64 {
+                c.u8_(0x42);
+            } else {
+                c.u8_(0x41);
+            }
+            c.sleb(g.init);
+            c.u8_(0x0b);
+        }
+        add_section(&mut w, 6, &mut c);
+    }
+    // export (functions with export names)
+    if un.exports.len > 0 {
+        c = bn.new_bytes();
+        c.uleb(@as(u64, un.exports.len));
+        for i in 0..un.exports.len {
+            let e = un.exports.get(i);
+            c.name(e.name);
+            c.u8_(0);
+            c.uleb(@as(u64, e.func));
+        }
+        add_section(&mut w, 7, &mut c);
+    }
+    // datacount
+    c = bn.new_bytes();
+    c.uleb(@as(u64, un.segs.len));
+    add_section(&mut w, 12, &mut c);
+    // code and data (relocation offsets are relative to the section contents)
+    let mut code_relocs = u.List.[Reloc].empty();
+    c = code_section(un, &mut code_relocs);
+    let code_sec = w.nsec;
+    add_section(&mut w, 10, &mut c);
+    let mut data_relocs = u.List.[Reloc].empty();
+    c = data_section(un, &mut data_relocs);
+    let data_sec = w.nsec;
+    add_section(&mut w, 11, &mut c);
+    c = linking_section(un);
+    add_custom(&mut w, "linking", &mut c);
+    reloc_section(&mut w, "reloc.CODE", code_sec, &code_relocs);
+    reloc_section(&mut w, "reloc.DATA", data_sec, &data_relocs);
+    // target features, so wasm-ld accepts the features we use
+    c = bn.new_bytes();
+    let feats = ["bulk-memory", "mutable-globals", "nontrapping-fptoint", "sign-ext", "simd128"];
+    c.uleb(@as(u64, feats.len));
+    for f in feats {
+        c.u8_('+');
+        c.name(f);
+    }
+    add_custom(&mut w, "target_features", &mut c);
+    code_relocs.deinit();
+    data_relocs.deinit();
+    let r = u.dup(w.out.view());
+    w.out.free();
+    return r;
+}
+
+// The imports: memory, table, globals, functions.
+fn import_section(un: *Unit) bn.Bytes {
+    let mut c = bn.new_bytes();
     let mut nimp = 1 + un.gimports.len + un.fimports.len;
     if un.uses_table {
         nimp += 1;
@@ -231,82 +320,27 @@ pub fn write_object(un: *mut Unit) []u8 {
         c.u8_(0);
         c.uleb(@as(u64, f.ty));
     }
-    section(&mut out, 2, &c);
-    nsec += 1;
-    c.free();
-    // function
-    c = bn.new_bytes();
+    return c;
+}
+
+// The function bodies; their relocations go to `relocs`.
+fn code_section(un: *Unit, relocs: *mut u.List.[Reloc]) bn.Bytes {
+    let mut c = bn.new_bytes();
     c.uleb(@as(u64, un.funcs.len));
-    for i in 0..un.funcs.len {
-        c.uleb(@as(u64, un.funcs.get(i).ty));
-    }
-    section(&mut out, 3, &c);
-    nsec += 1;
-    c.free();
-    // global
-    if un.globals.len > 0 {
-        c = bn.new_bytes();
-        c.uleb(@as(u64, un.globals.len));
-        for i in 0..un.globals.len {
-            let g = un.globals.get(i);
-            c.u8_(g.vt);
-            c.u8_(u.pick(g.mutable, "\x01", "\x00")[0]);
-            if g.vt == I64 {
-                c.u8_(0x42);
-            } else {
-                c.u8_(0x41);
-            }
-            c.sleb(g.init);
-            c.u8_(0x0b);
-        }
-        section(&mut out, 6, &c);
-        nsec += 1;
-        c.free();
-    }
-    // export (functions with export names)
-    if un.exports.len > 0 {
-        c = bn.new_bytes();
-        c.uleb(@as(u64, un.exports.len));
-        for i in 0..un.exports.len {
-            let e = un.exports.get(i);
-            c.name(e.name);
-            c.u8_(0);
-            c.uleb(@as(u64, e.func));
-        }
-        section(&mut out, 7, &c);
-        nsec += 1;
-        c.free();
-    }
-    // datacount
-    c = bn.new_bytes();
-    c.uleb(@as(u64, un.segs.len));
-    section(&mut out, 12, &c);
-    nsec += 1;
-    c.free();
-    // code (relocation offsets are relative to the section contents)
-    c = bn.new_bytes();
-    c.uleb(@as(u64, un.funcs.len));
-    let mut code_relocs = u.List.[Reloc].empty();
     for i in 0..un.funcs.len {
         let f = un.funcs.get(i);
         c.uleb(@as(u64, f.body.len()));
-        let base = @int_cast(u32, c.len());
+        add_relocs(relocs, &f.relocs, @int_cast(u32, c.len()));
         c.put(f.body.view());
-        for k in 0..f.relocs.len {
-            let mut r = f.relocs.get(k);
-            r.off += base;
-            code_relocs.push(r);
-        }
     }
-    let code_sec = nsec;
-    section(&mut out, 10, &c);
-    nsec += 1;
-    c.free();
-    // data
-    c = bn.new_bytes();
+    return c;
+}
+
+// The data segments (active, at 0 until linked); their relocations go to
+// `relocs`.
+fn data_section(un: *Unit, relocs: *mut u.List.[Reloc]) bn.Bytes {
+    let mut c = bn.new_bytes();
     c.uleb(@as(u64, un.segs.len));
-    let mut data_relocs = u.List.[Reloc].empty();
-    let mut seg_offs = u.List.[u32].empty();
     for i in 0..un.segs.len {
         let sg = un.segs.get(i);
         c.u8_(0);  // active, memory 0
@@ -318,23 +352,38 @@ pub fn write_object(un: *mut Unit) []u8 {
         c.sleb(0);
         c.u8_(0x0b);
         c.uleb(@as(u64, sg.data.len()));
-        let base = @int_cast(u32, c.len());
-        seg_offs.push(base);
+        add_relocs(relocs, &sg.relocs, @int_cast(u32, c.len()));
         c.put(sg.data.view());
-        for k in 0..sg.relocs.len {
-            let mut r = sg.relocs.get(k);
-            r.off += base;
-            data_relocs.push(r);
-        }
     }
-    let data_sec = nsec;
-    section(&mut out, 11, &c);
-    nsec += 1;
-    c.free();
-    // linking
-    c = bn.new_bytes();
+    return c;
+}
+
+// Adds relocations rs, at base in the section, to relocs.
+fn add_relocs(relocs: *mut u.List.[Reloc], rs: *u.List.[Reloc], base: u32) void {
+    for k in 0..rs.len {
+        let mut r = rs.get(k);
+        r.off += base;
+        relocs.push(r);
+    }
+}
+
+// The custom section of a section's relocations, if it has any.
+fn reloc_section(w: *mut Writer, name: []u8, sec: u32, relocs: *u.List.[Reloc]) void {
+    if relocs.len == 0 {
+        return;
+    }
+    let mut c = bn.new_bytes();
+    c.uleb(@as(u64, sec));
+    c.uleb(@as(u64, relocs.len));
+    write_relocs(&mut c, relocs, 0);
+    add_custom(w, name, &mut c);
+}
+
+// The linking section: the symbol table, then the segments' names,
+// alignments and flags.
+fn linking_section(un: *Unit) bn.Bytes {
+    let mut c = bn.new_bytes();
     c.uleb(2);
-    // symbol table
     let mut st = bn.new_bytes();
     st.uleb(@as(u64, un.syms.len));
     for i in 0..un.syms.len {
@@ -355,11 +404,7 @@ pub fn write_object(un: *mut Unit) []u8 {
             }
         }
     }
-    c.u8_(8);
-    c.uleb(@as(u64, st.len()));
-    c.put(st.view());
-    st.free();
-    // segment info
+    subsection(&mut c, 8, &mut st);
     if un.segs.len > 0 {
         st = bn.new_bytes();
         st.uleb(@as(u64, un.segs.len));
@@ -373,45 +418,17 @@ pub fn write_object(un: *mut Unit) []u8 {
             }
             st.uleb(fl);
         }
-        c.u8_(5);
-        c.uleb(@as(u64, st.len()));
-        c.put(st.view());
-        st.free();
+        subsection(&mut c, 5, &mut st);
     }
-    custom(&mut out, "linking", &c);
-    c.free();
-    if code_relocs.len > 0 {
-        c = bn.new_bytes();
-        c.uleb(@as(u64, code_sec));
-        c.uleb(@as(u64, code_relocs.len));
-        write_relocs(&mut c, &code_relocs, 0);
-        custom(&mut out, "reloc.CODE", &c);
-        c.free();
-    }
-    if data_relocs.len > 0 {
-        c = bn.new_bytes();
-        c.uleb(@as(u64, data_sec));
-        c.uleb(@as(u64, data_relocs.len));
-        write_relocs(&mut c, &data_relocs, 0);
-        custom(&mut out, "reloc.DATA", &c);
-        c.free();
-    }
-    // target features, so wasm-ld accepts the features we use
-    c = bn.new_bytes();
-    let feats = ["bulk-memory", "mutable-globals", "nontrapping-fptoint", "sign-ext", "simd128"];
-    c.uleb(@as(u64, feats.len));
-    for f in feats {
-        c.u8_('+');
-        c.name(f);
-    }
-    custom(&mut out, "target_features", &c);
-    c.free();
-    code_relocs.deinit();
-    data_relocs.deinit();
-    seg_offs.deinit();
-    let r = u.dup(out.view());
-    out.free();
-    return r;
+    return c;
+}
+
+// A subsection of the linking section (its content freed).
+fn subsection(c: *mut bn.Bytes, id: u8, content: *mut bn.Bytes) void {
+    c.u8_(id);
+    c.uleb(@as(u64, content.len()));
+    c.put(content.view());
+    content.free();
 }
 
 // -----------------------------------------------------------------------------
@@ -431,6 +448,19 @@ fn read_relocs(r: *mut bn.Reader, out: *mut u.List.[Reloc]) void {
     }
 }
 
+// What read_object gathers before it can complete the unit's functions and
+// segments.
+struct Reading {
+    code_relocs: u.List.[Reloc],  // offsets in the code section
+    data_relocs: u.List.[Reloc],  // in the data section
+    ftypes: u.List.[u32],         // each function's type
+    body_offs: u.List.[usize],    // each body's offset in the code section
+    seg_offs: u.List.[usize],     // each segment's data in the data section
+    seg_names: u.List.[[]u8],
+    seg_aligns: u.List.[u32],
+    seg_tls: u.List.[bool],
+}
+
 // Returns nil if the bytes are not an object this compiler wrote.
 pub fn read_object(d: []u8) *mut Unit {
     let mut r = bn.reader(d);
@@ -439,16 +469,10 @@ pub fn read_object(d: []u8) *mut Unit {
     }
     r.pos = 8;
     let un = new_unit(false);
-    let mut code_start: usize = 0;
-    let mut data_start: usize = 0;
-    let mut code_relocs = u.List.[Reloc].empty();
-    let mut data_relocs = u.List.[Reloc].empty();
-    let mut ftypes = u.List.[u32].empty();
-    let mut body_offs = u.List.[usize].empty();
-    let mut seg_offs = u.List.[usize].empty();
-    let mut seg_names = u.List.[[]u8].empty();
-    let mut seg_aligns = u.List.[u32].empty();
-    let mut seg_tls = u.List.[bool].empty();
+    let mut rd = Reading.{ code_relocs: u.List.[Reloc].empty(), data_relocs: u.List.[Reloc].empty(),
+                           ftypes: u.List.[u32].empty(), body_offs: u.List.[usize].empty(),
+                           seg_offs: u.List.[usize].empty(), seg_names: u.List.[[]u8].empty(),
+                           seg_aligns: u.List.[u32].empty(), seg_tls: u.List.[bool].empty() };
     while not r.at_end() and not r.bad {
         let id = r.u8_();
         let size = @truncate(usize, r.uleb());
@@ -466,39 +490,11 @@ pub fn read_object(d: []u8) *mut Unit {
                 un.types.push(u.dup(d[s..r.pos]));
             }
         } else if id == 2 {
-            let n = r.uleb();
-            for i in @as(u64, 0)..n {
-                let m = r.name();
-                let nm = r.name();
-                let kind = r.u8_();
-                if kind == 0 {
-                    let t = @truncate(u32, r.uleb());
-                    un.fimports.push(Import.{ module: m, name: nm, ty: t, mutable: false });
-                } else if kind == 1 {
-                    _ = r.u8_();
-                    let fl = r.u8_();
-                    _ = r.uleb();
-                    if (fl & 1) != 0 {
-                        _ = r.uleb();
-                    }
-                    un.uses_table = true;
-                } else if kind == 2 {
-                    let fl = r.u8_();
-                    un.wasm64 = (fl & 4) != 0;
-                    _ = r.uleb();
-                    if (fl & 1) != 0 {
-                        _ = r.uleb();
-                    }
-                } else if kind == 3 {
-                    let vt = r.u8_();
-                    let mu = r.u8_() != 0;
-                    un.gimports.push(Import.{ module: m, name: nm, ty: @as(u32, vt), mutable: mu });
-                }
-            }
+            read_imports(&mut r, un);
         } else if id == 3 {
             let n = r.uleb();
             for i in @as(u64, 0)..n {
-                ftypes.push(@truncate(u32, r.uleb()));
+                rd.ftypes.push(@truncate(u32, r.uleb()));
             }
         } else if id == 6 {
             let n = r.uleb();
@@ -519,18 +515,16 @@ pub fn read_object(d: []u8) *mut Unit {
                 un.exports.push(Export.{ name: nm, func: fi });
             }
         } else if id == 10 {
-            code_start = start;
             let n = r.uleb();
             for i in @as(u64, 0)..n {
                 let sz = @truncate(usize, r.uleb());
-                body_offs.push(r.pos - start);
+                rd.body_offs.push(r.pos - start);
                 let f = u.new.[Func]();
-                f.ty = ftypes.get(@truncate(usize, i));
+                f.ty = rd.ftypes.get(@truncate(usize, i));
                 f.body.put(r.bytes(sz));
                 un.funcs.push(f);
             }
         } else if id == 11 {
-            data_start = start;
             let n = r.uleb();
             for i in @as(u64, 0)..n {
                 _ = r.u8_();
@@ -538,7 +532,7 @@ pub fn read_object(d: []u8) *mut Unit {
                 _ = r.sleb();
                 _ = r.u8_();
                 let sz = @truncate(usize, r.uleb());
-                seg_offs.push(r.pos - start);
+                rd.seg_offs.push(r.pos - start);
                 let sg = u.new.[Seg]();
                 sg.data.put(r.bytes(sz));
                 un.segs.push(sg);
@@ -546,51 +540,13 @@ pub fn read_object(d: []u8) *mut Unit {
         } else if id == 0 {
             let nm = r.name();
             if u.str_eq(nm, "linking") {
-                _ = r.uleb();
-                while r.pos < end {
-                    let sub = r.u8_();
-                    let ssz = @truncate(usize, r.uleb());
-                    let send = r.pos + ssz;
-                    if sub == 8 {
-                        let n = r.uleb();
-                        for i in @as(u64, 0)..n {
-                            let mut s = Sym.{ kind: r.u8_(), flags: 0, name: "", index: 0, seg: 0, off: 0, size: 0 };
-                            s.flags = @truncate(u32, r.uleb());
-                            if s.kind == SYM_DATA {
-                                s.name = r.name();
-                                if (s.flags & F_UNDEFINED) == 0 {
-                                    s.seg = @truncate(u32, r.uleb());
-                                    s.off = r.uleb();
-                                    s.size = r.uleb();
-                                }
-                            } else {
-                                s.index = @truncate(u32, r.uleb());
-                                if ((s.flags & F_UNDEFINED) == 0) or ((s.flags & F_EXPLICIT_NAME) != 0) {
-                                    s.name = r.name();
-                                } else if (s.kind == SYM_FUNC) and (@as(usize, s.index) < un.fimports.len) {
-                                    s.name = un.fimports.get(@as(usize, s.index)).name;
-                                } else if (s.kind == SYM_GLOBAL) and (@as(usize, s.index) < un.gimports.len) {
-                                    s.name = un.gimports.get(@as(usize, s.index)).name;
-                                }
-                            }
-                            _ = add_sym(un, s);
-                        }
-                    } else if sub == 5 {
-                        let n = r.uleb();
-                        for i in @as(u64, 0)..n {
-                            seg_names.push(r.name());
-                            seg_aligns.push(@truncate(u32, r.uleb()));
-                            seg_tls.push((r.uleb() & 2) != 0);
-                        }
-                    }
-                    r.pos = send;
-                }
+                read_linking(&mut r, end, un, &mut rd);
             } else if u.str_eq(nm, "reloc.CODE") {
                 _ = r.uleb();
-                read_relocs(&mut r, &mut code_relocs);
+                read_relocs(&mut r, &mut rd.code_relocs);
             } else if u.str_eq(nm, "reloc.DATA") {
                 _ = r.uleb();
-                read_relocs(&mut r, &mut data_relocs);
+                read_relocs(&mut r, &mut rd.data_relocs);
             }
         }
         r.pos = end;
@@ -599,40 +555,26 @@ pub fn read_object(d: []u8) *mut Unit {
         return u.nil.[Unit]();
     }
     // distribute relocations to functions and segments
-    for i in 0..code_relocs.len {
-        let x = code_relocs.get(i);
-        let off = @as(usize, x.off);
-        let mut k = body_offs.len;
-        while (k > 0) and (body_offs.get(k - 1) > off) {
-            k -= 1;
+    for i in 0..rd.code_relocs.len {
+        let x = rd.code_relocs.get(i);
+        let k = owner(&rd.body_offs, @as(usize, x.off));
+        if k > 0 {
+            un.funcs.get(k - 1).relocs.push(moved(x, rd.body_offs.get(k - 1)));
         }
-        if k == 0 {
-            continue;
-        }
-        let f = un.funcs.get(k - 1);
-        f.relocs.push(Reloc.{ ty: x.ty, off: @int_cast(u32, off - body_offs.get(k - 1)), sym: x.sym,
-                              addend: x.addend });
     }
-    for i in 0..data_relocs.len {
-        let x = data_relocs.get(i);
-        let off = @as(usize, x.off);
-        let mut k = seg_offs.len;
-        while (k > 0) and (seg_offs.get(k - 1) > off) {
-            k -= 1;
+    for i in 0..rd.data_relocs.len {
+        let x = rd.data_relocs.get(i);
+        let k = owner(&rd.seg_offs, @as(usize, x.off));
+        if k > 0 {
+            un.segs.get(k - 1).relocs.push(moved(x, rd.seg_offs.get(k - 1)));
         }
-        if k == 0 {
-            continue;
-        }
-        let sg = un.segs.get(k - 1);
-        sg.relocs.push(Reloc.{ ty: x.ty, off: @int_cast(u32, off - seg_offs.get(k - 1)), sym: x.sym,
-                               addend: x.addend });
     }
     for i in 0..un.segs.len {
         let sg = un.segs.get(i);
-        if i < seg_names.len {
-            sg.name = seg_names.get(i);
-            sg.align = seg_aligns.get(i);
-            sg.tls = seg_tls.get(i);
+        if i < rd.seg_names.len {
+            sg.name = rd.seg_names.get(i);
+            sg.align = rd.seg_aligns.get(i);
+            sg.tls = rd.seg_tls.get(i);
         }
     }
     // function names and symbols
@@ -647,4 +589,102 @@ pub fn read_object(d: []u8) *mut Unit {
         }
     }
     return un;
+}
+
+// The import section: function and global imports (the memory's says
+// whether the unit is wasm64; a table's that it uses one).
+fn read_imports(r: *mut bn.Reader, un: *mut Unit) void {
+    let n = r.uleb();
+    for i in @as(u64, 0)..n {
+        let m = r.name();
+        let nm = r.name();
+        let kind = r.u8_();
+        if kind == 0 {
+            let t = @truncate(u32, r.uleb());
+            un.fimports.push(Import.{ module: m, name: nm, ty: t, mutable: false });
+        } else if kind == 1 {
+            _ = r.u8_();
+            let fl = r.u8_();
+            _ = r.uleb();
+            if (fl & 1) != 0 {
+                _ = r.uleb();
+            }
+            un.uses_table = true;
+        } else if kind == 2 {
+            let fl = r.u8_();
+            un.wasm64 = (fl & 4) != 0;
+            _ = r.uleb();
+            if (fl & 1) != 0 {
+                _ = r.uleb();
+            }
+        } else if kind == 3 {
+            let vt = r.u8_();
+            let mu = r.u8_() != 0;
+            un.gimports.push(Import.{ module: m, name: nm, ty: @as(u32, vt), mutable: mu });
+        }
+    }
+}
+
+// The linking section (to `end`): the symbol table, the segments' info.
+fn read_linking(r: *mut bn.Reader, end: usize, un: *mut Unit, rd: *mut Reading) void {
+    _ = r.uleb();
+    while r.pos < end {
+        let sub = r.u8_();
+        let ssz = @truncate(usize, r.uleb());
+        let send = r.pos + ssz;
+        if sub == 8 {
+            let n = r.uleb();
+            for i in @as(u64, 0)..n {
+                _ = add_sym(un, read_sym(r, un));
+            }
+        } else if sub == 5 {
+            let n = r.uleb();
+            for i in @as(u64, 0)..n {
+                rd.seg_names.push(r.name());
+                rd.seg_aligns.push(@truncate(u32, r.uleb()));
+                rd.seg_tls.push((r.uleb() & 2) != 0);
+            }
+        }
+        r.pos = send;
+    }
+}
+
+// A symbol table entry (an undefined one without a name of its own has its
+// import's).
+fn read_sym(r: *mut bn.Reader, un: *Unit) Sym {
+    let mut s = Sym.{ kind: r.u8_(), flags: 0, name: "", index: 0, seg: 0, off: 0, size: 0 };
+    s.flags = @truncate(u32, r.uleb());
+    if s.kind == SYM_DATA {
+        s.name = r.name();
+        if (s.flags & F_UNDEFINED) == 0 {
+            s.seg = @truncate(u32, r.uleb());
+            s.off = r.uleb();
+            s.size = r.uleb();
+        }
+    } else {
+        s.index = @truncate(u32, r.uleb());
+        if ((s.flags & F_UNDEFINED) == 0) or ((s.flags & F_EXPLICIT_NAME) != 0) {
+            s.name = r.name();
+        } else if (s.kind == SYM_FUNC) and (@as(usize, s.index) < un.fimports.len) {
+            s.name = un.fimports.get(@as(usize, s.index)).name;
+        } else if (s.kind == SYM_GLOBAL) and (@as(usize, s.index) < un.gimports.len) {
+            s.name = un.gimports.get(@as(usize, s.index)).name;
+        }
+    }
+    return s;
+}
+
+// Which of the pieces starting at offs (in order) holds offset off: its
+// index + 1, 0 if none.
+fn owner(offs: *u.List.[usize], off: usize) usize {
+    let mut k = offs.len;
+    while (k > 0) and (offs.get(k - 1) > off) {
+        k -= 1;
+    }
+    return k;
+}
+
+// A relocation moved to a piece's own offsets (the piece at base).
+fn moved(x: Reloc, base: usize) Reloc {
+    return Reloc.{ ty: x.ty, off: @int_cast(u32, @as(usize, x.off) - base), sym: x.sym, addend: x.addend };
 }

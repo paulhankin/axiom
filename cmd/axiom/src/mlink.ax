@@ -110,7 +110,7 @@ fn class_of(s: *elf.Sec) i32 {
 // -----------------------------------------------------------------------------
 fn collect_symbols() void {
     nl.define_globals();
-    nl.use_unavailable(is_foreign);
+    nl.use_unavailable();
     // What is still undefined must come from libSystem: C library names,
     // never our own (module-qualified) ones.
     for gi in 0..nl.gsyms.len {
@@ -119,14 +119,6 @@ fn collect_symbols() void {
             nl.err(u.f1("undefined symbol '%s'", g.name));
         }
     }
-}
-
-// The ordinal of a function from another system's library.
-const FOREIGN: u32 = 0xffff_fffe;
-
-// From another system's library (a Windows DLL)?
-fn is_foreign(name: []u8) bool {
-    return import_ord.get(u.intern(name)) == FOREIGN;
 }
 
 // Frameworks whose install names are not Versions/A.
@@ -159,41 +151,25 @@ fn dylib_path(name: []u8) []u8 {
     return u.f3("/System/Library/Frameworks/%s.framework/Versions/%s/%s", name, ver, name);
 }
 
-// The libraries that extern blocks named (the axiom.import.* constants).
+// The libraries that extern blocks named (the functions of Windows DLLs
+// are the runtime's ax_unavailable: nl.use_unavailable).
 fn collect_dylibs() void {
-    for oi in 0..nl.objs.len {
-        let o = nl.objs.get(oi);
-        for si in 0..o.syms.len {
-            let s = o.syms.get(si);
-            if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
-                continue;
-            }
-            let d = o.secs.get(@as(usize, @bit_cast(u32, s.sec))).data.view();
-            let start = @truncate(usize, s.value);
-            let mut e = start;
-            while (e < d.len) and (d[e] != 0) {
-                e += 1;
-            }
-            if nl.is_windows_dll(d[start..e]) {
-                import_ord.put(u.intern(s.name[13..]), FOREIGN);
-                continue;
-            }
-            let path = dylib_path(d[start..e]);
-            let mut ord: u32 = 1;
-            if path.len > 0 {
-                let mut k = dylibs.len;
-                for j in 0..dylibs.len {
-                    if u.str_eq(dylibs.get(j), path) {
-                        k = j;
-                    }
+    for f in nl.extern_fns(nl.is_windows_dll).items() {
+        let path = dylib_path(f.lib);
+        let mut ord: u32 = 1;
+        if path.len > 0 {
+            let mut k = dylibs.len;
+            for j in 0..dylibs.len {
+                if u.str_eq(dylibs.get(j), path) {
+                    k = j;
                 }
-                if k == dylibs.len {
-                    dylibs.push(u.dup(path));
-                }
-                ord = @int_cast(u32, k) + 2;
             }
-            import_ord.put(u.intern(s.name[13..]), ord);
+            if k == dylibs.len {
+                dylibs.push(u.dup(path));
+            }
+            ord = @int_cast(u32, k) + 2;
         }
+        import_ord.put(u.intern(f.name), ord);
     }
 }
 
@@ -579,14 +555,6 @@ fn bind_info() []u8 {
     return b.view();
 }
 
-struct NSym {
-    name: []u8,
-    ty: u8,
-    sect: u8,
-    desc: u64,
-    value: u64,
-}
-
 // Links `inputs` into the executable `out`. 0: done; 1: errors (reported).
 pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     nl.begin(inputs);
@@ -603,11 +571,86 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     if nl.errors != 0 {
         return 1;
     }
-    // GOT slots that dyld binds (libSystem) or rebases (our own symbols)
-    let ngot = @as(u64, nl.got_sym.len);
-
-    // the load commands' size, which places everything after them
     let ident = u.basename(out);
+    let ly = lay_out();
+    let mut fileb = bn.new_bytes();
+    fileb.zeros(@truncate(usize, data_off + ly.data_filesize));
+    let b = fileb.view();
+    write_contents(b);
+    if nl.errors != 0 {
+        return 1;
+    }
+    let le = link_edit(&ly, ident);
+    let mut h = bn.new_bytes();
+    let uuid_at = load_commands(&mut h, &ly, &le);
+    if @as(u64, h.len()) != (32 + ly.sizeofcmds) {
+        nl.err("internal: load command size");
+        return 1;
+    }
+    bn.put_at(b, 0, h.view());
+
+    // the whole file before the signature
+    let mut f = bn.new_bytes();
+    f.put(b);
+    f.put(le.rebase);
+    f.put(le.bind);
+    f.put(le.exports);
+    f.put(le.symtab.view());
+    f.put(le.strtab.view());
+    while @as(u64, f.len()) < le.sig_off {
+        f.u8_(0);
+    }
+    // a UUID from the contents (deterministic builds)
+    let mut digest: [32]u8 = [0; 32];
+    sha2.sha256(f.view(), digest[..]);
+    digest[6] = (digest[6] & 0x0f) | 0x40;
+    digest[8] = (digest[8] & 0x3f) | 0x80;
+    let fv = f.view();
+    @mem_copy(fv[uuid_at..uuid_at + 16], digest[0..16]);
+    let sig = signature(fv, ident, le.sig_off, ly.text_size);
+    f.put(sig);
+    return write_new(out, f.view());
+}
+
+// Writes the executable as a new file renamed over `out`: macOS caches an
+// executable's code signature with its file, and kills a program rewritten
+// in place. 0: done; 1: errors (reported).
+fn write_new(out: []u8, d: []u8) i32 {
+    let tmp = u.f2("%s.tmp%s", out, u.idec(u.getpid()));
+    if not u.write_file(tmp, d) {
+        _ = u.unlink(u.cz(tmp));
+        nl.err(u.f1("cannot write %s", out));
+        return 1;
+    }
+    _ = u.chmod(u.cz(tmp), 0o755);
+    if u.rename(u.cz(tmp), u.cz(out)) != 0 {
+        _ = u.unlink(u.cz(tmp));
+        nl.err(u.f1("cannot write %s", out));
+        return 1;
+    }
+    return 0;
+}
+
+// Where the link puts things (beyond the addresses relocation uses).
+struct Layout {
+    ncmds: u64,  // the load commands
+    sizeofcmds: u64,
+    text_end: u64,  // __text (code, stubs) ends
+    const_addr: u64,
+    const_end: u64,
+    text_size: u64,   // __TEXT's
+    ngot: u64,        // GOT slots
+    data_start: u64,  // __data
+    data_end: u64,
+    bss_addr: u64,
+    bss_end: u64,
+    data_filesize: u64,  // __DATA's
+    data_vmsize: u64,
+}
+
+// Places __TEXT (after the load commands) and __DATA.
+fn lay_out() Layout {
+    // the load commands' size, which places everything after them
     let mut ncmds: u64 = 13;
     let mut sizeofcmds: u64 = (72 + (72 + (2 * 80)) + (72 + (3 * 80)) + 72) + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 56 +
                               16;
@@ -625,7 +668,9 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     let const_end = nl.place(nl.C_CONST, const_addr);
     let text_size = nl.align_up(const_end - BASE, PAGE);
 
-    // __DATA
+    // __DATA: GOT slots that dyld binds (libSystem) or rebases (our own
+    // symbols), data, the thread-local template, then .bss
+    let ngot = @as(u64, nl.got_sym.len);
     data_addr = BASE + text_size;
     data_off = text_size;
     got_addr = data_addr;
@@ -640,13 +685,15 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     data_end = tdata_end;
     let bss_addr = nl.align_up(data_end, nl.class_align(nl.C_BSS));
     let bss_end = nl.place(nl.C_BSS, bss_addr);
-    let data_filesize = nl.align_up(data_end - data_addr, PAGE);
-    let data_vmsize = nl.align_up(bss_end - data_addr, PAGE);
+    return Layout.{ ncmds: ncmds, sizeofcmds: sizeofcmds, text_end: text_end, const_addr: const_addr,
+                    const_end: const_end, text_size: text_size, ngot: ngot, data_start: data_start, data_end: data_end,
+                    bss_addr: bss_addr, bss_end: bss_end, data_filesize: nl.align_up(data_end - data_addr, PAGE),
+                    data_vmsize: nl.align_up(bss_end - data_addr, PAGE) };
+}
 
-    let total_body = data_off + data_filesize;
-    let mut fileb = bn.new_bytes();
-    fileb.zeros(@truncate(usize, total_body));
-    let b = fileb.view();
+// __TEXT and __DATA's contents in b: the sections, the stubs, the GOT and
+// the runtime's TLS record, relocated (noting what dyld rebases and binds).
+fn write_contents(b: []mut u8) void {
     nl.copy_class(b, nl.C_TEXT, file_of);
     nl.copy_class(b, nl.C_CONST, file_of);
     nl.copy_class(b, nl.C_DATA, file_of);
@@ -685,18 +732,80 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     bn.w64(b, ifo + 16, tls_filesz);
     bn.w64(b, ifo + 24, tls_memsz);
     bn.w64(b, ifo + 32, @max(tls_align, 16));
-    if nl.errors != 0 {
-        return 1;
-    }
+}
 
-    // __LINKEDIT: rebase, bind, exports, symbols, strings, signature
+struct NSym {
+    name: []u8,
+    ty: u8,
+    sect: u8,
+    desc: u64,
+    value: u64,
+}
+
+// __LINKEDIT's contents, and where each is.
+struct LinkEdit {
+    rebase: []u8,
+    bind: []u8,
+    exports: []u8,
+    symtab: bn.Bytes,
+    strtab: bn.Bytes,
+    nsyms: u64,
+    nlocal: u64,  // the local symbols, then 2 defined external ones, then
+    nundef: u64,  // the undefined ones
+    off: u64,     // __LINKEDIT's
+    addr: u64,
+    size: u64,
+    rebase_off: u64,
+    bind_off: u64,
+    export_off: u64,
+    sym_off: u64,
+    str_off: u64,
+    sig_off: u64,
+    sig_size: u64,
+}
+
+// __LINKEDIT: rebase, bind, exports, symbols, strings, signature.
+fn link_edit(ly: *Layout, ident: []u8) LinkEdit {
     let rebase = rebase_info();
     let bind = bind_info();
     let exports = export_trie();
+    let mut nlocal: u64 = 0;
+    let syms = symbols(&mut nlocal);
     let mut strtab = bn.new_bytes();
     strtab.u8_(0x20);
     strtab.u8_(0);
-    let mut locals = u.List.[NSym].empty();
+    let mut symtab = bn.new_bytes();
+    for x in syms.items() {
+        symtab.u32_(@as(u64, strtab.len()));
+        strtab.put(x.name);
+        strtab.u8_(0);
+        symtab.u8_(x.ty);
+        symtab.u8_(x.sect);
+        symtab.u16_(x.desc);
+        symtab.u64_(x.value);
+    }
+    strtab.align(8);
+
+    let le_off = data_off + ly.data_filesize;
+    let rebase_off = le_off;
+    let bind_off = rebase_off + @as(u64, rebase.len);
+    let export_off = bind_off + @as(u64, bind.len);
+    let sym_off = export_off + @as(u64, exports.len);
+    let str_off = sym_off + @as(u64, symtab.len());
+    let sig_off = nl.align_up(str_off + @as(u64, strtab.len()), 16);
+    let sig_size = signature_size(ident, sig_off);
+    return LinkEdit.{ rebase: rebase, bind: bind, exports: exports, symtab: symtab, strtab: strtab,
+                      nsyms: @as(u64, syms.len), nlocal: nlocal, nundef: @as(u64, syms.len) - (nlocal + 2), off: le_off,
+                      addr: data_addr + ly.data_vmsize, size: (sig_off + sig_size) - le_off, rebase_off: rebase_off,
+                      bind_off: bind_off, export_off: export_off, sym_off: sym_off, str_off: str_off, sig_off: sig_off,
+                      sig_size: sig_size };
+}
+
+// The symbol table's symbols: the local ones (every defined symbol), the
+// external ones (the header, for dyld, and main), then the undefined ones,
+// each with its library's ordinal (libSystem's is 1). Sets nlocal.
+fn symbols(nlocal: *mut u64) u.List.[NSym] {
+    let mut syms = u.List.[NSym].empty();
     for oi in 0..nl.objs.len {
         let o = nl.objs.get(oi);
         for si in 0..o.syms.len {
@@ -722,21 +831,15 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
             } else if cls == nl.C_BSS {
                 sect = 5;
             }
-            locals.push(
+            syms.push(
                 NSym.{
                     name: elf.display_name(s.name), ty: 0x0e, sect: sect, desc: 0,
                     value: nl.sym_addr_in(oi, @int_cast(u32, si)) });
         }
     }
-    let mut syms = u.List.[NSym].empty();
-    for x in locals.items() {
-        syms.push(x);
-    }
-    // external: the header (for dyld) and main
+    nlocal.* = @as(u64, syms.len);
     syms.push(NSym.{ name: "__mh_execute_header", ty: 0x0f, sect: 1, desc: 0x10, value: BASE });
     syms.push(NSym.{ name: "_main", ty: 0x0f, sect: 1, desc: 0, value: nl.global_addr("main") });
-    // undefined: each with its library's ordinal (libSystem's is 1)
-    let nlocal = locals.len;
     let mut undef = u.List.[[]u8].empty();
     for gi in 0..nl.gsyms.len {
         let g = nl.gsyms.at(gi);
@@ -749,85 +852,65 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
         let desc = @as(u64, ordinal_of(nm[1..])) << 8;  // SET_LIBRARY_ORDINAL
         syms.push(NSym.{ name: nm, ty: 0x01, sect: 0, desc: desc, value: 0 });
     }
-    let nundef = syms.len - (nlocal + 2);
-    let mut symtab = bn.new_bytes();
-    for x in syms.items() {
-        symtab.u32_(@as(u64, strtab.len()));
-        strtab.put(x.name);
-        strtab.u8_(0);
-        symtab.u8_(x.ty);
-        symtab.u8_(x.sect);
-        symtab.u16_(x.desc);
-        symtab.u64_(x.value);
-    }
-    strtab.align(8);
+    return syms;
+}
 
-    let le_off = data_off + data_filesize;
-    let rebase_off = le_off;
-    let bind_off = rebase_off + @as(u64, rebase.len);
-    let export_off = bind_off + @as(u64, bind.len);
-    let sym_off = export_off + @as(u64, exports.len);
-    let str_off = sym_off + @as(u64, symtab.len());
-    let sig_off = nl.align_up(str_off + @as(u64, strtab.len()), 16);
-    let sig_size = signature_size(ident, sig_off);
-    let le_size = (sig_off + sig_size) - le_off;
-    let le_addr = data_addr + data_vmsize;
-
-    // the header and load commands
-    let mut h = bn.new_bytes();
+// The Mach header and load commands into h; returns the UUID's offset (for
+// the caller to fill in).
+fn load_commands(h: *mut bn.Bytes, ly: *Layout, le: *LinkEdit) usize {
     h.u32_(0xfeed_facf);  // MH_MAGIC_64
     h.u32_(0x0100_000c);  // CPU_TYPE_ARM64
     h.u32_(0);            // CPU_SUBTYPE_ARM64_ALL
     h.u32_(2);            // MH_EXECUTE
-    h.u32_(ncmds);
-    h.u32_(sizeofcmds);
+    h.u32_(ly.ncmds);
+    h.u32_(ly.sizeofcmds);
     h.u32_(0x0020_0085);  // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
     h.u32_(0);
-    segment(&mut h, "__PAGEZERO", 0, BASE, 0, 0, 0, 0);
-    segment(&mut h, "__TEXT", BASE, text_size, 0, text_size, 5, 2);
-    section(&mut h, "__text", "__TEXT", text_addr, text_end - text_addr, file_of(text_addr), 16, 0x8000_0400);
-    section(&mut h, "__const", "__TEXT", const_addr, const_end - const_addr, file_of(const_addr),
+    segment(h, "__PAGEZERO", 0, BASE, 0, 0, 0, 0);
+    segment(h, "__TEXT", BASE, ly.text_size, 0, ly.text_size, 5, 2);
+    section(h, "__text", "__TEXT", text_addr, ly.text_end - text_addr, file_of(text_addr), 16, 0x8000_0400);
+    section(h, "__const", "__TEXT", ly.const_addr, ly.const_end - ly.const_addr, file_of(ly.const_addr),
             @max(nl.class_align(nl.C_CONST), 1), 0);
-    segment(&mut h, "__DATA", data_addr, data_vmsize, data_off, data_filesize, 3, 3);
-    section(&mut h, "__got", "__DATA", got_addr, ngot * 8, data_off, 8, 0);
-    section(&mut h, "__data", "__DATA", data_start, data_end - data_start, file_of(data_start), 16, 0);
-    section(&mut h, "__bss", "__DATA", bss_addr, bss_end - bss_addr, 0, @max(nl.class_align(nl.C_BSS), 1), 1);
-    segment(&mut h, "__LINKEDIT", le_addr, nl.align_up(le_size, PAGE), le_off, le_size, 1, 0);
+    segment(h, "__DATA", data_addr, ly.data_vmsize, data_off, ly.data_filesize, 3, 3);
+    section(h, "__got", "__DATA", got_addr, ly.ngot * 8, data_off, 8, 0);
+    section(h, "__data", "__DATA", ly.data_start, ly.data_end - ly.data_start, file_of(ly.data_start), 16, 0);
+    section(h, "__bss", "__DATA", ly.bss_addr, ly.bss_end - ly.bss_addr, 0, @max(nl.class_align(nl.C_BSS), 1), 1);
+    segment(h, "__LINKEDIT", le.addr, nl.align_up(le.size, PAGE), le.off, le.size, 1, 0);
     h.u32_(0x8000_0022);  // LC_DYLD_INFO_ONLY
     h.u32_(48);
-    h.u32_(rebase_off);
-    h.u32_(@as(u64, rebase.len));
-    h.u32_(bind_off);
-    h.u32_(@as(u64, bind.len));
+    h.u32_(le.rebase_off);
+    h.u32_(@as(u64, le.rebase.len));
+    h.u32_(le.bind_off);
+    h.u32_(@as(u64, le.bind.len));
     h.u32_(0);  // weak bind
     h.u32_(0);
     h.u32_(0);  // lazy bind
     h.u32_(0);
-    h.u32_(export_off);
-    h.u32_(@as(u64, exports.len));
+    h.u32_(le.export_off);
+    h.u32_(@as(u64, le.exports.len));
     h.u32_(2);  // LC_SYMTAB
     h.u32_(24);
-    h.u32_(sym_off);
-    h.u32_(@as(u64, syms.len));
-    h.u32_(str_off);
-    h.u32_(@as(u64, strtab.len()));
+    h.u32_(le.sym_off);
+    h.u32_(le.nsyms);
+    h.u32_(le.str_off);
+    h.u32_(@as(u64, le.strtab.len()));
     h.u32_(0xb);  // LC_DYSYMTAB
     h.u32_(80);
     h.u32_(0);  // ilocalsym
-    h.u32_(@as(u64, nlocal));
-    h.u32_(@as(u64, nlocal));  // iextdefsym
+    h.u32_(le.nlocal);
+    h.u32_(le.nlocal);  // iextdefsym
     h.u32_(2);
-    h.u32_(@as(u64, nlocal) + 2);  // iundefsym
-    h.u32_(@as(u64, nundef));
+    h.u32_(le.nlocal + 2);  // iundefsym
+    h.u32_(le.nundef);
     for _k in @as(u32, 0)..12 {
         h.u32_(0);  // no TOC, modules, external or indirect symbols, relocations
     }
     h.u32_(0xe);  // LC_LOAD_DYLINKER
     h.u32_(32);
     h.u32_(12);
-    name16(&mut h, "/usr/lib/dyld");
+    name16(h, "/usr/lib/dyld");
     h.u32_(0);
-    h.u32_(0x1b);  // LC_UUID (filled in below)
+    h.u32_(0x1b);  // LC_UUID (filled in by the caller)
     h.u32_(24);
     let uuid_at = h.len();
     h.zeros(16);
@@ -841,58 +924,13 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     h.u32_(24);
     h.u64_(file_of(nl.global_addr("main")));
     h.u64_(0);  // default stack size
-    load_dylib(&mut h, "/usr/lib/libSystem.B.dylib", 0x0547_0000);  // current version 1351
+    load_dylib(h, "/usr/lib/libSystem.B.dylib", 0x0547_0000);  // current version 1351
     for d in dylibs.items() {
-        load_dylib(&mut h, d, 0x0001_0000);
+        load_dylib(h, d, 0x0001_0000);
     }
     h.u32_(0x1d);  // LC_CODE_SIGNATURE
     h.u32_(16);
-    h.u32_(sig_off);
-    h.u32_(sig_size);
-    if @as(u64, h.len()) != (32 + sizeofcmds) {
-        nl.err("internal: load command size");
-        return 1;
-    }
-    let hv = h.view();
-    for i in 0..hv.len {
-        b[i] = hv[i];
-    }
-
-    // the whole file before the signature
-    let mut f = bn.new_bytes();
-    f.put(b);
-    f.put(rebase);
-    f.put(bind);
-    f.put(exports);
-    f.put(symtab.view());
-    f.put(strtab.view());
-    while @as(u64, f.len()) < sig_off {
-        f.u8_(0);
-    }
-    // a UUID from the contents (deterministic builds)
-    let mut digest: [32]u8 = [0; 32];
-    sha2.sha256(f.view(), digest[..]);
-    digest[6] = (digest[6] & 0x0f) | 0x40;
-    digest[8] = (digest[8] & 0x3f) | 0x80;
-    let fv = f.view();
-    for i in @as(usize, 0)..16 {
-        fv[uuid_at + i] = digest[i];
-    }
-    let sig = signature(fv, ident, sig_off, text_size);
-    f.put(sig);
-    // a new file renamed over the output: macOS caches an executable's code
-    // signature with its file, and kills a program rewritten in place
-    let tmp = u.f2("%s.tmp%s", out, u.idec(u.getpid()));
-    if not u.write_file(tmp, f.view()) {
-        _ = u.unlink(u.cz(tmp));
-        nl.err(u.f1("cannot write %s", out));
-        return 1;
-    }
-    _ = u.chmod(u.cz(tmp), 0o755);
-    if u.rename(u.cz(tmp), u.cz(out)) != 0 {
-        _ = u.unlink(u.cz(tmp));
-        nl.err(u.f1("cannot write %s", out));
-        return 1;
-    }
-    return 0;
+    h.u32_(le.sig_off);
+    h.u32_(le.sig_size);
+    return uuid_at;
 }

@@ -261,40 +261,105 @@ struct Shdr {
     entsize: u64,
 }
 
+// An object file being written: its bytes, section headers and their names.
+struct Writer {
+    out: bn.Bytes,
+    shstr: bn.Bytes,
+    shdrs: u.List.[Shdr],
+}
+
+// Adds a section name (prefix, then name) to .shstrtab; returns its offset.
+fn sec_name(w: *mut Writer, prefix: []u8, name: []u8) u32 {
+    let nm = @int_cast(u32, w.shstr.len());
+    w.shstr.put(prefix);
+    w.shstr.put(name);
+    w.shstr.u8_(0);
+    return nm;
+}
+
 pub fn write(o: *mut Obj) []u8 {
-    let mut out = bn.new_bytes();
-    out.zeros(64);
-    let mut shstr = bn.new_bytes();
-    shstr.u8_(0);
-    let mut shdrs = u.List.[Shdr].empty();
-    shdrs.push(Shdr.{ name: 0, ty: 0, flags: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 });
+    let mut w = Writer.{ out: bn.new_bytes(), shstr: bn.new_bytes(), shdrs: u.List.[Shdr].empty() };
+    w.out.zeros(64);
+    w.shstr.u8_(0);
+    w.shdrs.push(Shdr.{ name: 0, ty: 0, flags: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 });
     // content sections
     for i in 0..o.secs.len {
         let s = o.secs.get(i);
-        let nm = @int_cast(u32, shstr.len());
-        shstr.put(s.name);
-        shstr.u8_(0);
+        let nm = sec_name(&mut w, "", s.name);
         let a = s.align;
         let mut al = a;
         if al == 0 {
             al = 1;
         }
-        out.align(@truncate(usize, al));
-        let off = @as(u64, out.len());
+        w.out.align(@truncate(usize, al));
+        let off = @as(u64, w.out.len());
         if sec_type(s.kind) == 1 {
-            out.put(s.data.view());
+            w.out.put(s.data.view());
         }
-        s.index = @int_cast(u32, shdrs.len);
-        shdrs.push(Shdr.{ name: nm, ty: sec_type(s.kind), flags: sec_flags(s.kind), off: off, size: sec_size(s),
-                          link: 0, info: 0, align: al, entsize: 0 });
+        s.index = @int_cast(u32, w.shdrs.len);
+        w.shdrs.push(Shdr.{ name: nm, ty: sec_type(s.kind), flags: sec_flags(s.kind), off: off, size: sec_size(s),
+                            link: 0, info: 0, align: al, entsize: 0 });
     }
-    // symbol table: null, section symbols, locals, then globals
     let mut strtab = bn.new_bytes();
-    strtab.u8_(0);
     let mut symtab = bn.new_bytes();
+    let map = u.newn.[u32](o.syms.len + 1);  // our index -> ELF index
+    symbol_table(o, &mut symtab, &mut strtab, map);
+    let mut first_global: u32 = 1;
+    for i in 0..o.syms.len {
+        if o.syms.at(i).bind == B_LOCAL {
+            first_global += 1;
+        }
+    }
+    // relocation sections
+    let mut nrel: u32 = 0;
+    for i in 0..o.secs.len {
+        if o.secs.get(i).relocs.len > 0 {
+            nrel += 1;
+        }
+    }
+    let symtab_index = @int_cast(u32, w.shdrs.len) + nrel;
+    for i in 0..o.secs.len {
+        let s = o.secs.get(i);
+        if s.relocs.len > 0 {
+            rela_section(&mut w, s, map, symtab_index);
+        }
+    }
+    // .symtab, .strtab, .note.GNU-stack, .shstrtab
+    let n_symtab = sec_name(&mut w, "", ".symtab");
+    w.out.align(8);
+    let so = @as(u64, w.out.len());
+    w.out.put(symtab.view());
+    w.shdrs.push(Shdr.{ name: n_symtab, ty: 2, flags: 0, off: so, size: @as(u64, symtab.len()), link: symtab_index + 1,
+                        info: first_global, align: 8, entsize: 24 });
+    let n_strtab = sec_name(&mut w, "", ".strtab");
+    let sto = @as(u64, w.out.len());
+    w.out.put(strtab.view());
+    w.shdrs.push(Shdr.{ name: n_strtab, ty: 3, flags: 0, off: sto, size: @as(u64, strtab.len()), link: 0, info: 0,
+                        align: 1, entsize: 0 });
+    let n_note = sec_name(&mut w, "", ".note.GNU-stack");
+    w.shdrs.push(Shdr.{ name: n_note, ty: 1, flags: 0, off: @as(u64, w.out.len()), size: 0, link: 0, info: 0, align: 1,
+                        entsize: 0 });
+    let n_shstr = sec_name(&mut w, "", ".shstrtab");
+    let sho = @as(u64, w.out.len());
+    w.out.put(w.shstr.view());
+    w.shdrs.push(Shdr.{ name: n_shstr, ty: 3, flags: 0, off: sho, size: @as(u64, w.shstr.len()), link: 0, info: 0,
+                        align: 1, entsize: 0 });
+    finish(&mut w, o.machine);
+    let r = u.dup(w.out.view());
+    w.out.free();
+    w.shstr.free();
+    strtab.free();
+    symtab.free();
+    w.shdrs.deinit();
+    return r;
+}
+
+// The symbol table (null, then the locals, then the globals) and its
+// strings; map: each symbol's index in it.
+fn symbol_table(o: *Obj, symtab: *mut bn.Bytes, strtab: *mut bn.Bytes, map: []mut u32) void {
+    strtab.u8_(0);
     symtab.zeros(24);
     let nsym = o.syms.len;
-    let map = u.newn.[u32](nsym + 1);  // our index -> ELF index
     let mut k: u32 = 1;
     for pass in @as(i32, 0)..2 {
         for i in 0..nsym {
@@ -328,73 +393,31 @@ pub fn write(o: *mut Obj) []u8 {
             k += 1;
         }
     }
-    let mut first_global: u32 = 1;
-    for i in 0..nsym {
-        if o.syms.at(i).bind == B_LOCAL {
-            first_global += 1;
-        }
+}
+
+// A section's relocations (.rela<name>); map: symbols' indexes in the
+// symbol table, section symtab_index.
+fn rela_section(w: *mut Writer, s: *Sec, map: []u32, symtab_index: u32) void {
+    let nm = sec_name(w, ".rela", s.name);
+    w.out.align(8);
+    let off = @as(u64, w.out.len());
+    for j in 0..s.relocs.len {
+        let r = s.relocs.get(j);
+        w.out.u64_(r.off);
+        w.out.u64_((@as(u64, map[@as(usize, r.sym)]) << 32) | @as(u64, r.ty));
+        w.out.u64_(@bit_cast(u64, r.addend));
     }
-    // relocation sections
-    let mut nrel: u32 = 0;
-    for i in 0..o.secs.len {
-        if o.secs.get(i).relocs.len > 0 {
-            nrel += 1;
-        }
-    }
-    let symtab_index = @int_cast(u32, shdrs.len) + nrel;
-    for i in 0..o.secs.len {
-        let s = o.secs.get(i);
-        if s.relocs.len == 0 {
-            continue;
-        }
-        let nm = @int_cast(u32, shstr.len());
-        shstr.put(".rela");
-        shstr.put(s.name);
-        shstr.u8_(0);
-        out.align(8);
-        let off = @as(u64, out.len());
-        for j in 0..s.relocs.len {
-            let r = s.relocs.get(j);
-            out.u64_(r.off);
-            out.u64_((@as(u64, map[@as(usize, r.sym)]) << 32) | @as(u64, r.ty));
-            out.u64_(@bit_cast(u64, r.addend));
-        }
-        shdrs.push(Shdr.{ name: nm, ty: 4, flags: 0x40, off: off, size: @as(u64, s.relocs.len) * 24, link: symtab_index,
-                          info: s.index, align: 8, entsize: 24 });
-    }
-    // .symtab, .strtab, .note.GNU-stack, .shstrtab
-    let n_symtab = @int_cast(u32, shstr.len());
-    shstr.put(".symtab");
-    shstr.u8_(0);
-    out.align(8);
-    let so = @as(u64, out.len());
-    out.put(symtab.view());
-    shdrs.push(Shdr.{ name: n_symtab, ty: 2, flags: 0, off: so, size: @as(u64, symtab.len()), link: symtab_index + 1,
-                      info: first_global, align: 8, entsize: 24 });
-    let n_strtab = @int_cast(u32, shstr.len());
-    shstr.put(".strtab");
-    shstr.u8_(0);
-    let sto = @as(u64, out.len());
-    out.put(strtab.view());
-    shdrs.push(Shdr.{ name: n_strtab, ty: 3, flags: 0, off: sto, size: @as(u64, strtab.len()), link: 0, info: 0,
-                      align: 1, entsize: 0 });
-    let n_note = @int_cast(u32, shstr.len());
-    shstr.put(".note.GNU-stack");
-    shstr.u8_(0);
-    shdrs.push(Shdr.{ name: n_note, ty: 1, flags: 0, off: @as(u64, out.len()), size: 0, link: 0, info: 0, align: 1,
-                      entsize: 0 });
-    let n_shstr = @int_cast(u32, shstr.len());
-    shstr.put(".shstrtab");
-    shstr.u8_(0);
-    let sho = @as(u64, out.len());
-    out.put(shstr.view());
-    shdrs.push(Shdr.{ name: n_shstr, ty: 3, flags: 0, off: sho, size: @as(u64, shstr.len()), link: 0, info: 0, align: 1,
-                      entsize: 0 });
-    // section headers
+    w.shdrs.push(Shdr.{ name: nm, ty: 4, flags: 0x40, off: off, size: @as(u64, s.relocs.len) * 24, link: symtab_index,
+                        info: s.index, align: 8, entsize: 24 });
+}
+
+// The section headers, and the ELF header (in the 64 bytes left for it).
+fn finish(w: *mut Writer, machine: u32) void {
+    let out = &mut w.out;
     out.align(8);
     let shoff = @as(u64, out.len());
-    for i in 0..shdrs.len {
-        let h = shdrs.get(i);
+    for i in 0..w.shdrs.len {
+        let h = w.shdrs.get(i);
         out.u32_(@as(u64, h.name));
         out.u32_(@as(u64, h.ty));
         out.u64_(h.flags);
@@ -406,25 +429,14 @@ pub fn write(o: *mut Obj) []u8 {
         out.u64_(h.align);
         out.u64_(h.entsize);
     }
-    // ELF header
-    let hdr = out.view();
-    let ident = "\x7fELF\x02\x01\x01";
-    for i in 0..ident.len {
-        hdr[i] = ident[i];
-    }
-    out.set_u32(16, 1 | (@as(u64, o.machine) << 16));  // e_type REL, e_machine
+    bn.put_at(out.view(), 0, "\x7fELF\x02\x01\x01");
+    let n = @as(u64, w.shdrs.len);
+    out.set_u32(16, 1 | (@as(u64, machine) << 16));  // e_type REL, e_machine
     out.set_u32(20, 1);  // e_version
     out.set_u64(40, shoff);
     out.set_u32(52, 64);  // e_ehsize = 64, e_phentsize = 0
     out.set_u32(56, 0 | (@as(u64, 64) << 16));  // e_phnum = 0, e_shentsize = 64
-    out.set_u32(60, @as(u64, shdrs.len) | (@as(u64, shdrs.len - 1) << 16));  // e_shnum, e_shstrndx
-    let r = u.dup(out.view());
-    out.free();
-    shstr.free();
-    strtab.free();
-    symtab.free();
-    shdrs.deinit();
-    return r;
+    out.set_u32(60, n | ((n - 1) << 16));       // e_shnum, e_shstrndx
 }
 
 // -----------------------------------------------------------------------------

@@ -218,46 +218,16 @@ fn add_lib(soname: []u8, file: []u8) *mut Lib {
 // Symbols
 // -----------------------------------------------------------------------------
 
-// Functions of another system's libraries (an extern block naming a Windows
-// DLL or a macOS framework): they are the runtime's ax_unavailable, which
-// says so if it is ever called, so that a program can support several
-// systems and choose at run time. (Codegen leaves each function's library
-// in a constant axiom.import.<function>.)
-let mut foreign: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
-                                                   cap: 0, len: 0 };
-
-fn is_foreign(name: []u8) bool {
-    return foreign.get(u.intern(name)) != 0;
-}
-
+// Another system's library (an extern block naming a Windows DLL or a macOS
+// framework): its functions are the runtime's ax_unavailable
+// (nl.use_unavailable).
 fn is_foreign_lib(name: []u8) bool {
     return nl.is_windows_dll(name) or nl.is_apple_lib(name);
 }
 
-fn collect_foreign() void {
-    for oi in 0..nl.objs.len {
-        let o = nl.objs.get(oi);
-        for si in 0..o.syms.len {
-            let s = o.syms.get(si);
-            if (s.sec < 0) or not u.starts(s.name, "axiom.import.") {
-                continue;
-            }
-            let d = o.secs.get(@as(usize, @bit_cast(u32, s.sec))).data.view();
-            let mut e = @truncate(usize, s.value);
-            let start = e;
-            while (e < d.len) and (d[e] != 0) {
-                e += 1;
-            }
-            if is_foreign_lib(d[start..e]) {
-                foreign.put(u.intern(s.name[13..]), 1);
-            }
-        }
-    }
-}
-
 fn collect_symbols() void {
     nl.define_globals();
-    nl.use_unavailable(is_foreign);
+    nl.use_unavailable();
     // Undefined symbols come from the shared libraries.
     let mut verified = true;
     for i in 0..libs.len {
@@ -578,6 +548,19 @@ fn write_plt(b: []mut u8) void {
     }
 }
 
+// The libraries of the C library itself: naming one (-l) adds nothing to
+// libc.so.6 and libm.so.6.
+let LIBC_PARTS: [5][]u8 = ["c", "m", "pthread", "dl", "rt"];
+
+fn is_libc_part(name: []u8) bool {
+    for x in LIBC_PARTS {
+        if u.str_eq(x, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Does the program need nothing from shared libraries? (Every symbol it
 // uses is defined by its objects or the stubs, or is one the runtime uses
 // only when the C library is there.)
@@ -586,14 +569,7 @@ fn needs_nothing(lib_names: [][]u8) bool {
         if is_foreign_lib(name) {
             continue;
         }
-        let builtin = ["c", "m", "pthread", "dl", "rt"];
-        let mut known = false;
-        for x in builtin {
-            if u.str_eq(x, name) {
-                known = true;
-            }
-        }
-        if not known or u.str_eq(name, "c") or u.str_eq(name, "m") {
+        if not is_libc_part(name) or u.str_eq(name, "c") or u.str_eq(name, "m") {
             return false;  // (asked for explicitly)
         }
     }
@@ -615,7 +591,8 @@ fn needs_nothing(lib_names: [][]u8) bool {
                 continue;
             }
             let k = u.intern(sy.name);
-            if not defined.has(k) and not lstub.provides(k, M) and not lstub.libc_only(k) and not is_foreign(sy.name) {
+            if not defined.has(k) and not lstub.provides(k, M) and not lstub.libc_only(k) and
+               not nl.is_foreign(sy.name) {
                 return false;
             }
         }
@@ -627,15 +604,9 @@ fn needs_nothing(lib_names: [][]u8) bool {
 // links with the system toolchain.
 pub const LINK_FALLBACK: i32 = 2;
 
-// Links `inputs` into the executable `out`. `lib_names` are the libraries
-// the program names (-l). 0: done; 1: errors (reported); LINK_FALLBACK.
-pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) i32 {
-    M = machine;
-    nl.begin(inputs);
-    collect_foreign();
-    static_link = needs_nothing(lib_names);
-    nl.objs.push(lstub.build(machine, static_link));
-    nl.objs.push(elf.rets_bounds(machine));
+// The C library (unless the link is static), then the libraries the
+// program names. 0, 1 (errors) or LINK_FALLBACK, as link() returns.
+fn load_libs(lib_names: [][]u8) i32 {
     if not static_link {
         let libc = add_lib("libc.so.6", "libc.so.6");
         let libm = add_lib("libm.so.6", "libm.so.6");
@@ -646,14 +617,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         libc.used = true;
     }
     for name in lib_names {
-        let builtin = ["c", "m", "pthread", "dl", "rt"];
-        let mut skip = false;
-        for x in builtin {
-            if u.str_eq(x, name) {
-                skip = true;
-            }
-        }
-        if skip or is_foreign_lib(name) {
+        if is_libc_part(name) or is_foreign_lib(name) {
             continue;
         }
         let file = u.f1("lib%s.so", name);
@@ -669,6 +633,22 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         }
         l.used = true;
         libs.push(l);
+    }
+    return 0;
+}
+
+// Links `inputs` into the executable `out`. `lib_names` are the libraries
+// the program names (-l). 0: done; 1: errors (reported); LINK_FALLBACK.
+pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) i32 {
+    M = machine;
+    nl.begin(inputs);
+    _ = nl.extern_fns(is_foreign_lib);  // (the functions of other systems' libraries)
+    static_link = needs_nothing(lib_names);
+    nl.objs.push(lstub.build(machine, static_link));
+    nl.objs.push(elf.rets_bounds(machine));
+    let loaded = load_libs(lib_names);
+    if loaded != 0 {
+        return loaded;
     }
     let mut lsm: u32 = 0;
     if not static_link {
@@ -690,15 +670,49 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     if not static_link {
         lsm_slot = nl.got_slot_g(lsm, 0, 0);
     }
+    let ds = dynamic_strings();
+    let ly = lay_out(&ds);
+    let mut outb = bn.new_bytes();
+    outb.zeros(@truncate(usize, segs[2].off + segs[2].filesz));
+    let b = outb.view();
+    let rels = write_contents(b, &ly, got_addr + (@as(u64, @bit_cast(u32, lsm_slot)) * 8));
+    write_dynamic_tables(b, &ly, &ds, &rels);
+    write_headers(b, &ly);
+    if nl.errors != 0 {
+        return 1;
+    }
+    return write_file(b, &ly, out);
+}
 
-    // .dynstr
+// -----------------------------------------------------------------------------
+// Dynamic linking tables
+// -----------------------------------------------------------------------------
+
+// .dynstr, and the offsets in it that the other tables refer to.
+struct DynStr {
+    b: bn.Bytes,
+    needed: u.List.[u64],  // each DT_NEEDED library's name
+    lib_off: []mut u64,    // per library (used): its name
+    sym_off: []mut u64,    // per dynamic symbol: its name
+    // the symbol versions needed: each one's library, name and its offset
+    vn_lib: u.List.[u32],
+    vn_name: u.List.[[]u8],
+    vn_off: u.List.[u64],
+    n_vlibs: u64,  // the libraries with versions needed
+}
+
+// .dynstr: the libraries needed, the symbol versions they must have (which
+// sets each dynamic symbol's .gnu.version index), the dynamic symbols.
+fn dynamic_strings() DynStr {
     let mut dynstr = bn.new_bytes();
     dynstr.u8_(0);
     let mut needed = u.List.[u64].empty();
+    let lib_off = u.newn.[u64](libs.len + 1);
     for i in 0..libs.len {
         let l = libs.get(i);
         if l.used {
-            needed.push(@as(u64, dynstr.len()));
+            lib_off[i] = @as(u64, dynstr.len());
+            needed.push(lib_off[i]);
             dynstr.put(l.soname);
             dynstr.u8_(0);
         }
@@ -728,30 +742,62 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         }
         g.vidx = found;
     }
-    let lib_off = u.newn.[u64](libs.len + 1);
-    let mut k_needed: usize = 0;
-    for i in 0..libs.len {
-        if libs.get(i).used {
-            lib_off[i] = needed.get(k_needed);
-            k_needed += 1;
-        }
-    }
     let mut n_vlibs: u64 = 0;
     for i in 0..libs.len {
-        for k in 0..vn_lib.len {
-            if vn_lib.get(k) == @int_cast(u32, i) {
-                n_vlibs += 1;
-                break;
-            }
+        if versions_of(&vn_lib, i) > 0 {
+            n_vlibs += 1;
         }
     }
-    let verneed_size = (n_vlibs * 16) + (@as(u64, vn_lib.len) * 16);
-    let name_off = u.newn.[u64](dyn_syms.len + 1);
+    let sym_off = u.newn.[u64](dyn_syms.len + 1);
     for i in 0..dyn_syms.len {
-        name_off[i] = @as(u64, dynstr.len());
+        sym_off[i] = @as(u64, dynstr.len());
         dynstr.put(nl.gsyms.at(@as(usize, dyn_syms.get(i))).name);
         dynstr.u8_(0);
     }
+    return DynStr.{ b: dynstr, needed: needed, lib_off: lib_off, sym_off: sym_off, vn_lib: vn_lib, vn_name: vn_name,
+                    vn_off: vn_off, n_vlibs: n_vlibs };
+}
+
+// How many of the versions needed are library i's.
+fn versions_of(vn_lib: *u.List.[u32], i: usize) u64 {
+    let mut cnt: u64 = 0;
+    for k in 0..vn_lib.len {
+        if vn_lib.get(k) == @int_cast(u32, i) {
+            cnt += 1;
+        }
+    }
+    return cnt;
+}
+
+// -----------------------------------------------------------------------------
+// Layout and the executable
+// -----------------------------------------------------------------------------
+
+// Where the link puts things (beyond segs, plt_addr, got_addr and the TLS
+// template, which relocation uses too).
+struct Layout {
+    interp: []u8,  // "" for a static program
+    has_tls: bool,
+    phnum: u64,
+    nsyms: u64,  // .dynsym's entries (with the null symbol)
+    interp_off: u64,
+    dynsym_off: u64,
+    dynstr_off: u64,
+    hash_off: u64,
+    versym_off: u64,
+    verneed_off: u64,
+    rela_off: u64,
+    start: u64,     // _start
+    dyn_addr: u64,  // .dynamic
+    dyn_off: u64,
+    n_dyn: u64,  // its entries
+    tdata_end: u64,
+    main_tls: u64,  // a static program's main thread: its TLS block
+    main_tp: u64,   // and thread pointer
+}
+
+// Places everything: the segments (segs), the tables in them, the sections.
+fn lay_out(ds: *DynStr) Layout {
     let mut interp = u.pick(is_x64(), "/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1");
     if static_link {
         interp = "";
@@ -778,9 +824,10 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     let interp_off = 64 + (phnum * 56);
     let dynsym_off = nl.align_up(interp_off + @as(u64, interp.len) + 1, 8);
     let dynstr_off = dynsym_off + (nsyms * 24);
-    let hash_off = nl.align_up(dynstr_off + @as(u64, dynstr.len()), 8);
+    let hash_off = nl.align_up(dynstr_off + @as(u64, ds.b.len()), 8);
     let versym_off = nl.align_up(hash_off + (4 * (2 + 1 + nsyms)), 2);
     let verneed_off = nl.align_up(versym_off + (2 * nsyms), 8);
+    let verneed_size = (ds.n_vlibs * 16) + (@as(u64, ds.vn_lib.len) * 16);
     let rela_off = nl.align_up(verneed_off + verneed_size, 8);
     let rela_size = (n_rela + n_got_dyn) * 24;
     segs[0] = Seg.{ vaddr: BASE, off: 0, filesz: 0, memsz: 0 };
@@ -799,7 +846,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     // Segment 3 (RW): .dynamic, .got, .data, .tdata; .bss after the file.
     segs[2] = next_seg(&segs[1], segs[1].off + segs[1].filesz);
     let dyn_addr = segs[2].vaddr;
-    let n_dyn = @as(u64, needed.len) + 16;
+    let n_dyn = @as(u64, ds.needed.len) + 16;
     got_addr = nl.align_up(dyn_addr + (n_dyn * 16), 8);
     let data_end = nl.place(nl.C_DATA, got_addr + (@as(u64, nl.got_dyn.len) * 8));
     tls_align = nl.class_align(nl.C_TDATA);
@@ -834,34 +881,36 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     let bss_end = nl.place(nl.C_BSS, file_end3);
     segs[2].filesz = file_end3 - segs[2].vaddr;
     segs[2].memsz = bss_end - segs[2].vaddr;
+    return Layout.{ interp: interp, has_tls: has_tls, phnum: phnum, nsyms: nsyms, interp_off: interp_off,
+                    dynsym_off: dynsym_off, dynstr_off: dynstr_off, hash_off: hash_off, versym_off: versym_off,
+                    verneed_off: verneed_off, rela_off: rela_off, start: start, dyn_addr: dyn_addr,
+                    dyn_off: file_of(dyn_addr), n_dyn: n_dyn, tdata_end: tdata_end, main_tls: main_tls,
+                    main_tp: main_tp };
+}
 
-    let total = segs[2].off + segs[2].filesz;
-    let mut outb = bn.new_bytes();
-    outb.zeros(@truncate(usize, total));
-    let b = outb.view();
-
-    // contents
+// The sections, _start, the PLT, the GOT and what the runtime needs, all
+// relocated; returns the dynamic relocations. lsm_got: the GOT slot of
+// __libc_start_main.
+fn write_contents(b: []mut u8, ly: *Layout, lsm_got: u64) u.List.[DynRel] {
     nl.copy_class(b, nl.C_CONST, file_of);
     nl.copy_class(b, nl.C_TEXT, file_of);
     nl.copy_class(b, nl.C_DATA, file_of);
     nl.copy_class(b, nl.C_TDATA, file_of);
-    let main_addr = nl.sym_addr(
-        @as(usize, @bit_cast(u32, nl.gsyms.at(@as(usize, mn)).obj)), nl.gsyms.at(@as(usize, mn)).sym);
+    let main_addr = nl.global_addr("main");
     if static_link {
-        lstub.write_start(b, file_of(start), start, nl.global_addr("axiom.start_sp"), main_tp, main_addr, M);
+        lstub.write_start(b, file_of(ly.start), ly.start, nl.global_addr("axiom.start_sp"), ly.main_tp, main_addr, M);
         // the main thread's TLS block starts as the template
-        let tsz = tdata_end - tls_addr;
+        let tsz = ly.tdata_end - tls_addr;
         for i in 0..@truncate(usize, tsz) {
-            b[@truncate(usize, file_of(main_tls)) + i] = b[@truncate(usize, file_of(tls_addr)) + i];
+            b[@truncate(usize, file_of(ly.main_tls)) + i] = b[@truncate(usize, file_of(tls_addr)) + i];
         }
     } else {
-        write_start(b, start, main_addr, got_addr + (@as(u64, @bit_cast(u32, lsm_slot)) * 8),
-                    nl.global_addr("axiom.start_sp"));
+        write_start(b, ly.start, main_addr, lsm_got, nl.global_addr("axiom.start_sp"));
     }
     // what the runtime needs to give a new thread its TLS block
     let ti = file_of(nl.global_addr("axiom.tls_info"));
     bn.w64(b, ti, tls_addr);
-    bn.w64(b, ti + 8, tdata_end - tls_addr);
+    bn.w64(b, ti + 8, ly.tdata_end - tls_addr);
     bn.w64(b, ti + 16, tls_memsz);
     bn.w64(b, ti + 24, tls_align);
     write_plt(b);
@@ -880,15 +929,17 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
             bn.w64(b, file_of(at), nl.sym_addr(@as(usize, nl.got_obj.get(i)), nl.got_sym.get(i)));
         }
     }
+    return rels;
+}
 
-    // .interp, .dynsym, .dynstr, .hash, .rela.dyn
-    for i in 0..interp.len {
-        b[@truncate(usize, interp_off) + i] = interp[i];
-    }
+// .interp, .dynsym, .dynstr, .hash, .gnu.version, .gnu.version_r,
+// .rela.dyn and .dynamic.
+fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[DynRel]) void {
+    bn.put_at(b, ly.interp_off, ly.interp);
     for i in 0..dyn_syms.len {
         let g = nl.gsyms.at(@as(usize, dyn_syms.get(i)));
-        let e = dynsym_off + ((@as(u64, i) + 1) * 24);
-        bn.w32(b, e, name_off[i]);
+        let e = ly.dynsym_off + ((@as(u64, i) + 1) * 24);
+        bn.w32(b, e, ds.sym_off[i]);
         let mut bind: u8 = elf.B_GLOBAL;
         if g.weak {
             bind = elf.B_WEAK;
@@ -899,32 +950,63 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         }
         b[@truncate(usize, e) + 4] = (bind << 4) | t;
     }
-    let ds = dynstr.view();
-    for i in 0..ds.len {
-        b[@truncate(usize, dynstr_off) + i] = ds[i];
-    }
-    bn.w32(b, hash_off, 1);          // nbucket
-    bn.w32(b, hash_off + 4, nsyms);  // nchain (the buckets and chains stay empty)
-    // .gnu.version, .gnu.version_r
+    bn.put_at(b, ly.dynstr_off, ds.b.view());
+    bn.w32(b, ly.hash_off, 1);             // nbucket
+    bn.w32(b, ly.hash_off + 4, ly.nsyms);  // nchain (the buckets and chains stay empty)
     for i in 0..dyn_syms.len {
-        bn.w16(b, versym_off + ((@as(u64, i) + 1) * 2), @as(u64, nl.gsyms.at(@as(usize, dyn_syms.get(i))).vidx));
+        bn.w16(b, ly.versym_off + ((@as(u64, i) + 1) * 2), @as(u64, nl.gsyms.at(@as(usize, dyn_syms.get(i))).vidx));
     }
-    let mut vo = verneed_off;
-    let mut left = n_vlibs;
+    write_verneed(b, ly.verneed_off, ds);
+    for i in 0..rels.len {
+        let r = rels.get(i);
+        let e = ly.rela_off + (@as(u64, i) * 24);
+        bn.w64(b, e, r.off);
+        bn.w64(b, e + 8, r.info);
+        bn.w64(b, e + 16, @bit_cast(u64, r.addend));
+    }
+
+    let mut dy = bn.new_bytes();
+    for i in 0..ds.needed.len {
+        dy.u64_(1);  // DT_NEEDED
+        dy.u64_(ds.needed.get(i));
+    }
+    let tags: [9]u64 = [4, 5, 6, 10, 11, 7, 8, 9, 30];
+    let vals: [9]u64 = [BASE + ly.hash_off, BASE + ly.dynstr_off, BASE + ly.dynsym_off, @as(u64, ds.b.len()), 24,
+                        BASE + ly.rela_off, @as(u64, rels.len) * 24, 24, 8];  // DF_BIND_NOW
+    for i in @as(usize, 0)..9 {
+        dy.u64_(tags[i]);
+        dy.u64_(vals[i]);
+    }
+    if ds.n_vlibs > 0 {
+        dy.u64_(0x6fff_fff0);  // DT_VERSYM
+        dy.u64_(BASE + ly.versym_off);
+        dy.u64_(0x6fff_fffe);  // DT_VERNEED
+        dy.u64_(BASE + ly.verneed_off);
+        dy.u64_(0x6fff_ffff);  // DT_VERNEEDNUM
+        dy.u64_(ds.n_vlibs);
+    }
+    dy.u64_(0x6fff_fffb);  // DT_FLAGS_1: DF_1_NOW
+    dy.u64_(1);
+    dy.u64_(21);  // DT_DEBUG
+    dy.u64_(0);
+    dy.u64_(0);  // DT_NULL
+    dy.u64_(0);
+    bn.put_at(b, ly.dyn_off, dy.view());
+}
+
+// .gnu.version_r at `at`: per library, the versions of it needed.
+fn write_verneed(b: []mut u8, at: u64, ds: *DynStr) void {
+    let mut vo = at;
+    let mut left = ds.n_vlibs;
     for i in 0..libs.len {
-        let mut cnt: u64 = 0;
-        for k in 0..vn_lib.len {
-            if vn_lib.get(k) == @int_cast(u32, i) {
-                cnt += 1;
-            }
-        }
+        let cnt = versions_of(&ds.vn_lib, i);
         if cnt == 0 {
             continue;
         }
         left -= 1;
         bn.w16(b, vo, 1);
         bn.w16(b, vo + 2, cnt);
-        bn.w32(b, vo + 4, lib_off[i]);
+        bn.w32(b, vo + 4, ds.lib_off[i]);
         bn.w32(b, vo + 8, 16);
         let mut next: u64 = 0;
         if left > 0 {
@@ -933,15 +1015,15 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         bn.w32(b, vo + 12, next);
         let mut ao = vo + 16;
         let mut done: u64 = 0;
-        for k in 0..vn_lib.len {
-            if vn_lib.get(k) != @int_cast(u32, i) {
+        for k in 0..ds.vn_lib.len {
+            if ds.vn_lib.get(k) != @int_cast(u32, i) {
                 continue;
             }
             done += 1;
-            bn.w32(b, ao, elf_hash(vn_name.get(k)));
+            bn.w32(b, ao, elf_hash(ds.vn_name.get(k)));
             bn.w16(b, ao + 4, 0);
             bn.w16(b, ao + 6, @as(u64, k) + 2);
-            bn.w32(b, ao + 8, vn_off.get(k));
+            bn.w32(b, ao + 8, ds.vn_off.get(k));
             let mut an: u64 = 0;
             if done < cnt {
                 an = 16;
@@ -951,54 +1033,17 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         }
         vo = ao;
     }
-    for i in 0..rels.len {
-        let r = rels.get(i);
-        let e = rela_off + (@as(u64, i) * 24);
-        bn.w64(b, e, r.off);
-        bn.w64(b, e + 8, r.info);
-        bn.w64(b, e + 16, @bit_cast(u64, r.addend));
-    }
+}
 
-    // .dynamic
-    let mut dy = bn.new_bytes();
-    for i in 0..needed.len {
-        dy.u64_(1);  // DT_NEEDED
-        dy.u64_(needed.get(i));
-    }
-    let tags: [9]u64 = [4, 5, 6, 10, 11, 7, 8, 9, 30];
-    let vals: [9]u64 = [BASE + hash_off, BASE + dynstr_off, BASE + dynsym_off, @as(u64, ds.len), 24, BASE + rela_off,
-                        @as(u64, rels.len) * 24, 24, 8];  // DF_BIND_NOW
-    for i in @as(usize, 0)..9 {
-        dy.u64_(tags[i]);
-        dy.u64_(vals[i]);
-    }
-    if n_vlibs > 0 {
-        dy.u64_(0x6fff_fff0);  // DT_VERSYM
-        dy.u64_(BASE + versym_off);
-        dy.u64_(0x6fff_fffe);  // DT_VERNEED
-        dy.u64_(BASE + verneed_off);
-        dy.u64_(0x6fff_ffff);  // DT_VERNEEDNUM
-        dy.u64_(n_vlibs);
-    }
-    dy.u64_(0x6fff_fffb);  // DT_FLAGS_1: DF_1_NOW
-    dy.u64_(1);
-    dy.u64_(21);  // DT_DEBUG
-    dy.u64_(0);
-    dy.u64_(0);  // DT_NULL
-    dy.u64_(0);
-    let dv = dy.view();
-    let dfo = file_of(dyn_addr);
-    for i in 0..dv.len {
-        b[@truncate(usize, dfo) + i] = dv[i];
-    }
-
-    // ELF header and program headers
+// The ELF header and program headers.
+fn write_headers(b: []mut u8, ly: *Layout) void {
+    let phnum = ly.phnum;
     let mut h = bn.new_bytes();
     h.put("\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
     h.u16_(2);  // ET_EXEC
     h.u16_(@as(u64, M));
     h.u32_(1);
-    h.u64_(start);
+    h.u64_(ly.start);
     h.u64_(64);  // e_phoff
     h.u64_(0);   // e_shoff
     h.u32_(0);
@@ -1010,7 +1055,8 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     h.u16_(0);
     phdr(&mut h, 6, 4, 64, BASE + 64, phnum * 56, phnum * 56, 8);  // PT_PHDR
     if not static_link {
-        phdr(&mut h, 3, 4, interp_off, BASE + interp_off, @as(u64, interp.len) + 1, @as(u64, interp.len) + 1, 1);
+        let n = @as(u64, ly.interp.len) + 1;
+        phdr(&mut h, 3, 4, ly.interp_off, BASE + ly.interp_off, n, n, 1);
     }
     let flags: [3]u64 = [4, 5, 6];
     for k in @as(usize, 0)..3 {
@@ -1018,23 +1064,25 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         phdr(&mut h, 1, flags[k], sg.off, sg.vaddr, sg.filesz, sg.memsz, PAGE);
     }
     if not static_link {
-        phdr(&mut h, 2, 6, dfo, dyn_addr, n_dyn * 16, n_dyn * 16, 8);  // PT_DYNAMIC
+        phdr(&mut h, 2, 6, ly.dyn_off, ly.dyn_addr, ly.n_dyn * 16, ly.n_dyn * 16, 8);  // PT_DYNAMIC
     }
-    if has_tls {
-        phdr(&mut h, 7, 4, segs[2].off + (tls_addr - segs[2].vaddr), tls_addr, tdata_end - tls_addr, tls_memsz,
+    if ly.has_tls {
+        phdr(&mut h, 7, 4, segs[2].off + (tls_addr - segs[2].vaddr), tls_addr, ly.tdata_end - tls_addr, tls_memsz,
              tls_align);
     }
     phdr(&mut h, 0x6474_e551, 6, 0, 0, 0, 0, 16);  // PT_GNU_STACK
-    let hv = h.view();
-    for i in 0..hv.len {
-        b[i] = hv[i];
-    }
-    if nl.errors != 0 {
-        return 1;
-    }
-    // a symbol table (for debuggers and profilers), with section headers
-    // over the segments for its symbols to refer to
-    let mut st = bn.new_bytes();
+    bn.put_at(b, 0, h.view());
+}
+
+// A symbol table (for debuggers and profilers): the local symbols, then
+// the others.
+struct SymTab {
+    syms: bn.Bytes,
+    strs: bn.Bytes,
+    nlocal: u64,
+}
+
+fn symbol_table() SymTab {
     let mut stl = bn.new_bytes();  // the local symbols, then the others
     let mut stg = bn.new_bytes();
     let mut str = bn.new_bytes();
@@ -1058,16 +1106,6 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
                 continue;  // a copy the link did not keep
             }
             let a = nl.sym_addr_in(oi, @int_cast(u32, si));
-            let mut shndx: u64 = 0xfff1;
-            if (a >= segs[1].vaddr) and (a < (segs[1].vaddr + segs[1].memsz)) {
-                shndx = 1;
-            } else if (a >= segs[0].vaddr) and (a < (segs[0].vaddr + segs[0].memsz)) {
-                shndx = 2;
-            } else if (a >= segs[2].vaddr) and (a < (segs[2].vaddr + segs[2].filesz)) {
-                shndx = 3;
-            } else if (a >= segs[2].vaddr) and (a < (segs[2].vaddr + segs[2].memsz)) {
-                shndx = 4;
-            }
             let mut e = &mut stg;
             let mut bind = sy.bind;
             if elf.is_part_name(sy.name) {
@@ -1080,24 +1118,49 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
             e.u32_(@as(u64, str.len()));
             e.u8_((bind << 4) | sy.ty);
             e.u8_(0);
-            e.u16_(shndx);
+            e.u16_(section_of(a));
             e.u64_(a);
             e.u64_(sy.size);
             str.put(elf.display_name(sy.name));
             str.u8_(0);
         }
     }
+    let mut st = bn.new_bytes();
     st.put(stl.view());
     st.put(stg.view());
+    return SymTab.{ syms: st, strs: str, nlocal: nlocal };
+}
+
+// The section header (of those write_file makes) an address is in.
+fn section_of(a: u64) u64 {
+    if (a >= segs[1].vaddr) and (a < (segs[1].vaddr + segs[1].memsz)) {
+        return 1;
+    }
+    if (a >= segs[0].vaddr) and (a < (segs[0].vaddr + segs[0].memsz)) {
+        return 2;
+    }
+    if (a >= segs[2].vaddr) and (a < (segs[2].vaddr + segs[2].filesz)) {
+        return 3;
+    }
+    if (a >= segs[2].vaddr) and (a < (segs[2].vaddr + segs[2].memsz)) {
+        return 4;
+    }
+    return 0xfff1;  // SHN_ABS
+}
+
+// Writes the executable b to `out`, with a symbol table and section headers
+// over the segments for its symbols to refer to.
+fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
+    let st = symbol_table();
     let mut shs = bn.new_bytes();
     shs.put("\x00.text\x00.rodata\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.dynamic\x00");
     let mut tail = bn.new_bytes();
     tail.put(b);
     let sym_off = nl.align_up(@as(u64, tail.len()), 8);
     tail.zeros(@truncate(usize, sym_off) - tail.len());
-    tail.put(st.view());
+    tail.put(st.syms.view());
     let str_off = @as(u64, tail.len());
-    tail.put(str.view());
+    tail.put(st.strs.view());
     let shs_off = @as(u64, tail.len());
     tail.put(shs.view());
     let sh_off = nl.align_up(@as(u64, tail.len()), 8);
@@ -1110,10 +1173,10 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
         [15, 1, 3, segs[2].vaddr, segs[2].off, segs[2].filesz, 0, 0, 8, 0],
         [21, 8, 3, segs[2].vaddr + segs[2].filesz, segs[2].off + segs[2].filesz, segs[2].memsz - segs[2].filesz, 0, 0,
          8, 0],
-        [26, 2, 0, 0, sym_off, @as(u64, st.len()), 6, nlocal, 8, 24],
-        [34, 3, 0, 0, str_off, @as(u64, str.len()), 0, 0, 1, 0],
+        [26, 2, 0, 0, sym_off, @as(u64, st.syms.len()), 6, st.nlocal, 8, 24],
+        [34, 3, 0, 0, str_off, @as(u64, st.strs.len()), 0, 0, 1, 0],
         [42, 3, 0, 0, shs_off, @as(u64, shs.len()), 0, 0, 1, 0],
-        [52, 6, 3, dyn_addr, dfo, n_dyn * 16, 0, 0, 8, 16],
+        [52, 6, 3, ly.dyn_addr, ly.dyn_off, ly.n_dyn * 16, 0, 0, 8, 16],
     ];
     for k in @as(usize, 0)..9 {
         let x = shdr[k];
