@@ -3257,19 +3257,7 @@ fn gen_call(v: *mut ir.Value) void {
     let fty = ir.fty_of(v);
     let n = v.xs.len;
     // arguments into registers (extended as the callee expects)
-    let regs = u.newn.[i32](n + 1);
-    for i in 0..n {
-        let x = v.xs.get(i);
-        let mut e: u8 = 0;
-        if (i + 1) < ir.ext_of(v).len {
-            e = ir.ext_of(v)[i + 1];
-        }
-        let mut r = reg(x);
-        if (e != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
-            r = ext_reg(r, x.ty.bits, e == 2, false);
-        }
-        regs[i] = r;
-    }
+    let regs = is.call_args(v, reg, ext_reg);
     let mut target: i32 = -1;
     if v.a.kind != ir.V_FUNC {
         target = reg(v.a);
@@ -3327,38 +3315,21 @@ fn gen_call(v: *mut ir.Value) void {
         _ = e2(xe.MOV_RI, 4, W(xe.RAX), I(@int_cast(i64, nx)));
         uses.push(R(xe.RAX));
     }
-    let mut ops = u.List.[mc.MOp].empty();
-    if target >= 0 {
-        ops.push(R(target));
-    } else {
-        ops.push(mc.symop(func_sym(ir.fnp_of(v.a)), 0));
-    }
-    for k in 0..uses.len {
-        ops.push(uses.get(k));
-    }
     let rt = fty.ret;
-    let has_ret = rt.kind != ir.T_VOID;
-    let mut rreg = xe.RAX;
-    if has_ret and (class_of(rt) == XMM) {
-        rreg = xe.XMM0;
-    }
-    if has_ret {
-        ops.push(W(rreg));
-    }
-    let ci = emit(xe.CALL, 0, ops.items());
-    ci.aux = ft.call_aux(v);  // (frame tables)
-    ci.clobber = caller_saved();
-    if (v.a.kind == ir.V_FUNC) and ir.fnp_of(v.a).noreturn {
-        ci.clobber = 0;  // nothing is live after it
-    }
-    em.MF.has_calls = true;
-    if has_ret {
-        let d = vreg(v);
+    let mut rreg: i32 = -1;
+    if rt.kind != ir.T_VOID {
+        rreg = xe.RAX;
         if class_of(rt) == XMM {
-            copy(d, xe.XMM0, XMM);
-        } else {
-            copy(d, xe.RAX, GPR);
+            rreg = xe.XMM0;
         }
+    }
+    let mut ops = is.call_ops(v, target, &uses, func_sym, rreg);
+    let ci = emit(xe.CALL, 0, ops.items());
+    is.finish_call(em.MF, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
+    if rreg == xe.XMM0 {
+        copy(vreg(v), xe.XMM0, XMM);
+    } else if rreg >= 0 {
+        copy(vreg(v), xe.RAX, GPR);
     }
     uses.deinit();
     ops.deinit();
@@ -3368,9 +3339,7 @@ fn gen_call(v: *mut ir.Value) void {
 // Integer intrinsics
 // -----------------------------------------------------------------------------
 fn gen_int_intr(v: *mut ir.Value, id: i32) void {
-    let t = v.ty;
-    let bits = t.bits;
-    let sz = isz(t);
+    let sz = isz(v.ty);
     let d = vreg(v);
     let a0 = v.xs.get(0);
     if (id == ir.IN_UMUL_OV) or (id == ir.IN_SMUL_OV) {
@@ -3402,61 +3371,11 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if id == ir.IN_CTLZ {
-        let x = reg_ext(a0, false);
-        if tg.has(tg.X_LZCNT) {
-            _ = bitscan(sz, d, x, 3);
-            if bits < 32 {
-                _ = alu(xe.ALU_SUB, 4, RW(d), I(@as(i64, 32 - bits)));
-            }
-            return;
-        }
-        let wbits = @as(i64, sz) * 8;
-        if nonzero_at(a0, v.blk) {
-            // bits - 1 - bsr(x), bsr(x) in [0, bits - 1]
-            _ = bitscan(sz, d, x, 1);
-            _ = alu(xe.ALU_XOR, sz, RW(d), I(wbits - 1));
-            if bits < 32 {
-                _ = alu(xe.ALU_SUB, 4, RW(d), I(@as(i64, 32 - bits)));
-            }
-            return;
-        }
-        // bits - 1 - bsr(x), with bsr(0) taken as -1
-        let m1 = vgpr();
-        _ = e2(xe.MOV_RI, sz, W(m1), I(-1));
-        let b = vgpr();
-        _ = bitscan(sz, b, x, 1);
-        let c = e2(xe.CMOV, sz, RW(b), R(m1));
-        c.cc = xe.CC_E;
-        _ = e2(xe.MOV_RI, sz, W(d), I(wbits - 1));
-        _ = alu(xe.ALU_SUB, sz, RW(d), R(b));
-        if bits < 32 {
-            _ = alu(xe.ALU_SUB, 4, RW(d), I(@as(i64, 32 - bits)));
-        }
+        gen_ctlz(v, d, a0, sz);
         return;
     }
     if id == ir.IN_CTTZ {
-        let mut x = reg(a0);
-        if bits < 32 {
-            let y = vgpr();
-            copy(y, x, GPR);
-            _ = alu(xe.ALU_OR, 4, RW(y), I(@as(i64, 1) << @int_cast(u32, bits)));
-            x = y;
-        }
-        if tg.has(tg.X_BMI1) {
-            _ = bitscan(sz, d, x, 2);
-            return;
-        }
-        if (bits < 32) or nonzero_at(a0, v.blk) {
-            // bsf alone: x is not zero (a bit set above a narrow x, or a
-            // loop over the set bits of a mask)
-            _ = bitscan(sz, d, x, 0);
-            return;
-        }
-        let w = vgpr();
-        _ = e2(xe.MOV_RI, 4, W(w), I(@as(i64, sz) * 8));
-        _ = bitscan(sz, d, x, 0);
-        let c = e2(xe.CMOV, sz, RW(d), R(w));
-        c.cc = xe.CC_E;
+        gen_cttz(v, d, a0, sz);
         return;
     }
     if id == ir.IN_CTPOP {
@@ -3475,71 +3394,11 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if (id == ir.IN_ROTL) or (id == ir.IN_ROTR) {
-        let x = reg(a0);
-        let k = v.xs.get(1);
-        let mut rsz = sz;
-        if bits == 8 {
-            rsz = 1;
-        } else if bits == 16 {
-            rsz = 2;
-        }
-        let mut digit: i32 = 0;
-        if id == ir.IN_ROTR {
-            digit = 1;
-        }
-        copy(d, x, GPR);
-        if is.is_c(k) {
-            let i = e3(xe.SHIFT, rsz, RW(d), NONE(), I(is.cval(k) & @as(i64, bits - 1)));
-            i.cc = digit;
-        } else {
-            _ = e2(xe.MOV_RR, 8, W(xe.RCX), R(reg(k)));
-            let i = e3(xe.SHIFT, rsz, RW(d), R(xe.RCX), NONE());
-            i.cc = digit;
-        }
+        gen_rotate(v, id, d);
         return;
     }
     if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
-        // compared at their own width (no extensions), a constant as an
-        // immediate; cmov at 32 or 64 bits
-        let mut x = a0;
-        let mut y = v.xs.get(1);
-        if is.is_c(x) and not is.is_c(y) {
-            x = v.xs.get(1);
-            y = a0;
-        }
-        let mut csz = sz;
-        if bits == 8 {
-            csz = 1;
-        } else if bits == 16 {
-            csz = 2;
-        }
-        let a = reg(x);
-        if is.is_c(y) and imm_ok(y) and (x.uses > 1) {
-            // the constant into d, then x where x wins: no copy of x, which
-            // lives on (min(n, 3) with n used after); with x ending here, d
-            // takes x's register and the constant's (hoisted) is cmoved in
-            _ = alu(xe.ALU_CMP, csz, R(a), I(narrow_imm(is.cval(y), csz)));
-            _ = e2(xe.MOV_RI, 8, W(d), I(is.cval(y)));
-            let m = e2(xe.CMOV, sz, RW(d), R(a));
-            if id == ir.IN_SMIN {
-                m.cc = xe.CC_LE;
-            } else if id == ir.IN_SMAX {
-                m.cc = xe.CC_GE;
-            } else if id == ir.IN_UMIN {
-                m.cc = xe.CC_BE;
-            } else {
-                m.cc = xe.CC_AE;
-            }
-            return;
-        }
-        let b = imm_reg(y);
-        if imm_ok(y) {
-            _ = alu(xe.ALU_CMP, csz, R(a), I(narrow_imm(is.cval(y), csz)));
-        } else {
-            _ = alu(xe.ALU_CMP, csz, R(a), R(b));
-        }
-        copy(d, a, GPR);  // (after the compare: a may end there)
-        minmax_cmov(id, sz, d, b);
+        gen_minmax(v, id, d);
         return;
     }
     if id == ir.IN_ABS {
@@ -3552,73 +3411,193 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
-        let sg = (id == ir.IN_SADD_SAT) or (id == ir.IN_SSUB_SAT);
-        let is_add = (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT);
-        let mut add_sub = xe.ALU_SUB;
-        if is_add {
-            add_sub = xe.ALU_ADD;
-        }
-        if bits < 64 {
-            // exact in 64 bits, then clamped
-            let a = ext_reg(reg(a0), bits, sg, true);
-            let b = ext_reg(reg(v.xs.get(1)), bits, sg, true);
-            let mut a64 = a;
-            let mut b64 = b;
-            if not sg and (bits == 32) {
-                a64 = a;
-                b64 = b;
-            }
-            let r = vgpr();
-            copy(r, a64, GPR);
-            _ = alu(add_sub, 8, RW(r), R(b64));
-            let mut lo: i64 = 0;
-            let mut hi: i64 = 0;
-            if sg {
-                lo = -(@as(i64, 1) << @int_cast(u32, bits - 1));
-                hi = (@as(i64, 1) << @int_cast(u32, bits - 1)) - 1;
-            } else {
-                hi = (@as(i64, 1) << @int_cast(u32, bits)) - 1;
-            }
-            let lr = vgpr();
-            let hr = vgpr();
-            _ = e2(xe.MOV_RI, 8, W(lr), I(lo));
-            _ = e2(xe.MOV_RI, 8, W(hr), I(hi));
-            _ = alu(xe.ALU_CMP, 8, R(r), R(lr));
-            let m1 = e2(xe.CMOV, 8, RW(r), R(lr));
-            m1.cc = xe.CC_L;
-            _ = alu(xe.ALU_CMP, 8, R(r), R(hr));
-            let m2 = e2(xe.CMOV, 8, RW(r), R(hr));
-            m2.cc = xe.CC_G;
-            copy(d, r, GPR);
-            return;
-        }
-        let a = reg(a0);
-        let b = reg(v.xs.get(1));
-        copy(d, a, GPR);
-        let sat = vgpr();
-        if sg {
-            // saturation value from a's sign: a < 0 ? MIN : MAX
-            copy(sat, a, GPR);
-            let s = e3(xe.SHIFT, 8, RW(sat), NONE(), I(63));
-            s.cc = 7;
-            let mx = vgpr();
-            _ = e2(xe.MOV_RI, 8, W(mx), I(9223372036854775807));
-            _ = alu(xe.ALU_XOR, 8, RW(sat), R(mx));
-        } else if is_add {
-            _ = e2(xe.MOV_RI, 8, W(sat), I(-1));
-        } else {
-            _ = e2(xe.MOV_RI, 4, W(sat), I(0));
-        }
-        _ = alu(add_sub, 8, RW(d), R(b));
-        let m = e2(xe.CMOV, 8, RW(d), R(sat));
-        if sg {
-            m.cc = xe.CC_O;
-        } else {
-            m.cc = xe.CC_B;
-        }
+        gen_sat(v, id, d);
         return;
     }
     em.fail(u.f1("integer intrinsic %s", u.idec(id)));
+}
+
+// d = ctlz(a0), sz the operand size.
+fn gen_ctlz(v: *mut ir.Value, d: i32, a0: *mut ir.Value, sz: u8) void {
+    let bits = v.ty.bits;
+    let x = reg_ext(a0, false);
+    if tg.has(tg.X_LZCNT) {
+        _ = bitscan(sz, d, x, 3);
+        if bits < 32 {
+            _ = alu(xe.ALU_SUB, 4, RW(d), I(@as(i64, 32 - bits)));
+        }
+        return;
+    }
+    let wbits = @as(i64, sz) * 8;
+    if nonzero_at(a0, v.blk) {
+        // bits - 1 - bsr(x), bsr(x) in [0, bits - 1]
+        _ = bitscan(sz, d, x, 1);
+        _ = alu(xe.ALU_XOR, sz, RW(d), I(wbits - 1));
+        if bits < 32 {
+            _ = alu(xe.ALU_SUB, 4, RW(d), I(@as(i64, 32 - bits)));
+        }
+        return;
+    }
+    // bits - 1 - bsr(x), with bsr(0) taken as -1
+    let m1 = vgpr();
+    _ = e2(xe.MOV_RI, sz, W(m1), I(-1));
+    let b = vgpr();
+    _ = bitscan(sz, b, x, 1);
+    let c = e2(xe.CMOV, sz, RW(b), R(m1));
+    c.cc = xe.CC_E;
+    _ = e2(xe.MOV_RI, sz, W(d), I(wbits - 1));
+    _ = alu(xe.ALU_SUB, sz, RW(d), R(b));
+    if bits < 32 {
+        _ = alu(xe.ALU_SUB, 4, RW(d), I(@as(i64, 32 - bits)));
+    }
+}
+
+// d = cttz(a0), sz the operand size.
+fn gen_cttz(v: *mut ir.Value, d: i32, a0: *mut ir.Value, sz: u8) void {
+    let bits = v.ty.bits;
+    let mut x = reg(a0);
+    if bits < 32 {
+        let y = vgpr();
+        copy(y, x, GPR);
+        _ = alu(xe.ALU_OR, 4, RW(y), I(@as(i64, 1) << @int_cast(u32, bits)));
+        x = y;
+    }
+    if tg.has(tg.X_BMI1) {
+        _ = bitscan(sz, d, x, 2);
+        return;
+    }
+    if (bits < 32) or nonzero_at(a0, v.blk) {
+        // bsf alone: x is not zero (a bit set above a narrow x, or a
+        // loop over the set bits of a mask)
+        _ = bitscan(sz, d, x, 0);
+        return;
+    }
+    let w = vgpr();
+    _ = e2(xe.MOV_RI, 4, W(w), I(@as(i64, sz) * 8));
+    _ = bitscan(sz, d, x, 0);
+    let c = e2(xe.CMOV, sz, RW(d), R(w));
+    c.cc = xe.CC_E;
+}
+
+// d = v, a rotate left or right (id) of its first argument.
+fn gen_rotate(v: *mut ir.Value, id: i32, d: i32) void {
+    let bits = v.ty.bits;
+    let a0 = v.xs.get(0);
+    let x = reg(a0);
+    let k = v.xs.get(1);
+    let rsz = cmp_size(v.ty);
+    let mut digit: i32 = 0;
+    if id == ir.IN_ROTR {
+        digit = 1;
+    }
+    copy(d, x, GPR);
+    if is.is_c(k) {
+        let i = e3(xe.SHIFT, rsz, RW(d), NONE(), I(is.cval(k) & @as(i64, bits - 1)));
+        i.cc = digit;
+    } else {
+        _ = e2(xe.MOV_RR, 8, W(xe.RCX), R(reg(k)));
+        let i = e3(xe.SHIFT, rsz, RW(d), R(xe.RCX), NONE());
+        i.cc = digit;
+    }
+}
+
+// d = v, the signed or unsigned minimum or maximum (id) of its arguments.
+fn gen_minmax(v: *mut ir.Value, id: i32, d: i32) void {
+    let sz = isz(v.ty);
+    let a0 = v.xs.get(0);
+    // compared at their own width (no extensions), a constant as an
+    // immediate; cmov at 32 or 64 bits
+    let mut x = a0;
+    let mut y = v.xs.get(1);
+    if is.is_c(x) and not is.is_c(y) {
+        x = v.xs.get(1);
+        y = a0;
+    }
+    let csz = cmp_size(v.ty);
+    let a = reg(x);
+    if is.is_c(y) and imm_ok(y) and (x.uses > 1) {
+        // the constant into d, then x where x wins: no copy of x, which
+        // lives on (min(n, 3) with n used after); with x ending here, d
+        // takes x's register and the constant's (hoisted) is cmoved in
+        _ = alu(xe.ALU_CMP, csz, R(a), I(narrow_imm(is.cval(y), csz)));
+        _ = e2(xe.MOV_RI, 8, W(d), I(is.cval(y)));
+        let m = e2(xe.CMOV, sz, RW(d), R(a));
+        if id == ir.IN_SMIN {
+            m.cc = xe.CC_LE;
+        } else if id == ir.IN_SMAX {
+            m.cc = xe.CC_GE;
+        } else if id == ir.IN_UMIN {
+            m.cc = xe.CC_BE;
+        } else {
+            m.cc = xe.CC_AE;
+        }
+        return;
+    }
+    let b = imm_reg(y);
+    if imm_ok(y) {
+        _ = alu(xe.ALU_CMP, csz, R(a), I(narrow_imm(is.cval(y), csz)));
+    } else {
+        _ = alu(xe.ALU_CMP, csz, R(a), R(b));
+    }
+    copy(d, a, GPR);  // (after the compare: a may end there)
+    minmax_cmov(id, sz, d, b);
+}
+
+// d = v, the saturating signed or unsigned sum or difference (id) of its
+// arguments.
+fn gen_sat(v: *mut ir.Value, id: i32, d: i32) void {
+    let bits = v.ty.bits;
+    let a0 = v.xs.get(0);
+    let sg = (id == ir.IN_SADD_SAT) or (id == ir.IN_SSUB_SAT);
+    let is_add = (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT);
+    let mut add_sub = xe.ALU_SUB;
+    if is_add {
+        add_sub = xe.ALU_ADD;
+    }
+    if bits < 64 {
+        // exact in 64 bits, then clamped
+        let a = ext_reg(reg(a0), bits, sg, true);
+        let b = ext_reg(reg(v.xs.get(1)), bits, sg, true);
+        let r = vgpr();
+        copy(r, a, GPR);
+        _ = alu(add_sub, 8, RW(r), R(b));
+        let lr = vgpr();
+        let hr = vgpr();
+        _ = e2(xe.MOV_RI, 8, W(lr), I(is.sat_min(bits, sg)));
+        _ = e2(xe.MOV_RI, 8, W(hr), I(is.sat_max(bits, sg)));
+        _ = alu(xe.ALU_CMP, 8, R(r), R(lr));
+        let m1 = e2(xe.CMOV, 8, RW(r), R(lr));
+        m1.cc = xe.CC_L;
+        _ = alu(xe.ALU_CMP, 8, R(r), R(hr));
+        let m2 = e2(xe.CMOV, 8, RW(r), R(hr));
+        m2.cc = xe.CC_G;
+        copy(d, r, GPR);
+        return;
+    }
+    let a = reg(a0);
+    let b = reg(v.xs.get(1));
+    copy(d, a, GPR);
+    let sat = vgpr();
+    if sg {
+        // saturation value from a's sign: a < 0 ? MIN : MAX
+        copy(sat, a, GPR);
+        let s = e3(xe.SHIFT, 8, RW(sat), NONE(), I(63));
+        s.cc = 7;
+        let mx = vgpr();
+        _ = e2(xe.MOV_RI, 8, W(mx), I(9223372036854775807));
+        _ = alu(xe.ALU_XOR, 8, RW(sat), R(mx));
+    } else if is_add {
+        _ = e2(xe.MOV_RI, 8, W(sat), I(-1));
+    } else {
+        _ = e2(xe.MOV_RI, 4, W(sat), I(0));
+    }
+    _ = alu(add_sub, 8, RW(d), R(b));
+    let m = e2(xe.CMOV, 8, RW(d), R(sat));
+    if sg {
+        m.cc = xe.CC_O;
+    } else {
+        m.cc = xe.CC_B;
+    }
 }
 
 // d = b where the compare of d (a) with b says b is the minimum / maximum.
@@ -5274,123 +5253,13 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         copy(vreg(v), r, GPR);
         return;
     }
-    if ((id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_BITMASK)) and (VL == 64) {
-        // AVX-512: through a mask register
-        let d = vreg(v);
-        let a = reg(a0);
-        let k = lk(at);
-        if id != ir.IN_BITMASK {
-            // the lanes not zero (any) or zero (all) into k1; kortest
-            materialize_cc(d, ptest_cc(v));
-            return;
-        }
-        _ = sse4(xe.VPMOVB2M + k, 64, W(xe.K1), R(a), NONE(), NONE());
-        let r = vgpr();
-        _ = sse4(xe.KMOVQ_RK, 8, W(r), R(xe.K1), NONE(), NONE());
-        copy(d, r, GPR);
-        return;
-    }
     if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) or (id == ir.IN_BITMASK) {
-        let d = vreg(v);
-        let a = reg(a0);
-        let k = lk(at);
-        if id == ir.IN_BITMASK {
-            if is.lane_float(at) or (k >= 2) {
-                if k == 2 {
-                    _ = sse2(xe.MOVMSKPS, W(d), R(a));
-                } else {
-                    _ = sse2(xe.MOVMSKPD, W(d), R(a));
-                }
-                return;
-            }
-            let mut x = a;
-            if k == 1 {
-                x = vxmm();
-                sse3(xe.PACKSSWB, x, a, R(a));
-            }
-            _ = sse2(xe.PMOVMSKB, W(d), R(x));
-            if k == 1 {
-                _ = alu(xe.ALU_AND, 4, RW(d), I(0xff));
-            }
-            return;
-        }
-        if ptest_cond(v) {
-            materialize_cc(d, ptest_cc(v));
-            return;
-        }
-        let z = vxmm();
-        vzero(z);
-        if id == ir.IN_ANYTRUE {
-            // some byte nonzero: not all bytes equal to zero
-            let e = vxmm();
-            sse3(xe.PCMPEQB, e, a, R(z));
-            let m = vgpr();
-            _ = sse2(xe.PMOVMSKB, W(m), R(e));
-            let mut all: i64 = 0xffff;
-            if VL == 32 {
-                all = -1;  // (32 bytes: 32 bits, the immediate sign-extended)
-            }
-            _ = alu(xe.ALU_CMP, 4, R(m), I(all));
-            materialize_cc(d, xe.CC_NE);
-            return;
-        }
-        // all lanes nonzero: no lane equal to zero
-        let e = vxmm();
-        if k == 3 {
-            if has41() {
-                sse3(xe.PCMPEQQ, e, a, R(z));
-            } else {
-                let e1_ = vxmm();
-                sse3(xe.PCMPEQD, e1_, a, R(z));
-                let sw = vxmm();
-                _ = sse_i(xe.PSHUFD, W(sw), R(e1_), 0xb1);
-                sse3(xe.PAND, e, e1_, R(sw));
-            }
-        } else {
-            sse3(xe.PCMPEQB + k, e, a, R(z));
-        }
-        let m = vgpr();
-        _ = sse2(xe.PMOVMSKB, W(m), R(e));
-        _ = e2(xe.TEST, 4, R(m), R(m));
-        materialize_cc(d, xe.CC_E);
+        gen_lane_test(v, id);
         return;
     }
     let d = vreg(v);
-    if (id == ir.IN_SWIZZLE) and not tg.has(tg.X_SSSE3) {
-        // byte by byte through memory
-        let a = reg(a0);
-        let idx = reg(v.xs.get(1));
-        let sx = vec_slot();
-        let si = vec_slot();
-        let sr = vec_slot();
-        _ = sse2(xe.MOVDQU_ST, R(a), mc.mem_slot(sx, 0));
-        _ = sse2(xe.MOVDQU_ST, R(idx), mc.mem_slot(si, 0));
-        for lane in @as(i64, 0)..16 {
-            let t = vgpr();
-            let b = vgpr();
-            let li = e2(xe.LOAD, 1, W(t), mc.mem_slot(si, lane));
-            li.cc = 1;
-            _ = e2(xe.MOV_RI, 4, W(b), I(0));
-            _ = alu(xe.ALU_CMP, 4, R(t), I(16));
-            let skip = new_label();
-            jcc(xe.CC_AE, skip);
-            let mut m = mc.mem_slot(sx, 0);
-            m.index = t;
-            m.scale = 1;
-            let lb = e2(xe.LOAD, 1, W(b), m);
-            lb.cc = 1;
-            place(skip);
-            _ = e2(xe.STORE, 1, mc.mem_slot(sr, lane), R(b));
-        }
-        _ = sse2(xe.MOVDQU_LD, W(d), mc.mem_slot(sr, 0));
-        return;
-    }
     if id == ir.IN_SWIZZLE {
-        let a = reg(a0);
-        let idx = reg(v.xs.get(1));
-        let adj = vxmm();
-        sse3(xe.PADDUSB, adj, idx, const16(0x7070_7070_7070_7070, 0x7070_7070_7070_7070));
-        sse3(xe.PSHUFB, d, a, R(adj));
+        gen_swizzle(v, d);
         return;
     }
     if id == ir.IN_DOT_I16 {
@@ -5429,38 +5298,8 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     let mut a: i32 = 0;
     let b = intr_src(v, &mut a);
     let mut op: i32 = 0;
-    if id == ir.IN_SMIN {
-        if k == 0 {
-            op = xe.PMINSB;
-        } else if k == 1 {
-            op = xe.PMINSW;
-        } else {
-            op = xe.PMINSD;
-        }
-    } else if id == ir.IN_SMAX {
-        if k == 0 {
-            op = xe.PMAXSB;
-        } else if k == 1 {
-            op = xe.PMAXSW;
-        } else {
-            op = xe.PMAXSD;
-        }
-    } else if id == ir.IN_UMIN {
-        if k == 0 {
-            op = xe.PMINUB;
-        } else if k == 1 {
-            op = xe.PMINUW;
-        } else {
-            op = xe.PMINUD;
-        }
-    } else if id == ir.IN_UMAX {
-        if k == 0 {
-            op = xe.PMAXUB;
-        } else if k == 1 {
-            op = xe.PMAXUW;
-        } else {
-            op = xe.PMAXUD;
-        }
+    if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
+        op = vec_minmax_op(id, k);
     } else if id == ir.IN_SADD_SAT {
         op = xe.PADDSB + k;
     } else if id == ir.IN_UADD_SAT {
@@ -5474,6 +5313,144 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     sse3(op, d, a, b);
+}
+
+// any_true, all_true or bitmask (id) of a vector's lanes.
+fn gen_lane_test(v: *mut ir.Value, id: i32) void {
+    let a0 = v.xs.get(0);
+    let at = a0.ty;
+    let d = vreg(v);
+    let a = reg(a0);
+    let k = lk(at);
+    if VL == 64 {
+        // AVX-512: through a mask register
+        if id != ir.IN_BITMASK {
+            // the lanes not zero (any) or zero (all) into k1; kortest
+            materialize_cc(d, ptest_cc(v));
+            return;
+        }
+        _ = sse4(xe.VPMOVB2M + k, 64, W(xe.K1), R(a), NONE(), NONE());
+        let r = vgpr();
+        _ = sse4(xe.KMOVQ_RK, 8, W(r), R(xe.K1), NONE(), NONE());
+        copy(d, r, GPR);
+        return;
+    }
+    if id == ir.IN_BITMASK {
+        if is.lane_float(at) or (k >= 2) {
+            if k == 2 {
+                _ = sse2(xe.MOVMSKPS, W(d), R(a));
+            } else {
+                _ = sse2(xe.MOVMSKPD, W(d), R(a));
+            }
+            return;
+        }
+        let mut x = a;
+        if k == 1 {
+            x = vxmm();
+            sse3(xe.PACKSSWB, x, a, R(a));
+        }
+        _ = sse2(xe.PMOVMSKB, W(d), R(x));
+        if k == 1 {
+            _ = alu(xe.ALU_AND, 4, RW(d), I(0xff));
+        }
+        return;
+    }
+    if ptest_cond(v) {
+        materialize_cc(d, ptest_cc(v));
+        return;
+    }
+    let z = vxmm();
+    vzero(z);
+    if id == ir.IN_ANYTRUE {
+        // some byte nonzero: not all bytes equal to zero
+        let e = vxmm();
+        sse3(xe.PCMPEQB, e, a, R(z));
+        let m = vgpr();
+        _ = sse2(xe.PMOVMSKB, W(m), R(e));
+        let mut all: i64 = 0xffff;
+        if VL == 32 {
+            all = -1;  // (32 bytes: 32 bits, the immediate sign-extended)
+        }
+        _ = alu(xe.ALU_CMP, 4, R(m), I(all));
+        materialize_cc(d, xe.CC_NE);
+        return;
+    }
+    // all lanes nonzero: no lane equal to zero
+    let e = vxmm();
+    if k == 3 {
+        if has41() {
+            sse3(xe.PCMPEQQ, e, a, R(z));
+        } else {
+            let e1_ = vxmm();
+            sse3(xe.PCMPEQD, e1_, a, R(z));
+            let sw = vxmm();
+            _ = sse_i(xe.PSHUFD, W(sw), R(e1_), 0xb1);
+            sse3(xe.PAND, e, e1_, R(sw));
+        }
+    } else {
+        sse3(xe.PCMPEQB + k, e, a, R(z));
+    }
+    let m = vgpr();
+    _ = sse2(xe.PMOVMSKB, W(m), R(e));
+    _ = e2(xe.TEST, 4, R(m), R(m));
+    materialize_cc(d, xe.CC_E);
+}
+
+// d = a lane-by-lane table lookup (swizzle) of v's first argument by its
+// second, a lane index out of range giving 0.
+fn gen_swizzle(v: *mut ir.Value, d: i32) void {
+    let a = reg(v.xs.get(0));
+    let idx = reg(v.xs.get(1));
+    if not tg.has(tg.X_SSSE3) {
+        // byte by byte through memory
+        let sx = vec_slot();
+        let si = vec_slot();
+        let sr = vec_slot();
+        _ = sse2(xe.MOVDQU_ST, R(a), mc.mem_slot(sx, 0));
+        _ = sse2(xe.MOVDQU_ST, R(idx), mc.mem_slot(si, 0));
+        for lane in @as(i64, 0)..16 {
+            let t = vgpr();
+            let b = vgpr();
+            let li = e2(xe.LOAD, 1, W(t), mc.mem_slot(si, lane));
+            li.cc = 1;
+            _ = e2(xe.MOV_RI, 4, W(b), I(0));
+            _ = alu(xe.ALU_CMP, 4, R(t), I(16));
+            let skip = new_label();
+            jcc(xe.CC_AE, skip);
+            let mut m = mc.mem_slot(sx, 0);
+            m.index = t;
+            m.scale = 1;
+            let lb = e2(xe.LOAD, 1, W(b), m);
+            lb.cc = 1;
+            place(skip);
+            _ = e2(xe.STORE, 1, mc.mem_slot(sr, lane), R(b));
+        }
+        _ = sse2(xe.MOVDQU_LD, W(d), mc.mem_slot(sr, 0));
+        return;
+    }
+    let adj = vxmm();
+    sse3(xe.PADDUSB, adj, idx, const16(0x7070_7070_7070_7070, 0x7070_7070_7070_7070));
+    sse3(xe.PSHUFB, d, a, R(adj));
+}
+
+// The packed minimum or maximum (id) of lanes of 8, 16 or 32 bits (k 0, 1,
+// 2 and up).
+fn vec_minmax_op(id: i32, k: i32) i32 {
+    let ops: [12]i32 = [xe.PMINSB, xe.PMINSW, xe.PMINSD, xe.PMAXSB, xe.PMAXSW, xe.PMAXSD, xe.PMINUB, xe.PMINUW,
+                        xe.PMINUD, xe.PMAXUB, xe.PMAXUW, xe.PMAXUD];
+    let mut row: i32 = 0;
+    if id == ir.IN_SMAX {
+        row = 1;
+    } else if id == ir.IN_UMIN {
+        row = 2;
+    } else if id == ir.IN_UMAX {
+        row = 3;
+    }
+    let mut col = k;
+    if col > 2 {
+        col = 2;
+    }
+    return ops[@int_cast(usize, (row * 3) + col)];
 }
 
 // -----------------------------------------------------------------------------
@@ -6682,40 +6659,7 @@ fn gen_inst_at(v: *mut ir.Value) void {
         gen_kand(v);
         return;
     }
-    if ((o == ir.OP_COPY) or (o == ir.OP_BITCAST)) and (class_of(t) != GPR) and (class_of(t) == class_of(v.a.ty)) {
-        let sr = reg(v.a);
-        let def = mc.remat_def(em.MF, sr);
-        if (u.notnil(def) or ((o == ir.OP_BITCAST) and (t.kind == ir.T_VEC))) and (v.loc < 0) {
-            // a copy of a constant, or a vector as other lanes: the same register
-            v.loc = sr;
-            return;
-        }
-        if u.notnil(def) {
-            // (its register is taken already: the constant built again)
-            let d = vreg(v);
-            let c = mc.clone_def(def, sr, d);
-            mc.append(CB, c);
-            mc.set_remat(em.MF, d, c);
-            return;
-        }
-        copy(vreg(v), sr, class_of(t));
-        return;
-    }
-    if (o == ir.OP_COPY) and (v.a.kind == ir.V_GLOBAL) and not ir.gv_of(v.a).tls {
-        // a global's address, hoisted out of a loop (opt.hoist_constants):
-        // built again rather than spilled
-        let d = vreg(v);
-        let mut m = mc.mem_sym(global_sym(ir.gv_of(v.a)), 0);
-        let mut op = xe.LEA;
-        if is.extern_global(ir.gv_of(v.a)) {
-            m.scale = 99;  // (from the GOT)
-            op = xe.LOAD;
-        }
-        mc.set_remat(em.MF, d, e2(op, 8, W(d), m));
-        return;
-    }
-    if o == ir.OP_COPY {
-        copy(vreg(v), reg(v.a), class_of(t));
+    if gen_copy(v) {
         return;
     }
     if ir.is_int_binop(o) {
@@ -6815,74 +6759,128 @@ fn gen_inst_at(v: *mut ir.Value) void {
         return;
     }
     if o == ir.OP_INTR {
-        if is.fused(v) {
-            return;  // (a ptest at each branch and select on it)
-        }
-        let id = @truncate(i32, @bit_cast(i64, v.cv));
-        if id == ir.IN_TRAP {
-            _ = e0(xe.UD2, 0);
-            return;
-        }
-        if id == ir.IN_CPUID {
-            gen_cpuid(v);
-            return;
-        }
-        if id == ir.IN_FRAME_ADDR {
-            _ = e2(xe.MOV_RR, 8, W(vreg(v)), R(xe.RBP));
-            return;
-        }
-        if ir.is_prefetch(id) {
-            let p = e1(xe.PREFETCH, 4, addr(v.xs.get(0)));
-            if (id == ir.IN_PREFETCHW) and tg.has(tg.X_PRFCHW) {
-                p.cc = 1;
-            }
-            return;
-        }
-        if is.is_insn(id) {
-            gen_insn(v, id);
-            return;
-        }
-        if (id == ir.IN_PERM) or (id == ir.IN_PERM2) {
-            gen_perm(v, id);
-            return;
-        }
-        if (id == ir.IN_LOAD_PARTIAL) or (id == ir.IN_STORE_PARTIAL) {
-            gen_partial(v, id);
-            return;
-        }
-        if (id == ir.IN_SHLV) or (id == ir.IN_LSHRV) or (id == ir.IN_ASHRV) {
-            gen_shiftv(v, id);
-            return;
-        }
-        if ((id == ir.IN_CTLZ) or (id == ir.IN_CTPOP) or (id == ir.IN_CTTZ)) and (t.kind == ir.T_VEC) {
-            gen_bitcount(v, id);
-            return;
-        }
-        if id == ir.IN_XGETBV {
-            let c = reg(v.xs.get(0));
-            _ = e2(xe.MOV_RR, 4, W(xe.RCX), R(c));
-            _ = e3(xe.XGETBV, 0, R(xe.RCX), W(xe.RAX), W(xe.RDX));
-            let d = vreg(v);
-            let hi = vgpr();
-            _ = e2(xe.MOV_RR, 4, W(hi), R(xe.RDX));  // (zero-extends)
-            let s = e3(xe.SHIFT, 8, RW(hi), NONE(), I(32));
-            s.cc = 4;
-            _ = e2(xe.MOV_RR, 4, W(d), R(xe.RAX));
-            _ = alu(xe.ALU_OR, 8, RW(d), R(hi));
-            return;
-        }
-        if (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
-            gen_vec_intr(v, id);
-            return;
-        }
-        if t.kind == ir.T_FLOAT {
-            gen_float_intr(v, id);
-            return;
-        }
-        gen_int_intr(v, id);
+        gen_intr(v);
         return;
     }
     em.fail(u.f1("cannot select %s", ir.inst_str(v)));
+}
+
+// A copy of v.a (OP_COPY, or a bitcast within a register class) into v,
+// if v is one: a register shared or a constant built again where it can.
+fn gen_copy(v: *mut ir.Value) bool {
+    let o = v.op;
+    let t = v.ty;
+    if ((o == ir.OP_COPY) or (o == ir.OP_BITCAST)) and (class_of(t) != GPR) and (class_of(t) == class_of(v.a.ty)) {
+        let sr = reg(v.a);
+        let def = mc.remat_def(em.MF, sr);
+        if (u.notnil(def) or ((o == ir.OP_BITCAST) and (t.kind == ir.T_VEC))) and (v.loc < 0) {
+            // a copy of a constant, or a vector as other lanes: the same register
+            v.loc = sr;
+            return true;
+        }
+        if u.notnil(def) {
+            // (its register is taken already: the constant built again)
+            let d = vreg(v);
+            let c = mc.clone_def(def, sr, d);
+            mc.append(CB, c);
+            mc.set_remat(em.MF, d, c);
+            return true;
+        }
+        copy(vreg(v), sr, class_of(t));
+        return true;
+    }
+    if (o == ir.OP_COPY) and (v.a.kind == ir.V_GLOBAL) and not ir.gv_of(v.a).tls {
+        // a global's address, hoisted out of a loop (opt.hoist_constants):
+        // built again rather than spilled
+        let d = vreg(v);
+        let mut m = mc.mem_sym(global_sym(ir.gv_of(v.a)), 0);
+        let mut op = xe.LEA;
+        if is.extern_global(ir.gv_of(v.a)) {
+            m.scale = 99;  // (from the GOT)
+            op = xe.LOAD;
+        }
+        mc.set_remat(em.MF, d, e2(op, 8, W(d), m));
+        return true;
+    }
+    if o == ir.OP_COPY {
+        copy(vreg(v), reg(v.a), class_of(t));
+        return true;
+    }
+    return false;
+}
+
+// An intrinsic call (OP_INTR).
+fn gen_intr(v: *mut ir.Value) void {
+    if is.fused(v) {
+        return;  // (a ptest at each branch and select on it)
+    }
+    let id = @truncate(i32, @bit_cast(i64, v.cv));
+    if id == ir.IN_TRAP {
+        _ = e0(xe.UD2, 0);
+        return;
+    }
+    if id == ir.IN_CPUID {
+        gen_cpuid(v);
+        return;
+    }
+    if id == ir.IN_FRAME_ADDR {
+        _ = e2(xe.MOV_RR, 8, W(vreg(v)), R(xe.RBP));
+        return;
+    }
+    if ir.is_prefetch(id) {
+        let p = e1(xe.PREFETCH, 4, addr(v.xs.get(0)));
+        if (id == ir.IN_PREFETCHW) and tg.has(tg.X_PRFCHW) {
+            p.cc = 1;
+        }
+        return;
+    }
+    if is.is_insn(id) {
+        gen_insn(v, id);
+        return;
+    }
+    if (id == ir.IN_PERM) or (id == ir.IN_PERM2) {
+        gen_perm(v, id);
+        return;
+    }
+    if (id == ir.IN_LOAD_PARTIAL) or (id == ir.IN_STORE_PARTIAL) {
+        gen_partial(v, id);
+        return;
+    }
+    if (id == ir.IN_SHLV) or (id == ir.IN_LSHRV) or (id == ir.IN_ASHRV) {
+        gen_shiftv(v, id);
+        return;
+    }
+    if ((id == ir.IN_CTLZ) or (id == ir.IN_CTPOP) or (id == ir.IN_CTTZ)) and (v.ty.kind == ir.T_VEC) {
+        gen_bitcount(v, id);
+        return;
+    }
+    if id == ir.IN_XGETBV {
+        gen_xgetbv(v);
+        return;
+    }
+    if (v.xs.len > 0) and (v.xs.get(0).ty.kind == ir.T_VEC) {
+        gen_vec_intr(v, id);
+        return;
+    }
+    if v.ty.kind == ir.T_FLOAT {
+        gen_float_intr(v, id);
+        return;
+    }
+    gen_int_intr(v, id);
+}
+
+// xgetbv: rdx:rax from the extended control register named by the argument.
+fn gen_xgetbv(v: *mut ir.Value) void {
+    let c = reg(v.xs.get(0));
+    _ = e2(xe.MOV_RR, 4, W(xe.RCX), R(c));
+    _ = e3(xe.XGETBV, 0, R(xe.RCX), W(xe.RAX), W(xe.RDX));
+    let d = vreg(v);
+    let hi = vgpr();
+    _ = e2(xe.MOV_RR, 4, W(hi), R(xe.RDX));  // (zero-extends)
+    let s = e3(xe.SHIFT, 8, RW(hi), NONE(), I(32));
+    s.cc = 4;
+    _ = e2(xe.MOV_RR, 4, W(d), R(xe.RAX));
+    _ = alu(xe.ALU_OR, 8, RW(d), R(hi));
 }
 
 fn gen_term(b: *mut ir.Block) void {
@@ -6995,30 +6993,9 @@ fn gen_term(b: *mut ir.Block) void {
 // -----------------------------------------------------------------------------
 fn prepare(f: *mut ir.Func) void {
     is.count_uses(f, true, partial_addr);
-    // an address-only ptradd with a variable offset that is the base of
-    // another one with a variable offset needs a register (base_mem): where
-    // that is in another block (perhaps a loop), compute it once instead
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            let q = i.a;
-            if (i.op == ir.OP_PTRADD) and not imm_ok(i.b) and ir.is_op(q, ir.OP_PTRADD) and ((q.flag & 1) != 0) and
-               not imm_ok(q.b) {
-                let mut away = i.blk != q.blk;
-                if ((i.flag & 1) != 0) and ((i.uses != 1) or u.isnil(i.user) or (i.user.blk != q.blk)) {
-                    away = true;
-                }
-                if away {
-                    q.flag = q.flag & ~1;
-                }
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
+    each_inst(f, localize_ptradd);
     // the and / or / not of comparisons a branch tests (branch_tree)
-    b = f.first;
+    let mut b = f.first;
     while u.notnil(b) {
         let t = ir.terminator(b);
         if u.notnil(t) and (t.op == ir.OP_CONDBR) {
@@ -7026,234 +7003,20 @@ fn prepare(f: *mut ir.Func) void {
         }
         b = b.next;
     }
-    // comparisons fused into their branches and selects: every use is the
-    // condition of a branch or a select in its block (each compares again),
-    // or a leaf of a branch tree
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
-            for k in @as(usize, 0)..3 {
-                let o = ops[k];
-                if u.notnil(o) and (is_scalar_cmp(o) or ptest_cond(o)) {
-                    let cond = (o.blk == b) and
-                               (((k == 0) and ((i.op == ir.OP_CONDBR) or (i.op == ir.OP_SELECT))) or
-                                ((k <= 1) and ((i.flag & F_BRANCH) != 0)));
-                    if not cond {
-                        o.flag = o.flag | F_VALUE;
-                    }
-                }
-            }
-            for k in 0..i.xs.len {
-                let o = i.xs.get(k);
-                if is_scalar_cmp(o) or ptest_cond(o) {
-                    o.flag = o.flag | F_VALUE;
-                }
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if (is_scalar_cmp(i) or ptest_cond(i)) and (i.uses >= 1) and ((i.flag & F_VALUE) == 0) {
-                i.flag = i.flag | 2;
-            }
-            if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
-                // (x & y) cmp 0: test x, y
-                let x = i.a;
-                if (i.op == ir.OP_ICMP) and is.is_c(i.b) and (is.cval(i.b) == 0) and (x.kind == ir.V_INST) and
-                   (x.op == ir.OP_AND) and (x.uses == 1) and (x.blk == b) and (x.ty.kind == ir.T_INT) and
-                   (x.ty.bits <= 64) {
-                    x.flag = x.flag | 4;
-                    // (x & (1 << k)) ==/!= 0: bt x, k
-                    let pr = @truncate(i32, @bit_cast(i64, i.cv));
-                    let eqne = (pr == ir.IntEQ) or (pr == ir.IntNE) or (pr == ir.IntUGT) or (pr == ir.IntULE);
-                    if eqne and ((x.ty.bits == 32) or (x.ty.bits == 64)) {
-                        if one_shl(x.b, b) {
-                            x.b.flag = x.b.flag | F_BT;
-                        } else if one_shl(x.a, b) {
-                            x.a.flag = x.a.flag | F_BT;
-                        } else if is.is_c(x.b) and (is.cval(x.b) == 1) and ir.is_op(x.a, ir.OP_LSHR) and
-                                  not is.is_c(x.a.b) and (x.a.uses == 1) and (x.a.blk == b) and (x.a.flag == 0) {
-                            // ((y >> k) & 1) ==/!= 0: bt y, k
-                            x.a.flag = x.a.flag | F_BTR;
-                        }
-                    }
-                }
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
+    each_inst(f, mark_cmp_values);
+    each_inst(f, mark_fused_cmp);
     // load; op; store to the same address: one read-modify-write instruction
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            mark_rmw(i);
-            i = i.next;
-        }
-        b = b.next;
-    }
-    // loads that are memory operands of their only user (a compare, or an
-    // add, sub, and, or, xor, mul) when nothing between writes memory
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_INT) and
-               u.notnil(i.user) and (i.user.blk == b) and ((i.flag & F_RMW) == 0) {
-                let us = i.user;
-                let bits = i.ty.bits;
-                let mut ok = false;
-                let mut end = us;
-                if (us.op == ir.OP_ICMP) and (us.uses == 1) and
-                   ((bits == 8) or (bits == 16) or (bits == 32) or (bits == 64)) {
-                    ok = ((us.a == i) and (us.b != i) and imm_ok(us.b)) or ((us.b == i) and (us.a != i));
-                    if is.fused(us) {
-                        // (compared at its branch or select, or a branch tree's branch)
-                        end = us.user;
-                        while (end.flag & F_BRANCH) != 0 {
-                            end = end.user;
-                        }
-                    }
-                } else if ((bits == 32) or (bits == 64)) and ((us.flag & (4 | F_RMW)) == 0) and (us.a != us.b) and
-                          ((us.op == ir.OP_ADD) or (us.op == ir.OP_SUB) or (us.op == ir.OP_AND) or
-                           (us.op == ir.OP_OR) or (us.op == ir.OP_XOR) or (us.op == ir.OP_MUL)) {
-                    ok = (us.b == i) or ((us.a == i) and (us.op != ir.OP_SUB));
-                    if folded_load(us.a) or folded_load(us.b) {
-                        ok = false;  // (one memory operand)
-                    }
-                    if (us.op == ir.OP_MUL) and is.is_c(us.b) {
-                        ok = false;  // (x * 1/2/4/8 may be an index: addresses use x itself)
-                    }
-                }
-                if ok and quiet_between(i, end) {
-                    i.flag = i.flag | 8;
-                }
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
+    each_inst(f, mark_rmw);
+    each_inst(f, mark_folded_load);
     mark_fused_vectors(f);
-    // x & ~y as andn (BMI1), the `not` used only there
     if tg.has(tg.X_BMI1) {
-        b = f.first;
-        while u.notnil(b) {
-            let mut i = b.first;
-            while u.notnil(i) {
-                if (i.op == ir.OP_AND) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= 32) and (i.ty.bits <= 64) and
-                   not is.is_c(i.a) and not is.is_c(i.b) and (i.a != i.b) and ((i.flag & ((4 | 8) | F_RMW)) == 0) and
-                   not folded_load(i.a) and not folded_load(i.b) {
-                    if bls_part(i.b, i, i.a) {
-                        i.b.flag = i.b.flag | F_BLS;
-                    } else if bls_part(i.a, i, i.b) {
-                        i.a.flag = i.a.flag | F_BLS;
-                    } else if andn_not(i.b, i) {
-                        i.b.flag = i.b.flag | F_ANDN;
-                    } else if andn_not(i.a, i) {
-                        i.a.flag = i.a.flag | F_ANDN;
-                    }
-                } else if (i.op == ir.OP_XOR) and (i.ty.kind == ir.T_INT) and (i.ty.bits >= 32) and
-                          (i.ty.bits <= 64) and not is.is_c(i.a) and not is.is_c(i.b) and (i.a != i.b) and
-                          ((i.flag & ((4 | 8) | F_RMW)) == 0) and not folded_load(i.a) and not folded_load(i.b) {
-                    if bls_part(i.b, i, i.a) {
-                        i.b.flag = i.b.flag | F_BLS;
-                    } else if bls_part(i.a, i, i.b) {
-                        i.a.flag = i.a.flag | F_BLS;
-                    }
-                }
-                i = i.next;
-            }
-            b = b.next;
-        }
+        each_inst(f, mark_bmi);
     }
-    // x ^ (1 << k) and x | (1 << k) as btc and bts, the shift used only there
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if ((i.op == ir.OP_XOR) or (i.op == ir.OP_OR)) and (i.ty.kind == ir.T_INT) and
-               ((i.ty.bits == 32) or (i.ty.bits == 64)) and not is.is_c(i.a) and not is.is_c(i.b) and (i.a != i.b) and
-               ((i.flag & ((4 | 8) | F_RMW)) == 0) and not folded_load(i.a) and not folded_load(i.b) {
-                if one_shl(i.b, b) and (i.b.ty == i.ty) {
-                    i.b.flag = i.b.flag | F_BTX;
-                } else if one_shl(i.a, b) and (i.a.ty == i.ty) {
-                    i.a.flag = i.a.flag | F_BTX;
-                }
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-    // ~y & x on vectors of up to 256 bits as pandn, the `not` used only there
-    // (AVX-512 forms of and-not are blends and ternary logic: see sel_parts)
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if (i.op == ir.OP_AND) and (i.ty.kind == ir.T_VEC) and (i.ty.size <= 32) and not avx512_for(i.ty.size) and
-               (i.flag == 0) and (i.a != i.b) and not folded_load(i.a) {
-                if vandn_not(i.b, i) {
-                    i.b.flag = i.b.flag | F_ANDN;
-                } else if vandn_not(i.a, i) {
-                    i.a.flag = i.a.flag | F_ANDN;
-                }
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-    // y + (x << k) and y | (x << k) (no bits in common) as lea
-    b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if ((i.op == ir.OP_ADD) or (i.op == ir.OP_OR)) and (i.ty.kind == ir.T_INT) and
-               ((i.ty.bits == 32) or (i.ty.bits == 64)) and (i.a != i.b) and ((i.flag & ((4 | 8) | F_RMW)) == 0) and
-               not folded_load(i.a) and not folded_load(i.b) {
-                if scale_part(i.b, i, i.a) {
-                    i.b.flag = i.b.flag | F_SCALE;
-                } else if scale_part(i.a, i, i.b) {
-                    i.a.flag = i.a.flag | F_SCALE;
-                }
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
-    // ctlz(x) used only as k - ctlz(x) or ctlz(x) + k: bsr(x), the index of
-    // the highest set bit, and k - ctlz(x) = bsr(x) + (k - (bits - 1)),
-    // ctlz(x) + k = (k + bits - 1) - bsr(x) (bsr(0) taken as -1)
+    each_inst(f, mark_btx);
+    each_inst(f, mark_vandn);
+    each_inst(f, mark_lea);
     if not tg.has(tg.X_LZCNT) {
-        for pass in @as(i32, 0)..3 {
-            b = f.first;
-            while u.notnil(b) {
-                let mut i = b.first;
-                while u.notnil(i) {
-                    if (pass == 0) and full_clz(i) {
-                        i.aux2 = 0;
-                    } else if pass == 1 {
-                        let c = clz_user(i);
-                        if u.notnil(c) {
-                            c.aux2 += 1;
-                        }
-                    } else if (pass == 2) and full_clz(i) {
-                        if (i.uses > 0) and (@as(i64, i.uses) == i.aux2) {
-                            i.flag = i.flag | F_BSR;
-                        }
-                        i.aux2 = 0;
-                    }
-                    i = i.next;
-                }
-                b = b.next;
-            }
-        }
+        mark_bsr(f);
     }
     // consecutive stores of constants filling memory: vector stores (after
     // mark_fused_vectors, which clears aux2)
@@ -7261,6 +7024,232 @@ fn prepare(f: *mut ir.Func) void {
     while u.notnil(b) {
         mark_store_runs(b);
         b = b.next;
+    }
+}
+
+// Calls visit on each instruction of f in order (one of prepare's passes).
+fn each_inst(f: *mut ir.Func, visit: fn(*mut ir.Value) void) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            visit(i);
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// An address-only ptradd with a variable offset that is the base of
+// another one with a variable offset needs a register (base_mem): where
+// that is in another block (perhaps a loop), compute it once instead.
+fn localize_ptradd(i: *mut ir.Value) void {
+    let q = i.a;
+    if (i.op == ir.OP_PTRADD) and not imm_ok(i.b) and ir.is_op(q, ir.OP_PTRADD) and ((q.flag & 1) != 0) and
+       not imm_ok(q.b) {
+        let mut away = i.blk != q.blk;
+        if ((i.flag & 1) != 0) and ((i.uses != 1) or u.isnil(i.user) or (i.user.blk != q.blk)) {
+            away = true;
+        }
+        if away {
+            q.flag = q.flag & ~1;
+        }
+    }
+}
+
+// Comparisons are fused into their branches and selects when every use is
+// the condition of a branch or a select in its block (each compares
+// again), or a leaf of a branch tree: marks with F_VALUE those that i uses
+// otherwise.
+fn mark_cmp_values(i: *mut ir.Value) void {
+    let b = i.blk;
+    let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+    for k in @as(usize, 0)..3 {
+        let o = ops[k];
+        if u.notnil(o) and (is_scalar_cmp(o) or ptest_cond(o)) {
+            let cond = (o.blk == b) and
+                       (((k == 0) and ((i.op == ir.OP_CONDBR) or (i.op == ir.OP_SELECT))) or
+                        ((k <= 1) and ((i.flag & F_BRANCH) != 0)));
+            if not cond {
+                o.flag = o.flag | F_VALUE;
+            }
+        }
+    }
+    for k in 0..i.xs.len {
+        let o = i.xs.get(k);
+        if is_scalar_cmp(o) or ptest_cond(o) {
+            o.flag = o.flag | F_VALUE;
+        }
+    }
+}
+
+// Marks comparison i fused (flag 2) unless mark_cmp_values found it used as
+// a value, and an and it compares with 0 as test (flag 4), or bt (F_BT and
+// F_BTR on the shift).
+fn mark_fused_cmp(i: *mut ir.Value) void {
+    let b = i.blk;
+    if (is_scalar_cmp(i) or ptest_cond(i)) and (i.uses >= 1) and ((i.flag & F_VALUE) == 0) {
+        i.flag = i.flag | 2;
+    }
+    if ((i.op == ir.OP_ICMP) or (i.op == ir.OP_FCMP)) and (i.a.ty.kind != ir.T_VEC) and (i.uses == 1) {
+        // (x & y) cmp 0: test x, y
+        let x = i.a;
+        if (i.op == ir.OP_ICMP) and is.is_c(i.b) and (is.cval(i.b) == 0) and (x.kind == ir.V_INST) and
+           (x.op == ir.OP_AND) and (x.uses == 1) and (x.blk == b) and (x.ty.kind == ir.T_INT) and (x.ty.bits <= 64) {
+            x.flag = x.flag | 4;
+            // (x & (1 << k)) ==/!= 0: bt x, k
+            let pr = @truncate(i32, @bit_cast(i64, i.cv));
+            let eqne = (pr == ir.IntEQ) or (pr == ir.IntNE) or (pr == ir.IntUGT) or (pr == ir.IntULE);
+            if eqne and ((x.ty.bits == 32) or (x.ty.bits == 64)) {
+                if one_shl(x.b, b) {
+                    x.b.flag = x.b.flag | F_BT;
+                } else if one_shl(x.a, b) {
+                    x.a.flag = x.a.flag | F_BT;
+                } else if is.is_c(x.b) and (is.cval(x.b) == 1) and ir.is_op(x.a, ir.OP_LSHR) and not is.is_c(x.a.b) and
+                          (x.a.uses == 1) and (x.a.blk == b) and (x.a.flag == 0) {
+                    // ((y >> k) & 1) ==/!= 0: bt y, k
+                    x.a.flag = x.a.flag | F_BTR;
+                }
+            }
+        }
+    }
+}
+
+// A load that is a memory operand of its only user (a compare, or an add,
+// sub, and, or, xor, mul) when nothing between writes memory: flag 8.
+fn mark_folded_load(i: *mut ir.Value) void {
+    let b = i.blk;
+    if (i.op == ir.OP_LOAD) and (i.uses == 1) and (i.flags == 0) and (i.ty.kind == ir.T_INT) and u.notnil(i.user) and
+       (i.user.blk == b) and ((i.flag & F_RMW) == 0) {
+        let us = i.user;
+        let bits = i.ty.bits;
+        let mut ok = false;
+        let mut end = us;
+        if (us.op == ir.OP_ICMP) and (us.uses == 1) and ((bits == 8) or (bits == 16) or (bits == 32) or (bits == 64)) {
+            ok = ((us.a == i) and (us.b != i) and imm_ok(us.b)) or ((us.b == i) and (us.a != i));
+            if is.fused(us) {
+                // (compared at its branch or select, or a branch tree's branch)
+                end = us.user;
+                while (end.flag & F_BRANCH) != 0 {
+                    end = end.user;
+                }
+            }
+        } else if ((bits == 32) or (bits == 64)) and ((us.flag & (4 | F_RMW)) == 0) and (us.a != us.b) and
+                  ((us.op == ir.OP_ADD) or (us.op == ir.OP_SUB) or (us.op == ir.OP_AND) or (us.op == ir.OP_OR) or
+                   (us.op == ir.OP_XOR) or (us.op == ir.OP_MUL)) {
+            ok = (us.b == i) or ((us.a == i) and (us.op != ir.OP_SUB));
+            if folded_load(us.a) or folded_load(us.b) {
+                ok = false;  // (one memory operand)
+            }
+            if (us.op == ir.OP_MUL) and is.is_c(us.b) {
+                ok = false;  // (x * 1/2/4/8 may be an index: addresses use x itself)
+            }
+        }
+        if ok and quiet_between(i, end) {
+            i.flag = i.flag | 8;
+        }
+    }
+}
+
+// Are i's operands two different registers, neither folded into it (as a
+// test, a memory operand or a read-modify-write)?
+fn two_regs(i: *mut ir.Value) bool {
+    return (i.a != i.b) and ((i.flag & ((4 | 8) | F_RMW)) == 0) and not folded_load(i.a) and not folded_load(i.b);
+}
+
+// Is i an operation on 32- to 64-bit integers in two different registers?
+fn int_reg_op(i: *mut ir.Value) bool {
+    return (i.ty.kind == ir.T_INT) and (i.ty.bits >= 32) and (i.ty.bits <= 64) and not is.is_c(i.a) and
+           not is.is_c(i.b) and two_regs(i);
+}
+
+// x & ~y as andn and x & (x - 1) and the like as BMI1 (F_ANDN, F_BLS),
+// the `not` or the other part used only there.
+fn mark_bmi(i: *mut ir.Value) void {
+    if (i.op == ir.OP_AND) and int_reg_op(i) {
+        if bls_part(i.b, i, i.a) {
+            i.b.flag = i.b.flag | F_BLS;
+        } else if bls_part(i.a, i, i.b) {
+            i.a.flag = i.a.flag | F_BLS;
+        } else if andn_not(i.b, i) {
+            i.b.flag = i.b.flag | F_ANDN;
+        } else if andn_not(i.a, i) {
+            i.a.flag = i.a.flag | F_ANDN;
+        }
+    } else if (i.op == ir.OP_XOR) and int_reg_op(i) {
+        if bls_part(i.b, i, i.a) {
+            i.b.flag = i.b.flag | F_BLS;
+        } else if bls_part(i.a, i, i.b) {
+            i.a.flag = i.a.flag | F_BLS;
+        }
+    }
+}
+
+// x ^ (1 << k) and x | (1 << k) as btc and bts, the shift used only there.
+fn mark_btx(i: *mut ir.Value) void {
+    if ((i.op == ir.OP_XOR) or (i.op == ir.OP_OR)) and int_reg_op(i) and ((i.ty.bits == 32) or (i.ty.bits == 64)) {
+        if one_shl(i.b, i.blk) and (i.b.ty == i.ty) {
+            i.b.flag = i.b.flag | F_BTX;
+        } else if one_shl(i.a, i.blk) and (i.a.ty == i.ty) {
+            i.a.flag = i.a.flag | F_BTX;
+        }
+    }
+}
+
+// ~y & x on vectors of up to 256 bits as pandn, the `not` used only there
+// (AVX-512 forms of and-not are blends and ternary logic: see sel_parts).
+fn mark_vandn(i: *mut ir.Value) void {
+    if (i.op == ir.OP_AND) and (i.ty.kind == ir.T_VEC) and (i.ty.size <= 32) and not avx512_for(i.ty.size) and
+       (i.flag == 0) and (i.a != i.b) and not folded_load(i.a) {
+        if vandn_not(i.b, i) {
+            i.b.flag = i.b.flag | F_ANDN;
+        } else if vandn_not(i.a, i) {
+            i.a.flag = i.a.flag | F_ANDN;
+        }
+    }
+}
+
+// y + (x << k) and y | (x << k) (no bits in common) as lea.
+fn mark_lea(i: *mut ir.Value) void {
+    if ((i.op == ir.OP_ADD) or (i.op == ir.OP_OR)) and (i.ty.kind == ir.T_INT) and
+       ((i.ty.bits == 32) or (i.ty.bits == 64)) and two_regs(i) {
+        if scale_part(i.b, i, i.a) {
+            i.b.flag = i.b.flag | F_SCALE;
+        } else if scale_part(i.a, i, i.b) {
+            i.a.flag = i.a.flag | F_SCALE;
+        }
+    }
+}
+
+// ctlz(x) used only as k - ctlz(x) or ctlz(x) + k: bsr(x), the index of
+// the highest set bit, and k - ctlz(x) = bsr(x) + (k - (bits - 1)),
+// ctlz(x) + k = (k + bits - 1) - bsr(x) (bsr(0) taken as -1). Such a ctlz
+// is marked F_BSR, its uses of that form counted in aux2.
+fn mark_bsr(f: *mut ir.Func) void {
+    each_inst(f, bsr_clear);
+    each_inst(f, bsr_count);
+    each_inst(f, bsr_mark);
+}
+
+fn bsr_clear(i: *mut ir.Value) void {
+    if full_clz(i) {
+        i.aux2 = 0;
+    }
+}
+
+fn bsr_count(i: *mut ir.Value) void {
+    let c = clz_user(i);
+    if u.notnil(c) {
+        c.aux2 += 1;
+    }
+}
+
+fn bsr_mark(i: *mut ir.Value) void {
+    if full_clz(i) {
+        if (i.uses > 0) and (@as(i64, i.uses) == i.aux2) {
+            i.flag = i.flag | F_BSR;
+        }
+        i.aux2 = 0;
     }
 }
 
@@ -8706,40 +8695,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.sink_compares(f);
     prepare(f);
     sink_to_use(f);
-    em.MF = mc.new_func();
-    for i in 0..order.len {
-        let b = order.get(i);
-        b.aux = @int_cast(i64, i);
-        let mb = mc.new_block(em.MF);
-        mb.loop_depth = b.loop_depth;
-        let bt = ir.terminator(b);
-        mb.cold = u.notnil(bt) and (bt.op == ir.OP_UNREACHABLE);
-    }
-    for i in 0..order.len {
-        let us = opt.unlikely_succ(order.get(i));
-        if u.notnil(us) {
-            em.MF.blocks.get(i).unlikely = @int_cast(i32, us.aux) + 1;
-        }
-    }
-    // stack slots for allocas
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if i.op == ir.OP_ALLOCA {
-                let mut al = ir.aty_of(i).align;
-                if @as(u64, i.align) > al {
-                    al = @as(u64, i.align);
-                }
-                if al == 0 {
-                    al = 1;
-                }
-                i.aux = @int_cast(i64, mc.new_slot(em.MF, ir.aty_of(i).size, al));
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
+    em.MF = is.new_mfunc(f, &order);
     // parameters
     mc.cur_src = f.src;
     CB = em.MF.blocks.get(0);

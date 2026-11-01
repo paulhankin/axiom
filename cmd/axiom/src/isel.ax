@@ -1,13 +1,15 @@
 // =============================================================================
 // isel.ax - what the native code generators (x64.ax and a64.ax) share:
-// questions about IR values that instruction selection asks, the use counts
-// it starts from, the parallel copies into phis, and the module's symbols
-// and data in the ELF object. wasm.ax uses the bytes of constants.
+// questions about IR values that instruction selection asks, the machine
+// function it fills, the shape of a call, the use counts it starts from,
+// the parallel copies into phis, and the module's symbols and data in the
+// ELF object. wasm.ax uses the bytes of constants.
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "ir.ax" as ir;
 import "mach.ax" as mc;
+import "opt.ax" as opt;
 import "util.ax" as u;
 
 // -----------------------------------------------------------------------------
@@ -42,6 +44,22 @@ pub fn fused(v: *mut ir.Value) bool {
 // inverse).
 pub fn invert(cc: i32) i32 {
     return cc ^ 1;
+}
+
+// The least and the greatest value of a signed (sg) or unsigned integer of
+// fewer than 64 bits: the bounds a saturating operation clamps to.
+pub fn sat_min(bits: i32, sg: bool) i64 {
+    if sg {
+        return -(@as(i64, 1) << @int_cast(u32, bits - 1));
+    }
+    return 0;
+}
+
+pub fn sat_max(bits: i32, sg: bool) i64 {
+    if sg {
+        return (@as(i64, 1) << @int_cast(u32, bits - 1)) - 1;
+    }
+    return (@as(i64, 1) << @int_cast(u32, bits)) - 1;
 }
 
 pub fn is_f32(t: *ir.Ty) bool {
@@ -188,6 +206,104 @@ pub fn sel_parts(o: *mut ir.Value) Sel {
         }
     }
     return r;
+}
+
+// -----------------------------------------------------------------------------
+// Functions
+// -----------------------------------------------------------------------------
+// The machine function for f: a block for each of f's in layout order (each
+// IR block's aux its index), with its loop depth, whether it is cold and its
+// unlikely successor, and a stack slot for each alloca (in the alloca's aux).
+pub fn new_mfunc(f: *mut ir.Func, order: *u.List.[*mut ir.Block]) *mut mc.MFunc {
+    let mf = mc.new_func();
+    for i in 0..order.len {
+        let b = order.get(i);
+        b.aux = @int_cast(i64, i);
+        let mb = mc.new_block(mf);
+        mb.loop_depth = b.loop_depth;
+        let bt = ir.terminator(b);
+        mb.cold = u.notnil(bt) and (bt.op == ir.OP_UNREACHABLE);
+    }
+    for i in 0..order.len {
+        let us = opt.unlikely_succ(order.get(i));
+        if u.notnil(us) {
+            mf.blocks.get(i).unlikely = @int_cast(i32, us.aux) + 1;
+        }
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_ALLOCA {
+                let mut al = ir.aty_of(i).align;
+                if @as(u64, i.align) > al {
+                    al = @as(u64, i.align);
+                }
+                if al == 0 {
+                    al = 1;
+                }
+                i.aux = @int_cast(i64, mc.new_slot(mf, ir.aty_of(i).size, al));
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return mf;
+}
+
+// -----------------------------------------------------------------------------
+// Calls
+// -----------------------------------------------------------------------------
+// The registers of call v's arguments, a narrow integer extended as the
+// callee expects (zero-extended for extension 1, sign-extended for 2).
+// reg and ext_reg are the target's.
+pub fn call_args(v: *mut ir.Value, reg: fn(*mut ir.Value) i32, ext_reg: fn(i32, i32, bool, bool) i32) []mut i32 {
+    let n = v.xs.len;
+    let regs = u.newn.[i32](n + 1);
+    for i in 0..n {
+        let x = v.xs.get(i);
+        let mut e: u8 = 0;
+        if (i + 1) < ir.ext_of(v).len {
+            e = ir.ext_of(v)[i + 1];
+        }
+        let mut r = reg(x);
+        if (e != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
+            r = ext_reg(r, x.ty.bits, e == 2, false);
+        }
+        regs[i] = r;
+    }
+    return regs;
+}
+
+// The operands of call v: the callee (register target, or if that is -1 the
+// function's symbol), the argument registers it reads (uses) and the
+// register ret of its result (-1: none). func_sym is the target's.
+pub fn call_ops(v: *mut ir.Value, target: i32, uses: *u.List.[mc.MOp], func_sym: fn(*ir.Func) i32,
+                ret: i32) u.List.[mc.MOp] {
+    let mut ops = u.List.[mc.MOp].empty();
+    if target >= 0 {
+        ops.push(mc.reg(target, mc.RU));
+    } else {
+        ops.push(mc.symop(func_sym(ir.fnp_of(v.a)), 0));
+    }
+    for k in 0..uses.len {
+        ops.push(uses.get(k));
+    }
+    if ret >= 0 {
+        ops.push(mc.reg(ret, mc.RD));
+    }
+    return ops;
+}
+
+// Completes ci, the call instruction of v in f: its frame-table entry aux
+// and the registers it clobbers (none after a call that does not return).
+pub fn finish_call(f: *mut mc.MFunc, ci: *mut mc.MInst, v: *mut ir.Value, aux: i64, clobber: u64) void {
+    ci.aux = aux;
+    ci.clobber = clobber;
+    if (v.a.kind == ir.V_FUNC) and ir.fnp_of(v.a).noreturn {
+        ci.clobber = 0;  // nothing is live after it
+    }
+    f.has_calls = true;
 }
 
 // -----------------------------------------------------------------------------

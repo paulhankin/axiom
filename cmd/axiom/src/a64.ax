@@ -1513,19 +1513,7 @@ fn stack_arg_size(t: *ir.Ty) u64 {
 fn gen_call(v: *mut ir.Value) void {
     let fty_ = ir.fty_of(v);
     let n = v.xs.len;
-    let regs = u.newn.[i32](n + 1);
-    for i in 0..n {
-        let x = v.xs.get(i);
-        let mut e: u8 = 0;
-        if (i + 1) < ir.ext_of(v).len {
-            e = ir.ext_of(v)[i + 1];
-        }
-        let mut r = reg(x);
-        if (e != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
-            r = ext_reg(r, x.ty.bits, e == 2, false);
-        }
-        regs[i] = r;
-    }
+    let regs = is.call_args(v, reg, ext_reg);
     let mut target: i32 = -1;
     if v.a.kind != ir.V_FUNC {
         target = reg(v.a);
@@ -1589,32 +1577,18 @@ fn gen_call(v: *mut ir.Value) void {
             uses.push(R(dest[i]));
         }
     }
-    let mut ops = u.List.[mc.MOp].empty();
-    if target >= 0 {
-        ops.push(R(target));
-    } else {
-        ops.push(mc.symop(func_sym(ir.fnp_of(v.a)), 0));
-    }
-    for k in 0..uses.len {
-        ops.push(uses.get(k));
-    }
     let rt = fty_.ret;
-    let has_ret = rt.kind != ir.T_VOID;
-    let mut rreg = X0;
-    if has_ret and (class_of(rt) == VR) {
-        rreg = V0;
+    let mut rreg: i32 = -1;
+    if rt.kind != ir.T_VOID {
+        rreg = X0;
+        if class_of(rt) == VR {
+            rreg = V0;
+        }
     }
-    if has_ret {
-        ops.push(W(rreg));
-    }
+    let mut ops = is.call_ops(v, target, &uses, func_sym, rreg);
     let ci = emit(CALL, 0, ops.items());
-    ci.aux = ft.call_aux(v);  // (frame tables)
-    ci.clobber = caller_saved();
-    if (v.a.kind == ir.V_FUNC) and ir.fnp_of(v.a).noreturn {
-        ci.clobber = 0;  // nothing is live after it
-    }
-    MF.has_calls = true;
-    if has_ret {
+    is.finish_call(MF, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
+    if rreg >= 0 {
         copy(vreg(v), rreg, class_of(rt));
     }
     uses.deinit();
@@ -1713,41 +1687,7 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if (id == ir.IN_ROTL) or (id == ir.IN_ROTR) {
-        let mut x = reg(a0);
-        let k = v.xs.get(1);
-        let mut rsf = sf;
-        let mut rb: i32 = bits;
-        if bits < 32 {
-            // replicate the value so a 32-bit rotation rotates it
-            let z = ext_reg(x, bits, false, false);
-            let y = vgpr();
-            _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, @as(u64, @bit_cast(u32, bits))), W(y), R(z), R(z), NONE());
-            x = y;
-            if bits == 8 {
-                let y2 = vgpr();
-                _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 16), W(y2), R(y), R(y), NONE());
-                x = y2;
-            }
-            rsf = 0;
-            rb = 32;
-        }
-        if is.is_c(k) {
-            let m = @bit_cast(u64, is.cval(k)) & @as(u64, @bit_cast(u32, bits - 1));
-            let mut n = m;
-            if id == ir.IN_ROTL {
-                n = (@as(u64, @bit_cast(u32, bits)) - m) & @as(u64, @bit_cast(u32, bits - 1));
-            }
-            _ = rb;
-            _ = raw(ae.extr(rsf, 0, 0, 0, n), W(d), R(x), R(x), NONE());
-            return;
-        }
-        let mut c = reg(k);
-        if id == ir.IN_ROTL {
-            let nc = vgpr();
-            raw_dm(ae.addsub_reg(0, true, false, 0, 31, 0, 0, 0), nc, c);
-            c = nc;
-        }
-        raw3(ae.dp2(rsf, 11, 0, 0, 0), d, x, c);
+        gen_rotate(v, id, d);
         return;
     }
     if (id == ir.IN_SMIN) or (id == ir.IN_SMAX) or (id == ir.IN_UMIN) or (id == ir.IN_UMAX) {
@@ -1773,55 +1713,94 @@ fn gen_int_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     if (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT) or (id == ir.IN_SSUB_SAT) or (id == ir.IN_USUB_SAT) {
-        let sg = (id == ir.IN_SADD_SAT) or (id == ir.IN_SSUB_SAT);
-        let is_add = (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT);
-        if bits < 64 {
-            // exact in 64 bits, then clamped
-            let a = ext_reg(reg(a0), bits, sg, true);
-            let b = ext_reg(reg(v.xs.get(1)), bits, sg, true);
-            let r = vgpr();
-            raw3(ae.addsub_reg(1, not is_add, false, 0, 0, 0, 0, 0), r, a, b);
-            let mut lo: i64 = 0;
-            let mut hi: i64 = 0;
-            if sg {
-                lo = -(@as(i64, 1) << @int_cast(u32, bits - 1));
-                hi = (@as(i64, 1) << @int_cast(u32, bits - 1)) - 1;
-            } else {
-                hi = (@as(i64, 1) << @int_cast(u32, bits)) - 1;
-            }
-            let lr = vgpr();
-            let hr = vgpr();
-            movi(lr, lo, 1);
-            movi(hr, hi, 1);
-            let r2 = vgpr();
-            cmp_reg(1, r, lr);
-            raw3(ae.csel(1, 0, 0, 0, 0, cc64(GT)), r2, r, lr);
-            cmp_reg(1, r2, hr);
-            raw3(ae.csel(1, 0, 0, 0, 0, cc64(LT)), d, r2, hr);
-            return;
-        }
-        let a = reg(a0);
-        let b = reg(v.xs.get(1));
-        let r = vgpr();
-        raw3(ae.addsub_reg(1, not is_add, true, 0, 0, 0, 0, 0), r, a, b);
-        if sg {
-            // on overflow: a < 0 ? MIN : MAX
-            let s = vgpr();
-            raw2(ae.asr_imm(1, 0, 0, 63), s, a);
-            let mx = vgpr();
-            movi(mx, 9223372036854775807, 1);
-            let sat = vgpr();
-            raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), sat, s, mx);
-            // flags are from the adds / subs above (the moves do not set them)
-            raw3(ae.csel(1, 0, 0, 0, 0, cc64(VS)), d, sat, r);
-        } else if is_add {
-            raw2(ae.csel(1, 2, 0, 0, 31, cc64(LO)), d, r);  // carry: all ones
-        } else {
-            raw2(ae.csel(1, 0, 0, 0, 31, cc64(HS)), d, r);  // borrow: zero
-        }
+        gen_sat(v, id, d);
         return;
     }
     fail(u.f1("integer intrinsic %s", u.idec(id)));
+}
+
+// d = v, a rotate left or right (id) of its first argument.
+fn gen_rotate(v: *mut ir.Value, id: i32, d: i32) void {
+    let bits = v.ty.bits;
+    let sf = sfv(v.ty);
+    let a0 = v.xs.get(0);
+    let mut x = reg(a0);
+    let k = v.xs.get(1);
+    let mut rsf = sf;
+    if bits < 32 {
+        // replicate the value so a 32-bit rotation rotates it
+        let z = ext_reg(x, bits, false, false);
+        let y = vgpr();
+        _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, @as(u64, @bit_cast(u32, bits))), W(y), R(z), R(z), NONE());
+        x = y;
+        if bits == 8 {
+            let y2 = vgpr();
+            _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 16), W(y2), R(y), R(y), NONE());
+            x = y2;
+        }
+        rsf = 0;
+    }
+    if is.is_c(k) {
+        let m = @bit_cast(u64, is.cval(k)) & @as(u64, @bit_cast(u32, bits - 1));
+        let mut n = m;
+        if id == ir.IN_ROTL {
+            n = (@as(u64, @bit_cast(u32, bits)) - m) & @as(u64, @bit_cast(u32, bits - 1));
+        }
+        _ = raw(ae.extr(rsf, 0, 0, 0, n), W(d), R(x), R(x), NONE());
+        return;
+    }
+    let mut c = reg(k);
+    if id == ir.IN_ROTL {
+        let nc = vgpr();
+        raw_dm(ae.addsub_reg(0, true, false, 0, 31, 0, 0, 0), nc, c);
+        c = nc;
+    }
+    raw3(ae.dp2(rsf, 11, 0, 0, 0), d, x, c);
+}
+
+// d = v, the saturating signed or unsigned sum or difference (id) of its
+// arguments.
+fn gen_sat(v: *mut ir.Value, id: i32, d: i32) void {
+    let bits = v.ty.bits;
+    let a0 = v.xs.get(0);
+    let sg = (id == ir.IN_SADD_SAT) or (id == ir.IN_SSUB_SAT);
+    let is_add = (id == ir.IN_SADD_SAT) or (id == ir.IN_UADD_SAT);
+    if bits < 64 {
+        // exact in 64 bits, then clamped
+        let a = ext_reg(reg(a0), bits, sg, true);
+        let b = ext_reg(reg(v.xs.get(1)), bits, sg, true);
+        let r = vgpr();
+        raw3(ae.addsub_reg(1, not is_add, false, 0, 0, 0, 0, 0), r, a, b);
+        let lr = vgpr();
+        let hr = vgpr();
+        movi(lr, is.sat_min(bits, sg), 1);
+        movi(hr, is.sat_max(bits, sg), 1);
+        let r2 = vgpr();
+        cmp_reg(1, r, lr);
+        raw3(ae.csel(1, 0, 0, 0, 0, cc64(GT)), r2, r, lr);
+        cmp_reg(1, r2, hr);
+        raw3(ae.csel(1, 0, 0, 0, 0, cc64(LT)), d, r2, hr);
+        return;
+    }
+    let a = reg(a0);
+    let b = reg(v.xs.get(1));
+    let r = vgpr();
+    raw3(ae.addsub_reg(1, not is_add, true, 0, 0, 0, 0, 0), r, a, b);
+    if sg {
+        // on overflow: a < 0 ? MIN : MAX
+        let s = vgpr();
+        raw2(ae.asr_imm(1, 0, 0, 63), s, a);
+        let mx = vgpr();
+        movi(mx, 9223372036854775807, 1);
+        let sat = vgpr();
+        raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), sat, s, mx);
+        // flags are from the adds / subs above (the moves do not set them)
+        raw3(ae.csel(1, 0, 0, 0, 0, cc64(VS)), d, sat, r);
+    } else if is_add {
+        raw2(ae.csel(1, 2, 0, 0, 31, cc64(LO)), d, r);  // carry: all ones
+    } else {
+        raw2(ae.csel(1, 0, 0, 0, 31, cc64(HS)), d, r);  // borrow: zero
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2491,108 +2470,11 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
     let d = vreg(v);
     let k = lk(at_);
     if (id == ir.IN_ANYTRUE) or (id == ir.IN_ALLTRUE) {
-        let a = reg(a0);
-        let s = vvr();
-        let g = vgpr();
-        if id == ir.IN_ANYTRUE {
-            raw2(ae.vacross(1, 1, 0, 0x0a, 0, 0), s, a);  // umaxv b
-            raw2(ae.umov(0, 0, 0, 0), g, s);
-            _ = cmp_imm(0, g, 0);
-            cset(d, NE);
-            return;
-        }
-        if k == 3 {
-            let z = vvr();
-            raw2(ae.v2(1, 0, 3, 0x09, 0, 0), z, a);       // cmeq v.2d, #0
-            raw2(ae.vacross(1, 1, 0, 0x0a, 0, 0), s, z);  // any zero lane?
-            raw2(ae.umov(0, 0, 0, 0), g, s);
-            _ = cmp_imm(0, g, 0);
-            cset(d, EQ);
-            return;
-        }
-        raw2(ae.vacross(1, 1, k, 0x1a, 0, 0), s, a);  // uminv
-        raw2(ae.umov(k, 0, 0, 0), g, s);
-        _ = cmp_imm(0, g, 0);
-        cset(d, NE);
+        gen_any_all(id, d, reg(a0), k);
         return;
     }
     if id == ir.IN_BITMASK {
-        let a = reg(a0);
-        let esize = @as(u64, 8) << @truncate(u32, k);
-        let bitv = vvr();
-        if k == 3 {
-            raw2(ae.vshift(1, 1, 0, esize, false, esize - 1, 0, 0), bitv, a);  // ushr: top bits as 0 / 1
-            let l0 = vgpr();
-            let l1 = vgpr();
-            raw2(ae.umov(3, 0, 0, 0), l0, bitv);
-            raw2(ae.umov(3, 1, 0, 0), l1, bitv);
-            _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 1), W(d), R(l0), R(l1), NONE());
-            return;
-        }
-        let mut inverted = false;
-        if (ir.is_op(a0, ir.OP_ICMP) and (@truncate(i32, @bit_cast(i64, a0.cv)) == ir.IntNE)) or
-           (ir.is_op(a0, ir.OP_FCMP) and (@truncate(i32, @bit_cast(i64, a0.cv)) == ir.RealUNE)) {
-            // x != y: the equal lanes, cleared from the weights below (BIC) rather than
-            // inverted first (the compare's own instructions are left dead)
-            let ea = reg(a0.a);
-            let eb = reg(a0.b);
-            if ir.is_op(a0, ir.OP_ICMP) {
-                raw3(ae.v3(1, 1, k, 0x11, 0, 0, 0), bitv, ea, eb);  // cmeq
-            } else {
-                raw3(ae.v3(1, 0, fsz(a0.a.ty), 0x1c, 0, 0, 0), bitv, ea, eb);  // fcmeq
-            }
-            inverted = true;
-        } else if ir.is_op(a0, ir.OP_ICMP) or ir.is_op(a0, ir.OP_FCMP) {
-            copy(bitv, a, VR);  // (a compare's lanes are all ones or zeros already)
-        } else {
-            raw2(ae.vshift(1, 0, 0, esize, false, esize - 1, 0, 0), bitv, a);  // sshr: top bits as all ones
-        }
-        let mut wl: u64 = 0;
-        let mut wh: u64 = 0;
-        if k == 0 {
-            wl = 0x8040_2010_0804_0201;
-            wh = wl;
-        } else if k == 1 {
-            wl = 0x0008_0004_0002_0001;
-            wh = 0x0080_0040_0020_0010;
-        } else {
-            wl = 0x0000_0002_0000_0001;
-            wh = 0x0000_0008_0000_0004;
-        }
-        let wv = vconst(wl, wh);
-        let m = vvr();
-        if inverted {
-            raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), m, wv, bitv);  // bic: weights of the lanes not equal
-        } else {
-            raw3(ae.v3(1, 0, 0, 3, 0, 0, 0), m, bitv, wv);  // and
-        }
-        let s = vvr();
-        if k == 0 {
-            // the high half's bytes interleaved with the low half's, summed as halfwords
-            let hi = vvr();
-            raw3(0x6E00_4000, hi, m, m);  // ext hi.16b, m, m, #8
-            let z = vvr();
-            raw3(0x4E00_3800, z, m, hi);                  // zip1 z.16b, m, hi
-            raw2(ae.vacross(1, 0, 1, 0x1b, 0, 0), s, z);  // addv h
-            raw2(ae.umov(1, 0, 0, 0), d, s);
-            return;
-        }
-        if k == 0 {
-            // two halves of 8 bytes
-            raw2(ae.vacross(0, 0, 0, 0x1b, 0, 0), s, m);
-            let hi = vvr();
-            raw2(ae.dup_scalar(3, 1, 0, 0), hi, m);
-            let s2 = vvr();
-            raw2(ae.vacross(0, 0, 0, 0x1b, 0, 0), s2, hi);
-            let lo = vgpr();
-            let h = vgpr();
-            raw2(ae.umov(0, 0, 0, 0), lo, s);
-            raw2(ae.umov(0, 0, 0, 0), h, s2);
-            _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 8), W(d), R(lo), R(h), NONE());
-            return;
-        }
-        raw2(ae.vacross(1, 0, k, 0x1b, 0, 0), s, m);
-        raw2(ae.umov(k, 0, 0, 0), d, s);
+        gen_bitmask(a0, d, k);
         return;
     }
     if id == ir.IN_SWIZZLE {
@@ -2668,6 +2550,98 @@ fn gen_vec_intr(v: *mut ir.Value, id: i32) void {
         return;
     }
     raw3(w, d, a, b);
+}
+
+// d = any_true or all_true (id) of the lanes of a, k their size (lk).
+fn gen_any_all(id: i32, d: i32, a: i32, k: u64) void {
+    let s = vvr();
+    let g = vgpr();
+    if id == ir.IN_ANYTRUE {
+        raw2(ae.vacross(1, 1, 0, 0x0a, 0, 0), s, a);  // umaxv b
+        raw2(ae.umov(0, 0, 0, 0), g, s);
+        _ = cmp_imm(0, g, 0);
+        cset(d, NE);
+        return;
+    }
+    if k == 3 {
+        let z = vvr();
+        raw2(ae.v2(1, 0, 3, 0x09, 0, 0), z, a);       // cmeq v.2d, #0
+        raw2(ae.vacross(1, 1, 0, 0x0a, 0, 0), s, z);  // any zero lane?
+        raw2(ae.umov(0, 0, 0, 0), g, s);
+        _ = cmp_imm(0, g, 0);
+        cset(d, EQ);
+        return;
+    }
+    raw2(ae.vacross(1, 1, k, 0x1a, 0, 0), s, a);  // uminv
+    raw2(ae.umov(k, 0, 0, 0), g, s);
+    _ = cmp_imm(0, g, 0);
+    cset(d, NE);
+}
+
+// d = the bitmask of a0's lanes (each lane's top bit), k their size (lk).
+fn gen_bitmask(a0: *mut ir.Value, d: i32, k: u64) void {
+    let a = reg(a0);
+    let esize = @as(u64, 8) << @truncate(u32, k);
+    let bitv = vvr();
+    if k == 3 {
+        raw2(ae.vshift(1, 1, 0, esize, false, esize - 1, 0, 0), bitv, a);  // ushr: top bits as 0 / 1
+        let l0 = vgpr();
+        let l1 = vgpr();
+        raw2(ae.umov(3, 0, 0, 0), l0, bitv);
+        raw2(ae.umov(3, 1, 0, 0), l1, bitv);
+        _ = raw(ae.logic_reg(0, 1, false, 0, 0, 0, 0, 1), W(d), R(l0), R(l1), NONE());
+        return;
+    }
+    let mut inverted = false;
+    if (ir.is_op(a0, ir.OP_ICMP) and (@truncate(i32, @bit_cast(i64, a0.cv)) == ir.IntNE)) or
+       (ir.is_op(a0, ir.OP_FCMP) and (@truncate(i32, @bit_cast(i64, a0.cv)) == ir.RealUNE)) {
+        // x != y: the equal lanes, cleared from the weights below (BIC) rather than
+        // inverted first (the compare's own instructions are left dead)
+        let ea = reg(a0.a);
+        let eb = reg(a0.b);
+        if ir.is_op(a0, ir.OP_ICMP) {
+            raw3(ae.v3(1, 1, k, 0x11, 0, 0, 0), bitv, ea, eb);  // cmeq
+        } else {
+            raw3(ae.v3(1, 0, fsz(a0.a.ty), 0x1c, 0, 0, 0), bitv, ea, eb);  // fcmeq
+        }
+        inverted = true;
+    } else if ir.is_op(a0, ir.OP_ICMP) or ir.is_op(a0, ir.OP_FCMP) {
+        copy(bitv, a, VR);  // (a compare's lanes are all ones or zeros already)
+    } else {
+        raw2(ae.vshift(1, 0, 0, esize, false, esize - 1, 0, 0), bitv, a);  // sshr: top bits as all ones
+    }
+    let mut wl: u64 = 0;
+    let mut wh: u64 = 0;
+    if k == 0 {
+        wl = 0x8040_2010_0804_0201;
+        wh = wl;
+    } else if k == 1 {
+        wl = 0x0008_0004_0002_0001;
+        wh = 0x0080_0040_0020_0010;
+    } else {
+        wl = 0x0000_0002_0000_0001;
+        wh = 0x0000_0008_0000_0004;
+    }
+    let wv = vconst(wl, wh);
+    let m = vvr();
+    if inverted {
+        raw3(ae.v3(1, 0, 1, 3, 0, 0, 0), m, wv, bitv);  // bic: weights of the lanes not equal
+    } else {
+        raw3(ae.v3(1, 0, 0, 3, 0, 0, 0), m, bitv, wv);  // and
+    }
+    let s = vvr();
+    if k == 0 {
+        // the high half's bytes interleaved with the low half's, summed as halfwords
+        let hi = vvr();
+        raw3(0x6E00_4000, hi, m, m);  // ext hi.16b, m, m, #8
+        let z = vvr();
+        raw3(0x4E00_3800, z, m, hi);                  // zip1 z.16b, m, hi
+        raw2(ae.vacross(1, 0, 1, 0x1b, 0, 0), s, z);  // addv h
+        raw2(ae.umov(1, 0, 0, 0), d, s);
+        return;
+    }
+    raw2(ae.vacross(1, 0, k, 0x1b, 0, 0), s, m);
+    raw2(ae.umov(k, 0, 0, 0), d, s);
 }
 
 // -----------------------------------------------------------------------------
@@ -3180,39 +3154,7 @@ fn compile_func(f: *mut ir.Func) void {
     opt.hoist_to_entry(f, is_tls_global);
     opt.layout(&mut order);
     prepare(f);
-    MF = mc.new_func();
-    for i in 0..order.len {
-        let b = order.get(i);
-        b.aux = @int_cast(i64, i);
-        let mb = mc.new_block(MF);
-        mb.loop_depth = b.loop_depth;
-        let bt = ir.terminator(b);
-        mb.cold = u.notnil(bt) and (bt.op == ir.OP_UNREACHABLE);
-    }
-    for i in 0..order.len {
-        let us = opt.unlikely_succ(order.get(i));
-        if u.notnil(us) {
-            MF.blocks.get(i).unlikely = @int_cast(i32, us.aux) + 1;
-        }
-    }
-    let mut b = f.first;
-    while u.notnil(b) {
-        let mut i = b.first;
-        while u.notnil(i) {
-            if i.op == ir.OP_ALLOCA {
-                let mut al = ir.aty_of(i).align;
-                if @as(u64, i.align) > al {
-                    al = @as(u64, i.align);
-                }
-                if al == 0 {
-                    al = 1;
-                }
-                i.aux = @int_cast(i64, mc.new_slot(MF, ir.aty_of(i).size, al));
-            }
-            i = i.next;
-        }
-        b = b.next;
-    }
+    MF = is.new_mfunc(f, &order);
     // parameters
     CB = MF.blocks.get(0);
     let mut ng: i32 = 0;
