@@ -838,14 +838,25 @@ struct Parser {
         self.partially_consumed_tab = false;
         self.break_kill = 0;
 
-        // 1. which open blocks does the line continue?
-        let mut container: u32 = 0;
         let mut all_matched = false;
+        let last_matched = self.match_open_blocks(&mut all_matched)!;
+        if last_matched == NONE {
+            return;
+        }
+        let container = self.open_new_blocks(last_matched, all_matched)!;
+        self.add_rest_of_line(container, last_matched)!;
+    }
+
+    // Step 1 of a line: the last open block it continues (with all_matched
+    // set if that is the last open block of all), or NONE if it was the
+    // closing fence of a code block.
+    fn match_open_blocks(self: *mut Parser, all_matched: *mut bool) MarkdownError!u32 {
+        let mut container: u32 = 0;
         let mut matched = true;
         while true {
             let last = self.nd(container).last;
             if (last == NONE) or not self.nd(last).open {
-                all_matched = true;
+                all_matched.* = true;
                 break;
             }
             container = last;
@@ -887,7 +898,7 @@ struct Parser {
                     if (close > 0) and (close >= @as(usize, n.fence_len)) {
                         // the closing fence ends the line too
                         self.current = self.finalize(container)!;
-                        return;
+                        return NONE;
                     }
                     let mut i = n.fence_offset;
                     while (i > 0) and is_space_or_tab(self.ch(self.offset)) {
@@ -908,9 +919,13 @@ struct Parser {
                 break;
             }
         }
-        let last_matched = container;
+        return container;
+    }
 
-        // 2. new blocks
+    // Step 2 of a line: opens the new blocks it starts inside parent (the
+    // last open block it continues): returns the innermost.
+    fn open_new_blocks(self: *mut Parser, parent: u32, all_matched: bool) MarkdownError!u32 {
+        let mut container = parent;
         let mut maybe_lazy = self.kind(self.current) == Kind.PARAGRAPH;
         let mut ck = self.kind(container);
         while (ck != Kind.CODE_BLOCK) and (ck != Kind.HTML_BLOCK) {
@@ -974,8 +989,13 @@ struct Parser {
             }
             maybe_lazy = false;
         }
+        return container;
+    }
 
-        // 3. the rest of the line
+    // Step 3 of a line: the rest of it goes to innermost, the innermost block
+    // (last_matched is the last of the blocks that were open that it continues).
+    fn add_rest_of_line(self: *mut Parser, innermost: u32, last_matched: u32) MarkdownError!void {
+        let mut container = innermost;
         self.find_first_nonspace();
         self.epoch += 1;
         if self.blank {
@@ -3697,8 +3717,7 @@ fn plain_into(doc: *Document, id: u32, out: *mut strs.String) MarkdownError!void
     while true {
         let n = doc.node(w.id);
         if w.entering {
-            if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) or
-               (n.kind == Kind.MATH) or (n.kind == Kind.DISPLAY_MATH) {
+            if is_plain_text(n.kind) {
                 out.push_str(doc.text(w.id))!;
             } else if (n.kind == Kind.SOFT_BREAK) or (n.kind == Kind.HARD_BREAK) {
                 out.push(' ')!;
@@ -3727,7 +3746,7 @@ fn is_math_info(info: []u8) bool {
 }
 
 // TeX as MathML onto out; false (and nothing written) if it does not parse.
-fn math_html(opts: Options, out: *mut strs.String, tex: []u8, display: tmath.Display) !bool {
+fn math_html(opts: *Options, out: *mut strs.String, tex: []u8, display: tmath.Display) !bool {
     if opts.math_html.render(opts.math_html.ctx, tex, display == tmath.Display.BLOCK, out)! {
         return true;
     }
@@ -3745,7 +3764,6 @@ fn math_html(opts: Options, out: *mut strs.String, tex: []u8, display: tmath.Dis
 // Renders into out; with `stream`, whatever piles up there goes on to sink
 // every 4 KB or so (all but the last byte, which cr() looks at).
 fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: bool) !void {
-    let opts = doc.opts;
     let mut w = doc.walk();
     // inside an image: children render as plain text (alt), up to this node
     let mut plain: u32 = NONE;
@@ -3765,8 +3783,7 @@ fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: b
                 // falls through to close the image
             } else {
                 if entering {
-                    if (n.kind == Kind.TEXT) or (n.kind == Kind.CODE) or (n.kind == Kind.HTML_INLINE) or
-                       (n.kind == Kind.MATH) or (n.kind == Kind.DISPLAY_MATH) {
+                    if is_plain_text(n.kind) {
                         escape_html(out, doc.text(id))!;
                     } else if (n.kind == Kind.SOFT_BREAK) or (n.kind == Kind.HARD_BREAK) {
                         out.push(' ')!;
@@ -3775,236 +3792,270 @@ fn render_html(doc: *Document, out: *mut strs.String, sink: io.Writer, stream: b
                 continue;
             }
         }
-        let k = n.kind;
-        if k == Kind.DOCUMENT {
-            // nothing
-        } else if k == Kind.BLOCK_QUOTE {
-            cr(out)!;
-            if entering {
-                out.push_str("<blockquote>\n")!;
-            } else {
-                out.push_str("</blockquote>\n")!;
+        if n.kind == Kind.IMAGE {
+            if render_image(doc, out, id, &n, entering)! {
+                plain = id;
             }
-        } else if k == Kind.LIST {
-            cr(out)!;
-            if entering {
-                if n.ordered {
-                    if n.start != 1 {
-                        out.push_str("<ol start=\"")!;
-                        put_uint(out, n.start)!;
-                        out.push_str("\">\n")!;
-                    } else {
-                        out.push_str("<ol>\n")!;
-                    }
+        } else if n.kind.is_inline() {
+            render_inline(doc, out, id, &n, entering)!;
+        } else {
+            render_block(doc, out, id, &n, entering)!;
+        }
+    }
+}
+
+// Whether a node's text is what it reads as in plain text (alt text and the like).
+fn is_plain_text(k: Kind) bool {
+    return (k == Kind.TEXT) or (k == Kind.CODE) or (k == Kind.HTML_INLINE) or (k == Kind.MATH) or
+           (k == Kind.DISPLAY_MATH);
+}
+
+// A block node's tags (on entering or leaving it), or a code or HTML block.
+inline fn render_block(doc: *Document, out: *mut strs.String, id: u32, n: *Node, entering: bool) !void {
+    let opts = &doc.opts;
+    let k = n.kind;
+    if k == Kind.DOCUMENT {
+        // nothing
+    } else if k == Kind.BLOCK_QUOTE {
+        cr(out)!;
+        if entering {
+            out.push_str("<blockquote>\n")!;
+        } else {
+            out.push_str("</blockquote>\n")!;
+        }
+    } else if k == Kind.LIST {
+        cr(out)!;
+        if entering {
+            if n.ordered {
+                if n.start != 1 {
+                    out.push_str("<ol start=\"")!;
+                    put_uint(out, n.start)!;
+                    out.push_str("\">\n")!;
                 } else {
-                    out.push_str("<ul>\n")!;
+                    out.push_str("<ol>\n")!;
                 }
-            } else if n.ordered {
-                out.push_str("</ol>\n")!;
             } else {
-                out.push_str("</ul>\n")!;
+                out.push_str("<ul>\n")!;
             }
-        } else if k == Kind.ITEM {
+        } else if n.ordered {
+            out.push_str("</ol>\n")!;
+        } else {
+            out.push_str("</ul>\n")!;
+        }
+    } else if k == Kind.ITEM {
+        if entering {
+            cr(out)!;
+            out.push_str("<li>")!;
+            if n.task == Task.OPEN {
+                out.push_str("<input disabled=\"\" type=\"checkbox\"> ")!;
+            } else if n.task == Task.DONE {
+                out.push_str("<input checked=\"\" disabled=\"\" type=\"checkbox\"> ")!;
+            }
+        } else {
+            out.push_str("</li>\n")!;
+        }
+    } else if k == Kind.HEADING {
+        if entering {
+            cr(out)!;
+            out.push_str("<h")!;
+            out.push('0' + n.level)!;
+            out.push('>')!;
+        } else {
+            out.push_str("</h")!;
+            out.push('0' + n.level)!;
+            out.push_str(">\n")!;
+        }
+    } else if (k == Kind.CODE_BLOCK) and opts.math and is_math_info(doc.info(id)) and
+              math_html(opts, out, strs.trim(doc.text(id)), tmath.Display.BLOCK)! {
+        cr(out)!;
+    } else if k == Kind.CODE_BLOCK {
+        cr(out)!;
+        let info = doc.info(id);
+        if info.len == 0 {
+            out.push_str("<pre><code>")!;
+        } else {
+            let mut e: usize = 0;
+            while (e < info.len) and not is_ascii_space(info[e]) {
+                e += 1;
+            }
+            out.push_str("<pre><code class=\"language-")!;
+            escape_html(out, info[..e])!;
+            out.push_str("\">")!;
+        }
+        escape_html(out, doc.text(id))!;
+        out.push_str("</code></pre>\n")!;
+    } else if k == Kind.HTML_BLOCK {
+        cr(out)!;
+        put_raw_html(out, opts, doc.text(id))!;
+        cr(out)!;
+    } else if k == Kind.THEMATIC_BREAK {
+        cr(out)!;
+        out.push_str("<hr />\n")!;
+    } else if k == Kind.PARAGRAPH {
+        if not in_tight_list(doc, id) {
             if entering {
                 cr(out)!;
-                out.push_str("<li>")!;
-                if n.task == Task.OPEN {
-                    out.push_str("<input disabled=\"\" type=\"checkbox\"> ")!;
-                } else if n.task == Task.DONE {
-                    out.push_str("<input checked=\"\" disabled=\"\" type=\"checkbox\"> ")!;
-                }
+                out.push_str("<p>")!;
             } else {
-                out.push_str("</li>\n")!;
-            }
-        } else if k == Kind.HEADING {
-            if entering {
-                cr(out)!;
-                out.push_str("<h")!;
-                out.push('0' + n.level)!;
-                out.push('>')!;
-            } else {
-                out.push_str("</h")!;
-                out.push('0' + n.level)!;
-                out.push_str(">\n")!;
-            }
-        } else if (k == Kind.CODE_BLOCK) and opts.math and is_math_info(doc.info(id)) and
-                  math_html(opts, out, strs.trim(doc.text(id)), tmath.Display.BLOCK)! {
-            cr(out)!;
-        } else if k == Kind.CODE_BLOCK {
-            cr(out)!;
-            let info = doc.info(id);
-            if info.len == 0 {
-                out.push_str("<pre><code>")!;
-            } else {
-                let mut e: usize = 0;
-                while (e < info.len) and not is_ascii_space(info[e]) {
-                    e += 1;
-                }
-                out.push_str("<pre><code class=\"language-")!;
-                escape_html(out, info[..e])!;
-                out.push_str("\">")!;
-            }
-            escape_html(out, doc.text(id))!;
-            out.push_str("</code></pre>\n")!;
-        } else if k == Kind.HTML_BLOCK {
-            cr(out)!;
-            if opts.unsafe_html {
-                raw_html(out, doc.text(id), opts.tagfilter)!;
-            } else {
-                out.push_str("<!-- raw HTML omitted -->")!;
-            }
-            cr(out)!;
-        } else if k == Kind.THEMATIC_BREAK {
-            cr(out)!;
-            out.push_str("<hr />\n")!;
-        } else if k == Kind.PARAGRAPH {
-            if not in_tight_list(doc, id) {
-                if entering {
-                    cr(out)!;
-                    out.push_str("<p>")!;
-                } else {
-                    out.push_str("</p>\n")!;
-                }
-            }
-        } else if k == Kind.TABLE {
-            if entering {
-                cr(out)!;
-                out.push_str("<table>\n")!;
-            } else {
-                // close the body if there was one
-                let last = doc.node(n.last);
-                if not last.header {
-                    out.push_str("</tbody>\n")!;
-                }
-                out.push_str("</table>\n")!;
-            }
-        } else if k == Kind.TABLE_ROW {
-            if entering {
-                if n.header {
-                    out.push_str("<thead>\n")!;
-                } else if (n.prev != NONE) and doc.node(n.prev).header {
-                    out.push_str("<tbody>\n")!;
-                }
-                out.push_str("<tr>\n")!;
-            } else {
-                out.push_str("</tr>\n")!;
-                if n.header {
-                    out.push_str("</thead>\n")!;
-                }
-            }
-        } else if k == Kind.TABLE_CELL {
-            let header = doc.node(n.parent).header;
-            if entering {
-                if header {
-                    out.push_str("<th")!;
-                } else {
-                    out.push_str("<td")!;
-                }
-                if n.align == Align.LEFT {
-                    out.push_str(" align=\"left\"")!;
-                } else if n.align == Align.CENTER {
-                    out.push_str(" align=\"center\"")!;
-                } else if n.align == Align.RIGHT {
-                    out.push_str(" align=\"right\"")!;
-                }
-                out.push('>')!;
-            } else if header {
-                out.push_str("</th>\n")!;
-            } else {
-                out.push_str("</td>\n")!;
-            }
-        } else if k == Kind.TEXT {
-            escape_html(out, doc.text(id))!;
-        } else if k == Kind.SOFT_BREAK {
-            if opts.hard_breaks {
-                out.push_str("<br />\n")!;
-            } else {
-                out.push('\n')!;
-            }
-        } else if k == Kind.HARD_BREAK {
-            out.push_str("<br />\n")!;
-        } else if k == Kind.MATH {
-            if not math_html(opts, out, doc.text(id), tmath.Display.INLINE)! {
-                out.push('$')!;
-                escape_html(out, doc.text(id))!;
-                out.push('$')!;
-            }
-        } else if k == Kind.DISPLAY_MATH {
-            if not math_html(opts, out, doc.text(id), tmath.Display.BLOCK)! {
-                out.push_str("$$")!;
-                escape_html(out, doc.text(id))!;
-                out.push_str("$$")!;
-            }
-        } else if k == Kind.CODE {
-            out.push_str("<code>")!;
-            escape_html(out, doc.text(id))!;
-            out.push_str("</code>")!;
-        } else if k == Kind.HTML_INLINE {
-            if opts.unsafe_html {
-                raw_html(out, doc.text(id), opts.tagfilter)!;
-            } else {
-                out.push_str("<!-- raw HTML omitted -->")!;
-            }
-        } else if k == Kind.EMPH {
-            if entering {
-                out.push_str("<em>")!;
-            } else {
-                out.push_str("</em>")!;
-            }
-        } else if k == Kind.STRONG {
-            if entering {
-                out.push_str("<strong>")!;
-            } else {
-                out.push_str("</strong>")!;
-            }
-        } else if k == Kind.STRIKETHROUGH {
-            if entering {
-                out.push_str("<del>")!;
-            } else {
-                out.push_str("</del>")!;
-            }
-        } else if k == Kind.LINK {
-            if entering {
-                out.push_str("<a href=\"")!;
-                let url = doc.url(id);
-                if opts.unsafe_html or not is_dangerous_url(url) {
-                    escape_href(out, url)!;
-                }
-                out.push('"')!;
-                let t = doc.title(id);
-                if t.len > 0 {
-                    out.push_str(" title=\"")!;
-                    escape_html(out, t)!;
-                    out.push('"')!;
-                }
-                out.push('>')!;
-            } else {
-                out.push_str("</a>")!;
-            }
-        } else if k == Kind.IMAGE {
-            if entering {
-                out.push_str("<img src=\"")!;
-                let url = doc.url(id);
-                if opts.unsafe_html or not is_dangerous_url(url) {
-                    escape_href(out, url)!;
-                }
-                out.push_str("\" alt=\"")!;
-                if n.first != NONE {
-                    plain = id;
-                    continue;
-                }
-            }
-            if entering or (n.first != NONE) {
-                out.push('"')!;
-                let t = doc.title(id);
-                if t.len > 0 {
-                    out.push_str(" title=\"")!;
-                    escape_html(out, t)!;
-                    out.push('"')!;
-                }
-                out.push_str(" />")!;
+                out.push_str("</p>\n")!;
             }
         }
+    } else if k == Kind.TABLE {
+        if entering {
+            cr(out)!;
+            out.push_str("<table>\n")!;
+        } else {
+            // close the body if there was one
+            let last = doc.node(n.last);
+            if not last.header {
+                out.push_str("</tbody>\n")!;
+            }
+            out.push_str("</table>\n")!;
+        }
+    } else if k == Kind.TABLE_ROW {
+        if entering {
+            if n.header {
+                out.push_str("<thead>\n")!;
+            } else if (n.prev != NONE) and doc.node(n.prev).header {
+                out.push_str("<tbody>\n")!;
+            }
+            out.push_str("<tr>\n")!;
+        } else {
+            out.push_str("</tr>\n")!;
+            if n.header {
+                out.push_str("</thead>\n")!;
+            }
+        }
+    } else if k == Kind.TABLE_CELL {
+        let header = doc.node(n.parent).header;
+        if entering {
+            if header {
+                out.push_str("<th")!;
+            } else {
+                out.push_str("<td")!;
+            }
+            if n.align == Align.LEFT {
+                out.push_str(" align=\"left\"")!;
+            } else if n.align == Align.CENTER {
+                out.push_str(" align=\"center\"")!;
+            } else if n.align == Align.RIGHT {
+                out.push_str(" align=\"right\"")!;
+            }
+            out.push('>')!;
+        } else if header {
+            out.push_str("</th>\n")!;
+        } else {
+            out.push_str("</td>\n")!;
+        }
+    }
+}
+
+// An inline node's tags (on entering or leaving it), or its text.
+inline fn render_inline(doc: *Document, out: *mut strs.String, id: u32, n: *Node, entering: bool) !void {
+    let opts = &doc.opts;
+    let k = n.kind;
+    if k == Kind.TEXT {
+        escape_html(out, doc.text(id))!;
+    } else if k == Kind.SOFT_BREAK {
+        if opts.hard_breaks {
+            out.push_str("<br />\n")!;
+        } else {
+            out.push('\n')!;
+        }
+    } else if k == Kind.HARD_BREAK {
+        out.push_str("<br />\n")!;
+    } else if k == Kind.MATH {
+        if not math_html(opts, out, doc.text(id), tmath.Display.INLINE)! {
+            out.push('$')!;
+            escape_html(out, doc.text(id))!;
+            out.push('$')!;
+        }
+    } else if k == Kind.DISPLAY_MATH {
+        if not math_html(opts, out, doc.text(id), tmath.Display.BLOCK)! {
+            out.push_str("$$")!;
+            escape_html(out, doc.text(id))!;
+            out.push_str("$$")!;
+        }
+    } else if k == Kind.CODE {
+        out.push_str("<code>")!;
+        escape_html(out, doc.text(id))!;
+        out.push_str("</code>")!;
+    } else if k == Kind.HTML_INLINE {
+        put_raw_html(out, opts, doc.text(id))!;
+    } else if k == Kind.EMPH {
+        if entering {
+            out.push_str("<em>")!;
+        } else {
+            out.push_str("</em>")!;
+        }
+    } else if k == Kind.STRONG {
+        if entering {
+            out.push_str("<strong>")!;
+        } else {
+            out.push_str("</strong>")!;
+        }
+    } else if k == Kind.STRIKETHROUGH {
+        if entering {
+            out.push_str("<del>")!;
+        } else {
+            out.push_str("</del>")!;
+        }
+    } else if k == Kind.LINK {
+        if entering {
+            out.push_str("<a href=\"")!;
+            put_url(out, opts, doc.url(id))!;
+            out.push('"')!;
+            put_title(out, doc.title(id))!;
+            out.push('>')!;
+        } else {
+            out.push_str("</a>")!;
+        }
+    }
+}
+
+// An image: entering one, its start up to the alt text, which its children
+// (if it has any) give: returns whether they do. Then, on leaving it (or
+// at once without children), the rest.
+fn render_image(doc: *Document, out: *mut strs.String, id: u32, n: *Node, entering: bool) !bool {
+    if entering {
+        out.push_str("<img src=\"")!;
+        put_url(out, &doc.opts, doc.url(id))!;
+        out.push_str("\" alt=\"")!;
+        if n.first != NONE {
+            return true;
+        }
+    }
+    if entering or (n.first != NONE) {
+        out.push('"')!;
+        put_title(out, doc.title(id))!;
+        out.push_str(" />")!;
+    }
+    return false;
+}
+
+// A link's or image's destination (left out if it is dangerous, unless raw
+// HTML is allowed).
+fn put_url(out: *mut strs.String, opts: *Options, url: []u8) !void {
+    if opts.unsafe_html or not is_dangerous_url(url) {
+        escape_href(out, url)!;
+    }
+}
+
+// A title attribute, unless the title is empty.
+fn put_title(out: *mut strs.String, t: []u8) !void {
+    if t.len > 0 {
+        out.push_str(" title=\"")!;
+        escape_html(out, t)!;
+        out.push('"')!;
+    }
+}
+
+// Raw HTML, if it is allowed, else a comment saying it was left out.
+fn put_raw_html(out: *mut strs.String, opts: *Options, html: []u8) !void {
+    if opts.unsafe_html {
+        raw_html(out, html, opts.tagfilter)!;
+    } else {
+        out.push_str("<!-- raw HTML omitted -->")!;
     }
 }
 

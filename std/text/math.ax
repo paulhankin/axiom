@@ -1118,6 +1118,18 @@ fn primary(p: *mut Parser) TexError!u32 {
     return op_node(p, t, cls);
 }
 
+// \big and the like: \big, \Big, \bigg and \Bigg (in that order) for each class.
+let SIZES: [16][]u8 = ["big", "Big", "bigg", "Bigg", "bigl", "Bigl", "biggl", "Biggl", "bigr", "Bigr", "biggr", "Biggr",
+                       "bigm", "Bigm", "biggm", "Biggm"];
+let SIZE_EMS: [4]f32 = [1.2, 1.8, 2.4, 3.0];
+
+// Font commands and their fonts; from \bf on, they set the rest of the group.
+let FONTS: [17][]u8 = ["mathbf", "mathit", "boldsymbol", "mathcal", "mathscr", "mathfrak", "mathbb", "mathsf", "mathtt",
+                       "mathrm", "bm", "mathbfit", "mathsfit", "bf", "rm", "it", "Bbb"];
+let FONT_OF: [17]Font = [Font.BOLD, Font.ITALIC, Font.BOLD_ITALIC, Font.SCRIPT, Font.SCRIPT, Font.FRAKTUR,
+                         Font.DOUBLE_STRUCK, Font.SANS, Font.MONO, Font.ROMAN, Font.BOLD_ITALIC, Font.BOLD_ITALIC,
+                         Font.SANS_ITALIC, Font.BOLD, Font.ROMAN, Font.ITALIC, Font.DOUBLE_STRUCK];
+
 fn command(p: *mut Parser) TexError!u32 {
     let at = p.pos;
     let name = take_command(p);
@@ -1135,143 +1147,25 @@ fn command(p: *mut Parser) TexError!u32 {
         }
     }
     if strs.eq(name, "frac") or strs.eq(name, "dfrac") or strs.eq(name, "tfrac") or strs.eq(name, "cfrac") {
-        let num = argument(p)!;
-        let den = argument(p)!;
-        let f = new_node(p, Kind.FRAC)!;
-        let fnode = p.f.node(f);
-        fnode.a = num;
-        fnode.b = den;
-        if strs.eq(name, "dfrac") or strs.eq(name, "cfrac") {
-            fnode.flags = F_DISPLAY;
-        } else if strs.eq(name, "tfrac") {
-            fnode.flags = F_TEXTSTYLE;
-        }
-        return f;
+        return fraction(p, name);
     }
     if strs.eq(name, "binom") or strs.eq(name, "dbinom") or strs.eq(name, "tbinom") {
-        let top = argument(p)!;
-        let bottom = argument(p)!;
-        let f = new_node(p, Kind.FRAC)!;
-        let fnode = p.f.node(f);
-        fnode.a = top;
-        fnode.b = bottom;
-        fnode.flags = F_THIN0;
-        if strs.eq(name, "dbinom") {
-            fnode.flags |= F_DISPLAY;
-        } else if strs.eq(name, "tbinom") {
-            fnode.flags |= F_TEXTSTYLE;
-        }
-        let fe = new_node(p, Kind.FENCE)!;
-        p.f.node(fe).a = f;
-        set_s(p, fe, "(")!;
-        set_s2(p, fe, ")")!;
-        return fe;
+        return binomial(p, name);
     }
     if strs.eq(name, "sqrt") {
-        if peek(p) == '[' {
-            p.pos += 1;
-            let idx = new_node(p, Kind.ROW)!;
-            let mut last: u32 = NIL;
-            while peek(p) != ']' {
-                if peek(p) == 0 {
-                    return fail(p, "missing ]");
-                }
-                enter(p)!;
-                let a = atom(p)!;
-                p.depth -= 1;
-                if a == NIL {
-                    return fail(p, "missing ]");
-                }
-                append_child(p, idx, a, &mut last);
-            }
-            p.pos += 1;
-            let body = argument(p)!;
-            let rt = new_node(p, Kind.ROOT)!;
-            p.f.node(rt).a = body;
-            p.f.node(rt).b = idx;
-            return rt;
-        }
-        let body = argument(p)!;
-        let sq = new_node(p, Kind.SQRT)!;
-        p.f.node(sq).a = body;
-        return sq;
+        return square_root(p);
     }
     if strs.eq(name, "left") {
-        let open = delimiter(p)!;
-        let content = row(p)!;
-        let mut last_mid: u32 = NIL;
-        // \middle delimiters split the content
-        let mut parts = content;
-        while (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "middle") {
-            _ = take_command(p);
-            let mid = delimiter(p)!;
-            let m = op_node(p, mid, C_REL)!;
-            p.f.node(m).flags = F_STRETCHY;
-            let more = row(p)!;
-            let r = new_node(p, Kind.ROW)!;
-            let mut last: u32 = NIL;
-            append_child(p, r, parts, &mut last);
-            append_child(p, r, m, &mut last);
-            append_child(p, r, more, &mut last);
-            parts = r;
-            last_mid = m;
-        }
-        _ = last_mid;
-        if not ((peek(p) == '\\') and strs.eq(command_at(p, p.pos), "right")) {
-            return fail(p, "\\left without \\right");
-        }
-        _ = take_command(p);
-        let close = delimiter(p)!;
-        let fe = new_node(p, Kind.FENCE)!;
-        p.f.node(fe).a = parts;
-        p.f.node(fe).flags = F_STRETCHY;
-        set_s(p, fe, open)!;
-        set_s2(p, fe, close)!;
-        return fe;
+        return left_right(p);
     }
-    let sizes: [16][]u8 = ["big", "Big", "bigg", "Bigg", "bigl", "Bigl", "biggl", "Biggl", "bigr", "Bigr", "biggr",
-                           "Biggr", "bigm", "Bigm", "biggm", "Biggm"];
-    let ems: [4]f32 = [1.2, 1.8, 2.4, 3.0];
-    for k in @as(usize, 0)..16 {
-        if strs.eq(name, sizes[k]) {
-            let d = delimiter(p)!;
-            let mut cls = C_ORD;
-            if (k >= 4) and (k < 8) {
-                cls = C_OPEN;
-            } else if (k >= 8) and (k < 12) {
-                cls = C_CLOSE;
-            } else if k >= 12 {
-                cls = C_REL;
-            }
-            let o = op_node(p, d, cls)!;
-            p.f.node(o).flags = F_SIZED;
-            p.f.node(o).width = ems[k % 4];
-            return o;
+    for k in @as(usize, 0)..SIZES.len {
+        if strs.eq(name, SIZES[k]) {
+            return sized_delimiter(p, k);
         }
     }
     if strs.eq(name, "text") or strs.eq(name, "textrm") or strs.eq(name, "textit") or strs.eq(name, "textbf") or
        strs.eq(name, "mbox") or strs.eq(name, "textnormal") or strs.eq(name, "textsf") or strs.eq(name, "texttt") {
-        let t = raw_group(p)!;
-        let n = new_node(p, Kind.TEXT)!;
-        // the few escapes text mode has
-        let mut b = strs.String.init();
-        defer b.deinit();
-        let mut i: usize = 0;
-        while i < t.len {
-            if (t[i] == '\\') and ((i + 1) < t.len) and not is_letter(t[i + 1]) {
-                b.push(t[i + 1])!;
-                i += 2;
-                continue;
-            }
-            if (t[i] == '{') or (t[i] == '}') {
-                i += 1;
-                continue;
-            }
-            b.push(t[i])!;
-            i += 1;
-        }
-        set_s(p, n, b.bytes())!;
-        return n;
+        return text_mode(p);
     }
     if strs.eq(name, "textcolor") {
         let st = color_style(p)!;
@@ -1283,120 +1177,21 @@ fn command(p: *mut Parser) TexError!u32 {
         return op_node(p, "mod", C_BIN);
     }
     if strs.eq(name, "pmod") or strs.eq(name, "mod") {
-        // \pmod{n}: a quad and (mod n); \mod{n}: a quad, mod and n
-        let arg = argument(p)!;
-        let r = new_node(p, Kind.ROW)!;
-        let mut last: u32 = NIL;
-        let sp = new_node(p, Kind.SPACE)!;
-        p.f.node(sp).width = 1.0;
-        append_child(p, r, sp, &mut last);
-        let inner = new_node(p, Kind.ROW)!;
-        let mut il: u32 = NIL;
-        let m = ident(p, "mod", true)!;
-        p.f.node(m).flags = F_FUNC;
-        p.f.node(m).cls = C_FUNC;
-        append_child(p, inner, m, &mut il);
-        let sp2 = new_node(p, Kind.SPACE)!;
-        p.f.node(sp2).width = 0.333;
-        append_child(p, inner, sp2, &mut il);
-        append_child(p, inner, arg, &mut il);
-        if strs.eq(name, "mod") {
-            append_child(p, r, inner, &mut last);
-            return r;
-        }
-        let fe = new_node(p, Kind.FENCE)!;
-        p.f.node(fe).a = inner;
-        set_s(p, fe, "(")!;
-        set_s2(p, fe, ")")!;
-        append_child(p, r, fe, &mut last);
-        return r;
+        return modulo(p, strs.eq(name, "pmod"));
     }
     if strs.eq(name, "operatorname") or strs.eq(name, "operatorname*") {
-        let mut star = false;
-        if peek(p) == '*' {
-            p.pos += 1;
-            star = true;
-        }
-        let t = raw_group(p)!;
-        let n = ident(p, strs.trim(t), true)!;
-        p.f.node(n).flags = F_FUNC;
-        if star {
-            p.f.node(n).cls = C_FUNCL;
-        } else {
-            p.f.node(n).cls = C_FUNC;
-        }
-        return n;
+        return operator_name(p);
     }
-    let fonts: [17][]u8 = ["mathbf", "mathit", "boldsymbol", "mathcal", "mathscr", "mathfrak", "mathbb", "mathsf",
-                           "mathtt", "mathrm", "bm", "mathbfit", "mathsfit", "bf", "rm", "it", "Bbb"];
-    let font_of: [17]Font = [Font.BOLD, Font.ITALIC, Font.BOLD_ITALIC, Font.SCRIPT, Font.SCRIPT, Font.FRAKTUR,
-                             Font.DOUBLE_STRUCK, Font.SANS, Font.MONO, Font.ROMAN, Font.BOLD_ITALIC, Font.BOLD_ITALIC,
-                             Font.SANS_ITALIC, Font.BOLD, Font.ROMAN, Font.ITALIC, Font.DOUBLE_STRUCK];
-    for k in @as(usize, 0)..17 {
-        if strs.eq(name, fonts[k]) {
-            let saved = p.font;
-            p.font = font_of[k];
-            defer p.font = saved;
-            if k >= 13 {
-                // \bf and the like: the rest of the group
-                return row(p);
-            }
-            if p.font == Font.ROMAN {
-                // \mathrm{abc}: one upright identifier
-                let save = p.pos;
-                let t = raw_group(p)!;
-                let mut letters = t.len > 1;
-                for ch in t {
-                    if not is_letter(ch) {
-                        letters = false;
-                    }
-                }
-                if letters {
-                    return ident(p, t, true);
-                }
-                p.pos = save;
-            }
-            return argument(p);
+    for k in @as(usize, 0)..FONTS.len {
+        if strs.eq(name, FONTS[k]) {
+            return font_command(p, k);
         }
     }
     if strs.eq(name, "overset") or strs.eq(name, "underset") or strs.eq(name, "stackrel") {
-        let top = argument(p)!;
-        let base = argument(p)!;
-        let l = new_node(p, Kind.LIMITS)!;
-        let ln = p.f.node(l);
-        ln.a = base;
-        if strs.eq(name, "underset") {
-            ln.b = top;
-        } else {
-            ln.c = top;
-        }
-        return l;
+        return over_under_set(p, name);
     }
     if strs.eq(name, "not") {
-        enter(p)!;
-        defer p.depth -= 1;
-        let next = primary(p)!;
-        if next == NIL {
-            return fail(p, "\\not of nothing");
-        }
-        let nd = p.f.node(next);
-        if (nd.kind == Kind.OP) or (nd.kind == Kind.IDENT) {
-            // the character with U+0338 (a precomposed one where there is)
-            let t = p.f.str(nd.s, nd.sl);
-            let pre: [6][]u8 = ["=", "\u{2208}", "\u{2264}", "\u{2265}", "\u{2282}", "\u{2261}"];
-            let neg: [6][]u8 = ["\u{2260}", "\u{2209}", "\u{2270}", "\u{2271}", "\u{2284}", "\u{2262}"];
-            for k in @as(usize, 0)..6 {
-                if strs.eq(t, pre[k]) {
-                    return op_node(p, neg[k], C_REL);
-                }
-            }
-            let mut b = strs.String.init();
-            defer b.deinit();
-            b.push_str(t)!;
-            b.push_str("\u{338}")!;
-            return op_node(p, b.bytes(), C_REL);
-        }
-        return next;
+        return negation(p);
     }
     if strs.eq(name, "begin") {
         return environment(p);
@@ -1432,29 +1227,277 @@ fn command(p: *mut Parser) TexError!u32 {
         p.pos = at;
         return fail(p, "unknown command");
     }
-    let sym = SYMBOLS[k];
+    return symbol(p, name, SYMBOLS[k]);
+}
+
+// \frac and its display and text style forms (\cfrac is \dfrac).
+fn fraction(p: *mut Parser, name: []u8) TexError!u32 {
+    let num = argument(p)!;
+    let den = argument(p)!;
+    let f = new_node(p, Kind.FRAC)!;
+    let fnode = p.f.node(f);
+    fnode.a = num;
+    fnode.b = den;
+    if strs.eq(name, "dfrac") or strs.eq(name, "cfrac") {
+        fnode.flags = F_DISPLAY;
+    } else if strs.eq(name, "tfrac") {
+        fnode.flags = F_TEXTSTYLE;
+    }
+    return f;
+}
+
+// \binom and its display and text style forms: a fraction without a rule, in
+// parentheses.
+fn binomial(p: *mut Parser, name: []u8) TexError!u32 {
+    let top = argument(p)!;
+    let bottom = argument(p)!;
+    let f = new_node(p, Kind.FRAC)!;
+    let fnode = p.f.node(f);
+    fnode.a = top;
+    fnode.b = bottom;
+    fnode.flags = F_THIN0;
+    if strs.eq(name, "dbinom") {
+        fnode.flags |= F_DISPLAY;
+    } else if strs.eq(name, "tbinom") {
+        fnode.flags |= F_TEXTSTYLE;
+    }
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node(fe).a = f;
+    set_s(p, fe, "(")!;
+    set_s2(p, fe, ")")!;
+    return fe;
+}
+
+// \sqrt, with an optional index in brackets.
+fn square_root(p: *mut Parser) TexError!u32 {
+    if peek(p) == '[' {
+        p.pos += 1;
+        let idx = new_node(p, Kind.ROW)!;
+        let mut last: u32 = NIL;
+        while peek(p) != ']' {
+            if peek(p) == 0 {
+                return fail(p, "missing ]");
+            }
+            enter(p)!;
+            let a = atom(p)!;
+            p.depth -= 1;
+            if a == NIL {
+                return fail(p, "missing ]");
+            }
+            append_child(p, idx, a, &mut last);
+        }
+        p.pos += 1;
+        let body = argument(p)!;
+        let rt = new_node(p, Kind.ROOT)!;
+        p.f.node(rt).a = body;
+        p.f.node(rt).b = idx;
+        return rt;
+    }
+    let body = argument(p)!;
+    let sq = new_node(p, Kind.SQRT)!;
+    p.f.node(sq).a = body;
+    return sq;
+}
+
+// \left ... \right, with any \middle delimiters between.
+fn left_right(p: *mut Parser) TexError!u32 {
+    let open = delimiter(p)!;
+    let content = row(p)!;
+    let mut last_mid: u32 = NIL;
+    // \middle delimiters split the content
+    let mut parts = content;
+    while (peek(p) == '\\') and strs.eq(command_at(p, p.pos), "middle") {
+        _ = take_command(p);
+        let mid = delimiter(p)!;
+        let m = op_node(p, mid, C_REL)!;
+        p.f.node(m).flags = F_STRETCHY;
+        let more = row(p)!;
+        let r = new_node(p, Kind.ROW)!;
+        let mut last: u32 = NIL;
+        append_child(p, r, parts, &mut last);
+        append_child(p, r, m, &mut last);
+        append_child(p, r, more, &mut last);
+        parts = r;
+        last_mid = m;
+    }
+    _ = last_mid;
+    if not ((peek(p) == '\\') and strs.eq(command_at(p, p.pos), "right")) {
+        return fail(p, "\\left without \\right");
+    }
+    _ = take_command(p);
+    let close = delimiter(p)!;
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node(fe).a = parts;
+    p.f.node(fe).flags = F_STRETCHY;
+    set_s(p, fe, open)!;
+    set_s2(p, fe, close)!;
+    return fe;
+}
+
+// \big and the like (SIZES[k]): a delimiter of a fixed size.
+fn sized_delimiter(p: *mut Parser, k: usize) TexError!u32 {
+    let d = delimiter(p)!;
+    let mut cls = C_ORD;
+    if (k >= 4) and (k < 8) {
+        cls = C_OPEN;
+    } else if (k >= 8) and (k < 12) {
+        cls = C_CLOSE;
+    } else if k >= 12 {
+        cls = C_REL;
+    }
+    let o = op_node(p, d, cls)!;
+    p.f.node(o).flags = F_SIZED;
+    p.f.node(o).width = SIZE_EMS[k % 4];
+    return o;
+}
+
+// \text and the like: the group as text.
+fn text_mode(p: *mut Parser) TexError!u32 {
+    let t = raw_group(p)!;
+    let n = new_node(p, Kind.TEXT)!;
+    // the few escapes text mode has
+    let mut b = strs.String.init();
+    defer b.deinit();
+    let mut i: usize = 0;
+    while i < t.len {
+        if (t[i] == '\\') and ((i + 1) < t.len) and not is_letter(t[i + 1]) {
+            b.push(t[i + 1])!;
+            i += 2;
+            continue;
+        }
+        if (t[i] == '{') or (t[i] == '}') {
+            i += 1;
+            continue;
+        }
+        b.push(t[i])!;
+        i += 1;
+    }
+    set_s(p, n, b.bytes())!;
+    return n;
+}
+
+// \pmod{n} (paren): a quad and (mod n); \mod{n}: a quad, mod and n.
+fn modulo(p: *mut Parser, paren: bool) TexError!u32 {
+    let arg = argument(p)!;
+    let r = new_node(p, Kind.ROW)!;
+    let mut last: u32 = NIL;
+    let sp = new_node(p, Kind.SPACE)!;
+    p.f.node(sp).width = 1.0;
+    append_child(p, r, sp, &mut last);
+    let inner = new_node(p, Kind.ROW)!;
+    let mut il: u32 = NIL;
+    let m = ident(p, "mod", true)!;
+    p.f.node(m).flags = F_FUNC;
+    p.f.node(m).cls = C_FUNC;
+    append_child(p, inner, m, &mut il);
+    let sp2 = new_node(p, Kind.SPACE)!;
+    p.f.node(sp2).width = 0.333;
+    append_child(p, inner, sp2, &mut il);
+    append_child(p, inner, arg, &mut il);
+    if not paren {
+        append_child(p, r, inner, &mut last);
+        return r;
+    }
+    let fe = new_node(p, Kind.FENCE)!;
+    p.f.node(fe).a = inner;
+    set_s(p, fe, "(")!;
+    set_s2(p, fe, ")")!;
+    append_child(p, r, fe, &mut last);
+    return r;
+}
+
+// \operatorname and \operatorname*.
+fn operator_name(p: *mut Parser) TexError!u32 {
+    let mut star = false;
+    if peek(p) == '*' {
+        p.pos += 1;
+        star = true;
+    }
+    let t = raw_group(p)!;
+    let n = ident(p, strs.trim(t), true)!;
+    p.f.node(n).flags = F_FUNC;
+    if star {
+        p.f.node(n).cls = C_FUNCL;
+    } else {
+        p.f.node(n).cls = C_FUNC;
+    }
+    return n;
+}
+
+// \mathbf and the like (FONTS[k]).
+fn font_command(p: *mut Parser, k: usize) TexError!u32 {
+    let saved = p.font;
+    p.font = FONT_OF[k];
+    defer p.font = saved;
+    if k >= 13 {
+        // \bf and the like: the rest of the group
+        return row(p);
+    }
+    if p.font == Font.ROMAN {
+        // \mathrm{abc}: one upright identifier
+        let save = p.pos;
+        let t = raw_group(p)!;
+        let mut letters = t.len > 1;
+        for ch in t {
+            if not is_letter(ch) {
+                letters = false;
+            }
+        }
+        if letters {
+            return ident(p, t, true);
+        }
+        p.pos = save;
+    }
+    return argument(p);
+}
+
+// \overset, \underset and \stackrel.
+fn over_under_set(p: *mut Parser, name: []u8) TexError!u32 {
+    let top = argument(p)!;
+    let base = argument(p)!;
+    let l = new_node(p, Kind.LIMITS)!;
+    let ln = p.f.node(l);
+    ln.a = base;
+    if strs.eq(name, "underset") {
+        ln.b = top;
+    } else {
+        ln.c = top;
+    }
+    return l;
+}
+
+// \not: the next operator or identifier, struck through.
+fn negation(p: *mut Parser) TexError!u32 {
+    enter(p)!;
+    defer p.depth -= 1;
+    let next = primary(p)!;
+    if next == NIL {
+        return fail(p, "\\not of nothing");
+    }
+    let nd = p.f.node(next);
+    if (nd.kind == Kind.OP) or (nd.kind == Kind.IDENT) {
+        // the character with U+0338 (a precomposed one where there is)
+        let t = p.f.str(nd.s, nd.sl);
+        let pre: [6][]u8 = ["=", "\u{2208}", "\u{2264}", "\u{2265}", "\u{2282}", "\u{2261}"];
+        let neg: [6][]u8 = ["\u{2260}", "\u{2209}", "\u{2270}", "\u{2271}", "\u{2284}", "\u{2262}"];
+        for k in @as(usize, 0)..6 {
+            if strs.eq(t, pre[k]) {
+                return op_node(p, neg[k], C_REL);
+            }
+        }
+        let mut b = strs.String.init();
+        defer b.deinit();
+        b.push_str(t)!;
+        b.push_str("\u{338}")!;
+        return op_node(p, b.bytes(), C_REL);
+    }
+    return next;
+}
+
+// A command from SYMBOLS: an accent, a Greek letter, a function name or an operator.
+fn symbol(p: *mut Parser, name: []u8, sym: Sym) TexError!u32 {
     if sym.cls == C_ACCENT {
-        let base = argument(p)!;
-        let acc = new_node(p, Kind.ACCENT)!;
-        let parts = accent_parts(sym.text);
-        set_s(p, acc, parts[0])!;
-        set_s2(p, acc, parts[1])!;
-        let an = p.f.node(acc);
-        an.a = base;
-        if strs.eq(name, "underline") or strs.eq(name, "underbrace") {
-            an.flags = F_UNDER;
-        }
-        if strs.eq(name, "widehat") or strs.eq(name, "widetilde") or strs.eq(name, "overline") or
-           strs.eq(name, "underline") or strs.eq(name, "overrightarrow") or strs.eq(name, "overleftarrow") or
-           strs.eq(name, "overbrace") or strs.eq(name, "underbrace") {
-            an.flags |= F_STRETCHY;
-        }
-        if strs.eq(name, "overbrace") {
-            an.cls = 1;
-        } else if strs.eq(name, "underbrace") {
-            an.cls = 2;
-        }
-        return acc;
+        return accent(p, name, sym);
     }
     if (sym.cls == C_GREEK) or (sym.cls == C_UGREEK) {
         if p.font != Font.NONE {
@@ -1473,6 +1516,31 @@ fn command(p: *mut Parser) TexError!u32 {
         return n;
     }
     return op_node(p, sym.text, sym.cls);
+}
+
+// An accent over (or under) the argument.
+fn accent(p: *mut Parser, name: []u8, sym: Sym) TexError!u32 {
+    let base = argument(p)!;
+    let acc = new_node(p, Kind.ACCENT)!;
+    let parts = accent_parts(sym.text);
+    set_s(p, acc, parts[0])!;
+    set_s2(p, acc, parts[1])!;
+    let an = p.f.node(acc);
+    an.a = base;
+    if strs.eq(name, "underline") or strs.eq(name, "underbrace") {
+        an.flags = F_UNDER;
+    }
+    if strs.eq(name, "widehat") or strs.eq(name, "widetilde") or strs.eq(name, "overline") or
+       strs.eq(name, "underline") or strs.eq(name, "overrightarrow") or strs.eq(name, "overleftarrow") or
+       strs.eq(name, "overbrace") or strs.eq(name, "underbrace") {
+        an.flags |= F_STRETCHY;
+    }
+    if strs.eq(name, "overbrace") {
+        an.cls = 1;
+    } else if strs.eq(name, "underbrace") {
+        an.cls = 2;
+    }
+    return acc;
 }
 
 // A delimiter after \left, \right, \middle or \big: its text ("" for '.').
@@ -1764,25 +1832,7 @@ fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
             o.esc(t)!;
             o.s("</mn>")!;
         }
-        .OP => {
-            if (n.flags & F_SIZED) != 0 {
-                o.s("<mo minsize=\"")!;
-                em(o, n.width)!;
-                o.s("\" maxsize=\"")!;
-                em(o, n.width)!;
-                o.s("\">")!;
-            } else if (n.flags & F_STRETCHY) != 0 {
-                o.s("<mo stretchy=\"true\">")!;
-            } else if (n.cls == C_OPEN) or (n.cls == C_CLOSE) {
-                o.s("<mo stretchy=\"false\">")!;
-            } else if (n.cls == C_ORD) and not strs.eq(t, "|") and not strs.eq(t, "/") {
-                o.s("<mo form=\"prefix\" lspace=\"0\" rspace=\"0\">")!;
-            } else {
-                o.s("<mo>")!;
-            }
-            o.esc(t)!;
-            o.s("</mo>")!;
-        }
+        .OP => { op_mathml(o, n, t)!; }
         .TEXT => {
             o.s("<mtext>")!;
             o.esc(t)!;
@@ -1793,24 +1843,7 @@ fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
             em(o, n.width)!;
             o.s("\"></mspace>")!;
         }
-        .FRAC => {
-            if (n.flags & F_DISPLAY) != 0 {
-                o.s("<mstyle displaystyle=\"true\" scriptlevel=\"0\">")!;
-            } else if (n.flags & F_TEXTSTYLE) != 0 {
-                o.s("<mstyle displaystyle=\"false\">")!;
-            }
-            if (n.flags & F_THIN0) != 0 {
-                o.s("<mfrac linethickness=\"0\">")!;
-            } else {
-                o.s("<mfrac>")!;
-            }
-            mathml(f, o, n.a)!;
-            mathml(f, o, n.b)!;
-            o.s("</mfrac>")!;
-            if (n.flags & (F_DISPLAY | F_TEXTSTYLE)) != 0 {
-                o.s("</mstyle>")!;
-            }
-        }
+        .FRAC => { frac_mathml(f, o, n)!; }
         .SQRT => {
             o.s("<msqrt>")!;
             mathml(f, o, n.a)!;
@@ -1822,140 +1855,11 @@ fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
             mathml(f, o, n.b)!;
             o.s("</mroot>")!;
         }
-        .SCRIPTS => {
-            if (n.b != NIL) and (n.c != NIL) {
-                o.s("<msubsup>")!;
-            } else if n.b != NIL {
-                o.s("<msub>")!;
-            } else {
-                o.s("<msup>")!;
-            }
-            mathml(f, o, n.a)!;
-            if n.b != NIL {
-                mathml(f, o, n.b)!;
-            }
-            if n.c != NIL {
-                mathml(f, o, n.c)!;
-            }
-            if (n.b != NIL) and (n.c != NIL) {
-                o.s("</msubsup>")!;
-            } else if n.b != NIL {
-                o.s("</msub>")!;
-            } else {
-                o.s("</msup>")!;
-            }
-        }
-        .LIMITS => {
-            let base = f.node(n.a);
-            // big operators move their limits to the side in inline style
-            // (movablelimits); \limits keeps them above and below
-            let mut tag: []u8 = "munderover";
-            if n.b == NIL {
-                tag = "mover";
-            } else if n.c == NIL {
-                tag = "munder";
-            }
-            o.s("<")!;
-            o.s(tag)!;
-            o.s(">")!;
-            if ((n.flags & F_LIMITS) != 0) and (base.kind == Kind.OP) {
-                o.s("<mo movablelimits=\"false\">")!;
-                o.esc(f.str(base.s, base.sl))!;
-                o.s("</mo>")!;
-            } else if base.kind == Kind.IDENT and ((base.flags & F_FUNC) != 0) {
-                // lim: an identifier whose limits may move
-                o.s("<mo movablelimits=\"true\" form=\"prefix\">")!;
-                o.esc(f.str(base.s, base.sl))!;
-                o.s("</mo>")!;
-            } else {
-                mathml(f, o, n.a)!;
-            }
-            if n.b != NIL {
-                mathml(f, o, n.b)!;
-            }
-            if n.c != NIL {
-                mathml(f, o, n.c)!;
-            }
-            o.s("</")!;
-            o.s(tag)!;
-            o.s(">")!;
-        }
-        .ACCENT => {
-            let under = (n.flags & F_UNDER) != 0;
-            if under {
-                o.s("<munder accentunder=\"true\">")!;
-            } else {
-                o.s("<mover accent=\"true\">")!;
-            }
-            mathml(f, o, n.a)!;
-            if (n.flags & F_STRETCHY) != 0 {
-                o.s("<mo stretchy=\"true\">")!;
-            } else {
-                o.s("<mo stretchy=\"false\">")!;
-            }
-            o.esc(t)!;
-            o.s("</mo>")!;
-            if under {
-                o.s("</munder>")!;
-            } else {
-                o.s("</mover>")!;
-            }
-        }
-        .FENCE => {
-            let t2 = f.str(n.s2, n.s2l);
-            let mut st: []u8 = "<mo fence=\"true\" stretchy=\"false\">";
-            if (n.flags & F_STRETCHY) != 0 {
-                st = "<mo fence=\"true\" stretchy=\"true\" symmetric=\"true\">";
-            }
-            o.s("<mrow>")!;
-            if t.len > 0 {
-                o.s(st)!;
-                o.esc(t)!;
-                o.s("</mo>")!;
-            }
-            mathml(f, o, n.a)!;
-            if t2.len > 0 {
-                o.s(st)!;
-                o.esc(t2)!;
-                o.s("</mo>")!;
-            }
-            o.s("</mrow>")!;
-        }
-        .TABLE => {
-            if (n.flags & F_SMALL) != 0 {
-                o.s("<mstyle scriptlevel=\"1\">")!;
-            }
-            o.s("<mtable>")!;
-            let mut r = n.first;
-            while r != NIL {
-                o.s("<mtr>")!;
-                let mut c = f.node(r).first;
-                let mut col: usize = 0;
-                while c != NIL {
-                    if (n.flags & F_LEFT) != 0 {
-                        o.s("<mtd style=\"text-align:left\">")!;
-                    } else if (n.flags & F_ALIGN) != 0 {
-                        if (col % 2) == 0 {
-                            o.s("<mtd style=\"text-align:right;padding-right:0\">")!;
-                        } else {
-                            o.s("<mtd style=\"text-align:left;padding-left:0\">")!;
-                        }
-                    } else {
-                        o.s("<mtd>")!;
-                    }
-                    mathml(f, o, f.node(c).a)!;
-                    o.s("</mtd>")!;
-                    c = f.node(c).next;
-                    col += 1;
-                }
-                o.s("</mtr>")!;
-                r = f.node(r).next;
-            }
-            o.s("</mtable>")!;
-            if (n.flags & F_SMALL) != 0 {
-                o.s("</mstyle>")!;
-            }
-        }
+        .SCRIPTS => { scripts_mathml(f, o, n)!; }
+        .LIMITS  => { limits_mathml(f, o, n)!; }
+        .ACCENT  => { accent_mathml(f, o, n, t)!; }
+        .FENCE   => { fence_mathml(f, o, n, t)!; }
+        .TABLE   => { table_mathml(f, o, n)!; }
         .TROW => {}
         .TCELL => {}
         .ENCLOSE => { enclose_mathml(f, o, n)!; }
@@ -1972,6 +1876,190 @@ fn mathml(f: *Formula, o: *mut Out, i: u32) !void {
             mathml(f, o, n.a)!;
             o.s("</mstyle>")!;
         }
+    }
+}
+
+// An operator: <mo>, stretchy or not, sized, or (a lone ordinary symbol) without
+// space around it.
+fn op_mathml(o: *mut Out, n: *Node, t: []u8) !void {
+    if (n.flags & F_SIZED) != 0 {
+        o.s("<mo minsize=\"")!;
+        em(o, n.width)!;
+        o.s("\" maxsize=\"")!;
+        em(o, n.width)!;
+        o.s("\">")!;
+    } else if (n.flags & F_STRETCHY) != 0 {
+        o.s("<mo stretchy=\"true\">")!;
+    } else if (n.cls == C_OPEN) or (n.cls == C_CLOSE) {
+        o.s("<mo stretchy=\"false\">")!;
+    } else if (n.cls == C_ORD) and not strs.eq(t, "|") and not strs.eq(t, "/") {
+        o.s("<mo form=\"prefix\" lspace=\"0\" rspace=\"0\">")!;
+    } else {
+        o.s("<mo>")!;
+    }
+    o.esc(t)!;
+    o.s("</mo>")!;
+}
+
+// A fraction (in a style of its own for \dfrac and \tfrac).
+fn frac_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.flags & F_DISPLAY) != 0 {
+        o.s("<mstyle displaystyle=\"true\" scriptlevel=\"0\">")!;
+    } else if (n.flags & F_TEXTSTYLE) != 0 {
+        o.s("<mstyle displaystyle=\"false\">")!;
+    }
+    if (n.flags & F_THIN0) != 0 {
+        o.s("<mfrac linethickness=\"0\">")!;
+    } else {
+        o.s("<mfrac>")!;
+    }
+    mathml(f, o, n.a)!;
+    mathml(f, o, n.b)!;
+    o.s("</mfrac>")!;
+    if (n.flags & (F_DISPLAY | F_TEXTSTYLE)) != 0 {
+        o.s("</mstyle>")!;
+    }
+}
+
+// A base with a subscript, a superscript or both.
+fn scripts_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    let mut tag: []u8 = "msup";
+    if (n.b != NIL) and (n.c != NIL) {
+        tag = "msubsup";
+    } else if n.b != NIL {
+        tag = "msub";
+    }
+    o.s("<")!;
+    o.s(tag)!;
+    o.s(">")!;
+    mathml(f, o, n.a)!;
+    if n.b != NIL {
+        mathml(f, o, n.b)!;
+    }
+    if n.c != NIL {
+        mathml(f, o, n.c)!;
+    }
+    o.s("</")!;
+    o.s(tag)!;
+    o.s(">")!;
+}
+
+// A base with limits under it, over it or both.
+fn limits_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    let base = f.node(n.a);
+    // big operators move their limits to the side in inline style
+    // (movablelimits); \limits keeps them above and below
+    let mut tag: []u8 = "munderover";
+    if n.b == NIL {
+        tag = "mover";
+    } else if n.c == NIL {
+        tag = "munder";
+    }
+    o.s("<")!;
+    o.s(tag)!;
+    o.s(">")!;
+    if ((n.flags & F_LIMITS) != 0) and (base.kind == Kind.OP) {
+        o.s("<mo movablelimits=\"false\">")!;
+        o.esc(f.str(base.s, base.sl))!;
+        o.s("</mo>")!;
+    } else if base.kind == Kind.IDENT and ((base.flags & F_FUNC) != 0) {
+        // lim: an identifier whose limits may move
+        o.s("<mo movablelimits=\"true\" form=\"prefix\">")!;
+        o.esc(f.str(base.s, base.sl))!;
+        o.s("</mo>")!;
+    } else {
+        mathml(f, o, n.a)!;
+    }
+    if n.b != NIL {
+        mathml(f, o, n.b)!;
+    }
+    if n.c != NIL {
+        mathml(f, o, n.c)!;
+    }
+    o.s("</")!;
+    o.s(tag)!;
+    o.s(">")!;
+}
+
+// An accent over or under the base.
+fn accent_mathml(f: *Formula, o: *mut Out, n: *Node, t: []u8) !void {
+    let under = (n.flags & F_UNDER) != 0;
+    if under {
+        o.s("<munder accentunder=\"true\">")!;
+    } else {
+        o.s("<mover accent=\"true\">")!;
+    }
+    mathml(f, o, n.a)!;
+    if (n.flags & F_STRETCHY) != 0 {
+        o.s("<mo stretchy=\"true\">")!;
+    } else {
+        o.s("<mo stretchy=\"false\">")!;
+    }
+    o.esc(t)!;
+    o.s("</mo>")!;
+    if under {
+        o.s("</munder>")!;
+    } else {
+        o.s("</mover>")!;
+    }
+}
+
+// Content between delimiters (stretchy ones from \left and \right).
+fn fence_mathml(f: *Formula, o: *mut Out, n: *Node, t: []u8) !void {
+    let t2 = f.str(n.s2, n.s2l);
+    let mut st: []u8 = "<mo fence=\"true\" stretchy=\"false\">";
+    if (n.flags & F_STRETCHY) != 0 {
+        st = "<mo fence=\"true\" stretchy=\"true\" symmetric=\"true\">";
+    }
+    o.s("<mrow>")!;
+    if t.len > 0 {
+        o.s(st)!;
+        o.esc(t)!;
+        o.s("</mo>")!;
+    }
+    mathml(f, o, n.a)!;
+    if t2.len > 0 {
+        o.s(st)!;
+        o.esc(t2)!;
+        o.s("</mo>")!;
+    }
+    o.s("</mrow>")!;
+}
+
+// An array or matrix.
+fn table_mathml(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.flags & F_SMALL) != 0 {
+        o.s("<mstyle scriptlevel=\"1\">")!;
+    }
+    o.s("<mtable>")!;
+    let mut r = n.first;
+    while r != NIL {
+        o.s("<mtr>")!;
+        let mut c = f.node(r).first;
+        let mut col: usize = 0;
+        while c != NIL {
+            if (n.flags & F_LEFT) != 0 {
+                o.s("<mtd style=\"text-align:left\">")!;
+            } else if (n.flags & F_ALIGN) != 0 {
+                if (col % 2) == 0 {
+                    o.s("<mtd style=\"text-align:right;padding-right:0\">")!;
+                } else {
+                    o.s("<mtd style=\"text-align:left;padding-left:0\">")!;
+                }
+            } else {
+                o.s("<mtd>")!;
+            }
+            mathml(f, o, f.node(c).a)!;
+            o.s("</mtd>")!;
+            c = f.node(c).next;
+            col += 1;
+        }
+        o.s("</mtr>")!;
+        r = f.node(r).next;
+    }
+    o.s("</mtable>")!;
+    if (n.flags & F_SMALL) != 0 {
+        o.s("</mstyle>")!;
     }
 }
 
@@ -2219,47 +2307,7 @@ fn text(f: *Formula, o: *mut Out, i: u32) !void {
     let n = f.node(i);
     let t = f.str(n.s, n.sl);
     match n.kind {
-        .ROW => {
-            if (n.first != NIL) and (f.node(n.first).next == NIL) {
-                text(f, o, n.first)!;
-                return;
-            }
-            let mut prev_cls: u8 = 255;  // nothing yet: a + or - is a sign
-            let mut c = n.first;
-            while c != NIL {
-                let cn = f.node(c);
-                let cls = text_class(f, c);
-                let unary = (prev_cls == 255) or (prev_cls == C_BIN) or (prev_cls == C_REL) or (prev_cls == C_OPEN) or
-                            (prev_cls == C_PUNCT) or (prev_cls == C_LARGE);
-                let func = is_func(f, c);
-                if (cls == C_REL) or ((cls == C_BIN) and not unary) {
-                    o.s(" ")!;
-                    text(f, o, c)!;
-                    o.s(" ")!;
-                } else if cls == C_PUNCT {
-                    text(f, o, c)!;
-                    o.s(" ")!;
-                } else {
-                    // a space between a name and a function name: "n log n"
-                    if func and ((prev_cls == C_ORD) or (prev_cls == C_CLOSE)) {
-                        o.s(" ")!;
-                    }
-                    text(f, o, c)!;
-                }
-                prev_cls = cls;
-                // a space after a function name, unless brackets follow
-                let nx = cn.next;
-                if func and (nx != NIL) and
-                   not ((f.node(nx).kind == Kind.FENCE) or (f.node(nx).kind == Kind.SPACE) or
-                        ((f.node(nx).kind == Kind.OP) and
-                         ((f.node(nx).cls == C_OPEN) or (f.node(nx).cls == C_REL) or (f.node(nx).cls == C_BIN) or
-                          (f.node(nx).cls == C_PUNCT)))) {
-                    o.s(" ")!;
-                    prev_cls = C_OPEN;
-                }
-                c = cn.next;
-            }
-        }
+        .ROW    => { row_text(f, o, n)!; }
         .IDENT  => { o.s(t)!; }
         .NUMBER => { o.s(t)!; }
         .TEXT   => { o.s(t)!; }
@@ -2305,83 +2353,138 @@ fn text(f: *Formula, o: *mut Out, i: u32) !void {
         }
         .SCRIPTS => { text_scripts(f, o, n)!; }
         .LIMITS  => { text_scripts(f, o, n)!; }
-        .ACCENT => {
-            let comb = f.str(n.s2, n.s2l);
-            let mut inner = text_to_string(f, n.a)!;
-            defer inner.deinit();
-            let b = inner.bytes();
-            if comb.len == 0 {
-                o.s(b)!;  // braces have no combining form
-                return;
-            }
-            let per_char = strs.eq(comb, "\u{305}") or strs.eq(comb, "\u{332}") or strs.eq(comb, "\u{304}");
-            let mut it = strs.runes(b);
-            let count = strs.rune_count(b);
-            let mut k: usize = 0;
-            loop {
-                let r = it.next() catch break;
-                let mut buf: [4]u8 = [0; 4];
-                o.s(strs.encode_rune(buf[..], r))!;
-                k += 1;
-                if per_char or (k == count) {
-                    o.s(comb)!;
-                }
-            }
-        }
+        .ACCENT  => { accent_text(f, o, n)!; }
         .FENCE => {
             o.s(t)!;
             text(f, o, n.a)!;
             o.s(f.str(n.s2, n.s2l))!;
         }
-        .TABLE => {
-            let mut r = n.first;
-            let mut first_row = true;
-            while r != NIL {
-                if not first_row {
-                    o.s("; ")!;
-                }
-                first_row = false;
-                let mut line = strs.String.init();
-                defer line.deinit();
-                let mut lo = Out.init(line.writer());
-                let mut c = f.node(r).first;
-                let mut first = true;
-                while c != NIL {
-                    if (not first) and ((n.flags & F_ALIGN) == 0) {
-                        lo.s(", ")!;
-                    }
-                    first = false;
-                    text(f, &mut lo, f.node(c).a)!;
-                    c = f.node(c).next;
-                }
-                lo.flush()!;
-                o.s(strs.trim(line.bytes()))!;
-                r = f.node(r).next;
-            }
-        }
+        .TABLE => { table_text(f, o, n)!; }
         .TROW => {}
         .TCELL => {}
-        .ENCLOSE => {
-            if (n.cls == E_CANCEL) or (n.cls == E_BCANCEL) or (n.cls == E_XCANCEL) {
-                // a stroke over each character
-                let mut inner = text_to_string(f, n.a)!;
-                defer inner.deinit();
-                let mut it = strs.runes(inner.bytes());
-                loop {
-                    let r = it.next() catch break;
-                    let mut b: [4]u8 = [0; 4];
-                    o.s(strs.encode_rune(b[..], r))!;
-                    if n.cls == E_BCANCEL {
-                        o.s("\u{20e5}")!;
-                    } else {
-                        o.s("\u{338}")!;
-                    }
-                }
-            } else if n.cls == E_BOX {
-                text(f, o, n.a)!;
+        .ENCLOSE => { enclose_text(f, o, n)!; }
+        .STYLE   => { text(f, o, n.a)!; }
+    }
+}
+
+// A row: spaces around relations and binary operators (not signs), after
+// punctuation, and around function names.
+fn row_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.first != NIL) and (f.node(n.first).next == NIL) {
+        text(f, o, n.first)!;
+        return;
+    }
+    let mut prev_cls: u8 = 255;  // nothing yet: a + or - is a sign
+    let mut c = n.first;
+    while c != NIL {
+        let cn = f.node(c);
+        let cls = text_class(f, c);
+        let unary = (prev_cls == 255) or (prev_cls == C_BIN) or (prev_cls == C_REL) or (prev_cls == C_OPEN) or
+                    (prev_cls == C_PUNCT) or (prev_cls == C_LARGE);
+        let func = is_func(f, c);
+        if (cls == C_REL) or ((cls == C_BIN) and not unary) {
+            o.s(" ")!;
+            text(f, o, c)!;
+            o.s(" ")!;
+        } else if cls == C_PUNCT {
+            text(f, o, c)!;
+            o.s(" ")!;
+        } else {
+            // a space between a name and a function name: "n log n"
+            if func and ((prev_cls == C_ORD) or (prev_cls == C_CLOSE)) {
+                o.s(" ")!;
+            }
+            text(f, o, c)!;
+        }
+        prev_cls = cls;
+        // a space after a function name, unless brackets follow
+        let nx = cn.next;
+        if func and (nx != NIL) and
+           not ((f.node(nx).kind == Kind.FENCE) or (f.node(nx).kind == Kind.SPACE) or
+                ((f.node(nx).kind == Kind.OP) and
+                 ((f.node(nx).cls == C_OPEN) or (f.node(nx).cls == C_REL) or (f.node(nx).cls == C_BIN) or
+                  (f.node(nx).cls == C_PUNCT)))) {
+            o.s(" ")!;
+            prev_cls = C_OPEN;
+        }
+        c = cn.next;
+    }
+}
+
+// An accent: its combining character after the base (after each character
+// of it, for bars).
+fn accent_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    let comb = f.str(n.s2, n.s2l);
+    let mut inner = text_to_string(f, n.a)!;
+    defer inner.deinit();
+    let b = inner.bytes();
+    if comb.len == 0 {
+        o.s(b)!;  // braces have no combining form
+        return;
+    }
+    let per_char = strs.eq(comb, "\u{305}") or strs.eq(comb, "\u{332}") or strs.eq(comb, "\u{304}");
+    let mut it = strs.runes(b);
+    let count = strs.rune_count(b);
+    let mut k: usize = 0;
+    loop {
+        let r = it.next() catch break;
+        let mut buf: [4]u8 = [0; 4];
+        o.s(strs.encode_rune(buf[..], r))!;
+        k += 1;
+        if per_char or (k == count) {
+            o.s(comb)!;
+        }
+    }
+}
+
+// An array or matrix: rows separated by semicolons, cells by commas.
+fn table_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    let mut r = n.first;
+    let mut first_row = true;
+    while r != NIL {
+        if not first_row {
+            o.s("; ")!;
+        }
+        first_row = false;
+        let mut line = strs.String.init();
+        defer line.deinit();
+        let mut lo = Out.init(line.writer());
+        let mut c = f.node(r).first;
+        let mut first = true;
+        while c != NIL {
+            if (not first) and ((n.flags & F_ALIGN) == 0) {
+                lo.s(", ")!;
+            }
+            first = false;
+            text(f, &mut lo, f.node(c).a)!;
+            c = f.node(c).next;
+        }
+        lo.flush()!;
+        o.s(strs.trim(line.bytes()))!;
+        r = f.node(r).next;
+    }
+}
+
+// \boxed (its content) or \cancel and friends (struck through); phantoms
+// leave nothing.
+fn enclose_text(f: *Formula, o: *mut Out, n: *Node) !void {
+    if (n.cls == E_CANCEL) or (n.cls == E_BCANCEL) or (n.cls == E_XCANCEL) {
+        // a stroke over each character
+        let mut inner = text_to_string(f, n.a)!;
+        defer inner.deinit();
+        let mut it = strs.runes(inner.bytes());
+        loop {
+            let r = it.next() catch break;
+            let mut b: [4]u8 = [0; 4];
+            o.s(strs.encode_rune(b[..], r))!;
+            if n.cls == E_BCANCEL {
+                o.s("\u{20e5}")!;
+            } else {
+                o.s("\u{338}")!;
             }
         }
-        .STYLE => { text(f, o, n.a)!; }
+    } else if n.cls == E_BOX {
+        text(f, o, n.a)!;
     }
 }
 

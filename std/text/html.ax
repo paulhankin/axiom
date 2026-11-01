@@ -697,944 +697,1007 @@ pub struct Tokenizer {
     }
 
     // Runs the state machine until a token other than characters is complete
-    // (characters collect in self.chars): returns its kind.
+    // (characters collect in self.chars): returns its kind. Each step below
+    // handles a group of states and returns TokenKind.NONE to go on.
     fn run(self: *mut Tokenizer) HtmlError!TokenKind {
-        let s = self.s;
-        let n = s.len;
         loop {
             let st = self.state;
-            // --- the text states, a run at a time
-            if st == State.DATA {
-                let b = self.i;
-                let mut i = b;
-                while (i < n) and (s[i] != '<') and (s[i] != '&') and (s[i] != 0) {
-                    i += 1;
+            let mut k = TokenKind.NONE;
+            match st {
+                .DATA                                           => { k = self.data()!; }
+                .RCDATA, .RAWTEXT, .SCRIPT, .PLAINTEXT          => { k = self.text(st)!; }
+                .TAG_OPEN, .END_TAG_OPEN, .SELF_CLOSING         => { k = self.tag(st)!; }
+                .TAG_NAME                                       => { k = self.tag_name()!; }
+                .BEFORE_ATTR_NAME, .ATTR_NAME, .AFTER_ATTR_NAME => { k = self.attr_name(st)!; }
+                .BEFORE_ATTR_VALUE, .ATTR_VALUE_DQ, .ATTR_VALUE_SQ, .ATTR_VALUE_UNQ, .AFTER_ATTR_VALUE => {
+                    k = self.attr_value(st)!;
                 }
-                self.chars.push_str(s[b..i])!;
-                self.i = i;
-                if i >= n {
-                    return TokenKind.EOF;
+                .RCDATA_LT, .RAWTEXT_LT, .RCDATA_END_OPEN, .RAWTEXT_END_OPEN, .SCRIPT_END_OPEN, .SCRIPT_ESC_END_OPEN,
+                    .RCDATA_END_NAME, .RAWTEXT_END_NAME, .SCRIPT_END_NAME, .SCRIPT_ESC_END_NAME => {
+                    k = self.text_end_tag(st)!;
                 }
-                self.i = i + 1;
-                let c = s[i];
-                if c == '&' {
-                    self.char_ref(false)!;
-                } else if c == '<' {
-                    self.state = State.TAG_OPEN;
-                } else {
-                    self.err();
-                    self.chars.push(0)!;  // (the tree builder drops it)
+                .SCRIPT_LT, .SCRIPT_ESC_START, .SCRIPT_ESC_START_DASH, .SCRIPT_ESC, .SCRIPT_ESC_DASH,
+                    .SCRIPT_ESC_DASH_DASH, .SCRIPT_ESC_LT => {
+                    k = self.script_escaped(st)!;
                 }
-                continue;
+                .SCRIPT_DESC_START, .SCRIPT_DESC_END, .SCRIPT_DESC, .SCRIPT_DESC_DASH, .SCRIPT_DESC_DASH_DASH,
+                    .SCRIPT_DESC_LT => {
+                    k = self.script_double_escaped(st)!;
+                }
+                .MARKUP_DECL, .BOGUS_COMMENT, .COMMENT_START, .COMMENT_START_DASH => { k = self.comment_open(st)!; }
+                .COMMENT, .COMMENT_LT, .COMMENT_LT_BANG, .COMMENT_LT_BANG_DASH, .COMMENT_LT_BANG_DASH_DASH => {
+                    k = self.comment_body(st)!;
+                }
+                .COMMENT_END_DASH, .COMMENT_END, .COMMENT_END_BANG                 => { k = self.comment_end(st)!; }
+                .CDATA, .CDATA_BRACKET, .CDATA_END                                 => { k = self.cdata(st)!; }
+                .DOCTYPE, .BEFORE_DOCTYPE_NAME, .DOCTYPE_NAME, .AFTER_DOCTYPE_NAME => { k = self.doctype_name(st)!; }
+                .AFTER_DOCTYPE_PUBLIC_KW, .BEFORE_DOCTYPE_PUBLIC_ID, .AFTER_DOCTYPE_SYSTEM_KW,
+                    .BEFORE_DOCTYPE_SYSTEM_ID, .DOCTYPE_PUBLIC_ID_DQ, .DOCTYPE_PUBLIC_ID_SQ, .DOCTYPE_SYSTEM_ID_DQ,
+                    .DOCTYPE_SYSTEM_ID_SQ => {
+                    k = self.doctype_id(st)!;
+                }
+                .AFTER_DOCTYPE_PUBLIC_ID, .BETWEEN_DOCTYPE_IDS, .AFTER_DOCTYPE_SYSTEM_ID, .BOGUS_DOCTYPE => {
+                    k = self.doctype_after_id(st)!;
+                }
             }
-            if (st == State.RCDATA) or (st == State.RAWTEXT) or (st == State.SCRIPT) or (st == State.PLAINTEXT) {
-                let b = self.i;
-                let mut i = b;
-                while (i < n) and (s[i] != '<') and (s[i] != 0) and ((s[i] != '&') or (st != State.RCDATA)) {
-                    i += 1;
-                }
-                self.chars.push_str(s[b..i])!;
-                self.i = i;
-                if i >= n {
-                    return TokenKind.EOF;
-                }
-                self.i = i + 1;
-                let c = s[i];
+            if k != TokenKind.NONE {
+                return k;
+            }
+        }
+    }
+
+    // The data state: a run of text up to a tag, a character reference or a NUL.
+    fn data(self: *mut Tokenizer) HtmlError!TokenKind {
+        let s = self.s;
+        let n = s.len;
+        let b = self.i;
+        let mut i = b;
+        while (i < n) and (s[i] != '<') and (s[i] != '&') and (s[i] != 0) {
+            i += 1;
+        }
+        self.chars.push_str(s[b..i])!;
+        self.i = i;
+        if i >= n {
+            return TokenKind.EOF;
+        }
+        self.i = i + 1;
+        let c = s[i];
+        if c == '&' {
+            self.char_ref(false)!;
+        } else if c == '<' {
+            self.state = State.TAG_OPEN;
+        } else {
+            self.err();
+            self.chars.push(0)!;  // (the tree builder drops it)
+        }
+        return TokenKind.NONE;
+    }
+
+    // The RCDATA, RAWTEXT, script data and PLAINTEXT states: a run of text.
+    fn text(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let s = self.s;
+        let n = s.len;
+        let b = self.i;
+        let mut i = b;
+        while (i < n) and (s[i] != '<') and (s[i] != 0) and ((s[i] != '&') or (st != State.RCDATA)) {
+            i += 1;
+        }
+        self.chars.push_str(s[b..i])!;
+        self.i = i;
+        if i >= n {
+            return TokenKind.EOF;
+        }
+        self.i = i + 1;
+        let c = s[i];
+        if c == 0 {
+            self.err();
+            self.chars.push_str("\xef\xbf\xbd")!;
+        } else if c == '&' {
+            self.char_ref(false)!;
+        } else if st == State.PLAINTEXT {
+            self.chars.push('<')!;
+        } else if st == State.RCDATA {
+            self.state = State.RCDATA_LT;
+        } else if st == State.RAWTEXT {
+            self.state = State.RAWTEXT_LT;
+        } else {
+            self.state = State.SCRIPT_LT;
+        }
+        return TokenKind.NONE;
+    }
+
+    // The tag open, end tag open and self-closing start tag states.
+    fn tag(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if st == State.TAG_OPEN {
+            if c == '!' {
+                self.i += 1;
+                self.state = State.MARKUP_DECL;
+            } else if c == '/' {
+                self.i += 1;
+                self.state = State.END_TAG_OPEN;
+            } else if is_alpha(c) {
+                self.new_tag(TokenKind.START);
+                self.state = State.TAG_NAME;
+            } else if c == '?' {
+                self.err();
+                self.comment.clear();
+                self.state = State.BOGUS_COMMENT;
+            } else if c < 0 {
+                self.err();
+                self.chars.push('<')!;
+                return TokenKind.EOF;
+            } else {
+                self.err();
+                self.chars.push('<')!;
+                self.state = State.DATA;
+            }
+        } else if st == State.END_TAG_OPEN {
+            if is_alpha(c) {
+                self.new_tag(TokenKind.END);
+                self.state = State.TAG_NAME;
+            } else if c == '>' {
+                self.err();
+                self.i += 1;
+                self.state = State.DATA;
+            } else if c < 0 {
+                self.err();
+                self.chars.push_str("</")!;
+                return TokenKind.EOF;
+            } else {
+                self.err();
+                self.comment.clear();
+                self.state = State.BOGUS_COMMENT;
+            }
+        } else if st == State.SELF_CLOSING {
+            if c == '>' {
+                self.i += 1;
+                self.self_closing = true;
+                self.state = State.DATA;
+                return self.emit_tag();
+            } else if c < 0 {
+                self.err();
+                return TokenKind.EOF;
+            } else {
+                self.err();
+                self.state = State.BEFORE_ATTR_NAME;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // The tag name state, a run of name characters at a time.
+    fn tag_name(self: *mut Tokenizer) HtmlError!TokenKind {
+        let s = self.s;
+        let mut i = self.i;
+        while (i < s.len) and not is_ws(s[i]) and (s[i] != '/') and (s[i] != '>') and (s[i] != 0) {
+            self.name.push(lower(@as(i32, s[i])))!;
+            i += 1;
+        }
+        self.i = i;
+        let c = self.at();
+        if c < 0 {
+            self.err();
+            return TokenKind.EOF;
+        }
+        self.i += 1;
+        let b = @truncate(u8, c);
+        if is_ws(b) {
+            self.state = State.BEFORE_ATTR_NAME;
+        } else if b == '/' {
+            self.state = State.SELF_CLOSING;
+        } else if b == '>' {
+            self.state = State.DATA;
+            return self.emit_tag();
+        } else {
+            self.err();  // (NUL)
+            self.name.push_str("\xef\xbf\xbd")!;
+        }
+        return TokenKind.NONE;
+    }
+
+    // The states before, in and after an attribute name.
+    fn attr_name(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if st == State.BEFORE_ATTR_NAME {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+            } else if (c == '/') or (c == '>') or (c < 0) {
+                self.state = State.AFTER_ATTR_NAME;
+            } else if c == '=' {
+                self.err();
+                self.new_attr()!;
+                self.abuf.push('=')!;
+                self.i += 1;
+                self.state = State.ATTR_NAME;
+            } else {
+                self.new_attr()!;
+                self.state = State.ATTR_NAME;
+            }
+        } else if st == State.ATTR_NAME {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') or (c < 0) {
+                self.end_attr_name()!;
+                self.state = State.AFTER_ATTR_NAME;
+            } else if c == '=' {
+                self.end_attr_name()!;
+                self.i += 1;
+                self.state = State.BEFORE_ATTR_VALUE;
+            } else {
+                self.i += 1;
                 if c == 0 {
                     self.err();
-                    self.chars.push_str("\xef\xbf\xbd")!;
-                } else if c == '&' {
-                    self.char_ref(false)!;
-                } else if st == State.PLAINTEXT {
-                    self.chars.push('<')!;
-                } else if st == State.RCDATA {
-                    self.state = State.RCDATA_LT;
-                } else if st == State.RAWTEXT {
-                    self.state = State.RAWTEXT_LT;
-                } else {
-                    self.state = State.SCRIPT_LT;
-                }
-                continue;
-            }
-            let c = self.at();
-            if st == State.TAG_NAME {
-                if c < 0 {
-                    self.err();
-                    return TokenKind.EOF;
-                }
-                self.i += 1;
-                let b = @truncate(u8, c);
-                if is_ws(b) {
-                    self.state = State.BEFORE_ATTR_NAME;
-                } else if b == '/' {
-                    self.state = State.SELF_CLOSING;
-                } else if b == '>' {
-                    self.state = State.DATA;
-                    return self.emit_tag();
-                } else if b == 0 {
-                    self.err();
-                    self.name.push_str("\xef\xbf\xbd")!;
-                } else {
-                    self.name.push(lower(c))!;
-                }
-                continue;
-            }
-            if st == State.BEFORE_ATTR_NAME {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                } else if (c == '/') or (c == '>') or (c < 0) {
-                    self.state = State.AFTER_ATTR_NAME;
-                } else if c == '=' {
-                    self.err();
-                    self.new_attr()!;
-                    self.abuf.push('=')!;
-                    self.i += 1;
-                    self.state = State.ATTR_NAME;
-                } else {
-                    self.new_attr()!;
-                    self.state = State.ATTR_NAME;
-                }
-                continue;
-            }
-            if st == State.ATTR_NAME {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') or (c < 0) {
-                    self.end_attr_name()!;
-                    self.state = State.AFTER_ATTR_NAME;
-                } else if c == '=' {
-                    self.end_attr_name()!;
-                    self.i += 1;
-                    self.state = State.BEFORE_ATTR_VALUE;
-                } else {
-                    self.i += 1;
-                    if c == 0 {
-                        self.err();
-                        self.abuf.push_str("\xef\xbf\xbd")!;
-                    } else {
-                        if (c == '"') or (c == '\'') or (c == '<') {
-                            self.err();
-                        }
-                        self.abuf.push(lower(c))!;
-                    }
-                }
-                continue;
-            }
-            if st == State.AFTER_ATTR_NAME {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                } else if c == '/' {
-                    self.i += 1;
-                    self.state = State.SELF_CLOSING;
-                } else if c == '=' {
-                    self.i += 1;
-                    self.state = State.BEFORE_ATTR_VALUE;
-                } else if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return self.emit_tag();
-                } else if c < 0 {
-                    self.err();
-                    return TokenKind.EOF;
-                } else {
-                    self.new_attr()!;
-                    self.state = State.ATTR_NAME;
-                }
-                continue;
-            }
-            if st == State.BEFORE_ATTR_VALUE {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                } else if c == '"' {
-                    self.i += 1;
-                    self.state = State.ATTR_VALUE_DQ;
-                } else if c == '\'' {
-                    self.i += 1;
-                    self.state = State.ATTR_VALUE_SQ;
-                } else if c == '>' {
-                    self.err();
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return self.emit_tag();
-                } else {
-                    self.state = State.ATTR_VALUE_UNQ;
-                }
-                continue;
-            }
-            if (st == State.ATTR_VALUE_DQ) or (st == State.ATTR_VALUE_SQ) {
-                let mut qq: u8 = '"';
-                if st == State.ATTR_VALUE_SQ {
-                    qq = '\'';
-                }
-                let b = self.i;
-                let mut i = b;
-                while (i < n) and (s[i] != qq) and (s[i] != '&') and (s[i] != 0) {
-                    i += 1;
-                }
-                self.abuf.push_str(s[b..i])!;
-                self.i = i;
-                if i >= n {
-                    self.err();
-                    return TokenKind.EOF;
-                }
-                self.i = i + 1;
-                if s[i] == qq {
-                    self.state = State.AFTER_ATTR_VALUE;
-                } else if s[i] == '&' {
-                    self.char_ref(true)!;
-                } else {
-                    self.err();
-                    self.abuf.push_str("\xef\xbf\xbd")!;
-                }
-                continue;
-            }
-            if st == State.ATTR_VALUE_UNQ {
-                if c < 0 {
-                    self.err();
-                    return TokenKind.EOF;
-                }
-                self.i += 1;
-                let b = @truncate(u8, c);
-                if (b == '\t') or (b == '\n') or (b == 12) or (b == ' ') {
-                    self.state = State.BEFORE_ATTR_NAME;
-                } else if b == '&' {
-                    self.char_ref(true)!;
-                } else if b == '>' {
-                    self.state = State.DATA;
-                    return self.emit_tag();
-                } else if b == 0 {
-                    self.err();
                     self.abuf.push_str("\xef\xbf\xbd")!;
                 } else {
-                    if (b == '"') or (b == '\'') or (b == '<') or (b == '=') or (b == '`') {
+                    if (c == '"') or (c == '\'') or (c == '<') {
                         self.err();
                     }
-                    self.abuf.push(b)!;
+                    self.abuf.push(lower(c))!;
                 }
-                continue;
             }
-            if st == State.AFTER_ATTR_VALUE {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                    self.state = State.BEFORE_ATTR_NAME;
-                } else if c == '/' {
-                    self.i += 1;
-                    self.state = State.SELF_CLOSING;
-                } else if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return self.emit_tag();
-                } else if c < 0 {
-                    self.err();
-                    return TokenKind.EOF;
-                } else {
-                    self.err();
-                    self.state = State.BEFORE_ATTR_NAME;
-                }
-                continue;
-            }
-            if st == State.SELF_CLOSING {
-                if c == '>' {
-                    self.i += 1;
-                    self.self_closing = true;
-                    self.state = State.DATA;
-                    return self.emit_tag();
-                } else if c < 0 {
-                    self.err();
-                    return TokenKind.EOF;
-                } else {
-                    self.err();
-                    self.state = State.BEFORE_ATTR_NAME;
-                }
-                continue;
-            }
-            if st == State.TAG_OPEN {
-                if c == '!' {
-                    self.i += 1;
-                    self.state = State.MARKUP_DECL;
-                } else if c == '/' {
-                    self.i += 1;
-                    self.state = State.END_TAG_OPEN;
-                } else if is_alpha(c) {
-                    self.new_tag(TokenKind.START);
-                    self.state = State.TAG_NAME;
-                } else if c == '?' {
-                    self.err();
-                    self.comment.clear();
-                    self.state = State.BOGUS_COMMENT;
-                } else if c < 0 {
-                    self.err();
-                    self.chars.push('<')!;
-                    return TokenKind.EOF;
-                } else {
-                    self.err();
-                    self.chars.push('<')!;
-                    self.state = State.DATA;
-                }
-                continue;
-            }
-            if st == State.END_TAG_OPEN {
-                if is_alpha(c) {
-                    self.new_tag(TokenKind.END);
-                    self.state = State.TAG_NAME;
-                } else if c == '>' {
-                    self.err();
-                    self.i += 1;
-                    self.state = State.DATA;
-                } else if c < 0 {
-                    self.err();
-                    self.chars.push_str("</")!;
-                    return TokenKind.EOF;
-                } else {
-                    self.err();
-                    self.comment.clear();
-                    self.state = State.BOGUS_COMMENT;
-                }
-                continue;
-            }
-            // --- RCDATA, RAWTEXT and script data end tags
-            if (st == State.RCDATA_LT) or (st == State.RAWTEXT_LT) {
-                let mut back = State.RCDATA;
-                if st == State.RAWTEXT_LT {
-                    back = State.RAWTEXT;
-                }
-                if c == '/' {
-                    self.i += 1;
-                    self.tmp.clear();
-                    if st == State.RCDATA_LT {
-                        self.state = State.RCDATA_END_OPEN;
-                    } else {
-                        self.state = State.RAWTEXT_END_OPEN;
-                    }
-                } else {
-                    self.chars.push('<')!;
-                    self.state = back;
-                }
-                continue;
-            }
-            if (st == State.RCDATA_END_OPEN) or (st == State.RAWTEXT_END_OPEN) or (st == State.SCRIPT_END_OPEN) or
-               (st == State.SCRIPT_ESC_END_OPEN) {
-                if is_alpha(c) {
-                    self.new_tag(TokenKind.END);
-                    self.state = end_name_state(st);
-                } else {
-                    self.chars.push_str("</")!;
-                    self.state = end_tag_back(st);
-                }
-                continue;
-            }
-            if (st == State.RCDATA_END_NAME) or (st == State.RAWTEXT_END_NAME) or (st == State.SCRIPT_END_NAME) or
-               (st == State.SCRIPT_ESC_END_NAME) {
-                if ((c == '\t') or (c == '\n') or (c == 12) or (c == ' ')) and self.appropriate() {
-                    self.i += 1;
-                    self.state = State.BEFORE_ATTR_NAME;
-                } else if (c == '/') and self.appropriate() {
-                    self.i += 1;
-                    self.state = State.SELF_CLOSING;
-                } else if (c == '>') and self.appropriate() {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return self.emit_tag();
-                } else if is_alpha(c) {
-                    self.i += 1;
-                    self.name.push(lower(c))!;
-                    self.tmp.push(@truncate(u8, c))!;
-                } else {
-                    self.flush_end_tag()!;
-                    self.state = end_tag_back(st);
-                }
-                continue;
-            }
-            if st == State.SCRIPT_LT {
-                if c == '/' {
-                    self.i += 1;
-                    self.tmp.clear();
-                    self.state = State.SCRIPT_END_OPEN;
-                } else if c == '!' {
-                    self.i += 1;
-                    self.chars.push_str("<!")!;
-                    self.state = State.SCRIPT_ESC_START;
-                } else {
-                    self.chars.push('<')!;
-                    self.state = State.SCRIPT;
-                }
-                continue;
-            }
-            if (st == State.SCRIPT_ESC_START) or (st == State.SCRIPT_ESC_START_DASH) {
-                if c == '-' {
-                    self.i += 1;
-                    self.chars.push('-')!;
-                    if st == State.SCRIPT_ESC_START {
-                        self.state = State.SCRIPT_ESC_START_DASH;
-                    } else {
-                        self.state = State.SCRIPT_ESC_DASH_DASH;
-                    }
-                } else {
-                    self.state = State.SCRIPT;
-                }
-                continue;
-            }
-            if (st == State.SCRIPT_ESC) or (st == State.SCRIPT_ESC_DASH) or (st == State.SCRIPT_ESC_DASH_DASH) {
-                if c < 0 {
-                    self.err();
-                    return TokenKind.EOF;
-                }
+        } else if st == State.AFTER_ATTR_NAME {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
                 self.i += 1;
-                if c == '-' {
-                    self.chars.push('-')!;
-                    if st == State.SCRIPT_ESC {
-                        self.state = State.SCRIPT_ESC_DASH;
-                    } else {
-                        self.state = State.SCRIPT_ESC_DASH_DASH;
-                    }
-                } else if c == '<' {
-                    self.state = State.SCRIPT_ESC_LT;
-                } else if (c == '>') and (st == State.SCRIPT_ESC_DASH_DASH) {
-                    self.chars.push('>')!;
-                    self.state = State.SCRIPT;
-                } else if c == 0 {
+            } else if c == '/' {
+                self.i += 1;
+                self.state = State.SELF_CLOSING;
+            } else if c == '=' {
+                self.i += 1;
+                self.state = State.BEFORE_ATTR_VALUE;
+            } else if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+                return self.emit_tag();
+            } else if c < 0 {
+                self.err();
+                return TokenKind.EOF;
+            } else {
+                self.new_attr()!;
+                self.state = State.ATTR_NAME;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // The states before, in and after an attribute value.
+    fn attr_value(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let s = self.s;
+        let n = s.len;
+        let c = self.at();
+        if st == State.BEFORE_ATTR_VALUE {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+            } else if c == '"' {
+                self.i += 1;
+                self.state = State.ATTR_VALUE_DQ;
+            } else if c == '\'' {
+                self.i += 1;
+                self.state = State.ATTR_VALUE_SQ;
+            } else if c == '>' {
+                self.err();
+                self.i += 1;
+                self.state = State.DATA;
+                return self.emit_tag();
+            } else {
+                self.state = State.ATTR_VALUE_UNQ;
+            }
+        } else if (st == State.ATTR_VALUE_DQ) or (st == State.ATTR_VALUE_SQ) {
+            let mut qq: u8 = '"';
+            if st == State.ATTR_VALUE_SQ {
+                qq = '\'';
+            }
+            let b = self.i;
+            let mut i = b;
+            while (i < n) and (s[i] != qq) and (s[i] != '&') and (s[i] != 0) {
+                i += 1;
+            }
+            self.abuf.push_str(s[b..i])!;
+            self.i = i;
+            if i >= n {
+                self.err();
+                return TokenKind.EOF;
+            }
+            self.i = i + 1;
+            if s[i] == qq {
+                self.state = State.AFTER_ATTR_VALUE;
+            } else if s[i] == '&' {
+                self.char_ref(true)!;
+            } else {
+                self.err();
+                self.abuf.push_str("\xef\xbf\xbd")!;
+            }
+        } else if st == State.ATTR_VALUE_UNQ {
+            if c < 0 {
+                self.err();
+                return TokenKind.EOF;
+            }
+            self.i += 1;
+            let b = @truncate(u8, c);
+            if (b == '\t') or (b == '\n') or (b == 12) or (b == ' ') {
+                self.state = State.BEFORE_ATTR_NAME;
+            } else if b == '&' {
+                self.char_ref(true)!;
+            } else if b == '>' {
+                self.state = State.DATA;
+                return self.emit_tag();
+            } else if b == 0 {
+                self.err();
+                self.abuf.push_str("\xef\xbf\xbd")!;
+            } else {
+                if (b == '"') or (b == '\'') or (b == '<') or (b == '=') or (b == '`') {
                     self.err();
-                    self.chars.push_str("\xef\xbf\xbd")!;
-                    self.state = State.SCRIPT_ESC;
-                } else {
-                    self.chars.push(@truncate(u8, c))!;
-                    self.state = State.SCRIPT_ESC;
                 }
-                continue;
+                self.abuf.push(b)!;
             }
-            if st == State.SCRIPT_ESC_LT {
-                if c == '/' {
-                    self.i += 1;
-                    self.tmp.clear();
-                    self.state = State.SCRIPT_ESC_END_OPEN;
-                } else if is_alpha(c) {
-                    self.tmp.clear();
-                    self.chars.push('<')!;
-                    self.state = State.SCRIPT_DESC_START;
+        } else if st == State.AFTER_ATTR_VALUE {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+                self.state = State.BEFORE_ATTR_NAME;
+            } else if c == '/' {
+                self.i += 1;
+                self.state = State.SELF_CLOSING;
+            } else if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+                return self.emit_tag();
+            } else if c < 0 {
+                self.err();
+                return TokenKind.EOF;
+            } else {
+                self.err();
+                self.state = State.BEFORE_ATTR_NAME;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // End tags in RCDATA, RAWTEXT and script data (escaped or not): the
+    // less-than sign, end tag open and end tag name states.
+    fn text_end_tag(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if (st == State.RCDATA_LT) or (st == State.RAWTEXT_LT) {
+            let mut back = State.RCDATA;
+            if st == State.RAWTEXT_LT {
+                back = State.RAWTEXT;
+            }
+            if c == '/' {
+                self.i += 1;
+                self.tmp.clear();
+                if st == State.RCDATA_LT {
+                    self.state = State.RCDATA_END_OPEN;
                 } else {
-                    self.chars.push('<')!;
-                    self.state = State.SCRIPT_ESC;
+                    self.state = State.RAWTEXT_END_OPEN;
                 }
-                continue;
+            } else {
+                self.chars.push('<')!;
+                self.state = back;
             }
-            if (st == State.SCRIPT_DESC_START) or (st == State.SCRIPT_DESC_END) {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') {
-                    self.i += 1;
-                    self.chars.push(@truncate(u8, c))!;
-                    let is_script = strs.eq(self.tmp.bytes(), "script");
-                    if st == State.SCRIPT_DESC_START {
-                        if is_script {
-                            self.state = State.SCRIPT_DESC;
-                        } else {
-                            self.state = State.SCRIPT_ESC;
-                        }
+        } else if (st == State.RCDATA_END_OPEN) or (st == State.RAWTEXT_END_OPEN) or (st == State.SCRIPT_END_OPEN) or
+                  (st == State.SCRIPT_ESC_END_OPEN) {
+            if is_alpha(c) {
+                self.new_tag(TokenKind.END);
+                self.state = end_name_state(st);
+            } else {
+                self.chars.push_str("</")!;
+                self.state = end_tag_back(st);
+            }
+        } else if (st == State.RCDATA_END_NAME) or (st == State.RAWTEXT_END_NAME) or (st == State.SCRIPT_END_NAME) or
+                  (st == State.SCRIPT_ESC_END_NAME) {
+            if ((c == '\t') or (c == '\n') or (c == 12) or (c == ' ')) and self.appropriate() {
+                self.i += 1;
+                self.state = State.BEFORE_ATTR_NAME;
+            } else if (c == '/') and self.appropriate() {
+                self.i += 1;
+                self.state = State.SELF_CLOSING;
+            } else if (c == '>') and self.appropriate() {
+                self.i += 1;
+                self.state = State.DATA;
+                return self.emit_tag();
+            } else if is_alpha(c) {
+                self.i += 1;
+                self.name.push(lower(c))!;
+                self.tmp.push(@truncate(u8, c))!;
+            } else {
+                self.flush_end_tag()!;
+                self.state = end_tag_back(st);
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // Script data: the less-than sign state and the escaped states.
+    fn script_escaped(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if st == State.SCRIPT_LT {
+            if c == '/' {
+                self.i += 1;
+                self.tmp.clear();
+                self.state = State.SCRIPT_END_OPEN;
+            } else if c == '!' {
+                self.i += 1;
+                self.chars.push_str("<!")!;
+                self.state = State.SCRIPT_ESC_START;
+            } else {
+                self.chars.push('<')!;
+                self.state = State.SCRIPT;
+            }
+        } else if (st == State.SCRIPT_ESC_START) or (st == State.SCRIPT_ESC_START_DASH) {
+            if c == '-' {
+                self.i += 1;
+                self.chars.push('-')!;
+                if st == State.SCRIPT_ESC_START {
+                    self.state = State.SCRIPT_ESC_START_DASH;
+                } else {
+                    self.state = State.SCRIPT_ESC_DASH_DASH;
+                }
+            } else {
+                self.state = State.SCRIPT;
+            }
+        } else if (st == State.SCRIPT_ESC) or (st == State.SCRIPT_ESC_DASH) or (st == State.SCRIPT_ESC_DASH_DASH) {
+            if c < 0 {
+                self.err();
+                return TokenKind.EOF;
+            }
+            self.i += 1;
+            if c == '-' {
+                self.chars.push('-')!;
+                if st == State.SCRIPT_ESC {
+                    self.state = State.SCRIPT_ESC_DASH;
+                } else {
+                    self.state = State.SCRIPT_ESC_DASH_DASH;
+                }
+            } else if c == '<' {
+                self.state = State.SCRIPT_ESC_LT;
+            } else if (c == '>') and (st == State.SCRIPT_ESC_DASH_DASH) {
+                self.chars.push('>')!;
+                self.state = State.SCRIPT;
+            } else if c == 0 {
+                self.err();
+                self.chars.push_str("\xef\xbf\xbd")!;
+                self.state = State.SCRIPT_ESC;
+            } else {
+                self.chars.push(@truncate(u8, c))!;
+                self.state = State.SCRIPT_ESC;
+            }
+        } else if st == State.SCRIPT_ESC_LT {
+            if c == '/' {
+                self.i += 1;
+                self.tmp.clear();
+                self.state = State.SCRIPT_ESC_END_OPEN;
+            } else if is_alpha(c) {
+                self.tmp.clear();
+                self.chars.push('<')!;
+                self.state = State.SCRIPT_DESC_START;
+            } else {
+                self.chars.push('<')!;
+                self.state = State.SCRIPT_ESC;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // Script data: the double-escaped states.
+    fn script_double_escaped(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if (st == State.SCRIPT_DESC_START) or (st == State.SCRIPT_DESC_END) {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') or (c == '/') or (c == '>') {
+                self.i += 1;
+                self.chars.push(@truncate(u8, c))!;
+                let is_script = strs.eq(self.tmp.bytes(), "script");
+                if st == State.SCRIPT_DESC_START {
+                    if is_script {
+                        self.state = State.SCRIPT_DESC;
                     } else {
-                        if is_script {
-                            self.state = State.SCRIPT_ESC;
-                        } else {
-                            self.state = State.SCRIPT_DESC;
-                        }
+                        self.state = State.SCRIPT_ESC;
                     }
-                } else if is_alpha(c) {
-                    self.i += 1;
-                    self.tmp.push(lower(c))!;
-                    self.chars.push(@truncate(u8, c))!;
                 } else {
-                    if st == State.SCRIPT_DESC_START {
+                    if is_script {
                         self.state = State.SCRIPT_ESC;
                     } else {
                         self.state = State.SCRIPT_DESC;
                     }
                 }
-                continue;
-            }
-            if (st == State.SCRIPT_DESC) or (st == State.SCRIPT_DESC_DASH) or (st == State.SCRIPT_DESC_DASH_DASH) {
-                if c < 0 {
-                    self.err();
-                    return TokenKind.EOF;
-                }
+            } else if is_alpha(c) {
                 self.i += 1;
-                if c == '-' {
-                    self.chars.push('-')!;
-                    if st == State.SCRIPT_DESC {
-                        self.state = State.SCRIPT_DESC_DASH;
-                    } else {
-                        self.state = State.SCRIPT_DESC_DASH_DASH;
-                    }
-                } else if c == '<' {
-                    self.chars.push('<')!;
-                    self.state = State.SCRIPT_DESC_LT;
-                } else if (c == '>') and (st == State.SCRIPT_DESC_DASH_DASH) {
-                    self.chars.push('>')!;
-                    self.state = State.SCRIPT;
-                } else if c == 0 {
-                    self.err();
-                    self.chars.push_str("\xef\xbf\xbd")!;
-                    self.state = State.SCRIPT_DESC;
-                } else {
-                    self.chars.push(@truncate(u8, c))!;
-                    self.state = State.SCRIPT_DESC;
-                }
-                continue;
-            }
-            if st == State.SCRIPT_DESC_LT {
-                if c == '/' {
-                    self.i += 1;
-                    self.tmp.clear();
-                    self.chars.push('/')!;
-                    self.state = State.SCRIPT_DESC_END;
+                self.tmp.push(lower(c))!;
+                self.chars.push(@truncate(u8, c))!;
+            } else {
+                if st == State.SCRIPT_DESC_START {
+                    self.state = State.SCRIPT_ESC;
                 } else {
                     self.state = State.SCRIPT_DESC;
                 }
-                continue;
             }
-            // --- comments
-            if st == State.MARKUP_DECL {
-                if self.lookahead("--") {
-                    self.i += 2;
-                    self.comment.clear();
-                    self.state = State.COMMENT_START;
-                } else if self.lookahead_ci("doctype") {
-                    self.i += 7;
-                    self.state = State.DOCTYPE;
-                } else if self.lookahead("[CDATA[") {
-                    self.i += 7;
-                    if self.cdata_ok {
-                        self.state = State.CDATA;
-                    } else {
-                        self.err();
-                        self.comment.clear();
-                        self.comment.push_str("[CDATA[")!;
-                        self.state = State.BOGUS_COMMENT;
-                    }
+        } else if (st == State.SCRIPT_DESC) or (st == State.SCRIPT_DESC_DASH) or (st == State.SCRIPT_DESC_DASH_DASH) {
+            if c < 0 {
+                self.err();
+                return TokenKind.EOF;
+            }
+            self.i += 1;
+            if c == '-' {
+                self.chars.push('-')!;
+                if st == State.SCRIPT_DESC {
+                    self.state = State.SCRIPT_DESC_DASH;
+                } else {
+                    self.state = State.SCRIPT_DESC_DASH_DASH;
+                }
+            } else if c == '<' {
+                self.chars.push('<')!;
+                self.state = State.SCRIPT_DESC_LT;
+            } else if (c == '>') and (st == State.SCRIPT_DESC_DASH_DASH) {
+                self.chars.push('>')!;
+                self.state = State.SCRIPT;
+            } else if c == 0 {
+                self.err();
+                self.chars.push_str("\xef\xbf\xbd")!;
+                self.state = State.SCRIPT_DESC;
+            } else {
+                self.chars.push(@truncate(u8, c))!;
+                self.state = State.SCRIPT_DESC;
+            }
+        } else if st == State.SCRIPT_DESC_LT {
+            if c == '/' {
+                self.i += 1;
+                self.tmp.clear();
+                self.chars.push('/')!;
+                self.state = State.SCRIPT_DESC_END;
+            } else {
+                self.state = State.SCRIPT_DESC;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // The markup declaration open, bogus comment and comment start states.
+    fn comment_open(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let s = self.s;
+        let n = s.len;
+        let c = self.at();
+        if st == State.MARKUP_DECL {
+            if self.lookahead("--") {
+                self.i += 2;
+                self.comment.clear();
+                self.state = State.COMMENT_START;
+            } else if self.lookahead_ci("doctype") {
+                self.i += 7;
+                self.state = State.DOCTYPE;
+            } else if self.lookahead("[CDATA[") {
+                self.i += 7;
+                if self.cdata_ok {
+                    self.state = State.CDATA;
                 } else {
                     self.err();
                     self.comment.clear();
+                    self.comment.push_str("[CDATA[")!;
                     self.state = State.BOGUS_COMMENT;
                 }
-                continue;
+            } else {
+                self.err();
+                self.comment.clear();
+                self.state = State.BOGUS_COMMENT;
             }
-            if st == State.BOGUS_COMMENT {
-                let b = self.i;
-                let mut i = b;
-                while (i < n) and (s[i] != '>') and (s[i] != 0) {
-                    i += 1;
+        } else if st == State.BOGUS_COMMENT {
+            let b = self.i;
+            let mut i = b;
+            while (i < n) and (s[i] != '>') and (s[i] != 0) {
+                i += 1;
+            }
+            self.comment.push_str(s[b..i])!;
+            self.i = i;
+            if i >= n {
+                return TokenKind.COMMENT;  // (then EOF)
+            }
+            self.i = i + 1;
+            if s[i] == '>' {
+                self.state = State.DATA;
+                return TokenKind.COMMENT;
+            }
+            self.err();
+            self.comment.push_str("\xef\xbf\xbd")!;
+        } else if (st == State.COMMENT_START) or (st == State.COMMENT_START_DASH) {
+            if c == '-' {
+                self.i += 1;
+                if st == State.COMMENT_START {
+                    self.state = State.COMMENT_START_DASH;
+                } else {
+                    self.state = State.COMMENT_END;
                 }
-                self.comment.push_str(s[b..i])!;
-                self.i = i;
-                if i >= n {
-                    return TokenKind.COMMENT;  // (then EOF)
+            } else if c == '>' {
+                self.err();
+                self.i += 1;
+                self.state = State.DATA;
+                return TokenKind.COMMENT;
+            } else if (c < 0) and (st == State.COMMENT_START_DASH) {
+                self.err();
+                return TokenKind.COMMENT;
+            } else {
+                if st == State.COMMENT_START_DASH {
+                    self.comment.push('-')!;
                 }
-                self.i = i + 1;
-                if s[i] == '>' {
-                    self.state = State.DATA;
-                    return TokenKind.COMMENT;
-                }
+                self.state = State.COMMENT;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // The comment state and those after a less-than sign in a comment.
+    fn comment_body(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let s = self.s;
+        let n = s.len;
+        let c = self.at();
+        if st == State.COMMENT {
+            let b = self.i;
+            let mut i = b;
+            while (i < n) and (s[i] != '<') and (s[i] != '-') and (s[i] != 0) {
+                i += 1;
+            }
+            self.comment.push_str(s[b..i])!;
+            self.i = i;
+            if i >= n {
+                self.err();
+                return TokenKind.COMMENT;
+            }
+            self.i = i + 1;
+            if s[i] == '<' {
+                self.comment.push('<')!;
+                self.state = State.COMMENT_LT;
+            } else if s[i] == '-' {
+                self.state = State.COMMENT_END_DASH;
+            } else {
                 self.err();
                 self.comment.push_str("\xef\xbf\xbd")!;
-                continue;
             }
-            if (st == State.COMMENT_START) or (st == State.COMMENT_START_DASH) {
-                if c == '-' {
-                    self.i += 1;
-                    if st == State.COMMENT_START {
-                        self.state = State.COMMENT_START_DASH;
-                    } else {
-                        self.state = State.COMMENT_END;
-                    }
-                } else if c == '>' {
-                    self.err();
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return TokenKind.COMMENT;
-                } else if (c < 0) and (st == State.COMMENT_START_DASH) {
-                    self.err();
-                    return TokenKind.COMMENT;
-                } else {
-                    if st == State.COMMENT_START_DASH {
-                        self.comment.push('-')!;
-                    }
-                    self.state = State.COMMENT;
-                }
-                continue;
+        } else if st == State.COMMENT_LT {
+            if c == '!' {
+                self.i += 1;
+                self.comment.push('!')!;
+                self.state = State.COMMENT_LT_BANG;
+            } else if c == '<' {
+                self.i += 1;
+                self.comment.push('<')!;
+            } else {
+                self.state = State.COMMENT;
             }
-            if st == State.COMMENT {
-                let b = self.i;
-                let mut i = b;
-                while (i < n) and (s[i] != '<') and (s[i] != '-') and (s[i] != 0) {
-                    i += 1;
-                }
-                self.comment.push_str(s[b..i])!;
-                self.i = i;
-                if i >= n {
-                    self.err();
-                    return TokenKind.COMMENT;
-                }
-                self.i = i + 1;
-                if s[i] == '<' {
-                    self.comment.push('<')!;
-                    self.state = State.COMMENT_LT;
-                } else if s[i] == '-' {
-                    self.state = State.COMMENT_END_DASH;
-                } else {
-                    self.err();
-                    self.comment.push_str("\xef\xbf\xbd")!;
-                }
-                continue;
+        } else if st == State.COMMENT_LT_BANG {
+            if c == '-' {
+                self.i += 1;
+                self.state = State.COMMENT_LT_BANG_DASH;
+            } else {
+                self.state = State.COMMENT;
             }
-            if st == State.COMMENT_LT {
-                if c == '!' {
-                    self.i += 1;
-                    self.comment.push('!')!;
-                    self.state = State.COMMENT_LT_BANG;
-                } else if c == '<' {
-                    self.i += 1;
-                    self.comment.push('<')!;
-                } else {
-                    self.state = State.COMMENT;
-                }
-                continue;
+        } else if st == State.COMMENT_LT_BANG_DASH {
+            if c == '-' {
+                self.i += 1;
+                self.state = State.COMMENT_LT_BANG_DASH_DASH;
+            } else {
+                self.state = State.COMMENT_END_DASH;
             }
-            if st == State.COMMENT_LT_BANG {
-                if c == '-' {
-                    self.i += 1;
-                    self.state = State.COMMENT_LT_BANG_DASH;
-                } else {
-                    self.state = State.COMMENT;
-                }
-                continue;
+        } else if st == State.COMMENT_LT_BANG_DASH_DASH {
+            if (c != '>') and (c >= 0) {
+                self.err();
             }
-            if st == State.COMMENT_LT_BANG_DASH {
-                if c == '-' {
-                    self.i += 1;
-                    self.state = State.COMMENT_LT_BANG_DASH_DASH;
-                } else {
-                    self.state = State.COMMENT_END_DASH;
-                }
-                continue;
-            }
-            if st == State.COMMENT_LT_BANG_DASH_DASH {
-                if (c != '>') and (c >= 0) {
-                    self.err();
-                }
+            self.state = State.COMMENT_END;
+        }
+        return TokenKind.NONE;
+    }
+
+    // The comment end dash, comment end and comment end bang states.
+    fn comment_end(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if st == State.COMMENT_END_DASH {
+            if c == '-' {
+                self.i += 1;
                 self.state = State.COMMENT_END;
-                continue;
+            } else if c < 0 {
+                self.err();
+                return TokenKind.COMMENT;
+            } else {
+                self.comment.push('-')!;
+                self.state = State.COMMENT;
             }
-            if st == State.COMMENT_END_DASH {
-                if c == '-' {
-                    self.i += 1;
-                    self.state = State.COMMENT_END;
-                } else if c < 0 {
+        } else if st == State.COMMENT_END {
+            if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+                return TokenKind.COMMENT;
+            } else if c == '!' {
+                self.i += 1;
+                self.state = State.COMMENT_END_BANG;
+            } else if c == '-' {
+                self.i += 1;
+                self.comment.push('-')!;
+            } else if c < 0 {
+                self.err();
+                return TokenKind.COMMENT;
+            } else {
+                self.comment.push_str("--")!;
+                self.state = State.COMMENT;
+            }
+        } else if st == State.COMMENT_END_BANG {
+            if c == '-' {
+                self.i += 1;
+                self.comment.push_str("--!")!;
+                self.state = State.COMMENT_END_DASH;
+            } else if c == '>' {
+                self.err();
+                self.i += 1;
+                self.state = State.DATA;
+                return TokenKind.COMMENT;
+            } else if c < 0 {
+                self.err();
+                return TokenKind.COMMENT;
+            } else {
+                self.comment.push_str("--!")!;
+                self.state = State.COMMENT;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // CDATA sections (in foreign content).
+    fn cdata(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let s = self.s;
+        let n = s.len;
+        let c = self.at();
+        if st == State.CDATA {
+            let b = self.i;
+            let mut i = b;
+            while (i < n) and (s[i] != ']') {
+                i += 1;
+            }
+            self.chars.push_str(s[b..i])!;
+            self.i = i;
+            if i >= n {
+                self.err();
+                return TokenKind.EOF;
+            }
+            self.i = i + 1;
+            self.state = State.CDATA_BRACKET;
+        } else if st == State.CDATA_BRACKET {
+            if c == ']' {
+                self.i += 1;
+                self.state = State.CDATA_END;
+            } else {
+                self.chars.push(']')!;
+                self.state = State.CDATA;
+            }
+        } else if st == State.CDATA_END {
+            if c == ']' {
+                self.i += 1;
+                self.chars.push(']')!;
+            } else if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+            } else {
+                self.chars.push_str("]]")!;
+                self.state = State.CDATA;
+            }
+        }
+        return TokenKind.NONE;
+    }
+
+    // The DOCTYPE states up to and after its name.
+    fn doctype_name(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if st == State.DOCTYPE {
+            self.new_doctype();
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else if c != '>' {
+                self.err();
+            }
+            self.state = State.BEFORE_DOCTYPE_NAME;
+        } else if st == State.BEFORE_DOCTYPE_NAME {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+            } else if c == '>' {
+                self.err();
+                self.i += 1;
+                self.force_quirks = true;
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else {
+                self.has_name = true;
+                self.state = State.DOCTYPE_NAME;
+            }
+        } else if st == State.DOCTYPE_NAME {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+                self.state = State.AFTER_DOCTYPE_NAME;
+            } else if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else {
+                self.i += 1;
+                if c == 0 {
                     self.err();
-                    return TokenKind.COMMENT;
+                    self.name.push_str("\xef\xbf\xbd")!;
                 } else {
-                    self.comment.push('-')!;
-                    self.state = State.COMMENT;
+                    self.name.push(lower(c))!;
                 }
-                continue;
             }
-            if st == State.COMMENT_END {
-                if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return TokenKind.COMMENT;
-                } else if c == '!' {
-                    self.i += 1;
-                    self.state = State.COMMENT_END_BANG;
-                } else if c == '-' {
-                    self.i += 1;
-                    self.comment.push('-')!;
-                } else if c < 0 {
-                    self.err();
-                    return TokenKind.COMMENT;
-                } else {
-                    self.comment.push_str("--")!;
-                    self.state = State.COMMENT;
-                }
-                continue;
+        } else if st == State.AFTER_DOCTYPE_NAME {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+            } else if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else if self.lookahead_ci("public") {
+                self.i += 6;
+                self.state = State.AFTER_DOCTYPE_PUBLIC_KW;
+            } else if self.lookahead_ci("system") {
+                self.i += 6;
+                self.state = State.AFTER_DOCTYPE_SYSTEM_KW;
+            } else {
+                self.err();
+                self.force_quirks = true;
+                self.state = State.BOGUS_DOCTYPE;
             }
-            if st == State.COMMENT_END_BANG {
-                if c == '-' {
-                    self.i += 1;
-                    self.comment.push_str("--!")!;
-                    self.state = State.COMMENT_END_DASH;
-                } else if c == '>' {
-                    self.err();
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return TokenKind.COMMENT;
-                } else if c < 0 {
-                    self.err();
-                    return TokenKind.COMMENT;
-                } else {
-                    self.comment.push_str("--!")!;
-                    self.state = State.COMMENT;
+        }
+        return TokenKind.NONE;
+    }
+
+    // The DOCTYPE states after a PUBLIC or SYSTEM keyword and in an identifier.
+    fn doctype_id(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.BEFORE_DOCTYPE_PUBLIC_ID) or
+           (st == State.AFTER_DOCTYPE_SYSTEM_KW) or (st == State.BEFORE_DOCTYPE_SYSTEM_ID) {
+            let public = (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.BEFORE_DOCTYPE_PUBLIC_ID);
+            let kw = (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.AFTER_DOCTYPE_SYSTEM_KW);
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+                if kw and public {
+                    self.state = State.BEFORE_DOCTYPE_PUBLIC_ID;
+                } else if kw {
+                    self.state = State.BEFORE_DOCTYPE_SYSTEM_ID;
                 }
-                continue;
-            }
-            // --- CDATA sections (in foreign content)
-            if st == State.CDATA {
-                let b = self.i;
-                let mut i = b;
-                while (i < n) and (s[i] != ']') {
-                    i += 1;
-                }
-                self.chars.push_str(s[b..i])!;
-                self.i = i;
-                if i >= n {
-                    self.err();
-                    return TokenKind.EOF;
-                }
-                self.i = i + 1;
-                self.state = State.CDATA_BRACKET;
-                continue;
-            }
-            if st == State.CDATA_BRACKET {
-                if c == ']' {
-                    self.i += 1;
-                    self.state = State.CDATA_END;
-                } else {
-                    self.chars.push(']')!;
-                    self.state = State.CDATA;
-                }
-                continue;
-            }
-            if st == State.CDATA_END {
-                if c == ']' {
-                    self.i += 1;
-                    self.chars.push(']')!;
-                } else if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                } else {
-                    self.chars.push_str("]]")!;
-                    self.state = State.CDATA;
-                }
-                continue;
-            }
-            // --- DOCTYPE
-            if st == State.DOCTYPE {
-                self.new_doctype();
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
-                } else if c != '>' {
+            } else if (c == '"') or (c == '\'') {
+                if kw {
                     self.err();
                 }
-                self.state = State.BEFORE_DOCTYPE_NAME;
-                continue;
-            }
-            if st == State.BEFORE_DOCTYPE_NAME {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                } else if c == '>' {
-                    self.err();
-                    self.i += 1;
-                    self.force_quirks = true;
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
-                } else {
-                    self.has_name = true;
-                    self.state = State.DOCTYPE_NAME;
-                }
-                continue;
-            }
-            if st == State.DOCTYPE_NAME {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                    self.state = State.AFTER_DOCTYPE_NAME;
-                } else if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
-                } else {
-                    self.i += 1;
-                    if c == 0 {
-                        self.err();
-                        self.name.push_str("\xef\xbf\xbd")!;
-                    } else {
-                        self.name.push(lower(c))!;
+                self.i += 1;
+                if public {
+                    self.has_public = true;
+                    self.state = State.DOCTYPE_PUBLIC_ID_DQ;
+                    if c == '\'' {
+                        self.state = State.DOCTYPE_PUBLIC_ID_SQ;
                     }
-                }
-                continue;
-            }
-            if st == State.AFTER_DOCTYPE_NAME {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                } else if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
-                } else if self.lookahead_ci("public") {
-                    self.i += 6;
-                    self.state = State.AFTER_DOCTYPE_PUBLIC_KW;
-                } else if self.lookahead_ci("system") {
-                    self.i += 6;
-                    self.state = State.AFTER_DOCTYPE_SYSTEM_KW;
                 } else {
-                    self.err();
-                    self.force_quirks = true;
-                    self.state = State.BOGUS_DOCTYPE;
-                }
-                continue;
-            }
-            if (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.BEFORE_DOCTYPE_PUBLIC_ID) or
-               (st == State.AFTER_DOCTYPE_SYSTEM_KW) or (st == State.BEFORE_DOCTYPE_SYSTEM_ID) {
-                let public = (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.BEFORE_DOCTYPE_PUBLIC_ID);
-                let kw = (st == State.AFTER_DOCTYPE_PUBLIC_KW) or (st == State.AFTER_DOCTYPE_SYSTEM_KW);
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                    if kw and public {
-                        self.state = State.BEFORE_DOCTYPE_PUBLIC_ID;
-                    } else if kw {
-                        self.state = State.BEFORE_DOCTYPE_SYSTEM_ID;
-                    }
-                } else if (c == '"') or (c == '\'') {
-                    if kw {
-                        self.err();
-                    }
-                    self.i += 1;
-                    if public {
-                        self.has_public = true;
-                        self.state = State.DOCTYPE_PUBLIC_ID_DQ;
-                        if c == '\'' {
-                            self.state = State.DOCTYPE_PUBLIC_ID_SQ;
-                        }
-                    } else {
-                        self.has_system = true;
-                        self.state = State.DOCTYPE_SYSTEM_ID_DQ;
-                        if c == '\'' {
-                            self.state = State.DOCTYPE_SYSTEM_ID_SQ;
-                        }
-                    }
-                } else if c == '>' {
-                    self.err();
-                    self.i += 1;
-                    self.force_quirks = true;
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
-                } else {
-                    self.err();
-                    self.force_quirks = true;
-                    self.state = State.BOGUS_DOCTYPE;
-                }
-                continue;
-            }
-            if (st == State.DOCTYPE_PUBLIC_ID_DQ) or (st == State.DOCTYPE_PUBLIC_ID_SQ) or
-               (st == State.DOCTYPE_SYSTEM_ID_DQ) or (st == State.DOCTYPE_SYSTEM_ID_SQ) {
-                let mut q: i32 = '"';
-                if (st == State.DOCTYPE_PUBLIC_ID_SQ) or (st == State.DOCTYPE_SYSTEM_ID_SQ) {
-                    q = '\'';
-                }
-                let public = (st == State.DOCTYPE_PUBLIC_ID_DQ) or (st == State.DOCTYPE_PUBLIC_ID_SQ);
-                if c == q {
-                    self.i += 1;
-                    if public {
-                        self.state = State.AFTER_DOCTYPE_PUBLIC_ID;
-                    } else {
-                        self.state = State.AFTER_DOCTYPE_SYSTEM_ID;
-                    }
-                } else if c == '>' {
-                    self.err();
-                    self.i += 1;
-                    self.force_quirks = true;
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
-                } else {
-                    self.i += 1;
-                    let mut out = &mut self.system_id;
-                    if public {
-                        out = &mut self.public_id;
-                    }
-                    if c == 0 {
-                        self.err();
-                        out.push_str("\xef\xbf\xbd")!;
-                    } else {
-                        out.push(@truncate(u8, c))!;
-                    }
-                }
-                continue;
-            }
-            if (st == State.AFTER_DOCTYPE_PUBLIC_ID) or (st == State.BETWEEN_DOCTYPE_IDS) {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                    self.state = State.BETWEEN_DOCTYPE_IDS;
-                } else if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
-                } else if (c == '"') or (c == '\'') {
-                    if st == State.AFTER_DOCTYPE_PUBLIC_ID {
-                        self.err();
-                    }
-                    self.i += 1;
                     self.has_system = true;
                     self.state = State.DOCTYPE_SYSTEM_ID_DQ;
                     if c == '\'' {
                         self.state = State.DOCTYPE_SYSTEM_ID_SQ;
                     }
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
-                } else {
-                    self.err();
-                    self.force_quirks = true;
-                    self.state = State.BOGUS_DOCTYPE;
                 }
-                continue;
+            } else if c == '>' {
+                self.err();
+                self.i += 1;
+                self.force_quirks = true;
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else {
+                self.err();
+                self.force_quirks = true;
+                self.state = State.BOGUS_DOCTYPE;
             }
-            if st == State.AFTER_DOCTYPE_SYSTEM_ID {
-                if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
-                    self.i += 1;
-                } else if c == '>' {
-                    self.i += 1;
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
-                } else if c < 0 {
-                    self.err();
-                    self.force_quirks = true;
-                    return TokenKind.DOCTYPE;
+        } else if (st == State.DOCTYPE_PUBLIC_ID_DQ) or (st == State.DOCTYPE_PUBLIC_ID_SQ) or
+                  (st == State.DOCTYPE_SYSTEM_ID_DQ) or (st == State.DOCTYPE_SYSTEM_ID_SQ) {
+            let mut q: i32 = '"';
+            if (st == State.DOCTYPE_PUBLIC_ID_SQ) or (st == State.DOCTYPE_SYSTEM_ID_SQ) {
+                q = '\'';
+            }
+            let public = (st == State.DOCTYPE_PUBLIC_ID_DQ) or (st == State.DOCTYPE_PUBLIC_ID_SQ);
+            if c == q {
+                self.i += 1;
+                if public {
+                    self.state = State.AFTER_DOCTYPE_PUBLIC_ID;
                 } else {
-                    self.err();
-                    self.state = State.BOGUS_DOCTYPE;
+                    self.state = State.AFTER_DOCTYPE_SYSTEM_ID;
                 }
-                continue;
+            } else if c == '>' {
+                self.err();
+                self.i += 1;
+                self.force_quirks = true;
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else {
+                self.i += 1;
+                let mut out = &mut self.system_id;
+                if public {
+                    out = &mut self.public_id;
+                }
+                if c == 0 {
+                    self.err();
+                    out.push_str("\xef\xbf\xbd")!;
+                } else {
+                    out.push(@truncate(u8, c))!;
+                }
             }
-            if st == State.BOGUS_DOCTYPE {
-                if c < 0 {
-                    return TokenKind.DOCTYPE;
+        }
+        return TokenKind.NONE;
+    }
+
+    // The DOCTYPE states after an identifier, and the bogus DOCTYPE state.
+    fn doctype_after_id(self: *mut Tokenizer, st: State) HtmlError!TokenKind {
+        let c = self.at();
+        if (st == State.AFTER_DOCTYPE_PUBLIC_ID) or (st == State.BETWEEN_DOCTYPE_IDS) {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+                self.state = State.BETWEEN_DOCTYPE_IDS;
+            } else if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            } else if (c == '"') or (c == '\'') {
+                if st == State.AFTER_DOCTYPE_PUBLIC_ID {
+                    self.err();
                 }
                 self.i += 1;
-                if c == '>' {
-                    self.state = State.DATA;
-                    return TokenKind.DOCTYPE;
+                self.has_system = true;
+                self.state = State.DOCTYPE_SYSTEM_ID_DQ;
+                if c == '\'' {
+                    self.state = State.DOCTYPE_SYSTEM_ID_SQ;
                 }
-                continue;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else {
+                self.err();
+                self.force_quirks = true;
+                self.state = State.BOGUS_DOCTYPE;
             }
-            @trap();
+        } else if st == State.AFTER_DOCTYPE_SYSTEM_ID {
+            if (c == '\t') or (c == '\n') or (c == 12) or (c == ' ') {
+                self.i += 1;
+            } else if c == '>' {
+                self.i += 1;
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            } else if c < 0 {
+                self.err();
+                self.force_quirks = true;
+                return TokenKind.DOCTYPE;
+            } else {
+                self.err();
+                self.state = State.BOGUS_DOCTYPE;
+            }
+        } else if st == State.BOGUS_DOCTYPE {
+            if c < 0 {
+                return TokenKind.DOCTYPE;
+            }
+            self.i += 1;
+            if c == '>' {
+                self.state = State.DATA;
+                return TokenKind.DOCTYPE;
+            }
         }
+        return TokenKind.NONE;
     }
 }
 
@@ -3915,22 +3978,10 @@ fn in_body_start(p: *mut Parser, t: *mut Token) HtmlError!bool {
         return in_head(p, t);
     }
     if g == tags.T_BODY {
-        if (p.stack.len == 1) or not p.is(p.stack.items()[1], tags.T_BODY) or p.has_template() {
-            return false;
-        }
-        p.frameset_ok = false;
-        p.add_missing_attrs(p.stack.items()[1], t)!;
-        return false;
+        return start_body(p, t);
     }
     if g == tags.T_FRAMESET {
-        if (p.stack.len == 1) or not p.is(p.stack.items()[1], tags.T_BODY) or not p.frameset_ok {
-            return false;
-        }
-        p.doc.remove(p.stack.items()[1]);
-        p.pop_to(1);
-        _ = p.insert(t, Namespace.HTML)!;
-        p.mode = Mode.IN_FRAMESET;
-        return false;
+        return start_frameset(p, t);
     }
     if (g >= tags.T_H1) and (g <= tags.T_H6) {
         p.close_p_in_button_scope();
@@ -3949,42 +4000,10 @@ fn in_body_start(p: *mut Parser, t: *mut Token) HtmlError!bool {
         return false;
     }
     if g == tags.T_FORM {
-        let tpl = p.has_template();
-        if (p.form != NONE) and not tpl {
-            return false;
-        }
-        p.close_p_in_button_scope();
-        let id = p.insert(t, Namespace.HTML)!;
-        if not tpl {
-            p.form = id;
-        }
-        return false;
+        return start_form(p, t);
     }
     if (g == tags.T_LI) or (g == tags.T_DD) or (g == tags.T_DT) {
-        p.frameset_ok = false;
-        let mut i = p.stack.len;
-        while i > 0 {
-            i -= 1;
-            let id = p.stack.items()[i];
-            let n = p.nd(id);
-            let mut hit: u16 = 0;
-            if (g == tags.T_LI) and p.is(id, tags.T_LI) {
-                hit = tags.T_LI;
-            } else if (g != tags.T_LI) and (p.is(id, tags.T_DD) or p.is(id, tags.T_DT)) {
-                hit = n.tag;
-            }
-            if hit != 0 {
-                p.gen_implied(hit);
-                p.pop_until(hit);
-                break;
-            }
-            if p.special(id) and not p.is(id, tags.T_ADDRESS) and not p.is(id, tags.T_DIV) and not p.is(id, tags.T_P) {
-                break;
-            }
-        }
-        p.close_p_in_button_scope();
-        _ = p.insert(t, Namespace.HTML)!;
-        return false;
+        return start_list_item(p, t);
     }
     if g == tags.T_PLAINTEXT {
         p.close_p_in_button_scope();
@@ -4003,42 +4022,10 @@ fn in_body_start(p: *mut Parser, t: *mut Token) HtmlError!bool {
         return false;
     }
     if g == tags.T_A {
-        let items = p.afe.items();
-        let mut i = items.len;
-        let mut old = NONE;
-        while i > 0 {
-            i -= 1;
-            if items[i] == MARKER {
-                break;
-            }
-            if p.is(items[i], tags.T_A) {
-                old = items[i];
-                break;
-            }
-        }
-        if old != NONE {
-            if not adoption(p, t)! {
-                any_other_end(p, t);
-            }
-            p.afe_remove(old);
-            p.stack_remove(old);
-        }
-        p.reconstruct()!;
-        let id = p.insert(t, Namespace.HTML)!;
-        p.afe_push(id)!;
-        return false;
+        return start_a(p, t);
     }
     if g == tags.T_NOBR {
-        p.reconstruct()!;
-        if p.in_scope(tags.T_NOBR, Scope.DEFAULT) {
-            if not adoption(p, t)! {
-                any_other_end(p, t);
-            }
-            p.reconstruct()!;
-        }
-        let id = p.insert(t, Namespace.HTML)!;
-        p.afe_push(id)!;
-        return false;
+        return start_nobr(p, t);
     }
     if (g == tags.T_APPLET) or (g == tags.T_MARQUEE) or (g == tags.T_OBJECT) {
         p.reconstruct()!;
@@ -4066,18 +4053,7 @@ fn in_body_start(p: *mut Parser, t: *mut Token) HtmlError!bool {
         return false;
     }
     if g == tags.T_INPUT {
-        if p.is(p.context, tags.T_SELECT) {
-            return false;
-        }
-        if p.in_scope(tags.T_SELECT, Scope.DEFAULT) {
-            p.pop_until(tags.T_SELECT);
-        }
-        p.reconstruct()!;
-        _ = p.insert_void(t)!;
-        if not is_hidden_input(t) {
-            p.frameset_ok = false;
-        }
-        return false;
+        return start_input(p, t);
     }
     if (g == tags.T_PARAM) or (g == tags.T_SOURCE) or (g == tags.T_TRACK) {
         _ = p.insert_void(t)!;
@@ -4120,68 +4096,203 @@ fn in_body_start(p: *mut Parser, t: *mut Token) HtmlError!bool {
         return false;
     }
     if g == tags.T_SELECT {
-        if p.is(p.context, tags.T_SELECT) {
-            return false;
-        }
-        if p.in_scope(tags.T_SELECT, Scope.DEFAULT) {
-            p.pop_until(tags.T_SELECT);
-            return false;
-        }
-        p.reconstruct()!;
-        _ = p.insert(t, Namespace.HTML)!;
-        p.frameset_ok = false;
-        return false;
+        return start_select(p, t);
     }
     if g == tags.T_OPTION {
-        if p.in_scope(tags.T_SELECT, Scope.DEFAULT) {
-            p.gen_implied(tags.T_OPTGROUP);
-        } else if p.cur_is(tags.T_OPTION) {
-            p.pop();
-        }
-        p.reconstruct()!;
-        _ = p.insert(t, Namespace.HTML)!;
-        return false;
+        return start_option(p, t, tags.T_OPTGROUP);
     }
     if g == tags.T_OPTGROUP {
-        if p.in_scope(tags.T_SELECT, Scope.DEFAULT) {
-            p.gen_implied(0);
-        } else if p.cur_is(tags.T_OPTION) {
-            p.pop();
-        }
-        p.reconstruct()!;
-        _ = p.insert(t, Namespace.HTML)!;
-        return false;
+        return start_option(p, t, 0);
     }
     if (g == tags.T_RB) or (g == tags.T_RTC) {
-        if p.in_scope(tags.T_RUBY, Scope.DEFAULT) {
-            p.gen_implied(0);
-        }
-        _ = p.insert(t, Namespace.HTML)!;
-        return false;
+        return start_ruby_text(p, t, 0);
     }
     if (g == tags.T_RP) or (g == tags.T_RT) {
-        if p.in_scope(tags.T_RUBY, Scope.DEFAULT) {
-            p.gen_implied(tags.T_RTC);
-        }
-        _ = p.insert(t, Namespace.HTML)!;
-        return false;
+        return start_ruby_text(p, t, tags.T_RTC);
     }
     if (g == tags.T_MATH) or (g == tags.T_SVG) {
-        p.reconstruct()!;
-        let mut ns = Namespace.MATHML;
-        if g == tags.T_SVG {
-            ns = Namespace.SVG;
-        }
-        let id = p.insert(t, ns)!;
-        if t.self_closing and p.opened(id) {
-            p.pop();
-        }
-        return false;
+        return start_foreign(p, t);
     }
     if tag_in(t, TABLE_PARTS[..]) {
         return false;
     }
     p.reconstruct()!;
+    _ = p.insert(t, Namespace.HTML)!;
+    return false;
+}
+
+// <body> in body: its attributes go to the body element, if there is one.
+fn start_body(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if (p.stack.len == 1) or not p.is(p.stack.items()[1], tags.T_BODY) or p.has_template() {
+        return false;
+    }
+    p.frameset_ok = false;
+    p.add_missing_attrs(p.stack.items()[1], t)!;
+    return false;
+}
+
+// <frameset> in body: replaces the body while that is still allowed.
+fn start_frameset(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if (p.stack.len == 1) or not p.is(p.stack.items()[1], tags.T_BODY) or not p.frameset_ok {
+        return false;
+    }
+    p.doc.remove(p.stack.items()[1]);
+    p.pop_to(1);
+    _ = p.insert(t, Namespace.HTML)!;
+    p.mode = Mode.IN_FRAMESET;
+    return false;
+}
+
+// <form>: one at a time, outside templates.
+fn start_form(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let tpl = p.has_template();
+    if (p.form != NONE) and not tpl {
+        return false;
+    }
+    p.close_p_in_button_scope();
+    let id = p.insert(t, Namespace.HTML)!;
+    if not tpl {
+        p.form = id;
+    }
+    return false;
+}
+
+// <li>, <dd> and <dt>: each closes an open item of its kind first.
+fn start_list_item(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let g = t.tag;
+    p.frameset_ok = false;
+    let mut i = p.stack.len;
+    while i > 0 {
+        i -= 1;
+        let id = p.stack.items()[i];
+        let n = p.nd(id);
+        let mut hit: u16 = 0;
+        if (g == tags.T_LI) and p.is(id, tags.T_LI) {
+            hit = tags.T_LI;
+        } else if (g != tags.T_LI) and (p.is(id, tags.T_DD) or p.is(id, tags.T_DT)) {
+            hit = n.tag;
+        }
+        if hit != 0 {
+            p.gen_implied(hit);
+            p.pop_until(hit);
+            break;
+        }
+        if p.special(id) and not p.is(id, tags.T_ADDRESS) and not p.is(id, tags.T_DIV) and not p.is(id, tags.T_P) {
+            break;
+        }
+    }
+    p.close_p_in_button_scope();
+    _ = p.insert(t, Namespace.HTML)!;
+    return false;
+}
+
+// <a>: an <a> still among the active formatting elements is closed first.
+fn start_a(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let items = p.afe.items();
+    let mut i = items.len;
+    let mut old = NONE;
+    while i > 0 {
+        i -= 1;
+        if items[i] == MARKER {
+            break;
+        }
+        if p.is(items[i], tags.T_A) {
+            old = items[i];
+            break;
+        }
+    }
+    if old != NONE {
+        if not adoption(p, t)! {
+            any_other_end(p, t);
+        }
+        p.afe_remove(old);
+        p.stack_remove(old);
+    }
+    p.reconstruct()!;
+    let id = p.insert(t, Namespace.HTML)!;
+    p.afe_push(id)!;
+    return false;
+}
+
+// <nobr>: an open <nobr> in scope is closed first.
+fn start_nobr(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    p.reconstruct()!;
+    if p.in_scope(tags.T_NOBR, Scope.DEFAULT) {
+        if not adoption(p, t)! {
+            any_other_end(p, t);
+        }
+        p.reconstruct()!;
+    }
+    let id = p.insert(t, Namespace.HTML)!;
+    p.afe_push(id)!;
+    return false;
+}
+
+// <input>: ignored in a <select> context, else closes an open <select>.
+fn start_input(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if p.is(p.context, tags.T_SELECT) {
+        return false;
+    }
+    if p.in_scope(tags.T_SELECT, Scope.DEFAULT) {
+        p.pop_until(tags.T_SELECT);
+    }
+    p.reconstruct()!;
+    _ = p.insert_void(t)!;
+    if not is_hidden_input(t) {
+        p.frameset_ok = false;
+    }
+    return false;
+}
+
+// <select>: ignored in a <select> context; one in scope is closed instead.
+fn start_select(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    if p.is(p.context, tags.T_SELECT) {
+        return false;
+    }
+    if p.in_scope(tags.T_SELECT, Scope.DEFAULT) {
+        p.pop_until(tags.T_SELECT);
+        return false;
+    }
+    p.reconstruct()!;
+    _ = p.insert(t, Namespace.HTML)!;
+    p.frameset_ok = false;
+    return false;
+}
+
+// <math> and <svg>: elements in their own namespaces.
+fn start_foreign(p: *mut Parser, t: *mut Token) HtmlError!bool {
+    let g = t.tag;
+    p.reconstruct()!;
+    let mut ns = Namespace.MATHML;
+    if g == tags.T_SVG {
+        ns = Namespace.SVG;
+    }
+    let id = p.insert(t, ns)!;
+    if t.self_closing and p.opened(id) {
+        p.pop();
+    }
+    return false;
+}
+
+// <option> and <optgroup>: implied end tags (but for the one excepted) close
+// what is open in a <select>; else an open <option> is closed.
+fn start_option(p: *mut Parser, t: *mut Token, except: u16) HtmlError!bool {
+    if p.in_scope(tags.T_SELECT, Scope.DEFAULT) {
+        p.gen_implied(except);
+    } else if p.cur_is(tags.T_OPTION) {
+        p.pop();
+    }
+    p.reconstruct()!;
+    _ = p.insert(t, Namespace.HTML)!;
+    return false;
+}
+
+// <rb>, <rtc>, <rp> and <rt>: implied end tags (but for the one excepted)
+// close what is open in a <ruby>.
+fn start_ruby_text(p: *mut Parser, t: *mut Token, except: u16) HtmlError!bool {
+    if p.in_scope(tags.T_RUBY, Scope.DEFAULT) {
+        p.gen_implied(except);
+    }
     _ = p.insert(t, Namespace.HTML)!;
     return false;
 }

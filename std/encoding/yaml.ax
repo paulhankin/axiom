@@ -2661,6 +2661,44 @@ fn next_line(data: []u8, at: *mut usize) []u8 {
     return data[st..nl];
 }
 
+// A case of the test-suite file: a line "<id> <name> <error> <yaml length>
+// <events length> <json length, or -1 for none>", then the yaml, the events
+// and the json, each followed by a newline.
+struct SuiteCase {
+    name: []u8,
+    is_err: bool,
+    yaml: []u8,
+    events: []u8,
+    json: []u8,
+    has_json: bool,
+}
+
+// The case at `at` (which moves past it), or error.Done at the end.
+fn next_case(data: []u8, at: *mut usize) !SuiteCase {
+    if at.* >= data.len {
+        return error.Done;
+    }
+    let head = next_line(data, at);
+    let mut f = strs.fields(head);
+    _ = f.next() catch return error.Done;
+    let name = f.next() catch return error.Done;
+    let is_err = strs.eq(f.next() catch return error.Done, "1");
+    let ylen = fmt.parse_int.[usize](f.next() catch return error.Done) catch return error.Done;
+    let elen = fmt.parse_int.[usize](f.next() catch return error.Done) catch return error.Done;
+    let jlen = fmt.parse_int.[i64](f.next() catch return error.Done) catch return error.Done;
+    let mut c = SuiteCase.{ name: name, is_err: is_err, yaml: "", events: "", json: "", has_json: jlen >= 0 };
+    c.yaml = data[at.*..at.* + ylen];
+    at.* += ylen + 1;
+    c.events = data[at.*..at.* + elen];
+    at.* += elen + 1;
+    if c.has_json {
+        let jn = @truncate(usize, @bit_cast(u64, jlen));
+        c.json = data[at.*..at.* + jn];
+        at.* += jn + 1;
+    }
+    return c;
+}
+
 // The event stream of text in test-suite form, or an error.
 fn events_text(text: []u8, out: *mut strs.String) !void {
     let mut a = arena.Arena.init();
@@ -2686,36 +2724,22 @@ test "yaml-test-suite: events" {
     let mut failed: usize = 0;
     let mut got = strs.String.init();
     defer got.deinit();
-    while at < data.len {
-        let head = next_line(data, &mut at);
-        let mut f = strs.fields(head);
-        _ = f.next() catch break;
-        let name = f.next() catch break;
-        let is_err = strs.eq(f.next() catch break, "1");
-        let ylen = fmt.parse_int.[usize](f.next() catch break) catch break;
-        let elen = fmt.parse_int.[usize](f.next() catch break) catch break;
-        let jlen = fmt.parse_int.[i64](f.next() catch break) catch break;
-        let text = data[at..at + ylen];
-        at += ylen + 1;
-        let want = data[at..at + elen];
-        at += elen + 1;
-        if jlen >= 0 {
-            at += @truncate(usize, @bit_cast(u64, jlen)) + 1;
-        }
+    loop {
+        let c = next_case(data, &mut at) catch break;
         got.clear();
-        let r = events_text(text, &mut got);
+        let r = events_text(c.yaml, &mut got);
         let mut ok = false;
-        if is_err {
+        if c.is_err {
             ok = fails(r);
         } else {
-            ok = not fails(r) and strs.eq(got.bytes(), want);
+            ok = not fails(r) and strs.eq(got.bytes(), c.events);
         }
         if ok {
             passed += 1;
         } else {
             failed += 1;
             if failed <= 60 {
-                fmt.print("FAIL {}\n", [fmt.str(name)]) catch {};
+                fmt.print("FAIL {}\n", [fmt.str(c.name)]) catch {};
             }
         }
     }
@@ -2815,31 +2839,16 @@ test "yaml-test-suite: documents against in.json" {
     let mut failed: usize = 0;
     let mut vals = vec.Vec.[[]u8].init();
     defer vals.deinit();
-    while at < data.len {
-        let head = next_line(data, &mut at);
-        let mut f = strs.fields(head);
-        _ = f.next() catch break;
-        let name = f.next() catch break;
-        let is_err = strs.eq(f.next() catch break, "1");
-        let ylen = fmt.parse_int.[usize](f.next() catch break) catch break;
-        let elen = fmt.parse_int.[usize](f.next() catch break) catch break;
-        let jlen = fmt.parse_int.[i64](f.next() catch break) catch break;
-        let text = data[at..at + ylen];
-        at += ylen + 1 + elen + 1;
-        if jlen < 0 {
-            continue;
-        }
-        let jn = @truncate(usize, @bit_cast(u64, jlen));
-        let jtext = data[at..at + jn];
-        at += jn + 1;
-        if is_err {
+    loop {
+        let c = next_case(data, &mut at) catch break;
+        if not c.has_json or c.is_err {
             continue;  // (a few error cases carry JSON of what came before the error)
         }
         vals.clear();
-        json_values(jtext, &mut vals)!;
+        json_values(c.json, &mut vals)!;
         let mut ok = true;
-        let mut st = parse_all(text) catch |e| {
-            fmt.print("FAIL {} ({})\n", [fmt.str(name), fmt.str(@error_name(e))]) catch {};
+        let mut st = parse_all(c.yaml) catch |e| {
+            fmt.print("FAIL {} ({})\n", [fmt.str(c.name), fmt.str(@error_name(e))]) catch {};
             failed += 1;
             continue;
         };
@@ -2859,7 +2868,7 @@ test "yaml-test-suite: documents against in.json" {
             passed += 1;
         } else {
             failed += 1;
-            fmt.print("FAIL {}\n", [fmt.str(name)]) catch {};
+            fmt.print("FAIL {}\n", [fmt.str(c.name)]) catch {};
         }
     }
     fmt.print("yaml-test-suite documents: {} passed, {} failed\n", [fmt.int(passed), fmt.int(failed)]) catch {};
