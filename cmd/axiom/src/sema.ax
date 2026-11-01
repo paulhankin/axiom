@@ -2100,6 +2100,119 @@ fn check_shift_count(pb: *mut *mut ast.Expr) bool {
     return false;
 }
 
+// x op y for a comparison operator op.
+fn compare_f64(op: i32, x: f64, y: f64) bool {
+    if op == lx.TK_EQEQ {
+        return x == y;
+    }
+    if op == lx.TK_NE {
+        return x != y;
+    }
+    if op == lx.TK_LT {
+        return x < y;
+    }
+    if op == lx.TK_LE {
+        return x <= y;
+    }
+    if op == lx.TK_GT {
+        return x > y;
+    }
+    if op == lx.TK_GE {
+        return x >= y;
+    }
+    return false;
+}
+
+fn compare_i128(op: i32, x: u.I128, y: u.I128) bool {
+    if op == lx.TK_EQEQ {
+        return x.eq(y);
+    }
+    if op == lx.TK_NE {
+        return not x.eq(y);
+    }
+    if op == lx.TK_LT {
+        return x.lt(y);
+    }
+    if op == lx.TK_LE {
+        return x.le(y);
+    }
+    if op == lx.TK_GT {
+        return x.gt(y);
+    }
+    if op == lx.TK_GE {
+        return x.ge(y);
+    }
+    return false;
+}
+
+// E0412 for the operands of a binary operator op, of types l and r: with a
+// fix that splats a scalar operand of a vector's lane type.
+fn operand_types_differ(e: *mut ast.Expr, op: i32, l: *mut ast.Type, r: *mut ast.Type) void {
+    let d = dg.err(e.span, "E0412", u.f3("operands of '%s' have different types: %s and %s", lx.tok_kind_name(op),
+                                         tstr(l), tstr(r)));
+    dg.set_types(d, tstr(l), tstr(r));
+    if (l.kind == ast.TY_VEC) and (r == l.elem) {
+        let txt = u.span_text(ast.b_of(e).span);
+        let fx = dg.fix(d, "broadcast the scalar to all lanes", "machine");
+        dg.edit(fx, ast.b_of(e).span, u.f1("@splat(%s)", txt));
+    } else if (r.kind == ast.TY_VEC) and (l == r.elem) {
+        let txt = u.span_text(e.a.span);
+        let fx = dg.fix(d, "broadcast the scalar to all lanes", "machine");
+        dg.edit(fx, e.a.span, u.f1("@splat(%s)", txt));
+    }
+}
+
+// A shift (op): the count unsigned, the operand an integer (vectors shift
+// per lane, by a scalar or a vector of counts of their shape).
+fn check_shift(e: *mut ast.Expr, expected: *mut ast.Type, op: i32) *mut ast.Type {
+    let mut hint = tnil();
+    if u.notnil(expected) and
+       ((expected.kind == ast.TY_INT) or ty.is_vec_int(expected) or (expected.kind == ast.TY_PARAM)) {
+        hint = expected;
+    }
+    let mut l = check_expr(e.a, hint);
+    let ok = check_shift_count(ast.b_mut(e));
+    if l.kind == ast.TY_UNTYPED_INT {
+        if e.a.is_const and ast.b_of(e).is_const and (ast.b_of(e).ty.kind == ast.TY_INT) {
+            let r = fold_int(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)), tnil(), e.span);
+            if r.ok {
+                ast.set_cval(e, r.v);
+                e.is_const = true;
+            }
+            e.ty = ty.t_untyped_int;
+            return e.ty;
+        }
+        if u.notnil(hint) {
+            coerce(&mut e.a, hint);
+            l = e.a.ty;
+        } else {
+            _ = finalize_untyped(&mut e.a);
+            return set_ty(e, ty.t_invalid);
+        }
+    }
+    if (l.kind != ast.TY_INT) and not ty.is_vec_int(l) and not param_has(l, ast.C_INT) and (l.kind != ast.TY_INVALID) {
+        _ = dg.err(e.a.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(l)));
+        return set_ty(e, ty.t_invalid);
+    }
+    let k = ast.b_of(e).ty;
+    if ok and ty.is_vec_int(k) and (l.kind != ast.TY_INVALID) and
+       not (ty.is_vec_int(l) and (l.lanes == k.lanes) and (l.elem.bits == k.elem.bits)) {
+        _ = dg.err(ast.b_of(e).span, "E0412",
+                   u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(l),
+                        tstr(k)));
+        return set_ty(e, ty.t_invalid);
+    }
+    if ok and e.a.is_const and ast.b_of(e).is_const and (l.kind == ast.TY_INT) {
+        let r = fold_int(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)), l, e.span);
+        if r.ok {
+            ast.set_cval(e, r.v);
+            e.is_const = true;
+        }
+    }
+    e.ty = l;
+    return e.ty;
+}
+
 fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     let op = ast.op_of(e);
     if (op == lx.KW_AND) or (op == lx.KW_OR) {
@@ -2109,53 +2222,7 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         return e.ty;
     }
     if is_shift_op(op) {
-        let mut hint = tnil();
-        if u.notnil(expected) and
-           ((expected.kind == ast.TY_INT) or ty.is_vec_int(expected) or (expected.kind == ast.TY_PARAM)) {
-            hint = expected;
-        }
-        let mut l = check_expr(e.a, hint);
-        let ok = check_shift_count(ast.b_mut(e));
-        if l.kind == ast.TY_UNTYPED_INT {
-            if e.a.is_const and ast.b_of(e).is_const and (ast.b_of(e).ty.kind == ast.TY_INT) {
-                let r = fold_int(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)), tnil(), e.span);
-                if r.ok {
-                    ast.set_cval(e, r.v);
-                    e.is_const = true;
-                }
-                e.ty = ty.t_untyped_int;
-                return e.ty;
-            }
-            if u.notnil(hint) {
-                coerce(&mut e.a, hint);
-                l = e.a.ty;
-            } else {
-                _ = finalize_untyped(&mut e.a);
-                return set_ty(e, ty.t_invalid);
-            }
-        }
-        if (l.kind != ast.TY_INT) and not ty.is_vec_int(l) and not param_has(l, ast.C_INT) and
-           (l.kind != ast.TY_INVALID) {
-            _ = dg.err(e.a.span, "E0513", u.f1("shift requires an integer operand, found %s", tstr(l)));
-            return set_ty(e, ty.t_invalid);
-        }
-        let k = ast.b_of(e).ty;
-        if ok and ty.is_vec_int(k) and (l.kind != ast.TY_INVALID) and
-           not (ty.is_vec_int(l) and (l.lanes == k.lanes) and (l.elem.bits == k.elem.bits)) {
-            _ = dg.err(ast.b_of(e).span, "E0412",
-                       u.f2("per-lane shift counts must have the shape of the shifted vector: %s and %s", tstr(l),
-                            tstr(k)));
-            return set_ty(e, ty.t_invalid);
-        }
-        if ok and e.a.is_const and ast.b_of(e).is_const and (l.kind == ast.TY_INT) {
-            let r = fold_int(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)), l, e.span);
-            if r.ok {
-                ast.set_cval(e, r.v);
-                e.is_const = true;
-            }
-        }
-        e.ty = l;
-        return e.ty;
+        return check_shift(e, expected, op);
     }
     let cmp = lx.is_compare_op(op);
     let mut hint = expected;
@@ -2195,18 +2262,7 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         t = l;
         if (l != r) and (l.kind != ast.TY_INVALID) and (r.kind != ast.TY_INVALID) and (l.kind != ast.TY_NEVER) and
            (r.kind != ast.TY_NEVER) and not ((l.kind == ast.TY_ERROR) and (r.kind == ast.TY_ERROR)) {
-            let d = dg.err(e.span, "E0412", u.f3("operands of '%s' have different types: %s and %s",
-                                                 lx.tok_kind_name(op), tstr(l), tstr(r)));
-            dg.set_types(d, tstr(l), tstr(r));
-            if (l.kind == ast.TY_VEC) and (r == l.elem) {
-                let txt = u.span_text(ast.b_of(e).span);
-                let fx = dg.fix(d, "broadcast the scalar to all lanes", "machine");
-                dg.edit(fx, ast.b_of(e).span, u.f1("@splat(%s)", txt));
-            } else if (r.kind == ast.TY_VEC) and (l == r.elem) {
-                let txt = u.span_text(e.a.span);
-                let fx = dg.fix(d, "broadcast the scalar to all lanes", "machine");
-                dg.edit(fx, e.a.span, u.f1("@splat(%s)", txt));
-            }
+            operand_types_differ(e, op, l, r);
             if cmp {
                 e.ty = ty.t_bool;
             } else {
@@ -2219,50 +2275,11 @@ fn check_binary(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
         _ = check_cmp_op(op, t, e.span);
         if ty.is_untyped(t) and e.a.is_const and ast.b_of(e).is_const {
             // two untyped constants: the comparison is a bool constant
-            let fa = ast.fval_of(e.a);
-            let fb = ast.fval_of(ast.b_of(e));
-            let a = ast.cval_of(e.a);
-            let b = ast.cval_of(ast.b_of(e));
-            let fl = t.kind == ast.TY_UNTYPED_FLOAT;
-            let mut res = false;
-            if op == lx.TK_EQEQ {
-                if fl {
-                    res = fa == fb;
-                } else {
-                    res = a.eq(b);
-                }
-            } else if op == lx.TK_NE {
-                if fl {
-                    res = fa != fb;
-                } else {
-                    res = not a.eq(b);
-                }
-            } else if op == lx.TK_LT {
-                if fl {
-                    res = fa < fb;
-                } else {
-                    res = a.lt(b);
-                }
-            } else if op == lx.TK_LE {
-                if fl {
-                    res = fa <= fb;
-                } else {
-                    res = a.le(b);
-                }
-            } else if op == lx.TK_GT {
-                if fl {
-                    res = fa > fb;
-                } else {
-                    res = a.gt(b);
-                }
-            } else if op == lx.TK_GE {
-                if fl {
-                    res = fa >= fb;
-                } else {
-                    res = a.ge(b);
-                }
+            if t.kind == ast.TY_UNTYPED_FLOAT {
+                e.bval = compare_f64(op, ast.fval_of(e.a), ast.fval_of(ast.b_of(e)));
+            } else {
+                e.bval = compare_i128(op, ast.cval_of(e.a), ast.cval_of(ast.b_of(e)));
             }
-            e.bval = res;
             e.is_const = true;
         }
         e.ty = ty.t_bool;
@@ -2903,180 +2920,201 @@ fn check_all_args(e: *mut ast.Expr) void {
     }
 }
 
+// A call of the function or method (callee) f: its arguments checked against
+// f's parameters (phase 1), generic arguments deduced from them unless all
+// are given (phase 2), and the arguments coerced to the parameters (phase 3).
+fn check_direct_call(e: *mut ast.Expr, callee: *mut ast.Expr, method: bool) *mut ast.Type {
+    let f = ast.decl_of(callee);
+    resolve_decl(f);
+    if method and (f.self_kind == ast.SELF_NONE) {
+        _ = dg.err(callee.span, "E0421", u.f3("'%s' has no 'self' parameter; call it as %s.%s(...)", f.name,
+                                              f.owner.name, f.name));
+        check_all_args(e);
+        return set_ty(e, ty.t_invalid);
+    }
+    let mut first: usize = 0;
+    if method {
+        first = 1;
+    }
+    let nparams = f.params.len - first;
+    check_args_count(e, nparams, f);
+    let nall = f.all_gparams.len;
+    let mut nown = f.gparams.len;
+    if f.kind == ast.D_HOST_FN {
+        nown = 0;
+    }
+    let nowner = nall - nown;
+    let gargs = u.newn.[*mut ast.Type](nall);
+    let mut i: usize = 0;
+    while (i < ast.gargs_of(callee).len) and (i < nall) {
+        gargs[i] = ast.gargs_of(callee)[i];
+        i += 1;
+    }
+    let deduce = (nown > 0) and (ast.gargs_of(callee).len < nall);
+    let owner_from = f.all_gparams[0..nowner];
+    let owner_to = gargs[0..nowner];
+    let own_vars = f.all_gparams[nowner..];
+    // phase 1: check args
+    let mut nargs = ast.args_of(e).len;
+    if nargs > nparams {
+        nargs = nparams;
+    }
+    for j in 0..ast.args_of(e).len {
+        if j >= nparams {
+            if f.variadic {
+                check_vararg(ast.args_of(e).at(j));
+            } else {
+                _ = check_expr(ast.args_of(e).get(j), tnil());
+            }
+            continue;
+        }
+        let mut pt = ty.subst(f.param_types[first + j], owner_from, owner_to);
+        if deduce and mentions(pt, own_vars) {
+            _ = check_expr(ast.args_of(e).get(j), tnil());
+        } else {
+            if not deduce {
+                pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
+            }
+            _ = check_expr(ast.args_of(e).get(j), pt);
+        }
+    }
+    // phase 2: deduce
+    if deduce {
+        deduce_gargs(e, f, first, nargs, nowner, gargs);
+    }
+    // phase 3: coerce args
+    for j in 0..nargs {
+        let pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
+        coerce(ast.args_of(e).at(j), pt);
+    }
+    ast.set_decl(e, f);
+    ast.set_gargs(e, gargs);
+    ast.set_call_kind(e, ast.CALLK_DIRECT);
+    if f.is_inline and u.notnil(C.fnd) and C.fnd.is_inline {
+        C.fnd.inline_callees.push(f);
+        C.fnd.inline_call_spans.push(e.span);
+    }
+    if method {
+        check_receiver(e, callee, f);
+    }
+    e.ty = ty.subst(f.ret_type, f.all_gparams, gargs);
+    return e.ty;
+}
+
+// Phase 2 of a direct call of f with deduced generic arguments: f's own
+// generic parameters (gargs[nowner..]) solved from the types of the first
+// nargs arguments (checked in phase 1). `first` skips a method's self.
+fn deduce_gargs(e: *mut ast.Expr, f: *mut ast.Decl, first: usize, nargs: usize, nowner: usize,
+                gargs: []mut *mut ast.Type) void {
+    let nown = gargs.len - nowner;
+    let owner_from = f.all_gparams[0..nowner];
+    let owner_to = gargs[0..nowner];
+    let own_vars = f.all_gparams[nowner..];
+    let sol = u.newn.[*mut ast.Type](nown);
+    let mut ok = true;
+    for j in 0..nargs {
+        let pt = ty.subst(f.param_types[first + j], owner_from, owner_to);
+        let arg = ast.args_of(e).get(j);
+        let mut before: [16]*mut ast.Type = [tnil(); 16];
+        for k in 0..nown {
+            if k >= 16 {
+                break;
+            }
+            before[k] = sol[k];
+        }
+        if not unify(pt, arg.ty, own_vars, sol) {
+            for k in 0..nown {
+                if k >= 16 {
+                    break;
+                }
+                if u.notnil(before[k]) and (sol[k] == before[k]) {
+                    let mut tmp: [1]*mut ast.Type = [tnil()];
+                    _ = unify(pt, arg.ty, own_vars[k..k + 1], tmp[..]);
+                    if u.notnil(tmp[0]) and (tmp[0] != before[k]) {
+                        let gp = f.gparams.at(k);
+                        let d = dg.err(arg.span, "E0464",
+                                       u.f3("conflicting types for generic parameter '%s': %s and %s", gp.name,
+                                            tstr(before[k]), tstr(tmp[0])));
+                        dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
+                    }
+                }
+            }
+            ok = false;
+        }
+    }
+    for k in 0..nown {
+        if not ok {
+            break;
+        }
+        if u.isnil(sol[k]) {
+            let gp = f.gparams.at(k);
+            let d = dg.err(e.span, "E0463",
+                           u.f3("cannot deduce generic parameter '%s' of '%s'; give it explicitly: %s.[...](...)",
+                                gp.name, f.name, f.name));
+            dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
+            ok = false;
+        }
+    }
+    for k in 0..nown {
+        if u.notnil(sol[k]) {
+            gargs[nowner + k] = sol[k];
+        } else {
+            gargs[nowner + k] = ty.t_invalid;
+        }
+    }
+    if ok {
+        _ = check_generic_args(f, gargs[nowner..nowner + nown], e.span, u.nil.[u.List.[*mut ast.TypeExpr]]());
+    }
+}
+
+// How a method call passes its receiver (callee.b) to f's self.
+fn check_receiver(e: *mut ast.Expr, callee: *mut ast.Expr, f: *mut ast.Decl) void {
+    let recv = ast.b_of(callee);
+    let rt = recv.ty;
+    let via_ptr = ast.self_mode_of(callee) == ast.SELF_DEREF;
+    let sk = f.self_kind;
+    if sk == ast.SELF_VALUE {
+        if via_ptr {
+            ast.set_self_mode(e, ast.SELF_DEREF);
+        } else {
+            ast.set_self_mode(e, ast.SELF_VALUE);
+        }
+    } else if sk == ast.SELF_ADDR {
+        if via_ptr {
+            ast.set_self_mode(e, ast.SELF_PASS);
+        } else {
+            // a temporary receiver gets a slot, as &temporary does
+            ast.set_self_mode(e, ast.SELF_ADDR);
+            mark_addr_taken(recv);
+        }
+    } else if sk == ast.SELF_PASS {
+        if via_ptr {
+            if not rt.is_mut {
+                _ = dg.err(recv.span, "E0702", u.f2("method '%s' takes '*mut Self', but the receiver is %s", f.name,
+                                                    tstr(rt)));
+            }
+            ast.set_self_mode(e, ast.SELF_PASS);
+        } else if not is_place(recv) {
+            _ = dg.err(recv.span, "E0703",
+                       u.f1("method '%s' needs the mutable address of its receiver, but it is a temporary", f.name));
+        } else {
+            if not is_mut_place(recv) {
+                not_mutable(recv, u.f1("call '%s' (it takes *mut Self)", f.name));
+            }
+            ast.set_self_mode(e, ast.SELF_ADDR);
+            mark_addr_taken(recv);
+        }
+    }
+    ast.set_b(e, recv);
+}
+
 fn check_call(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     let callee = e.a;
     _ = check_operand(callee, tnil());
     e.cat = ast.CAT_VALUE;
     let cc = callee.cat;
     if (cc == ast.CAT_FUNC) or (cc == ast.CAT_METHOD) {
-        let f = ast.decl_of(callee);
-        resolve_decl(f);
-        let method = cc == ast.CAT_METHOD;
-        if method and (f.self_kind == ast.SELF_NONE) {
-            _ = dg.err(callee.span, "E0421", u.f3("'%s' has no 'self' parameter; call it as %s.%s(...)", f.name,
-                                                  f.owner.name, f.name));
-            check_all_args(e);
-            return set_ty(e, ty.t_invalid);
-        }
-        let mut first: usize = 0;
-        if method {
-            first = 1;
-        }
-        let nparams = f.params.len - first;
-        check_args_count(e, nparams, f);
-        let nall = f.all_gparams.len;
-        let mut nown = f.gparams.len;
-        if f.kind == ast.D_HOST_FN {
-            nown = 0;
-        }
-        let nowner = nall - nown;
-        let gargs = u.newn.[*mut ast.Type](nall);
-        let mut i: usize = 0;
-        while (i < ast.gargs_of(callee).len) and (i < nall) {
-            gargs[i] = ast.gargs_of(callee)[i];
-            i += 1;
-        }
-        let deduce = (nown > 0) and (ast.gargs_of(callee).len < nall);
-        let owner_from = f.all_gparams[0..nowner];
-        let owner_to = gargs[0..nowner];
-        let own_vars = f.all_gparams[nowner..];
-        // phase 1: check args
-        let mut nargs = ast.args_of(e).len;
-        if nargs > nparams {
-            nargs = nparams;
-        }
-        for j in 0..ast.args_of(e).len {
-            if j >= nparams {
-                if f.variadic {
-                    check_vararg(ast.args_of(e).at(j));
-                } else {
-                    _ = check_expr(ast.args_of(e).get(j), tnil());
-                }
-                continue;
-            }
-            let mut pt = ty.subst(f.param_types[first + j], owner_from, owner_to);
-            if deduce and mentions(pt, own_vars) {
-                _ = check_expr(ast.args_of(e).get(j), tnil());
-            } else {
-                if not deduce {
-                    pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
-                }
-                _ = check_expr(ast.args_of(e).get(j), pt);
-            }
-        }
-        // phase 2: deduce
-        if deduce {
-            let sol = u.newn.[*mut ast.Type](nown);
-            let mut ok = true;
-            for j in 0..nargs {
-                let pt = ty.subst(f.param_types[first + j], owner_from, owner_to);
-                let arg = ast.args_of(e).get(j);
-                let mut before: [16]*mut ast.Type = [tnil(); 16];
-                for k in 0..nown {
-                    if k >= 16 {
-                        break;
-                    }
-                    before[k] = sol[k];
-                }
-                if not unify(pt, arg.ty, own_vars, sol) {
-                    for k in 0..nown {
-                        if k >= 16 {
-                            break;
-                        }
-                        if u.notnil(before[k]) and (sol[k] == before[k]) {
-                            let mut tmp: [1]*mut ast.Type = [tnil()];
-                            _ = unify(pt, arg.ty, own_vars[k..k + 1], tmp[..]);
-                            if u.notnil(tmp[0]) and (tmp[0] != before[k]) {
-                                let gp = f.gparams.at(k);
-                                let d = dg.err(arg.span, "E0464",
-                                               u.f3("conflicting types for generic parameter '%s': %s and %s", gp.name,
-                                                    tstr(before[k]), tstr(tmp[0])));
-                                dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
-                            }
-                        }
-                    }
-                    ok = false;
-                }
-            }
-            for k in 0..nown {
-                if not ok {
-                    break;
-                }
-                if u.isnil(sol[k]) {
-                    let gp = f.gparams.at(k);
-                    let d = dg.err(e.span, "E0463",
-                                   u.f3("cannot deduce generic parameter '%s' of '%s'; give it explicitly: %s.[...](...)",
-                                        gp.name, f.name, f.name));
-                    dg.note(d, gp.span, u.f1("'%s' declared here", gp.name));
-                    ok = false;
-                }
-            }
-            for k in 0..nown {
-                if u.notnil(sol[k]) {
-                    gargs[nowner + k] = sol[k];
-                } else {
-                    gargs[nowner + k] = ty.t_invalid;
-                }
-            }
-            if ok {
-                _ = check_generic_args(f, gargs[nowner..nowner + nown], e.span, u.nil.[u.List.[*mut ast.TypeExpr]]());
-            }
-        }
-        // phase 3: coerce args
-        for j in 0..nargs {
-            let pt = ty.subst(f.param_types[first + j], f.all_gparams, gargs);
-            coerce(ast.args_of(e).at(j), pt);
-        }
-        ast.set_decl(e, f);
-        ast.set_gargs(e, gargs);
-        ast.set_call_kind(e, ast.CALLK_DIRECT);
-        if f.is_inline and u.notnil(C.fnd) and C.fnd.is_inline {
-            C.fnd.inline_callees.push(f);
-            C.fnd.inline_call_spans.push(e.span);
-        }
-        // receiver
-        if method {
-            let recv = ast.b_of(callee);
-            let rt = recv.ty;
-            let via_ptr = ast.self_mode_of(callee) == ast.SELF_DEREF;
-            let sk = f.self_kind;
-            if sk == ast.SELF_VALUE {
-                if via_ptr {
-                    ast.set_self_mode(e, ast.SELF_DEREF);
-                } else {
-                    ast.set_self_mode(e, ast.SELF_VALUE);
-                }
-            } else if sk == ast.SELF_ADDR {
-                if via_ptr {
-                    ast.set_self_mode(e, ast.SELF_PASS);
-                } else {
-                    // a temporary receiver gets a slot, as &temporary does
-                    ast.set_self_mode(e, ast.SELF_ADDR);
-                    mark_addr_taken(recv);
-                }
-            } else if sk == ast.SELF_PASS {
-                if via_ptr {
-                    if not rt.is_mut {
-                        _ = dg.err(recv.span, "E0702", u.f2("method '%s' takes '*mut Self', but the receiver is %s",
-                                                            f.name, tstr(rt)));
-                    }
-                    ast.set_self_mode(e, ast.SELF_PASS);
-                } else if not is_place(recv) {
-                    _ = dg.err(recv.span, "E0703",
-                               u.f1("method '%s' needs the mutable address of its receiver, but it is a temporary",
-                                    f.name));
-                } else {
-                    if not is_mut_place(recv) {
-                        not_mutable(recv, u.f1("call '%s' (it takes *mut Self)", f.name));
-                    }
-                    ast.set_self_mode(e, ast.SELF_ADDR);
-                    mark_addr_taken(recv);
-                }
-            }
-            ast.set_b(e, recv);
-        }
-        e.ty = ty.subst(f.ret_type, f.all_gparams, gargs);
-        return e.ty;
+        return check_direct_call(e, callee, cc == ast.CAT_METHOD);
     }
     if cc == ast.CAT_VARIANT {
         let ut = ast.tval_of(callee);
@@ -3732,7 +3770,12 @@ fn operand(pe: *mut *mut ast.Expr, hint: *mut ast.Type) *mut ast.Type {
 
 // Two operands of the same type.
 fn pair(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
-    let mut a = check_expr(barg(e, 0), expected);
+    return pair_checked(e, check_expr(barg(e, 0), expected), expected);
+}
+
+/// `pair` with the first operand already checked as `a0`.
+fn pair_checked(e: *mut ast.Expr, a0: *mut ast.Type, expected: *mut ast.Type) *mut ast.Type {
+    let mut a = a0;
     let mut h2 = a;
     if ty.is_untyped(a) {
         h2 = expected;
@@ -3750,32 +3793,6 @@ fn pair(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
             coerce(earg(e, 1), expected);
             return expected;
         }
-        _ = finalize_untyped(earg(e, 0));
-        return ty.t_invalid;
-    }
-    if (a != b) and (a.kind != ast.TY_INVALID) and (b.kind != ast.TY_INVALID) {
-        let d = dg.err(e.span, "E0412", u.f3("@%s operands have different types: %s and %s", e.name, tstr(a), tstr(b)));
-        dg.set_types(d, tstr(a), tstr(b));
-        return ty.t_invalid;
-    }
-    return a;
-}
-
-/// `pair` with the first operand already checked as `a` (without an expected type).
-fn pair_checked(e: *mut ast.Expr, a0: *mut ast.Type) *mut ast.Type {
-    let mut a = a0;
-    let mut h2 = a;
-    if ty.is_untyped(a) {
-        h2 = tnil();
-    }
-    let mut b = check_expr(barg(e, 1), h2);
-    if ty.is_untyped(a) and not ty.is_untyped(b) {
-        coerce(earg(e, 0), b);
-        a = b;
-    } else if ty.is_untyped(b) and not ty.is_untyped(a) {
-        coerce(earg(e, 1), a);
-        b = a;
-    } else if ty.is_untyped(a) and ty.is_untyped(b) {
         _ = finalize_untyped(earg(e, 0));
         return ty.t_invalid;
     }
@@ -3884,6 +3901,9 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     // (each family's function gives nil for the others' builtins)
     let mut r = check_conversion_builtin(e);
     if u.isnil(r) {
+        r = check_pointer_builtin(e);
+    }
+    if u.isnil(r) {
         r = check_memory_builtin(e);
     }
     if u.isnil(r) {
@@ -3891,6 +3911,9 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     }
     if u.isnil(r) {
         r = check_vector_builtin(e, x);
+    }
+    if u.isnil(r) {
+        r = check_vector_op_builtin(e, x);
     }
     if u.isnil(r) {
         r = check_system_builtin(e);
@@ -3901,7 +3924,141 @@ fn builtin_check(e: *mut ast.Expr, expected: *mut ast.Type) *mut ast.Type {
     return r;
 }
 
-// @size_of ... @cast_slice: types, conversions, pointers and slices.
+// @int_from_float(T, x) (to_int) or @float_from_int(T, x): scalars, or vectors
+// of as many lanes, lane-wise (spec §13.2).
+fn check_int_float_conversion(e: *mut ast.Expr, to_int: bool) *mut ast.Type {
+    let t = targ(e, 0);
+    ast.set_tval(e, t);
+    if (to_int and ty.is_vec_int(t)) or (not to_int and ty.is_vec_float(t)) {
+        let s = operand(earg(e, 1), tnil());
+        let src_ok = (to_int and ty.is_vec_float(s)) or (not to_int and ty.is_vec_int(s));
+        if (s.kind != ast.TY_INVALID) and not (src_ok and (s.lanes == t.lanes)) {
+            let msg = u.pick(to_int, "@int_from_float to %s requires a float vector of %s lanes, found %s",
+                             "@float_from_int to %s requires an integer vector of %s lanes, found %s");
+            _ = dg.err(barg(e, 1).span, "E0822", u.f3(msg, tstr(t), u.idec(t.lanes), tstr(s)));
+        }
+        return set_ty(e, t);
+    }
+    if to_int {
+        if not is_int_like(t) {
+            _ = dg.err(e.span, "E0822", "@int_from_float requires an integer target type");
+        }
+        let s = operand(earg(e, 1), ty.t_f64);
+        if not is_float_like(s) {
+            _ = dg.err(barg(e, 1).span, "E0822", "@int_from_float requires a float operand");
+        }
+        return set_ty(e, t);
+    }
+    if not is_float_like(t) {
+        _ = dg.err(e.span, "E0822", "@float_from_int requires a float target type");
+    }
+    let s = operand(earg(e, 1), ty.t_i64);
+    if not is_int_like(s) {
+        _ = dg.err(barg(e, 1).span, "E0822", "@float_from_int requires an integer operand");
+    }
+    return set_ty(e, t);
+}
+
+// @enum_from_int(T, x): constant when x is, which must then be a member's value.
+fn check_enum_from_int(e: *mut ast.Expr) *mut ast.Type {
+    let t = targ(e, 0);
+    ast.set_tval(e, t);
+    if t.kind != ast.TY_ENUM {
+        if t.kind != ast.TY_INVALID {
+            _ = dg.err(e.span, "E0822", u.f1("@enum_from_int requires an enum target type, found %s", tstr(t)));
+        }
+        _ = check_expr(barg(e, 1), tnil());
+        return set_ty(e, ty.t_invalid);
+    }
+    let s = check_expr(barg(e, 1), t.elem);
+    if s.kind == ast.TY_UNTYPED_INT {
+        coerce(earg(e, 1), t.elem);
+    } else if ty.is_untyped(s) {
+        _ = finalize_untyped(earg(e, 1));
+    } else if (s.kind != ast.TY_INT) and (s.kind != ast.TY_INVALID) {
+        _ = dg.err(barg(e, 1).span, "E0822", u.f1("@enum_from_int requires an integer operand, found %s", tstr(s)));
+    }
+    let a = barg(e, 1);
+    if a.is_const and (a.ty.kind == ast.TY_INT) {
+        let mut found = false;
+        for i in 0..t.decl.variants.len {
+            if t.decl.variants.at(i).value.eq(ast.cval_of(a)) {
+                found = true;
+            }
+        }
+        if found {
+            e.is_const = true;
+            ast.set_cval(e, ast.cval_of(a));
+        } else {
+            _ = dg.err(a.span, "E0826", u.f1("%s has no member with this value", tstr(t)));
+        }
+    }
+    return set_ty(e, t);
+}
+
+// @offset_of(T, field): a constant unless T has generic parameters.
+fn check_offset_of(e: *mut ast.Expr) *mut ast.Type {
+    let t = targ(e, 0);
+    ast.set_tval(e, t);
+    let f = barg(e, 1);
+    if f.kind != ast.E_IDENT {
+        _ = dg.err(f.span, "E0821", "@offset_of expects a field name");
+        return set_ty(e, ty.t_usize);
+    }
+    if t.kind != ast.TY_STRUCT {
+        if t.kind != ast.TY_INVALID {
+            _ = dg.err(e.span, "E0821", "@offset_of requires a struct type");
+        }
+        return set_ty(e, ty.t_usize);
+    }
+    let fi = find_field(t.decl, f.name);
+    if fi < 0 {
+        _ = dg.err(f.span, "E0404", u.f2("%s has no field '%s'", tstr(t), f.name));
+        return set_ty(e, ty.t_usize);
+    }
+    ast.set_builtin(e, ast.BI_OFFSET_OF);
+    ast.set_index(f, fi);
+    f.ty = ty.t_invalid;
+    if not t.has_params {
+        e.is_const = true;
+        ast.set_cval(e, u.I128.of(ty.type_field_offset(t, @int_cast(usize, fi))));
+    }
+    return set_ty(e, ty.t_usize);
+}
+
+// @as(T, x): x converted to T without possible loss of information.
+fn check_as(e: *mut ast.Expr) *mut ast.Type {
+    let t = targ(e, 0);
+    ast.set_tval(e, t);
+    let s = check_expr(barg(e, 1), t);
+    if ty.is_untyped(s) {
+        coerce(earg(e, 1), t);
+        let a = barg(e, 1);
+        e.is_const = a.is_const;
+        ast.set_cval(e, ast.cval_of(a));
+        ast.set_fval(e, ast.fval_of(a));
+        return set_ty(e, t);
+    }
+    if (s.kind == ast.TY_BOOL) and (t.kind == ast.TY_INT) and (barg(e, 1).kind == ast.E_BOOL) {
+        e.is_const = true;
+        ast.set_cval(e, u.I128.zero());
+        if barg(e, 1).bval {
+            ast.set_cval(e, u.I128.ofu(1));
+        }
+    }
+    if (s.kind != ast.TY_INVALID) and (t.kind != ast.TY_INVALID) and not lossless(s, t) {
+        let d = dg.err(e.span, "E0510", u.f2("@as cannot convert %s to %s without possible loss of information",
+                                             tstr(s), tstr(t)));
+        if (s.kind == ast.TY_INT) and (t.kind == ast.TY_INT) {
+            let txt = u.span_text(barg(e, 1).span);
+            let fx = dg.fix(d, "use a checked conversion", "suggestion");
+            dg.edit(fx, e.span, u.f2("@int_cast(%s, %s)", tstr(t), txt));
+        }
+    }
+    return set_ty(e, t);
+}
+
+// @size_of ... @bit_cast: types and conversions.
 fn check_conversion_builtin(e: *mut ast.Expr) *mut ast.Type {
     let id = ast.builtin_of(e);
     if (id == ast.BI_SIZE_OF) or (id == ast.BI_ALIGN_OF) {
@@ -3918,32 +4075,7 @@ fn check_conversion_builtin(e: *mut ast.Expr) *mut ast.Type {
         return set_ty(e, ty.t_usize);
     }
     if id == ast.BI_OFFSET_OF {
-        let t = targ(e, 0);
-        ast.set_tval(e, t);
-        let f = barg(e, 1);
-        if f.kind != ast.E_IDENT {
-            _ = dg.err(f.span, "E0821", "@offset_of expects a field name");
-            return set_ty(e, ty.t_usize);
-        }
-        if t.kind != ast.TY_STRUCT {
-            if t.kind != ast.TY_INVALID {
-                _ = dg.err(e.span, "E0821", "@offset_of requires a struct type");
-            }
-            return set_ty(e, ty.t_usize);
-        }
-        let fi = find_field(t.decl, f.name);
-        if fi < 0 {
-            _ = dg.err(f.span, "E0404", u.f2("%s has no field '%s'", tstr(t), f.name));
-            return set_ty(e, ty.t_usize);
-        }
-        ast.set_builtin(e, ast.BI_OFFSET_OF);
-        ast.set_index(f, fi);
-        f.ty = ty.t_invalid;
-        if not t.has_params {
-            e.is_const = true;
-            ast.set_cval(e, u.I128.of(ty.type_field_offset(t, @int_cast(usize, fi))));
-        }
-        return set_ty(e, ty.t_usize);
+        return check_offset_of(e);
     }
     if (id == ast.BI_MIN_VALUE) or (id == ast.BI_MAX_VALUE) {
         let t = targ(e, 0);
@@ -3964,34 +4096,7 @@ fn check_conversion_builtin(e: *mut ast.Expr) *mut ast.Type {
         return set_ty(e, t);
     }
     if id == ast.BI_AS {
-        let t = targ(e, 0);
-        ast.set_tval(e, t);
-        let s = check_expr(barg(e, 1), t);
-        if ty.is_untyped(s) {
-            coerce(earg(e, 1), t);
-            let a = barg(e, 1);
-            e.is_const = a.is_const;
-            ast.set_cval(e, ast.cval_of(a));
-            ast.set_fval(e, ast.fval_of(a));
-            return set_ty(e, t);
-        }
-        if (s.kind == ast.TY_BOOL) and (t.kind == ast.TY_INT) and (barg(e, 1).kind == ast.E_BOOL) {
-            e.is_const = true;
-            ast.set_cval(e, u.I128.zero());
-            if barg(e, 1).bval {
-                ast.set_cval(e, u.I128.ofu(1));
-            }
-        }
-        if (s.kind != ast.TY_INVALID) and (t.kind != ast.TY_INVALID) and not lossless(s, t) {
-            let d = dg.err(e.span, "E0510", u.f2("@as cannot convert %s to %s without possible loss of information",
-                                                 tstr(s), tstr(t)));
-            if (s.kind == ast.TY_INT) and (t.kind == ast.TY_INT) {
-                let txt = u.span_text(barg(e, 1).span);
-                let fx = dg.fix(d, "use a checked conversion", "suggestion");
-                dg.edit(fx, e.span, u.f2("@int_cast(%s, %s)", tstr(t), txt));
-            }
-        }
-        return set_ty(e, t);
+        return check_as(e);
     }
     if id == ast.BI_INT_FROM_ENUM {
         let s = check_expr(barg(e, 0), tnil());
@@ -4008,39 +4113,7 @@ fn check_conversion_builtin(e: *mut ast.Expr) *mut ast.Type {
         return set_ty(e, s.elem);
     }
     if id == ast.BI_ENUM_FROM_INT {
-        let t = targ(e, 0);
-        ast.set_tval(e, t);
-        if t.kind != ast.TY_ENUM {
-            if t.kind != ast.TY_INVALID {
-                _ = dg.err(e.span, "E0822", u.f1("@enum_from_int requires an enum target type, found %s", tstr(t)));
-            }
-            _ = check_expr(barg(e, 1), tnil());
-            return set_ty(e, ty.t_invalid);
-        }
-        let s = check_expr(barg(e, 1), t.elem);
-        if s.kind == ast.TY_UNTYPED_INT {
-            coerce(earg(e, 1), t.elem);
-        } else if ty.is_untyped(s) {
-            _ = finalize_untyped(earg(e, 1));
-        } else if (s.kind != ast.TY_INT) and (s.kind != ast.TY_INVALID) {
-            _ = dg.err(barg(e, 1).span, "E0822", u.f1("@enum_from_int requires an integer operand, found %s", tstr(s)));
-        }
-        let a = barg(e, 1);
-        if a.is_const and (a.ty.kind == ast.TY_INT) {
-            let mut found = false;
-            for i in 0..t.decl.variants.len {
-                if t.decl.variants.at(i).value.eq(ast.cval_of(a)) {
-                    found = true;
-                }
-            }
-            if found {
-                e.is_const = true;
-                ast.set_cval(e, ast.cval_of(a));
-            } else {
-                _ = dg.err(a.span, "E0826", u.f1("%s has no member with this value", tstr(t)));
-            }
-        }
-        return set_ty(e, t);
+        return check_enum_from_int(e);
     }
     if (id == ast.BI_INT_CAST) or (id == ast.BI_TRUNCATE) {
         let t = targ(e, 0);
@@ -4066,49 +4139,8 @@ fn check_conversion_builtin(e: *mut ast.Expr) *mut ast.Type {
         }
         return set_ty(e, t);
     }
-    if id == ast.BI_INT_FROM_FLOAT {
-        let t = targ(e, 0);
-        ast.set_tval(e, t);
-        if ty.is_vec_int(t) {
-            // lane-wise (spec §13.2)
-            let s = operand(earg(e, 1), tnil());
-            if (s.kind != ast.TY_INVALID) and not (ty.is_vec_float(s) and (s.lanes == t.lanes)) {
-                _ = dg.err(barg(e, 1).span, "E0822",
-                           u.f3("@int_from_float to %s requires a float vector of %s lanes, found %s", tstr(t),
-                                u.idec(t.lanes), tstr(s)));
-            }
-            return set_ty(e, t);
-        }
-        if not is_int_like(t) {
-            _ = dg.err(e.span, "E0822", "@int_from_float requires an integer target type");
-        }
-        let s = operand(earg(e, 1), ty.t_f64);
-        if not is_float_like(s) {
-            _ = dg.err(barg(e, 1).span, "E0822", "@int_from_float requires a float operand");
-        }
-        return set_ty(e, t);
-    }
-    if id == ast.BI_FLOAT_FROM_INT {
-        let t = targ(e, 0);
-        ast.set_tval(e, t);
-        if ty.is_vec_float(t) {
-            // lane-wise (spec §13.2)
-            let s = operand(earg(e, 1), tnil());
-            if (s.kind != ast.TY_INVALID) and not (ty.is_vec_int(s) and (s.lanes == t.lanes)) {
-                _ = dg.err(barg(e, 1).span, "E0822",
-                           u.f3("@float_from_int to %s requires an integer vector of %s lanes, found %s", tstr(t),
-                                u.idec(t.lanes), tstr(s)));
-            }
-            return set_ty(e, t);
-        }
-        if not is_float_like(t) {
-            _ = dg.err(e.span, "E0822", "@float_from_int requires a float target type");
-        }
-        let s = operand(earg(e, 1), ty.t_i64);
-        if not is_int_like(s) {
-            _ = dg.err(barg(e, 1).span, "E0822", "@float_from_int requires an integer operand");
-        }
-        return set_ty(e, t);
+    if (id == ast.BI_INT_FROM_FLOAT) or (id == ast.BI_FLOAT_FROM_INT) {
+        return check_int_float_conversion(e, id == ast.BI_INT_FROM_FLOAT);
     }
     if id == ast.BI_FLOAT_CAST {
         let t = targ(e, 0);
@@ -4144,6 +4176,12 @@ fn check_conversion_builtin(e: *mut ast.Expr) *mut ast.Type {
         }
         return set_ty(e, t);
     }
+    return tnil();
+}
+
+// @int_from_ptr ... @cast_slice: pointers and slices.
+fn check_pointer_builtin(e: *mut ast.Expr) *mut ast.Type {
+    let id = ast.builtin_of(e);
     if id == ast.BI_INT_FROM_PTR {
         let s = check_expr(barg(e, 0), tnil());
         if (s.kind != ast.TY_PTR) and (s.kind != ast.TY_INVALID) {
@@ -4372,33 +4410,148 @@ fn check_math_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     return tnil();
 }
 
-// @splat ... @narrow: SIMD vectors.
+// @splat(x): a vector of the type from context (x), each lane x.
+fn check_splat(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
+    if u.notnil(x) and is_fvec_param(x) {
+        // the lane type is not known: a float literal, converted to it
+        // when instantiated
+        let at = check_expr(barg(e, 0), tnil());
+        if (at.kind != ast.TY_UNTYPED_FLOAT) and (at.kind != ast.TY_UNTYPED_INT) and (at.kind != ast.TY_INVALID) {
+            _ = dg.err(barg(e, 0).span, "E0461",
+                       u.f1("@splat of a value to a FloatVector parameter '%s' needs a float literal", x.name));
+        } else {
+            _ = check_expr_to(earg(e, 0), ty.t_f64);
+        }
+        return set_ty(e, x);
+    }
+    if u.isnil(x) or ((x.kind != ast.TY_VEC) and (x.kind != ast.TY_INVALID)) {
+        _ = dg.err(e.span, "E0820", "@splat needs a vector type from context, e.g. let v: f32x4 = @splat(x);");
+        _ = check_expr(barg(e, 0), tnil());
+        return set_ty(e, ty.t_invalid);
+    }
+    if x.kind == ast.TY_INVALID {
+        _ = check_expr(barg(e, 0), tnil());
+        return set_ty(e, ty.t_invalid);
+    }
+    _ = check_expr_to(earg(e, 0), x.elem);
+    return set_ty(e, x);
+}
+
+// @shuffle(a, b, [i, ...]): lanes of a and b picked by constant indices; the
+// indices' count sets the result's lanes, a vector of 128, 256 or 512 bits.
+fn check_shuffle(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
+    let t = pair(e, x);
+    if not require_vec(e, barg(e, 0), t) or (t.kind == ast.TY_INVALID) {
+        _ = check_expr(barg(e, 2), tnil());
+        return set_ty(e, ty.t_invalid);
+    }
+    let idx = barg(e, 2);
+    // the indices' count sets the result's lanes: a vector of 128, 256 or 512 bits
+    let mut nb: i32 = 0;
+    if idx.kind == ast.E_ARRAY_LIT {
+        nb = @int_cast(i32, ast.args_of(idx).len) * t.elem.bits;
+    }
+    if (nb != 128) and (nb != 256) and (nb != 512) {
+        _ = dg.err(idx.span, "E0820", u.f3("@shuffle needs an array literal of %s, %s or %s constant lane indices",
+                                           u.idec(128 / t.elem.bits), u.idec(256 / t.elem.bits),
+                                           u.idec(512 / t.elem.bits)));
+        _ = check_expr(idx, tnil());
+        return set_ty(e, t);
+    }
+    for i in 0..ast.args_of(idx).len {
+        let pi = ast.args_of(idx).at(i);
+        _ = check_expr(pi.*, ty.t_u32);
+        if not pi.*.is_const or ast.cval_of(pi.*).is_neg() or ast.cval_of(pi.*).ge(u.I128.of(@as(i64, 2 * t.lanes))) {
+            _ = dg.err(pi.*.span, "E0820", u.f1("shuffle index must be a constant in 0..%s",
+                                                u.idec((2 * t.lanes) - 1)));
+        }
+        if ty.is_untyped(pi.*.ty) {
+            coerce(pi, ty.t_u32);
+        }
+    }
+    idx.ty = ty.type_array(ty.t_u32, @int_cast(i64, ast.args_of(idx).len));
+    if ast.args_of(idx).len == @int_cast(usize, t.lanes) {
+        return set_ty(e, t);
+    }
+    return set_ty(e, ty.type_vec(t.elem, @int_cast(i32, ast.args_of(idx).len)));
+}
+
+// @dot(a, b): of float vectors, a float; of i16 lanes, i32 lanes of the sums of
+// pairs of products; of i8 lanes, or u8 lanes by i8 lanes, i32 lanes of the sums
+// of four (the u8 by i8 form is x86's VNNI vpdpbusd).
+fn check_dot(e: *mut ast.Expr) *mut ast.Type {
+    let a0 = check_expr(barg(e, 0), tnil());
+    if (a0.kind == ast.TY_VEC) and (a0.elem == ty.t_u8) {
+        let want = ty.type_vec(ty.t_i8, a0.lanes);
+        let mut b0 = check_expr(barg(e, 1), want);
+        if ty.is_untyped(b0) {
+            coerce(earg(e, 1), want);
+            b0 = want;
+        }
+        if b0.kind == ast.TY_INVALID {
+            return set_ty(e, ty.t_invalid);
+        }
+        if (b0.kind != ast.TY_VEC) or (b0.elem != ty.t_i8) or (b0.lanes != a0.lanes) or ((a0.lanes % 4) != 0) {
+            _ = dg.err(e.span, "E0812",
+                       u.f2("@dot of u8 lanes requires i8 lanes as many (a multiple of 4), found %s and %s", tstr(a0),
+                            tstr(b0)));
+            return set_ty(e, ty.t_invalid);
+        }
+        return set_ty(e, ty.type_vec(ty.t_i32, a0.lanes / 4));
+    }
+    let t = pair_checked(e, a0, tnil());
+    if t.kind == ast.TY_INVALID {
+        return set_ty(e, ty.t_invalid);
+    }
+    if ty.is_vec_float(t) {
+        return set_ty(e, t.elem);
+    }
+    if (t.kind == ast.TY_VEC) and (t.elem == ty.t_i16) {
+        return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 2));
+    }
+    if (t.kind == ast.TY_VEC) and (t.elem == ty.t_i8) and ((t.lanes % 4) == 0) {
+        return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 4));
+    }
+    _ = dg.err(e.span, "E0812",
+               u.f1("@dot requires float vectors, i16 lanes, i8 lanes or u8 by i8 lanes (a multiple of 4), found %s",
+                    tstr(t)));
+    return set_ty(e, ty.t_invalid);
+}
+
+// @narrow(T, a, b): the lanes of a then b, each saturated to the narrower lane type.
+fn check_narrow(e: *mut ast.Expr) *mut ast.Type {
+    let t = targ(e, 0);
+    ast.set_tval(e, t);
+    let s = operand(earg(e, 1), tnil());
+    let s2 = operand(earg(e, 2), tnil());
+    if (s != s2) and (s.kind != ast.TY_INVALID) and (s2.kind != ast.TY_INVALID) {
+        let d = dg.err(e.span, "E0412", u.f2("@narrow operands have different types: %s and %s", tstr(s), tstr(s2)));
+        dg.set_types(d, tstr(s), tstr(s2));
+        return set_ty(e, t);
+    }
+    if (s.kind == ast.TY_INVALID) or (s2.kind == ast.TY_INVALID) or (t.kind == ast.TY_INVALID) {
+        return set_ty(e, t);
+    }
+    if not ty.is_vec_int(s) or (s.elem.bits < 16) {
+        _ = dg.err(barg(e, 1).span, "E0812",
+                   u.f1("@narrow requires integer vectors with 16-, 32- or 64-bit lanes, found %s", tstr(s)));
+        return set_ty(e, t);
+    }
+    if not ty.is_vec_int(t) or ((t.elem.bits * 2) != s.elem.bits) or (t.lanes != (s.lanes * 2)) {
+        let hb = u.idec(s.elem.bits / 2);
+        let n2 = u.idec(s.lanes * 2);
+        _ = dg.err(e.span, "E0812", u.f6("@narrow of %s gives i%sx%s or u%sx%s, not %s", tstr(s), hb, n2, hb, n2,
+                                         tstr(t)));
+    }
+    return set_ty(e, t);
+}
+
+// @splat ... @swizzle2, @load_partial, @store_partial: SIMD vectors made, read and
+// written.
 fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
     let id = ast.builtin_of(e);
     if id == ast.BI_SPLAT {
-        if u.notnil(x) and is_fvec_param(x) {
-            // the lane type is not known: a float literal, converted to it
-            // when instantiated
-            let at = check_expr(barg(e, 0), tnil());
-            if (at.kind != ast.TY_UNTYPED_FLOAT) and (at.kind != ast.TY_UNTYPED_INT) and (at.kind != ast.TY_INVALID) {
-                _ = dg.err(barg(e, 0).span, "E0461",
-                           u.f1("@splat of a value to a FloatVector parameter '%s' needs a float literal", x.name));
-            } else {
-                _ = check_expr_to(earg(e, 0), ty.t_f64);
-            }
-            return set_ty(e, x);
-        }
-        if u.isnil(x) or ((x.kind != ast.TY_VEC) and (x.kind != ast.TY_INVALID)) {
-            _ = dg.err(e.span, "E0820", "@splat needs a vector type from context, e.g. let v: f32x4 = @splat(x);");
-            _ = check_expr(barg(e, 0), tnil());
-            return set_ty(e, ty.t_invalid);
-        }
-        if x.kind == ast.TY_INVALID {
-            _ = check_expr(barg(e, 0), tnil());
-            return set_ty(e, ty.t_invalid);
-        }
-        _ = check_expr_to(earg(e, 0), x.elem);
-        return set_ty(e, x);
+        return check_splat(e, x);
     }
     if id == ast.BI_VEC {
         let v = targ(e, 0);
@@ -4463,41 +4616,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
         return set_ty(e, ty.t_void);
     }
     if id == ast.BI_SHUFFLE {
-        let t = pair(e, x);
-        if not require_vec(e, barg(e, 0), t) or (t.kind == ast.TY_INVALID) {
-            _ = check_expr(barg(e, 2), tnil());
-            return set_ty(e, ty.t_invalid);
-        }
-        let idx = barg(e, 2);
-        // the indices' count sets the result's lanes: a vector of 128, 256 or 512 bits
-        let mut nb: i32 = 0;
-        if idx.kind == ast.E_ARRAY_LIT {
-            nb = @int_cast(i32, ast.args_of(idx).len) * t.elem.bits;
-        }
-        if (nb != 128) and (nb != 256) and (nb != 512) {
-            _ = dg.err(idx.span, "E0820", u.f3("@shuffle needs an array literal of %s, %s or %s constant lane indices",
-                                               u.idec(128 / t.elem.bits), u.idec(256 / t.elem.bits),
-                                               u.idec(512 / t.elem.bits)));
-            _ = check_expr(idx, tnil());
-            return set_ty(e, t);
-        }
-        for i in 0..ast.args_of(idx).len {
-            let pi = ast.args_of(idx).at(i);
-            _ = check_expr(pi.*, ty.t_u32);
-            if not pi.*.is_const or ast.cval_of(pi.*).is_neg() or
-               ast.cval_of(pi.*).ge(u.I128.of(@as(i64, 2 * t.lanes))) {
-                _ = dg.err(pi.*.span, "E0820", u.f1("shuffle index must be a constant in 0..%s",
-                                                    u.idec((2 * t.lanes) - 1)));
-            }
-            if ty.is_untyped(pi.*.ty) {
-                coerce(pi, ty.t_u32);
-            }
-        }
-        idx.ty = ty.type_array(ty.t_u32, @int_cast(i64, ast.args_of(idx).len));
-        if ast.args_of(idx).len == @int_cast(usize, t.lanes) {
-            return set_ty(e, t);
-        }
-        return set_ty(e, ty.type_vec(t.elem, @int_cast(i32, ast.args_of(idx).len)));
+        return check_shuffle(e, x);
     }
     if (id == ast.BI_SWIZZLE) or (id == ast.BI_SWIZZLE2) {
         // a table of any lanes, indices of the same width taken as unsigned (spec §13.2)
@@ -4549,6 +4668,104 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
         }
         return set_ty(e, ty.t_void);
     }
+    return tnil();
+}
+
+// @expect_eq(a, b): operands of one type that == compares. []mut u8 and []u8
+// compare equal-typed (mutability weakening).
+fn check_expect_eq(e: *mut ast.Expr) *mut ast.Type {
+    for k in @as(usize, 0)..2 {
+        let at = check_expr(barg(e, k), tnil());
+        if (at.kind == ast.TY_SLICE) and at.is_mut {
+            coerce(earg(e, k), ty.type_slice(at.elem, false));
+        }
+    }
+    let ta = barg(e, 0).ty;
+    let tb = barg(e, 1).ty;
+    let mut t = tnil();
+    if ty.is_untyped(ta) and not ty.is_untyped(tb) {
+        coerce(earg(e, 0), tb);
+        t = tb;
+    } else if ty.is_untyped(tb) and not ty.is_untyped(ta) {
+        coerce(earg(e, 1), ta);
+        t = ta;
+    } else if ty.is_untyped(ta) {
+        _ = finalize_untyped(earg(e, 0));
+        t = ty.t_invalid;
+    } else {
+        t = ta;
+        // (errors of different sets compare by their codes, as with ==)
+        if (ta != tb) and (ta.kind != ast.TY_INVALID) and (tb.kind != ast.TY_INVALID) and
+           not ((ta.kind == ast.TY_ERROR) and (tb.kind == ast.TY_ERROR)) {
+            let d = dg.err(e.span, "E0412", u.f2("@expect_eq operands have different types: %s and %s", tstr(ta),
+                                                 tstr(tb)));
+            dg.set_types(d, tstr(ta), tstr(tb));
+            t = ty.t_invalid;
+        }
+    }
+    let tk = t.kind;
+    let ok = (tk == ast.TY_INT) or (tk == ast.TY_FLOAT) or (tk == ast.TY_BOOL) or (tk == ast.TY_ERROR) or
+             (tk == ast.TY_PTR) or (tk == ast.TY_FN) or (tk == ast.TY_ENUM) or (tk == ast.TY_INVALID) or
+             ((tk == ast.TY_SLICE) and (t.elem == ty.t_u8)) or ((tk == ast.TY_PARAM) and ty.satisfies(t, ast.C_EQ));
+    if not ok {
+        _ = dg.err(e.span, "E0825",
+                   u.f1("@expect_eq compares numbers, bool, error, pointers and []u8; found %s (use @expect(...))",
+                        tstr(t)));
+    }
+    return set_ty(e, ty.t_void);
+}
+
+// @atomic_load ... @atomic_notify. The first argument is a pointer to an integer
+// (spec §12.8); everything but load, wait and notify needs *mut.
+fn check_atomic_builtin(e: *mut ast.Expr, id: i32) *mut ast.Type {
+    let need_mut = (id != ast.BI_ATOMIC_LOAD) and (id != ast.BI_ATOMIC_WAIT) and (id != ast.BI_ATOMIC_NOTIFY);
+    let p = check_expr(barg(e, 0), tnil());
+    let mut t = ty.t_invalid;
+    if (p.kind == ast.TY_PTR) and
+       ((p.elem.kind == ast.TY_INT) or ((p.elem.kind == ast.TY_PARAM) and ty.satisfies(p.elem, ast.C_INT))) {
+        t = p.elem;
+        if need_mut and not p.is_mut {
+            _ = dg.err(barg(e, 0).span, "E0706", u.f2("@%s needs a *mut pointer, found %s", e.name, tstr(p)));
+        }
+    } else if p.kind != ast.TY_INVALID {
+        _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s needs a pointer to an integer, found %s", e.name, tstr(p)));
+    }
+    let wn = (id == ast.BI_ATOMIC_WAIT) or (id == ast.BI_ATOMIC_NOTIFY);
+    if wn and (t.kind == ast.TY_INT) and (t.bits != 32) {
+        _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s works on 32-bit integers (*i32 or *u32), found %s", e.name,
+                                                  tstr(p)));
+    }
+    if wn and (t.kind == ast.TY_PARAM) {
+        _ = dg.err(barg(e, 0).span, "E0823", u.f1("@%s works on 32-bit integers (*i32 or *u32)", e.name));
+    }
+    if id == ast.BI_ATOMIC_LOAD {
+        return set_ty(e, t);
+    }
+    if id == ast.BI_ATOMIC_STORE {
+        _ = check_expr_to(earg(e, 1), t);
+        return set_ty(e, ty.t_void);
+    }
+    if id == ast.BI_ATOMIC_CAS {
+        _ = check_expr_to(earg(e, 1), t);
+        _ = check_expr_to(earg(e, 2), t);
+        return set_ty(e, t);
+    }
+    if id == ast.BI_ATOMIC_WAIT {
+        _ = check_expr_to(earg(e, 1), t);
+        _ = check_expr_to(earg(e, 2), ty.t_i64);
+        return set_ty(e, ty.t_u32);
+    }
+    if id == ast.BI_ATOMIC_NOTIFY {
+        _ = check_expr_to(earg(e, 1), ty.t_u32);
+        return set_ty(e, ty.t_u32);
+    }
+    _ = check_expr_to(earg(e, 1), t);
+    return set_ty(e, t);  // read-modify-write: the old value
+}
+
+// @lanes_eq ... @dot, @widen_low ... @narrow: operations on SIMD vectors.
+fn check_vector_op_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
+    let id = ast.builtin_of(e);
     if (id >= ast.BI_LANES_EQ) and (id <= ast.BI_LANES_GE) {
         let t = pair(e, tnil());
         if not require_vec(e, barg(e, 0), t) {
@@ -4596,44 +4813,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
         return set_ty(e, t.elem);
     }
     if id == ast.BI_DOT {
-        // u8 lanes by i8 lanes: each i32 lane the sum of four products, the first operand's
-        // bytes unsigned (x86's VNNI vpdpbusd)
-        let a0 = check_expr(barg(e, 0), tnil());
-        if (a0.kind == ast.TY_VEC) and (a0.elem == ty.t_u8) {
-            let want = ty.type_vec(ty.t_i8, a0.lanes);
-            let mut b0 = check_expr(barg(e, 1), want);
-            if ty.is_untyped(b0) {
-                coerce(earg(e, 1), want);
-                b0 = want;
-            }
-            if b0.kind == ast.TY_INVALID {
-                return set_ty(e, ty.t_invalid);
-            }
-            if (b0.kind != ast.TY_VEC) or (b0.elem != ty.t_i8) or (b0.lanes != a0.lanes) or ((a0.lanes % 4) != 0) {
-                _ = dg.err(e.span, "E0812",
-                           u.f2("@dot of u8 lanes requires i8 lanes as many (a multiple of 4), found %s and %s",
-                                tstr(a0), tstr(b0)));
-                return set_ty(e, ty.t_invalid);
-            }
-            return set_ty(e, ty.type_vec(ty.t_i32, a0.lanes / 4));
-        }
-        let t = pair_checked(e, a0);
-        if t.kind == ast.TY_INVALID {
-            return set_ty(e, ty.t_invalid);
-        }
-        if ty.is_vec_float(t) {
-            return set_ty(e, t.elem);
-        }
-        if (t.kind == ast.TY_VEC) and (t.elem == ty.t_i16) {
-            return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 2));
-        }
-        if (t.kind == ast.TY_VEC) and (t.elem == ty.t_i8) and ((t.lanes % 4) == 0) {
-            return set_ty(e, ty.type_vec(ty.t_i32, t.lanes / 4));
-        }
-        _ = dg.err(e.span, "E0812",
-                   u.f1("@dot requires float vectors, i16 lanes, i8 lanes or u8 by i8 lanes (a multiple of 4), found %s",
-                        tstr(t)));
-        return set_ty(e, ty.t_invalid);
+        return check_dot(e);
     }
     if (id == ast.BI_WIDEN_LOW) or (id == ast.BI_WIDEN_HIGH) {
         // half the lanes, each twice as wide, extended by the lane type's sign
@@ -4649,32 +4829,7 @@ fn check_vector_builtin(e: *mut ast.Expr, x: *mut ast.Type) *mut ast.Type {
         return set_ty(e, ty.type_vec(ty.type_int(t.elem.bits * 2, t.elem.is_signed, false), t.lanes / 2));
     }
     if id == ast.BI_NARROW {
-        // the lanes of a then b, each saturated to the narrower lane type
-        let t = targ(e, 0);
-        ast.set_tval(e, t);
-        let s = operand(earg(e, 1), tnil());
-        let s2 = operand(earg(e, 2), tnil());
-        if (s != s2) and (s.kind != ast.TY_INVALID) and (s2.kind != ast.TY_INVALID) {
-            let d = dg.err(e.span, "E0412", u.f2("@narrow operands have different types: %s and %s", tstr(s),
-                                                 tstr(s2)));
-            dg.set_types(d, tstr(s), tstr(s2));
-            return set_ty(e, t);
-        }
-        if (s.kind == ast.TY_INVALID) or (s2.kind == ast.TY_INVALID) or (t.kind == ast.TY_INVALID) {
-            return set_ty(e, t);
-        }
-        if not ty.is_vec_int(s) or (s.elem.bits < 16) {
-            _ = dg.err(barg(e, 1).span, "E0812",
-                       u.f1("@narrow requires integer vectors with 16-, 32- or 64-bit lanes, found %s", tstr(s)));
-            return set_ty(e, t);
-        }
-        if not ty.is_vec_int(t) or ((t.elem.bits * 2) != s.elem.bits) or (t.lanes != (s.lanes * 2)) {
-            let hb = u.idec(s.elem.bits / 2);
-            let n2 = u.idec(s.lanes * 2);
-            _ = dg.err(e.span, "E0812", u.f6("@narrow of %s gives i%sx%s or u%sx%s, not %s", tstr(s), hb, n2, hb, n2,
-                                             tstr(t)));
-        }
-        return set_ty(e, t);
+        return check_narrow(e);
     }
     return tnil();
 }
@@ -4735,96 +4890,13 @@ fn check_system_builtin(e: *mut ast.Expr) *mut ast.Type {
         return set_ty(e, ty.t_void);
     }
     if id == ast.BI_EXPECT_EQ {
-        // []mut u8 and []u8 compare equal-typed (mutability weakening).
-        for k in @as(usize, 0)..2 {
-            let at = check_expr(barg(e, k), tnil());
-            if (at.kind == ast.TY_SLICE) and at.is_mut {
-                coerce(earg(e, k), ty.type_slice(at.elem, false));
-            }
-        }
-        let ta = barg(e, 0).ty;
-        let tb = barg(e, 1).ty;
-        let mut t = tnil();
-        if ty.is_untyped(ta) and not ty.is_untyped(tb) {
-            coerce(earg(e, 0), tb);
-            t = tb;
-        } else if ty.is_untyped(tb) and not ty.is_untyped(ta) {
-            coerce(earg(e, 1), ta);
-            t = ta;
-        } else if ty.is_untyped(ta) {
-            _ = finalize_untyped(earg(e, 0));
-            t = ty.t_invalid;
-        } else {
-            t = ta;
-            // (errors of different sets compare by their codes, as with ==)
-            if (ta != tb) and (ta.kind != ast.TY_INVALID) and (tb.kind != ast.TY_INVALID) and
-               not ((ta.kind == ast.TY_ERROR) and (tb.kind == ast.TY_ERROR)) {
-                let d = dg.err(e.span, "E0412", u.f2("@expect_eq operands have different types: %s and %s", tstr(ta),
-                                                     tstr(tb)));
-                dg.set_types(d, tstr(ta), tstr(tb));
-                t = ty.t_invalid;
-            }
-        }
-        let tk = t.kind;
-        let ok = (tk == ast.TY_INT) or (tk == ast.TY_FLOAT) or (tk == ast.TY_BOOL) or (tk == ast.TY_ERROR) or
-                 (tk == ast.TY_PTR) or (tk == ast.TY_FN) or (tk == ast.TY_ENUM) or (tk == ast.TY_INVALID) or
-                 ((tk == ast.TY_SLICE) and (t.elem == ty.t_u8)) or ((tk == ast.TY_PARAM) and ty.satisfies(t, ast.C_EQ));
-        if not ok {
-            _ = dg.err(e.span, "E0825",
-                       u.f1("@expect_eq compares numbers, bool, error, pointers and []u8; found %s (use @expect(...))",
-                            tstr(t)));
-        }
-        return set_ty(e, ty.t_void);
+        return check_expect_eq(e);
     }
     if id == ast.BI_FENCE {
         return set_ty(e, ty.t_void);
     }
     if (id >= ast.BI_ATOMIC_LOAD) and (id <= ast.BI_ATOMIC_NOTIFY) {
-        // First argument: pointer to an integer (spec §12.8). Everything but
-        // load, wait and notify needs *mut.
-        let need_mut = (id != ast.BI_ATOMIC_LOAD) and (id != ast.BI_ATOMIC_WAIT) and (id != ast.BI_ATOMIC_NOTIFY);
-        let p = check_expr(barg(e, 0), tnil());
-        let mut t = ty.t_invalid;
-        if (p.kind == ast.TY_PTR) and
-           ((p.elem.kind == ast.TY_INT) or ((p.elem.kind == ast.TY_PARAM) and ty.satisfies(p.elem, ast.C_INT))) {
-            t = p.elem;
-            if need_mut and not p.is_mut {
-                _ = dg.err(barg(e, 0).span, "E0706", u.f2("@%s needs a *mut pointer, found %s", e.name, tstr(p)));
-            }
-        } else if p.kind != ast.TY_INVALID {
-            _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s needs a pointer to an integer, found %s", e.name, tstr(p)));
-        }
-        let wn = (id == ast.BI_ATOMIC_WAIT) or (id == ast.BI_ATOMIC_NOTIFY);
-        if wn and (t.kind == ast.TY_INT) and (t.bits != 32) {
-            _ = dg.err(barg(e, 0).span, "E0823", u.f2("@%s works on 32-bit integers (*i32 or *u32), found %s", e.name,
-                                                      tstr(p)));
-        }
-        if wn and (t.kind == ast.TY_PARAM) {
-            _ = dg.err(barg(e, 0).span, "E0823", u.f1("@%s works on 32-bit integers (*i32 or *u32)", e.name));
-        }
-        if id == ast.BI_ATOMIC_LOAD {
-            return set_ty(e, t);
-        }
-        if id == ast.BI_ATOMIC_STORE {
-            _ = check_expr_to(earg(e, 1), t);
-            return set_ty(e, ty.t_void);
-        }
-        if id == ast.BI_ATOMIC_CAS {
-            _ = check_expr_to(earg(e, 1), t);
-            _ = check_expr_to(earg(e, 2), t);
-            return set_ty(e, t);
-        }
-        if id == ast.BI_ATOMIC_WAIT {
-            _ = check_expr_to(earg(e, 1), t);
-            _ = check_expr_to(earg(e, 2), ty.t_i64);
-            return set_ty(e, ty.t_u32);
-        }
-        if id == ast.BI_ATOMIC_NOTIFY {
-            _ = check_expr_to(earg(e, 1), ty.t_u32);
-            return set_ty(e, ty.t_u32);
-        }
-        _ = check_expr_to(earg(e, 1), t);
-        return set_ty(e, t);  // read-modify-write: the old value
+        return check_atomic_builtin(e, id);
     }
     if id == ast.BI_ERROR_NAME {
         _ = check_expr_to(earg(e, 0), ty.t_error);
@@ -5045,196 +5117,214 @@ fn check_assign(s: *mut ast.Stmt) void {
     _ = check_expr(probe, tnil());
 }
 
+// The arms of a match on a union or enum (t): its variants or members, each at
+// most once, all of them unless there is an else. Whether every arm diverges.
+fn check_variant_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
+    let mut all_div = true;
+    let mut has_else = false;
+    let narms = ast.stmt_more(s).arms.len;
+    let ud = t.decl;
+    let is_enum = t.kind == ast.TY_ENUM;
+    let what = u.pick(is_enum, "member", "variant");
+    let seen = u.newn.[bool](ud.variants.len);
+    for i in 0..narms {
+        let a = ast.stmt_more(s).arms.at(i);
+        if has_else and not a.alt {
+            _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
+        }
+        scope_push();
+        match a.pat {
+            .Else => { has_else = true; }
+            .Variant(p) => {
+                let v = find_variant(ud, p.name);
+                if v < 0 {
+                    _ = dg.err(a.span, "E0632", u.f3("%s has no %s '%s'", tstr(t), what, p.name));
+                } else {
+                    let vi = @int_cast(usize, v);
+                    a.variant = v;
+                    a.value = ud.variants.at(vi).value;
+                    if seen[vi] {
+                        _ = dg.err(a.span, "E0631", u.f2("%s '%s' is matched more than once", what, p.name));
+                    }
+                    seen[vi] = true;
+                    let mut pt = tnil();
+                    if not is_enum {
+                        pt = ty.type_variant(t, vi);
+                    }
+                    if not u.isnos(p.bind) {
+                        if u.isnil(pt) {
+                            _ = dg.err(p.bind_span, "E0633",
+                                       u.f2("%s '%s' has no payload to bind", u.pick(is_enum, "enum member", "variant"),
+                                            p.name));
+                        } else if a.alt or (((i + 1) < narms) and ast.stmt_more(s).arms.at(i + 1).alt) {
+                            _ = dg.err(p.bind_span, "E0635", "a match arm with several patterns cannot bind a payload");
+                        } else {
+                            a.bind_local = declare_local(p.bind, p.bind_span, pt, false, false);
+                        }
+                    }
+                }
+            }
+            else => {
+                _ = dg.err(a.span, "E0634",
+                           u.f2("this pattern cannot match a value of %s type %s", u.pick(is_enum, "enum", "union"),
+                                tstr(t)));
+            }
+        }
+        if not a.alt and not check_block(a.body) {
+            all_div = false;
+        }
+        scope_pop();
+    }
+    if not has_else {
+        let mut missing = u.Buf.init();
+        let mut nm: i32 = 0;
+        for v in 0..ud.variants.len {
+            if seen[v] {
+                continue;
+            }
+            if nm != 0 {
+                missing.s(", ");
+            }
+            nm += 1;
+            missing.c('.');
+            missing.s(ud.variants.at(v).name);
+        }
+        let ms = missing.done();
+        if nm != 0 {
+            _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
+        }
+    }
+    return all_div;
+}
+
+// The arms of a match on an integer, bool or error (t): values of its type, each
+// at most once, every one (bool, a named error set) or an else. Whether every
+// arm diverges.
+fn check_value_match(s: *mut ast.Stmt, t: *mut ast.Type) bool {
+    let mut all_div = true;
+    let mut has_else = false;
+    let narms = ast.stmt_more(s).arms.len;
+    let mut seen_names = u.List.[[]u8].empty();
+    let mut seenv = u.List.[u.I128].empty();
+    let mut seen_true = false;
+    let mut seen_false = false;
+    for i in 0..narms {
+        let a = ast.stmt_more(s).arms.at(i);
+        if has_else and not a.alt {
+            _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
+        }
+        scope_push();
+        let mut key = u.I128.zero();
+        let mut keyed = false;
+        let mut fits = false;  // the pattern is of the scrutinee's kind
+        match a.pat {
+            .Else => {
+                has_else = true;
+                fits = true;
+            }
+            .Int(n) => {
+                if t.kind == ast.TY_INT {
+                    if not fits_type(n, t) {
+                        _ = dg.err(a.span, "E0503", u.f1("pattern does not fit in %s", tstr(t)));
+                    }
+                    key = n;
+                    keyed = true;
+                    fits = true;
+                }
+            }
+            .Bool(bv) => {
+                if t.kind == ast.TY_BOOL {
+                    let dupe = (bv and seen_true) or (not bv and seen_false);
+                    if dupe {
+                        _ = dg.err(a.span, "E0631", "pattern is matched more than once");
+                    }
+                    if bv {
+                        seen_true = true;
+                    } else {
+                        seen_false = true;
+                    }
+                    fits = true;
+                }
+            }
+            .Error(name) => {
+                if t.kind == ast.TY_ERROR {
+                    let code = error_code_of(name);
+                    if code == 0 {
+                        _ = dg.err(a.span, "E0650", u.f1("'error.%s' is not declared", name));
+                    } else if not set_has(t.decl, name) {
+                        _ = dg.err(a.span, "E0652", u.f2("'error.%s' is not in error set %s", name, t.decl.name));
+                    }
+                    seen_names.push(name);
+                    a.error_code = code;
+                    key = u.I128.ofu(@as(u64, code));
+                    keyed = true;
+                    fits = true;
+                }
+            }
+            .Variant => {}
+        }
+        if not fits {
+            _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of type %s", tstr(t)));
+        }
+        if keyed {
+            for k in 0..seenv.len {
+                if seenv.get(k).eq(key) {
+                    _ = dg.err(a.span, "E0631", "pattern is matched more than once");
+                }
+            }
+            seenv.push(key);
+        }
+        if not a.alt and not check_block(a.body) {
+            all_div = false;
+        }
+        scope_pop();
+    }
+    seenv.deinit();
+    let exhaustive = has_else or ((t.kind == ast.TY_BOOL) and seen_true and seen_false);
+    if not exhaustive and (t.kind == ast.TY_ERROR) and u.notnil(t.decl) {
+        // a named error set: every error it holds, or else
+        let mut missing = u.Buf.init();
+        let mut nm: i32 = 0;
+        for v in 0..t.decl.set_names.len {
+            let n = t.decl.set_names.get(v);
+            let mut hit = false;
+            for k in 0..seen_names.len {
+                if u.same(seen_names.get(k), n) {
+                    hit = true;
+                }
+            }
+            if hit {
+                continue;
+            }
+            if nm != 0 {
+                missing.s(", ");
+            }
+            nm += 1;
+            missing.s("error.");
+            missing.s(n);
+        }
+        let ms = missing.done();
+        if nm != 0 {
+            _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
+        }
+    } else if not exhaustive {
+        _ = dg.err(s.span, "E0630", "non-exhaustive match: add an 'else' arm");
+    }
+    seen_names.deinit();
+    return all_div;
+}
+
 fn check_match(s: *mut ast.Stmt) bool {
     let mut t = check_expr(s.e, tnil());
     if ty.is_untyped(t) {
         t = finalize_untyped(&mut s.e);
     }
-    let mut all_div = true;
-    let mut has_else = false;
     let narms = ast.stmt_more(s).arms.len;
+    let mut all_div = false;
     if (t.kind == ast.TY_UNION) or (t.kind == ast.TY_ENUM) {
-        let ud = t.decl;
-        let is_enum = t.kind == ast.TY_ENUM;
-        let what = u.pick(is_enum, "member", "variant");
-        let seen = u.newn.[bool](ud.variants.len);
-        for i in 0..narms {
-            let a = ast.stmt_more(s).arms.at(i);
-            if has_else and not a.alt {
-                _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
-            }
-            scope_push();
-            match a.pat {
-                .Else => { has_else = true; }
-                .Variant(p) => {
-                    let v = find_variant(ud, p.name);
-                    if v < 0 {
-                        _ = dg.err(a.span, "E0632", u.f3("%s has no %s '%s'", tstr(t), what, p.name));
-                    } else {
-                        let vi = @int_cast(usize, v);
-                        a.variant = v;
-                        a.value = ud.variants.at(vi).value;
-                        if seen[vi] {
-                            _ = dg.err(a.span, "E0631", u.f2("%s '%s' is matched more than once", what, p.name));
-                        }
-                        seen[vi] = true;
-                        let mut pt = tnil();
-                        if not is_enum {
-                            pt = ty.type_variant(t, vi);
-                        }
-                        if not u.isnos(p.bind) {
-                            if u.isnil(pt) {
-                                _ = dg.err(p.bind_span, "E0633",
-                                           u.f2(
-                                               "%s '%s' has no payload to bind",
-                                               u.pick(is_enum, "enum member", "variant"), p.name));
-                            } else if a.alt or (((i + 1) < narms) and ast.stmt_more(s).arms.at(i + 1).alt) {
-                                _ = dg.err(p.bind_span, "E0635",
-                                           "a match arm with several patterns cannot bind a payload");
-                            } else {
-                                a.bind_local = declare_local(p.bind, p.bind_span, pt, false, false);
-                            }
-                        }
-                    }
-                }
-                else => {
-                    _ = dg.err(a.span, "E0634",
-                               u.f2("this pattern cannot match a value of %s type %s", u.pick(is_enum, "enum", "union"),
-                                    tstr(t)));
-                }
-            }
-            if not a.alt and not check_block(a.body) {
-                all_div = false;
-            }
-            scope_pop();
-        }
-        if not has_else {
-            let mut missing = u.Buf.init();
-            let mut nm: i32 = 0;
-            for v in 0..ud.variants.len {
-                if seen[v] {
-                    continue;
-                }
-                if nm != 0 {
-                    missing.s(", ");
-                }
-                nm += 1;
-                missing.c('.');
-                missing.s(ud.variants.at(v).name);
-            }
-            let ms = missing.done();
-            if nm != 0 {
-                _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
-            }
-        }
+        all_div = check_variant_match(s, t);
     } else if (t.kind == ast.TY_INT) or (t.kind == ast.TY_BOOL) or (t.kind == ast.TY_ERROR) {
-        let mut seen_names = u.List.[[]u8].empty();
-        let mut seenv = u.List.[u.I128].empty();
-        let mut seen_true = false;
-        let mut seen_false = false;
-        for i in 0..narms {
-            let a = ast.stmt_more(s).arms.at(i);
-            if has_else and not a.alt {
-                _ = dg.warning(a.span, "W0631", "unreachable match arm after 'else'");
-            }
-            scope_push();
-            let mut key = u.I128.zero();
-            let mut keyed = false;
-            let mut fits = false;  // the pattern is of the scrutinee's kind
-            match a.pat {
-                .Else => {
-                    has_else = true;
-                    fits = true;
-                }
-                .Int(n) => {
-                    if t.kind == ast.TY_INT {
-                        if not fits_type(n, t) {
-                            _ = dg.err(a.span, "E0503", u.f1("pattern does not fit in %s", tstr(t)));
-                        }
-                        key = n;
-                        keyed = true;
-                        fits = true;
-                    }
-                }
-                .Bool(bv) => {
-                    if t.kind == ast.TY_BOOL {
-                        let dupe = (bv and seen_true) or (not bv and seen_false);
-                        if dupe {
-                            _ = dg.err(a.span, "E0631", "pattern is matched more than once");
-                        }
-                        if bv {
-                            seen_true = true;
-                        } else {
-                            seen_false = true;
-                        }
-                        fits = true;
-                    }
-                }
-                .Error(name) => {
-                    if t.kind == ast.TY_ERROR {
-                        let code = error_code_of(name);
-                        if code == 0 {
-                            _ = dg.err(a.span, "E0650", u.f1("'error.%s' is not declared", name));
-                        } else if not set_has(t.decl, name) {
-                            _ = dg.err(a.span, "E0652", u.f2("'error.%s' is not in error set %s", name, t.decl.name));
-                        }
-                        seen_names.push(name);
-                        a.error_code = code;
-                        key = u.I128.ofu(@as(u64, code));
-                        keyed = true;
-                        fits = true;
-                    }
-                }
-                .Variant => {}
-            }
-            if not fits {
-                _ = dg.err(a.span, "E0634", u.f1("this pattern cannot match a value of type %s", tstr(t)));
-            }
-            if keyed {
-                for k in 0..seenv.len {
-                    if seenv.get(k).eq(key) {
-                        _ = dg.err(a.span, "E0631", "pattern is matched more than once");
-                    }
-                }
-                seenv.push(key);
-            }
-            if not a.alt and not check_block(a.body) {
-                all_div = false;
-            }
-            scope_pop();
-        }
-        seenv.deinit();
-        let exhaustive = has_else or ((t.kind == ast.TY_BOOL) and seen_true and seen_false);
-        if not exhaustive and (t.kind == ast.TY_ERROR) and u.notnil(t.decl) {
-            // a named error set: every error it holds, or else
-            let mut missing = u.Buf.init();
-            let mut nm: i32 = 0;
-            for v in 0..t.decl.set_names.len {
-                let n = t.decl.set_names.get(v);
-                let mut hit = false;
-                for k in 0..seen_names.len {
-                    if u.same(seen_names.get(k), n) {
-                        hit = true;
-                    }
-                }
-                if hit {
-                    continue;
-                }
-                if nm != 0 {
-                    missing.s(", ");
-                }
-                nm += 1;
-                missing.s("error.");
-                missing.s(n);
-            }
-            let ms = missing.done();
-            if nm != 0 {
-                _ = dg.err(s.span, "E0630", u.f1("non-exhaustive match: missing %s", ms));
-            }
-        } else if not exhaustive {
-            _ = dg.err(s.span, "E0630", "non-exhaustive match: add an 'else' arm");
-        }
-        seen_names.deinit();
+        all_div = check_value_match(s, t);
     } else {
         if t.kind != ast.TY_INVALID {
             _ = dg.err(s.e.span, "E0634",
@@ -5249,8 +5339,6 @@ fn check_match(s: *mut ast.Stmt) bool {
             _ = check_block(ast.stmt_more(s).arms.at(i).body);
             scope_pop();
         }
-        all_div = false;
-        has_else = true;
     }
     return (narms > 0) and all_div;
 }

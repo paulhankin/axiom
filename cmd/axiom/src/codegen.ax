@@ -1915,6 +1915,52 @@ fn get_callee(d: *mut ast.Decl, gargs: []mut *mut ast.Type) *mut FnInst {
     return get_inst(d, gargs);
 }
 
+// The symbol of an instance of the function d (not exported, not a host
+// function): its module's prefix, owner and name, generic arguments and,
+// compiled for its caller's extensions (own_feats), those extensions.
+fn inst_symbol(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64, own_feats: bool) []u8 {
+    let n = gargs.len;
+    let mut nb = u.Buf.init();
+    nb.s(mangle_prefix(d));
+    nb.s(".");
+    if u.notnil(d.owner) {
+        nb.s(d.owner.name);
+        nb.s(".");
+    }
+    nb.s(d.name);
+    let nown = d.gparams.len;
+    if nown != 0 {
+        nb.s(".[");
+        for i in n - nown..n {
+            if i > (n - nown) {
+                nb.s(", ");
+            }
+            nb.s(mangle_type(gargs[i]));
+        }
+        nb.s("]");
+    }
+    if u.notnil(d.owner) and (d.owner.gparams.len != 0) {
+        nb.s("@[");
+        for i in 0..d.owner.gparams.len {
+            if i != 0 {
+                nb.s(",");
+            }
+            nb.s(mangle_type(gargs[i]));
+        }
+        nb.s("]");
+    }
+    if own_feats {
+        let sfx = tg.features_string(feats & ~g_build_features);
+        nb.s(".");
+        if sfx.len == 0 {
+            nb.s("base");
+        } else {
+            nb.s(sfx);
+        }
+    }
+    return nb.done();
+}
+
 fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut FnInst {
     let n = gargs.len;
     let mut kb = u.Buf.init();
@@ -1974,45 +2020,7 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
         // Test binaries bring their own `main` (the test driver).
         name = export_symbol(d);
     } else {
-        let mut nb = u.Buf.init();
-        nb.s(mangle_prefix(d));
-        nb.s(".");
-        if u.notnil(d.owner) {
-            nb.s(d.owner.name);
-            nb.s(".");
-        }
-        nb.s(d.name);
-        let nown = d.gparams.len;
-        if nown != 0 {
-            nb.s(".[");
-            for i in n - nown..n {
-                if i > (n - nown) {
-                    nb.s(", ");
-                }
-                nb.s(mangle_type(gargs[i]));
-            }
-            nb.s("]");
-        }
-        if u.notnil(d.owner) and (d.owner.gparams.len != 0) {
-            nb.s("@[");
-            for i in 0..d.owner.gparams.len {
-                if i != 0 {
-                    nb.s(",");
-                }
-                nb.s(mangle_type(gargs[i]));
-            }
-            nb.s("]");
-        }
-        if own_feats {
-            let sfx = tg.features_string(feats & ~g_build_features);
-            nb.s(".");
-            if sfx.len == 0 {
-                nb.s("base");
-            } else {
-                nb.s(sfx);
-            }
-        }
-        name = nb.done();
+        name = inst_symbol(d, gargs, feats, own_feats);
     }
     if d.variadic {
         fi.llty = ir.t_fn(fi.llty.ret, fi.llty.params, true);
@@ -3127,6 +3135,14 @@ fn lane_mask(k: *mut ir.Value) *mut ir.Value {
     return b_sub(m, one);
 }
 
+// The integer v (signed or not) converted to the float type t.
+fn int_to_float(v: *mut ir.Value, signed: bool, t: *mut ir.Ty) *mut ir.Value {
+    if signed {
+        return ir.cast(B, ir.OP_SITOFP, v, t);
+    }
+    return ir.cast(B, ir.OP_UITOFP, v, t);
+}
+
 // A lane-wise builtin on a vector (spec §13.2) that the backends have for
 // scalars only: lane by lane. `src_signed`: the operand's lanes, for
 // @float_from_int.
@@ -3147,10 +3163,8 @@ fn lanewise(id: i32, rt: *mut ast.Type, v: *mut ir.Value, src_signed: bool) *mut
             let mut tys: [2]*mut ir.Ty = [lt, x.ty];
             let mut args: [1]*mut ir.Value = [x];
             y = intrinsic(u.pick(rt.is_signed, "llvm.fptosi.sat", "llvm.fptoui.sat"), tys[..], args[..]);
-        } else if src_signed {
-            y = ir.cast(B, ir.OP_SITOFP, x, lt);
         } else {
-            y = ir.cast(B, ir.OP_UITOFP, x, lt);
+            y = int_to_float(x, src_signed, lt);
         }
         r = ir.insert_elem(B, r, y, k);
     }
@@ -3203,9 +3217,110 @@ fn barg(e: *mut ast.Expr, i: usize) *mut ast.Expr {
     return ast.more(e).bargs.at(i).e;
 }
 
+// Code for a builtin call (spec §5.7), by family, as sema checks them.
 fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     let rt = ct(e.ty);
     let id = ast.builtin_of(e);
+    if (id <= ast.BI_CAST_SLICE) or (id == ast.BI_INT_FROM_ENUM) or (id == ast.BI_ENUM_FROM_INT) or
+       (id == ast.BI_PTR_ADD) or (id == ast.BI_PTR_SUB) {
+        return gen_conversion_builtin(e, id, rt);
+    }
+    if ((id >= ast.BI_MEM_COPY) and (id <= ast.BI_MEMORY_GROW)) or (id == ast.BI_MEMORY_DISCARD) or
+       (id == ast.BI_PREFETCH) or (id == ast.BI_PREFETCH_WRITE) {
+        return gen_memory_builtin(e, id, rt);
+    }
+    if (id >= ast.BI_CLZ) and (id <= ast.BI_COPYSIGN) {
+        return gen_math_builtin(e, id, rt);
+    }
+    if ((id >= ast.BI_SPLAT) and (id <= ast.BI_DOT)) or ((id >= ast.BI_LOAD_PARTIAL) and (id <= ast.BI_NARROW)) {
+        return gen_vector_builtin(e, id, rt);
+    }
+    return gen_system_builtin(e, id, rt);
+}
+
+fn builtin_missing(e: *mut ast.Expr) *mut ir.Value {
+    internal_error(u.f1("builtin @%s not implemented", e.name));
+    return vnil();
+}
+
+// @int_cast(T, x): x converted to T, trapping unless T holds its value.
+fn gen_int_cast(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
+    let s = ct(barg(e, 1).ty);
+    let v = gen(barg(e, 1));
+    if s == rt {
+        return v;
+    }
+    // Range check in the source type's width (no 128-bit arithmetic).
+    let stt = v.ty;
+    let sb = @int_cast(u32, s.bits);
+    let tb = @int_cast(u32, rt.bits);
+    let mut ok = ir.cint(T_i1, 1);
+    if s.is_signed {
+        if not rt.is_signed {
+            ok = icmp(ir.IntSGE, v, ir.czero(stt));
+        } else if tb < sb {
+            ok = icmp(ir.IntSGE, v, cint(stt, u.I128.pow2(tb - 1).neg()));
+        }
+    }
+    let mut tmax_bits = tb;  // T.max = 2^tmax_bits - 1
+    if rt.is_signed {
+        tmax_bits = tb - 1;
+    }
+    let mut smax_bits = sb;
+    if s.is_signed {
+        smax_bits = sb - 1;
+    }
+    if tmax_bits < smax_bits {
+        let hi = cint(stt, u.I128.pow2(tmax_bits).sub(u.I128.of(1)));
+        let mut p = ir.IntULE;
+        if s.is_signed {
+            p = ir.IntSLE;
+        }
+        ok = b_and(ok, icmp(p, v, hi));
+    }
+    check_or_trap(ok, T_INTCAST);
+    return ext_int(v, lty(rt), s.is_signed);
+}
+
+// @enum_from_int(T, x): x, trapping unless it is one of the enum's members.
+fn gen_enum_from_int(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
+    let d = ast.tval_of(e).decl;
+    let s = ct(barg(e, 1).ty);
+    let v = gen(barg(e, 1));
+    let ok = new_bb("enum.ok".ptr);
+    let sw = ir.switch_(B, v, trap_block(T_UNIONTAG));
+    let r = ty.int_range(s);
+    for i in 0..d.variants.len {
+        let x = d.variants.at(i).value;
+        if x.ge(r.lo) and x.le(r.hi) {
+            ir.add_case(sw, cint(v.ty, x), ok);
+        }
+    }
+    at_end(ok);
+    return ext_int(v, lty(rt), s.is_signed);
+}
+
+// @cast_slice(T, s): s reinterpreted as a slice of T, trapping unless its bytes
+// are a whole number of Ts.
+fn gen_cast_slice(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
+    let stt = ct(barg(e, 1).ty);
+    let s = gen(barg(e, 1));
+    let from = ty.type_size(stt.elem);
+    let to = ty.type_size(rt.elem);
+    let len = extract(s, 1);
+    let bytes = b_mul(len, usz(from));
+    let mut nlen = vnil();
+    if to == 0 {
+        nlen = usz(0);
+    } else {
+        check_or_trap(icmp(ir.IntEQ, ir.binop(B, ir.OP_UREM, bytes, usz(to)), usz(0)), T_LENGTH);
+        nlen = ir.binop(B, ir.OP_UDIV, bytes, usz(to));
+    }
+    return insert(s, nlen, 1);
+}
+
+// @size_of ... @cast_slice: types, conversions, pointers and slices.
+fn gen_conversion_builtin(e: *mut ast.Expr, id: i32, rt: *mut ast.Type) *mut ir.Value {
     if id == ast.BI_SIZE_OF {
         let t = ct(ast.tval_of(e));
         if (ty.type_size(t) > ty.max_object_size()) and (dg.error_count() == 0) {
@@ -3243,10 +3358,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
             return ir.cast(B, ir.OP_FPEXT, v, lty(rt));
         }
         if (s.kind == ast.TY_INT) and (rt.kind == ast.TY_FLOAT) {
-            if s.is_signed {
-                return ir.cast(B, ir.OP_SITOFP, v, lty(rt));
-            }
-            return ir.cast(B, ir.OP_UITOFP, v, lty(rt));
+            return int_to_float(v, s.is_signed, lty(rt));
         }
         return v;
     }
@@ -3254,58 +3366,10 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return gen(barg(e, 0));
     }
     if id == ast.BI_ENUM_FROM_INT {
-        // Trap unless the value is one of the enum's members.
-        let d = ast.tval_of(e).decl;
-        let s = ct(barg(e, 1).ty);
-        let v = gen(barg(e, 1));
-        let ok = new_bb("enum.ok".ptr);
-        let sw = ir.switch_(B, v, trap_block(T_UNIONTAG));
-        let r = ty.int_range(s);
-        for i in 0..d.variants.len {
-            let x = d.variants.at(i).value;
-            if x.ge(r.lo) and x.le(r.hi) {
-                ir.add_case(sw, cint(v.ty, x), ok);
-            }
-        }
-        at_end(ok);
-        return ext_int(v, lty(rt), s.is_signed);
+        return gen_enum_from_int(e, rt);
     }
     if id == ast.BI_INT_CAST {
-        let s = ct(barg(e, 1).ty);
-        let v = gen(barg(e, 1));
-        if s == rt {
-            return v;
-        }
-        // Range check in the source type's width (no 128-bit arithmetic).
-        let stt = v.ty;
-        let sb = @int_cast(u32, s.bits);
-        let tb = @int_cast(u32, rt.bits);
-        let mut ok = ir.cint(T_i1, 1);
-        if s.is_signed {
-            if not rt.is_signed {
-                ok = icmp(ir.IntSGE, v, ir.czero(stt));
-            } else if tb < sb {
-                ok = icmp(ir.IntSGE, v, cint(stt, u.I128.pow2(tb - 1).neg()));
-            }
-        }
-        let mut tmax_bits = tb;  // T.max = 2^tmax_bits - 1
-        if rt.is_signed {
-            tmax_bits = tb - 1;
-        }
-        let mut smax_bits = sb;
-        if s.is_signed {
-            smax_bits = sb - 1;
-        }
-        if tmax_bits < smax_bits {
-            let hi = cint(stt, u.I128.pow2(tmax_bits).sub(u.I128.of(1)));
-            let mut p = ir.IntULE;
-            if s.is_signed {
-                p = ir.IntSLE;
-            }
-            ok = b_and(ok, icmp(p, v, hi));
-        }
-        check_or_trap(ok, T_INTCAST);
-        return ext_int(v, lty(rt), s.is_signed);
+        return gen_int_cast(e, rt);
     }
     if id == ast.BI_TRUNCATE {
         let s = ct(barg(e, 1).ty);
@@ -3329,21 +3393,6 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         }
         return lanewise(id, rt, v, srct.is_signed);
     }
-    if ((id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT)) and (rt.kind == ast.TY_VEC) {
-        let v = gen(barg(e, 0));
-        if on_x64() and (v.ty.elem.bits == lty(rt).elem.bits) {
-            // whole vectors (x64.ax counts them, or the lanes one by one)
-            let mut iid = ir.IN_CTPOP;
-            if id == ast.BI_CLZ {
-                iid = ir.IN_CTLZ;
-            } else if id == ast.BI_CTZ {
-                iid = ir.IN_CTTZ;
-            }
-            let mut args: [1]*mut ir.Value = [v];
-            return ir.intr(B, iid, lty(rt), args[..]);
-        }
-        return lanewise(id, rt, v, false);
-    }
     if id == ast.BI_INT_FROM_FLOAT {
         let v = gen(barg(e, 1));
         let mut tys: [2]*mut ir.Ty = [lty(rt), v.ty];
@@ -3352,11 +3401,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     }
     if id == ast.BI_FLOAT_FROM_INT {
         let s = ct(barg(e, 1).ty);
-        let v = gen(barg(e, 1));
-        if s.is_signed {
-            return ir.cast(B, ir.OP_SITOFP, v, lty(rt));
-        }
-        return ir.cast(B, ir.OP_UITOFP, v, lty(rt));
+        return int_to_float(gen(barg(e, 1)), s.is_signed, lty(rt));
     }
     if id == ast.BI_FLOAT_CAST {
         let s = ct(barg(e, 1).ty);
@@ -3410,21 +3455,13 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return insert(s, n, 1);
     }
     if id == ast.BI_CAST_SLICE {
-        let stt = ct(barg(e, 1).ty);
-        let s = gen(barg(e, 1));
-        let from = ty.type_size(stt.elem);
-        let to = ty.type_size(rt.elem);
-        let len = extract(s, 1);
-        let bytes = b_mul(len, usz(from));
-        let mut nlen = vnil();
-        if to == 0 {
-            nlen = usz(0);
-        } else {
-            check_or_trap(icmp(ir.IntEQ, ir.binop(B, ir.OP_UREM, bytes, usz(to)), usz(0)), T_LENGTH);
-            nlen = ir.binop(B, ir.OP_UDIV, bytes, usz(to));
-        }
-        return insert(s, nlen, 1);
+        return gen_cast_slice(e, rt);
     }
+    return builtin_missing(e);
+}
+
+// @mem_copy ... @prefetch: memory.
+fn gen_memory_builtin(e: *mut ast.Expr, id: i32, rt: *mut ast.Type) *mut ir.Value {
     if id == ast.BI_MEM_COPY {
         let dt = ct(barg(e, 0).ty);
         let d = gen(barg(e, 0));
@@ -3512,6 +3549,60 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let code = sel(failed, errcode_value(sema.error_code_of(u.intern("OutOfMemory"))), ir.cint(T_i16, 0));
         return errunion_value(rt, code, prev);
     }
+    if (id == ast.BI_PREFETCH) or (id == ast.BI_PREFETCH_WRITE) {
+        // a hint (spec §5.7): the pointer is evaluated; WebAssembly has no
+        // prefetch
+        let p = gen(barg(e, 0));
+        if not ty.g_target.is_wasm {
+            let mut args: [1]*mut ir.Value = [p];
+            let mut k = ir.IN_PREFETCH;
+            if id == ast.BI_PREFETCH_WRITE {
+                k = ir.IN_PREFETCHW;
+            }
+            _ = ir.intr(B, k, T_void, args[..]);
+        }
+        return vnil();
+    }
+    if id == ast.BI_MEMORY_DISCARD {
+        // WebAssembly memory cannot give pages back: nothing to do there
+        let addr = gen(barg(e, 0));
+        let len = gen(barg(e, 1));
+        if not ty.g_target.is_wasm {
+            let mut ps: [2]*mut ir.Ty = [T_isz, T_isz];
+            let fty = ir.t_fn(T_void, ps[..], false);
+            let mut args: [2]*mut ir.Value = [addr, len];
+            _ = call(fty, native_rt_fn("ax_memory_discard", fty), args[..]);
+        }
+        return vnil();
+    }
+    return builtin_missing(e);
+}
+
+// @clz ... @copysign: integer and float operations.
+// Whether the integer type t, or the lanes of the vector type t, are signed.
+fn signed_lanes(t: *mut ast.Type) bool {
+    if t.kind == ast.TY_INT {
+        return t.is_signed;
+    }
+    return t.elem.is_signed;
+}
+
+fn gen_math_builtin(e: *mut ast.Expr, id: i32, rt: *mut ast.Type) *mut ir.Value {
+    if ((id == ast.BI_CLZ) or (id == ast.BI_CTZ) or (id == ast.BI_POPCOUNT)) and (rt.kind == ast.TY_VEC) {
+        let v = gen(barg(e, 0));
+        if on_x64() and (v.ty.elem.bits == lty(rt).elem.bits) {
+            // whole vectors (x64.ax counts them, or the lanes one by one)
+            let mut iid = ir.IN_CTPOP;
+            if id == ast.BI_CLZ {
+                iid = ir.IN_CTLZ;
+            } else if id == ast.BI_CTZ {
+                iid = ir.IN_CTTZ;
+            }
+            let mut args: [1]*mut ir.Value = [v];
+            return ir.intr(B, iid, lty(rt), args[..]);
+        }
+        return lanewise(id, rt, v, false);
+    }
     if (id == ast.BI_CLZ) or (id == ast.BI_CTZ) {
         let v = gen(barg(e, 0));
         let mut t: [1]*mut ir.Ty = [v.ty];
@@ -3530,13 +3621,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return intrinsic(u.pick(id == ast.BI_ROTL, "llvm.fshl", "llvm.fshr"), t[..], args[..]);
     }
     if (id == ast.BI_ADD_SAT) or (id == ast.BI_SUB_SAT) {
-        let mut sg = false;
-        if rt.kind == ast.TY_INT {
-            sg = rt.is_signed;
-        } else {
-            sg = rt.elem.is_signed;
-        }
-        let nm = u.f2("llvm.%s%s.sat", u.pick(sg, "s", "u"), u.pick(id == ast.BI_ADD_SAT, "add", "sub"));
+        let nm = u.f2("llvm.%s%s.sat", u.pick(signed_lanes(rt), "s", "u"), u.pick(id == ast.BI_ADD_SAT, "add", "sub"));
         let a1 = gen(barg(e, 1));  // (right to left, as in the C implementation)
         let a0 = gen(barg(e, 0));
         return intr2(nm, a0, a1);
@@ -3554,13 +3639,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let t = rt.elem;
         let l = gen(barg(e, 0));
         let r = gen(barg(e, 1));
-        let mut base: i32 = 2;
-        if id == ast.BI_ADD_CHECKED {
-            base = 0;
-        } else if id == ast.BI_SUB_CHECKED {
-            base = 1;
-        }
-        let o = op_with_overflow(base, t.is_signed, l, r);
+        let o = op_with_overflow(id - ast.BI_ADD_CHECKED, t.is_signed, l, r);  // (0 add, 1 sub, 2 mul)
         let code = sel(o.ovf, errcode_value(sema.error_code_of(u.intern("Overflow"))), ir.cint(T_i16, 0));
         return errunion_value(rt, code, o.val);
     }
@@ -3571,13 +3650,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         if (rt.kind == ast.TY_FLOAT) or ty.is_vec_float(rt) {
             return intr2(u.pick(mn, "llvm.minimum", "llvm.maximum"), l, r);
         }
-        let mut sg = false;
-        if rt.kind == ast.TY_INT {
-            sg = rt.is_signed;
-        } else {
-            sg = rt.elem.is_signed;
-        }
-        return intr2(u.f2("llvm.%s%s", u.pick(sg, "s", "u"), u.pick(mn, "min", "max")), l, r);
+        return intr2(u.f2("llvm.%s%s", u.pick(signed_lanes(rt), "s", "u"), u.pick(mn, "min", "max")), l, r);
     }
     if id == ast.BI_ABS {
         let v = gen(barg(e, 0));
@@ -3604,20 +3677,9 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let mut args: [2]*mut ir.Value = [v, ir.cint(T_i1, 0)];
         return intrinsic("llvm.abs", tys[..], args[..]);  // vectors wrap, as in WASM
     }
-    if id == ast.BI_SQRT {
-        return intr1("llvm.sqrt", gen(barg(e, 0)));
-    }
-    if id == ast.BI_FLOOR {
-        return intr1("llvm.floor", gen(barg(e, 0)));
-    }
-    if id == ast.BI_CEIL {
-        return intr1("llvm.ceil", gen(barg(e, 0)));
-    }
-    if id == ast.BI_TRUNC {
-        return intr1("llvm.trunc", gen(barg(e, 0)));
-    }
-    if id == ast.BI_NEAREST {
-        return intr1("llvm.roundeven", gen(barg(e, 0)));
+    if (id >= ast.BI_SQRT) and (id <= ast.BI_NEAREST) {
+        let names = ["llvm.sqrt", "llvm.floor", "llvm.ceil", "llvm.trunc", "llvm.roundeven"];
+        return intr1(names[@int_cast(usize, id - ast.BI_SQRT)], gen(barg(e, 0)));
     }
     if id == ast.BI_FMA {
         let x = gen(barg(e, 0));
@@ -3640,6 +3702,166 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let y = gen(barg(e, 1));
         return intr2("llvm.copysign", x, y);
     }
+    return builtin_missing(e);
+}
+
+// The length and address checks of @load and @store: the slice s (of type
+// stt) holds at least vb bytes.
+fn check_vec_span(s: *mut ir.Value, stt: *mut ast.Type, vb: i64) void {
+    let len = extract(s, 1);
+    check_or_trap(icmp(ir.IntUGE, len, usz(elems_for(vb, ty.type_size(stt.elem)))), T_LENGTH);
+    asan_check(extract(s, 0), usz(vb));
+}
+
+// @dot(x, y): the lanes' products summed, in pairs (i16), fours (i8) or all (floats).
+fn gen_dot(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
+    let vt = ct(barg(e, 0).ty);
+    let x = gen(barg(e, 0));
+    let y = gen(barg(e, 1));
+    if vt.elem.kind == ast.TY_FLOAT {
+        return reduce_add(vt, ir.binop(B, ir.OP_FMUL, x, y));
+    }
+    if vt.elem.bits == 8 {
+        // (u8 by i8 lanes: the first operand's bytes unsigned)
+        let sx = vt.elem.is_signed;
+        if not sx and on_x64() and x64.vnni_ok(@as(u64, @bit_cast(u32, vt.lanes))) {
+            // (vpdpbusd: x64.ax)
+            let mut vargs: [2]*mut ir.Value = [x, y];
+            return ir.intr(B, ir.IN_DOT_U8I8, lty(rt), vargs[..]);
+        }
+        if sx and on_a64() and ((@as(u64, @bit_cast(u32, vt.lanes)) % 16) == 0) {
+            // (sdot; or fused into the add it feeds: a64.ax)
+            let mut sargs: [2]*mut ir.Value = [x, y];
+            return ir.intr(B, ir.IN_DOT_I8, lty(rt), sargs[..]);
+        }
+        // lane by lane
+        let n = @as(u64, @bit_cast(u32, rt.lanes));
+        let lt = lty(rt.elem);
+        let mut r = ir.czero(lty(rt));
+        for i in @as(u64, 0)..n {
+            let mut s = ir.czero(lt);
+            for j in @as(u64, 0)..4 {
+                let xa = ext_int(ext_elem(x, ci32((4 * i) + j)), lt, sx);
+                let ya = ext_int(ext_elem(y, ci32((4 * i) + j)), lt, true);
+                s = ir.binop(B, ir.OP_ADD, s, ir.binop(B, ir.OP_MUL, xa, ya));
+            }
+            r = ins_elem(r, s, ci32(i));
+        }
+        return r;
+    }
+    let mut dargs: [2]*mut ir.Value = [x, y];
+    return ir.intr(B, ir.IN_DOT_I16, lty(rt), dargs[..]);
+}
+
+// @widen_low, @widen_high: half the lanes, each extended to twice its width.
+fn gen_widen(e: *mut ast.Expr, id: i32, rt: *mut ast.Type) *mut ir.Value {
+    let vt = ct(barg(e, 0).ty);
+    let v = gen(barg(e, 0));
+    let wbits = @as(u64, @bit_cast(u32, vt.lanes * vt.elem.bits));
+    if (on_a64() and ((wbits % 128) == 0)) or (on_x64() and x64.widen_ok(wbits)) {
+        // (sxtl, uxtl2 ...; or fused into the multiply they feed: a64.ax; pmovsx,
+        // pmovzx: x64.ax)
+        let mut wid = ir.IN_SWIDEN_LO;
+        if not vt.elem.is_signed {
+            wid = ir.IN_UWIDEN_LO;
+        }
+        if id == ast.BI_WIDEN_HIGH {
+            wid += 1;
+        }
+        let mut wargs: [1]*mut ir.Value = [v];
+        return ir.intr(B, wid, lty(rt), wargs[..]);
+    }
+    // lane by lane: WebAssembly's extend_low/extend_high
+    let n = @as(u64, @bit_cast(u32, rt.lanes));
+    let mut base: u64 = 0;
+    if id == ast.BI_WIDEN_HIGH {
+        base = n;
+    }
+    let lt = lty(rt.elem);
+    let mut r = ir.czero(lty(rt));
+    for i in @as(u64, 0)..n {
+        let x = ext_int(ext_elem(v, ci32(base + i)), lt, vt.elem.is_signed);
+        r = ins_elem(r, x, ci32(i));
+    }
+    return r;
+}
+
+// @narrow(T, x, y): the lanes of x then y, lane by lane, each saturated to
+// the result's range: WebAssembly's narrow_*_sat, by the operand and result
+// lane types.
+fn gen_narrow(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
+    let vt = ct(barg(e, 1).ty);
+    let x = gen(barg(e, 1));
+    let y = gen(barg(e, 2));
+    let n = @as(u64, @bit_cast(u32, vt.lanes));
+    let wt = lty(vt.elem);
+    let lt = lty(rt.elem);
+    let bits = @as(u64, @bit_cast(u32, rt.elem.bits));
+    let mut hi: u64 = (@as(u64, 1) << bits) - 1;
+    let mut lo: u64 = 0;
+    if rt.elem.is_signed {
+        hi = (@as(u64, 1) << (bits - 1)) - 1;
+        lo = 0 -% (@as(u64, 1) << (bits - 1));
+    }
+    let mut r = ir.czero(lty(rt));
+    for i in @as(u64, 0)..(2 * n) {
+        let mut src = x;
+        let mut k = i;
+        if i >= n {
+            src = y;
+            k = i - n;
+        }
+        let mut l = ext_elem(src, ci32(k));
+        if vt.elem.is_signed {
+            l = sel(icmp(ir.IntSLT, l, ir.cint(wt, lo)), ir.cint(wt, lo), l);
+            l = sel(icmp(ir.IntSGT, l, ir.cint(wt, hi)), ir.cint(wt, hi), l);
+        } else {
+            l = sel(icmp(ir.IntUGT, l, ir.cint(wt, hi)), ir.cint(wt, hi), l);
+        }
+        r = ins_elem(r, trunc(l, lt), ci32(i));
+    }
+    return r;
+}
+
+// @load_partial(T, s): the first min(len, n) lanes copied to a zeroed vector.
+fn gen_load_partial(e: *mut ast.Expr, rt: *mut ast.Type) *mut ir.Value {
+    let s = gen(barg(e, 1));
+    let p = extract(s, 0);
+    let len = extract(s, 1);
+    let n = usz(@as(i64, rt.lanes));
+    let k = sel(icmp(ir.IntULT, len, n), len, n);
+    if on_x64() and x64.partial_ok(@int_cast(i32, rt.elem.bits), @int_cast(i32, rt.lanes)) {
+        let mut pargs: [2]*mut ir.Value = [p, lane_mask(k)];
+        return ir.intr(B, ir.IN_LOAD_PARTIAL, lty(rt), pargs[..]);
+    }
+    let tmp = alloca_in_entry(lty(rt), "partial".ptr);
+    _ = ir.memop(B, ir.OP_MEMSET, tmp, ir.cint(T_i8, 0), usz(ty.type_size(rt)));
+    _ = ir.memop(B, ir.OP_MEMMOVE, tmp, p, b_mul(k, usz(ty.type_size(rt.elem))));
+    return load(rt, tmp, true);
+}
+
+// @store_partial(s, v): the first min(len, n) lanes of v stored to s.
+fn gen_store_partial(e: *mut ast.Expr) *mut ir.Value {
+    let vt = ct(barg(e, 1).ty);
+    let s = gen(barg(e, 0));
+    let v = gen(barg(e, 1));
+    let p = extract(s, 0);
+    let len = extract(s, 1);
+    let n = usz(@as(i64, vt.lanes));
+    let k = sel(icmp(ir.IntULT, len, n), len, n);
+    if on_x64() and x64.partial_ok(@int_cast(i32, vt.elem.bits), @int_cast(i32, vt.lanes)) {
+        let mut pargs: [3]*mut ir.Value = [v, p, lane_mask(k)];
+        _ = ir.intr(B, ir.IN_STORE_PARTIAL, T_void, pargs[..]);
+        return vnil();
+    }
+    let tmp = alloca_in_entry(lty(vt), "partial".ptr);
+    store(vt, v, tmp, true);
+    _ = ir.memop(B, ir.OP_MEMMOVE, p, tmp, b_mul(k, usz(ty.type_size(vt.elem))));
+    return vnil();
+}
+
+// @splat ... @narrow: SIMD vectors.
+fn gen_vector_builtin(e: *mut ast.Expr, id: i32, rt: *mut ast.Type) *mut ir.Value {
     if id == ast.BI_SPLAT {
         let mut x = gen(barg(e, 0));
         // a literal splatted to a FloatVector parameter is an f64
@@ -3668,10 +3890,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
     if id == ast.BI_LOAD {
         let stt = ct(barg(e, 1).ty);
         let s = gen(barg(e, 1));
-        let len = extract(s, 1);
-        let vb = ty.type_size(rt);
-        check_or_trap(icmp(ir.IntUGE, len, usz(elems_for(vb, ty.type_size(stt.elem)))), T_LENGTH);
-        asan_check(extract(s, 0), usz(vb));
+        check_vec_span(s, stt, ty.type_size(rt));
         return load(rt, extract(s, 0), true);
     }
     if id == ast.BI_STORE {
@@ -3679,10 +3898,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let vt = ct(barg(e, 1).ty);
         let s = gen(barg(e, 0));
         let v = gen(barg(e, 1));
-        let len = extract(s, 1);
-        let vb = ty.type_size(vt);
-        check_or_trap(icmp(ir.IntUGE, len, usz(elems_for(vb, ty.type_size(stt.elem)))), T_LENGTH);
-        asan_check(extract(s, 0), usz(vb));
+        check_vec_span(s, stt, ty.type_size(vt));
         store(vt, v, extract(s, 0), true);
         return vnil();
     }
@@ -3721,38 +3937,10 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return bitcast(b_or(bitcast(lo, idx.ty), bitcast(hi, idx.ty)), x.ty);
     }
     if id == ast.BI_LOAD_PARTIAL {
-        // the first min(len, n) lanes copied to a zeroed vector
-        let s = gen(barg(e, 1));
-        let p = extract(s, 0);
-        let len = extract(s, 1);
-        let n = usz(@as(i64, rt.lanes));
-        let k = sel(icmp(ir.IntULT, len, n), len, n);
-        if on_x64() and x64.partial_ok(@int_cast(i32, rt.elem.bits), @int_cast(i32, rt.lanes)) {
-            let mut pargs: [2]*mut ir.Value = [p, lane_mask(k)];
-            return ir.intr(B, ir.IN_LOAD_PARTIAL, lty(rt), pargs[..]);
-        }
-        let tmp = alloca_in_entry(lty(rt), "partial".ptr);
-        _ = ir.memop(B, ir.OP_MEMSET, tmp, ir.cint(T_i8, 0), usz(ty.type_size(rt)));
-        _ = ir.memop(B, ir.OP_MEMMOVE, tmp, p, b_mul(k, usz(ty.type_size(rt.elem))));
-        return load(rt, tmp, true);
+        return gen_load_partial(e, rt);
     }
     if id == ast.BI_STORE_PARTIAL {
-        let vt = ct(barg(e, 1).ty);
-        let s = gen(barg(e, 0));
-        let v = gen(barg(e, 1));
-        let p = extract(s, 0);
-        let len = extract(s, 1);
-        let n = usz(@as(i64, vt.lanes));
-        let k = sel(icmp(ir.IntULT, len, n), len, n);
-        if on_x64() and x64.partial_ok(@int_cast(i32, vt.elem.bits), @int_cast(i32, vt.lanes)) {
-            let mut pargs: [3]*mut ir.Value = [v, p, lane_mask(k)];
-            _ = ir.intr(B, ir.IN_STORE_PARTIAL, T_void, pargs[..]);
-            return vnil();
-        }
-        let tmp = alloca_in_entry(lty(vt), "partial".ptr);
-        store(vt, v, tmp, true);
-        _ = ir.memop(B, ir.OP_MEMMOVE, p, tmp, b_mul(k, usz(ty.type_size(vt.elem))));
-        return vnil();
+        return gen_store_partial(e);
     }
     if (id >= ast.BI_LANES_EQ) and (id <= ast.BI_LANES_GE) {
         let vt = ct(barg(e, 0).ty);
@@ -3797,109 +3985,19 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         return reduce_add(ct(barg(e, 0).ty), gen(barg(e, 0)));
     }
     if id == ast.BI_DOT {
-        let vt = ct(barg(e, 0).ty);
-        let x = gen(barg(e, 0));
-        let y = gen(barg(e, 1));
-        if vt.elem.kind == ast.TY_FLOAT {
-            return reduce_add(vt, ir.binop(B, ir.OP_FMUL, x, y));
-        }
-        if vt.elem.bits == 8 {
-            // (u8 by i8 lanes: the first operand's bytes unsigned)
-            let sx = vt.elem.is_signed;
-            if not sx and on_x64() and x64.vnni_ok(@as(u64, @bit_cast(u32, vt.lanes))) {
-                // (vpdpbusd: x64.ax)
-                let mut vargs: [2]*mut ir.Value = [x, y];
-                return ir.intr(B, ir.IN_DOT_U8I8, lty(rt), vargs[..]);
-            }
-            if sx and on_a64() and ((@as(u64, @bit_cast(u32, vt.lanes)) % 16) == 0) {
-                // (sdot; or fused into the add it feeds: a64.ax)
-                let mut sargs: [2]*mut ir.Value = [x, y];
-                return ir.intr(B, ir.IN_DOT_I8, lty(rt), sargs[..]);
-            }
-            // lane by lane
-            let n = @as(u64, @bit_cast(u32, rt.lanes));
-            let lt = lty(rt.elem);
-            let mut r = ir.czero(lty(rt));
-            for i in @as(u64, 0)..n {
-                let mut s = ir.czero(lt);
-                for j in @as(u64, 0)..4 {
-                    let xa = ext_int(ext_elem(x, ci32((4 * i) + j)), lt, sx);
-                    let ya = ext_int(ext_elem(y, ci32((4 * i) + j)), lt, true);
-                    s = ir.binop(B, ir.OP_ADD, s, ir.binop(B, ir.OP_MUL, xa, ya));
-                }
-                r = ins_elem(r, s, ci32(i));
-            }
-            return r;
-        }
-        let mut dargs: [2]*mut ir.Value = [x, y];
-        return ir.intr(B, ir.IN_DOT_I16, lty(rt), dargs[..]);
+        return gen_dot(e, rt);
     }
     if (id == ast.BI_WIDEN_LOW) or (id == ast.BI_WIDEN_HIGH) {
-        let vt = ct(barg(e, 0).ty);
-        let v = gen(barg(e, 0));
-        let wbits = @as(u64, @bit_cast(u32, vt.lanes * vt.elem.bits));
-        if (on_a64() and ((wbits % 128) == 0)) or (on_x64() and x64.widen_ok(wbits)) {
-            // (sxtl, uxtl2 ...; or fused into the multiply they feed: a64.ax; pmovsx,
-            // pmovzx: x64.ax)
-            let mut wid = ir.IN_SWIDEN_LO;
-            if not vt.elem.is_signed {
-                wid = ir.IN_UWIDEN_LO;
-            }
-            if id == ast.BI_WIDEN_HIGH {
-                wid += 1;
-            }
-            let mut wargs: [1]*mut ir.Value = [v];
-            return ir.intr(B, wid, lty(rt), wargs[..]);
-        }
-        // lane by lane: WebAssembly's extend_low/extend_high
-        let n = @as(u64, @bit_cast(u32, rt.lanes));
-        let mut base: u64 = 0;
-        if id == ast.BI_WIDEN_HIGH {
-            base = n;
-        }
-        let lt = lty(rt.elem);
-        let mut r = ir.czero(lty(rt));
-        for i in @as(u64, 0)..n {
-            let x = ext_int(ext_elem(v, ci32(base + i)), lt, vt.elem.is_signed);
-            r = ins_elem(r, x, ci32(i));
-        }
-        return r;
+        return gen_widen(e, id, rt);
     }
     if id == ast.BI_NARROW {
-        // lane by lane, each saturated to the result's range: WebAssembly's
-        // narrow_*_sat, by the operand and result lane types
-        let vt = ct(barg(e, 1).ty);
-        let x = gen(barg(e, 1));
-        let y = gen(barg(e, 2));
-        let n = @as(u64, @bit_cast(u32, vt.lanes));
-        let wt = lty(vt.elem);
-        let lt = lty(rt.elem);
-        let bits = @as(u64, @bit_cast(u32, rt.elem.bits));
-        let mut hi: u64 = (@as(u64, 1) << bits) - 1;
-        let mut lo: u64 = 0;
-        if rt.elem.is_signed {
-            hi = (@as(u64, 1) << (bits - 1)) - 1;
-            lo = 0 -% (@as(u64, 1) << (bits - 1));
-        }
-        let mut r = ir.czero(lty(rt));
-        for i in @as(u64, 0)..(2 * n) {
-            let mut src = x;
-            let mut k = i;
-            if i >= n {
-                src = y;
-                k = i - n;
-            }
-            let mut l = ext_elem(src, ci32(k));
-            if vt.elem.is_signed {
-                l = sel(icmp(ir.IntSLT, l, ir.cint(wt, lo)), ir.cint(wt, lo), l);
-                l = sel(icmp(ir.IntSGT, l, ir.cint(wt, hi)), ir.cint(wt, hi), l);
-            } else {
-                l = sel(icmp(ir.IntUGT, l, ir.cint(wt, hi)), ir.cint(wt, hi), l);
-            }
-            r = ins_elem(r, trunc(l, lt), ci32(i));
-        }
-        return r;
+        return gen_narrow(e, rt);
     }
+    return builtin_missing(e);
+}
+
+// @trap, the target and processor queries, tests, atomics and @error_name.
+fn gen_system_builtin(e: *mut ast.Expr, id: i32, rt: *mut ast.Type) *mut ir.Value {
     if id == ast.BI_TRAP {
         emit_trap(T_TRAP);
         return vnil();
@@ -3954,34 +4052,8 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         ir.fence(B);
         return vnil();
     }
-    if (id == ast.BI_PREFETCH) or (id == ast.BI_PREFETCH_WRITE) {
-        // a hint (spec §5.7): the pointer is evaluated; WebAssembly has no
-        // prefetch
-        let p = gen(barg(e, 0));
-        if not ty.g_target.is_wasm {
-            let mut args: [1]*mut ir.Value = [p];
-            let mut k = ir.IN_PREFETCH;
-            if id == ast.BI_PREFETCH_WRITE {
-                k = ir.IN_PREFETCHW;
-            }
-            _ = ir.intr(B, k, T_void, args[..]);
-        }
-        return vnil();
-    }
     if (id >= ast.BI_ATOMIC_LOAD) and (id <= ast.BI_ATOMIC_NOTIFY) {
         return gen_atomic(e);
-    }
-    if id == ast.BI_MEMORY_DISCARD {
-        // WebAssembly memory cannot give pages back: nothing to do there
-        let addr = gen(barg(e, 0));
-        let len = gen(barg(e, 1));
-        if not ty.g_target.is_wasm {
-            let mut ps: [2]*mut ir.Ty = [T_isz, T_isz];
-            let fty = ir.t_fn(T_void, ps[..], false);
-            let mut args: [2]*mut ir.Value = [addr, len];
-            _ = call(fty, native_rt_fn("ax_memory_discard", fty), args[..]);
-        }
-        return vnil();
     }
     if id == ast.BI_ERROR_NAME {
         let code = gen(barg(e, 0));
@@ -3989,8 +4061,7 @@ fn gen_builtin(e: *mut ast.Expr) *mut ir.Value {
         let mut args: [1]*mut ir.Value = [code];
         return call(error_name_fty(), f, args[..]);
     }
-    internal_error(u.f1("builtin @%s not implemented", e.name));
-    return vnil();
+    return builtin_missing(e);
 }
 
 // A function of std/internal/runtime/rt.ax (loaded with every program that is built).
