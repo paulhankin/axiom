@@ -46,3 +46,5 @@
   for subnormal ones.
 - On Windows, `process.Command.set_env` and `remove_env` match variable names without
   case, as Windows does: `remove_env("PATH")` left `Path` in the child.
+- `zstd.decompress` fails with `Corrupt`, instead of trapping, on a block whose table
+  description ends part-way into the byte after the block.
