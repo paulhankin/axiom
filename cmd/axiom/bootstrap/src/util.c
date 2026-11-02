@@ -2,6 +2,7 @@
 #include "util.h"
 
 #include <stdarg.h>
+#include <sys/stat.h>
 
 // ---------------------------------------------------------------------------
 // Arena
@@ -154,6 +155,11 @@ FileVec g_files;
 char *read_entire_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
+    struct stat st;  // (a directory's "size" from seeking to its end can be anything)
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
+        fclose(f);
+        return NULL;
+    }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);

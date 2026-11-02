@@ -25,3 +25,5 @@ These programs were accepted and now are compile errors; the fixes are mechanica
 - An import path with a NUL byte is `E0218` (the bootstrap compiler cut the path at
   the NUL and imported what was left).
 - `@dot` reports nothing more about an operand that already has an error.
+- An import path that names a directory is `E0211`; both compilers ran out of memory
+  on it.
