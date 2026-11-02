@@ -50,3 +50,6 @@
   description ends part-way into the byte after the block.
 - `webp.decode` fails with `Corrupt`, instead of trapping, on a file whose RIFF size is
   smaller than its header.
+- `markdown` no longer reads freed memory when it splits text around an extended
+  autolink (`www.example.com`): the link's text was copied out of the parser's buffer
+  after a push that could move the buffer.
