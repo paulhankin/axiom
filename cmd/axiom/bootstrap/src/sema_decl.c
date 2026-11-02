@@ -155,7 +155,13 @@ static Module *load_module(const char *fs_path, Span *from) {
 // ---------------------------------------------------------------------------
 static bool is_constraint_name(Sym s) { return constraint_from_name(s) != C_NONE && (int)constraint_from_name(s) >= 0; }
 
+// The parser's name for a name it did not find (after reporting it): not
+// checked for duplicates, which in a list of them would take time in the
+// square of its length.
+static bool placeholder(Sym name) { return strcmp(name, "<error>") == 0; }
+
 static void dup_error(Span sp, Sym name, Span prev) {
+    if (placeholder(name)) return;
     Diag *d = diag_error(sp, "E0201", "'%s' is already declared", name);
     diag_note(d, prev, "previous declaration of '%s'", name);
 }
@@ -198,11 +204,11 @@ static void register_module(Module *m) {
                 symmap_put(&d->method_map, md->name, md);
             }
             for (int j = 0; j < d->fields.len; j++)
-                for (int k = 0; k < j; k++)
+                for (int k = 0; k < (placeholder(d->fields.data[j].name) ? 0 : j); k++)
                     if (d->fields.data[j].name == d->fields.data[k].name)
                         dup_error(d->fields.data[j].span, d->fields.data[j].name, d->fields.data[k].span);
             for (int j = 0; j < d->variants.len; j++)
-                for (int k = 0; k < j; k++)
+                for (int k = 0; k < (placeholder(d->variants.data[j].name) ? 0 : j); k++)
                     if (d->variants.data[j].name == d->variants.data[k].name)
                         dup_error(d->variants.data[j].span, d->variants.data[j].name, d->variants.data[k].span);
         }
@@ -286,7 +292,7 @@ static void ensure_gparams(Decl *d) {
             c = (Constraint)cc;
         }
         g->type = type_param(d, i, g->name, c, g->is_const, ct);
-        for (int j = 0; j < i; j++)
+        for (int j = 0; j < (placeholder(g->name) ? 0 : i); j++)
             if (d->gparams.data[j].name == g->name) dup_error(g->span, g->name, d->gparams.data[j].span);
     }
 }
@@ -543,7 +549,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
         for (int i = 0; i < te->fields.len; i++) {
             Field f = te->fields.data[i];
             f.type = resolve_type(f.te, tc);
-            for (int j = 0; j < i; j++)
+            for (int j = 0; j < (placeholder(f.name) ? 0 : i); j++)
                 if (fv.data[j].name == f.name) dup_error(f.span, f.name, fv.data[j].span);
             vec_push(fv, f);
         }
@@ -635,7 +641,7 @@ static void resolve_fn(Decl *d) {
             diag_error(p->te->span, "E0404", "parameter '%s' cannot have type void", p->name);
             d->param_types[i] = t_invalid;
         }
-        for (int j = 0; j < i; j++)
+        for (int j = 0; j < (placeholder(p->name) ? 0 : i); j++)
             if (d->params.data[j].name == p->name) dup_error(p->span, p->name, d->params.data[j].span);
     }
     d->ret_type = d->ret_te ? resolve_type(d->ret_te, &tc) : t_void;

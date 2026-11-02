@@ -1008,6 +1008,12 @@ await section('', {
     const bad = r.j.diagnostics.filter((x) => x.message.includes('<error>') || x.code === 'E0801');
     return bad.length === 0 ? null : `${bad.length} cascading: ${bad[0].code} ${bad[0].message}`;
   };
+  cases['a long list of missing names is not checked in pairs'] = () => {
+    // (20000 parameters the parser could not read: in pairs, 2e8 comparisons)
+    const r = check(`fn f(${','.repeat(20000)}) void {\n}\nstruct S {\n${'    : u8,\n'.repeat(5000)}}\n`, 'pairs');
+    if (r.err) return r.err;
+    return r.ms < 5000 ? null : `took ${r.ms} ms`;
+  };
   cases['at most 1000 diagnostics are shown'] = () => {
     const r = check(`fn f() void {\n${'    x;\n'.repeat(3000)}}\n`, 'many');
     if (r.err) return r.err;
