@@ -792,12 +792,16 @@ Type *builtin_check(Expr *e, Type *expected) {
             diag_types(d, type_str(a0), type_str(b0));
             return e->type = t_invalid;
         }
-        if (t->kind == TY_INVALID || b0->kind == TY_INVALID) return e->type = t_invalid;
+        // (an operand reported already, or a literal that did not fit: no more about it)
+        Type *b = (*earg(e, 1))->type;
+        if (t->kind == TY_INVALID || b0->kind == TY_INVALID || !b || b->kind == TY_INVALID) return e->type = t_invalid;
         if (ty_is_vec_float(t)) return e->type = t->elem;
         if (t->kind == TY_VEC && t->elem == t_i16) return e->type = type_vec(t_i32, t->lanes / 2);
         // i8 lanes: each i32 lane the sum of four signed products (Arm's SDOT)
         if (t->kind == TY_VEC && t->elem == t_i8 && t->lanes % 4 == 0) return e->type = type_vec(t_i32, t->lanes / 4);
-        diag_error(e->span, "E0812", "@dot requires float vectors, i16 or i8 lanes, or u8 by i8 lanes, found %s", type_str(t));
+        diag_error(e->span, "E0812",
+                   "@dot requires float vectors, i16 lanes, i8 lanes or u8 by i8 lanes (a multiple of 4), found %s",
+                   type_str(t));
         return e->type = t_invalid;
     }
     case BI_WIDEN_LOW:

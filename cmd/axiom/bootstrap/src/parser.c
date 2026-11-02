@@ -1249,7 +1249,9 @@ static void parse_top(Parser *P) {
         }
         Decl *d = new_decl(P, D_IMPORT, start);
         Token *s = expect(P, TK_STRING);
-        if (s->kind == TK_STRING) {
+        if (s->kind == TK_STRING && memchr(s->str.bytes, 0, s->str.len))
+            diag_error(s->span, "E0218", "an import path may not contain a NUL byte");
+        else if (s->kind == TK_STRING) {
             d->import_path = intern(s->str.bytes, s->str.len);
             d->import_path_span = s->span;
         }

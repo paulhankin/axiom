@@ -20,3 +20,8 @@ These programs were accepted and now are compile errors; the fixes are mechanica
   directory is inside the `internal` tree it names.
 - `@features` checks each extension's whole name: the bootstrap compiler cut names at
   63 characters, so a long unknown name could be taken for a known one.
+- An enum whose representation type is itself, or an enum that depends on it, is
+  `E0308`; both compilers crashed on it.
+- An import path with a NUL byte is `E0218` (the bootstrap compiler cut the path at
+  the NUL and imported what was left).
+- `@dot` reports nothing more about an operand that already has an error.

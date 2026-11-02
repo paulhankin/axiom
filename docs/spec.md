@@ -387,7 +387,7 @@ An unknown builtin name is a compile error (`E0120`) raised by the parser.
 
 Each `.ax` file is a module. `import "path.ax" as name;` binds `name` to that module's `pub`
 declarations. Paths are relative to the importing file, with `/` between their parts on
-every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\` is `E0218`.
+every host: an absolute path (`/a/b.ax`, `C:/a/b.ax`) or one containing `\` or a NUL byte is `E0218`.
 A path beginning with `std/` resolves to the standard library, for example
 `import "std/mem" as mem;`. A path beginning with `pkg:` names a module of another package
 (§4.6). The rest of a `std/` path, and of a `pkg:name/` path, may not have a `..` part, so
@@ -2506,7 +2506,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0215 | Invalid `axiom.toml` |
 | E0216 | Git dependency can't be fetched |
 | E0217 | Package directory or manifest missing |
-| E0218 | Import path absolute or containing `\`, or a `std/` or `pkg:` path with a `..` part |
+| E0218 | Import path absolute or containing `\` or a NUL byte, or a `std/` or `pkg:` path with a `..` part |
 | E0219 | Import of an `internal` module from outside its parent's tree (§4.1) |
 | E0220 | A package needs a newer compiler (`axiom` in its manifest, §4.6) |
 | E0301 | Missing return type |

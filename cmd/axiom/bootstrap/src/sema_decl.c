@@ -686,6 +686,15 @@ static void resolve_enum(Decl *d) {
     Type *repr = NULL;
     if (d->te) {
         repr = resolve_type(d->te, &tc);
+        if (!repr) {
+            // (an enum whose representation is itself, or an enum whose
+            // representation depends on it: not yet a type)
+            const char *name = "this type";
+            if (d->te->kind == TE_NAMED)
+                name = d->te->qual ? arena_printf("%s.%s", d->te->qual, d->te->name) : d->te->name;
+            diag_error(d->te->span, "E0308", "an enum's representation must be an integer type, found %s", name);
+            repr = t_invalid;
+        }
         if (repr->kind != TY_INT) {
             if (repr->kind != TY_INVALID)
                 diag_error(d->te->span, "E0308", "an enum's representation must be an integer type, found %s",
