@@ -27,3 +27,5 @@ These programs were accepted and now are compile errors; the fixes are mechanica
 - `@dot` reports nothing more about an operand that already has an error.
 - An import path that names a directory is `E0211`; both compilers ran out of memory
   on it.
+- A global initialized by a union variant with no argument, or by `@ptr_from_int` with
+  one, is `E0420`; both compilers crashed on it.

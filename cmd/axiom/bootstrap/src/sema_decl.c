@@ -983,8 +983,8 @@ static bool is_const_init(Expr *e) {
     case E_FIELD:
         return e->op == FK_VARIANT_UNIT || e->op == FK_CONST || (e->op == FK_DECL && e->decl && e->decl->kind == D_FN);
     case E_IDENT: return e->cat == CAT_VALUE && e->decl && e->decl->kind == D_FN && e->type->kind == TY_FN;
-    case E_CALL: return e->op == CALLK_VARIANT && is_const_init(e->args.data[0]);
-    case E_BUILTIN: return e->index == BI_PTR_FROM_INT && is_const_init(e->bargs.data[1].e);
+    case E_CALL: return e->op == CALLK_VARIANT && e->args.len == 1 && is_const_init(e->args.data[0]);
+    case E_BUILTIN: return e->index == BI_PTR_FROM_INT && e->bargs.len == 2 && is_const_init(e->bargs.data[1].e);
     case E_UNARY: return e->op == TK_MINUS && is_const_init(e->a) && e->a->kind == E_FLOAT;
     default: return false;
     }
