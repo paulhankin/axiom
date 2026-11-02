@@ -53,3 +53,6 @@
 - `markdown` no longer reads freed memory when it splits text around an extended
   autolink (`www.example.com`): the link's text was copied out of the parser's buffer
   after a push that could move the buffer.
+- `pdf.read` ignores object numbers larger than the file when it rebuilds a damaged
+  cross-reference table (a stray `8000000 0 obj` made it build tables of millions of
+  entries, taking seconds).
