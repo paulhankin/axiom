@@ -48,3 +48,5 @@
   case, as Windows does: `remove_env("PATH")` left `Path` in the child.
 - `zstd.decompress` fails with `Corrupt`, instead of trapping, on a block whose table
   description ends part-way into the byte after the block.
+- `webp.decode` fails with `Corrupt`, instead of trapping, on a file whose RIFF size is
+  smaller than its header.
