@@ -1,0 +1,121 @@
+// =============================================================================
+// std/internal/runtime/coverage.ax - the coverage runtime of native Linux
+// programs built with --coverage=afl (spec §16.9), in the coverage map
+// protocol a fuzzer uses.
+//
+// The compiler counts each edge between blocks in `area`, a 64 KiB map
+// (cmd/axiom/src/cover.ax): area[cur ^ prev] += 1, then prev = cur >> 1. Until
+// a fuzzer gives it a map of its own the counters go to `dummy`, so an
+// instrumented program runs as usual outside of one. ax_cov_init, called at
+// the start of main (before the program's own main), attaches the fuzzer's
+// map (shared memory named by __AFL_SHM_ID) and, under a fork server (one
+// listening on file descriptors 198 and 199), becomes the fork server: for
+// each run it is asked for, it forks a child that goes on to run the program
+// and reports the child's process id and wait status. This module is not
+// instrumented, like the rest of the runtime.
+// =============================================================================
+import "linux.ax" as sys;
+
+// (the map's size, a power of two: block numbers are below it)
+pub let mut dummy: [65536]u8 = [0; 65536];
+// The map the counters go to: the compiler makes it point at dummy.
+pub let mut area: *mut u8 = @ptr_from_int(*mut u8, 0);
+// The previous block's number, shifted right by one.
+pub let mut prev: usize = 0;
+
+// shmat: [x86-64, AArch64]
+let SYS_SHMAT: [2]i64 = [30, 196];
+// The fork server's control (requests) and status (replies) descriptors.
+const FD_CONTROL: i32 = 198;
+const FD_STATUS: i32 = 199;
+// (with the terminating NUL: a fuzzer looks for the name in the executable)
+let SHM_VAR: []u8 = "__AFL_SHM_ID\x00";
+
+fn shm_id(s: []u8) isize {
+    if (s.len == 0) or (s.len > 10) {
+        return -1;
+    }
+    let mut v: isize = 0;
+    for c in s {
+        if (c < '0') or (c > '9') {
+            return -1;
+        }
+        v = (v * 10) + @as(isize, c - '0');
+    }
+    return v;
+}
+
+// The fuzzer's map, if it names one.
+fn attach() void {
+    let id = shm_id(sys.getenv(SHM_VAR[0..SHM_VAR.len - 1]));
+    if id < 0 {
+        return;
+    }
+    let mut nr = SYS_SHMAT[0];
+    if sys.axiom_target_arch() == 2 {
+        nr = SYS_SHMAT[1];
+    }
+    let r = sys.ax_syscall(nr, @bit_cast(usize, id), 0, 0, 0, 0, 0);
+    if (r < 0) and (r > -4096) {
+        return;  // (keep the dummy map)
+    }
+    area = @ptr_from_int(*mut u8, @bit_cast(usize, r));
+}
+
+fn put32(fd: i32, v: u32) bool {
+    let b = v;
+    return sys.write(fd, @ptr_cast(*u8, &b), 4) == 4;
+}
+
+// Reads 4 bytes (retrying after interruptions); false at the end or on an error.
+fn get32(fd: i32) bool {
+    let mut b: u32 = 0;
+    loop {
+        let r = sys.read(fd, @ptr_cast(*mut u8, &mut b), 4);
+        if r == -sys.EINTR {
+            continue;
+        }
+        return r == 4;
+    }
+}
+
+// Runs before the program's main.
+export fn ax_cov_init() void {
+    attach();
+    // a fork server is listening if it takes the hello
+    if not put32(FD_STATUS, 0) {
+        return;
+    }
+    loop {
+        if not get32(FD_CONTROL) {
+            sys.exit(0);  // (the fuzzer is done)
+        }
+        let pid = sys.fork();
+        if pid < 0 {
+            sys.exit(1);
+        }
+        if pid == 0 {
+            _ = sys.close(FD_CONTROL);
+            _ = sys.close(FD_STATUS);
+            prev = 0;
+            return;  // run the program
+        }
+        let child = @truncate(i32, pid);
+        if not put32(FD_STATUS, @bit_cast(u32, child)) {
+            sys.exit(1);
+        }
+        let mut status: i32 = 0;
+        loop {
+            let r = sys.wait4(child, &mut status, 0);
+            if r != -sys.EINTR {
+                if r < 0 {
+                    sys.exit(1);
+                }
+                break;
+            }
+        }
+        if not put32(FD_STATUS, @bit_cast(u32, status)) {
+            sys.exit(1);
+        }
+    }
+}

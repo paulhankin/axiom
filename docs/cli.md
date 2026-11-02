@@ -134,6 +134,7 @@ that lacks the extensions it was built with.
 | `--overflow=wrap\|trap\|saturate` | Integer overflow mode (spec §7.6; default `wrap`). |
 | `--stack-traces=on\|off` | Record call sites for crash traces and profiles (default on; spec §16.4). |
 | `--sanitize=address\|none` | Check heap accesses: use after free, double free, overflows, leaks (spec §16.8). |
+| `--coverage=afl\|none` | Native Linux targets: edge coverage counters for a coverage-guided fuzzer, and its fork server (spec §16.9; default `none`). |
 | `-g`, `--debug-info=lines\|none` | DWARF line tables (a compile unit per object, a subprogram per function, a line and column per instruction, inlined functions included), for `perf annotate`, debuggers and `addr2line -i`. Off by default at every optimization level: stack traces need no debug information. Today only the bootstrap compiler's LLVM backend emits them; the compiler's own backends accept the option and emit none. |
 | `--release` | Accepted for compatibility; changes nothing. |
 | `--units=module\|program` | Compile modules separately and cache them, or the program as one unit (default: `module` at `-O0`/`-O1`, `program` at `-O2`/`-O3`). |

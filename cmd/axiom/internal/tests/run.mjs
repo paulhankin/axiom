@@ -743,6 +743,50 @@ await section('spec §16.3', {
       const c = spawnSync(compiler, ['test', path.join(root, 'cmd/axiom/src/version.ax'), ...targetFlags], { encoding: 'utf8' });
       return c.status === 0 && /\n\d+ passed, 0 failed/.test(c.stdout) ? null : `${c.stdout}${c.stderr}`;
     },
+    // --coverage=afl (spec §16.9): an instrumented program runs as usual, and
+    // under afl-showmap (when installed) its two inputs, taking different
+    // branches, cover different edges.
+    '--coverage=afl: runs as usual, and afl-showmap sees the branches': () => {
+      if (isBootstrap()) return { skip: true, reason: 'the compiler only' };
+      if (process.platform !== 'linux' || !['x64', 'arm64'].includes(process.arch) || process.env.AXIOM_NATIVE_TARGET) {
+        return { skip: true, reason: 'a Linux host, not cross testing' };
+      }
+      prepare();
+      const f = path.join(dir, 'cov.ax');
+      fs.writeFileSync(f, [
+        'import "std/io" as io;', 'import "std/os" as os;', '',
+        'fn classify(s: []u8) []u8 {',
+        '    if (s.len > 1) and (s[0] == \'a\') and (s[1] == \'b\') {', '        return "ab";', '    }',
+        '    let mut n: usize = 0;', '    for c in s {', '        if c == \'x\' {', '            n += 1;', '        }', '    }',
+        '    if n > 2 {', '        return "many";', '    }', '    return "other";', '}', '',
+        'export fn main() i32 {', '    let s = os.arg(1) catch return 1;',
+        '    io.stdout().write_all(classify(s)) catch return 1;', '    return 0;', '}', ''].join('\n'));
+      const o = path.join(dir, 'cov');
+      const c = spawnSync(compiler, ['build', f, '--coverage=afl', '-o', o, '--target=native', ...extraFlags], { encoding: 'utf8' });
+      if (c.status) return c.stderr;
+      for (const [arg, want] of [['ab', 'ab'], ['xxxx', 'many']]) {
+        const r = spawnSync(o, [arg], { encoding: 'utf8' });
+        if (r.status !== 0 || r.stdout !== want) return `${arg}: status ${r.status}: ${r.stdout}${r.stderr}`;
+      }
+      if (spawnSync('afl-showmap', ['-h']).error) return { skip: true, reason: 'ran; no afl-showmap to check the coverage' };
+      const edges = [];
+      for (const arg of ['ab', 'xxxx']) {
+        const m = path.join(dir, `cov-${arg}.map`);
+        const r = spawnSync('afl-showmap', ['-q', '-o', m, '--', o, arg], { encoding: 'utf8', timeout: 60000 });
+        if (r.status !== 0 || !fs.existsSync(m)) return `afl-showmap ${arg}: status ${r.status}: ${r.stdout}${r.stderr}`;
+        edges.push(new Set(fs.readFileSync(m, 'utf8').split('\n').filter((l) => l).map((l) => l.split(':')[0])));
+      }
+      if (edges[0].size < 10 || edges[1].size < 10) return `few edges: ${edges[0].size}, ${edges[1].size}`;
+      const only = (a, b) => [...a].filter((e) => !b.has(e)).length;
+      return only(edges[0], edges[1]) && only(edges[1], edges[0]) ? null : 'both inputs cover the same edges';
+    },
+    '--coverage=afl for wasm32 is E9001': () => {
+      if (isBootstrap()) return { skip: true, reason: 'the compiler only' };
+      prepare();
+      const c = spawnSync(compiler, ['build', src, '--coverage=afl', '--target=wasm32', '--format=agent-json', '-o', path.join(dir, 'x.wasm')],
+        { encoding: 'utf8' });
+      return c.status === 2 && /"E9001".*--coverage=afl is not supported/.test(c.stdout) ? null : `${c.status}: ${c.stdout}${c.stderr}`;
+    },
     'unknown target is E9002': () => {
       prepare();
       const c = spawnSync(compiler, ['build', src, '--target=vax', '--format=agent-json', '-o', path.join(dir, 'x')], { encoding: 'utf8' });

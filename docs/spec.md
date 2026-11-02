@@ -2380,7 +2380,7 @@ axiom update [<version> | latest | head]         # replace the toolchain with an
 
 Every command accepts `--format=human` (the default) or `--format=agent-json` (§16.2)
 and `--std=<dir>`. `--target` names a target of §14; `--cpu` and `--features` select
-processor extensions (§13.4); `--sanitize=address` is §16.8. `--overflow` selects the
+processor extensions (§13.4); `--sanitize=address` is §16.8, `--coverage` §16.9. `--overflow` selects the
 overflow mode (§7.6): `wrap`, the default, is the language's meaning; `trap` checks
 every `+`, `-`, `*`, unary `-`, `MIN / -1` and `@abs` on integers and traps (`T0002`) on
 overflow, to find unintended overflows; `saturate` clamps. The remaining options
@@ -2961,6 +2961,31 @@ looks its shadow byte up inline and calls into `std/mem.ax` only when that test 
 programs typically run three to four times slower, and use more memory. In code,
 `@sanitize_address()` is a constant: whether the program is being built with the
 sanitizer.
+
+### 16.9 Coverage for fuzzing
+
+`--coverage=afl` (accepted by `build`, `test` and `profile`; `--coverage=none` is the
+default) builds a program a coverage-guided fuzzer can run, in the coverage map
+protocol such fuzzers use. It is supported for native Linux targets (`x86_64`,
+`aarch64`, and `native` on Linux); for other targets it is an error (`E9001`).
+
+- After optimization, the compiler adds an edge counter at the start of every basic
+  block of every function but the runtime's (`std/internal/runtime/`): with `cur` the
+  block's number below 65536, `map[cur ^ prev] += 1` (wrapping, a byte per entry), then
+  `prev = cur >> 1`. A block's number is a hash of its function's symbol and its
+  position in the function, so the same build gives the same numbers. The counters do
+  not change what the optimizer does to the program's own code.
+- The map is the runtime's own 64 KiB until the program starts. Before the program's
+  `main` (§14), the coverage runtime (`std/internal/runtime/coverage.ax`) attaches the
+  shared memory named by the environment variable `__AFL_SHM_ID`, if set, as the map;
+  then, if a fork server listens on file descriptors 198 and 199 (a 4-byte hello on 199
+  succeeds), it serves it: for each 4-byte request on 198 it forks a child, which runs
+  the program, and replies with the child's process id and then its wait status. Run
+  outside a fuzzer, an instrumented program behaves as the uninstrumented one.
+
+Programs and their tests run slower: a few instructions per block, typically 1.3 to 2
+times the time. `prev` is one per program, not per thread, so
+the edges of threads running at the same time mix.
 
 ## 17. Testing
 

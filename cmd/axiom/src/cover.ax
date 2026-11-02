@@ -1,0 +1,81 @@
+// =============================================================================
+// cover.ax - coverage counters (--coverage=afl): at the start of every block
+// of a function, after its phis, the edge-coverage sequence of the coverage
+// map protocol a fuzzer uses:
+//
+//   cur = <the block's number, 0 .. 65535>
+//   area[cur ^ prev] += 1     (wrapping)
+//   prev = cur >> 1
+//
+// with area and prev the coverage runtime's globals
+// (std/internal/runtime/coverage.ax: Module.cov_area, Module.cov_prev). A
+// block's number is a hash of its function's symbol and its index in the
+// function, so builds are reproducible. It runs once the optimizer is done
+// with the function (passes.finish_funcs), so that the counters change
+// nothing it does, in each part of a program compiled in parts too.
+// =============================================================================
+import "ir.ax" as ir;
+import "util.ax" as u;
+
+// FNV-1a of the function's symbol, then the block's index, folded to 16 bits.
+fn block_id(fh: u64, k: u64) u64 {
+    let mut h = fh;
+    for sh in [@as(u32, 0), 8, 16, 24] {
+        h = (h ^ ((k >> sh) & 0xFF)) *% 0x100_0000_01B3;
+    }
+    h ^= h >> 29;
+    h = h *% 0xBF58_476D_1CE4_E5B9;
+    h ^= h >> 32;
+    return (h ^ (h >> 16)) & 0xFFFF;
+}
+
+fn name_hash(s: []u8) u64 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for c in s {
+        h = (h ^ @as(u64, c)) *% 0x100_0000_01B3;
+    }
+    return h;
+}
+
+// The first instruction of b that is neither a phi nor (in the entry block)
+// an alloca: where its counter goes.
+fn insert_point(b: *mut ir.Block, entry: bool) *mut ir.Value {
+    let mut i = b.first;
+    while u.notnil(i) and ((i.op == ir.OP_PHI) or (entry and (i.op == ir.OP_ALLOCA))) {
+        i = i.next;
+    }
+    return i;
+}
+
+// Adds the counters to f's blocks.
+pub fn instrument(m: *mut ir.Module, f: *mut ir.Func) void {
+    let area = m.cov_area;
+    let prev = m.cov_prev;
+    if u.isnil(area) or u.isnil(prev) or ir.is_decl(f) {
+        return;
+    }
+    let isz = ir.isz();
+    let t8 = ir.t_int(8);
+    let fh = name_hash(f.name);
+    let bd = ir.new_builder();
+    let saved = ir.cur_src;
+    let mut k: u64 = 0;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let at = insert_point(b, b == f.first);
+        if u.notnil(at) {
+            ir.cur_src = at.src;
+            ir.at_before(bd, at);
+            let cur = block_id(fh, k);
+            let pv = ir.load(bd, isz, prev);
+            let map = ir.load(bd, ir.t_ptr(), area);
+            let p = ir.ptradd(bd, map, ir.xor(bd, pv, ir.cint(isz, cur)));
+            let n = ir.load(bd, t8, p);
+            _ = ir.store(bd, ir.add(bd, n, ir.cint(t8, 1)), p);
+            _ = ir.store(bd, ir.cint(isz, cur >> 1), prev);
+        }
+        k += 1;
+        b = b.next;
+    }
+    ir.cur_src = saved;
+}

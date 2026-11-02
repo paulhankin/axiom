@@ -45,6 +45,7 @@ pub struct CgOptions {
     stack_traces: bool,      // shadow stack for traces and profiles (--stack-traces=on, default)
     profile: bool,           // axiom profile: the shadow stack is sampled concurrently
     sanitize_address: bool,  // --sanitize=address: heap accesses are checked (spec §16.8)
+    coverage: bool,          // --coverage=afl: coverage counters in every block (cover.ax)
     unit: i32,
     module: *mut ast.Module,  // CG_MODULE
 }
@@ -1748,6 +1749,9 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
         set_linkage(g, ir.LINK_INTERNAL);
     }
     set_init(g, gen_const(d.init, t));
+    if O.coverage and is_cov_decl(d, "area") {
+        set_init(g, cov_global("dummy"));  // (no constant expression says this)
+    }
     if not d.is_mut {
         ir.gv_of(g).is_const = true;
     }
@@ -4090,6 +4094,33 @@ fn asan_on() bool {
     return not u.str_eq(f, "std/mem.ax") and not u.starts(f, "std/internal/runtime/");
 }
 
+// --coverage=afl: the functions with coverage counters (cover.ax), all but
+// the runtime's (std/internal/runtime/, which has the coverage runtime).
+fn cov_on(m: *ast.Module) bool {
+    if not O.coverage or u.isnil(m) {
+        return false;
+    }
+    return not u.starts(u.file_of(m.file.id).display, "std/internal/runtime/");
+}
+
+fn is_cov_decl(d: *ast.Decl, name: []u8) bool {
+    return u.str_eq(d.name, name) and u.notnil(d.module) and
+           u.ends(u.file_of(d.module.file.id).display, "std/internal/runtime/coverage.ax");
+}
+
+// A global of the coverage runtime (std/internal/runtime/coverage.ax).
+fn cov_global(name: []u8) *mut ir.Value {
+    let P = sema.g_prog;
+    for i in 0..P.globals.len {
+        let d = P.globals.get(i);
+        if is_cov_decl(d, name) {
+            return global_addr(d);
+        }
+    }
+    internal_error(u.f1("std/internal/runtime/coverage.ax has no %s (is --std right?)", name));
+    return u.nil.[ir.Value]();
+}
+
 fn mem_fn(name: []u8) *mut FnInst {
     let P = sema.g_prog;
     for i in 0..P.fns.len {
@@ -5333,6 +5364,7 @@ fn gen_fn_body_of(fi: *mut FnInst) void {
     // code before its body's first statement)
     set_span(d.name_span);
     ir.fnp_of(fi.fnv).src = ir.cur_src;
+    ir.fnp_of(fi.fnv).coverage = cov_on(d.module);
     stt.no_trace = is_runtime_module(d.module);
     stt.locals = u.newn.[*mut ir.Value](d.locals.len + 1);
     let saved = F;
@@ -5567,6 +5599,9 @@ fn emit_native_entry() void {
         _ = call(aty, ir.add_function(M, "ax_rt_args", aty).val, aargs[..]);
     }
     call_runtime("ax_rt_init");
+    if O.coverage {
+        call_runtime("ax_cov_init");  // (attaches the fuzzer's map, runs its fork server)
+    }
     if O.profile {
         call_runtime("ax_profile_start");
     }
@@ -5625,6 +5660,10 @@ pub fn codegen_program(o: *mut CgOptions) bool {
     T_f64 = ir.t_float(64);
     T_v128 = ir.t_vec(T_i32, 4);
 
+    if O.coverage {
+        M.cov_area = cov_global("area");
+        M.cov_prev = cov_global("prev");
+    }
     let program_parts = O.unit != CG_MODULE;
     if program_parts and ty.g_target.is_wasm and g_threads {
         emit_thread_start();
