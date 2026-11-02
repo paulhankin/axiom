@@ -628,6 +628,7 @@ fn resolve_type(te: *mut ast.TypeExpr, tc: *mut TypeCtx) *mut ast.Type {
     match te.shape {
         .Prim(p) => { return ty.type_prim(p); }
         .Error   => { return ty.t_error; }
+        .Invalid => { return ty.t_invalid; }
         .SelfType => {
             if u.isnil(tc.self_) {
                 _ = dg.err(te.span, "E0205", "'Self' is only available inside a struct or union");
@@ -990,7 +991,7 @@ fn resolve_fn(d: *mut ast.Decl) void {
             _ = dg.err(d.name_span, "E0466", u.f1("%s functions cannot be generic", what));
         }
         for i in 0..d.params.len {
-            if not boundary_type_ok(d.param_types[i], false) {
+            if not boundary_type_ok(d.param_types[i], false) and (d.param_types[i].kind != ast.TY_INVALID) {
                 _ = dg.err(d.params.at(i).te.span, "E0801", u.f3("type %s is not allowed at the %s function boundary%s",
                                                                  tstr(d.param_types[i]), what,
                                                                  fn_type_hint(d.param_types[i])));
@@ -1262,6 +1263,9 @@ fn expected_set(t: *mut ast.Type) *mut ast.Decl {
     return dnil();
 }
 
+// The function E0355 was last reported for.
+let mut g_self_dep: *mut ast.Decl = @ptr_from_int(*mut ast.Decl, 0);
+
 fn resolve_decl(d: *mut ast.Decl) void {
     if d.state == 2 {
         return;
@@ -1271,6 +1275,9 @@ fn resolve_decl(d: *mut ast.Decl) void {
             _ = dg.err(d.name_span, "E0351", u.f1("constant '%s' depends on itself", d.name));
         } else if d.kind == ast.D_ERROR {
             _ = dg.err(d.name_span, "E0654", u.f1("error set '%s' includes itself", d.name));
+        } else if ((d.kind == ast.D_FN) or (d.kind == ast.D_HOST_FN)) and (d != g_self_dep) {
+            _ = dg.err(d.name_span, "E0355", u.f1("the signature of function '%s' depends on itself", d.name));
+            g_self_dep = d;  // (once, however often its signature calls it)
         }
         return;
     }
@@ -2949,6 +2956,11 @@ fn check_all_args(e: *mut ast.Expr) void {
 fn check_direct_call(e: *mut ast.Expr, callee: *mut ast.Expr, method: bool) *mut ast.Type {
     let f = ast.decl_of(callee);
     resolve_decl(f);
+    if f.state != 2 {
+        // (a call in the function's own signature, E0355: its parameters are not known yet)
+        check_all_args(e);
+        return set_ty(e, ty.t_invalid);
+    }
     if method and (f.self_kind == ast.SELF_NONE) {
         _ = dg.err(callee.span, "E0421", u.f3("'%s' has no 'self' parameter; call it as %s.%s(...)", f.name,
                                               f.owner.name, f.name));

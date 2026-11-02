@@ -301,6 +301,7 @@ TokenVec lex_file(SourceFile *f) {
         L.pos = 3;
     }
     check_source_text(&L);
+    Diag *bad = NULL;  // the last "unexpected character"
     for (;;) {
         skip_ws(&L);
         if (L.pos >= L.len) break;
@@ -446,7 +447,10 @@ TokenVec lex_file(SourceFile *f) {
         if (!matched) {
             uint32_t e = L.pos + 1;
             while (e < L.len && ((unsigned char)L.s[e] & 0xC0) == 0x80) e++;
-            diag_error(mkspan(&L, start, e), "E0002", "unexpected character");
+            if (bad && bad->span.end == start)
+                bad->span.end = e;  // (a run of them: one error)
+            else
+                bad = diag_error(mkspan(&L, start, e), "E0002", "unexpected character");
             L.pos = e;
         }
     }

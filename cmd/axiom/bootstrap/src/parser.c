@@ -203,7 +203,7 @@ static TypeExpr *parse_type_in(Parser *P);
 static TypeExpr *parse_type(Parser *P) {
     if (!enter(P)) {
         leave(P);
-        return new_te(TE_ERROR, peek(P)->span);
+        return new_te(TE_INVALID, peek(P)->span);
     }
     TypeExpr *te = parse_type_in(P);
     leave(P);
@@ -350,7 +350,7 @@ static TypeExpr *parse_type_in(Parser *P) {
     }
     default:
         syntax_error(P, "type");
-        return new_te(TE_ERROR, start);
+        return new_te(TE_INVALID, start);
     }
 }
 

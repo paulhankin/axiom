@@ -25,6 +25,7 @@ typedef enum TEKind {
     TE_ANON_STRUCT,
     TE_ERRUNION,
     TE_ERROR,
+    TE_INVALID,  // what the parser makes of a type it could not read (reported already)
     TE_SELF,
     TE_INTLIT,     // generic const argument, or an array length
     TE_CONSTEXPR,  // an array length that is a constant expression

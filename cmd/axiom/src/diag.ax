@@ -53,6 +53,11 @@ fn diag_new(sev: i32, sp: u.Span, code: []u8, msg: []u8) *mut Diag {
     d.code = code;
     d.msg = trunc(msg);
     d.seq = diags.len;
+    // (about the parser's name for one it did not find, after the error that
+    // said so: made, for its caller to add notes to, but not shown)
+    if u.contains(d.msg, "'<error>'") {
+        return d;
+    }
     diags.push(d);
     if sev == SEV_ERROR {
         nerrors += 1;
@@ -310,6 +315,11 @@ fn context_line(sp: u.Span) []u8 {
     while (s < e) and ((t[s] == ' ') or (t[s] == '\t')) {
         s += 1;
     }
+    // (up to a NUL byte, if the line has one)
+    let z = u.find(t[s..e], 0);
+    if z >= 0 {
+        e = s + @int_cast(usize, z);
+    }
     return u.dup(t[s..e]);
 }
 
@@ -324,14 +334,19 @@ fn sev_name(s: i32) []u8 {
 }
 
 // Writes all diagnostics, sorted, to stdout (to_stdout) or stderr.
+// At most this many diagnostics are shown (the first, in order), so that
+// a file of garbage does not make the compiler print without end.
+const MAX_SHOWN: usize = 1000;
+
 pub fn emit(json: bool, to_stdout: bool) void {
     u.sort(diags.items(), diag_cmp);
+    let shown = @min(diags.len, MAX_SHOWN);
     let mut b = u.Buf.init();
     if json {
         b.s("{\"schema\":\"axiom-diagnostics/1\",\"status\":\"");
         b.s(u.pick(nerrors != 0, "error", "ok"));
         b.s("\",\"diagnostics\":[");
-        for i in 0..diags.len {
+        for i in 0..shown {
             let d = diags.get(i);
             if i != 0 {
                 b.c(',');
@@ -398,9 +413,13 @@ pub fn emit(json: bool, to_stdout: bool) void {
             b.s("]}");
         }
         b.s(u.pick(diags.len != 0, "\n", ""));
-        b.s("]}\n");
+        b.s("]");
+        if shown < diags.len {
+            b.s(u.f1(",\"omitted\":%s", u.zdec(diags.len - shown)));
+        }
+        b.s("}\n");
     } else {
-        for i in 0..diags.len {
+        for i in 0..shown {
             let d = diags.get(i);
             let lc = u.span_linecol(d.span);
             b.s(u.f5("%s:%s:%s: %s[%s]: ", u.file_of(d.span.file).display, u.idec(lc.sl), u.idec(lc.sc),
@@ -427,6 +446,9 @@ pub fn emit(json: bool, to_stdout: bool) void {
                 let f = d.fixes.get(j);
                 b.s(u.f2("  fix (%s): %s\n", f.applicability, f.description));
             }
+        }
+        if shown < diags.len {
+            b.s(u.f1("axiom: %s more diagnostics not shown\n", u.zdec(diags.len - shown)));
         }
     }
     let text = b.done();

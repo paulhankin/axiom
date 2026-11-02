@@ -982,6 +982,41 @@ await section('', {
   await section('nesting limit', cases, { timed: false });
 }
 
+// Garbage in: a run of characters that are not Axiom is one E0002; the
+// parser's placeholder for a missing name leads to no more errors (it is
+// not "already declared", does not "shadow"); and at most 1000 diagnostics
+// are shown, with the number left out (spec §16.3). The compilers took
+// seconds and printed hundreds of megabytes for files like these.
+{
+  const cases = {};
+  const check = (src, name) => {
+    const f = path.join(tmp, `garbage-${name}.ax`);
+    fs.writeFileSync(f, src);
+    const t0 = Date.now();
+    const c = spawnSync(compiler, ['check', f, '--format=agent-json'], { encoding: 'utf8', maxBuffer: 1 << 26 });
+    try { return { j: JSON.parse(c.stdout), ms: Date.now() - t0 }; } catch { return { err: `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`.slice(0, 2000) }; }
+  };
+  cases['a run of control characters is one error'] = () => {
+    const r = check(`fn f() u64 {\n    return 3;\n}\n${'\x1b'.repeat(20000)}\n`, 'run');
+    if (r.err) return r.err;
+    const codes = r.j.diagnostics.map((x) => x.code);
+    return codes.length === 1 && codes[0] === 'E0002' ? null : `diagnostics: ${codes.slice(0, 20).join(', ')} (${codes.length})`;
+  };
+  cases['no errors about the placeholder for a missing name'] = () => {
+    const r = check(`export fn f(${','.repeat(600)}) void {\n    let = 1;\n    let = 2;\n}\n`, 'names');
+    if (r.err) return r.err;
+    const bad = r.j.diagnostics.filter((x) => x.message.includes('<error>') || x.code === 'E0801');
+    return bad.length === 0 ? null : `${bad.length} cascading: ${bad[0].code} ${bad[0].message}`;
+  };
+  cases['at most 1000 diagnostics are shown'] = () => {
+    const r = check(`fn f() void {\n${'    x;\n'.repeat(3000)}}\n`, 'many');
+    if (r.err) return r.err;
+    const n = r.j.diagnostics.length;
+    return n === 1000 && r.j.omitted === 2000 ? null : `${n} shown, omitted ${r.j.omitted}`;
+  };
+  await section('garbage in', cases, { timed: false });
+}
+
 // `axiom fmt` (spec §16.5; the compiler only, not the bootstrap one). Each
 // cmd/axiom/internal/tests/fmt/<name>.ax formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left

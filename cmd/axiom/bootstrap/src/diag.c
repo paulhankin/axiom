@@ -15,6 +15,9 @@ static Diag *diag_new(int sev, Span sp, const char *code, const char *fmt, va_li
     vsnprintf(buf, sizeof buf, fmt, ap);
     d->msg = arena_strndup(buf, strlen(buf));
     d->seq = diags.len;
+    // (about the parser's name for one it did not find, after the error that
+    // said so: made, for its caller to add notes to, but not shown)
+    if (strstr(d->msg, "'<error>'")) return d;
     vec_push(diags, d);
     if (sev == SEV_ERROR) nerrors++;
     return d;
@@ -229,17 +232,25 @@ static char *context_line(Span sp) {
     while (s > 0 && f->text[s - 1] != '\n') s--;
     while (e < f->len && f->text[e] != '\n' && f->text[e] != '\r') e++;
     while (s < e && (f->text[s] == ' ' || f->text[s] == '\t')) s++;
+    // (up to a NUL byte, if the line has one)
+    const char *z = memchr(f->text + s, 0, e - s);
+    if (z) e = (uint32_t)(z - f->text);
     return arena_strndup(f->text + s, e - s);
 }
 
 static const char *sev_name(int s) { return s == SEV_ERROR ? "error" : s == SEV_WARNING ? "warning" : "note"; }
 
+// At most this many diagnostics are shown (the first, in order), so that
+// a file of garbage does not make the compiler print without end.
+#define MAX_SHOWN 1000
+
 void diag_emit(bool json, FILE *out) {
     if (diags.len) qsort(diags.data, (size_t)diags.len, sizeof(Diag *), diag_cmp);
+    int shown = diags.len < MAX_SHOWN ? diags.len : MAX_SHOWN;
     if (json) {
         fprintf(out, "{\"schema\":\"axiom-diagnostics/1\",\"status\":\"%s\",\"diagnostics\":[",
                 nerrors ? "error" : "ok");
-        for (int i = 0; i < diags.len; i++) {
+        for (int i = 0; i < shown; i++) {
             Diag *d = diags.data[i];
             if (i) fputc(',', out);
             fprintf(out, "\n  {\"code\":");
@@ -291,10 +302,12 @@ void diag_emit(bool json, FILE *out) {
             }
             fprintf(out, "]}");
         }
-        fprintf(out, "%s]}\n", diags.len ? "\n" : "");
+        fprintf(out, "%s]", diags.len ? "\n" : "");
+        if (shown < diags.len) fprintf(out, ",\"omitted\":%d", diags.len - shown);
+        fprintf(out, "}\n");
         return;
     }
-    for (int i = 0; i < diags.len; i++) {
+    for (int i = 0; i < shown; i++) {
         Diag *d = diags.data[i];
         int sl, sc, el, ec;
         span_linecol(d->span, &sl, &sc, &el, &ec);
@@ -310,6 +323,7 @@ void diag_emit(bool json, FILE *out) {
         for (int j = 0; j < d->fixes.len; j++) fprintf(out, "  fix (%s): %s\n", d->fixes.data[j]->applicability,
                                                         d->fixes.data[j]->description);
     }
+    if (shown < diags.len) fprintf(out, "axiom: %d more diagnostics not shown\n", diags.len - shown);
 }
 
 void diag_emit_fatal(bool json, const char *code, const char *msg) {

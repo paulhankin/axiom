@@ -481,6 +481,7 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
     switch (te->kind) {
     case TE_PRIM: return type_prim(te->prim);
     case TE_ERROR: return t_error;
+    case TE_INVALID: return t_invalid;
     case TE_SELF:
         if (!tc->self) {
             diag_error(te->span, "E0205", "'Self' is only available inside a struct or union");
@@ -666,7 +667,7 @@ static void resolve_fn(Decl *d) {
         const char *what = d->is_export ? "exported" : d->extern_c ? "C" : "imported";
         if (d->gparams.len) diag_error(d->name_span, "E0466", "%s functions cannot be generic", what);
         for (int i = 0; i < d->params.len; i++)
-            if (!boundary_type_ok(d->param_types[i], false))
+            if (!boundary_type_ok(d->param_types[i], false) && d->param_types[i]->kind != TY_INVALID)
                 diag_error(d->params.data[i].te->span, "E0801", "type %s is not allowed at the %s function boundary%s",
                            type_str(d->param_types[i]), what, fn_type_hint(d->param_types[i]));
         if (!boundary_type_ok(d->ret_type, true))
@@ -857,6 +858,9 @@ Decl *expected_set(Type *t) {
     return NULL;
 }
 
+// The function E0355 was last reported for.
+static Decl *self_dep;
+
 void resolve_decl(Decl *d) {
     if (d->state == 2) return;
     if (d->state == 1) {
@@ -864,6 +868,10 @@ void resolve_decl(Decl *d) {
             diag_error(d->name_span, "E0351", "constant '%s' depends on itself", d->name);
         else if (d->kind == D_ERROR)
             diag_error(d->name_span, "E0654", "error set '%s' includes itself", d->name);
+        else if ((d->kind == D_FN || d->kind == D_HOST_FN) && d != self_dep) {
+            diag_error(d->name_span, "E0355", "the signature of function '%s' depends on itself", d->name);
+            self_dep = d;  // (once, however often its signature calls it)
+        }
         return;
     }
     d->state = 1;

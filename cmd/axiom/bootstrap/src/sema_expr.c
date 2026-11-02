@@ -1164,6 +1164,11 @@ static Type *check_call(Expr *e, Type *expected) {
     case CAT_METHOD: {
         Decl *fn = callee->decl;
         resolve_decl(fn);
+        if (fn->state != 2) {
+            // (a call in the function's own signature, E0355: its parameters are not known yet)
+            for (int i = 0; i < e->args.len; i++) check_expr(e->args.data[i], NULL);
+            return e->type = t_invalid;
+        }
         bool method = callee->cat == CAT_METHOD;
         if (method && fn->self_kind == SELF_NONE) {
             diag_error(callee->span, "E0421", "'%s' has no 'self' parameter; call it as %s.%s(...)", fn->name,

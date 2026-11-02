@@ -29,3 +29,10 @@ These programs were accepted and now are compile errors; the fixes are mechanica
   on it.
 - A global initialized by a union variant with no argument, or by `@ptr_from_int` with
   one, is `E0420`; both compilers crashed on it.
+- A function called in its own signature (in a parameter's type, say) is the new
+  `E0355`; the compilers crashed or ran out of stack.
+- A file of garbage no longer makes the compiler run for seconds and print hundreds of
+  megabytes: a run of characters that are not Axiom is one `E0002`, a type the parser
+  could not read leads to no more errors, nor does a name it could not read, and at
+  most 1000 diagnostics are shown, followed by how many more there were (in JSON, the
+  `omitted` member).

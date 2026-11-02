@@ -2525,6 +2525,7 @@ it does (and that both compilers emit the same codes, each asserted by a test):
 | E0352 | A `const` of a type other than integer, float, bool or enum |
 | E0353 | A `const` union value with a payload (not supported yet) |
 | E0354 | Thread-local global without `mut` |
+| E0355 | A function called in its own signature (a parameter's type, say), directly or through others |
 | E0400 | A type expected, found an integer, an expression or a constant |
 | E0401 | Nested error union `!!T` |
 | E0403 | A struct or union that contains itself by value |
