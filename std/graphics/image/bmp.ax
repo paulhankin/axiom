@@ -98,7 +98,13 @@ fn read_palette(data: []u8, pal_at: usize, pal_entry: usize, palette: []mut u32)
     }
 }
 
+/// Decodes a BMP file, of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) BmpError!image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes a BMP file, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) BmpError!image.Image {
     if not is_bmp(data) {
         return error.Corrupt;
     }
@@ -134,9 +140,7 @@ pub fn decode(data: []u8) BmpError!image.Image {
     if (width <= 0) or (h == 0) or (width > 0x7fffffff) {
         return error.Corrupt;
     }
-    if (@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS {
-        return error.Corrupt;
-    }
+    _ = opts.check(w, h)!;
     let masks = read_masks(data, hsize, compression, bpp)!;
     let fields: [4]Field = [Field.of(masks[0]), Field.of(masks[1]), Field.of(masks[2]), Field.of(masks[3])];
     let has_alpha = (masks[3] != 0) and ((bpp == 16) or (bpp == 32));
@@ -515,16 +519,19 @@ test "small files claiming big images" {
     // 16384 x 16384, 24-bit with no pixels, and RLE8 with an end of bitmap
     let mut f: [1080]u8 = [0; 1080];
     let hdr =
-        "BM\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\x00\x40\x00\x00\x00\x40\x00\x00\x01\x00\x18\x00";
+        "BM\x00\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\x00\x40\x00\x00\x00\x40\x00\x00\x01\x00\x18\x00";
     @mem_copy(f[..hdr.len], hdr);
-    @expect(corrupt(decode(f[..54])));
+    let all = image.DecodeOptions.{ max_pixels: image.MAX_PIXELS };
+    @expect(too_large(decode(f[..54])));  // past the default limit
+    @expect(corrupt(decode_with(f[..54], all)));
     f[10] = 0x36;
     f[11] = 0x04;  // after the palette
     f[28] = 8;
     f[30] = 1;
     f[1078] = 0;
     f[1079] = 1;
-    @expect(corrupt(decode(f[..])));
+    @expect(too_large(decode(f[..])));
+    @expect(corrupt(decode_with(f[..], all)));
     // 2^27 x 1 at 32 bits: the row's bits wrap a 32-bit usize to 0
     @mem_set(f[..], 0);
     @mem_copy(f[..hdr.len], hdr);
@@ -535,7 +542,24 @@ test "small files claiming big images" {
     f[22] = 1;
     f[23] = 0;
     f[28] = 32;
-    @expect(corrupt(decode(f[..118])));
+    @expect(corrupt(decode_with(f[..118], all)));
+}
+
+test "pixel limits" {
+    let mut img = image.Image.init(11, 10, 3, image.Depth.U8)!;
+    defer img.deinit();
+    let enc = encode(&img)!;
+    defer mem.free(enc);
+    @expect(too_large(decode_with(enc, image.DecodeOptions.{ max_pixels: 100 })));
+    let mut back = decode(enc)!;
+    defer back.deinit();
+    @expect_eq(back.width, 11);
+}
+
+fn too_large(r: BmpError!image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
+    img.deinit();
+    return false;
 }
 
 fn corrupt(r: BmpError!image.Image) bool {

@@ -53,18 +53,30 @@ pub struct Animation {
     }
 }
 
-/// The first frame.
+/// The first frame, of a canvas of at most image.DEFAULT_MAX_PIXELS (else
+/// TooLarge).
 pub fn decode(data: []u8) GifError!image.Image {
-    let mut a = decode_frames(data, true, image.MAX_PIXELS)!;
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// The first frame, of a canvas of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) GifError!image.Image {
+    let mut a = decode_frames(data, true, opts)!;
     let f = a.frames.get(0);
     a.frames.clear();
     a.deinit();
     return f.image;
 }
 
-/// Every frame.
+/// Every frame, of at most image.DEFAULT_MAX_PIXELS together (else TooLarge).
 pub fn decode_all(data: []u8) GifError!Animation {
-    return decode_frames(data, false, image.MAX_PIXELS)!;
+    return decode_frames(data, false, image.DecodeOptions.default())!;
+}
+
+/// Every frame, of at most opts.max_pixels together (else TooLarge): each
+/// frame is a whole canvas.
+pub fn decode_all_with(data: []u8, opts: image.DecodeOptions) GifError!Animation {
+    return decode_frames(data, false, opts)!;
 }
 
 // the data sub-blocks from i, joined; i moves past the terminator
@@ -189,8 +201,8 @@ fn paint(canvas: *mut image.Image, idx: []u8, r: [4]usize, interlaced: bool, ct:
     }
 }
 
-// limit: the pixels in all the frames
-fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
+// opts limits the pixels in all the frames
+fn decode_frames(b: []u8, first_only: bool, opts: image.DecodeOptions) GifError!Animation {
     if not is_gif(b) or (b.len < 13) {
         return error.Corrupt;
     }
@@ -199,9 +211,8 @@ fn decode_frames(b: []u8, first_only: bool, limit: usize) GifError!Animation {
     if (w == 0) or (h == 0) {
         return error.Corrupt;
     }
-    if (w * h) > image.MAX_PIXELS {
-        return error.TooLarge;
-    }
+    _ = opts.check(w, h)!;
+    let limit = opts.limit();
     let mut i: usize = 13;
     let gct = color_table(b, &mut i, b[10], b[0..0])!;
     let mut anim = Animation.{ width: w, height: h, loops: -1, frames: vec.Vec.[Frame].init() };
@@ -984,15 +995,41 @@ test "many frames" {
         d.push_str("\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00")!;
     }
     d.push(0x3b)!;
-    let mut a = decode_frames(d.bytes(), false, 64 * 64 * 100)!;
+    let mut a = decode_all_with(d.bytes(), image.DecodeOptions.{ max_pixels: 64 * 64 * 100 })!;
     @expect_eq(a.frames.len, 100);
     a.deinit();
-    let mut over = decode_frames(d.bytes(), false, 64 * 64 * 99) catch |e| {
+    let mut over = decode_all_with(d.bytes(), image.DecodeOptions.{ max_pixels: 64 * 64 * 99 }) catch |e| {
         @expect_eq(e, error.TooLarge);
         return;
     };
     over.deinit();
     @trap();
+}
+
+test "pixel limits" {
+    // a 1x1 frame on an 11 x 10 canvas
+    let small =
+        "GIF89a\x0b\x00\x0a\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+    @expect(too_large(decode_with(small, image.DecodeOptions.{ max_pixels: 100 })));
+    let mut img = decode(small)!;
+    defer img.deinit();
+    @expect_eq(img.width, 11);
+    // a canvas of 8193 x 8192, past the default limit
+    let big =
+        "GIF89a\x01\x20\x00\x20\x80\x00\x00\x00\x00\x00\xff\xff\xff\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+    @expect(too_large(decode(big)));
+    let mut a = decode_all(big) catch |e| {
+        @expect_eq(e, error.TooLarge);
+        return;
+    };
+    a.deinit();
+    @trap();
+}
+
+fn too_large(r: GifError!image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
+    img.deinit();
+    return false;
 }
 
 fn invalid(r: !image.Image) bool {

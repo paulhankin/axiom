@@ -105,7 +105,7 @@ fn cstr(data: []u8, pos: *mut usize) ExrError![]u8 {
     return rest[..n];
 }
 
-fn parse_header(data: []u8, pos: *mut usize) ExrError!Header {
+fn parse_header(data: []u8, pos: *mut usize, opts: *image.DecodeOptions) ExrError!Header {
     let mut h = Header.{
         channels: [Channel.{ name: "", kind: PixelType.HALF, target: -1 }; 16],
         nch: 0,
@@ -193,10 +193,7 @@ fn parse_header(data: []u8, pos: *mut usize) ExrError!Header {
     if not have_window or (h.nch == 0) or (compression == 256) {
         return error.Corrupt;
     }
-    let px = @mul_checked(h.width, h.height) catch return error.Corrupt;
-    if px > image.MAX_PIXELS {
-        return error.Corrupt;
-    }
+    _ = opts.check(h.width, h.height)!;
     if compression > @as(u32, @int_from_enum(Compression.PXR24)) {
         return error.Unsupported;  // B44, B44A, DWAA, DWAB
     }
@@ -204,7 +201,14 @@ fn parse_header(data: []u8, pos: *mut usize) ExrError!Header {
     return h;
 }
 
+/// Decodes an OpenEXR file, of at most image.DEFAULT_MAX_PIXELS (else
+/// TooLarge).
 pub fn decode(data: []u8) ExrError!image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes an OpenEXR file, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) ExrError!image.Image {
     if not is_exr(data) {
         return error.Corrupt;
     }
@@ -213,7 +217,7 @@ pub fn decode(data: []u8) ExrError!image.Image {
         return error.Unsupported;  // other versions, deep or multi-part
     }
     let mut pos: usize = 8;
-    let mut h = parse_header(data, &mut pos)!;
+    let mut h = parse_header(data, &mut pos, &opts)!;
     h.tiled = (flags & 0x200) != 0;
     if h.tiled and ((h.tile_w == 0) or (h.tile_h == 0)) {
         return error.Corrupt;
@@ -1368,6 +1372,30 @@ test "round trips" {
             }
         }
     }
+}
+
+test "pixel limits" {
+    let mut img = image.Image.init(11, 10, 3, image.Depth.F32)!;
+    defer img.deinit();
+    let enc = encode(&img, Options.default())!;
+    defer mem.free(enc);
+    @expect(fails_with(decode_with(enc, image.DecodeOptions.{ max_pixels: 100 }), error.TooLarge));
+    let mut back = decode(enc)!;
+    defer back.deinit();
+    @expect_eq(back.width, 11);
+    // a data window of 8193 x 8192: past the default limit, and too big for
+    // the file under MAX_PIXELS
+    let at = strs.index_of(enc, "dataWindow\x00box2i\x00")! + 21;
+    binary.put_u32_le(enc[at + 8..], 8192);
+    binary.put_u32_le(enc[at + 12..], 8191);
+    @expect(fails_with(decode(enc), error.TooLarge));
+    @expect(fails_with(decode_with(enc, image.DecodeOptions.{ max_pixels: image.MAX_PIXELS }), error.Corrupt));
+}
+
+fn fails_with(r: ExrError!image.Image, want: ExrError) bool {
+    let mut img = r catch |e| return e == want;
+    img.deinit();
+    return false;
 }
 
 test "encode_to" {

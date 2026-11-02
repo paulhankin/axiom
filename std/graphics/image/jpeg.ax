@@ -227,6 +227,7 @@ struct Decoder {
     scans: usize,
     work: usize,  // blocks visited by the scans so far
     work_limit: usize,
+    opts: image.DecodeOptions,  // the pixel limit
     // frame
     width: usize,
     height: usize,
@@ -693,9 +694,7 @@ struct Decoder {
         if s.len < (6 + (3 * self.ncomp)) {
             return error.Corrupt;
         }
-        if (self.width * self.height) > image.MAX_PIXELS {
-            return error.Corrupt;
-        }
+        _ = self.opts.check(self.width, self.height)!;
         self.hmax = 1;
         self.vmax = 1;
         for i in @as(usize, 0)..self.ncomp {
@@ -971,11 +970,18 @@ fn butterfly(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: 
 // Decoding
 // -----------------------------------------------------------------------------
 
+/// Decodes a JPEG file, of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) JpegError!image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes a JPEG file, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) JpegError!image.Image {
     if not is_jpeg(data) {
         return error.Corrupt;
     }
     let d = mem.new_zeroed.[Decoder]()!;
+    d.opts = opts;
     defer mem.destroy(d);
     for i in @as(usize, 0)..4 {
         d.comp[i].coeffs = @slice_from_ptr(@ptr_from_int(*mut i16, 2), 0);
@@ -2152,6 +2158,37 @@ test "scans that code no data" {
         img.deinit();
         @trap();
     }
+}
+
+test "pixel limits" {
+    let mut img = image.Image.init(11, 10, 3, image.Depth.U8)!;
+    defer img.deinit();
+    let enc = encode(&img, 90, Subsample.S420)!;
+    defer mem.free(enc);
+    @expect(fails_with(decode_with(enc, image.DecodeOptions.{ max_pixels: 100 }), error.TooLarge));
+    let mut back = decode(enc)!;
+    defer back.deinit();
+    @expect_eq(back.width, 11);
+    // frames of 8193 x 8192, past the default limit (but under MAX_PIXELS:
+    // then too big for the file), and of 65535 x 65535, past MAX_PIXELS
+    let all = image.DecodeOptions.{ max_pixels: image.MAX_PIXELS };
+    let sofs: [2][]u8 = ["\x08\x20\x00\x20\x01\x01\x01\x11\x00", "\x08\xff\xff\xff\xff\x01\x01\x11\x00"];
+    let raised: [2]JpegError = [error.Corrupt, error.TooLarge];
+    for k in @as(usize, 0)..2 {
+        let mut s = strs.String.init();
+        defer s.deinit();
+        s.push_str("\xff\xd8")!;
+        put_segment(&mut s, 0xc0, sofs[k])!;
+        s.push_str("\xff\xd9")!;
+        @expect(fails_with(decode(s.bytes()), error.TooLarge));
+        @expect(fails_with(decode_with(s.bytes(), all), raised[k]));
+    }
+}
+
+fn fails_with(r: JpegError!image.Image, want: JpegError) bool {
+    let mut img = r catch |e| return e == want;
+    img.deinit();
+    return false;
 }
 
 test "thin frames" {

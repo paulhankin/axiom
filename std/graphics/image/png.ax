@@ -57,7 +57,13 @@ struct Header {
 // Decoding
 // -----------------------------------------------------------------------------
 
+/// Decodes a PNG file, of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) !image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes a PNG file, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) !image.Image {
     if not is_png(data) {
         return error.Corrupt;
     }
@@ -90,7 +96,7 @@ pub fn decode(data: []u8) !image.Image {
             if have_header or (len != 13) {
                 return error.Corrupt;
             }
-            hdr = parse_header(body)!;
+            hdr = parse_header(body, &opts)!;
             have_header = true;
         } else if not have_header {
             return error.Corrupt;
@@ -209,7 +215,7 @@ pub fn decode(data: []u8) !image.Image {
     return img;
 }
 
-fn parse_header(b: []u8) PngError!Header {
+fn parse_header(b: []u8, opts: *image.DecodeOptions) PngError!Header {
     let w = @as(usize, binary.u32_be(b[0..]));
     let h = @as(usize, binary.u32_be(b[4..]));
     let depth = @as(usize, b[8]);
@@ -217,9 +223,7 @@ fn parse_header(b: []u8) PngError!Header {
     if (w == 0) or (h == 0) or (b[10] != 0) or (b[11] != 0) or (b[12] > 1) {
         return error.Corrupt;
     }
-    if (@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS {
-        return error.Corrupt;
-    }
+    _ = opts.check(w, h)!;
     let mut samples: usize = 0;
     let mut ok = false;
     if ct == 0 {
@@ -635,6 +639,28 @@ test "rows too long for a usize" {
     let mut img = decode(wide) catch return;
     img.deinit();
     @trap();
+}
+
+test "pixel limits" {
+    let mut img = image.Image.init(11, 10, 3, image.Depth.U8)!;
+    defer img.deinit();
+    let enc = encode(&img, FAST)!;
+    defer mem.free(enc);
+    @expect(too_large(decode_with(enc, image.DecodeOptions.{ max_pixels: 100 })));
+    let mut back = decode(enc)!;
+    defer back.deinit();
+    @expect_eq(back.width, 11);
+    // a header claiming 8193 x 8192 (past the default limit), with no data
+    binary.put_u32_be(enc[16..], 8193);
+    binary.put_u32_be(enc[20..], 8192);
+    binary.put_u32_be(enc[29..], deflate.crc32(0, enc[12..29]));
+    @expect(too_large(decode(enc)));
+}
+
+fn too_large(r: !image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
+    img.deinit();
+    return false;
 }
 
 test "encode_to" {

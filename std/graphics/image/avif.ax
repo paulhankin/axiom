@@ -124,6 +124,8 @@ struct File {
     idat: []u8,
     index: vec.Vec.[u64],  // (id << 32) | the item's index, sorted
     budget: u64,           // what item_data may still read
+    // the pixel limit
+    opts: image.DecodeOptions,
 
     fn deinit(self: *mut File) void {
         self.index.deinit();
@@ -159,7 +161,8 @@ struct File {
 fn parse(data: []u8) AvifError!File {
     let mut f = File.{ data: data, primary: 0, items: vec.Vec.[Item].init(), extents: vec.Vec.[Extent].init(),
                        props: vec.Vec.[Prop].init(), dimg_from: vec.Vec.[u32].init(), dimg_to: vec.Vec.[u32].init(),
-                       idat: data[..0], index: vec.Vec.[u64].init(), budget: @as(u64, data.len) * 2 };
+                       idat: data[..0], index: vec.Vec.[u64].init(), budget: @as(u64, data.len) * 2,
+                       opts: image.DecodeOptions.default() };
     parse_boxes(&mut f, data) catch |e| {
         f.deinit();
         return e;
@@ -529,7 +532,7 @@ fn decode_item(f: *mut File, it: *Item) AvifError!av1.Frame {
     }
     let data = item_data(f, it, cfg)!;
     defer mem.free(data);
-    return av1.decode(data);
+    return av1.decode(data, f.opts.limit());
 }
 
 // -----------------------------------------------------------------------------
@@ -762,9 +765,7 @@ fn picture(f: *mut File, it: *Item) AvifError!Pic {
         return Pic.{ frame: p, col: colour_of(f, it, &p) };
     }
     let g = read_grid(f, it)!;
-    if (@mul_checked(g.width, g.height) catch return error.Unsupported) > image.MAX_PIXELS {
-        return error.Unsupported;
-    }
+    _ = f.opts.check(g.width, g.height)!;
     let mut ids = vec.Vec.[u32].init();
     defer ids.deinit();
     tiles(f, it.id, &mut ids)!;
@@ -908,10 +909,18 @@ fn info_of(f: *mut File, it: *Item) AvifError!Info {
 }
 
 /// Decodes an AVIF file's primary image: gray, gray + alpha, RGB or RGBA; U8
-/// for 8-bit images, else U16.
+/// for 8-bit images, else U16. Its frames (or grid) may be at most
+/// image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) AvifError!image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes an AVIF file's primary image, of at most opts.max_pixels (else
+/// TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) AvifError!image.Image {
     let mut f = parse(data)!;
     defer f.deinit();
+    f.opts = opts;
     let pi = f.find(f.primary)!;
     let prim = f.items.get(pi);
     let info = info_of(&mut f, &prim)!;
@@ -1422,11 +1431,49 @@ test "small files claiming big images, extents and items" {
     let f4 = make_file(hi[..], ipco.bytes(), "", huge[..])!;
     defer mem.free(f4);
     let mut img4 = decode(f4) catch |e| {
-        @expect_eq(e, error.Unsupported);
+        @expect_eq(e, error.TooLarge);
         return;
     };
     img4.deinit();
     @expect(false);
+}
+
+fn too_large(r: AvifError!image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
+    img.deinit();
+    return false;
+}
+
+test "pixel limits" {
+    let mut ipco = strs.String.init();
+    defer ipco.deinit();
+    let mut tile = strs.String.init();
+    defer tile.deinit();
+    tile_of("alpha.avif", &mut ipco, &mut tile) catch return;
+    ispe_box(&mut ipco, 64, 48)!;  // 2
+    let props: [2]u8 = [1, 2];
+    let whole: [2]u32 = [0, @truncate(u32, tile.bytes().len)];
+    let one: [1]TItem = [TItem.{ id: 1, typ: "av01", props: props[..], ext: whole[..] }];
+    let ok = make_file(one[..], ipco.bytes(), "", tile.bytes())!;
+    defer mem.free(ok);
+    @expect(too_large(decode_with(ok, image.DecodeOptions.{ max_pixels: 3000 })));  // a frame of 64 x 48
+    let mut img = decode_with(ok, image.DecodeOptions.{ max_pixels: 3072 })!;
+    img.deinit();
+    // grids: of 120 x 48 (each tile within the limit), and of 8193 x 8192
+    // (past the default limit, and not covered by its tiles under MAX_PIXELS)
+    let two: [2]u16 = [2, 3];
+    let g1 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 120, 48, two[..])!;
+    defer mem.free(g1);
+    @expect(too_large(decode_with(g1, image.DecodeOptions.{ max_pixels: 5000 })));
+    let g2 = grid_file(ipco.bytes(), tile.bytes(), 1, 2, 8193, 8192, two[..])!;
+    defer mem.free(g2);
+    @expect(too_large(decode(g2)));
+    let mut img2 = decode_with(g2, image.DecodeOptions.{ max_pixels: image.MAX_PIXELS }) catch |e| {
+        @expect_eq(e, error.Corrupt);
+        return;
+    };
+    img2.deinit();
+    @trap();
 }
 
 // a grid item (1) of rows x cols tiles, the items 2, 3, ... in ids

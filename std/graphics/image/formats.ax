@@ -7,12 +7,17 @@
 //
 //     let f = formats.detect(bytes);                   // Format.PNG, ... or Format.UNKNOWN
 //     let img2 = formats.decode(bytes)!;               // or decode_from(reader)
+//     let opts = image.DecodeOptions.{ max_pixels: image.MAX_PIXELS };
+//     let img3 = formats.decode_with(bytes, opts)!;    // past the default limit
 //     let out = formats.encode(&img, formats.Format.PNG, formats.Options.default())!;
 //     formats.encode_to(w, &img, formats.Format.PNG, formats.Options.default())!;  // to an io.Writer
 //
 // Formats: PNG, JPEG, BMP, QOI, PNM (PBM, PGM, PPM, PAM, PFM), Radiance HDR,
 // OpenEXR, GIF, TIFF, WebP (lossless when writing) and AVIF (reading). HDR and EXR hold linear floating point
 // (F32) images; the others 8 or 16 bits per sample. Encoding converts as the format needs.
+// Decoding is limited to image.DEFAULT_MAX_PIXELS pixels unless given
+// DecodeOptions (decode_with, decode_from_with, load_with): past the limit it
+// fails with TooLarge.
 // =============================================================================
 
 import "../../io.ax" as io;
@@ -150,51 +155,63 @@ pub fn from_extension(path: []u8) Format {
     return Format.UNKNOWN;
 }
 
-/// Decodes an image in any supported format.
+/// Decodes an image in any supported format, of at most
+/// image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) !image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes an image in any supported format, of at most opts.max_pixels
+/// (else TooLarge): raise it, up to image.MAX_PIXELS, for files you trust.
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) !image.Image {
     let f = detect(data);
     if f == Format.PNG {
-        return png.decode(data);
+        return png.decode_with(data, opts);
     }
     if f == Format.JPEG {
-        return jpeg.decode(data);
+        return jpeg.decode_with(data, opts);
     }
     if f == Format.BMP {
-        return bmp.decode(data);
+        return bmp.decode_with(data, opts);
     }
     if f == Format.QOI {
-        return qoi.decode(data);
+        return qoi.decode_with(data, opts);
     }
     if f == Format.PNM {
-        return pnm.decode(data);
+        return pnm.decode_with(data, opts);
     }
     if f == Format.HDR {
-        return hdr.decode(data);
+        return hdr.decode_with(data, opts);
     }
     if f == Format.EXR {
-        return exr.decode(data);
+        return exr.decode_with(data, opts);
     }
     if f == Format.GIF {
-        return gif.decode(data);
+        return gif.decode_with(data, opts);
     }
     if f == Format.TIFF {
-        return tiff.decode(data);
+        return tiff.decode_with(data, opts);
     }
     if f == Format.WEBP {
-        return webp.decode(data);
+        return webp.decode_with(data, opts);
     }
     if f == Format.AVIF {
-        return avif.decode(data);
+        return avif.decode_with(data, opts);
     }
     return error.Unsupported;
 }
 
 /// Reads everything r has (an image file in any supported format) and
-/// decodes it.
+/// decodes it (of at most image.DEFAULT_MAX_PIXELS).
 pub fn decode_from(r: io.Reader) !image.Image {
+    return decode_from_with(r, image.DecodeOptions.default());
+}
+
+/// Reads everything r has and decodes it, of at most opts.max_pixels.
+pub fn decode_from_with(r: io.Reader, opts: image.DecodeOptions) !image.Image {
     let data = r.read_all()!;
     defer mem.free(data);
-    return decode(data);
+    return decode_with(data, opts);
 }
 
 /// Encodes an image (free the result with mem.free).
@@ -268,11 +285,16 @@ pub fn encode_to(w: io.Writer, img: *image.Image, format: Format, opts: Options)
     return error.Unsupported;
 }
 
-/// Reads and decodes an image file.
+/// Reads and decodes an image file (of at most image.DEFAULT_MAX_PIXELS).
 pub fn load(path: []u8) !image.Image {
+    return load_with(path, image.DecodeOptions.default());
+}
+
+/// Reads and decodes an image file, of at most opts.max_pixels.
+pub fn load_with(path: []u8, opts: image.DecodeOptions) !image.Image {
     let f = io.open(path)!;
     defer f.close();
-    return decode_from(f.reader());
+    return decode_from_with(f.reader(), opts);
 }
 
 /// Encodes an image in the format its file name's extension names, and
@@ -337,6 +359,38 @@ test "every format" {
     };
     mem.free(out);
     @expect(false);
+}
+
+fn too_large(r: !image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
+    img.deinit();
+    return false;
+}
+
+test "pixel limits" {
+    let mut img = image.Image.init(10, 6, 3, image.Depth.U8)!;
+    defer img.deinit();
+    let formats: [10]Format = [Format.PNG, Format.JPEG, Format.BMP, Format.QOI, Format.PNM, Format.HDR, Format.EXR,
+                               Format.GIF, Format.TIFF, Format.WEBP];
+    for f in formats {
+        let enc = encode(&img, f, Options.default())!;
+        defer mem.free(enc);
+        @expect(too_large(decode_with(enc, image.DecodeOptions.{ max_pixels: 59 })));
+        let mut back = decode_with(enc, image.DecodeOptions.{ max_pixels: 60 })!;
+        back.deinit();
+    }
+    // a QOI header claiming 8193 x 8192: past the default limit; within
+    // MAX_PIXELS, too big for the file
+    let big = "qoif\x00\x00\x20\x01\x00\x00\x20\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x01";
+    @expect(too_large(decode(big)));
+    let mut sr = io.SliceReader.init(big);
+    @expect(too_large(decode_from(sr.reader())));
+    let mut r = decode_with(big, image.DecodeOptions.{ max_pixels: image.MAX_PIXELS }) catch |e| {
+        @expect(e == error.Corrupt);
+        return;
+    };
+    r.deinit();
+    @trap();
 }
 
 import "../../os/fs.ax" as fs;

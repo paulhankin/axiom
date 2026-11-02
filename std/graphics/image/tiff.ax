@@ -75,6 +75,8 @@ struct File {
     data: []u8,
     be: bool,
     big: bool,  // BigTIFF
+    // the pixel limit
+    opts: image.DecodeOptions,
 
     // (callers check the bounds)
     fn u16at(self: *File, i: usize) u64 {
@@ -104,7 +106,8 @@ fn open(data: []u8) TiffError!File {
     if not is_tiff(data) {
         return error.Corrupt;
     }
-    let f = File.{ data: data, be: data[0] == 'M', big: (data[2] == 43) or (data[3] == 43) };
+    let big = (data[2] == 43) or (data[3] == 43);
+    let f = File.{ data: data, be: data[0] == 'M', big: big, opts: image.DecodeOptions.default() };
     if f.big and ((data.len < 16) or (f.u16at(4) != 8) or (f.u16at(6) != 0)) {
         return error.Corrupt;
     }
@@ -355,14 +358,25 @@ pub fn page_count(data: []u8) TiffError!usize {
     return k;
 }
 
-/// The first page.
+/// The first page, of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) !image.Image {
     return decode_page(data, 0);
 }
 
-/// Page n (from 0).
+/// The first page, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) !image.Image {
+    return decode_page_with(data, 0, opts);
+}
+
+/// Page n (from 0), of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode_page(data: []u8, n: usize) !image.Image {
-    let f = open(data)!;
+    return decode_page_with(data, n, image.DecodeOptions.default());
+}
+
+/// Page n (from 0), of at most opts.max_pixels (else TooLarge).
+pub fn decode_page_with(data: []u8, n: usize, opts: image.DecodeOptions) !image.Image {
+    let mut f = open(data)!;
+    f.opts = opts;
     let p = page_at(&f, n)!;
     return decode_ifd(&f, &p);
 }
@@ -469,10 +483,7 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
     }
     let w = @truncate(usize, p.width);
     let h = @truncate(usize, p.height);
-    let px = @mul_checked(w, h) catch return error.TooLarge;
-    if px > image.MAX_PIXELS {
-        return error.TooLarge;
-    }
+    let px = f.opts.check(w, h)!;
     let sm = read_samples(f, p)!;
     let spp = sm.spp;
     let bps = sm.bps;
@@ -519,9 +530,54 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
         esz = 2;
     }
     let raw_len = @mul_checked(@mul_checked(px, spp) catch return error.TooLarge, esz) catch return error.TooLarge;
+    let lay = Chunks.{ tiled: tiled, cw: cw, chh: chh, across: across, per_plane: per_plane, nchunks: nchunks,
+                       planes: planes, spc: spc, rowbytes: rowbytes, chunk_bytes: chunk_bytes };
+    if simple_samples(&sm) and (spp == out_channels(&sm)) {
+        // the raw samples are laid out as the image's: decode in place
+        let mut depth = image.Depth.U8;
+        if sm.float {
+            depth = image.Depth.F32;
+        } else if bps > 8 {
+            depth = image.Depth.U16;
+        }
+        let mut img = image.Image.init(w, h, spp, depth)!;
+        errdefer img.deinit();
+        read_chunks(f, p, &sm, &lay, img.data[..raw_len], w, h)!;
+        finish_simple(img.data[..raw_len], img.data, px, spp, spp, &sm)!;
+        return img;
+    }
     let raw = mem.alloc_zeroed.[u8](raw_len)!;
     defer mem.free(raw);
-    let buf = mem.alloc.[u8](@max(chunk_bytes, 1))!;
+    read_chunks(f, p, &sm, &lay, raw, w, h)!;
+    return finish(f, p, raw, w, h, &sm);
+}
+
+// How a page is cut into chunks (strips or tiles).
+struct Chunks {
+    tiled: bool,
+    cw: usize,   // a chunk's width
+    chh: usize,  // and height
+    across: usize,
+    per_plane: usize,
+    nchunks: usize,
+    planes: usize,
+    spc: usize,  // samples per pixel of a chunk
+    rowbytes: usize,
+    chunk_bytes: usize,
+}
+
+// The chunks' samples into raw (zeroed, px * spp samples): u8 up to 8 bits,
+// u16 up to 16 (and deeper integers) or f32.
+fn read_chunks(f: *File, p: *Page, sm: *Samples, lay: *Chunks, raw: []mut u8, w: usize, h: usize) !void {
+    let spp = sm.spp;
+    let bps = sm.bps;
+    let comp = p.compression;
+    let fax = (comp == 2) or (comp == 3) or (comp == 4);
+    let cw = lay.cw;
+    let chh = lay.chh;
+    let spc = lay.spc;
+    let rowbytes = lay.rowbytes;
+    let buf = mem.alloc.[u8](@max(lay.chunk_bytes, 1))!;
     defer mem.free(buf);
     let vals = mem.alloc.[u64](cw * spc)!;
     defer mem.free(vals);
@@ -536,13 +592,13 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
         fx.init()!;
     }
     let len = @as(u64, f.data.len);
-    for ci in @as(usize, 0)..nchunks {
-        let plane = ci / per_plane;
-        let rest = ci % per_plane;
-        let x0 = (rest % across) * cw;
-        let y0 = (rest / across) * chh;
+    for ci in @as(usize, 0)..lay.nchunks {
+        let plane = ci / lay.per_plane;
+        let rest = ci % lay.per_plane;
+        let x0 = (rest % lay.across) * cw;
+        let y0 = (rest / lay.across) * chh;
         let mut rows = chh;
-        if not tiled {
+        if not lay.tiled {
             rows = @min(chh, h - y0);
         }
         let off = elem(f, p.offsets, @as(u64, ci));
@@ -562,43 +618,201 @@ fn decode_ifd(f: *File, p: *Page) !image.Image {
             src = s;
         }
         let out = buf[..rowbytes * rows];
-        decompress_chunk(f, p, &fx, src, out, cw, rows, rowbytes, spc)!;
-        for r in @as(usize, 0)..rows {
+        let got = decompress_chunk(f, p, &fx, src, out, cw, rows, rowbytes, spc)!;
+        // Rows of zero bytes are zero samples (but for signed integers),
+        // which raw holds already.
+        let mut need = rows;
+        if not sm.signed {
+            need = @min(rows, (got + (rowbytes - 1)) / rowbytes);
+        }
+        need = @min(need, h - @min(h, y0));
+        let nb = @min(need * rowbytes, out.len);
+        if got < nb {
+            @mem_set(out[got..nb], 0);
+        }
+        let xn = @min(cw, w - x0);
+        let mut step: usize = 1;   // between the samples of a chunk's row in raw
+        let mut first: usize = 0;  // the first's offset from its pixel
+        if lay.planes > 1 {
+            step = spp;
+            first = plane;
+        }
+        for r in @as(usize, 0)..need {
             let y = y0 + r;
-            if y >= h {
-                break;
+            let row = out[r * rowbytes..(r + 1) * rowbytes];
+            let start = (((y * w) + x0) * spp) + first;
+            if store_row(f.be, row, raw, start, step, xn * spc, spc, sm, p.predictor) {
+                continue;
             }
-            unpack_row(f, out[r * rowbytes..(r + 1) * rowbytes], vals, spc, bps, p.predictor, tmp);
-            let xn = @min(cw, w - x0);
-            for c in @as(usize, 0)..xn {
-                let base = ((y * w) + x0 + c) * spp;
-                for s in @as(usize, 0)..spc {
-                    let v = vals[(c * spc) + s];
-                    let mut idx = base + s;
-                    if planes > 1 {
-                        idx = base + plane;
-                    }
-                    put_raw(raw, idx, v, sm.float, sm.signed, bps);
-                }
+            unpack_row(f, row, vals, spc, bps, p.predictor, tmp);
+            for j in @as(usize, 0)..xn * spc {
+                put_raw(raw, start + (j * step), vals[j], sm.float, sm.signed, bps);
             }
         }
     }
-    return finish(f, p, raw, w, h, &sm);
+}
+
+// One row of a chunk's samples straight into raw, n samples from index start,
+// step apart, as unpack_row and put_raw would, for integers of up to 16 bits;
+// false (doing nothing) for the rest.
+fn store_row(be: bool, row: []u8, raw: []mut u8, start: usize, step: usize, n: usize, spc: usize, sm: *Samples,
+             pred: u64) bool {
+    let bps = sm.bps;
+    if sm.float or (pred == 3) {
+        return false;
+    }
+    let back = step * spc;  // to the sample the predictor adds
+    if bps == 8 {
+        let mut flip: u8 = 0;
+        if sm.signed {
+            flip = 0x80;
+        }
+        if step == 1 {
+            let d = raw[start..start + n];
+            @mem_copy(d, row[..n]);
+            if (pred == 2) and (spc == 1) {
+                let mut a: u8 = 0;
+                for i in @as(usize, 0)..n {
+                    a = a +% d[i];
+                    d[i] = a;
+                }
+            } else if pred == 2 {
+                for i in spc..n {
+                    d[i] = d[i] +% d[i - spc];
+                }
+            }
+            if flip != 0 {
+                for i in @as(usize, 0)..n {
+                    d[i] ^= flip;
+                }
+            }
+            return true;
+        }
+        let mut idx = start;
+        for j in @as(usize, 0)..n {
+            let mut v = row[j];
+            if (pred == 2) and (j >= spc) {
+                v = v +% (raw[idx - back] ^ flip);
+            }
+            raw[idx] = v ^ flip;
+            idx += step;
+        }
+        return true;
+    }
+    if bps == 16 {
+        let r16 = @cast_slice(u16, raw[..(raw.len / 2) * 2]);
+        let mut flip: u16 = 0;
+        if sm.signed {
+            flip = 0x8000;
+        }
+        if step == 1 {
+            let d = r16[start..start + n];
+            if be {
+                for j in @as(usize, 0)..n {
+                    d[j] = (@as(u16, row[2 * j]) << 8) | @as(u16, row[(2 * j) + 1]);
+                }
+            } else {
+                @mem_copy(raw[2 * start..2 * (start + n)], row[..2 * n]);  // (memory is little-endian)
+            }
+            if pred == 2 {
+                for i in spc..n {
+                    d[i] = d[i] +% d[i - spc];
+                }
+            }
+            if flip != 0 {
+                for i in @as(usize, 0)..n {
+                    d[i] ^= flip;
+                }
+            }
+            return true;
+        }
+        let mut idx = start;
+        for j in @as(usize, 0)..n {
+            let mut v: u16 = 0;
+            if be {
+                v = (@as(u16, row[2 * j]) << 8) | @as(u16, row[(2 * j) + 1]);
+            } else {
+                v = @as(u16, row[2 * j]) | (@as(u16, row[(2 * j) + 1]) << 8);
+            }
+            if (pred == 2) and (j >= spc) {
+                v = v +% (r16[idx - back] ^ flip);
+            }
+            r16[idx] = v ^ flip;
+            idx += step;
+        }
+        return true;
+    }
+    if (bps == 1) or (bps == 2) or (bps == 4) {
+        // (no predictor: it needs 8 bits or more)
+        let b = @truncate(u8, bps);
+        let per = 8 / @as(usize, b);
+        let mask = @truncate(u8, (@as(u64, 1) << bps) - 1);
+        let mut flip: u8 = 0;
+        if sm.signed {
+            flip = @truncate(u8, @as(u64, 1) << (bps - 1));
+        }
+        let mut idx = start;
+        let mut j: usize = 0;
+        let mut k: usize = 0;
+        while j < n {
+            let byte = row[k];
+            k += 1;
+            let mut sh: u8 = 8;
+            for _q in @as(usize, 0)..@min(per, n - j) {
+                sh -= b;
+                raw[idx] = ((byte >> sh) & mask) ^ flip;
+                idx += step;
+            }
+            j += per;
+        }
+        return true;
+    }
+    if bps < 16 {
+        // (3, 5, 6, 7 and 9 to 15 bits, most significant first)
+        let mask = (@as(u64, 1) << bps) - 1;
+        let mut flip: u64 = 0;
+        if sm.signed {
+            flip = @as(u64, 1) << (bps - 1);
+        }
+        let r16 = @cast_slice(u16, raw[..(raw.len / 2) * 2]);
+        let mut acc: u64 = 0;
+        let mut nacc: u64 = 0;
+        let mut k: usize = 0;
+        let mut idx = start;
+        for _j in @as(usize, 0)..n {
+            while nacc < bps {
+                acc = (acc << 8) | @as(u64, row[k]);
+                k += 1;
+                nacc += 8;
+            }
+            nacc -= bps;
+            let v = ((acc >> nacc) & mask) ^ flip;
+            if bps < 8 {
+                raw[idx] = @truncate(u8, v);
+            } else {
+                r16[idx] = @truncate(u16, v);
+            }
+            idx += step;
+        }
+        return true;
+    }
+    return false;
 }
 
 // Decompresses a chunk (rows rows of cw pixels of spc samples, rowbytes to a row)
-// to out, zero filled where src runs short.
+// to out, returning the length k decoded: the rest of out is to be zero
+// filled where src runs short (out[k..] is left as it was).
 fn decompress_chunk(f: *File, p: *Page, fx: *Fax, src: []u8, out: []mut u8, cw: usize, rows: usize, rowbytes: usize,
-                    spc: usize) !void {
+                    spc: usize) !usize {
     let comp = p.compression;
-    @mem_set(out, 0);
     if comp == 1 {
         let k = @min(src.len, out.len);
         @mem_copy(out[..k], src[..k]);
+        return k;
     } else if comp == 32773 {
-        unpackbits(src, out);
+        return unpackbits(src, out);
     } else if comp == 5 {
-        _ = lzw_decode(src, out)!;
+        return lzw_decode(src, out)!;
     } else if (comp == 8) or (comp == 32946) {
         let z = deflate.decompress(src, deflate.Format.ZLIB, out.len + 65536) catch |e| {
             if e == error.OutOfMemory {
@@ -609,11 +823,15 @@ fn decompress_chunk(f: *File, p: *Page, fx: *Fax, src: []u8, out: []mut u8, cw: 
         let k = @min(z.len, out.len);
         @mem_copy(out[..k], z[..k]);
         mem.free(z);
-    } else if (comp == 2) or (comp == 3) or (comp == 4) {
+        return k;
+    }
+    @mem_set(out, 0);
+    if (comp == 2) or (comp == 3) or (comp == 4) {
         fx.decode(src, out, cw, rows, rowbytes, comp, p.t4)!;
     } else {
         jpeg_chunk(f, p, src, out, cw, rows, spc)!;
     }
+    return out.len;
 }
 
 fn reverse_bits(b: u8) u8 {
@@ -712,6 +930,133 @@ fn put_raw(raw: []mut u8, idx: usize, v: u64, float: bool, signed: bool, bps: u6
     }
 }
 
+// the image's channels
+fn out_channels(sm: *Samples) usize {
+    let mut outc: usize = 3;
+    if (sm.photo == 0) or (sm.photo == 1) {
+        outc = 1;
+    }
+    if sm.alpha != 0 {
+        outc += 1;
+    }
+    return outc;
+}
+
+// Whether each of the image's samples is a function of one raw sample (gray
+// or RGB, without a palette or premultiplied alpha): the image's are then the
+// first of the raw samples of a pixel, scaled (and gray inverted for
+// WhiteIsZero).
+fn simple_samples(sm: *Samples) bool {
+    let photo = sm.photo;
+    return ((photo == 0) or (photo == 1) or (photo == 2) or (photo == 6)) and (sm.alpha != 1);
+}
+
+// Raw samples (spp to a pixel) to the image's o (outc to a pixel, outc <=
+// spp), for simple_samples. o may be raw itself.
+fn finish_simple(raw: []u8, o: []mut u8, px: usize, spp: usize, outc: usize, sm: *Samples) TiffError!void {
+    let bps = sm.bps;
+    let invert = sm.photo == 0;  // (then the first sample is gray)
+    let same = @int_from_ptr(raw.ptr) == @int_from_ptr(o.ptr);
+    if sm.float {
+        let r32 = @cast_slice(f32, raw[..(px * spp) * 4]);
+        let o32 = @cast_slice(f32, o[..(px * outc) * 4]);
+        if not same {
+            for i in @as(usize, 0)..px {
+                for k in @as(usize, 0)..outc {
+                    o32[(i * outc) + k] = r32[(i * spp) + k];
+                }
+            }
+        }
+        if invert {
+            for i in @as(usize, 0)..px {
+                o32[i * outc] = 1.0 - r32[i * spp];
+            }
+        }
+        return;
+    }
+    if bps <= 8 {
+        let maxv = (@as(u64, 1) << bps) - 1;
+        if (maxv == 255) and not invert and same {
+            return;
+        }
+        // a table for each output channel
+        let mut t: [4][256]u8 = [[0; 256]; 4];
+        for v in @as(usize, 0)..256 {
+            let x = scale(@as(u64, v), maxv, 255);
+            for k in @as(usize, 0)..outc {
+                t[k][v] = @truncate(u8, x);
+            }
+            if invert {
+                t[0][v] = @truncate(u8, 255 - x);
+            }
+        }
+        if (spp == 1) and (outc == 1) {
+            for i in @as(usize, 0)..px {
+                o[i] = t[0][@as(usize, raw[i])];
+            }
+            return;
+        }
+        for i in @as(usize, 0)..px {
+            for k in @as(usize, 0)..outc {
+                o[(i * outc) + k] = t[k][@as(usize, raw[(i * spp) + k])];
+            }
+        }
+        return;
+    }
+    let r16 = @cast_slice(u16, raw[..(px * spp) * 2]);
+    let o16 = @cast_slice(u16, o[..(px * outc) * 2]);
+    if bps >= 16 {
+        if invert {
+            for i in @as(usize, 0)..px {
+                for k in @as(usize, 0)..outc {
+                    o16[(i * outc) + k] = r16[(i * spp) + k];
+                }
+                o16[i * outc] = 65535 - r16[i * spp];
+            }
+        } else if not same {
+            for i in @as(usize, 0)..px {
+                for k in @as(usize, 0)..outc {
+                    o16[(i * outc) + k] = r16[(i * spp) + k];
+                }
+            }
+        }
+        return;
+    }
+    // 9 to 15 bits: scaled, by a table when there are enough samples
+    let maxv = (@as(u64, 1) << bps) - 1;
+    let nv = @truncate(usize, maxv) + 1;
+    if (px * outc) > nv {
+        let t = mem.alloc.[u16](nv)!;
+        defer mem.free(t);
+        for v in @as(usize, 0)..nv {
+            t[v] = @truncate(u16, scale(@as(u64, v), maxv, 65535));
+        }
+        let top = @truncate(usize, maxv);
+        for i in @as(usize, 0)..px {
+            let x = t[@min(@as(usize, r16[i * spp]), top)];
+            for k in @as(usize, 1)..outc {
+                o16[(i * outc) + k] = t[@min(@as(usize, r16[(i * spp) + k]), top)];
+            }
+            if invert {
+                o16[i * outc] = 65535 - x;
+            } else {
+                o16[i * outc] = x;
+            }
+        }
+        return;
+    }
+    for i in @as(usize, 0)..px {
+        for k in @as(usize, 0)..outc {
+            let x = scale(@as(u64, r16[(i * spp) + k]), maxv, 65535);
+            if invert and (k == 0) {
+                o16[(i * outc) + k] = @truncate(u16, 65535 - x);
+            } else {
+                o16[(i * outc) + k] = @truncate(u16, x);
+            }
+        }
+    }
+}
+
 // raw samples to an image: photometric interpretation, palettes, scaling,
 // alpha
 fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, sm: *Samples) TiffError!image.Image {
@@ -721,14 +1066,22 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, sm: *Samples) TiffE
     let alpha = sm.alpha;
     let float = sm.float;
     let bps = sm.bps;
-    let mut outc: usize = 3;
-    if (photo == 0) or (photo == 1) {
-        outc = 1;
-    }
-    if alpha != 0 {
-        outc += 1;
-    }
+    let outc = out_channels(sm);
     let px = w * h;
+    if simple_samples(sm) {
+        let mut depth = image.Depth.U8;
+        if float {
+            depth = image.Depth.F32;
+        } else if bps > 8 {
+            depth = image.Depth.U16;
+        }
+        let mut img = image.Image.init(w, h, outc, depth)!;
+        finish_simple(raw, img.data, px, spp, outc, sm) catch |e| {
+            img.deinit();
+            return e;
+        };
+        return img;
+    }
     if float {
         let mut img = image.Image.init(w, h, outc, image.Depth.F32)!;
         let o = img.samples32();
@@ -775,6 +1128,10 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, sm: *Samples) TiffE
         depth = image.Depth.U16;
     }
     let mut img = image.Image.init(w, h, outc, depth)!;
+    if depth == image.Depth.U8 {
+        finish8(f, p, raw, img.data, px, sm, outc);
+        return img;
+    }
     let o8 = img.data;
     let mut o16 = @slice_from_ptr(@ptr_from_int(*mut u16, 2), 0);
     let mut r16: []u16 = o16;
@@ -849,6 +1206,105 @@ fn finish(f: *File, p: *Page, raw: []u8, w: usize, h: usize, sm: *Samples) TiffE
     return img;
 }
 
+// finish for up to 8 bits, but with the same results
+fn finish8(f: *File, p: *Page, raw: []u8, o: []mut u8, px: usize, sm: *Samples, outc: usize) void {
+    let spp = sm.spp;
+    let colors = sm.colors;
+    let photo = sm.photo;
+    let alpha = sm.alpha;
+    let bps = sm.bps;
+    let maxv = (@as(u64, 1) << bps) - 1;
+    let mut sc: [256]u32 = [0; 256];
+    for v in @as(usize, 0)..256 {
+        sc[v] = @truncate(u32, scale(@as(u64, v), maxv, 255));
+    }
+    let ncol = @as(usize, 1) << @truncate(usize, bps);
+    let mut pal: [768]u32 = [0; 768];
+    if photo == 3 {
+        for k in @as(usize, 0)..3 {
+            for ix in @as(usize, 0)..ncol {
+                pal[(k * 256) + ix] = @truncate(u32, elem(f, p.colormap, @as(u64, (k * ncol) + ix)) >> 8);
+            }
+        }
+    }
+    let sct = sc[..];
+    let pt = pal[..];
+    if (photo == 3) and (alpha == 0) {
+        for i in @as(usize, 0)..px {
+            let ix = @as(usize, raw[i * spp]);
+            if ix < ncol {
+                o[3 * i] = @truncate(u8, pt[ix]);
+                o[(3 * i) + 1] = @truncate(u8, pt[256 + ix]);
+                o[(3 * i) + 2] = @truncate(u8, pt[512 + ix]);
+            }
+        }
+        return;
+    }
+    if (photo == 5) and (alpha == 0) {
+        for i in @as(usize, 0)..px {
+            let at = i * spp;
+            let kk = 255 - sct[@as(usize, raw[at + 3])];
+            for k in @as(usize, 0)..3 {
+                // ((255 - s) * kk + 127) / 255, without dividing
+                let t = ((255 - sct[@as(usize, raw[at + k])]) * kk) + 127;
+                o[(3 * i) + k] = @truncate(u8, (t + (t >> 8) + 1) >> 8);
+            }
+        }
+        return;
+    }
+    let gray = (photo == 0) or (photo == 1);
+    for i in @as(usize, 0)..px {
+        let at = i * spp;
+        let mut c0: u32 = 0;
+        let mut c1: u32 = 0;
+        let mut c2: u32 = 0;
+        if photo == 3 {
+            let ix = @as(usize, raw[at]);
+            if ix < ncol {
+                c0 = pt[ix];
+                c1 = pt[256 + ix];
+                c2 = pt[512 + ix];
+            }
+        } else if photo == 0 {
+            c0 = 255 - sct[@as(usize, raw[at])];
+        } else if photo == 1 {
+            c0 = sct[@as(usize, raw[at])];
+        } else if photo == 5 {
+            let kk = 255 - sct[@as(usize, raw[at + 3])];
+            c0 = (((255 - sct[@as(usize, raw[at])]) * kk) + 127) / 255;
+            c1 = (((255 - sct[@as(usize, raw[at + 1])]) * kk) + 127) / 255;
+            c2 = (((255 - sct[@as(usize, raw[at + 2])]) * kk) + 127) / 255;
+        } else {
+            c0 = sct[@as(usize, raw[at])];
+            c1 = sct[@as(usize, raw[at + 1])];
+            c2 = sct[@as(usize, raw[at + 2])];
+        }
+        let ot = i * outc;
+        if alpha != 0 {
+            let a = sct[@as(usize, raw[at + colors])];
+            if alpha == 1 {
+                if a == 0 {
+                    c0 = 0;
+                    c1 = 0;
+                    c2 = 0;
+                } else {
+                    c0 = @min(255, ((c0 * 255) + (a / 2)) / a);
+                    if not gray {
+                        c1 = @min(255, ((c1 * 255) + (a / 2)) / a);
+                        c2 = @min(255, ((c2 * 255) + (a / 2)) / a);
+                    }
+                }
+            }
+            o[ot + (outc - 1)] = @truncate(u8, a);
+        }
+        o[ot] = @truncate(u8, c0);
+        if not gray {
+            o[ot + 1] = @truncate(u8, c1);
+            o[ot + 2] = @truncate(u8, c2);
+        }
+    }
+}
+
 // v of 0..maxv to 0..outmax
 fn scale(v: u64, maxv: u64, outmax: u64) u64 {
     if maxv == outmax {
@@ -874,7 +1330,7 @@ fn jpeg_chunk(f: *File, p: *Page, src: []u8, out: []mut u8, cw: usize, rows: usi
     } else {
         js.push_str(src)!;
     }
-    let mut im = jpeg.decode(js.bytes()) catch |e| {
+    let mut im = jpeg.decode_with(js.bytes(), f.opts) catch |e| {
         if e == error.OutOfMemory {
             return e;
         }
@@ -898,7 +1354,8 @@ fn jpeg_chunk(f: *File, p: *Page, src: []u8, out: []mut u8, cw: usize, rows: usi
 // PackBits and LZW
 // -----------------------------------------------------------------------------
 
-fn unpackbits(src: []u8, out: []mut u8) void {
+// (returns the bytes written)
+fn unpackbits(src: []u8, out: []mut u8) usize {
     let mut i: usize = 0;
     let mut o: usize = 0;
     while (i < src.len) and (o < out.len) {
@@ -911,7 +1368,7 @@ fn unpackbits(src: []u8, out: []mut u8) void {
             o += k;
         } else if n > 128 {
             if i >= src.len {
-                return;
+                return o;
             }
             let k = @min(257 - n, out.len - o);
             @mem_set(out[o..o + k], src[i]);
@@ -919,6 +1376,7 @@ fn unpackbits(src: []u8, out: []mut u8) void {
             o += k;
         }
     }
+    return o;
 }
 
 fn lzw_decode(src: []u8, out: []mut u8) TiffError!usize {
@@ -1961,6 +2419,47 @@ fn fails_n(r: TiffError!usize) bool {
 
 fn fails(r: !image.Image) bool {
     let mut img = r catch return true;
+    img.deinit();
+    return false;
+}
+
+test "pixel limits" {
+    let mut img = test_image(11, 10, 3, image.Depth.U8)!;
+    defer img.deinit();
+    let enc = encode(&img, Options.default())!;
+    defer mem.free(enc);
+    let small = image.DecodeOptions.{ max_pixels: 100 };
+    @expect(too_large(decode_with(enc, small)));
+    let mut back = decode(enc)!;
+    defer back.deinit();
+    @expect_eq(back.width, 11);
+    // pages of 8193 x 8192 and 8323125 x 21, past the default limit, with no
+    // strips: under MAX_PIXELS, they are refused only for the strips
+    let all = image.DecodeOptions.{ max_pixels: image.MAX_PIXELS };
+    let sizes: [2][2]u32 = [[8193, 8192], [8323125, 21]];
+    for sz in sizes {
+        let mut d = strs.String.init();
+        defer d.deinit();
+        d.push_str("II*\x00\x08\x00\x00\x00\x02\x00")!;
+        let tags: [2]u32 = [256, 257];  // ImageWidth, ImageLength
+        for k in @as(usize, 0)..2 {
+            let e: [12]u8 = [@truncate(u8, tags[k]), @truncate(u8, tags[k] >> 8), 4, 0, 1, 0, 0, 0,
+                             @truncate(u8, sz[k]), @truncate(u8, sz[k] >> 8), @truncate(u8, sz[k] >> 16), 0];
+            d.push_str(e[..])!;
+        }
+        d.push_str("\x00\x00\x00\x00")!;
+        @expect(too_large(decode(d.bytes())));
+        let mut ok = decode_with(d.bytes(), all) catch |e| {
+            @expect(e != error.TooLarge);
+            continue;
+        };
+        ok.deinit();
+        @trap();
+    }
+}
+
+fn too_large(r: !image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
     img.deinit();
     return false;
 }

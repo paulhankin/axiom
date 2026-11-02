@@ -82,14 +82,21 @@ fn is_space(c: u8) bool {
     return (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r') or (c == 11) or (c == 12);
 }
 
+/// Decodes a PNM, PAM or PFM file, of at most image.DEFAULT_MAX_PIXELS (else
+/// TooLarge).
 pub fn decode(data: []u8) PnmError!image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes a PNM, PAM or PFM file, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) PnmError!image.Image {
     if not is_pnm(data) {
         return error.Corrupt;
     }
     let kind = data[1];
     let mut s = Scan.{ d: data, pos: 2 };
     if (kind == 'F') or (kind == 'f') {
-        return decode_pfm(&mut s, kind == 'F');
+        return decode_pfm(&mut s, kind == 'F', opts);
     }
     let mut w: usize = 0;
     let mut h: usize = 0;
@@ -131,9 +138,7 @@ pub fn decode(data: []u8) PnmError!image.Image {
     if (w == 0) or (h == 0) or (maxval == 0) or (maxval > 65535) or (depth < 1) or (depth > 4) {
         return error.Corrupt;
     }
-    if (@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS {
-        return error.Corrupt;
-    }
+    _ = opts.check(w, h)!;
     // binary data starts after exactly one whitespace byte
     if (kind >= '4') and (s.pos < data.len) {
         s.pos += 1;
@@ -211,7 +216,7 @@ pub fn decode(data: []u8) PnmError!image.Image {
     return img;
 }
 
-fn decode_pfm(s: *mut Scan, color: bool) PnmError!image.Image {
+fn decode_pfm(s: *mut Scan, color: bool, opts: image.DecodeOptions) PnmError!image.Image {
     let w = s.number()!;
     let h = s.number()!;
     let scale_text = s.token()!;
@@ -223,9 +228,10 @@ fn decode_pfm(s: *mut Scan, color: bool) PnmError!image.Image {
     if color {
         ch = 3;
     }
-    if (w == 0) or (h == 0) or ((@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS) {
+    if (w == 0) or (h == 0) {
         return error.Corrupt;
     }
+    _ = opts.check(w, h)!;
     let n = (w * h) * ch;
     if (s.pos + (n * 4)) > s.d.len {
         return error.Corrupt;
@@ -402,10 +408,40 @@ test "encode_to" {
 }
 
 test "small files claiming big images" {
-    @expect(corrupt(decode("P6 16384 16384 255\n\x00\x00\x00")));
-    @expect(corrupt(decode("P4 16384 16384\n\x00")));
-    @expect(corrupt(decode("P2 16384 16384 255\n0 0 0")));
+    let all = image.DecodeOptions.{ max_pixels: image.MAX_PIXELS };
+    let big: [4][]u8 = ["P6 16384 16384 255\n\x00\x00\x00", "P4 16384 16384\n\x00", "P2 16384 16384 255\n0 0 0",
+                        "PF 16384 16384 -1.0\n\x00\x00\x00\x00"];
+    for b in big {
+        @expect(too_large(decode(b)));  // past the default limit
+        @expect(corrupt(decode_with(b, all)));
+    }
+    @expect(too_large(decode("P7 WIDTH 8193 HEIGHT 8192 DEPTH 1 MAXVAL 255 ENDHDR\n\x00")));
     @expect(corrupt(decode("P5 2 2 65535\n\x00\x00\x00\x00\x00\x00\x00")));
+}
+
+test "pixel limits" {
+    // 11 x 10 in PGM and gray PFM
+    let small = image.DecodeOptions.{ max_pixels: 100 };
+    let heads: [2][]u8 = ["P5 11 10 255\n", "Pf 11 10 -1.0\n"];
+    let sizes: [2]usize = [1, 4];
+    for k in @as(usize, 0)..2 {
+        let mut d = strs.String.init();
+        defer d.deinit();
+        d.push_str(heads[k])!;
+        for i in @as(usize, 0)..110 * sizes[k] {
+            d.push(0)!;
+        }
+        @expect(too_large(decode_with(d.bytes(), small)));
+        let mut img = decode(d.bytes())!;
+        defer img.deinit();
+        @expect_eq(img.width, 11);
+    }
+}
+
+fn too_large(r: PnmError!image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
+    img.deinit();
+    return false;
 }
 
 fn corrupt(r: PnmError!image.Image) bool {

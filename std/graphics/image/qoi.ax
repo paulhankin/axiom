@@ -27,7 +27,13 @@ fn hash(p: [4]u8) usize {
         (((@as(usize, p[0]) * 3) + (@as(usize, p[1]) * 5)) + (@as(usize, p[2]) * 7)) + (@as(usize, p[3]) * 11)) % 64;
 }
 
+/// Decodes a QOI file, of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) QoiError!image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes a QOI file, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) QoiError!image.Image {
     if not is_qoi(data) {
         return error.Corrupt;
     }
@@ -37,9 +43,7 @@ pub fn decode(data: []u8) QoiError!image.Image {
     if (w == 0) or (h == 0) or ((ch != 3) and (ch != 4)) or (data[13] > 1) {
         return error.Corrupt;
     }
-    if (@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS {
-        return error.Corrupt;
-    }
+    _ = opts.check(w, h)!;
     // a byte holds at most 62 pixels (a run): a file too small for its size
     // is broken, refused before allocating for it
     if ((w * h) / 62) > (data.len - @min(data.len, 22)) {
@@ -238,8 +242,10 @@ test "encode_to" {
 }
 
 test "small files claiming big images" {
-    // 16384 x 16384 in 22 bytes
-    @expect(corrupt(decode("qoif\x00\x00\x40\x00\x00\x00\x40\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x01")));
+    // 16384 x 16384 in 22 bytes: past the default limit, and too small for its size
+    let big = "qoif\x00\x00\x40\x00\x00\x00\x40\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x01";
+    @expect(too_large(decode(big)));
+    @expect(corrupt(decode_with(big, image.DecodeOptions.{ max_pixels: image.MAX_PIXELS })));
     // but runs of 62 are fine
     let mut d = strs.String.init();
     defer d.deinit();
@@ -251,6 +257,25 @@ test "small files claiming big images" {
     let mut img = decode(d.bytes())!;
     defer img.deinit();
     @expect_eq(img.width, 620);
+}
+
+test "pixel limits" {
+    let mut d = strs.String.init();
+    defer d.deinit();
+    d.push_str("qoif\x00\x00\x00\x0b\x00\x00\x00\x0a\x03\x00")!;  // 11 x 10
+    d.push(0xc0 + 61)!;  // runs of 62
+    d.push(0xc0 + 47)!;
+    d.push_str("\x00\x00\x00\x00\x00\x00\x00\x01")!;
+    @expect(too_large(decode_with(d.bytes(), image.DecodeOptions.{ max_pixels: 100 })));
+    let mut img = decode(d.bytes())!;
+    defer img.deinit();
+    @expect_eq(img.width, 11);
+}
+
+fn too_large(r: QoiError!image.Image) bool {
+    let mut img = r catch |e| return e == error.TooLarge;
+    img.deinit();
+    return false;
 }
 
 fn corrupt(r: QoiError!image.Image) bool {

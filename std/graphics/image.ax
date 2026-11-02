@@ -17,6 +17,15 @@
 // Reading and writing files: std/graphics/image/formats (any format, by content or
 // file extension), or the codecs std/graphics/image/png, jpeg, bmp, qoi, pnm (PPM,
 // PGM, PFM), hdr (Radiance), exr (OpenEXR), gif, tiff, webp and avif.
+//
+// Decoding refuses an image (or the frames of an animation, together) of
+// more than DEFAULT_MAX_PIXELS (2^26) with TooLarge, before allocating for it:
+// a file of a few hundred bytes can claim one that big. Each decoder's
+// decode_with (and formats.decode_with) takes DecodeOptions to set another
+// limit, up to MAX_PIXELS (2^28), for files you trust:
+//
+//     let opts = image.DecodeOptions.{ max_pixels: image.MAX_PIXELS };
+//     let big = formats.decode_with(bytes, opts)!;
 // =============================================================================
 
 import "../mem.ax" as mem;
@@ -31,9 +40,43 @@ pub enum Depth: u8 {
     F32,
 }
 
-/// Images bigger than this many pixels are refused by the decoders (a guard
-/// against hostile headers); 2^28 is 16384 x 16384.
+/// The most pixels an Image can have (Image.init fails with TooLarge past
+/// it), and so the highest limit a decode can be given; 2^28 is 16384 x 16384.
 pub const MAX_PIXELS: usize = 268435456;
+
+/// The decoders' limit unless a decode is given another (DecodeOptions):
+/// 2^26 pixels (8192 x 8192), 256 MiB as RGBA. A file of a few hundred bytes
+/// can claim an image that big, and decoding costs memory and time in
+/// proportion to the size claimed, so past the limit the decoders fail with
+/// TooLarge before allocating.
+pub const DEFAULT_MAX_PIXELS: usize = 67108864;
+
+/// Settings for decoders (formats.decode_with and each format's decode_with).
+pub struct DecodeOptions {
+    /// The most pixels to decode: an image (or the frames or canvas of an
+    /// animation, all together) claiming more fails with TooLarge before
+    /// anything is allocated for it. Raise it, up to MAX_PIXELS (beyond
+    /// which it has no effect), only for files you trust.
+    max_pixels: usize,
+
+    pub fn default() DecodeOptions {
+        return DecodeOptions.{ max_pixels: DEFAULT_MAX_PIXELS };
+    }
+
+    /// The limit in effect: max_pixels, at most MAX_PIXELS.
+    pub fn limit(self: *DecodeOptions) usize {
+        return @min(self.max_pixels, MAX_PIXELS);
+    }
+
+    /// width * height, or TooLarge if that is over the limit (or overflows).
+    pub fn check(self: *DecodeOptions, width: usize, height: usize) ImageError!usize {
+        let px = @mul_checked(width, height) catch return error.TooLarge;
+        if px > self.limit() {
+            return error.TooLarge;
+        }
+        return px;
+    }
+}
 
 pub fn bytes_per_sample(depth: Depth) usize {
     if depth == Depth.U8 {
@@ -525,6 +568,28 @@ test "pixels and conversion" {
     @expect_eq(cr.get(0, 0).to_rgba8().to_u32(), 0x40806020);
     img.flip_vertical();
     @expect_eq(img.get(1, 0).to_rgba8().to_u32(), 0x40806020);
+}
+
+fn too_large(r: ImageError!usize) bool {
+    _ = r catch |e| return e == error.TooLarge;
+    return false;
+}
+
+test "decode limits" {
+    let d = DecodeOptions.default();
+    @expect_eq(d.limit(), DEFAULT_MAX_PIXELS);
+    @expect_eq(d.check(8192, 8192)!, DEFAULT_MAX_PIXELS);
+    @expect(too_large(d.check(8192, 8193)));
+    @expect(too_large(d.check(@as(usize, 0) -% 1, 2)));  // overflows
+    let big = DecodeOptions.{ max_pixels: MAX_PIXELS };
+    @expect_eq(big.check(16384, 16384)!, MAX_PIXELS);
+    // past MAX_PIXELS, a limit has no effect
+    let huge = DecodeOptions.{ max_pixels: @as(usize, 0) -% 1 };
+    @expect_eq(huge.limit(), MAX_PIXELS);
+    @expect(too_large(huge.check(16384, 16385)));
+    let small = DecodeOptions.{ max_pixels: 100 };
+    @expect_eq(small.check(10, 10)!, 100);
+    @expect(too_large(small.check(10, 11)));
 }
 
 test "sizes past a usize" {

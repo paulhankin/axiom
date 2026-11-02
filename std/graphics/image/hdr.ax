@@ -26,7 +26,13 @@ pub fn is_hdr(data: []u8) bool {
     return strs.starts_with(data, "#?RADIANCE") or strs.starts_with(data, "#?RGBE");
 }
 
+/// Decodes a Radiance file, of at most image.DEFAULT_MAX_PIXELS (else TooLarge).
 pub fn decode(data: []u8) HdrError!image.Image {
+    return decode_with(data, image.DecodeOptions.default());
+}
+
+/// Decodes a Radiance file, of at most opts.max_pixels (else TooLarge).
+pub fn decode_with(data: []u8, opts: image.DecodeOptions) HdrError!image.Image {
     if not is_hdr(data) {
         return error.Corrupt;
     }
@@ -61,9 +67,10 @@ pub fn decode(data: []u8) HdrError!image.Image {
     let bottom_up = @mem_eq(ya, "+Y");
     let h = fmt.parse_int.[usize](yv) catch return error.Corrupt;
     let w = fmt.parse_int.[usize](xv) catch return error.Corrupt;
-    if (w == 0) or (h == 0) or ((@mul_checked(w, h) catch return error.Corrupt) > image.MAX_PIXELS) {
+    if (w == 0) or (h == 0) {
         return error.Corrupt;
     }
+    _ = opts.check(w, h)!;
     // a file too small for its size is broken, refused before allocating for
     // it: runs hold at most 127 pixels in 8 bytes (old-style runs can hold
     // more, but files don't use them for whole images)
@@ -338,11 +345,24 @@ test "encode_to" {
 }
 
 test "small files claiming big images" {
-    let r = decode("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 16384 +X 16384\n\x02\x02\x40\x00\xff\x00");
-    let mut img = r catch |e| {
-        @expect_eq(e, error.Corrupt);
-        return;
-    };
+    let big = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 16384 +X 16384\n\x02\x02\x40\x00\xff\x00";
+    @expect(fails_with(decode(big), error.TooLarge));  // past the default limit
+    @expect(fails_with(decode_with(big, image.DecodeOptions.{ max_pixels: image.MAX_PIXELS }), error.Corrupt));
+}
+
+test "pixel limits" {
+    let mut img = image.Image.init(11, 10, 3, image.Depth.F32)!;
+    defer img.deinit();
+    let enc = encode(&img)!;
+    defer mem.free(enc);
+    @expect(fails_with(decode_with(enc, image.DecodeOptions.{ max_pixels: 100 }), error.TooLarge));
+    let mut back = decode(enc)!;
+    defer back.deinit();
+    @expect_eq(back.width, 11);
+}
+
+fn fails_with(r: HdrError!image.Image, want: HdrError) bool {
+    let mut img = r catch |e| return e == want;
     img.deinit();
-    @trap();
+    return false;
 }
