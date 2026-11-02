@@ -10,3 +10,6 @@
 - On x86-64, a float select could read a constant that the code had loaded only on
   the other path of an earlier select in the same block (seen with `--cpu=x86-64-v2`
   and later at `-O2`): the result was garbage instead of the constant.
+- The register allocator's shrink-wrapping wrote into memory it had freed, in `-O2`
+  builds of functions it could shrink-wrap (found by the compiler built with
+  `--sanitize=address`).
