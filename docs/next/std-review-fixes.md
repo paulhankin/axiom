@@ -56,3 +56,6 @@
 - `pdf.read` ignores object numbers larger than the file when it rebuilds a damaged
   cross-reference table (a stray `8000000 0 obj` made it build tables of millions of
   entries, taking seconds).
+- `font` gives each glyph a budget of 65536 steps (charstring bytes or components),
+  not a million: a malformed font could make drawing a few hundred glyphs take seconds.
+  The glyphs of real fonts take a few thousand at most.
