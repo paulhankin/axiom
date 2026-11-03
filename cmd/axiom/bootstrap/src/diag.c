@@ -15,9 +15,10 @@ static Diag *diag_new(int sev, Span sp, const char *code, const char *fmt, va_li
     vsnprintf(buf, sizeof buf, fmt, ap);
     d->msg = arena_strndup(buf, strlen(buf));
     d->seq = diags.len;
-    // (about the parser's name for one it did not find, after the error that
-    // said so: made, for its caller to add notes to, but not shown)
-    if (strstr(d->msg, "'<error>'")) return d;
+    // (about the parser's name for one it did not find, or about a type that
+    // is invalid, after the error that said so: made, for its caller to add
+    // notes to, but not shown)
+    if (strstr(d->msg, "'<error>'") || strstr(d->msg, "<invalid>")) return d;
     vec_push(diags, d);
     if (sev == SEV_ERROR) nerrors++;
     return d;

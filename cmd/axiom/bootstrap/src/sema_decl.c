@@ -580,6 +580,13 @@ Type *resolve_type(TypeExpr *te, TypeCtx *tc) {
             return t_invalid;
         }
         resolve_decl(d);
+        if (!d->type) {
+            // (an enum still being resolved: named in its own representation, or
+            // in that of an enum it depends on)
+            diag_error(te->span, "E0308", "an enum's representation must be an integer type, found %s",
+                       te->qual ? arena_printf("%s.%s", te->qual, te->name) : te->name);
+            return t_invalid;
+        }
         if (d->gparams.len == 0) {
             if (te->has_args) diag_error(te->span, "E0468", "'%s' is not generic", te->name);
             return d->type;

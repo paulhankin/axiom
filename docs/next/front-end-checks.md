@@ -36,3 +36,5 @@ These programs were accepted and now are compile errors; the fixes are mechanica
   could not read leads to no more errors, nor does a name it could not read, and at
   most 1000 diagnostics are shown, followed by how many more there were (in JSON, the
   `omitted` member).
+- An enum whose representation is a type made of the enum itself (`[2]A`, `*A`,
+  `[]A`) is `E0308` too; both compilers crashed on it.
