@@ -2299,7 +2299,9 @@ pub fn alloc_aligned_bytes(size: usize, align: usize) usize
 pub fn free_bytes(p: usize, size: usize) void
 pub fn realloc_bytes(p: usize, old: usize, size: usize) usize
 pub fn in_use() usize                        // bytes allocated and not freed
+pub fn stats() Stats                         // counters: bytes in use, mapped, retained, ...
 pub fn enable_threads() void
+pub fn thread_exit() void
 ```
 
 These are ordinary functions (§10), not builtins. The rules:
@@ -2321,15 +2323,20 @@ These are ordinary functions (§10), not builtins. The rules:
 - **Zero sizes.** `alloc.[T](0)` returns an empty slice that owns no memory; freeing it
   does nothing.
 - **Threads.** The allocator is safe to use from every thread. `std/thread` calls
-  `enable_threads` before starting the program's second thread; code that starts threads
-  another way (from C) must call it first.
+  `enable_threads` before starting the program's second thread, and `thread_exit` on
+  each thread it started when the thread's function returns; code that starts threads
+  another way (from C) must call `enable_threads` first, and `thread_exit` on each such
+  thread before it ends.
 
 The design is not normative: objects up to 8 KiB are rounded up to one of 32 size classes
 and carved from 64 KiB spans, one class per span, with no per-object header; larger ones are
 blocks of 4 KiB units that merge with free neighbours. A single-threaded program never
-locks; with threads, each thread uses one of 32 heaps (chosen by its stack address) with
-its own lock. Freed memory is reused, and past a budget, large free blocks are returned to
-the system with `@memory_discard`.
+locks; with threads, each thread uses one of up to 32 heaps (the least used when it first
+allocates), each with its own lock, and keeps a cache of free small objects per size class
+that it refills from its heap and flushes to their heaps in batches, so that most
+allocations and frees take no lock. Freed memory is reused; free memory that stays unused
+for about ten seconds is returned to the system with `@memory_discard`, gradually, and
+past a budget large free blocks are returned at once.
 
 A program that wants arena or pool allocation writes it on top of `mem.alloc`: an arena is
 a struct that takes large blocks from `mem.alloc` and hands out pieces of them.

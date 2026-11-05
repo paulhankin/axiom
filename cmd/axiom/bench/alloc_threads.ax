@@ -1,0 +1,78 @@
+// The allocator, several threads: each thread allocates and frees objects of
+// its own (random sizes, 16 to 1024 bytes, a few thousand live per thread),
+// with 1, 2 and 4 threads (or the count given as the argument).
+import "common.ax" as c;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/thread" as thread;
+
+struct Job {
+    seed: u64,
+    steps: usize,
+    out: *mut u64,
+}
+
+fn next(s: *mut u64) u64 {
+    s.* ^= s.* << 13;
+    s.* ^= s.* >> 7;
+    s.* ^= s.* << 17;
+    return s.*;
+}
+
+fn work(j: Job) void {
+    let live: usize = 2000;
+    let objs = mem.alloc.[[]mut u8](live) catch return;
+    let mut seed = j.seed;
+    let mut sum: u64 = 0;
+    for i in 0..live {
+        objs[i] = mem.alloc.[u8](16 + @truncate(usize, next(&mut seed) % 1009)) catch return;
+        objs[i][0] = 1;
+    }
+    for _s in 0..j.steps {
+        let r = next(&mut seed);
+        let i = @truncate(usize, (r >> 20) % @as(u64, live));
+        sum +%= @as(u64, objs[i][0]) + @as(u64, objs[i].len);
+        mem.free(objs[i]);
+        let x = mem.alloc.[u8](16 + @truncate(usize, r % 1009)) catch return;
+        x[0] = @truncate(u8, r);
+        objs[i] = x;
+    }
+    for i in 0..live {
+        mem.free(objs[i]);
+    }
+    mem.free(objs);
+    j.out.* = sum;
+}
+
+// `n` threads share 8 million steps.
+fn run(n: usize) u64 {
+    let mut sums: [16]u64 = [0; 16];
+    let ts = mem.alloc.[thread.Thread.[Job]](n) catch return 0;
+    defer mem.free(ts);
+    let steps = 8_000_000 / n;
+    for i in 0..n {
+        let j = Job.{ seed: 0x9E37_79B9_7F4A_7C15 +% @as(u64, i), steps: steps, out: &mut sums[i] };
+        ts[i] = thread.spawn(work, j) catch return 0;
+    }
+    let mut sum: u64 = 0;
+    for i in 0..n {
+        ts[i].join();
+        sum +%= sums[i];
+    }
+    return sum;
+}
+
+export fn main() i32 {
+    let mut sum: u64 = 0;
+    if os.arg_count() > 1 {
+        let a = os.arg(1) catch return 1;
+        let n = io.parse_u64(a) catch return 1;
+        mem.free(a);
+        sum = run(@truncate(usize, @min(n, 16)));
+    } else {
+        sum = (run(1) +% run(2)) +% run(4);
+    }
+    c.result("threads", sum);
+    return 0;
+}

@@ -1,0 +1,98 @@
+// The allocator, objects freed by another thread: producers allocate batches
+// of objects (random sizes, 16 to 512 bytes, filled with a pattern) and pass
+// them through a channel to consumers, which check and free them. 1 and 2
+// producer/consumer pairs (or the count of pairs given as the argument).
+import "common.ax" as c;
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/sync" as sync;
+import "std/thread" as thread;
+
+const BATCH: usize = 256;
+
+struct Pair {
+    ch: *mut sync.Channel.[usize],  // batches: []mut []mut u8, as an address
+    seed: u64,
+    batches: usize,
+    out: *mut u64,
+}
+
+fn next(s: *mut u64) u64 {
+    s.* ^= s.* << 13;
+    s.* ^= s.* >> 7;
+    s.* ^= s.* << 17;
+    return s.*;
+}
+
+fn produce(p: Pair) void {
+    let mut seed = p.seed;
+    for _b in 0..p.batches {
+        let batch = mem.alloc.[[]mut u8](BATCH) catch return;
+        for i in 0..BATCH {
+            let x = mem.alloc.[u8](16 + @truncate(usize, next(&mut seed) % 497)) catch return;
+            x[0] = @truncate(u8, x.len);
+            x[x.len - 1] = @truncate(u8, i);
+            batch[i] = x;
+        }
+        p.ch.send(@int_from_ptr(batch.ptr)) catch return;
+    }
+    p.ch.close();
+}
+
+fn consume(p: Pair) void {
+    let mut sum: u64 = 0;
+    loop {
+        let a = p.ch.recv() catch break;
+        let batch = @slice_from_ptr(@ptr_from_int(*mut []mut u8, a), BATCH);
+        for i in 0..BATCH {
+            let x = batch[i];
+            if (x[0] != @truncate(u8, x.len)) or (x[x.len - 1] != @truncate(u8, i)) {
+                sum +%= 1 << 40;  // (never)
+            }
+            sum +%= @as(u64, x.len);
+            mem.free(x);
+        }
+        mem.free(batch);
+    }
+    p.out.* = sum;
+}
+
+// `n` pairs share 40000 batches.
+fn run(n: usize) u64 {
+    let chans = mem.alloc.[sync.Channel.[usize]](n) catch return 0;
+    defer mem.free(chans);
+    let sums = mem.alloc_zeroed.[u64](n) catch return 0;
+    defer mem.free(sums);
+    let ps = mem.alloc.[thread.Thread.[Pair]](2 * n) catch return 0;
+    defer mem.free(ps);
+    for i in 0..n {
+        chans[i] = sync.Channel.[usize].init(16) catch return 0;
+        let p = Pair.{ ch: &mut chans[i], seed: 0x2545_F491_4F6C_DD1D +% @as(u64, i), batches: 40000 / n,
+                       out: &mut sums[i] };
+        ps[2 * i] = thread.spawn(produce, p) catch return 0;
+        ps[(2 * i) + 1] = thread.spawn(consume, p) catch return 0;
+    }
+    let mut sum: u64 = 0;
+    for i in 0..n {
+        ps[2 * i].join();
+        ps[(2 * i) + 1].join();
+        chans[i].deinit();
+        sum +%= sums[i];
+    }
+    return sum;
+}
+
+export fn main() i32 {
+    let mut sum: u64 = 0;
+    if os.arg_count() > 1 {
+        let a = os.arg(1) catch return 1;
+        let n = io.parse_u64(a) catch return 1;
+        mem.free(a);
+        sum = run(@truncate(usize, @max(@min(n, 8), 1)));
+    } else {
+        sum = run(1) +% run(2);
+    }
+    c.result("handoff", sum);
+    return 0;
+}

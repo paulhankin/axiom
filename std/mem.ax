@@ -19,13 +19,20 @@
 //   Free blocks are kept in size bins (with a bitmap of the non-empty ones)
 //   and merged with free neighbours (boundary tags); a block next to the
 //   never-used end of memory (the wilderness) goes back into it, and a
-//   block there can grow in place (realloc). Past a budget of free memory,
-//   big free blocks are given back to the system (@memory_discard).
+//   block there can grow in place (realloc). Free memory that stays unused
+//   for about ten seconds is given back to the system (@memory_discard),
+//   gradually (decay, below); past a budget, big free blocks go back at once.
 //
 // Until a second thread starts (enable_threads, called by std/thread), there
-// is one heap and no locking. Then there are 32 heaps, each with a lock; a
-// thread uses the heap its stack address hashes to, and frees go to the heap
-// that owns the span. Blocks and spans come from one pool with its own lock.
+// is one heap and no locking, and objects go straight to and from their
+// spans. Then there are up to 32 heaps (four per processor), each with a
+// lock; a thread takes the heap fewest threads use when it first allocates.
+// Each thread has a cache of free small objects per class (per-thread
+// caches, below), so that most allocations and frees take no lock: it is
+// refilled from the thread's heap and flushed to the heaps owning its
+// objects in batches. Blocks and spans come from one pool with its own lock.
+// A heap refills from the lowest-addressed of its spans with free objects
+// (as far as a short search finds), so that higher spans can drain.
 //
 // Sizes are passed to free (a slice knows its length), so objects carry no
 // header. Freeing memory that did not come from here traps.
@@ -48,8 +55,13 @@ const NHEAPS: usize = 32;
 const NBINS: usize = 160;
 const GROW_MIN: usize = 16;          // pages taken from the system at a time
 const SPAN_CACHE: usize = 32;        // empty spans kept for reuse
-const RETAIN: usize = 64 << 20;      // free bytes kept before giving memory back
-const DISCARD_MIN: usize = 1 << 20;  // the smallest free block given back
+const RETAIN: usize = 64 << 20;      // free bytes kept before giving memory back at once
+const DISCARD_MIN: usize = 1 << 20;  // the smallest free block given back at once
+// free memory unused for about EPOCHS * EPOCH_NS (10 s) is given back (see
+// decay below)
+const EPOCHS: usize = 20;
+const EPOCH_NS: i64 = 500_000_000;
+const DECAY_EVERY: u32 = 64;  // pool operations between looks at the clock
 
 const MAGIC_SPAN: u64 = 0x5350_414E_9E37_79B9;
 const MAGIC_USED: u64 = 0x5553_4544_7F4A_7C15;
@@ -109,6 +121,7 @@ struct Block {
     prev_free: usize,  // 1: the block before is free
     next: usize,       // bin links (free blocks)
     prev: usize,
+    dirty: usize,  // a free block: bytes of it that may be resident (not given back)
 }
 
 // class_of for sizes up to 1024, by (size + 15) / 16
@@ -138,7 +151,62 @@ let mut bin_bits: [3]u64 = [0; 3];
 let mut span_cache: usize = 0;
 let mut span_cached: usize = 0;
 let mut large_bytes: usize = 0;  // bytes of large blocks in use
-let mut retained: usize = 0;     // free block bytes not given back
+let mut retained: usize = 0;     // free block bytes not given back (their dirty)
+// [wild_lo, wild_dirty) was handed out and returned to the wilderness: it may
+// be resident
+let mut wild_dirty: usize = 0;
+let mut mapped: usize = 0;     // bytes taken from the system
+let mut given_back: u64 = 0;   // bytes given back to the system, in all
+let mut decay_ops: u32 = 0;    // pool operations since the last look at the clock
+let mut decay_start: i64 = 0;  // when the current epoch began (0: not yet)
+let mut decay_epoch: usize = 0;
+let mut freed_in: [20]usize = [0; 20];    // bytes freed in each of the last epochs (a ring)
+let mut nheaps: usize = 1;                // heaps threads are put on
+let mut heap_threads: [32]u32 = [0; 32];  // threads using each heap
+
+// -----------------------------------------------------------------------------
+// Per-thread caches
+//
+// Once threads run, each thread keeps, per small class, a stack of free
+// objects (linked through their first word), so that most allocations and
+// frees take no lock and no atomic operation. An empty stack is refilled from
+// the thread's heap with a batch of objects under one lock; a stack past its
+// limit gives back half of it, grouped by the heap owning each object (one
+// lock per heap: objects freed by a thread other than the one that allocated
+// them are cached like any other, and go back to their heap in a batch). A
+// class's limit starts small and doubles each time its stack runs empty or
+// over, up to CACHE_BYTES of objects (CACHE_MIN to CACHE_MAX of them); every
+// GC_EVERY misses and flushes, one class (in turn) whose stack was not
+// refilled or flushed since its last turn gives back half of what it holds
+// and halves its limit. A thread's cache is emptied when it ends
+// (thread_exit, from std/thread). Before a second thread starts the caches
+// are not used (see cache_alloc).
+// -----------------------------------------------------------------------------
+const CACHE_BYTES: usize = 65536;
+const CACHE_MAX: u32 = 256;  // objects per class, at most
+const CACHE_MIN: u32 = 4;    // the smallest limit
+const CACHE_START: u32 = 8;  // a class's first limit
+const GC_EVERY: u32 = 16;
+
+struct TCache {
+    head: [32]usize,  // per class, the newest free object (0: none)
+    count: [32]u32,   // objects in the stack
+    limit: [32]u32,   // a free beyond this many flushes
+    touched: u32,     // bit c: class c was refilled or flushed since its collection
+    heap: u32,        // the thread's heap + 1; 0 until set up (by the first miss or flush)
+    ticks: u32,       // misses and flushes, for the collection
+    gc_next: u32,     // the class collected next
+    misses: u64,
+    flushes: u64,
+    next: usize,  // links in the list of set-up caches (caches)
+    prev: usize,
+}
+
+threadlocal let mut tc: TCache = TCache.{ head: [0; 32], count: [0; 32], limit: [0; 32], touched: 0, heap: 0, ticks: 0,
+                                          gc_next: 0, misses: 0, flushes: 0, next: 0, prev: 0 };
+let mut caches: usize = 0;     // the threads' caches (pool lock)
+let mut gone_misses: u64 = 0;  // counters of the caches of threads that ended
+let mut gone_flushes: u64 = 0;
 
 fn span(s: usize) *mut Span {
     return @ptr_from_int(*mut Span, s);
@@ -200,17 +268,21 @@ fn pool_leave() void {
 /// Called before the program starts its second thread (std/thread does).
 /// From then on the allocator locks, and threads use separate heaps.
 pub fn enable_threads() void {
+    if multi {
+        return;
+    }
+    // a few heaps per processor, so that threads seldom share one
+    nheaps = @min(@max(@as(usize, ax_cpu_count()) * 4, 1), NHEAPS);
     multi = true;
 }
 
-// The heap for the calling thread: threads have separate stacks.
-fn heap_index() usize {
+// The heap of the calling thread.
+fn my_heap() usize {
     if not multi {
         return 0;
     }
-    let marker: u32 = 0;
-    let a = @as(u64, @int_from_ptr(&marker));
-    return @truncate(usize, ((a >> 20) *% 0x9E37_79B9_7F4A_7C15) >> 59);
+    cache_setup();
+    return @as(usize, tc.heap - 1);
 }
 
 // -----------------------------------------------------------------------------
@@ -242,11 +314,13 @@ fn bin_of(units: usize) usize {
     return 64 + ((b - 6) * 4) + ((units >> (b - 2)) & 3);
 }
 
-fn bin_insert(s: usize, size: usize) void {
+fn bin_insert(s: usize, size: usize, dirty: usize) void {
     let bi = bin_of(size / UNIT);
     let b = block(s);
     b.magic = tag(MAGIC_FREE, s);
     b.size = size;
+    b.dirty = @min(dirty, size);
+    retained += b.dirty;
     b.prev = 0;
     b.next = bins[bi];
     if b.next != 0 {
@@ -261,6 +335,7 @@ fn bin_insert(s: usize, size: usize) void {
 fn bin_remove(s: usize) void {
     let b = block(s);
     let bi = bin_of(b.size / UNIT);
+    retained -= b.dirty;
     if b.prev != 0 {
         block(b.prev).next = b.next;
     } else {
@@ -320,41 +395,198 @@ fn take_free(size: usize) usize {
 // the wilderness if it borders it, else put in a bin.
 fn release_block(s0: usize, size0: usize) void {
     block(s0).magic = 0;  // no longer a used block (a second free traps)
+    freed_in[decay_epoch] += size0;
     let mut s = s0;
     let mut size = size0;
+    let mut dirty = size0;
     let n = s + size;
     if (n != wild_lo) and (magic_at(n) == tag(MAGIC_FREE, n)) {
         let ns = block(n).size;
+        dirty += block(n).dirty;
         bin_remove(n);
-        took(ns);
         size += ns;
     }
     if block(s).prev_free != 0 {
         let ps = word(s - @size_of(usize)).*;
+        dirty += block(s - ps).dirty;
         bin_remove(s - ps);
-        took(ps);
         s -= ps;
         size += ps;
     }
     if (s + size) == wild_lo {
+        wild_dirty = @max(wild_dirty, wild_lo);
         wild_lo = s;
+        if dirty_bytes() > RETAIN {
+            purge_wild(dirty_bytes() - RETAIN);  // past the budget
+        }
+        decay_tick();
         return;
     }
     block(s).prev_free = 0;
-    retained += size;
-    if (size >= DISCARD_MIN) and (retained > RETAIN) {
-        @memory_discard(s + UNIT, size - (2 * UNIT));
-        retained -= size;
+    if (size >= DISCARD_MIN) and ((retained + dirty) > RETAIN) {
+        // past the budget: the pages of what was just freed go back, with a
+        // page on either side (which held a neighbour's header or size, so
+        // could not go back before), but not again all of the neighbours
+        // merged with it, which may be back already
+        let lo = @max(@sub_sat(s0 & ~(PAGE - 1), PAGE), s + UNIT);
+        let hi = @min((((s0 + size0) + PAGE - 1) & ~(PAGE - 1)) + PAGE, (s + size) - UNIT);
+        let got = whole_pages(lo, hi);
+        if got > 0 {
+            @memory_discard(lo, hi - lo);
+            given_back += @as(u64, @min(got, dirty));
+            dirty -= @min(got, dirty);
+        }
     }
-    bin_insert(s, size);
+    bin_insert(s, size, dirty);
+    decay_tick();
 }
 
-fn took(size: usize) void {
-    if retained >= size {
-        retained -= size;
-    } else {
-        retained = 0;
+// The bytes of the whole pages (PAGE) in [a, b).
+fn whole_pages(a: usize, b: usize) usize {
+    let lo = (a + PAGE - 1) & ~(PAGE - 1);
+    let hi = b & ~(PAGE - 1);
+    if hi > lo {
+        return hi - lo;
     }
+    return 0;
+}
+
+// Gives about n bytes of the free block at s back to the system (all of it
+// if n >= dirty, but for its first and last units, which hold its header and
+// size); returns how much of it may still be resident. The resident part is
+// taken to be at the start: the pages given back are below s + dirty.
+fn give_back(s: usize, size: usize, dirty: usize, n: usize) usize {
+    let lo0 = s + UNIT;
+    let hi0 = (s + size) - UNIT;
+    let mut lo = lo0;
+    let mut hi = hi0;
+    if n < dirty {
+        hi = @min(hi0, s + dirty) & ~(PAGE - 1);
+        lo = @max(lo0, @sub_sat(hi, (n + PAGE) - 1));
+    }
+    let got = whole_pages(lo, hi);
+    if got == 0 {
+        return dirty;
+    }
+    @memory_discard(lo, hi - lo);
+    given_back += @as(u64, @min(got, dirty));
+    if (lo == lo0) and (hi == hi0) {
+        return @min(dirty, size - got);
+    }
+    return dirty - @min(got, dirty);
+}
+
+// The free memory that may be resident (pool lock).
+fn dirty_bytes() usize {
+    return retained + @sub_sat(wild_dirty, wild_lo);
+}
+
+// Decay: free memory goes back to the system once it has stayed unused for a
+// while. Time is divided into epochs of EPOCH_NS; the pool counts the bytes
+// freed in each of the last EPOCHS, and of the free memory that may be
+// resident it keeps no more than those counts weighted by age, along a
+// smooth curve from all (this epoch) to none (EPOCHS epochs ago). Every
+// DECAY_EVERY pool operations it looks at the clock; when an epoch has
+// passed, it gives back what is over that limit: the wilderness first, then
+// free blocks, the biggest first. (RETAIN still gives big blocks back at once.)
+fn decay_tick() void {
+    // (WebAssembly memory cannot shrink; and a freestanding module's host
+    // need not provide the clock, so the call is not compiled there)
+    if not (@target_arch("wasm32") or @target_arch("wasm64")) {
+        decay_ops += 1;
+        if decay_ops >= DECAY_EVERY {
+            decay_ops = 0;
+            decay_at(ax_clock_ns(1));
+        }
+    }
+}
+
+// The weight of memory freed `age` epochs ago, out of 1024.
+fn decay_weight(age: usize) u64 {
+    if age >= EPOCHS {
+        return 0;
+    }
+    let x = (@as(u64, age) * 1024) / @as(u64, EPOCHS);
+    return 1024 - ((x * x * (3072 - (2 * x))) >> 20);
+}
+
+// The decay at time `now` (monotonic nanoseconds; pool lock).
+fn decay_at(now: i64) void {
+    if now <= 0 {
+        return;  // no clock
+    }
+    if decay_start == 0 {
+        decay_start = now;
+        return;
+    }
+    let k = (now - decay_start) / EPOCH_NS;
+    if k <= 0 {
+        return;
+    }
+    decay_start += k * EPOCH_NS;
+    let mut passed = EPOCHS;
+    if k < 20 {  // (EPOCHS)
+        passed = @truncate(usize, k);
+    }
+    for _e in 0..passed {
+        decay_epoch = (decay_epoch + 1) % EPOCHS;
+        freed_in[decay_epoch] = 0;
+    }
+    let mut keep: u64 = 0;
+    for age in 0..EPOCHS {
+        let e = ((decay_epoch + EPOCHS) - age) % EPOCHS;
+        keep += (@as(u64, freed_in[e]) * decay_weight(age)) >> 10;
+    }
+    let limit = @truncate(usize, @min(keep, @as(u64, @max_value(usize))));
+    if dirty_bytes() > limit {
+        purge(limit);
+    }
+}
+
+// Gives back about `over` bytes of the wilderness's resident part (its top).
+fn purge_wild(over: usize) void {
+    let wd = @sub_sat(wild_dirty, wild_lo);
+    if wd == 0 {
+        return;
+    }
+    let lo_page = (wild_lo + PAGE - 1) & ~(PAGE - 1);
+    let mut a = lo_page;
+    if over < wd {
+        a = @max(lo_page, (wild_dirty - over) & ~(PAGE - 1));
+    }
+    if a < wild_dirty {
+        given_back += @as(u64, whole_pages(a, wild_dirty));
+        @memory_discard(a, wild_dirty - a);
+    }
+    wild_dirty = @max(a, wild_lo);
+    if a == lo_page {
+        wild_dirty = wild_lo;  // (what is left is part of a page)
+    }
+}
+
+// Gives back free memory until no more than `limit` bytes of it may be
+// resident (or what is left cannot be: parts of pages).
+fn purge(limit: usize) void {
+    purge_wild(dirty_bytes() - limit);
+    let mut bi = NBINS;
+    while (bi > 0) and (retained > limit) {
+        bi -= 1;
+        let mut b = bins[bi];
+        while (b != 0) and (retained > limit) {
+            let blk = block(b);
+            if blk.dirty > 0 {
+                let d = give_back(b, blk.size, blk.dirty, retained - limit);
+                retained -= blk.dirty - d;
+                blk.dirty = d;
+            }
+            b = blk.next;
+        }
+    }
+}
+
+// How much of [a, b), in the wilderness, may be resident.
+fn wild_dirty_in(a: usize, b: usize) usize {
+    return @sub_sat(@min(b, wild_dirty), a);
 }
 
 // Takes `pages` more pages from the system; false if there are none.
@@ -368,15 +600,17 @@ fn grow(pages: usize) bool {
         if wild_hi > wild_lo {
             let rest_at = wild_lo;
             let rest = wild_hi - wild_lo;
+            let d = wild_dirty_in(rest_at, wild_hi);
             wild_lo = base;
             block(rest_at).prev_free = 0;
-            bin_insert(rest_at, rest);
-            retained += rest;
+            bin_insert(rest_at, rest, d);
         }
         wild_lo = base;
+        wild_dirty = base;
         clean = base;
     }
     wild_hi = base + (n * PAGE);
+    mapped += n * PAGE;
     return true;
 }
 
@@ -385,13 +619,13 @@ fn block_alloc(size: usize) usize {
     let mut s = take_free(size);
     if s != 0 {
         fresh_at = s + size;  // (none of it is known to be zero)
-        took(block(s).size);
         let rest = block(s).size - size;
         if rest >= UNIT {
             let t = s + size;
+            let d = block(s).dirty;
             block(t).prev_free = 0;
             block(s).size = size;
-            bin_insert(t, rest);
+            bin_insert(t, rest, d);
         }
     } else {
         if (wild_hi - wild_lo) < size {
@@ -415,6 +649,7 @@ fn block_alloc(size: usize) usize {
     }
     block(s).magic = tag(MAGIC_USED, s);
     set_prev_free(s + block(s).size, 0);
+    decay_tick();
     return s;
 }
 
@@ -425,6 +660,10 @@ fn span_take() usize {
         span_cache = span(s).next;
         span_cached -= 1;
         return s;
+    }
+    let b = span_from_bins();
+    if b != 0 {
+        return b;
     }
     let mut a = (wild_lo + PAGE - 1) & ~(PAGE - 1);
     if (a + PAGE) > wild_hi {
@@ -438,8 +677,7 @@ fn span_take() usize {
         block(wild_lo).prev_free = 0;
         let g = wild_lo;
         wild_lo = a;
-        bin_insert(g, gap);
-        retained += gap;
+        bin_insert(g, gap, wild_dirty_in(g, a));
     }
     wild_lo = a + PAGE;
     clean = @max(clean, wild_lo);
@@ -450,6 +688,42 @@ fn span_take() usize {
     if gap > 0 {
         sp.prev_free = 1;
     }
+    return a;
+}
+
+// A span carved from a free block (spans given back are reused, rather than
+// the wilderness growing), or 0 if no free block holds an aligned span.
+fn span_from_bins() usize {
+    let mut s = take_free(PAGE);
+    if s != 0 {
+        if (((s + PAGE - 1) & ~(PAGE - 1)) + PAGE) > (s + block(s).size) {
+            bin_insert(s, block(s).size, block(s).dirty);  // (too small once aligned)
+            s = take_free(2 * PAGE);
+        }
+    }
+    if s == 0 {
+        return 0;
+    }
+    let size = block(s).size;
+    let d = block(s).dirty;
+    let a = (s + PAGE - 1) & ~(PAGE - 1);
+    let gap = a - s;
+    if gap > 0 {
+        bin_insert(s, gap, d);
+    }
+    let rest = (s + size) - (a + PAGE);
+    if rest > 0 {
+        block(a + PAGE).prev_free = 0;
+        bin_insert(a + PAGE, rest, d);
+    }
+    let sp = span(a);
+    sp.magic = tag(MAGIC_SPAN, a);
+    sp.size = PAGE;
+    sp.prev_free = 0;
+    if gap > 0 {
+        sp.prev_free = 1;
+    }
+    decay_tick();
     return a;
 }
 
@@ -544,23 +818,120 @@ fn span_alloc(sp: *mut Span, h: usize) usize {
     return p;
 }
 
+// Takes an object of class c from heap h (locked), or 0 if memory is
+// exhausted.
+fn heap_alloc(h: usize, c: usize) usize {
+    let s = active[(h * NCLS) + c];
+    if s != 0 {
+        let sp = span(s);
+        if (sp.free != 0) or (sp.bump < sp.end) {
+            return span_alloc(sp, h);
+        }
+    }
+    return refill(h, c);
+}
+
+// Puts span s, which has a free object again, in its heap's list of partial
+// spans: in address order as far as a few steps go, so that refill (which
+// takes the first) prefers low spans and high ones can drain and go back.
+fn partial_insert(i: usize, s: usize) void {
+    let sp = span(s);
+    sp.state = PARTIAL;
+    let mut before: usize = 0;
+    let mut q = partial[i];
+    let mut k: u32 = 0;
+    while (q != 0) and (q < s) and (k < 16) {
+        before = q;
+        q = span(q).next;
+        k += 1;
+    }
+    sp.prev = before;
+    sp.next = q;
+    if before != 0 {
+        span(before).next = s;
+    } else {
+        partial[i] = s;
+    }
+    if q != 0 {
+        span(q).prev = s;
+    }
+}
+
+// Takes up to n more objects from span sp of heap h (locked), linked after
+// `last` (whose link is set, to 0 after the last); returns how many.
+fn span_take_batch(sp: *mut Span, h: usize, last0: usize, n: u32) u32 {
+    let mut last = last0;
+    let mut got: u32 = 0;
+    // the span's free list is linked already: cut it after n objects
+    let f = sp.free;
+    if (f != 0) and (n > 0) {
+        let mut q = f;
+        got = 1;
+        while (got < n) and (word(q).* != 0) {
+            q = word(q).*;
+            got += 1;
+        }
+        word(last).* = f;
+        last = q;
+        sp.free = word(q).*;
+    }
+    // then objects never handed out
+    let os = @as(usize, sp.osize);
+    let mut b = sp.bump;
+    while (got < n) and (b < sp.end) {
+        word(last).* = b;
+        last = b;
+        b += os;
+        got += 1;
+    }
+    sp.bump = b;
+    word(last).* = 0;
+    sp.used += got;
+    heap_bytes[h] += @as(usize, got) * os;
+    return got;
+}
+
+// Returns object p (checked) to its span, of heap h (locked).
+fn span_free(h: usize, p: usize) void {
+    let s = p & ~(PAGE - 1);
+    let sp = span(s);
+    if p == sp.free {
+        @trap();  // freed twice
+    }
+    word(p).* = sp.free;
+    sp.free = p;
+    sp.used -= 1;
+    heap_bytes[h] -= @as(usize, sp.osize);
+    if sp.state == FULL {
+        partial_insert((h * NCLS) + @as(usize, sp.cls), s);
+    } else if (sp.state == PARTIAL) and (sp.used == 0) {
+        partial_remove((h * NCLS) + @as(usize, sp.cls), s);
+        pool_enter();
+        span_give(s);
+        pool_leave();
+    }
+}
+
+// Traps unless p is an object of a span, of class c0 or above (an aligned
+// allocation may come from a larger class than its size's).
+fn small_check(p: usize, c0: usize) void {
+    let s = p & ~(PAGE - 1);
+    let sp = span(s);
+    if (sp.magic != tag(MAGIC_SPAN, s)) or (sp.cls < @truncate(u32, c0)) or (sp.state == CACHED) or
+       not is_object_start(sp, s, p) {
+        @trap();  // not an object of this size from the allocator
+    }
+}
+
+// An object of class c straight from the thread's heap (no cache: one thread,
+// or the address sanitizer's allocations).
 fn small_alloc(c: usize) usize {
-    let h = heap_index();
+    let h = my_heap();
     let m = multi;
     if m {
         lock(&mut heap_lock[h]);
     }
-    let s = active[(h * NCLS) + c];
-    let mut r: usize = 0;
-    if s != 0 {
-        let sp = span(s);
-        if (sp.free != 0) or (sp.bump < sp.end) {
-            r = span_alloc(sp, h);
-        }
-    }
-    if r == 0 {
-        r = refill(h, c);
-    }
+    let r = heap_alloc(h, c);
     if m {
         unlock(&mut heap_lock[h]);
     }
@@ -568,45 +939,248 @@ fn small_alloc(c: usize) usize {
 }
 
 fn small_free(p: usize, c0: usize) void {
-    let s = p & ~(PAGE - 1);
-    let sp = span(s);
-    // (an aligned allocation may come from a larger class than its size's)
-    if (sp.magic != tag(MAGIC_SPAN, s)) or (sp.cls < @truncate(u32, c0)) or (sp.state == CACHED) {
-        @trap();  // not an object of this size from the allocator
-    }
-    let c = @as(usize, sp.cls);
-    // the start of an object handed out (not inside one), and not the one
-    // freed last (a double free would put it on the list twice)
-    if not is_object_start(sp, s, p) or (p == sp.free) {
-        @trap();
-    }
-    let h = @as(usize, sp.heap);
+    small_check(p, c0);
+    let h = @as(usize, span(p & ~(PAGE - 1)).heap);
     let m = multi;
     if m {
         lock(&mut heap_lock[h]);
     }
-    word(p).* = sp.free;
-    sp.free = p;
-    sp.used -= 1;
-    heap_bytes[h] -= @as(usize, sp.osize);
-    if sp.state == FULL {
-        let i = (h * NCLS) + c;
-        sp.state = PARTIAL;
-        sp.prev = 0;
-        sp.next = partial[i];
-        if sp.next != 0 {
-            span(sp.next).prev = s;
+    span_free(h, p);
+    if m {
+        unlock(&mut heap_lock[h]);
+    }
+}
+
+// --- the per-thread caches -----------------------------------------------------
+
+fn cache_cap(c: usize) u32 {
+    let n = CACHE_BYTES / @as(usize, class_size[c]);
+    return @truncate(u32, @min(@max(n, @as(usize, CACHE_MIN)), @as(usize, CACHE_MAX)));
+}
+
+fn cache_of(a: usize) *mut TCache {
+    return @ptr_from_int(*mut TCache, a);
+}
+
+// Gives the calling thread a heap (the one fewest threads use) and its
+// cache its limits, the first time.
+fn cache_setup() void {
+    if tc.heap != 0 {
+        return;
+    }
+    pool_enter();
+    let mut h: usize = 0;
+    if multi {
+        for k in 1..nheaps {
+            if heap_threads[k] < heap_threads[h] {
+                h = k;
+            }
         }
-        partial[i] = s;
-    } else if (sp.state == PARTIAL) and (sp.used == 0) {
-        partial_remove((h * NCLS) + c, s);
-        pool_enter();
-        span_give(s);
-        pool_leave();
+    }
+    heap_threads[h] += 1;
+    tc.heap = @truncate(u32, h + 1);
+    let me = @int_from_ptr(&mut tc);
+    tc.prev = 0;
+    tc.next = caches;
+    if caches != 0 {
+        cache_of(caches).prev = me;
+    }
+    caches = me;
+    pool_leave();
+    for c in 0..NCLS {
+        tc.limit[c] = @min(CACHE_START, cache_cap(c));
+    }
+}
+
+/// An object of class c, from the thread's cache; 0 if memory is exhausted.
+/// (Before a second thread starts there is no lock to save, and objects come
+/// from their spans, small_alloc and small_free: so that allocations fill the
+/// current span, and spans whose objects are freed drain and go back, rather
+/// than being spread by a cache's reuse of whatever was freed last. Measured,
+/// that kept the memory of a shrinking workload from going back.)
+fn cache_alloc(c: usize) usize {
+    let p = tc.head[c];
+    if p != 0 {
+        tc.head[c] = word(p).*;
+        tc.count[c] -= 1;
+        return p;
+    }
+    return cache_miss(c);
+}
+
+// The cache of class c is empty: refills it with a batch from the thread's
+// heap, and returns one object.
+fn cache_miss(c: usize) usize {
+    cache_setup();
+    let mut lim = tc.limit[c];
+    let cap = cache_cap(c);
+    if lim < cap {
+        lim = @min(cap, lim * 2);
+        tc.limit[c] = lim;
+    }
+    let want = @max(lim / 2, 1);
+    let h = @as(usize, tc.heap - 1);
+    let m = multi;
+    if m {
+        lock(&mut heap_lock[h]);
+    }
+    // the first object as one alloc would take it (refilling the heap's span
+    // if need be), then more from the same span
+    let first = heap_alloc(h, c);
+    let mut got: u32 = 0;
+    if first != 0 {
+        got = 1 + span_take_batch(span(active[(h * NCLS) + c]), h, first, want - 1);
     }
     if m {
         unlock(&mut heap_lock[h]);
     }
+    if first == 0 {
+        return 0;
+    }
+    tc.head[c] = word(first).*;
+    tc.count[c] = got - 1;
+    tc.misses += 1;
+    tc.touched |= @as(u32, 1) << @truncate(u32, c);
+    cache_tick();
+    return first;
+}
+
+/// Frees object p (of class c0 or, if aligned, above) into the thread's cache.
+fn cache_free(p: usize, c0: usize) void {
+    small_check(p, c0);
+    let c = @as(usize, span(p & ~(PAGE - 1)).cls);
+    let top = tc.head[c];
+    if p == top {
+        @trap();  // freed twice
+    }
+    word(p).* = top;
+    tc.head[c] = p;
+    tc.count[c] += 1;
+    if tc.count[c] > tc.limit[c] {
+        cache_overflow(c);
+    }
+}
+
+// The cache of class c is past its limit: gives back the older half.
+fn cache_overflow(c: usize) void {
+    cache_setup();
+    let mut lim = tc.limit[c];
+    if tc.count[c] <= lim {
+        return;
+    }
+    let cap = cache_cap(c);
+    if lim < cap {
+        lim = @min(cap, lim * 2);
+        tc.limit[c] = lim;
+    }
+    cache_trim(c, lim / 2);
+    tc.flushes += 1;
+    tc.touched |= @as(u32, 1) << @truncate(u32, c);
+    cache_tick();
+}
+
+// Gives back all but `keep` objects of class c's cache (the newest: they
+// are found without walking past them).
+fn cache_trim(c: usize, keep: u32) void {
+    let n = tc.count[c];
+    if n <= keep {
+        return;
+    }
+    let rest = tc.head[c];
+    let mut q = rest;
+    for _k in @as(u32, 1)..(n - keep) {
+        q = word(q).*;
+    }
+    tc.head[c] = word(q).*;
+    word(q).* = 0;
+    tc.count[c] = keep;
+    release_list(rest);
+}
+
+// Returns a list of objects to their spans, taking each heap's lock once.
+fn release_list(list0: usize) void {
+    let mut list = list0;
+    let m = multi;
+    while list != 0 {
+        let h = span(list & ~(PAGE - 1)).heap;
+        if m {
+            lock(&mut heap_lock[@as(usize, h)]);
+        }
+        let mut other: usize = 0;
+        let mut q = list;
+        while q != 0 {
+            let nx = word(q).*;
+            if span(q & ~(PAGE - 1)).heap == h {
+                span_free(@as(usize, h), q);
+            } else {
+                word(q).* = other;
+                other = q;
+            }
+            q = nx;
+        }
+        if m {
+            unlock(&mut heap_lock[@as(usize, h)]);
+        }
+        list = other;
+    }
+}
+
+// The incremental collection: a step every GC_EVERY misses and flushes.
+fn cache_tick() void {
+    tc.ticks += 1;
+    if (tc.ticks % GC_EVERY) != 0 {
+        return;
+    }
+    let c = @as(usize, tc.gc_next);
+    tc.gc_next = @truncate(u32, (c + 1) % NCLS);
+    let bit = @as(u32, 1) << @truncate(u32, c);
+    if ((tc.touched & bit) == 0) and (tc.count[c] > 0) {
+        cache_trim(c, tc.count[c] / 2);
+        tc.limit[c] = @max(tc.limit[c] / 2, @min(CACHE_MIN, cache_cap(c)));
+    }
+    tc.touched &= ~bit;
+}
+
+/// Called by std/thread when a thread's function returns: gives back the
+/// objects in the thread's cache, and its place on its heap.
+pub fn thread_exit() void {
+    if tc.heap == 0 {
+        return;
+    }
+    for c in 0..NCLS {
+        cache_trim(c, 0);
+        tc.limit[c] = 0;  // (a later free sets the cache up again)
+    }
+    pool_enter();
+    if tc.prev != 0 {
+        cache_of(tc.prev).next = tc.next;
+    } else {
+        caches = tc.next;
+    }
+    if tc.next != 0 {
+        cache_of(tc.next).prev = tc.prev;
+    }
+    heap_threads[@as(usize, tc.heap - 1)] -= 1;
+    gone_misses += tc.misses;
+    gone_flushes += tc.flushes;
+    pool_leave();
+    tc.heap = 0;
+    tc.misses = 0;
+    tc.flushes = 0;
+}
+
+// Bytes of free objects in the threads' caches (pool lock).
+fn cached_bytes() usize {
+    let mut n: usize = 0;
+    let mut a = caches;
+    while a != 0 {
+        let t = cache_of(a);
+        for c in 0..NCLS {
+            n += @as(usize, t.count[c]) * @as(usize, class_size[c]);
+        }
+        a = t.next;
+    }
+    return n;
 }
 
 // -----------------------------------------------------------------------------
@@ -751,14 +1325,14 @@ fn large_resize(p: usize, size: usize) bool {
             }
         } else if (magic_at(n) == tag(MAGIC_FREE, n)) and ((have + block(n).size) >= need) {
             let ns = block(n).size;
+            let d = block(n).dirty;
             bin_remove(n);
-            took(ns);
             let rest = (have + ns) - need;
             b.size = need;
             large_bytes += need - have;
             if rest >= UNIT {
                 block(s + need).prev_free = 0;
-                bin_insert(s + need, rest);
+                bin_insert(s + need, rest, d);
             } else {
                 b.size = have + ns;
                 large_bytes += rest;
@@ -1025,6 +1599,8 @@ extern "C" {
 
 import host "axiom" {
     fn ax_write(fd: i32, p: *u8, n: usize) isize;
+    fn ax_cpu_count() u32;
+    fn ax_clock_ns(clock: u32) i64;
 }
 
 /// Messages to stderr, built in a fixed buffer.
@@ -1262,7 +1838,7 @@ fn asan_alloc_aligned(size: usize, align: usize) usize {
     let mut pad: usize = 0;
     let mut q: usize = 0;
     if align <= 16 {
-        q = alloc_slow(total);
+        q = raw_alloc(total);
     } else {
         if align > AS_HDR {
             pad = align - AS_HDR;
@@ -1362,7 +1938,7 @@ fn asan_free(p: usize, size: usize) void {
             as_q_last = 0;
         }
         as_q_bytes -= n;
-        free_slow(old - pad, n + pad);
+        raw_free(old - pad, n + pad);
     }
     as_leave();
 }
@@ -1468,23 +2044,33 @@ pub fn alloc_bytes(size: usize) usize {
     if @sanitize_address() {
         return asan_alloc(size);
     }
-    // the common case, without calls: one thread, and an object in the
-    // current span of the class
-    if ((size -% 1) < 1024) and not multi {
-        let s = active[@as(usize, small_class[(size +% 15) >> 4])];
-        if s != 0 {
-            let sp = span(s);
-            let mut p = sp.free;
+    // the common case, without calls: an object in the thread's cache
+    // (threads) or in the current span of the class (one thread)
+    if (size -% 1) < 1024 {
+        let c = @as(usize, small_class[(size +% 15) >> 4]);
+        if multi {
+            let p = tc.head[c];
             if p != 0 {
-                sp.free = word(p).*;
-            } else if sp.bump < sp.end {
-                p = sp.bump;
-                sp.bump +%= @as(usize, sp.osize);
-            }
-            if p != 0 {
-                sp.used +%= 1;
-                heap_bytes[0] +%= @as(usize, sp.osize);
+                tc.head[c] = word(p).*;
+                tc.count[c] -%= 1;
                 return p;
+            }
+        } else {
+            let s = active[c];
+            if s != 0 {
+                let sp = span(s);
+                let mut q = sp.free;
+                if q != 0 {
+                    sp.free = word(q).*;
+                } else if sp.bump < sp.end {
+                    q = sp.bump;
+                    sp.bump +%= @as(usize, sp.osize);
+                }
+                if q != 0 {
+                    sp.used +%= 1;
+                    heap_bytes[0] +%= @as(usize, sp.osize);
+                    return q;
+                }
             }
         }
     }
@@ -1495,6 +2081,17 @@ fn alloc_slow(size: usize) usize {
     if size == 0 {
         return 0;
     }
+    if size <= SMALL_MAX {
+        if multi {
+            return cache_alloc(class_of(size));
+        }
+        return small_alloc(class_of(size));
+    }
+    return large_alloc(size);
+}
+
+// alloc_slow without the caches (the address sanitizer's memory).
+fn raw_alloc(size: usize) usize {
     if size <= SMALL_MAX {
         return small_alloc(class_of(size));
     }
@@ -1508,19 +2105,32 @@ pub fn free_bytes(p: usize, size: usize) void {
         asan_free(p, size);
         return;
     }
-    // the common case, without calls: one thread, and the span stays in the
-    // list it is in
-    if ((size -% 1) < 1024) and not multi {
-        let c = small_class[(size +% 15) >> 4];
+    // the common case, without calls: into the thread's cache, which has room
+    // (threads), or into the span, which stays in the list it is in (one thread)
+    if (size -% 1) < 1024 {
         let s = p & ~(PAGE - 1);
         let sp = span(s);
-        if (sp.magic == tag(MAGIC_SPAN, s)) and (sp.cls == @as(u32, c)) and is_object_start(sp, s, p) and
-           (p != sp.free) and ((sp.state == ACTIVE) or ((sp.state == PARTIAL) and (sp.used > 1))) {
-            word(p).* = sp.free;
-            sp.free = p;
-            sp.used -%= 1;
-            heap_bytes[0] -%= @as(usize, sp.osize);
-            return;
+        let c = small_class[(size +% 15) >> 4];
+        if not multi {
+            if (sp.magic == tag(MAGIC_SPAN, s)) and (sp.cls == @as(u32, c)) and is_object_start(sp, s, p) and
+               (p != sp.free) and ((sp.state == ACTIVE) or ((sp.state == PARTIAL) and (sp.used > 1))) {
+                word(p).* = sp.free;
+                sp.free = p;
+                sp.used -%= 1;
+                heap_bytes[0] -%= @as(usize, sp.osize);
+                return;
+            }
+        } else if (sp.magic == tag(MAGIC_SPAN, s)) and (sp.cls == @as(u32, c)) and (sp.state != CACHED) and
+                  is_object_start(sp, s, p) {
+            let k = @as(usize, c);
+            let top = tc.head[k];
+            let n = tc.count[k] +% 1;
+            if (p != top) and (n <= tc.limit[k]) {
+                word(p).* = top;
+                tc.head[k] = p;
+                tc.count[k] = n;
+                return;
+            }
         }
     }
     free_slow(p, size);
@@ -1530,6 +2140,19 @@ fn free_slow(p: usize, size: usize) void {
     if size == 0 {
         return;
     }
+    if (size <= SMALL_MAX) and not is_over_aligned(p) {
+        if multi {
+            cache_free(p, class_of(size));
+        } else {
+            small_free(p, class_of(size));
+        }
+        return;
+    }
+    large_free(p);
+}
+
+// free_slow without the caches (the address sanitizer's memory).
+fn raw_free(p: usize, size: usize) void {
     if (size <= SMALL_MAX) and not is_over_aligned(p) {
         small_free(p, class_of(size));
         return;
@@ -1586,7 +2209,10 @@ fn aligned_alloc(size: usize, align: usize) usize {
     while (@as(usize, class_size[c]) & (align - 1)) != 0 {
         c += 1;
     }
-    return small_alloc(c);
+    if @sanitize_address() or not multi {
+        return small_alloc(c);
+    }
+    return cache_alloc(c);
 }
 
 /// `size` bytes at a multiple of `align`, a power of two up to 4096 (other
@@ -1736,7 +2362,46 @@ pub fn in_use() usize {
     for h in 0..NHEAPS {
         n += heap_bytes[h];
     }
-    return n;
+    pool_enter();
+    let cached = cached_bytes();
+    pool_leave();
+    return @sub_sat(n, cached);
+}
+
+/// The allocator's counters (stats). With --sanitize=address they count the
+/// sanitizer's memory (headers, redzones, the quarantine) too.
+pub struct Stats {
+    small: usize,        // bytes of small objects in use (as their size classes)
+    large: usize,        // bytes of large blocks in use (whole 4 KiB units, headers included)
+    cached: usize,       // bytes of free small objects kept in threads' caches
+    mapped: usize,       // bytes taken from the system
+    retained: usize,     // bytes of free memory that may be resident (not given back)
+    given_back: u64,     // bytes given back to the system, in all
+    cache_misses: u64,   // times a thread's cache was refilled from its heap
+    cache_flushes: u64,  // times a thread's cache gave back a batch
+}
+
+/// The allocator's counters now. While other threads allocate, they are
+/// only approximately consistent with each other.
+pub fn stats() Stats {
+    let mut small: usize = 0;
+    for h in 0..NHEAPS {
+        small += heap_bytes[h];
+    }
+    pool_enter();
+    let cached = cached_bytes();
+    let mut misses = gone_misses;
+    let mut flushes = gone_flushes;
+    let mut a = caches;
+    while a != 0 {
+        misses += cache_of(a).misses;
+        flushes += cache_of(a).flushes;
+        a = cache_of(a).next;
+    }
+    let r = Stats.{ small: @sub_sat(small, cached), large: large_bytes, cached: cached, mapped: mapped,
+                    retained: dirty_bytes(), given_back: given_back, cache_misses: misses, cache_flushes: flushes };
+    pool_leave();
+    return r;
 }
 
 // -----------------------------------------------------------------------------
@@ -2028,4 +2693,75 @@ test "zeroed memory is zero, fresh or reused" {
         @expect_eq(big[12345], 0);
         free(big);
     }
+}
+
+test "free memory is given back as it ages" {
+    if @sanitize_address() or @target_arch("wasm32") or @target_arch("wasm64") {
+        return;  // (WebAssembly memory cannot shrink)
+    }
+    // a time past the clock's, so that the allocator's own looks at it
+    // change nothing
+    let t = ax_clock_ns(1) + 1_000_000_000_000;
+    decay_start = 0;
+    decay_at(t);
+    let none = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    let mut blocks: [8][]mut u8 = [none; 8];
+    for k in 0..blocks.len {
+        blocks[k] = alloc.[u8](1 << 20)!;
+        @mem_set(blocks[k], 1);
+    }
+    let guard = alloc.[u8](100000)!;  // (the blocks do not border the wilderness)
+    for k in 0..blocks.len {
+        free(blocks[k]);
+    }
+    let before = stats();
+    @expect(before.retained >= (8 << 20));
+    decay_at(t + 1_000_000_000);  // freed a second ago: kept
+    @expect(stats().retained >= (before.retained / 2));
+    decay_at(t + 11_000_000_000);  // freed 11 seconds ago: given back
+    let after = stats();
+    @expect(after.retained < (before.retained / 4));
+    @expect(after.given_back >= (@as(u64, before.retained - after.retained) / 2));
+    free(guard);
+}
+
+test "caches: limits, the collection, and emptying at a thread's end" {
+    if @sanitize_address() {
+        return;  // (the sanitizer uses no caches)
+    }
+    let base = in_use();
+    enable_threads();  // (batches, as with threads)
+    let c = class_of(64);
+    let xs = alloc.[[]mut u8](1000)!;
+    let mid = in_use();
+    for i in @as(usize, 0)..200 {
+        xs[i] = alloc.[u8](64)!;
+    }
+    for i in @as(usize, 0)..200 {
+        free(xs[i]);
+    }
+    let before = tc.count[c];
+    @expect((before > 0) and (before <= tc.limit[c]) and (tc.limit[c] <= cache_cap(c)));
+    @expect(in_use() == mid);  // (cached objects do not count)
+    // misses and flushes of another class collect the idle one
+    for _r in @as(usize, 0)..300 {
+        for i in @as(usize, 0)..1000 {
+            xs[i] = alloc.[u8](1000)!;
+        }
+        for i in @as(usize, 0)..1000 {
+            free(xs[i]);
+        }
+    }
+    @expect(tc.count[c] < before);
+    @expect(stats().cache_flushes > 0);
+    free(xs);
+    @expect(in_use() == base);
+    thread_exit();
+    for k in 0..NCLS {
+        @expect(tc.count[k] == 0);
+    }
+    @expect(stats().cached == 0);
+    let p = create.[u64](7)!;  // (the cache is set up again)
+    destroy(p);
+    @expect(in_use() == base);
 }

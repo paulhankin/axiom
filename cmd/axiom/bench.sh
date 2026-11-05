@@ -7,7 +7,8 @@
 #     LLVM's. (bootstrap.sh builds stage 1 at -O0 to save a minute, so this
 #     script builds its own LLVM reference at -O2.)
 #   - the programs in cmd/axiom/bench/ (loops over arrays, hashing, sorting,
-#     floating point) built by the bootstrap compiler (LLVM) and by stage 2, -O2.
+#     floating point, the allocator: alloc_*, some with threads) built by the
+#     bootstrap compiler (LLVM) and by stage 2, -O2.
 # Needs cmd/axiom/bootstrap.sh, and a Linux x86-64 or AArch64 machine (the
 # bootstrap compiler builds native code there only).
 #

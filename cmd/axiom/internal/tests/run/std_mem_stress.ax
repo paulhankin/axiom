@@ -1,0 +1,155 @@
+// The global allocator under many threads: each allocates objects of random
+// sizes (mostly small, some large), fills them with a pattern, frees some of
+// its own and passes others to the next thread, which checks and frees them;
+// threads end with full caches. Everything comes back.
+import "../lib/io.ax" as io;
+import "std/mem" as mem;
+import "std/sync" as sync;
+import "std/thread" as thread;
+
+const THREADS: usize = 8;
+const LIVE: usize = 300;
+
+struct Worker {
+    id: usize,
+    seed: u64,
+    inbox: *mut sync.Channel.[[]mut u8],   // from the thread before
+    outbox: *mut sync.Channel.[[]mut u8],  // to the thread after
+    bad: u64,
+    passed: u64,
+}
+
+fn rng(s: *mut u64) u64 {
+    s.* ^= s.* << 13;
+    s.* ^= s.* >> 7;
+    s.* ^= s.* << 17;
+    return s.*;
+}
+
+// The pattern: every byte from the object's length and a key in its first
+// bytes (so that a receiver can check an object it did not make).
+fn fill(x: []mut u8, key: u8) void {
+    for i in 0..x.len {
+        x[i] = @truncate(u8, i *% 7) ^ key;
+    }
+    if x.len > 0 {
+        x[0] = key;
+    }
+}
+
+fn intact(x: []u8) bool {
+    if x.len == 0 {
+        return true;
+    }
+    let key = x[0];
+    for i in 1..x.len {
+        if x[i] != (@truncate(u8, i *% 7) ^ key) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn size_for(r: u64) usize {
+    if (r % 50) == 0 {
+        return 8193 + @truncate(usize, (r >> 8) % 40000);  // large
+    }
+    if (r % 7) == 0 {
+        return 1 + @truncate(usize, (r >> 8) % 8192);
+    }
+    return 1 + @truncate(usize, (r >> 8) % 300);
+}
+
+fn take_inbox(w: *mut Worker) void {
+    loop {
+        let x = w.inbox.try_recv() catch return;
+        if not intact(x) {
+            w.bad += 1;
+        }
+        mem.free(x);
+    }
+}
+
+fn work(w: *mut Worker) void {
+    let mut seed = w.seed;
+    let live = mem.alloc.[[]mut u8](LIVE) catch return;
+    for i in 0..LIVE {
+        live[i] = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    }
+    for _step in @as(usize, 0)..30000 {
+        let r = rng(&mut seed);
+        let i = @truncate(usize, (r >> 32) % @as(u64, LIVE));
+        if not intact(live[i]) {
+            w.bad += 1;
+        }
+        if ((r % 8) == 0) and (live[i].len > 0) {
+            w.outbox.send(live[i]) catch return;  // the next thread frees it
+            w.passed += 1;
+        } else {
+            mem.free(live[i]);
+        }
+        let x = mem.alloc.[u8](size_for(rng(&mut seed))) catch return;
+        fill(x, @truncate(u8, r));
+        live[i] = x;
+        if (r % 4) == 0 {
+            take_inbox(w);
+        }
+    }
+    for i in 0..LIVE {
+        if not intact(live[i]) {
+            w.bad += 1;
+        }
+        mem.free(live[i]);
+    }
+    mem.free(live);
+}
+
+// Fills its cache with objects of every small size, then ends.
+fn fill_cache_and_end(n: usize) void {
+    let objs = mem.alloc.[[]mut u8](n) catch return;
+    for i in 0..n {
+        objs[i] = mem.alloc.[u8](1 + ((i * 37) % 8192)) catch return;
+    }
+    for i in 0..n {
+        mem.free(objs[i]);
+    }
+    mem.free(objs);
+}
+
+export fn run() void {
+    let base = mem.in_use();
+    let chans = mem.alloc.[sync.Channel.[[]mut u8]](THREADS) catch return;
+    for i in 0..THREADS {
+        // big enough for everything one thread passes on: no thread blocks
+        chans[i] = sync.Channel.[[]mut u8].init(8000) catch return;
+    }
+    let ws = mem.alloc.[Worker](THREADS) catch return;
+    let ts = mem.alloc.[thread.Thread.[*mut Worker]](THREADS) catch return;
+    for i in 0..THREADS {
+        ws[i] = Worker.{ id: i, seed: 0x9E37_79B9_7F4A_7C15 *% (@as(u64, i) + 1), inbox: &mut chans[i],
+                         outbox: &mut chans[(i + 1) % THREADS], bad: 0, passed: 0 };
+        ts[i] = thread.spawn(work, &mut ws[i]) catch return;
+    }
+    let h = thread.spawn(fill_cache_and_end, @as(usize, 5000)) catch return;
+    for i in 0..THREADS {
+        ts[i].join();
+    }
+    h.join();
+    let mut bad: u64 = 0;
+    let mut passed: u64 = 0;
+    for i in 0..THREADS {
+        take_inbox(&mut ws[i]);
+        bad += ws[i].bad;
+        passed += ws[i].passed;
+        chans[i].deinit();
+    }
+    mem.free(ts);
+    mem.free(ws);
+    mem.free(chans);
+    io.uint(bad);                      // expect: 0
+    io.boolean(passed > 10000);        // expect: true
+    io.boolean(mem.in_use() == base);  // expect: true
+    let st = mem.stats();
+    io.boolean((st.small + st.large) == mem.in_use());  // expect: true
+    io.boolean(st.cache_misses > 0);                    // expect: true
+}
