@@ -1,0 +1,446 @@
+// A randomized multithreaded fuzzer of the global allocator (std/mem):
+// `alloc <seed> [<threads> <mask>]`. The seed picks a configuration (threads,
+// waves of threads, sizes up to 2 MiB, how often objects are reallocated,
+// aligned, zeroed, handed to another thread, freed in bursts, how often
+// threads sleep long enough for free memory to be given back, end their
+// caches with mem.thread_exit, and whether a thread reads mem.stats() all
+// along). Every object carries a pattern, checked by whichever thread frees
+// it. Exit 0: everything intact, and in_use() back where it started; 1 and a
+// report on stderr otherwise (a trap or a signal is a failure too).
+// <threads> (0: the seed's) and <mask> (features turned off, below) help
+// narrow a failure down. cmd/axiom/internal/tests/tools/fuzz_alloc.py runs this.
+import "std/io" as io;
+import "std/mem" as mem;
+import "std/os" as os;
+import "std/sync" as sync;
+import "std/thread" as thread;
+
+const MAXT: usize = 16;
+const BOX: usize = 2048;
+const MAIN: usize = 99;  // the main thread's id, in reports
+
+struct Box {
+    m: sync.Mutex,
+    n: usize,
+    items: [2048][]mut u8,
+}
+
+struct Cfg {
+    threads: usize,
+    waves: usize,
+    steps: usize,
+    live: usize,
+    tiny: bool,      // sizes mostly 1..64
+    large_pct: u64,  // per 1000
+    huge_pct: u64,   // per 10000
+    pass_pct: u64,   // per 100: hand to the next thread
+    realloc_pct: u64,
+    aligned_pct: u64,
+    zeroed_pct: u64,
+    burst_pct: u64,  // per 10000: allocate a burst, free it all
+    sleep_pct: u64,  // per 100000: sleep up to 700 ms
+    exit_pct: u64,   // per 100000: mem.thread_exit mid-run
+    monitor: bool,
+}
+
+struct Worker {
+    id: usize,
+    seed: u64,
+    cfg: *Cfg,
+    boxes: *mut [16]Box,
+    shared: *mut Box,  // objects the main thread allocated before threads
+    bad: u64,
+}
+
+fn rng(s: *mut u64) u64 {
+    s.* ^= s.* << 13;
+    s.* ^= s.* >> 7;
+    s.* ^= s.* << 17;
+    return s.*;
+}
+
+fn fill(x: []mut u8, key: u8) void {
+    for i in 0..x.len {
+        x[i] = @truncate(u8, i *% 7) ^ key;
+    }
+    if x.len > 0 {
+        x[0] = key;
+    }
+}
+
+// The first n bytes hold the pattern (key in x[0]).
+fn intact_n(x: []u8, n: usize) bool {
+    if n == 0 {
+        return true;
+    }
+    let key = x[0];
+    for i in 1..n {
+        if x[i] != (@truncate(u8, i *% 7) ^ key) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn intact(x: []u8) bool {
+    return intact_n(x, x.len);
+}
+
+fn report(what: []u8, id: usize, len: usize) void {
+    io.stderr().print("alloc: ") catch {};
+    io.stderr().print(what) catch {};
+    io.stderr().print(" (thread ") catch {};
+    io.stderr().print_u64(@as(u64, id)) catch {};
+    io.stderr().print(", len ") catch {};
+    io.stderr().print_u64(@as(u64, len)) catch {};
+    io.stderr().print(")\n") catch {};
+}
+
+fn size_for(c: *Cfg, s: *mut u64) usize {
+    let r = rng(s);
+    if (r % 10000) < c.huge_pct {
+        return 65536 + @truncate(usize, (r >> 16) % (2 << 20));
+    }
+    if (r % 1000) < c.large_pct {
+        return 8193 + @truncate(usize, (r >> 16) % 120000);
+    }
+    if c.tiny {
+        return 1 + @truncate(usize, (r >> 16) % 64);
+    }
+    if (r % 5) == 0 {
+        return 1 + @truncate(usize, (r >> 16) % 8192);
+    }
+    return 1 + @truncate(usize, (r >> 16) % 1024);
+}
+
+fn box_put(b: *mut Box, x: []mut u8) bool {
+    b.m.lock();
+    let ok = b.n < BOX;
+    if ok {
+        b.items[b.n] = x;
+        b.n += 1;
+    }
+    b.m.unlock();
+    return ok;
+}
+
+fn drain(w: *mut Worker, b: *mut Box) void {
+    b.m.lock();
+    let n = b.n;
+    for i in 0..n {
+        let x = b.items[i];
+        if not intact(x) {
+            w.bad += 1;
+            report("received object corrupt", w.id, x.len);
+        }
+        mem.free(x);
+    }
+    b.n = 0;
+    b.m.unlock();
+}
+
+fn new_obj(w: *mut Worker, s: *mut u64) []mut u8 {
+    let c = w.cfg;
+    let r = rng(s);
+    let n = size_for(c, s);
+    let key = @truncate(u8, r >> 24);
+    if (r % 100) < c.aligned_pct {
+        let align = @as(usize, 16) << @truncate(u32, (r >> 8) % 9);  // 16..4096
+        let x = mem.alloc_aligned.[u8](n, align) catch {
+            w.bad += 1;
+            report("aligned alloc failed", w.id, n);
+            return @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        };
+        if (@int_from_ptr(x.ptr) & (align - 1)) != 0 {
+            w.bad += 1;
+            report("misaligned", w.id, n);
+        }
+        fill(x, key);
+        return x;
+    }
+    if ((r >> 4) % 100) < c.zeroed_pct {
+        let x = mem.alloc_zeroed.[u8](n) catch {
+            w.bad += 1;
+            report("zeroed alloc failed", w.id, n);
+            return @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+        };
+        for i in 0..x.len {
+            if x[i] != 0 {
+                w.bad += 1;
+                report("zeroed alloc not zero", w.id, n);
+                break;
+            }
+        }
+        fill(x, key);
+        return x;
+    }
+    let x = mem.alloc.[u8](n) catch {
+        w.bad += 1;
+        report("alloc failed", w.id, n);
+        return @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    };
+    fill(x, key);
+    return x;
+}
+
+fn burst(w: *mut Worker, s: *mut u64) void {
+    let n = 100 + @truncate(usize, rng(s) % 3000);
+    let xs = mem.alloc.[[]mut u8](n) catch return;
+    for i in 0..n {
+        xs[i] = new_obj(w, s);
+    }
+    for i in 0..n {
+        if not intact(xs[i]) {
+            w.bad += 1;
+            report("burst object corrupt", w.id, xs[i].len);
+        }
+        mem.free(xs[i]);
+    }
+    mem.free(xs);
+}
+
+fn work(w: *mut Worker) void {
+    let c = w.cfg;
+    let mut seed = w.seed;
+    let none = @slice_from_ptr(@ptr_from_int(*mut u8, 1), 0);
+    let live = mem.alloc.[[]mut u8](c.live) catch return;
+    for i in 0..c.live {
+        live[i] = none;
+    }
+    let me = &mut w.boxes[w.id];
+    let next = &mut w.boxes[(w.id + 1) % c.threads];
+    drain(w, w.shared);
+    for _step in 0..c.steps {
+        let r = rng(&mut seed);
+        let i = @truncate(usize, (r >> 32) % @as(u64, c.live));
+        if not intact(live[i]) {
+            w.bad += 1;
+            report("live object corrupt", w.id, live[i].len);
+        }
+        if ((r % 100) < c.realloc_pct) and (live[i].len > 0) {
+            let old = live[i].len;
+            // half the time a size near the old one (in place, often)
+            let mut n = size_for(c, &mut seed);
+            let q = rng(&mut seed);
+            if (q % 2) == 0 {
+                let d = 1 + @truncate(usize, (q >> 8) % @as(u64, (old / 4) + 1));
+                n = old + d;
+                if ((q >> 1) % 2) == 0 {
+                    n = @max(old - @min(d, old), 1);
+                }
+            }
+            let y = mem.realloc(live[i], n) catch {
+                w.bad += 1;
+                report("realloc failed", w.id, n);
+                continue;
+            };
+            if not intact_n(y, @min(old, n)) {
+                w.bad += 1;
+                report("realloc lost contents", w.id, n);
+            }
+            fill(y, @truncate(u8, r >> 40));
+            live[i] = y;
+        } else {
+            if (((r >> 8) % 100) < c.pass_pct) and (live[i].len > 0) and box_put(next, live[i]) {
+                // the next thread frees it
+            } else {
+                mem.free(live[i]);
+            }
+            live[i] = new_obj(w, &mut seed);
+        }
+        if ((r >> 16) % 8) == 0 {
+            drain(w, me);
+        }
+        let q = rng(&mut seed);
+        if (q % 10000) < c.burst_pct {
+            burst(w, &mut seed);
+        }
+        if (q % 100000) < c.sleep_pct {
+            thread.sleep_ms((q >> 20) % 700);
+        }
+        if ((q >> 3) % 100000) < c.exit_pct {
+            mem.thread_exit();  // and go on: the cache is set up again
+        }
+    }
+    for i in 0..c.live {
+        if not intact(live[i]) {
+            w.bad += 1;
+            report("live object corrupt at end", w.id, live[i].len);
+        }
+        mem.free(live[i]);
+    }
+    mem.free(live);
+    drain(w, me);
+}
+
+struct Mon {
+    stop: u32,
+    sum: u64,  // (so that the reads are not dropped)
+}
+
+// Reads the allocator's counters while the workers run (stats walks the
+// threads' caches).
+fn monitor(m: *mut Mon) void {
+    while @atomic_load(&m.stop) == 0 {
+        let st = mem.stats();
+        m.sum +%= @as(u64, st.mapped +% mem.in_use());
+        thread.sleep_ms(1);
+    }
+}
+
+fn pick(s: *mut u64, n: u64) u64 {
+    return rng(s) % n;
+}
+
+export fn main() i32 {
+    let mut seed: u64 = 1;
+    if os.arg_count() > 1 {
+        let a = os.arg(1) catch return 2;
+        seed = io.parse_u64(a) catch return 2;
+        mem.free(a);
+    }
+    let mut s = (seed *% 0x9E37_79B9_7F4A_7C15) | 1;
+    _ = rng(&mut s);
+    let mut c = Cfg.{
+        threads: 1 + @truncate(usize, pick(&mut s, 12)),
+        waves: 1 + @truncate(usize, pick(&mut s, 3)),
+        steps: 2000 + @truncate(usize, pick(&mut s, 30000)),
+        live: 16 + @truncate(usize, pick(&mut s, 800)),
+        tiny: pick(&mut s, 3) == 0,
+        large_pct: pick(&mut s, 60),
+        huge_pct: pick(&mut s, 20),
+        pass_pct: pick(&mut s, 50),
+        realloc_pct: pick(&mut s, 30),
+        aligned_pct: pick(&mut s, 15),
+        zeroed_pct: pick(&mut s, 20),
+        burst_pct: pick(&mut s, 30),
+        sleep_pct: pick(&mut s, 3) * pick(&mut s, 20),
+        exit_pct: pick(&mut s, 50),
+        monitor: pick(&mut s, 2) == 0,
+    };
+    // <threads> <mask>: the mask's bits turn off 1 realloc, 2 aligned, 4 zeroed, 8 bursts, 16 sleeps, 32 thread_exit,
+    // 64 monitor, 128 passing, 256 huge, 512 large
+    if os.arg_count() > 3 {
+        let a = os.arg(2) catch return 2;
+        let t = io.parse_u64(a) catch return 2;
+        mem.free(a);
+        if t > 0 {
+            c.threads = @truncate(usize, @min(t, 16));
+        }
+        let b = os.arg(3) catch return 2;
+        let m = io.parse_u64(b) catch return 2;
+        mem.free(b);
+        if (m & 1) != 0 {
+            c.realloc_pct = 0;
+        }
+        if (m & 2) != 0 {
+            c.aligned_pct = 0;
+        }
+        if (m & 4) != 0 {
+            c.zeroed_pct = 0;
+        }
+        if (m & 8) != 0 {
+            c.burst_pct = 0;
+        }
+        if (m & 16) != 0 {
+            c.sleep_pct = 0;
+        }
+        if (m & 32) != 0 {
+            c.exit_pct = 0;
+        }
+        if (m & 64) != 0 {
+            c.monitor = false;
+        }
+        if (m & 128) != 0 {
+            c.pass_pct = 0;
+        }
+        if (m & 256) != 0 {
+            c.huge_pct = 0;
+        }
+        if (m & 512) != 0 {
+            c.large_pct = 0;
+        }
+        io.stderr().print("threads ") catch {};
+        io.stderr().print_u64(@as(u64, c.threads)) catch {};
+        io.stderr().print(" waves ") catch {};
+        io.stderr().print_u64(@as(u64, c.waves)) catch {};
+        io.stderr().print(" realloc ") catch {};
+        io.stderr().print_u64(c.realloc_pct) catch {};
+        io.stderr().print(" aligned ") catch {};
+        io.stderr().print_u64(c.aligned_pct) catch {};
+        io.stderr().print(" large ") catch {};
+        io.stderr().print_u64(c.large_pct) catch {};
+        io.stderr().print(" huge ") catch {};
+        io.stderr().print_u64(c.huge_pct) catch {};
+        io.stderr().print("\n") catch {};
+    }
+    let base = mem.in_use();
+    let boxes = mem.new_zeroed.[[16]Box]() catch return 2;
+    for i in 0..MAXT {
+        boxes[i].m = sync.Mutex.init();
+    }
+    // objects allocated before the second thread, freed by the workers
+    let shared = mem.new_zeroed.[Box]() catch return 2;
+    shared.m = sync.Mutex.init();
+    let mut wm = Worker.{ id: MAIN, seed: rng(&mut s) | 1, cfg: &c, boxes: boxes, shared: shared, bad: 0 };
+    let pre = 1 + @truncate(usize, pick(&mut s, 2000));
+    for _k in 0..pre {
+        let x = new_obj(&mut wm, &mut s);
+        if not box_put(shared, x) {
+            mem.free(x);
+        }
+    }
+    let ws = mem.alloc.[Worker](c.threads) catch return 2;
+    let ts = mem.alloc.[thread.Thread.[*mut Worker]](c.threads) catch return 2;
+    let mut mon = Mon.{ stop: 0, sum: 0 };
+    let mut mt = @slice_from_ptr(@ptr_from_int(*mut thread.Thread.[*mut Mon], 8), 0);
+    if c.monitor {
+        mt = mem.alloc.[thread.Thread.[*mut Mon]](1) catch return 2;
+        mt[0] = thread.spawn(monitor, &mut mon) catch return 2;
+    }
+    let mut bad: u64 = 0;
+    for wave in 0..c.waves {
+        for i in 0..c.threads {
+            ws[i] = Worker.{ id: i, seed: rng(&mut s) | 1, cfg: &c, boxes: boxes, shared: shared, bad: 0 };
+            ts[i] = thread.spawn(work, &mut ws[i]) catch return 2;
+        }
+        // the main thread allocates and frees too, while the first wave runs
+        if wave == 0 {
+            burst(&mut wm, &mut s);
+        }
+        for i in 0..c.threads {
+            ts[i].join();
+        }
+        // (what a thread passed on after the next one ended)
+        for i in 0..c.threads {
+            drain(&mut ws[i], &mut boxes[i]);
+            bad += ws[i].bad;
+        }
+    }
+    drain(&mut wm, shared);
+    bad += wm.bad;
+    if c.monitor {
+        @atomic_store(&mut mon.stop, 1);
+        mt[0].join();
+        mem.free(mt);
+    }
+    mem.free(ts);
+    mem.free(ws);
+    mem.destroy(boxes);
+    mem.destroy(shared);
+    if bad != 0 {
+        report("objects bad", @truncate(usize, bad), 0);
+        return 1;
+    }
+    let u = mem.in_use();
+    if u != base {
+        report("in_use not back to base", @truncate(usize, u), base);
+        return 1;
+    }
+    let st = mem.stats();
+    if not @sanitize_address() and ((st.small + st.large) != u) {
+        report("stats disagree with in_use", st.small + st.large, u);
+        return 1;
+    }
+    return 0;
+}

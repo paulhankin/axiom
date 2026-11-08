@@ -43,6 +43,20 @@ limit).
   The fuzzer runs for a few minutes in the release steps (`docs/releasing.md`); a
   longer run with a new seed is worth it after a change to a parser.
 
+  `cmd/axiom/internal/tests/tools/fuzz_alloc.py` fuzzes the global allocator: it runs
+  `cmd/axiom/internal/tests/fuzz/alloc.ax` with random seeds, each picking threads,
+  sizes and a mix of allocations, frees (some by another thread), reallocations,
+  aligned and zeroed allocations, and pauses long enough for free memory to be given
+  back. Every object's contents are checked when it is freed, and the allocator's
+  counters must come back to where they started. It builds the program natively at
+  -O2 and -O0, with the address sanitizer, with the bootstrap compiler, and for
+  wasm32:
+
+      cmd/axiom/internal/tests/tools/fuzz_alloc.py --runs 500
+      cmd/axiom/internal/tests/tools/fuzz_alloc.py --minutes 30 --seed 0 o2 asan
+
+  It is worth a long run after a change to `std/mem`.
+
 - **The address sanitizer.** `axiom test --sanitize=address` (spec §16.8) traps on use
   after free, double frees and out-of-block accesses in the heap, and reports leaks.
 

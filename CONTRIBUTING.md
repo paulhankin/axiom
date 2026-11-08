@@ -52,7 +52,7 @@ the number of tests run at a time.
 | `lowering/*.ax` | Instruction selection: each `// lower: <flags> \| <regex> \| <count>` line builds the file with `--emit=asm` and counts the regex's matches. |
 | `traces/`, `profile/`, `sanitize/`, `units/`, `packages/`, `testing/`, `fmt/` | Stack traces and crash reports, the profiler, the address sanitizer, separate compilation, packages and manifests, `axiom test` itself, canonical formatting. |
 | `macos/`, `windows/` | Cross-builds for the other platforms; the binaries are inspected (and run under Wine where it is installed). |
-| `tools/` | Generators of test data, the std fuzzer (`fuzz.py`) and the C-library benchmark. |
+| `tools/` | Generators of test data, the std fuzzer (`fuzz.py`), the allocator's fuzzer (`fuzz_alloc.py`) and the C-library benchmark. |
 
 The suite also runs every `test` block in `std/`, builds the examples, and checks that
 every `.ax` file is in canonical form (`axiom fmt --check`). A new language feature gets

@@ -42,8 +42,8 @@ copyleft license.
 - `docs/spec.md`: the language specification. `examples/`: example programs and
   packages. `tools/`: editor support (`tools/editors/vscode/`).
 - `cmd/axiom/internal/tests/`: the test suite (`run.mjs`). Its `tools/` holds the
-  generators of test data, the std fuzzer (`fuzz.py`) and the C-library benchmark
-  (`bench_std.py`).
+  generators of test data, the std fuzzer (`fuzz.py`), the allocator's fuzzer
+  (`fuzz_alloc.py`) and the C-library benchmark (`bench_std.py`).
 - `docs/releasing.md`: releases (`cmd/axiom/release.sh`); the compiler's version is in
   `cmd/axiom/src/version.ax` and `cmd/axiom/bootstrap/src/version.h`.
 - `cmd/internal/tools/`: generators of std's checked-in tables (Unicode, codecs, ...).
