@@ -2175,7 +2175,9 @@ pub fn realloc_bytes(p: usize, old: usize, size: usize) usize {
         return 0;
     }
     if (old <= SMALL_MAX) and (size <= SMALL_MAX) {
-        if class_of(old) == class_of(size) {
+        // (an object aligned beyond HDR is in a block sized for `old`, not
+        // a class's object)
+        if (class_of(old) == class_of(size)) and not is_over_aligned(p) {
             return p;
         }
     } else if (old > SMALL_MAX) and (size > SMALL_MAX) and not is_over_aligned(p) and large_resize(p, size) {
@@ -2638,6 +2640,31 @@ test "freeing a large block twice traps" expect trap {
 test "freeing what did not come from alloc traps" expect trap {
     let big = alloc.[u8](200000)!;
     free(big[70000..70016]);
+}
+
+test "realloc within a size class moves an over-aligned object that would not fit" {
+    if @sanitize_address() {
+        return;
+    }
+    let base = in_use();
+    // 7169 bytes at 256: a block of two units, the object 256 bytes in, so
+    // the class's 8192 bytes do not fit after it
+    let x = alloc_aligned.[u8](7169, 256)!;
+    @mem_set(x, 0x5A);
+    let y = realloc(x, 8192)!;
+    let p = @int_from_ptr(y.ptr);
+    if is_over_aligned(p) {
+        let s = block(p - HDR).size;  // (the alias header names the block)
+        @expect((p + y.len) <= (s + block(s).size));
+    } else {
+        @expect(class_of(8192) == class_of(7169));  // a fresh object of the class
+    }
+    for i in @as(usize, 0)..7169 {
+        @expect(y[i] == 0x5A);
+    }
+    @mem_set(y, 0xA5);
+    free(y);
+    @expect_eq(in_use(), base);
 }
 
 test "huge requests fail cleanly" {
