@@ -285,8 +285,26 @@ pub fn phase(name: []u8) void {
         return;
     }
     let t = now_ns();
-    eprint(f2("axiom: %s ms  %s\n", ffmt("%8.1f", @float_from_int(f64, t - times_last) / 1000000.0), name));
+    let st = smem.stats();
+    let line = f2("axiom: %s ms  %s", ffmt("%8.1f", @float_from_int(f64, t - times_last) / 1000000.0),
+                  f2("%s MB in use  %s MB mapped", mbfmt(st.small + st.large), mbfmt(st.mapped)));
+    eprint(f3("%s  %s  %s\n", line, arena_report(), name));
     times_last = t;
+}
+
+fn mbfmt(n: usize) []u8 {
+    return ffmt("%5.0f", @float_from_int(f64, n) / 1048576.0);
+}
+
+// "name used/taken" in MB for an arena: bytes handed out, and bytes taken from the allocator.
+fn arena_mb(name: []u8, a: *Arena) []u8 {
+    let used = a.taken - a.slack - (a.end - a.cur);
+    return cat2(name, cat2(mbfmt(used), cat2("/", cat2(mbfmt(a.taken), " MB"))));
+}
+
+fn arena_report() []u8 {
+    return f3("%s  %s  %s", arena_mb("perm", &main_arena), arena_mb("tree", &tree_arena),
+              arena_mb("scratch", &scratch_arena));
 }
 
 pub fn die(msg: []u8) void {
@@ -312,15 +330,19 @@ struct Arena {
     chunks: *mut usize,  // (base, size, used) per chunk
     nchunks: usize,
     cap: usize,
-    at: usize,  // the chunk in use
+    at: usize,     // the chunk in use
+    taken: usize,  // bytes of the chunks
+    slack: usize,  // bytes left unused in the chunks passed over
 }
 
-let mut main_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0 };
-let mut scratch_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0,
-                                       at: 0 };
+let mut main_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0,
+                                    taken: 0, slack: 0 };
+let mut scratch_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0,
+                                       taken: 0, slack: 0 };
 // The syntax tree's (tree_new), given back once the IR is made from it
 // (release_tree): the optimizer's IR reuses the memory.
-let mut tree_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0 };
+let mut tree_arena: Arena = Arena.{ cur: 0, end: 0, chunks: @ptr_from_int(*mut usize, 0), nchunks: 0, cap: 0, at: 0,
+                                    taken: 0, slack: 0 };
 let mut scratch_depth: i32 = 0;
 let mut poison: i32 = -1;  // unknown, no, yes
 
@@ -333,6 +355,7 @@ fn chunk_slice(a: *mut Arena) []mut usize {
 // Moves to the next chunk with room for `size` (keeping the old ones of
 // the scratch arena to reuse), or a new one.
 fn next_chunk(a: *mut Arena, size: usize, keep: bool) void {
+    a.slack += a.end - a.cur;
     if keep and (a.nchunks != 0) {
         let cs = chunk_slice(a);
         cs[(a.at * 3) + 2] = a.cur - cs[a.at * 3];
@@ -375,6 +398,7 @@ fn next_chunk(a: *mut Arena, size: usize, keep: bool) void {
     cs[a.nchunks * 3] = @int_from_ptr(p);
     cs[(a.nchunks * 3) + 1] = bs;
     cs[(a.nchunks * 3) + 2] = 0;
+    a.taken += bs;
     a.at = a.nchunks;
     a.nchunks += 1;
     a.cur = @int_from_ptr(p);
@@ -438,6 +462,8 @@ pub fn release_tree() void {
     a.cur = 0;
     a.end = 0;
     a.at = 0;
+    a.taken = 0;
+    a.slack = 0;
 }
 
 pub fn perm_new[T]() *mut T {
@@ -467,6 +493,25 @@ pub fn scratch_begin() void {
 
 // Ends a scratch scope; the outermost one releases everything allocated
 // in it.
+// Gives back the chunks the scratch arena keeps for the next scope, outside
+// any scope, once no more code is made.
+pub fn scratch_release() void {
+    let a = &mut scratch_arena;
+    if (scratch_depth > 0) or (a.nchunks == 0) or poisoning() {
+        return;
+    }
+    let cs = chunk_slice(a);
+    for k in 0..a.nchunks {
+        free(@ptr_from_int(*mut void, cs[k * 3]));
+    }
+    a.nchunks = 0;
+    a.cur = 0;
+    a.end = 0;
+    a.at = 0;
+    a.taken = 0;
+    a.slack = 0;
+}
+
 pub fn scratch_end() void {
     scratch_depth -= 1;
     if scratch_depth > 0 {
@@ -500,6 +545,7 @@ pub fn scratch_end() void {
         let size = cs[(k * 3) + 1];
         let used = cs[(k * 3) + 2];
         if size > CHUNK {
+            a.taken -= size;
             free(@ptr_from_int(*mut void, base));
             continue;
         }
@@ -513,6 +559,7 @@ pub fn scratch_end() void {
     }
     a.nchunks = kept;
     a.at = 0;
+    a.slack = 0;
     if kept == 0 {
         a.cur = 0;
         a.end = 0;
@@ -569,6 +616,21 @@ pub fn dup(s: []u8) []u8 {
     return d;
 }
 
+// A copy of `s` on the heap, followed by a NUL, for the caller to free
+// (free).
+pub fn heap_dup(s: []u8) []u8 {
+    let p = @ptr_cast(*mut u8, malloc(s.len + 1));
+    let d = @slice_from_ptr(p, s.len);
+    @mem_copy(d, s);
+    @slice_from_ptr(p, s.len + 1)[s.len] = 0;
+    return d;
+}
+
+// Frees a slice from read_file_heap or heap_dup.
+pub fn free_heap(s: []u8) void {
+    free(@ptr_from_int(*mut void, @int_from_ptr(s.ptr)));
+}
+
 pub fn nosym() []u8 {
     return @slice_from_ptr(@ptr_from_int(*u8, 0), 0);
 }
@@ -606,12 +668,7 @@ pub struct List[T] {
             if self.cap != 0 {
                 ncap = self.cap * 2;
             }
-            let p = realloc(@ptr_cast(*mut void, self.data), ncap * @size_of(T));
-            if isvnil(p) {
-                die("out of memory");
-            }
-            self.data = @ptr_cast(*mut T, p);
-            self.cap = ncap;
+            self.set_cap(ncap);
         }
         let s = @slice_from_ptr(self.data, self.len + 1);
         s[self.len] = x;
@@ -623,12 +680,41 @@ pub struct List[T] {
         if n <= self.cap {
             return;
         }
-        let p = realloc(@ptr_cast(*mut void, self.data), n * @size_of(T));
+        self.set_cap(n);
+    }
+
+    // Room for n more items, doubling the capacity as push does.
+    pub fn room(self: *mut Self, n: usize) void {
+        if self.len + n <= self.cap {
+            return;
+        }
+        let mut ncap: usize = @max(16 / @max(@size_of(T), 1), 2);
+        if self.cap != 0 {
+            ncap = self.cap * 2;
+        }
+        while ncap < self.len + n {
+            ncap = ncap * 2;
+        }
+        self.set_cap(ncap);
+    }
+
+    // Appends n items and returns their slots, for the caller to fill in.
+    pub fn extend(self: *mut Self, n: usize) []mut T {
+        self.room(n);
+        let s = @slice_from_ptr(self.data, self.len + n);
+        let slots = s[self.len..];
+        self.len += n;
+        return slots;
+    }
+
+    // Reallocates the items to hold ncap of them.
+    fn set_cap(self: *mut Self, ncap: usize) void {
+        let p = realloc(@ptr_cast(*mut void, self.data), ncap * @size_of(T));
         if isvnil(p) {
             die("out of memory");
         }
         self.data = @ptr_cast(*mut T, p);
-        self.cap = n;
+        self.cap = ncap;
     }
 
     pub fn items(self: *Self) []mut T {
@@ -681,9 +767,8 @@ pub struct Buf {
     }
 
     pub fn s(self: *mut Buf, x: []u8) void {
-        for c in x {
-            self.b.push(c);
-        }
+        let d = self.b.extend(x.len);
+        @mem_copy(d, x);
     }
 
     pub fn c(self: *mut Buf, x: u8) void {
@@ -1769,7 +1854,9 @@ pub fn quit(code: i32) void {
 // -----------------------------------------------------------------------------
 // The file's bytes (followed by a NUL), or a nil slice if it can't be read.
 // (Read to the end: /proc files have no size.)
-pub fn read_file(path: []u8) []u8 {
+// The contents of the file on the heap, for the caller to free (free),
+// or nosym() if it cannot be read.
+pub fn read_file_heap(path: []u8) []u8 {
     let fd = ax_open(path.ptr, path.len, 0);
     if fd < 0 {
         return nosym();
@@ -1801,10 +1888,18 @@ pub fn read_file(path: []u8) []u8 {
         len += @int_cast(usize, n);
     }
     ax_close(fd);
-    let out = alloc(len + 1);
-    @mem_copy(@slice_from_ptr(out, len), @slice_from_ptr(buf, len));
-    free(@ptr_cast(*mut void, buf));
-    return @slice_from_ptr(out, len);
+    return @slice_from_ptr(buf, len);
+}
+
+pub fn read_file(path: []u8) []u8 {
+    let d = read_file_heap(path);
+    if isnos(d) {
+        return d;
+    }
+    let out = alloc(d.len + 1);
+    @mem_copy(@slice_from_ptr(out, d.len), d);
+    free_heap(d);
+    return @slice_from_ptr(out, d.len);
 }
 
 pub fn write_file(path: []u8, data: []u8) bool {

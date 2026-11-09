@@ -217,8 +217,9 @@ fn derived_from(v: *mut ir.Value, derived: []mut u64) u64 {
     return 0;
 }
 
-// The parameters of f that may be kept, given what is known of the others.
-fn kept_params(f: *mut ir.Func) u64 {
+// The parameters of f that may be kept, given what is known of the others;
+// the ids of the defined functions it calls directly are added to calls.
+fn kept_params(f: *mut ir.Func, calls: *mut u.List.[i32]) u64 {
     let derived = u.calloc_slice.[u64](@int_cast(usize, f.nvals) + 1);
     let mut again = true;
     while again {
@@ -270,6 +271,9 @@ fn kept_params(f: *mut ir.Func) u64 {
                 if u.notnil(g) and not ir.is_decl(g) {
                     kg = kept_bits(g);
                     np = g.params.len;
+                    if (g.id >= 0) and (@int_cast(usize, g.id) < kept.len) {
+                        calls.push(g.id);
+                    }
                 }
                 for k in 0..i.xs.len {
                     let mut e: u8 = 0;
@@ -309,21 +313,79 @@ pub fn find_kept_params(m: *mut ir.Module) void {
         }
         kept.push(x);
     }
+    // A function's bits depend only on its own body and on the bits of the
+    // functions it calls directly, and only ever grow. So after the first
+    // visit it is looked at again only when one of its callees' bits changed
+    // since. (tick counts the changes; stamp is the tick of each one, and
+    // seen the tick when a function was last looked at.) A function with no
+    // pointer parameter keeps none.
+    let n = m.funcs.len;
+    let mut calls: u.List.[i32] = u.List.[i32].empty();
+    let mut scratch: u.List.[i32] = u.List.[i32].empty();
+    let mut cstart: u.List.[usize] = u.List.[usize].empty();
+    let stamp = u.calloc_slice.[usize](n + 1);
+    let seen = u.calloc_slice.[usize](n + 1);
+    let mut tick: usize = 1;
     let mut again = true;
+    let mut first = true;
     while again {
         again = false;
-        for k in 0..m.funcs.len {
+        for k in 0..n {
             let f = m.funcs.get(k);
             if kept.get(k) == ~@as(u64, 0) {
+                if first {
+                    cstart.push(calls.len);
+                }
                 continue;
             }
-            let x = kept.get(k) | kept_params(f);
+            if first {
+                cstart.push(calls.len);
+                let mut ptrs = false;
+                for j in 0..f.params.len {
+                    if f.params[j].ty.kind == ir.T_PTR {
+                        ptrs = true;
+                    }
+                }
+                if not ptrs {
+                    seen[k] = tick;
+                    continue;
+                }
+            } else {
+                let mut stale = false;
+                for j in cstart.get(k)..cstart.get(k + 1) {
+                    if stamp[@int_cast(usize, calls.get(j))] > seen[k] {
+                        stale = true;
+                    }
+                }
+                if not stale {
+                    continue;
+                }
+            }
+            seen[k] = tick;
+            scratch.clear();
+            let mut x = kept.get(k);
+            if first {
+                x |= kept_params(f, &mut calls);
+            } else {
+                x |= kept_params(f, &mut scratch);
+            }
             if x != kept.get(k) {
                 kept.set(k, x);
+                tick += 1;
+                stamp[k] = tick;
                 again = true;
             }
         }
+        if first {
+            cstart.push(calls.len);
+        }
+        first = false;
     }
+    calls.deinit();
+    scratch.deinit();
+    cstart.deinit();
+    u.free_slice.[usize](stamp);
+    u.free_slice.[usize](seen);
 }
 
 /// Forgets what find_kept_params found.

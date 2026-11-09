@@ -296,7 +296,7 @@ builds with different settings do not share objects.
 | `AXIOM_X64_FALIGN=<a>` | Functions start at multiples of `a` bytes (default 16). |
 | `AXIOM_X64_LALIGN=<a>`, `AXIOM_X64_LMAX=<n>`, `AXIOM_X64_LMODE=1\|2` | Hot loop tops aligned to `a` bytes (default 0: not aligned) with at most `n` bytes of nops (default 15); mode 1 (default) aligns the targets of backward jumps, 2 any loop block not often fallen into. |
 | `AXIOM_X64_JCC=1` | No jump, call or return ends within or crosses a 32-byte boundary in a way the compare-and-jump erratum penalizes (see the head of `x64emit.ax`). |
-| `AXIOM_TIMES=1` | Print the time each phase of a build takes (parsing and checking, IR, the optimizer's phases, machine code, linking; each part's, for a program compiled in parts). |
+| `AXIOM_TIMES=1` | Print the time each phase of a build takes (parsing and checking, IR, the optimizer's phases, machine code, linking; each part's, for a program compiled in parts), with the memory in use and taken from the system after it, and how much of each of the compiler's arenas is used. |
 | `AXIOM_PARTS=<n>` | Compile the program in `n` parts (`backend.ax`), whatever its size; `1` for one. The test suite's stress run of parts sets it. |
 | `AXIOM_PROFILE=<file>`, `AXIOM_PROFILE_HZ=<rate>` | Read by a program built with the profiler: where to write raw samples and how often to take them. `axiom profile` sets them. |
 | `AXIOM_O0_PIPELINE=<passes>` | The bootstrap compiler's LLVM pass pipeline at `-O0` (default `always-inline,function(mem2reg,simplifycfg)`; empty for none). |
