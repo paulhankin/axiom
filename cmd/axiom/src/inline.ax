@@ -247,6 +247,8 @@ struct Node {
     on_stack: bool,
     scc: i32,
     calls: i32,  // direct call sites in the module
+    live: i32,   // the same, kept exact as functions change (retire); `calls` is what `want` reckons with
+    retired: bool,
     addr_taken: bool,
     cost: i32,        // cost(f), or -1: not known (f changed since)
     inlinable: i8,    // inlinable(f): 1 or 0, or -1: not known
@@ -376,6 +378,7 @@ fn build_graph(m: *mut ir.Module) void {
                 if u.notnil(g) {
                     n.callees.push(@int_cast(i32, g.aux));
                     node_of(g).calls += 1;
+                    node_of(g).live += 1;
                 } else if may_ref(x.a) {
                     note_ref(x.a);
                 }
@@ -658,8 +661,9 @@ pub fn inline_module(
             n.cost = -1;
             n.inlinable = -1;
             n.frame = -1;
+            let mut g = u.nil.[ir.Func]();
             if node_cost(n) > SMALL {
-                let g = split(m, n.f);
+                g = split(m, n.f);
                 if u.notnil(g) {
                     add_node(g);
                     n.cost = -1;
@@ -667,10 +671,76 @@ pub fn inline_module(
                     n.frame = -1;
                 }
             }
+            retire(n, g);
         }
     }
     order.deinit();
     remove_dead(m);
+}
+
+// The functions whose bodies were given back before the end (retire).
+let mut retired: u.List.[*mut ir.Func] = u.List.[*mut ir.Func].{ data: @ptr_from_int(*mut *mut ir.Func, 0), len: 0,
+                                                                 cap: 0 };
+
+// The direct calls in n's function, counted again (it changed).
+fn recount(n: *mut Node) void {
+    n.callees.clear();
+    let mut b = n.f.first;
+    while u.notnil(b) {
+        let mut x = b.first;
+        while u.notnil(x) {
+            let h = callee_of(x);
+            if u.notnil(h) {
+                n.callees.push(@int_cast(i32, h.aux));
+                node_of(h).live += 1;
+            }
+            x = x.next;
+        }
+        b = b.next;
+    }
+}
+
+// Whether nothing can call or name n's function any more: internal, never
+// used as a value, and with no direct call left.
+fn unreachable(n: *Node) bool {
+    let f = n.f;
+    return not n.retired and (n.live <= 0) and not n.addr_taken and (f.linkage == ir.LINK_INTERNAL) and
+           not ir.is_decl(f) and (f.export_name.len == 0);
+}
+
+// After n's function changed (calls inlined, simplified, its cold part g
+// split off, or nil): the functions it called that nothing calls now give
+// their bodies back at once, and so on down, for the inlining still to come
+// to reuse (a function inlined into its only callers is otherwise garbage
+// until the end, when remove_dead takes it out of the module). The count of
+// each function's direct call sites (Node.live) is kept exact for this: a
+// function's are counted again when it changes.
+fn retire(n: *mut Node, g: *mut ir.Func) void {
+    let mut work = u.List.[i32].empty();
+    for k in 0..n.callees.len {
+        let c = n.callees.get(k);
+        nodes.get(@int_cast(usize, c)).live -= 1;
+        work.push(c);
+    }
+    if u.notnil(g) {
+        recount(node_of(g));
+    }
+    recount(n);
+    while work.len > 0 {
+        let x = nodes.get(@int_cast(usize, work.pop()));
+        if (x == n) or not unreachable(x) {
+            continue;
+        }
+        x.retired = true;
+        retired.push(x.f);
+        for k in 0..x.callees.len {
+            let c = x.callees.get(k);
+            nodes.get(@int_cast(usize, c)).live -= 1;
+            work.push(c);
+        }
+        ir.drop_body(x.f);
+    }
+    work.deinit();
 }
 
 // Deletes internal functions that nothing refers to.
@@ -680,6 +750,11 @@ fn remove_dead(m: *mut ir.Module) void {
     let mut any = false;
     // functions only called by dead functions die too: iterate
     let mut dead = u.newn.[bool](m.funcs.len + 1);
+    for k in 0..retired.len {
+        dead[@int_cast(usize, retired.get(k).aux)] = true;  // (declarations now)
+        any = true;
+    }
+    retired.clear();
     let mut changed = true;
     while changed {
         changed = false;
@@ -701,6 +776,9 @@ fn remove_dead(m: *mut ir.Module) void {
         let f = m.funcs.get(i);
         if dead[i] {
             any = true;
+            if not ir.is_decl(f) {
+                ir.drop_body(f);
+            }
             continue;
         }
         f.id = @int_cast(i32, kept.len);
