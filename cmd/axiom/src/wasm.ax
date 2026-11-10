@@ -2400,42 +2400,73 @@ fn inlines_effects(i: *mut ir.Value) bool {
     return false;
 }
 
+// The depth of the expression at i (aux2: 1 + its inline operands' depths).
+fn tree_depth(i: *mut ir.Value) i64 {
+    let mut d: i64 = 0;
+    let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+    for o in ops {
+        if u.notnil(o) and (o.kind == ir.V_INST) and (o.flag == FL_INLINE) {
+            d = @max(d, o.aux2);
+        }
+    }
+    for k in 0..i.xs.len {
+        let o = i.xs.get(k);
+        if (o.kind == ir.V_INST) and (o.flag == FL_INLINE) {
+            d = @max(d, o.aux2);
+        }
+    }
+    return d + 1;
+}
+
+// An expression is pushed by calls as deep as it is (expr): one deeper than
+// this is cut, its operand left in a local (a sum of thousands of terms
+// would otherwise run the compiler out of stack).
+const MAX_TREE: i64 = 256;
+
 fn classify(f: *mut ir.Func) void {
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
         while u.notnil(i) {
-            let o = i.op;
-            if o == ir.OP_ALLOCA {
-                i.flag = FL_REMAT;
-            } else if (o == ir.OP_PTRADD) and (i.b.kind == ir.V_CINT) and (i.uses > 1) and
-                      ((i.a.kind != ir.V_INST) or (i.a.flag == FL_LOCAL) or (i.a.flag == FL_REMAT)) {
-                i.flag = FL_REMAT;
-            } else if (i.uses == 1) and (o != ir.OP_PHI) and pure_op(i) and (i.user.op == ir.OP_PHI) and
-                      phi_from(i.user, i) == b {
-                // computed where the phi copy at the end of this block pushes it;
-                // that is on one edge only unless the block ends in a plain branch
-                if not inlines_effects(i) or ((ir.terminator(b).op == ir.OP_BR) and no_effects_between(i, ir.vnil())) {
-                    i.flag = FL_INLINE;
-                }
-            } else if (i.uses == 1) and (o != ir.OP_PHI) and not ir.is_term(o) and (i.user.blk == b) and
-                      (i.user.op != ir.OP_PHI) and (i.user.pos > i.pos) {
-                if pure_op(i) {
-                    // a load inside it moves to the user too
-                    if not inlines_effects(i) or no_effects_between(i, i.user) {
-                        i.flag = FL_INLINE;
-                    }
-                } else if (o == ir.OP_LOAD) or (o == ir.OP_CALL) or (o == ir.OP_INTR) or (o == ir.OP_RMW) or
-                          (o == ir.OP_CMPXCHG) {
-                    // only if nothing with effects happens in between
-                    if no_effects_between(i, i.user) {
-                        i.flag = FL_INLINE;
-                    }
-                }
+            classify_one(b, i);
+            i.aux2 = tree_depth(i);
+            if (i.flag == FL_INLINE) and (i.aux2 > MAX_TREE) {
+                i.flag = FL_LOCAL;
             }
             i = i.next;
         }
         b = b.next;
+    }
+}
+
+fn classify_one(b: *mut ir.Block, i: *mut ir.Value) void {
+    let o = i.op;
+    if o == ir.OP_ALLOCA {
+        i.flag = FL_REMAT;
+    } else if (o == ir.OP_PTRADD) and (i.b.kind == ir.V_CINT) and (i.uses > 1) and
+              ((i.a.kind != ir.V_INST) or (i.a.flag == FL_LOCAL) or (i.a.flag == FL_REMAT)) {
+        i.flag = FL_REMAT;
+    } else if (i.uses == 1) and (o != ir.OP_PHI) and pure_op(i) and (i.user.op == ir.OP_PHI) and
+              phi_from(i.user, i) == b {
+        // computed where the phi copy at the end of this block pushes it;
+        // that is on one edge only unless the block ends in a plain branch
+        if not inlines_effects(i) or ((ir.terminator(b).op == ir.OP_BR) and no_effects_between(i, ir.vnil())) {
+            i.flag = FL_INLINE;
+        }
+    } else if (i.uses == 1) and (o != ir.OP_PHI) and not ir.is_term(o) and (i.user.blk == b) and
+              (i.user.op != ir.OP_PHI) and (i.user.pos > i.pos) {
+        if pure_op(i) {
+            // a load inside it moves to the user too
+            if not inlines_effects(i) or no_effects_between(i, i.user) {
+                i.flag = FL_INLINE;
+            }
+        } else if (o == ir.OP_LOAD) or (o == ir.OP_CALL) or (o == ir.OP_INTR) or (o == ir.OP_RMW) or
+                  (o == ir.OP_CMPXCHG) {
+            // only if nothing with effects happens in between
+            if no_effects_between(i, i.user) {
+                i.flag = FL_INLINE;
+            }
+        }
     }
 }
 
@@ -2669,9 +2700,13 @@ fn alloc_locals(f: *mut ir.Func, order: u.List.[*mut ir.Block]) void {
         for k in 0..occ.len {
             occ.set(k, false);
         }
+        // (word by word: few of a big function's values are live in a block)
         let li = live_in[@int_cast(usize, b.rpo)];
-        for k in 0..n {
-            if bit(li, @int_cast(u32, k)) {
+        for w in 0..words {
+            let mut bits = li[w];
+            while bits != 0 {
+                let k = (w * 64) + @int_cast(usize, @ctz(bits));
+                bits &= bits - 1;
                 if colour[k] < 0 {
                     fail("a value is live before it has a local");
                     continue;
@@ -2816,23 +2851,33 @@ fn branch_depth(from: *mut ir.Block, to: *mut ir.Block) u64 {
     return depth_of(CTX_BLOCK, to);
 }
 
-fn do_branch(from: *mut ir.Block, to: *mut ir.Block) void {
+// The branch from `from` to `to`: a `br` to a loop's start or to a merge
+// block's place (nil is returned), or nothing, where `to` is to be emitted
+// right here: then `to` is returned, for the caller to emit.
+fn branch_next(from: *mut ir.Block, to: *mut ir.Block) *mut ir.Block {
     phi_copies(from, to);
     if to.rpo <= from.rpo {
         op(0x0c);
         C.uleb(depth_of(CTX_LOOP, to));
-        return;
+        return u.nil.[ir.Block]();
     }
     if is_merge(to) {
         op(0x0c);
         C.uleb(depth_of(CTX_BLOCK, to));
-        return;
+        return u.nil.[ir.Block]();
     }
-    do_tree(to);
+    return to;
 }
 
-fn do_tree(x: *mut ir.Block) void {
-    // merge children, in decreasing reverse postorder
+fn do_branch(from: *mut ir.Block, to: *mut ir.Block) void {
+    let n = branch_next(from, to);
+    if u.notnil(n) {
+        do_tree(n);
+    }
+}
+
+// The merge children of x, in decreasing reverse postorder.
+fn merges_of(x: *mut ir.Block) u.List.[*mut ir.Block] {
     let mut ys = u.List.[*mut ir.Block].empty();
     for k in 0..x.dom_kids.len {
         let y = x.dom_kids.get(k);
@@ -2850,17 +2895,47 @@ fn do_tree(x: *mut ir.Block) void {
             j -= 1;
         }
     }
-    if is_header(x) {
-        op(0x03);
+    return ys;
+}
+
+// The code of x and of the blocks it dominates. What comes last in it, the
+// block a plain branch falls into or the last of x's merge children, is done
+// in a loop here, not by a call: a long run of statements is a chain of such
+// blocks as long as the function, and each call's frames would stay on the
+// compiler's stack.
+fn do_tree(x0: *mut ir.Block) void {
+    let mut x = x0;
+    loop {
+        let mut ys = merges_of(x);
+        if is_header(x) {
+            op(0x03);
+            op(0x40);
+            ctx.push(Ctx.{ kind: CTX_LOOP, target: x });
+            node_within(x, ys.items());
+            _ = ctx.pop();
+            op(0x0b);
+            ys.deinit();
+            return;
+        }
+        if ys.len == 0 {
+            ys.deinit();
+            let n = emit_block(x);
+            if u.isnil(n) {
+                return;
+            }
+            x = n;
+            continue;
+        }
+        let y = ys.get(0);
+        op(0x02);
         op(0x40);
-        ctx.push(Ctx.{ kind: CTX_LOOP, target: x });
-        node_within(x, ys.items());
+        ctx.push(Ctx.{ kind: CTX_BLOCK, target: y });
+        node_within(x, ys.items()[1..]);
         _ = ctx.pop();
         op(0x0b);
-    } else {
-        node_within(x, ys.items());
+        ys.deinit();
+        x = y;
     }
-    ys.deinit();
 }
 
 fn node_within(x: *mut ir.Block, ys: []mut *mut ir.Block) void {
@@ -2875,10 +2950,15 @@ fn node_within(x: *mut ir.Block, ys: []mut *mut ir.Block) void {
         do_tree(y);
         return;
     }
-    emit_block(x);
+    let n = emit_block(x);
+    if u.notnil(n) {
+        do_tree(n);
+    }
 }
 
-fn emit_block(x: *mut ir.Block) void {
+// The code of block x. Returns the block its last branch falls into, for
+// the caller to emit next (nil: none).
+fn emit_block(x: *mut ir.Block) *mut ir.Block {
     let mut i = x.first;
     while u.notnil(i) {
         let o = i.op;
@@ -2899,18 +2979,18 @@ fn emit_block(x: *mut ir.Block) void {
     let t = ir.terminator(x);
     let o = t.op;
     if o == ir.OP_BR {
-        do_branch(x, t.t1);
+        return branch_next(x, t.t1);
     } else if (o == ir.OP_CONDBR) and plain_branch(x, t.t1) {
         // br_if to the target, then the other side inline
         push(t.a);
         op(0x0d);
         C.uleb(branch_depth(x, t.t1));
-        do_branch(x, t.t2);
+        return branch_next(x, t.t2);
     } else if (o == ir.OP_CONDBR) and plain_branch(x, t.t2) {
         push_not(t.a);
         op(0x0d);
         C.uleb(branch_depth(x, t.t2));
-        do_branch(x, t.t1);
+        return branch_next(x, t.t1);
     } else if o == ir.OP_CONDBR {
         push(t.a);
         op(0x04);
@@ -2932,6 +3012,7 @@ fn emit_block(x: *mut ir.Block) void {
     } else {
         op(0x00);
     }
+    return u.nil.[ir.Block]();
 }
 
 fn emit_switch(x: *mut ir.Block, t: *mut ir.Value) void {

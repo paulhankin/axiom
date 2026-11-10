@@ -88,9 +88,14 @@ fn note_in(r: *mut Region, v: *mut ir.Value) bool {
     return true;
 }
 
-// The region under t (entered only from b), when it can be outlined.
-fn region_of(f: *mut ir.Func, b: *mut ir.Block, t: *mut ir.Block, r: *mut Region) bool {
+// The region under t (entered only from b), when it can be outlined. fixed:
+// by a block's place in the reverse postorder (its rpo), whether it or a
+// block it dominates has an instruction that cannot move (fixed_blocks).
+fn region_of(f: *mut ir.Func, b: *mut ir.Block, t: *mut ir.Block, r: *mut Region, fixed: []bool) bool {
     if (t.preds.len != 1) or (t == b) or (u.notnil(t.first) and (t.first.op == ir.OP_PHI)) {
+        return false;
+    }
+    if fixed[@int_cast(usize, t.rpo)] {
         return false;
     }
     tag_gen += 1;
@@ -385,6 +390,7 @@ fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) *mut ir.Func
     opt.compute_preds(f);
     let order = opt.dominators(f);
     opt.loop_depths(f, &order);
+    let fixed = fixed_blocks(&order);
     let mut done = u.nil.[ir.Func]();
     for i in 0..order.len {
         let b = order.get(i);
@@ -396,7 +402,7 @@ fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) *mut ir.Func
         }
         for k in @as(usize, 0)..2 {
             let s = ir.succ(t, k);
-            if region_of(f, b, s, r) {
+            if region_of(f, b, s, r, fixed) {
                 done = outline(m, f, b, r, @int_cast(i32, i));
                 break;
             }
@@ -406,7 +412,33 @@ fn outline_func(m: *mut ir.Module, f: *mut ir.Func, r: *mut Region) *mut ir.Func
         }
     }
     order.deinit();
+    u.free_slice.[bool](fixed);
     return done;
+}
+
+// For each block of `order` (the reverse postorder, by its place there, its
+// rpo): whether it, or a block it dominates, has an instruction that
+// keeps a region from being outlined (a return, a stack slot, a switch).
+// Asked of every branch's two ways, the answer is mostly yes (what follows a
+// branch dominates the rest of the function, with its returns), and finding
+// that by walking the region each time is quadratic in a function that is a
+// long chain of branches.
+fn fixed_blocks(order: *u.List.[*mut ir.Block]) []mut bool {
+    let fixed = u.calloc_slice.[bool](order.len + 1);
+    let mut i = order.len;
+    while i > 0 {
+        i -= 1;
+        let b = order.get(i);
+        let mut x = b.first;
+        while u.notnil(x) and not fixed[i] {
+            fixed[i] = (x.op == ir.OP_RET) or (x.op == ir.OP_ALLOCA) or (x.op == ir.OP_SWITCH);
+            x = x.next;
+        }
+        if fixed[i] and u.notnil(b.idom) {
+            fixed[@int_cast(usize, b.idom.rpo)] = true;
+        }
+    }
+    return fixed;
 }
 
 // True if any function changed (those changed are listed in `changed`).
