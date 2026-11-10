@@ -812,6 +812,9 @@ static LLVMMetadataRef frame_call_begin(const char *callee) {
 static void frame_call_end(LLVMValueRef call, LLVMMetadataRef saved) {
     if (!frame_traces() || !F || !F->di_sp) return;
     add_nomerge(call);
+    // (a call turned into a jump, or a recursion into a loop, leaves no
+    // frame for the trace)
+    LLVMSetTailCallKind(call, LLVMTailCallKindNoTail);
     LLVMSetCurrentDebugLocation2(B, saved);
 }
 
