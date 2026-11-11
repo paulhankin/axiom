@@ -14,6 +14,7 @@ import "cast.ax" as cast;
 import "cconst.ax" as cc;
 import "copts.ax" as co;
 import "csema.ax" as cs;
+import "csema_attr.ax" as catr;
 import "csema_bitint.ax" as csb;
 import "csema_bits.ax" as cb;
 import "csema_generic.ax" as csg;
@@ -119,7 +120,9 @@ pub fn rv(e: *mut cast.Expr) *mut cast.Expr {
 /// Types e as an expression whose value is not used (an expression
 /// statement, the first operand of a comma, the clauses of for).
 pub fn full_expr(e: *mut cast.Expr) *mut cast.Expr {
-    return rv(e);
+    let x = rv(e);
+    catr.discarded(x);
+    return x;
 }
 
 /// Types the controlling expression of if, while, do, for or ?: (scalar).
@@ -491,12 +494,20 @@ fn ident(e: *mut cast.Expr) *mut cast.Expr {
         if u.str_eq(e.name, "__func__") and u.notnil(cs.cur_fn()) and (cs.std() >= co.C99) {
             return func_name(e);
         }
-        cs.err(e.span, "C3001", u.f1("'%s' is not declared", e.name));
+        let mut why: []u8 = "";
+        if u.str_eq(e.name, "true") or u.str_eq(e.name, "false") {
+            why = u.pick(cs.std() >= co.C99, " (a keyword from C23; before, <stdbool.h> defines it)",
+                         " (a keyword from C23)");
+        } else if u.str_eq(e.name, "nullptr") {
+            why = " (a keyword from C23)";
+        }
+        cs.err(e.span, "C3001", u.f2("'%s' is not declared%s", e.name, why));
         return bad(e);
     }
     e.sym = s;
     s.used = true;
     csm.referred(s, e.span);
+    catr.use_sym(s, e.span);
     if s.kind == cast.SK_ENUMCONST {
         e.ty = s.ty;
         e.is_const = true;
@@ -1136,6 +1147,7 @@ fn member(e: *mut cast.Expr) *mut cast.Expr {
         return bad(e);
     }
     e.mem = fm.m;
+    catr.use_member(fm.m, e.name_span);
     e.cval = fm.offset;
     e.ty = cty.qualify(fm.m.ty, st.quals);
     e.lvalue = arrow or base.lvalue;
@@ -1213,9 +1225,7 @@ fn size_align(e: *mut cast.Expr) *mut cast.Expr {
         e.ty = cty.t_size;
         return e;
     }
-    // (_Alignof of an array of unknown length is its element type's)
-    let complete = cty.is_complete(t) or (alignof_ and (t.kind == cty.TK_ARRAY) and cty.is_complete(t.elem));
-    if not complete {
+    if not cty.is_complete(t) {
         cs.err(e.span, "C3029", u.f2("the operand of %s has incomplete type %s", what, cs.tq(t)));
         return bad(e);
     }

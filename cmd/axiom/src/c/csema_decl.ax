@@ -16,6 +16,7 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "copts.ax" as co;
 import "csema.ax" as cs;
+import "csema_attr.ax" as catr;
 import "csema_bitint.ax" as csb;
 import "csema_bits.ax" as cb;
 import "csema_builtin.ax" as csbi;
@@ -93,6 +94,7 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
     let mut td_span = ds.span;
     let mut qual_seen: i32 = 0;
     let mut bad = false;
+    dsp.attrs(&ds.attrs, dsp.AP_TYPE);
     for si in 0..ds.items.len {
         let s = ds.items.at(si);
         let k = s.kind;
@@ -174,6 +176,7 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
             if u.notnil(ts) and (ts.kind == cast.SK_TYPEDEF) {
                 other = ts.ty;
                 ts.used = true;
+                catr.use_sym(ts, s.span);
                 td_seen = true;
                 td_span = s.span;
             } else {
@@ -250,9 +253,10 @@ fn typeof_type(s: *mut cast.Spec) *mut cty.CType {
 // array and its element type are qualified alike), so they go too.
 fn unqual_array(t: *mut cty.CType) *mut cty.CType {
     if t.kind == cty.TK_ARRAY {
-        let a = cty.array_of(unqual_array(t.elem), t.len, t.has_len);
-        a.vla = t.vla;
-        return a;
+        if t.vla {
+            return cty.vla_of(unqual_array(t.elem), t.vexpr);  // (the same length: evaluated once)
+        }
+        return cty.array_of(unqual_array(t.elem), t.len, t.has_len);
     }
     return cty.unqual(t);
 }
@@ -417,9 +421,11 @@ fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
         return ts.ty;
     }
     let kind = tag_kind(ts.kw);
-    dsp.attrs(&ts.attrs, dsp.AP_OTHER);
+    dsp.attrs(&ts.attrs, dsp.AP_TAG);
     if kind == cty.TK_ENUM {
-        return dsp.enum_tag(ts, lone);
+        let et = dsp.enum_tag(ts, lone);
+        tag_attrs(ts, et, ts.has_body or lone or u.notnil(ts.fixed));
+        return et;
     }
     let named = ts.name.len > 0;
     let mut t = u.nil.[cty.CType]();
@@ -436,6 +442,9 @@ fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
                             "declared here");
                 ts.ty = cty.t_error;
                 return ts.ty;
+            }
+            if ts.has_body and t.tag.complete and (cs.std() >= co.C23) {
+                return redefined_record(ts, t, kind);
             }
             if ts.has_body and (t.tag.complete or t.tag.defining) {
                 cs.err_note(ts.name_span, "C3002", u.f2("redefinition of '%s %s'", kind_word(kind), ts.name),
@@ -471,10 +480,47 @@ fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
         }
     }
     ts.ty = t;
+    tag_attrs(ts, t, ts.has_body or lone);
     if ts.has_body {
         record_body(t, ts);
     }
     return t;
+}
+
+// C23 6.7.2.3: a structure or union defined again in the same scope is
+// the same type if the definitions are compatible (6.2.7p1); the second
+// is read into a type of its own, then compared.
+fn redefined_record(ts: *mut cast.TagSpec, t: *mut cty.CType, kind: i32) *mut cty.CType {
+    let nt = cty.new_tagged(kind, ts.name, ts.name_span);
+    ts.ty = nt;
+    record_body(nt, ts);
+    if not cty.compatible(nt, t) {
+        cs.err_note(ts.name_span, "C3002", u.f2("redefinition of '%s %s' with other members (or other types of them)",
+                                                kind_word(kind), ts.name), t.tag.span, "defined before here");
+        ts.ty = cty.t_error;
+        return ts.ty;
+    }
+    ts.ty = t;
+    catr.mark_tag(t, &ts.attrs);
+    return t;
+}
+
+// What the attributes of tag specifier ts say of its type t (declares: it
+// defines or declares the tag), or, for a use, a warning if it is deprecated.
+fn tag_attrs(ts: *mut cast.TagSpec, t: *mut cty.CType, declares: bool) void {
+    if cty.is_error(t) {
+        return;
+    }
+    if declares {
+        catr.mark_tag(t, &ts.attrs);
+        return;
+    }
+    if ts.attrs.len > 0 {
+        cs.err(ts.attrs.get(0).span, "C3077",
+               u.f1("attributes in '%s' can appear only where it is defined, or in a declaration of the tag alone",
+                    u.cat3(kind_word(tag_kind(ts.kw)), " ", ts.name)));
+    }
+    catr.use_tag(t, ts.name_span);
 }
 
 fn undefined_enum(ts: *mut cast.TagSpec) *mut cty.CType {
@@ -498,7 +544,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             continue;
         }
         let sp = specifiers(md.specs, CTX_MEMBER, md.decls.len == 0);
-        dsp.attrs(&md.attrs, dsp.AP_OTHER);
+        dsp.attrs(&md.attrs, dsp.AP_MEMBER);
         if md.decls.len == 0 {
             // an anonymous structure or union (C11)
             let at = sp.ty;
@@ -515,7 +561,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             continue;
         }
         for d in md.decls.items() {
-            dsp.attrs(&d.attrs, dsp.AP_OTHER);
+            dsp.attrs(&d.attrs, dsp.AP_MEMBER);
             if u.notnil(d.width) {
                 let bt = derive(sp.ty, d, CTX_MEMBER);
                 d.ty = bt;
@@ -542,6 +588,8 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                 }
                 add_member(ti, d.name, msp, bt);
                 let bm = ti.members.last();
+                catr.mark_member(bm, &md.attrs);
+                catr.mark_member(bm, &d.attrs);
                 bm.is_bitfield = true;
                 bm.bit_width = w;
                 continue;
@@ -573,6 +621,8 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             }
             check_dup(&mut names, d.name, d.name_span);
             add_member(ti, d.name, d.name_span, mt);
+            catr.mark_member(ti.members.last(), &md.attrs);
+            catr.mark_member(ti.members.last(), &d.attrs);
             named += 1;
             if sp.has_align and dsp.check_alignment(sp.align, sp.align_sp, mt, d.name) {
                 ti.members.last().align = sp.align;
@@ -622,6 +672,11 @@ fn derive(base: *mut cty.CType, d: *mut cast.Declarator, ctx: i32) *mut cty.CTyp
             return t;
         }
         let dv = d.derivs.at(k);
+        if dv.kind == cast.DerivKind.FUNCTION {
+            dsp.attrs(&dv.attrs, dsp.AP_FUNCTYPE);
+        } else {
+            dsp.attrs(&dv.attrs, dsp.AP_TYPE);
+        }
         if dv.kind == cast.DerivKind.POINTER {
             if ((dv.quals & cast.Q_RESTRICT) != 0) and cty.is_func(t) {
                 cs.err(dv.span, "C3006", "'restrict' qualifies a pointer to a function");
@@ -749,6 +804,8 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             dsp.attrs(&p.attrs, dsp.AP_OBJECT);
             dsp.attrs(&p.decl.attrs, dsp.AP_OBJECT);
             p.decl.sym = s;
+            catr.mark_sym(s, &p.attrs);
+            catr.mark_sym(s, &p.decl.attrs);
             if p.decl.name.len > 0 {
                 let prior = cs.lookup_here(p.decl.name);
                 if u.notnil(prior) {
@@ -809,7 +866,7 @@ pub fn external(d: *mut cast.Decl) void {
     } else if d.kind == cast.DeclKind.STATIC_ASSERT {
         static_assert(d);
     } else if d.kind == cast.DeclKind.ATTR {
-        dsp.attrs(&d.attrs, dsp.AP_OBJECT);  // (appertains to nothing: not fallthrough, nor noreturn)
+        dsp.attrs(&d.attrs, dsp.AP_NOTHING);
     }
 }
 
@@ -819,6 +876,8 @@ pub fn block_decl(d: *mut cast.Decl) void {
         declaration(d, CTX_BLOCK);
     } else if d.kind == cast.DeclKind.STATIC_ASSERT {
         static_assert(d);
+    } else if d.kind == cast.DeclKind.ATTR {
+        dsp.attrs(&d.attrs, dsp.AP_BLOCK_DECL);
     }
 }
 
@@ -839,9 +898,11 @@ pub fn for_decl(d: *mut cast.Decl) void {
 fn declaration(d: *mut cast.Decl, ctx: i32) void {
     let lone = d.decls.len == 0;
     let sp = specifiers(d.specs, ctx, lone);
-    dsp.attrs(&d.specs.attrs, dsp.AP_OTHER);
     if lone {
-        dsp.attrs(&d.attrs, dsp.AP_OTHER);
+        if d.attrs.len > 0 {
+            cs.err(d.attrs.get(0).span, "C3077",
+                   "attributes before a declaration that declares no identifier (a tag's go after its keyword)");
+        }
         if sp.infer or sp.constexpr_ {
             cs.err(d.span, u.pick(sp.infer, "C3074", "C3073"), u.f1("a declaration with '%s' that declares no object",
                                                                     u.pick(sp.infer, "auto", "constexpr")));
@@ -867,7 +928,9 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
     dcl.ty = t;
     let name = dcl.name;
     let mut what = dsp.AP_OBJECT;
-    if cty.is_func(t) and (sp.sc != cast.SC_TYPEDEF) {
+    if sp.sc == cast.SC_TYPEDEF {
+        what = dsp.AP_TYPEDEF;
+    } else if cty.is_func(t) {
         what = dsp.AP_FUNC;
     }
     dsp.attrs(&d.attrs, what);
@@ -897,11 +960,13 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
                 return;
             }
             dcl.sym = prior;
+            mark_decl(d, dcl);
             return;
         }
         let s = cs.new_sym(cast.SK_TYPEDEF, name, dcl.name_span, t);
         dcl.sym = s;
         cs.declare(name, s);
+        mark_decl(d, dcl);
         return;
     }
     if (sp.funcs != 0) and not cty.is_func(t) {
@@ -914,9 +979,19 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
                                                 dsp.sc_name(cast.SC_THREAD_LOCAL)));
         }
         func_decl(sp, dcl, t, ctx);
+        if (sp.funcs & cast.FS_NORETURN) != 0 {
+            catr.set_noreturn(dcl.sym);
+        }
     } else {
         object_decl(sp, dcl, t, ctx);
     }
+    mark_decl(d, dcl);
+}
+
+// What the attributes of declaration d and of its declarator dcl say of the entity declared.
+fn mark_decl(d: *mut cast.Decl, dcl: *mut cast.Declarator) void {
+    catr.mark_sym(dcl.sym, &d.attrs);
+    catr.mark_sym(dcl.sym, &dcl.attrs);
 }
 
 // The entity a declaration of `name` with linkage `lk` declares: the one of
@@ -1141,7 +1216,6 @@ fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
 fn function_def(d: *mut cast.Decl) void {
     let sp = specifiers(d.specs, CTX_FILE, false);
     dsp.attrs(&d.attrs, dsp.AP_FUNC);
-    dsp.attrs(&d.specs.attrs, dsp.AP_OTHER);
     let dcl = d.decls.get(0);
     g_params = u.List.[*mut cast.CSym].empty();
     g_kr_ids = false;
@@ -1183,6 +1257,10 @@ fn function_def(d: *mut cast.Decl) void {
     let s = entity(dcl.name, dcl.name_span, cast.SK_FUNC, t, lk);
     dcl.sym = s;
     dcl.ty = t;
+    mark_decl(d, dcl);
+    if (sp.funcs & cast.FS_NORETURN) != 0 {
+        catr.set_noreturn(s);
+    }
     if s.defined {
         cs.err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", dcl.name), s.span, "defined before here");
         return;

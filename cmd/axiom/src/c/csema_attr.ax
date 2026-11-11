@@ -1,0 +1,245 @@
+// =============================================================================
+// csema_attr.ax - what the standard attributes deprecated, nodiscard and
+// maybe_unused (C23 6.7.13) say of the entities they appertain to, and
+// the warnings they ask for: a use of a deprecated name (an object, function,
+// typedef name, enumeration constant, tag or member; not its declarations),
+// and the result of a call of a nodiscard function, or of a function that
+// returns a nodiscard structure, union or enumeration, evaluated as a void
+// expression (an expression statement, a clause of `for` that is not its
+// condition, an operand of the comma operator that is discarded; a cast to
+// void says the result is discarded on purpose). maybe_unused on a label
+// keeps it from the warning about labels that are not used.
+//
+// What an entity's declarations said is kept here, by the entity's identity
+// (a CSym, a TagInfo or a Member), and accumulates: a later declaration with
+// the attribute makes the uses after it deprecated (6.7.13: an entity
+// may be redeclared with or without the attribute).
+//
+// Diagnostics:
+//   C4050  a use of a name or entity declared [[deprecated]] (with its message, if it has one)
+//   C4051  the result of a call that is [[nodiscard]] is discarded (with its message, if it has one)
+//   C4052  an attribute without a prefix that is not a standard attribute: ignored
+//   C4053  a function declared _Noreturn or [[noreturn]] that can return (IR generation finds it)
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "csema.ax" as cs;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// What the declarations of one entity said.
+struct Note {
+    deprecated: bool,
+    dep_msg: []u8,  // the string literal of deprecated("..."), as written; empty if none
+    nodiscard: bool,
+    nd_msg: []u8,
+    maybe_unused: bool,
+    noreturn: bool,  // a function declared _Noreturn or [[noreturn]]
+}
+
+let mut g_notes: u.SymMap.[*mut Note] = u.SymMap.[*mut Note].{ keys: @ptr_from_int(*mut usize, 0),
+                                                               vals: @ptr_from_int(*mut *mut Note, 0), cap: 0, len: 0 };
+
+fn note_of(p: usize, make: bool) *mut Note {
+    let k = u.addr_key(p);
+    let mut n = g_notes.get(k);
+    if u.isnil(n) and make {
+        n = u.new.[Note]();
+        g_notes.put(k, n);
+    }
+    return n;
+}
+
+// The attribute's name without the `__x__` spelling.
+fn plain(n: []u8) []u8 {
+    if (n.len > 4) and u.starts(n, "__") and u.ends(n, "__") {
+        return n[2..n.len - 2];
+    }
+    return n;
+}
+
+// The message of deprecated("...") or nodiscard("..."), as written; empty if none.
+fn message(a: *cast.Attr) []u8 {
+    if a.has_args and (a.args.len == 1) and (a.args[0].kind == ct.T_STRING) {
+        return a.args[0].text;
+    }
+    return "";
+}
+
+// Records what the standard attributes among `list` say of the entity at p.
+fn record(p: usize, list: *u.List.[*mut cast.Attr]) void {
+    for a in list.items() {
+        if a.prefix.len > 0 {
+            continue;
+        }
+        let n = plain(a.name);
+        if u.str_eq(n, "deprecated") {
+            let x = note_of(p, true);
+            x.deprecated = true;
+            if message(a).len > 0 {
+                x.dep_msg = message(a);
+            }
+        } else if u.str_eq(n, "nodiscard") {
+            let x = note_of(p, true);
+            x.nodiscard = true;
+            if message(a).len > 0 {
+                x.nd_msg = message(a);
+            }
+        } else if u.str_eq(n, "maybe_unused") {
+            note_of(p, true).maybe_unused = true;
+        } else if u.str_eq(n, "noreturn") or u.str_eq(n, "_Noreturn") {
+            note_of(p, true).noreturn = true;
+        }
+    }
+}
+
+/// Records what the attributes `list` say of the entity s (an object,
+/// function, typedef name, enumeration constant or label).
+pub fn mark_sym(s: *cast.CSym, list: *u.List.[*mut cast.Attr]) void {
+    if u.notnil(s) and (list.len > 0) {
+        record(@int_from_ptr(s), list);
+    }
+}
+
+/// Records what the attributes `list` say of the structure, union or enumeration type t.
+pub fn mark_tag(t: *cty.CType, list: *u.List.[*mut cast.Attr]) void {
+    if u.notnil(t) and u.notnil(t.tag) and (list.len > 0) {
+        record(@int_from_ptr(t.tag), list);
+    }
+}
+
+/// Records what the attributes `list` say of member m.
+pub fn mark_member(m: *cty.Member, list: *u.List.[*mut cast.Attr]) void {
+    if u.notnil(m) and (list.len > 0) {
+        record(@int_from_ptr(m), list);
+    }
+}
+
+/// Function s is declared with the function specifier _Noreturn.
+pub fn set_noreturn(s: *cast.CSym) void {
+    if u.notnil(s) {
+        note_of(@int_from_ptr(s), true).noreturn = true;
+    }
+}
+
+/// Was function s declared _Noreturn or [[noreturn]] (6.7.4p8, C23
+/// 6.7.13): it does not return to its caller?
+pub fn is_noreturn(s: *cast.CSym) bool {
+    if (g_notes.len == 0) or u.isnil(s) {
+        return false;
+    }
+    let n = note_of(@int_from_ptr(s), false);
+    return u.notnil(n) and n.noreturn;
+}
+
+/// Was label l declared [[maybe_unused]]?
+pub fn maybe_unused(l: *cast.CSym) bool {
+    let n = note_of(@int_from_ptr(l), false);
+    return u.notnil(n) and n.maybe_unused;
+}
+
+fn warn_deprecated(n: *Note, sp: u.Span, what: []u8) void {
+    if u.isnil(n) or not n.deprecated {
+        return;
+    }
+    let mut msg = u.cat2(what, " is deprecated");
+    if n.dep_msg.len > 0 {
+        msg = u.cat3(msg, ": ", n.dep_msg);
+    }
+    cs.warn(sp, "C4050", msg);
+}
+
+/// A use of the name of s at sp: warned about if s is deprecated.
+pub fn use_sym(s: *cast.CSym, sp: u.Span) void {
+    if g_notes.len == 0 {
+        return;
+    }
+    warn_deprecated(note_of(@int_from_ptr(s), false), sp, u.f1("'%s'", s.name));
+}
+
+/// A use of the tag of t (a structure, union or enumeration) at sp, other
+/// than to declare it: warned about if it is deprecated.
+pub fn use_tag(t: *mut cty.CType, sp: u.Span) void {
+    if (g_notes.len == 0) or u.isnil(t) or u.isnil(t.tag) {
+        return;
+    }
+    warn_deprecated(note_of(@int_from_ptr(t.tag), false), sp, cs.tq(cty.unqual(t)));
+}
+
+/// A use of member m at sp: warned about if it is deprecated.
+pub fn use_member(m: *cty.Member, sp: u.Span) void {
+    if g_notes.len == 0 {
+        return;
+    }
+    warn_deprecated(note_of(@int_from_ptr(m), false), sp, u.f1("the member '%s'", m.name));
+}
+
+// The function a call's callee designates (through the decay to a pointer
+// and any `*`), or nil.
+fn callee(e0: *cast.Expr) *cast.CSym {
+    let mut e = e0;
+    while u.notnil(e) {
+        if (e.kind == cast.ExprKind.CAST) and u.isnil(e.tname) {
+            e = e.a;
+        } else if (e.kind == cast.ExprKind.UNARY) and (e.op == ct.P_STAR) {
+            e = e.a;
+        } else {
+            break;
+        }
+    }
+    if u.notnil(e) and (e.kind == cast.ExprKind.IDENT) and u.notnil(e.sym) and (e.sym.kind == cast.SK_FUNC) {
+        return e.sym;
+    }
+    return u.nil.[cast.CSym]();
+}
+
+/// e (typed) is evaluated as a void expression: a call of a nodiscard
+/// function, or one that returns a nodiscard type, is warned about. (The
+/// left operand of a comma operator is checked when it is analyzed.)
+pub fn discarded(e: *cast.Expr) void {
+    if (g_notes.len == 0) or u.isnil(e) {
+        return;
+    }
+    if e.kind == cast.ExprKind.COMMA {
+        discarded(e.b);
+        return;
+    }
+    if e.kind == cast.ExprKind.COND {
+        discarded(e.b);
+        discarded(e.c);
+        return;
+    }
+    if e.kind != cast.ExprKind.CALL {
+        return;
+    }
+    let f = callee(e.a);
+    if u.notnil(f) {
+        let n = note_of(@int_from_ptr(f), false);
+        if u.notnil(n) and n.nodiscard {
+            let mut msg = u.f1("the result of calling '%s' is discarded, and it is declared 'nodiscard'", f.name);
+            if n.nd_msg.len > 0 {
+                msg = u.cat3(msg, ": ", n.nd_msg);
+            }
+            cs.warn(e.span, "C4051", msg);
+            return;
+        }
+    }
+    let t = e.ty;
+    if u.notnil(t) and u.notnil(t.tag) and
+       ((t.kind == cty.TK_STRUCT) or (t.kind == cty.TK_UNION) or (t.kind == cty.TK_ENUM)) {
+        let n = note_of(@int_from_ptr(t.tag), false);
+        if u.notnil(n) and n.nodiscard {
+            let mut msg = u.f1("the result of a call is discarded, and its type %s is declared 'nodiscard'",
+                               cs.tq(cty.unqual(t)));
+            if n.nd_msg.len > 0 {
+                msg = u.cat3(msg, ": ", n.nd_msg);
+            }
+            cs.warn(e.span, "C4051", msg);
+        }
+    }
+}
+
+/// An attribute without a prefix that is not a standard one (ignored).
+pub fn unknown(a: *cast.Attr) void {
+    cs.warn(a.span, "C4052", u.f1("'%s' is not a standard attribute, and is ignored", a.name));
+}

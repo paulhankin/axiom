@@ -12,18 +12,30 @@ are written against; `docs/c.md` (to come) is for users.
 - **Freestanding**: no C library. The compiler provides the headers a freestanding
   implementation must (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`,
   `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdnoreturn.h>`, and
-  C23's `<stdbit.h>` and `<stdckdint.h>`), in `std/c/include/`.
+  C23's `<stdbit.h>` and `<stdckdint.h>`), in `std/c/include/`. C23 (4p7) also asks a
+  freestanding implementation for most of `<string.h>` and some functions of
+  `<stdlib.h>` (and `<fenv.h>`, `<math.h>` when it claims Annex F): those are a
+  library's, and not provided. `<float.h>` has no `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`
+  (signaling NaNs are not guaranteed to stay signaling).
 - **Calling convention**: each target's C ABI (x86-64 System V, Windows x64,
   AAPCS64 and its macOS variant, the WebAssembly C ABI), for structures and
   unions by value and variadic functions too (`cgen_abi.ax`, `cgen_va.ax`), so
-  that C compiled here calls and is called by the platform's C libraries.
+  that C compiled here calls and is called by the platform's C libraries. Not
+  matched: on x86-64 System V, a variadic argument of a type aligned to more than 16
+  bytes that goes on the stack (it must be at an address aligned as its type is,
+  which needs the caller's frame realigned: the stack keeps 16 bytes' alignment); on
+  macOS, a variadic argument of a type aligned to 16 bytes gets no padding before it
+  (the platform aligns its stack slot to 16).
 - **No extensions**: no GNU or Microsoft extensions, and `#pragma` lines are ignored
   (as are `_Pragma` operators). Identifiers the compiler needs for its own headers are
   in the reserved namespace (`__builtin_va_list`, `__axiom_int64`, ...).
 - **Not supported, and said so by the feature macros**: `_Complex`
   (`__STDC_NO_COMPLEX__`), `_Atomic` (`__STDC_NO_ATOMICS__`), threads
   (`__STDC_NO_THREADS__`), decimal floating types, `long double` wider than `double`
-  (it is `double`).
+  (it is `double`). Annex F is not claimed (`__STDC_IEC_559__` and
+  `__STDC_IEC_60559_BFP__` are not defined): the floating types have IEC 60559's
+  formats (`FLT_IS_IEC_60559`), but without a library there is no `<fenv.h>` or
+  `<math.h>`, and no exception flags or rounding modes.
 - **Implementation-defined choices** a build can make: `--c-char=signed|unsigned`,
   `--c-int=16|32|64`, `--c-long=32|64`. `short` is 16 bits, `long long` 64, pointers
   and `size_t` the target's. The defaults are the target's C ABI:

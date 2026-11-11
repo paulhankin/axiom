@@ -27,7 +27,7 @@ ok6
 #if __has_c_attribute(nodiscard) == 202003L && __has_c_attribute(__deprecated__) == 201904L && __has_c_attribute(noreturn) == 202202L
 ok7
 #endif
-#if !__has_c_attribute(vendor::attr) && !__has_c_attribute(unknown) && __has_c_attribute(_Noreturn) && __has_c_attribute(maybe_unused) == 201904L
+#if !__has_c_attribute(vendor::attr) && !__has_c_attribute(unknown) && __has_c_attribute(_Noreturn) && __has_c_attribute(maybe_unused) == 202106L
 ok8
 #endif
 #if __has_c_attribute(fallthrough) == 201904L && __has_c_attribute(unsequenced) == 202207L && __has_c_attribute(reproducible) == 202207L

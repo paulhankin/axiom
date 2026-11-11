@@ -28,6 +28,7 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "copts.ax" as co;
 import "csema.ax" as cs;
+import "csema_attr.ax" as catr;
 import "csema_expr.ax" as cx;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
@@ -345,6 +346,16 @@ pub fn enum_tag(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
                                                         ts.name, cs.tq(ft), cs.tq(ti.fixed)), ti.span,
                             "declared before here");
             }
+            if ts.has_body and ti.listed and (cs.std() >= co.C23) {
+                // (C23: the same constants again, with the same values, are the same type: 6.7.2.3)
+                ts.ty = t;
+                if not enumerators(t, ts, true) {
+                    cs.err_note(ts.name_span, "C3002", u.f1("redefinition of 'enum %s' with other constants", ts.name),
+                                ti.span, "defined before here");
+                    ts.ty = cty.t_error;
+                }
+                return ts.ty;
+            }
             if ts.has_body and ti.listed {
                 cs.err_note(ts.name_span, "C3002", u.f1("redefinition of 'enum %s'", ts.name), ti.span,
                             "defined before here");
@@ -373,7 +384,7 @@ pub fn enum_tag(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
     ts.ty = t;
     if ts.has_body {
         t.tag.listed = true;
-        enumerators(t, ts);
+        _ = enumerators(t, ts, false);
     }
     return t;
 }
@@ -395,8 +406,26 @@ fn first_fit(cands: []mut *mut cty.CType, x: Val) *mut cty.CType {
     return u.nil.[cty.CType]();
 }
 
-fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
+// The constants of the enumeration t that tag specifier ts defines, declared
+// (again: the list of a definition of t seen before, C23, whose constants
+// must be these: false if they are not).
+let mut g_consts: u.SymMap.[*mut u.List.[*mut cast.CSym]] =
+    u.SymMap.[*mut u.List.[*mut cast.CSym]].{ keys: @ptr_from_int(*mut usize, 0),
+                                              vals: @ptr_from_int(*mut *mut u.List.[*mut cast.CSym], 0), cap: 0,
+                                              len: 0 };
+
+fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
     let fixed = t.tag.fixed;
+    let key = u.addr_key(@int_from_ptr(t.tag));
+    let mut old = g_consts.get(key);
+    let mut same = true;
+    if not again {
+        old = u.new.[u.List.[*mut cast.CSym]]();
+        g_consts.put(key, old);
+    } else if u.isnil(old) {
+        return false;
+    }
+    let mut k: usize = 0;
     let c23 = cs.std() >= co.C23;
     let mut syms = u.List.[*mut cast.CSym].empty();
     let mut prev = Val.{ v: 0, neg: false, ok: false };
@@ -406,7 +435,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
     let mut max = Val.{ v: 0, neg: false, ok: false };
     let mut first = true;
     for en in ts.enumerators.items() {
-        attrs(&en.attrs, AP_OTHER);
+        attrs(&en.attrs, AP_ENUMERATOR);
         let mut x = Val.{ v: 0, neg: false, ok: true };
         let mut ety = cty.t_int;
         if u.notnil(en.value) {
@@ -425,9 +454,6 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                     if not c23 {
                         cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of int", en.name));
                         x = Val.{ v: 0, neg: false, ok: true };
-                    } else if not cty.fits(cty.t_llong, x.v, x.neg) {
-                        cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of long long", en.name));
-                        x = Val.{ v: 0, neg: false, ok: true };
                     } else {
                         ety = cty.promote(r.e.ty);
                     }
@@ -436,11 +462,12 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         } else if not first {
             // the previous value plus one
             x = Val.{ v: prev.v +% 1, neg: prev.neg and (prev.v != 0xFFFF_FFFF_FFFF_FFFF), ok: true };
+            let wrapped = not prev.neg and (prev.v == 0xFFFF_FFFF_FFFF_FFFF);  // (past every type's range)
             let mut lim = prev_ty;
             if u.notnil(fixed) {
                 lim = fixed;
             }
-            if not cty.fits(lim, x.v, x.neg) {
+            if wrapped or not cty.fits(lim, x.v, x.neg) {
                 if u.notnil(fixed) or not c23 {
                     let mut what: []u8 = "int";
                     if u.notnil(fixed) {
@@ -451,10 +478,16 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                                 what));
                     x = prev;
                 } else {
-                    let mut cands: [3]*mut cty.CType = [cty.t_long, cty.t_llong, cty.t_ullong];
+                    // (6.7.2.2p11: a wider type of the previous constant's signedness)
+                    let mut cands: [2]*mut cty.CType = [cty.t_long, cty.t_llong];
+                    if not prev_ty.is_signed {
+                        cands = [cty.t_ulong, cty.t_ullong];
+                    }
                     let nt = first_fit(cands[..], x);
-                    if u.isnil(nt) or not cty.fits(cty.t_llong, x.v, x.neg) {
-                        cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of long long", en.name));
+                    if u.isnil(nt) or wrapped {
+                        cs.err(en.span, "C3013",
+                               u.f1("the value of '%s' (the previous one plus 1) is outside the range of every integer type",
+                                    en.name));
                         x = prev;
                     } else {
                         ety = nt;
@@ -478,6 +511,17 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         first = false;
         prev = x;
         prev_ty = ety;
+        if again {
+            // (the k-th constant of the earlier list: the same name and value)
+            if (k < old.len) and u.same(old.get(k).name, en.name) and
+               ((old.get(k).value == x.v) or (old.get(k).value == cty.wrap(old.get(k).ty, x.v))) {
+                en.sym = old.get(k);
+            } else {
+                same = false;
+            }
+            k += 1;
+            continue;
+        }
         let prior = cs.lookup_here(en.name);
         if u.notnil(prior) {
             cs.err_note(en.span, "C3002", u.f1("redefinition of '%s'", en.name), prior.span, "declared before here");
@@ -489,11 +533,16 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         let s = cs.new_sym(cast.SK_ENUMCONST, en.name, en.span, st);
         s.value = cty.wrap(st, x.v);
         en.sym = s;
+        catr.mark_sym(s, &en.attrs);
         syms.push(s);
+        old.push(s);
         cs.declare(en.name, s);
     }
+    if again {
+        return same and (k == old.len);
+    }
     if u.notnil(fixed) {
-        return;
+        return true;
     }
     // the compatible type: unsigned int if no value is negative, else int,
     // or (C23) the first wider type that holds them all
@@ -510,6 +559,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         base = first_fit(cands[..], max);
     }
     if u.isnil(base) {
+        cs.err(ts.span, "C3013", "no integer type can represent all the values of the enumeration's constants");
         base = cty.t_llong;
     }
     cty.set_enum_base(t, base);
@@ -520,6 +570,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             s.value = cty.wrap(base, s.value);
         }
     }
+    return true;
 }
 
 // a < b, for values given as bits and sign.
@@ -608,9 +659,18 @@ pub fn inferred(d: *mut cast.Declarator, quals: i32, several: bool, first: bool)
 // -----------------------------------------------------------------------------
 
 /// What attributes appertain to.
-pub const AP_OBJECT: i32 = 1;  // an object, typedef or other entity that is not a function
-pub const AP_FUNC: i32 = 2;    // a function (or its type)
-pub const AP_OTHER: i32 = 3;   // a type, tag, member, enumerator, or nothing decided here
+pub const AP_OBJECT: i32 = 1;       // an object (a parameter too)
+pub const AP_FUNC: i32 = 2;         // a function
+pub const AP_TYPEDEF: i32 = 3;      // a typedef name
+pub const AP_TAG: i32 = 4;          // a structure, union or enumeration (after the keyword)
+pub const AP_MEMBER: i32 = 5;       // a member of a structure or union
+pub const AP_ENUMERATOR: i32 = 6;   // an enumeration constant
+pub const AP_TYPE: i32 = 7;         // a type: after declaration specifiers, '*' or an array declarator's ']'
+pub const AP_FUNCTYPE: i32 = 8;     // a function type: after a function declarator's ')'
+pub const AP_LABEL: i32 = 9;        // a label
+pub const AP_STMT: i32 = 10;        // a statement
+pub const AP_NOTHING: i32 = 11;     // an attribute declaration at file scope
+pub const AP_BLOCK_DECL: i32 = 12;  // an attribute declaration in a block (fallthrough's place)
 
 // The attribute's name without the `__x__` spelling.
 fn plain(n: []u8) []u8 {
@@ -620,9 +680,54 @@ fn plain(n: []u8) []u8 {
     return n;
 }
 
-/// Checks the standard attributes among `list` (appertaining to `what`, an
-/// AP_ constant): their argument clauses, and noreturn, unsequenced and
-/// reproducible only for functions. Others are ignored.
+// What a standard attribute may appertain to (6.7.13), for messages:
+// empty if `what` is one of them.
+fn misplaced(n: []u8, what: i32) []u8 {
+    let entity = (what == AP_OBJECT) or (what == AP_FUNC) or (what == AP_TYPEDEF) or (what == AP_TAG) or
+                 (what == AP_MEMBER) or (what == AP_ENUMERATOR);
+    if u.str_eq(n, "deprecated") {
+        if entity {
+            return "";
+        }
+        return "a declaration of an object, function, typedef name, member, enumeration constant or tag";
+    }
+    if u.str_eq(n, "maybe_unused") {
+        if entity or (what == AP_LABEL) {
+            return "";
+        }
+        return "a declaration of an object, function, typedef name, member, enumeration constant, tag or label";
+    }
+    if u.str_eq(n, "nodiscard") {
+        if (what == AP_FUNC) or (what == AP_TAG) {
+            return "";
+        }
+        return "a declaration of a function, or a structure, union or enumeration";
+    }
+    if u.str_eq(n, "noreturn") or u.str_eq(n, "_Noreturn") {
+        if what == AP_FUNC {
+            return "";
+        }
+        return "a declaration of a function";
+    }
+    if u.str_eq(n, "unsequenced") or u.str_eq(n, "reproducible") {
+        if (what == AP_FUNCTYPE) or (what == AP_TYPE) {
+            return "";
+        }
+        return "a function declarator or a type specifier of a function type";
+    }
+    if u.str_eq(n, "fallthrough") {
+        if what == AP_BLOCK_DECL {
+            return "";
+        }
+        return "a null statement before a case or default label (an attribute declaration)";
+    }
+    return "";
+}
+
+/// Checks the attributes `list` (appertaining to `what`, an AP_ constant):
+/// a standard attribute's argument clause and what it may appertain to.
+/// Attributes with a prefix are ignored; others without one are ignored
+/// with a warning.
 pub fn attrs(list: *u.List.[*mut cast.Attr], what: i32) void {
     for a in list.items() {
         if a.prefix.len > 0 {
@@ -632,6 +737,10 @@ pub fn attrs(list: *u.List.[*mut cast.Attr], what: i32) void {
         let none = u.str_eq(n, "fallthrough") or u.str_eq(n, "maybe_unused") or u.str_eq(n, "noreturn") or
                    u.str_eq(n, "_Noreturn") or u.str_eq(n, "unsequenced") or u.str_eq(n, "reproducible");
         let str = u.str_eq(n, "deprecated") or u.str_eq(n, "nodiscard");
+        if not none and not str {
+            catr.unknown(a);
+            continue;
+        }
         if none and a.has_args {
             cs.err(a.span, "C3077", u.f1("the attribute '%s' takes no arguments", a.name));
         } else if str and a.has_args {
@@ -640,13 +749,15 @@ pub fn attrs(list: *u.List.[*mut cast.Attr], what: i32) void {
                 cs.err(a.span, "C3077", u.f1("the argument of the attribute '%s' must be a string literal", a.name));
             }
         }
-        let fnonly = u.str_eq(n, "noreturn") or u.str_eq(n, "_Noreturn") or u.str_eq(n, "unsequenced") or
-                     u.str_eq(n, "reproducible");
-        if fnonly and (what == AP_OBJECT) {
-            cs.err(a.span, "C3077", u.f1("the attribute '%s' applies only to functions", a.name));
-        }
-        if u.str_eq(n, "fallthrough") and (what != AP_OTHER) {
-            cs.err(a.span, "C3077", "the attribute 'fallthrough' applies only to a null statement before a case");
+        let where = misplaced(n, what);
+        if where.len > 0 {
+            if u.str_eq(n, "fallthrough") {
+                cs.err(a.span, "C3077", "the attribute 'fallthrough' applies only to a null statement before a case");
+            } else if (u.str_eq(n, "noreturn") or u.str_eq(n, "_Noreturn")) and (what == AP_OBJECT) {
+                cs.err(a.span, "C3077", u.f1("the attribute '%s' applies only to functions", a.name));
+            } else {
+                cs.err(a.span, "C3077", u.f2("the attribute '%s' can appertain only to %s", a.name, where));
+            }
         }
     }
 }

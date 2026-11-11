@@ -22,6 +22,7 @@ import "cgen_flow.ax" as flow;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "csema.ax" as cs;
+import "csema_attr.ax" as catr;
 import "csema_vla.ax" as svla;
 import "ctypes.ax" as cty;
 
@@ -46,6 +47,19 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     cg.hooks.body = function_body;
     cg.hooks.local_init = init_local;
     return cg.generate(m, cu, wasm);
+}
+
+// Has f (its unreachable blocks removed) a return?
+fn can_return(f: *ir.Func) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_RET) {
+            return true;
+        }
+        b = b.next;
+    }
+    return false;
 }
 
 fn function_body(s: *mut cast.CSym) void {
@@ -85,6 +99,14 @@ fn function_body(s: *mut cast.CSym) void {
     cg.at_end(F.entry);
     ir.br(cg.B, start);
     ir.remove_unreachable(f);
+    if catr.is_noreturn(s) and can_return(f) {
+        // (in the memory that outlives IR generation's, which is given back before diagnostics are shown)
+        let saved = u.tree_default;
+        u.tree_default = false;
+        cs.warn(d.decls.get(0).name_span, "C4053",
+                u.f1("the function '%s' is declared not to return ('noreturn'), but it can return", s.name));
+        u.tree_default = saved;
+    }
     if cg.is_wasm {
         flow.make_reducible(f);
     }
@@ -97,6 +119,7 @@ fn param_lengths(d: *cast.Decl) void {
     let fd = d.decls.get(0).derivs.at(0);
     for p in fd.params.items() {
         if u.notnil(p.decl.ty) and cty.is_vm(p.decl.ty) {
+            gv.eval_specs(p.specs, gx.rv, gx.effects);
             gv.eval_declarator(p.decl, p.decl.ty, gx.rv);
         }
     }
@@ -177,9 +200,28 @@ fn label_block(l: *mut cast.CSym) *mut ir.Block {
     return @ptr_cast(*mut ir.Block, l.ir);
 }
 
+// Have declaration specifiers ds a typeof of a variably modified type?
+fn has_vm_typeof(ds: *cast.DeclSpec) bool {
+    for s in ds.items.items() {
+        if s.kind == cast.SpecKind.TYPEOF {
+            if u.notnil(s.tname) and u.notnil(s.tname.ty) and cty.is_vm(s.tname.ty) {
+                return true;
+            }
+            if u.isnil(s.tname) and u.notnil(s.e) and u.notnil(s.e.ty) and cty.is_vm(s.e.ty) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn decl(d: *mut cast.Decl) void {
     if d.kind != cast.DeclKind.DECL {
         return;
+    }
+    if (d.decls.len > 0) and has_vm_typeof(d.specs) {
+        cg.continue_after();
+        gv.eval_specs(d.specs, gx.rv, gx.effects);
     }
     for x in d.decls.items() {
         let s = x.sym;

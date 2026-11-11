@@ -14,6 +14,7 @@ import "cgen_bitint.ax" as cgbi;
 import "cgen_bits.ax" as cgb;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
+import "csema_attr.ax" as catr;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -314,14 +315,20 @@ fn vla_sizeof(e: *mut cast.Expr) *mut ir.Value {
         _ = rv_or_lv(e.a, true);
         return gv.size_value(e.a.ty);
     }
-    gv.eval_declarator(e.tname.decl, e.tname.ty, rv);
+    gv.eval_type_name(e.tname, rv, effects);
     return gv.size_value(e.tname.ty);
+}
+
+/// Evaluates e (typed) for its effects (the operand of sizeof or typeof of
+/// a variably modified type).
+pub fn effects(e: *mut cast.Expr) void {
+    _ = rv_or_lv(e, true);
 }
 
 fn conversion(e: *mut cast.Expr) *mut ir.Value {
     let op = e.op;
     if u.notnil(e.tname) and cty.is_vm(e.tname.ty) {
-        gv.eval_declarator(e.tname.decl, e.tname.ty, rv);  // (a cast to a variably modified type)
+        gv.eval_type_name(e.tname, rv, effects);  // (a cast to a variably modified type)
     }
     if op == cast.CV_LOAD {
         let p = lv(e.a);
@@ -661,8 +668,10 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
     }
     let mut sig = cg.sig_of(ft.ret, ats[0..n], nnamed, ft.proto and ft.variadic, false);
     let mut callee = ir.vnil();
+    let mut noreturn = false;
     let mut callee_name: []u8 = "";
     if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) {
+        noreturn = catr.is_noreturn(fe.a.sym);
         callee_name = fe.a.sym.name;
         let f = cg.func_of(fe.a.sym, sig);
         callee = f.val;
@@ -681,7 +690,13 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
         fname = cg.F.sym.name;
     }
     cg.next_site = cg.call_site(e.span, fname, callee_name);
-    return gva.emit_call(sig.plan, sig.ty, callee, vs[0..n]);
+    let r = gva.emit_call(sig.plan, sig.ty, callee, vs[0..n]);
+    if noreturn {
+        // (a function declared _Noreturn or [[noreturn]] does not return)
+        ir.unreachable(cg.B);
+        cg.continue_after();
+    }
+    return r;
 }
 
 fn same_sig(a: *ir.Ty, b: *ir.Ty) bool {

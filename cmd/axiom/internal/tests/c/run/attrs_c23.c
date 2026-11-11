@@ -22,7 +22,7 @@ struct [[deprecated]] Tagged { [[maybe_unused]] int a; };
 enum Colors { RED [[deprecated]], GREEN };
 thread_local int tl = 7;
 alignas(16) static int al = 8;
-[[maybe_unused]];
+[[vendor::anything]];
 
 int main(void) {
     [[maybe_unused]] int local = 0;
