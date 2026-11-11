@@ -21,6 +21,7 @@
 // =============================================================================
 import "../diag.ax" as dg;
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
@@ -76,6 +77,20 @@ fn no_local_init(s: *mut cast.CSym, p: *mut ir.Value) void {
 
 pub let mut hooks: Hooks = Hooks.{ body: no_body, local_init: no_local_init };
 
+fn no_call_site(sp: u.Span, fname: []u8, callee: []u8) *mut ir.Value {
+    _ = sp;
+    _ = fname;
+    _ = callee;
+    return ir.vnil();
+}
+
+/// The call-site record of a call at `sp` in function `fname` of `callee`
+/// ("": through a pointer), for native stack traces (codegen.ax makes them,
+/// with Axiom's), or nil; and the record the next call made (cgen_va.ax:
+/// emit_call) is given.
+pub let mut call_site: fn(u.Span, []u8, []u8) *mut ir.Value = no_call_site;
+pub let mut next_site: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
 /// The alignment of object s: its type's, or an alignment specifier's if stricter.
 pub fn object_align(s: *cast.CSym) u64 {
     let a = cty.align_of(s.ty);
@@ -84,6 +99,11 @@ pub fn object_align(s: *cast.CSym) u64 {
     }
     return a;
 }
+
+// The names of the C units' functions in the module (1), which the units
+// share.
+let mut c_functions: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
 
 let mut strings: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
                                                                        vals: @ptr_from_int(*mut *mut ir.Value, 0),
@@ -282,10 +302,13 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
     }
     let name = symbol_name(s);
     let mut f = ir.get_function(M, name);
-    if u.notnil(f) and not ir.is_decl(f) {
+    if u.notnil(f) and not ir.is_decl(f) and (c_functions.get(u.intern(name)) == 0) {
         _ = dg.err(s.span, "C3062", u.f1("the name '%s' is the name of a function of the runtime", s.name));
         f = u.nil.[ir.Func]();
     }
+    // (another unit's function of the same name is the same: cc.ax has
+    // checked that only one unit defines it)
+    c_functions.put(u.intern(name), 1);
     if u.isnil(f) {
         f = ir.add_function(M, name, sig.ty);
     } else {
@@ -306,8 +329,27 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
         f.import_module = "env";
         f.import_name = s.name;
     }
+    if u.isnil(s.def) and (s.linkage == cast.LK_EXTERNAL) and tg.is_windows() {
+        c_library_import(name);
+    }
     s.ir = @ptr_cast(*mut void, f);
     return f;
+}
+
+/// On Windows, a function C code declares and no unit defines is the C
+/// library's (or a system DLL's, by its name): the linker reads a constant
+/// axiom.import.<name> holding "c" (cmd/axiom/src/plink.ax). A unit that
+/// defines the function makes the constant unused.
+pub fn c_library_import(name: []u8) void {
+    let gname = u.cat2("axiom.import.", name);
+    if u.notnil(ir.get_global(M, gname)) {
+        return;
+    }
+    let g = ir.add_global(M, ir.t_array(T_i8, 2), gname);
+    g.init = ir.cstring("c");
+    g.linkage = ir.LINK_LINKONCE;
+    g.is_const = true;
+    g.align = 1;
 }
 
 /// The address of object s (with static storage duration).
@@ -661,7 +703,8 @@ fn init_types() void {
 }
 
 /// Generates unit cu into module m (wasm: for a WebAssembly target): its
-/// objects and functions, and START_SYMBOL. False after an error (reported).
+/// objects and functions. False after an error (reported). The units of a
+/// program are generated in turn, then the start-up (generate_start).
 pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     M = m;
     B = ir.new_builder();
@@ -681,6 +724,19 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
         hooks.body(s);
         F = u.nil.[FnState]();
     }
+    return dg.error_count() == 0;
+}
+
+/// Generates START_SYMBOL(argc, argv) into module m, after the units: it
+/// calls main (the function main of the unit that defines it: cu) and returns
+/// its value as an i32.
+pub fn generate_start(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
+    M = m;
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    is_wasm = wasm;
+    init_types();
     start(cu);
     return dg.error_count() == 0;
 }
@@ -692,10 +748,6 @@ fn start(cu: *mut cs.CUnit) void {
     let mut f = ir.get_function(M, START_SYMBOL);
     if u.isnil(f) {
         f = ir.add_function(M, START_SYMBOL, fty);
-    }
-    if u.isnil(cu.main) {
-        _ = dg.err(u.mkspan(0, 0, 0), "C3063", "the program has no function main");
-        return;
     }
     if not ir.is_decl(f) {
         return;
@@ -718,13 +770,27 @@ fn start(cu: *mut cs.CUnit) void {
     mark_call(r, func_sig(cu.main).plan);
     _ = mt;
     let ib = cty.t_int.bits;
+    let mut status = r;
     if ib > 32 {
-        ir.ret(B, ir.trunc(B, r, T_i32));
+        status = ir.trunc(B, r, T_i32);
     } else if ib < 32 {
-        ir.ret(B, ir.sext(B, r, T_i32));
-    } else {
-        ir.ret(B, r);
+        status = ir.sext(B, r, T_i32);
     }
+    if tg.is_windows() {
+        // returning from main is calling exit with its value (5.1.2.2.3):
+        // the C library's exit flushes its streams and runs the atexit
+        // functions (the start-up's return would end the process at once)
+        let mut pe: [1]*mut ir.Ty = [T_i32];
+        let ety = ir.t_fn(T_void, pe[..], false);
+        let mut ef = ir.get_function(M, "exit");
+        if u.isnil(ef) {
+            ef = ir.add_function(M, "exit", ety);
+        }
+        c_library_import("exit");
+        let mut ea: [1]*mut ir.Value = [status];
+        _ = ir.call(B, ety, ef.val, ea[..]);
+    }
+    ir.ret(B, status);
     F = u.nil.[FnState]();
 }
 

@@ -1,5 +1,6 @@
 /* flags: --c-std=c23 */
 /* native-only */
+/* linux-only */
 /* Variable arguments of C23 types (the C library's snprintf, which the
    native tests link): a _BitInt is not promoted (one as wide as int is
    passed as one), nullptr_t is passed as a null void *. */

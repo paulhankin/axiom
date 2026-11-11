@@ -1,4 +1,5 @@
 /* native-only */
+/* linux-only */
 /* The platform's C calling convention against the system's C compiler
    (c/host_native.c's h_ functions): structures and unions of each size
    class passed and returned by value both ways, callbacks through function

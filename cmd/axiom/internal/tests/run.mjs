@@ -318,22 +318,30 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // /* expect: */ lines, or the build must fail with each /* expect-error: C3xxx */
 // code; it must warn with each /* expect-warning: C4xxx */ code. The tests
 // print through host.h (next to run/); natively its functions are
-// c/host_native.c's, compiled by the system's C compiler. AXIOM_C_TARGET=wasm64
-// builds them for wasm64 instead of wasm32.
+// c/host_native.c's, compiled by the system's C compiler, or for Windows and
+// macOS c/host_c.c's, a second translation unit over the platform's C library
+// (tests marked /* linux-only */ need the former). AXIOM_C_TARGET=wasm64
+// builds them for wasm64 instead of wasm32. A test marked /* check-only */ is
+// only checked (axiom check, with its own --target), not built or run.
 const cRunDir = path.join(root, 'cmd/axiom/internal/tests/c/run');
 const cRunFiles = fs.existsSync(cRunDir) ? fs.readdirSync(cRunDir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(cRunDir, f)) : [];
 await section('', byFile(cRunFiles, '[c]', async (f) => {
   if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
-  if (native && noC) return { skip: true, reason: 'links C code' };
   const src = fs.readFileSync(f, 'utf8');
+  if (native && noC && /\/\* linux-only \*\//.test(src)) return { skip: true, reason: 'links C code' };
   const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
   const errors = [...src.matchAll(/\/\* expect-error: (C\d+) \*\//g)].map((m) => m[1]);
   const warnings = [...src.matchAll(/\/\* expect-warning: (C\d+) \*\//g)].map((m) => m[1]);
   const expect = [...src.matchAll(/^\/\* expect: ?(.*?) \*\/$/gm)].map((m) => m[1]);
   if ((native && /\/\* wasm-only \*\//.test(src)) || (!native && /\/\* native-only \*\//.test(src))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
   const out = path.join(tmp, `c-${path.basename(f, '.c')}${native ? '' : '.wasm'}`);
+  if (/\/\* check-only \*\//.test(src)) {
+    const c = await spawnAsync(compiler, ['check', f, `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, ...flags], { encoding: 'utf8', timeout: compileTimeout });
+    return c.status === 0 ? null : `the check failed:\n${c.stdout}${c.stderr}`;
+  }
   const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags];
-  if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`);
+  if (native && noC) args.push(nativeTarget, path.join(root, 'cmd/axiom/internal/tests/c/host_c.c'));
+  else if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`);
   else if (process.env.AXIOM_C_TARGET && !flags.some((x) => x.startsWith('--target='))) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
   const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
   if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
@@ -350,10 +358,156 @@ await section('', byFile(cRunFiles, '[c]', async (f) => {
   for (const w of warnings) if (!wcodes.includes(w)) return `expected warning ${w}, got [${wcodes.join(', ')}]`;
   const r = native ? await runNative(out) : await runWasm(out);
   let problem = r.trapped ? `unexpected trap: ${r.msg}` : null;
-  const want = expect.join('\n'), got = r.out.join('\n');
+  // (the C library of Windows writes lines ending in \r\n)
+  const want = expect.join('\n'), got = r.out.map((l) => l.replace(/\r$/, '')).join('\n');
   if (!problem && want !== got) problem = `output mismatch\n--- expected\n${want}\n--- got\n${got}`;
   return { problem, stderr: r.stderr };
 }), { parallel: true });
+
+// The C driver (main.ax: c_option, c_options, check_c_options, build_c;
+// c/cc.ax): every option, several translation units, and the errors of
+// options and files. The sources are written into a directory of their own.
+function cDriverCases() {
+  const dir = path.join(tmp, 'c-driver');
+  const write = (files) => {
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [n, t] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, n)), { recursive: true });
+      fs.writeFileSync(path.join(dir, n), t);
+    }
+  };
+  const ax = (args) => spawnAsync(compiler, args, { encoding: 'utf8', cwd: dir, timeout: compileTimeout });
+  const fatal = async (args, re) => {
+    const c = await ax(args);
+    return c.status === 2 && re.test(c.stderr) ? null : `${args.join(' ')}: status ${c.status}, expected ${re}:\n${c.stdout}${c.stderr}`;
+  };
+  const codes = (c) => { try { return JSON.parse(c.stdout).diagnostics.map((x) => `${x.severity[0]}:${x.code}`); } catch { return null; } };
+  const skip = () => (bootstrapCompiler() ? { skip: true, reason: 'the C front end is the compiler\'s' } : null);
+  return {
+    'C: --c-std= names': async () => {
+      if (skip()) return skip();
+      write({ 'std.c': 'long v = __STDC_VERSION__;\n' });
+      const want = { c89: '__STDC_VERSION__', c90: '__STDC_VERSION__', c95: '199409L', c99: '199901L', c11: '201112L',
+        c17: '201710L', c18: '201710L', c23: '202311L' };
+      for (const [n, v] of Object.entries(want)) {
+        const c = await ax(['build', 'std.c', '--emit=c-pp', `--c-std=${n}`]);
+        if (c.status !== 0 || c.stdout.trim() !== `long v = ${v};`) return `--c-std=${n}: ${c.stdout}${c.stderr}`;
+      }
+      const d = await ax(['build', 'std.c', '--emit=c-pp']);
+      if (d.stdout.trim() !== 'long v = 201710L;') return `the default is not c17: ${d.stdout}`;
+      for (const bad of ['--c-std=gnu99', '--c-char=yes', '--c-int=8', '--c-long=16']) {
+        const p = await fatal(['build', 'std.c', bad], /E9001/);
+        if (p) return p;
+      }
+      return fatal(['build', 'std.c', '--c-int=64', '--c-long=32'], /--c-long must be at least --c-int/);
+    },
+    'C: -D, -U and -I, in order': async () => {
+      if (skip()) return skip();
+      write({ 'm.c': 'A B C f(3) E\n#ifdef Z\nz\n#endif\n#include <h.h>\n#include "h.h"\n#include <g.h>\n',
+        'i1/h.h': 'one\n', 'i2/h.h': 'two\n', 'i2/g.h': 'three\n', 'h.h': 'local\n' });
+      const lines = (c) => c.stdout.split('\n').filter((l) => l.trim()).join('|');
+      let c = await ax(['build', 'm.c', '--emit=c-pp', '-DA', '-DB=2', '-Df(x)=x+1', '-DC=', '-DZ', '-UZ', '-Ii1', '-Ii2']);
+      if (lines(c) !== '1 2 3+1 E|one|local|three') return `-D -U -I: ${c.stdout}${c.stderr}`;
+      c = await ax(['build', 'm.c', '--emit=c-pp', '-D', 'E=5', '-U', 'E', '-DE=6', '-I', 'i2', '-Ii1', '-DZ']);
+      if (lines(c) !== 'A B C f(3) 6|z|two|local|three') return `-D NAME, -U NAME, -I dir: ${c.stdout}${c.stderr}`;
+      c = await ax(['build', 'm.c', '--emit=c-pp', '-D3x', '--format=agent-json']);
+      if (c.status !== 1 || !(codes(c) || []).includes('e:C1052')) return `-D3x: ${c.stdout}${c.stderr}`;
+      let p = await fatal(['build', 'm.c', '-Inope'], /include directory 'nope' \(-I\) does not exist/);
+      if (p) return p;
+      p = await fatal(['build', 'm.c', '-Ih.h'], /is not a directory/);
+      return p || fatal(['build', 'm.c', '-D'], /'-D' needs a value/);
+    },
+    'C: several translation units': async () => {
+      if (skip()) return skip();
+      write({
+        'a.c': '#include "host.h"\nstatic int helper(int x) { return x * 2; }\nint counter;\nextern int shared;\n' +
+          'int b_func(int);\nint tentative;\nint main(void) {\n    counter = 5;\n' +
+          '    print_i64(helper(b_func(1)) + shared + tentative);\n    return 0;\n}\n',
+        'b.c': 'static int helper(int x) { return x + 100; }\nextern int counter;\nint shared = 7;\n' +
+          'int b_func(int y) { return helper(y) + counter; }\n',
+        'c.c': 'int counter = 3;\nint b_func(int y) { return y; }\n',
+        'lib.c': 'int lib_f(int x) { return x + 1; }\nstatic int g;\n',
+      });
+      const out = path.join(dir, 'ab.wasm');
+      const inc = `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`;
+      let c = await ax(['build', 'a.c', 'b.c', inc, '-o', out]);
+      if (c.status !== 0) return `a.c b.c: ${c.stdout}${c.stderr}`;
+      const r = await runWasm(out);
+      // (each unit's helper is its own; counter, shared and tentative are one object each)
+      if (r.trapped || r.out.join('|') !== '219') return `a.c b.c printed ${r.out.join('|')} ${r.msg || ''}`;
+      c = await ax(['build', 'a.c', 'b.c', 'c.c', inc, '--format=agent-json']);
+      if (c.status !== 1 || (codes(c) || []).join(' ') !== 'e:C3064 e:C3064') return `a.c b.c c.c: ${c.stdout}${c.stderr}`;
+      c = await ax(['check', 'a.c', 'b.c', inc]);
+      if (c.status !== 0) return `check a.c b.c: ${c.stdout}${c.stderr}`;
+      c = await ax(['build', 'lib.c', '--format=agent-json']);
+      if (c.status !== 1 || (codes(c) || []).join(' ') !== 'e:C3063') return `lib.c without main: ${c.stdout}${c.stderr}`;
+      c = await ax(['build', 'lib.c', '--emit=obj', '-o', path.join(dir, 'lib.o')]);
+      if (c.status !== 0 || !fs.statSync(path.join(dir, 'lib.o')).size) return `lib.c --emit=obj: ${c.stdout}${c.stderr}`;
+      c = await ax(['build', 'lib.c', '--emit=ir', '-o', path.join(dir, 'lib.ir')]);
+      const ir = c.status === 0 ? fs.readFileSync(path.join(dir, 'lib.ir'), 'utf8') : '';
+      if (!ir.includes('@lib_f(') || ir.includes('__axiom_c_main')) return `lib.c --emit=ir: the units' code alone expected:\n${c.stderr}`;
+      return fatal(['build', 'a.c', 'b.c', '--emit=c-pp'], /--emit=c-pp takes one C source/);
+    },
+    'C: options for Axiom code, C options without C sources': async () => {
+      if (skip()) return skip();
+      write({ 'w.c': 'int main(void) { return 0; }\n', 'x.ax': 'export fn main() i32 {\n    return 0;\n}\n' });
+      for (const o of ['--overflow=trap', '--sanitize=address', '--coverage=afl', '--emit-header=w.h', '--link=x.ax', '--units=module']) {
+        const p = await fatal(['build', 'w.c', o], /is an option for Axiom code, and not for C sources/);
+        if (p) return p;
+      }
+      for (const o of ['--c-std=c99', '--c-char=signed', '--c-int=16', '--c-long=32', '-DX', '-UX']) {
+        const p = await fatal(['build', 'x.ax', o], /is an option for C sources, and the input is not one/);
+        if (p) return p;
+      }
+      for (const args of [['w.c', 'x.ax'], ['x.ax', 'w.c']]) {
+        const p = await fatal(['build', ...args], /cannot be built together/);
+        if (p) return p;
+      }
+      for (const cmd of ['test', 'profile']) {
+        const p = await fatal([cmd, 'w.c'], new RegExp(`axiom ${cmd} does not take a C source`));
+        if (p) return p;
+      }
+      const p = await fatal(['ide', 'w.c', '--query=diagnostics'], /axiom ide answers about Axiom sources/);
+      return p || fatal(['fmt', 'w.c'], /axiom fmt formats Axiom sources, and 'w.c' is a C source/);
+    },
+    'C: files, outputs, --emit and -O, warnings and --format=agent-json': async () => {
+      if (skip()) return skip();
+      write({ 'p.c': '#include "host.h"\nint main(void) {\n    print_i64(6 * 7);\nunused:\n    return 0;\n}\n', 'd.c/x': '' });
+      const inc = `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`;
+      let p = await fatal(['build', 'nosuch.c'], /E0211.*cannot read 'nosuch.c'/);
+      if (!p) p = await fatal(['build', 'p.c', 'nosuch.c', inc], /E0211.*cannot read 'nosuch.c'/);
+      if (!p) p = await fatal(['build', 'p.c', inc, '-o', '.'], /the output '.' is a directory/);
+      if (!p) p = await fatal(['build', 'p.c', inc, '--emit=asm'], /--emit=asm is not supported/);
+      if (!p) p = await fatal(['build', 'p.c', inc, '--emit=nothing'], /unknown --emit kind/);
+      if (p) return p;
+      for (const o of ['-O0', '-O1', '-O2', '-O3', '-g']) {
+        const out = path.join(dir, `p${o}.wasm`);
+        const c = await ax(['build', 'p.c', inc, o, '-o', out, '--format=agent-json']);
+        // (a warning does not fail the build, and is in the JSON)
+        if (c.status !== 0 || (codes(c) || []).join(' ') !== 'w:C4040') return `${o}: status ${c.status}: ${c.stdout}${c.stderr}`;
+        const r = await runWasm(out);
+        if (r.out.join('|') !== '42') return `${o}: printed ${r.out.join('|')}`;
+      }
+      for (const [e, want] of [['c-pp', /print_i64\(6 \* 7\)/], ['c-tokens', /^keyword int/m], ['c-ast', /^translation-unit/]]) {
+        const c = await ax(['build', 'p.c', inc, `--emit=${e}`]);
+        if (c.status !== 0 || !want.test(c.stdout)) return `--emit=${e}: ${c.stdout.slice(0, 200)}${c.stderr}`;
+      }
+      const c = await ax(['build', '--help']);
+      return c.status === 0 && /--c-std=c89\|c90\|c95\|c99\|c11\|c17\|c18\|c23/.test(c.stderr) ? null : `--help: ${c.stderr}`;
+    },
+    'C: native stack traces through C functions': async () => {
+      if (skip()) return skip();
+      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      write({ 'crash.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
+        'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n' });
+      const out = path.join(dir, 'crash');
+      const c = await ax(['build', 'crash.c', '-O0', nativeTarget, '-o', out]);
+      if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
+      const r = spawnSync(out, [], { encoding: 'utf8' });
+      return /at deref\n\s+at middle \(crash\.c:5:12\)\n\s+at main \(crash\.c:9:12\)/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
+    },
+  };
+}
 
 // A C program as an object and as IR: the start-up's module with the unit in it.
 await section('C programs', {
@@ -370,6 +524,7 @@ await section('C programs', {
     if (c.status !== 0) return `--emit=obj failed:\n${c.stdout}${c.stderr}`;
     return fs.statSync(obj).size > 0 ? null : 'an empty object';
   },
+  ...cDriverCases(),
 });
 
 // `axiom test`: the standard library's own tests must pass, and the
@@ -1288,6 +1443,18 @@ if (!skipPlatform) {
 }
 
 // macOS (spec §14.1; the compiler only, not the bootstrap one). cmd/axiom/internal/tests/macho.mjs checks
+// A C program of two translation units over the platform's C library (for the
+// macos and windows sections): printf, an atexit function (returning from
+// main is calling exit), the arguments, static functions of the same name.
+const platformC = (n) => {
+  const a = path.join(tmp, `${n}-c-a.c`), b = path.join(tmp, `${n}-c-b.c`);
+  fs.writeFileSync(a, 'int printf(const char *, ...);\nint atexit(void (*)(void));\nstatic int f(void) { return 1; }\n' +
+    'int g(void);\nstatic void bye(void) { printf("bye\\n"); }\n' +
+    'int main(int argc, char **argv) {\n    atexit(bye);\n    printf("%s %d %.2f\\n", argv[1], f() + g(), 2.5);\n    return 3;\n}\n');
+  fs.writeFileSync(b, 'static int f(void) { return 40; }\nint g(void) { return f() + 1; }\n');
+  return [a, b];
+};
+
 // the executables built for --target=aarch64-macos the way dyld and the
 // kernel would; the compiler itself is among them. On a Mac they also run
 // (and the whole suite runs natively with AXIOM_NATIVE_TARGET=aarch64-macos);
@@ -1359,6 +1526,13 @@ if (!skipPlatform) {
         if (d.readUInt32BE(0) !== 0x89504e47 || d.length < 2000) return `${e}: not much of a PNG`;
       }
       return null;
+    },
+    'a C program: two translation units, the C library': () => {
+      const [a, b] = platformC('macos');
+      const p = check(a, 'c', [b]);
+      if (p || !onMac) return p;
+      const r = spawnSync(out('c'), ['x'], { encoding: 'utf8' });
+      return r.status === 3 && r.stdout === 'x 42 2.50\nbye\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
     'axiom test': () => {
       const r = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=aarch64-macos'], { encoding: 'utf8', cwd: root });
@@ -1433,6 +1607,15 @@ if (!skipPlatform) {
       if (p || !wine) return p;
       const r = run('hello');
       return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    'a C program: two translation units, the C library (msvcrt.dll)': () => {
+      const [a, b] = platformC('windows');
+      const c = build(a, 'c', [b]);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const p = checkPE(out('c'));
+      if (p || !wine) return p;
+      const r = run('c', ['x']);
+      return r.status === 3 && r.stdout === 'x 42 2.50\r\nbye\r\n' ? null : `status ${r.status}: ${JSON.stringify(r.stdout)}${r.stderr}`;
     },
     'debug symbols (a PDB)': () => {
       const c = build(path.join(root, 'examples/pi/pi.ax'), 'pdb', ['-O2']);

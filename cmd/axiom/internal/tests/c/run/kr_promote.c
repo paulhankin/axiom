@@ -4,7 +4,8 @@
    calls through declarations without prototypes promote the arguments
    (6.5.2.2p6); a prototype compatible with such a definition (6.7.6.3p15)
    converts them to its own (promoted) types; a parameter without a
-   declaration is int (C89). */
+   declaration is int (C89). An argument must have its parameter's promoted
+   type (4L for a long), or the call is undefined. */
 #include "host.h"
 
 int sum();
@@ -28,7 +29,7 @@ int implicit(a, b) long b; { return a * 10 + (int)b; }
 
 static int narrow(c) signed char c; { return c; }
 
-static int through(int (*fp)()) { return fp(3, 4); }
+static int through(int (*fp)()) { return fp(3, 4L); }
 
 int main() {
     char c = 1;

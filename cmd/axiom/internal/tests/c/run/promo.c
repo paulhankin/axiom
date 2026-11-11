@@ -69,7 +69,7 @@ int main(void) {
     print_i64(sizeof 0x80000000);
     print_i64(sizeof 2147483648);
     print_i64(sizeof 'a');
-    print_i64('\377' < 0 ? -1 : 1);
+    print_i64('\377' == (char)-1);
     print_i64(-INT_MAX - 1 == INT_MIN);
     print_i64(1 << 31 < 0);
     print_i64(-7 >> 1);
@@ -125,7 +125,7 @@ int main(void) {
 /* expect: 4 */
 /* expect: 8 */
 /* expect: 4 */
-/* expect: -1 */
+/* expect: 1 */
 /* expect: 1 */
 /* expect: 1 */
 /* expect: -4 */

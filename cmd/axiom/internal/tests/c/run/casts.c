@@ -8,7 +8,7 @@ int main(void) {
     int x = 5;
     int *p = &x;
     unsigned long long up;
-    print_i64((char)v);
+    print_i64((signed char)v);
     print_i64((unsigned char)v);
     print_i64((short)v);
     print_i64((unsigned short)v);
@@ -22,7 +22,7 @@ int main(void) {
     print_i64((int)d);
     print_i64((unsigned char)(int)d);
     print_f64((float)d);
-    print_f64((double)(char)-3);
+    print_f64((double)(signed char)-3);
     print_f64((double)(unsigned char)-3);
     print_i64((double)0xFFFFFFFFFFFFFFFFull == 18446744073709551616.0);
     print_f64((float)0xFFFFFFFFull);

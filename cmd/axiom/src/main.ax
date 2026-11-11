@@ -3,6 +3,7 @@
 //
 //   axiom build <file.ax> [options] -o <out>
 //   axiom check <file.ax> [options]
+//   axiom build|check <file.c>... [options]   a C program (c/cc.ax; docs/c-frontend.md)
 //   axiom lsp [options]          language server for editors (lsp.ax)
 //   axiom ide <file.ax> --query=<q> [options]   one question from it (ide.ax)
 //
@@ -24,6 +25,12 @@
 //                              GUI program with no console window
 //   --icon=<file.ico>          x86_64-windows: the program's icon (in its resources)
 //   -o <path>                  output path
+//
+// C sources (c_option, c_options, build_c):
+//   --c-std=c89|c90|c95|c99|c11|c17|c18|c23   (default c17)
+//   --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64   (default: the target's C ABI)
+//   -DNAME[=value]  -UNAME  -I<dir> (also -D NAME, -U NAME, -I <dir>)
+//   --emit=c-pp|c-tokens|c-ast   preprocessed text, tokens, syntax tree
 // =============================================================================
 import "ast.ax" as ast;
 import "backend.ax" as be;
@@ -55,6 +62,7 @@ import "wobj.ax" as wo;
 
 fn usage() void {
     u.eprint("usage: axiom <build|check|test> [<file.ax> | <package dir>] [options]\n");
+    u.eprint("       axiom <build|check> <file.c>... [options]   a C program (its translation units)\n");
     u.eprint("       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>] [-- <program args>]\n");
     u.eprint("       axiom fmt <file.ax | dir>... [--check] [--stdout]   canonical layout, tidy imports\n");
     u.eprint("       axiom new <name>      create a package skeleton\n");
@@ -75,6 +83,12 @@ fn usage() void {
     u.eprint("  --icon=<file.ico>        x86_64-windows: the program's icon, shown by Explorer and the taskbar\n");
     u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
     u.eprint("                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
+    u.eprint("  C sources:\n");
+    u.eprint("  --c-std=c89|c90|c95|c99|c11|c17|c18|c23   the standard (default c17)\n");
+    u.eprint("  --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64   (default: the target's C ABI)\n");
+    u.eprint("  -DNAME[=value]  -UNAME  -I<dir>   macros and include directories, in order\n");
+    u.eprint("  --emit=c-pp|c-tokens|c-ast   the preprocessed text, the tokens or the syntax tree\n");
+    u.eprint("  --emit=obj|ir without a main: the units' code alone, to link into another program\n");
 }
 
 fn find_std(argv0: []u8) []u8 {
@@ -270,6 +284,7 @@ struct Options {
     link_flags: u.List.[[]u8],  // -l / -L
     inc_flags: u.List.[[]u8],   // -I, for C sources
     c_args: u.List.[[]u8],      // the C front end's options (c_option)
+    c_inputs: u.List.[[]u8],    // the C sources after the first (input)
     header_path: []u8,
     test_filter: []u8,
     test_timeout: []u8,
@@ -293,10 +308,13 @@ fn new_options(cmd: []u8) Options {
                      emit: "exe", json: false, co: co, link_inputs: u.List.[[]u8].empty(),
                      ax_links: u.List.[[]u8].empty(), feature_args: u.List.[[]u8].empty(),
                      link_flags: u.List.[[]u8].empty(), inc_flags: u.List.[[]u8].empty(), c_args: u.List.[[]u8].empty(),
-                     header_path: u.nosym(), test_filter: u.nosym(), test_timeout: u.nosym(), show_output: false,
-                     prof_hz: 999, units_mode: -1, verbose: false, folded_path: u.nosym(),
-                     prog_args: u.List.[[]u8].empty() };
+                     c_inputs: u.List.[[]u8].empty(), header_path: u.nosym(), test_filter: u.nosym(),
+                     test_timeout: u.nosym(), show_output: false, prof_hz: 999, units_mode: -1, verbose: false,
+                     folded_path: u.nosym(), prog_args: u.List.[[]u8].empty() };
 }
+
+// An object of C code alone (build_c): no runtime, so no system call stubs.
+let mut g_c_object: bool = false;
 
 // A step of the driver returns this to go on, or an exit status.
 const CONTINUE: i32 = -1;
@@ -324,9 +342,12 @@ fn c_option(o: *mut Options, a: []u8) bool {
 fn c_options(o: *Options, c: *mut cop.COptions) bool {
     let win = tg.g_os == tg.OS_WINDOWS;
     c.std = cop.C17;
-    // (the targets' C ABIs: plain char is unsigned on AArch64 Linux; long is
-    // 32 bits on Windows and where pointers are)
-    c.char_signed = not ((tg.g_arch == tg.ARCH_A64) and (tg.g_os == tg.OS_LINUX));
+    // (the targets' C ABIs: plain char and wchar_t are unsigned on AArch64
+    // Linux (AAPCS64; Apple's variant makes char signed and wchar_t int);
+    // long is 32 bits on Windows and where pointers are; wchar_t is int, or
+    // on Windows unsigned short)
+    let a64_linux = (tg.g_arch == tg.ARCH_A64) and (tg.g_os == tg.OS_LINUX);
+    c.char_signed = not a64_linux;
     c.int_bits = 32;
     c.ptr_bits = ty.g_target.ptr_bits;
     c.long_bits = 64;
@@ -334,7 +355,7 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         c.long_bits = 32;
     }
     c.wchar_bits = 32;
-    c.wchar_signed = true;
+    c.wchar_signed = not a64_linux;
     if win {
         c.wchar_bits = 16;
         c.wchar_signed = false;
@@ -342,14 +363,24 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     let mut defs = u.List.[cop.Define].empty();
     let mut dirs = u.List.[[]u8].empty();
     for k in 0..o.inc_flags.len {
-        dirs.push(o.inc_flags.get(k)[2..]);
+        let d = o.inc_flags.get(k)[2..];
+        if not u.is_dir(d) {
+            let what = u.pick(u.file_exists(d), "is not a directory", "does not exist");
+            dg.emit_fatal(o.json, "E9001", u.f2("the include directory '%s' (-I) %s", d, what));
+            return false;
+        }
+        dirs.push(d);
     }
     for k in 0..o.c_args.len {
         let a = o.c_args.get(k);
         let mut ok = true;
         if u.starts(a, "--c-std=") {
             c.std = cop.std_named(a[8..]);
-            ok = c.std >= 0;
+            if c.std < 0 {
+                dg.emit_fatal(o.json, "E9001",
+                              u.f1("unknown C standard in '%s' (known: c89, c90, c95, c99, c11, c17, c18, c23)", a));
+                return false;
+            }
         } else if u.starts(a, "--c-char=") {
             c.char_signed = u.str_eq(a[9..], "signed");
             ok = c.char_signed or u.str_eq(a[9..], "unsigned");
@@ -385,6 +416,50 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     return true;
 }
 
+// Is `path` a C source (its name ends in .c)?
+fn is_c_source(path: []u8) bool {
+    return (path.len > 2) and u.ends(path, ".c");
+}
+
+// The options that are the Axiom compiler's and mean nothing for C sources
+// (C code has no overflow modes, heap checks or coverage counters, and an
+// Axiom header or source is of Axiom code): false after reporting one.
+// Without C sources, the C front end's options are errors.
+fn check_c_options(o: *Options) bool {
+    let c_input = is_c_source(o.input);
+    if not c_input {
+        if o.c_args.len > 0 {
+            dg.emit_fatal(o.json, "E9001", u.f1("'%s' is an option for C sources, and the input is not one (*.c)",
+                                                o.c_args.get(0)));
+            return false;
+        }
+        return true;
+    }
+    let mut bad = u.nosym();
+    if o.co.overflow != cg.OVF_WRAP {
+        bad = "--overflow";  // (C's signed overflow is undefined; unsigned wraps)
+    } else if o.co.sanitize_address {
+        bad = "--sanitize=address";
+    } else if o.co.coverage {
+        bad = "--coverage=afl";
+    } else if not u.isnos(o.header_path) {
+        bad = "--emit-header";
+    } else if o.ax_links.len > 0 {
+        bad = "--link=<file.ax>";
+    } else if o.units_mode >= 0 {
+        bad = "--units";
+    }
+    if not u.isnos(bad) {
+        dg.emit_fatal(o.json, "E9001", u.f1("%s is an option for Axiom code, and not for C sources", bad));
+        return false;
+    }
+    if cfront.text_emit(o.emit) and (o.c_inputs.len > 0) {
+        dg.emit_fatal(o.json, "E9001", u.f1("--emit=%s takes one C source", o.emit));
+        return false;
+    }
+    return true;
+}
+
 // Reads the options after the command into *o; false on an error (reported).
 fn parse_options(o: *mut Options, args: [][]u8) bool {
     let co = o.co;
@@ -397,6 +472,18 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
         } else if u.str_eq(a, "-o") and ((i + 1) < argc) {
             i += 1;
             o.out = args[i];
+        } else if (u.str_eq(a, "-D") or u.str_eq(a, "-U") or u.str_eq(a, "-I")) and ((i + 1) < argc) {
+            // (-D NAME, -U NAME, -I dir: as -DNAME, -UNAME, -Idir)
+            i += 1;
+            let joined = u.cat2(a, args[i]);
+            if a[1] == 'I' {
+                o.inc_flags.push(joined);
+            } else {
+                o.c_args.push(joined);
+            }
+        } else if u.str_eq(a, "-D") or u.str_eq(a, "-U") or u.str_eq(a, "-I") or u.str_eq(a, "-o") {
+            dg.emit_fatal(o.json, "E9001", u.f1("'%s' needs a value (-DNAME[=value], -UNAME, -Idir, -o <path>)", a));
+            return false;
         } else if u.starts(a, "--target=") {
             o.target = a[9..];
         } else if u.str_eq(a, "-O0") or u.str_eq(a, "-O1") or u.str_eq(a, "-O2") or u.str_eq(a, "-O3") {
@@ -485,6 +572,13 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             return false;
         } else if u.isnos(o.input) {
             o.input = a;
+        } else if is_c_source(o.input) and is_c_source(a) {
+            o.c_inputs.push(a);  // another translation unit of the program
+        } else if is_c_source(o.input) or is_c_source(a) {
+            dg.emit_fatal(o.json, "E9001",
+                          u.f2("'%s' and '%s' cannot be built together: a build is of C sources or of an Axiom program (an Axiom program links C code with --link=<file.c>)",
+                               o.input, a));
+            return false;
         } else {
             dg.emit_fatal(o.json, "E9001", u.f1("unexpected argument '%s'", a));
             return false;
@@ -711,17 +805,29 @@ fn compile(args: [][]u8) i32 {
     if rc != CONTINUE {
         return rc;
     }
-    if not set_target(o.target, o.json) or not set_cpu(&o) {
+    if not set_target(o.target, o.json) or not set_cpu(&o) or not check_c_options(&o) {
         return 2;
     }
-    if not u.file_exists(o.input) {
+    if not u.file_exists(o.input) or u.is_dir(o.input) {
         return fatal(o.json, "E0211", u.f1("cannot read '%s'", o.input));
+    }
+    for k in 0..o.c_inputs.len {
+        if not u.file_exists(o.c_inputs.get(k)) or u.is_dir(o.c_inputs.get(k)) {
+            return fatal(o.json, "E0211", u.f1("cannot read '%s'", o.c_inputs.get(k)));
+        }
+    }
+    if not u.isnos(o.out) and u.is_dir(o.out) {
+        return fatal(o.json, "E9001", u.f1("the output '%s' is a directory (-o names the file to write)", o.out));
     }
     ty.types_init();
     if u.isnos(o.std_dir) {
         o.std_dir = find_std(args[0]);
     }
-    if u.ends(o.input, ".c") and not o.ide_mode {
+    if is_c_source(o.input) and o.ide_mode {
+        // (axiom lsp asks only about Axiom sources; nothing to answer here)
+        return fatal(o.json, "E9001", u.f1("axiom ide answers about Axiom sources, and '%s' is a C source", o.input));
+    }
+    if is_c_source(o.input) {
         // a C translation unit (docs/c.md)
         let mut c = u.new.[cop.COptions]();
         if not c_options(&o, c) {
@@ -754,16 +860,26 @@ fn compile(args: [][]u8) i32 {
     return build_program(&mut o);
 }
 
-// A C program (docs/c-frontend.md): the translation unit is checked, then
-// the start-up module (std/internal/runtime/c_start.ax), which calls its
-// main, is built as an Axiom program, and the unit's IR joins its module
-// (codegen.ax), so that both go through the same optimizer, backends and
-// linkers. One unit: the C code is not compiled separately.
+// A C program (docs/c-frontend.md): each translation unit is checked, the
+// units are linked (cfront.link_check), then the start-up module
+// (std/internal/runtime/c_start.ax), which calls main, is built as an Axiom
+// program, and the units' IR joins its module (codegen.ax), so that all go
+// through the same optimizer, backends and linkers. The units are one
+// module: they are not compiled separately. An object (--emit=obj or ir) of
+// units without main is theirs alone: its root module is
+// std/internal/runtime/c_object.ax, with no start-up or runtime.
 fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     if o.testing or o.profiling or o.ide_mode {
         return fatal(o.json, "E9001", u.f1("axiom %s does not take a C source", o.cmd));
     }
-    let ok = cfront.check(o.input, c);
+    let mut ok = cfront.check(o.input, c);
+    for k in 0..o.c_inputs.len {
+        ok = cfront.check(o.c_inputs.get(k), c) and ok;
+    }
+    let exe = u.str_eq(o.emit, "exe");
+    if ok {
+        ok = cfront.link_check(o.build and exe);
+    }
     if not ok or not o.build {
         dg.emit(o.json, o.json);
         if ok {
@@ -771,13 +887,15 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
         }
         return 1;
     }
-    let start = u.f1("%s/internal/runtime/c_start.ax", o.std_dir);
+    let object = not exe and not cfront.has_main();
+    g_c_object = object;
+    let start = u.f2("%s/internal/runtime/%s", o.std_dir, u.pick(object, "c_object.ax", "c_start.ax"));
     if not u.file_exists(start) {
         return fatal(o.json, "E9003", u.f1("cannot find the C start-up module (%s)", start));
     }
     o.units_mode = 0;
     let mut files = u.List.[[]u8].empty();
-    if not runtime_sources(o, &mut files) {
+    if not object and not runtime_sources(o, &mut files) {
         return 2;
     }
     let so = sema.SemaOptions.{ std_dir: o.std_dir, extra_files: files.items() };
@@ -794,7 +912,7 @@ fn set_emit(o: *Options, final_link: bool) bool {
     let co = o.co;
     if u.str_eq(o.emit, "obj") {
         co.emit = cg.EMIT_OBJ;
-        be.g_stubs = not ty.g_target.is_wasm and (tg.g_os == tg.OS_LINUX);
+        be.g_stubs = not ty.g_target.is_wasm and (tg.g_os == tg.OS_LINUX) and not g_c_object;
     } else if u.str_eq(o.emit, "ir") {
         co.emit = cg.EMIT_IR;
     } else if u.str_eq(o.emit, "asm") {
@@ -1199,6 +1317,19 @@ fn driver(args: [][]u8) i32 {
         return 2;
     }
     let cmd = args[1];
+    for a in args[1..] {
+        if u.str_eq(a, "--") {
+            break;  // (axiom profile: the program's arguments)
+        }
+        if u.str_eq(a, "--help") or u.str_eq(a, "-h") {
+            usage();
+            return 0;
+        }
+    }
+    if u.str_eq(cmd, "help") {
+        usage();
+        return 0;
+    }
     if u.str_eq(cmd, "cache") {
         return run_cache(args[2..]);
     }

@@ -1,29 +1,42 @@
 // =============================================================================
-// cc.ax - the C front end's driver: what `axiom build file.c` does.
+// cc.ax - the C front end's driver: what `axiom build file.c...` does.
 //
 //   --emit=c-pp    the preprocessed text
 //   --emit=c-ast   the syntax tree, as text
 //   --emit=c-tokens  the tokens and their values, one to a line (for tests)
-//   --emit=exe|obj|ir  a program: the translation unit is analyzed here
-//                  (check), and main.ax builds the start-up module
-//                  (std/internal/runtime/c_start.ax) as an Axiom program,
-//                  whose IR module the unit's code joins (gen_ir, called by
-//                  codegen.ax) before the optimizer and backends run
+//   --emit=exe|obj|ir  a program: each translation unit is analyzed here
+//                  (check), the units are linked (link_check: one definition
+//                  of each external name, and main), and main.ax builds the
+//                  start-up module (std/internal/runtime/c_start.ax) as an
+//                  Axiom program, whose IR module the units' code joins
+//                  (gen_ir, called by codegen.ax) before the optimizer and
+//                  backends run
+//
+// Several units are one IR module: their names with external linkage are
+// the same symbols (a reference in one unit to another's definition is to
+// it), names with internal linkage are numbered apart (csema.ax: uid).
 //
 // (docs/c.md describes the options; docs/c-frontend.md the design.)
 // =============================================================================
 import "../diag.ax" as dg;
 import "../ir.ax" as ir;
 import "../util.ax" as u;
+import "cast.ax" as cast;
 import "cast_dump.ax" as cdump;
+import "cgen.ax" as cg;
 import "cgen_stmt.ax" as cgs;
 import "copts.ax" as co;
 import "cparse.ax" as cparse;
 import "cpp.ax" as cpp;
 import "csema.ax" as cs;
+import "csema_marks.ax" as csm;
 import "csema_stmt.ax" as css;
 
-let mut g_unit: *mut cs.CUnit = @ptr_from_int(*mut cs.CUnit, 0);
+// The checked units, in the order of the command line, and the file each
+// is (for diagnostics about the whole program).
+let mut g_units: u.List.[*mut cs.CUnit] = u.List.[*mut cs.CUnit].{ data: @ptr_from_int(*mut *mut cs.CUnit, 0), len: 0,
+                                                                   cap: 0 };
+let mut g_files: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
 
 /// Is `emit` one of the C front end's text outputs (run makes them)?
 pub fn text_emit(emit: []u8) bool {
@@ -32,35 +45,111 @@ pub fn text_emit(emit: []u8) bool {
 
 /// Preprocesses, parses and analyzes the C source at `path`; true if it
 /// has no errors (they are reported through diag.ax, not emitted), and
-/// then its typed unit is what gen_ir generates.
+/// then its typed unit is one gen_ir generates.
 pub fn check(path: []u8, o: *co.COptions) bool {
+    let before = dg.error_count();
     let toks = cpp.preprocess(path, o);
-    if dg.error_count() > 0 {
+    if dg.error_count() > before {
         return false;
     }
     let t = cparse.parse(toks.items(), o);
-    if dg.error_count() > 0 {
+    if dg.error_count() > before {
         return false;
     }
     let cu = css.analyze(t, o);
-    if dg.error_count() > 0 {
+    if dg.error_count() > before {
         return false;
     }
-    g_unit = cu;
+    g_units.push(cu);
+    // (the end of file token's span is in the unit's own file)
+    g_files.push(toks.get(toks.len - 1).span.file);
     return true;
 }
 
-/// Is there a C translation unit for gen_ir?
-pub fn pending() bool {
-    return u.notnil(g_unit);
+// The span of the definition of s, a function or object of unit k.
+fn def_span(s: *cast.CSym) u.Span {
+    if (s.kind == cast.SK_FUNC) and u.notnil(s.def) {
+        return s.def.decls.get(0).name_span;
+    }
+    return s.span;
 }
 
-/// Generates the checked translation unit into module m (wasm: for a
-/// WebAssembly target). False after an error (reported).
-pub fn gen_ir(m: *mut ir.Module, wasm: bool) bool {
-    let cu = g_unit;
-    g_unit = u.nil.[cs.CUnit]();
-    return cgs.generate(m, cu, wasm);
+/// After every unit is checked: the program's external names have one
+/// definition each (6.9p5: C3064), and (program: an executable, not an
+/// object) one unit defines main (C3063). True if so (else reported).
+pub fn link_check(program: bool) bool {
+    let mut defs = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    let mut ok = true;
+    for k in 0..g_units.len {
+        let cu = g_units.get(k);
+        let mut syms = u.List.[*mut cast.CSym].empty();
+        for f in cu.funcs.items() {
+            if (f.linkage == cast.LK_EXTERNAL) and not csm.is_inline_def(f) {
+                syms.push(f);
+            }
+        }
+        for x in cu.objects.items() {
+            if x.linkage == cast.LK_EXTERNAL {
+                syms.push(x);
+            }
+        }
+        for s in syms.items() {
+            let key = u.intern(s.name);
+            let prev = defs.get(key);
+            if u.notnil(prev) {
+                let d = dg.err(def_span(s), "C3064",
+                               u.f1("'%s' is defined in two translation units (an external name has one definition)",
+                                    s.name));
+                dg.note(d, def_span(prev), "the other definition");
+                ok = false;
+            } else {
+                defs.put(key, s);
+            }
+        }
+    }
+    if program and ok and u.isnil(main_unit()) and (g_files.len > 0) {
+        _ = dg.err(u.mkspan(g_files.get(0), 0, 0), "C3063", "the program has no function main");
+        ok = false;
+    }
+    return ok;
+}
+
+// The unit that defines main, or nil.
+fn main_unit() *mut cs.CUnit {
+    for cu in g_units.items() {
+        if u.notnil(cu.main) {
+            return cu;
+        }
+    }
+    return u.nil.[cs.CUnit]();
+}
+
+/// Does a unit define main?
+pub fn has_main() bool {
+    return u.notnil(main_unit());
+}
+
+/// Are there C translation units for gen_ir?
+pub fn pending() bool {
+    return g_units.len > 0;
+}
+
+/// Generates the checked translation units into module m (wasm: for a
+/// WebAssembly target), and the start-up's call of main if one defines it;
+/// `site` makes the call-site records of native stack traces (codegen.ax).
+/// False after an error (reported).
+pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut ir.Value) bool {
+    cg.call_site = site;
+    let mut ok = true;
+    for cu in g_units.items() {
+        ok = cgs.generate(m, cu, wasm) and ok;
+    }
+    let mu = main_unit();
+    if ok and u.notnil(mu) {
+        ok = cg.generate_start(m, mu, wasm);
+    }
+    g_units.clear();
+    return ok;
 }
 
 /// Compiles the C source at `path`. `emit` is the --emit kind, `out` the

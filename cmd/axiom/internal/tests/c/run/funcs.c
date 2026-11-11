@@ -15,7 +15,7 @@ static double half(double x) { return x / 2; }
 static unsigned char low(unsigned char c) { return c; }
 static short neg(short s) { return -s; }
 static _Bool nz(int x) { return x; }
-static long long wide(long long a, int b, char c) { return a * b + c; }
+static long long wide(long long a, int b, signed char c) { return a * b + c; }
 static void set(int *p, int v) { *p = v; }
 int old();
 int old(a, b) int a; int b; { return a - b; }

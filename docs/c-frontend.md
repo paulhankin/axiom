@@ -26,7 +26,20 @@ are written against; `docs/c.md` (to come) is for users.
   (it is `double`).
 - **Implementation-defined choices** a build can make: `--c-char=signed|unsigned`,
   `--c-int=16|32|64`, `--c-long=32|64`. `short` is 16 bits, `long long` 64, pointers
-  and `size_t` the target's. The defaults are the target's C ABI.
+  and `size_t` the target's. The defaults are the target's C ABI:
+
+  | target | plain `char` | `long` | `wchar_t` |
+  |---|---|---|---|
+  | `x86_64` (Linux; x86-64 System V) | signed | 64 | `int` |
+  | `aarch64` (Linux; AAPCS64) | unsigned | 64 | `unsigned int` |
+  | `aarch64-macos` (Apple's arm64 ABI) | signed | 64 | `int` |
+  | `x86_64-windows` (Windows x64) | signed | 32 | `unsigned short` |
+  | `wasm32`, `wasm64` (the WebAssembly C ABI) | signed | 32, 64 | `int` |
+
+  (`c/run/target_*.c` check them.) Where the platforms' headers choose between
+  types of the same width, this implementation's may choose the other (`size_t` is
+  `unsigned int` on wasm32, `int64_t` is `long` on macOS): the representation and
+  calling convention are the same.
 - **Fixed choices**: `BITINT_MAXWIDTH` is 64 (a `_BitInt(N)` is stored in the
   smallest of 8, 16, 32 and 64 bits that holds it); an inline definition (6.7.4p7)
   is compiled with internal linkage for the unit's own calls, so the external
@@ -90,20 +103,52 @@ cmd/axiom/internal/tests/c/ tests
 ## Command line
 
 ```
-axiom build file.c [-o out] [--target=...] [-O0..-O3]
-    --c-std=c89|c95|c99|c11|c17|c23      (default c17)
+axiom build file.c... [-o out] [--target=...] [-O0..-O3]
+axiom check file.c...           the units are analyzed and linked, nothing is written
+    --c-std=c89|c90|c95|c99|c11|c17|c18|c23      (default c17)
     --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64
-    -DNAME[=value]  -UNAME  -Idir
-    --emit=c-pp     the preprocessed text
+    -DNAME[=value]  -UNAME  -Idir   (also -D NAME, -U NAME, -I dir; in order)
+    --emit=c-pp     the preprocessed text           (one source; standard output
+    --emit=c-tokens the tokens, one to a line        without -o)
     --emit=c-ast    the syntax tree, as text
     --emit=obj|ir   an object, or the IR
+    --format=agent-json   the diagnostics as JSON (warnings do not fail a build)
 ```
+
+The other options of `axiom build` that apply: `--target`, `--cpu`, `--features`,
+`-O0`..`-O3`, `--stack-traces` (C functions' calls have call-site records, so
+native stack traces show C frames with their lines), `-g` (accepted: this
+compiler writes line tables for no code), `-l`, `-L`, `--link=` (objects,
+libraries, and C sources for the system's C compiler), `--subsystem`, `--icon`,
+`--pdb`. Those of Axiom code (`--overflow`, `--sanitize`, `--coverage`,
+`--units`, `--emit-header`, `--link=file.ax`) are errors with C sources, as are the
+C options without one, Axiom and C sources together, and `axiom test`, `profile`,
+`ide` and `fmt` of a C source. A missing source or include directory and an
+output that is a directory are errors before anything is compiled.
+
+Several sources are the translation units of one program. Each is preprocessed,
+parsed and analyzed on its own (its macros, types and internal names are its own:
+internal names are numbered apart); then the units are linked (`cc.ax`:
+`link_check`): an external name is defined in one unit at most (C3064: a second
+definition, a tentative one included, is an error with a note at the first), and
+an executable's units define `main` once (C3063). Their code is one IR module, so
+a reference in one unit to another's definition is to that definition. An object
+or IR (`--emit=obj|ir`) of units without `main` holds their code alone (its root
+module is `std/internal/runtime/c_object.ax`: no start-up, no runtime), to be
+linked into another program; with `main` it is the whole program's, as for Axiom.
 
 ## Programs
 
 A C program's `main` is called by a start-up module of the runtime, which the build
 adds; functions the program declares and does not define are imports (WebAssembly:
-from the module `env`) or undefined symbols for the linker.
+from the module `env`) or undefined symbols for the linker: Linux's C library (the
+program is then linked with the system's C compiler), macOS's libSystem, and on
+Windows `msvcrt.dll`, unless their names are those of the system DLLs' functions
+(`plink.ax`). On Windows the start-up calls the C library's `exit` with `main`'s
+value (which flushes its streams and runs the `atexit` functions); elsewhere the
+system's start-up does. A program may define the C library's functions itself
+(`memcpy`, `memset`, ... in a freestanding program): the runtime's own copies
+(AArch64 Linux) are weak.
 
 ## Tests
 
@@ -115,13 +160,19 @@ comments, so that they are valid in every standard:
 /* expect: 42 */            one line of expected output, in order
 /* expect-error: C3012 */   the build must fail with this code
 /* expect-warning: C4040 */ the build must warn with this code
+/* check-only */            only checked (axiom check, with the flags' --target)
+/* linux-only */            natively, only where host_native.c is linked
 ```
 
 Programs print through functions the test host provides (`print_i64`, `print_u64`,
 `print_f64`, `print_str`), declared in `cmd/axiom/internal/tests/c/host.h`
-(`#include "host.h"`; natively they are `c/host_native.c`'s). The programs of
-`c/run/` are built for wasm32, or with `--native` for the machine, at the
-suite's optimization level; they may say `/* native-only */` or `/* wasm-only */`.
+(`#include "host.h"`; natively they are `c/host_native.c`'s, built by the system's
+C compiler, or for Windows and macOS `c/host_c.c`'s, a second translation unit
+over the platform's C library). The programs of `c/run/` are built for wasm32
+(`AXIOM_C_TARGET=wasm64`: wasm64), or with `--native` for the machine
+(`AXIOM_NATIVE_TARGET` and `AXIOM_NATIVE_EXEC` for another), at the suite's
+optimization level; they may say `/* native-only */` or `/* wasm-only */`. The
+`C programs` section tests the driver: its options, several units, its errors.
 Preprocessor tests compare `--emit=c-pp` output with a `.pp` file next to them; parser
 tests compare `--emit=c-ast` with a `.ast` file.
 

@@ -12,13 +12,15 @@ x1 + x2, of x1 << x2 and of c ? x1 : x2, whether (T1)-1 < (T2)1, and the
 value of (T1)-1 + (T2)0 converted to unsigned long long. A type is printed
 as its number in TYPES (through _Generic, so the tests are C11). The
 int32_long64 configuration is the one of the usual 64-bit C ABIs; its
-expected output can be checked with the system's C compiler.
+expected output can be checked with the system's C compiler. The
+configurations that do not choose plain char's signedness pass on every
+target: they do not print the values of a plain char's -1 (only its types).
 """
 import os
 
 out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'c', 'run')
 
-# name, C spelling, rank (6.3.1.1p1), whether signed (None: by config), width (None: by config)
+# name, C spelling, rank (6.3.1.1p1)
 TYPES = [
     ('char', 'char', 1), ('schar', 'signed char', 1), ('uchar', 'unsigned char', 1),
     ('short', 'short', 2), ('ushort', 'unsigned short', 2), ('int', 'int', 3), ('uint', 'unsigned', 3),
@@ -29,16 +31,19 @@ TYPES = [
 IDS = {t[0]: i + 1 for i, t in enumerate(TYPES)}
 OPERANDS = [t[0] for t in TYPES] + ['enum']
 CONFIGS = [
-    ('int32_long64', '--c-int=32 --c-long=64', 32, 64, True),
-    ('int32_long32', '--c-int=32 --c-long=32', 32, 32, True),
-    ('int16_long32', '--c-int=16 --c-long=32', 16, 32, True),
-    ('int64_long64', '--c-int=64 --c-long=64', 64, 64, True),
+    ('int32_long64', '--c-int=32 --c-long=64', 32, 64, None),
+    ('int32_long32', '--c-int=32 --c-long=32', 32, 32, None),
+    ('int16_long32', '--c-int=16 --c-long=32', 16, 32, None),
+    ('int64_long64', '--c-int=64 --c-long=64', 64, 64, None),
+    ('schar', '--c-char=signed --c-int=32 --c-long=64', 32, 64, True),
     ('uchar', '--c-char=unsigned --c-int=32 --c-long=64', 32, 64, False),
 ]
 
 
 class Config:
     def __init__(self, ib, lb, char_signed):
+        # (char_signed None: the target's; a plain char's promotion is the
+        # same either way, as int is wider than char)
         self.ib, self.lb, self.char_signed = ib, lb, char_signed
 
     def bits(self, t):
@@ -149,7 +154,7 @@ def generate(name, flags, ib, lb, char_signed):
                 val += type_id(c.promote(a))
             out.append('        print_i64(%s);' % line)
             expect.append(val)
-            if ints:
+            if ints and (c.char_signed is not None or 'char' not in (a, b)):
                 out.append('        print_i64((%s)-1 < (%s)1);' % (spelling(a), spelling(b)))
                 expect.append(1 if c.conv(r, c.conv(a, -1)) < c.conv(r, c.conv(b, 1)) else 0)
                 out.append('        print_u64((unsigned long long)((%s)-1 + (%s)0));' % (spelling(a), spelling(b)))

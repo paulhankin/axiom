@@ -107,78 +107,56 @@ int main(void) {
         char x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (char)1);
-        print_u64((unsigned long long)((char)-1 + (char)0));
     }
     {
         char x = 1;
         signed char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (signed char)1);
-        print_u64((unsigned long long)((char)-1 + (signed char)0));
     }
     {
         char x = 1;
         unsigned char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (unsigned char)1);
-        print_u64((unsigned long long)((char)-1 + (unsigned char)0));
     }
     {
         char x = 1;
         short y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (short)1);
-        print_u64((unsigned long long)((char)-1 + (short)0));
     }
     {
         char x = 1;
         unsigned short y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (unsigned short)1);
-        print_u64((unsigned long long)((char)-1 + (unsigned short)0));
     }
     {
         char x = 1;
         int y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (int)1);
-        print_u64((unsigned long long)((char)-1 + (int)0));
     }
     {
         char x = 1;
         unsigned y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (unsigned)1);
-        print_u64((unsigned long long)((char)-1 + (unsigned)0));
     }
     {
         char x = 1;
         long y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (long)1);
-        print_u64((unsigned long long)((char)-1 + (long)0));
     }
     {
         char x = 1;
         unsigned long y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (unsigned long)1);
-        print_u64((unsigned long long)((char)-1 + (unsigned long)0));
     }
     {
         char x = 1;
         long long y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (long long)1);
-        print_u64((unsigned long long)((char)-1 + (long long)0));
     }
     {
         char x = 1;
         unsigned long long y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (unsigned long long)1);
-        print_u64((unsigned long long)((char)-1 + (unsigned long long)0));
     }
     {
         char x = 1;
@@ -199,22 +177,16 @@ int main(void) {
         char x = 1;
         _Bool y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (_Bool)1);
-        print_u64((unsigned long long)((char)-1 + (_Bool)0));
     }
     {
         char x = 1;
         enum E y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((char)-1 < (enum E)1);
-        print_u64((unsigned long long)((char)-1 + (enum E)0));
     }
     {
         signed char x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((signed char)-1 < (char)1);
-        print_u64((unsigned long long)((signed char)-1 + (char)0));
     }
     {
         signed char x = 1;
@@ -319,8 +291,6 @@ int main(void) {
         unsigned char x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((unsigned char)-1 < (char)1);
-        print_u64((unsigned long long)((unsigned char)-1 + (char)0));
     }
     {
         unsigned char x = 1;
@@ -425,8 +395,6 @@ int main(void) {
         short x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((short)-1 < (char)1);
-        print_u64((unsigned long long)((short)-1 + (char)0));
     }
     {
         short x = 1;
@@ -531,8 +499,6 @@ int main(void) {
         unsigned short x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((unsigned short)-1 < (char)1);
-        print_u64((unsigned long long)((unsigned short)-1 + (char)0));
     }
     {
         unsigned short x = 1;
@@ -637,8 +603,6 @@ int main(void) {
         int x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((int)-1 < (char)1);
-        print_u64((unsigned long long)((int)-1 + (char)0));
     }
     {
         int x = 1;
@@ -743,8 +707,6 @@ int main(void) {
         unsigned x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((unsigned)-1 < (char)1);
-        print_u64((unsigned long long)((unsigned)-1 + (char)0));
     }
     {
         unsigned x = 1;
@@ -849,8 +811,6 @@ int main(void) {
         long x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((long)-1 < (char)1);
-        print_u64((unsigned long long)((long)-1 + (char)0));
     }
     {
         long x = 1;
@@ -955,8 +915,6 @@ int main(void) {
         unsigned long x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((unsigned long)-1 < (char)1);
-        print_u64((unsigned long long)((unsigned long)-1 + (char)0));
     }
     {
         unsigned long x = 1;
@@ -1061,8 +1019,6 @@ int main(void) {
         long long x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((long long)-1 < (char)1);
-        print_u64((unsigned long long)((long long)-1 + (char)0));
     }
     {
         long long x = 1;
@@ -1167,8 +1123,6 @@ int main(void) {
         unsigned long long x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((unsigned long long)-1 < (char)1);
-        print_u64((unsigned long long)((unsigned long long)-1 + (char)0));
     }
     {
         unsigned long long x = 1;
@@ -1513,8 +1467,6 @@ int main(void) {
         _Bool x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((_Bool)-1 < (char)1);
-        print_u64((unsigned long long)((_Bool)-1 + (char)0));
     }
     {
         _Bool x = 1;
@@ -1619,8 +1571,6 @@ int main(void) {
         enum E x = 1;
         char y = 1;
         print_i64(T(x + y) * 10000LL + T(c ? x : y) * 100LL + T(x << y));
-        print_i64((enum E)-1 < (char)1);
-        print_u64((unsigned long long)((enum E)-1 + (char)0));
     }
     {
         enum E x = 1;
@@ -1770,8 +1720,22 @@ int main(void) {
 /* expect: 7 */
 /* expect: 6 */
 /* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
+/* expect: 60606 */
+/* expect: 60606 */
+/* expect: 60606 */
+/* expect: 60606 */
+/* expect: 60606 */
+/* expect: 70706 */
+/* expect: 80806 */
+/* expect: 90906 */
+/* expect: 101006 */
+/* expect: 111106 */
+/* expect: 121200 */
+/* expect: 131300 */
+/* expect: 141400 */
+/* expect: 60606 */
+/* expect: 70706 */
+/* expect: 60606 */
 /* expect: 60606 */
 /* expect: 1 */
 /* expect: 18446744073709551615 */
@@ -1812,50 +1776,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 18446744073709551615 */
 /* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 70706 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
-/* expect: 80806 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 90906 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
-/* expect: 101006 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 111106 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
-/* expect: 121200 */
-/* expect: 131300 */
-/* expect: 141400 */
-/* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
-/* expect: 70706 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
-/* expect: 60606 */
-/* expect: 0 */
-/* expect: 255 */
 /* expect: 60606 */
 /* expect: 0 */
 /* expect: 255 */
@@ -1896,8 +1816,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 255 */
 /* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
 /* expect: 60606 */
 /* expect: 1 */
 /* expect: 18446744073709551615 */
@@ -1938,8 +1856,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 18446744073709551615 */
 /* expect: 60606 */
-/* expect: 0 */
-/* expect: 65535 */
 /* expect: 60606 */
 /* expect: 0 */
 /* expect: 65535 */
@@ -1980,8 +1896,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 65535 */
 /* expect: 60606 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
 /* expect: 60606 */
 /* expect: 1 */
 /* expect: 18446744073709551615 */
@@ -2022,8 +1936,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 18446744073709551615 */
 /* expect: 70707 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
 /* expect: 70707 */
 /* expect: 0 */
 /* expect: 18446744073709551615 */
@@ -2064,8 +1976,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 18446744073709551615 */
 /* expect: 80808 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
 /* expect: 80808 */
 /* expect: 1 */
 /* expect: 18446744073709551615 */
@@ -2106,8 +2016,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 18446744073709551615 */
 /* expect: 90909 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
 /* expect: 90909 */
 /* expect: 0 */
 /* expect: 18446744073709551615 */
@@ -2148,8 +2056,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 18446744073709551615 */
 /* expect: 101010 */
-/* expect: 1 */
-/* expect: 18446744073709551615 */
 /* expect: 101010 */
 /* expect: 1 */
 /* expect: 18446744073709551615 */
@@ -2190,8 +2096,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 18446744073709551615 */
 /* expect: 111111 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
 /* expect: 111111 */
 /* expect: 0 */
 /* expect: 18446744073709551615 */
@@ -2280,8 +2184,6 @@ int main(void) {
 /* expect: 141400 */
 /* expect: 141400 */
 /* expect: 60606 */
-/* expect: 0 */
-/* expect: 1 */
 /* expect: 60606 */
 /* expect: 0 */
 /* expect: 1 */
@@ -2322,8 +2224,6 @@ int main(void) {
 /* expect: 0 */
 /* expect: 1 */
 /* expect: 70707 */
-/* expect: 0 */
-/* expect: 18446744073709551615 */
 /* expect: 70707 */
 /* expect: 0 */
 /* expect: 18446744073709551615 */

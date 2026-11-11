@@ -1,4 +1,5 @@
 /* native-only */
+/* linux-only */
 /* Calls of a variadic function (the C library's snprintf, which the native
    tests link): the default argument promotions of the variable arguments. */
 #include "host.h"
