@@ -1,0 +1,483 @@
+// =============================================================================
+// cconst.ax - C constant expressions (6.6): the evaluation of integer and
+// arithmetic constant expressions as semantic analysis types them (fold),
+// with the wrap-around of each type, and address constants for the
+// initializers of objects with static storage duration (address).
+//
+// An expression's value is in its Expr: is_const, and cval (an integer's
+// bits, sign- or zero-extended from its type's width: ctypes.wrap) or
+// fcval (a floating value; a float's is rounded to float). fold runs on a
+// node once its operands are typed and converted, so constness is found
+// bottom-up; operations whose result is undefined (division by zero, an
+// overflowing conversion of a floating value) are left to run time.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+/// Sets e's value (is_const, cval or fcval) from its operands', if they are
+/// constant and e's operation can be done now.
+pub fn fold(e: *mut cast.Expr) void {
+    let t = e.ty;
+    if u.isnil(t) or not cty.is_arith(t) {
+        return;
+    }
+    let k = e.kind;
+    if k == cast.ExprKind.CAST {
+        if (e.op == cast.CV_VALUE) and e.a.is_const and cty.is_arith(e.a.ty) {
+            convert(e, e.a);
+        }
+    } else if k == cast.ExprKind.UNARY {
+        if e.a.is_const {
+            unary(e);
+        }
+    } else if k == cast.ExprKind.BINARY {
+        binary(e);
+    } else if k == cast.ExprKind.COND {
+        if e.a.is_const {
+            let c = truth(e.a);
+            let x = pick(c, e.b, e.c);
+            if x.is_const {
+                set_from(e, x);
+            }
+        }
+    }
+}
+
+fn pick(c: bool, a: *mut cast.Expr, b: *mut cast.Expr) *mut cast.Expr {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn set_int(e: *mut cast.Expr, v: u64) void {
+    e.is_const = true;
+    e.cval = cty.wrap(e.ty, v);
+}
+
+fn set_float(e: *mut cast.Expr, f: f64) void {
+    e.is_const = true;
+    if e.ty.kind == cty.TK_FLOAT {
+        e.fcval = @as(f64, @float_cast(f32, f));
+    } else {
+        e.fcval = f;
+    }
+}
+
+fn set_from(e: *mut cast.Expr, x: *cast.Expr) void {
+    e.is_const = true;
+    e.cval = x.cval;
+    e.fcval = x.fcval;
+}
+
+/// Is constant x (of arithmetic type) nonzero?
+pub fn truth(x: *cast.Expr) bool {
+    if cty.is_floating(x.ty) {
+        return x.fcval != 0.0;
+    }
+    return x.cval != 0;
+}
+
+// A constant's value as a double.
+fn as_float(x: *cast.Expr) f64 {
+    if cty.is_floating(x.ty) {
+        return x.fcval;
+    }
+    if x.ty.is_signed {
+        return @float_from_int(f64, @bit_cast(i64, x.cval));
+    }
+    return @float_from_int(f64, x.cval);
+}
+
+/// e (a conversion to an arithmetic type) of constant x: 6.3.1.
+fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
+    let to = e.ty;
+    let from = x.ty;
+    if cty.is_integer(to) {
+        if cty.is_integer(from) {
+            set_int(e, x.cval);
+            return;
+        }
+        let f = x.fcval;
+        if to.kind == cty.TK_BOOL {
+            set_int(e, selu(f != 0.0, 1, 0));
+            return;
+        }
+        // the value must fit (6.3.1.4p1); otherwise left to run time
+        if not (f > -9.3e18 and f < 1.8e19) or (f != f) {
+            return;
+        }
+        let tr = trunc_f(f);
+        if tr < 0.0 {
+            if not to.is_signed {
+                return;
+            }
+            set_int(e, @bit_cast(u64, @int_from_float(i64, tr)));
+        } else {
+            set_int(e, @int_from_float(u64, tr));
+        }
+        if cty.wrap(to, e.cval) != e.cval or not value_fits(to, tr) {
+            e.is_const = false;
+        }
+        return;
+    }
+    // to a floating type
+    if cty.is_floating(from) {
+        set_float(e, x.fcval);
+        return;
+    }
+    if to.kind == cty.TK_FLOAT {
+        // (rounded once, from the integer)
+        e.is_const = true;
+        if from.is_signed {
+            e.fcval = @as(f64, @float_from_int(f32, @bit_cast(i64, x.cval)));
+        } else {
+            e.fcval = @as(f64, @float_from_int(f32, x.cval));
+        }
+        return;
+    }
+    set_float(e, as_float(x));
+}
+
+fn trunc_f(f: f64) f64 {
+    if f < 0.0 {
+        return -@floor(-f);
+    }
+    return @floor(f);
+}
+
+// Does the integral value f fit integer type t?
+fn value_fits(t: *cty.CType, f: f64) bool {
+    if t.is_signed {
+        let lim = @float_from_int(f64, @bit_cast(i64, cty.int_max(t))) + 1.0;
+        return (f < lim) and (f >= -lim);
+    }
+    let ulim = @float_from_int(f64, cty.int_max(t)) + 1.0;
+    return (f >= 0.0) and (f < ulim);
+}
+
+fn unary(e: *mut cast.Expr) void {
+    let x = e.a;
+    let op = e.op;
+    if op == ct.P_BANG {
+        set_int(e, selu(truth(x), 0, 1));
+        return;
+    }
+    if cty.is_floating(e.ty) {
+        if op == ct.P_MINUS {
+            set_float(e, -x.fcval);
+        } else if op == ct.P_PLUS {
+            set_float(e, x.fcval);
+        }
+        return;
+    }
+    if op == ct.P_MINUS {
+        set_int(e, 0 -% x.cval);
+    } else if op == ct.P_PLUS {
+        set_int(e, x.cval);
+    } else if op == ct.P_TILDE {
+        set_int(e, ~x.cval);
+    }
+}
+
+fn binary(e: *mut cast.Expr) void {
+    let op = e.op;
+    let a = e.a;
+    let b = e.b;
+    // && and || are constant once the first operand decides them
+    if (op == ct.P_ANDAND) or (op == ct.P_OROR) {
+        if not a.is_const or not cty.is_scalar(a.ty) or not cty.is_arith(a.ty) {
+            return;
+        }
+        let ta = truth(a);
+        if (op == ct.P_ANDAND) and not ta {
+            set_int(e, 0);
+        } else if (op == ct.P_OROR) and ta {
+            set_int(e, 1);
+        } else if b.is_const and cty.is_arith(b.ty) {
+            set_int(e, selu(truth(b), 1, 0));
+        }
+        return;
+    }
+    if not a.is_const or not b.is_const or not cty.is_arith(a.ty) or not cty.is_arith(b.ty) {
+        return;
+    }
+    if is_compare(op) {
+        set_int(e, selu(compare(op, a, b), 1, 0));
+        return;
+    }
+    if cty.is_floating(e.ty) {
+        let x = a.fcval;
+        let y = b.fcval;
+        if op == ct.P_PLUS {
+            set_float(e, x + y);
+        } else if op == ct.P_MINUS {
+            set_float(e, x - y);
+        } else if op == ct.P_STAR {
+            set_float(e, x * y);
+        } else if op == ct.P_SLASH {
+            set_float(e, x / y);
+        }
+        return;
+    }
+    let r = int_op(op, e.ty, a.cval, b.cval);
+    if r.ok {
+        set_int(e, r.v);
+    }
+}
+
+pub fn is_compare(op: i32) bool {
+    return (op == ct.P_LT) or (op == ct.P_GT) or (op == ct.P_LE) or (op == ct.P_GE) or (op == ct.P_EQ) or
+           (op == ct.P_NE);
+}
+
+fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
+    let t = a.ty;
+    if cty.is_floating(t) {
+        let x = a.fcval;
+        let y = b.fcval;
+        if op == ct.P_LT {
+            return x < y;
+        }
+        if op == ct.P_GT {
+            return x > y;
+        }
+        if op == ct.P_LE {
+            return x <= y;
+        }
+        if op == ct.P_GE {
+            return x >= y;
+        }
+        if op == ct.P_EQ {
+            return x == y;
+        }
+        return x != y;
+    }
+    if op == ct.P_EQ {
+        return a.cval == b.cval;
+    }
+    if op == ct.P_NE {
+        return a.cval != b.cval;
+    }
+    let mut lt = a.cval < b.cval;
+    let mut gt = a.cval > b.cval;
+    if t.is_signed {
+        lt = @bit_cast(i64, a.cval) < @bit_cast(i64, b.cval);
+        gt = @bit_cast(i64, a.cval) > @bit_cast(i64, b.cval);
+    }
+    if op == ct.P_LT {
+        return lt;
+    }
+    if op == ct.P_GT {
+        return gt;
+    }
+    if op == ct.P_LE {
+        return not gt;
+    }
+    return not lt;
+}
+
+pub struct IntResult {
+    v: u64,
+    ok: bool,
+}
+
+/// x op y in integer type t (the operands' bits as cval; a shift's right
+/// operand is a count): wrapping; not ok for a division by zero or a shift
+/// count out of range.
+pub fn int_op(op: i32, t: *cty.CType, x: u64, y: u64) IntResult {
+    let sg = t.is_signed;
+    let mut v: u64 = 0;
+    if op == ct.P_PLUS {
+        v = x +% y;
+    } else if op == ct.P_MINUS {
+        v = x -% y;
+    } else if op == ct.P_STAR {
+        v = x *% y;
+    } else if (op == ct.P_SLASH) or (op == ct.P_PERCENT) {
+        if y == 0 {
+            return IntResult.{ v: 0, ok: false };
+        }
+        if sg {
+            let a = @bit_cast(i64, x);
+            let b = @bit_cast(i64, y);
+            if (b == -1) and (a == @min_value(i64)) {
+                v = selu(op == ct.P_SLASH, x, 0);
+            } else if op == ct.P_SLASH {
+                v = @bit_cast(u64, a / b);
+            } else {
+                v = @bit_cast(u64, a % b);
+            }
+        } else {
+            let ux = cty.wrap_bits(x, t.bits, false);
+            let uy = cty.wrap_bits(y, t.bits, false);
+            if op == ct.P_SLASH {
+                v = ux / uy;
+            } else {
+                v = ux % uy;
+            }
+        }
+    } else if (op == ct.P_SHL) or (op == ct.P_SHR) {
+        if y >= @as(u64, @bit_cast(u32, t.bits)) {
+            return IntResult.{ v: 0, ok: false };
+        }
+        let k = @truncate(u32, y);
+        if op == ct.P_SHL {
+            v = x << k;
+        } else if sg {
+            v = @bit_cast(u64, @bit_cast(i64, x) >> k);
+        } else {
+            v = cty.wrap_bits(x, t.bits, false) >> k;
+        }
+    } else if op == ct.P_AMP {
+        v = x & y;
+    } else if op == ct.P_PIPE {
+        v = x | y;
+    } else if op == ct.P_CARET {
+        v = x ^ y;
+    } else {
+        return IntResult.{ v: 0, ok: false };
+    }
+    return IntResult.{ v: cty.wrap(t, v), ok: true };
+}
+
+// -----------------------------------------------------------------------------
+// Address constants (6.6p9)
+// -----------------------------------------------------------------------------
+
+/// An address constant: the address of `sym` (an object with static storage
+/// duration, or a function) or of the string literal `str`, plus `off`
+/// bytes; neither: the integer `off` (a null pointer when 0).
+pub struct Addr {
+    ok: bool,
+    sym: *mut cast.CSym,
+    str: *mut cast.Expr,
+    off: u64,
+}
+
+fn no_addr() Addr {
+    return Addr.{ ok: false, sym: u.nil.[cast.CSym](), str: u.nil.[cast.Expr](), off: 0 };
+}
+
+fn plus(a: Addr, d: u64) Addr {
+    let mut r = a;
+    r.off = r.off +% d;
+    return r;
+}
+
+/// The value of e (a pointer, or an integer as wide as one) as an address
+/// constant; ok false if it is not one.
+pub fn address(e: *mut cast.Expr) Addr {
+    if e.is_const and cty.is_integer(e.ty) {
+        return Addr.{ ok: true, sym: u.nil.[cast.CSym](), str: u.nil.[cast.Expr](), off: e.cval };
+    }
+    let k = e.kind;
+    if k == cast.ExprKind.NULLPTR {
+        return Addr.{ ok: true, sym: u.nil.[cast.CSym](), str: u.nil.[cast.Expr](), off: 0 };
+    }
+    if k == cast.ExprKind.CAST {
+        if (e.op == cast.CV_ADECAY) or (e.op == cast.CV_FDECAY) {
+            return lv_address(e.a);
+        }
+        if e.op == cast.CV_VALUE {
+            let from = e.a.ty;
+            let to = e.ty;
+            let wide = cty.size_of(to) == cty.ptr_bytes;
+            if (to.kind == cty.TK_POINTER) or (cty.is_integer(to) and wide) {
+                if (from.kind == cty.TK_POINTER) or cty.is_integer(from) {
+                    return address(e.a);
+                }
+            }
+        }
+        return no_addr();
+    }
+    if k == cast.ExprKind.UNARY {
+        if e.op == ct.P_AMP {
+            return lv_address(e.a);
+        }
+        return no_addr();
+    }
+    if k == cast.ExprKind.BINARY {
+        if (e.op != ct.P_PLUS) and (e.op != ct.P_MINUS) {
+            return no_addr();
+        }
+        if (e.a.ty.kind != cty.TK_POINTER) or not e.b.is_const {
+            return no_addr();
+        }
+        let base = address(e.a);
+        if not base.ok {
+            return base;
+        }
+        let d = e.b.cval *% cty.size_of(e.a.ty.elem);
+        if e.op == ct.P_MINUS {
+            return plus(base, 0 -% d);
+        }
+        return plus(base, d);
+    }
+    if k == cast.ExprKind.COND {
+        if e.a.is_const {
+            if truth(e.a) {
+                return address(e.b);
+            }
+            return address(e.c);
+        }
+        return no_addr();
+    }
+    return no_addr();
+}
+
+/// The address of lvalue (or function designator) e as an address constant.
+pub fn lv_address(e: *mut cast.Expr) Addr {
+    let k = e.kind;
+    if k == cast.ExprKind.IDENT {
+        let s = e.sym;
+        if u.isnil(s) {
+            return no_addr();
+        }
+        if (s.kind == cast.SK_FUNC) or ((s.kind == cast.SK_OBJECT) and (s.duration == cast.SD_STATIC)) {
+            return Addr.{ ok: true, sym: s, str: u.nil.[cast.Expr](), off: 0 };
+        }
+        return no_addr();
+    }
+    if k == cast.ExprKind.STRING {
+        return Addr.{ ok: true, sym: u.nil.[cast.CSym](), str: e, off: 0 };
+    }
+    if k == cast.ExprKind.UNARY {
+        if e.op == ct.P_STAR {
+            return address(e.a);
+        }
+        return no_addr();
+    }
+    if k == cast.ExprKind.INDEX {
+        if not e.b.is_const {
+            return no_addr();
+        }
+        let base = address(e.a);
+        if not base.ok {
+            return base;
+        }
+        return plus(base, e.b.cval *% cty.size_of(e.ty));
+    }
+    if k == cast.ExprKind.MEMBER {
+        let mut base = no_addr();
+        if e.op == ct.P_DOT {
+            base = lv_address(e.a);
+        } else {
+            base = address(e.a);
+        }
+        if not base.ok {
+            return base;
+        }
+        return plus(base, e.cval);
+    }
+    return no_addr();
+}
+
+fn selu(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}

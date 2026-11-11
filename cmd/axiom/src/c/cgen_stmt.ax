@@ -1,0 +1,347 @@
+// =============================================================================
+// cgen_stmt.ax - IR generation for C statements and function bodies, and
+// the initialization of automatic objects; generate is the entry point of
+// IR generation (it installs the hook cgen.ax calls for function bodies).
+//
+// Every object of a function is an alloca in its entry block (mem2reg
+// promotes those whose address is not taken). A label or case is a block;
+// goto, break, continue and switch branch to them. (A goto into a loop
+// makes control flow irreducible: the native backends take it, the
+// WebAssembly backend's structuring may not.)
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "cgen_expr.ax" as gx;
+import "csema.ax" as cs;
+import "ctypes.ax" as cty;
+
+struct Jump {
+    brk: *mut ir.Block,
+    cont: *mut ir.Block,  // nil for a switch
+}
+
+struct Body {
+    jumps: u.List.[Jump],
+    cases: u.SymMap.[*mut ir.Block],  // a CASE or DEFAULT statement's block, by its address
+    is_main: bool,
+}
+
+let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
+
+/// Generates unit cu into module m (wasm: for a WebAssembly target).
+/// False after an error (reported).
+pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
+    cg.hooks.body = function_body;
+    return cg.generate(m, cu, wasm);
+}
+
+fn function_body(s: *mut cast.CSym) void {
+    let F = cg.F;
+    let f = F.f;
+    let b = u.new.[Body]();
+    b.cases = u.SymMap.[*mut ir.Block].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Block](), cap: 0, len: 0 };
+    b.is_main = u.str_eq(s.name, "main") and (s.linkage == cast.LK_EXTERNAL);
+    BD = b;
+    let d = s.def;
+    cg.set_span(d.decls.get(0).name_span);
+    f.src = ir.cur_src;
+    F.entry = cg.new_block("entry");
+    let start = cg.new_block("start");
+    cg.at_end(start);
+    let mut k: usize = 0;
+    if F.sig.sret {
+        F.sret = f.params[0];
+        k = 1;
+    }
+    for p in s.params.items() {
+        let pv = f.params[k];
+        k += 1;
+        let a = cg.alloca(p.ty, p.name);
+        p.ir = @ptr_cast(*mut void, a);
+        if cg.by_ptr(p.ty) {
+            gx.copy(p.ty, a, pv);
+        } else if cty.is_record(p.ty) {
+            _ = ir.store(cg.B, pv, a);
+        } else {
+            gx.store(cty.unqual(p.ty), pv, a);
+        }
+    }
+    for x in d.body.items.items() {
+        stmt(x);
+    }
+    if not cg.terminated() {
+        // the end of the body: main returns 0 (5.1.2.2.3); the value of
+        // any other is undefined (6.9.1p12)
+        let rt = F.ret;
+        if cty.is_void(rt) or F.sig.sret {
+            ir.ret_void(cg.B);
+        } else if cty.is_record(rt) {
+            ir.ret(cg.B, ir.undef(cg.lty(rt)));
+        } else {
+            ir.ret(cg.B, ir.czero(cg.lty(rt)));
+        }
+    }
+    cg.at_end(F.entry);
+    ir.br(cg.B, start);
+    ir.remove_unreachable(f);
+    BD = u.nil.[Body]();
+}
+
+fn stmt(s: *mut cast.Stmt) void {
+    if u.isnil(s) {
+        return;
+    }
+    cg.set_span(s.span);
+    let k = s.kind;
+    if k == cast.StmtKind.COMPOUND {
+        for x in s.items.items() {
+            stmt(x);
+        }
+    } else if k == cast.StmtKind.DECL {
+        decl(s.decl);
+    } else if k == cast.StmtKind.EXPR {
+        if u.notnil(s.e) {
+            cg.continue_after();
+            _ = gx.rv(s.e);
+        }
+    } else if k == cast.StmtKind.IF {
+        if_stmt(s);
+    } else if k == cast.StmtKind.SWITCH {
+        switch_stmt(s);
+    } else if k == cast.StmtKind.WHILE {
+        while_stmt(s);
+    } else if k == cast.StmtKind.DO {
+        do_stmt(s);
+    } else if k == cast.StmtKind.FOR {
+        for_stmt(s);
+    } else if k == cast.StmtKind.GOTO {
+        cg.br(label_block(s.sym));
+    } else if k == cast.StmtKind.CONTINUE {
+        let mut i = BD.jumps.len;
+        while i > 0 {
+            i -= 1;
+            if u.notnil(BD.jumps.at(i).cont) {
+                cg.br(BD.jumps.at(i).cont);
+                break;
+            }
+        }
+    } else if k == cast.StmtKind.BREAK {
+        cg.br(BD.jumps.last().brk);
+    } else if k == cast.StmtKind.RETURN {
+        return_stmt(s);
+    } else if k == cast.StmtKind.LABEL {
+        let b = label_block(s.sym);
+        cg.br(b);
+        cg.at_end(b);
+        stmt(s.body);
+    } else {
+        // CASE, DEFAULT
+        let b = BD.cases.get(u.addr_key(@int_from_ptr(s)));
+        cg.br(b);
+        cg.at_end(b);
+        stmt(s.body);
+    }
+}
+
+fn label_block(l: *mut cast.CSym) *mut ir.Block {
+    if u.isvnil(l.ir) {
+        l.ir = @ptr_cast(*mut void, cg.new_block(l.name));
+    }
+    return @ptr_cast(*mut ir.Block, l.ir);
+}
+
+fn decl(d: *mut cast.Decl) void {
+    if d.kind != cast.DeclKind.DECL {
+        return;
+    }
+    for x in d.decls.items() {
+        let s = x.sym;
+        if u.isnil(s) or (s.kind != cast.SK_OBJECT) or (s.duration != cast.SD_AUTO) {
+            continue;
+        }
+        if u.isvnil(s.ir) {
+            s.ir = @ptr_cast(*mut void, cg.alloca(s.ty, s.name));
+        }
+        if u.notnil(s.init) {
+            cg.continue_after();
+            init_local(s, @ptr_cast(*mut ir.Value, s.ir));
+        }
+    }
+}
+
+// Stores automatic object s's initializer at p.
+fn init_local(s: *mut cast.CSym, p: *mut ir.Value) void {
+    let list = s.init;
+    let vol = volatile_of(s.ty);
+    if list.zero {
+        gx.zero(p, cty.size_of(s.ty));
+    }
+    for k in 0..list.items.len {
+        let it = list.items.at(k);
+        let at = ir.ptradd(cg.B, p, cg.usz(it.off));
+        let t = it.ty;
+        if t.kind == cty.TK_ARRAY {
+            // a string literal: its code units, then zeros
+            let es = cty.size_of(t.elem);
+            let mut n = @as(u64, it.e.tok.units.len) + 1;
+            if n > t.len {
+                n = t.len;
+            }
+            if not list.zero and (n < t.len) {
+                gx.zero(at, t.len * es);
+            }
+            _ = ir.memop(cg.B, ir.OP_MEMCPY, at, cg.string_addr(it.e), cg.usz(n * es));
+        } else if cty.is_record(t) {
+            gx.copy(t, at, gx.rv(it.e));
+        } else {
+            // (a volatile object's initialization is a volatile access too)
+            gx.store(cty.qualify(t, vol), gx.rv(it.e), at);
+        }
+    }
+}
+
+// The volatile qualifier of t or of its elements.
+fn volatile_of(t: *cty.CType) i32 {
+    if t.kind == cty.TK_ARRAY {
+        return volatile_of(t.elem);
+    }
+    return t.quals & cty.Q_VOLATILE;
+}
+
+fn if_stmt(s: *mut cast.Stmt) void {
+    cg.continue_after();
+    let yes = cg.new_block("then");
+    let done = cg.new_block("endif");
+    let mut no = done;
+    if u.notnil(s.els) {
+        no = cg.new_block("else");
+    }
+    gx.branch(s.e, yes, no);
+    cg.at_end(yes);
+    stmt(s.body);
+    cg.br(done);
+    if u.notnil(s.els) {
+        cg.at_end(no);
+        stmt(s.els);
+        cg.br(done);
+    }
+    cg.at_end(done);
+}
+
+fn while_stmt(s: *mut cast.Stmt) void {
+    let head = cg.new_block("while");
+    let body = cg.new_block("body");
+    let done = cg.new_block("endwhile");
+    cg.br(head);
+    cg.at_end(head);
+    gx.branch(s.e, body, done);
+    cg.at_end(body);
+    BD.jumps.push(Jump.{ brk: done, cont: head });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    cg.br(head);
+    cg.at_end(done);
+}
+
+fn do_stmt(s: *mut cast.Stmt) void {
+    let body = cg.new_block("do");
+    let cond = cg.new_block("dotest");
+    let done = cg.new_block("enddo");
+    cg.br(body);
+    cg.at_end(body);
+    BD.jumps.push(Jump.{ brk: done, cont: cond });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    cg.br(cond);
+    cg.at_end(cond);
+    gx.branch(s.e, body, done);
+    cg.at_end(done);
+}
+
+fn for_stmt(s: *mut cast.Stmt) void {
+    if u.notnil(s.decl) {
+        decl(s.decl);
+    } else if u.notnil(s.first) {
+        cg.continue_after();
+        _ = gx.rv(s.first);
+    }
+    let head = cg.new_block("for");
+    let body = cg.new_block("body");
+    let step = cg.new_block("step");
+    let done = cg.new_block("endfor");
+    cg.br(head);
+    cg.at_end(head);
+    if u.notnil(s.e) {
+        gx.branch(s.e, body, done);
+    } else {
+        ir.br(cg.B, body);
+    }
+    cg.at_end(body);
+    BD.jumps.push(Jump.{ brk: done, cont: step });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    cg.br(step);
+    cg.at_end(step);
+    if u.notnil(s.step) {
+        _ = gx.rv(s.step);
+    }
+    cg.br(head);
+    cg.at_end(done);
+}
+
+fn switch_stmt(s: *mut cast.Stmt) void {
+    cg.continue_after();
+    let v = gx.rv(s.e);
+    let done = cg.new_block("endswitch");
+    let mut dflt = done;
+    let blocks = u.newn.[*mut ir.Block](s.cases.len + 1);
+    for i in 0..s.cases.len {
+        let c = s.cases.get(i);
+        let b = cg.new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
+        blocks[i] = b;
+        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
+        if c.kind == cast.StmtKind.DEFAULT {
+            dflt = b;
+        }
+    }
+    let sw = ir.switch_(cg.B, v, dflt);
+    for i in 0..s.cases.len {
+        let c = s.cases.get(i);
+        if c.kind == cast.StmtKind.CASE {
+            ir.add_case(sw, ir.cint(v.ty, c.cval), blocks[i]);
+        }
+    }
+    cg.at_end(cg.new_block("switchbody"));
+    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block]() });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    cg.br(done);
+    cg.at_end(done);
+}
+
+fn return_stmt(s: *mut cast.Stmt) void {
+    let F = cg.F;
+    cg.continue_after();
+    if u.isnil(s.e) {
+        if cty.is_void(F.ret) or F.sig.sret {
+            ir.ret_void(cg.B);
+        } else {
+            ir.ret(cg.B, ir.czero(cg.lty(F.ret)));
+        }
+        return;
+    }
+    let v = gx.rv(s.e);
+    let rt = F.ret;
+    if cty.is_void(rt) {
+        ir.ret_void(cg.B);
+    } else if F.sig.sret {
+        gx.copy(rt, F.sret, v);
+        ir.ret_void(cg.B);
+    } else if cty.is_record(rt) {
+        ir.ret(cg.B, ir.load(cg.B, cg.lty(rt), v));
+    } else {
+        ir.ret(cg.B, v);
+    }
+}

@@ -27,19 +27,7 @@
 // =============================================================================
 import "../util.ax" as u;
 import "ctok.ax" as ct;
-
-/// A C type. Semantic analysis (ctypes.ax) defines its contents; the parser
-/// only reserves the pointers to it (Expr.ty and the like), all nil.
-pub struct CType {
-    kind: i32,
-}
-
-/// What a declared name denotes (an object, function, typedef, enumeration
-/// constant, tag or label). Semantic analysis defines its contents; the
-/// parser leaves the `sym` fields nil.
-pub struct CSym {
-    kind: i32,
-}
+import "ctypes.ax" as cty;
 
 // -----------------------------------------------------------------------------
 // Attributes (C23 6.7.13)
@@ -112,13 +100,16 @@ pub struct Expr {
     bval: bool,                     // BOOL
     parens: i32,                    // how many pairs of parentheses enclose it
     height: i32,                    // the levels of the tree it makes, itself included (at most cparse.MAX_DEPTH)
-    // set by semantic analysis
-    ty: *mut CType,
-    lvalue: bool,    // its value category: an lvalue (or a function designator)
-    is_const: bool,  // an (integer or arithmetic) constant expression, whose value is cval or fcval
-    cval: u64,       // an integer constant's value, as bits
-    fcval: f64,      // a floating constant's value
-    sym: *mut CSym,  // IDENT: what it names; MEMBER: the member
+    // set by semantic analysis (csema.ax describes the typed tree)
+    ty: *mut cty.CType,
+    lvalue: bool,          // its value category: an lvalue (or a function designator)
+    is_const: bool,        // an (integer or arithmetic) constant expression, whose value is cval or fcval
+    cval: u64,             // an integer constant's value, as bits (sign- or zero-extended from its type's width);
+                           // MEMBER: the member's offset in the structure or union
+    fcval: f64,            // a floating constant's value
+    sym: *mut CSym,        // IDENT: what it names
+    mem: *mut cty.Member,  // MEMBER: the member
+    opty: *mut cty.CType,  // ASSIGN (compound), prefix and postfix ++ --: the type the operation is done in
 }
 
 // -----------------------------------------------------------------------------
@@ -196,7 +187,7 @@ pub struct TagSpec {
     fixed: *mut TypeName,                   // enum: the fixed underlying type `enum E : T` (C23), or nil
     trailing_comma: bool,                   // enum: the list ends with ','
     // set by semantic analysis
-    ty: *mut CType,
+    ty: *mut cty.CType,
     sym: *mut CSym,
 }
 
@@ -251,7 +242,7 @@ pub struct Declarator {
     init: *mut Init,            // `= initializer`, or nil
     width: *mut Expr,           // a member's bit-field width, or nil
     // set by semantic analysis
-    ty: *mut CType,
+    ty: *mut cty.CType,
     sym: *mut CSym,
 }
 
@@ -268,7 +259,7 @@ pub struct TypeName {
     span: u.Span,
     specs: *mut DeclSpec,
     decl: *mut Declarator,  // abstract (no name), maybe with no derivations
-    ty: *mut CType,         // set by semantic analysis
+    ty: *mut cty.CType,     // set by semantic analysis
 }
 
 /// What a Decl is.
@@ -360,7 +351,10 @@ pub struct Stmt {
     items: u.List.[*mut Stmt],  // COMPOUND
     label: []u8,                // LABEL, GOTO (interned)
     label_span: u.Span,
-    sym: *mut CSym,  // set by semantic analysis: LABEL, GOTO
+    // set by semantic analysis
+    sym: *mut CSym,             // LABEL, GOTO: the label
+    cases: u.List.[*mut Stmt],  // SWITCH: its CASE and DEFAULT statements, in order
+    cval: u64,                  // CASE: the value, converted to the promoted type of the controlling expression
 }
 
 /// A translation unit: its external declarations, in order.
@@ -421,4 +415,70 @@ pub fn punct_text(p: i32) []u8 {
         return "?";
     }
     return names[@int_cast(usize, p)];
+}
+
+// -----------------------------------------------------------------------------
+// The typed tree's own records (set by semantic analysis: csema.ax)
+// -----------------------------------------------------------------------------
+
+// The conversion a CAST node makes (its op): an explicit cast has a type
+// name (tname); semantic analysis inserts the implicit conversions as CAST
+// nodes without one.
+pub const CV_LOAD: i32 = 1;    // lvalue conversion (6.3.2.1p2): the value of a, an lvalue of a non-array object type
+pub const CV_ADECAY: i32 = 2;  // a, of array type, to a pointer to its first element (6.3.2.1p3)
+pub const CV_FDECAY: i32 = 3;  // a, a function designator, to a pointer to the function (6.3.2.1p4)
+pub const CV_VALUE: i32 = 4;   // a's value (scalar) converted to ty (scalar, or void: evaluated and discarded)
+
+// What a CSym is.
+pub const SK_OBJECT: i32 = 1;
+pub const SK_FUNC: i32 = 2;
+pub const SK_TYPEDEF: i32 = 3;
+pub const SK_ENUMCONST: i32 = 4;
+pub const SK_LABEL: i32 = 5;
+
+// Linkage (6.2.2).
+pub const LK_NONE: i32 = 0;
+pub const LK_INTERNAL: i32 = 1;
+pub const LK_EXTERNAL: i32 = 2;
+
+// Storage duration of an object (6.2.4).
+pub const SD_AUTO: i32 = 0;    // automatic (a block's object, a parameter)
+pub const SD_STATIC: i32 = 1;  // static (file scope, or `static`/`extern` in a block)
+
+/// What a declared name denotes. Every declaration of one entity with
+/// linkage shares a CSym (its type is the composite of the declarations
+/// seen so far).
+pub struct CSym {
+    kind: i32,  // SK_
+    name: []u8,
+    span: u.Span,  // the first declaration's name
+    ty: *mut cty.CType,
+    linkage: i32,                // LK_
+    duration: i32,               // objects: SD_
+    defined: bool,               // object: a definition (an initializer, or a tentative definition at the end); function: a body
+    tentative: bool,             // file-scope object: a tentative definition was seen
+    is_param: bool,              // a function's parameter
+    used: bool,                  // referred to (functions: called or its address taken; labels: by a goto)
+    init: *mut InitList,         // object with an initializer: its normal form
+    def: *mut Decl,              // function: its definition (FUNC_DEF), once seen
+    params: u.List.[*mut CSym],  // function definition: its parameters, in order (unnamed ones too)
+    value: u64,                  // SK_ENUMCONST: the value (as cval)
+    uid: i32,                    // a number unique in the translation unit (for symbol names of local statics)
+    ir: *mut void,               // IR generation's: the object's address, the function, the label's block
+}
+
+/// One element of an initializer's normal form: the subobject at `off`
+/// bytes into the object, of type `ty`, gets the value of `e`.
+pub struct InitItem {
+    off: u64,
+    ty: *mut cty.CType,  // a scalar type (e converted to it); a struct or union (e of that type: copied); or an
+                         // array of characters (e a string literal, whose code units are copied, then zeros)
+    e: *mut Expr,
+}
+
+/// An object's initializer in normal form: its items, in the order they are
+/// to be evaluated (6.7.9p23: indeterminately sequenced) and stored.
+pub struct InitList {
+    items: u.List.[InitItem],
+    zero: bool,  // a brace-enclosed initializer: what no item covers is zero (6.7.9p21)
 }

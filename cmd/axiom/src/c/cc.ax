@@ -4,15 +4,64 @@
 //   --emit=c-pp    the preprocessed text
 //   --emit=c-ast   the syntax tree, as text
 //   --emit=c-tokens  the tokens and their values, one to a line (for tests)
+//   --emit=exe|obj|ir  a program: the translation unit is analyzed here
+//                  (check), and main.ax builds the start-up module
+//                  (std/internal/runtime/c_start.ax) as an Axiom program,
+//                  whose IR module the unit's code joins (gen_ir, called by
+//                  codegen.ax) before the optimizer and backends run
 //
 // (docs/c.md describes the options; docs/c-frontend.md the design.)
 // =============================================================================
 import "../diag.ax" as dg;
+import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast_dump.ax" as cdump;
+import "cgen_stmt.ax" as cgs;
 import "copts.ax" as co;
 import "cparse.ax" as cparse;
 import "cpp.ax" as cpp;
+import "csema.ax" as cs;
+import "csema_stmt.ax" as css;
+
+let mut g_unit: *mut cs.CUnit = @ptr_from_int(*mut cs.CUnit, 0);
+
+/// Is `emit` one of the C front end's text outputs (run makes them)?
+pub fn text_emit(emit: []u8) bool {
+    return u.str_eq(emit, "c-pp") or u.str_eq(emit, "c-tokens") or u.str_eq(emit, "c-ast");
+}
+
+/// Preprocesses, parses and analyzes the C source at `path`; true if it
+/// has no errors (they are reported through diag.ax, not emitted), and
+/// then its typed unit is what gen_ir generates.
+pub fn check(path: []u8, o: *co.COptions) bool {
+    let toks = cpp.preprocess(path, o);
+    if dg.error_count() > 0 {
+        return false;
+    }
+    let t = cparse.parse(toks.items(), o);
+    if dg.error_count() > 0 {
+        return false;
+    }
+    let cu = css.analyze(t, o);
+    if dg.error_count() > 0 {
+        return false;
+    }
+    g_unit = cu;
+    return true;
+}
+
+/// Is there a C translation unit for gen_ir?
+pub fn pending() bool {
+    return u.notnil(g_unit);
+}
+
+/// Generates the checked translation unit into module m (wasm: for a
+/// WebAssembly target). False after an error (reported).
+pub fn gen_ir(m: *mut ir.Module, wasm: bool) bool {
+    let cu = g_unit;
+    g_unit = u.nil.[cs.CUnit]();
+    return cgs.generate(m, cu, wasm);
+}
 
 /// Compiles the C source at `path`. `emit` is the --emit kind, `out` the
 /// output path (empty: standard output, for the text kinds). The exit status.

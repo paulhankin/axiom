@@ -67,8 +67,13 @@ cmd/axiom/internal/tests/c/ tests
   category, implicit conversions are explicit nodes, constant expressions are
   evaluated, initializers are in their normal form (one entry per scalar subobject),
   objects and types have their layout.
+  `csema.ax`'s header is the contract: how conversions, lvalues, pointer
+  arithmetic, calls and initializers appear in the typed tree.
 - `cgen` writes the typed tree into an `ir.Module`, which the existing
-  `backend.emit_module` compiles.
+  `backend.emit_module` compiles. A program's root is the start-up module
+  `std/internal/runtime/c_start.ax`, built as an Axiom program; the C unit's
+  IR joins its module (`codegen.ax` calls `cc.gen_ir`) before the optimizer
+  runs. C's `main` is `axiom.c.main`, called through `__axiom_c_main`.
 - Diagnostics go through `diag.ax` with spans into the source files (`util.load_file`).
   Codes: `C1xxx` preprocessing and lexing, `C2xxx` syntax, `C3xxx` constraints and
   semantics, `C4xxx` warnings. A constraint violation is an error; the messages name
@@ -104,7 +109,10 @@ comments, so that they are valid in every standard:
 ```
 
 Programs print through functions the test host provides (`print_i64`, `print_u64`,
-`print_f64`, `print_str`), declared in `cmd/axiom/internal/tests/c/host.h`.
+`print_f64`, `print_str`), declared in `cmd/axiom/internal/tests/c/host.h`
+(`#include "host.h"`; natively they are `c/host_native.c`'s). The programs of
+`c/run/` are built for wasm32, or with `--native` for the machine, at the
+suite's optimization level; they may say `/* native-only */` or `/* wasm-only */`.
 Preprocessor tests compare `--emit=c-pp` output with a `.pp` file next to them; parser
 tests compare `--emit=c-ast` with a `.ast` file.
 

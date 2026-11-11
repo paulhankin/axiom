@@ -1,0 +1,274 @@
+// =============================================================================
+// csema_init.ax - initializers (6.7.9) into their normal form: for each
+// scalar subobject that is given a value, its offset, type and the
+// expression converted to that type (cast.InitList); a structure or union
+// given by an expression, or a character array by a string literal, is one
+// item. Brace-enclosed lists fill subobjects in order, with the braces of
+// inner aggregates elided as 6.7.9p20 says; an array of unknown length gets
+// its length from the list. Designators are not supported yet.
+//
+// For an object with static storage duration every item must be a
+// constant: an arithmetic constant expression, or an address constant
+// (cconst.address) for a pointer (or an integer as wide as one).
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cconst.ax" as cc;
+import "csema.ax" as cs;
+import "csema_expr.ax" as cx;
+import "ctypes.ax" as cty;
+
+struct Filler {
+    list: *mut cast.InitList,
+    is_static: bool,
+    errors: bool,
+}
+
+/// What initializer returns: the normal form, and the object's type (an
+/// array of unknown length completed).
+pub struct Result {
+    list: *mut cast.InitList,
+    ty: *mut cty.CType,
+}
+
+/// The initializer `it` of an object of type t (static: of static storage
+/// duration) in normal form.
+pub fn initializer(t: *mut cty.CType, it: *mut cast.Init, is_static: bool) Result {
+    let F = u.new.[Filler]();
+    F.list = u.new.[cast.InitList]();
+    F.is_static = is_static;
+    let mut ty = t;
+    if it.kind == cast.InitKind.EXPR {
+        let e = it.e;
+        if is_char_array(t) and is_string_for(t, e) {
+            ty = string_item(F, t, 0, e);
+        } else if t.kind == cty.TK_ARRAY {
+            let x = cx.rv(e);
+            if u.notnil(x.ty) and not cty.is_error(x.ty) {
+                cs.err(x.span, "C3033", u.f1("an array (of type %s) is initialized by a brace-enclosed list",
+                                             cs.tq(t)));
+            }
+        } else {
+            expr_item(F, t, 0, cx.rv(e));
+        }
+        return Result.{ list: F.list, ty: ty };
+    }
+    F.list.zero = true;
+    if not cty.is_scalar(t) and not cty.is_record(t) and (t.kind != cty.TK_ARRAY) {
+        cs.err(it.span, "C3033", u.f1("an initializer for an object of type %s", cs.tq(t)));
+        return Result.{ list: F.list, ty: ty };
+    }
+    let items = it.items.items();
+    let r = fill(F, t, 0, items, 0, true);
+    if (r.next < items.len) and not F.errors {
+        cs.err(items[r.next].span, "C3032", u.f1("excess elements in the initializer of %s", cs.tq(t)));
+    }
+    if (t.kind == cty.TK_ARRAY) and not t.has_len {
+        ty = cty.qualify(cty.array_of(t.elem, r.count, true), t.quals);
+    }
+    return Result.{ list: F.list, ty: ty };
+}
+
+fn is_char_array(t: *cty.CType) bool {
+    if t.kind != cty.TK_ARRAY {
+        return false;
+    }
+    let el = cty.unqual(t.elem);
+    return cty.is_char(el) or (el == cty.t_wchar) or (el == cty.t_char16) or (el == cty.t_char32);
+}
+
+// Is e a string literal (maybe parenthesized) that can initialize char array t?
+fn is_string_for(t: *cty.CType, e: *cast.Expr) bool {
+    if e.kind != cast.ExprKind.STRING {
+        return false;
+    }
+    let el = cty.unqual(t.elem);
+    let se = cx.string_elem(e.tok.prefix);
+    if cty.is_char(el) {
+        return cty.is_char(se);
+    }
+    return cty.compatible_unq(el, se);
+}
+
+// A string literal for char array t at off; returns t, completed.
+fn string_item(F: *mut Filler, t: *mut cty.CType, off: u64, e: *mut cast.Expr) *mut cty.CType {
+    let x = cx.check(e);
+    let n = @as(u64, e.tok.units.len);
+    let mut ty = t;
+    if not t.has_len {
+        ty = cty.qualify(cty.array_of(t.elem, n + 1, true), t.quals);
+    } else if n > t.len {
+        cs.err(e.span, "C3032", u.f2("the string (%s characters) is too long for an array of %s", u.udec(n),
+                                     u.udec(t.len)));
+        F.errors = true;
+    }
+    F.list.items.push(cast.InitItem.{ off: off, ty: ty, e: x });
+    return ty;
+}
+
+// Rvalue e for the subobject of type t at off.
+fn expr_item(F: *mut Filler, t: *mut cty.CType, off: u64, e: *mut cast.Expr) void {
+    if u.isnil(e.ty) or cty.is_error(e.ty) {
+        F.errors = true;
+        return;
+    }
+    let x = cx.assign_convert(e, cty.unqual(t), "initialization");
+    if F.is_static and not constant(x, t) {
+        cs.err(x.span, "C3031", "the initializer of an object with static storage duration is not a constant");
+        F.errors = true;
+    }
+    F.list.items.push(cast.InitItem.{ off: off, ty: cty.unqual(t), e: x });
+}
+
+// Is x a constant initializer for a subobject of type t (6.6p7)?
+fn constant(x: *mut cast.Expr, t: *cty.CType) bool {
+    if cty.is_arith(t) and x.is_const {
+        return true;
+    }
+    if (t.kind == cty.TK_POINTER) or (cty.is_integer(t) and (cty.size_of(t) == cty.ptr_bytes)) {
+        return cc.address(x).ok;
+    }
+    return false;
+}
+
+struct Filled {
+    next: usize,  // the index of the first item not used
+    count: u64,   // arrays: the elements filled (the length, for one without)
+}
+
+// Fills the subobjects of the aggregate (or scalar) of type t at off from
+// items[i..], as far as t's subobjects go (top: the whole list is t's).
+fn fill(F: *mut Filler, t: *mut cty.CType, off: u64, items: []mut *mut cast.Init, i0: usize, top: bool) Filled {
+    let mut i = i0;
+    if t.kind == cty.TK_ARRAY {
+        let el = t.elem;
+        let es = cty.size_of(el);
+        let mut k: u64 = 0;
+        while (i < items.len) and (not t.has_len or (k < t.len)) {
+            if not top and (items[i].desigs.len > 0) {
+                break;  // (a designator applies to the enclosing list)
+            }
+            i = sub(F, el, off + (k * es), items, i);
+            k += 1;
+        }
+        return Filled.{ next: i, count: k };
+    }
+    if cty.is_record(t) {
+        if not cty.is_complete(t) {
+            cs.err(items[i0].span, "C3007", u.f1("an initializer for an object of incomplete type %s", cs.tq(t)));
+            F.errors = true;
+            return Filled.{ next: items.len, count: 0 };
+        }
+        for m in t.unq.tag.members.items() {
+            if i >= items.len {
+                break;
+            }
+            if not top and (items[i].desigs.len > 0) {
+                break;
+            }
+            if (m.ty.kind == cty.TK_ARRAY) and not m.ty.has_len {
+                break;  // a flexible array member is not initialized
+            }
+            i = sub(F, cty.qualify(m.ty, t.quals), off + m.offset, items, i);
+            if t.kind == cty.TK_UNION {
+                break;  // the first member only
+            }
+        }
+        return Filled.{ next: i, count: 0 };
+    }
+    // a scalar in braces
+    if i < items.len {
+        i = sub(F, t, off, items, i);
+    }
+    return Filled.{ next: i, count: 0 };
+}
+
+// One subobject of type t at off from items[i] (and, with its braces
+// elided, the items after it); the index of the next item.
+fn sub(F: *mut Filler, t: *mut cty.CType, off: u64, items: []mut *mut cast.Init, i: usize) usize {
+    let it = items[i];
+    if it.desigs.len > 0 {
+        cs.unsupported(it.desigs.at(0).span, "a designated initializer");
+        F.errors = true;
+        return i + 1;
+    }
+    if it.kind == cast.InitKind.LIST {
+        let inner = it.items.items();
+        if cty.is_scalar(t) {
+            if inner.len == 0 {
+                // (C23: `{}` is zero)
+                return i + 1;
+            }
+            if inner[0].kind == cast.InitKind.LIST {
+                cs.err(inner[0].span, "C3033", u.f1("too many braces around the initializer of a scalar (%s)",
+                                                    cs.tq(t)));
+                F.errors = true;
+                return i + 1;
+            }
+            expr_item(F, t, off, cx.rv(inner[0].e));
+            if inner.len > 1 {
+                cs.err(inner[1].span, "C3032", u.f1("excess elements in the initializer of a scalar (%s)", cs.tq(t)));
+                F.errors = true;
+            }
+            return i + 1;
+        }
+        if (inner.len == 1) and is_char_array(t) and (inner[0].kind == cast.InitKind.EXPR) and
+           is_string_for(t, inner[0].e) {
+            // `char s[4] = { "abc" }`
+            _ = string_item(F, t, off, inner[0].e);
+            return i + 1;
+        }
+        let r = fill(F, t, off, inner, 0, true);
+        if (r.next < inner.len) and not F.errors {
+            cs.err(inner[r.next].span, "C3032", u.f1("excess elements in the initializer of %s", cs.tq(t)));
+            F.errors = true;
+        }
+        return i + 1;
+    }
+    let e = it.e;
+    if is_char_array(t) and is_string_for(t, e) {
+        _ = string_item(F, t, off, e);
+        return i + 1;
+    }
+    if cty.is_scalar(t) {
+        expr_item(F, t, off, cx.rv(e));
+        return i + 1;
+    }
+    // an aggregate: an expression of its type, or its first subobject's
+    // initializer with the braces elided (a string literal: for a character
+    // array inside it)
+    if e.kind == cast.ExprKind.STRING {
+        return elided(F, t, off, items, i);
+    }
+    let x = cx.rv(e);
+    it.e = x;
+    if cty.is_record(t) and u.notnil(x.ty) and cty.compatible_unq(t, x.ty) {
+        if F.is_static {
+            cs.err(x.span, "C3031", "the initializer of an object with static storage duration is not a constant");
+            F.errors = true;
+        }
+        F.list.items.push(cast.InitItem.{ off: off, ty: cty.unqual(t), e: x });
+        return i + 1;
+    }
+    if u.isnil(x.ty) or cty.is_error(x.ty) {
+        F.errors = true;
+        return i + 1;
+    }
+    if (t.kind == cty.TK_ARRAY) and not t.has_len {
+        cs.err(x.span, "C3033", "an initializer for a flexible array member");
+        F.errors = true;
+        return i + 1;
+    }
+    return elided(F, t, off, items, i);
+}
+
+// The subobject's braces elided: its subobjects from the enclosing list.
+fn elided(F: *mut Filler, t: *mut cty.CType, off: u64, items: []mut *mut cast.Init, i: usize) usize {
+    let n = fill(F, t, off, items, i, false).next;
+    if n == i {
+        cs.err(items[i].span, "C3033", u.f1("an initializer for %s that has no subobject to give it to", cs.tq(t)));
+        F.errors = true;
+        return i + 1;
+    }
+    return n;
+}

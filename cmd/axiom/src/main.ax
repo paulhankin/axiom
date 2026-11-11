@@ -111,6 +111,9 @@ fn strip_ph(base: []u8) []u8 {
     if (base.len > 3) and u.ends(base, ".ax") {
         return base[0..base.len - 3];
     }
+    if (base.len > 2) and u.ends(base, ".c") {
+        return base[0..base.len - 2];
+    }
     return base;
 }
 
@@ -724,7 +727,10 @@ fn compile(args: [][]u8) i32 {
         if not c_options(&o, c) {
             return 2;
         }
-        return cfront.run(o.input, c, o.emit, o.out, o.json);
+        if cfront.text_emit(o.emit) {
+            return cfront.run(o.input, c, o.emit, o.out, o.json);
+        }
+        return build_c(&mut o, c);
     }
     if o.ide_mode {
         return ide.run(o.input, o.std_dir);
@@ -746,6 +752,41 @@ fn compile(args: [][]u8) i32 {
         return 1;
     }
     return build_program(&mut o);
+}
+
+// A C program (docs/c-frontend.md): the translation unit is checked, then
+// the start-up module (std/internal/runtime/c_start.ax), which calls its
+// main, is built as an Axiom program, and the unit's IR joins its module
+// (codegen.ax), so that both go through the same optimizer, backends and
+// linkers. One unit: the C code is not compiled separately.
+fn build_c(o: *mut Options, c: *cop.COptions) i32 {
+    if o.testing or o.profiling or o.ide_mode {
+        return fatal(o.json, "E9001", u.f1("axiom %s does not take a C source", o.cmd));
+    }
+    let ok = cfront.check(o.input, c);
+    if not ok or not o.build {
+        dg.emit(o.json, o.json);
+        if ok {
+            return 0;
+        }
+        return 1;
+    }
+    let start = u.f1("%s/internal/runtime/c_start.ax", o.std_dir);
+    if not u.file_exists(start) {
+        return fatal(o.json, "E9003", u.f1("cannot find the C start-up module (%s)", start));
+    }
+    o.units_mode = 0;
+    let mut files = u.List.[[]u8].empty();
+    if not runtime_sources(o, &mut files) {
+        return 2;
+    }
+    let so = sema.SemaOptions.{ std_dir: o.std_dir, extra_files: files.items() };
+    if not sema.run(start, &so) {
+        dg.emit(o.json, o.json);
+        return 1;
+    }
+    u.phase("parse and check");
+    return build_program(o);
 }
 
 // Sets the output kind from --emit; false on an error (reported).

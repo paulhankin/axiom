@@ -312,6 +312,60 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
   return want === c.stdout ? null : `output mismatch\n--- expected\n${want}--- got\n${c.stdout}`;
 }), { parallel: true });
 
+// C programs (docs/c-frontend.md): each cmd/axiom/internal/tests/c/run/*.c is
+// built (for wasm32, or with --native for this machine, at the suite's
+// optimization level) with its /* flags: */ and run; its output must be its
+// /* expect: */ lines, or the build must fail with each /* expect-error: C3xxx */
+// code. The tests print through host.h (next to run/); natively its functions
+// are c/host_native.c's, compiled by the system's C compiler.
+const cRunDir = path.join(root, 'cmd/axiom/internal/tests/c/run');
+const cRunFiles = fs.existsSync(cRunDir) ? fs.readdirSync(cRunDir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(cRunDir, f)) : [];
+await section('', byFile(cRunFiles, '[c]', async (f) => {
+  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+  if (native && noC) return { skip: true, reason: 'links C code' };
+  const src = fs.readFileSync(f, 'utf8');
+  const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
+  const errors = [...src.matchAll(/\/\* expect-error: (C\d+) \*\//g)].map((m) => m[1]);
+  const expect = [...src.matchAll(/^\/\* expect: ?(.*?) \*\/$/gm)].map((m) => m[1]);
+  if ((native && /\/\* wasm-only \*\//.test(src)) || (!native && /\/\* native-only \*\//.test(src))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
+  const out = path.join(tmp, `c-${path.basename(f, '.c')}${native ? '' : '.wasm'}`);
+  const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags];
+  if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`);
+  const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
+  if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
+  let json = null;
+  try { json = JSON.parse(c.stdout); } catch { json = null; }
+  if (errors.length) {
+    const codes = json ? json.diagnostics.filter((x) => x.severity === 'error').map((x) => x.code) : [];
+    if (c.status === 0) return `expected errors ${errors.join(', ')}, but compilation succeeded`;
+    for (const e of errors) if (!codes.includes(e)) return `expected ${e}, got [${codes.join(', ')}]:\n${c.stdout}${c.stderr}`;
+    return null;
+  }
+  if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+  const r = native ? await runNative(out) : await runWasm(out);
+  let problem = r.trapped ? `unexpected trap: ${r.msg}` : null;
+  const want = expect.join('\n'), got = r.out.join('\n');
+  if (!problem && want !== got) problem = `output mismatch\n--- expected\n${want}\n--- got\n${got}`;
+  return { problem, stderr: r.stderr };
+}), { parallel: true });
+
+// A C program as an object and as IR: the start-up's module with the unit in it.
+await section('C programs', {
+  '--emit=ir and --emit=obj': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const f = path.join(cRunDir, 'funcs.c');
+    const inc = `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`;
+    const ir = path.join(tmp, 'c-emit.ir'), obj = path.join(tmp, 'c-emit.o');
+    let c = await spawnAsync(compiler, ['build', f, inc, '--emit=ir', '-o', ir, ...targetFlags], { encoding: 'utf8' });
+    if (c.status !== 0) return `--emit=ir failed:\n${c.stdout}${c.stderr}`;
+    const text = fs.readFileSync(ir, 'utf8');
+    for (const fn of ['@__axiom_c_main(', '@axiom.c.main(', '@old(']) if (!text.includes(fn)) return `the IR has no ${fn}`;
+    c = await spawnAsync(compiler, ['build', f, inc, '--emit=obj', '-o', obj, ...targetFlags], { encoding: 'utf8' });
+    if (c.status !== 0) return `--emit=obj failed:\n${c.stdout}${c.stderr}`;
+    return fs.statSync(obj).size > 0 ? null : 'an empty object';
+  },
+});
+
 // `axiom test`: the standard library's own tests must pass, and the
 // self-tests in cmd/axiom/internal/tests/testing/ must produce exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];

@@ -1,0 +1,1135 @@
+// =============================================================================
+// csema_decl.ax - C declarations (6.7, 6.9): declaration specifiers to
+// types, declarators, storage classes and linkage, structure, union and
+// enumeration specifiers, typedefs, function definitions, tentative
+// definitions and static assertions.
+//
+// A declarator's derivations are applied to the specifiers' type from the
+// last (the outermost) to the first. Parameter types are adjusted (arrays and
+// functions to pointers); a definition's parameters are made into CSyms
+// (csema_stmt declares them in the body's scope). Identifiers with linkage
+// share one CSym across their declarations, whose type is the composite of
+// theirs; an object with static storage duration that is defined (or
+// tentatively defined) here is added to the unit once.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "csema.ax" as cs;
+import "csema_expr.ax" as cx;
+import "csema_init.ax" as ci;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// Where declaration specifiers are.
+const CTX_FILE: i32 = 0;
+const CTX_BLOCK: i32 = 1;
+const CTX_PARAM: i32 = 2;
+const CTX_MEMBER: i32 = 3;
+const CTX_TYPENAME: i32 = 4;
+const CTX_FOR: i32 = 5;
+
+// What declaration specifiers say.
+struct Specs {
+    ty: *mut cty.CType,
+    sc: i32,         // the storage-class specifier (a cast.SC_ bit), or 0
+    thread: bool,    // _Thread_local (with or without static or extern)
+    funcs: i32,      // cast.FS_ bits
+    tag_decl: bool,  // a structure, union or enumeration specifier that declares something
+    sp: u.Span,
+}
+
+// The parameters of the last function declarator at a declarator's
+// identifier (derivs[0]): a definition's.
+let mut g_params: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0),
+                                                                      len: 0, cap: 0 };
+let mut g_kr_ids: bool = false;  // ... given as an identifier list
+
+// -----------------------------------------------------------------------------
+// Declaration specifiers (6.7.1 - 6.7.4)
+// -----------------------------------------------------------------------------
+
+struct Counts {
+    void_: i32,
+    char_: i32,
+    short_: i32,
+    int_: i32,
+    long_: i32,
+    float_: i32,
+    double_: i32,
+    signed_: i32,
+    unsigned_: i32,
+    bool_: i32,
+    int64: i32,
+    valist: i32,
+    other: i32,  // a tag, typedef name or other type specifier
+}
+
+fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
+    let mut r = Specs.{ ty: cty.t_int, sc: 0, thread: false, funcs: ds.funcs, tag_decl: false, sp: ds.span };
+    let mut c = Counts.{ void_: 0, char_: 0, short_: 0, int_: 0, long_: 0, float_: 0, double_: 0, signed_: 0,
+                         unsigned_: 0, bool_: 0, int64: 0, valist: 0, other: 0 };
+    let mut other = cty.t_error;
+    let mut nstorage: i32 = 0;
+    let mut qual_seen: i32 = 0;
+    let mut bad = false;
+    for si in 0..ds.items.len {
+        let s = ds.items.at(si);
+        let k = s.kind;
+        if k == cast.SpecKind.STORAGE {
+            if s.kw == ct.K_THREAD_LOCAL {
+                r.thread = true;
+                continue;
+            }
+            nstorage += 1;
+            if nstorage > 1 {
+                cs.err(s.span, "C3006", "more than one storage-class specifier");
+            }
+            r.sc = storage_bit(s.kw);
+            if s.kw == ct.K_CONSTEXPR {
+                cs.unsupported(s.span, "constexpr");
+            } else if (s.kw == ct.K_AUTO) and (cs.std() >= co.C23) and not ds.has_type {
+                cs.unsupported(s.span, "type inference with auto");
+            }
+        } else if k == cast.SpecKind.TYPE {
+            let kw = s.kw;
+            if kw == ct.K_VOID {
+                c.void_ += 1;
+            } else if kw == ct.K_CHAR {
+                c.char_ += 1;
+            } else if kw == ct.K_SHORT {
+                c.short_ += 1;
+            } else if kw == ct.K_INT {
+                c.int_ += 1;
+            } else if kw == ct.K_LONG {
+                c.long_ += 1;
+            } else if kw == ct.K_FLOAT {
+                c.float_ += 1;
+            } else if kw == ct.K_DOUBLE {
+                c.double_ += 1;
+            } else if kw == ct.K_SIGNED {
+                c.signed_ += 1;
+            } else if kw == ct.K_UNSIGNED {
+                c.unsigned_ += 1;
+            } else if kw == ct.K_BOOL {
+                c.bool_ += 1;
+            } else if kw == ct.K_INT64 {
+                c.int64 += 1;
+            } else if kw == ct.K_BUILTIN_VA_LIST {
+                c.valist += 1;
+            } else {
+                cs.not_supported(s.span, u.f1("'%s'", cast.kw_text(kw)));
+                bad = true;
+            }
+        } else if k == cast.SpecKind.QUAL {
+            let q = qual_bit(s.kw);
+            if q == cty.Q_ATOMIC {
+                cs.not_supported(s.span, "_Atomic");
+                bad = true;
+            } else if ((qual_seen & q) != 0) and (cs.std() < co.C99) {
+                cs.err(s.span, "C3006", u.f1("'%s' is repeated (allowed from C99)", cast.kw_text(s.kw)));
+            }
+            qual_seen = qual_seen | q;
+        } else if k == cast.SpecKind.FUNC {
+            // (checked where the declared identifier's type is known)
+        } else if k == cast.SpecKind.ALIGN {
+            cs.unsupported(s.span, "_Alignas");
+        } else if k == cast.SpecKind.TAG {
+            c.other += 1;
+            other = tag_type(s.tag, lone);
+            r.tag_decl = s.tag.has_body or lone;
+        } else if k == cast.SpecKind.TYPEDEF_NAME {
+            c.other += 1;
+            let ts = cs.lookup(s.name);
+            if u.notnil(ts) and (ts.kind == cast.SK_TYPEDEF) {
+                other = ts.ty;
+                ts.used = true;
+            } else {
+                cs.err(s.span, "C3001", u.f1("'%s' is not a type name", s.name));
+                bad = true;
+            }
+        } else if k == cast.SpecKind.TYPEOF {
+            c.other += 1;
+            other = typeof_type(s);
+        } else if k == cast.SpecKind.BITINT {
+            c.other += 1;
+            cs.unsupported(s.span, "_BitInt");
+            bad = true;
+        } else {
+            c.other += 1;
+            cs.not_supported(s.span, "_Atomic");
+            bad = true;
+        }
+    }
+    if r.thread {
+        cs.unsupported(ds.span, "_Thread_local");
+    }
+    if bad {
+        r.ty = cty.t_error;
+        return r;
+    }
+    let t = base_type(&c, other, ds.span);
+    r.ty = cty.qualify(t, qual_seen & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT));
+    if (ctx == CTX_MEMBER) or (ctx == CTX_TYPENAME) {
+        r.sc = 0;  // (the parser reported any)
+    }
+    return r;
+}
+
+// typeof and typeof_unqual (C23 6.7.2.5): the type of a type name, or of an
+// expression (not evaluated, not converted: an array stays an array).
+fn typeof_type(s: *mut cast.Spec) *mut cty.CType {
+    let mut t = cty.t_error;
+    if u.notnil(s.tname) {
+        t = type_name(s.tname);
+    } else {
+        let x = cx.check(s.e);
+        s.e = x;
+        if u.notnil(x.ty) {
+            t = x.ty;
+        }
+    }
+    if s.kw == ct.K_TYPEOF_UNQUAL {
+        return cty.unqual(t);
+    }
+    return t;
+}
+
+fn storage_bit(kw: i32) i32 {
+    if kw == ct.K_TYPEDEF {
+        return cast.SC_TYPEDEF;
+    }
+    if kw == ct.K_EXTERN {
+        return cast.SC_EXTERN;
+    }
+    if kw == ct.K_STATIC {
+        return cast.SC_STATIC;
+    }
+    if kw == ct.K_AUTO {
+        return cast.SC_AUTO;
+    }
+    if kw == ct.K_REGISTER {
+        return cast.SC_REGISTER;
+    }
+    return cast.SC_CONSTEXPR;
+}
+
+fn qual_bit(kw: i32) i32 {
+    if kw == ct.K_CONST {
+        return cty.Q_CONST;
+    }
+    if kw == ct.K_VOLATILE {
+        return cty.Q_VOLATILE;
+    }
+    if kw == ct.K_RESTRICT {
+        return cty.Q_RESTRICT;
+    }
+    return cty.Q_ATOMIC;
+}
+
+// The type the type specifiers name (6.7.2p2), or the error type (reported).
+fn base_type(c: *Counts, other: *mut cty.CType, sp: u.Span) *mut cty.CType {
+    let kws = c.void_ + c.char_ + c.short_ + c.int_ + c.long_ + c.float_ + c.double_ + c.signed_ + c.unsigned_ +
+              c.bool_ + c.int64 + c.valist;
+    if c.other > 0 {
+        if (c.other > 1) or (kws > 0) {
+            return bad_combination(sp);
+        }
+        return other;
+    }
+    if kws == 0 {
+        return cty.t_int;  // implicit int (C89; the parser reported it later)
+    }
+    let sign = c.signed_ + c.unsigned_;
+    if (sign > 1) or (c.int_ > 1) or (c.short_ > 1) or (c.long_ > 2) or (c.char_ > 1) {
+        return bad_combination(sp);
+    }
+    let alone = (c.void_ + c.float_ + c.double_ + c.bool_ + c.valist) > 0;
+    if alone {
+        if c.void_ + c.float_ + c.bool_ + c.valist + c.double_ != 1 {
+            return bad_combination(sp);
+        }
+        if c.double_ == 1 {
+            if kws - c.long_ != 1 or c.long_ > 1 {
+                return bad_combination(sp);
+            }
+            if c.long_ == 1 {
+                return cty.t_ldouble;
+            }
+            return cty.t_double;
+        }
+        if kws != 1 {
+            return bad_combination(sp);
+        }
+        if c.void_ == 1 {
+            return cty.t_void;
+        }
+        if c.float_ == 1 {
+            return cty.t_float;
+        }
+        if c.bool_ == 1 {
+            return cty.t_bool;
+        }
+        return cty.pointer_to(cty.t_char);  // __builtin_va_list (variable arguments: not supported yet)
+    }
+    if c.int64 > 0 {
+        if (c.int64 > 1) or (kws - sign != 1) {
+            return bad_combination(sp);
+        }
+        return pick_sign(cty.t_int64, c.unsigned_ == 0);
+    }
+    if c.char_ == 1 {
+        if c.short_ + c.int_ + c.long_ > 0 {
+            return bad_combination(sp);
+        }
+        if c.signed_ == 1 {
+            return cty.t_schar;
+        }
+        if c.unsigned_ == 1 {
+            return cty.t_uchar;
+        }
+        return cty.t_char;
+    }
+    if (c.short_ == 1) and (c.long_ > 0) {
+        return bad_combination(sp);
+    }
+    let sg = c.unsigned_ == 0;
+    if c.short_ == 1 {
+        return pick_sign(cty.t_short, sg);
+    }
+    if c.long_ == 2 {
+        return pick_sign(cty.t_llong, sg);
+    }
+    if c.long_ == 1 {
+        return pick_sign(cty.t_long, sg);
+    }
+    return pick_sign(cty.t_int, sg);
+}
+
+fn pick_sign(t: *mut cty.CType, sg: bool) *mut cty.CType {
+    if sg {
+        return cty.to_signed(t);
+    }
+    return cty.to_unsigned(t);
+}
+
+fn bad_combination(sp: u.Span) *mut cty.CType {
+    cs.err(sp, "C3005", "an invalid combination of type specifiers");
+    return cty.t_error;
+}
+
+// -----------------------------------------------------------------------------
+// Structures, unions and enumerations (6.7.2.1 - 6.7.2.3)
+// -----------------------------------------------------------------------------
+
+fn tag_kind(kw: i32) i32 {
+    if kw == ct.K_STRUCT {
+        return cty.TK_STRUCT;
+    }
+    if kw == ct.K_UNION {
+        return cty.TK_UNION;
+    }
+    return cty.TK_ENUM;
+}
+
+fn kind_word(k: i32) []u8 {
+    if k == cty.TK_STRUCT {
+        return "struct";
+    }
+    if k == cty.TK_UNION {
+        return "union";
+    }
+    return "enum";
+}
+
+// The type a struct-or-union or enum specifier names (lone: the whole
+// declaration is `struct S;`).
+fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
+    if u.notnil(ts.ty) {
+        return ts.ty;
+    }
+    let kind = tag_kind(ts.kw);
+    let named = ts.name.len > 0;
+    let mut t = u.nil.[cty.CType]();
+    if ts.has_body or lone {
+        if named {
+            t = cs.lookup_tag_here(ts.name);
+        }
+        if u.notnil(t) {
+            if t.kind != kind {
+                cs.err_note(ts.name_span, "C3011", u.f2("'%s' was declared as %s", ts.name,
+                                                        u.cat2(
+                                                            "a different kind of tag (",
+                                                            u.cat2(kind_word(t.kind), ")"))), t.tag.span,
+                            "declared here");
+                ts.ty = cty.t_error;
+                return ts.ty;
+            }
+            if ts.has_body and (t.tag.complete or t.tag.defining) {
+                cs.err_note(ts.name_span, "C3002", u.f2("redefinition of '%s %s'", kind_word(kind), ts.name),
+                            t.tag.span, "defined before here");
+                ts.ty = cty.t_error;
+                return ts.ty;
+            }
+        } else if (kind == cty.TK_ENUM) and not ts.has_body {
+            return undefined_enum(ts);
+        } else {
+            t = cty.new_tagged(kind, ts.name, ts.name_span);
+            if not named {
+                t.tag.span = ts.span;
+            }
+            if named {
+                cs.declare_tag(ts.name, t);
+            }
+        }
+    } else {
+        t = cs.lookup_tag(ts.name);
+        if u.notnil(t) {
+            if t.kind != kind {
+                cs.err_note(ts.name_span, "C3011", u.f2("'%s' is not a %s tag", ts.name, kind_word(kind)), t.tag.span,
+                            "declared here");
+                ts.ty = cty.t_error;
+                return ts.ty;
+            }
+        } else if kind == cty.TK_ENUM {
+            return undefined_enum(ts);
+        } else {
+            t = cty.new_tagged(kind, ts.name, ts.name_span);
+            cs.declare_tag(ts.name, t);
+        }
+    }
+    ts.ty = t;
+    if ts.has_body {
+        if kind == cty.TK_ENUM {
+            enum_body(t, ts);
+        } else {
+            record_body(t, ts);
+        }
+    }
+    return t;
+}
+
+fn undefined_enum(ts: *mut cast.TagSpec) *mut cty.CType {
+    cs.err(ts.name_span, "C3011", u.f1("'enum %s' is not defined", ts.name));
+    ts.ty = cty.t_error;
+    return ts.ty;
+}
+
+fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
+    let ti = t.tag;
+    ti.defining = true;
+    let mut names = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    let mut flex = u.nil.[cty.Member]();
+    let mut named: i32 = 0;
+    for md in ts.members.items() {
+        if md.kind == cast.DeclKind.STATIC_ASSERT {
+            static_assert(md);
+            continue;
+        }
+        if md.kind != cast.DeclKind.DECL {
+            continue;
+        }
+        let sp = specifiers(md.specs, CTX_MEMBER, md.decls.len == 0);
+        if md.decls.len == 0 {
+            // an anonymous structure or union (C11)
+            let at = sp.ty;
+            if cty.is_record(at) and (at.tag.name.len == 0) {
+                add_member(ti, "", md.span, at);
+                for m in at.tag.members.items() {
+                    if m.name.len > 0 {
+                        check_dup(&mut names, m.name, m.span);
+                    }
+                }
+            } else if not cty.is_error(at) {
+                cs.err(md.span, "C3010", "a member declaration that declares no member");
+            }
+            continue;
+        }
+        for d in md.decls.items() {
+            if u.notnil(d.width) {
+                cs.unsupported(d.span, "a bit-field");
+                continue;
+            }
+            let mt = derive(sp.ty, d, CTX_MEMBER);
+            d.ty = mt;
+            if cty.is_error(mt) {
+                continue;
+            }
+            if u.notnil(flex) {
+                cs.err(flex.span, "C3008", "a flexible array member that is not the last member");
+                flex = u.nil.[cty.Member]();
+            }
+            if cty.is_func(mt) {
+                cs.err(d.name_span, "C3008", u.f1("the member '%s' has a function type", d.name));
+                continue;
+            }
+            let is_flex = (mt.kind == cty.TK_ARRAY) and not mt.has_len and not mt.vla and cty.is_complete(mt.elem);
+            if not is_flex and not cty.is_complete(mt) {
+                cs.err(d.name_span, "C3007", u.f2("the member '%s' has incomplete type %s", d.name, cs.tq(mt)));
+                continue;
+            }
+            if cty.is_record(mt) and mt.tag.has_flex {
+                cs.err(d.name_span, "C3008", u.f1("the member '%s' is a structure with a flexible array member",
+                                                  d.name));
+            }
+            check_dup(&mut names, d.name, d.name_span);
+            add_member(ti, d.name, d.name_span, mt);
+            named += 1;
+            if is_flex {
+                if (ti.kind == cty.TK_UNION) or (named == 1) {
+                    cs.err(d.name_span, "C3008",
+                           u.f1("the flexible array member '%s' must follow another member of a structure", d.name));
+                }
+                flex = ti.members.last();
+            }
+        }
+    }
+    ti.defining = false;
+    cty.layout(ti);
+}
+
+fn check_dup(names: *mut u.SymMap.[i32], name: []u8, sp: u.Span) void {
+    if names.get(name) != 0 {
+        cs.err(sp, "C3002", u.f1("a duplicate member '%s'", name));
+        return;
+    }
+    names.put(name, 1);
+}
+
+fn add_member(ti: *mut cty.TagInfo, name: []u8, sp: u.Span, t: *mut cty.CType) void {
+    let m = u.new.[cty.Member]();
+    m.name = name;
+    m.span = sp;
+    m.ty = t;
+    m.index = @int_cast(i32, ti.members.len);
+    ti.members.push(m);
+}
+
+fn enum_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
+    if u.notnil(ts.fixed) {
+        cs.unsupported(ts.fixed.span, "an enumeration with a fixed underlying type");
+    }
+    let int_max = @bit_cast(i64, cty.int_max(cty.t_int));
+    let int_min = -int_max - 1;
+    let mut v: i64 = 0;
+    let mut first = true;
+    let mut neg = false;
+    for en in ts.enumerators.items() {
+        if u.notnil(en.value) {
+            let r = cx.ice(en.value, "an enumeration constant's value");
+            en.value = r.e;
+            if r.ok {
+                let signed_ = r.e.ty.is_signed;
+                if not signed_ and (r.v > @bit_cast(u64, int_max)) {
+                    range_error(en);
+                    v = 0;
+                } else {
+                    v = @bit_cast(i64, r.v);
+                    if (v > int_max) or (v < int_min) {
+                        range_error(en);
+                        v = 0;
+                    }
+                }
+            }
+        } else if not first {
+            if v == int_max {
+                range_error(en);
+            } else {
+                v += 1;
+            }
+        }
+        first = false;
+        if v < 0 {
+            neg = true;
+        }
+        let prior = cs.lookup_here(en.name);
+        if u.notnil(prior) {
+            cs.err_note(en.span, "C3002", u.f1("redefinition of '%s'", en.name), prior.span, "declared before here");
+        }
+        let s = cs.new_sym(cast.SK_ENUMCONST, en.name, en.span, cty.t_int);
+        s.value = cty.wrap(cty.t_int, @bit_cast(u64, v));
+        en.sym = s;
+        cs.declare(en.name, s);
+    }
+    // the compatible type: unsigned int unless a value is negative
+    if neg {
+        cty.set_enum_base(t, cty.t_int);
+    } else {
+        cty.set_enum_base(t, cty.t_uint);
+    }
+}
+
+fn range_error(en: *mut cast.Enumerator) void {
+    if cs.std() >= co.C23 {
+        cs.unsupported(en.span, "an enumeration constant outside the range of int");
+    } else {
+        cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of int", en.name));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Declarators (6.7.6)
+// -----------------------------------------------------------------------------
+
+// The type declarator d gives the specifiers' type `base`.
+fn derive(base: *mut cty.CType, d: *mut cast.Declarator, ctx: i32) *mut cty.CType {
+    let mut t = base;
+    let n = d.derivs.len;
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        if cty.is_error(t) {
+            return t;
+        }
+        let dv = d.derivs.at(k);
+        if dv.kind == cast.DerivKind.POINTER {
+            if ((dv.quals & cast.Q_RESTRICT) != 0) and cty.is_func(t) {
+                cs.err(dv.span, "C3006", "'restrict' qualifies a pointer to a function");
+            }
+            if (dv.quals & cast.Q_ATOMIC) != 0 {
+                cs.not_supported(dv.span, "_Atomic");
+            }
+            if dv.dup_quals and (cs.std() < co.C99) {
+                cs.err(dv.span, "C3006", "a repeated type qualifier (allowed from C99)");
+            }
+            t = cty.qualify(cty.pointer_to(t), dv.quals & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT));
+        } else if dv.kind == cast.DerivKind.ARRAY {
+            t = array_deriv(t, dv, (ctx == CTX_PARAM) and (k == 0));
+        } else {
+            if cty.is_func(t) or (t.kind == cty.TK_ARRAY) {
+                cs.err(dv.span, "C3008",
+                       u.f1("a function returning %s", u.pick(cty.is_func(t), "a function", "an array")));
+                return cty.t_error;
+            }
+            t = function_deriv(t, dv, k == 0);
+        }
+    }
+    if ((t.quals & cty.Q_RESTRICT) != 0) and ((t.kind != cty.TK_POINTER) or cty.is_func(t.elem)) {
+        cs.err(d.span, "C3006", u.f1("'restrict' qualifies %s, not a pointer to an object type", cs.tq(t)));
+    }
+    return t;
+}
+
+fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool) *mut cty.CType {
+    if cty.is_func(t) {
+        cs.err(dv.span, "C3008", "an array of functions");
+        return cty.t_error;
+    }
+    if not cty.is_complete(t) {
+        cs.err(dv.span, "C3007", u.f1("an array of elements of incomplete type %s", cs.tq(t)));
+        return cty.t_error;
+    }
+    if cty.is_record(t) and t.tag.has_flex {
+        cs.err(dv.span, "C3008", "an array of structures with a flexible array member");
+    }
+    if ((dv.quals != 0) or dv.is_static) and not outer_param {
+        cs.err(dv.span, "C3008",
+               "'static' or a type qualifier in an array declarator that is not a parameter's outermost one");
+    }
+    if dv.is_star {
+        cs.unsupported(dv.span, "a variable length array");
+        return cty.array_of(t, 1, true);
+    }
+    if u.isnil(dv.size) {
+        return cty.array_of(t, 0, false);
+    }
+    let x = cx.rv(dv.size);
+    dv.size = x;
+    if u.isnil(x.ty) or cty.is_error(x.ty) {
+        return cty.t_error;
+    }
+    if not cty.is_integer(x.ty) {
+        cs.err(x.span, "C3009", u.f1("the size of an array has type %s, not an integer type", cs.tq(x.ty)));
+        return cty.t_error;
+    }
+    if not x.is_const {
+        cs.unsupported(x.span, "a variable length array");
+        return cty.array_of(t, 1, true);
+    }
+    if (x.ty.is_signed and (@bit_cast(i64, x.cval) < 0)) or (x.cval == 0) {
+        cs.err(x.span, "C3009",
+               u.f1(
+                   "the size of an array is %s; it must be greater than zero",
+                   u.pick(x.ty.is_signed, u.dec(@bit_cast(i64, x.cval)), u.udec(x.cval))));
+        return cty.t_error;
+    }
+    let es = cty.size_of(t);
+    if (es != 0) and (x.cval > (@as(u64, 1) << 47) / es) {
+        cs.err(x.span, "C3009", "the array is too large");
+        return cty.t_error;
+    }
+    return cty.array_of(t, x.cval, true);
+}
+
+// A function returning ret; at_name: the declarator's innermost derivation,
+// whose parameters become g_params.
+fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut cty.CType {
+    let mut syms = u.List.[*mut cast.CSym].empty();
+    let mut types = u.List.[*mut cty.CType].empty();
+    let mut proto = true;
+    if dv.id_list {
+        proto = false;
+        for id in dv.ids.items() {
+            let s = cs.new_sym(cast.SK_OBJECT, id.name, id.span, cty.t_int);
+            s.is_param = true;
+            syms.push(s);
+        }
+    } else if dv.empty {
+        proto = cs.std() >= co.C23;
+    } else {
+        cs.push_scope();
+        let ps = dv.params.items();
+        for i in 0..ps.len {
+            let p = ps[i];
+            let sp = specifiers(p.specs, CTX_PARAM, false);
+            if (sp.sc != 0) and (sp.sc != cast.SC_REGISTER) {
+                cs.err(p.specs.span, "C3006", "a parameter's only storage-class specifier can be 'register'");
+            }
+            let pt = derive(sp.ty, p.decl, CTX_PARAM);
+            p.decl.ty = pt;
+            if cty.is_void(pt) and (ps.len == 1) and (p.decl.name.len == 0) and (p.decl.derivs.len == 0) and
+               (pt.quals == 0) and not dv.variadic {
+                break;  // (void)
+            }
+            if cty.is_void(pt) {
+                cs.err(p.span, "C3008", "a parameter of type void");
+            }
+            let adj = adjust_param(pt, p.decl);
+            let s = cs.new_sym(cast.SK_OBJECT, p.decl.name, p.decl.name_span, adj);
+            s.is_param = true;
+            p.decl.sym = s;
+            if p.decl.name.len > 0 {
+                let prior = cs.lookup_here(p.decl.name);
+                if u.notnil(prior) {
+                    cs.err_note(p.decl.name_span, "C3002", u.f1("a second parameter named '%s'", p.decl.name),
+                                prior.span, "the first");
+                }
+                cs.declare(p.decl.name, s);
+            }
+            syms.push(s);
+            types.push(cty.unqual(adj));
+        }
+        cs.pop_scope();
+    }
+    if at_name {
+        g_params = syms;
+        g_kr_ids = dv.id_list;
+    }
+    return cty.function(ret, types.items(), proto, dv.variadic);
+}
+
+// A parameter's type adjusted (6.7.6.3p7-8): arrays to pointers (with the
+// qualifiers of the array declarator), functions to pointers.
+fn adjust_param(t: *mut cty.CType, d: *cast.Declarator) *mut cty.CType {
+    if t.kind == cty.TK_ARRAY {
+        let mut q: i32 = 0;
+        if (d.derivs.len > 0) and (d.derivs.at(0).kind == cast.DerivKind.ARRAY) {
+            q = d.derivs.at(0).quals & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT);
+        }
+        return cty.qualify(cty.pointer_to(t.elem), q);
+    }
+    if cty.is_func(t) {
+        return cty.pointer_to(t);
+    }
+    return t;
+}
+
+/// The type of a type name (6.7.7).
+pub fn type_name(tn: *mut cast.TypeName) *mut cty.CType {
+    if u.notnil(tn.ty) {
+        return tn.ty;
+    }
+    let sp = specifiers(tn.specs, CTX_TYPENAME, false);
+    let t = derive(sp.ty, tn.decl, CTX_TYPENAME);
+    tn.ty = t;
+    return t;
+}
+
+// -----------------------------------------------------------------------------
+// Declarations
+// -----------------------------------------------------------------------------
+
+/// An external declaration (6.9).
+pub fn external(d: *mut cast.Decl) void {
+    if d.kind == cast.DeclKind.DECL {
+        declaration(d, CTX_FILE);
+    } else if d.kind == cast.DeclKind.FUNC_DEF {
+        function_def(d);
+    } else if d.kind == cast.DeclKind.STATIC_ASSERT {
+        static_assert(d);
+    }
+}
+
+/// A declaration in a block.
+pub fn block_decl(d: *mut cast.Decl) void {
+    if d.kind == cast.DeclKind.DECL {
+        declaration(d, CTX_BLOCK);
+    } else if d.kind == cast.DeclKind.STATIC_ASSERT {
+        static_assert(d);
+    }
+}
+
+/// The declaration in the first clause of a for statement (6.8.5p3: only
+/// objects with storage class auto or register).
+pub fn for_decl(d: *mut cast.Decl) void {
+    if d.kind != cast.DeclKind.DECL {
+        block_decl(d);
+        return;
+    }
+    let sc = d.specs.storage & ~(cast.SC_AUTO | cast.SC_REGISTER);
+    if sc != 0 {
+        cs.err(d.specs.span, "C3006", "a declaration in 'for' can only declare objects that are auto or register");
+    }
+    declaration(d, CTX_FOR);
+}
+
+fn declaration(d: *mut cast.Decl, ctx: i32) void {
+    let lone = d.decls.len == 0;
+    let sp = specifiers(d.specs, ctx, lone);
+    if lone {
+        if not sp.tag_decl and not cty.is_error(sp.ty) {
+            cs.err(d.span, "C3010", "a declaration that declares nothing");
+        }
+        return;
+    }
+    for dcl in d.decls.items() {
+        declare_one(&sp, dcl, ctx);
+    }
+}
+
+fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32) void {
+    let t = derive(sp.ty, dcl, ctx);
+    dcl.ty = t;
+    let name = dcl.name;
+    if sp.sc == cast.SC_TYPEDEF {
+        if u.notnil(dcl.init) {
+            cs.err(dcl.init.span, "C3033", u.f1("the typedef '%s' has an initializer", name));
+        }
+        let prior = cs.lookup_here(name);
+        if u.notnil(prior) {
+            let same = (prior.kind == cast.SK_TYPEDEF) and cty.compatible(prior.ty, t) and
+                       ((t.kind != cty.TK_ARRAY) or (prior.ty.has_len == t.has_len));
+            if not same or (cs.std() < co.C11) {
+                cs.err_note(dcl.name_span, u.pick(same or (prior.kind == cast.SK_TYPEDEF), "C3002", "C3003"),
+                            u.f1("redefinition of '%s'", name), prior.span, "declared before here");
+                return;
+            }
+            dcl.sym = prior;
+            return;
+        }
+        let s = cs.new_sym(cast.SK_TYPEDEF, name, dcl.name_span, t);
+        dcl.sym = s;
+        cs.declare(name, s);
+        return;
+    }
+    if (sp.funcs != 0) and not cty.is_func(t) {
+        cs.err(dcl.name_span, "C3006", u.f1("'inline' or '_Noreturn' in the declaration of '%s', not a function",
+                                            name));
+    }
+    if cty.is_func(t) {
+        func_decl(sp, dcl, t, ctx);
+    } else {
+        object_decl(sp, dcl, t, ctx);
+    }
+}
+
+// The entity a declaration of `name` with linkage `lk` declares: the one of
+// an earlier declaration in the same scope or with the same linkage, its
+// type made the composite, or a new one, bound in the current scope.
+fn entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32) *mut cast.CSym {
+    let here = cs.lookup_here(name);
+    let mut prior = here;
+    if u.isnil(prior) and (lk != cast.LK_NONE) {
+        prior = cs.linked(name);
+    }
+    if u.notnil(prior) {
+        if prior.kind != kind {
+            cs.err_note(sp, "C3003", u.f1("'%s' is redeclared as a different kind of identifier", name), prior.span,
+                        "declared before here");
+            return new_entity(name, sp, kind, t, lk, false);
+        }
+        if (prior.linkage == cast.LK_NONE) or (lk == cast.LK_NONE) {
+            cs.err_note(sp, "C3002", u.f1("redefinition of '%s'", name), prior.span, "declared before here");
+            return new_entity(name, sp, kind, t, lk, false);
+        }
+        if prior.linkage != lk {
+            cs.err_note(sp, "C3004", u.f2("'%s' is declared with %s linkage after a declaration with the other", name,
+                                          u.pick(lk == cast.LK_INTERNAL, "internal", "external")), prior.span,
+                        "declared before here");
+        }
+        if not cty.compatible(prior.ty, t) {
+            cs.err_note(sp, "C3003", u.f3("conflicting types for '%s': %s, declared before as %s", name, cs.tq(t),
+                                          cs.tq(prior.ty)), prior.span, "declared before here");
+        } else {
+            prior.ty = cty.composite(prior.ty, t);
+        }
+        if u.isnil(here) {
+            cs.declare(name, prior);
+        }
+        return prior;
+    }
+    return new_entity(name, sp, kind, t, lk, true);
+}
+
+fn new_entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32, link: bool) *mut cast.CSym {
+    let s = cs.new_sym(kind, name, sp, t);
+    s.linkage = lk;
+    if link and (lk != cast.LK_NONE) {
+        cs.set_linked(name, s);
+    }
+    cs.declare(name, s);
+    return s;
+}
+
+fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32) void {
+    let sc = sp.sc;
+    if cs.at_file_scope() {
+        if (sc != 0) and (sc != cast.SC_EXTERN) and (sc != cast.SC_STATIC) {
+            cs.err(dcl.name_span, "C3006", u.f1("the function '%s' has an invalid storage class", dcl.name));
+        }
+    } else if (sc != 0) and (sc != cast.SC_EXTERN) {
+        cs.err(dcl.name_span, "C3006", u.f1("the function '%s', declared in a block, can only be extern", dcl.name));
+    }
+    if u.notnil(dcl.init) {
+        cs.err(dcl.init.span, "C3033", u.f1("the function '%s' has an initializer", dcl.name));
+    }
+    let mut sc2 = sc;
+    if (sc != cast.SC_STATIC) and (sc != cast.SC_EXTERN) {
+        sc2 = 0;
+    }
+    if not cs.at_file_scope() and (sc2 == cast.SC_STATIC) {
+        sc2 = 0;
+    }
+    let lk = cs.linkage_of(dcl.name, sc2, true);
+    dcl.sym = entity(dcl.name, dcl.name_span, cast.SK_FUNC, t, lk);
+}
+
+fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32) void {
+    let sc = sp.sc;
+    let name = dcl.name;
+    if cty.is_void(t) {
+        cs.err(dcl.name_span, "C3007", u.f1("the object '%s' has type void", name));
+        return;
+    }
+    if cs.at_file_scope() {
+        if (sc == cast.SC_AUTO) or (sc == cast.SC_REGISTER) {
+            cs.err(dcl.name_span, "C3006", u.f1("'%s' at file scope cannot be auto or register", name));
+        }
+        let mut sc2 = sc;
+        if (sc != cast.SC_STATIC) and (sc != cast.SC_EXTERN) {
+            sc2 = 0;
+        }
+        let lk = cs.linkage_of(name, sc2, false);
+        let s = entity(name, dcl.name_span, cast.SK_OBJECT, t, lk);
+        s.duration = cast.SD_STATIC;
+        dcl.sym = s;
+        let listed = s.defined or s.tentative;
+        if u.notnil(dcl.init) {
+            if s.defined {
+                cs.err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", name), s.span, "defined before here");
+            }
+            init_object(s, dcl.init, true);
+            s.defined = true;
+        } else if sc != cast.SC_EXTERN {
+            s.tentative = true;
+        }
+        if not listed and (s.defined or s.tentative) {
+            cs.add_object(s);
+        }
+        dcl.ty = s.ty;
+        return;
+    }
+    if sc == cast.SC_EXTERN {
+        let lk = cs.linkage_of(name, sc, false);
+        let s = entity(name, dcl.name_span, cast.SK_OBJECT, t, lk);
+        s.duration = cast.SD_STATIC;
+        dcl.sym = s;
+        if u.notnil(dcl.init) {
+            cs.err(dcl.init.span, "C3033", u.f1("'%s', declared extern in a block, has an initializer", name));
+        }
+        return;
+    }
+    let prior = cs.lookup_here(name);
+    if u.notnil(prior) {
+        cs.err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", name), prior.span, "declared before here");
+    }
+    let s = cs.new_sym(cast.SK_OBJECT, name, dcl.name_span, t);
+    if sc == cast.SC_STATIC {
+        s.duration = cast.SD_STATIC;
+    }
+    dcl.sym = s;
+    cs.declare(name, s);
+    if u.notnil(dcl.init) {
+        init_object(s, dcl.init, s.duration == cast.SD_STATIC);
+    }
+    if not cty.is_complete(s.ty) and not cty.is_error(s.ty) {
+        cs.err(dcl.name_span, "C3007", u.f2("the object '%s' has incomplete type %s", name, cs.tq(s.ty)));
+    }
+    if s.duration == cast.SD_STATIC {
+        s.defined = true;
+        cs.add_object(s);
+    }
+    dcl.ty = s.ty;
+}
+
+fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
+    if cty.is_error(s.ty) {
+        return;
+    }
+    let r = ci.initializer(s.ty, it, is_static);
+    s.init = r.list;
+    s.ty = r.ty;
+}
+
+// -----------------------------------------------------------------------------
+// Function definitions (6.9.1)
+// -----------------------------------------------------------------------------
+
+fn function_def(d: *mut cast.Decl) void {
+    let sp = specifiers(d.specs, CTX_FILE, false);
+    let dcl = d.decls.get(0);
+    g_params = u.List.[*mut cast.CSym].empty();
+    g_kr_ids = false;
+    let mut t = derive(sp.ty, dcl, CTX_FILE);
+    let params = g_params;
+    let kr = g_kr_ids;
+    if cty.is_error(t) or not cty.is_func(t) {
+        return;
+    }
+    if sp.sc == cast.SC_TYPEDEF {
+        cs.err(dcl.name_span, "C3006", "a function definition cannot be a typedef");
+        return;
+    }
+    if kr {
+        t = kr_params(t, d, &params);
+    }
+    let mut sc = sp.sc;
+    if (sc != 0) and (sc != cast.SC_EXTERN) and (sc != cast.SC_STATIC) {
+        cs.err(dcl.name_span, "C3006", u.f1("the function '%s' has an invalid storage class", dcl.name));
+        sc = 0;
+    }
+    if sc == cast.SC_EXTERN {
+        sc = 0;
+    }
+    let lk = cs.linkage_of(dcl.name, sc, true);
+    let s = entity(dcl.name, dcl.name_span, cast.SK_FUNC, t, lk);
+    dcl.sym = s;
+    dcl.ty = t;
+    if s.defined {
+        cs.err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", dcl.name), s.span, "defined before here");
+        return;
+    }
+    let rt = t.ret;
+    if not cty.is_void(rt) and not cty.is_complete(rt) {
+        cs.err(dcl.name_span, "C3007", u.f2("'%s' returns incomplete type %s", dcl.name, cs.tq(rt)));
+    }
+    for p in params.items() {
+        if not cty.is_complete(p.ty) and not cty.is_error(p.ty) {
+            cs.err(p.span, "C3007", u.f2("the parameter '%s' has incomplete type %s", p.name, cs.tq(p.ty)));
+        }
+    }
+    s.defined = true;
+    s.def = d;
+    s.params = params;
+    if u.str_eq(dcl.name, "main") and (lk == cast.LK_EXTERNAL) {
+        check_main(s, dcl);
+    }
+    cs.add_function(s);
+    cs.hooks.body(s, d);
+}
+
+// A K&R definition's parameters get their types from its declaration list
+// (int when they have none, before C99); the function's type, which is not a
+// prototype, gets them.
+fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CSym]) *mut cty.CType {
+    let ps = params.items();
+    let mut given = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    for p in ps {
+        given.put(p.name, p);
+    }
+    let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    for kd in d.kr_decls.items() {
+        if kd.kind != cast.DeclKind.DECL {
+            continue;
+        }
+        let sp = specifiers(kd.specs, CTX_PARAM, false);
+        if (sp.sc != 0) and (sp.sc != cast.SC_REGISTER) {
+            cs.err(kd.specs.span, "C3006", "a parameter's only storage-class specifier can be 'register'");
+        }
+        for x in kd.decls.items() {
+            let p = given.get(x.name);
+            if u.isnil(p) {
+                cs.err(x.name_span, "C3010", u.f1("'%s' is declared, but is not a parameter", x.name));
+                continue;
+            }
+            if seen.get(x.name) != 0 {
+                cs.err(x.name_span, "C3002", u.f1("the parameter '%s' is declared twice", x.name));
+            }
+            seen.put(x.name, 1);
+            if u.notnil(x.init) {
+                cs.err(x.init.span, "C3033", u.f1("the parameter '%s' has an initializer", x.name));
+            }
+            let pt = derive(sp.ty, x, CTX_PARAM);
+            x.ty = pt;
+            x.sym = p;
+            p.ty = adjust_param(pt, x);
+            p.span = x.name_span;
+        }
+    }
+    let types = u.newn.[*mut cty.CType](ps.len + 1);
+    for i in 0..ps.len {
+        let p = ps[i];
+        if (seen.get(p.name) == 0) and (cs.std() >= co.C99) {
+            cs.err(p.span, "C3010", u.f1("the parameter '%s' has no declaration (implicit int is not in C99)", p.name));
+        }
+        if cty.arg_promote(p.ty) != cty.unqual(p.ty) {
+            cs.unsupported(p.span,
+                           u.f1("a K&R-style parameter whose type the default argument promotions change ('%s')",
+                                p.name));
+        }
+        types[i] = cty.unqual(p.ty);
+    }
+    return cty.function(t.ret, types[0..ps.len], false, false);
+}
+
+// main is called by the program's start-up: int main(void) or
+// int main(int, char **).
+fn check_main(s: *mut cast.CSym, dcl: *cast.Declarator) void {
+    let t = s.ty;
+    let mut ok = cty.unqual(t.ret) == cty.t_int;
+    let n = t.params.len;
+    if n == 2 {
+        let p1 = t.params[1];
+        ok = ok and (cty.unqual(t.params[0]) == cty.t_int) and (p1.kind == cty.TK_POINTER) and
+             (p1.elem.kind == cty.TK_POINTER) and (cty.unqual(p1.elem.elem) == cty.t_char);
+    } else if n != 0 {
+        ok = false;
+    }
+    if t.variadic {
+        ok = false;
+    }
+    if not ok {
+        cs.err(dcl.name_span, "C3061", u.f1("main has type %s; it must be 'int (void)' or 'int (int, char **)'",
+                                            cs.tq(t)));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Static assertions (6.7.10)
+// -----------------------------------------------------------------------------
+
+fn static_assert(d: *mut cast.Decl) void {
+    let r = cx.ice(d.cond, "the condition of a static assertion");
+    d.cond = r.e;
+    if r.ok and (r.v == 0) {
+        let mut msg: []u8 = "";
+        if u.notnil(d.msg) and u.notnil(d.msg.tok) {
+            let mut b = u.Buf.init();
+            for x in d.msg.tok.units {
+                b.c(@truncate(u8, x));
+            }
+            msg = u.cat2(": ", b.done());
+        }
+        cs.err(d.cond.span, "C3050", u.cat2("static assertion failed", msg));
+    }
+}

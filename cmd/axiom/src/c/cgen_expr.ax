@@ -1,0 +1,661 @@
+// =============================================================================
+// cgen_expr.ax - IR generation for C expressions (the typed tree: csema.ax).
+//
+// rv(e) is e's value: a scalar's IR value, a structure's or union's address
+// (memory holding the value), nothing for void; lv(e) is the address of
+// lvalue e (and of a structure member reached from a structure value). The
+// implicit conversions are CAST nodes, so each node does one thing.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+fn lty(t: *mut cty.CType) *mut ir.Ty {
+    return cg.lty(t);
+}
+
+fn is_volatile(t: *cty.CType) bool {
+    return (t.quals & cty.Q_VOLATILE) != 0;
+}
+
+/// Loads a scalar of type t from p (volatile: as its type says).
+pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    let v = ir.load(cg.B, lty(t), p);
+    v.align = @truncate(u32, cty.align_of(t));
+    if is_volatile(t) {
+        v.flags = v.flags | ir.F_VOLATILE;
+    }
+    return v;
+}
+
+/// Stores scalar v of type t at p.
+pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
+    let s = ir.store(cg.B, v, p);
+    s.align = @truncate(u32, cty.align_of(t));
+    if is_volatile(t) {
+        s.flags = s.flags | ir.F_VOLATILE;
+    }
+}
+
+/// Copies an object of type t from src to dst (which may be the same).
+pub fn copy(t: *mut cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
+    let n = cty.size_of(t);
+    if n == 0 {
+        return;
+    }
+    _ = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(n));
+}
+
+/// Sets n bytes at p to zero.
+pub fn zero(p: *mut ir.Value, n: u64) void {
+    if n == 0 {
+        return;
+    }
+    _ = ir.memop(cg.B, ir.OP_MEMSET, p, ir.cint(cg.T_i8, 0), cg.usz(n));
+}
+
+/// The constant value of e (is_const, of arithmetic type).
+pub fn const_value(e: *cast.Expr) *mut ir.Value {
+    let t = lty(e.ty);
+    if cty.is_floating(e.ty) {
+        return ir.cfp(t, e.fcval);
+    }
+    return ir.cint(t, e.cval);
+}
+
+fn i1_to(t: *mut cty.CType, c: *mut ir.Value) *mut ir.Value {
+    return ir.zext(cg.B, c, lty(t));
+}
+
+/// The truth of scalar value v of type t, as an i1.
+pub fn truth(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if cty.is_floating(t) {
+        return ir.fcmp(cg.B, ir.RealUNE, v, ir.cfp(v.ty, 0.0));
+    }
+    if t.kind == cty.TK_POINTER {
+        return ir.icmp(cg.B, ir.IntNE, ir.ptrtoint(cg.B, v, cg.T_isz), cg.usz(0));
+    }
+    return ir.icmp(cg.B, ir.IntNE, v, ir.cint(v.ty, 0));
+}
+
+/// Scalar value v of type `from` converted to type `to` (6.3.1, 6.3.2.3).
+pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
+    if cty.is_void(to) {
+        return ir.vnil();
+    }
+    let f = from.unq;
+    let t = to.unq;
+    if f == t {
+        return v;
+    }
+    let tt = lty(t);
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(cg.B, truth(v, f), tt);
+    }
+    if cty.is_integer(t) {
+        if cty.is_integer(f) {
+            return int_resize(v, f.is_signed, tt);
+        }
+        if f.kind == cty.TK_POINTER {
+            return ir.ptrtoint(cg.B, v, tt);
+        }
+        if t.is_signed {
+            return ir.cast(cg.B, ir.OP_FPTOSI_SAT, v, tt);
+        }
+        return ir.cast(cg.B, ir.OP_FPTOUI_SAT, v, tt);
+    }
+    if cty.is_floating(t) {
+        if cty.is_integer(f) {
+            if f.is_signed {
+                return ir.cast(cg.B, ir.OP_SITOFP, v, tt);
+            }
+            return ir.cast(cg.B, ir.OP_UITOFP, v, tt);
+        }
+        if tt.bits > v.ty.bits {
+            return ir.cast(cg.B, ir.OP_FPEXT, v, tt);
+        }
+        if tt.bits < v.ty.bits {
+            return ir.cast(cg.B, ir.OP_FPTRUNC, v, tt);
+        }
+        return v;
+    }
+    if t.kind == cty.TK_POINTER {
+        if cty.is_integer(f) {
+            if ir.is_cint(v) and (ir.cint_val(v) == 0) {
+                return ir.czero(cg.T_ptr);
+            }
+            return ir.inttoptr(cg.B, int_resize(v, f.is_signed, cg.T_isz));
+        }
+        return v;
+    }
+    return v;
+}
+
+fn int_resize(v: *mut ir.Value, from_signed: bool, tt: *mut ir.Ty) *mut ir.Value {
+    if v.ty.bits == tt.bits {
+        return v;
+    }
+    if v.ty.bits > tt.bits {
+        return ir.trunc(cg.B, v, tt);
+    }
+    if from_signed {
+        return ir.sext(cg.B, v, tt);
+    }
+    return ir.zext(cg.B, v, tt);
+}
+
+// -----------------------------------------------------------------------------
+// Lvalues
+// -----------------------------------------------------------------------------
+
+/// The address of lvalue e (an object, a function, or a member of a
+/// structure value).
+pub fn lv(e: *mut cast.Expr) *mut ir.Value {
+    let k = e.kind;
+    if k == cast.ExprKind.IDENT {
+        let s = e.sym;
+        if s.kind == cast.SK_FUNC {
+            return cg.func_of(s, cg.func_sig(s)).val;
+        }
+        if s.duration == cast.SD_STATIC {
+            return cg.object_addr(s);
+        }
+        if u.isvnil(s.ir) {
+            s.ir = @ptr_cast(*mut void, cg.alloca(s.ty, s.name));
+        }
+        return @ptr_cast(*mut ir.Value, s.ir);
+    }
+    if k == cast.ExprKind.STRING {
+        return cg.string_addr(e);
+    }
+    if k == cast.ExprKind.UNARY {
+        // *p
+        return rv(e.a);
+    }
+    if k == cast.ExprKind.INDEX {
+        let p = rv(e.a);
+        let i = rv(e.b);
+        return offset(p, i, cty.size_of(e.ty), false);
+    }
+    if k == cast.ExprKind.MEMBER {
+        let base = rv_or_lv(e.a, e.op == ct.P_DOT);
+        return ir.ptradd(cg.B, base, cg.usz(e.cval));
+    }
+    // (a structure or union value: its address)
+    return rv(e);
+}
+
+fn rv_or_lv(e: *mut cast.Expr, want_lv: bool) *mut ir.Value {
+    if want_lv and e.lvalue {
+        return lv(e);
+    }
+    return rv(e);
+}
+
+// p + i * size (i: a pointer-sized integer), or minus.
+fn offset(p: *mut ir.Value, i0: *mut ir.Value, size: u64, neg: bool) *mut ir.Value {
+    let mut i = i0;
+    if i.ty.bits != cg.T_isz.bits {
+        i = int_resize(i, true, cg.T_isz);
+    }
+    let mut d = ir.mul(cg.B, i, cg.usz(size));
+    if neg {
+        d = ir.sub(cg.B, cg.usz(0), d);
+    }
+    return ir.ptradd(cg.B, p, d);
+}
+
+// -----------------------------------------------------------------------------
+// Values
+// -----------------------------------------------------------------------------
+
+/// The value of e.
+pub fn rv(e: *mut cast.Expr) *mut ir.Value {
+    if e.is_const and cty.is_arith(e.ty) {
+        return const_value(e);
+    }
+    let k = e.kind;
+    if k == cast.ExprKind.CAST {
+        return conversion(e);
+    }
+    if k == cast.ExprKind.UNARY {
+        return unary(e);
+    }
+    if (k == cast.ExprKind.POSTFIX) or ((k == cast.ExprKind.UNARY) and ((e.op == ct.P_INC) or (e.op == ct.P_DEC))) {
+        return incdec(e);
+    }
+    if k == cast.ExprKind.BINARY {
+        return binary(e);
+    }
+    if k == cast.ExprKind.ASSIGN {
+        return assign(e);
+    }
+    if k == cast.ExprKind.COND {
+        return conditional(e);
+    }
+    if k == cast.ExprKind.COMMA {
+        _ = rv(e.a);
+        return rv(e.b);
+    }
+    if k == cast.ExprKind.CALL {
+        return call(e);
+    }
+    if k == cast.ExprKind.NULLPTR {
+        return ir.czero(cg.T_ptr);
+    }
+    if (k == cast.ExprKind.MEMBER) or (k == cast.ExprKind.INDEX) or (k == cast.ExprKind.IDENT) {
+        // (the member of a structure value; lvalues are converted by CV_LOAD)
+        let p = lv(e);
+        if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) {
+            return p;
+        }
+        return load(e.ty, p);
+    }
+    u.die("internal compiler error (C front end): an expression without a value");
+    return ir.vnil();
+}
+
+fn conversion(e: *mut cast.Expr) *mut ir.Value {
+    let op = e.op;
+    if op == cast.CV_LOAD {
+        let p = lv(e.a);
+        if cty.is_record(e.ty) {
+            return p;
+        }
+        return load(e.a.ty, p);
+    }
+    if (op == cast.CV_ADECAY) or (op == cast.CV_FDECAY) {
+        return lv(e.a);
+    }
+    let v = rv(e.a);
+    if cty.is_void(e.ty) or not cty.is_scalar(e.a.ty) {
+        return ir.vnil();
+    }
+    return convert(v, e.a.ty, e.ty);
+}
+
+fn unary(e: *mut cast.Expr) *mut ir.Value {
+    let op = e.op;
+    if (op == ct.P_INC) or (op == ct.P_DEC) {
+        return incdec(e);
+    }
+    if op == ct.P_AMP {
+        return lv(e.a);
+    }
+    if op == ct.P_STAR {
+        // (a void lvalue's value is not used: *p as a statement)
+        _ = rv(e.a);
+        return ir.vnil();
+    }
+    let v = rv(e.a);
+    if op == ct.P_BANG {
+        return i1_to(e.ty, ir.not_(cg.B, truth(v, e.a.ty)));
+    }
+    if op == ct.P_MINUS {
+        if cty.is_floating(e.ty) {
+            return ir.fneg(cg.B, v);
+        }
+        return ir.sub(cg.B, ir.cint(v.ty, 0), v);
+    }
+    if op == ct.P_TILDE {
+        return ir.xor(cg.B, v, ir.cint(v.ty, 0xFFFF_FFFF_FFFF_FFFF));
+    }
+    return v;
+}
+
+// x op y in arithmetic type t (both of type t; a shift's y converted to x's width).
+fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    if cty.is_floating(t) {
+        let mut fo = ir.OP_FADD;
+        if op == ct.P_MINUS {
+            fo = ir.OP_FSUB;
+        } else if op == ct.P_STAR {
+            fo = ir.OP_FMUL;
+        } else if op == ct.P_SLASH {
+            fo = ir.OP_FDIV;
+        }
+        return ir.binop(cg.B, fo, x, y);
+    }
+    let sg = t.unq.is_signed and (t.unq.kind != cty.TK_BOOL);
+    let mut io = ir.OP_ADD;
+    if op == ct.P_MINUS {
+        io = ir.OP_SUB;
+    } else if op == ct.P_STAR {
+        io = ir.OP_MUL;
+    } else if op == ct.P_SLASH {
+        io = pick(sg, ir.OP_SDIV, ir.OP_UDIV);
+    } else if op == ct.P_PERCENT {
+        io = pick(sg, ir.OP_SREM, ir.OP_UREM);
+    } else if op == ct.P_AMP {
+        io = ir.OP_AND;
+    } else if op == ct.P_PIPE {
+        io = ir.OP_OR;
+    } else if op == ct.P_CARET {
+        io = ir.OP_XOR;
+    } else if (op == ct.P_SHL) or (op == ct.P_SHR) {
+        let k = int_resize(y, false, x.ty);
+        if op == ct.P_SHL {
+            return ir.binop(cg.B, ir.OP_SHL, x, k);
+        }
+        return ir.binop(cg.B, pick(sg, ir.OP_ASHR, ir.OP_LSHR), x, k);
+    }
+    return ir.binop(cg.B, io, x, y);
+}
+
+fn pick(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The operator of a compound assignment: '+=' is '+'.
+fn base_op(op: i32) i32 {
+    if op == ct.P_MUL_EQ {
+        return ct.P_STAR;
+    }
+    if op == ct.P_DIV_EQ {
+        return ct.P_SLASH;
+    }
+    if op == ct.P_MOD_EQ {
+        return ct.P_PERCENT;
+    }
+    if op == ct.P_ADD_EQ {
+        return ct.P_PLUS;
+    }
+    if op == ct.P_SUB_EQ {
+        return ct.P_MINUS;
+    }
+    if op == ct.P_SHL_EQ {
+        return ct.P_SHL;
+    }
+    if op == ct.P_SHR_EQ {
+        return ct.P_SHR;
+    }
+    if op == ct.P_AND_EQ {
+        return ct.P_AMP;
+    }
+    if op == ct.P_XOR_EQ {
+        return ct.P_CARET;
+    }
+    return ct.P_PIPE;
+}
+
+fn compare(e: *mut cast.Expr) *mut ir.Value {
+    let op = e.op;
+    let t = e.a.ty;
+    let mut x = rv(e.a);
+    let mut y = rv(e.b);
+    if cty.is_floating(t) {
+        let mut p = ir.RealOEQ;
+        if op == ct.P_NE {
+            p = ir.RealUNE;
+        } else if op == ct.P_LT {
+            p = ir.RealOLT;
+        } else if op == ct.P_GT {
+            p = ir.RealOGT;
+        } else if op == ct.P_LE {
+            p = ir.RealOLE;
+        } else if op == ct.P_GE {
+            p = ir.RealOGE;
+        }
+        return i1_to(e.ty, ir.fcmp(cg.B, p, x, y));
+    }
+    let mut sg = cty.is_integer(t) and t.is_signed and (t.kind != cty.TK_BOOL);
+    if t.kind == cty.TK_POINTER {
+        x = ir.ptrtoint(cg.B, x, cg.T_isz);
+        y = ir.ptrtoint(cg.B, y, cg.T_isz);
+        sg = false;
+    }
+    let mut p = ir.IntEQ;
+    if op == ct.P_NE {
+        p = ir.IntNE;
+    } else if op == ct.P_LT {
+        p = pick(sg, ir.IntSLT, ir.IntULT);
+    } else if op == ct.P_GT {
+        p = pick(sg, ir.IntSGT, ir.IntUGT);
+    } else if op == ct.P_LE {
+        p = pick(sg, ir.IntSLE, ir.IntULE);
+    } else if op == ct.P_GE {
+        p = pick(sg, ir.IntSGE, ir.IntUGE);
+    }
+    return i1_to(e.ty, ir.icmp(cg.B, p, x, y));
+}
+
+/// Branches to t if scalar expression e is nonzero, else to f.
+pub fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
+    if e.is_const and cty.is_arith(e.ty) {
+        let mut c = e.cval != 0;
+        if cty.is_floating(e.ty) {
+            c = e.fcval != 0.0;
+        }
+        if c {
+            cg.br(t);
+        } else {
+            cg.br(f);
+        }
+        return;
+    }
+    if (e.kind == cast.ExprKind.BINARY) and ((e.op == ct.P_ANDAND) or (e.op == ct.P_OROR)) {
+        let mid = cg.new_block(u.pick(e.op == ct.P_ANDAND, "and", "or"));
+        if e.op == ct.P_ANDAND {
+            branch(e.a, mid, f);
+        } else {
+            branch(e.a, t, mid);
+        }
+        cg.at_end(mid);
+        branch(e.b, t, f);
+        return;
+    }
+    if (e.kind == cast.ExprKind.UNARY) and (e.op == ct.P_BANG) {
+        branch(e.a, f, t);
+        return;
+    }
+    let v = rv(e);
+    ir.condbr(cg.B, truth(v, e.ty), t, f);
+}
+
+fn binary(e: *mut cast.Expr) *mut ir.Value {
+    let op = e.op;
+    if (op == ct.P_ANDAND) or (op == ct.P_OROR) {
+        let yes = cg.new_block("true");
+        let no = cg.new_block("false");
+        let done = cg.new_block("logic");
+        branch(e, yes, no);
+        cg.at_end(yes);
+        ir.br(cg.B, done);
+        cg.at_end(no);
+        ir.br(cg.B, done);
+        cg.at_end(done);
+        let ph = ir.phi(cg.B, lty(e.ty));
+        ir.add_incoming(ph, ir.cint(lty(e.ty), 1), yes);
+        ir.add_incoming(ph, ir.cint(lty(e.ty), 0), no);
+        return ph;
+    }
+    if (op == ct.P_LT) or (op == ct.P_GT) or (op == ct.P_LE) or (op == ct.P_GE) or (op == ct.P_EQ) or (op == ct.P_NE) {
+        return compare(e);
+    }
+    let ta = e.a.ty;
+    if ta.kind == cty.TK_POINTER {
+        let p = rv(e.a);
+        if e.b.ty.kind == cty.TK_POINTER {
+            // p - q: the difference in elements
+            let q = rv(e.b);
+            let d = ir.sub(cg.B, ir.ptrtoint(cg.B, p, cg.T_isz), ir.ptrtoint(cg.B, q, cg.T_isz));
+            let n = ir.binop(cg.B, ir.OP_SDIV, d, cg.usz(cty.size_of(ta.elem)));
+            return int_resize(n, true, lty(e.ty));
+        }
+        let i = rv(e.b);
+        return offset(p, i, cty.size_of(ta.elem), op == ct.P_MINUS);
+    }
+    let x = rv(e.a);
+    let y = rv(e.b);
+    return arith_op(op, e.ty, x, y);
+}
+
+fn assign(e: *mut cast.Expr) *mut ir.Value {
+    let lt = e.a.ty;
+    if e.op == ct.P_ASSIGN {
+        let v = rv(e.b);
+        let p = lv(e.a);
+        if cty.is_record(lt) {
+            copy(lt, p, v);
+            return p;
+        }
+        store(lt, v, p);
+        return v;
+    }
+    let p = lv(e.a);
+    let old = load(lt, p);
+    let r = rv(e.b);
+    let ot = e.opty;
+    let mut nv = ir.vnil();
+    if ot.kind == cty.TK_POINTER {
+        nv = offset(old, r, cty.size_of(ot.elem), e.op == ct.P_SUB_EQ);
+    } else {
+        let x = convert(old, lt, ot);
+        nv = convert(arith_op(base_op(e.op), ot, x, r), ot, lt);
+    }
+    store(lt, nv, p);
+    return nv;
+}
+
+// ++ and --, prefix (UNARY) or postfix.
+fn incdec(e: *mut cast.Expr) *mut ir.Value {
+    let t = e.a.ty;
+    let p = lv(e.a);
+    let old = load(t, p);
+    let ot = e.opty;
+    let dec = e.op == ct.P_DEC;
+    let mut nv = ir.vnil();
+    if ot.kind == cty.TK_POINTER {
+        nv = offset(old, cg.usz(1), cty.size_of(ot.elem), dec);
+    } else {
+        let x = convert(old, t, ot);
+        let mut one = ir.vnil();
+        if cty.is_floating(ot) {
+            one = ir.cfp(lty(ot), 1.0);
+        } else {
+            one = ir.cint(lty(ot), 1);
+        }
+        nv = convert(arith_op(pick(dec, ct.P_MINUS, ct.P_PLUS), ot, x, one), ot, t);
+    }
+    store(t, nv, p);
+    if e.kind == cast.ExprKind.POSTFIX {
+        return old;
+    }
+    return nv;
+}
+
+fn conditional(e: *mut cast.Expr) *mut ir.Value {
+    let yes = cg.new_block("then");
+    let no = cg.new_block("else");
+    let done = cg.new_block("cond");
+    branch(e.a, yes, no);
+    cg.at_end(yes);
+    let x = rv(e.b);
+    let xb = ir.insert_block(cg.B);
+    ir.br(cg.B, done);
+    cg.at_end(no);
+    let y = rv(e.c);
+    let yb = ir.insert_block(cg.B);
+    ir.br(cg.B, done);
+    cg.at_end(done);
+    if cty.is_void(e.ty) {
+        return ir.vnil();
+    }
+    let mut pt = cg.T_ptr;
+    if cty.is_scalar(e.ty) {
+        pt = lty(e.ty);
+    }
+    let ph = ir.phi(cg.B, pt);
+    ir.add_incoming(ph, x, xb);
+    ir.add_incoming(ph, y, yb);
+    return ph;
+}
+
+fn call(e: *mut cast.Expr) *mut ir.Value {
+    let fe = e.a;
+    let ft = fe.ty.elem;
+    let n = e.args.len;
+    let ats = u.newn.[*mut cty.CType](n + 1);
+    for i in 0..n {
+        ats[i] = e.args.get(i).ty;
+    }
+    // the signature: the prototype's (and the variadic arguments'), or the arguments'
+    let mut np = n;
+    let mut ps = ats[0..n];
+    if ft.proto {
+        np = ft.params.len;
+        ps = ft.params;
+    }
+    let mut sig = cg.sig_of(ft.ret, ps, ft.proto and ft.variadic);
+    let mut callee = ir.vnil();
+    if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) {
+        let f = cg.func_of(fe.a.sym, sig);
+        callee = f.val;
+        if same_sig(f.ty, sig.ty) {
+            sig.ty = f.ty;
+        }
+    } else {
+        callee = rv(fe);
+    }
+    let mut k: usize = 0;
+    let mut total = n;
+    if sig.sret {
+        total += 1;
+    }
+    let av = u.newn.[*mut ir.Value](total + 1);
+    let mut tmp = ir.vnil();
+    if sig.sret {
+        tmp = cg.alloca(ft.ret, "ret");
+        av[0] = tmp;
+        k = 1;
+    }
+    for i in 0..n {
+        let a = e.args.get(i);
+        let v = rv(a);
+        let at = ats[i];
+        if cg.by_ptr(at) {
+            let c = cg.alloca(at, "arg");
+            copy(at, c, v);
+            av[k] = c;
+        } else if cty.is_record(at) {
+            av[k] = ir.load(cg.B, lty(at), v);
+        } else {
+            av[k] = v;
+        }
+        k += 1;
+    }
+    let r = ir.call(cg.B, sig.ty, callee, av[0..total]);
+    cg.mark_call(r, ft.ret, ats[0..n], sig.sret);
+    _ = np;
+    let rt = e.ty;
+    if sig.sret {
+        return tmp;
+    }
+    if cty.is_void(rt) {
+        return ir.vnil();
+    }
+    if cty.is_record(rt) {
+        let t2 = cg.alloca(rt, "ret");
+        _ = ir.store(cg.B, r, t2);
+        return t2;
+    }
+    return r;
+}
+
+fn same_sig(a: *ir.Ty, b: *ir.Ty) bool {
+    if (a.ret != b.ret) or (a.vararg != b.vararg) or (a.params.len != b.params.len) {
+        return false;
+    }
+    for i in 0..a.params.len {
+        if a.params[i] != b.params[i] {
+            return false;
+        }
+    }
+    return true;
+}

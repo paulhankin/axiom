@@ -1,0 +1,419 @@
+// =============================================================================
+// csema.ax - semantic analysis of a C translation unit: the scopes and name
+// spaces, symbols and linkage, diagnostics, and the walk over the external
+// declarations (run). The other parts are csema_decl.ax (declarations),
+// csema_expr.ax (expressions), csema_stmt.ax (statements), csema_init.ax
+// (initializers) and cconst.ax (constant expressions); this module is the
+// one they all import, and it reaches them through the hooks they install
+// (csema_stmt.analyze does), so that the modules form no import cycle.
+//
+// The typed tree (what IR generation, cgen*.ax, may rely on once a unit has
+// no errors) is the syntax tree annotated in place:
+//
+//   - Every Expr has its type (ty) and value category (lvalue). An lvalue's
+//     type keeps its qualifiers; an rvalue's is unqualified. A function
+//     designator is an lvalue of function type.
+//   - Implicit conversions are explicit: CAST nodes without a type name,
+//     whose op is one of cast.CV_: CV_LOAD (lvalue conversion: wherever an
+//     lvalue's value is used), CV_ADECAY and CV_FDECAY (arrays and function
+//     designators used as values), CV_VALUE (a scalar converted to another
+//     scalar type, or any value to void). An explicit cast is a CAST with a
+//     type name and op CV_VALUE. So an operand is an lvalue only where the
+//     operator takes one (&, ++, --, the left of an assignment, the base of
+//     '.', sizeof and _Alignof).
+//   - The operands of arithmetic operators are converted to the type the
+//     operation is done in (the usual arithmetic conversions, or the
+//     integer promotions), which is the result's type; a comparison's to
+//     their common type (its result is int); a shift's each promoted. In
+//     pointer arithmetic (p + i, p - i, p[i], i[p]) the pointer is `a` and
+//     the integer `b`, converted to ptrdiff_t or size_t (as it is signed or
+//     not); p - q has type ptrdiff_t. A compound assignment's right operand
+//     is converted to the type its operation is done in (opty): its left
+//     operand's value is converted to opty, the operation done, and the
+//     result converted back; ++ and -- likewise with 1 (opty: the
+//     operand's promoted type, or the pointer type).
+//   - A call's callee is a pointer to a function (after CV_FDECAY), its
+//     arguments converted to the parameters' types (as by assignment), the
+//     variadic ones and those of a call without a prototype promoted.
+//   - IDENT: sym is the object, function or enumeration constant. MEMBER:
+//     mem is the member, cval its offset (through anonymous members).
+//   - Constant expressions have is_const and their value (cconst.ax); IR
+//     generation may use the value instead of the tree.
+//   - Objects with initializers have them in normal form (CSym.init: a list
+//     of (offset, type, expression)); a SWITCH lists its cases (Stmt.cases),
+//     each CASE its value (Stmt.cval); LABEL and GOTO have the label's CSym.
+//
+// Diagnostics (C3xxx: constraints; C4xxx: warnings):
+//   C3001  an undeclared identifier
+//   C3002  a redefinition (object, function, tag, label, member, parameter)
+//   C3003  conflicting types or kinds of declarations of one identifier
+//   C3004  conflicting linkage (declared static after external, ...)
+//   C3005  an invalid combination of type specifiers
+//   C3006  an invalid storage-class or function specifier, or qualifier
+//   C3007  an incomplete type where a complete one is needed
+//   C3008  an invalid declarator (arrays of functions, functions returning arrays, void parameters ...)
+//   C3009  an invalid array size
+//   C3010  a declaration that declares nothing, or a name where none can be
+//   C3011  the wrong kind of tag (`union S` for a structure), or an undefined enumeration
+//   C3013  an enumeration constant out of range
+//   C3020  invalid operands to an operator
+//   C3021  an assignment to something that is not a modifiable lvalue
+//   C3022  incompatible types (assignment, initialization, argument, return)
+//   C3023  the wrong number of arguments
+//   C3024  a call of something that is not a function
+//   C3025  a member access on something without that member
+//   C3026  an operand that must be an lvalue is not one (&, ++, --)
+//   C3028  an invalid cast
+//   C3029  an invalid operand of sizeof or _Alignof
+//   C3030  a void value used, or a value that must be scalar or integer is not
+//   C3031  an initializer of an object with static storage duration that is not constant
+//   C3032  excess elements in an initializer, or a string too long for its array
+//   C3033  an invalid initializer
+//   C3034  an integer constant too large for any type
+//   C3035  a constant expression is needed
+//   C3040  case or default outside a switch statement
+//   C3041  a duplicate case value or default label
+//   C3042  break outside a loop or switch, continue outside a loop
+//   C3043  a label that is used but not defined
+//   C3044  a return statement with or without a value where the function says otherwise
+//   C3050  a static assertion that fails
+//   C3060  a call of an undeclared function (C99 and later)
+//   C3061  a definition of main of a form that is not supported
+//   C3062  an external name that is the name of a function of the runtime (IR generation)
+//   C3063  a program without a function main (IR generation)
+//   C3900  a C feature that is not supported yet
+//   C3901  a C feature that this implementation does not support (_Complex, _Atomic, decimal floating)
+//   C4001  an implicit function declaration (C89, C95)
+// =============================================================================
+import "../diag.ax" as dg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "ctypes.ax" as cty;
+
+/// The translation unit, typed: what IR generation emits.
+pub struct CUnit {
+    funcs: u.List.[*mut cast.CSym],    // the functions defined, in order
+    objects: u.List.[*mut cast.CSym],  // the objects with static storage duration defined here, in order
+    main: *mut cast.CSym,              // the function main, if defined
+}
+
+/// The other parts of semantic analysis, reached from the ones they import.
+pub struct Hooks {
+    external: fn(*mut cast.Decl) void,                 // an external declaration (csema_decl)
+    type_name: fn(*mut cast.TypeName) *mut cty.CType,  // a type name's type (csema_decl)
+    body: fn(*mut cast.CSym, *mut cast.Decl) void,     // a function definition's body (csema_stmt)
+}
+
+fn no_external(d: *mut cast.Decl) void {
+    _ = d;
+}
+
+fn no_type_name(t: *mut cast.TypeName) *mut cty.CType {
+    _ = t;
+    return cty.t_error;
+}
+
+fn no_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
+    _ = f;
+    _ = d;
+}
+
+pub let mut hooks: Hooks = Hooks.{ external: no_external, type_name: no_type_name, body: no_body };
+
+// -----------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------
+
+// An identifier bound in a scope: an ordinary identifier's CSym, or a tag's type.
+struct Bind {
+    name: []u8,
+    sym: *mut cast.CSym,
+    tag: *mut cty.CType,
+    level: i32,
+    prev: i32,  // the binding it hides (index + 1), or 0
+}
+
+// One name space: its bindings, innermost last, and each name's innermost.
+struct Space {
+    binds: u.List.[Bind],
+    names: u.SymMap.[i32],
+}
+
+fn new_space() Space {
+    return Space.{ binds: u.List.[Bind].empty(),
+                   names: u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 } };
+}
+
+struct State {
+    o: *co.COptions,
+    ordinary: Space,
+    tags: Space,
+    level: i32,  // 0: file scope
+    linked: u.SymMap.[*mut cast.CSym],  // the entities with linkage, by name
+    unit: *mut CUnit,
+    next_uid: i32,
+    cur_fn: *mut cast.CSym,  // the function whose body is being analyzed
+}
+
+let mut S: *mut State = @ptr_from_int(*mut State, 0);
+
+/// The options of the translation unit.
+pub fn opts() *co.COptions {
+    return S.o;
+}
+
+/// The standard in force.
+pub fn std() i32 {
+    return S.o.std;
+}
+
+/// The unit being analyzed.
+pub fn unit() *mut CUnit {
+    return S.unit;
+}
+
+// -----------------------------------------------------------------------------
+// Diagnostics
+// -----------------------------------------------------------------------------
+
+/// Reports a constraint violation.
+pub fn err(sp: u.Span, code: []u8, msg: []u8) void {
+    _ = dg.err(sp, code, msg);
+}
+
+/// Reports a constraint violation about a declaration, with a note at the
+/// one it conflicts with.
+pub fn err_note(sp: u.Span, code: []u8, msg: []u8, other: u.Span, note: []u8) void {
+    let d = dg.err(sp, code, msg);
+    dg.note(d, other, note);
+}
+
+pub fn warn(sp: u.Span, code: []u8, msg: []u8) void {
+    _ = dg.warning(sp, code, msg);
+}
+
+/// Reports a feature that is not supported yet (C3900): "<what> is not supported yet".
+pub fn unsupported(sp: u.Span, what: []u8) void {
+    _ = dg.err(sp, "C3900", u.cat2(what, " is not supported yet"));
+}
+
+/// Reports a feature this implementation does not support (C3901).
+pub fn not_supported(sp: u.Span, what: []u8) void {
+    _ = dg.err(sp, "C3901", u.cat2(what, " is not supported"));
+}
+
+/// A type for messages: 'int *'.
+pub fn tq(t: *cty.CType) []u8 {
+    return u.cat3("'", cty.type_str(t), "'");
+}
+
+// -----------------------------------------------------------------------------
+// Scopes
+// -----------------------------------------------------------------------------
+
+/// The depth of the current scope (0: file scope).
+pub fn level() i32 {
+    return S.level;
+}
+
+pub fn at_file_scope() bool {
+    return S.level == 0;
+}
+
+pub fn push_scope() void {
+    S.level += 1;
+}
+
+fn pop_space(sp: *mut Space, lv: i32) void {
+    while (sp.binds.len > 0) and (sp.binds.at(sp.binds.len - 1).level >= lv) {
+        let b = sp.binds.pop();
+        sp.names.put(b.name, b.prev);
+    }
+}
+
+/// Leaves the current scope: its bindings are forgotten.
+pub fn pop_scope() void {
+    pop_space(&mut S.ordinary, S.level);
+    pop_space(&mut S.tags, S.level);
+    S.level -= 1;
+}
+
+fn bind(sp: *mut Space, name: []u8, sym: *mut cast.CSym, tag: *mut cty.CType) void {
+    let prev = sp.names.get(name);
+    sp.binds.push(Bind.{ name: name, sym: sym, tag: tag, level: S.level, prev: prev });
+    sp.names.put(name, @int_cast(i32, sp.binds.len));
+}
+
+fn innermost(sp: *mut Space, name: []u8) *mut Bind {
+    let k = sp.names.get(name);
+    if k == 0 {
+        return u.nil.[Bind]();
+    }
+    return sp.binds.at(@int_cast(usize, k - 1));
+}
+
+/// The ordinary identifier `name` as seen here, or nil.
+pub fn lookup(name: []u8) *mut cast.CSym {
+    let b = innermost(&mut S.ordinary, name);
+    if u.isnil(b) {
+        return u.nil.[cast.CSym]();
+    }
+    return b.sym;
+}
+
+/// The ordinary identifier `name` if declared in the current scope, or nil.
+pub fn lookup_here(name: []u8) *mut cast.CSym {
+    let b = innermost(&mut S.ordinary, name);
+    if u.isnil(b) or (b.level != S.level) {
+        return u.nil.[cast.CSym]();
+    }
+    return b.sym;
+}
+
+/// Binds ordinary identifier `name` to s in the current scope.
+pub fn declare(name: []u8, s: *mut cast.CSym) void {
+    bind(&mut S.ordinary, name, s, u.nil.[cty.CType]());
+}
+
+/// The tag `name` as seen here (its type), or nil.
+pub fn lookup_tag(name: []u8) *mut cty.CType {
+    let b = innermost(&mut S.tags, name);
+    if u.isnil(b) {
+        return u.nil.[cty.CType]();
+    }
+    return b.tag;
+}
+
+/// The tag `name` if declared in the current scope, or nil.
+pub fn lookup_tag_here(name: []u8) *mut cty.CType {
+    let b = innermost(&mut S.tags, name);
+    if u.isnil(b) or (b.level != S.level) {
+        return u.nil.[cty.CType]();
+    }
+    return b.tag;
+}
+
+/// Binds tag `name` to type t in the current scope.
+pub fn declare_tag(name: []u8, t: *mut cty.CType) void {
+    bind(&mut S.tags, name, u.nil.[cast.CSym](), t);
+}
+
+// -----------------------------------------------------------------------------
+// Symbols and linkage
+// -----------------------------------------------------------------------------
+
+/// A new symbol.
+pub fn new_sym(kind: i32, name: []u8, sp: u.Span, t: *mut cty.CType) *mut cast.CSym {
+    let s = u.new.[cast.CSym]();
+    s.kind = kind;
+    s.name = name;
+    s.span = sp;
+    s.ty = t;
+    S.next_uid += 1;
+    s.uid = S.next_uid;
+    return s;
+}
+
+/// The entity with linkage named `name` declared anywhere in the unit so far, or nil.
+pub fn linked(name: []u8) *mut cast.CSym {
+    return S.linked.get(name);
+}
+
+pub fn set_linked(name: []u8, s: *mut cast.CSym) void {
+    S.linked.put(name, s);
+}
+
+/// The linkage of a declaration of `name` (6.2.2) with storage-class
+/// specifier `sc` (a cast.SC_ bit or 0) of a function (is_fn) or object:
+/// LK_INTERNAL for `static` at file scope; the linkage of a prior visible
+/// declaration for `extern` (and for functions without one); else external
+/// at file scope, and none in a block.
+pub fn linkage_of(name: []u8, sc: i32, is_fn: bool) i32 {
+    if at_file_scope() and (sc == cast.SC_STATIC) {
+        return cast.LK_INTERNAL;
+    }
+    if (sc == cast.SC_EXTERN) or (is_fn and (sc == 0)) {
+        let prior = lookup(name);
+        if u.notnil(prior) and ((prior.kind == cast.SK_OBJECT) or (prior.kind == cast.SK_FUNC)) and
+           (prior.linkage != cast.LK_NONE) {
+            return prior.linkage;
+        }
+        return cast.LK_EXTERNAL;
+    }
+    if at_file_scope() {
+        return cast.LK_EXTERNAL;
+    }
+    return cast.LK_NONE;
+}
+
+/// Declares `name` as C89 does a function called without a declaration:
+/// `extern int name();` in the current scope.
+pub fn implicit_function(name: []u8, sp: u.Span) void {
+    let mut s = linked(name);
+    if u.isnil(s) or (s.kind != cast.SK_FUNC) {
+        let none = u.newn.[*mut cty.CType](1);
+        s = new_sym(cast.SK_FUNC, name, sp, cty.function(cty.t_int, none[0..0], false, false));
+        s.linkage = cast.LK_EXTERNAL;
+        set_linked(name, s);
+    }
+    declare(name, s);
+}
+
+/// The function whose body is being analyzed, or nil.
+pub fn cur_fn() *mut cast.CSym {
+    return S.cur_fn;
+}
+
+pub fn set_cur_fn(f: *mut cast.CSym) void {
+    S.cur_fn = f;
+}
+
+// -----------------------------------------------------------------------------
+// The walk
+// -----------------------------------------------------------------------------
+
+/// Analyzes the translation unit `t` under options `o` (with the hooks
+/// installed: csema_stmt.analyze). Errors are reported through diag.ax; the
+/// unit is complete enough to walk either way, but only one without errors
+/// is the typed tree described above.
+pub fn run(t: *mut cast.Unit, o: *co.COptions) *mut CUnit {
+    cty.init(o);
+    S = u.new.[State]();
+    S.o = o;
+    S.ordinary = new_space();
+    S.tags = new_space();
+    S.linked = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    S.unit = u.new.[CUnit]();
+    for d in t.decls.items() {
+        hooks.external(d);
+    }
+    // tentative definitions with no definition are definitions with a zero
+    // initializer (6.9.2p2): an array without a length gets one element
+    for s in S.unit.objects.items() {
+        if s.tentative and not s.defined {
+            s.defined = true;
+            if (s.ty.kind == cty.TK_ARRAY) and not s.ty.has_len {
+                s.ty = cty.qualify(cty.array_of(s.ty.elem, 1, true), s.ty.quals);
+            }
+            if not cty.is_complete(s.ty) {
+                err(s.span, "C3007", u.f2("the definition of '%s' has incomplete type %s", s.name, tq(s.ty)));
+            }
+        }
+    }
+    return S.unit;
+}
+
+/// Adds a defined function to the unit.
+pub fn add_function(s: *mut cast.CSym) void {
+    S.unit.funcs.push(s);
+    if u.str_eq(s.name, "main") and (s.linkage == cast.LK_EXTERNAL) {
+        S.unit.main = s;
+    }
+}
+
+/// Adds an object with static storage duration defined (or tentatively
+/// defined) here to the unit.
+pub fn add_object(s: *mut cast.CSym) void {
+    S.unit.objects.push(s);
+}

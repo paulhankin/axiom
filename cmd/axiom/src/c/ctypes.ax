@@ -1,0 +1,922 @@
+// =============================================================================
+// ctypes.ax - C types: their representation, construction, layout for the
+// target, compatibility and composite types, the integer promotions and the
+// usual arithmetic conversions (C17 6.2.5, 6.2.7, 6.3.1, 6.7.2.1).
+//
+// A type is a CType. The unqualified basic types are made once (init) and
+// shared; a qualified type is another CType with the same contents whose
+// `unq` is the unqualified one (each type keeps its qualified versions, so
+// that they are made once too); pointer types are made once per pointee.
+// Array and function types are made as needed and compared structurally;
+// structure, union and enumeration types are identified by their TagInfo
+// (each struct-or-union-specifier or enum-specifier that declares a new tag
+// makes one). Typedef names are transparent: a typedef's type is the type.
+//
+// The integer types follow the build's choices (copts.ax): plain char is
+// signed or unsigned, int is 16, 32 or 64 bits, long 32 or 64; short is 16
+// bits and long long 64. Their size and alignment are their width in bytes,
+// as for every scalar on the targets (wasm32, wasm64, x86-64, AArch64), so a
+// structure's layout is the natural one: each member at the next offset
+// that is a multiple of its alignment, the structure's alignment the largest
+// of its members', its size rounded up to that.
+// =============================================================================
+import "../util.ax" as u;
+import "copts.ax" as co;
+
+// What a CType is (CType.kind). The integer kinds are in order of rank,
+// signed before unsigned.
+pub const TK_ERROR: i32 = 0;  // the type of an erroneous expression: compatible with anything, never reported
+pub const TK_VOID: i32 = 1;
+pub const TK_BOOL: i32 = 2;
+pub const TK_CHAR: i32 = 3;
+pub const TK_SCHAR: i32 = 4;
+pub const TK_UCHAR: i32 = 5;
+pub const TK_SHORT: i32 = 6;
+pub const TK_USHORT: i32 = 7;
+pub const TK_INT: i32 = 8;
+pub const TK_UINT: i32 = 9;
+pub const TK_LONG: i32 = 10;
+pub const TK_ULONG: i32 = 11;
+pub const TK_LLONG: i32 = 12;
+pub const TK_ULLONG: i32 = 13;
+pub const TK_ENUM: i32 = 14;  // an integer type (its tag's `base`)
+pub const TK_FLOAT: i32 = 15;
+pub const TK_DOUBLE: i32 = 16;
+pub const TK_LDOUBLE: i32 = 17;  // long double: the representation of double, a distinct type
+pub const TK_POINTER: i32 = 18;
+pub const TK_ARRAY: i32 = 19;
+pub const TK_FUNCTION: i32 = 20;
+pub const TK_STRUCT: i32 = 21;
+pub const TK_UNION: i32 = 22;
+
+// Qualifiers (CType.quals): as cast.Q_.
+pub const Q_CONST: i32 = 1;
+pub const Q_VOLATILE: i32 = 2;
+pub const Q_RESTRICT: i32 = 4;
+pub const Q_ATOMIC: i32 = 8;
+
+/// A member of a structure or union.
+pub struct Member {
+    name: []u8,  // empty for an unnamed member (an anonymous structure or union)
+    span: u.Span,
+    ty: *mut CType,
+    offset: u64,
+    index: i32,  // its place among the members
+}
+
+/// What a structure, union or enumeration type is: its tag, members and
+/// layout (or, for an enumeration, its compatible integer type).
+pub struct TagInfo {
+    kind: i32,   // TK_STRUCT, TK_UNION or TK_ENUM
+    name: []u8,  // empty for an untagged one
+    span: u.Span,
+    complete: bool,
+    defining: bool,  // its member list is being read (a member of its own type is incomplete)
+    members: u.List.[*mut Member],
+    size: u64,
+    align: u64,
+    has_flex: bool,    // a structure that ends with a flexible array member
+    base: *mut CType,  // TK_ENUM: the compatible integer type
+    id: i32,
+}
+
+pub struct CType {
+    kind: i32,
+    quals: i32,       // Q_ bits
+    unq: *mut CType,  // the unqualified version (itself if quals is 0)
+    // integers: their width in bits, signedness and rank (6.3.1.1)
+    bits: i32,
+    is_signed: bool,
+    rank: i32,
+    // pointer, array: the referenced or element type
+    elem: *mut CType,
+    // array
+    len: u64,
+    has_len: bool,  // complete (a length is known)
+    vla: bool,      // a variable length array (not supported yet: the length is unknown)
+    // function
+    ret: *mut CType,
+    params: []mut *mut CType,  // adjusted parameter types (arrays and functions become pointers), unqualified
+    proto: bool,               // a prototype (otherwise: an old-style declaration, `()` before C23)
+    variadic: bool,            // ends with `...`
+    // structure, union, enumeration
+    tag: *mut TagInfo,
+    // made once: the pointer to it, its qualified versions (by quals)
+    ptr: *mut CType,
+    qv: [16]*mut CType,
+    backend: *mut void,  // IR generation's type for it (unqualified types only)
+    id: i32,
+}
+
+let mut g_opts: *co.COptions = @ptr_from_int(*co.COptions, 0);
+let mut g_next_id: i32 = 0;
+
+pub let mut t_error: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_void: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_bool: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_char: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_schar: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_uchar: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_short: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_ushort: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_int: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_uint: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_long: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_ulong: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_llong: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_ullong: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_float: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_double: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_ldouble: *mut CType = @ptr_from_int(*mut CType, 0);
+// the implementation's choices among them
+pub let mut t_size: *mut CType = @ptr_from_int(*mut CType, 0);     // size_t: sizeof, _Alignof
+pub let mut t_ptrdiff: *mut CType = @ptr_from_int(*mut CType, 0);  // ptrdiff_t: pointer differences
+pub let mut t_wchar: *mut CType = @ptr_from_int(*mut CType, 0);    // wchar_t: L'x', L"..."
+pub let mut t_char16: *mut CType = @ptr_from_int(*mut CType, 0);   // char16_t (uint_least16_t)
+pub let mut t_char32: *mut CType = @ptr_from_int(*mut CType, 0);   // char32_t (uint_least32_t)
+pub let mut t_int64: *mut CType = @ptr_from_int(*mut CType, 0);    // __axiom_int64: long or long long
+pub let mut ptr_bytes: u64 = 8;
+
+fn new_type(k: i32) *mut CType {
+    let t = u.new.[CType]();
+    t.kind = k;
+    t.unq = t;
+    g_next_id += 1;
+    t.id = g_next_id;
+    return t;
+}
+
+fn int_type(k: i32, bits: i32, signed_: bool, rank: i32) *mut CType {
+    let t = new_type(k);
+    t.bits = bits;
+    t.is_signed = signed_;
+    t.rank = rank;
+    return t;
+}
+
+// The standard integer type of `bits` bits and signedness `sg`, among
+// int, long, long long, short (in that order of preference); nil if none.
+fn int_of_width(bits: i32, sg: bool) *mut CType {
+    let cands: [4]*mut CType = [t_int, t_long, t_llong, t_short];
+    for c in cands {
+        if c.bits == bits {
+            return pick_sign(c, sg);
+        }
+    }
+    return u.nil.[CType]();
+}
+
+fn pick_sign(t: *mut CType, sg: bool) *mut CType {
+    if sg {
+        return to_signed(t);
+    }
+    return to_unsigned(t);
+}
+
+/// Makes the basic types for the options `o` (once per translation unit).
+pub fn init(o: *co.COptions) void {
+    g_opts = o;
+    ptr_bytes = @as(u64, @bit_cast(u32, o.ptr_bits / 8));
+    t_error = new_type(TK_ERROR);
+    t_void = new_type(TK_VOID);
+    t_bool = int_type(TK_BOOL, 8, false, 0);
+    t_char = int_type(TK_CHAR, 8, o.char_signed, 1);
+    t_schar = int_type(TK_SCHAR, 8, true, 1);
+    t_uchar = int_type(TK_UCHAR, 8, false, 1);
+    t_short = int_type(TK_SHORT, 16, true, 2);
+    t_ushort = int_type(TK_USHORT, 16, false, 2);
+    t_int = int_type(TK_INT, o.int_bits, true, 3);
+    t_uint = int_type(TK_UINT, o.int_bits, false, 3);
+    t_long = int_type(TK_LONG, o.long_bits, true, 4);
+    t_ulong = int_type(TK_ULONG, o.long_bits, false, 4);
+    t_llong = int_type(TK_LLONG, 64, true, 5);
+    t_ullong = int_type(TK_ULLONG, 64, false, 5);
+    t_float = new_type(TK_FLOAT);
+    t_float.bits = 32;
+    t_double = new_type(TK_DOUBLE);
+    t_double.bits = 64;
+    t_ldouble = new_type(TK_LDOUBLE);
+    t_ldouble.bits = 64;
+    // size_t and ptrdiff_t: the first of int, long and long long at least as
+    // wide as a pointer; wchar_t: (unsigned) short when 16 bits, else int,
+    // or long when int is 16 bits (as <stddef.h> says)
+    t_size = t_ullong;
+    if t_uint.bits >= o.ptr_bits {
+        t_size = t_uint;
+    } else if t_ulong.bits >= o.ptr_bits {
+        t_size = t_ulong;
+    }
+    t_ptrdiff = to_signed(t_size);
+    if o.wchar_bits == 16 {
+        t_wchar = pick_sign(t_short, o.wchar_signed);
+    } else if (t_int.bits == 32) or (t_long.bits != 32) {
+        t_wchar = pick_sign(t_int, o.wchar_signed);
+    } else {
+        t_wchar = pick_sign(t_long, o.wchar_signed);
+    }
+    t_char16 = t_ushort;
+    t_char32 = int_of_width(32, false);
+    if u.isnil(t_char32) {
+        t_char32 = t_ulong;
+    }
+    t_int64 = t_llong;
+    if t_long.bits == 64 {
+        t_int64 = t_long;
+    }
+}
+
+/// The standard in force.
+pub fn std() i32 {
+    return g_opts.std;
+}
+
+// -----------------------------------------------------------------------------
+// Construction
+// -----------------------------------------------------------------------------
+
+/// `t` with the qualifiers `q` added.
+pub fn qualify(t: *mut CType, q: i32) *mut CType {
+    if (q == 0) or (t.kind == TK_ERROR) {
+        return t;
+    }
+    let all = t.quals | q;
+    if all == t.quals {
+        return t;
+    }
+    let b = t.unq;
+    let k = @int_cast(usize, all & 15);
+    if u.isnil(b.qv[k]) {
+        let n = u.new.[CType]();
+        n.* = b.*;
+        n.quals = all;
+        n.unq = b;
+        n.ptr = u.nil.[CType]();
+        for j in @as(usize, 0)..16 {
+            n.qv[j] = u.nil.[CType]();
+        }
+        g_next_id += 1;
+        n.id = g_next_id;
+        b.qv[k] = n;
+    }
+    return b.qv[k];
+}
+
+/// `t` without qualifiers.
+pub fn unqual(t: *mut CType) *mut CType {
+    return t.unq;
+}
+
+/// A pointer to `t`.
+pub fn pointer_to(t: *mut CType) *mut CType {
+    if u.isnil(t.ptr) {
+        let p = new_type(TK_POINTER);
+        p.elem = t;
+        p.bits = @bit_cast(i32, @truncate(u32, ptr_bytes * 8));
+        t.ptr = p;
+    }
+    return t.ptr;
+}
+
+/// An array of `n` (has_len) elements of type `t`.
+pub fn array_of(t: *mut CType, n: u64, has_len: bool) *mut CType {
+    let a = new_type(TK_ARRAY);
+    a.elem = t;
+    a.len = n;
+    a.has_len = has_len;
+    return a;
+}
+
+/// A function type returning `ret`.
+pub fn function(ret: *mut CType, params: []mut *mut CType, proto: bool, variadic: bool) *mut CType {
+    let f = new_type(TK_FUNCTION);
+    f.ret = ret;
+    f.params = params;
+    f.proto = proto;
+    f.variadic = variadic;
+    return f;
+}
+
+/// A new structure, union or enumeration type (incomplete), with tag `name`.
+pub fn new_tagged(kind: i32, name: []u8, sp: u.Span) *mut CType {
+    let ti = u.new.[TagInfo]();
+    ti.kind = kind;
+    ti.name = name;
+    ti.span = sp;
+    ti.align = 1;
+    g_next_id += 1;
+    ti.id = g_next_id;
+    let t = new_type(kind);
+    t.tag = ti;
+    if kind == TK_ENUM {
+        ti.base = t_uint;
+        t.bits = t_uint.bits;
+        t.is_signed = false;
+        t.rank = t_uint.rank;
+    }
+    return t;
+}
+
+/// Sets an enumeration's compatible integer type (once its constants are
+/// known); `t` is the enumeration type.
+pub fn set_enum_base(t: *mut CType, base: *mut CType) void {
+    let b = t.unq;
+    b.tag.base = base;
+    b.tag.complete = true;
+    b.bits = base.bits;
+    b.is_signed = base.is_signed;
+    b.rank = base.rank;
+    for j in @as(usize, 0)..16 {
+        let q = b.qv[j];
+        if u.notnil(q) {
+            q.bits = base.bits;
+            q.is_signed = base.is_signed;
+            q.rank = base.rank;
+        }
+    }
+}
+
+/// Lays out a structure or union whose members are in ti.members (their
+/// types complete, but a structure's last may be an array without a length:
+/// a flexible array member): sets their offsets, its size and alignment, and
+/// makes it complete.
+pub fn layout(ti: *mut TagInfo) void {
+    let mut off: u64 = 0;
+    let mut al: u64 = 1;
+    let mut size: u64 = 0;
+    for m in ti.members.items() {
+        let ma = align_of(m.ty);
+        let ms = size_of(m.ty);
+        if ma > al {
+            al = ma;
+        }
+        if ti.kind == TK_UNION {
+            m.offset = 0;
+            if ms > size {
+                size = ms;
+            }
+        } else {
+            off = round_up(off, ma);
+            m.offset = off;
+            off += ms;
+            if (m.ty.kind == TK_ARRAY) and not m.ty.has_len {
+                ti.has_flex = true;
+            }
+        }
+    }
+    if ti.kind == TK_STRUCT {
+        size = off;
+    }
+    ti.size = round_up(size, al);
+    ti.align = al;
+    ti.complete = true;
+}
+
+pub fn round_up(x: u64, a: u64) u64 {
+    if a <= 1 {
+        return x;
+    }
+    return ((x + a) - 1) / a * a;
+}
+
+// -----------------------------------------------------------------------------
+// Classification
+// -----------------------------------------------------------------------------
+
+/// An integer type (6.2.5p17: char, the signed and unsigned integer types, enumerations).
+pub fn is_integer(t: *CType) bool {
+    return (t.kind >= TK_BOOL) and (t.kind <= TK_ENUM);
+}
+
+pub fn is_floating(t: *CType) bool {
+    return (t.kind >= TK_FLOAT) and (t.kind <= TK_LDOUBLE);
+}
+
+/// An arithmetic type: integer or floating.
+pub fn is_arith(t: *CType) bool {
+    return (t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE);
+}
+
+/// A scalar type: arithmetic or pointer.
+pub fn is_scalar(t: *CType) bool {
+    return (t.kind >= TK_BOOL) and (t.kind <= TK_POINTER);
+}
+
+pub fn is_pointer(t: *CType) bool {
+    return t.kind == TK_POINTER;
+}
+
+pub fn is_void(t: *CType) bool {
+    return t.kind == TK_VOID;
+}
+
+/// A structure or union type.
+pub fn is_record(t: *CType) bool {
+    return (t.kind == TK_STRUCT) or (t.kind == TK_UNION);
+}
+
+pub fn is_aggregate(t: *CType) bool {
+    return (t.kind == TK_ARRAY) or (t.kind == TK_STRUCT);
+}
+
+/// A character type: char, signed char, unsigned char.
+pub fn is_char(t: *CType) bool {
+    return (t.kind >= TK_CHAR) and (t.kind <= TK_UCHAR);
+}
+
+pub fn is_func(t: *CType) bool {
+    return t.kind == TK_FUNCTION;
+}
+
+pub fn is_error(t: *CType) bool {
+    return t.kind == TK_ERROR;
+}
+
+/// An integer type whose values are signed (an enumeration: its base's).
+pub fn is_signed_int(t: *CType) bool {
+    return is_integer(t) and t.is_signed;
+}
+
+/// A complete object type (sizeof applies): not void, a function, an array
+/// without a length, or an incomplete structure, union or enumeration.
+pub fn is_complete(t: *CType) bool {
+    let k = t.kind;
+    if (k == TK_VOID) or (k == TK_FUNCTION) {
+        return false;
+    }
+    if k == TK_ARRAY {
+        return t.has_len and not t.vla and is_complete(t.elem);
+    }
+    if (k == TK_STRUCT) or (k == TK_UNION) or (k == TK_ENUM) {
+        return t.tag.complete and not t.tag.defining;
+    }
+    return true;
+}
+
+/// A null pointer constant's type may be any integer type; `void *`.
+pub fn is_void_ptr(t: *CType) bool {
+    return (t.kind == TK_POINTER) and (t.elem.kind == TK_VOID);
+}
+
+// -----------------------------------------------------------------------------
+// Size and alignment
+// -----------------------------------------------------------------------------
+
+/// The size of a complete object type (0 for others).
+pub fn size_of(t: *CType) u64 {
+    let k = t.kind;
+    if is_integer(t) or (k == TK_POINTER) {
+        return @as(u64, @bit_cast(u32, t.bits / 8));
+    }
+    if k == TK_FLOAT {
+        return 4;
+    }
+    if (k == TK_DOUBLE) or (k == TK_LDOUBLE) {
+        return 8;
+    }
+    if k == TK_ARRAY {
+        if not t.has_len {
+            return 0;
+        }
+        return t.len *% size_of(t.elem);
+    }
+    if (k == TK_STRUCT) or (k == TK_UNION) {
+        return t.tag.size;
+    }
+    return 0;
+}
+
+/// The alignment of an object type (1 for others).
+pub fn align_of(t: *CType) u64 {
+    let k = t.kind;
+    if k == TK_ARRAY {
+        return align_of(t.elem);
+    }
+    if (k == TK_STRUCT) or (k == TK_UNION) {
+        return t.tag.align;
+    }
+    let s = size_of(t);
+    if s == 0 {
+        return 1;
+    }
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+// Integer values
+// -----------------------------------------------------------------------------
+
+/// The low `bits` bits of x, sign-extended when `sg` (the canonical form of
+/// an integer constant's bits).
+pub fn wrap_bits(x: u64, bits: i32, sg: bool) u64 {
+    if bits >= 64 {
+        return x;
+    }
+    let sh = @as(u32, @bit_cast(u32, 64 - bits));
+    if sg {
+        return @bit_cast(u64, @bit_cast(i64, x << sh) >> sh);
+    }
+    return (x << sh) >> sh;
+}
+
+/// x converted to integer type t (6.3.1.3; a signed result wraps, as the
+/// implementation defines). _Bool: 0 or 1.
+pub fn wrap(t: *CType, x: u64) u64 {
+    if t.kind == TK_BOOL {
+        if x != 0 {
+            return 1;
+        }
+        return 0;
+    }
+    return wrap_bits(x, t.bits, t.is_signed);
+}
+
+/// The largest value of integer type t, as bits.
+pub fn int_max(t: *CType) u64 {
+    if t.kind == TK_BOOL {
+        return 1;
+    }
+    if t.is_signed {
+        return (@as(u64, 1) << @as(u32, @bit_cast(u32, t.bits - 1))) - 1;
+    }
+    if t.bits >= 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    return (@as(u64, 1) << @as(u32, @bit_cast(u32, t.bits))) - 1;
+}
+
+/// Does integer type t hold the value v (the bits of a value of type `from`)?
+pub fn fits(t: *CType, v: u64, from_signed: bool) bool {
+    let neg = from_signed and (@bit_cast(i64, v) < 0);
+    if neg {
+        if not t.is_signed {
+            return false;
+        }
+        let min = -@bit_cast(i64, int_max(t)) - 1;
+        return @bit_cast(i64, v) >= min;
+    }
+    return v <= int_max(t);
+}
+
+// -----------------------------------------------------------------------------
+// Conversions (6.3.1)
+// -----------------------------------------------------------------------------
+
+/// The signed integer type of t's rank.
+pub fn to_signed(t: *mut CType) *mut CType {
+    let k = t.unq.kind;
+    if (k == TK_UCHAR) or (k == TK_CHAR) {
+        return t_schar;
+    }
+    if k == TK_USHORT {
+        return t_short;
+    }
+    if k == TK_UINT {
+        return t_int;
+    }
+    if k == TK_ULONG {
+        return t_long;
+    }
+    if k == TK_ULLONG {
+        return t_llong;
+    }
+    if k == TK_ENUM {
+        return to_signed(t.unq.tag.base);
+    }
+    return t.unq;
+}
+
+/// The unsigned integer type of t's rank.
+pub fn to_unsigned(t: *mut CType) *mut CType {
+    let k = t.unq.kind;
+    if (k == TK_SCHAR) or (k == TK_CHAR) {
+        return t_uchar;
+    }
+    if k == TK_SHORT {
+        return t_ushort;
+    }
+    if k == TK_INT {
+        return t_uint;
+    }
+    if k == TK_LONG {
+        return t_ulong;
+    }
+    if k == TK_LLONG {
+        return t_ullong;
+    }
+    if k == TK_ENUM {
+        return to_unsigned(t.unq.tag.base);
+    }
+    return t.unq;
+}
+
+/// The integer promotions (6.3.1.1p2) of an arithmetic type (others:
+/// unqualified, unchanged). An enumeration is first its compatible type.
+pub fn promote(t0: *mut CType) *mut CType {
+    let mut t = t0.unq;
+    if t.kind == TK_ENUM {
+        t = t.tag.base;
+    }
+    if not is_integer(t) or (t.rank >= t_int.rank) {
+        return t;
+    }
+    // int holds every value of a narrower type, and of one as wide that is signed
+    if (t.bits < t_int.bits) or t.is_signed {
+        return t_int;
+    }
+    return t_uint;
+}
+
+/// The default argument promotions (6.5.2.2p6): the integer promotions, and
+/// float to double.
+pub fn arg_promote(t: *mut CType) *mut CType {
+    if t.unq.kind == TK_FLOAT {
+        return t_double;
+    }
+    return promote(t);
+}
+
+/// The common real type of the usual arithmetic conversions (6.3.1.8) of
+/// two arithmetic types.
+pub fn common_type(a0: *mut CType, b0: *mut CType) *mut CType {
+    let a = promote(a0);
+    let b = promote(b0);
+    if (a.kind == TK_LDOUBLE) or (b.kind == TK_LDOUBLE) {
+        return t_ldouble;
+    }
+    if (a.kind == TK_DOUBLE) or (b.kind == TK_DOUBLE) {
+        return t_double;
+    }
+    if (a.kind == TK_FLOAT) or (b.kind == TK_FLOAT) {
+        return t_float;
+    }
+    if a == b {
+        return a;
+    }
+    if a.is_signed == b.is_signed {
+        if a.rank >= b.rank {
+            return a;
+        }
+        return b;
+    }
+    let mut s = a;
+    let mut uu = b;
+    if not a.is_signed {
+        s = b;
+        uu = a;
+    }
+    if uu.rank >= s.rank {
+        return uu;
+    }
+    if s.bits > uu.bits {
+        return s;
+    }
+    return to_unsigned(s);
+}
+
+// -----------------------------------------------------------------------------
+// Compatibility and composite types (6.2.7)
+// -----------------------------------------------------------------------------
+
+/// Are a and b compatible types (qualifiers included)?
+pub fn compatible(a: *mut CType, b: *mut CType) bool {
+    if (a.kind == TK_ERROR) or (b.kind == TK_ERROR) {
+        return true;
+    }
+    if a.quals != b.quals {
+        return false;
+    }
+    return compatible_unq(a.unq, b.unq);
+}
+
+/// Are a and b compatible once their own (outermost) qualifiers are ignored?
+pub fn compatible_unq(a0: *mut CType, b0: *mut CType) bool {
+    let a = a0.unq;
+    let b = b0.unq;
+    if a == b {
+        return true;
+    }
+    if (a.kind == TK_ERROR) or (b.kind == TK_ERROR) {
+        return true;
+    }
+    // an enumeration is compatible with its integer type
+    if (a.kind == TK_ENUM) and (b.kind != TK_ENUM) {
+        return a.tag.base == b;
+    }
+    if (b.kind == TK_ENUM) and (a.kind != TK_ENUM) {
+        return b.tag.base == a;
+    }
+    if a.kind != b.kind {
+        return false;
+    }
+    let k = a.kind;
+    if k == TK_POINTER {
+        return compatible(a.elem, b.elem);
+    }
+    if k == TK_ARRAY {
+        if not compatible(a.elem, b.elem) {
+            return false;
+        }
+        if a.has_len and b.has_len and not a.vla and not b.vla {
+            return a.len == b.len;
+        }
+        return true;
+    }
+    if k == TK_FUNCTION {
+        if not compatible(a.ret, b.ret) {
+            return false;
+        }
+        if a.proto and b.proto {
+            if (a.params.len != b.params.len) or (a.variadic != b.variadic) {
+                return false;
+            }
+            for i in 0..a.params.len {
+                if not compatible_unq(a.params[i], b.params[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if a.proto or b.proto {
+            // one has no prototype: the other's parameters must be ones the
+            // default argument promotions do not change, and not variadic (6.7.6.3p15)
+            let p = pick_proto(a, b);
+            if p.variadic {
+                return false;
+            }
+            for x in p.params {
+                if arg_promote(x) != x.unq {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    if (k == TK_STRUCT) or (k == TK_UNION) or (k == TK_ENUM) {
+        return a.tag == b.tag;
+    }
+    return false;
+}
+
+fn pick_proto(a: *mut CType, b: *mut CType) *mut CType {
+    if a.proto {
+        return a;
+    }
+    return b;
+}
+
+/// The composite type of two compatible types (6.2.7p3).
+pub fn composite(a: *mut CType, b: *mut CType) *mut CType {
+    if a.kind == TK_ERROR {
+        return b;
+    }
+    if (b.kind == TK_ERROR) or (a == b) {
+        return a;
+    }
+    let k = a.kind;
+    if (k == TK_ARRAY) and (b.kind == TK_ARRAY) {
+        let el = composite(a.elem, b.elem);
+        if a.has_len {
+            return qualify(array_of(el, a.len, true), a.quals);
+        }
+        return qualify(array_of(el, b.len, b.has_len), a.quals);
+    }
+    if (k == TK_POINTER) and (b.kind == TK_POINTER) {
+        return qualify(pointer_to(composite(a.elem, b.elem)), a.quals);
+    }
+    if (k == TK_FUNCTION) and (b.kind == TK_FUNCTION) {
+        let ret = composite(a.ret, b.ret);
+        if a.proto and b.proto {
+            let n = a.params.len;
+            let ps = u.newn.[*mut CType](n + 1);
+            for i in 0..n {
+                ps[i] = composite(a.params[i], b.params[i]);
+            }
+            return function(ret, ps[0..n], true, a.variadic);
+        }
+        let p = pick_proto(a, b);
+        return function(ret, p.params, p.proto, p.variadic);
+    }
+    return a;
+}
+
+// -----------------------------------------------------------------------------
+// Members
+// -----------------------------------------------------------------------------
+
+/// A member found by name: the member, and its offset from the start of the
+/// structure or union searched (through unnamed members, C11 6.7.2.1p13).
+pub struct Found {
+    m: *mut Member,
+    offset: u64,
+}
+
+/// The member `name` of structure or union type t (complete), or one with m nil.
+pub fn find_member(t: *mut CType, name: []u8) Found {
+    for m in t.unq.tag.members.items() {
+        if m.name.len == 0 {
+            if is_record(m.ty) {
+                let f = find_member(m.ty, name);
+                if u.notnil(f.m) {
+                    return Found.{ m: f.m, offset: f.offset + m.offset };
+                }
+            }
+        } else if u.same(m.name, name) {
+            return Found.{ m: m, offset: m.offset };
+        }
+    }
+    return Found.{ m: u.nil.[Member](), offset: 0 };
+}
+
+// -----------------------------------------------------------------------------
+// Spelling (for diagnostics)
+// -----------------------------------------------------------------------------
+
+fn base_name(t: *CType) []u8 {
+    let names = ["<error>", "void", "_Bool", "char", "signed char", "unsigned char", "short", "unsigned short", "int",
+                 "unsigned int", "long", "unsigned long", "long long", "unsigned long long", "enum", "float", "double",
+                 "long double"];
+    let k = t.kind;
+    if (k == TK_BOOL) and (g_opts.std >= co.C23) {
+        return "bool";
+    }
+    if (k == TK_STRUCT) or (k == TK_UNION) or (k == TK_ENUM) {
+        let kw = u.pick(k == TK_STRUCT, "struct", u.pick(k == TK_UNION, "union", "enum"));
+        if t.tag.name.len == 0 {
+            return u.cat2(kw, " <anonymous>");
+        }
+        return u.f2("%s %s", kw, t.tag.name);
+    }
+    return names[@int_cast(usize, k)];
+}
+
+fn quals_text(q: i32) []u8 {
+    let mut b = u.Buf.init();
+    if (q & Q_CONST) != 0 {
+        b.s("const ");
+    }
+    if (q & Q_VOLATILE) != 0 {
+        b.s("volatile ");
+    }
+    if (q & Q_RESTRICT) != 0 {
+        b.s("restrict ");
+    }
+    if (q & Q_ATOMIC) != 0 {
+        b.s("_Atomic ");
+    }
+    return b.done();
+}
+
+// t spelled as a declaration of `inner` (a declarator, maybe empty).
+fn spell(t: *CType, inner: []u8) []u8 {
+    let k = t.kind;
+    if k == TK_POINTER {
+        let mut q = quals_text(t.quals);
+        if q.len > 0 {
+            q = q[0..q.len - 1];
+            if inner.len > 0 {
+                q = u.cat2(q, " ");
+            }
+        }
+        let mut d = u.cat3("*", q, inner);
+        let ek = t.elem.kind;
+        if (ek == TK_ARRAY) or (ek == TK_FUNCTION) {
+            d = u.cat3("(", d, ")");
+        }
+        return spell(t.elem, d);
+    }
+    if k == TK_ARRAY {
+        let mut n: []u8 = "";
+        if t.has_len {
+            n = u.udec(t.len);
+        }
+        return spell(t.elem, u.f2("%s[%s]", inner, n));
+    }
+    if k == TK_FUNCTION {
+        let mut b = u.Buf.init();
+        b.s(inner);
+        b.s("(");
+        for i in 0..t.params.len {
+            if i > 0 {
+                b.s(", ");
+            }
+            b.s(spell(t.params[i], ""));
+        }
+        if t.variadic {
+            b.s(u.pick(t.params.len > 0, ", ...", "..."));
+        } else if t.proto and (t.params.len == 0) {
+            b.s("void");
+        }
+        b.s(")");
+        return spell(t.ret, b.done());
+    }
+    let base = u.cat2(quals_text(t.quals), base_name(t));
+    if inner.len == 0 {
+        return base;
+    }
+    return u.cat3(base, " ", inner);
+}
+
+/// The type as C spells it in a type name: "unsigned long", "char *", "int (*)[3]".
+pub fn type_str(t: *CType) []u8 {
+    return spell(t, "");
+}

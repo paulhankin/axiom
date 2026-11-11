@@ -1,0 +1,716 @@
+// =============================================================================
+// cgen.ax - IR generation for a C translation unit (its typed tree: csema.ax)
+// into the compiler's IR module (ir.ax), next to the Axiom program that
+// starts it (std/internal/runtime/c_start.ax): the module's functions and
+// objects, their symbol names and linkage, the data of objects with static
+// storage duration, string literals, the IR types of C types and the
+// signatures of C functions. cgen_expr.ax and cgen_stmt.ax generate the
+// code of functions; cgen_stmt.generate is the entry point.
+//
+// Representation: a C scalar is an IR value of the type lty gives (_Bool an
+// i8 that is 0 or 1; every integer its width); an object is memory, reached
+// by its address; the value of a structure or union is the address of
+// memory holding it (an object's own, or a temporary's). Functions take and
+// return structures and unions as Axiom code does its own: those of at
+// most 32 bytes as aggregate values (which lowering passes as their
+// leaves), larger ones by address (EXT_BYVAL, EXT_SRET). That is not each
+// platform's C calling convention for them yet; scalars follow it (integer
+// arguments and results narrower than 32 bits are sign- or zero-extended).
+//
+// C code has none of Axiom's run-time checks: no bounds or overflow checks,
+// no shadow-stack records (on native targets, no frame-table entries for
+// its calls: a crash report skips its frames).
+// =============================================================================
+import "../diag.ax" as dg;
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cconst.ax" as cc;
+import "csema.ax" as cs;
+import "ctypes.ax" as cty;
+
+/// The symbol C's main is generated under, and the one the start-up calls.
+pub let MAIN_SYMBOL: []u8 = "axiom.c.main";
+pub let START_SYMBOL: []u8 = "__axiom_c_main";
+
+// -----------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------
+
+pub let mut M: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+pub let mut B: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+pub let mut is_wasm: bool = false;
+pub let mut T_i1: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub let mut T_i8: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub let mut T_i32: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub let mut T_isz: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub let mut T_ptr: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+pub let mut T_void: *mut ir.Ty = @ptr_from_int(*mut ir.Ty, 0);
+
+/// The function being generated.
+pub struct FnState {
+    sym: *mut cast.CSym,
+    f: *mut ir.Func,
+    entry: *mut ir.Block,  // the allocas
+    sret: *mut ir.Value,   // the result's address (a large structure or union), or nil
+    ret: *mut cty.CType,
+    sig: Sig,
+}
+
+pub let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
+
+/// The code generation of a function's body (cgen_stmt.ax).
+pub struct Hooks {
+    body: fn(*mut cast.CSym) void,
+}
+
+fn no_body(s: *mut cast.CSym) void {
+    _ = s;
+}
+
+pub let mut hooks: Hooks = Hooks.{ body: no_body };
+
+let mut strings: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                       vals: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                       cap: 0, len: 0 };
+
+fn internal_error(msg: []u8) void {
+    u.die(u.cat2("internal compiler error (C front end): ", msg));
+}
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+
+/// The IR type of objects of C type t (and of its scalar values).
+pub fn lty(t0: *mut cty.CType) *mut ir.Ty {
+    let t = t0.unq;
+    let k = t.kind;
+    if cty.is_integer(t) {
+        return ir.t_int(t.bits);
+    }
+    if k == cty.TK_POINTER {
+        return T_ptr;
+    }
+    if k == cty.TK_FLOAT {
+        return ir.t_float(32);
+    }
+    if (k == cty.TK_DOUBLE) or (k == cty.TK_LDOUBLE) {
+        return ir.t_float(64);
+    }
+    if k == cty.TK_ARRAY {
+        let mut n: u64 = 0;
+        if t.has_len {
+            n = t.len;
+        }
+        return ir.t_array(lty(t.elem), n);
+    }
+    if (k == cty.TK_STRUCT) or (k == cty.TK_UNION) {
+        return record_ty(t);
+    }
+    if k == cty.TK_VOID {
+        return T_void;
+    }
+    if k == cty.TK_FUNCTION {
+        return T_ptr;
+    }
+    internal_error(u.cat2("no IR type for ", cty.type_str(t)));
+    return T_void;
+}
+
+fn unit_ty(a: u64) *mut ir.Ty {
+    if a >= 8 {
+        return ir.t_int(64);
+    }
+    if a >= 4 {
+        return ir.t_int(32);
+    }
+    if a >= 2 {
+        return ir.t_int(16);
+    }
+    return T_i8;
+}
+
+// A structure's IR type: its members in order, which the IR lays out as C
+// does; a union's: as many units of its alignment as fill it.
+fn record_ty(t: *mut cty.CType) *mut ir.Ty {
+    if not u.isvnil(t.backend) {
+        return @ptr_cast(*mut ir.Ty, t.backend);
+    }
+    let ti = t.tag;
+    let mut name = ti.name;
+    if name.len == 0 {
+        name = "anon";
+    }
+    let r = ir.t_named_struct(u.f3("%s.%s.%s", u.pick(ti.kind == cty.TK_UNION, "union", "struct"), name,
+                                   u.idec(ti.id)));
+    t.backend = @ptr_cast(*mut void, r);
+    if ti.kind == cty.TK_STRUCT {
+        let n = ti.members.len;
+        let fs = u.newn.[*mut ir.Ty](n + 1);
+        for i in 0..n {
+            fs[i] = lty(ti.members.get(i).ty);
+        }
+        ir.struct_set_body(r, fs[0..n]);
+        let mut same = (r.size == ti.size) and (r.align == ti.align);
+        for i in 0..n {
+            if r.offs[i] != ti.members.get(i).offset {
+                same = false;
+            }
+        }
+        if same {
+            return r;
+        }
+    }
+    // (a union, or a structure the IR would lay out otherwise)
+    let unit = unit_ty(ti.align);
+    let mut cnt = ti.size / unit.size;
+    if cnt == 0 {
+        cnt = 1;
+    }
+    let mut one: [1]*mut ir.Ty = [ir.t_array(unit, cnt)];
+    ir.struct_set_body(r, one[..]);
+    return r;
+}
+
+/// Structures and unions larger than this are passed and returned by
+/// address (as Axiom's aggregates are).
+pub fn by_ptr(t: *cty.CType) bool {
+    return cty.is_record(t) and (cty.size_of(t) > 32);
+}
+
+/// A C function's IR signature.
+pub struct Sig {
+    ty: *mut ir.Ty,
+    sret: bool,  // the result's address is the first parameter
+}
+
+/// The signature of a function returning ret with parameters (or
+/// arguments, for a call without a prototype) of types ps.
+pub fn sig_of(ret: *mut cty.CType, ps: []mut *mut cty.CType, variadic: bool) Sig {
+    let sret = by_ptr(ret);
+    let mut n = ps.len;
+    if sret {
+        n += 1;
+    }
+    let ts = u.newn.[*mut ir.Ty](n + 1);
+    let mut k: usize = 0;
+    if sret {
+        ts[0] = T_ptr;
+        k = 1;
+    }
+    for p in ps {
+        if by_ptr(p) {
+            ts[k] = T_ptr;
+        } else {
+            ts[k] = lty(p);
+        }
+        k += 1;
+    }
+    let mut rt = T_void;
+    if not sret and not cty.is_void(ret) {
+        rt = lty(ret);
+    }
+    return Sig.{ ty: ir.t_fn(rt, ts[0..n], variadic), sret: sret };
+}
+
+/// The extension (0, ir zext 1, sext 2) a value of type t gets as an
+/// argument or result.
+pub fn ext_of(t: *cty.CType) u8 {
+    if t.kind == cty.TK_BOOL {
+        return 1;
+    }
+    if cty.is_integer(t) and (t.bits < 32) {
+        if t.is_signed {
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/// The marks of a function's parameters and result (ext: the call's
+/// ext_of, or the function's param_ext with ret_ext).
+pub fn mark_call(v: *mut ir.Value, ret: *mut cty.CType, ps: []mut *mut cty.CType, sret: bool) void {
+    let ex = ir.ext_of(v);
+    let mut k: usize = 1;
+    if sret {
+        ex[1] = ir.EXT_SRET;
+        k = 2;
+    } else {
+        ex[0] = ext_of(ret);
+    }
+    for p in ps {
+        if k < ex.len {
+            if by_ptr(p) {
+                ex[k] = ir.EXT_BYVAL;
+            } else {
+                ex[k] = ext_of(p);
+            }
+        }
+        k += 1;
+    }
+}
+
+fn mark_func(f: *mut ir.Func, ret: *mut cty.CType, ps: []mut *mut cty.CType, sret: bool) void {
+    let mut k: usize = 0;
+    if sret {
+        f.param_ext[0] = ir.EXT_SRET;
+        k = 1;
+    } else {
+        f.ret_ext = ext_of(ret);
+    }
+    for p in ps {
+        if k < f.param_ext.len {
+            if by_ptr(p) {
+                f.param_ext[k] = ir.EXT_BYVAL;
+            } else {
+                f.param_ext[k] = ext_of(p);
+            }
+        }
+        k += 1;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Symbols
+// -----------------------------------------------------------------------------
+
+// The symbol name of an entity: its own with external linkage (main's is
+// MAIN_SYMBOL), else made unique.
+fn symbol_name(s: *cast.CSym) []u8 {
+    if s.linkage == cast.LK_EXTERNAL {
+        if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") {
+            return MAIN_SYMBOL;
+        }
+        return s.name;
+    }
+    return u.f2("%s.%s", s.name, u.idec(s.uid));
+}
+
+// The parameter types of function s's IR signature: its definition's
+// parameters, or its type's (a declaration with a prototype).
+fn param_types(s: *cast.CSym) []mut *mut cty.CType {
+    if u.notnil(s.def) {
+        let n = s.params.len;
+        let ts = u.newn.[*mut cty.CType](n + 1);
+        for i in 0..n {
+            ts[i] = cty.unqual(s.params.get(i).ty);
+        }
+        return ts[0..n];
+    }
+    return s.ty.params;
+}
+
+/// Function s's signature (nil ty: a function without a prototype that is
+/// not defined, whose signature comes from its calls).
+pub fn func_sig(s: *cast.CSym) Sig {
+    if not s.ty.proto and u.isnil(s.def) {
+        return Sig.{ ty: u.nil.[ir.Ty](), sret: false };
+    }
+    return sig_of(s.ty.ret, param_types(s), s.ty.variadic and u.isnil(s.def));
+}
+
+/// The IR function of C function s; `sig`: the signature to declare it
+/// with if it has none of its own (a call's, without a prototype).
+pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
+    if not u.isvnil(s.ir) {
+        return @ptr_cast(*mut ir.Func, s.ir);
+    }
+    let mut sig = func_sig(s);
+    let mut ps = param_types(s);
+    if u.isnil(sig.ty) {
+        sig = sig0;
+        ps = u.nil_slice.[*mut cty.CType]();
+    }
+    let name = symbol_name(s);
+    let mut f = ir.get_function(M, name);
+    if u.notnil(f) and not ir.is_decl(f) {
+        _ = dg.err(s.span, "C3062", u.f1("the name '%s' is the name of a function of the runtime", s.name));
+        f = u.nil.[ir.Func]();
+    }
+    if u.isnil(f) {
+        f = ir.add_function(M, name, sig.ty);
+    } else {
+        f.ty = sig.ty;
+    }
+    if s.linkage != cast.LK_EXTERNAL {
+        f.linkage = ir.LINK_INTERNAL;
+    }
+    if u.str_eq(name, MAIN_SYMBOL) {
+        f.linkage = ir.LINK_INTERNAL;
+    }
+    mark_func(f, s.ty.ret, ps, sig.sret);
+    if u.isnil(s.def) and is_wasm and (s.linkage == cast.LK_EXTERNAL) {
+        // a function the program does not define: the host's
+        f.import_module = "env";
+        f.import_name = s.name;
+    }
+    s.ir = @ptr_cast(*mut void, f);
+    return f;
+}
+
+/// The address of object s (with static storage duration).
+pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
+    if not u.isvnil(s.ir) {
+        return @ptr_cast(*mut ir.Value, s.ir);
+    }
+    let name = symbol_name(s);
+    let mut g = ir.get_global(M, name);
+    if u.isnil(g) {
+        g = ir.add_global(M, lty(s.ty), name);
+    }
+    g.align = cty.align_of(s.ty);
+    if s.linkage != cast.LK_EXTERNAL {
+        g.linkage = ir.LINK_INTERNAL;
+    }
+    s.ir = @ptr_cast(*mut void, g.val);
+    return g.val;
+}
+
+/// The address of string literal e (its array, NUL-terminated).
+pub fn string_addr(e: *cast.Expr) *mut ir.Value {
+    let key = u.addr_key(@int_from_ptr(e));
+    let found = strings.get(key);
+    if u.notnil(found) {
+        return found;
+    }
+    let el = e.ty.elem;
+    let units = e.tok.units;
+    let mut init = ir.vnil();
+    if cty.size_of(el) == 1 {
+        let bs = u.newn.[u8](units.len + 1);
+        for i in 0..units.len {
+            bs[i] = @truncate(u8, units[i]);
+        }
+        init = ir.cstring(bs[0..units.len]);
+    } else {
+        let et = lty(el);
+        let xs = u.newn.[*mut ir.Value](units.len + 2);
+        for i in 0..units.len {
+            xs[i] = ir.cint(et, @as(u64, units[i]));
+        }
+        xs[units.len] = ir.cint(et, 0);
+        init = ir.carray(et, xs[0..units.len + 1]);
+    }
+    let g = ir.add_global(M, init.ty, ".str");
+    g.init = init;
+    g.linkage = ir.LINK_INTERNAL;
+    g.is_const = true;
+    g.align = cty.align_of(el);
+    strings.put(key, g.val);
+    return g.val;
+}
+
+// -----------------------------------------------------------------------------
+// Data: the initial values of objects with static storage duration
+// -----------------------------------------------------------------------------
+
+// An address in an object's data.
+struct Reloc {
+    off: u64,
+    v: *mut ir.Value,  // a global's or function's address, with its addend
+}
+
+struct Image {
+    bytes: []mut u8,
+    relocs: u.List.[Reloc],
+}
+
+fn put_le(im: *mut Image, off: u64, v: u64, n: u64) void {
+    for i in 0..n {
+        let at = @truncate(usize, off + i);
+        if at < im.bytes.len {
+            im.bytes[at] = @truncate(u8, v >> @truncate(u32, i * 8));
+        }
+    }
+}
+
+// The address constant a as an IR constant (a global or function's
+// address with an addend), or nil for a plain integer.
+fn addr_value(a: cc.Addr) *mut ir.Value {
+    let mut base = ir.vnil();
+    if u.notnil(a.sym) {
+        if a.sym.kind == cast.SK_FUNC {
+            base = func_of(a.sym, Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false), sret: false }).val;
+        } else {
+            base = object_addr(a.sym);
+        }
+    } else if u.notnil(a.str) {
+        base = string_addr(a.str);
+    } else {
+        return ir.vnil();
+    }
+    if a.off == 0 {
+        return base;
+    }
+    if base.kind == ir.V_FUNC {
+        return base;  // (a function's address plus an offset: meaningless; the function)
+    }
+    return ir.cgaddr(ir.gv_of(base), a.off);
+}
+
+// Writes item it's value into the image.
+fn put_item(im: *mut Image, it: *cast.InitItem) void {
+    let t = it.ty;
+    let e = it.e;
+    let size = cty.size_of(t);
+    if t.kind == cty.TK_ARRAY {
+        // a string literal
+        let es = cty.size_of(t.elem);
+        let us = e.tok.units;
+        let mut n = @as(u64, us.len);
+        if n > t.len {
+            n = t.len;
+        }
+        for i in 0..n {
+            put_le(im, it.off + (i * es), @as(u64, us[@truncate(usize, i)]), es);
+        }
+        return;
+    }
+    if cty.is_floating(t) {
+        if t.kind == cty.TK_FLOAT {
+            put_le(im, it.off, @as(u64, @bit_cast(u32, @float_cast(f32, e.fcval))), 4);
+        } else {
+            put_le(im, it.off, @bit_cast(u64, e.fcval), 8);
+        }
+        return;
+    }
+    if cty.is_integer(t) and e.is_const {
+        put_le(im, it.off, e.cval, size);
+        return;
+    }
+    let a = cc.address(e);
+    let v = addr_value(a);
+    if u.isnil(v) {
+        put_le(im, it.off, a.off, size);
+        return;
+    }
+    im.relocs.push(Reloc.{ off: it.off, v: v });
+}
+
+fn byte_run(bs: []mut u8) *mut ir.Value {
+    let mut zero = true;
+    for b in bs {
+        if b != 0 {
+            zero = false;
+        }
+    }
+    if zero {
+        return ir.czero(ir.t_array(T_i8, @as(u64, bs.len)));
+    }
+    let xs = u.newn.[*mut ir.Value](bs.len + 1);
+    for i in 0..bs.len {
+        xs[i] = ir.cint(T_i8, @as(u64, bs[i]));
+    }
+    return ir.carray(T_i8, xs[0..bs.len]);
+}
+
+// The IR constant of object s's initial value: runs of bytes and the
+// addresses between them.
+fn initial_value(s: *mut cast.CSym) *mut ir.Value {
+    let size = cty.size_of(s.ty);
+    let im = u.new.[Image]();
+    im.bytes = u.newn.[u8](@truncate(usize, size) + 1)[0..@truncate(usize, size)];
+    @mem_set(im.bytes, 0);
+    if u.notnil(s.init) {
+        for k in 0..s.init.items.len {
+            put_item(im, s.init.items.at(k));
+        }
+    }
+    let rs = im.relocs.items();
+    if rs.len == 0 {
+        if u.isnil(s.init) or (s.init.items.len == 0) {
+            return ir.czero(ir.t_array(T_i8, size));
+        }
+    }
+    // relocations in order of offset
+    let n = rs.len;
+    for i in 1..n {
+        let mut j = i;
+        while (j > 0) and (rs[j - 1].off > rs[j].off) {
+            let x = rs[j];
+            rs[j] = rs[j - 1];
+            rs[j - 1] = x;
+            j -= 1;
+        }
+    }
+    let mut parts = u.List.[*mut ir.Value].empty();
+    let mut at: u64 = 0;
+    for r in rs {
+        if r.off > at {
+            parts.push(byte_run(im.bytes[@truncate(usize, at)..@truncate(usize, r.off)]));
+        }
+        parts.push(r.v);
+        at = r.off + cty.ptr_bytes;
+    }
+    if at < size {
+        parts.push(byte_run(im.bytes[@truncate(usize, at)..@truncate(usize, size)]));
+    }
+    return ir.cstruct(parts.items());
+}
+
+fn define_object(s: *mut cast.CSym) void {
+    let g = ir.gv_of(object_addr(s));
+    let init = initial_value(s);
+    g.ty = init.ty;
+    g.init = init;
+    g.align = cty.align_of(s.ty);
+}
+
+// -----------------------------------------------------------------------------
+// Functions: helpers for the code of one
+// -----------------------------------------------------------------------------
+
+/// Sets the source location of the instructions made next.
+pub fn set_span(sp: u.Span) void {
+    let lc = u.span_linecol(sp);
+    ir.cur_src = ir.src_loc(sp.file, lc.sl);
+}
+
+pub fn at_end(b: *mut ir.Block) void {
+    ir.at_end(B, b);
+}
+
+pub fn new_block(name: []u8) *mut ir.Block {
+    return ir.append_block(F.f, name);
+}
+
+/// Has the current block ended (a branch or return)?
+pub fn terminated() bool {
+    let b = ir.insert_block(B);
+    return u.notnil(b.last) and ir.is_term(b.last.op);
+}
+
+/// Continues in a new block (no predecessor yet) if the current one has ended.
+pub fn continue_after() void {
+    if terminated() {
+        at_end(new_block("dead"));
+    }
+}
+
+pub fn br(b: *mut ir.Block) void {
+    if not terminated() {
+        ir.br(B, b);
+    }
+}
+
+/// A new object of type t in the function's frame (its entry block).
+pub fn alloca(t: *mut cty.CType, name: []u8) *mut ir.Value {
+    let cur = ir.insert_block(B);
+    let term = ir.terminator(F.entry);
+    if u.notnil(term) {
+        ir.at_before(B, term);
+    } else {
+        ir.at_end(B, F.entry);
+    }
+    let mut it = lty(t);
+    if it.size == 0 {
+        it = T_i8;
+    }
+    let a = ir.alloca(B, it, name);
+    let al = cty.align_of(t);
+    if @as(u64, a.align) < al {
+        a.align = @truncate(u32, al);
+    }
+    ir.at_end(B, cur);
+    return a;
+}
+
+/// An integer constant of pointer width.
+pub fn usz(v: u64) *mut ir.Value {
+    return ir.cint(T_isz, v);
+}
+
+// -----------------------------------------------------------------------------
+// The unit
+// -----------------------------------------------------------------------------
+
+fn init_types() void {
+    T_i1 = ir.t_int(1);
+    T_i8 = ir.t_int(8);
+    T_i32 = ir.t_int(32);
+    T_isz = ir.isz();
+    T_ptr = ir.t_ptr();
+    T_void = ir.t_void();
+}
+
+/// Generates unit cu into module m (wasm: for a WebAssembly target): its
+/// objects and functions, and START_SYMBOL. False after an error (reported).
+pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
+    M = m;
+    B = ir.new_builder();
+    is_wasm = wasm;
+    init_types();
+    for s in cu.objects.items() {
+        define_object(s);
+    }
+    for s in cu.funcs.items() {
+        let f = func_of(s, func_sig(s));
+        let st = u.new.[FnState]();
+        st.sym = s;
+        st.f = f;
+        st.ret = s.ty.ret;
+        st.sig = func_sig(s);
+        F = st;
+        hooks.body(s);
+        F = u.nil.[FnState]();
+    }
+    start(cu);
+    return dg.error_count() == 0;
+}
+
+// START_SYMBOL(argc, argv): main's value (an i32).
+fn start(cu: *mut cs.CUnit) void {
+    let mut pi: [2]*mut ir.Ty = [T_i32, T_ptr];
+    let fty = ir.t_fn(T_i32, pi[..], false);
+    let mut f = ir.get_function(M, START_SYMBOL);
+    if u.isnil(f) {
+        f = ir.add_function(M, START_SYMBOL, fty);
+    }
+    if u.isnil(cu.main) {
+        _ = dg.err(u.mkspan(0, 0, 0), "C3063", "the program has no function main");
+        return;
+    }
+    if not ir.is_decl(f) {
+        return;
+    }
+    let st = u.new.[FnState]();
+    st.f = f;
+    F = st;
+    st.entry = new_block("entry");
+    at_end(st.entry);
+    let mf = func_of(cu.main, func_sig(cu.main));
+    let mt = cu.main.ty;
+    let mut av: [2]*mut ir.Value = [ir.vnil(), ir.vnil()];
+    let mut n: usize = 0;
+    if cu.main.params.len == 2 {
+        av[0] = conv_i32(f.params[0], cty.t_int);
+        av[1] = f.params[1];
+        n = 2;
+    }
+    let r = ir.call(B, mf.ty, mf.val, av[0..n]);
+    let ps = param_types(cu.main);
+    mark_call(r, mt.ret, ps, false);
+    let ib = cty.t_int.bits;
+    if ib > 32 {
+        ir.ret(B, ir.trunc(B, r, T_i32));
+    } else if ib < 32 {
+        ir.ret(B, ir.sext(B, r, T_i32));
+    } else {
+        ir.ret(B, r);
+    }
+    F = u.nil.[FnState]();
+}
+
+// i32 v as a value of integer type t.
+fn conv_i32(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let it = lty(t);
+    if it.bits > 32 {
+        return ir.sext(B, v, it);
+    }
+    if it.bits < 32 {
+        return ir.trunc(B, v, it);
+    }
+    return v;
+}

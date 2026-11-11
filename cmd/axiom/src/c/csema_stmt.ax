@@ -1,0 +1,258 @@
+// =============================================================================
+// csema_stmt.ax - C statements (6.8) and function bodies: the scopes of
+// blocks, switch with its case and default labels (Stmt.cases, Stmt.cval),
+// break and continue, return, and the labels of goto, which have function
+// scope (Stmt.sym). analyze is the entry point of semantic analysis: it
+// installs the hooks csema.ax calls and runs it.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "csema.ax" as cs;
+import "csema_decl.ax" as cd;
+import "csema_expr.ax" as cx;
+import "ctypes.ax" as cty;
+
+// A switch statement being analyzed.
+struct Switch {
+    s: *mut cast.Stmt,
+    ty: *mut cty.CType,  // the promoted type of its controlling expression
+    values: u.SymMap.[i32],
+    has_default: bool,
+}
+
+struct Body {
+    f: *mut cast.CSym,
+    ret: *mut cty.CType,
+    labels: u.SymMap.[*mut cast.CSym],
+    label_list: u.List.[*mut cast.CSym],
+    switches: u.List.[*mut Switch],
+    loops: i32,      // loops around the current statement
+    breakable: i32,  // loops and switches around it
+}
+
+let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
+
+/// Analyzes the translation unit: the typed tree (csema.ax).
+pub fn analyze(t: *mut cast.Unit, o: *co.COptions) *mut cs.CUnit {
+    cs.hooks.external = cd.external;
+    cs.hooks.type_name = cd.type_name;
+    cs.hooks.body = function_body;
+    return cs.run(t, o);
+}
+
+// The body of function definition d of function f: its parameters are in
+// the scope of the body's outermost block.
+fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
+    let b = u.new.[Body]();
+    b.f = f;
+    b.ret = f.ty.ret;
+    b.labels = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    let saved = BD;
+    BD = b;
+    cs.set_cur_fn(f);
+    cs.push_scope();
+    for p in f.params.items() {
+        if p.name.len > 0 {
+            let prior = cs.lookup_here(p.name);
+            if u.isnil(prior) {
+                cs.declare(p.name, p);
+            }
+        }
+    }
+    for s in d.body.items.items() {
+        stmt(s);
+    }
+    cs.pop_scope();
+    for l in b.label_list.items() {
+        if not l.defined {
+            cs.err(l.span, "C3043", u.f1("the label '%s' is used but not defined", l.name));
+        }
+    }
+    cs.set_cur_fn(u.nil.[cast.CSym]());
+    BD = saved;
+}
+
+fn label_sym(name: []u8, sp: u.Span) *mut cast.CSym {
+    let mut l = BD.labels.get(name);
+    if u.isnil(l) {
+        l = cs.new_sym(cast.SK_LABEL, name, sp, cty.t_void);
+        BD.labels.put(name, l);
+        BD.label_list.push(l);
+    }
+    return l;
+}
+
+fn stmt(s: *mut cast.Stmt) void {
+    if u.isnil(s) {
+        return;
+    }
+    let k = s.kind;
+    if k == cast.StmtKind.COMPOUND {
+        cs.push_scope();
+        for x in s.items.items() {
+            stmt(x);
+        }
+        cs.pop_scope();
+    } else if k == cast.StmtKind.DECL {
+        cd.block_decl(s.decl);
+    } else if k == cast.StmtKind.EXPR {
+        if u.notnil(s.e) {
+            s.e = cx.full_expr(s.e);
+        }
+    } else if k == cast.StmtKind.IF {
+        s.e = cx.cond_expr(s.e, "'if'");
+        sub(s.body);
+        sub(s.els);
+    } else if k == cast.StmtKind.SWITCH {
+        switch_stmt(s);
+    } else if (k == cast.StmtKind.WHILE) or (k == cast.StmtKind.DO) {
+        s.e = cx.cond_expr(s.e, u.pick(k == cast.StmtKind.WHILE, "'while'", "'do'"));
+        loop_body(s.body);
+    } else if k == cast.StmtKind.FOR {
+        // (the clauses and body are a block of their own: C99 6.8.5p5)
+        cs.push_scope();
+        if u.notnil(s.decl) {
+            cd.for_decl(s.decl);
+        } else if u.notnil(s.first) {
+            s.first = cx.full_expr(s.first);
+        }
+        if u.notnil(s.e) {
+            s.e = cx.cond_expr(s.e, "'for'");
+        }
+        if u.notnil(s.step) {
+            s.step = cx.full_expr(s.step);
+        }
+        loop_body(s.body);
+        cs.pop_scope();
+    } else if k == cast.StmtKind.GOTO {
+        let l = label_sym(s.label, s.label_span);
+        l.used = true;
+        s.sym = l;
+    } else if k == cast.StmtKind.CONTINUE {
+        if BD.loops == 0 {
+            cs.err(s.span, "C3042", "'continue' is not in a loop");
+        }
+    } else if k == cast.StmtKind.BREAK {
+        if BD.breakable == 0 {
+            cs.err(s.span, "C3042", "'break' is not in a loop or switch statement");
+        }
+    } else if k == cast.StmtKind.RETURN {
+        return_stmt(s);
+    } else if k == cast.StmtKind.LABEL {
+        let l = label_sym(s.label, s.label_span);
+        if l.defined {
+            cs.err_note(s.label_span, "C3002", u.f1("a second label '%s'", s.label), l.span, "the first");
+        }
+        l.defined = true;
+        l.span = s.label_span;
+        s.sym = l;
+        stmt(s.body);
+    } else if k == cast.StmtKind.CASE {
+        case_stmt(s);
+    } else {
+        default_stmt(s);
+    }
+}
+
+// A secondary block (the body of a selection or iteration statement): a
+// scope of its own from C99 (6.8.4p3).
+fn sub(s: *mut cast.Stmt) void {
+    if u.isnil(s) {
+        return;
+    }
+    let scoped = (cs.std() >= co.C99) and (s.kind != cast.StmtKind.COMPOUND);
+    if scoped {
+        cs.push_scope();
+    }
+    stmt(s);
+    if scoped {
+        cs.pop_scope();
+    }
+}
+
+fn loop_body(s: *mut cast.Stmt) void {
+    BD.loops += 1;
+    BD.breakable += 1;
+    sub(s);
+    BD.loops -= 1;
+    BD.breakable -= 1;
+}
+
+fn switch_stmt(s: *mut cast.Stmt) void {
+    let e = cx.rv(s.e);
+    let sw = u.new.[Switch]();
+    sw.s = s;
+    sw.ty = cty.t_error;
+    sw.values = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    if u.notnil(e.ty) and not cty.is_error(e.ty) {
+        if not cty.is_integer(e.ty) {
+            cs.err(e.span, "C3030", u.f1("the controlling expression of 'switch' has type %s, not an integer type",
+                                         cs.tq(e.ty)));
+        } else {
+            sw.ty = cty.promote(e.ty);
+        }
+    }
+    s.e = cx.convert(e, sw.ty);
+    BD.switches.push(sw);
+    BD.breakable += 1;
+    sub(s.body);
+    BD.breakable -= 1;
+    _ = BD.switches.pop();
+}
+
+fn case_stmt(s: *mut cast.Stmt) void {
+    let r = cx.ice(s.e, "a case label");
+    s.e = r.e;
+    if BD.switches.len == 0 {
+        cs.err(s.span, "C3040", "'case' is not in a switch statement");
+    } else if r.ok {
+        let sw = BD.switches.last();
+        if not cty.is_error(sw.ty) {
+            // the value converted to the promoted controlling type (6.8.4.2p5)
+            s.cval = cty.wrap(sw.ty, r.v);
+            let key = u.intern(u.udec(s.cval));
+            if sw.values.get(key) != 0 {
+                cs.err(s.e.span, "C3041",
+                       u.f1("a second case with the value %s", u.pick(sw.ty.is_signed, u.dec(@bit_cast(i64, s.cval)),
+                                                                      u.udec(s.cval))));
+            }
+            sw.values.put(key, 1);
+            sw.s.cases.push(s);
+        }
+    }
+    stmt(s.body);
+}
+
+fn default_stmt(s: *mut cast.Stmt) void {
+    if BD.switches.len == 0 {
+        cs.err(s.span, "C3040", "'default' is not in a switch statement");
+    } else {
+        let sw = BD.switches.last();
+        if sw.has_default {
+            cs.err(s.span, "C3041", "a second 'default' label in one switch statement");
+        }
+        sw.has_default = true;
+        sw.s.cases.push(s);
+    }
+    stmt(s.body);
+}
+
+fn return_stmt(s: *mut cast.Stmt) void {
+    let rt = BD.ret;
+    if u.isnil(s.e) {
+        if not cty.is_void(rt) and (cs.std() >= co.C99) {
+            cs.err(s.span, "C3044", u.f2("'return' without a value in '%s', which returns %s", BD.f.name, cs.tq(rt)));
+        }
+        return;
+    }
+    let e = cx.rv(s.e);
+    s.e = e;
+    if cty.is_void(rt) {
+        if u.notnil(e.ty) and not cty.is_error(e.ty) {
+            cs.err(e.span, "C3044", u.f1("'return' with a value in '%s', which returns void", BD.f.name));
+        }
+        return;
+    }
+    s.e = cx.assign_convert(e, cty.unqual(rt), "return");
+}
