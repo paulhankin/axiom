@@ -282,6 +282,36 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   return { problem, stderr: r.stderr };
 }), { parallel: true });
 
+// The C preprocessor (docs/c-frontend.md): each cmd/axiom/internal/tests/c/pp/*.c
+// is preprocessed (--emit=c-pp) with its /* flags: */; the output must be
+// the .pp file next to it, or the build must fail with each
+// /* expect-error: C1xxx */ code. /* expect-warning: C4xxx */ codes must be
+// reported. __DATE__ and __TIME__ are fixed (SOURCE_DATE_EPOCH).
+const cDir = path.join(root, 'cmd/axiom/internal/tests/c/pp');
+const cFiles = fs.existsSync(cDir) ? fs.readdirSync(cDir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(cDir, f)) : [];
+await section('', byFile(cFiles, '[c-pp]', async (f) => {
+  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+  const src = fs.readFileSync(f, 'utf8');
+  const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
+  const errors = [...src.matchAll(/\/\* expect-error: (C\d+) \*\//g)].map((m) => m[1]);
+  const warnings = [...src.matchAll(/\/\* expect-warning: (C\d+) \*\//g)].map((m) => m[1]);
+  const env = { ...process.env, SOURCE_DATE_EPOCH: '1700000000' };
+  const c = await spawnAsync(compiler, ['build', path.basename(f), '--emit=c-pp', ...flags],
+    { encoding: 'utf8', timeout: compileTimeout, cwd: cDir, env });
+  if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
+  const codes = (sev) => [...c.stderr.matchAll(new RegExp(`: ${sev}\\[(C\\d+)\\]`, 'g'))].map((m) => m[1]);
+  for (const w of warnings) if (!codes('warning').includes(w)) return `expected warning ${w}, got [${codes('warning').join(', ')}]`;
+  if (errors.length) {
+    if (c.status === 0) return `expected errors ${errors.join(', ')}, but preprocessing succeeded`;
+    if (c.status !== 1) return `the compiler failed (status ${c.status}, signal ${c.signal}):\n${c.stderr}`;
+    for (const e of errors) if (!codes('error').includes(e)) return `expected ${e}, got [${codes('error').join(', ')}]:\n${c.stderr}`;
+    return null;
+  }
+  if (c.status !== 0) return `preprocessing failed:\n${c.stdout}${c.stderr}`;
+  const want = fs.readFileSync(f.replace(/\.c$/, '.pp'), 'utf8');
+  return want === c.stdout ? null : `output mismatch\n--- expected\n${want}--- got\n${c.stdout}`;
+}), { parallel: true });
+
 // `axiom test`: the standard library's own tests must pass, and the
 // self-tests in cmd/axiom/internal/tests/testing/ must produce exactly the declared results.
 const testTargets = native ? [nativeTarget] : [];

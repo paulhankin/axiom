@@ -1,0 +1,173 @@
+// =============================================================================
+// cpp_out.ax - the preprocessed text (--emit=c-pp): tokens on the lines they
+// came from, with a space wherever two would otherwise lex as other tokens.
+// =============================================================================
+import "../util.ax" as u;
+import "ctok.ax" as ct;
+
+// Every punctuator's spelling, digraphs, # and ## included.
+let PUNCTS: [54][]u8 = [
+    "[",
+    "]",
+    "(",
+    ")",
+    "{",
+    "}",
+    ".",
+    "->",
+    "++",
+    "--",
+    "&",
+    "*",
+    "+",
+    "-",
+    "~",
+    "!",
+    "/",
+    "%",
+    "<<",
+    ">>",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "==",
+    "!=",
+    "^",
+    "|",
+    "&&",
+    "||",
+    "?",
+    ":",
+    ";",
+    "...",
+    "=",
+    "*=",
+    "/=",
+    "%=",
+    "+=",
+    "-=",
+    "<<=",
+    ">>=",
+    "&=",
+    "^=",
+    "|=",
+    ",",
+    "::",
+    "#",
+    "##",
+    "<:",
+    ":>",
+    "<%",
+    "%>",
+    "%:%:",
+];
+
+fn identlike(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9')) or (c == '_') or
+           (c >= 0x80) or (c == '\\');
+}
+
+fn is_digit(c: u8) bool {
+    return (c >= '0') and (c <= '9');
+}
+
+// Whether some punctuator starts with p followed by c.
+fn punct_prefix(p: []u8, c: u8) bool {
+    for q in PUNCTS {
+        if (q.len > p.len) and (q[p.len] == c) and @mem_eq(q[0..p.len], p) {
+            return true;
+        }
+    }
+    // (%: is a digraph's prefix too)
+    return (p.len == 1) and (p[0] == '%') and (c == ':');
+}
+
+/// Whether the spellings a and b, written together, could lex as other
+/// tokens (conservatively, under every standard).
+pub fn needs_space(a: []u8, akind: i32, b: []u8) bool {
+    let x = a[a.len - 1];
+    let y = b[0];
+    if identlike(x) and (identlike(y) or (y == '"') or (y == '\'')) {
+        return true;
+    }
+    let num = (akind == ct.T_INT) or (akind == ct.T_FLOAT);
+    if num and ((y == '.') or (((y == '+') or (y == '-')) and ((x == 'e') or (x == 'E') or (x == 'p') or (x == 'P')))) {
+        return true;
+    }
+    if (x == '.') and is_digit(y) {
+        return true;
+    }
+    if (x == '/') and ((y == '/') or (y == '*')) {
+        return true;
+    }
+    if akind == ct.T_PUNCT {
+        return punct_prefix(a, y);
+    }
+    // (a stray character, or a pp-number, before a punctuator)
+    if (akind != ct.T_STRING) and (akind != ct.T_CHAR) and not identlike(x) {
+        return punct_prefix(a[a.len - 1..], y);
+    }
+    return false;
+}
+
+/// The text of the tokens, one source line to a line.
+pub fn text(toks: []ct.Token) []u8 {
+    let mut b = u.Buf.init();
+    let mut have = false;
+    let mut pk: i32 = 0;
+    let mut ptext = "";
+    for k in 0..toks.len {
+        let t = &toks[k];
+        if (t.kind == ct.T_EOF) or (t.text.len == 0) {
+            continue;
+        }
+        if have {
+            if t.bol {
+                b.c('\n');
+            } else if t.space or needs_space(ptext, pk, t.text) {
+                b.c(' ');
+            }
+        }
+        b.s(t.text);
+        have = true;
+        pk = t.kind;
+        ptext = t.text;
+    }
+    if have {
+        b.c('\n');
+    }
+    return b.done();
+}
+
+/// The tokens with their values, one to a line (--emit=c-tokens).
+pub fn dump(toks: []ct.Token) []u8 {
+    let mut b = u.Buf.init();
+    let kinds = ["eof", "ident", "keyword", "punct", "int", "float", "char", "string"];
+    for k in 0..toks.len {
+        let t = &toks[k];
+        b.s(kinds[@int_cast(usize, t.kind)]);
+        b.c(' ');
+        b.s(t.text);
+        if (t.kind == ct.T_KEYWORD) or (t.kind == ct.T_PUNCT) {
+            b.s(u.f1(" id=%s", u.idec(t.id)));
+        } else if t.kind == ct.T_INT {
+            b.s(u.f5(" value=%s base=%s u=%s l=%s wb=%s", u.udec(t.ival), u.idec(t.base), u.pick(t.unsigned_, "1", "0"),
+                     u.idec(t.longs), u.pick(t.bitint, "1", "0")));
+        } else if t.kind == ct.T_FLOAT {
+            b.s(u.f2(" bits=%s suffix=%s", u.hex16(@bit_cast(u64, t.fval)), u.idec(t.fsuffix)));
+        } else if t.kind == ct.T_CHAR {
+            b.s(u.f2(" prefix=%s value=%s", u.idec(t.prefix), u.dec(@bit_cast(i64, t.ival))));
+        } else if t.kind == ct.T_STRING {
+            b.s(u.f1(" prefix=%s units=", u.idec(t.prefix)));
+            for j in 0..t.units.len {
+                if j > 0 {
+                    b.c(',');
+                }
+                b.s(u.udec(@as(u64, t.units[j])));
+            }
+        }
+        b.c('\n');
+    }
+    return b.done();
+}

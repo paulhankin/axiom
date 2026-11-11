@@ -1,0 +1,281 @@
+/* stdint.h - integer types (C99 7.18, C11 7.20, C23 7.22), for the Axiom
+   compiler's C front end. short is 16 bits, int 16, 32 or 64, long 32 or
+   64, long long 64; a pointer 32 or 64. */
+#ifndef __AXIOM_STDINT_H
+#define __AXIOM_STDINT_H
+
+#if __STDC_VERSION__ < 199901L
+#error "<stdint.h> is a header of C99 and later"
+#endif
+
+#if __STDC_VERSION__ >= 202311L
+#define __STDC_VERSION_STDINT_H__ 202311L
+#endif
+
+/* exact widths (there is no 32-bit type when int is 64 bits) */
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef short int16_t;
+typedef unsigned short uint16_t;
+#if __AXIOM_INT_WIDTH__ == 32
+#define __AXIOM_HAS_INT32 1
+typedef int int32_t;
+typedef unsigned int uint32_t;
+#define __AXIOM_C32(c) c
+#define __AXIOM_UC32(c) c##U
+#elif __AXIOM_LONG_WIDTH__ == 32
+#define __AXIOM_HAS_INT32 1
+typedef long int32_t;
+typedef unsigned long uint32_t;
+#define __AXIOM_C32(c) c##L
+#define __AXIOM_UC32(c) c##UL
+#endif
+#if __AXIOM_LONG_WIDTH__ == 64
+typedef long int64_t;
+typedef unsigned long uint64_t;
+#define __AXIOM_C64(c) c##L
+#define __AXIOM_UC64(c) c##UL
+#else
+typedef long long int64_t;
+typedef unsigned long long uint64_t;
+#define __AXIOM_C64(c) c##LL
+#define __AXIOM_UC64(c) c##ULL
+#endif
+
+/* the least and the fastest of at least a width: the exact ones (int for
+   32 bits when there is no 32-bit type) */
+typedef int8_t int_least8_t;
+typedef uint8_t uint_least8_t;
+typedef int16_t int_least16_t;
+typedef uint16_t uint_least16_t;
+typedef int64_t int_least64_t;
+typedef uint64_t uint_least64_t;
+typedef int8_t int_fast8_t;
+typedef uint8_t uint_fast8_t;
+typedef int16_t int_fast16_t;
+typedef uint16_t uint_fast16_t;
+typedef int64_t int_fast64_t;
+typedef uint64_t uint_fast64_t;
+#ifdef __AXIOM_HAS_INT32
+typedef int32_t int_least32_t;
+typedef uint32_t uint_least32_t;
+typedef int32_t int_fast32_t;
+typedef uint32_t uint_fast32_t;
+#define __AXIOM_LEAST32_MIN INT32_MIN
+#define __AXIOM_LEAST32_MAX INT32_MAX
+#define __AXIOM_ULEAST32_MAX UINT32_MAX
+#define __AXIOM_LEAST32_WIDTH 32
+#define INT32_C(c) __AXIOM_C32(c)
+#define UINT32_C(c) __AXIOM_UC32(c)
+#else
+typedef int int_least32_t;
+typedef unsigned int uint_least32_t;
+typedef int int_fast32_t;
+typedef unsigned int uint_fast32_t;
+#define __AXIOM_LEAST32_MIN (-9223372036854775807 - 1)
+#define __AXIOM_LEAST32_MAX 9223372036854775807
+#define __AXIOM_ULEAST32_MAX 18446744073709551615U
+#define __AXIOM_LEAST32_WIDTH 64
+#define INT32_C(c) c
+#define UINT32_C(c) c##U
+#endif
+
+/* integers that hold pointers: as size_t and ptrdiff_t */
+#if __AXIOM_INT_WIDTH__ >= __AXIOM_PTR_WIDTH__
+typedef int intptr_t;
+typedef unsigned int uintptr_t;
+#define __AXIOM_PTR_BITS __AXIOM_INT_WIDTH__
+#elif __AXIOM_LONG_WIDTH__ >= __AXIOM_PTR_WIDTH__
+typedef long intptr_t;
+typedef unsigned long uintptr_t;
+#define __AXIOM_PTR_BITS __AXIOM_LONG_WIDTH__
+#else
+typedef long long intptr_t;
+typedef unsigned long long uintptr_t;
+#define __AXIOM_PTR_BITS 64
+#endif
+
+typedef int64_t intmax_t;
+typedef uint64_t uintmax_t;
+
+/* limits */
+#define INT8_MIN (-127 - 1)
+#define INT8_MAX 127
+#define UINT8_MAX 255
+#define INT16_MIN (-32767 - 1)
+#define INT16_MAX 32767
+#if __AXIOM_INT_WIDTH__ == 16
+#define UINT16_MAX 65535U
+#else
+#define UINT16_MAX 65535
+#endif
+#ifdef __AXIOM_HAS_INT32
+#define INT32_MIN (-INT32_C(2147483647) - 1)
+#define INT32_MAX INT32_C(2147483647)
+#define UINT32_MAX UINT32_C(4294967295)
+#endif
+#define INT64_MIN (-INT64_C(9223372036854775807) - 1)
+#define INT64_MAX INT64_C(9223372036854775807)
+#define UINT64_MAX UINT64_C(18446744073709551615)
+
+#define INT_LEAST8_MIN INT8_MIN
+#define INT_LEAST8_MAX INT8_MAX
+#define UINT_LEAST8_MAX UINT8_MAX
+#define INT_LEAST16_MIN INT16_MIN
+#define INT_LEAST16_MAX INT16_MAX
+#define UINT_LEAST16_MAX UINT16_MAX
+#define INT_LEAST32_MIN __AXIOM_LEAST32_MIN
+#define INT_LEAST32_MAX __AXIOM_LEAST32_MAX
+#define UINT_LEAST32_MAX __AXIOM_ULEAST32_MAX
+#define INT_LEAST64_MIN INT64_MIN
+#define INT_LEAST64_MAX INT64_MAX
+#define UINT_LEAST64_MAX UINT64_MAX
+
+#define INT_FAST8_MIN INT8_MIN
+#define INT_FAST8_MAX INT8_MAX
+#define UINT_FAST8_MAX UINT8_MAX
+#define INT_FAST16_MIN INT16_MIN
+#define INT_FAST16_MAX INT16_MAX
+#define UINT_FAST16_MAX UINT16_MAX
+#define INT_FAST32_MIN __AXIOM_LEAST32_MIN
+#define INT_FAST32_MAX __AXIOM_LEAST32_MAX
+#define UINT_FAST32_MAX __AXIOM_ULEAST32_MAX
+#define INT_FAST64_MIN INT64_MIN
+#define INT_FAST64_MAX INT64_MAX
+#define UINT_FAST64_MAX UINT64_MAX
+
+#if __AXIOM_PTR_BITS == 32
+#define INTPTR_MIN INT32_MIN
+#define INTPTR_MAX INT32_MAX
+#define UINTPTR_MAX UINT32_MAX
+#define PTRDIFF_MIN INT32_MIN
+#define PTRDIFF_MAX INT32_MAX
+#define SIZE_MAX UINT32_MAX
+#elif __AXIOM_INT_WIDTH__ >= __AXIOM_PTR_WIDTH__
+/* (int is 64 bits) */
+#define INTPTR_MIN (-9223372036854775807 - 1)
+#define INTPTR_MAX 9223372036854775807
+#define UINTPTR_MAX 18446744073709551615U
+#define PTRDIFF_MIN INTPTR_MIN
+#define PTRDIFF_MAX INTPTR_MAX
+#define SIZE_MAX UINTPTR_MAX
+#elif __AXIOM_LONG_WIDTH__ >= __AXIOM_PTR_WIDTH__
+#define INTPTR_MIN (-9223372036854775807L - 1)
+#define INTPTR_MAX 9223372036854775807L
+#define UINTPTR_MAX 18446744073709551615UL
+#define PTRDIFF_MIN INTPTR_MIN
+#define PTRDIFF_MAX INTPTR_MAX
+#define SIZE_MAX UINTPTR_MAX
+#else
+#define INTPTR_MIN (-9223372036854775807LL - 1)
+#define INTPTR_MAX 9223372036854775807LL
+#define UINTPTR_MAX 18446744073709551615ULL
+#define PTRDIFF_MIN INTPTR_MIN
+#define PTRDIFF_MAX INTPTR_MAX
+#define SIZE_MAX UINTPTR_MAX
+#endif
+
+#define INTMAX_MIN INT64_MIN
+#define INTMAX_MAX INT64_MAX
+#define UINTMAX_MAX UINT64_MAX
+
+/* sig_atomic_t (<signal.h>) is int; wint_t (<wchar.h>) is as wchar_t */
+#if __AXIOM_INT_WIDTH__ == 16
+#define SIG_ATOMIC_MIN (-32767 - 1)
+#define SIG_ATOMIC_MAX 32767
+#elif __AXIOM_INT_WIDTH__ == 32
+#define SIG_ATOMIC_MIN (-2147483647 - 1)
+#define SIG_ATOMIC_MAX 2147483647
+#else
+#define SIG_ATOMIC_MIN (-9223372036854775807 - 1)
+#define SIG_ATOMIC_MAX 9223372036854775807
+#endif
+
+#if __AXIOM_WCHAR_WIDTH__ == 16
+#if __AXIOM_WCHAR_SIGNED__
+#define WCHAR_MIN (-32767 - 1)
+#define WCHAR_MAX 32767
+#elif __AXIOM_INT_WIDTH__ == 16
+#define WCHAR_MIN 0U
+#define WCHAR_MAX 65535U
+#else
+#define WCHAR_MIN 0
+#define WCHAR_MAX 65535
+#endif
+#define __AXIOM_WCHAR_BITS 16
+#elif __AXIOM_INT_WIDTH__ == 64
+/* (wchar_t is int: there is no 32-bit type) */
+#if __AXIOM_WCHAR_SIGNED__
+#define WCHAR_MIN (-9223372036854775807 - 1)
+#define WCHAR_MAX 9223372036854775807
+#else
+#define WCHAR_MIN 0U
+#define WCHAR_MAX 18446744073709551615U
+#endif
+#define __AXIOM_WCHAR_BITS 64
+#else
+#if __AXIOM_WCHAR_SIGNED__
+#define WCHAR_MIN INT32_MIN
+#define WCHAR_MAX INT32_MAX
+#else
+#define WCHAR_MIN UINT32_C(0)
+#define WCHAR_MAX UINT32_MAX
+#endif
+#define __AXIOM_WCHAR_BITS 32
+#endif
+#define WINT_MIN WCHAR_MIN
+#define WINT_MAX WCHAR_MAX
+
+/* constants */
+#define INT8_C(c) c
+#define UINT8_C(c) c
+#define INT16_C(c) c
+#if __AXIOM_INT_WIDTH__ == 16
+#define UINT16_C(c) c##U
+#else
+#define UINT16_C(c) c
+#endif
+#define INT64_C(c) __AXIOM_C64(c)
+#define UINT64_C(c) __AXIOM_UC64(c)
+#define INTMAX_C(c) __AXIOM_C64(c)
+#define UINTMAX_C(c) __AXIOM_UC64(c)
+
+#if __STDC_VERSION__ >= 202311L
+#define INT8_WIDTH 8
+#define UINT8_WIDTH 8
+#define INT16_WIDTH 16
+#define UINT16_WIDTH 16
+#ifdef __AXIOM_HAS_INT32
+#define INT32_WIDTH 32
+#define UINT32_WIDTH 32
+#endif
+#define INT64_WIDTH 64
+#define UINT64_WIDTH 64
+#define INT_LEAST8_WIDTH 8
+#define UINT_LEAST8_WIDTH 8
+#define INT_LEAST16_WIDTH 16
+#define UINT_LEAST16_WIDTH 16
+#define INT_LEAST32_WIDTH __AXIOM_LEAST32_WIDTH
+#define UINT_LEAST32_WIDTH __AXIOM_LEAST32_WIDTH
+#define INT_LEAST64_WIDTH 64
+#define UINT_LEAST64_WIDTH 64
+#define INT_FAST8_WIDTH 8
+#define UINT_FAST8_WIDTH 8
+#define INT_FAST16_WIDTH 16
+#define UINT_FAST16_WIDTH 16
+#define INT_FAST32_WIDTH __AXIOM_LEAST32_WIDTH
+#define UINT_FAST32_WIDTH __AXIOM_LEAST32_WIDTH
+#define INT_FAST64_WIDTH 64
+#define UINT_FAST64_WIDTH 64
+#define INTPTR_WIDTH __AXIOM_PTR_BITS
+#define UINTPTR_WIDTH __AXIOM_PTR_BITS
+#define INTMAX_WIDTH 64
+#define UINTMAX_WIDTH 64
+#define PTRDIFF_WIDTH __AXIOM_PTR_BITS
+#define SIZE_WIDTH __AXIOM_PTR_BITS
+#define SIG_ATOMIC_WIDTH __AXIOM_INT_WIDTH__
+#define WCHAR_WIDTH __AXIOM_WCHAR_BITS
+#define WINT_WIDTH __AXIOM_WCHAR_BITS
+#endif
+
+#endif

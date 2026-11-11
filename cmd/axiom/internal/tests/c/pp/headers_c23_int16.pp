@@ -1,0 +1,244 @@
+typedef unsigned long size_t;
+typedef long ptrdiff_t;
+typedef long wchar_t;
+typedef struct {
+long long __axiom_ll;
+long double __axiom_ld;
+} max_align_t;
+typedef typeof(nullptr) nullptr_t;
+typedef __builtin_va_list va_list;
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef short int16_t;
+typedef unsigned short uint16_t;
+typedef long int32_t;
+typedef unsigned long uint32_t;
+typedef long long int64_t;
+typedef unsigned long long uint64_t;
+typedef int8_t int_least8_t;
+typedef uint8_t uint_least8_t;
+typedef int16_t int_least16_t;
+typedef uint16_t uint_least16_t;
+typedef int64_t int_least64_t;
+typedef uint64_t uint_least64_t;
+typedef int8_t int_fast8_t;
+typedef uint8_t uint_fast8_t;
+typedef int16_t int_fast16_t;
+typedef uint16_t uint_fast16_t;
+typedef int64_t int_fast64_t;
+typedef uint64_t uint_fast64_t;
+typedef int32_t int_least32_t;
+typedef uint32_t uint_least32_t;
+typedef int32_t int_fast32_t;
+typedef uint32_t uint_fast32_t;
+typedef long intptr_t;
+typedef unsigned long uintptr_t;
+typedef int64_t intmax_t;
+typedef uint64_t uintmax_t;
+x___STDC_VERSION_STDDEF_H__ = 202311L
+x_unreachable = ((void)0)
+x_NULL = ((void *)0)
+x_offsetof = __builtin_offsetof(a0, a1)
+x___STDC_VERSION_LIMITS_H__ = 202311L
+x_CHAR_BIT = 8
+x_SCHAR_MIN = (-127 - 1)
+x_SCHAR_MAX = 127
+x_UCHAR_MAX = 255
+x_CHAR_MIN = (-127 - 1)
+x_CHAR_MAX = 127
+x_MB_LEN_MAX = 4
+x_SHRT_MIN = (-32767 - 1)
+x_SHRT_MAX = 32767
+x_USHRT_MAX = 65535U
+x_INT_MIN = (-32767 - 1)
+x_INT_MAX = 32767
+x_UINT_MAX = 65535U
+x_LONG_MIN = (-2147483647L - 1)
+x_LONG_MAX = 2147483647L
+x_ULONG_MAX = 4294967295UL
+x_LLONG_MIN = (-9223372036854775807LL - 1)
+x_LLONG_MAX = 9223372036854775807LL
+x_ULLONG_MAX = 18446744073709551615ULL
+x_BOOL_MAX = 1
+x_BOOL_WIDTH = 1
+x_CHAR_WIDTH = 8
+x_SCHAR_WIDTH = 8
+x_UCHAR_WIDTH = 8
+x_SHRT_WIDTH = 16
+x_USHRT_WIDTH = 16
+x_INT_WIDTH = 16
+x_UINT_WIDTH = 16
+x_LONG_WIDTH = 32
+x_ULONG_WIDTH = 32
+x_LLONG_WIDTH = 64
+x_ULLONG_WIDTH = 64
+x_BITINT_MAXWIDTH = 64
+x___STDC_VERSION_FLOAT_H__ = 202311L
+x_FLT_ROUNDS = 1
+x_FLT_RADIX = 2
+x_FLT_MANT_DIG = 24
+x_DBL_MANT_DIG = 53
+x_LDBL_MANT_DIG = 53
+x_FLT_DIG = 6
+x_DBL_DIG = 15
+x_LDBL_DIG = 15
+x_FLT_MIN_EXP = (-125)
+x_DBL_MIN_EXP = (-1021)
+x_LDBL_MIN_EXP = (-1021)
+x_FLT_MIN_10_EXP = (-37)
+x_DBL_MIN_10_EXP = (-307)
+x_LDBL_MIN_10_EXP = (-307)
+x_FLT_MAX_EXP = 128
+x_DBL_MAX_EXP = 1024
+x_LDBL_MAX_EXP = 1024
+x_FLT_MAX_10_EXP = 38
+x_DBL_MAX_10_EXP = 308
+x_LDBL_MAX_10_EXP = 308
+x_FLT_MAX = 3.40282347e+38F
+x_DBL_MAX = 1.7976931348623157e+308
+x_LDBL_MAX = 1.7976931348623157e+308L
+x_FLT_EPSILON = 1.19209290e-7F
+x_DBL_EPSILON = 2.2204460492503131e-16
+x_LDBL_EPSILON = 2.2204460492503131e-16L
+x_FLT_MIN = 1.17549435e-38F
+x_DBL_MIN = 2.2250738585072014e-308
+x_LDBL_MIN = 2.2250738585072014e-308L
+x_FLT_EVAL_METHOD = 0
+x_DECIMAL_DIG = 17
+x_FLT_DECIMAL_DIG = 9
+x_DBL_DECIMAL_DIG = 17
+x_LDBL_DECIMAL_DIG = 17
+x_FLT_HAS_SUBNORM = 1
+x_DBL_HAS_SUBNORM = 1
+x_LDBL_HAS_SUBNORM = 1
+x_FLT_TRUE_MIN = 1.40129846e-45F
+x_DBL_TRUE_MIN = 4.9406564584124654e-324
+x_LDBL_TRUE_MIN = 4.9406564584124654e-324L
+x_FLT_NORM_MAX = 3.40282347e+38F
+x_DBL_NORM_MAX = 1.7976931348623157e+308
+x_LDBL_NORM_MAX = 1.7976931348623157e+308L
+x_FLT_IS_IEC_60559 = 1
+x_DBL_IS_IEC_60559 = 1
+x_LDBL_IS_IEC_60559 = 1
+x_INFINITY = __builtin_inff()
+x_NAN = __builtin_nanf("")
+x___STDC_VERSION_STDARG_H__ = 202311L
+x_va_start = __builtin_va_start(ap, 0)
+x_va_arg = __builtin_va_arg(a0, a1)
+x_va_end = __builtin_va_end(a0)
+x_va_copy = __builtin_va_copy(a0, a1)
+x_and = &&
+x_and_eq = &=
+x_bitand = &
+x_bitor = |
+x_compl = ~
+x_not = !
+x_not_eq = !=
+x_or = ||
+x_or_eq = |=
+x_xor = ^
+x_xor_eq = ^=
+x___STDC_VERSION_STDINT_H__ = 202311L
+x_INT32_C = 7L
+x_UINT32_C = 7UL
+x_INT8_MIN = (-127 - 1)
+x_INT8_MAX = 127
+x_UINT8_MAX = 255
+x_INT16_MIN = (-32767 - 1)
+x_INT16_MAX = 32767
+x_UINT16_MAX = 65535U
+x_INT32_MIN = (-2147483647L - 1)
+x_INT32_MAX = 2147483647L
+x_UINT32_MAX = 4294967295UL
+x_INT64_MIN = (-9223372036854775807LL - 1)
+x_INT64_MAX = 9223372036854775807LL
+x_UINT64_MAX = 18446744073709551615ULL
+x_INT_LEAST8_MIN = (-127 - 1)
+x_INT_LEAST8_MAX = 127
+x_UINT_LEAST8_MAX = 255
+x_INT_LEAST16_MIN = (-32767 - 1)
+x_INT_LEAST16_MAX = 32767
+x_UINT_LEAST16_MAX = 65535U
+x_INT_LEAST32_MIN = (-2147483647L - 1)
+x_INT_LEAST32_MAX = 2147483647L
+x_UINT_LEAST32_MAX = 4294967295UL
+x_INT_LEAST64_MIN = (-9223372036854775807LL - 1)
+x_INT_LEAST64_MAX = 9223372036854775807LL
+x_UINT_LEAST64_MAX = 18446744073709551615ULL
+x_INT_FAST8_MIN = (-127 - 1)
+x_INT_FAST8_MAX = 127
+x_UINT_FAST8_MAX = 255
+x_INT_FAST16_MIN = (-32767 - 1)
+x_INT_FAST16_MAX = 32767
+x_UINT_FAST16_MAX = 65535U
+x_INT_FAST32_MIN = (-2147483647L - 1)
+x_INT_FAST32_MAX = 2147483647L
+x_UINT_FAST32_MAX = 4294967295UL
+x_INT_FAST64_MIN = (-9223372036854775807LL - 1)
+x_INT_FAST64_MAX = 9223372036854775807LL
+x_UINT_FAST64_MAX = 18446744073709551615ULL
+x_INTPTR_MIN = (-2147483647L - 1)
+x_INTPTR_MAX = 2147483647L
+x_UINTPTR_MAX = 4294967295UL
+x_PTRDIFF_MIN = (-2147483647L - 1)
+x_PTRDIFF_MAX = 2147483647L
+x_SIZE_MAX = 4294967295UL
+x_INTMAX_MIN = (-9223372036854775807LL - 1)
+x_INTMAX_MAX = 9223372036854775807LL
+x_UINTMAX_MAX = 18446744073709551615ULL
+x_SIG_ATOMIC_MIN = (-32767 - 1)
+x_SIG_ATOMIC_MAX = 32767
+x_WCHAR_MIN = (-2147483647L - 1)
+x_WCHAR_MAX = 2147483647L
+x_WINT_MIN = (-2147483647L - 1)
+x_WINT_MAX = 2147483647L
+x_INT8_C = 7
+x_UINT8_C = 7
+x_INT16_C = 7
+x_UINT16_C = 7U
+x_INT64_C = 7LL
+x_UINT64_C = 7ULL
+x_INTMAX_C = 7LL
+x_UINTMAX_C = 7ULL
+x_INT8_WIDTH = 8
+x_UINT8_WIDTH = 8
+x_INT16_WIDTH = 16
+x_UINT16_WIDTH = 16
+x_INT32_WIDTH = 32
+x_UINT32_WIDTH = 32
+x_INT64_WIDTH = 64
+x_UINT64_WIDTH = 64
+x_INT_LEAST8_WIDTH = 8
+x_UINT_LEAST8_WIDTH = 8
+x_INT_LEAST16_WIDTH = 16
+x_UINT_LEAST16_WIDTH = 16
+x_INT_LEAST32_WIDTH = 32
+x_UINT_LEAST32_WIDTH = 32
+x_INT_LEAST64_WIDTH = 64
+x_UINT_LEAST64_WIDTH = 64
+x_INT_FAST8_WIDTH = 8
+x_UINT_FAST8_WIDTH = 8
+x_INT_FAST16_WIDTH = 16
+x_UINT_FAST16_WIDTH = 16
+x_INT_FAST32_WIDTH = 32
+x_UINT_FAST32_WIDTH = 32
+x_INT_FAST64_WIDTH = 64
+x_UINT_FAST64_WIDTH = 64
+x_INTPTR_WIDTH = 32
+x_UINTPTR_WIDTH = 32
+x_INTMAX_WIDTH = 64
+x_UINTMAX_WIDTH = 64
+x_PTRDIFF_WIDTH = 32
+x_SIZE_WIDTH = 32
+x_SIG_ATOMIC_WIDTH = 16
+x_WCHAR_WIDTH = 32
+x_WINT_WIDTH = 32
+x_bool = bool
+x_true = true
+x_false = false
+x___bool_true_false_are_defined = 1
+x_alignas = alignas
+x_alignof = alignof
+x___alignas_is_defined = 1
+x___alignof_is_defined = 1
+x_noreturn = _Noreturn

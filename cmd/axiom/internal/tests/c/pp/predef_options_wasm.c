@@ -1,0 +1,2 @@
+/* flags: --target=wasm32 --c-int=64 --c-long=64 */
+__CHAR_UNSIGNED__ __AXIOM_INT_WIDTH__ __AXIOM_LONG_WIDTH__ __AXIOM_PTR_WIDTH__ __AXIOM_WCHAR_WIDTH__ __AXIOM_WCHAR_SIGNED__

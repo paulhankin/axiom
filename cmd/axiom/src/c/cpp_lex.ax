@@ -1,0 +1,1130 @@
+// =============================================================================
+// cpp_lex.ax - the C preprocessor's lexer: translation phases 1 to 3. A
+// source file's text is mapped (trigraphs, line splices, \r\n line ends) and
+// decomposed into preprocessing tokens and white space, one token at a time.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../util.ax" as u;
+import "copts.ax" as co;
+import "ctok.ax" as ct;
+import "std/unicode" as uni;
+
+// Preprocessing tokens.
+pub const PK_EOF: i32 = 0;
+pub const PK_IDENT: i32 = 1;
+pub const PK_NUMBER: i32 = 2;       // a pp-number
+pub const PK_CHAR: i32 = 3;         // id: the encoding prefix (ct.ENC_)
+pub const PK_STRING: i32 = 4;       // id: the encoding prefix
+pub const PK_PUNCT: i32 = 5;        // id: a ct.P_ constant, or PP_HASH, PP_HASHHASH
+pub const PK_OTHER: i32 = 6;        // a character that is no other token (or an unterminated literal)
+pub const PK_HEADER: i32 = 7;       // a header name, <...> or "..." (after #include and #embed)
+pub const PK_PLACEMARKER: i32 = 8;  // (macro replacement)
+pub const PK_PARAM: i32 = 9;        // a parameter in a replacement list; id: its index
+pub const PK_VAOPT: i32 = 10;       // __VA_OPT__ in a replacement list
+
+pub const PP_HASH: i32 = 100;      // # %:
+pub const PP_HASHHASH: i32 = 101;  // ## %:%:
+
+pub struct PTok {
+    kind: i32,
+    id: i32,
+    text: []u8,  // the spelling
+    name: []u8,  // identifiers: interned, universal character names decoded to UTF-8
+    span: u.Span,
+    space: bool,     // white space came before it
+    bol: bool,       // first on its line
+    noexpand: bool,  // an identifier never again replaced as a macro (6.10.3.4)
+    exp: bool,       // from a macro expansion
+}
+
+/// A token of the kind, with nothing before it and not from a macro.
+pub fn mktok(kind: i32, id: i32, text: []u8, sp: u.Span) PTok {
+    return PTok.{ kind: kind, id: id, text: text, name: u.nosym(), span: sp, space: false, bol: false, noexpand: false,
+                  exp: false };
+}
+
+/// Whether t is the punctuator `id`.
+pub fn is_punct(t: *PTok, id: i32) bool {
+    return (t.kind == PK_PUNCT) and (t.id == id);
+}
+
+/// Whether t is the identifier `name`.
+pub fn is_ident(t: *PTok, name: []u8) bool {
+    return (t.kind == PK_IDENT) and u.str_eq(t.name, name);
+}
+
+// A point where the mapped text and the file's own stop corresponding byte
+// for byte: mapped offset `at` is file offset `orig`, and so on until the
+// next point.
+struct Adj {
+    at: u32,
+    orig: u32,
+}
+
+pub struct Lx {
+    sf: *mut u.SourceFile,
+    s: []u8,  // the text after phases 1 and 2, ending with a new-line
+    adj: u.List.[Adj],
+    pos: usize,
+    std: i32,
+    bol: bool,         // the next token starts a line
+    quiet: bool,       // no diagnostics (in a skipped group)
+    scratch: bool,     // no diagnostics at all (text that is no file's)
+    ntok: i32,         // tokens lexed on this line
+    first_hash: bool,  // this line starts with # (a directive)
+    dname: []u8,       // the directive's name (the line's second token), interned
+    eol: usize,        // where the last line with tokens ended (its new-line)
+    pend_space: bool,  // at_eol skipped white space before the next token
+    prev: PTok,        // the last two tokens of the line, for header names
+    prev2: PTok,
+    has_la: bool,
+    la: PTok,
+}
+
+fn ret_tok() PTok {
+    return mktok(PK_EOF, 0, "", u.mkspan(0, 0, 0));
+}
+
+// -----------------------------------------------------------------------------
+// Phases 1 and 2
+// -----------------------------------------------------------------------------
+fn trigraph(c: u8) u8 {
+    match c {
+        '='  => { return '#'; }
+        '('  => { return '['; }
+        '/'  => { return '\\'; }
+        ')'  => { return ']'; }
+        '\'' => { return '^'; }
+        '<'  => { return '{'; }
+        '!'  => { return '|'; }
+        '>'  => { return '}'; }
+        '-'  => { return '~'; }
+        else => { return 0; }
+    }
+}
+
+// The phase-1 character at t[i] and how many bytes it takes: a trigraph,
+// \r\n, or the byte.
+fn eff_len(t: []u8, i: usize, tri: bool) usize {
+    if tri and ((i + 2) < t.len) and (t[i] == '?') and (t[i + 1] == '?') and (trigraph(t[i + 2]) != 0) {
+        return 3;
+    }
+    if (t[i] == '\r') and ((i + 1) < t.len) and (t[i + 1] == '\n') {
+        return 2;
+    }
+    return 1;
+}
+
+fn eff_char(t: []u8, i: usize, n: usize) u8 {
+    if n == 3 {
+        return trigraph(t[i + 2]);
+    }
+    if n == 2 {
+        return '\n';
+    }
+    return t[i];
+}
+
+/// A lexer for the source file `sf` (phases 1 and 2 are done here, once).
+pub fn open(sf: *mut u.SourceFile, std: i32) *mut Lx {
+    let L = u.new.[Lx]();
+    L.sf = sf;
+    L.std = std;
+    L.bol = true;
+    L.prev = ret_tok();
+    L.prev2 = ret_tok();
+    L.la = ret_tok();
+    L.dname = u.nosym();
+    let t = sf.text;
+    let tri = std < co.C23;
+    let mut start: usize = 0;
+    // (a byte-order mark is not part of the text)
+    if (t.len >= 3) and (t[0] == 0xEF) and (t[1] == 0xBB) and (t[2] == 0xBF) {
+        start = 3;
+    }
+    // most files need no mapping
+    let mut plain = true;
+    let mut i = start;
+    while i < t.len {
+        let c = t[i];
+        if (c == '\r') or ((c == '\\') and ((i + 1) < t.len) and ((t[i + 1] == '\n') or (t[i + 1] == '\r'))) or
+           (tri and (c == '?') and ((i + 1) < t.len) and (t[i + 1] == '?')) {
+            plain = false;
+            break;
+        }
+        i += 1;
+    }
+    L.adj.push(Adj.{ at: 0, orig: @int_cast(u32, start) });
+    if plain and (t.len > start) and (t[t.len - 1] == '\n') {
+        L.s = t[start..];
+        return L;
+    }
+    let mut b = u.Buf.init();
+    i = start;
+    let mut spliced_at_end = false;
+    while i < t.len {
+        let n = eff_len(t, i, tri);
+        let c = eff_char(t, i, n);
+        if (c == '\\') and ((i + n) < t.len) {
+            let n2 = eff_len(t, i + n, tri);
+            if eff_char(t, i + n, n2) == '\n' {
+                i += n + n2;
+                L.adj.push(Adj.{ at: @int_cast(u32, b.len()), orig: @int_cast(u32, i) });
+                spliced_at_end = i >= t.len;
+                continue;
+            }
+        }
+        b.c(c);
+        i += n;
+        if n != 1 {
+            L.adj.push(Adj.{ at: @int_cast(u32, b.len()), orig: @int_cast(u32, i) });
+        }
+    }
+    if spliced_at_end {
+        _ = dg.warning(u.mkspan(sf.id, @int_cast(u32, t.len), @int_cast(u32, t.len)), "C4101",
+                       "backslash-newline at end of file");
+    }
+    if (b.len() == 0) or (b.view()[b.len() - 1] != '\n') {
+        b.c('\n');
+    }
+    L.s = b.done();
+    return L;
+}
+
+// The file offset of mapped offset p.
+fn orig_of(L: *Lx, p: usize) u32 {
+    let a = L.adj.items();
+    if a.len == 1 {
+        return a[0].orig + @int_cast(u32, p);
+    }
+    let pp = @int_cast(u32, p);
+    let mut lo: usize = 0;
+    let mut hi = a.len - 1;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if a[mid].at <= pp {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let r = a[lo].orig + (pp - a[lo].at);
+    let lim = @int_cast(u32, L.sf.text.len);
+    if r > lim {
+        return lim;
+    }
+    return r;
+}
+
+/// The span of the mapped text a..b.
+pub fn span_of(L: *Lx, a: usize, b: usize) u.Span {
+    let sa = orig_of(L, a);
+    let mut sb = sa;
+    if b > a {
+        sb = orig_of(L, b - 1) + 1;
+    }
+    return u.mkspan(L.sf.id, sa, sb);
+}
+
+// -----------------------------------------------------------------------------
+// Characters
+// -----------------------------------------------------------------------------
+/// The value of a hexadecimal digit, or -1.
+pub fn hexval(c: u8) i32 {
+    if (c >= '0') and (c <= '9') {
+        return @as(i32, c - '0');
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return @as(i32, c - 'a') + 10;
+    }
+    if (c >= 'A') and (c <= 'F') {
+        return @as(i32, c - 'A') + 10;
+    }
+    return -1;
+}
+
+/// Whether c is a letter or `_` (a nondigit of an identifier).
+pub fn is_alpha_(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or (c == '_');
+}
+
+/// Whether c is a decimal digit.
+pub fn is_digit(c: u8) bool {
+    return (c >= '0') and (c <= '9');
+}
+
+/// The code point of the UTF-8 sequence at s[i], and its length in `n` (0
+/// if it is not well formed).
+pub fn utf8_at(s: []u8, i: usize, n: *mut usize) u32 {
+    let c = s[i];
+    n.* = 0;
+    if c < 0x80 {
+        n.* = 1;
+        return @as(u32, c);
+    }
+    let mut len: usize = 0;
+    let mut cp: u32 = 0;
+    let mut min: u32 = 0;
+    if (c & 0xE0) == 0xC0 {
+        len = 2;
+        cp = @as(u32, c & 0x1F);
+        min = 0x80;
+    } else if (c & 0xF0) == 0xE0 {
+        len = 3;
+        cp = @as(u32, c & 0x0F);
+        min = 0x800;
+    } else if (c & 0xF8) == 0xF0 {
+        len = 4;
+        cp = @as(u32, c & 0x07);
+        min = 0x10000;
+    } else {
+        return 0xFFFD;
+    }
+    if (i + len) > s.len {
+        return 0xFFFD;
+    }
+    for k in 1..len {
+        let d = s[i + k];
+        if (d & 0xC0) != 0x80 {
+            return 0xFFFD;
+        }
+        cp = (cp << 6) | @as(u32, d & 0x3F);
+    }
+    if (cp < min) or (cp > 0x10FFFF) or ((cp >= 0xD800) and (cp <= 0xDFFF)) {
+        return 0xFFFD;
+    }
+    n.* = len;
+    return cp;
+}
+
+/// Appends the UTF-8 encoding of cp.
+pub fn put_utf8(b: *mut u.Buf, cp: u32) void {
+    if cp < 0x80 {
+        b.c(@truncate(u8, cp));
+    } else if cp < 0x800 {
+        b.c(@truncate(u8, 0xC0 | (cp >> 6)));
+        b.c(@truncate(u8, 0x80 | (cp & 0x3F)));
+    } else if cp < 0x10000 {
+        b.c(@truncate(u8, 0xE0 | (cp >> 12)));
+        b.c(@truncate(u8, 0x80 | ((cp >> 6) & 0x3F)));
+        b.c(@truncate(u8, 0x80 | (cp & 0x3F)));
+    } else {
+        b.c(@truncate(u8, 0xF0 | (cp >> 18)));
+        b.c(@truncate(u8, 0x80 | ((cp >> 12) & 0x3F)));
+        b.c(@truncate(u8, 0x80 | ((cp >> 6) & 0x3F)));
+        b.c(@truncate(u8, 0x80 | (cp & 0x3F)));
+    }
+}
+
+// The ranges of characters allowed in identifiers by C11 Annex D (D.1),
+// as pairs; used for C99 to C17.
+let ANNEX_D: [84]u32 = [
+    0xA8,
+    0xA8,
+    0xAA,
+    0xAA,
+    0xAD,
+    0xAD,
+    0xAF,
+    0xAF,
+    0xB2,
+    0xB5,
+    0xB7,
+    0xBA,
+    0xBC,
+    0xBE,
+    0xC0,
+    0xD6,
+    0xD8,
+    0xF6,
+    0xF8,
+    0xFF,
+    0x100,
+    0x167F,
+    0x1681,
+    0x180D,
+    0x180F,
+    0x1FFF,
+    0x200B,
+    0x200D,
+    0x202A,
+    0x202E,
+    0x203F,
+    0x2040,
+    0x2054,
+    0x2054,
+    0x2060,
+    0x206F,
+    0x2070,
+    0x218F,
+    0x2460,
+    0x24FF,
+    0x2776,
+    0x2793,
+    0x2C00,
+    0x2DFF,
+    0x2E80,
+    0x2FFF,
+    0x3004,
+    0x3007,
+    0x3021,
+    0x302F,
+    0x3031,
+    0x303F,
+    0x3040,
+    0xD7FF,
+    0xF900,
+    0xFD3D,
+    0xFD40,
+    0xFDCF,
+    0xFDF0,
+    0xFE44,
+    0xFE47,
+    0xFFFD,
+    0x10000,
+    0x1FFFD,
+    0x20000,
+    0x2FFFD,
+    0x30000,
+    0x3FFFD,
+    0x40000,
+    0x4FFFD,
+    0x50000,
+    0x5FFFD,
+    0x60000,
+    0x6FFFD,
+    0x70000,
+    0x7FFFD,
+    0x80000,
+    0x8FFFD,
+    0x90000,
+    0x9FFFD,
+    0xA0000,
+    0xAFFFD,
+    0xB0000,
+    0xBFFFD,
+];
+
+fn annex_d(cp: u32) bool {
+    let mut k: usize = 0;
+    while k < ANNEX_D.len {
+        if (cp >= ANNEX_D[k]) and (cp <= ANNEX_D[k + 1]) {
+            return true;
+        }
+        k += 2;
+    }
+    // (the last planes, written out of the table to keep it short)
+    let plane = cp >> 16;
+    return (plane >= 0xC) and (plane <= 0xE) and ((cp & 0xFFFF) <= 0xFFFD);
+}
+
+// Characters not allowed first in an identifier (C11 D.2): combining marks.
+fn annex_d2(cp: u32) bool {
+    return ((cp >= 0x300) and (cp <= 0x36F)) or ((cp >= 0x1DC0) and (cp <= 0x1DFF)) or
+           ((cp >= 0x20D0) and (cp <= 0x20FF)) or ((cp >= 0xFE20) and (cp <= 0xFE2F));
+}
+
+// XID_Start and XID_Continue (UAX #31) from ID_Start and ID_Continue: the
+// characters whose compatibility decomposition is no identifier.
+fn not_xid(cp: u32, start: bool) bool {
+    if (cp == 0x37A) or (cp == 0x309B) or (cp == 0x309C) or ((cp >= 0xFC5E) and (cp <= 0xFC63)) or (cp == 0xFDFA) or
+       (cp == 0xFDFB) or ((cp >= 0xFE70) and (cp <= 0xFE7E) and ((cp & 1) == 0)) {
+        return true;
+    }
+    return start and ((cp == 0xE33) or (cp == 0xEB3) or (cp == 0xFF9E) or (cp == 0xFF9F));
+}
+
+/// Whether the character cp (not ASCII) may be in an identifier, first or
+/// not, under the standard.
+pub fn ident_char(cp: u32, first: bool, std: i32) bool {
+    if std < co.C99 {
+        return false;
+    }
+    if std >= co.C23 {
+        if first {
+            return uni.is_id_start(cp) and not not_xid(cp, true);
+        }
+        return uni.is_id_continue(cp) and not not_xid(cp, false);
+    }
+    return annex_d(cp) and not (first and annex_d2(cp));
+}
+
+/// The value of the universal character name at s[i] (\u or \U and its
+/// digits), its length in `n`; n is 0 if there is none.
+pub fn ucn_at(s: []u8, i: usize, n: *mut usize) u32 {
+    n.* = 0;
+    if ((i + 1) >= s.len) or (s[i] != '\\') or ((s[i + 1] != 'u') and (s[i + 1] != 'U')) {
+        return 0;
+    }
+    let mut nd: usize = 4;
+    if s[i + 1] == 'U' {
+        nd = 8;
+    }
+    if (i + 2 + nd) > s.len {
+        return 0;
+    }
+    let mut v: u32 = 0;
+    for k in 0..nd {
+        let h = hexval(s[i + 2 + k]);
+        if h < 0 {
+            return 0;
+        }
+        v = (v << 4) | @int_cast(u32, h);
+    }
+    n.* = 2 + nd;
+    return v;
+}
+
+/// Whether a universal character name for cp is valid, in or out of a
+/// character constant or string literal; else the error.
+pub fn ucn_error(cp: u32, in_literal: bool, std: i32) []u8 {
+    if (cp > 0x10FFFF) or ((cp >= 0xD800) and (cp <= 0xDFFF)) {
+        return "universal character name designates no character";
+    }
+    if std >= co.C23 {
+        if not in_literal and (cp < 0xA0) {
+            return "universal character name outside a literal designates a basic or control character";
+        }
+        return u.nosym();
+    }
+    if (cp < 0xA0) and (cp != 0x24) and (cp != 0x40) and (cp != 0x60) {
+        return "universal character name designates a character of the basic character set";
+    }
+    return u.nosym();
+}
+
+// -----------------------------------------------------------------------------
+// Phase 3
+// -----------------------------------------------------------------------------
+fn err(L: *Lx, a: usize, b: usize, code: []u8, msg: []u8) void {
+    if not L.quiet and not L.scratch {
+        _ = dg.err(span_of(L, a, b), code, msg);
+    }
+}
+
+fn at(L: *Lx, i: usize) u8 {
+    if i < L.s.len {
+        return L.s[i];
+    }
+    return 0;
+}
+
+// The punctuator at s[i]: its length (0 if none) and its id in `id`.
+fn punct_at(L: *Lx, i: usize, id: *mut i32) usize {
+    let c = at(L, i);
+    let c1 = at(L, i + 1);
+    let c2 = at(L, i + 2);
+    let c3 = at(L, i + 3);
+    let dig = L.std >= co.C95;
+    id.* = 0;
+    match c {
+        '[' => {
+            id.* = ct.P_LBRACKET;
+            return 1;
+        }
+        ']' => {
+            id.* = ct.P_RBRACKET;
+            return 1;
+        }
+        '(' => {
+            id.* = ct.P_LPAREN;
+            return 1;
+        }
+        ')' => {
+            id.* = ct.P_RPAREN;
+            return 1;
+        }
+        '{' => {
+            id.* = ct.P_LBRACE;
+            return 1;
+        }
+        '}' => {
+            id.* = ct.P_RBRACE;
+            return 1;
+        }
+        '~' => {
+            id.* = ct.P_TILDE;
+            return 1;
+        }
+        '?' => {
+            id.* = ct.P_QUESTION;
+            return 1;
+        }
+        ';' => {
+            id.* = ct.P_SEMI;
+            return 1;
+        }
+        ',' => {
+            id.* = ct.P_COMMA;
+            return 1;
+        }
+        '.' => {
+            if (c1 == '.') and (c2 == '.') {
+                id.* = ct.P_ELLIPSIS;
+                return 3;
+            }
+            id.* = ct.P_DOT;
+            return 1;
+        }
+        '-' => {
+            if c1 == '>' {
+                id.* = ct.P_ARROW;
+                return 2;
+            }
+            if c1 == '-' {
+                id.* = ct.P_DEC;
+                return 2;
+            }
+            if c1 == '=' {
+                id.* = ct.P_SUB_EQ;
+                return 2;
+            }
+            id.* = ct.P_MINUS;
+            return 1;
+        }
+        '+' => {
+            if c1 == '+' {
+                id.* = ct.P_INC;
+                return 2;
+            }
+            if c1 == '=' {
+                id.* = ct.P_ADD_EQ;
+                return 2;
+            }
+            id.* = ct.P_PLUS;
+            return 1;
+        }
+        '&' => {
+            if c1 == '&' {
+                id.* = ct.P_ANDAND;
+                return 2;
+            }
+            if c1 == '=' {
+                id.* = ct.P_AND_EQ;
+                return 2;
+            }
+            id.* = ct.P_AMP;
+            return 1;
+        }
+        '|' => {
+            if c1 == '|' {
+                id.* = ct.P_OROR;
+                return 2;
+            }
+            if c1 == '=' {
+                id.* = ct.P_OR_EQ;
+                return 2;
+            }
+            id.* = ct.P_PIPE;
+            return 1;
+        }
+        '*' => {
+            if c1 == '=' {
+                id.* = ct.P_MUL_EQ;
+                return 2;
+            }
+            id.* = ct.P_STAR;
+            return 1;
+        }
+        '/' => {
+            if c1 == '=' {
+                id.* = ct.P_DIV_EQ;
+                return 2;
+            }
+            id.* = ct.P_SLASH;
+            return 1;
+        }
+        '^' => {
+            if c1 == '=' {
+                id.* = ct.P_XOR_EQ;
+                return 2;
+            }
+            id.* = ct.P_CARET;
+            return 1;
+        }
+        '!' => {
+            if c1 == '=' {
+                id.* = ct.P_NE;
+                return 2;
+            }
+            id.* = ct.P_BANG;
+            return 1;
+        }
+        '=' => {
+            if c1 == '=' {
+                id.* = ct.P_EQ;
+                return 2;
+            }
+            id.* = ct.P_ASSIGN;
+            return 1;
+        }
+        ':' => {
+            if dig and (c1 == '>') {
+                id.* = ct.P_RBRACKET;
+                return 2;
+            }
+            if (L.std >= co.C23) and (c1 == ':') {
+                id.* = ct.P_COLONCOLON;
+                return 2;
+            }
+            id.* = ct.P_COLON;
+            return 1;
+        }
+        '#' => {
+            if c1 == '#' {
+                id.* = PP_HASHHASH;
+                return 2;
+            }
+            id.* = PP_HASH;
+            return 1;
+        }
+        '<' => {
+            if c1 == '<' {
+                if c2 == '=' {
+                    id.* = ct.P_SHL_EQ;
+                    return 3;
+                }
+                id.* = ct.P_SHL;
+                return 2;
+            }
+            if c1 == '=' {
+                id.* = ct.P_LE;
+                return 2;
+            }
+            if dig and (c1 == ':') {
+                id.* = ct.P_LBRACKET;
+                return 2;
+            }
+            if dig and (c1 == '%') {
+                id.* = ct.P_LBRACE;
+                return 2;
+            }
+            id.* = ct.P_LT;
+            return 1;
+        }
+        '>' => {
+            if c1 == '>' {
+                if c2 == '=' {
+                    id.* = ct.P_SHR_EQ;
+                    return 3;
+                }
+                id.* = ct.P_SHR;
+                return 2;
+            }
+            if c1 == '=' {
+                id.* = ct.P_GE;
+                return 2;
+            }
+            id.* = ct.P_GT;
+            return 1;
+        }
+        '%' => {
+            if c1 == '=' {
+                id.* = ct.P_MOD_EQ;
+                return 2;
+            }
+            if dig and (c1 == '>') {
+                id.* = ct.P_RBRACE;
+                return 2;
+            }
+            if dig and (c1 == ':') {
+                if (c2 == '%') and (c3 == ':') {
+                    id.* = PP_HASHHASH;
+                    return 4;
+                }
+                id.* = PP_HASH;
+                return 2;
+            }
+            id.* = ct.P_PERCENT;
+            return 1;
+        }
+        else => { return 0; }
+    }
+}
+
+// The end of the identifier characters from s[i] (ASCII, universal
+// character names, UTF-8), with the name's UTF-8 in `nb` when one is not
+// plain ASCII (`plain` is then cleared).
+fn scan_ident(L: *mut Lx, i0: usize, first: bool, nb: *mut u.Buf, plain: *mut bool) usize {
+    let s = L.s;
+    let mut i = i0;
+    let mut is_first = first;
+    loop {
+        let c = s[i];
+        if is_alpha_(c) or is_digit(c) {
+            if is_first and is_digit(c) {
+                return i;
+            }
+            nb.c(c);
+            i += 1;
+        } else if (c == '\\') and (L.std >= co.C99) {
+            let mut n: usize = 0;
+            let cp = ucn_at(s, i, &mut n);
+            if n == 0 {
+                return i;
+            }
+            let e = ucn_error(cp, false, L.std);
+            if not u.isnos(e) {
+                err(L, i, i + n, "C1003", e);
+            } else if (cp >= 0x80) and not ident_char(cp, is_first, L.std) {
+                if is_first {
+                    return i;
+                }
+                err(L, i, i + n, "C1004", u.f1("universal character name '%s' is not allowed in an identifier",
+                                               s[i..i + n]));
+            }
+            if plain.* {
+                plain.* = false;
+            }
+            put_utf8(nb, cp);
+            i += n;
+        } else if c >= 0x80 {
+            let mut n: usize = 0;
+            let cp = utf8_at(s, i, &mut n);
+            if (n == 0) or not ident_char(cp, is_first, L.std) {
+                return i;
+            }
+            plain.* = false;
+            nb.s(s[i..i + n]);
+            i += n;
+        } else {
+            return i;
+        }
+        is_first = false;
+    }
+}
+
+// The end of the pp-number from s[i].
+fn scan_number(L: *mut Lx, i0: usize) usize {
+    let s = L.s;
+    let mut i = i0;
+    loop {
+        let c = s[i];
+        if ((c == 'e') or (c == 'E') or (((c == 'p') or (c == 'P')) and (L.std >= co.C99))) and
+           ((s[i + 1] == '+') or (s[i + 1] == '-')) {
+            i += 2;
+        } else if is_alpha_(c) or is_digit(c) or (c == '.') {
+            i += 1;
+        } else if (c == '\'') and (L.std >= co.C23) and (is_alpha_(s[i + 1]) or is_digit(s[i + 1])) {
+            i += 2;
+        } else if ((c == '\\') or (c >= 0x80)) and (L.std >= co.C99) {
+            let mut nb = u.Buf.init();
+            let mut plain = true;
+            let j = scan_ident(L, i, false, &mut nb, &mut plain);
+            nb.b.deinit();
+            if j == i {
+                return i;
+            }
+            i = j;
+        } else {
+            return i;
+        }
+    }
+}
+
+// The end of the character constant or string literal whose quote is at
+// s[i], or of the line (the literal is unterminated: `ok` is cleared).
+fn scan_quoted(L: *Lx, i0: usize, q: u8, ok: *mut bool) usize {
+    let s = L.s;
+    let mut i = i0 + 1;
+    loop {
+        let c = s[i];
+        if c == q {
+            return i + 1;
+        }
+        if c == '\n' {
+            ok.* = false;
+            return i;
+        }
+        if (c == '\\') and (s[i + 1] != '\n') {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+// Whether a header name may come next: after `#include` or `#embed`, or
+// after `__has_include(` or `__has_embed(` in #if and #elif (C23).
+fn header_next(L: *Lx) bool {
+    if not L.first_hash {
+        return false;
+    }
+    if L.ntok == 2 {
+        return u.str_eq(L.dname, "include") or u.str_eq(L.dname, "embed");
+    }
+    if (L.std >= co.C23) and (L.ntok >= 3) and is_punct(&L.prev, ct.P_LPAREN) and
+       (is_ident(&L.prev2, "__has_include") or is_ident(&L.prev2, "__has_embed")) {
+        return u.str_eq(L.dname, "if") or u.str_eq(L.dname, "elif");
+    }
+    return false;
+}
+
+// Skips white space and comments; true if there was some. Stops at a new-line.
+fn skip_space(L: *mut Lx) bool {
+    let s = L.s;
+    let mut sp = false;
+    loop {
+        let c = s[L.pos];
+        if (c == ' ') or (c == '\t') {
+            L.pos += 1;
+        } else if (c == '\x0c') or (c == '\x0b') or (c == '\r') {
+            if L.first_hash {
+                err(L, L.pos, L.pos + 1, "C1008", "form feed or vertical tab in a preprocessing directive");
+            }
+            L.pos += 1;
+        } else if (c == '/') and (s[L.pos + 1] == '*') {
+            let a = L.pos;
+            let mut i = L.pos + 2;
+            loop {
+                if (i + 1) >= s.len {
+                    // (an unterminated comment: said even in a skipped group)
+                    if not L.scratch {
+                        _ = dg.err(span_of(L, a, a + 2), "C1001", "unterminated comment");
+                    }
+                    i = s.len - 1;
+                    break;
+                }
+                if (s[i] == '*') and (s[i + 1] == '/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            L.pos = i;
+        } else if (c == '/') and (s[L.pos + 1] == '/') and (L.std >= co.C99) {
+            while s[L.pos] != '\n' {
+                L.pos += 1;
+            }
+        } else {
+            return sp;
+        }
+        sp = true;
+    }
+}
+
+/// The next preprocessing token (EOF at the end of the text). `space` and
+/// `bol` say what came before it.
+fn lex1(L: *mut Lx) PTok {
+    let s = L.s;
+    let mut sp = L.pend_space;
+    L.pend_space = false;
+    loop {
+        if L.pos >= s.len {
+            let mut t = mktok(PK_EOF, 0, "", span_of(L, s.len, s.len));
+            t.bol = true;
+            return t;
+        }
+        if skip_space(L) {
+            sp = true;
+        }
+        if L.pos >= s.len {
+            continue;
+        }
+        if s[L.pos] == '\n' {
+            if not L.bol {
+                L.eol = L.pos;
+            }
+            L.pos += 1;
+            L.bol = true;
+            L.ntok = 0;
+            L.first_hash = false;
+            sp = false;
+            continue;
+        }
+        break;
+    }
+    let a = L.pos;
+    let c = s[a];
+    let mut kind = PK_OTHER;
+    let mut id: i32 = 0;
+    let mut name = u.nosym();
+    let mut end = a + 1;
+    if header_next(L) and ((c == '<') or (c == '"')) {
+        let mut close: u8 = '>';
+        if c == '"' {
+            close = '"';
+        }
+        let mut i = a + 1;
+        while (s[i] != close) and (s[i] != '\n') {
+            i += 1;
+        }
+        if s[i] == close {
+            kind = PK_HEADER;
+            end = i + 1;
+        }
+    }
+    if kind == PK_HEADER {
+        // (taken above)
+    } else if is_alpha_(c) or (c == '\\') or (c >= 0x80) {
+        let mut nb = u.Buf.init();
+        let mut plain = true;
+        let e = scan_ident(L, a, true, &mut nb, &mut plain);
+        if e > a {
+            kind = PK_IDENT;
+            end = e;
+            if plain {
+                name = u.intern(s[a..e]);
+            } else {
+                name = u.intern(nb.view());
+            }
+            // an encoding prefix
+            let q = s[e];
+            if (q == '"') or (q == '\'') {
+                let p = s[a..e];
+                let mut enc: i32 = -1;
+                if u.str_eq(p, "L") {
+                    enc = ct.ENC_WIDE;
+                } else if u.str_eq(p, "u") and (L.std >= co.C11) {
+                    enc = ct.ENC_UTF16;
+                } else if u.str_eq(p, "U") and (L.std >= co.C11) {
+                    enc = ct.ENC_UTF32;
+                } else if u.str_eq(p, "u8") and ((L.std >= co.C23) or ((q == '"') and (L.std >= co.C11))) {
+                    enc = ct.ENC_UTF8;
+                }
+                if enc >= 0 {
+                    let mut ok = true;
+                    end = scan_quoted(L, e, q, &mut ok);
+                    name = u.nosym();
+                    if ok {
+                        kind = PK_STRING;
+                        if q == '\'' {
+                            kind = PK_CHAR;
+                        }
+                        id = enc;
+                    } else {
+                        kind = PK_OTHER;
+                        err(L, a, end, "C1002", u.f1("missing terminating %s character", u.pick(q == '"', "\"", "'")));
+                    }
+                }
+            }
+        } else if c >= 0x80 {
+            let mut n: usize = 0;
+            _ = utf8_at(s, a, &mut n);
+            if n == 0 {
+                n = 1;
+            }
+            end = a + n;
+        }
+        nb.b.deinit();
+    } else if is_digit(c) or ((c == '.') and is_digit(s[a + 1])) {
+        kind = PK_NUMBER;
+        end = scan_number(L, a + 1);
+    } else if (c == '\'') or (c == '"') {
+        let mut ok = true;
+        end = scan_quoted(L, a, c, &mut ok);
+        if ok {
+            kind = PK_STRING;
+            if c == '\'' {
+                kind = PK_CHAR;
+            }
+            id = ct.ENC_NONE;
+        } else {
+            err(L, a, end, "C1002", u.f1("missing terminating %s character", u.pick(c == '"', "\"", "'")));
+        }
+    } else {
+        let n = punct_at(L, a, &mut id);
+        if n > 0 {
+            kind = PK_PUNCT;
+            end = a + n;
+        }
+    }
+    L.pos = end;
+    let mut t = mktok(kind, id, s[a..end], span_of(L, a, end));
+    t.name = name;
+    t.space = sp;
+    t.bol = L.bol;
+    L.bol = false;
+    if t.bol and (kind == PK_PUNCT) and (id == PP_HASH) {
+        L.first_hash = true;
+        L.dname = u.nosym();
+    } else if L.first_hash and (L.ntok == 1) and (kind == PK_IDENT) {
+        L.dname = name;
+    }
+    L.ntok += 1;
+    L.prev2 = L.prev;
+    L.prev = t;
+    return t;
+}
+
+/// The next token.
+pub fn next(L: *mut Lx) PTok {
+    if L.has_la {
+        L.has_la = false;
+        return L.la;
+    }
+    return lex1(L);
+}
+
+/// The next token, left to be read again.
+pub fn peek(L: *mut Lx) *PTok {
+    if not L.has_la {
+        L.la = lex1(L);
+        L.has_la = true;
+    }
+    return &L.la;
+}
+
+/// Skips the rest of the line (after a directive); the tokens are lexed
+/// (quietly when `quiet`).
+pub fn skip_line(L: *mut Lx) void {
+    while not at_eol(L) {
+        _ = next(L);
+    }
+}
+
+/// Whether the line's tokens are all read (the next token starts a line,
+/// or there is none). The next line is not lexed.
+pub fn at_eol(L: *mut Lx) bool {
+    if L.has_la {
+        return L.la.bol or (L.la.kind == PK_EOF);
+    }
+    if L.bol {
+        return true;
+    }
+    if skip_space(L) {
+        L.pend_space = true;
+    }
+    if (L.pos >= L.s.len) or (L.s[L.pos] == '\n') {
+        L.eol = L.pos;
+        return true;
+    }
+    return false;
+}
+
+/// The line (1-based) of mapped offset p in the file.
+pub fn line_at(L: *Lx, p: usize) i64 {
+    let lc = u.span_linecol(u.mkspan(L.sf.id, orig_of(L, p), orig_of(L, p)));
+    return @as(i64, lc.sl);
+}
+
+/// Lexes `text` as a single token under the standard, for ## and for the
+/// spelling checks of --emit=c-pp: the token, and whether it is the whole
+/// text (no white space or comment, nothing after it).
+pub fn lex_one(text: []u8, std: i32, sp: u.Span, whole: *mut bool) PTok {
+    let sf = u.new.[u.SourceFile]();
+    let mut b = u.Buf.init();
+    b.s(text);
+    b.c('\n');
+    sf.text = b.done();
+    sf.id = sp.file;
+    sf.path = "";
+    sf.display = "";
+    let L = u.new.[Lx]();
+    L.sf = sf;
+    L.s = sf.text;
+    L.std = std;
+    L.quiet = true;
+    L.scratch = true;
+    L.prev = ret_tok();
+    L.prev2 = ret_tok();
+    L.la = ret_tok();
+    L.dname = u.nosym();
+    L.adj.push(Adj.{ at: 0, orig: 0 });
+    let mut t = lex1(L);
+    whole.* = (not t.space) and (t.kind != PK_EOF) and (L.pos == text.len);
+    t.span = sp;
+    t.text = text[0..@min(t.text.len, text.len)];
+    L.adj.deinit();
+    return t;
+}

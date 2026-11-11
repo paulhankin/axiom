@@ -1,0 +1,773 @@
+// =============================================================================
+// cpp_conv.ax - translation phases 5 to 7: escape sequences, the values of
+// character constants and numbers, adjacent string literals joined, and
+// preprocessing tokens made the tokens of ctok.ax.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../util.ax" as u;
+import "copts.ax" as co;
+import "cpp_lex.ax" as lx;
+import "ctok.ax" as ct;
+
+fn bad(sp: u.Span, code: []u8, msg: []u8, quiet: bool) void {
+    if not quiet {
+        _ = dg.err(sp, code, msg);
+    }
+}
+
+/// The largest code unit of an encoding (the unsigned type of its
+/// characters: unsigned char, wchar_t's, char16_t, char32_t).
+fn unit_max(enc: i32, o: *co.COptions) u64 {
+    if (enc == ct.ENC_NONE) or (enc == ct.ENC_UTF8) {
+        return 0xFF;
+    }
+    if (enc == ct.ENC_UTF16) or ((enc == ct.ENC_WIDE) and (o.wchar_bits == 16)) {
+        return 0xFFFF;
+    }
+    return 0xFFFFFFFF;
+}
+
+fn utf16_units(enc: i32, o: *co.COptions) bool {
+    return (enc == ct.ENC_UTF16) or ((enc == ct.ENC_WIDE) and (o.wchar_bits == 16));
+}
+
+// Appends the code units of the character cp in the encoding.
+fn put_cp(out: *mut u.List.[u32], cp: u32, enc: i32, o: *co.COptions) void {
+    if (enc == ct.ENC_NONE) or (enc == ct.ENC_UTF8) {
+        let mut b = u.Buf.init();
+        lx.put_utf8(&mut b, cp);
+        for c in b.view() {
+            out.push(@as(u32, c));
+        }
+        b.b.deinit();
+    } else if utf16_units(enc, o) and (cp >= 0x10000) {
+        let v = cp - 0x10000;
+        out.push(0xD800 + (v >> 10));
+        out.push(0xDC00 + (v & 0x3FF));
+    } else {
+        out.push(cp);
+    }
+}
+
+/// Appends the code units of the body of a character constant or string
+/// literal (between its quotes) in the encoding `enc`: escape sequences and
+/// universal character names decoded, the source's UTF-8 transcoded. False
+/// after an error (reported unless `quiet`).
+pub fn decode(body: []u8, enc: i32, o: *co.COptions, sp: u.Span, out: *mut u.List.[u32], quiet: bool) bool {
+    let mut ok = true;
+    let max = unit_max(enc, o);
+    let mut i: usize = 0;
+    while i < body.len {
+        let c = body[i];
+        if c != '\\' {
+            if c < 0x80 {
+                out.push(@as(u32, c));
+                i += 1;
+                continue;
+            }
+            let mut n: usize = 0;
+            let cp = lx.utf8_at(body, i, &mut n);
+            if n == 0 {
+                if (enc == ct.ENC_NONE) or (enc == ct.ENC_UTF8) {
+                    // (bytes that are not UTF-8 stand for themselves in a narrow literal)
+                    out.push(@as(u32, c));
+                    i += 1;
+                    continue;
+                }
+                bad(sp, "C1024", "invalid UTF-8 in a character constant or string literal", quiet);
+                return false;
+            }
+            put_cp(out, cp, enc, o);
+            i += n;
+            continue;
+        }
+        if (i + 1) >= body.len {
+            bad(sp, "C1012", "a string literal or character constant ends with a lone backslash", quiet);
+            return false;
+        }
+        let e = body[i + 1];
+        let mut v: u64 = 0;
+        let mut simple = true;
+        match e {
+            'a'  => { v = 7; }
+            'b'  => { v = 8; }
+            'f'  => { v = 12; }
+            'n'  => { v = 10; }
+            'r'  => { v = 13; }
+            't'  => { v = 9; }
+            'v'  => { v = 11; }
+            '\\' => { v = 92; }
+            '\'' => { v = 39; }
+            '"'  => { v = 34; }
+            '?'  => { v = 63; }
+            else => { simple = false; }
+        }
+        if simple {
+            out.push(@truncate(u32, v));
+            i += 2;
+            continue;
+        }
+        if (e >= '0') and (e <= '7') {
+            let mut j = i + 1;
+            while (j < body.len) and (j < (i + 4)) and (body[j] >= '0') and (body[j] <= '7') {
+                v = (v * 8) + @as(u64, body[j] - '0');
+                j += 1;
+            }
+            if v > max {
+                bad(sp, "C1013", u.f1("octal escape sequence '%s' is out of range", body[i..j]), quiet);
+                ok = false;
+            }
+            out.push(@truncate(u32, v));
+            i = j;
+            continue;
+        }
+        if e == 'x' {
+            let mut j = i + 2;
+            let mut big = false;
+            while (j < body.len) and (lx.hexval(body[j]) >= 0) {
+                if v > 0xFFFFFFFF {
+                    big = true;
+                }
+                v = (v << 4) | @as(u64, @int_cast(u32, lx.hexval(body[j])));
+                j += 1;
+            }
+            if j == (i + 2) {
+                bad(sp, "C1012", "\\x used with no following hex digits", quiet);
+                return false;
+            }
+            if big or (v > max) {
+                bad(sp, "C1013", u.f1("hex escape sequence '%s' is out of range", body[i..j]), quiet);
+                ok = false;
+            }
+            out.push(@truncate(u32, v));
+            i = j;
+            continue;
+        }
+        if ((e == 'u') or (e == 'U')) and (o.std >= co.C99) {
+            let mut n: usize = 0;
+            let cp = lx.ucn_at(body, i, &mut n);
+            if n == 0 {
+                bad(sp, "C1003", u.f1("incomplete universal character name in '%s'", body), quiet);
+                return false;
+            }
+            let msg = lx.ucn_error(cp, true, o.std);
+            if not u.isnos(msg) {
+                bad(sp, "C1003", u.f2("%s: '%s'", msg, body[i..i + n]), quiet);
+                return false;
+            }
+            put_cp(out, cp, enc, o);
+            i += n;
+            continue;
+        }
+        let mut en: usize = 1;
+        if e >= 0x80 {
+            _ = lx.utf8_at(body, i + 1, &mut en);
+            if en == 0 {
+                en = 1;
+            }
+        }
+        bad(sp, "C1012", u.f1("unknown escape sequence '\\%s'", body[i + 1..i + 1 + en]), quiet);
+        return false;
+    }
+    return ok;
+}
+
+/// The length of an encoding prefix (ct.ENC_) in a literal's spelling.
+pub fn prefix_len(enc: i32) usize {
+    if enc == ct.ENC_UTF8 {
+        return 2;
+    }
+    if enc == ct.ENC_NONE {
+        return 0;
+    }
+    return 1;
+}
+
+// Sign-extends the low `bits` of v.
+fn sext(v: u64, bits: i32) u64 {
+    if bits >= 64 {
+        return v;
+    }
+    let sh = @int_cast(u32, 64 - bits);
+    return @bit_cast(u64, @bit_cast(i64, v << sh) >> sh);
+}
+
+/// The value of a character constant, in the representation of its type
+/// (int for a plain one; wchar_t, char8_t, char16_t or char32_t), sign
+/// extended to 64 bits. A plain constant of several characters is an int
+/// made of their bytes, the first the most significant (and diagnosed);
+/// one of a single character is a char's value converted to int. `ok` is
+/// cleared after an error.
+pub fn char_value(t: *lx.PTok, o: *co.COptions, quiet: bool, ok: *mut bool) u64 {
+    let enc = t.id;
+    let body = t.text[prefix_len(enc) + 1..t.text.len - 1];
+    let mut units = u.List.[u32].empty();
+    defer units.deinit();
+    if not decode(body, enc, o, t.span, &mut units, quiet) {
+        ok.* = false;
+        return 0;
+    }
+    if units.len == 0 {
+        bad(t.span, "C1010", "empty character constant", quiet);
+        ok.* = false;
+        return 0;
+    }
+    let us = units.items();
+    if enc == ct.ENC_NONE {
+        if us.len == 1 {
+            let v = @as(u64, us[0]);
+            if o.char_signed {
+                return sext(v, 8);
+            }
+            return v;
+        }
+        if us.len > @int_cast(usize, o.int_bits / 8) {
+            bad(t.span, "C1011", "character constant too long for its type", quiet);
+            ok.* = false;
+            return 0;
+        }
+        if not quiet {
+            _ = dg.warning(t.span, "C4102", "multi-character character constant");
+        }
+        let mut v: u64 = 0;
+        for x in us {
+            v = (v << 8) | @as(u64, x & 0xFF);
+        }
+        return sext(v, o.int_bits);
+    }
+    if us.len != 1 {
+        bad(t.span, "C1011", "character constant with an encoding prefix must be one code unit", quiet);
+        ok.* = false;
+        return 0;
+    }
+    let v = @as(u64, us[0]);
+    if (enc == ct.ENC_WIDE) and o.wchar_signed {
+        return sext(v, o.wchar_bits);
+    }
+    return v;
+}
+
+// -----------------------------------------------------------------------------
+// Numbers
+// -----------------------------------------------------------------------------
+/// The result of converting a pp-number.
+pub struct PNum {
+    ok: bool,
+    is_float: bool,
+    ival: u64,
+    base: i32,
+    unsigned_: bool,
+    longs: i32,
+    bitint: bool,
+    fval: f64,
+    fsuffix: i32,
+}
+
+fn digit_ok(c: u8, base: i32) bool {
+    let h = lx.hexval(c);
+    if (h < 0) or (h >= base) {
+        // (a too-large octal digit is reported as one)
+        return (base == 8) and ((c == '8') or (c == '9'));
+    }
+    return true;
+}
+
+/// Whether the pp-number `s` is a floating constant (by its form).
+fn looks_float(s: []u8) bool {
+    let hex = (s.len > 1) and (s[0] == '0') and ((s[1] == 'x') or (s[1] == 'X'));
+    for c in s {
+        if c == '.' {
+            return true;
+        }
+        if hex and ((c == 'p') or (c == 'P')) {
+            return true;
+        }
+        if not hex and ((c == 'e') or (c == 'E')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Converts the pp-number `t` to an integer or floating constant.
+pub fn number(t: *lx.PTok, o: *co.COptions, quiet: bool) PNum {
+    let mut r = PNum.{ ok: true, is_float: false, ival: 0, base: 10, unsigned_: false, longs: 0, bitint: false,
+                       fval: 0.0, fsuffix: 0 };
+    let s = t.text;
+    if looks_float(s) {
+        r.is_float = true;
+        float_number(t, o, quiet, &mut r);
+        return r;
+    }
+    let mut i: usize = 0;
+    if (s.len > 1) and (s[0] == '0') and ((s[1] == 'x') or (s[1] == 'X')) {
+        r.base = 16;
+        i = 2;
+    } else if (s.len > 1) and (s[0] == '0') and ((s[1] == 'b') or (s[1] == 'B')) {
+        r.base = 2;
+        i = 2;
+        if o.std < co.C23 {
+            bad(t.span, "C1017", "binary integer constants are a C23 feature", quiet);
+            r.ok = false;
+        }
+    } else if (s[0] == '0') and (s.len > 1) and (lx.is_digit(s[1]) or (s[1] == '\'')) {
+        // (a lone 0 is an octal constant in the grammar, but its value and
+        // type are a decimal 0's: it is given as one)
+        r.base = 8;
+    }
+    let d0 = i;
+    let mut over = false;
+    while i < s.len {
+        let c = s[i];
+        if (c == '\'') and (o.std >= co.C23) {
+            // a digit separator, between two digits
+            if (i == d0) or ((i + 1) >= s.len) or not digit_ok(s[i + 1], r.base) {
+                bad(t.span, "C1014", u.f1("misplaced digit separator in '%s'", s), quiet);
+                r.ok = false;
+                return r;
+            }
+            i += 1;
+            continue;
+        }
+        if not digit_ok(c, r.base) {
+            break;
+        }
+        let h = @as(u64, @int_cast(u32, lx.hexval(c)));
+        if (r.base == 8) and (h >= 8) {
+            bad(t.span, "C1014", u.f2("invalid digit '%s' in octal constant '%s'", s[i..i + 1], s), quiet);
+            r.ok = false;
+            return r;
+        }
+        let b = @as(u64, @int_cast(u32, r.base));
+        if r.ival > ((0xFFFFFFFFFFFFFFFF - h) / b) {
+            over = true;
+        }
+        r.ival = (r.ival *% b) +% h;
+        i += 1;
+    }
+    if (i == d0) and (r.base != 8) {
+        bad(t.span, "C1014", u.f1("invalid integer constant '%s'", s), quiet);
+        r.ok = false;
+        return r;
+    }
+    // the suffix
+    let suf = s[i..];
+    let mut j: usize = 0;
+    let mut good = true;
+    while j < suf.len {
+        let c = suf[j];
+        let mut c1: u8 = 0;
+        if (j + 1) < suf.len {
+            c1 = suf[j + 1];
+        }
+        if ((c == 'u') or (c == 'U')) and not r.unsigned_ {
+            r.unsigned_ = true;
+            j += 1;
+        } else if ((c == 'l') or (c == 'L')) and (r.longs == 0) and not r.bitint {
+            if ((j + 1) < suf.len) and (c1 == c) {
+                r.longs = 2;
+                j += 2;
+            } else {
+                r.longs = 1;
+                j += 1;
+            }
+        } else if (((c == 'w') and (c1 == 'b')) or ((c == 'W') and (c1 == 'B'))) and ((j + 1) < suf.len) and
+                  (r.longs == 0) and not r.bitint and (o.std >= co.C23) {
+            r.bitint = true;
+            j += 2;
+        } else {
+            good = false;
+            break;
+        }
+    }
+    if not good {
+        bad(t.span, "C1015", u.f2("invalid suffix '%s' on integer constant '%s'", suf, s), quiet);
+        r.ok = false;
+        return r;
+    }
+    if (r.longs == 2) and (o.std < co.C99) {
+        bad(t.span, "C1017", "long long integer constants are a C99 feature", quiet);
+        r.ok = false;
+    }
+    if over {
+        bad(t.span, "C1016", u.f1("integer constant '%s' is too large", s), quiet);
+        r.ok = false;
+    }
+    return r;
+}
+
+// Rounds m * 2^e2 (with `sticky`: nonzero bits below m) to a binary float
+// of `p` significand bits, least exponent `lsb_min` (of the smallest
+// subnormal) and greatest exponent `emax`: its bits, or the infinity's.
+fn round_bin(mant: u64, e2: i64, sticky: bool, p: i64, lsb_min: i64, emax: i64) u64 {
+    if mant == 0 {
+        return 0;
+    }
+    let mut msb: i64 = 63;
+    while ((mant >> @int_cast(u32, msb)) & 1) == 0 {
+        msb -= 1;
+    }
+    let inf = @as(u64, @int_cast(u32, (2 * emax) + 1)) << @int_cast(u32, p - 1);
+    let top = msb + e2;
+    if top > emax {
+        return inf;
+    }
+    let mut lsb = top - (p - 1);
+    if lsb < lsb_min {
+        lsb = lsb_min;
+    }
+    let shift = lsb - e2;
+    let mut m: u64 = 0;
+    if shift <= 0 {
+        m = mant << @int_cast(u32, -shift);
+    } else if shift > 64 {
+        m = 0;
+    } else {
+        let sh = @int_cast(u32, shift);
+        if sh == 64 {
+            m = 0;
+        } else {
+            m = mant >> sh;
+        }
+        let rem = mant & ((@as(u64, 1) << sh) -% 1);
+        let half = @as(u64, 1) << (sh - 1);
+        if sh == 64 {
+            // (all of mant is below the last place)
+            if (mant > half) or ((mant == half) and sticky) {
+                m = 1;
+            }
+        } else if (rem > half) or ((rem == half) and (sticky or ((m & 1) == 1))) {
+            m += 1;
+        }
+    }
+    let one = @as(u64, 1) << @int_cast(u32, p - 1);
+    if m >= (one << 1) {
+        m = m >> 1;
+        lsb += 1;
+    }
+    if (lsb + p - 1) > emax {
+        return inf;
+    }
+    if m >= one {
+        let ef = @bit_cast(u64, lsb - lsb_min + 1);
+        return (ef << @int_cast(u32, p - 1)) | (m - one);
+    }
+    return m;
+}
+
+fn float_number(t: *lx.PTok, o: *co.COptions, quiet: bool, r: *mut PNum) void {
+    let s = t.text;
+    let hex = (s.len > 1) and (s[0] == '0') and ((s[1] == 'x') or (s[1] == 'X'));
+    let mut i: usize = 0;
+    let mut digits = u.Buf.init();
+    defer digits.b.deinit();
+    let mut mant: u64 = 0;
+    let mut e2: i64 = 0;
+    let mut sticky = false;
+    let mut nd: i32 = 0;
+    let mut point = false;
+    if hex {
+        i = 2;
+        if o.std < co.C99 {
+            bad(t.span, "C1017", "hexadecimal floating constants are a C99 feature", quiet);
+            r.ok = false;
+            return;
+        }
+    }
+    while i < s.len {
+        let c = s[i];
+        if (c == '\'') and (o.std >= co.C23) {
+            let prev_ok = (i > 0) and (lx.hexval(s[i - 1]) >= 0) and (hex or lx.is_digit(s[i - 1]));
+            let next_ok = ((i + 1) < s.len) and (lx.hexval(s[i + 1]) >= 0) and (hex or lx.is_digit(s[i + 1]));
+            if not prev_ok or not next_ok {
+                bad(t.span, "C1014", u.f1("misplaced digit separator in '%s'", s), quiet);
+                r.ok = false;
+                return;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '.') and not point {
+            point = true;
+            digits.c('.');
+            i += 1;
+            continue;
+        }
+        let h = lx.hexval(c);
+        if (h < 0) or (not hex and (h > 9)) {
+            break;
+        }
+        nd += 1;
+        digits.c(c);
+        if hex {
+            if mant < (@as(u64, 1) << 60) {
+                mant = (mant << 4) | @as(u64, @int_cast(u32, h));
+                if point {
+                    e2 -= 4;
+                }
+            } else {
+                if h != 0 {
+                    sticky = true;
+                }
+                if not point {
+                    e2 += 4;
+                }
+            }
+        }
+        i += 1;
+    }
+    if nd == 0 {
+        bad(t.span, "C1014", u.f1("invalid floating constant '%s'", s), quiet);
+        r.ok = false;
+        return;
+    }
+    // the exponent
+    let mut exp: i64 = 0;
+    let mut has_exp = false;
+    if (i < s.len) and ((hex and ((s[i] == 'p') or (s[i] == 'P'))) or (not hex and ((s[i] == 'e') or (s[i] == 'E')))) {
+        has_exp = true;
+        let ea = i;
+        i += 1;
+        let mut neg = false;
+        if (i < s.len) and ((s[i] == '+') or (s[i] == '-')) {
+            neg = s[i] == '-';
+            i += 1;
+        }
+        let mut ne: i32 = 0;
+        while (i < s.len) and (lx.is_digit(s[i]) or ((s[i] == '\'') and (o.std >= co.C23))) {
+            if s[i] != '\'' {
+                if exp < 1000000 {
+                    exp = (exp * 10) + @as(i64, s[i] - '0');
+                }
+                ne += 1;
+            }
+            i += 1;
+        }
+        if ne == 0 {
+            bad(t.span, "C1014", u.f1("exponent has no digits in '%s'", s), quiet);
+            r.ok = false;
+            return;
+        }
+        if neg {
+            exp = -exp;
+        }
+        if not hex {
+            digits.c('e');
+            for c in s[ea + 1..i] {
+                if c != '\'' {
+                    digits.c(c);
+                }
+            }
+        }
+    }
+    if hex and not has_exp {
+        bad(t.span, "C1014", u.f1("hexadecimal floating constant '%s' requires an exponent", s), quiet);
+        r.ok = false;
+        return;
+    }
+    let suf = s[i..];
+    if suf.len == 0 {
+        r.fsuffix = 0;
+    } else if u.str_eq(suf, "f") or u.str_eq(suf, "F") {
+        r.fsuffix = 1;
+    } else if u.str_eq(suf, "l") or u.str_eq(suf, "L") {
+        r.fsuffix = 2;
+    } else if (o.std >= co.C23) and
+              (u.str_eq(suf, "df") or u.str_eq(suf, "dd") or u.str_eq(suf, "dl") or u.str_eq(suf, "DF") or
+               u.str_eq(suf, "DD") or u.str_eq(suf, "DL")) {
+        bad(t.span, "C1019", u.f1("decimal floating constants are not supported: '%s'", s), quiet);
+        r.ok = false;
+        return;
+    } else {
+        bad(t.span, "C1015", u.f2("invalid suffix '%s' on floating constant '%s'", suf, s), quiet);
+        r.ok = false;
+        return;
+    }
+    let mut inf = false;
+    if hex {
+        let ex = e2 + exp;
+        if r.fsuffix == 1 {
+            let bits = round_bin(mant, ex, sticky, 24, -149, 127);
+            inf = bits == 0x7F800000;
+            r.fval = @as(f64, @bit_cast(f32, @truncate(u32, bits)));
+        } else {
+            let bits = round_bin(mant, ex, sticky, 53, -1074, 1023);
+            inf = bits == 0x7FF0000000000000;
+            r.fval = @bit_cast(f64, bits);
+        }
+    } else {
+        // (the digits, with a point and an exponent: a form the parser takes)
+        let txt = digits.view();
+        if r.fsuffix == 1 {
+            let f = u.parse_f32(txt);
+            inf = (f - f) != (f - f);
+            r.fval = @as(f64, f);
+        } else {
+            r.fval = u.parse_f64(txt);
+            inf = (r.fval - r.fval) != (r.fval - r.fval);
+        }
+    }
+    if inf {
+        bad(t.span, "C1018", u.f1("floating constant '%s' is out of range", s), quiet);
+        r.ok = false;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Phase 7
+// -----------------------------------------------------------------------------
+fn ctoken(kind: i32, t: *lx.PTok) ct.Token {
+    return ct.Token.{ kind: kind, id: 0, span: t.span, text: t.text, ival: 0, base: 10, unsigned_: false, longs: 0,
+                      bitint: false, fval: 0.0, fsuffix: 0, prefix: 0, units: u.nil_slice.[u32](), space: t.space,
+                      bol: t.bol };
+}
+
+fn enc_name(enc: i32) []u8 {
+    if enc == ct.ENC_WIDE {
+        return "L";
+    }
+    if enc == ct.ENC_UTF8 {
+        return "u8";
+    }
+    if enc == ct.ENC_UTF16 {
+        return "u";
+    }
+    if enc == ct.ENC_UTF32 {
+        return "U";
+    }
+    return "";
+}
+
+// Joins the string literals ts (adjacent): the encoding of the result, or
+// -1 if they cannot be joined (reported).
+fn joined_enc(ts: []lx.PTok, o: *co.COptions) i32 {
+    let mut enc = ct.ENC_NONE;
+    for k in 0..ts.len {
+        let e = ts[k].id;
+        if (e == ct.ENC_NONE) or (e == enc) {
+            continue;
+        }
+        if enc == ct.ENC_NONE {
+            enc = e;
+            continue;
+        }
+        _ = dg.err(ts[k].span, "C1020", u.f2("string literals with prefixes '%s' and '%s' cannot be concatenated",
+                                             enc_name(enc), enc_name(e)));
+        return -1;
+    }
+    if (o.std < co.C99) and (enc != ct.ENC_NONE) {
+        for k in 0..ts.len {
+            if ts[k].id == ct.ENC_NONE {
+                _ = dg.err(ts[k].span, "C1020", "a narrow and a wide string literal cannot be concatenated before C99");
+                return -1;
+            }
+        }
+    }
+    return enc;
+}
+
+/// The tokens of phase 7 for the preprocessing tokens `ts`, followed by a
+/// T_EOF token: strings joined, numbers and character constants converted,
+/// keywords of the standard recognized. Errors are reported.
+pub fn convert(ts: []lx.PTok, o: *co.COptions, out: *mut u.List.[ct.Token]) void {
+    let mut i: usize = 0;
+    while i < ts.len {
+        let t = &ts[i];
+        if t.kind == lx.PK_EOF {
+            break;
+        }
+        if t.kind == lx.PK_IDENT {
+            let mut r = ctoken(ct.T_IDENT, t);
+            r.text = t.name;
+            let kw = ct.keyword_id(t.name, o.std);
+            if kw != 0 {
+                r.kind = ct.T_KEYWORD;
+                r.id = kw;
+            } else if (u.str_eq(t.name, "__VA_ARGS__") and (o.std >= co.C99)) or
+                      (u.str_eq(t.name, "__VA_OPT__") and (o.std >= co.C23)) {
+                _ = dg.err(t.span, "C1023", u.f1("'%s' can appear only in the replacement list of a variadic macro",
+                                                 t.name));
+            }
+            out.push(r);
+            i += 1;
+        } else if t.kind == lx.PK_NUMBER {
+            let n = number(t, o, false);
+            let mut r = ctoken(ct.T_INT, t);
+            if n.is_float {
+                r.kind = ct.T_FLOAT;
+                r.fval = n.fval;
+                r.fsuffix = n.fsuffix;
+            } else {
+                r.ival = n.ival;
+                r.base = n.base;
+                r.unsigned_ = n.unsigned_;
+                r.longs = n.longs;
+                r.bitint = n.bitint;
+            }
+            out.push(r);
+            i += 1;
+        } else if t.kind == lx.PK_CHAR {
+            let mut ok = true;
+            let mut r = ctoken(ct.T_CHAR, t);
+            r.ival = char_value(t, o, false, &mut ok);
+            r.prefix = t.id;
+            out.push(r);
+            i += 1;
+        } else if t.kind == lx.PK_STRING {
+            let mut j = i + 1;
+            while (j < ts.len) and (ts[j].kind == lx.PK_STRING) {
+                j += 1;
+            }
+            let group = ts[i..j];
+            let mut r = ctoken(ct.T_STRING, t);
+            let enc = joined_enc(group, o);
+            let mut units = u.List.[u32].empty();
+            if enc >= 0 {
+                r.prefix = enc;
+                for k in 0..group.len {
+                    let g = &group[k];
+                    let body = g.text[prefix_len(g.id) + 1..g.text.len - 1];
+                    _ = decode(body, enc, o, g.span, &mut units, false);
+                }
+            }
+            if group.len > 1 {
+                let mut b = u.Buf.init();
+                for k in 0..group.len {
+                    if k > 0 {
+                        b.c(' ');
+                    }
+                    b.s(group[k].text);
+                }
+                r.text = b.done();
+                r.span = u.span_join(group[0].span, group[group.len - 1].span);
+            }
+            let us = u.newn.[u32](units.len);
+            @mem_copy(us, units.items());
+            units.deinit();
+            r.units = us;
+            out.push(r);
+            i = j;
+        } else if t.kind == lx.PK_PUNCT {
+            let mut r = ctoken(ct.T_PUNCT, t);
+            r.id = t.id;
+            if (t.id == lx.PP_HASH) or (t.id == lx.PP_HASHHASH) {
+                _ = dg.err(t.span, "C1022", u.f1("stray '%s' outside a preprocessing directive", t.text));
+            }
+            out.push(r);
+            i += 1;
+        } else {
+            // (an unterminated literal was reported when it was read)
+            if (u.find(t.text, '\'') < 0) and (u.find(t.text, '"') < 0) {
+                _ = dg.err(t.span, "C1021", u.f1("stray '%s' in program", t.text));
+            }
+            i += 1;
+        }
+    }
+    let mut e = ct.Token.{ kind: ct.T_EOF, id: 0, span: u.mkspan(0, 0, 0), text: "", ival: 0, base: 10,
+                           unsigned_: false, longs: 0, bitint: false, fval: 0.0, fsuffix: 0, prefix: 0,
+                           units: u.nil_slice.[u32](), space: false, bol: true };
+    if i < ts.len {
+        e.span = ts[i].span;
+    }
+    out.push(e);
+}

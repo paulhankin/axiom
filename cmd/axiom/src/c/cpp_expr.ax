@@ -1,0 +1,433 @@
+// =============================================================================
+// cpp_expr.ax - the controlling expressions of #if and #elif (C 6.10.1),
+// evaluated in intmax_t and uintmax_t (64 bits) after macro replacement.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../util.ax" as u;
+import "copts.ax" as co;
+import "cpp_conv.ax" as cv;
+import "cpp_lex.ax" as lx;
+import "ctok.ax" as ct;
+
+struct V {
+    v: u64,
+    uns: bool,
+}
+
+struct Ev {
+    ts: []lx.PTok,
+    pos: usize,
+    o: *co.COptions,
+    end: u.Span,   // where the expression ends, for "expected" errors
+    failed: bool,  // a syntax error was reported (the rest is not looked at)
+    depth: i32,
+}
+
+const MAX_DEPTH: i32 = 2000;
+const IMAX: u64 = 0x7FFFFFFFFFFFFFFF;
+
+fn sv(x: i64) V {
+    return V.{ v: @bit_cast(u64, x), uns: false };
+}
+
+fn neg(x: V) bool {
+    return not x.uns and (@bit_cast(i64, x.v) < 0);
+}
+
+fn cur(E: *Ev) *lx.PTok {
+    return &E.ts[E.pos];
+}
+
+fn at_punct(E: *Ev, id: i32) bool {
+    return lx.is_punct(cur(E), id);
+}
+
+fn here(E: *Ev) u.Span {
+    let t = cur(E);
+    if t.kind == lx.PK_EOF {
+        return E.end;
+    }
+    return t.span;
+}
+
+fn syntax(E: *mut Ev, msg: []u8) void {
+    if not E.failed {
+        let t = cur(E);
+        let mut m = msg;
+        if t.kind != lx.PK_EOF {
+            m = u.f2("%s before '%s'", msg, t.text);
+        } else {
+            m = u.cat2(msg, " at the end of the line");
+        }
+        _ = dg.err(here(E), "C1031", u.cat2(m, " in a preprocessing conditional expression"));
+    }
+    E.failed = true;
+}
+
+fn ev_err(E: *mut Ev, ev: bool, sp: u.Span, code: []u8, msg: []u8) void {
+    if ev and not E.failed {
+        _ = dg.err(sp, code, msg);
+    }
+}
+
+fn primary(E: *mut Ev, ev: bool) V {
+    if E.failed {
+        return sv(0);
+    }
+    let t = cur(E);
+    if t.kind == lx.PK_NUMBER {
+        E.pos += 1;
+        let n = cv.number(t, E.o, false);
+        if not n.ok {
+            E.failed = true;
+            return sv(0);
+        }
+        if n.is_float {
+            _ = dg.err(t.span, "C1030", u.f1("floating constant '%s' in a preprocessing conditional expression",
+                                             t.text));
+            E.failed = true;
+            return sv(0);
+        }
+        let mut uns = n.unsigned_;
+        if not uns and (n.ival > IMAX) {
+            // too large for intmax_t: uintmax_t if it is octal or hexadecimal
+            // (or C89's unsigned long); else it has no type
+            uns = true;
+            if (n.base == 10) and (E.o.std >= co.C99) {
+                _ = dg.err(t.span, "C1016", u.f1("integer constant '%s' is too large for its type", t.text));
+            }
+        }
+        return V.{ v: n.ival, uns: uns };
+    }
+    if t.kind == lx.PK_CHAR {
+        E.pos += 1;
+        let mut ok = true;
+        let v = cv.char_value(t, E.o, false, &mut ok);
+        if not ok {
+            E.failed = true;
+        }
+        return V.{ v: v, uns: false };
+    }
+    if t.kind == lx.PK_IDENT {
+        E.pos += 1;
+        if (u.str_eq(t.name, "__VA_ARGS__") and (E.o.std >= co.C99)) or
+           (u.str_eq(t.name, "__VA_OPT__") and (E.o.std >= co.C23)) {
+            _ = dg.err(t.span, "C1023", u.f1("'%s' can appear only in the replacement list of a variadic macro",
+                                             t.name));
+            E.failed = true;
+            return sv(0);
+        }
+        if (E.o.std >= co.C23) and u.str_eq(t.name, "true") {
+            return sv(1);
+        }
+        return sv(0);
+    }
+    if lx.is_punct(t, ct.P_LPAREN) {
+        E.pos += 1;
+        let v = comma(E, ev);
+        if not at_punct(E, ct.P_RPAREN) {
+            syntax(E, "expected ')'");
+            return sv(0);
+        }
+        E.pos += 1;
+        return v;
+    }
+    if t.kind == lx.PK_EOF {
+        syntax(E, "expected an expression");
+    } else if (t.kind == lx.PK_STRING) or (t.kind == lx.PK_OTHER) or (t.kind == lx.PK_HEADER) {
+        if not E.failed {
+            _ = dg.err(t.span, "C1030", u.f1("'%s' is not allowed in a preprocessing conditional expression", t.text));
+        }
+        E.failed = true;
+    } else {
+        syntax(E, "expected an expression");
+    }
+    return sv(0);
+}
+
+fn unary(E: *mut Ev, ev: bool) V {
+    if E.failed {
+        return sv(0);
+    }
+    E.depth += 1;
+    defer E.depth -= 1;
+    if E.depth > MAX_DEPTH {
+        if not E.failed {
+            _ = dg.err(here(E), "C1037", "preprocessing conditional expression nested too deeply");
+        }
+        E.failed = true;
+        return sv(0);
+    }
+    let t = cur(E);
+    if t.kind == lx.PK_PUNCT {
+        let id = t.id;
+        if (id == ct.P_PLUS) or (id == ct.P_MINUS) or (id == ct.P_TILDE) or (id == ct.P_BANG) {
+            let sp = t.span;
+            E.pos += 1;
+            let x = unary(E, ev);
+            if id == ct.P_PLUS {
+                return x;
+            }
+            if id == ct.P_TILDE {
+                return V.{ v: ~x.v, uns: x.uns };
+            }
+            if id == ct.P_BANG {
+                return sv(@as(i64, x.v == 0));
+            }
+            if not x.uns and (x.v == (IMAX + 1)) {
+                ev_err(E, ev, sp, "C1033", "integer overflow in a preprocessing conditional expression");
+            }
+            return V.{ v: 0 -% x.v, uns: x.uns };
+        }
+    }
+    return primary(E, ev);
+}
+
+// The binding power of a binary operator (0: none).
+fn prec(t: *lx.PTok) i32 {
+    if t.kind != lx.PK_PUNCT {
+        return 0;
+    }
+    let id = t.id;
+    if (id == ct.P_STAR) or (id == ct.P_SLASH) or (id == ct.P_PERCENT) {
+        return 10;
+    }
+    if (id == ct.P_PLUS) or (id == ct.P_MINUS) {
+        return 9;
+    }
+    if (id == ct.P_SHL) or (id == ct.P_SHR) {
+        return 8;
+    }
+    if (id == ct.P_LT) or (id == ct.P_GT) or (id == ct.P_LE) or (id == ct.P_GE) {
+        return 7;
+    }
+    if (id == ct.P_EQ) or (id == ct.P_NE) {
+        return 6;
+    }
+    if id == ct.P_AMP {
+        return 5;
+    }
+    if id == ct.P_CARET {
+        return 4;
+    }
+    if id == ct.P_PIPE {
+        return 3;
+    }
+    if id == ct.P_ANDAND {
+        return 2;
+    }
+    if id == ct.P_OROR {
+        return 1;
+    }
+    return 0;
+}
+
+fn arith(E: *mut Ev, ev: bool, id: i32, a: V, b: V, sp: u.Span) V {
+    let uns = a.uns or b.uns;
+    let x = a.v;
+    let y = b.v;
+    let sx = @bit_cast(i64, x);
+    let sy = @bit_cast(i64, y);
+    let ovf = "integer overflow in a preprocessing conditional expression";
+    if id == ct.P_STAR {
+        if not uns {
+            let r = sx *% sy;
+            if (sx != 0) and (((r / sx) != sy) or ((sx == -1) and (sy == @bit_cast(i64, IMAX + 1)))) {
+                ev_err(E, ev, sp, "C1033", ovf);
+            }
+            return sv(r);
+        }
+        return V.{ v: x *% y, uns: true };
+    }
+    if (id == ct.P_SLASH) or (id == ct.P_PERCENT) {
+        if y == 0 {
+            ev_err(E, ev, sp, "C1032", "division by zero in a preprocessing conditional expression");
+            return V.{ v: 0, uns: uns };
+        }
+        if uns {
+            if id == ct.P_SLASH {
+                return V.{ v: x / y, uns: true };
+            }
+            return V.{ v: x % y, uns: true };
+        }
+        if (sy == -1) and (x == (IMAX + 1)) {
+            if id == ct.P_SLASH {
+                ev_err(E, ev, sp, "C1033", ovf);
+            }
+            return sv(0);
+        }
+        if id == ct.P_SLASH {
+            return sv(sx / sy);
+        }
+        return sv(sx % sy);
+    }
+    if (id == ct.P_PLUS) or (id == ct.P_MINUS) {
+        let mut ny = y;
+        if id == ct.P_MINUS {
+            ny = 0 -% y;
+        }
+        let r = x +% ny;
+        if not uns {
+            let rs = @bit_cast(i64, r);
+            let o1 = (id == ct.P_PLUS) and
+                     (((sx >= 0) and (sy >= 0) and (rs < 0)) or ((sx < 0) and (sy < 0) and (rs >= 0)));
+            let o2 = (id == ct.P_MINUS) and
+                     (((sx >= 0) and (sy < 0) and (rs < 0)) or ((sx < 0) and (sy >= 0) and (rs >= 0)));
+            if o1 or o2 {
+                ev_err(E, ev, sp, "C1033", ovf);
+            }
+        }
+        return V.{ v: r, uns: uns };
+    }
+    if (id == ct.P_SHL) or (id == ct.P_SHR) {
+        // (the type is the left operand's)
+        if neg(b) or (y >= 64) {
+            ev_err(E, ev, sp, "C1036", "shift count out of range in a preprocessing conditional expression");
+            return V.{ v: 0, uns: a.uns };
+        }
+        let k = @truncate(u32, y);
+        if id == ct.P_SHR {
+            if a.uns {
+                return V.{ v: x >> k, uns: true };
+            }
+            return sv(sx >> k);
+        }
+        if not a.uns {
+            if sx < 0 {
+                ev_err(E, ev, sp, "C1036", "left shift of a negative value in a preprocessing conditional expression");
+            } else if (x >> (63 - k)) != 0 {
+                ev_err(E, ev, sp, "C1033", ovf);
+            }
+        }
+        return V.{ v: x << k, uns: a.uns };
+    }
+    if (id == ct.P_LT) or (id == ct.P_GT) or (id == ct.P_LE) or (id == ct.P_GE) {
+        let mut lt = sx < sy;
+        if uns {
+            lt = x < y;
+        }
+        let eq = x == y;
+        if id == ct.P_LT {
+            return sv(@as(i64, lt));
+        }
+        if id == ct.P_GT {
+            return sv(@as(i64, not lt and not eq));
+        }
+        if id == ct.P_LE {
+            return sv(@as(i64, lt or eq));
+        }
+        return sv(@as(i64, not lt));
+    }
+    if id == ct.P_EQ {
+        return sv(@as(i64, x == y));
+    }
+    if id == ct.P_NE {
+        return sv(@as(i64, x != y));
+    }
+    if id == ct.P_AMP {
+        return V.{ v: x & y, uns: uns };
+    }
+    if id == ct.P_CARET {
+        return V.{ v: x ^ y, uns: uns };
+    }
+    return V.{ v: x | y, uns: uns };
+}
+
+// Binary operators of at least binding power `min`.
+fn binary(E: *mut Ev, ev: bool, min: i32) V {
+    let mut a = unary(E, ev);
+    loop {
+        if E.failed {
+            return sv(0);
+        }
+        let t = cur(E);
+        let p = prec(t);
+        if (p == 0) or (p < min) {
+            return a;
+        }
+        let id = t.id;
+        let sp = t.span;
+        E.pos += 1;
+        if id == ct.P_ANDAND {
+            let b = binary(E, ev and (a.v != 0), p + 1);
+            a = sv(@as(i64, (a.v != 0) and (b.v != 0)));
+        } else if id == ct.P_OROR {
+            let b = binary(E, ev and (a.v == 0), p + 1);
+            a = sv(@as(i64, (a.v != 0) or (b.v != 0)));
+        } else {
+            let b = binary(E, ev, p + 1);
+            a = arith(E, ev, id, a, b, sp);
+        }
+    }
+}
+
+fn cond(E: *mut Ev, ev: bool) V {
+    E.depth += 1;
+    defer E.depth -= 1;
+    if E.depth > MAX_DEPTH {
+        if not E.failed {
+            _ = dg.err(here(E), "C1037", "preprocessing conditional expression nested too deeply");
+        }
+        E.failed = true;
+        return sv(0);
+    }
+    let c = binary(E, ev, 1);
+    if E.failed or not at_punct(E, ct.P_QUESTION) {
+        return c;
+    }
+    E.pos += 1;
+    let a = comma(E, ev and (c.v != 0));
+    if E.failed {
+        return sv(0);
+    }
+    if not at_punct(E, ct.P_COLON) {
+        syntax(E, "expected ':'");
+        return sv(0);
+    }
+    E.pos += 1;
+    let b = cond(E, ev and (c.v == 0));
+    let uns = a.uns or b.uns;
+    if c.v != 0 {
+        return V.{ v: a.v, uns: uns };
+    }
+    return V.{ v: b.v, uns: uns };
+}
+
+fn comma(E: *mut Ev, ev: bool) V {
+    let mut a = cond(E, ev);
+    while not E.failed and at_punct(E, ct.P_COMMA) {
+        ev_err(E, ev, cur(E).span, "C1034", "comma operator in a preprocessing conditional expression");
+        E.pos += 1;
+        a = cond(E, ev);
+    }
+    return a;
+}
+
+/// The value of the #if or #elif expression `ts` (macros replaced, ending
+/// with a PK_EOF token) as a truth value; false after an error (reported).
+/// `end` is the directive's span, for errors at its end.
+pub fn eval(ts: []lx.PTok, o: *co.COptions, end: u.Span) bool {
+    let mut ok = true;
+    return value(ts, o, end, &mut ok) != 0;
+}
+
+/// The value of the integer constant expression `ts`, as eval reads it
+/// (an intmax_t's or uintmax_t's bits); `ok` is cleared after an error.
+pub fn value(ts: []lx.PTok, o: *co.COptions, end: u.Span, ok: *mut bool) u64 {
+    let mut E = Ev.{ ts: ts, pos: 0, o: o, end: end, failed: false, depth: 0 };
+    if ts[0].kind == lx.PK_EOF {
+        _ = dg.err(end, "C1031", "missing expression in a preprocessing conditional");
+        ok.* = false;
+        return 0;
+    }
+    let errs = dg.error_count();
+    let v = comma(&mut E, true);
+    if not E.failed and (cur(&E).kind != lx.PK_EOF) {
+        syntax(&mut E, "unexpected token");
+    }
+    if E.failed or (dg.error_count() != errs) {
+        ok.* = false;
+        return 0;
+    }
+    return v.v;
+}

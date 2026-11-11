@@ -1,0 +1,22 @@
+/* # and ## and their order (C99 6.10.3.5 EXAMPLE 4), and hash_hash (6.10.3.3 EXAMPLE). */
+/* flags: --c-std=c99 */
+#define str(s) # s
+#define xstr(s) str(s)
+#define debug(s, t) printf("x" # s "= %d, x" # t "= %s", \
+ x ## s, x ## t)
+#define INCFILE(n) vers ## n
+#define glue(a, b) a ## b
+#define xglue(a, b) glue(a, b)
+#define HIGHLOW "hello"
+#define LOW LOW ", world"
+debug(1, 2);
+fputs(str(strncmp("abc\0d", "abc", '\4') // this goes away
+ == 0) str(: @\n), s);
+xstr(INCFILE(2).h)
+glue(HIGH, LOW);
+xglue(HIGH, LOW)
+#define hash_hash # ## #
+#define mkstr(a) # a
+#define in_between(a) mkstr(a)
+#define join(c, d) in_between(c hash_hash d)
+char p[] = join(x, y);

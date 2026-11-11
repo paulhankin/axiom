@@ -1,0 +1,7 @@
+/* The predefined macros of C11 (an undefined one stays itself). */
+/* flags: --c-std=c11 --target=x86_64 */
+__STDC__ __STDC_VERSION__ __STDC_HOSTED__ __STDC_IEC_559__ __STDC_IEC_60559_BFP__
+__STDC_UTF_16__ __STDC_UTF_32__ __STDC_NO_ATOMICS__ __STDC_NO_COMPLEX__ __STDC_NO_THREADS__ __STDC_NO_VLA__
+__STDC_EMBED_NOT_FOUND__ __STDC_EMBED_FOUND__ __STDC_EMBED_EMPTY__
+__FILE__ __LINE__ __DATE__ __TIME__
+__AXIOM__ __CHAR_UNSIGNED__ __AXIOM_INT_WIDTH__ __AXIOM_LONG_WIDTH__ __AXIOM_PTR_WIDTH__ __AXIOM_WCHAR_WIDTH__ __AXIOM_WCHAR_SIGNED__
