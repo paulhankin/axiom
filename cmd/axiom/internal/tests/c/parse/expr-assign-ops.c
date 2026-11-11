@@ -1,0 +1,14 @@
+/* The assignment operators. */
+void f(int a, int b) {
+    a = b;
+    a *= b;
+    a /= b;
+    a %= b;
+    a += b;
+    a -= b;
+    a <<= b;
+    a >>= b;
+    a &= b;
+    a ^= b;
+    a |= b;
+}

@@ -1,0 +1,424 @@
+// =============================================================================
+// cast.ax - the C syntax tree: a translation unit's declarations as written,
+// with their declaration specifiers, declarators, statements, expressions,
+// initializers and attributes. The parser (cparse.ax) builds it; semantic
+// analysis annotates it in place (the `ty`, `sym` and constant fields), and
+// IR generation walks it.
+//
+// Declarations are kept as the grammar has them: no types are built here.
+// A declarator's derivations (pointer, array, function) are listed from the
+// declared identifier outward, so `int *a[3]` has [array 3, pointer] ("a is
+// an array of 3 pointers to int"); its type is made by applying them to the
+// type the specifiers give, last first.
+//
+// Nodes are allocated in the compiler's arena (util.new), zeroed: a field a
+// node's kind does not use is nil, empty or zero.
+//
+// A tree parsed without errors has no ERROR expressions; every Decl of kind
+// DECL has specs with at least one item; a FUNC_DEF has one declarator
+// whose first derivation is a FUNCTION, a COMPOUND body, and kr_decls only
+// if that function has an identifier list; a declarator in a declaration
+// or a member declaration has a name, except an unnamed bit-field (which
+// has a width); a TypeName's declarator has none; every expression is at
+// most MAX_DEPTH (cparse.ax) levels high, and so is the nesting of
+// statements, declarators and initializers. After errors the tree is still
+// complete enough to walk (no nil where the kind needs a node, but ERROR
+// expressions and empty names where the source had none).
+// =============================================================================
+import "../util.ax" as u;
+import "ctok.ax" as ct;
+
+/// A C type. Semantic analysis (ctypes.ax) defines its contents; the parser
+/// only reserves the pointers to it (Expr.ty and the like), all nil.
+pub struct CType {
+    kind: i32,
+}
+
+/// What a declared name denotes (an object, function, typedef, enumeration
+/// constant, tag or label). Semantic analysis defines its contents; the
+/// parser leaves the `sym` fields nil.
+pub struct CSym {
+    kind: i32,
+}
+
+// -----------------------------------------------------------------------------
+// Attributes (C23 6.7.13)
+// -----------------------------------------------------------------------------
+
+/// One attribute of an attribute specifier `[[...]]`: `name`, or
+/// `prefix::name`, with its argument clause kept as the balanced tokens
+/// between its parentheses.
+pub struct Attr {
+    span: u.Span,
+    prefix: []u8,  // the vendor prefix of `prefix::name`; empty if none
+    name: []u8,
+    has_args: bool,    // an argument clause, maybe empty: `name()`
+    args: []ct.Token,  // its tokens, without the outer parentheses
+}
+
+// -----------------------------------------------------------------------------
+// Expressions (6.5)
+// -----------------------------------------------------------------------------
+
+/// What an Expr is.
+pub enum ExprKind {
+    ERROR,        // in place of an expression with a syntax error (reported)
+    IDENT,        // name
+    INT,          // tok: an integer constant (ival, base, unsigned_, longs, bitint)
+    FLOAT,        // tok: a floating constant (fval, fsuffix, text)
+    CHAR,         // tok: a character constant (ival, prefix)
+    STRING,       // tok: a string literal, adjacent ones joined (units, prefix)
+    BOOL,         // C23 `true` or `false`: bval
+    NULLPTR,      // C23 `nullptr`
+    UNARY,        // op a: & * + - ~ ! and prefix ++ -- (op P_INC, P_DEC)
+    POSTFIX,      // a op: postfix ++ -- (op P_INC, P_DEC)
+    BINARY,       // a op b: * / % + - << >> < > <= >= == != & ^ | && ||
+    ASSIGN,       // a op b: = *= /= %= += -= <<= >>= &= ^= |=
+    COND,         // a ? b : c
+    COMMA,        // a , b
+    CALL,         // a(args)
+    INDEX,        // a[b]
+    MEMBER,       // a.name (op P_DOT) or a->name (op P_ARROW)
+    CAST,         // (tname) a
+    SIZEOF_EXPR,  // sizeof a
+    SIZEOF_TYPE,  // sizeof (tname)
+    ALIGNOF,      // _Alignof (tname), alignof (tname) in C23 (op: the keyword's spelling is in name)
+    COMPOUND,     // (tname) { init }: a compound literal; tname.specs may hold storage-class specifiers (C23)
+    GENERIC,      // _Generic(a, assocs)
+}
+
+/// One association of a generic selection: `type-name: e`, or `default: e`
+/// (tname nil).
+pub struct GenericAssoc {
+    span: u.Span,
+    tname: *mut TypeName,
+    e: *mut Expr,
+}
+
+pub struct Expr {
+    kind: ExprKind,
+    op: i32,  // UNARY, POSTFIX, BINARY, ASSIGN, MEMBER: the operator (a ctok P_ constant)
+    span: u.Span,
+    a: *mut Expr,
+    b: *mut Expr,
+    c: *mut Expr,
+    args: u.List.[*mut Expr],       // CALL: the arguments
+    assocs: u.List.[GenericAssoc],  // GENERIC
+    name: []u8,                     // IDENT, MEMBER (interned); ALIGNOF: the keyword as written
+    name_span: u.Span,              // MEMBER: the member's name
+    tname: *mut TypeName,           // CAST, SIZEOF_TYPE, ALIGNOF, COMPOUND
+    init: *mut Init,                // COMPOUND: a brace-enclosed list
+    tok: *ct.Token,                 // INT, FLOAT, CHAR, STRING: (a copy of) the token
+    bval: bool,                     // BOOL
+    parens: i32,                    // how many pairs of parentheses enclose it
+    height: i32,                    // the levels of the tree it makes, itself included (at most cparse.MAX_DEPTH)
+    // set by semantic analysis
+    ty: *mut CType,
+    lvalue: bool,    // its value category: an lvalue (or a function designator)
+    is_const: bool,  // an (integer or arithmetic) constant expression, whose value is cval or fcval
+    cval: u64,       // an integer constant's value, as bits
+    fcval: f64,      // a floating constant's value
+    sym: *mut CSym,  // IDENT: what it names; MEMBER: the member
+}
+
+// -----------------------------------------------------------------------------
+// Declaration specifiers and declarators (6.7)
+// -----------------------------------------------------------------------------
+
+// Storage-class specifiers (DeclSpec.storage).
+pub const SC_TYPEDEF: i32 = 1;
+pub const SC_EXTERN: i32 = 2;
+pub const SC_STATIC: i32 = 4;
+pub const SC_THREAD_LOCAL: i32 = 8;  // _Thread_local, thread_local
+pub const SC_AUTO: i32 = 16;
+pub const SC_REGISTER: i32 = 32;
+pub const SC_CONSTEXPR: i32 = 64;  // C23
+
+// Type qualifiers (DeclSpec.quals, Deriv.quals).
+pub const Q_CONST: i32 = 1;
+pub const Q_VOLATILE: i32 = 2;
+pub const Q_RESTRICT: i32 = 4;
+pub const Q_ATOMIC: i32 = 8;  // _Atomic as a qualifier (not followed by '(')
+
+// Function specifiers (DeclSpec.funcs).
+pub const FS_INLINE: i32 = 1;
+pub const FS_NORETURN: i32 = 2;  // _Noreturn
+
+/// What a Spec is.
+pub enum SpecKind {
+    STORAGE,       // kw: K_TYPEDEF, K_EXTERN, K_STATIC, K_THREAD_LOCAL, K_AUTO, K_REGISTER, K_CONSTEXPR
+    TYPE,          // kw: a type keyword (K_VOID, K_CHAR, K_SHORT, K_INT, K_LONG, K_FLOAT, K_DOUBLE, K_SIGNED,
+                   //     K_UNSIGNED, K_BOOL, K_COMPLEX, K_IMAGINARY, K_DECIMAL32/64/128, K_BUILTIN_VA_LIST, K_INT64)
+    QUAL,          // kw: K_CONST, K_VOLATILE, K_RESTRICT, K_ATOMIC
+    FUNC,          // kw: K_INLINE, K_NORETURN
+    ALIGN,         // _Alignas / alignas: (tname) or (e)
+    TAG,           // a struct, union or enum specifier: tag
+    TYPEDEF_NAME,  // name
+    TYPEOF,        // kw K_TYPEOF or K_TYPEOF_UNQUAL: (tname) or (e)
+    BITINT,        // _BitInt(e)
+    ATOMIC,        // _Atomic(tname), the type specifier
+}
+
+/// One declaration specifier, as written.
+pub struct Spec {
+    kind: SpecKind,
+    kw: i32,  // the keyword (a ctok K_ constant)
+    span: u.Span,
+    name: []u8,            // TYPEDEF_NAME (interned)
+    tag: *mut TagSpec,     // TAG
+    tname: *mut TypeName,  // ALIGN, TYPEOF of a type name; ATOMIC
+    e: *mut Expr,          // ALIGN, TYPEOF of an expression; BITINT: the width
+}
+
+/// The declaration specifiers of a declaration, a parameter, a member, or a
+/// type name, in the order written (items, duplicates included), with
+/// their kinds summed up.
+pub struct DeclSpec {
+    span: u.Span,
+    items: u.List.[Spec],
+    storage: i32,               // SC_ bits
+    quals: i32,                 // Q_ bits
+    funcs: i32,                 // FS_ bits
+    has_type: bool,             // a type specifier is among the items (TYPE, TAG, TYPEDEF_NAME, TYPEOF, BITINT, ATOMIC)
+    attrs: u.List.[*mut Attr],  // the attributes after the specifiers (C23): they appertain to the type
+}
+
+/// A struct, union or enum specifier.
+pub struct TagSpec {
+    kw: i32,  // K_STRUCT, K_UNION or K_ENUM
+    span: u.Span,
+    name: []u8,  // the tag (interned), or empty
+    name_span: u.Span,
+    attrs: u.List.[*mut Attr],              // after the keyword
+    has_body: bool,                         // a member or enumerator list in braces
+    members: u.List.[*mut Decl],            // struct, union: member declarations (DECL with member declarators; STATIC_ASSERT)
+    enumerators: u.List.[*mut Enumerator],  // enum
+    fixed: *mut TypeName,                   // enum: the fixed underlying type `enum E : T` (C23), or nil
+    trailing_comma: bool,                   // enum: the list ends with ','
+    // set by semantic analysis
+    ty: *mut CType,
+    sym: *mut CSym,
+}
+
+pub struct Enumerator {
+    span: u.Span,
+    name: []u8,
+    attrs: u.List.[*mut Attr],
+    value: *mut Expr,  // nil if none
+    sym: *mut CSym,
+}
+
+/// What a Deriv is.
+pub enum DerivKind {
+    POINTER,   // * quals attrs
+    ARRAY,     // [ static? quals size ] or [ quals * ]
+    FUNCTION,  // ( params ) or ( identifier list )
+}
+
+/// One derivation of a declarator.
+pub struct Deriv {
+    kind: DerivKind,
+    span: u.Span,
+    quals: i32,                 // POINTER, ARRAY: Q_ bits
+    dup_quals: bool,            // a qualifier was written more than once
+    attrs: u.List.[*mut Attr],  // after '*', ']' or ')' (C23)
+    // ARRAY
+    size: *mut Expr,  // nil for `[]` and `[*]`
+    is_static: bool,  // `[static n]`, `[const static n]`
+    is_star: bool,    // `[*]`: a variable-length array of unspecified size
+    // FUNCTION
+    params: u.List.[*mut Param],  // a parameter type list: as written, so `(void)` has one parameter
+    variadic: bool,               // ends with `...` (alone in C23: `(...)`)
+    empty: bool,                  // written `()`: no prototype before C23, `(void)` from C23
+    id_list: bool,                // an identifier list (K&R): ids
+    ids: u.List.[Ident],
+}
+
+pub struct Ident {
+    name: []u8,
+    span: u.Span,
+}
+
+/// A declarator: a declared name with its derivations, its initializer or
+/// bit-field width. An abstract declarator (in a type name or an unnamed
+/// parameter) has an empty name.
+pub struct Declarator {
+    span: u.Span,
+    name: []u8,  // interned; empty if abstract
+    name_span: u.Span,
+    attrs: u.List.[*mut Attr],  // after the identifier (C23): they appertain to the entity
+    derivs: u.List.[Deriv],     // from the identifier outward
+    init: *mut Init,            // `= initializer`, or nil
+    width: *mut Expr,           // a member's bit-field width, or nil
+    // set by semantic analysis
+    ty: *mut CType,
+    sym: *mut CSym,
+}
+
+/// A parameter declaration.
+pub struct Param {
+    span: u.Span,
+    attrs: u.List.[*mut Attr],  // before it (C23)
+    specs: *mut DeclSpec,
+    decl: *mut Declarator,  // maybe abstract
+}
+
+/// A type name: specifiers and an abstract declarator.
+pub struct TypeName {
+    span: u.Span,
+    specs: *mut DeclSpec,
+    decl: *mut Declarator,  // abstract (no name), maybe with no derivations
+    ty: *mut CType,         // set by semantic analysis
+}
+
+/// What a Decl is.
+pub enum DeclKind {
+    DECL,           // specs decls;  (a declaration; or a member declaration, in a TagSpec)
+    FUNC_DEF,       // specs decls[0] kr_decls body: a function definition
+    STATIC_ASSERT,  // _Static_assert(cond, msg) / static_assert(cond) in C23 (msg nil)
+    ATTR,           // an attribute declaration `[[...]];` (C23): attrs
+}
+
+/// A declaration, function definition, static assertion or attribute
+/// declaration (at file scope, in a block, or as a struct member).
+pub struct Decl {
+    kind: DeclKind,
+    span: u.Span,
+    attrs: u.List.[*mut Attr],  // before it (C23): they appertain to each declared entity
+    specs: *mut DeclSpec,
+    decls: u.List.[*mut Declarator],  // the init-declarators or member declarators, maybe none
+    // FUNC_DEF
+    kr_decls: u.List.[*mut Decl],  // the declarations of a K&R definition's parameters
+    body: *mut Stmt,               // a COMPOUND statement
+    // STATIC_ASSERT
+    cond: *mut Expr,
+    msg: *mut Expr,  // a STRING, or nil
+}
+
+// -----------------------------------------------------------------------------
+// Initializers (6.7.10)
+// -----------------------------------------------------------------------------
+
+pub enum InitKind {
+    EXPR,  // e
+    LIST,  // { items }: maybe empty (C23)
+}
+
+pub enum DesigKind {
+    INDEX,   // [e]
+    MEMBER,  // .name
+}
+
+pub struct Designator {
+    kind: DesigKind,
+    span: u.Span,
+    e: *mut Expr,
+    name: []u8,
+}
+
+pub struct Init {
+    kind: InitKind,
+    span: u.Span,
+    e: *mut Expr,
+    items: u.List.[*mut Init],    // LIST
+    desigs: u.List.[Designator],  // the designation before this element of its list (`.a[2] =`), maybe none
+    trailing_comma: bool,         // LIST: ends with ','
+}
+
+// -----------------------------------------------------------------------------
+// Statements (6.8)
+// -----------------------------------------------------------------------------
+
+pub enum StmtKind {
+    COMPOUND,  // { items }: statements, DECL statements and labels
+    DECL,      // decl (a declaration, static assertion or attribute declaration in a block)
+    EXPR,      // e; or the null statement `;` (e nil)
+    IF,        // if (e) body else els (els nil without one)
+    SWITCH,    // switch (e) body
+    WHILE,     // while (e) body
+    DO,        // do body while (e);
+    FOR,       // for (first or decl; e; step) body: any of first, decl, e, step may be nil
+    GOTO,      // goto label;
+    CONTINUE,
+    BREAK,
+    RETURN,   // return e; (e nil without a value)
+    LABEL,    // label: body (body nil for a label at the end of a block, C23)
+    CASE,     // case e: body (body nil at the end of a block, C23)
+    DEFAULT,  // default: body (likewise)
+}
+
+pub struct Stmt {
+    kind: StmtKind,
+    span: u.Span,
+    attrs: u.List.[*mut Attr],  // before it (C23); for a label, those before the label
+    e: *mut Expr,
+    first: *mut Expr,  // FOR: the first clause, an expression
+    step: *mut Expr,   // FOR: the third clause
+    decl: *mut Decl,   // DECL; FOR: the first clause, a declaration
+    body: *mut Stmt,
+    els: *mut Stmt,
+    items: u.List.[*mut Stmt],  // COMPOUND
+    label: []u8,                // LABEL, GOTO (interned)
+    label_span: u.Span,
+    sym: *mut CSym,  // set by semantic analysis: LABEL, GOTO
+}
+
+/// A translation unit: its external declarations, in order.
+pub struct Unit {
+    decls: u.List.[*mut Decl],
+}
+
+// -----------------------------------------------------------------------------
+// Making nodes
+// -----------------------------------------------------------------------------
+
+/// A new expression of kind `k` at `sp` (one level high).
+pub fn new_expr(k: ExprKind, sp: u.Span) *mut Expr {
+    let e = u.new.[Expr]();
+    e.kind = k;
+    e.span = sp;
+    e.height = 1;
+    return e;
+}
+
+/// A new statement of kind `k` at `sp`.
+pub fn new_stmt(k: StmtKind, sp: u.Span) *mut Stmt {
+    let s = u.new.[Stmt]();
+    s.kind = k;
+    s.span = sp;
+    return s;
+}
+
+/// A new declaration of kind `k` at `sp`.
+pub fn new_decl(k: DeclKind, sp: u.Span) *mut Decl {
+    let d = u.new.[Decl]();
+    d.kind = k;
+    d.span = sp;
+    return d;
+}
+
+/// The usual spelling of a keyword (the C11 one for those C23 respells).
+pub fn kw_text(kw: i32) []u8 {
+    let names = ["?", "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum",
+                 "extern", "float", "for", "goto", "if", "int", "long", "register", "return", "short", "signed",
+                 "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+                 "inline", "restrict", "_Bool", "_Complex", "_Imaginary", "_Alignas", "_Alignof", "_Atomic", "_Generic",
+                 "_Noreturn", "_Static_assert", "_Thread_local", "constexpr", "false", "nullptr", "true", "typeof",
+                 "typeof_unqual", "_BitInt", "_Decimal32", "_Decimal64", "_Decimal128", "__builtin_va_list",
+                 "__axiom_int64"];
+    if (kw < 0) or (@int_cast(usize, kw) >= names.len) {
+        return "?";
+    }
+    return names[@int_cast(usize, kw)];
+}
+
+/// The spelling of a punctuator (a ctok P_ constant).
+pub fn punct_text(p: i32) []u8 {
+    let names = ["?", "[", "]", "(", ")", "{", "}", ".", "->", "++", "--", "&", "*", "+", "-", "~", "!", "/", "%", "<<",
+                 ">>", "<", ">", "<=", ">=", "==", "!=", "^", "|", "&&", "||", "?", ":", ";", "...", "=", "*=", "/=",
+                 "%=", "+=", "-=", "<<=", ">>=", "&=", "^=", "|=", ",", "::"];
+    if (p < 0) or (@int_cast(usize, p) >= names.len) {
+        return "?";
+    }
+    return names[@int_cast(usize, p)];
+}

@@ -1023,6 +1023,129 @@ await section('', {
   await section('garbage in', cases, { timed: false });
 }
 
+// The C parser (docs/c-frontend.md; the compiler only): each
+// cmd/axiom/internal/tests/c/parse/<name>.c gives the tree in <name>.ast
+// (--emit=c-ast), or with `/* expect-error: C2xxx */` directives exactly
+// those errors (`/* expect-errors */`: some, any). `/* flags: ... */` adds
+// options. Then robustness: truncated copies of the tests, unbalanced
+// brackets, deep nesting and token soup end with diagnostics, not a crash.
+{
+  const dir = path.join(root, 'cmd/axiom/internal/tests/c/parse');
+  const cfiles = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(dir, f)) : [];
+  const cdirectives = (src) => ({
+    flags: [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].split(' ')),
+    errors: [...src.matchAll(/\/\* expect-error: (C\d{4}) \*\//g)].map((m) => m[1]),
+    anyErrors: /\/\* expect-errors \*\//.test(src),
+  });
+  const skipBootstrap = () => (bootstrapCompiler() ? { skip: true, reason: 'the compiler only' } : null);
+  // The compiler on file f: { status, codes, out } (codes of the errors), or a problem.
+  // (the tree on standard output when there are no errors, the diagnostics' JSON when there are)
+  const parseC = (f, flags) => {
+    const c = spawnSync(compiler, ['build', f, '--emit=c-ast', '--format=agent-json', ...flags], { encoding: 'utf8', timeout: 60000, maxBuffer: 1 << 28 });
+    if (c.error) return `${c.error.code || c.error}`;
+    if (c.status !== 0 && c.status !== 1) return `status ${c.status} (signal ${c.signal}):\n${c.stdout.slice(0, 2000)}${c.stderr.slice(0, 2000)}`;
+    const nl = c.status === 0 ? c.stdout.indexOf('\n') : c.stdout.length;
+    let codes = [];
+    try { codes = JSON.parse(c.stdout.slice(0, nl)).diagnostics.filter((x) => x.severity === 'error').map((x) => x.code); } catch { return `bad output (status ${c.status}):\n${c.stdout.slice(0, 2000)}${c.stderr}`; }
+    return { status: c.status, codes, out: c.stdout.slice(nl + 1) };
+  };
+  const cases = byFile(cfiles, '', (f) => {
+    const s = skipBootstrap();
+    if (s) return s;
+    const src = fs.readFileSync(f, 'utf8');
+    const d = cdirectives(src);
+    const r = parseC(f, d.flags);
+    if (typeof r === 'string') return r;
+    if (d.anyErrors) return r.status === 1 && r.codes.length ? null : 'expected errors, but there were none';
+    if (d.errors.length) {
+      const want = [...d.errors].sort().join(', '), got = [...r.codes].sort().join(', ');
+      return want === got ? null : `expected errors [${want}], got [${got}]:\n${r.out.slice(0, 3000)}`;
+    }
+    if (r.status !== 0) return `errors [${r.codes.join(', ')}]:\n${r.out.slice(0, 3000)}`;
+    const want = fs.readFileSync(f.replace(/\.c$/, '.ast'), 'utf8');
+    return r.out === want ? null : `tree mismatch\n--- expected\n${want}\n--- got\n${r.out}`;
+  });
+  const write = (name, text) => {
+    const f = path.join(tmp, `cparse-${name}.c`);
+    fs.writeFileSync(f, text);
+    return f;
+  };
+  // ends with errors (any, or exactly one `code` when given), in a few seconds at most
+  const fails = (name, text, code, flags = []) => () => {
+    const s = skipBootstrap();
+    if (s) return s;
+    const t0 = Date.now();
+    const r = parseC(write(name, text), flags);
+    if (typeof r === 'string') return r;
+    if (Date.now() - t0 > 10000) return `took ${Date.now() - t0} ms`;
+    if (r.status !== 1 || !r.codes.length) return 'no errors';
+    if (code && (r.codes.length !== 1 || r.codes[0] !== code)) return `expected one ${code}, got [${r.codes.slice(0, 20).join(', ')}]`;
+    return null;
+  };
+  const passes = (name, text, flags = []) => () => {
+    const s = skipBootstrap();
+    if (s) return s;
+    const r = parseC(write(name, text), flags);
+    if (typeof r === 'string') return r;
+    return r.status === 0 ? null : `errors [${r.codes.slice(0, 20).join(', ')}]`;
+  };
+  const fn = (body) => `int f(int x) {\n${body}\n}\n`;
+  const deep = {
+    parentheses: (n) => fn(`return ${'('.repeat(n)}x${')'.repeat(n)};`),
+    'unary operators': (n) => fn(`return ${'- '.repeat(n)}x;`),
+    casts: (n) => fn(`return ${'(int)'.repeat(n)}x;`),
+    'an operator chain': (n) => fn(`return ${Array(n).fill('x').join(' + ')};`),
+    assignments: (n) => fn(`${Array(n).fill('x').join(' = ')} = 1; return x;`),
+    conditionals: (n) => fn(`return ${'x ? x : '.repeat(n)}x;`),
+    'a postfix chain': (n) => fn(`return x${'[0]'.repeat(n)};`),
+    blocks: (n) => fn(`${'{'.repeat(n)}x++;${'}'.repeat(n)} return x;`),
+    'else-if chains': (n) => fn(`${'if (x) x++; else '.repeat(n)}x--; return x;`),
+    initializers: (n) => `int a = ${'{'.repeat(n)}1${'}'.repeat(n)};\n`,
+    declarators: (n) => `int ${'('.repeat(n)}a${')'.repeat(n)};\n`,
+    'function declarators': (n) => `int a${'(int'.repeat(n)}${')'.repeat(n)};\n`,
+    structures: (n) => `${'struct { '.repeat(n)}int x;${' } a;'.repeat(n)}\n`,
+    'typeof operands': (n) => `int x;\n${'typeof('.repeat(n)}x${')'.repeat(n)} y;\n`,
+    'compound literals': (n) => fn(`return ${'(int[]){ '.repeat(n)}1${' }[0]'.repeat(n)};`),
+  };
+  for (const [name, gen] of Object.entries(deep)) {
+    const flags = name === 'typeof operands' ? ['--c-std=c23'] : [];
+    cases[`${name}, 400 levels deep`] = passes(`ok-${name.replace(/ /g, '_')}`, gen(400), flags);
+    cases[`${name}, 2000 levels deep, is C2002`] = fails(`deep-${name.replace(/ /g, '_')}`, gen(2000), 'C2002', flags);
+  }
+  cases['unbalanced brackets'] = fails('unbalanced', `${'int f(void) { ( [ { '.repeat(300)}\nint g(void) { return 0; } ) ] } }\n`);
+  cases['only closing brackets'] = fails('closing', ') ] } '.repeat(2000));
+  cases['a file of opening braces'] = fails('braces', '{'.repeat(100000));
+  // token soup: random tokens from a fixed seed
+  {
+    const words = ['int', 'char', 'struct', 'union', 'enum', 'typedef', 'static', 'const', 'x', 'y', 'T', '(', ')', '[', ']',
+      '{', '}', ';', ',', '*', '=', '+', '?', ':', '.', '->', '...', '1', '"s"', "'c'", 'if', 'else', 'for', 'while', 'do',
+      'return', 'case', 'default', 'goto', 'sizeof', '_Generic', '_Atomic', '[[', ']]', '::', 'typeof', 'alignas', '_BitInt'];
+    for (let seed = 1; seed <= 6; seed++) {
+      let st = seed * 2654435761 >>> 0;
+      const rnd = () => ((st = (st * 1103515245 + 12345) >>> 0) >>> 8) % words.length;
+      const toks = ['typedef int T;'];
+      for (let i = 0; i < 20000; i++) toks.push(words[rnd()]);
+      cases[`token soup ${seed}`] = fails(`soup${seed}`, toks.join(' ') + '\n', null, seed % 2 ? ['--c-std=c89'] : ['--c-std=c23']);
+    }
+  }
+  // truncated copies of the tests: diagnostics or a tree, nothing else
+  cases['the tests, truncated'] = () => {
+    const s = skipBootstrap();
+    if (s) return s;
+    for (const f of cfiles) {
+      const src = fs.readFileSync(f, 'utf8');
+      const d = cdirectives(src);
+      for (const frac of [0.3, 0.6, 0.9]) {
+        const cut = Math.floor(src.length * frac);
+        const r = parseC(write('cut', src.slice(0, cut)), d.flags);
+        if (typeof r === 'string') return `${path.basename(f)} cut at ${cut}: ${r}`;
+      }
+    }
+    return null;
+  };
+  await section('C parser', cases, { parallel: true, timed: false });
+}
+
 // `axiom fmt` (spec §16.5; the compiler only, not the bootstrap one). Each
 // cmd/axiom/internal/tests/fmt/<name>.ax formats to <name>.expected, which formats to itself;
 // --check lists what is not canonical; a file with a syntax error is left

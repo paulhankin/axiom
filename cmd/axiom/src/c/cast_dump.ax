@@ -1,0 +1,554 @@
+// =============================================================================
+// cast_dump.ax - the C syntax tree as text (--emit=c-ast): one node per line,
+// indented two spaces per level, with its source span (@line:col-col, or
+// @line:col-line:col). A child that has a role in its parent is prefixed
+// with it ("cond: ", "init: ").
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "ctok.ax" as ct;
+
+struct Dumper {
+    b: u.Buf,
+}
+
+fn line(D: *mut Dumper, depth: i32, role: []u8, text: []u8, sp: u.Span) void {
+    for k in 0..depth {
+        _ = k;
+        D.b.s("  ");
+    }
+    if role.len > 0 {
+        D.b.s(role);
+        D.b.s(": ");
+    }
+    D.b.s(text);
+    let lc = u.span_linecol(sp);
+    D.b.s(" @");
+    D.b.s(u.idec(lc.sl));
+    D.b.c(':');
+    D.b.s(u.idec(lc.sc));
+    D.b.c('-');
+    if lc.el != lc.sl {
+        D.b.s(u.idec(lc.el));
+        D.b.c(':');
+    }
+    D.b.s(u.idec(lc.ec));
+    D.b.c('\n');
+}
+
+fn quote(s: []u8) []u8 {
+    return u.cat3("'", s, "'");
+}
+
+fn hex_digit(v: u32) u8 {
+    if v < 10 {
+        return @truncate(u8, v) + '0';
+    }
+    return @truncate(u8, v - 10) + 'a';
+}
+
+// A string literal's code units, quoted, with escapes for those that are
+// not printable ASCII.
+fn units_text(us: []u32) []u8 {
+    let mut b = u.Buf.init();
+    b.c('"');
+    for x in us {
+        if x == '"' {
+            b.s("\\\"");
+        } else if x == '\\' {
+            b.s("\\\\");
+        } else if x == 10 {
+            b.s("\\n");
+        } else if x == 9 {
+            b.s("\\t");
+        } else if (x >= 32) and (x < 127) {
+            b.c(@truncate(u8, x));
+        } else {
+            b.s("\\x{");
+            let mut started = false;
+            let mut sh: u32 = 28;
+            loop {
+                let d = (x >> sh) & 15;
+                if (d != 0) or started or (sh == 0) {
+                    b.c(hex_digit(d));
+                    started = true;
+                }
+                if sh == 0 {
+                    break;
+                }
+                sh -= 4;
+            }
+            b.c('}');
+        }
+    }
+    b.c('"');
+    return b.done();
+}
+
+fn prefix_word(p: i32) []u8 {
+    if p == ct.ENC_WIDE {
+        return " L";
+    }
+    if p == ct.ENC_UTF8 {
+        return " u8";
+    }
+    if p == ct.ENC_UTF16 {
+        return " u";
+    }
+    if p == ct.ENC_UTF32 {
+        return " U";
+    }
+    return "";
+}
+
+fn attrs(D: *mut Dumper, depth: i32, xs: *u.List.[*mut cast.Attr]) void {
+    for a in xs.items() {
+        let mut b = u.Buf.init();
+        b.s("attr ");
+        if a.prefix.len > 0 {
+            b.s(a.prefix);
+            b.s("::");
+        }
+        b.s(a.name);
+        if a.has_args {
+            b.s(" (");
+            for k in 0..a.args.len {
+                if k > 0 {
+                    b.c(' ');
+                }
+                b.s(a.args[k].text);
+            }
+            b.c(')');
+        }
+        line(D, depth, "", b.done(), a.span);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Expressions
+// -----------------------------------------------------------------------------
+fn int_text(t: *ct.Token) []u8 {
+    let mut b = u.Buf.init();
+    b.s("int ");
+    b.s(u.udec(t.ival));
+    if t.base == 16 {
+        b.s(" hex");
+    } else if t.base == 8 {
+        b.s(" octal");
+    } else if t.base == 2 {
+        b.s(" binary");
+    }
+    if t.unsigned_ {
+        b.s(" u");
+    }
+    if t.longs == 1 {
+        b.s(" l");
+    } else if t.longs == 2 {
+        b.s(" ll");
+    }
+    if t.bitint {
+        b.s(" wb");
+    }
+    return b.done();
+}
+
+fn expr_text(e: *cast.Expr) []u8 {
+    let mut s: []u8 = "";
+    match e.kind {
+        .ERROR       => { s = "error"; }
+        .IDENT       => { s = u.cat2("ident ", quote(e.name)); }
+        .INT         => { s = int_text(e.tok); }
+        .FLOAT       => { s = u.cat2("float ", e.tok.text); }
+        .CHAR        => { s = u.cat3("char ", u.udec(e.tok.ival), prefix_word(e.tok.prefix)); }
+        .STRING      => { s = u.cat3("string ", units_text(e.tok.units), prefix_word(e.tok.prefix)); }
+        .BOOL        => { s = u.pick(e.bval, "bool true", "bool false"); }
+        .NULLPTR     => { s = "nullptr"; }
+        .UNARY       => { s = u.cat2("unary ", cast.punct_text(e.op)); }
+        .POSTFIX     => { s = u.cat2("postfix ", cast.punct_text(e.op)); }
+        .BINARY      => { s = u.cat2("binary ", cast.punct_text(e.op)); }
+        .ASSIGN      => { s = u.cat2("assign ", cast.punct_text(e.op)); }
+        .COND        => { s = "cond"; }
+        .COMMA       => { s = "comma"; }
+        .CALL        => { s = "call"; }
+        .INDEX       => { s = "index"; }
+        .MEMBER      => { s = u.cat3("member ", cast.punct_text(e.op), e.name); }
+        .CAST        => { s = "cast"; }
+        .SIZEOF_EXPR => { s = "sizeof"; }
+        .SIZEOF_TYPE => { s = "sizeof-type"; }
+        .ALIGNOF     => { s = u.cat2("alignof ", e.name); }
+        .COMPOUND    => { s = "compound-literal"; }
+        .GENERIC     => { s = "generic"; }
+    }
+    if e.parens > 0 {
+        s = u.cat2(s, " (parenthesized)");
+    }
+    return s;
+}
+
+fn expr(D: *mut Dumper, depth: i32, role: []u8, e: *cast.Expr) void {
+    if u.isnil(e) {
+        return;
+    }
+    line(D, depth, role, expr_text(e), e.span);
+    let d = depth + 1;
+    match e.kind {
+        .COND => {
+            expr(D, d, "", e.a);
+            expr(D, d, "then", e.b);
+            expr(D, d, "else", e.c);
+        }
+        .CALL => {
+            expr(D, d, "", e.a);
+            for x in e.args.items() {
+                expr(D, d, "arg", x);
+            }
+        }
+        .CAST, .SIZEOF_TYPE, .ALIGNOF => {
+            type_name(D, d, "", e.tname);
+            expr(D, d, "", e.a);
+        }
+        .COMPOUND => {
+            type_name(D, d, "", e.tname);
+            init(D, d, "", e.init);
+        }
+        .GENERIC => {
+            expr(D, d, "", e.a);
+            for g in e.assocs.items() {
+                if u.isnil(g.tname) {
+                    line(D, d, "", "default", g.span);
+                } else {
+                    line(D, d, "", "assoc", g.span);
+                    type_name(D, d + 1, "", g.tname);
+                }
+                expr(D, d + 1, "", g.e);
+            }
+        }
+        else => {
+            expr(D, d, "", e.a);
+            expr(D, d, "", e.b);
+            expr(D, d, "", e.c);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Initializers
+// -----------------------------------------------------------------------------
+fn init(D: *mut Dumper, depth: i32, role: []u8, it: *cast.Init) void {
+    if u.isnil(it) {
+        return;
+    }
+    let mut d = depth;
+    let mut r = role;
+    if it.desigs.len > 0 {
+        line(D, d, role, "designated", u.span_join(it.desigs.at(0).span, it.span));
+        d += 1;
+        for x in it.desigs.items() {
+            if x.kind == cast.DesigKind.MEMBER {
+                line(D, d, "", u.cat2("designator .", x.name), x.span);
+            } else {
+                line(D, d, "", "designator []", x.span);
+                expr(D, d + 1, "", x.e);
+            }
+        }
+        r = "";
+    }
+    if it.kind == cast.InitKind.EXPR {
+        expr(D, d, r, it.e);
+        return;
+    }
+    line(D, d, r, u.pick(it.trailing_comma, "init-list trailing-comma", "init-list"), it.span);
+    for x in it.items.items() {
+        init(D, d + 1, "", x);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Declarations
+// -----------------------------------------------------------------------------
+fn quals_text(q: i32) []u8 {
+    let mut b = u.Buf.init();
+    if (q & cast.Q_CONST) != 0 {
+        b.s(" const");
+    }
+    if (q & cast.Q_VOLATILE) != 0 {
+        b.s(" volatile");
+    }
+    if (q & cast.Q_RESTRICT) != 0 {
+        b.s(" restrict");
+    }
+    if (q & cast.Q_ATOMIC) != 0 {
+        b.s(" _Atomic");
+    }
+    return b.done();
+}
+
+fn spec_word(s: *cast.Spec) []u8 {
+    match s.kind {
+        .TYPEDEF_NAME => { return quote(s.name); }
+        .ALIGN        => { return "_Alignas"; }
+        .ATOMIC       => { return "_Atomic()"; }
+        else          => { return cast.kw_text(s.kw); }
+    }
+}
+
+fn specs(D: *mut Dumper, depth: i32, ds: *cast.DeclSpec) void {
+    if u.isnil(ds) {
+        return;
+    }
+    let mut b = u.Buf.init();
+    b.s("specs");
+    if ds.items.len == 0 {
+        b.s(" (none)");
+    }
+    for s in ds.items.items() {
+        b.c(' ');
+        b.s(spec_word(&s));
+    }
+    line(D, depth, "", b.done(), ds.span);
+    for s in ds.items.items() {
+        match s.kind {
+            .TAG => { tag(D, depth + 1, s.tag); }
+            .TYPEOF, .ALIGN => {
+                line(D, depth + 1, "", spec_word(&s), s.span);
+                type_name(D, depth + 2, "", s.tname);
+                expr(D, depth + 2, "", s.e);
+            }
+            .ATOMIC => {
+                line(D, depth + 1, "", "_Atomic()", s.span);
+                type_name(D, depth + 2, "", s.tname);
+            }
+            .BITINT => {
+                line(D, depth + 1, "", "_BitInt", s.span);
+                expr(D, depth + 2, "", s.e);
+            }
+            else => {}
+        }
+    }
+    attrs(D, depth + 1, &ds.attrs);
+}
+
+fn tag(D: *mut Dumper, depth: i32, tg: *cast.TagSpec) void {
+    let mut b = u.Buf.init();
+    b.s(cast.kw_text(tg.kw));
+    if tg.name.len > 0 {
+        b.c(' ');
+        b.s(quote(tg.name));
+    }
+    if tg.has_body {
+        b.s(" {}");
+    }
+    if tg.trailing_comma {
+        b.s(" trailing-comma");
+    }
+    line(D, depth, "", b.done(), tg.span);
+    let d = depth + 1;
+    attrs(D, d, &tg.attrs);
+    if u.notnil(tg.fixed) {
+        type_name(D, d, "fixed", tg.fixed);
+    }
+    for m in tg.members.items() {
+        decl(D, d, "", m);
+    }
+    for en in tg.enumerators.items() {
+        line(D, d, "", u.cat2("enumerator ", quote(en.name)), en.span);
+        attrs(D, d + 1, &en.attrs);
+        expr(D, d + 1, "value", en.value);
+    }
+}
+
+fn deriv(D: *mut Dumper, depth: i32, dv: *cast.Deriv) void {
+    let mut b = u.Buf.init();
+    match dv.kind {
+        .POINTER => {
+            b.s("pointer");
+            b.s(quals_text(dv.quals));
+        }
+        .ARRAY => {
+            b.s("array");
+            if dv.is_static {
+                b.s(" static");
+            }
+            b.s(quals_text(dv.quals));
+            if dv.is_star {
+                b.s(" [*]");
+            }
+        }
+        .FUNCTION => {
+            b.s("function");
+            if dv.empty {
+                b.s(" ()");
+            }
+            if dv.id_list {
+                b.s(" ids");
+                for x in dv.ids.items() {
+                    b.c(' ');
+                    b.s(x.name);
+                }
+            }
+            if dv.variadic {
+                b.s(" ...");
+            }
+        }
+    }
+    if dv.dup_quals {
+        b.s(" (repeated qualifier)");
+    }
+    line(D, depth, "", b.done(), dv.span);
+    attrs(D, depth + 1, &dv.attrs);
+    expr(D, depth + 1, "size", dv.size);
+    for pm in dv.params.items() {
+        line(D, depth + 1, "", "param", pm.span);
+        attrs(D, depth + 2, &pm.attrs);
+        specs(D, depth + 2, pm.specs);
+        declarator(D, depth + 2, pm.decl);
+    }
+}
+
+fn declarator(D: *mut Dumper, depth: i32, dc: *cast.Declarator) void {
+    if u.isnil(dc) {
+        return;
+    }
+    if (dc.name.len == 0) and (dc.derivs.len == 0) and (dc.attrs.len == 0) and u.isnil(dc.init) and u.isnil(dc.width) {
+        return;
+    }
+    let mut text = "declarator (abstract)";
+    if dc.name.len > 0 {
+        text = u.cat2("declarator ", quote(dc.name));
+    }
+    line(D, depth, "", text, dc.span);
+    let d = depth + 1;
+    attrs(D, d, &dc.attrs);
+    for k in 0..dc.derivs.len {
+        deriv(D, d, dc.derivs.at(k));
+    }
+    expr(D, d, "width", dc.width);
+    init(D, d, "init", dc.init);
+}
+
+fn type_name(D: *mut Dumper, depth: i32, role: []u8, tn: *cast.TypeName) void {
+    if u.isnil(tn) {
+        return;
+    }
+    line(D, depth, role, "type-name", tn.span);
+    specs(D, depth + 1, tn.specs);
+    declarator(D, depth + 1, tn.decl);
+}
+
+fn decl(D: *mut Dumper, depth: i32, role: []u8, dl: *cast.Decl) void {
+    if u.isnil(dl) {
+        return;
+    }
+    let d = depth + 1;
+    match dl.kind {
+        .STATIC_ASSERT => {
+            line(D, depth, role, "static-assert", dl.span);
+            expr(D, d, "", dl.cond);
+            expr(D, d, "msg", dl.msg);
+        }
+        .ATTR => {
+            line(D, depth, role, "attribute-declaration", dl.span);
+            attrs(D, d, &dl.attrs);
+        }
+        .DECL, .FUNC_DEF => {
+            line(D, depth, role, u.pick(dl.kind == cast.DeclKind.FUNC_DEF, "function-definition", "decl"), dl.span);
+            attrs(D, d, &dl.attrs);
+            specs(D, d, dl.specs);
+            for dc in dl.decls.items() {
+                declarator(D, d, dc);
+            }
+            for kd in dl.kr_decls.items() {
+                decl(D, d, "", kd);
+            }
+            stmt(D, d, "", dl.body);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Statements
+// -----------------------------------------------------------------------------
+fn stmt(D: *mut Dumper, depth: i32, role: []u8, s: *cast.Stmt) void {
+    if u.isnil(s) {
+        return;
+    }
+    let d = depth + 1;
+    match s.kind {
+        .COMPOUND => {
+            line(D, depth, role, "compound", s.span);
+            attrs(D, d, &s.attrs);
+            for x in s.items.items() {
+                stmt(D, d, "", x);
+            }
+        }
+        .DECL => { decl(D, depth, role, s.decl); }
+        .EXPR => {
+            line(D, depth, role, u.pick(u.isnil(s.e), "null-stmt", "expr-stmt"), s.span);
+            attrs(D, d, &s.attrs);
+            expr(D, d, "", s.e);
+        }
+        .IF => {
+            line(D, depth, role, "if", s.span);
+            attrs(D, d, &s.attrs);
+            expr(D, d, "cond", s.e);
+            stmt(D, d, "then", s.body);
+            stmt(D, d, "else", s.els);
+        }
+        .SWITCH, .WHILE => {
+            line(D, depth, role, u.pick(s.kind == cast.StmtKind.SWITCH, "switch", "while"), s.span);
+            attrs(D, d, &s.attrs);
+            expr(D, d, "cond", s.e);
+            stmt(D, d, "body", s.body);
+        }
+        .DO => {
+            line(D, depth, role, "do", s.span);
+            attrs(D, d, &s.attrs);
+            stmt(D, d, "body", s.body);
+            expr(D, d, "cond", s.e);
+        }
+        .FOR => {
+            line(D, depth, role, "for", s.span);
+            attrs(D, d, &s.attrs);
+            decl(D, d, "init", s.decl);
+            expr(D, d, "init", s.first);
+            expr(D, d, "cond", s.e);
+            expr(D, d, "step", s.step);
+            stmt(D, d, "body", s.body);
+        }
+        .GOTO => {
+            line(D, depth, role, u.cat2("goto ", quote(s.label)), s.span);
+            attrs(D, d, &s.attrs);
+        }
+        .CONTINUE, .BREAK => {
+            line(D, depth, role, u.pick(s.kind == cast.StmtKind.BREAK, "break", "continue"), s.span);
+            attrs(D, d, &s.attrs);
+        }
+        .RETURN => {
+            line(D, depth, role, "return", s.span);
+            attrs(D, d, &s.attrs);
+            expr(D, d, "", s.e);
+        }
+        .LABEL, .CASE, .DEFAULT => {
+            let mut text = "default";
+            if s.kind == cast.StmtKind.LABEL {
+                text = u.cat2("label ", quote(s.label));
+            } else if s.kind == cast.StmtKind.CASE {
+                text = "case";
+            }
+            line(D, depth, role, text, s.span);
+            attrs(D, d, &s.attrs);
+            expr(D, d, "", s.e);
+            stmt(D, d, "", s.body);
+        }
+    }
+}
+
+/// The tree of a translation unit as text (see the header).
+pub fn dump(unit: *cast.Unit) []u8 {
+    let mut D = Dumper.{ b: u.Buf.init() };
+    D.b.s("translation-unit\n");
+    for dl in unit.decls.items() {
+        decl(&mut D, 1, "", dl);
+    }
+    return D.b.done();
+}
