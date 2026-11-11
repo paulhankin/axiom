@@ -27,6 +27,8 @@
 // =============================================================================
 import "ast.ax" as ast;
 import "backend.ax" as be;
+import "c/cc.ax" as cfront;
+import "c/copts.ax" as cop;
 import "codegen.ax" as cg;
 import "diag.ax" as dg;
 import "elf.ax" as elf;
@@ -264,6 +266,7 @@ struct Options {
     feature_args: u.List.[[]u8],
     link_flags: u.List.[[]u8],  // -l / -L
     inc_flags: u.List.[[]u8],   // -I, for C sources
+    c_args: u.List.[[]u8],      // the C front end's options (c_option)
     header_path: []u8,
     test_filter: []u8,
     test_timeout: []u8,
@@ -286,9 +289,10 @@ fn new_options(cmd: []u8) Options {
                      input: u.nosym(), out: u.nosym(), run_dir: u.nosym(), std_dir: u.nosym(), target: "wasm32",
                      emit: "exe", json: false, co: co, link_inputs: u.List.[[]u8].empty(),
                      ax_links: u.List.[[]u8].empty(), feature_args: u.List.[[]u8].empty(),
-                     link_flags: u.List.[[]u8].empty(), inc_flags: u.List.[[]u8].empty(), header_path: u.nosym(),
-                     test_filter: u.nosym(), test_timeout: u.nosym(), show_output: false, prof_hz: 999, units_mode: -1,
-                     verbose: false, folded_path: u.nosym(), prog_args: u.List.[[]u8].empty() };
+                     link_flags: u.List.[[]u8].empty(), inc_flags: u.List.[[]u8].empty(), c_args: u.List.[[]u8].empty(),
+                     header_path: u.nosym(), test_filter: u.nosym(), test_timeout: u.nosym(), show_output: false,
+                     prof_hz: 999, units_mode: -1, verbose: false, folded_path: u.nosym(),
+                     prog_args: u.List.[[]u8].empty() };
 }
 
 // A step of the driver returns this to go on, or an exit status.
@@ -298,6 +302,84 @@ const CONTINUE: i32 = -1;
 fn fatal(json: bool, code: []u8, msg: []u8) i32 {
     dg.emit_fatal(json, code, msg);
     return 2;
+}
+
+// The C front end's options (docs/c.md): the standard, the choices the
+// implementation makes, and macros. True if `a` is one (kept in o.c_args, for
+// c_options to read once the target is known).
+fn c_option(o: *mut Options, a: []u8) bool {
+    if u.starts(a, "--c-std=") or u.starts(a, "--c-char=") or u.starts(a, "--c-int=") or u.starts(a, "--c-long=") or
+       ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
+        o.c_args.push(a);
+        return true;
+    }
+    return false;
+}
+
+// The C options for the target, with o.c_args applied; false on an error
+// (reported).
+fn c_options(o: *Options, c: *mut cop.COptions) bool {
+    let win = tg.g_os == tg.OS_WINDOWS;
+    c.std = cop.C17;
+    // (the targets' C ABIs: plain char is unsigned on AArch64 Linux; long is
+    // 32 bits on Windows and where pointers are)
+    c.char_signed = not ((tg.g_arch == tg.ARCH_A64) and (tg.g_os == tg.OS_LINUX));
+    c.int_bits = 32;
+    c.ptr_bits = ty.g_target.ptr_bits;
+    c.long_bits = 64;
+    if win or (c.ptr_bits == 32) {
+        c.long_bits = 32;
+    }
+    c.wchar_bits = 32;
+    c.wchar_signed = true;
+    if win {
+        c.wchar_bits = 16;
+        c.wchar_signed = false;
+    }
+    let mut defs = u.List.[cop.Define].empty();
+    let mut dirs = u.List.[[]u8].empty();
+    for k in 0..o.inc_flags.len {
+        dirs.push(o.inc_flags.get(k)[2..]);
+    }
+    for k in 0..o.c_args.len {
+        let a = o.c_args.get(k);
+        let mut ok = true;
+        if u.starts(a, "--c-std=") {
+            c.std = cop.std_named(a[8..]);
+            ok = c.std >= 0;
+        } else if u.starts(a, "--c-char=") {
+            c.char_signed = u.str_eq(a[9..], "signed");
+            ok = c.char_signed or u.str_eq(a[9..], "unsigned");
+        } else if u.starts(a, "--c-int=") {
+            c.int_bits = @truncate(i32, u.atol(a[8..]));
+            ok = (c.int_bits == 16) or (c.int_bits == 32) or (c.int_bits == 64);
+        } else if u.starts(a, "--c-long=") {
+            c.long_bits = @truncate(i32, u.atol(a[9..]));
+            ok = (c.long_bits == 32) or (c.long_bits == 64);
+        } else if a[1] == 'U' {
+            defs.push(cop.Define.{ name: a[2..], body: "", undef: true });
+        } else {
+            let eq = u.find(a, '=');
+            if eq < 0 {
+                defs.push(cop.Define.{ name: a[2..], body: "1", undef: false });
+            } else {
+                defs.push(cop.Define.{ name: a[2..@int_cast(usize, eq)], body: a[@int_cast(usize, eq) + 1..],
+                                       undef: false });
+            }
+        }
+        if not ok {
+            dg.emit_fatal(o.json, "E9001", u.f1("bad value in '%s'", a));
+            return false;
+        }
+    }
+    if c.long_bits < c.int_bits {
+        dg.emit_fatal(o.json, "E9001", "--c-long must be at least --c-int");
+        return false;
+    }
+    c.defines = defs.items();
+    c.include_dirs = dirs.items();
+    c.sys_include = u.cat2(o.std_dir, "/c/include");
+    return true;
 }
 
 // Reads the options after the command into *o; false on an error (reported).
@@ -387,6 +469,8 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             o.link_flags.push(a);
         } else if (a.len > 2) and (a[0] == '-') and (a[1] == 'I') {
             o.inc_flags.push(a);
+        } else if c_option(o, a) {
+            // an option of the C front end
         } else if o.profiling and u.str_eq(a, "--") {
             // the rest are the program's arguments
             for k in i + 1..argc {
@@ -633,6 +717,14 @@ fn compile(args: [][]u8) i32 {
     ty.types_init();
     if u.isnos(o.std_dir) {
         o.std_dir = find_std(args[0]);
+    }
+    if u.ends(o.input, ".c") and not o.ide_mode {
+        // a C translation unit (docs/c.md)
+        let mut c = u.new.[cop.COptions]();
+        if not c_options(&o, c) {
+            return 2;
+        }
+        return cfront.run(o.input, c, o.emit, o.out, o.json);
     }
     if o.ide_mode {
         return ide.run(o.input, o.std_dir);

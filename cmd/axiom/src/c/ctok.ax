@@ -1,0 +1,358 @@
+// =============================================================================
+// ctok.ax - the tokens the C preprocessor hands the parser (translation
+// phase 7): preprocessing is done, adjacent string literals are joined,
+// numbers are converted, and identifiers that are keywords of the standard
+// in force are keywords.
+// =============================================================================
+import "../util.ax" as u;
+
+pub const T_EOF: i32 = 0;
+pub const T_IDENT: i32 = 1;    // text
+pub const T_KEYWORD: i32 = 2;  // id: a K_ constant; text
+pub const T_PUNCT: i32 = 3;    // id: a P_ constant; text (a digraph is its ordinary punctuator)
+pub const T_INT: i32 = 4;      // ival, base, unsigned_, longs, bitint
+pub const T_FLOAT: i32 = 5;    // fval, fsuffix; text (the spelling)
+pub const T_CHAR: i32 = 6;     // ival (the value, as the prefix's type), prefix
+pub const T_STRING: i32 = 7;   // units, prefix
+
+// Encoding prefixes of character constants and string literals.
+pub const ENC_NONE: i32 = 0;
+pub const ENC_WIDE: i32 = 1;   // L
+pub const ENC_UTF8: i32 = 2;   // u8
+pub const ENC_UTF16: i32 = 3;  // u
+pub const ENC_UTF32: i32 = 4;  // U
+
+pub struct Token {
+    kind: i32,
+    id: i32,       // T_KEYWORD, T_PUNCT
+    span: u.Span,  // where it is written; for a token from a macro, where the macro was invoked
+    text: []u8,    // its spelling (interned for identifiers and keywords)
+    // T_INT, T_CHAR
+    ival: u64,
+    base: i32,        // 8, 10, 16 or 2
+    unsigned_: bool,  // a u suffix
+    longs: i32,       // l suffixes: 0, 1 or 2
+    bitint: bool,     // a wb suffix (C23)
+    // T_FLOAT
+    fval: f64,
+    fsuffix: i32,  // 0 none (double), 1 f, 2 l
+    // T_CHAR, T_STRING
+    prefix: i32,   // ENC_
+    units: []u32,  // T_STRING: the code units, without a terminating zero
+    // for printing preprocessed text (--emit=c-pp)
+    space: bool,  // white space came before it
+    bol: bool,    // it is the first token of its line
+}
+
+// Punctuators.
+pub const P_LBRACKET: i32 = 1;     // [
+pub const P_RBRACKET: i32 = 2;     // ]
+pub const P_LPAREN: i32 = 3;       // (
+pub const P_RPAREN: i32 = 4;       // )
+pub const P_LBRACE: i32 = 5;       // {
+pub const P_RBRACE: i32 = 6;       // }
+pub const P_DOT: i32 = 7;          // .
+pub const P_ARROW: i32 = 8;        // ->
+pub const P_INC: i32 = 9;          // ++
+pub const P_DEC: i32 = 10;         // --
+pub const P_AMP: i32 = 11;         // &
+pub const P_STAR: i32 = 12;        // *
+pub const P_PLUS: i32 = 13;        // +
+pub const P_MINUS: i32 = 14;       // -
+pub const P_TILDE: i32 = 15;       // ~
+pub const P_BANG: i32 = 16;        // !
+pub const P_SLASH: i32 = 17;       // /
+pub const P_PERCENT: i32 = 18;     // %
+pub const P_SHL: i32 = 19;         // <<
+pub const P_SHR: i32 = 20;         // >>
+pub const P_LT: i32 = 21;          // <
+pub const P_GT: i32 = 22;          // >
+pub const P_LE: i32 = 23;          // <=
+pub const P_GE: i32 = 24;          // >=
+pub const P_EQ: i32 = 25;          // ==
+pub const P_NE: i32 = 26;          // !=
+pub const P_CARET: i32 = 27;       // ^
+pub const P_PIPE: i32 = 28;        // |
+pub const P_ANDAND: i32 = 29;      // &&
+pub const P_OROR: i32 = 30;        // ||
+pub const P_QUESTION: i32 = 31;    // ?
+pub const P_COLON: i32 = 32;       // :
+pub const P_SEMI: i32 = 33;        // ;
+pub const P_ELLIPSIS: i32 = 34;    // ...
+pub const P_ASSIGN: i32 = 35;      // =
+pub const P_MUL_EQ: i32 = 36;      // *=
+pub const P_DIV_EQ: i32 = 37;      // /=
+pub const P_MOD_EQ: i32 = 38;      // %=
+pub const P_ADD_EQ: i32 = 39;      // +=
+pub const P_SUB_EQ: i32 = 40;      // -=
+pub const P_SHL_EQ: i32 = 41;      // <<=
+pub const P_SHR_EQ: i32 = 42;      // >>=
+pub const P_AND_EQ: i32 = 43;      // &=
+pub const P_XOR_EQ: i32 = 44;      // ^=
+pub const P_OR_EQ: i32 = 45;       // |=
+pub const P_COMMA: i32 = 46;       // ,
+pub const P_COLONCOLON: i32 = 47;  // :: (C23, in attributes)
+
+// Keywords. keyword_id gives the one an identifier is under a standard.
+pub const K_AUTO: i32 = 1;
+pub const K_BREAK: i32 = 2;
+pub const K_CASE: i32 = 3;
+pub const K_CHAR: i32 = 4;
+pub const K_CONST: i32 = 5;
+pub const K_CONTINUE: i32 = 6;
+pub const K_DEFAULT: i32 = 7;
+pub const K_DO: i32 = 8;
+pub const K_DOUBLE: i32 = 9;
+pub const K_ELSE: i32 = 10;
+pub const K_ENUM: i32 = 11;
+pub const K_EXTERN: i32 = 12;
+pub const K_FLOAT: i32 = 13;
+pub const K_FOR: i32 = 14;
+pub const K_GOTO: i32 = 15;
+pub const K_IF: i32 = 16;
+pub const K_INT: i32 = 17;
+pub const K_LONG: i32 = 18;
+pub const K_REGISTER: i32 = 19;
+pub const K_RETURN: i32 = 20;
+pub const K_SHORT: i32 = 21;
+pub const K_SIGNED: i32 = 22;
+pub const K_SIZEOF: i32 = 23;
+pub const K_STATIC: i32 = 24;
+pub const K_STRUCT: i32 = 25;
+pub const K_SWITCH: i32 = 26;
+pub const K_TYPEDEF: i32 = 27;
+pub const K_UNION: i32 = 28;
+pub const K_UNSIGNED: i32 = 29;
+pub const K_VOID: i32 = 30;
+pub const K_VOLATILE: i32 = 31;
+pub const K_WHILE: i32 = 32;
+// C99
+pub const K_INLINE: i32 = 33;
+pub const K_RESTRICT: i32 = 34;
+pub const K_BOOL: i32 = 35;       // _Bool; bool in C23
+pub const K_COMPLEX: i32 = 36;    // _Complex
+pub const K_IMAGINARY: i32 = 37;  // _Imaginary
+// C11
+pub const K_ALIGNAS: i32 = 38;        // _Alignas; alignas in C23
+pub const K_ALIGNOF: i32 = 39;        // _Alignof; alignof in C23
+pub const K_ATOMIC: i32 = 40;         // _Atomic
+pub const K_GENERIC: i32 = 41;        // _Generic
+pub const K_NORETURN: i32 = 42;       // _Noreturn
+pub const K_STATIC_ASSERT: i32 = 43;  // _Static_assert; static_assert in C23
+pub const K_THREAD_LOCAL: i32 = 44;   // _Thread_local; thread_local in C23
+// C23
+pub const K_CONSTEXPR: i32 = 45;
+pub const K_FALSE: i32 = 46;
+pub const K_NULLPTR: i32 = 47;
+pub const K_TRUE: i32 = 48;
+pub const K_TYPEOF: i32 = 49;
+pub const K_TYPEOF_UNQUAL: i32 = 50;
+pub const K_BITINT: i32 = 51;      // _BitInt
+pub const K_DECIMAL32: i32 = 52;   // _Decimal32
+pub const K_DECIMAL64: i32 = 53;   // _Decimal64
+pub const K_DECIMAL128: i32 = 54;  // _Decimal128
+// The compiler's own, in every standard (reserved identifiers; the
+// compiler's headers are written with them).
+pub const K_BUILTIN_VA_LIST: i32 = 55;  // __builtin_va_list
+pub const K_INT64: i32 = 56;            // __axiom_int64: the 64-bit integer type (long or long long)
+
+// The keywords: spelling, K_ constant, and the first standard each is a keyword in.
+let KW_NAMES: [61][]u8 = [
+    "auto",
+    "break",
+    "case",
+    "char",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extern",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "int",
+    "long",
+    "register",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "struct",
+    "switch",
+    "typedef",
+    "union",
+    "unsigned",
+    "void",
+    "volatile",
+    "while",
+    "inline",
+    "restrict",
+    "_Bool",
+    "_Complex",
+    "_Imaginary",
+    "_Alignas",
+    "_Alignof",
+    "_Atomic",
+    "_Generic",
+    "_Noreturn",
+    "_Static_assert",
+    "_Thread_local",
+    "alignas",
+    "alignof",
+    "bool",
+    "constexpr",
+    "false",
+    "nullptr",
+    "static_assert",
+    "thread_local",
+    "true",
+    "typeof",
+    "typeof_unqual",
+    "_BitInt",
+    "_Decimal32",
+    "_Decimal64",
+    "_Decimal128",
+    "__builtin_va_list",
+    "__axiom_int64",
+];
+let KW_IDS: [61]i32 = [
+    K_AUTO,
+    K_BREAK,
+    K_CASE,
+    K_CHAR,
+    K_CONST,
+    K_CONTINUE,
+    K_DEFAULT,
+    K_DO,
+    K_DOUBLE,
+    K_ELSE,
+    K_ENUM,
+    K_EXTERN,
+    K_FLOAT,
+    K_FOR,
+    K_GOTO,
+    K_IF,
+    K_INT,
+    K_LONG,
+    K_REGISTER,
+    K_RETURN,
+    K_SHORT,
+    K_SIGNED,
+    K_SIZEOF,
+    K_STATIC,
+    K_STRUCT,
+    K_SWITCH,
+    K_TYPEDEF,
+    K_UNION,
+    K_UNSIGNED,
+    K_VOID,
+    K_VOLATILE,
+    K_WHILE,
+    K_INLINE,
+    K_RESTRICT,
+    K_BOOL,
+    K_COMPLEX,
+    K_IMAGINARY,
+    K_ALIGNAS,
+    K_ALIGNOF,
+    K_ATOMIC,
+    K_GENERIC,
+    K_NORETURN,
+    K_STATIC_ASSERT,
+    K_THREAD_LOCAL,
+    K_ALIGNAS,
+    K_ALIGNOF,
+    K_BOOL,
+    K_CONSTEXPR,
+    K_FALSE,
+    K_NULLPTR,
+    K_STATIC_ASSERT,
+    K_THREAD_LOCAL,
+    K_TRUE,
+    K_TYPEOF,
+    K_TYPEOF_UNQUAL,
+    K_BITINT,
+    K_DECIMAL32,
+    K_DECIMAL64,
+    K_DECIMAL128,
+    K_BUILTIN_VA_LIST,
+    K_INT64,
+];
+let KW_SINCE: [61]i32 = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2,
+    2,
+    2,
+    2,
+    2,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    0,
+    0,
+];
+
+/// The keyword `name` is under standard `std` (a copts constant), or 0.
+pub fn keyword_id(name: []u8, std: i32) i32 {
+    for k in 0..KW_NAMES.len {
+        if (KW_SINCE[k] <= std) and u.str_eq(KW_NAMES[k], name) {
+            return KW_IDS[k];
+        }
+    }
+    return 0;
+}
