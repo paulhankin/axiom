@@ -27,6 +27,7 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
 import "csema.ax" as cs;
+import "csema_marks.ax" as csm;
 import "ctypes.ax" as cty;
 
 /// The symbol C's main is generated under, and the one the start-up calls.
@@ -87,9 +88,9 @@ pub fn lty(t0: *mut cty.CType) *mut ir.Ty {
     let t = t0.unq;
     let k = t.kind;
     if cty.is_integer(t) {
-        return ir.t_int(t.bits);
+        return ir.t_int(cty.storage_bits(t));
     }
-    if k == cty.TK_POINTER {
+    if (k == cty.TK_POINTER) or (k == cty.TK_NULLPTR) {
         return T_ptr;
     }
     if k == cty.TK_FLOAT {
@@ -220,7 +221,7 @@ pub fn ext_of(t: *cty.CType) u8 {
     if t.kind == cty.TK_BOOL {
         return 1;
     }
-    if cty.is_integer(t) and (t.bits < 32) {
+    if cty.is_integer(t) and (cty.storage_bits(t) < 32) {
         if t.is_signed {
             return 2;
         }
@@ -279,7 +280,7 @@ fn mark_func(f: *mut ir.Func, ret: *mut cty.CType, ps: []mut *mut cty.CType, sre
 // The symbol name of an entity: its own with external linkage (main's is
 // MAIN_SYMBOL), else made unique.
 fn symbol_name(s: *cast.CSym) []u8 {
-    if s.linkage == cast.LK_EXTERNAL {
+    if (s.linkage == cast.LK_EXTERNAL) and not ((s.kind == cast.SK_FUNC) and csm.is_inline_def(s)) {
         if (s.kind == cast.SK_FUNC) and u.str_eq(s.name, "main") {
             return MAIN_SYMBOL;
         }
@@ -288,14 +289,20 @@ fn symbol_name(s: *cast.CSym) []u8 {
     return u.f2("%s.%s", s.name, u.idec(s.uid));
 }
 
-// The parameter types of function s's IR signature: its definition's
-// parameters, or its type's (a declaration with a prototype).
-fn param_types(s: *cast.CSym) []mut *mut cty.CType {
+/// The parameter types of function s's IR signature: its definition's
+/// parameters (promoted, for a definition with an identifier list: the
+/// arguments arrive so), or its type's (a declaration with a prototype).
+pub fn param_types(s: *cast.CSym) []mut *mut cty.CType {
     if u.notnil(s.def) {
+        let dt = s.def.decls.get(0).ty;
+        let kr = u.notnil(dt) and (dt.kind == cty.TK_FUNCTION) and dt.kr;
         let n = s.params.len;
         let ts = u.newn.[*mut cty.CType](n + 1);
         for i in 0..n {
             ts[i] = cty.unqual(s.params.get(i).ty);
+            if kr {
+                ts[i] = cty.arg_promote(ts[i]);
+            }
         }
         return ts[0..n];
     }
@@ -334,7 +341,8 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
     } else {
         f.ty = sig.ty;
     }
-    if s.linkage != cast.LK_EXTERNAL {
+    if (s.linkage != cast.LK_EXTERNAL) or csm.is_inline_def(s) {
+        // (an inline definition is for this unit only: 6.7.4p7)
         f.linkage = ir.LINK_INTERNAL;
     }
     if u.str_eq(name, MAIN_SYMBOL) {

@@ -16,8 +16,10 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "copts.ax" as co;
 import "csema.ax" as cs;
+import "csema_bitint.ax" as csb;
 import "csema_expr.ax" as cx;
 import "csema_init.ax" as ci;
+import "csema_marks.ax" as csm;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -62,13 +64,17 @@ struct Counts {
     bool_: i32,
     int64: i32,
     valist: i32,
+    bitint: i32,  // _BitInt(width)
+    width: i32,   // its width (0: in error, reported)
+    width_sp: u.Span,
     other: i32,  // a tag, typedef name or other type specifier
 }
 
 fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
     let mut r = Specs.{ ty: cty.t_int, sc: 0, thread: false, funcs: ds.funcs, tag_decl: false, sp: ds.span };
     let mut c = Counts.{ void_: 0, char_: 0, short_: 0, int_: 0, long_: 0, float_: 0, double_: 0, signed_: 0,
-                         unsigned_: 0, bool_: 0, int64: 0, valist: 0, other: 0 };
+                         unsigned_: 0, bool_: 0, int64: 0, valist: 0, bitint: 0, width: 0, width_sp: ds.span,
+                         other: 0 };
     let mut other = cty.t_error;
     let mut nstorage: i32 = 0;
     let mut qual_seen: i32 = 0;
@@ -152,9 +158,15 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
             c.other += 1;
             other = typeof_type(s);
         } else if k == cast.SpecKind.BITINT {
-            c.other += 1;
-            cs.unsupported(s.span, "_BitInt");
-            bad = true;
+            c.bitint += 1;
+            c.width_sp = s.span;
+            let w = cx.ice(s.e, "the width of _BitInt");
+            s.e = w.e;
+            if w.ok {
+                c.width = csb.width_value(w.v, w.e.ty.is_signed);
+            } else {
+                bad = true;
+            }
         } else {
             c.other += 1;
             cs.not_supported(s.span, "_Atomic");
@@ -190,9 +202,20 @@ fn typeof_type(s: *mut cast.Spec) *mut cty.CType {
         }
     }
     if s.kw == ct.K_TYPEOF_UNQUAL {
-        return cty.unqual(t);
+        return unqual_array(t);
     }
     return t;
+}
+
+// t without qualifiers; an array's are its elements' (C23 6.7.4.1p10: an
+// array and its element type are qualified alike), so they go too.
+fn unqual_array(t: *mut cty.CType) *mut cty.CType {
+    if t.kind == cty.TK_ARRAY {
+        let a = cty.array_of(unqual_array(t.elem), t.len, t.has_len);
+        a.vla = t.vla;
+        return a;
+    }
+    return cty.unqual(t);
 }
 
 fn storage_bit(kw: i32) i32 {
@@ -232,10 +255,16 @@ fn base_type(c: *Counts, other: *mut cty.CType, sp: u.Span) *mut cty.CType {
     let kws = c.void_ + c.char_ + c.short_ + c.int_ + c.long_ + c.float_ + c.double_ + c.signed_ + c.unsigned_ +
               c.bool_ + c.int64 + c.valist;
     if c.other > 0 {
-        if (c.other > 1) or (kws > 0) {
+        if (c.other > 1) or (kws > 0) or (c.bitint > 0) {
             return bad_combination(sp);
         }
         return other;
+    }
+    if c.bitint > 0 {
+        if (c.bitint > 1) or (kws != c.signed_ + c.unsigned_) or (kws > 1) {
+            return bad_combination(sp);
+        }
+        return csb.bitint_type(c.width, c.unsigned_ == 0, c.width_sp);
     }
     if kws == 0 {
         return cty.t_int;  // implicit int (C89; the parser reported it later)
@@ -669,7 +698,12 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
     let mut proto = true;
     if dv.id_list {
         proto = false;
+        let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
         for id in dv.ids.items() {
+            if seen.get(id.name) != 0 {
+                cs.err(id.span, "C3002", u.f1("a second parameter named '%s'", id.name));
+            }
+            seen.put(id.name, 1);
             let s = cs.new_sym(cast.SK_OBJECT, id.name, id.span, cty.t_int);
             s.is_param = true;
             syms.push(s);
@@ -697,6 +731,9 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             let adj = adjust_param(pt, p.decl);
             let s = cs.new_sym(cast.SK_OBJECT, p.decl.name, p.decl.name_span, adj);
             s.is_param = true;
+            if sp.sc == cast.SC_REGISTER {
+                csm.set_register(s);
+            }
             p.decl.sym = s;
             if p.decl.name.len > 0 {
                 let prior = cs.lookup_here(p.decl.name);
@@ -902,6 +939,9 @@ fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32)
     }
     let lk = cs.linkage_of(dcl.name, sc2, true);
     dcl.sym = entity(dcl.name, dcl.name_span, cast.SK_FUNC, t, lk);
+    if cs.at_file_scope() and (dcl.sym.kind == cast.SK_FUNC) {
+        csm.function_declared(dcl.sym, sp.funcs, sc, dcl.name_span);
+    }
 }
 
 fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32) void {
@@ -957,6 +997,9 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i3
     if sc == cast.SC_STATIC {
         s.duration = cast.SD_STATIC;
     }
+    if sc == cast.SC_REGISTER {
+        csm.set_register(s);
+    }
     dcl.sym = s;
     cs.declare(name, s);
     if u.notnil(dcl.init) {
@@ -968,6 +1011,7 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i3
     if s.duration == cast.SD_STATIC {
         s.defined = true;
         cs.add_object(s);
+        csm.static_defined(s, dcl.name_span);
     }
     dcl.ty = s.ty;
 }
@@ -1034,13 +1078,17 @@ fn function_def(d: *mut cast.Decl) void {
     if u.str_eq(dcl.name, "main") and (lk == cast.LK_EXTERNAL) {
         check_main(s, dcl);
     }
+    csm.function_declared(s, sp.funcs, sp.sc, dcl.name_span);
     cs.add_function(s);
+    csm.begin_body(s);
     cs.hooks.body(s, d);
+    csm.end_body();
 }
 
 // A K&R definition's parameters get their types from its declaration list
 // (int when they have none, before C99); the function's type, which is not a
-// prototype, gets them.
+// prototype, gets them (kr: its compatibility with a prototype is by their
+// promoted types, 6.7.6.3p15).
 fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CSym]) *mut cty.CType {
     let ps = params.items();
     let mut given = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
@@ -1072,6 +1120,9 @@ fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CS
             let pt = derive(sp.ty, x, CTX_PARAM);
             x.ty = pt;
             x.sym = p;
+            if sp.sc == cast.SC_REGISTER {
+                csm.set_register(p);
+            }
             p.ty = adjust_param(pt, x);
             p.span = x.name_span;
         }
@@ -1082,14 +1133,13 @@ fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CS
         if (seen.get(p.name) == 0) and (cs.std() >= co.C99) {
             cs.err(p.span, "C3010", u.f1("the parameter '%s' has no declaration (implicit int is not in C99)", p.name));
         }
-        if cty.arg_promote(p.ty) != cty.unqual(p.ty) {
-            cs.unsupported(p.span,
-                           u.f1("a K&R-style parameter whose type the default argument promotions change ('%s')",
-                                p.name));
-        }
         types[i] = cty.unqual(p.ty);
     }
-    return cty.function(t.ret, types[0..ps.len], false, false);
+    // (callers pass each argument promoted: IR generation receives the
+    // parameters in their promoted types and converts them)
+    let f = cty.function(t.ret, types[0..ps.len], false, false);
+    f.kr = true;
+    return f;
 }
 
 // main is called by the program's start-up: int main(void) or

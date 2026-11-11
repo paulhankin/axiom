@@ -1,0 +1,210 @@
+// =============================================================================
+// csema_marks.ax - what semantic analysis records about functions and
+// objects beyond their CSyms: objects declared `register` (whose address
+// cannot be taken, 6.5.3.2p1), and the inline functions of 6.7.4.
+//
+// A function with external linkage all of whose file-scope declarations in
+// the unit say `inline` and none `extern` has an inline definition here
+// (6.7.4p7): it is no external definition, so IR generation gives it
+// internal linkage and a name of its own (calls in the unit use it; the
+// external function, if any, is another unit's). Such a definition must not
+// define a modifiable object with static storage duration nor refer to an
+// identifier with internal linkage (6.7.4p3); whether a definition is an
+// inline one is known only at the end of the unit (a later declaration can
+// make it an external definition), so what its body does is recorded and
+// reported then (finish).
+//
+// Diagnostics:
+//   C3220  main declared inline or _Noreturn
+//   C3221  an inline definition that defines a modifiable static object or refers to an internal identifier
+//   C3222  the address of an object declared register is taken (or a register array is used as a pointer)
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "csema.ax" as cs;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// A function declared inline at file scope with external linkage.
+struct InlineFn {
+    sym: *mut cast.CSym,
+    plain: bool,  // a file-scope declaration without inline, or with extern
+    problems: u.List.[Problem],
+}
+
+struct Problem {
+    sp: u.Span,
+    msg: []u8,
+}
+
+struct Marks {
+    fns: u.SymMap.[*mut InlineFn],
+    fn_list: u.List.[*mut InlineFn],
+    registers: u.SymMap.[i32],
+    body: *mut InlineFn,  // the inline function whose body is being analyzed, or nil
+}
+
+let mut M: *mut Marks = @ptr_from_int(*mut Marks, 0);
+
+fn marks() *mut Marks {
+    if u.isnil(M) {
+        M = u.new.[Marks]();
+        M.fns = u.SymMap.[*mut InlineFn].{ keys: u.nil.[usize](), vals: u.nil.[*mut InlineFn](), cap: 0, len: 0 };
+        M.fn_list = u.List.[*mut InlineFn].empty();
+        M.registers = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    }
+    return M;
+}
+
+fn key(s: *cast.CSym) []u8 {
+    return u.addr_key(@int_from_ptr(s));
+}
+
+// -----------------------------------------------------------------------------
+// register
+// -----------------------------------------------------------------------------
+
+/// Object s is declared with the storage-class specifier register.
+pub fn set_register(s: *mut cast.CSym) void {
+    marks().registers.put(key(s), 1);
+}
+
+/// Was object s declared register?
+pub fn is_register(s: *cast.CSym) bool {
+    return marks().registers.get(key(s)) != 0;
+}
+
+/// The object declared register that lvalue e (typed) designates or is a
+/// member or element of an array of (x.y, a[i] of an array), or nil.
+pub fn register_object(e: *cast.Expr) *mut cast.CSym {
+    let mut x = e;
+    loop {
+        let k = x.kind;
+        if (k == cast.ExprKind.MEMBER) and (x.op == ct.P_DOT) {
+            x = x.a;
+        } else if (k == cast.ExprKind.CAST) and (x.op == cast.CV_ADECAY) {
+            x = x.a;
+        } else if (k == cast.ExprKind.INDEX) and (x.a.kind == cast.ExprKind.CAST) and (x.a.op == cast.CV_ADECAY) {
+            x = x.a.a;
+        } else {
+            break;
+        }
+    }
+    if (x.kind == cast.ExprKind.IDENT) and u.notnil(x.sym) and (x.sym.kind == cast.SK_OBJECT) and is_register(x.sym) {
+        return x.sym;
+    }
+    return u.nil.[cast.CSym]();
+}
+
+// -----------------------------------------------------------------------------
+// inline
+// -----------------------------------------------------------------------------
+
+/// A file-scope declaration (or the definition) of function s, with
+/// function specifiers `funcs` (cast.FS_ bits) and storage class sc; sp: its name.
+pub fn function_declared(s: *mut cast.CSym, funcs: i32, sc: i32, sp: u.Span) void {
+    if u.str_eq(s.name, "main") and (s.linkage == cast.LK_EXTERNAL) and (funcs != 0) {
+        cs.err(sp, "C3220", "main cannot be declared inline or _Noreturn");
+    }
+    if s.linkage != cast.LK_EXTERNAL {
+        return;
+    }
+    let m = marks();
+    let inl = (funcs & cast.FS_INLINE) != 0;
+    let mut f = m.fns.get(key(s));
+    if u.isnil(f) {
+        if not inl {
+            // (a declaration without inline first: never an inline definition)
+            f = u.new.[InlineFn]();
+            f.sym = s;
+            f.plain = true;
+            m.fns.put(key(s), f);
+            return;
+        }
+        f = u.new.[InlineFn]();
+        f.sym = s;
+        f.problems = u.List.[Problem].empty();
+        m.fns.put(key(s), f);
+        m.fn_list.push(f);
+    }
+    if not inl or (sc == cast.SC_EXTERN) {
+        f.plain = true;
+    }
+}
+
+/// Does function s have an inline definition in this unit (one that is no
+/// external definition)?
+pub fn is_inline_def(s: *cast.CSym) bool {
+    if (s.linkage != cast.LK_EXTERNAL) or u.isnil(s.def) {
+        return false;
+    }
+    let f = marks().fns.get(key(s));
+    return u.notnil(f) and not f.plain;
+}
+
+/// The body of function s is analyzed from now (until end_body).
+pub fn begin_body(s: *mut cast.CSym) void {
+    let m = marks();
+    m.body = u.nil.[InlineFn]();
+    if s.linkage != cast.LK_EXTERNAL {
+        return;
+    }
+    let f = m.fns.get(key(s));
+    if u.notnil(f) and not f.plain {
+        m.body = f;
+    }
+}
+
+pub fn end_body() void {
+    marks().body = u.nil.[InlineFn]();
+}
+
+fn problem(sp: u.Span, msg: []u8) void {
+    let f = marks().body;
+    if u.notnil(f) {
+        f.problems.push(Problem.{ sp: sp, msg: msg });
+    }
+}
+
+/// Identifier s is referred to at sp (in the body being analyzed, if any).
+pub fn referred(s: *cast.CSym, sp: u.Span) void {
+    if u.isnil(M) or u.isnil(M.body) {
+        return;
+    }
+    if (s.linkage == cast.LK_INTERNAL) and ((s.kind == cast.SK_OBJECT) or (s.kind == cast.SK_FUNC)) {
+        problem(sp, u.f2("the inline definition of '%s' refers to '%s', which has internal linkage", M.body.sym.name,
+                         s.name));
+    }
+}
+
+/// Object s with static storage duration is defined in a block (of the body
+/// being analyzed, if any).
+pub fn static_defined(s: *cast.CSym, sp: u.Span) void {
+    if u.isnil(M) or u.isnil(M.body) {
+        return;
+    }
+    let mut t = s.ty;
+    while t.kind == cty.TK_ARRAY {
+        t = t.elem;
+    }
+    if (t.quals & cty.Q_CONST) == 0 {
+        problem(sp, u.f2("the inline definition of '%s' defines '%s', a modifiable object with static storage duration",
+                         M.body.sym.name, s.name));
+    }
+}
+
+/// At the end of the unit: reports what the bodies of the inline
+/// definitions (those still so) do that they must not.
+pub fn finish() void {
+    if u.isnil(M) {
+        return;
+    }
+    for f in M.fn_list.items() {
+        if f.plain {
+            continue;
+        }
+        for p in f.problems.items() {
+            cs.err(p.sp, "C3221", p.msg);
+        }
+    }
+}

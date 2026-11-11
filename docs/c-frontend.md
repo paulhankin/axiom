@@ -23,6 +23,10 @@ are written against; `docs/c.md` (to come) is for users.
 - **Implementation-defined choices** a build can make: `--c-char=signed|unsigned`,
   `--c-int=16|32|64`, `--c-long=32|64`. `short` is 16 bits, `long long` 64, pointers
   and `size_t` the target's. The defaults are the target's C ABI.
+- **Fixed choices**: `BITINT_MAXWIDTH` is 64 (a `_BitInt(N)` is stored in the
+  smallest of 8, 16, 32 and 64 bits that holds it); an inline definition (6.7.4p7)
+  is compiled with internal linkage for the unit's own calls, so the external
+  function is another unit's.
 - **Macros and include paths**: `-DNAME`, `-DNAME=value`, `-UNAME`, `-Idir`.
 
 ## Rules

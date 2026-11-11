@@ -1,0 +1,111 @@
+// =============================================================================
+// csema_generic.ax - generic selections (C11 6.5.1.1): `_Generic(a, T1: e1,
+// ..., default: e)`. The controlling expression is typed but not evaluated;
+// its type is the one it has after lvalue conversion and the conversions of
+// arrays and functions to pointers (C17: so it is unqualified). The
+// association whose type is compatible with it is selected (default when
+// none is); the generic selection is replaced by the selected expression,
+// whose type, value and value category it has. The other associations'
+// expressions are typed too (their constraints hold) but not evaluated.
+//
+// Diagnostics:
+//   C3200  more than one default association
+//   C3201  an association's type is not a complete object type, or is variably modified
+//   C3202  two associations with compatible types
+//   C3203  no association matches the controlling expression's type (and there is no default)
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "csema.ax" as cs;
+import "ctypes.ax" as cty;
+
+/// The expression that generic selection e stands for, typed (check: the
+/// typing of an expression where an lvalue may stand; rv: where its value
+/// is used: csema_expr's); e itself, of the error type, after an error.
+pub fn generic(e: *mut cast.Expr, check: fn(*mut cast.Expr) *mut cast.Expr,
+               rv: fn(*mut cast.Expr) *mut cast.Expr) *mut cast.Expr {
+    let ctl = rv(e.a);
+    e.a = ctl;
+    let mut ok = u.notnil(ctl.ty) and not cty.is_error(ctl.ty);
+    let n = e.assocs.len;
+    let types = u.newn.[*mut cty.CType](n + 1);
+    let mut def: i32 = -1;
+    let mut pick: i32 = -1;
+    for i in 0..n {
+        let a = e.assocs.at(i);
+        types[i] = cty.t_error;
+        if u.isnil(a.tname) {
+            if def >= 0 {
+                cs.err_note(a.span, "C3200", "a generic selection with more than one default association",
+                            e.assocs.at(@int_cast(usize, def)).span, "the first default association");
+                ok = false;
+            } else {
+                def = @int_cast(i32, i);
+            }
+            continue;
+        }
+        let t = cs.hooks.type_name(a.tname);
+        if cty.is_error(t) {
+            ok = false;
+            continue;
+        }
+        if not cty.is_complete(t) or variably_modified(t) {
+            let why = u.pick(variably_modified(t), "a variably modified type", "not a complete object type");
+            cs.err(a.tname.span, "C3201", u.f2("the type %s of a generic association is %s", cs.tq(t), why));
+            ok = false;
+            continue;
+        }
+        types[i] = t;
+        for j in 0..i {
+            if not cty.is_error(types[j]) and cty.compatible(types[j], t) {
+                cs.err_note(a.tname.span, "C3202",
+                            u.f2("the generic association's type %s is compatible with an earlier one's (%s)", cs.tq(t),
+                                 cs.tq(types[j])), e.assocs.at(j).span, "the earlier association");
+                ok = false;
+            }
+        }
+        if ok and cty.compatible(cty.unqual(ctl.ty), t) {
+            pick = @int_cast(i32, i);
+        }
+    }
+    // the associations' expressions (only the selected one is evaluated)
+    let mut chosen = u.nil.[cast.Expr]();
+    for i in 0..n {
+        let a = e.assocs.at(i);
+        let x = check(a.e);
+        a.e = x;
+        if (@int_cast(i32, i) == pick) or ((pick < 0) and (@int_cast(i32, i) == def)) {
+            chosen = x;
+        }
+    }
+    if not ok {
+        return bad(e);
+    }
+    if u.isnil(chosen) {
+        cs.err(ctl.span, "C3203", u.f1("no association of the generic selection matches the controlling type %s",
+                                       cs.tq(ctl.ty)));
+        return bad(e);
+    }
+    return chosen;
+}
+
+fn bad(e: *mut cast.Expr) *mut cast.Expr {
+    e.ty = cty.t_error;
+    e.lvalue = false;
+    return e;
+}
+
+// Is t variably modified (a variable length array, or derived from one)?
+fn variably_modified(t: *cty.CType) bool {
+    let k = t.kind;
+    if k == cty.TK_ARRAY {
+        return t.vla or variably_modified(t.elem);
+    }
+    if k == cty.TK_POINTER {
+        return variably_modified(t.elem);
+    }
+    if k == cty.TK_FUNCTION {
+        return variably_modified(t.ret);
+    }
+    return false;
+}

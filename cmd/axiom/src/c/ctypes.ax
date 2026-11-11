@@ -14,7 +14,11 @@
 //
 // The integer types follow the build's choices (copts.ax): plain char is
 // signed or unsigned, int is 16, 32 or 64 bits, long 32 or 64; short is 16
-// bits and long long 64. Their size and alignment are their width in bytes,
+// bits and long long 64. The bit-precise integer types (C23 _BitInt(N),
+// TK_BITINT, made once per width and signedness) have N bits, N at most
+// BITINT_MAXWIDTH (64); an object of one is stored in the smallest of 8, 16,
+// 32 and 64 bits that holds it (storage_bits), its value sign- or
+// zero-extended there. Integer sizes and alignments are their storage widths in bytes,
 // as for every scalar on the targets (wasm32, wasm64, x86-64, AArch64), so a
 // structure's layout is the natural one: each member at the next offset
 // that is a multiple of its alignment, the structure's alignment the largest
@@ -48,6 +52,11 @@ pub const TK_ARRAY: i32 = 19;
 pub const TK_FUNCTION: i32 = 20;
 pub const TK_STRUCT: i32 = 21;
 pub const TK_UNION: i32 = 22;
+pub const TK_BITINT: i32 = 23;   // _BitInt(N), unsigned _BitInt(N) (C23): an integer type of `bits` bits
+pub const TK_NULLPTR: i32 = 24;  // nullptr_t (C23): a scalar type whose one value is a null pointer
+
+/// The largest N of _BitInt(N) (<limits.h>'s BITINT_MAXWIDTH).
+pub const BITINT_MAXWIDTH: i32 = 64;
 
 // Qualifiers (CType.quals): as cast.Q_.
 pub const Q_CONST: i32 = 1;
@@ -98,6 +107,8 @@ pub struct CType {
     ret: *mut CType,
     params: []mut *mut CType,  // adjusted parameter types (arrays and functions become pointers), unqualified
     proto: bool,               // a prototype (otherwise: an old-style declaration, `()` before C23)
+    kr: bool,                  // not a prototype: the type of a definition with an identifier list (params: its
+                               // parameters' declared types, adjusted)
     variadic: bool,            // ends with `...`
     // structure, union, enumeration
     tag: *mut TagInfo,
@@ -135,7 +146,11 @@ pub let mut t_wchar: *mut CType = @ptr_from_int(*mut CType, 0);    // wchar_t: L
 pub let mut t_char16: *mut CType = @ptr_from_int(*mut CType, 0);   // char16_t (uint_least16_t)
 pub let mut t_char32: *mut CType = @ptr_from_int(*mut CType, 0);   // char32_t (uint_least32_t)
 pub let mut t_int64: *mut CType = @ptr_from_int(*mut CType, 0);    // __axiom_int64: long or long long
+pub let mut t_nullptr: *mut CType = @ptr_from_int(*mut CType, 0);  // nullptr_t (C23)
 pub let mut ptr_bytes: u64 = 8;
+// the bit-precise integer types made so far, by width (signed, unsigned)
+// [n]: _BitInt(n); [65 + n]: unsigned _BitInt(n)
+let mut g_bitint: u.List.[*mut CType] = u.List.[*mut CType].{ data: @ptr_from_int(*mut *mut CType, 0), len: 0, cap: 0 };
 
 fn new_type(k: i32) *mut CType {
     let t = u.new.[CType]();
@@ -179,24 +194,32 @@ pub fn init(o: *co.COptions) void {
     ptr_bytes = @as(u64, @bit_cast(u32, o.ptr_bits / 8));
     t_error = new_type(TK_ERROR);
     t_void = new_type(TK_VOID);
-    t_bool = int_type(TK_BOOL, 8, false, 0);
-    t_char = int_type(TK_CHAR, 8, o.char_signed, 1);
-    t_schar = int_type(TK_SCHAR, 8, true, 1);
-    t_uchar = int_type(TK_UCHAR, 8, false, 1);
-    t_short = int_type(TK_SHORT, 16, true, 2);
-    t_ushort = int_type(TK_USHORT, 16, false, 2);
-    t_int = int_type(TK_INT, o.int_bits, true, 3);
-    t_uint = int_type(TK_UINT, o.int_bits, false, 3);
-    t_long = int_type(TK_LONG, o.long_bits, true, 4);
-    t_ulong = int_type(TK_ULONG, o.long_bits, false, 4);
-    t_llong = int_type(TK_LLONG, 64, true, 5);
-    t_ullong = int_type(TK_ULLONG, 64, false, 5);
+    // (ranks in steps of RANK_STEP, which leaves room for the bit-precise types': bitint)
+    t_bool = int_type(TK_BOOL, 8, false, RANK_STEP);
+    t_char = int_type(TK_CHAR, 8, o.char_signed, 2 * RANK_STEP);
+    t_schar = int_type(TK_SCHAR, 8, true, 2 * RANK_STEP);
+    t_uchar = int_type(TK_UCHAR, 8, false, 2 * RANK_STEP);
+    t_short = int_type(TK_SHORT, 16, true, 3 * RANK_STEP);
+    t_ushort = int_type(TK_USHORT, 16, false, 3 * RANK_STEP);
+    t_int = int_type(TK_INT, o.int_bits, true, 4 * RANK_STEP);
+    t_uint = int_type(TK_UINT, o.int_bits, false, 4 * RANK_STEP);
+    t_long = int_type(TK_LONG, o.long_bits, true, 5 * RANK_STEP);
+    t_ulong = int_type(TK_ULONG, o.long_bits, false, 5 * RANK_STEP);
+    t_llong = int_type(TK_LLONG, 64, true, 6 * RANK_STEP);
+    t_ullong = int_type(TK_ULLONG, 64, false, 6 * RANK_STEP);
     t_float = new_type(TK_FLOAT);
     t_float.bits = 32;
     t_double = new_type(TK_DOUBLE);
     t_double.bits = 64;
     t_ldouble = new_type(TK_LDOUBLE);
     t_ldouble.bits = 64;
+    t_nullptr = new_type(TK_NULLPTR);
+    t_nullptr.bits = o.ptr_bits;
+    g_bitint = u.List.[*mut CType].empty();
+    for i in @as(usize, 0)..130 {
+        _ = i;
+        g_bitint.push(u.nil.[CType]());
+    }
     // size_t and ptrdiff_t: the first of int, long and long long at least as
     // wide as a pointer; wchar_t: (unsigned) short when 16 bits, else int,
     // or long when int is 16 bits (as <stddef.h> says)
@@ -223,6 +246,54 @@ pub fn init(o: *co.COptions) void {
     if t_long.bits == 64 {
         t_int64 = t_long;
     }
+}
+
+const RANK_STEP: i32 = 100;
+
+/// The bit-precise integer type _BitInt(n) (signed) or unsigned _BitInt(n),
+/// 1 <= n <= BITINT_MAXWIDTH. Its rank (6.3.1.1p1) is above that of every
+/// standard integer type narrower than n bits and below every other's, and
+/// grows with n.
+pub fn bitint(n: i32, sg: bool) *mut CType {
+    let mut k = @int_cast(usize, n);
+    if not sg {
+        k += 65;
+    }
+    if u.notnil(g_bitint.get(k)) {
+        return g_bitint.get(k);
+    }
+    // the first standard type (in order of rank) at least n bits wide, and the width of the one before
+    let stds: [6]*mut CType = [t_bool, t_uchar, t_ushort, t_uint, t_ulong, t_ullong];
+    let mut above = t_ullong;
+    let mut below: i32 = 0;
+    for i in 0..stds.len {
+        let mut w = stds[i].bits;
+        if i == 0 {
+            w = 1;
+        }
+        if w >= n {
+            above = stds[i];
+            break;
+        }
+        below = w;
+    }
+    let t = int_type(TK_BITINT, n, sg, (above.rank - RANK_STEP) + (n - below));
+    g_bitint.set(k, t);
+    return t;
+}
+
+/// The width of the storage of an integer, floating or pointer type's
+/// values (a bit-precise integer type's: the smallest of 8, 16, 32 and 64
+/// bits that holds it).
+pub fn storage_bits(t: *CType) i32 {
+    if t.kind == TK_BITINT {
+        let mut w: i32 = 8;
+        while w < t.bits {
+            w *= 2;
+        }
+        return w;
+    }
+    return t.bits;
 }
 
 /// The standard in force.
@@ -384,7 +455,17 @@ pub fn round_up(x: u64, a: u64) u64 {
 
 /// An integer type (6.2.5p17: char, the signed and unsigned integer types, enumerations).
 pub fn is_integer(t: *CType) bool {
-    return (t.kind >= TK_BOOL) and (t.kind <= TK_ENUM);
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_ENUM)) or (t.kind == TK_BITINT);
+}
+
+/// A bit-precise integer type (_BitInt).
+pub fn is_bitint(t: *CType) bool {
+    return t.kind == TK_BITINT;
+}
+
+/// The type nullptr_t (C23).
+pub fn is_nullptr(t: *CType) bool {
+    return t.kind == TK_NULLPTR;
 }
 
 pub fn is_floating(t: *CType) bool {
@@ -393,12 +474,12 @@ pub fn is_floating(t: *CType) bool {
 
 /// An arithmetic type: integer or floating.
 pub fn is_arith(t: *CType) bool {
-    return (t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE);
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT);
 }
 
-/// A scalar type: arithmetic or pointer.
+/// A scalar type: arithmetic, pointer or nullptr_t.
 pub fn is_scalar(t: *CType) bool {
-    return (t.kind >= TK_BOOL) and (t.kind <= TK_POINTER);
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_POINTER)) or (t.kind == TK_BITINT) or (t.kind == TK_NULLPTR);
 }
 
 pub fn is_pointer(t: *CType) bool {
@@ -464,8 +545,8 @@ pub fn is_void_ptr(t: *CType) bool {
 /// The size of a complete object type (0 for others).
 pub fn size_of(t: *CType) u64 {
     let k = t.kind;
-    if is_integer(t) or (k == TK_POINTER) {
-        return @as(u64, @bit_cast(u32, t.bits / 8));
+    if is_integer(t) or (k == TK_POINTER) or (k == TK_NULLPTR) {
+        return @as(u64, @bit_cast(u32, storage_bits(t) / 8));
     }
     if k == TK_FLOAT {
         return 4;
@@ -582,6 +663,9 @@ pub fn to_signed(t: *mut CType) *mut CType {
     if k == TK_ENUM {
         return to_signed(t.unq.tag.base);
     }
+    if k == TK_BITINT {
+        return bitint(t.bits, true);
+    }
     return t.unq;
 }
 
@@ -606,17 +690,21 @@ pub fn to_unsigned(t: *mut CType) *mut CType {
     if k == TK_ENUM {
         return to_unsigned(t.unq.tag.base);
     }
+    if k == TK_BITINT {
+        return bitint(t.bits, false);
+    }
     return t.unq;
 }
 
 /// The integer promotions (6.3.1.1p2) of an arithmetic type (others:
-/// unqualified, unchanged). An enumeration is first its compatible type.
+/// unqualified, unchanged). An enumeration is first its compatible type; a
+/// bit-precise integer type is not promoted.
 pub fn promote(t0: *mut CType) *mut CType {
     let mut t = t0.unq;
     if t.kind == TK_ENUM {
         t = t.tag.base;
     }
-    if not is_integer(t) or (t.rank >= t_int.rank) {
+    if not is_integer(t) or (t.rank >= t_int.rank) or (t.kind == TK_BITINT) {
         return t;
     }
     // int holds every value of a narrower type, and of one as wide that is signed
@@ -737,14 +825,32 @@ pub fn compatible_unq(a0: *mut CType, b0: *mut CType) bool {
             return true;
         }
         if a.proto or b.proto {
-            // one has no prototype: the other's parameters must be ones the
-            // default argument promotions do not change, and not variadic (6.7.6.3p15)
             let p = pick_proto(a, b);
+            let mut o = a;
+            if a.proto {
+                o = b;
+            }
             if p.variadic {
                 return false;
             }
+            if o.kr {
+                // the other is a definition with an identifier list: as
+                // many parameters, each compatible with the promoted type
+                // of the definition's (6.7.6.3p15)
+                if p.params.len != o.params.len {
+                    return false;
+                }
+                for i in 0..p.params.len {
+                    if not compatible_unq(p.params[i], arg_promote(o.params[i])) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            // the other gives no parameters: the prototype's must be ones
+            // the default argument promotions do not change (6.7.6.3p15)
             for x in p.params {
-                if arg_promote(x) != x.unq {
+                if not compatible_unq(arg_promote(x), x) {
                     return false;
                 }
             }
@@ -757,8 +863,10 @@ pub fn compatible_unq(a0: *mut CType, b0: *mut CType) bool {
     return false;
 }
 
+// The one of two function types that has a prototype, else the one that
+// has parameters (a definition with an identifier list), else b.
 fn pick_proto(a: *mut CType, b: *mut CType) *mut CType {
-    if a.proto {
+    if a.proto or (a.kr and not b.proto) {
         return a;
     }
     return b;
@@ -794,7 +902,9 @@ pub fn composite(a: *mut CType, b: *mut CType) *mut CType {
             return function(ret, ps[0..n], true, a.variadic);
         }
         let p = pick_proto(a, b);
-        return function(ret, p.params, p.proto, p.variadic);
+        let f = function(ret, p.params, p.proto, p.variadic);
+        f.kr = p.kr;
+        return f;
     }
     return a;
 }
@@ -838,6 +948,12 @@ fn base_name(t: *CType) []u8 {
     let k = t.kind;
     if (k == TK_BOOL) and (g_opts.std >= co.C23) {
         return "bool";
+    }
+    if k == TK_BITINT {
+        return u.f2("%s_BitInt(%s)", u.pick(t.is_signed, "", "unsigned "), u.idec(t.bits));
+    }
+    if k == TK_NULLPTR {
+        return "nullptr_t";
     }
     if (k == TK_STRUCT) or (k == TK_UNION) or (k == TK_ENUM) {
         let kw = u.pick(k == TK_STRUCT, "struct", u.pick(k == TK_UNION, "union", "enum"));
@@ -893,9 +1009,14 @@ fn spell(t: *CType, inner: []u8) []u8 {
     }
     if k == TK_FUNCTION {
         let mut b = u.Buf.init();
+        let mut n_shown: usize = 0;
+        if t.proto {
+            n_shown = t.params.len;
+        }
         b.s(inner);
         b.s("(");
-        for i in 0..t.params.len {
+        // (a type without a prototype shows no parameters, as it is written)
+        for i in 0..n_shown {
             if i > 0 {
                 b.s(", ");
             }

@@ -14,6 +14,10 @@ import "cast.ax" as cast;
 import "cconst.ax" as cc;
 import "copts.ax" as co;
 import "csema.ax" as cs;
+import "csema_bitint.ax" as csb;
+import "csema_generic.ax" as csg;
+import "csema_ice.ax" as csi;
+import "csema_marks.ax" as csm;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -25,6 +29,13 @@ fn bad(e: *mut cast.Expr) *mut cast.Expr {
     e.ty = cty.t_error;
     e.lvalue = false;
     return e;
+}
+
+fn pick_ty(c: bool, a: *mut cty.CType, b: *mut cty.CType) *mut cty.CType {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 fn is_err(e: *cast.Expr) bool {
@@ -64,6 +75,18 @@ pub fn value_of(e: *mut cast.Expr) *mut cast.Expr {
     }
     let t = e.ty;
     if t.kind == cty.TK_ARRAY {
+        if not e.lvalue and (cs.std() < co.C99) {
+            // (C89 3.2.2.1: only an lvalue array is converted to a pointer)
+            cs.err(e.span, "C3020",
+                   u.f1("an array that is not an lvalue (of type %s) is used as a pointer; that is C99", cs.tq(t)));
+            return bad(e);
+        }
+        let reg = csm.register_object(e);
+        if u.notnil(reg) {
+            cs.err(e.span, "C3222", u.f1("the array '%s', declared register, is used as a pointer (its address)",
+                                         reg.name));
+            return bad(e);
+        }
         return conv(e, cast.CV_ADECAY, cty.pointer_to(t.elem));
     }
     if t.kind == cty.TK_FUNCTION {
@@ -118,7 +141,7 @@ pub fn ice(e: *mut cast.Expr, what: []u8) Ice {
         cs.err(x.span, "C3035", u.f2("%s must have integer type, not %s", what, cs.tq(x.ty)));
         return Ice.{ ok: false, v: 0, e: x };
     }
-    if not x.is_const {
+    if not x.is_const or not csi.is_ice(x) {
         cs.err(x.span, "C3035", u.cat2(what, " must be an integer constant expression"));
         return Ice.{ ok: false, v: 0, e: x };
     }
@@ -130,7 +153,7 @@ pub fn is_npc(e: *cast.Expr) bool {
     if is_err(e) {
         return false;
     }
-    if cty.is_integer(e.ty) and e.is_const and (e.cval == 0) {
+    if cty.is_integer(e.ty) and e.is_const and (e.cval == 0) and csi.is_ice(e) {
         return true;
     }
     if e.kind == cast.ExprKind.NULLPTR {
@@ -138,7 +161,7 @@ pub fn is_npc(e: *cast.Expr) bool {
     }
     if (e.kind == cast.ExprKind.CAST) and u.notnil(e.tname) and (e.op == cast.CV_VALUE) and cty.is_void_ptr(e.ty) and
        (e.ty.elem.quals == 0) {
-        return cty.is_integer(e.a.ty) and e.a.is_const and (e.a.cval == 0);
+        return cty.is_integer(e.a.ty) and e.a.is_const and (e.a.cval == 0) and csi.is_ice(e.a);
     }
     return false;
 }
@@ -219,8 +242,13 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
         if cty.compatible_unq(t, s) {
             return e;
         }
+    } else if cty.is_nullptr(t) {
+        // (C23 6.5.17.2p1)
+        if is_npc(e) or cty.is_nullptr(s) {
+            return convert(e, t);
+        }
     } else if t.kind == cty.TK_POINTER {
-        if is_npc(e) {
+        if is_npc(e) or cty.is_nullptr(s) {
             return convert(e, t);
         }
         if s.kind == cty.TK_POINTER {
@@ -240,7 +268,7 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
             }
             return convert(e, t);
         }
-    } else if (t.kind == cty.TK_BOOL) and (s.kind == cty.TK_POINTER) {
+    } else if (t.kind == cty.TK_BOOL) and ((s.kind == cty.TK_POINTER) or cty.is_nullptr(s)) {
         return convert(e, t);
     }
     cs.err(e.span, "C3022", u.f3("incompatible types in %s: %s to %s", what, cs.tq(s), cs.tq(t)));
@@ -256,8 +284,14 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
 fn int_const(e: *mut cast.Expr) *mut cast.Expr {
     let t = e.tok;
     if t.bitint {
-        cs.unsupported(e.span, "a _BitInt constant (the 'wb' suffix)");
-        return bad(e);
+        let bt = csb.const_type(t, e.span);
+        if cty.is_error(bt) {
+            return bad(e);
+        }
+        e.ty = bt;
+        e.is_const = true;
+        e.cval = cty.wrap(bt, t.ival);
+        return e;
     }
     let dec = t.base == 10;
     let mut cands = u.List.[*mut cty.CType].empty();
@@ -393,8 +427,8 @@ pub fn check(e: *mut cast.Expr) *mut cast.Expr {
         return e;
     }
     if k == cast.ExprKind.NULLPTR {
-        // (a null pointer constant; its type nullptr_t is void * here)
-        e.ty = cty.pointer_to(cty.t_void);
+        // (a null pointer constant, of type nullptr_t)
+        e.ty = cty.t_nullptr;
         return e;
     }
     if k == cast.ExprKind.UNARY {
@@ -437,8 +471,7 @@ pub fn check(e: *mut cast.Expr) *mut cast.Expr {
         cs.unsupported(e.span, "a compound literal");
         return bad(e);
     }
-    cs.unsupported(e.span, "a generic selection (_Generic)");
-    return bad(e);
+    return csg.generic(e, check, rv);
 }
 
 fn ident(e: *mut cast.Expr) *mut cast.Expr {
@@ -452,6 +485,7 @@ fn ident(e: *mut cast.Expr) *mut cast.Expr {
     }
     e.sym = s;
     s.used = true;
+    csm.referred(s, e.span);
     if s.kind == cast.SK_ENUMCONST {
         e.ty = cty.t_int;
         e.is_const = true;
@@ -517,8 +551,18 @@ fn unary(e: *mut cast.Expr) *mut cast.Expr {
         if is_err(a) {
             return bad(e);
         }
+        if (a.kind == cast.ExprKind.UNARY) and (a.op == ct.P_STAR) and cty.is_void(a.ty) and (cs.std() >= co.C99) {
+            // &*E is E (6.5.3.2p3), also when *E is not an lvalue (E a pointer to void)
+            e.ty = a.a.ty;
+            return e;
+        }
         if not a.lvalue {
             cs.err(a.span, "C3026", "the operand of '&' is not an lvalue");
+            return bad(e);
+        }
+        let reg = csm.register_object(a);
+        if u.notnil(reg) {
+            cs.err(a.span, "C3222", u.f1("the address of '%s', declared register, is taken", reg.name));
             return bad(e);
         }
         e.ty = cty.pointer_to(a.ty);
@@ -713,11 +757,31 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
         return e;
     }
     let eq = (op == ct.P_EQ) or (op == ct.P_NE);
+    if eq and (cty.is_nullptr(ta) or cty.is_nullptr(tb)) {
+        // (C23 6.5.10p2: two nullptr_t values, or one and a pointer or a null pointer constant)
+        if cty.is_nullptr(ta) and cty.is_nullptr(tb) {
+            return e;
+        }
+        if cty.is_nullptr(ta) and ((tb.kind == cty.TK_POINTER) or is_npc(e.b)) {
+            e.a = convert(e.a, pick_ty(tb.kind == cty.TK_POINTER, tb, ta));
+            e.b = convert(e.b, e.a.ty);
+            return e;
+        }
+        if cty.is_nullptr(tb) and ((ta.kind == cty.TK_POINTER) or is_npc(e.a)) {
+            e.b = convert(e.b, pick_ty(ta.kind == cty.TK_POINTER, ta, tb));
+            e.a = convert(e.a, e.b.ty);
+            return e;
+        }
+        return bad_operands(e);
+    }
     if (ta.kind == cty.TK_POINTER) and (tb.kind == cty.TK_POINTER) {
-        let ok = cty.compatible_unq(ta.elem, tb.elem) or
+        // (6.5.8p2, 6.5.9p2: relational operators take pointers to object
+        // types; == and != also a pointer to void with one to an object
+        // type, or a null pointer constant)
+        let ok = (cty.compatible_unq(ta.elem, tb.elem) and (eq or not cty.is_func(ta.elem))) or
                  (eq and
                   ((cty.is_void(ta.elem) and not cty.is_func(tb.elem)) or
-                   (cty.is_void(tb.elem) and not cty.is_func(ta.elem))));
+                   (cty.is_void(tb.elem) and not cty.is_func(ta.elem)) or is_npc(e.a) or is_npc(e.b)));
         if not ok {
             cs.err(e.span, "C3020", u.f3("comparison with '%s' of pointers to incompatible types (%s and %s)",
                                          cast.punct_text(op), cs.tq(ta), cs.tq(tb)));
@@ -814,6 +878,21 @@ fn conditional(e: *mut cast.Expr) *mut cast.Expr {
     }
     if cty.is_void(tb) and cty.is_void(tc) {
         e.ty = cty.t_void;
+        return e;
+    }
+    // (C23 6.5.16p3: two nullptr_t operands, or one and a pointer)
+    if cty.is_nullptr(tb) and cty.is_nullptr(tc) {
+        e.ty = cty.t_nullptr;
+        return e;
+    }
+    if cty.is_nullptr(tb) and (tc.kind == cty.TK_POINTER) {
+        e.ty = tc;
+        e.b = convert(b, tc);
+        return e;
+    }
+    if cty.is_nullptr(tc) and (tb.kind == cty.TK_POINTER) {
+        e.ty = tb;
+        e.c = convert(c, tb);
         return e;
     }
     if (tb.kind == cty.TK_POINTER) and (tc.kind == cty.TK_POINTER) {
@@ -1048,6 +1127,20 @@ fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
         return e;
     }
     let s = a.ty;
+    if cty.is_nullptr(s) or cty.is_nullptr(t) {
+        // (C23 6.5.5p4: nullptr_t only to void, bool, a pointer type or itself; nothing else to nullptr_t)
+        let mut ok = (t.kind == cty.TK_BOOL) or (t.kind == cty.TK_POINTER);
+        if cty.is_nullptr(t) {
+            ok = cty.is_nullptr(s);
+        }
+        if not ok {
+            let why = "nullptr_t converts only to void, bool and pointer types, and only nullptr_t to it";
+            cs.err(e.span, "C3028", u.f3("a cast from %s to %s (%s)", cs.tq(s), cs.tq(t), why));
+            return bad(e);
+        }
+        cc.fold(e);
+        return e;
+    }
     if not cty.is_scalar(t) or not cty.is_scalar(s) {
         cs.err(e.span, "C3028", u.f2("a cast from %s to %s (casts are between scalar types, or to void)", cs.tq(s),
                                      cs.tq(t)));
