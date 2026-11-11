@@ -10,7 +10,8 @@ import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
-import "cgen_bitint.ax" as cgb;
+import "cgen_bitint.ax" as cgbi;
+import "cgen_bits.ax" as cgb;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -98,15 +99,15 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
     }
     if cty.is_integer(t) {
         if cty.is_integer(f) {
-            return cgb.norm(int_resize(v, f.is_signed, tt), t);
+            return cgbi.norm(int_resize(v, f.is_signed, tt), t);
         }
         if f.kind == cty.TK_POINTER {
-            return cgb.norm(ir.ptrtoint(cg.B, v, tt), t);
+            return cgbi.norm(ir.ptrtoint(cg.B, v, tt), t);
         }
         if t.is_signed {
-            return cgb.norm(ir.cast(cg.B, ir.OP_FPTOSI_SAT, v, tt), t);
+            return cgbi.norm(ir.cast(cg.B, ir.OP_FPTOSI_SAT, v, tt), t);
         }
-        return cgb.norm(ir.cast(cg.B, ir.OP_FPTOUI_SAT, v, tt), t);
+        return cgbi.norm(ir.cast(cg.B, ir.OP_FPTOUI_SAT, v, tt), t);
     }
     if cty.is_floating(t) {
         if cty.is_integer(f) {
@@ -175,6 +176,9 @@ pub fn lv(e: *mut cast.Expr) *mut ir.Value {
     if k == cast.ExprKind.STRING {
         return cg.string_addr(e);
     }
+    if k == cast.ExprKind.COMPOUND {
+        return compound_literal(e);
+    }
     if k == cast.ExprKind.UNARY {
         // *p
         return rv(e.a);
@@ -190,6 +194,40 @@ pub fn lv(e: *mut cast.Expr) *mut ir.Value {
     }
     // (a structure or union value: its address)
     return rv(e);
+}
+
+// A compound literal's object: static, or (automatic) initialized again
+// each time it is evaluated.
+fn compound_literal(e: *mut cast.Expr) *mut ir.Value {
+    let s = e.sym;
+    if s.duration == cast.SD_STATIC {
+        return cg.object_addr(s);
+    }
+    if u.isvnil(s.ir) {
+        s.ir = @ptr_cast(*mut void, cg.aligned_alloca(s.ty, "literal", s.align));
+    }
+    let p = @ptr_cast(*mut ir.Value, s.ir);
+    cg.hooks.local_init(s, p);
+    return p;
+}
+
+// The value of lvalue e at p (a bit-field's too).
+fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
+    let m = cgb.of(e);
+    if u.notnil(m) {
+        return cgb.load(m, e.ty, p);
+    }
+    return load(e.ty, p);
+}
+
+// Stores v in lvalue e at p (of type t, e's unqualified); returns the value e then has.
+fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
+    let m = cgb.of(e);
+    if u.notnil(m) {
+        return cgb.store(m, e.ty, v, p);
+    }
+    store(t, v, p);
+    return v;
 }
 
 fn rv_or_lv(e: *mut cast.Expr, want_lv: bool) *mut ir.Value {
@@ -256,7 +294,7 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
         if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) {
             return p;
         }
-        return load(e.ty, p);
+        return load_lv(e, p);
     }
     u.die("internal compiler error (C front end): an expression without a value");
     return ir.vnil();
@@ -269,7 +307,7 @@ fn conversion(e: *mut cast.Expr) *mut ir.Value {
         if cty.is_record(e.ty) {
             return p;
         }
-        return load(e.a.ty, p);
+        return load_lv(e.a, p);
     }
     if (op == cast.CV_ADECAY) or (op == cast.CV_FDECAY) {
         return lv(e.a);
@@ -302,10 +340,10 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
         if cty.is_floating(e.ty) {
             return ir.fneg(cg.B, v);
         }
-        return cgb.norm(ir.sub(cg.B, ir.cint(v.ty, 0), v), e.ty);
+        return cgbi.norm(ir.sub(cg.B, ir.cint(v.ty, 0), v), e.ty);
     }
     if op == ct.P_TILDE {
-        return cgb.norm(ir.xor(cg.B, v, ir.cint(v.ty, 0xFFFF_FFFF_FFFF_FFFF)), e.ty);
+        return cgbi.norm(ir.xor(cg.B, v, ir.cint(v.ty, 0xFFFF_FFFF_FFFF_FFFF)), e.ty);
     }
     return v;
 }
@@ -342,11 +380,11 @@ fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut
     } else if (op == ct.P_SHL) or (op == ct.P_SHR) {
         let k = int_resize(y, false, x.ty);
         if op == ct.P_SHL {
-            return cgb.norm(ir.binop(cg.B, ir.OP_SHL, x, k), t);
+            return cgbi.norm(ir.binop(cg.B, ir.OP_SHL, x, k), t);
         }
         return ir.binop(cg.B, pick(sg, ir.OP_ASHR, ir.OP_LSHR), x, k);
     }
-    return cgb.norm(ir.binop(cg.B, io, x, y), t);
+    return cgbi.norm(ir.binop(cg.B, io, x, y), t);
 }
 
 fn pick(c: bool, a: i32, b: i32) i32 {
@@ -509,11 +547,10 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
             copy(lt, p, v);
             return p;
         }
-        store(lt, v, p);
-        return v;
+        return store_lv(e.a, lt, v, p);
     }
     let p = lv(e.a);
-    let old = load(lt, p);
+    let old = load_lv(e.a, p);
     let r = rv(e.b);
     let ot = e.opty;
     let mut nv = ir.vnil();
@@ -523,15 +560,14 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
         let x = convert(old, lt, ot);
         nv = convert(arith_op(base_op(e.op), ot, x, r), ot, lt);
     }
-    store(lt, nv, p);
-    return nv;
+    return store_lv(e.a, lt, nv, p);
 }
 
 // ++ and --, prefix (UNARY) or postfix.
 fn incdec(e: *mut cast.Expr) *mut ir.Value {
     let t = e.a.ty;
     let p = lv(e.a);
-    let old = load(t, p);
+    let old = load_lv(e.a, p);
     let ot = e.opty;
     let dec = e.op == ct.P_DEC;
     let mut nv = ir.vnil();
@@ -547,11 +583,11 @@ fn incdec(e: *mut cast.Expr) *mut ir.Value {
         }
         nv = convert(arith_op(pick(dec, ct.P_MINUS, ct.P_PLUS), ot, x, one), ot, t);
     }
-    store(t, nv, p);
+    let stored = store_lv(e.a, t, nv, p);
     if e.kind == cast.ExprKind.POSTFIX {
         return old;
     }
-    return nv;
+    return stored;
 }
 
 fn conditional(e: *mut cast.Expr) *mut ir.Value {

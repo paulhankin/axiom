@@ -1,0 +1,98 @@
+// =============================================================================
+// cgen_bits.ax - IR generation for bit-fields: a bit-field is reached
+// through its storage unit (csema_bits.ax lays them out), an integer of its
+// declared type's width at the member's offset, holding it at bit_off from
+// the least significant bit. A load extracts it (sign-extended for a signed
+// type), a store reads the unit, replaces its bits and writes it back.
+// =============================================================================
+import "../ir.ax" as ir;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "csema_bits.ax" as cb;
+import "ctypes.ax" as cty;
+
+/// The bit-field that lvalue e designates, or nil.
+pub fn of(e: *cast.Expr) *mut cty.Member {
+    return cb.member(e);
+}
+
+fn unit_load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    let v = ir.load(cg.B, cg.lty(t), p);
+    v.align = @truncate(u32, cty.align_of(t));
+    if (t.quals & cty.Q_VOLATILE) != 0 {
+        v.flags = v.flags | ir.F_VOLATILE;
+    }
+    return v;
+}
+
+fn mask(w: i32) u64 {
+    if w >= 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    return (@as(u64, 1) << @as(u32, @bit_cast(u32, w))) - 1;
+}
+
+fn signed_field(t: *cty.CType) bool {
+    return t.is_signed and (t.unq.kind != cty.TK_BOOL);
+}
+
+/// The value of bit-field m of type t (its lvalue's: qualified) in the unit
+/// at p, as a value of t.
+pub fn load(m: *cty.Member, t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    let u_ = unit_load(t, p);
+    let ut = u_.ty;
+    let ub = ut.bits;
+    let w = m.bit_width;
+    if signed_field(t) {
+        let left = ub - w - m.bit_off;
+        let mut v = u_;
+        if left > 0 {
+            v = ir.binop(cg.B, ir.OP_SHL, v, ir.cint(ut, @as(u64, @bit_cast(u32, left))));
+        }
+        if ub - w > 0 {
+            v = ir.binop(cg.B, ir.OP_ASHR, v, ir.cint(ut, @as(u64, @bit_cast(u32, ub - w))));
+        }
+        return v;
+    }
+    let mut v = u_;
+    if m.bit_off > 0 {
+        v = ir.binop(cg.B, ir.OP_LSHR, v, ir.cint(ut, @as(u64, @bit_cast(u32, m.bit_off))));
+    }
+    if w < ub {
+        v = ir.and_(cg.B, v, ir.cint(ut, mask(w)));
+    }
+    return v;
+}
+
+/// Stores v (a value of t) into bit-field m in the unit at p; returns the
+/// value the bit-field then has (v cut to its width), as a value of t.
+pub fn store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
+    let ut = cg.lty(t);
+    let ub = ut.bits;
+    let w = m.bit_width;
+    let mut nv = v;
+    if w < ub {
+        let bits = ir.and_(cg.B, v, ir.cint(ut, mask(w)));
+        let mut placed = bits;
+        if m.bit_off > 0 {
+            placed = ir.binop(cg.B, ir.OP_SHL, bits, ir.cint(ut, @as(u64, @bit_cast(u32, m.bit_off))));
+        }
+        let old = unit_load(t, p);
+        let keep = ~(mask(w) << @as(u32, @bit_cast(u32, m.bit_off)));
+        nv = ir.or_(cg.B, ir.and_(cg.B, old, ir.cint(ut, keep)), placed);
+    }
+    let s = ir.store(cg.B, nv, p);
+    s.align = @truncate(u32, cty.align_of(t));
+    if (t.quals & cty.Q_VOLATILE) != 0 {
+        s.flags = s.flags | ir.F_VOLATILE;
+    }
+    if w >= ub {
+        return v;
+    }
+    // the value stored, as the bit-field reads it
+    if signed_field(t) {
+        let sh = ir.cint(ut, @as(u64, @bit_cast(u32, ub - w)));
+        return ir.binop(cg.B, ir.OP_ASHR, ir.binop(cg.B, ir.OP_SHL, v, sh), sh);
+    }
+    return ir.and_(cg.B, v, ir.cint(ut, mask(w)));
+}

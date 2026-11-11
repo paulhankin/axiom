@@ -1,0 +1,652 @@
+// =============================================================================
+// csema_dspec.ax - the parts of declarations that csema_decl.ax hands over:
+// combinations of storage-class specifiers (C23 lets auto, constexpr and
+// thread_local join others: 6.7.1p2), thread storage, alignment specifiers
+// (6.7.5), the widths of bit-fields (6.7.2.1p4-5), enumerations (6.7.2.2,
+// with C23's fixed underlying types and constants outside int), the types
+// constexpr objects may have, the type of a declaration with `auto` and no
+// type (C23 6.7.10), and the arguments of the standard attributes (C23
+// 6.7.13; other attributes are ignored).
+//
+// The implementation has no threads (__STDC_NO_THREADS__): an object with
+// thread storage duration is an object with static storage duration, which
+// the constraints on thread_local still treat as a different duration.
+// Alignment specifiers may ask for any power of two up to MAX_ALIGN.
+//
+// Diagnostics (beside csema.ax's):
+//   C3070  an invalid bit-field (its type or width), or an operator applied to one (&, sizeof, typeof)
+//   C3071  an invalid alignment specifier, or one where none may be
+//   C3072  an invalid designator in an initializer
+//   C3073  an invalid constexpr declaration or initializer (C23)
+//   C3074  an invalid declaration whose type is inferred (C23 auto)
+//   C3075  an invalid fixed underlying type of an enumeration (C23)
+//   C3076  thread_local where it cannot be, or declarations that disagree about it
+//   C3077  an invalid argument clause of a standard attribute, or an attribute where it cannot be
+//   C3078  an invalid compound literal (its type or storage-class specifiers)
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "csema.ax" as cs;
+import "csema_expr.ax" as cx;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+/// The strictest alignment an alignment specifier may ask for.
+pub const MAX_ALIGN: u64 = 4096;
+
+/// Set while the type name of a compound literal is analyzed (it declares
+/// an object: an alignment specifier may stand in it).
+pub let mut in_compound: bool = false;
+
+/// The alignment an alignment specifier in that type name asks for (0: none).
+pub let mut compound_align: u64 = 0;
+
+// -----------------------------------------------------------------------------
+// Storage-class specifiers (6.7.1)
+// -----------------------------------------------------------------------------
+
+/// What the storage-class specifiers of a declaration say.
+pub struct Storage {
+    sc: i32,           // the one that decides storage and linkage (a cast.SC_ bit), or 0
+    constexpr_: bool,  // constexpr (C23)
+    infer: bool,       // auto without a type specifier (C23): the type is the initializer's
+}
+
+fn bit_count(x: i32) i32 {
+    let mut n: i32 = 0;
+    let mut v = x;
+    while v != 0 {
+        n += v & 1;
+        v = v >> 1;
+    }
+    return n;
+}
+
+/// The storage-class specifiers `bits` (cast.SC_ bits, without thread_local)
+/// of declaration specifiers ds, checked: at most one, except as C23 allows.
+pub fn storage(bits: i32, ds: *cast.DeclSpec) Storage {
+    let mut r = Storage.{ sc: bits, constexpr_: false, infer: false };
+    if bits == 0 {
+        return r;
+    }
+    if cs.std() < co.C23 {
+        if bit_count(bits) > 1 {
+            cs.err(ds.span, "C3006", "more than one storage-class specifier");
+            r.sc = lowest(bits);
+        }
+        return r;
+    }
+    let mut rest = bits;
+    if (bits & cast.SC_AUTO) != 0 {
+        if (bits & cast.SC_TYPEDEF) != 0 {
+            cs.err(ds.span, "C3006", "'auto' cannot be combined with 'typedef'");
+        }
+        r.infer = not ds.has_type;
+        if r.infer or (bits != cast.SC_AUTO) {
+            rest = rest & ~cast.SC_AUTO;  // (it only asks for the type to be inferred)
+        }
+    }
+    if (rest & cast.SC_CONSTEXPR) != 0 {
+        r.constexpr_ = true;
+        rest = rest & ~cast.SC_CONSTEXPR;
+        let bad = rest & ~(cast.SC_STATIC | cast.SC_REGISTER | cast.SC_AUTO);
+        if bad != 0 {
+            cs.err(ds.span, "C3073", u.f1("'constexpr' cannot be combined with '%s'", sc_name(lowest(bad))));
+            r.constexpr_ = false;
+        }
+    }
+    if bit_count(rest) > 1 {
+        cs.err(ds.span, "C3006", "more than one storage-class specifier");
+        rest = lowest(rest);
+    }
+    r.sc = rest;
+    return r;
+}
+
+fn lowest(x: i32) i32 {
+    return x & -x;
+}
+
+/// The keyword of a storage-class specifier bit.
+pub fn sc_name(b: i32) []u8 {
+    if b == cast.SC_TYPEDEF {
+        return "typedef";
+    }
+    if b == cast.SC_EXTERN {
+        return "extern";
+    }
+    if b == cast.SC_STATIC {
+        return "static";
+    }
+    if b == cast.SC_AUTO {
+        return "auto";
+    }
+    if b == cast.SC_REGISTER {
+        return "register";
+    }
+    if b == cast.SC_THREAD_LOCAL {
+        return u.pick(cs.std() >= co.C23, "thread_local", "_Thread_local");
+    }
+    return "constexpr";
+}
+
+/// Checks thread_local in specifiers ds with storage s (6.7.1p3-4):
+/// with static or extern only, and in a block only with one of them;
+/// block: the declaration is in a block; param: a parameter's.
+pub fn thread_local(ds: *cast.DeclSpec, s: Storage, block: bool, param: bool) void {
+    let tl = sc_name(cast.SC_THREAD_LOCAL);
+    if param {
+        cs.err(ds.span, "C3076", u.f1("a parameter cannot be declared '%s'", tl));
+        return;
+    }
+    if s.constexpr_ {
+        cs.err(ds.span, "C3073", u.f1("'constexpr' cannot be combined with '%s'", tl));
+        return;
+    }
+    if (s.sc != 0) and (s.sc != cast.SC_STATIC) and (s.sc != cast.SC_EXTERN) {
+        cs.err(ds.span, "C3076", u.f2("'%s' cannot be combined with '%s'", tl, sc_name(s.sc)));
+        return;
+    }
+    if block and (s.sc == 0) {
+        cs.err(ds.span, "C3076", u.f1("an object declared '%s' in a block must also be 'static' or 'extern'", tl));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Alignment specifiers (6.7.5)
+// -----------------------------------------------------------------------------
+
+/// The alignment that alignment specifier s asks for (0: none, or an error,
+/// reported).
+pub fn alignment(s: *mut cast.Spec) u64 {
+    let what = u.pick(cs.std() >= co.C23, "alignas", "_Alignas");
+    if u.notnil(s.tname) {
+        let t = cs.hooks.type_name(s.tname);
+        if cty.is_error(t) {
+            return 0;
+        }
+        let ok = cty.is_complete(t) or ((t.kind == cty.TK_ARRAY) and cty.is_complete(t.elem));
+        if not ok {
+            cs.err(s.span, "C3071", u.f2("the type in '%s' is %s, not a complete object type", what, cs.tq(t)));
+            return 0;
+        }
+        return cty.align_of(t);
+    }
+    let r = cx.ice(s.e, u.f1("the alignment in '%s'", what));
+    s.e = r.e;
+    if not r.ok {
+        return 0;
+    }
+    let v = r.v;
+    if r.e.ty.is_signed and (@bit_cast(i64, v) < 0) {
+        cs.err(s.e.span, "C3071", u.f1("the alignment %s is negative", u.dec(@bit_cast(i64, v))));
+        return 0;
+    }
+    if v == 0 {
+        return 0;  // (no effect)
+    }
+    if (v & (v - 1)) != 0 {
+        cs.err(s.e.span, "C3071", u.f1("the alignment %s is not a power of two", u.udec(v)));
+        return 0;
+    }
+    if v > MAX_ALIGN {
+        cs.err(s.e.span, "C3071", u.f2("the alignment %s is larger than the largest supported (%s)", u.udec(v),
+                                       u.udec(MAX_ALIGN)));
+        return 0;
+    }
+    return v;
+}
+
+/// Checks the alignment `a` the specifiers ask for (at sp) against the type
+/// t of the object or member `name` (6.7.5p4: not less strict than t's).
+pub fn check_alignment(a: u64, sp: u.Span, t: *mut cty.CType, name: []u8) bool {
+    if a == 0 or cty.is_error(t) {
+        return true;
+    }
+    let mut nat = cty.align_of(t);
+    if (t.kind == cty.TK_ARRAY) and not t.has_len {
+        nat = cty.align_of(t.elem);
+    }
+    if a < nat {
+        cs.err(sp, "C3071", u.f3("the alignment %s is less strict than the alignment of '%s', %s", u.udec(a), name,
+                                 u.udec(nat)));
+        return false;
+    }
+    return true;
+}
+
+/// An alignment specifier where none may be (6.7.5p2): `what` names it.
+pub fn misplaced_alignment(sp: u.Span, what: []u8) void {
+    cs.err(sp, "C3071", u.f1("an alignment specifier in %s", what));
+}
+
+// -----------------------------------------------------------------------------
+// Bit-fields (6.7.2.1p4-5)
+// -----------------------------------------------------------------------------
+
+// The width of integer type t's objects in bits (_Bool: 1).
+fn type_width(t: *cty.CType) i32 {
+    if t.unq.kind == cty.TK_BOOL {
+        return 1;
+    }
+    return t.bits;
+}
+
+/// The width of bit-field declarator d of type t, checked; -1 after an
+/// error (reported).
+pub fn bit_width(t: *mut cty.CType, d: *mut cast.Declarator) i32 {
+    let name = u.pick(d.name.len > 0, u.f1("the bit-field '%s'", d.name), "an unnamed bit-field");
+    let r = cx.ice(d.width, u.f1("the width of %s", name));
+    d.width = r.e;
+    if cty.is_error(t) {
+        return -1;
+    }
+    if not cty.is_integer(t) {
+        cs.err(d.span, "C3070", u.f2("%s has type %s, not an integer type", name, cs.tq(t)));
+        return -1;
+    }
+    let k = t.unq.kind;
+    if cs.std() < co.C99 {
+        if (k != cty.TK_INT) and (k != cty.TK_UINT) {
+            cs.err(d.span, "C3070", u.f2("%s has type %s (before C99: int, signed int or unsigned int)", name,
+                                         cs.tq(t)));
+            return -1;
+        }
+    }
+    if not r.ok {
+        return -1;
+    }
+    let v = r.v;
+    if r.e.ty.is_signed and (@bit_cast(i64, v) < 0) {
+        cs.err(r.e.span, "C3070", u.f2("the width of %s is negative (%s)", name, u.dec(@bit_cast(i64, v))));
+        return -1;
+    }
+    let tw = type_width(t);
+    if v > @as(u64, @bit_cast(u32, tw)) {
+        cs.err(r.e.span, "C3070", u.f4("the width of %s is %s, more than the width of %s (%s)", name, u.udec(v),
+                                       cs.tq(t), u.idec(tw)));
+        return -1;
+    }
+    if (v == 0) and (d.name.len > 0) {
+        cs.err(r.e.span, "C3070", u.f1("%s has width 0 (only an unnamed bit-field can)", name));
+        return -1;
+    }
+    return @bit_cast(i32, @truncate(u32, v));
+}
+
+// -----------------------------------------------------------------------------
+// Enumerations (6.7.2.2)
+// -----------------------------------------------------------------------------
+
+fn kind_word(k: i32) []u8 {
+    if k == cty.TK_STRUCT {
+        return "struct";
+    }
+    if k == cty.TK_UNION {
+        return "union";
+    }
+    return "enum";
+}
+
+// The fixed underlying type of ts (C23), checked; nil if none (or invalid).
+fn fixed_type(ts: *mut cast.TagSpec) *mut cty.CType {
+    if u.isnil(ts.fixed) {
+        return u.nil.[cty.CType]();
+    }
+    let t = cs.hooks.type_name(ts.fixed);
+    if cty.is_error(t) {
+        return u.nil.[cty.CType]();
+    }
+    if not cty.is_integer(t) or (t.kind == cty.TK_ENUM) {
+        cs.err(ts.fixed.span, "C3075",
+               u.f1("the underlying type of an enumeration is %s, not an integer type that is not an enumeration",
+                    cs.tq(t)));
+        return u.nil.[cty.CType]();
+    }
+    return cty.unqual(t);
+}
+
+/// The type an enum specifier names (lone: the whole declaration is the
+/// specifier and a ';'), declaring and defining it as it says.
+pub fn enum_tag(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
+    let named = ts.name.len > 0;
+    let ft = fixed_type(ts);
+    if u.notnil(ts.fixed) and not ts.has_body and not lone {
+        cs.err(ts.fixed.span, "C3075",
+               "an enumeration's underlying type is given only with its list, or in a declaration of the tag alone");
+    }
+    let declares = ts.has_body or u.notnil(ts.fixed);
+    let mut t = u.nil.[cty.CType]();
+    if declares {
+        if named {
+            t = cs.lookup_tag_here(ts.name);
+        }
+    } else if named {
+        t = cs.lookup_tag(ts.name);
+    }
+    if u.notnil(t) {
+        if t.kind != cty.TK_ENUM {
+            cs.err_note(ts.name_span, "C3011", u.f2("'%s' was declared as %s", ts.name,
+                                                    u.cat3("a different kind of tag (", kind_word(t.kind), ")")),
+                        t.tag.span, "declared here");
+            ts.ty = cty.t_error;
+            return ts.ty;
+        }
+        let ti = t.tag;
+        if declares {
+            let prev_fixed = u.notnil(ti.fixed);
+            if prev_fixed != u.notnil(ts.fixed) {
+                cs.err_note(ts.name_span, "C3075",
+                            u.f1("'enum %s' is declared with a fixed underlying type and without one", ts.name),
+                            ti.span, "declared before here");
+            } else if prev_fixed and u.notnil(ft) and not cty.compatible_unq(ti.fixed, ft) {
+                cs.err_note(ts.name_span, "C3075", u.f3("'enum %s' has underlying type %s, declared before as %s",
+                                                        ts.name, cs.tq(ft), cs.tq(ti.fixed)), ti.span,
+                            "declared before here");
+            }
+            if ts.has_body and ti.listed {
+                cs.err_note(ts.name_span, "C3002", u.f1("redefinition of 'enum %s'", ts.name), ti.span,
+                            "defined before here");
+                ts.ty = cty.t_error;
+                return ts.ty;
+            }
+        }
+    } else {
+        if not declares {
+            cs.err(ts.name_span, "C3011", u.f1("'enum %s' is not defined", ts.name));
+            ts.ty = cty.t_error;
+            return ts.ty;
+        }
+        t = cty.new_tagged(cty.TK_ENUM, ts.name, ts.name_span);
+        if not named {
+            t.tag.span = ts.span;
+        }
+        if named {
+            cs.declare_tag(ts.name, t);
+        }
+        if u.notnil(ft) {
+            t.tag.fixed = ft;
+            cty.set_enum_base(t, ft);  // (complete from here on: C23 6.7.2.2p?)
+        }
+    }
+    ts.ty = t;
+    if ts.has_body {
+        t.tag.listed = true;
+        enumerators(t, ts);
+    }
+    return t;
+}
+
+// The value of an enumeration constant: its bits, and whether negative.
+struct Val {
+    v: u64,
+    neg: bool,
+    ok: bool,
+}
+
+// The first of the types `cands` that holds v; nil if none.
+fn first_fit(cands: []mut *mut cty.CType, x: Val) *mut cty.CType {
+    for c in cands {
+        if cty.fits(c, x.v, x.neg) {
+            return c;
+        }
+    }
+    return u.nil.[cty.CType]();
+}
+
+fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
+    let fixed = t.tag.fixed;
+    let c23 = cs.std() >= co.C23;
+    let mut syms = u.List.[*mut cast.CSym].empty();
+    let mut prev = Val.{ v: 0, neg: false, ok: false };
+    let mut prev_ty = cty.t_int;
+    let mut all_int = true;
+    let mut min = Val.{ v: 0, neg: false, ok: false };
+    let mut max = Val.{ v: 0, neg: false, ok: false };
+    let mut first = true;
+    for en in ts.enumerators.items() {
+        attrs(&en.attrs, AP_OTHER);
+        let mut x = Val.{ v: 0, neg: false, ok: true };
+        let mut ety = cty.t_int;
+        if u.notnil(en.value) {
+            let r = cx.ice(en.value, "an enumeration constant's value");
+            en.value = r.e;
+            if r.ok {
+                x = Val.{ v: r.v, neg: r.e.ty.is_signed and (@bit_cast(i64, r.v) < 0), ok: true };
+                if u.notnil(fixed) {
+                    if not cty.fits(fixed, x.v, x.neg) {
+                        cs.err(en.span, "C3013",
+                               u.f2("the value of '%s' is outside the range of its underlying type %s", en.name,
+                                    cs.tq(fixed)));
+                        x = Val.{ v: 0, neg: false, ok: true };
+                    }
+                } else if not cty.fits(cty.t_int, x.v, x.neg) {
+                    if not c23 {
+                        cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of int", en.name));
+                        x = Val.{ v: 0, neg: false, ok: true };
+                    } else if not cty.fits(cty.t_llong, x.v, x.neg) {
+                        cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of long long", en.name));
+                        x = Val.{ v: 0, neg: false, ok: true };
+                    } else {
+                        ety = cty.promote(r.e.ty);
+                    }
+                }
+            }
+        } else if not first {
+            // the previous value plus one
+            x = Val.{ v: prev.v +% 1, neg: prev.neg and (prev.v != 0xFFFF_FFFF_FFFF_FFFF), ok: true };
+            let mut lim = prev_ty;
+            if u.notnil(fixed) {
+                lim = fixed;
+            }
+            if not cty.fits(lim, x.v, x.neg) {
+                if u.notnil(fixed) or not c23 {
+                    let mut what: []u8 = "int";
+                    if u.notnil(fixed) {
+                        what = u.cat2("its underlying type ", cs.tq(fixed));
+                    }
+                    cs.err(en.span, "C3013",
+                           u.f2("the value of '%s' (the previous one plus 1) is outside the range of %s", en.name,
+                                what));
+                    x = prev;
+                } else {
+                    let mut cands: [3]*mut cty.CType = [cty.t_long, cty.t_llong, cty.t_ullong];
+                    let nt = first_fit(cands[..], x);
+                    if u.isnil(nt) or not cty.fits(cty.t_llong, x.v, x.neg) {
+                        cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of long long", en.name));
+                        x = prev;
+                    } else {
+                        ety = nt;
+                    }
+                }
+            } else {
+                ety = lim;
+            }
+        }
+        if u.isnil(fixed) and not cty.fits(cty.t_int, x.v, x.neg) {
+            all_int = false;
+        } else if u.isnil(fixed) and (ety.rank > cty.t_int.rank) {
+            ety = cty.t_int;  // (back in int's range)
+        }
+        if first or less(x, min) {
+            min = x;
+        }
+        if first or less(max, x) {
+            max = x;
+        }
+        first = false;
+        prev = x;
+        prev_ty = ety;
+        let prior = cs.lookup_here(en.name);
+        if u.notnil(prior) {
+            cs.err_note(en.span, "C3002", u.f1("redefinition of '%s'", en.name), prior.span, "declared before here");
+        }
+        let mut st = ety;
+        if u.notnil(fixed) {
+            st = t;  // (C23: the constants of an enumeration with a fixed type have the enumerated type)
+        }
+        let s = cs.new_sym(cast.SK_ENUMCONST, en.name, en.span, st);
+        s.value = cty.wrap(st, x.v);
+        en.sym = s;
+        syms.push(s);
+        cs.declare(en.name, s);
+    }
+    if u.notnil(fixed) {
+        return;
+    }
+    // the compatible type: unsigned int if no value is negative, else int,
+    // or (C23) the first wider type that holds them all
+    let mut base = u.nil.[cty.CType]();
+    if min.neg {
+        let mut cands: [3]*mut cty.CType = [cty.t_int, cty.t_long, cty.t_llong];
+        for c in cands {
+            if u.isnil(base) and cty.fits(c, min.v, true) and cty.fits(c, max.v, max.neg) {
+                base = c;
+            }
+        }
+    } else {
+        let mut cands: [3]*mut cty.CType = [cty.t_uint, cty.t_ulong, cty.t_ullong];
+        base = first_fit(cands[..], max);
+    }
+    if u.isnil(base) {
+        base = cty.t_llong;
+    }
+    cty.set_enum_base(t, base);
+    if not all_int {
+        // (C23: when some value is outside int, the constants have the enumerated type)
+        for s in syms.items() {
+            s.ty = t;
+            s.value = cty.wrap(base, s.value);
+        }
+    }
+}
+
+// a < b, for values given as bits and sign.
+fn less(a: Val, b: Val) bool {
+    if a.neg != b.neg {
+        return a.neg;
+    }
+    if a.neg {
+        return @bit_cast(i64, a.v) < @bit_cast(i64, b.v);
+    }
+    return a.v < b.v;
+}
+
+// -----------------------------------------------------------------------------
+// constexpr objects (C23 6.7.1p5-6)
+// -----------------------------------------------------------------------------
+
+/// Checks the type t of an object declared constexpr (at sp): no volatile,
+/// restrict or atomic type, in any of its members either.
+pub fn constexpr_type(t: *mut cty.CType, sp: u.Span) bool {
+    if (t.quals & (cty.Q_VOLATILE | cty.Q_RESTRICT | cty.Q_ATOMIC)) != 0 {
+        cs.err(sp, "C3073", u.f1("an object declared 'constexpr' has type %s (volatile, restrict or atomic)",
+                                 cs.tq(t)));
+        return false;
+    }
+    if t.kind == cty.TK_ARRAY {
+        if t.vla {
+            cs.err(sp, "C3073", "an object declared 'constexpr' has a variable length array type");
+            return false;
+        }
+        return constexpr_type(t.elem, sp);
+    }
+    if cty.is_record(t) and t.tag.complete {
+        for m in t.unq.tag.members.items() {
+            if not constexpr_type(m.ty, sp) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Type inference (C23 6.7.10)
+// -----------------------------------------------------------------------------
+
+/// The type of declarator d of a declaration with `auto` and no type
+/// specifier, whose other specifiers add qualifiers quals: its
+/// initializer's (after lvalue conversion, unqualified); the error type
+/// after an error (reported). `several`: the declaration has more than one
+/// declarator (reported at the first).
+pub fn inferred(d: *mut cast.Declarator, quals: i32, several: bool, first: bool) *mut cty.CType {
+    if several {
+        if first {
+            cs.err(d.name_span, "C3074", "a declaration whose type is inferred ('auto') can only have one declarator");
+        }
+        return cty.t_error;
+    }
+    if d.derivs.len > 0 {
+        cs.err(d.name_span, "C3074",
+               u.f1("'%s' has its type inferred ('auto'), and its declarator must be the identifier alone", d.name));
+        return cty.t_error;
+    }
+    if u.isnil(d.init) {
+        cs.err(d.name_span, "C3074", u.f1("'%s' has its type inferred ('auto') but no initializer", d.name));
+        return cty.t_error;
+    }
+    if d.init.kind != cast.InitKind.EXPR {
+        cs.err(d.init.span, "C3074",
+               u.f1("'%s' has its type inferred ('auto'): its initializer must be an expression, not a list", d.name));
+        return cty.t_error;
+    }
+    let x = cx.rv(d.init.e);
+    if u.isnil(x.ty) or cty.is_error(x.ty) {
+        return cty.t_error;
+    }
+    if cty.is_void(x.ty) {
+        cs.err(x.span, "C3074", u.f1("the initializer of '%s' (whose type is inferred) has type void", d.name));
+        return cty.t_error;
+    }
+    return cty.qualify(cty.unqual(x.ty), quals);
+}
+
+// -----------------------------------------------------------------------------
+// Attributes (C23 6.7.13)
+// -----------------------------------------------------------------------------
+
+/// What attributes appertain to.
+pub const AP_OBJECT: i32 = 1;  // an object, typedef or other entity that is not a function
+pub const AP_FUNC: i32 = 2;    // a function (or its type)
+pub const AP_OTHER: i32 = 3;   // a type, tag, member, enumerator, or nothing decided here
+
+// The attribute's name without the `__x__` spelling.
+fn plain(n: []u8) []u8 {
+    if (n.len > 4) and u.starts(n, "__") and u.ends(n, "__") {
+        return n[2..n.len - 2];
+    }
+    return n;
+}
+
+/// Checks the standard attributes among `list` (appertaining to `what`, an
+/// AP_ constant): their argument clauses, and noreturn, unsequenced and
+/// reproducible only for functions. Others are ignored.
+pub fn attrs(list: *u.List.[*mut cast.Attr], what: i32) void {
+    for a in list.items() {
+        if a.prefix.len > 0 {
+            continue;
+        }
+        let n = plain(a.name);
+        let none = u.str_eq(n, "fallthrough") or u.str_eq(n, "maybe_unused") or u.str_eq(n, "noreturn") or
+                   u.str_eq(n, "_Noreturn") or u.str_eq(n, "unsequenced") or u.str_eq(n, "reproducible");
+        let str = u.str_eq(n, "deprecated") or u.str_eq(n, "nodiscard");
+        if none and a.has_args {
+            cs.err(a.span, "C3077", u.f1("the attribute '%s' takes no arguments", a.name));
+        } else if str and a.has_args {
+            let ok = (a.args.len == 1) and (a.args[0].kind == ct.T_STRING);
+            if not ok {
+                cs.err(a.span, "C3077", u.f1("the argument of the attribute '%s' must be a string literal", a.name));
+            }
+        }
+        let fnonly = u.str_eq(n, "noreturn") or u.str_eq(n, "_Noreturn") or u.str_eq(n, "unsequenced") or
+                     u.str_eq(n, "reproducible");
+        if fnonly and (what == AP_OBJECT) {
+            cs.err(a.span, "C3077", u.f1("the attribute '%s' applies only to functions", a.name));
+        }
+        if u.str_eq(n, "fallthrough") and (what != AP_OTHER) {
+            cs.err(a.span, "C3077", "the attribute 'fallthrough' applies only to a null statement before a case");
+        }
+    }
+}

@@ -17,8 +17,10 @@ import "cast.ax" as cast;
 import "copts.ax" as co;
 import "csema.ax" as cs;
 import "csema_bitint.ax" as csb;
+import "csema_bits.ax" as cb;
+import "csema_desig.ax" as cdi;
+import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
-import "csema_init.ax" as ci;
 import "csema_marks.ax" as csm;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
@@ -39,6 +41,12 @@ struct Specs {
     funcs: i32,      // cast.FS_ bits
     tag_decl: bool,  // a structure, union or enumeration specifier that declares something
     sp: u.Span,
+    quals: i32,       // the qualifiers among the specifiers
+    align: u64,       // the strictest alignment an alignment specifier asks for, or 0
+    has_align: bool,  // an alignment specifier is among them
+    align_sp: u.Span,
+    constexpr_: bool,  // constexpr (C23)
+    infer: bool,       // auto without a type specifier (C23): the type is the initializer's
 }
 
 // The parameters of the last function declarator at a declarator's
@@ -71,12 +79,15 @@ struct Counts {
 }
 
 fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
-    let mut r = Specs.{ ty: cty.t_int, sc: 0, thread: false, funcs: ds.funcs, tag_decl: false, sp: ds.span };
+    let mut r = Specs.{ ty: cty.t_int, sc: 0, thread: false, funcs: ds.funcs, tag_decl: false, sp: ds.span, quals: 0,
+                        align: 0, has_align: false, align_sp: ds.span, constexpr_: false, infer: false };
+    let mut scs: i32 = 0;
     let mut c = Counts.{ void_: 0, char_: 0, short_: 0, int_: 0, long_: 0, float_: 0, double_: 0, signed_: 0,
                          unsigned_: 0, bool_: 0, int64: 0, valist: 0, bitint: 0, width: 0, width_sp: ds.span,
                          other: 0 };
     let mut other = cty.t_error;
-    let mut nstorage: i32 = 0;
+    let mut td_seen = false;  // a typedef name, at td_span
+    let mut td_span = ds.span;
     let mut qual_seen: i32 = 0;
     let mut bad = false;
     for si in 0..ds.items.len {
@@ -87,16 +98,11 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
                 r.thread = true;
                 continue;
             }
-            nstorage += 1;
-            if nstorage > 1 {
-                cs.err(s.span, "C3006", "more than one storage-class specifier");
+            let b = storage_bit(s.kw);
+            if (scs & b) != 0 {
+                cs.err(s.span, "C3006", u.f1("'%s' is repeated", dsp.sc_name(b)));
             }
-            r.sc = storage_bit(s.kw);
-            if s.kw == ct.K_CONSTEXPR {
-                cs.unsupported(s.span, "constexpr");
-            } else if (s.kw == ct.K_AUTO) and (cs.std() >= co.C23) and not ds.has_type {
-                cs.unsupported(s.span, "type inference with auto");
-            }
+            scs = scs | b;
         } else if k == cast.SpecKind.TYPE {
             let kw = s.kw;
             if kw == ct.K_VOID {
@@ -139,7 +145,22 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
         } else if k == cast.SpecKind.FUNC {
             // (checked where the declared identifier's type is known)
         } else if k == cast.SpecKind.ALIGN {
-            cs.unsupported(s.span, "_Alignas");
+            let a = dsp.alignment(s);
+            if (ctx == CTX_TYPENAME) and not dsp.in_compound {
+                dsp.misplaced_alignment(s.span, "a type name");
+            } else if ctx == CTX_PARAM {
+                dsp.misplaced_alignment(s.span, "the declaration of a parameter");
+            }
+            if not r.has_align {
+                r.align_sp = s.span;
+            }
+            r.has_align = true;
+            if a > r.align {
+                r.align = a;
+            }
+            if dsp.in_compound and (a > dsp.compound_align) {
+                dsp.compound_align = a;
+            }
         } else if k == cast.SpecKind.TAG {
             c.other += 1;
             other = tag_type(s.tag, lone);
@@ -150,6 +171,8 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
             if u.notnil(ts) and (ts.kind == cast.SK_TYPEDEF) {
                 other = ts.ty;
                 ts.used = true;
+                td_seen = true;
+                td_span = s.span;
             } else {
                 cs.err(s.span, "C3001", u.f1("'%s' is not a type name", s.name));
                 bad = true;
@@ -173,15 +196,26 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
             bad = true;
         }
     }
-    if r.thread {
-        cs.unsupported(ds.span, "_Thread_local");
+    if td_seen and ((other.quals & qual_seen) != 0) and (cs.std() < co.C99) {
+        cs.err(td_span, "C3006", "a type qualifier is repeated, through a typedef name (allowed from C99)");
+    }
+    let st = dsp.storage(scs, ds);
+    r.sc = st.sc;
+    r.constexpr_ = st.constexpr_;
+    r.infer = st.infer;
+    if r.thread and (ctx != CTX_MEMBER) and (ctx != CTX_TYPENAME) {
+        dsp.thread_local(ds, st, (ctx == CTX_BLOCK) or (ctx == CTX_FOR), ctx == CTX_PARAM);
+    }
+    if (ctx == CTX_PARAM) and r.constexpr_ {
+        cs.err(ds.span, "C3073", "a parameter cannot be declared 'constexpr'");
     }
     if bad {
         r.ty = cty.t_error;
         return r;
     }
     let t = base_type(&c, other, ds.span);
-    r.ty = cty.qualify(t, qual_seen & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT));
+    r.quals = qual_seen & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT);
+    r.ty = cty.qualify(t, r.quals);
     if (ctx == CTX_MEMBER) or (ctx == CTX_TYPENAME) {
         r.sc = 0;  // (the parser reported any)
     }
@@ -197,7 +231,9 @@ fn typeof_type(s: *mut cast.Spec) *mut cty.CType {
     } else {
         let x = cx.check(s.e);
         s.e = x;
-        if u.notnil(x.ty) {
+        if u.notnil(cb.member(x)) {
+            cs.err(x.span, "C3070", u.f1("'%s' of a bit-field", cast.kw_text(s.kw)));
+        } else if u.notnil(x.ty) {
             t = x.ty;
         }
     }
@@ -378,6 +414,10 @@ fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
         return ts.ty;
     }
     let kind = tag_kind(ts.kw);
+    dsp.attrs(&ts.attrs, dsp.AP_OTHER);
+    if kind == cty.TK_ENUM {
+        return dsp.enum_tag(ts, lone);
+    }
     let named = ts.name.len > 0;
     let mut t = u.nil.[cty.CType]();
     if ts.has_body or lone {
@@ -429,11 +469,7 @@ fn tag_type(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
     }
     ts.ty = t;
     if ts.has_body {
-        if kind == cty.TK_ENUM {
-            enum_body(t, ts);
-        } else {
-            record_body(t, ts);
-        }
+        record_body(t, ts);
     }
     return t;
 }
@@ -459,6 +495,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             continue;
         }
         let sp = specifiers(md.specs, CTX_MEMBER, md.decls.len == 0);
+        dsp.attrs(&md.attrs, dsp.AP_OTHER);
         if md.decls.len == 0 {
             // an anonymous structure or union (C11)
             let at = sp.ty;
@@ -475,8 +512,35 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             continue;
         }
         for d in md.decls.items() {
+            dsp.attrs(&d.attrs, dsp.AP_OTHER);
             if u.notnil(d.width) {
-                cs.unsupported(d.span, "a bit-field");
+                let bt = derive(sp.ty, d, CTX_MEMBER);
+                d.ty = bt;
+                let w = dsp.bit_width(bt, d);
+                if sp.has_align {
+                    dsp.misplaced_alignment(sp.align_sp, u.pick(d.name.len > 0,
+                                                                u.f1("the declaration of the bit-field '%s'", d.name),
+                                                                "an unnamed bit-field"));
+                }
+                if w < 0 {
+                    continue;
+                }
+                if u.notnil(flex) {
+                    cs.err(flex.span, "C3008", "a flexible array member that is not the last member");
+                    flex = u.nil.[cty.Member]();
+                }
+                if d.name.len > 0 {
+                    check_dup(&mut names, d.name, d.name_span);
+                    named += 1;
+                }
+                let mut msp = d.span;
+                if d.name.len > 0 {
+                    msp = d.name_span;
+                }
+                add_member(ti, d.name, msp, bt);
+                let bm = ti.members.last();
+                bm.is_bitfield = true;
+                bm.bit_width = w;
                 continue;
             }
             let mt = derive(sp.ty, d, CTX_MEMBER);
@@ -498,12 +562,18 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                 continue;
             }
             if cty.is_record(mt) and mt.tag.has_flex {
-                cs.err(d.name_span, "C3008", u.f1("the member '%s' is a structure with a flexible array member",
-                                                  d.name));
+                if ti.kind == cty.TK_STRUCT {
+                    cs.err(d.name_span, "C3008", u.f1("the member '%s' has a flexible array member", d.name));
+                } else {
+                    ti.has_flex = true;  // (a union may hold one: 6.7.2.1p3; it is then as constrained)
+                }
             }
             check_dup(&mut names, d.name, d.name_span);
             add_member(ti, d.name, d.name_span, mt);
             named += 1;
+            if sp.has_align and dsp.check_alignment(sp.align, sp.align_sp, mt, d.name) {
+                ti.members.last().align = sp.align;
+            }
             if is_flex {
                 if (ti.kind == cty.TK_UNION) or (named == 1) {
                     cs.err(d.name_span, "C3008",
@@ -514,7 +584,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         }
     }
     ti.defining = false;
-    cty.layout(ti);
+    cb.layout(ti);
 }
 
 fn check_dup(names: *mut u.SymMap.[i32], name: []u8, sp: u.Span) void {
@@ -532,68 +602,6 @@ fn add_member(ti: *mut cty.TagInfo, name: []u8, sp: u.Span, t: *mut cty.CType) v
     m.ty = t;
     m.index = @int_cast(i32, ti.members.len);
     ti.members.push(m);
-}
-
-fn enum_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
-    if u.notnil(ts.fixed) {
-        cs.unsupported(ts.fixed.span, "an enumeration with a fixed underlying type");
-    }
-    let int_max = @bit_cast(i64, cty.int_max(cty.t_int));
-    let int_min = -int_max - 1;
-    let mut v: i64 = 0;
-    let mut first = true;
-    let mut neg = false;
-    for en in ts.enumerators.items() {
-        if u.notnil(en.value) {
-            let r = cx.ice(en.value, "an enumeration constant's value");
-            en.value = r.e;
-            if r.ok {
-                let signed_ = r.e.ty.is_signed;
-                if not signed_ and (r.v > @bit_cast(u64, int_max)) {
-                    range_error(en);
-                    v = 0;
-                } else {
-                    v = @bit_cast(i64, r.v);
-                    if (v > int_max) or (v < int_min) {
-                        range_error(en);
-                        v = 0;
-                    }
-                }
-            }
-        } else if not first {
-            if v == int_max {
-                range_error(en);
-            } else {
-                v += 1;
-            }
-        }
-        first = false;
-        if v < 0 {
-            neg = true;
-        }
-        let prior = cs.lookup_here(en.name);
-        if u.notnil(prior) {
-            cs.err_note(en.span, "C3002", u.f1("redefinition of '%s'", en.name), prior.span, "declared before here");
-        }
-        let s = cs.new_sym(cast.SK_ENUMCONST, en.name, en.span, cty.t_int);
-        s.value = cty.wrap(cty.t_int, @bit_cast(u64, v));
-        en.sym = s;
-        cs.declare(en.name, s);
-    }
-    // the compatible type: unsigned int unless a value is negative
-    if neg {
-        cty.set_enum_base(t, cty.t_int);
-    } else {
-        cty.set_enum_base(t, cty.t_uint);
-    }
-}
-
-fn range_error(en: *mut cast.Enumerator) void {
-    if cs.std() >= co.C23 {
-        cs.unsupported(en.span, "an enumeration constant outside the range of int");
-    } else {
-        cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of int", en.name));
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -734,6 +742,8 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             if sp.sc == cast.SC_REGISTER {
                 csm.set_register(s);
             }
+            dsp.attrs(&p.attrs, dsp.AP_OBJECT);
+            dsp.attrs(&p.decl.attrs, dsp.AP_OBJECT);
             p.decl.sym = s;
             if p.decl.name.len > 0 {
                 let prior = cs.lookup_here(p.decl.name);
@@ -794,6 +804,8 @@ pub fn external(d: *mut cast.Decl) void {
         function_def(d);
     } else if d.kind == cast.DeclKind.STATIC_ASSERT {
         static_assert(d);
+    } else if d.kind == cast.DeclKind.ATTR {
+        dsp.attrs(&d.attrs, dsp.AP_OBJECT);  // (appertains to nothing: not fallthrough, nor noreturn)
     }
 }
 
@@ -823,21 +835,47 @@ pub fn for_decl(d: *mut cast.Decl) void {
 fn declaration(d: *mut cast.Decl, ctx: i32) void {
     let lone = d.decls.len == 0;
     let sp = specifiers(d.specs, ctx, lone);
+    dsp.attrs(&d.specs.attrs, dsp.AP_OTHER);
     if lone {
+        dsp.attrs(&d.attrs, dsp.AP_OTHER);
+        if sp.infer or sp.constexpr_ {
+            cs.err(d.span, u.pick(sp.infer, "C3074", "C3073"), u.f1("a declaration with '%s' that declares no object",
+                                                                    u.pick(sp.infer, "auto", "constexpr")));
+            return;
+        }
         if not sp.tag_decl and not cty.is_error(sp.ty) {
             cs.err(d.span, "C3010", "a declaration that declares nothing");
         }
         return;
     }
     for dcl in d.decls.items() {
-        declare_one(&sp, dcl, ctx);
+        declare_one(&sp, dcl, ctx, d);
     }
 }
 
-fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32) void {
-    let t = derive(sp.ty, dcl, ctx);
+fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Decl) void {
+    let mut t = cty.t_error;
+    if sp.infer {
+        t = dsp.inferred(dcl, sp.quals, d.decls.len > 1, dcl == d.decls.get(0));
+    } else {
+        t = derive(sp.ty, dcl, ctx);
+    }
     dcl.ty = t;
     let name = dcl.name;
+    let mut what = dsp.AP_OBJECT;
+    if cty.is_func(t) and (sp.sc != cast.SC_TYPEDEF) {
+        what = dsp.AP_FUNC;
+    }
+    dsp.attrs(&d.attrs, what);
+    dsp.attrs(&dcl.attrs, what);
+    if sp.has_align and ((sp.sc == cast.SC_TYPEDEF) or cty.is_func(t) or (sp.sc == cast.SC_REGISTER)) {
+        let kind = u.pick(
+            sp.sc == cast.SC_TYPEDEF, "the typedef", u.pick(cty.is_func(t), "the function", "the register object"));
+        dsp.misplaced_alignment(sp.align_sp, u.f2("the declaration of %s '%s'", kind, name));
+    }
+    if sp.constexpr_ and ((sp.sc == cast.SC_TYPEDEF) or cty.is_func(t)) {
+        cs.err(dcl.name_span, "C3073", u.f1("'%s' is declared 'constexpr', but is not an object", name));
+    }
     if sp.sc == cast.SC_TYPEDEF {
         if u.notnil(dcl.init) {
             cs.err(dcl.init.span, "C3033", u.f1("the typedef '%s' has an initializer", name));
@@ -864,6 +902,10 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32) void {
                                             name));
     }
     if cty.is_func(t) {
+        if sp.thread {
+            cs.err(dcl.name_span, "C3076", u.f2("the function '%s' cannot be declared '%s'", name,
+                                                dsp.sc_name(cast.SC_THREAD_LOCAL)));
+        }
         func_decl(sp, dcl, t, ctx);
     } else {
         object_decl(sp, dcl, t, ctx);
@@ -944,12 +986,21 @@ fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32)
     }
 }
 
-fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32) void {
+fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t0: *mut cty.CType, ctx: i32) void {
     let sc = sp.sc;
     let name = dcl.name;
+    let mut t = t0;
     if cty.is_void(t) {
         cs.err(dcl.name_span, "C3007", u.f1("the object '%s' has type void", name));
         return;
+    }
+    if sp.constexpr_ {
+        // (C23 6.7.1: a definition with an initializer, of a const type)
+        if u.isnil(dcl.init) {
+            cs.err(dcl.name_span, "C3073", u.f1("'%s' is declared 'constexpr' but has no initializer", name));
+        }
+        _ = dsp.constexpr_type(t, dcl.name_span);
+        t = cty.qualify(t, cty.Q_CONST);
     }
     if cs.at_file_scope() {
         if (sc == cast.SC_AUTO) or (sc == cast.SC_REGISTER) {
@@ -959,10 +1010,14 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i3
         if (sc != cast.SC_STATIC) and (sc != cast.SC_EXTERN) {
             sc2 = 0;
         }
+        if sp.constexpr_ {
+            sc2 = cast.SC_STATIC;  // (internal linkage: C23 6.2.2p3)
+        }
         let lk = cs.linkage_of(name, sc2, false);
         let s = entity(name, dcl.name_span, cast.SK_OBJECT, t, lk);
         s.duration = cast.SD_STATIC;
         dcl.sym = s;
+        object_flags(sp, s, dcl);
         let listed = s.defined or s.tentative;
         if u.notnil(dcl.init) {
             if s.defined {
@@ -971,6 +1026,12 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i3
             init_object(s, dcl.init, true);
             s.defined = true;
         } else if sc != cast.SC_EXTERN {
+            if (lk == cast.LK_INTERNAL) and not cty.is_complete(s.ty) and not cty.is_error(s.ty) {
+                // (6.9.2p3)
+                cs.err(dcl.name_span, "C3007",
+                       u.f2("the tentative definition of '%s', which has internal linkage, has incomplete type %s",
+                            name, cs.tq(s.ty)));
+            }
             s.tentative = true;
         }
         if not listed and (s.defined or s.tentative) {
@@ -984,6 +1045,7 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i3
         let s = entity(name, dcl.name_span, cast.SK_OBJECT, t, lk);
         s.duration = cast.SD_STATIC;
         dcl.sym = s;
+        object_flags(sp, s, dcl);
         if u.notnil(dcl.init) {
             cs.err(dcl.init.span, "C3033", u.f1("'%s', declared extern in a block, has an initializer", name));
         }
@@ -994,13 +1056,14 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i3
         cs.err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", name), prior.span, "declared before here");
     }
     let s = cs.new_sym(cast.SK_OBJECT, name, dcl.name_span, t);
-    if sc == cast.SC_STATIC {
+    if (sc == cast.SC_STATIC) or sp.thread {
         s.duration = cast.SD_STATIC;
     }
     if sc == cast.SC_REGISTER {
         csm.set_register(s);
     }
     dcl.sym = s;
+    object_flags(sp, s, dcl);
     cs.declare(name, s);
     if u.notnil(dcl.init) {
         init_object(s, dcl.init, s.duration == cast.SD_STATIC);
@@ -1016,11 +1079,48 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i3
     dcl.ty = s.ty;
 }
 
+// What the specifiers sp say of object s besides its type: constexpr, thread_local (which every declaration of it says, or none:
+// 6.2.4p4), and its alignment (6.7.5p7: every declaration that has an
+// alignment specifier asks for the same).
+fn object_flags(sp: *Specs, s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
+    let had = s.flags;
+    if sp.constexpr_ {
+        s.flags = s.flags | cast.CF_CONSTEXPR;
+    }
+    let tl = (had & cast.CF_THREAD_LOCAL) != 0;
+    if sp.thread {
+        s.flags = s.flags | cast.CF_THREAD_LOCAL;
+    }
+    let again = (s.span.file != dcl.name_span.file) or (s.span.start != dcl.name_span.start);
+    if (s.linkage != cast.LK_NONE) and again and (tl != sp.thread) {
+        cs.err_note(dcl.name_span, "C3076", u.f2("'%s' is declared %s, after a declaration that says otherwise",
+                                                 dcl.name,
+                                                 u.pick(sp.thread, u.cat3("'", dsp.sc_name(cast.SC_THREAD_LOCAL), "'"),
+                                                        u.cat2(
+                                                            "without '",
+                                                            u.cat2(dsp.sc_name(cast.SC_THREAD_LOCAL), "'")))), s.span,
+                    "declared before here");
+    }
+    if sp.has_align {
+        if dsp.check_alignment(sp.align, sp.align_sp, s.ty, dcl.name) {
+            let a = sp.align;
+            if ((s.flags & cast.CF_ALIGNAS) != 0) and (a != s.align) and (a != 0) and (s.align != 0) {
+                cs.err_note(sp.align_sp, "C3071", u.f3("'%s' is declared with alignment %s, before with %s", dcl.name,
+                                                       u.udec(a), u.udec(s.align)), s.span, "declared before here");
+            }
+            if a > s.align {
+                s.align = a;
+            }
+        }
+        s.flags = s.flags | cast.CF_ALIGNAS;
+    }
+}
+
 fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
     if cty.is_error(s.ty) {
         return;
     }
-    let r = ci.initializer(s.ty, it, is_static);
+    let r = cdi.initializer(s.ty, it, is_static, (s.flags & cast.CF_CONSTEXPR) != 0);
     s.init = r.list;
     s.ty = r.ty;
 }
@@ -1031,6 +1131,8 @@ fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
 
 fn function_def(d: *mut cast.Decl) void {
     let sp = specifiers(d.specs, CTX_FILE, false);
+    dsp.attrs(&d.attrs, dsp.AP_FUNC);
+    dsp.attrs(&d.specs.attrs, dsp.AP_OTHER);
     let dcl = d.decls.get(0);
     g_params = u.List.[*mut cast.CSym].empty();
     g_kr_ids = false;
@@ -1043,6 +1145,19 @@ fn function_def(d: *mut cast.Decl) void {
     if sp.sc == cast.SC_TYPEDEF {
         cs.err(dcl.name_span, "C3006", "a function definition cannot be a typedef");
         return;
+    }
+    dsp.attrs(&dcl.attrs, dsp.AP_FUNC);
+    if sp.infer {
+        cs.err(dcl.name_span, "C3074", u.f1("the function '%s' cannot have its type inferred ('auto')", dcl.name));
+    }
+    if sp.has_align {
+        dsp.misplaced_alignment(sp.align_sp, u.f1("the definition of the function '%s'", dcl.name));
+    }
+    if sp.constexpr_ or sp.thread {
+        cs.err(dcl.name_span, u.pick(sp.constexpr_, "C3073", "C3076"),
+               u.f2(
+                   "the function '%s' cannot be declared '%s'", dcl.name,
+                   u.pick(sp.constexpr_, "constexpr", dsp.sc_name(cast.SC_THREAD_LOCAL))));
     }
     if kr {
         t = kr_params(t, d, &params);

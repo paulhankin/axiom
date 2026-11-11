@@ -15,9 +15,11 @@ import "cconst.ax" as cc;
 import "copts.ax" as co;
 import "csema.ax" as cs;
 import "csema_bitint.ax" as csb;
+import "csema_bits.ax" as cb;
 import "csema_generic.ax" as csg;
 import "csema_ice.ax" as csi;
 import "csema_marks.ax" as csm;
+import "csema_named.ax" as cn;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -97,7 +99,14 @@ pub fn value_of(e: *mut cast.Expr) *mut cast.Expr {
             cs.err(e.span, "C3007", u.f1("the value of an object of incomplete type %s is used", cs.tq(t)));
             return bad(e);
         }
-        return conv(e, cast.CV_LOAD, cty.unqual(t));
+        let c = conv(e, cast.CV_LOAD, cty.unqual(t));
+        let bm = cb.member(e);
+        if u.notnil(bm) {
+            // (a bit-field's value is promoted by its width: 6.3.1.1p2)
+            return convert(c, cb.promoted(bm));
+        }
+        cn.fold_load(c);
+        return c;
     }
     return e;
 }
@@ -468,8 +477,7 @@ pub fn check(e: *mut cast.Expr) *mut cast.Expr {
         return size_align(e);
     }
     if k == cast.ExprKind.COMPOUND {
-        cs.unsupported(e.span, "a compound literal");
-        return bad(e);
+        return cs.hooks.compound(e);
     }
     return csg.generic(e, check, rv);
 }
@@ -487,7 +495,7 @@ fn ident(e: *mut cast.Expr) *mut cast.Expr {
     s.used = true;
     csm.referred(s, e.span);
     if s.kind == cast.SK_ENUMCONST {
-        e.ty = cty.t_int;
+        e.ty = s.ty;
         e.is_const = true;
         e.cval = s.value;
         return e;
@@ -529,7 +537,7 @@ fn func_name(e: *mut cast.Expr) *mut cast.Expr {
         s.duration = cast.SD_STATIC;
         s.defined = true;
         s.init = u.new.[cast.InitList]();
-        s.init.items.push(cast.InitItem.{ off: 0, ty: t, e: str });
+        s.init.items.push(cast.InitItem.{ off: 0, ty: t, e: str, bits: u.nil.[cty.Member]() });
         cs.add_object(s);
         g_func_names.put(key, s);
     }
@@ -558,6 +566,10 @@ fn unary(e: *mut cast.Expr) *mut cast.Expr {
         }
         if not a.lvalue {
             cs.err(a.span, "C3026", "the operand of '&' is not an lvalue");
+            return bad(e);
+        }
+        if u.notnil(cb.member(a)) {
+            cs.err(e.span, "C3070", u.f1("the address of the bit-field '%s' is taken", a.mem.name));
             return bad(e);
         }
         let reg = csm.register_object(a);
@@ -622,7 +634,7 @@ fn incdec(e: *mut cast.Expr) *mut cast.Expr {
     }
     let t = a.ty;
     if cty.is_arith(t) {
-        e.opty = cty.promote(t);
+        e.opty = cb.promote_lvalue(a);
     } else if object_pointer(t) {
         e.opty = cty.unqual(t);
     } else {
@@ -835,7 +847,7 @@ fn assign(e: *mut cast.Expr) *mut cast.Expr {
         }
     } else if (op == ct.P_SHL_EQ) or (op == ct.P_SHR_EQ) {
         if cty.is_integer(lt) and cty.is_integer(tb) {
-            e.opty = cty.promote(lt);
+            e.opty = cb.promote_lvalue(a);
             e.b = convert(b, cty.promote(tb));
             return e;
         }
@@ -847,7 +859,7 @@ fn assign(e: *mut cast.Expr) *mut cast.Expr {
 }
 
 fn compound_arith(e: *mut cast.Expr) *mut cast.Expr {
-    let t = cty.common_type(e.a.ty, e.b.ty);
+    let t = cty.common_type(cb.promote_lvalue(e.a), e.b.ty);
     e.opty = t;
     e.b = convert(e.b, t);
     return e;
@@ -1162,6 +1174,10 @@ fn size_align(e: *mut cast.Expr) *mut cast.Expr {
         let a = check(e.a);
         e.a = a;
         if is_err(a) {
+            return bad(e);
+        }
+        if u.notnil(cb.member(a)) {
+            cs.err(e.span, "C3070", u.f1("'sizeof' of the bit-field '%s'", a.mem.name));
             return bad(e);
         }
         t = a.ty;

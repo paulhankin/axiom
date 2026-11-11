@@ -1,0 +1,133 @@
+// =============================================================================
+// csema_bits.ax - bit-fields and the layout of structures and unions
+// (6.7.2.1): where each member goes, with bit-fields packed into storage
+// units, alignment specifiers on members, and the integer promotion of a
+// bit-field's value (6.3.1.1p2). It imports only the types, so that both
+// declarations and expressions can use it.
+//
+// Layout (the implementation's choices, the same on every target): a
+// bit-field of type T (of size and alignment S bytes) goes at the next bit
+// if it fits in the S-byte unit, aligned to S, that holds that bit;
+// otherwise it starts the next such unit. A bit-field never straddles two
+// units, so it is reached by loading and storing its unit (Member.offset,
+// .bit_off: bits from the least significant end). An unnamed bit-field of
+// width 0 moves the next member to the next unit of its type; unnamed
+// bit-fields take space but do not add to the alignment of the structure
+// (a named one adds its type's). A plain `int` bit-field is signed (6.7.2p5
+// leaves it to the implementation), as every other int is. Other members
+// go at the next byte that is a multiple of their alignment (with an
+// alignment specifier: the stricter of its and their type's).
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "ctypes.ax" as cty;
+
+/// The bit-field that expression e designates (a member access), or nil.
+pub fn member(e: *cast.Expr) *mut cty.Member {
+    if (e.kind == cast.ExprKind.MEMBER) and u.notnil(e.mem) and e.mem.is_bitfield {
+        return e.mem;
+    }
+    return u.nil.[cty.Member]();
+}
+
+/// The type the value of bit-field m promotes to (6.3.1.1p2): int if int
+/// holds every value of its width, else unsigned int, for the types of rank
+/// up to int's; a wider type is its own promotion.
+pub fn promoted(m: *cty.Member) *mut cty.CType {
+    let t = cty.promote(m.ty);
+    if t.rank > cty.t_int.rank {
+        return t;
+    }
+    let w = m.bit_width;
+    let sg = m.ty.is_signed and (m.ty.kind != cty.TK_BOOL);
+    if (w < cty.t_int.bits) or ((w == cty.t_int.bits) and sg) {
+        return cty.t_int;
+    }
+    return cty.t_uint;
+}
+
+/// The type an operation on lvalue e's value is done in: its promoted type,
+/// a bit-field's as `promoted` says.
+pub fn promote_lvalue(e: *cast.Expr) *mut cty.CType {
+    let m = member(e);
+    if u.notnil(m) {
+        return promoted(m);
+    }
+    return cty.promote(e.ty);
+}
+
+/// The alignment of member m: its type's, or an alignment specifier's if stricter.
+pub fn member_align(m: *cty.Member) u64 {
+    let a = cty.align_of(m.ty);
+    if m.align > a {
+        return m.align;
+    }
+    return a;
+}
+
+/// Lays out a structure or union whose members are in ti.members (their
+/// types complete, but a structure's last may be an array without a length:
+/// a flexible array member; bit-fields with their widths): sets their
+/// offsets, its size and alignment, and makes it complete.
+pub fn layout(ti: *mut cty.TagInfo) void {
+    let is_union = ti.kind == cty.TK_UNION;
+    let mut pos: u64 = 0;  // a structure: the next free bit
+    let mut al: u64 = 1;
+    let mut size: u64 = 0;  // a union: its largest member
+    for m in ti.members.items() {
+        if m.is_bitfield {
+            let ub = cty.size_of(m.ty) * 8;  // the unit's bits
+            let w = @as(u64, @bit_cast(u32, m.bit_width));
+            if (m.name.len > 0) and (cty.align_of(m.ty) > al) {
+                al = cty.align_of(m.ty);
+            }
+            if is_union {
+                m.offset = 0;
+                m.bit_off = 0;
+                if (w + 7) / 8 > size {
+                    size = (w + 7) / 8;
+                }
+                continue;
+            }
+            if w == 0 {
+                pos = cty.round_up(pos, ub);
+                m.offset = pos / 8;
+                m.bit_off = 0;
+                continue;
+            }
+            let mut unit = pos / ub * ub;
+            if pos + w > unit + ub {
+                pos = cty.round_up(pos, ub);
+                unit = pos;
+            }
+            m.offset = unit / 8;
+            m.bit_off = @bit_cast(i32, @truncate(u32, pos - unit));
+            pos += w;
+            continue;
+        }
+        let ma = member_align(m);
+        let ms = cty.size_of(m.ty);
+        if ma > al {
+            al = ma;
+        }
+        if is_union {
+            m.offset = 0;
+            if ms > size {
+                size = ms;
+            }
+        } else {
+            let off = cty.round_up((pos + 7) / 8, ma);
+            m.offset = off;
+            pos = (off + ms) * 8;
+            if (m.ty.kind == cty.TK_ARRAY) and not m.ty.has_len {
+                ti.has_flex = true;
+            }
+        }
+    }
+    if not is_union {
+        size = (pos + 7) / 8;
+    }
+    ti.size = cty.round_up(size, al);
+    ti.align = al;
+    ti.complete = true;
+}

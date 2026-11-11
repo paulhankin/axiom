@@ -1,0 +1,99 @@
+// =============================================================================
+// csema_named.ax - named constants (C23 6.6p7): an object declared
+// constexpr, and a member of one reached by '.', is a constant expression
+// where its value is used. The value is the object's initializer's (its
+// normal form, CSym.init); the lvalue conversion of such an lvalue gets
+// is_const and the value (cval or fcval), the lvalue itself does not (a
+// MEMBER's cval is its offset).
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// The constexpr object lvalue e designates (or a member of), and where.
+struct Root {
+    sym: *mut cast.CSym,
+    off: u64,
+}
+
+fn root(e: *cast.Expr) Root {
+    if (e.kind == cast.ExprKind.IDENT) and u.notnil(e.sym) and (e.sym.kind == cast.SK_OBJECT) and
+       ((e.sym.flags & cast.CF_CONSTEXPR) != 0) {
+        return Root.{ sym: e.sym, off: 0 };
+    }
+    if (e.kind == cast.ExprKind.COMPOUND) and u.notnil(e.sym) and ((e.sym.flags & cast.CF_CONSTEXPR) != 0) {
+        return Root.{ sym: e.sym, off: 0 };
+    }
+    if (e.kind == cast.ExprKind.MEMBER) and (e.op == ct.P_DOT) and u.notnil(e.mem) {
+        // (only '.': p->m is not a named constant)
+        let r = root(e.a);
+        if u.notnil(r.sym) {
+            return Root.{ sym: r.sym, off: r.off + e.cval };
+        }
+    }
+    return Root.{ sym: u.nil.[cast.CSym](), off: 0 };
+}
+
+/// The constexpr object that lvalue e is (or a member of, at `off`): a
+/// named constant of structure or union type; nil sym if none.
+pub struct Object {
+    sym: *mut cast.CSym,
+    off: u64,
+}
+
+pub fn object_of(e: *cast.Expr) Object {
+    let r = root(e);
+    if u.isnil(r.sym) or u.isnil(r.sym.init) {
+        return Object.{ sym: u.nil.[cast.CSym](), off: 0 };
+    }
+    return Object.{ sym: r.sym, off: r.off };
+}
+
+/// Gives c, the lvalue conversion of c.a, the value of c.a if c.a is a
+/// named constant of arithmetic type.
+pub fn fold_load(c: *mut cast.Expr) void {
+    let e = c.a;
+    if u.isnil(e.ty) or not cty.is_arith(e.ty) {
+        return;
+    }
+    let r = root(e);
+    if u.isnil(r.sym) or u.isnil(r.sym.init) {
+        return;
+    }
+    let mut bits = u.nil.[cty.Member]();
+    if e.kind == cast.ExprKind.MEMBER {
+        bits = e.mem;
+        if not bits.is_bitfield {
+            bits = u.nil.[cty.Member]();
+        }
+    }
+    // the last item for that subobject (a later one overrides), else zero
+    let items = r.sym.init.items.items();
+    let mut k = items.len;
+    while k > 0 {
+        k -= 1;
+        let it = items[k];
+        if (it.off == r.off) and (it.bits == bits) and cty.is_arith(it.ty) and (cty.unqual(it.ty) == cty.unqual(e.ty)) {
+            if not it.e.is_const {
+                return;
+            }
+            c.is_const = true;
+            c.cval = it.e.cval;
+            c.fcval = it.e.fcval;
+            if u.notnil(bits) {
+                c.cval = cty.wrap_bits(it.e.cval, bits.bit_width, e.ty.is_signed and (e.ty.kind != cty.TK_BOOL));
+            }
+            return;
+        }
+        // an item covering the subobject another way (a whole structure copied): not known here
+        if (it.off <= r.off) and (r.off < it.off + cty.size_of(it.ty)) and not cty.is_arith(it.ty) {
+            return;
+        }
+    }
+    if r.sym.init.zero or (items.len == 0) {
+        c.is_const = true;
+        c.cval = 0;
+        c.fcval = 0.0;
+    }
+}

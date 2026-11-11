@@ -63,13 +63,28 @@ pub let mut F: *mut FnState = @ptr_from_int(*mut FnState, 0);
 /// The code generation of a function's body (cgen_stmt.ax).
 pub struct Hooks {
     body: fn(*mut cast.CSym) void,
+    local_init: fn(*mut cast.CSym, *mut ir.Value) void,  // stores an automatic object's initializer at its address
 }
 
 fn no_body(s: *mut cast.CSym) void {
     _ = s;
 }
 
-pub let mut hooks: Hooks = Hooks.{ body: no_body };
+fn no_local_init(s: *mut cast.CSym, p: *mut ir.Value) void {
+    _ = s;
+    _ = p;
+}
+
+pub let mut hooks: Hooks = Hooks.{ body: no_body, local_init: no_local_init };
+
+/// The alignment of object s: its type's, or an alignment specifier's if stricter.
+pub fn object_align(s: *cast.CSym) u64 {
+    let a = cty.align_of(s.ty);
+    if s.align > a {
+        return s.align;
+    }
+    return a;
+}
 
 let mut strings: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
                                                                        vals: @ptr_from_int(*mut *mut ir.Value, 0),
@@ -368,7 +383,7 @@ pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
     if u.isnil(g) {
         g = ir.add_global(M, lty(s.ty), name);
     }
-    g.align = cty.align_of(s.ty);
+    g.align = object_align(s);
     if s.linkage != cast.LK_EXTERNAL {
         g.linkage = ir.LINK_INTERNAL;
     }
@@ -434,6 +449,27 @@ fn put_le(im: *mut Image, off: u64, v: u64, n: u64) void {
     }
 }
 
+// Writes value v of bit-field m into the bytes of its unit at off
+// (little-endian), keeping the other bits.
+fn put_bits(im: *mut Image, off: u64, m: *cty.Member, v: u64) void {
+    let n = cty.size_of(m.ty);
+    let mut x: u64 = 0;
+    for i in 0..n {
+        let at = @truncate(usize, off + i);
+        if at < im.bytes.len {
+            x = x | (@as(u64, im.bytes[at]) << @truncate(u32, i * 8));
+        }
+    }
+    let sh = @as(u32, @bit_cast(u32, m.bit_off));
+    let mut mk: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    if m.bit_width < 64 {
+        mk = (@as(u64, 1) << @as(u32, @bit_cast(u32, m.bit_width))) - 1;
+    }
+    mk = mk << sh;
+    x = (x & ~mk) | ((v << sh) & mk);
+    put_le(im, off, x, n);
+}
+
 // The address constant a as an IR constant (a global or function's
 // address with an addend), or nil for a plain integer.
 fn addr_value(a: cc.Addr) *mut ir.Value {
@@ -485,6 +521,10 @@ fn put_item(im: *mut Image, it: *cast.InitItem) void {
         return;
     }
     if cty.is_integer(t) and e.is_const {
+        if u.notnil(it.bits) {
+            put_bits(im, it.off, it.bits, e.cval);
+            return;
+        }
         put_le(im, it.off, e.cval, size);
         return;
     }
@@ -563,7 +603,7 @@ fn define_object(s: *mut cast.CSym) void {
     let init = initial_value(s);
     g.ty = init.ty;
     g.init = init;
-    g.align = cty.align_of(s.ty);
+    g.align = object_align(s);
 }
 
 // -----------------------------------------------------------------------------
@@ -605,6 +645,13 @@ pub fn br(b: *mut ir.Block) void {
 
 /// A new object of type t in the function's frame (its entry block).
 pub fn alloca(t: *mut cty.CType, name: []u8) *mut ir.Value {
+    if cty.align_of(t) > 16 {
+        return aligned_alloca(t, name, 0);
+    }
+    return frame_object(t, name);
+}
+
+fn frame_object(t: *mut cty.CType, name: []u8) *mut ir.Value {
     let cur = ir.insert_block(B);
     let term = ir.terminator(F.entry);
     if u.notnil(term) {
@@ -623,6 +670,38 @@ pub fn alloca(t: *mut cty.CType, name: []u8) *mut ir.Value {
     }
     ir.at_end(B, cur);
     return a;
+}
+
+/// A new object of type t in the function's frame aligned to `al` (an
+/// alignment specifier's, or 0). Frames are aligned to 16 bytes: a stricter
+/// alignment takes room for the object and the padding before it, and the
+/// object's address is the first suitably aligned one in it.
+pub fn aligned_alloca(t: *mut cty.CType, name: []u8, al0: u64) *mut ir.Value {
+    let mut al = al0;
+    if cty.align_of(t) > al {
+        al = cty.align_of(t);
+    }
+    if al <= 16 {
+        let a = frame_object(t, name);
+        if @as(u64, a.align) < al {
+            a.align = @truncate(u32, al);
+        }
+        return a;
+    }
+    let raw = frame_object(cty.array_of(cty.t_uchar, cty.size_of(t) + al, true), name);
+    raw.align = 16;
+    let cur = ir.insert_block(B);
+    // (in the entry block, after the frame's objects: it dominates every use)
+    let term = ir.terminator(F.entry);
+    if u.notnil(term) {
+        ir.at_before(B, term);
+    } else {
+        ir.at_end(B, F.entry);
+    }
+    let pad = ir.and_(B, ir.sub(B, usz(0), ir.ptrtoint(B, raw, T_isz)), usz(al - 1));
+    let p = ir.ptradd(B, raw, pad);
+    ir.at_end(B, cur);
+    return p;
 }
 
 /// An integer constant of pointer width.
