@@ -1,14 +1,16 @@
-# The C front end: design and plan
+# The C front end: design
 
-Work in progress, on a branch. `axiom build file.c` compiles a C translation unit with
-the compiler's own optimizer, backends and linkers. This file is the design the pieces
-are written against; `docs/c.md` (to come) is for users.
+`axiom build file.c` compiles C translation units with the compiler's own optimizer,
+backends and linkers. This file is the design of the front end, for those who work on
+it; [`docs/c.md`](c.md) is for users and [`docs/c-diagnostics.md`](c-diagnostics.md)
+lists the diagnostics.
 
 ## Scope
 
 - **Standards**: C89/C90, C95 (Amendment 1), C99, C11, C17 and C23, chosen with
   `--c-std=`. Each mode accepts its standard's language and rejects what a later one
-  added or its own removed (C23 has no K&R definitions, no implicit `int`).
+  added or its own removed (C99 has no implicit `int` or implicit function
+  declarations, C23 no K&R definitions).
 - **Freestanding**: no C library. The compiler provides the headers a freestanding
   implementation must (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`,
   `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdnoreturn.h>`, and
@@ -77,11 +79,12 @@ are written against; `docs/c.md` (to come) is for users.
 cmd/axiom/src/c/copts.ax    options: the standard, the implementation's choices
 cmd/axiom/src/c/ctok.ax     the tokens the preprocessor hands the parser
 cmd/axiom/src/c/cpp.ax      preprocessor and lexer (phases 1-6)            (+ cpp_*.ax)
-cmd/axiom/src/c/cast.ax     the syntax tree
-cmd/axiom/src/c/cparse.ax   parser                                         (+ cparse_*.ax)
+cmd/axiom/src/c/cast.ax     the syntax tree                          (+ cast_dump.ax)
+cmd/axiom/src/c/cparse.ax   parser
 cmd/axiom/src/c/ctypes.ax   C types, layout, conversions
+cmd/axiom/src/c/cconst.ax   constant expressions
 cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree
-cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax)
+cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conventions
 cmd/axiom/src/c/cc.ax       the driver
 std/c/include/              the compiler's headers
 cmd/axiom/internal/tests/c/ tests
@@ -132,10 +135,10 @@ axiom check file.c...           the units are analyzed and linked, nothing is wr
 ```
 
 The other options of `axiom build` that apply: `--target`, `--cpu`, `--features`,
-`-O0`..`-O3`, `--stack-traces` (C functions' calls have call-site records, so
-native stack traces show C frames with their lines), `-g` (accepted: this
-compiler writes line tables for no code), `-l`, `-L`, `--link=` (objects,
-libraries, and C sources for the system's C compiler), `--subsystem`, `--icon`,
+`-O0`..`-O3`, `--stack-traces` (on native targets C functions' calls have call-site
+records, so stack traces show C frames with their lines; on WebAssembly they have none),
+`-g` (accepted: this compiler writes line tables for no code), `-l`, `-L`, `--link=`
+(objects, libraries, and C sources for the system's C compiler), `--subsystem`, `--icon`,
 `--pdb`. Those of Axiom code (`--overflow`, `--sanitize`, `--coverage`,
 `--units`, `--emit-header`, `--link=file.ax`) are errors with C sources, as are the
 C options without one, Axiom and C sources together, and `axiom test`, `profile`,
@@ -174,7 +177,7 @@ comments, so that they are valid in every standard:
 ```c
 /* flags: --c-std=c89 */
 /* expect: 42 */            one line of expected output, in order
-/* expect-error: C3012 */   the build must fail with this code
+/* expect-error: C3022 */   the build must fail with this code
 /* expect-warning: C4040 */ the build must warn with this code
 /* check-only */            only checked (axiom check, with the flags' --target)
 /* linux-only */            natively, only where host_native.c is linked
@@ -194,10 +197,19 @@ tests compare `--emit=c-ast` with a `.ast` file.
 
 ## Phases
 
-1. Preprocessor and lexer; syntax tree and parser. (parallel)
-2. The core: types and layout, the typed tree, IR generation for the scalar types,
-   pointers, arrays, structures, functions, the statements; program start-up.
-3. Completion, by area (parallel): expressions; declarations, initializers and layout;
-   control flow, `goto`, variable-length arrays; variadic functions and the headers.
-4. Each standard's particulars, diagnostics for constraint violations, documentation,
-   larger programs.
+A translation unit goes through these, in order. Errors in the first four stages stop
+the build before code is generated; the parser and the analysis go on after an error to
+report more.
+
+1. **Preprocessing and lexing** (`cpp*.ax`): translation phases 1 to 6, ending in the
+   tokens of `ctok.ax`. `--emit=c-pp` and `--emit=c-tokens` stop here.
+2. **Parsing** (`cparse.ax`): the syntax tree, with typedef names resolved and no types.
+   `--emit=c-ast` stops here.
+3. **Semantic analysis** (`csema*.ax`, `ctypes.ax`, `cconst.ax`): the typed tree and the
+   constraint diagnostics. `axiom check` stops here, after step 4.
+4. **Link check** (`cc.ax`, `link_check`): once all the units are analyzed, one
+   definition of each external name and one `main`.
+5. **IR generation** (`cgen*.ax`): the typed tree of each unit into the IR module of the
+   start-up (`c_start.ax`) or of the object (`c_object.ax`). The few diagnostics that
+   only this stage can give (`C3062`, `C4053`) come here.
+6. **The compiler's back end**: optimization, code generation and linking, as for Axiom.

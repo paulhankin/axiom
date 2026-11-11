@@ -57,6 +57,7 @@ axiom profile prog.ax                             # sampling profiler: hot funct
 axiom build prog.ax --sanitize=address            # trap on use after free, double free, overflows; report leaks
 axiom build app --verbose                         # modules compile separately and are cached (spec §16.7)
 axiom lsp                                         # the language server, for editors (docs/editors.md)
+axiom build prog.c --c-std=c11 -o prog            # C, with the compiler's own front end (docs/c.md)
 ```
 
 [`docs/cli.md`](docs/cli.md) lists every command, flag and environment variable.
@@ -76,6 +77,9 @@ the test suite.
 | [`docs/install.md`](docs/install.md) | Installing a release, a first program, building from source |
 | [`docs/tour.md`](docs/tour.md) | A tour of the language: values, slices, structs and unions, errors, memory, generics, tests, SIMD |
 | [`docs/cli.md`](docs/cli.md) | The `axiom` command: every command and flag, environment variables, the cache, exit codes |
+| [`docs/c.md`](docs/c.md) | Compiling C: `axiom build file.c`, the standards (C89 to C23), the implementation-defined choices, the headers, what is not supported |
+| [`docs/c-diagnostics.md`](docs/c-diagnostics.md) | Every diagnostic code of the C front end |
+| [`docs/c-frontend.md`](docs/c-frontend.md) | The design of the C front end |
 | [`docs/editors.md`](docs/editors.md) | Editor support: the VS Code extension, and `axiom lsp` with Neovim, Helix and Emacs |
 | [`docs/spec.md`](docs/spec.md) | The language specification (v0.1 working draft) |
 | [`docs/comparison.md`](docs/comparison.md) | Axiom compared with Zig, Rust, C++ and C |

@@ -9,6 +9,8 @@ promised.
 ```
 axiom build   <file.ax | package dir> [options] -o <out>
 axiom check   <file.ax | package dir> [options]
+axiom build   <file.c>... [options] [-o <out>]     (C sources: docs/c.md)
+axiom check   <file.c>... [options]
 axiom test    <file.ax | package dir> [options] [--filter=<text>] [--timeout=<ms>] [--show-output]
 axiom profile <file.ax | package dir> [options] [--rate=<hz>] [--folded=<path>] [-- <program args>]
 axiom fmt     <file.ax | dir>... [--check] [--stdout]
@@ -26,11 +28,12 @@ With no arguments, `axiom` prints a summary of this page and exits with status 2
 ### `axiom build`
 
 Compiles a program. The input is a `.ax` file, a package directory (one with an
-`axiom.toml`, whose entry module is built), or nothing, meaning the package in the
-current directory. The output (`-o`) is an executable for native targets, a `.wasm`
-module for WebAssembly, or an object or text file with `--emit`. Without `-o` a package
-builds to a file named after the package. Modules are compiled separately and cached by
-default at `-O0` and `-O1` (spec §16.7; `--units`).
+`axiom.toml`, whose entry module is built), nothing, meaning the package in the current
+directory, or one or more `.c` files, which are C translation units of one program
+(see [C sources](#c-sources)). The output (`-o`) is an executable for native targets, a
+`.wasm` module for WebAssembly, or an object or text file with `--emit`. Without `-o` a
+package builds to a file named after the package. Modules are compiled separately and
+cached by default at `-O0` and `-O1` (spec §16.7; `--units`).
 
 ### `axiom check`
 
@@ -149,13 +152,32 @@ that lacks the extensions it was built with.
 | `--emit-header=<file.h>` | Also write a C header for the program's `export`ed functions (spec §14.5). |
 | `--format=human\|agent-json` | Diagnostics as text on stderr, or as one JSON object on stdout (spec §16.2). |
 
+### C sources
+
+Options for `axiom build` and `axiom check` with `.c` inputs, which are compiled by the
+compiler's own C front end ([`docs/c.md`](c.md)). They are errors with Axiom inputs.
+
+| Option | |
+|---|---|
+| `--c-std=<std>` | `c89` (`c90`), `c95`, `c99`, `c11`, `c17` (`c18`) or `c23`; default `c17`. |
+| `--c-char=signed\|unsigned` | Whether plain `char` is signed (default: the target's C ABI). |
+| `--c-int=16\|32\|64` | The width of `int` (default 32). |
+| `--c-long=32\|64` | The width of `long` (default: the target's C ABI). |
+| `-D<name>[=<value>]`, `-U<name>` | Define or undefine a macro. |
+| `-I<dir>` | An include directory. |
+| `--emit=c-pp\|c-tokens\|c-ast` | The preprocessed text, the tokens, or the syntax tree, of one source. |
+
+With C sources, `--emit=obj` and `--emit=ir` of units that define no `main` give their
+code alone. `--overflow`, `--sanitize`, `--coverage`, `--units`, `--emit-header` and
+`--link=<file.ax>` are errors.
+
 ### Linking
 
 | Option | |
 |---|---|
 | `--link=<file>` | Link a C source, object, archive or `.ax` module into the program. C sources are compiled with `cc`; the compiled runtime objects are cached. |
 | `-l<lib>`, `-L<dir>` | A library to link and a directory to search, passed to the system linker (native targets with C code). |
-| `-I<dir>` | An include directory for C sources given with `--link`. |
+| `-I<dir>` | An include directory, for C sources given with `--link` and for the C front end's inputs. |
 
 Programs for native targets that link no C code are linked by the compiler's own
 linkers and are static executables; with C code or `-l` the system's `cc` links them.

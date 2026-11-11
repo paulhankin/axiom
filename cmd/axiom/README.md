@@ -377,6 +377,7 @@ types share a module.
 | `fmt.ax` | | `axiom fmt`: canonical layout from the token stream, imports tidied |
 | `ide.ax` | | `axiom ide`: answers an editor's questions (diagnostics, hover, definitions, references, rename, completion, signatures, outline, formatting) from the checked tree, with unsaved buffers on stdin |
 | `lsp.ax` | | `axiom lsp`: the Language Server Protocol over stdio, one `axiom ide` process per request (VS Code client in [`tools/editors/vscode`](../../tools/editors/vscode/README.md)) |
+| `c/` | | the C front end, `axiom build file.c`: preprocessor, parser, semantic analysis and IR generation for C89 to C23, in the compiler only ([`docs/c.md`](../../docs/c.md), design in [`docs/c-frontend.md`](../../docs/c-frontend.md)) |
 
 ## How C idioms map to Axiom
 
