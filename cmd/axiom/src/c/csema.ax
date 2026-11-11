@@ -49,7 +49,8 @@
 //     generation may use the value instead of the tree.
 //   - Objects with initializers have them in normal form (CSym.init: a list
 //     of (offset, type, expression), and the bit-field, if it is one; a later
-//     item for the same bytes overrides an earlier one); CSym.align is an
+//     item for the same bytes overrides an earlier one; an item without an
+//     expression makes its subobject zero); CSym.align is an
 //     alignment specifier's (0 if none), CSym.flags says register,
 //     constexpr and thread_local (thread storage is static storage); a SWITCH lists its cases (Stmt.cases),
 //     each CASE its value (Stmt.cval); LABEL and GOTO have the label's CSym.
@@ -82,11 +83,13 @@
 //   C3033  an invalid initializer
 //   C3034  an integer constant too large for any type
 //   C3035  a constant expression is needed
+//   C3036  a constant expression whose evaluation overflows (a signed integer operation: 6.6p4)
 //   C3040  case or default outside a switch statement
 //   C3041  a duplicate case value or default label
 //   C3042  break outside a loop or switch, continue outside a loop
 //   C3043  a label that is used but not defined
 //   C3044  a return statement with or without a value where the function says otherwise
+//   C3045  a function with internal linkage used in an expression but not defined (6.9p3)
 //   C3050  a static assertion that fails
 //   C3060  a call of an undeclared function (C99 and later)
 //   C3061  a definition of main of a form that is not supported
@@ -181,7 +184,29 @@ struct State {
     linked: u.SymMap.[*mut cast.CSym],  // the entities with linkage, by name
     unit: *mut CUnit,
     next_uid: i32,
-    cur_fn: *mut cast.CSym,  // the function whose body is being analyzed
+    cur_fn: *mut cast.CSym,       // the function whose body is being analyzed
+    internal_uses: u.List.[Use],  // functions with internal linkage used before their definition
+    unevaluated: i32,             // inside the operand of sizeof or _Alignof
+}
+
+// A function used in an expression (6.9p3), and where.
+struct Use {
+    sym: *mut cast.CSym,
+    span: u.Span,
+}
+
+/// Identifier s is used at sp in an expression: one with internal linkage
+/// must then be defined in the unit (6.9p3), which is checked at its end.
+pub fn used_at(s: *mut cast.CSym, sp: u.Span) void {
+    if (s.kind == cast.SK_FUNC) and (s.linkage == cast.LK_INTERNAL) and not s.defined and (S.unevaluated == 0) {
+        S.internal_uses.push(Use.{ sym: s, span: sp });
+    }
+}
+
+/// Enters (+1) or leaves (-1) the operand of sizeof or _Alignof, whose
+/// identifiers are not used in the sense of 6.9p3.
+pub fn unevaluated(delta: i32) void {
+    S.unevaluated += delta;
 }
 
 let mut S: *mut State = @ptr_from_int(*mut State, 0);
@@ -419,6 +444,16 @@ pub fn run(t: *mut cast.Unit, o: *co.COptions) *mut CUnit {
     S.next_uid = g_uid_base;
     for d in t.decls.items() {
         hooks.external(d);
+    }
+    // (6.9p3: a function with internal linkage used is defined; reported at its first use)
+    let mut told = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    for x in S.internal_uses.items() {
+        let k = u.addr_key(@int_from_ptr(x.sym));
+        if not x.sym.defined and (told.get(k) == 0) {
+            told.put(k, 1);
+            err_note(x.span, "C3045", u.f1("the function '%s' has internal linkage and is used, but is not defined",
+                                           x.sym.name), x.sym.span, "declared here");
+        }
     }
     // tentative definitions with no definition are definitions with a zero
     // initializer (6.9.2p2): an array without a length gets one element

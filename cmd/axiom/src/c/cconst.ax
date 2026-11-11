@@ -9,10 +9,14 @@
 // fcval (a floating value; a float's is rounded to float). fold runs on a
 // node once its operands are typed and converted, so constness is found
 // bottom-up; operations whose result is undefined (division by zero, an
-// overflowing conversion of a floating value) are left to run time.
+// overflowing conversion of a floating value) are left to run time. A
+// signed integer operation that overflows gives the wrapped value, and
+// marks the expression (ovf, carried up through the operands evaluated):
+// where a constant expression is required that is an error (6.6p4).
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "copts.ax" as co;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -27,6 +31,7 @@ pub fn fold(e: *mut cast.Expr) void {
     if k == cast.ExprKind.CAST {
         if (e.op == cast.CV_VALUE) and e.a.is_const and cty.is_arith(e.a.ty) {
             convert(e, e.a);
+            e.ovf = e.a.ovf;
         } else if (e.op == cast.CV_VALUE) and (e.a.kind == cast.ExprKind.NULLPTR) {
             set_int(e, 0);  // nullptr to bool: false
         } else if (e.op == cast.CV_VALUE) and (e.ty.kind == cty.TK_BOOL) and (e.a.ty.kind == cty.TK_POINTER) {
@@ -39,6 +44,7 @@ pub fn fold(e: *mut cast.Expr) void {
     } else if k == cast.ExprKind.UNARY {
         if e.a.is_const {
             unary(e);
+            e.ovf = e.ovf or e.a.ovf;
         }
     } else if k == cast.ExprKind.BINARY {
         binary(e);
@@ -48,6 +54,7 @@ pub fn fold(e: *mut cast.Expr) void {
             let x = pick(c, e.b, e.c);
             if x.is_const {
                 set_from(e, x);
+                e.ovf = e.a.ovf or x.ovf;
             }
         }
     }
@@ -183,6 +190,7 @@ fn unary(e: *mut cast.Expr) void {
     }
     if op == ct.P_MINUS {
         set_int(e, 0 -% x.cval);
+        e.ovf = e.ty.is_signed and (x.cval != 0) and (e.cval == x.cval);  // (the most negative value)
     } else if op == ct.P_PLUS {
         set_int(e, x.cval);
     } else if op == ct.P_TILDE {
@@ -202,16 +210,20 @@ fn binary(e: *mut cast.Expr) void {
         let ta = truth(a);
         if (op == ct.P_ANDAND) and not ta {
             set_int(e, 0);
+            e.ovf = a.ovf;
         } else if (op == ct.P_OROR) and ta {
             set_int(e, 1);
+            e.ovf = a.ovf;
         } else if b.is_const and cty.is_arith(b.ty) {
             set_int(e, selu(truth(b), 1, 0));
+            e.ovf = a.ovf or b.ovf;
         }
         return;
     }
     if not a.is_const or not b.is_const or not cty.is_arith(a.ty) or not cty.is_arith(b.ty) {
         return;
     }
+    e.ovf = a.ovf or b.ovf;
     if is_compare(op) {
         set_int(e, selu(compare(op, a, b), 1, 0));
         return;
@@ -233,7 +245,49 @@ fn binary(e: *mut cast.Expr) void {
     let r = int_op(op, e.ty, a.cval, b.cval);
     if r.ok {
         set_int(e, r.v);
+        e.ovf = e.ovf or (e.ty.is_signed and overflows(op, e.ty, a.cval, b.cval));
     }
+}
+
+// Does signed x op y (sign-extended bits) overflow type t (6.5p5)? For <<,
+// from C99 on, a negative x or a result not representable (6.5.7p4).
+fn overflows(op: i32, t: *cty.CType, x: u64, y: u64) bool {
+    let a = @bit_cast(i64, x);
+    let b = @bit_cast(i64, y);
+    let lo = @bit_cast(i64, cty.wrap(t, @as(u64, 1) << @truncate(u32, @bit_cast(u32, t.bits) - 1)));
+    let hi = @bit_cast(i64, cty.int_max(t));
+    if op == ct.P_PLUS {
+        if b >= 0 {
+            return a > hi - b;
+        }
+        return a < lo - b;
+    }
+    if op == ct.P_MINUS {
+        if b >= 0 {
+            return a < lo + b;
+        }
+        return a > hi + b;
+    }
+    if op == ct.P_STAR {
+        if (a == 0) or (b == 0) {
+            return false;
+        }
+        if (a == -1) or (b == -1) {
+            return (a == lo) or (b == lo);
+        }
+        let p = a *% b;
+        return ((p / b) != a) or (p < lo) or (p > hi);
+    }
+    if (op == ct.P_SLASH) or (op == ct.P_PERCENT) {
+        return (a == lo) and (b == -1);
+    }
+    if (op == ct.P_SHL) and (cty.std() >= co.C99) {
+        if a < 0 {
+            return true;
+        }
+        return a > (hi >> @truncate(u32, y));
+    }
+    return false;
 }
 
 pub fn is_compare(op: i32) bool {

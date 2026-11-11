@@ -86,8 +86,8 @@ pub fn value_of(e: *mut cast.Expr) *mut cast.Expr {
         }
         let reg = csm.register_object(e);
         if u.notnil(reg) {
-            cs.err(e.span, "C3222", u.f1("the array '%s', declared register, is used as a pointer (its address)",
-                                         reg.name));
+            cs.err(e.span, "C3222", u.f1("the array %s, declared register, is used as a pointer (its address)",
+                                         reg_name(reg)));
             return bad(e);
         }
         return conv(e, cast.CV_ADECAY, cty.pointer_to(t.elem));
@@ -157,7 +157,28 @@ pub fn ice(e: *mut cast.Expr, what: []u8) Ice {
         cs.err(x.span, "C3035", u.cat2(what, " must be an integer constant expression"));
         return Ice.{ ok: false, v: 0, e: x };
     }
+    if not const_in_range(x) {
+        return Ice.{ ok: false, v: 0, e: x };
+    }
     return Ice.{ ok: true, v: x.cval, e: x };
+}
+
+// How a diagnostic names object s: 'name', or a compound literal (C23: register).
+fn reg_name(s: *cast.CSym) []u8 {
+    if u.str_eq(s.name, "__compound_literal") {
+        return "a compound literal";
+    }
+    return u.f1("'%s'", s.name);
+}
+
+/// Is constant expression x's value in range (6.6p4)? If a signed integer
+/// operation in it overflowed, that is reported (C3036).
+pub fn const_in_range(x: *cast.Expr) bool {
+    if x.ovf {
+        cs.err(x.span, "C3036", "integer overflow in a constant expression");
+        return false;
+    }
+    return true;
 }
 
 /// Is e (typed, an rvalue) a null pointer constant (6.3.2.3p3)?
@@ -500,12 +521,15 @@ fn ident(e: *mut cast.Expr) *mut cast.Expr {
                          " (a keyword from C23)");
         } else if u.str_eq(e.name, "nullptr") {
             why = " (a keyword from C23)";
+        } else if u.str_eq(e.name, "__func__") {
+            why = " (a predefined identifier from C99)";
         }
         cs.err(e.span, "C3001", u.f2("'%s' is not declared%s", e.name, why));
         return bad(e);
     }
     e.sym = s;
     s.used = true;
+    cs.used_at(s, e.span);
     csm.referred(s, e.span);
     catr.use_sym(s, e.span);
     if s.kind == cast.SK_ENUMCONST {
@@ -588,7 +612,7 @@ fn unary(e: *mut cast.Expr) *mut cast.Expr {
         }
         let reg = csm.register_object(a);
         if u.notnil(reg) {
-            cs.err(a.span, "C3222", u.f1("the address of '%s', declared register, is taken", reg.name));
+            cs.err(a.span, "C3222", u.f1("the address of %s, declared register, is taken", reg_name(reg)));
             return bad(e);
         }
         e.ty = cty.pointer_to(a.ty);
@@ -801,6 +825,12 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
         return bad_operands(e);
     }
     if (ta.kind == cty.TK_POINTER) and (tb.kind == cty.TK_POINTER) {
+        if not eq and (cty.is_func(ta.elem) or cty.is_func(tb.elem)) {
+            cs.err(e.span, "C3020",
+                   u.f1("comparison with '%s' of pointers to functions (only '==' and '!=' compare them)",
+                        cast.punct_text(op)));
+            return bad(e);
+        }
         // (6.5.8p2, 6.5.9p2: relational operators take pointers to object
         // types; == and != also a pointer to void with one to an object
         // type, or a null pointer constant)
@@ -811,6 +841,13 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
         if not ok {
             cs.err(e.span, "C3020", u.f3("comparison with '%s' of pointers to incompatible types (%s and %s)",
                                          cast.punct_text(op), cs.tq(ta), cs.tq(tb)));
+            return bad(e);
+        }
+        // (C89-C99 6.5.8p2: both point to object types, or both to incomplete types)
+        if (not eq) and (cs.std() < co.C11) and (cty.is_complete(ta.elem) != cty.is_complete(tb.elem)) {
+            cs.err(e.span, "C3020",
+                   u.f1("comparison with '%s' of a pointer to a complete type and one to an incomplete type is not allowed before C11",
+                        cast.punct_text(op)));
             return bad(e);
         }
         return e;
@@ -1199,7 +1236,9 @@ fn size_align(e: *mut cast.Expr) *mut cast.Expr {
     let k = e.kind;
     let what = u.pick(k == cast.ExprKind.ALIGNOF, u.cat2("'", u.cat2(e.name, "'")), "'sizeof'");
     if k == cast.ExprKind.SIZEOF_EXPR {
+        cs.unevaluated(1);
         let a = check(e.a);
+        cs.unevaluated(-1);
         e.a = a;
         if is_err(a) {
             return bad(e);

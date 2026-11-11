@@ -57,7 +57,8 @@ struct Specs {
 // identifier (derivs[0]): a definition's.
 let mut g_params: u.List.[*mut cast.CSym] = u.List.[*mut cast.CSym].{ data: @ptr_from_int(*mut *mut cast.CSym, 0),
                                                                       len: 0, cap: 0 };
-let mut g_kr_ids: bool = false;  // ... given as an identifier list
+let mut g_kr_ids: bool = false;    // ... given as an identifier list
+let mut g_defining: bool = false;  // the declarator is a function definition's (not its parameters')
 
 // -----------------------------------------------------------------------------
 // Declaration specifiers (6.7.1 - 6.7.4)
@@ -202,7 +203,11 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
             bad = true;
         }
     }
-    if td_seen and ((other.quals & qual_seen) != 0) and (cs.std() < co.C99) {
+    let mut oq = other;
+    while oq.kind == cty.TK_ARRAY {
+        oq = oq.elem;  // (an array type's qualifiers are its elements')
+    }
+    if td_seen and ((oq.quals & qual_seen) != 0) and (cs.std() < co.C99) {
         cs.err(td_span, "C3006", "a type qualifier is repeated, through a typedef name (allowed from C99)");
     }
     let st = dsp.storage(scs, ds);
@@ -221,6 +226,11 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
     }
     let t = base_type(&c, other, ds.span);
     r.quals = qual_seen & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT);
+    if cty.is_func(t) and (r.quals != 0) {
+        // (6.7.3p8: undefined)
+        cs.err(ds.span, "C3006", u.f1("type qualifiers on a function type (%s, a typedef name's)", cs.tq(t)));
+        r.quals = 0;
+    }
     r.ty = cty.qualify(t, r.quals);
     if (ctx == CTX_MEMBER) or (ctx == CTX_TYPENAME) {
         r.sc = 0;  // (the parser reported any)
@@ -608,6 +618,11 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                 continue;
             }
             let is_flex = (mt.kind == cty.TK_ARRAY) and not mt.has_len and not mt.vla and cty.is_complete(mt.elem);
+            if is_flex and (cs.std() < co.C99) {
+                cs.err(d.name_span, "C3007",
+                       u.f1("the member '%s' has incomplete type (flexible array members are a C99 feature)", d.name));
+                continue;
+            }
             if not is_flex and not cty.is_complete(mt) {
                 cs.err(d.name_span, "C3007", u.f2("the member '%s' has incomplete type %s", d.name, cs.tq(mt)));
                 continue;
@@ -742,6 +757,9 @@ fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool, in_par
         dv.size = @ptr_cast(*mut cast.Expr, a.vexpr);
         return a;
     }
+    if not cx.const_in_range(x) {
+        return cty.t_error;
+    }
     if (x.ty.is_signed and (@bit_cast(i64, x.cval) < 0)) or (x.cval == 0) {
         cs.err(x.span, "C3009",
                u.f1(
@@ -765,6 +783,10 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
     let mut proto = true;
     if dv.id_list {
         proto = false;
+        if (dv.ids.len > 0) and not (at_name and g_defining) {
+            // (6.7.5.3p3: an identifier list only in a function definition's declarator)
+            cs.err(dv.ids.at(0).span, "C3008", "an identifier list in a function declarator that is not a definition");
+        }
         let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
         for id in dv.ids.items() {
             if seen.get(id.name) != 0 {
@@ -778,6 +800,8 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
     } else if dv.empty {
         proto = cs.std() >= co.C23;
     } else {
+        let defining = g_defining;
+        g_defining = false;
         cs.push_scope();
         let ps = dv.params.items();
         for i in 0..ps.len {
@@ -818,6 +842,7 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             types.push(cty.unqual(adj));
         }
         cs.pop_scope();
+        g_defining = defining;
     }
     if at_name {
         g_params = syms;
@@ -893,6 +918,26 @@ pub fn for_decl(d: *mut cast.Decl) void {
         cs.err(d.specs.span, "C3006", "a declaration in 'for' can only declare objects that are auto or register");
     }
     declaration(d, CTX_FOR);
+    // (6.8.5p3: only objects; not a tag, an enumeration constant or a function)
+    for s in d.specs.items.items() {
+        if (s.kind != cast.SpecKind.TAG) or u.isnil(s.tag.ty) or cty.is_error(s.tag.ty) {
+            continue;
+        }
+        let ts = s.tag;
+        if (ts.name.len > 0) and (cs.lookup_tag_here(ts.name) == ts.ty) {
+            cs.err(ts.name_span, "C3006", u.f2("a declaration in 'for' declares the tag '%s %s', not only objects",
+                                               cast.kw_text(ts.kw), ts.name));
+        } else if (ts.kw == ct.K_ENUM) and ts.has_body and (ts.enumerators.len > 0) {
+            cs.err(ts.enumerators.get(0).span, "C3006",
+                   "a declaration in 'for' declares enumeration constants, not only objects");
+        }
+    }
+    for dcl in d.decls.items() {
+        if u.notnil(dcl.ty) and cty.is_func(dcl.ty) {
+            cs.err(dcl.name_span, "C3006", u.f1("a declaration in 'for' declares the function '%s', not an object",
+                                                dcl.name));
+        }
+    }
 }
 
 fn declaration(d: *mut cast.Decl, ctx: i32) void {
@@ -949,6 +994,11 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
     if sp.sc == cast.SC_TYPEDEF {
         if u.notnil(dcl.init) {
             cs.err(dcl.init.span, "C3033", u.f1("the typedef '%s' has an initializer", name));
+        }
+        if sp.funcs != 0 {
+            // (6.7.4p1: function specifiers only in the declaration of a function)
+            cs.err(dcl.name_span, "C3006", u.f1("'inline' or '_Noreturn' in the declaration of the typedef '%s'",
+                                                name));
         }
         let prior = cs.lookup_here(name);
         if u.notnil(prior) {
@@ -1014,8 +1064,9 @@ fn entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32) *mut ca
             return new_entity(name, sp, kind, t, lk, false);
         }
         if prior.linkage != lk {
-            cs.err_note(sp, "C3004", u.f2("'%s' is declared with %s linkage after a declaration with the other", name,
-                                          u.pick(lk == cast.LK_INTERNAL, "internal", "external")), prior.span,
+            cs.err_note(sp, "C3004", u.f3("'%s' is declared with %s linkage after a declaration with %s linkage", name,
+                                          u.pick(lk == cast.LK_INTERNAL, "internal", "external"),
+                                          u.pick(lk == cast.LK_INTERNAL, "external", "internal")), prior.span,
                         "declared before here");
         }
         if not cty.compatible(prior.ty, t) {
@@ -1219,7 +1270,9 @@ fn function_def(d: *mut cast.Decl) void {
     let dcl = d.decls.get(0);
     g_params = u.List.[*mut cast.CSym].empty();
     g_kr_ids = false;
+    g_defining = true;
     let mut t = derive(sp.ty, dcl, CTX_FILE);
+    g_defining = false;
     let params = g_params;
     let kr = g_kr_ids;
     if cty.is_error(t) or not cty.is_func(t) {
@@ -1299,6 +1352,9 @@ fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CS
         given.put(p.name, p);
     }
     let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    // (each parameter is in scope after its declarator, for the sizes of
+    // the later ones' variable length arrays: 6.2.1p7)
+    cs.push_scope();
     for kd in d.kr_decls.items() {
         if kd.kind != cast.DeclKind.DECL {
             continue;
@@ -1328,8 +1384,10 @@ fn kr_params(t: *mut cty.CType, d: *mut cast.Decl, params: *u.List.[*mut cast.CS
             }
             p.ty = adjust_param(pt, x);
             p.span = x.name_span;
+            cs.declare(x.name, p);
         }
     }
+    cs.pop_scope();
     let types = u.newn.[*mut cty.CType](ps.len + 1);
     for i in 0..ps.len {
         let p = ps[i];

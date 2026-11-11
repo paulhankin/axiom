@@ -13,6 +13,7 @@
 // Diagnostics (C2xxx):
 //   C2001  a syntax error: expected one thing, found another
 //   C2002  nested too deeply (MAX_DEPTH levels of expressions, declarators, statements)
+//   C2003  a '//' comment before C99 ('/' and '/' written together)
 //   C2004  an empty declaration ';' outside a function
 //   C2005  an attribute where none can appear
 //   C2011  a declaration where only a statement can be (the body of if, while, ...)
@@ -192,7 +193,66 @@ fn syntax(P: *mut Parser, what: []u8) void {
     }
     P.err_pos = @int_cast(i64, P.pos);
     let t = cur(P);
-    error_at(t.span, "C2001", u.f2("expected %s, found %s", what, describe(t)));
+    error_at(t.span, "C2001", u.f3("expected %s, found %s%s", what, describe(t), digraph_hint(P)));
+}
+
+// Before C99, '/' and '/' (or '/=') written together, which are never valid
+// C, are a '//' comment, which is C99's: reported, and the rest of the line
+// dropped.
+fn line_comments(ts: []ct.Token) []ct.Token {
+    let mut out = u.List.[ct.Token].empty();
+    let mut i: usize = 0;
+    let mut found = false;
+    while i < ts.len {
+        let t = &ts[i];
+        if is_punct(t, ct.P_SLASH) and ((i + 1) < ts.len) and
+           (is_punct(&ts[i + 1], ct.P_SLASH) or is_punct(&ts[i + 1], ct.P_DIV_EQ)) and adjacent(t, &ts[i + 1]) {
+            error_at(t.span, "C2003", "'//' comments are a C99 feature");
+            found = true;
+            i += 2;
+            while (i < ts.len) and not ts[i].bol and (ts[i].kind != ct.T_EOF) {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(ts[i]);
+        i += 1;
+    }
+    if not found {
+        out.deinit();
+        return ts;
+    }
+    return out.items();
+}
+
+// Two tokens written together, a then b?
+fn adjacent(a: *ct.Token, b: *ct.Token) bool {
+    return (a.span.file == b.span.file) and (a.span.end == b.span.start);
+}
+
+fn is_punct(t: *ct.Token, id: i32) bool {
+    return (t.kind == ct.T_PUNCT) and (t.id == id);
+}
+
+// Before C95, what a digraph would have been (two punctuators written
+// together that are never valid one after the other).
+fn digraph_hint(P: *Parser) []u8 {
+    if P.std >= co.C95 {
+        return "";
+    }
+    let t = cur(P);
+    let names = ["<:", ":>", "<%", "%>", "%:"];
+    let firsts: [5]i32 = [ct.P_LT, ct.P_COLON, ct.P_LT, ct.P_PERCENT, ct.P_PERCENT];
+    let seconds: [5]i32 = [ct.P_COLON, ct.P_GT, ct.P_PERCENT, ct.P_GT, ct.P_COLON];
+    for k in 0..names.len {
+        let before = (P.pos > 0) and is_punct(&P.t[P.pos - 1], firsts[k]) and is_punct(t, seconds[k]) and
+                     adjacent(&P.t[P.pos - 1], t);
+        let after = is_punct(t, firsts[k]) and is_punct(peek(P, 1), seconds[k]) and adjacent(t, peek(P, 1));
+        if before or after {
+            return u.f1(" ('%s' is a digraph, a C95 feature)", names[k]);
+        }
+    }
+    return "";
 }
 
 // Once the input nests too deeply the rest of the file is skipped, and
@@ -1039,7 +1099,10 @@ fn parse_array_suffix(P: *mut Parser, ad: *mut cast.Deriv) void {
             break;
         }
     }
-    if at_p(P, ct.P_STAR) and is_p(peek(P, 1), ct.P_RBRACKET) {
+    if at_p(P, ct.P_STAR) and is_p(peek(P, 1), ct.P_RBRACKET) and ad.is_static {
+        syntax(P, "the array's size after 'static'");  // (6.7.5.2p1: no `[static *]`)
+        _ = advance(P);
+    } else if at_p(P, ct.P_STAR) and is_p(peek(P, 1), ct.P_RBRACKET) {
         let sp = advance(P).span;
         feature(P, co.C99, sp, "C2110", "variable-length arrays of unspecified size '[*]' are");
         ad.is_star = true;
@@ -2412,11 +2475,15 @@ fn parse_for(P: *mut Parser, start: u.Span) *mut cast.Stmt {
 /// standard. Errors are reported through diag.ax; the tree is complete
 /// either way (with ERROR expressions where there were errors), and safe to
 /// walk.
-pub fn parse(toks: []ct.Token, o: *co.COptions) *mut cast.Unit {
+pub fn parse(toks0: []ct.Token, o: *co.COptions) *mut cast.Unit {
     let unit = u.new.[cast.Unit]();
     g_quiet = false;
-    if toks.len == 0 {
+    if toks0.len == 0 {
         return unit;
+    }
+    let mut toks = toks0;
+    if o.std < co.C99 {
+        toks = line_comments(toks0);
     }
     let mut P = Parser.{
         t: toks,

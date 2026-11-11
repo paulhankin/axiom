@@ -111,6 +111,10 @@ cmd/axiom/internal/tests/c/ tests
   Codes: `C1xxx` preprocessing and lexing, `C2xxx` syntax, `C3xxx` constraints and
   semantics, `C4xxx` warnings. A constraint violation is an error; the messages name
   the construct in C's terms.
+  A `#line` directive marks the lines after it in the file (`util.mark_lines`): the
+  text format shows the presumed file and line, the `agent-json` format the physical
+  span with `presumed_file` and `presumed_line` beside it. A feature of a later
+  standard (or one an earlier one removed) gets one diagnostic naming the standard.
 
 ## Command line
 

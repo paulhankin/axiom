@@ -14,7 +14,8 @@
 // whole (by a list, a string, a structure value, or a union through another
 // member) first drops the items inside it, which the zeroing of the whole
 // object then covers. (An item that covers a larger subobject, a structure
-// copied, is not cut.) Unnamed bit-fields and a flexible array member take
+// copied, is not cut: an aggregate inside it initialized again by a list or
+// a string gets a zero item first, which the new items then override.) Unnamed bit-fields and a flexible array member take
 // no part; an array of unknown length gets the length the highest index
 // initialized gives it.
 //
@@ -35,6 +36,7 @@
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
+import "copts.ax" as co;
 import "csema.ax" as cs;
 import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
@@ -46,11 +48,13 @@ struct Filler {
     list: *mut cast.InitList,
     is_static: bool,
     constexpr_: bool,
+    c89_list: bool,  // a brace-enclosed list for an aggregate or union before C99: its items must be constants
     errors: bool,
     hw: u64,                 // the end of the furthest item so far: an item before it may be overridden
     desig: bool,             // the initializer has a designator: subobjects may be initialized again
     starts: u.SymMap.[i32],  // (desig) how many items start at each offset
     unions: u.SymMap.[u64],  // the member (index + 1) each union subobject was last given through, by place
+    copies: i32,             // (desig) the items that copy a structure or union
 }
 
 /// What initializer returns: the normal form, and the object's type (an
@@ -110,6 +114,7 @@ pub fn initializer(t: *mut cty.CType, it: *mut cast.Init, is_static: bool, const
         return Result.{ list: F.list, ty: ty };
     }
     F.list.zero = true;
+    F.c89_list = (cs.std() < co.C99) and not cty.is_scalar(t);
     if not cty.is_scalar(t) and not cty.is_record(t) and (t.kind != cty.TK_ARRAY) {
         cs.err(it.span, "C3033", u.f1("an initializer for an object of type %s", cs.tq(t)));
         return Result.{ list: F.list, ty: ty };
@@ -171,6 +176,9 @@ fn push(F: *mut Filler, it: cast.InitItem) void {
     if F.desig {
         let k = off_key(it.off);
         F.starts.put(k, F.starts.get(k) + 1);
+        if cty.is_record(it.ty) and u.notnil(it.e) {
+            F.copies += 1;
+        }
     }
     let end = it.off + cty.size_of(it.ty);
     if end > F.hw {
@@ -213,6 +221,23 @@ fn drop_inside(F: *mut Filler, off: u64, size: u64) void {
     F.list.items.len = j;
 }
 
+// The aggregate t at off is initialized again as a whole by a list or a
+// string, inside an earlier item that copies a larger structure or union:
+// what the new initializer does not give is zero, not the copy's (a zero
+// item for it goes first).
+fn zero_if_copied(F: *mut Filler, off: u64, t: *mut cty.CType) void {
+    if not F.desig or (F.copies == 0) or (off >= F.hw) {
+        return;
+    }
+    let size = cty.size_of(t);
+    for it in F.list.items.items() {
+        if cty.is_record(it.ty) and u.notnil(it.e) and (it.off <= off) and (off + size <= it.off + cty.size_of(it.ty)) {
+            push(F, cast.InitItem.{ off: off, ty: t, e: u.nil.[cast.Expr](), bits: no_bits() });
+            return;
+        }
+    }
+}
+
 // A string literal for character array t at off; returns t, completed.
 fn string_item(F: *mut Filler, t: *mut cty.CType, off: u64, e: *mut cast.Expr) *mut cty.CType {
     let x = cx.check(e);
@@ -243,6 +268,7 @@ fn string_item(F: *mut Filler, t: *mut cty.CType, off: u64, e: *mut cast.Expr) *
         }
     }
     drop_inside(F, off, cty.size_of(ty));
+    zero_if_copied(F, off, ty);
     push(F, cast.InitItem.{ off: off, ty: ty, e: x, bits: no_bits() });
     return ty;
 }
@@ -281,6 +307,13 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
         }
     } else if F.is_static and (not constant(x, t) or (u.notnil(s.bits) and not x.is_const)) {
         cs.err(x.span, "C3031", "the initializer of an object with static storage duration is not a constant");
+        F.errors = true;
+    } else if F.is_static and not cx.const_in_range(x) {
+        F.errors = true;
+    } else if F.c89_list and not constant(x, t) {
+        // (C89 6.5.7: the items of an initializer list for an aggregate or union are constants)
+        cs.err(x.span, "C3031",
+               "an initializer list for an aggregate or union has an item that is not a constant (allowed from C99)");
         F.errors = true;
     }
     if cty.is_record(t) {
@@ -637,6 +670,7 @@ fn place(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) void {
         if item.kind == cast.InitKind.LIST {
             if not cty.is_scalar(s.t) and u.isnil(s.bits) {
                 drop_inside(F, s.off, cty.size_of(s.t));
+                zero_if_copied(F, s.off, s.t);
             }
             _ = fill_list(F, s, item);
             step(lv);
@@ -703,6 +737,11 @@ pub fn compound_literal(e: *mut cast.Expr) *mut cast.Expr {
         return bad(e);
     }
     let unknown = (t0.kind == cty.TK_ARRAY) and not t0.has_len and not t0.vla and cty.is_complete(t0.elem);
+    if cty.is_vla(t0) {
+        // (6.5.2.5p1)
+        cs.err(tn.span, "C3078", u.f1("a compound literal of variable length array type %s", cs.tq(t0)));
+        return bad(e);
+    }
     if cty.is_func(t0) or (not cty.is_complete(t0) and not unknown) {
         cs.err(tn.span, "C3078",
                u.f1("a compound literal of type %s (a complete object type or an array of unknown length is needed)",

@@ -524,6 +524,15 @@ await section('C programs', {
     if (c.status !== 0) return `--emit=obj failed:\n${c.stdout}${c.stderr}`;
     return fs.statSync(obj).size > 0 ? null : 'an empty object';
   },
+  'diagnostics at #line positions': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const f = path.join(cRunDir, 'err_line_presumed.c');
+    const c = await spawnAsync(compiler, ['build', f, '-o', path.join(tmp, 'c-line')], { encoding: 'utf8' });
+    for (const want of ['gen.y:100:9: error[C3001]', 'gen.y:7:9: error[C3001]']) if (!c.stderr.includes(want)) return `no ${want} in:\n${c.stderr}`;
+    const j = await spawnAsync(compiler, ['build', f, '--format=agent-json', '-o', path.join(tmp, 'c-line')], { encoding: 'utf8' });
+    const d = JSON.parse(j.stdout).diagnostics[0];
+    return d.span.start_line === 7 && d.presumed_file === 'gen.y' && d.presumed_line === 100 ? null : `got ${JSON.stringify(d)}`;
+  },
   ...cDriverCases(),
 });
 
