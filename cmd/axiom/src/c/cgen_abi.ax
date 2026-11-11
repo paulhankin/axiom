@@ -1,0 +1,983 @@
+// =============================================================================
+// cgen_abi.ax - the platform C calling conventions: how the arguments and
+// the result of a C function travel between caller and callee, as the IR
+// parameters of its IR signature (a Plan), for each target's ABI:
+//
+//   x86-64 System V  classification of structures and unions into eightbytes
+//                    (INTEGER, SSE, MEMORY); those of at most two in rdi..r9
+//                    and xmm0-7 when both fit, else on the stack; results in
+//                    rax/rdx/xmm0/xmm1, or through a pointer in rdi (also
+//                    returned in rax)
+//   Windows x64      by position; structures of 1, 2, 4 or 8 bytes as an
+//                    integer, others by reference (a copy); the same for
+//                    results, else through a pointer in rcx (returned in rax);
+//                    variadic doubles in the integer registers
+//   AArch64          homogeneous floating-point aggregates (HFA, up to four
+//                    members) in v0-v7, other structures of at most 16 bytes
+//                    in x0-x7, larger ones by reference; results the same,
+//                    else through x8 (AAPCS64); macOS passes variadic
+//                    arguments on the stack, in 8-byte slots
+//   WebAssembly      structures with a single scalar as that scalar, others
+//                    by reference; results the same, else through a pointer
+//                    first parameter; variadic arguments in a buffer whose
+//                    address is the last parameter
+//
+// The backends pass scalar IR parameters as the C ABIs do (rdi, rsi, ...; in
+// order of each register class, then the stack), so a structure here is
+// split into scalar pieces loaded from its memory, and its place is chosen
+// by what precedes it: a piece bound for the stack while registers of its
+// class are free follows filler parameters that use them up (x86-64 puts
+// such pieces after the arguments that do get registers: the stack holds
+// them in order). Two things the backends do for this module: a result in
+// two to four registers comes back through a buffer marked with
+// ir.EXT_REGS (the call stores the registers there; the callee's buffer
+// parameter is a frame slot loaded into them at its return), and the
+// AArch64 result address is marked ir.EXT_X8SRET (x8, not x0).
+//
+// A variadic function's definition gets parameters after its named ones for
+// the registers its caller may have put variadic arguments in (x86-64,
+// Windows, AArch64 Linux), which va_start saves, or the buffer's address
+// (WebAssembly); its IR signature is not variadic. cgen_va.ax generates the
+// code that uses a Plan.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "ctypes.ax" as cty;
+
+// The ABIs.
+pub const ABI_SYSV: i32 = 1;    // x86-64 System V (Linux)
+pub const ABI_WIN: i32 = 2;     // Windows x64
+pub const ABI_A64: i32 = 3;     // AArch64 (AAPCS64, Linux)
+pub const ABI_DARWIN: i32 = 4;  // AArch64 macOS
+pub const ABI_WASM: i32 = 5;    // WebAssembly (32 or 64 bits)
+
+/// The target's C ABI.
+pub fn abi() i32 {
+    if tg.is_wasm() {
+        return ABI_WASM;
+    }
+    if tg.g_arch == tg.ARCH_A64 {
+        if tg.is_darwin() {
+            return ABI_DARWIN;
+        }
+        return ABI_A64;
+    }
+    if tg.is_windows() {
+        return ABI_WIN;
+    }
+    return ABI_SYSV;
+}
+
+// -----------------------------------------------------------------------------
+// Plans
+// -----------------------------------------------------------------------------
+
+// How an argument travels (ArgPlan.kind).
+pub const A_SCALAR: i32 = 0;  // a scalar: its value
+pub const A_PIECES: i32 = 1;  // a structure or union: scalars loaded from its memory
+pub const A_REF: i32 = 2;     // a structure or union: the address of a copy
+
+// How the result travels (Plan.ret).
+pub const R_VOID: i32 = 0;
+pub const R_SCALAR: i32 = 1;  // a scalar: the IR result
+pub const R_PIECE: i32 = 2;   // a structure or union: one scalar, the IR result
+pub const R_REGS: i32 = 3;    // a structure or union in several registers: through the buffer of parameter 0
+pub const R_SRET: i32 = 4;    // a structure or union in the caller's memory, whose address is parameter 0
+
+// What an IR parameter is (Plan.what).
+pub const SL_ARG: i32 = 0;     // (a piece of) an argument
+pub const SL_FILL: i32 = 1;    // a filler that uses up a register (its value is never used)
+pub const SL_PAD_GP: i32 = 2;  // a variadic definition's integer register
+pub const SL_PAD_FP: i32 = 3;  // a variadic definition's floating-point register
+pub const SL_RET: i32 = 4;     // the result's buffer or address
+pub const SL_VABUF: i32 = 5;   // the variadic arguments' buffer (WebAssembly)
+
+/// A scalar of a structure or union: its IR type and offset.
+pub struct Piece {
+    ty: *mut ir.Ty,
+    off: u64,
+}
+
+pub struct ArgPlan {
+    ty: *mut cty.CType,
+    kind: i32,
+    pieces: []mut Piece,  // A_PIECES (A_SCALAR: [0] is the scalar's type; A_REF: a pointer)
+    n: usize,
+    slot: []mut i32,  // the IR parameter of each piece, of the scalar or of the address; -1: in the variadic buffer
+    span: u64,        // A_PIECES: the bytes the pieces cover (may exceed the type's size: then read through a copy)
+    as_int: bool,     // a floating-point value in an integer register (its bits: Windows variadic arguments)
+    va_off: u64,      // WebAssembly variadic argument: its offset in the buffer
+}
+
+pub struct Plan {
+    abi: i32,
+    ret: i32,
+    rty: *mut cty.CType,
+    rpieces: [4]Piece,  // R_PIECE, R_REGS
+    rn: usize,
+    rspan: u64,
+    ret_ptr: bool,  // R_SRET: the function also returns the address (x86-64)
+    args: []mut ArgPlan,
+    nnamed: usize,             // the arguments that are a prototype's parameters
+    tys: u.List.[*mut ir.Ty],  // the IR parameters
+    exts: u.List.[u8],
+    what: u.List.[i32],
+    nfixed: usize,  // a variadic call: the IR parameters of the signature (the rest are its variadic arguments)
+    vararg: bool,   // the IR signature is variadic (a call of a variadic function, but on WebAssembly)
+    vabuf: i32,     // the IR parameter of the variadic buffer, or -1
+    vabuf_size: u64,
+    // a variadic definition: what the named parameters use (va_start)
+    va_gp: u64,             // integer registers
+    va_fp: u64,             // floating-point (vector) registers
+    va_stack: u64,          // bytes of stack
+    pads_gp: u.List.[i32],  // the parameters of the other registers, in order
+    pads_fp: u.List.[i32],
+    fty: *mut ir.Ty,
+}
+
+// The IR type of a scalar C type.
+fn scalar_ty(t0: *cty.CType) *mut ir.Ty {
+    let t = t0.unq;
+    if cty.is_integer(t) {
+        return ir.t_int(cty.storage_bits(t));
+    }
+    if t.kind == cty.TK_FLOAT {
+        return ir.t_float(32);
+    }
+    if (t.kind == cty.TK_DOUBLE) or (t.kind == cty.TK_LDOUBLE) {
+        return ir.t_float(64);
+    }
+    return ir.t_ptr();
+}
+
+/// The extension (0, ir zext 1, sext 2) a scalar of type t gets as an
+/// argument or result.
+pub fn ext_of(t: *cty.CType) u8 {
+    if t.kind == cty.TK_BOOL {
+        return 1;
+    }
+    if cty.is_integer(t) and (cty.storage_bits(t) < 32) {
+        if t.is_signed {
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn int_piece(n: u64) *mut ir.Ty {
+    if n <= 1 {
+        return ir.t_int(8);
+    }
+    if n <= 2 {
+        return ir.t_int(16);
+    }
+    if n <= 4 {
+        return ir.t_int(32);
+    }
+    return ir.t_int(64);
+}
+
+// -----------------------------------------------------------------------------
+// The scalars of a type
+// -----------------------------------------------------------------------------
+
+// A scalar inside a structure or union: its offset, size and whether it is
+// floating-point.
+struct Leaf {
+    off: u64,
+    size: u64,
+    fp: bool,
+}
+
+const MAX_LEAVES: usize = 64;
+
+struct Leaves {
+    xs: [64]Leaf,
+    n: usize,
+    ok: bool,  // all of them fit in xs
+}
+
+fn add_leaves(t0: *cty.CType, off: u64, l: *mut Leaves) void {
+    let t = t0.unq;
+    if t.kind == cty.TK_ARRAY {
+        if not t.has_len {
+            return;
+        }
+        let es = cty.size_of(t.elem);
+        for i in 0..t.len {
+            if not l.ok {
+                return;
+            }
+            add_leaves(t.elem, off + (i * es), l);
+        }
+        return;
+    }
+    if (t.kind == cty.TK_STRUCT) or (t.kind == cty.TK_UNION) {
+        for m in t.tag.members.items() {
+            add_leaves(m.ty, off + m.offset, l);
+        }
+        return;
+    }
+    if l.n >= MAX_LEAVES {
+        l.ok = false;
+        return;
+    }
+    l.xs[l.n] = Leaf.{ off: off, size: cty.size_of(t), fp: cty.is_floating(t) };
+    l.n += 1;
+}
+
+fn leaves_of(t: *cty.CType, l: *mut Leaves) void {
+    l.n = 0;
+    l.ok = true;
+    add_leaves(t, 0, l);
+}
+
+// The members of a homogeneous floating-point aggregate (AAPCS64): its
+// count (1 to 4) and their size (4 or 8), or count 0.
+struct Hfa {
+    n: u64,
+    es: u64,
+}
+
+fn hfa_of(t: *cty.CType) Hfa {
+    let none = Hfa.{ n: 0, es: 0 };
+    let size = cty.size_of(t);
+    if not cty.is_record(t) or (size == 0) or (size > 32) {
+        return none;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return none;
+    }
+    let es = l.xs[0].size;
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if not x.fp or (x.size != es) or ((x.off % es) != 0) {
+            return none;
+        }
+    }
+    if (size % es) != 0 {
+        return none;
+    }
+    let n = size / es;
+    if n > 4 {
+        return none;
+    }
+    // (every element there: a union's members overlap, padding is not allowed)
+    let mut seen: [4]bool = [false, false, false, false];
+    for i in 0..l.n {
+        seen[@truncate(usize, l.xs[i].off / es)] = true;
+    }
+    for k in 0..n {
+        if not seen[@truncate(usize, k)] {
+            return none;
+        }
+    }
+    return Hfa.{ n: n, es: es };
+}
+
+// The x86-64 System V classes of a structure or union's eightbytes.
+const C_NONE: u8 = 0;
+const C_INT: u8 = 1;
+const C_SSE: u8 = 2;
+
+struct Classes {
+    n: usize,  // 0: MEMORY
+    c: [2]u8,
+    fsize: [2]u64,  // the bytes of floating-point data in each SSE eightbyte
+}
+
+fn classify_sysv(t: *cty.CType) Classes {
+    let mem = Classes.{ n: 0, c: [C_NONE, C_NONE], fsize: [0, 0] };
+    let size = cty.size_of(t);
+    if (size == 0) or (size > 16) {
+        return mem;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok {
+        return mem;
+    }
+    let mut r = Classes.{ n: @truncate(usize, (size + 7) / 8), c: [C_NONE, C_NONE], fsize: [0, 0] };
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if (x.size > 0) and ((x.off % x.size) != 0) {
+            return mem;  // (an unaligned member)
+        }
+        let k = @truncate(usize, x.off / 8);
+        if k >= r.n {
+            continue;
+        }
+        if x.fp {
+            if r.c[k] == C_NONE {
+                r.c[k] = C_SSE;
+            }
+            let end = (x.off % 8) + x.size;
+            if end > r.fsize[k] {
+                r.fsize[k] = end;
+            }
+        } else {
+            r.c[k] = C_INT;
+        }
+    }
+    // (an eightbyte of padding only: the last is left out, another passed as INTEGER)
+    if (r.n == 2) and (r.c[1] == C_NONE) {
+        r.n = 1;
+    }
+    for k in 0..r.n {
+        if r.c[k] == C_NONE {
+            r.c[k] = C_INT;
+        }
+    }
+    return r;
+}
+
+// The type of a WebAssembly single-scalar structure or union (a member, or
+// a member of one, that is all of it), or nil.
+fn single_scalar(t: *cty.CType) *mut ir.Ty {
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return u.nil.[ir.Ty]();
+    }
+    let x = l.xs[0];
+    for i in 1..l.n {
+        if (l.xs[i].off != x.off) or (l.xs[i].size != x.size) or (l.xs[i].fp != x.fp) {
+            return u.nil.[ir.Ty]();
+        }
+    }
+    if (x.off != 0) or (x.size != cty.size_of(t)) {
+        return u.nil.[ir.Ty]();
+    }
+    // (a union of a float and an int of one size is not one scalar)
+    let mut fp_and_int = false;
+    for i in 0..l.n {
+        if l.xs[i].fp != x.fp {
+            fp_and_int = true;
+        }
+    }
+    if fp_and_int {
+        return u.nil.[ir.Ty]();
+    }
+    if x.fp {
+        return ir.t_float(@truncate(i32, @bit_cast(i64, x.size * 8)));
+    }
+    return int_piece(x.size);
+}
+
+// -----------------------------------------------------------------------------
+// Building a plan
+// -----------------------------------------------------------------------------
+
+// An IR parameter before its place is fixed.
+struct Item {
+    ty: *mut ir.Ty,
+    ext: u8,
+    what: i32,
+    arg: i32,  // the argument (SL_ARG), or -1
+    piece: usize,
+}
+
+struct Builder {
+    p: *mut Plan,
+    regs: u.List.[Item],   // in order
+    stack: u.List.[Item],  // x86-64 System V: those bound for the stack, after the others
+    ng: u64,               // registers used
+    nf: u64,
+    pos: u64,   // Windows: positions used
+    soff: u64,  // bytes of stack used by the named arguments
+}
+
+fn item(ty: *mut ir.Ty, ext: u8, what: i32, arg: i32, piece: usize) Item {
+    return Item.{ ty: ty, ext: ext, what: what, arg: arg, piece: piece };
+}
+
+fn is_fp_ty(t: *ir.Ty) bool {
+    return t.kind == ir.T_FLOAT;
+}
+
+fn new_plan(ret: *mut cty.CType, n: usize) *mut Plan {
+    let p = u.new.[Plan]();
+    p.abi = abi();
+    p.rty = ret;
+    p.args = u.newn.[ArgPlan](n + 1)[0..n];
+    p.tys = u.List.[*mut ir.Ty].empty();
+    p.exts = u.List.[u8].empty();
+    p.what = u.List.[i32].empty();
+    p.pads_gp = u.List.[i32].empty();
+    p.pads_fp = u.List.[i32].empty();
+    p.vabuf = -1;
+    return p;
+}
+
+// The pieces of type t in eightbytes (x86-64 SSE ones as their floating
+// type: an f32 when only one float is there), or plain 8-byte integers.
+fn eightbyte_pieces(a: *mut ArgPlan, t: *cty.CType, cl: *Classes) void {
+    let size = cty.size_of(t);
+    a.kind = A_PIECES;
+    set_n(a, cl.n);
+    for k in 0..cl.n {
+        let off = @as(u64, k) * 8;
+        let rest = size - off;
+        let mut pt = int_piece(rest);
+        if (rest > 4) and (rest < 8) {
+            pt = ir.t_int(64);
+        }
+        if cl.c[k] == C_SSE {
+            pt = ir.t_float(64);
+            if cl.fsize[k] <= 4 {
+                pt = ir.t_float(32);
+            }
+        }
+        a.pieces[k] = Piece.{ ty: pt, off: off };
+    }
+    a.span = memory_span(a);
+}
+
+fn memory_span(a: *ArgPlan) u64 {
+    let mut s: u64 = 0;
+    for k in 0..a.n {
+        let e = a.pieces[k].off + a.pieces[k].ty.size;
+        if e > s {
+            s = e;
+        }
+    }
+    return s;
+}
+
+// t's memory as 8-byte integers (the stack image of a structure).
+fn chunk_pieces(a: *mut ArgPlan, t: *cty.CType) void {
+    let size = cty.size_of(t);
+    let n = (size + 7) / 8;
+    a.kind = A_PIECES;
+    set_n(a, @truncate(usize, n));
+    for k in 0..a.n {
+        a.pieces[k] = Piece.{ ty: ir.t_int(64), off: @as(u64, k) * 8 };
+    }
+    a.span = n * 8;
+}
+
+fn set_n(a: *mut ArgPlan, n: usize) void {
+    a.n = n;
+    a.pieces = u.newn.[Piece](n + 1)[0..n];
+    a.slot = u.newn.[i32](n + 1)[0..n];
+}
+
+fn set_scalar(a: *mut ArgPlan, t: *cty.CType) void {
+    a.kind = A_SCALAR;
+    set_n(a, 1);
+    a.pieces[0] = Piece.{ ty: scalar_ty(t), off: 0 };
+    a.span = cty.size_of(t);
+}
+
+fn set_ref(a: *mut ArgPlan) void {
+    a.kind = A_REF;
+    set_n(a, 1);
+    a.pieces[0] = Piece.{ ty: ir.t_ptr(), off: 0 };
+}
+
+// The pieces of argument i as items (scalar ones with their extension).
+fn push_pieces(b: *mut Builder, i: usize, to_stack: bool) void {
+    let a = &mut b.p.args[i];
+    for k in 0..a.n {
+        let mut ext: u8 = 0;
+        let mut ty = a.pieces[k].ty;
+        if a.kind == A_SCALAR {
+            ext = ext_of(a.ty);
+            if a.as_int {
+                ty = ir.t_int(64);
+                ext = 0;
+            }
+        }
+        let it = item(ty, ext, SL_ARG, @int_cast(i32, i), k);
+        if to_stack {
+            b.stack.push(it);
+        } else {
+            b.regs.push(it);
+        }
+    }
+}
+
+fn fill(b: *mut Builder, fp: bool, n: u64) void {
+    for k in 0..n {
+        _ = k;
+        if fp {
+            b.regs.push(item(ir.t_float(64), 0, SL_FILL, -1, 0));
+        } else {
+            b.regs.push(item(ir.t_int(64), 0, SL_FILL, -1, 0));
+        }
+    }
+}
+
+// x86-64 System V: argument i.
+fn sysv_arg(b: *mut Builder, i: usize) void {
+    let a = &mut b.p.args[i];
+    let t = a.ty;
+    if not cty.is_record(t) {
+        set_scalar(a, t);
+        let fp = is_fp_ty(a.pieces[0].ty);
+        if fp and (b.nf < 8) {
+            b.nf += 1;
+            push_pieces(b, i, false);
+        } else if not fp and (b.ng < 6) {
+            b.ng += 1;
+            push_pieces(b, i, false);
+        } else {
+            b.soff += 8;
+            push_pieces(b, i, true);
+        }
+        return;
+    }
+    let cl = classify_sysv(t);
+    if cl.n > 0 {
+        let mut g: u64 = 0;
+        let mut f: u64 = 0;
+        for k in 0..cl.n {
+            if cl.c[k] == C_SSE {
+                f += 1;
+            } else {
+                g += 1;
+            }
+        }
+        if ((b.ng + g) <= 6) and ((b.nf + f) <= 8) {
+            eightbyte_pieces(a, t, &cl);
+            b.ng += g;
+            b.nf += f;
+            push_pieces(b, i, false);
+            return;
+        }
+    }
+    // MEMORY, or no registers left for all of it: its image on the stack
+    chunk_pieces(a, t);
+    pad_stack(b, cty.align_of(t), false, true);
+    b.soff += @as(u64, a.n) * 8;
+    push_pieces(b, i, true);
+}
+
+// Windows x64: argument i, at the next position.
+fn win_arg(b: *mut Builder, i: usize, variadic: bool) void {
+    let a = &mut b.p.args[i];
+    let t = a.ty;
+    if not cty.is_record(t) {
+        set_scalar(a, t);
+        a.as_int = variadic and (b.pos < 4) and is_fp_ty(a.pieces[0].ty);
+    } else {
+        let size = cty.size_of(t);
+        if (size == 1) or (size == 2) or (size == 4) or (size == 8) {
+            a.kind = A_PIECES;
+            set_n(a, 1);
+            a.pieces[0] = Piece.{ ty: int_piece(size), off: 0 };
+            a.span = size;
+        } else {
+            set_ref(a);
+        }
+    }
+    b.pos += 1;
+    if b.pos > 4 {
+        b.soff += 8;
+    }
+    push_pieces(b, i, false);
+}
+
+// AArch64: argument i (darwin_va: a variadic argument on macOS, in 8-byte
+// stack slots).
+fn a64_arg(b: *mut Builder, i: usize, darwin_va: bool) void {
+    let a = &mut b.p.args[i];
+    let t = a.ty;
+    let darwin = b.p.abi == ABI_DARWIN;
+    if not cty.is_record(t) {
+        set_scalar(a, t);
+        if darwin_va {
+            push_pieces(b, i, false);
+            return;
+        }
+        let fp = is_fp_ty(a.pieces[0].ty);
+        if fp and (b.nf < 8) {
+            b.nf += 1;
+        } else if not fp and (b.ng < 8) {
+            b.ng += 1;
+        } else {
+            stack_bytes(b, a.pieces[0].ty.size, darwin);
+        }
+        push_pieces(b, i, false);
+        return;
+    }
+    let size = cty.size_of(t);
+    if darwin_va {
+        if size > 16 {
+            set_ref(a);
+        } else {
+            chunk_pieces(a, t);
+        }
+        push_pieces(b, i, false);
+        return;
+    }
+    let h = hfa_of(t);
+    if h.n > 0 {
+        if (b.nf + h.n) <= 8 {
+            a.kind = A_PIECES;
+            set_n(a, @truncate(usize, h.n));
+            let et = ir.t_float(@truncate(i32, @bit_cast(i64, h.es * 8)));
+            for k in 0..a.n {
+                a.pieces[k] = Piece.{ ty: et, off: @as(u64, k) * h.es };
+            }
+            a.span = size;
+            b.nf += h.n;
+            push_pieces(b, i, false);
+            return;
+        }
+        // (no registers for all of it: none for any floating-point argument after it)
+        fill(b, true, 8 - b.nf);
+        b.nf = 8;
+        chunk_pieces(a, t);
+        // (its image in floating-point pieces: those, and not the integer
+        // registers left, are used up)
+        for k in 0..a.n {
+            a.pieces[k].ty = ir.t_float(64);
+        }
+        pad_stack(b, cty.align_of(t), true, false);
+        stack_bytes(b, @as(u64, a.n) * 8, false);
+        push_pieces(b, i, false);
+        return;
+    }
+    if size > 16 {
+        set_ref(a);
+        if b.ng < 8 {
+            b.ng += 1;
+        } else {
+            stack_bytes(b, 8, darwin);
+        }
+        push_pieces(b, i, false);
+        return;
+    }
+    chunk_pieces(a, t);
+    let n = @as(u64, a.n);
+    if (cty.align_of(t) >= 16) and ((b.ng % 2) == 1) and (b.ng < 8) {
+        fill(b, false, 1);
+        b.ng += 1;
+    }
+    if (b.ng + n) <= 8 {
+        b.ng += n;
+    } else {
+        fill(b, false, 8 - b.ng);
+        b.ng = 8;
+        pad_stack(b, cty.align_of(t), false, false);
+        stack_bytes(b, n * 8, false);
+    }
+    push_pieces(b, i, false);
+}
+
+// Fillers that land on the stack (the registers of their class are used
+// up) until it is aligned to al (at most 16 on AArch64): a structure's
+// alignment there (to_stack: System V's list of what goes on the stack).
+fn pad_stack(b: *mut Builder, al0: u64, fp: bool, to_stack: bool) void {
+    let mut al = al0;
+    if not to_stack and (al > 16) {
+        al = 16;
+    }
+    if al <= 8 {
+        return;
+    }
+    b.soff = cty.round_up(b.soff, 8);
+    while (b.soff % al) != 0 {
+        let mut it = item(ir.t_int(64), 0, SL_FILL, -1, 0);
+        if fp {
+            it = item(ir.t_float(64), 0, SL_FILL, -1, 0);
+        }
+        if to_stack {
+            b.stack.push(it);
+        } else {
+            b.regs.push(it);
+        }
+        b.soff += 8;
+    }
+}
+
+// The stack the named arguments use: 8-byte slots, but macOS packs scalars
+// at their own size and alignment.
+fn stack_bytes(b: *mut Builder, size: u64, packed: bool) void {
+    if packed {
+        b.soff = cty.round_up(b.soff, size) + size;
+    } else {
+        b.soff = cty.round_up(b.soff, 8) + cty.round_up(size, 8);
+    }
+}
+
+// WebAssembly: argument i.
+fn wasm_arg(b: *mut Builder, i: usize, in_buffer: bool) void {
+    let a = &mut b.p.args[i];
+    let t = a.ty;
+    if not cty.is_record(t) {
+        set_scalar(a, t);
+    } else {
+        let st = single_scalar(t);
+        if u.notnil(st) {
+            a.kind = A_PIECES;
+            set_n(a, 1);
+            a.pieces[0] = Piece.{ ty: st, off: 0 };
+            a.span = st.size;
+        } else {
+            set_ref(a);
+        }
+    }
+    if in_buffer {
+        // (each in a slot of at least 4 bytes, aligned to its size)
+        let mut sz = a.pieces[0].ty.size;
+        if sz < 4 {
+            sz = 4;
+        }
+        let off = cty.round_up(b.soff, sz);
+        a.va_off = off;
+        a.slot[0] = -1;
+        b.soff = off + sz;
+        return;
+    }
+    push_pieces(b, i, false);
+}
+
+fn set_result(b: *mut Builder) void {
+    let p = b.p;
+    let t = p.rty;
+    if cty.is_void(t) {
+        p.ret = R_VOID;
+        return;
+    }
+    if not cty.is_record(t) {
+        p.ret = R_SCALAR;
+        p.rn = 1;
+        p.rpieces[0] = Piece.{ ty: scalar_ty(t), off: 0 };
+        return;
+    }
+    let size = cty.size_of(t);
+    let ab = p.abi;
+    let a = u.new.[ArgPlan]();
+    a.ty = t;
+    if ab == ABI_SYSV {
+        let cl = classify_sysv(t);
+        if cl.n > 0 {
+            eightbyte_pieces(a, t, &cl);
+            set_pieces_result(b, a);
+            return;
+        }
+        sret(b, 0);
+        p.ret_ptr = true;
+        b.ng = 1;
+        return;
+    }
+    if ab == ABI_WIN {
+        if (size == 1) or (size == 2) or (size == 4) or (size == 8) {
+            set_n(a, 1);
+            a.pieces[0] = Piece.{ ty: int_piece(size), off: 0 };
+            a.span = size;
+            set_pieces_result(b, a);
+            return;
+        }
+        sret(b, 0);
+        p.ret_ptr = true;
+        b.pos = 1;
+        return;
+    }
+    if (ab == ABI_A64) or (ab == ABI_DARWIN) {
+        let h = hfa_of(t);
+        if h.n > 0 {
+            set_n(a, @truncate(usize, h.n));
+            let et = ir.t_float(@truncate(i32, @bit_cast(i64, h.es * 8)));
+            for k in 0..a.n {
+                a.pieces[k] = Piece.{ ty: et, off: @as(u64, k) * h.es };
+            }
+            a.span = size;
+            set_pieces_result(b, a);
+            return;
+        }
+        if size <= 16 {
+            chunk_pieces(a, t);
+            if size <= 4 {
+                a.pieces[0].ty = int_piece(size);
+                a.span = memory_span(a);
+            }
+            set_pieces_result(b, a);
+            return;
+        }
+        sret(b, ir.EXT_X8SRET);  // (in x8: no x register used)
+        return;
+    }
+    let st = single_scalar(t);
+    if u.notnil(st) {
+        set_n(a, 1);
+        a.pieces[0] = Piece.{ ty: st, off: 0 };
+        a.span = st.size;
+        set_pieces_result(b, a);
+        return;
+    }
+    sret(b, ir.EXT_SRET);
+}
+
+fn sret(b: *mut Builder, ext: u8) void {
+    b.p.ret = R_SRET;
+    b.regs.push(item(ir.t_ptr(), ext, SL_RET, -1, 0));
+}
+
+fn set_pieces_result(b: *mut Builder, a: *ArgPlan) void {
+    let p = b.p;
+    p.rn = a.n;
+    for k in 0..a.n {
+        p.rpieces[k] = a.pieces[k];
+    }
+    p.rspan = memory_span(a);
+    if a.n == 1 {
+        p.ret = R_PIECE;
+        return;
+    }
+    p.ret = R_REGS;
+    // the buffer: no register; the mark says which registers fill it
+    let mut code = ir.EXT_REGS | @truncate(u8, a.n - 1);
+    if a.pieces[1].off == 8 {
+        code = code | ir.EXT_REGS_WIDE;
+    }
+    for k in 0..a.n {
+        if is_fp_ty(a.pieces[k].ty) {
+            code = code | (ir.EXT_REGS_FP0 << @truncate(u8, k));
+        }
+    }
+    b.regs.push(item(ir.t_ptr(), code, SL_RET, -1, 0));
+}
+
+/// The plan of a call of, or the definition (define) of, a function
+/// returning ret whose arguments (or parameters) have types ps (the
+/// variadic arguments' promoted), of which the first nnamed are the
+/// prototype's parameters; variadic: the function's type ends with `...`.
+pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variadic: bool, define: bool) *mut Plan {
+    let p = new_plan(ret, ps.len);
+    p.nnamed = nnamed;
+    for i in 0..ps.len {
+        p.args[i].ty = cty.unqual(ps[i]);
+    }
+    let b = u.new.[Builder]();
+    b.p = p;
+    b.regs = u.List.[Item].empty();
+    b.stack = u.List.[Item].empty();
+    set_result(b);
+    let ab = p.abi;
+    let mut nfixed_items: usize = 0;
+    for i in 0..ps.len {
+        let va = i >= nnamed;
+        if va and (nfixed_items == 0) {
+            nfixed_items = b.regs.len + b.stack.len;
+        }
+        if ab == ABI_SYSV {
+            sysv_arg(b, i);
+        } else if ab == ABI_WIN {
+            win_arg(b, i, va);
+        } else if (ab == ABI_A64) or (ab == ABI_DARWIN) {
+            a64_arg(b, i, va and (ab == ABI_DARWIN));
+        } else {
+            wasm_arg(b, i, va);
+        }
+    }
+    if (nnamed >= ps.len) or (nfixed_items == 0) {
+        nfixed_items = b.regs.len + b.stack.len;
+    }
+    // the named arguments' use, for va_start
+    p.va_gp = b.ng;
+    p.va_fp = b.nf;
+    p.va_stack = b.soff;
+    if ab == ABI_WIN {
+        p.va_gp = b.pos;
+    }
+    if variadic and define {
+        if ab == ABI_SYSV {
+            pads(b, false, 6 - b.ng);
+            pads(b, true, 8 - b.nf);
+            b.ng = 6;
+            b.nf = 8;
+        } else if ab == ABI_WIN {
+            if b.pos < 4 {
+                pads(b, false, 4 - b.pos);
+            }
+        } else if ab == ABI_A64 {
+            pads(b, false, 8 - b.ng);
+            pads(b, true, 8 - b.nf);
+        }
+    }
+    // x86-64: what goes on the stack follows fillers for the free registers
+    if b.stack.len > 0 {
+        let mut gp = false;
+        let mut fp = false;
+        for x in b.stack.items() {
+            if is_fp_ty(x.ty) {
+                fp = true;
+            } else {
+                gp = true;
+            }
+        }
+        if gp and (b.ng < 6) {
+            fill(b, false, 6 - b.ng);
+            b.ng = 6;
+        }
+        if fp and (b.nf < 8) {
+            fill(b, true, 8 - b.nf);
+            b.nf = 8;
+        }
+        for x in b.stack.items() {
+            b.regs.push(x);
+        }
+    }
+    if (ab == ABI_WASM) and variadic {
+        p.vabuf_size = b.soff;
+        b.regs.push(item(ir.t_ptr(), 0, SL_VABUF, -1, 0));
+    }
+    // the IR parameters, and where each argument went
+    for k in 0..b.regs.len {
+        let x = b.regs.get(k);
+        let idx = @int_cast(i32, p.tys.len);
+        p.tys.push(x.ty);
+        p.exts.push(x.ext);
+        p.what.push(x.what);
+        if x.what == SL_ARG {
+            p.args[@int_cast(usize, x.arg)].slot[x.piece] = idx;
+        } else if x.what == SL_PAD_GP {
+            p.pads_gp.push(idx);
+        } else if x.what == SL_PAD_FP {
+            p.pads_fp.push(idx);
+        } else if x.what == SL_VABUF {
+            p.vabuf = idx;
+        }
+    }
+    p.vararg = variadic and not define and (ab != ABI_WASM);
+    p.nfixed = p.tys.len;
+    if p.vararg and (ab == ABI_DARWIN) {
+        p.nfixed = nfixed_items;
+    }
+    let mut rt = ir.t_void();
+    if (p.ret == R_SCALAR) or (p.ret == R_PIECE) {
+        rt = p.rpieces[0].ty;
+    } else if (p.ret == R_SRET) and p.ret_ptr {
+        rt = ir.t_ptr();
+    }
+    let all = p.tys.items();
+    p.fty = ir.t_fn(rt, all[0..p.nfixed], p.vararg);
+    return p;
+}
+
+fn pads(b: *mut Builder, fp: bool, n: u64) void {
+    for k in 0..n {
+        _ = k;
+        if fp {
+            b.regs.push(item(ir.t_float(64), 0, SL_PAD_FP, -1, 0));
+        } else {
+            b.regs.push(item(ir.t_int(64), 0, SL_PAD_GP, -1, 0));
+        }
+    }
+}
+
+/// The IR parameters' marks (a call's ext slice from index 1, a function's
+/// param_ext), and the result's in ex[0] when it is a scalar.
+pub fn ret_ext(p: *Plan) u8 {
+    if p.ret == R_SCALAR {
+        return ext_of(p.rty);
+    }
+    return 0;
+}

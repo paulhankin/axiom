@@ -1,0 +1,859 @@
+// =============================================================================
+// cgen_va.ax - IR generation for the platform C calling conventions (the
+// Plans of cgen_abi.ax): the arguments of a call and its result, a
+// function's parameters and its return; variable arguments (va_start,
+// va_arg, va_copy, va_end) on each ABI; and the other builtins
+// (csema_builtin.ax): unreachable, <stdbit.h>'s and <stdckdint.h>'s.
+//
+// Values are as cgen.ax has them: a scalar is an IR value, a structure or
+// union the address of memory holding it.
+//
+// A variadic function saves at its start the registers its plan's pads
+// arrive in, where va_arg finds them: System V's register save area (176
+// bytes: rdi..r9, then xmm0-7 in 16-byte slots), AArch64's (64 bytes of
+// x0-x7 below __gr_top, 128 of q0-q7 below __vr_top), or (Windows) the home
+// area its caller reserved above the return address; its stack arguments
+// start 16 bytes above the frame address (IN_FRAME_ADDR: the saved frame
+// pointer and the return address are there).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "cgen_abi.ax" as abi;
+import "csema_builtin.ax" as csb;
+import "ctypes.ax" as cty;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+fn B() *mut ir.Builder {
+    return cg.B;
+}
+
+fn i32t() *mut ir.Ty {
+    return ir.t_int(32);
+}
+
+fn i64t() *mut ir.Ty {
+    return ir.t_int(64);
+}
+
+fn c32(v: i64) *mut ir.Value {
+    return ir.cint(i32t(), @bit_cast(u64, v));
+}
+
+fn c64(v: u64) *mut ir.Value {
+    return ir.cint(i64t(), v);
+}
+
+// p + off bytes.
+fn at(p: *mut ir.Value, off: u64) *mut ir.Value {
+    if off == 0 {
+        return p;
+    }
+    return ir.ptradd(B(), p, cg.usz(off));
+}
+
+// The largest power of two (at most a) that divides off.
+fn align_at(a: u64, off: u64) u64 {
+    let mut al = a;
+    while (al > 1) and ((off % al) != 0) {
+        al = al / 2;
+    }
+    if al == 0 {
+        return 1;
+    }
+    return al;
+}
+
+fn ld(t: *mut ir.Ty, p: *mut ir.Value, al: u64) *mut ir.Value {
+    let v = ir.load(B(), t, p);
+    v.align = @truncate(u32, @min(al, t.size));
+    return v;
+}
+
+fn st(v: *mut ir.Value, p: *mut ir.Value, al: u64) void {
+    let s = ir.store(B(), v, p);
+    s.align = @truncate(u32, @min(al, v.ty.size));
+}
+
+// A buffer of n bytes in the frame, aligned to al.
+fn buffer(n: u64, al: u64) *mut ir.Value {
+    let mut sz = n;
+    if sz == 0 {
+        sz = 1;
+    }
+    return cg.aligned_alloca(cty.array_of(cty.t_uchar, sz, true), "abi", al);
+}
+
+fn copy(dst: *mut ir.Value, src: *mut ir.Value, n: u64) void {
+    if n > 0 {
+        _ = ir.memop(B(), ir.OP_MEMMOVE, dst, src, cg.usz(n));
+    }
+}
+
+// The memory of a structure or union of type t at p, readable for span
+// bytes: p, or a copy.
+fn readable(t: *cty.CType, p: *mut ir.Value, span: u64) *mut ir.Value {
+    let size = cty.size_of(t);
+    if span <= size {
+        return p;
+    }
+    let b = buffer(span, cty.align_of(t));
+    copy(b, p, size);
+    return b;
+}
+
+fn alloc_of(t: *mut cty.CType, span: u64) *mut ir.Value {
+    if span <= cty.size_of(t) {
+        return cg.alloca(t, "tmp");
+    }
+    return buffer(span, @max(cty.align_of(t), 8));
+}
+
+// A pointer as an integer and back (for rounding addresses up).
+fn round_ptr(p: *mut ir.Value, al: u64) *mut ir.Value {
+    if al <= 1 {
+        return p;
+    }
+    let i = ir.ptrtoint(B(), p, cg.T_isz);
+    let r = ir.and_(B(), ir.add(B(), i, cg.usz(al - 1)), cg.usz(0 - al));
+    return ir.inttoptr(B(), r);
+}
+
+// A value of the promoted type `from` as one of type t (for va_arg of a
+// type the promotions change): a narrower integer or float.
+fn narrow(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if t.kind == cty.TK_BOOL {
+        let nz = ir.icmp(B(), ir.IntNE, v, ir.cint(v.ty, 0));
+        return ir.zext(B(), nz, ir.t_int(8));
+    }
+    if cty.is_integer(t) and (cty.storage_bits(t) < v.ty.bits) {
+        return ir.trunc(B(), v, ir.t_int(cty.storage_bits(t)));
+    }
+    if (t.kind == cty.TK_FLOAT) and (v.ty.bits == 64) {
+        return ir.cast(B(), ir.OP_FPTRUNC, v, ir.t_float(32));
+    }
+    return v;
+}
+
+// The IR type of scalar C type t.
+fn sty(t: *mut cty.CType) *mut ir.Ty {
+    return cg.lty(t);
+}
+
+// -----------------------------------------------------------------------------
+// Calls
+// -----------------------------------------------------------------------------
+
+/// Emits a call of callee (of IR type fty, made by plan p) with the C
+/// argument values vs; returns the C result's value (nil for void).
+pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: []mut *mut ir.Value) *mut ir.Value {
+    let nt = p.tys.len;
+    let args = u.newn.[*mut ir.Value](nt + 1);
+    let mut res = ir.vnil();
+    let mut vb = ir.vnil();
+    for k in 0..nt {
+        let w = p.what.get(k);
+        let t = p.tys.get(k);
+        if w == abi.SL_RET {
+            if p.ret == abi.R_SRET {
+                res = cg.alloca(p.rty, "ret");
+            } else {
+                res = buffer(32, 16);
+            }
+            args[k] = res;
+        } else if w == abi.SL_VABUF {
+            vb = buffer(p.vabuf_size + 8, 16);
+            args[k] = vb;
+        } else if w != abi.SL_ARG {
+            args[k] = ir.czero(t);  // (a filler)
+        }
+    }
+    for i in 0..p.args.len {
+        let a = &p.args[i];
+        let v = vs[i];
+        if a.kind == abi.A_SCALAR {
+            let mut x = v;
+            if a.as_int {
+                x = ir.bitcast(B(), v, i64t());
+            }
+            if a.slot[0] < 0 {
+                va_store_scalar(vb, a, x);
+            } else {
+                args[@int_cast(usize, a.slot[0])] = x;
+            }
+        } else if a.kind == abi.A_REF {
+            let c = cg.alloca(a.ty, "arg");
+            copy(c, v, cty.size_of(a.ty));
+            if a.slot[0] < 0 {
+                st(c, at(vb, a.va_off), cty.ptr_bytes);
+            } else {
+                args[@int_cast(usize, a.slot[0])] = c;
+            }
+        } else {
+            let src = readable(a.ty, v, a.span);
+            let al = cty.align_of(a.ty);
+            for k in 0..a.n {
+                let pc = a.pieces[k];
+                let x = ld(pc.ty, at(src, pc.off), align_at(al, pc.off));
+                if a.slot[k] < 0 {
+                    va_store_scalar(vb, a, x);
+                } else {
+                    args[@int_cast(usize, a.slot[k])] = x;
+                }
+            }
+        }
+    }
+    let r = ir.call(B(), fty, callee, args[0..nt]);
+    let ex = ir.ext_of(r);
+    ex[0] = abi.ret_ext(p);
+    for k in 0..nt {
+        if (k + 1) < ex.len {
+            ex[k + 1] = p.exts.get(k);
+        }
+    }
+    if (p.ret == abi.R_SRET) or (p.ret == abi.R_REGS) {
+        return res;
+    }
+    if p.ret == abi.R_PIECE {
+        let tmp = alloc_of(p.rty, p.rspan);
+        st(r, tmp, cty.align_of(p.rty));
+        return tmp;
+    }
+    if p.ret == abi.R_VOID {
+        return ir.vnil();
+    }
+    return r;
+}
+
+// A WebAssembly variadic argument (a scalar, or a structure's one piece)
+// into the buffer, in a slot of at least 4 bytes.
+fn va_store_scalar(vb: *mut ir.Value, a: *abi.ArgPlan, x0: *mut ir.Value) void {
+    let mut x = x0;
+    if (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
+        if (a.kind == abi.A_SCALAR) and a.ty.is_signed and (a.ty.kind != cty.TK_BOOL) {
+            x = ir.sext(B(), x, i32t());
+        } else {
+            x = ir.zext(B(), x, i32t());
+        }
+    }
+    st(x, at(vb, a.va_off), x.ty.size);
+}
+
+// -----------------------------------------------------------------------------
+// Functions: parameters and return
+// -----------------------------------------------------------------------------
+
+struct VaState {
+    p: *mut abi.Plan,
+    f: *mut ir.Func,
+    on: bool,             // the function is variadic
+    save: *mut ir.Value,  // the register save area (System V, AArch64)
+    args: *mut ir.Value,  // the stack arguments' start (native targets)
+}
+
+let mut VA: VaState = VaState.{ p: @ptr_from_int(*mut abi.Plan, 0), f: @ptr_from_int(*mut ir.Func, 0), on: false,
+                                save: @ptr_from_int(*mut ir.Value, 0), args: @ptr_from_int(*mut ir.Value, 0) };
+
+/// The start of function f (plan p), in its first block: the objects of
+/// its parameters ps (each one's ir set), the result's address (the
+/// returned value: R_SRET, R_REGS), and for a variadic function the
+/// registers its variadic arguments may be in, saved.
+pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, variadic: bool) *mut ir.Value {
+    VA = VaState.{ p: p, f: f, on: variadic, save: ir.vnil(), args: ir.vnil() };
+    let mut res = ir.vnil();
+    for k in 0..p.what.len {
+        if p.what.get(k) == abi.SL_RET {
+            res = f.params[k];
+        }
+    }
+    for i in 0..ps.len {
+        let s = ps[i];
+        let a = &p.args[i];
+        if a.kind == abi.A_REF {
+            // (the caller's copy: this function's own)
+            s.ir = @ptr_cast(*mut void, f.params[@int_cast(usize, a.slot[0])]);
+            continue;
+        }
+        let o = alloc_of(s.ty, a.span);
+        s.ir = @ptr_cast(*mut void, o);
+        if a.kind == abi.A_SCALAR {
+            // (a parameter of a definition with an identifier list arrives
+            // promoted: cgen_stmt converts it)
+            if a.ty == cty.unqual(s.ty) {
+                st(f.params[@int_cast(usize, a.slot[0])], o, cty.align_of(s.ty));
+            }
+            continue;
+        }
+        let al = cty.align_of(s.ty);
+        for k in 0..a.n {
+            let pc = a.pieces[k];
+            st(f.params[@int_cast(usize, a.slot[k])], at(o, pc.off), align_at(al, pc.off));
+        }
+    }
+    if variadic {
+        save_registers(p, f);
+    }
+    return res;
+}
+
+fn frame_args() *mut ir.Value {
+    let none = u.newn.[*mut ir.Value](1);
+    let fa = ir.intr(B(), ir.IN_FRAME_ADDR, cg.T_ptr, none[0..0]);
+    return at(fa, 16);
+}
+
+fn save_registers(p: *mut abi.Plan, f: *mut ir.Func) void {
+    let ab = p.abi;
+    if ab == abi.ABI_WASM {
+        return;
+    }
+    VA.args = frame_args();
+    if ab == abi.ABI_WIN {
+        // the home area of the positions after the named ones
+        for j in 0..p.pads_gp.len {
+            let x = f.params[@int_cast(usize, p.pads_gp.get(j))];
+            st(x, at(VA.args, (p.va_gp + @as(u64, j)) * 8), 8);
+        }
+        return;
+    }
+    if ab == abi.ABI_DARWIN {
+        return;
+    }
+    let mut gsize: u64 = 48;
+    if ab == abi.ABI_A64 {
+        gsize = 64;
+    }
+    VA.save = buffer(gsize + 128, 16);
+    for j in 0..p.pads_gp.len {
+        let x = f.params[@int_cast(usize, p.pads_gp.get(j))];
+        st(x, at(VA.save, (p.va_gp + @as(u64, j)) * 8), 8);
+    }
+    for j in 0..p.pads_fp.len {
+        let x = f.params[@int_cast(usize, p.pads_fp.get(j))];
+        st(x, at(VA.save, gsize + ((p.va_fp + @as(u64, j)) * 16)), 8);
+    }
+}
+
+/// Returns value v (a scalar, or a structure's address; nil: none) of the
+/// function with plan p, whose result's address is res.
+pub fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
+    if p.ret == abi.R_VOID {
+        ir.ret_void(B());
+        return;
+    }
+    if u.isnil(v) {
+        ret_default(p, res);
+        return;
+    }
+    if p.ret == abi.R_SCALAR {
+        ir.ret(B(), v);
+        return;
+    }
+    let size = cty.size_of(p.rty);
+    if p.ret == abi.R_PIECE {
+        let src = readable(p.rty, v, p.rspan);
+        ir.ret(B(), ld(p.rpieces[0].ty, src, cty.align_of(p.rty)));
+        return;
+    }
+    copy(res, v, size);
+    if p.ret_ptr {
+        ir.ret(B(), res);
+        return;
+    }
+    ir.ret_void(B());
+}
+
+/// The return at the end of a function body (plan p) that has none: the
+/// value is undefined (6.9.1p12), main's is 0 (it returns int).
+pub fn ret_default(p: *mut abi.Plan, res: *mut ir.Value) void {
+    if p.ret == abi.R_SCALAR {
+        ir.ret(B(), ir.czero(p.rpieces[0].ty));
+    } else if p.ret == abi.R_PIECE {
+        ir.ret(B(), ir.undef(p.rpieces[0].ty));
+    } else if (p.ret == abi.R_SRET) and p.ret_ptr {
+        ir.ret(B(), res);
+    } else {
+        ir.ret_void(B());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Variable arguments
+// -----------------------------------------------------------------------------
+
+fn va_start(ap: *mut ir.Value) void {
+    let p = VA.p;
+    let ab = p.abi;
+    if ab == abi.ABI_WASM {
+        st(VA.f.params[@int_cast(usize, p.vabuf)], ap, cty.ptr_bytes);
+        return;
+    }
+    if ab == abi.ABI_WIN {
+        st(at(VA.args, p.va_gp * 8), ap, 8);
+        return;
+    }
+    if ab == abi.ABI_DARWIN {
+        st(at(VA.args, cty.round_up(p.va_stack, 8)), ap, 8);
+        return;
+    }
+    if ab == abi.ABI_SYSV {
+        st(c32(@bit_cast(i64, p.va_gp * 8)), ap, 4);
+        st(c32(@bit_cast(i64, 48 + (p.va_fp * 16))), at(ap, 4), 4);
+        st(at(VA.args, p.va_stack), at(ap, 8), 8);
+        st(VA.save, at(ap, 16), 8);
+        return;
+    }
+    st(at(VA.args, cty.round_up(p.va_stack, 8)), ap, 8);
+    st(at(VA.save, 64), at(ap, 8), 8);
+    st(at(VA.save, 192), at(ap, 16), 8);
+    st(c32(0 - @bit_cast(i64, (8 - p.va_gp) * 8)), at(ap, 24), 4);
+    st(c32(0 - @bit_cast(i64, (8 - p.va_fp) * 16)), at(ap, 28), 4);
+}
+
+/// The value of va_arg(*ap, t): a scalar, or the address of a copy.
+pub fn va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let pt = cty.arg_promote(cty.unqual(t));
+    let ab = abi.abi();
+    let mut addr = ir.vnil();
+    if ab == abi.ABI_SYSV {
+        addr = sysv_va_arg(ap, pt);
+    } else if ab == abi.ABI_A64 {
+        addr = a64_va_arg(ap, pt);
+    } else {
+        addr = slot_va_arg(ap, pt, ab);
+    }
+    if cty.is_record(pt) {
+        let r = cg.alloca(pt, "va");
+        copy(r, addr, cty.size_of(pt));
+        return r;
+    }
+    let v = ld(sty(pt), addr, cty.align_of(pt));
+    return narrow(v, t);
+}
+
+// Windows, macOS, WebAssembly: va_list points at the next argument's slot.
+fn slot_va_arg(ap: *mut ir.Value, t: *mut cty.CType, ab: i32) *mut ir.Value {
+    let mut p = ld(cg.T_ptr, ap, cty.ptr_bytes);
+    let size = cty.size_of(t);
+    let mut slot: u64 = 8;
+    let mut by_ref = false;
+    if ab == abi.ABI_WIN {
+        by_ref = cty.is_record(t) and not ((size == 1) or (size == 2) or (size == 4) or (size == 8));
+    } else if ab == abi.ABI_DARWIN {
+        by_ref = cty.is_record(t) and (size > 16);
+        if not by_ref {
+            slot = cty.round_up(size, 8);
+        }
+    } else {
+        // (as cgen_abi.wasm_arg puts them: at least 4 bytes, aligned to the size)
+        let a = one_arg(t, true);
+        by_ref = a.kind == abi.A_REF;
+        slot = a.pieces[0].ty.size;
+        if slot < 4 {
+            slot = 4;
+        }
+        p = round_ptr(p, slot);
+    }
+    st(at(p, slot), ap, cty.ptr_bytes);
+    if by_ref {
+        return ld(cg.T_ptr, p, cty.ptr_bytes);
+    }
+    return p;
+}
+
+// System V: from the register save area while the registers the argument
+// needs are left, else from the overflow area.
+fn sysv_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let a = one_arg(t, false);
+    let size = cty.size_of(t);
+    let mut g: u64 = 0;
+    let mut f: u64 = 0;
+    // (the plan of one argument alone puts it in registers unless it is
+    // MEMORY: then its pieces follow the six integer fillers)
+    let regs_ok = a.slot[0] < 6;
+    for k in 0..a.n {
+        if a.pieces[k].ty.kind == ir.T_FLOAT {
+            f += 1;
+        } else {
+            g += 1;
+        }
+    }
+    let regb = cg.new_block("va.reg");
+    let stackb = cg.new_block("va.stack");
+    let done = cg.new_block("va.done");
+    let gp = ld(i32t(), ap, 4);
+    let fp = ld(i32t(), at(ap, 4), 4);
+    if regs_ok {
+        let mut c = ir.icmp(B(), ir.IntULE, gp, c32(@bit_cast(i64, 48 - (8 * g))));
+        if f > 0 {
+            let c2 = ir.icmp(B(), ir.IntULE, fp, c32(@bit_cast(i64, 176 - (16 * f))));
+            c = ir.and_(B(), c, c2);
+        }
+        ir.condbr(B(), c, regb, stackb);
+    } else {
+        ir.br(B(), stackb);
+    }
+    // registers: the pieces into a buffer, which then holds the value
+    cg.at_end(regb);
+    let rsa = ld(cg.T_ptr, at(ap, 16), 8);
+    let buf = buffer(16, 16);
+    let mut gi: u64 = 0;
+    let mut fi: u64 = 0;
+    for k in 0..a.n {
+        let pc = a.pieces[k];
+        let mut src = ir.vnil();
+        if pc.ty.kind == ir.T_FLOAT {
+            src = ir.ptradd(B(), rsa, ir.zext(B(), ir.add(B(), fp, c32(@bit_cast(i64, fi * 16))), cg.T_isz));
+            fi += 1;
+        } else {
+            src = ir.ptradd(B(), rsa, ir.zext(B(), ir.add(B(), gp, c32(@bit_cast(i64, gi * 8))), cg.T_isz));
+            gi += 1;
+        }
+        st(ld(i64t(), src, 8), at(buf, @as(u64, k) * 8), 8);
+    }
+    if g > 0 {
+        st(ir.add(B(), gp, c32(@bit_cast(i64, g * 8))), ap, 4);
+    }
+    if f > 0 {
+        st(ir.add(B(), fp, c32(@bit_cast(i64, f * 16))), at(ap, 4), 4);
+    }
+    let regend = ir.insert_block(B());
+    ir.br(B(), done);
+    // the overflow area (aligned to 16 for a type that is)
+    cg.at_end(stackb);
+    let mut ov = ld(cg.T_ptr, at(ap, 8), 8);
+    if cty.align_of(t) > 8 {
+        ov = round_ptr(ov, cty.align_of(t));
+    }
+    st(at(ov, cty.round_up(size, 8)), at(ap, 8), 8);
+    let stackend = ir.insert_block(B());
+    ir.br(B(), done);
+    cg.at_end(done);
+    let ph = ir.phi(B(), cg.T_ptr);
+    ir.add_incoming(ph, buf, regend);
+    ir.add_incoming(ph, ov, stackend);
+    return ph;
+}
+
+// The plan of an argument of type t alone (variadic: as a variadic argument).
+fn one_arg(t: *mut cty.CType, variadic: bool) abi.ArgPlan {
+    let mut one: [1]*mut cty.CType = [t];
+    let mut nnamed: usize = 1;
+    if variadic {
+        nnamed = 0;
+    }
+    return abi.plan(cty.t_void, one[..], nnamed, variadic, false).args[0];
+}
+
+// AArch64 (AAPCS64): from the general or vector register save area while
+// the registers the argument needs are left, else from the stack.
+fn a64_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let size = cty.size_of(t);
+    let a = one_arg(t, false);
+    let fpa = (a.kind != abi.A_REF) and (a.pieces[0].ty.kind == ir.T_FLOAT);
+    let by_ref = a.kind == abi.A_REF;
+    let mut n = @as(u64, a.n);
+    let mut es: u64 = 8;
+    if fpa {
+        es = a.pieces[0].ty.size;
+    }
+    let regb = cg.new_block("va.reg");
+    let stackb = cg.new_block("va.stack");
+    let done = cg.new_block("va.done");
+    let mut offs_at: u64 = 24;
+    let mut unit: u64 = 8;
+    let mut top_at: u64 = 8;
+    if fpa {
+        offs_at = 28;
+        unit = 16;
+        top_at = 16;
+    }
+    let offs0 = ld(i32t(), at(ap, offs_at), 4);
+    let try_regs = cg.new_block("va.try");
+    ir.condbr(B(), ir.icmp(B(), ir.IntSGE, offs0, c32(0)), stackb, try_regs);
+    cg.at_end(try_regs);
+    let mut offs = offs0;
+    if not fpa and (cty.align_of(t) >= 16) and not by_ref {
+        offs = ir.and_(B(), ir.add(B(), offs, c32(15)), c32(-16));
+    }
+    if by_ref {
+        n = 1;
+    }
+    let nw = ir.add(B(), offs, c32(@bit_cast(i64, n * unit)));
+    st(nw, at(ap, offs_at), 4);
+    ir.condbr(B(), ir.icmp(B(), ir.IntSGT, nw, c32(0)), stackb, regb);
+    // registers
+    cg.at_end(regb);
+    let top = ld(cg.T_ptr, at(ap, top_at), 8);
+    let base = ir.ptradd(B(), top, ir.sext(B(), offs, cg.T_isz));
+    let mut addr = base;
+    if fpa {
+        // (an HFA's members are each in a 16-byte register slot)
+        let buf = buffer(32, 16);
+        for k in 0..n {
+            let ft = a.pieces[0].ty;
+            st(ld(ft, at(base, k * 16), es), at(buf, k * es), es);
+        }
+        addr = buf;
+    }
+    let regend = ir.insert_block(B());
+    ir.br(B(), done);
+    // the stack
+    cg.at_end(stackb);
+    let mut s = ld(cg.T_ptr, ap, 8);
+    if (cty.align_of(t) >= 16) and not by_ref {
+        s = round_ptr(s, 16);
+    }
+    let mut adv = cty.round_up(size, 8);
+    if by_ref {
+        adv = 8;
+    }
+    st(at(s, adv), ap, 8);
+    let stackend = ir.insert_block(B());
+    ir.br(B(), done);
+    cg.at_end(done);
+    let ph = ir.phi(B(), cg.T_ptr);
+    ir.add_incoming(ph, addr, regend);
+    ir.add_incoming(ph, s, stackend);
+    if by_ref {
+        return ld(cg.T_ptr, ph, 8);
+    }
+    return ph;
+}
+
+// -----------------------------------------------------------------------------
+// Builtins
+// -----------------------------------------------------------------------------
+
+/// The value of builtin call e (e.op: a csema_builtin BI_ number) with the
+/// argument values vs (nil for void).
+pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    let id = e.op;
+    if id == csb.BI_VA_START {
+        va_start(vs[0]);
+        return ir.vnil();
+    }
+    if id == csb.BI_VA_END {
+        return ir.vnil();
+    }
+    if id == csb.BI_VA_COPY {
+        copy(vs[0], vs[1], cty.size_of(csb.va_list_type()));
+        return ir.vnil();
+    }
+    if id == csb.BI_UNREACHABLE {
+        ir.unreachable(B());
+        cg.continue_after();
+        return ir.vnil();
+    }
+    if id < csb.BI_CKD_ADD {
+        return stdbit(id, vs[0], e.args.get(0).ty, e.ty);
+    }
+    let rp = e.args.get(0);
+    return ckd(id, vs[0], rp.ty.elem, vs[1], e.args.get(1).ty, vs[2], e.args.get(2).ty);
+}
+
+fn intr1(id: i32, x: *mut ir.Value) *mut ir.Value {
+    let mut a: [1]*mut ir.Value = [x];
+    return ir.intr(B(), id, x.ty, a[..]);
+}
+
+fn all_ones(t: *mut ir.Ty) *mut ir.Value {
+    return ir.cint(t, 0xFFFF_FFFF_FFFF_FFFF);
+}
+
+// An unsigned result of type rt from w-bit count c (of x's type).
+fn to_uint(c: *mut ir.Value, rt: *mut cty.CType) *mut ir.Value {
+    let it = sty(rt);
+    if c.ty.bits > it.bits {
+        return ir.trunc(B(), c, it);
+    }
+    if c.ty.bits < it.bits {
+        return ir.zext(B(), c, it);
+    }
+    return c;
+}
+
+// k + 1, or 0 where k is the width (none found): the first_* functions.
+fn first(k: *mut ir.Value, w: i32) *mut ir.Value {
+    let none = ir.icmp(B(), ir.IntEQ, k, ir.cint(k.ty, @as(u64, @bit_cast(u32, w))));
+    return ir.select(B(), none, ir.cint(k.ty, 0), ir.add(B(), k, ir.cint(k.ty, 1)));
+}
+
+fn stdbit(id: i32, x: *mut ir.Value, xt: *mut cty.CType, rt: *mut cty.CType) *mut ir.Value {
+    let t = x.ty;
+    let w = t.bits;
+    let wv = ir.cint(t, @as(u64, @bit_cast(u32, w)));
+    let inv = ir.xor(B(), x, all_ones(t));
+    _ = xt;
+    if id == csb.BI_LEADING_ZEROS {
+        return to_uint(intr1(ir.IN_CTLZ, x), rt);
+    }
+    if id == csb.BI_LEADING_ONES {
+        return to_uint(intr1(ir.IN_CTLZ, inv), rt);
+    }
+    if id == csb.BI_TRAILING_ZEROS {
+        return to_uint(intr1(ir.IN_CTTZ, x), rt);
+    }
+    if id == csb.BI_TRAILING_ONES {
+        return to_uint(intr1(ir.IN_CTTZ, inv), rt);
+    }
+    if id == csb.BI_FIRST_LEADING_ZERO {
+        return to_uint(first(intr1(ir.IN_CTLZ, inv), w), rt);
+    }
+    if id == csb.BI_FIRST_LEADING_ONE {
+        return to_uint(first(intr1(ir.IN_CTLZ, x), w), rt);
+    }
+    if id == csb.BI_FIRST_TRAILING_ZERO {
+        return to_uint(first(intr1(ir.IN_CTTZ, inv), w), rt);
+    }
+    if id == csb.BI_FIRST_TRAILING_ONE {
+        return to_uint(first(intr1(ir.IN_CTTZ, x), w), rt);
+    }
+    if id == csb.BI_COUNT_ZEROS {
+        return to_uint(intr1(ir.IN_CTPOP, inv), rt);
+    }
+    if id == csb.BI_COUNT_ONES {
+        return to_uint(intr1(ir.IN_CTPOP, x), rt);
+    }
+    if id == csb.BI_HAS_SINGLE_BIT {
+        let one = ir.icmp(B(), ir.IntEQ, intr1(ir.IN_CTPOP, x), ir.cint(t, 1));
+        return ir.zext(B(), one, ir.t_int(8));
+    }
+    let bw = ir.sub(B(), wv, intr1(ir.IN_CTLZ, x));  // the bits it takes
+    if id == csb.BI_BIT_WIDTH {
+        return to_uint(bw, rt);
+    }
+    let one = ir.cint(t, 1);
+    if id == csb.BI_BIT_FLOOR {
+        // 0 for 0, else the highest bit set
+        let zero = ir.icmp(B(), ir.IntEQ, x, ir.cint(t, 0));
+        let sh = ir.sub(B(), bw, one);
+        let v = ir.binop(B(), ir.OP_SHL, one, ir.select(B(), zero, ir.cint(t, 0), sh));
+        return ir.select(B(), zero, ir.cint(t, 0), v);
+    }
+    // bit_ceil: 1 for 0 and 1, else 2 to the bits of x - 1 (0 if that is the width:
+    // not representable)
+    let small = ir.icmp(B(), ir.IntULE, x, one);
+    let bm = ir.sub(B(), wv, intr1(ir.IN_CTLZ, ir.sub(B(), x, one)));
+    let over = ir.icmp(B(), ir.IntUGE, bm, wv);
+    let sh = ir.select(B(), over, ir.cint(t, 0), bm);
+    let v = ir.select(B(), over, ir.cint(t, 0), ir.binop(B(), ir.OP_SHL, one, sh));
+    return ir.select(B(), small, one, v);
+}
+
+// x of integer type t, as a 64-bit integer and the high word of its 128-bit
+// two's complement value.
+fn widen(x: *mut ir.Value, t: *cty.CType) [2]*mut ir.Value {
+    let mut lo = x;
+    if x.ty.bits < 64 {
+        if t.is_signed {
+            lo = ir.sext(B(), x, i64t());
+        } else {
+            lo = ir.zext(B(), x, i64t());
+        }
+    }
+    let mut hi = c64(0);
+    if t.is_signed {
+        hi = ir.binop(B(), ir.OP_ASHR, lo, c64(63));
+    }
+    return [lo, hi];
+}
+
+fn lsh(x: *mut ir.Value, n: u64) *mut ir.Value {
+    return ir.binop(B(), ir.OP_LSHR, x, c64(n));
+}
+
+// The 128-bit product of 64-bit unsigned x and y: [low, high].
+fn umul128(x: *mut ir.Value, y: *mut ir.Value) [2]*mut ir.Value {
+    let m = c64(0xFFFF_FFFF);
+    let xl = ir.and_(B(), x, m);
+    let xh = lsh(x, 32);
+    let yl = ir.and_(B(), y, m);
+    let yh = lsh(y, 32);
+    let ll = ir.mul(B(), xl, yl);
+    let lh = ir.mul(B(), xl, yh);
+    let hl = ir.mul(B(), xh, yl);
+    let hh = ir.mul(B(), xh, yh);
+    let mid = ir.add(B(), ir.add(B(), lsh(ll, 32), ir.and_(B(), lh, m)), ir.and_(B(), hl, m));
+    let lo = ir.or_(B(), ir.and_(B(), ll, m), ir.binop(B(), ir.OP_SHL, mid, c64(32)));
+    let hi = ir.add(B(), ir.add(B(), hh, lsh(lh, 32)), ir.add(B(), lsh(hl, 32), lsh(mid, 32)));
+    return [lo, hi];
+}
+
+// The largest value of integer type t, as a u64 constant.
+fn max_of(t: *cty.CType) u64 {
+    return cty.int_max(t);
+}
+
+// ckd_add, ckd_sub, ckd_mul (C23 7.20): the mathematical result of a op b
+// wrapped into *r (of type rt), and whether it did not fit.
+fn ckd(id: i32, rp: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, at_: *mut cty.CType, b: *mut ir.Value,
+       bt: *mut cty.CType) *mut ir.Value {
+    let wa = widen(a, at_);
+    let wb = widen(b, bt);
+    let w = rt.bits;
+    let mut lo = ir.vnil();
+    let mut fits = ir.vnil();
+    if (id == csb.BI_CKD_ADD) or (id == csb.BI_CKD_SUB) {
+        let mut hi = ir.vnil();
+        if id == csb.BI_CKD_ADD {
+            lo = ir.add(B(), wa[0], wb[0]);
+            let carry = ir.zext(B(), ir.icmp(B(), ir.IntULT, lo, wa[0]), i64t());
+            hi = ir.add(B(), ir.add(B(), wa[1], wb[1]), carry);
+        } else {
+            lo = ir.sub(B(), wa[0], wb[0]);
+            let borrow = ir.zext(B(), ir.icmp(B(), ir.IntULT, wa[0], wb[0]), i64t());
+            hi = ir.sub(B(), ir.sub(B(), wa[1], wb[1]), borrow);
+        }
+        // fits: the 128-bit value is the extension of its low w bits
+        if rt.is_signed {
+            fits = ir.icmp(B(), ir.IntEQ, hi, ir.binop(B(), ir.OP_ASHR, lo, c64(63)));
+            if w < 64 {
+                let ext = ir.sext(B(), ir.trunc(B(), lo, ir.t_int(w)), i64t());
+                fits = ir.and_(B(), fits, ir.icmp(B(), ir.IntEQ, ext, lo));
+            }
+        } else {
+            fits = ir.icmp(B(), ir.IntEQ, hi, c64(0));
+            if w < 64 {
+                fits = ir.and_(B(), fits, ir.icmp(B(), ir.IntULE, lo, c64(max_of(rt))));
+            }
+        }
+    } else {
+        // the product's sign and magnitude
+        let zero = c64(0);
+        let mut an = ir.cint(ir.t_int(1), 0);
+        let mut ma = wa[0];
+        if at_.is_signed {
+            an = ir.icmp(B(), ir.IntSLT, wa[0], zero);
+            ma = ir.select(B(), an, ir.sub(B(), zero, wa[0]), wa[0]);
+        }
+        let mut bn = ir.cint(ir.t_int(1), 0);
+        let mut mb = wb[0];
+        if bt.is_signed {
+            bn = ir.icmp(B(), ir.IntSLT, wb[0], zero);
+            mb = ir.select(B(), bn, ir.sub(B(), zero, wb[0]), wb[0]);
+        }
+        let pr = umul128(ma, mb);
+        let neg = ir.xor(B(), an, bn);
+        let small = ir.icmp(B(), ir.IntEQ, pr[1], zero);
+        // positive: at most rt's max; negative: at most -min (0 for an unsigned rt)
+        let pos_ok = ir.and_(B(), small, ir.icmp(B(), ir.IntULE, pr[0], c64(max_of(rt))));
+        let mut lim: u64 = 0;
+        if rt.is_signed {
+            lim = max_of(rt) + 1;
+        }
+        let neg_ok = ir.and_(B(), small, ir.icmp(B(), ir.IntULE, pr[0], c64(lim)));
+        fits = ir.select(B(), neg, neg_ok, pos_ok);
+        lo = ir.select(B(), neg, ir.sub(B(), zero, pr[0]), pr[0]);
+    }
+    let mut r = lo;
+    if w < 64 {
+        r = ir.trunc(B(), lo, ir.t_int(w));
+    }
+    st(r, rp, cty.align_of(rt));
+    return ir.zext(B(), ir.not_(B(), fits), ir.t_int(8));
+}

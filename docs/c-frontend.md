@@ -11,8 +11,12 @@ are written against; `docs/c.md` (to come) is for users.
   added or its own removed (C23 has no K&R definitions, no implicit `int`).
 - **Freestanding**: no C library. The compiler provides the headers a freestanding
   implementation must (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`,
-  `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdnoreturn.h>`), in
-  `std/c/include/`.
+  `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdnoreturn.h>`, and
+  C23's `<stdbit.h>` and `<stdckdint.h>`), in `std/c/include/`.
+- **Calling convention**: each target's C ABI (x86-64 System V, Windows x64,
+  AAPCS64 and its macOS variant, the WebAssembly C ABI), for structures and
+  unions by value and variadic functions too (`cgen_abi.ax`, `cgen_va.ax`), so
+  that C compiled here calls and is called by the platform's C libraries.
 - **No extensions**: no GNU or Microsoft extensions, and `#pragma` lines are ignored
   (as are `_Pragma` operators). Identifiers the compiler needs for its own headers are
   in the reserved namespace (`__builtin_va_list`, `__axiom_int64`, ...).

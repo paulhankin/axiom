@@ -32,6 +32,7 @@ const VR: u8 = 1;
 const X0: i32 = 0;
 const X16: i32 = 16;
 const X17: i32 = 17;
+const X8: i32 = 8;  // the indirect result register
 const FP: i32 = 29;
 const LR: i32 = 30;
 const SP: i32 = 31;
@@ -1533,10 +1534,25 @@ fn gen_call(v: *mut ir.Value) void {
     if tg.is_darwin() and fty_.vararg {
         nfixed = fty_.params.len;
     }
+    let mut rbuf: i32 = -1;  // (a C result in registers: the buffer they are stored in)
+    let mut rcode: u8 = 0;
     for i in 0..n {
         let x = v.xs.get(i);
         let c = class_of(x.ty);
         dest[i] = -1;
+        let mut e: u8 = 0;
+        if (i + 1) < ir.ext_of(v).len {
+            e = ir.ext_of(v)[i + 1];
+        }
+        if e >= ir.EXT_REGS {
+            rcode = e;
+            rbuf = regs[i];
+            continue;
+        }
+        if e == ir.EXT_X8SRET {
+            dest[i] = X8;  // (the C result's address)
+            continue;
+        }
         if i >= nfixed {
             off = (off + 7) & ~@as(u64, 7);  // (after packed fixed arguments)
             let m = mc.mem(SP, -1, 0, @bit_cast(i64, off));
@@ -1590,8 +1606,16 @@ fn gen_call(v: *mut ir.Value) void {
         }
     }
     let mut ops = is.call_ops(v, target, &uses, func_sym, rreg);
+    if rbuf >= 0 {
+        for k in 0..c_result_count(rcode) {
+            ops.push(mc.reg(c_result_reg(rcode, k), mc.RD));
+        }
+    }
     let ci = emit(CALL, 0, ops.items());
     is.finish_call(MF, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
+    if rbuf >= 0 {
+        store_c_result(rcode, rbuf);
+    }
     if (rreg >= 0) and is.foreign_bool(v) {
         let t = vgpr();
         copy(t, rreg, GPR);
@@ -1600,6 +1624,73 @@ fn gen_call(v: *mut ir.Value) void {
         copy(vreg(v), rreg, class_of(rt));
     }
     uses.deinit();
+    ops.deinit();
+}
+
+// A C result in registers (AAPCS64: a structure or union in x0 and x1, or
+// a homogeneous floating-point aggregate in v0-v3), as ir.EXT_REGS rc
+// says: register k, its class and size.
+fn c_result_reg(rc: u8, k: usize) i32 {
+    if (rc & (ir.EXT_REGS_FP0 << @truncate(u8, k))) != 0 {
+        return V0 + @int_cast(i32, k);
+    }
+    return X0 + @int_cast(i32, k);
+}
+
+fn c_result_count(rc: u8) usize {
+    return @as(usize, rc & 3) + 1;
+}
+
+fn c_result_size(rc: u8) u64 {
+    if (rc & ir.EXT_REGS_WIDE) != 0 {
+        return 8;
+    }
+    return 4;
+}
+
+// After the call: its result's registers, into the buffer at register b.
+fn store_c_result(rc: u8, b: i32) void {
+    let n = c_result_count(rc);
+    let sz = c_result_size(rc);
+    let mut ts: [4]i32 = [0, 0, 0, 0];
+    for k in 0..n {
+        let r = c_result_reg(rc, k);
+        if r >= V0 {
+            ts[k] = vvr();
+            copy(ts[k], r, VR);
+        } else {
+            ts[k] = vgpr();
+            copy(ts[k], r, GPR);
+        }
+    }
+    for k in 0..n {
+        let m = mc.mem(b, -1, 0, @bit_cast(i64, @as(u64, k) * sz));
+        if c_result_reg(rc, k) >= V0 {
+            _ = e2(FSTR, @truncate(u8, sz), m, R(ts[k]));
+        } else {
+            _ = e2(STR, @truncate(u8, sz), m, R(ts[k]));
+        }
+    }
+}
+
+// The return of a function whose C result is in registers: loaded from its
+// buffer (the frame slot c_ret_slot).
+fn ret_c_result() void {
+    let rc = c_ret_code;
+    let n = c_result_count(rc);
+    let sz = c_result_size(rc);
+    let mut ops = u.List.[mc.MOp].empty();
+    for k in 0..n {
+        let r = c_result_reg(rc, k);
+        let m = mc.mem_slot(c_ret_slot, @bit_cast(i64, @as(u64, k) * sz));
+        if r >= V0 {
+            _ = e2(FLDR, @truncate(u8, sz), W(r), m);
+        } else {
+            _ = e2(LDR, @truncate(u8, sz), W(r), m);
+        }
+        ops.push(R(r));
+    }
+    _ = emit(RET, 0, ops.items());
     ops.deinit();
 }
 
@@ -2938,6 +3029,10 @@ fn gen_term(b: *mut ir.Block) void {
             }
             return;
         }
+        if c_ret_slot >= 0 {
+            ret_c_result();
+            return;
+        }
         _ = e0(RET, 0);
         return;
     }
@@ -3199,10 +3294,23 @@ fn compile_func(f: *mut ir.Func) void {
     let mut ng: i32 = 0;
     let mut nv: i32 = 0;
     let mut soff: i64 = 16;
-    for p in f.params {
+    c_ret_slot = -1;
+    for pi in 0..f.params.len {
+        let p = f.params[pi];
         let c = class_of(p.ty);
         let d = vreg(p);
-        if (c == GPR) and (ng < 8) {
+        let mut e: u8 = 0;
+        if pi < f.param_ext.len {
+            e = f.param_ext[pi];
+        }
+        if e >= ir.EXT_REGS {
+            // (a C result in registers: its buffer, in the frame)
+            c_ret_code = e;
+            c_ret_slot = mc.new_slot(MF, 32, 16);
+            _ = e2(LEA, 8, W(d), mc.mem_slot(c_ret_slot, 0));
+        } else if e == ir.EXT_X8SRET {
+            copy(d, X8, GPR);
+        } else if (c == GPR) and (ng < 8) {
             copy(d, ng, GPR);
             ng += 1;
         } else if (c == VR) and (nv < 8) {
@@ -3619,6 +3727,11 @@ fn needs_frame() bool {
     }
     return false;
 }
+
+// The frame slot of the buffer a C result in registers is returned from,
+// or -1, and its ir.EXT_REGS code.
+let mut c_ret_slot: i32 = -1;
+let mut c_ret_code: u8 = 0;
 
 fn prologue() void {
     if frameless {

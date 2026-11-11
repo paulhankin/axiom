@@ -15,9 +15,11 @@ import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
+import "cgen_abi.ax" as abi;
 import "cgen_bits.ax" as cgb;
 import "cgen_expr.ax" as gx;
 import "cgen_flow.ax" as flow;
+import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "csema.ax" as cs;
 import "csema_vla.ax" as svla;
@@ -60,26 +62,15 @@ fn function_body(s: *mut cast.CSym) void {
     F.entry = cg.new_block("entry");
     let start = cg.new_block("start");
     cg.at_end(start);
-    let mut k: usize = 0;
-    if F.sig.sret {
-        F.sret = f.params[0];
-        k = 1;
-    }
+    F.sret = gva.enter_function(F.sig.plan, f, s.params.items(), s.ty.variadic);
+    // (a parameter of a definition with an identifier list arrives promoted)
     let pts = cg.param_types(s);
     for j in 0..s.params.len {
         let p = s.params.get(j);
-        let pv = f.params[k];
-        let pt = pts[j];
-        k += 1;
-        let a = cg.alloca(p.ty, p.name);
-        p.ir = @ptr_cast(*mut void, a);
-        if cg.by_ptr(p.ty) {
-            gx.copy(p.ty, a, pv);
-        } else if cty.is_record(p.ty) {
-            _ = ir.store(cg.B, pv, a);
-        } else {
-            // (a parameter of a definition with an identifier list arrives promoted)
-            gx.store(cty.unqual(p.ty), gx.convert(pv, pt, p.ty), a);
+        let a = F.sig.plan.args[j];
+        if (a.kind == abi.A_SCALAR) and (pts[j] != cty.unqual(p.ty)) {
+            let pv = f.params[@int_cast(usize, a.slot[0])];
+            gx.store(cty.unqual(p.ty), gx.convert(pv, pts[j], p.ty), @ptr_cast(*mut ir.Value, p.ir));
         }
     }
     param_lengths(d);
@@ -89,14 +80,7 @@ fn function_body(s: *mut cast.CSym) void {
     if not cg.terminated() {
         // the end of the body: main returns 0 (5.1.2.2.3); the value of
         // any other is undefined (6.9.1p12)
-        let rt = F.ret;
-        if cty.is_void(rt) or F.sig.sret {
-            ir.ret_void(cg.B);
-        } else if cty.is_record(rt) {
-            ir.ret(cg.B, ir.undef(cg.lty(rt)));
-        } else {
-            ir.ret(cg.B, ir.czero(cg.lty(rt)));
-        }
+        gva.ret_default(F.sig.plan, F.sret);
     }
     cg.at_end(F.entry);
     ir.br(cg.B, start);
@@ -400,23 +384,13 @@ fn return_stmt(s: *mut cast.Stmt) void {
     let F = cg.F;
     cg.continue_after();
     if u.isnil(s.e) {
-        if cty.is_void(F.ret) or F.sig.sret {
-            ir.ret_void(cg.B);
-        } else {
-            ir.ret(cg.B, ir.czero(cg.lty(F.ret)));
-        }
+        gva.ret_default(F.sig.plan, F.sret);
         return;
     }
     let v = gx.rv(s.e);
-    let rt = F.ret;
-    if cty.is_void(rt) {
+    if cty.is_void(F.ret) {
         ir.ret_void(cg.B);
-    } else if F.sig.sret {
-        gx.copy(rt, F.sret, v);
-        ir.ret_void(cg.B);
-    } else if cty.is_record(rt) {
-        ir.ret(cg.B, ir.load(cg.B, cg.lty(rt), v));
-    } else {
-        ir.ret(cg.B, v);
+        return;
     }
+    gva.ret_value(F.sig.plan, F.sret, v);
 }

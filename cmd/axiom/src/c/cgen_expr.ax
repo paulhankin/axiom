@@ -12,6 +12,7 @@ import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_bitint.ax" as cgbi;
 import "cgen_bits.ax" as cgb;
+import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
@@ -288,6 +289,9 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
     }
     if k == cast.ExprKind.NULLPTR {
         return ir.czero(cg.T_ptr);
+    }
+    if k == cast.ExprKind.VA_ARG {
+        return gva.va_arg(rv(e.a), e.ty);
     }
     if (k == cast.ExprKind.SIZEOF_EXPR) or (k == cast.ExprKind.SIZEOF_TYPE) {
         return vla_sizeof(e);
@@ -635,21 +639,27 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
 }
 
 fn call(e: *mut cast.Expr) *mut ir.Value {
+    let n = e.args.len;
+    let vs = u.newn.[*mut ir.Value](n + 1);
+    if e.op != 0 {
+        // a builtin (csema_builtin.ax)
+        for i in 0..n {
+            vs[i] = rv(e.args.get(i));
+        }
+        return gva.builtin(e, vs[0..n]);
+    }
     let fe = e.a;
     let ft = fe.ty.elem;
-    let n = e.args.len;
     let ats = u.newn.[*mut cty.CType](n + 1);
     for i in 0..n {
         ats[i] = e.args.get(i).ty;
     }
     // the signature: the prototype's (and the variadic arguments'), or the arguments'
-    let mut np = n;
-    let mut ps = ats[0..n];
+    let mut nnamed = n;
     if ft.proto {
-        np = ft.params.len;
-        ps = ft.params;
+        nnamed = ft.params.len;
     }
-    let mut sig = cg.sig_of(ft.ret, ps, ft.proto and ft.variadic);
+    let mut sig = cg.sig_of(ft.ret, ats[0..n], nnamed, ft.proto and ft.variadic, false);
     let mut callee = ir.vnil();
     if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) {
         let f = cg.func_of(fe.a.sym, sig);
@@ -660,49 +670,10 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
     } else {
         callee = rv(fe);
     }
-    let mut k: usize = 0;
-    let mut total = n;
-    if sig.sret {
-        total += 1;
-    }
-    let av = u.newn.[*mut ir.Value](total + 1);
-    let mut tmp = ir.vnil();
-    if sig.sret {
-        tmp = cg.alloca(ft.ret, "ret");
-        av[0] = tmp;
-        k = 1;
-    }
     for i in 0..n {
-        let a = e.args.get(i);
-        let v = rv(a);
-        let at = ats[i];
-        if cg.by_ptr(at) {
-            let c = cg.alloca(at, "arg");
-            copy(at, c, v);
-            av[k] = c;
-        } else if cty.is_record(at) {
-            av[k] = ir.load(cg.B, lty(at), v);
-        } else {
-            av[k] = v;
-        }
-        k += 1;
+        vs[i] = rv(e.args.get(i));
     }
-    let r = ir.call(cg.B, sig.ty, callee, av[0..total]);
-    cg.mark_call(r, ft.ret, ats[0..n], sig.sret);
-    _ = np;
-    let rt = e.ty;
-    if sig.sret {
-        return tmp;
-    }
-    if cty.is_void(rt) {
-        return ir.vnil();
-    }
-    if cty.is_record(rt) {
-        let t2 = cg.alloca(rt, "ret");
-        _ = ir.store(cg.B, r, t2);
-        return t2;
-    }
-    return r;
+    return gva.emit_call(sig.plan, sig.ty, callee, vs[0..n]);
 }
 
 fn same_sig(a: *ir.Ty, b: *ir.Ty) bool {

@@ -67,7 +67,7 @@ typedef uint32_t uint_fast32_t;
 #define __AXIOM_LEAST32_WIDTH 32
 #define INT32_C(c) __AXIOM_C32(c)
 #define UINT32_C(c) __AXIOM_UC32(c)
-#else
+#elif __AXIOM_INT_WIDTH__ == 64
 typedef int int_least32_t;
 typedef unsigned int uint_least32_t;
 typedef int int_fast32_t;
@@ -78,6 +78,18 @@ typedef unsigned int uint_fast32_t;
 #define __AXIOM_LEAST32_WIDTH 64
 #define INT32_C(c) c
 #define UINT32_C(c) c##U
+#else
+/* (int is 16 bits and long 64) */
+typedef long int_least32_t;
+typedef unsigned long uint_least32_t;
+typedef long int_fast32_t;
+typedef unsigned long uint_fast32_t;
+#define __AXIOM_LEAST32_MIN (-9223372036854775807L - 1)
+#define __AXIOM_LEAST32_MAX 9223372036854775807L
+#define __AXIOM_ULEAST32_MAX 18446744073709551615UL
+#define __AXIOM_LEAST32_WIDTH 64
+#define INT32_C(c) c##L
+#define UINT32_C(c) c##UL
 #endif
 
 /* integers that hold pointers: as size_t and ptrdiff_t */
@@ -211,6 +223,16 @@ typedef uint64_t uintmax_t;
 #else
 #define WCHAR_MIN 0U
 #define WCHAR_MAX 18446744073709551615U
+#endif
+#define __AXIOM_WCHAR_BITS 64
+#elif __AXIOM_LONG_WIDTH__ == 64 && __AXIOM_INT_WIDTH__ == 16
+/* (wchar_t is long: there is no 32-bit type) */
+#if __AXIOM_WCHAR_SIGNED__
+#define WCHAR_MIN (-9223372036854775807L - 1)
+#define WCHAR_MAX 9223372036854775807L
+#else
+#define WCHAR_MIN 0UL
+#define WCHAR_MAX 18446744073709551615UL
 #endif
 #define __AXIOM_WCHAR_BITS 64
 #else

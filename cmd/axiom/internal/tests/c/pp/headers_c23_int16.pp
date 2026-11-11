@@ -36,7 +36,7 @@ typedef unsigned long uintptr_t;
 typedef int64_t intmax_t;
 typedef uint64_t uintmax_t;
 x___STDC_VERSION_STDDEF_H__ = 202311L
-x_unreachable = ((void)0)
+x_unreachable = __builtin_unreachable()
 x_NULL = ((void *)0)
 x_offsetof = __builtin_offsetof(a0, a1)
 x___STDC_VERSION_LIMITS_H__ = 202311L

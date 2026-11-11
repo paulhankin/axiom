@@ -23,14 +23,15 @@ typedef unsigned __axiom_int64 size_t;
 typedef __axiom_int64 ptrdiff_t;
 #endif
 
-/* wchar_t: as the literals L"..." are (16 or 32 bits) */
+/* wchar_t: as the literals L"..." are (16 or 32 bits: the narrowest type of
+   at least 32 when none has 32) */
 #if __AXIOM_WCHAR_WIDTH__ == 16
 #if __AXIOM_WCHAR_SIGNED__
 typedef short wchar_t;
 #else
 typedef unsigned short wchar_t;
 #endif
-#elif __AXIOM_INT_WIDTH__ == 32 || __AXIOM_LONG_WIDTH__ != 32
+#elif __AXIOM_INT_WIDTH__ == 32 || (__AXIOM_LONG_WIDTH__ != 32 && __AXIOM_INT_WIDTH__ >= 32)
 #if __AXIOM_WCHAR_SIGNED__
 typedef int wchar_t;
 #else
@@ -53,8 +54,8 @@ typedef struct {
 
 #if __STDC_VERSION__ >= 202311L
 typedef typeof(nullptr) nullptr_t;
-/* (reaching it is undefined: nothing need be done) */
-#define unreachable() ((void)0)
+/* (reaching it is undefined: the code after it is not generated) */
+#define unreachable() __builtin_unreachable()
 #endif
 
 #define NULL ((void *)0)

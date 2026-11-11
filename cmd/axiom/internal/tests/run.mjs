@@ -145,7 +145,7 @@ async function runWasm(file) {
     print_i64: x => line(String(x)),
     print_u64: x => line(String(BigInt.asUintN(64, x))),
     print_f64: x => line(String(x)),
-    print_str: (p, n) => line(dec.decode(new Uint8Array(mem.buffer, p >>> 0, n >>> 0))),
+    print_str: (p, n) => line(dec.decode(new Uint8Array(mem.buffer, Number(p), Number(n)))),  // (BigInts on wasm64)
     print_bool: b => line(b ? 'true' : 'false'),
   };
   const instance = host.instantiate(fs.readFileSync(file), { env });
@@ -318,7 +318,8 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // /* expect: */ lines, or the build must fail with each /* expect-error: C3xxx */
 // code; it must warn with each /* expect-warning: C4xxx */ code. The tests
 // print through host.h (next to run/); natively its functions are
-// c/host_native.c's, compiled by the system's C compiler.
+// c/host_native.c's, compiled by the system's C compiler. AXIOM_C_TARGET=wasm64
+// builds them for wasm64 instead of wasm32.
 const cRunDir = path.join(root, 'cmd/axiom/internal/tests/c/run');
 const cRunFiles = fs.existsSync(cRunDir) ? fs.readdirSync(cRunDir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(cRunDir, f)) : [];
 await section('', byFile(cRunFiles, '[c]', async (f) => {
@@ -333,6 +334,7 @@ await section('', byFile(cRunFiles, '[c]', async (f) => {
   const out = path.join(tmp, `c-${path.basename(f, '.c')}${native ? '' : '.wasm'}`);
   const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags];
   if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`);
+  else if (process.env.AXIOM_C_TARGET && !flags.some((x) => x.startsWith('--target='))) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
   const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
   if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
   let json = null;

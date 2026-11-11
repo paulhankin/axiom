@@ -1894,6 +1894,10 @@ fn parse_primary(P: *mut Parser) *mut cast.Expr {
         if (later_kw(P, 0) == ct.K_GENERIC) and is_p(peek(P, 1), ct.P_LPAREN) {
             return parse_generic(P);
         }
+        if (u.str_eq(t.text, "__builtin_va_arg") or u.str_eq(t.text, "__builtin_offsetof")) and
+           is_p(peek(P, 1), ct.P_LPAREN) {
+            return parse_type_builtin(P);
+        }
         if is_typedef(P, t.text) {
             syntax(P, "an expression");
             let e = error_expr(P);
@@ -1950,6 +1954,79 @@ fn parse_primary(P: *mut Parser) *mut cast.Expr {
     }
     syntax(P, "an expression");
     return error_expr(P);
+}
+
+// The builtins with a type name among their operands (the headers' va_arg
+// and offsetof): `__builtin_va_arg ( assignment-expression , type-name )`
+// and `__builtin_offsetof ( type-name , member-designator )`, where the
+// member designator is an identifier followed by any of `. identifier` and
+// `[ constant-expression ]` (each a MEMBER or an INDEX node in args).
+fn parse_type_builtin(P: *mut Parser) *mut cast.Expr {
+    let t = advance(P);
+    let va = u.str_eq(t.text, "__builtin_va_arg");
+    let e = cast.new_expr(cast.ExprKind.OFFSETOF, t.span);
+    if va {
+        e.kind = cast.ExprKind.VA_ARG;
+    }
+    e.name = t.text;
+    _ = advance(P);  // (the '(')
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    let mut ok = true;
+    if va {
+        e.a = parse_assign(P);
+        ok = expect_p(P, ct.P_COMMA);
+        if ok {
+            e.tname = parse_type_name(P, CTX_TYPENAME);
+        }
+    } else {
+        e.tname = parse_type_name(P, CTX_TYPENAME);
+        ok = expect_p(P, ct.P_COMMA);
+        let mut first = true;
+        while ok {
+            let sp = cur(P).span;
+            if first or at_p(P, ct.P_DOT) {
+                if not first {
+                    _ = advance(P);
+                }
+                let m = cur(P);
+                if m.kind != ct.T_IDENT {
+                    syntax(P, "a member name");
+                    ok = false;
+                    break;
+                }
+                _ = advance(P);
+                let x = cast.new_expr(cast.ExprKind.MEMBER, m.span);
+                x.op = ct.P_DOT;
+                x.name = m.text;
+                x.name_span = m.span;
+                x.span = span_from(P, sp);
+                e.args.push(x);
+            } else if at_p(P, ct.P_LBRACKET) {
+                _ = advance(P);
+                let x = cast.new_expr(cast.ExprKind.INDEX, sp);
+                x.b = parse_cond(P);
+                ok = expect_p(P, ct.P_RBRACKET);
+                x.span = span_from(P, sp);
+                e.args.push(grown(P, x));
+            } else {
+                break;
+            }
+            first = false;
+        }
+    }
+    leave(P);
+    if not ok {
+        // (the tree after an error: no operand missing)
+        e.kind = cast.ExprKind.ERROR;
+        skip_to_rparen(P);
+    } else if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    e.span = span_from(P, t.span);
+    return grown(P, e);
 }
 
 // `_Generic ( assignment-expression , generic-association-list )`.

@@ -11,11 +11,9 @@
 // i8 that is 0 or 1; every integer its width); an object is memory, reached
 // by its address; the value of a structure or union is the address of
 // memory holding it (an object's own, or a temporary's). Functions take and
-// return structures and unions as Axiom code does its own: those of at
-// most 32 bytes as aggregate values (which lowering passes as their
-// leaves), larger ones by address (EXT_BYVAL, EXT_SRET). That is not each
-// platform's C calling convention for them yet; scalars follow it (integer
-// arguments and results narrower than 32 bits are sign- or zero-extended).
+// return their arguments and results as the platform's C calling
+// convention says (cgen_abi.ax plans it, cgen_va.ax generates the code), so
+// that C compiled here calls and is called by the platform's C libraries.
 //
 // C code has none of Axiom's run-time checks: no bounds or overflow checks,
 // no shadow-stack records (on native targets, no frame-table entries for
@@ -26,6 +24,7 @@ import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
+import "cgen_abi.ax" as abi;
 import "csema.ax" as cs;
 import "csema_marks.ax" as csm;
 import "ctypes.ax" as cty;
@@ -53,7 +52,7 @@ pub struct FnState {
     sym: *mut cast.CSym,
     f: *mut ir.Func,
     entry: *mut ir.Block,  // the allocas
-    sret: *mut ir.Value,   // the result's address (a large structure or union), or nil
+    sret: *mut ir.Value,   // the result's address or buffer (cgen_abi: R_SRET, R_REGS), or nil
     ret: *mut cty.CType,
     sig: Sig,
 }
@@ -189,102 +188,39 @@ fn record_ty(t: *mut cty.CType) *mut ir.Ty {
     return r;
 }
 
-/// Structures and unions larger than this are passed and returned by
-/// address (as Axiom's aggregates are).
-pub fn by_ptr(t: *cty.CType) bool {
-    return cty.is_record(t) and (cty.size_of(t) > 32);
-}
-
-/// A C function's IR signature.
+/// A C function's IR signature, and how its arguments and result travel
+/// (the platform's C calling convention: cgen_abi.ax).
 pub struct Sig {
     ty: *mut ir.Ty,
-    sret: bool,  // the result's address is the first parameter
+    plan: *mut abi.Plan,
 }
 
-/// The signature of a function returning ret with parameters (or
-/// arguments, for a call without a prototype) of types ps.
-pub fn sig_of(ret: *mut cty.CType, ps: []mut *mut cty.CType, variadic: bool) Sig {
-    let sret = by_ptr(ret);
-    let mut n = ps.len;
-    if sret {
-        n += 1;
-    }
-    let ts = u.newn.[*mut ir.Ty](n + 1);
-    let mut k: usize = 0;
-    if sret {
-        ts[0] = T_ptr;
-        k = 1;
-    }
-    for p in ps {
-        if by_ptr(p) {
-            ts[k] = T_ptr;
-        } else {
-            ts[k] = lty(p);
-        }
-        k += 1;
-    }
-    let mut rt = T_void;
-    if not sret and not cty.is_void(ret) {
-        rt = lty(ret);
-    }
-    return Sig.{ ty: ir.t_fn(rt, ts[0..n], variadic), sret: sret };
+/// The signature of a call of (define: the definition of) a function
+/// returning ret with arguments (parameters) of types ps, of which the
+/// first nnamed are its prototype's parameters; variadic: its type ends
+/// with `...`.
+pub fn sig_of(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variadic: bool, define: bool) Sig {
+    let p = abi.plan(ret, ps, nnamed, variadic, define);
+    return Sig.{ ty: p.fty, plan: p };
 }
 
-/// The extension (0, ir zext 1, sext 2) a value of type t gets as an
-/// argument or result.
-pub fn ext_of(t: *cty.CType) u8 {
-    if t.kind == cty.TK_BOOL {
-        return 1;
-    }
-    if cty.is_integer(t) and (cty.storage_bits(t) < 32) {
-        if t.is_signed {
-            return 2;
-        }
-        return 1;
-    }
-    return 0;
-}
-
-/// The marks of a function's parameters and result (ext: the call's
-/// ext_of, or the function's param_ext with ret_ext).
-pub fn mark_call(v: *mut ir.Value, ret: *mut cty.CType, ps: []mut *mut cty.CType, sret: bool) void {
+/// The marks of a call's arguments and result, as its plan says.
+pub fn mark_call(v: *mut ir.Value, p: *abi.Plan) void {
     let ex = ir.ext_of(v);
-    let mut k: usize = 1;
-    if sret {
-        ex[1] = ir.EXT_SRET;
-        k = 2;
-    } else {
-        ex[0] = ext_of(ret);
-    }
-    for p in ps {
-        if k < ex.len {
-            if by_ptr(p) {
-                ex[k] = ir.EXT_BYVAL;
-            } else {
-                ex[k] = ext_of(p);
-            }
+    ex[0] = abi.ret_ext(p);
+    for k in 0..p.exts.len {
+        if (k + 1) < ex.len {
+            ex[k + 1] = p.exts.get(k);
         }
-        k += 1;
     }
 }
 
-fn mark_func(f: *mut ir.Func, ret: *mut cty.CType, ps: []mut *mut cty.CType, sret: bool) void {
-    let mut k: usize = 0;
-    if sret {
-        f.param_ext[0] = ir.EXT_SRET;
-        k = 1;
-    } else {
-        f.ret_ext = ext_of(ret);
-    }
-    for p in ps {
+fn mark_func(f: *mut ir.Func, p: *abi.Plan) void {
+    f.ret_ext = abi.ret_ext(p);
+    for k in 0..p.exts.len {
         if k < f.param_ext.len {
-            if by_ptr(p) {
-                f.param_ext[k] = ir.EXT_BYVAL;
-            } else {
-                f.param_ext[k] = ext_of(p);
-            }
+            f.param_ext[k] = p.exts.get(k);
         }
-        k += 1;
     }
 }
 
@@ -328,9 +264,10 @@ pub fn param_types(s: *cast.CSym) []mut *mut cty.CType {
 /// not defined, whose signature comes from its calls).
 pub fn func_sig(s: *cast.CSym) Sig {
     if not s.ty.proto and u.isnil(s.def) {
-        return Sig.{ ty: u.nil.[ir.Ty](), sret: false };
+        return Sig.{ ty: u.nil.[ir.Ty](), plan: u.nil.[abi.Plan]() };
     }
-    return sig_of(s.ty.ret, param_types(s), s.ty.variadic and u.isnil(s.def));
+    let ps = param_types(s);
+    return sig_of(s.ty.ret, ps, ps.len, s.ty.variadic, u.notnil(s.def));
 }
 
 /// The IR function of C function s; `sig`: the signature to declare it
@@ -340,10 +277,8 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
         return @ptr_cast(*mut ir.Func, s.ir);
     }
     let mut sig = func_sig(s);
-    let mut ps = param_types(s);
     if u.isnil(sig.ty) {
         sig = sig0;
-        ps = u.nil_slice.[*mut cty.CType]();
     }
     let name = symbol_name(s);
     let mut f = ir.get_function(M, name);
@@ -363,7 +298,9 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
     if u.str_eq(name, MAIN_SYMBOL) {
         f.linkage = ir.LINK_INTERNAL;
     }
-    mark_func(f, s.ty.ret, ps, sig.sret);
+    if u.notnil(sig.plan) {
+        mark_func(f, sig.plan);
+    }
     if u.isnil(s.def) and is_wasm and (s.linkage == cast.LK_EXTERNAL) {
         // a function the program does not define: the host's
         f.import_module = "env";
@@ -476,7 +413,8 @@ fn addr_value(a: cc.Addr) *mut ir.Value {
     let mut base = ir.vnil();
     if u.notnil(a.sym) {
         if a.sym.kind == cast.SK_FUNC {
-            base = func_of(a.sym, Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false), sret: false }).val;
+            base = func_of(a.sym, Sig.{ ty: ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false),
+                                        plan: u.nil.[abi.Plan]() }).val;
         } else {
             base = object_addr(a.sym);
         }
@@ -777,8 +715,8 @@ fn start(cu: *mut cs.CUnit) void {
         n = 2;
     }
     let r = ir.call(B, mf.ty, mf.val, av[0..n]);
-    let ps = param_types(cu.main);
-    mark_call(r, mt.ret, ps, false);
+    mark_call(r, func_sig(cu.main).plan);
+    _ = mt;
     let ib = cty.t_int.bits;
     if ib > 32 {
         ir.ret(B, ir.trunc(B, r, T_i32));

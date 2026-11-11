@@ -321,6 +321,12 @@ function addrOf(r) {
   return { host: g.join(':'), port, family: 6 };
 }
 
+// The host functions whose result is an isize or usize (std's declarations
+// of the `axiom` imports).
+const SIZE_RESULTS = new Set(['ax_arg', 'ax_dir_read', 'ax_environ', 'ax_getcwd', 'ax_getenv', 'ax_mmap', 'ax_pipe_read',
+  'ax_pipe_write', 'ax_read', 'ax_readdir', 'ax_readlink', 'ax_sock_read', 'ax_sock_write', 'ax_start_sp', 'ax_syscall',
+  'ax_thread_create', 'ax_thread_stack_size', 'ax_udp_recv', 'ax_udp_send', 'ax_watch_read', 'ax_write']);
+
 export function createHost(opts = {}) {
   let memory = opts.memory || null;
   let module = null;
@@ -843,10 +849,16 @@ export function createHost(opts = {}) {
     instantiateModule(mod, extra = {}) {
       module = mod;
       const imports = {};
+      // (on wasm64, the functions whose result is an isize or usize return an
+      // i64: a BigInt, where the others return a Number)
+      const wide = WebAssembly.Module.exports(mod).some((e) => e.name === 'axiom_wasm64');
       for (const imp of WebAssembly.Module.imports(mod)) {
         imports[imp.module] ||= {};
         let v;
-        if (imp.module === 'axiom' && axiom[imp.name]) v = axiom[imp.name];
+        if (imp.module === 'axiom' && axiom[imp.name] && wide && SIZE_RESULTS.has(imp.name)) {
+          const f = axiom[imp.name];
+          v = (...a) => { const r = f(...a); return typeof r === 'number' ? BigInt(r) : r; };
+        } else if (imp.module === 'axiom' && axiom[imp.name]) v = axiom[imp.name];
         else if (imp.kind === 'memory') v = memory;
         else if (extra[imp.module] && extra[imp.module][imp.name] !== undefined) v = extra[imp.module][imp.name];
         else if (imp.kind === 'function') v = () => { throw new Error(`host import ${imp.module}.${imp.name} is not available`); };
