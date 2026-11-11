@@ -773,6 +773,7 @@ fn emit_lines(name: []u8, rows: []u64) void {
 const UW_PUSH: u32 = 0;   // pushed register `reg`
 const UW_ALLOC: u32 = 1;  // lowered rsp by `val`
 const UW_XMM: u32 = 2;    // stored xmm `reg` at [rsp + val]
+const UW_SETFP: u32 = 3;  // rbp = rsp (a function whose stack pointer moves: xe.DYNSTACK)
 
 struct UnwindStep {
     off: u64,  // the code offset just after it
@@ -801,6 +802,9 @@ fn prologue(sub: i64) void {
     b8(0x48);
     b8(0x89);
     b8(0xe5);  // mov rbp, rsp
+    if WIN and dyn_stack() {
+        uw_step(UW_SETFP, xe.RBP, 0);
+    }
     for k in 0..@int_cast(usize, nsaved) {
         let r = saved[k];
         if r >= 8 {
@@ -839,15 +843,33 @@ fn prologue(sub: i64) void {
     prologue_end = @as(u64, E.b.len());
 }
 
+// Does MF move the stack pointer after the prologue (xe.DYNSTACK)?
+fn dyn_stack() bool {
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if i.op == xe.DYNSTACK {
+                return true;
+            }
+            i = i.next;
+        }
+    }
+    return false;
+}
+
 // The function's UNWIND_INFO for Windows x64, which the system's stack
 // walker (exception dispatch, stack traces) needs for every function with a
 // frame: version 1, no handler, the prologue's size, the number of code
 // slots, no frame register (rsp stays put after the prologue, and rbp is
-// described as a saved register), then the codes in reverse order of the
+// described as a saved register; but see below), then the codes in reverse order of the
 // prologue's steps: push (UWOP_PUSH_NONVOL), sub rsp (UWOP_ALLOC_SMALL or
 // _LARGE), xmm saves (UWOP_SAVE_XMM128_FAR, at an unscaled offset from rsp).
 // Offsets past 255 (only in prologues with large frames' probes) are
-// clamped.
+// clamped. A function whose stack pointer moves after the prologue
+// (DYNSTACK) has rbp as its frame register (UWOP_SET_FPREG after the push of
+// rbp), from which the walk finds the frame's top and return address (the
+// callee-saved registers it reads relative to rsp before that: right only
+// while the stack pointer is where the prologue left it).
 fn unwind_info() bn.Bytes {
     let mut codes = bn.new_bytes();
     let mut n: u64 = 0;
@@ -859,6 +881,10 @@ fn unwind_info() bn.Bytes {
         if s.op == UW_PUSH {
             codes.u8_(@truncate(u8, off));
             codes.u8_(@truncate(u8, 0 | (@as(u64, s.reg) << 4)));
+            n += 1;
+        } else if s.op == UW_SETFP {
+            codes.u8_(@truncate(u8, off));
+            codes.u8_(3);
             n += 1;
         } else if s.op == UW_ALLOC {
             if s.val <= 128 {
@@ -890,7 +916,13 @@ fn unwind_info() bn.Bytes {
     b.u8_(1);
     b.u8_(@truncate(u8, @min(prologue_end, 255)));
     b.u8_(@truncate(u8, n));
-    b.u8_(0);
+    let mut fr: u64 = 0;
+    for k2 in 0..nuw {
+        if uw[k2].op == UW_SETFP {
+            fr = 5;  // (rbp, at offset 0)
+        }
+    }
+    b.u8_(@truncate(u8, fr));
     b.put(codes.view());
     codes.free();
     return b;
@@ -1128,9 +1160,79 @@ fn enc_rep(cc: i32) void {
     }
 }
 
+// REX.W with the R and B bits of registers r and b.
+fn rex_wrb(r: i32, b: i32) void {
+    b8(@as(u64, 0x48 | (@bit_cast(u32, r >> 3) << 2)) | @as(u64, @bit_cast(u32, b >> 3)));
+}
+
+// xe.DYNSTACK: the stack pointer moved, for dynamic allocation.
+fn enc_dynstack(i: *mut mc.MInst) void {
+    if i.cc == 1 {
+        let d = P(i.ops[0].reg);
+        rex_wrb(0, d);
+        b8(0x89);
+        b8(0xe0 | @as(u64, @bit_cast(u32, d & 7)));  // mov d, rsp
+        return;
+    }
+    if i.cc == 2 {
+        let s = P(i.ops[0].reg);
+        rex_wrb(0, s);
+        b8(0x8b);
+        b8(0xe0 | @as(u64, @bit_cast(u32, s & 7)));  // mov rsp, s
+        return;
+    }
+    let t = P(i.ops[0].reg);
+    let d = P(i.ops[1].reg);
+    let tl = @as(u64, @bit_cast(u32, t & 7));
+    // t = (t + 15) & -16
+    rex_wrb(0, t);
+    b8(0x83);
+    b8(0xc0 | tl);
+    b8(0x0f);
+    rex_wrb(0, t);
+    b8(0x83);
+    b8(0xe0 | tl);
+    b8(0xf0);
+    // while t > 4096: one page more, touched (as the prologue does)
+    rex_wrb(0, t);
+    b8(0x81);
+    b8(0xf8 | tl);
+    E.b.u32_(4096);  // cmp t, 4096
+    b8(0x76);
+    b8(21);  // jbe (past the loop)
+    b8(0x48);
+    b8(0x81);
+    b8(0xec);
+    E.b.u32_(4096);  // sub rsp, 4096
+    b8(0x48);
+    b8(0x83);
+    b8(0x0c);
+    b8(0x24);
+    b8(0x00);  // or qword [rsp], 0
+    rex_wrb(0, t);
+    b8(0x81);
+    b8(0xe8 | tl);
+    E.b.u32_(4096);  // sub t, 4096
+    b8(0xeb);
+    b8(0xe2);  // jmp (back to the cmp: -30)
+    rex_wrb(t, 0);
+    b8(0x29);
+    b8(0xc4 | (tl << 3));  // sub rsp, t
+    // d = rsp + the outgoing arguments' area (below the allocation)
+    rex_wrb(d, 0);
+    b8(0x8d);
+    b8(0x84 | (@as(u64, @bit_cast(u32, d & 7)) << 3));
+    b8(0x24);
+    E.b.u32_(out_area);
+}
+
 fn enc_inst(i: *mut mc.MInst) void {
     let op = i.op;
     let sz = i.sz;
+    if op == xe.DYNSTACK {
+        enc_dynstack(i);
+        return;
+    }
     // thread-local memory addressed relative to the fs segment
     for k in 0..i.ops.len {
         if (i.ops[k].kind == mc.K_MEM) and (i.ops[k].slot == -3) {

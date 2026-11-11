@@ -21,7 +21,9 @@ import "csema_bits.ax" as cb;
 import "csema_desig.ax" as cdi;
 import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
+import "csema_ice.ax" as csi;
 import "csema_marks.ax" as csm;
+import "csema_vla.ax" as vla;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -545,7 +547,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             }
             let mt = derive(sp.ty, d, CTX_MEMBER);
             d.ty = mt;
-            if cty.is_error(mt) {
+            if cty.is_error(mt) or not vla.check_member(d, mt) {
                 continue;
             }
             if u.notnil(flex) {
@@ -631,7 +633,7 @@ fn derive(base: *mut cty.CType, d: *mut cast.Declarator, ctx: i32) *mut cty.CTyp
             }
             t = cty.qualify(cty.pointer_to(t), dv.quals & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT));
         } else if dv.kind == cast.DerivKind.ARRAY {
-            t = array_deriv(t, dv, (ctx == CTX_PARAM) and (k == 0));
+            t = array_deriv(t, dv, (ctx == CTX_PARAM) and (k == 0), ctx == CTX_PARAM);
         } else {
             if cty.is_func(t) or (t.kind == cty.TK_ARRAY) {
                 cs.err(dv.span, "C3008",
@@ -647,7 +649,7 @@ fn derive(base: *mut cty.CType, d: *mut cast.Declarator, ctx: i32) *mut cty.CTyp
     return t;
 }
 
-fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool) *mut cty.CType {
+fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool, in_param: bool) *mut cty.CType {
     if cty.is_func(t) {
         cs.err(dv.span, "C3008", "an array of functions");
         return cty.t_error;
@@ -664,8 +666,7 @@ fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool) *mut c
                "'static' or a type qualifier in an array declarator that is not a parameter's outermost one");
     }
     if dv.is_star {
-        cs.unsupported(dv.span, "a variable length array");
-        return cty.array_of(t, 1, true);
+        return vla.star(t, dv, in_param);
     }
     if u.isnil(dv.size) {
         return cty.array_of(t, 0, false);
@@ -679,9 +680,11 @@ fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool) *mut c
         cs.err(x.span, "C3009", u.f1("the size of an array has type %s, not an integer type", cs.tq(x.ty)));
         return cty.t_error;
     }
-    if not x.is_const {
-        cs.unsupported(x.span, "a variable length array");
-        return cty.array_of(t, 1, true);
+    if not x.is_const or not csi.is_ice(x) {
+        // (a size that is a constant but not an integer constant expression too)
+        let a = vla.array(t, x);
+        dv.size = @ptr_cast(*mut cast.Expr, a.vexpr);
+        return a;
     }
     if (x.ty.is_signed and (@bit_cast(i64, x.cval) < 0)) or (x.cval == 0) {
         cs.err(x.span, "C3009",
@@ -876,6 +879,9 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
     if sp.constexpr_ and ((sp.sc == cast.SC_TYPEDEF) or cty.is_func(t)) {
         cs.err(dcl.name_span, "C3073", u.f1("'%s' is declared 'constexpr', but is not an object", name));
     }
+    if cty.is_vm(t) {
+        vla.check_decl(name, dcl.name_span, t, sp.sc);
+    }
     if sp.sc == cast.SC_TYPEDEF {
         if u.notnil(dcl.init) {
             cs.err(dcl.init.span, "C3033", u.f1("the typedef '%s' has an initializer", name));
@@ -884,7 +890,7 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
         if u.notnil(prior) {
             let same = (prior.kind == cast.SK_TYPEDEF) and cty.compatible(prior.ty, t) and
                        ((t.kind != cty.TK_ARRAY) or (prior.ty.has_len == t.has_len));
-            if not same or (cs.std() < co.C11) {
+            if not same or (cs.std() < co.C11) or cty.is_vm(t) {
                 cs.err_note(dcl.name_span, u.pick(same or (prior.kind == cast.SK_TYPEDEF), "C3002", "C3003"),
                             u.f1("redefinition of '%s'", name), prior.span, "declared before here");
                 return;
@@ -1065,7 +1071,9 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t0: *mut cty.CType, ctx: i
     dcl.sym = s;
     object_flags(sp, s, dcl);
     cs.declare(name, s);
-    if u.notnil(dcl.init) {
+    if u.notnil(dcl.init) and cty.is_vla(s.ty) {
+        vla.init(s, dcl.init);
+    } else if u.notnil(dcl.init) {
         init_object(s, dcl.init, s.duration == cast.SD_STATIC);
     }
     if not cty.is_complete(s.ty) and not cty.is_error(s.ty) {
@@ -1187,6 +1195,7 @@ fn function_def(d: *mut cast.Decl) void {
             cs.err(p.span, "C3007", u.f2("the parameter '%s' has incomplete type %s", p.name, cs.tq(p.ty)));
         }
     }
+    vla.check_params(dcl.derivs.at(0));
     s.defined = true;
     s.def = d;
     s.params = params;

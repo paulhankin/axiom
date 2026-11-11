@@ -110,6 +110,7 @@ comments, so that they are valid in every standard:
 /* flags: --c-std=c89 */
 /* expect: 42 */            one line of expected output, in order
 /* expect-error: C3012 */   the build must fail with this code
+/* expect-warning: C4040 */ the build must warn with this code
 ```
 
 Programs print through functions the test host provides (`print_i64`, `print_u64`,

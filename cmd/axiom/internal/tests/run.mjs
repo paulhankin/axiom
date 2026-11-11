@@ -316,8 +316,9 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // built (for wasm32, or with --native for this machine, at the suite's
 // optimization level) with its /* flags: */ and run; its output must be its
 // /* expect: */ lines, or the build must fail with each /* expect-error: C3xxx */
-// code. The tests print through host.h (next to run/); natively its functions
-// are c/host_native.c's, compiled by the system's C compiler.
+// code; it must warn with each /* expect-warning: C4xxx */ code. The tests
+// print through host.h (next to run/); natively its functions are
+// c/host_native.c's, compiled by the system's C compiler.
 const cRunDir = path.join(root, 'cmd/axiom/internal/tests/c/run');
 const cRunFiles = fs.existsSync(cRunDir) ? fs.readdirSync(cRunDir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(cRunDir, f)) : [];
 await section('', byFile(cRunFiles, '[c]', async (f) => {
@@ -326,6 +327,7 @@ await section('', byFile(cRunFiles, '[c]', async (f) => {
   const src = fs.readFileSync(f, 'utf8');
   const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
   const errors = [...src.matchAll(/\/\* expect-error: (C\d+) \*\//g)].map((m) => m[1]);
+  const warnings = [...src.matchAll(/\/\* expect-warning: (C\d+) \*\//g)].map((m) => m[1]);
   const expect = [...src.matchAll(/^\/\* expect: ?(.*?) \*\/$/gm)].map((m) => m[1]);
   if ((native && /\/\* wasm-only \*\//.test(src)) || (!native && /\/\* native-only \*\//.test(src))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
   const out = path.join(tmp, `c-${path.basename(f, '.c')}${native ? '' : '.wasm'}`);
@@ -342,6 +344,8 @@ await section('', byFile(cRunFiles, '[c]', async (f) => {
     return null;
   }
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+  const wcodes = json ? json.diagnostics.filter((x) => x.severity === 'warning').map((x) => x.code) : [];
+  for (const w of warnings) if (!wcodes.includes(w)) return `expected warning ${w}, got [${wcodes.join(', ')}]`;
   const r = native ? await runNative(out) : await runWasm(out);
   let problem = r.trapped ? `unexpected trap: ${r.msg}` : null;
   const want = expect.join('\n'), got = r.out.join('\n');

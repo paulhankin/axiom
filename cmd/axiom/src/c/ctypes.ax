@@ -111,8 +111,10 @@ pub struct CType {
     elem: *mut CType,
     // array
     len: u64,
-    has_len: bool,  // complete (a length is known)
-    vla: bool,      // a variable length array (not supported yet: the length is unknown)
+    has_len: bool,     // complete (a length is known)
+    vla: bool,         // a variable length array: complete, its length known at run time (len 0, has_len false)
+    vexpr: *mut void,  // a VLA's length: the expression (cast.Expr, of type size_t) evaluated where its
+                       // declarator is reached; nil for `[*]` (csema_vla.ax, cgen_vla.ax)
     // function
     ret: *mut CType,
     params: []mut *mut CType,  // adjusted parameter types (arrays and functions become pointers), unqualified
@@ -367,6 +369,38 @@ pub fn array_of(t: *mut CType, n: u64, has_len: bool) *mut CType {
     return a;
 }
 
+/// A variable length array of elements of type `t` whose length is the
+/// value of `vexpr` (a cast.Expr, or nil for `[*]`).
+pub fn vla_of(t: *mut CType, vexpr: *mut void) *mut CType {
+    let a = new_type(TK_ARRAY);
+    a.elem = t;
+    a.vla = true;
+    a.vexpr = vexpr;
+    return a;
+}
+
+/// Is t a variable length array type (6.7.6.2p4): an array whose length or
+/// element size is not a constant (so its size is known at run time only)?
+pub fn is_vla(t: *CType) bool {
+    return (t.kind == TK_ARRAY) and (t.vla or is_vla(t.elem));
+}
+
+/// Is t variably modified (6.7.6p3): a variable length array, or derived
+/// from one by arrays and pointers (and function results)?
+pub fn is_vm(t: *CType) bool {
+    let k = t.kind;
+    if k == TK_ARRAY {
+        return t.vla or is_vm(t.elem);
+    }
+    if k == TK_POINTER {
+        return is_vm(t.elem);
+    }
+    if k == TK_FUNCTION {
+        return is_vm(t.ret);
+    }
+    return false;
+}
+
 /// A function type returning `ret`.
 pub fn function(ret: *mut CType, params: []mut *mut CType, proto: bool, variadic: bool) *mut CType {
     let f = new_type(TK_FUNCTION);
@@ -535,7 +569,7 @@ pub fn is_complete(t: *CType) bool {
         return false;
     }
     if k == TK_ARRAY {
-        return t.has_len and not t.vla and is_complete(t.elem);
+        return (t.has_len or t.vla) and is_complete(t.elem);
     }
     if (k == TK_STRUCT) or (k == TK_UNION) or (k == TK_ENUM) {
         return t.tag.complete and not t.tag.defining;
@@ -896,6 +930,14 @@ pub fn composite(a: *mut CType, b: *mut CType) *mut CType {
         if a.has_len {
             return qualify(array_of(el, a.len, true), a.quals);
         }
+        if not b.has_len and (a.vla or b.vla) {
+            // (a variable length array's length: the one evaluated, if either is)
+            let mut x = a.vexpr;
+            if u.isvnil(x) or not a.vla {
+                x = b.vexpr;
+            }
+            return qualify(vla_of(el, x), a.quals);
+        }
         return qualify(array_of(el, b.len, b.has_len), a.quals);
     }
     if (k == TK_POINTER) and (b.kind == TK_POINTER) {
@@ -1014,6 +1056,8 @@ fn spell(t: *CType, inner: []u8) []u8 {
         let mut n: []u8 = "";
         if t.has_len {
             n = u.udec(t.len);
+        } else if t.vla {
+            n = "*";
         }
         return spell(t.elem, u.f2("%s[%s]", inner, n));
     }

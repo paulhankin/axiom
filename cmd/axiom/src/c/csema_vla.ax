@@ -1,0 +1,292 @@
+// =============================================================================
+// csema_vla.ax - variable length arrays and variably modified types (C99
+// 6.7.5.2, C11 6.7.6.2): their types, the constraints on the declarations
+// that have them, and the scopes they open in a function body, which no
+// goto and no case or default label may jump into (6.8.6.1p1, 6.8.4.2p2).
+//
+// A variable length array type is a CType with vla set (cty.vla_of): it is
+// complete, its size is not a constant, and its length is the expression
+// in vexpr, converted to size_t, which IR generation evaluates each time the
+// declarator it was written in is reached (cgen_vla.ax); `[*]` (a
+// parameter in a prototype that is not a definition) has none. The sizes of
+// a prototype's parameters are not evaluated, as though they were `[*]`.
+//
+// In a function body the declarations of identifiers with a variably
+// modified type form a tree of scopes (VNode): each such declaration opens
+// one, inside the one current where it is; a block's end leaves those its
+// declarations opened. Labels, gotos and switch statements remember the
+// scope they are in: a label must be in the scope of a goto that jumps to
+// it (or an enclosing one), a case or default label in its switch
+// statement's. The automatic objects of variable length array type are
+// allocated where they are declared and released when their scope is left
+// (cgen_vla.ax); `depth` counts those around a label, for the jumps to it.
+//
+// Diagnostics:
+//   C3080  a variable length array before C99
+//   C3081  a variably modified type where none can be (file scope, linkage, a member, static storage)
+//   C3082  an initializer of a variable length array (C23: other than `{}`)
+//   C3083  a goto into the scope of an identifier with a variably modified type
+//   C3084  a case or default label in the scope of such an identifier declared in its switch statement
+//   C3085  `[*]` outside the parameters of a prototype that is not a definition
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "copts.ax" as co;
+import "csema.ax" as cs;
+import "csema_expr.ax" as cx;
+import "ctypes.ax" as cty;
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+
+fn pre_c99(sp: u.Span) bool {
+    if cs.std() < co.C99 {
+        cs.err(sp, "C3080",
+               "a variable length array (an array size that is not an integer constant expression) is a C99 feature");
+        return true;
+    }
+    return false;
+}
+
+/// The variable length array of elements of type t whose size is x (an
+/// expression of integer type that is not constant: an array declarator's).
+pub fn array(t: *mut cty.CType, x: *mut cast.Expr) *mut cty.CType {
+    _ = pre_c99(x.span);
+    let n = cx.convert(x, cty.t_size);
+    return cty.vla_of(t, @ptr_cast(*mut void, n));
+}
+
+/// The variable length array of unspecified size `[*]` (in_param: in a
+/// parameter's declarator).
+pub fn star(t: *mut cty.CType, dv: *cast.Deriv, in_param: bool) *mut cty.CType {
+    if not pre_c99(dv.span) and not in_param {
+        cs.err(dv.span, "C3085", "'[*]' outside the parameters of a function prototype");
+    }
+    return cty.vla_of(t, u.vnil());
+}
+
+// Has t a variable length array of unspecified size (`[*]`) in it?
+fn has_star(t: *cty.CType) bool {
+    let k = t.kind;
+    if k == cty.TK_ARRAY {
+        return (t.vla and u.isvnil(t.vexpr)) or has_star(t.elem);
+    }
+    if k == cty.TK_POINTER {
+        return has_star(t.elem);
+    }
+    return false;
+}
+
+/// The parameters of a function definition (its declarator's function
+/// derivation fd), which have no `[*]`.
+pub fn check_params(fd: *cast.Deriv) void {
+    for p in fd.params.items() {
+        let t = p.decl.ty;
+        if u.notnil(t) and has_star(t) {
+            cs.err(p.span, "C3085", u.f1("the parameter '%s' of a function definition has '[*]' in its type",
+                                         p.decl.name));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Declarations
+// -----------------------------------------------------------------------------
+
+/// A declaration of `name` (at sp) with variably modified type t and
+/// storage-class specifier sc (a cast.SC_ bit or 0), at file scope or in a
+/// block: what 6.7.6.2p2 does not allow.
+pub fn check_decl(name: []u8, sp: u.Span, t: *mut cty.CType, sc: i32) void {
+    if cs.at_file_scope() {
+        cs.err(sp, "C3081", u.f2("'%s' has a variably modified type %s at file scope", name, cs.tq(t)));
+        return;
+    }
+    if cty.is_func(t) {
+        cs.err(sp, "C3081", u.f2("the function '%s' returns a variably modified type %s", name, cs.tq(t.ret)));
+        return;
+    }
+    if sc == cast.SC_EXTERN {
+        cs.err(sp, "C3081", u.f2("'%s', declared extern, has a variably modified type %s", name, cs.tq(t)));
+        return;
+    }
+    if (sc == cast.SC_STATIC) and cty.is_vla(t) {
+        cs.err(sp, "C3081", u.f2("'%s' has static storage duration and a variable length array type %s", name,
+                                 cs.tq(t)));
+    }
+}
+
+/// A member's type mt, which cannot be variably modified; false if it is.
+pub fn check_member(d: *cast.Declarator, mt: *mut cty.CType) bool {
+    if cty.is_vm(mt) {
+        cs.err(d.name_span, "C3081", u.f2("the member '%s' has a variably modified type %s", d.name, cs.tq(mt)));
+        return false;
+    }
+    return true;
+}
+
+/// The initializer of s, an object of variable length array type: none
+/// can be, but for an empty one in C23 (6.7.10p4), which makes it zero.
+pub fn init(s: *mut cast.CSym, it: *mut cast.Init) void {
+    if (cs.std() >= co.C23) and (it.kind == cast.InitKind.LIST) and (it.items.len == 0) {
+        let l = u.new.[cast.InitList]();
+        l.zero = true;
+        s.init = l;
+        return;
+    }
+    cs.err(it.span, "C3082", u.f2("the variable length array '%s' has an initializer%s", s.name,
+                                  u.pick(cs.std() >= co.C23, " other than '{}'", "")));
+}
+
+// -----------------------------------------------------------------------------
+// Scopes in a function body
+// -----------------------------------------------------------------------------
+
+// The scope of one declaration of an identifier with a variably modified type.
+struct VNode {
+    parent: *mut VNode,
+    name: []u8,
+    span: u.Span,
+    depth: i32,  // the automatic variable length arrays in this scope and those around it
+}
+
+struct Goto {
+    s: *mut cast.Stmt,
+    at: *mut VNode,
+}
+
+struct Scopes {
+    cur: *mut VNode,
+    labels: u.SymMap.[*mut VNode],  // a label's scope, by its CSym's address (labels defined so far)
+    gotos: u.List.[Goto],
+}
+
+let mut SC: *mut Scopes = @ptr_from_int(*mut Scopes, 0);
+
+// The jumps' depths (by label CSym): for IR generation, after analysis.
+let mut depths: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                  cap: 0, len: 0 };
+
+fn key(l: *cast.CSym) []u8 {
+    return u.addr_key(@int_from_ptr(l));
+}
+
+/// Starts a function body.
+pub fn begin_body() void {
+    SC = u.new.[Scopes]();
+    SC.labels = u.SymMap.[*mut VNode].{ keys: u.nil.[usize](), vals: u.nil.[*mut VNode](), cap: 0, len: 0 };
+}
+
+/// The current scope (for leave).
+pub fn mark() *mut void {
+    return @ptr_cast(*mut void, SC.cur);
+}
+
+/// Leaves the scopes opened since mark m was taken (a block's end).
+pub fn leave(m: *mut void) void {
+    SC.cur = @ptr_cast(*mut VNode, m);
+}
+
+fn cur_depth() i32 {
+    if u.isnil(SC.cur) {
+        return 0;
+    }
+    return SC.cur.depth;
+}
+
+/// A declaration in a block (or a for statement), analyzed: each declarator
+/// with a variably modified type opens a scope.
+pub fn declared(d: *cast.Decl) void {
+    if d.kind != cast.DeclKind.DECL {
+        return;
+    }
+    for x in d.decls.items() {
+        if u.isnil(x.ty) or not cty.is_vm(x.ty) {
+            continue;
+        }
+        let n = u.new.[VNode]();
+        n.parent = SC.cur;
+        n.name = x.name;
+        n.span = x.name_span;
+        n.depth = cur_depth();
+        if allocates(x.sym) {
+            n.depth += 1;
+        }
+        SC.cur = n;
+    }
+}
+
+/// Is s an object that is allocated where it is declared: an automatic
+/// variable length array?
+pub fn allocates(s: *cast.CSym) bool {
+    return u.notnil(s) and (s.kind == cast.SK_OBJECT) and (s.duration == cast.SD_AUTO) and not s.is_param and
+           cty.is_vla(s.ty);
+}
+
+/// Label l is defined here.
+pub fn label(l: *mut cast.CSym) void {
+    SC.labels.put(key(l), SC.cur);
+    depths.put(key(l), cur_depth());
+}
+
+/// A goto statement is here (checked at the end of the body).
+pub fn goto_(s: *mut cast.Stmt) void {
+    SC.gotos.push(Goto.{ s: s, at: SC.cur });
+}
+
+/// The automatic variable length arrays around label l (IR generation).
+pub fn depth(l: *cast.CSym) i32 {
+    return depths.get(key(l));
+}
+
+/// A case or default label s of a switch statement whose body starts in
+/// scope `at` (a mark).
+pub fn case_label(s: *cast.Stmt, at: *mut void) void {
+    let sw = @ptr_cast(*mut VNode, at);
+    if SC.cur == sw {
+        return;
+    }
+    let mut n = SC.cur;
+    while u.notnil(n.parent) and (n.parent != sw) {
+        n = n.parent;
+    }
+    let what = u.pick(s.kind == cast.StmtKind.CASE, "case", "default");
+    cs.err_note(s.span, "C3084",
+                u.f2("a '%s' label in the scope of '%s', which has a variably modified type: the switch jumps past it",
+                     what, n.name), n.span, "declared here");
+}
+
+/// The end of the body: the gotos jump to labels in their scope.
+pub fn end_body() void {
+    for g in SC.gotos.items() {
+        let l = g.s.sym;
+        if u.isnil(l) or not l.defined {
+            continue;
+        }
+        let to = SC.labels.get(key(l));
+        // the label's scope encloses the goto's (or is it)
+        let mut n = g.at;
+        while u.notnil(n) and (n != to) {
+            n = n.parent;
+        }
+        if n == to {
+            continue;
+        }
+        // the outermost scope the label is in and the goto is not
+        let mut x = to;
+        loop {
+            let mut y = g.at;
+            while u.notnil(y) and (y != x.parent) {
+                y = y.parent;
+            }
+            if y == x.parent {
+                break;
+            }
+            x = x.parent;
+        }
+        cs.err_note(g.s.span, "C3083",
+                    u.f2("'goto %s' jumps into the scope of '%s', which has a variably modified type", l.name, x.name),
+                    x.span, "declared here");
+    }
+    SC = u.nil.[Scopes]();
+}

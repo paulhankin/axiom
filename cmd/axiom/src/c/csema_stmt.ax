@@ -13,6 +13,7 @@ import "csema_decl.ax" as cd;
 import "csema_desig.ax" as cdi;
 import "csema_expr.ax" as cx;
 import "csema_marks.ax" as csm;
+import "csema_vla.ax" as vla;
 import "ctypes.ax" as cty;
 
 // A switch statement being analyzed.
@@ -21,6 +22,7 @@ struct Switch {
     ty: *mut cty.CType,  // the promoted type of its controlling expression
     values: u.SymMap.[i32],
     has_default: bool,
+    scope: *mut void,  // the scope its body starts in (csema_vla.mark)
 }
 
 struct Body {
@@ -56,6 +58,7 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
     let saved = BD;
     BD = b;
     cs.set_cur_fn(f);
+    vla.begin_body();
     cs.push_scope();
     for p in f.params.items() {
         if p.name.len > 0 {
@@ -65,15 +68,20 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
             }
         }
     }
-    for s in d.body.items.items() {
-        stmt(s);
+    let xs = d.body.items.items();
+    for i in 0..xs.len {
+        stmt(xs[i]);
+        fallthrough(xs, i);
     }
     cs.pop_scope();
     for l in b.label_list.items() {
         if not l.defined {
             cs.err(l.span, "C3043", u.f1("the label '%s' is used but not defined", l.name));
+        } else if not l.used {
+            cs.warn(l.span, "C4040", u.f1("the label '%s' is defined but not used", l.name));
         }
     }
+    vla.end_body();
     cs.set_cur_fn(u.nil.[cast.CSym]());
     BD = saved;
 }
@@ -95,12 +103,17 @@ fn stmt(s: *mut cast.Stmt) void {
     let k = s.kind;
     if k == cast.StmtKind.COMPOUND {
         cs.push_scope();
-        for x in s.items.items() {
-            stmt(x);
+        let m = vla.mark();
+        let xs = s.items.items();
+        for i in 0..xs.len {
+            stmt(xs[i]);
+            fallthrough(xs, i);
         }
+        vla.leave(m);
         cs.pop_scope();
     } else if k == cast.StmtKind.DECL {
         cd.block_decl(s.decl);
+        vla.declared(s.decl);
     } else if k == cast.StmtKind.EXPR {
         if u.notnil(s.e) {
             s.e = cx.full_expr(s.e);
@@ -117,8 +130,10 @@ fn stmt(s: *mut cast.Stmt) void {
     } else if k == cast.StmtKind.FOR {
         // (the clauses and body are a block of their own: C99 6.8.5p5)
         cs.push_scope();
+        let m = vla.mark();
         if u.notnil(s.decl) {
             cd.for_decl(s.decl);
+            vla.declared(s.decl);
         } else if u.notnil(s.first) {
             s.first = cx.full_expr(s.first);
         }
@@ -129,11 +144,13 @@ fn stmt(s: *mut cast.Stmt) void {
             s.step = cx.full_expr(s.step);
         }
         loop_body(s.body);
+        vla.leave(m);
         cs.pop_scope();
     } else if k == cast.StmtKind.GOTO {
         let l = label_sym(s.label, s.label_span);
         l.used = true;
         s.sym = l;
+        vla.goto_(s);
     } else if k == cast.StmtKind.CONTINUE {
         if BD.loops == 0 {
             cs.err(s.span, "C3042", "'continue' is not in a loop");
@@ -152,11 +169,44 @@ fn stmt(s: *mut cast.Stmt) void {
         l.defined = true;
         l.span = s.label_span;
         s.sym = l;
+        vla.label(l);
         stmt(s.body);
     } else if k == cast.StmtKind.CASE {
         case_stmt(s);
     } else {
         default_stmt(s);
+    }
+}
+
+// Is s (after its labels) a fallthrough declaration `[[fallthrough]];` (C23)?
+fn is_fallthrough(s0: *cast.Stmt) bool {
+    let mut s = s0;
+    while ((s.kind == cast.StmtKind.LABEL) or (s.kind == cast.StmtKind.CASE) or (s.kind == cast.StmtKind.DEFAULT)) and
+          u.notnil(s.body) {
+        s = s.body;
+    }
+    if (s.kind != cast.StmtKind.DECL) or u.isnil(s.decl) or (s.decl.kind != cast.DeclKind.ATTR) {
+        return false;
+    }
+    for a in s.decl.attrs.items() {
+        if (a.prefix.len == 0) and (u.str_eq(a.name, "fallthrough") or u.str_eq(a.name, "__fallthrough__")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Block item xs[i], if a fallthrough declaration, is in a switch statement and
+// followed by a case or default label (C23 6.7.13.5p2).
+fn fallthrough(xs: []*mut cast.Stmt, i: usize) void {
+    if not is_fallthrough(xs[i]) {
+        return;
+    }
+    let next_case = ((i + 1) < xs.len) and
+                    ((xs[i + 1].kind == cast.StmtKind.CASE) or (xs[i + 1].kind == cast.StmtKind.DEFAULT));
+    if (BD.switches.len == 0) or not next_case {
+        cs.err(xs[i].span, "C3077",
+               "'[[fallthrough]]' is not followed by a case or default label of a switch statement");
     }
 }
 
@@ -199,6 +249,7 @@ fn switch_stmt(s: *mut cast.Stmt) void {
         }
     }
     s.e = cx.convert(e, sw.ty);
+    sw.scope = vla.mark();
     BD.switches.push(sw);
     BD.breakable += 1;
     sub(s.body);
@@ -225,6 +276,7 @@ fn case_stmt(s: *mut cast.Stmt) void {
             sw.values.put(key, 1);
             sw.s.cases.push(s);
         }
+        vla.case_label(s, BD.switches.last().scope);
     }
     stmt(s.body);
 }
@@ -239,6 +291,7 @@ fn default_stmt(s: *mut cast.Stmt) void {
         }
         sw.has_default = true;
         sw.s.cases.push(s);
+        vla.case_label(s, sw.scope);
     }
     stmt(s.body);
 }

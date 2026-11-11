@@ -12,6 +12,7 @@ import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_bitint.ax" as cgbi;
 import "cgen_bits.ax" as cgb;
+import "cgen_vla.ax" as gv;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -186,7 +187,7 @@ pub fn lv(e: *mut cast.Expr) *mut ir.Value {
     if k == cast.ExprKind.INDEX {
         let p = rv(e.a);
         let i = rv(e.b);
-        return offset(p, i, cty.size_of(e.ty), false);
+        return offset(p, i, gv.size_value(e.ty), false);
     }
     if k == cast.ExprKind.MEMBER {
         let base = rv_or_lv(e.a, e.op == ct.P_DOT);
@@ -237,13 +238,13 @@ fn rv_or_lv(e: *mut cast.Expr, want_lv: bool) *mut ir.Value {
     return rv(e);
 }
 
-// p + i * size (i: a pointer-sized integer), or minus.
-fn offset(p: *mut ir.Value, i0: *mut ir.Value, size: u64, neg: bool) *mut ir.Value {
+// p + i * size (i: a pointer-sized integer; size: the elements', cgen_vla.size_value), or minus.
+fn offset(p: *mut ir.Value, i0: *mut ir.Value, size: *mut ir.Value, neg: bool) *mut ir.Value {
     let mut i = i0;
     if i.ty.bits != cg.T_isz.bits {
         i = int_resize(i, true, cg.T_isz);
     }
-    let mut d = ir.mul(cg.B, i, cg.usz(size));
+    let mut d = ir.mul(cg.B, i, size);
     if neg {
         d = ir.sub(cg.B, cg.usz(0), d);
     }
@@ -288,6 +289,9 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
     if k == cast.ExprKind.NULLPTR {
         return ir.czero(cg.T_ptr);
     }
+    if (k == cast.ExprKind.SIZEOF_EXPR) or (k == cast.ExprKind.SIZEOF_TYPE) {
+        return vla_sizeof(e);
+    }
     if (k == cast.ExprKind.MEMBER) or (k == cast.ExprKind.INDEX) or (k == cast.ExprKind.IDENT) {
         // (the member of a structure value; lvalues are converted by CV_LOAD)
         let p = lv(e);
@@ -300,8 +304,21 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
     return ir.vnil();
 }
 
+// sizeof of a variable length array (not a constant): its operand evaluated.
+fn vla_sizeof(e: *mut cast.Expr) *mut ir.Value {
+    if e.kind == cast.ExprKind.SIZEOF_EXPR {
+        _ = rv_or_lv(e.a, true);
+        return gv.size_value(e.a.ty);
+    }
+    gv.eval_declarator(e.tname.decl, e.tname.ty, rv);
+    return gv.size_value(e.tname.ty);
+}
+
 fn conversion(e: *mut cast.Expr) *mut ir.Value {
     let op = e.op;
+    if u.notnil(e.tname) and cty.is_vm(e.tname.ty) {
+        gv.eval_declarator(e.tname.decl, e.tname.ty, rv);  // (a cast to a variably modified type)
+    }
     if op == cast.CV_LOAD {
         let p = lv(e.a);
         if cty.is_record(e.ty) {
@@ -527,11 +544,11 @@ fn binary(e: *mut cast.Expr) *mut ir.Value {
             // p - q: the difference in elements
             let q = rv(e.b);
             let d = ir.sub(cg.B, ir.ptrtoint(cg.B, p, cg.T_isz), ir.ptrtoint(cg.B, q, cg.T_isz));
-            let n = ir.binop(cg.B, ir.OP_SDIV, d, cg.usz(cty.size_of(ta.elem)));
+            let n = ir.binop(cg.B, ir.OP_SDIV, d, gv.size_value(ta.elem));
             return int_resize(n, true, lty(e.ty));
         }
         let i = rv(e.b);
-        return offset(p, i, cty.size_of(ta.elem), op == ct.P_MINUS);
+        return offset(p, i, gv.size_value(ta.elem), op == ct.P_MINUS);
     }
     let x = rv(e.a);
     let y = rv(e.b);
@@ -555,7 +572,7 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
     let ot = e.opty;
     let mut nv = ir.vnil();
     if ot.kind == cty.TK_POINTER {
-        nv = offset(old, r, cty.size_of(ot.elem), e.op == ct.P_SUB_EQ);
+        nv = offset(old, r, gv.size_value(ot.elem), e.op == ct.P_SUB_EQ);
     } else {
         let x = convert(old, lt, ot);
         nv = convert(arith_op(base_op(e.op), ot, x, r), ot, lt);
@@ -572,7 +589,7 @@ fn incdec(e: *mut cast.Expr) *mut ir.Value {
     let dec = e.op == ct.P_DEC;
     let mut nv = ir.vnil();
     if ot.kind == cty.TK_POINTER {
-        nv = offset(old, cg.usz(1), cty.size_of(ot.elem), dec);
+        nv = offset(old, cg.usz(1), gv.size_value(ot.elem), dec);
     } else {
         let x = convert(old, t, ot);
         let mut one = ir.vnil();

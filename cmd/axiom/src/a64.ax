@@ -57,6 +57,9 @@ const RET: i32 = 16;    // uses
 const LABEL: i32 = 17;  // aux: local label
 const RAW: i32 = 18;    // up to 4 register operands: Rd, Rn, Rm, Ra fields; aux: the instruction word
 const PRFM: i32 = 19;   // mem; cc: the operation (0 pldl1keep, 0x10 pstl1keep)
+// The stack pointer moved (ir.IN_STACK_ALLOC ...), sp an operand: cc 0: r(UD) bytes allocated (probing each
+// page), r(D) <- their address above the outgoing arguments; 1: r(D) <- sp; 2: sp <- r(U)
+const DYNSTACK: i32 = 20;
 
 const LOCAL_BASE: i32 = 1_000_000;
 
@@ -93,7 +96,8 @@ let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 let mut nlocal: i32 = 0;
-let mut out_area: u64 = 0;  // outgoing stack-argument bytes
+let mut out_area: u64 = 0;        // outgoing stack-argument bytes
+let mut dyn_frame: bool = false;  // sp moves after the prologue (DYNSTACK): the slots are addressed from x29
 
 fn fail(msg: []u8) void {
     u.eprint(u.f2("axiom: AArch64 code generation: %s (in %s)\n", msg, F.name));
@@ -2827,6 +2831,23 @@ fn gen_inst(v: *mut ir.Value) void {
             _ = e2(MOV, 8, W(vreg(v)), R(FP));
             return;
         }
+        if ir.is_dyn_stack(id) {
+            dyn_frame = true;
+            if id == ir.IN_STACK_ALLOC {
+                let n = vgpr();
+                copy(n, reg(v.xs.get(0)), GPR);
+                let ops: [3]mc.MOp = [RW(n), W(vreg(v)), RW(SP)];
+                let i = emit(DYNSTACK, 8, ops[..]);
+                i.cc = 0;
+            } else if id == ir.IN_STACK_SAVE {
+                let i = e2(DYNSTACK, 8, W(vreg(v)), R(SP));
+                i.cc = 1;
+            } else {
+                let i = e2(DYNSTACK, 8, R(reg(v.xs.get(0))), RW(SP));
+                i.cc = 2;
+            }
+            return;
+        }
         if ir.is_prefetch(id) {
             gen_prefetch(v, id);
             return;
@@ -3162,6 +3183,7 @@ fn compile_func(f: *mut ir.Func) void {
     vc_blk = @ptr_from_int(*mut mc.MBlock, 0);
     nlocal = 0;
     out_area = 0;
+    dyn_frame = false;
     opt.split_critical_edges(f);
     lower.scalarize(f, legal);
     opt.compute_preds(f);
@@ -3404,6 +3426,11 @@ fn resolve(o: mc.MOp) Loc {
     if o.slot >= 0 {
         l.base = SP;
         l.disp += MF.slots.get(@int_cast(usize, o.slot)).offset;
+        if dyn_frame {
+            // (x29 is the stack pointer after the prologue plus the frame)
+            l.base = FP;
+            l.disp -= frame;
+        }
         return l;
     }
     if o.base >= 0 {
@@ -3618,15 +3645,49 @@ fn epilogue() void {
         w32(ae.RET);
         return;
     }
+    if dyn_frame {
+        add_disp(SP, FP, -frame);  // (the saved registers are where the prologue put them)
+    }
     save_restore(true);
     w32(0x9100_03BF);  // mov sp, x29
     w32(0xA8C1_7BFD);  // ldp x29, x30, [sp], #16
     w32(ae.RET);
 }
 
+// DYNSTACK: the stack pointer moved, for dynamic allocation.
+fn enc_dynstack(i: *mut mc.MInst) void {
+    if i.cc == 1 {
+        w32(ae.addsub_imm(1, false, false, P(i.ops[0].reg), SP, 0, false));  // mov d, sp
+        return;
+    }
+    if i.cc == 2 {
+        w32(ae.addsub_imm(1, false, false, SP, P(i.ops[0].reg), 0, false));  // mov sp, s
+        return;
+    }
+    let t = P(i.ops[0].reg);
+    let d = P(i.ops[1].reg);
+    // t = (t + 15) & ~15
+    w32(ae.addsub_imm(1, false, false, t, t, 15, false));
+    w32(ae.logic_imm(1, 0, t, t, @bit_cast(u64, ae.logical_imm(~@as(u64, 15), 64))));
+    // while t > 4096: one page more, touched (as the prologue does)
+    w32(ae.addsub_imm(1, true, true, 31, t, 1, true));        // cmp t, #4096
+    w32(ae.bcond(cc64(LS)) | (5 << 5));                       // b.ls (past the loop)
+    w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));      // sub sp, sp, #4096
+    w32(ae.ldst_uimm(3, false, 0, 31, SP, 0));                // str xzr, [sp]
+    w32(ae.addsub_imm(1, true, false, t, t, 1, true));        // sub t, t, #4096
+    w32(ae.B | (@bit_cast(u64, @as(i64, -5)) & 0x3ff_ffff));  // b (back to the cmp)
+    w32(ae.addsub_ext(1, true, false, SP, SP, t, 0));         // sub sp, sp, t
+    // d = sp + the outgoing arguments' area (below the allocation)
+    add_disp(d, SP, @bit_cast(i64, (out_area + 15) & ~@as(u64, 15)));
+}
+
 fn enc_inst(i: *mut mc.MInst) void {
     let op = i.op;
     let sz = i.sz;
+    if op == DYNSTACK {
+        enc_dynstack(i);
+        return;
+    }
     if op == RAW {
         let mut w = @bit_cast(u64, i.aux);
         let shifts: [4]u64 = [0, 5, 16, 10];

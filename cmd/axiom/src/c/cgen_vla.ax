@@ -1,0 +1,157 @@
+// =============================================================================
+// cgen_vla.ax - IR generation for variable length arrays (csema_vla.ax): the
+// lengths of their types, sizes known at run time, and the stack space of
+// automatic ones.
+//
+// A variable length array type's length (its CType's vexpr) is evaluated
+// where its declarator is reached (eval_declarator: a declaration, a
+// function definition's parameters, the type name of a cast or sizeof) and
+// kept in a slot of the function's frame, which every use of the type then
+// reads: so a type keeps the length it had when it was declared.
+//
+// An automatic object of variable length array type is allocated on the
+// stack when its declaration is reached (ir.IN_STACK_ALLOC), after saving
+// the stack pointer (ir.IN_STACK_SAVE); the saved values form a chain, one
+// per such object in scope. Leaving the scope of some of them (the end of a
+// block, a break, a continue, a goto out) moves the stack pointer back to the
+// value saved before the first of them (ir.IN_STACK_RESTORE); returning
+// releases all with the frame.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "ctypes.ax" as cty;
+
+struct State {
+    lens: u.SymMap.[*mut ir.Value],  // a length's slot, by its expression's address
+    chain: u.List.[*mut ir.Value],   // the stack pointers saved before the allocations in scope
+}
+
+let mut VS: *mut State = @ptr_from_int(*mut State, 0);
+
+fn key(p: *void) []u8 {
+    return u.addr_key(@int_from_ptr(p));
+}
+
+/// Starts a function's body.
+pub fn begin_function() void {
+    VS = u.new.[State]();
+    VS.lens = u.SymMap.[*mut ir.Value].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Value](), cap: 0, len: 0 };
+}
+
+fn none() []mut *mut ir.Value {
+    let xs = u.newn.[*mut ir.Value](1);
+    return xs[0..0];
+}
+
+// -----------------------------------------------------------------------------
+// Lengths and sizes
+// -----------------------------------------------------------------------------
+
+/// Evaluates the lengths of the variable length arrays declarator d makes
+/// of type t (d's own derivations: what its declaration specifiers give was
+/// evaluated where that was declared), in the order they are written; ev
+/// is an expression's value (cgen_expr.rv).
+pub fn eval_declarator(d: *cast.Declarator, t0: *mut cty.CType, ev: fn(*mut cast.Expr) *mut ir.Value) void {
+    let mut t = t0;
+    for k in 0..d.derivs.len {
+        let dv = d.derivs.at(k);
+        if dv.kind == cast.DerivKind.FUNCTION {
+            return;  // (a prototype's parameters: not evaluated)
+        }
+        if ((dv.kind == cast.DerivKind.ARRAY) and (t.kind != cty.TK_ARRAY)) or
+           ((dv.kind == cast.DerivKind.POINTER) and (t.kind != cty.TK_POINTER)) {
+            return;  // (a parameter's array adjusted to a pointer)
+        }
+        if t.vla and not u.isvnil(t.vexpr) {
+            set_len(t, ev(@ptr_cast(*mut cast.Expr, t.vexpr)));
+        }
+        t = t.elem;
+    }
+}
+
+fn slot(t: *cty.CType) *mut ir.Value {
+    let k = key(t.vexpr);
+    let mut s = VS.lens.get(k);
+    if u.isnil(s) {
+        s = cg.alloca(cty.t_size, "vla.len");
+        VS.lens.put(k, s);
+    }
+    return s;
+}
+
+fn set_len(t: *cty.CType, v: *mut ir.Value) void {
+    _ = ir.store(cg.B, v, slot(t));
+}
+
+// The length of variable length array type t (as a pointer-sized integer).
+fn len(t: *cty.CType) *mut ir.Value {
+    if not t.vla {
+        return cg.usz(t.len);
+    }
+    if u.isvnil(t.vexpr) {
+        u.die("internal compiler error (C front end): the length of an array of unspecified size ([*]) is used");
+    }
+    return ir.load(cg.B, cg.T_isz, slot(t));
+}
+
+/// The size of an object of type t, in bytes, as a pointer-sized integer:
+/// a constant unless t is a variable length array type.
+pub fn size_value(t: *cty.CType) *mut ir.Value {
+    if not cty.is_vla(t) {
+        return cg.usz(cty.size_of(t));
+    }
+    let es = size_value(t.elem);
+    let n = len(t);
+    if ir.is_cint(es) and (ir.cint_val(es) == 1) {
+        return n;
+    }
+    return ir.mul(cg.B, n, es);
+}
+
+// -----------------------------------------------------------------------------
+// Stack space
+// -----------------------------------------------------------------------------
+
+/// The number of automatic variable length arrays in scope.
+pub fn depth() i32 {
+    return @int_cast(i32, VS.chain.len);
+}
+
+/// Allocates an object of variable length array type t, aligned to al
+/// (its type's alignment, or an alignment specifier's); its address.
+pub fn allocate(t: *cty.CType, al: u64) *mut ir.Value {
+    let size = size_value(t);
+    VS.chain.push(ir.intr(cg.B, ir.IN_STACK_SAVE, cg.T_ptr, none()));
+    let mut n = size;
+    if al > 16 {
+        n = ir.add(cg.B, n, cg.usz(al - 16));  // (the stack keeps 16 bytes' alignment)
+    }
+    let mut args: [1]*mut ir.Value = [n];
+    let mut p = ir.intr(cg.B, ir.IN_STACK_ALLOC, cg.T_ptr, args[..]);
+    if al > 16 {
+        let a = ir.ptrtoint(cg.B, p, cg.T_isz);
+        let off = ir.and_(cg.B, ir.sub(cg.B, cg.usz(0), a), cg.usz(al - 1));
+        p = ir.ptradd(cg.B, p, off);
+    }
+    return p;
+}
+
+/// Releases the allocations beyond the first d in scope (before a jump to
+/// where only those are, or at the end of a block).
+pub fn release_to(d: i32) void {
+    if (depth() > d) and not cg.terminated() {
+        let mut args: [1]*mut ir.Value = [VS.chain.get(@int_cast(usize, d))];
+        _ = ir.intr(cg.B, ir.IN_STACK_RESTORE, cg.T_void, args[..]);
+    }
+}
+
+/// Leaves the scope of the allocations beyond the first d (the end of
+/// their block, as generated).
+pub fn leave(d: i32) void {
+    release_to(d);
+    while depth() > d {
+        _ = VS.chain.pop();
+    }
+}

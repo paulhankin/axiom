@@ -1,0 +1,387 @@
+// =============================================================================
+// cgen_flow.ax - IR generation for C's control flow where the IR wants a
+// shape of its own: switch statements as a search over their case values,
+// and functions whose gotos make control flow irreducible, made reducible
+// for WebAssembly.
+//
+// A switch with few cases is one IR switch. One with more is a binary search
+// over its sorted case values, down to runs of at most SMALL cases, or (for
+// WebAssembly, whose backend makes a br_table of a dense switch) to runs
+// dense enough for a table: a thousand-case switch takes a handful of
+// compares rather than a thousand.
+//
+// A goto into a loop, or into the middle of a cycle that gotos make, gives
+// the cycle more than one entry. The WebAssembly backend structures only
+// reducible control flow (every cycle entered through one block, its
+// header), so on WebAssembly each such cycle gets one: a dispatch block
+// that every edge into any of the cycle's entries goes through instead,
+// setting a selector first (a variable mem2reg makes a phi of), and that
+// switches on it to the entry. The cycles are found as the strongly
+// connected components of the graph, then those within each with its
+// header removed, and so on, until each has one entry. (The entries have no
+// phis: C's are only joins within an expression, never a label, case or
+// loop head; the values defined in a cycle and used in it keep their
+// dominance, as no entry of a cycle is dominated by a block in it.)
+// =============================================================================
+import "../ir.ax" as ir;
+import "../opt.ax" as opt;
+import "../util.ax" as u;
+import "cgen.ax" as cg;
+
+// -----------------------------------------------------------------------------
+// Switch statements
+// -----------------------------------------------------------------------------
+
+const SMALL: usize = 8;
+
+struct Case {
+    v: u64,  // the value, as the switch's IR type's bits (zero-extended)
+    b: *mut ir.Block,
+}
+
+let mut g_signed: bool = false;
+let mut g_bits: i32 = 64;
+
+// The value's key for ordering: its bits, with the sign bit flipped for a
+// signed type (so that unsigned order is the signed one).
+fn ord(v: u64) u64 {
+    let mut x = v;
+    if g_signed {
+        x = x ^ (@as(u64, 1) << @int_cast(u32, g_bits - 1));
+    }
+    return x;
+}
+
+fn cmp_case(a: Case, b: Case) i32 {
+    let x = ord(a.v);
+    let y = ord(b.v);
+    if x < y {
+        return -1;
+    }
+    if x > y {
+        return 1;
+    }
+    return 0;
+}
+
+/// Ends the current block with a switch on v (an integer of a signed or
+/// unsigned C type: sg) to the blocks bs for the values vs (distinct, as v's
+/// IR type's bits), or to dflt.
+pub fn switch_to(v: *mut ir.Value, sg: bool, vs: []u64, bs: []*mut ir.Block, dflt: *mut ir.Block) void {
+    let n = vs.len;
+    let cs = u.newn.[Case](n + 1);
+    for i in 0..n {
+        cs[i] = Case.{ v: vs[i], b: bs[i] };
+    }
+    g_signed = sg;
+    g_bits = v.ty.bits;
+    u.sort.[Case](cs[0..n], cmp_case);
+    search(v, sg, cs[0..n], dflt);
+}
+
+// Is a table over cs (sorted) dense enough for the WebAssembly backend's
+// br_table (wasm.ax emit_switch)?
+fn dense(cs: []Case) bool {
+    let d = ord(cs[cs.len - 1].v) -% ord(cs[0].v);
+    return (d < (@as(u64, cs.len) * 3) + 8) and (d < 10000);
+}
+
+fn search(v: *mut ir.Value, sg: bool, cs: []Case, dflt: *mut ir.Block) void {
+    if (cs.len <= SMALL) or (cg.is_wasm and dense(cs)) {
+        let sw = ir.switch_(cg.B, v, dflt);
+        for c in cs {
+            ir.add_case(sw, ir.cint(v.ty, c.v), c.b);
+        }
+        return;
+    }
+    let mid = cs.len / 2;
+    let lo = cg.new_block("caselo");
+    let hi = cg.new_block("casehi");
+    let p = ir.cint(v.ty, cs[mid].v);
+    let mut pr = ir.IntULT;
+    if sg {
+        pr = ir.IntSLT;
+    }
+    let lt = ir.icmp(cg.B, pr, v, p);
+    ir.condbr(cg.B, lt, lo, hi);
+    cg.at_end(lo);
+    search(v, sg, cs[0..mid], dflt);
+    cg.at_end(hi);
+    search(v, sg, cs[mid..cs.len], dflt);
+}
+
+// -----------------------------------------------------------------------------
+// Reducible control flow
+// -----------------------------------------------------------------------------
+
+// The function's reachable blocks, numbered (Block.mark: the number + 1;
+// 0 for those not reached), and the work arrays of the search, by number.
+struct Graph {
+    blocks: u.List.[*mut ir.Block],
+    in_set: []mut bool,  // in the subgraph searched
+    index: []mut i32,    // Tarjan's: the order of the visit (-1: not yet), the lowest index reached
+    low: []mut i32,
+    on: []mut bool,  // on Tarjan's stack
+}
+
+fn number(f: *mut ir.Func, g: *mut Graph) void {
+    g.blocks.clear();
+    let mut b = f.first;
+    while u.notnil(b) {
+        b.mark = 0;
+        b = b.next;
+    }
+    let mut stack = u.List.[*mut ir.Block].empty();
+    stack.push(f.first);
+    f.first.mark = 1;
+    g.blocks.push(f.first);
+    while stack.len > 0 {
+        let x = stack.pop();
+        let t = ir.terminator(x);
+        for k in 0..ir.succ_count(t) {
+            let s = ir.succ(t, k);
+            if s.mark == 0 {
+                g.blocks.push(s);
+                s.mark = @as(i64, @int_cast(i64, g.blocks.len));
+                stack.push(s);
+            }
+        }
+    }
+    stack.deinit();
+    let n = g.blocks.len;
+    g.in_set = u.newn.[bool](n + 1)[0..n];
+    g.index = u.newn.[i32](n + 1)[0..n];
+    g.low = u.newn.[i32](n + 1)[0..n];
+    g.on = u.newn.[bool](n + 1)[0..n];
+    for i in 0..n {
+        g.in_set[i] = false;
+        g.on[i] = false;
+    }
+}
+
+fn idx(b: *ir.Block) usize {
+    return @int_cast(usize, b.mark - 1);
+}
+
+fn set_members(g: *mut Graph, ms: []*mut ir.Block, on: bool) void {
+    for b in ms {
+        g.in_set[idx(b)] = on;
+    }
+}
+
+// The strongly connected components of the subgraph of the blocks ms
+// (Tarjan's algorithm, without recursion), each with more than one block
+// or a branch to itself: their blocks, in comps (each ended by a nil).
+fn components(g: *mut Graph, ms: []*mut ir.Block, comps: *mut u.List.[*mut ir.Block]) void {
+    set_members(g, ms, true);
+    for b in ms {
+        g.index[idx(b)] = -1;
+    }
+    let mut st = u.List.[usize].empty();    // Tarjan's stack
+    let mut work = u.List.[usize].empty();  // the DFS: block, next successor (pairs)
+    let mut next: i32 = 0;
+    for rb in ms {
+        let root = idx(rb);
+        if g.index[root] >= 0 {
+            continue;
+        }
+        work.push(root);
+        work.push(0);
+        g.index[root] = next;
+        g.low[root] = next;
+        next += 1;
+        st.push(root);
+        g.on[root] = true;
+        while work.len > 0 {
+            let v = work.get(work.len - 2);
+            let k = work.get(work.len - 1);
+            let t = ir.terminator(g.blocks.get(v));
+            if k < ir.succ_count(t) {
+                work.set(work.len - 1, k + 1);
+                let s = ir.succ(t, k);
+                if s.mark == 0 {
+                    continue;
+                }
+                let w = idx(s);
+                if not g.in_set[w] {
+                    continue;
+                }
+                if g.index[w] < 0 {
+                    g.index[w] = next;
+                    g.low[w] = next;
+                    next += 1;
+                    st.push(w);
+                    g.on[w] = true;
+                    work.push(w);
+                    work.push(0);
+                } else if g.on[w] and (g.index[w] < g.low[v]) {
+                    g.low[v] = g.index[w];
+                }
+                continue;
+            }
+            // v is done
+            _ = work.pop();
+            _ = work.pop();
+            if work.len > 0 {
+                let p = work.get(work.len - 2);
+                if g.low[v] < g.low[p] {
+                    g.low[p] = g.low[v];
+                }
+            }
+            if g.low[v] == g.index[v] {
+                let start = comps.len;
+                loop {
+                    let w = st.pop();
+                    g.on[w] = false;
+                    comps.push(g.blocks.get(w));
+                    if w == v {
+                        break;
+                    }
+                }
+                if ((comps.len - start) == 1) and not self_loop(g.blocks.get(v)) {
+                    _ = comps.pop();
+                } else {
+                    comps.push(ir.bnil());
+                }
+            }
+        }
+    }
+    st.deinit();
+    work.deinit();
+    set_members(g, ms, false);
+}
+
+fn self_loop(b: *mut ir.Block) bool {
+    let t = ir.terminator(b);
+    for k in 0..ir.succ_count(t) {
+        if ir.succ(t, k) == b {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_phi(b: *ir.Block) bool {
+    return u.notnil(b.first) and (b.first.op == ir.OP_PHI);
+}
+
+/// Makes f's control flow reducible (for WebAssembly), as the header says.
+pub fn make_reducible(f: *mut ir.Func) void {
+    let g = u.new.[Graph]();
+    let mut rounds: i32 = 0;
+    while (rounds < 10000) and fix_one(f, g) {
+        rounds += 1;
+    }
+    g.blocks.deinit();
+}
+
+// Gives the cycles with more than one entry one each (those found in one
+// search: the dispatch blocks may make others within them, which the next
+// finds); false if there were none.
+fn fix_one(f: *mut ir.Func, g: *mut Graph) bool {
+    number(f, g);
+    opt.compute_preds(f);
+    // regions to search: lists of blocks, each ended by a nil
+    let mut regions = u.List.[*mut ir.Block].empty();
+    for b in g.blocks.items() {
+        regions.push(b);
+    }
+    regions.push(ir.bnil());
+    let mut at: usize = 0;
+    let mut comps = u.List.[*mut ir.Block].empty();
+    let mut entries = u.List.[*mut ir.Block].empty();
+    let mut found = false;
+    while at < regions.len {
+        let rs = at;
+        while u.notnil(regions.get(at)) {
+            at += 1;
+        }
+        comps.clear();
+        components(g, regions.items()[rs..at], &mut comps);
+        at += 1;
+        let mut k: usize = 0;
+        while k < comps.len {
+            let start = k;
+            while u.notnil(comps.get(k)) {
+                k += 1;
+            }
+            let c = comps.items()[start..k];
+            k += 1;
+            // its entries: the blocks with a predecessor outside it
+            set_members(g, c, true);
+            entries.clear();
+            for b in c {
+                let mut outside = b == f.first;
+                for p in b.preds.items() {
+                    if (p.mark == 0) or not g.in_set[idx(p)] {
+                        outside = true;
+                    }
+                }
+                if outside {
+                    entries.push(b);
+                }
+            }
+            set_members(g, c, false);
+            if entries.len > 1 {
+                // (the other components of this search are apart from it:
+                // what it changes leaves them as they are)
+                if dispatch(f, entries.items()) {
+                    found = true;
+                }
+                continue;
+            }
+            // one entry: the cycles within, without it
+            for b in c {
+                if (entries.len == 0) or (b != entries.get(0)) {
+                    regions.push(b);
+                }
+            }
+            regions.push(ir.bnil());
+        }
+    }
+    regions.deinit();
+    comps.deinit();
+    entries.deinit();
+    return found;
+}
+
+// Points every edge into the entries at a dispatch block that branches to
+// the one the edge was for; false (nothing done) if an entry has phis.
+fn dispatch(f: *mut ir.Func, entries: []*mut ir.Block) bool {
+    for e in entries {
+        if has_phi(e) or (e == f.first) {
+            return false;
+        }
+    }
+    let i32t = ir.t_int(32);
+    // the selector, in the entry block
+    let term = ir.terminator(f.first);
+    if u.notnil(term) {
+        ir.at_before(cg.B, term);
+    } else {
+        ir.at_end(cg.B, f.first);
+    }
+    let sel = ir.alloca(cg.B, i32t, "dispatch");
+    let h = ir.append_block(f, "dispatch");
+    for k in 0..entries.len {
+        let e = entries[k];
+        let preds = e.preds.items();
+        for p in preds {
+            if p.mark == 0 {
+                continue;  // (not reached)
+            }
+            let s = ir.append_block(f, "toentry");
+            ir.at_end(cg.B, s);
+            _ = ir.store(cg.B, ir.cint(i32t, @as(u64, k)), sel);
+            ir.br(cg.B, h);
+            ir.retarget(p, e, s);
+        }
+    }
+    ir.at_end(cg.B, h);
+    let x = ir.load(cg.B, i32t, sel);
+    let sw = ir.switch_(cg.B, x, entries[0]);
+    for k in 1..entries.len {
+        ir.add_case(sw, ir.cint(i32t, @as(u64, k)), entries[k]);
+    }
+    return true;
+}
