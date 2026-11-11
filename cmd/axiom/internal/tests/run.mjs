@@ -341,7 +341,8 @@ const cRunTest = async (f) => {
     const c = await spawnAsync(compiler, ['check', f, `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, ...flags], { encoding: 'utf8', timeout: compileTimeout });
     return c.status === 0 ? null : `the check failed:\n${c.stdout}${c.stderr}`;
   }
-  const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags];
+  // (--units is for Axiom code: the suite run with it builds the C tests as always)
+  const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
   if (native && noC) args.push(nativeTarget, path.join(root, 'cmd/axiom/internal/tests/c/host_c.c'));
   else if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`);
   else if (process.env.AXIOM_C_TARGET && !flags.some((x) => x.startsWith('--target='))) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
