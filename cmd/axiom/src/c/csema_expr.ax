@@ -109,6 +109,11 @@ pub fn value_of(e: *mut cast.Expr) *mut cast.Expr {
         cn.fold_load(c);
         return c;
     }
+    // (a bit-field of a structure that is not an lvalue, as f().m, too)
+    let bm = cb.member(e);
+    if u.notnil(bm) {
+        return convert(e, cb.promoted(bm));
+    }
     return e;
 }
 
@@ -261,6 +266,39 @@ fn index_operand(i: *mut cast.Expr) *mut cast.Expr {
 // Assignment compatibility (6.5.16.1)
 // -----------------------------------------------------------------------------
 
+// In C23 an array type has the qualifiers of its element type (6.7.4.1p3),
+// so pointers to arrays that differ only in their elements' qualifiers point
+// to types that are compatible but for qualifiers.
+fn pointee_compatible(l: *mut cty.CType, r: *mut cty.CType) bool {
+    if cty.compatible_unq(l, r) {
+        return true;
+    }
+    if (cs.std() < co.C23) or (l.kind != cty.TK_ARRAY) or (r.kind != cty.TK_ARRAY) {
+        return false;
+    }
+    let mut a = l;
+    let mut b = r;
+    while (a.kind == cty.TK_ARRAY) and (b.kind == cty.TK_ARRAY) {
+        if a.has_len and b.has_len and not a.vla and not b.vla and (a.len != b.len) {
+            return false;
+        }
+        a = a.elem;
+        b = b.elem;
+    }
+    return cty.compatible_unq(a, b);
+}
+
+// The qualifiers of a pointed-to type: in C23 an array's are its element's.
+fn pointee_quals(t: *mut cty.CType) i32 {
+    let mut x = t;
+    if cs.std() >= co.C23 {
+        while x.kind == cty.TK_ARRAY {
+            x = x.elem;
+        }
+    }
+    return x.quals;
+}
+
 /// Rvalue e converted to type t as if by assignment; `what` says where
 /// ("assignment", "initialization", "argument 2 of 'f'", "return").
 pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cast.Expr {
@@ -289,13 +327,13 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
             let r = s.elem;
             let lobj = l.kind != cty.TK_FUNCTION;
             let robj = r.kind != cty.TK_FUNCTION;
-            let ok = cty.compatible_unq(l, r) or ((l.kind == cty.TK_VOID) and robj) or
+            let ok = pointee_compatible(l, r) or ((l.kind == cty.TK_VOID) and robj) or
                      ((r.kind == cty.TK_VOID) and lobj);
             if not ok {
                 cs.err(e.span, "C3022", u.f3("incompatible pointer types in %s: %s to %s", what, cs.tq(s), cs.tq(t)));
                 return e;
             }
-            if (r.quals & ~l.quals) != 0 {
+            if (pointee_quals(r) & ~pointee_quals(l)) != 0 {
                 cs.err(e.span, "C3022", u.f3("%s discards qualifiers: %s to %s", what, cs.tq(s), cs.tq(t)));
                 return e;
             }
@@ -747,7 +785,7 @@ fn binary(e: *mut cast.Expr) *mut cast.Expr {
             return ptr_offset(e);
         }
         if (ta.kind == cty.TK_POINTER) and (tb.kind == cty.TK_POINTER) {
-            if not cty.compatible_unq(ta.elem, tb.elem) {
+            if not pointee_compatible(ta.elem, tb.elem) {
                 cs.err(e.span, "C3020", u.f2("subtraction of pointers to incompatible types (%s and %s)", cs.tq(ta),
                                              cs.tq(tb)));
                 return bad(e);
@@ -834,7 +872,7 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
         // (6.5.8p2, 6.5.9p2: relational operators take pointers to object
         // types; == and != also a pointer to void with one to an object
         // type, or a null pointer constant)
-        let ok = (cty.compatible_unq(ta.elem, tb.elem) and (eq or not cty.is_func(ta.elem))) or
+        let ok = (pointee_compatible(ta.elem, tb.elem) and (eq or not cty.is_func(ta.elem))) or
                  (eq and
                   ((cty.is_void(ta.elem) and not cty.is_func(tb.elem)) or
                    (cty.is_void(tb.elem) and not cty.is_func(ta.elem)) or is_npc(e.a) or is_npc(e.b)));

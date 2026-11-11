@@ -323,9 +323,11 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // (tests marked /* linux-only */ need the former). AXIOM_C_TARGET=wasm64
 // builds them for wasm64 instead of wasm32. A test marked /* check-only */ is
 // only checked (axiom check, with its own --target), not built or run.
+// The larger programs of c/prog/ are built and run the same way ([c-prog]).
 const cRunDir = path.join(root, 'cmd/axiom/internal/tests/c/run');
-const cRunFiles = fs.existsSync(cRunDir) ? fs.readdirSync(cRunDir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(cRunDir, f)) : [];
-await section('', byFile(cRunFiles, '[c]', async (f) => {
+const cFilesIn = (dir) => fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.c')).sort().map((f) => path.join(dir, f)) : [];
+const cRunFiles = cFilesIn(cRunDir);
+const cRunTest = async (f) => {
   if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
   const src = fs.readFileSync(f, 'utf8');
   if (native && noC && /\/\* linux-only \*\//.test(src)) return { skip: true, reason: 'links C code' };
@@ -362,7 +364,9 @@ await section('', byFile(cRunFiles, '[c]', async (f) => {
   const want = expect.join('\n'), got = r.out.map((l) => l.replace(/\r$/, '')).join('\n');
   if (!problem && want !== got) problem = `output mismatch\n--- expected\n${want}\n--- got\n${got}`;
   return { problem, stderr: r.stderr };
-}), { parallel: true });
+};
+await section('', byFile(cRunFiles, '[c]', cRunTest), { parallel: true });
+await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/prog')), '[c-prog]', cRunTest), { parallel: true });
 
 // The C driver (main.ax: c_option, c_options, check_c_options, build_c;
 // c/cc.ax): every option, several translation units, and the errors of

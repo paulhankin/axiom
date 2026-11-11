@@ -192,6 +192,11 @@ over the platform's C library). The programs of `c/run/` are built for wasm32
 (`AXIOM_NATIVE_TARGET` and `AXIOM_NATIVE_EXEC` for another), at the suite's
 optimization level; they may say `/* native-only */` or `/* wasm-only */`. The
 `C programs` section tests the driver: its options, several units, its errors.
+`c/prog/` holds larger programs (300 to 1500 lines each, combining features, in
+each standard and with `--c-int`/`--c-long` choices), built and run the same way
+(`[c-prog]`); their expected output was checked against another implementation.
+`tools/gen_c_programs.py` writes random programs free of undefined behaviour for
+differential testing.
 Preprocessor tests compare `--emit=c-pp` output with a `.pp` file next to them; parser
 tests compare `--emit=c-ast` with a `.ast` file.
 
