@@ -1,6 +1,6 @@
 typedef unsigned long size_t;
-typedef long ptrdiff_t;
 typedef long wchar_t;
+typedef long ptrdiff_t;
 typedef struct {
 long long __axiom_ll;
 _Alignas(16) long double __axiom_ld;

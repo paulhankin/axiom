@@ -11,15 +11,15 @@ lists the diagnostics.
   `--c-std=`. Each mode accepts its standard's language and rejects what a later one
   added or its own removed (C99 has no implicit `int` or implicit function
   declarations, C23 no K&R definitions).
-- **Freestanding**: the compiler provides the headers a freestanding implementation
-  must (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`, `<stdarg.h>`,
-  `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdatomic.h>`, `<stdnoreturn.h>`, and C23's `<stdbit.h>`
-  and `<stdckdint.h>`), in `std/c/include/`, and of the library what C23 (4p7) asks of a
-  freestanding implementation in `<string.h>` (all but `strdup`, `strndup`, `strcoll`,
-  `strxfrm` and `strerror`): `std/c/include/string.h`, with one C source per function in
-  `std/c/lib/string/`, units of the C library (main.ax `c_library`; kept with
-  `--c-freestanding`). C23's `<stdlib.h>` part (and `<fenv.h>`, `<math.h>` when it claims
-  Annex F) is not provided. `<float.h>` has no `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`
+- **Hosted, with the C library**: `__STDC_HOSTED__` is 1 and the C library
+  (`std/c/include/`, `std/c/lib/`, `std/c/rt/`: docs/c.md, "The C library") is linked;
+  `--c-freestanding` (`COptions.hosted` false) makes `__STDC_HOSTED__` 0 and finds only
+  the freestanding headers (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`,
+  `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdatomic.h>`,
+  `<stdnoreturn.h>`, C23's `<stdbit.h>` and `<stdckdint.h>`, `<complex.h>` and
+  `<string.h>`: `cpp.ax`, `freestanding_header`), and of the library what C23 (4p7) asks
+  of a freestanding implementation in `<string.h>` (`std/c/lib/string/`, kept with
+  `--c-freestanding`). `<float.h>` has no `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`
   (signaling NaNs are not guaranteed to stay signaling).
 - **Calling convention**: each target's C ABI (x86-64 System V, Windows x64,
   AAPCS64 and its macOS variant, the WebAssembly C ABI), for structures and
@@ -222,9 +222,26 @@ beside it (sema's extra files). In both, every unit and module is one IR module:
   reachable or exported), the start-up's call of `main`, and the functions code
   generation calls by name; everything the units define that the roots do not reach,
   through instructions' operands, call-site records and initializers, is removed.
-- `exit`: when the program defines it (a unit, or an Axiom export), the start-up calls
-  it with `main`'s value (`cgen.generate_start`), as it calls the C library's on
-  Windows.
+- `exit`: when the program defines it (a unit, the library's, or an Axiom export), the
+  start-up calls it with `main`'s value (`cgen.generate_start`, converted to the
+  width of the definition's `int`), as it calls the C library's on Windows. A library
+  unit's definition gives way to an Axiom module's `export fn` of the same name
+  (`cc.boundary_check`), as to a program's unit's (`link_check`).
+- `setjmp` (`std/c/include/setjmp.h`) is `__axc_setjmp`, whose direct calls mark the
+  calling function `returns_twice` (`cgen_expr.ax`: `ir.Func`): the optimizer leaves it
+  alone but for folding and CFG simplification (`passes.ax`: no promotion of its
+  objects to registers, no slot sharing, no value numbering), does not inline it or
+  into it (`inline.ax`), makes no sibling calls in it, and the x86-64 backend does not
+  shrink-wrap it, so that every object lives in a slot of its own across the call and
+  nothing is in a register but what `longjmp` restores. The functions are machine code
+  of `jstub.ax`, which every native linker adds (weak). On WebAssembly a call is
+  `C3300`; its address taken, `C3301`.
+
+The C library's tests are `cmd/axiom/internal/tests/c/lib/<part>/*.c` (`[c-lib]` in
+`run.mjs`): hosted programs printing through `c/mix/print.ax`, built and run on each
+target (wasm32, or `--native`), with `expect:`, `expect-status:`, `expect-signal:` (the
+default action of a signal ends it), `expect-stderr:`, `expect-error:`, `flags:` and
+`native-only`, `wasm-only`, `linux-only`, `posix-only`.
 
 Tests: each directory of `cmd/axiom/internal/tests/c/mix/` is a program of both
 languages (`[c-mix]` in `run.mjs`: its `main.ax` or `main.c` with the directory's
@@ -239,9 +256,9 @@ adds; functions the program declares and does not define are imports (WebAssembl
 from the module `env`) or undefined symbols for the linker: Linux's C library (the
 program is then linked with the system's C compiler), macOS's libSystem, and on
 Windows `msvcrt.dll`, unless their names are those of the system DLLs' functions
-(`plink.ax`). On Windows the start-up calls the C library's `exit` with `main`'s
-value (which flushes its streams and runs the `atexit` functions); elsewhere the
-system's start-up does. A program may define the C library's functions itself
+(`plink.ax`). The start-up calls the C library's `exit` with `main`'s value (the
+compiler's library's; with `--c-freestanding` on Windows `msvcrt.dll`'s, and elsewhere
+the system's start-up ends the process). A program may define the C library's functions itself
 (`memcpy`, `memset`, ... in a freestanding program): the runtime's own copies
 (AArch64 Linux) are weak.
 
@@ -275,6 +292,10 @@ each standard and with `--c-int`/`--c-long` choices), built and run the same way
 `tools/gen_c_programs.py` writes random programs free of undefined behaviour for
 differential testing, and `tools/gen_c_abi.py` random tests of the calling conventions
 (its `--host` output is `c/run/abi_gen_*.c`, with their callees in `c/run/abi/`).
+The hosted C library's tests are `c/lib/<part>/*.c` (`[c-lib]`: programs built with
+the library, which print through it, with directives for standard input, standard
+error and their order), and `c/mix/stdio_threads/` (streams written by several
+threads).
 Preprocessor tests compare `--emit=c-pp` output with a `.pp` file next to them; parser
 tests compare `--emit=c-ast` with a `.ast` file.
 

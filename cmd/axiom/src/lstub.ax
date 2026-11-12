@@ -13,6 +13,7 @@
 //   ax_tls_info() *u64     [template address, template size, memory size,
 //                          alignment] of the thread-local storage block
 //   ax_libc_linked() i32   1 if the program is linked against the C library
+//   __axc_setjmp, longjmp  C's (jstub.ax)
 //   memcpy, memmove, memset (AArch64, whose code generator calls them):
 //                          weak, so that a program's own definitions (C
 //                          programs may define them) are the ones used
@@ -21,16 +22,24 @@
 // _start (elink.ax). One that uses the C library (extern "C" functions, C
 // sources, -l) is linked against it as before; the runtime then creates
 // threads with pthread_create, which only exists then: in a static program
-// those names are stubs that fail.
+// those names are stubs that fail (and the C library's heap functions, which
+// the hosted C library's malloc then uses, stubs that return 0).
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "jstub.ax" as jstub;
 import "util.ax" as u;
+
+// The C library's heap, which the hosted C library's malloc uses when the
+// system's C library is linked (std/c/rt/core_alloc.ax), so that the two
+// libraries' allocations are one heap's.
+let HEAP: [5][]u8 = ["__libc_malloc", "__libc_calloc", "__libc_realloc", "__libc_free", "__libc_memalign"];
 
 // The C library functions the runtime uses when it is linked (and only then).
 pub fn libc_only(name: []u8) bool {
     let names = ["pthread_create", "pthread_attr_init", "pthread_attr_setdetachstate", "pthread_attr_destroy",
-                 "__libc_start_main"];
+                 "__libc_start_main", "__libc_malloc", "__libc_calloc", "__libc_realloc", "__libc_free",
+                 "__libc_memalign"];
     for n in names {
         if u.str_eq(n, name) {
             return true;
@@ -46,6 +55,9 @@ pub fn provides(name: []u8, machine: u32) bool {
         if u.str_eq(n, name) {
             return true;
         }
+    }
+    if jstub.provides(name) {
+        return true;
     }
     if machine == elf.EM_AARCH64 {
         return u.str_eq(name, "memcpy") or u.str_eq(name, "memmove") or u.str_eq(name, "memset");
@@ -127,7 +139,12 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
                 _ = func(o, text, f);
                 bytes(o, text, "\xb8\x26\x00\x00\x00\xc3");  // return ENOSYS
             }
+            for f in HEAP {
+                _ = func(o, text, f);
+                bytes(o, text, "\x31\xc0\xc3");  // return 0
+            }
         }
+        jstub.add(o, text, machine, false);
         return o;
     }
     // AArch64: x8 = n; x0..x5 = a..f
@@ -182,7 +199,13 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
             let en: [2]u64 = [0x528004C0, 0xD65F03C0];  // mov w0, #38 (ENOSYS); ret
             words(o, text, en[..]);
         }
+        for f in HEAP {
+            _ = func(o, text, f);
+            let z: [2]u64 = [0xD2800000, 0xD65F03C0];  // mov x0, #0; ret
+            words(o, text, z[..]);
+        }
     }
+    jstub.add(o, text, machine, false);
     return o;
 }
 

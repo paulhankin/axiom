@@ -1,6 +1,6 @@
 typedef unsigned __axiom_int64 size_t;
-typedef __axiom_int64 ptrdiff_t;
 typedef unsigned short wchar_t;
+typedef __axiom_int64 ptrdiff_t;
 typedef __builtin_va_list va_list;
 x___STDC_VERSION_STDDEF_H__ = __STDC_VERSION_STDDEF_H__
 x_unreachable = unreachable()

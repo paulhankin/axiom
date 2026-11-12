@@ -1459,13 +1459,30 @@ fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
             d = P.o.include_dirs[@int_cast(usize, k)];
         }
         let p = join(d, name);
-        if u.is_file(p) {
+        // (the compiler's own headers: the library's only when hosted)
+        if u.is_file(p) and ((k < n) or P.o.hosted or freestanding_header(name)) {
             P.found_index = k;
             return p;
         }
         k += 1;
     }
     return u.nosym();
+}
+
+// Is `name` one of the compiler's headers that a freestanding program has
+// (--c-freestanding)? Those of 4p6 (C23 4p7), and <complex.h>'s macros,
+// which need no library, and the private headers they include (axc/types.h,
+// axc/wchar_limits.h); the others are the hosted library's.
+fn freestanding_header(name: []u8) bool {
+    let names = ["float.h", "iso646.h", "limits.h", "stdalign.h", "stdarg.h", "stdbit.h", "stdbool.h", "stdckdint.h",
+                 "stddef.h", "stdint.h", "stdnoreturn.h", "stdatomic.h", "complex.h", "string.h", "axc/types.h",
+                 "axc/wchar_limits.h"];
+    for n in names {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Where #include_next (and __has_include_next) searches from: the entry of
@@ -1579,6 +1596,9 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
         let mut msg = u.f1("cannot find include file %s", hn);
         if (name.len > 0) and u.is_dir(join(dir_of(cur_src(P).path), name)) {
             msg = u.f1("include file %s is a directory", hn);
+        }
+        if not P.o.hosted and u.is_file(join(P.o.sys_include, name)) {
+            msg = u.f1("%s is a header of the C library, which --c-freestanding leaves out", hn);
         }
         _ = dg.err(sp, "C1081", msg);
         P.fatal = true;
@@ -2392,7 +2412,14 @@ fn predefined_text(P: *PP) []u8 {
         // defined: the types have IEC 60559's formats, which float.h's
         // *_IS_IEC_60559 say, but there is no <fenv.h> or <math.h>, no
         // exception flags and no rounding modes, which Annex F requires)
-        b.s("#define __STDC_HOSTED__ 0\n");
+        // (hosted unless --c-freestanding: the C library is linked, 4p6)
+        b.s(u.f1("#define __STDC_HOSTED__ %s\n", u.pick(o.hosted, "1", "0")));
+        if o.hosted and (o.wchar_bits == 32) {
+            // (6.10.8.2: every character of ISO/IEC 10646 is a wchar_t of its
+            // code point; the library's classes are Unicode 15.1's, of
+            // September 2023: std/unicode. Not with a 16-bit wchar_t)
+            b.s("#define __STDC_ISO_10646__ 202309L\n");
+        }
     }
     if std >= co.C11 {
         b.s("#define __STDC_UTF_16__ 1\n#define __STDC_UTF_32__ 1\n");

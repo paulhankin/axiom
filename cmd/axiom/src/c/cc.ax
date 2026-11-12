@@ -109,6 +109,65 @@ pub fn check(path: []u8, o: *co.COptions, lib: bool) bool {
     return true;
 }
 
+/// --emit=c-lib-defs (the C library's index, cmd/internal/tools/
+/// gen_c_lib_index.mjs): checks `path` as a unit of the library and
+/// prints the external names it defines, one to a line.
+pub fn lib_defs(path: []u8, o: *co.COptions, json: bool) i32 {
+    if not check(path, lib_options(o), true) {
+        dg.emit(json, json);
+        return 1;
+    }
+    let cu = g_units.get(g_units.len - 1);
+    let mut b = u.Buf.init();
+    for f in cu.funcs.items() {
+        if (f.linkage == cast.LK_EXTERNAL) and not csm.is_inline_def(f) {
+            b.s(f.name);
+            b.c('\n');
+        }
+    }
+    for x in cu.objects.items() {
+        if x.linkage == cast.LK_EXTERNAL {
+            b.s(x.name);
+            b.c('\n');
+        }
+    }
+    u.print(b.done());
+    return 0;
+}
+
+/// The external names the last unit checked uses and does not define.
+pub fn last_refs() [][]u8 {
+    if g_units.len == 0 {
+        return u.nil_slice.[[]u8]();
+    }
+    return g_units.get(g_units.len - 1).refs.items();
+}
+
+/// The external names that the units checked so far define.
+pub fn defined_names(out: *mut u.SymMap.[i32]) void {
+    for cu in g_units.items() {
+        for f in cu.funcs.items() {
+            if f.linkage == cast.LK_EXTERNAL {
+                out.put(u.intern(f.name), 1);
+            }
+        }
+        for x in cu.objects.items() {
+            if x.linkage == cast.LK_EXTERNAL {
+                out.put(u.intern(x.name), 1);
+            }
+        }
+    }
+}
+
+/// The external names the units checked so far use and do not define.
+pub fn all_refs(out: *mut u.List.[[]u8]) void {
+    for cu in g_units.items() {
+        for r in cu.refs.items() {
+            out.push(r);
+        }
+    }
+}
+
 /// The options a library's units are checked with: C17 (the library's
 /// sources are), with the build's --c-int, --c-long and --c-char, and no
 /// -D or -I of the program's.
@@ -116,8 +175,11 @@ pub fn lib_options(o: *co.COptions) *co.COptions {
     let lo = u.new.[co.COptions]();
     lo.* = o.*;
     lo.std = co.C17;
+    lo.gnu = false;  // (C17 without extensions: the library's sources are C17)
+    lo.warn_pragmas = false;
     lo.defines = u.nil_slice.[co.Define]();
     lo.include_dirs = u.nil_slice.[[]u8]();
+    lo.hosted = true;  // (its headers are all found)
     return lo;
 }
 
@@ -261,7 +323,7 @@ fn is_lib_sym(s: *mut cast.CSym) bool {
 
 /// Does a unit define the external name `name` (after link_check)?
 pub fn defines(name: []u8) bool {
-    return g_defs.has(u.intern(name));
+    return u.notnil(g_defs.get(u.intern(name)));
 }
 
 /// An external name of the Axiom program: an `export fn` (span: its name).
@@ -276,15 +338,30 @@ pub struct AxName {
 /// (else reported).
 pub fn boundary_check(names: []AxName, axiom_main: bool) bool {
     let mut ok = true;
+    let mut gave_way = false;
     for x in names {
-        let s = g_defs.get(u.intern(x.name));
+        let key = u.intern(x.name);
+        let s = g_defs.get(key);
         if u.isnil(s) {
+            continue;
+        }
+        if is_lib_sym(s) {
+            // (the program's Axiom module defines it: the C library's
+            // definition is not linked, as for a program's C unit)
+            drop(s);
+            g_defs.put(key, u.nil.[cast.CSym]());
+            gave_way = true;
             continue;
         }
         let d = dg.err(def_span(s), "C3065",
                        u.f1("'%s' is defined in C and in Axiom (an external name has one definition)", s.name));
         dg.note(d, x.span, "the Axiom definition");
         ok = false;
+    }
+    if gave_way {
+        for cu in g_units.items() {
+            drop_from(cu);
+        }
     }
     let mu = main_unit();
     if axiom_main and u.notnil(mu) {
@@ -363,6 +440,12 @@ pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut i
     }
     g_units.clear();
     return ok;
+}
+
+/// An Axiom program's main (its function in m) runs the C units'
+/// constructors and destructors around it (after gen_ir).
+pub fn wrap_axiom_main(m: *mut ir.Module, main: *mut ir.Func) void {
+    cg.wrap_axiom_main(m, main);
 }
 
 /// Compiles the C source at `path`. `emit` is the --emit kind, `out` the

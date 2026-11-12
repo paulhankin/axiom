@@ -8,8 +8,10 @@
 // lvalue e (and of a structure member reached from a structure value). The
 // implicit conversions are CAST nodes, so each node does one thing.
 // =============================================================================
+import "../diag.ax" as dg;
 import "../divconst.ax" as divc;
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
@@ -542,6 +544,10 @@ fn conversion(e: *mut cast.Expr) *mut ir.Value {
         return load_lv(e.a, p);
     }
     if (op == cast.CV_ADECAY) or (op == cast.CV_FDECAY) {
+        if (op == cast.CV_FDECAY) and (e.a.kind == cast.ExprKind.IDENT) and u.str_eq(e.a.name, SETJMP) {
+            // (a call through a pointer would not be known to return twice)
+            _ = dg.err(e.span, "C3301", "'setjmp' can only be called (its address cannot be taken)");
+        }
         return lv(e.a);
     }
     let v = rv(e.a);
@@ -1078,6 +1084,28 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
     return ph;
 }
 
+// <setjmp.h>'s setjmp (std/c/include/setjmp.h): a function the linkers
+// provide (cmd/axiom/src/jstub.ax) that returns twice.
+let SETJMP: []u8 = "__axc_setjmp";
+
+// A call of setjmp (C 7.13.1.1) in the function being generated: after
+// longjmp the call returns again, with the registers and the stack pointer
+// it saved, so the function is compiled without optimization (ir.Func's
+// returns_twice): every object stays in its own stack slot, where longjmp
+// finds what was stored before it (7.13.2.1p3), and no value lives in a
+// register across the call. WebAssembly has no way to return to the frame
+// (without its exception handling, which the code generator does not use).
+fn returns_twice(e: *cast.Expr) void {
+    if tg.is_wasm() {
+        _ = dg.err(e.span, "C3300", "setjmp and longjmp are not available on WebAssembly targets");
+        return;
+    }
+    if u.notnil(cg.F) {
+        cg.F.f.returns_twice = true;
+        cg.F.f.noinline = true;
+    }
+}
+
 fn call(e: *mut cast.Expr) *mut ir.Value {
     let n = e.args.len;
     let vs = u.newn.[*mut ir.Value](n + 1);
@@ -1112,6 +1140,9 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
     if (fe.kind == cast.ExprKind.CAST) and (fe.op == cast.CV_FDECAY) and (fe.a.kind == cast.ExprKind.IDENT) {
         noreturn = catr.is_noreturn(fe.a.sym);
         callee_name = fe.a.sym.name;
+        if u.str_eq(callee_name, SETJMP) {
+            returns_twice(e);
+        }
         let f = cg.func_of(fe.a.sym, sig);
         callee = f.val;
         if same_sig(f.ty, sig.ty) {

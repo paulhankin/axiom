@@ -3,7 +3,8 @@
    freestanding implementation, which are all but strdup, strndup, strcoll,
    strxfrm and strerror (those need allocation or a locale). Their
    definitions are std/c/lib/string/<name>.c, which a program gets when it
-   uses them and does not define them itself. */
+   uses them and does not define them itself. A hosted program also has the
+   others (axc/string_hosted.h: std/c/lib/core/). */
 #ifndef __AXIOM_STRING_H
 #define __AXIOM_STRING_H
 
@@ -11,10 +12,8 @@
 #define __STDC_VERSION_STRING_H__ 202311L
 #endif
 
-#ifndef __AXIOM_SIZE_T_DEFINED
-#define __AXIOM_SIZE_T_DEFINED
-typedef __AXIOM_SIZE_TYPE__ size_t;
-#endif
+#define __AXIOM_WANT_SIZE_T
+#include <axc/types.h>
 
 /* (as <stddef.h> has it: the same definition again is no redefinition) */
 #define NULL ((void *)0)
@@ -74,6 +73,10 @@ void *memset_explicit(void *s, int c, size_t n);
 #define strrchr(s, c) _Generic((s), const char *: (const char *)strrchr((s), (c)), default: strrchr((s), (c)))
 #define strstr(s1, s2) _Generic((s1), const char *: (const char *)strstr((s1), (s2)), \
     default: strstr((s1), (s2)))
+#endif
+
+#if __STDC_HOSTED__
+#include <axc/string_hosted.h>
 #endif
 
 #endif

@@ -1,6 +1,6 @@
 typedef unsigned long size_t;
-typedef long ptrdiff_t;
 typedef int wchar_t;
+typedef long ptrdiff_t;
 typedef __builtin_va_list va_list;
 x___STDC_VERSION_STDDEF_H__ = __STDC_VERSION_STDDEF_H__
 x_unreachable = unreachable()

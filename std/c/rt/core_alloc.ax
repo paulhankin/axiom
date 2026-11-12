@@ -1,0 +1,279 @@
+// =============================================================================
+// std/c/rt/core_alloc.ax - C's memory management (C23 7.24.3: malloc,
+// calloc, realloc, free, aligned_alloc, free_sized, free_aligned_sized) on
+// the Axiom allocator (std/mem.ax), which is thread-safe; or, where the
+// program has the system's C library (always on macOS, on Linux when it is
+// linked against it), on that library's heap, so that memory its functions
+// allocate (realpath, getline, ...) is freed by free, and theirs frees ours:
+// on Linux through __libc_malloc and its kin (stubs returning 0 in a static
+// program, which never calls them: cmd/axiom/src/lstub.ax), on macOS
+// through libSystem's (__axiom_libc_malloc ...: cmd/axiom/src/mlink.ax).
+// Either way a size of 0 is an object of its own, a failure sets errno.
+//
+// std/mem's free takes the size, and C's does not: every object has a
+// header of 16 bytes just before it, holding the address and the size of
+// the block it is in. An object of malloc, calloc and realloc is 16 bytes
+// into its block, so aligned to 16 (alignof(max_align_t), and the
+// allocator's alignment); an object of aligned_alloc is at a multiple of its
+// alignment (std/mem.alloc_aligned_bytes up to 4096, past that by rounding
+// up within a larger block). A size of 0 is an object of no bytes, with an
+// address of its own. A failure sets errno to ENOMEM (EINVAL for an
+// alignment that is not a power of two).
+// =============================================================================
+import "../../mem.ax" as mem;
+
+extern "C" {
+    fn __axc_set_errno(e: i64) void;  // (errno is an int of the build's width)
+    // Linux
+    fn ax_libc_linked() i32;
+    fn __libc_malloc(n: usize) *mut u8;
+    fn __libc_calloc(n: usize, size: usize) *mut u8;
+    fn __libc_realloc(p: *mut u8, n: usize) *mut u8;
+    fn __libc_free(p: *mut u8) void;
+    fn __libc_memalign(align: usize, n: usize) *mut u8;
+    // macOS
+    fn __axiom_libc_malloc(n: usize) *mut u8;
+    fn __axiom_libc_calloc(n: usize, size: usize) *mut u8;
+    fn __axiom_libc_realloc(p: *mut u8, n: usize) *mut u8;
+    fn __axiom_libc_free(p: *mut u8) void;
+    fn __axiom_libc_posix_memalign(p: *mut *mut u8, align: usize, n: usize) i32;
+}
+
+// Is the heap the system C library's? (On Linux the stub answers whether
+// the library is linked.)
+fn sys_heap() bool {
+    if @target_os("macos") {
+        return true;
+    }
+    if @target_os("linux") {
+        return ax_libc_linked() != 0;
+    }
+    return false;
+}
+
+fn sys_malloc(n: usize) *mut u8 {
+    let mut p = nullp();
+    if @target_os("macos") {
+        p = __axiom_libc_malloc(n);
+    } else if @target_os("linux") {
+        p = __libc_malloc(n);
+    }
+    if @int_from_ptr(p) == 0 {
+        return fail(ENOMEM);
+    }
+    return p;
+}
+
+fn sys_calloc(n: usize, size: usize) *mut u8 {
+    let mut p = nullp();
+    if @target_os("macos") {
+        p = __axiom_libc_calloc(n, size);
+    } else if @target_os("linux") {
+        p = __libc_calloc(n, size);
+    }
+    if @int_from_ptr(p) == 0 {
+        return fail(ENOMEM);
+    }
+    return p;
+}
+
+// (n 0 is 1: realloc to 0 frees, in the system's)
+fn sys_realloc(p: *mut u8, n: usize) *mut u8 {
+    let mut q = nullp();
+    if @target_os("macos") {
+        q = __axiom_libc_realloc(p, @max(n, 1));
+    } else if @target_os("linux") {
+        q = __libc_realloc(p, @max(n, 1));
+    }
+    if @int_from_ptr(q) == 0 {
+        return fail(ENOMEM);
+    }
+    return q;
+}
+
+fn sys_free(p: *mut u8) void {
+    if @target_os("macos") {
+        __axiom_libc_free(p);
+    } else if @target_os("linux") {
+        __libc_free(p);
+    }
+}
+
+fn sys_aligned(align: usize, n: usize) *mut u8 {
+    let mut p = nullp();
+    if @target_os("macos") {
+        if __axiom_libc_posix_memalign(&mut p, @max(align, 16), n) != 0 {
+            p = nullp();
+        }
+    } else if @target_os("linux") {
+        p = __libc_memalign(align, n);
+    }
+    if @int_from_ptr(p) == 0 {
+        return fail(ENOMEM);
+    }
+    return p;
+}
+
+const HDR: usize = 16;
+const ENOMEM: i64 = 12;  // std/c/include/errno.h
+const EINVAL: i64 = 22;
+
+fn nullp() *mut u8 {
+    return @ptr_from_int(*mut u8, 0);
+}
+
+fn fail(e: i64) *mut u8 {
+    __axc_set_errno(e);
+    return nullp();
+}
+
+// The header of the object at p: [the block's address, the block's size].
+fn header(p: usize) *mut [2]usize {
+    return @ptr_from_int(*mut [2]usize, p - HDR);
+}
+
+fn object(block: usize, size: usize, p: usize) *mut u8 {
+    let h = header(p);
+    h[0] = block;
+    h[1] = size;
+    return @ptr_from_int(*mut u8, p);
+}
+
+// n bytes at a multiple of align (a power of two of at least 16).
+fn alloc(n: usize, align: usize) *mut u8 {
+    if align <= HDR {
+        if n > ~@as(usize, 0) - HDR {
+            return fail(ENOMEM);
+        }
+        let b = mem.alloc_bytes(n + HDR);
+        if b == 0 {
+            return fail(ENOMEM);
+        }
+        return object(b, n + HDR, b + HDR);
+    }
+    if align <= 4096 {
+        // (the header in the alignment's bytes before the object)
+        if n > ~@as(usize, 0) - align {
+            return fail(ENOMEM);
+        }
+        let b = mem.alloc_aligned_bytes(n + align, align);
+        if b == 0 {
+            return fail(ENOMEM);
+        }
+        return object(b, n + align, b + align);
+    }
+    if n > ~@as(usize, 0) - align - HDR {
+        return fail(ENOMEM);
+    }
+    let b = mem.alloc_bytes(n + align + HDR);
+    if b == 0 {
+        return fail(ENOMEM);
+    }
+    return object(b, n + align + HDR, (b + HDR + align - 1) & ~(align - 1));
+}
+
+/// C's malloc: n bytes aligned to 16, contents unspecified; null (errno
+/// ENOMEM) if there is no memory.
+export fn malloc(n: usize) *mut u8 {
+    if sys_heap() {
+        return sys_malloc(n);
+    }
+    return alloc(n, HDR);
+}
+
+/// C's calloc: an array of nmemb objects of size bytes, all bytes zero;
+/// null (errno ENOMEM) if there is no memory or the size overflows.
+export fn calloc(nmemb: usize, size: usize) *mut u8 {
+    if (size != 0) and (nmemb > ~@as(usize, 0) / size) {
+        return fail(ENOMEM);
+    }
+    if sys_heap() {
+        return sys_calloc(nmemb, size);
+    }
+    let n = nmemb * size;
+    let p = alloc(n, HDR);
+    if @int_from_ptr(p) != 0 {
+        @mem_set(@slice_from_ptr(p, n), 0);
+    }
+    return p;
+}
+
+/// C's free: gives back an object of these functions; nothing for null.
+export fn free(p: *mut u8) void {
+    let a = @int_from_ptr(p);
+    if a == 0 {
+        return;
+    }
+    if sys_heap() {
+        sys_free(p);
+        return;
+    }
+    let h = header(a);
+    mem.free_bytes(h[0], h[1]);
+}
+
+/// C's free_sized (C23): free (the size is not needed).
+export fn free_sized(p: *mut u8, size: usize) void {
+    _ = size;
+    free(p);
+}
+
+/// C's free_aligned_sized (C23): free.
+export fn free_aligned_sized(p: *mut u8, alignment: usize, size: usize) void {
+    _ = alignment;
+    _ = size;
+    free(p);
+}
+
+/// C's aligned_alloc: size bytes at a multiple of alignment, any power of
+/// two (null with errno EINVAL for another value).
+export fn aligned_alloc(alignment: usize, size: usize) *mut u8 {
+    if (alignment == 0) or ((alignment & (alignment - 1)) != 0) {
+        return fail(EINVAL);
+    }
+    if sys_heap() {
+        return sys_aligned(alignment, size);
+    }
+    return alloc(size, @max(alignment, HDR));
+}
+
+/// C's realloc: the object at p with its size changed to n (its contents up
+/// to the smaller size kept), maybe moved; malloc(n) for a null p. Null
+/// (errno ENOMEM) if there is no memory: then p is unchanged. Size 0 gives
+/// an object of no bytes (C23 makes realloc(p, 0) undefined; C17 leaves it
+/// to the implementation).
+export fn realloc(p: *mut u8, n: usize) *mut u8 {
+    let a = @int_from_ptr(p);
+    if sys_heap() {
+        if a == 0 {
+            return sys_malloc(n);
+        }
+        return sys_realloc(p, n);
+    }
+    if a == 0 {
+        return alloc(n, HDR);
+    }
+    let h = header(a);
+    let block = h[0];
+    let size = h[1];
+    if block == a - HDR {
+        if n > ~@as(usize, 0) - HDR {
+            return fail(ENOMEM);
+        }
+        let b = mem.realloc_bytes(block, size, n + HDR);
+        if b == 0 {
+            return fail(ENOMEM);
+        }
+        return object(b, n + HDR, b + HDR);
+    }
+    // an aligned_alloc object: moved to one of malloc's
+    let q = alloc(n, HDR);
+    if @int_from_ptr(q) == 0 {
+        return q;
+    }
+    let had = block + size - a;
+    let k = @min(had, n);
+    @mem_copy(@slice_from_ptr(q, k), @slice_from_ptr(@ptr_from_int(*u8, a), k));
+    mem.free_bytes(block, size);
+    return q;
+}

@@ -463,6 +463,7 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     c.defines = defs.items();
     c.include_dirs = dirs.items();
     c.sys_include = u.cat2(o.std_dir, "/c/include");
+    c.hosted = not o.c_freestanding;
     return true;
 }
 
@@ -904,6 +905,10 @@ fn compile(args: [][]u8) i32 {
         if cfront.text_emit(o.emit) {
             return cfront.run(o.input, c, o.emit, o.out, o.json);
         }
+        if u.str_eq(o.emit, "c-lib-defs") {
+            // (the C library's index: cmd/internal/tools/gen_c_lib_index.mjs)
+            return cfront.lib_defs(o.input, c, o.json);
+        }
         return build_c(&mut o, c);
     }
     if o.ide_mode {
@@ -1049,7 +1054,9 @@ fn c_library(o: *Options, c: *cop.COptions, modules: *mut u.List.[[]u8]) bool {
     }
     let rt = u.f1("%s/c/rt", o.std_dir);
     let start = modules.len;
-    pkg.files_under(rt, ".ax", modules);
+    for k in 0..g_rt_needed.len {
+        modules.push(g_rt_needed.get(k));
+    }
     if modules.len > start {
         let r = u.real_path(rt);
         cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
@@ -1058,18 +1065,163 @@ fn c_library(o: *Options, c: *cop.COptions, modules: *mut u.List.[[]u8]) bool {
 }
 
 // The C library's units (<std>/c/lib/**.c), checked as a library's with
-// cfront.lib_options; with --c-freestanding only those of <string.h>
+// cfront.lib_options, on demand: those that define a name the program's
+// units use, and so on for what those use (the index, <std>/c/lib/index,
+// maps each external name to the file that defines it; without it, every
+// unit is checked). With --c-freestanding only those of <string.h>
 // (c/lib/string/), which C23 (4p7) asks of a freestanding implementation
-// too. False after an error (reported).
+// too. The run-time modules (<std>/c/rt/) whose exports are used are
+// recorded in g_rt_needed (c_library adds them). False after an error
+// (reported).
 fn c_library_units(o: *Options, c: *cop.COptions) bool {
     let mut ok = true;
-    let mut srcs = u.List.[[]u8].empty();
     let lo = cfront.lib_options(c);
-    pkg.files_under(u.f2("%s/c/lib%s", o.std_dir, u.pick(o.c_freestanding, "/string", "")), ".c", &mut srcs);
-    for k in 0..srcs.len {
-        ok = cfront.check(srcs.get(k), lo, true) and ok;
+    g_rt_needed = u.List.[[]u8].empty();
+    let idx = u.read_file(u.f1("%s/c/lib/index", o.std_dir));
+    if u.isnos(idx) {
+        let mut srcs = u.List.[[]u8].empty();
+        pkg.files_under(u.f2("%s/c/lib%s", o.std_dir, u.pick(o.c_freestanding, "/string", "")), ".c", &mut srcs);
+        for k in 0..srcs.len {
+            ok = cfront.check(srcs.get(k), lo, true) and ok;
+        }
+        let rt = u.f1("%s/c/rt", o.std_dir);
+        pkg.files_under(rt, ".ax", &mut g_rt_needed);
+        return ok;
+    }
+    // the index: "D name path" (path, under <std>/c/, defines name) and
+    // "N path name" (the run-time module path calls name)
+    let mut defs = u.SymMap.[[]u8].{ keys: u.nil.[usize](), vals: u.nil.[[]u8](), cap: 0, len: 0 };
+    let mut needs = u.List.[[]u8].empty();  // pairs: path, name
+    let mut i: usize = 0;
+    while i < idx.len {
+        let mut j = i;
+        while (j < idx.len) and (idx[j] != '\n') {
+            j += 1;
+        }
+        let line = idx[i..j];
+        i = j + 1;
+        if (line.len < 3) or (line[1] != ' ') {
+            continue;
+        }
+        let mut k: usize = 2;
+        while (k < line.len) and (line[k] != ' ') {
+            k += 1;
+        }
+        if k >= line.len {
+            continue;
+        }
+        let x = line[2..k];
+        let y = line[k + 1..];
+        if line[0] == 'D' {
+            defs.put(u.intern(x), y);
+        } else if line[0] == 'N' {
+            needs.push(x);
+            needs.push(y);
+        }
+    }
+    let mut done = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };  // names, paths
+    let mut defined = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    cfront.defined_names(&mut defined);
+    let mut work = u.List.[[]u8].empty();
+    cfront.all_refs(&mut work);
+    if not o.c_freestanding {
+        // what code generation calls by name (the start-up's exit; the
+        // memory functions the code generators call: c/cstrip.ax)
+        for n in ["exit", "memcpy", "memmove", "memset", "memcmp"] {
+            work.push(n);
+        }
+        // and what the program's Axiom modules declare in extern "C" blocks
+        extern_c_names(o, &mut work);
+    } else {
+        for n in ["memcpy", "memmove", "memset", "memcmp"] {
+            work.push(n);
+        }
+    }
+    while work.len > 0 {
+        let n = u.intern(work.pop());
+        if done.has(n) or defined.has(n) {
+            continue;
+        }
+        done.put(n, 1);
+        let path = defs.get(n);
+        if u.isnos(path) or (path.len == 0) {
+            continue;  // (the platform's, or nobody's)
+        }
+        let pk = u.intern(path);
+        if done.has(pk) {
+            continue;
+        }
+        done.put(pk, 1);
+        if u.starts(path, "rt/") {
+            if o.c_freestanding {
+                continue;
+            }
+            g_rt_needed.push(u.f2("%s/c/%s", o.std_dir, path));
+            for q in 0..needs.len / 2 {
+                if u.str_eq(needs.get(2 * q), path) {
+                    work.push(needs.get(2 * q + 1));
+                }
+            }
+            continue;
+        }
+        if o.c_freestanding and not u.starts(path, "lib/string/") {
+            continue;
+        }
+        let before = defined.len;
+        _ = before;
+        if not cfront.check(u.f2("%s/c/%s", o.std_dir, path), lo, true) {
+            ok = false;
+            continue;
+        }
+        for r in cfront.last_refs() {
+            work.push(r);
+        }
     }
     return ok;
+}
+
+// The run-time modules of the C library that the units use (c_library_units).
+let mut g_rt_needed: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+// The names that the extern "C" blocks of the program's own Axiom modules
+// declare (the C library's functions they may call): of the Axiom program
+// (sema has run), or of the modules beside a C program (--link=file.ax,
+// read as text: `fn name(` in an extern "C" block).
+fn extern_c_names(o: *Options, out: *mut u.List.[[]u8]) void {
+    if u.notnil(sema.g_prog) {
+        for i in 0..sema.g_prog.fns.len {
+            let d = sema.g_prog.fns.get(i);
+            if d.extern_c and not sema.is_std_module(d.module) {
+                out.push(d.name);
+            }
+        }
+    }
+    for k in 0..o.ax_links.len {
+        let t = u.read_file(o.ax_links.get(k));
+        if u.isnos(t) {
+            continue;
+        }
+        let mut i: usize = 0;
+        let mut inside = false;
+        while i < t.len {
+            if not inside and u.starts(t[i..], "extern \"C\"") {
+                inside = true;
+            } else if inside and (t[i] == '}') {
+                inside = false;
+            } else if inside and u.starts(t[i..], "fn ") {
+                let mut j = i + 3;
+                while (j < t.len) and
+                      ((t[j] == '_') or ((t[j] | 0x20) >= 'a' and (t[j] | 0x20) <= 'z') or
+                       (t[j] >= '0' and t[j] <= '9')) {
+                    j += 1;
+                }
+                out.push(t[i + 3..j]);
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+    }
 }
 
 // With C units, an executable that our own linkers link (no --link inputs

@@ -6,11 +6,13 @@ is built for every target of the compiler (WebAssembly, x86-64 and AArch64 Linux
 Windows, AArch64 macOS) with no C compiler and no external linker, except to link to the
 platform's C library on Linux (see "What a C program is here").
 
-It is a freestanding implementation, in C's terms: it has the freestanding headers and
-the functions of `<string.h>` that C23 asks of one, and no other library. It reads C89, C95, C99, C11, C17 and C23 (`--c-std=`; C17 by default), each
-mode accepting its standard's language and diagnosing what a later standard added or its
-own removed, and their GNU dialects (`--c-std=gnu89` ... `gnu23`), which add the widely
-used GNU extensions ("GNU dialects", below). Under an ISO standard there are no extensions,
+It is a hosted implementation, in C's terms: a C program links the compiler's own C
+library ("The C library"), and `--c-freestanding` makes it a freestanding one, with the
+freestanding headers and of the library only `<string.h>`'s functions that C23 asks of
+one. It reads C89, C95, C99, C11, C17 and C23 (`--c-std=`; C17 by default), each mode
+accepting its standard's language and diagnosing what a later standard added or its own
+removed, and their GNU dialects (`--c-std=gnu89` ... `gnu23`), which add the widely used
+GNU extensions ("GNU dialects", below). Under an ISO standard there are no extensions,
 but the pragmas, which every mode has.
 
 ```
@@ -28,12 +30,12 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
 
 ## What a C program is here
 
-- **No library but `<string.h>`.** There is no `<stdio.h>`, `<stdlib.h>` or any other
-  library header. `#include <stdio.h>` is the error `C1081`. `<string.h>` has the
-  functions a freestanding implementation has in C23 (see "Headers"), from the C library
-  (below).
-- **Undefined functions are the platform's.** A function a program declares and does not
-  define is looked up outside the program:
+- **The library is the compiler's, as far as it goes.** The headers and functions of
+  "The C library" (below) are linked into every program that uses them, on every target.
+  There is no `<math.h>`, `<fenv.h>` or `<threads.h>` yet: `#include <math.h>` is the
+  error `C1081`.
+- **Other undefined functions are the platform's.** A function a program declares and
+  that neither it nor the library defines is looked up outside the program:
   - On Linux, by the linker, in the system's C library: such a program is linked by the
     system's C compiler (`cc`), which must be installed. A program that defines every
     function it calls is linked by the compiler's own linker, and is a static executable
@@ -83,7 +85,7 @@ Axiom in one program").
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
 | `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111` (it is ignored either way). |
 | `-Idir` | Add a directory to the include path. |
-| `--c-freestanding` | Link no C library into the program ("The C library"). |
+| `--c-freestanding` | A freestanding program: `__STDC_HOSTED__` is 0, only the freestanding headers are found (another is `C1081`), and no C library is linked ("The C library"). |
 
 `-D`, `-U` and `-I` apply in the order given. The C options are errors for an Axiom
 source. The unknown ones are errors too: there are no `-W...`, `-std=`, `-c` or `-f...`
@@ -255,44 +257,227 @@ The order in which a program starts and ends is the same with or without C:
    C's `main` with them. Everything of the runtime works from C's first instruction on:
    C code may call Axiom functions that allocate, print or start threads.
 3. When C's `main` returns, its value is the argument of a call of `exit` (5.1.2.2.3)
-   if the program defines `exit` (a C unit, or an Axiom module's `export fn exit`: the
-   hosted C library's), and on Windows, where `exit` is otherwise the C library's
-   (`msvcrt.dll`), which runs its `atexit` functions and flushes its streams. Such an
-   `exit` ends the process through the runtime: `std/os.exit`, which finishes the
-   runtime (`ax_rt_fini`) and exits with the status.
+   if the program defines `exit` (the C library's, unless `--c-freestanding`; or the
+   program's own: a C unit, or an Axiom module's `export fn exit`), and on Windows,
+   where `exit` is otherwise the system C library's (`msvcrt.dll`), which runs its
+   `atexit` functions and flushes its streams. The library's `exit` runs the `atexit`
+   functions, then the GNU dialects' destructors, then the standard I/O's flushing, and ends the
+   process through the runtime: `std/os.exit`, which finishes the runtime
+   (`ax_rt_fini`) and exits with the status. Its argument has the width of `int`
+   (`--c-int`).
 4. Otherwise `main`'s value goes back to the runtime's entry point, which finishes the
    runtime and returns it to the system (on Linux with the C library linked, to the C
    library's start-up, which calls its `exit`).
 
-A C call of `exit` anywhere is the same function as in step 3. A C program on Linux that
-calls the C library's `exit` (it defines none) ends through the C library, without the
-runtime's finishing step, which only writes a profile (`axiom profile` does not take C
-programs).
+A C call of `exit` anywhere is the same function as in step 3. A freestanding C program
+on Linux that calls the system C library's `exit` (it defines none) ends through the C
+library, without the runtime's finishing step, which only writes a profile (`axiom
+profile` does not take C programs). Under WebAssembly a hosted program ends by calling
+the host's `ax_exit` (`std/internal/runtime/host.mjs`: `process.exit`, or the
+embedder's `exit` option) rather than by returning from the module's `main`.
 
-### The C library
+## The C library
 
-A hosted C program links the compiler's C library, which is compiled from the standard
-library's sources with the program, unless `--c-freestanding` is given:
+A hosted C program links the compiler's own C library, which is compiled from the
+standard library's sources with the program, unless `--c-freestanding` is given (then
+only `<string.h>`'s functions that C23 asks of a freestanding implementation). It is in
+parts, each with its sources and its private header:
 
-- every C source under `<std>/c/lib/` is a translation unit of the program, a library's:
-  a name that one of the program's own units defines is that unit's, and the library's
-  definition of it is left out (as a linker leaves out an archive's member nothing
-  needs), so a program may define a library function itself;
-- every Axiom module under `<std>/c/rt/` (the library's run-time layer: the system's
-  services, from the Axiom standard library, under C names) is a module of the program,
-  whose `export fn`s are generated only when something reaches them, and give way to a
-  C unit's definition of the same name.
+| Part | Headers | Sources |
+|---|---|---|
+| core | `<assert.h>`, `<ctype.h>`, `<errno.h>`, `<setjmp.h>`, `<signal.h>`, `<stdlib.h>` (but its multibyte functions), `<string.h>`'s hosted functions | `std/c/lib/core/`, `std/c/rt/core*.ax`, `axc/core_impl.h` |
+| strings | `<string.h>` (C23's freestanding functions) | `std/c/lib/string/` |
+| standard input/output | `<stdio.h>`, `<wchar.h>`'s input/output | `std/c/lib/stdio/`, `std/c/rt/stdio.ax` |
+| text | `<locale.h>`, `<wchar.h>`, `<wctype.h>`, `<uchar.h>`, `<time.h>`, `<inttypes.h>`, `<stdlib.h>`'s multibyte functions | `std/c/lib/text/`, `std/c/rt/text*.ax`, `axc/text.h`, `axc/locale.h` ([`docs/c-text.md`](c-text.md)) |
 
-Either directory may be missing. Today `std/c/lib/` holds `<string.h>`'s functions
-(`std/c/lib/string/`, one function to a file), which `--c-freestanding` keeps (C23 asks a
-freestanding implementation for them), and `std/c/rt/` only `ldouble.ax` (the arithmetic
-of a `long double` wider than `double`, which every C program whose `long double` is wider
-loads, freestanding or not, and which exports no names); a C program calls the system's
-library for the rest. A unit of the library is analyzed as C17, with the program's
-`--c-int`, `--c-long`, `--c-char` and `--c-long-double` and none of its `-D` and `-I`
-options. What an executable does not reach is left out of it when the compiler's own
-linker links it (no `--link` inputs or `-l` libraries); otherwise all of the library's
-functions are in it.
+There is no `<math.h>`, `<fenv.h>` or `<threads.h>` yet (`__STDC_NO_THREADS__`).
+
+### How the library is linked
+
+- The library's C units (`<std>/c/lib/**.c`) are compiled on demand: a unit is checked
+  and compiled when it defines a name that the program uses (its C units', its Axiom
+  modules' `extern "C"` declarations, the start-up's `exit`, the memory functions the
+  code generators call), and so on for the names that unit uses. The index
+  `<std>/c/lib/index` says which file defines each external name; it is written by
+  `cmd/internal/tools/gen_c_lib_index.mjs` (from `--emit=c-lib-defs`, the names a unit
+  defines) and the suite checks that it is current. Each external name `X` is defined in
+  a file `X.c` of its own where it can be; the standard I/O's larger files define several.
+- The run-time modules (`<std>/c/rt/*.ax`: the system's services, from the Axiom standard
+  library, under C names) are modules of the program when one of their exports is used
+  (with the C functions they call, which the index lists); their `export fn`s are
+  generated only when something reaches them. A program whose `main` is Axiom's has all
+  of them. `std/c/rt/ldouble.ax` (the arithmetic of a `long double` wider than `double`)
+  is every such program's, freestanding or not.
+- A name that one of the program's own units, or one of its Axiom modules (an `export
+  fn`), defines is the program's, and the library's definition of it is left out (as a
+  linker leaves out an archive's member nothing needs), so a program may define a library
+  function itself.
+- The library's units are C17 whatever the program's `--c-std` (its headers serve every
+  standard), without extensions, with the program's `--c-int`, `--c-long`, `--c-char`
+  and `--c-long-double`, and without its `-D`, `-U` and `-I`. Behaviours that C23
+  changed are chosen per call: in C23 mode the headers map `strtol` and its kin,
+  `wcstol`'s, `strtoimax`'s and `fscanf`'s families to `__axc_..._c23` functions, which
+  take the `0b` prefix. Names the parts share begin with `__axc_`; the types several
+  headers declare (`size_t`, `wchar_t`, `wint_t`, `mbstate_t`) are defined once, from
+  the compiler's `__AXIOM_*_TYPE__` macros, by `axc/types.h`. The functions of
+  `<std>/c/rt/` take and return no `int`, whose width the build chooses (64-bit
+  integers cross instead).
+- What a program does not reach is not in its executable ("What is linked"). A program
+  that returns 3 from `main` builds within about 20 ms of a freestanding one (x86-64
+  Linux) and is a few KB larger (the exit path).
+- `exit` runs the `atexit` functions (last registered first), then the GNU dialects'
+  destructors (highest priority first), then flushes and closes the streams and removes
+  `tmpfile`'s files; the constructors run before `main` (lowest priority first), also
+  in a program whose `main` is Axiom's, where the destructors run when it returns.
+
+Under Linux a program that still calls a function of the system's C library (one of the
+headers this library does not have yet: `<math.h>`, such as `sin`) is linked with it, as before,
+and the library's functions (`exit`, `qsort`, ...) are the ones the program uses. Its
+`malloc` and the others of `<stdlib.h>`'s memory management then use the system
+library's heap (`__libc_malloc` and its kin), as they always do on macOS
+(`libSystem`'s), so that memory one library allocates the other frees; in a program that
+needs nothing of the system's (a static one on Linux; Windows; WebAssembly) they use the
+Axiom allocator. A C source linked with `--link=` (compiled by the system's C compiler,
+against its headers) uses the system library's streams, and the program's code this
+library's, under the same names (`printf`, `fopen`, ...): such a program should be built
+with `--c-freestanding` if both write. On
+Windows nothing the library defines comes from `msvcrt.dll`; the rest still does by
+name (the functions of `<math.h>`). On macOS the runtime reaches
+`libSystem`'s `exit`, `getenv`, `raise`, `malloc`, `calloc` and `free` under names of
+its own (`__axiom_libc_...`, which the linker binds to those), so that they are never
+the program's.
+
+The library's core (`std/c/lib/core/`, `std/c/rt/core*.ax`):
+
+| Header | What is there |
+|---|---|
+| `<assert.h>` | `assert` (C23: variadic), `static_assert` (C11, C17). A failed assertion writes `file:line: function: assertion failed: expression` to standard error and calls `abort`. |
+| `<ctype.h>` | All of it, from one table: the "C" locale's classes in every locale (the bytes past 127 are in no class); every `int` is safe (EOF, `unsigned char` values, and others: no class). |
+| `<errno.h>` | `errno`, each thread's own (a macro over the function `__axc_errno`, whose object is `_Thread_local`), `EDOM`, `ERANGE`, `EILSEQ` and the codes the library reports (`ENOMEM`, `EINVAL`, ...): the library's own values, the same on every target. |
+| `<setjmp.h>` | `jmp_buf`, `setjmp`, `longjmp` ("setjmp and longjmp", below). |
+| `<signal.h>` | `signal`, `raise`, `sig_atomic_t`, the six signals ("Signals", below). |
+| `<stdlib.h>` | All of it (the multibyte functions and `MB_CUR_MAX` are the text part's). Its header comment lists the choices: `malloc(0)` and the like give a unique pointer; memory is the Axiom allocator's (`std/mem`, thread-safe) or the system C library's (above), aligned to 16, `aligned_alloc` to any power of two; `calloc` checks its product; `rand` is a 64-bit linear congruential generator (`RAND_MAX` 2147483647); `qsort` is an introspective sort (O(n log n) at worst, O(log n) stack); `strtod`, `strtof` and `strtold` (in `long double`'s format, whichever the target has) are correctly rounded for every input, decimal and hexadecimal, and set `ERANGE` on overflow and on a zero or subnormal result; in C23 mode `strtol` and its kin take `0b`; `atexit` and `at_quick_exit` take any number of functions; `getenv`'s strings stay valid until the variable's value is asked for again after it changed; `system` uses `/bin/sh` (Linux, macOS) or `cmd.exe` (Windows); under WebAssembly there is no command processor; `strfromd`, `strfromf` and `strfroml` (C23) format with `snprintf`, the standard I/O's. |
+| `<string.h>` | The hosted functions: `strerror` (the library's messages), `strcoll` and `strxfrm` (the order of the bytes, in every locale), and in C23 `strdup` and `strndup`. |
+
+Measured on x86-64 Linux against the system's C library (both at their best options):
+`qsort` of integers and of 24-byte records 1.1 times its time, `strtod` 1.0 times,
+`malloc` and `free` of small blocks 0.96 times.
+
+### Wide characters, locales and time
+
+See [`docs/c-text.md`](c-text.md). `__STDC_ISO_10646__` is `202309L` (Unicode 15.1)
+where `wchar_t` is 32 bits; with Windows' 16-bit `wchar_t` (UTF-16) it is not defined.
+
+### `long double`
+
+`strtold`, `wcstold`, `strfroml`, and `fprintf`'s and `fscanf`'s `L` conversions are
+exact (correctly rounded) in the format `long double` has: binary64, the x87 80-bit
+format or binary128 (`LDBL_MANT_DIG` 53, 64 or 113, "Floating types"), read from and
+written to the value's bits by the standard I/O's engines (`fmtfloat.c`, `scanfloat.c`).
+
+### Standard input/output: `<stdio.h>`
+
+The library's `<stdio.h>` (`std/c/lib/stdio/`, over `std/c/rt/stdio.ax`) is all of
+C17's 7.21 with C23's additions, and the wide-character input/output of `<wchar.h>`
+(7.29.2, 7.29.3), on every target. Its implementation-defined choices:
+
+- **Streams**: `stdin` and `stdout` are fully buffered unless they are a terminal, then
+  line buffered (decided at their first use); `stderr` is unbuffered; a file `fopen`
+  opens is line buffered when it is a terminal. `BUFSIZ` is 4096, `FOPEN_MAX` 20 (no
+  limit but memory), `FILENAME_MAX` 4096, `L_tmpnam` 260, `TMP_MAX` 2147483647. A
+  line-buffered stream writes up to its last new-line; reading from an unbuffered or
+  line-buffered stream first writes the line-buffered output streams (7.21.3p3). A
+  formatted output to an unbuffered stream is one write.
+- **Files**: every mode of 7.21.5.3, `x` (C11) included; another character ends the
+  mode. Text streams translate `'\n'` to and from `"\r\n"` on Windows (a lone `'\r'`
+  is itself); elsewhere text and binary streams are the same. Positions are 64-bit
+  (`fgetpos`, `fsetpos`, and `fseek`/`ftell` as far as `long` goes: on Windows and
+  wasm32, where `long` has 32 bits, `ftell` fails with `EOVERFLOW` past 2 GB).
+  `tmpfile` creates a file in the directory for temporary files (`TMPDIR`, else `/tmp`;
+  on Windows `TMP`, `TEMP`, ...) and removes it at once (on Windows when it is closed
+  or the program exits); `tmpnam` gives names there that no file has. `remove`
+  removes an empty directory too. On WebAssembly the files are the node host's.
+- **Pushback**: `ungetc` takes up to 8 bytes, `ungetwc` a wide character as its
+  multibyte bytes (one at least). Output after input, and input after output, need no
+  `fflush` or seek between them (7.21.5.3p7 asks for one); `fflush` of an input stream
+  gives its unread bytes back to the file.
+- **Orientation**: a byte function on a wide-oriented stream fails (returns `EOF` or a
+  negative value, writing and reading nothing), and a wide one on a byte-oriented
+  stream fails (`WEOF`).
+- **Errors**: the error indicator is set by a failed read or write, and by reading a
+  stream opened only for writing or writing one opened only for reading (with `errno`
+  `EBADF`); failures of the system set `errno` to `ENOENT`, `EACCES`, `EEXIST`,
+  `ENOTDIR`, `EISDIR`, `EINVAL`, `ESPIPE` or `EIO`.
+- **Threads**: each stream has a lock, which every function takes for its whole
+  operation, from the first thread a program starts on (until then there is one
+  thread, and nothing to lock).
+- **`fprintf`**: `%p` is `0x` and the address in hexadecimal digits (`0x0` for a null
+  pointer), as `%#x` would write it; infinity is `inf`, NaN `nan` or `-nan` (no
+  n-char-sequence: `_PRINTF_NAN_LEN_MAX` is 0); `%a` writes a normal value with the
+  leading digit 1 and a subnormal with 0 and the smallest normal's exponent, in every
+  floating format; a conversion the standard does not have makes the call fail. The
+  decimal conversions are exact and correctly rounded at any precision, halfway cases
+  to even; the current rounding direction is not consulted. C23's `%b` and `%B` and the
+  `wN` and `wfN` length modifiers are accepted in every mode.
+- **`fscanf`**: an input item is the longest prefix of a matching sequence, and only
+  the character after it is given back (7.21.6.2p9), so a prefix that is not a whole
+  number is a matching failure: `"0x"` for `%x`, `"1e+"` and `"100ergs"` (the example of
+  7.21.6.2p20) for `%f`, and `%3c` when the input ends after two characters. The
+  scanset `%[a-z]` is a range when `-` is neither first nor last. `%p` reads what `%p`
+  writes. Floating conversions are correctly rounded for every format; `%i` reads C23's
+  `0b` prefix in C23 mode (the header maps the functions to `__axc_..._c23` forms) and
+  not before, and `%b` reads binary digits after an optional `0b`.
+- **`perror`** writes `strerror`'s message. The streams are flushed at exit, and the
+  files `tmpfile` created removed.
+
+### setjmp and longjmp
+
+`setjmp` is a macro for `__axc_setjmp`, which the linkers provide on every native target
+(`cmd/axiom/src/jstub.ax`), with `longjmp`: they save and restore the registers the
+platform's calling convention keeps across a call (with the floating-point ones:
+`xmm6`-`xmm15`, MXCSR and the x87 control word on Windows, `d8`-`d15` on AArch64), the
+stack pointer and the return address; `jmp_buf` is 32 words. The compiler knows that
+`__axc_setjmp` returns twice: a function that calls it is not optimized (its objects
+stay in memory, each in a slot of its own, and no value lives in a register across the
+call), not inlined, and makes no sibling calls, at every level, so that the objects not
+modified between `setjmp` and `longjmp` have their values after the jump (C17
+7.13.2.1p3), as do volatile ones that were. Its address cannot be taken (`C3301`): a
+call through a pointer would not be known to return twice.
+
+- `longjmp` unwinds nothing. On Windows no exception handlers of the frames it leaves
+  run (the system's unwinding is not used); the restored stack pointer drops the
+  frames.
+- Jumping back into a function whose variable length arrays were allocated after the
+  `setjmp` call frees them (the stack pointer goes back); jumping out of, or over,
+  Axiom functions that C called (an Axiom function on the stack between the `setjmp`
+  and the `longjmp`) is undefined: their `defer`s do not run.
+- WebAssembly cannot return to a frame without its exception handling, which the code
+  generator does not use: `setjmp` there is `C3300`.
+- `setjmp` saves no signal mask: a signal handler that leaves with `longjmp` leaves
+  its signal blocked (on Linux and macOS).
+
+### Signals
+
+The six signals of `<signal.h>` have Linux's numbers on every target. A handler set
+with `signal` stays set while it runs, and its signal waits until it returns
+(7.14.1.1p3's second choice).
+
+- Linux and macOS: the system delivers them (`rt_sigaction` through the runtime's
+  system call stub, or `libSystem`'s `sigaction`), on the runtime's signal stack where
+  the thread has one; `raise` sends the signal to the thread, and the system's
+  default actions apply (killed by the signal). A handler of `SIGSEGV`, `SIGFPE` or
+  `SIGILL` replaces the runtime's crash report while it is set; `SIG_DFL` puts back
+  the action the program started with (the crash report).
+- Windows: `SIGINT` is the console's Ctrl-C and Ctrl-Break (a console control
+  handler, which the system calls on a thread of its own); the others arrive only from
+  `raise`, which calls the handler at once; the processor's faults stay the crash
+  reporter's. The default action of a raised signal ends the process with status 3
+  for `SIGABRT` (as `abort`'s) and 128 + the signal's number for the others.
+- WebAssembly: `raise` alone, as on Windows.
+
+`abort` raises `SIGABRT`; if that returns (a handler returned, or the signal is
+ignored), it sets the default action and raises it again, and ends the process with
+status 3 if it still lives.
 
 ## Standards
 
@@ -337,10 +522,10 @@ implementation knows act, the others are ignored.
 
 `__STDC__` (1), `__STDC_VERSION__` (above), `__DATE__`, `__TIME__` (the build's time, or
 the `SOURCE_DATE_EPOCH` environment variable's, in UTC), `__FILE__`, `__LINE__`. From C99,
-`__STDC_HOSTED__` is 0. From C11, `__STDC_UTF_16__`, `__STDC_UTF_32__`,
-`__STDC_NO_THREADS__` is 1 (there is no `<threads.h>` yet); `__STDC_NO_ATOMICS__` and
-`__STDC_NO_COMPLEX__` are not defined: atomics (see "Atomics and threads") and complex
-types are supported. In C23,
+`__STDC_HOSTED__` is 1, or 0 with `--c-freestanding`. From C11, `__STDC_UTF_16__`,
+`__STDC_UTF_32__` and `__STDC_NO_THREADS__` are 1 (there is no `<threads.h>` yet);
+`__STDC_NO_ATOMICS__` and `__STDC_NO_COMPLEX__` are not defined: atomics (see "Atomics and
+threads") and complex types are supported. In C23,
 `__STDC_EMBED_NOT_FOUND__`, `__STDC_EMBED_FOUND__` and `__STDC_EMBED_EMPTY__` are 0, 1
 and 2. `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__` and `__STDC_ISO_10646__` are not
 defined, nor is `__STDC_IEC_559_COMPLEX__` (see "Known deviations").
@@ -460,8 +645,10 @@ format than the ABI's cannot pass `long double` values to it.
 ## Headers
 
 The compiler provides the headers a freestanding implementation must have, in
-`std/c/include/`. Each is available from the standard that introduced it; including it
-in an earlier mode is an `#error`.
+`std/c/include/`, and the C library's ("The C library"). Each is available from the
+standard that introduced it; including it in an earlier mode is an `#error`. With
+`--c-freestanding` only the ones of this table and `<string.h>` are found; the
+library's are `C1081`.
 
 | Header | Modes | Notes |
 |---|---|---|
@@ -478,16 +665,23 @@ in an earlier mode is an `#error`.
 | `<stdnoreturn.h>` | C11 and later | |
 | `<stdbit.h>` | C23 | The `stdc_` functions as `static inline` functions and type-generic macros. |
 | `<stdckdint.h>` | C23 | `ckd_add`, `ckd_sub`, `ckd_mul`. |
+| `<stdio.h>` | all (hosted) | The C library's ("The C library"). `snprintf`, `vscanf` and C99's other names from C99; `gets` before C11 only; `__STDC_VERSION_STDIO_H__` and `_PRINTF_NAN_LEN_MAX` in C23. |
 
-| `<string.h>` | all | The functions C23 (4p7) asks of a freestanding implementation: all but `strdup`, `strndup`, `strcoll`, `strxfrm` and `strerror`. `memccpy` and `memset_explicit` from C23; in C23 `memchr`, `strchr`, `strpbrk`, `strrchr` and `strstr` are also generic macros whose result points to `const` when the argument does. |
+| `<string.h>` | all | C23's freestanding functions in every program (all but `strdup`, `strndup`, `strcoll`, `strxfrm` and `strerror`, which hosted programs have: "The C library"). `memccpy` and `memset_explicit` from C23; in C23 `memchr`, `strchr`, `strpbrk`, `strrchr` and `strstr` are also generic macros whose result points to `const` when the argument does. |
 
-Every other header is `C1081`. The functions of `<string.h>` are C sources in
-`std/c/lib/string/` (`memcpy.c`, ...), units of the C library ("The C library"): an
-executable gets those it does not define itself; `memcpy`, `memmove`, `memset`,
-`memcmp`, `memchr` and `strlen` work a word at a time. C23 (4p7) also asks a
-freestanding implementation for some of `<stdlib.h>`, and for `<fenv.h>` and `<math.h>`
-if it claims Annex F; those are not provided. The C23 headers also define
-`__STDC_VERSION_<NAME>_H__` as the standard says.
+The library's headers are in "The C library"; any other is `C1081`. The C23 headers
+also define `__STDC_VERSION_<NAME>_H__` as the standard says.
+
+| `<locale.h>`, `<time.h>` | all | The C library's ([`docs/c-text.md`](c-text.md)). |
+| `<wchar.h>`, `<wctype.h>` | C95 and later | The C library's ([`docs/c-text.md`](c-text.md)). |
+| `<inttypes.h>` | C99 and later | The C library's ([`docs/c-text.md`](c-text.md)). |
+| `<uchar.h>` | C11 and later | The C library's ([`docs/c-text.md`](c-text.md)). |
+
+Every other header is `C1081`. C23 (4p7) also asks a
+freestanding implementation for most of `<string.h>` and some functions of `<stdlib.h>`
+(and `<fenv.h>` and `<math.h>` if it claims Annex F). These are a library's, and the
+compiler does not provide them. The C23 headers also define `__STDC_VERSION_<NAME>_H__`
+as the standard says.
 
 ## Not supported
 
@@ -495,7 +689,9 @@ if it claims Annex F; those are not provided. The C23 headers also define
   constants: each is `C3901` (a decimal constant is `C1019`).
 - `<threads.h>` (`__STDC_NO_THREADS__`). Thread-local objects and atomics work with the
   threads a program has (see "Atomics and threads").
-- The library but `<string.h>`, and Annex F, `<fenv.h>` and `<math.h>`: exception flags and rounding modes.
+- `<math.h>` and `<fenv.h>`, and Annex F (exception flags and rounding modes). Annex K is
+  not provided (`__STDC_LIB_EXT1__` is not defined).
+- `setjmp` on WebAssembly (`C3300`).
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
   and `__asm__`, `__int128`, `__typeof__` (and `typeof` before C23), statement
@@ -584,7 +780,7 @@ C4052 and is ignored.
 | `error("m")`, `warning("m")` | functions | A call is error C3091, or warning C4123. |
 | `fallthrough` | an attribute statement | As `[[fallthrough]]`. |
 | `gnu_inline` | functions | GNU89's inline semantics (below) in a later dialect. |
-| `constructor`, `constructor(p)`, `destructor`, `destructor(p)` | functions without parameters | Called by the program's start-up before `main` (lowest priority first; without one, 65535; then in the order defined), and after `main` returns (highest priority first, the last defined first). A program that ends otherwise (calling `exit`) does not run the destructors, and an object without `main` (`--emit=obj`), or a program whose `main` is Axiom's, runs neither. |
+| `constructor`, `constructor(p)`, `destructor`, `destructor(p)` | functions without parameters | Called by the program's start-up before `main` (lowest priority first; without one, 65535; then in the order defined), and after `main` returns (highest priority first, the last defined first). `exit` (the C library's) runs the destructors too, after the `atexit` functions, once; a program whose `main` is Axiom's runs the constructors before it and the destructors when it returns; an object without `main` (`--emit=obj`), and a freestanding program that ends by calling the system's `exit`, run neither, or no destructors. |
 | `cleanup(f)` | automatic objects | `f(&object)` when its scope is left: the end of its block, `break`, `continue`, `goto` out, `return` (after the value is computed), the end of a statement expression; innermost first. A jump into its scope is C3083. |
 | `transparent_union` | unions (and their typedefs) | A parameter of the type takes an argument of any member's type (or a null pointer constant, or a pointer to void for a pointer member). It is passed as the union is (the platform ABIs pass a union of one pointer or integer as that member). |
 | `mode(m)` | integer objects, members, typedefs | The integer type of m's width with the declared type's signedness: QI, HI, SI, DI, `byte`, `word`, `pointer` (also `__QI__` ...); TI (128 bits) is C3901. |
@@ -674,14 +870,16 @@ Programs should not use them.
 | `__axiom_cmul_f32`, `__axiom_cdiv_f64`, ... | The compiler's own functions for complex multiplication and division (internal to the program). |
 | `__axiom_int64` | A keyword for a 64-bit integer type (`unsigned __axiom_int64` too) in every mode, for `size_t` in headers before C99 and for programs that need one in C89. |
 | `__AXIOM_...`, `__axiom_...` | Macros and members of the headers. |
+| `__axc_...`, `__AXC_...` | The C library's internal names (`__axc_setjmp`, `__axc_errno`, ...), and its private headers `axc/*.h`. |
 
 ## Programs
 
 A C program's `main` is called by a start-up module of the runtime, which the build adds.
 It gives `main` its arguments (`argv[argc]` is null) and uses its result as the exit
-status. On Windows the start-up calls the C library's `exit` with `main`'s value, which
-flushes the library's streams and runs its `atexit` functions; elsewhere the system's
-own start-up ends the process (on WebAssembly, the host).
+status: it calls the C library's `exit` with `main`'s value ("Start-up and exit"),
+which runs the `atexit` functions; a freestanding program's start-up does so on
+Windows (with `msvcrt.dll`'s), and elsewhere the system's own start-up ends the process
+(on WebAssembly, the host).
 
 A program that defines `memcpy`, `memset` and `memmove` itself builds for every target.
 Names that the runtime uses for its own functions (such as `ax_write`) cannot be
@@ -896,8 +1094,8 @@ complete a stack trace is after a crash.
 These are the places where the implementation does not follow the standard it claims, or
 claims less than the standard allows. None is hidden: each is said above or here.
 
-- The implementation is freestanding (`__STDC_HOSTED__` is 0), and misses the part of
-  `<stdlib.h>` that C23 4p7 asks a freestanding one for.
+- The implementation is hosted (`__STDC_HOSTED__` is 1) without `<math.h>`, `<fenv.h>`
+  and `<threads.h>`: see "Not supported".
 - Annex F is not claimed. The floating types have IEC 60559 formats (`FLT_IS_IEC_60559`
   in `<float.h>`), but there are no exception flags or rounding modes; signaling NaNs are
   not guaranteed to stay signaling, so `<float.h>` has no `FLT_SNAN`.
@@ -920,5 +1118,6 @@ claims less than the standard allows. None is hidden: each is said above or here
   program with `--link=` (above); the C sources build with it instead. There are no
   static archives of the compiler's own objects.
 - In a GNU dialect: `__int128` and the `_FloatN` types are not supported; the
-  destructors run only when `main` returns; an alias is another name in its unit only; the
+  destructors run when `main` returns and from the library's `exit`, not when the
+  process ends otherwise (`_Exit`, `quick_exit`, a signal); an alias is another name in its unit only; the
   attribute `section` places only data, and only in ELF objects.

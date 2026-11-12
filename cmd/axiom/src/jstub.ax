@@ -1,0 +1,138 @@
+// =============================================================================
+// jstub.ax - C's setjmp and longjmp (std/c/include/setjmp.h), as a few
+// lines of machine code per platform, which every native linker adds to a
+// program (lstub.ax for Linux; mlink.ax and plink.ax): C code cannot save
+// and restore the registers that a call keeps.
+//
+//   __axc_setjmp(env) int      saves the registers the platform's calling
+//                              convention says a call keeps, the stack
+//                              pointer after the return and the return
+//                              address in env (a jmp_buf: 32 words); 0
+//   longjmp(env, val)          restores them and returns from that
+//                              __axc_setjmp call again, with val (1 if val
+//                              is 0: C 7.13.2.1p4)
+//
+// The layout of env is this file's own (only these two functions read it):
+//   x86-64 System V  rbx, rbp, r12..r15, the stack pointer, the return address
+//   x86-64 Windows   rbx, rbp, rdi, rsi, r12..r15, the stack pointer, the
+//                    return address, MXCSR (at 80), the x87 control word (84),
+//                    xmm6..xmm15 (96..256); the Windows x64 convention keeps all
+//   AArch64          x19..x28, x29 (frame), x30 (link: the return address),
+//                    the stack pointer (96), d8..d15 (104..168), as AAPCS64
+//                    keeps them (and on macOS; x18 is the platform's and is
+//                    not touched)
+//
+// longjmp does not unwind: on Windows no handlers run in the frames it
+// leaves, as on the other systems. The compiler treats a function calling
+// __axc_setjmp as one where it returns twice (c/cgen_expr.ax: ir.Func's
+// returns_twice). Both are weak: a program's own definitions win.
+// =============================================================================
+import "elf.ax" as elf;
+
+/// Are `name`'s the functions this file defines (on every native target)?
+pub fn provides(name: []u8) bool {
+    return str_eq(name, "__axc_setjmp") or str_eq(name, "longjmp");
+}
+
+fn str_eq(a: []u8, b: []u8) bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn func(o: *mut elf.Obj, text: i32, name: []u8) void {
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    s.data.align(16);
+    _ = elf.add_sym(o, elf.Sym.{ name: name, sec: text, value: @as(u64, s.data.len()), size: 0, bind: elf.B_WEAK,
+                                 ty: elf.T_FUNC, hidden: false });
+}
+
+fn bytes(o: *mut elf.Obj, text: i32, b: []u8) void {
+    o.secs.get(@as(usize, @bit_cast(u32, text))).data.put(b);
+}
+
+fn words(o: *mut elf.Obj, text: i32, ws: []u32) void {
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    for w in ws {
+        s.data.u32_(@as(u64, w));
+    }
+}
+
+/// Adds the functions to section `text` of o, for `machine` (and the
+/// Windows x64 convention when `windows`).
+pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
+    if (machine == elf.EM_X86_64) and windows {
+        func(o, text, "__axc_setjmp");
+        // mov [rcx+0..56], rbx rbp rdi rsi r12 r13 r14 r15
+        bytes(o, text, "\x48\x89\x19\x48\x89\x69\x08\x48\x89\x79\x10\x48\x89\x71\x18");
+        bytes(o, text, "\x4c\x89\x61\x20\x4c\x89\x69\x28\x4c\x89\x71\x30\x4c\x89\x79\x38");
+        // lea rdx, [rsp+8]; mov [rcx+64], rdx; mov rdx, [rsp]; mov [rcx+72], rdx
+        bytes(o, text, "\x48\x8d\x54\x24\x08\x48\x89\x51\x40\x48\x8b\x14\x24\x48\x89\x51\x48");
+        // stmxcsr [rcx+80]; fnstcw [rcx+84]
+        bytes(o, text, "\x0f\xae\x59\x50\xd9\x79\x54");
+        // movups [rcx+96..240], xmm6..xmm15
+        bytes(o, text, "\x0f\x11\x71\x60\x0f\x11\x79\x70");
+        bytes(o, text, "\x44\x0f\x11\x81\x80\x00\x00\x00\x44\x0f\x11\x89\x90\x00\x00\x00");
+        bytes(o, text, "\x44\x0f\x11\x91\xa0\x00\x00\x00\x44\x0f\x11\x99\xb0\x00\x00\x00");
+        bytes(o, text, "\x44\x0f\x11\xa1\xc0\x00\x00\x00\x44\x0f\x11\xa9\xd0\x00\x00\x00");
+        bytes(o, text, "\x44\x0f\x11\xb1\xe0\x00\x00\x00\x44\x0f\x11\xb9\xf0\x00\x00\x00");
+        bytes(o, text, "\x31\xc0\xc3");  // xor eax, eax; ret
+        func(o, text, "longjmp");
+        // mov eax, edx; test eax, eax; jnz 1f; mov eax, 1; 1:
+        bytes(o, text, "\x89\xd0\x85\xc0\x75\x05\xb8\x01\x00\x00\x00");
+        bytes(o, text, "\x48\x8b\x19\x48\x8b\x69\x08\x48\x8b\x79\x10\x48\x8b\x71\x18");
+        bytes(o, text, "\x4c\x8b\x61\x20\x4c\x8b\x69\x28\x4c\x8b\x71\x30\x4c\x8b\x79\x38");
+        // ldmxcsr [rcx+80]; fldcw [rcx+84]
+        bytes(o, text, "\x0f\xae\x51\x50\xd9\x69\x54");
+        bytes(o, text, "\x0f\x10\x71\x60\x0f\x10\x79\x70");
+        bytes(o, text, "\x44\x0f\x10\x81\x80\x00\x00\x00\x44\x0f\x10\x89\x90\x00\x00\x00");
+        bytes(o, text, "\x44\x0f\x10\x91\xa0\x00\x00\x00\x44\x0f\x10\x99\xb0\x00\x00\x00");
+        bytes(o, text, "\x44\x0f\x10\xa1\xc0\x00\x00\x00\x44\x0f\x10\xa9\xd0\x00\x00\x00");
+        bytes(o, text, "\x44\x0f\x10\xb1\xe0\x00\x00\x00\x44\x0f\x10\xb9\xf0\x00\x00\x00");
+        // mov rsp, [rcx+64]; jmp [rcx+72]
+        bytes(o, text, "\x48\x8b\x61\x40\xff\x61\x48");
+        return;
+    }
+    if machine == elf.EM_X86_64 {
+        func(o, text, "__axc_setjmp");
+        // mov [rdi+0..40], rbx rbp r12 r13 r14 r15
+        bytes(o, text, "\x48\x89\x1f\x48\x89\x6f\x08\x4c\x89\x67\x10\x4c\x89\x6f\x18\x4c\x89\x77\x20\x4c\x89\x7f\x28");
+        // lea rdx, [rsp+8]; mov [rdi+48], rdx; mov rdx, [rsp]; mov [rdi+56], rdx
+        bytes(o, text, "\x48\x8d\x54\x24\x08\x48\x89\x57\x30\x48\x8b\x14\x24\x48\x89\x57\x38");
+        bytes(o, text, "\x31\xc0\xc3");  // xor eax, eax; ret
+        func(o, text, "longjmp");
+        // mov eax, esi; test eax, eax; jnz 1f; mov eax, 1; 1:
+        bytes(o, text, "\x89\xf0\x85\xc0\x75\x05\xb8\x01\x00\x00\x00");
+        bytes(o, text, "\x48\x8b\x1f\x48\x8b\x6f\x08\x4c\x8b\x67\x10\x4c\x8b\x6f\x18\x4c\x8b\x77\x20\x4c\x8b\x7f\x28");
+        // mov rsp, [rdi+48]; jmp [rdi+56]
+        bytes(o, text, "\x48\x8b\x67\x30\xff\x67\x38");
+        return;
+    }
+    // AArch64 (Linux and macOS)
+    func(o, text, "__axc_setjmp");
+    // stp x19..x30 pairs at [x0, 0..80]; mov x16, sp; str x16, [x0, 96];
+    // stp d8..d15 pairs at [x0, 104..152]; mov w0, 0; ret
+    let sj: [14]u32 = [0xA9005013, 0xA9015815, 0xA9026017, 0xA9036819, 0xA904701B, 0xA905781D, 0x910003F0, 0xF9003010,
+                       0x6D06A408, 0x6D07AC0A, 0x6D08B40C, 0x6D09BC0E, 0x52800000, 0xD65F03C0];
+    words(o, text, sj[..]);
+    func(o, text, "longjmp");
+    // ldp the same; ldr x16, [x0, 96]; mov sp, x16; cmp w1, 0;
+    // csinc w0, w1, wzr, ne (val, or 1); ret (to x30, the saved return address)
+    let lj: [15]u32 = [0xA9405013, 0xA9415815, 0xA9426017, 0xA9436819, 0xA944701B, 0xA945781D, 0xF9403010, 0x9100021F,
+                       0x6D46A408, 0x6D47AC0A, 0x6D48B40C, 0x6D49BC0E, 0x7100003F, 0x1A9F1420, 0xD65F03C0];
+    words(o, text, lj[..]);
+}
+
+/// An object with the functions alone (for mlink.ax and plink.ax).
+pub fn build(machine: u32, windows: bool) *mut elf.Obj {
+    let o = elf.new_obj(machine);
+    let text = elf.add_sec(o, ".text.axiom.setjmp", elf.S_TEXT, 16);
+    add(o, text, machine, windows);
+    return o;
+}

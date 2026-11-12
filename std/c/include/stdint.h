@@ -157,48 +157,7 @@ typedef __AXIOM_UINTMAX_TYPE__ uintmax_t;
 #define SIG_ATOMIC_MAX 9223372036854775807
 #endif
 
-#if __AXIOM_WCHAR_WIDTH__ == 16
-#if __AXIOM_WCHAR_SIGNED__
-#define WCHAR_MIN (-32767 - 1)
-#define WCHAR_MAX 32767
-#elif __AXIOM_INT_WIDTH__ == 16
-#define WCHAR_MIN 0U
-#define WCHAR_MAX 65535U
-#else
-#define WCHAR_MIN 0
-#define WCHAR_MAX 65535
-#endif
-#define __AXIOM_WCHAR_BITS 16
-#elif __AXIOM_INT_WIDTH__ == 64
-/* (wchar_t is int: there is no 32-bit type) */
-#if __AXIOM_WCHAR_SIGNED__
-#define WCHAR_MIN (-9223372036854775807 - 1)
-#define WCHAR_MAX 9223372036854775807
-#else
-#define WCHAR_MIN 0U
-#define WCHAR_MAX 18446744073709551615U
-#endif
-#define __AXIOM_WCHAR_BITS 64
-#elif __AXIOM_LONG_WIDTH__ == 64 && __AXIOM_INT_WIDTH__ == 16
-/* (wchar_t is long: there is no 32-bit type) */
-#if __AXIOM_WCHAR_SIGNED__
-#define WCHAR_MIN (-9223372036854775807L - 1)
-#define WCHAR_MAX 9223372036854775807L
-#else
-#define WCHAR_MIN 0UL
-#define WCHAR_MAX 18446744073709551615UL
-#endif
-#define __AXIOM_WCHAR_BITS 64
-#else
-#if __AXIOM_WCHAR_SIGNED__
-#define WCHAR_MIN INT32_MIN
-#define WCHAR_MAX INT32_MAX
-#else
-#define WCHAR_MIN UINT32_C(0)
-#define WCHAR_MAX UINT32_MAX
-#endif
-#define __AXIOM_WCHAR_BITS 32
-#endif
+#include <axc/wchar_limits.h>
 /* wint_t (<wchar.h>): as the platform has it */
 #define WINT_MIN __AXIOM_WINT_MIN__
 #define WINT_MAX __AXIOM_WINT_MAX__

@@ -1,6 +1,6 @@
 typedef unsigned long long size_t;
-typedef long long ptrdiff_t;
 typedef unsigned short wchar_t;
+typedef long long ptrdiff_t;
 typedef long double max_align_t;
 typedef __builtin_va_list va_list;
 typedef signed char int8_t;

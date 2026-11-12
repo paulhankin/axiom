@@ -1042,10 +1042,17 @@ fn start(cu: *mut cs.CUnit) void {
         av[1] = f.params[1];
         n = 2;
     }
-    call_ctors(true);
+    let runners = define_runners();
+    if runners {
+        call_runner(CTORS_FN);
+    }
     let r = ir.call(B, mf.ty, mf.val, av[0..n]);
     mark_call(r, func_sig(cu.main).plan);
-    call_ctors(false);
+    if runners and not program_exit {
+        // (a program without exit: the destructors when main returns; else
+        // exit runs them, through __axc_at_exit_dtors)
+        call_runner(DTORS_FN);
+    }
     _ = mt;
     let ib = cty.t_int.bits;
     let mut status = r;
@@ -1070,11 +1077,138 @@ fn start(cu: *mut cs.CUnit) void {
         if not program_exit {
             c_library_import("exit");
         }
-        let mut ea: [1]*mut ir.Value = [status];
-        _ = ir.call(B, ety, ef.val, ea[..]);
+        // (a C unit's exit takes an int of the build's width, --c-int)
+        let mut arg = status;
+        if ef.ty.params.len == 1 {
+            let pt = ef.ty.params[0];
+            if (pt.kind == ir.T_INT) and (pt.bits > 32) {
+                arg = ir.sext(B, status, pt);
+            } else if (pt.kind == ir.T_INT) and (pt.bits < 32) {
+                arg = ir.trunc(B, status, pt);
+            }
+        }
+        let mut ea: [1]*mut ir.Value = [arg];
+        _ = ir.call(B, ef.ty, ef.val, ea[..]);
     }
     ir.ret(B, status);
     F = u.nil.[FnState]();
+}
+
+// The runners of the constructors and destructors (define_runners).
+pub let CTORS_FN: []u8 = "__axiom_c_ctors";
+pub let DTORS_FN: []u8 = "__axiom_c_dtors";
+// exit's slot for the destructors (the hosted C library's, std/c/lib/core)
+let DTORS_HOOK: []u8 = "__axc_at_exit_dtors";
+
+fn call_runner(name: []u8) void {
+    let f = ir.get_function(M, name);
+    _ = ir.call(B, f.ty, f.val, u.nil_slice.[*mut ir.Value]());
+}
+
+/// Defines CTORS_FN and DTORS_FN if the program has constructors or
+/// destructors (true then). CTORS_FN calls the constructors, and gives exit
+/// the destructors where the C library has exit's slot for them
+/// (DTORS_HOOK), so that exit, the program's end however it comes, runs
+/// them after the atexit functions; DTORS_FN calls them, once.
+pub fn define_runners() bool {
+    if g_ctors.len == 0 {
+        return false;
+    }
+    if u.notnil(ir.get_function(M, CTORS_FN)) {
+        return true;
+    }
+    let saved_b = B;
+    let saved_f = F;
+    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
+    let df = ir.add_function(M, DTORS_FN, fty);
+    df.linkage = ir.LINK_INTERNAL;
+    let cf = ir.add_function(M, CTORS_FN, fty);
+    cf.linkage = ir.LINK_INTERNAL;
+    B = ir.new_builder();
+    // the destructors, once (exit's, or main's return)
+    let done = ir.add_global(M, T_i8, "axiom.c.dtors_done");
+    done.init = ir.cint(T_i8, 0);
+    done.linkage = ir.LINK_INTERNAL;
+    let dst = u.new.[FnState]();
+    dst.f = df;
+    F = dst;
+    let entry = new_block("entry");
+    let run = new_block("run");
+    let out = new_block("done");
+    at_end(entry);
+    let was = ir.load(B, T_i8, done.val);
+    ir.condbr(B, ir.icmp(B, ir.IntEQ, was, ir.cint(T_i8, 0)), run, out);
+    at_end(run);
+    _ = ir.store(B, ir.cint(T_i8, 1), done.val);
+    call_ctors(false);
+    ir.br(B, out);
+    at_end(out);
+    ir.ret_void(B);
+    let cst = u.new.[FnState]();
+    cst.f = cf;
+    F = cst;
+    at_end(new_block("entry"));
+    let hook = ir.get_global(M, DTORS_HOOK);
+    if u.notnil(hook) {
+        _ = ir.store(B, df.val, hook.val);
+    }
+    call_ctors(true);
+    ir.ret_void(B);
+    B = saved_b;
+    F = saved_f;
+    return true;
+}
+
+/// For a program whose main is the Axiom module's (main: its function):
+/// the C units' constructors before it, their destructors when it returns
+/// (and from exit, as for a C program: define_runners).
+pub fn wrap_axiom_main(m: *mut ir.Module, main: *mut ir.Func) void {
+    M = m;
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    init_types();
+    if not define_runners() or ir.is_decl(main) {
+        return;
+    }
+    let saved = B;
+    B = ir.new_builder();
+    let cf = ir.get_function(M, CTORS_FN);
+    let df = ir.get_function(M, DTORS_FN);
+    // a call before the first instruction, and one before each return
+    let mut b = main.first;
+    let tmp = ir.append_block(cf, "tmp");
+    ir.at_end(B, tmp);
+    let c0 = ir.call(B, cf.ty, cf.val, u.nil_slice.[*mut ir.Value]());
+    unlink_last(tmp);
+    ir.insert_before(main.first.first, c0);
+    while u.notnil(b) {
+        let mut v = b.first;
+        while u.notnil(v) {
+            if v.op == ir.OP_RET {
+                ir.at_end(B, tmp);
+                let c = ir.call(B, df.ty, df.val, u.nil_slice.[*mut ir.Value]());
+                unlink_last(tmp);
+                ir.insert_before(v, c);
+            }
+            v = v.next;
+        }
+        b = b.next;
+    }
+    ir.remove_block(tmp);
+    B = saved;
+}
+
+// Takes the last instruction out of block b (to put it elsewhere).
+fn unlink_last(b: *mut ir.Block) void {
+    let v = b.last;
+    b.last = v.prev;
+    if u.notnil(v.prev) {
+        v.prev.next = ir.vnil();
+    } else {
+        b.first = ir.vnil();
+    }
+    v.prev = ir.vnil();
 }
 
 fn ctor_key(s: *mut cast.CSym, ctor: bool) i64 {

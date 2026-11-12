@@ -7,36 +7,12 @@
 #define __STDC_VERSION_STDDEF_H__ 202311L
 #endif
 
-/* size_t and ptrdiff_t: the platform's types as wide as a pointer (the
-   compiler's macros: unsigned long and long, or on Windows unsigned long
-   long and long long) */
-#ifndef __AXIOM_SIZE_T_DEFINED
-#define __AXIOM_SIZE_T_DEFINED
-typedef __AXIOM_SIZE_TYPE__ size_t;
-#endif
+/* size_t and wchar_t (defined once with the other headers: axc/types.h),
+   ptrdiff_t: the platform's types (the compiler's macros) */
+#define __AXIOM_WANT_SIZE_T
+#define __AXIOM_WANT_WCHAR_T
+#include <axc/types.h>
 typedef __AXIOM_PTRDIFF_TYPE__ ptrdiff_t;
-
-/* wchar_t: as the literals L"..." are (16 or 32 bits: the narrowest type of
-   at least 32 when none has 32) */
-#if __AXIOM_WCHAR_WIDTH__ == 16
-#if __AXIOM_WCHAR_SIGNED__
-typedef short wchar_t;
-#else
-typedef unsigned short wchar_t;
-#endif
-#elif __AXIOM_INT_WIDTH__ == 32 || (__AXIOM_LONG_WIDTH__ != 32 && __AXIOM_INT_WIDTH__ >= 32)
-#if __AXIOM_WCHAR_SIGNED__
-typedef int wchar_t;
-#else
-typedef unsigned int wchar_t;
-#endif
-#else
-#if __AXIOM_WCHAR_SIGNED__
-typedef long wchar_t;
-#else
-typedef unsigned long wchar_t;
-#endif
-#endif
 
 #if __STDC_VERSION__ >= 201112L
 /* the platforms' choices: aligned to 16 bytes, or to 8 (Windows, macOS) */

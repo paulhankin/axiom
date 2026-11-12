@@ -97,7 +97,7 @@ accepted as if the mode allowed it (so that one use gives one message).
 | `C1071` | `#else`, `#elif` or `#endif` with no `#if`. |
 | `C1072` | `#else` or `#elif` after `#else`. |
 | `C1080` | `#include` or `#embed` with a header name in neither form, `"file"` or `<file>`. |
-| `C1081` | An include file or embedded resource that cannot be found or read, or one that is a directory. |
+| `C1081` | An include file or embedded resource that cannot be found or read, or one that is a directory; also a header of the C library (`<stdlib.h>`, ...) in a program built with `--c-freestanding`. |
 | `C1082` | `#include` nested too deeply (more than 200 files). |
 | `C1083` | An invalid `#embed` parameter: not an identifier, a repeated one, one with unbalanced parentheses, one without its parenthesized clause, a bad `limit`. |
 | `C1084` | An `#embed` parameter that no standard has. |
@@ -243,6 +243,8 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3065` | An external name defined by a C translation unit and by an Axiom `export fn` of the same program; a note points to the Axiom definition. |
 | `C3066` | A C translation unit defines `main` in a program whose root module is Axiom's (`axiom build main.ax x.c`), which has the program's `main`. |
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
+| `C3300` | A call of `setjmp` (`<setjmp.h>`) in a program for a WebAssembly target, which cannot return to a frame. Reported by `build`. |
+| `C3301` | The address of `setjmp`'s function (`__axc_setjmp`) taken: it can only be called, so that the compiler knows the function calling it. Reported by `build`. |
 | `C3901` | A feature that this implementation does not support: `_Imaginary` (the imaginary types), and (C23) the decimal floating types; in a GNU dialect inline assembly, `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), explicit register variables, `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
 
 ### The GNU dialects

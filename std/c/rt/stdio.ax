@@ -1,0 +1,215 @@
+// =============================================================================
+// std/c/rt/stdio.ax - the operating-system layer of the C library's
+// <stdio.h> (std/c/lib/stdio/): files as the host ABI has them (std/io,
+// std/os/fs), under reserved C names (__axc_sys_*), for every target.
+//
+// The functions take C strings (NUL-terminated) and return the host ABI's
+// codes: a negative result is a failure, -2 not found, -13 access denied,
+// -17 already exists, -20 not a directory, -21 is a directory, -1 anything
+// else (std/README.md, "Host ABI"); the C side turns them into errno values.
+// Each is generated only when the C library reaches it.
+// =============================================================================
+
+import "../../crypto/random.ax" as random;
+import "../../mem.ax" as mem;
+import "../../os.ax" as os;
+import "../../os/fs.ax" as fs;
+
+import host "axiom" {
+    fn ax_write(fd: i32, p: *u8, n: usize) isize;
+    fn ax_read(fd: i32, p: *mut u8, n: usize) isize;
+    fn ax_open(path: *u8, len: usize, flags: u32) i32;
+    fn ax_close(fd: i32) void;
+    fn ax_seek(fd: i32, off: i64, whence: u32) i64;
+    fn ax_remove(path: *u8, len: usize, dir: u32) i32;
+    fn ax_rename(from: *u8, flen: usize, to: *u8, tlen: usize) i32;
+    fn ax_isatty(fd: i32) i32;
+    fn ax_os() i32;
+}
+
+// The length of the C string s.
+fn cstr_len(s: *u8) usize {
+    let mut n: usize = 0;
+    while @slice_from_ptr(s, n + 1)[n] != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+/// Opens the file named by the C string path: flags as ax_open's (0 read,
+/// 1 write created or truncated, 2 append, 3 read and write, 4 read and
+/// write created or truncated, 5 read and append; 8 with 1 or 4: the file
+/// must not exist). Returns a descriptor or a negative code.
+export fn __axc_sys_open(path: *u8, flags: i64) i64 {
+    let n = cstr_len(path);
+    if n == 0 {
+        return -2;  // (no file has an empty name)
+    }
+    return @as(i64, ax_open(path, n, @truncate(u32, @bit_cast(u64, flags))));
+}
+
+/// Reads up to n bytes; the count (0 at the end of the file) or -1.
+export fn __axc_sys_read(fd: i64, p: *mut u8, n: u64) i64 {
+    return @as(i64, ax_read(@truncate(i32, fd), p, @int_cast(usize, n)));
+}
+
+/// Writes the n bytes at p, all of them unless a write fails; the count
+/// written, which is less than n after a failure.
+export fn __axc_sys_write(fd: i64, p: *u8, n64: u64) u64 {
+    let n = @int_cast(usize, n64);
+    let mut done: usize = 0;
+    while done < n {
+        let r = ax_write(@truncate(i32, fd), @ptr_from_int(*u8, @int_from_ptr(p) + done), n - done);
+        if r <= 0 {
+            break;
+        }
+        done += @as(usize, @bit_cast(usize, r));
+    }
+    return @as(u64, done);
+}
+
+/// Moves the file position (whence: 0 start, 1 current, 2 end); the new
+/// position, or a negative value.
+export fn __axc_sys_seek(fd: i64, off: i64, whence: i64) i64 {
+    return ax_seek(@truncate(i32, fd), off, @truncate(u32, @bit_cast(u64, whence)));
+}
+
+export fn __axc_sys_close(fd: i64) void {
+    ax_close(@truncate(i32, fd));
+}
+
+/// Removes a file, or an empty directory; 0 or a negative code.
+export fn __axc_sys_remove(path: *u8) i64 {
+    let n = cstr_len(path);
+    if n == 0 {
+        return -2;
+    }
+    let r = ax_remove(path, n, 0);
+    if (r == -21) or ((r < 0) and fs.is_dir(@slice_from_ptr(path, n))) {
+        return @as(i64, ax_remove(path, n, 1));
+    }
+    return @as(i64, r);
+}
+
+/// Renames a file (replacing a file of the new name); 0 or a negative code.
+export fn __axc_sys_rename(from: *u8, to: *u8) i64 {
+    let a = cstr_len(from);
+    let b = cstr_len(to);
+    if (a == 0) or (b == 0) {
+        return -2;
+    }
+    return @as(i64, ax_rename(from, a, to, b));
+}
+
+/// 1 if the descriptor is an interactive device (a terminal), else 0.
+export fn __axc_sys_isatty(fd: i64) i64 {
+    if ax_isatty(@truncate(i32, fd)) == 1 {
+        return 1;
+    }
+    return 0;
+}
+
+/// The operating system: 1 Linux, 2 macOS, 3 Windows, 0 another (or none).
+export fn __axc_sys_os() i64 {
+    return @as(i64, ax_os());
+}
+
+/// Fills p[0..n] with random bytes; 0, or -1 if the system has none.
+export fn __axc_sys_random(p: *mut u8, n: u64) i64 {
+    random.fill(@slice_from_ptr(p, @int_cast(usize, n))) catch {
+        return -1;
+    };
+    return 0;
+}
+
+/// Writes the directory for temporary files, with a separator after it and
+/// a NUL, into buf (cap bytes); the length without the NUL, or -1 if it
+/// does not fit or there is none.
+export fn __axc_sys_tmpdir(buf: *mut u8, cap64: u64) i64 {
+    let cap = @int_cast(usize, cap64);
+    let d = fs.temp_dir() catch {
+        return -1;
+    };
+    defer mem.free(d);
+    let mut n = d.len;
+    let mut sep: u8 = '/';
+    if os.is_windows() {
+        sep = '\\';
+    }
+    let need_sep = (n == 0) or ((d[n - 1] != '/') and (d[n - 1] != '\\'));
+    if (n + 2) > cap {
+        return -1;
+    }
+    let out = @slice_from_ptr(buf, cap);
+    @mem_copy(out[0..n], d);
+    if need_sep {
+        out[n] = sep;
+        n += 1;
+    }
+    out[n] = 0;
+    return @as(i64, @bit_cast(isize, n));
+}
+
+/// Locks the lock word at p (0 unlocked; its low 32 bits, the targets
+/// being little-endian): a futex-style lock, as std/sync's Mutex (0
+/// unlocked, 1 locked, 2 locked with waiters), which waits in the system
+/// when contended.
+export fn __axc_sys_lock(p: *mut u64) void {
+    let w = @ptr_cast(*mut u32, p);
+    let mut s = @atomic_cas(w, 0, 1);
+    if s == 0 {
+        return;
+    }
+    if s != 2 {
+        s = @atomic_xchg(w, 2);
+    }
+    while s != 0 {
+        _ = @atomic_wait(@ptr_cast(*u32, w), 2, -1);
+        s = @atomic_xchg(w, 2);
+    }
+}
+
+export fn __axc_sys_unlock(p: *mut u64) void {
+    let w = @ptr_cast(*mut u32, p);
+    if @atomic_sub(w, 1) != 1 {
+        @atomic_store(w, 0);
+        _ = @atomic_notify(@ptr_cast(*u32, w), 1);
+    }
+}
+
+/// Copies n bytes from src to dst (which do not overlap).
+export fn __axc_sys_copy(dst: *mut u8, src: *u8, n: u64) void {
+    let k = @int_cast(usize, n);
+    if k > 0 {
+        @mem_copy(@slice_from_ptr(dst, k), @slice_from_ptr(src, k));
+    }
+}
+
+/// 1 once a thread has been started (std/mem), else 0: until then the
+/// streams need no lock.
+export fn __axc_sys_threaded() i64 {
+    if mem.threads_enabled() {
+        return 1;
+    }
+    return 0;
+}
+
+/// Ends the process with the status, through the runtime (std/os.exit).
+export fn __axc_sys_exit(status: i64) void {
+    os.exit(@truncate(i32, status));
+}
+
+/// n bytes from the Axiom allocator (std/mem), or null.
+export fn __axc_sys_alloc(n: u64) *mut u8 {
+    let s = mem.alloc.[u8](@int_cast(usize, n)) catch {
+        return @ptr_from_int(*mut u8, 0);
+    };
+    return s.ptr;
+}
+
+/// Frees what __axc_sys_alloc(n) returned.
+export fn __axc_sys_free(p: *mut u8, n: u64) void {
+    if @int_from_ptr(p) != 0 {
+        mem.free(@slice_from_ptr(p, @int_cast(usize, n)));
+    }
+}

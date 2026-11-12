@@ -66,6 +66,7 @@ pub extern "C" {
     fn ExitProcess(code: u32) void;
     fn TerminateProcess(h: usize, code: u32) i32;
     fn GetCurrentProcess() usize;
+    fn GetProcessTimes(h: usize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) i32;
     fn GetCurrentProcessId() u32;
     fn CreateProcessW(app: *u16, cmd: *mut u16, psa: *void, tsa: *void, inherit: i32, flags: u32, env: *void, cwd: *u16,
                       si: *u8, pi: *mut u8) i32;
@@ -480,14 +481,24 @@ export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
     }
     let mut access = GENERIC_READ;
     let mut disp = OPEN_EXISTING;
-    if flags == 1 {
+    let base = flags & 7;
+    if base == 1 {
         access = GENERIC_WRITE;
         disp = CREATE_ALWAYS;
-    } else if flags == 2 {
+    } else if base == 2 {
         access = 0x0010_0004;  // FILE_APPEND_DATA | SYNCHRONIZE: every write at the end
         disp = OPEN_ALWAYS;
-    } else if flags == 3 {
+    } else if base == 3 {
         access = GENERIC_READ | GENERIC_WRITE;
+    } else if base == 4 {
+        access = GENERIC_READ | GENERIC_WRITE;
+        disp = CREATE_ALWAYS;
+    } else if base == 5 {
+        access = GENERIC_READ | 0x0010_0004;  // reads anywhere, writes at the end
+        disp = OPEN_ALWAYS;
+    }
+    if ((flags & 8) != 0) and ((base == 1) or (base == 4)) {
+        disp = 1;  // CREATE_NEW: the file must not exist
     }
     let h = CreateFileW(&w[0], access, SHARE_ALL, @ptr_from_int(*void, 0), disp, FA_NORMAL, 0);
     if h == INVALID {
@@ -3147,8 +3158,17 @@ export fn ax_random(p: *mut u8, n: usize) i32 {
 
 let mut qpc_freq: i64 = 0;
 
-// Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+// Nanoseconds on clock 0 (real time since 1970), 1 (monotonic) or 2 (the
+// processor time of the process: kernel and user, in units of 100 ns).
 export fn ax_clock_ns(clock: u32) i64 {
+    if clock == 2 {
+        let mut c: u64 = 0;
+        let mut e: u64 = 0;
+        let mut k: u64 = 0;
+        let mut u: u64 = 0;
+        _ = GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u);
+        return @bit_cast(i64, (k + u) * 100);
+    }
     if clock == 1 {
         if qpc_freq == 0 {
             let mut f: i64 = 0;

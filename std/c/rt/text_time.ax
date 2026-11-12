@@ -1,0 +1,163 @@
+// =============================================================================
+// std/c/rt/text_time.ax - the clocks and the local time zone of the C
+// library's <time.h> (std/c/lib/text/), from the runtime's clocks and the
+// standard library's time zones (std/time/tz).
+//
+// The local zone is std/time/tz's Zone.local(): $TZ (a zone name, a TZif
+// file or a POSIX rule), else /etc/localtime, else UTC. It is read the
+// first time a C function needs it and kept for the rest of the program,
+// by every thread.
+// =============================================================================
+
+import "std/mem" as mem;
+import "std/time/tz" as tz;
+
+import host "axiom" {
+    fn ax_clock_ns(clock: u32) i64;
+}
+
+// 0 not read, 1 being read, 2 read (zone_addr is the Zone's address)
+let mut zone_state: u32 = 0;
+let mut zone_addr: usize = 0;
+
+fn read_zone() void {
+    let z = mem.alloc.[tz.Zone](1) catch {
+        return;
+    };
+    z[0] = tz.Zone.local() catch tz.Zone.utc();
+    @atomic_store(&mut zone_addr, @int_from_ptr(z.ptr));
+}
+
+// The local zone; null if there was no memory to read it (then local time
+// is UTC).
+fn zone() *mut tz.Zone {
+    if @atomic_load(&zone_state) != 2 {
+        if @atomic_cas(&mut zone_state, 0, 1) == 0 {
+            read_zone();
+            @atomic_store(&mut zone_state, 2);
+            _ = @atomic_notify(&zone_state, 0xFFFF_FFFF);
+        } else {
+            while @atomic_load(&zone_state) != 2 {
+                _ = @atomic_wait(&zone_state, 1, -1);
+            }
+        }
+    }
+    return @ptr_from_int(*mut tz.Zone, @atomic_load(&zone_addr));
+}
+
+/// Nanoseconds on the runtime's clock 0 (real time since 1970), 1
+/// (monotonic) or 2 (the processor time of the process).
+export fn __axc_clock_ns(clock: u64) i64 {
+    return ax_clock_ns(@truncate(u32, clock));
+}
+
+/// The resolution in nanoseconds of the same clocks: what the system's
+/// interface to each gives (100 ns on Windows, whose clocks count in that
+/// unit; microseconds for the real time and the processor time on macOS
+/// and WebAssembly's host).
+export fn __axc_clock_res(clock: u64) i64 {
+    if @target_os("windows") {
+        return 100;
+    }
+    if (clock != 1) and (@target_os("macos") or @target_os("none")) {
+        return 1000;
+    }
+    return 1;
+}
+
+/// What the local zone says of the instant t (seconds since 1970): its
+/// offset east of UTC in seconds into *off, 1 into *dst if daylight saving
+/// time is in force (else 0), and its abbreviation into abbr (at most cap
+/// bytes with the null one; nothing if cap is 0).
+export fn __axc_tz_info(t: i64, off: *mut i64, dst: *mut i64, abbr: *mut u8, cap: usize) void {
+    let z = zone();
+    if @int_from_ptr(z) == 0 {
+        off.* = 0;
+        dst.* = 0;
+        put(abbr, cap, "UTC");
+        return;
+    }
+    let i = z.lookup(t);
+    off.* = @as(i64, i.offset);
+    dst.* = 0;
+    if i.is_dst {
+        dst.* = 1;
+    }
+    put(abbr, cap, i.abbrev);
+}
+
+fn put(p: *mut u8, cap: usize, s: []u8) void {
+    if cap == 0 {
+        return;
+    }
+    let out = @slice_from_ptr(p, cap);
+    let n = @min(s.len, cap - 1);
+    for k in 0..n {
+        out[k] = s[k];
+    }
+    out[n] = 0;
+}
+
+/// The instant whose local time is l (seconds since 1970 of the local
+/// calendar), as mktime reads it (C17 7.27.2.3; POSIX: tm_isdst "causes
+/// mktime to presume initially" that daylight saving time is or is not in
+/// effect): isdst > 0 asks for a time of daylight saving time, 0 for one of
+/// standard time, < 0 for whichever is in force. Of the instants with that
+/// local time (none in a gap, two in a repeated hour), the one of the kind
+/// asked for. Else l read with the offset of that kind in force nearest to
+/// it (within a year: a summer time given as standard time is read with
+/// the winter's offset); where there is none, an hour from the offset in
+/// force, daylight saving time being taken as an hour ahead of standard
+/// time. With no kind asked for, the first instant, or in a gap l read
+/// with the offset before the change (so the time is moved forward by the
+/// gap's length).
+export fn __axc_tz_from_local(l: i64, isdst: i64) i64 {
+    let z = zone();
+    if @int_from_ptr(z) == 0 {
+        return l;
+    }
+    let near: [3]tz.Info = [z.lookup(l - 86400), z.lookup(l), z.lookup(l + 86400)];
+    let mut first: i64 = 0;
+    let mut have = false;
+    for k in @as(usize, 0)..3 {
+        let o = @as(i64, near[k].offset);
+        let t = l - o;
+        let at = z.lookup(t);
+        if @as(i64, at.offset) != o {
+            continue;
+        }
+        if (isdst >= 0) and (at.is_dst == (isdst > 0)) {
+            return t;
+        }
+        if not have or (t < first) {
+            first = t;
+            have = true;
+        }
+    }
+    if isdst >= 0 {
+        let want = isdst > 0;
+        for d in @as(i64, 1)..367 {
+            let a = z.lookup(l - (d * 86400));
+            if a.is_dst == want {
+                return l - @as(i64, a.offset);
+            }
+            let b = z.lookup(l + (d * 86400));
+            if b.is_dst == want {
+                return l - @as(i64, b.offset);
+            }
+        }
+    }
+    let mut t = l - @as(i64, near[0].offset);
+    if have {
+        t = first;
+    }
+    if isdst >= 0 {
+        let now = z.lookup(t).is_dst;
+        if (isdst > 0) and not now {
+            t -= 3600;
+        } else if (isdst == 0) and now {
+            t += 3600;
+        }
+    }
+    return t;
+}

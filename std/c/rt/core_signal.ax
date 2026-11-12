@@ -1,0 +1,211 @@
+// =============================================================================
+// std/c/rt/core_signal.ax - the system's part of C's <signal.h>
+// (std/c/lib/core/signal.c, raise.c): the library's signal numbers are
+// Linux's (SIGINT 2, SIGILL 4, SIGABRT 6, SIGFPE 8, SIGSEGV 11, SIGTERM 15),
+// which macOS shares.
+//
+//   __axc_os_signal(sig, action)   the system's action for sig: 0 its
+//                                  default, 1 ignore, 2 call
+//                                  __axc_sig_deliver(sig) (C's handler)
+//   __axc_os_raise(sig)            sends sig to the calling thread
+//
+// Linux: rt_sigaction through the runtime's system call stub (ax_syscall;
+// the return trampoline ax_sigreturn on x86-64, the kernel's on AArch64),
+// with SA_SIGINFO, SA_RESTART and SA_ONSTACK (on the runtime's signal stack
+// where the thread has one), the signal itself blocked while its handler
+// runs; raise is tgkill. The first change of a signal saves the action
+// before it, which the default (SIG_DFL) puts back: so SIGSEGV, SIGFPE and
+// SIGILL go back to the runtime's crash report.
+// macOS: libSystem's sigaction (SA_SIGINFO 0x40, SA_ONSTACK 1, SA_RESTART
+// 2) and pthread_kill; the same saving.
+// Windows: SIGINT is the console's Ctrl-C and Ctrl-Break, through a console
+// control handler (which the system calls on a thread of its own); the
+// others are only raise's (-1: the C side calls the handler at once). The
+// processor's faults stay the crash reporter's.
+// WebAssembly: none (-1).
+// =============================================================================
+
+extern "C" {
+    fn __axc_sig_deliver(sig: i64) void;  // (no int crosses: core.ax)
+    // Linux (lstub.ax)
+    fn ax_syscall(n: isize, a: isize, b: isize, c: isize, d: isize, e: isize, f: isize) isize;
+    fn ax_sigreturn() void;
+    // macOS (libSystem)
+    fn sigaction(sig: i32, act: *void, old: *mut void) i32;
+    fn pthread_kill(t: usize, sig: i32) i32;
+    fn pthread_self() usize;
+    // Windows (kernel32)
+    fn SetConsoleCtrlHandler(handler: fn(u32) i32, add: i32) i32;
+}
+
+// The kernel's struct sigaction on Linux (not the C library's).
+struct LinuxAction {
+    handler: usize,
+    flags: u64,
+    restorer: usize,
+    mask: u64,
+}
+
+struct LinuxActionFn {
+    handler: fn(i32, *mut void, *mut void) void,
+    flags: u64,
+    restorer: fn() void,
+    mask: u64,
+}
+
+// macOS's struct sigaction.
+struct DarwinAction {
+    handler: usize,
+    mask: u32,
+    flags: i32,
+}
+
+struct DarwinActionFn {
+    handler: fn(i32, *mut void, *mut void) void,
+    mask: u32,
+    flags: i32,
+}
+
+// the actions before the library's first change, per signal
+let mut saved_linux: [32]LinuxAction = [LinuxAction.{ handler: 0, flags: 0, restorer: 0, mask: 0 }; 32];
+let mut saved_darwin: [32]DarwinAction = [DarwinAction.{ handler: 0, mask: 0, flags: 0 }; 32];
+let mut saved: [32]bool = [false; 32];
+// Windows: SIGINT's action (0 default, 1 ignore, 2 deliver), and whether
+// the console handler is set
+let mut ctrl_action: i32 = 0;
+let mut ctrl_set: bool = false;
+
+fn on_signal(sig: i32, si: *mut void, uc: *mut void) void {
+    _ = si;
+    _ = uc;
+    __axc_sig_deliver(@as(i64, sig));
+}
+
+fn on_ctrl(ev: u32) i32 {
+    if ev > 1 {
+        return 0;  // (not Ctrl-C or Ctrl-Break: the next handler's)
+    }
+    if ctrl_action == 2 {
+        __axc_sig_deliver(2);
+        return 1;
+    }
+    return @as(i32, ctrl_action == 1);
+}
+
+fn linux_sigaction(sig: i32, act: usize, old: usize) isize {
+    let mut n: isize = 13;  // x86-64
+    if @target_arch("aarch64") {
+        n = 134;
+    }
+    return ax_syscall(n, @as(isize, sig), @bit_cast(isize, act), @bit_cast(isize, old), 8, 0, 0);
+}
+
+fn linux_signal(sig: i32, action: i32) i32 {
+    let k = @as(usize, @bit_cast(u32, sig));
+    if not saved[k] {
+        if linux_sigaction(sig, 0, @int_from_ptr(&mut saved_linux[k])) < 0 {
+            return -2;
+        }
+        saved[k] = true;
+    }
+    let mut r: isize = 0;
+    if action == 2 {
+        // SA_SIGINFO | SA_ONSTACK | SA_RESTART (| SA_RESTORER on x86-64)
+        let mut flags: u64 = 0x0000_0004 | 0x0800_0000 | 0x1000_0000;
+        if @target_arch("x86_64") {
+            flags |= 0x0400_0000;
+        }
+        let sa = LinuxActionFn.{ handler: on_signal, flags: flags, restorer: ax_sigreturn, mask: 0 };
+        r = linux_sigaction(sig, @int_from_ptr(&sa), 0);
+    } else if action == 1 {
+        let sa = LinuxAction.{ handler: 1, flags: 0, restorer: 0, mask: 0 };
+        r = linux_sigaction(sig, @int_from_ptr(&sa), 0);
+    } else {
+        let sa = saved_linux[k];
+        r = linux_sigaction(sig, @int_from_ptr(&sa), 0);
+    }
+    if r < 0 {
+        return -2;
+    }
+    return 0;
+}
+
+fn darwin_signal(sig: i32, action: i32) i32 {
+    let k = @as(usize, @bit_cast(u32, sig));
+    if not saved[k] {
+        if sigaction(sig, @ptr_from_int(*void, 0), @ptr_cast(*mut void, &mut saved_darwin[k])) != 0 {
+            return -2;
+        }
+        saved[k] = true;
+    }
+    let mut r: i32 = 0;
+    if action == 2 {
+        let sa = DarwinActionFn.{ handler: on_signal, mask: 0, flags: 0x40 | 0x1 | 0x2 };
+        r = sigaction(sig, @ptr_cast(*void, &sa), @ptr_from_int(*mut void, 0));
+    } else if action == 1 {
+        let sa = DarwinAction.{ handler: 1, mask: 0, flags: 0 };
+        r = sigaction(sig, @ptr_cast(*void, &sa), @ptr_from_int(*mut void, 0));
+    } else {
+        let sa = saved_darwin[k];
+        r = sigaction(sig, @ptr_cast(*void, &sa), @ptr_from_int(*mut void, 0));
+    }
+    if r != 0 {
+        return -2;
+    }
+    return 0;
+}
+
+/// Sets the system's action for the library's signal sig (one of the six;
+/// signal.c checks): 0 default, 1 ignore, 2 deliver to __axc_sig_deliver.
+/// 0, -1 where the system has no such signal (only raise delivers it), or
+/// -2 if the system refused.
+export fn __axc_os_signal(sig64: i64, action64: i64) i64 {
+    let sig = @truncate(i32, sig64);
+    let action = @truncate(i32, action64);
+    if @target_os("linux") {
+        return @as(i64, linux_signal(sig, action));
+    }
+    if @target_os("macos") {
+        return @as(i64, darwin_signal(sig, action));
+    }
+    if @target_os("windows") {
+        if sig != 2 {
+            return -1;
+        }
+        ctrl_action = action;
+        if not ctrl_set {
+            if SetConsoleCtrlHandler(on_ctrl, 1) == 0 {
+                return -2;
+            }
+            ctrl_set = true;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+/// Sends the library's signal sig to the calling thread through the system:
+/// 0 (its handler has returned, or its action was taken), or -1 where the
+/// system has no such signal.
+export fn __axc_os_raise(sig64: i64) i64 {
+    let sig = @truncate(i32, sig64);
+    if @target_os("linux") {
+        let mut nr: [3]isize = [39, 186, 234];  // getpid, gettid, tgkill (x86-64)
+        if @target_arch("aarch64") {
+            nr = [172, 178, 131];
+        }
+        let pid = ax_syscall(nr[0], 0, 0, 0, 0, 0, 0);
+        let tid = ax_syscall(nr[1], 0, 0, 0, 0, 0, 0);
+        if ax_syscall(nr[2], pid, tid, @as(isize, sig), 0, 0, 0) < 0 {
+            return -1;
+        }
+        return 0;
+    }
+    if @target_os("macos") {
+        if pthread_kill(pthread_self(), sig) != 0 {
+            return -1;
+        }
+        return 0;
+    }
+    return -1;
+}

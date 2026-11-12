@@ -62,15 +62,15 @@ pub extern "C" {
     fn munmap(addr: *mut void, len: usize) i32;
     fn mprotect(addr: *mut void, len: usize, prot: i32) i32;
     fn msync(addr: *mut void, len: usize, flags: i32) i32;
-    fn getenv(name: *u8) *u8;
+    fn __axiom_libc_getenv(name: *u8) *u8;
     fn setenv(name: *u8, value: *u8, overwrite: i32) i32;
     fn unsetenv(name: *u8) i32;
     fn _NSGetEnviron() *mut *mut *mut u8;
-    fn exit(code: i32) void;
+    fn __axiom_libc_exit(code: i32) void;
     fn getpid() i32;
     fn fork() i32;
     fn kill(pid: i32, sig: i32) i32;
-    fn raise(sig: i32) i32;
+    fn __axiom_libc_raise(sig: i32) i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) i32;
     fn pipe(fds: *mut i32) i32;
     fn posix_spawn(pid: *mut i32, path: *u8, fa: *usize, attr: *usize, argv: *mut *mut u8, envp: *mut *mut u8) i32;
@@ -88,9 +88,9 @@ pub extern "C" {
     fn sigaltstack(ss: *StackT, old: *mut StackT) i32;
     fn setitimer(which: i32, value: *void, old: *mut void) i32;
     fn setrlimit(resource: i32, rl: *void) i32;
-    fn malloc(n: usize) *mut void;
-    fn calloc(n: usize, size: usize) *mut void;
-    fn free(p: *mut void) void;
+    fn __axiom_libc_malloc(n: usize) *mut void;
+    fn __axiom_libc_calloc(n: usize, size: usize) *mut void;
+    fn __axiom_libc_free(p: *mut void) void;
     fn posix_memalign(p: *mut *mut void, align: usize, size: usize) i32;
     fn sysconf(name: i32) isize;
     fn sysctlbyname(name: *u8, old: *mut void, oldlen: *mut usize, new: *void, newlen: usize) i32;
@@ -206,6 +206,7 @@ const O_WRONLY: i32 = 1;
 const O_RDWR: i32 = 2;
 const O_APPEND: i32 = 0x8;
 const O_NOFOLLOW: i32 = 0x100;
+const O_EXCL: i32 = 0x800;
 const O_CREAT: i32 = 0x200;
 const O_TRUNC: i32 = 0x400;
 const O_EVTONLY: i32 = 0x8000;
@@ -365,12 +366,20 @@ export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
         return AX_ERR;
     }
     let mut f: i32 = 0;  // O_RDONLY
-    if flags == 1 {
+    let base = flags & 7;
+    if base == 1 {
         f = (O_WRONLY | O_CREAT) | O_TRUNC;
-    } else if flags == 2 {
+    } else if base == 2 {
         f = (O_WRONLY | O_CREAT) | O_APPEND;
-    } else if flags == 3 {
+    } else if base == 3 {
         f = O_RDWR;
+    } else if base == 4 {
+        f = (O_RDWR | O_CREAT) | O_TRUNC;
+    } else if base == 5 {
+        f = (O_RDWR | O_CREAT) | O_APPEND;
+    }
+    if (flags & 8) != 0 {
+        f = f | O_EXCL;  // the file must not exist
     }
     let fd = open(&buf[0], f | O_CLOEXEC, @as(i32, 0o644));
     if fd >= 0 {
@@ -382,6 +391,9 @@ export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
     }
     if e == EACCES {
         return -13;
+    }
+    if e == EEXIST {
+        return -17;
     }
     if e == EISDIR {
         return -21;
@@ -684,7 +696,7 @@ export fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
     if not copy_cstr(k[..], name, len) {
         return -2;
     }
-    let v = getenv(&k[0]);
+    let v = __axiom_libc_getenv(&k[0]);
     if @int_from_ptr(v) == 0 {
         return -2;
     }
@@ -697,7 +709,7 @@ export fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize {
 
 export fn ax_exit(code: i32) void {
     ax_rt_fini();
-    exit(code);
+    __axiom_libc_exit(code);
 }
 
 // -----------------------------------------------------------------------------
@@ -748,12 +760,12 @@ export fn ax_setenv(k: *u8, kn: usize, v: *u8, vn: usize) i32 {
     if not env_name_ok(@slice_from_ptr(k, kn)) or not copy_cstr(name[..], k, kn) {
         return AX_ERR;
     }
-    let value = @ptr_cast(*mut u8, malloc(vn + 1));
+    let value = @ptr_cast(*mut u8, __axiom_libc_malloc(vn + 1));
     if @int_from_ptr(value) == 0 {
         return AX_ERR;
     }
     if not copy_cstr(@slice_from_ptr(value, vn + 1), v, vn) {
-        free(@ptr_cast(*mut void, value));
+        __axiom_libc_free(@ptr_cast(*mut void, value));
         return AX_ERR;
     }
     // unsetenv removes every entry for the name (the initial environment can
@@ -762,7 +774,7 @@ export fn ax_setenv(k: *u8, kn: usize, v: *u8, vn: usize) i32 {
     if r == 0 {
         r = setenv(&name[0], value, 1);
     }
-    free(@ptr_cast(*mut void, value));
+    __axiom_libc_free(@ptr_cast(*mut void, value));
     if r == 0 {
         return 0;
     }
@@ -860,7 +872,7 @@ fn starts_with(p: *u8, prefix: []u8) bool {
 // /dev/null; it is replaced by the pipe's handle, or -1.
 export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
     // a copy that ends in a NUL (the directory's terminator)
-    let sp = @ptr_cast(*mut u8, malloc(len + 1));
+    let sp = @ptr_cast(*mut u8, __axiom_libc_malloc(len + 1));
     if @int_from_ptr(sp) == 0 {
         return AX_ERR;
     }
@@ -870,7 +882,7 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
     let body = s[0..len];
     let modes = @slice_from_ptr(stdio, 3);
     let argc = count_list(body, 0);
-    let argv = @ptr_cast(*mut *mut u8, calloc(argc + 1, 8));
+    let argv = @ptr_cast(*mut *mut u8, __axiom_libc_calloc(argc + 1, 8));
     // the environment starts after argv's list
     let mut i: usize = 0;
     for _k in 0..argc {
@@ -882,7 +894,7 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
     i += 1;
     let env_at = i;
     let envc = count_list(body, env_at);
-    let envp = @ptr_cast(*mut *mut u8, calloc(envc + 1, 8));
+    let envp = @ptr_cast(*mut *mut u8, __axiom_libc_calloc(envc + 1, 8));
     let cwd_at = split_list(body, env_at, envp, sp);
     _ = split_list(body, 0, argv, sp);
     let mut result: i32 = AX_ERR;
@@ -1016,9 +1028,9 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
     }
     _ = posix_spawn_file_actions_destroy(&mut fa);
     _ = posix_spawnattr_destroy(&mut attr);
-    free(@ptr_cast(*mut void, argv));
-    free(@ptr_cast(*mut void, envp));
-    free(@ptr_cast(*mut void, sp));
+    __axiom_libc_free(@ptr_cast(*mut void, argv));
+    __axiom_libc_free(@ptr_cast(*mut void, envp));
+    __axiom_libc_free(@ptr_cast(*mut void, sp));
     return result;
 }
 
@@ -1815,12 +1827,12 @@ fn went_name(e: *WEnt) []u8 {
 // A larger copy of an array of n items of size sz (the old one freed);
 // 0 if there is no memory.
 fn grow(p: usize, n: usize, sz: usize, cap: usize) usize {
-    let q = @int_from_ptr(calloc(cap, sz));
+    let q = @int_from_ptr(__axiom_libc_calloc(cap, sz));
     if (q != 0) and (n > 0) {
         @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, q), n * sz), @slice_from_ptr(@ptr_from_int(*u8, p), n * sz));
     }
     if (q != 0) and (p != 0) {
-        free(@ptr_from_int(*mut void, p));
+        __axiom_libc_free(@ptr_from_int(*mut void, p));
     }
     return q;
 }
@@ -1872,7 +1884,7 @@ fn ent_release(e: *mut WEnt) void {
         e.fd = -1;
     }
     if e.name != 0 {
-        free(@ptr_from_int(*mut void, e.name));
+        __axiom_libc_free(@ptr_from_int(*mut void, e.name));
     }
     e.name = 0;
     e.len = 0;
@@ -1900,7 +1912,7 @@ fn ent_add(w: *mut WDir, slot: usize, name: []u8, ty: u8) bool {
         }
         w.n += 1;
     }
-    let p = @int_from_ptr(malloc(name.len + 1));
+    let p = @int_from_ptr(__axiom_libc_malloc(name.len + 1));
     if p == 0 {
         return false;
     }
@@ -2019,10 +2031,10 @@ fn wdir_release(w: *mut WDir) void {
         ent_release(went(w, i));
     }
     if w.ents != 0 {
-        free(@ptr_from_int(*mut void, w.ents));
+        __axiom_libc_free(@ptr_from_int(*mut void, w.ents));
     }
     if w.path != 0 {
-        free(@ptr_from_int(*mut void, w.path));
+        __axiom_libc_free(@ptr_from_int(*mut void, w.path));
     }
     _ = close(w.fd);
     w.kq = -1;
@@ -2057,7 +2069,7 @@ export fn ax_watch_add(h: i32, path: *u8, len: usize) i32 {
         return AX_ERR;
     }
     let mode = @as(u32, st[4]) | (@as(u32, st[5]) << 8);  // st_mode (u16) at 4
-    let pc = @int_from_ptr(malloc(len + 1));
+    let pc = @int_from_ptr(__axiom_libc_malloc(len + 1));
     if pc == 0 {
         _ = close(fd);
         return AX_ERR;
@@ -2077,7 +2089,7 @@ export fn ax_watch_add(h: i32, path: *u8, len: usize) i32 {
             let q = grow(wdirs, nwdirs, @size_of(WDir), nc);
             if q == 0 {
                 unlock_watches();
-                free(@ptr_from_int(*mut void, pc));
+                __axiom_libc_free(@ptr_from_int(*mut void, pc));
                 _ = close(fd);
                 return AX_ERR;
             }
@@ -2309,7 +2321,7 @@ export fn ax_term_raw(fd: i32, enable: u32) i32 {
 let mut tls_key: u64 = 0;
 
 fn tls_free(p: *mut void) void {
-    free(p);
+    __axiom_libc_free(p);
 }
 
 // Gives the calling thread its block of thread-locals (a copy of the
@@ -2353,7 +2365,7 @@ fn thread_main(p: *mut void) *mut void {
     if not thread_setup() {
         let msg = "axiom: cannot set up a thread\n";
         _ = write(2, msg.ptr, msg.len);
-        exit(70);
+        __axiom_libc_exit(70);
     }
     if has_thread_hook {
         thread_hook(true);
@@ -2368,15 +2380,15 @@ fn thread_main(p: *mut void) *mut void {
     let off = StackT.{ sp: 0, size: 0, flags: 4 };  // SS_DISABLE
     let mut old = StackT.{ sp: 0, size: 0, flags: 0 };
     if sigaltstack(&off, &mut old) == 0 {
-        free(@ptr_from_int(*mut void, old.sp));
+        __axiom_libc_free(@ptr_from_int(*mut void, old.sp));
     }
-    free(p);
+    __axiom_libc_free(p);
     return vnull();
 }
 
 // stack_top is ignored: native threads get their stack from the system.
 export fn ax_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32 {
-    let st = @ptr_cast(*mut ThreadStart, malloc(@size_of(ThreadStart)));
+    let st = @ptr_cast(*mut ThreadStart, __axiom_libc_malloc(@size_of(ThreadStart)));
     if @int_from_ptr(st) == 0 {
         return AX_ERR;
     }
@@ -2390,7 +2402,7 @@ export fn ax_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: 
     let rc = pthread_create(&mut t, @ptr_cast(*void, ap), thread_main, @ptr_cast(*mut void, st));
     _ = pthread_attr_destroy(ap);
     if rc != 0 {
-        free(@ptr_cast(*mut void, st));
+        __axiom_libc_free(@ptr_cast(*mut void, st));
         return AX_ERR;
     }
     return @atomic_add(&mut next_thread_id, 1);
@@ -2457,7 +2469,8 @@ export fn ax_random(p: *mut u8, n: usize) i32 {
     return 0;
 }
 
-// Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+// Nanoseconds on clock 0 (real time since 1970), 1 (monotonic) or 2 (the
+// processor time of the process).
 export fn ax_clock_ns(clock: u32) i64 {
     if clock == 1 {
         // CLOCK_UPTIME_RAW (8), read in user space from the commpage, as nanoseconds (~8 ns,
@@ -2466,7 +2479,11 @@ export fn ax_clock_ns(clock: u32) i64 {
         return @bit_cast(i64, clock_gettime_nsec_np(8));
     }
     let mut ts = Timespec.{ sec: 0, nsec: 0 };
-    _ = clock_gettime(0, &mut ts);  // CLOCK_REALTIME
+    if clock == 2 {
+        _ = clock_gettime(12, &mut ts);  // CLOCK_PROCESS_CPUTIME_ID
+    } else {
+        _ = clock_gettime(0, &mut ts);  // CLOCK_REALTIME
+    }
     return (ts.sec * 1000000000) + ts.nsec;
 }
 
@@ -2670,7 +2687,7 @@ export fn ax_unavailable() void {
     tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
     write_all(2, o.text());
     flush_profile();
-    exit(134);
+    __axiom_libc_exit(134);
 }
 
 // Stack traces from frame pointers (trap_format.ax: walk_frames), within
@@ -2752,7 +2769,7 @@ fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
         crash_hook(@as(u64, code));
         let dfl = SigAction.{ handler: 0, mask: 0, flags: 0 };  // SIG_DFL
         _ = set_action(sig, @ptr_cast(*void, &dfl));
-        _ = raise(sig);
+        _ = __axiom_libc_raise(sig);
         return;
     }
     let mut o = tf.fmt(report[..]);
@@ -2776,12 +2793,12 @@ fn on_crash(sig: i32, si: *mut void, uc: *mut void) void {
     flush_profile();
     let sa = SigAction.{ handler: 0, mask: 0, flags: 0 };  // SIG_DFL
     _ = set_action(sig, @ptr_cast(*void, &sa));
-    _ = raise(sig);
+    _ = __axiom_libc_raise(sig);
 }
 
 // The calling thread's signal stack, for reporting its stack overflow.
 pub fn install_crash_stack() void {
-    let p = malloc(65536);
+    let p = __axiom_libc_malloc(65536);
     if @int_from_ptr(p) != 0 {
         let ss = StackT.{ sp: @int_from_ptr(p), size: 65536, flags: 0 };
         _ = sigaltstack(&ss, nil_ptr.[StackT]());
@@ -2797,13 +2814,13 @@ export fn ax_rt_args(argc: i32, argv: *mut *mut u8) void {
     if pthread_key_create(&mut tls_key, tls_free) != 0 {
         let msg = "axiom: cannot create a pthread key\n";
         _ = write(2, msg.ptr, msg.len);
-        exit(70);
+        __axiom_libc_exit(70);
     }
     ti.key_off = tls_key * 8;
     if not thread_setup() {
         let msg = "axiom: cannot set up the main thread\n";
         _ = write(2, msg.ptr, msg.len);
-        exit(70);
+        __axiom_libc_exit(70);
     }
 }
 

@@ -1,0 +1,816 @@
+/* scanfloat.c - the floating-point input of fscanf (C17 7.21.6.2p12: a
+   e f g, as strtod's subject sequence, 7.22.1.3): the scanner of the text
+   (from any source of characters, one character of look-ahead) and the
+   correctly rounded conversion of the number it read to binary32,
+   binary64, the x87 80-bit format or binary128.
+
+   The scanner keeps at most a format's number of significant digits and
+   whether any dropped digit was not zero: with enough digits (more than
+   any halfway point between two values of the format has), a dropped tail
+   is a 1 after them, which rounds the same way. The conversion is exact:
+   the decimal digits D and exponent E give D * 10^E; for E >= 0 that is an
+   integer, for E < 0 the quotient of D * 2^s by 10^-E is taken to more bits
+   than the format has, its remainder telling whether the value is above
+   the quotient; then the binary value is rounded once, half to even
+   (W. D. Clinger, "How to read floating point numbers accurately", PLDI
+   1990, for the method; the arithmetic here is plain long division). */
+#include "impl.h"
+
+/* (32-bit limbs and bit counts as long: valid with every --c-int) */
+typedef uint_least32_t limb;
+#define LOW32(x) ((limb)((x) & 0xffffffffUL))
+
+/* -------------------------------------------------------------------------
+   Big binary integers: 32-bit limbs, least significant first */
+
+struct bnum {
+    limb *l;
+    long n, cap;
+};
+
+static void bn_set(struct bnum *b, limb v) {
+    b->n = v != 0;
+    b->l[0] = v;
+}
+
+/* b = b * k + add */
+static int bn_muladd(struct bnum *b, limb k, limb add) {
+    unsigned __axiom_int64 c = add;
+    long i;
+    for (i = 0; i < b->n; i++) {
+        unsigned __axiom_int64 t = (unsigned __axiom_int64)b->l[i] * k + c;
+        b->l[i] = LOW32(t);
+        c = t >> 32;
+    }
+    if (c != 0) {
+        if (b->n >= b->cap)
+            return -1;
+        b->l[b->n++] = LOW32(c);
+    }
+    return 0;
+}
+
+/* b = b << s */
+static int bn_shl(struct bnum *b, long s) {
+    long w = s / 32, r = s % 32, i;
+    if (b->n == 0)
+        return 0;
+    if (b->n + w + 1 > b->cap)
+        return -1;
+    if (r != 0) {
+        b->l[b->n] = 0;
+        for (i = b->n; i > 0; i--)
+            b->l[i] = LOW32((b->l[i] << r) | (b->l[i - 1] >> (32 - r)));
+        b->l[0] = LOW32(b->l[0] << r);
+        b->n++;
+    }
+    if (w != 0) {
+        for (i = b->n - 1; i >= 0; i--)
+            b->l[i + w] = b->l[i];
+        for (i = 0; i < w; i++)
+            b->l[i] = 0;
+        b->n += w;
+    }
+    while (b->n > 0 && b->l[b->n - 1] == 0)
+        b->n--;
+    return 0;
+}
+
+static long bn_bits(const struct bnum *b) {
+    limb t;
+    long n;
+    if (b->n == 0)
+        return 0;
+    t = b->l[b->n - 1];
+    n = 32 * (b->n - 1);
+    while (t != 0) {
+        n++;
+        t >>= 1;
+    }
+    return n;
+}
+
+static int bn_bit(const struct bnum *b, long i) {
+    if (i < 0 || i / 32 >= b->n)
+        return 0;
+    return (int)((b->l[i / 32] >> (i % 32)) & 1);
+}
+
+/* Is any bit below i set? */
+static int bn_low_nonzero(const struct bnum *b, long i) {
+    long w = i / 32, k;
+    if (i <= 0)
+        return 0;
+    for (k = 0; k < w && k < b->n; k++) {
+        if (b->l[k] != 0)
+            return 1;
+    }
+    if (w < b->n && (i % 32) != 0 && (b->l[w] & (((limb)1 << (i % 32)) - 1)) != 0)
+        return 1;
+    return 0;
+}
+
+/* Limb i of t << s (s = 32 w + r) */
+static limb shifted_limb(const struct bnum *t, long w, long r, long i) {
+    long j = i - w;
+    limb lo, hi;
+    if (j < 0 || j > t->n)
+        return 0;
+    hi = j < t->n ? t->l[j] : 0;
+    if (r == 0)
+        return hi;
+    lo = j > 0 ? t->l[j - 1] : 0;
+    return LOW32((hi << r) | (lo >> (32 - r)));
+}
+
+/* a >= t << s ? */
+static int bn_ge_shifted(const struct bnum *a, const struct bnum *t, long s) {
+    long w = s / 32, r = s % 32, top = t->n + w + 1, i;
+    if (a->n > top)
+        return 1;
+    for (i = top - 1; i >= 0; i--) {
+        limb x = i < a->n ? a->l[i] : 0, y = shifted_limb(t, w, r, i);
+        if (x != y)
+            return x > y;
+    }
+    return 1;
+}
+
+/* a -= t << s (a >= t << s) */
+static void bn_sub_shifted(struct bnum *a, const struct bnum *t, long s) {
+    long w = s / 32, r = s % 32, i;
+    unsigned __axiom_int64 borrow = 0;
+    for (i = w; i < a->n; i++) {
+        unsigned __axiom_int64 y = (unsigned __axiom_int64)shifted_limb(t, w, r, i) + borrow;
+        unsigned __axiom_int64 x = a->l[i];
+        borrow = x < y;
+        a->l[i] = LOW32(x - y);
+    }
+    while (a->n > 0 && a->l[a->n - 1] == 0)
+        a->n--;
+}
+
+/* -------------------------------------------------------------------------
+   The formats */
+
+struct fmt {
+    int p;    /* significand bits, the leading one included */
+    int emin; /* the exponent of the smallest normal's leading bit */
+    int emax; /* the exponent of the largest finite value's leading bit */
+    int digits; /* significant digits that decide any rounding */
+};
+
+static const struct fmt F32 = {24, -126, 127, 120};
+static const struct fmt F64 = {53, -1022, 1023, 800};
+#if LDBL_MANT_DIG == 64
+static const struct fmt FLD = {64, -16382, 16383, 11600};
+#elif LDBL_MANT_DIG == 113
+static const struct fmt FLD = {113, -16382, 16383, 11600};
+#else
+#define FLD F64
+#endif
+
+/* The rounded result: m * 2^e (m < 2^p), or infinity */
+struct res {
+    unsigned __axiom_int64 hi, lo;
+    long e;
+    int inf, inexact;
+};
+
+/* Rounds q * 2^-s (plus a little more if sticky) to the format: half to
+   even, with the subnormal values below emin. */
+static void round_to(const struct fmt *f, const struct bnum *q, long s, int sticky, struct res *r) {
+    long nb = bn_bits(q), lead, keep, drop, i;
+    r->hi = r->lo = 0;
+    r->inf = 0;
+    r->inexact = sticky;
+    r->e = 0;
+    if (nb == 0)
+        return;
+    lead = nb - 1 - s;
+    if (lead > f->emax) {
+        r->inf = 1;
+        r->inexact = 1;
+        return;
+    }
+    keep = f->p;
+    if (lead < f->emin)
+        keep = f->p - (f->emin - lead);
+    drop = nb - keep;
+    if (drop <= 0) {
+        /* exact: q shifted up */
+        for (i = nb - 1; i >= 0; i--) {
+            long b = i - drop;
+            if (bn_bit(q, i)) {
+                if (b >= 64)
+                    r->hi |= (unsigned __axiom_int64)1 << (b - 64);
+                else
+                    r->lo |= (unsigned __axiom_int64)1 << b;
+            }
+        }
+        r->e = -s + drop;
+    } else {
+        int half = bn_bit(q, drop - 1), rest = sticky || bn_low_nonzero(q, drop - 1), up;
+        for (i = drop; i < nb; i++) {
+            long b = i - drop;
+            if (bn_bit(q, i)) {
+                if (b >= 64)
+                    r->hi |= (unsigned __axiom_int64)1 << (b - 64);
+                else
+                    r->lo |= (unsigned __axiom_int64)1 << b;
+            }
+        }
+        r->inexact = half || rest;
+        up = half && (rest || (r->lo & 1));
+        if (up) {
+            r->lo++;
+            if (r->lo == 0)
+                r->hi++;
+        }
+        r->e = -s + drop;
+        /* a carry to 2^keep: one more bit (for a subnormal, it may become
+           the smallest normal, which has the same exponent of its lsb) */
+        if (keep > 0 && ((keep >= 64 ? r->hi >> (keep - 64) : r->lo >> keep) & 1) && keep == f->p) {
+            r->lo = (r->lo >> 1) | (r->hi << 63);
+            r->hi >>= 1;
+            r->e++;
+        }
+    }
+    if (r->e + f->p - 1 > f->emax) {
+        r->inf = 1;
+        r->inexact = 1;
+    }
+}
+
+/* -------------------------------------------------------------------------
+   The scanned number */
+
+/* The decimal or hexadecimal number n to the format f; *range set when
+   the result overflows or underflows (is not normal and inexact). */
+static void convert(const struct fmt *f, struct __axc_num *n, struct res *r, int *range) {
+    limb store[3 * 140];
+    limb *heap = NULL;
+    size_t heapn = 0;
+    struct bnum q, t;
+    long s = 0, i, limbs;
+    int sticky = 0;
+    r->hi = r->lo = 0;
+    r->e = 0;
+    r->inf = 0;
+    r->inexact = 0;
+    *range = 0;
+    if (n->kind == 1) {
+        limb l[4];
+        q.l = l;
+        q.cap = 4;
+        q.n = 4;
+        l[0] = LOW32(n->mlo);
+        l[1] = LOW32(n->mlo >> 32);
+        l[2] = LOW32(n->mhi);
+        l[3] = LOW32(n->mhi >> 32);
+        while (q.n > 0 && q.l[q.n - 1] == 0)
+            q.n--;
+        if (q.n == 0)
+            return;
+        /* (an exponent far out of range: clamp it, keeping the result) */
+        if (n->bexp > 100000)
+            n->bexp = 100000;
+        if (n->bexp < -100000)
+            n->bexp = -100000;
+        round_to(f, &q, -n->bexp, n->sticky, r);
+        goto done;
+    }
+    if (n->nd == 0)
+        return;
+    /* out of range at once: above 10^(emax+1)log2.. or below the smallest
+       subnormal's half */
+    if (n->dexp > (long)(f->emax + 1) * 30103 / 100000 + 1) {
+        r->inf = 1;
+        *range = 1;
+        return;
+    }
+    if (n->dexp < (long)(f->emin - f->p) * 30103 / 100000 - 1) {
+        *range = 1;
+        return;
+    }
+    if (n->sticky) {
+        /* the dropped digits as a 1 after those kept */
+        n->d[n->nd++] = 1;
+    }
+    {
+        long e10 = n->dexp - n->nd;
+        /* sizes: D < 10^nd, 10^|e10|, and the quotient's bits */
+        long dbits = (long)n->nd * 3322 / 1000 + 2, tbits = (e10 < 0 ? -e10 : e10) * 3322 / 1000 + 2;
+        long need = (e10 >= 0 ? dbits + tbits : (dbits > tbits ? dbits : tbits) + f->p + 8) / 32 + 4;
+        limbs = need;
+        if (2 * limbs > (long)(sizeof store / sizeof store[0])) {
+            heapn = (size_t)2 * (size_t)limbs * sizeof(limb);
+            heap = __axc_sys_alloc(heapn);
+            if (heap == NULL) {
+                r->inf = 0;
+                *range = 1;
+                return;
+            }
+            q.l = heap;
+        } else {
+            q.l = store;
+        }
+        t.l = q.l + limbs;
+        q.cap = t.cap = limbs;
+        /* D, nine digits at a time */
+        bn_set(&q, 0);
+        for (i = 0; i < n->nd;) {
+            limb chunk = 0, mul = 1;
+            int k;
+            for (k = 0; k < 9 && i < n->nd; k++, i++) {
+                chunk = chunk * 10 + (limb)n->d[i];
+                mul *= 10;
+            }
+            bn_muladd(&q, mul, chunk);
+        }
+        if (e10 >= 0) {
+            for (; e10 >= 9; e10 -= 9)
+                bn_muladd(&q, 1000000000u, 0);
+            if (e10 > 0) {
+                limb p10 = 1;
+                while (e10-- > 0)
+                    p10 *= 10;
+                bn_muladd(&q, p10, 0);
+            }
+            round_to(f, &q, 0, 0, r);
+        } else {
+            /* T = 10^-e10; q = floor(D * 2^s / T), the remainder sticky */
+            long k = -e10;
+            struct bnum quo;
+            limb ql[6];
+            long db, tb, qb;
+            bn_set(&t, 1);
+            for (; k >= 9; k -= 9)
+                bn_muladd(&t, 1000000000u, 0);
+            if (k > 0) {
+                limb p10 = 1;
+                while (k-- > 0)
+                    p10 *= 10;
+                bn_muladd(&t, p10, 0);
+            }
+            db = bn_bits(&q);
+            tb = bn_bits(&t);
+            /* q = D * 2^s / T has p + 3 or p + 4 bits: for s < 0 (D far
+               above T), T * 2^-s is the divisor */
+            s = f->p + 3 - db + tb;
+            if (s >= 0)
+                bn_shl(&q, s);
+            else
+                bn_shl(&t, -s);
+            tb = bn_bits(&t);
+            /* the quotient has qb or qb - 1 bits */
+            qb = bn_bits(&q) - tb + 1;
+            quo.l = ql;
+            quo.cap = 6;
+            quo.n = 0;
+            for (i = 0; i < 6; i++)
+                ql[i] = 0;
+            for (i = qb - 1; i >= 0; i--) {
+                if (bn_ge_shifted(&q, &t, i)) {
+                    bn_sub_shifted(&q, &t, i);
+                    ql[i / 32] |= (limb)1 << (i % 32);
+                }
+            }
+            quo.n = 6;
+            while (quo.n > 0 && quo.l[quo.n - 1] == 0)
+                quo.n--;
+            sticky = q.n != 0;
+            round_to(f, &quo, s, sticky, r);
+        }
+    }
+    if (heap != NULL)
+        __axc_sys_free(heap, heapn);
+done:
+    /* (7.22.1.3p10: overflow; underflow when the result is not normal and
+       inexact, or zero) */
+    if (r->inf)
+        *range = 1;
+    else if (r->inexact && !((f->p > 64 ? r->hi >> (f->p - 1 - 64) : r->lo >> (f->p - 1)) & 1))
+        *range = 1;
+}
+
+/* -------------------------------------------------------------------------
+   The scanner */
+
+static int lower(int c) {
+    return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+}
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    c = lower(c);
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+/* Adds a decimal digit (point: after the point) */
+static void add_digit(struct __axc_num *n, int v, int point) {
+    if (v == 0 && n->nd == 0) {
+        /* leading zeros only move the point */
+        if (point)
+            n->dexp--;
+        return;
+    }
+    if (n->nd < n->cap - 1)
+        n->d[n->nd++] = (char)v;
+    else if (v != 0)
+        n->sticky = 1;
+    if (!point && n->dexp < 1000000000L)
+        n->dexp++;
+}
+
+/* Adds a hexadecimal digit */
+static void add_hex(struct __axc_num *n, int v, int point) {
+    if (v == 0 && n->mhi == 0 && n->mlo == 0) {
+        if (point)
+            n->bexp -= 4;
+        return;
+    }
+    if ((n->mhi >> 52) == 0) {
+        n->mhi = (n->mhi << 4) | (n->mlo >> 60);
+        n->mlo = (n->mlo << 4) | (unsigned)v;
+        if (point)
+            n->bexp -= 4;
+    } else {
+        if (v != 0)
+            n->sticky = 1;
+        if (!point)
+            n->bexp += 4;
+    }
+}
+
+/* Reads a number as strtod's subject sequence (7.22.1.3p3) from in, at
+   most width characters (width < 0: no limit), taking a character only
+   while what was taken is a prefix of a number (so that the character that
+   ends it is the only one given back, 7.21.6.2p9). *taken counts the
+   characters taken, *valid those of the longest prefix that is a whole
+   number (strtod's end), whose value n holds. 0 if no character was taken
+   for want of input (end of file), 1 otherwise. */
+int __axc_scan_num(struct __axc_in *in, long width, struct __axc_num *n, size_t *taken, size_t *valid) {
+    size_t t = 0;
+    int c, point = 0, digits = 0, i;
+    long save_dexp, save_bexp;
+    int save_nd;
+#define NEXT() ((width < 0 || (long)t < width) ? (c = in->get(in), c >= 0 ? (t++, 1) : 0) : (c = -1, 0))
+#define BACK() (in->unget(in, c), t--)
+    n->kind = 0;
+    n->neg = 0;
+    n->nd = 0;
+    n->sticky = 0;
+    n->dexp = 0;
+    n->mhi = n->mlo = 0;
+    n->bexp = 0;
+    *valid = 0;
+    if (!NEXT()) {
+        *taken = 0;
+        return 0;
+    }
+    if (c == '+' || c == '-') {
+        n->neg = c == '-';
+        if (!NEXT())
+            goto end;
+    }
+    if (lower(c) == 'i' || lower(c) == 'n') {
+        /* inf, infinity, nan, nan(n-char-sequence) */
+        const char *w = lower(c) == 'i' ? "infinity" : "nan";
+        n->kind = lower(c) == 'i' ? 2 : 3;
+        for (i = 1; w[i] != 0; i++) {
+            if (!NEXT())
+                goto end;
+            if (lower(c) != w[i]) {
+                BACK();
+                goto end;
+            }
+            if (i == 2)
+                *valid = t;
+        }
+        *valid = t;
+        if (n->kind == 3) {
+            if (!NEXT())
+                goto end;
+            if (c != '(') {
+                BACK();
+                goto end;
+            }
+            for (;;) {
+                if (!NEXT())
+                    goto end;
+                if (c == ')') {
+                    *valid = t;
+                    goto end;
+                }
+                if (!((c >= '0' && c <= '9') || (lower(c) >= 'a' && lower(c) <= 'z') || c == '_')) {
+                    BACK();
+                    goto end;
+                }
+            }
+        }
+        goto end;
+    }
+    if (c == '0') {
+        /* 0x: hexadecimal, if a digit follows */
+        digits = 1;
+        *valid = t;
+        if (!NEXT())
+            goto end;
+        if (lower(c) == 'x') {
+            int hd = 0;
+            n->kind = 1;
+            for (;;) {
+                if (!NEXT())
+                    break;
+                if (c == '.' && !point) {
+                    point = 1;
+                    continue;
+                }
+                if (hexval(c) < 0) {
+                    BACK();
+                    break;
+                }
+                hd = 1;
+                add_hex(n, hexval(c), point);
+                *valid = t;
+            }
+            if (!hd) {
+                /* "0x" alone: the number is the 0 */
+                n->kind = 0;
+                goto end;
+            }
+            /* the binary exponent: p, a sign, digits */
+            if (c != 'p' && c != 'P')
+                goto end;
+            if (!NEXT())
+                goto end;
+            if (c != 'p' && c != 'P') {
+                BACK();
+                goto end;
+            }
+            save_bexp = n->bexp;
+            {
+                int eneg = 0, ed = 0;
+                long ev = 0;
+                if (!NEXT())
+                    goto end;
+                if (c == '+' || c == '-') {
+                    eneg = c == '-';
+                    if (!NEXT())
+                        goto end;
+                }
+                while (c >= '0' && c <= '9') {
+                    ed = 1;
+                    if (ev < 100000000L)
+                        ev = ev * 10 + (c - '0');
+                    *valid = t;
+                    n->bexp = save_bexp + (eneg ? -ev : ev);
+                    if (!NEXT())
+                        goto end;
+                }
+                BACK();
+                (void)ed;
+            }
+            goto end;
+        }
+        BACK();
+        if (!NEXT())
+            goto end;
+    }
+    /* decimal digits, a point, digits */
+    for (;;) {
+        if (c >= '0' && c <= '9') {
+            digits = 1;
+            add_digit(n, c - '0', point);
+            *valid = t;
+        } else if (c == '.' && !point) {
+            point = 1;
+            if (digits)
+                *valid = t;
+        } else {
+            break;
+        }
+        if (!NEXT())
+            goto end;
+    }
+    if (!digits) {
+        BACK();
+        goto end;
+    }
+    if (c != 'e' && c != 'E') {
+        BACK();
+        goto end;
+    }
+    /* the exponent: e, a sign, digits */
+    save_dexp = n->dexp;
+    save_nd = n->nd;
+    (void)save_nd;
+    {
+        int eneg = 0;
+        long ev = 0;
+        if (!NEXT())
+            goto end;
+        if (c == '+' || c == '-') {
+            eneg = c == '-';
+            if (!NEXT())
+                goto end;
+        }
+        while (c >= '0' && c <= '9') {
+            if (ev < 100000000L)
+                ev = ev * 10 + (c - '0');
+            *valid = t;
+            n->dexp = save_dexp + (eneg ? -ev : ev);
+            if (!NEXT())
+                goto end;
+        }
+        BACK();
+    }
+end:
+    *taken = t;
+    return 1;
+#undef NEXT
+#undef BACK
+}
+
+/* The value of n (scanned) in each format */
+static void to_parts(const struct fmt *f, struct __axc_num *n, struct res *r, int *range) {
+    if (n->kind >= 2) {
+        r->inf = n->kind == 2;
+        r->hi = r->lo = 0;
+        r->e = 0;
+        *range = 0;
+        return;
+    }
+    convert(f, n, r, range);
+}
+
+double __axc_num_double(struct __axc_num *n, int *range) {
+    struct res r;
+    unsigned __axiom_int64 bits;
+    double x;
+    unsigned char *s = (unsigned char *)&bits, *d = (unsigned char *)&x;
+    int k;
+    /* exact cases (Clinger's fast path): up to 15 digits times or over an
+       exact power of ten round once */
+    if (n->kind == 0 && !n->sticky && n->nd <= 15 && n->nd > 0) {
+        long e10 = n->dexp - n->nd;
+        if (e10 >= -22 && e10 <= 22) {
+            static const double p10[23] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+                                           1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+            __axiom_int64 v = 0;
+            for (k = 0; k < n->nd; k++)
+                v = v * 10 + n->d[k];
+            x = (double)v;
+            x = e10 < 0 ? x / p10[-e10] : x * p10[e10];
+            *range = 0;
+            return n->neg ? -x : x;
+        }
+    }
+    to_parts(&F64, n, &r, range);
+    if (n->kind == 3)
+        bits = 0x7ff8000000000000ULL;
+    else if (r.inf)
+        bits = 0x7ff0000000000000ULL;
+    else if (r.lo >> 52)
+        bits = ((unsigned __axiom_int64)(r.e + 52 + 1023) << 52) | (r.lo & 0xfffffffffffffULL);
+    else
+        bits = r.lo; /* subnormal or zero */
+    if (n->neg)
+        bits |= 0x8000000000000000ULL;
+    for (k = 0; k < 8; k++)
+        d[k] = s[k];
+    return x;
+}
+
+float __axc_num_float(struct __axc_num *n, int *range) {
+    struct res r;
+    limb bits;
+    float x;
+    unsigned char *s = (unsigned char *)&bits, *d = (unsigned char *)&x;
+    int k;
+    to_parts(&F32, n, &r, range);
+    if (n->kind == 3)
+        bits = 0x7fc00000u;
+    else if (r.inf)
+        bits = 0x7f800000u;
+    else if (r.lo >> 23)
+        bits = ((limb)(r.e + 23 + 127) << 23) | ((limb)r.lo & 0x7fffffu);
+    else
+        bits = (limb)r.lo;
+    if (n->neg)
+        bits |= 0x80000000u;
+    for (k = 0; k < 4; k++)
+        d[k] = s[k];
+    return x;
+}
+
+long double __axc_num_long_double(struct __axc_num *n, int *range) {
+#if LDBL_MANT_DIG == 53
+    return __axc_num_double(n, range);
+#else
+    struct res r;
+    long double x = 0;
+    unsigned char *d = (unsigned char *)&x;
+    unsigned __axiom_int64 w0, w1;
+    int k;
+    to_parts(&FLD, n, &r, range);
+#if LDBL_MANT_DIG == 64
+    /* the explicit leading bit; exponent 0 for subnormals */
+    if (n->kind == 3) {
+        w0 = 0xc000000000000000ULL;
+        w1 = 0x7fff;
+    } else if (r.inf) {
+        w0 = 0x8000000000000000ULL;
+        w1 = 0x7fff;
+    } else {
+        w0 = r.lo;
+        w1 = (r.lo >> 63) ? (unsigned __axiom_int64)(r.e + 63 + 16383) : 0;
+    }
+    if (n->neg)
+        w1 |= 0x8000;
+#else
+    if (n->kind == 3) {
+        w0 = 0;
+        w1 = 0x7fff800000000000ULL;
+    } else if (r.inf) {
+        w0 = 0;
+        w1 = 0x7fff000000000000ULL;
+    } else {
+        w0 = r.lo;
+        w1 = r.hi & 0xffffffffffffULL;
+        if (r.hi >> 48)
+            w1 |= (unsigned __axiom_int64)(r.e + 112 + 16383) << 48;
+    }
+    if (n->neg)
+        w1 |= 0x8000000000000000ULL;
+#endif
+    for (k = 0; k < 8; k++) {
+        d[k] = (unsigned char)(w0 >> (8 * k));
+        d[8 + k] = (unsigned char)(w1 >> (8 * k));
+    }
+    return x;
+#endif
+}
+
+/* The digit room a conversion of each format needs (struct __axc_num.cap) */
+int __axc_num_digits(int ld) {
+    return ld ? FLD.digits + 2 : F64.digits + 2;
+}
+
+/* strtold's work (<stdlib.h>, C17 7.22.1.3): the longest initial part of s,
+   after white space, that is a subject sequence, in long double's format
+   (whichever it is: LDBL_MANT_DIG); *end after it (s if there is none),
+   *range when the result overflows or underflows. */
+static int text_get(struct __axc_in *i) {
+    return *i->s ? *i->s++ : -1;
+}
+
+static void text_unget(struct __axc_in *i, int c) {
+    (void)c;
+    i->s--;
+}
+
+long double __axc_strtold(const char *s, char **end, int *range) {
+    struct __axc_in in;
+    struct __axc_num n;
+    size_t taken, valid, cap = (size_t)__axc_num_digits(1);
+    const char *p = s;
+    char small[804];
+    long double v = 0;
+    *range = 0;
+    while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
+        p++;
+    in.get = text_get;
+    in.unget = text_unget;
+    in.count = 0;
+    in.f = NULL;
+    in.s = (const unsigned char *)p;
+    in.ws = NULL;
+    in.eof = in.error = 0;
+    in.c23 = 0;
+    n.d = small;
+    if (cap > sizeof small)
+        n.d = __axc_sys_alloc(cap);
+    if (n.d == NULL || cap <= sizeof small) {
+        /* (within binary64's digits: exact for it, and for wider formats
+           the halfway cases that have no more) */
+        n.d = small;
+        cap = sizeof small;
+    }
+    n.cap = (int)cap;
+    if (__axc_scan_num(&in, -1, &n, &taken, &valid) && valid > 0) {
+        v = __axc_num_long_double(&n, range);
+        p += valid;
+    } else {
+        p = s;
+    }
+    if (n.d != small)
+        __axc_sys_free(n.d, cap);
+    if (end != NULL)
+        *end = (char *)p;
+    return v;
+}

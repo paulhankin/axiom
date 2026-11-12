@@ -129,7 +129,10 @@ async function runWasm(file) {
   let mem;
   const dec = new TextDecoder();
   const line = (s) => { text += s + '\n'; };
+  // (a program that ends by calling exit, as a hosted C program does when
+  // main returns, ends this run alone: the host's exit throws WasmExit)
   const host = createHost({
+    exit: (code) => { throw new WasmExit(code); },
     write: (fd, bytes) => {
       if (fd === 1) {
         text += dec.decode(bytes);
@@ -156,10 +159,18 @@ async function runWasm(file) {
     (instance.exports.run || instance.exports.main)();
     return { out: lines(), trapped: false, stderr: errText };
   } catch (e) {
+    if (e instanceof WasmExit) return { out: lines(), trapped: false, stderr: errText };
     if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) return { out: lines(), trapped: true, msg: e.message, stderr: errText };
     throw e;
   } finally {
     host.close();
+  }
+}
+
+class WasmExit extends Error {
+  constructor(code) {
+    super(`exit ${code}`);
+    this.code = code;
   }
 }
 
@@ -417,8 +428,13 @@ const cRunTest = async (f) => {
   // (--units is for Axiom code: the suite run with it builds the C tests as always)
   const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
   if (native && noC) args.push(nativeTarget, path.join(root, 'cmd/axiom/internal/tests/c/host_c.c'));
-  else if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`);
+  // (host_native.c is the system C library's client: the program links that
+  // library, not the compiler's, whose names would take the place of its)
+  else if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`, '--c-freestanding');
   else if (process.env.AXIOM_C_TARGET && !flags.some((x) => x.startsWith('--target='))) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
+  // (the test host runs no wasm64 program that uses the runtime's host
+  // functions, as the C library's exit does: those tests are freestanding)
+  if (!native && (flags.includes('--target=wasm64') || (process.env.AXIOM_C_TARGET === 'wasm64' && !flags.some((x) => x.startsWith('--target='))))) args.push('--c-freestanding');
   const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
   if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
   let json = null;
@@ -500,6 +516,115 @@ const cMixTest = async (dir) => {
   return { problem: want === got.join('\n') ? null : `output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
 };
 await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true });
+
+// The hosted C library (docs/c.md, "The C library"): each
+// cmd/axiom/internal/tests/c/lib/<part>/*.c is a hosted C program, built
+// with the library (and c/mix/print.ax, which print.h declares, and the
+// files of its uses: directive) at the suite's optimization level for wasm32
+// (AXIOM_C_TARGET=wasm64: wasm64, built only), or with --native for the
+// machine, and run in a process of its own whose working directory is a
+// scratch directory. Directives, in // or /* */ comments: expect: <line>
+// (standard output, in order), expect-status: <n> (default 0),
+// expect-signal: <n> (the default action of signal n ends it),
+// expect-stderr: <text> (standard error has it), expect-error: <code> (the
+// build fails with it), flags:, native-only, wasm-only, linux-only
+// (natively on Linux), posix-only (natively on Linux or macOS); stdin:
+// <line> (the lines are the standard input, else it is empty);
+// merge-stderr (standard error goes to standard output's file, so that the
+// order of the two shows); check-only (only checked, with axiom check:
+// with expect-error: codes, it must fail with them).
+const cLibDir = path.join(root, 'cmd/axiom/internal/tests/c/lib');
+const cLibFiles = fs.existsSync(cLibDir) ? fs.readdirSync(cLibDir).filter((n) => fs.statSync(path.join(cLibDir, n)).isDirectory()).sort()
+  .flatMap((n) => cFilesIn(path.join(cLibDir, n))) : [];
+const cLibTest = async (f) => {
+  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+  const src = fs.readFileSync(f, 'utf8');
+  const dv = (name) => [...src.matchAll(new RegExp(`/\\* ${name}: ?(.*?) \\*/|// ${name}: ?(.*?)$`, 'gm'))].map((m) => m[1] ?? m[2]);
+  const has = (name) => new RegExp(`(?:// |/\\* )${name}\\b`, 'm').test(src);
+  const nt = process.env.AXIOM_NATIVE_TARGET || '';
+  if ((native && has('wasm-only')) || (!native && has('native-only'))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
+  if (has('linux-only') && (!native || /windows|macos|darwin/.test(nt) || process.platform !== 'linux')) return { skip: true, reason: 'Linux only' };
+  if (has('posix-only') && (!native || /windows/.test(nt))) return { skip: true, reason: 'Linux and macOS only' };
+  const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
+  const errors = dv('expect-error');
+  if (has('check-only')) {
+    const c = await spawnAsync(compiler, ['check', f, '--format=agent-json', ...flags], { encoding: 'utf8', timeout: compileTimeout });
+    if (!errors.length) return c.status === 0 ? null : `the check failed:\n${c.stdout}${c.stderr}`;
+    let codes = [];
+    try { codes = JSON.parse(c.stdout).diagnostics.filter((x) => x.severity === 'error').map((x) => x.code); } catch { codes = []; }
+    for (const e of errors) if (!codes.includes(e)) return `expected ${e}, got [${codes.join(', ')}]:\n${c.stdout}${c.stderr}`;
+    return null;
+  }
+  const status = dv('expect-status').length ? Number(dv('expect-status')[0]) : 0;
+  const rel = path.relative(cLibDir, f).replace(/[\/\\]/g, '-').replace(/\.c$/, '');
+  const out = path.join(tmp, `clib-${rel}${native ? '' : '.wasm'}`);
+  const uses = dv('uses').flatMap((x) => x.trim().split(/\s+/)).map((x) => path.resolve(path.dirname(f), x));
+  const args = ['build', f, path.join(root, 'cmd/axiom/internal/tests/c/mix/print.ax'), ...uses, '--format=agent-json',
+    `-I${path.join(root, 'cmd/axiom/internal/tests/c/mix')}`, '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
+  if (native) args.push(nativeTarget);
+  else if (process.env.AXIOM_C_TARGET && !flags.some((x) => x.startsWith('--target='))) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
+  const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
+  if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
+  if (errors.length) {
+    let codes = [];
+    try { codes = JSON.parse(c.stdout).diagnostics.filter((x) => x.severity === 'error').map((x) => x.code); } catch { codes = []; }
+    if (c.status === 0) return `expected errors ${errors.join(', ')}, but the build succeeded`;
+    for (const e of errors) if (!codes.includes(e)) return `expected ${e}, got [${codes.join(', ')}]:\n${c.stdout}${c.stderr}`;
+    return null;
+  }
+  if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+  // (the node host's CLI does not run std/io programs for wasm64: built only)
+  if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return null;
+  const cwd = path.join(tmp, `clib-${rel}.dir`);
+  fs.mkdirSync(cwd, { recursive: true });
+  const stdinLines = dv('stdin');
+  const input = stdinLines.length ? stdinLines.join('\n') + '\n' : '';
+  const merged = has('merge-stderr');
+  const outFile = path.join(cwd, 'out.txt'), errFile = path.join(cwd, 'err.txt');
+  const outFd = fs.openSync(outFile, 'w'), errFd = merged ? outFd : fs.openSync(errFile, 'w');
+  const [cmd, ...cargs] = native ? [...execWrap, out] : [process.execPath, path.join(root, 'std/internal/runtime/host.mjs'), out];
+  const r = await new Promise((resolve) => {
+    let p;
+    try { p = spawn(cmd, cargs, { cwd, stdio: ['pipe', outFd, errFd] }); } catch (e) { resolve({ status: null, error: e }); return; }
+    const timer = setTimeout(() => { p.kill('SIGTERM'); resolve({ status: null, timedOut: true }); }, runTimeout);
+    p.on('error', (e) => { clearTimeout(timer); resolve({ status: null, error: e }); });
+    p.on('close', (st, signal) => { clearTimeout(timer); resolve({ status: st, signal }); });
+    p.stdin.on('error', () => {});
+    p.stdin.end(input);
+  });
+  fs.closeSync(outFd);
+  if (!merged) fs.closeSync(errFd);
+  if (r.timedOut) return `timed out after ${runTimeout / 1000} s`;
+  const text = (file) => fs.readFileSync(file, 'utf8');
+  const got = text(outFile).split('\n').map((l) => l.replace(/\r$/, ''));
+  if (got[got.length - 1] === '') got.pop();
+  const stderr = merged ? '' : text(errFile);
+  const want = dv('expect');
+  // (expect-signal: <n>: on Linux and macOS the system's default action
+  // kills the process with signal n; elsewhere the library ends it with
+  // status 3 for SIGABRT, 128 + n for the others: std/c/include/signal.h)
+  const sig = dv('expect-signal').length ? Number(dv('expect-signal')[0]) : 0;
+  const names = { 2: 'SIGINT', 4: 'SIGILL', 6: 'SIGABRT', 8: 'SIGFPE', 11: 'SIGSEGV', 15: 'SIGTERM' };
+  if (sig && native && !/windows/.test(nt)) {
+    if (r.signal !== names[sig]) return { problem: `ended with status ${r.status} (signal ${r.signal}), expected signal ${names[sig]}; output:\n${got.join('\n')}`, stderr };
+  } else if (r.status !== (sig ? (sig === 6 ? 3 : 128 + sig) : status)) {
+    return { problem: `exit status ${r.status} (signal ${r.signal}), expected ${sig ? (sig === 6 ? 3 : 128 + sig) : status}; output:\n${got.join('\n')}`, stderr };
+  }
+  for (const t of dv('expect-stderr')) if (!stderr.includes(t)) return { problem: `no '${t}' in the program's stderr`, stderr };
+  return { problem: want.join('\n') === got.join('\n') ? null : `output mismatch\n--- expected\n${want.join('\n')}\n--- got\n${got.join('\n')}`, stderr: dv('expect-stderr').length ? '' : stderr };
+};
+await section('', byFile(cLibFiles, '[c-lib]', cLibTest), { parallel: true });
+// The C library's index (std/c/lib/index: which unit defines each name, for
+// loading the library on demand) is what cmd/internal/tools/gen_c_lib_index.mjs
+// writes from the sources.
+await section('', {
+  'C library: std/c/lib/index is current': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/internal/tools/gen_c_lib_index.mjs'), '--check'],
+      { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: compileTimeout });
+    return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
+  },
+});
 
 // The C driver (main.ax: c_option, c_options, check_c_options, build_c;
 // c/cc.ax): every option, several translation units, and the errors of

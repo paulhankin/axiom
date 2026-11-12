@@ -438,8 +438,11 @@ export function createHost(opts = {}) {
     },
     ax_open(p, n, flags) {
       try {
-        const fd = fs.openSync(str(p, n), ['r', 'w', 'a', 'r+'][flags] || 'r');
-        pos.set(fd, flags === 2 ? -1 : 0);  // appends go to the end
+        // (flags 4 and 5: w+ and a+; flag 8: the file must not exist)
+        const excl = (flags & 8) && [1, 4].includes(flags & 7);
+        const mode = excl ? ((flags & 7) === 1 ? 'wx' : 'wx+') : (['r', 'w', 'a', 'r+', 'w+', 'a+'][flags & 7] || 'r');
+        const fd = fs.openSync(str(p, n), mode);
+        pos.set(fd, (flags & 7) === 2 ? -1 : 0);  // appends go to the end
         return fd;
       } catch (e) {
         return fsErr(e);
@@ -574,7 +577,7 @@ export function createHost(opts = {}) {
       if (v === undefined) return -2;
       return give(Buffer.from(v, 'utf8'), out, cap);
     },
-    ax_exit(code) { process.exit(code); },
+    ax_exit(code) { (opts.exit || process.exit)(code); },  // (opts.exit: an embedder's, which must not return)
     ax_tcp_connect: (p, n, port) => net().call('connect', { host: str(p, n), port }),
     ax_tcp_listen: (p, n, port) => net().call('listen', { host: str(p, n), port }),
     ax_tcp_accept: (h) => net().call('accept', { h }),
@@ -831,9 +834,11 @@ export function createHost(opts = {}) {
       }
       return 0;
     },
-    // Nanoseconds on clock 0 (real time since 1970) or 1 (monotonic).
+    // Nanoseconds on clock 0 (real time since 1970), 1 (monotonic) or 2 (the
+    // processor time of the process, in microseconds).
     ax_clock_ns(clock) {
       if (clock === 1) return process.hrtime.bigint();
+      if (clock === 2) { const u = process.cpuUsage(); return BigInt(u.user + u.system) * 1000n; }
       return BigInt(Math.round((performance.timeOrigin + performance.now()) * 1000)) * 1000n;  // microseconds
     },
   };
