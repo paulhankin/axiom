@@ -1,0 +1,2895 @@
+// =============================================================================
+// asm/a64.ax - an AArch64 assembler: the GNU assembler's syntax for A64
+// (`op dst, src...`, registers x0-x30, w0-w30, sp, xzr; v0-v31 as b, h, s,
+// d, q or with an arrangement; immediates with or without '#'; addressing
+// [xn], [xn, #imm], [xn, #imm]!, [xn], #imm, [xn, xm, lsl #s], [xn, wm,
+// sxtw]; shifted and extended register operands; conditions; :lo12: and
+// :got: relocation operators), into instruction words, for inline assembly
+// and file-scope asm (asm/core.ax reads the text and does the passes).
+//
+// What it encodes (the Arm Architecture Reference Manual's A64 encodings,
+// written from its tables): the base integer instructions (arithmetic,
+// logic, moves of immediates, bit-fields, shifts, multiplies and divides,
+// conditional selects and compares, bit operations, CRC32), branches,
+// loads and stores of every addressing form (pairs, exclusives,
+// acquire/release, LSE atomics), system instructions (svc, brk, hints,
+// barriers, mrs, msr of named registers), scalar floating point (moves,
+// arithmetic, compares, conversions, rounding) and the common vector
+// instructions. Others are an error naming them.
+//
+// Relocations: b and bl to other symbols (R_AARCH64_JUMP26, _CALL26),
+// adrp (_ADR_PREL_PG_HI21; :got: _ADR_GOT_PAGE), :lo12: in add and in
+// loads and stores (_ADD_ABS_LO12_NC, _LDSTn_ABS_LO12_NC; :got_lo12:
+// _LD64_GOT_LO12_NC), .quad and .word of addresses.
+// =============================================================================
+import "../a64enc.ax" as ae;
+import "../elf.ax" as elf;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "core.ax" as cr;
+import "inline.ax" as ai;
+
+// Operand kinds
+const AK_NONE: u8 = 0;
+const AK_REG: u8 = 1;   // a general register (reg 31: sp or zr, as sp says)
+const AK_VREG: u8 = 2;  // a floating-point/vector register: view b h s d q, or v with an arrangement
+const AK_IMM: u8 = 3;
+const AK_MEM: u8 = 4;
+const AK_SHIFT: u8 = 5;  // lsl #n ..., uxtw #n ...
+const AK_EXPR: u8 = 6;   // a label or symbol (or a condition, or a name: barrier options, system registers)
+const AK_LIST: u8 = 7;   // {v0.16b, v1.16b}
+
+// shift and extend kinds (AOp.sh)
+const SH_LSL: u8 = 0;
+const SH_LSR: u8 = 1;
+const SH_ASR: u8 = 2;
+const SH_ROR: u8 = 3;
+const SH_UXTB: u8 = 4;  // 4 + option (uxtb uxth uxtw uxtx sxtb sxth sxtw sxtx)
+
+struct AOp {
+    kind: u8,
+    reg: i32,
+    x: bool,     // a 64-bit general register (x, sp, xzr)
+    sp: bool,    // reg 31 is sp (else zr)
+    view: u8,    // AK_VREG: 'b' 'h' 's' 'd' 'q', or 'v' (with esize/lanes)
+    esize: u32,  // a vector's element size in bits (8 16 32 64)
+    lanes: u32,
+    index: i32,  // an element index, or -1
+    v: cr.Val,   // AK_IMM: the value; AK_MEM: the offset; AK_EXPR: the target
+    fp: bool,    // AK_IMM: a floating constant (f)
+    f: f64,
+    base: i32,   // AK_MEM
+    off: bool,   // AK_MEM: an immediate offset is given
+    rm: i32,     // AK_MEM: a register offset, or -1
+    rmx: bool,   // its width (x)
+    sh: u8,      // AK_SHIFT; AK_MEM with rm: its extend
+    amt: i32,    // AK_SHIFT, AK_MEM: the amount, or -1 if not written
+    pre: bool,   // AK_MEM: [xn, #i]!
+    name: []u8,  // AK_EXPR: the text (a condition, option or register name)
+    nregs: u32,  // AK_LIST
+}
+
+fn none_op() AOp {
+    return AOp.{ kind: AK_NONE, reg: -1, x: false, sp: false, view: 0, esize: 0, lanes: 0, index: -1, v: cr.konst(0),
+                 fp: false, f: 0.0, base: -1, off: false, rm: -1, rmx: false, sh: 0, amt: -1, pre: false, name: "",
+                 nregs: 0 };
+}
+
+fn zr(x: bool) AOp {
+    let mut z = none_op();
+    z.kind = AK_REG;
+    z.reg = 31;
+    z.x = x;
+    return z;
+}
+
+fn pick_i64(c: bool, a: i64, b: i64) i64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn pick_us(c: bool, a: usize, b: usize) usize {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn u32_pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// -----------------------------------------------------------------------------
+// Operands
+// -----------------------------------------------------------------------------
+// A general register: x0-x30, w0-w30, sp, wsp, xzr, wzr, fp, lr.
+fn gpr_name(n: []u8, op: *mut AOp) bool {
+    if u.str_eq(n, "sp") or u.str_eq(n, "wsp") {
+        op.kind = AK_REG;
+        op.reg = 31;
+        op.sp = true;
+        op.x = n[0] == 's';
+        return true;
+    }
+    if u.str_eq(n, "xzr") or u.str_eq(n, "wzr") {
+        op.kind = AK_REG;
+        op.reg = 31;
+        op.x = n[0] == 'x';
+        return true;
+    }
+    if u.str_eq(n, "fp") or u.str_eq(n, "lr") {
+        op.kind = AK_REG;
+        op.reg = 30;
+        if n[0] == 'f' {
+            op.reg = 29;
+        }
+        op.x = true;
+        return true;
+    }
+    if (n.len >= 2) and ((n[0] == 'x') or (n[0] == 'w')) {
+        let k = ai.num(n[1..]);
+        if (k >= 0) and (k <= 30) {
+            op.kind = AK_REG;
+            op.reg = @int_cast(i32, k);
+            op.x = n[0] == 'x';
+            return true;
+        }
+    }
+    return false;
+}
+
+// A floating-point/vector register: b0 h0 s0 d0 q0, v0, v0.4s, v0.s[1], v0.4s[1].
+fn vreg_name(n: []u8, op: *mut AOp) bool {
+    if n.len < 2 {
+        return false;
+    }
+    let c = n[0];
+    if (c != 'b') and (c != 'h') and (c != 's') and (c != 'd') and (c != 'q') and (c != 'v') {
+        return false;
+    }
+    let mut j: usize = 1;
+    while (j < n.len) and u.is_digit(n[j]) {
+        j += 1;
+    }
+    let k = ai.num(n[1..j]);
+    if (k < 0) or (k > 31) {
+        return false;
+    }
+    if j == n.len {
+        op.kind = AK_VREG;
+        op.reg = @int_cast(i32, k);
+        op.view = c;
+        return true;
+    }
+    if (c != 'v') or (n[j] != '.') {
+        return false;
+    }
+    // the arrangement: 8b 16b 4h 8h 2s 4s 1d 2d 1q, or an element: b h s d [i]
+    let mut r = n[j + 1..];
+    let mut index: i32 = -1;
+    let lb = u.find(r, '[');
+    if lb >= 0 {
+        let ix = r[@int_cast(usize, lb) + 1..];
+        if (ix.len < 2) or (ix[ix.len - 1] != ']') {
+            return false;
+        }
+        let iv = ai.num(ix[0..ix.len - 1]);
+        if iv < 0 {
+            return false;
+        }
+        index = @int_cast(i32, iv);
+        r = r[0..@int_cast(usize, lb)];
+    }
+    let mut lanes: i64 = 0;
+    let mut p: usize = 0;
+    while (p < r.len) and u.is_digit(r[p]) {
+        p += 1;
+    }
+    if p > 0 {
+        lanes = ai.num(r[0..p]);
+    }
+    if (p + 1) != r.len {
+        return false;
+    }
+    let e = r[p];
+    let mut es: u32 = 0;
+    if e == 'b' {
+        es = 8;
+    } else if e == 'h' {
+        es = 16;
+    } else if e == 's' {
+        es = 32;
+    } else if e == 'd' {
+        es = 64;
+    } else if e == 'q' {
+        es = 128;
+    } else {
+        return false;
+    }
+    let ln = @truncate(u32, @bit_cast(u64, lanes));
+    if (lanes != 0) and ((es * ln) != 64) and ((es * ln) != 128) {
+        return false;
+    }
+    op.kind = AK_VREG;
+    op.reg = @int_cast(i32, k);
+    op.view = 'v';
+    op.esize = es;
+    op.lanes = ln;
+    op.index = index;
+    return true;
+}
+
+fn shift_kind(n: []u8) i32 {
+    let names = ["lsl", "lsr", "asr", "ror", "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"];
+    for k in 0..names.len {
+        if u.str_eq(n, names[k]) {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+// An immediate (with or without '#'; maybe with :lo12: and the like).
+fn imm_op(A: *mut cr.Asm, s0: []u8) AOp {
+    let mut op = none_op();
+    op.kind = AK_IMM;
+    let mut s = cr.trim(s0);
+    if (s.len > 0) and (s[0] == '#') {
+        s = cr.trim(s[1..]);
+    }
+    let mut rm = cr.RM_NONE;
+    if (s.len > 0) and (s[0] == ':') {
+        let e = u.find(s[1..], ':');
+        if e < 0 {
+            cr.fail(A, u.f1("'%s' is not a relocation operator", s));
+            return op;
+        }
+        let name = cr.lower(s[1..@int_cast(usize, e) + 1]);
+        if u.str_eq(name, "lo12") {
+            rm = cr.RM_LO12;
+        } else if u.str_eq(name, "got") {
+            rm = cr.RM_GOT;
+        } else if u.str_eq(name, "got_lo12") {
+            rm = cr.RM_GOT_LO12;
+        } else {
+            cr.fail(A, u.f1("the relocation operator ':%s:' is not supported", name));
+            return op;
+        }
+        s = cr.trim(s[@int_cast(usize, e) + 2..]);
+    }
+    // a floating constant
+    if (rm == cr.RM_NONE) and is_float_text(s) {
+        op.fp = true;
+        op.f = u.parse_f64(s);
+        return op;
+    }
+    op.v = cr.eval(A, s);
+    if rm != cr.RM_NONE {
+        op.v.rm = rm;
+    }
+    return op;
+}
+
+fn is_float_text(s: []u8) bool {
+    let mut digits = false;
+    let mut dot = false;
+    let mut i: usize = 0;
+    if (s.len > 1) and (s[0] == '0') and ((s[1] == 'x') or (s[1] == 'X')) {
+        return false;
+    }
+    if (i < s.len) and ((s[i] == '-') or (s[i] == '+')) {
+        i += 1;
+    }
+    while i < s.len {
+        let c = s[i];
+        if u.is_digit(c) {
+            digits = true;
+        } else if c == '.' {
+            dot = true;
+        } else if (c == 'e') or (c == 'E') {
+            if not digits {
+                return false;
+            }
+            dot = true;
+            if ((i + 1) < s.len) and ((s[i + 1] == '-') or (s[i + 1] == '+')) {
+                i += 1;
+            }
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    return digits and dot;
+}
+
+fn parse_op(A: *mut cr.Asm, s0: []u8) AOp {
+    let s = cr.trim(s0);
+    let mut op = none_op();
+    if s.len == 0 {
+        cr.fail(A, "an operand is missing");
+        return op;
+    }
+    if s[0] == '[' {
+        return mem_op(A, s);
+    }
+    if s[0] == '{' {
+        return list_op(A, s);
+    }
+    if (s[0] == '#') or (s[0] == ':') or (s[0] == '-') or u.is_digit(s[0]) {
+        return imm_op(A, s);
+    }
+    let low = cr.lower(s);
+    if gpr_name(low, &mut op) or vreg_name(low, &mut op) {
+        return op;
+    }
+    // lsl #3, uxtw, sxtw #2
+    let mut k: usize = 0;
+    while (k < low.len) and cr.is_sym_char(low[k]) {
+        k += 1;
+    }
+    let sk = shift_kind(low[0..k]);
+    if sk >= 0 {
+        op.kind = AK_SHIFT;
+        op.sh = @truncate(u8, @bit_cast(u32, sk));
+        let rest = cr.trim(s[k..]);
+        if rest.len > 0 {
+            let iv = imm_op(A, rest);
+            let c = cr.settle(A, iv.v);
+            if not cr.is_const(c) {
+                cr.fail(A, u.f1("the shift amount '%s' is not a constant", rest));
+                return op;
+            }
+            op.amt = @truncate(i32, c.k);
+        }
+        return op;
+    }
+    op.kind = AK_EXPR;
+    op.name = low;
+    if cond_of(low) >= 0 {
+        return op;
+    }
+    op.v = cr.eval(A, s);
+    return op;
+}
+
+fn mem_op(A: *mut cr.Asm, s: []u8) AOp {
+    let mut op = none_op();
+    op.kind = AK_MEM;
+    let mut t = s;
+    if t[t.len - 1] == '!' {
+        op.pre = true;
+        t = cr.trim(t[0..t.len - 1]);
+    }
+    if (t.len < 2) or (t[t.len - 1] != ']') {
+        cr.fail(A, u.f1("'%s' is not a memory operand", s));
+        return op;
+    }
+    let parts = cr.split_args(t[1..t.len - 1]);
+    if parts.len == 0 {
+        cr.fail(A, u.f1("'%s' has no base register", s));
+        return op;
+    }
+    let mut b = none_op();
+    if not gpr_name(cr.lower(parts[0]), &mut b) or not b.x or ((b.reg == 31) and not b.sp) {
+        cr.fail(A, u.f1("'%s' is not a base register", parts[0]));
+        return op;
+    }
+    op.base = b.reg;
+    if parts.len >= 2 {
+        let p = parts[1];
+        let mut r = none_op();
+        if gpr_name(cr.lower(p), &mut r) {
+            if r.sp {
+                cr.fail(A, "sp cannot be an offset register");
+                return op;
+            }
+            op.rm = r.reg;
+            op.rmx = r.x;
+            op.sh = SH_LSL;
+            if not r.x {
+                op.sh = SH_UXTB + 2;
+            }
+            if parts.len >= 3 {
+                let e = parse_op(A, parts[2]);
+                if e.kind != AK_SHIFT {
+                    cr.fail(A, u.f1("'%s' is not an extend or shift", parts[2]));
+                    return op;
+                }
+                op.sh = e.sh;
+                op.amt = e.amt;
+            }
+            return op;
+        }
+        let iv = imm_op(A, p);
+        op.v = iv.v;
+        op.off = true;
+        if parts.len > 2 {
+            cr.fail(A, u.f1("'%s' is not a memory operand", s));
+        }
+    }
+    return op;
+}
+
+fn list_op(A: *mut cr.Asm, s: []u8) AOp {
+    let mut op = none_op();
+    op.kind = AK_LIST;
+    let rb = u.rfind(s, '}');
+    if rb < 0 {
+        cr.fail(A, u.f1("'%s' is not a register list", s));
+        return op;
+    }
+    let after = cr.trim(s[@int_cast(usize, rb) + 1..]);
+    let t = s[1..@int_cast(usize, rb)];
+    let mut first = none_op();
+    let mut n: u32 = 0;
+    let dash = u.find(t, '-');
+    if dash >= 0 {
+        let a = cr.trim(t[0..@int_cast(usize, dash)]);
+        let b = cr.trim(t[@int_cast(usize, dash) + 1..]);
+        let mut x = none_op();
+        if not vreg_name(cr.lower(a), &mut first) or not vreg_name(cr.lower(b), &mut x) {
+            cr.fail(A, u.f1("'%s' is not a register list", s));
+            return op;
+        }
+        n = @bit_cast(u32, ((x.reg - first.reg) & 31) + 1);
+    } else {
+        let xs = cr.split_args(t);
+        for k in 0..xs.len {
+            let mut x = none_op();
+            if not vreg_name(cr.lower(xs[k]), &mut x) {
+                cr.fail(A, u.f1("'%s' is not a register list", s));
+                return op;
+            }
+            if k == 0 {
+                first = x;
+            } else if (x.reg != ((first.reg + @int_cast(i32, k)) & 31)) or (x.esize != first.esize) {
+                cr.fail(A, u.f1("the registers of '%s' are not consecutive", s));
+                return op;
+            }
+        }
+        n = @truncate(u32, xs.len);
+    }
+    if (n == 0) or (n > 4) or (first.view != 'v') {
+        cr.fail(A, u.f1("'%s' is not a register list", s));
+        return op;
+    }
+    op.reg = first.reg;
+    op.esize = first.esize;
+    op.lanes = first.lanes;
+    op.nregs = n;
+    op.index = first.index;
+    if after.len > 0 {
+        if (after.len < 3) or (after[0] != '[') or (after[after.len - 1] != ']') {
+            cr.fail(A, u.f1("'%s' is not a register list", s));
+            return op;
+        }
+        op.index = @truncate(i32, ai.num(after[1..after.len - 1]));
+    }
+    return op;
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+fn w32(A: *mut cr.Asm, w: u64) void {
+    cr.emit32(A, w & 0xffff_ffff);
+}
+
+fn r5(r: i32) u64 {
+    return @as(u64, @bit_cast(u32, r)) & 31;
+}
+
+fn sfb(x: bool) u64 {
+    if x {
+        return @as(u64, 1) << 31;
+    }
+    return 0;
+}
+
+fn bx(x: bool) u64 {
+    if x {
+        return 1;
+    }
+    return 0;
+}
+
+fn bad(A: *mut cr.Asm, m: []u8) void {
+    if not cr.failed(A) {
+        cr.fail(A, u.f1("'%s' does not take these operands", m));
+    }
+}
+
+fn n_ops(A: *mut cr.Asm, ops: []AOp, n: usize, m: []u8) bool {
+    if ops.len != n {
+        cr.fail(A, u.f2("'%s' takes %s operands", m, u.zdec(n)));
+        return false;
+    }
+    return true;
+}
+
+fn is_r(o: *AOp) bool {
+    return o.kind == AK_REG;
+}
+
+// A general register that is not sp (31 is the zero register).
+fn is_rz(o: *AOp) bool {
+    return (o.kind == AK_REG) and not o.sp;
+}
+
+fn same_width(ops: []AOp) bool {
+    for o in ops {
+        if (o.kind == AK_REG) and (o.x != ops[0].x) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn all_rz(ops: []AOp) bool {
+    for o in ops {
+        if not is_rz(&o) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The constant value of an immediate operand (an error if it is not one).
+fn konst(A: *mut cr.Asm, o: *AOp, what: []u8) i64 {
+    if o.kind != AK_IMM {
+        cr.fail(A, u.f1("%s must be an immediate", what));
+        return 0;
+    }
+    if o.fp {
+        cr.fail(A, u.f1("%s must be an integer", what));
+        return 0;
+    }
+    let v = cr.settle(A, o.v);
+    if not cr.is_const(v) {
+        cr.fail(A, u.f1("%s must be a constant", what));
+        return 0;
+    }
+    return v.k;
+}
+
+fn range(A: *mut cr.Asm, x: i64, lo: i64, hi: i64, what: []u8) bool {
+    if (x < lo) or (x > hi) {
+        if not cr.failed(A) {
+            cr.fail(A, u.f4("%s %s is out of range (%s to %s)", what, u.dec(x), u.dec(lo), u.dec(hi)));
+        }
+        return false;
+    }
+    return true;
+}
+
+let CONDS: [18][]u8 = ["eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
+                       "hs", "lo"];
+let CONDV: [18]u64 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 2, 3];
+
+fn cond_of(n: []u8) i64 {
+    for k in 0..CONDS.len {
+        if u.str_eq(n, CONDS[k]) {
+            return @bit_cast(i64, CONDV[k]);
+        }
+    }
+    return -1;
+}
+
+fn cond_op(A: *mut cr.Asm, o: *AOp) u64 {
+    if o.kind == AK_EXPR {
+        let c = cond_of(o.name);
+        if c >= 0 {
+            return @bit_cast(u64, c);
+        }
+    }
+    cr.fail(A, u.f1("'%s' is not a condition", o.name));
+    return 0;
+}
+
+// A branch target: the label's offset from here in units of `scale` (bits
+// wide), else a relocation of type ty (0: none allowed) at the word.
+fn target(A: *mut cr.Asm, o: *AOp, ty: u32, bits: u32, scale: i64, what: []u8) i64 {
+    if (o.kind != AK_EXPR) and (o.kind != AK_IMM) {
+        cr.fail(A, u.f1("%s needs a label", what));
+        return 0;
+    }
+    let v = cr.settle(A, o.v);
+    if not v.ok {
+        return 0;
+    }
+    let here = cr.here(A);
+    let mut toff: u64 = 0;
+    if cr.local_target(A, v, &mut toff) and (v.rm == cr.RM_NONE) {
+        let rel = (@bit_cast(i64, toff) + v.k) - @bit_cast(i64, here);
+        if (rel % scale) != 0 {
+            cr.fail(A, u.f1("%s: a target not aligned to its instruction", what));
+            return 0;
+        }
+        let q = rel / scale;
+        let lim = @as(i64, 1) << @truncate(u32, bits - 1);
+        if ((q < -lim) or (q >= lim)) and (A.pass > 0) {
+            cr.fail(A, u.f1("%s: the target is out of reach", what));
+            return 0;
+        }
+        return q & ((lim * 2) - 1);
+    }
+    if cr.is_const(v) or (v.sym < 0) {
+        cr.fail(A, u.f1("%s to an absolute address", what));
+        return 0;
+    }
+    if ty == 0 {
+        cr.fail(A, u.f1("%s to a symbol of another section or unit (no relocation for it)", what));
+        return 0;
+    }
+    cr.reloc(A, here, ty, v, v.k);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Immediates
+// -----------------------------------------------------------------------------
+// The 8-bit form of a floating constant for fmov (VFPExpandImm's inverse:
+// +-n/16 * 2^e, n 16..31, e -3..4), or -1.
+fn fp_imm8(f: f64) i64 {
+    let mut a: i64 = 0;
+    let mut x = f;
+    if x < 0.0 {
+        a = 1;
+        x = -x;
+    }
+    for e in @as(i64, -3)..5 {
+        for n in @as(i64, 16)..32 {
+            let mut v = @float_from_int(f64, n) / 16.0;
+            let mut k = e;
+            while k > 0 {
+                v = v * 2.0;
+                k -= 1;
+            }
+            while k < 0 {
+                v = v / 2.0;
+                k += 1;
+            }
+            if v == x {
+                let mut b: i64 = 1;
+                let mut cd: i64 = e + 3;
+                if e >= 1 {
+                    b = 0;
+                    cd = e - 1;
+                }
+                return ((a << 7) | (b << 6)) | ((cd << 4) | (n - 16));
+            }
+        }
+    }
+    return -1;
+}
+
+// mov rd, #imm: movz, movn or orr (a logical immediate), as the GNU
+// assembler chooses them, or an error.
+fn mov_imm(A: *mut cr.Asm, d: AOp, x0: i64) void {
+    let wide = d.x;
+    let mut x = @bit_cast(u64, x0);
+    let mut width: u32 = 64;
+    if not wide {
+        if (x0 < -2147483648) or (x0 > 4294967295) {
+            cr.fail(A, "a 32-bit move of an immediate that does not fit");
+            return;
+        }
+        x = x & 0xffff_ffff;
+        width = 32;
+    }
+    let nh: u64 = u64_pick(wide, 4, 2);
+    // movz: one 16-bit part set
+    if not d.sp {
+        for hw in @as(u64, 0)..nh {
+            if (x & ~(@as(u64, 0xffff) << (hw * 16))) == 0 {
+                w32(A, ((0x52800000 | sfb(wide)) | (hw << 21)) | ((((x >> (hw * 16)) & 0xffff) << 5) | r5(d.reg)));
+                return;
+            }
+        }
+        // movn: one 16-bit part not all ones
+        let mut nx = ~x;
+        if not wide {
+            nx = nx & 0xffff_ffff;
+        }
+        for hw in @as(u64, 0)..nh {
+            if (nx & ~(@as(u64, 0xffff) << (hw * 16))) == 0 {
+                w32(A, ((0x12800000 | sfb(wide)) | (hw << 21)) | ((((nx >> (hw * 16)) & 0xffff) << 5) | r5(d.reg)));
+                return;
+            }
+        }
+    }
+    let li = ae.logical_imm(x, width);
+    if (li >= 0) and (d.sp or (d.reg != 31)) {
+        w32(A, ((0x32000000 | sfb(wide)) | (@bit_cast(u64, li) << 10)) | ((31 << 5) | r5(d.reg)));
+        return;
+    }
+    cr.fail(A, u.f1("mov of the immediate %s, which needs more than one instruction", u.dec(x0)));
+}
+
+// -----------------------------------------------------------------------------
+// Instructions
+// -----------------------------------------------------------------------------
+/// The arch description core.run takes.
+pub fn arch() cr.Arch {
+    return cr.Arch.{ insn: insn, directive: directive, nop: 0, align_pow2: true, word: 4 };
+}
+
+fn directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
+    if u.str_eq(st.op, ".inst") {
+        for a in cr.split_args(st.args) {
+            let x = cr.eval_const(A, a, "an instruction word");
+            w32(A, @bit_cast(u64, x));
+        }
+        return true;
+    }
+    return false;
+}
+
+fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
+    let m = st.op;
+    let xs = cr.split_args(st.args);
+    let ops0 = u.newn.[AOp](xs.len + 1);
+    for k in 0..xs.len {
+        ops0[k] = parse_op(A, xs[k]);
+    }
+    if cr.failed(A) {
+        return;
+    }
+    let ops = ops0[0..xs.len];
+    if (cr.here(A) % 4) != 0 {
+        cr.fail(A, "an instruction at an offset that is not a multiple of 4");
+        return;
+    }
+    if integer(A, m, ops) or branch(A, m, ops) or ldst(A, m, ops) or system(A, m, ops) or fp(A, m, ops) or
+       simd(A, m, ops) {
+        return;
+    }
+    if not cr.failed(A) {
+        cr.fail(A, u.f1("the instruction '%s' is not supported (or not known)", m));
+    }
+}
+
+// The optional shift of a register operand at ops[k] (none: lsl #0).
+fn shift_at(A: *mut cr.Asm, ops: []AOp, k: usize, sh: *mut u64, amt: *mut u64, ror_ok: bool, m: []u8) bool {
+    sh.* = 0;
+    amt.* = 0;
+    if k >= ops.len {
+        return true;
+    }
+    let s = ops[k];
+    if (s.kind != AK_SHIFT) or (s.sh > SH_ROR) or ((s.sh == SH_ROR) and not ror_ok) or (s.amt < 0) {
+        bad(A, m);
+        return false;
+    }
+    sh.* = @as(u64, s.sh);
+    amt.* = @as(u64, @bit_cast(u32, s.amt));
+    return true;
+}
+
+// ops with a zero register first.
+fn with_zr(ops: []AOp, at: usize) []AOp {
+    let all = u.newn.[AOp](ops.len + 2);
+    let mut j: usize = 0;
+    for k in 0..(ops.len + 1) {
+        if k == at {
+            let mut x = true;
+            if ops.len > 0 {
+                x = ops[0].x;
+            }
+            all[k] = zr(x);
+        } else {
+            all[k] = ops[j];
+            j += 1;
+        }
+    }
+    return all[0..ops.len + 1];
+}
+
+fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if (ops.len > 0) and (ops[0].kind == AK_VREG) and (ops[0].view == 'v') and not u.str_eq(m, "mov") {
+        return false;  // (the vector forms of add, and ...)
+    }
+    // add, adds, sub, subs, and aliases cmp, cmn, neg, negs
+    let addsub = ["add", "adds", "sub", "subs"];
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(m, addsub[k]) {
+            add_sub(A, m, k >= 2, (k & 1) != 0, ops);
+            return true;
+        }
+    }
+    if u.str_eq(m, "cmp") or u.str_eq(m, "cmn") {
+        if ops.len < 2 {
+            bad(A, m);
+            return true;
+        }
+        add_sub(A, m, m[2] == 'p', true, with_zr(ops, 0));
+        return true;
+    }
+    if u.str_eq(m, "neg") or u.str_eq(m, "negs") {
+        if (ops.len < 2) or not is_rz(&ops[0]) or not is_rz(&ops[1]) {
+            bad(A, m);
+            return true;
+        }
+        addsub_reg(A, m, true, m.len == 4, with_zr(ops, 1));
+        return true;
+    }
+    // adc, adcs, sbc, sbcs, ngc, ngcs
+    let carry = ["adc", "adcs", "sbc", "sbcs", "ngc", "ngcs"];
+    let cbase: [4]u64 = [0x1a000000, 0x3a000000, 0x5a000000, 0x7a000000];
+    for k in @as(usize, 0)..6 {
+        if u.str_eq(m, carry[k]) {
+            let mut o = ops;
+            let mut b = cbase[k & 3];
+            if k >= 4 {
+                o = with_zr(ops, 1);
+                b = cbase[k - 2];
+            }
+            if (o.len != 3) or not all_rz(o) or not same_width(o) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, (((b | sfb(o[0].x)) | (r5(o[2].reg) << 16)) | (r5(o[1].reg) << 5)) | r5(o[0].reg));
+            return true;
+        }
+    }
+    // logic
+    let logic = ["and", "orr", "eor", "ands", "bic", "orn", "eon", "bics"];
+    for k in @as(usize, 0)..8 {
+        if u.str_eq(m, logic[k]) {
+            logical(A, m, @as(u64, k & 3), k >= 4, ops);
+            return true;
+        }
+    }
+    if u.str_eq(m, "tst") {
+        if ops.len < 2 {
+            bad(A, m);
+            return true;
+        }
+        logical(A, m, 3, false, with_zr(ops, 0));
+        return true;
+    }
+    if u.str_eq(m, "mvn") {
+        if (ops.len < 2) or not is_rz(&ops[0]) or not is_rz(&ops[1]) {
+            if (ops.len == 2) and (ops[0].view == 'v') {
+                return false;
+            }
+            bad(A, m);
+            return true;
+        }
+        let mut sh: u64 = 0;
+        let mut amt: u64 = 0;
+        if shift_at(A, ops, 2, &mut sh, &mut amt, true, m) {
+            w32(A, ae.logic_reg(bx(ops[0].x), 1, true, ops[0].reg, 31, ops[1].reg, sh, amt));
+        }
+        return true;
+    }
+    if u.str_eq(m, "mov") {
+        mov(A, m, ops);
+        return true;
+    }
+    if u.str_eq(m, "movz") or u.str_eq(m, "movn") or u.str_eq(m, "movk") {
+        if (ops.len < 2) or (ops.len > 3) or not is_rz(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let v = konst(A, &ops[1], "the immediate");
+        let mut hw: u64 = 0;
+        if ops.len == 3 {
+            if (ops[2].kind != AK_SHIFT) or (ops[2].sh != SH_LSL) or ((ops[2].amt % 16) != 0) or (ops[2].amt < 0) {
+                bad(A, m);
+                return true;
+            }
+            hw = @as(u64, @bit_cast(u32, ops[2].amt / 16));
+        }
+        if not range(A, v, 0, 65535, "the immediate") or (hw >= u64_pick(ops[0].x, 4, 2)) {
+            bad(A, m);
+            return true;
+        }
+        let opc: u64 = u64_pick(m[3] == 'n', 0, u64_pick(m[3] == 'z', 2, 3));
+        w32(A, ae.movw(bx(ops[0].x), opc, ops[0].reg, @bit_cast(u64, v), hw));
+        return true;
+    }
+    // shifts: lsl lsr asr ror (immediate and register)
+    let shifts = ["lsl", "lsr", "asr", "ror"];
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(m, shifts[k]) {
+            if not n_ops(A, ops, 3, m) or not is_rz(&ops[0]) or not is_rz(&ops[1]) or not same_width(ops[0..2]) {
+                bad(A, m);
+                return true;
+            }
+            let x = ops[0].x;
+            let bits = pick_i64(x, 64, 32);
+            if is_rz(&ops[2]) {
+                w32(A, ae.dp2(bx(x), 8 + @as(u64, k), ops[0].reg, ops[1].reg, ops[2].reg));
+                return true;
+            }
+            let s = konst(A, &ops[2], "the shift");
+            if not range(A, s, 0, bits - 1, "the shift") {
+                return true;
+            }
+            let su = @bit_cast(u64, s);
+            let bu = @bit_cast(u64, bits);
+            if k == 0 {
+                w32(A, ae.bfm(bx(x), 2, ops[0].reg, ops[1].reg, (bu - su) % bu, (bu - 1) - su));
+            } else if k == 1 {
+                w32(A, ae.bfm(bx(x), 2, ops[0].reg, ops[1].reg, su, bu - 1));
+            } else if k == 2 {
+                w32(A, ae.bfm(bx(x), 0, ops[0].reg, ops[1].reg, su, bu - 1));
+            } else {
+                w32(A, ae.extr(bx(x), ops[0].reg, ops[1].reg, ops[1].reg, su));
+            }
+            return true;
+        }
+    }
+    if bitfield(A, m, ops) or mul_div(A, m, ops) or csel(A, m, ops) {
+        return true;
+    }
+    if u.str_eq(m, "extr") {
+        if not n_ops(A, ops, 4, m) or not all_rz(ops[0..3]) or not same_width(ops[0..3]) {
+            bad(A, m);
+            return true;
+        }
+        let s = konst(A, &ops[3], "the lsb");
+        if range(A, s, 0, pick_i64(ops[0].x, 63, 31), "the lsb") {
+            w32(A, ae.extr(bx(ops[0].x), ops[0].reg, ops[1].reg, ops[2].reg, @bit_cast(u64, s)));
+        }
+        return true;
+    }
+    // one-source: rbit rev16 rev32 rev clz cls (rev64: rev of x)
+    let ones = ["rbit", "rev16", "rev32", "rev", "clz", "cls", "rev64"];
+    let onec: [7]u64 = [0, 1, 2, 3, 4, 5, 3];
+    for k in @as(usize, 0)..7 {
+        if u.str_eq(m, ones[k]) and (ops.len == 2) and is_rz(&ops[0]) {
+            if not is_rz(&ops[1]) or not same_width(ops) or ((k == 2) and not ops[0].x) or ((k == 6) and not ops[0].x) {
+                bad(A, m);
+                return true;
+            }
+            let mut opc = onec[k];
+            if (k == 3) and not ops[0].x {
+                opc = 2;
+            }
+            w32(A, ae.dp1(bx(ops[0].x), opc, ops[0].reg, ops[1].reg));
+            return true;
+        }
+    }
+    // conditional compare
+    if u.str_eq(m, "ccmp") or u.str_eq(m, "ccmn") {
+        if not n_ops(A, ops, 4, m) or not is_rz(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let nzcv = konst(A, &ops[2], "nzcv");
+        if not range(A, nzcv, 0, 15, "nzcv") {
+            return true;
+        }
+        let c = cond_op(A, &ops[3]);
+        let mut w = u64_pick(m[3] == 'p', 0x7a400000, 0x3a400000) | sfb(ops[0].x);
+        if is_rz(&ops[1]) {
+            if ops[1].x != ops[0].x {
+                bad(A, m);
+                return true;
+            }
+            w = w | (r5(ops[1].reg) << 16);
+        } else {
+            let i = konst(A, &ops[1], "the immediate");
+            if not range(A, i, 0, 31, "the immediate") {
+                return true;
+            }
+            w = (w | 0x800) | (@bit_cast(u64, i) << 16);
+        }
+        w32(A, ((w | (c << 12)) | (r5(ops[0].reg) << 5)) | @bit_cast(u64, nzcv));
+        return true;
+    }
+    // crc32
+    let crcs = ["crc32b", "crc32h", "crc32w", "crc32x", "crc32cb", "crc32ch", "crc32cw", "crc32cx"];
+    for k in @as(usize, 0)..8 {
+        if u.str_eq(m, crcs[k]) {
+            let sz = @as(u64, k & 3);
+            if not n_ops(A, ops, 3, m) or not all_rz(ops) or ops[0].x or ops[1].x or (ops[2].x != (sz == 3)) {
+                bad(A, m);
+                return true;
+            }
+            let c = @as(u64, k >> 2);
+            w32(A,
+                (((0x1ac04000 | sfb(sz == 3)) | (r5(ops[2].reg) << 16)) | ((c << 12) | (sz << 10))) |
+                ((r5(ops[1].reg) << 5) | r5(ops[0].reg)));
+            return true;
+        }
+    }
+    // adr, adrp
+    if u.str_eq(m, "adr") or u.str_eq(m, "adrp") {
+        if not n_ops(A, ops, 2, m) or not is_rz(&ops[0]) or not ops[0].x {
+            bad(A, m);
+            return true;
+        }
+        adr(A, m.len == 4, ops[0].reg, &ops[1]);
+        return true;
+    }
+    return false;
+}
+
+fn add_sub(A: *mut cr.Asm, m: []u8, sub0: bool, s: bool, ops: []AOp) void {
+    if (ops.len < 3) or not is_r(&ops[0]) or not is_r(&ops[1]) {
+        bad(A, m);
+        return;
+    }
+    if ops[2].kind == AK_IMM {
+        let mut sub = sub0;
+        let d = ops[0];
+        let n = ops[1];
+        if (not d.sp and (d.reg == 31) and not s) or (not n.sp and (n.reg == 31)) or (d.x != n.x) or (s and d.sp) {
+            bad(A, m);
+            return;
+        }
+        let v = cr.settle(A, ops[2].v);
+        let mut sh = false;
+        if ops.len == 4 {
+            if (ops[3].kind != AK_SHIFT) or (ops[3].sh != SH_LSL) or ((ops[3].amt != 0) and (ops[3].amt != 12)) {
+                bad(A, m);
+                return;
+            }
+            sh = ops[3].amt == 12;
+        }
+        if v.rm == cr.RM_LO12 {
+            // add xd, xn, :lo12:sym
+            if sub or s or sh {
+                bad(A, m);
+                return;
+            }
+            cr.reloc(A, cr.here(A), elf.R_AARCH64_ADD_ABS_LO12_NC, v, v.k);
+            w32(A, ae.addsub_imm(bx(d.x), false, false, d.reg, n.reg, 0, false));
+            return;
+        }
+        if not cr.is_const(v) {
+            cr.fail(A, u.f1("'%s' needs a constant immediate", m));
+            return;
+        }
+        let mut k = v.k;
+        if k < 0 {
+            k = -k;
+            sub = not sub;
+        }
+        let mut imm = @bit_cast(u64, k);
+        if not sh and (imm > 4095) and ((imm & 0xfff) == 0) and (imm <= 0xfff000) {
+            imm = imm >> 12;
+            sh = true;
+        }
+        if imm > 4095 {
+            cr.fail(A, u.f2("the immediate %s of '%s' is out of range", u.dec(v.k), m));
+            return;
+        }
+        w32(A, ae.addsub_imm(bx(d.x), sub, s, d.reg, n.reg, imm, sh));
+        return;
+    }
+    addsub_reg(A, m, sub0, s, ops);
+}
+
+// add/sub of a register: shifted, or extended (when sp is an operand, or
+// with an extend).
+fn addsub_reg(A: *mut cr.Asm, m: []u8, sub: bool, s: bool, ops: []AOp) void {
+    if (ops.len < 3) or (ops.len > 4) or not is_rz(&ops[2]) {
+        bad(A, m);
+        return;
+    }
+    let d = ops[0];
+    let n = ops[1];
+    let rm = ops[2];
+    let ext = (d.sp and (d.reg == 31)) or (n.sp and (n.reg == 31)) or
+              ((ops.len == 4) and (ops[3].kind == AK_SHIFT) and (ops[3].sh >= SH_UXTB)) or (d.x and not rm.x);
+    if ext {
+        // extended register: option, imm3
+        let mut option: u64 = u64_pick(d.x, 3, 2);  // uxtx / uxtw (lsl)
+        let mut amt: u64 = 0;
+        if ops.len == 4 {
+            let e = ops[3];
+            if e.kind != AK_SHIFT {
+                bad(A, m);
+                return;
+            }
+            if e.sh >= SH_UXTB {
+                option = @as(u64, e.sh - SH_UXTB);
+            } else if e.sh != SH_LSL {
+                bad(A, m);
+                return;
+            }
+            if e.amt > 0 {
+                amt = @as(u64, @bit_cast(u32, e.amt));
+            }
+            if amt > 4 {
+                bad(A, m);
+                return;
+            }
+        }
+        if (s and d.sp) or (not n.sp and (n.reg == 31)) or (d.x != n.x) {
+            bad(A, m);
+            return;
+        }
+        let mut w: u64 = 0x0b200000;
+        if sub {
+            w = w | 0x40000000;
+        }
+        if s {
+            w = w | 0x20000000;
+        }
+        w32(A,
+            (((w | sfb(d.x)) | (r5(rm.reg) << 16)) | ((option << 13) | (amt << 10))) | ((r5(n.reg) << 5) | r5(d.reg)));
+        return;
+    }
+    if d.sp or n.sp or (d.x != n.x) or (d.x != rm.x) {
+        bad(A, m);
+        return;
+    }
+    let mut sh: u64 = 0;
+    let mut amt: u64 = 0;
+    if not shift_at(A, ops, 3, &mut sh, &mut amt, false, m) {
+        return;
+    }
+    if amt >= u64_pick(d.x, 64, 32) {
+        bad(A, m);
+        return;
+    }
+    w32(A, ae.addsub_reg(bx(d.x), sub, s, d.reg, n.reg, rm.reg, sh, amt));
+}
+
+fn logical(A: *mut cr.Asm, m: []u8, opc: u64, neg: bool, ops: []AOp) void {
+    if (ops.len < 3) or not is_r(&ops[0]) or not is_rz(&ops[1]) or (ops[0].x != ops[1].x) {
+        bad(A, m);
+        return;
+    }
+    let d = ops[0];
+    if ops[2].kind == AK_IMM {
+        if neg or (d.sp and (opc == 3)) or (ops.len != 3) {
+            bad(A, m);
+            return;
+        }
+        let v = konst(A, &ops[2], "the immediate");
+        let mut x = @bit_cast(u64, v);
+        if not d.x {
+            x = x & 0xffff_ffff;
+        }
+        let li = ae.logical_imm(x, u32_pick(d.x, 64, 32));
+        if li < 0 {
+            if not cr.failed(A) {
+                cr.fail(A, u.f2("the immediate %s of '%s' is not a logical immediate", u.dec(v), m));
+            }
+            return;
+        }
+        w32(A, ae.logic_imm(bx(d.x), opc, d.reg, ops[1].reg, @bit_cast(u64, li)));
+        return;
+    }
+    if d.sp or not is_rz(&ops[2]) or not same_width(ops[0..3]) {
+        bad(A, m);
+        return;
+    }
+    let mut sh: u64 = 0;
+    let mut amt: u64 = 0;
+    if shift_at(A, ops, 3, &mut sh, &mut amt, true, m) {
+        w32(A, ae.logic_reg(bx(d.x), opc, neg, d.reg, ops[1].reg, ops[2].reg, sh, amt));
+    }
+}
+
+fn mov(A: *mut cr.Asm, m: []u8, ops: []AOp) void {
+    if not n_ops(A, ops, 2, m) {
+        return;
+    }
+    let d = ops[0];
+    let s = ops[1];
+    if (d.kind == AK_VREG) or (s.kind == AK_VREG) {
+        vmov(A, m, d, s);
+        return;
+    }
+    if not is_r(&d) {
+        bad(A, m);
+        return;
+    }
+    if s.kind == AK_IMM {
+        mov_imm(A, d, konst(A, &s, "the immediate"));
+        return;
+    }
+    if not is_r(&s) or (d.x != s.x) {
+        bad(A, m);
+        return;
+    }
+    if (d.sp and (d.reg == 31)) or (s.sp and (s.reg == 31)) {
+        // mov to or from sp: add #0
+        w32(A, ae.addsub_imm(bx(d.x), false, false, d.reg, s.reg, 0, false));
+        return;
+    }
+    w32(A, ae.logic_reg(bx(d.x), 1, false, d.reg, 31, s.reg, 0, 0));
+}
+
+// The bit-field instructions and their aliases.
+fn bitfield(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let names = ["sbfm", "bfm", "ubfm"];
+    for k in @as(usize, 0)..3 {
+        if u.str_eq(m, names[k]) {
+            if not n_ops(A, ops, 4, m) or not all_rz(ops[0..2]) or not same_width(ops[0..2]) {
+                bad(A, m);
+                return true;
+            }
+            let r = konst(A, &ops[2], "immr");
+            let s = konst(A, &ops[3], "imms");
+            let top = pick_i64(ops[0].x, 63, 31);
+            if range(A, r, 0, top, "immr") and range(A, s, 0, top, "imms") {
+                w32(A, ae.bfm(bx(ops[0].x), @as(u64, k), ops[0].reg, ops[1].reg, @bit_cast(u64, r), @bit_cast(u64, s)));
+            }
+            return true;
+        }
+    }
+    // ubfx sbfx bfxil (lsb, width), ubfiz sbfiz bfi (lsb, width)
+    let al = ["sbfx", "bfxil", "ubfx", "sbfiz", "bfi", "ubfiz"];
+    for k in @as(usize, 0)..6 {
+        if u.str_eq(m, al[k]) {
+            if not n_ops(A, ops, 4, m) or not all_rz(ops[0..2]) or not same_width(ops[0..2]) {
+                bad(A, m);
+                return true;
+            }
+            let bits = pick_i64(ops[0].x, 64, 32);
+            let lsb = konst(A, &ops[2], "the lsb");
+            let wd = konst(A, &ops[3], "the width");
+            if not range(A, lsb, 0, bits - 1, "the lsb") or not range(A, wd, 1, bits - lsb, "the width") {
+                return true;
+            }
+            let opc = @as(u64, k % 3);
+            if k < 3 {
+                w32(A,
+                    ae.bfm(
+                        bx(ops[0].x), opc, ops[0].reg, ops[1].reg, @bit_cast(u64, lsb),
+                        @bit_cast(u64, (lsb + wd) - 1)));
+            } else {
+                w32(A, ae.bfm(bx(ops[0].x), opc, ops[0].reg, ops[1].reg, @bit_cast(u64, (bits - lsb) % bits),
+                              @bit_cast(u64, wd - 1)));
+            }
+            return true;
+        }
+    }
+    if u.str_eq(m, "bfc") {
+        if not n_ops(A, ops, 3, m) or not is_rz(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let bits = pick_i64(ops[0].x, 64, 32);
+        let lsb = konst(A, &ops[1], "the lsb");
+        let wd = konst(A, &ops[2], "the width");
+        if range(A, lsb, 0, bits - 1, "the lsb") and range(A, wd, 1, bits - lsb, "the width") {
+            w32(A,
+                ae.bfm(bx(ops[0].x), 1, ops[0].reg, 31, @bit_cast(u64, (bits - lsb) % bits), @bit_cast(u64, wd - 1)));
+        }
+        return true;
+    }
+    // sxtb sxth sxtw uxtb uxth
+    let ext = ["sxtb", "sxth", "sxtw", "uxtb", "uxth"];
+    for k in @as(usize, 0)..5 {
+        if u.str_eq(m, ext[k]) {
+            if not n_ops(A, ops, 2, m) or not all_rz(ops) or ops[1].x or ((k >= 3) and ops[0].x) or
+               ((k == 2) and not ops[0].x) {
+                bad(A, m);
+                return true;
+            }
+            let top: u64 = u64_pick((k % 3) == 0, 7, u64_pick((k % 3) == 1, 15, 31));
+            let opc: u64 = u64_pick(k < 3, 0, 2);
+            w32(A, ae.bfm(bx(ops[0].x), opc, ops[0].reg, ops[1].reg, 0, top));
+            return true;
+        }
+    }
+    return false;
+}
+
+fn mul_div(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "madd") or u.str_eq(m, "msub") {
+        if not n_ops(A, ops, 4, m) or not all_rz(ops) or not same_width(ops) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ae.madd(bx(ops[0].x), m[1] == 's', ops[0].reg, ops[1].reg, ops[2].reg, ops[3].reg));
+        return true;
+    }
+    if u.str_eq(m, "mul") or u.str_eq(m, "mneg") {
+        if not n_ops(A, ops, 3, m) or not all_rz(ops) or not same_width(ops) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ae.madd(bx(ops[0].x), m[1] == 'n', ops[0].reg, ops[1].reg, ops[2].reg, 31));
+        return true;
+    }
+    // smaddl smsubl umaddl umsubl, smull smnegl umull umnegl
+    let longs = ["smaddl", "smsubl", "umaddl", "umsubl", "smull", "smnegl", "umull", "umnegl"];
+    for k in @as(usize, 0)..8 {
+        if u.str_eq(m, longs[k]) {
+            let four = k < 4;
+            let n: usize = pick_us(four, 4, 3);
+            if not n_ops(A, ops, n, m) or not all_rz(ops) or not ops[0].x or ops[1].x or ops[2].x or
+               (four and not ops[3].x) {
+                bad(A, m);
+                return true;
+            }
+            let mut ra: i32 = 31;
+            if four {
+                ra = ops[3].reg;
+            }
+            let uns = (k == 2) or (k == 3) or (k == 6) or (k == 7);
+            let neg = (k == 1) or (k == 3) or (k == 5) or (k == 7);
+            let mut w: u64 = 0x9b200000;
+            if uns {
+                w = 0x9ba00000;
+            }
+            if neg {
+                w = w | 0x8000;
+            }
+            w32(A, ((w | (r5(ops[2].reg) << 16)) | (r5(ra) << 10)) | ((r5(ops[1].reg) << 5) | r5(ops[0].reg)));
+            return true;
+        }
+    }
+    if u.str_eq(m, "smulh") or u.str_eq(m, "umulh") {
+        if not n_ops(A, ops, 3, m) or not all_rz(ops) or not ops[0].x or not same_width(ops) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ae.mulh(m[0] == 's', ops[0].reg, ops[1].reg, ops[2].reg));
+        return true;
+    }
+    if u.str_eq(m, "udiv") or u.str_eq(m, "sdiv") {
+        if not n_ops(A, ops, 3, m) or not all_rz(ops) or not same_width(ops) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ae.dp2(bx(ops[0].x), u64_pick(m[0] == 'u', 2, 3), ops[0].reg, ops[1].reg, ops[2].reg));
+        return true;
+    }
+    let vs = ["lslv", "lsrv", "asrv", "rorv"];
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(m, vs[k]) {
+            if not n_ops(A, ops, 3, m) or not all_rz(ops) or not same_width(ops) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.dp2(bx(ops[0].x), 8 + @as(u64, k), ops[0].reg, ops[1].reg, ops[2].reg));
+            return true;
+        }
+    }
+    return false;
+}
+
+fn csel(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let four = ["csel", "csinc", "csinv", "csneg"];
+    let opv: [4]u64 = [0, 0, 1, 1];
+    let o2v: [4]u64 = [0, 1, 0, 1];
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(m, four[k]) {
+            if not n_ops(A, ops, 4, m) or not all_rz(ops[0..3]) or not same_width(ops[0..3]) {
+                bad(A, m);
+                return true;
+            }
+            let c = cond_op(A, &ops[3]);
+            w32(A, csel_word(ops[0].x, opv[k], o2v[k], ops[0].reg, ops[1].reg, ops[2].reg, c));
+            return true;
+        }
+    }
+    // cset csetm (rd, cond), cinc cinv cneg (rd, rn, cond)
+    if u.str_eq(m, "cset") or u.str_eq(m, "csetm") {
+        if not n_ops(A, ops, 2, m) or not is_rz(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let c = cond_op(A, &ops[1]);
+        if c >= 14 {
+            bad(A, m);
+            return true;
+        }
+        w32(A, csel_word(ops[0].x, u64_pick(m.len == 5, 1, 0), u64_pick(m.len == 5, 0, 1), ops[0].reg, 31, 31, c ^ 1));
+        return true;
+    }
+    let three = ["cinc", "cinv", "cneg"];
+    for k in @as(usize, 0)..3 {
+        if u.str_eq(m, three[k]) {
+            if not n_ops(A, ops, 3, m) or not all_rz(ops[0..2]) or not same_width(ops[0..2]) {
+                bad(A, m);
+                return true;
+            }
+            let c = cond_op(A, &ops[2]);
+            if c >= 14 {
+                bad(A, m);
+                return true;
+            }
+            let op: u64 = u64_pick(k == 0, 0, 1);
+            let o2: u64 = u64_pick(k == 1, 0, 1);
+            w32(A, csel_word(ops[0].x, op, o2, ops[0].reg, ops[1].reg, ops[1].reg, c ^ 1));
+            return true;
+        }
+    }
+    return false;
+}
+
+fn csel_word(x: bool, op: u64, o2: u64, d: i32, n: i32, mm: i32, c: u64) u64 {
+    return (((0x1a800000 | sfb(x)) | (op << 30)) | ((r5(mm) << 16) | (c << 12))) |
+           (((o2 << 10) | (r5(n) << 5)) | r5(d));
+}
+
+fn adr(A: *mut cr.Asm, page: bool, d: i32, o: *AOp) void {
+    let v = cr.settle(A, o.v);
+    if not v.ok {
+        return;
+    }
+    let here = cr.here(A);
+    if page {
+        if v.sym < 0 {
+            cr.fail(A, "adrp needs a symbol");
+            return;
+        }
+        if A.inline_ and cr.def_of(A, v.sym).intext {
+            cr.fail(A, "adrp to a label of inline assembly");
+            return;
+        }
+        let mut ty = elf.R_AARCH64_ADR_PREL_PG_HI21;
+        if v.rm == cr.RM_GOT {
+            ty = elf.R_AARCH64_ADR_GOT_PAGE;
+        } else if v.rm != cr.RM_NONE {
+            cr.fail(A, "this relocation operator is not one of adrp");
+            return;
+        }
+        cr.reloc(A, here, ty, v, v.k);
+        w32(A, 0x90000000 | r5(d));
+        return;
+    }
+    let mut toff: u64 = 0;
+    if not cr.local_target(A, v, &mut toff) or (v.rm != cr.RM_NONE) {
+        cr.fail(A, "adr needs a label of this section (adrp and add reach symbols)");
+        return;
+    }
+    let rel = (@bit_cast(i64, toff) + v.k) - @bit_cast(i64, here);
+    if ((rel < -1048576) or (rel > 1048575)) and (A.pass > 0) {
+        cr.fail(A, "adr: the target is out of reach");
+        return;
+    }
+    let r = @bit_cast(u64, rel) & 0x1fffff;
+    w32(A, ((0x10000000 | ((r & 3) << 29)) | (((r >> 2) & 0x7ffff) << 5)) | r5(d));
+}
+
+fn branch(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if u.str_eq(m, "b") or u.str_eq(m, "bl") {
+        if not n_ops(A, ops, 1, m) {
+            return true;
+        }
+        let bl = m.len == 2;
+        let ty = u32_pick(bl, elf.R_AARCH64_CALL26, elf.R_AARCH64_JUMP26);
+        let off = target(A, &ops[0], ty, 26, 4, m);
+        w32(A, u64_pick(bl, 0x94000000, 0x14000000) | @bit_cast(u64, off));
+        return true;
+    }
+    if (m.len >= 3) and u.starts(m, "b.") {
+        let c = cond_of(m[2..]);
+        if c < 0 {
+            return false;
+        }
+        if not n_ops(A, ops, 1, m) {
+            return true;
+        }
+        let off = target(A, &ops[0], 0, 19, 4, m);
+        w32(A, (0x54000000 | (@bit_cast(u64, off) << 5)) | @bit_cast(u64, c));
+        return true;
+    }
+    if u.str_eq(m, "cbz") or u.str_eq(m, "cbnz") {
+        if not n_ops(A, ops, 2, m) or not is_rz(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let off = target(A, &ops[1], 0, 19, 4, m);
+        w32(A,
+            ((u64_pick(m.len == 4, 0x35000000, 0x34000000) | sfb(ops[0].x)) | (@bit_cast(u64,
+                                                                                         off) << 5)) | r5(ops[0].reg));
+        return true;
+    }
+    if u.str_eq(m, "tbz") or u.str_eq(m, "tbnz") {
+        if not n_ops(A, ops, 3, m) or not is_rz(&ops[0]) {
+            bad(A, m);
+            return true;
+        }
+        let b = konst(A, &ops[1], "the bit");
+        if not range(A, b, 0, pick_i64(ops[0].x, 63, 31), "the bit") {
+            return true;
+        }
+        let off = target(A, &ops[2], 0, 14, 4, m);
+        let bu = @bit_cast(u64, b);
+        w32(A, ((u64_pick(m.len == 4, 0x37000000,
+                          0x36000000) | ((bu >> 5) << 31)) | (
+                              ((bu & 31) << 19) | (@bit_cast(u64, off) << 5))) | r5(ops[0].reg));
+        return true;
+    }
+    if u.str_eq(m, "br") or u.str_eq(m, "blr") or u.str_eq(m, "ret") {
+        let mut r: i32 = 30;
+        if ops.len == 1 {
+            if not is_rz(&ops[0]) or not ops[0].x {
+                bad(A, m);
+                return true;
+            }
+            r = ops[0].reg;
+        } else if (ops.len != 0) or not u.str_eq(m, "ret") {
+            bad(A, m);
+            return true;
+        }
+        let base = u64_pick(u.str_eq(m, "br"), 0xd61f0000, u64_pick(u.str_eq(m, "blr"), 0xd63f0000, 0xd65f0000));
+        w32(A, base | (r5(r) << 5));
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Loads and stores
+// -----------------------------------------------------------------------------
+fn ldst(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let names = ["ldr", "str", "ldrb", "strb", "ldrh", "strh", "ldrsb", "ldrsh", "ldrsw", "ldur", "stur", "ldurb",
+                 "sturb", "ldurh", "sturh", "ldursb", "ldursh", "ldursw", "prfm", "prfum"];
+    for k in @as(usize, 0)..names.len {
+        if u.str_eq(m, names[k]) {
+            single(A, m, k, ops);
+            return true;
+        }
+    }
+    let pairs = ["ldp", "stp", "ldpsw", "ldnp", "stnp"];
+    for k in @as(usize, 0)..5 {
+        if u.str_eq(m, pairs[k]) {
+            pair(A, m, k, ops);
+            return true;
+        }
+    }
+    return exclusive(A, m, ops) or lse(A, m, ops);
+}
+
+// The size (log2 bytes) of a register for loads and stores, and V; or -1.
+fn reg_size(o: *AOp, v: *mut bool) i64 {
+    if o.kind == AK_REG {
+        v.* = false;
+        return pick_i64(o.x, 3, 2);
+    }
+    if o.kind == AK_VREG {
+        v.* = true;
+        let c = o.view;
+        if c == 'b' {
+            return 0;
+        }
+        if c == 'h' {
+            return 1;
+        }
+        if c == 's' {
+            return 2;
+        }
+        if c == 'd' {
+            return 3;
+        }
+        if c == 'q' {
+            return 4;
+        }
+    }
+    return -1;
+}
+
+let LO12_TYPES: [5]u32 = [elf.R_AARCH64_LDST8_ABS_LO12_NC, elf.R_AARCH64_LDST16_ABS_LO12_NC,
+                          elf.R_AARCH64_LDST32_ABS_LO12_NC, elf.R_AARCH64_LDST64_ABS_LO12_NC,
+                          elf.R_AARCH64_LDST128_ABS_LO12_NC];
+
+// ldr str (and b, h, sb, sh, sw), the unscaled ldur..., prfm: names[k].
+fn single(A: *mut cr.Asm, m: []u8, k0: usize, ops: []AOp) void {
+    if (ops.len < 2) or (ops.len > 3) {
+        bad(A, m);
+        return;
+    }
+    let t = ops[0];
+    let mem = ops[1];
+    let prfm = k0 >= 18;
+    let unscaled = ((k0 >= 9) and (k0 <= 17)) or (k0 == 19);
+    // the scaled instruction's index for an unscaled one (ldur -> ldr ...)
+    let mut k = k0;
+    if (k0 >= 9) and (k0 <= 17) {
+        k = k0 - 9;
+    }
+    let load = (m[0] == 'l') or prfm;
+    let mut size: i64 = 0;
+    let mut v = false;
+    let mut opc: u64 = 0;
+    if prfm {
+        size = 3;
+        opc = 2;
+        if (t.kind == AK_EXPR) and (prfop(t.name) < 0) {
+            cr.fail(A, u.f1("'%s' is not a prefetch operation", t.name));
+            return;
+        }
+        if (t.kind != AK_EXPR) and (t.kind != AK_IMM) {
+            bad(A, m);
+            return;
+        }
+    } else if (k == 0) or (k == 1) {
+        size = reg_size(&t, &mut v);
+        if (size < 0) or ((t.kind == AK_REG) and t.sp) {
+            bad(A, m);
+            return;
+        }
+        opc = u64_pick(load, 1, 0);
+        if v and (size == 4) {
+            opc = u64_pick(load, 3, 2);
+        }
+    } else {
+        if not is_rz(&t) {
+            bad(A, m);
+            return;
+        }
+        if (k >= 2) and (k <= 5) {
+            size = pick_i64(k <= 3, 0, 1);
+            opc = u64_pick(load, 1, 0);
+            if t.x {
+                bad(A, m);
+                return;
+            }
+        } else if (k == 6) or (k == 7) {
+            size = pick_i64(k == 6, 0, 1);
+            opc = u64_pick(t.x, 2, 3);
+        } else {
+            size = 2;
+            opc = 2;
+            if not t.x {
+                bad(A, m);
+                return;
+            }
+        }
+    }
+    let su = @bit_cast(u64, size & 3);
+    let vb: u64 = u64_pick(v, 1 << 26, 0);
+    let rt = prf_or_reg(A, &t);
+    // a literal: ldr xt, label
+    if (mem.kind == AK_EXPR) or (mem.kind == AK_IMM) {
+        if not load or unscaled or ((k != 0) and (k != 8) and not prfm) {
+            bad(A, m);
+            return;
+        }
+        let off = target(A, &mem, 0, 19, 4, m);
+        let mut lopc: u64 = 0;
+        if prfm {
+            lopc = 3;
+        } else if k == 8 {
+            lopc = 2;
+        } else if v {
+            if size < 2 {
+                bad(A, m);
+                return;
+            }
+            lopc = @bit_cast(u64, size - 2);
+        } else {
+            lopc = u64_pick(t.x, 1, 0);
+        }
+        w32(A, (((lopc << 30) | 0x18000000) | vb) | ((@bit_cast(u64, off) << 5) | r5(rt)));
+        return;
+    }
+    if mem.kind != AK_MEM {
+        bad(A, m);
+        return;
+    }
+    let w0 = ((su << 30) | 0x38000000) | ((vb | (opc << 22)) | ((r5(mem.base) << 5) | r5(rt)));
+    // post-index: [xn], #imm
+    if ops.len == 3 {
+        if mem.off or (mem.rm >= 0) or mem.pre or unscaled or prfm {
+            bad(A, m);
+            return;
+        }
+        let i = konst(A, &ops[2], "the offset");
+        if range(A, i, -256, 255, "the offset") {
+            w32(A, (w0 | 0x400) | ((@bit_cast(u64, i) & 0x1ff) << 12));
+        }
+        return;
+    }
+    if mem.rm >= 0 {
+        // register offset: lsl (x), uxtw / sxtw (w), sxtx (x)
+        if unscaled or mem.pre {
+            bad(A, m);
+            return;
+        }
+        let mut option: u64 = 3;
+        if mem.sh == SH_LSL {
+            if not mem.rmx {
+                bad(A, m);
+                return;
+            }
+        } else if (mem.sh == (SH_UXTB + 2)) or (mem.sh == (SH_UXTB + 6)) {
+            option = @as(u64, mem.sh - SH_UXTB);
+            if mem.rmx {
+                bad(A, m);
+                return;
+            }
+        } else if mem.sh == (SH_UXTB + 7) {
+            option = 7;
+            if not mem.rmx {
+                bad(A, m);
+                return;
+            }
+        } else {
+            bad(A, m);
+            return;
+        }
+        let mut s: u64 = 0;
+        if mem.amt >= 0 {
+            if (@as(i64, mem.amt) != size) and (mem.amt != 0) {
+                cr.fail(A, u.f1("the shift of '%s' must be the access's size (log2) or 0", m));
+                return;
+            }
+            if (mem.amt != 0) or (size == 0) {
+                s = 1;
+            }
+        }
+        w32(A, ((w0 | 0x00200800) | (r5(mem.rm) << 16)) | ((option << 13) | (s << 12)));
+        return;
+    }
+    let ov = cr.settle(A, mem.v);
+    if not ov.ok {
+        return;
+    }
+    if (ov.rm == cr.RM_LO12) or (ov.rm == cr.RM_GOT_LO12) {
+        if mem.pre or unscaled {
+            bad(A, m);
+            return;
+        }
+        let mut ty = LO12_TYPES[@int_cast(usize, size)];
+        if ov.rm == cr.RM_GOT_LO12 {
+            if (size != 3) or v {
+                bad(A, m);
+                return;
+            }
+            ty = elf.R_AARCH64_LD64_GOT_LO12_NC;
+        }
+        cr.reloc(A, cr.here(A), ty, ov, ov.k);
+        w32(A, w0 | 0x01000000);
+        return;
+    }
+    if not cr.is_const(ov) {
+        cr.fail(A, u.f1("the offset of '%s' must be a constant", m));
+        return;
+    }
+    let off = ov.k;
+    if mem.pre {
+        if unscaled or prfm {
+            bad(A, m);
+            return;
+        }
+        if range(A, off, -256, 255, "the offset") {
+            w32(A, (w0 | 0xc00) | ((@bit_cast(u64, off) & 0x1ff) << 12));
+        }
+        return;
+    }
+    let scale = @as(i64, 1) << @truncate(u32, @bit_cast(u64, size));
+    if not unscaled and (off >= 0) and ((off % scale) == 0) and ((off / scale) <= 4095) {
+        w32(A, (w0 | 0x01000000) | (@bit_cast(u64, off / scale) << 10));
+        return;
+    }
+    // unscaled (ldur, or an offset ldr cannot scale)
+    if range(A, off, -256, 255, "the offset") {
+        w32(A, w0 | ((@bit_cast(u64, off) & 0x1ff) << 12));
+    }
+}
+
+fn prfop(n: []u8) i64 {
+    let ops = ["pldl1keep", "pldl1strm", "pldl2keep", "pldl2strm", "pldl3keep", "pldl3strm", "", "", "plil1keep",
+               "plil1strm", "plil2keep", "plil2strm", "plil3keep", "plil3strm", "", "", "pstl1keep", "pstl1strm",
+               "pstl2keep", "pstl2strm", "pstl3keep", "pstl3strm"];
+    for k in 0..ops.len {
+        if (ops[k].len > 0) and u.str_eq(n, ops[k]) {
+            return @int_cast(i64, k);
+        }
+    }
+    return -1;
+}
+
+// The Rt field: a register, or a prefetch operation.
+fn prf_or_reg(A: *mut cr.Asm, t: *AOp) i32 {
+    if t.kind == AK_EXPR {
+        return @truncate(i32, prfop(t.name) & 31);
+    }
+    if t.kind == AK_IMM {
+        return @truncate(i32, konst(A, t, "the prefetch operation") & 31);
+    }
+    return t.reg;
+}
+
+fn pair(A: *mut cr.Asm, m: []u8, k: usize, ops: []AOp) void {
+    if (ops.len < 3) or (ops.len > 4) {
+        bad(A, m);
+        return;
+    }
+    let t1 = ops[0];
+    let t2 = ops[1];
+    let mem = ops[2];
+    let load = m[0] == 'l';
+    let mut v = false;
+    let mut v2 = false;
+    let size = reg_size(&t1, &mut v);
+    let size2 = reg_size(&t2, &mut v2);
+    if (size < 2) or (size != size2) or (v != v2) or (mem.kind != AK_MEM) or (mem.rm >= 0) or
+       ((t1.kind == AK_REG) and (t1.sp or t2.sp)) {
+        bad(A, m);
+        return;
+    }
+    let mut opc: u64 = 0;
+    if v {
+        opc = @bit_cast(u64, size - 2);
+    } else if size == 3 {
+        opc = 2;
+    }
+    let mut scale = @as(i64, 1) << @truncate(u32, @bit_cast(u64, size));
+    if k == 2 {
+        // ldpsw
+        if v or (size != 3) {
+            bad(A, m);
+            return;
+        }
+        opc = 1;
+        scale = 4;
+    }
+    let mut mode: u64 = 2;  // signed offset
+    let mut off: i64 = 0;
+    if ops.len == 4 {
+        if mem.off or mem.pre or (k >= 3) {
+            bad(A, m);
+            return;
+        }
+        mode = 1;
+        off = konst(A, &ops[3], "the offset");
+    } else {
+        if mem.off {
+            let ov = cr.settle(A, mem.v);
+            if not cr.is_const(ov) {
+                cr.fail(A, u.f1("the offset of '%s' must be a constant", m));
+                return;
+            }
+            off = ov.k;
+        }
+        if mem.pre {
+            if k >= 3 {
+                bad(A, m);
+                return;
+            }
+            mode = 3;
+        }
+    }
+    if k >= 3 {
+        mode = 0;
+    }
+    if (off % scale) != 0 {
+        cr.fail(A, u.f1("the offset of '%s' is not a multiple of the registers' size", m));
+        return;
+    }
+    if not range(A, off, -64 * scale, 63 * scale, "the offset") {
+        return;
+    }
+    let q = off / scale;
+    let vb: u64 = u64_pick(v, 1 << 26, 0);
+    let lb: u64 = u64_pick(load, 1 << 22, 0);
+    w32(A,
+        ((((opc << 30) | 0x28000000) | (vb | (mode << 23))) | (lb | ((@bit_cast(u64,
+                                                                                q) & 0x7f) << 15))) |
+        (((r5(t2.reg) << 10) | (r5(mem.base) << 5)) | r5(t1.reg)));
+}
+
+// The base register of an exclusive or atomic access: [xn] (or [xn, #0]).
+fn base_only(A: *mut cr.Asm, o: *AOp, m: []u8) i32 {
+    if (o.kind != AK_MEM) or (o.rm >= 0) or o.pre {
+        bad(A, m);
+        return -1;
+    }
+    if o.off {
+        let v = cr.settle(A, o.v);
+        if not cr.is_const(v) or (v.k != 0) {
+            cr.fail(A, u.f1("'%s' takes a base register with no offset", m));
+            return -1;
+        }
+    }
+    return o.base;
+}
+
+// ldxr ldaxr stxr stlxr ldar stlr ldapr ldlar stllr (b, h), the pairs, clrex
+fn exclusive(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let names = ["ldxr", "ldaxr", "stxr", "stlxr", "ldar", "stlr", "ldapr", "ldlar", "stllr"];
+    let bases: [9]u64 = [0x085f7c00, 0x085ffc00, 0x08007c00, 0x0800fc00, 0x08dffc00, 0x089ffc00, 0x38bfc000, 0x08df7c00,
+                         0x089f7c00];
+    for k in @as(usize, 0)..9 {
+        let mut sz: i64 = -1;
+        if u.str_eq(m, names[k]) {
+            sz = 4;  // (by the register)
+        } else if u.str_eq(m, u.cat2(names[k], "b")) {
+            sz = 0;
+        } else if u.str_eq(m, u.cat2(names[k], "h")) {
+            sz = 1;
+        }
+        if sz < 0 {
+            continue;
+        }
+        let st = (k == 2) or (k == 3);
+        let n: usize = pick_us(st, 3, 2);
+        if not n_ops(A, ops, n, m) {
+            return true;
+        }
+        let t = ops[n - 2];
+        if not is_rz(&t) or (st and (not is_rz(&ops[0]) or ops[0].x)) {
+            bad(A, m);
+            return true;
+        }
+        if sz == 4 {
+            sz = pick_i64(t.x, 3, 2);
+        } else if t.x {
+            bad(A, m);
+            return true;
+        }
+        let b = base_only(A, &ops[n - 1], m);
+        if b < 0 {
+            return true;
+        }
+        let mut w = bases[k] | (@bit_cast(u64, sz) << 30);
+        if st {
+            w = w | (r5(ops[0].reg) << 16);
+        }
+        w32(A, (w | (r5(b) << 5)) | r5(t.reg));
+        return true;
+    }
+    let pn = ["ldxp", "ldaxp", "stxp", "stlxp"];
+    let pb: [4]u64 = [0x887f0000, 0x887f8000, 0x88200000, 0x88208000];
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(m, pn[k]) {
+            let st = k >= 2;
+            let n: usize = pick_us(st, 4, 3);
+            if not n_ops(A, ops, n, m) {
+                return true;
+            }
+            let t1 = ops[n - 3];
+            let t2 = ops[n - 2];
+            if not is_rz(&t1) or not is_rz(&t2) or (t1.x != t2.x) or (st and (not is_rz(&ops[0]) or ops[0].x)) {
+                bad(A, m);
+                return true;
+            }
+            let b = base_only(A, &ops[n - 1], m);
+            if b < 0 {
+                return true;
+            }
+            let mut w = pb[k] | (bx(t1.x) << 30);
+            if st {
+                w = w | (r5(ops[0].reg) << 16);
+            }
+            w32(A, ((w | (r5(t2.reg) << 10)) | (r5(b) << 5)) | r5(t1.reg));
+            return true;
+        }
+    }
+    if u.str_eq(m, "clrex") {
+        let mut crm: u64 = 15;
+        if ops.len == 1 {
+            let x = konst(A, &ops[0], "the option");
+            if not range(A, x, 0, 15, "the option") {
+                return true;
+            }
+            crm = @bit_cast(u64, x);
+        }
+        w32(A, 0xd503305f | (crm << 8));
+        return true;
+    }
+    return false;
+}
+
+// The LSE atomics: cas, ld<op>, st<op>, swp (with a, l, al; b, h).
+fn lse(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let opsn = ["add", "clr", "eor", "set", "smax", "smin", "umax", "umin"];
+    let mut kind: i32 = -1;  // 0 cas, 1 ld<op>, 2 st<op>, 3 swp
+    let mut found: u64 = 0;
+    let mut tail = "";
+    if u.starts(m, "cas") {
+        kind = 0;
+        tail = m[3..];
+    } else if u.starts(m, "swp") {
+        kind = 3;
+        tail = m[3..];
+    } else if (m.len > 4) and (u.starts(m, "ld") or u.starts(m, "st")) {
+        for k in @as(usize, 0)..8 {
+            if u.starts(m[2..], opsn[k]) {
+                found = @as(u64, k);
+                kind = 2;
+                if m[0] == 'l' {
+                    kind = 1;
+                }
+                tail = m[2 + opsn[k].len..];
+            }
+        }
+    }
+    if kind < 0 {
+        return false;
+    }
+    // the size suffix (b, h), then the ordering (a, l, al)
+    let mut sz: i64 = 4;
+    if u.ends(tail, "b") {
+        sz = 0;
+        tail = tail[0..tail.len - 1];
+    } else if u.ends(tail, "h") {
+        sz = 1;
+        tail = tail[0..tail.len - 1];
+    }
+    let mut acq = false;
+    let mut rel = false;
+    if u.str_eq(tail, "a") {
+        acq = true;
+    } else if u.str_eq(tail, "l") {
+        rel = true;
+    } else if u.str_eq(tail, "al") {
+        acq = true;
+        rel = true;
+    } else if tail.len != 0 {
+        return false;
+    }
+    if (kind == 2) and acq {
+        return false;
+    }
+    let n: usize = pick_us(kind == 2, 2, 3);
+    if not n_ops(A, ops, n, m) {
+        return true;
+    }
+    let s = ops[0];
+    let mut t = zr(s.x);
+    if n == 3 {
+        t = ops[1];
+    }
+    if not is_rz(&s) or not is_rz(&t) or (s.x != t.x) {
+        bad(A, m);
+        return true;
+    }
+    if sz == 4 {
+        sz = pick_i64(s.x, 3, 2);
+    } else if s.x {
+        bad(A, m);
+        return true;
+    }
+    let b = base_only(A, &ops[n - 1], m);
+    if b < 0 {
+        return true;
+    }
+    let szu = @bit_cast(u64, sz) << 30;
+    if kind == 0 {
+        w32(A,
+            (((0x08a07c00 | szu) | (bx(acq) << 22)) | (bx(rel) << 15)) |
+            (((r5(s.reg) << 16) | (r5(b) << 5)) | r5(t.reg)));
+        return true;
+    }
+    let mut w = ((0x38200000 | szu) | (bx(acq) << 23)) | (bx(rel) << 22);
+    if kind == 3 {
+        w = w | 0x8000;
+    } else {
+        w = w | (found << 12);
+    }
+    w32(A, (w | (r5(s.reg) << 16)) | ((r5(b) << 5) | r5(t.reg)));
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// System instructions
+// -----------------------------------------------------------------------------
+// The system registers programs read and write: their o0:op1:CRn:CRm:op2
+// (op0's low bit first: 15 bits).
+let SYSREGS: [14][]u8 = ["tpidr_el0", "tpidrro_el0", "fpcr", "fpsr", "nzcv", "cntvct_el0", "cntfrq_el0", "cntpct_el0",
+                         "dczid_el0", "ctr_el0", "midr_el1", "mpidr_el1", "dit", "rndr"];
+let SYSENC: [14]u64 = [0x5e82, 0x5e83, 0x5a20, 0x5a21, 0x5a10, 0x5f02, 0x5f00, 0x5f01, 0x5807, 0x5801, 0x4000, 0x4005,
+                       0x5a15, 0x5920];
+
+// A system register's encoding (the 15 bits of mrs/msr from bit 5), or -1.
+fn sysreg(n: []u8) i64 {
+    for k in 0..SYSREGS.len {
+        if u.str_eq(n, SYSREGS[k]) {
+            return @bit_cast(i64, SYSENC[k]);
+        }
+    }
+    // s<op0>_<op1>_c<n>_c<m>_<op2>
+    if (n.len > 0) and (n[0] == 's') {
+        let parts = u.split(n[1..], '_', 8);
+        if parts.len == 5 {
+            let op0 = ai.num(parts.get(0));
+            let op1 = ai.num(parts.get(1));
+            let crn = cnum(parts.get(2));
+            let crm = cnum(parts.get(3));
+            let op2 = ai.num(parts.get(4));
+            if (op0 >= 2) and (op0 <= 3) and (op1 >= 0) and (op1 < 8) and (crn >= 0) and (crn < 16) and (crm >= 0) and
+               (crm < 16) and (op2 >= 0) and (op2 < 8) {
+                return ((((op0 - 2) << 14) | (op1 << 11)) | ((crn << 7) | (crm << 3))) | op2;
+            }
+        }
+    }
+    return -1;
+}
+
+fn cnum(s: []u8) i64 {
+    if (s.len < 2) or (s[0] != 'c') {
+        return -1;
+    }
+    return ai.num(s[1..]);
+}
+
+let BARRIERS: [12][]u8 = ["oshld", "oshst", "osh", "nshld", "nshst", "nsh", "ishld", "ishst", "ish", "ld", "st", "sy"];
+let BARV: [12]u64 = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15];
+
+fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let hints = ["nop", "yield", "wfe", "wfi", "sev", "sevl", "esb", "csdb", "paciasp", "autiasp", "bti", "pacibsp",
+                 "autibsp", "xpaclri"];
+    let hv: [14]u64 = [0, 1, 2, 3, 4, 5, 16, 20, 25, 29, 32, 27, 31, 7];
+    for k in 0..hints.len {
+        if u.str_eq(m, hints[k]) {
+            let mut x = hv[k];
+            if (k == 10) and (ops.len == 1) {
+                // bti c, j, jc
+                let n = ops[0].name;
+                if u.str_eq(n, "c") {
+                    x = 34;
+                } else if u.str_eq(n, "j") {
+                    x = 36;
+                } else if u.str_eq(n, "jc") {
+                    x = 38;
+                } else {
+                    bad(A, m);
+                    return true;
+                }
+            } else if ops.len != 0 {
+                bad(A, m);
+                return true;
+            }
+            w32(A, 0xd503201f | (x << 5));
+            return true;
+        }
+    }
+    if u.str_eq(m, "hint") {
+        if not n_ops(A, ops, 1, m) {
+            return true;
+        }
+        let x = konst(A, &ops[0], "the hint");
+        if range(A, x, 0, 127, "the hint") {
+            w32(A, 0xd503201f | (@bit_cast(u64, x) << 5));
+        }
+        return true;
+    }
+    if u.str_eq(m, "svc") or u.str_eq(m, "brk") or u.str_eq(m, "hlt") or u.str_eq(m, "udf") {
+        if not n_ops(A, ops, 1, m) {
+            return true;
+        }
+        let x = konst(A, &ops[0], "the immediate");
+        if not range(A, x, 0, 65535, "the immediate") {
+            return true;
+        }
+        if m[0] == 'u' {
+            w32(A, @bit_cast(u64, x));
+            return true;
+        }
+        let base = u64_pick(m[0] == 's', 0xd4000001, u64_pick(m[0] == 'b', 0xd4200000, 0xd4400000));
+        w32(A, base | (@bit_cast(u64, x) << 5));
+        return true;
+    }
+    if u.str_eq(m, "dmb") or u.str_eq(m, "dsb") or u.str_eq(m, "isb") {
+        let mut crm: u64 = 15;
+        if ops.len == 1 {
+            if ops[0].kind == AK_EXPR {
+                let mut ok = false;
+                for k in 0..BARRIERS.len {
+                    if u.str_eq(ops[0].name, BARRIERS[k]) {
+                        crm = BARV[k];
+                        ok = true;
+                    }
+                }
+                if not ok or (u.str_eq(m, "isb") and (crm != 15)) {
+                    cr.fail(A, u.f1("'%s' is not a barrier option", ops[0].name));
+                    return true;
+                }
+            } else {
+                let x = konst(A, &ops[0], "the option");
+                if not range(A, x, 0, 15, "the option") {
+                    return true;
+                }
+                crm = @bit_cast(u64, x);
+            }
+        } else if (ops.len != 0) or not u.str_eq(m, "isb") {
+            bad(A, m);
+            return true;
+        }
+        let base = u64_pick(m[1] == 'm', 0xd50330bf, u64_pick(m[0] == 'd', 0xd503309f, 0xd50330df));
+        w32(A, base | (crm << 8));
+        return true;
+    }
+    if u.str_eq(m, "mrs") or u.str_eq(m, "msr") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        let rd = m[1] == 'r';
+        let r = ops[pick_us(rd, 0, 1)];
+        let s = ops[pick_us(rd, 1, 0)];
+        if not is_rz(&r) or not r.x or (s.kind != AK_EXPR) {
+            bad(A, m);
+            return true;
+        }
+        let e = sysreg(s.name);
+        if e < 0 {
+            cr.fail(A, u.f1("the system register '%s' is not supported", s.name));
+            return true;
+        }
+        let base = u64_pick(rd, 0xd5300000, 0xd5100000);
+        w32(A, (base | (@bit_cast(u64, e) << 5)) | r5(r.reg));
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Floating point (scalar)
+// -----------------------------------------------------------------------------
+// The ftype field of a scalar view: s 0, d 1, h 3; or -1.
+fn ftype(o: *AOp) i64 {
+    if o.kind != AK_VREG {
+        return -1;
+    }
+    if o.view == 's' {
+        return 0;
+    }
+    if o.view == 'd' {
+        return 1;
+    }
+    if o.view == 'h' {
+        return 3;
+    }
+    return -1;
+}
+
+fn same_ft(ops: []AOp) i64 {
+    let t = ftype(&ops[0]);
+    for o in ops {
+        if ftype(&o) != t {
+            return -1;
+        }
+    }
+    return t;
+}
+
+fn fp(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    let two = ["fmul", "fdiv", "fadd", "fsub", "fmax", "fmin", "fmaxnm", "fminnm", "fnmul"];
+    for k in 0..two.len {
+        if u.str_eq(m, two[k]) and (ops.len == 3) and (ops[0].view != 'v') {
+            let t = same_ft(ops);
+            if t < 0 {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.fp2(@bit_cast(u64, t), @as(u64, k), ops[0].reg, ops[1].reg, ops[2].reg));
+            return true;
+        }
+    }
+    let one = ["fmov", "fabs", "fneg", "fsqrt", "", "", "", "", "frintn", "frintp", "frintm", "frintz", "frinta", "",
+               "frintx", "frinti"];
+    for k in 0..one.len {
+        if (one[k].len > 0) and u.str_eq(m, one[k]) and (ops.len == 2) and (ftype(&ops[0]) >= 0) and
+           (ftype(&ops[1]) >= 0) {
+            let t = same_ft(ops);
+            if t < 0 {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.fp1(@bit_cast(u64, t), @as(u64, k), ops[0].reg, ops[1].reg));
+            return true;
+        }
+    }
+    if u.str_eq(m, "fmov") {
+        return fmov(A, m, ops);
+    }
+    if u.str_eq(m, "fcvt") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        let d = ftype(&ops[0]);
+        let s = ftype(&ops[1]);
+        if (d < 0) or (s < 0) or (d == s) {
+            bad(A, m);
+            return true;
+        }
+        let opc = u64_pick(d == 0, 4, u64_pick(d == 1, 5, 7));
+        w32(A, ae.fp1(@bit_cast(u64, s), opc, ops[0].reg, ops[1].reg));
+        return true;
+    }
+    let three = ["fmadd", "fmsub", "fnmadd", "fnmsub"];
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(m, three[k]) {
+            if not n_ops(A, ops, 4, m) {
+                return true;
+            }
+            let t = same_ft(ops);
+            if t < 0 {
+                bad(A, m);
+                return true;
+            }
+            let o1 = @as(u64, k >> 1);
+            let o0 = @as(u64, k & 1);
+            w32(A, (((0x1f000000 | (@bit_cast(u64,
+                                              t) << 22)) | ((o1 << 21) | (r5(ops[2].reg) << 16))) |
+                    ((o0 << 15) | (r5(ops[3].reg) << 10))) | ((r5(ops[1].reg) << 5) | r5(ops[0].reg)));
+            return true;
+        }
+    }
+    if u.str_eq(m, "fcmp") or u.str_eq(m, "fcmpe") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        let t = ftype(&ops[0]);
+        if t < 0 {
+            bad(A, m);
+            return true;
+        }
+        let mut opc: u64 = u64_pick(m.len == 5, 0x10, 0);
+        let mut rm: i32 = 0;
+        if ops[1].kind == AK_IMM {
+            let z = (ops[1].fp and (ops[1].f == 0.0)) or (not ops[1].fp and (konst(A, &ops[1], "the constant") == 0));
+            if not z {
+                cr.fail(A, u.f1("'%s' compares with 0.0 only", m));
+                return true;
+            }
+            opc = opc | 8;
+        } else {
+            if ftype(&ops[1]) != t {
+                bad(A, m);
+                return true;
+            }
+            rm = ops[1].reg;
+        }
+        w32(A, (((0x1e202000 | (@bit_cast(u64, t) << 22)) | (r5(rm) << 16)) | (r5(ops[0].reg) << 5)) | opc);
+        return true;
+    }
+    if u.str_eq(m, "fccmp") or u.str_eq(m, "fccmpe") {
+        if not n_ops(A, ops, 4, m) {
+            return true;
+        }
+        let t = same_ft(ops[0..2]);
+        if t < 0 {
+            bad(A, m);
+            return true;
+        }
+        let nz = konst(A, &ops[2], "nzcv");
+        if not range(A, nz, 0, 15, "nzcv") {
+            return true;
+        }
+        let c = cond_op(A, &ops[3]);
+        w32(A, (((0x1e200400 | (@bit_cast(u64,
+                                          t) << 22)) | (r5(ops[1].reg) << 16)) | ((c << 12) | (r5(ops[0].reg) << 5))) |
+            (u64_pick(m.len == 6, 0x10, 0) | @bit_cast(u64, nz)));
+        return true;
+    }
+    if u.str_eq(m, "fcsel") {
+        if not n_ops(A, ops, 4, m) {
+            return true;
+        }
+        let t = same_ft(ops[0..3]);
+        if t < 0 {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ae.fcsel(@bit_cast(u64, t), ops[0].reg, ops[1].reg, ops[2].reg, cond_op(A, &ops[3])));
+        return true;
+    }
+    // conversions between integers and floating point
+    let cvs = ["fcvtns", "fcvtnu", "scvtf", "ucvtf", "fcvtas", "fcvtau", "fcvtps", "fcvtpu", "fcvtms", "fcvtmu",
+               "fcvtzs", "fcvtzu"];
+    let rmo: [12]u64 = [0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3];
+    let opo: [12]u64 = [0, 1, 2, 3, 4, 5, 0, 1, 0, 1, 0, 1];
+    for k in 0..cvs.len {
+        if u.str_eq(m, cvs[k]) and (ops.len == 2) and ((ops[0].kind == AK_REG) or (ops[1].kind == AK_REG)) {
+            let to_fp = (k == 2) or (k == 3);
+            let g = ops[pick_us(to_fp, 1, 0)];
+            let f = ops[pick_us(to_fp, 0, 1)];
+            let t = ftype(&f);
+            if not is_rz(&g) or (t < 0) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.fcvt_int(bx(g.x), @bit_cast(u64, t), rmo[k], opo[k], ops[0].reg, ops[1].reg));
+            return true;
+        }
+    }
+    return false;
+}
+
+fn fmov(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if not n_ops(A, ops, 2, m) {
+        return true;
+    }
+    let d = ops[0];
+    let s = ops[1];
+    let td = ftype(&d);
+    if (td >= 0) and (s.kind == AK_IMM) {
+        let mut f = s.f;
+        if not s.fp {
+            f = @float_from_int(f64, konst(A, &s, "the constant"));
+        }
+        let im = fp_imm8(f);
+        if im < 0 {
+            cr.fail(A, "fmov of a constant that is not a floating-point immediate");
+            return true;
+        }
+        w32(A, ((0x1e201000 | (@bit_cast(u64, td) << 22)) | (@bit_cast(u64, im) << 13)) | r5(d.reg));
+        return true;
+    }
+    // general <-> floating point
+    if (td >= 0) and is_rz(&s) {
+        if not (((td == 0) and not s.x) or ((td == 1) and s.x) or (td == 3)) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ((u64_pick(s.x, 0x9e270000, 0x1e270000) | (@bit_cast(u64, td) << 22)) | (r5(s.reg) << 5)) | r5(d.reg));
+        return true;
+    }
+    let ts = ftype(&s);
+    if is_rz(&d) and (ts >= 0) {
+        if not (((ts == 0) and not d.x) or ((ts == 1) and d.x) or (ts == 3)) {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ((u64_pick(d.x, 0x9e260000, 0x1e260000) | (@bit_cast(u64, ts) << 22)) | (r5(s.reg) << 5)) | r5(d.reg));
+        return true;
+    }
+    // x <-> v.d[1]
+    if is_rz(&s) and (d.view == 'v') and (d.esize == 64) and (d.index == 1) and s.x {
+        w32(A, (0x9eaf0000 | (r5(s.reg) << 5)) | r5(d.reg));
+        return true;
+    }
+    if is_rz(&d) and (s.view == 'v') and (s.esize == 64) and (s.index == 1) and d.x {
+        w32(A, (0x9eae0000 | (r5(s.reg) << 5)) | r5(d.reg));
+        return true;
+    }
+    bad(A, m);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Vectors (the common instructions)
+// -----------------------------------------------------------------------------
+// The size field of an arrangement (8b 16b 4h 8h 2s 4s 1d 2d) and its Q
+// bit, or -1.
+fn arr(o: *AOp, q: *mut u64) i64 {
+    if (o.kind != AK_VREG) or (o.view != 'v') or (o.lanes == 0) or (o.index >= 0) {
+        return -1;
+    }
+    q.* = u64_pick((o.esize * o.lanes) == 128, 1, 0);
+    if o.esize == 8 {
+        return 0;
+    }
+    if o.esize == 16 {
+        return 1;
+    }
+    if o.esize == 32 {
+        return 2;
+    }
+    if o.esize == 64 {
+        return 3;
+    }
+    return -1;
+}
+
+fn same_arr(ops: []AOp, q: *mut u64) i64 {
+    let s = arr(&ops[0], q);
+    for o in ops {
+        let mut q2: u64 = 0;
+        if (arr(&o, &mut q2) != s) or (q2 != q.*) {
+            return -1;
+        }
+    }
+    return s;
+}
+
+// The size (log2 bytes) of an element operand v0.s[1], or -1.
+fn elem(o: *AOp) i64 {
+    if (o.kind != AK_VREG) or (o.view != 'v') or (o.index < 0) {
+        return -1;
+    }
+    if o.esize == 8 {
+        return 0;
+    }
+    if o.esize == 16 {
+        return 1;
+    }
+    if o.esize == 32 {
+        return 2;
+    }
+    if o.esize == 64 {
+        return 3;
+    }
+    return -1;
+}
+
+fn idx(o: *AOp) u64 {
+    return @as(u64, @bit_cast(u32, o.index));
+}
+
+// mov of vector registers and elements (orr, ins, umov, dup).
+fn vmov(A: *mut cr.Asm, m: []u8, d: AOp, s: AOp) void {
+    let mut q: u64 = 0;
+    let two: [2]AOp = [d, s];
+    if same_arr(two[..], &mut q) >= 0 {
+        w32(A, (((0x0ea01c00 | (q << 30)) | (r5(s.reg) << 16)) | (r5(s.reg) << 5)) | r5(d.reg));
+        return;
+    }
+    let de = elem(&d);
+    let se = elem(&s);
+    if (de >= 0) and is_rz(&s) {
+        w32(A, ae.ins_gen(@bit_cast(u64, de), idx(&d), d.reg, s.reg));
+        return;
+    }
+    if (de >= 0) and (se == de) {
+        w32(A, ae.ins_elem(@bit_cast(u64, de), idx(&d), idx(&s), d.reg, s.reg));
+        return;
+    }
+    if is_rz(&d) and (se >= 2) {
+        // mov w0, v1.s[1] / mov x0, v1.d[1]: umov
+        if (se == 3) != d.x {
+            bad(A, m);
+            return;
+        }
+        w32(A, ae.umov(@bit_cast(u64, se), idx(&s), d.reg, s.reg));
+        return;
+    }
+    if (ftype(&d) >= 0) and (se >= 0) {
+        // mov s0, v1.s[1]: dup (scalar)
+        w32(A, ae.dup_scalar(@bit_cast(u64, se), idx(&s), d.reg, s.reg));
+        return;
+    }
+    bad(A, m);
+}
+
+fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    // three registers of one arrangement: (name, U, opcode); the logic ones
+    // have size fixed (logic_size), the others any but 1d
+    let names = ["add", "sub", "mul", "and", "orr", "eor", "bic", "orn", "cmeq", "cmgt", "cmge", "cmhi", "cmhs", "addp",
+                 "umax", "umin", "smax", "smin", "uqadd", "sqadd", "uqsub", "sqsub", "ushl", "sshl", "cmtst", "bsl",
+                 "bit", "bif"];
+    let uv: [28]u64 = [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1];
+    let opv: [28]u64 = [0x10, 0x10, 0x13, 0x03, 0x03, 0x03, 0x03, 0x03, 0x11, 0x06, 0x07, 0x06, 0x07, 0x17, 0x0c, 0x0d,
+                        0x0c, 0x0d, 0x01, 0x01, 0x05, 0x05, 0x08, 0x08, 0x11, 0x03, 0x03, 0x03];
+    let logic_size: [28]i64 = [-1, -1, -1, 0, 2, 0, 1, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                               -1, -1, 1, 2, 3];
+    for k in 0..names.len {
+        if u.str_eq(m, names[k]) and (ops.len == 3) and (ops[0].kind == AK_VREG) and (ops[0].view == 'v') {
+            let mut q: u64 = 0;
+            let mut sz = same_arr(ops, &mut q);
+            if sz < 0 {
+                bad(A, m);
+                return true;
+            }
+            if logic_size[k] >= 0 {
+                if sz != 0 {
+                    bad(A, m);
+                    return true;
+                }
+                sz = logic_size[k];
+            } else if (sz == 3) and (q == 0) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.v3(q, uv[k], @bit_cast(u64, sz), opv[k], ops[0].reg, ops[1].reg, ops[2].reg));
+            return true;
+        }
+    }
+    // floating point, three registers: fadd fsub fmul fdiv fmax fmin fmaxnm fminnm
+    let fnames = ["fadd", "fsub", "fmul", "fdiv", "fmax", "fmin", "fmaxnm", "fminnm"];
+    let fu: [8]u64 = [0, 0, 1, 1, 0, 0, 0, 0];
+    let fsz: [8]u64 = [0, 2, 0, 0, 0, 2, 0, 2];
+    let fop: [8]u64 = [0x1a, 0x1a, 0x1b, 0x1f, 0x1e, 0x1e, 0x18, 0x18];
+    for k in @as(usize, 0)..8 {
+        if u.str_eq(m, fnames[k]) and (ops.len == 3) and (ops[0].view == 'v') {
+            let mut q: u64 = 0;
+            let sz = same_arr(ops, &mut q);
+            if (sz < 2) or ((sz == 3) and (q == 0)) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.v3(q, fu[k], fsz[k] | @bit_cast(u64, sz - 2), fop[k], ops[0].reg, ops[1].reg, ops[2].reg));
+            return true;
+        }
+    }
+    let twos = ["not", "mvn", "cnt", "rev64", "neg", "abs"];
+    for k in @as(usize, 0)..6 {
+        if u.str_eq(m, twos[k]) and (ops.len == 2) and (ops[0].view == 'v') {
+            let mut q: u64 = 0;
+            let sz = same_arr(ops, &mut q);
+            if (sz < 0) or ((k <= 2) and (sz != 0)) or ((k >= 4) and (sz == 3) and (q == 0)) {
+                bad(A, m);
+                return true;
+            }
+            if k <= 1 {
+                w32(A, ae.v2(q, 1, 0, 0x05, ops[0].reg, ops[1].reg));
+            } else if k == 2 {
+                w32(A, ae.v2(q, 0, 0, 0x05, ops[0].reg, ops[1].reg));
+            } else if k == 3 {
+                w32(A, ae.v2(q, 0, @bit_cast(u64, sz), 0x00, ops[0].reg, ops[1].reg));
+            } else {
+                w32(A, ae.v2(q, bx(k == 4), @bit_cast(u64, sz), 0x0b, ops[0].reg, ops[1].reg));
+            }
+            return true;
+        }
+    }
+    let across = ["addv", "uaddlv", "umaxv", "uminv", "smaxv", "sminv", "saddlv"];
+    let acu: [7]u64 = [0, 1, 1, 1, 0, 0, 0];
+    let aco: [7]u64 = [0x1b, 0x03, 0x0a, 0x1a, 0x0a, 0x1a, 0x03];
+    for k in @as(usize, 0)..7 {
+        if u.str_eq(m, across[k]) {
+            if not n_ops(A, ops, 2, m) {
+                return true;
+            }
+            let mut q: u64 = 0;
+            let s1: [1]AOp = [ops[1]];
+            let sz = same_arr(s1[..], &mut q);
+            if (sz < 0) or (sz == 3) or ((sz == 2) and (q == 0)) or (ops[0].kind != AK_VREG) or (ops[0].view == 'v') {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.vacross(q, acu[k], @bit_cast(u64, sz), aco[k], ops[0].reg, ops[1].reg));
+            return true;
+        }
+    }
+    if u.str_eq(m, "dup") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        let mut q: u64 = 0;
+        let s1: [1]AOp = [ops[0]];
+        let sz = same_arr(s1[..], &mut q);
+        if (sz < 0) or ((sz == 3) and (q == 0)) {
+            bad(A, m);
+            return true;
+        }
+        if is_rz(&ops[1]) {
+            w32(A, ae.dup_gen(@bit_cast(u64, sz), ops[0].reg, ops[1].reg) | (q << 30));
+            return true;
+        }
+        if elem(&ops[1]) != sz {
+            bad(A, m);
+            return true;
+        }
+        w32(A, ae.dup_elem(@bit_cast(u64, sz), idx(&ops[1]), ops[0].reg, ops[1].reg) | (q << 30));
+        return true;
+    }
+    if u.str_eq(m, "ins") {
+        if n_ops(A, ops, 2, m) {
+            vmov(A, m, ops[0], ops[1]);
+        }
+        return true;
+    }
+    if u.str_eq(m, "umov") or u.str_eq(m, "smov") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        let se = elem(&ops[1]);
+        if not is_rz(&ops[0]) or (se < 0) {
+            bad(A, m);
+            return true;
+        }
+        if m[0] == 'u' {
+            if ((se == 3) != ops[0].x) or ((se < 3) and ops[0].x) {
+                bad(A, m);
+                return true;
+            }
+            w32(A, ae.umov(@bit_cast(u64, se), idx(&ops[1]), ops[0].reg, ops[1].reg));
+        } else {
+            if (se == 3) or ((se == 2) and not ops[0].x) {
+                bad(A, m);
+                return true;
+            }
+            let i5 = ae.imm5(@bit_cast(u64, se), idx(&ops[1]));
+            w32(A, (((0x0e002c00 | (bx(ops[0].x) << 30)) | (i5 << 16)) | (r5(ops[1].reg) << 5)) | r5(ops[0].reg));
+        }
+        return true;
+    }
+    if u.str_eq(m, "movi") {
+        if not n_ops(A, ops, 2, m) {
+            return true;
+        }
+        let x = konst(A, &ops[1], "the immediate");
+        if (ops[0].view == 'd') and (x == 0) {
+            w32(A, 0x2f00e400 | r5(ops[0].reg));
+            return true;
+        }
+        let mut q: u64 = 0;
+        let s1: [1]AOp = [ops[0]];
+        let sz = same_arr(s1[..], &mut q);
+        if (sz == 0) and (x >= 0) and (x <= 255) {
+            let xu = @bit_cast(u64, x);
+            w32(A, ((0x0f00e400 | (q << 30)) | (((xu >> 5) & 7) << 16)) | (((xu & 31) << 5) | r5(ops[0].reg)));
+            return true;
+        }
+        if (sz == 3) and (q == 1) and (x == 0) {
+            w32(A, 0x6f00e400 | r5(ops[0].reg));
+            return true;
+        }
+        bad(A, m);
+        return true;
+    }
+    if u.str_eq(m, "ext") {
+        if not n_ops(A, ops, 4, m) {
+            return true;
+        }
+        let mut q: u64 = 0;
+        let sz = same_arr(ops[0..3], &mut q);
+        if sz != 0 {
+            bad(A, m);
+            return true;
+        }
+        let i = konst(A, &ops[3], "the index");
+        if range(A, i, 0, @bit_cast(i64, (q * 8) + 7), "the index") {
+            w32(A,
+                ((0x2e000000 | (q << 30)) | (r5(ops[2].reg) << 16)) | (
+                    (@bit_cast(u64, i) << 11) | ((r5(ops[1].reg) << 5) | r5(ops[0].reg))));
+        }
+        return true;
+    }
+    if u.str_eq(m, "ld1") or u.str_eq(m, "st1") {
+        if (ops.len != 2) and (ops.len != 3) {
+            bad(A, m);
+            return true;
+        }
+        let l = ops[0];
+        if (l.kind != AK_LIST) or (l.index >= 0) or (ops[1].kind != AK_MEM) or (ops[1].rm >= 0) or ops[1].pre or
+           ops[1].off {
+            bad(A, m);
+            return true;
+        }
+        let mut lv = none_op();
+        lv.kind = AK_VREG;
+        lv.view = 'v';
+        lv.esize = l.esize;
+        lv.lanes = l.lanes;
+        let mut q: u64 = 0;
+        let sz = arr(&lv, &mut q);
+        if sz < 0 {
+            bad(A, m);
+            return true;
+        }
+        let opcodes: [4]u64 = [7, 10, 6, 2];
+        let mut w = (
+            (((0x0c000000 | (q << 30)) | (bx(m[0] == 'l') << 22)) | (opcodes[@as(usize,
+                                                                                 l.nregs - 1)] << 12)) | (
+                                                                                     @bit_cast(
+                                                                                         u64,
+                                                                                         sz) << 10)) |
+                    ((r5(ops[1].base) << 5) | r5(l.reg));
+        if ops.len == 3 {
+            // post-index: by the registers' bytes (#imm), or by a register
+            w = w | 0x00800000;
+            if is_rz(&ops[2]) {
+                w = w | (r5(ops[2].reg) << 16);
+            } else {
+                let x = konst(A, &ops[2], "the offset");
+                if x != (@as(i64, l.nregs) * @as(i64, u32_pick(q == 1, 16, 8))) {
+                    cr.fail(A, u.f1("the post-index of '%s' must be the registers' size", m));
+                    return true;
+                }
+                w = w | (31 << 16);
+            }
+        }
+        w32(A, w);
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Operands of asm statements
+// -----------------------------------------------------------------------------
+/// The text of operand o with modifier `mod` (GCC's AArch64 modifiers: w
+/// and x for a general register's widths (of the constant 0: wzr, xzr),
+/// b h s d q for a floating-point and vector register's views, c for a
+/// constant, n for its negation); `err` says why not.
+pub fn render(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
+    if o.kind == ai.OK_REG {
+        if o.reg >= 32 {
+            let n = u.idec(o.reg - 32);
+            let mut v = mod;
+            if mod == 0 {
+                v = 'd';
+                if o.bits == 32 {
+                    v = 's';
+                } else if o.bits == 16 {
+                    v = 'h';
+                } else if o.bits == 128 {
+                    v = 'q';
+                }
+            }
+            if u.find("bhsdq", v) < 0 {
+                err.* = u.f1("the modifier '%s' of a floating-point register", ai.ch_text(mod));
+                return "";
+            }
+            return u.cat2(ai.ch_text(v), n);
+        }
+        let mut x = o.bits == 64;
+        if mod == 'w' {
+            x = false;
+        } else if mod == 'x' {
+            x = true;
+        } else if mod != 0 {
+            err.* = u.f1("the modifier '%s' of a general register", ai.ch_text(mod));
+            return "";
+        }
+        return u.cat2(u.pick(x, "x", "w"), u.idec(o.reg));
+    }
+    if o.kind == ai.OK_MEM {
+        if (mod != 0) and (mod != 'a') {
+            err.* = u.f1("the modifier '%s' of a memory operand", ai.ch_text(mod));
+            return "";
+        }
+        if o.disp != 0 {
+            return u.f2("[x%s, #%s]", u.idec(o.base), u.dec(o.disp));
+        }
+        return u.f1("[x%s]", u.idec(o.base));
+    }
+    if o.sym {
+        if o.k == 0 {
+            return o.name;
+        }
+        if o.k > 0 {
+            return u.f2("%s+%s", o.name, u.dec(o.k));
+        }
+        return u.cat2(o.name, u.dec(o.k));
+    }
+    if (mod == 'w') or (mod == 'x') {
+        if o.k == 0 {
+            return u.pick(mod == 'x', "xzr", "wzr");
+        }
+        err.* = "'%w' or '%x' of a constant other than 0";
+        return "";
+    }
+    if mod == 'n' {
+        return u.dec(0 -% o.k);
+    }
+    if (mod == 0) or (mod == 'c') {
+        return u.dec(o.k);
+    }
+    err.* = u.f1("the modifier '%s' of a constant", ai.ch_text(mod));
+    return "";
+}
+
+/// The text of asm goto's label k in its template.
+pub fn label_text(k: i32) []u8 {
+    return u.cat2(".L__axiom_label_", u.idec(k));
+}
+
+/// What follows the template of an asm goto with n labels: w<r> set to 0
+/// where the template ends, k + 1 at label k, all meeting after it.
+pub fn goto_tail(n: i32, r: i32) []u8 {
+    let mut b = u.Buf.init();
+    b.s(u.f1("\n\tmov w%s, #0\n\tb .L__axiom_goto_end\n", u.idec(r)));
+    for k in 0..n {
+        b.s(u.f3("%s:\n\tmov w%s, #%s\n", label_text(k), u.idec(r), u.idec(k + 1)));
+        if (k + 1) < n {
+            b.s("\tb .L__axiom_goto_end\n");
+        }
+    }
+    b.s(".L__axiom_goto_end:\n");
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Entry points
+// -----------------------------------------------------------------------------
+/// Assembles inline text (an asm statement's template, operands
+/// substituted) whose first byte will be at `origin` in its section.
+pub fn assemble_inline(text: []u8, origin: u64) *mut cr.Asm {
+    let A = cr.new_asm(tg.ARCH_A64, text, true, 0);
+    A.origin = origin;
+    let ar = arch();
+    cr.run(A, &ar);
+    return A;
+}
+
+/// Assembles file-scope asm text: its sections, symbols and relocations.
+pub fn assemble_file(text: []u8) *mut cr.Asm {
+    let A = cr.new_asm(tg.ARCH_A64, text, false, 0);
+    let ar = arch();
+    cr.run(A, &ar);
+    return A;
+}

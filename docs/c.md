@@ -543,6 +543,7 @@ The compiler's own macros say what the build chose:
 | `__AXIOM_<T>_TYPE__`, `__AXIOM_<T>_MIN__`, `__AXIOM_<T>_MAX__`, `__AXIOM_<T>_WIDTH__`, `__AXIOM_<T>_C__(c)` | For `<T>` one of `SIZE`, `PTRDIFF`, `INT64`, `UINT64`, `INTMAX`, `UINTMAX`, `INT_FAST16`, `UINT_FAST16`, `INT_FAST32`, `UINT_FAST32`: the type the platform gives that typedef (`__AXIOM_SIZE_TYPE__` is `unsigned long`, ...), its limits, width and constant macro, which the headers use. `__AXIOM_WINT_TYPE__`, `_MIN__`, `_MAX__` and `_WIDTH__` are `wint_t`'s; `__AXIOM_MAX_ALIGN__` is `max_align_t`'s alignment. |
 | `__CHAR_UNSIGNED__` | 1, defined only if plain `char` is unsigned. |
 | `__AXIOM_GNU__` | 1, defined only in a GNU dialect. |
+| `__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__` | 1, defined only in a GNU dialect on x86-64 or AArch64 targets: the language of inline assembly's templates ("Inline assembly"). |
 
 No macro names the target (`__linux__`, `_WIN32`, `__x86_64__` and the like are not
 defined): pass `-D` for what a program needs to know.
@@ -699,7 +700,7 @@ as the standard says.
   as values, `__builtin_*` functions other than those below ("Reserved identifiers"),
   `#include_next`, `#ident`. A GNU dialect has them ("GNU dialects"), but for those it
   rejects too.
-- In every mode: inline assembly (`asm` statements, C3901), `__declspec`, `#import`,
+- In every mode: inline assembly on WebAssembly targets (C3901), `__declspec`, `#import`,
   `#assert`, `__int128`, the floating types `_Float16`, `_FloatN`, `_FloatNx` and
   `__float128`, and vector types (the attribute `vector_size`): C3901 in a GNU dialect.
 
@@ -733,7 +734,8 @@ exactly what works (there is no option that defines `__GNUC__`).
 | `void *` and function pointers | Arithmetic on them as on `char *`; `sizeof` and `__alignof__` of `void` and of a function type are 1. |
 | Constants | Binary constants (`0b101`) and the escape `\e` (27) in every dialect. |
 | `__FUNCTION__`, `__PRETTY_FUNCTION__` | Other names of `__func__` (`""` outside a function). |
-| `T f(...) asm("name");` | The function's or object's symbol is `name` (an asm label; with external linkage). On an automatic object it is C3090, on a `register` one (an explicit register variable) C3901. |
+| `T f(...) asm("name");` | The function's or object's symbol is `name` (an asm label; with external linkage). On an automatic object it is C3090, but on a `register` one: an explicit register variable ("Inline assembly"). |
+| `asm`, `__asm__` statements; file-scope `asm("...")` | Inline assembly on x86-64 and AArch64 ("Inline assembly", below). |
 
 ### Preprocessor
 
@@ -772,6 +774,7 @@ C4052 and is ignored.
 | `visibility("v")` | objects, functions | default, hidden, protected or internal: accepted (no effect: programs are static executables, and objects are linked into them). |
 | `noreturn` | functions | As `[[noreturn]]` (C4053). |
 | `noinline`, `always_inline`, `cold` | functions | Given to the optimizer. |
+| `naked` | functions | The function is its asm statements (basic, or extended with no operands: else C3096): their text after a label of its name, with no prologue or epilogue ("Inline assembly"). |
 | `hot`, `const`, `pure`, `malloc`, `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `sentinel`, `format_arg`, `may_alias` | | Accepted; no effect (none is needed for correct code). |
 | `format(archetype, i, j)` | functions | Arguments checked; the calls are not. |
 | `nonnull`, `nonnull(i, ...)` | functions | A null pointer constant passed for one of those parameters (all pointers without indexes) is warning C4121. |
@@ -788,6 +791,91 @@ C4052 and is ignored.
 
 In gnu89 and gnu90 `inline` has GNU89's meaning: `inline` alone defines the external
 function, `extern inline` is an inline definition (C99's `inline`).
+
+### Inline assembly
+
+On x86-64 (Linux, Windows) and AArch64 (Linux, macOS) targets; on WebAssembly an asm
+statement is C3901. The compiler has its own assemblers (`cmd/axiom/src/asm/`), so no
+other tool is needed:
+
+- **x86-64**: the AT&T syntax (source operands first; `%reg`, `$imm`,
+  `disp(base, index, scale)`, `%fs:`/`%gs:` overrides, `*` for indirect jumps and calls,
+  size suffixes b, w, l, q or the size of a register operand, `lock`, `rep`, `repe`,
+  `repne`); `{att|intel}` dialect alternatives give their first. Instructions: the
+  general-purpose ones a program runs (moves, arithmetic, logic, shifts and rotates, bit
+  operations, `cmovcc`, `setcc`, jumps, calls, `push`/`pop`, string instructions, `xchg`,
+  `xadd`, `cmpxchg`, `cmpxchg8b`/`16b`, `bswap`, `cpuid`, `rdtsc`/`rdtscp`, `syscall`,
+  fences, `pause`, `ud2`, `crc32`, `movbe`, `rdrand`/`rdseed`, prefetches, the multi-byte
+  `nop`s ...), BMI1 and BMI2, and SSE through SSE4.1's moves, arithmetic, compares,
+  conversions, logic, shuffles, packs, integer instructions and shifts.
+- **AArch64**: the base integer instructions (with their aliases: `mov`, `cmp`, `lsl`,
+  `ubfx`, `cset` ...), branches, loads and stores in every addressing form (pairs,
+  exclusives, acquire/release, the LSE atomics), `svc`, `brk`, hints, barriers, `mrs`/`msr`
+  of the registers programs use (`tpidr_el0`, `fpcr`, `fpsr`, `nzcv`, `cntvct_el0`, ... and
+  `s<op0>_<op1>_c<n>_c<m>_<op2>`), scalar floating point, and the common vector
+  instructions; immediates with or without `#`.
+- Directives: `.byte`, `.short`/`.hword`/`.2byte`, `.word` (2 bytes on x86-64, 4 on
+  AArch64), `.long`/`.int`, `.quad`/`.xword`, `.ascii`, `.asciz`/`.string`, `.float`,
+  `.double`, `.zero`/`.skip`/`.space`, `.fill`, `.balign`, `.p2align`, `.align`, `.set`/`.equ`
+  and `=`, `.inst` (AArch64); in file-scope asm also `.text`, `.data`, `.bss`,
+  `.section`, `.pushsection`, `.popsection`, `.previous`, `.globl`, `.weak`, `.local`,
+  `.type`, `.size`. Labels: `name:` and numeric local labels (`1:`, `1b`, `1f`).
+  Relocations: x86-64 rel32 calls and jumps to symbols (`@PLT`), `sym(%rip)`
+  (`@GOTPCREL`), absolute 32- and 64-bit addresses; AArch64 `b`/`bl` to symbols,
+  `adrp` (`:got:`), `:lo12:` and `:got_lo12:` in `add` and loads and stores, `.quad` and
+  `.word` of addresses. `.cfi_*`, `.file`, `.loc`, `.ident`, `.arch` and the like are
+  accepted and do nothing. An instruction, operand form or directive that is not
+  supported is C3097, naming it, at the statement.
+
+`asm [volatile] [inline] [goto] ("template" : outputs : inputs : clobbers : labels)`, as
+GCC's documentation describes extended asm, with these rules:
+
+- Operands are numbered outputs first, then inputs, then (for `%l`) labels; `%[name]`
+  names one. An output's constraint starts with `=` or `+` (also an input: it is read and
+  written), and its operand is a modifiable lvalue; `&` is early clobber. Matching
+  constraints (`"0"`, `"[name]"`) tie an input to an output in a register.
+- Constraints (the first alternative of `"r,m"`): `r`, `g`, `X`, `m`, `o`, `V`, `i`, `n`,
+  `s`, the digits; x86-64 `a b c d S D` (those registers), `q`, `R`, `Q`, `U`, `l`, `x`,
+  `v`, `Y`, `I J K M N O e Z` (constants in their ranges); AArch64 `w` (any v register),
+  `x` (v0-v15), `y` (v0-v7), `Q` (memory at a base register), `I J K L M N Z S`. An operand
+  chooses a constant when it is one (and the constraint allows it), else a register, else
+  memory. A register operand is an integer, pointer or floating value of 1, 2, 4 or 8
+  bytes (a floating value in a general register is its bits, an integer in a vector
+  register too). `A`, `t`, `u`, `f`, `y` (x87, MMX) and AVX-512 mask registers are C3901.
+- Explicit register variables, `register long x asm("rax")` (or `"x8"`, `"w19"`, `"d0"`
+  ...): such a variable is in that register when it is an asm operand in a register (the
+  usual way to pass system call arguments); elsewhere it is an ordinary variable. The stack
+  and frame pointers, and on AArch64 x16, x17 and x18, cannot be.
+- Clobbers: registers (with or without `%` on x86-64), `"cc"` (always assumed on x86-64),
+  `"memory"`; not the stack or frame pointer (C3096). A clobbered callee-saved register is
+  saved by the function.
+- Template modifiers: x86-64 `%b %w %k %q %h` (a register's widths, its high byte), `%x`
+  (xmm), `%c %P %p %a` (a constant without `$`, an address), `%n` (negated), `%A` (`*`),
+  `%H` (memory 8 bytes on), `%V`, `%z` (the size suffix); AArch64 `%w %x` (also of the
+  constant 0: `wzr`, `xzr`), `%b %h %s %d %q`, `%c`, `%n`. Without a modifier an x86-64
+  register is written at its operand's width, an AArch64 general register as `w` up to 32
+  bits and `x` for 64, and a floating-point register as `s` or `d` by its type; an AArch64
+  memory operand is `[xn]`. `%%`, `%=` (a number unique to each copy of the statement),
+  `%l[label]`.
+- `asm goto`'s template may jump to its labels (`%l[name]`); outputs are stored on every
+  path. A jump out of a scope leaves it as `goto` would.
+- Every asm statement is treated as `volatile` and as clobbering memory: none is removed,
+  moved or merged, and none is reordered with memory accesses (the optimizer sees an
+  opaque operation). Outputs in registers are stored to temporaries just after the
+  template and then assigned to their lvalues. An output is never given an input's
+  register (as though every output were early clobber), which is always correct.
+- The template must leave the stack pointer where it was (pushes and pops in pairs are
+  fine) and must not change the frame or the frame pointer: call frame information and
+  stack traces describe the function as compiled (`.cfi_*` directives are ignored). A
+  template that calls a function aligns the stack itself (as with other compilers). A
+  function with an asm statement makes no sibling calls. Named labels in a template are
+  local to it (the template is assembled on its own); a symbol a template refers to by
+  name has external linkage (or is defined by file-scope asm), and is kept in the program.
+  `.p2align` in a template aligns relative to the function's start (16 bytes on x86-64).
+- File-scope `asm("...")` is a basic asm (operands are C3096) whose text is assembled into
+  the unit's object: its labels are local symbols unless `.globl`, and C refers to its
+  functions and objects by declaring them. On Windows it is assembled the same way (the
+  calling convention in it is the template's business).
 
 ### Builtins
 

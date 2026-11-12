@@ -16,6 +16,10 @@
 // that uses them clears the upper halves (vzeroupper) before each call and
 // return, as code using the legacy SSE encoding expects.
 // =============================================================================
+import "asm/core.ax" as acr;
+import "asm/inline.ax" as ai;
+import "asm/obj.ax" as aob;
+import "asm/x64.ax" as ax;
 import "bin.ax" as bn;
 import "dwarf.ax" as dw;
 import "elf.ax" as elf;
@@ -4603,6 +4607,200 @@ fn gen_cpuid(v: *mut ir.Value) void {
     _ = sse2(xe.MOVDQU_LD, W(vreg(v)), mc.mem_slot(s, 0));
 }
 
+// -----------------------------------------------------------------------------
+// Inline assembly (ir.IN_ASM; asm/inline.ax says what its operands are)
+// -----------------------------------------------------------------------------
+let mut asm_count: i32 = 0;
+
+// The register of class cls in mask `subset` (all of the class when 0) that
+// no fixed operand or clobber of the statement takes.
+fn asm_pick(b: *ai.Blob, subset: u64, cls: u8, taken: u64) i32 {
+    let mut base: i32 = 0;
+    if cls == ai.CL_VEC {
+        base = xe.XMM0;
+    }
+    for k in @as(i32, 0)..16 {
+        let r = base + k;
+        if (subset != 0) and ((subset & (@as(u64, 1) << @int_cast(u32, k))) == 0) {
+            continue;
+        }
+        if (r == xe.RSP) or (r == xe.RBP) or ((taken & (@as(u64, 1) << @int_cast(u32, r))) != 0) {
+            continue;
+        }
+        return r;
+    }
+    _ = b;
+    em.fail("an asm statement whose operands need more registers of a class than there are");
+    return base;
+}
+
+// The asm statement's MInst xe.ASM: one operand for each of the blob's (a
+// register, memory or a constant), the clobbered registers (written before
+// the inputs are read, so that no operand is in one), and for asm goto the
+// register of its result. Outputs in registers are written early too (an
+// output is never in an input's register, a cautious reading of the rules
+// that is always right), and stored to their temporaries after it; inputs
+// tied to outputs are copied into them first; operands in specific
+// registers are copied into and out of them.
+fn gen_asm(v: *mut ir.Value) void {
+    let bi = is.cval(v.xs.get(0));
+    let b = ai.blob(bi);
+    let n = b.ops.len;
+    let ops = u.newn.[mc.MOp](n + 34);
+    let regs = u.newn.[i32](n + 1);  // each operand's register (vreg or physical), or -1
+    // the registers fixed operands and clobbers take
+    let mut taken = b.clobber;
+    for k in 0..n {
+        let op = b.ops[k];
+        if (op.kind == ai.OK_FIXED) and (op.reg >= 0) {
+            taken = taken | (@as(u64, 1) << @int_cast(u32, op.reg));
+        }
+    }
+    // values first (their materialization may emit code)
+    let vals = u.newn.[i32](n + 1);
+    for k in 0..n {
+        let op = b.ops[k];
+        let x = v.xs.get(k + 1);
+        vals[k] = -1;
+        regs[k] = -1;
+        if not op.out and ((op.kind == ai.OK_REG) or (op.kind == ai.OK_FIXED)) {
+            vals[k] = reg(x);
+        }
+    }
+    for k in 0..n {
+        let op = b.ops[k];
+        let x = v.xs.get(k + 1);
+        if op.kind == ai.OK_MEM {
+            let mut m = addr(x);
+            if (m.slot == -2) or (m.slot == -3) or (m.scale == 99) {
+                m = mc.mem(reg(x), -1, 0, 0);
+            }
+            ops[k] = m;
+            continue;
+        }
+        if op.kind == ai.OK_IMM {
+            ops[k] = asm_imm(x);
+            continue;
+        }
+        let cls = u8_of(op.cls == ai.CL_VEC, XMM, GPR);
+        if op.tie >= 0 {
+            // (in its output's register, which the output's operand reads too)
+            let t = regs[@int_cast(usize, op.tie)];
+            regs[k] = t;
+            ops[k] = R(t);
+            ops[@int_cast(usize, op.tie)].role = mc.RUD;
+            continue;
+        }
+        let mut r: i32 = -1;
+        if op.kind == ai.OK_FIXED {
+            r = op.reg;
+        } else if op.subset != 0 {
+            r = asm_pick(b, op.subset, op.cls, taken);
+            taken = taken | (@as(u64, 1) << @int_cast(u32, r));
+        } else {
+            r = mc.new_vreg(em.MF, cls);
+        }
+        regs[k] = r;
+        if op.out {
+            if op.early or mc.is_vreg(r) {
+                ops[k] = mc.reg(r, mc.RD | mc.RE);
+            } else {
+                ops[k] = W(r);
+            }
+        } else if mc.is_vreg(r) {
+            ops[k] = R(vals[k]);
+            regs[k] = vals[k];
+        } else {
+            ops[k] = R(r);
+        }
+    }
+    // copies into the registers inputs are pinned or tied to
+    for k in 0..n {
+        let op = b.ops[k];
+        if op.out or ((op.kind != ai.OK_REG) and (op.kind != ai.OK_FIXED)) {
+            continue;
+        }
+        let cls = u8_of(op.cls == ai.CL_VEC, XMM, GPR);
+        if (op.tie >= 0) or not mc.is_vreg(regs[k]) {
+            if op.tie >= 0 {
+                let to = b.ops[@int_cast(usize, op.tie)];
+                copy(regs[k], vals[k], u8_of(to.cls == ai.CL_VEC, XMM, GPR));
+            } else {
+                copy(regs[k], vals[k], cls);
+            }
+        }
+    }
+    let mut no = n;
+    for r in @as(i32, 0)..32 {
+        if (b.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
+            ops[no] = mc.reg(r, mc.RD | mc.RE);
+            no += 1;
+        }
+    }
+    if b.goto_ {
+        ops[no] = mc.reg(vreg(v), mc.RD | mc.RE);
+        no += 1;
+    }
+    let i = emit(xe.ASM, 0, ops[0..no]);
+    i.aux = bi;
+    asm_count += 1;
+    i.cc = asm_count;
+    i.keep = true;
+    // outputs in registers: to their temporaries
+    for k in 0..n {
+        let op = b.ops[k];
+        if not op.out or ((op.kind != ai.OK_REG) and (op.kind != ai.OK_FIXED)) {
+            continue;
+        }
+        let mut r = regs[k];
+        let vec = op.cls == ai.CL_VEC;
+        if not mc.is_vreg(r) {
+            let t = mc.new_vreg(em.MF, u8_of(vec, XMM, GPR));
+            copy(t, r, u8_of(vec, XMM, GPR));
+            r = t;
+        }
+        let m = addr(v.xs.get(k + 1));
+        if vec {
+            if op.bits == 32 {
+                _ = sse2(xe.MOVSS_ST, R(r), m);
+            } else {
+                _ = sse2(xe.MOVSD_ST, R(r), m);
+            }
+        } else {
+            _ = e2(xe.STORE, @truncate(u8, op.bits / 8), m, R(r));
+        }
+    }
+}
+
+fn u8_of(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// An immediate operand of an asm statement: a constant, or a symbol's
+// address plus a constant.
+fn asm_imm(x: *mut ir.Value) mc.MOp {
+    if is.is_c(x) {
+        return I(is.cval(x));
+    }
+    let mut p = x;
+    let mut off: i64 = 0;
+    if ir.is_op(p, ir.OP_PTRADD) and is.is_c(p.b) {
+        off = is.cval(p.b);
+        p = p.a;
+    }
+    if p.kind == ir.V_GLOBAL {
+        return mc.symop(global_sym(ir.gv_of(p)), off);
+    }
+    if p.kind == ir.V_FUNC {
+        return mc.symop(func_sym(ir.fnp_of(p)), off);
+    }
+    em.fail("an asm operand that must be a constant is not one after optimization");
+    return I(0);
+}
+
 // Part k (16 bytes) of wide vector register a (of VL bytes), in an xmm
 // register (the register itself for part 0).
 // (The low part is the register itself: extract_lane's instructions take
@@ -7125,6 +7323,10 @@ fn gen_intr(v: *mut ir.Value) void {
         gen_cpuid(v);
         return;
     }
+    if id == ir.IN_ASM {
+        gen_asm(v);
+        return;
+    }
     if id == ir.IN_FRAME_ADDR {
         _ = e2(xe.MOV_RR, 8, W(vreg(v)), R(xe.RBP));
         return;
@@ -7915,7 +8117,7 @@ fn quiet_between(from: *mut ir.Value, to: *mut ir.Value) bool {
 fn intr_writes(x: *ir.Value) bool {
     let id = @truncate(i32, @bit_cast(i64, x.cv));
     return (id == ir.IN_TRAP) or (id == ir.IN_MEMGROW) or (id == ir.IN_WAIT32) or (id == ir.IN_NOTIFY) or
-           (id == ir.IN_SET_SP) or (id == ir.IN_STORE_PARTIAL);
+           (id == ir.IN_SET_SP) or (id == ir.IN_STORE_PARTIAL) or (id == ir.IN_ASM);
 }
 
 let gpr_order: [14]i32 = [0, 1, 2, 6, 7, 8, 9, 10, 11, 3, 12, 13, 14, 15];
@@ -9259,6 +9461,15 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
                                                      ty: elf.T_NOTYPE, hidden: false });
     }
     let relro = is.add_symbols(em.OBJ, m, em.TEXT, RODATA, elf.R_X86_64_64, &mut em.fsym, &mut gsym);
+    // file-scope asm (the C front end's GNU dialects): its sections and symbols
+    for b in ai.toplevel.items() {
+        let A = ax.assemble_file(b.text);
+        if acr.failed(A) {
+            em.fail(u.f2("file-scope asm at %s: %s", b.loc, acr.message(A)));
+            return u.nil.[elf.Obj]();
+        }
+        aob.add_file(em.OBJ, em.TEXT, A);
+    }
     em.FT = ft.begin(em.OBJ, m, em.TEXT, relro, &mut gsym, elf.R_X86_64_PC32, elf.R_X86_64_64);
     let mut level = tg.g_debug;
     if em.WIN {

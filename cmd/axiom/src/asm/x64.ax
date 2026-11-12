@@ -1,0 +1,2991 @@
+// =============================================================================
+// asm/x64.ax - an x86-64 assembler: the AT&T syntax of the GNU assembler
+// (operands source first, `%reg`, `$imm`, `disp(base, index, scale)`,
+// `%fs:` segment overrides, `*` for indirect jumps and calls, operand-size
+// suffixes b, w, l, q), into machine code, for inline assembly and
+// file-scope asm (asm/core.ax reads the text and does the passes).
+//
+// What it encodes (Intel SDM vol. 2's encodings, written from its tables):
+// the general-purpose instructions of 64-bit mode that user code runs
+// (moves, arithmetic and logic, shifts and rotates, bit operations, cmovcc,
+// setcc, jumps, calls, stack, string instructions with rep/repe/repne,
+// lock, the atomics, bswap, cpuid, rdtsc, syscall, fences, pause, ud2 ...),
+// the BMI1 and BMI2 instructions, and SSE through SSE4.1's common
+// instructions (moves, arithmetic, compares, conversions, logic, shuffles,
+// packs and unpacks, integer SIMD, shifts by an immediate). An instruction
+// or operand form not among them is an error naming it.
+//
+// Relocations: rel32 calls and jumps to other symbols (R_X86_64_PLT32),
+// rip-relative operands (R_X86_64_PC32; @GOTPCREL: R_X86_64_REX_GOTPCRELX),
+// absolute 32-bit displacements and immediates (R_X86_64_32S, _32) and
+// 64-bit ones (movabs, .quad: R_X86_64_64).
+// =============================================================================
+import "../elf.ax" as elf;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "core.ax" as cr;
+import "inline.ax" as ai;
+
+// Operand kinds
+const XK_NONE: u8 = 0;
+const XK_REG: u8 = 1;
+const XK_IMM: u8 = 2;
+const XK_MEM: u8 = 3;
+
+const RIP: i32 = 99;
+
+struct XOp {
+    kind: u8,
+    reg: i32,    // XK_REG: 0-15 general, 16-31 xmm
+    bits: u32,   // XK_REG: 8, 16, 32, 64, 128
+    hi8: bool,   // ah, ch, dh, bh
+    star: bool,  // `*`: an indirect jump or call's operand
+    base: i32,   // XK_MEM: -1 none, RIP
+    index: i32,
+    scale: u8,
+    seg: u8,     // a segment override prefix (0x64 fs, 0x65 gs ...), 0 none
+    a32: bool,   // 32-bit address registers (prefix 0x67)
+    v: cr.Val,   // XK_MEM: the displacement; XK_IMM: the value
+    bare: bool,  // XK_MEM written as an expression alone (a jump's or call's target)
+}
+
+fn none_op() XOp {
+    return XOp.{ kind: XK_NONE, reg: -1, bits: 0, hi8: false, star: false, base: -1, index: -1, scale: 1, seg: 0,
+                 a32: false, v: cr.konst(0), bare: false };
+}
+
+// -----------------------------------------------------------------------------
+// Operands
+// -----------------------------------------------------------------------------
+fn reg_of(A: *mut cr.Asm, n: []u8, op: *mut XOp) bool {
+    let r = ai.x86_reg(n);
+    if r.reg < 0 {
+        return false;
+    }
+    op.kind = XK_REG;
+    op.reg = r.reg;
+    op.bits = r.bits;
+    op.hi8 = r.hi8;
+    if r.hi8 {
+        op.reg = r.reg + 4;  // (ah ch dh bh: 4-7 without a REX prefix)
+    }
+    _ = A;
+    return true;
+}
+
+fn seg_prefix(n: []u8) u8 {
+    let names = ["es", "cs", "ss", "ds", "fs", "gs"];
+    let pf: [6]u8 = [0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65];
+    for k in @as(usize, 0)..6 {
+        if u.str_eq(n, names[k]) {
+            return pf[k];
+        }
+    }
+    return 0;
+}
+
+// The register name at s[i..] after a '%': (its end in `end`).
+fn reg_name_at(s: []u8, i: usize, end: *mut usize) []u8 {
+    let mut j = i;
+    while (j < s.len) and (cr.is_sym_char(s[j]) or (s[j] == '(') or (s[j] == ')')) {
+        if (s[j] == '(') or (s[j] == ')') {
+            break;
+        }
+        j += 1;
+    }
+    end.* = j;
+    return cr.lower(s[i..j]);
+}
+
+fn parse_op(A: *mut cr.Asm, s0: []u8) XOp {
+    let mut op = none_op();
+    let mut s = cr.trim(s0);
+    if s.len == 0 {
+        cr.fail(A, "an operand is missing");
+        return op;
+    }
+    if s[0] == '*' {
+        op.star = true;
+        s = cr.trim(s[1..]);
+    }
+    if s[0] == '$' {
+        op.kind = XK_IMM;
+        op.v = cr.eval(A, s[1..]);
+        return op;
+    }
+    if s[0] == '%' {
+        let mut e: usize = 0;
+        let n = reg_name_at(s, 1, &mut e);
+        let rest = cr.trim(s[e..]);
+        if (rest.len > 0) and (rest[0] == ':') {
+            op.seg = seg_prefix(n);
+            if op.seg == 0 {
+                cr.fail(A, u.f1("'%%%s' is not a segment register", n));
+                return op;
+            }
+            s = cr.trim(rest[1..]);
+        } else {
+            if rest.len > 0 {
+                cr.fail(A, u.f1("unexpected '%s' after a register", rest));
+                return op;
+            }
+            if not reg_of(A, n, &mut op) {
+                cr.fail(A, u.f1("'%%%s' is not a register", n));
+            }
+            return op;
+        }
+    }
+    // memory: disp(base, index, scale), or an expression alone
+    op.kind = XK_MEM;
+    if (s.len > 0) and (s[s.len - 1] == ')') {
+        // the last parenthesized group: registers, if it starts with '%' or ','
+        let mut depth: i32 = 0;
+        let mut k = s.len;
+        while k > 0 {
+            k -= 1;
+            if s[k] == ')' {
+                depth += 1;
+            } else if s[k] == '(' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        let inner = cr.trim(s[k + 1..s.len - 1]);
+        if (inner.len == 0) or (inner[0] == '%') or (inner[0] == ',') {
+            let disp = cr.trim(s[0..k]);
+            if disp.len > 0 {
+                op.v = cr.eval(A, disp);
+            }
+            let parts = cr.split_args(inner);
+            if parts.len > 3 {
+                cr.fail(A, u.f1("'(%s)' is not a memory operand", inner));
+                return op;
+            }
+            let mut abits: u32 = 0;
+            for p in 0..parts.len {
+                let x = parts[p];
+                if p == 2 {
+                    let sc = cr.eval_const(A, x, "the scale");
+                    if (sc != 1) and (sc != 2) and (sc != 4) and (sc != 8) {
+                        cr.fail(A, u.f1("the scale %s is not 1, 2, 4 or 8", x));
+                        return op;
+                    }
+                    op.scale = @truncate(u8, @bit_cast(u64, sc));
+                    continue;
+                }
+                if x.len == 0 {
+                    continue;
+                }
+                if x[0] != '%' {
+                    cr.fail(A, u.f1("'%s' is not a register", x));
+                    return op;
+                }
+                let n = cr.lower(x[1..]);
+                if (p == 0) and (u.str_eq(n, "rip") or u.str_eq(n, "eip")) {
+                    op.base = RIP;
+                    continue;
+                }
+                let r = ai.x86_reg(n);
+                if (r.reg < 0) or (r.reg >= 16) or ((r.bits != 64) and (r.bits != 32)) or r.hi8 {
+                    cr.fail(A, u.f1("'%s' is not an address register", x));
+                    return op;
+                }
+                if (abits != 0) and (abits != r.bits) {
+                    cr.fail(A, "address registers of different sizes");
+                    return op;
+                }
+                abits = r.bits;
+                if p == 0 {
+                    op.base = r.reg;
+                } else {
+                    if r.reg == 4 {
+                        cr.fail(A, "%rsp cannot be an index register");
+                        return op;
+                    }
+                    op.index = r.reg;
+                }
+            }
+            op.a32 = abits == 32;
+            return op;
+        }
+    }
+    op.v = cr.eval(A, s);
+    op.bare = op.seg == 0;
+    return op;
+}
+
+// -----------------------------------------------------------------------------
+// Encoding
+// -----------------------------------------------------------------------------
+// One instruction to encode: prefixes, REX bits, opcode, ModRM, immediate.
+struct Enc {
+    pfx: u8,    // a mandatory prefix (0x66, 0xf2, 0xf3), 0 none
+    osz: bool,  // the operand-size prefix 0x66 (16-bit operands)
+    w: bool,    // REX.W
+    opc: [3]u8,
+    nopc: usize,
+    modrm: bool,
+    regf: i32,  // the ModRM reg field: a register (0-31) or a /digit
+    rm: XOp,    // the ModRM r/m operand: a register or memory
+    plus: i32,  // a register added to the last opcode byte (+r), or -1
+    imm: cr.Val,
+    isz: u32,       // the immediate's bytes (0 none)
+    ibyte: bool,    // an 8-bit register is used (spl, bpl, sil, dil then need a REX prefix)
+    rex: bool,      // a REX prefix even if no bit is set
+    regbyte: bool,  // regf names an 8-bit register
+}
+
+fn new_enc() Enc {
+    return Enc.{ pfx: 0, osz: false, w: false, opc: [0, 0, 0], nopc: 0, modrm: false, regf: 0, rm: none_op(), plus: -1,
+                 imm: cr.konst(0), isz: 0, ibyte: false, rex: false, regbyte: false };
+}
+
+fn op1(e: *mut Enc, a: u8) void {
+    e.opc[0] = a;
+    e.nopc = 1;
+}
+
+fn op2(e: *mut Enc, a: u8, b: u8) void {
+    e.opc[0] = a;
+    e.opc[1] = b;
+    e.nopc = 2;
+}
+
+fn op3(e: *mut Enc, a: u8, b: u8, c: u8) void {
+    e.opc[0] = a;
+    e.opc[1] = b;
+    e.opc[2] = c;
+    e.nopc = 3;
+}
+
+fn rr(r: i32) u64 {
+    return @as(u64, @bit_cast(u32, r & 7));
+}
+
+fn hibit(r: i32) u64 {
+    if (r >= 0) and (r != RIP) and ((r & 8) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// The prefixes of the statement (lock, rep ...), set by insn (a fixed
+// array: the assembler's memory is a scratch scope's).
+let mut g_pfx_b: [4]u8 = [0; 4];
+let mut g_npfx: usize = 0;
+
+fn pfxs() []u8 {
+    return g_pfx_b[0..g_npfx];
+}
+
+fn uses_rex_byte(r: i32, bits: u32, hi8: bool) bool {
+    return (bits == 8) and not hi8 and (r >= 4) and (r <= 7);
+}
+
+fn emit(A: *mut cr.Asm, e: *mut Enc) void {
+    let m = e.rm;
+    if (m.kind == XK_MEM) and (m.seg != 0) {
+        cr.emit8(A, @as(u64, m.seg));
+    }
+    if (m.kind == XK_MEM) and m.a32 {
+        cr.emit8(A, 0x67);
+    }
+    if e.osz {
+        cr.emit8(A, 0x66);
+    }
+    for p in pfxs() {
+        cr.emit8(A, @as(u64, p));
+    }
+    if e.pfx != 0 {
+        cr.emit8(A, @as(u64, e.pfx));
+    }
+    // REX
+    let mut w: u64 = 0;
+    if e.w {
+        w = 1;
+    }
+    let mut r: u64 = 0;
+    let mut x: u64 = 0;
+    let mut b: u64 = 0;
+    if e.modrm {
+        r = hibit(e.regf);
+        if m.kind == XK_REG {
+            b = hibit(m.reg);
+        } else {
+            b = hibit(m.base);
+            x = hibit(m.index);
+        }
+    }
+    if e.plus >= 0 {
+        b = hibit(e.plus);
+    }
+    let v = ((w << 3) | (r << 2)) | ((x << 1) | b);
+    if g_hi8 {
+        if v != 0 {
+            cr.fail(A, "%ah, %bh, %ch and %dh cannot be used with a register that needs a REX prefix");
+        }
+    } else {
+        rex_byte(A, e, v);
+    }
+    for k in 0..e.nopc {
+        let mut c = @as(u64, e.opc[k]);
+        if ((k + 1) == e.nopc) and (e.plus >= 0) {
+            c += rr(e.plus);
+        }
+        cr.emit8(A, c);
+    }
+    if e.modrm {
+        modrm(A, e.regf, &e.rm, e.isz);
+    }
+    if e.isz > 0 {
+        imm(A, e.imm, e.isz, e.w);
+    }
+}
+
+// The REX prefix (v: its WRXB bits), also when an 8-bit register needs one.
+fn rex_byte(A: *mut cr.Asm, e: *Enc, v: u64) void {
+    let m = e.rm;
+    let mut force = e.rex;
+    if e.modrm and e.regbyte and uses_rex_byte(e.regf, 8, false) {
+        force = true;
+    }
+    if (m.kind == XK_REG) and uses_rex_byte(m.reg, m.bits, m.hi8) {
+        force = true;
+    }
+    if (e.plus >= 0) and e.ibyte and uses_rex_byte(e.plus, 8, false) {
+        force = true;
+    }
+    if (v != 0) or force {
+        cr.emit8(A, 0x40 | v);
+    }
+}
+
+// Does an instruction use %ah ... %bh (then no REX prefix), and is it valid
+// so (no spl, bpl, sil, dil, which need one)?
+let mut g_hi8: bool = false;
+
+fn fits8(x: i64) bool {
+    return (x >= -128) and (x <= 127);
+}
+
+fn fits32(x: i64) bool {
+    return (x >= -2147483648) and (x <= 2147483647);
+}
+
+// ModRM, SIB and displacement for reg field regf and operand m (imm_after:
+// the bytes of the immediate after them, for rip-relative addends).
+fn modrm(A: *mut cr.Asm, regf: i32, m: *XOp, imm_after: u32) void {
+    let rf = rr(regf) << 3;
+    if m.kind == XK_REG {
+        cr.emit8(A, (0xc0 | rf) | rr(m.reg));
+        return;
+    }
+    let v = cr.settle(A, m.v);
+    if not v.ok {
+        return;
+    }
+    if m.base == RIP {
+        cr.emit8(A, rf | 5);
+        let at = cr.here(A);
+        let mut toff: u64 = 0;
+        if cr.local_target(A, v, &mut toff) and (v.rm == cr.RM_NONE) {
+            let next = at + 4 + @as(u64, imm_after);
+            cr.emit32(A, @bit_cast(u64, (@bit_cast(i64, toff) + v.k) - @bit_cast(i64, next)));
+            return;
+        }
+        if v.sym >= 0 {
+            let mut ty = elf.R_X86_64_PC32;
+            if v.rm == cr.RM_GOTPCREL {
+                ty = elf.R_X86_64_REX_GOTPCRELX;
+            }
+            cr.reloc(A, at, ty, v, v.k - (4 + @as(i64, imm_after)));
+            cr.emit32(A, 0);
+            return;
+        }
+        cr.emit32(A, @bit_cast(u64, v.k));
+        return;
+    }
+    let sym = v.sym >= 0;
+    if sym and A.inline_ {
+        let d = cr.def_of(A, v.sym);
+        if d.intext {
+            cr.fail(A, "an absolute address of a label of inline assembly (use (%rip))");
+            return;
+        }
+    }
+    let base = m.base;
+    let index = m.index;
+    let mut mode: u64 = 0;
+    let mut dsz: u32 = 0;
+    if base < 0 {
+        // [index*scale + disp32] or [disp32]: SIB with no base
+        cr.emit8(A, rf | 4);
+        let mut ix: u64 = 4;
+        if index >= 0 {
+            ix = rr(index);
+        }
+        cr.emit8(A, ((scale_bits(m.scale) << 6) | (ix << 3)) | 5);
+        disp32(A, v);
+        return;
+    }
+    if sym {
+        mode = 2;
+        dsz = 4;
+    } else if (v.k == 0) and ((base & 7) != 5) {
+        mode = 0;
+    } else if fits8(v.k) {
+        mode = 1;
+        dsz = 1;
+    } else if fits32(v.k) {
+        mode = 2;
+        dsz = 4;
+    } else {
+        cr.fail(A, "a displacement that does not fit in 32 bits");
+        return;
+    }
+    if (index >= 0) or ((base & 7) == 4) {
+        cr.emit8(A, ((mode << 6) | rf) | 4);
+        let mut ix: u64 = 4;
+        if index >= 0 {
+            ix = rr(index);
+        }
+        cr.emit8(A, ((scale_bits(m.scale) << 6) | (ix << 3)) | rr(base));
+    } else {
+        cr.emit8(A, ((mode << 6) | rf) | rr(base));
+    }
+    if dsz == 1 {
+        cr.emit8(A, @bit_cast(u64, v.k));
+    } else if dsz == 4 {
+        disp32(A, v);
+    }
+}
+
+fn disp32(A: *mut cr.Asm, v: cr.Val) void {
+    if v.sym >= 0 {
+        cr.reloc(A, cr.here(A), elf.R_X86_64_32S, v, v.k);
+        cr.emit32(A, 0);
+        return;
+    }
+    if not fits32(v.k) {
+        cr.fail(A, "a displacement that does not fit in 32 bits");
+        return;
+    }
+    cr.emit32(A, @bit_cast(u64, v.k));
+}
+
+fn scale_bits(s: u8) u64 {
+    if s == 2 {
+        return 1;
+    }
+    if s == 4 {
+        return 2;
+    }
+    if s == 8 {
+        return 3;
+    }
+    return 0;
+}
+
+// An immediate of n bytes (w: of a 64-bit operation, which sign-extends a
+// 32-bit one).
+fn imm(A: *mut cr.Asm, v0: cr.Val, n: u32, w: bool) void {
+    let v = cr.settle(A, v0);
+    if not v.ok {
+        return;
+    }
+    if v.sym >= 0 {
+        if A.inline_ and cr.def_of(A, v.sym).intext {
+            cr.fail(A, "an absolute address of a label of inline assembly");
+            return;
+        }
+        let mut ty: u32 = 0;
+        if n == 8 {
+            ty = elf.R_X86_64_64;
+        } else if n == 4 {
+            ty = elf.R_X86_64_32;
+            if w {
+                ty = elf.R_X86_64_32S;
+            }
+        } else {
+            cr.fail(A, "a symbol's address in an immediate of fewer than 4 bytes");
+            return;
+        }
+        cr.reloc(A, cr.here(A), ty, v, v.k);
+        for _k in @as(u32, 0)..n {
+            cr.emit8(A, 0);
+        }
+        return;
+    }
+    let x = @bit_cast(u64, v.k);
+    if n == 1 {
+        cr.emit8(A, x);
+    } else if n == 2 {
+        cr.emit16(A, x);
+    } else if n == 4 {
+        cr.emit32(A, x);
+    } else {
+        cr.emit64(A, x);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Operand sizes
+// -----------------------------------------------------------------------------
+// The size a suffix letter gives (b w l q), or 0.
+fn suffix_bits(c: u8) u32 {
+    if c == 'b' {
+        return 8;
+    }
+    if c == 'w' {
+        return 16;
+    }
+    if c == 'l' {
+        return 32;
+    }
+    if c == 'q' {
+        return 64;
+    }
+    return 0;
+}
+
+// Does mnemonic m name `base`, maybe with a size suffix? 0: no; else the
+// size (1 for none).
+fn named(m: []u8, base: []u8) u32 {
+    if u.str_eq(m, base) {
+        return 1;
+    }
+    if (m.len == (base.len + 1)) and u.starts(m, base) {
+        return suffix_bits(m[m.len - 1]);
+    }
+    return 0;
+}
+
+fn is_gpr(o: *XOp) bool {
+    return (o.kind == XK_REG) and (o.reg < 16);
+}
+
+fn is_xmm(o: *XOp) bool {
+    return (o.kind == XK_REG) and (o.reg >= 16);
+}
+
+fn is_rm(o: *XOp) bool {
+    return is_gpr(o) or (o.kind == XK_MEM);
+}
+
+// The operation size: the suffix's, else the general registers' (all the
+// same), else an error (what: the instruction).
+fn size_of(A: *mut cr.Asm, sfx: u32, ops: []XOp, what: []u8) u32 {
+    let mut sz: u32 = 0;
+    if sfx > 1 {
+        sz = sfx;
+    }
+    for o in ops {
+        if is_gpr(&o) {
+            if (sz != 0) and (sz != o.bits) {
+                cr.fail(A, u.f1("operand sizes do not match in '%s'", what));
+                return 0;
+            }
+            sz = o.bits;
+        }
+    }
+    if sz == 0 {
+        cr.fail(A, u.f1("no operand size in '%s' (a size suffix or a register is needed)", what));
+    }
+    return sz;
+}
+
+// Sets the encoding's size: 16 (0x66), 64 (REX.W); 8 for byte forms (false: use opc8).
+fn set_size(e: *mut Enc, sz: u32) void {
+    if sz == 16 {
+        e.osz = true;
+    }
+    if sz == 64 {
+        e.w = true;
+    }
+    if sz == 8 {
+        e.ibyte = true;
+        e.regbyte = true;
+    }
+}
+
+fn rm_enc(e: *mut Enc, regf: i32, rm: XOp) void {
+    e.modrm = true;
+    e.regf = regf;
+    e.rm = rm;
+}
+
+// ModRM with a /digit in the reg field.
+fn rm_digit(e: *mut Enc, d: i32, rm: XOp) void {
+    rm_enc(e, d, rm);
+    e.regbyte = false;
+}
+
+// -----------------------------------------------------------------------------
+// Instructions
+// -----------------------------------------------------------------------------
+let CCS: [30][]u8 = ["o", "no", "b", "nb", "e", "ne", "be", "nbe", "s", "ns", "p", "np", "l", "nl", "le", "nle", "c",
+                     "nae", "nc", "ae", "z", "nz", "na", "a", "pe", "po", "nge", "ge", "ng", "g"];
+let CCV: [30]i32 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 2, 2, 3, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14,
+                    15];
+
+// The condition code named s, or -1.
+fn cond(s: []u8) i32 {
+    for k in 0..CCS.len {
+        if u.str_eq(s, CCS[k]) {
+            return CCV[k];
+        }
+    }
+    return -1;
+}
+
+fn args_of(A: *mut cr.Asm, st: *cr.Stmt) []XOp {
+    let xs = cr.split_args(st.args);
+    let ops = u.newn.[XOp](xs.len + 1);
+    for k in 0..xs.len {
+        ops[k] = parse_op(A, xs[k]);
+    }
+    return ops[0..xs.len];
+}
+
+fn nargs(A: *mut cr.Asm, ops: []XOp, n: usize, m: []u8) bool {
+    if ops.len != n {
+        cr.fail(A, u.f2("'%s' takes %s operands", m, u.zdec(n)));
+        return false;
+    }
+    return true;
+}
+
+fn bad_form(A: *mut cr.Asm, m: []u8) void {
+    cr.fail(A, u.f1("'%s' does not take these operands", m));
+}
+
+/// The arch description core.run takes.
+pub fn arch() cr.Arch {
+    return cr.Arch.{ insn: insn, directive: no_directive, nop: 0x90, align_pow2: false, word: 2 };
+}
+
+fn no_directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
+    _ = A;
+    _ = st;
+    return false;
+}
+
+fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
+    g_npfx = 0;
+    g_sse_built = false;
+    let mut m = st.op;
+    let mut rest = st.args;
+    // prefixes: lock, rep, repe, repz, repne, repnz (alone or before the instruction)
+    loop {
+        let p = prefix_byte(m);
+        if p == 0 {
+            break;
+        }
+        if g_npfx >= 4 {
+            cr.fail(A, "too many prefixes");
+            return;
+        }
+        g_pfx_b[g_npfx] = p;
+        g_npfx += 1;
+        let t = cr.trim(rest);
+        let mut k: usize = 0;
+        while (k < t.len) and not cr.is_space(t[k]) {
+            k += 1;
+        }
+        m = cr.lower(t[0..k]);
+        rest = cr.trim(t[k..]);
+        if m.len == 0 {
+            // a prefix alone: its byte
+            for b in pfxs() {
+                cr.emit8(A, @as(u64, b));
+            }
+            return;
+        }
+    }
+    let saved = st.args;
+    st.args = rest;
+    let ops = args_of(A, st);
+    st.args = saved;
+    if cr.failed(A) {
+        return;
+    }
+    g_hi8 = false;
+    for o in ops {
+        if (o.kind == XK_REG) and o.hi8 {
+            g_hi8 = true;
+        }
+    }
+    if g_hi8 {
+        for o in ops {
+            if (o.kind == XK_REG) and (o.bits == 8) and not o.hi8 and (o.reg >= 4) {
+                cr.fail(A, "%ah, %bh, %ch and %dh cannot be used with a register that needs a REX prefix");
+                return;
+            }
+        }
+    }
+    if general(A, st, m, ops) {
+        return;
+    }
+    if sse(A, m, ops) {
+        return;
+    }
+    if cr.failed(A) {
+        return;
+    }
+    cr.fail(A, u.f1("the instruction '%s' is not supported (or not known)", m));
+}
+
+fn prefix_byte(m: []u8) u8 {
+    if u.str_eq(m, "lock") {
+        return 0xf0;
+    }
+    if u.str_eq(m, "rep") or u.str_eq(m, "repe") or u.str_eq(m, "repz") {
+        return 0xf3;
+    }
+    if u.str_eq(m, "repne") or u.str_eq(m, "repnz") {
+        return 0xf2;
+    }
+    if u.str_eq(m, "data16") {
+        return 0x66;
+    }
+    return 0;
+}
+
+// Instructions with no operands: their bytes.
+fn simple(A: *mut cr.Asm, m: []u8) bool {
+    let names = ["nop", "pause", "cpuid", "rdtsc", "rdtscp", "syscall", "ud2", "int3", "mfence", "lfence", "sfence",
+                 "clc", "stc", "cmc", "cld", "std", "cbtw", "cbw", "cwtl", "cwde", "cltq", "cdqe", "cwtd", "cwd",
+                 "cltd", "cdq", "cqto", "cqo", "lahf", "sahf", "leave", "leaveq", "ret", "retq", "pushf", "pushfq",
+                 "popf", "popfq", "xgetbv", "endbr64", "hlt", "xlat", "xlatb", "ud1", "int1", "rdpkru", "wrpkru",
+                 "serialize", "xend", "xtest", "rdpmc", "emms", "vzeroupper", "vzeroall", "clac", "stac", "wait",
+                 "fwait"];
+    let codes = ["90", "f390", "0fa2", "0f31", "0f01f9", "0f05", "0f0b", "cc", "0faef0", "0faee8", "0faef8", "f8", "f9",
+                 "f5", "fc", "fd", "6698", "6698", "98", "98", "4898", "4898", "6699", "6699", "99", "99", "4899",
+                 "4899", "9f", "9e", "c9", "c9", "c3", "c3", "9c", "9c", "9d", "9d", "0f01d0", "f30f1efa", "", "d7",
+                 "d7", "", "", "0f01ee", "0f01ef", "0f01e8", "0f01d5", "0f01d6", "", "0f77", "c5f877", "c5fc77", "", "",
+                 "9b", "9b"];
+    for k in 0..names.len {
+        if u.str_eq(m, names[k]) {
+            let c = codes[k];
+            if c.len == 0 {
+                cr.fail(A, u.f1("'%s' is not available to programs (or not supported)", m));
+                return true;
+            }
+            for b in pfxs() {
+                cr.emit8(A, @as(u64, b));
+            }
+            let mut i: usize = 0;
+            while i < c.len {
+                cr.emit8(A, @bit_cast(u64, hex2(c[i], c[i + 1])));
+                i += 2;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+fn hex2(a: u8, b: u8) i64 {
+    return (hexd(a) * 16) + hexd(b);
+}
+
+fn hexd(c: u8) i64 {
+    if u.is_digit(c) {
+        return @as(i64, c - '0');
+    }
+    return @as(i64, c - 'a') + 10;
+}
+
+// ALU operations (their /digit): add or adc sbb and sub xor cmp.
+let ALU: [8][]u8 = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"];
+
+fn general(A: *mut cr.Asm, st: *mut cr.Stmt, m: []u8, ops: []XOp) bool {
+    if (ops.len == 0) and simple(A, m) {
+        return true;
+    }
+    // ALU
+    for d in @as(usize, 0)..8 {
+        let s = named(m, ALU[d]);
+        if s != 0 {
+            alu(A, m, s, @int_cast(i32, d), ops);
+            return true;
+        }
+    }
+    let ts = named(m, "test");
+    if ts != 0 {
+        test_op(A, m, ts, ops);
+        return true;
+    }
+    let ms = named(m, "mov");
+    let mut any_xmm = false;
+    for o in ops {
+        if is_xmm(&o) {
+            any_xmm = true;
+        }
+    }
+    if (ms != 0) and not any_xmm {
+        mov(A, m, ms, ops);
+        return true;
+    }
+    if u.str_eq(m, "movabs") or u.str_eq(m, "movabsq") {
+        movabs(A, m, ops);
+        return true;
+    }
+    if movx(A, m, ops) {
+        return true;
+    }
+    let ls = named(m, "lea");
+    if ls != 0 {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if (ops[0].kind != XK_MEM) or not is_gpr(&ops[1]) or (ops[1].bits == 8) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, ls, ops[1..], m);
+        let mut e = new_enc();
+        set_size(&mut e, sz);
+        op1(&mut e, 0x8d);
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    if shift(A, m, ops) {
+        return true;
+    }
+    if unary(A, m, ops) {
+        return true;
+    }
+    if stack(A, m, ops) {
+        return true;
+    }
+    if branch(A, st, m, ops) {
+        return true;
+    }
+    if bitops(A, m, ops) {
+        return true;
+    }
+    if strings(A, m, ops) {
+        return true;
+    }
+    if misc(A, m, ops) {
+        return true;
+    }
+    if bmi(A, m, ops) {
+        return true;
+    }
+    return false;
+}
+
+// An ALU operation (/digit d): to r/m from a register or an immediate, or to
+// a register from r/m.
+fn alu(A: *mut cr.Asm, m: []u8, sfx: u32, d: i32, ops: []XOp) void {
+    if not nargs(A, ops, 2, m) {
+        return;
+    }
+    let src = ops[0];
+    let dst = ops[1];
+    let mut e = new_enc();
+    let dd = @as(u8, @truncate(u8, @bit_cast(u32, d))) * 8;
+    if src.kind == XK_IMM {
+        if not is_rm(&dst) {
+            bad_form(A, m);
+            return;
+        }
+        let one: [1]XOp = [dst];
+        let sz = size_of(A, sfx, one[..], m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        let v = cr.settle(A, src.v);
+        e.imm = v;
+        if sz == 8 {
+            if is_gpr(&dst) and (dst.reg == 0) {
+                op1(&mut e, dd + 4);
+                e.isz = 1;
+                emit(A, &mut e);
+                return;
+            }
+            op1(&mut e, 0x80);
+            rm_digit(&mut e, d, dst);
+            e.isz = 1;
+            emit(A, &mut e);
+            return;
+        }
+        if cr.is_const(v) and fits8(v.k) {
+            op1(&mut e, 0x83);
+            rm_digit(&mut e, d, dst);
+            e.isz = 1;
+            emit(A, &mut e);
+            return;
+        }
+        let mut n: u32 = 4;
+        if sz == 16 {
+            n = 2;
+        }
+        if is_gpr(&dst) and (dst.reg == 0) {
+            op1(&mut e, dd + 5);
+            e.isz = n;
+            emit(A, &mut e);
+            return;
+        }
+        op1(&mut e, 0x81);
+        rm_digit(&mut e, d, dst);
+        e.isz = n;
+        emit(A, &mut e);
+        return;
+    }
+    if is_gpr(&src) and is_rm(&dst) {
+        let sz = size_of(A, sfx, ops, m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        if sz == 8 {
+            op1(&mut e, dd);
+        } else {
+            op1(&mut e, dd + 1);
+        }
+        rm_enc(&mut e, src.reg, dst);
+        emit(A, &mut e);
+        return;
+    }
+    if (src.kind == XK_MEM) and is_gpr(&dst) {
+        let sz = size_of(A, sfx, ops, m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        if sz == 8 {
+            op1(&mut e, dd + 2);
+        } else {
+            op1(&mut e, dd + 3);
+        }
+        rm_enc(&mut e, dst.reg, src);
+        emit(A, &mut e);
+        return;
+    }
+    bad_form(A, m);
+}
+
+fn test_op(A: *mut cr.Asm, m: []u8, sfx: u32, ops: []XOp) void {
+    if not nargs(A, ops, 2, m) {
+        return;
+    }
+    let a = ops[0];
+    let b = ops[1];
+    let mut e = new_enc();
+    if a.kind == XK_IMM {
+        if not is_rm(&b) {
+            bad_form(A, m);
+            return;
+        }
+        let one: [1]XOp = [b];
+        let sz = size_of(A, sfx, one[..], m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        e.imm = a.v;
+        e.isz = imm_bytes(sz);
+        if is_gpr(&b) and (b.reg == 0) {
+            op1(&mut e, u8_pick(sz == 8, 0xa8, 0xa9));
+        } else {
+            op1(&mut e, u8_pick(sz == 8, 0xf6, 0xf7));
+            rm_digit(&mut e, 0, b);
+        }
+        emit(A, &mut e);
+        return;
+    }
+    // test r, r/m (either order)
+    let mut reg = a;
+    let mut rm = b;
+    if not is_gpr(&a) {
+        reg = b;
+        rm = a;
+    }
+    if not is_gpr(&reg) or not is_rm(&rm) {
+        bad_form(A, m);
+        return;
+    }
+    let sz = size_of(A, sfx, ops, m);
+    if sz == 0 {
+        return;
+    }
+    set_size(&mut e, sz);
+    op1(&mut e, u8_pick(sz == 8, 0x84, 0x85));
+    rm_enc(&mut e, reg.reg, rm);
+    emit(A, &mut e);
+}
+
+fn u8_pick(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The immediate's bytes for an operation of size sz (imm32 for 64-bit ones).
+fn imm_bytes(sz: u32) u32 {
+    if sz == 8 {
+        return 1;
+    }
+    if sz == 16 {
+        return 2;
+    }
+    return 4;
+}
+
+fn mov(A: *mut cr.Asm, m: []u8, sfx: u32, ops: []XOp) void {
+    if not nargs(A, ops, 2, m) {
+        return;
+    }
+    let src = ops[0];
+    let dst = ops[1];
+    let mut e = new_enc();
+    if src.kind == XK_IMM {
+        if not is_rm(&dst) {
+            bad_form(A, m);
+            return;
+        }
+        let one: [1]XOp = [dst];
+        let sz = size_of(A, sfx, one[..], m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        let v = cr.settle(A, src.v);
+        e.imm = v;
+        if is_gpr(&dst) {
+            if sz == 64 {
+                if cr.is_const(v) and not fits32(v.k) {
+                    // movabs
+                    op1(&mut e, 0xb8);
+                    e.plus = dst.reg;
+                    e.isz = 8;
+                    emit(A, &mut e);
+                    return;
+                }
+                op1(&mut e, 0xc7);
+                rm_digit(&mut e, 0, dst);
+                e.isz = 4;
+                emit(A, &mut e);
+                return;
+            }
+            if sz == 8 {
+                if dst.hi8 {
+                    op1(&mut e, 0xb0 + 4 + @truncate(u8, @bit_cast(u32, dst.reg)));
+                } else {
+                    op1(&mut e, 0xb0);
+                    e.plus = dst.reg;
+                }
+                e.isz = 1;
+                emit(A, &mut e);
+                return;
+            }
+            op1(&mut e, 0xb8);
+            e.plus = dst.reg;
+            e.isz = imm_bytes(sz);
+            emit(A, &mut e);
+            return;
+        }
+        op1(&mut e, u8_pick(sz == 8, 0xc6, 0xc7));
+        rm_digit(&mut e, 0, dst);
+        e.isz = imm_bytes(sz);
+        emit(A, &mut e);
+        return;
+    }
+    if is_gpr(&src) and is_rm(&dst) {
+        let sz = size_of(A, sfx, ops, m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        op1(&mut e, u8_pick(sz == 8, 0x88, 0x89));
+        rm_enc(&mut e, src.reg, dst);
+        emit(A, &mut e);
+        return;
+    }
+    if (src.kind == XK_MEM) and is_gpr(&dst) {
+        let sz = size_of(A, sfx, ops, m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        op1(&mut e, u8_pick(sz == 8, 0x8a, 0x8b));
+        rm_enc(&mut e, dst.reg, src);
+        emit(A, &mut e);
+        return;
+    }
+    if is_xmm(&src) or is_xmm(&dst) {
+        // (mov between general and xmm registers is movd/movq)
+        bad_form(A, m);
+        return;
+    }
+    bad_form(A, m);
+}
+
+fn movabs(A: *mut cr.Asm, m: []u8, ops: []XOp) void {
+    if not nargs(A, ops, 2, m) {
+        return;
+    }
+    if (ops[0].kind != XK_IMM) or not is_gpr(&ops[1]) or (ops[1].bits != 64) {
+        bad_form(A, m);
+        return;
+    }
+    let mut e = new_enc();
+    e.w = true;
+    op1(&mut e, 0xb8);
+    e.plus = ops[1].reg;
+    e.imm = ops[0].v;
+    e.isz = 8;
+    emit(A, &mut e);
+}
+
+// movzx / movsx / movsxd in their AT&T spellings (movzbl ...), and
+// movzx/movsx with the sizes from the registers.
+fn movx(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    let mut zx = false;
+    let mut from: u32 = 0;
+    let mut to: u32 = 0;
+    if u.str_eq(m, "movzx") or u.str_eq(m, "movsx") or u.str_eq(m, "movsxd") {
+        zx = m[3] == 'z';
+        if ops.len == 2 {
+            from = ops[0].bits;
+            to = ops[1].bits;
+        }
+        if u.str_eq(m, "movsxd") {
+            from = 32;
+        }
+    } else if (m.len == 6) and (u.starts(m, "movz") or u.starts(m, "movs")) {
+        from = suffix_bits(m[4]);
+        to = suffix_bits(m[5]);
+        zx = m[3] == 'z';
+        if (from == 0) or (to == 0) or (from >= to) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    if not nargs(A, ops, 2, m) {
+        return true;
+    }
+    if not is_rm(&ops[0]) or not is_gpr(&ops[1]) {
+        bad_form(A, m);
+        return true;
+    }
+    if (ops[0].kind == XK_REG) and (ops[0].bits != from) {
+        bad_form(A, m);
+        return true;
+    }
+    if (ops[1].bits != to) or (from == 0) or (from >= to) {
+        bad_form(A, m);
+        return true;
+    }
+    let mut e = new_enc();
+    set_size(&mut e, to);
+    e.ibyte = false;
+    e.regbyte = false;
+    if from == 32 {
+        if zx {
+            bad_form(A, m);
+            return true;
+        }
+        op1(&mut e, 0x63);
+    } else {
+        let mut c: u8 = 0xb6;
+        if not zx {
+            c = 0xbe;
+        }
+        if from == 16 {
+            c += 1;
+        }
+        op2(&mut e, 0x0f, c);
+    }
+    rm_enc(&mut e, ops[1].reg, ops[0]);
+    emit(A, &mut e);
+    return true;
+}
+
+let SHIFTS: [7][]u8 = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sar"];
+let SHIFTD: [7]i32 = [0, 1, 2, 3, 4, 5, 7];
+
+fn shift(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    let mut d: i32 = -1;
+    let mut sfx: u32 = 0;
+    for k in @as(usize, 0)..7 {
+        let s = named(m, SHIFTS[k]);
+        if s != 0 {
+            d = SHIFTD[k];
+            sfx = s;
+        }
+    }
+    let sal = named(m, "sal");
+    if sal != 0 {
+        d = 4;
+        sfx = sal;
+    }
+    if d < 0 {
+        let sd = named(m, "shld");
+        let sr = named(m, "shrd");
+        if (sd == 0) and (sr == 0) {
+            return false;
+        }
+        shiftd(A, m, sd + sr, sd != 0, ops);
+        return true;
+    }
+    if (ops.len < 1) or (ops.len > 2) {
+        bad_form(A, m);
+        return true;
+    }
+    let dst = ops[ops.len - 1];
+    if not is_rm(&dst) {
+        bad_form(A, m);
+        return true;
+    }
+    let one: [1]XOp = [dst];
+    let sz = size_of(A, sfx, one[..], m);
+    if sz == 0 {
+        return true;
+    }
+    let mut e = new_enc();
+    set_size(&mut e, sz);
+    let b8 = sz == 8;
+    if ops.len == 1 {
+        op1(&mut e, u8_pick(b8, 0xd0, 0xd1));
+        rm_digit(&mut e, d, dst);
+        emit(A, &mut e);
+        return true;
+    }
+    let c = ops[0];
+    if is_gpr(&c) and (c.reg == 1) and (c.bits == 8) and not c.hi8 {
+        op1(&mut e, u8_pick(b8, 0xd2, 0xd3));
+        rm_digit(&mut e, d, dst);
+        emit(A, &mut e);
+        return true;
+    }
+    if c.kind != XK_IMM {
+        bad_form(A, m);
+        return true;
+    }
+    let v = cr.settle(A, c.v);
+    if cr.is_const(v) and (v.k == 1) {
+        op1(&mut e, u8_pick(b8, 0xd0, 0xd1));
+        rm_digit(&mut e, d, dst);
+        emit(A, &mut e);
+        return true;
+    }
+    op1(&mut e, u8_pick(b8, 0xc0, 0xc1));
+    rm_digit(&mut e, d, dst);
+    e.imm = v;
+    e.isz = 1;
+    emit(A, &mut e);
+    return true;
+}
+
+fn shiftd(A: *mut cr.Asm, m: []u8, sfx: u32, left: bool, ops: []XOp) void {
+    if (ops.len < 2) or (ops.len > 3) {
+        bad_form(A, m);
+        return;
+    }
+    let dst = ops[ops.len - 1];
+    let src = ops[ops.len - 2];
+    if not is_gpr(&src) or not is_rm(&dst) or (src.bits == 8) {
+        bad_form(A, m);
+        return;
+    }
+    let two: [2]XOp = [src, dst];
+    let sz = size_of(A, sfx, two[..], m);
+    if sz == 0 {
+        return;
+    }
+    let mut e = new_enc();
+    set_size(&mut e, sz);
+    let mut base: u8 = 0xa4;
+    if not left {
+        base = 0xac;
+    }
+    if (ops.len == 2) or (is_gpr(&ops[0]) and (ops[0].reg == 1) and (ops[0].bits == 8)) {
+        op2(&mut e, 0x0f, base + 1);
+        rm_enc(&mut e, src.reg, dst);
+        emit(A, &mut e);
+        return;
+    }
+    if ops[0].kind != XK_IMM {
+        bad_form(A, m);
+        return;
+    }
+    op2(&mut e, 0x0f, base);
+    rm_enc(&mut e, src.reg, dst);
+    e.imm = ops[0].v;
+    e.isz = 1;
+    emit(A, &mut e);
+}
+
+// not neg mul imul div idiv inc dec (and imul's two- and three-operand forms)
+fn unary(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    let names = ["not", "neg", "mul", "imul", "div", "idiv", "inc", "dec"];
+    let digits: [8]i32 = [2, 3, 4, 5, 6, 7, 0, 1];
+    for k in @as(usize, 0)..8 {
+        let s = named(m, names[k]);
+        if s == 0 {
+            continue;
+        }
+        if (k == 3) and (ops.len >= 2) {
+            imul(A, m, s, ops);
+            return true;
+        }
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        if not is_rm(&ops[0]) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, s, ops, m);
+        if sz == 0 {
+            return true;
+        }
+        let mut e = new_enc();
+        set_size(&mut e, sz);
+        if k >= 6 {
+            op1(&mut e, u8_pick(sz == 8, 0xfe, 0xff));
+        } else {
+            op1(&mut e, u8_pick(sz == 8, 0xf6, 0xf7));
+        }
+        rm_digit(&mut e, digits[k], ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    return false;
+}
+
+fn imul(A: *mut cr.Asm, m: []u8, sfx: u32, ops: []XOp) void {
+    let mut e = new_enc();
+    if ops.len == 2 {
+        if ops[0].kind == XK_IMM {
+            // imul $i, %r: %r = %r * i
+            let three: [3]XOp = [ops[0], ops[1], ops[1]];
+            imul(A, m, sfx, three[..]);
+            return;
+        }
+        if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits == 8) {
+            bad_form(A, m);
+            return;
+        }
+        let sz = size_of(A, sfx, ops, m);
+        if sz == 0 {
+            return;
+        }
+        set_size(&mut e, sz);
+        op2(&mut e, 0x0f, 0xaf);
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return;
+    }
+    if (ops.len != 3) or (ops[0].kind != XK_IMM) or not is_rm(&ops[1]) or not is_gpr(&ops[2]) or (ops[2].bits == 8) {
+        bad_form(A, m);
+        return;
+    }
+    let sz = size_of(A, sfx, ops[1..], m);
+    if sz == 0 {
+        return;
+    }
+    set_size(&mut e, sz);
+    let v = cr.settle(A, ops[0].v);
+    e.imm = v;
+    if cr.is_const(v) and fits8(v.k) {
+        op1(&mut e, 0x6b);
+        e.isz = 1;
+    } else {
+        op1(&mut e, 0x69);
+        e.isz = imm_bytes(sz);
+    }
+    rm_enc(&mut e, ops[2].reg, ops[1]);
+    emit(A, &mut e);
+}
+
+fn stack(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    let ps = named(m, "push");
+    let pp = named(m, "pop");
+    if (ps == 0) and (pp == 0) {
+        return false;
+    }
+    if not nargs(A, ops, 1, m) {
+        return true;
+    }
+    let o = ops[0];
+    let mut e = new_enc();
+    let sfx = ps + pp;
+    if (sfx == 8) or (sfx == 32) {
+        bad_form(A, m);
+        return true;
+    }
+    if is_gpr(&o) {
+        if (o.bits != 64) and (o.bits != 16) {
+            bad_form(A, m);
+            return true;
+        }
+        e.osz = o.bits == 16;
+        op1(&mut e, u8_pick(ps != 0, 0x50, 0x58));
+        e.plus = o.reg;
+        emit(A, &mut e);
+        return true;
+    }
+    e.osz = sfx == 16;
+    if o.kind == XK_MEM {
+        if ps != 0 {
+            op1(&mut e, 0xff);
+            rm_enc(&mut e, 6, o);
+        } else {
+            op1(&mut e, 0x8f);
+            rm_enc(&mut e, 0, o);
+        }
+        emit(A, &mut e);
+        return true;
+    }
+    if (o.kind == XK_IMM) and (ps != 0) {
+        let v = cr.settle(A, o.v);
+        e.imm = v;
+        if cr.is_const(v) and fits8(v.k) {
+            op1(&mut e, 0x6a);
+            e.isz = 1;
+        } else {
+            op1(&mut e, 0x68);
+            e.isz = u32_pick(sfx == 16, 2, 4);
+        }
+        emit(A, &mut e);
+        return true;
+    }
+    bad_form(A, m);
+    return true;
+}
+
+fn u32_pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// jmp, jcc, call, ret, loop, jrcxz; setcc and cmovcc
+fn branch(A: *mut cr.Asm, st: *mut cr.Stmt, m: []u8, ops: []XOp) bool {
+    if (u.str_eq(m, "ret") or u.str_eq(m, "retq")) and (ops.len == 1) {
+        if ops[0].kind != XK_IMM {
+            bad_form(A, m);
+            return true;
+        }
+        let mut e = new_enc();
+        op1(&mut e, 0xc2);
+        e.imm = ops[0].v;
+        e.isz = 2;
+        emit(A, &mut e);
+        return true;
+    }
+    let is_jmp = u.str_eq(m, "jmp") or u.str_eq(m, "jmpq");
+    let is_call = u.str_eq(m, "call") or u.str_eq(m, "callq");
+    let mut cc: i32 = -1;
+    if (m.len > 1) and (m[0] == 'j') and not is_jmp {
+        cc = cond(m[1..]);
+    }
+    let mut loopk: i32 = -1;
+    let loops = ["loopne", "loopnz", "loope", "loopz", "loop", "jrcxz", "jecxz"];
+    let loopc: [7]i32 = [0xe0, 0xe0, 0xe1, 0xe1, 0xe2, 0xe3, 0xe3];
+    for k in @as(usize, 0)..7 {
+        if u.str_eq(m, loops[k]) {
+            loopk = @int_cast(i32, k);
+        }
+    }
+    if is_jmp or is_call or (cc >= 0) or (loopk >= 0) {
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        let t = ops[0];
+        if t.star or (t.kind == XK_REG) or ((t.kind == XK_MEM) and not t.bare) {
+            // indirect: jmp *r/m (FF /4), call *r/m (FF /2)
+            if not is_jmp and not is_call {
+                bad_form(A, m);
+                return true;
+            }
+            if (t.kind == XK_REG) and (not is_gpr(&t) or (t.bits != 64)) {
+                bad_form(A, m);
+                return true;
+            }
+            let mut e = new_enc();
+            op1(&mut e, 0xff);
+            rm_enc(&mut e, u32_to_i32(u32_pick(is_jmp, 4, 2)), t);
+            emit(A, &mut e);
+            return true;
+        }
+        if t.kind != XK_MEM {
+            bad_form(A, m);
+            return true;
+        }
+        rel_jump(A, st, t.v, is_jmp, is_call, cc, loopk, loopc);
+        return true;
+    }
+    if (m.len > 3) and u.starts(m, "set") {
+        let mut c = cond(m[3..]);
+        if (c < 0) and (m[m.len - 1] == 'b') {
+            c = cond(m[3..m.len - 1]);
+        }
+        if c >= 0 {
+            if not nargs(A, ops, 1, m) {
+                return true;
+            }
+            if not is_rm(&ops[0]) or (is_gpr(&ops[0]) and (ops[0].bits != 8)) {
+                bad_form(A, m);
+                return true;
+            }
+            let mut e = new_enc();
+            e.regbyte = false;
+            e.ibyte = true;
+            op2(&mut e, 0x0f, 0x90 + @truncate(u8, @bit_cast(u32, c)));
+            rm_enc(&mut e, 0, ops[0]);
+            emit(A, &mut e);
+            return true;
+        }
+    }
+    if (m.len > 4) and u.starts(m, "cmov") {
+        let mut c = cond(m[4..]);
+        let mut sfx: u32 = 1;
+        if (c < 0) and (suffix_bits(m[m.len - 1]) != 0) {
+            c = cond(m[4..m.len - 1]);
+            sfx = suffix_bits(m[m.len - 1]);
+        }
+        if c >= 0 {
+            if not nargs(A, ops, 2, m) {
+                return true;
+            }
+            if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits == 8) {
+                bad_form(A, m);
+                return true;
+            }
+            let sz = size_of(A, sfx, ops, m);
+            if sz == 0 {
+                return true;
+            }
+            let mut e = new_enc();
+            set_size(&mut e, sz);
+            op2(&mut e, 0x0f, 0x40 + @truncate(u8, @bit_cast(u32, c)));
+            rm_enc(&mut e, ops[1].reg, ops[0]);
+            emit(A, &mut e);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn u32_to_i32(x: u32) i32 {
+    return @bit_cast(i32, x);
+}
+
+// A jump or call to target v: rel8 when it is a near label of this text
+// (jumps), else rel32 (a relocation for another symbol).
+fn rel_jump(A: *mut cr.Asm, st: *mut cr.Stmt, v0: cr.Val, is_jmp: bool, is_call: bool, cc: i32, loopk: i32,
+            loopc: [7]i32) void {
+    let v = cr.settle(A, v0);
+    if not v.ok {
+        return;
+    }
+    for b in pfxs() {
+        cr.emit8(A, @as(u64, b));
+    }
+    if cr.is_const(v) {
+        cr.fail(A, "a jump to an absolute address");
+        return;
+    }
+    let mut toff: u64 = 0;
+    let local = cr.local_target(A, v, &mut toff) and (v.rm == cr.RM_NONE);
+    let start = cr.here(A);
+    let target = @bit_cast(i64, toff) + v.k;
+    if loopk >= 0 {
+        // rel8 only
+        if not local {
+            cr.fail(A, "loop and jrcxz need a target in this assembly");
+            return;
+        }
+        let mut n: u64 = 2;
+        if loopk == 6 {
+            cr.emit8(A, 0x67);
+            n = 3;
+        }
+        cr.emit8(A, @bit_cast(u64, @as(i64, loopc[@int_cast(usize, loopk)])));
+        let rel = target - @bit_cast(i64, start + n);
+        if not fits8(rel) and (A.pass > 0) {
+            cr.fail(A, "a loop or jrcxz target out of reach");
+            return;
+        }
+        cr.emit8(A, @bit_cast(u64, rel));
+        return;
+    }
+    if local and not is_call and not st.long_ {
+        let rel = target - @bit_cast(i64, start + 2);
+        if fits8(rel) {
+            if is_jmp {
+                cr.emit8(A, 0xeb);
+            } else {
+                cr.emit8(A, 0x70 + @as(u64, @bit_cast(u32, cc)));
+            }
+            cr.emit8(A, @bit_cast(u64, rel));
+            return;
+        }
+        st.long_ = true;
+        A.changed = true;
+    }
+    let mut n: u64 = 5;
+    if is_call {
+        cr.emit8(A, 0xe8);
+    } else if is_jmp {
+        cr.emit8(A, 0xe9);
+    } else {
+        cr.emit8(A, 0x0f);
+        cr.emit8(A, 0x80 + @as(u64, @bit_cast(u32, cc)));
+        n = 6;
+    }
+    if local {
+        cr.emit32(A, @bit_cast(u64, target - @bit_cast(i64, start + n)));
+        return;
+    }
+    if v.neg >= 0 {
+        cr.fail(A, "a jump to a difference of symbols");
+        return;
+    }
+    cr.reloc(A, cr.here(A), elf.R_X86_64_PLT32, v, v.k - 4);
+    cr.emit32(A, 0);
+}
+
+// bt bts btr btc, bsf bsr, tzcnt lzcnt popcnt, bswap, xchg xadd cmpxchg
+// cmpxchg8b cmpxchg16b
+fn bitops(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    let bts = ["bt", "bts", "btr", "btc"];
+    for k in @as(usize, 0)..4 {
+        let s = named(m, bts[k]);
+        if s == 0 {
+            continue;
+        }
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        let mut e = new_enc();
+        let dst = ops[1];
+        if not is_rm(&dst) {
+            bad_form(A, m);
+            return true;
+        }
+        if ops[0].kind == XK_IMM {
+            let one: [1]XOp = [dst];
+            let sz = size_of(A, s, one[..], m);
+            if (sz == 0) or (sz == 8) {
+                if sz == 8 {
+                    bad_form(A, m);
+                }
+                return true;
+            }
+            set_size(&mut e, sz);
+            op2(&mut e, 0x0f, 0xba);
+            rm_enc(&mut e, 4 + @int_cast(i32, k), dst);
+            e.imm = ops[0].v;
+            e.isz = 1;
+            emit(A, &mut e);
+            return true;
+        }
+        if not is_gpr(&ops[0]) or (ops[0].bits == 8) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, s, ops, m);
+        if sz == 0 {
+            return true;
+        }
+        set_size(&mut e, sz);
+        let codes: [4]u8 = [0xa3, 0xab, 0xb3, 0xbb];
+        op2(&mut e, 0x0f, codes[k]);
+        rm_enc(&mut e, ops[0].reg, dst);
+        emit(A, &mut e);
+        return true;
+    }
+    let scans = ["bsf", "bsr", "tzcnt", "lzcnt", "popcnt"];
+    let scodes: [5]u8 = [0xbc, 0xbd, 0xbc, 0xbd, 0xb8];
+    for k in @as(usize, 0)..5 {
+        let s = named(m, scans[k]);
+        if s == 0 {
+            continue;
+        }
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits == 8) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, s, ops, m);
+        if sz == 0 {
+            return true;
+        }
+        let mut e = new_enc();
+        set_size(&mut e, sz);
+        if k >= 2 {
+            e.pfx = 0xf3;
+        }
+        op2(&mut e, 0x0f, scodes[k]);
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    let bs = named(m, "bswap");
+    if bs != 0 {
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        if not is_gpr(&ops[0]) or (ops[0].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, bs, ops, m);
+        if sz == 0 {
+            return true;
+        }
+        let mut e = new_enc();
+        set_size(&mut e, sz);
+        op2(&mut e, 0x0f, 0xc8);
+        e.plus = ops[0].reg;
+        emit(A, &mut e);
+        return true;
+    }
+    let xc = named(m, "xchg");
+    if xc != 0 {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        let mut a = ops[0];
+        let mut b = ops[1];
+        if not is_gpr(&a) {
+            a = ops[1];
+            b = ops[0];
+        }
+        if not is_gpr(&a) or not is_rm(&b) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, xc, ops, m);
+        if sz == 0 {
+            return true;
+        }
+        let mut e = new_enc();
+        set_size(&mut e, sz);
+        if (sz != 8) and is_gpr(&b) and ((a.reg == 0) or (b.reg == 0)) and
+           not ((sz == 32) and (a.reg == 0) and (b.reg == 0)) {
+            // xchg with the accumulator: 90+r (xchg %rax, %rax is nop: no REX.W)
+            op1(&mut e, 0x90);
+            e.plus = a.reg + b.reg;
+            if e.plus == 0 {
+                e.w = false;
+            }
+            emit(A, &mut e);
+            return true;
+        }
+        op1(&mut e, u8_pick(sz == 8, 0x86, 0x87));
+        if is_gpr(&b) {
+            rm_enc(&mut e, ops[0].reg, ops[1]);
+        } else {
+            rm_enc(&mut e, a.reg, b);
+        }
+        emit(A, &mut e);
+        return true;
+    }
+    let xa = named(m, "xadd");
+    let cx = named(m, "cmpxchg");
+    if (xa != 0) or (cx != 0) {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_gpr(&ops[0]) or not is_rm(&ops[1]) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, xa + cx, ops, m);
+        if sz == 0 {
+            return true;
+        }
+        let mut e = new_enc();
+        set_size(&mut e, sz);
+        let mut c: u8 = 0xb0;
+        if xa != 0 {
+            c = 0xc0;
+        }
+        if sz != 8 {
+            c += 1;
+        }
+        op2(&mut e, 0x0f, c);
+        rm_enc(&mut e, ops[0].reg, ops[1]);
+        emit(A, &mut e);
+        return true;
+    }
+    if u.str_eq(m, "cmpxchg8b") or u.str_eq(m, "cmpxchg16b") {
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        if ops[0].kind != XK_MEM {
+            bad_form(A, m);
+            return true;
+        }
+        let mut e = new_enc();
+        e.w = u.str_eq(m, "cmpxchg16b");
+        op2(&mut e, 0x0f, 0xc7);
+        rm_enc(&mut e, 1, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    return false;
+}
+
+// movs cmps scas lods stos (b w l q, or the size from operands)
+fn strings(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    let names = ["movs", "cmps", "stos", "lods", "scas"];
+    let codes: [5]u8 = [0xa4, 0xa6, 0xaa, 0xac, 0xae];
+    for k in @as(usize, 0)..5 {
+        let s = named(m, names[k]);
+        if s == 0 {
+            continue;
+        }
+        let mut sz = s;
+        if sz == 1 {
+            // the size from a register operand (stos %al, ...), else an error
+            sz = 0;
+            for o in ops {
+                if is_gpr(&o) {
+                    sz = o.bits;
+                }
+            }
+            if sz == 0 {
+                if ops.len == 0 {
+                    return false;
+                }
+                cr.fail(A, u.f1("no operand size in '%s'", m));
+                return true;
+            }
+        }
+        if ((k == 0) and (sz == 32) and (ops.len == 2) and (is_xmm(&ops[0]) or is_xmm(&ops[1]))) {
+            return false;  // (movsd of xmm registers: SSE2)
+        }
+        if ((k == 1) and (sz == 32) and (ops.len >= 2)) {
+            return false;  // (cmpsd of xmm registers)
+        }
+        for o in ops {
+            if (o.kind == XK_IMM) or is_xmm(&o) {
+                return false;
+            }
+        }
+        let mut e = new_enc();
+        set_size(&mut e, sz);
+        e.ibyte = false;
+        e.regbyte = false;
+        op1(&mut e, u8_pick(sz == 8, codes[k], codes[k] + 1));
+        emit(A, &mut e);
+        return true;
+    }
+    return false;
+}
+
+// nopw/nopl (multi-byte nops), prefetches, clflush, rdrand, rdseed,
+// crc32, movbe, int, enter, adcx/adox, ldmxcsr/stmxcsr, movnti
+fn misc(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    let mut e = new_enc();
+    let ns = named(m, "nop");
+    if (ns != 0) and (ops.len == 1) {
+        if not is_rm(&ops[0]) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, ns, ops, m);
+        if (sz == 0) or (sz == 8) {
+            return true;
+        }
+        set_size(&mut e, sz);
+        op2(&mut e, 0x0f, 0x1f);
+        rm_enc(&mut e, 0, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    let pf = ["prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2", "prefetchw", "clflush", "clflushopt", "clwb"];
+    for k in @as(usize, 0)..pf.len {
+        if u.str_eq(m, pf[k]) {
+            if not nargs(A, ops, 1, m) {
+                return true;
+            }
+            if ops[0].kind != XK_MEM {
+                bad_form(A, m);
+                return true;
+            }
+            if k < 4 {
+                op2(&mut e, 0x0f, 0x18);
+                rm_enc(&mut e, @int_cast(i32, k), ops[0]);
+            } else if k == 4 {
+                op2(&mut e, 0x0f, 0x0d);
+                rm_enc(&mut e, 1, ops[0]);
+            } else {
+                op2(&mut e, 0x0f, 0xae);
+                rm_enc(&mut e, u32_to_i32(u32_pick(k == 7, 6, 7)), ops[0]);
+                if k == 6 {
+                    e.osz = true;
+                } else if k == 7 {
+                    e.osz = true;
+                }
+            }
+            emit(A, &mut e);
+            return true;
+        }
+    }
+    let rd = ["rdrand", "rdseed"];
+    for k in @as(usize, 0)..2 {
+        let s = named(m, rd[k]);
+        if s != 0 {
+            if not nargs(A, ops, 1, m) {
+                return true;
+            }
+            if not is_gpr(&ops[0]) or (ops[0].bits == 8) {
+                bad_form(A, m);
+                return true;
+            }
+            let sz = size_of(A, s, ops, m);
+            set_size(&mut e, sz);
+            op2(&mut e, 0x0f, 0xc7);
+            rm_enc(&mut e, u32_to_i32(u32_pick(k == 0, 6, 7)), ops[0]);
+            emit(A, &mut e);
+            return true;
+        }
+    }
+    let crc = named(m, "crc32");
+    if crc != 0 {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        let mut src = crc;
+        if is_gpr(&ops[0]) {
+            src = ops[0].bits;
+        }
+        if src <= 1 {
+            cr.fail(A, "no operand size in 'crc32'");
+            return true;
+        }
+        e.pfx = 0xf2;
+        e.osz = src == 16;
+        e.w = ops[1].bits == 64;
+        e.ibyte = src == 8;
+        op3(&mut e, 0x0f, 0x38, u8_pick(src == 8, 0xf0, 0xf1));
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    let mb = named(m, "movbe");
+    if mb != 0 {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        let sz = size_of(A, mb, ops, m);
+        if (sz == 0) or (sz == 8) {
+            return true;
+        }
+        set_size(&mut e, sz);
+        if (ops[0].kind == XK_MEM) and is_gpr(&ops[1]) {
+            op3(&mut e, 0x0f, 0x38, 0xf0);
+            rm_enc(&mut e, ops[1].reg, ops[0]);
+        } else if is_gpr(&ops[0]) and (ops[1].kind == XK_MEM) {
+            op3(&mut e, 0x0f, 0x38, 0xf1);
+            rm_enc(&mut e, ops[0].reg, ops[1]);
+        } else {
+            bad_form(A, m);
+            return true;
+        }
+        emit(A, &mut e);
+        return true;
+    }
+    if u.str_eq(m, "int") {
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        if ops[0].kind != XK_IMM {
+            bad_form(A, m);
+            return true;
+        }
+        let v = cr.settle(A, ops[0].v);
+        if cr.is_const(v) and (v.k == 3) {
+            cr.emit8(A, 0xcc);
+            return true;
+        }
+        op1(&mut e, 0xcd);
+        e.imm = v;
+        e.isz = 1;
+        emit(A, &mut e);
+        return true;
+    }
+    if u.str_eq(m, "enter") or u.str_eq(m, "enterq") {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        cr.emit8(A, 0xc8);
+        imm(A, ops[0].v, 2, false);
+        imm(A, ops[1].v, 1, false);
+        return true;
+    }
+    let ac = named(m, "adcx");
+    let ao = named(m, "adox");
+    if (ac != 0) or (ao != 0) {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        let sz = size_of(A, ac + ao, ops, m);
+        set_size(&mut e, sz);
+        e.pfx = u8_pick(ac != 0, 0x66, 0xf3);
+        op3(&mut e, 0x0f, 0x38, 0xf6);
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    if u.str_eq(m, "ldmxcsr") or u.str_eq(m, "stmxcsr") {
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        if ops[0].kind != XK_MEM {
+            bad_form(A, m);
+            return true;
+        }
+        op2(&mut e, 0x0f, 0xae);
+        rm_enc(&mut e, u32_to_i32(u32_pick(m[0] == 'l', 2, 3)), ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    let mn = named(m, "movnti");
+    if mn != 0 {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_gpr(&ops[0]) or (ops[1].kind != XK_MEM) or (ops[0].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        e.w = ops[0].bits == 64;
+        op2(&mut e, 0x0f, 0xc3);
+        rm_enc(&mut e, ops[0].reg, ops[1]);
+        emit(A, &mut e);
+        return true;
+    }
+    if u.str_eq(m, "rdpid") {
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        if not is_gpr(&ops[0]) or (ops[0].bits != 64) {
+            bad_form(A, m);
+            return true;
+        }
+        e.pfx = 0xf3;
+        op2(&mut e, 0x0f, 0xc7);
+        rm_enc(&mut e, 7, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    if u.str_eq(m, "rdfsbase") or u.str_eq(m, "rdgsbase") or u.str_eq(m, "wrfsbase") or u.str_eq(m, "wrgsbase") {
+        if not nargs(A, ops, 1, m) {
+            return true;
+        }
+        if not is_gpr(&ops[0]) or (ops[0].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        e.pfx = 0xf3;
+        e.w = ops[0].bits == 64;
+        op2(&mut e, 0x0f, 0xae);
+        let mut d: i32 = 0;
+        if m[2] == 'g' {
+            d = 1;
+        }
+        if m[0] == 'w' {
+            d += 2;
+        }
+        rm_enc(&mut e, d, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// VEX (BMI1, BMI2)
+// -----------------------------------------------------------------------------
+// VEX prefix (3 bytes, or 2 where it can be), then opcode and ModRM.
+// mmmmm: 1 0F, 2 0F38, 3 0F3A; pp: 0 none, 1 66, 2 F3, 3 F2; vvvv: a register or -1.
+fn vex(A: *mut cr.Asm, mmmmm: u64, pp: u64, w: bool, l: u64, vvvv: i32, opc: u8, regf: i32, rm: XOp, isz: u32,
+       iv: cr.Val) void {
+    let r = hibit(regf);
+    let mut x: u64 = 0;
+    let mut b: u64 = 0;
+    if rm.kind == XK_REG {
+        b = hibit(rm.reg);
+    } else {
+        b = hibit(rm.base);
+        x = hibit(rm.index);
+        if rm.seg != 0 {
+            cr.emit8(A, @as(u64, rm.seg));
+        }
+        if rm.a32 {
+            cr.emit8(A, 0x67);
+        }
+    }
+    let mut v: u64 = 15;
+    if vvvv >= 0 {
+        v = (~@as(u64, @bit_cast(u32, vvvv & 15))) & 15;
+    }
+    let mut wb: u64 = 0;
+    if w {
+        wb = 1;
+    }
+    if (x == 0) and (b == 0) and (mmmmm == 1) and not w {
+        cr.emit8(A, 0xc5);
+        cr.emit8(A, ((((~r) & 1) << 7) | (v << 3)) | ((l << 2) | pp));
+    } else {
+        cr.emit8(A, 0xc4);
+        cr.emit8(A, ((((~r) & 1) << 7) | (((~x) & 1) << 6)) | ((((~b) & 1) << 5) | mmmmm));
+        cr.emit8(A, ((wb << 7) | (v << 3)) | ((l << 2) | pp));
+    }
+    cr.emit8(A, @as(u64, opc));
+    modrm(A, regf, &rm, isz);
+    if isz > 0 {
+        imm(A, iv, isz, false);
+    }
+}
+
+fn bmi(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    // three-operand: andn (src2, src1, dst) = dst <- ~src1 & src2 (VEX.vvvv src1)
+    let names3 = ["andn", "bextr", "bzhi", "pdep", "pext", "mulx", "sarx", "shlx", "shrx"];
+    // pp, opcode, vvvv from: 0 the middle operand, 1 the first (bextr, bzhi, sarx...)
+    let pps: [9]u64 = [0, 0, 0, 3, 2, 3, 2, 1, 3];
+    let opcs: [9]u8 = [0xf2, 0xf7, 0xf5, 0xf5, 0xf5, 0xf6, 0xf7, 0xf7, 0xf7];
+    let vfirst: [9]bool = [false, true, true, false, false, false, true, true, true];
+    for k in @as(usize, 0)..9 {
+        let s = named(m, names3[k]);
+        if s == 0 {
+            continue;
+        }
+        if not nargs(A, ops, 3, m) {
+            return true;
+        }
+        let dst = ops[2];
+        if not is_gpr(&dst) or (dst.bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        let w = dst.bits == 64;
+        if vfirst[k] {
+            // op %ctl, r/m, %dst: vvvv = ctl
+            if not is_gpr(&ops[0]) or not is_rm(&ops[1]) {
+                bad_form(A, m);
+                return true;
+            }
+            vex(A, 2, pps[k], w, 0, ops[0].reg, opcs[k], dst.reg, ops[1], 0, cr.konst(0));
+        } else {
+            // op r/m, %src1, %dst: vvvv = src1
+            if not is_rm(&ops[0]) or not is_gpr(&ops[1]) {
+                bad_form(A, m);
+                return true;
+            }
+            vex(A, 2, pps[k], w, 0, ops[1].reg, opcs[k], dst.reg, ops[0], 0, cr.konst(0));
+        }
+        return true;
+    }
+    let names1 = ["blsr", "blsmsk", "blsi"];
+    let digits: [3]i32 = [1, 2, 3];
+    for k in @as(usize, 0)..3 {
+        let s = named(m, names1[k]);
+        if s == 0 {
+            continue;
+        }
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        vex(A, 2, 0, ops[1].bits == 64, 0, ops[1].reg, 0xf3, digits[k], ops[0], 0, cr.konst(0));
+        return true;
+    }
+    let rx = named(m, "rorx");
+    if rx != 0 {
+        if not nargs(A, ops, 3, m) {
+            return true;
+        }
+        if (ops[0].kind != XK_IMM) or not is_rm(&ops[1]) or not is_gpr(&ops[2]) or (ops[2].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        vex(A, 3, 3, ops[2].bits == 64, 0, -1, 0xf0, ops[2].reg, ops[1], 1, ops[0].v);
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// SSE
+// -----------------------------------------------------------------------------
+// The forms of SSE instructions (SseRow.form)
+const F_XX: u8 = 1;    // xmm <- xmm/m (the destination the reg field)
+const F_XXI: u8 = 2;   // the same with an imm8 first
+const F_GX: u8 = 3;    // general register <- xmm (movmskps, pmovmskb)
+const F_GXM: u8 = 4;   // general register <- xmm/m (cvttss2si ...; the size from the register)
+const F_XG: u8 = 5;    // xmm <- general register/m (cvtsi2ss ...: the size from the register or a suffix)
+const F_SHI: u8 = 6;   // xmm shifted by imm8 (/digit), or by xmm/m (the second opcode)
+const F_MX: u8 = 7;    // m <- xmm only (movntps ...)
+const F_XM: u8 = 8;    // xmm <- m only (movhps loads ...: their stores are the opcode + 1)
+const F_GXI: u8 = 9;   // general register <- xmm, imm8 (pextrw, pextrd ...)
+const F_XGI: u8 = 10;  // xmm <- general register/m, imm8 (pinsrw, pinsrd ...)
+
+struct SseRow {
+    name: []u8,
+    pfx: u8,
+    map: u8,  // 1: 0F, 2: 0F38, 3: 0F3A
+    opc: u8,
+    form: u8,
+    st: u8,     // a store form's opcode (xmm -> m), 0 none
+    w: bool,    // REX.W
+    digit: i8,  // F_SHI: the /digit of the immediate form
+}
+
+fn row(name: []u8, pfx: u8, map: u8, opc: u8, form: u8, st: u8) SseRow {
+    return SseRow.{ name: name, pfx: pfx, map: map, opc: opc, form: form, st: st, w: false, digit: -1 };
+}
+
+// The table, made for each lookup (its memory is the assembler's, a scratch
+// scope's).
+let mut g_sse: u.List.[SseRow] = u.List.[SseRow].{ data: @ptr_from_int(*mut SseRow, 0), len: 0, cap: 0 };
+
+// The common xx forms: (name, prefix, map, opcode) for four prefixes at once
+// (ps, pd, ss, sd).
+fn arith4(base: []u8, opc: u8) void {
+    g_sse.push(row(u.cat2(base, "ps"), 0, 1, opc, F_XX, 0));
+    g_sse.push(row(u.cat2(base, "pd"), 0x66, 1, opc, F_XX, 0));
+    g_sse.push(row(u.cat2(base, "ss"), 0xf3, 1, opc, F_XX, 0));
+    g_sse.push(row(u.cat2(base, "sd"), 0xf2, 1, opc, F_XX, 0));
+}
+
+fn x66(name: []u8, opc: u8) void {
+    g_sse.push(row(name, 0x66, 1, opc, F_XX, 0));
+}
+
+fn build_sse() void {
+    g_sse = u.List.[SseRow].empty();
+    arith4("add", 0x58);
+    arith4("mul", 0x59);
+    arith4("sub", 0x5c);
+    arith4("min", 0x5d);
+    arith4("div", 0x5e);
+    arith4("max", 0x5f);
+    arith4("sqrt", 0x51);
+    g_sse.push(row("rcpps", 0, 1, 0x53, F_XX, 0));
+    g_sse.push(row("rcpss", 0xf3, 1, 0x53, F_XX, 0));
+    g_sse.push(row("rsqrtps", 0, 1, 0x52, F_XX, 0));
+    g_sse.push(row("rsqrtss", 0xf3, 1, 0x52, F_XX, 0));
+    // moves: load opcode, store opcode
+    g_sse.push(row("movaps", 0, 1, 0x28, F_XX, 0x29));
+    g_sse.push(row("movapd", 0x66, 1, 0x28, F_XX, 0x29));
+    g_sse.push(row("movups", 0, 1, 0x10, F_XX, 0x11));
+    g_sse.push(row("movupd", 0x66, 1, 0x10, F_XX, 0x11));
+    g_sse.push(row("movss", 0xf3, 1, 0x10, F_XX, 0x11));
+    g_sse.push(row("movsd", 0xf2, 1, 0x10, F_XX, 0x11));
+    g_sse.push(row("movdqa", 0x66, 1, 0x6f, F_XX, 0x7f));
+    g_sse.push(row("movdqu", 0xf3, 1, 0x6f, F_XX, 0x7f));
+    g_sse.push(row("lddqu", 0xf2, 1, 0xf0, F_XM, 0));
+    g_sse.push(row("movhps", 0, 1, 0x16, F_XM, 0x17));
+    g_sse.push(row("movlps", 0, 1, 0x12, F_XM, 0x13));
+    g_sse.push(row("movhpd", 0x66, 1, 0x16, F_XM, 0x17));
+    g_sse.push(row("movlpd", 0x66, 1, 0x12, F_XM, 0x13));
+    g_sse.push(row("movhlps", 0, 1, 0x12, F_XX, 0));
+    g_sse.push(row("movlhps", 0, 1, 0x16, F_XX, 0));
+    g_sse.push(row("movntps", 0, 1, 0x2b, F_MX, 0x2b));
+    g_sse.push(row("movntpd", 0x66, 1, 0x2b, F_MX, 0x2b));
+    g_sse.push(row("movntdq", 0x66, 1, 0xe7, F_MX, 0xe7));
+    g_sse.push(row("movntdqa", 0x66, 2, 0x2a, F_XM, 0));
+    g_sse.push(row("movddup", 0xf2, 1, 0x12, F_XX, 0));
+    g_sse.push(row("movshdup", 0xf3, 1, 0x16, F_XX, 0));
+    g_sse.push(row("movsldup", 0xf3, 1, 0x12, F_XX, 0));
+    g_sse.push(row("movmskps", 0, 1, 0x50, F_GX, 0));
+    g_sse.push(row("movmskpd", 0x66, 1, 0x50, F_GX, 0));
+    g_sse.push(row("pmovmskb", 0x66, 1, 0xd7, F_GX, 0));
+    // logic
+    g_sse.push(row("andps", 0, 1, 0x54, F_XX, 0));
+    g_sse.push(row("andpd", 0x66, 1, 0x54, F_XX, 0));
+    g_sse.push(row("andnps", 0, 1, 0x55, F_XX, 0));
+    g_sse.push(row("andnpd", 0x66, 1, 0x55, F_XX, 0));
+    g_sse.push(row("orps", 0, 1, 0x56, F_XX, 0));
+    g_sse.push(row("orpd", 0x66, 1, 0x56, F_XX, 0));
+    g_sse.push(row("xorps", 0, 1, 0x57, F_XX, 0));
+    g_sse.push(row("xorpd", 0x66, 1, 0x57, F_XX, 0));
+    // compares
+    g_sse.push(row("cmpps", 0, 1, 0xc2, F_XXI, 0));
+    g_sse.push(row("cmppd", 0x66, 1, 0xc2, F_XXI, 0));
+    g_sse.push(row("cmpss", 0xf3, 1, 0xc2, F_XXI, 0));
+    g_sse.push(row("cmpsd", 0xf2, 1, 0xc2, F_XXI, 0));
+    g_sse.push(row("comiss", 0, 1, 0x2f, F_XX, 0));
+    g_sse.push(row("comisd", 0x66, 1, 0x2f, F_XX, 0));
+    g_sse.push(row("ucomiss", 0, 1, 0x2e, F_XX, 0));
+    g_sse.push(row("ucomisd", 0x66, 1, 0x2e, F_XX, 0));
+    // shuffles, unpacks
+    g_sse.push(row("shufps", 0, 1, 0xc6, F_XXI, 0));
+    g_sse.push(row("shufpd", 0x66, 1, 0xc6, F_XXI, 0));
+    g_sse.push(row("unpcklps", 0, 1, 0x14, F_XX, 0));
+    g_sse.push(row("unpckhps", 0, 1, 0x15, F_XX, 0));
+    g_sse.push(row("unpcklpd", 0x66, 1, 0x14, F_XX, 0));
+    g_sse.push(row("unpckhpd", 0x66, 1, 0x15, F_XX, 0));
+    g_sse.push(row("pshufd", 0x66, 1, 0x70, F_XXI, 0));
+    g_sse.push(row("pshufhw", 0xf3, 1, 0x70, F_XXI, 0));
+    g_sse.push(row("pshuflw", 0xf2, 1, 0x70, F_XXI, 0));
+    // conversions
+    g_sse.push(row("cvtps2pd", 0, 1, 0x5a, F_XX, 0));
+    g_sse.push(row("cvtpd2ps", 0x66, 1, 0x5a, F_XX, 0));
+    g_sse.push(row("cvtss2sd", 0xf3, 1, 0x5a, F_XX, 0));
+    g_sse.push(row("cvtsd2ss", 0xf2, 1, 0x5a, F_XX, 0));
+    g_sse.push(row("cvtdq2ps", 0, 1, 0x5b, F_XX, 0));
+    g_sse.push(row("cvtps2dq", 0x66, 1, 0x5b, F_XX, 0));
+    g_sse.push(row("cvttps2dq", 0xf3, 1, 0x5b, F_XX, 0));
+    g_sse.push(row("cvtdq2pd", 0xf3, 1, 0xe6, F_XX, 0));
+    g_sse.push(row("cvtpd2dq", 0xf2, 1, 0xe6, F_XX, 0));
+    g_sse.push(row("cvttpd2dq", 0x66, 1, 0xe6, F_XX, 0));
+    g_sse.push(row("cvtsi2ss", 0xf3, 1, 0x2a, F_XG, 0));
+    g_sse.push(row("cvtsi2sd", 0xf2, 1, 0x2a, F_XG, 0));
+    g_sse.push(row("cvttss2si", 0xf3, 1, 0x2c, F_GXM, 0));
+    g_sse.push(row("cvttsd2si", 0xf2, 1, 0x2c, F_GXM, 0));
+    g_sse.push(row("cvtss2si", 0xf3, 1, 0x2d, F_GXM, 0));
+    g_sse.push(row("cvtsd2si", 0xf2, 1, 0x2d, F_GXM, 0));
+    // integer SIMD (SSE2)
+    let ints = ["punpcklbw", "punpcklwd", "punpckldq", "packsswb", "pcmpgtb", "pcmpgtw", "pcmpgtd", "packuswb",
+                "punpckhbw", "punpckhwd", "punpckhdq", "packssdw", "punpcklqdq", "punpckhqdq"];
+    for k in 0..ints.len {
+        x66(ints[k], 0x60 + @truncate(u8, k));
+    }
+    x66("pcmpeqb", 0x74);
+    x66("pcmpeqw", 0x75);
+    x66("pcmpeqd", 0x76);
+    let d0 = ["", "psrlw", "psrld", "psrlq", "paddq", "pmullw", "", "", "psubusb", "psubusw", "pminub", "pand",
+              "paddusb", "paddusw", "pmaxub", "pandn", "pavgb", "psraw", "psrad", "pavgw", "pmulhuw", "pmulhw", "", "",
+              "psubsb", "psubsw", "pminsw", "por", "paddsb", "paddsw", "pmaxsw", "pxor", "", "psllw", "pslld", "psllq",
+              "pmuludq", "pmaddwd", "psadbw", "", "psubb", "psubw", "psubd", "psubq", "paddb", "paddw", "paddd", ""];
+    for k in 0..d0.len {
+        if (d0[k].len > 0) and not is_shift_name(d0[k]) {
+            x66(d0[k], 0xd0 + @truncate(u8, k));
+        }
+    }
+    // shifts: by xmm/m (0xd1 ...), by imm8 (/digit of 71, 72, 73)
+    shift_row("psrlw", 0xd1, 0x71, 2);
+    shift_row("psrld", 0xd2, 0x72, 2);
+    shift_row("psrlq", 0xd3, 0x73, 2);
+    shift_row("psraw", 0xe1, 0x71, 4);
+    shift_row("psrad", 0xe2, 0x72, 4);
+    shift_row("psllw", 0xf1, 0x71, 6);
+    shift_row("pslld", 0xf2, 0x72, 6);
+    shift_row("psllq", 0xf3, 0x73, 6);
+    shift_row("psrldq", 0, 0x73, 3);
+    shift_row("pslldq", 0, 0x73, 7);
+    g_sse.push(row("pinsrw", 0x66, 1, 0xc4, F_XGI, 0));
+    g_sse.push(row("pextrw", 0x66, 1, 0xc5, F_GXI, 0));
+    // SSE3, SSSE3, SSE4.1 (the common ones)
+    g_sse.push(row("addsubps", 0xf2, 1, 0xd0, F_XX, 0));
+    g_sse.push(row("addsubpd", 0x66, 1, 0xd0, F_XX, 0));
+    g_sse.push(row("haddps", 0xf2, 1, 0x7c, F_XX, 0));
+    g_sse.push(row("haddpd", 0x66, 1, 0x7c, F_XX, 0));
+    g_sse.push(row("hsubps", 0xf2, 1, 0x7d, F_XX, 0));
+    g_sse.push(row("hsubpd", 0x66, 1, 0x7d, F_XX, 0));
+    let s38 = ["pshufb", "phaddw", "phaddd", "phaddsw", "pmaddubsw", "phsubw", "phsubd", "phsubsw", "psignb", "psignw",
+               "psignd", "pmulhrsw"];
+    for k in 0..s38.len {
+        g_sse.push(row(s38[k], 0x66, 2, @truncate(u8, k), F_XX, 0));
+    }
+    let s38b = ["pabsb", "pabsw", "pabsd"];
+    for k in 0..s38b.len {
+        g_sse.push(row(s38b[k], 0x66, 2, 0x1c + @truncate(u8, k), F_XX, 0));
+    }
+    let s41 = ["pmovsxbw", "pmovsxbd", "pmovsxbq", "pmovsxwd", "pmovsxwq", "pmovsxdq"];
+    for k in 0..s41.len {
+        g_sse.push(row(s41[k], 0x66, 2, 0x20 + @truncate(u8, k), F_XX, 0));
+    }
+    let z41 = ["pmovzxbw", "pmovzxbd", "pmovzxbq", "pmovzxwd", "pmovzxwq", "pmovzxdq"];
+    for k in 0..z41.len {
+        g_sse.push(row(z41[k], 0x66, 2, 0x30 + @truncate(u8, k), F_XX, 0));
+    }
+    g_sse.push(row("pmuldq", 0x66, 2, 0x28, F_XX, 0));
+    g_sse.push(row("pcmpeqq", 0x66, 2, 0x29, F_XX, 0));
+    g_sse.push(row("packusdw", 0x66, 2, 0x2b, F_XX, 0));
+    g_sse.push(row("pcmpgtq", 0x66, 2, 0x37, F_XX, 0));
+    let mm41 = ["pminsb", "pminsd", "pminuw", "pminud", "pmaxsb", "pmaxsd", "pmaxuw", "pmaxud", "pmulld"];
+    for k in 0..mm41.len {
+        g_sse.push(row(mm41[k], 0x66, 2, 0x38 + @truncate(u8, k), F_XX, 0));
+    }
+    g_sse.push(row("ptest", 0x66, 2, 0x17, F_XX, 0));
+    g_sse.push(row("phminposuw", 0x66, 2, 0x41, F_XX, 0));
+    g_sse.push(row("roundps", 0x66, 3, 0x08, F_XXI, 0));
+    g_sse.push(row("roundpd", 0x66, 3, 0x09, F_XXI, 0));
+    g_sse.push(row("roundss", 0x66, 3, 0x0a, F_XXI, 0));
+    g_sse.push(row("roundsd", 0x66, 3, 0x0b, F_XXI, 0));
+    g_sse.push(row("blendps", 0x66, 3, 0x0c, F_XXI, 0));
+    g_sse.push(row("blendpd", 0x66, 3, 0x0d, F_XXI, 0));
+    g_sse.push(row("pblendw", 0x66, 3, 0x0e, F_XXI, 0));
+    g_sse.push(row("palignr", 0x66, 3, 0x0f, F_XXI, 0));
+    g_sse.push(row("dpps", 0x66, 3, 0x40, F_XXI, 0));
+    g_sse.push(row("dppd", 0x66, 3, 0x41, F_XXI, 0));
+    g_sse.push(row("mpsadbw", 0x66, 3, 0x42, F_XXI, 0));
+    g_sse.push(row("pclmulqdq", 0x66, 3, 0x44, F_XXI, 0));
+    g_sse.push(row("insertps", 0x66, 3, 0x21, F_XXI, 0));
+    g_sse.push(row("pextrb", 0x66, 3, 0x14, F_GXI, 0));
+    g_sse.push(row("pextrd", 0x66, 3, 0x16, F_GXI, 0));
+    let mut pq = row("pextrq", 0x66, 3, 0x16, F_GXI, 0);
+    pq.w = true;
+    g_sse.push(pq);
+    g_sse.push(row("extractps", 0x66, 3, 0x17, F_GXI, 0));
+    g_sse.push(row("pinsrb", 0x66, 3, 0x20, F_XGI, 0));
+    g_sse.push(row("pinsrd", 0x66, 3, 0x22, F_XGI, 0));
+    let mut iq = row("pinsrq", 0x66, 3, 0x22, F_XGI, 0);
+    iq.w = true;
+    g_sse.push(iq);
+    g_sse.push(row("blendvps", 0x66, 2, 0x14, F_XX, 0));
+    g_sse.push(row("blendvpd", 0x66, 2, 0x15, F_XX, 0));
+    g_sse.push(row("pblendvb", 0x66, 2, 0x10, F_XX, 0));
+    // AES-NI, SHA (common in hand-written code)
+    g_sse.push(row("aesenc", 0x66, 2, 0xdc, F_XX, 0));
+    g_sse.push(row("aesenclast", 0x66, 2, 0xdd, F_XX, 0));
+    g_sse.push(row("aesdec", 0x66, 2, 0xde, F_XX, 0));
+    g_sse.push(row("aesdeclast", 0x66, 2, 0xdf, F_XX, 0));
+    g_sse.push(row("aesimc", 0x66, 2, 0xdb, F_XX, 0));
+    g_sse.push(row("aeskeygenassist", 0x66, 3, 0xdf, F_XXI, 0));
+}
+
+fn is_shift_name(n: []u8) bool {
+    return u.str_eq(n, "psrlw") or u.str_eq(n, "psrld") or u.str_eq(n, "psrlq") or u.str_eq(n, "psraw") or
+           u.str_eq(n, "psrad") or u.str_eq(n, "psllw") or u.str_eq(n, "pslld") or u.str_eq(n, "psllq");
+}
+
+fn shift_row(name: []u8, opc: u8, iopc: u8, digit: i8) void {
+    let mut r = row(name, 0x66, 1, opc, F_SHI, iopc);
+    r.digit = digit;
+    g_sse.push(r);
+}
+
+fn sse_enc(e: *mut Enc, r: *SseRow, opc: u8) void {
+    e.pfx = r.pfx;
+    e.w = r.w;
+    if r.map == 1 {
+        op2(e, 0x0f, opc);
+    } else if r.map == 2 {
+        op3(e, 0x0f, 0x38, opc);
+    } else {
+        op3(e, 0x0f, 0x3a, opc);
+    }
+}
+
+fn find_sse(m: []u8) i32 {
+    if not g_sse_built {
+        build_sse();
+        g_sse_built = true;
+    }
+    for k in 0..g_sse.len {
+        if u.str_eq(g_sse.at(k).name, m) {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+let mut g_sse_built: bool = false;
+
+fn sse(A: *mut cr.Asm, m0: []u8, ops: []XOp) bool {
+    let mut m = m0;
+    // movd / movq
+    if u.str_eq(m, "movd") or u.str_eq(m, "movq") {
+        return movdq(A, m, ops);
+    }
+    // cmpeqps ...: cmpps with the predicate in the name
+    let preds = ["eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord"];
+    if u.starts(m, "cmp") and (m.len > 5) {
+        for k in @as(usize, 0)..8 {
+            let p = preds[k];
+            if u.starts(m[3..], p) and (m.len == (3 + p.len + 2)) {
+                let tail = m[3 + p.len..];
+                if u.str_eq(tail, "ps") or u.str_eq(tail, "pd") or u.str_eq(tail, "ss") or u.str_eq(tail, "sd") {
+                    let ri = find_sse(u.cat2("cmp", tail));
+                    if (ri < 0) or (ops.len != 2) {
+                        return false;
+                    }
+                    let mut e = new_enc();
+                    let r = g_sse.at(@int_cast(usize, ri));
+                    if not is_xmm(&ops[1]) or not (is_xmm(&ops[0]) or (ops[0].kind == XK_MEM)) {
+                        bad_form(A, m);
+                        return true;
+                    }
+                    sse_enc(&mut e, r, r.opc);
+                    rm_enc(&mut e, ops[1].reg, ops[0]);
+                    e.imm = cr.konst(@int_cast(i64, k));
+                    e.isz = 1;
+                    emit(A, &mut e);
+                    return true;
+                }
+            }
+        }
+    }
+    // cvtsi2ss with a size suffix (cvtsi2ssl, cvtsi2sdq ...)
+    let mut sfx: u32 = 0;
+    let mut ri = find_sse(m);
+    if (ri < 0) and (m.len > 1) and (suffix_bits(m[m.len - 1]) >= 32) {
+        let r2 = find_sse(m[0..m.len - 1]);
+        if r2 >= 0 {
+            let f = g_sse.at(@int_cast(usize, r2)).form;
+            if (f == F_XG) or (f == F_GXM) {
+                ri = r2;
+                sfx = suffix_bits(m[m.len - 1]);
+                m = m[0..m.len - 1];
+            }
+        }
+    }
+    if ri < 0 {
+        return false;
+    }
+    let r = g_sse.at(@int_cast(usize, ri));
+    let mut e = new_enc();
+    let f = r.form;
+    if (f == F_XX) or (f == F_XM) or (f == F_MX) {
+        if u.contains(r.name, "blendv") and (ops.len == 3) {
+            // blendvps %xmm0, src, dst (the mask implicit in xmm0)
+            if not is_xmm(&ops[0]) or (ops[0].reg != 16) {
+                bad_form(A, m);
+                return true;
+            }
+            let two: [2]XOp = [ops[1], ops[2]];
+            return sse(A, m0, two[..]);
+        }
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        let src = ops[0];
+        let dst = ops[1];
+        if is_xmm(&dst) and (is_xmm(&src) or (src.kind == XK_MEM)) and (f != F_MX) {
+            if (f == F_XM) and (src.kind != XK_MEM) {
+                bad_form(A, m);
+                return true;
+            }
+            sse_enc(&mut e, r, r.opc);
+            rm_enc(&mut e, dst.reg, src);
+            emit(A, &mut e);
+            return true;
+        }
+        if is_xmm(&src) and (dst.kind == XK_MEM) and (r.st != 0) {
+            sse_enc(&mut e, r, r.st);
+            rm_enc(&mut e, src.reg, dst);
+            emit(A, &mut e);
+            return true;
+        }
+        bad_form(A, m);
+        return true;
+    }
+    if f == F_XXI {
+        if not nargs(A, ops, 3, m) {
+            return true;
+        }
+        if (ops[0].kind != XK_IMM) or not is_xmm(&ops[2]) or not (is_xmm(&ops[1]) or (ops[1].kind == XK_MEM)) {
+            bad_form(A, m);
+            return true;
+        }
+        sse_enc(&mut e, r, r.opc);
+        rm_enc(&mut e, ops[2].reg, ops[1]);
+        e.imm = ops[0].v;
+        e.isz = 1;
+        emit(A, &mut e);
+        return true;
+    }
+    if f == F_GX {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_xmm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        sse_enc(&mut e, r, r.opc);
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    if f == F_GXM {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not (is_xmm(&ops[0]) or (ops[0].kind == XK_MEM)) or not is_gpr(&ops[1]) or (ops[1].bits < 32) {
+            bad_form(A, m);
+            return true;
+        }
+        sse_enc(&mut e, r, r.opc);
+        e.w = ops[1].bits == 64;
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    if f == F_XG {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_rm(&ops[0]) or not is_xmm(&ops[1]) {
+            bad_form(A, m);
+            return true;
+        }
+        let mut sz = sfx;
+        if is_gpr(&ops[0]) {
+            if (sz != 0) and (sz != ops[0].bits) {
+                bad_form(A, m);
+                return true;
+            }
+            sz = ops[0].bits;
+        }
+        if sz == 0 {
+            cr.fail(A, u.f1("no operand size in '%s' (a suffix l or q is needed)", m));
+            return true;
+        }
+        if sz < 32 {
+            bad_form(A, m);
+            return true;
+        }
+        sse_enc(&mut e, r, r.opc);
+        e.w = sz == 64;
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    if f == F_SHI {
+        if not nargs(A, ops, 2, m) {
+            return true;
+        }
+        if not is_xmm(&ops[1]) {
+            bad_form(A, m);
+            return true;
+        }
+        if ops[0].kind == XK_IMM {
+            sse_enc(&mut e, r, r.st);
+            rm_enc(&mut e, @as(i32, r.digit), ops[1]);
+            e.imm = ops[0].v;
+            e.isz = 1;
+            emit(A, &mut e);
+            return true;
+        }
+        if (r.opc == 0) or not (is_xmm(&ops[0]) or (ops[0].kind == XK_MEM)) {
+            bad_form(A, m);
+            return true;
+        }
+        sse_enc(&mut e, r, r.opc);
+        rm_enc(&mut e, ops[1].reg, ops[0]);
+        emit(A, &mut e);
+        return true;
+    }
+    if f == F_GXI {
+        if not nargs(A, ops, 3, m) {
+            return true;
+        }
+        if (ops[0].kind != XK_IMM) or not is_xmm(&ops[1]) or not is_rm(&ops[2]) {
+            bad_form(A, m);
+            return true;
+        }
+        if r.map == 1 {
+            // pextrw (66 0F C5): the general register in the reg field
+            if not is_gpr(&ops[2]) {
+                bad_form(A, m);
+                return true;
+            }
+            sse_enc(&mut e, r, r.opc);
+            rm_enc(&mut e, ops[2].reg, ops[1]);
+        } else {
+            sse_enc(&mut e, r, r.opc);
+            rm_enc(&mut e, ops[1].reg, ops[2]);
+            if is_gpr(&ops[2]) and (ops[2].bits == 64) {
+                e.w = true;
+            }
+        }
+        e.imm = ops[0].v;
+        e.isz = 1;
+        emit(A, &mut e);
+        return true;
+    }
+    if f == F_XGI {
+        if not nargs(A, ops, 3, m) {
+            return true;
+        }
+        if (ops[0].kind != XK_IMM) or not is_rm(&ops[1]) or not is_xmm(&ops[2]) {
+            bad_form(A, m);
+            return true;
+        }
+        sse_enc(&mut e, r, r.opc);
+        rm_enc(&mut e, ops[2].reg, ops[1]);
+        e.imm = ops[0].v;
+        e.isz = 1;
+        emit(A, &mut e);
+        return true;
+    }
+    return false;
+}
+
+// movd / movq: between general registers or memory and xmm registers, and
+// movq between xmm registers and memory (64 bits).
+fn movdq(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
+    if not nargs(A, ops, 2, m) {
+        return true;
+    }
+    let src = ops[0];
+    let dst = ops[1];
+    let q = m[3] == 'q';
+    let mut e = new_enc();
+    if q and is_xmm(&dst) and (is_xmm(&src) or (src.kind == XK_MEM)) {
+        // movq xmm/m64 -> xmm: F3 0F 7E
+        e.pfx = 0xf3;
+        op2(&mut e, 0x0f, 0x7e);
+        rm_enc(&mut e, dst.reg, src);
+        emit(A, &mut e);
+        return true;
+    }
+    if q and is_xmm(&src) and (dst.kind == XK_MEM) {
+        // movq xmm -> m64: 66 0F D6
+        e.pfx = 0x66;
+        op2(&mut e, 0x0f, 0xd6);
+        rm_enc(&mut e, src.reg, dst);
+        emit(A, &mut e);
+        return true;
+    }
+    if is_xmm(&dst) and is_rm(&src) {
+        // movd/movq r/m -> xmm: 66 (REX.W) 0F 6E
+        if is_gpr(&src) and (src.bits != u32_pick(q, 64, 32)) {
+            bad_form(A, m);
+            return true;
+        }
+        e.pfx = 0x66;
+        e.w = q;
+        op2(&mut e, 0x0f, 0x6e);
+        rm_enc(&mut e, dst.reg, src);
+        emit(A, &mut e);
+        return true;
+    }
+    if is_xmm(&src) and is_rm(&dst) {
+        if is_gpr(&dst) and (dst.bits != u32_pick(q, 64, 32)) {
+            bad_form(A, m);
+            return true;
+        }
+        e.pfx = 0x66;
+        e.w = q;
+        op2(&mut e, 0x0f, 0x7e);
+        rm_enc(&mut e, src.reg, dst);
+        emit(A, &mut e);
+        return true;
+    }
+    if q {
+        // movq between general registers and memory: mov with REX.W
+        mov(A, m, 64, ops);
+        return true;
+    }
+    bad_form(A, m);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Operands of asm statements
+// -----------------------------------------------------------------------------
+fn suffix_of(bits: u32) []u8 {
+    if bits == 8 {
+        return "b";
+    }
+    if bits == 16 {
+        return "w";
+    }
+    if bits == 32 {
+        return "l";
+    }
+    return "q";
+}
+
+fn mem_text(o: *ai.ROp, extra: i64) []u8 {
+    let mut b = u.Buf.init();
+    if o.seg == 0x64 {
+        b.s("%fs:");
+    } else if o.seg == 0x65 {
+        b.s("%gs:");
+    }
+    let d = o.disp + extra;
+    if o.base < 0 {
+        // rip-relative to a symbol
+        b.s(o.name);
+        if d != 0 {
+            if d > 0 {
+                b.c('+');
+            }
+            b.s(u.dec(d));
+        }
+        b.s("(%rip)");
+        return b.done();
+    }
+    if d != 0 {
+        b.s(u.dec(d));
+    }
+    b.s("(%");
+    b.s(ai.x86_reg_text(o.base, 64, false));
+    if o.index >= 0 {
+        b.s(",%");
+        b.s(ai.x86_reg_text(o.index, 64, false));
+        b.c(',');
+        b.s(u.udec(@as(u64, o.scale)));
+    }
+    b.c(')');
+    return b.done();
+}
+
+fn imm_text(o: *ai.ROp) []u8 {
+    if o.sym {
+        if o.k == 0 {
+            return o.name;
+        }
+        if o.k > 0 {
+            return u.f2("%s+%s", o.name, u.dec(o.k));
+        }
+        return u.cat2(o.name, u.dec(o.k));
+    }
+    return u.dec(o.k);
+}
+
+/// The text of operand o with modifier `mod` (GCC's x86 operand modifiers:
+/// b w k q h for a register's widths, x for its xmm register, c and P for a
+/// constant without '$', n for its negation, a for an address, A for an
+/// indirect operand, H for memory 8 bytes on, V for a register without '%',
+/// z for the size suffix); `err` says why not.
+pub fn render(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
+    if mod == 'z' {
+        return suffix_of(o.bits);
+    }
+    if o.kind == ai.OK_REG {
+        if o.reg >= 16 {
+            if (mod == 0) or (mod == 'x') {
+                return u.cat2("%", ai.x86_reg_text(o.reg, 128, false));
+            }
+            if mod == 't' {
+                return u.f1("%%ymm%s", u.idec(o.reg - 16));
+            }
+            err.* = u.f1("the modifier '%s' of an xmm register", ai.ch_text(mod));
+            return "";
+        }
+        let mut bits = o.bits;
+        let mut hi = false;
+        if mod == 'b' {
+            bits = 8;
+        } else if mod == 'w' {
+            bits = 16;
+        } else if mod == 'k' {
+            bits = 32;
+        } else if mod == 'q' {
+            bits = 64;
+        } else if mod == 'h' {
+            if o.reg > 3 {
+                err.* = "'%h' of a register with no high byte";
+                return "";
+            }
+            bits = 8;
+            hi = true;
+        } else if mod == 'x' {
+            err.* = "'%x' of a general register";
+            return "";
+        }
+        let name = ai.x86_reg_text(o.reg, bits, hi);
+        if mod == 'V' {
+            return name;
+        }
+        if mod == 'A' {
+            return u.cat2("*%", name);
+        }
+        if mod == 'a' {
+            return u.f1("(%%%s)", name);
+        }
+        return u.cat2("%", name);
+    }
+    if o.kind == ai.OK_MEM {
+        if mod == 'H' {
+            return mem_text(o, 8);
+        }
+        if mod == 'A' {
+            return u.cat2("*", mem_text(o, 0));
+        }
+        if (mod == 0) or (mod == 'a') or (mod == 'P') or (mod == 'p') {
+            return mem_text(o, 0);
+        }
+        err.* = u.f1("the modifier '%s' of a memory operand", ai.ch_text(mod));
+        return "";
+    }
+    // a constant
+    if (mod == 'c') or (mod == 'P') or (mod == 'p') or (mod == 'a') {
+        return imm_text(o);
+    }
+    if mod == 'n' {
+        if o.sym {
+            err.* = "'%n' of an address";
+            return "";
+        }
+        return u.dec(0 -% o.k);
+    }
+    if mod == 0 {
+        return u.cat2("$", imm_text(o));
+    }
+    err.* = u.f1("the modifier '%s' of a constant", ai.ch_text(mod));
+    return "";
+}
+
+/// The text of asm goto's label k in its template.
+pub fn label_text(k: i32) []u8 {
+    return u.cat2(".L__axiom_label_", u.idec(k));
+}
+
+/// What follows the template of an asm goto with n labels: register r (an
+/// i32's) set to 0 where the template ends, k + 1 at label k, and all of
+/// them meeting after (so the switch after the asm dispatches).
+pub fn goto_tail(n: i32, r: i32) []u8 {
+    let reg = ai.x86_reg_text(r, 32, false);
+    let mut b = u.Buf.init();
+    b.s(u.f1("\n\tmovl $0, %%%s\n\tjmp .L__axiom_goto_end\n", reg));
+    for k in 0..n {
+        b.s(u.f3("%s:\n\tmovl $%s, %%%s\n", label_text(k), u.idec(k + 1), reg));
+        if (k + 1) < n {
+            b.s("\tjmp .L__axiom_goto_end\n");
+        }
+    }
+    b.s(".L__axiom_goto_end:\n");
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Entry points
+// -----------------------------------------------------------------------------
+/// Assembles inline text (an asm statement's template, operands substituted)
+/// whose first byte will be at `origin` in its section: the assembly, whose
+/// .text section and relocations hold the result (or its error).
+pub fn assemble_inline(text: []u8, origin: u64) *mut cr.Asm {
+    let A = cr.new_asm(tg.ARCH_X64, text, true, '#');
+    A.origin = origin;
+    let ar = arch();
+    cr.run(A, &ar);
+    return A;
+}
+
+/// Assembles file-scope asm text: its sections, symbols and relocations.
+pub fn assemble_file(text: []u8) *mut cr.Asm {
+    let A = cr.new_asm(tg.ARCH_X64, text, false, '#');
+    let ar = arch();
+    cr.run(A, &ar);
+    return A;
+}

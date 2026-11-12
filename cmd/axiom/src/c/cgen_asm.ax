@@ -1,0 +1,167 @@
+// =============================================================================
+// cgen_asm.ax - IR generation for asm statements and file-scope asm (a GNU
+// dialect): the intrinsic IN_ASM with the operands asm/inline.ax describes.
+//
+// Before the intrinsic, in the order of the operands: each output's address
+// (an output in a register gets a temporary object, which the backend stores
+// the register to; its lvalue's address is computed here, before the asm),
+// each input's value (converted to the register class's type: a floating
+// value for a general register as the integer of its bits, an integer for a
+// floating-point register as the floating value of its bits), and each
+// memory operand's address (an input that is not an lvalue is first stored
+// in a temporary object). After it, each temporary's value is stored in its
+// output's lvalue, as an assignment would (bit-fields, atomics). (Semantic
+// analysis has assembled the template with stand-in operands: csema_asm.ax;
+// the backend assembles it again with the operands it chose.)
+// =============================================================================
+import "../asm/check.ax" as ack;
+import "../asm/inline.ax" as ai;
+import "../diag.ax" as dg;
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "cgen_expr.ax" as gx;
+import "ctypes.ax" as cty;
+
+/// File-scope asm a: its text joins the program's (asm/inline.ax:
+/// toplevel), to be assembled into the object.
+pub fn toplevel(a: *mut cast.Asm) void {
+    if u.isnil(a.blob) {
+        return;
+    }
+    ai.toplevel.push(a.blob);
+}
+
+// v (of C type t) as the type a register of op's class holds.
+fn to_class(v: *mut ir.Value, op: ai.Op) *mut ir.Value {
+    let k = v.ty.kind;
+    if (op.cls == ai.CL_GPR) and (k == ir.T_FLOAT) {
+        return ir.bitcast(cg.B, v, ir.t_int(v.ty.bits));
+    }
+    if (op.cls == ai.CL_VEC) and ((k == ir.T_INT) or (k == ir.T_PTR)) {
+        let mut x = v;
+        if k == ir.T_PTR {
+            x = ir.ptrtoint(cg.B, v, ir.t_int(@int_cast(i32, cty.ptr_bytes * 8)));
+        }
+        if x.ty.bits < 32 {
+            x = ir.zext(cg.B, x, ir.t_int(32));
+        }
+        return ir.bitcast(cg.B, x, ir.t_float(x.ty.bits));
+    }
+    return v;
+}
+
+/// Asm statement a: IN_ASM, and the stores of its outputs. Returns the
+/// intrinsic (for `asm goto`, an i32 that says which label the template
+/// jumped to: 0 none, k + 1 label k), or nil after an error.
+pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
+    let b = a.blob;
+    if u.isnil(b) {
+        return u.nil.[ir.Value]();
+    }
+    let index = ai.add(b);
+    let mut xs = u.List.[*mut ir.Value].empty();
+    xs.push(ir.ci32(@as(u64, @bit_cast(u32, index))));
+    // outputs in registers: (lvalue, its address, the temporary)
+    let mut outs = u.List.[*mut cast.Expr].empty();
+    let mut addrs = u.List.[*mut ir.Value].empty();
+    let mut tmps = u.List.[*mut ir.Value].empty();
+    for k in 0..b.ops.len {
+        let op = b.ops[k];
+        let e = a.exprs.get(k);
+        if op.out {
+            if op.kind == ai.OK_MEM {
+                xs.push(gx.lv(e));
+                continue;
+            }
+            let t = cty.unqual(e.ty);
+            let tmp = cg.alloca(t, "asm.out");
+            outs.push(e);
+            addrs.push(gx.lv(e));
+            tmps.push(tmp);
+            xs.push(tmp);
+            continue;
+        }
+        if op.kind == ai.OK_MEM {
+            if e.lvalue {
+                xs.push(gx.lv(e));
+            } else {
+                let tmp = cg.alloca(cty.unqual(e.ty), "asm.in");
+                gx.store(cty.unqual(e.ty), gx.rv(e), tmp);
+                xs.push(tmp);
+            }
+            continue;
+        }
+        let v = gx.rv(e);
+        if op.kind == ai.OK_IMM {
+            xs.push(v);
+            continue;
+        }
+        xs.push(to_class(v, op));
+    }
+    let mut rt = cg.T_void;
+    if b.goto_ {
+        rt = cg.T_i32;
+    }
+    let r = ir.intr(cg.B, ir.IN_ASM, rt, xs.items());
+    for k in 0..outs.len {
+        let e = outs.get(k);
+        let t = cty.unqual(e.ty);
+        _ = gx.store_lv(e, t, gx.load(t, tmps.get(k)), addrs.get(k));
+    }
+    return r;
+}
+
+/// A function with the attribute naked, of symbol `name`: no IR body; its
+/// asm statements' text, after a label of its name, is file-scope asm (so
+/// the function has no prologue or epilogue; its symbol is global, an
+/// internal function's name being unique).
+pub fn naked(name: []u8, f: *mut ir.Func, body: *cast.Stmt) void {
+    f.linkage = ir.LINK_EXTERNAL;
+    let mut t = u.Buf.init();
+    let mut first = u.nil.[ai.Blob]();
+    t.s(".text\n");
+    if tg.g_arch == tg.ARCH_X64 {
+        t.s(".p2align 4\n");
+    } else {
+        t.s(".p2align 2\n");
+    }
+    t.s(u.f2(".globl %s\n.type %s, @function\n", name, name));
+    t.s(u.cat2(name, ":\n"));
+    for x in body.items.items() {
+        if (x.kind != cast.StmtKind.ASM) or u.isnil(x.asm.blob) {
+            continue;
+        }
+        let b = x.asm.blob;
+        if u.isnil(first) {
+            first = b;
+        }
+        if b.basic {
+            t.s(b.text);
+        } else {
+            for p in b.pieces {
+                if p.kind == ai.PK_TEXT {
+                    t.s(p.text);
+                }
+            }
+        }
+        t.s("\n");
+    }
+    t.s(u.f2(".size %s, . - %s\n", name, name));
+    if u.isnil(first) {
+        return;
+    }
+    let nb = u.perm_new.[ai.Blob]();
+    nb.arch = first.arch;
+    nb.basic = true;
+    nb.text = u.perm_dup(t.done());
+    nb.loc = first.loc;
+    let msg = ack.check_text(nb.arch, nb.text, false);
+    if msg.len > 0 {
+        _ = dg.err(body.span, "C3097", msg);
+        return;
+    }
+    ai.toplevel.push(nb);
+}

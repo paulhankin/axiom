@@ -6,6 +6,9 @@
 // placement, and the encoding (x64enc.ax) of each function into the object.
 // The state of the function being compiled, which x64.ax sets, lives here.
 // =============================================================================
+import "asm/core.ax" as acr;
+import "asm/inline.ax" as ai;
+import "asm/x64.ax" as ax;
 import "bin.ax" as bn;
 import "dwarf.ax" as dw;
 import "elf.ax" as elf;
@@ -1527,9 +1530,90 @@ fn fill_jump_tables(base: u64, boff: []u64) void {
     jtabs.clear();
 }
 
+// -----------------------------------------------------------------------------
+// Inline assembly (xe.ASM): the template with the operands where they were
+// allocated, assembled (asm/x64.ax) into the function's code
+// -----------------------------------------------------------------------------
+let mut asm_inst: *mc.MInst = @ptr_from_int(*mc.MInst, 0);
+let mut asm_err: []u8 = "";
+
+// Operand k of the statement being encoded, as asm/x64.ax renders it.
+fn asm_operand(b: *ai.Blob, k: usize, mod: u8) []u8 {
+    let o = asm_inst.ops[k];
+    let op = b.ops[k];
+    let mut r = ai.rop_reg(0, op.bits, op.fp);
+    if o.kind == mc.K_REG {
+        r.reg = P(o.reg);
+    } else if o.kind == mc.K_MEM {
+        let m = to_mem(o);
+        r.kind = ai.OK_MEM;
+        r.base = m.base;
+        r.index = m.index;
+        r.scale = m.scale;
+        r.disp = m.disp;
+        if (m.base < 0) and (m.sym >= 0) {
+            r.name = u.cat2("__axiom_sym_", u.idec(m.sym));
+        } else if m.base < 0 {
+            asm_err = "a memory operand without a base register";
+        }
+    } else if o.kind == mc.K_SYM {
+        r.kind = ai.OK_IMM;
+        r.sym = true;
+        r.name = u.cat2("__axiom_sym_", u.idec(o.sym));
+        r.k = o.disp;
+    } else {
+        r.kind = ai.OK_IMM;
+        r.k = o.disp;
+    }
+    let mut err = "";
+    let t = ax.render(&r, mod, &mut err);
+    if (err.len > 0) and (asm_err.len == 0) {
+        asm_err = u.f2("operand %s: %s", u.zdec(k), err);
+    }
+    return t;
+}
+
+// The object symbol a relocation of inline assembly names.
+fn asm_symbol(name: []u8) u32 {
+    if u.starts(name, "__axiom_sym_") {
+        return @truncate(u32, @bit_cast(u64, u.atol(name[12..])));
+    }
+    return elf.ext_sym(OBJ, u.perm_dup(name), false);
+}
+
+fn enc_asm(i: *mut mc.MInst) void {
+    let b = ai.blob(i.aux);
+    asm_inst = i;
+    asm_err = "";
+    let mut text = ai.expand(b, asm_operand, ax.label_text, @as(u64, @bit_cast(u32, i.cc)));
+    if b.goto_ {
+        text = u.cat2(text, ax.goto_tail(b.nlabels, P(i.ops[i.ops.len - 1].reg)));
+    }
+    if asm_err.len > 0 {
+        fail(u.f2("inline assembly at %s: %s", b.loc, asm_err));
+        return;
+    }
+    let start = @as(u64, E.b.len());
+    let A = ax.assemble_inline(text, FBASE + start);
+    if acr.failed(A) {
+        fail(u.f2("inline assembly at %s: %s", b.loc, acr.message(A)));
+        return;
+    }
+    let s = A.secs.at(0);
+    E.b.put(s.data.items());
+    for r in A.relocs.items() {
+        E.relocs.push(xe.Reloc.{ off: start + r.off, ty: r.ty, sym: @bit_cast(i32, asm_symbol(r.name)),
+                                 addend: r.addend });
+    }
+}
+
 fn enc_inst(i: *mut mc.MInst) void {
     let op = i.op;
     let sz = i.sz;
+    if op == xe.ASM {
+        enc_asm(i);
+        return;
+    }
     if op == xe.DYNSTACK {
         enc_dynstack(i);
         return;

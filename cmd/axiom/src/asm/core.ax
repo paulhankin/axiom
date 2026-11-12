@@ -1,0 +1,1556 @@
+// =============================================================================
+// asm/core.ax - what the two assemblers (asm/x64.ax, asm/a64.ax) share: the
+// assembly text read into statements (labels, a directive or instruction and
+// its operands), expressions over numbers and symbols, sections and their
+// bytes, the directives that are not an architecture's, labels (named, and
+// numeric local ones: `1:`, `1b`, `1f`), relocations, and the passes that
+// settle the sizes of instructions whose length depends on where labels are
+// (an architecture's encoder chooses the short form of a jump while its
+// target is near: `Stmt.long_` is set, never cleared, when it is not, so the
+// passes end).
+//
+// Two kinds of text are assembled: an asm statement's template (`inline_`:
+// its bytes go into its function's code, it defines no symbols and
+// switches to no section) and file-scope asm (sections and symbols of the
+// object). The syntax is the GNU assembler's for the architecture (AT&T for
+// x86-64); what an instruction or directive this does not know is, is an
+// error naming it, never silently wrong bytes.
+// =============================================================================
+import "../elf.ax" as elf;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+
+// -----------------------------------------------------------------------------
+// The assembly
+// -----------------------------------------------------------------------------
+pub struct Stmt {
+    line: i32,      // its line in the text (from 1)
+    labels: []i32,  // the labels defined just before it (Def indexes)
+    op: []u8,       // the directive (with its '.') or mnemonic, lower case; empty for none
+    args: []u8,     // the rest of the statement
+    long_: bool,    // (the encoder's: a jump that needs its long form)
+    aux: i64,       // (the encoder's)
+}
+
+pub struct Sec {
+    name: []u8,
+    kind: i32,  // elf.S_*
+    data: u.List.[u8],
+    size: u64,  // a section without data (bss): its size
+    align: u64,
+}
+
+pub struct Reloc {
+    sec: i32,
+    off: u64,
+    ty: u32,     // elf.R_*
+    name: []u8,  // the symbol: one this text defines, or another (external)
+    addend: i64,
+}
+
+// A label or symbol of the text.
+pub struct Def {
+    name: []u8,
+    sec: i32,  // -1: not defined (yet)
+    off: u64,
+    prev_sec: i32,  // where the previous pass put it (forward references read this)
+    prev_off: u64,
+    defined: bool,  // in this pass
+    global: bool,
+    weak: bool,
+    ty: u8,  // elf.T_*
+    size: i64,
+    has_size: bool,
+    numeric: bool,  // a numeric local label (`1:`): one of its definitions
+    abs: bool,      // `.set name, value` of a constant: value in off
+    tmp: bool,      // the current place (`.`) where an expression was read
+    intext: bool,   // a label this text defines
+}
+
+pub struct Asm {
+    arch: i32,
+    inline_: bool,
+    text: []u8,
+    stmts: u.List.[Stmt],
+    secs: u.List.[Sec],
+    cur: i32,
+    stack: u.List.[i32],
+    prev: i32,  // .previous
+    defs: u.List.[Def],
+    names: u.SymMap.[i32],           // name -> Def index + 1
+    numeric: u.List.[u.List.[i64]],  // numeric label n -> its definitions (statement index << 32 | Def index)
+    relocs: u.List.[Reloc],
+    err: []u8,
+    err_line: i32,
+    pass: i32,
+    changed: bool,
+    origin: u64,  // inline: where the text starts in its section (for alignment)
+    si: usize,    // the statement being assembled
+    comment: u8,  // the comment character ('#' for x86-64, 0: '//' only)
+}
+
+/// A new assembly of `text` for arch (inline_: an asm statement's template).
+pub fn new_asm(arch: i32, text: []u8, inline_: bool, comment: u8) *mut Asm {
+    let A = u.new.[Asm]();
+    A.arch = arch;
+    A.text = text;
+    A.inline_ = inline_;
+    A.comment = comment;
+    A.names = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    A.err_line = -1;
+    return A;
+}
+
+/// Reports an error at the statement being assembled (the first only).
+pub fn fail(A: *mut Asm, msg: []u8) void {
+    if A.err.len > 0 {
+        return;
+    }
+    let mut line: i32 = 0;
+    if A.si < A.stmts.len {
+        line = A.stmts.get(A.si).line;
+    }
+    A.err_line = line;
+    A.err = msg;
+}
+
+pub fn failed(A: *Asm) bool {
+    return A.err.len > 0;
+}
+
+/// The message of the error, with its line (when the text has several).
+pub fn message(A: *Asm) []u8 {
+    let mut many = false;
+    for ch in A.text {
+        if ch == '\n' {
+            many = true;
+        }
+    }
+    if many and (A.err_line > 0) {
+        return u.f2("%s (line %s of the assembly)", A.err, u.idec(A.err_line));
+    }
+    return A.err;
+}
+
+// -----------------------------------------------------------------------------
+// Reading the text
+// -----------------------------------------------------------------------------
+pub fn is_sym_start(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or (c == '_') or (c == '.') or (c == '$');
+}
+
+pub fn is_sym_char(c: u8) bool {
+    return is_sym_start(c) or u.is_digit(c);
+}
+
+pub fn is_space(c: u8) bool {
+    return (c == ' ') or (c == '\t') or (c == '\r') or (c == 11) or (c == 12);
+}
+
+pub fn trim(s: []u8) []u8 {
+    let mut a: usize = 0;
+    let mut b = s.len;
+    while (a < b) and is_space(s[a]) {
+        a += 1;
+    }
+    while (b > a) and is_space(s[b - 1]) {
+        b -= 1;
+    }
+    return s[a..b];
+}
+
+pub fn lower(s: []u8) []u8 {
+    let b = u.newn.[u8](s.len + 1);
+    for k in 0..s.len {
+        let c = s[k];
+        if (c >= 'A') and (c <= 'Z') {
+            b[k] = c + 32;
+        } else {
+            b[k] = c;
+        }
+    }
+    return b[0..s.len];
+}
+
+// Splits the text into statements (at newlines and ';', outside strings),
+// without comments.
+fn split(A: *mut Asm) void {
+    let t = A.text;
+    let mut line: i32 = 1;
+    let mut b = u.Buf.init();
+    let mut i: usize = 0;
+    let mut st_line: i32 = 1;
+    while i <= t.len {
+        if i == t.len {
+            add_stmt(A, b.done(), st_line);
+            break;
+        }
+        let c = t[i];
+        if c == '"' {
+            // a string: to its closing quote
+            b.c(c);
+            i += 1;
+            while (i < t.len) and (t[i] != '"') and (t[i] != '\n') {
+                if (t[i] == '\\') and ((i + 1) < t.len) {
+                    b.c(t[i]);
+                    i += 1;
+                }
+                b.c(t[i]);
+                i += 1;
+            }
+            if (i < t.len) and (t[i] == '"') {
+                b.c('"');
+                i += 1;
+            }
+            continue;
+        }
+        if (c == '/') and ((i + 1) < t.len) and (t[i + 1] == '*') {
+            i += 2;
+            while ((i + 1) < t.len) and not ((t[i] == '*') and (t[i + 1] == '/')) {
+                if t[i] == '\n' {
+                    line += 1;
+                }
+                i += 1;
+            }
+            i += 2;
+            b.c(' ');
+            continue;
+        }
+        let line_comment = ((c == '/') and ((i + 1) < t.len) and (t[i + 1] == '/') and (A.comment == 0)) or
+                           ((A.comment != 0) and (c == A.comment));
+        if line_comment {
+            while (i < t.len) and (t[i] != '\n') {
+                i += 1;
+            }
+            continue;
+        }
+        if (c == '\n') or (c == ';') {
+            add_stmt(A, b.done(), st_line);
+            b = u.Buf.init();
+            if c == '\n' {
+                line += 1;
+            }
+            st_line = line;
+            i += 1;
+            continue;
+        }
+        b.c(c);
+        i += 1;
+    }
+}
+
+// One statement's text: its labels, then its directive or instruction.
+fn add_stmt(A: *mut Asm, s0: []u8, line: i32) void {
+    let mut s = trim(s0);
+    let mut labels = u.List.[i32].empty();
+    loop {
+        // `name:` (or `1:`) at the start
+        let mut k: usize = 0;
+        if (s.len > 0) and u.is_digit(s[0]) {
+            while (k < s.len) and u.is_digit(s[k]) {
+                k += 1;
+            }
+        } else if (s.len > 0) and is_sym_start(s[0]) {
+            while (k < s.len) and is_sym_char(s[k]) {
+                k += 1;
+            }
+        }
+        if (k == 0) or (k >= s.len) or (s[k] != ':') {
+            break;
+        }
+        let name = s[0..k];
+        labels.push(label_def(A, name, line));
+        s = trim(s[k + 1..]);
+    }
+    // `name = expr`: .set
+    let mut k: usize = 0;
+    while (k < s.len) and is_sym_char(s[k]) {
+        k += 1;
+    }
+    let rest = trim(s[k..]);
+    if (k > 0) and (rest.len > 1) and (rest[0] == '=') and (rest[1] != '=') {
+        A.stmts.push(Stmt.{ line: line, labels: labels.items(), op: ".set", args: u.cat3(s[0..k], ",", rest[1..]),
+                            long_: false, aux: 0 });
+        return;
+    }
+    while (k < s.len) and not is_space(s[k]) {
+        k += 1;
+    }
+    let op = lower(s[0..k]);
+    let args = trim(s[k..]);
+    if (op.len == 0) and (labels.len == 0) {
+        return;
+    }
+    A.stmts.push(Stmt.{ line: line, labels: labels.items(), op: op, args: args, long_: false, aux: 0 });
+}
+
+// The Def of label `name` defined at the statement being read (numeric:
+// a new definition of it).
+fn label_def(A: *mut Asm, name: []u8, line: i32) i32 {
+    _ = line;
+    if u.is_digit(name[0]) {
+        let n = @int_cast(usize, u.atol(name));
+        while A.numeric.len <= n {
+            A.numeric.push(u.List.[i64].empty());
+        }
+        let d = new_def(A, u.f2("%s\x02%s", name, u.zdec(A.numeric.at(n).len)));
+        A.defs.at(@int_cast(usize, d)).numeric = true;
+        A.defs.at(@int_cast(usize, d)).intext = true;
+        A.numeric.at(n).push((@int_cast(i64, A.stmts.len) << 32) | @as(i64, d));
+        return d;
+    }
+    let d = sym(A, name);
+    A.defs.at(@int_cast(usize, d)).intext = true;
+    return d;
+}
+
+fn new_def(A: *mut Asm, name: []u8) i32 {
+    A.defs.push(Def.{ name: name, sec: -1, off: 0, prev_sec: -1, prev_off: 0, defined: false, global: false,
+                      weak: false, ty: elf.T_NOTYPE, size: 0, has_size: false, numeric: false, abs: false, tmp: false,
+                      intext: false });
+    return @int_cast(i32, A.defs.len - 1);
+}
+
+/// The Def of symbol `name` (made if new).
+pub fn sym(A: *mut Asm, name: []u8) i32 {
+    let k = u.intern(name);
+    let found = A.names.get(k);
+    if found != 0 {
+        return found - 1;
+    }
+    let d = new_def(A, k);
+    A.names.put(k, d + 1);
+    return d;
+}
+
+/// The Def a numeric label reference (`1b`, `1f`) names, or -1.
+fn numeric_ref(A: *mut Asm, n: usize, fwd: bool) i32 {
+    if n >= A.numeric.len {
+        return -1;
+    }
+    let ds = A.numeric.at(n);
+    let mut best: i32 = -1;
+    for x in ds.items() {
+        let si = @int_cast(usize, x >> 32);
+        let d = @truncate(i32, x & 0xffff_ffff);
+        if fwd {
+            if si > A.si {
+                return d;
+            }
+        } else if si <= A.si {
+            best = d;
+        }
+    }
+    return best;
+}
+
+// -----------------------------------------------------------------------------
+// Expressions
+// -----------------------------------------------------------------------------
+// Relocation modifiers: `sym@PLT`, `sym@GOTPCREL`, AArch64's `:lo12:sym` ...
+pub const RM_NONE: u8 = 0;
+pub const RM_PLT: u8 = 1;
+pub const RM_GOTPCREL: u8 = 2;
+pub const RM_LO12: u8 = 3;      // :lo12:
+pub const RM_GOT: u8 = 4;       // :got:
+pub const RM_GOT_LO12: u8 = 5;  // :got_lo12:
+pub const RM_PG_HI21: u8 = 6;   // (adrp's page: no modifier written)
+
+/// An expression's value: k, plus a symbol's address (sym: a Def index, or
+/// -1), minus another's (neg, same section: then a constant once both are
+/// placed).
+pub struct Val {
+    ok: bool,
+    k: i64,
+    sym: i32,
+    neg: i32,
+    rm: u8,
+}
+
+pub fn konst(k: i64) Val {
+    return Val.{ ok: true, k: k, sym: -1, neg: -1, rm: RM_NONE };
+}
+
+fn bad_val() Val {
+    return Val.{ ok: false, k: 0, sym: -1, neg: -1, rm: RM_NONE };
+}
+
+/// Is v a plain constant (no symbol)?
+pub fn is_const(v: Val) bool {
+    return v.ok and (v.sym < 0) and (v.neg < 0);
+}
+
+struct Ex {
+    A: *mut Asm,
+    s: []u8,
+    i: usize,
+}
+
+fn ex_space(E: *mut Ex) void {
+    while (E.i < E.s.len) and is_space(E.s[E.i]) {
+        E.i += 1;
+    }
+}
+
+fn ex_peek(E: *mut Ex) u8 {
+    ex_space(E);
+    if E.i < E.s.len {
+        return E.s[E.i];
+    }
+    return 0;
+}
+
+/// The value of expression s (all of it), or an error.
+pub fn eval(A: *mut Asm, s: []u8) Val {
+    let mut E = Ex.{ A: A, s: s, i: 0 };
+    let v = ex_or(&mut E);
+    ex_space(&mut E);
+    if v.ok and (E.i < s.len) {
+        fail(A, u.f1("unexpected '%s' in an expression", s[E.i..]));
+        return bad_val();
+    }
+    return v;
+}
+
+/// The value of s, which must be a constant (what as `what`).
+pub fn eval_const(A: *mut Asm, s: []u8, what: []u8) i64 {
+    let v = eval(A, s);
+    if not v.ok {
+        return 0;
+    }
+    let c = settle(A, v);
+    if not is_const(c) {
+        fail(A, u.f2("%s must be a constant: '%s'", what, s));
+        return 0;
+    }
+    return c.k;
+}
+
+// A difference of two labels of one section, once placed: a constant.
+pub fn settle(A: *mut Asm, v: Val) Val {
+    if not v.ok or (v.neg < 0) {
+        return v;
+    }
+    if v.sym < 0 {
+        return v;
+    }
+    let a = A.defs.get(@int_cast(usize, v.sym));
+    let b = A.defs.get(@int_cast(usize, v.neg));
+    let asec = def_sec(A, a);
+    let bsec = def_sec(A, b);
+    if (asec >= 0) and (asec == bsec) {
+        return konst(v.k + (@bit_cast(i64, def_off(A, a)) - @bit_cast(i64, def_off(A, b))));
+    }
+    return v;
+}
+
+/// The section label d is in (this pass's place, else the previous one's).
+pub fn def_sec(A: *Asm, d: Def) i32 {
+    _ = A;
+    if d.defined {
+        return d.sec;
+    }
+    return d.prev_sec;
+}
+
+pub fn def_off(A: *Asm, d: Def) u64 {
+    _ = A;
+    if d.defined {
+        return d.off;
+    }
+    return d.prev_off;
+}
+
+fn ex_or(E: *mut Ex) Val {
+    let mut a = ex_xor(E);
+    while a.ok and (ex_peek(E) == '|') and not (((E.i + 1) < E.s.len) and (E.s[E.i + 1] == '|')) {
+        E.i += 1;
+        let b = ex_xor(E);
+        a = arith(E.A, a, b, '|');
+    }
+    return a;
+}
+
+fn ex_xor(E: *mut Ex) Val {
+    let mut a = ex_and(E);
+    while a.ok and (ex_peek(E) == '^') {
+        E.i += 1;
+        let b = ex_and(E);
+        a = arith(E.A, a, b, '^');
+    }
+    return a;
+}
+
+fn ex_and(E: *mut Ex) Val {
+    let mut a = ex_add(E);
+    while a.ok and (ex_peek(E) == '&') and not (((E.i + 1) < E.s.len) and (E.s[E.i + 1] == '&')) {
+        E.i += 1;
+        let b = ex_add(E);
+        a = arith(E.A, a, b, '&');
+    }
+    return a;
+}
+
+fn ex_add(E: *mut Ex) Val {
+    let mut a = ex_mul(E);
+    loop {
+        let c = ex_peek(E);
+        if not a.ok or ((c != '+') and (c != '-')) {
+            break;
+        }
+        E.i += 1;
+        let b = ex_mul(E);
+        if not b.ok {
+            return b;
+        }
+        if c == '+' {
+            if (a.sym >= 0) and (b.sym >= 0) {
+                fail(E.A, "an expression adds two symbols");
+                return bad_val();
+            }
+            if b.sym >= 0 {
+                a.sym = b.sym;
+                a.rm = b.rm;
+            }
+            if b.neg >= 0 {
+                a.neg = b.neg;
+            }
+            a.k = a.k +% b.k;
+        } else {
+            if b.neg >= 0 {
+                fail(E.A, "an expression subtracts a difference of symbols");
+                return bad_val();
+            }
+            if b.sym >= 0 {
+                if a.neg >= 0 {
+                    fail(E.A, "an expression subtracts two symbols");
+                    return bad_val();
+                }
+                a.neg = b.sym;
+            }
+            a.k = a.k -% b.k;
+        }
+    }
+    return a;
+}
+
+fn ex_mul(E: *mut Ex) Val {
+    let mut a = ex_unary(E);
+    loop {
+        let c = ex_peek(E);
+        let mut op: u8 = 0;
+        if (c == '*') or (c == '/') or (c == '%') {
+            op = c;
+            E.i += 1;
+        } else if ((c == '<') or (c == '>')) and ((E.i + 1) < E.s.len) and (E.s[E.i + 1] == c) {
+            op = c;
+            E.i += 2;
+        } else {
+            break;
+        }
+        if not a.ok {
+            break;
+        }
+        let b = ex_unary(E);
+        a = arith(E.A, a, b, op);
+    }
+    return a;
+}
+
+// a op b, both constants (after settling label differences).
+fn arith(A: *mut Asm, a0: Val, b0: Val, op: u8) Val {
+    if not a0.ok or not b0.ok {
+        return bad_val();
+    }
+    let a = settle(A, a0);
+    let b = settle(A, b0);
+    if not is_const(a) or not is_const(b) {
+        fail(A, u.f1("'%s' of a symbol's address (only + and - are)", ch1(op)));
+        return bad_val();
+    }
+    let x = a.k;
+    let y = b.k;
+    if op == '|' {
+        return konst(x | y);
+    }
+    if op == '^' {
+        return konst(x ^ y);
+    }
+    if op == '&' {
+        return konst(x & y);
+    }
+    if op == '*' {
+        return konst(x *% y);
+    }
+    if (op == '/') or (op == '%') {
+        if y == 0 {
+            fail(A, "a division by zero in an expression");
+            return bad_val();
+        }
+        if op == '/' {
+            return konst(x / y);
+        }
+        return konst(x % y);
+    }
+    let sh = @truncate(u32, @bit_cast(u64, y) & 63);
+    if op == '<' {
+        return konst(@bit_cast(i64, @bit_cast(u64, x) << sh));
+    }
+    return konst(x >> sh);
+}
+
+fn ch1(c: u8) []u8 {
+    let b = u.newn.[u8](1);
+    b[0] = c;
+    return b[0..1];
+}
+
+fn ex_unary(E: *mut Ex) Val {
+    let c = ex_peek(E);
+    if c == '-' {
+        E.i += 1;
+        let v = ex_unary(E);
+        if not v.ok {
+            return v;
+        }
+        let s = settle(E.A, v);
+        if not is_const(s) {
+            fail(E.A, "the negation of a symbol's address");
+            return bad_val();
+        }
+        return konst(0 -% s.k);
+    }
+    if c == '+' {
+        E.i += 1;
+        return ex_unary(E);
+    }
+    if (c == '~') or (c == '!') {
+        E.i += 1;
+        let v = ex_unary(E);
+        if not v.ok {
+            return v;
+        }
+        let s = settle(E.A, v);
+        if not is_const(s) {
+            fail(E.A, "'~' of a symbol's address");
+            return bad_val();
+        }
+        if c == '!' {
+            if s.k == 0 {
+                return konst(1);
+            }
+            return konst(0);
+        }
+        return konst(~s.k);
+    }
+    return ex_primary(E);
+}
+
+fn ex_primary(E: *mut Ex) Val {
+    let c = ex_peek(E);
+    let s = E.s;
+    if c == '(' {
+        E.i += 1;
+        let v = ex_or(E);
+        if ex_peek(E) != ')' {
+            fail(E.A, "a ')' missing in an expression");
+            return bad_val();
+        }
+        E.i += 1;
+        return v;
+    }
+    if c == '\'' {
+        // a character
+        E.i += 1;
+        if E.i >= s.len {
+            fail(E.A, "a character constant at the end");
+            return bad_val();
+        }
+        let mut ch = @as(i64, s[E.i]);
+        if (s[E.i] == '\\') and ((E.i + 1) < s.len) {
+            E.i += 1;
+            ch = @as(i64, escape(s[E.i]));
+        }
+        E.i += 1;
+        if (E.i < s.len) and (s[E.i] == '\'') {
+            E.i += 1;
+        }
+        return konst(ch);
+    }
+    if u.is_digit(c) {
+        let st = E.i;
+        while (E.i < s.len) and (is_sym_char(s[E.i])) {
+            E.i += 1;
+        }
+        let t = s[st..E.i];
+        // a numeric label reference: 1b, 1f
+        if (t.len >= 2) and ((t[t.len - 1] == 'b') or (t[t.len - 1] == 'f')) and all_digits(t[0..t.len - 1]) {
+            let fwd = t[t.len - 1] == 'f';
+            let d = numeric_ref(E.A, @int_cast(usize, u.atol(t[0..t.len - 1])), fwd);
+            if d < 0 {
+                fail(E.A, u.f1("the local label '%s' is not defined", t));
+                return bad_val();
+            }
+            return Val.{ ok: true, k: 0, sym: d, neg: -1, rm: RM_NONE };
+        }
+        let mut ok = true;
+        let n = number(t, &mut ok);
+        if not ok {
+            fail(E.A, u.f1("'%s' is not a number", t));
+            return bad_val();
+        }
+        return konst(n);
+    }
+    if is_sym_start(c) or (c == '"') {
+        let st = E.i;
+        let mut name = "";
+        if c == '"' {
+            E.i += 1;
+            let ns = E.i;
+            while (E.i < s.len) and (s[E.i] != '"') {
+                E.i += 1;
+            }
+            name = s[ns..E.i];
+            if E.i < s.len {
+                E.i += 1;
+            }
+        } else {
+            while (E.i < s.len) and is_sym_char(s[E.i]) {
+                E.i += 1;
+            }
+            name = s[st..E.i];
+        }
+        if u.str_eq(name, ".") {
+            // the current place
+            let d = here_def(E.A);
+            return Val.{ ok: true, k: 0, sym: d, neg: -1, rm: RM_NONE };
+        }
+        let mut rm = RM_NONE;
+        if (E.i < s.len) and (s[E.i] == '@') {
+            let ms = E.i + 1;
+            E.i += 1;
+            while (E.i < s.len) and is_sym_char(s[E.i]) {
+                E.i += 1;
+            }
+            let m = lower(s[ms..E.i]);
+            if u.str_eq(m, "plt") {
+                rm = RM_PLT;
+            } else if u.str_eq(m, "gotpcrel") {
+                rm = RM_GOTPCREL;
+            } else {
+                fail(E.A, u.f1("the relocation '@%s' is not supported", s[ms..E.i]));
+                return bad_val();
+            }
+        }
+        let d = sym(E.A, name);
+        let df = E.A.defs.get(@int_cast(usize, d));
+        if df.abs {
+            return konst(@bit_cast(i64, df.off));
+        }
+        return Val.{ ok: true, k: 0, sym: d, neg: -1, rm: rm };
+    }
+    if c == 0 {
+        fail(E.A, "an expression is missing");
+    } else {
+        fail(E.A, u.f1("unexpected '%s' in an expression", s[E.i..]));
+    }
+    return bad_val();
+}
+
+fn all_digits(s: []u8) bool {
+    if s.len == 0 {
+        return false;
+    }
+    for c in s {
+        if not u.is_digit(c) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn escape(c: u8) u8 {
+    if c == 'n' {
+        return 10;
+    }
+    if c == 't' {
+        return 9;
+    }
+    if c == 'r' {
+        return 13;
+    }
+    if c == '0' {
+        return 0;
+    }
+    if c == 'b' {
+        return 8;
+    }
+    if c == 'f' {
+        return 12;
+    }
+    if c == 'v' {
+        return 11;
+    }
+    if c == 'a' {
+        return 7;
+    }
+    return c;
+}
+
+fn digit_val(c: u8) i64 {
+    if u.is_digit(c) {
+        return @as(i64, c - '0');
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return @as(i64, c - 'a') + 10;
+    }
+    if (c >= 'A') and (c <= 'F') {
+        return @as(i64, c - 'A') + 10;
+    }
+    return 99;
+}
+
+/// An integer in the assembler's notation: decimal, 0x hexadecimal, 0b
+/// binary, 0 octal.
+pub fn number(t: []u8, ok: *mut bool) i64 {
+    let mut base: i64 = 10;
+    let mut i: usize = 0;
+    if (t.len > 2) and (t[0] == '0') and ((t[1] == 'x') or (t[1] == 'X')) {
+        base = 16;
+        i = 2;
+    } else if (t.len > 2) and (t[0] == '0') and ((t[1] == 'b') or (t[1] == 'B')) {
+        base = 2;
+        i = 2;
+    } else if (t.len > 1) and (t[0] == '0') {
+        base = 8;
+        i = 1;
+    }
+    let mut v: u64 = 0;
+    if i >= t.len {
+        ok.* = t.len > 0;
+        return 0;
+    }
+    while i < t.len {
+        let d = digit_val(t[i]);
+        if d >= base {
+            ok.* = false;
+            return 0;
+        }
+        v = (v *% @bit_cast(u64, base)) +% @bit_cast(u64, d);
+        i += 1;
+    }
+    return @bit_cast(i64, v);
+}
+
+// A Def for the current place (`.`): a label made for it.
+fn here_def(A: *mut Asm) i32 {
+    let d = new_def(A, u.f1(".\x02here%s", u.zdec(A.defs.len)));
+    let p = A.defs.at(@int_cast(usize, d));
+    p.sec = A.cur;
+    p.off = here(A);
+    p.defined = true;
+    p.tmp = true;
+    return d;
+}
+
+// -----------------------------------------------------------------------------
+// Operand lists
+// -----------------------------------------------------------------------------
+/// The operands of s, split at the commas outside parentheses, brackets,
+/// braces and strings.
+pub fn split_args(s: []u8) [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    if trim(s).len == 0 {
+        return out.items();
+    }
+    let mut depth: i32 = 0;
+    let mut st: usize = 0;
+    let mut i: usize = 0;
+    let mut in_str = false;
+    while i < s.len {
+        let c = s[i];
+        if in_str {
+            if (c == '\\') and ((i + 1) < s.len) {
+                i += 1;
+            } else if c == '"' {
+                in_str = false;
+            }
+        } else if c == '"' {
+            in_str = true;
+        } else if (c == '(') or (c == '[') or (c == '{') {
+            depth += 1;
+        } else if (c == ')') or (c == ']') or (c == '}') {
+            depth -= 1;
+        } else if (c == ',') and (depth == 0) {
+            out.push(trim(s[st..i]));
+            st = i + 1;
+        }
+        i += 1;
+    }
+    out.push(trim(s[st..]));
+    return out.items();
+}
+
+// -----------------------------------------------------------------------------
+// Sections and bytes
+// -----------------------------------------------------------------------------
+/// The section named `name` (made, of kind `kind`, if new).
+pub fn section(A: *mut Asm, name: []u8, kind: i32) i32 {
+    for k in 0..A.secs.len {
+        if u.str_eq(A.secs.get(k).name, name) {
+            return @int_cast(i32, k);
+        }
+    }
+    A.secs.push(Sec.{ name: u.dup(name), kind: kind, data: u.List.[u8].empty(), size: 0, align: 1 });
+    return @int_cast(i32, A.secs.len - 1);
+}
+
+/// Where the next byte goes in the current section.
+pub fn here(A: *Asm) u64 {
+    let s = A.secs.at(@int_cast(usize, A.cur));
+    if s.kind == elf.S_BSS {
+        return s.size;
+    }
+    return @as(u64, s.data.len);
+}
+
+pub fn emit8(A: *mut Asm, x: u64) void {
+    let s = A.secs.at(@int_cast(usize, A.cur));
+    if (s.kind == elf.S_BSS) or (s.kind == elf.S_TBSS) {
+        if (x & 0xff) != 0 {
+            fail(A, "data in a section of zeros (bss)");
+        }
+        s.size += 1;
+        return;
+    }
+    s.data.push(@truncate(u8, x));
+}
+
+pub fn emit16(A: *mut Asm, x: u64) void {
+    emit8(A, x);
+    emit8(A, x >> 8);
+}
+
+pub fn emit32(A: *mut Asm, x: u64) void {
+    emit16(A, x);
+    emit16(A, x >> 16);
+}
+
+pub fn emit64(A: *mut Asm, x: u64) void {
+    emit32(A, x);
+    emit32(A, x >> 32);
+}
+
+/// Overwrites the 4 bytes at off of the current section.
+pub fn patch32(A: *mut Asm, off: u64, x: u64) void {
+    let s = A.secs.at(@int_cast(usize, A.cur));
+    for k in @as(u64, 0)..4 {
+        s.data.set(@truncate(usize, off + k), @truncate(u8, x >> @truncate(u32, k * 8)));
+    }
+}
+
+/// A relocation of type ty at off in the current section for v's symbol.
+pub fn reloc(A: *mut Asm, off: u64, ty: u32, v: Val, addend: i64) void {
+    let d = A.defs.get(@int_cast(usize, v.sym));
+    A.relocs.push(Reloc.{ sec: A.cur, off: off, ty: ty, name: d.name, addend: addend });
+}
+
+/// Is v's symbol a label of this text in the current section (so a
+/// pc-relative reference to it needs no relocation)? Its offset in `off`
+/// (before the label is first placed: here).
+pub fn local_target(A: *Asm, v: Val, off: *mut u64) bool {
+    if v.sym < 0 {
+        return false;
+    }
+    let d = A.defs.get(@int_cast(usize, v.sym));
+    if not d.intext and not d.tmp {
+        return false;
+    }
+    if d.global and not A.inline_ {
+        return false;  // (another unit's definition may take its place, as with the system's assemblers)
+    }
+    let s = def_sec(A, d);
+    if s < 0 {
+        off.* = here(A);
+        return true;  // (not placed yet: the first pass)
+    }
+    if s != A.cur {
+        return false;
+    }
+    off.* = def_off(A, d);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// The passes
+// -----------------------------------------------------------------------------
+/// The functions an architecture gives the passes: its instruction encoder
+/// and its own directives (false: not one of them).
+pub struct Arch {
+    insn: fn(*mut Asm, *mut Stmt) void,
+    directive: fn(*mut Asm, *mut Stmt) bool,
+    nop: u8,           // the byte that pads code (x86-64 0x90), or 0: words (AArch64's nop)
+    align_pow2: bool,  // .align n is 2^n (AArch64), else n bytes (x86-64)
+    word: u32,         // .word's size: 2 (x86-64) or 4 (AArch64)
+}
+
+/// Assembles A's text: passes until no label moves (at most 12).
+pub fn run(A: *mut Asm, arch: *Arch) void {
+    split(A);
+    if failed(A) {
+        return;
+    }
+    let mut pass: i32 = 0;
+    while pass < 12 {
+        A.pass = pass;
+        A.changed = false;
+        one_pass(A, arch);
+        if failed(A) {
+            return;
+        }
+        // labels: placed where the previous pass put them?
+        let mut moved = false;
+        for k in 0..A.defs.len {
+            let d = A.defs.at(k);
+            if ((d.sec != d.prev_sec) or (d.off != d.prev_off)) and not d.tmp {
+                moved = true;
+            }
+            d.prev_sec = d.sec;
+            d.prev_off = d.off;
+            if d.defined {
+                d.defined = false;
+            }
+        }
+        if not moved and not A.changed and (pass > 0) {
+            // the last pass's labels are final: mark them defined again
+            for k in 0..A.defs.len {
+                let d = A.defs.at(k);
+                d.defined = d.sec >= 0;
+            }
+            return;
+        }
+        pass += 1;
+    }
+    fail(A, "the assembly's labels do not settle (instructions that change size forever)");
+}
+
+fn one_pass(A: *mut Asm, arch: *Arch) void {
+    A.secs.clear();
+    A.relocs.clear();
+    A.stack.clear();
+    if A.inline_ {
+        A.cur = section(A, ".text", elf.S_TEXT);
+    } else {
+        A.cur = section(A, ".text", elf.S_TEXT);
+    }
+    A.prev = A.cur;
+    for k in 0..A.defs.len {
+        let d = A.defs.at(k);
+        d.defined = false;
+        if not d.abs {
+            d.sec = -1;
+            d.off = 0;
+        }
+    }
+    for i in 0..A.stmts.len {
+        A.si = i;
+        let st = A.stmts.at(i);
+        for l in st.labels {
+            let d = A.defs.at(@int_cast(usize, l));
+            if d.defined or d.abs {
+                fail(A, u.f1("the label '%s' is defined twice", d.name));
+                return;
+            }
+            d.defined = true;
+            d.sec = A.cur;
+            d.off = here(A);
+        }
+        if st.op.len == 0 {
+            continue;
+        }
+        if st.op[0] == '.' {
+            if not arch.directive(A, st) {
+                directive(A, st, arch);
+            }
+        } else {
+            arch.insn(A, st);
+        }
+        if failed(A) {
+            return;
+        }
+    }
+}
+
+// The alignment padding to a multiple of n (a power of two).
+fn align_to(A: *mut Asm, n: u64, fill: i64, has_fill: bool, arch: *Arch, max: u64) void {
+    if (n == 0) or ((n & (n - 1)) != 0) {
+        fail(A, u.f1("an alignment of %s, which is not a power of two", u.udec(n)));
+        return;
+    }
+    let s = A.secs.at(@int_cast(usize, A.cur));
+    if n > s.align {
+        s.align = n;
+    }
+    let mut at = here(A);
+    if A.inline_ {
+        at += A.origin;
+    }
+    let pad = (n - (at % n)) % n;
+    if (max != 0) and (pad > max) {
+        return;
+    }
+    if (s.kind == elf.S_TEXT) and not has_fill {
+        if arch.nop != 0 {
+            for _k in @as(u64, 0)..pad {
+                emit8(A, @as(u64, arch.nop));
+            }
+        } else {
+            let mut p = pad;
+            while (p % 4) != 0 {
+                emit8(A, 0);
+                p -= 1;
+            }
+            while p > 0 {
+                emit32(A, 0xd503201f);  // nop
+                p -= 4;
+            }
+        }
+        return;
+    }
+    for _k in @as(u64, 0)..pad {
+        emit8(A, @bit_cast(u64, fill));
+    }
+}
+
+// Data of n bytes from each operand (a constant, or a symbol's address).
+fn data(A: *mut Asm, args: []u8, n: u32) void {
+    for a in split_args(args) {
+        let v = settle(A, eval(A, a));
+        if not v.ok {
+            return;
+        }
+        if is_const(v) {
+            let x = @bit_cast(u64, v.k);
+            if n == 1 {
+                emit8(A, x);
+            } else if n == 2 {
+                emit16(A, x);
+            } else if n == 4 {
+                emit32(A, x);
+            } else {
+                emit64(A, x);
+            }
+            continue;
+        }
+        if v.neg >= 0 {
+            // sym - label: pc-relative when label is here's section
+            let d = A.defs.get(@int_cast(usize, v.neg));
+            if def_sec(A, d) == A.cur {
+                let off = here(A);
+                let ty = pcrel_type(A, n);
+                if ty == 0 {
+                    fail(A, "a difference of symbols in data of this size");
+                    return;
+                }
+                let delta = @bit_cast(i64, off) - @bit_cast(i64, def_off(A, d));
+                reloc(A, off, ty, v, v.k + delta);
+                emit_zero(A, n);
+                continue;
+            }
+            fail(A, "a difference of symbols of different sections");
+            return;
+        }
+        if A.inline_ {
+            fail(A, "an address in data in inline assembly (a relocation in a function's code)");
+            return;
+        }
+        let ty = abs_type(A, n);
+        if ty == 0 {
+            fail(A, u.f1("an address in %s-byte data", u.udec(@as(u64, n))));
+            return;
+        }
+        reloc(A, here(A), ty, v, v.k);
+        emit_zero(A, n);
+    }
+}
+
+fn emit_zero(A: *mut Asm, n: u32) void {
+    for _k in @as(u32, 0)..n {
+        emit8(A, 0);
+    }
+}
+
+fn abs_type(A: *Asm, n: u32) u32 {
+    if A.arch == tg.ARCH_X64 {
+        if n == 8 {
+            return elf.R_X86_64_64;
+        }
+        if n == 4 {
+            return elf.R_X86_64_32;
+        }
+        return 0;
+    }
+    if n == 8 {
+        return elf.R_AARCH64_ABS64;
+    }
+    if n == 4 {
+        return elf.R_AARCH64_ABS32;
+    }
+    return 0;
+}
+
+fn pcrel_type(A: *Asm, n: u32) u32 {
+    if n != 4 {
+        return 0;
+    }
+    if A.arch == tg.ARCH_X64 {
+        return elf.R_X86_64_PC32;
+    }
+    return elf.R_AARCH64_PREL32;
+}
+
+// A string literal's bytes (in the GNU assembler's escapes).
+pub fn string(A: *mut Asm, s0: []u8) []u8 {
+    let s = trim(s0);
+    if (s.len < 2) or (s[0] != '"') or (s[s.len - 1] != '"') {
+        fail(A, u.f1("'%s' is not a string", s));
+        return "";
+    }
+    let mut b = u.Buf.init();
+    let mut i: usize = 1;
+    while i < (s.len - 1) {
+        let c = s[i];
+        if (c == '\\') and ((i + 1) < (s.len - 1)) {
+            i += 1;
+            let e = s[i];
+            if (e >= '0') and (e <= '7') {
+                let mut v: u32 = 0;
+                let mut n: i32 = 0;
+                while (n < 3) and (i < (s.len - 1)) and (s[i] >= '0') and (s[i] <= '7') {
+                    v = (v * 8) + @as(u32, s[i] - '0');
+                    i += 1;
+                    n += 1;
+                }
+                b.c(@truncate(u8, v));
+                continue;
+            }
+            if e == 'x' {
+                i += 1;
+                let mut v: u32 = 0;
+                while (i < (s.len - 1)) and (digit_val(s[i]) < 16) {
+                    v = (v * 16) + @truncate(u32, @bit_cast(u64, digit_val(s[i])));
+                    i += 1;
+                }
+                b.c(@truncate(u8, v));
+                continue;
+            }
+            b.c(escape(e));
+            i += 1;
+            continue;
+        }
+        b.c(c);
+        i += 1;
+    }
+    return b.done();
+}
+
+fn kind_of_section(name: []u8, flags: []u8, ty: []u8) i32 {
+    if u.starts(name, ".text") {
+        return elf.S_TEXT;
+    }
+    if u.starts(name, ".bss") or u.contains(ty, "nobits") {
+        if u.contains(flags, "T") or u.starts(name, ".tbss") {
+            return elf.S_TBSS;
+        }
+        return elf.S_BSS;
+    }
+    if u.starts(name, ".tbss") {
+        return elf.S_TBSS;
+    }
+    if u.starts(name, ".tdata") or u.contains(flags, "T") {
+        return elf.S_TDATA;
+    }
+    if u.starts(name, ".rodata") {
+        return elf.S_RODATA;
+    }
+    if u.starts(name, ".data") {
+        return elf.S_DATA;
+    }
+    if u.contains(flags, "x") {
+        return elf.S_TEXT;
+    }
+    if u.contains(flags, "w") {
+        return elf.S_DATA;
+    }
+    return elf.S_RODATA;
+}
+
+// Directives every architecture has.
+fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
+    let op = st.op;
+    let args = st.args;
+    if u.str_eq(op, ".byte") {
+        data(A, args, 1);
+        return;
+    }
+    if u.str_eq(op, ".short") or u.str_eq(op, ".hword") or u.str_eq(op, ".2byte") or u.str_eq(op, ".value") {
+        data(A, args, 2);
+        return;
+    }
+    if u.str_eq(op, ".word") {
+        data(A, args, arch.word);
+        return;
+    }
+    if u.str_eq(op, ".long") or u.str_eq(op, ".int") or u.str_eq(op, ".4byte") {
+        data(A, args, 4);
+        return;
+    }
+    if u.str_eq(op, ".quad") or u.str_eq(op, ".xword") or u.str_eq(op, ".8byte") or u.str_eq(op, ".dword") {
+        data(A, args, 8);
+        return;
+    }
+    if u.str_eq(op, ".ascii") or u.str_eq(op, ".asciz") or u.str_eq(op, ".string") {
+        for s in split_args(args) {
+            for c in string(A, s) {
+                emit8(A, @as(u64, c));
+            }
+            if not u.str_eq(op, ".ascii") {
+                emit8(A, 0);
+            }
+        }
+        return;
+    }
+    if u.str_eq(op, ".float") or u.str_eq(op, ".single") or u.str_eq(op, ".double") {
+        for s in split_args(args) {
+            let f = u.parse_f64(trim(s));
+            if u.str_eq(op, ".double") {
+                emit64(A, @bit_cast(u64, f));
+            } else {
+                emit32(A, @as(u64, @bit_cast(u32, @float_cast(f32, f))));
+            }
+        }
+        return;
+    }
+    if u.str_eq(op, ".zero") or u.str_eq(op, ".skip") or u.str_eq(op, ".space") {
+        let xs = split_args(args);
+        if xs.len == 0 {
+            fail(A, u.f1("%s needs a size", op));
+            return;
+        }
+        let n = eval_const(A, xs[0], "the size");
+        let mut fill: i64 = 0;
+        if xs.len > 1 {
+            fill = eval_const(A, xs[1], "the fill");
+        }
+        if (n < 0) or (n > 0x1000_0000) {
+            fail(A, u.f1("a size of %s", u.dec(n)));
+            return;
+        }
+        for _k in @as(i64, 0)..n {
+            emit8(A, @bit_cast(u64, fill));
+        }
+        return;
+    }
+    if u.str_eq(op, ".fill") {
+        let xs = split_args(args);
+        let n = eval_const(A, xs[0], "the count");
+        let mut size: i64 = 1;
+        let mut val: i64 = 0;
+        if xs.len > 1 {
+            size = eval_const(A, xs[1], "the size");
+        }
+        if xs.len > 2 {
+            val = eval_const(A, xs[2], "the value");
+        }
+        if (n < 0) or (n > 0x100_0000) or (size < 0) or (size > 8) {
+            fail(A, ".fill of an unsupported count or size");
+            return;
+        }
+        for _k in @as(i64, 0)..n {
+            for j in @as(i64, 0)..size {
+                if j < 4 {
+                    emit8(A, @bit_cast(u64, val) >> @truncate(u32, @bit_cast(u64, j * 8)));
+                } else {
+                    emit8(A, 0);
+                }
+            }
+        }
+        return;
+    }
+    if u.str_eq(op, ".balign") or u.str_eq(op, ".p2align") or u.str_eq(op, ".align") or u.str_eq(op, ".balignw") or
+       u.str_eq(op, ".balignl") or u.str_eq(op, ".p2alignw") or u.str_eq(op, ".p2alignl") {
+        let xs = split_args(args);
+        if xs.len == 0 {
+            fail(A, u.f1("%s needs an alignment", op));
+            return;
+        }
+        let mut n = eval_const(A, xs[0], "the alignment");
+        let pow = u.starts(op, ".p2align") or (u.str_eq(op, ".align") and arch.align_pow2);
+        if pow {
+            if (n < 0) or (n > 30) {
+                fail(A, "an alignment out of range");
+                return;
+            }
+            n = @as(i64, 1) << @truncate(u32, @bit_cast(u64, n));
+        }
+        let mut fill: i64 = 0;
+        let mut has_fill = false;
+        if (xs.len > 1) and (xs[1].len > 0) {
+            fill = eval_const(A, xs[1], "the fill");
+            has_fill = true;
+        }
+        let mut max: i64 = 0;
+        if xs.len > 2 {
+            max = eval_const(A, xs[2], "the maximum");
+        }
+        align_to(A, @bit_cast(u64, n), fill, has_fill, arch, @bit_cast(u64, max));
+        return;
+    }
+    if u.str_eq(op, ".text") or u.str_eq(op, ".data") or u.str_eq(op, ".bss") or u.str_eq(op, ".rodata") or
+       u.str_eq(op, ".section") or u.str_eq(op, ".pushsection") {
+        let mut name = op;
+        let mut flags = "";
+        let mut ty = "";
+        if u.str_eq(op, ".section") or u.str_eq(op, ".pushsection") {
+            let xs = split_args(args);
+            if xs.len == 0 {
+                fail(A, u.f1("%s needs a name", op));
+                return;
+            }
+            name = xs[0];
+            if (name.len >= 2) and (name[0] == '"') {
+                name = name[1..name.len - 1];
+            }
+            if xs.len > 1 {
+                flags = xs[1];
+            }
+            if xs.len > 2 {
+                ty = xs[2];
+            }
+        }
+        let kind = kind_of_section(name, flags, ty);
+        if A.inline_ and not (u.str_eq(name, ".text") and not u.str_eq(op, ".pushsection")) {
+            fail(A, u.f1("inline assembly cannot change the section (%s)", st.args));
+            return;
+        }
+        if u.str_eq(op, ".pushsection") {
+            A.stack.push(A.cur);
+        }
+        A.prev = A.cur;
+        A.cur = section(A, name, kind);
+        return;
+    }
+    if u.str_eq(op, ".popsection") {
+        if A.stack.len == 0 {
+            fail(A, ".popsection without .pushsection");
+            return;
+        }
+        A.prev = A.cur;
+        A.cur = A.stack.pop();
+        return;
+    }
+    if u.str_eq(op, ".previous") {
+        let p = A.prev;
+        A.prev = A.cur;
+        A.cur = p;
+        return;
+    }
+    if u.str_eq(op, ".globl") or u.str_eq(op, ".global") or u.str_eq(op, ".weak") or u.str_eq(op, ".local") or
+       u.str_eq(op, ".hidden") or u.str_eq(op, ".protected") or u.str_eq(op, ".internal") {
+        if A.inline_ {
+            fail(A, u.f1("inline assembly cannot define symbols (%s)", op));
+            return;
+        }
+        for n in split_args(args) {
+            let d = A.defs.at(@int_cast(usize, sym(A, n)));
+            if u.str_eq(op, ".weak") {
+                d.weak = true;
+                d.global = true;
+            } else if u.str_eq(op, ".globl") or u.str_eq(op, ".global") {
+                d.global = true;
+            } else if u.str_eq(op, ".local") {
+                d.global = false;
+            }
+        }
+        return;
+    }
+    if u.str_eq(op, ".type") {
+        let xs = split_args(args);
+        if xs.len == 2 {
+            let d = A.defs.at(@int_cast(usize, sym(A, xs[0])));
+            let t = xs[1];
+            if u.contains(t, "function") {
+                d.ty = elf.T_FUNC;
+            } else if u.contains(t, "object") {
+                d.ty = elf.T_OBJECT;
+            } else if u.contains(t, "tls") {
+                d.ty = elf.T_TLS;
+            }
+        }
+        return;
+    }
+    if u.str_eq(op, ".size") {
+        if A.inline_ {
+            return;
+        }
+        let xs = split_args(args);
+        if xs.len == 2 {
+            let d = sym(A, xs[0]);
+            let v = settle(A, eval(A, xs[1]));
+            if is_const(v) {
+                let p = A.defs.at(@int_cast(usize, d));
+                p.size = v.k;
+                p.has_size = true;
+            }
+        }
+        return;
+    }
+    if u.str_eq(op, ".set") or u.str_eq(op, ".equ") {
+        let xs = split_args(args);
+        if xs.len != 2 {
+            fail(A, u.f1("%s needs a name and a value", op));
+            return;
+        }
+        let v = settle(A, eval(A, xs[1]));
+        if not v.ok {
+            return;
+        }
+        let d = A.defs.at(@int_cast(usize, sym(A, xs[0])));
+        if is_const(v) {
+            d.abs = true;
+            d.off = @bit_cast(u64, v.k);
+            return;
+        }
+        if (v.sym >= 0) and (v.neg < 0) {
+            let t = A.defs.get(@int_cast(usize, v.sym));
+            if def_sec(A, t) >= 0 {
+                d.defined = true;
+                d.sec = def_sec(A, t);
+                d.off = def_off(A, t) + @bit_cast(u64, v.k);
+                return;
+            }
+        }
+        fail(A, u.f1("%s of a value that is not a constant or a label of this assembly", op));
+        return;
+    }
+    // what changes nothing here: debug information, call frame information
+    // (a template that changes the frame is not supported: docs/c.md), the
+    // file's name, identification, the syntax and target already in force
+    let ignored = [".file", ".loc", ".ident", ".att_syntax", ".code64", ".arch", ".cpu", ".arch_extension",
+                   ".cfi_startproc", ".cfi_endproc", ".cfi_def_cfa", ".cfi_def_cfa_offset", ".cfi_def_cfa_register",
+                   ".cfi_offset", ".cfi_adjust_cfa_offset", ".cfi_rel_offset", ".cfi_restore", ".cfi_remember_state",
+                   ".cfi_restore_state", ".cfi_sections", ".cfi_signal_frame", ".cfi_undefined", ".cfi_same_value",
+                   ".cfi_register", ".cfi_escape", ".cfi_window_save", ".cfi_negate_ra_state", ".cfi_personality",
+                   ".cfi_lsda", ".nops_off", ".variant_pcs", ".addrsig", ".addrsig_sym"];
+    for x in ignored {
+        if u.str_eq(op, x) {
+            return;
+        }
+    }
+    fail(A, u.f1("the directive '%s' is not supported", op));
+}
+
+/// The value of symbol s, a label placed by this text: its section and offset.
+pub fn def_of(A: *Asm, s: i32) Def {
+    return A.defs.get(@int_cast(usize, s));
+}

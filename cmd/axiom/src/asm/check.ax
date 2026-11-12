@@ -1,0 +1,141 @@
+// =============================================================================
+// asm/check.ax - an asm statement's template assembled with stand-in
+// operands (registers of the operands' classes, a memory operand at a base
+// register, the constant 1 or a symbol), for the front end's diagnostics
+// (cgen_asm.ax): an unknown instruction, an operand form an instruction
+// does not have, a bad directive. The backend assembles it again with the
+// operands it chose (asm/x64.ax, asm/a64.ax), where only what depends on
+// them (a constant out of range) can still fail.
+// =============================================================================
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "a64.ax" as a64;
+import "core.ax" as cr;
+import "inline.ax" as ai;
+import "x64.ax" as x64;
+
+// Stand-in registers: x86-64 rax rcx rdx rbx rsi rdi r8-r15; AArch64 x0-x15
+let X86_GPR: [14]i32 = [0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+let mut g_arch: i32 = 0;
+let mut g_err: []u8 = "";
+
+fn pick(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The stand-in of operand k.
+fn stand_in(b: *ai.Blob, k: usize) ai.ROp {
+    let mut op = b.ops[k];
+    if op.tie >= 0 {
+        op = b.ops[@int_cast(usize, op.tie)];
+        op.bits = b.ops[k].bits;
+    }
+    let x86 = b.arch == tg.ARCH_X64;
+    let mut o = ai.rop_reg(0, op.bits, op.fp);
+    if (op.kind == ai.OK_REG) or (op.kind == ai.OK_FIXED) {
+        let mut r = op.reg;
+        if op.kind == ai.OK_REG {
+            if op.subset != 0 {
+                r = first_bit(op.subset);
+                if op.cls == ai.CL_VEC {
+                    r += pick(x86, 16, 32);
+                }
+            } else if op.cls == ai.CL_VEC {
+                r = @int_cast(i32, k % 16) + pick(x86, 16, 32);
+            } else if x86 {
+                r = X86_GPR[k % 14];
+            } else {
+                r = @int_cast(i32, k % 16);
+            }
+        }
+        o.reg = r;
+        return o;
+    }
+    if op.kind == ai.OK_MEM {
+        o.kind = ai.OK_MEM;
+        o.base = pick(x86, 3, 1);
+        return o;
+    }
+    o.kind = ai.OK_IMM;
+    o.k = 1;
+    if op.sym {
+        o.sym = true;
+        o.name = "__axiom_stand_in";
+        o.k = 0;
+    }
+    return o;
+}
+
+fn first_bit(m: u64) i32 {
+    for k in @as(u32, 0)..64 {
+        if ((m >> k) & 1) != 0 {
+            return @bit_cast(i32, k);
+        }
+    }
+    return 0;
+}
+
+fn render(b: *ai.Blob, k: usize, mod: u8) []u8 {
+    let o = stand_in(b, k);
+    let mut err = "";
+    let mut t = "";
+    if b.arch == tg.ARCH_X64 {
+        t = x64.render(&o, mod, &mut err);
+    } else {
+        t = a64.render(&o, mod, &mut err);
+    }
+    if (err.len > 0) and (g_err.len == 0) {
+        g_err = u.f2("operand %s: %s", u.zdec(k), err);
+    }
+    return t;
+}
+
+fn label(k: i32) []u8 {
+    if g_arch == tg.ARCH_X64 {
+        return x64.label_text(k);
+    }
+    return a64.label_text(k);
+}
+
+/// Why blob b's template does not assemble, or "".
+pub fn check(b: *ai.Blob) []u8 {
+    g_arch = b.arch;
+    g_err = "";
+    let mut text = ai.expand(b, render, label, 0);
+    if g_err.len > 0 {
+        return g_err;
+    }
+    if b.goto_ {
+        if b.arch == tg.ARCH_X64 {
+            text = u.cat2(text, x64.goto_tail(b.nlabels, 0));
+        } else {
+            text = u.cat2(text, a64.goto_tail(b.nlabels, 0));
+        }
+    }
+    return check_text(b.arch, text, true);
+}
+
+/// Why asm text does not assemble (inline_: as a template, else as
+/// file-scope asm), or "".
+pub fn check_text(arch: i32, text: []u8, inline_: bool) []u8 {
+    let mut A = u.nil.[cr.Asm]();
+    if arch == tg.ARCH_X64 {
+        if inline_ {
+            A = x64.assemble_inline(text, 0);
+        } else {
+            A = x64.assemble_file(text);
+        }
+    } else if inline_ {
+        A = a64.assemble_inline(text, 0);
+    } else {
+        A = a64.assemble_file(text);
+    }
+    if cr.failed(A) {
+        return cr.message(A);
+    }
+    return "";
+}

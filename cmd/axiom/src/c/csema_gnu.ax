@@ -21,6 +21,7 @@
 //   used, weak, alias("t"), visibility("v"), constructor(p), destructor(p),
 //   cleanup(f), mode(m), transparent_union, error("m"), warning("m"),
 //   nonnull(i...), format(...): as docs/c.md says.
+//   naked: the function's body is its asm statements' text (csema_asm.ax, cgen_asm.ax)
 //   noinline, always_inline, cold: the IR function's; hot, const, pure,
 //   malloc and the other hints are accepted and change nothing.
 //
@@ -33,6 +34,7 @@ import "cast.ax" as cast;
 import "cfeat.ax" as cf;
 import "cpragma.ax" as cpg;
 import "csema.ax" as cs;
+import "csema_asm.ax" as csa;
 import "csema_bits.ax" as cb;
 import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
@@ -51,6 +53,7 @@ pub struct Note {
     noinline: bool,
     always_inline: bool,
     cold: bool,
+    naked: bool,  // a function whose body is basic asm only: no prologue or epilogue (cgen_asm.ax)
     ctor: bool,
     ctor_prio: i32,  // 65535 without a priority (after those with one)
     dtor: bool,
@@ -180,12 +183,12 @@ fn one_of(n: []u8, names: [][]u8) bool {
 }
 
 // The attributes of functions only.
-let FUNC_ATTRS: [31][]u8 = ["noreturn", "noinline", "always_inline", "const", "pure", "malloc", "format", "format_arg",
+let FUNC_ATTRS: [32][]u8 = ["noreturn", "noinline", "always_inline", "const", "pure", "malloc", "format", "format_arg",
                             "nonnull", "returns_nonnull", "warn_unused_result", "constructor", "destructor",
                             "gnu_inline", "artificial", "nothrow", "leaf", "externally_visible",
                             "no_instrument_function", "flatten", "noclone", "noipa", "sentinel", "alloc_size",
                             "alloc_align", "assume_aligned", "error", "warning", "nodiscard", "returns_twice",
-                            "optimize"];
+                            "optimize", "naked"];
 
 /// Checks GNU attribute a, which appertains to `what` (a dsp.AP_ constant):
 /// its place and its arguments. In a mode that is no GNU dialect, an
@@ -430,7 +433,7 @@ fn record(p: usize, a: *mut cast.Attr, what: i32) void {
     let n = cf.plain(a.name);
     let rec = ["section", "alias", "weak", "used", "visibility", "noinline", "always_inline", "cold", "constructor",
                "destructor", "cleanup", "nonnull", "error", "warning", "packed", "aligned", "transparent_union",
-               "format"];
+               "format", "naked"];
     if not one_of(n, rec[..]) {
         return;
     }
@@ -454,6 +457,8 @@ fn record(p: usize, a: *mut cast.Attr, what: i32) void {
         }
     } else if u.str_eq(n, "noinline") {
         x.noinline = true;
+    } else if u.str_eq(n, "naked") {
+        x.naked = true;
     } else if u.str_eq(n, "always_inline") {
         x.always_inline = true;
     } else if u.str_eq(n, "cold") {
@@ -622,8 +627,13 @@ pub fn entity(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
 // `register int x asm("r")`, is C3901).
 fn asm_label(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
     if (s.kind == cast.SK_OBJECT) and (s.duration != cast.SD_STATIC) {
-        if s.is_param or csm.is_register(s) {
-            cs.not_supported(dcl.asm_span, "an explicit register variable ('register ... asm(\"reg\")')");
+        if csm.is_register(s) and not s.is_param {
+            // an explicit register variable: in that register as an asm operand (csema_asm.ax)
+            if csa.register_name(dcl.asm_span, dcl.asm_name) {
+                s.asm_name = dcl.asm_name;
+            }
+        } else if s.is_param {
+            cs.err(dcl.asm_span, "C3090", u.f1("the parameter '%s' cannot have an asm label", s.name));
         } else {
             cs.err(dcl.asm_span, "C3090", u.f1("the automatic object '%s' cannot have an asm label", s.name));
         }

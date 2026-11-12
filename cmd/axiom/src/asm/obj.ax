@@ -1,0 +1,120 @@
+// =============================================================================
+// asm/obj.ax - file-scope asm into the object the native backends write:
+// its sections (.text joins the object's code; the others are sections of
+// their own), its labels (symbols: global with .globl, weak with .weak,
+// local otherwise) and its relocations.
+// =============================================================================
+import "../elf.ax" as elf;
+import "../util.ax" as u;
+import "core.ax" as cr;
+
+// The name a label of the text has in the object (numeric labels are
+// numbered: `1` defined three times gives three local symbols).
+fn sym_name(d: cr.Def) []u8 {
+    let mut b = u.Buf.init();
+    for c in d.name {
+        if c == 2 {
+            b.s("$");
+        } else {
+            b.c(c);
+        }
+    }
+    if d.numeric {
+        return u.cat2(".Lasm$", b.done());
+    }
+    return b.done();
+}
+
+/// Adds assembled file-scope asm A to obj, whose code section is `text`.
+pub fn add_file(obj: *mut elf.Obj, text: i32, A: *mut cr.Asm) void {
+    // sections: where each of A's starts in obj's
+    let secmap = u.newn.[i32](A.secs.len + 1);
+    let base = u.newn.[u64](A.secs.len + 1);
+    for k in 0..A.secs.len {
+        let s = A.secs.at(k);
+        let n = @as(u64, s.data.len);
+        if (s.kind == elf.S_TEXT) and u.str_eq(s.name, ".text") {
+            let os = obj.secs.get(@int_cast(usize, text));
+            os.data.align(@truncate(usize, s.align));
+            if s.align > os.align {
+                os.align = s.align;
+            }
+            secmap[k] = text;
+            base[k] = @as(u64, os.data.len());
+            os.data.put(s.data.items());
+            continue;
+        }
+        _ = n;
+        let ns = elf.add_sec(obj, u.perm_dup(s.name), s.kind, s.align);
+        let os = obj.secs.get(@int_cast(usize, ns));
+        if (s.kind == elf.S_BSS) or (s.kind == elf.S_TBSS) {
+            os.size = s.size;
+        } else {
+            os.data.put(s.data.items());
+        }
+        secmap[k] = ns;
+        base[k] = 0;
+    }
+    // labels: the global ones, the local ones but .L and numeric labels,
+    // and those relocations refer to
+    let syms = u.newn.[i64](A.defs.len + 1);
+    let wanted = u.newn.[bool](A.defs.len + 1);
+    for k in 0..A.defs.len {
+        let d = A.defs.get(k);
+        wanted[k] = d.global or d.weak or not (d.numeric or u.starts(d.name, ".L"));
+    }
+    for r in A.relocs.items() {
+        for k in 0..A.defs.len {
+            if u.str_eq(A.defs.get(k).name, r.name) {
+                wanted[k] = true;
+            }
+        }
+    }
+    for k in 0..A.defs.len {
+        syms[k] = -1;
+        let d = A.defs.get(k);
+        if d.tmp or not d.defined or d.abs or (d.sec < 0) or not wanted[k] {
+            continue;
+        }
+        let si = @int_cast(usize, d.sec);
+        let mut bind = elf.B_LOCAL;
+        if d.weak {
+            bind = elf.B_WEAK;
+        } else if d.global {
+            bind = elf.B_GLOBAL;
+        }
+        let mut size: u64 = 0;
+        if d.has_size {
+            size = @bit_cast(u64, d.size);
+        }
+        let mut ty = d.ty;
+        if (ty == elf.T_NOTYPE) and (A.secs.at(si).kind == elf.S_TEXT) {
+            ty = elf.T_FUNC;  // (a label in code; untyped ones would be written as objects)
+        }
+        let s = elf.add_sym(obj, elf.Sym.{ name: u.perm_dup(sym_name(d)), sec: secmap[si], value: base[si] + d.off,
+                                           size: size, bind: bind, ty: ty, hidden: false });
+        syms[k] = @as(i64, s);
+    }
+    // relocations
+    for r in A.relocs.items() {
+        let si = @int_cast(usize, r.sec);
+        let mut sym: u32 = 0;
+        let d = A.names.get(u.intern(r.name));
+        if (d != 0) and (syms[@int_cast(usize, d - 1)] >= 0) {
+            sym = @truncate(u32, @bit_cast(u64, syms[@int_cast(usize, d - 1)]));
+        } else {
+            let mut found = false;
+            for k in 0..A.defs.len {
+                if (syms[k] >= 0) and u.str_eq(A.defs.get(k).name, r.name) {
+                    sym = @truncate(u32, @bit_cast(u64, syms[k]));
+                    found = true;
+                }
+            }
+            if not found {
+                sym = elf.ext_sym(obj, u.perm_dup(r.name), false);
+            }
+        }
+        let os = obj.secs.get(@int_cast(usize, secmap[si]));
+        os.relocs.push(elf.Rel.{ off: base[si] + r.off, ty: r.ty, sym: sym, addend: r.addend });
+    }
+}

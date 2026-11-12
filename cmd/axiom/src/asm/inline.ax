@@ -1,0 +1,782 @@
+// =============================================================================
+// asm/inline.ax - inline assembly (the C front end's GNU dialects): what an
+// asm statement is once analyzed, shared by the front end (which checks it
+// and builds it) and the native backends (which allocate its operands and
+// assemble its template: x64.ax and a64.ax, with asm/x64.ax and asm/a64.ax).
+//
+// An asm statement in the IR is the intrinsic IN_ASM (ir.ax): its first
+// operand is the index of its Blob in `blobs` (an i32 constant), the others
+// its operands' values, in the order of Blob.ops: a register or immediate
+// input's value, a memory operand's address, and for an output in a
+// register the address of the object the backend stores the register to
+// just after the template (the front end then copies that into the output's
+// lvalue). Its result is void, or for `asm goto` an i32: 0 when the template
+// ends normally, k + 1 when it jumps to its label k (the backend makes the
+// jumps to label k set it: see goto_tail), which a switch after it dispatches.
+//
+// The template's text is kept as pieces: literal text and references to
+// operands (`%0`, `%[name]`, with a modifier letter: `%k0`), labels (`%l1`,
+// `%l[name]`), `%=` (a number unique to each copy of the statement in the
+// code). Constraints are parsed by `constraint`; registers are numbered as
+// the backends number them: x86-64 rax..r15 0-15 and xmm0-15 16-31; AArch64
+// x0-x30 0-30, sp 31, v0-v31 32-63.
+// =============================================================================
+import "../target.ax" as tg;
+import "../util.ax" as u;
+
+// Register classes of operands
+pub const CL_GPR: u8 = 0;  // general purpose (x86-64 r, AArch64 r)
+pub const CL_VEC: u8 = 1;  // floating point and vector (x86-64 x, AArch64 w)
+
+// What an operand is once its constraint is chosen (Op.kind)
+pub const OK_REG: u8 = 1;    // a register of its class (allocated)
+pub const OK_FIXED: u8 = 2;  // a specific register (Op.reg)
+pub const OK_MEM: u8 = 3;    // memory at its IR operand (an address)
+pub const OK_IMM: u8 = 4;    // an integer constant, or a symbol's address plus a constant (the IR operand)
+
+// One operand of an asm statement, as the backends see it.
+pub struct Op {
+    kind: u8,
+    cls: u8,
+    reg: i32,     // OK_FIXED: the register
+    subset: u64,  // OK_REG: one of these registers only (0: any of the class)
+    out: bool,    // an output (written by the template)
+    early: bool,  // an early-clobber output (`&`): written before the inputs are all read
+    tie: i32,     // an input that must be in output `tie`'s register (a matching constraint, or `+`), or -1
+    bits: u32,    // the width of its value: 8, 16, 32, 64 (or 128)
+    fp: bool,     // its C type is a floating type (a register of CL_VEC holds it as such)
+    name: []u8,   // the operand's symbolic name, for `%[name]` (empty: none)
+    q: bool,      // OK_MEM of AArch64's Q: addressed by a base register alone
+    sym: bool,    // OK_IMM: an address (a symbol's, plus a constant)
+}
+
+/// An operand as the backend placed it (or check.ax's stand-in), which an
+/// architecture's `render` writes in its assembly syntax.
+pub struct ROp {
+    kind: u8,  // OK_REG (reg), OK_MEM, OK_IMM (k, or name + k when sym)
+    reg: i32,
+    bits: u32,  // the value's width
+    fp: bool,
+    base: i32,  // OK_MEM: the base register (-1: none: rip-relative to `name` on x86-64), index, scale, disp
+    index: i32,
+    scale: u8,
+    disp: i64,
+    seg: u8,  // x86-64: a segment override (0x64 fs ...)
+    k: i64,
+    name: []u8,  // a symbol: OK_IMM's (sym), or OK_MEM's (base -1)
+    sym: bool,
+}
+
+pub fn rop_reg(r: i32, bits: u32, fp: bool) ROp {
+    return ROp.{ kind: OK_REG, reg: r, bits: bits, fp: fp, base: -1, index: -1, scale: 1, disp: 0, seg: 0, k: 0,
+                 name: "", sym: false };
+}
+
+// Template pieces (Piece.kind)
+pub const PK_TEXT: u8 = 0;
+pub const PK_OP: u8 = 1;      // operand op, with modifier `mod` (0: none)
+pub const PK_LABEL: u8 = 2;   // label op (from 0)
+pub const PK_UNIQUE: u8 = 3;  // %=
+
+pub struct Piece {
+    kind: u8,
+    mod: u8,
+    op: i32,
+    text: []u8,  // PK_TEXT; for a reference by name before it is resolved, the name
+}
+
+/// An asm statement once analyzed (or file-scope asm, which has only text).
+pub struct Blob {
+    arch: i32,
+    basic: bool,  // a basic asm: the template is its text, with no references
+    text: []u8,   // a basic asm's text
+    pieces: []Piece,
+    ops: []Op,
+    nlabels: i32,
+    clobber: u64,  // the registers the template changes besides its outputs
+    cc: bool,      // "cc": the flags (always assumed on x86-64)
+    memory: bool,  // "memory"
+    volatile_: bool,
+    goto_: bool,
+    loc: []u8,  // "file:line", for the messages of the backends
+}
+
+/// A list of blobs in permanent memory (the IR's lifetime: the front end's
+/// own memory is given back before the backends run).
+pub struct Blobs {
+    data: *mut *mut Blob,
+    cap: usize,
+    len: usize,
+
+    pub fn push(self: *mut Blobs, b: *mut Blob) void {
+        if self.len == self.cap {
+            let n = @max(self.cap * 2, 16);
+            let ys = u.perm_newn.[*mut Blob](n);
+            let xs = @slice_from_ptr(self.data, self.len);
+            for k in 0..self.len {
+                ys[k] = xs[k];
+            }
+            self.data = &mut ys[0];
+            self.cap = n;
+        }
+        let xs = @slice_from_ptr(self.data, self.len + 1);
+        xs[self.len] = b;
+        self.len += 1;
+    }
+
+    pub fn items(self: *Blobs) []mut *mut Blob {
+        return @slice_from_ptr(self.data, self.len);
+    }
+
+    pub fn clear(self: *mut Blobs) void {
+        self.len = 0;
+    }
+}
+
+/// The asm statements of the program being compiled (IN_ASM's first operand
+/// indexes it).
+pub let mut blobs: Blobs = Blobs.{ data: @ptr_from_int(*mut *mut Blob, 0), cap: 0, len: 0 };
+
+/// The file-scope asm of the program's units, in order: each is assembled
+/// into the object (its sections and symbols: asm/obj.ax).
+pub let mut toplevel: Blobs = Blobs.{ data: @ptr_from_int(*mut *mut Blob, 0), cap: 0, len: 0 };
+
+/// Adds blob b to the table: its index.
+pub fn add(b: *mut Blob) i32 {
+    blobs.push(b);
+    return @int_cast(i32, blobs.len - 1);
+}
+
+pub fn blob(k: i64) *mut Blob {
+    return blobs.items()[@int_cast(usize, k)];
+}
+
+// -----------------------------------------------------------------------------
+// Constraints
+// -----------------------------------------------------------------------------
+/// A constraint, parsed: what its first alternative allows (an operand of
+/// several alternatives, "r,m", takes its first).
+pub struct Con {
+    ok: bool,
+    msg: []u8,  // why not, when not ok
+    output: bool,
+    inout: bool,  // '+'
+    early: bool,  // '&'
+    reg: bool,    // a register of class cls ...
+    cls: u8,
+    fixed: i32,   // ... that register (x86-64 a, b, c, d, S, D), or -1
+    subset: u64,  // ... one of these registers (x86-64 Q; AArch64 x and y), or 0 (any of the class)
+    mem: bool,    // memory
+    mem_q: bool,  // memory addressed by one base register (AArch64 Q)
+    imm: bool,    // an integer constant (imm_lo..imm_hi), and for sym_ok an address constant
+    imm_lo: i64,
+    imm_hi: i64,
+    sym_ok: bool,
+    imm_letter: u8,  // the letter that asked for the constant (I, K, ...), for messages
+    tie: i32,        // a matching constraint: the operand number, or -1
+    tie_name: []u8,  // a matching constraint by name ([name])
+}
+
+fn no_con(msg: []u8) Con {
+    let mut c = new_con();
+    c.ok = false;
+    c.msg = msg;
+    return c;
+}
+
+fn new_con() Con {
+    return Con.{ ok: true, msg: "", output: false, inout: false, early: false, reg: false, cls: CL_GPR, fixed: -1,
+                 subset: 0, mem: false, mem_q: false, imm: false, imm_lo: 0, imm_hi: 0, sym_ok: false, imm_letter: 0,
+                 tie: -1, tie_name: "" };
+}
+
+fn set_imm(c: *mut Con, lo: i64, hi: i64, which: u8) void {
+    if c.imm and (c.imm_letter == 0) {
+        return;  // (an i or n already allows any constant)
+    }
+    c.imm = true;
+    c.imm_lo = lo;
+    c.imm_hi = hi;
+    c.imm_letter = which;
+}
+
+const I64_MIN: i64 = -9223372036854775807 - 1;
+const I64_MAX: i64 = 9223372036854775807;
+
+/// Parses constraint s of an operand for architecture arch (an output if
+/// `output`): its modifiers (`=`, `+`, `&`, `%`) and its first
+/// alternative's letters.
+pub fn constraint(arch: i32, s: []u8, output: bool) Con {
+    let mut c = new_con();
+    let x86 = arch == tg.ARCH_X64;
+    let mut i: usize = 0;
+    let mut seen = false;
+    // the modifiers first (GCC allows `=` and `+` only first; `&` and `%` anywhere)
+    while i < s.len {
+        let ch = s[i];
+        if (ch == '=') or (ch == '+') {
+            if i != 0 {
+                return no_con("'=' and '+' must begin the constraint");
+            }
+            c.output = true;
+            c.inout = ch == '+';
+        } else if ch == '&' {
+            c.early = true;
+        } else if (ch == '%') or (ch == '*') or (ch == '?') or (ch == '!') or (ch == ' ') or (ch == '\t') {
+            // (commutative operands, and the weights of alternatives: no effect here)
+        } else if ch == '#' {
+            // (what follows is ignored up to the next alternative)
+            while (i < s.len) and (s[i] != ',') {
+                i += 1;
+            }
+            break;
+        } else if ch == ',' {
+            if seen {
+                break;  // (the first alternative only)
+            }
+        } else if ch == '[' {
+            let st = i + 1;
+            while (i < s.len) and (s[i] != ']') {
+                i += 1;
+            }
+            if i >= s.len {
+                return no_con("an unterminated '[' in the constraint");
+            }
+            c.tie_name = u.dup(s[st..i]);
+            seen = true;
+        } else if u.is_digit(ch) {
+            let mut n: i32 = 0;
+            while (i < s.len) and u.is_digit(s[i]) {
+                n = (n * 10) + @as(i32, s[i] - '0');
+                i += 1;
+            }
+            i -= 1;
+            c.tie = n;
+            seen = true;
+        } else {
+            let ok = letter(&mut c, arch, ch, x86);
+            if not ok.ok {
+                return ok;
+            }
+            seen = true;
+        }
+        i += 1;
+    }
+    if c.output != output {
+        if output {
+            return no_con("an output's constraint must begin with '=' or '+'");
+        }
+        return no_con("an input's constraint cannot have '=' or '+'");
+    }
+    if c.early and not output {
+        return no_con("'&' (early clobber) is for outputs");
+    }
+    if ((c.tie >= 0) or (c.tie_name.len > 0)) and output {
+        return no_con("an output cannot have a matching constraint");
+    }
+    if not seen {
+        return no_con("the constraint allows no operand");
+    }
+    if output and c.imm and not c.reg and not c.mem {
+        return no_con("an output cannot be a constant");
+    }
+    return c;
+}
+
+// One constraint letter (its effect on c), or why it is not allowed.
+fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
+    let ok = new_con();
+    // the letters every target has
+    if (ch == 'r') or ((ch == 'g') or (ch == 'X')) {
+        c.reg = true;
+        if (ch == 'g') or (ch == 'X') {
+            c.mem = true;
+            set_imm(c, I64_MIN, I64_MAX, 0);
+            c.sym_ok = true;
+        }
+        return ok;
+    }
+    if (ch == 'm') or ((ch == 'o') or (ch == 'V')) {
+        c.mem = true;
+        return ok;
+    }
+    if (ch == 'i') or (ch == 'n') or (ch == 's') {
+        set_imm(c, I64_MIN, I64_MAX, 0);
+        c.sym_ok = ch != 'n';
+        return ok;
+    }
+    if x86 {
+        // x86-64 (GCC's machine constraints for i386 in 64-bit mode)
+        let fixed = "abcdSD";
+        let regs: [6]i32 = [0, 3, 1, 2, 6, 7];  // rax rbx rcx rdx rsi rdi
+        for k in 0..fixed.len {
+            if ch == fixed[k] {
+                c.reg = true;
+                c.fixed = regs[k];
+                return ok;
+            }
+        }
+        if (ch == 'q') or (ch == 'R') or (ch == 'l') {
+            c.reg = true;  // (in 64-bit mode every general register has a low byte)
+            if ch == 'R' {
+                c.subset = 0xcf;  // the legacy registers: rax rcx rdx rbx rsi rdi
+            }
+            return ok;
+        }
+        if ch == 'Q' {
+            c.reg = true;
+            c.subset = 0x0f;  // rax rcx rdx rbx: those with a high byte (%h)
+            return ok;
+        }
+        if (ch == 'x') or (ch == 'v') or (ch == 'Y') {
+            c.reg = true;
+            c.cls = CL_VEC;
+            return ok;
+        }
+        if ch == 'U' {
+            c.reg = true;
+            c.subset = 0x0fc7;  // the registers calls clobber: rax rcx rdx rsi rdi r8-r11
+            return ok;
+        }
+        if ch == 'I' {
+            set_imm(c, 0, 31, ch);
+            return ok;
+        }
+        if ch == 'J' {
+            set_imm(c, 0, 63, ch);
+            return ok;
+        }
+        if ch == 'K' {
+            set_imm(c, -128, 127, ch);
+            return ok;
+        }
+        if ch == 'M' {
+            set_imm(c, 0, 3, ch);
+            return ok;
+        }
+        if ch == 'N' {
+            set_imm(c, 0, 255, ch);
+            return ok;
+        }
+        if ch == 'O' {
+            set_imm(c, 0, 127, ch);
+            return ok;
+        }
+        if ch == 'e' {
+            set_imm(c, -2147483648, 2147483647, ch);
+            c.sym_ok = true;
+            return ok;
+        }
+        if ch == 'Z' {
+            set_imm(c, 0, 4294967295, ch);
+            c.sym_ok = true;
+            return ok;
+        }
+        if (ch == 'A') or (ch == 't') or (ch == 'u') or (ch == 'f') or (ch == 'y') or (ch == 'k') {
+            return no_con(u.f1("the constraint '%s' (x87, MMX, mask or register-pair operands) is not supported",
+                               ch_text(ch)));
+        }
+        return no_con(u.f1("'%s' is not a constraint of x86-64", ch_text(ch)));
+    }
+    if arch == tg.ARCH_A64 {
+        if ch == 'w' {
+            c.reg = true;
+            c.cls = CL_VEC;
+            return ok;
+        }
+        if ch == 'x' {
+            c.reg = true;
+            c.cls = CL_VEC;
+            c.subset = 0xffff;  // v0-v15 (as indexed elements of 16-bit lanes need)
+            return ok;
+        }
+        if ch == 'y' {
+            c.reg = true;
+            c.cls = CL_VEC;
+            c.subset = 0xff;  // v0-v7
+            return ok;
+        }
+        if ch == 'Q' {
+            c.mem = true;
+            c.mem_q = true;
+            return ok;
+        }
+        if ch == 'I' {
+            set_imm(c, 0, 4095, ch);  // an add's immediate (also shifted: checked when used)
+            return ok;
+        }
+        if ch == 'J' {
+            set_imm(c, -4095, 0, ch);
+            return ok;
+        }
+        if (ch == 'K') or (ch == 'L') or (ch == 'M') or (ch == 'N') {
+            set_imm(c, I64_MIN, I64_MAX, ch);  // (logical and move immediates: the assembler checks them)
+            return ok;
+        }
+        if ch == 'Z' {
+            set_imm(c, 0, 0, ch);
+            return ok;
+        }
+        if (ch == 'S') or (ch == 'U') {
+            if ch == 'S' {
+                set_imm(c, I64_MIN, I64_MAX, ch);
+                c.sym_ok = true;
+                return ok;
+            }
+        }
+        return no_con(u.f1("'%s' is not a constraint of AArch64 supported here", ch_text(ch)));
+    }
+    return no_con("inline assembly is not supported on this target");
+}
+
+pub fn ch_text(ch: u8) []u8 {
+    let b = u.newn.[u8](1);
+    b[0] = ch;
+    return b[0..1];
+}
+
+// -----------------------------------------------------------------------------
+// Registers
+// -----------------------------------------------------------------------------
+/// A register named by a clobber or an explicit register variable: its
+/// number, class and width (bits: 8 for al, 64 for rax ...), or reg -1.
+pub struct RegName {
+    reg: i32,
+    cls: u8,
+    bits: u32,
+    hi8: bool,  // x86-64 ah, bh, ch, dh
+}
+
+fn rn(reg: i32, cls: u8, bits: u32) RegName {
+    return RegName.{ reg: reg, cls: cls, bits: bits, hi8: false };
+}
+
+let X86_64: [16][]u8 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+                        "r14", "r15"];
+let X86_32: [16][]u8 = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d",
+                        "r13d", "r14d", "r15d"];
+let X86_16: [16][]u8 = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w",
+                        "r14w", "r15w"];
+let X86_8: [16][]u8 = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b",
+                       "r14b", "r15b"];
+let X86_8H: [4][]u8 = ["ah", "ch", "dh", "bh"];
+
+/// The x86-64 register named `n` (without '%').
+pub fn x86_reg(n: []u8) RegName {
+    for k in @as(usize, 0)..16 {
+        let r = @int_cast(i32, k);
+        if u.str_eq(n, X86_64[k]) {
+            return rn(r, CL_GPR, 64);
+        }
+        if u.str_eq(n, X86_32[k]) {
+            return rn(r, CL_GPR, 32);
+        }
+        if u.str_eq(n, X86_16[k]) {
+            return rn(r, CL_GPR, 16);
+        }
+        if u.str_eq(n, X86_8[k]) {
+            return rn(r, CL_GPR, 8);
+        }
+    }
+    for k in @as(usize, 0)..4 {
+        if u.str_eq(n, X86_8H[k]) {
+            let mut x = rn(@int_cast(i32, k), CL_GPR, 8);
+            x.hi8 = true;
+            return x;
+        }
+    }
+    if u.starts(n, "xmm") and (n.len >= 4) and (n.len <= 5) {
+        let k = num(n[3..]);
+        if (k >= 0) and (k < 16) {
+            return rn(16 + @int_cast(i32, k), CL_VEC, 128);
+        }
+    }
+    return rn(-1, CL_GPR, 0);
+}
+
+/// The text of x86-64 register r at a width (bits; hi8: the high byte).
+pub fn x86_reg_text(r: i32, bits: u32, hi8: bool) []u8 {
+    if r >= 16 {
+        return u.cat2("xmm", u.idec(r - 16));
+    }
+    let k = @int_cast(usize, r & 15);
+    if hi8 {
+        return X86_8H[k & 3];
+    }
+    if bits == 8 {
+        return X86_8[k];
+    }
+    if bits == 16 {
+        return X86_16[k];
+    }
+    if bits == 32 {
+        return X86_32[k];
+    }
+    return X86_64[k];
+}
+
+// A decimal number (all of s), or -1.
+pub fn num(s: []u8) i64 {
+    if (s.len == 0) or (s.len > 9) {
+        return -1;
+    }
+    let mut v: i64 = 0;
+    for ch in s {
+        if not u.is_digit(ch) {
+            return -1;
+        }
+        v = (v * 10) + @as(i64, ch - '0');
+    }
+    if (s.len > 1) and (s[0] == '0') {
+        return -1;
+    }
+    return v;
+}
+
+/// The AArch64 register named `n`: x0-x30, w0-w30 (and fp, lr, x29, x30),
+/// v0-v31 with b, h, s, d, q views.
+pub fn a64_reg(n: []u8) RegName {
+    if u.str_eq(n, "fp") {
+        return rn(29, CL_GPR, 64);
+    }
+    if u.str_eq(n, "lr") {
+        return rn(30, CL_GPR, 64);
+    }
+    if u.str_eq(n, "sp") {
+        return rn(31, CL_GPR, 64);
+    }
+    if n.len < 2 {
+        return rn(-1, CL_GPR, 0);
+    }
+    let k = num(n[1..]);
+    if (k < 0) or (k > 31) {
+        return rn(-1, CL_GPR, 0);
+    }
+    let r = @int_cast(i32, k);
+    let c = n[0];
+    if (c == 'x') and (k < 31) {
+        return rn(r, CL_GPR, 64);
+    }
+    if (c == 'w') and (k < 31) {
+        return rn(r, CL_GPR, 32);
+    }
+    let views = "bhsdqv";
+    let widths: [6]u32 = [8, 16, 32, 64, 128, 128];
+    for j in 0..views.len {
+        if c == views[j] {
+            return rn(32 + r, CL_VEC, widths[j]);
+        }
+    }
+    return rn(-1, CL_GPR, 0);
+}
+
+/// A register named by a clobber or a register variable on arch (a leading
+/// '%' allowed on x86-64).
+pub fn reg_named(arch: i32, n0: []u8) RegName {
+    if arch == tg.ARCH_X64 {
+        let mut n = n0;
+        if (n.len > 0) and (n[0] == '%') {
+            n = n[1..];
+        }
+        return x86_reg(n);
+    }
+    if arch == tg.ARCH_A64 {
+        return a64_reg(n0);
+    }
+    return rn(-1, CL_GPR, 0);
+}
+
+/// Is the clobber named n one of those that name no register: "cc" and
+/// "memory", and on x86-64 the flags' other names and the x87's registers
+/// (which this compiler never uses)?
+pub fn clobber_kind(arch: i32, n: []u8) i32 {
+    if u.str_eq(n, "memory") {
+        return 2;
+    }
+    if u.str_eq(n, "cc") {
+        return 1;
+    }
+    if arch == tg.ARCH_X64 {
+        let others = ["flags", "eflags", "rflags", "dirflag", "fpsr", "fpcr", "st", "st(0)", "st(1)", "st(2)", "st(3)",
+                      "st(4)", "st(5)", "st(6)", "st(7)", "mm0", "mm1", "mm2", "mm3", "mm4", "mm5", "mm6", "mm7"];
+        for o in others {
+            if u.str_eq(n, o) {
+                return 1;
+            }
+        }
+    }
+    if arch == tg.ARCH_A64 {
+        if u.str_eq(n, "nzcv") or u.str_eq(n, "fpsr") or u.str_eq(n, "fpcr") {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// Why register r cannot be clobbered or pinned on arch (the stack and
+/// frame pointers, and AArch64's reserved x18 and the encoder's x16 and
+/// x17 as operands), or "" if it can.
+pub fn reg_reserved(arch: i32, r: i32, pinned: bool) []u8 {
+    if arch == tg.ARCH_X64 {
+        if r == 4 {
+            return "the stack pointer";
+        }
+        if r == 5 {
+            return "the frame pointer (rbp)";
+        }
+        return "";
+    }
+    if r == 31 {
+        return "the stack pointer";
+    }
+    if r == 29 {
+        return "the frame pointer (x29)";
+    }
+    if (r == 18) and (tg.is_darwin() or pinned) {
+        return "the platform register (x18)";
+    }
+    if ((r == 16) or (r == 17)) and pinned {
+        return "a scratch register of the code generator (x16, x17)";
+    }
+    return "";
+}
+
+// -----------------------------------------------------------------------------
+// Templates
+// -----------------------------------------------------------------------------
+/// A template's pieces, or an error (msg) in `err`. On x86-64 the
+/// dialect alternatives `{att|intel}` give their first (the AT&T syntax),
+/// and `%{`, `%|`, `%}` are those characters.
+pub fn parse_template(arch: i32, t: []u8, err: *mut []u8) []Piece {
+    let mut ps = u.List.[Piece].empty();
+    let mut b = u.Buf.init();
+    let x86 = arch == tg.ARCH_X64;
+    let mut alt: i32 = 0;  // 0: outside braces, 1: in the first alternative, 2: in a later one
+    let mut i: usize = 0;
+    while i < t.len {
+        let ch = t[i];
+        if x86 and (ch == '{') and (alt == 0) {
+            alt = 1;
+            i += 1;
+            continue;
+        }
+        if x86 and (ch == '|') and (alt != 0) {
+            alt = 2;
+            i += 1;
+            continue;
+        }
+        if x86 and (ch == '}') and (alt != 0) {
+            alt = 0;
+            i += 1;
+            continue;
+        }
+        if ch != '%' {
+            if alt != 2 {
+                b.c(ch);
+            }
+            i += 1;
+            continue;
+        }
+        if (i + 1) >= t.len {
+            err.* = "a '%' at the end of the template";
+            return ps.items();
+        }
+        let n = t[i + 1];
+        if (n == '%') or (x86 and ((n == '{') or (n == '|') or (n == '}'))) {
+            if alt != 2 {
+                b.c(n);
+            }
+            i += 2;
+            continue;
+        }
+        let mut p = Piece.{ kind: PK_OP, mod: 0, op: -1, text: "" };
+        if n == '=' {
+            p.kind = PK_UNIQUE;
+            i += 2;
+        } else {
+            let mut j = i + 1;
+            if u.is_alnum(t[j]) and not u.is_digit(t[j]) {
+                p.mod = t[j];
+                j += 1;
+            }
+            if (j < t.len) and (t[j] == '[') {
+                let st = j + 1;
+                while (j < t.len) and (t[j] != ']') {
+                    j += 1;
+                }
+                if j >= t.len {
+                    err.* = "an unterminated '%[' in the template";
+                    return ps.items();
+                }
+                p.text = u.dup(t[st..j]);
+                j += 1;
+            } else if (j < t.len) and u.is_digit(t[j]) {
+                let mut v: i32 = 0;
+                while (j < t.len) and u.is_digit(t[j]) {
+                    v = (v * 10) + @as(i32, t[j] - '0');
+                    if v > 100000 {
+                        v = 100000;
+                    }
+                    j += 1;
+                }
+                p.op = v;
+            } else {
+                err.* = u.f1("'%%%s' in the template is not an operand reference (write '%%%%' for a '%%')",
+                             ch_text(t[i + 1]));
+                return ps.items();
+            }
+            if p.mod == 'l' {
+                p.kind = PK_LABEL;
+                p.mod = 0;
+            }
+            i = j;
+        }
+        if alt != 2 {
+            if b.len() > 0 {
+                ps.push(Piece.{ kind: PK_TEXT, mod: 0, op: -1, text: b.done() });
+                b = u.Buf.init();
+            }
+            ps.push(p);
+        }
+    }
+    if alt != 0 {
+        err.* = "a '{' without its '}' in the template";
+    }
+    if b.len() > 0 {
+        ps.push(Piece.{ kind: PK_TEXT, mod: 0, op: -1, text: b.done() });
+    }
+    return ps.items();
+}
+
+/// Is `m` an operand modifier of arch that this implementation knows?
+pub fn modifier_ok(arch: i32, m: u8) bool {
+    if m == 0 {
+        return true;
+    }
+    if arch == tg.ARCH_X64 {
+        return u.find("abwkqhcnPpVzxAHt", m) >= 0;
+    }
+    return u.find("wxbhsdqcnZ", m) >= 0;
+}
+
+/// The text of a blob's template with each reference replaced by what
+/// `render` makes of it (operand k, modifier), labels by `label(k)` and %=
+/// by `unique`. A basic asm's text is itself.
+pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, unique: u64) []u8 {
+    if b.basic {
+        return b.text;
+    }
+    let mut out = u.Buf.init();
+    for p in b.pieces {
+        if p.kind == PK_TEXT {
+            out.s(p.text);
+        } else if p.kind == PK_OP {
+            out.s(render(b, @int_cast(usize, p.op), p.mod));
+        } else if p.kind == PK_LABEL {
+            out.s(label(p.op));
+        } else {
+            out.s(u.udec(unique));
+        }
+    }
+    return out.done();
+}

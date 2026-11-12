@@ -38,6 +38,18 @@ lists the diagnostics.
   No Microsoft extensions. Pragmas are read in every mode (`cpp.ax`; what the later phases
   need is in `cpragma.ax`). Identifiers the compiler needs for its own headers are in the
   reserved namespace (`__builtin_va_list`, `__axiom_int64`, ...).
+- **Inline assembly** (GNU dialects; x86-64 and AArch64): an asm statement is the IR's
+  opaque intrinsic `IN_ASM`, whose first operand indexes its description
+  (`asm/inline.ax`: the template's pieces, each operand's kind, class, register, width
+  and tie, the clobbers); outputs in registers go through temporaries. The backends
+  (`x64.ax`, `a64.ax`: `gen_asm`) make one machine instruction of it whose register
+  operands the allocator places (pinned ones copied into and out of their registers,
+  outputs and clobbers written early), then render the operands into the template and
+  assemble it (`asm/x64.ax`, `asm/a64.ax`) into the function's code at its place.
+  Semantic analysis assembles each template with stand-in operands for its
+  diagnostics. File-scope asm and naked functions are assembled into the object's
+  sections (`asm/obj.ax`). `c/run/asm_table_*.c` check thousands of instruction
+  encodings.
 - **Atomics and thread storage**: `_Atomic` types (csema_atomic.ax) are
   accessed atomically (cgen_atomic.ax: lock-free for 1, 2, 4 and 8 bytes, a
   table of spinlocks otherwise; every order sequentially consistent);
@@ -107,6 +119,12 @@ cmd/axiom/src/c/ctypes.ax   C types, layout, conversions
 cmd/axiom/src/c/cconst.ax   constant expressions                        (+ ccomplex.ax)
 cmd/axiom/src/c/cldbl.ax    long double constants wider than double: read exactly, folded
 cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree (csema_atomic.ax: atomic types, <stdatomic.h>)
+cmd/axiom/src/c/csema_asm.ax   asm statements (a GNU dialect): constraints, operands, clobbers, references
+cmd/axiom/src/c/cgen_asm.ax    their IR (ir.IN_ASM), naked functions
+cmd/axiom/src/asm/          inline assembly: inline.ax (the IN_ASM description shared with the backends),
+                            core.ax (statements, expressions, labels, sections, directives, passes),
+                            x64.ax and a64.ax (the assemblers), check.ax (stand-in operands),
+                            obj.ax (file-scope asm into the object)
 cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conventions
                             (cgen_complex.ax: complex arithmetic; cgen_ld.ax: long double
                             wider than double; cgen_atomic.ax: atomic operations;

@@ -245,7 +245,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
 | `C3300` | A call of `setjmp` (`<setjmp.h>`) in a program for a WebAssembly target, which cannot return to a frame. Reported by `build`. |
 | `C3301` | The address of `setjmp`'s function (`__axc_setjmp`) taken: it can only be called, so that the compiler knows the function calling it. Reported by `build`. |
-| `C3901` | A feature that this implementation does not support: `_Imaginary` (the imaginary types), and (C23) the decimal floating types; in a GNU dialect inline assembly, `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), explicit register variables, `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
+| `C3901` | A feature that this implementation does not support: `_Imaginary` (the imaginary types), and (C23) the decimal floating types; in a GNU dialect inline assembly on WebAssembly targets, constraints it does not know (x87, MMX, mask registers), `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
 
 ### The GNU dialects
 
@@ -253,6 +253,8 @@ array checks and the builtin checks were numbered apart. The message says which.
 |---|---|
 | `C3090` | An invalid use of a GNU extension: a statement expression or a label's address outside a function, an asm label on an automatic object or after a use, two asm labels for one entity, weak or alias without linkage, an alias whose target the unit does not define, a section for an automatic object, a constructor or destructor with parameters, a cleanup on an object that is not automatic or with a function of more than one parameter, `__builtin_frame_address` or `__builtin_return_address` of a level other than 0. |
 | `C3091` | A call of a function declared with the attribute `error("message")`. |
+| `C3096` | An asm statement or file-scope asm the rules reject: a constraint (an output's without `=` or `+`, a matching constraint that names no output in a register, a constant out of its letter's range or not a constant), an operand (of a type no register holds, two of one name, a memory operand of a bit-field or a `register` object), a clobber that is not a register or is the stack or frame pointer, an operand in a clobbered register or two in one register, a template reference to no operand or label, file-scope asm with operands, an explicit register variable of no register of the target, a naked function's body that is not asm statements without operands. |
+| `C3097` | The assembler rejects an asm statement's template (with stand-in operands) or file-scope asm: an instruction, operand form or directive that is not supported or does not exist, an immediate out of range; the message names it, and its line in the text. |
 
 ## C4xxx: warnings
 

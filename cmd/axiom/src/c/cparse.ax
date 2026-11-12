@@ -815,18 +815,164 @@ fn asm_label(P: *mut Parser, d: *mut cast.Declarator) void {
     d.asm_span = span_from(P, sp);
 }
 
-// An `asm` statement or file-scope `asm(...)` (a GNU dialect): not
-// supported (C3901); skipped to its ';'.
-fn asm_statement(P: *mut Parser) void {
+// A string literal without an encoding prefix (an asm template, constraint
+// or clobber), as bytes; syntax error if there is none.
+fn asm_string(P: *mut Parser, what: []u8, out: *mut []u8, sp: *mut u.Span) bool {
+    let t = cur(P);
+    if (t.kind != ct.T_STRING) or (t.prefix != ct.ENC_NONE) {
+        syntax(P, what);
+        return false;
+    }
+    _ = advance(P);
+    let mut b = u.Buf.init();
+    for x in t.units {
+        b.c(@truncate(u8, x));
+    }
+    out.* = b.done();
+    sp.* = t.span;
+    return true;
+}
+
+// The next ':' of an asm statement: a C23 '::' is two of them (the second
+// left in place, as `kept`).
+fn asm_colon(P: *mut Parser, kept: *mut bool) bool {
+    if kept.* {
+        kept.* = false;
+        return true;
+    }
+    if at_p(P, ct.P_COLONCOLON) {
+        _ = advance(P);
+        kept.* = true;
+        return true;
+    }
+    return accept_p(P, ct.P_COLON);
+}
+
+// Is the next token where an asm statement's section ends (':' or ')')?
+fn asm_section_end(P: *mut Parser, kept: bool) bool {
+    return kept or at_p(P, ct.P_COLON) or at_p(P, ct.P_COLONCOLON) or at_p(P, ct.P_RPAREN);
+}
+
+// The operands of one section of an extended asm: `[name] "constraint" (e)`, ...
+fn asm_operands(P: *mut Parser, out: *mut u.List.[*mut cast.AsmOperand], kept: bool) void {
+    if asm_section_end(P, kept) {
+        return;
+    }
+    loop {
+        let o = u.new.[cast.AsmOperand]();
+        o.span = cur(P).span;
+        if accept_p(P, ct.P_LBRACKET) {
+            let t = cur(P);
+            if (t.kind == ct.T_IDENT) or (t.kind == ct.T_KEYWORD) {
+                o.name = t.text;
+                _ = advance(P);
+            } else {
+                syntax(P, "an operand name");
+            }
+            _ = expect_p(P, ct.P_RBRACKET);
+        }
+        if not asm_string(P, "a string literal (the operand's constraint)", &mut o.constraint, &mut o.cspan) {
+            return;
+        }
+        if not expect_p(P, ct.P_LPAREN) {
+            return;
+        }
+        o.e = parse_expr(P);
+        if not expect_p(P, ct.P_RPAREN) {
+            return;
+        }
+        o.span = span_from(P, o.span);
+        out.push(o);
+        if not accept_p(P, ct.P_COMMA) {
+            return;
+        }
+    }
+}
+
+// An `asm` statement or file-scope `asm(...)` (a GNU dialect), from `asm`
+// to its ';': `asm qualifiers ( template [: outputs [: inputs [: clobbers
+// [: labels]]]] )`. Nil after a syntax error (reported; skipped to ';').
+fn asm_statement(P: *mut Parser) *mut cast.Asm {
     let sp = advance(P).span;
-    error_at(sp, "C3901", "inline assembly ('asm' statements) is not supported");
-    while not at_eof(P) and not at_p(P, ct.P_LPAREN) and not at_p(P, ct.P_SEMI) {
+    let a = u.new.[cast.Asm]();
+    a.span = sp;
+    loop {
+        if at_kw(P, ct.K_VOLATILE) {
+            a.volatile_ = true;
+        } else if at_kw(P, ct.K_INLINE) {
+            a.inline_ = true;
+        } else if at_kw(P, ct.K_GOTO) {
+            a.goto_ = true;
+        } else {
+            break;
+        }
         _ = advance(P);
     }
-    if accept_p(P, ct.P_LPAREN) {
+    let mut ok = expect_p(P, ct.P_LPAREN) and
+                 asm_string(P, "a string literal (the assembly template)", &mut a.tmpl, &mut a.tspan);
+    a.basic = true;
+    let mut kept = false;
+    let mut section: i32 = 0;
+    while ok and (section < 4) and asm_colon(P, &mut kept) {
+        a.basic = false;
+        section += 1;
+        if section == 1 {
+            asm_operands(P, &mut a.outputs, kept);
+        } else if section == 2 {
+            asm_operands(P, &mut a.inputs, kept);
+        } else {
+            if asm_section_end(P, kept) {
+                continue;
+            }
+            loop {
+                let n = u.new.[cast.AsmName]();
+                if section == 3 {
+                    let mut nsp = cur(P).span;
+                    if not asm_string(P, "a string literal (a clobbered register)", &mut n.name, &mut nsp) {
+                        ok = false;
+                        break;
+                    }
+                    n.span = nsp;
+                    a.clobbers.push(n);
+                } else {
+                    let t = cur(P);
+                    if t.kind != ct.T_IDENT {
+                        syntax(P, "a label");
+                        ok = false;
+                        break;
+                    }
+                    _ = advance(P);
+                    n.name = t.text;
+                    n.span = t.span;
+                    a.labels.push(n);
+                }
+                if not accept_p(P, ct.P_COMMA) {
+                    break;
+                }
+            }
+        }
+    }
+    if ok and kept {
+        syntax(P, "')'");
+        ok = false;
+    }
+    if ok and not expect_p(P, ct.P_RPAREN) {
+        ok = false;
+    }
+    if not ok {
         skip_to_rparen(P);
+        _ = accept_p(P, ct.P_RPAREN);
+        _ = expect_p(P, ct.P_SEMI);
+        return u.nil.[cast.Asm]();
+    }
+    a.span = span_from(P, sp);
+    if a.goto_ and (section < 4) {
+        error_at(a.span, "C2001", "'asm goto' needs a list of labels after a fourth ':'");
+    } else if not a.goto_ and (section == 4) {
+        error_at(a.span, "C2001", "only 'asm goto' has a list of labels");
     }
     _ = expect_p(P, ct.P_SEMI);
+    return a;
 }
 
 // Attributes where none can appear: reported and skipped.
@@ -1511,8 +1657,13 @@ fn parse_declaration(P: *mut Parser, ctx: i32) *mut cast.Decl {
         _ = advance(P);
     }
     if at_kw(P, ct.K_ASM) and (ctx == CTX_FILE) {
-        asm_statement(P);
-        return u.nil.[cast.Decl]();
+        let a = asm_statement(P);
+        if u.isnil(a) {
+            return u.nil.[cast.Decl]();
+        }
+        let d = cast.new_decl(cast.DeclKind.ASM, a.span);
+        d.asm = a;
+        return d;
     }
     parse_attrs_g(P, &mut attrs);
     return parse_declaration_after(P, ctx, attrs, start);
@@ -2658,8 +2809,13 @@ fn statement_body(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt 
         return cast.new_stmt(cast.StmtKind.EXPR, span_from(P, start));
     }
     if at_kw(P, ct.K_ASM) {
-        asm_statement(P);
-        return cast.new_stmt(cast.StmtKind.EXPR, span_from(P, start));
+        let a = asm_statement(P);
+        if u.isnil(a) {
+            return cast.new_stmt(cast.StmtKind.EXPR, span_from(P, start));
+        }
+        let s = cast.new_stmt(cast.StmtKind.ASM, span_from(P, start));
+        s.asm = a;
+        return s;
     }
     if t.kind == ct.T_KEYWORD {
         let id = t.id;
