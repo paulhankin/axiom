@@ -609,11 +609,18 @@ class Gen:
             return ['%s%s = 0;' % (ind, v), '%sdo {' % ind] + body + ['%s} while (++%s < %d);' % (ind, v, k)]
         if r < 0.8:
             e, et = self.int_expr(env, 2)
+            # few cases, or more of them spread out and shifted (code
+            # generation makes tables, bit tests and searches of those)
             n = self.r.randint(2, 6)
-            lines = ['%sswitch ((int)(%s %% %d)) {' % (ind, self.conv_to(e, et, 'ullong'), n)]
+            scale, off = 1, 0
+            if self.chance(0.3):
+                n = self.r.randint(7, 40)
+                scale = self.r.choice([1, 1, 2, 3, 7, 1000])
+                off = self.r.choice([0, -5, 100, -2147000000, 2147000000])
+            lines = ['%sswitch ((int)(%s %% %d) + %d) {' % (ind, self.conv_to(e, et, 'ullong'), n * scale, off)]
             cases = self.r.sample(range(n), self.r.randint(1, n))
             for c in cases:
-                lines.append('%scase %d:;' % (ind, c))
+                lines.append('%scase %d:;' % (ind, c * scale + off))
                 lines += self.block(env, self.r.randint(0, 2), depth - 1, ind + '    ')
                 if self.chance(0.7):
                     lines.append('%s    break;' % ind)

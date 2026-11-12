@@ -1,0 +1,599 @@
+// =============================================================================
+// switches.ax - multiway branches: what the optimizer simplifies in an IR
+// switch (simplify), and how code generation lowers one (lower), the same
+// for both front ends and every target.
+//
+// A switch stays one instruction through the optimizer (whose passes see
+// its cases as edges: gvn.ax knows the value on a case edge, thread.ax
+// threads through one). Just before code generation (x64.ax, a64.ax,
+// wasm.ax: compile_func / gen_function) lower() turns each switch into
+// a search over clusters of its cases, sorted by their values as signed
+// integers of the switch's type:
+//
+//   - a range: consecutive values with one target (one value: `x == v`;
+//     several: `x - lo <=u hi - lo`, or one signed compare where the
+//     search already knows one side);
+//   - a jump table: a run of at least TABLE_MIN ranges, at least 40% of
+//     whose span (at most TABLE_MAX values) are cases (60% for fewer than
+//     8 values). It is a range check
+//     (unless the search knows the value is in the run) and a switch on
+//     `x - lo` marked ir.SW_TABLE, with a case for every value of the span,
+//     which the native backends make an indirect jump through a table of
+//     32-bit offsets and WebAssembly a br_table;
+//   - a bit test: cases within one 64-bit word's range going to at most
+//     three targets, enough of them to beat their compares (one target and
+//     at least three compares, two and five, three and six, a range counting
+//     two): a range check, then `(1 << (x - base)) & mask` per target.
+//
+// Jump tables are chosen first, by dynamic programming over the ranges for
+// the fewest clusters (greedily for more than DP_MAX ranges), then bit tests
+// greedily among the ranges left. The clusters are then searched by a
+// balanced binary tree of signed compares, down to at most LEAF clusters,
+// tested in ascending order: where the clusters at a leaf are all single
+// values they stay one small switch, which the backends compare in a
+// chain. The search keeps the interval the value is known to be in, which
+// drops range checks a table or bit test does not need and turns the last
+// range of an interval into a plain jump.
+//
+// A switch with at most LEAF cases is left as it is (a compare chain).
+// =============================================================================
+import "ir.ax" as ir;
+import "util.ax" as u;
+
+pub const TABLE_MIN: usize = 4;    // ranges a jump table covers at least
+pub const TABLE_MAX: u64 = 65536;  // values a jump table spans at most
+const LEAF: usize = 4;             // clusters tested in sequence at a leaf of the search
+const DP_MAX: usize = 2000;        // ranges the dynamic programming partitions at most
+const WORD: u64 = 64;              // the bits of a bit test's mask
+
+const K_RANGE: i32 = 0;
+const K_TABLE: i32 = 1;
+const K_BITS: i32 = 2;
+
+struct Case {
+    v: i64,  // the value, sign-extended from the switch's type
+    b: *mut ir.Block,
+}
+
+struct Cl {
+    kind: i32,
+    lo: i64,  // the values it covers: lo..hi (signed order)
+    hi: i64,
+    b: *mut ir.Block,  // K_RANGE: the target
+    first: usize,      // its cases: cs[first..last]
+    last: usize,
+}
+
+// -----------------------------------------------------------------------------
+// Simplification (opt.simplify_cfg)
+// -----------------------------------------------------------------------------
+
+/// Simplifies the switch t ending block b: cases that go where the default
+/// does are dropped (b stays a predecessor of that block: its phis keep
+/// their input), a switch left without cases becomes a jump and one with one
+/// case a compare and a conditional branch. (A switch on a constant is
+/// opt.simplify_cfg's.) True if anything changed.
+pub fn simplify(b: *mut ir.Block, t: *mut ir.Value) bool {
+    if (t.op != ir.OP_SWITCH) or ir.is_const(t.a) or (t.cv == ir.SW_TABLE) {
+        return false;
+    }
+    let mut any = false;
+    let mut n: usize = 0;
+    let bs = ir.bs_mut(t);
+    for k in 0..t.xs.len {
+        if bs.get(k) != t.t1 {
+            t.xs.set(n, t.xs.get(k));
+            bs.set(n, bs.get(k));
+            n += 1;
+        }
+    }
+    if n != t.xs.len {
+        t.xs.len = n;
+        bs.len = n;
+        any = true;
+    }
+    if n == 0 {
+        t.op = ir.OP_BR;
+        t.a = ir.vnil();
+        return true;
+    }
+    if (n == 1) and (t.a.ty.kind == ir.T_INT) and (t.a.ty.bits > 1) {
+        // (a bool's switch stays: compare chains test it as it is)
+        let c = ir.new_inst(b.fnp, ir.OP_ICMP, ir.t_int(1));
+        c.cv = @as(u64, @bit_cast(u32, ir.IntEQ));
+        c.a = t.a;
+        c.b = t.xs.get(0);
+        c.src = t.src;
+        ir.insert_before(t, c);
+        let target = bs.get(0);
+        t.xs.clear();
+        bs.clear();
+        t.op = ir.OP_CONDBR;
+        t.a = c;
+        t.t2 = t.t1;
+        t.t1 = target;
+        return true;
+    }
+    return any;
+}
+
+// -----------------------------------------------------------------------------
+// Lowering
+// -----------------------------------------------------------------------------
+
+let mut BD: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+let mut X: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);     // the value switched on
+let mut DFLT: *mut ir.Block = @ptr_from_int(*mut ir.Block, 0);  // where no case goes
+let mut CS: u.List.[Case] = u.List.[Case].{ data: @ptr_from_int(*mut Case, 0), len: 0, cap: 0 };  // the cases, sorted
+let mut MADE: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                cap: 0 };
+
+fn cmp_case(a: Case, b: Case) i32 {
+    if a.v < b.v {
+        return -1;
+    }
+    if a.v > b.v {
+        return 1;
+    }
+    return 0;
+}
+
+/// Lowers f's switches for code generation, as the header says.
+pub fn lower(f: *mut ir.Func) void {
+    let mut todo = u.List.[*mut ir.Block].empty();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_SWITCH) and (t.cv != ir.SW_TABLE) and (t.a.ty.kind == ir.T_INT) and
+           (t.a.ty.bits >= 8) and (t.a.ty.bits <= 64) and not ir.is_const(t.a) and (t.xs.len > LEAF) {
+            todo.push(b);
+        }
+        b = b.next;
+    }
+    if todo.len == 0 {
+        todo.deinit();
+        return;
+    }
+    if u.isnil(BD) {
+        BD = ir.new_builder();
+    }
+    F = f;
+    let src = ir.cur_src;
+    for k in 0..todo.len {
+        lower_one(todo.get(k));
+    }
+    ir.cur_src = src;
+    todo.deinit();
+}
+
+// The input of phi p from block `from` (nil: none).
+fn phi_input(p: *ir.Value, from: *mut ir.Block) *mut ir.Value {
+    for k in 0..ir.bs_of(p).len {
+        if ir.bs_of(p).get(k) == from {
+            return p.xs.get(k);
+        }
+    }
+    return ir.vnil();
+}
+
+fn lower_one(b: *mut ir.Block) void {
+    let t = ir.terminator(b);
+    X = t.a;
+    DFLT = t.t1;
+    ir.cur_src = t.src;
+    // the cases, sorted, without those going to the default and (keeping
+    // the first) repeated values
+    let n0 = t.xs.len;
+    CS.clear();
+    for _k in 0..n0 {
+        CS.push(Case.{ v: 0, b: DFLT });
+    }
+    let cs = CS.items();
+    let mut n: usize = 0;
+    for k in 0..n0 {
+        if ir.bs_of(t).get(k) != DFLT {
+            cs[n] = Case.{ v: ir.sval(t.xs.get(k)), b: ir.bs_of(t).get(k) };
+            n += 1;
+        }
+    }
+    u.sort.[Case](cs[0..n], cmp_case);  // (stable)
+    let mut m: usize = 0;
+    for k in 0..n {
+        if (m == 0) or (cs[k].v != cs[m - 1].v) {
+            cs[m] = cs[k];
+            m += 1;
+        }
+    }
+    CS.len = m;
+    // the old successors with phis (each once: is_old, by block id), to
+    // give the phis inputs from the new blocks and take b's away where b no
+    // longer goes
+    let nids = @int_cast(usize, F.nblocks);
+    let mut olds = u.List.[*mut ir.Block].empty();
+    let is_old = u.calloc_slice.[bool](nids + 1);
+    for k in 0..ir.succ_count(t) {
+        let s = ir.succ(t, k);
+        let id = @int_cast(usize, s.id);
+        if not is_old[id] and u.notnil(s.first) and (s.first.op == ir.OP_PHI) {
+            is_old[id] = true;
+            olds.push(s);
+        }
+    }
+    ir.remove_inst(t);
+    MADE.clear();
+    if m == 0 {
+        ir.at_end(BD, b);
+        ir.br(BD, DFLT);
+    } else {
+        let cl = clusters(CS.items());
+        let bits = X.ty.bits;
+        let mut tmin: i64 = 0 - 0x7fff_ffff_ffff_ffff - 1;
+        let mut tmax: i64 = 0x7fff_ffff_ffff_ffff;
+        if bits < 64 {
+            tmax = @bit_cast(i64, (@as(u64, 1) << @int_cast(u32, bits - 1)) - 1);
+            tmin = 0 - tmax - 1;
+        }
+        tree(b, cl.items(), tmin, tmax);
+        cl.deinit();
+    }
+    if olds.len > 0 {
+        // each new block's edges into them take b's input (once per block:
+        // seen holds 1 + the index of the last block that gave one)
+        let seen = u.calloc_slice.[usize](nids + 1);
+        for mi in 0..MADE.len {
+            let nb = MADE.get(mi);
+            let nt = ir.terminator(nb);
+            for k in 0..ir.succ_count(nt) {
+                let s = ir.succ(nt, k);
+                let id = @int_cast(usize, s.id);
+                if (id < nids) and is_old[id] and (seen[id] != mi + 1) {
+                    seen[id] = mi + 1;
+                    let mut p = s.first;
+                    while u.notnil(p) and (p.op == ir.OP_PHI) {
+                        let x = phi_input(p, b);
+                        if u.notnil(x) {
+                            ir.add_incoming(p, x, nb);
+                        }
+                        p = p.next;
+                    }
+                }
+            }
+        }
+        // b's own input stays where b still goes
+        let bt = ir.terminator(b);
+        for k in 0..ir.succ_count(bt) {
+            let id = @int_cast(usize, ir.succ(bt, k).id);
+            if id < nids {
+                seen[id] = 0x7fff_ffff;
+            }
+        }
+        for s in olds.items() {
+            if seen[@int_cast(usize, s.id)] != 0x7fff_ffff {
+                ir.remove_phi_input(s, b);
+            }
+        }
+        u.free_slice(seen);
+    }
+    u.free_slice(is_old);
+    olds.deinit();
+}
+
+fn new_block() *mut ir.Block {
+    let b = ir.append_block(F, "switch");
+    MADE.push(b);
+    return b;
+}
+
+// d = hi - lo, as an unsigned distance (it may not fit an i64)
+fn dist(lo: i64, hi: i64) u64 {
+    return @bit_cast(u64, hi) -% @bit_cast(u64, lo);
+}
+
+// The clusters of the sorted cases cs (the header says how).
+fn clusters(cs: []Case) u.List.[Cl] {
+    // ranges
+    let mut rs = u.List.[Cl].empty();
+    for k in 0..cs.len {
+        if (rs.len > 0) and (rs.get(rs.len - 1).b == cs[k].b) and (cs[k].v == rs.get(rs.len - 1).hi +% 1) {
+            let r = rs.at(rs.len - 1);
+            r.hi = cs[k].v;
+            r.last = k + 1;
+        } else {
+            rs.push(Cl.{ kind: K_RANGE, lo: cs[k].v, hi: cs[k].v, b: cs[k].b, first: k, last: k + 1 });
+        }
+    }
+    let nr = rs.len;
+    // jump tables: end[i] is the last range of the cluster starting at i
+    let end = u.newn.[usize](nr + 1);
+    for i in 0..nr {
+        end[i] = i;
+    }
+    if nr >= TABLE_MIN {
+        if nr <= DP_MAX {
+            // fewest clusters for rs[i..]: best[i]
+            let best = u.newn.[usize](nr + 1);
+            best[nr] = 0;
+            let mut i = nr;
+            while i > 0 {
+                i -= 1;
+                best[i] = 1 + best[i + 1];
+                let mut j = i + TABLE_MIN - 1;
+                while j < nr {
+                    let d = dist(rs.get(i).lo, rs.get(j).hi);
+                    if d >= TABLE_MAX {
+                        break;
+                    }
+                    if dense(rs.get(i).first, rs.get(j).last, d) and (1 + best[j + 1] <= best[i]) {
+                        best[i] = 1 + best[j + 1];
+                        end[i] = j;
+                    }
+                    j += 1;
+                }
+            }
+        } else {
+            let mut i: usize = 0;
+            while i < nr {
+                let mut j = i;
+                while (j + 1 < nr) and (dist(rs.get(i).lo, rs.get(j + 1).hi) < TABLE_MAX) and
+                      dense(rs.get(i).first, rs.get(j + 1).last, dist(rs.get(i).lo, rs.get(j + 1).hi)) {
+                    j += 1;
+                }
+                if j + 1 - i >= TABLE_MIN {
+                    end[i] = j;
+                }
+                i = j + 1;
+            }
+        }
+    }
+    let mut cl = u.List.[Cl].empty();
+    let mut i: usize = 0;
+    while i < nr {
+        let j = end[i];
+        if j + 1 - i >= TABLE_MIN {
+            cl.push(Cl.{ kind: K_TABLE, lo: rs.get(i).lo, hi: rs.get(j).hi, b: ir.bnil(), first: rs.get(i).first,
+                         last: rs.get(j).last });
+            i = j + 1;
+            continue;
+        }
+        // bit tests, among the ranges up to the next table
+        let mut stop = i + 1;
+        while (stop < nr) and (end[stop] + 1 - stop < TABLE_MIN) {
+            stop += 1;
+        }
+        let mut p = i;
+        while p < stop {
+            let q = bit_run(rs.items(), p, stop);
+            if q > p {
+                cl.push(Cl.{ kind: K_BITS, lo: rs.get(p).lo, hi: rs.get(q).hi, b: ir.bnil(), first: rs.get(p).first,
+                             last: rs.get(q).last });
+                p = q + 1;
+            } else {
+                cl.push(rs.get(p));
+                p += 1;
+            }
+        }
+        i = stop;
+    }
+    rs.deinit();
+    return cl;
+}
+
+// Are the values of the cases CS[first..last], spanning d + 1, dense
+// enough for a jump table: at least 40% of the span, or 60% for fewer than
+// 8 values (where a few compares cost about what the table's lookup does)?
+fn dense(first: usize, last: usize, d: u64) bool {
+    let n = @as(u64, last - first);
+    if n < 8 {
+        return n * 10 >= (d + 1) * 6;
+    }
+    return n * 10 >= (d + 1) * 4;
+}
+
+// The last range of a bit test starting at range p (before `stop`), or p
+// if none is worth it.
+fn bit_run(rs: []Cl, p: usize, stop: usize) usize {
+    let mut tg: [3]*mut ir.Block = [ir.bnil(), ir.bnil(), ir.bnil()];
+    let mut nt: usize = 0;
+    let mut ncmp: usize = 0;
+    let mut best = p;
+    let mut q = p;
+    while (q < stop) and (dist(rs[p].lo, rs[q].hi) < WORD) {
+        let mut known = false;
+        for k in 0..nt {
+            if tg[k] == rs[q].b {
+                known = true;
+            }
+        }
+        if not known {
+            if nt == 3 {
+                break;
+            }
+            tg[nt] = rs[q].b;
+            nt += 1;
+        }
+        ncmp += 2;
+        if rs[q].lo == rs[q].hi {
+            ncmp -= 1;
+        }
+        if ((nt == 1) and (ncmp >= 3)) or ((nt == 2) and (ncmp >= 5)) or ((nt == 3) and (ncmp >= 6)) {
+            best = q;
+        }
+        q += 1;
+    }
+    return best;
+}
+
+// The search over the clusters cl from block b, the value known to be in
+// lo..hi.
+fn tree(b: *mut ir.Block, cl: []Cl, lo: i64, hi: i64) void {
+    if cl.len <= LEAF {
+        leaf(b, cl, lo, hi);
+        return;
+    }
+    let mid = cl.len / 2;
+    let pivot = cl[mid].lo;
+    let lb = new_block();
+    let rb = new_block();
+    ir.at_end(BD, b);
+    let c = ir.icmp(BD, ir.IntSLT, X, ir.cint(X.ty, @bit_cast(u64, pivot)));
+    ir.condbr(BD, c, lb, rb);
+    tree(lb, cl[0..mid], lo, pivot -% 1);
+    tree(rb, cl[mid..cl.len], pivot, hi);
+}
+
+fn single(c: Cl) bool {
+    return (c.kind == K_RANGE) and (c.lo == c.hi);
+}
+
+// The tests of clusters cl in turn, from block b (the value in lo..hi).
+fn leaf(b: *mut ir.Block, cl: []Cl, lo0: i64, hi0: i64) void {
+    let mut lo = lo0;
+    let mut hi = hi0;
+    let mut all_single = cl.len >= 2;
+    for c in cl {
+        if not single(c) {
+            all_single = false;
+        }
+    }
+    if all_single and ((cl[0].lo > lo) or (cl[cl.len - 1].hi < hi)) {
+        // a chain of compares (a small switch)
+        ir.at_end(BD, b);
+        let sw = ir.switch_(BD, X, DFLT);
+        for c in cl {
+            ir.add_case(sw, ir.cint(X.ty, @bit_cast(u64, c.lo)), c.b);
+        }
+        return;
+    }
+    let mut cur = b;
+    for k in 0..cl.len {
+        let mut els = DFLT;
+        if k + 1 < cl.len {
+            els = new_block();
+        }
+        test_one(cur, cl[k], lo, hi, els);
+        // (failed: not in cl[k], which may narrow the interval)
+        if cl[k].lo <= lo {
+            lo = cl[k].hi +% 1;
+        }
+        cur = els;
+    }
+}
+
+// Block b tests cluster c (the value in lo..hi) and goes on to els if the
+// value is not in it.
+fn test_one(b: *mut ir.Block, c: Cl, lo: i64, hi: i64, els: *mut ir.Block) void {
+    ir.at_end(BD, b);
+    let ty = X.ty;
+    let inside = (c.lo <= lo) and (c.hi >= hi);  // (the value is in c's span)
+    if c.kind == K_RANGE {
+        if inside {
+            ir.br(BD, c.b);
+        } else if c.lo == c.hi {
+            ir.condbr(BD, ir.icmp(BD, ir.IntEQ, X, ir.cint(ty, @bit_cast(u64, c.lo))), c.b, els);
+        } else if c.lo <= lo {
+            ir.condbr(BD, ir.icmp(BD, ir.IntSLE, X, ir.cint(ty, @bit_cast(u64, c.hi))), c.b, els);
+        } else if c.hi >= hi {
+            ir.condbr(BD, ir.icmp(BD, ir.IntSGE, X, ir.cint(ty, @bit_cast(u64, c.lo))), c.b, els);
+        } else {
+            let d = ir.binop(BD, ir.OP_SUB, X, ir.cint(ty, @bit_cast(u64, c.lo)));
+            ir.condbr(BD, ir.icmp(BD, ir.IntULE, d, ir.cint(ty, dist(c.lo, c.hi))), c.b, els);
+        }
+        return;
+    }
+    if c.kind == K_TABLE {
+        let d = dist(c.lo, c.hi);
+        let mut idx = X;
+        if c.lo != 0 {
+            idx = ir.binop(BD, ir.OP_SUB, X, ir.cint(ty, @bit_cast(u64, c.lo)));
+        }
+        let mut tb = b;
+        if not inside {
+            tb = new_block();
+            ir.condbr(BD, ir.icmp(BD, ir.IntULE, idx, ir.cint(ty, d)), tb, els);
+            ir.at_end(BD, tb);
+        }
+        // a case for each value of the span (the holes: the default)
+        let sw = ir.switch_(BD, idx, CS.get(c.first).b);
+        sw.cv = ir.SW_TABLE;
+        let mut k = c.first;
+        for j in @as(u64, 0)..(d + 1) {
+            let v = c.lo +% @bit_cast(i64, j);
+            let mut s = DFLT;
+            if (k < c.last) and (CS.get(k).v == v) {
+                s = CS.get(k).b;
+                k += 1;
+            }
+            ir.add_case(sw, ir.cint(ty, j), s);
+        }
+        return;
+    }
+    // a bit test: base 0 when the cases are within the first word (the
+    // values below c.lo are no other cluster's: those before were tested
+    // already, those after are above)
+    let mut base = c.lo;
+    if (c.lo >= 0) and (c.hi < @bit_cast(i64, WORD)) {
+        base = 0;
+    }
+    let mut idx = X;
+    if base != 0 {
+        idx = ir.binop(BD, ir.OP_SUB, X, ir.cint(ty, @bit_cast(u64, base)));
+    }
+    let mut tb = b;
+    if not ((base <= lo) and (c.hi >= hi)) {
+        tb = new_block();
+        ir.condbr(BD, ir.icmp(BD, ir.IntULE, idx, ir.cint(ty, dist(base, c.hi))), tb, els);
+        ir.at_end(BD, tb);
+    }
+    let i64t = ir.t_int(64);
+    let mut wide = idx;
+    if ty.bits < 64 {
+        wide = ir.zext(BD, idx, i64t);
+    }
+    let bit = ir.binop(BD, ir.OP_SHL, ir.cint(i64t, 1), wide);
+    // the targets and their masks, the most cases first
+    let mut tg: [3]*mut ir.Block = [ir.bnil(), ir.bnil(), ir.bnil()];
+    let mut mk: [3]u64 = [0, 0, 0];
+    let mut cnt: [3]u32 = [0, 0, 0];
+    let mut nt: usize = 0;
+    for k in c.first..c.last {
+        let mut at = nt;
+        for j in 0..nt {
+            if tg[j] == CS.get(k).b {
+                at = j;
+            }
+        }
+        if at == nt {
+            tg[nt] = CS.get(k).b;
+            nt += 1;
+        }
+        mk[at] = mk[at] | (@as(u64, 1) << @truncate(u32, dist(base, CS.get(k).v)));
+        cnt[at] += 1;
+    }
+    for i in 0..nt {
+        for j in (i + 1)..nt {
+            if cnt[j] > cnt[i] {
+                let a = tg[i];
+                tg[i] = tg[j];
+                tg[j] = a;
+                let x = mk[i];
+                mk[i] = mk[j];
+                mk[j] = x;
+                let y = cnt[i];
+                cnt[i] = cnt[j];
+                cnt[j] = y;
+            }
+        }
+    }
+    let mut cur = tb;
+    for j in 0..nt {
+        let mut next = DFLT;
+        if j + 1 < nt {
+            next = new_block();
+        }
+        ir.at_end(BD, cur);
+        let hit = ir.binop(BD, ir.OP_AND, bit, ir.cint(i64t, mk[j]));
+        ir.condbr(BD, ir.icmp(BD, ir.IntNE, hit, ir.cint(i64t, 0)), tg[j], next);
+        cur = next;
+    }
+}
