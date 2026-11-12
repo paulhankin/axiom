@@ -4,9 +4,11 @@
 // Functions are visited bottom-up (callees before callers, by strongly
 // connected components of the call graph), so a callee is already inlined
 // into and simplified when its cost is measured. A direct call is inlined
-// when the callee is small, or internal with a single call site; calls
-// within a strongly connected component (recursion) are not inlined.
-// Internal functions nothing refers to any more are deleted.
+// when the callee is small, or internal with a single call site. Calls in
+// recursion (a callee in the caller's strongly connected component, or one
+// that is recursive itself) are inlined under the rules at `want` that keep
+// the expansion bounded. Internal functions nothing refers to any more are
+// deleted.
 //
 // The shadow stack records (stack traces) are explicit stores around each
 // call in the IR, so inlining keeps traces the same.
@@ -24,6 +26,9 @@ const SMALL: i32 = 30;          // always worth inlining
 const ONE_CALLER: i32 = 1200;   // an internal function called once
 const CALLER_MAX: i32 = 20000;  // stop growing a caller beyond this
 const TAIL_MAX: i32 = 120;      // a callee called in tail position, from one place
+// What inlining recursive callees (see `want`) may add to a caller, beyond
+// its cost when its inlining began, unless the callee has no other caller.
+const RECURSIVE_GROWTH: i32 = 240;
 // A callee whose stack slots take more than this is not inlined into a
 // recursive function, where every level of the recursion would pay for them
 // (as LLVM's limit for recursive callers).
@@ -121,6 +126,10 @@ fn map_blk(b: *mut ir.Block) *mut ir.Block {
     return @ptr_cast(*mut ir.Block, b.auxp);
 }
 
+// The chain (see `want`) inline_call gives the calls it copies, in their
+// aux2.
+let mut clone_chain: i64 = 0;
+
 // Inlines call c (in f) of g.
 pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
     let g = ir.fnp_of(c.a);
@@ -164,6 +173,7 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
             if x.op == ir.OP_CALL {
                 // the inlined call's records follow those of its code's calls
                 ir.set_chain(y, ir.chain_cat(ir.chain_of(x), ir.chain_of(c)));
+                y.aux2 = clone_chain;
             }
             x.auxp = @ptr_cast(*mut void, y);
             if x.op == ir.OP_ALLOCA {
@@ -181,9 +191,14 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
         }
         gb = gb.next;
     }
-    // operands, and returns become branches to the continuation
+    // operands, and returns become branches to the continuation (a result
+    // in registers, ir.EXT_REGS: their values, of each return in turn, in
+    // regs, its blocks in regblocks)
     let mut rets = u.List.[*mut ir.Value].empty();
     let mut rblocks = u.List.[*mut ir.Block].empty();
+    let mut regs = u.List.[*mut ir.Value].empty();
+    let mut regblocks = u.List.[*mut ir.Block].empty();
+    let nregs = regs_result(c);
     for k in 0..clones.len {
         let y = clones.get(k);
         y.a = map_val(g, y.a, &args);
@@ -202,8 +217,19 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
                 rets.push(y.a);
                 rblocks.push(y.blk);
             }
+            if nregs > 0 {
+                regblocks.push(y.blk);
+                for j in 0..nregs {
+                    if j < y.xs.len {
+                        regs.push(y.xs.get(j));
+                    } else {
+                        regs.push(vnil());  // (not reached: the marks differ)
+                    }
+                }
+            }
             y.op = ir.OP_BR;
             y.a = vnil();
+            y.xs.clear();
             y.t1 = cont;
         }
     }
@@ -212,28 +238,81 @@ pub fn inline_call(f: *mut ir.Func, c: *mut ir.Value) void {
     br.t1 = map_blk(g.first);
     ir.remove_inst(c);
     ir.append_inst(b, br);
-    if c.ty.kind != ir.T_VOID {
-        if rets.len == 1 {
-            ir.forward(c, rets.get(0));
-        } else if rets.len == 0 {
-            ir.forward(c, ir.undef(c.ty));
-        } else {
-            let p = ir.new_inst(f, ir.OP_PHI, c.ty);
-            for k in 0..rets.len {
-                ir.add_incoming(p, rets.get(k), rblocks.get(k));
+    if nregs > 0 {
+        // the registers' values for the IN_CALL_RESULTs of c, which go
+        let mut vals: [4]*mut ir.Value = [vnil(), vnil(), vnil(), vnil()];
+        let mut b2 = f.first;
+        while u.notnil(b2) {
+            let mut x = b2.first;
+            while u.notnil(x) {
+                let nx = x.next;
+                if (ir.intr_id(x) == ir.IN_CALL_RESULT) and (ir.resolve(x.xs.get(0)) == c) {
+                    let k = @truncate(usize, ir.cint_val(x.xs.get(1)));
+                    if (k < nregs) and u.isnil(vals[k]) {
+                        let mut js = u.List.[*mut ir.Value].empty();
+                        for r in 0..regblocks.len {
+                            let mut y = regs.get((r * nregs) + k);
+                            if u.isnil(y) {
+                                y = ir.undef(x.ty);
+                            }
+                            js.push(y);
+                        }
+                        vals[k] = merge(f, cont, x.ty, &js, &regblocks);
+                        js.deinit();
+                    }
+                    if k < nregs {
+                        ir.forward(x, vals[k]);
+                    } else {
+                        ir.forward(x, ir.undef(x.ty));
+                    }
+                    ir.remove_inst(x);
+                }
+                x = nx;
             }
-            if u.notnil(cont.first) {
-                ir.insert_before(cont.first, p);
-            } else {
-                ir.append_inst(cont, p);
-            }
-            ir.forward(c, p);
+            b2 = b2.next;
         }
+    }
+    if c.ty.kind != ir.T_VOID {
+        ir.forward(c, merge(f, cont, c.ty, &rets, &rblocks));
     }
     args.deinit();
     clones.deinit();
     rets.deinit();
     rblocks.deinit();
+    regs.deinit();
+    regblocks.deinit();
+}
+
+// The number of registers of call c's result, when it is in registers
+// (ir.EXT_REGS), else 0.
+fn regs_result(c: *ir.Value) usize {
+    let ex = ir.ext_of(c);
+    if (ex.len == 0) or (ex[0] < ir.EXT_REGS) {
+        return 0;
+    }
+    return @as(usize, ex[0] & 3) + 1;
+}
+
+// The value (of type t) that returns vs from blocks bs give at the start of
+// cont: the one, a phi of them, or undefined when there is none.
+fn merge(f: *mut ir.Func, cont: *mut ir.Block, t: *mut ir.Ty, vs: *u.List.[*mut ir.Value],
+         bs: *u.List.[*mut ir.Block]) *mut ir.Value {
+    if vs.len == 1 {
+        return vs.get(0);
+    }
+    if vs.len == 0 {
+        return ir.undef(t);
+    }
+    let p = ir.new_inst(f, ir.OP_PHI, t);
+    for k in 0..vs.len {
+        ir.add_incoming(p, vs.get(k), bs.get(k));
+    }
+    if u.notnil(cont.first) {
+        ir.insert_before(cont.first, p);
+    } else {
+        ir.append_inst(cont, p);
+    }
+    return p;
 }
 
 // -----------------------------------------------------------------------------
@@ -250,10 +329,12 @@ struct Node {
     live: i32,   // the same, kept exact as functions change (retire); `calls` is what `want` reckons with
     retired: bool,
     addr_taken: bool,
-    cost: i32,        // cost(f), or -1: not known (f changed since)
-    inlinable: i8,    // inlinable(f): 1 or 0, or -1: not known
-    frame: i64,       // frame_bytes(f), or -1: not known
-    recursive: bool,  // calls itself, directly or not
+    cost: i32,         // cost(f), or -1: not known (f changed since)
+    inlinable: i8,     // inlinable(f): 1 or 0, or -1: not known
+    frame: i64,        // frame_bytes(f), or -1: not known
+    recursive: bool,   // calls itself, directly or not
+    selfcall: i8,      // its function has a direct call to itself: 1 or 0, or -1: not known
+    cycle_calls: i32,  // its direct calls of functions of its component (node_selfcall)
 }
 
 let mut nodes: u.List.[*mut Node] = u.List.[*mut Node].{ data: @ptr_from_int(*mut *mut Node, 0), len: 0, cap: 0 };
@@ -354,6 +435,50 @@ fn node_inlinable(n: *mut Node) bool {
     return n.inlinable == 1;
 }
 
+// Does n's function call itself directly? (And its calls of functions of
+// its own component, in n.cycle_calls.)
+fn node_selfcall(n: *mut Node) bool {
+    if n.selfcall < 0 {
+        n.selfcall = 0;
+        n.cycle_calls = 0;
+        let mut b = n.f.first;
+        while u.notnil(b) {
+            let mut x = b.first;
+            while u.notnil(x) {
+                let h = callee_of(x);
+                if u.notnil(h) and (node_of(h).scc == n.scc) {
+                    n.cycle_calls += 1;
+                    if h == n.f {
+                        n.selfcall = 1;
+                    }
+                }
+                x = x.next;
+            }
+            b = b.next;
+        }
+    }
+    return n.selfcall == 1;
+}
+
+// Inlining chains: chain 0 is empty; chain k > 0 is function ch_node[k] (a
+// node index) followed by chain ch_parent[k]. A call that inlining brought
+// into the caller has in aux2 the chain of the functions whose inlined bodies
+// it came from, innermost first (0 for the caller's own calls).
+let mut ch_node: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+let mut ch_parent: u.List.[i64] = u.List.[i64].{ data: @ptr_from_int(*mut i64, 0), len: 0, cap: 0 };
+
+fn on_chain(chain: i64, g: i32) bool {
+    let mut k = chain;
+    while k > 0 {
+        let i = @truncate(usize, @bit_cast(u64, k));
+        if ch_node.get(i) == g {
+            return true;
+        }
+        k = ch_parent.get(i);
+    }
+    return false;
+}
+
 fn build_graph(m: *mut ir.Module) void {
     nodes.clear();
     for i in 0..m.funcs.len {
@@ -365,6 +490,7 @@ fn build_graph(m: *mut ir.Module) void {
         n.cost = -1;
         n.inlinable = -1;
         n.frame = -1;
+        n.selfcall = -1;
         nodes.push(n);
     }
     for i in 0..m.funcs.len {
@@ -507,29 +633,74 @@ fn tail_call(c: *mut ir.Value) bool {
     }
 }
 
-// Should call c (in f, whose current cost is fcost) be inlined?
-fn want(n: *mut Node, c: *mut ir.Value, fcost: i32) bool {
+// Should call c (in f, whose current cost is fcost) be inlined? budget is
+// what f's cost may grow to by inlining recursive callees.
+//
+// Recursion. A callee g is recursive for this when it is in f's strongly
+// connected component (f reaches g and g reaches f) or recursive itself
+// (it reaches itself). Inlining such a g copies calls that lead back to g,
+// whose inlining would copy them again: unbounded, without these rules:
+//   (1) a call whose chain (the functions whose inlined bodies brought it
+//       into f, Node / ch_node) holds g is not inlined; the calls copied from
+//       g's body get c's chain plus g;
+//   (2) g in f's component is not inlined if it calls itself directly (its
+//       copies would bring calls to g again; it is inlined once into the
+//       callers outside the component instead), and f is never inlined into
+//       itself; nor is g into a caller outside its component if it makes
+//       more than one call into its component (a tree walk: a copy saves
+//       one call and brings two, measured a loss);
+//   (3) g is inlined only while f stays within budget (its cost when its
+//       inlining began plus RECURSIVE_GROWTH), unless g is internal with no
+//       other call site (no copy then: g dies) and within ONE_CALLER.
+// Termination and bound: every inlining in f removes one call and adds g's
+// copied calls, each with a chain one function longer than c's that holds g;
+// by (1) the functions on a chain are distinct, so no chain is longer than
+// the number of functions in the module (a recursive expansion is at most as
+// deep as its cycle is long), and the rounds (inline_into) end within three
+// anyway. The size is bounded by (3), whatever the fan-out of the
+// recursion: the copies of recursive callees add at most RECURSIVE_GROWTH
+// plus one callee's cost (each at most SMALL + the bonus), besides the
+// bodies of callees with no other call site, which are not copied but
+// moved (each exists once, and leaves the module), and of inline functions,
+// which (1) inlines at most once per chain and which form no cycle among
+// themselves (E0314), so that a chain of them ends. A self-recursive g is so
+// expanded one level into an outside caller per inline_module run (the
+// chains live only while one caller is inlined into), its own calls to
+// itself staying calls: by (1) within the run, and the next run starts from
+// a caller whose growth was bounded by (3).
+fn want(n: *mut Node, c: *mut ir.Value, fcost: i32, budget: i32) bool {
     let g = callee_of(c);
     if u.isnil(g) or ir.is_decl(g) or (g == n.f) {
         return false;
     }
     let gn = node_of(g);
-    if (gn.scc == n.scc) or not node_inlinable(gn) {
+    if not node_inlinable(gn) {
         return false;
+    }
+    let same = gn.scc == n.scc;
+    let rec = same or gn.recursive;
+    if rec and on_chain(c.aux2, @int_cast(i32, g.aux)) {
+        return false;  // (1)
+    }
+    if same and node_selfcall(gn) {
+        return false;  // (2)
+    }
+    if rec and not same {
+        _ = node_selfcall(gn);
+        if gn.cycle_calls > 1 {
+            return false;  // (2)
+        }
     }
     // (code compiled for extensions the caller is not compiled for stays in
     // its own function, behind the check that chose it)
     if (tg.fn_features(g) & ~tg.fn_features(n.f)) != 0 {
         return false;
     }
+    // (an inline function is inlined whatever its size, spec §9.5; it
+    // cannot call itself, nor be on a cycle of inline functions only, so
+    // rule (1) bounds it)
     if g.always_inline {
         return true;
-    }
-    // a function that calls itself brings its calls to itself along: a
-    // small one with several would be inlined into its own copies, level
-    // after level
-    if gn.recursive {
-        return false;
     }
     if n.recursive and (node_frame(gn) > RECURSIVE_FRAME_MAX) {
         return false;
@@ -538,13 +709,17 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32) bool {
         return false;
     }
     let gc = node_cost(gn);
+    let one = (g.linkage == ir.LINK_INTERNAL) and (gn.calls == 1) and not gn.addr_taken and (g.export_name.len == 0);
+    if rec and not one and ((fcost + gc) > budget) {
+        return false;  // (3)
+    }
     if gc <= SMALL {
         return true;
     }
     if fcost > CALLER_MAX {
         return false;
     }
-    if (g.linkage == ir.LINK_INTERNAL) and (gn.calls == 1) and not gn.addr_taken and (g.export_name.len == 0) {
+    if one {
         // `return slow(x)` after a fast path: inlining saves only the call
         // but makes the caller's fast path pay for the callee's frame
         if tail_call(c) and (gc > TAIL_MAX) {
@@ -569,15 +744,23 @@ fn inline_into(n: *mut Node) bool {
     let f = n.f;
     let mut calls = u.List.[*mut ir.Value].empty();
     let mut fcost = cost(f);
+    let budget = fcost + RECURSIVE_GROWTH;
     let mut any = false;
+    ch_node.clear();
+    ch_parent.clear();
+    ch_node.push(-1);  // chain 0: empty
+    ch_parent.push(0);
     // again over the calls that inlining brings in
-    for _round in @as(i32, 0)..3 {
+    for round in @as(i32, 0)..3 {
         calls.clear();
         let mut b = f.first;
         while u.notnil(b) {
             let mut x = b.first;
             while u.notnil(x) {
                 if u.notnil(callee_of(x)) {
+                    if round == 0 {
+                        x.aux2 = 0;  // f's own calls
+                    }
                     calls.push(x);
                 }
                 x = x.next;
@@ -587,12 +770,15 @@ fn inline_into(n: *mut Node) bool {
         let mut did = false;
         for k in 0..calls.len {
             let c = calls.get(k);
-            if want(n, c, fcost) {
+            if want(n, c, fcost, budget) {
                 let g = callee_of(c);
                 fcost += node_cost(node_of(g));
                 n.frame = node_frame(n) + node_frame(node_of(g));
                 node_of(g).calls -= 1;
                 count_calls(g);
+                clone_chain = @bit_cast(i64, @as(u64, ch_node.len));
+                ch_node.push(@int_cast(i32, g.aux));
+                ch_parent.push(c.aux2);
                 inline_call(f, c);
                 did = true;
             }
@@ -603,6 +789,7 @@ fn inline_into(n: *mut Node) bool {
         any = true;
         ir.apply_forwarding(f);
     }
+    clone_chain = 0;
     calls.deinit();
     return any;
 }
@@ -633,6 +820,7 @@ fn add_node(g: *mut ir.Func) void {
     n.cost = -1;
     n.inlinable = -1;
     n.frame = -1;
+    n.selfcall = -1;
     n.calls = 1;
     g.aux = @int_cast(i64, nodes.len);
     nodes.push(n);
@@ -667,6 +855,7 @@ pub fn inline_module(
             n.cost = -1;
             n.inlinable = -1;
             n.frame = -1;
+            n.selfcall = -1;
             let mut g = u.nil.[ir.Func]();
             if node_cost(n) > SMALL {
                 g = split(m, n.f);
@@ -675,6 +864,7 @@ pub fn inline_module(
                     n.cost = -1;
                     n.inlinable = -1;
                     n.frame = -1;
+                    n.selfcall = -1;
                 }
             }
             retire(n, g);

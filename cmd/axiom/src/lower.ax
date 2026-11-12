@@ -11,12 +11,17 @@
 //   - extractvalue of an aggregate field is an address inside the slot, of
 //     a scalar field a load from it;
 //   - a constant aggregate is a read-only global;
-//   - aggregate parameters arrive as addresses, and aggregate results are
-//     written through a hidden first parameter (sret).
+//   - aggregate parameters arrive as addresses (small ones as their scalar
+//     leaves), and aggregate results are written through a hidden first
+//     parameter (sret), but for small ones on the native targets, which
+//     come back in registers (ir.EXT_REGS: the call's IN_CALL_RESULTs,
+//     stored into its slot; a return of the leaves loaded from the
+//     result's).
 // Slots are never written after their value is complete, so aliasing a slot
 // (a field address, a select of two slots) is safe.
 // =============================================================================
 import "ir.ax" as ir;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 let mut M: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
@@ -24,6 +29,7 @@ let mut B: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
 let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut sret_calls: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0),
                                                                       len: 0, cap: 0 };
+
 let mut const_globals: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut ir.Value, 0), cap: 0, len: 0 };
 
@@ -76,12 +82,40 @@ fn split(t: *mut ir.Ty, l: *mut Leaves) bool {
     return ir.is_agg(t) and leaves_of(t, 0, l);
 }
 
+// How an aggregate result of type t comes back: in registers, as their
+// ir.EXT_REGS mark says (its leaves l: on the native targets, of at most
+// four leaves, integers and floats of 32 or 64 bits; on x86-64 at most two
+// of each, in rax, rdx, xmm0 and xmm1), or through sret (0).
+fn regs_code(t: *mut ir.Ty, l: *mut Leaves) u8 {
+    if tg.is_wasm() or not split(t, l) or (l.n == 0) {
+        return 0;
+    }
+    let mut code = ir.EXT_REGS | @truncate(u8, l.n - 1);
+    let mut nf: usize = 0;
+    for k in 0..l.n {
+        let lt = l.tys[k];
+        if lt.kind == ir.T_FLOAT {
+            if (lt.bits != 32) and (lt.bits != 64) {
+                return 0;
+            }
+            code = code | (ir.EXT_REGS_FP0 << @truncate(u8, k));
+            nf += 1;
+        }
+    }
+    if (tg.g_arch == tg.ARCH_X64) and ((nf > 2) or ((l.n - nf) > 2)) {
+        return 0;
+    }
+    return code;
+}
+
 // The signature with aggregates passed by address (small ones as their
-// leaves) and returned through sret.
+// leaves) and returned through sret (small ones in registers: regs_code).
 fn lower_fty(t: *mut ir.Ty) *mut ir.Ty {
     let mut any = ir.is_agg(t.ret);
     let mut n = t.params.len;
     let mut l = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
+    let mut rl = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
+    let rcode = regs_code(t.ret, &mut rl);
     for p in t.params {
         if ir.is_agg(p) {
             any = true;
@@ -96,7 +130,9 @@ fn lower_fty(t: *mut ir.Ty) *mut ir.Ty {
     let ps = u.newn.[*mut ir.Ty](n + 2);
     let mut k: usize = 0;
     let mut rt = t.ret;
-    if ir.is_agg(t.ret) {
+    if rcode != 0 {
+        rt = ir.t_void();
+    } else if ir.is_agg(t.ret) {
         ps[0] = ir.t_ptr();
         k = 1;
         rt = ir.t_void();
@@ -123,7 +159,9 @@ fn lower_sig(f: *mut ir.Func) void {
     if nt == f.ty {
         return;
     }
-    let sret = ir.is_agg(f.ty.ret);
+    let mut rl = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
+    let rcode = regs_code(f.ty.ret, &mut rl);
+    let sret = ir.is_agg(f.ty.ret) and (rcode == 0);
     let n = nt.params.len;
     let mut k: usize = 0;
     let ps = u.newn.[*mut ir.Value](n + 2);
@@ -167,6 +205,9 @@ fn lower_sig(f: *mut ir.Func) void {
     f.sret = sret;
     if sret {
         f.ret_ext = 0;
+    }
+    if rcode != 0 {
+        f.ret_ext = rcode;
     }
 }
 
@@ -314,7 +355,9 @@ fn lower_call(v: *mut ir.Value) void {
     if nt == old {
         return;
     }
-    let sret = ir.is_agg(old.ret);
+    let mut rl = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
+    let rcode = regs_code(old.ret, &mut rl);
+    let sret = ir.is_agg(old.ret) and (rcode == 0);
     let n = v.xs.len;
     let mut args = u.List.[*mut ir.Value].empty();
     let ext = u.newn.[u8](nt.params.len + 3);
@@ -352,9 +395,27 @@ fn lower_call(v: *mut ir.Value) void {
         k += 1;
     }
     v.xs = args;
+    if rcode != 0 {
+        ext[0] = rcode;
+    }
     ir.set_ext(v, ext[0..k]);
     ir.set_fty(v, nt);
     if sret {
+        sret_calls.push(v);  // typed void once every use is lowered
+    }
+    if rcode != 0 {
+        // the registers stored into the call's slot after it (scalar
+        // replacement takes it apart again)
+        let s = entry_alloca(old.ret);
+        ir.at_before(B, v.next);
+        for j in 0..rl.n {
+            let mut ka: [2]*mut ir.Value = [v, ir.cint(ir.t_int(32), @as(u64, j))];
+            let x = ir.intr(B, ir.IN_CALL_RESULT, rl.tys[j], ka[..]);
+            let st = ir.store(B, x, ir.ptradd(B, s, isz(rl.offs[j])));
+            st.align = @int_cast(u32, rl.tys[j].align);
+        }
+        set_slot(v, s);
+        v.aux2 = 1;
         sret_calls.push(v);  // typed void once every use is lowered
     }
 }
@@ -462,6 +523,22 @@ fn lower_body(f: *mut ir.Func) void {
                 ir.remove_inst(i);
             } else if op == ir.OP_CALL {
                 lower_call(i);
+            } else if (op == ir.OP_RET) and u.notnil(i.a) and ir.is_agg(i.a.ty) and (f.ret_ext >= ir.EXT_REGS) {
+                // the leaves of the result, in registers
+                let mut rl = Leaves.{ tys: [ir.t_void(); 4], offs: [0; 4], n: 0 };
+                _ = split(i.a.ty, &mut rl);
+                let s = slot_of(i.a);
+                let mut xs = u.List.[*mut ir.Value].empty();
+                for j in 0..rl.n {
+                    let ld = ir.load(B, rl.tys[j], ir.ptradd(B, s, isz(rl.offs[j])));
+                    ld.align = @int_cast(u32, rl.tys[j].align);
+                    xs.push(ld);
+                }
+                i.a = vnil();
+                for j in 0..xs.len {
+                    i.xs.push(xs.get(j));
+                }
+                xs.deinit();
             } else if (op == ir.OP_RET) and u.notnil(i.a) and ir.is_agg(i.a.ty) {
                 store_agg(i.a, sret_p);
                 i.a = vnil();
@@ -485,6 +562,7 @@ fn lower_body(f: *mut ir.Func) void {
         sret_calls.get(k).ty = ir.t_void();
     }
     sret_calls.clear();
+
     ir.apply_forwarding(f);
 }
 

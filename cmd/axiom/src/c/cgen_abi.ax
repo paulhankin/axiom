@@ -29,10 +29,9 @@
 // class are free follows filler parameters that use them up (x86-64 puts
 // such pieces after the arguments that do get registers: the stack holds
 // them in order). Two things the backends do for this module: a result in
-// two to four registers comes back through a buffer marked with
-// ir.EXT_REGS (the call stores the registers there; the callee's buffer
-// parameter is a frame slot loaded into them at its return), and the
-// AArch64 result address is marked ir.EXT_X8SRET (x8, not x0).
+// two to four registers is marked ir.EXT_REGS (the call's registers are
+// IN_CALL_RESULTs; a return returns them as its xs), and the AArch64 result
+// address is marked ir.EXT_X8SRET (x8, not x0).
 //
 // A variadic function's definition gets parameters after its named ones for
 // the registers its caller may have put variadic arguments in (x86-64,
@@ -82,7 +81,7 @@ pub const A_REF: i32 = 2;     // a structure or union: the address of a copy
 pub const R_VOID: i32 = 0;
 pub const R_SCALAR: i32 = 1;  // a scalar: the IR result
 pub const R_PIECE: i32 = 2;   // a structure or union: one scalar, the IR result
-pub const R_REGS: i32 = 3;    // a structure or union in several registers: through the buffer of parameter 0
+pub const R_REGS: i32 = 3;    // a structure or union in several registers: IN_CALL_RESULT (ir.EXT_REGS)
 pub const R_SRET: i32 = 4;    // a structure or union in the caller's memory, whose address is parameter 0
 
 // What an IR parameter is (Plan.what).
@@ -90,7 +89,7 @@ pub const SL_ARG: i32 = 0;     // (a piece of) an argument
 pub const SL_FILL: i32 = 1;    // a filler that uses up a register (its value is never used)
 pub const SL_PAD_GP: i32 = 2;  // a variadic definition's integer register
 pub const SL_PAD_FP: i32 = 3;  // a variadic definition's floating-point register
-pub const SL_RET: i32 = 4;     // the result's buffer or address
+pub const SL_RET: i32 = 4;     // the result's address (R_SRET)
 pub const SL_VABUF: i32 = 5;   // the variadic arguments' buffer (WebAssembly)
 
 /// A scalar of a structure or union: its IR type and offset.
@@ -118,6 +117,7 @@ pub struct Plan {
     rn: usize,
     rspan: u64,
     ret_ptr: bool,  // R_SRET: the function also returns the address (x86-64)
+    rcode: u8,      // R_REGS: the result's ir.EXT_REGS mark
     args: []mut ArgPlan,
     nnamed: usize,             // the arguments that are a prototype's parameters
     tys: u.List.[*mut ir.Ty],  // the IR parameters
@@ -832,17 +832,14 @@ fn set_pieces_result(b: *mut Builder, a: *ArgPlan) void {
         return;
     }
     p.ret = R_REGS;
-    // the buffer: no register; the mark says which registers fill it
+    // the result's mark says which registers hold the pieces
     let mut code = ir.EXT_REGS | @truncate(u8, a.n - 1);
-    if a.pieces[1].off == 8 {
-        code = code | ir.EXT_REGS_WIDE;
-    }
     for k in 0..a.n {
         if is_fp_ty(a.pieces[k].ty) {
             code = code | (ir.EXT_REGS_FP0 << @truncate(u8, k));
         }
     }
-    b.regs.push(item(ir.t_ptr(), code, SL_RET, -1, 0));
+    p.rcode = code;
 }
 
 /// The plan of a call of, or the definition (define) of, a function
@@ -974,10 +971,14 @@ fn pads(b: *mut Builder, fp: bool, n: u64) void {
 }
 
 /// The IR parameters' marks (a call's ext slice from index 1, a function's
-/// param_ext), and the result's in ex[0] when it is a scalar.
+/// param_ext), and the result's in ex[0] when it is a scalar or in several
+/// registers.
 pub fn ret_ext(p: *Plan) u8 {
     if p.ret == R_SCALAR {
         return ext_of(p.rty);
+    }
+    if p.ret == R_REGS {
+        return p.rcode;
     }
     return 0;
 }

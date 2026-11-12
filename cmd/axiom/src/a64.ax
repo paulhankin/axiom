@@ -623,6 +623,18 @@ fn scalar_not(v: *mut ir.Value) *mut ir.Value {
     return ir.vnil();
 }
 
+// The bits of integer constant x (narrower than 32 bits) extended to 32
+// bits, zero- or sign- (a result's ABI extension).
+fn ext_const(x: *ir.Value, sign: bool) i64 {
+    let bits = x.ty.bits;
+    let m = (@as(u64, 1) << @truncate(u32, @bit_cast(i64, @as(i64, bits)))) - 1;
+    let mut v = @bit_cast(u64, is.cval(x)) & m;
+    if sign and ((v >> @truncate(u32, @bit_cast(i64, @as(i64, bits - 1)))) != 0) {
+        v = v | ~m;
+    }
+    return @bit_cast(i64, v & 0xffff_ffff);
+}
+
 // Extends the narrow integer in r into a fresh register (32 or 64 bits).
 fn ext_reg(r: i32, bits: i32, sign: bool, to64: bool) i32 {
     let d = vgpr();
@@ -1308,32 +1320,51 @@ fn call_lib(name: []u8, args: []i32) void {
     MF.has_calls = true;
 }
 
-// memcpy / memmove / memset
+// memcpy / memmove / memset. Copies of a constant size up to 128 bytes are
+// 16-, 8-, 4-, 2- and 1-byte loads and stores: for memcpy, and memmove of
+// operands the same or apart (ir.same_or_apart), each store after its
+// load (a forward copy, which copies the same bytes onto themselves); for
+// other memmoves all loads first, so that overlapping operands read the
+// source before any of it is written.
 fn gen_memop(v: *mut ir.Value) void {
     let o = v.op;
-    if (o == ir.OP_MEMCPY) and is.is_c(v.c) and (is.cval(v.c) <= 128) {
+    let fwd = (o == ir.OP_MEMCPY) or ir.same_or_apart(v);
+    if (o != ir.OP_MEMSET) and is.is_c(v.c) and (is.cval(v.c) >= 0) and (is.cval(v.c) <= 128) {
         let n = is.cval(v.c);
         let dm = addr(v.a);
         let sm = addr(v.b);
+        let mut regs: [16]i32 = [0; 16];
+        let mut offs: [16]i64 = [0; 16];
+        let mut wds: [16]i64 = [0; 16];
+        let mut m: usize = 0;
         let mut k: i64 = 0;
         while k < n {
             let rem = n - k;
-            if rem >= 16 {
-                let t = vvr();
-                _ = e2(FLDR, 16, W(t), at(sm, k));
-                _ = e2(FSTR, 16, at(dm, k), R(t));
-                k += 16;
-                continue;
-            }
-            let mut w: i64 = 8;
+            let mut w: i64 = 16;
             while w > rem {
                 w = w / 2;
             }
-            let t = vgpr();
-            let sz = @truncate(u8, @bit_cast(u64, w));
-            _ = e2(LDR, sz, W(t), at(sm, k));
-            _ = e2(STR, sz, at(dm, k), R(t));
+            if w == 16 {
+                regs[m] = vvr();
+                _ = e2(FLDR, 16, W(regs[m]), at(sm, k));
+            } else {
+                regs[m] = vgpr();
+                _ = e2(LDR, @truncate(u8, @bit_cast(u64, w)), W(regs[m]), at(sm, k));
+            }
+            offs[m] = k;
+            wds[m] = w;
+            m += 1;
             k += w;
+            if fwd or (k == n) {
+                for j in 0..m {
+                    if wds[j] == 16 {
+                        _ = e2(FSTR, 16, at(dm, offs[j]), R(regs[j]));
+                    } else {
+                        _ = e2(STR, @truncate(u8, @bit_cast(u64, wds[j])), at(dm, offs[j]), R(regs[j]));
+                    }
+                }
+                m = 0;
+            }
         }
         return;
     }
@@ -1539,8 +1570,6 @@ fn gen_call(v: *mut ir.Value) void {
     if tg.is_darwin() and fty_.vararg {
         nfixed = fty_.params.len;
     }
-    let mut rbuf: i32 = -1;  // (a C result in registers: the buffer they are stored in)
-    let mut rcode: u8 = 0;
     for i in 0..n {
         let x = v.xs.get(i);
         let c = class_of(x.ty);
@@ -1548,11 +1577,6 @@ fn gen_call(v: *mut ir.Value) void {
         let mut e: u8 = 0;
         if (i + 1) < ir.ext_of(v).len {
             e = ir.ext_of(v)[i + 1];
-        }
-        if e >= ir.EXT_REGS {
-            rcode = e;
-            rbuf = regs[i];
-            continue;
         }
         if e == ir.EXT_X8SRET {
             dest[i] = X8;  // (the C result's address)
@@ -1611,15 +1635,26 @@ fn gen_call(v: *mut ir.Value) void {
         }
     }
     let mut ops = is.call_ops(v, target, &uses, func_sym, rreg);
-    if rbuf >= 0 {
+    let mut rcode: u8 = 0;
+    if (ir.ext_of(v).len > 0) and (ir.ext_of(v)[0] >= ir.EXT_REGS) {
+        rcode = ir.ext_of(v)[0];
+        // (the call defines the result's registers)
         for k in 0..c_result_count(rcode) {
             ops.push(mc.reg(c_result_reg(rcode, k), mc.RD));
         }
     }
     let ci = emit(CALL, 0, ops.items());
     is.finish_call(MF, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
-    if rbuf >= 0 {
-        store_c_result(rcode, rbuf);
+    if rcode != 0 {
+        // the registers, for the IN_CALL_RESULTs
+        for k in 0..c_result_count(rcode) {
+            let r = c_result_reg(rcode, k);
+            if r >= V0 {
+                copy(call_result_vreg(v, k, VR), r, VR);
+            } else {
+                copy(call_result_vreg(v, k, GPR), r, GPR);
+            }
+        }
     }
     if (rreg >= 0) and is.foreign_bool(v) {
         let t = vgpr();
@@ -1632,9 +1667,10 @@ fn gen_call(v: *mut ir.Value) void {
     ops.deinit();
 }
 
-// A C result in registers (AAPCS64: a structure or union in x0 and x1, or
-// a homogeneous floating-point aggregate in v0-v3), as ir.EXT_REGS rc
-// says: register k, its class and size.
+// A result in registers (AAPCS64: a structure or union in x0 and x1, or
+// a homogeneous floating-point aggregate in v0-v3; Axiom's small
+// aggregates, lower.ax, by place: the k-th in xk or vk), as ir.EXT_REGS rc
+// says: register k, and its class.
 fn c_result_reg(rc: u8, k: usize) i32 {
     if (rc & (ir.EXT_REGS_FP0 << @truncate(u8, k))) != 0 {
         return V0 + @int_cast(i32, k);
@@ -1646,52 +1682,57 @@ fn c_result_count(rc: u8) usize {
     return @as(usize, rc & 3) + 1;
 }
 
-fn c_result_size(rc: u8) u64 {
-    if (rc & ir.EXT_REGS_WIDE) != 0 {
-        return 8;
-    }
-    return 4;
+// The virtual registers that hold register k of the results of calls in
+// registers (IN_CALL_RESULT), made when the call or the intrinsic is
+// selected, whichever comes first.
+struct CallResult {
+    call: *ir.Value,
+    k: usize,
+    r: i32,
 }
 
-// After the call: its result's registers, into the buffer at register b.
-fn store_c_result(rc: u8, b: i32) void {
-    let n = c_result_count(rc);
-    let sz = c_result_size(rc);
-    let mut ts: [4]i32 = [0, 0, 0, 0];
-    for k in 0..n {
-        let r = c_result_reg(rc, k);
-        if r >= V0 {
-            ts[k] = vvr();
-            copy(ts[k], r, VR);
-        } else {
-            ts[k] = vgpr();
-            copy(ts[k], r, GPR);
+let mut call_results: u.List.[CallResult] = u.List.[CallResult].{ data: @ptr_from_int(*mut CallResult, 0), len: 0,
+                                                                  cap: 0 };
+
+fn call_result_vreg(v: *ir.Value, k: usize, c: u8) i32 {
+    for x in call_results.items() {
+        if (x.call == v) and (x.k == k) {
+            return x.r;
         }
     }
-    for k in 0..n {
-        let m = mc.mem(b, -1, 0, @bit_cast(i64, @as(u64, k) * sz));
-        if c_result_reg(rc, k) >= V0 {
-            _ = e2(FSTR, @truncate(u8, sz), m, R(ts[k]));
-        } else {
-            _ = e2(STR, @truncate(u8, sz), m, R(ts[k]));
-        }
+    let mut r: i32 = 0;
+    if c == VR {
+        r = vvr();
+    } else {
+        r = vgpr();
     }
+    call_results.push(CallResult.{ call: v, k: k, r: r });
+    return r;
 }
 
-// The return of a function whose C result is in registers: loaded from its
-// buffer (the frame slot c_ret_slot).
-fn ret_c_result() void {
-    let rc = c_ret_code;
+// IN_CALL_RESULT(call, k): the copy the call made of register k.
+fn gen_call_result(v: *mut ir.Value) void {
+    let c = ir.resolve(v.xs.get(0));
+    let k = @truncate(usize, ir.cint_val(v.xs.get(1)));
+    let cl = class_of(v.ty);
+    copy(vreg(v), call_result_vreg(c, k, cl), cl);
+}
+
+// The return of a function whose result is in registers (ir.EXT_REGS):
+// t's xs in them.
+fn ret_c_result(t: *mut ir.Value) void {
+    let rc = F.ret_ext;
     let n = c_result_count(rc);
-    let sz = c_result_size(rc);
     let mut ops = u.List.[mc.MOp].empty();
     for k in 0..n {
         let r = c_result_reg(rc, k);
-        let m = mc.mem_slot(c_ret_slot, @bit_cast(i64, @as(u64, k) * sz));
+        let x = t.xs.get(k);
         if r >= V0 {
-            _ = e2(FLDR, @truncate(u8, sz), W(r), m);
+            let m = e2(FMOV, 16, W(r), R(reg(x)));
+            m.is_move = true;
         } else {
-            _ = e2(LDR, @truncate(u8, sz), W(r), m);
+            let m = e2(MOV, 8, W(r), R(reg(x)));
+            m.is_move = true;
         }
         ops.push(R(r));
     }
@@ -2927,6 +2968,10 @@ fn gen_inst(v: *mut ir.Value) void {
             _ = e2(MOV, 8, W(vreg(v)), R(FP));
             return;
         }
+        if id == ir.IN_CALL_RESULT {
+            gen_call_result(v);
+            return;
+        }
         if ir.is_dyn_stack(id) {
             dyn_frame = true;
             if id == ir.IN_STACK_ALLOC {
@@ -3024,11 +3069,27 @@ fn gen_term(b: *mut ir.Block) void {
         return;
     }
     if o == ir.OP_RET {
+        if F.ret_ext >= ir.EXT_REGS {
+            ret_c_result(t);
+            return;
+        }
         if u.notnil(t.a) {
             let x = t.a;
-            let mut r = reg(x);
+            let mut r: i32 = -1;
             if (F.ret_ext != 0) and (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
-                r = ext_reg(r, x.ty.bits, F.ret_ext == 2, false);
+                // the result extended to 32 bits, as the ABI's mark says:
+                // a constant built so, a load that extends (zero), or the
+                // value extended
+                if is.is_c(x) and (x.kind != ir.V_UNDEF) {
+                    r = vgpr();
+                    movi(r, ext_const(x, F.ret_ext == 2), 0);
+                } else if (F.ret_ext == 1) and ir.is_op(x, ir.OP_LOAD) and (x.flags == 0) and (x.ty.bits >= 8) {
+                    r = reg(x);
+                } else {
+                    r = ext_reg(reg(x), x.ty.bits, F.ret_ext == 2, false);
+                }
+            } else {
+                r = reg(x);
             }
             if class_of(x.ty) == VR {
                 let m = e2(FMOV, 16, W(V0), R(r));
@@ -3039,10 +3100,6 @@ fn gen_term(b: *mut ir.Block) void {
                 m.is_move = true;
                 _ = e1(RET, 0, R(X0));
             }
-            return;
-        }
-        if c_ret_slot >= 0 {
-            ret_c_result();
             return;
         }
         _ = e0(RET, 0);
@@ -3348,7 +3405,7 @@ fn compile_func(f: *mut ir.Func) void {
     let mut ng: i32 = 0;
     let mut nv: i32 = 0;
     let mut soff: i64 = 16;
-    c_ret_slot = -1;
+    call_results.clear();
     for pi in 0..f.params.len {
         let p = f.params[pi];
         let c = class_of(p.ty);
@@ -3357,12 +3414,7 @@ fn compile_func(f: *mut ir.Func) void {
         if pi < f.param_ext.len {
             e = f.param_ext[pi];
         }
-        if e >= ir.EXT_REGS {
-            // (a C result in registers: its buffer, in the frame)
-            c_ret_code = e;
-            c_ret_slot = mc.new_slot(MF, 32, 16);
-            _ = e2(LEA, 8, W(d), mc.mem_slot(c_ret_slot, 0));
-        } else if e == ir.EXT_X8SRET {
+        if e == ir.EXT_X8SRET {
             copy(d, X8, GPR);
         } else if (c == GPR) and (ng < 8) {
             copy(d, ng, GPR);
@@ -3778,11 +3830,6 @@ fn needs_frame() bool {
     }
     return false;
 }
-
-// The frame slot of the buffer a C result in registers is returned from,
-// or -1, and its ir.EXT_REGS code.
-let mut c_ret_slot: i32 = -1;
-let mut c_ret_code: u8 = 0;
 
 fn prologue() void {
     if frameless {

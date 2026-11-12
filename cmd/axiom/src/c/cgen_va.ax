@@ -159,11 +159,7 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
         let w = p.what.get(k);
         let t = p.tys.get(k);
         if w == abi.SL_RET {
-            if p.ret == abi.R_SRET {
-                res = cg.alloca(p.rty, "ret");
-            } else {
-                res = buffer(32, 16);
-            }
+            res = cg.alloca(p.rty, "ret");
             args[k] = res;
         } else if w == abi.SL_VABUF {
             vb = buffer(p.vabuf_size + 8, 16);
@@ -219,12 +215,24 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
             ex[k + 1] = p.exts.get(k);
         }
     }
-    if (p.ret == abi.R_SRET) or (p.ret == abi.R_REGS) {
+    if p.ret == abi.R_SRET {
         return res;
     }
-    if p.ret == abi.R_PIECE {
+    if (p.ret == abi.R_PIECE) or (p.ret == abi.R_REGS) {
+        // the registers' pieces stored into an object (which scalar
+        // replacement takes apart again when the result is used by field)
         let tmp = alloc_of(p.rty, p.rspan);
-        st(r, tmp, cty.align_of(p.rty));
+        let al = cty.align_of(p.rty);
+        if p.ret == abi.R_PIECE {
+            st(r, tmp, al);
+            return tmp;
+        }
+        for k in 0..p.rn {
+            let pc = p.rpieces[k];
+            let mut ka: [2]*mut ir.Value = [r, c32(@bit_cast(i64, @as(u64, k)))];
+            let x = ir.intr(B(), ir.IN_CALL_RESULT, pc.ty, ka[..]);
+            st(x, at(tmp, pc.off), align_at(al, pc.off));
+        }
         return tmp;
     }
     if p.ret == abi.R_VOID {
@@ -264,8 +272,8 @@ let mut VA: VaState = VaState.{ p: @ptr_from_int(*mut abi.Plan, 0), f: @ptr_from
 
 /// The start of function f (plan p), in its first block: the objects of
 /// its parameters ps (each one's ir set), the result's address (the
-/// returned value: R_SRET, R_REGS), and for a variadic function the
-/// registers its variadic arguments may be in, saved.
+/// returned value: R_SRET), and for a variadic function the registers its
+/// variadic arguments may be in, saved.
 pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, variadic: bool) *mut ir.Value {
     VA = VaState.{ p: p, f: f, on: variadic, save: ir.vnil(), args: ir.vnil() };
     let mut res = ir.vnil();
@@ -363,6 +371,19 @@ pub fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
         ir.ret(B(), ld(p.rpieces[0].ty, src, cty.align_of(p.rty)));
         return;
     }
+    if p.ret == abi.R_REGS {
+        // the pieces loaded from the object, into the registers
+        // (ir.EXT_REGS)
+        let src = readable(p.rty, v, p.rspan);
+        let al = cty.align_of(p.rty);
+        let mut xs: [4]*mut ir.Value = [ir.vnil(), ir.vnil(), ir.vnil(), ir.vnil()];
+        for k in 0..p.rn {
+            let pc = p.rpieces[k];
+            xs[k] = ld(pc.ty, at(src, pc.off), align_at(al, pc.off));
+        }
+        ret_regs(p, xs[..]);
+        return;
+    }
     copy(res, v, size);
     if p.ret_ptr {
         ir.ret(B(), res);
@@ -378,11 +399,22 @@ pub fn ret_default(p: *mut abi.Plan, res: *mut ir.Value) void {
         ir.ret(B(), ir.czero(p.rpieces[0].ty));
     } else if p.ret == abi.R_PIECE {
         ir.ret(B(), ir.undef(p.rpieces[0].ty));
+    } else if p.ret == abi.R_REGS {
+        let mut xs: [4]*mut ir.Value = [ir.vnil(), ir.vnil(), ir.vnil(), ir.vnil()];
+        for k in 0..p.rn {
+            xs[k] = ir.undef(p.rpieces[k].ty);
+        }
+        ret_regs(p, xs[..]);
     } else if (p.ret == abi.R_SRET) and p.ret_ptr {
         ir.ret(B(), res);
     } else {
         ir.ret_void(B());
     }
+}
+
+// A return of the result in registers whose pieces are xs[0..p.rn].
+fn ret_regs(p: *abi.Plan, xs: []mut *mut ir.Value) void {
+    ir.ret_regs(B(), xs[0..p.rn]);
 }
 
 // -----------------------------------------------------------------------------

@@ -409,7 +409,7 @@ pub const OP_PHI: i32 = 53;           // xs: values, bs: blocks
 pub const OP_BR: i32 = 54;            // t1
 pub const OP_CONDBR: i32 = 55;        // a: condition; t1 if true, t2 if false
 pub const OP_SWITCH: i32 = 56;        // a: value; t1: default; xs: case constants, bs: targets; cv: 0, or SW_TABLE
-pub const OP_RET: i32 = 57;           // a: value (nil for void)
+pub const OP_RET: i32 = 57;           // a: value (nil for void); xs: the registers of a result in registers (EXT_REGS)
 pub const OP_UNREACHABLE: i32 = 58;
 pub const OP_COPY: i32 = 59;  // a (backend use)
 
@@ -587,6 +587,12 @@ pub const IN_DOT_U8I8: i32 = 99;
 pub const IN_STACK_ALLOC: i32 = 100;
 pub const IN_STACK_SAVE: i32 = 101;
 pub const IN_STACK_RESTORE: i32 = 102;
+// IN_CALL_RESULT(call, k: i32 constant): register k (from 0) of the result
+// of a call whose result's mark is EXT_REGS. It stays where it is made,
+// after the call in its block (kept like a hint: it has no effect, but is
+// not moved), so that copies of the block copy it with its call; the
+// backends define its value at the call.
+pub const IN_CALL_RESULT: i32 = 103;
 
 pub fn is_widen(id: i32) bool {
     return (id >= IN_SWIDEN_LO) and (id <= IN_UWIDEN_HI);
@@ -722,7 +728,7 @@ pub const INF_LANEWISE: u32 = 32;   // PURE, and the same operation on each lane
 
 const INF_LANES: u32 = INF_PURE | INF_LANEWISE;
 
-let IN_PROPS: [103]u32 = [
+let IN_PROPS: [104]u32 = [
     0,               // (no intrinsic 0)
     INF_LANES,       // IN_CTLZ
     INF_LANES,       // IN_CTTZ
@@ -826,10 +832,11 @@ let IN_PROPS: [103]u32 = [
     INF_OPAQUE,      // IN_STACK_ALLOC
     INF_OPAQUE,      // IN_STACK_SAVE
     INF_OPAQUE,      // IN_STACK_RESTORE
+    INF_HINT,        // IN_CALL_RESULT
 ];
 
 pub fn intr_props(id: i32) u32 {
-    if (id < 0) or (id > IN_STACK_RESTORE) {
+    if (id < 0) or (id > IN_CALL_RESULT) {
         return 0;
     }
     return IN_PROPS[@int_cast(usize, id)];
@@ -896,19 +903,31 @@ pub const EXT_SRET: u8 = 4;   // the result's memory: the call writes it (a para
 // The C front end's marks for the platforms' C calling conventions
 // (c/cgen_abi.ax); Axiom code has none of them:
 pub const EXT_X8SRET: u8 = 5;  // the address of the result's memory, passed in x8 (AArch64), not as a parameter
-// A result in 2 to 4 registers, through memory: the call's argument marked
-// so (taking no register) is a buffer of 32 bytes where the call stores
-// them, and a function's parameter marked so is the address of such a
-// buffer in its frame, which its return loads them from. The bits below
-// EXT_REGS: the count less one, whether each register takes 8 bytes (else
-// 4: an AArch64 aggregate of floats) and which are floating-point.
+// A result in 1 to 4 registers (a structure: System V's rax, rdx, xmm0,
+// xmm1; AArch64's x0, x1 or v0-v3), as the result's mark (a call's ext[0],
+// a function's ret_ext) says. The IR signature's result is void: the call's
+// registers are IN_CALL_RESULT(call, k), k from 0, and the function's
+// returns return their values as their xs, in order (their a is nil). (No
+// pass can then replace the call by another value, nor a return's values
+// by none.) The bits below EXT_REGS: the count less one, and which are
+// floating-point.
 pub const EXT_REGS: u8 = 0x80;
-pub const EXT_REGS_WIDE: u8 = 0x04;
 pub const EXT_REGS_FP0: u8 = 0x08;  // shifted left by the register's place (0 to 3)
 
 // Load/store flags
 pub const F_VOLATILE: u32 = 1;
 pub const F_ATOMIC: u32 = 2;  // sequentially consistent
+
+// An OP_MEMMOVE whose destination and source are the same bytes or apart,
+// never partly overlapping (a C structure assignment, C11 6.5.16.1p3), for
+// which a forward copy is correct: marked by its cv (which memory
+// operations have no other use for). Passes that make a new memmove, or
+// change an operand of one to another object, leave the mark out.
+pub const MEMMOVE_SAME_OR_APART: u64 = 1;
+
+pub fn same_or_apart(v: *Value) bool {
+    return (v.op == OP_MEMMOVE) and (v.cv == MEMMOVE_SAME_OR_APART);
+}
 
 pub struct Value {
     // the fields every walk over the IR reads come first (two cache lines)
@@ -3373,6 +3392,14 @@ pub fn add_case(sw: *mut Value, c: *mut Value, b: *mut Block) void {
 pub fn ret(bd: *mut Builder, x: *mut Value) void {
     let v = emit(bd, OP_RET, t_void());
     v.a = x;
+}
+
+// A return of a result in registers (EXT_REGS): their values xs.
+pub fn ret_regs(bd: *mut Builder, xs: []*mut Value) void {
+    let v = emit(bd, OP_RET, t_void());
+    for y in xs {
+        v.xs.push(y);
+    }
 }
 
 pub fn ret_void(bd: *mut Builder) void {

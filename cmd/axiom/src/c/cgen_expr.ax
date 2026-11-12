@@ -51,7 +51,11 @@ pub fn copy(t: *mut cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
     if n == 0 {
         return;
     }
-    _ = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(n));
+    // (a memmove: an assignment may copy an object onto itself, `*p = *q`
+    // with p == q; but never onto a part of itself, C11 6.5.16.1p3, nor
+    // an initializer, which copies into an object whose lifetime begins)
+    let m = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(n));
+    m.cv = ir.MEMMOVE_SAME_OR_APART;
 }
 
 /// Sets n bytes at p to zero.
@@ -83,7 +87,48 @@ pub fn truth(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     if (t.kind == cty.TK_POINTER) or (t.kind == cty.TK_NULLPTR) {
         return ir.icmp(cg.B, ir.IntNE, ir.ptrtoint(cg.B, v, cg.T_isz), cg.usz(0));
     }
+    if (t.unq.kind == cty.TK_BOOL) and (v.ty.kind == ir.T_INT) and (v.ty.bits > 1) {
+        // a _Bool is 0 or 1: its low bit is its truth (a _Bool object holds
+        // no other value, 6.2.5p2; the ABIs give a _Bool argument or result
+        // in a register with its low 8 bits 0 or 1)
+        return ir.trunc(cg.B, v, ir.t_int(1));
+    }
     return ir.icmp(cg.B, ir.IntNE, v, ir.cint(v.ty, 0));
+}
+
+// The values of && and || (0 or 1) made in the function being generated:
+// converted to _Bool, they need no comparison.
+// (by number in the function: a value's memory may be another's later)
+let mut known01: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+let mut known01_fn: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+
+fn note_01(v: *mut ir.Value) void {
+    let f = v.blk.fnp;
+    if f != known01_fn {
+        known01.clear();
+        known01_fn = f;
+    }
+    known01.push(v.id);
+}
+
+// Is v (an integer) 0 or 1: a constant, an i1 widened, or a value of && or
+// ||?
+fn is_01(v: *ir.Value) bool {
+    if ir.is_cint(v) {
+        return ir.cint_val(v) <= 1;
+    }
+    if ir.is_op(v, ir.OP_ZEXT) and (v.a.ty.bits == 1) {
+        return true;
+    }
+    if (v.kind != ir.V_INST) or (v.op != ir.OP_PHI) or u.isnil(v.blk) or (v.blk.fnp != known01_fn) {
+        return false;
+    }
+    for x in known01.items() {
+        if x == v.id {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Scalar value v of type `from` converted to type `to` (6.3.1, 6.3.2.3).
@@ -98,6 +143,9 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
     }
     let tt = lty(t);
     if t.kind == cty.TK_BOOL {
+        if cty.is_integer(f) and is_01(v) {
+            return int_resize(v, false, tt);
+        }
         return ir.zext(cg.B, truth(v, f), tt);
     }
     if cty.is_integer(t) {
@@ -531,18 +579,38 @@ pub fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
 fn binary(e: *mut cast.Expr) *mut ir.Value {
     let op = e.op;
     if (op == ct.P_ANDAND) or (op == ct.P_OROR) {
-        let yes = cg.new_block("true");
-        let no = cg.new_block("false");
+        // the first operand decides whether the second is evaluated; the
+        // second's truth is then the value, without a branch on it (a
+        // call's _Bool result returned as it is)
+        let is_and = op == ct.P_ANDAND;
+        let mid = cg.new_block(u.pick(is_and, "and", "or"));
+        let short = cg.new_block(u.pick(is_and, "false", "true"));
         let done = cg.new_block("logic");
-        branch(e, yes, no);
-        cg.at_end(yes);
+        if is_and {
+            branch(e.a, mid, short);
+        } else {
+            branch(e.a, short, mid);
+        }
+        cg.at_end(mid);
+        let mut v = ir.vnil();
+        if e.b.ty.unq.kind == cty.TK_BOOL {
+            v = int_resize(rv(e.b), false, lty(e.ty));  // (0 or 1)
+        } else {
+            v = i1_to(e.ty, truth(rv(e.b), e.b.ty));
+        }
+        let from = cg.B.blk;
         ir.br(cg.B, done);
-        cg.at_end(no);
+        cg.at_end(short);
         ir.br(cg.B, done);
         cg.at_end(done);
         let ph = ir.phi(cg.B, lty(e.ty));
-        ir.add_incoming(ph, ir.cint(lty(e.ty), 1), yes);
-        ir.add_incoming(ph, ir.cint(lty(e.ty), 0), no);
+        ir.add_incoming(ph, v, from);
+        let mut sv: u64 = 1;
+        if is_and {
+            sv = 0;
+        }
+        ir.add_incoming(ph, ir.cint(lty(e.ty), sv), short);
+        note_01(ph);
         return ph;
     }
     if (op == ct.P_LT) or (op == ct.P_GT) or (op == ct.P_LE) or (op == ct.P_GE) or (op == ct.P_EQ) or (op == ct.P_NE) {
