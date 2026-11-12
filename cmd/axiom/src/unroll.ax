@@ -747,6 +747,326 @@ pub fn full_unroll(f: *mut ir.Func) bool {
 }
 
 // -----------------------------------------------------------------------------
+// Unrolling by two of a small innermost loop whose trip count is not known:
+//
+//     H: i = phi [s, P], [i + 1, L];  condbr (i < n) -> S, X     (n invariant)
+//
+// becomes, ahead of it, a loop running the body twice per test
+//
+//     P:  condbr (n > MIN) -> H2, H           (else n - 1 wraps; H runs no times)
+//     H2: i2 = phi [s, P], [.., L'']; condbr (i2 < n - 1) -> S', H
+//     S'..L': the body for i2;  H'': the body for i2 + 1 (its test dropped:
+//     i2 + 1 < n);  L'' -> H2
+//
+// and the loop itself, entered from H2 with the values there, runs the one
+// iteration that may be left (i2 < n - 1 is i2 + 1 < n, as n - 1 does not
+// wrap). < may be signed or unsigned (MIN: the type's least value). Only for
+// a loop that leaves at H, or for a failed check (a block that traps), and
+// whose values used after it are H's, which still runs last; no calls in it,
+// nothing volatile or atomic, and nothing in H with an effect (H runs again
+// after H2 with H2's values).
+// The test and a back edge per two iterations go, and the operations of the
+// two bodies overlap.
+// -----------------------------------------------------------------------------
+const RUNTIME_SIZE: i64 = 24;
+const RUNTIME_FUNC_VALUES: i32 = 3000;
+
+let mut runtime_f: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+let mut runtime_done: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0),
+                                                                        len: 0, cap: 0 };
+
+fn runtime_seen(f: *mut ir.Func, h: *mut ir.Block) bool {
+    if f != runtime_f {
+        runtime_f = f;
+        runtime_done.clear();
+    }
+    for k in 0..runtime_done.len {
+        if runtime_done.get(k) == h {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The loop's counter i (or its truncation), compared with n (`i < n` keeps
+// it in the loop): its step is +1 along the one latch. Sets *n and *signed_.
+fn runtime_counter(h: *mut ir.Block, tag: i64, stay: *mut ir.Block, latch: *mut ir.Block, n: *mut *mut ir.Value,
+                   signed_: *mut bool) *mut ir.Value {
+    let t = ir.terminator(h);
+    let c = ir.resolve(t.a);
+    if not ir.is_op(c, ir.OP_ICMP) {
+        return vnil();
+    }
+    let mut pred = ir.pred_of(c);
+    let mut i = ir.resolve(c.a);
+    let mut lim = ir.resolve(c.b);
+    if t.t1 != stay {
+        // (leaving when the compare holds: staying while its inverse does)
+        if pred == ir.IntSGE {
+            pred = ir.IntSLT;
+        } else if pred == ir.IntUGE {
+            pred = ir.IntULT;
+        } else {
+            return vnil();
+        }
+    }
+    if (pred == ir.IntSGT) or (pred == ir.IntUGT) {
+        // n > i
+        let x = i;
+        i = lim;
+        lim = x;
+        if pred == ir.IntSGT {
+            pred = ir.IntSLT;
+        } else {
+            pred = ir.IntULT;
+        }
+    }
+    if (pred != ir.IntSLT) and (pred != ir.IntULT) {
+        return vnil();
+    }
+    // (or the counter's low bits, trunc(i): trunc(i) + 1 is trunc(i + 1))
+    let mut ph = i;
+    if ir.is_op(i, ir.OP_TRUNC) and (i.blk == h) {
+        ph = ir.resolve(i.a);
+    }
+    if not ir.is_op(ph, ir.OP_PHI) or (ph.blk != h) or (ph.xs.len != 2) or (ph.ty.kind != ir.T_INT) or
+       (i.ty.kind != ir.T_INT) or (i.ty.bits > 64) or opt.in_members(lim, tag) {
+        return vnil();
+    }
+    let st = ir.resolve(ir.incoming(ph, latch));
+    if not ir.is_op(st, ir.OP_ADD) or (ir.resolve(st.a) != ph) or not ir.is_cint(ir.resolve(st.b)) or
+       (ir.cint_val(ir.resolve(st.b)) != 1) {
+        return vnil();
+    }
+    n.* = lim;
+    signed_.* = pred == ir.IntSLT;
+    return i;
+}
+
+fn try_runtime(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    let t = ir.terminator(h);
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) or runtime_seen(f, h) {
+        return false;
+    }
+    // (not a loop unrolled already, by a constant factor)
+    if f == partial_f {
+        for k in 0..partial_done.len {
+            if partial_done.get(k) == h {
+                return false;
+            }
+        }
+    }
+    // (the header's test is the loop's: one way stays in it, the other
+    // leaves)
+    let mut stay = t.t1;
+    let mut out = t.t2;
+    if stay.mark != tag {
+        stay = t.t2;
+        out = t.t1;
+    }
+    if (stay.mark != tag) or (out.mark == tag) or (stay == h) {
+        return false;
+    }
+    // one latch, one way in (P, ending in `br h`), no loop inside
+    let mut latch = ir.bnil();
+    let mut pre = ir.bnil();
+    for k in 0..h.preds.len {
+        let q = h.preds.get(k);
+        if q.mark == tag {
+            if u.notnil(latch) {
+                return false;
+            }
+            latch = q;
+        } else {
+            if u.notnil(pre) {
+                return false;
+            }
+            pre = q;
+        }
+    }
+    if u.isnil(latch) or u.isnil(pre) or (ir.terminator(pre).op != ir.OP_BR) {
+        return false;
+    }
+    for k in 1..members.len {
+        if opt.is_loop_header(members.get(k)) {
+            return false;
+        }
+    }
+    // (h computes only its test: the first body's header H2 leaves for h
+    // when its test fails, where h computes what H2 did again; nothing it
+    // does may then happen twice)
+    let mut hv = h.first;
+    while u.notnil(hv) and (hv != t) {
+        if (hv.op != ir.OP_PHI) and (ir.has_effects(hv) or (hv.op == ir.OP_CALL) or (hv.op == ir.OP_ALLOCA)) {
+            return false;
+        }
+        hv = hv.next;
+    }
+    // (nor a loop that waits on memory other threads write: volatile and
+    // atomic accesses, which unrolling gains nothing in)
+    for k in 0..members.len {
+        let mut v = members.get(k).first;
+        while u.notnil(v) {
+            let op = v.op;
+            if (((op == ir.OP_LOAD) or (op == ir.OP_STORE)) and (v.flags != 0)) or (op == ir.OP_RMW) or
+               (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
+                return false;
+            }
+            v = v.next;
+        }
+    }
+    let size = loop_size(members);
+    if (size < 0) or (size > RUNTIME_SIZE) or has_side_exits(h, tag, members, false) or not uses_ok(h, tag, false) {
+        return false;
+    }
+    let mut n = vnil();
+    let mut signed_ = false;
+    let iv = runtime_counter(h, tag, stay, latch, &mut n, &mut signed_);
+    if u.isnil(iv) {
+        return false;
+    }
+    // P: n - 1, and whether it wraps
+    let bld = ir.new_builder();
+    let pt = ir.terminator(pre);
+    ir.at_before(bld, pt);
+    let ty = iv.ty;
+    let mut least: u64 = 0;
+    let mut pl = ir.IntUGT;
+    let mut pc = ir.IntULT;
+    if signed_ {
+        least = @as(u64, 1) << @int_cast(u32, ty.bits - 1);
+        pl = ir.IntSGT;
+        pc = ir.IntSLT;
+    }
+    let mut ok = ir.cint(ir.t_int(1), 1);
+    if not (signed_ and ir.is_op(n, ir.OP_SEXT) and (n.a.ty.bits < ty.bits)) {
+        // (a narrower value sign-extended is above the least value already)
+        ok = ir.icmp(bld, pl, n, ir.cint(ty, least));
+    }
+    let lim = ir.sub(bld, n, ir.cint(ty, 1));
+    // the entry values of h's phis
+    let mut from = u.List.[*mut ir.Block].empty();
+    let mut latches = u.List.[*mut ir.Block].empty();
+    let mut ins = u.List.[*mut ir.Value].empty();
+    from.push(pre);
+    latches.push(latch);
+    let mut q = h.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        ins.push(ir.resolve(ir.incoming(q, pre)));
+        q = q.next;
+    }
+    let side = has_side_exits(h, tag, members, true);
+    // the first body (its header H2 testing i2 < n - 1), entered from P
+    let h2 = chain_copy(f, h, stay, tag, members, &latches, side, h, &mut from, &mut ins, false, false);
+    let h2t = ir.terminator(h2);
+    let iv2 = opt.member_copy(iv, tag);
+    ir.at_before(bld, h2t);
+    let c2 = ir.icmp(bld, pc, iv2, lim);
+    h2t.op = ir.OP_CONDBR;
+    h2t.a = c2;
+    h2t.t2 = h;
+    // (h's values as H2 has them, for h's phis on the edge from H2)
+    let mut at_h2 = u.List.[*mut ir.Value].empty();
+    q = h.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        at_h2.push(opt.member_copy(q, tag));
+        q = q.next;
+    }
+    // the second body, entered from the first's latch (now into its own
+    // header copy H''), going back to H2
+    let h3 = chain_copy(f, h, stay, tag, members, &latches, side, h2, &mut from, &mut ins, false, true);
+    for k in 0..from.len {
+        ir.retarget(from.get(k), h3, h2);
+    }
+    let mut j: usize = 0;
+    q = h2.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for k in 0..from.len {
+            ir.add_incoming(q, ins.get((j * from.len) + k), from.get(k));
+        }
+        j += 1;
+        q = q.next;
+    }
+    // h: entered from P when n - 1 wraps, and from H2 for what is left
+    j = 0;
+    q = h.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        ir.add_incoming(q, at_h2.get(j), h2);
+        j += 1;
+        q = q.next;
+    }
+    if ir.is_cint(ok) {
+        // (h is no longer entered from P)
+        pt.t1 = h2;
+        q = h.first;
+        while u.notnil(q) and (q.op == ir.OP_PHI) {
+            let mut e: usize = 0;
+            while e < ir.bs_of(q).len {
+                if ir.bs_of(q).get(e) == pre {
+                    ir.remove_incoming(q, e);
+                } else {
+                    e += 1;
+                }
+            }
+            q = q.next;
+        }
+    } else {
+        pt.op = ir.OP_CONDBR;
+        pt.a = ok;
+        pt.t1 = h2;
+        pt.t2 = h;
+    }
+    runtime_done.push(h);
+    runtime_done.push(h2);
+    at_h2.deinit();
+    ins.deinit();
+    from.deinit();
+    latches.deinit();
+    ir.apply_forwarding(f);
+    return true;
+}
+
+/// Unrolls small innermost loops of f whose trip count is not known by two
+/// (see above); true if it did any.
+pub fn runtime_unroll(f: *mut ir.Func) bool {
+    // (not in a big function: the backend's work grows faster than the
+    // code, and a hot loop is more likely in a small one)
+    if u.isnil(f.first) or not budget_left() or (f.nvals > RUNTIME_FUNC_VALUES) {
+        return false;
+    }
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) and not any {
+        any = maybe_header(b);
+        b = b.next;
+    }
+    if not any {
+        return false;
+    }
+    opt.compute_preds(f);
+    let mut order = opt.dominators(f);
+    let hs = opt.loop_headers(&order);
+    let mut members = u.List.[*mut ir.Block].empty();
+    let mut did = false;
+    for k in 0..hs.len {
+        unroll_mark += 1;
+        opt.members_of(hs.get(k), unroll_mark, &mut members);
+        if try_runtime(f, hs.get(k), unroll_mark, &members) {
+            did = true;
+            // (the dominator tree and predecessors of the new blocks, which
+            // the next loops ask)
+            opt.compute_preds(f);
+            order.deinit();
+            order = opt.dominators(f);
+        }
+    }
+    members.deinit();
+    order.deinit();
+    hs.deinit();
+    return did;
+}
+
+// -----------------------------------------------------------------------------
 // Loop fusion: two loops in a row with the same constant trip count,
 //
 //   for k in 0..n { s += a[k] * b[k * n + j] }      r[j] = s

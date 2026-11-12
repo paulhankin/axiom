@@ -1,0 +1,501 @@
+// =============================================================================
+// loops.ax - counters narrower than a pointer, widened, and the addresses
+// computed from them.
+//
+// A loop counter of a type narrower than a pointer (C's `int i`) indexes
+// through an extension, `p + sext(i) * 4`, which the machine computes in
+// every iteration (x86-64's movslq, AArch64's sxtw), and `i + k` is added in
+// the narrow type and then extended. Where the counter's step cannot wrap
+// (its add is marked F_NSW or F_NUW: C's signed arithmetic, a range loop),
+// the loop gets a counter of the pointer's width that is always the narrow
+// one extended:
+//
+//     H: i = phi [s, pre], [i +nsw c, latch]      W = phi [sext s, pre], [W + c, latch]
+//
+// (by induction: W = sext(i) holds on entry, and sext(i + c) = sext(i) + c
+// when i + c does not overflow). Then
+//
+//   - sext(i) is W, sext(i +nsw c) is W + c;
+//   - sext(a +nsw b), sext(a -nsw b), sext(a *nsw k) with a and b counters,
+//     loop invariants or constants are the operations on their extensions
+//     (each a counter's wide one, or made before the loop), the same for
+//     zext with F_NUW;
+//   - a compare of i with a constant or a loop invariant compares W with its
+//     extension (an extension keeps the order of the values it extends: sext
+//     both the signed and the unsigned one, zext the unsigned one);
+//   - other uses of i take trunc(W) (the same bits).
+//
+// The narrow counter is then unused, and the address computed in the loop
+//
+//     p + (u + v) * k    with p, u invariant  ->  (p + u * k) + v * k
+//
+// takes one addressing mode (or one pointer, gvn.reduce_addresses) per
+// access, the invariant part made once before the loop (pointer arithmetic
+// wraps: this holds for all values).
+// =============================================================================
+import "gvn.ax" as gvn;
+import "ir.ax" as ir;
+import "opt.ax" as opt;
+import "util.ax" as u;
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+// The narrow values (counters and their steps) and their wide versions, for
+// the function (an inner loop extends an outer loop's counter as its wide one).
+let mut narrow: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                  cap: 0 };
+let mut wide: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                cap: 0 };
+let mut wide_op: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+
+// Extensions of loop invariants made in the current loop's preheader.
+let mut made_of: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                   cap: 0 };
+let mut made: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                cap: 0 };
+let mut made_op: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+
+let mut loop_tag: i64 = 0x2000_0000_0000;
+
+fn invariant(v: *ir.Value, tag: i64) bool {
+    return u.isnil(v) or (v.kind != ir.V_INST) or u.isnil(v.blk) or (v.blk.mark != tag);
+}
+
+// The flag an extension op (OP_SEXT, OP_ZEXT) of an operation needs for it
+// to be the operation on the extensions.
+fn flag_for(ext: i32) u32 {
+    if ext == ir.OP_SEXT {
+        return ir.F_NSW;
+    }
+    return ir.F_NUW;
+}
+
+// The wide version of v for extension ext, if v is a counter widened so.
+fn wide_of(v: *mut ir.Value, ext: i32) *mut ir.Value {
+    for k in 0..narrow.len {
+        if (narrow.get(k) == v) and (wide_op.get(k) == ext) {
+            return wide.get(k);
+        }
+    }
+    return vnil();
+}
+
+// ext(v) to t for a loop invariant v: before the preheader's terminator
+// (once per loop), a constant folded.
+fn ext_invariant(bld: *mut ir.Builder, pre: *mut ir.Block, v: *mut ir.Value, ext: i32, t: *mut ir.Ty) *mut ir.Value {
+    if ir.is_cint(v) {
+        return ir.cast(bld, ext, v, t);
+    }
+    let w = wide_of(v, ext);
+    if u.notnil(w) {
+        return w;
+    }
+    for k in 0..made_of.len {
+        if (made_of.get(k) == v) and (made_op.get(k) == ext) {
+            return made.get(k);
+        }
+    }
+    ir.at_before(bld, ir.terminator(pre));
+    let x = ir.cast(bld, ext, v, t);
+    made_of.push(v);
+    made.push(x);
+    made_op.push(ext);
+    return x;
+}
+
+// Can ext(v) (in the loop marked tag) be computed from the extensions of
+// its parts, one of them a widened counter (any: so far)?
+fn splits(v0: *mut ir.Value, ext: i32, tag: i64, any: *mut bool, depth: i32) bool {
+    let v = ir.resolve(v0);
+    if ir.is_cint(v) {
+        return true;
+    }
+    if u.notnil(wide_of(v, ext)) {
+        any.* = true;
+        return true;
+    }
+    if invariant(v, tag) {
+        return true;
+    }
+    if (depth > 4) or not ir.no_wrap(v, flag_for(ext)) or (v.blk.mark != tag) {
+        return false;
+    }
+    if v.op == ir.OP_MUL {
+        return ir.is_cint(ir.resolve(v.b)) and splits(v.a, ext, tag, any, depth + 1);
+    }
+    if (v.op == ir.OP_ADD) or (v.op == ir.OP_SUB) {
+        return splits(v.a, ext, tag, any, depth + 1) and splits(v.b, ext, tag, any, depth + 1);
+    }
+    return false;
+}
+
+// ext(v) to t from the extensions of its parts (splits), built before at.
+fn split(bld: *mut ir.Builder, pre: *mut ir.Block, at: *mut ir.Value, v0: *mut ir.Value, ext: i32, t: *mut ir.Ty,
+         tag: i64) *mut ir.Value {
+    let v = ir.resolve(v0);
+    let w = wide_of(v, ext);
+    if u.notnil(w) {
+        return w;
+    }
+    if ir.is_cint(v) or invariant(v, tag) {
+        return ext_invariant(bld, pre, v, ext, t);
+    }
+    let a = split(bld, pre, at, v.a, ext, t, tag);
+    let b = split(bld, pre, at, v.b, ext, t, tag);
+    ir.at_before(bld, at);
+    let r = ir.binop(bld, v.op, a, b);
+    // (the narrow operation did not overflow: nor does the wide one)
+    if r.kind == ir.V_INST {
+        r.flags = r.flags | flag_for(ext);
+    }
+    return r;
+}
+
+// The counter's step: the latch's input n of phi p, `p + c` or `p - c` (c a
+// constant) marked as not wrapping for ext; nil otherwise.
+fn step_of(p: *mut ir.Value, latch: *mut ir.Block, ext: i32) *mut ir.Value {
+    let n = ir.resolve(ir.incoming(p, latch));
+    if not ir.no_wrap(n, flag_for(ext)) or ((n.op != ir.OP_ADD) and (n.op != ir.OP_SUB)) {
+        return vnil();
+    }
+    if (ir.resolve(n.a) != p) or not ir.is_cint(ir.resolve(n.b)) {
+        return vnil();
+    }
+    return n;
+}
+
+// Is the value worth a wide counter: extended to the pointer's width in the
+// loop, itself or in an operation on it?
+fn extended(f: *mut ir.Func, p: *mut ir.Value, n: *mut ir.Value, ext: i32, t: *mut ir.Ty) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ext) and (i.ty == t) {
+                let x = ir.resolve(i.a);
+                if (x == p) or (x == n) {
+                    return true;
+                }
+                if ir.no_wrap(x, flag_for(ext)) {
+                    let xa = ir.resolve(x.a);
+                    let xb = ir.resolve(x.b);
+                    if (xa == p) or (xa == n) or (xb == p) or (xb == n) {
+                        return true;
+                    }
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+// Is a compare of a value extended by ext (both operands) the same compare?
+fn order_kept(pred: i32, ext: i32) bool {
+    if ext == ir.OP_SEXT {
+        return true;
+    }
+    return (pred == ir.IntEQ) or (pred == ir.IntNE) or (pred == ir.IntULT) or (pred == ir.IntULE) or
+           (pred == ir.IntUGT) or (pred == ir.IntUGE);
+}
+
+// The uses of p and n (other than n's of p) as uses of the wide counter w
+// and its step wn: extensions, compares in the loop, the rest through
+// truncations.
+fn rewrite_uses(f: *mut ir.Func, p: *mut ir.Value, n: *mut ir.Value, w: *mut ir.Value, wn: *mut ir.Value, ext: i32,
+                h: *mut ir.Block, pre: *mut ir.Block, tag: i64) void {
+    let bld = ir.new_builder();
+    let mut tp = vnil();  // trunc(w), after h's phis
+    let mut tn = vnil();  // trunc(wn), after wn
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if (i == p) or (i == n) or (i == w) or (i == wn) or (i == tp) or (i == tn) {
+                i = next;
+                continue;
+            }
+            if (i.op == ext) and (i.ty == w.ty) and ((i.a == p) or (i.a == n)) {
+                if i.a == p {
+                    ir.forward(i, w);
+                } else {
+                    ir.forward(i, wn);
+                }
+                i = next;
+                continue;
+            }
+            if (i.op == ir.OP_ICMP) and (b.mark == tag) and order_kept(ir.pred_of(i), ext) {
+                let ap = (i.a == p) or (i.a == n);
+                let bp = (i.b == p) or (i.b == n);
+                if ap != bp {
+                    let mut other = i.a;
+                    let mut mine = i.b;
+                    if ap {
+                        other = i.b;
+                        mine = i.a;
+                    }
+                    if invariant(other, tag) {
+                        let wo = ext_invariant(bld, pre, other, ext, w.ty);
+                        let mut wm = wn;
+                        if mine == p {
+                            wm = w;
+                        }
+                        if ap {
+                            i.a = wm;
+                            i.b = wo;
+                        } else {
+                            i.a = wo;
+                            i.b = wm;
+                        }
+                        i = next;
+                        continue;
+                    }
+                }
+            }
+            // the rest: the narrow value as the wide one's low bits
+            let uses_p = (i.a == p) or (i.b == p) or (i.c == p) or in_xs(i, p);
+            let uses_n = (i.a == n) or (i.b == n) or (i.c == n) or in_xs(i, n);
+            if uses_p and u.isnil(tp) {
+                let mut at = h.first;
+                while at.op == ir.OP_PHI {
+                    at = at.next;
+                }
+                ir.at_before(bld, at);
+                tp = ir.trunc(bld, w, p.ty);
+                // (an operation on the truncation is one on the counter, for split)
+                narrow.push(tp);
+                wide.push(w);
+                wide_op.push(ext);
+            }
+            if uses_n and u.isnil(tn) {
+                ir.at_before(bld, wn.next);
+                tn = ir.trunc(bld, wn, n.ty);
+                narrow.push(tn);
+                wide.push(wn);
+                wide_op.push(ext);
+            }
+            if uses_p {
+                replace_operand(i, p, tp);
+            }
+            if uses_n {
+                replace_operand(i, n, tn);
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+}
+
+fn in_xs(i: *ir.Value, v: *mut ir.Value) bool {
+    for k in 0..i.xs.len {
+        if i.xs.get(k) == v {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn replace_operand(i: *mut ir.Value, old: *mut ir.Value, new: *mut ir.Value) void {
+    if i.a == old {
+        i.a = new;
+    }
+    if i.b == old {
+        i.b = new;
+    }
+    if i.c == old {
+        i.c = new;
+    }
+    for k in 0..i.xs.len {
+        if i.xs.get(k) == old {
+            i.xs.set(k, new);
+        }
+    }
+}
+
+// The counters of the loop at h (marked tag) widened; true if any was.
+fn widen_counters(f: *mut ir.Func, h: *mut ir.Block, pre: *mut ir.Block, latch: *mut ir.Block, tag: i64) bool {
+    let t = ir.isz();
+    let mut any = false;
+    let mut p = h.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let next = p.next;
+        if (p.ty.kind == ir.T_INT) and (p.ty.bits < t.bits) and (p.xs.len == 2) {
+            let mut ext = ir.OP_SEXT;
+            let mut n = step_of(p, latch, ext);
+            if u.isnil(n) {
+                ext = ir.OP_ZEXT;
+                n = step_of(p, latch, ext);
+            }
+            if u.notnil(n) and extended(f, p, n, ext, t) {
+                let bld = ir.new_builder();
+                let s = ext_invariant(bld, pre, ir.resolve(ir.incoming(p, pre)), ext, t);
+                ir.at_before(bld, p);
+                let w = ir.phi(bld, t);
+                ir.at_before(bld, n.next);
+                let wn = ir.binop(bld, n.op, w, ir.cast(bld, ext, ir.resolve(n.b), t));
+                wn.flags = wn.flags | flag_for(ext);
+                ir.add_incoming(w, s, pre);
+                ir.add_incoming(w, wn, latch);
+                rewrite_uses(f, p, n, w, wn, ext, h, pre, tag);
+                narrow.push(p);
+                wide.push(w);
+                wide_op.push(ext);
+                narrow.push(n);
+                wide.push(wn);
+                wide_op.push(ext);
+                any = true;
+            }
+        }
+        p = next;
+    }
+    return any;
+}
+
+// In the loop marked tag: extensions of operations split (splits), and
+// addresses p + (u + v) * k with p and u invariant reassociated.
+fn rewrite_loop(f: *mut ir.Func, members: *u.List.[*mut ir.Block], pre: *mut ir.Block, tag: i64) bool {
+    let bld = ir.new_builder();
+    let mut any = false;
+    for mi in 0..members.len {
+        let mut i = members.get(mi).first;
+        while u.notnil(i) {
+            let next = i.next;
+            let op = i.op;
+            if ((op == ir.OP_SEXT) or (op == ir.OP_ZEXT)) and (i.ty == ir.isz()) {
+                let x = ir.resolve(i.a);
+                let mut one = false;
+                if ir.no_wrap(x, flag_for(op)) and (x.blk.mark == tag) and splits(x, op, tag, &mut one, 0) and one {
+                    ir.forward(i, split(bld, pre, i, x, op, i.ty, tag));
+                    any = true;
+                }
+            } else if op == ir.OP_PTRADD {
+                if reassociate(bld, pre, i, tag) {
+                    any = true;
+                }
+            }
+            i = next;
+        }
+    }
+    if any {
+        ir.apply_forwarding(f);
+    }
+    return any;
+}
+
+// i = p + off in the loop, p invariant, off = (u + v) * k or u + v (k a
+// constant multiplier or shift; u invariant, v not): (p + u * k) + v * k,
+// the first ptradd before the loop.
+fn reassociate(bld: *mut ir.Builder, pre: *mut ir.Block, i: *mut ir.Value, tag: i64) bool {
+    let base = ir.resolve(i.a);
+    let off = ir.resolve(i.b);
+    if not invariant(base, tag) or invariant(off, tag) {
+        return false;
+    }
+    let mut sum = off;
+    let mut scale = vnil();
+    if (ir.is_op(off, ir.OP_MUL) or ir.is_op(off, ir.OP_SHL)) and ir.is_cint(ir.resolve(off.b)) {
+        sum = ir.resolve(off.a);
+        scale = off;
+    }
+    if not ir.is_op(sum, ir.OP_ADD) or not (sum.blk.mark == tag) {
+        return false;
+    }
+    let mut x = ir.resolve(sum.a);
+    let mut y = ir.resolve(sum.b);
+    if invariant(y, tag) and not invariant(x, tag) {
+        let s = x;
+        x = y;
+        y = s;
+    }
+    if not invariant(x, tag) or invariant(y, tag) or ir.is_cint(x) {
+        return false;
+    }
+    // the invariant part before the loop
+    ir.at_before(bld, ir.terminator(pre));
+    let mut xo = x;
+    if u.notnil(scale) {
+        xo = ir.binop(bld, scale.op, x, ir.resolve(scale.b));
+    }
+    let nb = ir.ptradd(bld, base, xo);
+    // and the varying part in place
+    ir.at_before(bld, i);
+    let mut yo = y;
+    if u.notnil(scale) {
+        yo = ir.binop(bld, scale.op, y, ir.resolve(scale.b));
+    }
+    i.a = nb;
+    i.b = yo;
+    return true;
+}
+
+/// Widens the counters of f's loops narrower than a pointer whose steps do
+/// not wrap, and reassociates the addresses computed from them; true if
+/// anything changed.
+pub fn widen(f: *mut ir.Func) bool {
+    if u.isnil(f.first) or (ir.isz().bits < 64) {
+        return false;
+    }
+    ir.apply_forwarding(f);
+    opt.compute_preds(f);
+    let mut order = opt.dominators(f);
+    let mut hs = opt.loop_headers(&order);
+    if hs.len == 0 {
+        order.deinit();
+        hs.deinit();
+        return false;
+    }
+    narrow.clear();
+    wide.clear();
+    wide_op.clear();
+    let mut members = u.List.[*mut ir.Block].empty();
+    let mut any = false;
+    // (outer loops first: an inner loop takes an outer counter's wide one
+    // as an invariant's extension; headers come in rpo)
+    for hi in 0..hs.len {
+        let h = hs.get(hi);
+        loop_tag += 1;
+        opt.members_of(h, loop_tag, &mut members);
+        if gvn.make_preheader(f, h, loop_tag) {
+            // (dominators of the new block: the next loops ask)
+            opt.compute_preds(f);
+            order.deinit();
+            order = opt.dominators(f);
+            loop_tag += 1;
+            opt.members_of(h, loop_tag, &mut members);
+        }
+        let tg = loop_tag;
+        let mut pre = ir.bnil();
+        let mut latch = ir.bnil();
+        let mut nlatch: i32 = 0;
+        for k in 0..h.preds.len {
+            let q = h.preds.get(k);
+            if q.mark == tg {
+                latch = q;
+                nlatch += 1;
+            } else {
+                pre = q;
+            }
+        }
+        if u.isnil(pre) or (nlatch != 1) or (ir.succ_count(ir.terminator(pre)) != 1) {
+            continue;
+        }
+        made_of.clear();
+        made.clear();
+        made_op.clear();
+        if widen_counters(f, h, pre, latch, tg) {
+            any = true;
+            ir.apply_forwarding(f);
+        }
+        if rewrite_loop(f, &members, pre, tg) {
+            any = true;
+        }
+    }
+    members.deinit();
+    order.deinit();
+    hs.deinit();
+    return any;
+}

@@ -2864,6 +2864,7 @@ fn visit_block(b: *mut ir.Block) void {
             let m = ub(i.b, 0);
             if (m >= 0) and (m <= kv(i.a)) {
                 let k = i.a;
+                ir.no_wrap_clear(i);
                 i.op = ir.OP_XOR;
                 i.a = i.b;
                 i.b = k;
@@ -2879,6 +2880,9 @@ fn visit_block(b: *mut ir.Block) void {
                 }
             }
             if u.notnil(r) {
+                // (r, which dominates i, now stands for i too: what i's
+                // flags do not say no longer holds of it)
+                ir.no_wrap_meet(r, i);
                 replace(i, r);
             } else {
                 add_expr(i, i);
@@ -3952,7 +3956,7 @@ let mut loop_mark: i64 = 0x1000_0000;
 
 // A preheader for h (members marked `tag`): the only outside predecessor
 // when it ends in `br h`, else a new block the outside edges go through.
-fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
+pub fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
     let mut outside = u.List.[*mut ir.Block].empty();
     for k in 0..h.preds.len {
         let p = h.preds.get(k);
@@ -4074,6 +4078,11 @@ pub fn licm(f: *mut ir.Func) bool {
         opt.members_of(hs.get(k), loop_mark, &mut members);
         if guard_loop(f, hs.get(k), loop_mark, &members) {
             gd = true;
+            // (the dominator tree as it now is, which the next loop's
+            // values_stay_in asks)
+            order.deinit();
+            opt.compute_preds(f);
+            order = opt.dominators(f);
         }
     }
     if gd {
@@ -4142,11 +4151,235 @@ pub fn licm(f: *mut ir.Func) bool {
                 i = next;
             }
         }
+        if promote(f, h, tag, &members, pre) {
+            any = true;
+            // (the exits' new blocks in the dominator tree, which the loops
+            // around this one ask)
+            opt.compute_preds(f);
+            order.deinit();
+            order = opt.dominators(f);
+        }
     }
     members.deinit();
     order.deinit();
     hs.deinit();
     return any or made;
+}
+
+// -----------------------------------------------------------------------------
+// Promotion of a location to a register across a loop: a global at a fixed
+// address that the loop stores to (a counter, `steps += 1`) and accesses only
+// by that address, with nothing else in the loop that may read or write it
+// (no call, no access that may alias, nothing volatile or atomic, no fence),
+// is loaded before the loop, kept in a stack slot of its own in the loop
+// (which mem2reg makes a register), and stored back on every exit from the
+// loop. The store back writes nothing the program did not: the loop must
+// have stored to the location before any exit is taken (a store executes
+// before each exiting block, or, for the header's exit, on every way to the
+// latches of a loop entered through a guard, which runs it at least once),
+// or the exit must end the program (a trap). The load before the loop reads
+// what the program may not have read (a global, in bounds: it cannot fault).
+// No other thread can see the difference without a data race.
+// -----------------------------------------------------------------------------
+fn promotable_store(i: *ir.Value, tag: i64) bool {
+    if (i.op != ir.OP_STORE) or (i.flags != 0) or not invariant(i.b, tag) or (i.a.ty.size == 0) or
+       ((i.a.ty.kind != ir.T_INT) and (i.a.ty.kind != ir.T_FLOAT) and (i.a.ty.kind != ir.T_PTR)) {
+        return false;
+    }
+    let sz = @bit_cast(i64, i.a.ty.size);
+    let l = loc_of(i.b, sz);
+    if u.isnil(l.obj) or (l.obj.kind != ir.V_GLOBAL) or noalias_global(l.obj) or ir.gv_of(l.obj).is_const or
+       not deref_ok(&l, sz) or (l.rlo != l.rhi) {
+        return false;
+    }
+    return true;
+}
+
+// Do the loop's other instructions leave the location at p (type t) alone,
+// and are its own accesses all loads and stores of t at p?
+fn only_accessed_at(members: *u.List.[*mut ir.Block], p: *mut ir.Value, t: *mut ir.Ty) bool {
+    let l = loc_of(p, @bit_cast(i64, t.size));
+    let w = loc_write(&l);
+    for k in 0..members.len {
+        let mut i = members.get(k).first;
+        while u.notnil(i) {
+            let op = i.op;
+            if (op == ir.OP_LOAD) or (op == ir.OP_STORE) {
+                let mut addr = i.a;
+                let mut ty = i.ty;
+                if op == ir.OP_STORE {
+                    addr = i.b;
+                    ty = i.a.ty;
+                }
+                if i.flags != 0 {
+                    return false;
+                }
+                if ir.resolve(addr) == p {
+                    if ty != t {
+                        return false;
+                    }
+                } else {
+                    let x = loc_of(addr, @bit_cast(i64, ty.size));
+                    if may_alias(&x, &w) {
+                        return false;
+                    }
+                }
+            } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or (op == ir.OP_MEMSET) {
+                let n = size_of(i.c);
+                let d = loc_of(i.a, n);
+                if may_alias(&d, &w) {
+                    return false;
+                }
+                if op != ir.OP_MEMSET {
+                    let sl = loc_of(i.b, n);
+                    if may_alias(&sl, &w) {
+                        return false;
+                    }
+                }
+            } else if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
+                return false;
+            } else if (op == ir.OP_INTR) and
+                      ((ir.intr_props(ir.intr_id(i)) & (ir.INF_READS_MEM | ir.INF_WRITES_MEM | ir.INF_OPAQUE)) != 0) {
+                return false;
+            } else if ir.op_writes_mem(op) {
+                return false;
+            }
+            i = i.next;
+        }
+    }
+    return true;
+}
+
+// Has the loop stored to p before each of its exits is taken (see above)?
+fn stored_before_exits(h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block], p: *mut ir.Value) bool {
+    // the blocks of the stores
+    let mut sb = u.List.[*mut ir.Block].empty();
+    for k in 0..members.len {
+        let mut i = members.get(k).first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_STORE) and (ir.resolve(i.b) == p) {
+                sb.push(members.get(k));
+            }
+            i = i.next;
+        }
+    }
+    let mut ok = true;
+    for k in 0..members.len {
+        let b = members.get(k);
+        let t = ir.terminator(b);
+        for j in 0..ir.succ_count(t) {
+            let x = ir.succ(t, j);
+            if (x.mark == tag) or trap_exit(x, tag) {
+                continue;
+            }
+            if (b == h) and not dominated_by_any(b, &sb) {
+                // a guarded loop runs its body once: the header's exit is
+                // taken after a latch, which a store's block dominates
+                if u.isnil(first_body(h, tag)) {
+                    ok = false;
+                }
+                for q in 0..h.preds.len {
+                    let l = h.preds.get(q);
+                    if (l.mark == tag) and not dominated_by_any(l, &sb) {
+                        ok = false;
+                    }
+                }
+            } else if not dominated_by_any(b, &sb) {
+                ok = false;
+            }
+        }
+    }
+    sb.deinit();
+    return ok;
+}
+
+fn dominated_by_any(b: *mut ir.Block, sb: *u.List.[*mut ir.Block]) bool {
+    for k in 0..sb.len {
+        if opt.dominates(sb.get(k), b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Set when promote made a slot: mem2reg has work (passes.ax).
+pub let mut promoted: bool = false;
+
+fn promote(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block], pre: *mut ir.Block) bool {
+    let mut done = false;
+    for k in 0..members.len {
+        let mut i = members.get(k).first;
+        while u.notnil(i) and not done {
+            if promotable_store(i, tag) {
+                let p = ir.resolve(i.b);
+                let t = i.a.ty;
+                if only_accessed_at(members, p, t) and stored_before_exits(h, tag, members, p) {
+                    promote_at(f, tag, members, pre, p, t, i.align);
+                    done = true;
+                    promoted = true;
+                }
+            }
+            i = i.next;
+        }
+    }
+    return done;
+}
+
+fn promote_at(f: *mut ir.Func, tag: i64, members: *u.List.[*mut ir.Block], pre: *mut ir.Block, p: *mut ir.Value,
+              t: *mut ir.Ty, align: u32) void {
+    let bld = ir.new_builder();
+    ir.at_before(bld, f.first.first);
+    let slot = ir.alloca(bld, t, "promoted");
+    ir.at_before(bld, ir.terminator(pre));
+    let v0 = ir.load(bld, t, p);
+    v0.align = align;
+    _ = ir.store(bld, v0, slot);
+    // the loop's accesses to the slot
+    let mut exits = u.List.[*mut ir.Block].empty();
+    for k in 0..members.len {
+        let b = members.get(k);
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.op == ir.OP_LOAD) and (ir.resolve(i.a) == p) {
+                i.a = slot;
+                i.align = slot.align;
+            } else if (i.op == ir.OP_STORE) and (ir.resolve(i.b) == p) {
+                i.b = slot;
+                i.align = slot.align;
+            }
+            i = i.next;
+        }
+        let tm = ir.terminator(b);
+        for j in 0..ir.succ_count(tm) {
+            let x = ir.succ(tm, j);
+            let mut seen = false;
+            let mut q: usize = 0;
+            while q < exits.len {
+                if (exits.get(q) == b) and (exits.get(q + 1) == x) {
+                    seen = true;
+                }
+                q += 2;
+            }
+            if (x.mark != tag) and not seen {
+                exits.push(b);
+                exits.push(x);
+            }
+        }
+    }
+    // and its value stored back on the way out
+    let mut k: usize = 0;
+    while k < exits.len {
+        let b = exits.get(k);
+        let x = exits.get(k + 1);
+        let e = ir.edge_block(f, "promoted.exit", b, x);
+        ir.retarget(b, x, e);
+        ir.at_before(bld, ir.terminator(e));
+        let v = ir.load(bld, t, slot);
+        let st = ir.store(bld, v, p);
+        st.align = align;
+        k += 2;
+    }
+    exits.deinit();
 }
 
 // -----------------------------------------------------------------------------
@@ -4238,12 +4471,46 @@ fn guard_wanted(s: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bo
         }
         i = i.next;
     }
+    // or a store promote may keep in a register once the body runs
+    for k in 0..members.len {
+        let mut w = members.get(k).first;
+        while u.notnil(w) and not want {
+            if promotable_store(w, tag) and only_accessed_at(members, ir.resolve(w.b), w.a.ty) {
+                want = true;
+            }
+            w = w.next;
+        }
+    }
     return want;
 }
 
-// Are the header's values used only in the loop (and by the exit's phis on
-// the edge from the header)?
-fn values_stay_in(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
+// Are the header's values used only in the loop, by the exit's phis on the
+// edge from the header, in blocks the exit x does not reach without passing
+// through the loop (all ways to them still pass through the header), and
+// (when x has no other predecessor than the header) in blocks x dominates?
+// The guard then gives those last uses a phi in x of the header's value and
+// the guard's copy of it: every way to them passes through x, entered either
+// from the header or from the guard.
+fn values_stay_in(f: *mut ir.Func, h: *mut ir.Block, tag: i64, x: *mut ir.Block) bool {
+    let below_x = (x.preds.len == 1) and (x.preds.get(0) == h);
+    // the blocks x reaches outside the loop (aux = stamp)
+    loop_mark += 1;
+    let stamp = loop_mark;
+    let mut work = u.List.[*mut ir.Block].empty();
+    x.aux = stamp;
+    work.push(x);
+    while work.len > 0 {
+        let b = work.pop();
+        let t = ir.terminator(b);
+        for k in 0..ir.succ_count(t) {
+            let sb = ir.succ(t, k);
+            if (sb.mark != tag) and (sb.aux != stamp) {
+                sb.aux = stamp;
+                work.push(sb);
+            }
+        }
+    }
+    work.deinit();
     let mut b = f.first;
     while u.notnil(b) {
         if b.mark != tag {
@@ -4252,16 +4519,67 @@ fn values_stay_in(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
                 if y.op == ir.OP_PHI {
                     for k in 0..y.xs.len {
                         let from = ir.bs_of(y).get(k);
-                        if defined_in(ir.resolve(y.xs.get(k)), h) and (from.mark != tag) {
+                        if defined_in(ir.resolve(y.xs.get(k)), h) and (from.mark != tag) and (from.aux == stamp) and
+                           not (below_x and opt.dominates(x, from)) {
                             return false;
                         }
                     }
-                } else if defined_in(y.a, h) or defined_in(y.b, h) or defined_in(y.c, h) {
+                } else if (defined_in(y.a, h) or defined_in(y.b, h) or defined_in(y.c, h) or uses_in(y, h)) and
+                          (b.aux == stamp) and not (below_x and opt.dominates(x, b)) {
                     return false;
+                }
+                y = y.next;
+            }
+        }
+        b = b.next;
+    }
+    return true;
+}
+
+fn uses_in(y: *ir.Value, h: *mut ir.Block) bool {
+    for k in 0..y.xs.len {
+        if defined_in(y.xs.get(k), h) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// After guard_loop made G: the uses outside the loop (in blocks below the
+// exit x, values_stay_in) of a value v defined in the header h, other than
+// the exit's phis on the edge from h, use a phi in x of v (from h) and G's
+// copy of it (from g) instead.
+fn exit_phis(f: *mut ir.Func, h: *mut ir.Block, tag: i64, x: *mut ir.Block, g: *mut ir.Block, pre: *mut ir.Block) void {
+    let bld = ir.new_builder();
+    xphi_of.clear();
+    xphis.clear();
+    let stamp = x.aux;  // (values_stay_in's marks: the blocks x reaches)
+    let mut b = f.first;
+    while u.notnil(b) {
+        if (b.mark != tag) and (b != g) and (b.aux == stamp) {
+            let mut y = b.first;
+            while u.notnil(y) {
+                if y.op == ir.OP_PHI {
+                    for k in 0..y.xs.len {
+                        let from = ir.bs_of(y).get(k);
+                        let v = ir.resolve(y.xs.get(k));
+                        if defined_in(v, h) and (from.mark != tag) and (from != g) and (from.aux == stamp) {
+                            y.xs.set(k, exit_phi(bld, v, h, x, g, pre));
+                        }
+                    }
                 } else {
+                    if defined_in(y.a, h) {
+                        y.a = exit_phi(bld, y.a, h, x, g, pre);
+                    }
+                    if defined_in(y.b, h) {
+                        y.b = exit_phi(bld, y.b, h, x, g, pre);
+                    }
+                    if defined_in(y.c, h) {
+                        y.c = exit_phi(bld, y.c, h, x, g, pre);
+                    }
                     for k in 0..y.xs.len {
                         if defined_in(y.xs.get(k), h) {
-                            return false;
+                            y.xs.set(k, exit_phi(bld, y.xs.get(k), h, x, g, pre));
                         }
                     }
                 }
@@ -4270,7 +4588,28 @@ fn values_stay_in(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
         }
         b = b.next;
     }
-    return true;
+}
+
+// The phi in x of v for exit_phis (made once: xphi_of, xphis).
+let mut xphi_of: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                   cap: 0 };
+let mut xphis: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                 cap: 0 };
+
+fn exit_phi(bld: *mut ir.Builder, v: *mut ir.Value, h: *mut ir.Block, x: *mut ir.Block, g: *mut ir.Block,
+            pre: *mut ir.Block) *mut ir.Value {
+    for k in 0..xphi_of.len {
+        if xphi_of.get(k) == v {
+            return xphis.get(k);
+        }
+    }
+    ir.at_before(bld, x.first);
+    let p = ir.phi(bld, v.ty);
+    ir.add_incoming(p, v, h);
+    ir.add_incoming(p, guard_map(v, h, pre), g);
+    xphi_of.push(v);
+    xphis.push(p);
+    return p;
 }
 
 fn guard_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
@@ -4299,7 +4638,7 @@ fn guard_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
     if (s.mark != tag) or (x.mark == tag) or (s == h) or (s.preds.len != 1) {
         return false;
     }
-    if not cheap_test(h, t) or not guard_wanted(s, tag, members) or not values_stay_in(f, h, tag) {
+    if not cheap_test(h, t) or not guard_wanted(s, tag, members) or not values_stay_in(f, h, tag, x) {
         return false;
     }
     // P -> G -> P2 -> H
@@ -4341,6 +4680,7 @@ fn guard_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
         }
         q = q.next;
     }
+    exit_phis(f, h, tag, x, g, pre);
     ir.retarget(pre, h, g);
     q = h.first;
     while u.notnil(q) and (q.op == ir.OP_PHI) {

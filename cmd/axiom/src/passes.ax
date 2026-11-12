@@ -6,15 +6,18 @@
 //         if-conversion (thread.ax), removing copies of aggregates that are
 //         only read (copies.ax), scalar replacement of aggregates (sroa.ax),
 //         global value numbering, dead stores, bounds and loop-invariant code
-//         motion (gvn.ax), calls of a function itself in tail position as a
-//         loop (tailrec.ax); at the end, stack slots whose contents are
-//         never needed at the same time sharing their bytes (slots.ax)
+//         motion and globals kept in registers across loops (gvn.ax), loop
+//         counters narrower than a pointer widened (loops.ax), calls of a
+//         function itself in tail position as a loop (tailrec.ax); at the
+//         end, stack slots whose contents are never needed at the same time
+//         sharing their bytes (slots.ax)
 //   -O2+  also interprocedural constant propagation and inlining
 //         (inline.ax), bottom-up over the call graph, each function simplified
 //         again after its calls are inlined; then small loops with a constant
-//         trip count unrolled (unroll.ax), and the function simplified again;
-//         last, the calls in tail position that can leave the frame first
-//         marked for the backends (tailrec.ax: sibling calls)
+//         trip count unrolled (unroll.ax), and small loops whose trip count
+//         is not known by two, and the function simplified again; last, the
+//         calls in tail position that can leave the frame first marked for
+//         the backends (tailrec.ax: sibling calls)
 // =============================================================================
 import "copies.ax" as copies;
 import "cover.ax" as cover;
@@ -22,6 +25,7 @@ import "divconst.ax" as divc;
 import "gvn.ax" as gvn;
 import "inline.ax" as inl;
 import "ir.ax" as ir;
+import "loops.ax" as loops;
 import "opt.ax" as opt;
 import "outline.ax" as outl;
 import "slots.ax" as slots;
@@ -94,7 +98,22 @@ fn gvn_rounds(f: *mut ir.Func, level: i32) void {
 
 // Loop-invariant code motion, and the redundancies it exposes.
 fn licm(f: *mut ir.Func, level: i32) void {
+    gvn.promoted = false;
     if gvn.licm(f) {
+        if gvn.promoted {
+            opt.mem2reg(f);  // (the slots of locations promoted across loops)
+        }
+        _ = cleanup(f, level);
+        _ = gvn.gvn(f);
+        _ = cleanup(f, level);
+    }
+}
+
+// Counters narrower than a pointer widened (loops.ax), and what that leaves
+// to fold.
+fn widen(f: *mut ir.Func, level: i32) void {
+    if loops.widen(f) {
+        opt.dce(f);
         _ = cleanup(f, level);
         _ = gvn.gvn(f);
         _ = cleanup(f, level);
@@ -139,6 +158,7 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
             rounds += 1;
         }
         licm(f, level);
+        widen(f, level);
         if slp.compare_masks(f) {
             _ = cleanup(f, level);
         }
@@ -185,6 +205,7 @@ fn light_func(f: *mut ir.Func, level: i32) void {
         _ = cleanup(f, level);
     }
     licm(f, level);
+    widen(f, level);
     opt.dce(f);
     _ = gvn.sink(f);
     opt.dce(f);
@@ -289,6 +310,15 @@ fn finish_func(f: *mut ir.Func, level: i32) void {
     }
     if jams > 0 {
         optimize_func(f, level);
+    }
+    // small loops whose trip count is not known, by two (then the copies'
+    // constants folded and what they compute alike shared)
+    if unr.runtime_unroll(f) {
+        _ = cleanup(f, level);
+        _ = gvn.gvn(f);
+        _ = cleanup(f, level);
+        opt.dce(f);
+        ir.recycle(f);
     }
     let split = gvn.split_loops(f);
     if split or gvn.reduce_addresses(f, tg.is_wasm()) {

@@ -926,6 +926,48 @@ pub const F_VOLATILE: u32 = 1;
 pub const F_ATOMIC: u32 = 2;  // sequentially consistent
 // Call flags
 pub const F_TAIL: u32 = 4;  // a sibling call: the backend may jump to the callee (tailrec.ax: mark_sibling_calls)
+// Flags of add, sub, mul and shl (integers): the operation does not overflow
+// as a signed (F_NSW) or as an unsigned (F_NUW) operation, as integers of any
+// width (for shl: the bits shifted out are copies of the result's sign bit,
+// or zeros). A front end sets one only where an overflow would be undefined
+// behaviour (C's signed arithmetic) or cannot happen (the step of a range
+// loop, an operation checked for overflow before its result is used). Passes
+// may then compute what depends on the result differently in the case of an
+// overflow: sext(a +nsw b) as sext(a) + sext(b), a counter widened. Moving or
+// copying the instruction keeps the flag (where an overflowed result is
+// computed speculatively, nothing that matters uses it); a pass that changes
+// an operation's operands or operator in place clears it (no_wrap_clear),
+// and one that replaces an operation by an equal one keeps only the flags
+// both have (no_wrap_meet).
+pub const F_NSW: u32 = 8;
+pub const F_NUW: u32 = 16;
+pub const F_NO_WRAP: u32 = 24;
+
+// Does v (an add, sub, mul or shl) have flag fl (F_NSW, F_NUW)?
+pub fn no_wrap(v: *Value, fl: u32) bool {
+    if u.isnil(v) or (v.kind != V_INST) or ((v.flags & fl) == 0) {
+        return false;
+    }
+    let op = v.op;
+    return (op == OP_ADD) or (op == OP_SUB) or (op == OP_MUL) or (op == OP_SHL);
+}
+
+// v's operands or operator changed: the flags no longer hold.
+pub fn no_wrap_clear(v: *mut Value) void {
+    v.flags = v.flags & ~F_NO_WRAP;
+}
+
+// v takes the place of w (an equal value): v's flags only where both have them.
+pub fn no_wrap_meet(v: *mut Value, w: *Value) void {
+    if u.notnil(v) and (v.kind == V_INST) and ((v.flags & F_NO_WRAP) != 0) {
+        let keep = (w.kind == V_INST) and (w.op == v.op);
+        if keep {
+            v.flags = v.flags & (w.flags | ~F_NO_WRAP);
+        } else {
+            no_wrap_clear(v);
+        }
+    }
+}
 
 // An OP_MEMMOVE whose destination and source are the same bytes or apart,
 // never partly overlapping (a C structure assignment, C11 6.5.16.1p3), for
@@ -3505,6 +3547,12 @@ pub fn inst_str(v: *Value) []u8 {
     }
     if (v.op == OP_CALL) and ((v.flags & F_TAIL) != 0) {
         b.s(" tail");
+    }
+    if no_wrap(v, F_NSW) {
+        b.s(" nsw");
+    }
+    if no_wrap(v, F_NUW) {
+        b.s(" nuw");
     }
     b.s(" ");
     b.s(ty_str(v.ty));

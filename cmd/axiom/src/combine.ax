@@ -815,6 +815,7 @@ fn simplify_add(B: *mut ir.Builder, i: *mut ir.Value, a: *mut ir.Value, b: *mut 
     }
     // (x + c1) + c2
     if bk and ir.is_op(a, ir.OP_ADD) and ir.is_cint(a.b) {
+        ir.no_wrap_clear(i);
         i.a = a.a;
         i.b = kt(t, k +% ir.cint_val(a.b));
         return simplify_bin(B, i);
@@ -884,7 +885,15 @@ fn simplify_sub(B: *mut ir.Builder, i: *mut ir.Value, a: *mut ir.Value, b: *mut 
         if k == 0 {
             return a;
         }
-        return ir.add(B, a, kt(t, 0 -% k));
+        let r = ir.add(B, a, kt(t, 0 -% k));
+        // (x - c does not overflow as a signed operation: nor does x + (-c),
+        // unless -c does, c the type's least value; the unsigned x + (-c)
+        // wraps)
+        if ir.no_wrap(i, ir.F_NSW) and ir.is_op(r, ir.OP_ADD) and (t.bits <= 64) and
+           (k != (@as(u64, 1) << @int_cast(u32, t.bits - 1))) {
+            r.flags = r.flags | ir.F_NSW;
+        }
+        return r;
     }
     // x - (c ? k : 0) = c ? x - k : x
     if (t.kind == ir.T_INT) and not ir.is_cint(a) and const_select(b) and (is_kv(b.b, 0) or is_kv(b.c, 0)) {
@@ -942,6 +951,7 @@ fn simplify_mul(B: *mut ir.Builder, i: *mut ir.Value, a: *mut ir.Value, b: *mut 
         }
         // (x * c1) * c2
         if ir.is_op(a, ir.OP_MUL) and ir.is_cint(a.b) {
+            ir.no_wrap_clear(i);
             i.a = a.a;
             i.b = kt(t, k *% ir.cint_val(a.b));
             return simplify_bin(B, i);
@@ -1078,6 +1088,7 @@ fn simplify_shift(B: *mut ir.Builder, i: *mut ir.Value, a: *mut ir.Value, b: *mu
     if bk and ir.is_op(a, op) and ir.is_cint(a.b) and (k < @as(u64, @bit_cast(u32, bits))) {
         let tot = k + ir.cint_val(a.b);
         if tot < @as(u64, @bit_cast(u32, bits)) {
+            ir.no_wrap_clear(i);
             i.a = a.a;
             i.b = kt(i.b.ty, tot);
             return vnil();
@@ -1455,6 +1466,15 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         if (op == ir.OP_ZEXT) and ir.is_op(a, ir.OP_TRUNC) and (a.a.ty == t) and fits_unsigned(a.a, a.ty.bits) {
             return a.a;
         }
+        // sext x = zext x where x's top bit is 0: x & k (k's top bit 0) or
+        // x >> k (k > 0), as an index (x86-64's 32-bit operations clear the
+        // top half of the register already)
+        if (op == ir.OP_SEXT) and (ir.is_op(a, ir.OP_AND) or ir.is_op(a, ir.OP_LSHR)) and ir.is_cint(a.b) and
+           (((a.op == ir.OP_AND) and (ir.sval(a.b) >= 0)) or
+            ((a.op == ir.OP_LSHR) and (ir.cint_val(a.b) > 0) and
+             (ir.cint_val(a.b) < @as(u64, @bit_cast(u32, a.ty.bits))))) {
+            return ir.zext(B, a, t);
+        }
         if (op == ir.OP_SEXT) and (ir.is_op(a, ir.OP_SEXT) or ir.is_op(a, ir.OP_ZEXT)) {
             // sext (zext x) = zext x: the top bit is 0
             if a.op == ir.OP_ZEXT {
@@ -1598,6 +1618,26 @@ fn simplify_ptradd(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
         i.a = a.a;
         i.b = ir.cint(off.ty, ir.cint_val(off) +% ir.cint_val(a.b));
         return simplify_ptradd(B, i);
+    }
+    // p + (x + c) * k = (p + x * k) + c * k, and p + (x + c) = (p + x) + c:
+    // the constant in the addressing mode, x * k shared with p + x * k
+    // (an unrolled loop's p[i] and p[i + 1]). Pointer arithmetic wraps: it
+    // holds for all values.
+    if (off.kind == ir.V_INST) and (off.ty.kind == ir.T_INT) and (off.ty.bits <= 64) {
+        if ir.is_op(off, ir.OP_ADD) and ir.is_cint(off.b) {
+            ir.at_before(B, i);
+            return ir.ptradd(B, ir.ptradd(B, a, off.a), off.b);
+        }
+        if (ir.is_op(off, ir.OP_MUL) or ir.is_op(off, ir.OP_SHL)) and ir.is_cint(off.b) and
+           ir.is_op(off.a, ir.OP_ADD) and ir.is_cint(off.a.b) and ((off.op == ir.OP_MUL) or (ir.cint_val(off.b) < 64)) {
+            let mut k = ir.cint_val(off.b);
+            if off.op == ir.OP_SHL {
+                k = @as(u64, 1) << @truncate(u32, k);
+            }
+            ir.at_before(B, i);
+            let x = ir.binop(B, off.op, off.a.a, off.b);
+            return ir.ptradd(B, ir.ptradd(B, a, x), ir.cint(off.ty, ir.cint_val(off.a.b) *% k));
+        }
     }
     return vnil();
 }
@@ -2285,7 +2325,7 @@ pub fn narrow_bool_phis(f: *mut ir.Func) bool {
 // a mask per arm, and the code once.
 // -----------------------------------------------------------------------------
 fn sinkable_op(i: *ir.Value) bool {
-    if (i.kind != ir.V_INST) or (i.flags != 0) {
+    if (i.kind != ir.V_INST) or ((i.flags & ~ir.F_NO_WRAP) != 0) {
         return false;
     }
     let op = i.op;
@@ -2378,7 +2418,7 @@ fn common_op(p: *ir.Value) i64 {
     for j in 1..n {
         let ij = ir.resolve(p.xs.get(j));
         if (ij == i0) or (ij.kind != ir.V_INST) or (ij.op != i0.op) or (ij.ty != i0.ty) or (ij.cv != i0.cv) or
-           (ij.flags != 0) or (ij.uses != 1) or (ij.xs.len != i0.xs.len) {
+           ((ij.flags & ~ir.F_NO_WRAP) != 0) or (ij.uses != 1) or (ij.xs.len != i0.xs.len) {
             return -1;
         }
         for j2 in 0..j {
@@ -2416,8 +2456,8 @@ fn same_op_inputs(p: *ir.Value) bool {
     }
     for j in 1..p.xs.len {
         let ij = ir.resolve(p.xs.get(j));
-        if (ij.kind != ir.V_INST) or (ij.op != i0.op) or (ij.ty != i0.ty) or (ij.cv != i0.cv) or (ij.flags != 0) or
-           (ij.xs.len != 0) {
+        if (ij.kind != ir.V_INST) or (ij.op != i0.op) or (ij.ty != i0.ty) or (ij.cv != i0.cv) or
+           ((ij.flags & ~ir.F_NO_WRAP) != 0) or (ij.xs.len != 0) {
             return false;
         }
         for k in @as(usize, 0)..3 {
@@ -2483,7 +2523,11 @@ pub fn sink_phi_ops(f: *mut ir.Func) bool {
                 }
                 if d == -2 {
                     // one copy here; the inputs stay for their other users
+                    // (with the flags all of them have)
                     let y = ir.copy_inst(f, i0);
+                    for j in 1..p.xs.len {
+                        ir.no_wrap_meet(y, ir.resolve(p.xs.get(j)));
+                    }
                     if u.notnil(at) {
                         ir.insert_before(at, y);
                     } else {
@@ -2511,6 +2555,8 @@ pub fn sink_phi_ops(f: *mut ir.Func) bool {
                     q.user = i0;
                 }
                 for j in 1..p.xs.len {
+                    // (i0 stands for each input: the flags all of them have)
+                    ir.no_wrap_meet(i0, ir.resolve(p.xs.get(j)));
                     ir.remove_inst(ir.resolve(p.xs.get(j)));
                 }
                 ir.remove_inst(i0);
