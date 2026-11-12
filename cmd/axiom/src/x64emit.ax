@@ -645,7 +645,16 @@ pub fn sw_movable(i: *mc.MInst) bool {
 }
 
 pub fn is_ret(i: *mc.MInst) bool {
-    return i.op == xe.RET;
+    return (i.op == xe.RET) or is_tail(i);
+}
+
+// A CALL with this cc leaves the function: the epilogue, then a jump to the
+// callee (x64.ax: gen_tail_call; enc_tail). Its aux is the bytes of stack
+// arguments it copies up into the incoming area.
+pub const TAIL: i32 = 1;
+
+pub fn is_tail(i: *mc.MInst) bool {
+    return (i.op == xe.CALL) and (i.cc == TAIL);
 }
 
 fn needs_frame() bool {
@@ -696,8 +705,14 @@ fn xmm_save_off(k: i64) i64 {
 }
 
 fn epilogue() void {
+    unframe();
+    b8(0xc3);
+}
+
+// The epilogue but its ret: the callee-saved registers and the caller's
+// frame back.
+fn unframe() void {
     if frameless or in_noframe {
-        b8(0xc3);
         return;
     }
     for k in 0..nxsaved {
@@ -724,13 +739,43 @@ fn epilogue() void {
             }
             b8(0x58 + @as(u64, @bit_cast(u32, r & 7)));
         }
+        b8(0x5d);  // pop rbp
     } else {
         b8(0xc9);  // leave
-        b8(0xc3);
-        return;
     }
-    b8(0x5d);
-    b8(0xc3);
+}
+
+// A sibling call (is_tail): its stack arguments, which the outgoing area
+// holds, copied up through r10 to where the function's own came in
+// (rbp + 16, past Windows' home area), then the epilogue and a jump to the
+// callee: `jmp rel32`, or `rex.w jmp r11` for a call through a pointer. Both
+// are forms Windows' unwinder takes as the end of an epilogue (a jump
+// leaving the function: rel32, or an indirect one with REX.W), and the frame
+// tables have no entry for it (no return address: the callee's is the
+// caller's).
+fn enc_tail(i: *mut mc.MInst) void {
+    if UPPER and DIRTY {
+        vzeroupper();
+    }
+    let mut sh: i64 = 0;
+    if WIN {
+        sh = 32;
+    }
+    let mut k: i64 = 0;
+    while k < i.aux {
+        enc_op(8, 1, 0x8b, 0, xe.R10, mc.mem(xe.RSP, -1, 0, sh + k), 0, false);
+        enc_op(8, 1, 0x89, 0, xe.R10, mc.mem(xe.RBP, -1, 0, 16 + sh + k), 0, false);
+        k += 8;
+    }
+    unframe();
+    let t = i.ops[0];
+    if t.kind == mc.K_SYM {
+        b8(0xe9);
+        E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_PLT32, sym: t.sym, addend: -4 });
+        E.b.u32_(0);
+    } else {
+        enc_op(8, 1, 0xff, 0, 4, t, 0, false);
+    }
 }
 
 // Windows: a function's line table, into .axiom.lines for plink.ax (which
@@ -1464,6 +1509,10 @@ fn enc_inst(i: *mut mc.MInst) void {
         local_off.set(@int_cast(usize, l), @as(u64, E.b.len()));
         return;
     }
+    if is_tail(i) {
+        enc_tail(i);
+        return;
+    }
     if op == xe.CALL {
         enc_call(i.ops[0]);
         return;
@@ -1577,7 +1626,8 @@ fn jump_target(b: *mc.MBlock) i32 {
 
 fn ends_flow(b: *mc.MBlock) bool {
     let l = b.last;
-    return u.notnil(l) and ((l.op == xe.JMP) or (l.op == xe.RET) or (l.op == xe.UD2) or (l.op == xe.JTAB));
+    return u.notnil(l) and
+           ((l.op == xe.JMP) or (l.op == xe.RET) or (l.op == xe.UD2) or (l.op == xe.JTAB) or is_tail(l));
 }
 
 // Does the code after block bi start with block t (with nothing encoded
@@ -2322,6 +2372,10 @@ fn dead_at(b0: usize, r: i32, skip: []bool, seen: []mut bool, budget: *mut i32) 
             if (i.clobber & (@as(u64, 1) << @int_cast(u32, r))) != 0 {
                 return true;
             }
+            if is_tail(i) {
+                // (as at a return: the epilogue restores the registers a convention keeps)
+                return (r == xe.RCX) or (r == xe.R8) or (r == xe.R9) or (r == xe.R10) or (r == xe.R11);
+            }
         } else if op == xe.UD2 {
             return true;  // (a trap, which may follow code that reads r)
         } else if op == xe.RET {
@@ -2830,7 +2884,7 @@ pub fn encode_func(f: *mut ir.Func) void {
                     last_src = i.src;
                 }
                 let last = enc_at(i, bi, skip, lal, sw);
-                if FT.on and (i.op == xe.CALL) {
+                if FT.on and (i.op == xe.CALL) and not is_tail(i) {
                     let mut at = @as(u64, E.b.len());
                     if in_noframe {
                         at = at | ft.CALL_FRAMELESS;  // (a call that does not return, before the frame is set up)

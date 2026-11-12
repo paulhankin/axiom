@@ -320,6 +320,15 @@ else partially; and simplify those functions again), and split loop ranges at th
 then lay out loops, hoist constants, fold loads into memory operands
 (x86-64) and allocate registers with live ranges that have holes.
 
+At `-O2` and above, a call in tail position whose callee the function's frame
+does not concern (no local's address reaches it, no call record for stack traces
+but a C call's, its stack arguments fit where the caller's came in) is a sibling
+call (`tailrec.ax`: `mark_sibling_calls`): the native backends restore the
+frame and jump to the callee, so mutual recursion and handlers that call the
+next one do not grow the stack. WebAssembly makes ordinary calls (its tail-call
+instructions are not available everywhere, and the compiler has no switch for
+WebAssembly extensions).
+
 If-conversion keeps a branch when the chosen value goes into the address of
 a load (a heap or tree walk), where a predicted branch lets the load start
 early.

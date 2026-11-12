@@ -206,3 +206,704 @@ fn rewrite(f: *mut ir.Func, sites: []*mut ir.Value, accs: []*mut ir.Value, rets:
     }
     phis.deinit();
 }
+
+// -----------------------------------------------------------------------------
+// Sibling calls
+//
+// A call whose result (or nothing) the function returns straight away can
+// leave the function first: the backend restores the callee-saved registers
+// and the frame, then jumps to the callee, which returns to this function's
+// caller (x64.ax, a64.ax: gen_tail_call). Its frame is gone, so the stack
+// does not grow along a chain of such calls (mutual recursion, a handler
+// that calls the next one, a wrapper that forwards its arguments). Run last
+// at -O2 and above (passes.finish_funcs), it marks those calls (ir.F_TAIL)
+// where the IR shows the jump keeps the program's meaning; the backend
+// checks what only it can see (where the arguments go) and makes an
+// ordinary call otherwise. A call is marked when:
+//
+// - It is followed by its block's return, which returns the call's result
+//   or nothing (a void function's call of one that returns something leaves
+//   its result unread). A call whose block jumps on, through blocks of
+//   nothing but phis, to such a return (of the phis that take the call's
+//   result along) is given a return of its own first (the merged return of
+//   `return c ? f(x) : g(x)`, and the nested merges inlining leaves).
+// - Its callee does not return to a frame of this function in another way:
+//   it is not noreturn (whose frame a trace shows), and nothing of this
+//   frame is the callee's: no alloca whose address escaped (was passed,
+//   stored, cast to an integer or otherwise used than as the address of a
+//   load or store) on any path that reaches the call, the call's own
+//   arguments included (an aggregate passed by value is the address of the
+//   caller's copy). The function allocates nothing dynamically
+//   (ir.uses_dyn_stack: its frame is addressed from the frame pointer, and
+//   the allocations would be the callee's), and does not take its frame
+//   address (IN_FRAME_ADDR: a C variadic function's va_list points into its
+//   incoming arguments; codegen's traps), nor is it variadic.
+// - The result is the caller's in every bit its own callers read: a narrow
+//   integer the caller extends (ret_ext: the C ABIs' char and short) comes
+//   from a callee defined here that extends it the same way; a bool comes
+//   from code that keeps it 0 or 1 in the whole register (isel.foreign_bool:
+//   not a C function declared here, nor a call through a pointer). A result
+//   the caller returns through memory (ir.EXT_SRET, EXT_X8SRET) is the
+//   callee's when the call passes on the caller's own address, with the same
+//   mark. A result in several registers (ir.EXT_REGS: a return with xs) is
+//   the callee's when the return's xs are exactly the call's registers
+//   (IN_CALL_RESULT(call, 0..n-1) in order, with nothing else between the
+//   call and its block's end), or the phis that take them along, and the
+//   call's mark is the caller's own (start_values); any other return with xs
+//   keeps its call.
+// - It leaves stack traces as they are documented: a call with a
+//   call-site record for native traces (ir.Chain) is marked only when every
+//   record in it is a C call's (docs/c.md: at -O2 a C trace can be shorter;
+//   the trace then lacks the caller's frame). An Axiom function's calls keep
+//   their frames, as tail_site's do (spec §16.4.1); with the shadow stack the
+//   stores after the call keep it out of tail position, and with
+//   --stack-traces=off its calls have no records and are marked too.
+// Shadow stack pops, defer, error-return traces and the like are code after
+// the call, which is then not in tail position. There is one calling
+// convention per target, so the caller's and the callee's are the same.
+// -----------------------------------------------------------------------------
+
+// Is every record of chain c a C call's?
+fn c_chain(c0: *mut ir.Chain) bool {
+    let mut c = c0;
+    while u.notnil(c) {
+        if not c.c_code {
+            return false;
+        }
+        c = c.next;
+    }
+    return true;
+}
+
+// The function-wide conditions: false if f makes no sibling calls.
+fn sibling_ok(f: *mut ir.Func) bool {
+    if u.isnil(f.first) or f.ty.vararg or ir.uses_dyn_stack(f) {
+        return false;
+    }
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_INTR {
+                let id = ir.intr_id(i);
+                if (id == ir.IN_FRAME_ADDR) or (id == ir.IN_GET_SP) or (id == ir.IN_SET_SP) {
+                    return false;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return true;
+}
+
+// The first instruction of block l after its phis, when that is a jump or
+// a return; else nil.
+fn after_phis(l: *mut ir.Block) *mut ir.Value {
+    let mut i = l.first;
+    while u.notnil(i) and (i.op == ir.OP_PHI) {
+        i = i.next;
+    }
+    if u.isnil(i) or ((i.op != ir.OP_BR) and (i.op != ir.OP_RET)) {
+        return u.nil.[ir.Value]();
+    }
+    return i;
+}
+
+// What call c gives the return (ret_after): c itself, or for a result in
+// registers (ir.EXT_REGS) its registers IN_CALL_RESULT(c, 0..n-1), in
+// order, when its mark is the function's own (the same registers in the
+// same classes). Filled by ret_after.
+let mut SV: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                              cap: 0 };
+let mut sv_regs: bool = false;  // (SV holds registers)
+let mut sv_ok: bool = false;    // (and the function may return them as they are)
+
+fn start_values(f: *ir.Func, c: *mut ir.Value, t: *mut ir.Value) void {
+    SV.clear();
+    let ex = ir.ext_of(c);
+    sv_regs = (ex.len > 0) and (ex[0] >= ir.EXT_REGS);
+    sv_ok = true;
+    if not sv_regs {
+        SV.push(c);
+        return;
+    }
+    sv_ok = ex[0] == f.ret_ext;
+    for k in 0..(@as(usize, ex[0] & 3) + 1) {
+        // (call_before: only registers of c between c and t)
+        let mut i = c.next;
+        while (i != t) and not call_result_of(i, c, @bit_cast(i64, @as(u64, k))) {
+            i = i.next;
+        }
+        if i == t {
+            sv_ok = false;
+            return;
+        }
+        SV.push(i);
+    }
+}
+
+// Does return r return nothing, or exactly the values `cur` stand for (the
+// call's result, or its registers in order)?
+fn returns_values(r: *ir.Value, cur: *u.List.[*mut ir.Value]) bool {
+    if u.isnil(r.a) and (r.xs.len == 0) {
+        return true;
+    }
+    if not sv_ok {
+        return false;
+    }
+    if not sv_regs {
+        return (r.xs.len == 0) and (r.a == cur.get(0));
+    }
+    if u.notnil(r.a) or (r.xs.len != cur.len) {
+        return false;
+    }
+    for k in 0..cur.len {
+        if r.xs.get(k) != cur.get(k) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The return a call c that ends block b (before its terminator t, or
+// before its registers and t) would be followed by: t itself, or the
+// return that a chain of jumps from t reaches through blocks of nothing but
+// phis, when that returns what c gives (start_values: along the chain, the
+// phis that take it from the block before) or nothing. That is the merged
+// return of `return c ? f(x) : g(y)`, and the nested merges inlining
+// leaves; split_return gives b a copy of it. Nil if neither.
+fn ret_after(b: *mut ir.Block, t: *mut ir.Value, c: *mut ir.Value) *mut ir.Value {
+    start_values(b.fnp, c, t);
+    let mut cur = u.List.[*mut ir.Value].empty();
+    for x in SV.items() {
+        cur.push(x);
+    }
+    let mut r = u.nil.[ir.Value]();
+    if t.op == ir.OP_RET {
+        if returns_values(t, &cur) {
+            r = t;
+        }
+    } else if t.op == ir.OP_BR {
+        let mut from = b;
+        let mut l = t.t1;
+        for _hop in @as(i32, 0)..8 {
+            let j = after_phis(l);
+            if (l == b) or u.isnil(j) {
+                break;
+            }
+            for k in 0..cur.len {
+                let mut p = l.first;
+                while p != j {
+                    if ir.incoming(p, from) == cur.get(k) {
+                        cur.set(k, p);
+                        break;
+                    }
+                    p = p.next;
+                }
+            }
+            if j.op == ir.OP_RET {
+                if returns_values(j, &cur) {
+                    r = j;
+                }
+                break;
+            }
+            from = l;
+            l = j.t1;
+        }
+    }
+    cur.deinit();
+    return r;
+}
+
+// Is v IN_CALL_RESULT(c, k) for some k (any k if k < 0)?
+fn call_result_of(v: *ir.Value, c: *ir.Value, k: i64) bool {
+    if (v.kind != ir.V_INST) or (v.op != ir.OP_INTR) or (ir.intr_id(v) != ir.IN_CALL_RESULT) or (v.xs.len != 2) {
+        return false;
+    }
+    if @int_from_ptr(ir.resolve(v.xs.get(0))) != @int_from_ptr(c) {
+        return false;
+    }
+    return (k < 0) or ((v.xs.get(1).kind == ir.V_CINT) and (@bit_cast(i64, ir.cint_val(v.xs.get(1))) == k));
+}
+
+// The call whose registers (IN_CALL_RESULT) are all that is between it and
+// the terminator t, or the call right before t; else nil.
+fn call_before(t: *mut ir.Value) *mut ir.Value {
+    let mut i = t.prev;
+    while u.notnil(i) and (i.op == ir.OP_INTR) and (ir.intr_id(i) == ir.IN_CALL_RESULT) {
+        i = i.prev;
+    }
+    if u.isnil(i) or (i.op != ir.OP_CALL) {
+        return u.nil.[ir.Value]();
+    }
+    let mut j = i.next;
+    while j != t {
+        if not call_result_of(j, i, -1) {
+            return u.nil.[ir.Value]();
+        }
+        j = j.next;
+    }
+    return i;
+}
+
+// Block b's jump t to the block of return r: a return of what call c gives
+// instead (SV, as ret_after left it), or of nothing.
+fn split_return(b: *mut ir.Block, t: *mut ir.Value, c: *mut ir.Value, r: *mut ir.Value) void {
+    ir.remove_phi_input(t.t1, b);
+    ir.remove_inst(t);
+    if u.isnil(TB) {
+        TB = ir.new_builder();
+    }
+    ir.at_end(TB, b);
+    if u.isnil(r.a) and (r.xs.len == 0) {
+        ir.ret_void(TB);
+    } else if sv_regs {
+        ir.ret_regs(TB, SV.items());
+    } else {
+        ir.ret(TB, c);
+    }
+}
+
+// Marks (aux = 1) the values derived from f's allocas, the allocas
+// themselves included: the pointer arithmetic, phis, selects and copies of
+// them.
+fn mark_derived(f: *mut ir.Func) bool {
+    let mut any = false;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                if i.aux == 0 {
+                    let mut d = i.op == ir.OP_ALLOCA;
+                    if ((i.op == ir.OP_PTRADD) or (i.op == ir.OP_COPY) or (i.op == ir.OP_BITCAST)) and derived(i.a) {
+                        d = true;
+                    } else if (i.op == ir.OP_SELECT) and (derived(i.b) or derived(i.c)) {
+                        d = true;
+                    } else if i.op == ir.OP_PHI {
+                        for k in 0..i.xs.len {
+                            if derived(i.xs.get(k)) {
+                                d = true;
+                            }
+                        }
+                    }
+                    if d {
+                        i.aux = 1;
+                        changed = true;
+                        any = true;
+                    }
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+    }
+    return any;
+}
+
+fn derived(x: *ir.Value) bool {
+    return u.notnil(x) and (x.kind == ir.V_INST) and (x.aux == 1);
+}
+
+// Does instruction i let the address of an alloca out (mark_derived): use
+// a derived value other than as the address a load, store, copy or fill
+// accesses, or the input of further derived values and comparisons?
+fn escapes(i: *ir.Value) bool {
+    let op = i.op;
+    if (op == ir.OP_PTRADD) or (op == ir.OP_COPY) or (op == ir.OP_BITCAST) or (op == ir.OP_PHI) or (op == ir.OP_ICMP) or
+       (op == ir.OP_LOAD) {
+        return derived(i.b) and (op == ir.OP_PTRADD);  // (an offset that is an address: as an integer)
+    }
+    if op == ir.OP_SELECT {
+        return derived(i.a);
+    }
+    if op == ir.OP_STORE {
+        return derived(i.a);
+    }
+    if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or (op == ir.OP_MEMSET) {
+        return false;  // (lengths and bytes are integers)
+    }
+    if (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) {
+        return derived(i.b) or derived(i.c);
+    }
+    if derived(i.a) or derived(i.b) or derived(i.c) {
+        return true;
+    }
+    for k in 0..i.xs.len {
+        if derived(i.xs.get(k)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Marks the blocks (aux = 1) from which an escaped alloca address can reach
+// their start: the successors of each block with an escape, and all they
+// reach. Returns the first escape in each block (by Block.auxp), for the
+// calls before it in the same block.
+fn mark_escaped(f: *mut ir.Func) void {
+    let mut work = u.List.[*mut ir.Block].empty();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if escapes(i) {
+                b.auxp = @ptr_cast(*mut void, i);
+                work.push(b);
+                break;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    while work.len > 0 {
+        let x = work.pop();
+        let t = ir.terminator(x);
+        for k in 0..ir.succ_count(t) {
+            let s = ir.succ(t, k);
+            if s.aux == 0 {
+                s.aux = 1;
+                work.push(s);
+            }
+        }
+    }
+    work.deinit();
+}
+
+// Can the callee of call c, in a block mark_escaped has seen, reach an
+// alloca of the caller?
+fn sees_frame(c: *mut ir.Value) bool {
+    let b = c.blk;
+    if b.aux == 1 {
+        return true;
+    }
+    if @int_from_ptr(b.auxp) == 0 {
+        return false;
+    }
+    // an escape at or before c
+    let e = @ptr_cast(*mut ir.Value, b.auxp);
+    let mut i = b.first;
+    while u.notnil(i) {
+        if i == e {
+            return true;
+        }
+        if i == c {
+            return false;
+        }
+        i = i.next;
+    }
+    return false;
+}
+
+// The other conditions of call c in f, whose result f returns if `value`
+// (see above).
+fn sibling_site(f: *mut ir.Func, c: *mut ir.Value, value: bool) bool {
+    if u.notnil(ir.chain_of(c)) and not c_chain(ir.chain_of(c)) {
+        return false;  // (an Axiom call's frame, in a stack trace)
+    }
+    let g = ir.direct_callee(c);
+    if (c.a.kind == ir.V_FUNC) and ir.fnp_of(c.a).noreturn {
+        return false;
+    }
+    if value {
+        let t = c.ty;
+        if (t.kind == ir.T_INT) and (t.bits < 32) and (f.ret_ext != 0) {
+            // the caller's callers expect it extended, which only a callee
+            // compiled here is known to do
+            if u.isnil(g) or ir.is_decl(g) or (g.ret_ext != f.ret_ext) {
+                return false;
+            }
+        }
+        if (t.kind == ir.T_INT) and (t.bits == 1) and (u.isnil(g) or ir.is_decl(g)) {
+            return false;  // (isel.foreign_bool: only its low byte is defined)
+        }
+    }
+    // results through memory: the caller's own address, passed on
+    let ext = ir.ext_of(c);
+    for k in 0..c.xs.len {
+        let e = arg_ext(ext, k);
+        if (e == ir.EXT_SRET) or (e == ir.EXT_X8SRET) {
+            if not own_param(f, c.xs.get(k), e) {
+                return false;
+            }
+        }
+    }
+    return not sees_frame(c);
+}
+
+fn arg_ext(ext: []u8, k: usize) u8 {
+    if (k + 1) < ext.len {
+        return ext[k + 1];
+    }
+    return 0;
+}
+
+// Is x a parameter of f with mark e?
+fn own_param(f: *mut ir.Func, x: *mut ir.Value, e: u8) bool {
+    for k in 0..f.params.len {
+        if (f.params[k] == x) and (k < f.param_ext.len) and (f.param_ext[k] == e) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Functions that return only 0 or 1 (by Func.id; see prepare_sibling): C
+// functions returning _Bool, and those returning what such calls return.
+let mut ret01: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
+
+let mut budget01: i32 = 0;  // (the values is01 may look at yet)
+
+// Is v 0 or 1 (as far as ret01 knows)?
+fn is01(v: *ir.Value, depth: i32) bool {
+    budget01 -= 1;
+    if (v.ty.kind != ir.T_INT) or (depth <= 0) or (budget01 < 0) {
+        return false;
+    }
+    if (v.kind == ir.V_CINT) or (v.kind == ir.V_ZERO) {
+        return (v.kind == ir.V_ZERO) or (v.cv <= 1);
+    }
+    if (v.ty.bits == 1) or (v.kind != ir.V_INST) {
+        return v.ty.bits == 1;
+    }
+    let op = v.op;
+    if op == ir.OP_ZEXT {
+        return is01(v.a, depth - 1);
+    }
+    if op == ir.OP_AND {
+        return ((v.b.kind == ir.V_CINT) and (v.b.cv == 1)) or is01(v.a, depth - 1) or is01(v.b, depth - 1);
+    }
+    if op == ir.OP_SELECT {
+        return is01(v.b, depth - 1) and is01(v.c, depth - 1);
+    }
+    if op == ir.OP_PHI {
+        for k in 0..v.xs.len {
+            let x = v.xs.get(k);
+            if (@int_from_ptr(x) != @int_from_ptr(v)) and not is01(x, depth - 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if op == ir.OP_CALL {
+        let g = ir.direct_callee(v);
+        return u.notnil(g) and (@int_cast(usize, g.id) < ret01.len) and ret01.get(@int_cast(usize, g.id));
+    }
+    return false;
+}
+
+// Does every return of f return 0 or 1, if the functions ret01 says so
+// do? (Optimistic: in a recursion, each one returns what the others do.)
+fn returns01(f: *ir.Func) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        budget01 = 64;
+        if u.notnil(t) and (t.op == ir.OP_RET) and (u.isnil(t.a) or not is01(t.a, 6)) {
+            return false;
+        }
+        b = b.next;
+    }
+    return true;
+}
+
+/// Before mark_sibling_calls on m's functions: which of them return only 0
+/// or 1, which a call's result that the caller returns as `x != 0` (C's
+/// `return a && f(x)`) then is already. From the IR as it is before any of
+/// them is marked, so that every part of a module compiled in parts finds
+/// the same (backend.ax: compile_parts).
+pub fn prepare_sibling(m: *mut ir.Module) void {
+    ret01.clear();
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        let t = f.ty.ret;
+        ret01.push(not ir.is_decl(f) and (t.kind == ir.T_INT) and (t.bits <= 64));
+    }
+    // (until nothing changes; or, after a few rounds, none)
+    let mut changed = true;
+    let mut rounds: i32 = 0;
+    while changed {
+        changed = false;
+        for i in 0..m.funcs.len {
+            if ret01.get(i) and ((rounds >= 8) or not returns01(m.funcs.get(i))) {
+                ret01.set(i, false);
+                changed = true;
+            }
+        }
+        rounds += 1;
+    }
+}
+
+// The value phi p (of block l) takes from the way from block a to s: s is
+// l, or a block of nothing but a jump to l.
+fn way_value(a: *mut ir.Block, s: *mut ir.Block, l: *mut ir.Block, p: *mut ir.Value) *mut ir.Value {
+    if s == l {
+        return ir.incoming(p, a);
+    }
+    let j = s.first;
+    if (j.op != ir.OP_BR) or (j.t1 != l) {
+        return u.nil.[ir.Value]();
+    }
+    return ir.incoming(p, s);
+}
+
+fn is_c(v: *ir.Value, x: u64) bool {
+    return u.notnil(v) and (((v.kind == ir.V_CINT) and (v.cv == x)) or ((v.kind == ir.V_ZERO) and (x == 0)));
+}
+
+// The call c that block b ends with as `x = icmp ne c, 0; condbr x` (or eq,
+// or c itself, an i1), when both ways go to a return of 1 where c is not 0
+// and of 0 where it is (way_value: of a phi, or its zero extension to c's
+// type), and c is 0 or 1 (is01): then b can return c itself. Else nil.
+fn bool_call(b: *mut ir.Block) *mut ir.Value {
+    let t = b.last;
+    if u.isnil(t) or (t.op != ir.OP_CONDBR) {
+        return u.nil.[ir.Value]();
+    }
+    let x = t.a;
+    let mut c = x;
+    let mut nz = t.t1;  // (the way where c is not 0)
+    let mut z = t.t2;
+    if ir.is_op(x, ir.OP_ICMP) and is_c(x.b, 0) and
+       ((x.cv == @int_cast(u64, ir.IntNE)) or (x.cv == @int_cast(u64, ir.IntEQ))) {
+        c = x.a;
+        if x.cv == @int_cast(u64, ir.IntEQ) {
+            nz = t.t2;
+            z = t.t1;
+        }
+    }
+    budget01 = 1;
+    if not ir.is_op(c, ir.OP_CALL) or (c.blk != b) or not is01(c, 1) {
+        return u.nil.[ir.Value]();
+    }
+    // c, then perhaps x, then t
+    if (c.next != t) and ((c.next != x) or (x.next != t)) {
+        return u.nil.[ir.Value]();
+    }
+    let mut l = nz;
+    if (l.first.op == ir.OP_BR) and (l.first == l.last) {
+        l = l.first.t1;
+    }
+    let mut p = l.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let mut r = p.next;
+        while u.notnil(r) and (r.op == ir.OP_PHI) {
+            r = r.next;
+        }
+        let mut v = p;
+        if ir.is_op(r, ir.OP_ZEXT) and (r.a == p) {
+            v = r;
+            r = r.next;
+        }
+        if ir.is_op(r, ir.OP_RET) and (r.a == v) and (v.ty == c.ty) {
+            if is_c(way_value(b, nz, l, p), 1) and is_c(way_value(b, z, l, p), 0) {
+                return c;
+            }
+            return u.nil.[ir.Value]();
+        }
+        p = p.next;
+    }
+    return u.nil.[ir.Value]();
+}
+
+// Block b (bool_call) returns its call c instead of branching on it.
+fn bool_return(f: *mut ir.Func, b: *mut ir.Block, c: *mut ir.Value) void {
+    let t = b.last;
+    let x = t.a;
+    for k in 0..ir.succ_count(t) {
+        ir.remove_phi_input(ir.succ(t, k), b);  // (a way straight to the return's block)
+    }
+    ir.remove_inst(t);
+    if (x != c) and not used(f, x) {
+        ir.remove_inst(x);
+    }
+    if u.isnil(TB) {
+        TB = ir.new_builder();
+    }
+    ir.at_end(TB, b);
+    ir.ret(TB, c);
+}
+
+// Is x an operand of an instruction of f?
+fn used(f: *mut ir.Func, x: *mut ir.Value) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if (i.a == x) or (i.b == x) or (i.c == x) {
+                return true;
+            }
+            for k in 0..i.xs.len {
+                if i.xs.get(k) == x {
+                    return true;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+/// Marks f's sibling calls (ir.F_TAIL; see above); the number marked.
+pub fn mark_sibling_calls(f: *mut ir.Func) i32 {
+    if not sibling_ok(f) {
+        return 0;
+    }
+    clear_marks(f);
+    if mark_derived(f) {
+        mark_escaped(f);
+    }
+    let mut n: i32 = 0;
+    let mut split = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = b.last;
+        let mut c = u.nil.[ir.Value]();
+        if u.notnil(t) {
+            c = call_before(t);
+        }
+        if u.notnil(c) {
+            let r = ret_after(b, t, c);
+            if u.notnil(r) and sibling_site(f, c, u.notnil(r.a)) {
+                if r != t {
+                    split_return(b, t, c, r);
+                    split = true;
+                }
+                c.flags = c.flags | ir.F_TAIL;
+                n += 1;
+            }
+        }
+        let bc = bool_call(b);
+        if u.notnil(bc) and sibling_site(f, bc, true) {
+            bool_return(f, b, bc);
+            split = true;
+            bc.flags = bc.flags | ir.F_TAIL;
+            n += 1;
+        }
+        b = b.next;
+    }
+    if split {
+        ir.remove_unreachable(f);  // (a return block that only the calls jumped to)
+    }
+    clear_marks(f);
+    return n;
+}
+
+// The scratch fields back to 0.
+fn clear_marks(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        b.aux = 0;
+        b.auxp = @ptr_from_int(*mut void, 0);
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+}

@@ -3454,6 +3454,9 @@ fn call_result_vreg(v: *ir.Value, k: usize, c: u8) i32 {
 // IN_CALL_RESULT(call, k): the copy the call made of register k.
 fn gen_call_result(v: *mut ir.Value) void {
     let c = ir.resolve(v.xs.get(0));
+    if tail_jumped and ((c.flags & ir.F_TAIL) != 0) {
+        return;  // (the call left the function: its registers are the callee's result, gen_tail_call)
+    }
     let k = @truncate(usize, ir.cint_val(v.xs.get(1)));
     let cl = class_of(v.ty);
     copy(vreg(v), call_result_vreg(c, k, cl), cl);
@@ -3479,6 +3482,143 @@ fn ret_c_result(t: *mut ir.Value) void {
     }
     _ = emit(xe.RET, 0, ops.items());
     ops.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Sibling calls (tailrec.ax: mark_sibling_calls)
+//
+// A call followed by the return of its result leaves the function first:
+// its arguments go where a call puts them, then one instruction (CALL with
+// cc em.TAIL) restores the callee-saved registers and the frame as the
+// return does and jumps to the callee (em.enc_tail), which returns to this
+// function's caller. Arguments on the stack go to the bottom of the stack
+// area this function's own stack parameters came in, which its caller made
+// for them: only when the callee needs no more of it than the caller took
+// (for both System V and Windows, whose 32 bytes of home area its caller
+// owns too and the callee may use); else it is an ordinary call. They are
+// stored into the outgoing area first and copied up by the jump, after
+// everything else has read the incoming ones (stack parameters are loaded
+// from there again rather than spilled: compile_func), so the two areas
+// never overlap. The callee's address, for a call through a pointer, is in
+// r11 (neither an argument register nor one the epilogue restores); a
+// variadic callee gets al as a call gives it. A result in registers
+// (ir.EXT_REGS) that the caller returns as it is (tailrec.ax: regs_return)
+// stays in the callee's registers: neither the call's registers
+// (gen_call_result) nor the return are selected.
+// -----------------------------------------------------------------------------
+let mut tail_jumped: bool = false;  // (gen_term: the block's return was the jump)
+
+// The bytes of stack arguments call v passes, or of stack parameters f
+// takes (as gen_call and compile_func place them, past Windows' home area).
+fn stack_bytes(f: *ir.Func, v: *ir.Value) u64 {
+    let mut ng: usize = 0;
+    let mut nx: usize = 0;
+    let mut off: u64 = 0;
+    let mut n = f.params.len;
+    if u.notnil(v) {
+        n = v.xs.len;
+    }
+    for i in 0..n {
+        let mut t = u.nil.[ir.Ty]();
+        if u.notnil(v) {
+            t = v.xs.get(i).ty;
+        } else {
+            t = f.params[i].ty;
+        }
+        if arg_reg(i, class_of(t), &mut ng, &mut nx) < 0 {
+            if t.kind == ir.T_VEC {
+                off = ((off + 15) & ~@as(u64, 15)) + 16;
+            } else {
+                off += 8;
+            }
+        }
+    }
+    return off;
+}
+
+// Call v as a jump to its callee, if its stack arguments fit (see above).
+fn gen_tail_call(v: *mut ir.Value) bool {
+    let need = stack_bytes(em.F, v);
+    if need > stack_bytes(em.F, u.nil.[ir.Value]()) {
+        return false;  // (the callee needs more of the stack than the caller was given)
+    }
+    let fty = ir.fty_of(v);
+    let n = v.xs.len;
+    let regs = is.call_args(v, reg, ext_reg);
+    let mut target: i32 = -1;
+    if v.a.kind != ir.V_FUNC {
+        target = reg(v.a);
+    }
+    let mut ng: usize = 0;
+    let mut nx: usize = 0;
+    let mut off: u64 = 0;
+    if em.WIN {
+        off = WIN_SHADOW;
+    }
+    let mut uses = u.List.[mc.MOp].empty();
+    let dest = u.newn.[i32](n + 1);
+    for i in 0..n {
+        let x = v.xs.get(i);
+        let c = class_of(x.ty);
+        dest[i] = arg_reg(i, c, &mut ng, &mut nx);
+        if dest[i] < 0 {
+            if x.ty.kind == ir.T_VEC {
+                off = (off + 15) & ~@as(u64, 15);
+            }
+            let m = mc.mem(xe.RSP, -1, 0, @bit_cast(i64, off));
+            if c == GPR {
+                _ = e2(xe.STORE, 8, m, R(regs[i]));
+                off += 8;
+            } else if x.ty.kind == ir.T_VEC {
+                _ = sse2(xe.MOVDQU_ST, R(regs[i]), m);
+                off += 16;
+            } else if x.ty.bits == 32 {
+                _ = sse2(xe.MOVSS_ST, R(regs[i]), m);
+                off += 8;
+            } else {
+                _ = sse2(xe.MOVSD_ST, R(regs[i]), m);
+                off += 8;
+            }
+        }
+    }
+    off = (off + 15) & ~@as(u64, 15);
+    if off > em.out_area {
+        em.out_area = off;
+    }
+    for i in 0..n {
+        if dest[i] >= 0 {
+            if dest[i] >= xe.XMM0 {
+                let m = sse2(xe.MOVAPS, W(dest[i]), R(regs[i]));
+                m.is_move = true;
+            } else {
+                let m = e2(xe.MOV_RR, 8, W(dest[i]), R(regs[i]));
+                m.is_move = true;
+            }
+            mc.hint(em.MF, regs[i], dest[i]);
+            uses.push(R(dest[i]));
+        }
+    }
+    if fty.vararg {
+        _ = e2(xe.MOV_RI, 4, W(xe.RAX), I(@int_cast(i64, nx)));
+        uses.push(R(xe.RAX));
+    }
+    if target >= 0 {
+        let m = e2(xe.MOV_RR, 8, W(xe.R11), R(target));
+        m.is_move = true;
+        target = xe.R11;
+    }
+    let mut ops = is.call_ops(v, target, &uses, func_sym, -1);
+    if need > 0 {
+        ops.push(mc.mem(xe.RBP, -1, 0, 16));  // (the incoming area it writes: the frame)
+    }
+    let ci = emit(xe.CALL, 0, ops.items());
+    ci.cc = em.TAIL;
+    ci.aux = @bit_cast(i64, need);  // (the bytes copied up)
+    ci.clobber = 0;                 // (nothing of the function runs after it)
+    tail_jumped = true;
+    uses.deinit();
+    ops.deinit();
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -6914,7 +7054,9 @@ fn gen_inst_at(v: *mut ir.Value) void {
         return;
     }
     if o == ir.OP_CALL {
-        gen_call(v);
+        if not is.sibling_call(v) or not gen_tail_call(v) {
+            gen_call(v);
+        }
         return;
     }
     if o == ir.OP_INTR {
@@ -7150,6 +7292,10 @@ fn gen_term(b: *mut ir.Block) void {
         if not is.next_block_is(b, t.t1) {
             jmp(is.blk(t.t1));
         }
+        return;
+    }
+    if (o == ir.OP_RET) and tail_jumped {
+        tail_jumped = false;  // (the call before it left the function: gen_tail_call)
         return;
     }
     if o == ir.OP_RET {

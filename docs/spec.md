@@ -1245,6 +1245,11 @@ fn name(p1: T1, p2: T2) R { … }
   page. On WebAssembly, frames that live in linear memory (locals whose address is
   taken, large aggregates) are checked on entry against the thread's stack limit,
   since running past the end of a linear-memory stack would otherwise go unnoticed.
+  How deep calls can go depends on the target and the optimization level: at `-O2`
+  and above, native code leaves a function's frame before a call whose result it
+  returns straight away, when the call keeps no record for stack traces (with
+  `--stack-traces=off`; §16.4.1) and nothing of the frame is the callee's, so such a
+  chain of calls (mutual recursion, say) does not use up the stack.
 
 ### 9.2 Methods
 

@@ -1,0 +1,137 @@
+// Calls in tail position to other functions (cmd/axiom/src/tailrec.ax:
+// sibling calls) jump to them at -O2 when the calls keep no records for
+// stack traces (--stack-traces=off; with traces, each call keeps its frame,
+// spec §16.4.1): ten million in a row here, which as calls would need far
+// more stack than a thread has. Mutual recursion with integer, bool and
+// float arguments (some on the stack, permuted on each hop), a threaded
+// interpreter whose handlers call the next through a table, and results
+// returned through memory and in registers.
+// flags: -O2 --stack-traces=off
+// native-only
+import "../lib/io.ax" as io;
+
+const N: u64 = 10_000_000;
+
+fn is_even(n: u64) bool {
+    if n == 0 {
+        return true;
+    }
+    return is_odd(n - 1);
+}
+
+fn is_odd(n: u64) bool {
+    if n == 0 {
+        return false;
+    }
+    return is_even(n - 1);
+}
+
+fn b_even(n: u64) bool {
+    return (n == 0) or b_odd(n - 1);
+}
+
+fn b_odd(n: u64) bool {
+    return (n != 0) and b_even(n - 1);
+}
+
+fn ping(n: u64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, x0: f64, x1: f64, x2: f64, x3: f64,
+        x4: f64, x5: f64, x6: f64, x7: f64, x8: f64, x9: f64) f64 {
+    if n == 0 {
+        return @float_from_int(f64,
+                               a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h) + x0 + 2.0 * x9 + 3.0 * x8;
+    }
+    return pong(n - 1, h, a, b, c, d, e, f, g, x9, x0, x1, x2, x3, x4, x5, x6, x7, x8);
+}
+
+fn pong(n: u64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64, x0: f64, x1: f64, x2: f64, x3: f64,
+        x4: f64, x5: f64, x6: f64, x7: f64, x8: f64, x9: f64) f64 {
+    if n == 0 {
+        return @float_from_int(f64, a - b + c - d + e - f + g - h) + x1 - x2;
+    }
+    return ping(n - 1, b, c, d, e, f, g, h, a, x1, x2, x3, x4, x5, x6, x7, x8, x9, x0);
+}
+
+struct Vm {
+    code: []u8,
+    acc: u64,
+    n: u64,
+}
+
+let mut TABLE: [4]fn(*mut Vm, usize) u64 = [op_inc, op_dec, op_loop, op_halt];
+
+fn op_inc(m: *mut Vm, pc: usize) u64 {
+    m.acc += 3;
+    return TABLE[@as(usize, m.code[pc + 1])](m, pc + 1);
+}
+
+fn op_dec(m: *mut Vm, pc: usize) u64 {
+    m.n -= 1;
+    return TABLE[@as(usize, m.code[pc + 1])](m, pc + 1);
+}
+
+fn op_loop(m: *mut Vm, pc: usize) u64 {
+    let mut to: usize = 0;
+    if m.n == 0 {
+        to = pc + 1;
+    }
+    return TABLE[@as(usize, m.code[to])](m, to);
+}
+
+fn op_halt(m: *mut Vm, pc: usize) u64 {
+    return m.acc + @as(u64, pc);
+}
+
+struct Big {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+fn down_a(n: u64, k: u64) Big {
+    if n == 0 {
+        return Big.{ a: k, b: k + 1, c: k + 2, d: k + 3 };
+    }
+    return down_b(n - 1, k + (n & 3));
+}
+
+fn down_b(n: u64, k: u64) Big {
+    if n == 0 {
+        return Big.{ a: k, b: k, c: k, d: k };
+    }
+    return down_a(n - 1, k + 1);
+}
+
+// small enough to come back in registers (an integer and a float)
+struct Pair {
+    a: u64,
+    x: f64,
+}
+
+fn pair_a(n: u64, x: f64) Pair {
+    if n == 0 {
+        return Pair.{ a: 1, x: x };
+    }
+    return pair_b(n - 1, x + 1.0);
+}
+
+fn pair_b(n: u64, x: f64) Pair {
+    if n == 0 {
+        return Pair.{ a: 2, x: x };
+    }
+    return pair_a(n - 1, x - 0.5);
+}
+
+export fn run() void {
+    io.boolean(is_even(N));     // expect: true
+    io.boolean(b_even(N + 1));  // expect: false
+    io.float(ping(N, 1, 2, 3, 4, 5, 6, 7, 8, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5));  // expect: 249
+    let code: [4]u8 = [0, 1, 2, 3];
+    let mut m = Vm.{ code: code[..], acc: 0, n: N / 3 };
+    io.uint(TABLE[0](&mut m, 0));  // expect: 10000002
+    let r = down_a(N, 0);
+    io.uint(r.a + r.b + r.c + r.d);  // expect: 40000006
+    let p = pair_a(N, 0.0);
+    io.uint(p.a);   // expect: 1
+    io.float(p.x);  // expect: 2500000
+}

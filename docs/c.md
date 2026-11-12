@@ -397,7 +397,8 @@ stack trace (innermost first):
 
 `--stack-traces=off` prints the crash line only. At `-O2` and `-O3` a trace can be
 shorter, or absent, when the optimizer has inlined the functions or moved the faulting
-access; at `-O0` and `-O1` it is complete in the programs tried. C code has none of
+access, or when a function's last act was a call (`return f(x);`), which then leaves
+its frame first: the trace lacks the caller; at `-O0` and `-O1` it is complete in the programs tried. C code has none of
 Axiom's run-time checks: no bounds or overflow checks, so a bad pointer is a crash if it
 is one at all. On WebAssembly C functions leave no call records: a trap (such as a
 division by zero) reports `__axiom_c_main` and the start-up, and no C frames.
