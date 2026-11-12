@@ -1,0 +1,675 @@
+// =============================================================================
+// divconst.ax - integer division and remainder by constants, without the
+// divide instruction (20 to 90 cycles where a multiplication takes 3).
+//
+// The last pass over a function (passes.finish_funcs, at -O1 and above), so
+// that the passes before it still see `x / c` and `x % c` (the value ranges
+// of gvn.ax, the strength reductions of combine.ax). For an N-bit operation
+// (N = 8, 16, 32, 64) with a constant divisor d:
+//
+// Unsigned, x / d:
+//   - d a power of two 2^k: x >> k; d > 2^(N-1): x >= d (the quotient is 0 or 1);
+//   - else the reciprocal (below): (x * m) >> p, the product exact. For
+//     N < 32 and for N = 32 with m < 2^32 it is a 64-bit (or 32-bit, when it
+//     fits) multiplication of the zero-extended x; for N = 64 the high half
+//     of the 128-bit product (ir.IN_UMULH) shifted by p - 64.
+//   - when m needs N + 1 bits (N = 32, 64): for an even d, x >> z by d / 2^z
+//     (odd), whose multiplier has at most N bits; for an odd d, m = 2^N + m',
+//     t = the high half of x * m', and q = (t + x) >> (p - N), the sum taken
+//     as ((x - t) >> 1) + t when it could overflow (N = 64; x - t >= 0, and
+//     x - t and x + t have the same parity).
+// Signed, x / d (d != 0, -1; truncated toward zero):
+//   - x / 2^k: (x + ((x >> (N-1)) >>u (N-k))) >> k, the negative x biased by
+//     2^k - 1 so that the arithmetic shift rounds toward zero; x / MIN: x == MIN;
+//   - else, for a = |d|, the reciprocal of the signed theorem (below): q =
+//     floor(x * m / 2^p) + (x < 0), the product exact (a 64-bit one of the
+//     sign-extended x for N <= 32; for N = 64 the signed high half,
+//     ir.IN_SMULH, of x and m - 2^64, plus x when m >= 2^63); then -q for d < 0.
+//   - a dividend known not to be negative (umax_of) is divided as unsigned;
+//   - x / -1 is left as it is: the IR's sdiv of MIN by -1 faults, and Axiom
+//     code checks for it (an explicit compare and trap before the division,
+//     codegen.ax), which stays as it was.
+// Remainders: x - (x / d) * d (signed: by |d|, the sign of the dividend's),
+// for signed powers of two x - ((x + bias) & -2^k). A remainder and a
+// quotient of the same x and divisor (a dominating one) share the multiply.
+// Tests x % d == 0 (and !=), N = 32 or 64, d = d' 2^z with d' odd: with
+// inv the inverse of d' modulo 2^N, x * inv is x / d' exactly when d' | x,
+// and multiplication by inv permutes the N-bit residues; so unsigned,
+// d | x iff rotr(x * inv, z) <= (2^N - 1) / d, and signed, with A =
+// (2^(N-1) - 1) / |d|, iff rotr(x * inv + A 2^z, z) <= 2A (the multiples
+// of |d| are k |d|, -A <= k <= A).
+//
+// The theorems (division by invariant integers using multiplication):
+// Unsigned: for 1 <= d, 0 <= x <= X, and m = ceil(2^p / d), e = m d - 2^p
+// (0 <= e < d): if e X < 2^p then floor(x m / 2^p) = floor(x / d) for every
+// such x. (Write x = q d + r, 0 <= r < d: x m / 2^p = q + (r + e x / 2^p) / d,
+// and 0 <= r + e x / 2^p < r + 1 <= d.) The condition holds for p = N + l,
+// l = ceil(log2 d) (e < d <= 2^l, X < 2^N), where m < 2^(N+1) when d is not
+// a power of two. X is the largest value the dividend's form allows (a
+// zero-extension, a mask, a shift: umax_of), else 2^N - 1; the smallest p
+// that makes the product fit in 64 bits is tried first, then the smallest
+// p >= N (for the high halves).
+// Signed: for 2 <= a not a power of two, |x| <= 2^(N-1), m = ceil(2^p / a),
+// e = m a - 2^p (0 < e < a): if e 2^(N-1) < 2^p then x / a (truncated) is
+// floor(x m / 2^p) for x >= 0 and floor(x m / 2^p) + 1 for x < 0. (For x =
+// -(q a + r): x m / 2^p = -q - (r + e |x| / 2^p) / a, and 0 < r + e |x| / 2^p
+// < a: the floor is -q - 1.) It holds for p = N - 1 + l, where m < 2^N.
+// The multipliers are computed exactly, in 128 bits (u.I128).
+//
+// wasm has no high multiply, and the engines turn an i64.div_u by a
+// constant into their own multiplication by the reciprocal: there a 64-bit
+// division that would need the high half is left as it is (computing the
+// high half from four 32-bit multiplications took twice as long as the
+// engine's division under node). The narrower ones are expanded on wasm too
+// (their product is an i64.mul): the engine's form is slower still where a
+// quotient and a remainder share one multiplication here, and no faster
+// elsewhere. The other operations are ones every target has.
+// =============================================================================
+import "ir.ax" as ir;
+import "isel.ax" as is;
+import "opt.ax" as opt;
+import "target.ax" as tg;
+import "util.ax" as u;
+
+let mut B: *mut ir.Builder = @ptr_from_int(*mut ir.Builder, 0);
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+fn kt(t: *mut ir.Ty, x: u64) *mut ir.Value {
+    return ir.cint(t, x);
+}
+
+fn t64() *mut ir.Ty {
+    return ir.t_int(64);
+}
+
+fn log2(x: u64) i32 {
+    if (x == 0) or ((x & (x -% 1)) != 0) {
+        return -1;
+    }
+    return @truncate(i32, @ctz(x));
+}
+
+fn ult(a: u.I128, b: u.I128) bool {
+    if a.hi != b.hi {
+        return a.hi < b.hi;
+    }
+    return a.lo < b.lo;
+}
+
+// A multiplier m = ceil(2^p / d) and its shift p (the theorems above): the
+// smallest p >= pmin with e * xmax < 2^p, e = m d - 2^p. d >= 3 is not a
+// power of two and xmax < 2^64, so the search ends by p = 64 + 63 (where
+// 2^p and e * xmax still fit in 128 bits, unsigned).
+struct Magic {
+    m: u.I128,
+    p: u32,
+}
+
+fn magic(d: u64, xmax: u.I128, pmin: u32) Magic {
+    let dd = u.I128.ofu(d);
+    let mut p = pmin;
+    while p <= 127 {
+        let two_p = u.I128.pow2(p);
+        let m = two_p.sub(u.I128.ofu(1)).div(dd).add(u.I128.ofu(1));  // (2^p - 1 < 2^127: a signed division is exact)
+        let e = m.mul(dd).sub(two_p);
+        if ult(e.mul(xmax), two_p) {
+            return Magic.{ m: m, p: p };
+        }
+        p += 1;
+    }
+    u.die("divconst: no multiplier");
+    return Magic.{ m: u.I128.zero(), p: 0 };
+}
+
+// The inverse of an odd d modulo 2^64 (Newton's iteration doubles the
+// number of correct low bits: d is its own inverse to 3 bits).
+fn inverse(d: u64) u64 {
+    let mut x = d;
+    for _k in @as(i32, 0)..5 {
+        x = x *% (2 -% (d *% x));
+    }
+    return x;
+}
+
+// -----------------------------------------------------------------------------
+// The largest value of x, when its form shows one below the type's: a
+// zero-extension, a mask, a logical shift right, a remainder.
+// -----------------------------------------------------------------------------
+fn umax_of(x: *ir.Value) u64 {
+    let all = ir.mask_bits(x.ty.bits);
+    if x.kind != ir.V_INST {
+        return all;
+    }
+    if x.op == ir.OP_ZEXT {
+        return ir.mask_bits(x.a.ty.bits);
+    }
+    if (x.op == ir.OP_AND) and ir.is_cint(x.b) {
+        return ir.cint_val(x.b);
+    }
+    if (x.op == ir.OP_LSHR) and ir.is_cint(x.b) and (ir.cint_val(x.b) < 64) {
+        return all >> @truncate(u32, ir.cint_val(x.b));
+    }
+    if (x.op == ir.OP_UREM) and ir.is_cint(x.b) and (ir.cint_val(x.b) != 0) {
+        return ir.cint_val(x.b) - 1;
+    }
+    return all;
+}
+
+// Is x known not to be negative (its top bit clear)?
+fn nonneg(x: *ir.Value) bool {
+    return (umax_of(x) >> @int_cast(u32, x.ty.bits - 1)) == 0;
+}
+
+// -----------------------------------------------------------------------------
+// High halves of 64-bit products by a constant (not on wasm: has_mulh)
+// -----------------------------------------------------------------------------
+fn has_mulh() bool {
+    return not tg.is_wasm();
+}
+
+// floor(x m / 2^64) for a 64-bit x, unsigned.
+fn umulh(x: *mut ir.Value, m: u64) *mut ir.Value {
+    let mut a: [2]*mut ir.Value = [x, kt(t64(), m)];
+    return ir.intr(B, ir.IN_UMULH, t64(), a[..]);
+}
+
+// floor(x m / 2^64) for a signed 64-bit x and an unsigned m < 2^64: the
+// signed high half of x and m - 2^64, plus x, when m >= 2^63 (x m = x (m -
+// 2^64) + x 2^64; the result is within the 64-bit range).
+fn smulh_of_u(x: *mut ir.Value, m: u64) *mut ir.Value {
+    let mut a: [2]*mut ir.Value = [x, kt(t64(), m)];
+    let h = ir.intr(B, ir.IN_SMULH, t64(), a[..]);
+    if (m >> 63) != 0 {
+        return ir.add(B, h, x);
+    }
+    return h;
+}
+
+fn shr(op: i32, x: *mut ir.Value, k: u32) *mut ir.Value {
+    if k == 0 {
+        return x;
+    }
+    return ir.binop(B, op, x, kt(x.ty, @as(u64, k)));
+}
+
+// -----------------------------------------------------------------------------
+// Quotients
+// -----------------------------------------------------------------------------
+// x / d, unsigned, d not 0.
+fn udiv_const(x: *mut ir.Value, d: u64) *mut ir.Value {
+    let t = x.ty;
+    let n = @int_cast(u32, t.bits);
+    if d == 1 {
+        return x;
+    }
+    let k = log2(d);
+    if k > 0 {
+        return shr(ir.OP_LSHR, x, @int_cast(u32, k));
+    }
+    if (d >> (n - 1)) != 0 {
+        return ir.zext(B, ir.icmp(B, ir.IntUGE, x, kt(t, d)), t);
+    }
+    let xmax = umax_of(x);
+    // a product that fits in 64 bits: always for N < 32
+    let mg0 = magic(d, u.I128.ofu(xmax), 64 - @truncate(u32, @clz(xmax)));
+    if fits64(xmax, mg0) {
+        return mul_shift(x, xmax, mg0);
+    }
+    let mg = magic(d, u.I128.ofu(xmax), n);
+    if (n == 32) and fits64(xmax, mg) {
+        return mul_shift(x, xmax, mg);
+    }
+    if (n == 64) and not has_mulh() {
+        return vnil();
+    }
+    if (n == 64) and (mg.m.hi == 0) {
+        return shr(ir.OP_LSHR, umulh(x, mg.m.lo), mg.p - 64);
+    }
+    // m has N + 1 bits
+    let z = @int_cast(u32, @ctz(d));
+    if z > 0 {
+        let x2 = shr(ir.OP_LSHR, x, z);
+        let mg2 = magic(d >> z, u.I128.ofu(xmax >> z), n);
+        if (n == 64) and (mg2.m.hi == 0) {
+            return shr(ir.OP_LSHR, umulh(x2, mg2.m.lo), mg2.p - 64);
+        }
+        if (n == 32) and fits64(xmax >> z, mg2) {
+            return mul_shift(x2, xmax >> z, mg2);
+        }
+        return vnil();  // (not reached: the multiplier has at most N bits)
+    }
+    if (mg.m.hi > 1) or ((n == 32) and (mg.m.hi != 0)) or ((n == 32) and ((mg.m.lo >> 33) != 0)) {
+        return vnil();  // (not reached: the multiplier has at most N + 1 bits)
+    }
+    let mp = mg.m.sub(u.I128.pow2(n)).lo;  // m - 2^N
+    if n == 32 {
+        // 64-bit: t = (x m') >> 32, (t + x) >> (p - 32)
+        let xw = ir.zext(B, x, t64());
+        let th = ir.binop(B, ir.OP_LSHR, ir.mul(B, xw, kt(t64(), mp)), kt(t64(), 32));
+        return ir.trunc(B, shr(ir.OP_LSHR, ir.add(B, th, xw), mg.p - 32), t);
+    }
+    let th = umulh(x, mp);
+    let s = ir.add(B, shr(ir.OP_LSHR, ir.sub(B, x, th), 1), th);
+    return shr(ir.OP_LSHR, s, mg.p - 65);
+}
+
+// Does x m < 2^64 hold for every x <= xmax, and p < 64?
+fn fits64(xmax: u64, mg: Magic) bool {
+    return (u.I128.ofu(xmax).mul(mg.m).hi == 0) and (mg.m.hi == 0) and (mg.p < 64);
+}
+
+// trunc((zext(x) * m) >> p), the product exact (fits64): in 32 bits when it
+// fits there (and p < 32) and x has at most 32, else in 64.
+fn mul_shift(x: *mut ir.Value, xmax: u64, mg: Magic) *mut ir.Value {
+    let t = x.ty;
+    let m = mg.m.lo;
+    let mut w = t64();
+    let prod = u.I128.ofu(xmax).mul(mg.m);
+    if (t.bits <= 32) and ((prod.lo >> 32) == 0) and (mg.p < 32) {
+        w = ir.t_int(32);
+    }
+    let mut xw = x;
+    if t.bits < w.bits {
+        xw = ir.zext(B, x, w);
+    }
+    let q = shr(ir.OP_LSHR, ir.mul(B, xw, kt(w, m)), mg.p);
+    if t.bits < w.bits {
+        return ir.trunc(B, q, t);
+    }
+    return q;
+}
+
+// x / a, signed, for 3 <= a < 2^(N-1) not a power of two.
+fn sdiv_magic(x: *mut ir.Value, a: u64) *mut ir.Value {
+    let t = x.ty;
+    let n = @int_cast(u32, t.bits);
+    let mut pmin = n - 1;
+    if n == 64 {
+        pmin = 64;
+    }
+    let mg = magic(a, u.I128.pow2(n - 1), pmin);
+    let m = mg.m.lo;  // < 2^N
+    if n == 64 {
+        if not has_mulh() {
+            return vnil();
+        }
+        let h = smulh_of_u(x, m);
+        return ir.add(B, shr(ir.OP_ASHR, h, mg.p - 64), shr(ir.OP_LSHR, x, 63));
+    }
+    let mut w = t64();
+    if ((u.I128.pow2(n - 1).mul(mg.m).lo >> 31) == 0) and (mg.p < 32) {
+        w = ir.t_int(32);  // (2^(N-1) m < 2^31)
+    }
+    let mut xw = x;
+    if t.bits < w.bits {
+        xw = ir.sext(B, x, w);
+    }
+    let wb = @int_cast(u32, w.bits);
+    // (|x| m < 2^(W-1): the product is exact; it is negative just when x is)
+    let prod = ir.mul(B, xw, kt(w, m));
+    let q = ir.add(B, shr(ir.OP_ASHR, prod, mg.p), shr(ir.OP_LSHR, xw, wb - 1));
+    if t.bits < w.bits {
+        return ir.trunc(B, q, t);
+    }
+    return q;
+}
+
+// x / 2^k, signed, 1 <= k <= N - 2: biased toward zero.
+fn sdiv_pow2(x: *mut ir.Value, k: u32) *mut ir.Value {
+    return shr(ir.OP_ASHR, ir.add(B, x, sbias(x, k)), k);
+}
+
+// 2^k - 1 where x < 0, else 0
+fn sbias(x: *mut ir.Value, k: u32) *mut ir.Value {
+    let n = @int_cast(u32, x.ty.bits);
+    if k == 1 {
+        return shr(ir.OP_LSHR, x, n - 1);
+    }
+    return shr(ir.OP_LSHR, shr(ir.OP_ASHR, x, n - 1), n - k);
+}
+
+// x / a, signed, a = |d| with d not 0 or -1, 1 <= a <= 2^(N-1) (as unsigned).
+fn sdiv_abs(x: *mut ir.Value, a: u64) *mut ir.Value {
+    let n = @int_cast(u32, x.ty.bits);
+    if a == 1 {
+        return x;
+    }
+    let k = log2(a);
+    if k == @bit_cast(i32, n - 1) {
+        // (by 2^(N-1): -1 for MIN, else 0; x / MIN is the negation)
+        return ir.sext(B, ir.icmp(B, ir.IntEQ, x, kt(x.ty, a)), x.ty);
+    }
+    if k > 0 {
+        return sdiv_pow2(x, @int_cast(u32, k));
+    }
+    if nonneg(x) {
+        return udiv_const(x, a);
+    }
+    return sdiv_magic(x, a);
+}
+
+// -----------------------------------------------------------------------------
+// Exact division
+// -----------------------------------------------------------------------------
+// x / d (signed, truncated) for a constant d > 0 that is known to divide x,
+// d = d' 2^z with d' odd: (x >> z) * inv, inv the inverse of d' modulo 2^N
+// (x >> z is exact, (x >> z) = q d' and q d' inv = q modulo 2^N). The C front
+// end's pointer differences (p - q) / sizeof *p, which C defines only when p
+// and q point into the same array: their distance is a multiple of the size.
+pub fn exact_sdiv(bd: *mut ir.Builder, x: *mut ir.Value, d: u64) *mut ir.Value {
+    let t = x.ty;
+    let z = @int_cast(u32, @ctz(d));
+    let mut q = x;
+    if z > 0 {
+        q = ir.binop(bd, ir.OP_ASHR, q, kt(t, @as(u64, z)));
+    }
+    if (d >> z) == 1 {
+        return q;
+    }
+    return ir.mul(bd, q, kt(t, inverse(d >> z)));
+}
+
+// -----------------------------------------------------------------------------
+// The pass
+// -----------------------------------------------------------------------------
+// The quotients made so far, for the remainders and quotients after them.
+struct Quot {
+    x: *mut ir.Value,
+    sg: bool,
+    a: u64,  // the divisor (signed: its absolute value)
+    q: *mut ir.Value,
+}
+
+let mut quots: u.List.[Quot] = u.List.[Quot].{ data: @ptr_from_int(*mut Quot, 0), len: 0, cap: 0 };
+let mut have_doms: bool = false;
+
+fn quotient(x: *mut ir.Value, sg: bool, a: u64) *mut ir.Value {
+    let c = cached(x, sg, a);
+    if u.notnil(c) {
+        return c;
+    }
+    let mut q = vnil();
+    if sg {
+        q = sdiv_abs(x, a);
+    } else {
+        q = udiv_const(x, a);
+    }
+    if u.isnil(q) {
+        return q;
+    }
+    quots.push(Quot.{ x: x, sg: sg, a: a, q: q });
+    return q;
+}
+
+// A quotient of x by a made before, available here, or nil.
+fn cached(x: *mut ir.Value, sg: bool, a: u64) *mut ir.Value {
+    let here = B.blk;
+    for k in 0..quots.len {
+        let e = quots.get(k);
+        if (e.x == x) and (e.sg == sg) and (e.a == a) {
+            let b = e.q.blk;
+            if u.isnil(b) or (b == here) {
+                return e.q;  // (a constant or x itself; or earlier in this block)
+            }
+            if have_doms and (b.rpo >= 0) and (here.rpo >= 0) and opt.dominates(b, here) {
+                return e.q;
+            }
+        }
+    }
+    return vnil();
+}
+
+// Is i a division or remainder this pass rewrites? Its absolute divisor in *a.
+fn candidate(i: *ir.Value, a: *mut u64) bool {
+    if not ir.is_int_div(i.op) or (i.ty.kind != ir.T_INT) or (i.b.kind != ir.V_CINT) {
+        return false;
+    }
+    let n = i.ty.bits;
+    if (n != 8) and (n != 16) and (n != 32) and (n != 64) {
+        return false;
+    }
+    let d = ir.cint_val(i.b);
+    if d == 0 {
+        return false;  // (it faults: kept)
+    }
+    if (i.op == ir.OP_SDIV) or (i.op == ir.OP_SREM) {
+        let sd = ir.sval(i.b);
+        if sd == -1 {
+            return false;  // (MIN / -1 faults: kept)
+        }
+        if sd < 0 {
+            a.* = (0 -% d) & ir.mask_bits(n);
+            return true;
+        }
+    }
+    a.* = d;
+    return true;
+}
+
+// Has a remainder by a (absolute) a divisibility test (`divisible`)?
+fn has_test(rem: *ir.Value, a: u64) bool {
+    let n = rem.ty.bits;
+    return (log2(a) > 0) or (((n == 32) or (n == 64)) and (a > 1));
+}
+
+// The test `rem == 0` (ne: `rem != 0`) for a remainder rem of x by d
+// (signed: by a = |d|; has_test).
+fn divisible(rem: *mut ir.Value, a: u64, ne: bool) *mut ir.Value {
+    let x = rem.a;
+    let t = x.ty;
+    let mut peq = ir.IntEQ;
+    let mut ple = ir.IntULE;
+    if ne {
+        peq = ir.IntNE;
+        ple = ir.IntUGT;
+    }
+    if log2(a) > 0 {
+        // (unsigned 2^k is a mask already; signed too: x % 2^k is 0 just when
+        // its low bits are)
+        return ir.icmp(B, peq, ir.and_(B, x, kt(t, a - 1)), kt(t, 0));
+    }
+    let z = @int_cast(u32, @ctz(a));
+    let inv = inverse(a >> z) & ir.mask_bits(t.bits);
+    if (rem.op == ir.OP_UREM) or nonneg(x) {
+        let y = ir.mul(B, x, kt(t, inv));
+        return ir.icmp(B, ple, rotr(y, z), kt(t, ir.mask_bits(t.bits) / a));
+    }
+    let lim = (ir.mask_bits(t.bits) >> 1) / a;  // A
+    let y = ir.add(B, ir.mul(B, x, kt(t, inv)), kt(t, lim << z));
+    return ir.icmp(B, ple, rotr(y, z), kt(t, 2 * lim));
+}
+
+fn rotr(y: *mut ir.Value, z: u32) *mut ir.Value {
+    if z == 0 {
+        return y;
+    }
+    let mut args: [2]*mut ir.Value = [y, kt(y.ty, @as(u64, z))];
+    return ir.intr(B, ir.IN_ROTR, y.ty, args[..]);
+}
+
+// Is i `rem == 0` or `rem != 0` (either way round)? The remainder, or nil.
+fn zero_test(i: *ir.Value) *mut ir.Value {
+    if (i.op != ir.OP_ICMP) or ((ir.pred_of(i) != ir.IntEQ) and (ir.pred_of(i) != ir.IntNE)) {
+        return vnil();
+    }
+    let mut r = i.a;
+    let mut z = i.b;
+    if (r.kind != ir.V_INST) {
+        r = i.b;
+        z = i.a;
+    }
+    if (r.kind != ir.V_INST) or ((r.op != ir.OP_UREM) and (r.op != ir.OP_SREM)) or not ir.is_cint(z) or
+       (ir.cint_val(z) != 0) {
+        return vnil();
+    }
+    return r;
+}
+
+// Rewrites f's divisions and remainders by constants (not at -O0). Whether
+// it changed anything.
+pub fn expand(f: *mut ir.Func) bool {
+    if u.isnil(B) {
+        B = ir.new_builder();
+    }
+    // the candidates, and how many of their uses are zero tests (aux2: uses,
+    // aux: zero tests)
+    let mut count: i32 = 0;
+    let mut a: u64 = 0;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            i.aux2 = 0;
+            if candidate(i, &mut a) {
+                count += 1;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    if (count == 0) and not tg.is_wasm() {
+        return false;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            count_use(i.a);
+            count_use(i.b);
+            count_use(i.c);
+            for k in 0..i.xs.len {
+                count_use(i.xs.get(k));
+            }
+            let r = zero_test(i);
+            if u.notnil(r) {
+                r.aux += 1;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    have_doms = count > 1;
+    if have_doms {
+        opt.compute_preds(f);
+        let mut order = opt.dominators(f);
+        order.deinit();
+    }
+    quots.clear();
+    let mut dead = u.List.[*mut ir.Value].empty();
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            let r = zero_test(i);
+            if u.notnil(r) and tested_only(r, &mut a) {
+                ir.at_before(B, i);
+                ir.forward(i, divisible(r, a, ir.pred_of(i) == ir.IntNE));
+                dead.push(i);
+            } else if candidate(i, &mut a) and not tested_only(i, &mut a) {
+                ir.at_before(B, i);
+                let v = rewrite(i, a);
+                if u.notnil(v) {
+                    ir.forward(i, v);
+                    dead.push(i);
+                }
+            } else if tg.is_wasm() and ((i.op == ir.OP_UREM) or (i.op == ir.OP_SREM)) and (i.b.kind != ir.V_CINT) {
+                // wasm: a remainder by a variable after the quotient of the
+                // same operands is x - q y (the native targets' instruction
+                // selection shares the divide: isel.rem_quotient); it faults
+                // where the quotient did
+                let q = is.rem_quotient(i);
+                if u.notnil(q) {
+                    ir.at_before(B, i);
+                    ir.forward(i, ir.sub(B, i.a, ir.mul(B, q, i.b)));
+                    dead.push(i);
+                }
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    quots.clear();
+    if dead.len == 0 {
+        dead.deinit();
+        return false;
+    }
+    ir.apply_forwarding(f);
+    for k in 0..dead.len {
+        ir.remove_inst(dead.get(k));
+    }
+    dead.deinit();
+    opt.dce(f);  // (the remainders the tests replaced, and what fed only them)
+    return true;
+}
+
+// Is rem a remainder by a constant whose every use is a zero test that
+// `divisible` replaces (it is then left dead)? Its absolute divisor in *a.
+fn tested_only(rem: *ir.Value, a: *mut u64) bool {
+    return (rem.aux > 0) and (rem.aux == rem.aux2) and candidate(rem, a) and has_test(rem, a.*);
+}
+
+fn count_use(v: *mut ir.Value) void {
+    if u.notnil(v) and (v.kind == ir.V_INST) {
+        v.aux2 += 1;
+    }
+}
+
+// The value of division or remainder i by a constant (its absolute value a).
+fn rewrite(i: *mut ir.Value, a: u64) *mut ir.Value {
+    let x = i.a;
+    let t = x.ty;
+    let o = i.op;
+    if (o == ir.OP_UDIV) or (o == ir.OP_UREM) {
+        if o == ir.OP_UDIV {
+            return quotient(x, false, a);
+        }
+        if log2(a) >= 0 {
+            return ir.and_(B, x, kt(t, a - 1));
+        }
+        if (a >> @int_cast(u32, t.bits - 1)) != 0 {
+            // (a quotient of 0 or 1)
+            return ir.select(B, ir.icmp(B, ir.IntUGE, x, kt(t, a)), ir.sub(B, x, kt(t, a)), x);
+        }
+        let q = quotient(x, false, a);
+        if u.isnil(q) {
+            return q;
+        }
+        return ir.sub(B, x, ir.mul(B, q, kt(t, a)));
+    }
+    let neg = ir.sval(i.b) < 0;
+    let n = @int_cast(u32, t.bits);
+    let k = log2(a);
+    if o == ir.OP_SDIV {
+        let q = quotient(x, true, a);
+        if neg and u.notnil(q) {
+            return ir.neg(B, q);
+        }
+        return q;
+    }
+    // x % d = x % |d|, the sign of x's
+    if k == @bit_cast(i32, n - 1) {
+        // (by MIN: x, but 0 for MIN itself)
+        return ir.select(B, ir.icmp(B, ir.IntEQ, x, kt(t, a)), kt(t, 0), x);
+    }
+    if k > 0 {
+        if nonneg(x) {
+            return ir.and_(B, x, kt(t, a - 1));
+        }
+        let q = cached(x, true, a);
+        if u.notnil(q) {
+            return ir.sub(B, x, ir.binop(B, ir.OP_SHL, q, kt(t, @as(u64, @bit_cast(u32, k)))));
+        }
+        let mask = (0 -% a) & ir.mask_bits(t.bits);
+        return ir.sub(B, x, ir.and_(B, ir.add(B, x, sbias(x, @int_cast(u32, k))), kt(t, mask)));
+    }
+    let q = quotient(x, true, a);
+    if u.isnil(q) {
+        return q;
+    }
+    return ir.sub(B, x, ir.mul(B, q, kt(t, a)));
+}
