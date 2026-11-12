@@ -1,9 +1,10 @@
 // =============================================================================
 // std/internal/runtime/darwin.ax - the Axiom host ABI (import module "axiom") on macOS
-// (Apple silicon), and crash reporting (trap messages and stack traces, spec
-// §16.4). The compiler builds it into every program for
-// --target=aarch64-macos in place of std/internal/runtime/native.ax; ax_rt_args and
-// ax_rt_init run before `main`, ax_rt_fini after it.
+// (Apple silicon and Intel Macs), and crash reporting (trap messages and
+// stack traces, spec §16.4). The compiler builds it into every program for
+// --target=aarch64-macos and --target=x86_64-macos in place of
+// std/internal/runtime/native.ax; ax_rt_args and ax_rt_init run before
+// `main`, ax_rt_fini after it.
 //
 // macOS has no stable system call interface: everything goes through
 // libSystem (cmd/axiom/src/mlink.ax binds these extern "C" functions to it).
@@ -12,7 +13,13 @@
 //
 // Thread-locals: each thread has a block, a copy of the program's template,
 // whose address is in the TSD slot of a pthread key (the code generator
-// reads it through TPIDRRO_EL0; see cmd/axiom/src/a64.ax). ax_rt_args makes
+// reads it through TPIDRRO_EL0 on arm64, cmd/axiom/src/a64.ax, or the gs
+// segment on x86-64, cmd/axiom/src/x64.ax).
+//
+// The structures are the same on both architectures (the linker binds the
+// x86-64 functions whose structures differ to their variants with these
+// layouts: cmd/axiom/src/mlink.ax), but for a thread's registers (the
+// signal handler's ucontext). ax_rt_args makes
 // the main thread's block before any Axiom code that uses one runs, and
 // thread_main each new thread's.
 // =============================================================================
@@ -2707,7 +2714,7 @@ export fn ax_unavailable() void {
     let mut o = tf.fmt(report[..]);
     o.s("axiom: crash: called a function from another system's library (not available on macOS)\n");
     let fp = axiom_frame_address().*;  // this function's frame
-    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, false);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, @target_arch("x86_64"));
     tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
     write_all(2, o.text());
     flush_profile();
@@ -2727,25 +2734,37 @@ fn shadow_stack() *mut tf.ShadowStack {
 // From axiom.trap (codegen), with its own frame.
 export fn ax_stack_walk(fp: *void) void {
     let f = @int_from_ptr(fp);
-    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, false);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, @target_arch("x86_64"));
 }
 
 // From a signal handler: the frames of the code it interrupted (the
-// ucontext's uc_mcontext: __es, then __ss: x0-x28, fp, lr, sp, pc).
+// ucontext's uc_mcontext, at 48: 16 bytes of __es, then __ss: on arm64 x0-x28,
+// fp, lr, sp, pc; on x86-64 rax, rbx, rcx, rdx, rdi, rsi, rbp, rsp, r8-r15,
+// rip).
 fn stack_walk_signal(uc: *mut void) void {
     let tab = axiom_frame_table();
     if tf.is_null(@ptr_cast(*void, tab)) {
         return;
     }
+    let x64 = @target_arch("x86_64");
     let m = @ptr_from_int(*usize, @int_from_ptr(uc) + 48).*;
-    let fp = @ptr_from_int(*usize, m + 248).*;
-    let sp = @ptr_from_int(*usize, m + 264).*;
-    let pc = @ptr_from_int(*usize, m + 272).*;
+    let mut fp = @ptr_from_int(*usize, m + 248).*;
+    let mut sp = @ptr_from_int(*usize, m + 264).*;
+    let mut pc = @ptr_from_int(*usize, m + 272).*;
+    if x64 {
+        fp = @ptr_from_int(*usize, m + 16 + 48).*;
+        sp = @ptr_from_int(*usize, m + 16 + 56).*;
+        pc = @ptr_from_int(*usize, m + 16 + 128).*;
+    }
     let mut leaf: usize = 0;
     if tf.frameless_at(tab, pc) {
-        leaf = @ptr_from_int(*usize, m + 256).*;  // the link register
+        // its return address: in the link register, or at the stack pointer
+        leaf = @ptr_from_int(*usize, m + 256).*;
+        if x64 {
+            leaf = @ptr_from_int(*usize, sp).*;
+        }
     }
-    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, false);
+    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, x64);
 }
 
 // Every trap calls this (see codegen: axiom.trap).

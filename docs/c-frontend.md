@@ -78,10 +78,12 @@ lists the diagnostics.
   | `x86_64` (Linux; x86-64 System V) | signed | 64 | `int` |
   | `aarch64` (Linux; AAPCS64) | unsigned | 64 | `unsigned int` |
   | `aarch64-macos` (Apple's arm64 ABI) | signed | 64 | `int` |
+  | `x86_64-macos` (Apple's x86-64 ABI, System V's) | signed | 64 | `int` |
   | `x86_64-windows` (Windows x64) | signed | 32 | `unsigned short` |
+  | `aarch64-windows` (Windows ARM64) | signed | 32 | `unsigned short` |
   | `wasm32`, `wasm64` (the WebAssembly C ABI) | signed | 32, 64 | `int` |
 
-  `long double` is the x87's 80-bit format on `x86_64` Linux, binary128 on `aarch64`
+  `long double` is the x87's 80-bit format on `x86_64` Linux and macOS, binary128 on `aarch64`
   Linux and WebAssembly, and binary64 elsewhere (`c/run/hdr_float_ld.c`).
   (`c/run/target_*.c` check them.) The typedefs of `<stddef.h>` and `<stdint.h>` are
   the platform's types (`copts.set_platform`; the headers read them from predefined

@@ -1,9 +1,11 @@
 // =============================================================================
-// mlink.ax - links the ELF relocatable objects of a64.ax (read with
-// elf.read) into a macOS executable for Apple silicon: Mach-O, position
-// independent (the kernel slides it), dynamically linked against libSystem
-// (macOS has no stable system call interface, and dyld is how every program
-// starts), ad-hoc code-signed (the kernel runs no unsigned arm64 code).
+// mlink.ax - links the ELF relocatable objects of a64.ax or x64.ax (read
+// with elf.read) into a macOS executable for Apple silicon or for an Intel
+// Mac: Mach-O (CPU_TYPE_ARM64 or CPU_TYPE_X86_64), position independent
+// (the kernel slides it), dynamically linked against libSystem (macOS has no
+// stable system call interface, and dyld is how every program starts),
+// ad-hoc code-signed (the kernel runs no unsigned arm64 code; an x86-64
+// program is signed the same way, which it may be).
 //
 // Layout (16 KiB pages; file offsets and addresses agree within each
 // segment):
@@ -17,8 +19,12 @@
 //   __LINKEDIT  r--  rebase and bind opcodes for dyld, the export trie,
 //                    the symbol and string tables, the code signature
 // Undefined symbols are bound by name, with a leading underscore, through
-// LC_DYLD_INFO_ONLY: calls go through a stub that jumps through the GOT, and
-// data words holding their addresses are bound in place. Every absolute
+// LC_DYLD_INFO_ONLY: calls go through a stub that jumps through the GOT
+// (adrp, ldr, br on arm64; jmp [rip + slot] on x86-64), and data words
+// holding their addresses are bound in place. On x86-64 the functions whose
+// structures have 64-bit inode numbers (stat, readdir, ...) are bound to
+// their $INODE64 names, the variants with the layouts arm64 has (libSystem's
+// unsuffixed x86-64 ones keep the old layouts). Every absolute
 // address the image holds is rebased. They are libSystem's, unless an
 // extern block named a library (codegen leaves the name in a constant
 // axiom.import.<function>): a framework ("AppKit", "Metal", ...), "objc"
@@ -28,7 +34,8 @@
 //
 // Thread-locals: macOS gives programs no thread pointer of their own, so the
 // code generator addresses them as a per-thread block found through a TSD
-// slot (a64.ax). The linker lays out the template (.tdata, then .tbss) and
+// slot (a64.ax: TPIDRRO_EL0 addresses the slots; x64.ax: the gs segment
+// does). The linker lays out the template (.tdata, then .tbss) and
 // resolves each thread-local's offset in it; the runtime (std/internal/runtime/darwin.ax)
 // copies the template for every thread, using the record that ax_tls_info()
 // returns: [the slot's byte offset (axiom.tls_key, which the runtime sets),
@@ -65,6 +72,37 @@ let mut dylibs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0
 let mut import_ord: u.SymMap.[u32] = u.SymMap.[u32].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 
+let mut X64: bool = false;  // linking x86-64 objects (else arm64 ones)
+
+// A stub's size: adrp, ldr, br; or jmp [rip + slot] and two int3s.
+fn stub_size() u64 {
+    if X64 {
+        return 8;
+    }
+    return 12;
+}
+
+fn machine() u32 {
+    if X64 {
+        return elf.EM_X86_64;
+    }
+    return elf.EM_AARCH64;
+}
+
+fn cpu_type() u64 {
+    if X64 {
+        return 0x0100_0007;  // CPU_TYPE_X86_64
+    }
+    return 0x0100_000c;  // CPU_TYPE_ARM64
+}
+
+fn cpu_subtype() u64 {
+    if X64 {
+        return 3;  // CPU_SUBTYPE_X86_64_ALL
+    }
+    return 0;  // CPU_SUBTYPE_ARM64_ALL
+}
+
 let mut text_addr: u64 = 0;
 let mut stub_addr: u64 = 0;
 let mut data_addr: u64 = 0;  // __DATA's address (and segment offsets from it)
@@ -76,6 +114,9 @@ let mut tls_memsz: u64 = 0;
 let mut tls_align: u64 = 1;
 
 fn is_abs64(ty: u32) bool {
+    if X64 {
+        return ty == elf.R_X86_64_64;
+    }
     return ty == elf.R_AARCH64_ABS64;
 }
 
@@ -212,17 +253,44 @@ fn is_import(oi: usize, si: u32) bool {
 }
 
 fn import_name(oi: usize, si: u32) []u8 {
-    return dylib_name(nl.objs.get(oi).syms.get(@as(usize, si)).name);
+    return bound_name(nl.objs.get(oi).syms.get(@as(usize, si)).name);
+}
+
+// The functions whose x86-64 libSystem names without a suffix use the
+// structures with 32-bit inode numbers (struct stat, struct dirent, DIR,
+// struct statfs); their $INODE64 variants use the 64-bit ones, which are
+// the only ones arm64 has (and std/internal/runtime/darwin.ax's layouts).
+let INODE64_FNS: [16][]u8 = ["stat", "lstat", "fstat", "fstatat", "statfs", "fstatfs", "getfsstat", "opendir",
+                             "fdopendir", "readdir", "readdir_r", "rewinddir", "seekdir", "telldir", "scandir",
+                             "alphasort"];
+
+// A function's name from the name it is bound by (bound_name).
+fn unbound_name(b: []u8) []u8 {
+    let mut n = b[1..];
+    let k = u.find(n, '$');
+    if k >= 0 {
+        n = n[0..@int_cast(usize, k)];
+    }
+    return n;
 }
 
 // The name in libSystem of an imported function: with the Mach-O
-// underscore. The runtime's __axiom_libc_<name> is libSystem's <name>
+// underscore (and on x86-64 the suffix of the variant, above). The
+// runtime's __axiom_libc_<name> is libSystem's <name>
 // (std/internal/runtime/darwin.ax): the C library's functions of the same
 // names (exit, malloc, ...) are a C program's own, which the runtime must
 // not call in their place.
-fn dylib_name(name: []u8) []u8 {
+fn bound_name(name0: []u8) []u8 {
+    let mut name = name0;
     if u.starts(name, "__axiom_libc_") {
-        return u.cat2("_", name[13..]);
+        name = name[13..];
+    }
+    if X64 {
+        for f in INODE64_FNS {
+            if u.str_eq(f, name) {
+                return u.f1("_%s$INODE64", name);
+            }
+        }
     }
     return u.cat2("_", name);
 }
@@ -237,10 +305,10 @@ fn scan_relocs() void {
                 continue;  // (nl.debug_sections)
             }
             for r in s.relocs.items() {
-                if nl.is_got_reloc(false, r.ty) {
+                if nl.is_got_reloc(X64, r.ty) {
                     _ = nl.got_slot(oi, r.sym);
                 } else if is_import(oi, r.sym) {
-                    if nl.is_call_reloc(false, r.ty) {
+                    if nl.is_call_reloc(X64, r.ty) {
                         _ = nl.got_slot(oi, r.sym);
                         let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, r.sym))));
                         if g.stub < 0 {
@@ -296,12 +364,19 @@ fn apply_relocs(b: []mut u8) void {
                 let t = r.ty;
                 let imp = is_import(oi, r.sym);
                 let mut sv = nl.sym_addr(oi, r.sym);
-                if imp and nl.is_call_reloc(false, t) {
+                if imp and nl.is_call_reloc(X64, t) {
                     let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, r.sym))));
-                    sv = stub_addr + (@as(u64, @bit_cast(u32, g.stub)) * 12);
+                    sv = stub_addr + (@as(u64, @bit_cast(u32, g.stub)) * stub_size());
                 }
-                if nl.is_got_reloc(false, t) {
-                    nl.a64_got(b, fo, p, t, got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, r.sym))) * 8));
+                if nl.is_got_reloc(X64, t) {
+                    let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, r.sym))) * 8);
+                    if not X64 {
+                        nl.a64_got(b, fo, p, t, ga);
+                    } else if not imp and nl.x64_relax(b, fo, t) {
+                        rel32(b, fo, p, sv +% @bit_cast(u64, r.addend));  // (lea of our own symbol)
+                    } else {
+                        rel32(b, fo, p, ga +% @bit_cast(u64, r.addend));
+                    }
                     continue;
                 }
                 let sa = sv +% @bit_cast(u64, r.addend);
@@ -313,6 +388,10 @@ fn apply_relocs(b: []mut u8) void {
                         rebase_at(p);
                         bn.w64(b, fo, sa);
                     }
+                    continue;
+                }
+                if X64 {
+                    x64_reloc(b, fo, p, t, sa);
                     continue;
                 }
                 if nl.a64_reloc(b, fo, p, t, sa) {
@@ -337,12 +416,42 @@ fn apply_relocs(b: []mut u8) void {
     }
 }
 
+// A 32-bit displacement at p (file offset fo) to target (x86-64: from the
+// end of the field, as the relocations' addends of -4 have it).
+fn rel32(b: []mut u8, fo: u64, p: u64, target: u64) void {
+    let v = @bit_cast(i64, target) - @bit_cast(i64, p);
+    if (v < -0x8000_0000) or (v > 0x7fff_ffff) {
+        nl.err("relocation out of range (pc32)");
+    }
+    bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+}
+
+// The x86-64 relocations but GOT ones and absolute addresses: calls, jumps
+// and RIP-relative references (to a stub for a library's function), and a
+// thread-local's offset in the thread's block (TPOFF32: x64.ax addresses
+// thread-locals as [block + offset]).
+fn x64_reloc(b: []mut u8, fo: u64, p: u64, t: u32, sa: u64) void {
+    if nl.is_call_reloc(true, t) {
+        rel32(b, fo, p, sa);
+    } else if t == elf.R_X86_64_TPOFF32 {
+        let v = @bit_cast(i64, sa -% tls_addr);
+        if (v < 0) or (v > 0x7fff_ffff) {
+            nl.err("thread-local offset out of range");
+        }
+        bn.w32(b, fo, @bit_cast(u64, v));
+    } else {
+        // (R_X86_64_32 and 32S: absolute 32-bit addresses, which a
+        // position-independent image cannot hold)
+        nl.err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // The linker's own object: the thread-local record (axiom.tls_key is its
 // first word) and ax_tls_info(), which returns its address.
 // -----------------------------------------------------------------------------
 fn own_object() *mut elf.Obj {
-    let o = elf.new_obj(elf.EM_AARCH64);
+    let o = elf.new_obj(machine());
     let text = elf.add_sec(o, ".text", elf.S_TEXT, 4);
     let data = elf.add_sec(o, ".data", elf.S_DATA, 8);
     let ds = o.secs.get(@int_cast(usize, data));
@@ -352,6 +461,13 @@ fn own_object() *mut elf.Obj {
     _ = elf.add_sym(o, elf.Sym.{ name: "ax_tls_info", sec: text, value: 0, size: 12, bind: elf.B_GLOBAL, ty: elf.T_FUNC,
                                  hidden: true });
     let ts = o.secs.get(@int_cast(usize, text));
+    if X64 {
+        let code: [8]u8 = [0x48, 0x8d, 0x05, 0, 0, 0, 0,  // lea rax, [rip + info]
+                           0xc3];  // ret
+        ts.data.put(code[..]);
+        ts.relocs.push(elf.Rel.{ off: 3, ty: elf.R_X86_64_PC32, sym: info, addend: -4 });
+        return o;
+    }
     ts.relocs.push(elf.Rel.{ off: 0, ty: elf.R_AARCH64_ADR_PREL_PG_HI21, sym: info, addend: 0 });
     ts.data.u32_(0x9000_0000);  // adrp x0, info
     ts.relocs.push(elf.Rel.{ off: 4, ty: elf.R_AARCH64_ADD_ABS_LO12_NC, sym: info, addend: 0 });
@@ -550,7 +666,7 @@ fn bind_info() []u8 {
     b.u8_(0x51);  // BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER
     let mut ord: u32 = 0;
     for x in binds.items() {
-        let o = ordinal_of(x.name[1..]);
+        let o = ordinal_of(unbound_name(x.name));
         if o != ord {
             ord = o;
             if o < 16 {
@@ -576,10 +692,11 @@ fn bind_info() []u8 {
 
 // Links `inputs` into the executable `out`. 0: done; 1: errors (reported).
 pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
+    X64 = (inputs.len > 0) and (inputs[0].machine == elf.EM_X86_64);
     nl.begin(inputs);
     nl.objs.push(own_object());
-    nl.objs.push(jstub.build(elf.EM_AARCH64, false));  // (C's setjmp and longjmp)
-    nl.objs.push(elf.rets_bounds(elf.EM_AARCH64));
+    nl.objs.push(jstub.build(machine(), false));  // (C's setjmp and longjmp)
+    nl.objs.push(elf.rets_bounds(machine()));
     collect_dylibs();
     collect_symbols();
     let mn = nl.gsym_index("main");
@@ -657,8 +774,8 @@ fn write_dsym(out: []u8, uuid: []u8, ly: *Layout) i32 {
     let sizeofcmds = 24 + (72 + 80) + (72 + (nsec * 80));
     let mut h = bn.new_bytes();
     h.u32_(0xfeed_facf);  // MH_MAGIC_64
-    h.u32_(0x0100_000c);  // CPU_TYPE_ARM64
-    h.u32_(0);
+    h.u32_(cpu_type());
+    h.u32_(cpu_subtype());
     h.u32_(0xa);  // MH_DSYM
     h.u32_(ncmds);
     h.u32_(sizeofcmds);
@@ -756,7 +873,7 @@ fn lay_out() Layout {
     text_addr = nl.align_up(BASE + 32 + sizeofcmds, 16);
     let code_end = nl.place(nl.C_TEXT, text_addr);
     stub_addr = nl.align_up(code_end, 4);
-    let text_end = stub_addr + (@as(u64, stubs.len) * 12);
+    let text_end = stub_addr + (@as(u64, stubs.len) * stub_size());
     let const_addr = nl.align_up(text_end, nl.class_align(nl.C_CONST));
     let const_end = nl.place(nl.C_CONST, const_addr);
     let text_size = nl.align_up(const_end - BASE, PAGE);
@@ -793,11 +910,18 @@ fn write_contents(b: []mut u8) void {
     nl.copy_class(b, nl.C_TDATA, file_of);
 
     // stubs: adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16
+    // (x86-64: jmp [rip + slot]; int3; int3)
     for k in 0..stubs.len {
         let g = nl.gsyms.at(@as(usize, stubs.get(k)));
-        let at = stub_addr + (@as(u64, k) * 12);
+        let at = stub_addr + (@as(u64, k) * stub_size());
         let slot = got_addr + (@as(u64, @bit_cast(u32, g.got)) * 8);
         let fo = file_of(at);
+        if X64 {
+            bn.w16(b, fo, 0x25ff);
+            rel32(b, fo + 2, at + 6, slot);
+            bn.w16(b, fo + 6, 0xcccc);
+            continue;
+        }
         bn.w32(b, fo, 0x9000_0010);
         nl.a64_adrp(b, fo, at, slot);
         bn.w32(b, fo + 4, 0xf940_0210);
@@ -937,12 +1061,19 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
     for gi in 0..nl.gsyms.len {
         let g = nl.gsyms.at(gi);
         if g.obj < 0 {
-            undef.push(dylib_name(g.name));
+            undef.push(bound_name(g.name));
         }
     }
     u.sort.[[]u8](undef.items(), u.str_cmp);
+    let mut prev: []u8 = "";
     for nm in undef.items() {
-        let desc = @as(u64, ordinal_of(nm[1..])) << 8;  // SET_LIBRARY_ORDINAL
+        // (once each: a function and the runtime's __axiom_libc_ name for
+        // it are one symbol of libSystem)
+        if u.str_eq(nm, prev) {
+            continue;
+        }
+        prev = nm;
+        let desc = @as(u64, ordinal_of(unbound_name(nm))) << 8;  // SET_LIBRARY_ORDINAL
         syms.push(NSym.{ name: nm, ty: 0x01, sect: 0, desc: desc, value: 0 });
     }
     return syms;
@@ -952,9 +1083,9 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
 // the caller to fill in).
 fn load_commands(h: *mut bn.Bytes, ly: *Layout, le: *LinkEdit) usize {
     h.u32_(0xfeed_facf);  // MH_MAGIC_64
-    h.u32_(0x0100_000c);  // CPU_TYPE_ARM64
-    h.u32_(0);            // CPU_SUBTYPE_ARM64_ALL
-    h.u32_(2);            // MH_EXECUTE
+    h.u32_(cpu_type());
+    h.u32_(cpu_subtype());
+    h.u32_(2);  // MH_EXECUTE
     h.u32_(ly.ncmds);
     h.u32_(ly.sizeofcmds);
     h.u32_(0x0020_0085);  // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
@@ -1010,7 +1141,7 @@ fn load_commands(h: *mut bn.Bytes, ly: *Layout, le: *LinkEdit) usize {
     h.u32_(0x32);  // LC_BUILD_VERSION
     h.u32_(24);
     h.u32_(1);            // PLATFORM_MACOS
-    h.u32_(0x000b_0000);  // minos 11.0, the first for Apple silicon
+    h.u32_(0x000b_0000);  // minos 11.0, the first for Apple silicon (and the runtime's on x86-64: __ulock_wait2)
     h.u32_(0x000b_0000);  // sdk
     h.u32_(0);            // no tools
     h.u32_(0x8000_0028);  // LC_MAIN

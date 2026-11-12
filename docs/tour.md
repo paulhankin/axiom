@@ -532,6 +532,8 @@ axiom build prog.ax --target=native -O2 -o prog            # this machine
 axiom build prog.ax --target=x86_64 -O2 -o prog            # any x86-64 Linux machine
 axiom build prog.ax --target=aarch64-macos -O2 -o prog     # Apple silicon
 axiom build prog.ax --target=x86_64-windows -O2 -o prog.exe
+axiom build prog.ax --target=x86_64-macos -O2 -o prog      # Intel Macs (not yet run on one)
+axiom build prog.ax --target=aarch64-windows -O2 -o prog.exe  # Windows on ARM64 (not yet run on it)
 axiom build prog.ax -O2 -o prog.wasm                       # WebAssembly (wasm32)
 axiom build prog.ax --sanitize=address --target=native     # use after free, double free, leaks
 axiom profile prog.ax --target=native -- args              # where the time goes

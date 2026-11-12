@@ -46,7 +46,8 @@ axiom build hello.ax -o hello.wasm                 # WebAssembly; run it with no
 ## Commands
 
 ```
-axiom build prog.ax --target=native -O2 -o prog   # native code for this machine (also x86_64, aarch64, aarch64-macos, x86_64-windows)
+axiom build prog.ax --target=native -O2 -o prog   # native code for this machine (also x86_64, aarch64, aarch64-macos, x86_64-windows;
+                                                  # x86_64-macos and aarch64-windows build, but have not yet run on real systems)
 axiom build prog.ax -O2 -o prog.wasm              # WebAssembly (wasm32; also wasm64)
 axiom build prog.ax --target=aarch64 --cpu=neoverse-n1 -o prog
 axiom test mylib.ax                               # run a file's `test` blocks

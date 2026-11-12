@@ -17,7 +17,7 @@
 //     gpu.draw_overlay(&mut ov, c.pixels());       // or c.to_image()
 //
 // Coordinates are pixels, from the top left. macOS only
-// (--target=aarch64-macos).
+// (--target=aarch64-macos, x86_64-macos).
 // =============================================================================
 
 import "../math.ax" as math;
@@ -28,8 +28,10 @@ import "image.ax" as image;
 pub error QuartzError { Unsupported, Failed, OutOfMemory, InvalidArgument, Corrupt, TooLarge }
 
 // Functions taking a CGRect or CGAffineTransform are declared without
-// parameters and called through a cast (see std/os/objc: such structs go in
-// registers as their fields, or a large one by address).
+// parameters and called through a cast (see std/os/objc: on Apple silicon
+// such structs go in registers as their fields, or a large one by address;
+// on x86-64 both are on the stack, as their fields after doubles that use
+// up the floating-point argument registers: rect_call and its kin).
 extern "C" "CoreGraphics" {
     fn CGColorSpaceCreateDeviceRGB() usize;
     fn CGColorSpaceRelease(cs: usize) void;
@@ -181,6 +183,18 @@ pub struct Size {
     width: f32,
     height: f32,
     lines: u32,
+}
+
+// A call of f(c, rect), a CoreGraphics function taking a context and a
+// CGRect: the rectangle as its four doubles, in registers on Apple silicon,
+// and on the stack on x86-64 (after doubles that use up xmm0-7).
+fn rect_call(f: fn() void, c: usize, r: [4]f64) void {
+    if @target_arch("x86_64") {
+        @bit_cast(fn(usize, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) void, f)(
+            c, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, r[0], r[1], r[2], r[3]);
+        return;
+    }
+    @bit_cast(fn(usize, f64, f64, f64, f64) void, f)(c, r[0], r[1], r[2], r[3]);
 }
 
 // A rectangle's four doubles, for the functions that take a CGRect.
@@ -347,7 +361,7 @@ pub struct Canvas {
     pub fn fill_rect(self: *mut Canvas, x: f32, y: f32, w: f32, h: f32, c: Color) void {
         self.fill_color(c);
         let r = rect(x, y, w, h);
-        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextFillRect)(self.ctx, r[0], r[1], r[2], r[3]);
+        rect_call(CGContextFillRect, self.ctx, r);
     }
 
     /// A rectangle's outline, `width` pixels thick.
@@ -355,13 +369,25 @@ pub struct Canvas {
         CGContextSetRGBStrokeColor(self.ctx, @float_cast(f64, c.r), @float_cast(f64, c.g), @float_cast(f64, c.b),
                                    @float_cast(f64, c.a));
         let r = rect(x, y, w, h);
-        @bit_cast(fn(usize, f64, f64, f64, f64, f64) void, CGContextStrokeRectWithWidth)(
-            self.ctx, r[0], r[1], r[2], r[3], @float_cast(f64, width));
+        let wd = @float_cast(f64, width);
+        if @target_arch("x86_64") {
+            @bit_cast(fn(usize, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) void,
+                      CGContextStrokeRectWithWidth)(self.ctx, wd, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, r[0], r[1], r[2],
+                                                    r[3]);
+        } else {
+            @bit_cast(fn(usize, f64, f64, f64, f64, f64) void, CGContextStrokeRectWithWidth)(
+                self.ctx, r[0], r[1], r[2], r[3], wd);
+        }
     }
 
     fn round_path(x: f32, y: f32, w: f32, h: f32, radius: f32) usize {
         let rr = @float_cast(f64, @min(radius, @min(w, h) / 2.0));
         let r = rect(x, y, w, h);
+        if @target_arch("x86_64") {
+            return @bit_cast(fn(f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, usize) usize,
+                             CGPathCreateWithRoundedRect)(rr, rr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, r[0], r[1], r[2], r[3],
+                                                          0);
+        }
         return @bit_cast(fn(f64, f64, f64, f64, f64, f64, usize) usize, CGPathCreateWithRoundedRect)(
             r[0], r[1], r[2], r[3], rr, rr, 0);
     }
@@ -393,13 +419,13 @@ pub struct Canvas {
     pub fn fill_ellipse(self: *mut Canvas, cx: f32, cy: f32, rx: f32, ry: f32, c: Color) void {
         self.fill_color(c);
         let r = rect(cx - rx, cy - ry, rx * 2.0, ry * 2.0);
-        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextFillEllipseInRect)(self.ctx, r[0], r[1], r[2], r[3]);
+        rect_call(CGContextFillEllipseInRect, self.ctx, r);
     }
 
     pub fn draw_ellipse(self: *mut Canvas, cx: f32, cy: f32, rx: f32, ry: f32, c: Color, width: f32) void {
         self.stroke_color(c, width);
         let r = rect(cx - rx, cy - ry, rx * 2.0, ry * 2.0);
-        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextStrokeEllipseInRect)(self.ctx, r[0], r[1], r[2], r[3]);
+        rect_call(CGContextStrokeEllipseInRect, self.ctx, r);
     }
 
     pub fn line(self: *mut Canvas, x0: f32, y0: f32, x1: f32, y1: f32, c: Color, width: f32) void {
@@ -566,7 +592,13 @@ pub struct Canvas {
             return error.OutOfMemory;
         }
         defer CFRelease(fs);
-        let path = @bit_cast(fn(f64, f64, f64, f64, usize) usize, CGPathCreateWithRect)(0.0, 0.0, width, BIG, 0);
+        let mut path: usize = 0;
+        if @target_arch("x86_64") {
+            path = @bit_cast(fn(f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, usize) usize,
+                             CGPathCreateWithRect)(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, width, BIG, 0);
+        } else {
+            path = @bit_cast(fn(f64, f64, f64, f64, usize) usize, CGPathCreateWithRect)(0.0, 0.0, width, BIG, 0);
+        }
         defer CGPathRelease(path);
         let frame = CTFramesetterCreateFrame(fs, 0, 0, path, 0);
         if frame == 0 {
@@ -701,8 +733,14 @@ pub struct Canvas {
         CGContextSetAlpha(self.ctx, @float_cast(f64, opacity));
         CGContextTranslateCTM(self.ctx, @float_cast(f64, x), @float_cast(f64, y + h));
         CGContextScaleCTM(self.ctx, 1.0, -1.0);
-        @bit_cast(fn(usize, f64, f64, f64, f64, usize) void, CGContextDrawImage)(
-            self.ctx, 0.0, 0.0, @float_cast(f64, w), @float_cast(f64, h), bm.img);
+        if @target_arch("x86_64") {
+            @bit_cast(fn(usize, usize, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) void,
+                      CGContextDrawImage)(self.ctx, bm.img, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                          @float_cast(f64, w), @float_cast(f64, h));
+        } else {
+            @bit_cast(fn(usize, f64, f64, f64, f64, usize) void, CGContextDrawImage)(
+                self.ctx, 0.0, 0.0, @float_cast(f64, w), @float_cast(f64, h), bm.img);
+        }
         CGContextRestoreGState(self.ctx);
     }
 
@@ -726,7 +764,14 @@ pub struct Canvas {
         // a CGAffineTransform (six doubles) is passed by address
         let m: [6]f64 = [@float_cast(f64, a), @float_cast(f64, b), @float_cast(f64, c), @float_cast(f64, d),
                          @float_cast(f64, e), @float_cast(f64, f)];
-        @bit_cast(fn(usize, *f64) void, CGContextConcatCTM)(self.ctx, &m[0]);
+        if @target_arch("x86_64") {
+            // (x86-64: on the stack, as its fields)
+            @bit_cast(fn(usize, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) void,
+                      CGContextConcatCTM)(self.ctx, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, m[0], m[1], m[2], m[3],
+                                          m[4], m[5]);
+        } else {
+            @bit_cast(fn(usize, *f64) void, CGContextConcatCTM)(self.ctx, &m[0]);
+        }
     }
 
     pub fn reset_transform(self: *mut Canvas) void {
@@ -748,7 +793,7 @@ pub struct Canvas {
         CGContextSaveGState(self.ctx);
         self.depth += 1;
         let r = rect(x, y, w, h);
-        @bit_cast(fn(usize, f64, f64, f64, f64) void, CGContextClipToRect)(self.ctx, r[0], r[1], r[2], r[3]);
+        rect_call(CGContextClipToRect, self.ctx, r);
     }
 
     pub fn unclip(self: *mut Canvas) void {

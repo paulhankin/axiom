@@ -682,8 +682,8 @@ the same width):
 |---|---|---|---|---|---|---|---|---|---|
 | `x86_64` (Linux) | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long` |
 | `aarch64` (Linux) | unsigned | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `unsigned int` | `long` |
-| `aarch64-macos` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long long` |
-| `x86_64-windows` | signed | 32 | 32 | 64 | 64 | `unsigned long long` | `long long` | `unsigned short` | `long long` |
+| `aarch64-macos`, `x86_64-macos` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long long` |
+| `x86_64-windows`, `aarch64-windows` | signed | 32 | 32 | 64 | 64 | `unsigned long long` | `long long` | `unsigned short` | `long long` |
 | `wasm32` | signed | 32 | 32 | 64 | 32 | `unsigned long` | `long` | `int` | `long long` |
 | `wasm64` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long long` |
 
@@ -691,7 +691,8 @@ the same width):
 |---|---|---|---|---|---|
 | `x86_64`, `aarch64` (Linux) | `long` | `long` | `long` | `unsigned int` | aligned to 16 |
 | `aarch64-macos` | `long` | `short` | `int` | `int` | `long double` (8) |
-| `x86_64-windows` | `long long` | `int` | `int` | `unsigned short` | `long double` (8) |
+| `x86_64-macos` | `long` | `short` | `int` | `int` | `long double` (16) |
+| `x86_64-windows`, `aarch64-windows` | `long long` | `int` | `int` | `unsigned short` | `long double` (8) |
 | `wasm32`, `wasm64` | `long long` | `int` | `int` | `int` | aligned to 16 |
 
 `short` is 16 bits on every target; `intptr_t` and `uintptr_t` are `ptrdiff_t` and
@@ -709,9 +710,9 @@ widths cannot pass such values to it.
 
 | Target | `long double` | Size, alignment | `LDBL_MANT_DIG` |
 |---|---|---|---|
-| `x86_64` (Linux) | the x87's 80-bit extended format | 16, 16 (10 bytes of value, 6 of padding) | 64 |
+| `x86_64` (Linux), `x86_64-macos` | the x87's 80-bit extended format | 16, 16 (10 bytes of value, 6 of padding) | 64 |
 | `aarch64` (Linux), `wasm32`, `wasm64` | IEEE 754 binary128 | 16, 16 | 113 |
-| `aarch64-macos`, `x86_64-windows` | binary64 (`double`'s) | 8, 8 | 53 |
+| `aarch64-macos`, `x86_64-windows`, `aarch64-windows` | binary64 (`double`'s) | 8, 8 | 53 |
 
 The WebAssembly C ABI makes `long double` binary128 too; this implementation follows it, so
 that the type has the size, alignment and range that C code built for WebAssembly
@@ -734,7 +735,7 @@ format than the ABI's cannot pass `long double` values to it.
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
 | `max_align_t` | Aligned as the platform's (above): a structure of a `long long` and a `long double` aligned to 16 (size 32 where `long double` is 16 bytes), or `long double` (8 bytes). |
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |
-| Bit-fields | Laid out as the target's ABI lays them out: allocated from the least significant bit of a storage unit of the declared type, never straddling two units. On x86-64 Linux, macOS and WebAssembly (the System V rules) a bit-field goes at the next bit if it fits in the unit that holds it, an unnamed one adds nothing to the alignment of the structure, and one of width 0 moves the next member to the next unit of its type. On AArch64 Linux (AAPCS64) the same, but every bit-field's type adds to the alignment, unnamed ones and those of width 0 too. On Windows (x64) bit-fields are allocated in runs: a bit-field joins the open unit only if its type has the unit's size and it fits, else it starts a new unit after it; another member closes the unit; one of width 0 closes it (and aligns the next member to its type) and is ignored when no unit is open; in a union, bit-fields add their type's size but not its alignment. In a packed structure or under `#pragma pack` (GNU dialects; any `pack(n)`), a bit-field goes at the next bit (System V, AAPCS64; AAPCS64 still aligns the structure to a zero-width one's type), while Windows keeps its units, aligned to at most n. A plain `int` bit-field is signed. A `char` bit-field has `char`'s signedness. |
+| Bit-fields | Laid out as the target's ABI lays them out: allocated from the least significant bit of a storage unit of the declared type, never straddling two units. On x86-64 Linux, macOS and WebAssembly (the System V rules) a bit-field goes at the next bit if it fits in the unit that holds it, an unnamed one adds nothing to the alignment of the structure, and one of width 0 moves the next member to the next unit of its type. On AArch64 Linux (AAPCS64) the same, but every bit-field's type adds to the alignment, unnamed ones and those of width 0 too. On Windows (x64 and ARM64) bit-fields are allocated in runs: a bit-field joins the open unit only if its type has the unit's size and it fits, else it starts a new unit after it; another member closes the unit; one of width 0 closes it (and aligns the next member to its type) and is ignored when no unit is open; in a union, bit-fields add their type's size but not its alignment. In a packed structure or under `#pragma pack` (GNU dialects; any `pack(n)`), a bit-field goes at the next bit (System V, AAPCS64; AAPCS64 still aligns the structure to a zero-width one's type), while Windows keeps its units, aligned to at most n. A plain `int` bit-field is signed. A `char` bit-field has `char`'s signedness. |
 | Enumerations | The type is `unsigned int` if no enumerator is negative, else `int`, when all fit; the enumeration constants are `int`. In C23, if some enumerator does not fit `int`, the first of `long`, `long long` (`unsigned long`, `unsigned long long` for an unsigned type) that holds all of them, and then the constants have the enumerated type. Before C23 a value outside `int` is `C3013`. With a fixed underlying type (C23), that type. |
 | `_BitInt(N)` | `BITINT_MAXWIDTH` is 64. An object is stored in the smallest of 8, 16, 32 or 64 bits that holds N (aligned as that integer type, as the x86-64 and AArch64 ABIs specify), extended to it. As an argument or result it is that integer; the bits beyond N that arrive are not relied on (the ABIs leave them unspecified). |
 | Null pointer | All bits zero. |
@@ -964,8 +965,8 @@ GCC's documentation describes extended asm, with these rules:
   usual way to pass system call arguments); elsewhere it is an ordinary variable. The stack
   and frame pointers, and on AArch64 x16, x17 and x18, cannot be.
 - Clobbers: registers (with or without `%` on x86-64), `"cc"` (always assumed on x86-64),
-  `"memory"`; not the stack or frame pointer (C3096). A clobbered callee-saved register is
-  saved by the function.
+  `"memory"`; not the stack or frame pointer, nor on macOS and Windows for AArch64 x18,
+  the platform's (C3096). A clobbered callee-saved register is saved by the function.
 - Template modifiers: x86-64 `%b %w %k %q %h` (a register's widths, its high byte), `%x`
   (xmm), `%c %P %p %a` (a constant without `$`, an address), `%n` (negated), `%A` (`*`),
   `%H` (memory 8 bytes on), `%V`, `%z` (the size suffix); AArch64 `%w %x` (also of the
@@ -1242,10 +1243,11 @@ library and is called by it:
 
 | Target | ABI |
 |---|---|
-| `x86_64` | x86-64 System V. |
+| `x86_64`, `x86_64-macos` | x86-64 System V. |
 | `x86_64-windows` | Windows x64. |
 | `aarch64` | AAPCS64. |
 | `aarch64-macos` | Apple's variant of AAPCS64. |
+| `aarch64-windows` | Windows ARM64: AAPCS64, but for variadic functions (below). |
 | `wasm32`, `wasm64` | The WebAssembly C ABI. |
 
 A complex value is passed and returned as the structure of its two parts would be, as
@@ -1264,6 +1266,18 @@ pointer first parameter.
 `va_list` is the ABI's: an array of one structure on x86-64 System V, the AAPCS64
 structure on AArch64 Linux, and `char *` elsewhere, so it can be passed to the library's
 `v...` functions.
+
+On Windows ARM64 every argument of a variadic function, the named ones too, goes as in
+the image of a stack of 8-byte slots whose first 64 bytes are `x0`-`x7` (the
+platform's rule: AAPCS64's C.12-C.15 applied to that image): floating-point values as
+their bits in integer registers, no homogeneous aggregates, a structure of at most 16
+bytes as its memory, a larger one by reference, a type aligned to 16 at an even slot. A
+structure can therefore straddle `x7` and the stack, as the specification of the
+platform says (the other compiler available here as an oracle passes such a structure
+whole on the stack, which its own `va_arg` then misreads; this implementation follows
+the specification). A variadic definition stores the registers after its named
+arguments in 64 bytes it reserves just below its stack arguments, so that `va_list` walks
+over both. Results are returned as in AAPCS64 (homogeneous aggregates included).
 
 On Windows, an object that C code declares and no unit defines is a DLL's, by the same
 rules as functions (`msvcrt.dll`'s unless its name is a Windows API's): the program
@@ -1290,7 +1304,18 @@ arrays, bit-fields, floating and integer members, `long double` and `long double
 _Complex` ones (`--ld`), over-aligned members, 1 to about 64 bytes) passed and returned by value, through pointers and as variadic arguments read with
 `va_arg`, `va_copy` and a `va_list` passed on; the layouts of bit-fields on every target
 against the platforms' C compilers. The suite runs a subset (`c/run/abi_gen_*.c`). Windows
-and macOS output is built but not run here. `long double` (alone, in
+and macOS output is built but not run here.
+
+`x86_64-macos` and `aarch64-windows` have never been run on their systems. For
+`x86_64-macos`, objects of random shapes built for it interoperate with the system's C
+compiler on x86-64 Linux (the same System V convention), linked and run here; layouts
+and types were checked against a compiler for `x86_64-apple-darwin`. For
+`aarch64-windows`, the callers and callees of random shapes were compiled for it, linked
+as AArch64 Linux programs (its code but for thread-locals is the same) and run under
+emulation, against each other and against another compiler's Windows ARM64 code (its IR
+for that target, given the Windows calling convention on Linux): they agree but for the
+structures that straddle `x7` and the stack (above); layouts and types were checked against
+a compiler for `aarch64-pc-windows-msvc`. `long double` (alone, in
 structures and unions, variadic, through function pointers, both ways, and the C
 library's `printf("%Lg")` and `strtold`) is tested against the system's C compiler on
 `x86_64` Linux and on `aarch64` Linux (under emulation), and with `--c-long-double=128`
@@ -1390,8 +1415,9 @@ Where it goes, per target:
 | Target | |
 |---|---|
 | `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`, and when needed `.debug_rnglists` and `.debug_loclists`. |
-| `aarch64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable is the same as without `-g`. It has no unwind information (`__unwind_info`, `__eh_frame`): the platform's ABI keeps a frame record (x29, x30) in every function that calls, and the crash reporter and `backtrace(3)` walk those records, so stack traces through our frames need none (a leaf without a frame has its caller in x30). Only an unwinder that needs the tables (C++ exceptions through our frames, which do not happen) would. |
+| `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable is the same as without `-g`. It has no unwind information (`__unwind_info`, `__eh_frame`): the platform's ABI keeps a frame record (x29, x30; on x86-64 rbp and the return address) in every function that calls, and the crash reporter and `backtrace(3)` walk those records, so stack traces through our frames need none (a leaf without a frame has its caller in x30, or on x86-64 at the stack pointer). Only an unwinder that needs the tables (C++ exceptions through our frames, which do not happen) would. |
 | `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`; no types or variables. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame). |
+| `aarch64-windows` | As `x86_64-windows`; the function table's ARM64 records describe every function with a frame (on Windows every function that calls has one). |
 | `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section (lines; no frames, which WebAssembly has no use for). |
 
 The objects of `--emit=obj` carry the same sections (ELF targets), with relocations,

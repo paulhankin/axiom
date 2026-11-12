@@ -1,18 +1,26 @@
 // Structural checks of a Mach-O executable written by the
-// linker for --target=aarch64-macos (cmd/axiom/src/mlink.ax). Nothing here
-// can run the program, so this checks what dyld and the kernel check:
-// load commands, segment and section layout, the rebase and bind opcode
-// streams, the symbol table, the entry point and the ad-hoc code signature.
+// linker for --target=aarch64-macos or x86_64-macos (cmd/axiom/src/mlink.ax).
+// Nothing here can run the program, so this checks what dyld and the kernel
+// check: load commands, segment and section layout, the rebase and bind
+// opcode streams, the symbol table, the entry point and the ad-hoc code
+// signature; and the code's links: every stub jumps through a __got slot
+// that dyld binds, and every call that the frame table records (each one's
+// return address) goes to a function's start (a symbol) or a stub (on arm64
+// every bl in __text, too).
 // Returns a list of problems (empty when the file is sound) and a summary.
 import crypto from 'node:crypto';
 
-export function checkMachO(d) {
+export function checkMachO(d, opts = {}) {
   const errs = [];
   const E = (m) => errs.push(m);
   const u32 = (o) => d.readUInt32LE(o), u64 = (o) => Number(d.readBigUInt64LE(o));
   const str = (o, n) => { const s = d.subarray(o, o + n); const z = s.indexOf(0); return s.subarray(0, z < 0 ? n : z).toString(); };
   const cstr = (o) => d.subarray(o, d.indexOf(0, o)).toString();
-  if (u32(0) !== 0xfeedfacf || u32(4) !== 0x0100000c || u32(12) !== 2) return { errs: ['not an arm64 Mach-O executable'] };
+  const x64 = u32(4) === 0x01000007;
+  if (u32(0) !== 0xfeedfacf || u32(12) !== 2 || !((u32(4) === 0x0100000c && u32(8) === 0) || (x64 && u32(8) === 3))) {
+    return { errs: ['not an arm64 or x86-64 Mach-O executable'] };
+  }
+  if (opts.x86_64 !== undefined && opts.x86_64 !== x64) return { errs: [`a Mach-O executable for ${x64 ? 'x86-64' : 'arm64'}, not the target's`] };
   const ncmds = u32(16), sizeofcmds = u32(20);
   const segs = [], sects = [], cmds = new Map();
   let off = 32;
@@ -75,6 +83,7 @@ export function checkMachO(d) {
   let ndylibs = 0;
   for (let k = 0, o = 32; k < ncmds; k++) { if (u32(o) === 0xc) ndylibs++; o += u32(o + 4); }
   let nbinds = 0;
+  const bound = new Set();
   for (let s = { i: bo }, name = '', seg = 0, so = 0; s.i < bo + bs;) {
     const b = d[s.i++], op = b & 0xf0, imm = b & 0xf;
     if (op === 0x00) continue;
@@ -89,6 +98,7 @@ export function checkMachO(d) {
       if (seg !== 2 || so + 8 > data.filesize) E(`bind of ${name} is outside __DATA`);
       if (!name.startsWith('_')) E(`bind name ${name} lacks the leading underscore`);
       if (rebased.has(`${seg}:${so}`)) E(`${name} is both rebased and bound`);
+      bound.add(data.vmaddr + so);
       so += 8;
     } else { E(`unexpected bind opcode ${op.toString(16)}`); break; }
   }
@@ -96,11 +106,12 @@ export function checkMachO(d) {
   const st = cmds.get(0x2), [symoff, nsyms, stroff, strsize] = [u32(st + 8), u32(st + 12), u32(st + 16), u32(st + 20)];
   const dy = cmds.get(0xb), [il, nl, ie, ne, iu, nu] = Array.from({ length: 6 }, (_, k) => u32(dy + 8 + 4 * k));
   if (il !== 0 || ie !== nl || iu !== nl + ne || iu + nu !== nsyms) E('LC_DYSYMTAB ranges do not cover the symbol table');
-  const names = [];
+  const names = [], defined = new Map(), starts = new Set();
   for (let k = 0; k < nsyms; k++) {
     const o = symoff + 16 * k, ty = d[o + 4], desc = d.readUInt16LE(o + 6), val = u64(o + 8);
     const nm = cstr(stroff + u32(o));
     names.push(nm);
+    if ((ty & 0x0e) === 0x0e) { defined.set(nm, val); starts.add(val); }
     if (k < nl && ty & 1) E(`local symbol ${nm} is external`);
     if (k >= nl && k < iu && ty !== 0x0f) E(`external symbol ${nm} has type ${ty}`);
     if (k >= iu && (ty !== 0x01 || (desc >> 8) < 1 || (desc >> 8) > ndylibs)) E(`import ${nm} is malformed`);
@@ -136,5 +147,63 @@ export function checkMachO(d) {
     if (!want.equals(d.subarray(csoff + cd + hoff + 32 * k, csoff + cd + hoff + 32 * (k + 1)))) bad++;
   }
   if (bad) E(`${bad} page hashes are wrong`);
-  return { errs, imports: names.slice(iu), rebases: rebased.size, binds: nbinds, pages: ncode };
+  const links = checkLinks(d, { x64, E, tsect, text, bound, defined, starts });
+  return { errs, imports: names.slice(iu), rebases: rebased.size, binds: nbinds, pages: ncode, ...links };
+}
+
+// The stubs at the end of __text (adrp x16, ldr x16, br x16 on arm64; jmp
+// [rip + slot], int3, int3 on x86-64), each through a bound __got slot; the
+// calls the frame table (__start_axiom_rets ... __stop_axiom_rets: entries
+// of a return address and a chain, each relative to itself) records, each
+// to a function's start or a stub.
+function checkLinks(d, { x64, E, tsect, text, bound, defined, starts }) {
+  const fileOf = (a) => a - text.vmaddr + text.fileoff;
+  const tend = tsect.addr + tsect.ssize;
+  const stubs = new Set();
+  const size = x64 ? 8 : 12;
+  for (let a = tend - size; a >= tsect.addr; a -= size) {
+    const o = fileOf(a);
+    let slot = -1;
+    if (x64) {
+      if (d[o] !== 0xff || d[o + 1] !== 0x25 || d[o + 6] !== 0xcc || d[o + 7] !== 0xcc) break;
+      slot = a + 6 + d.readInt32LE(o + 2);
+    } else {
+      const w0 = d.readUInt32LE(o), w1 = d.readUInt32LE(o + 4), w2 = d.readUInt32LE(o + 8);
+      if (((w0 & 0x9f00001f) >>> 0) !== 0x90000010 || ((w1 & 0xffc003ff) >>> 0) !== 0xf9400210 || w2 !== 0xd61f0200) break;
+      const imm = ((w0 >> 29) & 3) | (((w0 >> 5) & 0x7ffff) << 2);
+      slot = (a - (a % 4096)) + (imm >= 0x100000 ? imm - 0x200000 : imm) * 4096 + ((w1 >> 10) & 0xfff) * 8;
+    }
+    if (!bound.has(slot)) E(`the stub at 0x${a.toString(16)} jumps through 0x${slot.toString(16)}, which dyld does not bind`);
+    stubs.add(a);
+  }
+  const ok = (t) => starts.has(t) || stubs.has(t);
+  let calls = 0;
+  const lo = defined.get('__start_axiom_rets'), hi = defined.get('__stop_axiom_rets');
+  if (lo !== undefined && hi !== undefined) {
+    for (let e = lo; e < hi; e += 8) {
+      const eo = fileOf(e);
+      const ra = e + d.readInt32LE(eo), chain = d.readInt32LE(eo + 4);
+      if ((chain & 2) || ra < tsect.addr + 4 || ra > tend) continue;  // (a marker: no call)
+      const ro = fileOf(ra);
+      if (x64 && ra >= tsect.addr + 5 && d[ro - 5] === 0xe8) {
+        const t = ra + d.readInt32LE(ro - 4);
+        // (or an indirect call whose bytes before it happen to hold 0xe8:
+        // call reg, with or without REX.B, or call [rip + disp32])
+        const indirect = (d[ro - 2] === 0xff && (d[ro - 1] & 0xf8) === 0xd0) ||
+          (d[ro - 3] === 0x41 && d[ro - 2] === 0xff && (d[ro - 1] & 0xf8) === 0xd0) || (d[ro - 6] === 0xff && d[ro - 5] === 0x15);
+        if (ok(t) || !indirect) calls++;
+        if (!ok(t) && !indirect) E(`the call before 0x${ra.toString(16)} goes to 0x${t.toString(16)}, no function's start`);
+      }
+    }
+  }
+  if (!x64) {
+    for (let a = tsect.addr; a < tend; a += 4) {
+      const w = d.readUInt32LE(fileOf(a));
+      if (((w & 0xfc000000) >>> 0) !== 0x94000000) continue;
+      calls++;
+      const imm = w & 0x3ffffff, t = a + (imm >= 0x2000000 ? imm - 0x4000000 : imm) * 4;
+      if (!ok(t)) E(`the bl at 0x${a.toString(16)} goes to 0x${t.toString(16)}, no function's start`);
+    }
+  }
+  return { stubs: stubs.size, calls };
 }

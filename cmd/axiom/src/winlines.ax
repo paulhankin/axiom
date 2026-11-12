@@ -1,0 +1,84 @@
+// =============================================================================
+// winlines.ax - the line tables of Windows objects (x64.ax and a64.ax), in a
+// section .axiom.lines that plink.ax reads to write the program database
+// (pdb.ax). The section is a series of records: 'F', a file's path (u32
+// length, bytes; files are numbered in order), or 'P', a function: its
+// symbol's name (u32 length, bytes), the number of rows, and rows of code
+// offset, file number and line (u32 each). Files and lines are the presumed
+// ones (C's #line).
+// =============================================================================
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "util.ax" as u;
+
+let mut line_file: [4096]u32 = [0; 4096];  // file id (without #line) -> its number + 1 in the section
+let mut nline_files: u32 = 0;
+let mut line_names: u.SymMap.[u32] = u.SymMap.[u32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+
+/// Adds the section to object o (for its functions' tables) and returns it.
+pub fn begin(o: *mut elf.Obj) i32 {
+    @mem_set(line_file[..], 0);
+    nline_files = 0;
+    line_names = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    return elf.add_sec(o, ".axiom.lines", elf.S_DEBUG, 1);
+}
+
+// The section's number of the file of location src, and its line there.
+fn line_of(o: *mut elf.Obj, sec: i32, src: u32, line: *mut u32) u32 {
+    let file = ir.src_file(src);
+    let k = @as(usize, @bit_cast(u32, file));
+    line.* = ir.src_line(src);
+    let sf = u.file_of(file);
+    if (sf.marks.len == 0) and (line_file[k] != 0) {
+        return line_file[k] - 1;
+    }
+    let mut path = u.real_path(sf.path);
+    if u.isnos(path) {
+        path = sf.path;
+    }
+    if sf.marks.len > 0 {
+        let p = u.presumed_line(file, @bit_cast(i32, line.*));
+        if p.marked {
+            path = p.name;
+            line.* = @truncate(u32, @bit_cast(u64, @max(p.line, 0)));
+        }
+    }
+    let key = u.intern(path);
+    let mut n = line_names.get(key);
+    if n == 0 {
+        let d = &mut o.secs.get(@int_cast(usize, sec)).data;
+        d.u8_('F');
+        d.u32_(@as(u64, path.len));
+        d.put(path);
+        nline_files += 1;
+        n = nline_files;
+        line_names.put(key, n);
+    }
+    if sf.marks.len == 0 {
+        line_file[k] = n;
+    }
+    return n - 1;
+}
+
+/// The line table of the function whose symbol is `name` into section sec
+/// of o (from begin); rows: code offset << 32 | ir.src_loc.
+pub fn emit(o: *mut elf.Obj, sec: i32, name: []u8, rows: []u64) void {
+    let mut files = u.List.[u64].empty();
+    for r in rows {
+        let mut line: u32 = 0;
+        let f = line_of(o, sec, @truncate(u32, r), &mut line);
+        files.push((@as(u64, f) << 32) | @as(u64, line));
+    }
+    let d = &mut o.secs.get(@int_cast(usize, sec)).data;
+    d.u8_('P');
+    d.u32_(@as(u64, name.len));
+    d.put(name);
+    d.u32_(@as(u64, rows.len));
+    for k in 0..rows.len {
+        d.u32_(rows[k] >> 32);
+        d.u32_(files.get(k) >> 32);
+        d.u32_(files.get(k) & 0xffff_ffff);
+    }
+    files.deinit();
+}

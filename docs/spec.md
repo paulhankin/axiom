@@ -2139,16 +2139,20 @@ std/hash/crc, with the portable code where they are absent.
 | `wasm64-freestanding` | 64 | memory64 |
 | native (`x86_64-*`, `aarch64-*`) | 64 | Allocator memory is a region of address space reserved at the first `@memory_grow` (up to 1 TiB) with no access, so that reserving it costs no memory; its 64 KiB pages are committed (made read-write) as it grows, and `@memory_grow` fails when the system cannot commit them. Pointers are machine addresses, and accesses through them are not checked (§12.1) |
 | `aarch64-macos` (also `aarch64-apple-darwin`, `macos`) | 64 | Apple silicon, macOS 11 or later; not the bootstrap compiler. A position-independent Mach-O executable linked against `libSystem` and given an ad-hoc code signature, so it runs without Xcode. Memory is as for native. Not yet supported: `axiom test` and `axiom profile` for this target, linking C code or `-l` libraries |
+| `x86_64-macos` (also `x86_64-apple-darwin`) | 64 | An Intel Mac, macOS 11 or later; not the bootstrap compiler. As `aarch64-macos`, with the x86-64 System V calling convention. Builds; not yet run on a real system |
+| `aarch64-windows` (also `aarch64-pc-windows-msvc`) | 64 | Windows on ARM64; not the bootstrap compiler. As `x86_64-windows`, with the Windows ARM64 calling convention (AAPCS64, but every argument of a variadic function in `x0`-`x7` and then the stack, floating-point ones as their bits). `axiom test` and `axiom profile` run only on Windows on ARM64. Builds; not yet run on a real system |
 | `x86_64-windows` (also `x86_64-pc-windows-msvc`, `windows`) | 64 | Windows 10 or later on x86-64; not the bootstrap compiler. A position-independent PE32+ console executable importing from the system's DLLs (`kernel32`, `ntdll`, `ws2_32`, `bcrypt`); no C runtime is needed. Memory is as for native. `axiom test` runs each test in a process of its own (Windows cannot fork), under Wine on other systems. Debug symbols (function names and line tables) go in `<out>.pdb` (`--pdb=off`: none). `--icon=<file.ico>` builds an icon into the executable's resources. Not yet supported: linking C code or `-l` libraries |
 
 Linux is the native operating system. `--target=native` on a Mac means
-`aarch64-macos`, and on Windows `x86_64-windows`; elsewhere they are cross targets,
-so a Linux host can build Mac and Windows executables. On macOS, variadic C arguments
-are passed on the stack (Apple's arm64 ABI), and a thread-local global (§12.8.6)
+`aarch64-macos` (or on an Intel Mac `x86_64-macos`), and on Windows `x86_64-windows`
+(or `aarch64-windows` on ARM64); elsewhere they are cross targets,
+so a Linux host can build Mac and Windows executables. On macOS for Apple silicon,
+variadic C arguments are passed on the stack (Apple's arm64 ABI); on an Intel Mac the
+calling convention is x86-64 System V's; on both a thread-local global (§12.8.6)
 lives in a per-thread block whose address is kept in a pthread key. On Windows,
 every function uses the Windows x64 calling convention (four register arguments,
-shadow space, `rsi`, `rdi` and `xmm6`-`xmm15` preserved), and thread-locals are the
-image's TLS directory. An `extern "C" "name"` block (§14.5.1) names the DLL its
+shadow space, `rsi`, `rdi` and `xmm6`-`xmm15` preserved), or on ARM64 the Windows ARM64
+one, and thread-locals are the image's TLS directory. An `extern "C" "name"` block (§14.5.1) names the DLL its
 functions come from (`name.dll`) rather than a library to link. A program can ask which system it runs on with `os.system()`
 (std/os); paths on Windows may begin with a drive (`C:/`), which `path.is_abs`
 recognizes there.

@@ -52,7 +52,7 @@
 //
 // Simplest correct use of the API, not the fastest: a frame is submitted
 // and waited for before the next is recorded, so buffers can be rewritten
-// between frames. macOS only (--target=aarch64-macos).
+// between frames. macOS only (--target=aarch64-macos, x86_64-macos).
 // =============================================================================
 
 import "../os/objc.ax" as objc;
@@ -1175,8 +1175,15 @@ pub struct Device {
             return 0;
         }
         let vp: [6]f64 = [0.0, 0.0, @float_from_int(f64, w), @float_from_int(f64, h), 0.0, 1.0];
-        _ = objc.send1(self.enc, objc.sel("setViewport:"), @int_from_ptr(&vp[0]));  // (an MTLViewport: by address)
-        _ = objc.call1(self.enc, "setFrontFacingWinding:", 1);                      // counter-clockwise
+        if @target_arch("x86_64") {
+            // (an MTLViewport, six doubles: on the stack, after doubles that use up xmm0-7)
+            @bit_cast(fn(usize, usize, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) void,
+                      objc.msg_send())(self.enc, objc.sel("setViewport:"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                       vp[0], vp[1], vp[2], vp[3], vp[4], vp[5]);
+        } else {
+            _ = objc.send1(self.enc, objc.sel("setViewport:"), @int_from_ptr(&vp[0]));  // (an MTLViewport: by address)
+        }
+        _ = objc.call1(self.enc, "setFrontFacingWinding:", 1);  // counter-clockwise
         _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[0], 0);
         _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[1], 1);
         _ = objc.call2(self.enc, "setFragmentSamplerState:atIndex:", self.samplers[2], 2);
@@ -1385,7 +1392,14 @@ pub struct Device {
         }
         let groups: [3]u64 = [@as(u64, x), @as(u64, y), @as(u64, z)];
         let threads = self.cur.group;
-        // MTLSizes (24 bytes) are passed by address
+        // MTLSizes (24 bytes) are passed by address (x86-64: on the stack, as
+        // their fields after words that use up the integer argument registers)
+        if @target_arch("x86_64") {
+            @bit_cast(fn(usize, usize, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) void,
+                      objc.msg_send())(self.enc, objc.sel("dispatchThreadgroups:threadsPerThreadgroup:"), 0, 0, 0, 0,
+                                       groups[0], groups[1], groups[2], threads[0], threads[1], threads[2]);
+            return;
+        }
         _ = objc.send2(self.enc, objc.sel("dispatchThreadgroups:threadsPerThreadgroup:"), @int_from_ptr(&groups[0]),
                        @int_from_ptr(&threads[0]));
     }
@@ -1437,9 +1451,18 @@ pub struct Device {
         let mut img = image.Image.init(w, h, 4, image.Depth.U8)!;
         // getBytes:bytesPerRow:fromRegion:mipmapLevel: (an MTLRegion: by address)
         let region: [6]u64 = [0, 0, 0, @as(u64, t.width), @as(u64, t.height), 1];
-        let f = @bit_cast(fn(usize, usize, *mut u8, u64, *u64, u64) void, objc.msg_send());
-        f(t.tex, objc.sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), img.data.ptr, @as(u64, w * 4), &region[0],
-          0);
+        if @target_arch("x86_64") {
+            // (x86-64: the MTLRegion on the stack, after the other arguments
+            // and a word that uses up r9)
+            let f = @bit_cast(fn(usize, usize, *mut u8, u64, u64, u64, u64, u64, u64, u64, u64, u64) void,
+                              objc.msg_send());
+            f(t.tex, objc.sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), img.data.ptr, @as(u64, w * 4), 0, 0,
+              region[0], region[1], region[2], region[3], region[4], region[5]);
+        } else {
+            let f = @bit_cast(fn(usize, usize, *mut u8, u64, *u64, u64) void, objc.msg_send());
+            f(t.tex, objc.sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), img.data.ptr, @as(u64, w * 4),
+              &region[0], 0);
+        }
         // BGRA to RGBA
         let mut i: usize = 0;
         while i < img.data.len {
@@ -1561,6 +1584,14 @@ fn pixel_format(format: u32) u64 {
 fn replace(tex: usize, width: u32, height: u32, data: []u8, row: usize) void {
     // replaceRegion:mipmapLevel:withBytes:bytesPerRow: (an MTLRegion: by address)
     let region: [6]u64 = [0, 0, 0, @as(u64, width), @as(u64, height), 1];
+    if @target_arch("x86_64") {
+        // (x86-64: the MTLRegion on the stack, after the other arguments and
+        // a word that uses up r9)
+        let f = @bit_cast(fn(usize, usize, u64, *u8, u64, u64, u64, u64, u64, u64, u64, u64) void, objc.msg_send());
+        f(tex, objc.sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), 0, data.ptr, @as(u64, row), 0, region[0],
+          region[1], region[2], region[3], region[4], region[5]);
+        return;
+    }
     let f = @bit_cast(fn(usize, usize, *u64, u64, *u8, u64) void, objc.msg_send());
     f(tex, objc.sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), &region[0], 0, data.ptr, @as(u64, row));
 }

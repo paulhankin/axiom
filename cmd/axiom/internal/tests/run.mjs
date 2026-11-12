@@ -9,6 +9,7 @@
 //   // flags: --overflow=trap  extra compiler flags
 //   // wasm-only               skip on the native target
 //   // native-only             skip on wasm
+//   // linux-only              natively, skip on macOS and Windows targets
 //   // selfhost-only: <why>    skip with the bootstrap compiler (whose LLVM differs:
 //                              it folds an integer round trip of a pointer, say)
 //   // x86-64-flags: --cpu=x86-64  extra flags for a native build on an x86-64 host
@@ -38,6 +39,7 @@ import os from 'os';
 import { Worker } from 'worker_threads';
 import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
+import { checkPE, checkPEFile } from './pe.mjs';
 import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
@@ -50,7 +52,14 @@ const nativeTarget = `--target=${process.env.AXIOM_NATIVE_TARGET || 'native'}`;
 // macOS link no C code: cmd/axiom/internal/tests/native_rt.ax replaces cmd/axiom/internal/tests/native_rt.c, and
 // tests that call C are skipped.
 const noC = /windows|macos|darwin/.test(process.env.AXIOM_NATIVE_TARGET || '');
-const execWrap = (process.env.AXIOM_NATIVE_EXEC || '').split(' ').filter((x) => x);
+// Build-only (AXIOM_NATIVE_EXEC=none, for a target nothing here can run:
+// AXIOM_NATIVE_TARGET=x86_64-macos, aarch64-windows, ...): the sections that
+// build programs (option buildOnly) build them and check each executable's
+// structure (checkBuilt: macho.mjs, pe.mjs) instead of running it; the
+// others are skipped.
+const buildOnly = native && process.env.AXIOM_NATIVE_EXEC === 'none';
+const buildNote = buildOnly ? 'built and checked, not run' : '';
+const execWrap = (buildOnly ? '' : process.env.AXIOM_NATIVE_EXEC || '').split(' ').filter((x) => x);
 const spawnExe = (exe, args, opts) => execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), exe, ...args], opts) : spawnSync(exe, args, opts);
 const filter = (argv.find(a => a.startsWith('--filter=')) || '').slice(9);
 const listOnly = argv.includes('--list');
@@ -104,7 +113,7 @@ function files(dir) {
 }
 
 function directives(src) {
-  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, selfhostOnly: null, links: [], header: null };
+  const d = { expect: [], trap: false, errors: [], warnings: [], flags: [], x64Flags: [], wasmOnly: false, nativeOnly: false, linuxOnly: false, selfhostOnly: null, links: [], header: null };
   for (const [i, line] of src.split('\n').entries()) {
     let m;
     if ((m = line.match(/\/\/ expect: ?(.*)$/))) d.expect.push(m[1]);
@@ -115,6 +124,7 @@ function directives(src) {
     else if ((m = line.match(/\/\/ x86-64-flags: (.*)$/))) d.x64Flags.push(...m[1].trim().split(/\s+/));
     else if (/\/\/ wasm-only\b/.test(line)) d.wasmOnly = true;
     else if (/\/\/ native-only\b/.test(line)) d.nativeOnly = true;
+    else if (/\/\/ linux-only\b/.test(line)) d.linuxOnly = true;
     else if ((m = line.match(/\/\/ selfhost-only\b:? ?(.*)$/))) d.selfhostOnly = m[1] || 'not for the bootstrap compiler';
     else if ((m = line.match(/\/\/ link: (\S+)/))) d.links.push(m[1]);
     else if ((m = line.match(/\/\/ header: (\S+)/))) d.header = m[1];
@@ -243,6 +253,18 @@ function checkDynUnwind(b) {
   return found ? null : 'no function with a frame register';
 }
 
+// A build-only run's check of an executable for the native target: its
+// structure (Mach-O or PE, with its PDB) as the system's loader would see
+// it; null when it is sound.
+function checkBuilt(exe) {
+  const t = process.env.AXIOM_NATIVE_TARGET || '';
+  let errs = [];
+  if (/macos|darwin/.test(t)) errs = checkMachO(fs.readFileSync(exe), { x86_64: /x86_64/.test(t) }).errs;
+  else if (/windows/.test(t)) errs = checkPEFile(exe, { arm64: /aarch64/.test(t) }).errs;
+  else if (fs.readFileSync(exe).readUInt32BE(0) !== 0x7f454c46) errs = ['not an ELF file'];
+  return errs.length ? `the executable: ${errs.join('\n')}` : null;
+}
+
 async function runNative(exe) {
   const r = await spawnExeAsync(exe, [], { encoding: 'utf8', timeout: runTimeout });
   if (r.error && r.error.code === 'ETIMEDOUT') return { out: [], trapped: true, msg: `timed out after ${runTimeout / 1000} s` };
@@ -283,6 +305,10 @@ async function section(prefix, cases, opts = {}) {
     .filter(([n]) => !filter || n.includes(filter));
   if (!entries.length) return;
   if (listOnly) { for (const [n] of entries) console.log(n); return; }
+  if (buildOnly && !opts.buildOnly) {
+    for (const [n] of entries) record(n, { skip: true, reason: 'a build-only run (AXIOM_NATIVE_EXEC=none)' });
+    return;
+  }
   const unsupported = opts.supported ? await opts.supported() : null;
   if (unsupported) { for (const [n] of entries) record(n, { skip: true, reason: unsupported }); return; }
   const timed = opts.timed !== false;
@@ -328,6 +354,7 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
   if ((native && d.wasmOnly) || (!native && d.nativeOnly)) return { skip: true, reason: native ? 'wasm only' : 'native only' };
+  if (native && d.linuxOnly && noC) return { skip: true, reason: 'Linux targets only' };
   if (d.selfhostOnly && bootstrapCompiler()) return { skip: true, reason: d.selfhostOnly };
   if (native && noC && (d.links.length || /extern "C"/.test(src))) return { skip: true, reason: 'links C code' };
   const dir = path.join(tmp, path.basename(path.dirname(f)) + '-' + path.basename(f, '.ax'));
@@ -354,6 +381,7 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
       .map((x) => `${x.code} at line ${x.span.start_line}`);
     if (got.sort().join(', ') !== [...d.warnings].sort().join(', ')) return `expected warnings [${d.warnings.join(', ')}], got [${got.join(', ')}]`;
   }
+  if (buildOnly) return checkBuilt(out);
   const r = native ? await runNative(out) : await runWasm(out);
   let problem = null;
   if (d.trap && !r.trapped) problem = 'expected a trap, but run completed';
@@ -361,7 +389,7 @@ await section('', byFile([...files(path.join(root, 'cmd/axiom/internal/tests/run
   const want = d.expect.join('\n'), got = r.out.join('\n');
   if (!problem && want !== got) problem = `output mismatch\n--- expected\n${want}\n--- got\n${got}`;
   return { problem, stderr: r.stderr };
-}), { parallel: true });
+}), { parallel: true, buildOnly: true, note: buildNote });
 
 // The C preprocessor (docs/c-frontend.md): each cmd/axiom/internal/tests/c/pp/*.c
 // is preprocessed (--emit=c-pp) with its /* flags: */; the output must be
@@ -430,10 +458,12 @@ const cRunTest = async (f) => {
   }
   // (--units is for Axiom code: the suite run with it builds the C tests as always)
   const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
-  if (native && noC) args.push(nativeTarget, path.join(root, 'cmd/axiom/internal/tests/c/host_c.c'));
+  // (an expected error of an explicit --target's rules: checked for that target)
+  const pinned = errors.length && flags.some((x) => x.startsWith('--target='));
+  if (native && noC && !pinned) args.push(nativeTarget, path.join(root, 'cmd/axiom/internal/tests/c/host_c.c'));
   // (host_native.c is the system C library's client: the program links that
   // library, not the compiler's, whose names would take the place of its)
-  else if (native) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`, '--c-freestanding');
+  else if (native && !pinned) args.push(nativeTarget, `--link=${path.join(root, 'cmd/axiom/internal/tests/c/host_native.c')}`, '--c-freestanding');
   else if (process.env.AXIOM_C_TARGET && !flags.some((x) => x.startsWith('--target='))) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
   // (the test host runs no wasm64 program that uses the runtime's host
   // functions, as the C library's exit does: those tests are freestanding)
@@ -451,6 +481,7 @@ const cRunTest = async (f) => {
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
   const wcodes = json ? json.diagnostics.filter((x) => x.severity === 'warning').map((x) => x.code) : [];
   for (const w of warnings) if (!wcodes.includes(w)) return `expected warning ${w}, got [${wcodes.join(', ')}]`;
+  if (buildOnly) return checkBuilt(out);
   const r = native ? await runNative(out) : await runWasm(out);
   let problem = r.trapped ? `unexpected trap: ${r.msg}` : null;
   // (the C library of Windows writes lines ending in \r\n)
@@ -458,8 +489,8 @@ const cRunTest = async (f) => {
   if (!problem && want !== got) problem = `output mismatch\n--- expected\n${want}\n--- got\n${got}`;
   return { problem, stderr: r.stderr };
 };
-await section('', byFile(cRunFiles, '[c]', cRunTest), { parallel: true });
-await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/prog')), '[c-prog]', cRunTest), { parallel: true });
+await section('', byFile(cRunFiles, '[c]', cRunTest), { parallel: true, buildOnly: true, note: buildNote });
+await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/prog')), '[c-prog]', cRunTest), { parallel: true, buildOnly: true, note: buildNote });
 
 // C and Axiom in one program (docs/c.md): each directory of
 // cmd/axiom/internal/tests/c/mix/ is a test. Its main.ax (an Axiom program
@@ -510,6 +541,7 @@ const cMixTest = async (dir) => {
     return null;
   }
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+  if (buildOnly) return checkBuilt(out);
   const r = native ? await spawnExeAsync(out, [], { encoding: 'utf8', timeout: runTimeout })
     : await spawnAsync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8', timeout: runTimeout });
   if (r.error && r.error.code === 'ETIMEDOUT') return `timed out after ${runTimeout / 1000} s`;
@@ -518,7 +550,7 @@ const cMixTest = async (dir) => {
   if (r.status !== status) return { problem: `exit status ${r.status} (signal ${r.signal}), expected ${status}; output:\n${got.join('\n')}`, stderr: r.stderr };
   return { problem: want === got.join('\n') ? null : `output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
 };
-await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true });
+await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, buildOnly: true, note: buildNote });
 
 // The hosted C library (docs/c.md, "The C library"): each
 // cmd/axiom/internal/tests/c/lib/<part>/*.c is a hosted C program, built
@@ -576,6 +608,7 @@ const cLibTest = async (f) => {
     return null;
   }
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+  if (buildOnly) return checkBuilt(out);
   // (the node host's CLI does not run std/io programs for wasm64: built only)
   if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return null;
   const cwd = path.join(tmp, `clib-${rel}.dir`);
@@ -616,7 +649,7 @@ const cLibTest = async (f) => {
   for (const t of dv('expect-stderr')) if (!stderr.includes(t)) return { problem: `no '${t}' in the program's stderr`, stderr };
   return { problem: want.join('\n') === got.join('\n') ? null : `output mismatch\n--- expected\n${want.join('\n')}\n--- got\n${got.join('\n')}`, stderr: dv('expect-stderr').length ? '' : stderr };
 };
-await section('', byFile(cLibFiles, '[c-lib]', cLibTest), { parallel: true });
+await section('', byFile(cLibFiles, '[c-lib]', cLibTest), { parallel: true, buildOnly: true, note: buildNote });
 // The C library's index (std/c/lib/index: which unit defines each name, for
 // loading the library on demand) is what cmd/internal/tools/gen_c_lib_index.mjs
 // writes from the sources.
@@ -1021,6 +1054,13 @@ const stdFiles = stdDirs.flatMap(files).filter((f) => /^test "/m.test(fs.readFil
 await section('', byFile([...stdFiles, ...files(path.join(root, 'cmd/axiom/internal/tests/testing'))], '[axiom test]', async (f) => {
   const src = fs.readFileSync(f, 'utf8');
   const d = directives(src);
+  if (buildOnly) {
+    // (the test binary, built and checked: --no-run)
+    const out = path.join(tmp, `test-${path.relative(root, f).replace(/[/.]/g, '-')}${/windows/.test(nativeTarget) ? '.exe' : ''}`);
+    const c = await spawnAsync(compiler, ['test', f, '--format=agent-json', `--no-run=${out}`, ...testTargets, ...d.flags, ...extraFlags], { encoding: 'utf8', timeout: compileTimeout });
+    if (c.status !== 0) return `the build failed (status ${c.status}):\n${c.stdout}${c.stderr}`;
+    return checkBuilt(out);
+  }
   const c = await spawnAsync(compiler, ['test', f, '--format=agent-json', ...testTargets, ...testTimeout, ...d.flags, ...extraFlags], { encoding: 'utf8' });
   let json = null;
   try { json = JSON.parse(c.stdout); } catch { return `bad output (status ${c.status}):\n${c.stdout}${c.stderr}`; }
@@ -1036,7 +1076,7 @@ await section('', byFile([...stdFiles, ...files(path.join(root, 'cmd/axiom/inter
     if (line && t.failure.span.start_line !== Number(line)) return `"${tname}": expected line ${line}, got ${t.failure.span.start_line}`;
   }
   return json.tests.length !== want.length ? `expected ${want.length} tests, got ${json.tests.length}` : null;
-}), { parallel: true });
+}), { parallel: true, buildOnly: true, note: buildNote });
 
 // Stack traces (spec §16.4): `// stack:` and `// errors:` lines in
 // cmd/axiom/internal/tests/traces/traces.ax give the expected frames of each failing test, and
@@ -1976,7 +2016,7 @@ if (!skipPlatform) {
     return Buffer.alloc(0);
   };
   const dcases = {};
-  const targets = ['x86_64', 'aarch64', 'aarch64-macos', 'wasm32', 'wasm64'];
+  const targets = ['x86_64', 'aarch64', 'aarch64-macos', 'x86_64-macos', 'wasm32', 'wasm64'];
   for (const [lang, file] of [['c', 'frames.c'], ['ax', 'frames.ax'], ['c', 'vars.c'], ['ax', 'vars.ax'], ['ax', 'shared.ax']]) {
     const src = path.join(ddir, file);
     for (const t of targets) {
@@ -2062,15 +2102,19 @@ const platformC = (n) => {
 if (!skipPlatform) {
   const onMac = process.platform === 'darwin' && os.arch() === 'arm64';
   const out = (n) => path.join(tmp, 'macos-' + n);
-  const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=aarch64-macos', '-o', out(n), ...extra],
-    { encoding: 'utf8', cwd: root, env: { ...process.env, AXIOM_CACHE: path.join(tmp, 'macos-cache') } });
-  const check = (src, n, extra) => {
-    const c = build(src, n, extra);
+  const build = (src, n, extra = [], t = 'aarch64-macos') => spawnSync(compiler, ['build', src, `--target=${t}`, '-o', out(n), ...extra],
+    { encoding: 'utf8', cwd: root, env: { ...process.env, AXIOM_CACHE: path.join(tmp, `macos-cache-${t}`) } });
+  const check = (src, n, extra, t = 'aarch64-macos') => {
+    const c = build(src, n, extra, t);
     if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
-    const r = checkMachO(fs.readFileSync(out(n)));
+    const r = checkMachO(fs.readFileSync(out(n)), { x86_64: t === 'x86_64-macos' });
     if (r.errs.length) return r.errs.join('\n');
     return (fs.statSync(out(n)).mode & 0o111) ? null : 'not executable';
   };
+  // x86_64-macos (an Intel Mac, or Apple silicon's translation of it): built
+  // and checked; nothing here has run it on a Mac yet
+  const onIntelMac = process.platform === 'darwin' && os.arch() === 'x64';
+  const x86 = (src, n, extra = []) => check(src, n, extra, 'x86_64-macos');
   await section('macos', {
     'thread-locals and output': () => {
       const src = path.join(tmp, 'macos-hello.ax');
@@ -2139,6 +2183,60 @@ if (!skipPlatform) {
       if (!onMac) return r.status !== 0 && /E9001/.test(r.stderr) ? null : `axiom test: status ${r.status}: ${r.stderr}`;
       return r.status === 0 && /passed, 0 failed/.test(r.stdout) ? null : `axiom test: status ${r.status}: ${r.stdout}${r.stderr}`;
     },
+    'x86_64-macos: thread-locals and output': () => {
+      const src = path.join(tmp, 'macos-hello.ax');
+      fs.writeFileSync(src, 'import "std/io" as io;\n\nthreadlocal let mut tl: u64 = 41;\n\nexport fn main() i32 {\n' +
+        '    tl += 1;\n    io.stdout().println("hello") catch return 1;\n    return @int_cast(i32, tl) - 42;\n}\n');
+      const p = x86(src, 'x-hello', ['-O2']);
+      if (p || !onIntelMac) return p;
+      const r = spawnSync(out('x-hello'), [], { encoding: 'utf8' });
+      return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    'x86_64-macos: examples, at -O0 and -O2, with -g': () => {
+      for (const e of ['wordcount', 'http_server', 'texmath', 'pi']) {
+        for (const o of ['-O0', '-O2']) {
+          const p = x86(path.join(root, `examples/${e}/${e}.ax`), `x-${e}${o}`, [o, '-g']);
+          if (p) return `${e} ${o}: ${p}`;
+          if (!fs.existsSync(`${out(`x-${e}${o}`)}.dSYM`)) return `${e} ${o}: no .dSYM`;
+        }
+      }
+      return null;
+    },
+    'x86_64-macos: the compiler': () => x86(path.join(root, 'cmd/axiom/src/main.ax'), 'x-axiom', ['-O2']),
+    'x86_64-macos: frameworks checked, examples on Metal built (structs on the stack: std/os/objc)': () => {
+      for (const f of fs.readdirSync(path.join(root, 'cmd/axiom/internal/tests/macos')).filter((n) => n.endsWith('.ax')).sort()) {
+        const c = spawnSync(compiler, ['check', `cmd/axiom/internal/tests/macos/${f}`, '--target=x86_64-macos'], { encoding: 'utf8', cwd: root });
+        if (c.status !== 0) return `${f}: check failed:\n${c.stdout}${c.stderr}`;
+      }
+      for (const e of ['metal', 'game']) {
+        const p = x86(path.join(root, `examples/${e}/${e}.ax`), `x-${e}`, ['-O2']);
+        if (p) return `${e}: ${p}`;
+      }
+      return null;
+    },
+    'x86_64-macos: a C program: two translation units, the C library': () => {
+      const [a, b] = platformC('macos-x');
+      const p = x86(a, 'x-c', [b]);
+      if (p || !onIntelMac) return p;
+      const r = spawnSync(out('x-c'), ['x'], { encoding: 'utf8' });
+      return r.status === 3 && r.stdout === 'x 42 2.50\nbye\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    'x86_64-macos: the 64-bit inode functions bound by their variants': () => {
+      const c = build(path.join(root, 'examples/wordcount/wordcount.ax'), 'x-inode', [], 'x86_64-macos');
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const r = checkMachO(fs.readFileSync(out('x-inode')));
+      for (const f of ['_stat$INODE64', '_fstat$INODE64', '_readdir$INODE64', '_opendir$INODE64']) if (!r.imports.includes(f)) return `no import ${f}`;
+      return r.imports.includes('_stat') ? 'an import of _stat (32-bit inodes)' : null;
+    },
+    'x86_64-macos: axiom test --no-run': () => {
+      const t = out('x-tests');
+      const r = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=x86_64-macos', `--no-run=${t}`], { encoding: 'utf8', cwd: root });
+      if (r.status !== 0) return `axiom test --no-run: status ${r.status}: ${r.stdout}${r.stderr}`;
+      const e = checkMachO(fs.readFileSync(t), { x86_64: true }).errs;
+      if (e.length) return e.join('\n');
+      const q = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=x86_64-macos'], { encoding: 'utf8', cwd: root });
+      return onMac || (q.status !== 0 && /E9001/.test(q.stderr)) ? null : `axiom test: status ${q.status}: ${q.stderr}`;
+    },
   }, {
     supported: () => (/unknown target/.test(build(path.join(root, 'examples/wordcount/wordcount.ax'), 'probe').stderr) ? 'the bootstrap compiler has no macOS target' : null),
     note: onMac ? '' : 'built, not run: no Mac',
@@ -2153,21 +2251,22 @@ if (!skipPlatform) {
 if (!skipPlatform) {
   const out = (n) => path.join(tmp, `windows-${n}.exe`);
   const env = { ...process.env, AXIOM_CACHE: path.join(tmp, 'windows-cache'), WINEDEBUG: process.env.WINEDEBUG || '-all' };
-  const build = (src, n, extra = []) => spawnSync(compiler, ['build', src, '--target=x86_64-windows', '-o', out(n), ...extra],
-    { encoding: 'utf8', cwd: root, env });
+  const build = (src, n, extra = [], t = 'x86_64-windows') => spawnSync(compiler, ['build', src, `--target=${t}`, '-o', out(n), ...extra],
+    { encoding: 'utf8', cwd: root, env: t === 'x86_64-windows' ? env : { ...env, AXIOM_CACHE: path.join(tmp, `windows-cache-${t}`) } });
   const wine = ['wine64', 'wine', '/usr/lib/wine/wine64'].find((w) => spawnSync(w, ['--version'], { encoding: 'utf8' }).status === 0);
-  // The headers: MZ, PE, x86-64, a console program with ASLR, and its sections.
-  const checkPE = (f) => {
-    const d = fs.readFileSync(f);
-    if (d.readUInt16LE(0) !== 0x5a4d) return 'no MZ header';
-    const pe = d.readUInt32LE(0x3c);
-    if (d.readUInt32LE(pe) !== 0x4550 || d.readUInt16LE(pe + 4) !== 0x8664) return 'not a PE file for x86-64';
-    const opt = pe + 24;
-    if (d.readUInt16LE(opt) !== 0x20b || d.readUInt16LE(opt + 68) !== 3) return 'not a PE32+ console program';
-    if ((d.readUInt16LE(opt + 70) & 0x60) !== 0x60) return 'no (high-entropy) ASLR';
-    const names = [];
-    for (let k = 0; k < d.readUInt16LE(pe + 6); k++) names.push(d.toString('latin1', opt + 240 + 40 * k, opt + 248 + 40 * k).replace(/\0+$/, ''));
-    return names.join(' ') === '.text .rdata .idata .data .reloc' ? null : `sections ${names.join(' ')}`;
+  // The headers and tables (pe.mjs; for ARM64 the code and its unwind
+  // information too, with the PDB when there is one).
+  const checkPE = (f, arm64 = false) => {
+    const r = checkPEFile(f, { arm64 });
+    return r.errs.length ? r.errs.join('\n') : null;
+  };
+  // aarch64-windows: built and checked; Wine runs x86-64 programs only, and
+  // nothing here has run one on Windows on ARM64 yet
+  const onArm64Windows = process.platform === 'win32' && os.arch() === 'arm64';
+  const arm = (src, n, extra = []) => {
+    const c = build(src, n, extra, 'aarch64-windows');
+    if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+    return checkPE(out(n), true);
   };
   const run = (n, args = []) => spawnSync(wine, [out(n), ...args], { encoding: 'utf8', cwd: root, env });
   const xvfb = ['xvfb-run'].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
@@ -2365,6 +2464,41 @@ if (!skipPlatform) {
         if (r.status !== 0) return `${f}: status ${r.status}: ${r.stdout}${r.stderr}`;
       }
       return null;
+    },
+    'aarch64-windows: thread-locals and output': () => {
+      const src = path.join(tmp, 'windows-hello.ax');
+      fs.writeFileSync(src, 'import "std/io" as io;\n\nthreadlocal let mut tl: u64 = 41;\n\nexport fn main() i32 {\n' +
+        '    tl += 1;\n    io.stdout().println("hello") catch return 1;\n    return @int_cast(i32, tl) - 42;\n}\n');
+      const p = arm(src, 'a-hello', ['-O2']);
+      if (p || !onArm64Windows) return p;
+      const r = spawnSync(out('a-hello'), [], { encoding: 'utf8' });
+      return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    'aarch64-windows: examples, at -O0, -O1 and -O2': () => {
+      for (const e of ['wordcount', 'http_server', 'texmath', 'pi']) {
+        for (const o of ['-O0', '-O1', '-O2']) {
+          const p = arm(path.join(root, `examples/${e}/${e}.ax`), `a-${e}${o}`, [o]);
+          if (p) return `${e} ${o}: ${p}`;
+        }
+      }
+      return null;
+    },
+    'aarch64-windows: a C program: two translation units, the C library (msvcrt.dll)': () => {
+      const [a, b] = platformC('windows-a');
+      const p = arm(a, 'a-c', [b]);
+      if (p || !onArm64Windows) return p;
+      const r = spawnSync(out('a-c'), ['x'], { encoding: 'utf8' });
+      return r.status === 3 && r.stdout === 'x 42 2.50\r\nbye\r\n' ? null : `status ${r.status}: ${JSON.stringify(r.stdout)}${r.stderr}`;
+    },
+    'aarch64-windows: the compiler': () => arm(path.join(root, 'cmd/axiom/src/main.ax'), 'a-axiom', ['-O2']),
+    'aarch64-windows: axiom test --no-run': () => {
+      const t = out('a-tests');
+      const r = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=aarch64-windows', `--no-run=${t}`], { encoding: 'utf8', cwd: root });
+      if (r.status !== 0) return `axiom test --no-run: status ${r.status}: ${r.stdout}${r.stderr}`;
+      const p = checkPE(t, true);
+      if (p) return p;
+      const q = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=aarch64-windows'], { encoding: 'utf8', cwd: root });
+      return onArm64Windows || (q.status !== 0 && /E9001/.test(q.stderr)) ? null : `axiom test: status ${q.status}: ${q.stderr}`;
     },
     'the compiler': () => {
       const c = build(path.join(root, 'cmd/axiom/src/main.ax'), 'axiom', ['-O1']);

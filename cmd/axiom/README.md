@@ -58,7 +58,8 @@ bootstrap compiler does (`std` in the repository above the executable, or `--std
 ## Targets and processor extensions
 
 ```
---target=wasm32 | wasm64 | x86_64 | aarch64 | aarch64-macos | x86_64-windows | native   (default wasm32)
+--target=wasm32 | wasm64 | x86_64 | aarch64 | aarch64-macos | x86_64-macos | x86_64-windows | aarch64-windows
+        | native   (default wasm32)
 --cpu=<preset>
 --features=+ext,-ext
 ```
@@ -66,8 +67,8 @@ bootstrap compiler does (`std` in the repository above the executable, or `--std
 | Target | `--cpu` presets | Extensions (`--features`) |
 |---|---|---|
 | wasm32, wasm64 | `mvp`, `generic` (default), `bleeding-edge` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call` |
-| x86_64, x86_64-windows | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `haswell`, `skylake`, `icelake-server`, `sapphirerapids`, `graniterapids`, `alderlake`, `arrowlake`, `znver3`, `znver4`, `znver5`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1`, `prfchw` |
-| aarch64, aarch64-macos | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `neoverse-n1`, `neoverse-n2`, `neoverse-v1`, `neoverse-v2`, `apple-m1` ... `apple-m4`, `native` | `lse`, `rcpc`, `dotprod`, `cssc`, `aes`, `sha2`, `sha3`, `sha512`, `sm4`, `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
+| x86_64, x86_64-macos, x86_64-windows | `x86-64` (= `generic`), `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `haswell`, `skylake`, `icelake-server`, `sapphirerapids`, `graniterapids`, `alderlake`, `arrowlake`, `znver3`, `znver4`, `znver5`, `native` | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1`, `prfchw` |
+| aarch64, aarch64-macos, aarch64-windows | `armv8-a` (= `generic`), `armv8.1-a`, `armv8.2-a`, `armv8.3-a`, `neoverse-n1`, `neoverse-n2`, `neoverse-v1`, `neoverse-v2`, `apple-m1` ... `apple-m4`, `native` | `lse`, `rcpc`, `dotprod`, `cssc`, `aes`, `sha2`, `sha3`, `sha512`, `sm4`, `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
 
 The names and their bits are std/os/cpu.ax's, which the compiler imports: programs see
 the same names through `@target_has` and `@cpu_has` (spec §13.4). An extension implies the
@@ -181,6 +182,58 @@ $ WINEDEBUG=-all AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=x86_64-windows 
 
 Not yet: linking C code or `-l` libraries (issue #7).
 
+Two more targets pair each architecture with the other system. They build, and their
+executables are checked structurally (below), but **neither has been run on a real
+system yet**:
+
+`--target=x86_64-macos` (also `x86_64-apple-darwin`) builds a Mach-O executable for an
+Intel Mac (macOS 11 or later: the runtime waits with `__ulock_wait2`), with `mlink.ax`
+as for Apple silicon: CPU type x86-64, stubs `jmp [rip + slot]`, the x86-64 relocations
+(calls and RIP-relative references, the GOT and its relaxation to `lea`, absolute
+addresses rebased or bound, thread-locals' offsets in the block), an ad-hoc signature
+(which x86-64 does not need, and which does no harm). The calling convention is
+x86-64 System V, as on Linux; thread-locals are the block whose address a TSD slot
+holds, read through `gs` (`gs:[axiom.tls_key]`, the slot's byte offset). libSystem's
+x86-64 functions whose structures have 32-bit inode numbers (`stat`, `readdir`, ...) are
+bound to their `$INODE64` variants, whose layouts are arm64's and the runtime's.
+`std/internal/runtime/darwin.ax` reads the x86-64 thread state from a signal's context;
+the frameworks' modules pass structs of more than 16 bytes on the stack there
+(std/os/objc). The CPU defaults to `x86-64-v2`.
+
+`--target=aarch64-windows` (also `aarch64-pc-windows-msvc`) builds a PE32+ executable
+for Windows on ARM64 (machine `0xAA64`), with `plink.ax`: thunks `adrp x16; ldr x16;
+br x16` through the import address table, the AArch64 relocations, `memcpy`,
+`memmove` and `memset` from `msvcrt.dll`, and every function with a frame described
+by ARM64 unwind records (`a64unwind.ax`; `.pdata` entries of 8 bytes): one code per
+prologue and epilogue instruction, the frame allocated in two steps so that the saved
+registers are within the codes' reach, `add x29, sp, #D` (which leaves `x29` as it is)
+after the saves of a function whose stack pointer moves, so that unwinding finds them
+from `x29`, and a large frame's pages probed below `sp` in a loop before one
+allocation. The calling convention is AAPCS64, but a variadic function's arguments,
+named ones too, all go as in the image of a stack whose first 64 bytes are `x0`-`x7`
+(floating-point values as their bits, no homogeneous aggregates; a structure may
+straddle `x7` and the stack), and a variadic C definition reserves 64 bytes above its
+frame record for `x0`-`x7` (`ir.Func.va_home`), below its stack arguments, so that a
+`va_list` is a pointer over both. Thread-locals are `TEB.ThreadLocalStoragePointer`
+(`[x18, #0x58]`) indexed by `_tls_index`. The PDB records the ARM64 machine. Wine runs
+only x86-64 programs, so `axiom test` and `axiom profile` for this target need Windows
+on ARM64; `axiom test --no-run=<file>` builds the test binary anywhere.
+
+The suite checks these executables without running them: `cmd/axiom/internal/tests/macho.mjs`
+(load commands, segments, rebase and bind streams, symbols, signature, every stub through
+a bound GOT slot, every recorded call to a function's start or a stub) and
+`cmd/axiom/internal/tests/pe.mjs` (headers, imports, base relocations, the TLS and
+exception directories; for ARM64 every function's unwind record decoded and matched,
+code for code, against its prologue and epilogues, every `bl` to a function or a thunk,
+every thunk to an import address table slot, the PDB's GUID and functions). A
+build-only run of the whole suite builds every test program for such a target and checks
+it so:
+
+```
+$ AXIOM=cmd/axiom/build/axiom AXIOM_NATIVE_TARGET=aarch64-windows AXIOM_NATIVE_EXEC=none \
+  node cmd/axiom/internal/tests/run.mjs --native
+```
+
 ## How code is generated
 
 | Module | What |
@@ -212,8 +265,8 @@ Not yet: linking C code or `-l` libraries (issue #7).
 | `elf.ax` | ELF relocatable objects: writing, and reading them back for the linker |
 | `nlink.ax` | What the native linkers share: the input objects' symbols and sections, the GOT, placing sections by class, and AArch64 and x86-64 relocations |
 | `elink.ax` | The ELF linker: a static executable when nothing needs the C library, otherwise a dynamically linked one against `libc.so.6` (own `_start`, PLT and GOT, symbol versions, thread-local storage, a symbol table for debuggers and profilers) |
-| `mlink.ax` | The Mach-O linker for `aarch64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes (libSystem, frameworks and dylibs by ordinal), rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
-| `plink.ax` | The PE linker for `x86_64-windows`: the same ELF objects in `.text`, `.rdata`, `.idata`, `.data` and `.reloc` sections; the import directory (each Windows function's DLL from its name), thunks, a GOT for our own symbols, base relocations, the TLS directory and the entry point |
+| `mlink.ax` | The Mach-O linker for `aarch64-macos` and `x86_64-macos`: the same ELF objects laid out in `__TEXT`/`__DATA` segments, import stubs and a GOT bound through dyld opcodes (libSystem, frameworks and dylibs by ordinal), rebases, the symbol table and export trie, `LC_MAIN`, and the ad-hoc code signature (SHA-256 per 4 KiB page) |
+| `plink.ax` | The PE linker for `x86_64-windows` and `aarch64-windows`: the same ELF objects in `.text`, `.rdata`, `.idata`, `.data` and `.reloc` sections; the import directory (each Windows function's DLL from its name), thunks, a GOT for our own symbols, base relocations, the TLS directory and the entry point |
 | `lstub.ax` | Machine code the linker supplies: the system call and thread-creation stubs, the signal return trampoline, the static `_start`, and `memcpy`/`memmove`/`memset` on AArch64 |
 | `target.ax` | Architectures, CPU presets, extensions, host detection |
 | `backend.ax` | Lowering, optimization and the target's code generator; a large program (native, linked by our own linker) in parts after inlining: its functions dealt out to a few parts by their size (by the program alone, so the executable is the same on any machine), each part finished and compiled in a forked process to an object of its own, the module's internal symbols global under names made unique (`isel.ax`), which the linkers' symbol tables show without the suffix |

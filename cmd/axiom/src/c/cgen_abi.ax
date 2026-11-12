@@ -17,6 +17,13 @@
 //                    in x0-x7, larger ones by reference; results the same,
 //                    else through x8 (AAPCS64); macOS passes variadic
 //                    arguments on the stack, in 8-byte slots
+//   Windows ARM64    AAPCS64, but every argument of a variadic function
+//                    (named ones too) goes as in the image of a stack in
+//                    8-byte slots whose first 64 bytes are x0-x7 (a
+//                    structure may straddle x7 and the stack): no
+//                    homogeneous aggregates, floating-point values in
+//                    integer registers (their bits), structures of at most
+//                    16 bytes as their memory, larger ones by reference
 //   WebAssembly      structures with a single scalar as that scalar, others
 //                    by reference; results the same, else through a pointer
 //                    first parameter; variadic arguments in a buffer whose
@@ -67,6 +74,7 @@ pub const ABI_WIN: i32 = 2;     // Windows x64
 pub const ABI_A64: i32 = 3;     // AArch64 (AAPCS64, Linux)
 pub const ABI_DARWIN: i32 = 4;  // AArch64 macOS
 pub const ABI_WASM: i32 = 5;    // WebAssembly (32 or 64 bits)
+pub const ABI_WINA64: i32 = 6;  // Windows ARM64
 
 /// The target's C ABI.
 pub fn abi() i32 {
@@ -76,6 +84,9 @@ pub fn abi() i32 {
     if tg.g_arch == tg.ARCH_A64 {
         if tg.is_darwin() {
             return ABI_DARWIN;
+        }
+        if tg.is_windows() {
+            return ABI_WINA64;
         }
         return ABI_A64;
     }
@@ -513,7 +524,7 @@ struct Builder {
     stack: u.List.[Item],  // x86-64 System V: those bound for the stack, after the others
     ng: u64,               // registers used
     nf: u64,
-    pos: u64,   // Windows: positions used
+    pos: u64,   // Windows: positions used (ARM64: 8-byte slots of a variadic function's arguments)
     soff: u64,  // bytes of stack used by the named arguments
     voff: u64,  // macOS: the next variadic argument's offset on the stack
 }
@@ -815,6 +826,39 @@ fn a64_arg(b: *mut Builder, i: usize, darwin_va: bool) void {
     push_pieces(b, i, false);
 }
 
+// Windows ARM64: argument i of a variadic function (named or not), at the
+// next 8-byte slot of the image whose first eight are x0-x7 (the ARM64 ABI's
+// rule for variadic functions: AAPCS64's C.12-C.15 for that image, with no
+// floating-point registers and no homogeneous aggregates). A type aligned
+// to 16 starts at an even slot; a structure of more than 16 bytes goes by
+// reference; floating-point scalars go as their bits (as_int).
+fn winarm_va_arg(b: *mut Builder, i: usize) void {
+    let a = &mut b.p.args[i];
+    let t = a.ty;
+    let mut n: u64 = 1;
+    let mut by_ref = false;
+    if not aggregate(t) {
+        set_scalar(a, t);
+        a.as_int = is_fp_ty(a.pieces[0].ty);
+        n = (cty.size_of(t) + 7) / 8;
+    } else if cty.size_of(t) > 16 {
+        set_ref(a);
+        by_ref = true;  // (its address: aligned as a pointer is)
+    } else {
+        chunk_pieces(a, t);
+        n = @as(u64, a.n);
+    }
+    if not by_ref and (cty.align_of(t) >= 16) and ((b.pos % 2) == 1) {
+        b.regs.push(item(ir.t_int(64), 0, SL_FILL, -1, 0));
+        b.pos += 1;
+    }
+    b.pos += n;
+    if b.pos > 8 {
+        b.soff = (b.pos - 8) * 8;
+    }
+    push_pieces(b, i, false);
+}
+
 // macOS: a variadic argument of alignment al in n 8-byte stack slots.
 // Apple's arm64 ABI puts each variadic argument on the stack at the next
 // offset aligned to its alignment (at least 8, at most 16): a filler slot
@@ -969,7 +1013,7 @@ fn set_result(b: *mut Builder) void {
         b.pos = 1;
         return;
     }
-    if (ab == ABI_A64) or (ab == ABI_DARWIN) {
+    if (ab == ABI_A64) or (ab == ABI_DARWIN) or (ab == ABI_WINA64) {
         let h = hfa_of(t);
         if h.n > 0 {
             set_n(a, @truncate(usize, h.n));
@@ -1064,6 +1108,10 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
             win_arg(b, i, va);
         } else if (ab == ABI_A64) or (ab == ABI_DARWIN) {
             a64_arg(b, i, va and (ab == ABI_DARWIN));
+        } else if (ab == ABI_WINA64) and variadic {
+            winarm_va_arg(b, i);
+        } else if ab == ABI_WINA64 {
+            a64_arg(b, i, false);
         } else {
             wasm_arg(b, i, va);
         }
@@ -1075,8 +1123,8 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
     p.va_gp = b.ng;
     p.va_fp = b.nf;
     p.va_stack = b.soff;
-    if ab == ABI_WIN {
-        p.va_gp = b.pos;
+    if (ab == ABI_WIN) or ((ab == ABI_WINA64) and variadic) {
+        p.va_gp = @min(b.pos, 8);
     }
     if variadic and define {
         if ab == ABI_SYSV {
@@ -1091,6 +1139,8 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
         } else if ab == ABI_A64 {
             pads(b, false, 8 - b.ng);
             pads(b, true, 8 - b.nf);
+        } else if (ab == ABI_WINA64) and (b.pos < 8) {
+            pads(b, false, 8 - b.pos);
         }
     }
     // x86-64: what goes on the stack follows fillers for the free registers

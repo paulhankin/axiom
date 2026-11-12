@@ -1,9 +1,12 @@
 // =============================================================================
 // std/internal/runtime/windows.ax - the Axiom host ABI (import module "axiom") on Windows
-// (x86-64), and crash reporting (trap messages and stack traces, spec
-// §16.4). The compiler builds it into every program for
-// --target=x86_64-windows in place of std/internal/runtime/native.ax; ax_rt_args and
-// ax_rt_init run before `main`, ax_rt_fini after it.
+// (x86-64 and ARM64), and crash reporting (trap messages and stack traces,
+// spec §16.4). The compiler builds it into every program for
+// --target=x86_64-windows and --target=aarch64-windows in place of
+// std/internal/runtime/native.ax; ax_rt_args and ax_rt_init run before
+// `main`, ax_rt_fini after it. The two architectures differ here only in a
+// thread's registers (the exception handler's CONTEXT) and in how a program
+// asks the processor for its extensions.
 //
 // Everything goes through the Win32 API (cmd/axiom/src/plink.ax imports
 // these functions from kernel32, ntdll, ws2_32 and bcrypt by name). The host
@@ -97,6 +100,7 @@ pub extern "C" {
     fn ExitThread(code: u32) void;
     fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize) void;
     fn GetSystemInfo(info: *mut u8) void;
+    fn IsProcessorFeaturePresent(feature: u32) i32;
     fn GetSystemTimePreciseAsFileTime(ft: *mut u64) void;
     fn QueryPerformanceCounter(c: *mut i64) i32;
     fn QueryPerformanceFrequency(f: *mut i64) i32;
@@ -3146,9 +3150,35 @@ export fn ax_os() i32 {
     return 3;
 }
 
-// x86-64 programs ask the processor (cpuid) for its extensions.
+// x86-64 programs ask the processor (cpuid) for its extensions; ARM64 ones
+// ask the system (IsProcessorFeaturePresent: PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE
+// 30 for AES and SHA-2, PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE 31,
+// PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE 34 for LSE,
+// PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE 43 for the dot products and
+// PF_ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE 45; the others are not reported,
+// so absent). The bits are std/os/cpu.ax's A_*: LSE 0, RCPC 1, DOTPROD 2,
+// AES 4, SHA2 5, CRC 9.
 export fn ax_cpu_features() u64 {
-    return 0;
+    if not @target_arch("aarch64") {
+        return 0;
+    }
+    let mut f: u64 = 0;
+    if IsProcessorFeaturePresent(34) != 0 {
+        f = f | 1;
+    }
+    if IsProcessorFeaturePresent(45) != 0 {
+        f = f | 2;
+    }
+    if IsProcessorFeaturePresent(43) != 0 {
+        f = f | 4;
+    }
+    if IsProcessorFeaturePresent(30) != 0 {
+        f = f | 0x30;
+    }
+    if IsProcessorFeaturePresent(31) != 0 {
+        f = f | 0x200;
+    }
+    return f;
 }
 
 export fn ax_cpu_count() u32 {
@@ -3380,7 +3410,7 @@ export fn ax_unavailable() void {
     let mut o = tf.fmt(report[..]);
     o.s("axiom: crash: called a function from another system's library (not available on Windows)\n");
     let fp = axiom_frame_address().*;  // this function's frame
-    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, true);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), fp, fp, thread_stack_top(), 0, @target_arch("x86_64"));
     tf.format_stack(&mut o, @ptr_from_int(*tf.Site, 0), axiom_shadow_stack());
     write_all(2, o.text());
     flush_profile();
@@ -3403,24 +3433,36 @@ fn shadow_stack() *mut tf.ShadowStack {
 // From axiom.trap (codegen), with its own frame.
 export fn ax_stack_walk(fp: *void) void {
     let f = @int_from_ptr(fp);
-    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, true);
+    tf.walk_frames(axiom_frame_table(), shadow_stack(), f, f, thread_stack_top(), 0, @target_arch("x86_64"));
 }
 
 // From the exception handler: the frames of the code that faulted (its
-// CONTEXT: Rsp, Rbp, Rip).
+// CONTEXT: on x86-64 Rsp at 0x98, Rbp at 0xa0, Rip at 0xf8; on ARM64 Fp
+// (x29) at 0xf0, Lr at 0xf8, Sp at 0x100, Pc at 0x108).
 fn stack_walk_context(ctx: usize) void {
     let tab = axiom_frame_table();
     if tf.is_null(@ptr_cast(*void, tab)) {
         return;
     }
-    let sp = @ptr_from_int(*usize, ctx + 0x98).*;
-    let fp = @ptr_from_int(*usize, ctx + 0xa0).*;
-    let pc = @ptr_from_int(*usize, ctx + 0xf8).*;
+    let x64 = @target_arch("x86_64");
+    let mut sp = @ptr_from_int(*usize, ctx + 0x98).*;
+    let mut fp = @ptr_from_int(*usize, ctx + 0xa0).*;
+    let mut pc = @ptr_from_int(*usize, ctx + 0xf8).*;
+    if not x64 {
+        fp = @ptr_from_int(*usize, ctx + 0xf0).*;
+        sp = @ptr_from_int(*usize, ctx + 0x100).*;
+        pc = @ptr_from_int(*usize, ctx + 0x108).*;
+    }
     let mut leaf: usize = 0;
     if tf.frameless_at(tab, pc) {
-        leaf = @ptr_from_int(*usize, sp).*;
+        // its return address: at the stack pointer, or in the link register
+        if x64 {
+            leaf = @ptr_from_int(*usize, sp).*;
+        } else {
+            leaf = @ptr_from_int(*usize, ctx + 0xf8).*;
+        }
     }
-    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, true);
+    tf.walk_frames(tab, shadow_stack(), fp, sp, thread_stack_top(), leaf, x64);
 }
 
 // Every trap calls this (see codegen: axiom.trap); the trap instruction

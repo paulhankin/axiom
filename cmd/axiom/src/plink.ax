@@ -1,6 +1,7 @@
 // =============================================================================
-// plink.ax - links the ELF relocatable objects of x64.ax (read with
-// elf.read) into a Windows executable for x86-64: PE32+, a console program
+// plink.ax - links the ELF relocatable objects of x64.ax or a64.ax (read
+// with elf.read) into a Windows executable for x86-64 or ARM64 (machine
+// 0x8664 or 0xAA64): PE32+, a console program
 // (or a GUI one, with no console window: --subsystem=windows), position
 // independent (base relocations; the loader may place it anywhere),
 // importing what the runtime calls from the system's DLLs.
@@ -9,8 +10,11 @@
 //   .text   r-x  code, one jump through the import address table per
 //                imported function called, the entry point
 //   .rdata  r--  read-only data, relocated read-only data, the thread-local
-//                directory, unwind information (.xdata), then the function
-//                table (.pdata: every function with a frame, sorted; the
+//                directory, unwind information (.xdata, in each
+//                architecture's format: x64.ax's UNWIND_INFO, a64unwind.ax's
+//                ARM64 records), then the function table (.pdata: every
+//                function with a frame, sorted, 12-byte entries on x86-64
+//                and 8-byte ones on ARM64; the
 //                exception directory), without which the system cannot walk
 //                the stack through our code, and an exception a DLL raises
 //                to catch itself further up can end the process; then the
@@ -33,18 +37,23 @@
 // code declares and does not define (a constant axiom.import.<function>
 // holding "c": cmd/axiom/src/c/cgen.ax) are, if no rule above names a DLL,
 // the C library's, msvcrt.dll (which every Windows has, and which exports
-// the whole C library, printf included). Anything else is undefined. Calls
-// go through a 6-byte thunk (jmp [rip+slot]); the thunk is also the
-// function's address wherever one is taken.
+// the whole C library, printf included), as are memcpy, memmove and memset
+// (which a64.ax calls). Anything else is undefined. Calls
+// go through a thunk (jmp [rip+slot] on x86-64; adrp x16, slot; ldr x16,
+// [x16, :lo12:slot]; br x16 on ARM64); the thunk is also the function's
+// address wherever one is taken.
 //
 // Thread-locals: the TLS directory makes the loader give every thread a copy
 // of the template (.tdata, then .tbss as zeros in the file) and store its index in
 // axiom.tls_index; code finds the copy in TEB.ThreadLocalStoragePointer
-// (x64.ax). A thread-local's TPOFF32 is its offset in the template.
+// (x64.ax; on ARM64 through x18, which holds the TEB: a64.ax). A
+// thread-local's TPOFF32 (on ARM64, its TLSLE_ADD_TPREL pair) is its offset
+// in the template.
 //
 // Entry: axiom.entry calls main(0, null) (the runtime reads the command line
 // itself) and passes its result to ExitProcess.
 // =============================================================================
+import "a64unwind.ax" as uw;
 import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
@@ -88,6 +97,34 @@ let mut import_dlls: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []
 let mut c_library_fns: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                          vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 let C_LIBRARY: []u8 = "msvcrt.dll";
+
+let mut A64: bool = false;  // linking ARM64 objects (else x86-64 ones)
+
+// An import thunk's size (see the header), and a .pdata entry's.
+fn thunk_size() u64 {
+    if A64 {
+        return 12;
+    }
+    return 8;
+}
+
+fn pdata_entry() u64 {
+    if A64 {
+        return 8;
+    }
+    return 12;
+}
+
+fn machine() u32 {
+    if A64 {
+        return elf.EM_AARCH64;
+    }
+    return elf.EM_X86_64;
+}
+
+fn is_rva32(t: u32) bool {
+    return (t == elf.R_X86_64_RVA32) or (t == elf.R_AARCH64_RVA32);
+}
 
 let mut thunk_addr: u64 = 0;
 let mut iat_addr: u64 = 0;  // the import address table: one slot per import, in thunk order, NULL after each DLL's
@@ -170,6 +207,10 @@ fn dll_of(name: []u8) []u8 {
         if c_library_fns.get(u.intern(name)) != 0 {
             return C_LIBRARY;
         }
+        // (a64.ax calls these for block copies and fills; x64.ax uses rep movsb)
+        if u.str_eq(name, "memcpy") or u.str_eq(name, "memmove") or u.str_eq(name, "memset") {
+            return C_LIBRARY;
+        }
         return "";
     }
     if u.starts(name, "WSA") {
@@ -209,7 +250,7 @@ fn is_import(oi: usize, si: u32) bool {
 fn sym_addr(oi: usize, si: u32) u64 {
     if is_import(oi, si) {
         let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, si))));
-        return thunk_addr + (@as(u64, @bit_cast(u32, g.stub)) * 8);
+        return thunk_addr + (@as(u64, @bit_cast(u32, g.stub)) * thunk_size());
     }
     return nl.sym_addr(oi, si);  // (0 for a missing weak one: see abs_at)
 }
@@ -243,7 +284,7 @@ fn scan_relocs() void {
             for r in s.relocs.items() {
                 if is_import(oi, r.sym) {
                     add_import(@bit_cast(u32, nl.global_of(oi, r.sym)));
-                } else if nl.is_got_reloc(true, r.ty) {
+                } else if nl.is_got_reloc(not A64, r.ty) {
                     _ = nl.got_slot(oi, r.sym);
                 }
             }
@@ -300,7 +341,17 @@ fn apply_relocs(b: []mut u8) void {
             for r in s.relocs.items() {
                 let p = base + r.off;
                 let t = r.ty;
-                let sa = sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend);
+                let mut sa = sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend);
+                if (cls == C_PDATA) and (o.syms.get(@as(usize, r.sym)).sec >= 0) {
+                    // (the object's own copy of the function: one more
+                    // object's definition of a weak one won, and the entry
+                    // must describe this copy's code, not the other's)
+                    sa = nl.sym_addr_in(oi, r.sym) +% @bit_cast(u64, r.addend);
+                }
+                if A64 {
+                    a64_reloc(b, oi, r.sym, p, t, sa);
+                    continue;
+                }
                 if nl.is_got_reloc(true, t) {
                     if is_import(oi, r.sym) {
                         // the import address table slot holds the address
@@ -320,7 +371,7 @@ fn apply_relocs(b: []mut u8) void {
                     abs_at(b, p, sa);
                 } else if nl.is_call_reloc(true, t) {
                     rel32(b, p, sa);
-                } else if t == elf.R_X86_64_RVA32 {
+                } else if is_rva32(t) {
                     bn.w32(b, file_of(p), sa - BASE);
                 } else if t == elf.R_X86_64_TPOFF32 {
                     // the offset in the thread's copy of the template
@@ -337,6 +388,46 @@ fn apply_relocs(b: []mut u8) void {
     }
 }
 
+// An ARM64 relocation at p of symbol si of object oi (target sa: the
+// symbol's address, an import's thunk's, plus the addend): loads of a GOT
+// slot (an import's import address table slot), absolute and image-relative
+// addresses, thread-local offsets in the template, and the instruction
+// fields nl.a64_reloc fills.
+fn a64_reloc(b: []mut u8, oi: usize, si: u32, p: u64, t: u32, sa: u64) void {
+    let fo = file_of(p);
+    if nl.is_got_reloc(false, t) {
+        let mut ga: u64 = 0;
+        if is_import(oi, si) {
+            let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, si))));
+            ga = iat_slot.get(@as(usize, @bit_cast(u32, g.stub)));
+        } else {
+            ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, si))) * 8);
+        }
+        nl.a64_got(b, fo, p, t, ga);
+        return;
+    }
+    if t == elf.R_AARCH64_ABS64 {
+        abs_at(b, p, sa);
+    } else if is_rva32(t) {
+        bn.w32(b, fo, sa - BASE);
+    } else if nl.a64_reloc(b, fo, p, t, sa) {
+        return;
+    } else if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12) or (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC) {
+        // the offset in the thread's copy of the template
+        let v = @bit_cast(i64, sa -% tls_addr);
+        if (v < 0) or (v >= 0x100_0000) {
+            nl.err("thread-local offset out of range");
+        }
+        if t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12 {
+            nl.a64_imm12(b, fo, @bit_cast(u64, v) >> 12);
+        } else {
+            nl.a64_imm12(b, fo, @bit_cast(u64, v) & 0xfff);
+        }
+    } else {
+        nl.err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // The linker's own object: the entry point, the thread-local index, the TLS
 // callback list (empty) and the TLS directory (filled in at the end).
@@ -345,7 +436,7 @@ let mut own_tls_dir: u32 = 0;
 let mut own_index: usize = 0;  // the object's index in nl.objs
 
 fn own_object() *mut elf.Obj {
-    let o = elf.new_obj(elf.EM_X86_64);
+    let o = elf.new_obj(machine());
     let text = elf.add_sec(o, ".text", elf.S_TEXT, 16);
     let data = elf.add_sec(o, ".data", elf.S_DATA, 8);
     let rodata = elf.add_sec(o, ".rdata", elf.S_RODATA, 8);
@@ -360,6 +451,10 @@ fn own_object() *mut elf.Obj {
     let main_ = elf.ext_sym(o, "main", false);
     let exitp = elf.ext_sym(o, "ExitProcess", false);
     let ts = o.secs.get(@int_cast(usize, text));
+    if A64 {
+        own_entry_a64(o, text, main_, exitp);
+        return o;
+    }
     let entry: [22]u8 = [0x48, 0x83, 0xec, 0x28,  // sub rsp, 40 (shadow space; aligned)
                          0x31, 0xc9,              // xor ecx, ecx
                          0x31, 0xd2,              // xor edx, edx
@@ -388,6 +483,42 @@ fn own_object() *mut elf.Obj {
     return o;
 }
 
+// ARM64: axiom.entry, with its unwind information (the frame record saved,
+// x29 set) and function table entry, as a64.ax makes them.
+fn own_entry_a64(o: *mut elf.Obj, text: i32, main_: u32, exitp: u32) void {
+    let ts = o.secs.get(@int_cast(usize, text));
+    let words: [7]u32 = [0xa9bf_7bfd,   // stp x29, x30, [sp, #-16]!
+                         0x9100_03fd,   // mov x29, sp
+                         0x5280_0000,   // mov w0, #0
+                         0xd280_0001,   // mov x1, #0
+                         0x9400_0000,   // bl main
+                         0x9400_0000,   // bl ExitProcess (w0: main's result)
+                         0x0000_0000];  // udf
+    for w in words {
+        ts.data.u32_(@as(u64, w));
+    }
+    ts.relocs.push(elf.Rel.{ off: 16, ty: elf.R_AARCH64_CALL26, sym: main_, addend: 0 });
+    ts.relocs.push(elf.Rel.{ off: 20, ty: elf.R_AARCH64_CALL26, sym: exitp, addend: 0 });
+    let es = elf.add_sym(o, elf.Sym.{ name: "axiom.entry", sec: text, value: 0, size: 28, bind: elf.B_GLOBAL,
+                                      ty: elf.T_FUNC, hidden: true });
+    let mut pro = uw.new_codes();
+    uw.save_fplr_x(&mut pro, 16);
+    uw.op1(&mut pro, uw.SET_FP);
+    let epi = uw.new_codes();
+    let none = u.List.[u64].empty();
+    let mut info = uw.xdata(28, &pro, &epi, none.items());
+    let xdata = elf.add_sec(o, ".xdata", elf.S_RODATA, 4);
+    o.secs.get(@int_cast(usize, xdata)).data.put(info.view());
+    info.free();
+    let xs = elf.add_sym(o, elf.Sym.{ name: "", sec: xdata, value: 0, size: 8, bind: elf.B_LOCAL, ty: elf.T_NOTYPE,
+                                      hidden: false });
+    let pdata = elf.add_sec(o, ".pdata", elf.S_RODATA, 4);
+    let ps = o.secs.get(@int_cast(usize, pdata));
+    ps.data.zeros(8);
+    ps.relocs.push(elf.Rel.{ off: 0, ty: elf.R_AARCH64_RVA32, sym: es, addend: 0 });
+    ps.relocs.push(elf.Rel.{ off: 4, ty: elf.R_AARCH64_RVA32, sym: xs, addend: 0 });
+}
+
 // The function table must be sorted by start address. It is, as the
 // objects' .text and .pdata are placed in the same order; this keeps it so
 // whatever the order (insertion sort: one pass when sorted).
@@ -396,14 +527,15 @@ fn sort_pdata(b: []mut u8, start: u64, end: u64) void {
         return;
     }
     let fo = @truncate(usize, file_of(start));
-    let n = @truncate(usize, (end - start) / 12);
+    let es = @truncate(usize, pdata_entry());
+    let n = @truncate(usize, end - start) / es;
     for i in @as(usize, 1)..n {
         let mut j = i;
-        while (j > 0) and (bn.rd32(b, fo + (j * 12)) < bn.rd32(b, fo + ((j - 1) * 12))) {
-            for k in @as(usize, 0)..12 {
-                let t = b[fo + (j * 12) + k];
-                b[fo + (j * 12) + k] = b[fo + ((j - 1) * 12) + k];
-                b[fo + ((j - 1) * 12) + k] = t;
+        while (j > 0) and (bn.rd32(b, fo + (j * es)) < bn.rd32(b, fo + ((j - 1) * es))) {
+            for k in @as(usize, 0)..es {
+                let t = b[fo + (j * es) + k];
+                b[fo + (j * es) + k] = b[fo + ((j - 1) * es) + k];
+                b[fo + ((j - 1) * es) + k] = t;
             }
             j -= 1;
         }
@@ -529,11 +661,13 @@ fn name8(h: *mut bn.Bytes, s: []u8) void {
 
 // Links `inputs` into the executable `out`. 0: done; 1: errors (reported).
 pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
+    A64 = (inputs.len > 0) and (inputs[0].machine == elf.EM_AARCH64);
+    pdb.g_arm64 = A64;
     nl.begin(inputs);
     own_index = nl.objs.len;
     nl.objs.push(own_object());
-    nl.objs.push(jstub.build(elf.EM_X86_64, true));  // (C's setjmp and longjmp)
-    nl.objs.push(elf.rets_bounds(elf.EM_X86_64));
+    nl.objs.push(jstub.build(machine(), true));  // (C's setjmp and longjmp)
+    nl.objs.push(elf.rets_bounds(machine()));
     collect_dll_names();
     collect_symbols();
     if nl.gsyms.at(@as(usize, nl.gsym_index("main"))).obj < 0 {
@@ -634,7 +768,7 @@ fn lay_out(out: []u8) Layout {
     let text_rva = nl.align_up(headers, SECT);
     let code_end = nl.place(nl.C_TEXT, BASE + text_rva);
     thunk_addr = nl.align_up(code_end, 8);
-    let text_end = thunk_addr + (@as(u64, imports.len) * 8);
+    let text_end = thunk_addr + (@as(u64, imports.len) * thunk_size());
     // .rdata
     let rdata_rva = nl.align_up(text_end - BASE, SECT);
     let pdata_start = nl.align_up(nl.place(nl.C_CONST, BASE + rdata_rva), 4);
@@ -703,9 +837,20 @@ fn write_contents(b: []mut u8, ly: *Layout) u64 {
     bn.put_at(b, outs[2].foff, ly.idata.view());
     // the import address table holds addresses only once bound: base
     // relocations do not apply to it
-    // thunks: jmp [rip + slot]
+    // thunks: jmp [rip + slot] (ARM64: adrp x16, slot; ldr x16, [x16, slot's
+    // offset in its page]; br x16)
     for k in 0..imports.len {
-        let at = thunk_addr + (@as(u64, k) * 8);
+        let at = thunk_addr + (@as(u64, k) * thunk_size());
+        if A64 {
+            let fo = file_of(at);
+            let slot = iat_slot.get(k);
+            bn.w32(b, fo, 0x9000_0010);
+            nl.a64_adrp(b, fo, at, slot);
+            bn.w32(b, fo + 4, 0xf940_0210);
+            nl.a64_imm12(b, fo + 4, (slot & 0xfff) >> 3);
+            bn.w32(b, fo + 8, 0xd61f_0200);
+            continue;
+        }
         let fo = @truncate(usize, file_of(at));
         b[fo] = 0xff;
         b[fo + 1] = 0x25;
@@ -784,7 +929,11 @@ fn pe_headers(ly: *Layout, tls_dir: u64, image_size: u64) bn.Bytes {
     h.u8_('E');
     h.u16_(0);
     // COFF file header
-    h.u16_(0x8664);
+    if A64 {
+        h.u16_(0xaa64);  // IMAGE_FILE_MACHINE_ARM64
+    } else {
+        h.u16_(0x8664);  // IMAGE_FILE_MACHINE_AMD64
+    }
     h.u16_(ly.nsec);
     h.u32_(0);  // TimeDateStamp (deterministic builds)
     h.u32_(0);
@@ -804,12 +953,18 @@ fn pe_headers(ly: *Layout, tls_dir: u64, image_size: u64) bn.Bytes {
     h.u64_(BASE);
     h.u32_(SECT);
     h.u32_(FILEAL);
+    // (operating system and subsystem versions: 6.0, Vista, on x86-64; 6.2,
+    // the first with ARM64's predecessor, on ARM64, as its loader expects)
+    let mut minor: u64 = 0;
+    if A64 {
+        minor = 2;
+    }
     h.u16_(6);  // operating system version
-    h.u16_(0);
+    h.u16_(minor);
     h.u16_(0);  // image version
     h.u16_(0);
     h.u16_(6);  // subsystem version
-    h.u16_(0);
+    h.u16_(minor);
     h.u32_(0);
     h.u32_(image_size);
     h.u32_(ly.headers);
@@ -1057,7 +1212,7 @@ fn pdb_funcs(text_rva: u64, files: *mut u.List.[[]u8]) u.List.[pdb.Func] {
             let addr = nl.sym_addr_in(oi, @truncate(u32, si));
             let mut ls = u.nil_slice.[pdb.Line]();
             let name = elf.display_name(sy.name);
-            let found = lines.get(u.intern(sy.name));  // (by the symbol's own name: see emit_lines)
+            let found = lines.get(u.intern(sy.name));  // (by the symbol's own name: winlines.emit)
             if u.notnil(found) {
                 ls = found.items();
             }
@@ -1070,7 +1225,7 @@ fn pdb_funcs(text_rva: u64, files: *mut u.List.[[]u8]) u.List.[pdb.Func] {
     return fs;
 }
 
-// An object's line tables (.axiom.lines: see x64.ax's emit_lines), by
+// An object's line tables (.axiom.lines: winlines.ax), by
 // function name; file numbers become indexes in `files`.
 fn object_lines(o: *mut elf.Obj, files: *mut u.List.[[]u8],
                 file_map: *mut u.SymMap.[u32]) u.SymMap.[*mut u.List.[pdb.Line]] {

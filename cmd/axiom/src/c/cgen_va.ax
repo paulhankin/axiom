@@ -12,7 +12,8 @@
 // arrive in, where va_arg finds them: System V's register save area (176
 // bytes: rdi..r9, then xmm0-7 in 16-byte slots), AArch64's (64 bytes of
 // x0-x7 below __gr_top, 128 of q0-q7 below __vr_top), or (Windows) the home
-// area its caller reserved above the return address; its stack arguments
+// area its caller reserved above the return address (on ARM64, the
+// function itself above its frame record: ir.Func.va_home); its stack arguments
 // start 16 bytes above the frame address (IN_FRAME_ADDR: the saved frame
 // pointer and the return address are there).
 // =============================================================================
@@ -179,7 +180,12 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
         if a.kind == abi.A_SCALAR {
             let mut x = v;
             if a.as_int {
-                x = ir.bitcast(B(), v, i64t());
+                // (its bits, in the low part of the integer register)
+                if v.ty.size < 8 {
+                    x = ir.zext(B(), ir.bitcast(B(), v, ir.t_int(@truncate(i32, v.ty.size * 8))), i64t());
+                } else {
+                    x = ir.bitcast(B(), v, i64t());
+                }
             }
             if a.slot[0] < 0 {
                 va_store_scalar(vb, a, 0, x);
@@ -353,7 +359,16 @@ pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, v
             // promoted: cgen_stmt converts it)
             // (a _BitInt's bits beyond its width are unspecified in the
             // ABIs: the value is brought to this implementation's form)
-            if a.ty == cty.unqual(s.ty) {
+            if a.as_int {
+                // (Windows ARM64: a floating-point parameter of a variadic
+                // function arrives as its bits in an integer register)
+                let ft = a.pieces[0].ty;
+                let mut x = f.params[@int_cast(usize, a.slot[0])];
+                if ft.size < 8 {
+                    x = ir.trunc(B(), x, ir.t_int(@truncate(i32, ft.size * 8)));
+                }
+                st(ir.bitcast(B(), x, ft), o, cty.align_of(s.ty));
+            } else if a.ty == cty.unqual(s.ty) {
                 st(cbi.norm(f.params[@int_cast(usize, a.slot[0])], a.ty), o, cty.align_of(s.ty));
             }
             continue;
@@ -382,6 +397,18 @@ fn save_registers(p: *mut abi.Plan, f: *mut ir.Func) void {
         return;
     }
     VA.args = frame_args();
+    if ab == abi.ABI_WINA64 {
+        // the home area the function reserves above its frame record
+        // (a64.ax: ir.Func.va_home), below its stack arguments: the
+        // positions after the named ones
+        f.va_home = true;
+        f.noinline = true;  // (its frame is what va_arg reads)
+        for j in 0..p.pads_gp.len {
+            let x = f.params[@int_cast(usize, p.pads_gp.get(j))];
+            st(x, at(VA.args, (p.va_gp + @as(u64, j)) * 8), 8);
+        }
+        return;
+    }
     if ab == abi.ABI_WIN {
         // the home area of the positions after the named ones
         for j in 0..p.pads_gp.len {
@@ -511,6 +538,11 @@ fn va_start(ap: *mut ir.Value) void {
         st(at(VA.args, p.va_gp * 8), ap, 8);
         return;
     }
+    if ab == abi.ABI_WINA64 {
+        // (the home area then the stack: one run of 8-byte slots)
+        st(at(VA.args, (p.va_gp * 8) + p.va_stack), ap, 8);
+        return;
+    }
     if ab == abi.ABI_DARWIN {
         st(at(VA.args, cty.round_up(p.va_stack, 8)), ap, 8);
         return;
@@ -550,7 +582,9 @@ pub fn va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
     return narrow(v, t);
 }
 
-// Windows, macOS, WebAssembly: va_list points at the next argument's slot.
+// Windows, macOS, WebAssembly: va_list points at the next argument's slot
+// (Windows ARM64's as macOS's: 8-byte slots, 16-aligned for a type aligned
+// to 16, structures of more than 16 bytes by reference).
 fn slot_va_arg(ap: *mut ir.Value, t: *mut cty.CType, ab: i32) *mut ir.Value {
     let mut p = ld(cg.T_ptr, ap, cty.ptr_bytes);
     let size = cty.size_of(t);
@@ -558,7 +592,7 @@ fn slot_va_arg(ap: *mut ir.Value, t: *mut cty.CType, ab: i32) *mut ir.Value {
     let mut by_ref = false;
     if ab == abi.ABI_WIN {
         by_ref = abi.aggregate(t) and not ((size == 1) or (size == 2) or (size == 4) or (size == 8));
-    } else if ab == abi.ABI_DARWIN {
+    } else if (ab == abi.ABI_DARWIN) or (ab == abi.ABI_WINA64) {
         by_ref = abi.aggregate(t) and (size > 16);
         if not by_ref {
             slot = cty.round_up(size, 8);

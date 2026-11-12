@@ -11,7 +11,7 @@ axiom build   <file.ax | package dir> [options] -o <out>
 axiom check   <file.ax | package dir> [options]
 axiom build   <file.c>... [options] [-o <out>]     (C sources: docs/c.md)
 axiom check   <file.c>... [options]
-axiom test    <file.ax | package dir> [options] [--filter=<text>] [--timeout=<ms>] [--show-output]
+axiom test    <file.ax | package dir> [options] [--filter=<text>] [--timeout=<ms>] [--show-output] [--no-run=<file>]
 axiom profile <file.ax | package dir> [options] [--rate=<hz>] [--folded=<path>] [-- <program args>]
 axiom fmt     <file.ax | dir>... [--check] [--stdout]
 axiom new     <name> [--format=agent-json]
@@ -52,6 +52,7 @@ run; dependencies' tests do not.
 | `--filter=<text>` | Run only the tests whose name contains `text`. |
 | `--timeout=<ms>` | Fail a test that runs longer (default 10000). |
 | `--show-output` | Print what each test wrote under its result line. Without it, only a failing test's output is shown. |
+| `--no-run=<file>` | Build the test binary into `<file>` (and, for Windows, its PDB) without running it: for a target this machine cannot run. |
 
 WebAssembly tests need [Node.js](https://nodejs.org) on the `PATH`; `--target=native`
 needs nothing else.
@@ -121,7 +122,7 @@ command accepts `--format`, `--std` and `--target`.
 
 | Option | |
 |---|---|
-| `--target=<t>` | `wasm32` (the default), `wasm64`, `x86_64`, `aarch64` (both Linux), `aarch64-macos`, `x86_64-windows`, or `native`: this machine, with its processor's extensions. |
+| `--target=<t>` | `wasm32` (the default), `wasm64`, `x86_64`, `aarch64` (both Linux), `aarch64-macos`, `x86_64-windows`, `x86_64-macos`, `aarch64-windows`, or `native`: this machine, with its processor's extensions. `x86_64-macos` (Intel Macs) and `aarch64-windows` (Windows on ARM64) build, and their executables are checked structurally, but they have not yet been run on real systems. |
 | `--cpu=<name>` | A processor preset for the extensions to use (`x86-64-v3`, `neoverse-n1`, …; spec §13.4). |
 | `--features=+ext,-ext` | Enable or disable extensions one by one (`+avx512bw`). |
 

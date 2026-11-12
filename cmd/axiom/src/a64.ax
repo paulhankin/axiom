@@ -1,7 +1,9 @@
 // =============================================================================
-// a64.ax - AArch64 code generation (AAPCS64, Linux): instruction selection
-// from the scalar IR into machine IR (mach.ax), register allocation, frame
-// layout and encoding (a64enc.ax) into an ELF object.
+// a64.ax - AArch64 code generation (AAPCS64: Linux, macOS, Windows):
+// instruction selection from the scalar IR into machine IR (mach.ax),
+// register allocation, frame layout and encoding (a64enc.ax) into an ELF
+// object (with, for Windows, unwind information: a64unwind.ax, and line
+// tables: winlines.ax).
 //
 // Like the x86-64 backend: integers narrower than 32 bits live in registers
 // with unspecified upper bits (i1 is always 0 or 1); every function keeps a
@@ -13,6 +15,7 @@
 // and the encoder fills in the allocated registers.
 // =============================================================================
 import "a64enc.ax" as ae;
+import "a64unwind.ax" as uw;
 import "asm/a64.ax" as aa;
 import "asm/core.ax" as acr;
 import "asm/inline.ax" as ai;
@@ -31,6 +34,7 @@ import "opt.ax" as opt;
 import "switches.ax" as swl;
 import "target.ax" as tg;
 import "util.ax" as u;
+import "winlines.ax" as wlines;
 
 const GPR: u8 = 0;
 const VR: u8 = 1;
@@ -106,6 +110,14 @@ let mut libsyms: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usiz
                                                    cap: 0, len: 0 };
 let mut errors: bool = false;
 let mut LSE_: bool = false;
+// Windows on ARM64: its variadic convention, thread-locals through the TEB
+// (x18), the prologue and epilogue its unwind information describes
+// (win_prologue), and line tables for the PDB
+let mut WIN_: bool = false;
+let mut XDATA: i32 = -1;
+let mut PDATA: i32 = -1;
+let mut LINES: i32 = -1;
+let mut XDATA_SYM: u32 = 0;
 
 let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
@@ -1605,9 +1617,25 @@ fn gen_call(v: *mut ir.Value) void {
     if tg.is_darwin() and fty_.vararg {
         nfixed = fty_.params.len;
     }
+    // Windows passes every argument of a variadic function in x0-x7 and
+    // then 8-byte stack slots, floating-point ones as their bits
+    let win_va = WIN_ and fty_.vararg;
     for i in 0..n {
         let x = v.xs.get(i);
-        let c = class_of(x.ty);
+        let mut c = class_of(x.ty);
+        if win_va and (c == VR) {
+            if x.ty.size > 8 {
+                fail("a vector argument of a variadic function (Windows)");
+            }
+            let t = vgpr();
+            if x.ty.bits == 64 {
+                raw2(ae.fcvt_int(1, 1, 0, 6, 0, 0), t, regs[i]);  // fmov xt, d
+            } else {
+                raw2(ae.fcvt_int(0, 0, 0, 6, 0, 0), t, regs[i]);  // fmov wt, s
+            }
+            regs[i] = t;
+            c = GPR;
+        }
         dest[i] = -1;
         let mut e: u8 = 0;
         if (i + 1) < ir.ext_of(v).len {
@@ -1853,6 +1881,9 @@ fn stack_bytes(f: *ir.Func, v: *ir.Value) u64 {
 
 // Call v as a jump to its callee, if its stack arguments fit (see above).
 fn gen_tail_call(v: *mut ir.Value) bool {
+    if WIN_ and (F.va_home or ir.fty_of(v).vararg) {
+        return false;  // (the home area above the frame record; arguments as gen_call places them)
+    }
     let need = stack_bytes(F, v);
     if need > stack_bytes(F, u.nil.[ir.Value]()) {
         return false;  // (the callee needs more of the stack than the caller was given)
@@ -3916,6 +3947,9 @@ fn compile_func(f: *mut ir.Func) void {
     let mut ng: i32 = 0;
     let mut nv: i32 = 0;
     let mut soff: i64 = 16;
+    if f.va_home {
+        soff += 64;  // (Windows: x0-x7's home area, win_prologue)
+    }
     call_results.clear();
     for pi in 0..f.params.len {
         let p = f.params[pi];
@@ -4032,6 +4066,17 @@ fn tls_key_sym() i32 {
         tls_key_si = @bit_cast(i32, elf.ext_sym(OBJ, "axiom.tls_key", false));
     }
     return tls_key_si;
+}
+
+// The symbol of the image's TLS index on Windows (axiom.tls_index, defined
+// by plink.ax; the loader sets it).
+let mut tls_index_si: i32 = -1;
+
+fn tls_index_sym() i32 {
+    if tls_index_si < 0 {
+        tls_index_si = @bit_cast(i32, elf.ext_sym(OBJ, "axiom.tls_index", false));
+    }
+    return tls_index_si;
 }
 
 fn reloc(ty: u32, sym: i32, addend: i64) void {
@@ -4334,7 +4379,7 @@ fn needs_frame() bool {
     for bi in 0..MF.blocks.len {
         let mut i = MF.blocks.get(bi).first;
         while u.notnil(i) {
-            if (i.clobber != 0) or (FT.on and (i.op == CALL) and not is_tail(i)) {
+            if (i.clobber != 0) or ((FT.on or WIN_) and (i.op == CALL) and not is_tail(i)) {
                 return true;
             }
             for k in 0..i.ops.len {
@@ -4406,6 +4451,10 @@ fn cfi_body() void {
 }
 
 fn prologue() void {
+    if WIN_ {
+        win_prologue();
+        return;
+    }
     if frameless {
         return;
     }
@@ -4436,6 +4485,10 @@ fn epilogue() void {
 
 // The epilogue but its ret: the callee-saved registers, x29, x30 and sp back.
 fn unframe() void {
+    if WIN_ {
+        win_unframe();
+        return;
+    }
     if frameless {
         return;
     }
@@ -4447,6 +4500,196 @@ fn unframe() void {
     w32(0x9100_03BF);      // mov sp, x29
     w32(0xA8C1_7BFD);      // ldp x29, x30, [sp], #16
     cfi(dw.A64_SP, 0, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Windows: the prologue and epilogue, as its unwind information describes
+// them (a64unwind.ax: one code per instruction). The frame is laid out as
+// on the other systems (x29 at the frame record, the saved registers just
+// below it, then the slots and the outgoing arguments), but allocated in two
+// steps, so that the saved registers are within reach of the codes (at
+// most 504 bytes above sp):
+//
+//   [sub sp, sp, #64]           alloc_s     (a variadic C definition: the
+//                                           home area of x0-x7, ir.Func.va_home)
+//   stp x29, x30, [sp, #-16]!   save_fplr_x
+//   mov x29, sp                 set_fp
+//   sub sp, sp, #D              alloc_s     (D: the saved registers' part)
+//   stp/str ...                 save_regp, save_reg, save_freg (q registers
+//                                           one by one: the codes restore d8-d15)
+//   [add x29, sp, #D]           add_fp      (x29 unchanged: for a frame
+//                                           whose sp moves, DYNSTACK, so that
+//                                           unwinding reads the saves from x29)
+//   sub sp, sp, #rest           alloc_*     (more than a page: each page
+//                                           probed below sp first, in a loop
+//                                           whose instructions are nops)
+//
+// and every epilogue as
+//
+//   sub sp, x29, #D             add_fp
+//   ldp/ldr ...                 save_regp, save_reg, save_freg
+//   [add sp, sp, #D]            alloc_s
+//   ldp x29, x30, [sp], #16     save_fplr_x
+//   [add sp, sp, #64]           alloc_s
+//   ret (or a sibling call's b) end
+// -----------------------------------------------------------------------------
+let mut uw_pro: uw.Codes = uw.Codes.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
+                                                                     cap: 0 } },
+                                      at: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 } };
+let mut uw_epi: uw.Codes = uw.Codes.{ b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
+                                                                     cap: 0 } },
+                                      at: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 } };
+let mut uw_epis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+// D: the bytes of the frame's top part, the saved registers' (from the
+// 16-byte boundary at or below the lowest save to the frame's top).
+fn win_top() i64 {
+    if nsaved == 0 {
+        return 0;
+    }
+    return frame - (save_off[0] & ~@as(i64, 15));
+}
+
+fn win_prologue() void {
+    uw.clear(&mut uw_pro);
+    uw.clear(&mut uw_epi);
+    uw_epis.clear();
+    if frameless {
+        return;
+    }
+    if F.va_home {
+        w32(ae.addsub_imm(1, true, false, SP, SP, 64, false));  // sub sp, sp, #64
+        _ = uw.alloc(&mut uw_pro, 64);
+    }
+    w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
+    uw.save_fplr_x(&mut uw_pro, 16);
+    w32(0x9100_03FD);  // mov x29, sp
+    uw.op1(&mut uw_pro, uw.SET_FP);
+    let top = win_top();
+    if top > 0 {
+        w32(ae.addsub_imm(1, true, false, SP, SP, @bit_cast(u64, top), false));
+        _ = uw.alloc(&mut uw_pro, @bit_cast(u64, top));
+    }
+    win_saves(false, &mut uw_pro);
+    if dyn_frame {
+        w32(ae.addsub_imm(1, false, false, FP, SP, @bit_cast(u64, top), false));  // add x29, sp, #D
+        uw.add_fp(&mut uw_pro, @bit_cast(u64, top));
+    }
+    let rest = @bit_cast(u64, frame - top);
+    if rest == 0 {
+        return;
+    }
+    if rest <= 4096 {
+        if rest == 4096 {
+            w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));
+        } else {
+            w32(ae.addsub_imm(1, true, false, SP, SP, rest, false));
+        }
+        _ = uw.alloc(&mut uw_pro, rest);
+        return;
+    }
+    // each page below sp touched in order (the stack's guard page), with
+    // sp where it is, then sp moved once
+    let n0 = here();
+    enc_movi(X17, @bit_cast(i64, rest / 4096), 1);
+    w32(ae.addsub_imm(1, false, false, X16, SP, 0, false));                      // mov x16, sp
+    w32(ae.addsub_imm(1, true, false, X16, X16, 1, true));                       // sub x16, x16, #4096
+    w32(ae.ldst_uimm(3, false, 0, 31, X16, 0));                                  // str xzr, [x16]
+    w32(ae.addsub_imm(1, true, true, X17, X17, 1, false));                       // subs x17, x17, #1
+    w32(ae.bcond(cc64(NE)) | ((@bit_cast(u64, @as(i64, -3)) & 0x7_ffff) << 5));  // b.ne (back to the sub)
+    enc_movi(X16, @bit_cast(i64, rest), 1);
+    for _k in 0..(here() - n0) / 4 {
+        uw.op1(&mut uw_pro, uw.NOP);
+    }
+    w32(ae.addsub_ext(1, true, false, SP, SP, X16, 0));  // sub sp, sp, x16
+    if not uw.alloc(&mut uw_pro, rest) {
+        fail("the stack frame is too large for Windows unwind information (256 MiB)");
+    }
+}
+
+// The saves (or with load the restores) of the callee-saved registers at
+// their offsets from sp below the frame's top part, each with its code in c.
+fn win_saves(load: bool, c: *mut uw.Codes) void {
+    let delta = frame - win_top();
+    let mut k: usize = 0;
+    while k < nsaved {
+        let r = saved[k];
+        let off = save_off[k] - delta;
+        let uoff = @bit_cast(u64, off);
+        if (r < V0) and ((k + 1) < nsaved) and (saved[k + 1] == (r + 1)) and (save_off[k + 1] == (save_off[k] + 8)) {
+            let mut w: u64 = 0xA900_0000;  // stp x (signed offset)
+            if load {
+                w = w | (1 << 22);
+            }
+            w32(((w | (((uoff / 8) & 0x7f) << 15)) | (ae.r5(r + 1) << 10)) | ((ae.r5(SP) << 5) | ae.r5(r)));
+            uw.save_regp(c, @bit_cast(u64, @as(i64, r)), uoff);
+            k += 2;
+            continue;
+        }
+        let m = mc.mem(SP, -1, 0, off);
+        let mut opc: u64 = 0;
+        if load {
+            opc = 1;
+        }
+        if r >= V0 {
+            ldst(0, true, opc + 2, 16, r, m);
+            uw.save_freg(c, @bit_cast(u64, @as(i64, r - V0)), uoff);
+        } else {
+            ldst(3, false, opc, 8, r, m);
+            uw.save_reg(c, @bit_cast(u64, @as(i64, r)), uoff);
+        }
+        k += 1;
+    }
+}
+
+fn win_unframe() void {
+    if frameless {
+        return;
+    }
+    let first = uw_epis.len == 0;
+    uw_epis.push(here());
+    let mut sink = uw.new_codes();
+    let mut c = &mut uw_epi;
+    if not first {
+        c = &mut sink;  // (every epilogue is the same: its codes once)
+    }
+    let top = win_top();
+    w32(ae.addsub_imm(1, true, false, SP, FP, @bit_cast(u64, top), false));  // sub sp, x29, #D
+    uw.add_fp(c, @bit_cast(u64, top));
+    win_saves(true, c);
+    if top > 0 {
+        w32(ae.addsub_imm(1, false, false, SP, SP, @bit_cast(u64, top), false));
+        _ = uw.alloc(c, @bit_cast(u64, top));
+    }
+    w32(0xA8C1_7BFD);  // ldp x29, x30, [sp], #16
+    uw.save_fplr_x(c, 16);
+    if F.va_home {
+        w32(ae.addsub_imm(1, false, false, SP, SP, 64, false));
+        _ = uw.alloc(c, 64);
+    }
+    sink.b.free();
+    sink.at.deinit();
+}
+
+// The function placed at `base` in .text with `size` bytes: its unwind
+// information in .xdata and its entry in .pdata (its start, and its
+// record's: addresses relative to the image, which plink.ax resolves).
+fn win_unwind(fs: u32, base: u64, size: u64) void {
+    let mut info = uw.xdata(size, &uw_pro, &uw_epi, uw_epis.items());
+    if info.len() == 0 {
+        fail("the function is too large for Windows unwind information (1 MiB of code, or too many epilogues)");
+        return;
+    }
+    let x = OBJ.secs.get(@int_cast(usize, XDATA));
+    x.data.align(4);
+    let xoff = @as(u64, x.data.len());
+    x.data.put(info.view());
+    info.free();
+    let p = OBJ.secs.get(@int_cast(usize, PDATA));
+    let poff = @as(u64, p.data.len());
+    p.data.zeros(8);
+    p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_AARCH64_RVA32, sym: fs, addend: 0 });
+    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_AARCH64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
 }
 
 // DYNSTACK: the stack pointer moved, for dynamic allocation.
@@ -4653,6 +4896,18 @@ fn enc_inst(i: *mut mc.MInst) void {
             reloc(elf.R_AARCH64_LDST64_ABS_LO12_NC, k, 0);
             w32(ae.ldst_uimm(3, false, 1, X16, X16, 0));
             w32(ae.ldst_reg(3, false, 1, d, d, X16, false));
+        } else if WIN_ {
+            // Windows: the image's block of this thread is
+            // TEB.ThreadLocalStoragePointer[_tls_index] (x18 holds the TEB;
+            // the linker supplies the index as axiom.tls_index, and makes
+            // the offsets below those in the block: plink.ax)
+            let k = tls_index_sym();
+            w32(ae.ldst_uimm(3, false, 1, d, 18, 0x58 / 8));  // ldr d, [x18, #0x58]
+            reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, k, 0);
+            w32(ae.adrp(X16));
+            reloc(elf.R_AARCH64_LDST32_ABS_LO12_NC, k, 0);
+            w32(ae.ldst_uimm(2, false, 1, X16, X16, 0));     // ldr w16, [x16, :lo12:axiom.tls_index]
+            w32(ae.ldst_reg(3, false, 1, d, d, X16, true));  // ldr d, [d, x16, lsl #3]
         } else {
             w32(ae.mrs_tpidr(d));
         }
@@ -4795,6 +5050,7 @@ fn encode_func(f: *mut ir.Func) void {
     let mut rows = u.List.[u64].empty();
     let mut last_src: u32 = 0;
     let mut pe_done = false;
+    let lines = DBG.on or WIN_;  // (Windows: for the PDB, winlines.ax)
     // -g (full): (code offset, lexical block) where the block changes
     let mut scopes = u.List.[u64].empty();
     let mut last_scope: u32 = 0;
@@ -4804,6 +5060,9 @@ fn encode_func(f: *mut ir.Func) void {
         }
         last_src = first_src(f);
         rows.push((here() << 32) | @as(u64, last_src));
+    } else if lines and (f.src != 0) {
+        rows.push(@as(u64, f.src));
+        last_src = f.src;
     }
     for bi in 0..nb {
         let b = MF.blocks.get(bi);
@@ -4817,7 +5076,7 @@ fn encode_func(f: *mut ir.Func) void {
                 rows.push(((here() << 32) | dw.ROW_PE) | @as(u64, i.src));
                 last_src = i.src;
                 pe_done = true;
-            } else if DBG.on and (i.src != 0) and (i.src != last_src) {
+            } else if lines and (i.src != 0) and (i.src != last_src) {
                 rows.push((here() << 32) | @as(u64, i.src));
                 last_src = i.src;
             }
@@ -4871,6 +5130,12 @@ fn encode_func(f: *mut ir.Func) void {
     s.value = base;
     s.size = @as(u64, code.len());
     ft.func(&FT, base, s.size, frameless, calls.items()[0..0], calls.items());
+    if WIN_ and not frameless {
+        win_unwind(fsym.get(@int_cast(usize, f.id)), base, s.size);
+    }
+    if WIN_ and (rows.len > 0) {
+        wlines.emit(OBJ, LINES, s.name, rows.items());
+    }
     if DBG.on {
         let mut regs: [20]u64 = [0; 20];
         regs[0] = dw.saved_reg(dw.A64_FP, -16);
@@ -4954,13 +5219,27 @@ fn first_src(f: *ir.Func) u32 {
 pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     errors = false;
     LSE_ = tg.has(tg.A_LSE);
+    WIN_ = tg.is_windows();
     OBJ = elf.new_obj(elf.EM_AARCH64);
     JT_OBJ = u.nil.[elf.Obj]();
     tls_key_si = -1;
+    tls_index_si = -1;
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     libsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 16);
     RODATA = elf.add_sec(OBJ, ".rodata", elf.S_RODATA, 16);
+    XDATA = -1;
+    PDATA = -1;
+    LINES = -1;
+    if WIN_ {
+        // (here, not when the first function needs them: functions are
+        // compiled in scratch scopes, and the sections must outlive them)
+        LINES = wlines.begin(OBJ);
+        XDATA = elf.add_sec(OBJ, ".xdata", elf.S_RODATA, 4);
+        PDATA = elf.add_sec(OBJ, ".pdata", elf.S_RODATA, 4);
+        XDATA_SYM = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: XDATA, value: 0, size: 0, bind: elf.B_LOCAL,
+                                               ty: elf.T_NOTYPE, hidden: false });
+    }
     let relro = is.add_symbols(OBJ, m, TEXT, RODATA, elf.R_AARCH64_ABS64, &mut fsym, &mut gsym);
     // file-scope asm (the C front end's GNU dialects): its sections and symbols
     for b in ai.toplevel.items() {
@@ -4982,7 +5261,11 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         galign.push(al);
     }
     FT = ft.begin(OBJ, m, TEXT, relro, &mut gsym, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
-    DBG = dw.begin(dw.ARCH_A64, 8, tg.g_debug);
+    let mut level = tg.g_debug;
+    if WIN_ {
+        level = tg.DEBUG_NONE;  // (Windows: the PDB, from .axiom.lines)
+    }
+    DBG = dw.begin(dw.ARCH_A64, 8, level);
     DBG.lang = dw.module_lang(m);
     if not tg.is_darwin() {
         DBG.tls_rel = elf.R_AARCH64_TLS_DTPREL64;

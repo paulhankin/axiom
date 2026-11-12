@@ -108,7 +108,7 @@ function loadMachO(d) {
     }
     off += size;
   }
-  return { kind: 'macho', machine: 'a64', sections, funcs: null, rets: [] };
+  return { kind: 'macho', machine: u32(d, 4) === 0x01000007 ? 'x64' : 'a64', sections, funcs: null, rets: [] };
 }
 
 function loadWasm(d) {

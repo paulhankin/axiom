@@ -34,6 +34,7 @@ import "switches.ax" as swl;
 import "target.ax" as tg;
 import "util.ax" as u;
 import "vsplit.ax" as vs;
+import "winlines.ax" as wlines;
 import "x64emit.ax" as em;
 import "x64enc.ax" as xe;
 
@@ -845,7 +846,7 @@ fn base_mem(q: *mut ir.Value) mc.MOp {
             return m;
         }
     }
-    if tls_global(q) and not em.WIN {
+    if tls_global(q) and not em.WIN and not em.MACOS {
         // (fs-relative, with no base register: the thread pointer is not
         // loaded for each access)
         return tls_mem(q);
@@ -858,10 +859,10 @@ fn tls_global(p: *ir.Value) bool {
 }
 
 // %fs:[sym@tpoff] (local-exec: the executable holds all thread-local data).
-// On Windows, [block + sym@tpoff], where the linker makes tpoff the offset
-// in the image's thread-local block.
+// On Windows and macOS, [block + sym@tpoff], where the linker makes tpoff
+// the offset in the thread's block (mlink.ax, plink.ax).
 fn tls_mem(p: *ir.Value) mc.MOp {
-    if em.WIN {
+    if em.WIN or em.MACOS {
         let mut m = mc.mem(tls_base(), -1, 0, 0);
         m.sym = global_sym(ir.gv_of(p));
         m.slot = -2;
@@ -874,13 +875,26 @@ fn tls_mem(p: *ir.Value) mc.MOp {
 }
 
 let mut tls_index_si: i32 = -1;
+let mut tls_key_si: i32 = -1;
 
 // A register holding the thread-local base: the thread pointer (fs:0), or
 // on Windows this thread's block for the image, which is
 // TEB.ThreadLocalStoragePointer[_tls_index] (gs:[0x58]; the linker supplies
-// the index variable as axiom.tls_index).
+// the index variable as axiom.tls_index), or on macOS the block whose
+// address is in the TSD slot of the runtime's pthread key (gs addresses the
+// slots; axiom.tls_key, which the runtime sets, holds the slot's byte
+// offset: std/internal/runtime/darwin.ax).
 fn tls_base() i32 {
     let r = vgpr();
+    if em.MACOS {
+        if tls_key_si < 0 {
+            tls_key_si = @bit_cast(i32, elf.ext_sym(em.OBJ, "axiom.tls_key", false));
+        }
+        let k = vgpr();
+        _ = e2(xe.LOAD, 8, W(k), mc.mem_sym(tls_key_si, 0));
+        _ = e2(xe.TLSBASE, 8, W(r), R(k));
+        return r;
+    }
     if not em.WIN {
         _ = e1(xe.TLSBASE, 8, W(r));
         return r;
@@ -9457,8 +9471,10 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     em.errors = false;
     em.AVX = tg.has(tg.X_AVX);
     em.WIN = tg.is_windows();
+    em.MACOS = tg.is_darwin();
     em.placement_knobs();
     tls_index_si = -1;
+    tls_key_si = -1;
     em.OBJ = elf.new_obj(elf.EM_X86_64);
     em.JT_OBJ = u.nil.[elf.Obj]();
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
@@ -9468,10 +9484,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     em.PDATA = -1;
     em.LINES = -1;
     if em.WIN {
-        em.LINES = elf.add_sec(em.OBJ, ".axiom.lines", elf.S_DEBUG, 1);
-        @mem_set(em.line_file[..], 0);
-        em.nline_files = 0;
-        em.line_names = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+        em.LINES = wlines.begin(em.OBJ);
         // here, not when the first function needs them: functions are
         // compiled in scratch scopes (their sections must outlive them)
         em.XDATA = elf.add_sec(em.OBJ, ".xdata", elf.S_RODATA, 4);
@@ -9496,7 +9509,11 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     }
     em.DBG = dw.begin(dw.ARCH_X64, 8, level);
     em.DBG.lang = dw.module_lang(m);
-    em.DBG.tls_rel = elf.R_X86_64_DTPOFF64;
+    if not em.MACOS {
+        // (macOS: thread-locals are in a block a TSD slot holds, which no
+        // DWARF location describes: they have none, as on Apple silicon)
+        em.DBG.tls_rel = elf.R_X86_64_DTPOFF64;
+    }
     for i in 0..m.globals.len {
         dw.add_data_sym(&mut em.DBG, m.globals.get(i).name, gsym.get(i));
     }

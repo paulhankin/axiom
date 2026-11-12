@@ -1,0 +1,160 @@
+// =============================================================================
+// a64unwind.ax - Windows ARM64 unwind information: the .xdata record of a
+// function (a64.ax describes its prologue and epilogue as it encodes them;
+// plink.ax links .pdata's entries to the records), in the format of the
+// Windows ARM64 exception-handling specification:
+//
+//   a header word: the function's length in 4-byte units (bits 0-17),
+//   version 0 (18-19), no exception data (X, 20), no epilogue packed into the
+//   header (E, 21), the number of epilogue scopes (22-26) and of 4-byte words
+//   of unwind codes (27-31); when either does not fit, both are 0 and a
+//   second word holds them (16 and 8 bits);
+//   an epilogue scope word per epilogue: its offset in 4-byte units (bits
+//   0-17) and the index of its first unwind code (byte index, 22-31);
+//   the unwind codes: the prologue's in the reverse of the order its
+//   instructions run, `end`, then the epilogue's in the order they run,
+//   `end`, padded with `nop`s to a word.
+//
+// Each code stands for one instruction (the unwinder counts them to find
+// how much of a prologue or epilogue has run), and says what undoing it does:
+//
+//   alloc_s   000xxxxx                    sp += x * 16 (x < 32)
+//   save_fplr_x 10zzzzzz                  x29, lr = [sp]; sp += (z + 1) * 8
+//   alloc_m   11000xxx xxxxxxxx           sp += x * 16 (x < 2048)
+//   save_regp 110010xx xxzzzzzz           x(19+x), x(20+x) = [sp + z * 8]
+//   save_reg  110100xx xxzzzzzz           x(19+x) = [sp + z * 8]
+//   save_freg 1101110x xxzzzzzz           d(8+x) = [sp + z * 8]
+//   alloc_l   11100000 x(24 bits)         sp += x * 16
+//   set_fp    11100001                    sp = x29
+//   add_fp    11100010 xxxxxxxx           sp = x29 - x * 8
+//   nop       11100011                    (an instruction that changes nothing unwinding needs)
+//   end       11100100                    the return (lr holds the return address)
+// =============================================================================
+import "bin.ax" as bn;
+import "util.ax" as u;
+
+pub const END: u8 = 0xe4;
+pub const NOP: u8 = 0xe3;
+pub const SET_FP: u8 = 0xe1;
+
+/// A function's codes: each one's bytes in `b`, and where each starts.
+pub struct Codes {
+    b: bn.Bytes,
+    at: u.List.[u32],
+}
+
+pub fn new_codes() Codes {
+    return Codes.{ b: bn.new_bytes(), at: u.List.[u32].empty() };
+}
+
+pub fn clear(c: *mut Codes) void {
+    c.b.b.clear();
+    c.at.clear();
+}
+
+fn start(c: *mut Codes) void {
+    c.at.push(@truncate(u32, c.b.len()));
+}
+
+pub fn op1(c: *mut Codes, x: u8) void {
+    start(c);
+    c.b.u8_(x);
+}
+
+pub fn op2(c: *mut Codes, x: u64) void {
+    start(c);
+    c.b.u8_(@truncate(u8, x >> 8));
+    c.b.u8_(@truncate(u8, x));
+}
+
+/// Undoing a subtraction of n bytes (a multiple of 16) from sp: alloc_s,
+/// alloc_m or alloc_l; false if n is too large for any (256 MiB).
+pub fn alloc(c: *mut Codes, n: u64) bool {
+    let x = n / 16;
+    if x < 32 {
+        op1(c, @truncate(u8, x));
+    } else if x < 2048 {
+        op2(c, 0xc000 | x);
+    } else if x < 0x100_0000 {
+        start(c);
+        c.b.u8_(0xe0);
+        c.b.u8_(@truncate(u8, x >> 16));
+        c.b.u8_(@truncate(u8, x >> 8));
+        c.b.u8_(@truncate(u8, x));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// stp x29, x30, [sp, #-n]!
+pub fn save_fplr_x(c: *mut Codes, n: u64) void {
+    op1(c, @truncate(u8, 0x80 | ((n / 8) - 1)));
+}
+
+/// add x29, sp, #n (n a multiple of 8, less than 2048)
+pub fn add_fp(c: *mut Codes, n: u64) void {
+    op2(c, 0xe200 | (n / 8));
+}
+
+/// stp x(r), x(r+1), [sp, #off] (r 19..27; off a multiple of 8, at most 504)
+pub fn save_regp(c: *mut Codes, r: u64, off: u64) void {
+    op2(c, 0xc800 | ((r - 19) << 6) | (off / 8));
+}
+
+/// str x(r), [sp, #off] (r 19..28)
+pub fn save_reg(c: *mut Codes, r: u64, off: u64) void {
+    op2(c, 0xd000 | ((r - 19) << 6) | (off / 8));
+}
+
+/// str d(r) (or the q register, whose low half it is), [sp, #off] (r 8..15)
+pub fn save_freg(c: *mut Codes, r: u64, off: u64) void {
+    op2(c, 0xdc00 | ((r - 8) << 6) | (off / 8));
+}
+
+/// The .xdata record of a function of `len` bytes whose prologue's codes
+/// (in the order its instructions run) are `pro`, and whose epilogues,
+/// each starting at a byte offset in `epis`, all run the instructions of
+/// the codes `epi`. Empty if it cannot be described (a function of 1 MiB
+/// or more, or too many codes or epilogues).
+pub fn xdata(len: u64, pro: *Codes, epi: *Codes, epis: []u64) bn.Bytes {
+    let mut codes = bn.new_bytes();
+    let pv = pro.b.view();
+    let mut k = pro.at.len;
+    while k > 0 {
+        k -= 1;
+        let a = @as(usize, pro.at.get(k));
+        let mut e = pv.len;
+        if (k + 1) < pro.at.len {
+            e = @as(usize, pro.at.get(k + 1));
+        }
+        codes.put(pv[a..e]);
+    }
+    codes.u8_(END);
+    let epi_index = @as(u64, codes.len());
+    codes.put(epi.b.view());
+    codes.u8_(END);
+    while (codes.len() % 4) != 0 {
+        codes.u8_(NOP);
+    }
+    let words = @as(u64, codes.len()) / 4;
+    let n = @as(u64, epis.len);
+    let mut b = bn.new_bytes();
+    if ((len % 4) != 0) or (len >= (@as(u64, 1) << 20)) or (words > 255) or (n > 0xffff) or (epi_index >= 1024) {
+        codes.free();
+        return b;
+    }
+    let units = len / 4;
+    if (words < 32) and (n < 32) {
+        b.u32_(units | (n << 22) | (words << 27));
+    } else {
+        b.u32_(units);
+        b.u32_(n | (words << 16));
+    }
+    for at in epis {
+        b.u32_((at / 4) | (epi_index << 22));
+    }
+    b.put(codes.view());
+    codes.free();
+    return b;
+}
