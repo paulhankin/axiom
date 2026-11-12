@@ -1,0 +1,213 @@
+// =============================================================================
+// std/c/rt/math_hyp.ax - sinh, cosh, tanh, asinh, acosh and atanh of the C
+// library (7.12.5, F.10.2).
+//
+// From their definitions in exponentials and logarithms (Abramowitz and
+// Stegun 4.5, 4.6), each term a double-double from math_exp.ax's and
+// math_log.ax's kernels, so that nothing cancels at double precision, and a
+// minimax polynomial near 0 for sinh and tanh, whose exponential form
+// cancels there (cosh's two exponentials need only their parts in double:
+// within 2^-57). Rounded once: within about 0.52 ulp (cosh 0.57).
+// =============================================================================
+import "math.ax" as m;
+import "math_exp.ax" as ex;
+import "math_log.ax" as lg;
+import "math_tables.ax" as t;
+
+/// e^x as a double-double, |x| <= 22.
+fn exp_dd2(x: f64) m.DD {
+    let p = ex.parts(x, 0.0);
+    let sc = m.pow2(p.k);
+    return m.fast_two_sum(sc * p.s, sc * p.e);
+}
+
+/// sign(x) e^(|x| - ln 2) = sign(x) e^|x| / 2: sinh and cosh beyond 22.
+fn half_exp(x: f64) f64 {
+    let a = @abs(x);
+    let r = ex.exp_dd(a - t.LN2_HI, -t.LN2_LO);
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}
+
+/// The hyperbolic sine.
+export fn sinh(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax <= 0x3fd0000000000000 {
+        // |x| <= 1/4
+        if ax < 0x3e40000000000000 {
+            if (ax < 0x0010000000000000) and (ax != 0) {
+                m.raise_underflow();
+            }
+            return x;  // |x| < 2^-27
+        }
+        let z = x * x;
+        let w = z * z;
+        let p = ((t.SINH_P0 + (z * t.SINH_P1)) + (w * (t.SINH_P2 + (z * t.SINH_P3)))) +
+                ((w * w) * (t.SINH_P4 + (z * t.SINH_P5)));
+        return x + ((x * z) * p);
+    }
+    if ax >= 0x4036000000000000 {
+        // |x| >= 22: e^-|x| is below an ulp
+        if ax >= 0x7ff0000000000000 {
+            return x + x;  // +-inf, NaN
+        }
+        return half_exp(x);
+    }
+    // (e^|x| - e^-|x|) / 2
+    let e = exp_dd2(m.from_bits(ax));
+    let r = m.dd_round(m.dd_add(e, m.dd_neg(m.dd_recip(e)))) * 0.5;
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}
+
+/// The hyperbolic cosine.
+export fn cosh(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax < 0x3e40000000000000 {
+        return 1.0;  // |x| < 2^-27
+    }
+    if ax >= 0x4036000000000000 {
+        if ax >= 0x7ff0000000000000 {
+            return m.from_bits(ax) + m.from_bits(ax);  // +inf, NaN
+        }
+        return half_exp(m.from_bits(ax));
+    }
+    // (e^|x| + e^-|x|)/2 from the two exponentials' parts (each within
+    // 2^-59.2 relative: the roundings of r, of 2^(j/128) p and of the low
+    // part), the larger and the sum's error exact, the low part rounded:
+    // within 2^-57 of the result, so within 0.57 ulp once rounded
+    let a = m.from_bits(ax);
+    let p1 = ex.parts(a, 0.0);
+    let p2 = ex.parts(-a, 0.0);
+    let sc1 = m.pow2(p1.k - 1);
+    let sc2 = m.pow2(p2.k - 1);
+    let b = m.fast_two_sum(sc1 * p1.s, sc2 * p2.s);
+    return b.hi + (b.lo + ((sc1 * p1.e) + (sc2 * p2.e)));
+}
+
+/// The hyperbolic tangent.
+export fn tanh(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax <= 0x3fa0000000000000 {
+        // |x| <= 1/32
+        if ax < 0x3e30000000000000 {
+            if (ax < 0x0010000000000000) and (ax != 0) {
+                m.raise_underflow();
+            }
+            return x;  // |x| < 2^-28
+        }
+        let z = x * x;
+        let p = t.TANH_P0 + (z * ((t.TANH_P1 + (z * t.TANH_P2)) + ((z * z) * (t.TANH_P3 + (z * t.TANH_P4)))));
+        return x + ((x * z) * p);
+    }
+    let mut r: f64 = 1.0;
+    if ax < 0x4036000000000000 {
+        // tanh|x| = em / (em + 2), em = e^(2|x|) - 1
+        let p = ex.parts(2.0 * m.from_bits(ax), 0.0);
+        let sc = m.pow2(p.k);
+        let a = m.two_sum(sc * p.s, -1.0);
+        let em = m.fast_two_sum(a.hi, a.lo + (sc * p.e));
+        r = m.dd_round(m.dd_div(em, m.dd_add_d(em, 2.0)));
+    } else if ax > 0x7ff0000000000000 {
+        return x + x;
+    }
+    // (|x| >= 22: 1, which is tanh|x| rounded)
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}
+
+/// The inverse hyperbolic sine.
+export fn asinh(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax < 0x3e40000000000000 {
+        if (ax < 0x0010000000000000) and (ax != 0) {
+            m.raise_underflow();
+        }
+        return x;  // |x| < 2^-27
+    }
+    if ax >= 0x7ff0000000000000 {
+        return x + x;
+    }
+    let a = m.from_bits(ax);
+    let mut l = m.dd(0.0, 0.0);
+    if ax >= 0x41b0000000000000 {
+        // |x| >= 2^28: log(2|x|)
+        l = m.dd_add(lg.log_dd(a), m.dd(t.LN2_HI, t.LN2_LO + t.LN2_LO2));
+    } else {
+        // log(|x| + sqrt(x^2 + 1))
+        let s = m.dd_sqrt(m.dd_add_d(m.two_sqr(a), 1.0));
+        l = lg.log_dd2(m.dd_add_d(s, a));
+    }
+    let r = m.dd_round(l);
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}
+
+/// The inverse hyperbolic cosine.
+export fn acosh(x: f64) f64 @multiversion("fma") {
+    let ix = m.bits(x);
+    if ((ix >> 63) != 0) or (ix <= 0x3ff0000000000000) {
+        if ix == 0x3ff0000000000000 {
+            return 0.0;
+        }
+        if (ix & 0x7fffffffffffffff) > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return m.domain();  // x < 1
+    }
+    if ix >= 0x7ff0000000000000 {
+        return x + x;  // +inf, NaN
+    }
+    let mut l = m.dd(0.0, 0.0);
+    if ix >= 0x41b0000000000000 {
+        // x >= 2^28: log(2x)
+        l = m.dd_add(lg.log_dd(x), m.dd(t.LN2_HI, t.LN2_LO + t.LN2_LO2));
+    } else if x <= 2.0 {
+        // log1p(u + sqrt(2u + u^2)), u = x - 1 exactly
+        let u = x - 1.0;
+        let q = m.dd_sqrt(m.dd_add_d(m.two_sqr(u), 2.0 * u));
+        l = lg.log1p_dd(m.dd_add_d(q, u));
+    } else {
+        // log(x + sqrt(x^2 - 1))
+        let s = m.dd_sqrt(m.dd_add_d(m.two_sqr(x), -1.0));
+        l = lg.log_dd2(m.dd_add_d(s, x));
+    }
+    return m.dd_round(l);
+}
+
+/// The inverse hyperbolic tangent.
+export fn atanh(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax < 0x3e30000000000000 {
+        if (ax < 0x0010000000000000) and (ax != 0) {
+            m.raise_underflow();
+        }
+        return x;  // |x| < 2^-28
+    }
+    if ax >= 0x3ff0000000000000 {
+        if ax == 0x3ff0000000000000 {
+            return m.pole(x < 0.0);  // atanh(+-1) = +-inf
+        }
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        return m.domain();
+    }
+    // log1p(2|x| / (1 - |x|)) / 2
+    let a = m.from_bits(ax);
+    let d = m.two_sum(1.0, -a);
+    let q = m.dd_div(m.dd(2.0 * a, 0.0), d);
+    let r = 0.5 * m.dd_round(lg.log1p_dd(q));
+    if x < 0.0 {
+        return -r;
+    }
+    return r;
+}

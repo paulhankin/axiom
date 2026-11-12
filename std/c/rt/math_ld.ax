@@ -1,0 +1,1749 @@
+// =============================================================================
+// std/c/rt/math_ld.ax - <math.h>'s elementary functions for a long double
+// wider than double (the x87's 80-bit format: x86-64 Linux; binary128:
+// AArch64 Linux, WebAssembly), in the format's precision.
+//
+// The arithmetic is triple-double: a value is the unevaluated sum of three
+// doubles h + m + l, |m| <= ulp(h), |l| <= ulp(m) (as in J.-M. Muller and
+// others, "Algorithms for triple-word arithmetic", IEEE Trans. Computers 68,
+// 2019, here with simpler, slightly less accurate operations), from the
+// error-free transformations of math.ax: about 150 bits, enough for
+// binary128's 113 with the errors of the kernels, and far more than the x87's
+// 64 (a double-double's 106 bits would do there; one implementation serves
+// both, at triple-double's cost). An argument is taken apart exactly (its
+// significand into the three doubles, its exponent separate: the formats'
+// exponents go far beyond double's), and the result is rounded once to the
+// format, from the exact sum of its three parts (td_to_ld). The kernels are
+// those of the double functions with more terms and tables of triple-doubles
+// (math_ld_tables.ax): Tang's table-driven exp and log (2^(j/64), and the
+// reciprocals c of math_tables.ax with log c), sin and cos from sin and cos
+// of j/64 and the series of the remainder, after an exact reduction by
+// multiples of pi/2 (Payne and Hanek's, with 2/pi to 16896 bits), atan from a
+// table of atan c; the others from these. Within about 2^-118 relative before
+// the rounding: 0.5 + 2^-6 ulp of binary128, 0.5 + 2^-55 of the x87's.
+//
+// The C wrappers (std/c/lib/math/m_ldouble.c) pass the long doubles by
+// address and the format's number (ldouble.ax: FMT_Q, FMT_X). Special
+// arguments (NaNs, infinities, zeros and the domain errors) take the double
+// function's value of the argument converted (and its errno and flags);
+// overflow and underflow of the format set ERANGE and raise the flags.
+// =============================================================================
+import "ldouble.ax" as ld;
+import "math.ax" as m;
+import "math_ld_tables.ax" as lt;
+import "math_tables.ax" as t;
+
+extern "C" {
+    fn __axc_math_err(e: i32, flags: u32) void;
+    fn exp(x: f64) f64;
+    fn exp2(x: f64) f64;
+    fn exp10(x: f64) f64;
+    fn expm1(x: f64) f64;
+    fn log(x: f64) f64;
+    fn log2(x: f64) f64;
+    fn log10(x: f64) f64;
+    fn log1p(x: f64) f64;
+    fn sin(x: f64) f64;
+    fn cos(x: f64) f64;
+    fn tan(x: f64) f64;
+    fn atan(x: f64) f64;
+    fn asin(x: f64) f64;
+    fn acos(x: f64) f64;
+    fn sinh(x: f64) f64;
+    fn cosh(x: f64) f64;
+    fn tanh(x: f64) f64;
+    fn asinh(x: f64) f64;
+    fn acosh(x: f64) f64;
+    fn atanh(x: f64) f64;
+    fn cbrt(x: f64) f64;
+    fn pow(x: f64, y: f64) f64;
+    fn atan2(y: f64, x: f64) f64;
+    fn hypot(x: f64, y: f64) f64;
+}
+
+// -----------------------------------------------------------------------------
+// Triple-doubles
+// -----------------------------------------------------------------------------
+
+pub struct TD {
+    h: f64,
+    m: f64,
+    l: f64,
+}
+
+inline fn td(h: f64, mm: f64, l: f64) TD {
+    return TD.{ h: h, m: mm, l: l };
+}
+
+inline fn tdd(x: f64) TD {
+    return TD.{ h: x, m: 0.0, l: 0.0 };
+}
+
+inline fn tneg(a: TD) TD {
+    return td(-a.h, -a.m, -a.l);
+}
+
+/// a scaled by a power of two (exact while nothing underflows).
+inline fn tscale(a: TD, s: f64) TD {
+    return td(a.h * s, a.m * s, a.l * s);
+}
+
+/// x0 + x1 + x2 + x3 (any magnitudes) as a triple-double.
+inline fn renorm(x0: f64, x1: f64, x2: f64, x3: f64) TD {
+    let a = m.two_sum(x2, x3);
+    let b = m.two_sum(x1, a.hi);
+    let c = m.two_sum(x0, b.hi);
+    let d = m.two_sum(c.lo, b.lo);
+    let e = m.two_sum(c.hi, d.hi);
+    let g = m.two_sum(e.lo, d.lo + a.lo);
+    let k = m.two_sum(e.hi, g.hi);
+    return td(k.hi, k.lo, g.lo);
+}
+
+inline fn tadd(a: TD, b: TD) TD {
+    let s = m.two_sum(a.h, b.h);
+    let u = m.two_sum(a.m, b.m);
+    let v = m.two_sum(s.lo, u.hi);
+    return renorm(s.hi, v.hi, v.lo, u.lo + (a.l + b.l));
+}
+
+inline fn tsub(a: TD, b: TD) TD {
+    return tadd(a, tneg(b));
+}
+
+inline fn tmul(a: TD, b: TD) TD {
+    let p = m.two_prod(a.h, b.h);
+    let q = m.two_prod(a.h, b.m);
+    let r = m.two_prod(a.m, b.h);
+    let s1 = m.two_sum(p.lo, q.hi);
+    let s2 = m.two_sum(s1.hi, r.hi);
+    let lo = ((s1.lo + s2.lo) + (q.lo + r.lo)) + (((a.h * b.l) + (a.m * b.m)) + (a.l * b.h));
+    return renorm(p.hi, s2.hi, lo, 0.0);
+}
+
+inline fn tmul_d(a: TD, b: f64) TD {
+    let p = m.two_prod(a.h, b);
+    let q = m.two_prod(a.m, b);
+    let s = m.two_sum(p.lo, q.hi);
+    return renorm(p.hi, s.hi, s.lo, q.lo + (a.l * b));
+}
+
+fn tdiv(a: TD, b: TD) TD @multiversion("fma") {
+    let q0 = a.h / b.h;
+    let r0 = tsub(a, tmul_d(b, q0));
+    let q1 = r0.h / b.h;
+    let r1 = tsub(r0, tmul_d(b, q1));
+    let q2 = r1.h / b.h;
+    return renorm(q0, q1, q2, 0.0);
+}
+
+/// sqrt(a), a > 0: two corrections of the double square root.
+fn tsqrt(a: TD) TD @multiversion("fma") {
+    if a.h == 0.0 {
+        return tdd(0.0);
+    }
+    let s = @sqrt(a.h);
+    let e0 = tsub(a, tmul(tdd(s), tdd(s)));
+    let c1 = e0.h / (2.0 * s);
+    let y = renorm(s, c1, 0.0, 0.0);
+    let e1 = tsub(a, tmul(y, y));
+    return renorm(y.h, y.m, e1.h / (2.0 * s), 0.0);
+}
+
+/// A table's triple-double.
+inline fn tab(a: []u64, i: usize) TD {
+    return td(m.from_bits(a[i]), m.from_bits(a[i + 1]), m.from_bits(a[i + 2]));
+}
+
+/// A table's double-double coefficient k (pairs).
+inline fn coef(a: []u64, k: usize) m.DD {
+    return m.dd(m.from_bits(a[2 * k]), m.from_bits(a[(2 * k) + 1]));
+}
+
+inline fn tdd2(a: m.DD) TD {
+    return td(a.hi, a.lo, 0.0);
+}
+
+inline fn dd_of(a: TD) m.DD {
+    return m.dd(a.h, a.m + a.l);
+}
+
+// -----------------------------------------------------------------------------
+// The formats' values taken apart, and the results put together
+// -----------------------------------------------------------------------------
+
+const C_ZERO: u32 = 0;
+const C_FIN: u32 = 1;
+const C_INF: u32 = 2;
+const C_NAN: u32 = 3;
+
+/// A long double: finite and nonzero, (sh:sl) 2^(e - 127), bit 127 set.
+struct X {
+    cls: u32,
+    neg: bool,
+    e: i32,
+    sh: u64,
+    sl: u64,
+}
+
+fn decode(a: *ld.W, f: u32) X {
+    if f == ld.FMT_X {
+        let ef = @bit_cast(i32, @truncate(u32, a.hi & 0x7FFF));
+        let neg = (a.hi & 0x8000) != 0;
+        let mm = a.lo;
+        if ef == 0x7FFF {
+            if ((mm >> 63) != 0) and ((mm << 1) == 0) {
+                return X.{ cls: C_INF, neg: neg, e: 0, sh: 0, sl: 0 };
+            }
+            return X.{ cls: C_NAN, neg: neg, e: 0, sh: 0, sl: 0 };
+        }
+        if mm == 0 {
+            return X.{ cls: C_ZERO, neg: neg, e: 0, sh: 0, sl: 0 };
+        }
+        if (ef != 0) and ((mm >> 63) == 0) {
+            return X.{ cls: C_NAN, neg: neg, e: 0, sh: 0, sl: 0 };  // (an unnormal: invalid)
+        }
+        let mut efe = ef;
+        if ef == 0 {
+            efe = 1;
+        }
+        let z = @as(u32, @truncate(u32, @clz(mm)));
+        return X.{ cls: C_FIN, neg: neg, e: (efe - 16383) - @bit_cast(i32, z), sh: mm << z, sl: 0 };
+    }
+    let ef = @bit_cast(i32, @truncate(u32, (a.hi >> 48) & 0x7FFF));
+    let neg = (a.hi >> 63) != 0;
+    let fh = a.hi & 0xFFFF_FFFF_FFFF;
+    let fl = a.lo;
+    if ef == 0x7FFF {
+        if (fh | fl) == 0 {
+            return X.{ cls: C_INF, neg: neg, e: 0, sh: 0, sl: 0 };
+        }
+        return X.{ cls: C_NAN, neg: neg, e: 0, sh: 0, sl: 0 };
+    }
+    if ef == 0 {
+        if (fh | fl) == 0 {
+            return X.{ cls: C_ZERO, neg: neg, e: 0, sh: 0, sl: 0 };
+        }
+        // subnormal: (fh:fl) 2^(1 - 16383 - 112)
+        let mut h = fh;
+        let mut l = fl;
+        let mut z: u32 = 0;
+        if h == 0 {
+            h = l;
+            l = 0;
+            z = 64;
+        }
+        let z2 = @as(u32, @truncate(u32, @clz(h)));
+        if z2 != 0 {
+            h = (h << z2) | (l >> (64 - z2));
+            l = l << z2;
+        }
+        // the leading bit, at 127 - z - z2 of the 128, is 2^(1 - 16383 - 112 + 127 - z - z2)
+        return X.{ cls: C_FIN, neg: neg, e: ((1 - 16383) + 15) - @bit_cast(i32, z + z2), sh: h, sl: l };
+    }
+    let h = (((fh | 0x1_0000_0000_0000) << 15) | (fl >> 49));
+    return X.{ cls: C_FIN, neg: neg, e: ef - 16383, sh: h, sl: fl << 15 };
+}
+
+/// The significand of a finite x as a triple-double in [1, 2) (exact).
+fn sig_td(x: X) TD {
+    let h = @float_from_int(f64, x.sh >> 11) * 2.220446049250313e-16;  // 2^-52
+    let mid = ((x.sh & 0x7FF) << 42) | (x.sl >> 22);
+    let mm = @float_from_int(f64, mid) * 2.465190328815662e-32;             // 2^-105
+    let l = @float_from_int(f64, x.sl & 0x3FFFFF) * 5.877471754111438e-39;  // 2^-127
+    return td(h, mm, l);
+}
+
+/// 2^k for -1022 <= k <= 1023.
+inline fn p2(k: i32) f64 {
+    return m.from_bits(@as(u64, @bit_cast(u32, k + 1023)) << 52);
+}
+
+/// x as a triple-double (|exponent| < 900).
+fn val_td(x: X) TD {
+    let s = sig_td(x);
+    let mut v = tscale(s, p2(x.e));
+    if x.neg {
+        v = tneg(v);
+    }
+    return v;
+}
+
+/// The 53-bit integer and the exponent of a nonzero double: |c| = n 2^q.
+struct Dbl {
+    n: u64,
+    q: i32,
+}
+
+inline fn dbl(c: f64) Dbl {
+    let b = m.abits(c);
+    let ef = @bit_cast(i32, @truncate(u32, b >> 52));
+    if ef == 0 {
+        return Dbl.{ n: b, q: -1074 };
+    }
+    return Dbl.{ n: (b & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000, q: ef - 1075 };
+}
+
+/// r = (v.h + v.m + v.l) 2^k rounded once to the format (to nearest): the
+/// parts summed exactly in a 192-bit integer whose unit is 2^(E - 190), E the
+/// exponent of h, those bits of a part below it rounded toward -inf and kept
+/// as a sticky bit (a part so small can only be the last; the sum is then
+/// within one unit above the integer, and the rounding at bit 113 or 64 from
+/// the top does not see the difference).
+fn td_to_ld(r: *mut ld.W, v: TD, k: i32, f: u32) void {
+    if v.h == 0.0 {
+        ld.from_f64(r, m.bits(v.h), f);
+        return;
+    }
+    let neg = v.h < 0.0;
+    let hd = dbl(v.h);
+    let base = (hd.q + 52) - 190;   // the integer's unit: 2^base
+    let mut a: [3]u64 = [0, 0, 0];  // a[0] the low word
+    let mut sticky = false;
+    let parts = [v.h, v.m, v.l];
+    for pi in @as(usize, 0)..3 {
+        let c = parts[pi];
+        if c == 0.0 {
+            continue;
+        }
+        let dc = dbl(c);
+        let sub = (c < 0.0) != neg;
+        let sh = dc.q - base;
+        let mut w: [3]u64 = [0, 0, 0];
+        if sh >= 0 {
+            let s = @bit_cast(u32, sh);
+            let wi = @as(usize, s / 64);
+            let bi = s % 64;
+            if wi < 3 {
+                w[wi] = dc.n << bi;
+                if (bi != 0) and (wi + 1 < 3) {
+                    w[wi + 1] = dc.n >> (64 - bi);
+                }
+            }
+        } else {
+            let s = @bit_cast(u32, -sh);
+            let mut q: u64 = 0;
+            let mut rest = dc.n;
+            if s < 64 {
+                q = dc.n >> s;
+                rest = dc.n & ((@as(u64, 1) << s) - 1);
+            }
+            if rest != 0 {
+                sticky = true;
+                if sub {
+                    q += 1;  // (subtracting the next unit: toward -inf)
+                }
+            }
+            w[0] = q;
+        }
+        if sub {
+            let mut borrow: u64 = 0;
+            for i in @as(usize, 0)..3 {
+                let x = a[i];
+                let y = w[i];
+                let d1 = x -% y;
+                let b1 = @as(u64, x < y);
+                let d2 = d1 -% borrow;
+                let b2 = @as(u64, d1 < borrow);
+                a[i] = d2;
+                borrow = b1 | b2;
+            }
+        } else {
+            let mut carry: u64 = 0;
+            for i in @as(usize, 0)..3 {
+                let s1 = a[i] +% w[i];
+                let c1 = @as(u64, s1 < a[i]);
+                let s2 = s1 +% carry;
+                let c2 = @as(u64, s2 < s1);
+                a[i] = s2;
+                carry = c1 | c2;
+            }
+        }
+    }
+    // the top 128 bits, the rest sticky
+    let mut top: i32 = 191;
+    while (top >= 0) and (((a[@as(usize, @bit_cast(u32, top) / 64)] >> (@bit_cast(u32, top) % 64)) & 1) == 0) {
+        top -= 1;
+    }
+    if top < 0 {
+        ld.from_f64(r, 0, f);
+        return;
+    }
+    // shift so that bit `top` lands at 127 of (hi:lo)
+    let mut hi: u64 = 0;
+    let mut lo: u64 = 0;
+    let shr = top - 127;
+    if shr >= 0 {
+        let s = @bit_cast(u32, shr);
+        // the 128 bits from bit s up
+        let wi = @as(usize, s / 64);
+        let bi = s % 64;
+        let g: [4]u64 = [a[0], a[1], a[2], 0];
+        if bi == 0 {
+            lo = g[wi];
+            hi = g[wi + 1];
+        } else {
+            lo = (g[wi] >> bi) | (g[wi + 1] << (64 - bi));
+            hi = (g[wi + 1] >> bi) | (g[wi + 2] << (64 - bi));
+        }
+        // the bits below s
+        for i in @as(usize, 0)..3 {
+            let lowb = @truncate(u32, i) * 64;
+            if lowb >= s {
+                break;
+            }
+            let n = s - lowb;
+            if n >= 64 {
+                if a[i] != 0 {
+                    sticky = true;
+                }
+            } else if (a[i] & ((@as(u64, 1) << n) - 1)) != 0 {
+                sticky = true;
+            }
+        }
+    } else {
+        // (the integer below 2^128: shifted up)
+        let s = @bit_cast(u32, -shr);
+        if s >= 64 {
+            hi = a[0] << (s - 64);
+            lo = 0;
+        } else {
+            hi = (a[1] << s) | (a[0] >> (64 - s));
+            lo = a[0] << s;
+        }
+    }
+    // value = (hi:lo) 2^(top - 127) 2^base 2^k = (hi:lo) 2^(e - 127)
+    ld.from_parts(r, neg, (top + base) + k, hi, lo, sticky, f);
+}
+
+/// The double function's value of the converted argument, converted back
+/// (the special arguments: NaNs, infinities, zeros, the domain errors); the
+/// multiples of pi/4 that atan and atan2 give for them in the format's
+/// precision.
+fn via_double(r: *mut ld.W, v: f64, f: u32) void {
+    let a = @abs(v);
+    let mut c = tdd(0.0);
+    if a == lt.PIO4_H {
+        c = td(lt.PIO4_H, lt.PIO4_M, lt.PIO4_L);
+    } else if a == lt.PIO2_H {
+        c = td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L);
+    } else if a == lt.PI_H {
+        c = td(lt.PI_H, lt.PI_M, lt.PI_L);
+    } else if a == 2.356194490192345 {
+        c = tsub(td(lt.PI_H, lt.PI_M, lt.PI_L), td(lt.PIO4_H, lt.PIO4_M, lt.PIO4_L));  // 3 pi/4
+    } else {
+        ld.from_f64(r, m.bits(v), f);
+        return;
+    }
+    if v < 0.0 {
+        c = tneg(c);
+    }
+    td_to_ld(r, c, 0, f);
+}
+
+inline fn to_d(a: *ld.W, f: u32) f64 {
+    return m.from_bits(ld.to_f64(a, f));
+}
+
+/// The range errors of a finite result r computed from a nonzero value:
+/// overflow (inf) and underflow (subnormal or zero).
+fn check_range(r: *ld.W, f: u32) void {
+    let x = decode(r, f);
+    if x.cls == C_INF {
+        __axc_math_err(m.ERANGE, m.FE_OVERFLOW | m.FE_INEXACT);
+    } else if (x.cls == C_ZERO) or ((x.cls == C_FIN) and (x.e < -16382)) {
+        __axc_math_err(m.ERANGE, m.FE_UNDERFLOW | m.FE_INEXACT);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// exp and log
+// -----------------------------------------------------------------------------
+
+/// e^x = v 2^k for a finite |x| < 12000: x = (64 k + j) ln2/64 + r, |r| <=
+/// ln2/128 (ln2/64 in parts that k times are exact), e^x = 2^k 2^(j/64) e^r
+/// (EXP_T); e^r - 1 = r + r^2 (1/2 + r P(r)), P's terms from r^3/3! in
+/// double-double (to r^17/17!, the first of them a 2^-25th of the result,
+/// so within 2^-129), the rest in triple-double.
+struct E {
+    v: TD,
+    k: i32,
+    em1: TD,  // e^r - 1
+    kf: f64,
+}
+
+fn exp_core(x: TD) E @multiversion("fma") {
+    let kd0 = (x.h * lt.INVLN2_64) + 6755399441055744.0;
+    let kf = kd0 - 6755399441055744.0;
+    let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
+    let a0 = x.h - (kf * lt.LN2_64_0);
+    let p = m.two_prod(kf, lt.LN2_64_3);
+    let r1 = tadd(td(a0, x.m, x.l), td(-(kf * lt.LN2_64_1), -(kf * lt.LN2_64_2), 0.0));
+    let r = tadd(r1, td(-p.hi, -p.lo, 0.0));
+    let rd = m.dd(r.h, r.m);
+    // P(r) = 1/3! + r/4! + ...: r^8/8! .. r^17/17! in double, then double-double
+    let mut q = m.from_bits(t_exp_c(17));
+    let mut i: usize = 16;
+    while i >= 8 {
+        q = m.from_bits(t_exp_c(i)) + (r.h * q);
+        i -= 1;
+    }
+    let mut pd = m.dd_add(coef(lt.EXP_C[..], 7), m.dd_mul_d(rd, q));
+    i = 6;
+    while i >= 3 {
+        pd = m.dd_add(coef(lt.EXP_C[..], i), m.dd_mul(rd, pd));
+        i -= 1;
+    }
+    let rp = m.dd_mul(rd, pd);
+    let s = renorm(0.5, rp.hi, rp.lo, 0.0);
+    let em1 = tadd(r, tmul(tmul(r, r), s));
+    let j = @as(usize, @bit_cast(u32, n & 63)) * 3;
+    let tj = tab(lt.EXP_T[..], j);
+    let v = tadd(tj, tmul(tj, em1));
+    return E.{ v: v, k: n >> 6, em1: em1, kf: kf };
+}
+
+inline fn t_exp_c(n: usize) u64 {
+    return lt.EXP_C[2 * n];
+}
+
+/// log of x = s 2^e (s a triple-double in [1, 2)): s = 2^k m, m in [0.709,
+/// 1.418), m c = 1 + r exactly but for 2^-159 (c from math_tables.ax's
+/// LOG_C, of 10 bits), log x = (e + k) ln2 - log c + log1p(r) (LOG_L);
+/// log1p(r) = r - r^2/2 + r^3/3 - r^4/4 + r^5 P(r), the first four in
+/// triple-double, P's terms from 1/5 in double-double (to r^10/10) and double
+/// (to r^20/20): within 2^-137 of the result.
+fn log_core(s0: TD, e0: i32) TD @multiversion("fma") {
+    let mut s = s0;
+    let mut e = e0;
+    if (m.bits(s.h) -% t.LOG_OFF) >= 0x0010000000000000 {
+        s = tscale(s, 0.5);  // (s beyond 1.418: m = s/2)
+        e += 1;
+    }
+    let tmp = m.bits(s.h) -% t.LOG_OFF;
+    let i = @as(usize, @truncate(u8, (tmp >> 45) & 127));
+    let c = m.from_bits(t.LOG_C[i]);
+    let p0 = m.two_prod(s.h, c);
+    let p1 = m.two_prod(s.m, c);
+    let r = renorm(p0.hi - 1.0, p0.lo, p1.hi, p1.lo + (s.l * c));
+    let l1 = log1p_series(r);
+    let ef = @float_from_int(f64, e);
+    let p3 = m.two_prod(ef, lt.LN2_S3);
+    let el = renorm(ef * lt.LN2_S0, ef * lt.LN2_S1, ef * lt.LN2_S2, p3.hi);
+    return tadd(tadd(el, tab(lt.LOG_L[..], 3 * i)), l1);
+}
+
+/// log1p(r) for |r| <= 2^-7.7 (the series of log_core).
+fn log1p_series(r: TD) TD @multiversion("fma") {
+    let rd = m.dd(r.h, r.m);
+    let mut q: f64 = 0.0;
+    let mut n: usize = 20;
+    while n >= 11 {
+        let inv = m.from_bits(lt.INV_N[2 * n]);
+        if (n & 1) == 0 {
+            q = -inv + (r.h * q);
+        } else {
+            q = inv + (r.h * q);
+        }
+        n -= 1;
+    }
+    let mut pd = m.dd_mul_d(rd, q);
+    n = 10;
+    while n >= 5 {
+        let mut cn = coef(lt.INV_N[..], n);
+        if (n & 1) == 0 {
+            cn = m.dd_neg(cn);
+        }
+        pd = m.dd_add(cn, pd);
+        if n > 5 {
+            pd = m.dd_mul(rd, pd);
+        }
+        n -= 1;
+    }
+    // Horner in triple-double: -1/4 + r P, 1/3 + r (...), -1/2 + r (...), 1 + r (...)
+    let mut u = tadd(tdd(-0.25), tmul(r, tdd2(pd)));
+    u = tadd(td(lt.THIRD_H, lt.THIRD_M, lt.THIRD_L), tmul(r, u));
+    u = tadd(tdd(-0.5), tmul(r, u));
+    u = tadd(tdd(1.0), tmul(r, u));
+    return tmul(r, u);
+}
+
+// -----------------------------------------------------------------------------
+// sin, cos, tan: the reduction and the kernel
+// -----------------------------------------------------------------------------
+
+fn mul128(a: u64, b: u64) [2]u64 {
+    let a0 = a & 0xffffffff;
+    let a1 = a >> 32;
+    let b0 = b & 0xffffffff;
+    let b1 = b >> 32;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = ((p00 >> 32) + (p01 & 0xffffffff)) + (p10 & 0xffffffff);
+    let hi = ((p11 + (p01 >> 32)) + (p10 >> 32)) + (mid >> 32);
+    return [hi, (mid << 32) | (p00 & 0xffffffff)];
+}
+
+/// Bit j (j >= 1) of 2/pi... as the 64 bits from bit j on (bit j the top).
+fn tp_bits(j: u32) u64 {
+    let g = j + 63;  // bit j of 2/pi is bit 63 + j of the array
+    let w = @as(usize, g / 64);
+    let s = g % 64;
+    let tp = lt.TWO_OVER_PI[..];
+    if w >= tp.len {
+        return 0;
+    }
+    let mut v = tp[w] << s;
+    if (s != 0) and (w + 1 < tp.len) {
+        v = v | (tp[w + 1] >> (64 - s));
+    }
+    return v;
+}
+
+/// x = n pi/2 + r, |r| <= pi/4 (a little more), for a finite x beyond pi/4:
+/// x 2/pi modulo 4 exactly from the 384 bits of 2/pi at x's exponent (the
+/// bits before give multiples of 4, those after less than 2^-250 of it).
+struct Red {
+    n: i32,
+    r: TD,
+}
+
+fn reduce(x: X) Red {
+    // x = S 2^(e - 127), S = (sh:sl); bits j < j0 of 2/pi give multiples of 4
+    let mut j0: i32 = x.e - 128;
+    if j0 < 1 {
+        j0 = 1;
+    }
+    let mut wv: [6]u64 = [0, 0, 0, 0, 0, 0];  // wv[0] the low word
+    for i in @as(usize, 0)..6 {
+        wv[5 - i] = tp_bits(@bit_cast(u32, j0) + (@truncate(u32, i) * 64));
+    }
+    // P = S W (8 words), P 2^(e - 127 - j0 - 383) = x 2/pi (mod 4)
+    let mut pw: [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let sv = [x.sl, x.sh];
+    for a in @as(usize, 0)..2 {
+        let mut carry: u64 = 0;
+        for b in @as(usize, 0)..6 {
+            let pr = mul128(sv[a], wv[b]);
+            let k = a + b;
+            let s1 = pw[k] +% pr[1];
+            let c1 = @as(u64, s1 < pw[k]);
+            let s2 = s1 +% carry;
+            let c2 = @as(u64, s2 < s1);
+            pw[k] = s2;
+            carry = (pr[0] + c1) + c2;
+        }
+        let mut k = a + 6;
+        while (carry != 0) and (k < 8) {
+            let s1 = pw[k] +% carry;
+            carry = @as(u64, s1 < pw[k]);
+            pw[k] = s1;
+            k += 1;
+        }
+    }
+    // the binary point at bit pt of P
+    let pt = @bit_cast(u32, (((127 + j0) + 383) - x.e));
+    // n: bits pt and pt + 1; the fraction: the 256 bits below pt
+    let mut n = @bit_cast(i32, @truncate(u32, get_bits(&pw, pt, 2)));
+    let mut f3 = get_bits(&pw, pt - 64, 64);
+    let mut f2 = get_bits(&pw, pt - 128, 64);
+    let mut f1 = get_bits(&pw, pt - 192, 64);
+    let mut f0 = get_bits(&pw, pt - 256, 64);
+    let mut neg = false;
+    if (f3 >> 63) != 0 {
+        // the fraction F >= 1/2: n + 1 and F - 1, whose magnitude is the
+        // two's complement
+        n += 1;
+        neg = true;
+        f0 = (~f0) +% 1;
+        f1 = ~f1;
+        f2 = ~f2;
+        f3 = ~f3;
+        if f0 == 0 {
+            f1 = f1 +% 1;
+            if f1 == 0 {
+                f2 = f2 +% 1;
+                if f2 == 0 {
+                    f3 = f3 +% 1;
+                }
+            }
+        }
+    }
+    // F (256 bits, below 1/2) as a triple-double: normalized, the top 159 bits
+    let mut sh: u32 = 0;
+    while (f3 == 0) and (sh < 256) {
+        f3 = f2;
+        f2 = f1;
+        f1 = f0;
+        f0 = 0;
+        sh += 64;
+    }
+    let z = @as(u32, @truncate(u32, @clz(f3)));
+    if (z != 0) and (z < 64) {
+        f3 = (f3 << z) | (f2 >> (64 - z));
+        f2 = (f2 << z) | (f1 >> (64 - z));
+        f1 = (f1 << z) | (f0 >> (64 - z));
+        sh += z;
+    }
+    // F = (f3:f2:f1) 2^(-192 - sh): the three 53-bit pieces
+    let h = @float_from_int(f64, f3 >> 11);
+    let mm = @float_from_int(f64, ((f3 & 0x7FF) << 42) | (f2 >> 22));
+    let l = @float_from_int(f64, ((f2 & 0x3FFFFF) << 31) | (f1 >> 33));
+    let sc = 2.220446049250313e-16 * p2(-@bit_cast(i32, sh) - 1);  // 2^(-53 - sh)
+    let fr = td(h * sc, mm * (sc * 1.1102230246251565e-16),
+                l * ((sc * 1.1102230246251565e-16) * 1.1102230246251565e-16));
+    let mut rv = tmul(fr, td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L));
+    if neg {
+        rv = tneg(rv);
+    }
+    if x.neg {
+        rv = tneg(rv);
+        n = -n;
+    }
+    return Red.{ n: n & 3, r: rv };
+}
+
+/// n bits of P starting at bit i (from the low end), as the low bits of the
+/// result (bits below 0 are 0).
+fn get_bits(p: *[8]u64, i: u32, n: u32) u64 {
+    let mut v: u64 = 0;
+    for k in 0..n {
+        let b = i + k;
+        if b < 512 {
+            v = v | (((p[@as(usize, b / 64)] >> (b % 64)) & 1) << k);
+        }
+    }
+    return v;
+}
+
+struct SC {
+    s: TD,
+    c: TD,
+}
+
+/// sin r and cos r for |r| <= pi/4 (and a little more): r = c + u, c = j/64
+/// nearest (SC_T), |u| <= 1/128; sin u = u + u z S(z) and cos u = 1 - z/2 +
+/// z^2 C(z), z = u^2, S and C (to z^7) in double-double, a 2^-16th and a
+/// 2^-32nd of the results.
+fn sincos_k(r: TD) SC @multiversion("fma") {
+    let neg = r.h < 0.0;
+    let mut a = r;
+    if neg {
+        a = tneg(r);
+    }
+    let j = @as(usize, @int_from_float(u32, (a.h * 64.0) + 0.5));
+    let u = tadd(a, tdd(-(@float_from_int(f64, j) * 0.015625)));
+    let z = tmul(u, u);
+    let zd = dd_of(z);
+    // S(z) = sum (-1)^(k+1) z^k/(2k+3)!, C(z) = sum (-1)^k z^k/(2k+4)!, k = 0 .. 7
+    let mut sp = m.dd(0.0, 0.0);
+    let mut cp = m.dd(0.0, 0.0);
+    let mut k: usize = 8;
+    while k > 0 {
+        k -= 1;
+        let mut cs = coef(lt.EXP_C[..], (2 * k) + 3);
+        let mut cc = coef(lt.EXP_C[..], (2 * k) + 4);
+        if (k & 1) == 0 {
+            cs = m.dd_neg(cs);
+        } else {
+            cc = m.dd_neg(cc);
+        }
+        sp = m.dd_add(cs, m.dd_mul(zd, sp));
+        cp = m.dd_add(cc, m.dd_mul(zd, cp));
+    }
+    let su = tadd(u, tmul(tmul(u, z), tdd2(sp)));
+    let cu = tadd(tdd(1.0), tadd(tscale(z, -0.5), tmul(tmul(z, z), tdd2(cp))));
+    let sj = tab(lt.SC_T[..], 6 * j);
+    let cj = tab(lt.SC_T[..], (6 * j) + 3);
+    let mut s = tadd(tmul(sj, cu), tmul(cj, su));
+    let c = tsub(tmul(cj, cu), tmul(sj, su));
+    if neg {
+        s = tneg(s);
+    }
+    return SC.{ s: s, c: c };
+}
+
+// -----------------------------------------------------------------------------
+// atan
+// -----------------------------------------------------------------------------
+
+/// atan u - u + u^3/3 = u^5 A(z) for |u| <= 1/32 (z = u^2): A = 1/5 - z/7 +
+/// ... to z^12, in double-double (a 2^-20th of the result).
+fn atan_series(u: TD) TD @multiversion("fma") {
+    let z = tmul(u, u);
+    let zd = dd_of(z);
+    let mut a = m.dd(0.0, 0.0);
+    let mut k: usize = 14;
+    while k >= 2 {
+        let mut c = coef(lt.INV_N[..], (2 * k) + 1);
+        if (k & 1) == 1 {
+            c = m.dd_neg(c);
+        }
+        a = m.dd_add(c, m.dd_mul(zd, a));
+        k -= 1;
+    }
+    // atan u = u (1 + z (-1/3 + z A))
+    let inner = tadd(tneg(td(lt.THIRD_H, lt.THIRD_M, lt.THIRD_L)), tmul(z, tdd2(a)));
+    return tadd(u, tmul(tmul(u, z), inner));
+}
+
+/// atan a for a finite a >= 0 (a triple-double).
+fn atan_core(a: TD) TD @multiversion("fma") {
+    if a.h < 0.015625 {
+        return atan_series(a);
+    }
+    if a.h >= 64.0 {
+        let v = atan_series(tdiv(tdd(1.0), a));
+        return tsub(td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L), v);
+    }
+    let row = @as(usize, @truncate(u32, (m.bits(a.h) >> 48) - ((1023 - 6) * 16))) * 4;
+    let c = m.from_bits(lt.ATAN_B[row]);
+    let num = tadd(a, tdd(-c));
+    let den = tadd(tdd(1.0), tmul_d(a, c));
+    let u = tdiv(num, den);
+    return tadd(tab(lt.ATAN_B[..], row + 1), atan_series(u));
+}
+
+// -----------------------------------------------------------------------------
+// The functions
+// -----------------------------------------------------------------------------
+
+// The functions of one argument (__axc_ld1's op) and of two (__axc_ld2's).
+const OP_EXP: u64 = 0;
+const OP_EXP2: u64 = 1;
+const OP_EXP10: u64 = 2;
+const OP_EXPM1: u64 = 3;
+const OP_LOG: u64 = 4;
+const OP_LOG2: u64 = 5;
+const OP_LOG10: u64 = 6;
+const OP_LOG1P: u64 = 7;
+const OP_SIN: u64 = 8;
+const OP_COS: u64 = 9;
+const OP_TAN: u64 = 10;
+const OP_ATAN: u64 = 11;
+const OP_SINH: u64 = 12;
+const OP_COSH: u64 = 13;
+const OP_TANH: u64 = 14;
+const OP_CBRT: u64 = 15;
+const OP_ASIN: u64 = 16;
+const OP_ACOS: u64 = 17;
+const OP_ASINH: u64 = 18;
+const OP_ACOSH: u64 = 19;
+const OP_ATANH: u64 = 20;
+const OP_POW: u64 = 0;
+const OP_ATAN2: u64 = 1;
+const OP_HYPOT: u64 = 2;
+const OP_CLOGRE: u64 = 3;  // log|x + iy| for x >= y >= 0, x > 0 (clogl)
+
+fn dfn1(op: u64, x: f64) f64 {
+    if op == OP_EXP {
+        return exp(x);
+    }
+    if op == OP_EXP2 {
+        return exp2(x);
+    }
+    if op == OP_EXP10 {
+        return exp10(x);
+    }
+    if op == OP_EXPM1 {
+        return expm1(x);
+    }
+    if op == OP_LOG {
+        return log(x);
+    }
+    if op == OP_LOG2 {
+        return log2(x);
+    }
+    if op == OP_LOG10 {
+        return log10(x);
+    }
+    if op == OP_LOG1P {
+        return log1p(x);
+    }
+    if op == OP_SIN {
+        return sin(x);
+    }
+    if op == OP_COS {
+        return cos(x);
+    }
+    if op == OP_TAN {
+        return tan(x);
+    }
+    if op == OP_ATAN {
+        return atan(x);
+    }
+    if op == OP_SINH {
+        return sinh(x);
+    }
+    if op == OP_COSH {
+        return cosh(x);
+    }
+    if op == OP_TANH {
+        return tanh(x);
+    }
+    if op == OP_CBRT {
+        return cbrt(x);
+    }
+    if op == OP_ASIN {
+        return asin(x);
+    }
+    if op == OP_ACOS {
+        return acos(x);
+    }
+    if op == OP_ASINH {
+        return asinh(x);
+    }
+    if op == OP_ACOSH {
+        return acosh(x);
+    }
+    return atanh(x);
+}
+
+/// e^v (v a triple-double, finite) into r, with the range errors.
+fn put_exp(r: *mut ld.W, v: TD, f: u32) void {
+    if v.h > 11400.0 {
+        __axc_math_err(m.ERANGE, m.FE_OVERFLOW | m.FE_INEXACT);
+        ld.from_f64(r, 0x7ff0000000000000, f);
+        return;
+    }
+    if v.h < -11500.0 {
+        __axc_math_err(m.ERANGE, m.FE_UNDERFLOW | m.FE_INEXACT);
+        ld.from_f64(r, 0, f);
+        return;
+    }
+    let ec = exp_core(v);
+    td_to_ld(r, ec.v, ec.k, f);
+    check_range(r, f);
+}
+
+/// The value as a triple-double and a power of two: v 2^k.
+struct TK {
+    v: TD,
+    k: i32,
+}
+
+/// log|x| for a finite nonzero x.
+inline fn log_x(x: X) TD {
+    return log_core(sig_td(x), x.e);
+}
+
+/// e^v - 1 (v finite, |v| < 12000) as v' 2^k.
+fn expm1_tk(v: TD) TK @multiversion("fma") {
+    if v.h < -200.0 {
+        return TK.{ v: tdd(-1.0), k: 0 };  // (e^v below 2^-288: -1 within 2^-288)
+    }
+    let ec = exp_core(v);
+    if ec.kf == 0.0 {
+        return TK.{ v: ec.em1, k: 0 };  // |v| <= ln2/128: no cancellation
+    }
+    if ec.k > 400 {
+        return TK.{ v: ec.v, k: ec.k };  // (1 is below 2^-400 of it)
+    }
+    return TK.{ v: tadd(tscale(ec.v, p2(ec.k)), tdd(-1.0)), k: 0 };
+}
+
+/// The long double functions of one argument: r = op(x) in format f.
+export fn __axc_ld1(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiversion("fma") {
+    let f = @truncate(u32, f64fmt);
+    let xv = decode(x, f);
+    if xv.cls != C_FIN {
+        via_double(r, dfn1(op, to_d(x, f)), f);
+        return;
+    }
+    let huge = xv.e > 900;
+    let tiny = xv.e < -900;
+    if op == OP_EXP or op == OP_EXP2 or op == OP_EXP10 or op == OP_EXPM1 {
+        if huge {
+            via_double(r, dfn1(op, to_d(x, f)), f);  // (overflow or underflow)
+            return;
+        }
+        if tiny {
+            // e^x = 1 + x (and expm1 x = x) within 2^-1800
+            if op == OP_EXPM1 {
+                td_to_ld(r, sig_td(xv), xv.e, f);
+                if xv.neg {
+                    ld.negate(r, r, f);
+                }
+                return;
+            }
+            td_to_ld(r, renorm(1.0, m.from_bits(0x0010000000000000) * @copysign(1.0, to_d(x, f)), 0.0, 0.0), 0, f);
+            return;
+        }
+        let mut v = val_td(xv);
+        if op == OP_EXP2 {
+            v = tmul(v, td(lt.LN2_H, lt.LN2_M, lt.LN2_L));
+        } else if op == OP_EXP10 {
+            v = tmul(v, td(lt.LN10_H, lt.LN10_M, lt.LN10_L));
+        }
+        if op == OP_EXPM1 {
+            let e = expm1_tk(v);
+            td_to_ld(r, e.v, e.k, f);
+            check_range(r, f);
+            return;
+        }
+        put_exp(r, v, f);
+        return;
+    }
+    if op == OP_LOG or op == OP_LOG2 or op == OP_LOG10 {
+        if xv.neg {
+            via_double(r, dfn1(op, -1.0), f);  // a domain error
+            return;
+        }
+        if (xv.e == 0) and (xv.sh == 0x8000000000000000) and (xv.sl == 0) {
+            ld.from_f64(r, 0, f);  // log 1 = +0
+            return;
+        }
+        let mut l = log_x(xv);
+        if op == OP_LOG2 {
+            l = tmul(l, td(lt.INVLN2_H, lt.INVLN2_M, lt.INVLN2_L));
+        } else if op == OP_LOG10 {
+            l = tmul(l, td(lt.INVLN10_H, lt.INVLN10_M, lt.INVLN10_L));
+        }
+        td_to_ld(r, l, 0, f);
+        return;
+    }
+    if op == OP_LOG1P {
+        if tiny {
+            td_to_ld(r, sig_td(xv), xv.e, f);  // log1p x = x within 2^-900
+            if xv.neg {
+                ld.negate(r, r, f);
+            }
+            return;
+        }
+        if huge {
+            td_to_ld(r, log_x(xv), 0, f);  // (1 + x = x to 2^-900)
+            return;
+        }
+        let v = val_td(xv);
+        if v.h <= -1.0 {
+            via_double(r, log1p(to_d(x, f)), f);  // a pole or a domain error
+            return;
+        }
+        td_to_ld(r, log1p_td(v), 0, f);
+        return;
+    }
+    if op == OP_SIN or op == OP_COS or op == OP_TAN {
+        if tiny {
+            // sin x = tan x = x, cos x = 1 within 2^-1800
+            if op == OP_COS {
+                td_to_ld(r, renorm(1.0, -m.from_bits(0x0010000000000000), 0.0, 0.0), 0, f);
+            } else {
+                td_to_ld(r, sig_td(xv), xv.e, f);
+                if xv.neg {
+                    ld.negate(r, r, f);
+                }
+                check_range(r, f);
+            }
+            return;
+        }
+        let mut n: i32 = 0;
+        let mut rr = tdd(0.0);
+        if (xv.e < 0) and (@abs(val_td(xv).h) <= 0.7853981633974483) {
+            rr = val_td(xv);
+        } else {
+            let red = reduce(xv);
+            n = red.n;
+            rr = red.r;
+        }
+        let sc = sincos_k(rr);
+        let mut q = n;
+        if op == OP_COS {
+            q = (n + 1) & 3;
+        }
+        if op == OP_TAN {
+            if (n & 1) == 0 {
+                td_to_ld(r, tdiv(sc.s, sc.c), 0, f);
+            } else {
+                td_to_ld(r, tneg(tdiv(sc.c, sc.s)), 0, f);
+            }
+            return;
+        }
+        let mut v = sc.s;
+        if q == 1 {
+            v = sc.c;
+        } else if q == 2 {
+            v = tneg(sc.s);
+        } else if q == 3 {
+            v = tneg(sc.c);
+        }
+        td_to_ld(r, v, 0, f);
+        return;
+    }
+    if op == OP_ATAN {
+        if tiny {
+            td_to_ld(r, sig_td(xv), xv.e, f);
+            if xv.neg {
+                ld.negate(r, r, f);
+            }
+            check_range(r, f);
+            return;
+        }
+        let mut v = td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L);
+        if not huge {
+            let a = val_td(xv);
+            let mut aa = a;
+            if xv.neg {
+                aa = tneg(a);
+            }
+            v = atan_core(aa);
+        }
+        if xv.neg {
+            v = tneg(v);
+        }
+        td_to_ld(r, v, 0, f);
+        return;
+    }
+    if op == OP_SINH or op == OP_COSH or op == OP_TANH {
+        if tiny {
+            if op == OP_COSH {
+                td_to_ld(r, renorm(1.0, m.from_bits(0x0010000000000000), 0.0, 0.0), 0, f);
+            } else {
+                td_to_ld(r, sig_td(xv), xv.e, f);
+                if xv.neg {
+                    ld.negate(r, r, f);
+                }
+                check_range(r, f);
+            }
+            return;
+        }
+        if huge or (xv.e >= 14) {
+            // |x| >= 16384: sinh, cosh overflow, tanh is +-1
+            if op == OP_TANH {
+                ld.from_f64(r, m.bits(@copysign(1.0, to_d(x, f))), f);
+                return;
+            }
+            via_double(r, dfn1(op, to_d(x, f)), f);
+            return;
+        }
+        let mut a = val_td(xv);
+        if xv.neg {
+            a = tneg(a);
+        }
+        if op == OP_TANH {
+            // tanh a = em / (em + 2), em = e^(2a) - 1
+            if a.h > 45.0 {
+                td_to_ld(r, tdd(@copysign(1.0, to_d(x, f))), 0, f);  // (1 within 2^-129)
+                return;
+            }
+            let em = expm1_tk(tscale(a, 2.0));
+            let emv = tscale(em.v, p2(em.k));
+            let mut v = tdiv(emv, tadd(emv, tdd(2.0)));
+            if xv.neg {
+                v = tneg(v);
+            }
+            td_to_ld(r, v, 0, f);
+            return;
+        }
+        if a.h > 400.0 {
+            // e^a / 2: e^-a is below 2^-1150 of it
+            let mut v = a;
+            v = tsub(v, td(lt.LN2_H, lt.LN2_M, lt.LN2_L));
+            let ec = exp_core(v);
+            let mut ev = ec.v;
+            if xv.neg and (op == OP_SINH) {
+                ev = tneg(ev);
+            }
+            td_to_ld(r, ev, ec.k, f);
+            check_range(r, f);
+            return;
+        }
+        if op == OP_COSH {
+            // (e^a + e^-a) / 2
+            let ec = exp_core(a);
+            let e1 = tscale(ec.v, p2(ec.k - 1));
+            let e2 = tdiv(tdd(0.25), e1);
+            td_to_ld(r, tadd(e1, e2), 0, f);
+            return;
+        }
+        // sinh a = (em + em / (em + 1)) / 2, em = e^a - 1
+        let em = expm1_tk(a);
+        let emv = tscale(em.v, p2(em.k));
+        let mut v = tscale(tadd(emv, tdiv(emv, tadd(emv, tdd(1.0)))), 0.5);
+        if xv.neg {
+            v = tneg(v);
+        }
+        td_to_ld(r, v, 0, f);
+        return;
+    }
+    if op == OP_CBRT {
+        // x = s 2^(3q + j): cbrt = cbrt(s 2^j) 2^q, by Newton's method in
+        // triple-double from the double's cube root
+        let q = (xv.e - (((xv.e % 3) + 3) % 3)) / 3;
+        let j = xv.e - (3 * q);
+        let a = tscale(sig_td(xv), p2(j));
+        let mut y = tdd(cbrt(a.h));
+        for it in @as(usize, 0)..2 {
+            _ = it;
+            // y = y - (y^3 - a) / (3 y^2)
+            let y2 = tmul(y, y);
+            let d = tsub(tmul(y2, y), a);
+            y = tsub(y, tdiv(d, tmul_d(y2, 3.0)));
+        }
+        if xv.neg {
+            y = tneg(y);
+        }
+        td_to_ld(r, y, q, f);
+        return;
+    }
+    if op == OP_ASIN or op == OP_ACOS {
+        let v = val_td(xv);
+        let a = @abs(v.h);
+        if (a > 1.0) or ((a == 1.0) and (v.m != 0.0) and ((v.m > 0.0) == (v.h > 0.0))) {
+            via_double(r, dfn1(op, 2.0), f);  // a domain error
+            return;
+        }
+        // asin x = atan(x / sqrt((1 - x)(1 + x))); acos x = 2 atan(sqrt((1 - x)/(1 + x)))
+        let one = tdd(1.0);
+        if op == OP_ASIN {
+            if tiny {
+                td_to_ld(r, sig_td(xv), xv.e, f);
+                if xv.neg {
+                    ld.negate(r, r, f);
+                }
+                check_range(r, f);
+                return;
+            }
+            let w = tmul(tsub(one, v), tadd(one, v));
+            let mut res = td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L);
+            if w.h != 0.0 {
+                let q = tdiv(v, tsqrt(w));
+                let mut aq = q;
+                if q.h < 0.0 {
+                    aq = tneg(q);
+                }
+                res = atan_core(aq);
+            }
+            if xv.neg {
+                res = tneg(res);
+            }
+            td_to_ld(r, res, 0, f);
+            return;
+        }
+        let num = tsub(one, v);
+        if num.h == 0.0 {
+            ld.from_f64(r, 0, f);  // acos 1 = +0
+            return;
+        }
+        let den = tadd(one, v);
+        if den.h == 0.0 {
+            td_to_ld(r, td(lt.PI_H, lt.PI_M, lt.PI_L), 0, f);
+            return;
+        }
+        td_to_ld(r, tscale(atan_core(tsqrt(tdiv(num, den))), 2.0), 0, f);
+        return;
+    }
+    if op == OP_ASINH or op == OP_ACOSH or op == OP_ATANH {
+        if (op == OP_ACOSH) and (xv.neg or (xv.e < 0)) {
+            via_double(r, dfn1(op, 0.0), f);  // x < 1: a domain error
+            return;
+        }
+        if tiny {
+            td_to_ld(r, sig_td(xv), xv.e, f);
+            if xv.neg {
+                ld.negate(r, r, f);
+            }
+            check_range(r, f);
+            return;
+        }
+        if huge {
+            if op == OP_ATANH {
+                via_double(r, dfn1(op, 2.0), f);
+                return;
+            }
+            // log 2|x|
+            let mut l = log_core(sig_td(xv), xv.e + 1);
+            if xv.neg {
+                l = tneg(l);
+            }
+            td_to_ld(r, l, 0, f);
+            return;
+        }
+        let v = val_td(xv);
+        let mut a = v;
+        if xv.neg {
+            a = tneg(v);
+        }
+        let one = tdd(1.0);
+        let mut l = tdd(0.0);
+        if op == OP_ATANH {
+            // atanh a = log1p(2a / (1 - a)) / 2
+            if (a.h > 1.0) or ((a.h == 1.0) and (a.m >= 0.0)) {
+                via_double(r, dfn1(op, @copysign(a.h, to_d(x, f))), f);  // a pole or a domain error
+                return;
+            }
+            l = tscale(log1p_td(tdiv(tscale(a, 2.0), tsub(one, a))), 0.5);
+        } else if op == OP_ASINH {
+            // asinh a = log1p(a + a^2 / (1 + sqrt(1 + a^2)))
+            let a2 = tmul(a, a);
+            l = log1p_td(tadd(a, tdiv(a2, tadd(one, tsqrt(tadd(one, a2))))));
+        } else {
+            // acosh a = log(a + sqrt(a^2 - 1)) = log1p(t + sqrt(t (t + 2))), t = a - 1
+            let tt = tsub(a, one);
+            l = log1p_td(tadd(tt, tsqrt(tmul(tt, tadd(tt, tdd(2.0))))));
+        }
+        if xv.neg {
+            l = tneg(l);
+        }
+        td_to_ld(r, l, 0, f);
+        return;
+    }
+    via_double(r, dfn1(op, to_d(x, f)), f);
+}
+
+/// log1p(v) for v > -1 (a triple-double): log of 1 + v, taken apart.
+fn log1p_td(v: TD) TD @multiversion("fma") {
+    if v.h == 0.0 {
+        return tdd(0.0);
+    }
+    if @abs(v.h) < 0.0029 {
+        return log1p_series(v);  // (1 + v would not hold v's bits)
+    }
+    let s = tadd(tdd(1.0), v);
+    let e = @bit_cast(i32, @truncate(u32, (m.bits(s.h) >> 52) & 0x7FF)) - 1023;
+    return log_core(tscale(s, p2(-e)), e);
+}
+
+/// Is x (finite) an integer, and odd? 0: not an integer, 1: odd, 2: even.
+fn int_kind(x: X) u32 {
+    if x.e < 0 {
+        return 0;
+    }
+    if x.e >= 127 {
+        return 2;
+    }
+    // the bits below 2^0 are those below bit 127 - e of (sh:sl)
+    let s = @bit_cast(u32, 127 - x.e);
+    let mut frac = false;
+    let mut odd = false;
+    if s >= 64 {
+        frac = (x.sl != 0) or ((x.sh << (128 - s)) != 0 and s < 128 and s > 64);
+        if s == 64 {
+            frac = x.sl != 0;
+            odd = (x.sh & 1) != 0;
+        } else {
+            frac = (x.sl != 0) or ((x.sh << (128 - s)) != 0);
+            odd = ((x.sh >> (s - 64)) & 1) != 0;
+        }
+    } else {
+        frac = (s != 0) and ((x.sl << (64 - s)) != 0);
+        if s == 0 {
+            frac = false;
+            odd = (x.sl & 1) != 0;
+        } else {
+            odd = (((x.sl >> s) | (x.sh << (64 - s))) & 1) != 0;
+        }
+    }
+    if frac {
+        return 0;
+    }
+    if odd {
+        return 1;
+    }
+    return 2;
+}
+
+/// The long double functions of two arguments: r = op(x, y) in format f.
+export fn __axc_ld2(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void @multiversion("fma") {
+    let f = @truncate(u32, f64fmt);
+    let xv = decode(x, f);
+    let yv = decode(y, f);
+    if op == OP_CLOGRE {
+        // log(a^2 + b^2)/2 + e ln2, a and b scaled by 2^-e (the squares'
+        // sum to 2^-150: log's reduction leaves nothing to cancel near 1)
+        let e = xv.e;
+        let a = sig_td(xv);
+        let mut b = tdd(0.0);
+        if (yv.cls == C_FIN) and ((e - yv.e) < 600) {
+            b = tscale(sig_td(yv), p2(yv.e - e));
+        }
+        let mut s2 = tadd(tmul(a, a), tmul(b, b));
+        let mut e2: i32 = 0;
+        if s2.h >= 4.0 {
+            s2 = tscale(s2, 0.25);
+            e2 = 2;
+        } else if s2.h >= 2.0 {
+            s2 = tscale(s2, 0.5);
+            e2 = 1;
+        }
+        let l = tadd(tscale(log_core(s2, e2), 0.5), tmul_d(td(lt.LN2_H, lt.LN2_M, lt.LN2_L), @float_from_int(f64, e)));
+        td_to_ld(r, l, 0, f);
+        return;
+    }
+    if op == OP_HYPOT {
+        if (xv.cls != C_FIN) or (yv.cls != C_FIN) {
+            via_double(r, hypot(to_d(x, f), to_d(y, f)), f);
+            return;
+        }
+        // sqrt(a^2 + b^2) 2^e, scaled by the larger exponent (the smaller
+        // part dropped below 2^-600 of it)
+        let e = @max(xv.e, yv.e);
+        let mut a = tdd(0.0);
+        let mut b = tdd(0.0);
+        if (e - xv.e) < 600 {
+            a = tscale(sig_td(xv), p2(xv.e - e));
+        }
+        if (e - yv.e) < 600 {
+            b = tscale(sig_td(yv), p2(yv.e - e));
+        }
+        td_to_ld(r, tsqrt(tadd(tmul(a, a), tmul(b, b))), e, f);
+        check_range(r, f);
+        return;
+    }
+    if op == OP_ATAN2 {
+        if (xv.cls != C_FIN) or (yv.cls != C_FIN) {
+            via_double(r, atan2(to_d(x, f), to_d(y, f)), f);
+            return;
+        }
+        // x is y's argument here: atan2(x, y), x the ordinate
+        let dy = xv;
+        let dx = yv;
+        let e = @max(dy.e, dx.e);
+        let mut ay = tdd(0.0);
+        let mut ax = tdd(0.0);
+        if (e - dy.e) < 600 {
+            ay = tscale(sig_td(dy), p2(dy.e - e));
+        }
+        if (e - dx.e) < 600 {
+            ax = tscale(sig_td(dx), p2(dx.e - e));
+        }
+        let mut v = tdd(0.0);
+        if ax.h == 0.0 {
+            v = td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L);
+        } else if ay.h == 0.0 {
+            if dy.e < -16000 {
+                v = tdd(0.0);
+            }
+            // |y/x| below 2^-600: atan2 = y/x
+            if not dx.neg {
+                td_to_ld(r, tdiv(sig_td(dy), sig_td(dx)), dy.e - dx.e, f);
+                if dy.neg {
+                    ld.negate(r, r, f);
+                }
+                check_range(r, f);
+                return;
+            }
+            v = tdd(0.0);
+        } else if ay.h <= ax.h {
+            v = atan_core(tdiv(ay, ax));
+        } else {
+            v = tsub(td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L), atan_core(tdiv(ax, ay)));
+        }
+        if dx.neg {
+            v = tsub(td(lt.PI_H, lt.PI_M, lt.PI_L), v);
+        }
+        if dy.neg {
+            v = tneg(v);
+        }
+        td_to_ld(r, v, 0, f);
+        return;
+    }
+    // pow(x, y): the special cases are the double function's, of the
+    // converted arguments, but for an integer y that double would not tell
+    // odd from even (beyond 2^53), and a non-integer y that it would round to
+    // an integer
+    let mut kind: u32 = 3;
+    if yv.cls == C_FIN {
+        kind = int_kind(yv);
+    }
+    if (xv.cls != C_FIN) or (yv.cls != C_FIN) {
+        let mut yd = to_d(y, f);
+        if yv.cls == C_FIN {
+            // (x is +-0, +-inf or a NaN: only y's sign and kind matter)
+            if kind == 1 {
+                yd = @copysign(3.0, yd);
+            } else if kind == 2 {
+                yd = @copysign(2.0, yd);
+            } else {
+                yd = @copysign(0.5, yd);
+            }
+        }
+        via_double(r, pow(to_d(x, f), yd), f);
+        return;
+    }
+    if xv.neg and (kind == 0) {
+        via_double(r, pow(-1.0, 0.5), f);  // a domain error
+        return;
+    }
+    let neg_r = xv.neg and (kind == 1);
+    if (xv.e == 0) and (xv.sh == 0x8000000000000000) and (xv.sl == 0) {
+        // (+-1)^y: 1, or -1 for x = -1 and an odd y
+        if neg_r {
+            ld.from_f64(r, m.bits(-1.0), f);
+        } else {
+            ld.from_f64(r, m.bits(1.0), f);
+        }
+        return;
+    }
+    // |x|^y = e^(y log|x|), y log|x| a triple-double
+    let mut ys = sig_td(yv);
+    if yv.neg {
+        ys = tneg(ys);
+    }
+    let yl0 = tmul(ys, log_x(xv));
+    let mut tv = tdd(0.0);
+    if yv.e > 1000 {
+        // |y log|x|| beyond 2^880 (|log|x|| is not below 2^-120): an
+        // overflow or an underflow, as its sign says
+        range_err(r, yl0.h > 0.0, neg_r, f);
+        return;
+    }
+    if yv.e >= -1000 {
+        tv = tscale(yl0, p2(yv.e));
+    }
+    put_exp(r, tv, f);
+    if neg_r {
+        ld.negate(r, r, f);
+    }
+}
+
+/// An overflow (+-inf) or an underflow (+-0) into r, with ERANGE and the flags.
+fn range_err(r: *mut ld.W, over: bool, neg: bool, f: u32) void {
+    if over {
+        __axc_math_err(m.ERANGE, m.FE_OVERFLOW | m.FE_INEXACT);
+        ld.from_f64(r, 0x7ff0000000000000, f);
+    } else {
+        __axc_math_err(m.ERANGE, m.FE_UNDERFLOW | m.FE_INEXACT);
+        ld.from_f64(r, 0, f);
+    }
+    if neg {
+        ld.negate(r, r, f);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// fma: exact, in 512-bit integers
+// -----------------------------------------------------------------------------
+
+/// Bit i of a (8 words, a[0] the low word).
+inline fn bit8(a: *[8]u64, i: i32) u64 {
+    if (i < 0) or (i >= 512) {
+        return 0;
+    }
+    let u = @bit_cast(u32, i);
+    return (a[@as(usize, u / 64)] >> (u % 64)) & 1;
+}
+
+fn msb8(a: *[8]u64) i32 {
+    let mut w: i32 = 7;
+    while w >= 0 {
+        let v = a[@as(usize, @bit_cast(u32, w))];
+        if v != 0 {
+            return (w * 64) + (63 - @bit_cast(i32, @truncate(u32, @clz(v))));
+        }
+        w -= 1;
+    }
+    return -1;
+}
+
+/// a shifted by n (left if n > 0, right if n < 0); the bits shifted out at
+/// the right are reported (true if any was set).
+fn shift8(a: *mut [8]u64, n: i32) bool {
+    let mut out = false;
+    let mut b: [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    for i in @as(usize, 0)..8 {
+        let v = a[i];
+        if v == 0 {
+            continue;
+        }
+        for k in @as(u32, 0)..64 {
+            if ((v >> k) & 1) == 0 {
+                continue;
+            }
+            let pos = ((@bit_cast(i32, @truncate(u32, i)) * 64) + @bit_cast(i32, k)) + n;
+            if pos < 0 {
+                out = true;
+            } else if pos < 512 {
+                let u = @bit_cast(u32, pos);
+                b[@as(usize, u / 64)] = b[@as(usize, u / 64)] | (@as(u64, 1) << (u % 64));
+            }
+        }
+    }
+    for i in @as(usize, 0)..8 {
+        a[i] = b[i];
+    }
+    return out;
+}
+
+fn add8(a: *mut [8]u64, b: *[8]u64) void {
+    let mut carry: u64 = 0;
+    for i in @as(usize, 0)..8 {
+        let s1 = a[i] +% b[i];
+        let c1 = @as(u64, s1 < a[i]);
+        let s2 = s1 +% carry;
+        let c2 = @as(u64, s2 < s1);
+        a[i] = s2;
+        carry = c1 | c2;
+    }
+}
+
+/// a - b, a >= b.
+fn sub8(a: *mut [8]u64, b: *[8]u64) void {
+    let mut borrow: u64 = 0;
+    for i in @as(usize, 0)..8 {
+        let x = a[i];
+        let d1 = x -% b[i];
+        let b1 = @as(u64, x < b[i]);
+        let d2 = d1 -% borrow;
+        let b2 = @as(u64, d1 < borrow);
+        a[i] = d2;
+        borrow = b1 | b2;
+    }
+}
+
+fn lt8(a: *[8]u64, b: *[8]u64) bool {
+    let mut i: usize = 8;
+    while i > 0 {
+        i -= 1;
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+    }
+    return false;
+}
+
+/// r = x y + z rounded once (fmal in a wide format).
+export fn __axc_ld_fma(f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W) void @multiversion("fma") {
+    let f = @truncate(u32, f64fmt);
+    let xv = decode(x, f);
+    let yv = decode(y, f);
+    let zv = decode(z, f);
+    if (xv.cls != C_FIN) or (yv.cls != C_FIN) {
+        // NaNs, infinities and zero products: the product is exact (or a
+        // NaN), the sum rounds once
+        let mut p = ld.W.{ lo: 0, hi: 0 };
+        ld.mul(&mut p, x, y, f);
+        ld.add(r, &p, z, f);
+        return;
+    }
+    if zv.cls != C_FIN {
+        if zv.cls == C_ZERO {
+            ld.mul(r, x, y, f);  // (x y nonzero: the sum is the product)
+            return;
+        }
+        // (z inf or NaN: the result is z's, or NaN)
+        let mut p = ld.W.{ lo: 0, hi: 0 };
+        ld.mul(&mut p, x, y, f);
+        ld.add(r, &p, z, f);
+        return;
+    }
+    // the product's 256 bits, P 2^(ex + ey - 254)
+    let mut pp: [8]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let xs = [xv.sl, xv.sh];
+    let ys = [yv.sl, yv.sh];
+    for a in @as(usize, 0)..2 {
+        let mut carry: u64 = 0;
+        for b in @as(usize, 0)..2 {
+            let pr = mul128(xs[a], ys[b]);
+            let k = a + b;
+            let s1 = pp[k] +% pr[1];
+            let c1 = @as(u64, s1 < pp[k]);
+            let s2 = s1 +% carry;
+            let c2 = @as(u64, s2 < s1);
+            pp[k] = s2;
+            carry = (pr[0] + c1) + c2;
+        }
+        let mut k = a + 2;
+        while (carry != 0) and (k < 8) {
+            let s1 = pp[k] +% carry;
+            carry = @as(u64, s1 < pp[k]);
+            pp[k] = s1;
+            k += 1;
+        }
+    }
+    let mut zz: [8]u64 = [zv.sl, zv.sh, 0, 0, 0, 0, 0, 0];
+    let ep = (xv.e + yv.e) - 254;  // the product's unit
+    let ez = zv.e - 127;
+    let tp = ep + msb8(&pp);  // the exponents of the leading bits
+    let tz = ez + 127;
+    let tmax = @max(tp, tz);
+    // the leading bit of the larger at bit 500 of the window, unit 2^(tmax - 500)
+    let sp = shift8(&mut pp, (500 - (tmax - tp)) - msb8(&pp));
+    let sz = shift8(&mut zz, (500 - (tmax - tz)) - 127);
+    let pneg = xv.neg != yv.neg;
+    let mut neg = pneg;
+    let mut sticky = sp or sz;
+    let one: [8]u64 = [1, 0, 0, 0, 0, 0, 0, 0];
+    if pneg == zv.neg {
+        add8(&mut pp, &zz);
+        if sp or sz {
+            sticky = true;
+        }
+    } else {
+        // the difference: the smaller operand's bits shifted out stand for a
+        // little more than its kept part, so it counts one unit more and the
+        // result a little more than that (sticky)
+        if lt8(&pp, &zz) {
+            if sp {
+                add8(&mut pp, &one);
+            }
+            sub8(&mut zz, &pp);
+            for i in @as(usize, 0)..8 {
+                pp[i] = zz[i];
+            }
+            neg = zv.neg;
+        } else {
+            if sz {
+                add8(&mut zz, &one);
+            }
+            sub8(&mut pp, &zz);
+        }
+    }
+    let tb = msb8(&pp);
+    if tb < 0 {
+        ld.from_f64(r, 0, f);  // an exact zero: +0 (to nearest)
+        return;
+    }
+    // the top 128 bits, the rest sticky
+    let mut hi: u64 = 0;
+    let mut lo: u64 = 0;
+    for k in @as(i32, 0)..128 {
+        let bt = bit8(&pp, (tb - 127) + k);
+        if k < 64 {
+            lo = lo | (bt << @bit_cast(u32, k));
+        } else {
+            hi = hi | (bt << @bit_cast(u32, k - 64));
+        }
+    }
+    let mut k2: i32 = 0;
+    while k2 < (tb - 127) {
+        if bit8(&pp, k2) != 0 {
+            sticky = true;
+            break;
+        }
+        k2 += 1;
+    }
+    let et = (tb + tmax) - 500;  // the exponent of the exact result's leading bit
+    ld.from_parts(r, neg, et, hi, lo, sticky, f);
+    let rv = decode(r, f);
+    if rv.cls == C_INF {
+        __axc_math_err(m.ERANGE, m.FE_OVERFLOW | m.FE_INEXACT);
+        return;
+    }
+    if et < -16382 {
+        // tiny: an underflow if the rounding was inexact (the bits below
+        // those a subnormal of that exponent keeps)
+        let mut p: i32 = 113;
+        if f == ld.FMT_X {
+            p = 64;
+        }
+        let kept = p - (-16382 - et);
+        let mut inexact = sticky;
+        for k in @as(i32, 0)..128 {
+            if k >= (128 - kept) {
+                break;
+            }
+            let mut bt = (lo >> @bit_cast(u32, k & 63)) & 1;
+            if k >= 64 {
+                bt = (hi >> @bit_cast(u32, k - 64)) & 1;
+            }
+            if bt != 0 {
+                inexact = true;
+            }
+        }
+        if inexact {
+            __axc_math_err(m.ERANGE, m.FE_UNDERFLOW | m.FE_INEXACT);
+        }
+    }
+}

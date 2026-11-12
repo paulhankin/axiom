@@ -32,8 +32,6 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
 
 - **The library is the compiler's, as far as it goes.** The headers and functions of
   "The C library" (below) are linked into every program that uses them, on every target.
-  There is no `<math.h>` or `<fenv.h>` yet: `#include <math.h>` is the
-  error `C1081`.
 - **Other undefined functions are the platform's.** A function a program declares and
   that neither it nor the library defines is looked up outside the program:
   - On Linux, by the linker, in the system's C library: such a program is linked by the
@@ -240,7 +238,8 @@ unit of 200 functions, say) adds nothing to a program that calls none of its fun
 and the size of one that calls one function is that of the program with that function
 alone. An object (`--emit=obj`) and a program that the system's linker links (with
 `--link=` inputs or `-l` libraries, whose code may refer to anything) keep every
-definition.
+definition of the program's own units; the C library's units ("The C library") are
+stripped there too, and the other code has the system's C library.
 
 ### Start-up and exit
 
@@ -289,9 +288,8 @@ parts, each with its sources and its private header:
 | strings | `<string.h>` (C23's freestanding functions) | `std/c/lib/string/` |
 | standard input/output | `<stdio.h>`, `<wchar.h>`'s input/output | `std/c/lib/stdio/`, `std/c/rt/stdio.ax` |
 | text | `<locale.h>`, `<wchar.h>`, `<wctype.h>`, `<uchar.h>`, `<time.h>`, `<inttypes.h>`, `<stdlib.h>`'s multibyte functions | `std/c/lib/text/`, `std/c/rt/text*.ax`, `axc/text.h`, `axc/locale.h` ([`docs/c-text.md`](c-text.md)) |
+| mathematics | `<math.h>`, `<fenv.h>`, `<tgmath.h>`, `<complex.h>`'s functions | `std/c/lib/math/`, `std/c/rt/math*.ax` (below) |
 | threads | `<threads.h>`, and C23's `call_once` of `<stdlib.h>` | `std/c/lib/threads/`, `std/c/rt/threads.ax`, `std/c/rt/threads_spawn.ax` (`threads_spawn_none.ax`), `axc/threads_impl.h`, `axc/once.h` ("Threads", below) |
-
-There is no `<math.h>` or `<fenv.h>` yet.
 
 ### How the library is linked
 
@@ -337,8 +335,8 @@ There is no `<math.h>` or `<fenv.h>` yet.
   `tmpfile`'s files; the constructors run before `main` (lowest priority first), also
   in a program whose `main` is Axiom's, where the destructors run when it returns.
 
-Under Linux a program that still calls a function of the system's C library (one of the
-headers this library does not have yet: `<math.h>`, such as `sin`) is linked with it, as before,
+Under Linux a program that still calls a function of the system's C library (one this
+library does not have, such as POSIX's `fork`) is linked with it, as before,
 and the library's functions (`exit`, `qsort`, ...) are the ones the program uses. Its
 `malloc` and the others of `<stdlib.h>`'s memory management then use the system
 library's heap (`__libc_malloc` and its kin), as they always do on macOS
@@ -349,7 +347,7 @@ against its headers) uses the system library's streams, and the program's code t
 library's, under the same names (`printf`, `fopen`, ...): such a program should be built
 with `--c-freestanding` if both write. On
 Windows nothing the library defines comes from `msvcrt.dll`; the rest still does by
-name (the functions of `<math.h>`). On macOS the runtime reaches
+name. On macOS the runtime reaches
 `libSystem`'s `exit`, `getenv`, `raise`, `malloc`, `calloc` and `free` under names of
 its own (`__axiom_libc_...`, which the linker binds to those), so that they are never
 the program's.
@@ -485,6 +483,114 @@ with `signal` stays set while it runs, and its signal waits until it returns
 `abort` raises `SIGABRT`; if that returns (a handler returned, or the signal is
 ignored), it sets the default action and raises it again, and ends the process with
 status 3 if it still lives.
+
+## `<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions
+
+The library's mathematics (C17 7.12, 7.6, 7.25, 7.3.5-7.3.9, and the C23 functions listed
+below) are its own: written from the standard and the published methods each source file
+cites, with polynomial coefficients and tables computed by
+`cmd/internal/tools/gen_math_tables.py` (in arbitrary precision; `std/c/rt/math_tables.ax`).
+The double and float functions are Axiom (`std/c/rt/math*.ax`); those that take or return
+`int` or `long`, the `long double` forms, `<fenv.h>` and the complex functions are C
+(`std/c/lib/math/`).
+
+- **Accuracy.** `sqrt`, `fma`, the rounding functions, `fmod`, `remainder`, `remquo`,
+  `ldexp`/`scalbn`, `frexp`, `nextafter` and the other exact ones are exact or correctly
+  rounded, in every rounding mode. The elementary functions are within 1 ulp over their
+  whole domains (the table below). Trigonometric arguments are reduced
+  exactly (Payne and Hanek's method beyond 2^20 pi/2), so `sin(1e300)` is accurate. The
+  float functions compute in double (`expf`, `logf`, `powf`, `sinf` and `cosf` with
+  kernels of their own, to about 2^-36) and round once (within 0.5 + 2^-12 ulp). Errors
+  are measured against mpmath on a million random and boundary arguments per function.
+- **Speed.** Where an estimate in plain double has a bound on its error that decides the
+  rounding, the double-double form is not computed (Ziv's strategy: `atan`, `atan2`,
+  `log2`, `log1p`); `tan` divides once from a table of tan(j/256), `cosh` adds two
+  exponentials' parts, the float kernels are short polynomials. Against the x86-64 Linux
+  system C library (`-O2`, one core, the time of a call on a stream of
+  arguments): `exp`, `expm1`, `sinh` and `tanh` are faster; `sin`, `cos`, `tan`,
+  `atan`, `atan2`, `log1p`, `log10`, `cosh`, `cbrt`, `pow`, `expf`, `logf` and `powf`
+  take up to 2 times as long; `log`, `log2`, `asin`, `acos` and `sinf` 2 to 2.6 times.
+- **The complex functions** follow Annex G's special values (G.6) and Kahan's methods;
+  each part is within a few ulps (measured: `clog` 0.5; `cexp`, `csqrt`, `csin`, `ccos`,
+  `csinh`, `ccosh` 1.9; `casin`, `cacos`, `catan`, `casinh`, `cacosh`, `catanh` 3.8; `ctan`,
+  `ctanh` 5.1), not correctly rounded. `cpow` is `cexp(w clog z)`, whose error grows with
+  the size of the result's exponent.
+- **`long double`** where it is `double` (Windows, macOS; and with `--c-long-double=64`) has
+  the double functions. Where it is wider (the 80-bit x87 format on x86-64 Linux, binary128
+  on AArch64 Linux and WebAssembly), the exact `l` functions (`fabsl`, `copysignl`, the
+  rounding functions, `fmodl`, `remainderl`, `remquol`, `frexpl`, `ldexpl`, `scalbnl`,
+  `ilogbl`, `logbl`, `modfl`, `nextafterl`, `nexttowardl`, `nextupl`, `nextdownl`, `fmaxl`,
+  `fminl`, `fdiml`, the `fmaximum` family) work on the format's bits and are exact, `sqrtl`
+  is correctly rounded (`std/c/lib/math/m_ldwide.c`), and so is `fmal` (exact in 512-bit
+  integers). The elementary ones (`expl`, `exp2l`, `exp10l`, `expm1l`, `logl`, `log2l`,
+  `log10l`, `log1pl`, `sinl`, `cosl`, `tanl`, `asinl`, `acosl`, `atanl`, `atan2l`,
+  `sinhl`, `coshl`, `tanhl`, `asinhl`, `acoshl`, `atanhl`, `powl`, `hypotl`, `cbrtl`)
+  compute in triple-double arithmetic (about 150 bits: binary128 needs more than a
+  double-double's 106; the x87's 64 would not, but one implementation serves both),
+  from the format's bits taken apart exactly, with tables of triple-doubles and an exact
+  reduction of the trigonometric arguments over the whole exponent range, and round once
+  (`std/c/rt/math_ld.ax`): within 0.5 + 2^-6 ulp of binary128, 0.5 + 2^-55 of the x87's
+  (measured: 0.500 for each, both formats). They take about 1 to 2 us a call (x86-64,
+  x87 format; the software arithmetic of the format is part of a call's cost), 10 to 80
+  times the x87 hardware's functions of the system library (`powl` and `fmal` about the
+  same). The complex `l` functions are the double ones' methods on these (each part within
+  3.3 ulps of the format, measured); `erfl`, `erfcl`, `lgammal`, `tgammal`, `sinpil` and
+  `cospil` compute in double.
+- **Errors** (7.12.1): `math_errhandling` is `MATH_ERRNO | MATH_ERREXCEPT` on x86-64 and
+  AArch64 and `MATH_ERRNO` on WebAssembly. A domain error sets `errno` to `EDOM` and raises
+  "invalid"; a pole error `ERANGE` and "divide-by-zero"; an overflow `ERANGE` and
+  "overflow"; an underflow (a result that is subnormal or zero and inexact) `ERANGE` and
+  "underflow". `lrint`, `lround` and the like with a result outside their type raise
+  "invalid", set `EDOM` and return the type's minimum.
+- **Classification and comparison macros** are builtins (`__builtin_axiom_isnan`, ...):
+  each operand is evaluated once, the classification is done on the bits, the comparisons
+  are quiet (no exception for a quiet NaN), and they are constant expressions for constant
+  operands. `<tgmath.h>` works in C99 as in later standards (`__builtin_axiom_tg`).
+- **`nan("n-char-sequence")`** reads the sequence as an unsigned integer (decimal, `0x`
+  hexadecimal or `0` octal) and puts its low bits (51, or 22 for `nanf`) in the payload;
+  any other sequence gives the payload 0.
+- **C23 functions** provided: `exp10`, `roundeven`, `nextup`, `nextdown`, `sinpi`, `cospi`,
+  `fmaximum`, `fminimum`, `fmaximum_mag`, `fminimum_mag`, `fmaximum_num`, `fminimum_num`,
+  `fmaximum_mag_num`, `fminimum_mag_num` (each in three types); `issubnormal`, `iszero`,
+  `issignaling`, `iscanonical`; `<fenv.h>`'s `fegetmode`, `fesetmode`, `fesetexcept`,
+  `fetestexceptflag`. Not provided (and not declared): the other C23 additions (`exp2m1`,
+  `log2p1`, `rootn`, `pown`, `compoundn`, `fromfp`, the narrowing `fadd`... functions,
+  `getpayload`, `totalorder`, `iseqsig`, ...).
+
+| Largest error measured (ulps) | |
+|---|---|
+| `log`, `log2`, `log10`, `log1p`, `cbrt`, `atan`, `atan2`, `tan`, `asinh`, `acosh`, `atanh` | 0.501 |
+| `exp`, `exp2`, `exp10`, `pow`, `cosh`, `sinh`, `tanh` | 0.51 |
+| `tgamma`, `hypot`, `erfc`, `acos`, `asin`, `expm1` | 0.52-0.56 (`cosh` is bounded by 0.57) |
+| `cos`, `sin` | 0.58 |
+| `erf` | 0.62 (0.54 for normal results) |
+| `lgamma` | 0.73 |
+| every float function | 0.501 |
+
+The results are the same bits on every target (the error-free transformations the
+functions use give the same bits with and without fused multiply-add).
+
+### The floating-point environment
+
+On x86-64 `<fenv.h>` reads and writes MXCSR, on AArch64 FPCR and FPSR (the compiler's
+builtins `__builtin_axiom_fenv_get` and `__builtin_axiom_fenv_set`, the backends' `stmxcsr`,
+`ldmxcsr`, `mrs` and `msr`): all four rounding modes and the five exception flags. Exceptions
+are never trapped. WebAssembly has no floating-point environment: rounding is to nearest,
+`fesetround` fails for the other modes, no flag is ever set (`fetestexcept` is 0) and
+`feraiseexcept` fails for a nonzero argument; the macros are defined all the same.
+
+What the compiler assumes: **the default environment.** `#pragma STDC FENV_ACCESS` is
+accepted and has no effect. The optimizer folds floating-point constant expressions as
+rounding to nearest with no flags raised (a folded `1.0 / 0.0` raises nothing at run
+time), and treats floating-point arithmetic as having no side effects: it may evaluate
+an operation whose result is not used never, move an operation across a call of a
+`<fenv.h>` function, or compute an expression once for two rounding modes. A program
+that changes the rounding mode or tests flags gets what it expects for operations on
+values the compiler cannot see (read through `volatile` objects or from outside) at
+`-O0`, and should not rely on the order of operations around the `<fenv.h>` calls at
+`-O2`. The library's functions raise their exceptions through the environment itself,
+not by arithmetic the optimizer could fold, and honor the rounding mode where the
+standard asks (`rint`, `lrint`, `nearbyint`, `sqrt`, `fma`, `scalbn` round in it).
 
 ## Standards
 
@@ -624,7 +730,7 @@ format than the ABI's cannot pass `long double` values to it.
 | Right shift of a negative value | Arithmetic (sign-extending): `-8 >> 1` is `-4`. |
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
 | Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. There are no imaginary types. |
-| Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest); the rounding mode cannot be changed. A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals; constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
+| Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest): it is the start-up's mode, which `fesetround` changes on x86-64 and AArch64 (`<fenv.h>`, below; `FLT_ROUNDS` itself stays 1). A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals; constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
 | `max_align_t` | Aligned as the platform's (above): a structure of a `long long` and a `long double` aligned to 16 (size 32 where `long double` is 16 bytes), or `long double` (8 bytes). |
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |
@@ -668,7 +774,10 @@ library's are `C1081`.
 | `<iso646.h>` | C95 and later | |
 | `<stdbool.h>` | C99 and later | In C23, `bool`, `true` and `false` are keywords and the header only defines `__bool_true_false_are_defined`. |
 | `<stdint.h>` | C99 and later | No `int32_t` family when no type is 32 bits wide. |
-| `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are a library's, which is not provided. No `imaginary` or `_Imaginary_I`. |
+| `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are the library's ("`<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions"). No `imaginary` or `_Imaginary_I`. |
+| `<math.h>` | all | C89's double functions; from C99 everything of C17 7.12, in the three types, and C23's listed below. |
+| `<fenv.h>` | C99 and later | All of C17 7.6; C23's `fegetmode`, `fesetmode`, `fesetexcept`, `fetestexceptflag`. |
+| `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. |
 | `<stdalign.h>` | C11 and later | |
 | `<stdatomic.h>` | C11 and later | All of 7.17 (see "Atomics and threads"). `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
 | `<stdnoreturn.h>` | C11 and later | |
@@ -697,8 +806,9 @@ as the standard says.
 
 - `_Imaginary` (the imaginary types, which are optional), decimal floating types and
   constants: each is `C3901` (a decimal constant is `C1019`).
-- `<math.h>` and `<fenv.h>`, and Annex F (exception flags and rounding modes). Annex K is
-  not provided (`__STDC_LIB_EXT1__` is not defined).
+- Annex F, which the library's `<math.h>` and `<fenv.h>` do not claim (they follow it
+  where the section on them says). Annex K is not provided (`__STDC_LIB_EXT1__` is not
+  defined).
 - `setjmp` on WebAssembly (`C3300`).
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
@@ -933,7 +1043,7 @@ is the warning C4112 and is ignored; an unknown one is ignored (the warning C411
 | `weak name`, `weak name = target` | As the attribute weak (and alias), if the unit declares name. |
 | `message("text")` | The warning C4110 with the text. |
 | `STDC FP_CONTRACT ON/OFF/DEFAULT` | Accepted: no floating operations are contracted (an FMA is only the `fma` the program calls), so both hold. |
-| `STDC FENV_ACCESS ON/OFF/DEFAULT` | OFF holds; ON is the warning C4113: the floating-point environment cannot be changed or tested, and the optimizer assumes the default one. |
+| `STDC FENV_ACCESS ON/OFF/DEFAULT` | OFF holds; ON is the warning C4113: the optimizer assumes the default floating-point environment (`<fenv.h>` changes and tests it at run time: see "The floating-point environment"). |
 | `STDC CX_LIMITED_RANGE ON/OFF/DEFAULT` | Accepted (it allows, and asks for nothing). |
 | `STDC FENV_ROUND dir` (C23) | FE_TONEAREST and FE_DYNAMIC hold; the other directions are C4113. |
 | `GCC diagnostic push`, `pop`, `ignored "-Wx"`, `warning "-Wx"`, `error "-Wx"` | The warnings after it (in its file, and in the files it includes) that -Wx names are not shown, shown, or errors (keeping their codes). -Wx is one of the compiler's codes (`"C4050"`), `-Wall`, `-Wextra` and `-Wpedantic` (every warning), or a usual name that stands for one: `-Wdeprecated-declarations` and `-Wdeprecated` (C4050), `-Wunused-result` and `-Wunused-value` (C4051), `-Wattributes` (C4052), `-Winvalid-noreturn` (C4053), `-Wimplicit-function-declaration` (C4001), `-Wunused-label` (C4040), `-Wvarargs` (C4080), `-Wmultichar` (C4102), `-Wcpp` (C4103), `-Wunknown-pragmas` (C4111), `-Wpragmas` (C4112), `-Wnonnull` (C4121), `-Wswitch-outside-range` (C4120), `-Wattribute-warning` (C4123); others are ignored. An error is never made a warning. |
@@ -959,7 +1069,11 @@ Programs should not use them.
 | `__builtin_ckd_add`, `__builtin_ckd_sub`, `__builtin_ckd_mul` | `<stdckdint.h>`. |
 | `__builtin_atomic_...` | The generic functions of `<stdatomic.h>`. |
 | `__axiom_atomic_lock`, `__axiom_atomic_unlock`, `__axiom_atomic_locks` | The lock of atomic objects that are not lock-free. |
-| `__builtin_inff`, `__builtin_nanf` | `<float.h>`. |
+| `__builtin_inff`, `__builtin_nanf` | `<float.h>` (`NAN` is a positive quiet NaN). |
+| `__builtin_axiom_fpclassify`, `__builtin_axiom_isnan`, ..., `__builtin_axiom_isgreater`, ... | `<math.h>`'s classification and comparison macros. |
+| `__builtin_axiom_tg(n, f, d, l, cf, cd, cl, args...)` | `<tgmath.h>`: the function of the six (0 for none) that the types of the first n arguments choose (C17 7.25p3), called with the arguments. |
+| `__builtin_axiom_fenv_kind()`, `__builtin_axiom_fenv_get()`, `__builtin_axiom_fenv_set(v)` | `<fenv.h>`: the target's floating-point environment (0 none, 1 MXCSR, 2 FPCR and FPSR), its registers read and written. |
+| `__axc_...` | The C library's internal functions and objects. |
 | `__builtin_complex`, `__builtin_creal`, `__builtin_cimag`, `__builtin_conj` | `<complex.h>`: `__builtin_complex(x, y)` is `x + iy` for `x` and `y` of one real floating type. |
 | `__axiom_cmul_f32`, `__axiom_cdiv_f64`, ... | The compiler's own functions for complex multiplication and division (internal to the program). |
 | `__axiom_int64` | A keyword for a 64-bit integer type (`unsigned __axiom_int64` too) in every mode, for `size_t` in headers before C99 and for programs that need one in C89. |
@@ -1302,11 +1416,14 @@ complete a stack trace is after a crash.
 These are the places where the implementation does not follow the standard it claims, or
 claims less than the standard allows. None is hidden: each is said above or here.
 
-- The implementation is hosted (`__STDC_HOSTED__` is 1) without `<math.h>` and `<fenv.h>`:
-  see "Not supported".
 - Annex F is not claimed. The floating types have IEC 60559 formats (`FLT_IS_IEC_60559`
-  in `<float.h>`), but there are no exception flags or rounding modes; signaling NaNs are
-  not guaranteed to stay signaling, so `<float.h>` has no `FLT_SNAN`.
+  in `<float.h>`), and `<fenv.h>` has the rounding modes and exception flags on x86-64 and
+  AArch64, but the optimizer assumes the default environment (`FENV_ACCESS` is not
+  honoured), WebAssembly has no environment, and the relational operators are quiet (a
+  quiet NaN operand of `<` raises nothing); signaling NaNs are not guaranteed to stay
+  signaling, so `<float.h>` has no `FLT_SNAN`.
+- `erfl`, `erfcl`, `lgammal`, `tgammal`, `sinpil` and `cospil`, where `long double` is
+  wider than `double`, compute in `double`: their results have `double`'s precision.
 - Annex G is not claimed (`__STDC_IEC_559_COMPLEX__` is not defined): it needs Annex F,
   and before C23 the imaginary types, which are absent. Complex arithmetic follows it
   all the same where it can: a real operand of `+ - * /` with a complex one is not made

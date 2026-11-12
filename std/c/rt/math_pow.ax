@@ -1,0 +1,224 @@
+// =============================================================================
+// std/c/rt/math_pow.ax - pow, sqrt, cbrt and hypot of the C library
+// (7.12.7, F.10.4).
+//
+// pow(x, y) = e^(y log|x|) with the logarithm as a double-double to about
+// 2^-75 (math_log.ax: log_dd), y log|x| as a double-double (Dekker's exact
+// product), and the exponential of that sum (math_exp.ax): the error before
+// the last rounding is far below an ulp (about 2^-62 relative), so the
+// result is within 0.51 ulp, and exact results (pow(9, 0.5), pow(2, 10))
+// come out exactly. The special cases are F.10.4.4's.
+// =============================================================================
+import "math.ax" as m;
+import "math_exp.ax" as ex;
+import "math_log.ax" as lg;
+
+/// Whether y (finite, nonzero) is an integer, and an odd one: 0 not an
+/// integer, 1 odd, 2 even. (From the bits, raising nothing.)
+fn int_kind(y: f64) i32 {
+    let e = m.exponent(y) - 1023;
+    if e < 0 {
+        return 0;
+    }
+    if e > 52 {
+        return 2;
+    }
+    let b = m.bits(y);
+    let frac = @as(u32, @bit_cast(u32, 52 - e));
+    if (frac > 0) and ((b & ((@as(u64, 1) << frac) - 1)) != 0) {
+        return 0;
+    }
+    if ((b >> frac) & 1) != 0 {
+        return 1;
+    }
+    return 2;
+}
+
+/// x^y.
+export fn pow(x: f64, y: f64) f64 @multiversion("fma") {
+    let ix = m.bits(x);
+    let iy = m.bits(y);
+    let ay = iy & 0x7fffffffffffffff;
+    if ((ix -% 0x0010000000000000) < 0x7fe0000000000000) and ((ay -% 0x3c00000000000000) < 0x0790000000000000) and
+       (ix != 0x3ff0000000000000) and (iy != 0x4000000000000000) {
+        // the usual case: x positive, normal and not 1, 2^-63 <= |y| < 2^58
+        // (so that y log x is not a NaN or the product's operands huge), y
+        // not 2
+        return pow_pos(x, y, false);
+    }
+    let ax = ix & 0x7fffffffffffffff;
+    if ay == 0 {
+        return 1.0;  // pow(x, +-0) = 1, even for a NaN x
+    }
+    if ix == 0x3ff0000000000000 {
+        return 1.0;  // pow(+1, y) = 1, even for a NaN y
+    }
+    if (ax > 0x7ff0000000000000) or (ay > 0x7ff0000000000000) {
+        return x + y;  // NaN
+    }
+    let neg_x = (ix >> 63) != 0;
+    let neg_y = (iy >> 63) != 0;
+    if ay == 0x7ff0000000000000 {
+        // y = +-inf
+        if ax == 0x3ff0000000000000 {
+            return 1.0;  // pow(-1, +-inf)
+        }
+        if (ax < 0x3ff0000000000000) == neg_y {
+            if ax == 0 {
+                return m.pole(false);  // pow(+-0, -inf) = +inf (a pole error)
+            }
+            return m.inf();  // |x| < 1, y = -inf; |x| > 1, y = +inf
+        }
+        return 0.0;
+    }
+    let kind = int_kind(y);
+    if ax == 0 {
+        // pow(+-0, y): +-0 or +-inf for an odd integer y, +0 or +inf else
+        let odd = (kind == 1) and neg_x;
+        if neg_y {
+            return m.pole(odd);
+        }
+        if odd {
+            return -0.0;
+        }
+        return 0.0;
+    }
+    if ax == 0x7ff0000000000000 {
+        // pow(+-inf, y)
+        let odd = (kind == 1) and neg_x;
+        if neg_y {
+            if odd {
+                return -0.0;
+            }
+            return 0.0;
+        }
+        if odd {
+            return -m.inf();
+        }
+        return m.inf();
+    }
+    let mut neg_r = false;
+    if neg_x {
+        if kind == 0 {
+            return m.domain();  // a negative x and a non-integer y
+        }
+        neg_r = kind == 1;
+    }
+    if (ay == 0x3ff0000000000000) and not neg_y {
+        return x;  // y = 1
+    }
+    if iy == 0x4000000000000000 {
+        // y = 2: one rounding, the same as the general case's
+        return m.check_tiny(m.check_huge(x * x));
+    }
+    return pow_pos(m.from_bits(ax), y, neg_r);
+}
+
+/// |x|^y (negated if neg_r) for finite nonzero x and y: e^(y log x), y log x
+/// as a double-double from log x's.
+inline fn pow_pos(x: f64, y: f64, neg_r: bool) f64 {
+    let l = lg.log_dd_k(x);
+    // a first estimate of y log|x| decides overflow and underflow, and
+    // keeps the exact product's operands in range
+    let e = y * l.hi;
+    if e > 710.0 {
+        return m.overflow(neg_r);
+    }
+    if e < -746.0 {
+        return m.underflow(neg_r);
+    }
+    let p = m.two_prod(y, l.hi);
+    let r = ex.exp_dd_k(p.hi, p.lo + (y * l.lo));
+    if neg_r {
+        return -r;
+    }
+    return r;
+}
+
+/// The square root (the hardware's, correctly rounded).
+export fn sqrt(x: f64) f64 {
+    if x < 0.0 {
+        return m.domain();
+    }
+    return @sqrt(x);
+}
+
+/// The cube root: Newton's iteration in double from an estimate made from
+/// the exponent's bits, then one step with the residual x - y^3 in
+/// double-double, which leaves an error far below an ulp.
+export fn cbrt(x: f64) f64 @multiversion("fma") {
+    let ix = m.bits(x);
+    let ax = ix & 0x7fffffffffffffff;
+    if (ax >= 0x7ff0000000000000) or (ax == 0) {
+        return x + x;  // +-0, +-inf, NaN
+    }
+    // |x| = 2^(3k) a, a in [1, 8)
+    let mut a = m.from_bits(ax);
+    let mut e = m.exponent(a);
+    if e == 0 {
+        a = a * 18014398509481984.0;  // 2^54
+        e = m.exponent(a) - 54;
+    }
+    let ub = e - 1023;
+    // k = floor(ub / 3)
+    let mut k = ub / 3;
+    if (ub - (3 * k)) < 0 {
+        k -= 1;
+    }
+    let mm = m.from_bits((m.bits(a) & 0x000fffffffffffff) | (@as(u64, @bit_cast(u32, 1023 + (ub - (3 * k)))) << 52));
+    // an estimate within 6 percent (the bits of mm divided by 3, which
+    // divides the exponent by 3, plus two thirds of the exponent bias), then
+    // Newton's steps, each squaring the relative error: 6e-2, 4e-3, 1e-5,
+    // 2e-10, 3e-20
+    let mut y = m.from_bits((m.bits(mm) / 3) + 0x2aa0000000000000);
+    for i in @as(i32, 0)..4 {
+        y = y - (((y * y) * y) - mm) / ((3.0 * y) * y);
+    }
+    // y + (mm - y^3) / (3 y^2), the residual exact
+    let y2 = m.two_sqr(y);
+    let y3 = m.dd_mul_d(y2, y);
+    let res = (mm - y3.hi) - y3.lo;
+    let r = y + (res / ((3.0 * y) * y));
+    let s = m.from_bits(m.bits(r) +% (@bit_cast(u64, @as(i64, k)) << 52));
+    if (ix >> 63) != 0 {
+        return -s;
+    }
+    return s;
+}
+
+/// sqrt(x^2 + y^2) without undue overflow or underflow: the sum of the
+/// squares as a double-double, its square root corrected by the residual.
+export fn hypot(x: f64, y: f64) f64 @multiversion("fma") {
+    let bx = m.abits(x);
+    let by = m.abits(y);
+    if (bx == 0x7ff0000000000000) or (by == 0x7ff0000000000000) {
+        return m.inf();  // even with a NaN (F.10.4.3)
+    }
+    if (bx > 0x7ff0000000000000) or (by > 0x7ff0000000000000) {
+        return x + y;
+    }
+    let mut a = m.from_bits(@max(bx, by));
+    let mut b = m.from_bits(@min(bx, by));
+    if (b == 0.0) or ((m.exponent(a) - m.exponent(b)) > 60) {
+        return a + b;  // b^2 is below half an ulp of a^2
+    }
+    let mut scale: f64 = 1.0;
+    if a > 1.0e150 {
+        a = a * m.pow2(-600);
+        b = b * m.pow2(-600);
+        scale = m.pow2(600);
+    } else if a < 1.0e-150 {
+        a = a * m.pow2(600);
+        b = b * m.pow2(600);
+        scale = m.pow2(-600);
+    }
+    let s = m.dd_add(m.two_sqr(a), m.two_sqr(b));
+    let h = @sqrt(s.hi);
+    let hh = m.two_sqr(h);
+    let res = ((s.hi - hh.hi) - hh.lo) + s.lo;
+    let r = (h + (res / (2.0 * h))) * scale;
+    if scale > 1.0 {
+        return m.check_huge(r);
+    }
+    return r;
+}

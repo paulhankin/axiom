@@ -3,7 +3,7 @@
 - C programs are hosted: `__STDC_HOSTED__` is 1 and the compiler's own C library is
   linked, on every target, from no DLL on Windows; `--c-freestanding` gives the
   freestanding implementation, with only the freestanding headers. The library has
-  every header of C17 and C23 but `<math.h>`, `<fenv.h>` and `<threads.h>`:
+  every header of C17 and C23:
   - its core: `<assert.h>`, `<ctype.h>`, `<errno.h>` (`errno` is each thread's),
     `<setjmp.h>` (not on WebAssembly), `<signal.h>`, `<stdlib.h>` (correctly rounded
     `strtod`, `strtof` and `strtold` in every `long double` format, decimal and

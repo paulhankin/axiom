@@ -1,0 +1,225 @@
+// =============================================================================
+// std/c/rt/math_exp.ax - exp, exp2, expm1 and exp10 (C23) of the C library
+// (7.12.6.1-3, F.10.3.1-3), and the exponential kernels the other functions
+// use (pow, the hyperbolic functions).
+//
+// The method is P. T. P. Tang's, "Table-driven implementation of the
+// exponential function in IEEE floating-point arithmetic", ACM TOMS 15
+// (1989): x = (128 k + j) ln2/128 + r with |r| <= ln2/256 (ln2/128 in a
+// directed rounding mode), e^x = 2^k 2^(j/128) e^r, the 128 values 2^(j/128)
+// as double-doubles and e^r - 1 a minimax polynomial (math_tables.ax). The
+// reduction is exact: ln2/128 is split so that n times its head is exact.
+// The result is 2^k (t_hi + (t_lo + t_hi p)), rounded once (twice when it is
+// subnormal); measured within 0.51 ulp.
+// =============================================================================
+import "math.ax" as m;
+import "math_tables.ax" as t;
+
+// 1.5 * 2^52: adding it rounds to an integer (in the current rounding mode)
+const SHIFT: f64 = 6755399441055744.0;
+
+// e^x overflows above OVF_X (the double below ln(DBL_MAX)'s successor) and
+// underflows to 0 below UNF_X (where e^x < 2^-1075)
+const OVF_X: f64 = 709.782712893384;
+const UNF_X: f64 = -745.1332191019412;
+
+/// e^(hi + lo) before its last rounding: 2^k (s + e), s = 2^(j/128) (k and j
+/// from hi + lo), |e| < 0.01 s.
+pub struct Parts {
+    k: i32,
+    s: f64,
+    e: f64,
+}
+
+/// e^(x + xl) as Parts, for |x| < 1100 and |xl| <= ulp(x).
+pub inline fn parts(x: f64, xl: f64) Parts {
+    let kd0 = (x * t.EXP_INVLN2N) + SHIFT;
+    let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
+    let kd = kd0 - SHIFT;
+    // exact: kd EXP_LN2N_HI has at most 53 bits, and x is near it
+    let r = ((x - (kd * t.EXP_LN2N_HI)) - (kd * t.EXP_LN2N_LO)) + xl;
+    let j = @as(usize, @bit_cast(u32, n & 127)) * 2;
+    let th = m.from_bits(t.EXP_T[j]);
+    let tl = m.from_bits(t.EXP_T[j + 1]);
+    let z = r * r;
+    let p = r + (z * ((t.EXP_P0 + (r * t.EXP_P1)) + (z * (t.EXP_P2 + (r * t.EXP_P3)))));
+    return Parts.{ k: n >> 7, s: th, e: tl + (th * p) };
+}
+
+/// (s + e) 2^k rounded once (s in [0.5, 2.1), |e| < 0.01 s): with the bits
+/// of the exponent when the result is normal; past the largest exponent in
+/// two steps, the second of which overflows if the result does; and a
+/// subnormal result as 2^-1022 times the rounding of 1 + (s + e) 2^(k+1022),
+/// whose ulp is that of the subnormals ("underflow" raised when it is not
+/// exact).
+pub inline fn scale(s: f64, e: f64, k: i32) f64 {
+    if (k >= -1020) and (k <= 1021) {
+        return m.from_bits(m.bits(s + e) +% (@bit_cast(u64, @as(i64, k)) << 52));
+    }
+    return scale_far(s, e, k);
+}
+
+/// scale beyond the normal exponents.
+fn scale_far(s: f64, e: f64, k: i32) f64 {
+    if k > 0 {
+        return m.check_huge(((s + e) * m.pow2(1000)) * m.pow2(k - 1000));
+    }
+    let sc = m.pow2(@max(k + 1022, -1000));
+    let wh = s * sc;
+    let wl = e * sc;
+    if (wh + wl) >= 1.0 {
+        return ((s + e) * sc) * m.pow2(-1022);  // normal
+    }
+    let a = m.two_sum(1.0, wh);
+    let r = a.hi + (a.lo + wl);
+    if (a.lo + wl) != 0.0 {
+        m.raise_underflow();
+    }
+    return (r - 1.0) * m.pow2(-1022);
+}
+
+/// e^(x + xl) rounded, with the range errors of the result.
+pub fn exp_dd(x: f64, xl: f64) f64 {
+    return exp_dd_k(x, xl);
+}
+
+/// exp_dd, inline (pow): the scaling of a normal result inline too.
+pub inline fn exp_dd_k(x: f64, xl: f64) f64 {
+    if x > OVF_X {
+        return m.overflow(false);
+    }
+    if x < UNF_X {
+        return m.underflow(false);
+    }
+    let p = parts(x, xl);
+    return scale(p.s, p.e, p.k);
+}
+
+/// e^x.
+export fn exp(x: f64) f64 {
+    let ax = m.abits(x);
+    if ax >= 0x4086232bdd7abcd2 {
+        // |x| >= 708.39 (about): NaN, infinities, and the results near
+        // overflow and underflow
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if ax == 0x7ff0000000000000 {
+            if x > 0.0 {
+                return x;
+            }
+            return 0.0;
+        }
+        return exp_dd(x, 0.0);
+    }
+    if ax < 0x3c90000000000000 {
+        return 1.0 + x;  // |x| < 2^-54
+    }
+    let p = parts(x, 0.0);
+    return scale(p.s, p.e, p.k);
+}
+
+/// 2^x.
+export fn exp2(x: f64) f64 {
+    let ax = m.abits(x);
+    if ax >= 0x408ff00000000000 {
+        // |x| >= 1022
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if ax == 0x7ff0000000000000 {
+            if x > 0.0 {
+                return x;
+            }
+            return 0.0;
+        }
+        if x >= 1024.0 {
+            return m.overflow(false);
+        }
+        if x <= -1075.0 {
+            return m.underflow(false);
+        }
+    }
+    if ax < 0x3c90000000000000 {
+        return 1.0 + x;
+    }
+    // x = n/128 + u exactly, |u| <= 1/256
+    let kd0 = (x * 128.0) + SHIFT;
+    let n = @bit_cast(i32, @truncate(u32, m.bits(kd0)));
+    let kd = kd0 - SHIFT;
+    let u = x - (kd * 0.0078125);
+    let j = @as(usize, @bit_cast(u32, n & 127)) * 2;
+    let th = m.from_bits(t.EXP_T[j]);
+    let tl = m.from_bits(t.EXP_T[j + 1]);
+    let z = u * u;
+    let q = u *
+            (((t.EXP2_P0 + (u * t.EXP2_P1)) + (z * (t.EXP2_P2 + (u * t.EXP2_P3)))) +
+             ((z * z) * (t.EXP2_P4 + (u * t.EXP2_P5))));
+    return scale(th, tl + (th * q), n >> 7);
+}
+
+/// e^x - 1.
+export fn expm1(x: f64) f64 {
+    let ax = m.abits(x);
+    if ax >= 0x4043000000000000 {
+        // |x| >= 38
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if x < 0.0 {
+            return -1.0;  // (e^x < 2^-54)
+        }
+        if x > 700.0 {
+            return exp(x);  // (1 is far below an ulp; +inf too)
+        }
+    }
+    if ax <= 0x3fb0000000000000 {
+        // |x| <= 1/16
+        if ax < 0x3c90000000000000 {
+            return x;  // |x| < 2^-54
+        }
+        let z = x * x;
+        let w = z * z;
+        let q = ((t.EXPM1_P0 + (x * t.EXPM1_P1)) + (z * (t.EXPM1_P2 + (x * t.EXPM1_P3)))) +
+                (w * (((t.EXPM1_P4 + (x * t.EXPM1_P5)) + (z * (t.EXPM1_P6 + (x * t.EXPM1_P7)))) + (w * t.EXPM1_P8)));
+        return x + (z * q);
+    }
+    // e^x - 1 = (2^k s - 1) + 2^k e, the first part exact when 2^k s is near
+    // 1, and its error kept by two_sum otherwise
+    let p = parts(x, 0.0);
+    let sc = m.pow2(p.k);
+    let a = m.two_sum(sc * p.s, -1.0);
+    return a.hi + (a.lo + (sc * p.e));
+}
+
+/// 10^x (C23).
+export fn exp10(x: f64) f64 @multiversion("fma") {
+    let ax = m.abits(x);
+    if ax >= 0x4073000000000000 {
+        // |x| >= 304
+        if ax > 0x7ff0000000000000 {
+            return x + x;
+        }
+        if ax == 0x7ff0000000000000 {
+            if x > 0.0 {
+                return x;
+            }
+            return 0.0;
+        }
+        if x > 309.0 {
+            return m.overflow(false);
+        }
+        if x < -324.0 {
+            return m.underflow(false);
+        }
+    }
+    if ax < 0x3c70000000000000 {
+        return 1.0 + x;  // |x| < 2^-56
+    }
+    // x ln10 as a double-double
+    let p = m.two_prod(x, t.LN10_HI);
+    let e = exp_dd(p.hi, p.lo + (x * t.LN10_LO));
+    // exact powers of ten (10^0 .. 10^22) come out exactly: the error is far
+    // below half an ulp
+    return e;
+}

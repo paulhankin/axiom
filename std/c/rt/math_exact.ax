@@ -1,0 +1,854 @@
+// =============================================================================
+// std/c/rt/math_exact.ax - the C library's functions whose results are
+// exact or correctly rounded by construction (7.12.6-7.12.13, F.10.6-
+// F.10.10): rounding to integers, fmod, remainder and remquo, frexp, ldexp,
+// scalbn, logb, ilogb, modf, nextafter, fdim, fmax, fmin, copysign, fabs and
+// fma, with C23's roundeven, nextup, nextdown and the fmaximum family.
+//
+// fmod, remainder and remquo divide the significands as integers, 11 bits
+// of quotient per step, so the remainder is exact for every exponent
+// difference; fma uses the hardware's fused multiply-add where the
+// processor has it and otherwise computes x y + z exactly in 128-bit
+// integers and rounds once, in the current rounding mode. The functions
+// whose C forms take or return int or long are wrapped by C functions
+// (std/c/lib/math/), which call the __axc_ ones here with 64-bit integers.
+// =============================================================================
+import "math.ax" as m;
+
+const TWO52: f64 = 4503599627370496.0;
+
+// -----------------------------------------------------------------------------
+// Rounding to integers (7.12.9)
+// -----------------------------------------------------------------------------
+
+export fn ceil(x: f64) f64 {
+    return @ceil(x);
+}
+
+export fn floor(x: f64) f64 {
+    return @floor(x);
+}
+
+export fn trunc(x: f64) f64 {
+    return @trunc(x);
+}
+
+/// To the nearest integer, halfway cases away from zero.
+export fn round(x: f64) f64 {
+    if m.abits(x) >= 0x4330000000000000 {
+        return x;  // |x| >= 2^52 (integers), inf, NaN
+    }
+    let t = @trunc(x);
+    if @abs(x - t) >= 0.5 {
+        return t + @copysign(1.0, x);
+    }
+    return t;
+}
+
+/// To the nearest integer, halfway cases to even (C23).
+export fn roundeven(x: f64) f64 {
+    if m.abits(x) >= 0x4330000000000000 {
+        return x;
+    }
+    let t = @trunc(x);
+    let d = @abs(x - t);
+    if (d > 0.5) or ((d == 0.5) and (@rem(t, 2.0) != 0.0)) {
+        return t + @copysign(1.0, x);
+    }
+    return t;
+}
+
+/// To an integer in the current rounding mode: adding and subtracting 2^52
+/// rounds there (x + 2^52 has no fraction bits), the sign kept for zeros.
+export fn rint(x: f64) f64 {
+    if m.abits(x) >= 0x4330000000000000 {
+        return x;
+    }
+    let mut r: f64 = 0.0;
+    if x >= 0.0 {
+        r = (x + TWO52) - TWO52;
+    } else {
+        r = (x - TWO52) + TWO52;
+    }
+    return @copysign(r, x);
+}
+
+// -----------------------------------------------------------------------------
+// Remainders (7.12.10)
+// -----------------------------------------------------------------------------
+
+/// x as an integer significand and exponent: |x| = mant 2^(e - 1075), with
+/// the subnormals' exponent 1.
+struct Sig {
+    mant: u64,
+    e: i32,
+}
+
+inline fn sig(b: u64) Sig {
+    let e = @as(i32, @truncate(u16, b >> 52));
+    if e == 0 {
+        return Sig.{ mant: b & 0x000fffffffffffff, e: 1 };
+    }
+    return Sig.{ mant: (b & 0x000fffffffffffff) | 0x0010000000000000, e: e };
+}
+
+/// mant 2^(e - 1075) (exact: mant < 2^53 and the result is a multiple of
+/// 2^-1074 in range).
+fn from_sig(mant: u64, e: i32) f64 {
+    let v = @float_from_int(f64, mant);
+    let k = e - 1075;
+    if k < -1000 {
+        return (v * m.pow2(k + 100)) * m.pow2(-100);
+    }
+    return v * m.pow2(k);
+}
+
+/// |x| mod |y| (finite, y nonzero, |x| >= |y|) as a significand at y's
+/// exponent, and the low 32 bits of the integer quotient.
+struct Rem {
+    r: u64,
+    q: u64,
+}
+
+fn rem_sig(x: Sig, y: Sig) Rem {
+    // y's significand normalized so that its top bit is bit 52 (a
+    // subnormal's is not)
+    let mut r = x.mant;
+    let my = y.mant;
+    let mut d = x.e - y.e;
+    // (x's subnormal significand is smaller than its exponent says, which
+    // only shortens the division)
+    let mut q: u64 = r / my;
+    r = r - (q * my);
+    while d > 0 {
+        let s = @min(d, 11);
+        r = r << @as(u32, @bit_cast(u32, s));
+        let qq = r / my;
+        r = r - (qq * my);
+        q = (q << @as(u32, @bit_cast(u32, s))) | qq;
+        d -= s;
+    }
+    return Rem.{ r: r, q: q };
+}
+
+/// x - n y, n = trunc(x / y): exact.
+export fn fmod(x: f64, y: f64) f64 {
+    let bx = m.abits(x);
+    let by = m.abits(y);
+    if (bx >= 0x7ff0000000000000) or (by == 0) or (by > 0x7ff0000000000000) {
+        if (bx > 0x7ff0000000000000) or (by > 0x7ff0000000000000) {
+            return x + y;
+        }
+        return m.domain();  // x infinite or y zero
+    }
+    if bx < by {
+        return x;  // |x| < |y|, y infinite included
+    }
+    let a = rem_sig(sig(bx), sig(by));
+    let r = from_sig(a.r, sig(by).e);
+    return @copysign(r, x);
+}
+
+/// remainder and remquo: x - n y, n the integer nearest x / y (halfway
+/// cases to even), and n's low bits with its sign.
+struct RemQuo {
+    r: f64,
+    q: i64,
+}
+
+fn remquo_k(x: f64, y: f64) RemQuo {
+    let bx = m.abits(x);
+    let by = m.abits(y);
+    if (bx >= 0x7ff0000000000000) or (by == 0) or (by > 0x7ff0000000000000) {
+        if (bx > 0x7ff0000000000000) or (by > 0x7ff0000000000000) {
+            return RemQuo.{ r: x + y, q: 0 };
+        }
+        return RemQuo.{ r: m.domain(), q: 0 };  // x infinite or y zero
+    }
+    if bx < by {
+        // n is 0 or 1 (|y| may be infinite): |x| - |y| when |x| > |y|/2,
+        // that is when |x| > |y| - |x| (exact by Sterbenz's lemma whenever
+        // it matters); n = 0 in the halfway case (0 is even)
+        let ax = m.from_bits(bx);
+        let ay = m.from_bits(by);
+        if ax > (ay - ax) {
+            return RemQuo.{ r: @copysign(ay - ax, -x), q: sign_q(1, x, y) };
+        }
+        return RemQuo.{ r: x, q: 0 };
+    }
+    // |x| = q |y| + r (r at y's exponent), then n = q or q + 1 by comparing
+    // 2r with |y|
+    let sy = sig(by);
+    let a = rem_sig(sig(bx), sy);
+    let mut r = a.r;
+    let mut q = a.q;
+    let mut flip = false;
+    let two_r = r << 1;
+    if (two_r > sy.mant) or ((two_r == sy.mant) and ((q & 1) != 0)) {
+        r = sy.mant - r;
+        q += 1;
+        flip = true;
+    }
+    let v = from_sig(r, sy.e);
+    let qq = sign_q(@bit_cast(i64, q & 7), x, y);
+    if flip {
+        return RemQuo.{ r: @copysign(v, -x), q: qq };
+    }
+    return RemQuo.{ r: @copysign(v, x), q: qq };
+}
+
+inline fn sign_q(q: i64, x: f64, y: f64) i64 {
+    if ((m.bits(x) ^ m.bits(y)) >> 63) != 0 {
+        return -q;
+    }
+    return q;
+}
+
+export fn remainder(x: f64, y: f64) f64 {
+    return remquo_k(x, y).r;
+}
+
+export fn __axc_remquo(x: f64, y: f64, quo: *mut i64) f64 {
+    let a = remquo_k(x, y);
+    quo.* = a.q;
+    return a.r;
+}
+
+// -----------------------------------------------------------------------------
+// Exponents (7.12.6)
+// -----------------------------------------------------------------------------
+
+/// x = m 2^e with 1/2 <= |m| < 1 (m = x and e = 0 for zeros, infinities and
+/// NaNs).
+export fn __axc_frexp(x: f64, e: *mut i64) f64 {
+    let b = m.abits(x);
+    if (b == 0) or (b >= 0x7ff0000000000000) {
+        e.* = 0;
+        return x;
+    }
+    let mut y = x;
+    let mut adj: i64 = 0;
+    if b < 0x0010000000000000 {
+        y = x * 18014398509481984.0;  // 2^54
+        adj = -54;
+    }
+    let ey = @as(i64, m.exponent(y));
+    e.* = (ey - 1022) + adj;
+    return m.from_bits((m.bits(y) & 0x800fffffffffffff) | 0x3fe0000000000000);
+}
+
+/// x 2^n, rounded once: the scaling in at most three steps of which only
+/// the last can round (Annex F: F.10.3.13).
+fn scale(x: f64, n0: i64) f64 {
+    let mut y = x;
+    let mut n = n0;
+    if n > 1023 {
+        y = y * m.pow2(1023);
+        n -= 1023;
+        if n > 1023 {
+            y = y * m.pow2(1023);
+            n -= 1023;
+            if n > 1023 {
+                n = 1023;
+            }
+        }
+    } else if n < -1022 {
+        // 2^-1022 2^53: exact while the product is normal
+        y = y * m.pow2(-969);
+        n += 969;
+        if n < -1022 {
+            y = y * m.pow2(-969);
+            n += 969;
+            if n < -1022 {
+                n = -1022;
+            }
+        }
+    }
+    return y * m.pow2(@as(i32, @truncate(i32, n)));
+}
+
+/// ldexp, scalbn and scalbln: x 2^n, with the range errors.
+export fn __axc_scalbn(x: f64, n: i64) f64 {
+    let b = m.abits(x);
+    if (b >= 0x7ff0000000000000) {
+        return x + x;  // (quiets a NaN)
+    }
+    if (b == 0) or (n == 0) {
+        return x;
+    }
+    let r = scale(x, n);
+    let br = m.abits(r);
+    if br == 0x7ff0000000000000 {
+        m.set_errno(m.ERANGE);
+    } else if br < 0x0010000000000000 {
+        // underflow, unless the result is exact
+        if scale(r, -n) != x {
+            m.set_errno(m.ERANGE);
+        }
+    }
+    return r;
+}
+
+// __axc_ilogb's results for 0, an infinity and a NaN
+pub const ILOGB_ZERO: i64 = -0x10000000000;
+pub const ILOGB_INF: i64 = -0x10000000001;
+pub const ILOGB_NAN: i64 = -0x10000000002;
+
+/// The unbiased exponent of x as an integer, or one of the codes above (the
+/// C wrapper turns them into FP_ILOGB0, INT_MAX and FP_ILOGBNAN).
+export fn __axc_ilogb(x: f64) i64 {
+    let b = m.abits(x);
+    if b == 0 {
+        return ILOGB_ZERO;
+    }
+    if b == 0x7ff0000000000000 {
+        return ILOGB_INF;
+    }
+    if b > 0x7ff0000000000000 {
+        return ILOGB_NAN;
+    }
+    if b < 0x0010000000000000 {
+        return -1011 - @bit_cast(i64, @clz(b));  // a subnormal's leading bit: 2^(63 - clz - 1074)
+    }
+    return @as(i64, m.exponent(x)) - 1023;
+}
+
+/// The exponent of x as a double (logb(0) is -inf, a pole error).
+export fn logb(x: f64) f64 {
+    let b = m.abits(x);
+    if b == 0 {
+        return m.pole(true);
+    }
+    if b >= 0x7ff0000000000000 {
+        return m.from_bits(b) + m.from_bits(b);  // +inf, NaN
+    }
+    if b < 0x0010000000000000 {
+        return @float_from_int(f64, -1011 - @bit_cast(i64, @clz(b)));
+    }
+    return @float_from_int(f64, m.exponent(x) - 1023);
+}
+
+/// The integer and fraction parts of x.
+export fn modf(x: f64, ip: *mut f64) f64 {
+    let b = m.abits(x);
+    if b >= 0x4330000000000000 {
+        // |x| >= 2^52, inf, NaN: no fraction
+        ip.* = x;
+        if b > 0x7ff0000000000000 {
+            return x;
+        }
+        return @copysign(0.0, x);
+    }
+    let i = @trunc(x);
+    ip.* = i;
+    return @copysign(x - i, x);
+}
+
+// -----------------------------------------------------------------------------
+// Neighbours, differences, maxima (7.12.11-7.12.12)
+// -----------------------------------------------------------------------------
+
+/// The next double after x toward y.
+export fn nextafter(x: f64, y: f64) f64 {
+    if (x != x) or (y != y) {
+        return x + y;
+    }
+    if x == y {
+        return y;
+    }
+    let b = m.bits(x);
+    let mut r: f64 = 0.0;
+    if (b << 1) == 0 {
+        r = @copysign(m.from_bits(1), y);  // the smallest subnormal toward y
+    } else if (x < y) == (x > 0.0) {
+        r = m.from_bits(b + 1);  // away from zero
+    } else {
+        r = m.from_bits(b - 1);
+    }
+    let br = m.abits(r);
+    if br == 0x7ff0000000000000 {
+        return m.overflow(r < 0.0);
+    }
+    if br < 0x0010000000000000 {
+        m.raise_underflow();
+    }
+    return r;
+}
+
+/// x 2^n for floats: exact in double (|n| clamped far beyond float's
+/// range), then rounded once to float.
+export fn __axc_scalbnf(x: f32, n: i64) f32 {
+    let r = scale(@float_cast(f64, x), @max(@min(n, 400), -400));
+    return m.to_f32_exact(r, x != 0.0);
+}
+
+/// The next float after x toward y.
+export fn nextafterf(x: f32, y: f32) f32 {
+    if (x != x) or (y != y) {
+        return x + y;
+    }
+    if x == y {
+        return y;
+    }
+    let b = m.fbits(x);
+    let mut r: f32 = 0.0;
+    if (b << 1) == 0 {
+        r = @copysign(m.from_fbits(1), y);
+    } else if (x < y) == (x > 0.0) {
+        r = m.from_fbits(b + 1);
+    } else {
+        r = m.from_fbits(b - 1);
+    }
+    let br = m.fbits(r) & 0x7fffffff;
+    if br == 0x7f800000 {
+        return @float_cast(f32, m.overflow(r < 0.0));
+    }
+    if br < 0x00800000 {
+        m.raise_underflow();
+    }
+    return r;
+}
+
+export fn nextupf(x: f32) f32 {
+    let b = m.fbits(x);
+    if (x != x) or (b == 0x7f800000) {
+        return x + x;
+    }
+    if (b << 1) == 0 {
+        return m.from_fbits(1);
+    }
+    if (b >> 31) == 0 {
+        return m.from_fbits(b + 1);
+    }
+    return m.from_fbits(b - 1);
+}
+
+export fn nextdownf(x: f32) f32 {
+    return -nextupf(-x);
+}
+
+/// The next double above x (C23).
+export fn nextup(x: f64) f64 {
+    let b = m.bits(x);
+    if (x != x) or (b == 0x7ff0000000000000) {
+        return x + x;
+    }
+    if (b << 1) == 0 {
+        return m.from_bits(1);
+    }
+    if (b >> 63) == 0 {
+        return m.from_bits(b + 1);
+    }
+    return m.from_bits(b - 1);
+}
+
+/// The next double below x (C23).
+export fn nextdown(x: f64) f64 {
+    return -nextup(-x);
+}
+
+/// The positive difference.
+export fn fdim(x: f64, y: f64) f64 {
+    if (x != x) or (y != y) {
+        return x + y;
+    }
+    if x > y {
+        return m.check_huge(x - y);
+    }
+    return 0.0;
+}
+
+/// The larger, a NaN being missing data (F.10.9.2); +0 over -0.
+export fn fmax(x: f64, y: f64) f64 {
+    if x != x {
+        return y;
+    }
+    if y != y {
+        return x;
+    }
+    if x == y {
+        return m.from_bits(m.bits(x) & m.bits(y));
+    }
+    if x > y {
+        return x;
+    }
+    return y;
+}
+
+export fn fmin(x: f64, y: f64) f64 {
+    if x != x {
+        return y;
+    }
+    if y != y {
+        return x;
+    }
+    if x == y {
+        return m.from_bits(m.bits(x) | m.bits(y));
+    }
+    if x < y {
+        return x;
+    }
+    return y;
+}
+
+/// C23's maximum and minimum (IEEE 754-2019's): a NaN operand gives a NaN;
+/// -0 < +0.
+export fn fmaximum(x: f64, y: f64) f64 {
+    if (x != x) or (y != y) {
+        return x + y;
+    }
+    return fmax(x, y);
+}
+
+export fn fminimum(x: f64, y: f64) f64 {
+    if (x != x) or (y != y) {
+        return x + y;
+    }
+    return fmin(x, y);
+}
+
+/// ... of the magnitudes.
+export fn fmaximum_mag(x: f64, y: f64) f64 {
+    if (x != x) or (y != y) {
+        return x + y;
+    }
+    let ax = @abs(x);
+    let ay = @abs(y);
+    if ax > ay {
+        return x;
+    }
+    if ay > ax {
+        return y;
+    }
+    return fmax(x, y);
+}
+
+export fn fminimum_mag(x: f64, y: f64) f64 {
+    if (x != x) or (y != y) {
+        return x + y;
+    }
+    let ax = @abs(x);
+    let ay = @abs(y);
+    if ax < ay {
+        return x;
+    }
+    if ay < ax {
+        return y;
+    }
+    return fmin(x, y);
+}
+
+/// ... with a NaN operand being missing data (maximumNumber).
+export fn fmaximum_num(x: f64, y: f64) f64 {
+    return fmax(x, y);
+}
+
+export fn fminimum_num(x: f64, y: f64) f64 {
+    return fmin(x, y);
+}
+
+export fn fmaximum_mag_num(x: f64, y: f64) f64 {
+    if x != x {
+        return y;
+    }
+    if y != y {
+        return x;
+    }
+    return fmaximum_mag(x, y);
+}
+
+export fn fminimum_mag_num(x: f64, y: f64) f64 {
+    if x != x {
+        return y;
+    }
+    if y != y {
+        return x;
+    }
+    return fminimum_mag(x, y);
+}
+
+export fn copysign(x: f64, y: f64) f64 {
+    return @copysign(x, y);
+}
+
+export fn fabs(x: f64) f64 {
+    return @abs(x);
+}
+
+// -----------------------------------------------------------------------------
+// Fused multiply-add (7.12.13)
+// -----------------------------------------------------------------------------
+
+fn fma_hw(x: f64, y: f64, z: f64) f64 @features("fma") {
+    return @fma(x, y, z);
+}
+
+/// x y + z rounded once.
+export fn fma(x: f64, y: f64, z: f64) f64 {
+    if @target_arch("aarch64") or @target_has("fma") {
+        return @fma(x, y, z);
+    }
+    if @target_arch("x86_64") {
+        if @cpu_has("fma") {
+            return fma_hw(x, y, z);
+        }
+    }
+    return fma_soft(x, y, z);
+}
+
+/// The 128-bit product a b.
+fn mul128(a: u64, b: u64) [2]u64 {
+    let a0 = a & 0xffffffff;
+    let a1 = a >> 32;
+    let b0 = b & 0xffffffff;
+    let b1 = b >> 32;
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = ((p00 >> 32) + (p01 & 0xffffffff)) + (p10 & 0xffffffff);
+    return [((p11 + (p01 >> 32)) + (p10 >> 32)) + (mid >> 32), (mid << 32) | (p00 & 0xffffffff)];
+}
+
+/// A 128-bit magnitude shifted right by k, the bits shifted out ORed into
+/// the lowest ("sticky").
+fn shr_sticky(hi: u64, lo: u64, k: i32) [2]u64 {
+    if k <= 0 {
+        return [hi, lo];
+    }
+    if k >= 128 {
+        if (hi | lo) != 0 {
+            return [0, 1];
+        }
+        return [0, 0];
+    }
+    let s = @as(u32, @bit_cast(u32, k));
+    if s >= 64 {
+        let t = s - 64;
+        let mut out = hi >> t;
+        let lost = lo | (hi & ((@as(u64, 1) << t) - 1));
+        if t == 0 {
+            out = hi;
+        }
+        if lost != 0 {
+            out = out | 1;
+        }
+        return [0, out];
+    }
+    let nlo = (lo >> s) | (hi << (64 - s));
+    let mut r = [hi >> s, nlo];
+    if (lo & ((@as(u64, 1) << s) - 1)) != 0 {
+        r[1] = r[1] | 1;
+    }
+    return r;
+}
+
+/// fma without the hardware's: x y + z exact in 128-bit integers with a
+/// sticky bit, then rounded once in the current rounding mode by the
+/// conversion of a 63-bit integer (which carries the sticky bit) to double,
+/// scaled exactly (the integer pre-shifted for a subnormal result).
+fn fma_soft(x: f64, y: f64, z: f64) f64 {
+    return fma_core(x, y, z, false);
+}
+
+fn fma_hw_f32(x: f32, y: f32, z: f32) f32 @features("fma") {
+    return @fma(x, y, z);
+}
+
+/// x y + z rounded once to float.
+export fn fmaf(x: f32, y: f32, z: f32) f32 {
+    if @target_arch("aarch64") or @target_has("fma") {
+        return @fma(x, y, z);
+    }
+    if @target_arch("x86_64") {
+        if @cpu_has("fma") {
+            return fma_hw_f32(x, y, z);
+        }
+    }
+    let r = fma_core(@float_cast(f64, x), @float_cast(f64, y), @float_cast(f64, z), true);
+    return @float_cast(f32, r);  // (exact, or the overflow of float)
+}
+
+/// fma_soft, rounding to float when single (the operands floats; the
+/// result then a float's value, or beyond float's range).
+fn fma_core(x: f64, y: f64, z: f64, single: bool) f64 {
+    let bx = m.abits(x);
+    let by = m.abits(y);
+    let bz = m.abits(z);
+    if (bx >= 0x7ff0000000000000) or (by >= 0x7ff0000000000000) or (bz >= 0x7ff0000000000000) or (bx == 0) or
+       (by == 0) {
+        if (bz == 0x7ff0000000000000) and (bx < 0x7ff0000000000000) and (by < 0x7ff0000000000000) {
+            return z;  // x y finite (it may overflow when rounded) plus an infinity
+        }
+        return (x * y) + z;  // exact product (0, an infinity or a NaN)
+    }
+    if bz == 0 {
+        return x * y;  // x y + 0 = x y (rounded once; the sign is the product's)
+    }
+    let sx = sig(bx);
+    let sy = sig(by);
+    let sz = sig(bz);
+    // x y = P 2^ep, P < 2^106
+    let p = mul128(sx.mant, sy.mant);
+    let ep = (sx.e - 1075) + (sy.e - 1075);
+    // both magnitudes with their top bit at 125 (two bits of headroom)
+    let mut ah = p[0];
+    let mut al = p[1];
+    let lza = @as(i32, @truncate(u8, @clz(ah)));
+    let mut sha = lza - 2;  // (P's top bit is at most at bit 105: lza >= 22)
+    if ah == 0 {
+        sha = 62 + @as(i32, @truncate(u8, @clz(al)));
+    }
+    let shu = @as(u32, @bit_cast(u32, sha));
+    if shu >= 64 {
+        ah = al << (shu - 64);
+        al = 0;
+    } else if shu > 0 {
+        ah = (ah << shu) | (al >> (64 - shu));
+        al = al << shu;
+    }
+    let ea = ep - sha;
+    let lzz = @as(i32, @truncate(u8, @clz(sz.mant)));
+    let shz = lzz + 62;  // top bit to 125
+    let mut zh = sz.mant << @as(u32, @bit_cast(u32, shz - 64));
+    let mut zl: u64 = 0;
+    let ez = (sz.e - 1075) - shz;
+    // align to the larger exponent
+    let mut e = ea;
+    if ea >= ez {
+        let r = shr_sticky(zh, zl, ea - ez);
+        zh = r[0];
+        zl = r[1];
+    } else {
+        let r = shr_sticky(ah, al, ez - ea);
+        ah = r[0];
+        al = r[1];
+        e = ez;
+    }
+    let neg_p = ((m.bits(x) ^ m.bits(y)) >> 63) != 0;
+    let neg_z = (m.bits(z) >> 63) != 0;
+    let mut sh: u64 = 0;
+    let mut sl: u64 = 0;
+    let mut neg = neg_p;
+    if neg_p == neg_z {
+        sl = al +% zl;
+        sh = ah +% zh;
+        if sl < al {
+            sh += 1;
+        }
+    } else {
+        // the larger magnitude minus the smaller
+        let p_big = (ah > zh) or ((ah == zh) and (al >= zl));
+        if p_big {
+            sl = al -% zl;
+            sh = ah -% zh;
+            if al < zl {
+                sh -= 1;
+            }
+        } else {
+            sl = zl -% al;
+            sh = zh -% ah;
+            if zl < al {
+                sh -= 1;
+            }
+            neg = neg_z;
+        }
+        if (sh | sl) == 0 {
+            return z - z;  // an exact 0: +0, or -0 rounding downward
+        }
+    }
+    // the top 64 bits, with the rest as sticky
+    let mut lz: u32 = 0;
+    if sh == 0 {
+        sh = sl;
+        sl = 0;
+        e -= 64;
+    }
+    lz = @as(u32, @truncate(u8, @clz(sh)));
+    if lz > 0 {
+        sh = (sh << lz) | (sl >> (64 - lz));
+        sl = sl << lz;
+    }
+    e -= @bit_cast(i32, lz);
+    // value = (sh 2^64 + sl) 2^e, its leading bit at 2^(e + 127); as 63
+    // bits mm with the rest ORed into the lowest: value = mm 2^ex
+    let top = e + 127;
+    let mut mm = sh >> 1;
+    if ((sh & 1) | sl) != 0 {
+        mm = mm | 1;
+    }
+    let mut ex = e + 65;
+    let mut emin: i32 = -1022;
+    if single {
+        emin = -126;
+    }
+    if top >= emin {
+        // normal: the conversion rounds to 53 bits (in the current mode), the
+        // scaling is exact unless it overflows
+        // (the signed value: rounding up or down depends on the sign)
+        let mut si = @bit_cast(i64, mm);
+        if neg {
+            si = -si;
+        }
+        let mut v = @float_from_int(f64, si);
+        if single {
+            v = @float_cast(f64, @float_from_int(f32, si));
+        }
+        if ex > 900 {
+            return m.check_huge((v * m.pow2(900)) * m.pow2(ex - 900));
+        }
+        if ex < -1000 {
+            return (v * m.pow2(ex + 200)) * m.pow2(-200);  // (a normal result)
+        }
+        return v * m.pow2(ex);
+    }
+    // subnormal: mm shifted (sticky) to units of 2^ex with ex = -1083, so
+    // that d + mm, d = 2^61 (the value 2^-1022), rounds at 2^-1074 when
+    // converted; then (d + mm) - d is the rounded result, scaled exactly
+    let s = (emin - ex) - 61;
+    if s >= 63 {
+        if mm != 0 {
+            mm = 1;
+        }
+    } else if s > 0 {
+        let su = @as(u32, @bit_cast(u32, s));
+        let lost = mm & ((@as(u64, 1) << su) - 1);
+        mm = mm >> su;
+        if lost != 0 {
+            mm = mm | 1;
+        }
+    }
+    ex = emin - 61;
+    let dd: i64 = 0x2000000000000000;
+    let mut si = dd + @bit_cast(i64, mm);
+    if neg {
+        si = -si;
+    }
+    let mut v: f64 = 0.0;
+    let mut lost: u64 = mm & 0x1ff;
+    if single {
+        v = @float_cast(f64, @float_from_int(f32, si));
+        lost = mm & 0x3fffffffff;
+    } else {
+        v = @float_from_int(f64, si);
+    }
+    if neg {
+        v = v + 2305843009213693952.0;
+    } else {
+        v = v - 2305843009213693952.0;
+    }
+    if lost != 0 {
+        m.raise_underflow();
+    }
+    if v == 0.0 {
+        // (rounded to zero: the zero has the exact result's sign)
+        if neg {
+            return -0.0;
+        }
+        return 0.0;
+    }
+    if single {
+        return v * m.pow2(ex);
+    }
+    return (v * m.pow2(-1000)) * m.pow2(-83);
+}

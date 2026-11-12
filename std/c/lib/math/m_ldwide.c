@@ -1,0 +1,745 @@
+/* m_ldwide.c - <math.h>'s exact long double functions where long double is
+   wider than double (the x87's 80-bit format: x86-64 Linux; IEEE 754
+   binary128: AArch64 Linux, WebAssembly): computed on the format's bits and
+   with its arithmetic (correctly rounded to nearest, in software:
+   std/c/rt/ldouble.ax), so that they are exact (and sqrtl correctly
+   rounded). The elementary l functions compute in double (m_ldouble.c).
+
+   The formats (little-endian): x87, a 64-bit significand with its integer
+   bit (bytes 0-7), then the sign and a 15-bit exponent (bytes 8-9), six
+   bytes of padding; binary128, a 112-bit fraction (bytes 0-13, the low 64
+   bits first), the exponent and the sign in bytes 14-15. Both have the
+   bias 16383. Where long double is double, these are the double
+   functions. */
+#if __STDC_VERSION__ >= 199901L
+#if __AXIOM_LDBL_WIDTH__ != 64
+#include <errno.h>
+#include <float.h>
+#include <limits.h>
+
+#define X87 (__AXIOM_LDBL_WIDTH__ == 80)
+#define P LDBL_MANT_DIG /* 64 or 113 */
+#define BIAS 16383
+
+void __axc_math_err(int e, unsigned int flags);
+double sqrt(double);
+
+typedef union {
+    long double v;
+    unsigned char b[16];
+} LD;
+
+/* the significand, as a 128-bit integer (hi, lo): x87's 64 bits in lo with
+   the integer bit, binary128's fraction with the implicit bit set for
+   normal numbers */
+typedef struct {
+    int neg;
+    int e; /* the biased exponent field */
+    unsigned long long hi, lo;
+} Parts;
+
+static unsigned long long get64(const unsigned char *p)
+{
+    unsigned long long v = 0;
+    int i;
+    for (i = 7; i >= 0; i--)
+        v = (v << 8) | p[i];
+    return v;
+}
+
+static void put64(unsigned char *p, unsigned long long v)
+{
+    int i;
+    for (i = 0; i < 8; i++) {
+        p[i] = (unsigned char)(v & 0xff);
+        v >>= 8;
+    }
+}
+
+static Parts parts(long double x)
+{
+    LD u;
+    Parts r;
+    unsigned se;
+    u.v = x;
+    if (X87) {
+        se = (unsigned)u.b[8] | ((unsigned)u.b[9] << 8);
+        r.lo = get64(u.b);
+        r.hi = 0;
+    } else {
+        unsigned long long h = get64(u.b + 8);
+        se = (unsigned)(h >> 48);
+        r.lo = get64(u.b);
+        r.hi = h & 0xffffffffffffULL;
+    }
+    r.neg = (se >> 15) & 1;
+    r.e = (int)(se & 0x7fff);
+    return r;
+}
+
+static long double make(Parts r)
+{
+    LD u;
+    unsigned se = ((unsigned)r.neg << 15) | (unsigned)r.e;
+    int i;
+    for (i = 0; i < 16; i++)
+        u.b[i] = 0;
+    put64(u.b, r.lo);
+    if (X87) {
+        u.b[8] = (unsigned char)(se & 0xff);
+        u.b[9] = (unsigned char)(se >> 8);
+    } else {
+        put64(u.b + 8, (r.hi & 0xffffffffffffULL) | ((unsigned long long)se << 48));
+    }
+    return u.v;
+}
+
+static int is_nan(long double x)
+{
+    return x != x;
+}
+
+static long double inf_l(void)
+{
+    Parts r;
+    r.neg = 0;
+    r.e = 0x7fff;
+    r.hi = 0;
+    r.lo = X87 ? 0x8000000000000000ULL : 0;
+    return make(r);
+}
+
+/* 2^n, for -16382 <= n <= 16383 */
+static long double pow2l(int n)
+{
+    Parts r;
+    r.neg = 0;
+    r.e = n + BIAS;
+    r.hi = 0;
+    r.lo = X87 ? 0x8000000000000000ULL : 0;
+    return make(r);
+}
+
+long double fabsl(long double x)
+{
+    Parts r = parts(x);
+    r.neg = 0;
+    return make(r);
+}
+
+long double copysignl(long double x, long double y)
+{
+    Parts r = parts(x);
+    r.neg = parts(y).neg;
+    return make(r);
+}
+
+/* x with its fraction bits below the units cleared (|x| >= 1, finite) */
+static long double trunc_bits(long double x)
+{
+    Parts r = parts(x);
+    int k = r.e - BIAS;          /* the units bit is k bits below the leading one */
+    int drop = (P - 1) - k;      /* fraction bits to clear */
+    if (drop <= 0)
+        return x;
+    if (drop >= 64) {
+        r.lo = 0;
+        r.hi &= ~((1ULL << (drop - 64)) - 1);
+    } else {
+        r.lo &= ~((1ULL << drop) - 1);
+    }
+    return make(r);
+}
+
+long double truncl(long double x)
+{
+    Parts r = parts(x);
+    if (r.e == 0x7fff)
+        return x + x; /* infinities, NaNs */
+    if (r.e >= BIAS + P - 1)
+        return x; /* integers */
+    if (r.e < BIAS)
+        return copysignl(0.0L, x); /* |x| < 1 */
+    return trunc_bits(x);
+}
+
+long double floorl(long double x)
+{
+    long double t = truncl(x);
+    if (x < t)
+        return t - 1.0L;
+    return t;
+}
+
+long double ceill(long double x)
+{
+    long double t = truncl(x);
+    if (x > t)
+        return t + 1.0L;
+    return t;
+}
+
+long double roundl(long double x)
+{
+    long double t = truncl(x);
+    if (fabsl(x - t) >= 0.5L)
+        return t + copysignl(1.0L, x);
+    return t;
+}
+
+/* t (an integer) is odd */
+static int odd(long double t)
+{
+    Parts r = parts(t);
+    int k = r.e - BIAS, drop = (P - 1) - k;
+    if (r.e < BIAS || drop < 0)
+        return 0;
+    if (drop >= 64)
+        return (int)((r.hi >> (drop - 64)) & 1);
+    return (int)((r.lo >> drop) & 1);
+}
+
+/* the arithmetic rounds to nearest: so do rintl and nearbyintl */
+long double rintl(long double x)
+{
+    long double t = truncl(x), d;
+    if (is_nan(x))
+        return x + x;
+    d = fabsl(x - t);
+    if (d > 0.5L || (d == 0.5L && odd(t)))
+        return t + copysignl(1.0L, x);
+    return t;
+}
+
+long double nearbyintl(long double x)
+{
+    return rintl(x);
+}
+
+long double roundevenl(long double x)
+{
+    return rintl(x);
+}
+
+static long long to_ll(long double r)
+{
+    if (r >= -0x1p63L && r < 0x1p63L)
+        return (long long)r;
+    __axc_math_err(EDOM, 0x01);
+    return LLONG_MIN;
+}
+
+static long to_l(long double r)
+{
+    if (r >= (long double)LONG_MIN && r < -(long double)LONG_MIN)
+        return (long)r;
+    __axc_math_err(EDOM, 0x01);
+    return LONG_MIN;
+}
+
+long lrintl(long double x)
+{
+    return to_l(rintl(x));
+}
+
+long long llrintl(long double x)
+{
+    return to_ll(rintl(x));
+}
+
+long lroundl(long double x)
+{
+    return to_l(roundl(x));
+}
+
+long long llroundl(long double x)
+{
+    return to_ll(roundl(x));
+}
+
+long double modfl(long double x, long double *ip)
+{
+    long double t = truncl(x);
+    *ip = t;
+    if (parts(x).e == 0x7fff && !is_nan(x))
+        return copysignl(0.0L, x);
+    return copysignl(x - t, x);
+}
+
+/* x 2^n, rounded once (in steps that are exact while the result is normal) */
+static long double scale(long double x, long n)
+{
+    if (n > 16383) {
+        x *= pow2l(16383);
+        n -= 16383;
+        if (n > 16383) {
+            x *= pow2l(16383);
+            n -= 16383;
+            if (n > 16383)
+                n = 16383;
+        }
+    } else if (n < -16382) {
+        x *= pow2l(-16382 + P);
+        n += 16382 - P;
+        if (n < -16382) {
+            x *= pow2l(-16382 + P);
+            n += 16382 - P;
+            if (n < -16382)
+                n = -16382;
+        }
+    }
+    return x * pow2l((int)n);
+}
+
+long double scalblnl(long double x, long n)
+{
+    long double r;
+    if (parts(x).e == 0x7fff)
+        return x + x;
+    if (x == 0 || n == 0)
+        return x;
+    r = scale(x, n);
+    if (parts(r).e == 0x7fff || (parts(r).e == 0 && scale(r, -n) != x))
+        __axc_math_err(ERANGE, 0); /* overflow, or an inexact underflow */
+    return r;
+}
+
+long double scalbnl(long double x, int n)
+{
+    return scalblnl(x, (long)n);
+}
+
+long double ldexpl(long double x, int n)
+{
+    return scalblnl(x, (long)n);
+}
+
+long double frexpl(long double x, int *ep)
+{
+    Parts r = parts(x);
+    int adj = 0;
+    if (x == 0 || r.e == 0x7fff) {
+        *ep = 0;
+        return x + x;
+    }
+    if (r.e == 0) {
+        x *= pow2l(P);
+        adj = -P;
+        r = parts(x);
+    }
+    *ep = r.e - (BIAS - 1) + adj;
+    r.e = BIAS - 1;
+    return make(r);
+}
+
+int ilogbl(long double x)
+{
+    Parts r = parts(x);
+    if (x == 0 || r.e == 0x7fff) {
+        __axc_math_err(EDOM, 0x01);
+        if (x == 0)
+            return -INT_MAX - 1;
+        return INT_MAX;
+    }
+    if (r.e == 0)
+        return parts(x * pow2l(P)).e - BIAS - P;
+    return r.e - BIAS;
+}
+
+long double logbl(long double x)
+{
+    Parts r = parts(x);
+    if (x == 0) {
+        volatile long double z = 0.0L;
+        __axc_math_err(ERANGE, 0x04);
+        return -1.0L / z;
+    }
+    if (r.e == 0x7fff)
+        return x * x;
+    return (long double)ilogbl(x);
+}
+
+/* |x| mod |y| by subtracting |y| 2^k (exactly: Sterbenz's lemma), from the
+   largest k down; the quotient's low bits in *q */
+static long double mod_core(long double ax, long double ay, unsigned *q)
+{
+    int k = ilogbl(ax) - ilogbl(ay);
+    unsigned qq = 0;
+    while (k >= 0) {
+        long double t = scale(ay, k);
+        qq <<= 1;
+        if (ax >= t) {
+            ax -= t;
+            qq |= 1;
+        }
+        k--;
+    }
+    *q = qq;
+    return ax;
+}
+
+long double fmodl(long double x, long double y)
+{
+    unsigned q;
+    long double r;
+    if (is_nan(x) || is_nan(y))
+        return x + y;
+    if (parts(x).e == 0x7fff || y == 0) {
+        volatile long double z = 0.0L;
+        __axc_math_err(EDOM, 0x01);
+        return z / z;
+    }
+    if (fabsl(x) < fabsl(y))
+        return x;
+    r = mod_core(fabsl(x), fabsl(y), &q);
+    return copysignl(r, x);
+}
+
+long double remquol(long double x, long double y, int *quo)
+{
+    unsigned q = 0;
+    long double ax = fabsl(x), ay = fabsl(y), r;
+    int neg = parts(x).neg ^ parts(y).neg;
+    *quo = 0;
+    if (is_nan(x) || is_nan(y))
+        return x + y;
+    if (parts(x).e == 0x7fff || y == 0) {
+        volatile long double z = 0.0L;
+        __axc_math_err(EDOM, 0x01);
+        return z / z;
+    }
+    if (parts(y).e == 0x7fff)
+        return x;
+    r = ax >= ay ? mod_core(ax, ay, &q) : ax;
+    /* n = q or q + 1: the nearer, the even one in a tie (r against |y|/2,
+       |y| - r being exact) */
+    if (r > ay - r || (r == ay - r && (q & 1))) {
+        r = r - ay;
+        q++;
+    }
+    *quo = (int)(q & 7) * (neg ? -1 : 1);
+    return parts(x).neg ? -r : r;
+}
+
+long double remainderl(long double x, long double y)
+{
+    int q;
+    return remquol(x, y, &q);
+}
+
+/* the next value of |x| up (dir > 0) or down, by the significand's bits */
+static long double step(long double x, int up)
+{
+    Parts r = parts(x);
+    if (X87) {
+        if (up) {
+            r.lo++;
+            if (r.lo == 0) {
+                r.lo = 0x8000000000000000ULL;
+                r.e++;
+            } else if (r.e == 0 && r.lo == 0x8000000000000000ULL) {
+                r.e = 1;
+            }
+        } else {
+            if (r.e >= 1 && r.lo == 0x8000000000000000ULL) {
+                r.e--;
+                r.lo = r.e == 0 ? 0x7fffffffffffffffULL : 0xffffffffffffffffULL;
+            } else {
+                r.lo--;
+            }
+        }
+        if (r.e == 0x7fff)
+            r.lo = 0x8000000000000000ULL;
+        return make(r);
+    }
+    /* binary128: the exponent and fraction are one 127-bit integer */
+    if (up) {
+        r.lo++;
+        if (r.lo == 0) {
+            r.hi++;
+            if (r.hi >> 48) {
+                r.hi = 0;
+                r.e++;
+            }
+        }
+    } else {
+        if (r.lo == 0) {
+            if (r.hi == 0) {
+                r.hi = 0xffffffffffffULL;
+                r.e--;
+            } else {
+                r.hi--;
+            }
+        }
+        r.lo--;
+    }
+    return make(r);
+}
+
+long double nextafterl(long double x, long double y)
+{
+    long double r;
+    if (is_nan(x) || is_nan(y))
+        return x + y;
+    if (x == y)
+        return y;
+    if (x == 0) {
+        Parts t;
+        t.neg = y < 0;
+        t.e = 0;
+        t.hi = 0;
+        t.lo = 1;
+        r = make(t);
+    } else {
+        r = step(x, (x < y) == (x > 0));
+    }
+    if (parts(r).e == 0x7fff) {
+        __axc_math_err(ERANGE, 0x08 | 0x20);
+    } else if (parts(r).e == 0) {
+        __axc_math_err(ERANGE, 0x10 | 0x20);
+    }
+    return r;
+}
+
+long double nexttowardl(long double x, long double y)
+{
+    return nextafterl(x, y);
+}
+
+long double nextupl(long double x)
+{
+    if (is_nan(x) || x == inf_l())
+        return x + x;
+    return nextafterl(x, inf_l());
+}
+
+long double nextdownl(long double x)
+{
+    if (is_nan(x) || x == -inf_l())
+        return x + x;
+    return nextafterl(x, -inf_l());
+}
+
+long double fmaxl(long double x, long double y)
+{
+    if (is_nan(x))
+        return y;
+    if (is_nan(y))
+        return x;
+    if (x == y)
+        return parts(x).neg ? y : x;
+    return x > y ? x : y;
+}
+
+long double fminl(long double x, long double y)
+{
+    if (is_nan(x))
+        return y;
+    if (is_nan(y))
+        return x;
+    if (x == y)
+        return parts(x).neg ? x : y;
+    return x < y ? x : y;
+}
+
+long double fdiml(long double x, long double y)
+{
+    if (is_nan(x) || is_nan(y))
+        return x + y;
+    return x > y ? x - y : 0.0L;
+}
+
+/* a = h + l, each with at most half the significand's bits (Veltkamp) */
+static void split(long double a, long double *h, long double *l)
+{
+    const long double c = X87 ? 4294967297.0L : 144115188075855873.0L; /* 2^32 + 1, 2^57 + 1 */
+    long double t = c * a;
+    *h = t - (t - a);
+    *l = a - *h;
+}
+
+/* x - y^2, exactly enough for its sign and size (Dekker's product) */
+static long double residual(long double x, long double y)
+{
+    long double yh, yl, p = y * y, e;
+    split(y, &yh, &yl);
+    e = ((yh * yh - p) + 2.0L * yh * yl) + yl * yl;
+    return (x - p) - e;
+}
+
+/* The square root, correctly rounded: an estimate from double's, Newton's
+   steps in long double, then the neighbour whose interval holds sqrt(x):
+   x against the squares of the midpoints, through the exact residual. */
+long double sqrtl(long double x)
+{
+    long double y, d, u;
+    int k;
+    if (is_nan(x) || x == 0 || x == inf_l())
+        return x + x;
+    if (x < 0) {
+        volatile long double z = 0.0L;
+        __axc_math_err(EDOM, 0x01);
+        return z / z;
+    }
+    /* x = m 4^k, m in [1, 4) */
+    k = ilogbl(x) >> 1;
+    {
+        long double m = scale(x, -2L * k);
+        y = (long double)sqrt((double)m);
+        y = 0.5L * (y + m / y);
+        y = 0.5L * (y + m / y);
+        y = 0.5L * (y + m / y);
+        /* the nearer of y and its neighbours: sqrt(m) >= y + u/2 when
+           m - y^2 >= y u + u^2/4 */
+        d = residual(m, y);
+        u = step(y, 1) - y;
+        if (d - y * u >= 0.25L * u * u)
+            y = step(y, 1);
+        else {
+            u = y - step(y, 0);
+            if (d + y * u < 0.25L * u * u)
+                y = step(y, 0);
+        }
+        return scale(y, k);
+    }
+}
+/* C23's maximum and minimum (IEEE 754-2019's) */
+long double fmaximuml(long double x, long double y)
+{
+    return is_nan(x) || is_nan(y) ? x + y : fmaxl(x, y);
+}
+
+long double fminimuml(long double x, long double y)
+{
+    return is_nan(x) || is_nan(y) ? x + y : fminl(x, y);
+}
+
+long double fmaximum_magl(long double x, long double y)
+{
+    if (is_nan(x) || is_nan(y))
+        return x + y;
+    if (fabsl(x) != fabsl(y))
+        return fabsl(x) > fabsl(y) ? x : y;
+    return fmaxl(x, y);
+}
+
+long double fminimum_magl(long double x, long double y)
+{
+    if (is_nan(x) || is_nan(y))
+        return x + y;
+    if (fabsl(x) != fabsl(y))
+        return fabsl(x) < fabsl(y) ? x : y;
+    return fminl(x, y);
+}
+
+long double fmaximum_numl(long double x, long double y)
+{
+    return fmaxl(x, y);
+}
+
+long double fminimum_numl(long double x, long double y)
+{
+    return fminl(x, y);
+}
+
+long double fmaximum_mag_numl(long double x, long double y)
+{
+    return is_nan(x) ? y : is_nan(y) ? x : fmaximum_magl(x, y);
+}
+
+long double fminimum_mag_numl(long double x, long double y)
+{
+    return is_nan(x) ? y : is_nan(y) ? x : fminimum_magl(x, y);
+}
+#else
+/* where long double is double: the double functions (the same names in
+   every format: the index names this file for them) */
+/* (the exact functions, where long double is double) */
+double sqrt(double);
+long double sqrtl(long double x) { return (long double)sqrt((double)x); }
+double ceil(double);
+long double ceill(long double x) { return (long double)ceil((double)x); }
+double fabs(double);
+long double fabsl(long double x) { return (long double)fabs((double)x); }
+double floor(double);
+long double floorl(long double x) { return (long double)floor((double)x); }
+double nearbyint(double);
+long double nearbyintl(long double x) { return (long double)nearbyint((double)x); }
+double rint(double);
+long double rintl(long double x) { return (long double)rint((double)x); }
+double round(double);
+long double roundl(long double x) { return (long double)round((double)x); }
+double trunc(double);
+long double truncl(long double x) { return (long double)trunc((double)x); }
+double logb(double);
+long double logbl(long double x) { return (long double)logb((double)x); }
+double fmod(double, double);
+long double fmodl(long double x, long double y) { return (long double)fmod((double)x, (double)y); }
+double remainder(double, double);
+long double remainderl(long double x, long double y) { return (long double)remainder((double)x, (double)y); }
+double copysign(double, double);
+long double copysignl(long double x, long double y) { return (long double)copysign((double)x, (double)y); }
+double nextafter(double, double);
+long double nextafterl(long double x, long double y) { return (long double)nextafter((double)x, (double)y); }
+double fdim(double, double);
+long double fdiml(long double x, long double y) { return (long double)fdim((double)x, (double)y); }
+double fmax(double, double);
+long double fmaxl(long double x, long double y) { return (long double)fmax((double)x, (double)y); }
+double fmin(double, double);
+long double fminl(long double x, long double y) { return (long double)fmin((double)x, (double)y); }
+double frexp(double, int *);
+long double frexpl(long double x, int *e) { return (long double)frexp((double)x, e); }
+double ldexp(double, int);
+long double ldexpl(long double x, int n) { return (long double)ldexp((double)x, n); }
+double scalbn(double, int);
+long double scalbnl(long double x, int n) { return (long double)scalbn((double)x, n); }
+double scalbln(double, long);
+long double scalblnl(long double x, long n) { return (long double)scalbln((double)x, n); }
+int ilogb(double);
+int ilogbl(long double x) { return ilogb((double)x); }
+long lrint(double);
+long lrintl(long double x) { return lrint((double)x); }
+long long llrint(double);
+long long llrintl(long double x) { return llrint((double)x); }
+long lround(double);
+long lroundl(long double x) { return lround((double)x); }
+long long llround(double);
+long long llroundl(long double x) { return llround((double)x); }
+double remquo(double, double, int *);
+long double remquol(long double x, long double y, int *q) { return (long double)remquo((double)x, (double)y, q); }
+double modf(double, double *);
+long double modfl(long double x, long double *ip)
+{
+    double i;
+    double r = modf((double)x, &i);
+    *ip = (long double)i;
+    return (long double)r;
+}
+double nexttoward(double, long double);
+long double nexttowardl(long double x, long double y) { return (long double)nexttoward((double)x, y); }
+double roundeven(double);
+long double roundevenl(long double x) { return (long double)roundeven((double)x); }
+double nextup(double);
+long double nextupl(long double x) { return (long double)nextup((double)x); }
+double nextdown(double);
+long double nextdownl(long double x) { return (long double)nextdown((double)x); }
+double fmaximum(double, double);
+long double fmaximuml(long double x, long double y) { return (long double)fmaximum((double)x, (double)y); }
+double fminimum(double, double);
+long double fminimuml(long double x, long double y) { return (long double)fminimum((double)x, (double)y); }
+double fmaximum_mag(double, double);
+long double fmaximum_magl(long double x, long double y) { return (long double)fmaximum_mag((double)x, (double)y); }
+double fminimum_mag(double, double);
+long double fminimum_magl(long double x, long double y) { return (long double)fminimum_mag((double)x, (double)y); }
+double fmaximum_num(double, double);
+long double fmaximum_numl(long double x, long double y) { return (long double)fmaximum_num((double)x, (double)y); }
+double fminimum_num(double, double);
+long double fminimum_numl(long double x, long double y) { return (long double)fminimum_num((double)x, (double)y); }
+double fmaximum_mag_num(double, double);
+long double fmaximum_mag_numl(long double x, long double y) { return (long double)fmaximum_mag_num((double)x, (double)y); }
+double fminimum_mag_num(double, double);
+long double fminimum_mag_numl(long double x, long double y) { return (long double)fminimum_mag_num((double)x, (double)y); }
+#endif
+#else
+typedef int __axc_ldwide_c89;
+#endif

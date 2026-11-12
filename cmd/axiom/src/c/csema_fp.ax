@@ -1,0 +1,362 @@
+// =============================================================================
+// csema_fp.ax - the builtins of <math.h>, <tgmath.h> and <fenv.h>, which the
+// headers in std/c/include/ are written with (csema_builtin.ax dispatches
+// the names beginning __builtin_axiom_ here; cgen_fp.ax generates them):
+//
+//   __builtin_axiom_fpclassify(x)  __builtin_axiom_isfinite(x)  ..._isinf
+//   ..._isnan  ..._isnormal  ..._signbit  ..._issubnormal  ..._iszero
+//   ..._issignaling  ..._iscanonical
+//       7.12.3: x of a real floating type (an integer is converted to
+//       double); the result an int, from x's bits: no floating-point
+//       exception is raised, x is evaluated once. FP_ values: <math.h>'s.
+//   __builtin_axiom_isgreater(x, y)  ..._isgreaterequal  ..._isless
+//   ..._islessequal  ..._islessgreater  ..._isunordered
+//       7.12.14: x and y real, converted by the usual arithmetic
+//       conversions (two integers to double); quiet comparisons (the
+//       backends' compares raise nothing for a quiet NaN), each operand
+//       evaluated once.
+//   __builtin_axiom_tg(n, f, d, l, cf, cd, cl, args...)
+//       <tgmath.h> (7.25), in every standard from C99 (where _Generic is
+//       not available): a call of one of the six functions named (0 for
+//       one that does not exist) with args, chosen by the types of the
+//       first n args: complex if any of them is complex, and then long
+//       double if any has a long double type, else double if any has
+//       double or an integer type, else float (7.25p3). With real
+//       arguments and no real function, the complex one of that real type
+//       (carg, cproj, creal, ...: 7.25p6). The call is then an ordinary
+//       call of that function (csema_expr.ax: call), its arguments
+//       converted to its parameters' types.
+//   __builtin_axiom_fenv_kind()  the target's floating-point environment,
+//       an integer constant: 0 none (WebAssembly), 1 x86-64 (MXCSR),
+//       2 AArch64 (FPCR, FPSR)
+//   __builtin_axiom_fenv_get()  an unsigned long long: MXCSR, or FPCR in
+//       the low 32 bits and FPSR in the high (0 where there is none)
+//   __builtin_axiom_fenv_set(v) writes them (nothing where there is none)
+//
+// Diagnostics: C3082 (an operand of a type the builtin does not take),
+// C3023 (the number of arguments).
+// =============================================================================
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "csema.ax" as cs;
+import "csema_expr.ax" as cx;
+import "ctypes.ax" as cty;
+
+// The builtins (a CALL node's op; 400 and up, apart from csema_builtin.ax's,
+// csema_atomic.ax's and the GNU dialects').
+pub const BI_FP: i32 = 400;
+pub const BI_FPCLASSIFY: i32 = 400;
+pub const BI_ISFINITE: i32 = 401;
+pub const BI_ISINF: i32 = 402;
+pub const BI_ISNAN: i32 = 403;
+pub const BI_ISNORMAL: i32 = 404;
+pub const BI_SIGNBIT: i32 = 405;
+pub const BI_ISSUBNORMAL: i32 = 406;
+pub const BI_ISZERO: i32 = 407;
+pub const BI_ISSIGNALING: i32 = 408;
+pub const BI_ISCANONICAL: i32 = 409;
+pub const BI_ISGREATER: i32 = 410;
+pub const BI_ISGREATEREQUAL: i32 = 411;
+pub const BI_ISLESS: i32 = 412;
+pub const BI_ISLESSEQUAL: i32 = 413;
+pub const BI_ISLESSGREATER: i32 = 414;
+pub const BI_ISUNORDERED: i32 = 415;
+pub const BI_FENV_KIND: i32 = 420;
+pub const BI_FENV_GET: i32 = 421;
+pub const BI_FENV_SET: i32 = 422;
+pub const BI_TG: i32 = 430;
+
+// <math.h>'s FP_ classification values
+pub const FP_NAN: u64 = 0;
+pub const FP_INFINITE: u64 = 1;
+pub const FP_ZERO: u64 = 2;
+pub const FP_SUBNORMAL: u64 = 3;
+pub const FP_NORMAL: u64 = 4;
+
+let names: [20][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
+                       "issignaling", "iscanonical", "isgreater", "isgreaterequal", "isless", "islessequal",
+                       "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "tg"];
+let ids: [20]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422, 430];
+
+/// The BI_ number of __builtin_axiom_<rest>, or 0.
+pub fn builtin_id(rest: []u8) i32 {
+    for k in 0..names.len {
+        if u.str_eq(rest, names[k]) {
+            return ids[k];
+        }
+    }
+    return 0;
+}
+
+fn is_err(e: *cast.Expr) bool {
+    return u.isnil(e.ty) or (e.ty.kind == cty.TK_ERROR);
+}
+
+fn bad(e: *mut cast.Expr) bool {
+    e.ty = cty.t_error;
+    e.lvalue = false;
+    return true;
+}
+
+fn arity(e: *mut cast.Expr, lo: usize, hi: usize) bool {
+    let n = e.args.len;
+    if (n >= lo) and (n <= hi) {
+        return true;
+    }
+    cs.err(e.span, "C3023", u.f3("'%s' takes %s arguments, not %s", e.a.name, u.zdec(lo), u.zdec(n)));
+    return false;
+}
+
+/// Types the call e of builtin id; false when it became an ordinary call
+/// that the caller then types (BI_TG).
+pub fn call(e: *mut cast.Expr, id: i32) bool {
+    e.op = id;
+    if id == BI_TG {
+        return tg_call(e);
+    }
+    if id >= BI_FENV_KIND {
+        return fenv_call(e, id);
+    }
+    if id >= BI_ISGREATER {
+        return compare_call(e, id);
+    }
+    return class_call(e, id);
+}
+
+// The value of a constant of floating type t as its format would hold it:
+// its bits (as a double for double and a long double that is one).
+fn class_of_const(v: f64, single: bool) u64 {
+    let b = @bit_cast(u64, v) & 0x7fffffffffffffff;
+    if b > 0x7ff0000000000000 {
+        return FP_NAN;
+    }
+    if b == 0x7ff0000000000000 {
+        return FP_INFINITE;
+    }
+    if b == 0 {
+        return FP_ZERO;
+    }
+    let mut lim: f64 = 2.2250738585072014e-308;
+    if single {
+        lim = 1.1754943508222875e-38;
+    }
+    if @bit_cast(f64, b) < lim {
+        return FP_SUBNORMAL;
+    }
+    return FP_NORMAL;
+}
+
+fn bit(c: bool) u64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+fn class_call(e: *mut cast.Expr, id: i32) bool {
+    if not arity(e, 1, 1) {
+        return bad(e);
+    }
+    let mut x = cx.rv(e.args.get(0));
+    if is_err(x) {
+        return bad(e);
+    }
+    if cty.is_integer(x.ty) {
+        x = cx.convert(x, cty.t_double);
+    }
+    if not cty.is_floating(x.ty) {
+        cs.err(x.span, "C3082", u.f2("the operand of %s has type %s, not a real floating type", e.a.name, cs.tq(x.ty)));
+        return bad(e);
+    }
+    e.args.set(0, x);
+    e.ty = cty.t_int;
+    if x.is_const and not cty.is_wide(x.ty) {
+        // folded: the constant's class (constants are quiet NaNs)
+        let c = class_of_const(x.fcval, x.ty.unq.kind == cty.TK_FLOAT);
+        let neg = (@bit_cast(u64, x.fcval) >> 63) != 0;
+        let mut r: u64 = 0;
+        if id == BI_FPCLASSIFY {
+            r = c;
+        } else if id == BI_ISFINITE {
+            r = bit((c != FP_NAN) and (c != FP_INFINITE));
+        } else if id == BI_ISINF {
+            r = bit(c == FP_INFINITE);
+        } else if id == BI_ISNAN {
+            r = bit(c == FP_NAN);
+        } else if id == BI_ISNORMAL {
+            r = bit(c == FP_NORMAL);
+        } else if id == BI_SIGNBIT {
+            r = bit(neg);
+        } else if id == BI_ISSUBNORMAL {
+            r = bit(c == FP_SUBNORMAL);
+        } else if id == BI_ISZERO {
+            r = bit(c == FP_ZERO);
+        } else if id == BI_ISCANONICAL {
+            r = 1;
+        }
+        e.is_const = true;
+        e.cval = r;
+    }
+    return true;
+}
+
+fn compare_call(e: *mut cast.Expr, id: i32) bool {
+    if not arity(e, 2, 2) {
+        return bad(e);
+    }
+    let mut x = cx.rv(e.args.get(0));
+    let mut y = cx.rv(e.args.get(1));
+    if is_err(x) or is_err(y) {
+        return bad(e);
+    }
+    if not cty.is_real(x.ty) or not cty.is_real(y.ty) {
+        cs.err(e.span, "C3082", u.f3("the operands of %s have types %s and %s, not real types", e.a.name, cs.tq(x.ty),
+                                     cs.tq(y.ty)));
+        return bad(e);
+    }
+    let mut t = cty.common_type(cty.unqual(x.ty), cty.unqual(y.ty));
+    if cty.is_integer(t) {
+        t = cty.t_double;
+    }
+    x = cx.convert(x, t);
+    y = cx.convert(y, t);
+    e.args.set(0, x);
+    e.args.set(1, y);
+    e.ty = cty.t_int;
+    if x.is_const and y.is_const and not cty.is_wide(t) {
+        let a = x.fcval;
+        let b = y.fcval;
+        let mut r = false;
+        if id == BI_ISGREATER {
+            r = a > b;
+        } else if id == BI_ISGREATEREQUAL {
+            r = a >= b;
+        } else if id == BI_ISLESS {
+            r = a < b;
+        } else if id == BI_ISLESSEQUAL {
+            r = a <= b;
+        } else if id == BI_ISLESSGREATER {
+            r = (a < b) or (a > b);
+        } else {
+            r = (a != a) or (b != b);
+        }
+        e.is_const = true;
+        e.cval = bit(r);
+    }
+    return true;
+}
+
+fn fenv_call(e: *mut cast.Expr, id: i32) bool {
+    if id == BI_FENV_KIND {
+        if not arity(e, 0, 0) {
+            return bad(e);
+        }
+        e.ty = cty.t_int;
+        e.is_const = true;
+        if tg.g_arch == tg.ARCH_X64 {
+            e.cval = 1;
+        } else if tg.g_arch == tg.ARCH_A64 {
+            e.cval = 2;
+        } else {
+            e.cval = 0;
+        }
+        return true;
+    }
+    if id == BI_FENV_GET {
+        if not arity(e, 0, 0) {
+            return bad(e);
+        }
+        e.ty = cty.t_ullong;
+        return true;
+    }
+    if not arity(e, 1, 1) {
+        return bad(e);
+    }
+    let x = cx.rv(e.args.get(0));
+    if is_err(x) {
+        return bad(e);
+    }
+    if not cty.is_integer(x.ty) {
+        cs.err(x.span, "C3082", u.f1("the operand of __builtin_axiom_fenv_set has type %s, not an integer type",
+                                     cs.tq(x.ty)));
+        return bad(e);
+    }
+    e.args.set(0, cx.convert(x, cty.t_ullong));
+    e.ty = cty.t_void;
+    return true;
+}
+
+// The real type that <tgmath.h> chooses for an argument of type t (7.25p3):
+// 0 float, 1 double, 2 long double; and whether it is complex.
+fn tg_rank(t: *mut cty.CType) i32 {
+    let mut r = t.unq;
+    if cty.is_complex(r) {
+        r = r.elem.unq;
+    }
+    if r.kind == cty.TK_FLOAT {
+        return 0;
+    }
+    if r.kind == cty.TK_LDOUBLE {
+        return 2;
+    }
+    return 1;  // double, and the integer types
+}
+
+fn tg_call(e: *mut cast.Expr) bool {
+    let n = e.args.len;
+    if n < 8 {
+        cs.err(e.span, "C3023", u.f1("'__builtin_axiom_tg' takes at least 8 arguments, not %s", u.zdec(n)));
+        return bad(e);
+    }
+    let ng = cx.ice(e.args.get(0), "the first argument of __builtin_axiom_tg");
+    if not ng.ok or (ng.v == 0) or ((ng.v + 7) > @as(u64, n)) {
+        if ng.ok {
+            cs.err(e.span, "C3023", "__builtin_axiom_tg has fewer arguments than its first says");
+        }
+        return bad(e);
+    }
+    let mut rank: i32 = 0;
+    let mut cplx = false;
+    let mut ok = true;
+    let ngv = @as(usize, @truncate(u32, ng.v));
+    for i in @as(usize, 7)..(7 + ngv) {
+        let a = cx.rv(e.args.get(i));
+        e.args.set(i, a);
+        if is_err(a) {
+            ok = false;
+        } else if not cty.is_arith(a.ty) {
+            cs.err(a.span, "C3082", u.f1("an argument of a type-generic macro has type %s, not an arithmetic type",
+                                         cs.tq(a.ty)));
+            ok = false;
+        } else {
+            rank = @max(rank, tg_rank(a.ty));
+            cplx = cplx or cty.is_complex(a.ty);
+        }
+    }
+    if not ok {
+        return bad(e);
+    }
+    // the function: slot 1 + rank (real) or 4 + rank (complex)
+    let real = e.args.get(1 + @as(usize, @bit_cast(u32, rank)));
+    let comp = e.args.get(4 + @as(usize, @bit_cast(u32, rank)));
+    let mut f = real;
+    if cplx or (real.kind != cast.ExprKind.IDENT) {
+        f = comp;
+    }
+    if f.kind != cast.ExprKind.IDENT {
+        let what = u.pick(cplx, "complex", "real");
+        cs.err(e.span, "C3082", u.f1("this type-generic macro has no function for %s arguments", what));
+        return bad(e);
+    }
+    let callee = cast.new_expr(cast.ExprKind.IDENT, f.span);
+    callee.name = f.name;
+    let mut args = u.List.[*mut cast.Expr].empty();
+    for i in @as(usize, 7)..n {
+        args.push(e.args.get(i));
+    }
+    e.a = callee;
+    e.args = args;
+    e.op = 0;
+    return false;
+}
