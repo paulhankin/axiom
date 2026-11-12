@@ -13,8 +13,8 @@ lists the diagnostics.
   declarations, C23 no K&R definitions).
 - **Freestanding**: no C library. The compiler provides the headers a freestanding
   implementation must (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`,
-  `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdnoreturn.h>`, and
-  C23's `<stdbit.h>` and `<stdckdint.h>`), in `std/c/include/`. C23 (4p7) also asks a
+  `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdatomic.h>`,
+  `<stdnoreturn.h>`, and C23's `<stdbit.h>` and `<stdckdint.h>`), in `std/c/include/`. C23 (4p7) also asks a
   freestanding implementation for most of `<string.h>` and some functions of
   `<stdlib.h>` (and `<fenv.h>`, `<math.h>` when it claims Annex F): those are a
   library's, and not provided. `<float.h>` has no `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`
@@ -36,12 +36,20 @@ lists the diagnostics.
   No Microsoft extensions. Pragmas are read in every mode (`cpp.ax`; what the later phases
   need is in `cpragma.ax`). Identifiers the compiler needs for its own headers are in the
   reserved namespace (`__builtin_va_list`, `__axiom_int64`, ...).
+- **Atomics and thread storage**: `_Atomic` types (csema_atomic.ax) are
+  accessed atomically (cgen_atomic.ax: lock-free for 1, 2, 4 and 8 bytes, a
+  table of spinlocks otherwise; every order sequentially consistent);
+  `<stdatomic.h>`'s generic functions are builtins. Thread-local objects are the
+  IR's thread-local globals natively, and per-thread blocks on WebAssembly with
+  threads (cgen_tls.ax). The runtime's threads are reached through
+  `__axiom_c_thread_start` and `__axiom_c_thread_join` (the start-up
+  `std/internal/runtime/c_threads.ax`), until there is a `<threads.h>`.
 - **Complex types** (C99): `float`, `double` and `long double _Complex`, with
   `<complex.h>` (the library's functions only declared). No imaginary types, and
   `__STDC_IEC_559_COMPLEX__` is not defined, though multiplication and division
   follow Annex G.5.1 (`ccomplex.ax` folds constants, `cgen_complex.ax` generates the
   same operations, with helper functions of the module for the slow paths).
-- **Not supported, and said so by the feature macros**: `_Atomic` (`__STDC_NO_ATOMICS__`), threads
+- **Not supported, and said so by the feature macros**: `<threads.h>`
   (`__STDC_NO_THREADS__`), decimal floating types. Annex F is not claimed (`__STDC_IEC_559__` and
   `__STDC_IEC_60559_BFP__` are not defined): the floating types have IEC 60559's
   formats (`FLT_IS_IEC_60559`), but without a library there is no `<fenv.h>` or
@@ -96,10 +104,11 @@ cmd/axiom/src/c/cparse.ax   parser
 cmd/axiom/src/c/ctypes.ax   C types, layout, conversions
 cmd/axiom/src/c/cconst.ax   constant expressions                        (+ ccomplex.ax)
 cmd/axiom/src/c/cldbl.ax    long double constants wider than double: read exactly, folded
-cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree
+cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree (csema_atomic.ax: atomic types, <stdatomic.h>)
 cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conventions
                             (cgen_complex.ax: complex arithmetic; cgen_ld.ax: long double
-                            wider than double)
+                            wider than double; cgen_atomic.ax: atomic operations;
+                            cgen_tls.ax: thread storage)
 std/c/rt/ldouble.ax         that long double's arithmetic, in software (the compiler's too)
 cmd/axiom/src/c/cc.ax       the driver, and the link of the units (with Axiom's)
 cmd/axiom/src/c/cstrip.ax   leaves out of an executable what the units define and nothing reaches

@@ -41,6 +41,7 @@ import "cast.ax" as cast;
 import "cast_dump.ax" as cdump;
 import "cgen.ax" as cg;
 import "cgen_stmt.ax" as cgs;
+import "cgen_tls.ax" as cgt;
 import "copts.ax" as co;
 import "cparse.ax" as cparse;
 import "cpp.ax" as cpp;
@@ -48,6 +49,7 @@ import "csema.ax" as cs;
 import "csema_gbuiltin.ax" as cgbi;
 import "csema_marks.ax" as csm;
 import "csema_stmt.ax" as css;
+import "ctok.ax" as ct;
 
 // The checked units, in the order of the command line, and the file each
 // is (for diagnostics about the whole program).
@@ -87,6 +89,11 @@ pub fn check(path: []u8, o: *co.COptions, lib: bool) bool {
         return false;
     }
     g_units.push(cu);
+    for x in toks.items() {
+        if (x.kind == ct.T_IDENT) and u.str_eq(x.text, THREAD_START) {
+            g_threads = true;
+        }
+    }
     // (the end of file token's span is in the unit's own file)
     g_files.push(toks.get(toks.len - 1).span.file);
     g_lib.push(lib);
@@ -277,6 +284,17 @@ fn main_unit() *mut cs.CUnit {
     return u.nil.[cs.CUnit]();
 }
 
+// The runtime's function that starts a thread for C code (std/internal/
+// runtime/c_threads.ax), and whether a unit names it.
+let THREAD_START: []u8 = "__axiom_c_thread_start";
+let mut g_threads: bool = false;
+
+/// Does a unit name the runtime's thread functions (then the program's
+/// start-up is std/internal/runtime/c_threads.ax, which has them)?
+pub fn uses_threads() bool {
+    return g_threads;
+}
+
 /// Does a unit define main?
 pub fn has_main() bool {
     return u.notnil(main_unit());
@@ -285,6 +303,18 @@ pub fn has_main() bool {
 /// Are there C translation units for gen_ir?
 pub fn pending() bool {
     return g_units.len > 0;
+}
+
+/// Whether the program creates threads on WebAssembly, where the units'
+/// thread-locals then have a block per thread (cgen_tls.ax): set before
+/// gen_ir, which defines TLS_START for the threads' start to call.
+pub fn set_wasm_threads(threads: bool) void {
+    cgt.wasm_threads = threads;
+}
+
+/// The function a WebAssembly thread's start calls (cgen_tls.ax).
+pub fn tls_start_name() []u8 {
+    return cgt.TLS_START;
 }
 
 /// Generates the checked translation units into module m (wasm: for a
@@ -306,6 +336,9 @@ pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut i
     let mu = main_unit();
     if ok and u.notnil(mu) {
         ok = cg.generate_start(m, mu, wasm, ax_exit or defines("exit"));
+    }
+    if ok {
+        cgt.define_start();  // (a C program's or an Axiom program's: its threads' start calls it)
     }
     g_units.clear();
     return ok;

@@ -14,14 +14,17 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
 import "cgen.ax" as cg;
+import "cgen_atomic.ax" as cga;
 import "cgen_bitint.ax" as cgbi;
 import "cgen_bits.ax" as cgb;
 import "cgen_complex.ax" as gcx;
 import "cgen_debug.ax" as cdbg;
 import "cgen_ld.ax" as gld;
+import "cgen_tls.ax" as cgt;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "cldbl.ax" as cl;
+import "csema_atomic.ax" as catm;
 import "csema_attr.ax" as catr;
 import "csema_builtin.ax" as csb;
 import "ctok.ax" as ct;
@@ -33,6 +36,10 @@ fn lty(t: *mut cty.CType) *mut ir.Ty {
 
 fn is_volatile(t: *cty.CType) bool {
     return (t.quals & cty.Q_VOLATILE) != 0;
+}
+
+fn is_atomic(t: *cty.CType) bool {
+    return (t.quals & cty.Q_ATOMIC) != 0;
 }
 
 /// Loads a scalar of type t from p (volatile: as its type says); a complex
@@ -304,7 +311,7 @@ pub fn lv(e: *mut cast.Expr) *mut ir.Value {
             return cg.func_of(s, cg.func_sig(s)).val;
         }
         if s.duration == cast.SD_STATIC {
-            return cg.object_addr(s);
+            return cgt.addr(s);
         }
         if u.isvnil(s.ir) {
             s.ir = @ptr_cast(*mut void, cg.alloca(s.ty, s.name));
@@ -340,7 +347,7 @@ pub fn lv(e: *mut cast.Expr) *mut ir.Value {
 fn compound_literal(e: *mut cast.Expr) *mut ir.Value {
     let s = e.sym;
     if s.duration == cast.SD_STATIC {
-        return cg.object_addr(s);
+        return cgt.addr(s);
     }
     if u.isvnil(s.ir) {
         s.ir = @ptr_cast(*mut void, cg.aligned_alloca(s.ty, "literal", s.align));
@@ -390,6 +397,9 @@ fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
     if u.notnil(m) {
         return cgb.load(m, e.ty, p);
     }
+    if is_atomic(e.ty) {
+        return cga.load(e.ty, p);
+    }
     if cty.is_wide(e.ty) {
         return gld.snapshot(p, is_volatile(e.ty));
     }
@@ -406,6 +416,10 @@ fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.V
     let m = cgb.of(e);
     if u.notnil(m) {
         return cgb.store(m, e.ty, v, p);
+    }
+    if is_atomic(e.ty) {
+        cga.store(e.ty, v, p);
+        return v;
     }
     if cty.is_wide(t) {
         gld.copy(p, v, is_volatile(e.ty));
@@ -522,7 +536,7 @@ fn conversion(e: *mut cast.Expr) *mut ir.Value {
     }
     if op == cast.CV_LOAD {
         let p = lv(e.a);
-        if cty.is_record(e.ty) {
+        if cty.is_record(e.ty) and not is_atomic(e.a.ty) {
             return p;
         }
         return load_lv(e.a, p);
@@ -829,6 +843,10 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
     if e.op == ct.P_ASSIGN {
         let v = rv(e.b);
         let p = lv(e.a);
+        if is_atomic(lt) {
+            cga.store(lt, v, p);
+            return v;
+        }
         if cty.is_wide(lt) {
             gld.copy(p, v, is_volatile(lt));
             return p;
@@ -839,9 +857,19 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
         }
         return store_lv(e.a, lt, v, p);
     }
+    if is_atomic(lt) {
+        return atomic_compound(e);
+    }
     let p = lv(e.a);
     let old = load_lv(e.a, p);
     let r = rv(e.b);
+    return store_lv(e.a, lt, compound_value(e, old, r), p);
+}
+
+// The value compound assignment e stores, from the left operand's value old
+// and the right operand's r.
+fn compound_value(e: *mut cast.Expr, old: *mut ir.Value, r: *mut ir.Value) *mut ir.Value {
+    let lt = e.a.ty;
     let ot = e.opty;
     let mut nv = ir.vnil();
     if ot.kind == cty.TK_POINTER {
@@ -864,12 +892,15 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
         let x = convert(old, lt, ot);
         nv = convert(arith_op(base_op(e.op), ot, x, r), ot, lt);
     }
-    return store_lv(e.a, lt, nv, p);
+    return nv;
 }
 
 // ++ and --, prefix (UNARY) or postfix.
 fn incdec(e: *mut cast.Expr) *mut ir.Value {
     let t = e.a.ty;
+    if is_atomic(t) {
+        return atomic_compound(e);
+    }
     let p = lv(e.a);
     let old = load_lv(e.a, p);
     let ot = e.opty;
@@ -894,6 +925,102 @@ fn incdec(e: *mut cast.Expr) *mut ir.Value {
         return old;
     }
     return stored;
+}
+
+// A compound assignment, ++ or -- of an atomic lvalue (6.5.2.4p2,
+// 6.5.16.2p3): one atomic read-modify-write. Addition, subtraction and the
+// bitwise operations on an integer (other than _Bool and a _BitInt narrower
+// than its storage) or a pointer are one instruction (their result, in the
+// object's width, is the same as in the promoted type); the others are a
+// loop of compare-exchanges (or the lock: cgen_atomic.ax), which compute the
+// new value again when another thread changed the object meanwhile.
+fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
+    let t = e.a.ty;
+    let ot = e.opty;
+    let post = e.kind == cast.ExprKind.POSTFIX;
+    let mut op = ct.P_PLUS;
+    let mut r = ir.vnil();
+    if e.kind == cast.ExprKind.ASSIGN {
+        op = base_op(e.op);
+        r = rv(e.b);  // (before the object: the loop evaluates no operand again)
+    } else if e.op == ct.P_DEC {
+        op = ct.P_MINUS;
+    }
+    let p = lv(e.a);
+    let tt = lty(t);
+    let k = t.unq.kind;
+    let bitwise = (op == ct.P_AMP) or (op == ct.P_PIPE) or (op == ct.P_CARET);
+    let additive = (op == ct.P_PLUS) or (op == ct.P_MINUS);
+    let int_ok = cty.is_integer(t) and (k != cty.TK_BOOL) and (cty.storage_bits(t) == t.unq.bits) and
+                 cty.is_integer(ot) and (additive or bitwise);
+    let ptr_ok = (k == cty.TK_POINTER) and additive;
+    if cga.lock_free(t) and (int_ok or ptr_ok) {
+        let mut x = ir.vnil();
+        if ptr_ok {
+            let mut n = cg.usz(1);
+            if u.notnil(r) {
+                n = int_resize(r, true, cg.T_isz);
+            }
+            x = no_wrap(ir.mul(cg.B, n, gv.size_value(ot.elem)), ir.OP_MUL);
+        } else if u.isnil(r) {
+            x = ir.cint(tt, 1);
+        } else {
+            x = int_resize(r, ot.is_signed, tt);
+        }
+        let mut rop = ir.RMW_ADD;
+        let mut io = ir.OP_ADD;
+        if op == ct.P_MINUS {
+            rop = ir.RMW_SUB;
+            io = ir.OP_SUB;
+        } else if op == ct.P_AMP {
+            rop = ir.RMW_AND;
+            io = ir.OP_AND;
+        } else if op == ct.P_PIPE {
+            rop = ir.RMW_OR;
+            io = ir.OP_OR;
+        } else if op == ct.P_CARET {
+            rop = ir.RMW_XOR;
+            io = ir.OP_XOR;
+        }
+        let old = cga.fetch(t, rop, p, x);
+        if post {
+            return old;
+        }
+        if ptr_ok {
+            return ir.ptradd(cg.B, old, pick_neg(op == ct.P_MINUS, x));
+        }
+        return ir.binop(cg.B, io, old, x);
+    }
+    let up = cga.update_begin(t, p);
+    let old = up.old;
+    let mut nv = ir.vnil();
+    if e.kind == cast.ExprKind.ASSIGN {
+        nv = compound_value(e, old, r);
+    } else if ot.kind == cty.TK_POINTER {
+        nv = offset(old, cg.usz(1), gv.size_value(ot.elem), op == ct.P_MINUS);
+    } else {
+        let x = convert(old, t, ot);
+        let mut one = ir.cint(lty(ot), 1);
+        if cty.is_wide(ot) {
+            one = gld.one_value();
+        } else if cty.is_floating(ot) {
+            one = ir.cfp(lty(ot), 1.0);
+        }
+        nv = convert(arith_op(op, ot, x, one), ot, t);
+    }
+    cga.update_end(up, nv);
+    if post {
+        return old;
+    }
+    return nv;
+}
+
+// x, or its negation (a byte offset).
+fn pick_neg(neg: bool, x: *mut ir.Value) *mut ir.Value {
+    if neg {
+        return ir.sub(cg.B, cg.usz(0), x);
+    }
+    return x;
 }
 
 fn conditional(e: *mut cast.Expr) *mut ir.Value {
@@ -958,6 +1085,9 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
         // a builtin (csema_builtin.ax)
         for i in 0..n {
             vs[i] = rv(e.args.get(i));
+        }
+        if catm.is_builtin(e.op) {
+            return cga.builtin(e, vs[0..n]);
         }
         if (e.op >= csb.BI_COMPLEX) and (e.op <= csb.BI_CONJ) {
             return complex_builtin(e, vs[0..n]);

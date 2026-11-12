@@ -275,7 +275,8 @@ fn index_operand(i: *mut cast.Expr) *mut cast.Expr {
 // so pointers to arrays that differ only in their elements' qualifiers point
 // to types that are compatible but for qualifiers.
 fn pointee_compatible(l: *mut cty.CType, r: *mut cty.CType) bool {
-    if cty.compatible_unq(l, r) {
+    // (an atomic type is not a qualified version of its non-atomic one: 6.2.5p27)
+    if cty.compatible_unq(l, r) and cty.same_atomic(l, r) {
         return true;
     }
     if (cs.std() < co.C23) or (l.kind != cty.TK_ARRAY) or (r.kind != cty.TK_ARRAY) {
@@ -290,7 +291,7 @@ fn pointee_compatible(l: *mut cty.CType, r: *mut cty.CType) bool {
         a = a.elem;
         b = b.elem;
     }
-    return cty.compatible_unq(a, b);
+    return cty.compatible_unq(a, b) and cty.same_atomic(a, b);
 }
 
 // The qualifiers of a pointed-to type: in C23 an array's are its element's.
@@ -338,7 +339,13 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
                 cs.err(e.span, "C3022", u.f3("incompatible pointer types in %s: %s to %s", what, cs.tq(s), cs.tq(t)));
                 return e;
             }
-            if (pointee_quals(r) & ~pointee_quals(l)) != 0 {
+            let dropped = pointee_quals(r) & ~pointee_quals(l);
+            if (dropped == cty.Q_ATOMIC) and (l.kind == cty.TK_VOID) {
+                // (6.5.16.1p1 asks for the qualifiers of the atomic type, _Atomic
+                // too, on the void; a warning, so that such pointers can be
+                // given to functions that take void *)
+                cs.warn(e.span, "C4091", u.f3("%s discards the _Atomic qualifier: %s to %s", what, cs.tq(s), cs.tq(t)));
+            } else if dropped != 0 {
                 cs.err(e.span, "C3022", u.f3("%s discards qualifiers: %s to %s", what, cs.tq(s), cs.tq(t)));
                 return e;
             }
@@ -1097,7 +1104,7 @@ fn conditional_types(e: *mut cast.Expr) *mut cast.Expr {
     }
     if (tb.kind == cty.TK_POINTER) and (tc.kind == cty.TK_POINTER) {
         let q = tb.elem.quals | tc.elem.quals;
-        if cty.compatible_unq(tb.elem, tc.elem) {
+        if cty.compatible_unq(tb.elem, tc.elem) and cty.same_atomic(tb.elem, tc.elem) {
             e.ty = cty.pointer_to(cty.qualify(cty.composite(cty.unqual(tb.elem), cty.unqual(tc.elem)), q));
         } else if is_npc(c) {
             e.ty = tb;
@@ -1345,7 +1352,12 @@ fn member(e: *mut cast.Expr) *mut cast.Expr {
     e.mem = fm.m;
     catr.use_member(fm.m, e.name_span);
     e.cval = fm.offset;
-    e.ty = cty.qualify(fm.m.ty, st.quals);
+    if (st.quals & cty.Q_ATOMIC) != 0 {
+        // (6.5.2.3p5: undefined; the member is accessed as an ordinary object)
+        cs.warn(e.name_span, "C4090", u.f2("accessing the member '%s' of an object of atomic type %s is undefined",
+                                           e.name, cs.tq(st)));
+    }
+    e.ty = cty.qualify(fm.m.ty, st.quals & ~cty.Q_ATOMIC);
     e.lvalue = arrow or base.lvalue;
     return e;
 }

@@ -1,16 +1,16 @@
 // =============================================================================
 // cgen_gatomic.ax - IR generation for the GNU dialects' atomic builtins
-// (`__sync_...`, `__atomic_...`: csema_gbuiltin.ax types them) on the IR's
-// atomic operations, all sequentially consistent: a load or store marked
-// F_ATOMIC, OP_RMW (exchange, add, sub, and, or, xor), OP_CMPXCHG, OP_FENCE.
-// A pointer is operated on as an integer of its width; nand, which the IR
-// has no RMW for, is a compare-and-swap loop; the generic forms (of any
-// object of 1, 2, 4 or 8 bytes) move the value as an integer of its size.
+// (`__sync_...`, `__atomic_...`: csema_gbuiltin.ax types them), all
+// sequentially consistent, through cgen_atomic.ax's operations (those of C11's
+// atomics): lock-free on objects of 1, 2, 4 and 8 bytes, under its lock for
+// other sizes (the generic forms, on any object). A pointer is operated on as
+// an integer of its width (in bytes, unscaled); nand, which the IR has no
+// read-modify-write for, is cgen_atomic's loop of compare-exchanges.
 // =============================================================================
 import "../ir.ax" as ir;
-import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
+import "cgen_atomic.ax" as cga;
 import "csema_gbuiltin.ax" as gb;
 import "ctypes.ax" as cty;
 
@@ -23,14 +23,6 @@ fn int_ty(t: *cty.CType) *mut ir.Ty {
     return ir.t_int(@truncate(i32, cty.size_of(t) * 8));
 }
 
-// v (of C type t: an integer or pointer) as an integer of t's width.
-fn as_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
-    if cty.is_pointer(t) {
-        return ir.ptrtoint(B(), v, int_ty(t));
-    }
-    return v;
-}
-
 // Integer v as a value of C type t.
 fn from_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     if cty.is_pointer(t) {
@@ -39,17 +31,12 @@ fn from_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     return v;
 }
 
-fn atomic_load(t: *mut ir.Ty, p: *mut ir.Value) *mut ir.Value {
-    let v = ir.load(B(), t, p);
-    v.align = @truncate(u32, t.size);
-    v.flags = v.flags | ir.F_ATOMIC | ir.F_VOLATILE;
+// v (of C type t: an integer or pointer) as an integer of t's width.
+fn as_int(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if cty.is_pointer(t) {
+        return ir.ptrtoint(B(), v, int_ty(t));
+    }
     return v;
-}
-
-fn atomic_store(v: *mut ir.Value, p: *mut ir.Value) void {
-    let s = ir.store(B(), v, p);
-    s.align = @truncate(u32, v.ty.size);
-    s.flags = s.flags | ir.F_ATOMIC | ir.F_VOLATILE;
 }
 
 // The plain operation `op` (an RMW_ number, or gb.OP_NAND) of integers x and y.
@@ -72,25 +59,16 @@ fn apply(op: u64, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
     return ir.xor(B(), ir.and_(B(), x, y), ir.cint(x.ty, 0xFFFF_FFFF_FFFF_FFFF));  // nand
 }
 
-// The atomic read-modify-write `op` of the integer at p with v: the old value.
-fn rmw(op: u64, p: *mut ir.Value, v: *mut ir.Value) *mut ir.Value {
+// The atomic read-modify-write `op` of the object of type t at p with
+// integer v: the old value, as an integer.
+fn rmw(op: u64, t: *mut cty.CType, p: *mut ir.Value, v: *mut ir.Value) *mut ir.Value {
     if op != gb.OP_NAND {
-        return ir.rmw(B(), @truncate(i32, @bit_cast(i64, op)), p, v);
+        return as_int(cga.fetch(t, @truncate(i32, @bit_cast(i64, op)), p, v), t);
     }
-    // nand: a compare-and-swap loop
-    let head = cg.new_block("nand");
-    let done = cg.new_block("nanddone");
-    let start = ir.insert_block(B());
-    let first = atomic_load(v.ty, p);
-    ir.br(B(), head);
-    cg.at_end(head);
-    let old = ir.phi(B(), v.ty);
-    ir.add_incoming(old, first, start);
-    let seen = ir.cmpxchg(B(), p, old, apply(op, old, v));
-    ir.add_incoming(old, seen, head);
-    ir.condbr(B(), ir.icmp(B(), ir.IntEQ, seen, old), done, head);
-    cg.at_end(done);
-    return seen;
+    let up = cga.update_begin(t, p);
+    let old = as_int(up.old, t);
+    cga.update_end(up, from_int(apply(op, old, v), t));
+    return old;
 }
 
 /// The value of atomic builtin call e (e.op: gb.GB_ATOMIC + an A_ kind;
@@ -98,7 +76,7 @@ fn rmw(op: u64, p: *mut ir.Value, v: *mut ir.Value) *mut ir.Value {
 pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let k = e.op - gb.GB_ATOMIC;
     if k == gb.A_FENCE {
-        ir.fence(B());
+        cga.fence();
         return ir.vnil();
     }
     let p = vs[0];
@@ -106,68 +84,62 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let it = int_ty(t);
     if (k == gb.A_FETCH_OP) or (k == gb.A_OP_FETCH) {
         let v = resize(vs[1], it);
-        let old = rmw(e.cval, p, v);
+        let old = rmw(e.cval, t, p, v);
         if k == gb.A_FETCH_OP {
             return from_int(old, t);
         }
         return from_int(apply(e.cval, old, v), t);
     }
     if k == gb.A_XCHG {
-        return from_int(ir.rmw(B(), ir.RMW_XCHG, p, as_int(vs[1], t)), t);
+        return cga.exchange(t, vs[1], p);
     }
     if (k == gb.A_CAS_BOOL) or (k == gb.A_CAS_VAL) {
-        let ex = as_int(vs[1], t);
-        let old = ir.cmpxchg(B(), p, ex, as_int(vs[2], t));
+        let old = cga.compare_exchange_value(t, p, vs[1], vs[2]);
         if k == gb.A_CAS_VAL {
-            return from_int(old, t);
+            return old;
         }
-        return ir.zext(B(), ir.icmp(B(), ir.IntEQ, old, ex), cg.T_i8);
+        return ir.zext(B(), ir.icmp(B(), ir.IntEQ, as_int(old, t), as_int(vs[1], t)), cg.T_i8);
     }
     if k == gb.A_LOAD {
-        return from_int(atomic_load(it, p), t);
+        return cga.load(t, p);
     }
     if k == gb.A_STORE {
-        atomic_store(as_int(vs[1], t), p);
+        cga.store(t, vs[1], p);
         return ir.vnil();
     }
     if k == gb.A_RELEASE {
-        atomic_store(ir.cint(it, 0), p);
+        cga.store(t, from_int(ir.cint(it, 0), t), p);
         return ir.vnil();
     }
-    if k == gb.A_TEST_SET {
-        let old = ir.rmw(B(), ir.RMW_XCHG, p, ir.cint(cg.T_i8, 1));
+    if (k == gb.A_TEST_SET) or (k == gb.A_CLEAR) {
+        // (on the object's first byte, whatever its type)
+        let flag = cty.t_uchar;
+        if k == gb.A_CLEAR {
+            cga.store(flag, ir.cint(cg.T_i8, 0), p);
+            return ir.vnil();
+        }
+        let old = cga.exchange(flag, ir.cint(cg.T_i8, 1), p);
         return ir.zext(B(), ir.icmp(B(), ir.IntNE, old, ir.cint(cg.T_i8, 0)), cg.T_i8);
     }
-    if k == gb.A_CLEAR {
-        atomic_store(ir.cint(cg.T_i8, 0), p);
-        return ir.vnil();
-    }
     if k == gb.A_CMPXCHG {
-        // (*expected gets the value found: on success, the one it had)
-        let ep = vs[1];
-        let ex = load_int(it, ep);
-        let old = ir.cmpxchg(B(), p, ex, as_int(vs[2], t));
-        store_int(old, ep);
-        return ir.zext(B(), ir.icmp(B(), ir.IntEQ, old, ex), cg.T_i8);
+        // (*expected gets the value found)
+        return ir.zext(B(), cga.compare_exchange(t, p, vs[1], vs[2]), cg.T_i8);
     }
-    // the generic forms
+    // the generic forms: values at addresses (objects of the same size)
     if k == gb.A_LOAD_G {
-        store_int(atomic_load(it, p), vs[1]);
+        cga.put_value(t, cga.load(t, p), vs[1]);
         return ir.vnil();
     }
     if k == gb.A_STORE_G {
-        atomic_store(load_int(it, vs[1]), p);
+        cga.store(t, cga.value_at(t, vs[1]), p);
         return ir.vnil();
     }
     if k == gb.A_XCHG_G {
-        store_int(ir.rmw(B(), ir.RMW_XCHG, p, load_int(it, vs[1])), vs[2]);
+        cga.put_value(t, cga.exchange(t, cga.value_at(t, vs[1]), p), vs[2]);
         return ir.vnil();
     }
     // A_CMPXCHG_G (p, expected *, desired *)
-    let ex = load_int(it, vs[1]);
-    let old = ir.cmpxchg(B(), p, ex, load_int(it, vs[2]));
-    store_int(old, vs[1]);
-    return ir.zext(B(), ir.icmp(B(), ir.IntEQ, old, ex), cg.T_i8);
+    return ir.zext(B(), cga.compare_exchange(t, p, vs[1], cga.value_at(t, vs[2])), cg.T_i8);
 }
 
 fn resize(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
@@ -181,16 +153,4 @@ fn resize(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
         return ir.sext(B(), v, t);
     }
     return v;
-}
-
-// The integer of type t at p, a plain load (aligned as its size need not be).
-fn load_int(t: *mut ir.Ty, p: *mut ir.Value) *mut ir.Value {
-    let v = ir.load(B(), t, p);
-    v.align = 1;
-    return v;
-}
-
-fn store_int(v: *mut ir.Value, p: *mut ir.Value) void {
-    let s = ir.store(B(), v, p);
-    s.align = 1;
 }

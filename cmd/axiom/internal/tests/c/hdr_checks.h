@@ -267,5 +267,6 @@ CHECK(WCHAR_WIDTH == sizeof(wchar_t) * CHAR_BIT && SIG_ATOMIC_WIDTH == INT_WIDTH
 #endif
 
 static int hc_run(void) { return hc_null() + hc_va(1, 41); }
+#include "hdr_atomic_checks.h"
 #endif
 

@@ -310,7 +310,7 @@ has it: `'long long' is a C99 feature`. The main differences:
 | C89 | The base language. Trigraphs. Implicit `int` and implicit function declarations (warning `C4001`). K&R function definitions. |
 | C95 | Digraphs, `<iso646.h>`, `__STDC_VERSION__`. |
 | C99 | `//` comments, `long long`, `_Bool`, `inline`, `restrict`, variable length arrays, flexible array members, designated initializers, compound literals, declarations after statements and in `for`, variadic macros and empty macro arguments, `_Pragma`, hexadecimal floating constants, universal character names, `__func__`, `<stdint.h>`, `<stdbool.h>`. No more implicit `int` or implicit function declarations (`C3060`). |
-| C11 | `_Generic`, `_Static_assert`, `_Noreturn`, `_Alignas`, `_Alignof`, `_Thread_local`, anonymous structures and unions, `u""`, `U""` and `u8""` literals and `u''` and `U''` constants, `<stdalign.h>`, `<stdnoreturn.h>`, the `__STDC_NO_...__` macros. |
+| C11 | `_Generic`, `_Static_assert`, `_Noreturn`, `_Alignas`, `_Alignof`, `_Atomic`, `_Thread_local`, anonymous structures and unions, `u""`, `U""` and `u8""` literals and `u''` and `U''` constants, `<stdalign.h>`, `<stdatomic.h>`, `<stdnoreturn.h>`, the `__STDC_NO_...__` macros. |
 | C17 | The same language as C11. |
 | C23 | Attributes (`[[deprecated]]` and the other standard ones), `constexpr`, `auto` type inference, `typeof` and `typeof_unqual`, `nullptr`, `bool`, `true`, `false`, `alignas`, `alignof`, `static_assert` and `thread_local` as keywords, `_BitInt(N)` and the `wb` suffix, binary constants, digit separators, `#embed`, `__has_include`, `__has_embed`, `__has_c_attribute`, `#elifdef`, `#elifndef`, `#warning`, `__VA_OPT__`, `{}` initializers, enumerations with a fixed underlying type, labels before declarations, unnamed parameters in definitions, `u8''` constants, `static_assert` without a message, `<stdbit.h>`, `<stdckdint.h>`, `unreachable` and `nullptr_t` in `<stddef.h>`. No more trigraphs, K&R function definitions or `()` as an unprototyped declarator. |
 
@@ -329,8 +329,9 @@ implementation knows act, the others are ignored.
 `__STDC__` (1), `__STDC_VERSION__` (above), `__DATE__`, `__TIME__` (the build's time, or
 the `SOURCE_DATE_EPOCH` environment variable's, in UTC), `__FILE__`, `__LINE__`. From C99,
 `__STDC_HOSTED__` is 0. From C11, `__STDC_UTF_16__`, `__STDC_UTF_32__`,
-`__STDC_NO_ATOMICS__` and `__STDC_NO_THREADS__` are 1 (`__STDC_NO_COMPLEX__` is not defined:
-complex types are supported). In C23,
+`__STDC_NO_THREADS__` is 1 (there is no `<threads.h>` yet); `__STDC_NO_ATOMICS__` and
+`__STDC_NO_COMPLEX__` are not defined: atomics (see "Atomics and threads") and complex
+types are supported. In C23,
 `__STDC_EMBED_NOT_FOUND__`, `__STDC_EMBED_FOUND__` and `__STDC_EMBED_EMPTY__` are 0, 1
 and 2. `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__` and `__STDC_ISO_10646__` are not
 defined, nor is `__STDC_IEC_559_COMPLEX__` (see "Known deviations").
@@ -452,6 +453,7 @@ in an earlier mode is an `#error`.
 | `<stdint.h>` | C99 and later | No `int32_t` family when no type is 32 bits wide. |
 | `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are a library's, which is not provided. No `imaginary` or `_Imaginary_I`. |
 | `<stdalign.h>` | C11 and later | |
+| `<stdatomic.h>` | C11 and later | All of 7.17 (see "Atomics and threads"). `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
 | `<stdnoreturn.h>` | C11 and later | |
 | `<stdbit.h>` | C23 | The `stdc_` functions as `static inline` functions and type-generic macros. |
 | `<stdckdint.h>` | C23 | `ckd_add`, `ckd_sub`, `ckd_mul`. |
@@ -464,11 +466,10 @@ as the standard says.
 
 ## Not supported
 
-- `_Imaginary` (the imaginary types, which are optional), `_Atomic` (`__STDC_NO_ATOMICS__`),
-  decimal floating types and constants: each is `C3901` (a decimal constant is `C1019`).
-- Threads (`__STDC_NO_THREADS__`; there is no `<threads.h>`). `thread_local` and
-  `_Thread_local` are accepted and checked, and such an object has static storage
-  duration, as it would in a program with one thread.
+- `_Imaginary` (the imaginary types, which are optional), decimal floating types and
+  constants: each is `C3901` (a decimal constant is `C1019`).
+- `<threads.h>` (`__STDC_NO_THREADS__`). Thread-local objects and atomics work with the
+  threads a program has (see "Atomics and threads").
 - The library, and Annex F, `<fenv.h>` and `<math.h>`: exception flags and rounding modes.
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
@@ -595,9 +596,11 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__sync_fetch_and_op`, `__sync_op_and_fetch` (op: add, sub, or, and, xor, nand), `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, `__sync_lock_release`, `__sync_synchronize` | Atomic, sequentially consistent. |
 | `__atomic_load_n`, `store_n`, `exchange_n`, `compare_exchange_n`, `fetch_op`, `op_fetch`, `test_and_set`, `clear`, `thread_fence`, `signal_fence`, the generic `load`, `store`, `exchange`, `compare_exchange`, `always_lock_free`, `is_lock_free` | Every memory order is taken as `__ATOMIC_SEQ_CST` (a stronger order is a valid one). |
 
-The atomic builtins take a pointer to an integer or pointer type of 1, 2, 4 or 8 bytes
-(the generic ones: to any object of those sizes, aligned to its size), with the IR's
-atomic operations (nand: a compare-and-swap loop); they are lock-free on every target.
+The atomic builtins take a pointer to an integer or pointer type of 1, 2, 4 or 8 bytes,
+aligned to its size (the generic ones: to any complete object), and are the operations
+of C11's atomics (see "Atomics and threads"; nand is a compare-and-swap loop): lock-free
+on objects of 1, 2, 4 and 8 bytes on every target, and for other sizes (the generic
+forms) under the same table of locks as `_Atomic` objects, so the two agree.
 
 ## Pragmas
 
@@ -638,6 +641,9 @@ Programs should not use them.
 | `__builtin_unreachable` | `unreachable` (C23). |
 | `__builtin_stdc_...` | The operations of `<stdbit.h>`. |
 | `__builtin_ckd_add`, `__builtin_ckd_sub`, `__builtin_ckd_mul` | `<stdckdint.h>`. |
+| `__builtin_atomic_...` | The generic functions of `<stdatomic.h>`. |
+| `__axiom_c_thread_start`, `__axiom_c_thread_join` | The runtime's threads (see "Atomics and threads"). |
+| `__axiom_atomic_lock`, `__axiom_atomic_unlock`, `__axiom_atomic_locks` | The lock of atomic objects that are not lock-free. |
 | `__builtin_inff`, `__builtin_nanf` | `<float.h>`. |
 | `__builtin_complex`, `__builtin_creal`, `__builtin_cimag`, `__builtin_conj` | `<complex.h>`: `__builtin_complex(x, y)` is `x + iy` for `x` and `y` of one real floating type. |
 | `__axiom_cmul_f32`, `__axiom_cdiv_f64`, ... | The compiler's own functions for complex multiplication and division (internal to the program). |
@@ -655,6 +661,67 @@ own start-up ends the process (on WebAssembly, the host).
 A program that defines `memcpy`, `memset` and `memmove` itself builds for every target.
 Names that the runtime uses for its own functions (such as `ax_write`) cannot be
 defined: `C3062` (reported by `build`).
+
+## Atomics and threads
+
+`_Atomic` qualifies a type, and `_Atomic(T)` names the same atomic type. An atomic type
+has the size of its non-atomic version; one of 1, 2, 4, 8 or 16 bytes is aligned to its
+size (so `_Atomic struct { char c[2]; }` is aligned to 2), any other keeps its
+alignment, on every target: the rule of the x86-64 and AArch64 psABIs, so atomic
+objects are laid out as the platform's C compilers lay them out (checked against them on
+Linux). An atomic type cannot be an array or function type (`C3092`), `_Atomic(T)`
+cannot be of an array, function, atomic or qualified type (`C3092`), and a bit-field
+cannot be atomic (implementation-defined, 6.7.2.1p5: `C3070`). An atomic type is not a
+qualified version of its non-atomic type: `int *` and `_Atomic int *` are incompatible
+(`C3022`), and a parameter or result keeps its `_Atomic` in the function's type. A
+member of an atomic structure or union accessed (undefined) is the warning `C4090`, and
+`void *p = &atomic_object` the warning `C4091`.
+
+Reading an atomic object (its value used), assigning it, `++`, `--` and the compound
+assignments are atomic operations (6.5.2.4, 6.5.16.2), all sequentially consistent.
+`+=`, `-=`, `&=`, `|=`, `^=`, `++` and `--` on an atomic integer or pointer are one
+read-modify-write instruction; the others (`*=`, `/=`, shifts, floating types, `_Bool`)
+are a loop of compare-exchanges that computes the new value again if another thread
+changed the object meanwhile. There is no floating-point environment, so the loop has no
+exceptions to discard (6.5.16.2p3, note).
+
+Objects of 1, 2, 4 and 8 bytes (every integer type and pointer) are lock-free: x86-64's
+locked instructions, AArch64's exclusive or LSE instructions, WebAssembly's atomic
+instructions. Others (a structure of 3 or of 16 bytes, a `double _Complex`) take one of 64 spinlocks, chosen
+by the object's address, in a table that every module and object holding such code
+defines once (linkonce). A signal handler must not touch such an object while the
+interrupted thread may hold its lock, and the platform C compilers' code uses its own
+library's locks for them: an object of this kind is atomic only among code compiled here.
+
+`<stdatomic.h>` has all of 7.17. Its generic functions are the compiler's builtins
+(`__builtin_atomic_load` and the others); atomic_flag's functions and the fences are
+`static inline` functions in the header. Every `memory_order` is made sequentially
+consistent, which is a valid implementation of each; `atomic_compare_exchange_weak` is
+the strong form (it never fails spuriously); `atomic_signal_fence` is a full fence. The
+`ATOMIC_*_LOCK_FREE` macros are 2 and `atomic_is_lock_free` says what the size gives.
+On WebAssembly without the atomics feature (`--features=-atomics`) a module has one
+thread, and the operations are ordinary loads and stores.
+
+`_Thread_local` (C23: `thread_local`) objects have one instance per thread, each starting
+with the object's initial value (which may hold addresses). On Linux they are ELF TLS
+(local-exec, so in an executable or an object linked into one); the C library's threads
+and the runtime's each get their copies. On Windows they are in the image's TLS
+directory, so every thread has them. On macOS they are the runtime's thread-local
+block, which the main thread and the runtime's threads have (threads the C library
+creates directly do not: there is no `<threads.h>` yet). On WebAssembly, in a program
+without threads they are ordinary globals; with threads, each thread's start makes its
+block of them. `--emit=obj` objects for WebAssembly have them as ordinary globals.
+
+Until `<threads.h>` exists, the runtime's threads are reached through two functions that
+a program declares (the suite's threaded tests use them):
+
+```c
+void *__axiom_c_thread_start(void (*f)(void *), void *arg);  /* null if it fails */
+void __axiom_c_thread_join(void *thread);
+```
+
+A program that names them has the start-up `std/internal/runtime/c_threads.ax` (which
+defines them) instead of `c_start.ax`.
 
 ## Calling conventions and interoperability
 
@@ -814,9 +881,8 @@ claims less than the standard allows. None is hidden: each is said above or here
   (no overflow forming the divisor's squared magnitude); it may differ in the last bit
   from other implementations' choices. `CX_LIMITED_RANGE` has no effect (the full
   algorithms are always used).
-- `_Atomic`, decimal floating types and threads are absent, as the feature
+- Decimal floating types and `<threads.h>` are absent, as the feature
   macros say.
-- `thread_local` objects have static storage duration.
 - `restrict` has no effect on the generated code; `#pragma STDC FENV_ACCESS ON` is not
   honoured (C4113).
 - The variadic-argument placement limits on x86-64 System V and macOS above.

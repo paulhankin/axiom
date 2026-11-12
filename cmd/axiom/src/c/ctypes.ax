@@ -732,17 +732,47 @@ pub fn size_of(t: *CType) u64 {
 /// The alignment of an object type (1 for others).
 pub fn align_of(t: *CType) u64 {
     let k = t.kind;
-    if (k == TK_ARRAY) or (k == TK_COMPLEX) {
+    if k == TK_ARRAY {
         return align_of(t.elem);
     }
+    let mut a = size_of(t);
     if (k == TK_STRUCT) or (k == TK_UNION) {
-        return t.tag.align;
-    }
-    let s = size_of(t);
-    if s == 0 {
+        a = t.tag.align;
+    } else if k == TK_COMPLEX {
+        a = align_of(t.elem);
+    } else if a == 0 {
         return 1;
     }
-    return s;
+    if (t.quals & Q_ATOMIC) != 0 {
+        return atomic_align(t, a);
+    }
+    return a;
+}
+
+// The alignment of atomic type t, whose non-atomic version is aligned to a
+// (6.2.5p27 lets them differ). The size is the same; one of 1, 2, 4, 8 or 16
+// bytes is aligned to its size, so that it can be accessed with one
+// instruction (the rule of the x86-64 System V and AAPCS64 psABIs for
+// _Atomic, used on every target; 16-byte objects are aligned so too, though
+// this implementation does not access them lock-free: cgen_atomic.ax).
+fn atomic_align(t: *CType, a: u64) u64 {
+    let s = size_of(t);
+    if ((s == 1) or (s == 2) or (s == 4) or (s == 8) or (s == 16)) and (s > a) {
+        return s;
+    }
+    return a;
+}
+
+/// Whether a and b are both atomic types or both not (the _Atomic
+/// qualifier is kept where the others are ignored: 6.2.5p27, 6.7.3).
+pub fn same_atomic(a: *CType, b: *CType) bool {
+    return ((a.quals ^ b.quals) & Q_ATOMIC) == 0;
+}
+
+/// t without its const, volatile and restrict qualifiers: an atomic type
+/// stays atomic (a parameter's type in a function type: 6.7.6.3p15).
+pub fn unqual_keep_atomic(t: *mut CType) *mut CType {
+    return qualify(t.unq, t.quals & Q_ATOMIC);
 }
 
 // -----------------------------------------------------------------------------
@@ -1001,7 +1031,7 @@ pub fn compatible_unq(a0: *mut CType, b0: *mut CType) bool {
                 return false;
             }
             for i in 0..a.params.len {
-                if not compatible_unq(a.params[i], b.params[i]) {
+                if not same_atomic(a.params[i], b.params[i]) or not compatible_unq(a.params[i], b.params[i]) {
                     return false;
                 }
             }

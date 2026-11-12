@@ -1,7 +1,8 @@
 /* flags: --c-std=c11 */
 /* _Thread_local (C11): objects with thread storage duration, at file scope
-   and in blocks with static or extern. The implementation has no threads
-   (__STDC_NO_THREADS__), so there is one instance of each. */
+   and in blocks with static or extern: the main thread's instances (each
+   thread has its own: atomic_threads.c). There is no <threads.h> yet
+   (__STDC_NO_THREADS__). */
 #include "host.h"
 
 _Thread_local int counter = 5;

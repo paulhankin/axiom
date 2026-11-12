@@ -1,0 +1,270 @@
+// =============================================================================
+// csema_atomic.ax - atomic types (C11 6.2.5p27, 6.7.2.4, 6.7.3) and the
+// builtins <stdatomic.h> is written with (7.17), checked.
+//
+// An atomic type is a CType with the qualifier Q_ATOMIC, made by the
+// _Atomic qualifier or the _Atomic ( type-name ) specifier, which mean the
+// same type. Its size is its non-atomic version's; its alignment may be
+// stricter (ctypes.ax: atomic_align). An lvalue of atomic type is read and
+// written atomically (cgen_atomic.ax): its lvalue conversion is an atomic
+// load (the value has the non-atomic, unqualified type), an assignment an
+// atomic store, and ++, -- and the compound assignments atomic
+// read-modify-write operations (6.5.2.4p2, 6.5.16.2p3), all sequentially
+// consistent.
+//
+// The builtins (a CALL node's op, BI_ATOMIC_FIRST..BI_ATOMIC_LAST of
+// csema_builtin.ax's numbering) are the generic functions of 7.17:
+//
+//   __builtin_atomic_init(obj, v)                 atomic_init (not atomic)
+//   __builtin_atomic_load(obj, order)             atomic_load_explicit
+//   __builtin_atomic_store(obj, v, order)         atomic_store_explicit
+//   __builtin_atomic_exchange(obj, v, order)      atomic_exchange_explicit
+//   __builtin_atomic_compare_exchange(obj, expected, desired, success, failure)
+//                                                 ..._strong_explicit and _weak_explicit
+//   __builtin_atomic_fetch_add(obj, v, order) ... _sub, _or, _xor, _and
+//   __builtin_atomic_is_lock_free(obj)            atomic_is_lock_free
+//   __builtin_atomic_thread_fence(order)          atomic_thread_fence
+//   __builtin_atomic_signal_fence(order)          atomic_signal_fence
+//
+// obj is a pointer to an atomic type A, whose non-atomic version is C; a
+// value v is converted to C as by assignment (for fetch_add and fetch_sub
+// on an atomic pointer, to ptrdiff_t: the operand counts elements, as in
+// pointer arithmetic). A memory order is any integer expression (its value
+// is not used: every operation is sequentially consistent, which every
+// order allows).
+//
+// Diagnostics:
+//   C3092  an invalid atomic type: _Atomic on an array or function type,
+//          _Atomic ( type-name ) of an array, function, atomic or qualified type
+//   C3093  an operand of an atomic builtin of a type it does not take
+//   C4090  a member of an object of atomic type accessed (undefined, 6.5.2.3p5)
+//   C4091  a pointer to an atomic type converted to a pointer to void
+//          without the _Atomic qualifier (csema_expr.ax: assign_convert)
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "csema.ax" as cs;
+import "csema_expr.ax" as cx;
+import "ctypes.ax" as cty;
+
+// The builtins (a CALL node's op; csema_builtin.ax numbers the others apart,
+// below 60).
+pub const BI_ATOMIC_FIRST: i32 = 60;
+pub const BI_ATOMIC_INIT: i32 = 60;
+pub const BI_ATOMIC_LOAD: i32 = 61;
+pub const BI_ATOMIC_STORE: i32 = 62;
+pub const BI_ATOMIC_EXCHANGE: i32 = 63;
+pub const BI_ATOMIC_CMPXCHG: i32 = 64;
+pub const BI_ATOMIC_FETCH_ADD: i32 = 65;
+pub const BI_ATOMIC_FETCH_SUB: i32 = 66;
+pub const BI_ATOMIC_FETCH_OR: i32 = 67;
+pub const BI_ATOMIC_FETCH_XOR: i32 = 68;
+pub const BI_ATOMIC_FETCH_AND: i32 = 69;
+pub const BI_ATOMIC_IS_LOCK_FREE: i32 = 70;
+pub const BI_ATOMIC_THREAD_FENCE: i32 = 71;
+pub const BI_ATOMIC_SIGNAL_FENCE: i32 = 72;
+pub const BI_ATOMIC_LAST: i32 = 72;
+
+// Their names after "__builtin_atomic_", by BI_ number, and the standard's
+// names of the functions (for messages).
+let names: [13][]u8 = ["init", "load", "store", "exchange", "compare_exchange", "fetch_add", "fetch_sub", "fetch_or",
+                       "fetch_xor", "fetch_and", "is_lock_free", "thread_fence", "signal_fence"];
+let std_names: [13][]u8 = ["atomic_init", "atomic_load", "atomic_store", "atomic_exchange", "atomic_compare_exchange",
+                           "atomic_fetch_add", "atomic_fetch_sub", "atomic_fetch_or", "atomic_fetch_xor",
+                           "atomic_fetch_and", "atomic_is_lock_free", "atomic_thread_fence", "atomic_signal_fence"];
+// the number of arguments of each
+let arities: [13]usize = [2, 2, 3, 3, 5, 3, 3, 3, 3, 3, 1, 1, 1];
+
+// -----------------------------------------------------------------------------
+// Atomic types
+// -----------------------------------------------------------------------------
+
+/// t with the _Atomic qualifier (at sp): the atomic version of t, or the
+/// error type (6.7.3p3: not of an array or function type).
+pub fn qualifier(t: *mut cty.CType, sp: u.Span) *mut cty.CType {
+    if cty.is_error(t) {
+        return t;
+    }
+    if (t.kind == cty.TK_ARRAY) or cty.is_func(t) {
+        cs.err(sp, "C3092", u.f1("the _Atomic qualifier on %s, an array or function type", cs.tq(t)));
+        return cty.t_error;
+    }
+    return cty.qualify(t, cty.Q_ATOMIC);
+}
+
+/// The type _Atomic ( type-name ) names, t the type name's (6.7.2.4p3: not
+/// an array, function, atomic or qualified type), or the error type.
+pub fn specifier(t: *mut cty.CType, sp: u.Span) *mut cty.CType {
+    if cty.is_error(t) {
+        return t;
+    }
+    if (t.kind == cty.TK_ARRAY) or cty.is_func(t) {
+        cs.err(sp, "C3092", u.f1("_Atomic ( type-name ) of %s, an array or function type", cs.tq(t)));
+        return cty.t_error;
+    }
+    if t.quals != 0 {
+        cs.err(sp, "C3092",
+               u.f2("_Atomic ( type-name ) of %s, %s", cs.tq(t), u.pick(is_atomic(t), "an atomic type",
+                                                                        "a qualified type")));
+        return cty.t_error;
+    }
+    return cty.qualify(t, cty.Q_ATOMIC);
+}
+
+/// Whether t is an atomic type.
+pub fn is_atomic(t: *cty.CType) bool {
+    return (t.quals & cty.Q_ATOMIC) != 0;
+}
+
+// -----------------------------------------------------------------------------
+// The builtins of <stdatomic.h>
+// -----------------------------------------------------------------------------
+
+/// Whether BI_ number id is one of these builtins.
+pub fn is_builtin(id: i32) bool {
+    return (id >= BI_ATOMIC_FIRST) and (id <= BI_ATOMIC_LAST);
+}
+
+/// The BI_ number of the builtin `name` (it starts with "__builtin_atomic_"), or 0.
+pub fn builtin_id(name: []u8) i32 {
+    let rest = name[17..];
+    for k in 0..names.len {
+        if u.str_eq(rest, names[k]) {
+            return BI_ATOMIC_FIRST + @int_cast(i32, k);
+        }
+    }
+    return 0;
+}
+
+fn bad(e: *mut cast.Expr) void {
+    e.ty = cty.t_error;
+    e.lvalue = false;
+}
+
+fn is_err(e: *cast.Expr) bool {
+    return u.isnil(e.ty) or (e.ty.kind == cty.TK_ERROR);
+}
+
+/// Types call e of builtin id (its op): its arguments, converted as the
+/// generic function's parameters are (7.17), and its type.
+pub fn call(e: *mut cast.Expr, id: i32) void {
+    let k = @int_cast(usize, id - BI_ATOMIC_FIRST);
+    let what = std_names[k];
+    let n = arities[k];
+    if e.args.len != n {
+        cs.err(e.span, "C3023", u.f3("'%s' takes %s arguments, not %s", e.a.name, u.zdec(n), u.zdec(e.args.len)));
+        for x in e.args.items() {
+            _ = cx.rv(x);
+        }
+        bad(e);
+        return;
+    }
+    let mut ok = true;
+    for i in 0..n {
+        let x = cx.rv(e.args.get(i));
+        e.args.set(i, x);
+        if is_err(x) {
+            ok = false;
+        }
+    }
+    if not ok {
+        bad(e);
+        return;
+    }
+    e.ty = cty.t_void;
+    if (id == BI_ATOMIC_THREAD_FENCE) or (id == BI_ATOMIC_SIGNAL_FENCE) {
+        _ = order(e, 0, what);
+        return;
+    }
+    // the object: a pointer to an atomic type (7.17.1p5: A)
+    let p = e.args.get(0);
+    let pt = p.ty;
+    if (pt.kind != cty.TK_POINTER) or not is_atomic(pt.elem) or not cty.is_complete(pt.elem) {
+        cs.err(p.span, "C3093", u.f2("the first argument of %s has type %s, not a pointer to a complete atomic type",
+                                     what, cs.tq(pt)));
+        bad(e);
+        return;
+    }
+    let a = pt.elem;
+    let c = cty.unqual(a);  // C: the non-atomic version of A
+    if id == BI_ATOMIC_IS_LOCK_FREE {
+        e.ty = cty.t_bool;
+        return;
+    }
+    if (id != BI_ATOMIC_LOAD) and ((a.quals & cty.Q_CONST) != 0) {
+        cs.err(p.span, "C3093", u.f2("the first argument of %s points to a const-qualified type (%s)", what, cs.tq(a)));
+        bad(e);
+        return;
+    }
+    if id == BI_ATOMIC_LOAD {
+        if not order(e, 1, what) {
+            return;
+        }
+        e.ty = c;
+        return;
+    }
+    if (id == BI_ATOMIC_INIT) or (id == BI_ATOMIC_STORE) or (id == BI_ATOMIC_EXCHANGE) {
+        e.args.set(1, cx.assign_convert(e.args.get(1), c, u.f1("the value argument of %s", what)));
+        if (id != BI_ATOMIC_INIT) and not order(e, 2, what) {
+            return;
+        }
+        if id == BI_ATOMIC_EXCHANGE {
+            e.ty = c;
+        }
+        return;
+    }
+    if id == BI_ATOMIC_CMPXCHG {
+        // (7.17.7.4: C *expected, C desired)
+        let x = e.args.get(1);
+        if (x.ty.kind != cty.TK_POINTER) or not cty.compatible_unq(x.ty.elem, c) or (x.ty.elem.quals != 0) {
+            cs.err(x.span, "C3093", u.f3("the expected argument of %s has type %s, not %s", what, cs.tq(x.ty),
+                                         cs.tq(cty.pointer_to(c))));
+            bad(e);
+            return;
+        }
+        e.args.set(2, cx.assign_convert(e.args.get(2), c, u.f1("the desired argument of %s", what)));
+        if not order(e, 3, what) or not order(e, 4, what) {
+            return;
+        }
+        e.ty = cty.t_bool;
+        return;
+    }
+    // fetch_*: an atomic integer type other than atomic_bool (7.17.7.5p1),
+    // or for fetch_add and fetch_sub an atomic pointer to an object type
+    // (whose operand is ptrdiff_t: 7.17.7.5p2-3)
+    let additive = (id == BI_ATOMIC_FETCH_ADD) or (id == BI_ATOMIC_FETCH_SUB);
+    if cty.is_integer(c) and (c.kind != cty.TK_BOOL) {
+        e.args.set(1, cx.assign_convert(e.args.get(1), c, u.f1("the operand of %s", what)));
+    } else if additive and (c.kind == cty.TK_POINTER) and cty.is_complete(c.elem) {
+        let v = e.args.get(1);
+        if not cty.is_integer(v.ty) {
+            cs.err(v.span, "C3093", u.f2("the operand of %s on an atomic pointer has type %s, not an integer type",
+                                         what, cs.tq(v.ty)));
+            bad(e);
+            return;
+        }
+        e.args.set(1, cx.convert(v, cty.t_ptrdiff));
+    } else {
+        cs.err(p.span, "C3093", u.f3("%s of %s, which is not an atomic integer type other than atomic_bool%s", what,
+                                     cs.tq(a), u.pick(additive, " or an atomic pointer to an object type", "")));
+        bad(e);
+        return;
+    }
+    if not order(e, 2, what) {
+        return;
+    }
+    e.ty = c;
+}
+
+// Checks argument i of e, a memory order (7.17.3: an enumerated type, so
+// any integer); false after an error (e is then in error).
+fn order(e: *mut cast.Expr, i: usize, what: []u8) bool {
+    let x = e.args.get(i);
+    if not cty.is_integer(x.ty) {
+        cs.err(x.span, "C3093", u.f2("the memory order argument of %s has type %s, not memory_order", what,
+                                     cs.tq(x.ty)));
+        bad(e);
+        return false;
+    }
+    return true;
+}

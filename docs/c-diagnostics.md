@@ -171,7 +171,7 @@ names the feature and the standard that has it (or removed it).
 | `C3033` | An invalid initializer: of a typedef, a function or a parameter, an `extern` object in a block, or too many braces around a scalar. |
 | `C3045` | A function with internal linkage that is used and not defined (6.9p3). |
 | `C3050` | A static assertion that fails. |
-| `C3070` | An invalid bit-field (its type or width), or an operator applied to one (`&`, `sizeof`, `typeof`). |
+| `C3070` | An invalid bit-field (its type, an atomic type included, or width), or an operator applied to one (`&`, `sizeof`, `typeof`). |
 | `C3071` | An invalid alignment specifier (an incomplete type, a negative value, a value that is not a power of two or is larger than 4096), one where none may be, or objects declared with different alignments. |
 | `C3073` | An invalid `constexpr` declaration or initializer (C23). |
 | `C3074` | An invalid declaration whose type is inferred (`auto`, C23). |
@@ -179,6 +179,7 @@ names the feature and the standard that has it (or removed it).
 | `C3076` | `thread_local` where it cannot be, or declarations that disagree about it. |
 | `C3077` | An invalid argument clause of a standard attribute, or an attribute where it cannot be. |
 | `C3078` | An invalid compound literal: of variable length array or incomplete type, or with a storage-class specifier it cannot have. |
+| `C3092` | An invalid atomic type: the `_Atomic` qualifier on an array or function type, or `_Atomic ( type-name )` of an array, function, atomic or qualified type. |
 | `C3200` | A generic selection with more than one `default` association. |
 | `C3201` | An association of a generic selection whose type is not a complete object type, or is variably modified. |
 | `C3202` | Two associations of a generic selection with compatible types. |
@@ -232,6 +233,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3080` | A `va_list` builtin used wrongly: outside a variadic function, with an operand that is not a `va_list`, or `va_arg` of a type that cannot be fetched. Also: a variable length array before C99. |
 | `C3081` | `offsetof` of a bit-field, or with a member designator that does not designate a member. Also: a variably modified type where none can be (file scope, a member, static storage duration, a function's result, an `extern` object). |
 | `C3082` | An operand of a `<stdbit.h>`, `<stdckdint.h>` or `<complex.h>` builtin (or of a GNU dialect's builtin) of a type it does not take (`__builtin_complex` takes two operands of one real floating type; `__builtin_creal`, `__builtin_cimag` and `__builtin_conj` a complex one). Also: an initializer of a variable length array (from C23, other than `{}`). |
+| `C3093` | An argument of a `<stdatomic.h>` generic function of a type it does not take: an object that is not a pointer to a complete atomic type (or one to a `const` type, where the function stores), `fetch_` operations on `atomic_bool`, on a floating or structure type, or (other than `fetch_add` and `fetch_sub`) on a pointer, an `expected` argument that is not a pointer to the non-atomic type, a memory order that is not an integer. |
 | `C3083` | A `goto` into the scope of an identifier with a variably modified type (or, in a GNU dialect, of an object with a cleanup). |
 | `C3084` | A `case` or `default` label in the scope of such an identifier declared in its `switch` statement. |
 | `C3085` | `[*]` outside the parameters of a function prototype that is not a definition. |
@@ -241,7 +243,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3065` | An external name defined by a C translation unit and by an Axiom `export fn` of the same program; a note points to the Axiom definition. |
 | `C3066` | A C translation unit defines `main` in a program whose root module is Axiom's (`axiom build main.ax x.c`), which has the program's `main`. |
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
-| `C3901` | A feature that this implementation does not support: `_Atomic` (qualifier or specifier), `_Imaginary` (the imaginary types), and (C23) the decimal floating types; in a GNU dialect inline assembly, `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), explicit register variables, `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
+| `C3901` | A feature that this implementation does not support: `_Imaginary` (the imaginary types), and (C23) the decimal floating types; in a GNU dialect inline assembly, `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), explicit register variables, `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
 
 ### The GNU dialects
 
@@ -260,6 +262,8 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4051` | The result of a call of a `[[nodiscard]]` function is discarded, with its message if it has one. |
 | `C4052` | An attribute with no prefix that is not a standard attribute; in a GNU dialect, a GNU attribute this compiler does not know, or one where it cannot appertain: it is ignored. |
 | `C4053` | A function declared `_Noreturn` or `[[noreturn]]` that can return. Reported when code is generated. |
+| `C4090` | A member of an object of atomic structure or union type accessed (undefined, 6.5.2.3p5): it is accessed as an ordinary object. |
+| `C4091` | A pointer to an atomic type converted to a pointer to `void` that does not have the `_Atomic` qualifier (6.5.16.1p1 asks for it): the conversion is made. |
 | `C4080` | The second argument of `va_start` is not the function's last parameter. |
 | `C4081` | `va_arg` of a type that the default argument promotions change. |
 | `C4101` | A backslash-newline at the end of a file. |

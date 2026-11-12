@@ -637,6 +637,29 @@ function cDriverCases() {
       const c = await ax(['build', '--help']);
       return c.status === 0 && /--c-std=c89\|c90\|c95\|c99\|c11\|c17\|c18\|c23/.test(c.stderr) ? null : `--help: ${c.stderr}`;
     },
+    'C: thread-locals and atomics in a program linked statically': async () => {
+      if (skip()) return skip();
+      if (!native || noC) return { skip: true, reason: 'Linux targets only' };
+      // (no C library: the compiler's linker, the runtime's threads and TLS blocks; the exit status says)
+      write({ 'tls.c': 'void *__axiom_c_thread_start(void (*f)(void *), void *arg);\n' +
+        'void __axiom_c_thread_join(void *thread);\nint g[4];\n_Thread_local int *tp = &g[2];\n' +
+        '_Thread_local int tv = 7;\n_Thread_local long long tz;\n_Atomic int bad, sum;\n' +
+        'static void w(void *a) {\n    int id = (int)(long long)a;\n    if (tp != &g[2] || tv != 7 || tz != 0) bad++;\n' +
+        '    tv = id; tz = id * 10; tp = &g[id];\n    for (int i = 0; i < 1000; i++) sum++;\n' +
+        '    if (tv != id || tz != id * 10 || tp != &g[id]) bad++;\n}\nint main(void) {\n    void *t[3];\n' +
+        '    for (int i = 0; i < 3; i++) t[i] = __axiom_c_thread_start(w, (void *)(long long)i);\n' +
+        '    for (int i = 0; i < 3; i++) __axiom_c_thread_join(t[i]);\n' +
+        '    return bad * 100 + (sum == 3000) * 10 + (tv == 7) + (tp == &g[2]) * 2;\n}\n' });
+      for (const o of ['-O0', '-O2']) {
+        const out = path.join(dir, `tls${o}`);
+        const c = await ax(['build', 'tls.c', o, nativeTarget, '-o', out]);
+        if (c.status !== 0) return `build ${o}: ${c.stdout}${c.stderr}`;
+        const r = execWrap.length ? spawnSync(execWrap[0], [...execWrap.slice(1), out], { encoding: 'utf8' })
+          : spawnSync(out, [], { encoding: 'utf8' });
+        if (r.status !== 13) return `${o}: exit status ${r.status} (13 expected) ${r.stderr || ''}`;
+      }
+      return null;
+    },
     'C: C and Axiom in one program: the command line': async () => {
       if (skip()) return skip();
       write({ 'm.ax': 'extern "C" {\n    fn c_f(x: i32) i32;\n}\n\nexport fn main() i32 {\n    return c_f(2) - 4;\n}\n',

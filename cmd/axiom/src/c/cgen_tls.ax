@@ -1,0 +1,172 @@
+// =============================================================================
+// cgen_tls.ax - objects with thread storage duration (C11 6.2.4p4:
+// _Thread_local, C23 thread_local): one instance per thread, each starting
+// with the object's initial value.
+//
+// On native targets such an object is a thread-local global of the IR
+// (ir.Global.tls), which each backend and linker implement as Axiom's own
+// thread-locals are (docs/spec.md §12.8.6): ELF TLS (local-exec) with a TLS
+// segment on Linux, the PE TLS directory on Windows, the runtime's TLS block
+// on macOS; a thread the runtime or the C library creates gets its copy.
+//
+// On WebAssembly a thread is an instance of the module on a shared memory,
+// and memory has no per-instance part. Without threads (a module with one
+// instance) the objects are ordinary globals. With threads (the program
+// creates some: codegen.ax's g_threads) each object's main-thread instance
+// is still its global, and every other thread has a block of all of them,
+// which the thread's start (codegen.ax: emit_thread_start) makes at the top
+// of its stack by calling TLS_START: it copies each object's initial value
+// (a constant global beside it) to the object's offset in the block and
+// records the block's address in a wasm global (per instance, so per
+// thread), which is null in the main thread. An access is to the global, or
+// to its offset in the block.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "ctypes.ax" as cty;
+
+/// The function a WebAssembly thread's start calls with the top of its
+/// stack, which returns the top below the C thread-locals' block.
+pub let TLS_START: []u8 = "axiom.c.tls_start";
+let TLS_PTR: []u8 = "axiom.c.tls";
+
+/// Whether the program creates threads on WebAssembly (set before the IR is
+/// generated: cc.ax).
+pub let mut wasm_threads: bool = false;
+
+// The objects in the block: their main-thread globals, and constant
+// globals holding their offsets in the block (set by define_start, once the
+// units have defined every object: a unit may use one another defines), in
+// order (by symbol: an object that several units declare is one).
+struct Entry {
+    g: *mut ir.Global,
+    off: *mut ir.Global,
+}
+
+let mut entries: u.List.[Entry] = u.List.[Entry].{ data: @ptr_from_int(*mut Entry, 0), len: 0, cap: 0 };
+
+fn is_thread_local(s: *cast.CSym) bool {
+    return (s.flags & cast.CF_THREAD_LOCAL) != 0;
+}
+
+// Whether object s lives in the WebAssembly threads' blocks.
+fn in_block(s: *cast.CSym) bool {
+    return cg.is_wasm and wasm_threads and is_thread_local(s);
+}
+
+/// The address of object s (with static or thread storage duration) in the
+/// function being generated: for a thread-local, the running thread's
+/// instance.
+pub fn addr(s: *mut cast.CSym) *mut ir.Value {
+    let gv = cg.object_addr(s);
+    if not in_block(s) {
+        return gv;
+    }
+    let off = ir.load(cg.B, cg.T_isz, offset_of(ir.gv_of(gv)));
+    let p = ir.load(cg.B, cg.T_ptr, tls_ptr());
+    let mine = ir.ptradd(cg.B, p, off);
+    return ir.select(cg.B, ir.is_null(cg.B, p), gv, mine);
+}
+
+// The block's address in this thread (null in the main thread): a wasm
+// global, so one per instance.
+fn tls_ptr() *mut ir.Value {
+    let g0 = ir.get_global(cg.M, TLS_PTR);
+    if u.notnil(g0) {
+        return g0.val;
+    }
+    let g = ir.add_global(cg.M, cg.T_ptr, TLS_PTR);
+    g.init = ir.czero(cg.T_ptr);
+    g.wasm_global = true;
+    g.linkage = ir.LINK_INTERNAL;
+    return g.val;
+}
+
+// The global holding the offset of g's object in the block.
+fn offset_of(g: *mut ir.Global) *mut ir.Value {
+    for e in entries.items() {
+        if e.g == g {
+            return e.off.val;
+        }
+    }
+    let o = ir.add_global(cg.M, cg.T_isz, u.cat2(g.name, ".tls_offset"));
+    o.is_const = true;
+    o.linkage = ir.LINK_INTERNAL;
+    o.align = cg.T_isz.size;
+    o.init = ir.czero(cg.T_isz);
+    entries.push(Entry.{ g: g, off: o });
+    return o.val;
+}
+
+/// Defines TLS_START (WebAssembly with threads; after the units): copies
+/// each object's initial value into the new thread's block, below `top`,
+/// and records its address. The globals' sizes are known by now.
+pub fn define_start() void {
+    if not (cg.is_wasm and wasm_threads) {
+        return;
+    }
+    let mut ps: [1]*mut ir.Ty = [cg.T_ptr];
+    let fty = ir.t_fn(cg.T_ptr, ps[..], false);
+    let mut f = ir.get_function(cg.M, TLS_START);
+    if u.isnil(f) {
+        f = ir.add_function(cg.M, TLS_START, fty);
+    }
+    if not ir.is_decl(f) {
+        return;
+    }
+    f.linkage = ir.LINK_INTERNAL;
+    // the block's layout: each object at the next multiple of its alignment
+    let mut block_size: u64 = 0;
+    let mut block_align: u64 = 16;
+    let offs = u.newn.[u64](entries.len + 1);
+    for k in 0..entries.len {
+        let e = entries.get(k);
+        let al = @max(e.g.align, 1);
+        if al > block_align {
+            block_align = al;
+        }
+        offs[k] = cty.round_up(block_size, al);
+        e.off.init = ir.cint(cg.T_isz, offs[k]);
+        block_size = offs[k] + e.g.ty.size;
+    }
+    let saved = cg.B;
+    let B = ir.new_builder();
+    cg.B = B;
+    ir.at_end(B, ir.append_block(f, "entry"));
+    let top = f.params[0];
+    if entries.len == 0 {
+        ir.ret(B, top);
+        cg.B = saved;
+        return;
+    }
+    let size = cty.round_up(block_size, block_align);
+    let base0 = ir.ptradd(B, top, ir.cint(cg.T_isz, 0 -% size));
+    // (aligned down: the stack's top is 16-aligned, an object may need more)
+    let a = ir.ptrtoint(B, base0, cg.T_isz);
+    let base = ir.ptradd(B, base0, ir.sub(B, cg.usz(0), ir.and_(B, a, cg.usz(block_align - 1))));
+    for k in 0..entries.len {
+        let e = entries.get(k);
+        let t = initial_copy(e.g);
+        let dst = ir.ptradd(B, base, cg.usz(offs[k]));
+        _ = ir.memop(B, ir.OP_MEMCPY, dst, t, cg.usz(e.g.ty.size));
+    }
+    _ = ir.store(B, base, tls_ptr());
+    ir.ret(B, base);
+    cg.B = saved;
+}
+
+// A constant global holding g's initial value (the main thread's instance
+// changes).
+fn initial_copy(g: *mut ir.Global) *mut ir.Value {
+    let c = ir.add_global(cg.M, g.ty, u.cat2(g.name, ".tls_init"));
+    c.init = g.init;
+    if u.isnil(c.init) {
+        c.init = ir.czero(g.ty);
+    }
+    c.is_const = true;
+    c.align = g.align;
+    c.linkage = ir.LINK_INTERNAL;
+    return c.val;
+}
