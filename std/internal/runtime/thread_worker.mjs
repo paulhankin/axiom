@@ -8,19 +8,27 @@
 // ends that test.
 import fs from 'fs';
 import { BroadcastChannel, workerData } from 'worker_threads';
-import { createHost, describeTrap, formatTrap, trapResult } from './host.mjs';
+import { THREAD_EXIT, createHost, describeTrap, formatTrap, trapResult } from './host.mjs';
 
 const { module, memory, entry, arg, stackTop, exited, netPort, shared, testTrap } = workerData;
 const host = createHost({ memory, netPort, shared });
 let instance = null;
-try {
-  instance = host.instantiateModule(module);
-  instance.exports.axiom_thread_start(entry, arg, stackTop);
-  // Only now is the thread off its stack, which the program may then free.
+// Only once the entry has returned (or the thread ended itself: the host's
+// ax_thread_exit) is the thread off its stack, which the program may then free.
+const done = () => {
   const words = new Int32Array(memory.buffer);
   const i = Number(exited) / 4;
   Atomics.store(words, i, 1);
   Atomics.notify(words, i, 1);
+};
+try {
+  instance = host.instantiateModule(module);
+  try {
+    instance.exports.axiom_thread_start(entry, arg, stackTop);
+  } catch (e) {
+    if (e !== THREAD_EXIT) throw e;
+  }
+  done();
 } catch (e) {
   const t = describeTrap(instance, memory, e);
   if (testTrap) {

@@ -8,7 +8,11 @@
 //                    (the names the compiler prints with --emit=c-lib-defs)
 //                    or a run-time module of std/c/rt/ (its `export fn`s)
 //     N path name    the run-time module path calls the C function name (in
-//                    an extern "C" block)
+//                    an extern "C" block), or a run-time module it imports does
+//     A path alt     where the target cannot have threads (WebAssembly
+//                    without the atomics extension), the run-time module
+//                    alt (path's name with _none) is linked in path's place:
+//                    it defines the same names
 //
 //     AXIOM=cmd/axiom/build/axiom node cmd/internal/tools/gen_c_lib_index.mjs
 //     node cmd/internal/tools/gen_c_lib_index.mjs --check   (the suite: is it current?)
@@ -47,16 +51,36 @@ for (const f of walk(path.join(std, 'lib'), '.c')) {
   if (r.status !== 0) throw new Error(`${rel}: ${r.stdout}${r.stderr}`);
   for (const n of r.stdout.split('\n').filter((x) => x)) def(n, rel);
 }
+// The C functions a run-time module calls, with those of the run-time
+// modules it imports (`import "name.ax"`, beside it), which come with it.
+const calls = (f, seen = new Set()) => {
+  if (seen.has(f)) return [];
+  seen.add(f);
+  const text = fs.readFileSync(f, 'utf8');
+  const out = [];
+  for (const b of text.matchAll(/^extern "C" \{([^}]*)\}/gm)) {
+    for (const m of b[1].matchAll(/^\s*fn (\w+)/gm)) out.push(m[1]);
+  }
+  for (const m of text.matchAll(/^import "(\w+\.ax)"/gm)) {
+    const g = path.join(path.dirname(f), m[1]);
+    if (fs.existsSync(g)) out.push(...calls(g, seen));
+  }
+  return out;
+};
 for (const f of walk(path.join(std, 'rt'), '.ax')) {
   const rel = path.relative(std, f).split(path.sep).join('/');
   const text = fs.readFileSync(f, 'utf8');
-  for (const m of text.matchAll(/^export fn (\w+)/gm)) def(m[1], rel);
-  for (const b of text.matchAll(/^extern "C" \{([^}]*)\}/gm)) {
-    for (const m of b[1].matchAll(/^\s*fn (\w+)/gm)) lines.push(`N ${rel} ${m[1]}`);
+  if (rel.endsWith('_none.ax')) {
+    const main = rel.replace(/_none\.ax$/, '.ax');
+    if (!fs.existsSync(path.join(std, main))) throw new Error(`${rel} stands in for ${main}, which is not there`);
+    lines.push(`A ${main} ${rel}`);
+    continue;
   }
+  for (const m of text.matchAll(/^export fn (\w+)/gm)) def(m[1], rel);
+  for (const n of [...new Set(calls(f))]) lines.push(`N ${rel} ${n}`);
 }
 const text = `# std/c/lib/index - the C library's index (cmd/internal/tools/gen_c_lib_index.mjs
-# writes it; do not edit): D name path, N module name
+# writes it; do not edit): D name path, N module name, A module alt
 ${lines.join('\n')}
 `;
 const out = path.join(std, 'lib', 'index');

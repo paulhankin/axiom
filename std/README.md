@@ -65,7 +65,7 @@ that owns memory has `deinit`).
 
 | Module | Contents |
 |---|---|
-| [`thread`](thread.ax) | `spawn(f, arg)` → `Thread[T]` with `join()`; `parallel_for`; `cpu_count`, `sleep_ms` |
+| [`thread`](thread.ax) | `spawn(f, arg)` → `Thread[T]` with `join()` and `is_finished()`; `exit` (of the calling thread); `parallel_for`; `cpu_count`, `sleep_ms` |
 | [`sync`](sync.ax) | `Atomic[T: Int]`, `Mutex`, `Condvar` (with timeouts), `RwLock` (writer-preferring), `Semaphore`, `Once`, `Barrier`, `WaitGroup`, `Channel[T]` (bounded MPMC, closable) |
 | [`thread/pool`](thread/pool.ax) | A thread pool: `submit(f, arg)` → `Future[A, R]` (`join`, `done`), fire-and-forget `run`, `wait` for all |
 
@@ -376,7 +376,7 @@ signals, terminals, UDP, Unix-domain sockets, polling, name resolution, file wat
 | `ax_tcp_accept(h) i32`, `ax_tcp_local_port(h) i32` | |
 | `ax_sock_read(h, p, n) isize`, `ax_sock_write(h, p, n) isize`, `ax_sock_close(h)` | |
 | `ax_sock_timeout(h, ms) i32` | later reads and writes on `h` fail with `-5` after `ms` milliseconds (`0`: never) |
-| `ax_thread_spawn(entry, arg, stack_top, exited) i32`, `ax_thread_stack_size() usize` | threads (spec §12.8.5) |
+| `ax_thread_spawn(entry, arg, stack_top, exited) i32`, `ax_thread_stack_size() usize`, `ax_thread_exit()` | threads (spec §12.8.5) |
 | `ax_cpu_count() u32`, `ax_sleep_ns(ns)` | |
 | `ax_random(p, n) i32` | fills `p[0..n]` with cryptographically secure random bytes |
 | `ax_clock_ns(clock) i64` | nanoseconds on clock `0` (real time since 1970), `1` (monotonic) or `2` (the processor time of the process) |

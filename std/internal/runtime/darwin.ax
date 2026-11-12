@@ -109,6 +109,7 @@ pub extern "C" {
     fn pthread_setspecific(key: u64, value: *void) i32;
     fn pthread_getspecific(key: u64) *mut void;
     fn pthread_self() *mut void;
+    fn pthread_exit(r: *mut void) void;
     fn pthread_get_stackaddr_np(t: *mut void) *mut void;
     fn pthread_get_stacksize_np(t: *mut void) usize;
     fn socket(domain: i32, ty: i32, proto: i32) i32;
@@ -2370,20 +2371,43 @@ fn thread_main(p: *mut void) *mut void {
     if has_thread_hook {
         thread_hook(true);
     }
+    cur_start = @int_from_ptr(st);
     st.entry(st.arg);
+    thread_end(st);
+    return vnull();
+}
+
+// The calling thread's ThreadStart (0 on a thread the runtime did not
+// start: the main thread), for ax_thread_exit.
+threadlocal let mut cur_start: usize = 0;
+
+// What a thread does after its entry function: `exited` set, its signal
+// stack and record freed (its thread-local block goes with its key).
+fn thread_end(st: *mut ThreadStart) void {
     if has_thread_hook {
         thread_hook(false);
     }
     @atomic_store(st.exited, 1);
     _ = ax_notify32(st.exited, 1);
-    // the signal stack goes with the thread (its block goes with its key)
     let off = StackT.{ sp: 0, size: 0, flags: 4 };  // SS_DISABLE
     let mut old = StackT.{ sp: 0, size: 0, flags: 0 };
     if sigaltstack(&off, &mut old) == 0 {
         __axiom_libc_free(@ptr_from_int(*mut void, old.sp));
     }
-    __axiom_libc_free(p);
-    return vnull();
+    __axiom_libc_free(@ptr_cast(*mut void, st));
+}
+
+/// Ends the calling thread, which ax_thread_spawn started, as its entry
+/// function's return would (thread_end, then pthread_exit). Returns at once
+/// on any other thread (the main thread).
+export fn ax_thread_exit() void {
+    if cur_start == 0 {
+        return;
+    }
+    let st = @ptr_from_int(*mut ThreadStart, cur_start);
+    cur_start = 0;
+    thread_end(st);
+    pthread_exit(vnull());
 }
 
 // stack_top is ignored: native threads get their stack from the system.

@@ -772,14 +772,13 @@ function cDriverCases() {
       if (skip()) return skip();
       if (!native || noC) return { skip: true, reason: 'Linux targets only' };
       // (no C library: the compiler's linker, the runtime's threads and TLS blocks; the exit status says)
-      write({ 'tls.c': 'void *__axiom_c_thread_start(void (*f)(void *), void *arg);\n' +
-        'void __axiom_c_thread_join(void *thread);\nint g[4];\n_Thread_local int *tp = &g[2];\n' +
+      write({ 'tls.c': '#include <threads.h>\nint g[4];\n_Thread_local int *tp = &g[2];\n' +
         '_Thread_local int tv = 7;\n_Thread_local long long tz;\n_Atomic int bad, sum;\n' +
-        'static void w(void *a) {\n    int id = (int)(long long)a;\n    if (tp != &g[2] || tv != 7 || tz != 0) bad++;\n' +
+        'static int w(void *a) {\n    int id = (int)(long long)a;\n    if (tp != &g[2] || tv != 7 || tz != 0) bad++;\n' +
         '    tv = id; tz = id * 10; tp = &g[id];\n    for (int i = 0; i < 1000; i++) sum++;\n' +
-        '    if (tv != id || tz != id * 10 || tp != &g[id]) bad++;\n}\nint main(void) {\n    void *t[3];\n' +
-        '    for (int i = 0; i < 3; i++) t[i] = __axiom_c_thread_start(w, (void *)(long long)i);\n' +
-        '    for (int i = 0; i < 3; i++) __axiom_c_thread_join(t[i]);\n' +
+        '    if (tv != id || tz != id * 10 || tp != &g[id]) bad++;\n    return 0;\n}\nint main(void) {\n    thrd_t t[3];\n' +
+        '    for (int i = 0; i < 3; i++) thrd_create(&t[i], w, (void *)(long long)i);\n' +
+        '    for (int i = 0; i < 3; i++) thrd_join(t[i], 0);\n' +
         '    return bad * 100 + (sum == 3000) * 10 + (tv == 7) + (tp == &g[2]) * 2;\n}\n' });
       for (const o of ['-O0', '-O2']) {
         const out = path.join(dir, `tls${o}`);

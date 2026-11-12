@@ -24,6 +24,7 @@ pub extern "C" {
     fn pthread_attr_init(a: *mut void) i32;
     fn pthread_attr_setdetachstate(a: *mut void, s: i32) i32;
     fn pthread_attr_destroy(a: *mut void) i32;
+    fn pthread_exit(r: *mut void) void;
 }
 
 // Error codes shared with std/internal/runtime/host.mjs and std/net.ax.
@@ -1003,14 +1004,44 @@ let mut next_thread_id: i32 = 1;
 let mut threads: usize = 0;  // ThreadStart records of threads not yet reclaimed
 let mut threads_lock: u32 = 0;
 
+// The calling thread's ThreadStart (0 on a thread the runtime did not
+// start: the main thread), for ax_thread_exit.
+threadlocal let mut cur_start: usize = 0;
+
 fn thread_run(p: *mut void) void {
     let mark: usize = 0;
     stack_hi = @int_from_ptr(&mark);
     let st = @ptr_cast(*mut ThreadStart, p);
+    cur_start = @int_from_ptr(st);
     _ = sys.sigaltstack(st.alt, ALT);
     st.entry(st.arg);
     @atomic_store(st.exited, 1);
     _ = ax_notify32(st.exited, 1);
+}
+
+/// Ends the calling thread, which ax_thread_spawn started, as its entry
+/// function's return would: `exited` is set (the thread is off the stack
+/// the program gave it) and the thread's mapping goes as it would then
+/// (the kernel's exit of the thread, or pthread_exit with the C library).
+/// Returns at once on any other thread (the main thread).
+export fn ax_thread_exit() void {
+    if cur_start == 0 {
+        return;
+    }
+    let st = @ptr_from_int(*mut ThreadStart, cur_start);
+    let base = st.base;
+    let size = st.size;
+    @atomic_store(st.exited, 1);
+    _ = ax_notify32(st.exited, 1);
+    if sys.ax_libc_linked() != 0 {
+        // (as thread_main after thread_run: the record and signal stack go)
+        _ = sys.sigaltstack_disable();
+        _ = sys.munmap(base, size);
+        pthread_exit(@ptr_from_int(*mut void, 0));
+    }
+    // (the mapping, this stack's, is reclaimed once the kernel has cleared
+    // ctid: reclaim)
+    sys.exit_thread();
 }
 
 // (pthread_create's calling convention: returns a pointer.) The thread

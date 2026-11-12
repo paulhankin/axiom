@@ -1,16 +1,14 @@
 /* flags: --c-std=c11 */
-/* Atomics and thread-locals with threads (the runtime's, through
-   std/internal/runtime/c_threads.ax): counters incremented with fetch_add,
-   ++ and +=, a compare-exchange loop, a structure through the lock table, a
+/* Atomics and thread-locals with threads (<threads.h>'s): counters
+   incremented with fetch_add, ++ and +=, a compare-exchange loop, a structure through the lock table, a
    spinlock of an atomic_flag around plain data, and each thread's own
    instances of the thread-locals (initialized, and zeroed). Without
    atomicity the totals come out short; with shared thread-locals the
    per-thread checks fail. */
 #include <stdatomic.h>
-#include "host.h"
+#include <threads.h>
+#include "print.h"
 
-void *__axiom_c_thread_start(void (*f)(void *), void *arg);
-void __axiom_c_thread_join(void *thread);
 
 #define THREADS 4
 #define ROUNDS 20000
@@ -37,7 +35,7 @@ static _Thread_local char tl_name[8] = "main";
 atomic_int tls_bad;
 atomic_int tls_sum;
 
-static void work(void *arg) {
+static int work(void *arg) {
     int id = (int)(long long)arg;
     int i;
     /* this thread's instances start with the initial values */
@@ -86,18 +84,19 @@ static void work(void *arg) {
     if (tl_init != id || tl_name[0] != 'a' + id || tl_ptr != &slots[id])
         atomic_fetch_add(&tls_bad, 1);
     atomic_fetch_add(&tls_sum, (int)(tl_zero / ROUNDS));
+    return 0;
 }
 
 int main(void) {
-    void *t[THREADS];
+    thrd_t t[THREADS];
     int i, filled = 0;
     struct wide w;
     struct odd o;
     cursor = slots;
     for (i = 0; i < THREADS; i++)
-        t[i] = __axiom_c_thread_start(work, (void *)(long long)i);
+        thrd_create(&t[i], work, (void *)(long long)i);
     for (i = 0; i < THREADS; i++)
-        __axiom_c_thread_join(t[i]);
+        thrd_join(t[i], NULL);
     print_i64(counter);
     print_i64(big_counter);
     print_i64(wrap16);

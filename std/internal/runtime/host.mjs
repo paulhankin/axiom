@@ -13,10 +13,13 @@
 // instantiate() handles modules that import a shared memory (threaded programs).
 import fs from 'fs';
 import os from 'os';
-import { MessageChannel, Worker } from 'worker_threads';
+import { MessageChannel, Worker, isMainThread } from 'worker_threads';
 import tty from 'tty';
 
 const READ_CHUNK = 1 << 16;
+
+// What ax_thread_exit throws to leave a thread's code (thread_worker.mjs).
+export const THREAD_EXIT = Symbol('axiom thread exit');
 
 export const TRAP_NAMES = [
   'trap', 'index out of bounds', 'integer overflow', 'division by zero', 'int_cast out of range',
@@ -816,6 +819,11 @@ export function createHost(opts = {}) {
       return nextThread++;
     },
     ax_thread_stack_size: () => THREAD_STACK,
+    // Ends the calling thread (a worker): thread_worker.mjs catches this,
+    // as the return of the thread's entry. Nothing on the main thread.
+    ax_thread_exit() {
+      if (!isMainThread) throw THREAD_EXIT;
+    },
     ax_os: () => ({ linux: 1, darwin: 2, win32: 3 }[process.platform] || 0),
     // WebAssembly cannot ask the processor (std/os/cpu.ax): no extensions.
     ax_cpu_features: () => 0n,

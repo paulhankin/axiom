@@ -1,0 +1,640 @@
+// =============================================================================
+// std/c/rt/threads.ax - the run-time layer of C's <threads.h> (C17 7.26,
+// std/c/lib/threads/) but for the creation and end of threads
+// (threads_spawn.ax): mutexes, condition variables, call_once, the
+// thread-specific storage and its destructors, thrd_current, thrd_sleep and
+// thrd_yield. Each export is generated only when C code refers to it.
+//
+// The primitives are std/sync's (the same three-state futex mutex, the
+// sequence-counter condition variable, the three-state once), on Axiom's
+// atomics and @atomic_wait / @atomic_notify, written here rather than
+// imported because this module must not make a program threaded: std/sync
+// imports std/thread (for its tests), and a WebAssembly program that has
+// std/thread runs on a shared memory, which needs the atomics extension.
+// Every wait goes through `wait`, which knows two things std/sync does not:
+//   - on WebAssembly, while no thread has been started (std/mem's
+//     threads_enabled), nothing can wake a waiting thread and the memory
+//     may not be shared (where @atomic_wait traps): a wait sleeps until its
+//     timeout (or for ever);
+//   - on WebAssembly a thread other than the main one cannot end the process
+//     (its host ends only that thread): its exit asks the main thread to,
+//     and the main thread's waits here look for that request (in slices of
+//     at most 50 ms) and end the process with the status (exit_request).
+//
+// No int crosses (its width is the build's, --c-int): results are the
+// <threads.h> codes as i64 (std/c/include/threads.h: thrd_success 0,
+// thrd_busy 1, thrd_error 2, thrd_nomem 3, thrd_timedout 4), and times are
+// i64 nanoseconds: a deadline since the epoch of TIME_UTC (the real-time
+// clock), a duration otherwise. The objects are the C types' (threads.h):
+// mtx_t is Mtx, cnd_t Cnd, once_flag Once, all of 64-bit fields.
+// =============================================================================
+import "../../mem.ax" as mem;
+import "../../os.ax" as os;
+
+import host "axiom" {
+    fn ax_clock_ns(clock: u32) i64;
+    fn ax_sleep_ns(ns: u64) void;
+}
+
+extern "C" {
+    // std/c/lib/threads/__axc_tss_call.c: calls a destructor (C's
+    // void (*)(void *)) with its value
+    fn __axc_tss_call(dtor: fn(*mut void) void, p: *mut void) void;
+    // thrd_yield's: Linux (the runtime's system call stub, lstub.ax), macOS
+    // (libSystem), Windows (kernel32)
+    fn ax_syscall(n: isize, a: isize, b: isize, c: isize, d: isize, e: isize, f: isize) isize;
+    fn sched_yield() i32;
+    fn SwitchToThread() i32;
+}
+
+pub const SUCCESS: i64 = 0;
+pub const BUSY: i64 = 1;
+pub const ERROR: i64 = 2;
+pub const NOMEM: i64 = 3;
+pub const TIMEDOUT: i64 = 4;
+
+// mtx_init's types (threads.h): mtx_plain 0, mtx_recursive 1, mtx_timed 2
+const RECURSIVE: u64 = 1;
+const TIMED: u64 = 2;
+
+// TSS_DTOR_ITERATIONS (threads.h)
+const DTOR_ITERATIONS: u32 = 4;
+
+const FOREVER: i64 = -1;
+const SLICE_NS: i64 = 50_000_000;
+
+fn is_wasm() bool {
+    return @target_arch("wasm32") or @target_arch("wasm64");
+}
+
+/// The real-time clock (TIME_UTC), in nanoseconds since the epoch.
+pub fn now_utc() i64 {
+    return ax_clock_ns(0);
+}
+
+// -----------------------------------------------------------------------------
+// The calling thread
+// -----------------------------------------------------------------------------
+
+/// A thread as <threads.h> knows it (thrd_t points to one). Those
+/// thrd_create starts are a larger record's first member
+/// (threads_spawn.ax); every other thread (the main thread, and threads
+/// that something else started) has its own `own`.
+pub struct CThread {
+    result: i64,    // thrd_exit's argument, or the start function's result
+    done: u32,      // 1 once the thread has ended (its destructors run)
+    spawned: bool,  // started by thrd_create (then a threads_spawn.ax record)
+}
+
+pub threadlocal let mut cur: *mut CThread = @ptr_from_int(*mut CThread, 0);
+threadlocal let mut own: CThread = CThread.{ result: 0, done: 0, spawned: false };
+
+/// The calling thread's record (thrd_current).
+pub fn current() *mut CThread {
+    if @int_from_ptr(cur) == 0 {
+        cur = &mut own;
+    }
+    return cur;
+}
+
+/// thrd_current (7.26.5.2).
+export fn __axc_thrd_current() *mut CThread {
+    return current();
+}
+
+// A value unique to each live thread: a mutex's owner.
+threadlocal let mut tag: u8 = 0;
+
+pub fn me() u64 {
+    return @as(u64, @int_from_ptr(&tag));
+}
+
+// -----------------------------------------------------------------------------
+// Waiting, and the exit of a WebAssembly program from another thread
+// -----------------------------------------------------------------------------
+
+/// Whether the calling thread is a WebAssembly worker that thrd_create
+/// started (threads_spawn.ax sets it): it cannot end the process.
+pub threadlocal let mut on_worker: bool = false;
+
+// exit's request to the main thread: its status, and 1 once made
+let mut exit_requested: u32 = 0;
+let mut exit_status: i64 = 0;
+// the word the main thread waits on (0: none), which a request wakes
+let mut main_waits_on: usize = 0;
+
+/// Ends the process with the status an exit on another thread asked for,
+/// if it did (on the main thread of a WebAssembly program).
+pub fn exit_request() void {
+    if @atomic_load(&exit_requested) != 0 {
+        os.exit(@truncate(i32, @atomic_load(&exit_status)));
+    }
+}
+
+/// (WebAssembly, a worker: exit's end, std/c/lib/threads/__axc_thrd_atexit)
+/// Asks the main thread to end the process with `status`, and waits for it.
+pub fn request_exit(status: i64) void {
+    @atomic_store(&mut exit_status, status);
+    @atomic_store(&mut exit_requested, 1);
+    let w = @atomic_load(&main_waits_on);
+    if w != 0 {
+        _ = @atomic_notify(@ptr_from_int(*u32, w), 0xFFFF_FFFF);
+    }
+    loop {
+        ax_sleep_ns(3_600_000_000_000);
+    }
+}
+
+/// Waits while *p is v, for at most timeout_ns nanoseconds (FOREVER: no
+/// limit), as @atomic_wait: 0 woken, 1 *p was not v, 2 timed out. (See the
+/// header for WebAssembly's two cases.)
+pub fn wait(p: *u32, v: u32, timeout_ns: i64) u32 {
+    if not is_wasm() {
+        return @atomic_wait(p, v, timeout_ns);
+    }
+    if not mem.threads_enabled() {
+        if @atomic_load(p) != v {
+            return 1;
+        }
+        if timeout_ns < 0 {
+            loop {
+                ax_sleep_ns(3_600_000_000_000);
+            }
+        }
+        ax_sleep_ns(@bit_cast(u64, timeout_ns));
+        return 2;
+    }
+    if on_worker {
+        return @atomic_wait(p, v, timeout_ns);
+    }
+    // the main thread: in slices, between which it looks for a request
+    let mut left = timeout_ns;
+    loop {
+        exit_request();
+        let mut t = SLICE_NS;
+        if (left >= 0) and (left < t) {
+            t = left;
+        }
+        @atomic_store(&mut main_waits_on, @int_from_ptr(p));
+        let start = ax_clock_ns(1);
+        let r = @atomic_wait(p, v, t);
+        @atomic_store(&mut main_waits_on, 0);
+        if r != 2 {
+            exit_request();
+            return r;
+        }
+        if left >= 0 {
+            left -= @max(ax_clock_ns(1) - start, 1);
+            if left <= 0 {
+                return 2;
+            }
+        }
+    }
+}
+
+// The nanoseconds from now to the real-time deadline (FOREVER for none),
+// at least 0.
+fn until(deadline: i64) i64 {
+    if deadline < 0 {
+        return FOREVER;
+    }
+    return @max(deadline - now_utc(), 0);
+}
+
+// -----------------------------------------------------------------------------
+// Mutexes (7.26.4): std/sync's Mutex (0 unlocked, 1 locked, 2 locked with
+// waiters), with an owner and a count for the recursive ones.
+// -----------------------------------------------------------------------------
+
+/// mtx_t.
+pub struct Mtx {
+    state: u32,
+    pad: u32,
+    kind: u64,   // mtx_init's type
+    owner: u64,  // (recursive) the holding thread's me(), or 0
+    count: u64,  // (recursive) how many times it holds it
+}
+
+/// Takes the lock word, waiting until the real-time deadline (FOREVER: no
+/// limit); false if it passed first.
+pub fn acquire(w: *mut u32, deadline: i64) bool {
+    let mut s = @atomic_cas(w, 0, 1);
+    if s == 0 {
+        return true;
+    }
+    if s != 2 {
+        s = @atomic_xchg(w, 2);
+    }
+    while s != 0 {
+        let t = until(deadline);
+        if t == 0 {
+            return false;
+        }
+        _ = wait(@ptr_cast(*u32, w), 2, t);
+        s = @atomic_xchg(w, 2);
+    }
+    return true;
+}
+
+/// Gives the lock word back, waking a waiter if there may be one.
+pub fn release(w: *mut u32) void {
+    if @atomic_sub(w, 1) != 1 {
+        @atomic_store(w, 0);
+        _ = @atomic_notify(@ptr_cast(*u32, w), 1);
+    }
+}
+
+/// mtx_init (7.26.4.2): mtx_plain, mtx_timed, and either with
+/// mtx_recursive; another type is an error.
+export fn __axc_mtx_init(m: *mut Mtx, kind: i64) i64 {
+    if (kind < 0) or (kind > 3) {
+        return ERROR;
+    }
+    m.* = Mtx.{ state: 0, pad: 0, kind: @bit_cast(u64, kind), owner: 0, count: 0 };
+    return SUCCESS;
+}
+
+// Locks m by the deadline (FOREVER: none); also try_only: no waiting.
+fn lock(m: *mut Mtx, deadline: i64, try_only: bool) i64 {
+    let rec = (m.kind & RECURSIVE) != 0;
+    if rec and (@atomic_load(&m.owner) == me()) {
+        m.count += 1;
+        return SUCCESS;
+    }
+    if try_only {
+        if @atomic_cas(&mut m.state, 0, 1) != 0 {
+            return BUSY;
+        }
+    } else if not acquire(&mut m.state, deadline) {
+        return TIMEDOUT;
+    }
+    if rec {
+        @atomic_store(&mut m.owner, me());
+        m.count = 1;
+    }
+    return SUCCESS;
+}
+
+/// mtx_lock (7.26.4.3).
+export fn __axc_mtx_lock(m: *mut Mtx) i64 {
+    // (the fast paths: a mutex that is not recursive, free; while no thread
+    // has been started, nothing else can take it, and plain accesses do:
+    // the start of a thread orders them before the thread's)
+    if (m.kind & RECURSIVE) == 0 {
+        if not mem.threads_enabled() {
+            if m.state == 0 {
+                m.state = 1;
+                return SUCCESS;
+            }
+        } else if @atomic_cas(&mut m.state, 0, 1) == 0 {
+            return SUCCESS;
+        }
+    }
+    return lock(m, FOREVER, false);
+}
+
+/// mtx_trylock (7.26.4.5): thrd_busy if another thread holds it.
+export fn __axc_mtx_trylock(m: *mut Mtx) i64 {
+    return lock(m, FOREVER, true);
+}
+
+/// mtx_timedlock (7.26.4.4): waits until the TIME_UTC deadline (ns),
+/// then thrd_timedout. (Any mutex may be waited for so, mtx_timed or not.)
+export fn __axc_mtx_timedlock(m: *mut Mtx, deadline: i64) i64 {
+    return lock(m, @max(deadline, 0), false);
+}
+
+/// mtx_unlock (7.26.4.6): thrd_error if a recursive mutex is not the
+/// calling thread's, or a mutex is not locked at all.
+export fn __axc_mtx_unlock(m: *mut Mtx) i64 {
+    // (the fast paths: not recursive, no waiter)
+    if (m.kind & RECURSIVE) == 0 {
+        if not mem.threads_enabled() {
+            if m.state == 1 {
+                m.state = 0;
+                return SUCCESS;
+            }
+        } else if @atomic_cas(&mut m.state, 1, 0) == 1 {
+            return SUCCESS;
+        }
+    }
+    if (m.kind & RECURSIVE) != 0 {
+        if @atomic_load(&m.owner) != me() {
+            return ERROR;
+        }
+        m.count -= 1;
+        if m.count > 0 {
+            return SUCCESS;
+        }
+        @atomic_store(&mut m.owner, 0);
+    } else if @atomic_load(&m.state) == 0 {
+        return ERROR;
+    }
+    release(&mut m.state);
+    return SUCCESS;
+}
+
+/// mtx_destroy (7.26.4.1): nothing to release; the object is marked
+/// unusable for a later mutex function's checks (its type out of range).
+export fn __axc_mtx_destroy(m: *mut Mtx) void {
+    m.kind = 0xFFFF_FFFF_FFFF_FFFF;
+}
+
+// -----------------------------------------------------------------------------
+// Condition variables (7.26.3): std/sync's Condvar (a sequence number,
+// which signal and broadcast advance and the waiters wait on).
+// -----------------------------------------------------------------------------
+
+/// cnd_t.
+pub struct Cnd {
+    seq: u32,
+    pad: u32,
+}
+
+/// cnd_init (7.26.3.3).
+export fn __axc_cnd_init(c: *mut Cnd) i64 {
+    c.* = Cnd.{ seq: 0, pad: 0 };
+    return SUCCESS;
+}
+
+/// cnd_signal (7.26.3.4): wakes one waiter.
+export fn __axc_cnd_signal(c: *mut Cnd) i64 {
+    _ = @atomic_add(&mut c.seq, 1);
+    _ = @atomic_notify(&c.seq, 1);
+    return SUCCESS;
+}
+
+/// cnd_broadcast (7.26.3.1): wakes every waiter.
+export fn __axc_cnd_broadcast(c: *mut Cnd) i64 {
+    _ = @atomic_add(&mut c.seq, 1);
+    _ = @atomic_notify(&c.seq, 0xFFFF_FFFF);
+    return SUCCESS;
+}
+
+/// cnd_wait (7.26.3.6) and cnd_timedwait (7.26.3.5, deadline >= 0: TIME_UTC
+/// ns): unlocks m (all the way, if recursive), waits for a signal (or a
+/// spurious wake), locks m again as it was. thrd_timedout once the deadline
+/// has passed; thrd_error if m is not locked (by the caller, if recursive).
+export fn __axc_cnd_wait(c: *mut Cnd, m: *mut Mtx, deadline: i64) i64 {
+    let rec = (m.kind & RECURSIVE) != 0;
+    let mut count: u64 = 0;
+    if rec {
+        if @atomic_load(&m.owner) != me() {
+            return ERROR;
+        }
+        count = m.count;
+        m.count = 0;
+        @atomic_store(&mut m.owner, 0);
+    } else if @atomic_load(&m.state) == 0 {
+        return ERROR;
+    }
+    let s = @atomic_load(&c.seq);
+    release(&mut m.state);
+    let mut r = SUCCESS;
+    let t = until(deadline);
+    if t == 0 {
+        r = TIMEDOUT;
+    } else if (wait(&c.seq, s, t) == 2) and (until(deadline) == 0) {
+        r = TIMEDOUT;
+    }
+    _ = acquire(&mut m.state, FOREVER);
+    if rec {
+        @atomic_store(&mut m.owner, me());
+        m.count = count;
+    }
+    return r;
+}
+
+/// cnd_destroy (7.26.3.2): nothing to release.
+export fn __axc_cnd_destroy(c: *mut Cnd) void {
+    _ = c;
+}
+
+// -----------------------------------------------------------------------------
+// call_once (7.26.2.1): std/sync's Once (0 not called, 1 running, 2 done).
+// -----------------------------------------------------------------------------
+
+/// once_flag.
+pub struct Once {
+    state: u32,
+    pad: u32,
+}
+
+/// Calls f once for the flag, however many threads call this at once; the
+/// others return when it has returned.
+export fn __axc_call_once(o: *mut Once, f: fn() void) void {
+    if @atomic_load(&o.state) == 2 {
+        return;
+    }
+    if @atomic_cas(&mut o.state, 0, 1) == 0 {
+        f();
+        @atomic_store(&mut o.state, 2);
+        _ = @atomic_notify(&o.state, 0xFFFF_FFFF);
+        return;
+    }
+    while @atomic_load(&o.state) != 2 {
+        _ = wait(&o.state, 1, FOREVER);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Thread-specific storage (7.26.6). A key (tss_t) is a slot's index in its
+// low 32 bits and the slot's generation in the high 32: a slot that
+// tss_delete gave back and tss_create gave again has a new generation, so
+// the values threads set for the old key are not the new key's. Each
+// thread's values are an array of its own (vals), indexed by slot.
+// -----------------------------------------------------------------------------
+
+struct Key {
+    dtor: fn(*mut void) void,
+    has_dtor: bool,
+    used: bool,
+    gen: u32,
+}
+
+struct Val {
+    p: *mut void,
+    gen: u32,
+}
+
+fn no_dtor(p: *mut void) void {
+    _ = p;
+}
+
+// the keys (keys_p[0..nkeys)), and their lock; the calling thread's
+// values (vals_p[0..nvals))
+let mut keys_p: *mut Key = @ptr_from_int(*mut Key, 0);
+let mut nkeys: usize = 0;
+let mut keys_lock: u32 = 0;
+threadlocal let mut vals_p: *mut Val = @ptr_from_int(*mut Val, 0);
+threadlocal let mut nvals: usize = 0;
+
+fn keys() []mut Key {
+    return @slice_from_ptr(keys_p, nkeys);
+}
+
+fn vals() []mut Val {
+    return @slice_from_ptr(vals_p, nvals);
+}
+
+/// tss_create (7.26.6.2): a new key, whose destructor (if has_dtor) runs at
+/// each thread's exit on its value there (when not null).
+export fn __axc_tss_create(key: *mut u64, dtor: fn(*mut void) void, has_dtor: i64) i64 {
+    _ = acquire(&mut keys_lock, FOREVER);
+    defer release(&mut keys_lock);
+    let mut k: usize = 0;
+    while (k < nkeys) and keys()[k].used {
+        k += 1;
+    }
+    if k == nkeys {
+        let n = @max(nkeys * 2, 8);
+        let nk = mem.alloc.[Key](n) catch {
+            return ERROR;
+        };
+        for i in 0..n {
+            nk[i] = Key.{ dtor: no_dtor, has_dtor: false, used: false, gen: 0 };
+        }
+        if nkeys > 0 {
+            @mem_copy(nk[0..nkeys], keys());
+            mem.free(keys());
+        }
+        keys_p = nk.ptr;
+        nkeys = n;
+    }
+    let g = keys()[k].gen +% 1;
+    keys()[k] = Key.{ dtor: dtor, has_dtor: has_dtor != 0, used: true, gen: g };
+    key.* = (@as(u64, g) << 32) | @as(u64, k);
+    return SUCCESS;
+}
+
+/// tss_delete (7.26.6.3): the key is given back; no destructor runs.
+export fn __axc_tss_delete(key: u64) void {
+    let k = @int_cast(usize, key & 0xFFFF_FFFF);
+    _ = acquire(&mut keys_lock, FOREVER);
+    if (k < nkeys) and keys()[k].used and (keys()[k].gen == @truncate(u32, key >> 32)) {
+        keys()[k].used = false;
+    }
+    release(&mut keys_lock);
+}
+
+/// tss_get (7.26.6.4): the calling thread's value for key (null if none).
+export fn __axc_tss_get(key: u64) *mut void {
+    let k = @int_cast(usize, key & 0xFFFF_FFFF);
+    if (k < nvals) and (vals()[k].gen == @truncate(u32, key >> 32)) {
+        return vals()[k].p;
+    }
+    return @ptr_from_int(*mut void, 0);
+}
+
+/// tss_set (7.26.6.5): sets the calling thread's value for key.
+export fn __axc_tss_set(key: u64, p: *mut void) i64 {
+    let k = @int_cast(usize, key & 0xFFFF_FFFF);
+    if k >= nvals {
+        let n = @max(@max(nvals * 2, k + 1), 8);
+        let nv = mem.alloc.[Val](n) catch {
+            return ERROR;
+        };
+        for i in 0..n {
+            nv[i] = Val.{ p: @ptr_from_int(*mut void, 0), gen: 0 };
+        }
+        if nvals > 0 {
+            @mem_copy(nv[0..nvals], vals());
+            mem.free(vals());
+        }
+        vals_p = nv.ptr;
+        nvals = n;
+    }
+    vals()[k] = Val.{ p: p, gen: @truncate(u32, key >> 32) };
+    return SUCCESS;
+}
+
+/// At the calling thread's exit (thrd_exit, or the return of its start
+/// function): for each of the thread's values that is not null and whose
+/// key (still there) has a destructor, in the order of the keys, the value
+/// is set to null and the destructor called with it; again while a
+/// destructor has set a value that is not null, TSS_DTOR_ITERATIONS rounds
+/// at most (7.26.6.1). Then the values are given back.
+pub fn run_dtors() void {
+    let mut round: u32 = 0;
+    while round < DTOR_ITERATIONS {
+        round += 1;
+        let mut called = false;
+        let mut k: usize = 0;
+        while k < nvals {
+            let v = vals()[k];
+            k += 1;
+            if @int_from_ptr(v.p) == 0 {
+                continue;
+            }
+            let j = k - 1;
+            let mut d = no_dtor;
+            let mut ok = false;
+            _ = acquire(&mut keys_lock, FOREVER);
+            if (j < nkeys) and keys()[j].used and (keys()[j].gen == v.gen) and keys()[j].has_dtor {
+                d = keys()[j].dtor;
+                ok = true;
+            }
+            release(&mut keys_lock);
+            if not ok {
+                continue;
+            }
+            vals()[j].p = @ptr_from_int(*mut void, 0);
+            __axc_tss_call(d, v.p);
+            called = true;
+        }
+        if not called {
+            break;
+        }
+    }
+    if nvals > 0 {
+        mem.free(vals());
+        vals_p = @ptr_from_int(*mut Val, 0);
+        nvals = 0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// thrd_sleep, thrd_yield
+// -----------------------------------------------------------------------------
+
+let mut never: u32 = 0;  // (a word nothing changes, to sleep on)
+
+/// thrd_sleep (7.26.5.7): sleeps for ns nanoseconds; 0 (it is not ended
+/// early by a signal: the runtime's sleep resumes after one).
+export fn __axc_thrd_sleep(ns: i64) i64 {
+    if ns <= 0 {
+        return 0;
+    }
+    if is_wasm() and mem.threads_enabled() and not on_worker {
+        // (the main thread: so that it sees an exit request)
+        let end = ax_clock_ns(1) + ns;
+        loop {
+            let left = end - ax_clock_ns(1);
+            if left <= 0 {
+                return 0;
+            }
+            _ = wait(&never, 0, left);
+        }
+    }
+    ax_sleep_ns(@bit_cast(u64, ns));
+    return 0;
+}
+
+/// thrd_yield (7.26.5.8): gives the processor up to another thread that
+/// is ready (sched_yield; Windows' SwitchToThread; on WebAssembly a sleep of
+/// no time).
+export fn __axc_thrd_yield() void {
+    if @target_os("linux") {
+        let mut n: isize = 24;  // sched_yield
+        if @target_arch("aarch64") {
+            n = 124;
+        }
+        _ = ax_syscall(n, 0, 0, 0, 0, 0, 0);
+    } else if @target_os("macos") {
+        _ = sched_yield();
+    } else if @target_os("windows") {
+        _ = SwitchToThread();
+    } else {
+        ax_sleep_ns(0);
+    }
+}

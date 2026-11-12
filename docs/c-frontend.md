@@ -55,16 +55,15 @@ lists the diagnostics.
   table of spinlocks otherwise; every order sequentially consistent);
   `<stdatomic.h>`'s generic functions are builtins. Thread-local objects are the
   IR's thread-local globals natively, and per-thread blocks on WebAssembly with
-  threads (cgen_tls.ax). The runtime's threads are reached through
-  `__axiom_c_thread_start` and `__axiom_c_thread_join` (the start-up
-  `std/internal/runtime/c_threads.ax`), until there is a `<threads.h>`.
+  threads (cgen_tls.ax). Threads are the C library's `<threads.h>`
+  (`std/c/lib/threads/`, `std/c/rt/threads*.ax`), on the runtime's threads.
 - **Complex types** (C99): `float`, `double` and `long double _Complex`, with
   `<complex.h>` (the library's functions only declared). No imaginary types, and
   `__STDC_IEC_559_COMPLEX__` is not defined, though multiplication and division
   follow Annex G.5.1 (`ccomplex.ax` folds constants, `cgen_complex.ax` generates the
   same operations, with helper functions of the module for the slow paths).
-- **Not supported, and said so by the feature macros**: `<threads.h>`
-  (`__STDC_NO_THREADS__`), decimal floating types. Annex F is not claimed (`__STDC_IEC_559__` and
+- **Not supported, and said so by the feature macros**: decimal floating
+  types. Annex F is not claimed (`__STDC_IEC_559__` and
   `__STDC_IEC_60559_BFP__` are not defined): the floating types have IEC 60559's
   formats (`FLT_IS_IEC_60559`), but without a library there is no `<fenv.h>` or
   `<math.h>`, and no exception flags or rounding modes.

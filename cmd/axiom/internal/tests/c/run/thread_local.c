@@ -1,8 +1,8 @@
 /* flags: --c-std=c11 */
 /* _Thread_local (C11): objects with thread storage duration, at file scope
    and in blocks with static or extern: the main thread's instances (each
-   thread has its own: atomic_threads.c). There is no <threads.h> yet
-   (__STDC_NO_THREADS__). */
+   thread has its own: c/lib/threads/atomic_threads.c). <threads.h> is
+   the C library's: __STDC_NO_THREADS__ is not defined. */
 #include "host.h"
 
 _Thread_local int counter = 5;
@@ -23,7 +23,11 @@ int main(void) {
     print_i64(zeroed);
     print_i64(bump());
     print_i64(later);
-    print_i64(__STDC_NO_THREADS__);
+#ifdef __STDC_NO_THREADS__
+    print_i64(1);
+#else
+    print_i64(0);
+#endif
     return 0;
 }
 
@@ -32,4 +36,4 @@ _Thread_local int later = 9;
 /* expect: 0 */
 /* expect: 3 */
 /* expect: 9 */
-/* expect: 1 */
+/* expect: 0 */

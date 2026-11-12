@@ -921,7 +921,7 @@ fn compile(args: [][]u8) i32 {
         // the C library's run-time layer (c_library)
         let rt = u.f1("%s/c/rt", o.std_dir);
         let start = pkg_files.len;
-        pkg.files_under(rt, ".ax", &mut pkg_files);
+        all_rt_modules(rt, threads_named(&o), &mut pkg_files);
         if pkg_files.len > start {
             let r = u.real_path(rt);
             cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
@@ -991,8 +991,7 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     }
     let object = not exe and not cfront.has_main();
     g_c_object = object;
-    let start = u.f2("%s/internal/runtime/%s", o.std_dir,
-                     u.pick(object, "c_object.ax", u.pick(cfront.uses_threads(), "c_threads.ax", "c_start.ax")));
+    let start = u.f2("%s/internal/runtime/%s", o.std_dir, u.pick(object, "c_object.ax", "c_start.ax"));
     if not u.file_exists(start) {
         return fatal(o.json, "E9003", u.f1("cannot find the C start-up module (%s)", start));
     }
@@ -1085,13 +1084,14 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
             ok = cfront.check(srcs.get(k), lo, true) and ok;
         }
         let rt = u.f1("%s/c/rt", o.std_dir);
-        pkg.files_under(rt, ".ax", &mut g_rt_needed);
+        all_rt_modules(rt, true, &mut g_rt_needed);
         return ok;
     }
     // the index: "D name path" (path, under <std>/c/, defines name) and
     // "N path name" (the run-time module path calls name)
     let mut defs = u.SymMap.[[]u8].{ keys: u.nil.[usize](), vals: u.nil.[[]u8](), cap: 0, len: 0 };
     let mut needs = u.List.[[]u8].empty();  // pairs: path, name
+    let mut alts = u.List.[[]u8].empty();   // pairs: path, its stand-in
     let mut i: usize = 0;
     while i < idx.len {
         let mut j = i;
@@ -1117,6 +1117,9 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
         } else if line[0] == 'N' {
             needs.push(x);
             needs.push(y);
+        } else if line[0] == 'A' {
+            alts.push(x);
+            alts.push(y);
         }
     }
     let mut done = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };  // names, paths
@@ -1156,7 +1159,7 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
             if o.c_freestanding {
                 continue;
             }
-            g_rt_needed.push(u.f2("%s/c/%s", o.std_dir, path));
+            g_rt_needed.push(u.f2("%s/c/%s", o.std_dir, rt_stand_in(path, &alts)));
             for q in 0..needs.len / 2 {
                 if u.str_eq(needs.get(2 * q), path) {
                     work.push(needs.get(2 * q + 1));
@@ -1178,6 +1181,77 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
         }
     }
     return ok;
+}
+
+// The run-time module of the C library to link for `path` (under <std>/c/):
+// itself, or where the target cannot have threads (WebAssembly without the
+// atomics extension) its stand-in, if the index's A lines (`alts`: pairs)
+// name one.
+fn rt_stand_in(path: []u8, alts: *u.List.[[]u8]) []u8 {
+    if not ty.g_target.is_wasm or tg.has(tg.W_ATOMICS) {
+        return path;
+    }
+    for q in 0..alts.len / 2 {
+        if u.str_eq(alts.get(2 * q), path) {
+            return alts.get(2 * q + 1);
+        }
+    }
+    return path;
+}
+
+// Every run-time module of the C library (<std>/c/rt/*.ax) into *out, for
+// a program that has them all (an Axiom program with C units; a C program
+// when there is no index): but a module that creates threads (one X.ax with
+// a stand-in X_none.ax: on WebAssembly a program that has std/thread runs
+// on a shared memory) only if `threads` (the C sources name <threads.h>'s
+// thread functions), and then its stand-in instead where the target cannot
+// have threads (rt_stand_in).
+fn all_rt_modules(rt: []u8, threads: bool, out: *mut u.List.[[]u8]) void {
+    let mut all = u.List.[[]u8].empty();
+    pkg.files_under(rt, ".ax", &mut all);
+    let none = ty.g_target.is_wasm and not tg.has(tg.W_ATOMICS);
+    for k in 0..all.len {
+        let f = all.get(k);
+        let mut stand_in = false;
+        let mut has_stand_in = false;
+        if u.ends(f, "_none.ax") {
+            stand_in = true;
+        } else {
+            has_stand_in = u.file_exists(u.cat2(f[0..f.len - 3], "_none.ax"));
+        }
+        if (stand_in or has_stand_in) and not threads {
+            continue;
+        }
+        if (stand_in and not none) or (has_stand_in and none) {
+            continue;
+        }
+        out.push(f);
+    }
+}
+
+// Whether the program's C sources name a thread function of <threads.h>
+// (thrd_create, thrd_exit, thrd_join, thrd_detach), read as text.
+fn threads_named(o: *Options) bool {
+    let mut srcs = u.List.[[]u8].empty();
+    srcs.push(o.input);
+    for k in 0..o.c_inputs.len {
+        srcs.push(o.c_inputs.get(k));
+    }
+    for k in 0..srcs.len {
+        if not is_c_source(srcs.get(k)) {
+            continue;
+        }
+        let t = u.read_file(srcs.get(k));
+        if u.isnos(t) {
+            continue;
+        }
+        for n in ["thrd_create", "thrd_exit", "thrd_join", "thrd_detach"] {
+            if u.contains(t, n) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // The run-time modules of the C library that the units use (c_library_units).

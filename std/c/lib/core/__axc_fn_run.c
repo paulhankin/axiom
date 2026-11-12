@@ -8,17 +8,24 @@
 
 void __axc_fn_run(struct __axc_fn_table *t) {
     for (;;) {
-        struct __axc_fn_block *b = t->top ? t->top : &t->first;
+        struct __axc_fn_block *b;
         void (*f)(void);
+        __axc_fn_lock(t);
+        b = t->top ? t->top : &t->first;
         if (t->n == 0) {
-            if (!t->top)
+            if (!t->top) {
+                t->lock = 0;
                 return;
+            }
             /* (the block before an emptied one is full) */
             t->top = b->prev == &t->first ? (struct __axc_fn_block *)0 : b->prev;
             t->n = 32;
+            t->lock = 0;
             continue;
         }
         f = b->fns[--t->n];
+        /* (called without the lock: it may register more, or exit) */
+        t->lock = 0;
         f();
     }
 }

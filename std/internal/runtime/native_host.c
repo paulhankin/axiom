@@ -904,18 +904,36 @@ int32_t ax_notify32(uint32_t *p, int32_t count);
 
 static void *install_alt_stack(void);
 
-static void *thread_main(void *p) {
-    struct thread_start st = *(struct thread_start *)p;
-    free(p);
-    void *alt = install_alt_stack();
-    st.entry(st.arg);
-    __atomic_store_n(st.exited, 1, __ATOMIC_SEQ_CST);
-    ax_notify32(st.exited, 1);
+/* the calling thread's exited word and signal stack (ax_thread_exit) */
+static __thread uint32_t *cur_exited;
+static __thread void *cur_alt;
+
+static void thread_end(void) {
+    __atomic_store_n(cur_exited, 1, __ATOMIC_SEQ_CST);
+    ax_notify32(cur_exited, 1);
+    cur_exited = NULL;
     /* the signal stack goes with the thread */
     stack_t off = {.ss_flags = SS_DISABLE};
     sigaltstack(&off, NULL);
-    free(alt);
+    free(cur_alt);
+}
+
+static void *thread_main(void *p) {
+    struct thread_start st = *(struct thread_start *)p;
+    free(p);
+    cur_alt = install_alt_stack();
+    cur_exited = st.exited;
+    st.entry(st.arg);
+    thread_end();
     return NULL;
+}
+
+// Ends the calling thread (one ax_thread_spawn started) as its entry's
+// return would; nothing on another thread.
+void ax_thread_exit(void) {
+    if (!cur_exited) return;
+    thread_end();
+    pthread_exit(NULL);
 }
 
 // stack_top is ignored: native threads get their stack from the OS.

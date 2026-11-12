@@ -7,6 +7,7 @@
 // No int crosses (its width is the build's, --c-int): i64 is long long.
 //
 //   __axc_exit(status)              ends the process (std/os.exit)
+//   __axc_exit_begin()              the start of exit (threads: one runs it)
 //   __axc_write_err(p, n)           n bytes to standard error
 //   __axc_parse_f64(p, n)           std/fmt.parse_float of a valid decimal
 //   __axc_parse_f32(p, n)           ... and parse_float32
@@ -43,8 +44,43 @@ fn cstr(p: *u8) []u8 {
     return @slice_from_ptr(p, n);
 }
 
+// What exit does in a program with threads (std/c/rt/threads_spawn.ax sets
+// them at its first thrd_create): exit_begin as exit starts (one thread
+// runs it), exit_end before the process ends (from a WebAssembly worker,
+// which cannot end it, the main thread is asked to).
+let mut has_thread_hooks: u32 = 0;
+let mut exit_begin: fn() void = no_begin;
+let mut exit_end: fn(i64) void = no_end;
+
+fn no_begin() void {}
+
+fn no_end(status: i64) void {
+    _ = status;
+}
+
+/// (threads_spawn.ax) Sets exit's hooks for a program with threads.
+pub fn thread_hooks(begin: fn() void, end: fn(i64) void) void {
+    if has_thread_hooks == 0 {
+        exit_begin = begin;
+        exit_end = end;
+        @atomic_store(&mut has_thread_hooks, 1);
+    }
+}
+
+/// The start of exit (std/c/lib/core/exit.c): in a program with threads,
+/// the first thread to call it goes on (so does a second call on that
+/// thread, from an atexit function), any other waits for the end.
+export fn __axc_exit_begin() void {
+    if @atomic_load(&has_thread_hooks) != 0 {
+        exit_begin();
+    }
+}
+
 /// Ends the process with `status` at once (C's _Exit, and the end of exit).
 export fn __axc_exit(status: i64) void {
+    if @atomic_load(&has_thread_hooks) != 0 {
+        exit_end(status);
+    }
     os.exit(@truncate(i32, status));
 }
 
@@ -89,8 +125,37 @@ fn same(a: []u8, b: []u8) bool {
     return true;
 }
 
+// The lock of env_values (std/sync's Mutex protocol: 0 unlocked, 1
+// locked, 2 locked with waiters): getenv may be called from any thread
+// (7.24.4.6p2 asks only that the environment not be changed meanwhile).
+let mut env_lock: u32 = 0;
+
+fn lock_env() void {
+    let mut s = @atomic_cas(&mut env_lock, 0, 1);
+    if s == 0 {
+        return;
+    }
+    if s != 2 {
+        s = @atomic_xchg(&mut env_lock, 2);
+    }
+    while s != 0 {
+        _ = @atomic_wait(&env_lock, 2, -1);
+        s = @atomic_xchg(&mut env_lock, 2);
+    }
+}
+
+fn unlock_env() void {
+    if @atomic_sub(&mut env_lock, 1) != 1 {
+        @atomic_store(&mut env_lock, 0);
+        _ = @atomic_notify(&env_lock, 1);
+    }
+}
+
 /// C's getenv: the value of the environment variable `name`, or null.
+/// Thread-safe (env_lock).
 export fn getenv(name: *u8) *mut u8 {
+    lock_env();
+    defer unlock_env();
     let key = cstr(name);
     let v = os.getenv(key) catch {
         return nullp();

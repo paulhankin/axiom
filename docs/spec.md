@@ -1827,7 +1827,11 @@ shared, `@atomic_wait` also traps. Programs that never block don't notice either
 
 - `spawn(alloc, f, arg) !Thread[T]` runs `f(arg)` on a new thread. `arg: T` is copied.
   To share data, pass a pointer, and synchronize access to it.
-- `Thread.join()` waits for `f` to return and releases the thread's resources.
+- `Thread.join()` waits for `f` to return and releases the thread's resources;
+  `Thread.is_finished()` says whether it has (then `join` does not wait).
+- `exit()` ends the calling thread at once, if `spawn` started it, as the return of
+  its function would (its `join` returns); the functions it leaves run no `defer`. On
+  any other thread (the main thread) it returns and does nothing.
 - `parallel_for(alloc, n, threads, body, ctx)` splits `0..n` into disjoint ranges,
   runs `body(ctx, lo, hi)` for each in parallel, and returns when all are done. Bodies
   that write only inside their own range cannot race.
@@ -1847,6 +1851,7 @@ Threads use host functions from module `"axiom"`:
 |---|---|
 | `ax_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32` | start a thread running `entry(arg)`; a negative result means failure. When the thread has returned from `entry` and no longer uses its stack, the host stores `1` to `*exited` and notifies it (so the stack can be freed) |
 | `ax_thread_stack_size() usize` | the stack size the program must allocate for a new thread, or `0` if the host provides stacks (native) |
+| `ax_thread_exit()` | end the calling thread, which `ax_thread_spawn` started, as the return of its `entry` would (`*exited` is set); on another thread (the main thread), return at once |
 | `ax_cpu_count() u32`, `ax_sleep_ns(ns: u64)` | |
 
 On WebAssembly, a program that uses threads is linked with a **shared, imported**

@@ -20,6 +20,7 @@ import host "axiom" {
     fn ax_thread_stack_size() usize;  // 0: the host provides stacks
     fn ax_cpu_count() u32;
     fn ax_sleep_ns(ns: u64) void;
+    fn ax_thread_exit() void;  // ends a thread ax_thread_spawn started (returns on another)
 }
 
 struct Start[T] {
@@ -29,10 +30,27 @@ struct Start[T] {
     stack: []mut u8,
 }
 
+// Whether the calling thread was started by spawn (for exit).
+threadlocal let mut spawned: bool = false;
+
 fn trampoline[T](ctx: *mut void) void {
+    spawned = true;
     let s = @ptr_cast(*mut Start.[T], ctx);
     s.f(s.arg);
     mem.thread_exit();  // the thread's cached free memory goes back
+}
+
+/// Ends the calling thread at once, if spawn started it, as the return of
+/// its function would: its join returns, its cached free memory goes back.
+/// What is on its stack is abandoned (no `defer` of the functions it leaves
+/// runs). On any other thread (the program's main thread) it returns,
+/// doing nothing.
+pub fn exit() void {
+    if not spawned {
+        return;
+    }
+    mem.thread_exit();
+    ax_thread_exit();
 }
 
 /// A running thread. Call join() exactly once.
@@ -48,6 +66,11 @@ pub struct Thread[T] {
             mem.free(self.start.stack);
         }
         mem.destroy(self.start);
+    }
+
+    /// Whether the thread has finished (then join returns at once).
+    pub fn is_finished(self: Self) bool {
+        return @atomic_load(&self.start.exited) != 0;
     }
 }
 
@@ -227,6 +250,23 @@ test "parallel_for covers 0..n exactly once, with any thread count" {
     let mut empty = Marks.{ seen: seen[..0], calls: 0 };
     parallel_for(0, 4, mark_range, &mut empty)!;
     @expect_eq(empty.calls, 1);  // one empty range, run on the calling thread
+}
+
+fn exit_early(p: *mut u32) void {
+    @atomic_store(p, 1);
+    exit();
+    @atomic_store(p, 2);  // (not reached)
+}
+
+test "exit ends the thread; join and is_finished see it" {
+    let mut v: u32 = 0;
+    let t = spawn(exit_early, &mut v)!;
+    while not t.is_finished() {
+        sleep_ms(1);
+    }
+    t.join();
+    @expect_eq(@atomic_load(&v), 1);
+    exit();  // (the test's thread was not started by spawn: nothing)
 }
 
 test "cpu_count and sleep_ms" {

@@ -17,7 +17,8 @@
      6364136223846793005, increment 1442695040888963407), whose high 31 bits
      are the result; RAND_MAX is 2147483647, srand(s) sets the state to s,
      and the first state is 1. One state for all threads (not required to be
-     free of data races: 7.22.2.1p3).
+     free of data races: 7.22.2.1p3): threads that call rand at once may
+     see the same value, or values out of the sequence.
    - qsort: introspective sort (quicksort with the median of three, or of
      nine for large arrays, heapsort past 2 log2(n) partitions, insertion sort
      for short runs): O(n log n) at worst, O(log n) stack. Not stable.
@@ -185,6 +186,8 @@ size_t wcstombs(char *__AXC_RESTRICT s, const wchar_t *__AXC_RESTRICT pwcs, size
 #if __STDC_VERSION__ >= 202311L
 /* alignment of memory (7.24.9) */
 size_t memalignment(const void *p);
+/* communication with the environment: call_once (7.24.2.1; <threads.h>'s) */
+#include <axc/once.h>
 #endif
 
 #endif

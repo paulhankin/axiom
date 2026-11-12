@@ -32,7 +32,7 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
 
 - **The library is the compiler's, as far as it goes.** The headers and functions of
   "The C library" (below) are linked into every program that uses them, on every target.
-  There is no `<math.h>`, `<fenv.h>` or `<threads.h>` yet: `#include <math.h>` is the
+  There is no `<math.h>` or `<fenv.h>` yet: `#include <math.h>` is the
   error `C1081`.
 - **Other undefined functions are the platform's.** A function a program declares and
   that neither it nor the library defines is looked up outside the program:
@@ -289,8 +289,9 @@ parts, each with its sources and its private header:
 | strings | `<string.h>` (C23's freestanding functions) | `std/c/lib/string/` |
 | standard input/output | `<stdio.h>`, `<wchar.h>`'s input/output | `std/c/lib/stdio/`, `std/c/rt/stdio.ax` |
 | text | `<locale.h>`, `<wchar.h>`, `<wctype.h>`, `<uchar.h>`, `<time.h>`, `<inttypes.h>`, `<stdlib.h>`'s multibyte functions | `std/c/lib/text/`, `std/c/rt/text*.ax`, `axc/text.h`, `axc/locale.h` ([`docs/c-text.md`](c-text.md)) |
+| threads | `<threads.h>`, and C23's `call_once` of `<stdlib.h>` | `std/c/lib/threads/`, `std/c/rt/threads.ax`, `std/c/rt/threads_spawn.ax` (`threads_spawn_none.ax`), `axc/threads_impl.h`, `axc/once.h` ("Threads", below) |
 
-There is no `<math.h>`, `<fenv.h>` or `<threads.h>` yet (`__STDC_NO_THREADS__`).
+There is no `<math.h>` or `<fenv.h>` yet.
 
 ### How the library is linked
 
@@ -306,7 +307,10 @@ There is no `<math.h>`, `<fenv.h>` or `<threads.h>` yet (`__STDC_NO_THREADS__`).
   library, under C names) are modules of the program when one of their exports is used
   (with the C functions they call, which the index lists); their `export fn`s are
   generated only when something reaches them. A program whose `main` is Axiom's has all
-  of them. `std/c/rt/ldouble.ax` (the arithmetic of a `long double` wider than `double`)
+  of them, but for the creation of threads (`threads_spawn.ax`, whose
+  `std/thread` gives a WebAssembly program a shared memory), which it has only
+  if its C sources name `thrd_create`, `thrd_exit`, `thrd_join` or
+  `thrd_detach`. `std/c/rt/ldouble.ax` (the arithmetic of a `long double` wider than `double`)
   is every such program's, freestanding or not.
 - A name that one of the program's own units, or one of its Axiom modules (an `export
   fn`), defines is the program's, and the library's definition of it is left out (as a
@@ -321,7 +325,10 @@ There is no `<math.h>`, `<fenv.h>` or `<threads.h>` yet (`__STDC_NO_THREADS__`).
   headers declare (`size_t`, `wchar_t`, `wint_t`, `mbstate_t`) are defined once, from
   the compiler's `__AXIOM_*_TYPE__` macros, by `axc/types.h`. The functions of
   `<std>/c/rt/` take and return no `int`, whose width the build chooses (64-bit
-  integers cross instead).
+  integers cross instead). A run-time module that imports another brings that
+  module's C functions too (the index lists them under it). A run-time module
+  `X_none.ax` stands in for `X.ax` where the target cannot have threads
+  (WebAssembly without the atomics extension): the index's `A` lines.
 - What a program does not reach is not in its executable ("What is linked"). A program
   that returns 3 from `main` builds within about 20 ms of a freestanding one (x86-64
   Linux) and is a few KB larger (the exit path).
@@ -523,9 +530,9 @@ implementation knows act, the others are ignored.
 `__STDC__` (1), `__STDC_VERSION__` (above), `__DATE__`, `__TIME__` (the build's time, or
 the `SOURCE_DATE_EPOCH` environment variable's, in UTC), `__FILE__`, `__LINE__`. From C99,
 `__STDC_HOSTED__` is 1, or 0 with `--c-freestanding`. From C11, `__STDC_UTF_16__`,
-`__STDC_UTF_32__` and `__STDC_NO_THREADS__` are 1 (there is no `<threads.h>` yet);
-`__STDC_NO_ATOMICS__` and `__STDC_NO_COMPLEX__` are not defined: atomics (see "Atomics and
-threads") and complex types are supported. In C23,
+`__STDC_UTF_32__` are 1; `__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__` and
+`__STDC_NO_THREADS__` are not defined: atomics, threads (see "Atomics and threads") and
+complex types are supported. In C23,
 `__STDC_EMBED_NOT_FOUND__`, `__STDC_EMBED_FOUND__` and `__STDC_EMBED_EMPTY__` are 0, 1
 and 2. `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__` and `__STDC_ISO_10646__` are not
 defined, nor is `__STDC_IEC_559_COMPLEX__` (see "Known deviations").
@@ -668,6 +675,7 @@ library's are `C1081`.
 | `<stdbit.h>` | C23 | The `stdc_` functions as `static inline` functions and type-generic macros. |
 | `<stdckdint.h>` | C23 | `ckd_add`, `ckd_sub`, `ckd_mul`. |
 | `<stdio.h>` | all (hosted) | The C library's ("The C library"). `snprintf`, `vscanf` and C99's other names from C99; `gets` before C11 only; `__STDC_VERSION_STDIO_H__` and `_PRINTF_NAN_LEN_MAX` in C23. |
+| `<threads.h>` | C11 and later (hosted) | The C library's ("Threads"). `thread_local` before C23; `__STDC_VERSION_THREADS_H__` in C23. |
 
 | `<string.h>` | all | C23's freestanding functions in every program (all but `strdup`, `strndup`, `strcoll`, `strxfrm` and `strerror`, which hosted programs have: "The C library"). `memccpy` and `memset_explicit` from C23; in C23 `memchr`, `strchr`, `strpbrk`, `strrchr` and `strstr` are also generic macros whose result points to `const` when the argument does. |
 
@@ -689,8 +697,6 @@ as the standard says.
 
 - `_Imaginary` (the imaginary types, which are optional), decimal floating types and
   constants: each is `C3901` (a decimal constant is `C1019`).
-- `<threads.h>` (`__STDC_NO_THREADS__`). Thread-local objects and atomics work with the
-  threads a program has (see "Atomics and threads").
 - `<math.h>` and `<fenv.h>`, and Annex F (exception flags and rounding modes). Annex K is
   not provided (`__STDC_LIB_EXT1__` is not defined).
 - `setjmp` on WebAssembly (`C3300`).
@@ -952,7 +958,6 @@ Programs should not use them.
 | `__builtin_stdc_...` | The operations of `<stdbit.h>`. |
 | `__builtin_ckd_add`, `__builtin_ckd_sub`, `__builtin_ckd_mul` | `<stdckdint.h>`. |
 | `__builtin_atomic_...` | The generic functions of `<stdatomic.h>`. |
-| `__axiom_c_thread_start`, `__axiom_c_thread_join` | The runtime's threads (see "Atomics and threads"). |
 | `__axiom_atomic_lock`, `__axiom_atomic_unlock`, `__axiom_atomic_locks` | The lock of atomic objects that are not lock-free. |
 | `__builtin_inff`, `__builtin_nanf` | `<float.h>`. |
 | `__builtin_complex`, `__builtin_creal`, `__builtin_cimag`, `__builtin_conj` | `<complex.h>`: `__builtin_complex(x, y)` is `x + iy` for `x` and `y` of one real floating type. |
@@ -1016,24 +1021,104 @@ thread, and the operations are ordinary loads and stores.
 
 `_Thread_local` (C23: `thread_local`) objects have one instance per thread, each starting
 with the object's initial value (which may hold addresses). On Linux they are ELF TLS
-(local-exec, so in an executable or an object linked into one); the C library's threads
-and the runtime's each get their copies. On Windows they are in the image's TLS
+(local-exec, so in an executable or an object linked into one); the system C library's
+threads and the runtime's each get their copies. On Windows they are in the image's TLS
 directory, so every thread has them. On macOS they are the runtime's thread-local
-block, which the main thread and the runtime's threads have (threads the C library
-creates directly do not: there is no `<threads.h>` yet). On WebAssembly, in a program
+block, which the main thread and the runtime's threads have: every thread of
+`thrd_create` is one of the runtime's (a thread something else creates, such as the
+system's C code with `pthread_create`, has none). On WebAssembly, in a program
 without threads they are ordinary globals; with threads, each thread's start makes its
 block of them. `--emit=obj` objects for WebAssembly have them as ordinary globals.
+The GNU dialects' `__thread` is `_Thread_local`.
 
-Until `<threads.h>` exists, the runtime's threads are reached through two functions that
-a program declares (the suite's threaded tests use them):
+### Threads
 
-```c
-void *__axiom_c_thread_start(void (*f)(void *), void *arg);  /* null if it fails */
-void __axiom_c_thread_join(void *thread);
-```
+`<threads.h>` (C11 7.26, C17, and C23's changes: `thread_local` is a macro only before
+C23, where it is a keyword; `call_once`, `once_flag` and `ONCE_FLAG_INIT` are also in
+C23's `<stdlib.h>`) is the C library's threads part, on every target:
+`std/c/lib/threads/<name>.c` over `std/c/rt/threads.ax` (mutexes, condition variables, `call_once`,
+thread-specific storage, `thrd_current`, `thrd_sleep`, `thrd_yield`) and
+`std/c/rt/threads_spawn.ax` (`thrd_create`, `thrd_join`, `thrd_detach`, `thrd_exit`),
+which build on `std/thread` and Axiom's atomics and `@atomic_wait`/`@atomic_notify` (the
+protocols of `std/sync`'s `Mutex`, `Condvar` and `Once`; `std/sync` itself is not
+imported, as it would make every WebAssembly program that uses a mutex threaded).
+`__STDC_NO_THREADS__` is not defined. The header's comment lists the choices; the
+main ones:
 
-A program that names them has the start-up `std/internal/runtime/c_threads.ax` (which
-defines them) instead of `c_start.ax`.
+- **Threads**: a thread of `thrd_create` is one of the Axiom runtime's (`std/thread.spawn`):
+  natively the runtime's own (`clone` on Linux, `pthread_create` with the system C library
+  or on macOS, `CreateThread` on Windows), on WebAssembly a worker on the shared memory.
+  It has the program's thread-locals (and its own `errno`), the runtime's crash reporting
+  and the allocator's per-thread caches. `thrd_t` points to the thread's record;
+  `thrd_current` on a thread `thrd_create` did not start (the main thread, or one Axiom
+  code started) gives a record of that thread's own, which cannot be joined by itself or
+  detached (`thrd_error`).
+- **Thread end**: the return of the start function, or `thrd_exit`, runs the thread's tss
+  destructors (below), records the result for `thrd_join`, and ends the thread through
+  `std/thread.exit` (the host's `ax_thread_exit`: the kernel's exit of the thread, or
+  `pthread_exit`, `ExitThread`, or the end of the worker), which gives back its stack
+  and records: at `thrd_join`, or for a detached thread when the next thread is created,
+  detached or ends. `thrd_exit` leaves the C frames it is called in without running
+  anything of them (as `longjmp` would); called in Axiom code that C called it leaves
+  that code's `defer`s unrun too.
+- **`thrd_exit` on the main thread** (7.26.5.5): its tss destructors run, its result is
+  recorded (another thread may `thrd_join` it), then it waits until every thread
+  `thrd_create` started has ended, joined or detached, and calls `exit(EXIT_SUCCESS)`
+  (the `atexit` functions run then, on the main thread). The main thread does not end
+  before the others (threads that Axiom code started are not waited for).
+- **`exit` from any thread**: the first thread to call it runs the `atexit` functions
+  (once), the destructors and the flushing, and ends the process with its status; a
+  second thread's `exit` meanwhile waits for the end. On WebAssembly a worker cannot end
+  the process (node ends only that worker): its `exit` (and `_Exit`, `quick_exit`, and
+  `abort`'s end), once the handlers have run on it, asks the main thread to end it with
+  the status, and the main thread does so as soon as it waits in `<threads.h>`
+  (`thrd_join`, a mutex, a condition variable, `call_once`, `thrd_sleep`, the `thrd_exit`
+  of the main thread, its own `exit`): those waits look for the request at least every
+  50 ms. A main thread that computes without waiting there goes on until it does, or
+  until `main` returns.
+- **Mutexes**: `mtx_plain`, `mtx_timed`, and either with `mtx_recursive`; another type
+  is `thrd_error`. A futex-style lock (no system call unless contended; while no thread
+  has been started, not even an atomic instruction); `mtx_timedlock` takes any mutex.
+  `mtx_unlock` of a mutex that is not locked (a recursive one: by the caller) is
+  `thrd_error`, as is `cnd_wait` with one.
+- **Time**: the deadlines of `mtx_timedlock` and `cnd_timedwait` are `TIME_UTC` (the
+  real-time clock) times, checked against it after each wake; one that has passed is a
+  timeout at once; a `timespec` whose `tv_nsec` is outside 0..999999999 is `thrd_error`.
+  `thrd_sleep` returns 0 (no signal ends it early; it never stores the remaining time)
+  or -2 for a negative or invalid duration; `thrd_yield` is `sched_yield`
+  (`SwitchToThread` on Windows; on WebAssembly a sleep of no time).
+- **Thread-specific storage**: any number of keys; a key reused after `tss_delete` does
+  not see the values of the deleted one. At a thread's end, for each key with a
+  destructor whose value is not null, in the order of the keys, the value is set to null
+  and the destructor called with it; again while the destructors set values, at most
+  `TSS_DTOR_ITERATIONS` (4) rounds. They do not run at `exit` or `main`'s return
+  (7.26.6.1). A key must not be used after `tss_delete` (7.26.6.3).
+- **Without threads**: on WebAssembly without the atomics extension (`--features=-atomics`)
+  `thrd_create` returns `thrd_error`, `thrd_join` and `thrd_detach` too
+  (`threads_spawn_none.ax` is linked instead), and the rest works on the one thread. A
+  program that uses `<threads.h>` but never creates a thread (no `thrd_create` or
+  `thrd_exit`) has no shared memory on WebAssembly; its waits, which nothing can end
+  early, sleep until their deadlines.
+
+The library is thread-safe where the standard asks: each stream has a lock, which
+every standard I/O function takes for its whole operation (formatted output to one
+stream from many threads comes out a call at a time); `malloc` and its kin are the Axiom
+allocator's, which is thread-safe (or the system C library's); `errno` is each thread's;
+`atexit` and `at_quick_exit` may be called from any thread (their table has a lock);
+`getenv`'s strings are kept under a lock; the library's own lazy initializations (the
+time zone, the wide character classes' table, the standard streams' first use) are
+done once, whichever threads ask at once, at the cost of an atomic load once done.
+What the standard lets race, races: `rand` (one state, 7.22.2.1p3), `strtok`, `asctime`,
+`ctime`, `gmtime`, `localtime` and `strerror`'s static results, `setlocale` and
+`localeconv` (7.11.1.1p5), the multibyte functions' internal states (`mblen`, `mbtowc`,
+`wctomb`), `signal` (undefined in a program with threads, 7.14.1.1p7), `tmpnam` with a
+null argument.
+
+Measured on x86-64 Linux against the system's C library and its threads (at -O2, a
+loaded machine, best of five runs): an uncontended `mtx_lock` and `mtx_unlock` take
+about 0.25 times its time in a program that has not started a thread and about 1.1
+times once one has; a `thrd_create` and `thrd_join` of a thread that returns at once,
+about 1.8 times.
 
 ## Calling conventions and interoperability
 
@@ -1217,8 +1302,8 @@ complete a stack trace is after a crash.
 These are the places where the implementation does not follow the standard it claims, or
 claims less than the standard allows. None is hidden: each is said above or here.
 
-- The implementation is hosted (`__STDC_HOSTED__` is 1) without `<math.h>`, `<fenv.h>`
-  and `<threads.h>`: see "Not supported".
+- The implementation is hosted (`__STDC_HOSTED__` is 1) without `<math.h>` and `<fenv.h>`:
+  see "Not supported".
 - Annex F is not claimed. The floating types have IEC 60559 formats (`FLT_IS_IEC_60559`
   in `<float.h>`), but there are no exception flags or rounding modes; signaling NaNs are
   not guaranteed to stay signaling, so `<float.h>` has no `FLT_SNAN`.
@@ -1231,8 +1316,9 @@ claims less than the standard allows. None is hidden: each is said above or here
   (no overflow forming the divisor's squared magnitude); it may differ in the last bit
   from other implementations' choices. `CX_LIMITED_RANGE` has no effect (the full
   algorithms are always used).
-- Decimal floating types and `<threads.h>` are absent, as the feature
-  macros say.
+- Decimal floating types are absent, as the feature macros say.
+- On WebAssembly, `exit` on a thread other than the main one ends the process only once
+  the main thread waits in `<threads.h>` or returns from `main` ("Threads").
 - `restrict` has no effect on the generated code; `#pragma STDC FENV_ACCESS ON` is not
   honoured (C4113).
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;

@@ -61,13 +61,15 @@ int __axc_errno_of(int code) {
     }
 }
 
-static int windows = -1;
+/* (atomic: threads may ask first at once, and all store the same value) */
+static _Atomic int windows = -1;
 
 /* Is this Windows (where text streams translate line ends)? */
 int __axc_is_windows(void) {
-    if (windows < 0)
-        windows = __axc_sys_os() == 3;
-    return windows;
+    int w = windows;
+    if (w < 0)
+        windows = w = __axc_sys_os() == 3;
+    return w;
 }
 
 /* The first use of a standard stream: its buffering (unless setvbuf chose

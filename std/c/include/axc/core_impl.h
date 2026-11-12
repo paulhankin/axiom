@@ -25,6 +25,9 @@ extern void (*__axc_at_exit_dtors)(void);
 /* Ends the process with the status at once, through the Axiom runtime
    (std/c/rt/core.ax: std/os.exit). */
 __AXC_NORETURN void __axc_exit(long long status);
+/* The start of exit: in a program with threads, a thread other than the
+   first to call exit waits here for the end (std/c/rt/core.ax). */
+void __axc_exit_begin(void);
 
 /* Writes n bytes to the process's standard error, unbuffered (the
    messages of assert and abort; std/c/rt/core.ax). */
@@ -57,7 +60,12 @@ struct __axc_fn_table {
     struct __axc_fn_block first;
     struct __axc_fn_block *top; /* null: first */
     int n;                      /* functions in top */
+    _Atomic int lock;           /* 1 while a thread changes the table */
 };
+/* Takes the table's lock (a spin: it is held for a few instructions, as
+   atexit and at_quick_exit may be called from any thread); `t->lock = 0`
+   (an atomic store) gives it back (__axc_fn_lock.c). */
+void __axc_fn_lock(struct __axc_fn_table *t);
 extern struct __axc_fn_table __axc_atexit_tab;
 extern struct __axc_fn_table __axc_quick_tab;
 int __axc_fn_push(struct __axc_fn_table *t, void (*f)(void));

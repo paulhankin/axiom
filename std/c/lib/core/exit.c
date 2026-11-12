@@ -5,12 +5,16 @@
    __axc_at_exit_flush); then the process ends with status (0 and
    EXIT_SUCCESS are success, EXIT_FAILURE is 1). Returning from main calls
    it (5.1.2.3.4, the start-up: std/internal/runtime/c_start.ax). A second
-   call from a handler goes on with the handlers not yet called. */
+   call from a handler goes on with the handlers not yet called. In a
+   program with threads, a call from another thread while one runs waits
+   (the process ends). */
 #include <stdlib.h>
 #include "axc/core_impl.h"
 
 void exit(int status) {
     void (*flush)(void);
+    /* (with threads: one thread runs the rest; std/c/rt/core.ax) */
+    __axc_exit_begin();
     __axc_fn_run(&__axc_atexit_tab);
     /* the destructors (a GNU dialect's), as after main's return */
     flush = __axc_at_exit_dtors;

@@ -3,17 +3,15 @@
    4 or 8 bytes: under the lock table of C11's atomics (cgen_atomic.ax), so
    that they are atomic with each other and with _Atomic objects, across
    threads. */
-#include "host.h"
-
-void *__axiom_c_thread_start(void (*f)(void *), void *arg);
-void __axiom_c_thread_join(void *thread);
+#include <threads.h>
+#include "print.h"
 
 struct wide { long long a, b; };
 struct odd { char c[3]; };
 struct wide w;
 struct odd o = { { 1, 2, 3 } };
 
-static void work(void *arg) {
+static int work(void *arg) {
     int i;
     (void)arg;
     for (i = 0; i < 5000; i++) {
@@ -24,12 +22,13 @@ static void work(void *arg) {
             next.b = cur.b + 2;
         } while (!__atomic_compare_exchange(&w, &cur, &next, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
     }
+    return 0;
 }
 
 int main(void) {
     struct odd x = { { 7, 8, 9 } }, r;
     struct wide v;
-    void *t[4];
+    thrd_t t[4];
     int i;
     __atomic_exchange(&o, &x, &r, __ATOMIC_SEQ_CST);
     print_i64(r.c[0] * 100 + r.c[1] * 10 + r.c[2]);
@@ -40,9 +39,9 @@ int main(void) {
     print_i64(o.c[0]);
     print_i64(__atomic_always_lock_free(sizeof w, 0) * 10 + __atomic_always_lock_free(sizeof(long long), 0));
     for (i = 0; i < 4; i++)
-        t[i] = __axiom_c_thread_start(work, 0);
+        thrd_create(&t[i], work, 0);
     for (i = 0; i < 4; i++)
-        __axiom_c_thread_join(t[i]);
+        thrd_join(t[i], NULL);
     __atomic_load(&w, &v, __ATOMIC_SEQ_CST);
     print_i64(v.a);
     print_i64(v.b);
