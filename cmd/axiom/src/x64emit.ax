@@ -53,7 +53,9 @@ pub let mut XDATA: i32 = -1;  // Windows: unwind information, and the function t
 pub let mut PDATA: i32 = -1;
 pub let mut XDATA_SYM: u32 = 0;
 pub let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
-                                  chains_sym: 0, rel32: 0, abs64: 0, empty: 0 };  // frame tables (ftab.ax)
+                                  chains_sym: 0, rel32: 0, abs64: 0, empty: 0, lines: false,
+                                  line_recs: u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0),
+                                                              vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 } };  // frame tables (ftab.ax)
 pub let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 pub let mut errors: bool = false;
 pub let mut AVX: bool = false;
@@ -819,11 +821,14 @@ fn unframe() void {
 // A sibling call (is_tail): its stack arguments, which the outgoing area
 // holds, copied up through r10 to where the function's own came in
 // (rbp + 16, past Windows' home area), then the epilogue and a jump to the
-// callee: `jmp rel32`, or `rex.w jmp r11` for a call through a pointer. Both
-// are forms Windows' unwinder takes as the end of an epilogue (a jump
-// leaving the function: rel32, or an indirect one with REX.W), and the frame
-// tables have no entry for it (no return address: the callee's is the
-// caller's).
+// callee: `jmp rel32`, or `rex.w jmp r11` for a call through a pointer.
+// The frame tables have no entry for it (no return address: the callee's
+// is the caller's). On Windows the function's unwind information is the
+// frame-register form (dyn_unwind_info: right while rbp is), and each jump
+// has its own function table entry, which describes no frame (emit_unwind),
+// so that every instruction of the epilogue unwinds right whether or not
+// the unwinder takes a jump out of the function for the end of an epilogue
+// (the specification's does, not every implementation).
 fn enc_tail(i: *mut mc.MInst) void {
     if UPPER and DIRTY {
         vzeroupper();
@@ -839,6 +844,7 @@ fn enc_tail(i: *mut mc.MInst) void {
         k += 8;
     }
     unframe();
+    let jmp_at = @as(u64, E.b.len());
     let t = i.ops[0];
     if t.kind == mc.K_SYM {
         b8(0xe9);
@@ -847,7 +853,28 @@ fn enc_tail(i: *mut mc.MInst) void {
     } else {
         enc_op(8, 1, 0xff, 0, 4, t, 0, false);
     }
+    if WIN and not frameless {
+        tail_jumps.push((jmp_at << 32) | @as(u64, E.b.len()));
+    }
     cfi_body();
+}
+
+// Windows: the sibling calls' jumps of the function being encoded, as
+// (start << 32) | end offsets (emit_unwind).
+let mut tail_jumps: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+// Does MF make a sibling call?
+fn has_tail() bool {
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if is_tail(i) {
+                return true;
+            }
+            i = i.next;
+        }
+    }
+    return false;
 }
 
 // Windows: what the prologue did, step by step, for the function's unwind
@@ -886,7 +913,7 @@ fn prologue(sub: i64) void {
     b8(0x89);
     b8(0xe5);  // mov rbp, rsp
     cfi(dw.X64_RBP, 2, 1);
-    if WIN and dyn_stack() {
+    if WIN and (dyn_stack() or has_tail()) {
         uw_step(UW_SETFP, xe.RBP, 0);
     }
     for k in 0..@int_cast(usize, nsaved) {
@@ -898,7 +925,28 @@ fn prologue(sub: i64) void {
         uw_step(UW_PUSH, r, 0);
         cfi(dw.X64_RBP, 2, (@as(u64, 1) << @int_cast(u32, k + 2)) - 1);
     }
-    if sub > 0 {
+    if (sub > 4096) and WIN {
+        // Windows: touch each page of a large frame in order (the stack's
+        // guard page) without moving rsp, so that the unwind information's
+        // single allocation code is right throughout (an exception, a stack
+        // overflow on the guard page, can arrive in the middle; the codes'
+        // offsets are bytes: the loop keeps the prologue short):
+        //   mov r11, -4096; L: or qword [rsp + r11], 0; sub r11, 4096;
+        //   cmp r11, -4096 * (pages + 1); jne L
+        // (r11 is free at the entry: Windows has no shrink-wrapping)
+        let pages = (sub - 1) / 4096;
+        E.b.put("\x49\xc7\xc3\x00\xf0\xff\xff");
+        E.b.put("\x4a\x83\x0c\x1c\x00");
+        E.b.put("\x49\x81\xeb\x00\x10\x00\x00");
+        E.b.put("\x49\x81\xfb");
+        E.b.u32_(@bit_cast(u64, -4096 * (pages + 1)));
+        E.b.put("\x75\xeb");
+        b8(0x48);
+        b8(0x81);
+        b8(0xec);
+        E.b.u32_(@bit_cast(u64, sub));
+        uw_step(UW_ALLOC, 0, @bit_cast(u64, sub));
+    } else if sub > 0 {
         // touch each page of a large frame in order (stack guard)
         let mut rem = sub;
         while rem > 4096 {
@@ -1120,19 +1168,82 @@ fn alloc_of() u64 {
 // Windows: the function placed at `base` in .text with `size` bytes gets its
 // unwind information in .xdata and an entry in .pdata (start, end, unwind
 // information: addresses relative to the image, which plink.ax resolves).
+// A function with sibling calls gets more than one entry: its code up to
+// the first sibling call's jump; each jump, with unwind information of no
+// codes (the frame is gone: the return address is at rsp); the code
+// between and after them, with chained unwind information (version 1,
+// UNW_FLAG_CHAININFO, no codes, then the first entry: the system unwinds
+// them as the first's body).
 fn emit_unwind(fs: u32, base: u64, size: u64) void {
+    _ = base;
     let x = OBJ.secs.get(@int_cast(usize, XDATA));
     x.data.align(4);
     let xoff = @as(u64, x.data.len());
     let mut info = unwind_info();
+    let freg = info.view()[3];
     x.data.put(info.view());
     info.free();
+    if tail_jumps.len == 0 {
+        _ = pdata_entry(fs, 0, size, xoff);
+        return;
+    }
+    let first_end = tail_jumps.get(0) >> 32;
+    let poff = pdata_entry(fs, 0, first_end, xoff);
+    // the jumps' information: no codes
+    x.data.align(4);
+    let leaf = @as(u64, x.data.len());
+    x.data.u32_(1);
+    let mut at = first_end;
+    for k in 0..tail_jumps.len {
+        let j = tail_jumps.get(k);
+        let js = j >> 32;
+        let je = j & 0xffff_ffff;
+        if js > at {
+            chained_entry(fs, at, js, freg, poff);
+        }
+        _ = pdata_entry(fs, js, je, leaf);
+        at = je;
+    }
+    if size > at {
+        chained_entry(fs, at, size, freg, poff);
+    }
+}
+
+// A .pdata entry for fs + [from, to) with the unwind information at xoff in
+// .xdata; its offset in .pdata.
+fn pdata_entry(fs: u32, from: u64, to: u64, xoff: u64) u64 {
     let p = OBJ.secs.get(@int_cast(usize, PDATA));
     let poff = @as(u64, p.data.len());
     p.data.zeros(12);
-    p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_X86_64_RVA32, sym: fs, addend: 0 });
-    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, size) });
+    p.relocs.push(elf.Rel.{ off: poff, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, from) });
+    p.relocs.push(elf.Rel.{ off: poff + 4, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, to) });
     p.relocs.push(elf.Rel.{ off: poff + 8, ty: elf.R_X86_64_RVA32, sym: XDATA_SYM, addend: @bit_cast(i64, xoff) });
+    return poff;
+}
+
+// An entry for fs + [from, to) whose unwind information is chained to the
+// function's first entry (at primary in .pdata; frame register byte freg).
+fn chained_entry(fs: u32, from: u64, to: u64, freg: u8, primary: u64) void {
+    let x = OBJ.secs.get(@int_cast(usize, XDATA));
+    x.data.align(4);
+    let xoff = @as(u64, x.data.len());
+    x.data.u8_(1 | (4 << 3));  // version 1, UNW_FLAG_CHAININFO
+    x.data.u8_(0);
+    x.data.u8_(0);
+    x.data.u8_(freg);
+    // the first entry, copied (begin, end, unwind information)
+    let p = OBJ.secs.get(@int_cast(usize, PDATA));
+    let first_end = tail_jumps.get(0) >> 32;
+    let at = @as(u64, x.data.len());
+    x.data.zeros(12);
+    x.relocs.push(elf.Rel.{ off: at, ty: elf.R_X86_64_RVA32, sym: fs, addend: 0 });
+    x.relocs.push(elf.Rel.{ off: at + 4, ty: elf.R_X86_64_RVA32, sym: fs, addend: @bit_cast(i64, first_end) });
+    for r in p.relocs.items() {
+        if r.off == primary + 8 {
+            x.relocs.push(elf.Rel.{ off: at + 8, ty: r.ty, sym: r.sym, addend: r.addend });
+        }
+    }
+    _ = pdata_entry(fs, from, to, xoff);
 }
 
 fn enc_sse(i: *mut mc.MInst) void {
@@ -3159,6 +3270,7 @@ pub fn encode_func(f: *mut ir.Func) void {
         calls.clear();
         noframe.clear();
         cfis.clear();
+        tail_jumps.clear();
         in_noframe = false;
         if sw < 0 {
             prologue(sub);
@@ -3272,7 +3384,8 @@ pub fn encode_func(f: *mut ir.Func) void {
     let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, E.b.len());
-    ft.func(&FT, base, s.size, frameless, noframe.items(), calls.items());
+    ft.func(&mut FT, base, s.size, frameless, noframe.items(), calls.items(), rows.items(),
+            dw.func_name(f, elf.display_name(s.name)));
     noframe.deinit();
     if WIN and not frameless {
         emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));

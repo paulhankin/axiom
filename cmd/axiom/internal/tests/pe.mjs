@@ -137,7 +137,210 @@ export function checkPE(d, opts = {}) {
   }
   const r = { errs, machine, imports, relocs: nrel, functions: pdata.length };
   if (arm64) checkArm64Code(d, { E, off, text, pdata, iat, entry, funcs: opts.pdb ? pdbFunctions(opts.pdb, E) : null, r });
+  else checkX64Unwind(d, { E, off, secOf, text, pdata, funcs: opts.pdb ? pdbFunctions(opts.pdb, E) : null, r });
   return r;
+}
+
+// The x64 function table and unwind information (the x64 exception-handling
+// specification: RUNTIME_FUNCTION, UNWIND_INFO, UNWIND_CODE), decoded as the
+// system's unwinder decodes them: each entry's range within .text, after the
+// one before it; its UNWIND_INFO 4-aligned in read-only data, version 1 or
+// 2, no handler (the compiler writes none), the
+// prologue within the function, its codes whole (CountOfCodes slots, each
+// operation its size), each a defined operation with its operand in range,
+// in descending code offsets within the prologue, UWOP_SET_FPREG exactly
+// when a frame register is named (and a frame offset only then). Then the
+// prologue's instructions (cmd/axiom/src/x64emit.ax's prologue, and the
+// linker's entry: push, mov rbp rsp, sub rsp, the stack probe's loop, xmm
+// stores) are matched to the codes, in order: every instruction within
+// SizeOfProlog that pushes, moves rsp, sets the frame register or saves a
+// register has the code its end offset names, with its operand, and no
+// code is left over; an instruction of another kind there is an error. A
+// function with sibling calls has more entries (x64emit.ax's emit_unwind):
+// each jump's, right after an entry of its function, without codes and
+// holding just the jump, and the code after it, chained (UNW_FLAG_CHAININFO,
+// no codes) to its function's first entry, with its frame register. A
+// function the PDB lists that starts by pushing rbp has an entry, and in a
+// function with an entry each epilogue (lea rsp / leave, then pops, then
+// ret or a jmp out of the function) pops rbp last.
+function checkX64Unwind(d, { E, off, secOf, text, pdata, funcs, r }) {
+  const to = off(text.rva, text.vsize);
+  if (to < 0) { E('.text is not all in the file'); return; }
+  const byte = (rva) => d[to + rva - text.rva];
+  const i32 = (rva) => d.readInt32LE(to + rva - text.rva);
+  let ncodes = 0, nepi = 0;
+  const OPS = { 0: 'push', 1: 'alloc_large', 2: 'alloc_small', 3: 'set_fpreg', 4: 'save_nonvol', 5: 'save_nonvol_far',
+                6: 'epilog', 8: 'save_xmm128', 9: 'save_xmm128_far', 10: 'push_machframe' };
+  const ranges = [];
+  for (let k = 0; k < pdata.length; k++) {
+    const p = pdata[k], at = `function table entry 0x${p.begin.toString(16)}`;
+    if (p.end <= p.begin || p.end > text.rva + text.vsize) { E(`${at}: its end 0x${p.end.toString(16)} is not after its start within .text`); continue; }
+    if (k > 0 && p.begin < pdata[k - 1].end) E(`${at} overlaps the one before it`);
+    if (p.info & 3) { E(`${at}: its unwind information's address is not 4-aligned (or is an indirect entry)`); continue; }
+    const s = secOf(p.info);
+    if (!s || (s.flags & 0x20000000) || (s.flags & 0x80000000)) { E(`${at}: its unwind information is not in read-only data`); continue; }
+    const xo = off(p.info, 4);
+    if (xo < 0) { E(`${at}: its unwind information is outside the file data`); continue; }
+    const ver = d[xo] & 7, flags = d[xo] >> 3, plen = d[xo + 1], n = d[xo + 2], freg = d[xo + 3] & 15, foff = d[xo + 3] >> 4;
+    if (ver !== 1 && ver !== 2) { E(`${at}: unwind information version ${ver}`); continue; }
+    if (flags & ~4) E(`${at}: unwind flags ${flags} (the compiler writes no handler)`);
+    if (flags & 4) {
+      // a chained entry (x64emit.ax's emit_unwind: the code after a sibling
+      // call's jump): no codes, the frame register of its function's first
+      // entry, which it names and which comes before it
+      const co = off(p.info + 4 + 2 * ((n + 1) & ~1), 12);
+      if (n || co < 0) { E(`${at}: a chained entry with codes, or its first entry outside the file data`); continue; }
+      const first = { begin: d.readUInt32LE(co), end: d.readUInt32LE(co + 4), info: d.readUInt32LE(co + 8) };
+      const f = ranges.find((x) => x.begin === first.begin && x.end === first.end && x.info === first.info);
+      if (!f || f.chained || first.end > p.begin) E(`${at}: chained to 0x${first.begin.toString(16)}, which is not an earlier first entry`);
+      else if (f.freg !== freg) E(`${at}: chained with frame register ${freg}, its first entry's is ${f.freg}`);
+      ranges.push({ ...p, framed: true, chained: true, freg });
+      continue;
+    }
+    if (n === 0 && !freg && plen === 0 && ranges.length && ranges[ranges.length - 1].end === p.begin && ranges[ranges.length - 1].framed) {
+      // a sibling call's jump after its function's epilogue (emit_unwind): jmp rel32 or rex.w jmp reg
+      const b0 = byte(p.begin), len = p.end - p.begin;
+      const ok = (b0 === 0xe9 && len === 5) || ((b0 === 0x48 || b0 === 0x49) && byte(p.begin + 1) === 0xff && ((byte(p.begin + 2) >> 3) & 7) === 4 && len === 3);
+      if (!ok) E(`${at}: an entry without codes after a function's that is not one jump`);
+      ranges.push({ ...p, framed: false, freg: 0, jump: true });
+      continue;
+    }
+    if (plen > p.end - p.begin) E(`${at}: a prologue of ${plen} bytes in a function of ${p.end - p.begin}`);
+    if (n && off(p.info + 4, 2 * n) < 0) { E(`${at}: its unwind codes are outside the file data`); continue; }
+    if (!freg && foff) E(`${at}: a frame offset without a frame register`);
+    const codes = [];
+    let bad = false;
+    for (let i = 0; i < n;) {
+      const c = xo + 4 + 2 * i, o = d[c], op = d[c + 1] & 15, info = d[c + 1] >> 4;
+      const x = { off: o, op: OPS[op], info };
+      let size = 1;
+      if (op === 1) {
+        if (info > 1) { E(`${at}: UWOP_ALLOC_LARGE with operation info ${info}`); bad = true; break; }
+        size = info ? 3 : 2;
+        if (i + size <= n) x.size = info ? d.readUInt32LE(c + 2) : d.readUInt16LE(c + 2) * 8;
+      } else if (op === 2) x.size = info * 8 + 8;
+      else if (op === 3) { if (!freg) E(`${at}: UWOP_SET_FPREG without a frame register`); }
+      else if (op === 4 || op === 8) { size = 2; if (i + size <= n) x.disp = d.readUInt16LE(c + 2) * (op === 8 ? 16 : 8); }
+      else if (op === 5 || op === 9) { size = 3; if (i + size <= n) x.disp = d.readUInt32LE(c + 2); }
+      else if (op === 6 && ver === 2) size = 2;
+      else if (op === 10) { if (info > 1) E(`${at}: UWOP_PUSH_MACHFRAME with operation info ${info}`); }
+      else if (op !== 0) { E(`${at}: unwind operation ${op}${op === 6 ? ' in a version 1 record' : ''}`); bad = true; break; }
+      if (i + size > n) { E(`${at}: unwind code ${i} runs past CountOfCodes`); bad = true; break; }
+      if (o > plen) E(`${at}: an unwind code at offset ${o}, past the prologue's ${plen} bytes`);
+      if (codes.length && o > codes[codes.length - 1].off) E(`${at}: unwind codes not in descending offsets`);
+      codes.push(x);
+      i += size;
+    }
+    if (bad) continue;
+    ncodes += codes.length;
+    const nfp = codes.filter((c) => c.op === 'set_fpreg').length;
+    if (freg && nfp !== 1) E(`${at}: frame register ${freg} with ${nfp} UWOP_SET_FPREG codes`);
+    // the prologue, from the function's start: each instruction and its code
+    const want = [...codes].reverse();
+    let a = p.begin, used = 0;
+    // (the codes the same offset carries: the dynamic-stack form's, all at set_fpreg's)
+    const take = (op, ok) => {
+      const c = want[used], end = a - p.begin;
+      if (!c || c.off !== end || c.op !== op || !ok(c)) {
+        E(`${at}+0x${end.toString(16)}: the prologue's ${op} has ${c ? `the code ${c.op} at offset ${c.off}` : 'no code'}`);
+        return false;
+      }
+      used++;
+      return true;
+    };
+    // (the dynamic-stack form (x64emit.ax's dyn_unwind_info) describes the
+    // saves from rbp: its codes for the pushes and stores after mov rbp, rsp
+    // are UWOP_SAVE_* at the offset of their instruction, its set_fpreg and
+    // the lift of the frame offset at mov rbp, rsp's)
+    const dyn = freg === 5;
+    // (a machine frame at the entry: core_signal.ax's trampoline, plink.ax)
+    while (want[used] && want[used].op === 'push_machframe' && want[used].off === 0) used++;
+    while (a - p.begin < plen) {
+      const b0 = byte(a), b1 = byte(a + 1), b2 = byte(a + 2);
+      let ok = true;
+      const rex41 = b0 === 0x41 && b1 >= 0x50 && b1 <= 0x57;
+      if ((b0 >= 0x50 && b0 <= 0x57) || rex41) {
+        const reg = rex41 ? b1 - 0x50 + 8 : b0 - 0x50;
+        a += rex41 ? 2 : 1;
+        if (dyn && reg !== 5) ok = take('save_nonvol_far', (c) => c.info === reg);
+        else ok = take('push', (c) => c.info === reg);
+      } else if (b0 === 0x48 && b1 === 0x89 && b2 === 0xe5) {
+        a += 3;
+        if (dyn) {
+          // (in prologue order) the lift of 16 * FrameOffset, then set_fpreg, both at this offset
+          const fo = d[off(p.info, 4) + 3] >> 4;
+          if (fo) ok = take(want[used] && want[used].op === 'alloc_large' ? 'alloc_large' : 'alloc_small', (c) => c.size === 16 * fo);
+          if (ok) ok = take('set_fpreg', () => true);
+        }
+      } else if (b0 === 0x48 && b1 === 0x83 && b2 === 0xec) {
+        const v = byte(a + 3);
+        a += 4;
+        if (!dyn) ok = take('alloc_small', (c) => c.size === v);
+      } else if (b0 === 0x48 && b1 === 0x81 && b2 === 0xec) {
+        const v = i32(a + 3) >>> 0;
+        a += 7;
+        if (!dyn) ok = take(want[used] && want[used].op === 'alloc_small' ? 'alloc_small' : 'alloc_large', (c) => c.size === v);
+      } else if (b0 === 0x49 && b1 === 0xc7 && b2 === 0xc3 && i32(a + 3) === -4096) {
+        // the stack probe's loop (x64emit.ax's prologue): mov r11, -4096; L: or qword [rsp+r11], 0;
+        // sub r11, 4096; cmp r11, -n; jne L: rsp does not move
+        a += 7;
+        const shape = [0x4a, 0x83, 0x0c, 0x1c, 0x00, 0x49, 0x81, 0xeb, 0x00, 0x10, 0x00, 0x00, 0x49, 0x81, 0xfb];
+        if (shape.some((x, j) => byte(a + j) !== x) || byte(a + 19) !== 0x75 || byte(a + 20) !== 0xeb) { E(`${at}: a malformed stack probe`); break; }
+        a += 21;
+      } else if ((b0 === 0x0f && b1 === 0x11) || (b0 === 0x44 && b1 === 0x0f && b2 === 0x11)) {
+        // movups [rbp + disp32], xmm
+        const q = a + (b0 === 0x44 ? 2 : 1) + 1, m = byte(q);
+        if ((m & 0xc7) !== 0x85) { E(`${at}+0x${(a - p.begin).toString(16)}: an xmm store in the prologue that is not to [rbp + disp32]`); break; }
+        a = q + 5;
+        const reg = ((m >> 3) & 7) + (b0 === 0x44 ? 8 : 0);
+        ok = take(want[used] && want[used].op === 'save_xmm128' ? 'save_xmm128' : 'save_xmm128_far', (c) => c.info === reg);
+      } else {
+        E(`${at}+0x${(a - p.begin).toString(16)}: an instruction in the prologue (0x${b0.toString(16)} 0x${b1.toString(16)} 0x${b2.toString(16)}) that is not one the compiler writes there`);
+        break;
+      }
+      if (!ok) break;
+    }
+    if (a - p.begin > plen) E(`${at}: the prologue's last instruction ends at +0x${(a - p.begin).toString(16)}, past SizeOfProlog ${plen}`);
+    if (used < want.length) E(`${at}: ${want.length - used} unwind codes describe no instruction of the prologue (it ends at +0x${(a - p.begin).toString(16)})`);
+    ranges.push({ ...p, framed: want.length > 0, freg });
+  }
+  const entryAt = (rva) => {
+    let lo = 0, hi = ranges.length - 1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (ranges[m].end <= rva) lo = m + 1; else if (ranges[m].begin > rva) hi = m - 1; else return ranges[m]; }
+    return null;
+  };
+  // epilogues: the instructions are not decoded; a ret or a jmp out of the
+  // function after pops and a lea rsp / leave before them is one
+  for (const p of ranges) {
+    if (!p.framed) continue;
+    for (let a = p.begin + 1; a < p.end; a++) {
+      const b = byte(a);
+      const out = b === 0xe9 && a + 5 <= p.end && ((t) => t < p.begin || t >= p.end)(a + 5 + i32(a + 1));
+      if (b !== 0xc3 && !out) continue;
+      let q = a;
+      while (q - 1 >= p.begin && byte(q - 1) >= 0x58 && byte(q - 1) <= 0x5f) {
+        q--;
+        if (q - 1 >= p.begin && byte(q - 1) === 0x41) q--;
+      }
+      const leave = byte(q - 1) === 0xc9 && q === a;
+      const lea8 = byte(q - 4) === 0x48 && byte(q - 3) === 0x8d && byte(q - 2) === 0x65;
+      const lea32 = byte(q - 7) === 0x48 && byte(q - 6) === 0x8d && byte(q - 5) === 0xa5;
+      if (!(leave || lea8 || lea32)) continue;  // (an immediate's or displacement's byte, not an epilogue)
+      nepi++;
+      if (!leave && byte(a - 1) !== 0x5d) E(`function 0x${p.begin.toString(16)}+0x${(a - p.begin).toString(16)}: an epilogue that does not pop rbp last`);
+    }
+  }
+  // a function the PDB lists that sets up a frame has an entry
+  if (funcs) {
+    let missing = 0;
+    for (const f of funcs) {
+      const a = text.rva + f.off;
+      if (byte(a) === 0x55 && byte(a + 1) === 0x48 && byte(a + 2) === 0x89 && byte(a + 3) === 0xe5 && !entryAt(a) && missing++ < 5) E(`${f.name} pushes rbp but has no function table entry`);
+    }
+    r.funcs = funcs.length;
+  }
+  r.unwindCodes = ncodes;
+  r.epilogues = nepi;
 }
 
 // The functions a program database lists: [{ off (in section 1), size, name }]

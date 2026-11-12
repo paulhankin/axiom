@@ -38,10 +38,11 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
     system's C compiler (`cc`), which must be installed. A program that defines every
     function it calls is linked by the compiler's own linker, and is a static executable
     that needs nothing.
-  - On macOS, in `libSystem`. On Windows, in `msvcrt.dll`, unless the name looks like a
-    Windows API function: a capitalized name is `kernel32.dll`'s (`WSA...` and the
-    socket functions are `ws2_32.dll`'s, `Rtl...` and `Nt...` are `ntdll.dll`'s,
-    `BCrypt...` are `bcrypt.dll`'s).
+  - On macOS, in `libSystem`. On Windows, in a system DLL by the name's rules: a
+    capitalized name is `kernel32.dll`'s (`WSA...` and the socket functions are
+    `ws2_32.dll`'s, `Rtl...`, `Nt...` and `Nls...` are `ntdll.dll`'s, `BCrypt...` are
+    `bcrypt.dll`'s); any other name is an undefined symbol at link time: nothing
+    comes from the system's C library (`msvcrt.dll`).
   - On WebAssembly, it is an import of the module `env`, with the name of the function.
     A host supplies it. The module also imports the runtime's host functions from the
     module `axiom` (`ax_write`, ...), which `std/internal/runtime/host.mjs` provides:
@@ -257,9 +258,7 @@ The order in which a program starts and ends is the same with or without C:
    C code may call Axiom functions that allocate, print or start threads.
 3. When C's `main` returns, its value is the argument of a call of `exit` (5.1.2.2.3)
    if the program defines `exit` (the C library's, unless `--c-freestanding`; or the
-   program's own: a C unit, or an Axiom module's `export fn exit`), and on Windows,
-   where `exit` is otherwise the system C library's (`msvcrt.dll`), which runs its
-   `atexit` functions and flushes its streams. The library's `exit` runs the `atexit`
+   program's own: a C unit, or an Axiom module's `export fn exit`). The library's `exit` runs the `atexit`
    functions, then the GNU dialects' destructors, then the standard I/O's flushing, and ends the
    process through the runtime: `std/os.exit`, which finishes the runtime
    (`ax_rt_fini`) and exits with the status. Its argument has the width of `int`
@@ -346,8 +345,8 @@ Axiom allocator. A C source linked with `--link=` (compiled by the system's C co
 against its headers) uses the system library's streams, and the program's code this
 library's, under the same names (`printf`, `fopen`, ...): such a program should be built
 with `--c-freestanding` if both write. On
-Windows nothing the library defines comes from `msvcrt.dll`; the rest still does by
-name. On macOS the runtime reaches
+Windows nothing comes from `msvcrt.dll` (the suite checks every Windows executable's
+imports). On macOS the runtime reaches
 `libSystem`'s `exit`, `getenv`, `raise`, `malloc`, `calloc` and `free` under names of
 its own (`__axiom_libc_...`, which the linker binds to those), so that they are never
 the program's.
@@ -449,9 +448,16 @@ modified between `setjmp` and `longjmp` have their values after the jump (C17
 7.13.2.1p3), as do volatile ones that were. Its address cannot be taken (`C3301`): a
 call through a pointer would not be known to return twice.
 
-- `longjmp` unwinds nothing. On Windows no exception handlers of the frames it leaves
-  run (the system's unwinding is not used); the restored stack pointer drops the
-  frames.
+- `longjmp` unwinds nothing on Linux, macOS and Windows ARM64: the restored stack
+  pointer drops the frames. On Windows x64 the hosted library's `longjmp` has the
+  system unwind the frames in between first (`RtlUnwindEx` to the `setjmp` caller's
+  frame, with `STATUS_LONGJUMP`; `jmp_buf` is the system's `_JUMP_BUFFER`), so that the
+  termination handlers of system frames in between run (a callback a DLL called, left
+  by `longjmp`); the registers are then restored from `jmp_buf`
+  (`std/c/rt/core_jump.ax`). A freestanding program's `longjmp` restores them at once,
+  which is right for the program's own frames (they have no handlers), and its last
+  instruction moves the stack pointer and returns in one step, so that the system's
+  unwinder is right at every instruction of it.
 - Jumping back into a function whose variable length arrays were allocated after the
   `setjmp` call frees them (the stack pointer goes back); jumping out of, or over,
   Axiom functions that C called (an Axiom function on the stack between the `setjmp`
@@ -474,9 +480,16 @@ with `signal` stays set while it runs, and its signal waits until it returns
   `SIGILL` replaces the runtime's crash report while it is set; `SIG_DFL` puts back
   the action the program started with (the crash report).
 - Windows: `SIGINT` is the console's Ctrl-C and Ctrl-Break (a console control
-  handler, which the system calls on a thread of its own); the others arrive only from
-  `raise`, which calls the handler at once; the processor's faults stay the crash
-  reporter's. The default action of a raised signal ends the process with status 3
+  handler, which the system calls on a thread of its own). On x64, `SIGSEGV`,
+  `SIGFPE` and `SIGILL` handlers get the processor's exceptions in the program's own
+  code (an access violation, an integer division fault or an unmasked floating-point
+  exception, an illegal instruction): a vectored exception handler redirects the
+  faulting thread as if the faulting instruction had called a trampoline (whose unwind
+  information lets the system's walks, and `longjmp`, go on through the faulting
+  function); a handler that returns runs the instruction again. A stack overflow, a
+  fault in a DLL, and any fault while the signal's action is `SIG_DFL` or `SIG_IGN`
+  are the crash reporter's. On ARM64 the faults stay the crash reporter's. The others
+  arrive only from `raise`, which calls the handler at once. The default action of a raised signal ends the process with status 3
   for `SIGABRT` (as `abort`'s) and 128 + the signal's number for the others.
 - WebAssembly: `raise` alone, as on Windows.
 
@@ -1111,9 +1124,8 @@ Programs should not use them.
 A C program's `main` is called by a start-up module of the runtime, which the build adds.
 It gives `main` its arguments (`argv[argc]` is null) and uses its result as the exit
 status: it calls the C library's `exit` with `main`'s value ("Start-up and exit"),
-which runs the `atexit` functions; a freestanding program's start-up does so on
-Windows (with `msvcrt.dll`'s), and elsewhere the system's own start-up ends the process
-(on WebAssembly, the host).
+which runs the `atexit` functions; in a freestanding program the start-up returns
+`main`'s value, and the process ends with it (on WebAssembly, the host).
 
 A program that defines `memcpy`, `memset` and `memmove` itself builds for every target.
 Names that the runtime uses for its own functions (such as `ax_write`) cannot be
@@ -1323,7 +1335,7 @@ arguments in 64 bytes it reserves just below its stack arguments, so that `va_li
 over both. Results are returned as in AAPCS64 (homogeneous aggregates included).
 
 On Windows, an object that C code declares and no unit defines is a DLL's, by the same
-rules as functions (`msvcrt.dll`'s unless its name is a Windows API's): the program
+rules as functions (`ntdll.dll`'s `NlsAnsiCodePage`, say): the program
 reads its address from the import address table, so `extern int _fmode;` is the C
 library's own object. Its address is not an address constant there (it is known only
 when the program runs): an initializer of an object with static storage duration that
@@ -1383,8 +1395,11 @@ stack trace (innermost first):
 `--stack-traces=off` prints the crash line only. The trace is made of the call-site
 records of the calls the crash is below: each line names the function that made a call
 and where, and the first the function called (only as `<indirect call>` when it was
-called through a pointer). The faulting instruction itself has no record, so its line
-is not shown (a debugger finds it in the line tables: "Debugging").
+called through a pointer). The faulting instruction itself has no record; with line
+tables (`-g`, `--debug-info=lines`) its line is shown all the same (`at deref
+(crash.c:2)`), from rows the frame table then holds (`cmd/axiom/src/ftab.ax`: no DWARF
+is read at run time), also where no call was recorded (all of a program inlined into
+`main`); without them the table and the code are as before.
 
 At `-O2` and `-O3` the trace is correct for the frames that exist, and the calls the
 optimizer inlined into them are in it too (an inlined call's record carries the calls
@@ -1403,6 +1418,9 @@ division by zero) reports `__axiom_c_main` and the start-up, and no C frames.
 `-g` (or `--debug-info=full`) writes DWARF 5 debug information, `--debug-info=lines`
 the line tables and frames only, and `--debug-info=none` (the default) nothing. It does
 not change the code generated, at any optimization level, and two builds are the same.
+With line tables the frame table also holds the line rows of crash traces ("Stack
+traces"): the executable's data grows by them, and on macOS the executable is no
+longer the same as without `-g`.
 
 - **Lines**: each function's code is mapped to the lines of the source, `#line`
   directives followed (the presumed file and line, as diagnostics show them); code the
@@ -1458,8 +1476,8 @@ Where it goes, per target:
 | Target | |
 |---|---|
 | `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`, and when needed `.debug_rnglists` and `.debug_loclists`. |
-| `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable is the same as without `-g`. It has no unwind information (`__unwind_info`, `__eh_frame`): the platform's ABI keeps a frame record (x29, x30; on x86-64 rbp and the return address) in every function that calls, and the crash reporter and `backtrace(3)` walk those records, so stack traces through our frames need none (a leaf without a frame has its caller in x30, or on x86-64 at the stack pointer). Only an unwinder that needs the tables (C++ exceptions through our frames, which do not happen) would. |
-| `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`; no types or variables. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame). |
+| `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable's code is the same as without `-g` (its frame table has the line rows). It has no unwind information (`__unwind_info`, `__eh_frame`): the platform's ABI keeps a frame record (x29, x30; on x86-64 rbp and the return address) in every function that calls, and the crash reporter and `backtrace(3)` walk those records, so stack traces through our frames need none (a leaf without a frame has its caller in x30, or on x86-64 at the stack pointer). Only an unwinder that needs the tables (C++ exceptions through our frames, which do not happen) would. |
+| `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`; no types or variables. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame), right at every instruction: a large frame's stack probe does not move `rsp`, and a function with sibling calls uses the frame-register form with an entry of its own for each jump (the code after it chained), so that the unwinder is right whether or not it takes a jump out of a function for the end of an epilogue. The suite decodes every unwind record as the system does before each Windows program runs (`pe.mjs`) and single-steps a walk through every kind of frame (`c/mix/win_walk`). |
 | `aarch64-windows` | As `x86_64-windows`; the function table's ARM64 records describe every function with a frame (on Windows every function that calls has one). |
 | `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section (lines; no frames, which WebAssembly has no use for). |
 
@@ -1468,9 +1486,8 @@ for the system's linker. Axiom functions in the same program are described in th
 compilation unit, whose language is C's (an Axiom program's own units have Axiom's:
 `docs/cli.md`, `-g`).
 
-The line of a crash's faulting instruction is not in the stack trace (above): run the
-program in a debugger, which stops there and reads its line from the line tables, or
-load the core dump into one.
+The line of a crash's faulting instruction is in the stack trace when the program has
+line tables (above).
 
 ## Optimization
 

@@ -10,20 +10,26 @@
 //                              address in env (a jmp_buf: 32 words); 0
 //   longjmp(env, val)          restores them and returns from that
 //                              __axc_setjmp call again, with val (1 if val
-//                              is 0: C 7.13.2.1p4)
+//                              is 0: C 7.13.2.1p4); also named
+//                              __axc_longjmp_restore, which the hosted C
+//                              library's longjmp calls (std/c/rt/core.ax:
+//                              on Windows x64 it unwinds through the system
+//                              first, and comes here otherwise)
 //
 // The layout of env is this file's own (only these two functions read it):
 //   x86-64 System V  rbx, rbp, r12..r15, the stack pointer, the return address
-//   x86-64 Windows   rbx, rbp, rdi, rsi, r12..r15, the stack pointer, the
-//                    return address, MXCSR (at 80), the x87 control word (84),
-//                    xmm6..xmm15 (96..256); the Windows x64 convention keeps all
+//   x86-64 Windows   the system's _JUMP_BUFFER (which its unwinder's
+//                    STATUS_LONGJUMP restores from): the frame (0, which
+//                    longjmp fills in), rbx, the stack pointer, rbp, rsi,
+//                    rdi, r12..r15, the return address (80), MXCSR (88), the
+//                    x87 control word (92), xmm6..xmm15 (96..256); the
+//                    Windows x64 convention keeps all
 //   AArch64          x19..x28, x29 (frame), x30 (link: the return address),
 //                    the stack pointer (96), d8..d15 (104..168), as AAPCS64
 //                    keeps them (and on macOS; x18 is the platform's and is
 //                    not touched)
 //
-// longjmp does not unwind: on Windows no handlers run in the frames it
-// leaves, as on the other systems. The compiler treats a function calling
+// This longjmp does not unwind: no handlers run in the frames it leaves. The compiler treats a function calling
 // __axc_setjmp as one where it returns twice (c/cgen_expr.ax: ir.Func's
 // returns_twice). Both are weak: a program's own definitions win.
 // =============================================================================
@@ -31,7 +37,7 @@ import "elf.ax" as elf;
 
 /// Are `name`'s the functions this file defines (on every native target)?
 pub fn provides(name: []u8) bool {
-    return str_eq(name, "__axc_setjmp") or str_eq(name, "longjmp");
+    return str_eq(name, "__axc_setjmp") or str_eq(name, "longjmp") or str_eq(name, "__axc_longjmp_restore");
 }
 
 fn str_eq(a: []u8, b: []u8) bool {
@@ -53,6 +59,13 @@ fn func(o: *mut elf.Obj, text: i32, name: []u8) void {
                                  ty: elf.T_FUNC, hidden: false });
 }
 
+// Another name of the function func just started.
+fn label(o: *mut elf.Obj, text: i32, name: []u8) void {
+    let s = o.secs.get(@as(usize, @bit_cast(u32, text)));
+    _ = elf.add_sym(o, elf.Sym.{ name: name, sec: text, value: @as(u64, s.data.len()), size: 0, bind: elf.B_WEAK,
+                                 ty: elf.T_FUNC, hidden: false });
+}
+
 fn bytes(o: *mut elf.Obj, text: i32, b: []u8) void {
     o.secs.get(@as(usize, @bit_cast(u32, text))).data.put(b);
 }
@@ -69,13 +82,13 @@ fn words(o: *mut elf.Obj, text: i32, ws: []u32) void {
 pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
     if (machine == elf.EM_X86_64) and windows {
         func(o, text, "__axc_setjmp");
-        // mov [rcx+0..56], rbx rbp rdi rsi r12 r13 r14 r15
-        bytes(o, text, "\x48\x89\x19\x48\x89\x69\x08\x48\x89\x79\x10\x48\x89\x71\x18");
-        bytes(o, text, "\x4c\x89\x61\x20\x4c\x89\x69\x28\x4c\x89\x71\x30\x4c\x89\x79\x38");
-        // lea rdx, [rsp+8]; mov [rcx+64], rdx; mov rdx, [rsp]; mov [rcx+72], rdx
-        bytes(o, text, "\x48\x8d\x54\x24\x08\x48\x89\x51\x40\x48\x8b\x14\x24\x48\x89\x51\x48");
-        // stmxcsr [rcx+80]; fnstcw [rcx+84]
-        bytes(o, text, "\x0f\xae\x59\x50\xd9\x79\x54");
+        // mov qword [rcx], 0 (Frame: longjmp finds it); mov [rcx+8], rbx;
+        // lea rdx, [rsp+8]; mov [rcx+16], rdx; mov [rcx+24..72], rbp rsi rdi r12 r13 r14 r15
+        bytes(o, text, "\x48\xc7\x01\x00\x00\x00\x00\x48\x89\x59\x08\x48\x8d\x54\x24\x08\x48\x89\x51\x10");
+        bytes(o, text, "\x48\x89\x69\x18\x48\x89\x71\x20\x48\x89\x79\x28");
+        bytes(o, text, "\x4c\x89\x61\x30\x4c\x89\x69\x38\x4c\x89\x71\x40\x4c\x89\x79\x48");
+        // mov rdx, [rsp]; mov [rcx+80], rdx; stmxcsr [rcx+88]; fnstcw [rcx+92]
+        bytes(o, text, "\x48\x8b\x14\x24\x48\x89\x51\x50\x0f\xae\x59\x58\xd9\x79\x5c");
         // movups [rcx+96..240], xmm6..xmm15
         bytes(o, text, "\x0f\x11\x71\x60\x0f\x11\x79\x70");
         bytes(o, text, "\x44\x0f\x11\x81\x80\x00\x00\x00\x44\x0f\x11\x89\x90\x00\x00\x00");
@@ -84,19 +97,25 @@ pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
         bytes(o, text, "\x44\x0f\x11\xb1\xe0\x00\x00\x00\x44\x0f\x11\xb9\xf0\x00\x00\x00");
         bytes(o, text, "\x31\xc0\xc3");  // xor eax, eax; ret
         func(o, text, "longjmp");
+        label(o, text, "__axc_longjmp_restore");
         // mov eax, edx; test eax, eax; jnz 1f; mov eax, 1; 1:
         bytes(o, text, "\x89\xd0\x85\xc0\x75\x05\xb8\x01\x00\x00\x00");
-        bytes(o, text, "\x48\x8b\x19\x48\x8b\x69\x08\x48\x8b\x79\x10\x48\x8b\x71\x18");
-        bytes(o, text, "\x4c\x8b\x61\x20\x4c\x8b\x69\x28\x4c\x8b\x71\x30\x4c\x8b\x79\x38");
-        // ldmxcsr [rcx+80]; fldcw [rcx+84]
-        bytes(o, text, "\x0f\xae\x51\x50\xd9\x69\x54");
+        // mov rbx, [rcx+8]; mov rbp rsi rdi r12 r13 r14 r15, [rcx+24..72]
+        bytes(o, text, "\x48\x8b\x59\x08\x48\x8b\x69\x18\x48\x8b\x71\x20\x48\x8b\x79\x28");
+        bytes(o, text, "\x4c\x8b\x61\x30\x4c\x8b\x69\x38\x4c\x8b\x71\x40\x4c\x8b\x79\x48");
+        // ldmxcsr [rcx+88]; fldcw [rcx+92]
+        bytes(o, text, "\x0f\xae\x51\x58\xd9\x69\x5c");
         bytes(o, text, "\x0f\x10\x71\x60\x0f\x10\x79\x70");
         bytes(o, text, "\x44\x0f\x10\x81\x80\x00\x00\x00\x44\x0f\x10\x89\x90\x00\x00\x00");
         bytes(o, text, "\x44\x0f\x10\x91\xa0\x00\x00\x00\x44\x0f\x10\x99\xb0\x00\x00\x00");
         bytes(o, text, "\x44\x0f\x10\xa1\xc0\x00\x00\x00\x44\x0f\x10\xa9\xd0\x00\x00\x00");
         bytes(o, text, "\x44\x0f\x10\xb1\xe0\x00\x00\x00\x44\x0f\x10\xb9\xf0\x00\x00\x00");
-        // mov rsp, [rcx+64]; jmp [rcx+72]
-        bytes(o, text, "\x48\x8b\x61\x40\xff\x61\x48");
+        // the return address where __axc_setjmp's was, and the stack pointer
+        // to it in one instruction, so that the system's unwinder (which
+        // takes this function for a leaf: its return address at rsp) is
+        // right at every instruction: mov r8, [rcx+80]; mov r9, [rcx+16];
+        // mov [r9-8], r8; lea rsp, [r9-8]; ret
+        bytes(o, text, "\x4c\x8b\x41\x50\x4c\x8b\x49\x10\x4d\x89\x41\xf8\x49\x8d\x61\xf8\xc3");
         return;
     }
     if machine == elf.EM_X86_64 {
@@ -107,6 +126,7 @@ pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
         bytes(o, text, "\x48\x8d\x54\x24\x08\x48\x89\x57\x30\x48\x8b\x14\x24\x48\x89\x57\x38");
         bytes(o, text, "\x31\xc0\xc3");  // xor eax, eax; ret
         func(o, text, "longjmp");
+        label(o, text, "__axc_longjmp_restore");
         // mov eax, esi; test eax, eax; jnz 1f; mov eax, 1; 1:
         bytes(o, text, "\x89\xf0\x85\xc0\x75\x05\xb8\x01\x00\x00\x00");
         bytes(o, text, "\x48\x8b\x1f\x48\x8b\x6f\x08\x4c\x8b\x67\x10\x4c\x8b\x6f\x18\x4c\x8b\x77\x20\x4c\x8b\x7f\x28");
@@ -122,6 +142,7 @@ pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
                        0x6D06A408, 0x6D07AC0A, 0x6D08B40C, 0x6D09BC0E, 0x52800000, 0xD65F03C0];
     words(o, text, sj[..]);
     func(o, text, "longjmp");
+    label(o, text, "__axc_longjmp_restore");
     // ldp the same; ldr x16, [x0, 96]; mov sp, x16; cmp w1, 0;
     // csinc w0, w1, wzr, ne (val, or 1); ret (to x30, the saved return address)
     let lj: [15]u32 = [0xA9405013, 0xA9415815, 0xA9426017, 0xA9436819, 0xA944701B, 0xA945781D, 0xF9403010, 0x9100021F,

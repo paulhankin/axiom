@@ -19,9 +19,11 @@
 // macOS: libSystem's sigaction (SA_SIGINFO 0x40, SA_ONSTACK 1, SA_RESTART
 // 2) and pthread_kill; the same saving.
 // Windows: SIGINT is the console's Ctrl-C and Ctrl-Break, through a console
-// control handler (which the system calls on a thread of its own); the
-// others are only raise's (-1: the C side calls the handler at once). The
-// processor's faults stay the crash reporter's.
+// control handler (which the system calls on a thread of its own). SIGSEGV,
+// SIGFPE and SIGILL are the processor's exceptions in the program's own
+// code (x64; see win_fault), while a handler is set: else they stay the
+// crash reporter's (std/internal/runtime/windows.ax). raise sends nothing
+// through the system (-1: the C side calls the handler at once).
 // WebAssembly: none (-1).
 // =============================================================================
 
@@ -34,8 +36,14 @@ extern "C" {
     fn sigaction(sig: i32, act: *void, old: *mut void) i32;
     fn pthread_kill(t: usize, sig: i32) i32;
     fn pthread_self() usize;
-    // Windows (kernel32)
+    // Windows (kernel32, ntdll)
     fn SetConsoleCtrlHandler(handler: fn(u32) i32, add: i32) i32;
+    fn AddVectoredExceptionHandler(first: u32, handler: fn(*mut usize) i32) *mut void;
+    fn GetModuleHandleW(name: *u16) usize;
+    fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize) void;
+    fn RtlRestoreContext(context: *mut u8, rec: *mut u8) void;
+    // (cmd/axiom/src/plink.ax: a frame on rbp, rsp aligned, call r8)
+    fn __axc_sig_trampoline() void;
 }
 
 // The kernel's struct sigaction on Linux (not the C library's).
@@ -74,6 +82,109 @@ let mut saved: [32]bool = [false; 32];
 // the console handler is set
 let mut ctrl_action: i32 = 0;
 let mut ctrl_set: bool = false;
+// Windows: SIGILL's, SIGFPE's and SIGSEGV's actions (index the signal), and
+// whether the exception handler is set; the image's addresses
+let mut fault_action: [12]i32 = [0; 12];
+let mut fault_set: bool = false;
+let mut image_lo: usize = 0;
+let mut image_hi: usize = 0;
+
+// The library's signal for exception code c (the processor's, NTSTATUS
+// values), or 0: SIGSEGV for an access violation, a page that could not be
+// read in, misaligned data, an array bound; SIGFPE for integer division by
+// zero or overflow and the floating-point exceptions (when unmasked);
+// SIGILL for an illegal or privileged instruction (and the trap instruction
+// of an Axiom run-time check, after its report, as on Linux). A stack
+// overflow is not delivered: no stack is left for a handler (the crash
+// reporter reports it).
+fn fault_signal(c: u32) i32 {
+    if (c == 0xc000_0005) or (c == 0xc000_0006) or (c == 0x8000_0002) or (c == 0xc000_008c) {
+        return 11;
+    }
+    if (c == 0xc000_0094) or (c == 0xc000_0095) or ((c >= 0xc000_008d) and (c <= 0xc000_0093)) or (c == 0xc000_02b4) or
+       (c == 0xc000_02b5) {
+        return 8;
+    }
+    if (c == 0xc000_001d) or (c == 0xc000_0096) {
+        return 4;
+    }
+    return 0;
+}
+
+// The exception handler (vectored: before the frames' and the crash
+// reporter's, which was set earlier): a fault of the program's own code
+// whose signal has a handler is delivered on the faulting thread, as the
+// system delivers it elsewhere. The context is copied (to the thread's
+// fault_ctx) and redirected as if the faulting instruction had called
+// __axc_sig_trampoline (its address pushed below rsp, which on Windows
+// holds nothing: the stack's guard is the system's), which calls
+// win_deliver(sig, copy): the system's walks (a longjmp out of the
+// handler, RtlUnwindEx; a stack trace) go from the handler through the
+// faulting function. If the handler returns, the copy is restored: the
+// instruction runs again (C17 7.14.1.1p3: undefined for a computational
+// exception). A thread with less than 32 KiB of stack left gets the crash
+// report.
+fn win_fault(ep: *mut usize) i32 {
+    let ptrs = @slice_from_ptr(ep, 2);
+    let rec = @ptr_from_int(*mut u32, ptrs[0]);
+    let ctx = @ptr_from_int(*mut u8, ptrs[1]);
+    let sig = fault_signal(rec.*);
+    let at = @ptr_from_int(*usize, ptrs[0] + 16).*;  // ExceptionAddress
+    if (sig == 0) or (fault_action[@as(usize, @bit_cast(u32, sig))] != 2) or (at < image_lo) or (at >= image_hi) {
+        return 0;  // EXCEPTION_CONTINUE_SEARCH
+    }
+    let r = @slice_from_ptr(@ptr_from_int(*mut u64, @int_from_ptr(ctx)), 0x4d0 / 8);
+    let rsp = @truncate(usize, r[0x98 / 8]);
+    let mut low: usize = 0;
+    let mut high: usize = 0;
+    GetCurrentThreadStackLimits(&mut low, &mut high);
+    if rsp < low + 32768 {
+        return 0;
+    }
+    let copy = (@int_from_ptr(&fault_ctx[0]) + 15) & ~@as(usize, 15);
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, copy), 0x4d0), @slice_from_ptr(ctx, 0x4d0));
+    @ptr_from_int(*mut u64, rsp - 8).* = r[0xf8 / 8];  // the "return address": the faulting instruction's
+    r[0x98 / 8] = @as(u64, rsp - 8);
+    r[0xf8 / 8] = trampoline();
+    r[0x80 / 8] = @as(u64, @bit_cast(u32, sig));            // rcx
+    r[0x88 / 8] = @as(u64, copy);                           // rdx
+    r[0xb8 / 8] = @as(u64, @bit_cast(usize, win_deliver));  // r8
+    return -1;                                              // EXCEPTION_CONTINUE_EXECUTION
+}
+
+// the context of the fault being delivered on this thread (16-aligned within)
+threadlocal let mut fault_ctx: [0x4e0]u8 = [0; 0x4e0];
+
+// __axc_sig_trampoline's address (plink.ax defines it for x86-64 only)
+fn trampoline() u64 {
+    if @target_arch("x86_64") {
+        return @as(u64, @bit_cast(usize, __axc_sig_trampoline));
+    }
+    return 0;
+}
+
+fn win_deliver(sig: u64, context: *mut u8) void {
+    __axc_sig_deliver(@bit_cast(i64, sig));
+    RtlRestoreContext(context, @ptr_from_int(*mut u8, 0));
+}
+
+fn win_fault_signal(sig: i32, action: i32) i32 {
+    if not @target_arch("x86_64") {
+        return -1;  // (ARM64: the crash reporter's)
+    }
+    fault_action[@as(usize, @bit_cast(u32, sig))] = action;
+    if not fault_set {
+        let base = GetModuleHandleW(@ptr_from_int(*u16, 0));
+        let pe = base + @as(usize, @ptr_from_int(*u32, base + 0x3c).*);
+        image_lo = base;
+        image_hi = base + @as(usize, @ptr_from_int(*u32, pe + 24 + 56).*);  // SizeOfImage
+        if @int_from_ptr(AddVectoredExceptionHandler(1, win_fault)) == 0 {
+            return -2;
+        }
+        fault_set = true;
+    }
+    return 0;
+}
 
 fn on_signal(sig: i32, si: *mut void, uc: *mut void) void {
     _ = si;
@@ -169,6 +280,9 @@ export fn __axc_os_signal(sig64: i64, action64: i64) i64 {
         return @as(i64, darwin_signal(sig, action));
     }
     if @target_os("windows") {
+        if (sig == 4) or (sig == 8) or (sig == 11) {
+            return @as(i64, win_fault_signal(sig, action));
+        }
         if sig != 2 {
             return -1;
         }

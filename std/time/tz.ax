@@ -16,7 +16,8 @@
 // file's last transition follow its POSIX TZ rule, as do zones made from a
 // TZ string by parse_posix ("EST5EDT,M3.2.0,M11.1.0"). local follows $TZ
 // (a zone name, a file or a rule) and then /etc/localtime, like the C
-// library. Leap seconds are ignored, as they are by time.Time.
+// library; on Windows, without $TZ, the system's setting (windows_local).
+// Leap seconds are ignored, as they are by time.Time.
 //
 // Zone names are checked before they are used as paths ("../x" and
 // absolute names are refused), and TZif files are validated, so neither
@@ -30,6 +31,13 @@ import "../os.ax" as os;
 import "../os/fs.ax" as fs;
 import "../str.ax" as strs;
 import "../time.ax" as time;
+
+// Windows (kernel32.dll): the system's time zone (called only under
+// @target_os("windows"), so that other targets do not refer to them)
+extern "C" {
+    fn GetDynamicTimeZoneInformation(info: *mut u8) u32;
+    fn GetTimeZoneInformationForYear(year: u16, dynamic: *u8, info: *mut u8) i32;
+}
 
 pub error TzError { UnknownZone, Corrupt, NonExistent, Ambiguous, OutOfMemory, NotFound, Done, InvalidUtf8 }
 
@@ -132,9 +140,13 @@ pub struct Zone {
     }
 
     /// The local time zone: from $TZ (":name", "name", "/path" or a POSIX
-    /// rule), else /etc/localtime, else UTC.
+    /// rule), else /etc/localtime (on Windows the system's setting:
+    /// windows_local), else UTC.
     pub fn local() TzError!Zone {
         let tzv = os.getenv("TZ") catch {
+            if @target_os("windows") {
+                return windows_local();
+            }
             let data = fs.read_file("/etc/localtime") catch return Zone.utc();
             defer mem.free(data);
             return Zone.parse_tzif(data) catch Zone.utc();
@@ -298,6 +310,264 @@ struct Candidates {
     n: usize,
     before: i32,
     after: i32,
+}
+
+// -----------------------------------------------------------------------------
+// Windows' time zones
+// -----------------------------------------------------------------------------
+
+// The years whose rules windows_local asks the system for; later years
+// follow the last one's rule.
+const WIN_FIRST: i64 = 1970;
+const WIN_LAST: i64 = 2037;
+
+// The zone Windows is set to: GetDynamicTimeZoneInformation (its
+// DYNAMIC_TIME_ZONE_INFORMATION: Bias, StandardName, StandardDate,
+// StandardBias, DaylightName, DaylightDate, DaylightBias, TimeZoneKeyName,
+// DynamicDaylightTimeDisabled), with each year's rules from
+// GetTimeZoneInformationForYear (the system's dynamic daylight saving
+// data: a zone whose rules changed, such as the United States' in 2007, is
+// right in every year) from 1970 to 2037 as transitions, and the last
+// year's rule after that. The offsets: UTC = local time + Bias +
+// StandardBias (or DaylightBias), in minutes. The rules (SYSTEMTIME):
+// month, day of the week and its occurrence (5: the last) and the time of
+// day in the local time in force before the change, as POSIX rules have
+// them; a year in it makes it a date of that year. The names are the
+// system's ("Eastern Standard Time"), as its C library's tzname has them.
+// Automatic daylight saving time turned off is standard time only. UTC if
+// the system says nothing.
+fn windows_local() TzError!Zone {
+    if not @target_os("windows") {
+        return Zone.utc();
+    }
+    let mut d: [432]u8 = [0; 432];
+    if not win_dynamic(&mut d[0]) {
+        return Zone.utc();
+    }
+    let names = mem.alloc.[u8](2 * 96)!;
+    let std_name = win_name(d[4..68], names[0..96]);
+    let dst_name = win_name(d[88..152], names[96..192]);
+    let mut z = Zone.fixed_static(0, "");
+    z.names = names;
+    if d[428] != 0 {
+        // (automatic daylight saving time off)
+        z.rule = win_rule(d[0..172], std_name, dst_name);
+        z.rule.has_dst = false;
+        return z;
+    }
+    let n = @as(usize, @truncate(u32, (WIN_LAST - WIN_FIRST) + 1)) * 3;
+    let trans = mem.alloc.[i64](n) catch |e| {
+        z.deinit();
+        return e;
+    };
+    let idx = mem.alloc.[u8](n) catch |e| {
+        mem.free(trans);
+        z.deinit();
+        return e;
+    };
+    let kinds = mem.alloc.[Kind](n) catch |e| {
+        mem.free(trans);
+        mem.free(idx);
+        z.deinit();
+        return e;
+    };
+    let mut b = Builder.{ trans: trans, idx: idx, kinds: kinds, nt: 0, nk: 0 };
+    let mut t: [172]u8 = [0; 172];
+    let mut r = win_rule(d[0..172], std_name, dst_name);
+    let mut y = WIN_FIRST;
+    while y <= WIN_LAST {
+        if win_for_year(@truncate(u16, y), &d[0], &mut t[0]) {
+            r = win_rule(t[..], std_name, dst_name);
+        }
+        let jan1 = time.days_from_civil(y, 1, 1) * 86400;
+        if not r.has_dst {
+            b.add(jan1, true, r.std);
+        } else {
+            let start = ((rule_day(r.start, y) * 86400) + @as(i64, r.start.time)) - @as(i64, r.std.offset);
+            let end = ((rule_day(r.end, y) * 86400) + @as(i64, r.end.time)) - @as(i64, r.dst.offset);
+            if start < end {
+                b.add(jan1, true, r.std);
+                b.add(start, false, r.dst);
+                b.add(end, false, r.std);
+            } else {
+                // (the southern hemisphere: in daylight saving time as the year starts)
+                b.add(jan1, true, r.dst);
+                b.add(end, false, r.std);
+                b.add(start, false, r.dst);
+            }
+        }
+        y += 1;
+    }
+    // (the arrays of the sizes used; with no memory, the last year's rule for every year)
+    z.rule = r;
+    let ft = mem.alloc.[i64](b.nt) catch empty_i64();
+    let fi = mem.alloc.[u8](b.nt) catch empty_u8();
+    let fk = mem.alloc.[Kind](b.nk) catch empty_kinds();
+    if (ft.len == b.nt) and (fi.len == b.nt) and (fk.len == b.nk) {
+        @mem_copy(ft, trans[0..b.nt]);
+        @mem_copy(fi, idx[0..b.nt]);
+        @mem_copy(fk, kinds[0..b.nk]);
+        mem.free(z.trans);
+        mem.free(z.idx);
+        mem.free(z.kinds);
+        z.trans = ft;
+        z.idx = fi;
+        z.kinds = fk;
+    } else {
+        mem.free(ft);
+        mem.free(fi);
+        mem.free(fk);
+    }
+    mem.free(trans);
+    mem.free(idx);
+    mem.free(kinds);
+    return z;
+}
+
+// The system's calls, on Windows only.
+fn win_dynamic(d: *mut u8) bool {
+    if @target_os("windows") {
+        return GetDynamicTimeZoneInformation(d) != 0xFFFF_FFFF;
+    }
+    return false;
+}
+
+fn win_for_year(y: u16, d: *u8, t: *mut u8) bool {
+    if @target_os("windows") {
+        return GetTimeZoneInformationForYear(y, d, t) != 0;
+    }
+    return false;
+}
+
+// windows_local's transitions as it adds them.
+struct Builder {
+    trans: []mut i64,
+    idx: []mut u8,
+    kinds: []mut Kind,
+    nt: usize,
+    nk: usize,
+
+    // k from t on (t a local time, in the offset in force before it, when
+    // local: a year's start), unless it is in force already
+    fn add(self: *mut Builder, t: i64, local: bool, k: Kind) void {
+        let mut at = t;
+        if self.nt > 0 {
+            let cur = self.kinds[@as(usize, self.idx[self.nt - 1])];
+            if (cur.offset == k.offset) and (cur.dst == k.dst) and strs.eq(cur.name, k.name) {
+                return;
+            }
+            if local {
+                at -= @as(i64, cur.offset);
+            }
+        } else if local {
+            at -= @as(i64, k.offset);
+        }
+        let mut ki = self.nk;
+        for j in 0..self.nk {
+            let x = self.kinds[j];
+            if (x.offset == k.offset) and (x.dst == k.dst) and strs.eq(x.name, k.name) {
+                ki = j;
+            }
+        }
+        if (ki == self.nk) and (self.nk < 255) {
+            self.kinds[self.nk] = k;
+            self.nk += 1;
+        }
+        if (self.nt > 0) and (at <= self.trans[self.nt - 1]) {
+            return;  // (a rule whose change is not after the year's start)
+        }
+        self.trans[self.nt] = at;
+        self.idx[self.nt] = @truncate(u8, @min(ki, self.nk - 1));
+        self.nt += 1;
+    }
+}
+
+// A TIME_ZONE_INFORMATION (its first 172 bytes) as a rule.
+fn win_rule(t: []u8, std_name: []u8, dst_name: []u8) Rule {
+    let bias = win_i32(t, 0);
+    let std = Kind.{ offset: -(bias + win_i32(t, 84)) * 60, dst: false, name: std_name };
+    let none = When.{ kind: 'n', n: 0, m: 0, w: 0, d: 0, time: 0 };
+    // (no daylight saving time: no month in DaylightDate)
+    if win_u16(t, 152 + 2) == 0 {
+        return Rule.{ std: std, dst: std, has_dst: false, start: none, end: none };
+    }
+    let dst = Kind.{ offset: -(bias + win_i32(t, 168)) * 60, dst: true, name: dst_name };
+    return Rule.{ std: std, dst: dst, has_dst: true, start: win_when(t, 152), end: win_when(t, 68) };
+}
+
+// The SYSTEMTIME at t[at..]: wYear, wMonth, wDayOfWeek, wDay, wHour,
+// wMinute, wSecond, wMilliseconds (rounded to the second).
+fn win_when(t: []u8, at: usize) When {
+    let year = win_u16(t, at);
+    let month = @as(u32, win_u16(t, at + 2));
+    let day = @as(u32, win_u16(t, at + 6));
+    let mut secs = ((@as(i32, win_u16(t, at + 8)) * 3600) + (@as(i32, win_u16(t, at + 10)) * 60)) + @as(
+        i32, win_u16(t, at + 12));
+    if win_u16(t, at + 14) >= 500 {
+        secs += 1;
+    }
+    if year != 0 {
+        let y = @as(i64, year);
+        let n = time.days_from_civil(y, month, day) - time.days_from_civil(y, 1, 1);
+        return When.{ kind: 'n', n: @truncate(u32, @bit_cast(u64, n)), m: 0, w: 0, d: 0, time: secs };
+    }
+    return When.{ kind: 'M', n: 0, m: @max(month, 1), w: @max(@min(day, 5), 1), d: @as(u32, win_u16(t, at + 4)) % 7,
+                  time: secs };
+}
+
+fn win_u16(t: []u8, at: usize) u16 {
+    return @as(u16, t[at]) | (@as(u16, t[at + 1]) << 8);
+}
+
+fn win_i32(t: []u8, at: usize) i32 {
+    let v = ((@as(u32, t[at]) | (@as(u32, t[at + 1]) << 8)) | (@as(u32, t[at + 2]) << 16)) | (
+        @as(u32, t[at + 3]) << 24);
+    return @bit_cast(i32, v);
+}
+
+// A name of 32 UTF-16 units (to the first 0) as UTF-8 in out (an unpaired
+// surrogate is U+FFFD).
+fn win_name(w: []u8, out: []mut u8) []u8 {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while (i + 1) < w.len {
+        let mut c = @as(u32, win_u16(w, i));
+        i += 2;
+        if c == 0 {
+            break;
+        }
+        if (c >= 0xd800) and (c < 0xdc00) and ((i + 1) < w.len) {
+            let lo = @as(u32, win_u16(w, i));
+            if (lo >= 0xdc00) and (lo < 0xe000) {
+                c = (0x10000 + ((c - 0xd800) << 10)) + (lo - 0xdc00);
+                i += 2;
+            } else {
+                c = 0xfffd;
+            }
+        } else if (c >= 0xd800) and (c < 0xe000) {
+            c = 0xfffd;
+        }
+        if c < 0x80 {
+            out[n] = @truncate(u8, c);
+            n += 1;
+        } else if c < 0x800 {
+            out[n] = @truncate(u8, 0xc0 | (c >> 6));
+            out[n + 1] = @truncate(u8, 0x80 | (c & 0x3f));
+            n += 2;
+        } else if c < 0x10000 {
+            out[n] = @truncate(u8, 0xe0 | (c >> 12));
+            out[n + 1] = @truncate(u8, 0x80 | ((c >> 6) & 0x3f));
+            out[n + 2] = @truncate(u8, 0x80 | (c & 0x3f));
+            n += 3;
+        } else {
+            out[n] = @truncate(u8, 0xf0 | (c >> 18));
+            out[n + 1] = @truncate(u8, 0x80 | ((c >> 12) & 0x3f));
+            out[n + 2] = @truncate(u8, 0x80 | ((c >> 6) & 0x3f));
+            out[n + 3] = @truncate(u8, 0x80 | (c & 0x3f));
+            n += 4;
+        }
+    }
+    return out[0..n];
 }
 
 fn empty_i64() []mut i64 {

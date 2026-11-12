@@ -35,6 +35,9 @@ void __axc_write_err(const char *p, size_t n);
 
 /* -- the core part's own ------------------------------------------------ */
 
+/* longjmp's work (std/c/rt/core_jump.ax): env is a jmp_buf, val not 0. */
+__AXC_NORETURN void __axc_longjmp(__axiom_int64 *env, long long val);
+
 /* The character classes of each value of unsigned char, and of EOF at
    index 0 (__axc_ctype_tab.c). */
 #define __AXC_UPPER 0x01

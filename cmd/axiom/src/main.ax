@@ -27,6 +27,7 @@
 //   --subsystem=console|windows  Windows: console program (default) or
 //                              GUI program with no console window
 //   --icon=<file.ico>          Windows: the program's icon (in its resources)
+//   --stack-size=<n>[K|M|G]    the main thread's stack (nl.g_stack_size)
 //   -o <path>                  output path
 //
 // C sources (c_option, c_options, build_c):
@@ -50,6 +51,7 @@ import "ide.ax" as ide;
 import "lsp.ax" as lsp;
 import "lstub.ax" as lstub;
 import "mlink.ax" as ml;
+import "nlink.ax" as nl;
 import "package.ax" as pkg;
 import "plink.ax" as pl;
 import "profiler.ax" as profiler;
@@ -90,6 +92,8 @@ fn usage() void {
     u.eprint("  --subsystem=console|windows  Windows: a console program (default) or a GUI one\n");
     u.eprint("  --pdb=on|off             Windows: debug symbols in <out>.pdb (default on)\n");
     u.eprint("  --icon=<file.ico>        Windows: the program's icon, shown by Explorer and the taskbar\n");
+    u.eprint("  --stack-size=<n>[K|M|G]  the main thread's stack (Windows: and its threads'; default 8M;\n");
+    u.eprint("                           WebAssembly 1M; Linux: the system's limit)\n");
     u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
     u.eprint("                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
     u.eprint("  C sources:\n");
@@ -202,7 +206,7 @@ fn link_wasm(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
         }
         us.push(un);
     }
-    let o = wl.Options.{ stack_size: 1048576, shared_memory: cg.g_threads, max_pages: 16384,
+    let o = wl.Options.{ stack_size: wasm_stack_size(), shared_memory: cg.g_threads, max_pages: 16384,
                          exports: cg.g_export_names.items() };
     let bytes = wl.link(us.items(), &o);
     if u.isnos(bytes) {
@@ -606,6 +610,13 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             pl.g_subsystem = pl.SUBSYSTEM_WINDOWS_CUI;
         } else if u.str_eq(a, "--subsystem=windows") {
             pl.g_subsystem = pl.SUBSYSTEM_WINDOWS_GUI;
+        } else if u.starts(a, "--stack-size=") {
+            nl.g_stack_size = parse_size(a[13..]);
+            if nl.g_stack_size == 0 {
+                dg.emit_fatal(o.json, "E9001", u.f1("bad stack size '%s' (bytes, with K, M or G for KiB, MiB or GiB)",
+                                                    a));
+                return false;
+            }
         } else if u.starts(a, "--icon=") {
             pl.g_icon = a[7..];
         } else if u.str_eq(a, "--pdb=on") {
@@ -662,6 +673,48 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
         i += 1;
     }
     return true;
+}
+
+// --stack-size's value: digits, then K, M or G for KiB, MiB or GiB; 0 when
+// it is malformed, 0, or not below 4 GiB.
+fn parse_size(s: []u8) u64 {
+    let mut v: u64 = 0;
+    let mut i: usize = 0;
+    while (i < s.len) and (s[i] >= '0') and (s[i] <= '9') {
+        v = (v * 10) + @as(u64, s[i] - '0');
+        if v >= (@as(u64, 1) << 32) {
+            return 0;
+        }
+        i += 1;
+    }
+    if i == 0 {
+        return 0;
+    }
+    if i + 1 == s.len {
+        if (s[i] == 'K') or (s[i] == 'k') {
+            v = v << 10;
+        } else if (s[i] == 'M') or (s[i] == 'm') {
+            v = v << 20;
+        } else if (s[i] == 'G') or (s[i] == 'g') {
+            v = v << 30;
+        } else {
+            return 0;
+        }
+    } else if i != s.len {
+        return 0;
+    }
+    if v >= (@as(u64, 1) << 32) {
+        return 0;
+    }
+    return v;
+}
+
+// The WebAssembly stack (the main thread's): --stack-size, 16-aligned, or 1 MiB.
+fn wasm_stack_size() u64 {
+    if nl.g_stack_size != 0 {
+        return (nl.g_stack_size + 15) & ~@as(u64, 15);
+    }
+    return 1048576;
 }
 
 // A package directory (or none: the current directory) builds the package's
@@ -1668,7 +1721,7 @@ fn link_wasm_ld(o: *mut Options, objpath: []u8, rc: *mut i32) i32 {
     av.push("--no-entry");
     av.push("--stack-first");
     av.push("-z");
-    av.push("stack-size=1048576");
+    av.push(u.f1("stack-size=%s", u.dec(@bit_cast(i64, wasm_stack_size()))));
     av.push("--export-memory");
     if cg.g_threads {
         // Threads are instances sharing one memory, which the host creates.

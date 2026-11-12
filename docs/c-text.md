@@ -120,8 +120,11 @@ a null pointer (`EOVERFLOW`) and `mktime` and `timegm` `(time_t)-1`.
 - **The local time zone** is the standard library's (`std/time/tz`, `Zone.local`):
   `$TZ` (a zone name, a TZif file or a POSIX rule such as `"EST5EDT,M3.2.0,M11.1.0"`),
   else `/etc/localtime`, else UTC. It is read the first time a program needs it and kept:
-  a later change of `$TZ` has no effect (there is no `tzset`). On Windows and on
-  WebAssembly, which have neither, local time is UTC.
+  a later change of `$TZ` has no effect (there is no `tzset`). On Windows without
+  `$TZ`, it is the system's setting (`GetDynamicTimeZoneInformation`, with each year's
+  rules from 1970 to 2037 from `GetTimeZoneInformationForYear` and the last year's
+  after; `%Z` gives the system's names, such as "Eastern Standard Time"), read once as
+  well. On WebAssembly local time is UTC.
 - **`mktime`** takes fields out of their ranges (each excess carried into the next field,
   as C17 7.27.2.3p2 says) and reads `tm_isdst` as POSIX does: positive presumes daylight
   saving time, 0 standard time, negative whichever is in force. A local time that occurs

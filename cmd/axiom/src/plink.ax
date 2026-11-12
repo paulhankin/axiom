@@ -32,13 +32,16 @@
 // function. A function declared in an `extern "C" "name"` block comes from
 // name.dll (codegen leaves the name in a constant axiom.import.<function>);
 // the runtime's are found in a DLL by their names: the BSD socket functions and those
-// beginning with WSA are ws2_32.dll's, Rtl and Nt ones ntdll.dll's, BCrypt
-// ones bcrypt.dll's, other capitalized ones kernel32.dll's. Functions C
-// code declares and does not define (a constant axiom.import.<function>
-// holding "c": cmd/axiom/src/c/cgen.ax) are, if no rule above names a DLL,
-// the C library's, msvcrt.dll (which every Windows has, and which exports
-// the whole C library, printf included), as are memcpy, memmove and memset
-// (which a64.ax calls). Anything else is undefined. Calls
+// beginning with WSA are ws2_32.dll's, Rtl, Nt and Nls ones ntdll.dll's,
+// BCrypt ones bcrypt.dll's, other capitalized ones kernel32.dll's. The C
+// library is the compiler's own (std/c), linked into the program: nothing
+// comes from the system's (msvcrt.dll), and a function or object that C
+// code declares, does not define and no rule above names (a constant
+// axiom.import.<function> holding "c": cmd/axiom/src/c/cgen.ax) is
+// undefined, unless tg.g_system_c_library is set (then it is msvcrt.dll's).
+// memcpy, memmove and memset, which a64.ax calls, are on ARM64 the
+// linker's own (lstub.ax's, weak: a C library's win) when nothing defines
+// them. Anything else is undefined. Calls
 // go through a thunk (jmp [rip+slot] on x86-64; adrp x16, slot; ldr x16,
 // [x16, :lo12:slot]; br x16 on ARM64); the thunk is also the function's
 // address wherever one is taken.
@@ -57,8 +60,10 @@ import "a64unwind.ax" as uw;
 import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
+import "lstub.ax" as lstub;
 import "nlink.ax" as nl;
 import "pdb.ax" as pdb;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 const BASE: u64 = 0x1_4000_0000;  // the preferred image base
@@ -96,7 +101,7 @@ let mut import_dlls: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []
 // C_LIBRARY's unless a rule of dll_of names another DLL
 let mut c_library_fns: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                          vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
-let C_LIBRARY: []u8 = "msvcrt.dll";
+let C_LIBRARY: []u8 = "msvcrt.dll";  // (with tg.g_system_c_library)
 
 let mut A64: bool = false;  // linking ARM64 objects (else x86-64 ones)
 
@@ -204,11 +209,7 @@ fn dll_of(name: []u8) []u8 {
         return "ws2_32.dll";
     }
     if (name.len == 0) or (name[0] < 'A') or (name[0] > 'Z') {
-        if c_library_fns.get(u.intern(name)) != 0 {
-            return C_LIBRARY;
-        }
-        // (a64.ax calls these for block copies and fills; x64.ax uses rep movsb)
-        if u.str_eq(name, "memcpy") or u.str_eq(name, "memmove") or u.str_eq(name, "memset") {
+        if tg.g_system_c_library and (c_library_fns.get(u.intern(name)) != 0) {
             return C_LIBRARY;
         }
         return "";
@@ -216,7 +217,7 @@ fn dll_of(name: []u8) []u8 {
     if u.starts(name, "WSA") {
         return "ws2_32.dll";
     }
-    if u.starts(name, "Rtl") or u.starts(name, "Nt") {
+    if u.starts(name, "Rtl") or u.starts(name, "Nt") or u.starts(name, "Nls") {
         return "ntdll.dll";
     }
     if u.starts(name, "BCrypt") {
@@ -236,7 +237,12 @@ fn collect_symbols() void {
     for gi in 0..nl.gsyms.len {
         let g = nl.gsyms.at(gi);
         if (g.obj < 0) and not g.weak and (dll_of(g.name).len == 0) {
-            nl.err(u.f1("undefined symbol '%s'", g.name));
+            if c_library_fns.get(u.intern(g.name)) != 0 {
+                nl.err(u.f1("undefined symbol '%s' (declared by C code and defined by no unit, nor by the C library)",
+                            g.name));
+            } else {
+                nl.err(u.f1("undefined symbol '%s'", g.name));
+            }
         }
     }
 }
@@ -480,6 +486,24 @@ fn own_object() *mut elf.Obj {
     ps.relocs.push(elf.Rel.{ off: 0, ty: elf.R_X86_64_RVA32, sym: es, addend: 0 });
     ps.relocs.push(elf.Rel.{ off: 4, ty: elf.R_X86_64_RVA32, sym: es, addend: 22 });
     ps.relocs.push(elf.Rel.{ off: 8, ty: elf.R_X86_64_RVA32, sym: xs, addend: 0 });
+    // __axc_sig_trampoline (std/c/rt/core_signal.ax: a fault delivered to a C
+    // signal handler), entered as if the faulting instruction had called it
+    // (whatever the alignment of rsp): push rbp; mov rbp, rsp; and rsp, -16;
+    // sub rsp, 32; call r8; int3, with unwind information on rbp
+    // (UWOP_PUSH_NONVOL rbp after 1 byte, UWOP_SET_FPREG after 4): the
+    // system's walks go on in the faulting function.
+    ts.data.zeros(10);  // (to 32)
+    let tramp: [17]u8 = [0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x83, 0xec, 0x20, 0x41, 0xff, 0xd0, 0xcc,
+                         0xcc];
+    ts.data.put(tramp[..]);
+    let tsym = elf.add_sym(o, elf.Sym.{ name: "__axc_sig_trampoline", sec: text, value: 32, size: 17,
+                                        bind: elf.B_GLOBAL, ty: elf.T_FUNC, hidden: false });
+    let tinfo: [8]u8 = [1, 4, 2, 5, 4, 3, 1, 0x50];
+    o.secs.get(@int_cast(usize, xdata)).data.put(tinfo[..]);
+    ps.data.zeros(12);
+    ps.relocs.push(elf.Rel.{ off: 12, ty: elf.R_X86_64_RVA32, sym: tsym, addend: 0 });
+    ps.relocs.push(elf.Rel.{ off: 16, ty: elf.R_X86_64_RVA32, sym: tsym, addend: 17 });
+    ps.relocs.push(elf.Rel.{ off: 20, ty: elf.R_X86_64_RVA32, sym: xs, addend: 8 });
     return o;
 }
 
@@ -667,6 +691,12 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     own_index = nl.objs.len;
     nl.objs.push(own_object());
     nl.objs.push(jstub.build(machine(), true));  // (C's setjmp and longjmp)
+    if A64 {
+        // memcpy, memmove and memset, which a64.ax calls (weak: the C library's win)
+        let mo = elf.new_obj(machine());
+        lstub.add_mem_a64(mo, elf.add_sec(mo, ".text.axiom.mem", elf.S_TEXT, 16));
+        nl.objs.push(mo);
+    }
     nl.objs.push(elf.rets_bounds(machine()));
     collect_dll_names();
     collect_symbols();
@@ -971,8 +1001,15 @@ fn pe_headers(ly: *Layout, tls_dir: u64, image_size: u64) bn.Bytes {
     h.u32_(0);  // CheckSum
     h.u16_(g_subsystem);
     h.u16_(0x8160);  // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
-    h.u64_(STACK_RESERVE);
-    h.u64_(0x10000);  // stack commit
+    // the stack: --stack-size or 8 MiB reserved (as on Linux), the
+    // default for the program's threads too (CreateThread with no size);
+    // 64 KiB committed at first, the rest as the guard page moves down
+    let mut reserve = STACK_RESERVE;
+    if nl.g_stack_size != 0 {
+        reserve = nl.align_up(nl.g_stack_size, 0x10000);
+    }
+    h.u64_(reserve);
+    h.u64_(@min(reserve, 0x10000));  // stack commit
     h.u64_(0x10_0000);
     h.u64_(0x1000);
     h.u32_(0);

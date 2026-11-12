@@ -22,10 +22,21 @@
 // where its return address is (runtime: the first entry after the faulting
 // instruction is one with F_FRAMELESS). So is the start of a function that
 // sets its frame up only after it (x64.ax: shrink-wrapping).
+//
+// With line tables (-g, --debug-info=lines), the table also maps code to
+// source lines, for the line of a crash's faulting instruction (runtime:
+// line_at): an entry with F_MARKER where the line changes (the rows of the
+// line tables, and one at each function's start), whose chain holds one
+// record shaped as a call site's (trap_format.ax's Site: the presumed file,
+// the line, column 0, the function's name; line 0 at a function's start
+// with no line), and F_FRAMELESS where the code runs without the frame. An
+// entry of another marker has the empty chain. Without line tables there
+// are none: the table is what it was.
 // =============================================================================
 import "elf.ax" as elf;
 import "ir.ax" as ir;
 import "isel.ax" as is;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 pub const F_FRAMELESS: u64 = 1;
@@ -40,14 +51,17 @@ pub struct Tab {
     chains: i32,    // where the chains go (.data.rel.ro)
     text_sym: u32,  // local symbols at the start of .text and of `chains`
     chains_sym: u32,
-    rel32: u32,  // R_X86_64_PC32 / R_AARCH64_PREL32
-    abs64: u32,  // R_X86_64_64 / R_AARCH64_ABS64
-    empty: u64,  // the empty chain's offset in `chains`
+    rel32: u32,                 // R_X86_64_PC32 / R_AARCH64_PREL32
+    abs64: u32,                 // R_X86_64_64 / R_AARCH64_ABS64
+    empty: u64,                 // the empty chain's offset in `chains`
+    lines: bool,                // line rows too (see the header)
+    line_recs: u.SymMap.[u64],  // their chains, by location and function: offset + 1
 }
 
 pub fn off() Tab {
     return Tab.{ on: false, obj: u.nil.[elf.Obj](), rets: -1, chains: -1, text_sym: 0, chains_sym: 0, rel32: 0,
-                 abs64: 0, empty: 0 };
+                 abs64: 0, empty: 0, lines: false,
+                 line_recs: u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 } };
 }
 
 fn local_sym(o: *mut elf.Obj, sec: i32) u32 {
@@ -65,6 +79,7 @@ pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut 
         return t;
     }
     t.on = true;
+    t.lines = tg.g_debug != tg.DEBUG_NONE;
     t.obj = o;
     t.rets = elf.add_sec(o, "axiom_rets", elf.S_RODATA, 4);
     t.chains = chains;
@@ -138,11 +153,118 @@ fn entry(t: *Tab, at: u64, chain: u64, flags: u64) void {
     s.data.zeros(8);
 }
 
+// The line rows of a function as entries (see the header): rows as the
+// line tables have them (code offset << 32 | flags | ir.src_loc), in code
+// order; name the function's.
+struct Lines {
+    rows: []u64,
+    k: usize,
+    name: []u8,
+    started: bool,
+}
+
+// The offset of the next row of l (none: u64 max), skipping those of the
+// line of the row before.
+fn next_row(l: *mut Lines) u64 {
+    if not l.started {
+        return 0;
+    }
+    if l.k >= l.rows.len {
+        return 0xffff_ffff_ffff_ffff;
+    }
+    return (l.rows[l.k] >> 32) & 0x7fff_ffff;
+}
+
+// Writes the next row of l at base + its offset (frameless: the code there
+// runs without the frame).
+fn put_row(t: *mut Tab, l: *mut Lines, base: u64, frameless: bool) void {
+    let mut fl = F_MARKER;
+    if frameless {
+        fl = fl | F_FRAMELESS;
+    }
+    if not l.started {
+        l.started = true;
+        // (a row at the function's start: of its first row's line if that is there)
+        let mut src: u32 = 0;
+        if (l.rows.len > 0) and (((l.rows[0] >> 32) & 0x7fff_ffff) == 0) {
+            src = @truncate(u32, l.rows[0]);
+            l.k = 1;
+        }
+        entry(t, base, line_chain(t, src, l.name), fl);
+        return;
+    }
+    let r = l.rows[l.k];
+    l.k += 1;
+    entry(t, base + ((r >> 32) & 0x7fff_ffff), line_chain(t, @truncate(u32, r), l.name), fl);
+}
+
+// The chain of one record for source location src in the function named
+// name (see the header), made once per object; a location without a file
+// or line has line 0.
+fn line_chain(t: *mut Tab, src: u32, name: []u8) u64 {
+    let key = u.intern(u.f2("%s/%s", u.dec(@as(i64, src)), name));
+    let at = t.line_recs.get(key);
+    if at != 0 {
+        return at - 1;
+    }
+    let file = ir.src_file(src);
+    let mut fname: []u8 = "";
+    let mut line: u64 = 0;
+    if (src != 0) and (file >= 0) and (@int_cast(usize, file) < u.g_files.len) {
+        let p = u.presumed_line(file, @bit_cast(i32, ir.src_line(src)));
+        fname = p.name;
+        if (p.line > 0) and (p.line < 0x7fff_ffff) {
+            line = @bit_cast(u64, p.line);
+        }
+    }
+    let cs = t.obj.secs.get(@int_cast(usize, t.chains));
+    cs.data.align(8);
+    // the record: code, file_id, start, end, line, col, file_off, text_off,
+    // fn_off, callee_off (u32), then strs: "file\0name\0\0" after it
+    let rec = @as(u64, cs.data.len());
+    cs.data.u32_(0);
+    cs.data.u32_(0);
+    cs.data.u32_(0);
+    cs.data.u32_(0);
+    cs.data.u32_(line);
+    cs.data.u32_(0);
+    let nf = @as(u64, fname.len) + 1;
+    cs.data.u32_(0);
+    cs.data.u32_(nf + @as(u64, name.len) + 1);
+    cs.data.u32_(nf);
+    cs.data.u32_(nf + @as(u64, name.len) + 1);
+    cs.relocs.push(
+        elf.Rel.{ off: @as(u64, cs.data.len()), ty: t.abs64, sym: t.chains_sym, addend: @bit_cast(i64, rec + 48) });
+    cs.data.zeros(8);
+    cs.data.put(fname);
+    cs.data.u8_(0);
+    cs.data.put(name);
+    cs.data.zeros(2);
+    cs.data.align(8);
+    // the chain: the record, then null
+    let ch = @as(u64, cs.data.len());
+    cs.relocs.push(elf.Rel.{ off: ch, ty: t.abs64, sym: t.chains_sym, addend: @bit_cast(i64, rec) });
+    cs.data.zeros(16);
+    t.line_recs.put(key, ch + 1);
+    return ch;
+}
+
 // A function's entries, once its code is at `base` in .text (`size` bytes):
-// `calls` holds pairs of the offset after a call and its MInst.aux.
-pub fn func(t: *Tab, base: u64, size: u64, frameless: bool, noframe: []u64, calls: []u64) void {
+// `calls` holds pairs of the offset after a call and its MInst.aux; `rows`
+// its line table's rows when it has one (else empty), `name` its name.
+pub fn func(t: *mut Tab, base: u64, size: u64, frameless: bool, noframe: []u64, calls: []u64, rows: []u64,
+            name: []u8) void {
     if not t.on {
         return;
+    }
+    // (an exported function by its own name: C's main, say)
+    let mut nm = name;
+    if u.starts(nm, "axiom.export.") and (nm.len > 13) {
+        nm = nm[13..];
+    }
+    let mut ls = Lines.{ rows: rows, k: 0, name: nm, started: not t.lines };
+    if not t.lines {
+        ls.rows = rows[0..0];
     }
     let mut fl: u64 = 0;
     if frameless {
@@ -160,6 +282,21 @@ pub fn func(t: *Tab, base: u64, size: u64, frameless: bool, noframe: []u64, call
         let mut at: u64 = 0;
         if more {
             at = calls[k] & ~CALL_FRAMELESS;
+        }
+        // (the rows before the next entry, which goes first at the same offset)
+        let mut next: u64 = 0xffff_ffff_ffff_ffff;
+        if more {
+            next = at;
+        }
+        if (end != 0) and (end < next) {
+            next = end;
+        }
+        if (end == 0) and ((n + 1) < noframe.len) and (noframe[n] < next) {
+            next = noframe[n];
+        }
+        if next_row(&mut ls) < next {
+            put_row(t, &mut ls, base, frameless or (end != 0));
+            continue;
         }
         if (end != 0) and (not more or (end < at)) {
             entry(t, base + end, t.empty, F_MARKER | F_FRAMELESS);
@@ -185,6 +322,9 @@ pub fn func(t: *Tab, base: u64, size: u64, frameless: bool, noframe: []u64, call
             entry(t, base + at, chain, cf);
         }
         k += 2;
+    }
+    while next_row(&mut ls) < size {
+        put_row(t, &mut ls, base, frameless);
     }
     if frameless {
         entry(t, base + size, t.empty, F_MARKER | F_FRAMELESS);

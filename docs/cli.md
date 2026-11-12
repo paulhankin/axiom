@@ -196,6 +196,7 @@ linkers and are static executables; with C code or `-l` the system's `cc` links 
 | `--subsystem=console\|windows` | A console program (default) or a GUI one, for `--target=x86_64-windows`. |
 | `--pdb=on\|off` | Debug symbols in `<out>.pdb` (default on). |
 | `--icon=<file.ico>` | The program's icon. |
+| `--stack-size=<n>[K\|M\|G]` | The main thread's stack, in bytes (any target): on Windows the image's stack reserve (default 8 MiB; 64 KiB committed at first), which the program's threads get too; on macOS `LC_MAIN`'s stack size (default: the system's 8 MiB); on WebAssembly the stack in linear memory (default 1 MiB). On Linux the main thread's stack is the system's limit (`ulimit -s`) and the option has no effect. |
 
 ### The standard library
 

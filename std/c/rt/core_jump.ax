@@ -1,0 +1,66 @@
+// =============================================================================
+// std/c/rt/core_jump.ax - the system's part of C's longjmp
+// (std/c/lib/core/longjmp.c):
+//
+//   __axc_longjmp(env, val)   returns from env's __axc_setjmp again, with
+//                             val (which is not 0)
+//
+// The registers are restored by __axc_longjmp_restore, which the linkers
+// provide with __axc_setjmp (cmd/axiom/src/jstub.ax). On Windows x64 the
+// system unwinds the frames between first, as its own C library's longjmp
+// has it do: RtlUnwindEx to the frame of the function that called
+// __axc_setjmp, with an exception record STATUS_LONGJUMP whose parameter
+// is env, a _JUMP_BUFFER (jstub.ax's layout). The unwind runs the
+// termination handlers of the system's frames in between (a callback that
+// a DLL called, left by longjmp: its __finally blocks, the locks it
+// holds), and the system's RtlRestoreContext then loads the registers from
+// env. That frame is the setjmp caller's establisher frame, as the x64
+// unwinding rules define it: its frame register less 16 times the frame
+// offset, which its unwind information names (a function whose stack
+// pointer moves, or that makes sibling calls: rbp; x64emit.ax), else its
+// stack pointer in its body, which is the one __axc_setjmp saved (after
+// its return). Elsewhere, and if the caller has no function table entry,
+// the registers are restored at once (the frames in between are the
+// program's, which have no handlers).
+// =============================================================================
+
+extern "C" {
+    fn __axc_longjmp_restore(env: *mut u64, val: i64) void;
+    // Windows (ntdll.dll)
+    fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, history: *mut void) *u32;
+    fn RtlUnwindEx(frame: u64, target: u64, rec: *mut u64, result: u64, context: *mut u8, history: *mut void) void;
+}
+
+const STATUS_LONGJUMP: u64 = 0x8000_0026;
+const CONTEXT_SIZE: usize = 0x4d0;  // the x64 CONTEXT, 16-aligned
+
+/// longjmp(env, val), val not 0.
+export fn __axc_longjmp(env: *mut u64, val: i64) void {
+    if @target_os("windows") and @target_arch("x86_64") {
+        let jb = @slice_from_ptr(env, 32);
+        let mut base: u64 = 0;
+        let f = RtlLookupFunctionEntry(jb[10], &mut base, @ptr_from_int(*mut void, 0));
+        if @int_from_ptr(f) != 0 {
+            // UNWIND_INFO's fourth byte: the frame register (rbp: 5) and offset
+            let info = @ptr_from_int(*u8, @truncate(usize, base + @as(u64, @slice_from_ptr(f, 3)[2])));
+            let fr = @slice_from_ptr(info, 4)[3];
+            let mut frame = jb[2];
+            if (fr & 15) == 5 {
+                frame = jb[3] - (16 * @as(u64, fr >> 4));
+            }
+            if (fr & 15) == 0 or (fr & 15) == 5 {
+                jb[0] = frame;
+                // EXCEPTION_RECORD: code, flags, record, address, one parameter: env
+                let mut rec: [19]u64 = [0; 19];
+                rec[0] = STATUS_LONGJUMP;
+                rec[3] = 1;
+                rec[4] = @as(u64, @int_from_ptr(env));
+                let mut ctx: [CONTEXT_SIZE + 16]u8 = [0; CONTEXT_SIZE + 16];
+                let at = (@int_from_ptr(&ctx[0]) + 15) & ~@as(usize, 15);
+                RtlUnwindEx(frame, jb[10], &mut rec[0], @bit_cast(u64, val), @ptr_from_int(*mut u8, at),
+                            @ptr_from_int(*mut void, 0));
+            }
+        }
+    }
+    __axc_longjmp_restore(env, val);
+}

@@ -225,7 +225,8 @@ function checkDynUnwind(b) {
   for (let e = off(ex.rva); e < off(ex.rva) + ex.size; e += 12) {
     const u = off(b.readUInt32LE(e + 8));
     const n = b[u + 2], fr = b[u + 3] & 15, fo = b[u + 3] >> 4;
-    if (!fr) continue;
+    // (a chained entry: the code after a sibling call's jump, whose first entry is checked)
+    if (!fr || (b[u] >> 3) & 4) continue;
     found++;
     if (fr !== 5) return `frame register ${fr}, not rbp`;
     const codes = [];
@@ -265,7 +266,22 @@ function checkBuilt(exe) {
   return errs.length ? `the executable: ${errs.join('\n')}` : null;
 }
 
+// Before a Windows executable runs (under Wine, say): checkBuilt's checks,
+// the x64 and ARM64 unwind information of every function included
+// (pe.mjs), and no import of the system's C library (msvcrt.dll, the
+// universal C runtime): programs use the compiler's own (docs/c.md).
+// null when it is sound.
+function checkWindowsExe(exe) {
+  if (!/windows/.test(process.env.AXIOM_NATIVE_TARGET || '')) return null;
+  const r = checkPEFile(exe, { arm64: /aarch64/.test(process.env.AXIOM_NATIVE_TARGET) });
+  const crt = (r.imports || []).filter((x) => /^(msvcrt|ucrtbase|api-ms-win-crt-[a-z-]+-l1-1-0)\.dll:/i.test(x));
+  const errs = [...r.errs, ...(crt.length ? [`imports from the system's C library: ${crt.join(' ')}`] : [])];
+  return errs.length ? `the executable: ${errs.join('\n')}` : null;
+}
+
 async function runNative(exe) {
+  const bad = checkWindowsExe(exe);
+  if (bad) return { out: [], trapped: true, msg: bad };
   const r = await spawnExeAsync(exe, [], { encoding: 'utf8', timeout: runTimeout });
   if (r.error && r.error.code === 'ETIMEDOUT') return { out: [], trapped: true, msg: `timed out after ${runTimeout / 1000} s` };
   const out = r.stdout.split('\n');
@@ -457,7 +473,11 @@ const cRunTest = async (f) => {
     return c.status === 0 ? null : `the check failed:\n${c.stdout}${c.stderr}`;
   }
   // (--units is for Axiom code: the suite run with it builds the C tests as always)
-  const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
+  // (a test's own optimization level wins over the suite's: tail_calls_deep.c
+  // needs -O2's sibling calls)
+  const pinnedO = flags.some((x) => /^-O[0-3]$/.test(x));
+  const args = ['build', f, '--format=agent-json', `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '-o', out, ...flags,
+    ...extraFlags.filter((a) => !a.startsWith('--units=') && !(pinnedO && /^-O[0-3]$/.test(a)))];
   // (an expected error of an explicit --target's rules: checked for that target)
   const pinned = errors.length && flags.some((x) => x.startsWith('--target='));
   if (native && noC && !pinned) args.push(nativeTarget, path.join(root, 'cmd/axiom/internal/tests/c/host_c.c'));
@@ -504,7 +524,7 @@ await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/pr
 // expect-stderr: <text> (with expect-error: the compiler's stderr has it),
 // expect-status: <n> (the exit status; default 0), flags:, uses: <files>,
 // wasm-only, native-only, linux-only (natively, Linux only), windows-only
-// (AXIOM_NATIVE_TARGET=x86_64-windows). Programs run in
+// (AXIOM_NATIVE_TARGET=x86_64-windows), x86-64-only (not for an AArch64 target). Programs run in
 // a process of their own (on WebAssembly with the node host): they may exit.
 const cMixDir = path.join(root, 'cmd/axiom/internal/tests/c/mix');
 const cMixDirs = fs.existsSync(cMixDir) ? fs.readdirSync(cMixDir).filter((n) => fs.statSync(path.join(cMixDir, n)).isDirectory()).sort().map((n) => path.join(cMixDir, n)) : [];
@@ -519,6 +539,7 @@ const cMixTest = async (dir) => {
   if (native && has('linux-only') && (noC || process.platform !== 'linux')) return { skip: true, reason: 'Linux only' };
   if (!native && has('linux-only')) return { skip: true, reason: 'Linux only' };
   if (has('windows-only') && !(native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || ''))) return { skip: true, reason: 'Windows only' };
+  if (has('x86-64-only') && native && /aarch64/.test(process.env.AXIOM_NATIVE_TARGET || '')) return { skip: true, reason: 'x86-64 only' };
   // (the node host's CLI does not run std/io programs for wasm64)
   if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return { skip: true, reason: 'wasm32 only' };
   const others = fs.readdirSync(dir).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || (!axMain && n.endsWith('.ax')))).sort().map((n) => path.join(dir, n));
@@ -542,6 +563,7 @@ const cMixTest = async (dir) => {
   }
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
   if (buildOnly) return checkBuilt(out);
+  { const bad = checkWindowsExe(out); if (bad) return bad; }
   const r = native ? await spawnExeAsync(out, [], { encoding: 'utf8', timeout: runTimeout })
     : await spawnAsync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8', timeout: runTimeout });
   if (r.error && r.error.code === 'ETIMEDOUT') return `timed out after ${runTimeout / 1000} s`;
@@ -563,7 +585,10 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // expect-signal: <n> (the default action of signal n ends it),
 // expect-stderr: <text> (standard error has it), expect-error: <code> (the
 // build fails with it), flags:, native-only, wasm-only, linux-only
-// (natively on Linux), posix-only (natively on Linux or macOS); stdin:
+// (natively on Linux), posix-only (natively on Linux or macOS),
+// windows-only (natively for a Windows target), x86-64-only (not for an
+// AArch64 target); env: NAME=value (in the
+// program's environment); stdin:
 // <line> (the lines are the standard input, else it is empty);
 // merge-stderr (standard error goes to standard output's file, so that the
 // order of the two shows); check-only (only checked, with axiom check:
@@ -580,6 +605,8 @@ const cLibTest = async (f) => {
   if ((native && has('wasm-only')) || (!native && has('native-only'))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
   if (has('linux-only') && (!native || /windows|macos|darwin/.test(nt) || process.platform !== 'linux')) return { skip: true, reason: 'Linux only' };
   if (has('posix-only') && (!native || /windows/.test(nt))) return { skip: true, reason: 'Linux and macOS only' };
+  if (has('windows-only') && !(native && /windows/.test(nt))) return { skip: true, reason: 'Windows only' };
+  if (has('x86-64-only') && native && /aarch64/.test(nt)) return { skip: true, reason: 'x86-64 only' };
   const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
   const errors = dv('expect-error');
   if (has('check-only')) {
@@ -609,6 +636,7 @@ const cLibTest = async (f) => {
   }
   if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
   if (buildOnly) return checkBuilt(out);
+  { const bad = checkWindowsExe(out); if (bad) return bad; }
   // (the node host's CLI does not run std/io programs for wasm64: built only)
   if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return null;
   const cwd = path.join(tmp, `clib-${rel}.dir`);
@@ -621,7 +649,9 @@ const cLibTest = async (f) => {
   const [cmd, ...cargs] = native ? [...execWrap, out] : [process.execPath, path.join(root, 'std/internal/runtime/host.mjs'), out];
   const r = await new Promise((resolve) => {
     let p;
-    try { p = spawn(cmd, cargs, { cwd, stdio: ['pipe', outFd, errFd] }); } catch (e) { resolve({ status: null, error: e }); return; }
+    // (env: NAME=value: in the program's environment)
+    const env = { ...process.env, ...Object.fromEntries(dv('env').map((x) => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)])) };
+    try { p = spawn(cmd, cargs, { cwd, env, stdio: ['pipe', outFd, errFd] }); } catch (e) { resolve({ status: null, error: e }); return; }
     const timer = setTimeout(() => { p.kill('SIGTERM'); resolve({ status: null, timedOut: true }); }, runTimeout);
     p.on('error', (e) => { clearTimeout(timer); resolve({ status: null, error: e }); });
     p.on('close', (st, signal) => { clearTimeout(timer); resolve({ status: st, signal }); });
@@ -959,9 +989,10 @@ function cDriverCases() {
     },
     'C: Windows: data of a DLL, and unwinding with a variable length array': async () => {
       if (skip()) return skip();
-      write({ 'dll.c': 'extern int _fmode;\nextern char **_environ;\nint get(void) { return _fmode; }\n' +
-          'int *where(void) { return &_fmode; }\nint main(void) { _fmode = get() + 1; return _environ != 0 && *where() > 0; }\n',
-        'dllinit.c': 'extern int _fmode;\nint *p = &_fmode;\nint main(void) { return *p; }\n',
+      // (ntdll.dll's objects: the system's C library, which has others, is not linked)
+      write({ 'dll.c': 'extern unsigned short NlsAnsiCodePage;\nextern unsigned char NlsMbCodePageTag;\nint get(void) { return NlsAnsiCodePage; }\n' +
+          'unsigned short *where(void) { return &NlsAnsiCodePage; }\nint main(void) { return (get() == *where()) + 2 * NlsMbCodePageTag; }\n',
+        'dllinit.c': 'extern unsigned short NlsAnsiCodePage;\nunsigned short *p = &NlsAnsiCodePage;\nint main(void) { return *p; }\n',
         'vla.c': 'int use(volatile int *p, int n);\ndouble dbl(double *p);\n' +
           'int f(int n, double x) {\n    int a[n];\n    double y = x * 2;\n    for (int i = 0; i < n; i++) a[i] = i;\n' +
           '    int r = use(a, n);\n    int b[n + r];\n    b[0] = r;\n    return r + (int)(dbl(&y) + x) + use(b, 1);\n}\n' +
@@ -971,7 +1002,8 @@ function cDriverCases() {
       let c = await ax(['build', 'dll.c', '--target=x86_64-windows', '--pdb=off', '-O2', '-o', out]);
       if (c.status !== 0) return `dll.c: ${c.stdout}${c.stderr}`;
       const pe = peImports(fs.readFileSync(out));
-      for (const n of ['_fmode', '_environ']) if (!(pe['msvcrt.dll'] || []).includes(n)) return `dll.c: no import of ${n}: ${JSON.stringify(pe)}`;
+      for (const n of ['NlsAnsiCodePage', 'NlsMbCodePageTag']) if (!(pe['ntdll.dll'] || []).includes(n)) return `dll.c: no import of ${n}: ${JSON.stringify(pe)}`;
+      if (pe['msvcrt.dll']) return `dll.c: imports from msvcrt.dll: ${JSON.stringify(pe)}`;
       c = await ax(['build', 'dllinit.c', '--target=x86_64-windows', '--format=agent-json', '-o', out]);
       if (c.status !== 1 || !(codes(c) || []).includes('e:C3067')) return `dllinit.c: ${c.stdout}${c.stderr}`;
       for (const o of ['-O0', '-O2']) {
@@ -1010,6 +1042,33 @@ function cDriverCases() {
       if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
       const r = spawnSync(out, [], { encoding: 'utf8' });
       return /at <indirect call>\n\s+at early \(crash2\.c:9:16\)\n\s+at tailer \(crash2\.c:15:12\)\n\s+at deep \(crash2\.c:18:16\)\n\s+at main \(crash2\.c:22:12\)/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
+    },
+    // With line tables (-g, --debug-info=lines) the innermost frame shows
+    // the faulting instruction's line too (the frame table's line rows:
+    // cmd/axiom/src/ftab.ax), also where no call was recorded (all of the
+    // program inlined into main at -O2); the code is the same.
+    'C: native stack traces with the faulting line (-g)': async () => {
+      if (skip()) return skip();
+      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      write({ 'crash.c': 'static int deref(int *p) {\n    return *p;\n}\nstatic int middle(int *p) {\n    return deref(p) + 1;\n}\n' +
+        'int main(void) {\n    int *volatile q = 0;\n    return middle(q);\n}\n',
+        'crash2.c': 'static int *volatile gp;\nstatic volatile int sink;\nint leafcrash(int x) {\n    return *gp + x;\n}\n' +
+        'static int (*volatile leafp)(int) = leafcrash;\nint early(int *p, int x) {\n    if (!p) {\n        return leafp(x) + 1;\n' +
+        '    }\n    return *p;\n}\nint tailer(int x) {\n    sink = x;\n    return early(0, x + 1);\n}\n' +
+        'int deep(int n) {\n    return n + tailer(n);\n}\nint main(int argc, char **argv) {\n    (void)argv;\n' +
+        '    return deep(argc + 2);\n}\n' });
+      const out = path.join(dir, 'crash-g');
+      const cases = [['crash.c', ['-O0', '-g'], /at deref \(crash\.c:2\)\n\s+at middle \(crash\.c:5:12\)\n\s+at main \(crash\.c:9:12\)/],
+        ['crash.c', ['-O0', '--debug-info=lines'], /at deref \(crash\.c:2\)\n\s+at middle \(crash\.c:5:12\)/],
+        ['crash.c', ['-O2', '-g'], /stack trace \(innermost first\):\n\s+at main \(crash\.c:[25]\)\n/],
+        ['crash2.c', ['-O2', '-g'], /at leafcrash \(crash2\.c:4\)\n\s+at early \(crash2\.c:9:16\)/]];
+      for (const [src, flags, want] of cases) {
+        const c = await ax(['build', src, ...flags, nativeTarget, '-o', out]);
+        if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
+        const r = spawnSync(out, [], { encoding: 'utf8' });
+        if (!want.test(r.stderr)) return `${src} ${flags.join(' ')}: the trace:\n${r.stderr}`;
+      }
+      return null;
     },
   };
 }
@@ -2015,6 +2074,22 @@ if (!skipPlatform) {
     }
     return Buffer.alloc(0);
   };
+  // the size of a Mach-O executable's __TEXT,__text section
+  const machoText = (d) => {
+    const ncmds = d.readUInt32LE(16);
+    for (let k = 0, at = 32; k < ncmds; k++) {
+      const cmd = d.readUInt32LE(at), size = d.readUInt32LE(at + 4);
+      if (cmd === 0x19) {
+        const nsect = d.readUInt32LE(at + 64);
+        for (let j = 0; j < nsect; j++) {
+          const sh = at + 72 + 80 * j;
+          if (d.toString('latin1', sh, sh + 16).replace(/\0+$/, '') === '__text') return Number(d.readBigUInt64LE(sh + 40));
+        }
+      }
+      at += size;
+    }
+    return -1;
+  };
   const dcases = {};
   const targets = ['x86_64', 'aarch64', 'aarch64-macos', 'x86_64-macos', 'wasm32', 'wasm64'];
   for (const [lang, file] of [['c', 'frames.c'], ['ax', 'frames.ax'], ['c', 'vars.c'], ['ax', 'vars.ax'], ['ax', 'shared.ax']]) {
@@ -2038,8 +2113,12 @@ if (!skipPlatform) {
             if (!a.equals(b)) return 'two builds differ';
             if (mac && fs.existsSync(`${outs[2]}.dSYM`)) return 'a .dSYM without -g';
             const [ea, en] = [fs.readFileSync(outs[0]), fs.readFileSync(outs[2])];
-            const same = mac ? ea.equals(en) : t.startsWith('wasm') ? wasmCode(ea).equals(wasmCode(en))
-              : obj ? objText(ea).equals(objText(en)) : loaded(ea).equals(loaded(en));
+            // (the code is the same: an object's instructions, with their
+            // relocations; in an executable, where the frame table's line rows
+            // (ftab.ax) move the data after them, its size)
+            const same = mac ? machoText(ea) === machoText(en) : t.startsWith('wasm') ? wasmCode(ea).equals(wasmCode(en))
+              : obj ? objText(ea).equals(objText(en)) : objText(ea).length === objText(en).length && objText(ea).length > 0;
+            void loaded;
             if (!same) return '-g changed the code';
             if (mac && checkMachO(ea).errs.length) return `the executable: ${checkMachO(ea).errs.join('\n')}`;
             if (!t.startsWith('wasm') && !mac && !obj && n.length === a.length) return 'no debug information';
@@ -2256,8 +2335,11 @@ if (!skipPlatform) {
   const wine = ['wine64', 'wine', '/usr/lib/wine/wine64'].find((w) => spawnSync(w, ['--version'], { encoding: 'utf8' }).status === 0);
   // The headers and tables (pe.mjs; for ARM64 the code and its unwind
   // information too, with the PDB when there is one).
+  // No program imports anything of the system's C library (docs/c.md).
   const checkPE = (f, arm64 = false) => {
     const r = checkPEFile(f, { arm64 });
+    const crt = r.imports ? r.imports.filter((x) => /^(msvcrt|ucrtbase)\.dll:/i.test(x)) : [];
+    if (crt.length) r.errs.push(`imports from the system's C library: ${crt.join(' ')}`);
     return r.errs.length ? r.errs.join('\n') : null;
   };
   // aarch64-windows: built and checked; Wine runs x86-64 programs only, and
@@ -2307,7 +2389,7 @@ if (!skipPlatform) {
       const r = run('hello');
       return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
-    'a C program: two translation units, the C library (msvcrt.dll)': () => {
+    'a C program: two translation units, the C library (the compiler\'s, no msvcrt.dll)': () => {
       const [a, b] = platformC('windows');
       const c = build(a, 'c', [b]);
       if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
@@ -2333,7 +2415,8 @@ if (!skipPlatform) {
         for (let e = off(ex.rva); e < off(ex.rva) + ex.size; e += 12) {
           const s0 = b.readUInt32LE(e), e0 = b.readUInt32LE(e + 4), u = b.readUInt32LE(e + 8);
           if (!(s0 >= prev && e0 > s0)) return `${o}: function table entry [0x${s0.toString(16)}, 0x${e0.toString(16)}) out of order`;
-          if (b[off(u)] !== 1) return `${o}: unwind information of version ${b[off(u)]} at 0x${s0.toString(16)}`;
+          // (version 1; no flags but UNW_FLAG_CHAININFO: the code after a sibling call's jump)
+          if ((b[off(u)] & 7) !== 1 || (b[off(u)] >> 3) & ~4) return `${o}: unwind information ${b[off(u)]} (version, flags) at 0x${s0.toString(16)}`;
           prev = e0;
         }
         if (!wine) continue;
@@ -2483,7 +2566,7 @@ if (!skipPlatform) {
       }
       return null;
     },
-    'aarch64-windows: a C program: two translation units, the C library (msvcrt.dll)': () => {
+    'aarch64-windows: a C program: two translation units, the C library (the compiler\'s, no msvcrt.dll)': () => {
       const [a, b] = platformC('windows-a');
       const p = arm(a, 'a-c', [b]);
       if (p || !onArm64Windows) return p;

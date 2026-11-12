@@ -440,6 +440,17 @@ fn frame_line(o: *mut Fmt, c: *Site) void {
 
 // "stack trace" lines for a trap at `top` (0: location unknown).
 pub fn format_stack(o: *mut Fmt, top: *Site, ss: *ShadowStack) void {
+    format_stack_line(o, top, ss, @ptr_from_int(*Site, 0));
+}
+
+/// format_stack for a crash at pc, with the frame table tab: the innermost
+/// frame's line also shows the faulting instruction's file and line when
+/// the program has line tables (-g: line_at).
+pub fn format_crash_stack(o: *mut Fmt, ss: *ShadowStack, tab: *usize, pc: usize) void {
+    format_stack_line(o, @ptr_from_int(*Site, 0), ss, line_at(tab, pc));
+}
+
+fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site) void {
     let has_ss = not is_null(@ptr_cast(*void, ss));
     let mut depth: u32 = 0;
     if has_ss {
@@ -447,6 +458,16 @@ pub fn format_stack(o: *mut Fmt, top: *Site, ss: *ShadowStack) void {
     }
     let has_top = not is_null(@ptr_cast(*void, top));
     if not has_top and (depth == 0) {
+        if not is_null(@ptr_cast(*void, line)) {
+            // (no call recorded: the faulting function's line alone)
+            o.s("stack trace (innermost first):\n  at ");
+            o.s(cstr(line.fn_()));
+            o.s(" (");
+            o.s(cstr(line.file()));
+            o.c(':');
+            o.u(@as(u64, line.line));
+            o.s(")\n");
+        }
         return;
     }
     o.s("stack trace (innermost first):\n");
@@ -457,8 +478,17 @@ pub fn format_stack(o: *mut Fmt, top: *Site, ss: *ShadowStack) void {
         o.s("  at ");
         if not is_null(@ptr_cast(*void, c)) and (cstr(c.callee()).len > 0) {
             o.s(cstr(c.callee()));
+        } else if not is_null(@ptr_cast(*void, line)) {
+            o.s(cstr(line.fn_()));
         } else {
             o.s("<indirect call>");
+        }
+        if not is_null(@ptr_cast(*void, line)) {
+            o.s(" (");
+            o.s(cstr(line.file()));
+            o.c(':');
+            o.u(@as(u64, line.line));
+            o.s(")");
         }
         o.s("\n");
     }
@@ -636,6 +666,36 @@ fn rets_frameless(a: usize, n: usize, pc: usize) bool {
         }
     }
     return (best != 0) and ((ent_flags(best) & RET_FRAMELESS) != 0);
+}
+
+/// The line of the code at pc, from the frame table's line rows (a program
+/// built with line tables: cmd/axiom/src/ftab.ax), as a record shaped as a
+/// call site's (its file, line and function; column 0); null without them
+/// or where the code has no line. The last row at or before pc: a marker
+/// whose chain holds the record (the other markers' chains are empty).
+pub fn line_at(tab: *usize, pc: usize) *Site {
+    let none = @ptr_from_int(*Site, 0);
+    let mut n: usize = 0;
+    let a = rets_table(tab, &mut n);
+    if (a == 0) or (pc == 0) or not rets_sorted(a, n) {
+        return none;
+    }
+    let mut i = rets_lower(a, n, pc + 1);
+    while i > 0 {
+        i -= 1;
+        let e = a + (8 * i);
+        if (ent_flags(e) & RET_MARKER) != 0 {
+            let s = rd_usize(ent_chain(e));
+            if s != 0 {
+                let site = @ptr_from_int(*Site, s);
+                if site.line == 0 {
+                    return none;
+                }
+                return site;
+            }
+        }
+    }
+    return none;
 }
 
 // The frame table: its first entry and their number (0: there is none).
