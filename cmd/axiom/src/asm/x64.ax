@@ -644,6 +644,24 @@ fn imm(A: *mut cr.Asm, v0: cr.Val, n: u32, w: bool) void {
         }
         return;
     }
+    // (a value that does not fit the field is an error, not truncated: an
+    // 8- or 16-bit field takes a signed or an unsigned value of its width, a
+    // 32-bit one too, but sign-extended to 64 bits (w) only a signed one)
+    let k = v.k;
+    let mut ok = true;
+    if n == 1 {
+        ok = (k >= -128) and (k <= 255);
+    } else if n == 2 {
+        ok = (k >= -32768) and (k <= 65535);
+    } else if (n == 4) and w {
+        ok = fits32(k);
+    } else if n == 4 {
+        ok = (k >= -2147483648) and (k <= 4294967295);
+    }
+    if not ok {
+        cr.fail(A, u.f2("the immediate %s does not fit in %s bytes", u.dec(k), u.udec(@as(u64, n))));
+        return;
+    }
     let x = @bit_cast(u64, v.k);
     if n == 1 {
         cr.emit8(A, x);
@@ -806,13 +824,17 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
     // pseudo-prefixes: {vex} {vex2} {vex3} {evex} (the encoding to choose)
     let mut evex = false;
     let mut vex3 = false;
+    let mut vexp = false;
     while (m.len > 2) and (m[0] == '{') and (m[m.len - 1] == '}') {
         let pn = m[1..m.len - 1];
         if u.str_eq(pn, "evex") {
             evex = true;
         } else if u.str_eq(pn, "vex3") {
             vex3 = true;
-        } else if not u.str_eq(pn, "vex") and not u.str_eq(pn, "vex2") {
+            vexp = true;
+        } else if u.str_eq(pn, "vex") or u.str_eq(pn, "vex2") {
+            vexp = true;
+        } else {
             cr.fail(A, u.f1("the pseudo-prefix '%s' is not supported", m));
             return;
         }
@@ -872,17 +894,26 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
             }
         }
     }
-    if table_insn(A, m, ops, evex, vex3) {
+    if table_insn(A, m, ops, evex, vex3, vexp) {
         return;
     }
     if evex {
         cr.fail(A, u.f1("'%s' has no EVEX form with these operands", m));
         return;
     }
-    if general(A, st, m, ops) {
-        return;
+    // (the instructions below take no AVX-512 decorations, vector indexes or rounding operands)
+    for o in ops {
+        if (o.mask != 0) or o.zero or (o.bcst != 0) or o.vix or (o.kind == XK_RC) {
+            cr.fail(A, u.f1("'%s' does not take these operands (masking, broadcast, rounding or a vector index)", m));
+            return;
+        }
     }
-    if sse(A, m, ops) {
+    let before = cr.here(A);
+    if general(A, st, m, ops) or sse(A, m, ops) {
+        if not cr.failed(A) and (cr.here(A) == before) {
+            // (every instruction has bytes: a form that encoded to nothing is not one)
+            bad_form(A, m);
+        }
         return;
     }
     if cr.failed(A) {
@@ -1070,9 +1101,17 @@ fn alu(A: *mut cr.Asm, m: []u8, sfx: u32, d: i32, ops: []XOp) void {
             emit(A, &mut e);
             return;
         }
-        if cr.is_const(v) and fits8(v.k) {
+        // (the value at the operation's width: addw $65535 is $-1)
+        let mut kw = v.k;
+        if cr.is_const(v) and (sz == 16) and (kw >= 0x8000) and (kw <= 0xffff) {
+            kw = kw - 0x10000;
+        } else if cr.is_const(v) and (sz == 32) and (kw >= 0x8000_0000) and (kw <= 0xffff_ffff) {
+            kw = kw - 0x1_0000_0000;
+        }
+        if cr.is_const(v) and fits8(kw) {
             op1(&mut e, 0x83);
             rm_digit(&mut e, d, dst);
+            e.imm = cr.konst(kw);
             e.isz = 1;
             emit(A, &mut e);
             return;
@@ -1604,6 +1643,11 @@ fn stack(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
     }
     if (o.kind == XK_IMM) and (ps != 0) {
         let v = cr.settle(A, o.v);
+        if cr.is_const(v) and (sfx != 16) and not fits32(v.k) {
+            // (pushed sign-extended to 64 bits)
+            cr.fail(A, u.f1("the immediate %s does not fit in 32 bits (sign-extended)", u.dec(v.k)));
+            return true;
+        }
         e.imm = v;
         if cr.is_const(v) and fits8(v.k) {
             op1(&mut e, 0x6a);
@@ -1659,6 +1703,10 @@ fn branch(A: *mut cr.Asm, st: *mut cr.Stmt, m: []u8, ops: []XOp) bool {
             return true;
         }
         let t = ops[0];
+        if (t.kind == XK_MEM) and (t.seg != 0) and not t.star {
+            cr.fail(A, u.f1("'%s' to a segment-relative address needs '*' (an indirect jump or call)", m));
+            return true;
+        }
         if t.star or (t.kind == XK_REG) or ((t.kind == XK_MEM) and not t.bare) {
             // indirect: jmp *r/m (FF /4), call *r/m (FF /2)
             if not is_jmp and not is_call {
@@ -2058,6 +2106,9 @@ fn misc(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
         }
         let sz = size_of(A, ns, ops, m);
         if (sz == 0) or (sz == 8) {
+            if sz == 8 {
+                bad_form(A, m);
+            }
             return true;
         }
         set_size(&mut e, sz);
@@ -2147,6 +2198,9 @@ fn misc(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
         }
         let sz = size_of(A, mb, ops, m);
         if (sz == 0) or (sz == 8) {
+            if sz == 8 {
+                bad_form(A, m);
+            }
             return true;
         }
         set_size(&mut e, sz);
@@ -2321,6 +2375,16 @@ fn vex(A: *mut cr.Asm, mmmmm: u64, pp: u64, w: bool, l: u64, vvvv: i32, opc: u8,
     }
 }
 
+// Are the general registers among ops all of `bits` bits (memory and immediates aside)?
+fn same_gpr_width(ops: []XOp, bits: u32) bool {
+    for o in ops {
+        if (o.kind == XK_REG) and ((o.reg >= 16) or (o.bits != bits) or o.hi8) {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn bmi(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
     // three-operand: andn (src2, src1, dst) = dst <- ~src1 & src2 (VEX.vvvv src1)
     let names3 = ["andn", "bextr", "bzhi", "pdep", "pext", "mulx", "sarx", "shlx", "shrx"];
@@ -2337,7 +2401,7 @@ fn bmi(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
             return true;
         }
         let dst = ops[2];
-        if not is_gpr(&dst) or (dst.bits < 32) {
+        if not is_gpr(&dst) or (dst.bits < 32) or not same_gpr_width(ops, dst.bits) {
             bad_form(A, m);
             return true;
         }
@@ -2369,7 +2433,7 @@ fn bmi(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
         if not nargs(A, ops, 2, m) {
             return true;
         }
-        if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits < 32) {
+        if not is_rm(&ops[0]) or not is_gpr(&ops[1]) or (ops[1].bits < 32) or not same_gpr_width(ops, ops[1].bits) {
             bad_form(A, m);
             return true;
         }
@@ -2381,7 +2445,8 @@ fn bmi(A: *mut cr.Asm, m: []u8, ops: []XOp) bool {
         if not nargs(A, ops, 3, m) {
             return true;
         }
-        if (ops[0].kind != XK_IMM) or not is_rm(&ops[1]) or not is_gpr(&ops[2]) or (ops[2].bits < 32) {
+        if (ops[0].kind != XK_IMM) or not is_rm(&ops[1]) or not is_gpr(&ops[2]) or (ops[2].bits < 32) or
+           not same_gpr_width(ops[1..], ops[2].bits) {
             bad_form(A, m);
             return true;
         }
@@ -3016,7 +3081,7 @@ fn imm_text(o: *ai.ROp) []u8 {
     return u.dec(o.k);
 }
 
-/// The text of operand o with modifier `mod` (GCC's x86 operand modifiers:
+/// The text of operand o with modifier `mod` (the dialect's x86 operand modifiers:
 /// b w k q h for a register's widths, x for its xmm register, c and P for a
 /// constant without '$', n for its negation, a for an address, A for an
 /// indirect operand, H for memory 8 bytes on, V for a register without '%',
@@ -3032,6 +3097,9 @@ pub fn render(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
             }
             if mod == 't' {
                 return u.f1("%%ymm%s", u.idec(o.reg - 16));
+            }
+            if mod == 'g' {
+                return u.f1("%%zmm%s", u.idec(o.reg - 16));
             }
             err.* = u.f1("the modifier '%s' of an xmm register", ai.ch_text(mod));
             return "";
@@ -3199,6 +3267,8 @@ const TT_VX: u32 = 0x10_0000;
 const TT_VY: u32 = 0x20_0000;
 const TT_VZ: u32 = 0x40_0000;
 const TT_I: u32 = 0x80_0000;
+const TT_VV: u32 = 0x100_0000;  // memory with a vector index of the form's length (VSIB)
+const TT_VH: u32 = 0x200_0000;  // ... of half of it (at least xmm)
 
 struct TForm {
     name: []u8,
@@ -3222,7 +3292,9 @@ struct TForm {
     kzero: bool,
     er: bool,
     sae: bool,
-    fimm: i32,  // a fixed imm8, or -1
+    fimm: i32,   // a fixed imm8, or -1
+    kreq: bool,  // a mask register is required (gathers and scatters)
+    pvex: bool,  // a VEX form chosen only under the {vex} pseudo-prefix (where EVEX is the default)
 }
 
 const TU_NONE: u8 = 0;
@@ -3276,9 +3348,9 @@ fn ttype(t: []u8, fix: *mut i32, fixb: *mut u32) u32 {
         let a = t[st..k];
         st = k + 1;
         let names = ["V", "H", "Q", "O", "x", "y", "z", "k", "mm", "st", "st0", "sreg", "cr", "dr", "r8", "r16", "r32",
-                     "r64", "m", "vx", "vy", "vz", "i"];
-        let vals: [23]u32 = [TT_V, TT_H, TT_Q, TT_O, TT_X, TT_Y, TT_Z, TT_K, TT_MM, TT_ST, TT_ST0, TT_SREG, TT_CR,
-                             TT_DR, TT_R8, TT_R16, TT_R32, TT_R64, TT_M, TT_VX, TT_VY, TT_VZ, TT_I];
+                     "r64", "m", "vx", "vy", "vz", "i", "vV", "vH"];
+        let vals: [25]u32 = [TT_V, TT_H, TT_Q, TT_O, TT_X, TT_Y, TT_Z, TT_K, TT_MM, TT_ST, TT_ST0, TT_SREG, TT_CR,
+                             TT_DR, TT_R8, TT_R16, TT_R32, TT_R64, TT_M, TT_VX, TT_VY, TT_VZ, TT_I, TT_VV, TT_VH];
         let mut found = false;
         for j in 0..names.len {
             if u.str_eq(a, names[j]) {
@@ -3315,7 +3387,7 @@ fn build_table() void {
         let enc = tword(line, &mut i);
         let mut f = TForm.{ name: u.intern(name), n: 0, role: [0; 5], ty: [0; 5], fix: [-1; 5], fixb: [0; 5], enc: TE_L,
                             pp: 0, map: 0, w: 0, opc: [0; 4], nopc: 0, digit: -2, lens: 1, tuple: TU_NONE, tn: 0, bc: 0,
-                            kmask: false, kzero: false, er: false, sae: false, fimm: -1 };
+                            kmask: false, kzero: false, er: false, sae: false, fimm: -1, kreq: false, pvex: false };
         if not u.str_eq(roles, "-0") {
             f.n = roles.len;
             for k in 0..roles.len {
@@ -3371,8 +3443,8 @@ fn build_table() void {
                 f.map = @truncate(u8, k);
             }
         }
-        let ws = ["w0", "w1", "wig", "wr"];
-        for k in @as(usize, 0)..4 {
+        let ws = ["w0", "w1", "wig", "wr", "wo"];
+        for k in @as(usize, 0)..5 {
             if u.str_eq(fields[3], ws[k]) {
                 f.w = @truncate(u8, k);
             }
@@ -3437,6 +3509,11 @@ fn build_table() void {
                 f.er = true;
             } else if u.str_eq(a, "sae") {
                 f.sae = true;
+            } else if u.str_eq(a, "kreq") {
+                f.kmask = true;
+                f.kreq = true;
+            } else if u.str_eq(a, "pvex") {
+                f.pvex = true;
             } else if u.starts(a, "imm=") {
                 f.fimm = @truncate(i32, u.atol(a[4..]));
             } else {
@@ -3539,14 +3616,29 @@ fn tmatch(f: *TForm, k: usize, o: *XOp, L: u32) bool {
     if o.kind == XK_MEM {
         if o.vix {
             let w = o.bits;
+            if o.bcst != 0 {
+                return false;
+            }
+            if ((o.index - R_VEC) >= 16) and (f.enc != TE_E) {
+                return false;
+            }
             return (((t & TT_VX) != 0) and (w == 128)) or (((t & TT_VY) != 0) and (w == 256)) or
-                   (((t & TT_VZ) != 0) and (w == 512));
+                   (((t & TT_VZ) != 0) and (w == 512)) or (((t & TT_VV) != 0) and (w == L)) or
+                   (((t & TT_VH) != 0) and (w == @max(L / 2, 128)));
         }
         if (t & TT_M) == 0 {
             return false;
         }
         if o.bcst != 0 {
-            if (f.bc == 0) or ((L / 8 / f.bc) != o.bcst) {
+            // (as many elements as the destination has: half as many in a half-vector tuple)
+            let mut want: u32 = 0;
+            if f.bc != 0 {
+                want = L / 8 / f.bc;
+                if f.tuple == TU_HV {
+                    want = want / 2;
+                }
+            }
+            if (f.bc == 0) or (want != o.bcst) {
                 return false;
             }
             // (a broadcast is the third operand's, or the second's of two)
@@ -3604,7 +3696,7 @@ fn fnum(o: *XOp) i32 {
 // Tries the table's forms of mnemonic m with operands ops (AT&T order):
 // true when one matched (and was encoded, or failed with an error).
 // evex: {evex} was written (EVEX forms only); vex3: {vex3} (no C5).
-fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool) bool {
+fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool, vexp: bool) bool {
     if not g_tbuilt {
         build_table();
         g_tbuilt = true;
@@ -3615,6 +3707,18 @@ fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool) bool
     }
     // Intel's order, without a rounding operand
     let mut rc: i64 = -1;
+    // (the rounding operand comes first, or right after an immediate)
+    let mut nimm: usize = 0;
+    for o in ops0 {
+        if o.kind == XK_IMM {
+            nimm += 1;
+        }
+    }
+    for k in 0..ops0.len {
+        if (ops0[k].kind == XK_RC) and (k != nimm) {
+            return false;
+        }
+    }
     let ops = u.newn.[XOp](ops0.len + 1);
     let mut n: usize = 0;
     let mut k = ops0.len;
@@ -3646,6 +3750,15 @@ fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool) bool
             if evex and (f.enc != TE_E) {
                 continue;
             }
+            if f.pvex and not vexp {
+                continue;
+            }
+            if vexp and (f.enc == TE_E) {
+                continue;  // ({vex}: a VEX form or none)
+            }
+            if f.kreq and ((n == 0) or (ops[0].mask == 0)) {
+                continue;
+            }
             if f.n != n {
                 continue;
             }
@@ -3658,8 +3771,8 @@ fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool) bool
                     continue;
                 }
                 let L = lens[li2];
-                // (a rounding operand implies the 512-bit form, or a scalar one)
-                if (rc >= 0) and (rc < 4) and (L != 512) and (f.lens != 8) {
+                // (rounding and {sae} imply the 512-bit form, or a scalar one)
+                if (rc >= 0) and (L != 512) and (f.lens != 8) {
                     continue;
                 }
                 let mut ok = true;
@@ -3679,7 +3792,7 @@ fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool) bool
                     return true;
                 }
                 let len = A.secs.at(@int_cast(usize, A.cur)).data.len - before;
-                // gas prefers a lower encoding class (legacy < VEX < EVEX), then
+                // the dialect prefers a lower encoding class (legacy < VEX < EVEX), then
                 // the shortest within a class (the 2-byte VEX, the store form)
                 let better = (best_fi < 0) or (@int_cast(i32, f.enc) < best_enc) or
                              ((@int_cast(i32, f.enc) == best_enc) and (@int_cast(i64, len) < best_len));
@@ -3773,6 +3886,12 @@ fn tencode(A: *mut cr.Asm, f: *TForm, ops: []XOp, L: u32, rc: i64, vex3: bool) v
     if f.w == 3 {
         W = w64;
     }
+    let mut first: usize = 0;
+    if (f.enc == TE_L) and (f.nopc > 1) and (f.opc[0] == 0x9b) {
+        // fwait before the prefixes (fstcw, fsave ...: two instructions)
+        cr.emit8(A, 0x9b);
+        first = 1;
+    }
     // prefixes of the memory operand
     if rm.kind == XK_MEM {
         if rm.seg != 0 {
@@ -3784,8 +3903,8 @@ fn tencode(A: *mut cr.Asm, f: *TForm, ops: []XOp, L: u32, rc: i64, vex3: bool) v
     }
     let ppv: [4]u8 = [0, 0x66, 0xf3, 0xf2];
     if f.enc == TE_L {
-        if osz and (f.w == 3) {
-            cr.emit8(A, 0x66);
+        if osz and ((f.w == 3) or (f.w == 4)) {
+            cr.emit8(A, 0x66);  // (wo: the operand-size prefix of a 16-bit register, never REX.W)
         }
         for p in pfxs() {
             cr.emit8(A, @as(u64, p));
@@ -3896,6 +4015,7 @@ fn tencode(A: *mut cr.Asm, f: *TForm, ops: []XOp, L: u32, rc: i64, vex3: bool) v
         let mut bbit: u64 = bx(bcst);
         if rc >= 0 {
             bbit = 1;
+            ll = 0;  // ({sae}: L'L is not read, and is written as 0)
             if rc < 4 {
                 ll = @bit_cast(u64, rc);
             }
@@ -3907,7 +4027,7 @@ fn tencode(A: *mut cr.Asm, f: *TForm, ops: []XOp, L: u32, rc: i64, vex3: bool) v
         cr.emit8(
             A, (((bx(zero) << 7) | (ll << 5)) | ((bbit << 4) | (((~v2) & 1) << 3))) | @bit_cast(u64, @as(i64, mask)));
     }
-    for k in 0..f.nopc {
+    for k in first..f.nopc {
         let mut c = @as(u64, f.opc[k]);
         if ((k + 1) == f.nopc) and (plus >= 0) {
             c += @bit_cast(u64, @as(i64, plus));
@@ -4034,4 +4154,11 @@ fn modrm_disp32(A: *mut cr.Asm, regf: i32, m: *XOp) void {
         cr.emit8(A, ((2 << 6) | rf) | rr(base));
     }
     cr.emit32(A, @bit_cast(u64, m.v.k));
+}
+
+fn pick_us(c: bool, a: usize, b: usize) usize {
+    if c {
+        return a;
+    }
+    return b;
 }

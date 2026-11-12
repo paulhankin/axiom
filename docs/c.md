@@ -958,7 +958,7 @@ other tool is needed:
   supported is C3097, naming it, at the statement.
 
 `asm [volatile] [inline] [goto] ("template" : outputs : inputs : clobbers : labels)`, as
-GCC's documentation describes extended asm, with these rules:
+The GNU dialect's documentation describes extended asm, with these rules:
 
 - Operands are numbered outputs first, then inputs, then (for `%l`) labels; `%[name]`
   names one. An output's constraint starts with `=` or `+` (also an input: it is read and
@@ -971,16 +971,29 @@ GCC's documentation describes extended asm, with these rules:
   chooses a constant when it is one (and the constraint allows it), else a register, else
   memory. A register operand is an integer, pointer or floating value of 1, 2, 4 or 8
   bytes (a floating value in a general register is its bits, an integer in a vector
-  register too). `A`, `t`, `u`, `f`, `y` (x87, MMX) and AVX-512 mask registers are C3901.
+  register too). On x86-64 also `Yz` (xmm0), and operands in registers the compiler does
+  not allocate, whose values go through memory: the moves are written around the template
+  (from the operand's memory to the register before it, back after it): `k` (an AVX-512 mask
+  register, of an integer of 1 to 8 bytes: `kmov`), `y` (an MMX register, of 4 or 8
+  bytes), and the x87 stack's `t` (st(0)), `u` (st(1)) and `f` (any), of `float`,
+  `double` and the 80-bit `long double`, with the stack's rules as the dialect's documentation
+  gives them: the inputs are loaded so that `t` is on top and `u` below it (`f` after
+  them), an output tied to an input (`"=t"(r) : "0"(x)`) replaces it, the inputs the
+  template pops are clobbered (`"st(1)"`) and must be the topmost (C3096 otherwise; also a
+  `u` operand without a `t` one), the outputs are popped after it, `t` first, and then the
+  inputs the template left on the stack. An `asm goto` cannot have such outputs. `A` (the
+  rdx:rax pair) is C3901.
 - Explicit register variables, `register long x asm("rax")` (or `"x8"`, `"w19"`, `"d0"`
   ...): such a variable is in that register when it is an asm operand in a register (the
   usual way to pass system call arguments); elsewhere it is an ordinary variable. The stack
   and frame pointers, and on AArch64 x16, x17 and x18, cannot be.
-- Clobbers: registers (with or without `%` on x86-64), `"cc"` (always assumed on x86-64),
-  `"memory"`; not the stack or frame pointer, nor on macOS and Windows for AArch64 x18,
+- Clobbers: registers (with or without `%` on x86-64; `ymm0-15` and `zmm0-15` are their
+  xmm register; `xmm16-31`, `ymm16-31`, `zmm16-31`, `k0-7` and `mm0-7`, which the compiler
+  keeps no value in across an asm statement, are accepted; `st` and `st(n)` say which x87
+  inputs the template pops), `"cc"` (always assumed on x86-64), `"memory"`; not the stack or frame pointer, nor on macOS and Windows for AArch64 x18,
   the platform's (C3096). A clobbered callee-saved register is saved by the function.
 - Template modifiers: x86-64 `%b %w %k %q %h` (a register's widths, its high byte), `%x`
-  (xmm), `%c %P %p %a` (a constant without `$`, an address), `%n` (negated), `%A` (`*`),
+  (xmm), `%t` (ymm), `%g` (zmm), `%c %P %p %a` (a constant without `$`, an address), `%n` (negated), `%A` (`*`),
   `%H` (memory 8 bytes on), `%V`, `%z` (the size suffix); AArch64 `%w %x` (also of the
   constant 0: `wzr`, `xzr`), `%b %h %s %d %q`, `%c`, `%n`. Without a modifier an x86-64
   register is written at its operand's width, an AArch64 general register as `w` up to 32

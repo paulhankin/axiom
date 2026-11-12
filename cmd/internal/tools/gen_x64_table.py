@@ -36,8 +36,8 @@ X87_NONE = {
     'fprem': 'd9 f8', 'fprem1': 'd9 f5', 'fptan': 'd9 f2', 'frndint': 'd9 fc', 'fscale': 'd9 fd',
     'fsin': 'd9 fe', 'fsincos': 'd9 fb', 'fsqrt': 'd9 fa', 'ftst': 'd9 e4', 'fucompp': 'da e9',
     'fxam': 'd9 e5', 'fxtract': 'd9 f4', 'fyl2x': 'd9 f1', 'fyl2xp1': 'd9 f9',
-    'faddp': 'de c1', 'fmulp': 'de c9', 'fsubp': 'de e9', 'fsubrp': 'de e1', 'fdivp': 'de f9',
-    'fdivrp': 'de f1', 'fcom': 'd8 d1', 'fcomp': 'd8 d9', 'fucom': 'dd e1', 'fucomp': 'dd e9',
+    'faddp': 'de c1', 'fmulp': 'de c9', 'fsubp': 'de e1', 'fsubrp': 'de e9', 'fdivp': 'de f1',
+    'fdivrp': 'de f9', 'fcom': 'd8 d1', 'fcomp': 'd8 d9', 'fucom': 'dd e1', 'fucomp': 'dd e9',
     'fxch': 'd9 c9', 'fnstsw': '', 'fstsw': '',
 }
 for n, c in X87_NONE.items():
@@ -55,7 +55,7 @@ for n, d, a, b, p in X87_ARITH:
     ln('f%sl' % n, 'M', 'm', 'L.np.-.w0', 'dc', '/%d' % d)
     ln('fi%ss' % n, 'M', 'm', 'L.np.-.w0', 'de', '/%d' % d)
     ln('fi%sl' % n, 'M', 'm', 'L.np.-.w0', 'da', '/%d' % d)
-    ln('fi%s' % n, 'M', 'm', 'L.np.-.w0', 'da', '/%d' % d)
+    ln('fi%s' % n, 'M', 'm', 'L.np.-.w0', 'de', '/%d' % d)
     ln('f%s' % n, '-O', 'st0,st', 'L.np.-.w0', 'd8', a)
     ln('f%s' % n, 'O', 'st', 'L.np.-.w0', 'd8', a)
     # st(i) <- st(i) op st: DC with the opcode of the reversed operation (System V)
@@ -68,20 +68,17 @@ for n, d, c in [('com', 2, 'd0'), ('comp', 3, 'd8')]:
     ln('f%sl' % n, 'M', 'm', 'L.np.-.w0', 'dc', '/%d' % d)
     ln('fi%ss' % n, 'M', 'm', 'L.np.-.w0', 'de', '/%d' % d)
     ln('fi%sl' % n, 'M', 'm', 'L.np.-.w0', 'da', '/%d' % d)
-    ln('fi%s' % n, 'M', 'm', 'L.np.-.w0', 'da', '/%d' % d)
+    ln('fi%s' % n, 'M', 'm', 'L.np.-.w0', 'de', '/%d' % d)
     ln('f%s' % n, 'O', 'st', 'L.np.-.w0', 'd8', c)
-    ln('f%s' % n, '-O', 'st0,st', 'L.np.-.w0', 'd8', c)
 for n, c in [('fucom', 'e0'), ('fucomp', 'e8')]:
     ln(n, 'O', 'st', 'L.np.-.w0', 'dd', c)
-    ln(n, '-O', 'st0,st', 'L.np.-.w0', 'dd', c)
 for n, p, c in [('fcomi', 'db', 'f0'), ('fcomip', 'df', 'f0'), ('fcompi', 'df', 'f0'), ('fucomi', 'db', 'e8'),
                 ('fucomip', 'df', 'e8'), ('fucompi', 'df', 'e8')]:
     ln(n, '-O', 'st0,st', 'L.np.-.w0', p, c)
     ln(n, 'O', 'st', 'L.np.-.w0', p, c)
 for n, p, c in [('fcmovb', 'da', 'c0'), ('fcmove', 'da', 'c8'), ('fcmovbe', 'da', 'd0'), ('fcmovu', 'da', 'd8'),
                 ('fcmovnb', 'db', 'c0'), ('fcmovae', 'db', 'c0'), ('fcmovne', 'db', 'c8'), ('fcmovnbe', 'db', 'd0'),
-                ('fcmova', 'db', 'd0'), ('fcmovnu', 'db', 'd8'), ('fcmovnae', 'da', 'c0'), ('fcmovz', 'da', 'c8'),
-                ('fcmovnz', 'db', 'c8'), ('fcmovna', 'da', 'd0')]:
+                ('fcmova', 'db', 'd0'), ('fcmovnu', 'db', 'd8'), ('fcmovnae', 'da', 'c0'), ('fcmovna', 'da', 'd0')]:
     ln(n, '-O', 'st0,st', 'L.np.-.w0', p, c)
 for n, p, c in [('fld', 'd9', 'c0'), ('fst', 'dd', 'd0'), ('fstp', 'dd', 'd8'), ('fxch', 'd9', 'c8'),
                 ('ffree', 'dd', 'c0'), ('ffreep', 'df', 'c0')]:

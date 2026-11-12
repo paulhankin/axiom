@@ -676,8 +676,8 @@ fn fp_imm8(f: f64) i64 {
     return -1;
 }
 
-// mov rd, #imm: movz, movn or orr (a logical immediate), as the GNU
-// assembler chooses them, or an error.
+// mov rd, #imm: movz, movn or orr (a logical immediate), as the
+// architecture's preferred disassembly chooses them, or an error.
 fn mov_imm(A: *mut cr.Asm, d: AOp, x0: i64) void {
     let wide = d.x;
     let mut x = @bit_cast(u64, x0);
@@ -811,7 +811,7 @@ fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         }
     }
     if u.str_eq(m, "cmp") or u.str_eq(m, "cmn") {
-        if ops.len < 2 {
+        if (ops.len < 2) or (ops.len > 3) {
             bad(A, m);
             return true;
         }
@@ -819,7 +819,7 @@ fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         return true;
     }
     if u.str_eq(m, "neg") or u.str_eq(m, "negs") {
-        if (ops.len < 2) or not is_rz(&ops[0]) or not is_rz(&ops[1]) {
+        if (ops.len < 2) or (ops.len > 3) or not is_rz(&ops[0]) or not is_rz(&ops[1]) {
             bad(A, m);
             return true;
         }
@@ -854,7 +854,7 @@ fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         }
     }
     if u.str_eq(m, "tst") {
-        if ops.len < 2 {
+        if (ops.len < 2) or (ops.len > 3) {
             bad(A, m);
             return true;
         }
@@ -862,7 +862,7 @@ fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         return true;
     }
     if u.str_eq(m, "mvn") {
-        if (ops.len < 2) or not is_rz(&ops[0]) or not is_rz(&ops[1]) {
+        if (ops.len < 2) or (ops.len > 3) or not is_rz(&ops[0]) or not is_rz(&ops[1]) or (ops[0].x != ops[1].x) {
             if (ops.len == 2) and (ops[0].view == 'v') {
                 return false;
             }
@@ -1022,8 +1022,12 @@ fn integer(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
 }
 
 fn add_sub(A: *mut cr.Asm, m: []u8, sub0: bool, s: bool, ops: []AOp) void {
-    if (ops.len < 3) or not is_r(&ops[0]) or not is_r(&ops[1]) {
+    if (ops.len < 3) or (ops.len > 4) or not is_r(&ops[0]) or not is_r(&ops[1]) {
         bad(A, m);
+        return;
+    }
+    if (ops[2].kind == AK_IMM) and ops[2].fp {
+        bad(A, m);  // (a floating constant is no integer immediate)
         return;
     }
     if ops[2].kind == AK_IMM {
@@ -1113,7 +1117,11 @@ fn addsub_reg(A: *mut cr.Asm, m: []u8, sub: bool, s: bool, ops: []AOp) void {
                 return;
             }
         }
-        if (s and d.sp) or (not n.sp and (n.reg == 31)) or (d.x != n.x) {
+        // (Rm is an x register for uxtx and sxtx in a 64-bit operation, else a w register)
+        let rm_x = d.x and ((option & 3) == 3);
+        // (Rd 31 is sp unless the flags are set, when it is the zero register)
+        let d_bad = (s and d.sp) or (not s and (d.reg == 31) and not d.sp);
+        if d_bad or (not n.sp and (n.reg == 31)) or (d.x != n.x) or (rm.x != rm_x) {
             bad(A, m);
             return;
         }
@@ -1145,7 +1153,8 @@ fn addsub_reg(A: *mut cr.Asm, m: []u8, sub: bool, s: bool, ops: []AOp) void {
 }
 
 fn logical(A: *mut cr.Asm, m: []u8, opc: u64, neg: bool, ops: []AOp) void {
-    if (ops.len < 3) or not is_r(&ops[0]) or not is_rz(&ops[1]) or (ops[0].x != ops[1].x) {
+    if (ops.len < 3) or (ops.len > 4) or not is_r(&ops[0]) or not is_rz(&ops[1]) or (ops[0].x != ops[1].x) or
+       ((ops[2].kind == AK_IMM) and ops[2].fp) {
         bad(A, m);
         return;
     }
@@ -1204,7 +1213,11 @@ fn mov(A: *mut cr.Asm, m: []u8, ops: []AOp) void {
         return;
     }
     if (d.sp and (d.reg == 31)) or (s.sp and (s.reg == 31)) {
-        // mov to or from sp: add #0
+        // mov to or from sp: add #0 (whose other register cannot be the zero register)
+        if ((d.reg == 31) and not d.sp) or ((s.reg == 31) and not s.sp) {
+            bad(A, m);
+            return;
+        }
         w32(A, ae.addsub_imm(bx(d.x), false, false, d.reg, s.reg, 0, false));
         return;
     }
@@ -1792,10 +1805,19 @@ fn prfop(n: []u8) i64 {
 // The Rt field: a register, or a prefetch operation.
 fn prf_or_reg(A: *mut cr.Asm, t: *AOp) i32 {
     if t.kind == AK_EXPR {
-        return @truncate(i32, prfop(t.name) & 31);
+        let p = prfop(t.name);
+        if p < 0 {
+            cr.fail(A, u.f1("'%s' is not a prefetch operation", t.name));
+            return 0;
+        }
+        return @truncate(i32, p & 31);
     }
     if t.kind == AK_IMM {
-        return @truncate(i32, konst(A, t, "the prefetch operation") & 31);
+        let x = konst(A, t, "the prefetch operation");
+        if not range(A, x, 0, 31, "the prefetch operation") {
+            return 0;
+        }
+        return @truncate(i32, x);
     }
     return t.reg;
 }
@@ -2530,13 +2552,22 @@ fn idx(o: *AOp) u64 {
 fn vmov(A: *mut cr.Asm, m: []u8, d: AOp, s: AOp) void {
     let mut q: u64 = 0;
     let two: [2]AOp = [d, s];
-    if same_arr(two[..], &mut q) >= 0 {
+    // (the vector form, an alias of orr, is of 8b or 16b only; ins moves elements)
+    if not u.str_eq(m, "ins") and (same_arr(two[..], &mut q) == 0) {
         w32(A, (((0x0ea01c00 | (q << 30)) | (r5(s.reg) << 16)) | (r5(s.reg) << 5)) | r5(d.reg));
         return;
     }
     let de = elem(&d);
     let se = elem(&s);
+    if u.str_eq(m, "ins") and (de < 0) {
+        bad(A, m);
+        return;
+    }
     if (de >= 0) and is_rz(&s) {
+        if s.x != (de == 3) {
+            bad(A, m);  // (an x register for a d element, else a w register)
+            return;
+        }
         w32(A, ae.ins_gen(@bit_cast(u64, de), idx(&d), d.reg, s.reg));
         return;
     }
@@ -2580,13 +2611,16 @@ fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
                 bad(A, m);
                 return true;
             }
+            // (the arrangements each takes, as the Arm ARM lists them: no 1d;
+            // mul and the maximum and minimum ones no 2d either)
+            let no_2d = (k == 2) or ((k >= 14) and (k <= 17));
             if logic_size[k] >= 0 {
                 if sz != 0 {
                     bad(A, m);
                     return true;
                 }
                 sz = logic_size[k];
-            } else if (sz == 3) and (q == 0) {
+            } else if ((sz == 3) and (q == 0)) or ((sz == 3) and no_2d) {
                 bad(A, m);
                 return true;
             }
@@ -2603,6 +2637,14 @@ fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         if u.str_eq(m, fnames[k]) and (ops.len == 3) and (ops[0].view == 'v') {
             let mut q: u64 = 0;
             let sz = same_arr(ops, &mut q);
+            if sz == 1 {
+                // half precision (FEAT_FP16): 0 Q U 01110 a 10 Rm 00 opcode 1 Rn Rd
+                let a = fsz[k] >> 1;
+                w32(A,
+                    ((((0x0e400400 | (q << 30)) | (fu[k] << 29)) | (a << 23)) | (r5(ops[2].reg) << 16)) |
+                    (((fop[k] & 7) << 11) | ((r5(ops[1].reg) << 5) | r5(ops[0].reg))));
+                return true;
+            }
             if (sz < 2) or ((sz == 3) and (q == 0)) {
                 bad(A, m);
                 return true;
@@ -2616,7 +2658,8 @@ fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         if u.str_eq(m, twos[k]) and (ops.len == 2) and (ops[0].view == 'v') {
             let mut q: u64 = 0;
             let sz = same_arr(ops, &mut q);
-            if (sz < 0) or ((k <= 2) and (sz != 0)) or ((k >= 4) and (sz == 3) and (q == 0)) {
+            if (sz < 0) or ((k <= 2) and (sz != 0)) or ((k >= 4) and (sz == 3) and (q == 0)) or
+               ((k == 3) and (sz == 3)) {
                 bad(A, m);
                 return true;
             }
@@ -2647,6 +2690,15 @@ fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
                 bad(A, m);
                 return true;
             }
+            let views = "bhsd";
+            let mut dv = @int_cast(usize, sz);
+            if (k == 1) or (k == 6) {
+                dv += 1;  // (uaddlv, saddlv: the sum is twice the element's width)
+            }
+            if ops[0].view != views[dv] {
+                bad(A, m);
+                return true;
+            }
             w32(A, ae.vacross(q, acu[k], @bit_cast(u64, sz), aco[k], ops[0].reg, ops[1].reg));
             return true;
         }
@@ -2663,14 +2715,19 @@ fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
             return true;
         }
         if is_rz(&ops[1]) {
-            w32(A, ae.dup_gen(@bit_cast(u64, sz), ops[0].reg, ops[1].reg) | (q << 30));
+            if ops[1].x != (sz == 3) {
+                bad(A, m);  // (an x register for 2d, a w register for the others)
+                return true;
+            }
+            w32(A, (ae.dup_gen(@bit_cast(u64, sz), ops[0].reg, ops[1].reg) & ~(@as(u64, 1) << 30)) | (q << 30));
             return true;
         }
         if elem(&ops[1]) != sz {
             bad(A, m);
             return true;
         }
-        w32(A, ae.dup_elem(@bit_cast(u64, sz), idx(&ops[1]), ops[0].reg, ops[1].reg) | (q << 30));
+        w32(A,
+            (ae.dup_elem(@bit_cast(u64, sz), idx(&ops[1]), ops[0].reg, ops[1].reg) & ~(@as(u64, 1) << 30)) | (q << 30));
         return true;
     }
     if u.str_eq(m, "ins") {
@@ -2704,8 +2761,43 @@ fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         }
         return true;
     }
-    if u.str_eq(m, "movi") {
-        if not n_ops(A, ops, 2, m) {
+    if u.str_eq(m, "movi") or u.str_eq(m, "mvni") {
+        let inv = m[1] == 'v';
+        if ((ops.len == 2) or (ops.len == 3)) and (ops[0].kind == AK_VREG) and (ops[0].view == 'v') {
+            let mut q: u64 = 0;
+            let s1: [1]AOp = [ops[0]];
+            let sz = same_arr(s1[..], &mut q);
+            if (sz == 1) or (sz == 2) {
+                // 0 Q op 0111100000 abc cmode 01 defgh Rd; cmode: 32-bit 0xx0 (lsl 8x), 16-bit 10x0
+                let x = konst(A, &ops[1], "the immediate");
+                let mut shift: i64 = 0;
+                if ops.len == 3 {
+                    if (ops[2].kind != AK_SHIFT) or (ops[2].sh != SH_LSL) {
+                        bad(A, m);
+                        return true;
+                    }
+                    shift = @as(i64, ops[2].amt);
+                }
+                let maxs = pick_i64(sz == 1, 8, 24);
+                if (x < 0) or (x > 255) or (shift < 0) or (shift > maxs) or ((shift % 8) != 0) {
+                    bad(A, m);
+                    return true;
+                }
+                let mut cmode = @bit_cast(u64, (shift / 8) << 1);
+                if sz == 1 {
+                    cmode = cmode | 8;
+                }
+                let xu = @bit_cast(u64, x);
+                w32(A,
+                    ((((0x0f000400 | (q << 30)) | (bx(inv) << 29)) | (((xu >> 5) & 7) << 16)) | (cmode << 12)) |
+                    (((xu & 31) << 5) | r5(ops[0].reg)));
+                return true;
+            }
+        }
+        if inv or not n_ops(A, ops, 2, m) {
+            if inv {
+                bad(A, m);
+            }
             return true;
         }
         let x = konst(A, &ops[1], "the immediate");
@@ -2799,7 +2891,7 @@ fn simd(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
 // -----------------------------------------------------------------------------
 // Operands of asm statements
 // -----------------------------------------------------------------------------
-/// The text of operand o with modifier `mod` (GCC's AArch64 modifiers: w
+/// The text of operand o with modifier `mod` (the dialect's AArch64 modifiers: w
 /// and x for a general register's widths (of the constant 0: wzr, xzr),
 /// b h s d q for a floating-point and vector register's views, c for a
 /// constant, n for its negation); `err` says why not.

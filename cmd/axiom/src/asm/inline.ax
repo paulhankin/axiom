@@ -48,7 +48,18 @@ pub struct Op {
     name: []u8,   // the operand's symbolic name, for `%[name]` (empty: none)
     q: bool,      // OK_MEM of AArch64's Q: addressed by a base register alone
     sym: bool,    // OK_IMM: an address (a symbol's, plus a constant)
+    via: u8,      // OK_MEM of a register the compiler does not allocate (VIA_*): its value goes through memory
+    x87: u8,      // VIA_X87: the constraint ('t' st(0), 'u' st(1), 'f' any)
+    inout: bool,  // an output also read ('+')
 }
+
+// Registers an operand can be in that the compiler never allocates: the
+// operand has a memory location, and the template is wrapped with the moves
+// between it and the register (expand).
+pub const VIA_NONE: u8 = 0;
+pub const VIA_K: u8 = 1;    // an AVX-512 mask register (x86-64 'k')
+pub const VIA_MM: u8 = 2;   // an MMX register (x86-64 'y')
+pub const VIA_X87: u8 = 3;  // the x87 register stack (x86-64 't', 'u', 'f')
 
 /// An operand as the backend placed it (or check.ax's stand-in), which an
 /// architecture's `render` writes in its assembly syntax.
@@ -98,7 +109,10 @@ pub struct Blob {
     memory: bool,  // "memory"
     volatile_: bool,
     goto_: bool,
-    loc: []u8,  // "file:line", for the messages of the backends
+    loc: []u8,    // "file:line", for the messages of the backends
+    stclob: u32,  // x86-64: the x87 registers clobbered (bit n: st(n)): inputs the template pops
+    kclob: u32,   // x86-64: the mask registers clobbered (bit n: kn)
+    mmclob: u32,  // x86-64: the MMX registers clobbered
 }
 
 /// A list of blobs in permanent memory (the IR's lifetime: the front end's
@@ -175,6 +189,8 @@ pub struct Con {
     imm_letter: u8,  // the letter that asked for the constant (I, K, ...), for messages
     tie: i32,        // a matching constraint: the operand number, or -1
     tie_name: []u8,  // a matching constraint by name ([name])
+    via: u8,         // VIA_*: a register the compiler does not allocate
+    x87: u8,
 }
 
 fn no_con(msg: []u8) Con {
@@ -187,7 +203,7 @@ fn no_con(msg: []u8) Con {
 fn new_con() Con {
     return Con.{ ok: true, msg: "", output: false, inout: false, early: false, reg: false, cls: CL_GPR, fixed: -1,
                  subset: 0, mem: false, mem_q: false, imm: false, imm_lo: 0, imm_hi: 0, sym_ok: false, imm_letter: 0,
-                 tie: -1, tie_name: "" };
+                 tie: -1, tie_name: "", via: VIA_NONE, x87: 0 };
 }
 
 fn set_imm(c: *mut Con, lo: i64, hi: i64, which: u8) void {
@@ -253,6 +269,13 @@ pub fn constraint(arch: i32, s: []u8, output: bool) Con {
             i -= 1;
             c.tie = n;
             seen = true;
+        } else if x86 and (ch == 'Y') and ((i + 1) < s.len) and (s[i + 1] == 'z') {
+            // Yz: the first SSE register, xmm0
+            c.reg = true;
+            c.cls = CL_VEC;
+            c.fixed = 16;
+            seen = true;
+            i += 1;
         } else {
             let ok = letter(&mut c, arch, ch, x86);
             if not ok.ok {
@@ -306,7 +329,7 @@ fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
         return ok;
     }
     if x86 {
-        // x86-64 (GCC's machine constraints for i386 in 64-bit mode)
+        // x86-64 (the dialect's machine constraints for x86-64)
         let fixed = "abcdSD";
         let regs: [6]i32 = [0, 3, 1, 2, 6, 7];  // rax rbx rcx rdx rsi rdi
         for k in 0..fixed.len {
@@ -372,9 +395,21 @@ fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
             c.sym_ok = true;
             return ok;
         }
-        if (ch == 'A') or (ch == 't') or (ch == 'u') or (ch == 'f') or (ch == 'y') or (ch == 'k') {
-            return no_con(u.f1("the constraint '%s' (x87, MMX, mask or register-pair operands) is not supported",
-                               ch_text(ch)));
+        if (ch == 'k') or (ch == 'y') or (ch == 't') or (ch == 'u') or (ch == 'f') {
+            // a mask, MMX or x87 register: the operand's value goes through memory (expand)
+            c.mem = true;
+            c.via = VIA_X87;
+            if ch == 'k' {
+                c.via = VIA_K;
+            } else if ch == 'y' {
+                c.via = VIA_MM;
+            } else {
+                c.x87 = ch;
+            }
+            return ok;
+        }
+        if ch == 'A' {
+            return no_con("the constraint 'A' (a value in the rdx:rax pair) is not supported");
         }
         return no_con(u.f1("'%s' is not a constraint of x86-64", ch_text(ch)));
     }
@@ -492,6 +527,58 @@ pub fn x86_reg(n: []u8) RegName {
         }
     }
     return rn(-1, CL_GPR, 0);
+}
+
+/// A clobber of x86-64's wider vector registers: ymm0-15 and zmm0-15 are
+/// their xmm register (the compiler holds values in the low 128 bits only;
+/// on Windows the upper halves are volatile, so only the xmm part is ever
+/// saved); xmm16-31, ymm16-31 and zmm16-31, which the compiler holds no value
+/// in across an asm statement, and the mask, MMX and x87 registers name
+/// nothing to save: -1 for those, else the register, or -2 if n is none.
+pub fn x86_wide_clobber(n0: []u8) i32 {
+    let mut n = n0;
+    if (n.len > 0) and (n[0] == '%') {
+        n = n[1..];
+    }
+    let pre = ["xmm", "ymm", "zmm"];
+    for p in pre {
+        if u.starts(n, p) and (n.len >= 4) and (n.len <= 5) {
+            let k = num(n[3..]);
+            if (k >= 0) and (k < 16) {
+                return 16 + @int_cast(i32, k);
+            }
+            if (k >= 16) and (k < 32) {
+                return -1;
+            }
+        }
+    }
+    return -2;
+}
+
+/// The x87 register a clobber names (st, st(n)), mask register (k0-k7) or
+/// MMX register (mm0-mm7): (kind 1, 2, 3; n), or kind 0.
+pub fn x86_special_clobber(n0: []u8, which: *mut i32) i32 {
+    let mut n = n0;
+    if (n.len > 0) and (n[0] == '%') {
+        n = n[1..];
+    }
+    if u.str_eq(n, "st") {
+        which.* = 0;
+        return 1;
+    }
+    if (n.len == 5) and u.starts(n, "st(") and (n[4] == ')') and (n[3] >= '0') and (n[3] <= '7') {
+        which.* = @as(i32, n[3] - '0');
+        return 1;
+    }
+    if (n.len == 2) and (n[0] == 'k') and (n[1] >= '0') and (n[1] <= '7') {
+        which.* = @as(i32, n[1] - '0');
+        return 2;
+    }
+    if (n.len == 3) and u.starts(n, "mm") and (n[2] >= '0') and (n[2] <= '7') {
+        which.* = @as(i32, n[2] - '0');
+        return 3;
+    }
+    return 0;
 }
 
 /// The text of x86-64 register r at a width (bits; hi8: the high byte).
@@ -754,7 +841,7 @@ pub fn modifier_ok(arch: i32, m: u8) bool {
         return true;
     }
     if arch == tg.ARCH_X64 {
-        return u.find("abwkqhcnPpVzxAHt", m) >= 0;
+        return u.find("abwkqhcnPpVzxAHtg", m) >= 0;
     }
     return u.find("wxbhsdqcnZ", m) >= 0;
 }
@@ -766,17 +853,224 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
     if b.basic {
         return b.text;
     }
+    let n = b.ops.len;
+    let vr = via_regs(b);
     let mut out = u.Buf.init();
-    for p in b.pieces {
-        if p.kind == PK_TEXT {
-            out.s(p.text);
-        } else if p.kind == PK_OP {
-            out.s(render(b, @int_cast(usize, p.op), p.mod));
-        } else if p.kind == PK_LABEL {
-            out.s(label(p.op));
+    // operands in mask, MMX and x87 registers: their values from memory first
+    let mut maxpos: i32 = -1;
+    for k in 0..n {
+        let op = b.ops[k];
+        if (op.via == VIA_NONE) or (op.out and not op.inout) {
+            continue;
+        }
+        if op.via == VIA_K {
+            out.s(u.f3("kmov%s %s, %%k%s\n", kmask_sfx(op.bits), render(b, k, 0), u.idec(vr[k])));
+        } else if op.via == VIA_MM {
+            out.s(u.f3("mov%s %s, %%mm%s\n", u.pick(op.bits == 32, "d", "q"), render(b, k, 0), u.idec(vr[k])));
+        } else if vr[k] > maxpos {
+            maxpos = vr[k];
+        }
+    }
+    // (the x87 inputs pushed deepest first, so that st(p) holds the one at position p)
+    let mut p = maxpos;
+    while p >= 0 {
+        for k in 0..n {
+            let op = b.ops[k];
+            if (op.via == VIA_X87) and (not op.out or op.inout) and (vr[k] == p) and not x87_tied_dup(b, k, vr) {
+                out.s(u.f2("fld%s %s\n", x87_sfx(op.bits), render(b, k, 0)));
+                break;
+            }
+        }
+        p -= 1;
+    }
+    for pc in b.pieces {
+        if pc.kind == PK_TEXT {
+            out.s(pc.text);
+        } else if pc.kind == PK_OP {
+            let k = @int_cast(usize, pc.op);
+            if (k < n) and (b.ops[k].via != VIA_NONE) {
+                out.s(via_text(b.ops[k], vr[k]));
+            } else {
+                out.s(render(b, k, pc.mod));
+            }
+        } else if pc.kind == PK_LABEL {
+            out.s(label(pc.op));
         } else {
             out.s(u.udec(unique));
         }
     }
+    // and the outputs to memory after it: the x87 outputs popped in order,
+    // then the inputs the template left on the stack
+    let mut any = false;
+    for k in 0..n {
+        if b.ops[k].via != VIA_NONE {
+            any = true;
+        }
+    }
+    if not any {
+        return out.done();
+    }
+    out.s("\n");
+    for k in 0..n {
+        let op = b.ops[k];
+        if not op.out or (op.via == VIA_NONE) {
+            continue;
+        }
+        if op.via == VIA_K {
+            out.s(u.f3("kmov%s %%k%s, %s\n", kmask_sfx(op.bits), u.idec(vr[k]), render(b, k, 0)));
+        } else if op.via == VIA_MM {
+            out.s(u.f3("mov%s %%mm%s, %s\n", u.pick(op.bits == 32, "d", "q"), u.idec(vr[k]), render(b, k, 0)));
+        }
+    }
+    let mut nout: i32 = 0;
+    for k in 0..n {
+        if b.ops[k].out and (b.ops[k].via == VIA_X87) {
+            nout += 1;
+        }
+    }
+    for pos in @as(i32, 0)..nout {
+        for k in 0..n {
+            let op = b.ops[k];
+            if op.out and (op.via == VIA_X87) and (vr[k] == pos) {
+                out.s(u.f2("fstp%s %s\n", x87_sfx(op.bits), render(b, k, 0)));
+            }
+        }
+    }
+    for _k in @as(i32, 0)..x87_survivors(b, vr) {
+        out.s("fstp %st(0)\n");
+    }
     return out.done();
+}
+
+/// The register each operand of a mask, MMX or x87 register is in (k1-k7,
+/// mm0-mm7 not clobbered, in operand order; an x87 operand's stack position:
+/// 't' 0, 'u' 1, 'f' the next after them, outputs and inputs apart; an input
+/// tied to an output, its output's); -1 for the others.
+pub fn via_regs(b: *Blob) []i32 {
+    let n = b.ops.len;
+    let vr = u.newn.[i32](n + 1);
+    let mut nextk: i32 = 1;
+    let mut nextmm: i32 = 0;
+    let mut fixed_out: i32 = 0;
+    let mut fixed_in: i32 = 0;
+    for k in 0..n {
+        vr[k] = -1;
+        let op = b.ops[k];
+        if (op.via == VIA_X87) and ((op.x87 == 't') or (op.x87 == 'u')) {
+            let pos = @as(i32, op.x87 - 't');  // (t 0, u 1)
+            if op.out or (op.tie >= 0) {
+                fixed_out = @max(fixed_out, pos + 1);
+            }
+            if not op.out or op.inout {
+                fixed_in = @max(fixed_in, pos + 1);
+            }
+        }
+    }
+    let mut nextf_out = fixed_out;
+    let mut nextf_in = fixed_in;
+    for k in 0..n {
+        let op = b.ops[k];
+        if op.via == VIA_NONE {
+            continue;
+        }
+        if (op.tie >= 0) and (b.ops[@int_cast(usize, op.tie)].via == op.via) {
+            vr[k] = vr[@int_cast(usize, op.tie)];
+            continue;
+        }
+        if op.via == VIA_K {
+            while (nextk < 8) and ((b.kclob & (@as(u32, 1) << @int_cast(u32, nextk))) != 0) {
+                nextk += 1;
+            }
+            vr[k] = nextk;
+            nextk += 1;
+        } else if op.via == VIA_MM {
+            while (nextmm < 8) and ((b.mmclob & (@as(u32, 1) << @int_cast(u32, nextmm))) != 0) {
+                nextmm += 1;
+            }
+            vr[k] = nextmm;
+            nextmm += 1;
+        } else if (op.x87 == 't') or (op.x87 == 'u') {
+            vr[k] = @as(i32, op.x87 - 't');
+        } else if op.out {
+            vr[k] = nextf_out;
+            nextf_out += 1;
+        } else {
+            vr[k] = nextf_in;
+            nextf_in += 1;
+        }
+    }
+    return vr;
+}
+
+// Is input k of the x87 stack tied to an output that is also an input
+// ('+t' and a "0" input): loaded once.
+fn x87_tied_dup(b: *Blob, k: usize, vr: []i32) bool {
+    _ = vr;
+    let op = b.ops[k];
+    if op.tie < 0 {
+        return false;
+    }
+    return b.ops[@int_cast(usize, op.tie)].inout;
+}
+
+/// The x87 inputs the template leaves on the stack (neither tied to an
+/// output nor in a clobbered st register, which it pops), popped after it.
+pub fn x87_survivors(b: *Blob, vr: []i32) i32 {
+    let mut seen: u32 = 0;
+    let mut consumed: u32 = 0;
+    for k in 0..b.ops.len {
+        let op = b.ops[k];
+        if (op.via != VIA_X87) or (vr[k] < 0) or (op.out and not op.inout) {
+            continue;
+        }
+        let bit = @as(u32, 1) << @int_cast(u32, vr[k]);
+        seen = seen | bit;
+        if (op.tie >= 0) or op.inout or ((b.stclob & bit) != 0) {
+            consumed = consumed | bit;
+        }
+    }
+    let mut n: i32 = 0;
+    for p in @as(u32, 0)..8 {
+        let bit = @as(u32, 1) << p;
+        if ((seen & bit) != 0) and ((consumed & bit) == 0) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn via_text(op: Op, r: i32) []u8 {
+    if op.via == VIA_K {
+        return u.cat2("%k", u.idec(r));
+    }
+    if op.via == VIA_MM {
+        return u.cat2("%mm", u.idec(r));
+    }
+    if r == 0 {
+        return "%st";
+    }
+    return u.f1("%%st(%s)", u.idec(r));
+}
+
+fn kmask_sfx(bits: u32) []u8 {
+    if bits <= 8 {
+        return "b";
+    }
+    if bits <= 16 {
+        return "w";
+    }
+    if bits <= 32 {
+        return "d";
+    }
+    return "q";
+}
+
+fn x87_sfx(bits: u32) []u8 {
+    if bits == 32 {
+        return "s";
+    }
+    if bits == 64 {
+        return "l";
+    }
+    return "t";
 }

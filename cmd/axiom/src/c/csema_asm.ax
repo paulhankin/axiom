@@ -9,7 +9,7 @@
 // C3901 for what this implementation does not support (inline assembly on
 // WebAssembly, constraints it does not know).
 //
-// The rules (GCC's "Extended Asm"): an output's constraint begins with '='
+// The rules (the GNU dialect's extended asm): an output's constraint begins with '='
 // or '+' and its operand is a modifiable lvalue; '+' makes it an input too
 // (an operand of its own after the inputs, tied to it, not referred to by
 // the template); a matching constraint (a digit, or [name]) ties an input to
@@ -209,6 +209,31 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         }
         return true;
     }
+    if c.via != ai.VIA_NONE {
+        // a mask, MMX or x87 register (its value through memory: asm/inline.ax, expand)
+        let mut n = cty.size_of(t) * 8;
+        let mut fits = false;
+        if c.via == ai.VIA_K {
+            fits = (cty.is_integer(t) or cty.is_pointer(t)) and (n >= 8) and (n <= 64) and not cty.is_wint(t);
+        } else if c.via == ai.VIA_MM {
+            fits = (cty.is_scalar(t) and not cty.is_complex(t) and not cty.is_wint(t)) and ((n == 32) or (n == 64));
+        } else {
+            // (the x87 loads and stores float, double and the 80-bit long double)
+            fits = cty.is_floating(t) and not cty.is_complex(t) and
+                   ((n == 32) or (n == 64) or (cty.is_wide(t) and (cty.ld_bits() == 80)));
+            if fits and (n > 64) {
+                n = 80;
+            }
+        }
+        if not fits {
+            bad(o.span, u.f2("an operand of type %s cannot be in the registers of the constraint '%s'", cs.tq(e.ty),
+                             o.constraint));
+            return false;
+        }
+        op.via = c.via;
+        op.x87 = c.x87;
+        op.bits = @truncate(u32, n);
+    }
     if c.mem {
         if not e.lvalue and output {
             bad(o.span, "a memory output must be an lvalue");
@@ -269,13 +294,14 @@ pub fn stmt(a: *mut cast.Asm) void {
         let o = a.outputs.get(k);
         let c = ai.constraint(arch, o.constraint, true);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: true, early: false, tie: -1, bits: 0, fp: false,
-                             name: "", q: false, sym: false };
+                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false };
         if not c.ok {
             report_con(o, c.msg);
             ok = false;
         } else if not cx.modifiable(o.e, "an asm output") {
             ok = false;
         } else if choose(o, o.e, &c, true, &mut op) {
+            op.inout = c.inout;
             if c.inout {
                 if (op.kind != ai.OK_REG) and (op.kind != ai.OK_FIXED) and (op.kind != ai.OK_MEM) {
                     ok = false;
@@ -293,7 +319,7 @@ pub fn stmt(a: *mut cast.Asm) void {
         let o = a.inputs.get(k);
         let c = ai.constraint(arch, o.constraint, false);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: false, early: false, tie: -1, bits: 0, fp: false,
-                             name: "", q: false, sym: false };
+                             name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false };
         let mut e = o.e;
         if not c.ok {
             report_con(o, c.msg);
@@ -323,7 +349,19 @@ pub fn stmt(a: *mut cast.Asm) void {
                 // (reported)
             } else if tie >= 0 {
                 let to = ops.get(@int_cast(usize, tie));
-                if (to.kind != ai.OK_REG) and (to.kind != ai.OK_FIXED) {
+                if to.via != ai.VIA_NONE {
+                    // (the output's mask, MMX or x87 register: the input's value through memory)
+                    e = cx.value_of(e);
+                    let mut c2 = c;
+                    c2.via = to.via;
+                    c2.x87 = to.x87;
+                    c2.mem = true;
+                    if choose(o, e, &c2, false, &mut op) {
+                        op.tie = tie;
+                    } else {
+                        ok = false;
+                    }
+                } else if (to.kind != ai.OK_REG) and (to.kind != ai.OK_FIXED) {
                     bad(o.cspan, "a matching constraint ties an input to an output in a register");
                     ok = false;
                 } else {
@@ -374,6 +412,31 @@ pub fn stmt(a: *mut cast.Asm) void {
     }
     // clobbers
     for c in a.clobbers.items() {
+        if arch == tg.ARCH_X64 {
+            let mut which: i32 = 0;
+            let sk = ai.x86_special_clobber(c.name, &mut which);
+            let bit = @as(u32, 1) << @int_cast(u32, which & 7);
+            if sk == 1 {
+                b.stclob = b.stclob | bit;
+                continue;
+            }
+            if sk == 2 {
+                b.kclob = b.kclob | bit;
+                continue;
+            }
+            if sk == 3 {
+                b.mmclob = b.mmclob | bit;
+                continue;
+            }
+            let wr = ai.x86_wide_clobber(c.name);
+            if wr == -1 {
+                continue;  // (xmm16-31, ymm16-31, zmm16-31: the compiler keeps nothing there across it)
+            }
+            if wr >= 0 {
+                b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, wr));
+                continue;
+            }
+        }
         let kind = ai.clobber_kind(arch, c.name);
         if kind == 2 {
             b.memory = true;
@@ -395,6 +458,77 @@ pub fn stmt(a: *mut cast.Asm) void {
             continue;
         }
         b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, r.reg));
+    }
+    // operands in mask, MMX and x87 registers: the rules of the x87 stack (the dialect's
+    // documentation of extended asm: the outputs and inputs in st(0) up, 't'
+    // before 'u'; the inputs the template pops, clobbered, are the topmost)
+    if ok and (arch == tg.ARCH_X64) {
+        let mut nk: u32 = 0;
+        let mut nmm: u32 = 0;
+        let mut out_t = false;
+        let mut out_u = false;
+        let mut in_t = false;
+        let mut in_u = false;
+        let mut nx87: u32 = 0;
+        for i in 0..ops.len {
+            let op = ops.get(i);
+            if op.via == ai.VIA_NONE {
+                continue;
+            }
+            if a.goto_ and op.out {
+                bad(a.span, "an asm goto cannot have outputs in mask, MMX or x87 registers");
+                ok = false;
+            }
+            if op.via == ai.VIA_K {
+                nk += 1;
+            } else if op.via == ai.VIA_MM {
+                nmm += 1;
+            } else {
+                nx87 += 1;
+                let is_in = not op.out or op.inout;
+                if op.out and (op.x87 == 't') {
+                    out_t = true;
+                }
+                if op.out and (op.x87 == 'u') {
+                    out_u = true;
+                }
+                if is_in and (op.x87 == 't') {
+                    in_t = true;
+                }
+                if is_in and (op.x87 == 'u') {
+                    in_u = true;
+                }
+                if (op.tie >= 0) and (ops.get(@int_cast(usize, op.tie)).x87 == 't') {
+                    in_t = true;
+                }
+                if (op.tie >= 0) and (ops.get(@int_cast(usize, op.tie)).x87 == 'u') {
+                    in_u = true;
+                }
+            }
+        }
+        if (out_u and not out_t) or (in_u and not in_t) {
+            bad(a.span, "an x87 operand in st(1) ('u') needs one in st(0) ('t')");
+            ok = false;
+        }
+        // (consumed: popped, clobbered, or replaced by the output tied to it)
+        let mut consumed = b.stclob;
+        for i in 0..ops.len {
+            let op = ops.get(i);
+            if (op.via == ai.VIA_X87) and ((op.tie >= 0) or op.inout) {
+                let x = ops.get(pick_us(op.tie >= 0, @int_cast(usize, @max(op.tie, 0)), i)).x87;
+                if (x == 't') or (x == 'u') {
+                    consumed = consumed | (@as(u32, 1) << @as(u32, x - 't'));
+                }
+            }
+        }
+        if (consumed != 0) and ((consumed & (consumed + 1)) != 0) {
+            bad(a.span, "the x87 registers an asm pops (its clobbers) must be the topmost, st(0) up");
+            ok = false;
+        }
+        if (nk > 7) or (nmm > 8) or (nx87 > 8) {
+            bad(a.span, "an asm statement with more mask, MMX or x87 operands than there are registers");
+            ok = false;
+        }
     }
     // a fixed register is not clobbered, nor given to two operands that are not tied
     for i in 0..ops.len {
@@ -537,4 +671,11 @@ pub fn naked_body(f: *cast.CSym, body: *cast.Stmt) void {
         bad(x.span, u.f1("the body of the naked function '%s' can only be asm statements", f.name));
         return;
     }
+}
+
+fn pick_us(c: bool, a: usize, b: usize) usize {
+    if c {
+        return a;
+    }
+    return b;
 }

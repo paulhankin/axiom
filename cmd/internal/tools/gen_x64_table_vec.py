@@ -81,21 +81,32 @@ INT_BW = {  # byte/word element, AVX-512BW (w0), tuple fvm
     'punpckhbw': '68', 'punpckhwd': '69', 'punpcklbw': '60', 'punpcklwd': '61', 'packsswb': '63',
     'packuswb': '67', 'packssdw': '6b', 'phaddw': None, 'phaddd': None,
 }
+CMPS = ('pcmpeqb', 'pcmpeqw', 'pcmpeqd', 'pcmpgtb', 'pcmpgtw', 'pcmpgtd')
 for n, c in INT_BW.items():
     if c is None:
         continue
-    vec_rvm(n, '66', '0f', c, tuple='fvm')
+    vec_rvm(n, '66', '0f', c, tuple='fvm', evex=n not in CMPS and n != 'psadbw')
+ln('vpsadbw', 'RVM', 'V,V,V/m', 'E.66.0f.wig', 'f6', '/r', 'lxyz', 'fvm')
 
 # dword/qword element (AVX-512F, w0 for d, w1 for q), tuple fv, broadcast
 INT_D = {'paddd': 'fe', 'psubd': 'fa', 'pcmpeqd': '76', 'pcmpgtd': '66', 'pmaxsd': ('38', '3d'),
          'pminsd': ('38', '39'), 'pmaxud': ('38', '3f'), 'pminud': ('38', '3b'), 'pmulld': ('38', '40'),
          'pmuludq': 'f4', 'punpckhdq': '6a', 'punpckldq': '62', 'punpckhqdq': '6d', 'punpcklqdq': '6c'}
 for n, c in INT_D.items():
-    q = n.endswith('q') or n in ('pmuludq', 'punpckhqdq', 'punpcklqdq')
+    q = n.endswith('qdq') or n in ('pmuludq',)
     if isinstance(c, tuple):
         vec_rvm(n, '66', '0f38', c[1], bc=8 if q else 4, dq=q)
     else:
-        vec_rvm(n, '66', '0f', c, bc=8 if q else 4, dq=q)
+        vec_rvm(n, '66', '0f', c, bc=8 if q else 4, dq=q, evex=n not in CMPS)
+# EVEX compares write a mask register (merging-masking only)
+for n, mp, c, ew, tp in [('pcmpeqb', '0f', '74', 'wig', 'fvm'), ('pcmpeqw', '0f', '75', 'wig', 'fvm'),
+                         ('pcmpgtb', '0f', '64', 'wig', 'fvm'), ('pcmpgtw', '0f', '65', 'wig', 'fvm'),
+                         ('pcmpeqd', '0f', '76', 'w0', 'fv b4'), ('pcmpgtd', '0f', '66', 'w0', 'fv b4'),
+                         ('pcmpeqq', '0f38', '29', 'w1', 'fv b8'), ('pcmpgtq', '0f38', '37', 'w1', 'fv b8')]:
+    ln('v' + n, 'RVM', 'k,V,V/m', 'E.66.%s.%s' % (mp, 'w0' if ew == 'wig' else ew), c, '/r', 'lxyz', *tp.split(), 'k')
+# (pcmpeqq and pcmpgtq: legacy and VEX)
+vec_rvm('pcmpeqq', '66', '0f38', '29', evex=False)
+vec_rvm('pcmpgtq', '66', '0f38', '37', evex=False)
 vec_rvm('paddq', '66', '0f', 'd4', bc=8, dq=True)
 vec_rvm('psubq', '66', '0f', 'fb', bc=8, dq=True)
 vec_rvm('pmuldq', '66', '0f38', '28', bc=8, dq=True)
@@ -112,16 +123,17 @@ for n, c in [('pand', 'db'), ('pandn', 'df'), ('por', 'eb'), ('pxor', 'ef')]:
 # arith4: those are handled there for legacy; add VEX+EVEX forms) ------------
 FLT = [('add', '58'), ('sub', '5c'), ('mul', '59'), ('div', '5e'), ('min', '5d'), ('max', '5f')]
 for n, c in FLT:
+    rnd = 'sae' if n in ('min', 'max') else 'er'
     # packed single (np.0f), packed double (66.0f): VEX+EVEX
     ln('v' + n + 'ps', 'RVM', 'V,V,V/m', 'V.np.0f.wig', c, '/r', 'lxy')
-    ln('v' + n + 'ps', 'RVM', 'V,V,V/m', 'E.np.0f.w0', c, '/r', 'lxyz', 'fv', 'b4', 'z', 'er')
+    ln('v' + n + 'ps', 'RVM', 'V,V,V/m', 'E.np.0f.w0', c, '/r', 'lxyz', 'fv', 'b4', 'z', rnd)
     ln('v' + n + 'pd', 'RVM', 'V,V,V/m', 'V.66.0f.wig', c, '/r', 'lxy')
-    ln('v' + n + 'pd', 'RVM', 'V,V,V/m', 'E.66.0f.w1', c, '/r', 'lxyz', 'fv', 'b8', 'z', 'er')
+    ln('v' + n + 'pd', 'RVM', 'V,V,V/m', 'E.66.0f.w1', c, '/r', 'lxyz', 'fv', 'b8', 'z', rnd)
     # scalar single/double
     ln('v' + n + 'ss', 'RVM', 'x,x,x/m', 'V.f3.0f.wig', c, '/r', 'lig')
-    ln('v' + n + 'ss', 'RVM', 'x,x,x/m', 'E.f3.0f.w0', c, '/r', 'lig', 'n4', 'z', 'er')
+    ln('v' + n + 'ss', 'RVM', 'x,x,x/m', 'E.f3.0f.w0', c, '/r', 'lig', 'n4', 'z', rnd)
     ln('v' + n + 'sd', 'RVM', 'x,x,x/m', 'V.f2.0f.wig', c, '/r', 'lig')
-    ln('v' + n + 'sd', 'RVM', 'x,x,x/m', 'E.f2.0f.w1', c, '/r', 'lig', 'n8', 'z', 'er')
+    ln('v' + n + 'sd', 'RVM', 'x,x,x/m', 'E.f2.0f.w1', c, '/r', 'lig', 'n8', 'z', rnd)
 for n, c in [('sqrt', '51')]:
     ln('v' + n + 'ps', 'RM', 'V,V/m', 'V.np.0f.wig', c, '/r', 'lxy')
     ln('v' + n + 'ps', 'RM', 'V,V/m', 'E.np.0f.w0', c, '/r', 'lxyz', 'fv', 'b4', 'z', 'er')
@@ -202,7 +214,7 @@ ln('vpbroadcastw', 'RM', 'V,x/m', 'V.66.0f38.w0', '79', '/r', 'lxy')
 ln('vpbroadcastd', 'RM', 'V,x/m', 'V.66.0f38.w0', '58', '/r', 'lxy')
 ln('vpbroadcastq', 'RM', 'V,x/m', 'V.66.0f38.w0', '59', '/r', 'lxy')
 ln('vpbroadcastb', 'RM', 'V,x/m', 'E.66.0f38.w0', '78', '/r', 'lxyz', 'n1', 'z')
-ln('vpbroadcastw', 'RM', 'V,x/m', 'E.66.0f38.w1', '79', '/r', 'lxyz', 'n2', 'z')
+ln('vpbroadcastw', 'RM', 'V,x/m', 'E.66.0f38.w0', '79', '/r', 'lxyz', 'n2', 'z')
 ln('vpbroadcastd', 'RM', 'V,x/m', 'E.66.0f38.w0', '58', '/r', 'lxyz', 'n4', 'z')
 ln('vpbroadcastq', 'RM', 'V,x/m', 'E.66.0f38.w1', '59', '/r', 'lxyz', 'n8', 'z')
 
@@ -222,9 +234,9 @@ for base, add in OPADD.items():
         for suf, ew, bc, pp in [('ps', 'w0', 4, '66'), ('pd', 'w1', 8, '66')]:
             code = o + ({'madd': 0, 'msub': 2, 'nmadd': 4, 'nmsub': 6, 'maddsub': -2, 'msubadd': -1}[base])
             if base == 'maddsub':
-                code = o + 6
+                code = o - 2
             elif base == 'msubadd':
-                code = o + 7
+                code = o - 1
             nm = 'vf%s%s%s' % (base, order, suf)
             ln(nm, 'RVM', 'V,V,V/m', 'V.66.0f38.%s' % ('w0' if suf == 'ps' else 'w1'), '%02x' % code, '/r', 'lxy')
             ln(nm, 'RVM', 'V,V,V/m', 'E.66.0f38.%s' % ew, '%02x' % code, '/r', 'lxyz', 'fv', 'b%d' % bc, 'z', 'er')
@@ -249,7 +261,15 @@ ln('vcvtps2dq', 'RM', 'V,V/m', 'V.66.0f.wig', '5b', '/r', 'lxy')
 ln('vcvtps2dq', 'RM', 'V,V/m', 'E.66.0f.w0', '5b', '/r', 'lxyz', 'fv', 'b4', 'z', 'er')
 ln('vcvttps2dq', 'RM', 'V,V/m', 'V.f3.0f.wig', '5b', '/r', 'lxy')
 ln('vcvttps2dq', 'RM', 'V,V/m', 'E.f3.0f.w0', '5b', '/r', 'lxyz', 'fv', 'b4', 'z', 'sae')
-ln('vcvtpd2ps', 'RM', 'V,V/m', 'V.66.0f.wig', '5a', '/r', 'lxy')
+ln('vcvtpd2ps', 'RM', 'x,x', 'V.66.0f.wig', '5a', '/r', 'lx')
+ln('vcvtpd2ps', 'RM', 'x,y', 'V.66.0f.wig', '5a', '/r', 'ly')
+ln('vcvtpd2psx', 'RM', 'x,x/m', 'V.66.0f.wig', '5a', '/r', 'lx')
+ln('vcvtpd2psy', 'RM', 'x,y/m', 'V.66.0f.wig', '5a', '/r', 'ly')
+ln('vcvtpd2ps', 'RM', 'y,z/m', 'E.66.0f.w1', '5a', '/r', 'lz', 'fv', 'b8', 'z', 'er')
+ln('vcvtpd2psx', 'RM', 'x,x/m', 'E.66.0f.w1', '5a', '/r', 'lx', 'fv', 'b8', 'z')
+ln('vcvtpd2psy', 'RM', 'x,y/m', 'E.66.0f.w1', '5a', '/r', 'ly', 'fv', 'b8', 'z')
+ln('vcvtpd2ps', 'RM', 'x,x', 'E.66.0f.w1', '5a', '/r', 'lx', 'fv', 'b8', 'z')
+ln('vcvtpd2ps', 'RM', 'x,y', 'E.66.0f.w1', '5a', '/r', 'ly', 'fv', 'b8', 'z')
 ln('vcvtps2pd', 'RM', 'V,H/m', 'V.np.0f.wig', '5a', '/r', 'lxy')
 ln('vcvtps2pd', 'RM', 'V,H/m', 'E.np.0f.w0', '5a', '/r', 'lxyz', 'hv', 'b4', 'z', 'sae')
 ln('vcvtsd2ss', 'RVM', 'x,x,x/m', 'V.f2.0f.wig', '5a', '/r', 'lig')
@@ -274,6 +294,8 @@ ln('vmovsd', 'RM', 'x,m', 'V.f2.0f.wig', '10', '/r', 'lig')
 ln('vmovsd', 'MR', 'm,x', 'V.f2.0f.wig', '11', '/r', 'lig')
 
 # movd/movq via VEX+EVEX
+ln('vmovq', 'RM', 'x,x/m', 'V.f3.0f.wig', '7e', '/r', 'lig')
+ln('vmovq', 'MR', 'x/m,x', 'V.66.0f.wig', 'd6', '/r', 'lig')
 ln('vmovd', 'RM', 'x,r32/m', 'V.66.0f.w0', '6e', '/r', 'lig')
 ln('vmovd', 'MR', 'r32/m,x', 'V.66.0f.w0', '7e', '/r', 'lig')
 ln('vmovq', 'RM', 'x,r64/m', 'V.66.0f.w1', '6e', '/r', 'lig')
@@ -302,7 +324,16 @@ ln('vpshufb', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', '00', '/r', 'lxyz', 'fvm', 'z')
 for n, c, d in [('psrlw', '71', 2), ('psraw', '71', 4), ('psllw', '71', 6), ('psrld', '72', 2),
                 ('psrad', '72', 4), ('pslld', '72', 6), ('psrlq', '73', 2), ('psllq', '73', 6),
                 ('psrldq', '73', 3), ('pslldq', '73', 7)]:
-    ln('v' + n, 'VMI', 'V,V/m,i', 'V.66.0f.wig', c, '/%d' % d, 'lxy')
+    ln('v' + n, 'VMI', 'V,V,i', 'V.66.0f.wig', c, '/%d' % d, 'lxy')
+    if n.endswith('dq'):
+        ln('v' + n, 'VMI', 'V,V/m,i', 'E.66.0f.wig', c, '/%d' % d, 'lxyz', 'fvm')
+    elif n.endswith('w'):
+        ln('v' + n, 'VMI', 'V,V/m,i', 'E.66.0f.wig', c, '/%d' % d, 'lxyz', 'fvm', 'z')
+    elif n.endswith('d'):
+        ln('v' + n, 'VMI', 'V,V/m,i', 'E.66.0f.w0', c, '/%d' % d, 'lxyz', 'fv', 'b4', 'z')
+    else:
+        ln('v' + n, 'VMI', 'V,V/m,i', 'E.66.0f.w1', c, '/%d' % d, 'lxyz', 'fv', 'b8', 'z')
+ln('vpsraq', 'VMI', 'V,V/m,i', 'E.66.0f.w1', '72', '/4', 'lxyz', 'fv', 'b8', 'z')
 # shift by xmm
 for n, c in [('psrlw', 'd1'), ('psrld', 'd2'), ('psrlq', 'd3'), ('psraw', 'e1'), ('psrad', 'e2'),
              ('psllw', 'f1'), ('pslld', 'f2'), ('psllq', 'f3')]:
@@ -401,7 +432,8 @@ none('hlt', 'L.np.-.w0', 'f4')
 none('swapgs', 'L.np.0f.w0', '01 f8')
 none('iret', 'L.np.-.w0', 'cf')
 none('iretq', 'L.np.-.w1', 'cf')
-none('iretd', 'L.np.-.w0', 'cf')
+none('iretl', 'L.np.-.w0', 'cf')
+none('iretw', 'L.66.-.w0', 'cf')
 none('rsm', 'L.np.0f.w0', 'aa')
 none('wrmsr', 'L.np.0f.w0', '30')
 none('rdmsr', 'L.np.0f.w0', '32')
@@ -420,8 +452,12 @@ for n, d in [('invlpg', 7), ('lgdt', 2), ('lidt', 3), ('sgdt', 0), ('sidt', 1), 
              ('sldt', None), ('ltr', 3), ('str', 1), ('lmsw', 6), ('smsw', 4), ('verr', 4), ('verw', 5)]:
     if n in ('invlpg', 'lgdt', 'lidt', 'sgdt', 'sidt', 'lmsw', 'smsw'):
         ln(n, 'M', 'm', 'L.np.0f.w0', '01', '/%d' % d)
-for n, d in [('lldt', 2), ('sldt', 0), ('ltr', 3), ('str', 1), ('verr', 4), ('verw', 5)]:
-    ln(n, 'M', 'r16/m', 'L.np.0f.w0', '00', '/%d' % d)
+for n, d in [('lldt', 2), ('ltr', 3), ('verr', 4), ('verw', 5)]:
+    ln(n, 'M', 'r16/r32/r64/m', 'L.np.0f.w0', '00', '/%d' % d)
+for n, d in [('sldt', 0), ('str', 1)]:
+    ln(n, 'M', 'r16/r32/r64/m', 'L.np.0f.wo', '00', '/%d' % d)
+ln('smsw', 'M', 'r16/r32/r64', 'L.np.0f.wr', '01', '/4')
+ln('lmsw', 'M', 'r16', 'L.np.0f.w0', '01', '/6')
 # mov to/from control and debug registers
 ln('mov', 'MR', 'r64,cr', 'L.np.0f.w0', '20', '/r')
 ln('mov', 'RM', 'cr,r64', 'L.np.0f.w0', '22', '/r')
@@ -440,3 +476,128 @@ ln('wrussq', 'MR', 'm,r64', 'L.66.0f38.w1', 'f5', '/r')
 ln('rstorssp', 'M', 'm', 'L.f3.0f.w0', '01', '/5')
 none('setssbsy', 'L.f3.0f.w0', '01 e8')
 none('saveprevssp', 'L.f3.0f.w0', '01 ea')
+
+
+# -- Stage B: SSE4.2 strings, SHA, GFNI, AES/PCLMUL (VEX, EVEX), AVX-512 CD,
+# VNNI (and AVX-VNNI under {vex}), IFMA, VBMI, BITALG, VPOPCNTDQ, gathers and
+# scatters, permutes, compress/expand, down-conversions, in/out -------------
+for n, c in [('pcmpestrm', '60'), ('pcmpestri', '61'), ('pcmpistrm', '62'), ('pcmpistri', '63')]:
+    ln(n, 'RMI', 'x,x/m,i', 'L.66.0f3a.w0', c, '/r')
+    ln('v' + n, 'RMI', 'x,x/m,i', 'V.66.0f3a.wig', c, '/r', 'lx')
+for n, mp, c in [('sha1nexte', '0f38', 'c8'), ('sha1msg1', '0f38', 'c9'), ('sha1msg2', '0f38', 'ca'),
+                 ('sha256msg1', '0f38', 'cc'), ('sha256msg2', '0f38', 'cd')]:
+    ln(n, 'RM', 'x,x/m', 'L.np.%s.w0' % mp, c, '/r')
+ln('sha1rnds4', 'RMI', 'x,x/m,i', 'L.np.0f3a.w0', 'cc', '/r')
+ln('sha256rnds2', 'RM-', 'x,x/m,xmm0', 'L.np.0f38.w0', 'cb', '/r')
+ln('sha256rnds2', 'RM', 'x,x/m', 'L.np.0f38.w0', 'cb', '/r')
+# GFNI
+ln('gf2p8mulb', 'RM', 'x,x/m', 'L.66.0f38.w0', 'cf', '/r')
+ln('gf2p8affineqb', 'RMI', 'x,x/m,i', 'L.66.0f3a.w0', 'ce', '/r')
+ln('gf2p8affineinvqb', 'RMI', 'x,x/m,i', 'L.66.0f3a.w0', 'cf', '/r')
+ln('vgf2p8mulb', 'RVM', 'V,V,V/m', 'V.66.0f38.w0', 'cf', '/r', 'lxy')
+ln('vgf2p8mulb', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', 'cf', '/r', 'lxyz', 'fvm', 'z')
+for n, c in [('vgf2p8affineqb', 'ce'), ('vgf2p8affineinvqb', 'cf')]:
+    ln(n, 'RVMI', 'V,V,V/m,i', 'V.66.0f3a.w1', c, '/r', 'lxy')
+    ln(n, 'RVMI', 'V,V,V/m,i', 'E.66.0f3a.w1', c, '/r', 'lxyz', 'fv', 'b8', 'z')
+# AES and PCLMULQDQ: VEX (VAES, VPCLMULQDQ for ymm) and EVEX
+for n, c in [('aesenc', 'dc'), ('aesenclast', 'dd'), ('aesdec', 'de'), ('aesdeclast', 'df')]:
+    ln('v' + n, 'RVM', 'V,V,V/m', 'V.66.0f38.wig', c, '/r', 'lxy')
+    ln('v' + n, 'RVM', 'V,V,V/m', 'E.66.0f38.wig', c, '/r', 'lxyz', 'fvm')
+ln('vaesimc', 'RM', 'x,x/m', 'V.66.0f38.wig', 'db', '/r', 'lx')
+ln('vaeskeygenassist', 'RMI', 'x,x/m,i', 'V.66.0f3a.wig', 'df', '/r', 'lx')
+ln('vpclmulqdq', 'RVMI', 'V,V,V/m,i', 'V.66.0f3a.wig', '44', '/r', 'lxy')
+ln('vpclmulqdq', 'RVMI', 'V,V,V/m,i', 'E.66.0f3a.wig', '44', '/r', 'lxyz', 'fvm')
+for suf, imm in [('lqlq', 0x00), ('hqlq', 0x01), ('lqhq', 0x10), ('hqhq', 0x11)]:
+    ln('pclmul%sdq' % suf, 'RM', 'x,x/m', 'L.66.0f3a.w0', '44', '/r', 'imm=%d' % imm)
+    ln('vpclmul%sdq' % suf, 'RVM', 'V,V,V/m', 'V.66.0f3a.wig', '44', '/r', 'lxy', 'imm=%d' % imm)
+    ln('vpclmul%sdq' % suf, 'RVM', 'V,V,V/m', 'E.66.0f3a.wig', '44', '/r', 'lxyz', 'fvm', 'imm=%d' % imm)
+# AVX-512 CD
+for n, c, w, b in [('vpconflictd', 'c4', 'w0', 4), ('vpconflictq', 'c4', 'w1', 8), ('vplzcntd', '44', 'w0', 4),
+                   ('vplzcntq', '44', 'w1', 8)]:
+    ln(n, 'RM', 'V,V/m', 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'fv', 'b%d' % b, 'z')
+ln('vpbroadcastmb2q', 'RM', 'V,k', 'E.f3.0f38.w1', '2a', '/r', 'lxyz')
+ln('vpbroadcastmw2d', 'RM', 'V,k', 'E.f3.0f38.w0', '3a', '/r', 'lxyz')
+# VNNI (EVEX by default; the VEX forms of AVX-VNNI with {vex})
+for n, c in [('vpdpbusd', '50'), ('vpdpbusds', '51'), ('vpdpwssd', '52'), ('vpdpwssds', '53')]:
+    ln(n, 'RVM', 'V,V,V/m', 'E.66.0f38.w0', c, '/r', 'lxyz', 'fv', 'b4', 'z')
+    ln(n, 'RVM', 'V,V,V/m', 'V.66.0f38.w0', c, '/r', 'lxy', 'pvex')
+# IFMA
+for n, c in [('vpmadd52luq', 'b4'), ('vpmadd52huq', 'b5')]:
+    ln(n, 'RVM', 'V,V,V/m', 'E.66.0f38.w1', c, '/r', 'lxyz', 'fv', 'b8', 'z')
+# VBMI
+ln('vpermb', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', '8d', '/r', 'lxyz', 'fvm', 'z')
+ln('vpermi2b', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', '75', '/r', 'lxyz', 'fvm', 'z')
+ln('vpermt2b', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', '7d', '/r', 'lxyz', 'fvm', 'z')
+ln('vpmultishiftqb', 'RVM', 'V,V,V/m', 'E.66.0f38.w1', '83', '/r', 'lxyz', 'fv', 'b8', 'z')
+# BITALG and VPOPCNTDQ
+ln('vpopcntb', 'RM', 'V,V/m', 'E.66.0f38.w0', '54', '/r', 'lxyz', 'fvm', 'z')
+ln('vpopcntw', 'RM', 'V,V/m', 'E.66.0f38.w1', '54', '/r', 'lxyz', 'fvm', 'z')
+ln('vpopcntd', 'RM', 'V,V/m', 'E.66.0f38.w0', '55', '/r', 'lxyz', 'fv', 'b4', 'z')
+ln('vpopcntq', 'RM', 'V,V/m', 'E.66.0f38.w1', '55', '/r', 'lxyz', 'fv', 'b8', 'z')
+ln('vpshufbitqmb', 'RVM', 'k,V,V/m', 'E.66.0f38.w0', '8f', '/r', 'lxyz', 'fvm', 'k')
+# permutes (AVX-512)
+for n, c, w, b in [('vpermi2d', '76', 'w0', 4), ('vpermi2q', '76', 'w1', 8), ('vpermi2ps', '77', 'w0', 4),
+                   ('vpermi2pd', '77', 'w1', 8), ('vpermt2d', '7e', 'w0', 4), ('vpermt2q', '7e', 'w1', 8),
+                   ('vpermt2ps', '7f', 'w0', 4), ('vpermt2pd', '7f', 'w1', 8)]:
+    ln(n, 'RVM', 'V,V,V/m', 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'fv', 'b%d' % b, 'z')
+for n, c, w, b in [('vpermi2w', '75', 'w1', 0), ('vpermt2w', '7d', 'w1', 0), ('vpermw', '8d', 'w1', 0)]:
+    ln(n, 'RVM', 'V,V,V/m', 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'fvm', 'z')
+ln('vpermd', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', '36', '/r', 'lyz', 'fv', 'b4', 'z')
+ln('vpermq', 'RVM', 'V,V,V/m', 'E.66.0f38.w1', '36', '/r', 'lyz', 'fv', 'b8', 'z')
+ln('vpermps', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', '16', '/r', 'lyz', 'fv', 'b4', 'z')
+ln('vpermpd', 'RVM', 'V,V,V/m', 'E.66.0f38.w1', '16', '/r', 'lyz', 'fv', 'b8', 'z')
+ln('vpermq', 'RMI', 'V,V/m,i', 'E.66.0f3a.w1', '00', '/r', 'lyz', 'fv', 'b8', 'z')
+ln('vpermpd', 'RMI', 'V,V/m,i', 'E.66.0f3a.w1', '01', '/r', 'lyz', 'fv', 'b8', 'z')
+# compress and expand
+for n, c, w, nn in [('vpcompressd', '8b', 'w0', 4), ('vpcompressq', '8b', 'w1', 8), ('vcompressps', '8a', 'w0', 4),
+                    ('vcompresspd', '8a', 'w1', 8)]:
+    ln(n, 'MR', 'V/m,V', 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'n%d' % nn, 'z')
+for n, c, w, nn in [('vpexpandd', '89', 'w0', 4), ('vpexpandq', '89', 'w1', 8), ('vexpandps', '88', 'w0', 4),
+                    ('vexpandpd', '88', 'w1', 8)]:
+    ln(n, 'RM', 'V,V/m', 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'n%d' % nn, 'z')
+# broadcasts from a general register
+ln('vpbroadcastb', 'RM', 'V,r32', 'E.66.0f38.w0', '7a', '/r', 'lxyz', 'z')
+ln('vpbroadcastw', 'RM', 'V,r32', 'E.66.0f38.w0', '7b', '/r', 'lxyz', 'z')
+ln('vpbroadcastd', 'RM', 'V,r32', 'E.66.0f38.w0', '7c', '/r', 'lxyz', 'z')
+ln('vpbroadcastq', 'RM', 'V,r64', 'E.66.0f38.w1', '7c', '/r', 'lxyz', 'z')
+# variable shifts (AVX2, AVX-512)
+for n, c, w, b in [('vpsllvd', '47', 'w0', 4), ('vpsllvq', '47', 'w1', 8), ('vpsrlvd', '45', 'w0', 4),
+                   ('vpsrlvq', '45', 'w1', 8), ('vpsravd', '46', 'w0', 4)]:
+    ln(n, 'RVM', 'V,V,V/m', 'V.66.0f38.%s' % w, c, '/r', 'lxy')
+    ln(n, 'RVM', 'V,V,V/m', 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'fv', 'b%d' % b, 'z')
+ln('vpsravq', 'RVM', 'V,V,V/m', 'E.66.0f38.w1', '46', '/r', 'lxyz', 'fv', 'b8', 'z')
+# gathers (VEX: vvvv the mask; EVEX: a mask register, required) and scatters
+for n, c, w, dt, it, nn in [('vpgatherdd', '90', 'w0', 'V', 'vV', 4), ('vpgatherdq', '90', 'w1', 'V', 'vH', 8),
+                            ('vpgatherqd', '91', 'w0', 'H', 'vV', 4), ('vpgatherqq', '91', 'w1', 'V', 'vV', 8),
+                            ('vgatherdps', '92', 'w0', 'V', 'vV', 4), ('vgatherdpd', '92', 'w1', 'V', 'vH', 8),
+                            ('vgatherqps', '93', 'w0', 'H', 'vV', 4), ('vgatherqpd', '93', 'w1', 'V', 'vV', 8)]:
+    ln(n, 'RMV', '%s,%s,%s' % (dt, it, dt), 'V.66.0f38.%s' % w, c, '/r', 'lxy')
+    ln(n, 'RM', '%s,%s' % (dt, it), 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'n%d' % nn, 'kreq')
+for n, c, w, dt, it, nn in [('vpscatterdd', 'a0', 'w0', 'V', 'vV', 4), ('vpscatterdq', 'a0', 'w1', 'V', 'vH', 8),
+                            ('vpscatterqd', 'a1', 'w0', 'H', 'vV', 4), ('vpscatterqq', 'a1', 'w1', 'V', 'vV', 8),
+                            ('vscatterdps', 'a2', 'w0', 'V', 'vV', 4), ('vscatterdpd', 'a2', 'w1', 'V', 'vH', 8),
+                            ('vscatterqps', 'a3', 'w0', 'H', 'vV', 4), ('vscatterqpd', 'a3', 'w1', 'V', 'vV', 8)]:
+    ln(n, 'MR', '%s,%s' % (it, dt), 'E.66.0f38.%s' % w, c, '/r', 'lxyz', 'n%d' % nn, 'kreq')
+# down-conversions (vpmovdb and kin; s: saturating 0x10 below, us: unsigned 0x20 below)
+for n, c, part in [('vpmovqb', 0x32, 'O'), ('vpmovqw', 0x34, 'Q'), ('vpmovqd', 0x35, 'H'), ('vpmovdb', 0x31, 'Q'),
+                   ('vpmovdw', 0x33, 'H'), ('vpmovwb', 0x30, 'H')]:
+    tn = {'O': 'ovm', 'Q': 'qvm', 'H': 'hvm'}[part]
+    for pre, off in [('', 0), ('s', 0x10), ('us', 0x20)]:
+        ln(n[:5] + pre + n[5:], 'MR', '%s/m,V' % part, 'E.f3.0f38.w0', '%02x' % (c - off), '/r', 'lxyz', tn, 'z')
+# in and out (the port an imm8 or %dx)
+for n, r, pp in [('inb', 'al', 'np'), ('inw', 'ax', '66'), ('inl', 'eax', 'np')]:
+    op = 'e4' if r == 'al' else 'e5'
+    ln(n, '-I', '%s,i' % r, 'L.%s.-.w0' % pp, op)
+    ln('in', '-I', '%s,i' % r, 'L.%s.-.w0' % pp, op)
+    op2 = 'ec' if r == 'al' else 'ed'
+    ln(n, '--', '%s,dx' % r, 'L.%s.-.w0' % pp, op2)
+    ln('in', '--', '%s,dx' % r, 'L.%s.-.w0' % pp, op2)
+for n, r, pp in [('outb', 'al', 'np'), ('outw', 'ax', '66'), ('outl', 'eax', 'np')]:
+    op = 'e6' if r == 'al' else 'e7'
+    ln(n, 'I-', 'i,%s' % r, 'L.%s.-.w0' % pp, op)
+    ln('out', 'I-', 'i,%s' % r, 'L.%s.-.w0' % pp, op)
+    op2 = 'ee' if r == 'al' else 'ef'
+    ln(n, '--', 'dx,%s' % r, 'L.%s.-.w0' % pp, op2)
+    ln('out', '--', 'dx,%s' % r, 'L.%s.-.w0' % pp, op2)
+for n, c in [('insb', '6c'), ('insw', '6d'), ('insl', '6d'), ('outsb', '6e'), ('outsw', '6f'), ('outsl', '6f')]:
+    none(n, 'L.%s.-.w0' % ('66' if n.endswith('w') else 'np'), c)
