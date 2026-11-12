@@ -82,6 +82,9 @@ fn is_abs64(ty: u32) bool {
 // since dyld rebases (or binds) them.
 fn class_of(s: *elf.Sec) i32 {
     let k = s.kind;
+    if k == elf.S_DEBUG {
+        return nl.C_DEBUG;
+    }
     if k == elf.S_TEXT {
         return nl.C_TEXT;
     }
@@ -217,6 +220,9 @@ fn scan_relocs() void {
         let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
+            if nl.sec_cls.get(oi)[k] == nl.C_DEBUG {
+                continue;  // (nl.debug_sections)
+            }
             for r in s.relocs.items() {
                 if nl.is_got_reloc(false, r.ty) {
                     _ = nl.got_slot(oi, r.sym);
@@ -267,7 +273,7 @@ fn apply_relocs(b: []mut u8) void {
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
             let cls = nl.sec_cls.get(oi)[k];
-            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) {
+            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) {
                 continue;
             }
             let base = nl.sec_addr.get(oi)[k];
@@ -609,7 +615,80 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     @mem_copy(fv[uuid_at..uuid_at + 16], digest[0..16]);
     let sig = signature(fv, ident, le.sig_off, ly.text_size);
     f.put(sig);
-    return write_new(out, f.view());
+    let st = write_new(out, f.view());
+    if st == 0 {
+        return write_dsym(out, digest[0..16], &ly);
+    }
+    return st;
+}
+
+// -----------------------------------------------------------------------------
+// Debug information
+//
+// macOS's debugger reads DWARF from a debug bundle next to the executable,
+// <out>.dSYM, whose Contents/Resources/DWARF/<name> is a Mach-O file of type
+// MH_DSYM with the executable's UUID: its __DWARF segment holds the
+// sections (__debug_info, __debug_line, ...), and its __TEXT segment's
+// sections say where the code is (with no contents). The executable itself
+// is the same with and without -g (and has no debug map: our objects are
+// not kept). Written only when the objects have debug information (-g).
+// -----------------------------------------------------------------------------
+fn write_dsym(out: []u8, uuid: []u8, ly: *Layout) i32 {
+    let dbg = nl.debug_sections();
+    if dbg.len == 0 {
+        return 0;
+    }
+    let ncmds: u64 = 3;
+    let nsec = @as(u64, dbg.len);
+    let sizeofcmds = 24 + (72 + 80) + (72 + (nsec * 80));
+    let mut h = bn.new_bytes();
+    h.u32_(0xfeed_facf);  // MH_MAGIC_64
+    h.u32_(0x0100_000c);  // CPU_TYPE_ARM64
+    h.u32_(0);
+    h.u32_(0xa);  // MH_DSYM
+    h.u32_(ncmds);
+    h.u32_(sizeofcmds);
+    h.u32_(0);
+    h.u32_(0);
+    h.u32_(0x1b);  // LC_UUID
+    h.u32_(24);
+    h.put(uuid);
+    segment(&mut h, "__TEXT", BASE, ly.text_size, 0, 0, 5, 1);
+    section(&mut h, "__text", "__TEXT", text_addr, ly.text_end - text_addr, 0, 16, 0x8000_0400);
+    let mut size: u64 = 0;
+    for k in 0..dbg.len {
+        size += @as(u64, dbg.get(k).data.len());
+    }
+    let dw_off = nl.align_up(32 + sizeofcmds, 16);
+    let dw_addr = nl.align_up(data_addr + ly.data_vmsize, PAGE);
+    segment(&mut h, "__DWARF", dw_addr, nl.align_up(size, PAGE), dw_off, size, 7, nsec);
+    let mut at = dw_off;
+    for k in 0..dbg.len {
+        let d = dbg.get(k);
+        let n = @as(u64, d.data.len());
+        section(&mut h, u.f1("__%s", d.name[1..]), "__DWARF", dw_addr + (at - dw_off), n, at, 1, 0x0200_0000);  // S_ATTR_DEBUG
+        at += n;
+    }
+    while @as(u64, h.len()) < dw_off {
+        h.u8_(0);
+    }
+    for k in 0..dbg.len {
+        h.put(dbg.at(k).data.view());
+        dbg.at(k).data.free();
+    }
+    let name = u.basename(out);
+    let dir = u.f1("%s.dSYM/Contents/Resources/DWARF", out);
+    u.mkdirs(dir);
+    let plist = u.f3("%s%s%s", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n",
+                     u.f1("\t<key>CFBundleIdentifier</key>\n\t<string>com.apple.xcode.dsym.%s</string>\n", name),
+                     "\t<key>CFBundleInfoDictionaryVersion</key>\n\t<string>6.0</string>\n\t<key>CFBundlePackageType</key>\n\t<string>dSYM</string>\n\t<key>CFBundleSignature</key>\n\t<string>????</string>\n\t<key>CFBundleVersion</key>\n\t<string>1</string>\n</dict>\n</plist>\n");
+    if not u.write_file(u.f1("%s.dSYM/Contents/Info.plist", out), plist) or
+       not u.write_file(u.f2("%s/%s", dir, name), h.view()) {
+        nl.err(u.f1("cannot write %s.dSYM", out));
+        return 1;
+    }
+    h.free();
+    return 0;
 }
 
 // Writes the executable as a new file renamed over `out`: macOS caches an

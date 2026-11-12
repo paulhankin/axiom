@@ -7,6 +7,7 @@
 // The state of the function being compiled, which x64.ax sets, lives here.
 // =============================================================================
 import "bin.ax" as bn;
+import "dwarf.ax" as dw;
 import "elf.ax" as elf;
 import "ftab.ax" as ft;
 import "ir.ax" as ir;
@@ -19,6 +20,25 @@ import "x64enc.ax" as xe;
 pub let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
 pub let mut TEXT: i32 = 0;
 pub let mut LINES: i32 = -1;  // Windows: line tables (.axiom.lines, for plink.ax's PDB)
+pub let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0,
+                                     parts: [
+                                         dw.Part.{
+                                             b: bn.Bytes.{
+                                                 b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
+                                             fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
+                                                                   cap: 0 } }; 7],
+                                     strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                            vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                     lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                     files: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
+                                     fmap: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                            vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                     by_id: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
+                                     nfuncs: 0, first_src: 0, text_sym: 0,
+                                     trefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                     gsyms: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 } };  // -g: DWARF (dwarf.ax; not on Windows)
 pub let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
 pub let mut PDATA: i32 = -1;
 pub let mut XDATA_SYM: u32 = 0;
@@ -707,6 +727,44 @@ fn xmm_save_off(k: i64) i64 {
 fn epilogue() void {
     unframe();
     b8(0xc3);
+    cfi_body();
+}
+
+// -g: the call frame states as the function is encoded (dwarf.cfi_state;
+// none unless DBG is on), and the registers the frame saves (dwarf.saved_reg):
+// rbp at CFA - 16, then the pushed callee-saved registers below it.
+let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+let mut cfi_regs: [20]u64 = [0; 20];
+// our register numbers -> DWARF's (rax rcx rdx rbx rsp rbp rsi rdi -> 0 2 1 3 7 6 4 5)
+let DW_GPR: [16]u32 = [0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
+
+// From here on: CFA = reg + 8k, the save list's registers in mask saved.
+fn cfi(reg: u32, k: u64, mask: u64) void {
+    if not DBG.on {
+        return;
+    }
+    let at = @as(u64, E.b.len());
+    let st = dw.cfi_state(at, reg, k, mask);
+    if (cfis.len > 0) and ((cfis.last() & 0xffff_ffff) == at) {
+        cfis.set(cfis.len - 1, st);
+        return;
+    }
+    cfis.push(st);
+}
+
+// The state at a function's entry (and in blocks run without the frame).
+fn cfi_entry() void {
+    cfi(dw.X64_RSP, 1, 0);
+}
+
+// The state in the function's body: CFA = rbp + 16, rbp and the callee-saved
+// registers saved (or, without a frame, the entry's).
+fn cfi_body() void {
+    if frameless or in_noframe {
+        cfi_entry();
+        return;
+    }
+    cfi(dw.X64_RBP, 2, (@as(u64, 1) << @int_cast(u32, nsaved + 1)) - 1);
 }
 
 // The epilogue but its ret: the callee-saved registers and the caller's
@@ -738,11 +796,13 @@ fn unframe() void {
                 b8(0x41);
             }
             b8(0x58 + @as(u64, @bit_cast(u32, r & 7)));
+            cfi(dw.X64_RBP, 2, (@as(u64, 1) << @int_cast(u32, k + 1)) - 1);  // (restored)
         }
         b8(0x5d);  // pop rbp
     } else {
         b8(0xc9);  // leave
     }
+    cfi_entry();
 }
 
 // A sibling call (is_tail): its stack arguments, which the outgoing area
@@ -776,6 +836,7 @@ fn enc_tail(i: *mut mc.MInst) void {
     } else {
         enc_op(8, 1, 0xff, 0, 4, t, 0, false);
     }
+    cfi_body();
 }
 
 // Windows: a function's line table, into .axiom.lines for plink.ax (which
@@ -783,34 +844,67 @@ fn enc_tail(i: *mut mc.MInst) void {
 // (u32 length, bytes; files are numbered in order), or 'P', a function: its
 // symbol's name (u32 length, bytes), the number of rows, and rows of code
 // offset, file number and line (u32 each). rows: offset << 32 | ir.src_loc.
-pub let mut line_file: [4096]u32 = [0; 4096];  // file id -> its number + 1 in the section
+// Files and lines are the presumed ones (C's #line).
+pub let mut line_file: [4096]u32 = [0; 4096];  // file id (without #line) -> its number + 1 in the section
 pub let mut nline_files: u32 = 0;
+pub let mut line_names: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                          vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 
-fn emit_lines(name: []u8, rows: []u64) void {
-    let sec = OBJ.secs.get(@int_cast(usize, LINES));
-    let d = &mut sec.data;
-    for r in rows {
-        let file = ir.src_file(@truncate(u32, r));
-        let k = @as(usize, @bit_cast(u32, file));
-        if line_file[k] == 0 {
-            let path = u.real_path(u.file_of(file).path);
-            d.u8_('F');
-            d.u32_(@as(u64, path.len));
-            d.put(path);
-            nline_files += 1;
-            line_file[k] = nline_files;
+// The section's number of the file of location src, and its line there.
+fn line_of(src: u32, line: *mut u32) u32 {
+    let file = ir.src_file(src);
+    let k = @as(usize, @bit_cast(u32, file));
+    line.* = ir.src_line(src);
+    let sf = u.file_of(file);
+    if (sf.marks.len == 0) and (line_file[k] != 0) {
+        return line_file[k] - 1;
+    }
+    let mut path = u.real_path(sf.path);
+    if u.isnos(path) {
+        path = sf.path;
+    }
+    if sf.marks.len > 0 {
+        let p = u.presumed_line(file, @bit_cast(i32, line.*));
+        if p.marked {
+            path = p.name;
+            line.* = @truncate(u32, @bit_cast(u64, @max(p.line, 0)));
         }
     }
+    let key = u.intern(path);
+    let mut n = line_names.get(key);
+    if n == 0 {
+        let d = &mut OBJ.secs.get(@int_cast(usize, LINES)).data;
+        d.u8_('F');
+        d.u32_(@as(u64, path.len));
+        d.put(path);
+        nline_files += 1;
+        n = nline_files;
+        line_names.put(key, n);
+    }
+    if sf.marks.len == 0 {
+        line_file[k] = n;
+    }
+    return n - 1;
+}
+
+fn emit_lines(name: []u8, rows: []u64) void {
+    let mut files = u.List.[u64].empty();
+    for r in rows {
+        let mut line: u32 = 0;
+        let f = line_of(@truncate(u32, r), &mut line);
+        files.push((@as(u64, f) << 32) | @as(u64, line));
+    }
+    let d = &mut OBJ.secs.get(@int_cast(usize, LINES)).data;
     d.u8_('P');
     d.u32_(@as(u64, name.len));
     d.put(name);
     d.u32_(@as(u64, rows.len));
-    for r in rows {
-        let src = @truncate(u32, r);
-        d.u32_(r >> 32);
-        d.u32_(@as(u64, line_file[@as(usize, @bit_cast(u32, ir.src_file(src)))] - 1));
-        d.u32_(@as(u64, ir.src_line(src)));
+    for k in 0..rows.len {
+        d.u32_(rows[k] >> 32);
+        d.u32_(files.get(k) >> 32);
+        d.u32_(files.get(k) & 0xffff_ffff);
     }
+    files.deinit();
 }
 
 // Windows: what the prologue did, step by step, for the function's unwind
@@ -844,9 +938,11 @@ fn prologue(sub: i64) void {
     }
     b8(0x55);  // push rbp
     uw_step(UW_PUSH, xe.RBP, 0);
+    cfi(dw.X64_RSP, 2, 1);
     b8(0x48);
     b8(0x89);
     b8(0xe5);  // mov rbp, rsp
+    cfi(dw.X64_RBP, 2, 1);
     if WIN and dyn_stack() {
         uw_step(UW_SETFP, xe.RBP, 0);
     }
@@ -857,6 +953,7 @@ fn prologue(sub: i64) void {
         }
         b8(0x50 + @as(u64, @bit_cast(u32, r & 7)));
         uw_step(UW_PUSH, r, 0);
+        cfi(dw.X64_RBP, 2, (@as(u64, 1) << @int_cast(u32, k + 2)) - 1);
     }
     if sub > 0 {
         // touch each page of a large frame in order (stack guard)
@@ -1243,9 +1340,11 @@ fn enc_call(t: mc.MOp) void {
         vzeroupper();
     }
     DIRTY = false;  // (the callee returns with the upper halves clear)
-    if frameless or in_noframe {
+    let nf = frameless or in_noframe;
+    if nf {
         // sub rsp, 8: the call (which does not return) needs rsp aligned
         E.b.put("\x48\x83\xec\x08");
+        cfi(dw.X64_RSP, 2, 0);
     }
     if t.kind == mc.K_SYM {
         b8(0xe8);
@@ -1253,6 +1352,9 @@ fn enc_call(t: mc.MOp) void {
         E.b.u32_(0);
     } else {
         enc_op(4, 1, 0xff, 0, 2, t, 0, false);
+    }
+    if nf {
+        cfi_entry();  // (the code after it is reached without the sub)
     }
 }
 
@@ -2912,6 +3014,34 @@ fn resolve_branches(boff: []u64) void {
     }
 }
 
+// The offset from rbp of the frame slot of alloca a (dwarf.var_locs).
+fn var_slot_off(a: *ir.Value) i64 {
+    let k = @int_cast(usize, a.aux);
+    if (a.aux < 0) or (k >= MF.slots.len) {
+        return dw.NO_LOC;
+    }
+    return MF.slots.at(k).offset;
+}
+
+// The location of f's first instruction that has one (or f's own).
+fn first_src(f: *ir.Func) u32 {
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if i.src != 0 {
+                return i.src;
+            }
+            i = i.next;
+        }
+    }
+    return f.src;
+}
+
+// The name of function f (symbol `sym`) for debuggers.
+fn dbg_name(f: *ir.Func, sym: []u8) []u8 {
+    return dw.func_name(f, elf.display_name(sym));
+}
+
 pub fn encode_func(f: *mut ir.Func) void {
     // callee-saved registers in use
     find_saved();
@@ -2950,13 +3080,28 @@ pub fn encode_func(f: *mut ir.Func) void {
         rows.clear();
         calls.clear();
         noframe.clear();
+        cfis.clear();
         in_noframe = false;
         if sw < 0 {
             prologue(sub);
         }
+        let lines = WIN or DBG.on;
         let mut last_src = f.src;
-        if WIN and (f.src != 0) {
+        if lines and (f.src != 0) {
             rows.push(@as(u64, f.src));
+        }
+        // -g: the prologue ends (for a debugger: where a breakpoint on the
+        // function stops) at the first instruction of another line than the
+        // function's own (past the parameters' stores); until then, the
+        // first instruction's line
+        let mut pe_done = not DBG.on;
+        if DBG.on {
+            let mut at = @as(u64, E.b.len());
+            if sw >= 0 {
+                at = 0;
+            }
+            rows.push((at << 32) | @as(u64, first_src(f)));
+            last_src = first_src(f);
         }
         for bi in 0..nb {
             let b = MF.blocks.get(bi);
@@ -2968,6 +3113,9 @@ pub fn encode_func(f: *mut ir.Func) void {
             }
             boff[bi] = @as(u64, E.b.len());
             if @as(i32, @int_cast(i32, bi)) == sw {
+                in_noframe = true;
+                cfi_entry();
+                in_noframe = false;
                 prologue(sub);  // (jumps into the block go here)
             }
             if skip[bi] {
@@ -2977,13 +3125,20 @@ pub fn encode_func(f: *mut ir.Func) void {
                 noframe.push(@as(u64, E.b.len()));
                 in_noframe = b.noframe;
             }
+            if @as(i32, @int_cast(i32, bi)) != sw {
+                cfi_body();
+            }
             DIRTY = dirty_in[bi];
             let mut i = b.first;
             while u.notnil(i) {
                 if writes_wide(i) {
                     DIRTY = true;  // (no call or return writes a vector register)
                 }
-                if WIN and (i.src != 0) and (i.src != last_src) {
+                if not pe_done and (i.src != 0) and (i.src != f.src) {
+                    rows.push(((@as(u64, E.b.len()) << 32) | dw.ROW_PE) | @as(u64, i.src));
+                    last_src = i.src;
+                    pe_done = true;
+                } else if lines and (i.src != 0) and (i.src != last_src) {
                     rows.push((@as(u64, E.b.len()) << 32) | @as(u64, i.src));
                     last_src = i.src;
                 }
@@ -3039,6 +3194,19 @@ pub fn encode_func(f: *mut ir.Func) void {
     }
     if WIN and (rows.len > 0) {
         emit_lines(s.name, rows.items());
+    }
+    if DBG.on {
+        let mut regs: [8]u64 = [0; 8];
+        regs[0] = dw.saved_reg(dw.X64_RBP, -16);
+        for k in 0..@int_cast(usize, nsaved) {
+            regs[k + 1] = dw.saved_reg(
+                DW_GPR[@as(usize, @bit_cast(u32, saved[k] & 15))], -24 - (8 * @as(i64, @int_cast(i64, k))));
+        }
+        let df = dw.Func.{ sym: fsym.get(@int_cast(usize, f.id)), name: dbg_name(f, s.name),
+                           external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
+                           cfi: cfis.items(), regs: regs[0..@int_cast(usize, nsaved) + 1], irf: f,
+                           vars: dw.var_locs(f, var_slot_off, 16) };
+        dw.add_func(&mut DBG, &df);
     }
     E.b.free();
     E.relocs.deinit();

@@ -1,0 +1,305 @@
+// =============================================================================
+// cgen_debug.ax - what the debug information (dwarf.ax, through dbginfo.ax)
+// is told of a C program at -g: its types, each function's parameters and
+// local variables (and their objects, which -O0 keeps in memory: ir.F_VAR),
+// its objects of static storage duration, and its enumerations' constants.
+//
+// Types are described as they are, not as they were named: a variable
+// declared with a typedef name has the type the name stands for (the
+// typedefs themselves are not described).
+// =============================================================================
+import "../dbginfo.ax" as dbi;
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "ctypes.ax" as cty;
+
+// a C type's id (CType.id) -> its dbinfo index + 1
+let mut by_id: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+// an enumeration's tag id (TagInfo.id) -> its constants
+let mut enum_consts: u.List.[*mut u.List.[*mut cast.CSym]] =
+    u.List.[*mut u.List.[*mut cast.CSym]].{ data: @ptr_from_int(*mut *mut u.List.[*mut cast.CSym], 0), len: 0, cap: 0 };
+
+fn on() bool {
+    return tg.g_debug == tg.DEBUG_FULL;
+}
+
+/// Records the constants of the enumeration with tag `tag` (csema_dspec).
+pub fn note_enum(tag: *cty.TagInfo, consts: []*mut cast.CSym) void {
+    if not on() or (tag.id < 0) {
+        return;
+    }
+    let k = @int_cast(usize, tag.id);
+    while enum_consts.len <= k {
+        enum_consts.push(u.nil.[u.List.[*mut cast.CSym]]());
+    }
+    let l = u.perm_new.[u.List.[*mut cast.CSym]]();
+    for c in consts {
+        l.push(c);
+    }
+    enum_consts.set(k, l);
+}
+
+/// Function f is C function s (its result's type).
+pub fn note_func(f: *ir.Func, s: *cast.CSym) void {
+    if on() and u.notnil(s.ty) and (s.ty.kind == cty.TK_FUNCTION) {
+        dbi.note_result(f.name, type_id(s.ty.ret));
+    }
+}
+
+/// Object `a` (an alloca) holds variable s of function f: it is kept in
+/// memory at -O0, and, with -g, described.
+pub fn note_var(f: *ir.Func, s: *cast.CSym, a: *mut ir.Value) void {
+    if u.isnil(a) or (a.kind != ir.V_INST) or (a.op != ir.OP_ALLOCA) {
+        return;
+    }
+    a.flags = a.flags | ir.F_VAR;
+    if not on() or (s.name.len == 0) {
+        return;
+    }
+    dbi.add_var(f.name, dbi.DVar.{ name: s.name, ty: type_id(s.ty), src: src_of(s.span), alloca: a,
+                                   global: u.nil.[ir.Global](), param: s.is_param, external: false });
+}
+
+/// Datum g is the object s of static storage duration (in function f, for
+/// a block-scope one; nil: at file scope).
+pub fn note_static(f: *ir.Func, s: *cast.CSym, g: *mut ir.Global) void {
+    if not on() or (s.name.len == 0) {
+        return;
+    }
+    let v = dbi.DVar.{ name: s.name, ty: type_id(s.ty), src: src_of(s.span), alloca: u.nil.[ir.Value](), global: g,
+                       param: false, external: s.linkage == cast.LK_EXTERNAL };
+    if u.notnil(f) and (s.linkage == cast.LK_NONE) {
+        dbi.add_var(f.name, v);
+    } else {
+        dbi.globals.push(v);
+    }
+}
+
+fn src_of(sp: u.Span) u32 {
+    if (sp.file < 0) or (@int_cast(usize, sp.file) >= u.g_files.len) {
+        return 0;
+    }
+    return ir.src_loc(sp.file, u.span_line(sp));
+}
+
+fn base(name: []u8, size: u64, enc: u8) dbi.DType {
+    return dbi.DType.{ kind: dbi.DK_BASE, name: name, size: size, enc: enc, target: -1, count: -1,
+                       members: u.List.[dbi.DMember].empty(), variadic: false, proto: false, complete: true, src: 0 };
+}
+
+fn derived(kind: u8, target: i32, size: u64) dbi.DType {
+    let mut t = base("", size, 0);
+    t.kind = kind;
+    t.target = target;
+    return t;
+}
+
+/// The dbinfo index of C type t (-1: void).
+pub fn type_id(t: *cty.CType) i32 {
+    if u.isnil(t) or (t.kind == cty.TK_VOID) or (t.kind == cty.TK_ERROR) {
+        if u.notnil(t) and (t.quals != 0) and (t.kind == cty.TK_VOID) {
+            return qualified(t, -1);
+        }
+        return -1;
+    }
+    let k = @int_cast(usize, @max(t.id, 0));
+    while by_id.len <= k {
+        by_id.push(0);
+    }
+    if by_id.get(k) != 0 {
+        return by_id.get(k) - 1;
+    }
+    if t.quals != 0 {
+        let id = qualified(t, type_id(t.unq));
+        by_id.set(k, id + 1);
+        return id;
+    }
+    let kind = t.kind;
+    if (kind == cty.TK_STRUCT) or (kind == cty.TK_UNION) {
+        return record(t, k);
+    }
+    let mut d = base("", cty.size_of(t), 0);
+    if kind == cty.TK_POINTER {
+        d = derived(dbi.DK_POINTER, -1, cty.size_of(t));
+        let id = dbi.add_type(d);
+        by_id.set(k, id + 1);          // (before the target: a structure may point to itself)
+        let target = type_id(t.elem);  // (which may add types: the list moves)
+        dbi.types.at(@int_cast(usize, id)).target = target;
+        return id;
+    }
+    if kind == cty.TK_ARRAY {
+        d = derived(dbi.DK_ARRAY, type_id(t.elem), 0);
+        if t.has_len {
+            d.count = @bit_cast(i64, t.len);
+            d.size = cty.size_of(t);
+        }
+    } else if kind == cty.TK_FUNCTION {
+        d = derived(dbi.DK_FUNC, type_id(t.ret), 0);
+        d.proto = t.proto;
+        d.variadic = t.variadic;
+        for p in t.params {
+            d.members.push(dbi.DMember.{ name: "", ty: type_id(p), off: 0, bits: 0, bit_off: 0, value: 0 });
+        }
+    } else if kind == cty.TK_ENUM {
+        d = enumeration(t);
+    } else {
+        d = base(base_name(t), cty.size_of(t), encoding(t));
+    }
+    let id = dbi.add_type(d);
+    by_id.set(k, id + 1);
+    return id;
+}
+
+// A qualified version of the type `inner` (t's qualifiers, outermost the
+// first of const, volatile, restrict, _Atomic).
+fn qualified(t: *cty.CType, inner: i32) i32 {
+    let mut id = inner;
+    let qs: [4]i32 = [cty.Q_ATOMIC, cty.Q_RESTRICT, cty.Q_VOLATILE, cty.Q_CONST];
+    let ks: [4]u8 = [dbi.DK_ATOMIC, dbi.DK_RESTRICT, dbi.DK_VOLATILE, dbi.DK_CONST];
+    for j in @as(usize, 0)..4 {
+        if (t.quals & qs[j]) != 0 {
+            id = dbi.add_type(derived(ks[j], id, 0));
+        }
+    }
+    return id;
+}
+
+// A structure or union: its entry first (its members may point to it).
+fn record(t: *cty.CType, k: usize) i32 {
+    let tag = t.tag;
+    let mut kind = dbi.DK_STRUCT;
+    if t.kind == cty.TK_UNION {
+        kind = dbi.DK_UNION;
+    }
+    let mut d = derived(kind, -1, 0);
+    d.name = tag.name;
+    d.complete = tag.complete;
+    d.src = src_of(tag.span);
+    if tag.complete {
+        d.size = tag.size;
+    }
+    let id = dbi.add_type(d);
+    by_id.set(k, id + 1);
+    if not tag.complete {
+        return id;
+    }
+    let mut ms = u.List.[dbi.DMember].empty();
+    for m in tag.members.items() {
+        let mut x = dbi.DMember.{ name: m.name, ty: type_id(m.ty), off: m.offset, bits: 0, bit_off: 0, value: 0 };
+        if m.is_bitfield {
+            if m.name.len == 0 {
+                continue;  // (padding)
+            }
+            x.bits = m.bit_width;
+            x.bit_off = m.bit_off;
+        }
+        ms.push(x);
+    }
+    dbi.types.at(@int_cast(usize, id)).members = ms;
+    return id;
+}
+
+fn enumeration(t: *cty.CType) dbi.DType {
+    let tag = t.tag;
+    let mut d = derived(dbi.DK_ENUM, -1, cty.size_of(t));
+    d.name = tag.name;
+    d.complete = tag.complete;
+    d.src = src_of(tag.span);
+    if u.notnil(tag.base) {
+        d.target = type_id(tag.base);
+    }
+    if (tag.id >= 0) and (@int_cast(usize, tag.id) < enum_consts.len) {
+        let l = enum_consts.get(@int_cast(usize, tag.id));
+        if u.notnil(l) {
+            for c in l.items() {
+                d.members.push(
+                    dbi.DMember.{ name: c.name, ty: -1, off: 0, bits: 0, bit_off: 0, value: @bit_cast(i64, c.value) });
+            }
+        }
+    }
+    return d;
+}
+
+fn base_name(t: *cty.CType) []u8 {
+    let k = t.kind;
+    if k == cty.TK_BOOL {
+        return "_Bool";
+    }
+    if k == cty.TK_CHAR {
+        return "char";
+    }
+    if k == cty.TK_SCHAR {
+        return "signed char";
+    }
+    if k == cty.TK_UCHAR {
+        return "unsigned char";
+    }
+    if k == cty.TK_SHORT {
+        return "short";
+    }
+    if k == cty.TK_USHORT {
+        return "unsigned short";
+    }
+    if k == cty.TK_INT {
+        return "int";
+    }
+    if k == cty.TK_UINT {
+        return "unsigned int";
+    }
+    if k == cty.TK_LONG {
+        return "long";
+    }
+    if k == cty.TK_ULONG {
+        return "unsigned long";
+    }
+    if k == cty.TK_LLONG {
+        return "long long";
+    }
+    if k == cty.TK_ULLONG {
+        return "unsigned long long";
+    }
+    if k == cty.TK_FLOAT {
+        return "float";
+    }
+    if k == cty.TK_DOUBLE {
+        return "double";
+    }
+    if k == cty.TK_LDOUBLE {
+        return "long double";
+    }
+    if k == cty.TK_NULLPTR {
+        return "nullptr_t";
+    }
+    if k == cty.TK_COMPLEX {
+        return u.f1("%s _Complex", base_name(t.elem));
+    }
+    if k == cty.TK_BITINT {
+        return u.f2("%s_BitInt(%s)", u.pick(t.is_signed, "", "unsigned "), u.idec(t.bits));
+    }
+    return "?";
+}
+
+fn encoding(t: *cty.CType) u8 {
+    let k = t.kind;
+    if k == cty.TK_BOOL {
+        return dbi.ATE_BOOLEAN;
+    }
+    if (k == cty.TK_FLOAT) or (k == cty.TK_DOUBLE) or (k == cty.TK_LDOUBLE) {
+        return dbi.ATE_FLOAT;
+    }
+    if k == cty.TK_COMPLEX {
+        return dbi.ATE_COMPLEX_FLOAT;
+    }
+    if (k == cty.TK_CHAR) or (k == cty.TK_SCHAR) or (k == cty.TK_UCHAR) {
+        if t.is_signed {
+            return dbi.ATE_SIGNED_CHAR;
+        }
+        return dbi.ATE_UNSIGNED_CHAR;
+    }
+    if (k == cty.TK_NULLPTR) or not t.is_signed {
+        return dbi.ATE_UNSIGNED;
+    }
+    return dbi.ATE_SIGNED;
+}

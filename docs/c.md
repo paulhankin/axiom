@@ -86,8 +86,8 @@ options, and no way to silence a warning.
 `--target`, `--cpu`, `--features`, `-O0`..`-O3` (see "Optimization"), `--stack-traces`
 (see "Stack traces"), `--format=agent-json`, `--std=<dir>` (the standard library's
 directory, where the compiler finds the C headers in `c/include/`), `-o`, `--emit`,
-`--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, and `-g` (accepted, and
-changing nothing: the compiler's own code generators write no line tables). The default
+`--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, and `-g` /
+`--debug-info=` (see "Debugging"). The default
 target is `wasm32`. `--link=file.c` links a further C source, compiled by the system's C
 compiler, as for Axiom programs; `-l` and `-L` pass libraries and directories to that
 linker.
@@ -543,13 +543,62 @@ stack trace (innermost first):
   at main (std/internal/runtime/c_start.ax:38:12)
 ```
 
-`--stack-traces=off` prints the crash line only. At `-O2` and `-O3` a trace can be
-shorter, or absent, when the optimizer has inlined the functions or moved the faulting
-access, or when a function's last act was a call (`return f(x);`), which then leaves
-its frame first: the trace lacks the caller; at `-O0` and `-O1` it is complete in the programs tried. C code has none of
+`--stack-traces=off` prints the crash line only. The trace is made of the call-site
+records of the calls the crash is below: each line names the function that made a call
+and where, and the first the function called (only as `<indirect call>` when it was
+called through a pointer). The faulting instruction itself has no record, so its line
+is not shown (a debugger finds it in the line tables: "Debugging").
+
+At `-O2` and `-O3` the trace is correct for the frames that exist, and the calls the
+optimizer inlined into them are in it too (an inlined call's record carries the calls
+it was inlined into). What is absent: a function whose last act was a call
+(`return f(x);`) leaves its frame first, so the trace lacks it; and a crash in code
+inlined into a function that makes no call between it and its caller (all of a small
+program inlined into `main`, say) shows only the frames from that function's caller
+up, which can be none: then only the crash line is printed. At `-O0` and `-O1` the
+functions are not inlined and the trace is complete in the programs tried. C code has none of
 Axiom's run-time checks: no bounds or overflow checks, so a bad pointer is a crash if it
 is one at all. On WebAssembly C functions leave no call records: a trap (such as a
 division by zero) reports `__axiom_c_main` and the start-up, and no C frames.
+
+## Debugging
+
+`-g` (or `--debug-info=full`) writes DWARF 5 debug information, `--debug-info=lines`
+the line tables and frames only, and `--debug-info=none` (the default) nothing. It does
+not change the code generated, at any optimization level, and two builds are the same.
+
+- **Lines**: each function's code is mapped to the lines of the source, `#line`
+  directives followed (the presumed file and line, as diagnostics show them); code the
+  optimizer inlined or moved keeps the line it came from. The prologue ends, for a
+  breakpoint on a function, past the stores of its parameters. Columns are not
+  recorded.
+- **Frames**: call frame information for every instruction of every function
+  (prologues, epilogues, sibling calls, code run before the frame is set up), so that
+  a debugger can unwind the stack wherever it stops.
+- **Types and variables** (`full`): the program's types (base types, pointers,
+  qualifiers, arrays, structures and unions with their bit-fields, enumerations and
+  their constants, function types); each function's result type, parameters and local
+  variables; objects of static storage duration (a block-scope `static` one appears
+  at the top level, beside the file's). A variable declared with a typedef name has
+  the type the name stands for: typedefs are not described. All of a function's
+  variables are in its scope: there are no lexical blocks, so two variables of the
+  same name in one function cannot be told apart. At `-O0` every variable is in
+  memory, in its frame slot, and has a location; at `-O1` and above variables have
+  none ("optimized out"), never a wrong one. The object of a variable length array
+  has no location, and its type no bound.
+
+Where it goes, per target:
+
+| Target | |
+|---|---|
+| `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`. |
+| `aarch64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable is the same as without `-g`. |
+| `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`; no types or variables. |
+| `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section (lines; no frames, which WebAssembly has no use for). |
+
+The objects of `--emit=obj` carry the same sections (ELF targets), with relocations,
+for the system's linker. Axiom functions in the same program get lines and frames but
+no variables.
 
 ## Optimization
 

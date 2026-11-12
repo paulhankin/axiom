@@ -15,6 +15,7 @@
 import "a64enc.ax" as ae;
 import "bin.ax" as bn;
 import "combine.ax" as cb;
+import "dwarf.ax" as dw;
 import "elf.ax" as elf;
 import "ftab.ax" as ft;
 import "ir.ax" as ir;
@@ -1934,6 +1935,7 @@ fn enc_tail(i: *mut mc.MInst) void {
     } else {
         w32(0xD61F_0000 | (ae.r5(P(t.reg)) << 5));  // br
     }
+    cfi_body();
 }
 
 // -----------------------------------------------------------------------------
@@ -3607,6 +3609,7 @@ fn compile_func(f: *mut ir.Func) void {
     prepare(f);
     MF = is.new_mfunc(f, &order);
     // parameters
+    mc.cur_src = f.src;
     CB = MF.blocks.get(0);
     let mut ng: i32 = 0;
     let mut nv: i32 = 0;
@@ -3645,6 +3648,9 @@ fn compile_func(f: *mut ir.Func) void {
         CB = MF.blocks.get(bi);
         let mut i = ib.first;
         while u.notnil(i) {
+            if i.src != 0 {
+                mc.cur_src = i.src;  // (the line of the instructions made for it)
+            }
             if not ir.is_term(i.op) {
                 gen_inst(i);
             }
@@ -3653,6 +3659,7 @@ fn compile_func(f: *mut ir.Func) void {
         gen_term(ib);
         is.push_succs(CB, ir.terminator(ib));
     }
+    mc.cur_src = 0;
     order.deinit();
     if errors {
         return;
@@ -4037,12 +4044,61 @@ fn needs_frame() bool {
     return false;
 }
 
+// -g: the debug information of the object (dwarf.ax), and the call frame
+// states as the function is encoded (dwarf.cfi_state): its save list is x29
+// at CFA - 16, x30 at CFA - 8, then the callee-saved registers in their slots.
+let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0,
+                                 parts: [
+                                     dw.Part.{
+                                         b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
+                                                                        cap: 0 } },
+                                         fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
+                                                               cap: 0 } }; 7],
+                                 strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                 lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                 files: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 },
+                                 fmap: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                 by_id: u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 }, nfuncs: 0,
+                                 first_src: 0, text_sym: 0,
+                                 trefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                 gsyms: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 } };
+let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+// From here on: CFA = reg + 8k, the save list's registers in mask saved.
+fn cfi(cfa_reg: u32, k: u64, mask: u64) void {
+    if not DBG.on {
+        return;
+    }
+    let pc = here();
+    let st = dw.cfi_state(pc, cfa_reg, k, mask);
+    if (cfis.len > 0) and ((cfis.last() & 0xffff_ffff) == pc) {
+        cfis.set(cfis.len - 1, st);
+        return;
+    }
+    cfis.push(st);
+}
+
+// The state in the function's body: CFA = x29 + 16, everything saved.
+fn cfi_body() void {
+    if frameless {
+        cfi(dw.A64_SP, 0, 0);
+        return;
+    }
+    cfi(dw.A64_FP, 2, (@as(u64, 1) << @int_cast(u32, nsaved + 2)) - 1);
+}
+
 fn prologue() void {
     if frameless {
         return;
     }
     w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
+    cfi(dw.A64_SP, 2, 3);
     w32(0x9100_03FD);  // mov x29, sp
+    cfi(dw.A64_FP, 2, 3);
     let mut rem = frame;
     while rem > 4096 {
         w32(ae.addsub_imm(1, true, false, SP, SP, 1, true));  // sub sp, sp, #4096
@@ -4055,11 +4111,13 @@ fn prologue() void {
         w32(ae.addsub_imm(1, true, false, SP, SP, @bit_cast(u64, rem), false));
     }
     save_restore(false);
+    cfi_body();
 }
 
 fn epilogue() void {
     unframe();
     w32(ae.RET);
+    cfi_body();
 }
 
 // The epilogue but its ret: the callee-saved registers, x29, x30 and sp back.
@@ -4071,8 +4129,10 @@ fn unframe() void {
         add_disp(SP, FP, -frame);  // (the saved registers are where the prologue put them)
     }
     save_restore(true);
-    w32(0x9100_03BF);  // mov sp, x29
-    w32(0xA8C1_7BFD);  // ldp x29, x30, [sp], #16
+    cfi(dw.A64_FP, 2, 3);  // (the callee-saved registers restored)
+    w32(0x9100_03BF);      // mov sp, x29
+    w32(0xA8C1_7BFD);      // ldp x29, x30, [sp], #16
+    cfi(dw.A64_SP, 0, 0);
 }
 
 // DYNSTACK: the stack pointer moved, for dynamic allocation.
@@ -4406,16 +4466,38 @@ fn encode_func(f: *mut ir.Func) void {
     jtabs.clear();
     local_off.clear();
     frameless = not needs_frame();
+    cfis.clear();
     prologue();
     let nb = MF.blocks.len;
     let boff = u.newn.[u64](nb + 1);
     // frame tables: (offset after each call, its chain)
     let mut calls = u.List.[u64].empty();
+    // -g: the line table, (code offset, source location) where the location changes
+    let mut rows = u.List.[u64].empty();
+    let mut last_src: u32 = 0;
+    let mut pe_done = false;
+    if DBG.on {
+        if f.src != 0 {
+            rows.push(@as(u64, f.src));
+        }
+        last_src = first_src(f);
+        rows.push((here() << 32) | @as(u64, last_src));
+    }
     for bi in 0..nb {
         let b = MF.blocks.get(bi);
         boff[bi] = here();
         let mut i = b.first;
         while u.notnil(i) {
+            // (the prologue ends, for a debugger, at the first instruction of
+            // another line than the function's: past the parameters' stores)
+            if DBG.on and not pe_done and (i.src != 0) and (i.src != f.src) {
+                rows.push(((here() << 32) | dw.ROW_PE) | @as(u64, i.src));
+                last_src = i.src;
+                pe_done = true;
+            } else if DBG.on and (i.src != 0) and (i.src != last_src) {
+                rows.push((here() << 32) | @as(u64, i.src));
+                last_src = i.src;
+            }
             enc_inst(i);
             if FT.on and (i.op == CALL) and not is_tail(i) {
                 calls.push(here());
@@ -4461,8 +4543,51 @@ fn encode_func(f: *mut ir.Func) void {
     s.value = base;
     s.size = @as(u64, code.len());
     ft.func(&FT, base, s.size, frameless, calls.items()[0..0], calls.items());
+    if DBG.on {
+        let mut regs: [20]u64 = [0; 20];
+        regs[0] = dw.saved_reg(dw.A64_FP, -16);
+        regs[1] = dw.saved_reg(dw.A64_LR, -8);
+        for k in 0..nsaved {
+            let r = saved[k];
+            let mut dr = @bit_cast(u32, r);
+            if r >= V0 {
+                dr = 64 + @bit_cast(u32, r - V0);  // (v8..v15: their low halves are the callee-saved d8..d15)
+            }
+            regs[k + 2] = dw.saved_reg(dr, -16 - frame + save_off[k]);
+        }
+        let df = dw.Func.{ sym: fsym.get(@int_cast(usize, f.id)), name: dw.func_name(f, elf.display_name(s.name)),
+                           external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
+                           cfi: cfis.items(), regs: regs[0..nsaved + 2], irf: f,
+                           vars: dw.var_locs(f, var_slot_off, 16 + frame) };
+        dw.add_func(&mut DBG, &df);
+    }
+    rows.deinit();
     code.free();
     calls.deinit();
+}
+
+// The offset from the frame's bottom (the stack pointer after the
+// prologue) of the frame slot of alloca a (dwarf.var_locs).
+fn var_slot_off(a: *ir.Value) i64 {
+    let k = @int_cast(usize, a.aux);
+    if (a.aux < 0) or (k >= MF.slots.len) {
+        return dw.NO_LOC;
+    }
+    return MF.slots.at(k).offset;
+}
+
+// The location of f's first instruction that has one (or f's own).
+fn first_src(f: *ir.Func) u32 {
+    for bi in 0..MF.blocks.len {
+        let mut i = MF.blocks.get(bi).first;
+        while u.notnil(i) {
+            if i.src != 0 {
+                return i.src;
+            }
+            i = i.next;
+        }
+    }
+    return f.src;
 }
 
 // -----------------------------------------------------------------------------
@@ -4490,6 +4615,11 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         galign.push(al);
     }
     FT = ft.begin(OBJ, m, TEXT, relro, &mut gsym, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
+    DBG = dw.begin(dw.ARCH_A64, 8, tg.g_debug);
+    DBG.lang = dw.module_lang(m);
+    for i in 0..m.globals.len {
+        dw.add_data_sym(&mut DBG, m.globals.get(i).name, gsym.get(i));
+    }
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
         if not ir.is_decl(f) {
@@ -4506,5 +4636,6 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             }
         }
     }
+    dw.finish_elf(&mut DBG, OBJ, TEXT, elf.R_AARCH64_ABS64, elf.R_AARCH64_ABS32);
     return OBJ;
 }

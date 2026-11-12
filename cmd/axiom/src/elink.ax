@@ -54,6 +54,9 @@ fn is_x64() bool {
 }
 
 fn class_of(s: *elf.Sec) i32 {
+    if s.kind == elf.S_DEBUG {
+        return nl.C_DEBUG;
+    }
     if elf.rets_rank(s) >= 0 {
         return nl.C_CONST;
     }
@@ -292,6 +295,9 @@ fn scan_relocs() void {
         let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
+            if nl.sec_cls.get(oi)[k] == nl.C_DEBUG {
+                continue;  // (nl.debug_sections)
+            }
             for r in s.relocs.items() {
                 if nl.is_got_reloc(is_x64(), r.ty) {
                     _ = nl.got_slot(oi, r.sym);
@@ -366,7 +372,7 @@ fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
             let s = o.secs.get(k);
             let base = nl.sec_addr.get(oi)[k];
             let cls = nl.sec_cls.get(oi)[k];
-            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) {
+            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) {
                 continue;
             }
             for r in s.relocs.items() {
@@ -1149,13 +1155,27 @@ fn section_of(a: u64) u64 {
 }
 
 // Writes the executable b to `out`, with a symbol table and section headers
-// over the segments for its symbols to refer to.
+// over the segments for its symbols to refer to, and the debug information
+// (-g: nl.debug_sections, not loaded).
 fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
     let st = symbol_table();
     let mut shs = bn.new_bytes();
     shs.put("\x00.text\x00.rodata\x00.data\x00.bss\x00.symtab\x00.strtab\x00.shstrtab\x00.dynamic\x00");
     let mut tail = bn.new_bytes();
     tail.put(b);
+    let dbg = nl.debug_sections();
+    let dbg_off = u.newn.[u64](dbg.len + 1);
+    let dbg_name = u.newn.[u64](dbg.len + 1);
+    let dbg_size = u.newn.[u64](dbg.len + 1);
+    for k in 0..dbg.len {
+        dbg_off[k] = @as(u64, tail.len());
+        dbg_size[k] = @as(u64, dbg.get(k).data.len());
+        tail.put(dbg.at(k).data.view());
+        dbg.at(k).data.free();
+        dbg_name[k] = @as(u64, shs.len());
+        shs.put(dbg.get(k).name);
+        shs.u8_(0);
+    }
     let sym_off = nl.align_up(@as(u64, tail.len()), 8);
     tail.zeros(@truncate(usize, sym_off) - tail.len());
     tail.put(st.syms.view());
@@ -1178,6 +1198,7 @@ fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
         [42, 3, 0, 0, shs_off, @as(u64, shs.len()), 0, 0, 1, 0],
         [52, 6, 3, ly.dyn_addr, ly.dyn_off, ly.n_dyn * 16, 0, 0, 8, 16],
     ];
+    let nsh = 9 + @as(u64, dbg.len);
     for k in @as(usize, 0)..9 {
         let x = shdr[k];
         tail.u32_(x[0]);
@@ -1191,10 +1212,22 @@ fn write_file(b: []u8, ly: *Layout, out: []u8) i32 {
         tail.u64_(x[8]);
         tail.u64_(x[9]);
     }
+    for k in 0..dbg.len {
+        tail.u32_(dbg_name[k]);
+        tail.u32_(1);  // SHT_PROGBITS, no flags
+        tail.u64_(0);
+        tail.u64_(0);
+        tail.u64_(dbg_off[k]);
+        tail.u64_(dbg_size[k]);
+        tail.u32_(0);
+        tail.u32_(0);
+        tail.u64_(1);
+        tail.u64_(0);
+    }
     let tb = tail.view();
     bn.w64(tb, 40, sh_off);  // e_shoff
     bn.w16(tb, 58, 64);      // e_shentsize
-    bn.w16(tb, 60, 9);       // e_shnum
+    bn.w16(tb, 60, nsh);     // e_shnum
     bn.w16(tb, 62, 7);       // e_shstrndx
     if not u.write_file(out, tb) {
         nl.err(u.f1("cannot write %s", out));

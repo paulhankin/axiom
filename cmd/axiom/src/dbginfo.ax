@@ -1,0 +1,144 @@
+// =============================================================================
+// dbginfo.ax - what the front ends tell the debug information (dwarf.ax)
+// beyond the IR, with -g: the source names of functions whose symbols are
+// not (C's internal functions, numbered apart; C's main).
+// =============================================================================
+import "ir.ax" as ir;
+import "util.ax" as u;
+
+/// Variables have locations (at -O0: backend.ax sets it).
+pub let mut locations: bool = false;
+
+/// A C program's __STDC_VERSION__ (0: C89), -1: not C.
+pub let mut c_version: i64 = -1;
+
+// IR function name (interned) -> its name in the source
+let mut names: u.SymMap.[[]u8] = u.SymMap.[[]u8].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut []u8, 0), cap: 0, len: 0 };
+
+/// Records that IR function `ir_name` is `name` in the source.
+pub fn note_func_name(ir_name: []u8, name: []u8) void {
+    names.put(u.intern(ir_name), u.intern(name));
+}
+
+/// The source name of IR function `ir_name`, or `dflt` if none was noted.
+pub fn func_name(ir_name: []u8, dflt: []u8) []u8 {
+    let n = names.get(u.intern(ir_name));
+    if n.len > 0 {
+        return n;
+    }
+    return dflt;
+}
+
+// -----------------------------------------------------------------------------
+// Types and variables (DEBUG_FULL): what the C front end (c/cgen_debug.ax)
+// describes of a program's types, functions' variables and globals, for
+// dwarf.ax to write as DWARF entries. Types are numbered (indexes in
+// `types`); -1 is void.
+// -----------------------------------------------------------------------------
+pub const DK_BASE: u8 = 1;
+pub const DK_POINTER: u8 = 2;
+pub const DK_CONST: u8 = 3;
+pub const DK_VOLATILE: u8 = 4;
+pub const DK_RESTRICT: u8 = 5;
+pub const DK_ATOMIC: u8 = 6;
+pub const DK_ARRAY: u8 = 7;
+pub const DK_STRUCT: u8 = 8;
+pub const DK_UNION: u8 = 9;
+pub const DK_ENUM: u8 = 10;
+pub const DK_TYPEDEF: u8 = 11;
+pub const DK_FUNC: u8 = 12;
+
+// Base type encodings (DWARF 5, 7.8: DW_ATE_*)
+pub const ATE_BOOLEAN: u8 = 2;
+pub const ATE_COMPLEX_FLOAT: u8 = 3;
+pub const ATE_FLOAT: u8 = 4;
+pub const ATE_SIGNED: u8 = 5;
+pub const ATE_SIGNED_CHAR: u8 = 6;
+pub const ATE_UNSIGNED: u8 = 7;
+pub const ATE_UNSIGNED_CHAR: u8 = 8;
+
+/// A member of a structure or union (bits > 0: a bit-field, bit_off bits
+/// past `off` bytes, from the least significant bit), an enumerator
+/// (value), or a function type's parameter (ty).
+pub struct DMember {
+    name: []u8,
+    ty: i32,
+    off: u64,
+    bits: i32,
+    bit_off: i32,
+    value: i64,
+}
+
+pub struct DType {
+    kind: u8,
+    name: []u8,  // (empty: none)
+    size: u64,
+    enc: u8,      // DK_BASE: ATE_*
+    target: i32,  // pointer, qualifier, array (element), typedef, enumeration (its integer type), function (result)
+    count: i64,   // DK_ARRAY: the number of elements, -1: not known (incomplete, a VLA)
+    members: u.List.[DMember],
+    variadic: bool,  // DK_FUNC
+    proto: bool,
+    complete: bool,  // DK_STRUCT, DK_UNION, DK_ENUM
+    src: u32,        // where it is declared (structures, unions, enumerations)
+}
+
+/// A variable: a function's (alloca: its object, for its location at -O0),
+/// or a static one (global: its datum), named in the source.
+pub struct DVar {
+    name: []u8,
+    ty: i32,
+    src: u32,
+    alloca: *mut ir.Value,
+    global: *mut ir.Global,
+    param: bool,
+    external: bool,
+}
+
+pub let mut types: u.List.[DType] = u.List.[DType].{ data: @ptr_from_int(*mut DType, 0), len: 0, cap: 0 };
+// the objects of static storage duration
+pub let mut globals: u.List.[DVar] = u.List.[DVar].{ data: @ptr_from_int(*mut DVar, 0), len: 0, cap: 0 };
+// IR function name (interned) -> its variables, in order of declaration
+let mut vars: u.SymMap.[*mut u.List.[DVar]] = u.SymMap.[*mut u.List.[DVar]].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut u.List.[DVar], 0), cap: 0, len: 0 };
+
+// IR function name (interned) -> the type of its result + 2 (1: void)
+let mut results: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                   cap: 0, len: 0 };
+
+/// Function `ir_name` returns type t (-1: void).
+pub fn note_result(ir_name: []u8, t: i32) void {
+    results.put(u.intern(ir_name), t + 2);
+}
+
+/// The type function `ir_name` returns: -1 void, -2 not known.
+pub fn result_of(ir_name: []u8) i32 {
+    return results.get(u.intern(ir_name)) - 2;
+}
+
+/// A new type; its index.
+pub fn add_type(t: DType) i32 {
+    types.push(t);
+    return @int_cast(i32, types.len - 1);
+}
+
+/// Adds variable v to the function named `ir_name`.
+pub fn add_var(ir_name: []u8, v: DVar) void {
+    let k = u.intern(ir_name);
+    let mut l = vars.get(k);
+    if u.isnil(l) {
+        l = u.perm_new.[u.List.[DVar]]();
+        vars.put(k, l);
+    }
+    l.push(v);
+}
+
+/// The variables of the function named `ir_name` (none: empty).
+pub fn vars_of(ir_name: []u8) []DVar {
+    let l = vars.get(u.intern(ir_name));
+    if u.isnil(l) {
+        return u.nil_slice.[DVar]();
+    }
+    return l.items();
+}

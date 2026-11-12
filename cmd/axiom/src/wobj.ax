@@ -79,6 +79,10 @@ pub struct Func {
     relocs: u.List.[Reloc],
     sym: u32,
     name: []u8,
+    // -g: the line table, (offset in body << 32) | ir.src_loc where the location
+    // changes (in an object: the custom section "axiom.lines"), and the declaration
+    lines: u.List.[u64],
+    src: u32,
 }
 
 pub struct Global {
@@ -273,11 +277,129 @@ pub fn write_object(un: *mut Unit) []u8 {
         c.name(f);
     }
     add_custom(&mut w, "target_features", &mut c);
+    lines_section(&mut w, un);
     code_relocs.deinit();
     data_relocs.deinit();
     let r = u.dup(w.out.view());
     w.out.free();
     return r;
+}
+
+// -g: the functions' line tables (Func.lines), for wlink.ax's DWARF, in a
+// custom section "axiom.lines": the files' paths (a count, then names),
+// then per function with a table: its index among the definitions, its
+// declaration's file (index + 1, 0: none) and line, the number of rows,
+// and the rows (code offset, file index, line). Our own: other linkers
+// keep custom sections they do not know as they are.
+fn lines_section(w: *mut Writer, un: *Unit) void {
+    let mut any = false;
+    for f in un.funcs.items() {
+        any = any or (f.lines.len > 0);
+    }
+    if not any {
+        return;
+    }
+    let mut files = u.List.[i32].empty();
+    let mut idx = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    let mut body = bn.new_bytes();
+    let mut nf: u64 = 0;
+    for f in un.funcs.items() {
+        if f.lines.len > 0 {
+            nf += 1;
+        }
+    }
+    body.uleb(nf);
+    for k in 0..un.funcs.len {
+        let f = un.funcs.get(k);
+        if f.lines.len == 0 {
+            continue;
+        }
+        body.uleb(@as(u64, k));
+        if f.src == 0 {
+            body.uleb(0);
+            body.uleb(0);
+        } else {
+            body.uleb(@as(u64, line_file(&mut files, &mut idx, f.src)) + 1);
+            body.uleb(@as(u64, ir_src_line(f.src)));
+        }
+        body.uleb(@as(u64, f.lines.len));
+        for r in f.lines.items() {
+            body.uleb(r >> 32);
+            body.uleb(@as(u64, line_file(&mut files, &mut idx, @truncate(u32, r))));
+            body.uleb(@as(u64, ir_src_line(@truncate(u32, r))));
+        }
+    }
+    let mut c = bn.new_bytes();
+    c.uleb(@as(u64, files.len));
+    for fid in files.items() {
+        c.name(u.file_of(fid).path);
+    }
+    c.put(body.view());
+    body.free();
+    add_custom(w, "axiom.lines", &mut c);
+}
+
+// (as ir.src_file and ir.src_line, which this module does not import)
+fn ir_src_line(s: u32) u32 {
+    return s & 0xf_ffff;
+}
+
+fn line_file(files: *mut u.List.[i32], idx: *mut u.SymMap.[u32], src: u32) u32 {
+    let fid = @bit_cast(i32, src >> 20) - 1;
+    let k = u.intern(u.file_of(fid).path);
+    let at = idx.get(k);
+    if at != 0 {
+        return at - 1;
+    }
+    files.push(fid);
+    idx.put(k, @int_cast(u32, files.len));
+    return @int_cast(u32, files.len - 1);
+}
+
+// Reads "axiom.lines" into the unit's functions: each file becomes a source
+// file of this process (u.g_files, with no text: only its path is used).
+fn read_lines(r: *mut bn.Reader, un: *mut Unit) void {
+    let nfiles = r.uleb();
+    let ids = u.newn.[i32](@truncate(usize, nfiles) + 1);
+    for k in @as(u64, 0)..nfiles {
+        let path = r.name();
+        let sf = u.new.[u.SourceFile]();
+        sf.path = path;
+        sf.display = path;
+        sf.text = "";
+        sf.id = @int_cast(i32, u.g_files.len);
+        u.g_files.push(sf);
+        ids[@truncate(usize, k)] = sf.id;
+    }
+    let nf = r.uleb();
+    for _k in @as(u64, 0)..nf {
+        let fi = @truncate(usize, r.uleb());
+        let df = r.uleb();
+        let dl = r.uleb();
+        let n = r.uleb();
+        let mut f = u.nil.[Func]();
+        if fi < un.funcs.len {
+            f = un.funcs.get(fi);
+        }
+        if u.notnil(f) and (df > 0) and (df <= nfiles) {
+            f.src = src_of(ids[@truncate(usize, df - 1)], dl);
+        }
+        for _j in @as(u64, 0)..n {
+            let off = r.uleb();
+            let file = r.uleb();
+            let line = r.uleb();
+            if u.notnil(f) and (file < nfiles) {
+                f.lines.push((off << 32) | @as(u64, src_of(ids[@truncate(usize, file)], line)));
+            }
+        }
+    }
+}
+
+fn src_of(file: i32, line: u64) u32 {
+    if (file >= 4095) or (line == 0) or (line >= 0x10_0000) {
+        return 0;
+    }
+    return (@bit_cast(u32, file + 1) << 20) | @truncate(u32, line);
 }
 
 // The imports: memory, table, globals, functions.
@@ -547,6 +669,8 @@ pub fn read_object(d: []u8) *mut Unit {
             } else if u.str_eq(nm, "reloc.DATA") {
                 _ = r.uleb();
                 read_relocs(&mut r, &mut rd.data_relocs);
+            } else if u.str_eq(nm, "axiom.lines") {
+                read_lines(&mut r, un);
             }
         }
         r.pos = end;

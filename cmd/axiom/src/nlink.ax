@@ -11,6 +11,7 @@
 // relocations that the ELF and Mach-O linkers both apply.
 // =============================================================================
 import "bin.ax" as bn;
+import "dwarf.ax" as dw;
 import "elf.ax" as elf;
 import "util.ax" as u;
 
@@ -21,6 +22,7 @@ pub const C_DATA: i32 = 2;
 pub const C_TDATA: i32 = 3;
 pub const C_TBSS: i32 = 4;
 pub const C_BSS: i32 = 5;
+pub const C_DEBUG: i32 = 6;  // debug information (dwarf.ax): not loaded, merged by debug_sections
 
 // A global (non-local) symbol of the link.
 pub struct GSym {
@@ -412,6 +414,76 @@ pub fn copy_class(b: []mut u8, cls: i32, file_of: fn(u64) u64) void {
             }
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Debug information
+// -----------------------------------------------------------------------------
+pub struct DebugSec {
+    name: []u8,
+    data: bn.Bytes,
+}
+
+/// The objects' debug sections (C_DEBUG; dwarf.ax), each name's pieces one
+/// after the other in the order of the objects, with their relocations
+/// applied: a piece's offset in the whole is its section's address
+/// (sec_addr), so offsets into another debug section and addresses of
+/// code both are the symbol's address plus the addend. A symbol is the
+/// object's own (a function's copy that the link did not keep still has its
+/// code, which its debug information describes). Empty without -g.
+pub fn debug_sections() u.List.[DebugSec] {
+    let mut out = u.List.[DebugSec].empty();
+    for name in dw.SEC_NAMES {
+        let mut d = bn.new_bytes();
+        for oi in 0..objs.len {
+            let o = objs.get(oi);
+            for k in 0..o.secs.len {
+                if (sec_cls.get(oi)[k] == C_DEBUG) and u.str_eq(o.secs.get(k).name, name) {
+                    sec_addr.get(oi)[k] = @as(u64, d.len());
+                    d.put(o.secs.get(k).data.view());
+                }
+            }
+        }
+        out.push(DebugSec.{ name: name, data: d });
+    }
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            if sec_cls.get(oi)[k] != C_DEBUG {
+                continue;
+            }
+            let s = o.secs.get(k);
+            let mut at: usize = 0;
+            while (at < out.len) and not u.str_eq(out.get(at).name, s.name) {
+                at += 1;
+            }
+            if at == out.len {
+                continue;
+            }
+            let b = out.at(at).data.view();
+            let base = sec_addr.get(oi)[k];
+            for r in s.relocs.items() {
+                let v = sym_addr_in(oi, r.sym) + @bit_cast(u64, r.addend);
+                let p = @truncate(usize, base + r.off);
+                if (r.ty == elf.R_X86_64_64) or (r.ty == elf.R_AARCH64_ABS64) {
+                    bn.w64(b, @as(u64, p), v);
+                } else if (r.ty == elf.R_X86_64_32) or (r.ty == elf.R_AARCH64_ABS32) {
+                    bn.w32(b, @as(u64, p), v & 0xffff_ffff);
+                }
+                // (other types come only from other compilers' objects: their
+                // debug information is kept as it is)
+            }
+        }
+    }
+    let mut n: usize = 0;
+    for k in 0..out.len {
+        if out.get(k).data.len() > 0 {
+            out.set(n, out.get(k));
+            n += 1;
+        }
+    }
+    out.len = n;
+    return out;
 }
 
 // -----------------------------------------------------------------------------

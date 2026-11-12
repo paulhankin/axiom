@@ -143,7 +143,8 @@ axiom check file.c...           the units are analyzed and linked, nothing is wr
 The other options of `axiom build` that apply: `--target`, `--cpu`, `--features`,
 `-O0`..`-O3`, `--stack-traces` (on native targets C functions' calls have call-site
 records, so stack traces show C frames with their lines; on WebAssembly they have none),
-`-g` (accepted: this compiler writes line tables for no code), `-l`, `-L`, `--link=`
+`-g` (debug information: `cgen_debug.ax` describes the types and variables, which
+`dwarf.ax` writes; at `-O0` the objects of variables stay in memory, `ir.F_VAR`), `-l`, `-L`, `--link=`
 (objects, libraries, and C sources for the system's C compiler), `--subsystem`, `--icon`,
 `--pdb`. Those of Axiom code (`--overflow`, `--sanitize`, `--coverage`,
 `--units`, `--emit-header`) are errors with C sources (an Axiom program with C units

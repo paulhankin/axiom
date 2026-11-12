@@ -1,0 +1,1300 @@
+// =============================================================================
+// dwarf.ax - DWARF 5 debug information for the native code generators
+// (x64.ax, a64.ax) and the WebAssembly linker (wlink.ax), with -g or
+// --debug-info=lines|full (tg.g_debug).
+//
+// A Unit collects an object's debug information as its functions are
+// encoded: each function's line table rows, its call frame states, its
+// name, place and declaration. finish_elf writes the sections into the
+// object, one compilation unit per object:
+//   .debug_abbrev    the abbreviations (a fixed table: abbrev_table)
+//   .debug_info      the compilation unit, a subprogram per function (and,
+//                    at DEBUG_FULL, the types and variables dbginfo.ax holds)
+//   .debug_str       names (DW_FORM_strp)
+//   .debug_line      the line program: a sequence per function
+//   .debug_line_str  the line table's directory and file names
+//   .debug_aranges   the unit's address range (its .text)
+//   .debug_frame     call frame information: a CIE, an FDE per function
+// References from one section to another and to code are relocations
+// (R_X86_64_32 / R_AARCH64_ABS32 against the section's symbol, R_X86_64_64
+// / R_AARCH64_ABS64 against the function's), which the system's linker and
+// our own (nlink.ax: debug_sections) resolve.
+//
+// What is recorded never changes the code: the code generators only note
+// offsets and states as they encode (and only when tg.g_debug is on).
+// Formats: the DWARF 5 standard (dwarfstd.org), sections 6.2 (line number
+// information), 6.4 (call frame information), 7 (data representation).
+// =============================================================================
+import "bin.ax" as bn;
+import "dbginfo.ax" as dbi;
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "util.ax" as u;
+import "version.ax" as ver;
+
+// The debug sections, in the order they are written.
+pub const D_ABBREV: usize = 0;
+pub const D_INFO: usize = 1;
+pub const D_STR: usize = 2;
+pub const D_LINE: usize = 3;
+pub const D_LINE_STR: usize = 4;
+pub const D_ARANGES: usize = 5;
+pub const D_FRAME: usize = 6;
+pub const NSEC: usize = 7;
+
+pub let SEC_NAMES: [7][]u8 = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line", ".debug_line_str",
+                              ".debug_aranges", ".debug_frame"];
+
+// Is it the name of a debug section this module writes (and the linkers merge)?
+pub fn is_debug_name(name: []u8) bool {
+    for n in SEC_NAMES {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Fixups: where a section refers to code or to another section.
+pub const FX_ADDR: u8 = 0;  // 8 bytes (4 on wasm32): the address of function `sym` + addend
+pub const FX_SEC: u8 = 1;   // 4 bytes: offset `addend` in this unit's debug section `sym` (a D_*)
+
+pub struct Fix {
+    off: u64,
+    kind: u8,
+    sym: u32,
+    addend: i64,
+}
+
+// A section's bytes and its fixups.
+pub struct Part {
+    b: bn.Bytes,
+    fx: u.List.[Fix],
+}
+
+// Architectures (the CIE and the register numbers differ)
+pub const ARCH_X64: i32 = 0;
+pub const ARCH_A64: i32 = 1;
+pub const ARCH_WASM: i32 = 2;
+
+// DWARF register numbers (System V x86-64 psABI 3.6.2; AAPCS64's DWARF
+// for the Arm 64-bit architecture, 4.1)
+pub const X64_RBP: u32 = 6;
+pub const X64_RSP: u32 = 7;
+pub const X64_RA: u32 = 16;
+pub const A64_FP: u32 = 29;
+pub const A64_LR: u32 = 30;
+pub const A64_SP: u32 = 31;
+
+pub struct Unit {
+    on: bool,
+    arch: i32,
+    addr_size: u64,
+    full: bool,  // DEBUG_FULL: types and variables too
+    lang: u32,   // DW_LANG_* (0: none named)
+    parts: [7]Part,
+    strs: u.SymMap.[u32],   // interned string -> its .debug_str offset + 1
+    lstrs: u.SymMap.[u32],  // interned string -> its .debug_line_str offset + 1
+    files: u.List.[u32],    // the line table's files: their names' .debug_line_str offsets
+    fmap: u.SymMap.[u32],   // interned file name -> its index in the line table
+    by_id: u.List.[u32],    // source file id -> its index in the line table + 1 (files without #line)
+    nfuncs: u32,
+    first_src: u32,  // the first function's location: the unit's name
+    text_sym: u32,   // (ELF) a local symbol at the start of .text
+    // DEBUG_FULL: references to types (in .debug_info: sym is the type's
+    // dbginfo index), and the data's symbols (name -> symbol index + 1)
+    trefs: u.List.[Fix],
+    gsyms: u.SymMap.[u32],
+}
+
+pub fn none() Unit {
+    return Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0, parts: [new_part(); 7],
+                  strs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
+                  lstrs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
+                  files: u.List.[u32].empty(), fmap: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](),
+                                                                      cap: 0, len: 0 }, by_id: u.List.[u32].empty(),
+                  nfuncs: 0, first_src: 0, text_sym: 0, trefs: u.List.[Fix].empty(),
+                  gsyms: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 } };
+}
+
+fn new_part() Part {
+    return Part.{ b: bn.new_bytes(), fx: u.List.[Fix].empty() };
+}
+
+/// A unit for an object of architecture `arch` (ARCH_*), with addresses of
+/// addr_size bytes, at debug level `level` (tg.DEBUG_*; DEBUG_NONE: off).
+pub fn begin(arch: i32, addr_size: u64, level: i32) Unit {
+    let mut d = none();
+    if level == 0 {
+        return d;
+    }
+    d.on = true;
+    d.arch = arch;
+    d.addr_size = addr_size;
+    d.full = level >= 2;
+    // the frame section starts with the CIE (frame_cie), which every FDE refers to
+    if arch != ARCH_WASM {
+        frame_cie(&mut d);
+    }
+    return d;
+}
+
+// -----------------------------------------------------------------------------
+// Strings and files
+// -----------------------------------------------------------------------------
+fn str_off(d: *mut Unit, s: []u8) u32 {
+    let k = u.intern(s);
+    let at = d.strs.get(k);
+    if at != 0 {
+        return at - 1;
+    }
+    let p = &mut d.parts[D_STR].b;
+    let o = @int_cast(u32, p.len());
+    p.put(s);
+    p.u8_(0);
+    d.strs.put(k, o + 1);
+    return o;
+}
+
+fn line_str_off(d: *mut Unit, s: []u8) u32 {
+    let k = u.intern(s);
+    let at = d.lstrs.get(k);
+    if at != 0 {
+        return at - 1;
+    }
+    let p = &mut d.parts[D_LINE_STR].b;
+    let o = @int_cast(u32, p.len());
+    p.put(s);
+    p.u8_(0);
+    d.lstrs.put(k, o + 1);
+    return o;
+}
+
+// A 4-byte reference to offset `at` of section `sec` of the unit.
+fn sec_ref(d: *mut Unit, p: *mut Part, sec: usize, at: u64) void {
+    p.fx.push(Fix.{ off: @as(u64, p.b.len()), kind: FX_SEC, sym: @truncate(u32, sec), addend: @bit_cast(i64, at) });
+    p.b.u32_(0);
+}
+
+// The address of function symbol `sym` + `add`.
+fn addr_ref(d: *mut Unit, p: *mut Part, sym: u32, add: u64) void {
+    p.fx.push(Fix.{ off: @as(u64, p.b.len()), kind: FX_ADDR, sym: sym, addend: @bit_cast(i64, add) });
+    if d.addr_size == 4 {
+        p.b.u32_(0);
+    } else {
+        p.b.u64_(0);
+    }
+}
+
+// A source file's path as debuggers should find it: absolute, if it exists.
+fn file_path(file: i32) []u8 {
+    let p = u.file_of(file).path;
+    let r = u.real_path(p);
+    if u.isnos(r) {
+        return p;
+    }
+    return r;
+}
+
+// The line table's index of the file and the line of a location, presumed
+// (C's #line directives).
+pub struct Where {
+    file: u32,
+    line: u32,
+}
+
+pub fn where_of(d: *mut Unit, src: u32) Where {
+    let file = ir.src_file(src);
+    let line = ir.src_line(src);
+    if (src == 0) or (file < 0) or (@int_cast(usize, file) >= u.g_files.len) {
+        return Where.{ file: 0, line: 0 };
+    }
+    let sf = u.file_of(file);
+    if sf.marks.len == 0 {
+        let k = @as(usize, @bit_cast(u32, file));
+        while d.by_id.len <= k {
+            d.by_id.push(0);
+        }
+        if d.by_id.get(k) == 0 {
+            d.by_id.set(k, file_index(d, file_path(file)) + 1);
+        }
+        return Where.{ file: d.by_id.get(k) - 1, line: line };
+    }
+    let p = u.presumed_line(file, @bit_cast(i32, line));
+    let mut name = p.name;
+    if not p.marked {
+        name = file_path(file);
+    }
+    let mut ln: u32 = 0;
+    if (p.line > 0) and (p.line < 0x7fff_ffff) {
+        ln = @truncate(u32, @bit_cast(u64, p.line));
+    }
+    return Where.{ file: file_index(d, name), line: ln };
+}
+
+// The line table's index of the file named `name` (from 1: DWARF 5's file 0
+// is the unit's primary file, which finish repeats as entry 0).
+fn file_index(d: *mut Unit, name: []u8) u32 {
+    let k = u.intern(name);
+    let at = d.fmap.get(k);
+    if at != 0 {
+        return at;
+    }
+    d.files.push(line_str_off(d, name));
+    let idx = @int_cast(u32, d.files.len);
+    d.fmap.put(k, idx);
+    return idx;
+}
+
+// -----------------------------------------------------------------------------
+// Functions
+// -----------------------------------------------------------------------------
+/// A line table row (encode_func's rows): the code offset in the high 32
+/// bits (ROW_PE: where the prologue ends), the source location (ir.src_loc)
+/// in the low.
+pub const ROW_PE: u64 = @as(u64, 1) << 63;
+
+/// A call frame state: from code offset `off` on (bits 0-31), the CFA is
+/// register `reg` (bits 56-60) + 8 * `k` (bits 61-63), and the registers of
+/// the function's save list (Func.regs) whose bits are set in bits 32-55
+/// are saved at their offsets from the CFA; the others hold the caller's
+/// values.
+pub fn cfi_state(off: u64, reg: u32, k: u64, mask: u64) u64 {
+    return ((off & 0xffff_ffff) | ((mask & 0xff_ffff) << 32)) | ((@as(u64, reg & 31) << 56) | ((k & 7) << 61));
+}
+
+/// A saved register (Func.regs): its DWARF number and its offset from the CFA.
+pub fn saved_reg(reg: u32, off: i64) u64 {
+    return (@as(u64, reg) << 32) | (@bit_cast(u64, off) & 0xffff_ffff);
+}
+
+pub struct Func {
+    sym: u32,    // its symbol (ELF: in the object; wasm: the linker's function number)
+    name: []u8,  // for people
+    external: bool,
+    size: u64,
+    src: u32,       // its declaration
+    rows: []u64,    // ROW_* (in code order)
+    cfi: []u64,     // cfi_state (in code order; empty: none)
+    regs: []u64,    // saved_reg
+    irf: *ir.Func,  // (DEBUG_FULL: its variables, dbginfo.ax)
+    vars: []i64,    // DEBUG_FULL: per variable of dbinfo.vars_of(irf), its frame offset from the CFA, or NO_LOC
+}
+
+// Is source location `src` in the standard library?
+fn from_std(src: u32) bool {
+    let file = ir.src_file(src);
+    if (src == 0) or (file < 0) or (@int_cast(usize, file) >= u.g_files.len) {
+        return true;
+    }
+    return u.starts(u.file_of(file).display, "std/");
+}
+
+/// The name for people of the function whose symbol is `sym`.
+pub fn name_of(sym: []u8) []u8 {
+    return dbi.func_name(sym, elf.display_name(sym));
+}
+
+/// The name of IR function f (symbol name `sym` for people) in its source.
+pub fn func_name(f: *ir.Func, sym: []u8) []u8 {
+    return dbi.func_name(f.name, sym);
+}
+
+/// Adds function `f`'s line table, subprogram and frame description.
+pub fn add_func(d: *mut Unit, f: *Func) void {
+    if not d.on {
+        return;
+    }
+    // (the unit is named after its first function's file, the standard
+    // library's only when all are: a C program's start-up comes first)
+    if (d.first_src == 0) or (from_std(d.first_src) and not from_std(f.src)) {
+        d.first_src = f.src;
+    }
+    d.nfuncs += 1;
+    line_sequence(d, f);
+    subprogram(d, f);
+    if f.cfi.len > 0 {
+        fde(d, f);
+    }
+}
+
+// Line number program opcodes (DWARF 5, 6.2.5)
+const LNS_COPY: u8 = 1;
+const LNS_ADVANCE_PC: u8 = 2;
+const LNS_ADVANCE_LINE: u8 = 3;
+const LNS_SET_FILE: u8 = 4;
+const LNS_SET_PROLOGUE_END: u8 = 10;
+const LNE_END_SEQUENCE: u8 = 1;
+const LNE_SET_ADDRESS: u8 = 2;
+const LINE_BASE: i64 = -5;
+const LINE_RANGE: i64 = 14;
+const OPCODE_BASE: i64 = 13;
+
+// The function's rows as a sequence of the line program: the rows in
+// order, one per offset (the last there wins, but a prologue end is kept),
+// none that repeats the location before it but a prologue end, and rows
+// without a location (src 0) left out: their code is the row's before.
+fn line_sequence(d: *mut Unit, f: *Func) void {
+    let p = &mut d.parts[D_LINE];
+    let b = &mut p.b;
+    b.u8_(0);
+    b.uleb(1 + d.addr_size);
+    b.u8_(LNE_SET_ADDRESS);
+    addr_ref(d, p, f.sym, 0);
+    let mut addr: u64 = 0;
+    let mut file: u32 = 1;
+    let mut line: i64 = 1;
+    let mut started = false;
+    let n = f.rows.len;
+    let mut k: usize = 0;
+    while k < n {
+        let r = f.rows[k];
+        let off = (r >> 32) & 0x7fff_ffff;
+        let mut pe = (r & ROW_PE) != 0;
+        let mut src = @truncate(u32, r);
+        // the last row at this offset (with a location) is the one
+        while ((k + 1) < n) and (((f.rows[k + 1] >> 32) & 0x7fff_ffff) == off) {
+            k += 1;
+            let r2 = f.rows[k];
+            if (r2 & ROW_PE) != 0 {
+                pe = true;
+            }
+            if @truncate(u32, r2) != 0 {
+                src = @truncate(u32, r2);
+            }
+        }
+        k += 1;
+        if off >= f.size {
+            continue;  // (nothing after it: a row at the end)
+        }
+        let mut w = Where.{ file: file, line: @truncate(u32, @bit_cast(u64, line)) };
+        if src != 0 {
+            w = where_of(d, src);
+            if w.line == 0 {
+                w = Where.{ file: file, line: @truncate(u32, @bit_cast(u64, line)) };
+            }
+        } else if not started {
+            continue;
+        }
+        if started and not pe and (w.file == file) and (@as(i64, w.line) == line) {
+            continue;
+        }
+        if not started and (src == 0) {
+            continue;
+        }
+        if not started and (off > 0) {
+            // (code before the first location, the prologue's: that location's)
+            row_at(b, &mut file, &mut line, &mut addr, w, 0, false);
+            started = true;
+            if not pe {
+                continue;
+            }
+        }
+        started = true;
+        row_at(b, &mut file, &mut line, &mut addr, w, off, pe);
+    }
+    if not started {
+        // (no location at all: the declaration's line for all of it, or line
+        // 0, DWARF's "no source", for code the compiler made up)
+        let mut w = where_of(d, f.src);
+        if w.line == 0 {
+            w = Where.{ file: 1, line: 0 };
+        }
+        row_at(b, &mut file, &mut line, &mut addr, w, 0, false);
+    }
+    if f.size > addr {
+        b.u8_(LNS_ADVANCE_PC);
+        b.uleb(f.size - addr);
+    }
+    b.u8_(0);
+    b.uleb(1);
+    b.u8_(LNE_END_SEQUENCE);
+}
+
+// A row of the line program: location w from code offset `off` on (pe: the
+// prologue ends there), from the state (file, line, addr) of the row before.
+fn row_at(b: *mut bn.Bytes, file: *mut u32, line: *mut i64, addr: *mut u64, w: Where, off: u64, pe: bool) void {
+    if w.file != file.* {
+        b.u8_(LNS_SET_FILE);
+        b.uleb(@as(u64, w.file));
+        file.* = w.file;
+    }
+    if pe {
+        b.u8_(LNS_SET_PROLOGUE_END);
+    }
+    let dl = @as(i64, w.line) - line.*;
+    let da = @bit_cast(i64, off - addr.*);
+    let mut sp: i64 = -1;
+    if (dl >= LINE_BASE) and (dl < (LINE_BASE + LINE_RANGE)) {
+        sp = (dl - LINE_BASE) + (LINE_RANGE * da) + OPCODE_BASE;
+    }
+    if (sp >= 0) and (sp <= 255) {
+        b.u8_(@truncate(u8, @bit_cast(u64, sp)));
+    } else {
+        if dl != 0 {
+            b.u8_(LNS_ADVANCE_LINE);
+            b.sleb(dl);
+        }
+        if da != 0 {
+            b.u8_(LNS_ADVANCE_PC);
+            b.uleb(@bit_cast(u64, da));
+        }
+        b.u8_(LNS_COPY);
+    }
+    addr.* = off;
+    line.* = @as(i64, w.line);
+}
+
+// -----------------------------------------------------------------------------
+// .debug_info
+// -----------------------------------------------------------------------------
+// Tags, attributes and forms (DWARF 5, 7.5)
+pub const TAG_COMPILE_UNIT: u64 = 0x11;
+pub const TAG_SUBPROGRAM: u64 = 0x2e;
+pub const AT_NAME: u64 = 0x03;
+pub const AT_STMT_LIST: u64 = 0x10;
+pub const AT_LOW_PC: u64 = 0x11;
+pub const AT_HIGH_PC: u64 = 0x12;
+pub const AT_LANGUAGE: u64 = 0x13;
+pub const AT_COMP_DIR: u64 = 0x1b;
+pub const AT_PRODUCER: u64 = 0x25;
+pub const AT_DECL_FILE: u64 = 0x3a;
+pub const AT_DECL_LINE: u64 = 0x3b;
+pub const AT_EXTERNAL: u64 = 0x3f;
+pub const AT_FRAME_BASE: u64 = 0x40;
+pub const FORM_ADDR: u64 = 0x01;
+pub const FORM_DATA2: u64 = 0x05;
+pub const FORM_DATA4: u64 = 0x06;
+pub const FORM_DATA8: u64 = 0x07;
+pub const FORM_DATA1: u64 = 0x0b;
+pub const FORM_FLAG: u64 = 0x0c;
+pub const FORM_SDATA: u64 = 0x0d;
+pub const FORM_STRP: u64 = 0x0e;
+pub const FORM_UDATA: u64 = 0x0f;
+pub const FORM_REF4: u64 = 0x13;
+pub const FORM_SEC_OFFSET: u64 = 0x17;
+pub const FORM_EXPRLOC: u64 = 0x18;
+pub const FORM_FLAG_PRESENT: u64 = 0x19;
+pub const FORM_LINE_STRP: u64 = 0x1f;
+pub const OP_CALL_FRAME_CFA: u8 = 0x9c;
+
+// Abbreviation codes (abbrev_table)
+pub const AB_CU: u64 = 1;
+pub const AB_CU_NOLANG: u64 = 2;
+pub const AB_SUB_EXT: u64 = 3;
+pub const AB_SUB: u64 = 4;
+pub const AB_SUB_EXT_KIDS: u64 = 5;
+pub const AB_SUB_KIDS: u64 = 6;
+pub const AB_SUB_TYPED: u64 = 7;  // + AB_SUB_EXT .. AB_SUB_KIDS - 3: with DW_AT_type (a C function's result)
+
+// The abbreviations: code, tag, children, (attribute, form) pairs, 0 0.
+fn abbrev_table(b: *mut bn.Bytes) void {
+    let cu: [7][2]u64 = [[AT_PRODUCER, FORM_STRP], [AT_LANGUAGE, FORM_DATA2], [AT_NAME, FORM_STRP],
+                         [AT_COMP_DIR, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
+                         [AT_STMT_LIST, FORM_SEC_OFFSET]];
+    abbrev(b, AB_CU, TAG_COMPILE_UNIT, true, cu[..]);
+    let cu2: [6][2]u64 = [[AT_PRODUCER, FORM_STRP], [AT_NAME, FORM_STRP], [AT_COMP_DIR, FORM_STRP],
+                          [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4], [AT_STMT_LIST, FORM_SEC_OFFSET]];
+    abbrev(b, AB_CU_NOLANG, TAG_COMPILE_UNIT, true, cu2[..]);
+    let sub: [7][2]u64 = [[AT_NAME, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
+                          [AT_FRAME_BASE, FORM_EXPRLOC], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                          [AT_EXTERNAL, FORM_FLAG_PRESENT]];
+    abbrev(b, AB_SUB_EXT, TAG_SUBPROGRAM, false, sub[..]);
+    abbrev(b, AB_SUB, TAG_SUBPROGRAM, false, sub[0..6]);
+    abbrev(b, AB_SUB_EXT_KIDS, TAG_SUBPROGRAM, true, sub[..]);
+    abbrev(b, AB_SUB_KIDS, TAG_SUBPROGRAM, true, sub[0..6]);
+    let tsub: [9][2]u64 = [[AT_NAME, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
+                           [AT_FRAME_BASE, FORM_EXPRLOC], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                           [AT_PROTOTYPED, FORM_FLAG_PRESENT], [AT_TYPE, FORM_REF4], [AT_EXTERNAL, FORM_FLAG_PRESENT]];
+    abbrev(b, AB_SUB_TYPED, TAG_SUBPROGRAM, false, tsub[..]);
+    abbrev(b, AB_SUB_TYPED + 1, TAG_SUBPROGRAM, false, tsub[0..8]);
+    abbrev(b, AB_SUB_TYPED + 2, TAG_SUBPROGRAM, true, tsub[..]);
+    abbrev(b, AB_SUB_TYPED + 3, TAG_SUBPROGRAM, true, tsub[0..8]);
+    type_abbrevs(b);
+    b.u8_(0);
+}
+
+pub fn abbrev(b: *mut bn.Bytes, code: u64, tag: u64, children: bool, attrs: [][2]u64) void {
+    b.uleb(code);
+    b.uleb(tag);
+    if children {
+        b.u8_(1);
+    } else {
+        b.u8_(0);
+    }
+    for a in attrs {
+        b.uleb(a[0]);
+        b.uleb(a[1]);
+    }
+    b.u8_(0);
+    b.u8_(0);
+}
+
+// The function's DW_TAG_subprogram (after the unit's DIE: finish_elf puts
+// the header and that DIE before these).
+fn subprogram(d: *mut Unit, f: *Func) void {
+    let mut vs: []dbi.DVar = u.nil_slice.[dbi.DVar]();
+    if d.full and u.notnil(f.irf) {
+        vs = dbi.vars_of(f.irf.name);
+    }
+    let kids = vs.len > 0;
+    let mut rt: i32 = -2;
+    if d.full and u.notnil(f.irf) {
+        rt = dbi.result_of(f.irf.name);
+    }
+    let p = &mut d.parts[D_INFO];
+    let mut code = AB_SUB;
+    if f.external {
+        code = pk(kids, AB_SUB_EXT_KIDS, AB_SUB_EXT);
+    } else if kids {
+        code = AB_SUB_KIDS;
+    }
+    if rt >= 0 {
+        code += AB_SUB_TYPED - AB_SUB_EXT;
+    }
+    p.b.uleb(code);
+    let so = str_off(d, f.name);
+    p.fx.push(Fix.{ off: @as(u64, p.b.len()), kind: FX_SEC, sym: @truncate(u32, D_STR), addend: @as(i64, so) });
+    p.b.u32_(0);
+    addr_ref(d, p, f.sym, 0);
+    p.b.u32_(f.size);
+    p.b.uleb(1);
+    p.b.u8_(OP_CALL_FRAME_CFA);
+    let w = where_of(d, f.src);
+    p.b.uleb(@as(u64, w.file));
+    p.b.uleb(@as(u64, w.line));
+    if rt >= 0 {
+        tref(d, rt);
+    }
+    if kids {
+        local_vars(d, f, vs);
+        d.parts[D_INFO].b.u8_(0);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Types and variables (DEBUG_FULL; dbginfo.ax)
+// -----------------------------------------------------------------------------
+pub const NO_LOC: i64 = -0x7fff_ffff_ffff_ffff;
+
+pub const TAG_ARRAY_TYPE: u64 = 0x01;
+pub const TAG_ENUMERATION_TYPE: u64 = 0x04;
+pub const TAG_FORMAL_PARAMETER: u64 = 0x05;
+pub const TAG_MEMBER: u64 = 0x0d;
+pub const TAG_POINTER_TYPE: u64 = 0x0f;
+pub const TAG_STRUCTURE_TYPE: u64 = 0x13;
+pub const TAG_SUBROUTINE_TYPE: u64 = 0x15;
+pub const TAG_UNION_TYPE: u64 = 0x17;
+pub const TAG_UNSPECIFIED_PARAMETERS: u64 = 0x18;
+pub const TAG_SUBRANGE_TYPE: u64 = 0x21;
+pub const TAG_BASE_TYPE: u64 = 0x24;
+pub const TAG_CONST_TYPE: u64 = 0x26;
+pub const TAG_ENUMERATOR: u64 = 0x28;
+pub const TAG_VARIABLE: u64 = 0x34;
+pub const TAG_VOLATILE_TYPE: u64 = 0x35;
+pub const TAG_RESTRICT_TYPE: u64 = 0x37;
+pub const TAG_ATOMIC_TYPE: u64 = 0x47;
+pub const AT_LOCATION: u64 = 0x02;
+pub const AT_BYTE_SIZE: u64 = 0x0b;
+pub const AT_BIT_SIZE: u64 = 0x0d;
+pub const AT_CONST_VALUE: u64 = 0x1c;
+pub const AT_PROTOTYPED: u64 = 0x27;
+pub const AT_COUNT: u64 = 0x37;
+pub const AT_DATA_MEMBER_LOCATION: u64 = 0x38;
+pub const AT_DECLARATION: u64 = 0x3c;
+pub const AT_ENCODING: u64 = 0x3e;
+pub const AT_TYPE: u64 = 0x49;
+pub const AT_DATA_BIT_OFFSET: u64 = 0x6b;
+pub const OP_ADDR: u8 = 0x03;
+pub const OP_FBREG: u8 = 0x91;
+
+// Abbreviation codes of types and variables (type_abbrevs)
+const AB_BASE: u64 = 16;
+const AB_PTR: u64 = 17;
+const AB_PTR_VOID: u64 = 18;
+const AB_QUAL: u64 = 19;  // + 2k (const, volatile, restrict, _Atomic), + 1: of void
+const AB_ARRAY: u64 = 27;
+const AB_SUBRANGE: u64 = 28;
+const AB_SUBRANGE_N: u64 = 29;
+const AB_RECORD: u64 = 30;  // + 0 a structure, 1 a union; + 2: without a name; + 4: incomplete
+const AB_MEMBER: u64 = 38;
+const AB_MEMBER_ANON: u64 = 39;
+const AB_BITFIELD: u64 = 40;
+const AB_ENUM: u64 = 41;
+const AB_ENUM_ANON: u64 = 42;
+const AB_ENUMERATOR: u64 = 43;
+const AB_FTYPE: u64 = 44;
+const AB_FTYPE_VOID: u64 = 45;
+const AB_FPARAM: u64 = 46;
+const AB_UNSPEC: u64 = 47;
+const AB_LVAR: u64 = 48;  // + 0 a variable, 1 a parameter; + 2: optimized out (no location)
+const AB_GVAR: u64 = 52;  // + 1: not external
+
+fn type_abbrevs(b: *mut bn.Bytes) void {
+    let base: [3][2]u64 = [[AT_NAME, FORM_STRP], [AT_BYTE_SIZE, FORM_UDATA], [AT_ENCODING, FORM_DATA1]];
+    abbrev(b, AB_BASE, TAG_BASE_TYPE, false, base[..]);
+    let ptr: [2][2]u64 = [[AT_BYTE_SIZE, FORM_UDATA], [AT_TYPE, FORM_REF4]];
+    abbrev(b, AB_PTR, TAG_POINTER_TYPE, false, ptr[..]);
+    abbrev(b, AB_PTR_VOID, TAG_POINTER_TYPE, false, ptr[0..1]);
+    let quals: [4]u64 = [TAG_CONST_TYPE, TAG_VOLATILE_TYPE, TAG_RESTRICT_TYPE, TAG_ATOMIC_TYPE];
+    let ty: [1][2]u64 = [[AT_TYPE, FORM_REF4]];
+    for k in @as(usize, 0)..4 {
+        abbrev(b, AB_QUAL + (2 * @as(u64, k)), quals[k], false, ty[..]);
+        abbrev(b, AB_QUAL + (2 * @as(u64, k)) + 1, quals[k], false, ty[0..0]);
+    }
+    abbrev(b, AB_ARRAY, TAG_ARRAY_TYPE, true, ty[..]);
+    abbrev(b, AB_SUBRANGE, TAG_SUBRANGE_TYPE, false, ty[0..0]);
+    let cnt: [1][2]u64 = [[AT_COUNT, FORM_UDATA]];
+    abbrev(b, AB_SUBRANGE_N, TAG_SUBRANGE_TYPE, false, cnt[..]);
+    let rec: [4][2]u64 = [
+        [AT_NAME, FORM_STRP], [AT_BYTE_SIZE, FORM_UDATA], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA]];
+    let decl: [2][2]u64 = [[AT_NAME, FORM_STRP], [AT_DECLARATION, FORM_FLAG_PRESENT]];
+    let tags: [2]u64 = [TAG_STRUCTURE_TYPE, TAG_UNION_TYPE];
+    for k in @as(usize, 0)..2 {
+        abbrev(b, AB_RECORD + @as(u64, k), tags[k], true, rec[..]);
+        abbrev(b, AB_RECORD + 2 + @as(u64, k), tags[k], true, rec[1..4]);
+        abbrev(b, AB_RECORD + 4 + @as(u64, k), tags[k], false, decl[..]);
+        abbrev(b, AB_RECORD + 6 + @as(u64, k), tags[k], false, decl[1..2]);
+    }
+    let mem: [3][2]u64 = [[AT_NAME, FORM_STRP], [AT_TYPE, FORM_REF4], [AT_DATA_MEMBER_LOCATION, FORM_UDATA]];
+    abbrev(b, AB_MEMBER, TAG_MEMBER, false, mem[..]);
+    abbrev(b, AB_MEMBER_ANON, TAG_MEMBER, false, mem[1..3]);
+    let bf: [4][2]u64 = [
+        [AT_NAME, FORM_STRP], [AT_TYPE, FORM_REF4], [AT_BIT_SIZE, FORM_UDATA], [AT_DATA_BIT_OFFSET, FORM_UDATA]];
+    abbrev(b, AB_BITFIELD, TAG_MEMBER, false, bf[..]);
+    let en: [3][2]u64 = [[AT_NAME, FORM_STRP], [AT_TYPE, FORM_REF4], [AT_BYTE_SIZE, FORM_UDATA]];
+    abbrev(b, AB_ENUM, TAG_ENUMERATION_TYPE, true, en[..]);
+    abbrev(b, AB_ENUM_ANON, TAG_ENUMERATION_TYPE, true, en[1..3]);
+    let er: [2][2]u64 = [[AT_NAME, FORM_STRP], [AT_CONST_VALUE, FORM_SDATA]];
+    abbrev(b, AB_ENUMERATOR, TAG_ENUMERATOR, false, er[..]);
+    let ft: [2][2]u64 = [[AT_PROTOTYPED, FORM_FLAG], [AT_TYPE, FORM_REF4]];
+    abbrev(b, AB_FTYPE, TAG_SUBROUTINE_TYPE, true, ft[..]);
+    abbrev(b, AB_FTYPE_VOID, TAG_SUBROUTINE_TYPE, true, ft[0..1]);
+    abbrev(b, AB_FPARAM, TAG_FORMAL_PARAMETER, false, ty[..]);
+    abbrev(b, AB_UNSPEC, TAG_UNSPECIFIED_PARAMETERS, false, ty[0..0]);
+    let lv: [5][2]u64 = [[AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                         [AT_TYPE, FORM_REF4], [AT_LOCATION, FORM_EXPRLOC]];
+    abbrev(b, AB_LVAR, TAG_VARIABLE, false, lv[..]);
+    abbrev(b, AB_LVAR + 1, TAG_FORMAL_PARAMETER, false, lv[..]);
+    abbrev(b, AB_LVAR + 2, TAG_VARIABLE, false, lv[0..4]);
+    abbrev(b, AB_LVAR + 3, TAG_FORMAL_PARAMETER, false, lv[0..4]);
+    let gv: [6][2]u64 = [[AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                         [AT_TYPE, FORM_REF4], [AT_LOCATION, FORM_EXPRLOC], [AT_EXTERNAL, FORM_FLAG_PRESENT]];
+    abbrev(b, AB_GVAR, TAG_VARIABLE, false, gv[..]);
+    abbrev(b, AB_GVAR + 1, TAG_VARIABLE, false, gv[0..5]);
+}
+
+/// The locations of function f's variables (dbginfo.vars_of), as offsets
+/// from the CFA: its object's frame slot's (slot_off: from the register the
+/// frame is addressed from, which is `base` below the CFA), or NO_LOC. Only
+/// at -O0 (dbginfo.locations), where each variable stays in its slot
+/// (ir.F_VAR), and only for an object still in the function.
+pub fn var_locs(f: *ir.Func, slot_off: fn(*ir.Value) i64, base: i64) []i64 {
+    let vs = dbi.vars_of(f.name);
+    if vs.len == 0 {
+        return u.nil_slice.[i64]();
+    }
+    let out = u.newn.[i64](vs.len + 1);
+    for k in 0..vs.len {
+        out[k] = NO_LOC;
+        let a = vs[k].alloca;
+        if not dbi.locations or u.isnil(a) or (a.op != ir.OP_ALLOCA) or (a.grave != 0) or u.isnil(a.blk) or
+           (@int_from_ptr(a.blk.fnp) != @int_from_ptr(f)) {
+            continue;
+        }
+        let o = slot_off(a);
+        if o != NO_LOC {
+            out[k] = o - base;
+        }
+    }
+    return out[0..vs.len];
+}
+
+/// Datum `name` of the object is symbol `sym` (DEBUG_FULL: the locations of
+/// static variables).
+pub fn add_data_sym(d: *mut Unit, name: []u8, sym: u32) void {
+    if d.on and d.full {
+        d.gsyms.put(u.intern(name), sym + 1);
+    }
+}
+
+fn pk(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn ib(d: *mut Unit) *mut bn.Bytes {
+    return &mut d.parts[D_INFO].b;
+}
+
+fn strp(d: *mut Unit, s: []u8) void {
+    let so = str_off(d, s);
+    sec_ref(d, &mut d.parts[D_INFO], D_STR, @as(u64, so));
+}
+
+// A reference to type t (a dbginfo index), which finish resolves.
+fn tref(d: *mut Unit, t: i32) void {
+    d.trefs.push(Fix.{ off: @as(u64, ib(d).len()), kind: FX_SEC, sym: @bit_cast(u32, t), addend: 0 });
+    ib(d).u32_(0);
+}
+
+fn decl_at(d: *mut Unit, src: u32) void {
+    let w = where_of(d, src);
+    ib(d).uleb(@as(u64, w.file));
+    ib(d).uleb(@as(u64, w.line));
+}
+
+// Function f's parameters and local variables vs, at the frame offsets
+// f.vars (from the CFA: DW_OP_fbreg, the frame base being the CFA), or
+// without a location (optimized out).
+fn local_vars(d: *mut Unit, f: *Func, vs: []dbi.DVar) void {
+    for k in 0..vs.len {
+        let v = vs[k];
+        if v.ty < 0 {
+            continue;
+        }
+        let mut loc = NO_LOC;
+        if k < f.vars.len {
+            loc = f.vars[k];
+        }
+        let mut code = AB_LVAR + pk(v.param, @as(u64, 1), @as(u64, 0));
+        if loc == NO_LOC {
+            code += 2;
+        }
+        ib(d).uleb(code);
+        strp(d, v.name);
+        decl_at(d, v.src);
+        tref(d, v.ty);
+        if loc != NO_LOC {
+            let mut e = bn.new_bytes();
+            e.u8_(OP_FBREG);
+            e.sleb(loc);
+            ib(d).uleb(@as(u64, e.len()));
+            ib(d).put(e.view());
+            e.free();
+        }
+    }
+}
+
+// The unit's static variables (those of the object's data) and every type,
+// after the subprograms; each type's offset in the part.
+fn types_and_data(d: *mut Unit) []u64 {
+    if not d.full {
+        return u.nil_slice.[u64]();
+    }
+    for v in dbi.globals.items() {
+        if u.isnil(v.global) or (v.ty < 0) {
+            continue;
+        }
+        let sym = d.gsyms.get(u.intern(v.global.name));
+        if sym == 0 {
+            continue;  // (another object's)
+        }
+        ib(d).uleb(AB_GVAR + pk(v.external, @as(u64, 0), @as(u64, 1)));
+        strp(d, v.name);
+        decl_at(d, v.src);
+        tref(d, v.ty);
+        ib(d).uleb(1 + d.addr_size);
+        ib(d).u8_(OP_ADDR);
+        addr_ref(d, &mut d.parts[D_INFO], sym - 1, 0);
+    }
+    let n = dbi.types.len;
+    let offs = u.newn.[u64](n + 1);
+    for k in 0..n {
+        offs[k] = @as(u64, ib(d).len());
+        type_die(d, dbi.types.at(k));
+    }
+    return offs[0..n];
+}
+
+fn type_die(d: *mut Unit, t: *dbi.DType) void {
+    let k = t.kind;
+    if k == dbi.DK_BASE {
+        ib(d).uleb(AB_BASE);
+        strp(d, t.name);
+        ib(d).uleb(t.size);
+        ib(d).u8_(t.enc);
+    } else if k == dbi.DK_POINTER {
+        ib(d).uleb(pk(t.target < 0, AB_PTR_VOID, AB_PTR));
+        ib(d).uleb(t.size);
+        if t.target >= 0 {
+            tref(d, t.target);
+        }
+    } else if (k == dbi.DK_CONST) or (k == dbi.DK_VOLATILE) or (k == dbi.DK_RESTRICT) or (k == dbi.DK_ATOMIC) {
+        let q = 2 * @as(u64, k - dbi.DK_CONST);
+        if t.target < 0 {
+            ib(d).uleb(AB_QUAL + q + 1);
+        } else {
+            ib(d).uleb(AB_QUAL + q);
+            tref(d, t.target);
+        }
+    } else if k == dbi.DK_ARRAY {
+        ib(d).uleb(AB_ARRAY);
+        tref(d, t.target);
+        if t.count >= 0 {
+            ib(d).uleb(AB_SUBRANGE_N);
+            ib(d).uleb(@bit_cast(u64, t.count));
+        } else {
+            ib(d).uleb(AB_SUBRANGE);  // (a bound not known: incomplete, or a variable length array)
+        }
+        ib(d).u8_(0);
+    } else if (k == dbi.DK_STRUCT) or (k == dbi.DK_UNION) {
+        record_die(d, t);
+    } else if k == dbi.DK_ENUM {
+        ib(d).uleb(pk(t.name.len > 0, AB_ENUM, AB_ENUM_ANON));
+        if t.name.len > 0 {
+            strp(d, t.name);
+        }
+        tref(d, t.target);
+        ib(d).uleb(t.size);
+        for m in t.members.items() {
+            ib(d).uleb(AB_ENUMERATOR);
+            strp(d, m.name);
+            ib(d).sleb(m.value);
+        }
+        ib(d).u8_(0);
+    } else {
+        // DK_FUNC: its parameters' types (unspecified after them: variadic, or no prototype)
+        ib(d).uleb(pk(t.target < 0, AB_FTYPE_VOID, AB_FTYPE));
+        ib(d).u8_(@truncate(u8, pk(t.proto, 1, 0)));
+        if t.target >= 0 {
+            tref(d, t.target);
+        }
+        for m in t.members.items() {
+            ib(d).uleb(AB_FPARAM);
+            tref(d, m.ty);
+        }
+        if t.variadic or not t.proto {
+            ib(d).uleb(AB_UNSPEC);
+        }
+        ib(d).u8_(0);
+    }
+}
+
+// A structure or union: its members at their offsets; a bit-field at its
+// bit offset from the start (DW_AT_data_bit_offset: on these little-endian
+// targets, the storage unit's offset in bits plus the field's place in it
+// from its least significant bit).
+fn record_die(d: *mut Unit, t: *dbi.DType) void {
+    let mut code = AB_RECORD + pk(t.kind == dbi.DK_UNION, @as(u64, 1), @as(u64, 0));
+    if t.name.len == 0 {
+        code += 2;
+    }
+    if not t.complete {
+        code += 4;
+    }
+    ib(d).uleb(code);
+    if t.name.len > 0 {
+        strp(d, t.name);
+    }
+    if not t.complete {
+        return;
+    }
+    ib(d).uleb(t.size);
+    decl_at(d, t.src);
+    for m in t.members.items() {
+        if m.bits > 0 {
+            ib(d).uleb(AB_BITFIELD);
+            strp(d, m.name);
+            tref(d, m.ty);
+            ib(d).uleb(@as(u64, @bit_cast(u32, m.bits)));
+            ib(d).uleb((m.off * 8) + @as(u64, @bit_cast(u32, m.bit_off)));
+            continue;
+        }
+        ib(d).uleb(pk(m.name.len > 0, AB_MEMBER, AB_MEMBER_ANON));
+        if m.name.len > 0 {
+            strp(d, m.name);
+        }
+        tref(d, m.ty);
+        ib(d).uleb(m.off);
+    }
+    ib(d).u8_(0);
+}
+
+// -----------------------------------------------------------------------------
+// .debug_frame
+// -----------------------------------------------------------------------------
+// Call frame instructions (DWARF 5, 6.4.2)
+const CFA_ADVANCE_LOC: u8 = 0x40;
+const CFA_OFFSET: u8 = 0x80;
+const CFA_NOP: u8 = 0x00;
+const CFA_ADVANCE_LOC1: u8 = 0x02;
+const CFA_ADVANCE_LOC2: u8 = 0x03;
+const CFA_ADVANCE_LOC4: u8 = 0x04;
+const CFA_OFFSET_EXTENDED: u8 = 0x05;
+const CFA_SAME_VALUE: u8 = 0x08;
+const CFA_DEF_CFA: u8 = 0x0c;
+const CFA_DEF_CFA_REGISTER: u8 = 0x0d;
+const CFA_DEF_CFA_OFFSET: u8 = 0x0e;
+const DATA_ALIGN: i64 = -8;
+
+fn code_align(d: *Unit) u64 {
+    if d.arch == ARCH_A64 {
+        return 4;
+    }
+    return 1;
+}
+
+// The CIE at the start of .debug_frame: version 4, no augmentation, the
+// address size, code and data alignment, the return address register, and
+// the state at a function's entry: x86-64 CFA = rsp + 8 with the return
+// address at CFA - 8; AArch64 CFA = sp, the return address in x30.
+fn frame_cie(d: *mut Unit) void {
+    let b = &mut d.parts[D_FRAME].b;
+    b.u32_(0);  // (the length, below)
+    b.u32_(0xffff_ffff);
+    b.u8_(4);
+    b.u8_(0);
+    b.u8_(@truncate(u8, d.addr_size));
+    b.u8_(0);
+    b.uleb(code_align(d));
+    b.sleb(DATA_ALIGN);
+    if d.arch == ARCH_A64 {
+        b.uleb(@as(u64, A64_LR));
+        b.u8_(CFA_DEF_CFA);
+        b.uleb(@as(u64, A64_SP));
+        b.uleb(0);
+    } else {
+        b.uleb(@as(u64, X64_RA));
+        b.u8_(CFA_DEF_CFA);
+        b.uleb(@as(u64, X64_RSP));
+        b.uleb(8);
+        b.u8_(CFA_OFFSET | @truncate(u8, X64_RA));
+        b.uleb(1);
+    }
+    pad_entry(b, 0);
+}
+
+// Pads the entry at `at` to a multiple of the address size with nops and
+// sets its length.
+fn pad_entry(b: *mut bn.Bytes, at: usize) void {
+    while ((b.len() - at) % 8) != 0 {
+        b.u8_(CFA_NOP);
+    }
+    b.set_u32(at, @as(u64, b.len() - at - 4));
+}
+
+fn cfa_entry_state(d: *Unit) u64 {
+    if d.arch == ARCH_A64 {
+        return cfi_state(0, A64_SP, 0, 0);
+    }
+    return cfi_state(0, X64_RSP, 1, 0);
+}
+
+// The function's FDE: its range, then for each change of state the advance
+// to it and what changed (the CFA rule, registers saved and given back).
+fn fde(d: *mut Unit, f: *Func) void {
+    let p = &mut d.parts[D_FRAME];
+    let at = p.b.len();
+    p.b.u32_(0);
+    sec_ref(d, p, D_FRAME, 0);
+    addr_ref(d, p, f.sym, 0);
+    if d.addr_size == 4 {
+        p.b.u32_(f.size);
+    } else {
+        p.b.u64_(f.size);
+    }
+    let b = &mut p.b;
+    let ca = code_align(d);
+    let mut cur = cfa_entry_state(d);
+    let mut loc: u64 = 0;
+    for s in f.cfi {
+        let off = s & 0xffff_ffff;
+        if off >= f.size {
+            break;  // (at the end: no code follows)
+        }
+        let st = s & ~@as(u64, 0xffff_ffff);
+        if st == (cur & ~@as(u64, 0xffff_ffff)) {
+            continue;
+        }
+        if off > loc {
+            let delta = (off - loc) / ca;
+            if delta < 64 {
+                b.u8_(CFA_ADVANCE_LOC | @truncate(u8, delta));
+            } else if delta < 256 {
+                b.u8_(CFA_ADVANCE_LOC1);
+                b.u8_(@truncate(u8, delta));
+            } else if delta < 65536 {
+                b.u8_(CFA_ADVANCE_LOC2);
+                b.u16_(delta);
+            } else {
+                b.u8_(CFA_ADVANCE_LOC4);
+                b.u32_(delta);
+            }
+            loc = off;
+        }
+        let creg = (st >> 56) & 31;
+        let ck = (st >> 61) * 8;
+        let oreg = (cur >> 56) & 31;
+        let ok = (cur >> 61) * 8;
+        if (creg != oreg) and (ck != ok) {
+            b.u8_(CFA_DEF_CFA);
+            b.uleb(creg);
+            b.uleb(ck);
+        } else if creg != oreg {
+            b.u8_(CFA_DEF_CFA_REGISTER);
+            b.uleb(creg);
+        } else if ck != ok {
+            b.u8_(CFA_DEF_CFA_OFFSET);
+            b.uleb(ck);
+        }
+        let nm = (st >> 32) & 0xff_ffff;
+        let om = (cur >> 32) & 0xff_ffff;
+        for k in 0..f.regs.len {
+            let bit = @as(u64, 1) << @as(u32, @truncate(u32, k));
+            if ((nm ^ om) & bit) == 0 {
+                continue;
+            }
+            let rg = f.regs[k] >> 32;
+            if (nm & bit) != 0 {
+                let o = @as(i64, @truncate(i32, @bit_cast(i64, f.regs[k] & 0xffff_ffff)));
+                let fo = @bit_cast(u64, o / DATA_ALIGN);
+                if rg < 64 {
+                    b.u8_(CFA_OFFSET | @truncate(u8, rg));
+                } else {
+                    b.u8_(CFA_OFFSET_EXTENDED);
+                    b.uleb(rg);
+                }
+                b.uleb(fo);
+            } else {
+                b.u8_(CFA_SAME_VALUE);
+                b.uleb(rg);
+            }
+        }
+        cur = s;
+    }
+    pad_entry(b, at);
+}
+
+// -----------------------------------------------------------------------------
+// Finishing
+// -----------------------------------------------------------------------------
+// DWARF language codes (DWARF 5, 7.12)
+pub const LANG_C89: u32 = 0x01;
+pub const LANG_C99: u32 = 0x0c;
+pub const LANG_C11: u32 = 0x1d;
+
+/// The language of module m's unit: C's, for a C program (its start-up and
+/// runtime are Axiom's, which DWARF has no code for); none for Axiom's.
+pub fn module_lang(m: *ir.Module) u32 {
+    return lang();
+}
+
+/// The language of the program's units (module_lang).
+pub fn lang() u32 {
+    if dbi.c_version >= 201112 {
+        return LANG_C11;
+    }
+    if dbi.c_version >= 199901 {
+        return LANG_C99;
+    }
+    if dbi.c_version >= 0 {
+        return LANG_C89;
+    }
+    return 0;
+}
+
+// The bytes of the unit's sections and their fixups, complete: the unit
+// header and DIE before the subprograms, the line program's header, the
+// address ranges (text_size bytes of code from text_sym).
+fn finish(d: *mut Unit, text_size: u64) void {
+    // .debug_abbrev
+    abbrev_table(&mut d.parts[D_ABBREV].b);
+    let mut name = "<unknown>";
+    if d.first_src != 0 {
+        let w = where_of(d, d.first_src);
+        if w.file != 0 {
+            name = elf.cstr_at(d.parts[D_LINE_STR].b.view(), @as(usize, d.files.get(@as(usize, w.file - 1))));
+        }
+    }
+    let name_s = u.perm_dup(name);
+    let comp_dir = u.cwd();
+    // .debug_info: the header and the unit's DIE, then the subprograms
+    let mut h = new_part();
+    h.b.u32_(0);
+    h.b.u16_(5);
+    h.b.u8_(1);  // DW_UT_compile
+    h.b.u8_(@truncate(u8, d.addr_size));
+    sec_ref(d, &mut h, D_ABBREV, 0);
+    if d.lang != 0 {
+        h.b.uleb(AB_CU);
+    } else {
+        h.b.uleb(AB_CU_NOLANG);
+    }
+    sec_ref(d, &mut h, D_STR, @as(u64, str_off(d, u.f1("axiom %s", ver.VERSION))));
+    if d.lang != 0 {
+        h.b.u16_(@as(u64, d.lang));
+    }
+    sec_ref(d, &mut h, D_STR, @as(u64, str_off(d, name_s)));
+    sec_ref(d, &mut h, D_STR, @as(u64, str_off(d, comp_dir)));
+    addr_ref(d, &mut h, d.text_sym, 0);
+    h.b.u32_(text_size);
+    sec_ref(d, &mut h, D_LINE, 0);
+    let toff = types_and_data(d);
+    let hn = @as(u64, h.b.len());
+    prepend(&mut d.parts[D_INFO], &mut h);
+    let info = &mut d.parts[D_INFO];
+    for x in d.trefs.items() {
+        let mut v: u64 = 0;  // (no type: never written, a reference is always to one)
+        if x.sym < @truncate(u32, toff.len) {
+            v = toff[@as(usize, x.sym)] + hn;
+        }
+        info.b.set_u32(@truncate(usize, x.off + hn), v);
+    }
+    d.trefs.deinit();
+    info.b.u8_(0);  // the end of the unit's children
+    info.b.set_u32(0, @as(u64, info.b.len() - 4));
+    // .debug_line: the header, then the program
+    let mut lh = new_part();
+    lh.b.u32_(0);
+    lh.b.u16_(5);
+    lh.b.u8_(@truncate(u8, d.addr_size));
+    lh.b.u8_(0);
+    lh.b.u32_(0);  // header_length (below)
+    let hstart = lh.b.len();
+    lh.b.u8_(1);  // minimum_instruction_length
+    lh.b.u8_(1);  // maximum_operations_per_instruction
+    lh.b.u8_(1);  // default_is_stmt
+    lh.b.u8_(@truncate(u8, @bit_cast(u64, LINE_BASE)));
+    lh.b.u8_(@truncate(u8, @bit_cast(u64, LINE_RANGE)));
+    lh.b.u8_(@truncate(u8, @bit_cast(u64, OPCODE_BASE)));
+    let lens: [12]u8 = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
+    lh.b.put(lens[..]);
+    // directories: the compilation directory
+    lh.b.u8_(1);
+    lh.b.uleb(1);  // DW_LNCT_path
+    lh.b.uleb(FORM_LINE_STRP);
+    lh.b.uleb(1);
+    sec_ref(d, &mut lh, D_LINE_STR, @as(u64, line_str_off(d, comp_dir)));
+    // files: path and directory; entry 0 (the unit's primary file) is entry 1 again
+    lh.b.u8_(2);
+    lh.b.uleb(1);
+    lh.b.uleb(FORM_LINE_STRP);
+    lh.b.uleb(2);  // DW_LNCT_directory_index
+    lh.b.uleb(FORM_UDATA);
+    if d.files.len == 0 {
+        _ = file_index(d, name_s);
+    }
+    lh.b.uleb(@as(u64, d.files.len + 1));
+    for k in 0..(d.files.len + 1) {
+        let mut fk = k;
+        if k > 0 {
+            fk = k - 1;
+        }
+        sec_ref(d, &mut lh, D_LINE_STR, @as(u64, d.files.get(fk)));
+        lh.b.uleb(0);
+    }
+    lh.b.set_u32(hstart - 4, @as(u64, lh.b.len() - hstart));
+    prepend(&mut d.parts[D_LINE], &mut lh);
+    let line = &mut d.parts[D_LINE];
+    line.b.set_u32(0, @as(u64, line.b.len() - 4));
+    // .debug_aranges: the unit's code
+    let ar = &mut d.parts[D_ARANGES];
+    ar.b.u32_(0);
+    ar.b.u16_(2);
+    sec_ref(d, ar, D_INFO, 0);
+    ar.b.u8_(@truncate(u8, d.addr_size));
+    ar.b.u8_(0);
+    while (ar.b.len() % @as(usize, @truncate(usize, 2 * d.addr_size))) != 0 {
+        ar.b.u8_(0);
+    }
+    addr_ref(d, ar, d.text_sym, 0);
+    if d.addr_size == 4 {
+        ar.b.u32_(text_size);
+        ar.b.u64_(0);
+    } else {
+        ar.b.u64_(text_size);
+        ar.b.u64_(0);
+        ar.b.u64_(0);
+    }
+    ar.b.set_u32(0, @as(u64, ar.b.len() - 4));
+}
+
+// Puts `h` (bytes and fixups) before `p`'s.
+fn prepend(p: *mut Part, h: *mut Part) void {
+    let n = @as(u64, h.b.len());
+    for k in 0..p.fx.len {
+        let x = p.fx.at(k);
+        x.off += n;
+    }
+    for x in p.fx.items() {
+        h.fx.push(x);
+    }
+    h.b.put(p.b.view());
+    p.b.free();
+    p.fx.deinit();
+    p.* = h.*;
+}
+
+/// Writes the unit into object `o` as its debug sections (relocations:
+/// abs64 for addresses, abs32 for offsets into the sections), its code
+/// being section `text` (text_size bytes).
+pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u32) void {
+    if not d.on or (d.nfuncs == 0) {
+        return;
+    }
+    d.text_sym = elf.add_sym(o, elf.Sym.{ name: "", sec: text, value: 0, size: 0, bind: elf.B_LOCAL, ty: elf.T_NOTYPE,
+                                          hidden: false });
+    let text_size = elf.sec_size(o.secs.get(@int_cast(usize, text)));
+    finish(d, text_size);
+    let mut secs: [7]i32 = [0; 7];
+    let mut ssym: [7]u32 = [0; 7];
+    for k in 0..NSEC {
+        secs[k] = elf.add_sec(o, SEC_NAMES[k], elf.S_DEBUG, 1);
+        ssym[k] = elf.add_sym(o, elf.Sym.{ name: "", sec: secs[k], value: 0, size: 0, bind: elf.B_LOCAL,
+                                           ty: elf.T_NOTYPE, hidden: false });
+    }
+    for k in 0..NSEC {
+        let p = &mut d.parts[k];
+        let s = o.secs.get(@int_cast(usize, secs[k]));
+        s.data.put(p.b.view());
+        for x in p.fx.items() {
+            if x.kind == FX_ADDR {
+                s.relocs.push(elf.Rel.{ off: x.off, ty: abs64, sym: x.sym, addend: x.addend });
+            } else {
+                s.relocs.push(elf.Rel.{ off: x.off, ty: abs32, sym: ssym[@as(usize, x.sym)], addend: x.addend });
+            }
+        }
+        p.b.free();
+        p.fx.deinit();
+    }
+    d.on = false;
+}
+
+/// The unit's sections with their fixups resolved, for a linker that knows
+/// each function's address (addr_of(sym)) and places the code at text_addr
+/// (text_size bytes): wlink.ax's custom sections.
+pub fn finish_linked(d: *mut Unit, text_addr: u64, text_size: u64, addr_of: fn(u32) u64) [7]bn.Bytes {
+    let mut out: [7]bn.Bytes = [bn.new_bytes(); 7];
+    if not d.on or (d.nfuncs == 0) {
+        return out;
+    }
+    d.text_sym = 0xffff_ffff;
+    finish(d, text_size);
+    for k in 0..NSEC {
+        let p = &mut d.parts[k];
+        for x in p.fx.items() {
+            let at = @truncate(usize, x.off);
+            if x.kind == FX_ADDR {
+                let mut a = text_addr;
+                if x.sym != 0xffff_ffff {
+                    a = addr_of(x.sym);
+                }
+                let v = a + @bit_cast(u64, x.addend);
+                if d.addr_size == 4 {
+                    p.b.set_u32(at, v & 0xffff_ffff);
+                } else {
+                    p.b.set_u64(at, v);
+                }
+            } else {
+                p.b.set_u32(at, @bit_cast(u64, x.addend) & 0xffff_ffff);
+            }
+        }
+        out[k] = p.b;
+        p.fx.deinit();
+    }
+    d.on = false;
+    return out;
+}

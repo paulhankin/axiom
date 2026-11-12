@@ -38,6 +38,7 @@ import os from 'os';
 import { Worker } from 'worker_threads';
 import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
+import { loadImage, checkDebug, addrsOfLine, subprogramAt } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -798,6 +799,24 @@ function cDriverCases() {
       if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
       const r = spawnSync(out, [], { encoding: 'utf8' });
       return /at deref\n\s+at middle \(crash\.c:5:12\)\n\s+at main \(crash\.c:9:12\)/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
+    },
+    // At -O2 the frames that exist are all there, with the calls inlined
+    // into them (their call-site records carry the inlining): here deep,
+    // tailer and early are inlined into main, and the crash is in a
+    // function reached by an indirect call, which names it only so.
+    'C: native stack traces through C functions at -O2': async () => {
+      if (skip()) return skip();
+      if (!native || noC || execWrap.length || process.platform !== 'linux') return { skip: true, reason: 'run on this Linux machine only' };
+      write({ 'crash2.c': 'static int *volatile gp;\nstatic volatile int sink;\nint leafcrash(int x) {\n    return *gp + x;\n}\n' +
+        'static int (*volatile leafp)(int) = leafcrash;\nint early(int *p, int x) {\n    if (!p) {\n        return leafp(x) + 1;\n' +
+        '    }\n    return *p;\n}\nint tailer(int x) {\n    sink = x;\n    return early(0, x + 1);\n}\n' +
+        'int deep(int n) {\n    return n + tailer(n);\n}\nint main(int argc, char **argv) {\n    (void)argv;\n' +
+        '    return deep(argc + 2);\n}\n' });
+      const out = path.join(dir, 'crash2');
+      const c = await ax(['build', 'crash2.c', '-O2', nativeTarget, '-o', out]);
+      if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
+      const r = spawnSync(out, [], { encoding: 'utf8' });
+      return /at <indirect call>\n\s+at early \(crash2\.c:9:16\)\n\s+at tailer \(crash2\.c:15:12\)\n\s+at deep \(crash2\.c:18:16\)\n\s+at main \(crash2\.c:22:12\)/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
     },
   };
 }
@@ -1741,6 +1760,113 @@ if (!skipPlatform) {
   await section('fmt', cases, {
     supported: () => (/usage:/.test(fmt(['--check', path.join(fdir, 'layout.expected')]).stderr) ? 'the bootstrap compiler has no axiom fmt' : null),
     timed: false,
+  });
+}
+
+// Debug information (-g; the compiler only): cmd/axiom/internal/tests/dwarf.mjs
+// reads the DWARF of the programs of cmd/axiom/internal/tests/debug, built for
+// each target at -O0 and -O2, and checks its structure (units, a subprogram
+// and a covering line sequence per function, call frame information per
+// function agreeing with the frame tables' calls); that marked lines are in
+// the line tables (and C's #line followed); that two builds are the same; and
+// that -g changes no code: an ELF executable's loaded bytes, a Mach-O
+// executable (the DWARF is in its .dSYM), a WebAssembly module but its
+// .debug_* sections, an object's .text are the same as without it.
+if (!skipPlatform) {
+  const ddir = path.join(root, 'cmd/axiom/internal/tests/debug');
+  const markLine = (src, mark) => fs.readFileSync(src, 'utf8').split('\n').findIndex((l) => l.includes(`line: ${mark}`)) + 1;
+  // the bytes a loader maps of an ELF executable (up to its last PT_LOAD's file end)
+  const loaded = (d) => {
+    const phoff = Number(d.readBigUInt64LE(32)), phnum = d.readUInt16LE(56);
+    let end = 0;
+    for (let k = 0; k < phnum; k++) {
+      const h = phoff + 56 * k;
+      if (d.readUInt32LE(h) === 1) end = Math.max(end, Number(d.readBigUInt64LE(h + 8) + d.readBigUInt64LE(h + 32)));
+    }
+    const b = Buffer.from(d.subarray(0, end));
+    b.fill(0, 40, 48);  // (e_shoff, e_shnum, e_shstrndx: the section headers come after it)
+    b.fill(0, 60, 64);
+    return b;
+  };
+  // a WebAssembly module without its .debug_* custom sections
+  const wasmCode = (d) => {
+    const out = [d.subarray(0, 8)];
+    let p = 8;
+    const uleb = () => { let r = 0, s = 0, b; do { b = d[p++]; r += (b & 0x7f) * 2 ** s; s += 7; } while (b & 0x80); return r; };
+    while (p < d.length) {
+      const at = p, id = d[p++], size = uleb(), end = p + size;
+      let keep = true;
+      if (id === 0) { const n = uleb(); keep = !d.subarray(p, p + n).toString().startsWith('.debug_'); }
+      if (keep) out.push(d.subarray(at, end));
+      p = end;
+    }
+    return Buffer.concat(out);
+  };
+  // an ELF object's .text
+  const objText = (d) => {
+    const shoff = Number(d.readBigUInt64LE(40)), shnum = d.readUInt16LE(60), shstr = d.readUInt16LE(62);
+    const so = Number(d.readBigUInt64LE(shoff + 64 * shstr + 24));
+    for (let k = 0; k < shnum; k++) {
+      const h = shoff + 64 * k;
+      if (d.subarray(so + d.readUInt32LE(h), so + d.readUInt32LE(h) + 6).toString() === '.text\0') {
+        const o = Number(d.readBigUInt64LE(h + 24));
+        return d.subarray(o, o + Number(d.readBigUInt64LE(h + 32)));
+      }
+    }
+    return Buffer.alloc(0);
+  };
+  const dcases = {};
+  const targets = ['x86_64', 'aarch64', 'aarch64-macos', 'wasm32', 'wasm64'];
+  for (const lang of ['c', 'ax']) {
+    const src = path.join(ddir, `frames.${lang}`);
+    for (const t of targets) {
+      for (const lvl of ['-O0', '-O2']) {
+        for (const obj of t.endsWith('64') && !t.startsWith('wasm') ? [false, true] : [false]) {
+          dcases[`frames.${lang} ${t} ${lvl}${obj ? ' object' : ''}`] = async () => {
+            const base = path.join(tmp, `debug-${lang}-${t}${lvl}${obj ? '-o' : ''}`);
+            // (the same name: a Mach-O executable's signature names it)
+            const outs = ['g1', 'g2', 'n'].map((k) => { fs.mkdirSync(`${base}-${k}`, { recursive: true }); return path.join(`${base}-${k}`, 'prog'); });
+            const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+            for (const [k, o] of outs.entries()) {
+              const r = await spawnAsync(compiler, ['build', src, `--target=${t}`, lvl, ...(k < 2 ? ['-g'] : []),
+                ...(obj ? ['--emit=obj'] : []), '-o', o], { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+              if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+            }
+            const mac = t.endsWith('macos');
+            const dfile = (o) => (mac ? path.join(`${o}.dSYM/Contents/Resources/DWARF`, path.basename(o)) : o);
+            const [a, b, n] = outs.map((o, k) => fs.readFileSync(k < 2 ? dfile(o) : o));
+            if (!a.equals(b)) return 'two builds differ';
+            if (mac && fs.existsSync(`${outs[2]}.dSYM`)) return 'a .dSYM without -g';
+            const [ea, en] = [fs.readFileSync(outs[0]), fs.readFileSync(outs[2])];
+            const same = mac ? ea.equals(en) : t.startsWith('wasm') ? wasmCode(ea).equals(wasmCode(en))
+              : obj ? objText(ea).equals(objText(en)) : loaded(ea).equals(loaded(en));
+            if (!same) return '-g changed the code';
+            if (mac && checkMachO(ea).errs.length) return `the executable: ${checkMachO(ea).errs.join('\n')}`;
+            if (!t.startsWith('wasm') && !mac && !obj && n.length === a.length) return 'no debug information';
+            const img = loadImage(a);
+            const r = checkDebug(img, { cfi: !t.startsWith('wasm') });
+            if (r.errs.length) return r.errs.join('\n');
+            if (obj && !r.nrets) return 'no frame table entries checked';
+            const lines = lang === 'c' ? ['add-sum', 'many-loop', 'vla-decl', 'tail-call'] : ['many-loop', 'tail-call'];
+            for (const m of lines) {
+              const at = addrsOfLine(r.dw, `frames.${lang}`, markLine(src, m));
+              if (!at.length) return `no code for the line marked ${m}`;
+            }
+            if (lang === 'c' && lvl === '-O0') {
+              const at = addrsOfLine(r.dw, 'generated.y', 501);
+              if (!at.length) return 'no code for generated.y:501 (#line)';
+              const sp = subprogramAt(r.dw, at[0]);
+              if (!sp || sp.attrs.get(0x03) !== 'presumed') return 'generated.y:501 is not in presumed';
+            }
+            return null;
+          };
+        }
+      }
+    }
+  }
+  await section('debug information', dcases, {
+    parallel: true,
+    supported: () => (bootstrapCompiler() ? 'the compiler\'s own code generators only' : null),
   });
 }
 
