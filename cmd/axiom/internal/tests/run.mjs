@@ -162,6 +162,75 @@ async function runWasm(file) {
   }
 }
 
+// A PE file's sections and data directories, for the checks below.
+function peLayout(b) {
+  const pe = b.readUInt32LE(0x3c), nsec = b.readUInt16LE(pe + 6), optSize = b.readUInt16LE(pe + 20);
+  const opt = pe + 24, secs = [];
+  for (let i = 0; i < nsec; i++) {
+    const o = opt + optSize + i * 40;
+    secs.push({ va: b.readUInt32LE(o + 12), vsize: b.readUInt32LE(o + 8), raw: b.readUInt32LE(o + 20) });
+  }
+  const off = (rva) => { const s = secs.find((x) => rva >= x.va && rva < x.va + x.vsize); return s ? s.raw + (rva - s.va) : -1; };
+  const dir = (k) => ({ rva: b.readUInt32LE(opt + 112 + k * 8), size: b.readUInt32LE(opt + 112 + k * 8 + 4) });
+  return { off, dir };
+}
+
+// The names a PE file imports, by DLL.
+function peImports(b) {
+  const { off, dir } = peLayout(b);
+  const cstr = (o) => b.subarray(o, b.indexOf(0, o)).toString();
+  const res = {};
+  for (let d = off(dir(1).rva); b.readUInt32LE(d + 12) !== 0; d += 20) {
+    const names = res[cstr(off(b.readUInt32LE(d + 12)))] = [];
+    for (let t = off(b.readUInt32LE(d)); ; t += 8) {
+      const e = Number(b.readBigUInt64LE(t));
+      if (!e) break;
+      names.push(cstr(off(e) + 2));
+    }
+  }
+  return res;
+}
+
+// The unwind information of the functions with a frame register in a PE
+// file (those whose stack pointer moves: a variable length array): every
+// register they save must be restored relative to the frame register, not
+// to rsp (Windows x64 unwinding: x64emit.ax, dyn_unwind_info). A problem, or
+// null; it is one if there is no such function.
+function checkDynUnwind(b) {
+  const { off, dir } = peLayout(b);
+  const ex = dir(3);
+  let found = 0;
+  for (let e = off(ex.rva); e < off(ex.rva) + ex.size; e += 12) {
+    const u = off(b.readUInt32LE(e + 8));
+    const n = b[u + 2], fr = b[u + 3] & 15, fo = b[u + 3] >> 4;
+    if (!fr) continue;
+    found++;
+    if (fr !== 5) return `frame register ${fr}, not rbp`;
+    const codes = [];
+    for (let j = 0; j < n;) {
+      const at = b[u + 4 + 2 * j], op = b[u + 5 + 2 * j] & 15, info = b[u + 5 + 2 * j] >> 4;
+      const size = op === 5 || op === 9 ? 3 : (op === 4 || op === 8 || op === 1 ? 2 : 1);
+      const val = size === 3 ? b.readUInt32LE(u + 6 + 2 * j) : (size === 2 ? b.readUInt16LE(u + 6 + 2 * j) : 0);
+      codes.push({ at, op, info, val });
+      j += size;
+    }
+    for (let k = 1; k < codes.length; k++) if (codes[k].at > codes[k - 1].at) return 'unwind codes out of order';
+    const setfp = codes.findIndex((c) => c.op === 3);
+    if (setfp < 0) return 'no UWOP_SET_FPREG';
+    // before it in the list (applied first): only saves relative to the frame base
+    for (const c of codes.slice(0, setfp)) {
+      if (c.op !== 5 && c.op !== 9) return `unwind code ${c.op} before UWOP_SET_FPREG (relative to rsp)`;
+      if (c.val + (c.op === 9 ? 16 : 8) > 16 * fo) return 'a saved register above the frame register';
+    }
+    const rest = codes.slice(setfp + 1);
+    const last = rest[rest.length - 1];
+    if (!last || last.op !== 0 || last.info !== 5) return 'the last unwind code is not the push of rbp';
+    const lift = rest.slice(0, -1).reduce((s, c) => s + (c.op === 2 ? (c.info + 1) * 8 : c.op === 1 && c.info === 0 ? c.val * 8 : 1e9), 0);
+    if (lift !== 16 * fo) return `rsp is lifted by ${lift} to rbp, not ${16 * fo}`;
+  }
+  return found ? null : 'no function with a frame register';
+}
+
 async function runNative(exe) {
   const r = await spawnExeAsync(exe, [], { encoding: 'utf8', timeout: runTimeout });
   if (r.error && r.error.code === 'ETIMEDOUT') return { out: [], trapped: true, msg: `timed out after ${runTimeout / 1000} s` };
@@ -369,6 +438,65 @@ const cRunTest = async (f) => {
 await section('', byFile(cRunFiles, '[c]', cRunTest), { parallel: true });
 await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/prog')), '[c-prog]', cRunTest), { parallel: true });
 
+// C and Axiom in one program (docs/c.md): each directory of
+// cmd/axiom/internal/tests/c/mix/ is a test. Its main.ax (an Axiom program
+// with C units) or main.c (a C program with Axiom modules) is built with the
+// directory's other .c files (and, for main.c, its .ax files), sorted, then
+// those its `uses:` directive names, at the suite's optimization level for
+// wasm32 (not for AXIOM_C_TARGET=wasm64) or with --native for the machine,
+// with no system C compiler or library: the tests print through
+// c/mix/print.ax. Directives of the main file, in // or /* */ comments:
+// expect: <line>, expect-error: <code> (the build fails with it),
+// expect-stderr: <text> (with expect-error: the compiler's stderr has it),
+// expect-status: <n> (the exit status; default 0), flags:, uses: <files>,
+// wasm-only, native-only, linux-only (natively, Linux only), windows-only
+// (AXIOM_NATIVE_TARGET=x86_64-windows). Programs run in
+// a process of their own (on WebAssembly with the node host): they may exit.
+const cMixDir = path.join(root, 'cmd/axiom/internal/tests/c/mix');
+const cMixDirs = fs.existsSync(cMixDir) ? fs.readdirSync(cMixDir).filter((n) => fs.statSync(path.join(cMixDir, n)).isDirectory()).sort().map((n) => path.join(cMixDir, n)) : [];
+const cMixTest = async (dir) => {
+  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+  const axMain = fs.existsSync(path.join(dir, 'main.ax'));
+  const main = path.join(dir, axMain ? 'main.ax' : 'main.c');
+  const src = fs.readFileSync(main, 'utf8');
+  const dv = (name) => [...src.matchAll(new RegExp(`(?:// |/\\* )${name}: ?(.*?)(?: \\*/)?$`, 'gm'))].map((m) => m[1]);
+  const has = (name) => new RegExp(`(?:// |/\\* )${name}\\b`, 'm').test(src);
+  if ((native && has('wasm-only')) || (!native && has('native-only'))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
+  if (native && has('linux-only') && (noC || process.platform !== 'linux')) return { skip: true, reason: 'Linux only' };
+  if (!native && has('linux-only')) return { skip: true, reason: 'Linux only' };
+  if (has('windows-only') && !(native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || ''))) return { skip: true, reason: 'Windows only' };
+  // (the node host's CLI does not run std/io programs for wasm64)
+  if (!native && process.env.AXIOM_C_TARGET === 'wasm64') return { skip: true, reason: 'wasm32 only' };
+  const others = fs.readdirSync(dir).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || (!axMain && n.endsWith('.ax')))).sort().map((n) => path.join(dir, n));
+  const uses = dv('uses').flatMap((x) => x.trim().split(/\s+/)).map((x) => path.resolve(dir, x));
+  const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/));
+  const errors = dv('expect-error'), want = dv('expect').join('\n');
+  const status = has('expect-status') ? Number(dv('expect-status')[0]) : 0;
+  const out = path.join(tmp, `mix-${path.basename(dir)}${native ? '' : '.wasm'}`);
+  const args = ['build', main, ...others, ...uses, '--format=agent-json', '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
+  if (native) args.push(nativeTarget);
+  else if (process.env.AXIOM_C_TARGET) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
+  const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
+  if (c.error && c.error.code === 'ETIMEDOUT') return `the compiler did not finish in ${compileTimeout / 1000} s`;
+  if (errors.length) {
+    let codes = [];
+    try { codes = JSON.parse(c.stdout).diagnostics.filter((x) => x.severity === 'error').map((x) => x.code); } catch { codes = []; }
+    if (c.status === 0) return `expected errors ${errors.join(', ')}, but the build succeeded`;
+    for (const e of errors) if (!codes.includes(e)) return `expected ${e}, got [${codes.join(', ')}]:\n${c.stdout}${c.stderr}`;
+    for (const t of dv('expect-stderr')) if (!c.stderr.includes(t)) return `no '${t}' in the compiler's stderr:\n${c.stderr}`;
+    return null;
+  }
+  if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+  const r = native ? await spawnExeAsync(out, [], { encoding: 'utf8', timeout: runTimeout })
+    : await spawnAsync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8', timeout: runTimeout });
+  if (r.error && r.error.code === 'ETIMEDOUT') return `timed out after ${runTimeout / 1000} s`;
+  const got = r.stdout.split('\n').map((l) => l.replace(/\r$/, ''));
+  if (got[got.length - 1] === '') got.pop();
+  if (r.status !== status) return { problem: `exit status ${r.status} (signal ${r.signal}), expected ${status}; output:\n${got.join('\n')}`, stderr: r.stderr };
+  return { problem: want === got.join('\n') ? null : `output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
+};
+await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true });
+
 // The C driver (main.ax: c_option, c_options, check_c_options, build_c;
 // c/cc.ax): every option, several translation units, and the errors of
 // options and files. The sources are written into a directory of their own.
@@ -456,7 +584,7 @@ function cDriverCases() {
     'C: options for Axiom code, C options without C sources': async () => {
       if (skip()) return skip();
       write({ 'w.c': 'int main(void) { return 0; }\n', 'x.ax': 'export fn main() i32 {\n    return 0;\n}\n' });
-      for (const o of ['--overflow=trap', '--sanitize=address', '--coverage=afl', '--emit-header=w.h', '--link=x.ax', '--units=module']) {
+      for (const o of ['--overflow=trap', '--sanitize=address', '--coverage=afl', '--emit-header=w.h', '--units=module']) {
         const p = await fatal(['build', 'w.c', o], /is an option for Axiom code, and not for C sources/);
         if (p) return p;
       }
@@ -464,9 +592,11 @@ function cDriverCases() {
         const p = await fatal(['build', 'x.ax', o], /is an option for C sources, and the input is not one/);
         if (p) return p;
       }
-      for (const args of [['w.c', 'x.ax'], ['x.ax', 'w.c']]) {
-        const p = await fatal(['build', ...args], /cannot be built together/);
-        if (p) return p;
+      // (both have a main: a C program's Axiom module exports main, an
+      // Axiom program's C unit defines one)
+      for (const [args, want] of [[['w.c', 'x.ax'], 'e:E0802'], [['x.ax', 'w.c'], 'e:C3066'], [['w.c', '--link=x.ax'], 'e:E0802']]) {
+        const c = await ax(['build', ...args, '--format=agent-json']);
+        if (c.status !== 1 || !(codes(c) || []).includes(want)) return `${args.join(' ')}: ${c.stdout}${c.stderr}`;
       }
       for (const cmd of ['test', 'profile']) {
         const p = await fatal([cmd, 'w.c'], new RegExp(`axiom ${cmd} does not take a C source`));
@@ -499,6 +629,164 @@ function cDriverCases() {
       }
       const c = await ax(['build', '--help']);
       return c.status === 0 && /--c-std=c89\|c90\|c95\|c99\|c11\|c17\|c18\|c23/.test(c.stderr) ? null : `--help: ${c.stderr}`;
+    },
+    'C: C and Axiom in one program: the command line': async () => {
+      if (skip()) return skip();
+      write({ 'm.ax': 'extern "C" {\n    fn c_f(x: i32) i32;\n}\n\nexport fn main() i32 {\n    return c_f(2) - 4;\n}\n',
+        'f.c': '#ifndef K\n#error K\n#endif\nint c_f(int x) { return x * K; }\n',
+        'cm.c': 'int ax_g(int);\nint main(void) { return ax_g(3) - 9; }\n',
+        'g.ax': 'export fn ax_g(x: i32) i32 {\n    return x * 3;\n}\n' });
+      const run = async (args) => {
+        const out = path.join(dir, 'mixed.wasm');
+        const c = await ax(['build', ...args, '-o', out]);
+        if (c.status !== 0) return `${args.join(' ')}: ${c.stdout}${c.stderr}`;
+        const r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
+        return r.status === 0 ? null : `${args.join(' ')}: the program exited with ${r.status}: ${r.stderr}`;
+      };
+      // C options apply to the C units, Axiom options to the Axiom code
+      let p = await run(['m.ax', 'f.c', '-DK=2', '--c-std=c99', '--overflow=trap', '-O2']);
+      if (!p) p = await run(['cm.c', 'g.ax']);
+      if (!p) p = await run(['cm.c', '--link=g.ax', '-O1']);
+      // the header of the Axiom program's exports is written before the C units are read
+      write({ 'h.ax': 'extern "C" {\n    fn c_h() i32;\n}\n\nexport fn ax_h(x: i32) i32 {\n    return x + 1;\n}\n\n' +
+        'export fn main() i32 {\n    return c_h() - 8;\n}\n', 'h.c': '#include "gen/h.h"\nint c_h(void) { return ax_h(7); }\n' });
+      fs.mkdirSync(path.join(dir, 'gen'), { recursive: true });
+      if (!p) p = await run(['h.ax', 'h.c', '--emit-header=gen/h.h', '--c-std=c11']);
+      if (p) return p;
+      let c = await ax(['check', 'm.ax', 'f.c', '-DK=1']);
+      if (c.status !== 0) return `check m.ax f.c: ${c.stdout}${c.stderr}`;
+      c = await ax(['check', 'm.ax', 'f.c']);
+      if (c.status !== 1 || !/#error/.test(c.stderr)) return `check without -DK: ${c.stdout}${c.stderr}`;
+      p = await fatal(['test', 'm.ax', 'f.c', '-DK=2'], /axiom test does not take C sources/);
+      if (!p) p = await fatal(['build', 'm.ax', 'f.c', '--emit=c-pp'], /takes one C source, and no Axiom source/);
+      if (!p) p = await fatal(['build', 'm.ax', 'f.c', '--units=module'], /--units is an option for Axiom code/);
+      if (!p) p = await fatal(['build', 'm.ax', 'g.ax'], /unexpected argument 'g.ax'/);
+      return p || fatal(['build', 'cm.c', 'g.ax', '--overflow=trap'], /--overflow is an option for Axiom code/);
+    },
+    'C: what is linked: only what is reached': async () => {
+      if (skip()) return skip();
+      // a library of 200 functions and a large table, of which a program
+      // calls one: the executable is the size of the program without it
+      let lib = '';
+      for (let i = 0; i < 200; i++) lib += `int lib_f${i}(int x) { int s = 0; for (int k = 0; k < x; k++) s += k * ${i} + (s >> 3); return s ^ ${i}; }\n`;
+      lib += 'static char lib_table[50000] = {1};\nint lib_t(int i) { return lib_table[i]; }\n';
+      write({ 'lib.c': lib, 'hello.c': 'int lib_f7(int);\nint main(void) { return lib_f7(3) & 1; }\n',
+        'alone.c': 'static int lib_f7(int x) { int s = 0; for (int k = 0; k < x; k++) s += k * 7 + (s >> 3); return s ^ 7; }\n' +
+          'int main(void) { return lib_f7(3) & 1; }\n',
+        'ax.ax': 'extern "C" {\n    fn lib_f7(x: i32) i32;\n}\n\nexport fn main() i32 {\n    return lib_f7(3) & 1;\n}\n' });
+      const targets = ['wasm32', 'x86_64', 'aarch64', 'x86_64-windows', 'aarch64-macos'];
+      for (const t of targets) {
+        for (const o of ['-O0', '-O2']) {
+          const size = async (args) => {
+            const out = path.join(dir, `size-${t}${o}`);
+            const c = await ax(['build', ...args, `--target=${t}`, o, '--pdb=off', '-o', out]);
+            return c.status === 0 ? fs.statSync(out).size : `${args.join(' ')} --target=${t} ${o}: ${c.stdout}${c.stderr}`;
+          };
+          const a = await size(['hello.c', 'lib.c']), b = await size(['alone.c']), x = await size(['ax.ax', 'lib.c']);
+          for (const v of [a, b, x]) if (typeof v === 'string') return v;
+          // (the program's own code is the same, but for its symbol names and a few bytes of alignment)
+          if (a > b + 1024) return `--target=${t} ${o}: ${a} bytes with the library, ${b} without`;
+          if (x > a + 1024 * 64) return `--target=${t} ${o}: an Axiom program with the library: ${x} bytes`;
+        }
+      }
+      // an object keeps every definition
+      const obj = path.join(dir, 'lib.o');
+      const c = await ax(['build', 'lib.c', '--emit=obj', '--target=x86_64', '-o', obj]);
+      if (c.status !== 0 || !fs.readFileSync(obj).includes('lib_f199')) return `lib.c --emit=obj: ${c.stdout}${c.stderr}`;
+      return null;
+    },
+    'C: the C library directories (std/c/lib, std/c/rt)': async () => {
+      if (skip()) return skip();
+      // a standard library whose c/lib and c/rt are this test's (the rest
+      // is the real one's, linked)
+      const std = path.join(dir, 'fakestd');
+      fs.rmSync(std, { recursive: true, force: true });
+      fs.mkdirSync(path.join(std, 'c/lib'), { recursive: true });
+      fs.mkdirSync(path.join(std, 'c/rt'), { recursive: true });
+      for (const n of fs.readdirSync(path.join(root, 'std'))) if (n !== 'c') fs.symlinkSync(path.join(root, 'std', n), path.join(std, n));
+      fs.symlinkSync(path.join(root, 'std/c/include'), path.join(std, 'c/include'));
+      fs.writeFileSync(path.join(std, 'c/lib/a.c'), 'int rt_twice(int);\nint lib_used(int x) { return rt_twice(x) + 1; }\n' +
+        'int lib_replaced(int x) { return -1; }\nint rt_unused_fn(int);\nint lib_unused(int x) { return rt_unused_fn(x); }\n');
+      fs.writeFileSync(path.join(std, 'c/rt/rt.ax'), 'export fn rt_twice(x: i32) i32 {\n    return x * 2;\n}\n\n' +
+        'export fn rt_unused_fn(x: i32) i32 {\n    return x;\n}\n');
+      write({ 'use.c': 'int lib_used(int);\nint lib_replaced(int x) { return x + 100; }\n' +
+        'int main(void) { return lib_used(20) + lib_replaced(0) - 141; }\n' });
+      const out = path.join(dir, 'use.wasm');
+      let c = await ax(['build', 'use.c', `--std=${std}`, '-o', out]);
+      if (c.status !== 0) return `use.c with the library: ${c.stdout}${c.stderr}`;
+      let r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
+      if (r.status !== 0) return `use.c: exit ${r.status} ${r.stderr}`;
+      if (fs.readFileSync(out).includes('rt_unused_fn')) return 'an unused export of std/c/rt is in the program';
+      // without the library, lib_used is the host's (WebAssembly imports it)
+      c = await ax(['build', 'use.c', `--std=${std}`, '--c-freestanding', '-o', out]);
+      if (c.status !== 0) return `--c-freestanding: ${c.stdout}${c.stderr}`;
+      const imps = WebAssembly.Module.imports(new WebAssembly.Module(fs.readFileSync(out))).map((i) => `${i.module}.${i.name}`);
+      if (!imps.includes('env.lib_used')) return `--c-freestanding: imports ${imps.join(', ')}`;
+      return null;
+    },
+    'C: a package with C sources (c-sources)': async () => {
+      if (skip()) return skip();
+      write({ 'pk/axiom.toml': '[package]\nname = "pk"\nversion = "0.1.0"\nc-sources = "csrc"\n',
+        'pk/src/main.ax': 'extern "C" {\n    fn c_sq(x: i32) i32;\n}\n\nexport fn ax_one() i32 {\n    return 1;\n}\n\n' +
+          'export fn main() i32 {\n    return c_sq(5) - 26;\n}\n',
+        'pk/csrc/sq.c': '#include "inc/k.h"\nint c_sq(int x) { return x * x + ONE(); }\n',
+        'pk/csrc/inc/k.h': 'int ax_one(void);\n#define ONE() ax_one()\n',
+        'bad/axiom.toml': '[package]\nname = "bad"\nversion = "0.1.0"\nc-sources = "nope"\n', 'bad/src/main.ax': '' });
+      const out = path.join(dir, 'pk.wasm');
+      const c = await ax(['build', 'pk', '-o', out]);
+      if (c.status !== 0) return `the package: ${c.stdout}${c.stderr}`;
+      const r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
+      if (r.status !== 0) return `the package's program: exit ${r.status} ${r.stderr}`;
+      const b = await ax(['build', 'bad']);
+      return b.status === 1 && /c-sources = "\.\.\." must name a directory/.test(b.stderr) ? null : `bad: ${b.status} ${b.stderr}`;
+    },
+    'C: C and Axiom built for Windows and macOS': async () => {
+      if (skip()) return skip();
+      // the c/mix programs, built (not run: that needs the systems)
+      for (const d of cMixDirs) {
+        const axMain = fs.existsSync(path.join(d, 'main.ax'));
+        const main = path.join(d, axMain ? 'main.ax' : 'main.c');
+        const src = fs.readFileSync(main, 'utf8');
+        if (/expect-error|linux-only|windows-only/.test(src)) continue;
+        const others = fs.readdirSync(d).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || (!axMain && n.endsWith('.ax')))).map((n) => path.join(d, n));
+        const uses = [...src.matchAll(/(?:\/\/ |\/\* )uses: (.*?)(?: \*\/)?$/gm)].flatMap((m) => m[1].trim().split(/\s+/)).map((x) => path.resolve(d, x));
+        for (const t of ['aarch64-macos', 'x86_64-windows']) {
+          const out = path.join(dir, `mix-${path.basename(d)}-${t}`);
+          const c = await ax(['build', main, ...others, ...uses, `--target=${t}`, '--pdb=off', '-o', out]);
+          if (c.status !== 0) return `${path.basename(d)} for ${t}: ${c.stdout}${c.stderr}`;
+          const bytes = fs.readFileSync(out);
+          if (t === 'aarch64-macos') {
+            const m = checkMachO(bytes);
+            if (m.errs.length) return `${path.basename(d)}: ${m.errs.join('\n')}`;
+          } else if (bytes.readUInt16LE(0) !== 0x5a4d) return `${path.basename(d)}: not a PE file`;
+        }
+      }
+      return null;
+    },
+    'C: Windows: data of a DLL, and unwinding with a variable length array': async () => {
+      if (skip()) return skip();
+      write({ 'dll.c': 'extern int _fmode;\nextern char **_environ;\nint get(void) { return _fmode; }\n' +
+          'int *where(void) { return &_fmode; }\nint main(void) { _fmode = get() + 1; return _environ != 0 && *where() > 0; }\n',
+        'dllinit.c': 'extern int _fmode;\nint *p = &_fmode;\nint main(void) { return *p; }\n',
+        'vla.c': 'int use(volatile int *p, int n);\ndouble dbl(double *p);\n' +
+          'int f(int n, double x) {\n    int a[n];\n    double y = x * 2;\n    for (int i = 0; i < n; i++) a[i] = i;\n' +
+          '    int r = use(a, n);\n    int b[n + r];\n    b[0] = r;\n    return r + (int)(dbl(&y) + x) + use(b, 1);\n}\n' +
+          'int use(volatile int *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += p[i]; return s; }\n' +
+          'double dbl(double *p) { return *p * 2; }\nint main(void) { return f(10, 1.5) & 0xff; }\n' });
+      const out = path.join(dir, 'dll.exe');
+      let c = await ax(['build', 'dll.c', '--target=x86_64-windows', '--pdb=off', '-O2', '-o', out]);
+      if (c.status !== 0) return `dll.c: ${c.stdout}${c.stderr}`;
+      const pe = peImports(fs.readFileSync(out));
+      for (const n of ['_fmode', '_environ']) if (!(pe['msvcrt.dll'] || []).includes(n)) return `dll.c: no import of ${n}: ${JSON.stringify(pe)}`;
+      c = await ax(['build', 'dllinit.c', '--target=x86_64-windows', '--format=agent-json', '-o', out]);
+      if (c.status !== 1 || !(codes(c) || []).includes('e:C3067')) return `dllinit.c: ${c.stdout}${c.stderr}`;
+      for (const o of ['-O0', '-O2']) {
+        c = await ax(['build', 'vla.c', '--target=x86_64-windows', '--pdb=off', o, '-o', out]);
+        if (c.status !== 0) return `vla.c ${o}: ${c.stdout}${c.stderr}`;
+        const p = checkDynUnwind(fs.readFileSync(out));
+        if (p) return `vla.c ${o}: ${p}`;
+      }
+      return null;
     },
     'C: native stack traces through C functions': async () => {
       if (skip()) return skip();

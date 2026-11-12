@@ -310,14 +310,29 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
     let name = symbol_name(s);
     let mut f = ir.get_function(M, name);
     if u.notnil(f) and not ir.is_decl(f) and (c_functions.get(u.intern(name)) == 0) {
-        _ = dg.err(s.span, "C3062", u.f1("the name '%s' is the name of a function of the runtime", s.name));
-        f = u.nil.[ir.Func]();
+        if u.notnil(s.def) or (s.linkage != cast.LK_EXTERNAL) {
+            _ = dg.err(s.span, "C3062", u.f1("the name '%s' is the name of a function of the runtime", s.name));
+            f = u.nil.[ir.Func]();
+        } else {
+            // a function C declares and Axiom code defines (an `export fn`,
+            // docs/c.md "C and Axiom in one program"): calls are to it, with
+            // the C signature, which the boundary types make the same ABI
+            s.ir = @ptr_cast(*mut void, f);
+            return f;
+        }
     }
     // (another unit's function of the same name is the same: cc.ax has
     // checked that only one unit defines it)
     c_functions.put(u.intern(name), 1);
     if u.isnil(f) {
         f = ir.add_function(M, name, sig.ty);
+    } else if u.notnil(s.def) and ir.is_decl(f) {
+        // a declaration (another unit's, or an Axiom extern "C" one) of the
+        // function this unit defines: the definition's signature, whose
+        // parameters may differ (a variadic definition's save area)
+        ir.retype_decl(f, sig.ty);
+        f.import_module = u.nosym();
+        f.import_name = u.nosym();
     } else {
         f.ty = sig.ty;
     }
@@ -327,6 +342,8 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
     }
     if u.str_eq(name, MAIN_SYMBOL) {
         f.linkage = ir.LINK_INTERNAL;
+    } else if s.weak and u.notnil(s.def) and (f.linkage != ir.LINK_INTERNAL) {
+        f.linkage = ir.LINK_WEAK;  // (kept: no unit has another definition; an object's users may)
     }
     if u.notnil(sig.plan) {
         mark_func(f, sig.plan);
@@ -359,6 +376,23 @@ pub fn c_library_import(name: []u8) void {
     g.align = 1;
 }
 
+/// Does the program (a unit: cc.ax sets it) define the external name?
+pub let mut defined_here: fn([]u8) bool = nothing_defined;
+
+fn nothing_defined(name: []u8) bool {
+    _ = name;
+    return false;
+}
+
+/// Is object s one of a DLL's (Windows): external, and defined by no unit?
+/// Code reaches it through its import address table slot, as through a
+/// GOT (an external global's address is loaded: x64.ax), which plink.ax
+/// fills with the address of the DLL's object; c_library_import names the
+/// DLL (the C library's, or a system DLL's by the name's rules).
+pub fn dll_object(s: *cast.CSym) bool {
+    return tg.is_windows() and (s.linkage == cast.LK_EXTERNAL) and not defined_here(s.name);
+}
+
 /// The address of object s (with static storage duration).
 pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
     if not u.isvnil(s.ir) {
@@ -369,9 +403,14 @@ pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
     if u.isnil(g) {
         g = ir.add_global(M, lty(s.ty), name);
     }
+    if dll_object(s) {
+        c_library_import(name);
+    }
     g.align = object_align(s);
     if s.linkage != cast.LK_EXTERNAL {
         g.linkage = ir.LINK_INTERNAL;
+    } else if s.weak and s.defined {
+        g.linkage = ir.LINK_WEAK;  // (as a function's: func_of)
     }
     s.ir = @ptr_cast(*mut void, g.val);
     return g.val;
@@ -532,6 +571,13 @@ fn put_item(im: *mut Image, it: *cast.InitItem) void {
         return;
     }
     let a = cc.address(e);
+    if u.notnil(a.sym) and (a.sym.kind != cast.SK_FUNC) and dll_object(a.sym) {
+        // (code reads its address from the import address table; data
+        // cannot hold it, and the image has no relocation for it)
+        _ = dg.err(e.span, "C3067",
+                   u.f1("the address of '%s', an object of a DLL, is not an address constant (on Windows the program finds it when it runs)",
+                        a.sym.name));
+    }
     let v = addr_value(a);
     if u.isnil(v) {
         put_le(im, it.off, a.off, size);
@@ -751,9 +797,11 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
 
 /// Generates START_SYMBOL(argc, argv) into module m, after the units: it
 /// calls main (the function main of the unit that defines it: cu) and returns
-/// its value as an i32.
-pub fn generate_start(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
+/// its value as an i32; `exit`: the program defines exit (a unit, or an
+/// Axiom module), which the start-up calls with main's value.
+pub fn generate_start(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool, exit: bool) bool {
     M = m;
+    program_exit = exit;
     if u.isnil(B) {
         B = ir.new_builder();
     }
@@ -762,6 +810,9 @@ pub fn generate_start(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     start(cu);
     return dg.error_count() == 0;
 }
+
+// Does the program define exit (generate_start)?
+let mut program_exit: bool = false;
 
 // START_SYMBOL(argc, argv): main's value (an i32).
 fn start(cu: *mut cs.CUnit) void {
@@ -798,17 +849,22 @@ fn start(cu: *mut cs.CUnit) void {
     } else if ib < 32 {
         status = ir.sext(B, r, T_i32);
     }
-    if tg.is_windows() {
+    if tg.is_windows() or program_exit {
         // returning from main is calling exit with its value (5.1.2.2.3):
         // the C library's exit flushes its streams and runs the atexit
-        // functions (the start-up's return would end the process at once)
+        // functions (the start-up's return would end the process at once).
+        // That is the program's own exit if it has one (a C unit's, or an
+        // Axiom module's export: the hosted C library's, docs/c.md), else
+        // on Windows the system's C library's.
         let mut pe: [1]*mut ir.Ty = [T_i32];
         let ety = ir.t_fn(T_void, pe[..], false);
         let mut ef = ir.get_function(M, "exit");
         if u.isnil(ef) {
             ef = ir.add_function(M, "exit", ety);
         }
-        c_library_import("exit");
+        if not program_exit {
+            c_library_import("exit");
+        }
         let mut ea: [1]*mut ir.Value = [status];
         _ = ir.call(B, ety, ef.val, ea[..]);
     }

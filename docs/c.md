@@ -19,7 +19,8 @@ axiom check prog.c                               # diagnostics only
 ```
 
 [`docs/c-diagnostics.md`](c-diagnostics.md) lists the diagnostics. How the front end is
-built is in [`docs/c-frontend.md`](c-frontend.md). Axiom programs that link C code
+built is in [`docs/c-frontend.md`](c-frontend.md). C units and Axiom modules build into
+one program ("C and Axiom in one program", below). Axiom programs that link C code
 compiled by the system's C compiler (`--link=file.c`) are a different feature, in
 [`docs/cli.md`](cli.md).
 
@@ -53,12 +54,15 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
 ```
 axiom build file.c... [options] [-o out]
 axiom check file.c...  [options]
+axiom build main.ax file.c... [options]       an Axiom program and C units
+axiom build main.c... file.ax... [options]    a C program and Axiom modules
 ```
 
 An input is a C source if its name ends in `.c`. Options take the forms `--name=value`
 and `-DNAME`; they may come before or after the inputs. `-D NAME`, `-U NAME` and
-`-I dir` (with a space) are accepted too. A build is of C sources or of an Axiom program,
-never of both.
+`-I dir` (with a space) are accepted too. The first input decides what the program is:
+a C program if it is a C source, an Axiom program if it is an Axiom source ("C and
+Axiom in one program").
 
 ### C options
 
@@ -71,6 +75,7 @@ never of both.
 | `-DNAME`, `-DNAME=value` | Define a macro (`NAME` is `NAME=1`). `-D'F(x)=x+1'` defines a function-like macro. |
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
 | `-Idir` | Add a directory to the include path. |
+| `--c-freestanding` | Link no C library into the program ("The C library"). |
 
 `-D`, `-U` and `-I` apply in the order given. The C options are errors for an Axiom
 source. The unknown ones are errors too: there are no `-W...`, `-std=`, `-c` or `-f...`
@@ -88,9 +93,11 @@ compiler, as for Axiom programs; `-l` and `-L` pass libraries and directories to
 linker.
 
 These are errors with C sources, since they mean something only for Axiom code:
-`--overflow`, `--sanitize`, `--coverage`, `--units`, `--emit-header`, `--link=file.ax`.
-So are `axiom test`, `axiom profile`, `axiom ide` and `axiom fmt` on a C source, and C
-sources together with an Axiom source.
+`--overflow`, `--sanitize`, `--coverage`, `--units`, `--emit-header`. An Axiom program
+with C units takes `--overflow` and `--emit-header`, which apply to its Axiom code (and
+the header is written before the C units are compiled, so they may include it). So are
+`axiom test`, `axiom profile`, `axiom ide` and `axiom fmt` on a C source, and `axiom
+test` and `axiom profile` of an Axiom program with C units.
 
 A missing source, a missing include directory (`-I`) and an output that is a directory are
 errors before anything is compiled.
@@ -114,7 +121,8 @@ An object or IR of translation units that do not define `main` holds their code 
 there is no start-up code and no runtime. The system's C compiler links such an object
 into a C program (`cc main.c lib.o`). It cannot be linked into an Axiom program with
 `--link=lib.o`: the link fails on the runtime symbols that the object defines (observed
-with `--target=x86_64`).
+with `--target=x86_64`). Give the C sources to the build of the Axiom program instead
+("C and Axiom in one program").
 
 ### `axiom check`
 
@@ -149,6 +157,125 @@ with its own macros, types and internal names. Then the units are linked:
 
 All the units are one program for the optimizer, so calls are inlined across them at
 `-O2` and `-O3`.
+
+## C and Axiom in one program
+
+C translation units and Axiom modules build into one program, on every target, with no
+C compiler or linker of the system's (unless the program calls the system's C library on
+Linux, as any C program may: "What a C program is here"):
+
+```
+axiom build main.ax util.c parse.c -o prog       # an Axiom program; its main is Axiom's
+axiom build main.c rt.ax io.ax -o prog           # a C program; its main is C's
+axiom build pkg/                                  # a package with c-sources (below)
+```
+
+- **What the program is** is decided by the first input. If it is an Axiom source, it is
+  the program's root module, as in any Axiom build (its `export fn main` is the entry),
+  and the other inputs must be C sources: the program's C units. A C unit that defines
+  `main` then is `C3066`. If the first input is a C source, the program is a C program:
+  one of its units defines `main` (`C3063`), and the Axiom sources among the inputs (or
+  given with `--link=file.ax`) are modules of the program, beside the C start-up module
+  (`std/internal/runtime/c_start.ax`), with their imports. An Axiom module that exports
+  `main` then is `E0802`.
+- **A package** names a directory of C sources in its manifest: `c-sources = "csrc"`
+  under `[package]`. Every `.c` file in it, at any depth and in the order of their paths,
+  is a C unit of the program, as if given on the command line; so are those of the
+  packages it depends on. `#include "..."` finds headers next to the including file and
+  in the `-I` directories.
+- **Axiom calls C** through its foreign declarations (spec §14.5.1): a function in an
+  `extern "C"` block that a C unit defines is that definition. Its arguments and result
+  are passed as the target's C ABI says, so the types at the boundary (spec §14.5.3)
+  mean the same on both sides: `i32` is `int`, `*u8` is `const char *`, a `fn(i32) i32`
+  is an `int (*)(int)`, and so on. Variadic C functions take Axiom's variadic calls.
+- **C calls Axiom**: an `export fn` of any of the program's modules is a C function of
+  the same name, which a C declaration (a prototype, `--emit-header`'s or one's own)
+  calls. An Axiom function passed to C as a function pointer is called with C's calling
+  convention, and a C function pointer passed to Axiom is called with an Axiom call.
+- **Structures** cross by pointer: an Axiom `struct` is laid out as C lays out the
+  structure with the same members (spec §5.9), so a `*Point` is a `struct point *`.
+  Passing one by value between Axiom and C is not supported (spec §14.5.3, `E0801`);
+  between C units it is, with the C ABI.
+- **Data** is shared through pointers: the Axiom language has no declarations of
+  external objects, so C's objects are reached through C functions that return their
+  addresses, and Axiom's through exported functions that return theirs.
+- **Names**: an external name is one symbol for the whole program, C's and Axiom's. On
+  macOS the object files add the leading underscore of Mach-O names to every one of
+  them; on WebAssembly a function that the program defines is a function of the module
+  and is called directly, and only one that nothing defines is an import (of `env`,
+  "What a C program is here"). An Axiom `export fn` is also an export of the WebAssembly
+  module, as in any Axiom program.
+- **Conflicts**: a name defined by two C units is `C3064`; one defined by a C unit and
+  by an Axiom `export fn` is `C3065`; a name of the runtime's own functions defined by C
+  is `C3062`. A name that nothing defines is the platform's (above): on Linux, a link
+  error if the C library does not have it either (`E9004`, after `link error: undefined
+  symbol 'name'`).
+
+Weak definitions, which standard C does not have, behave as a linker treats them: a
+weak definition gives way to another unit's definition that is not weak, and of two weak
+ones the first unit's is kept. The runtime's own copies of `memcpy`, `memmove` and
+`memset` are weak, so that a C unit may define them. Tentative definitions (6.9.2) are
+definitions: two units' tentative definitions of one name are `C3064`, as two
+definitions are (6.9p5), and there are no "common" objects.
+
+### What is linked
+
+An executable holds what its `main` (and the Axiom program's exports) can reach, and
+nothing else the C units define: a function that nothing calls or takes the address of,
+an object that nothing refers to, and a string literal only they use are left out, at
+every optimization level, before the optimizer runs. So a C library given in full (a
+unit of 200 functions, say) adds nothing to a program that calls none of its functions,
+and the size of one that calls one function is that of the program with that function
+alone. An object (`--emit=obj`) and a program that the system's linker links (with
+`--link=` inputs or `-l` libraries, whose code may refer to anything) keep every
+definition.
+
+### Start-up and exit
+
+The order in which a program starts and ends is the same with or without C:
+
+1. The system starts the runtime's entry point (on WebAssembly, the host calls the
+   module's `main` export). It records the arguments, checks the processor when the
+   program is built for more than its target's baseline (`--cpu`), and starts the
+   runtime (`ax_rt_init`: the crash handlers; the allocator and the threads start on
+   their first use). Axiom's global variables have their initial values in the
+   executable's data, before any code runs.
+2. The program's `main` runs: an Axiom program's, or for a C program the start-up
+   module's, which makes C strings of the arguments (with the Axiom allocator) and calls
+   C's `main` with them. Everything of the runtime works from C's first instruction on:
+   C code may call Axiom functions that allocate, print or start threads.
+3. When C's `main` returns, its value is the argument of a call of `exit` (5.1.2.2.3)
+   if the program defines `exit` (a C unit, or an Axiom module's `export fn exit`: the
+   hosted C library's), and on Windows, where `exit` is otherwise the C library's
+   (`msvcrt.dll`), which runs its `atexit` functions and flushes its streams. Such an
+   `exit` ends the process through the runtime: `std/os.exit`, which finishes the
+   runtime (`ax_rt_fini`) and exits with the status.
+4. Otherwise `main`'s value goes back to the runtime's entry point, which finishes the
+   runtime and returns it to the system (on Linux with the C library linked, to the C
+   library's start-up, which calls its `exit`).
+
+A C call of `exit` anywhere is the same function as in step 3. A C program on Linux that
+calls the C library's `exit` (it defines none) ends through the C library, without the
+runtime's finishing step, which only writes a profile (`axiom profile` does not take C
+programs).
+
+### The C library
+
+A hosted C program links the compiler's C library, which is compiled from the standard
+library's sources with the program, unless `--c-freestanding` is given:
+
+- every C source under `<std>/c/lib/` is a translation unit of the program, a library's:
+  a name that one of the program's own units defines is that unit's, and the library's
+  definition of it is left out (as a linker leaves out an archive's member nothing
+  needs), so a program may define a library function itself;
+- every Axiom module under `<std>/c/rt/` (the library's run-time layer: the system's
+  services, from the Axiom standard library, under C names) is a module of the program,
+  whose `export fn`s are generated only when something reaches them, and give way to a
+  C unit's definition of the same name.
+
+Either directory may be missing: today `std/c/` holds only the headers, so a C program
+calls the system's library as before. A unit of the library is analyzed with the
+program's C options (`--c-std`, `--c-int`, ...).
 
 ## Standards
 
@@ -379,6 +506,16 @@ checked against the system's C compiler on `x86_64` and `aarch64` Linux.
 structure on AArch64 Linux, and `char *` elsewhere, so it can be passed to the library's
 `v...` functions.
 
+On Windows, an object that C code declares and no unit defines is a DLL's, by the same
+rules as functions (`msvcrt.dll`'s unless its name is a Windows API's): the program
+reads its address from the import address table, so `extern int _fmode;` is the C
+library's own object. Its address is not an address constant there (it is known only
+when the program runs): an initializer of an object with static storage duration that
+takes it is `C3067`. A function whose stack pointer moves (one with a variable length
+array) has unwind information that finds its saved registers from its frame pointer,
+so the system's stack walks (exceptions, debuggers) go through it while the array is
+live.
+
 Known limits:
 
 - On x86-64 System V, a variadic argument whose type is aligned to more than 16 bytes and
@@ -452,4 +589,5 @@ claims less than the standard allows. None is hidden: each is said above or here
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;
   a program must not rely on it.
 - An object from `--emit=obj` of units with no `main` does not link into an Axiom
-  program with `--link=` (above).
+  program with `--link=` (above); the C sources build with it instead. There are no
+  static archives of the compiler's own objects.

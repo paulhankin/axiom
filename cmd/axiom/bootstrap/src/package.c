@@ -296,6 +296,9 @@ Package *pkg_load_dir(const char *dir_in, Span *from) {
                                AXIOM_VERSION);
             } else if (!strcmp(key_s, "entry")) {
                 entry = v;
+            } else if (!strcmp(key_s, "c-sources")) {
+                /* C translation units: the compiler's own C front end builds them (docs/c.md) */
+                perr(&P, ks, ke, "c-sources needs the C front end, which only the compiler (not the bootstrap compiler) has");
             } else {
                 perr(&P, ks, ke, arena_printf("unknown key '%s' in [package]", key_s));
             }

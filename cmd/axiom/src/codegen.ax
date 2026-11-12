@@ -8,6 +8,7 @@
 import "ast.ax" as ast;
 import "backend.ax" as be;
 import "c/cc.ax" as cfront;
+import "c/cstrip.ax" as cstrip;
 import "diag.ax" as dg;
 import "ir.ax" as ir;
 import "lexer.ax" as lx;
@@ -55,6 +56,18 @@ pub struct CgOptions {
 pub let mut g_export_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 // Libraries named by extern "C" "lib" blocks (for the linker).
 pub let mut g_link_libs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+// C units in the program (docs/c.md, "C and Axiom in one program"):
+// g_lib_prefix is the directory (its real path and a '/') of the Axiom
+// modules that are a library's, whose `export fn`s are generated only when
+// something refers to them, and give way to a C unit's definition of the
+// same name (lazy_export); with g_strip, what the C units define and
+// nothing reaches is left out (main.ax sets it for executables that our
+// own linkers link: c/cstrip.ax).
+pub let mut g_lib_prefix: []u8 = "";
+pub let mut g_strip: bool = false;
+// Has the program C units (cfront.pending when code generation starts)?
+let mut g_c_program: bool = false;
 // Build a test binary (axiom test): tests become roots and are exported.
 pub let mut g_test_mode: bool = false;
 // Set before codegen: the program spawns threads (wasm: shared memory and a
@@ -779,11 +792,12 @@ pub fn file_from_key(text: []u8) i32 {
 // named by extern "C" blocks: computed from the checked program.
 pub fn collect_link_names(o: *CgOptions) void {
     g_sanitize_main = o.sanitize_address;
+    g_c_program = cfront.pending();
     let mut seen = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     let P = sema.g_prog;
     for i in 0..P.fns.len {
         let d = P.fns.get(i);
-        if not d.is_export {
+        if not d.is_export or lazy_export(d) {
             continue;
         }
         let s = u.intern(export_symbol(d));
@@ -2062,11 +2076,15 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
         fi.llty = ir.t_fn(fi.llty.ret, fi.llty.params, true);
     }
     let mut existing = vnil();
-    if d.kind == ast.D_HOST_FN {
+    if (d.kind == ast.D_HOST_FN) or (d.is_export and g_c_program) {
+        // (an export: C code, or an extern "C" block, may have declared it)
         existing = named_fn(name);
     }
     if u.notnil(existing) {
         fi.fnv = existing;
+        if d.is_export and ir.is_decl(ir.fnp_of(existing)) {
+            ir.retype_decl(ir.fnp_of(existing), fi.llty);  // (C's declaration)
+        }
     } else {
         fi.fnv = ir.add_function(M, name, fi.llty).val;
     }
@@ -2102,13 +2120,16 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
         } else if (O.unit == CG_MODULE) and (n == 0) {
             define = (d.module == O.module) or own_feats;
         }
+        if lazy_export(d) and cfront.defines(d.name) {
+            define = false;  // a library's: a C unit defines the name, and that is the definition
+        }
         if ((O.unit == CG_WHOLE) and not d.is_export) or own_feats {
             set_linkage(fi.fnv, ir.LINK_INTERNAL);
         } else if define and (n > 0) {
             set_linkage(fi.fnv, ir.LINK_LINKONCE);
         }
         let asan_main = g_sanitize_main and not g_test_mode and u.str_eq(d.name, "main");
-        if define and d.is_export and ty.g_target.is_wasm and not asan_main {
+        if define and d.is_export and ty.g_target.is_wasm and not asan_main and not lazy_export(d) {
             add_str_attr(fi.fnv, "wasm-export-name", d.name);
         }
         if define {
@@ -5670,6 +5691,96 @@ fn emit_native_entry() void {
     }
 }
 
+// Generates the bodies of the functions instantiated and not yet generated.
+fn gen_pending() void {
+    while u.notnil(pending_head) {
+        let fi = pending_head;
+        pending_head = fi.next;
+        if u.isnil(pending_head) {
+            pending_tail = u.nil.[FnInst]();
+        }
+        gen_fn_body(fi);
+    }
+}
+
+// Does an Axiom module define exit (an `export fn`: the hosted C library's
+// run-time layer, which the C start-up calls when main returns)?
+fn exports_exit() bool {
+    let P = sema.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if d.is_export and u.str_eq(d.name, "exit") {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is d an `export fn` of a library's module (g_lib_prefix), generated only
+// when referred to, in a program with C units?
+fn lazy_export(d: *ast.Decl) bool {
+    if not d.is_export or (g_lib_prefix.len == 0) or not g_c_program or u.isnil(d.module) {
+        return false;
+    }
+    return u.starts(d.module.path, g_lib_prefix);
+}
+
+// The library modules' exports to generate when referred to (lazy_export),
+// by name: those whose names no C unit defines.
+let mut lazy_fns: u.SymMap.[*mut ast.Decl] = u.SymMap.[*mut ast.Decl].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut *mut ast.Decl, 0),
+                                                                        cap: 0, len: 0 };
+
+fn find_lazy_exports() void {
+    let P = sema.g_prog;
+    for i in 0..P.fns.len {
+        let d = P.fns.get(i);
+        if lazy_export(d) and not cfront.defines(d.name) {
+            lazy_fns.put(u.intern(d.name), d);
+        }
+    }
+}
+
+// If declaration f is a library module's export (lazy_fns), generates it,
+// and what it refers to; true if so (cstrip.ax calls it for what it
+// reaches).
+fn define_lazy(f: *mut ir.Func) bool {
+    if lazy_fns.len == 0 {
+        return false;
+    }
+    let d = lazy_fns.get(f.name);
+    if u.isnil(d) {
+        return false;
+    }
+    _ = get_inst(d, ty.no_types());
+    gen_pending();
+    return not ir.is_decl(f);
+}
+
+// After the C units are generated, when nothing is stripped (an object):
+// the library modules' exports that the module declares are generated, and
+// what they refer to, until no more are (as an archive's members are
+// linked).
+fn link_lazy_exports() void {
+    if lazy_fns.len == 0 {
+        return;
+    }
+    let mut done: usize = 0;
+    loop {
+        let n = M.funcs.len;
+        if done == n {
+            break;
+        }
+        for i in done..n {
+            let f = M.funcs.get(i);
+            if ir.is_decl(f) {
+                _ = define_lazy(f);
+            }
+        }
+        done = n;
+    }
+}
+
 // Generates code for the checked program. False on failure (errors reported
 // through diag or printed to stderr).
 pub fn codegen_program(o: *mut CgOptions) bool {
@@ -5703,6 +5814,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         M.cov_prev = cov_global("prev");
     }
     let program_parts = O.unit != CG_MODULE;
+    g_c_program = cfront.pending();
     if program_parts and ty.g_target.is_wasm and g_threads {
         emit_thread_start();
     }
@@ -5713,7 +5825,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         // unreachable code costs nothing in the backend.
         for i in 0..P.fns.len {
             let d = P.fns.get(i);
-            if d.is_export {
+            if d.is_export and not lazy_export(d) {
                 _ = get_inst(d, ty.no_types());
             }
         }
@@ -5778,17 +5890,26 @@ pub fn codegen_program(o: *mut CgOptions) bool {
             emit_asan_main_wasm();
         }
     }
-    while u.notnil(pending_head) {
-        let fi = pending_head;
-        pending_head = fi.next;
-        if u.isnil(pending_head) {
-            pending_tail = u.nil.[FnInst]();
-        }
-        gen_fn_body(fi);
-    }
-    // a C program (main.ax): its translation unit joins the start-up's module
-    if cfront.pending() and not cfront.gen_ir(M, ty.g_target.is_wasm, c_call_site) {
+    gen_pending();
+    // C translation units (main.ax) join the module: a C program's start-up,
+    // or an Axiom program
+    let c_units = cfront.pending();
+    let f0 = M.funcs.len;
+    let g0 = M.globals.len;
+    if c_units and not cfront.gen_ir(M, ty.g_target.is_wasm, c_call_site, exports_exit()) {
         return false;
+    }
+    let f1 = M.funcs.len;
+    let g1 = M.globals.len;
+    if c_units {
+        find_lazy_exports();
+        if g_strip {
+            // what nothing reaches goes, and the library exports reached are
+            // generated (define_lazy)
+            cstrip.strip(M, f0, f1, g0, g1, define_lazy);
+        } else {
+            link_lazy_exports();
+        }
     }
     if dg.error_count() != 0 {
         return false;

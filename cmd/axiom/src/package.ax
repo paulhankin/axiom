@@ -8,6 +8,8 @@
 //     version = "0.1.0"
 //     axiom = "0.1"                 # optional: the oldest compiler that builds it
 //     entry = "src/lib.ax"          # optional: default src/lib.ax, else src/main.ax
+//     c-sources = "csrc"            # optional: a directory whose .c files are
+//                                   # C translation units of the program (docs/c.md)
 //
 //     [dependencies]
 //     vecmath = { path = "../vecmath" }
@@ -26,6 +28,7 @@ pub struct Package {
     version: []u8,
     dir: []u8,           // real path of the package root (where axiom.toml is)
     entry: []u8,         // real path of the entry module
+    c_dir: []u8,         // c-sources: the directory of its C sources, or nil
     manifest_file: i32,  // g_files index, for diagnostics
     deps: u.SymMap.[*mut Package],
     dep_names: u.List.[[]u8],
@@ -334,6 +337,12 @@ fn parse_package_key(P: *mut Parser, p: *mut Package, m: *mut Manifest, key: []u
         }
     } else if u.str_eq(key, "entry") {
         m.entry = v;
+    } else if u.str_eq(key, "c-sources") {
+        if (v.len == 0) or (v[0] == '/') or u.contains(v, "..") or not u.is_dir(u.f2("%s/%s", p.dir, v)) {
+            perr(P, ks, P.pos, "c-sources = \"...\" must name a directory in the package");
+        } else {
+            p.c_dir = u.f2("%s/%s", p.dir, v);
+        }
     } else {
         perr(P, ks, ke, u.f1("unknown key '%s' in [package]", key));
     }
@@ -575,6 +584,11 @@ pub fn resolve_import(importer: *mut Package, spec: []u8, sp: u.Span) []u8 {
 }
 
 fn collect(dir: []u8, out: *mut u.List.[[]u8]) void {
+    collect_ext(dir, ".ax", out);
+}
+
+// The files under dir (at any depth) whose names end in ext, into *out.
+fn collect_ext(dir: []u8, ext: []u8, out: *mut u.List.[[]u8]) void {
     let mut names = u.List.[[]u8].empty();
     if not u.list_dir(dir, &mut names) {
         return;
@@ -586,11 +600,40 @@ fn collect(dir: []u8, out: *mut u.List.[[]u8]) void {
         }
         let p = u.f2("%s/%s", dir, n);
         if u.is_dir(p) {
-            collect(p, out);
-        } else if (n.len > 3) and u.ends(n, ".ax") {
+            collect_ext(p, ext, out);
+        } else if (n.len > ext.len) and u.ends(n, ext) {
             out.push(p);
         }
     }
+}
+
+/// The C sources of the packages loaded (each one's c-sources directory, its
+/// .c files at any depth, sorted), into *out.
+pub fn c_sources(out: *mut u.List.[[]u8]) void {
+    let mut dirs = u.List.[[]u8].empty();
+    for i in 0..pkg_by_dir.cap {
+        if pkg_by_dir.cap == 0 {
+            break;
+        }
+        let p = @slice_from_ptr(pkg_by_dir.vals, pkg_by_dir.cap)[i];
+        if u.notnil(p) and not u.isnos(p.c_dir) {
+            dirs.push(p.c_dir);
+        }
+    }
+    u.sort(dirs.items(), u.str_cmp);
+    for d in dirs.items() {
+        let start = out.len;
+        collect_ext(d, ".c", out);
+        u.sort(out.items()[start..], u.str_cmp);
+    }
+}
+
+/// The files under dir, at any depth, whose names end in ext (sorted), into
+/// *out (none if there is no such directory).
+pub fn files_under(dir: []u8, ext: []u8, out: *mut u.List.[[]u8]) void {
+    let start = out.len;
+    collect_ext(dir, ext, out);
+    u.sort(out.items()[start..], u.str_cmp);
 }
 
 // Every .ax file under the package's src/ directory (sorted).

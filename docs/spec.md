@@ -466,6 +466,7 @@ name = "geometry"          # required: lower-case letters, digits and '_', not s
 version = "0.1.0"          # optional; informational
 axiom = "0.1"              # optional: the oldest compiler that builds the package
 entry = "src/lib.ax"       # optional; default src/lib.ax if it exists, otherwise src/main.ax
+c-sources = "csrc"         # optional: a directory of C translation units of the program
 
 [dependencies]
 vecmath = { path = "../vecmath" }
@@ -474,6 +475,11 @@ json = { git = "https://example.com/json.git", rev = "3f1c2a9d0e5b7c4a8f6e2d1b0c
 
 - An unknown section, an unknown key, a malformed line, an invalid name, or a duplicate
   dependency is `E0215`.
+- `c-sources` names a directory of the package (relative to it); every `.c` file in it,
+  at any depth, is a C translation unit of a program that uses the package, compiled by
+  the compiler's C front end (docs/c.md, "C and Axiom in one program"). One that is not
+  a directory of the package is `E0215`; the bootstrap compiler, which has no C front
+  end, reports `E0215` for the key.
 - `axiom` names the oldest compiler version that builds the package (`a`, `a.b` or
   `a.b.c`; a value that is not a version is `E0215`). A compiler older than that
   (`axiom version`) refuses the package with `E0220`.

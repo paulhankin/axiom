@@ -167,9 +167,15 @@ compiler's own C front end ([`docs/c.md`](c.md)). They are errors with Axiom inp
 | `-I<dir>` | An include directory. |
 | `--emit=c-pp\|c-tokens\|c-ast` | The preprocessed text, the tokens, or the syntax tree, of one source. |
 
+| `--c-freestanding` | Link no C library into the program. |
+
 With C sources, `--emit=obj` and `--emit=ir` of units that define no `main` give their
-code alone. `--overflow`, `--sanitize`, `--coverage`, `--units`, `--emit-header` and
-`--link=<file.ax>` are errors.
+code alone. `--overflow`, `--sanitize`, `--coverage`, `--units` and `--emit-header` are
+errors, except that an Axiom program with C units (`axiom build main.ax x.c`) takes
+`--overflow` and `--emit-header`. `axiom build main.ax x.c...` builds an Axiom program
+with C translation units, `axiom build main.c... x.ax...` a C program with Axiom modules,
+into one program (docs/c.md, "C and Axiom in one program"); a package's manifest names
+its C sources with `c-sources = "dir"`.
 
 ### Linking
 

@@ -16,6 +16,21 @@
 // the same symbols (a reference in one unit to another's definition is to
 // it), names with internal linkage are numbered apart (csema.ax: uid).
 //
+// C beside Axiom (docs/c.md, "C and Axiom in one program"): the units join
+// the module of an Axiom program (`axiom build main.ax x.c`), or a C
+// program's start-up module with Axiom modules beside it (`axiom build
+// main.c rt.ax`). A C declaration of a function that Axiom code defines (an
+// `export fn`) calls it; an Axiom `extern "C"` function that a unit defines
+// is that definition. boundary_check reports a name both define (C3065).
+//
+// A library's units (check with lib: a C library's sources) give way: a
+// name a program's unit defines is that unit's, and the library's
+// definition of it is dropped (as an archive's member would not be linked,
+// 7.1.3 leaves the rest to the implementation). So does a weak definition
+// (CSym.weak, which only an extension can make) to a definition that is not
+// weak; of two weak ones the first is kept. Everything a unit defines that
+// the program does not reach is left out of an executable (cstrip.ax).
+//
 // (docs/c.md describes the options; docs/c-frontend.md the design.)
 // =============================================================================
 import "../diag.ax" as dg;
@@ -37,6 +52,12 @@ import "csema_stmt.ax" as css;
 let mut g_units: u.List.[*mut cs.CUnit] = u.List.[*mut cs.CUnit].{ data: @ptr_from_int(*mut *mut cs.CUnit, 0), len: 0,
                                                                    cap: 0 };
 let mut g_files: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+// Whether each unit is a library's (check: lib).
+let mut g_lib: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
+// The external names the units define (after link_check): the definition.
+let mut g_defs: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                        vals: @ptr_from_int(*mut *mut cast.CSym, 0),
+                                                                        cap: 0, len: 0 };
 
 /// Is `emit` one of the C front end's text outputs (run makes them)?
 pub fn text_emit(emit: []u8) bool {
@@ -45,8 +66,9 @@ pub fn text_emit(emit: []u8) bool {
 
 /// Preprocesses, parses and analyzes the C source at `path`; true if it
 /// has no errors (they are reported through diag.ax, not emitted), and
-/// then its typed unit is one gen_ir generates.
-pub fn check(path: []u8, o: *co.COptions) bool {
+/// then its typed unit is one gen_ir generates. `lib`: the unit is a
+/// library's, whose definitions give way to the program's (link_check).
+pub fn check(path: []u8, o: *co.COptions, lib: bool) bool {
     let before = dg.error_count();
     let toks = cpp.preprocess(path, o);
     if dg.error_count() > before {
@@ -63,6 +85,7 @@ pub fn check(path: []u8, o: *co.COptions) bool {
     g_units.push(cu);
     // (the end of file token's span is in the unit's own file)
     g_files.push(toks.get(toks.len - 1).span.file);
+    g_lib.push(lib);
     return true;
 }
 
@@ -75,40 +98,166 @@ fn def_span(s: *cast.CSym) u.Span {
 }
 
 /// After every unit is checked: the program's external names have one
-/// definition each (6.9p5: C3064), and (program: an executable, not an
-/// object) one unit defines main (C3063). True if so (else reported).
+/// definition each (6.9p5: C3064), and (program: an executable whose main
+/// is C's, not an object or a program whose main is Axiom's) one unit
+/// defines main (C3063). A library unit's definition of a name that a
+/// program unit defines is dropped (the header). True if so (else
+/// reported).
 pub fn link_check(program: bool) bool {
-    let mut defs = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
+    g_defs = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
     let mut ok = true;
-    for k in 0..g_units.len {
-        let cu = g_units.get(k);
-        let mut syms = u.List.[*mut cast.CSym].empty();
-        for f in cu.funcs.items() {
-            if (f.linkage == cast.LK_EXTERNAL) and not csm.is_inline_def(f) {
-                syms.push(f);
+    // the program's units first, so that a library's definitions find theirs
+    g_dropped = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    for pass in @as(usize, 0)..2 {
+        for k in 0..g_units.len {
+            let lib = g_lib.get(k);
+            if lib != (pass == 1) {
+                continue;
             }
+            ok = define_unit(g_units.get(k), lib) and ok;
         }
-        for x in cu.objects.items() {
-            if x.linkage == cast.LK_EXTERNAL {
-                syms.push(x);
-            }
-        }
-        for s in syms.items() {
-            let key = u.intern(s.name);
-            let prev = defs.get(key);
-            if u.notnil(prev) {
-                let d = dg.err(def_span(s), "C3064",
-                               u.f1("'%s' is defined in two translation units (an external name has one definition)",
-                                    s.name));
-                dg.note(d, def_span(prev), "the other definition");
-                ok = false;
-            } else {
-                defs.put(key, s);
-            }
+    }
+    if g_dropped.len > 0 {
+        for cu in g_units.items() {
+            drop_from(cu);
         }
     }
     if program and ok and u.isnil(main_unit()) and (g_files.len > 0) {
         _ = dg.err(u.mkspan(g_files.get(0), 0, 0), "C3063", "the program has no function main");
+        ok = false;
+    }
+    return ok;
+}
+
+// The definitions that give way to others (link_check), by address.
+let mut g_dropped: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+// Enters unit cu's external definitions into g_defs (C3064 for a second
+// one). False after an error.
+fn define_unit(cu: *mut cs.CUnit, lib: bool) bool {
+    let mut ok = true;
+    for f in cu.funcs.items() {
+        if (f.linkage == cast.LK_EXTERNAL) and not csm.is_inline_def(f) {
+            define(f, lib, &mut ok);
+        }
+    }
+    for x in cu.objects.items() {
+        if x.linkage == cast.LK_EXTERNAL {
+            define(x, lib, &mut ok);
+        }
+    }
+    return ok;
+}
+
+// Takes the definitions that give way out of unit cu: what refers to them
+// refers to the definition that is kept, of the same name.
+fn drop_from(cu: *mut cs.CUnit) void {
+    let mut funcs = u.List.[*mut cast.CSym].empty();
+    for f in cu.funcs.items() {
+        if not g_dropped.has(u.addr_key(@int_from_ptr(f))) {
+            funcs.push(f);
+        }
+    }
+    let mut objects = u.List.[*mut cast.CSym].empty();
+    for x in cu.objects.items() {
+        if not g_dropped.has(u.addr_key(@int_from_ptr(x))) {
+            objects.push(x);
+        }
+    }
+    cu.funcs = funcs;
+    cu.objects = objects;
+}
+
+// s (a definition) is not the one linked.
+fn drop(s: *mut cast.CSym) void {
+    s.def = u.nil.[cast.Decl]();
+    s.defined = false;
+    g_dropped.put(u.addr_key(@int_from_ptr(s)), 1);
+}
+
+// Enters s, an external definition, into g_defs, or drops it or the one
+// before it: a library's (s is one: lib) gives way to the program's, a weak
+// one to one that is not. A second definition otherwise is C3064 (*ok
+// false).
+fn define(s: *mut cast.CSym, lib: bool, ok: *mut bool) void {
+    let key = u.intern(s.name);
+    let prev = g_defs.get(key);
+    if u.isnil(prev) {
+        g_defs.put(key, s);
+        return;
+    }
+    if lib and not is_lib_sym(prev) {
+        drop(s);  // the program defines it: the library's is not linked
+        return;
+    }
+    if s.weak {
+        drop(s);  // (of two weak ones, the first)
+        return;
+    }
+    if prev.weak {
+        drop(prev);
+        g_defs.put(key, s);
+        return;
+    }
+    let d = dg.err(def_span(s), "C3064",
+                   u.f1("'%s' is defined in two translation units (an external name has one definition)", s.name));
+    dg.note(d, def_span(prev), "the other definition");
+    ok.* = false;
+}
+
+// Is s (in g_defs) a library unit's definition?
+fn is_lib_sym(s: *mut cast.CSym) bool {
+    for k in 0..g_units.len {
+        if not g_lib.get(k) {
+            continue;
+        }
+        let cu = g_units.get(k);
+        for f in cu.funcs.items() {
+            if f == s {
+                return true;
+            }
+        }
+        for x in cu.objects.items() {
+            if x == s {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Does a unit define the external name `name` (after link_check)?
+pub fn defines(name: []u8) bool {
+    return g_defs.has(u.intern(name));
+}
+
+/// An external name of the Axiom program: an `export fn` (span: its name).
+pub struct AxName {
+    name: []u8,
+    span: u.Span,
+}
+
+/// After link_check: no external name is defined by a unit and by the
+/// Axiom program's `export fn`s (`names`), C3065, and a unit defines no
+/// main if the Axiom program has its own (axiom_main), C3066. True if so
+/// (else reported).
+pub fn boundary_check(names: []AxName, axiom_main: bool) bool {
+    let mut ok = true;
+    for x in names {
+        let s = g_defs.get(u.intern(x.name));
+        if u.isnil(s) {
+            continue;
+        }
+        let d = dg.err(def_span(s), "C3065",
+                       u.f1("'%s' is defined in C and in Axiom (an external name has one definition)", s.name));
+        dg.note(d, x.span, "the Axiom definition");
+        ok = false;
+    }
+    let mu = main_unit();
+    if axiom_main and u.notnil(mu) {
+        _ = dg.err(def_span(mu.main), "C3066",
+                   "the program's main is the Axiom module's, and a C translation unit defines main too");
         ok = false;
     }
     return ok;
@@ -137,16 +286,19 @@ pub fn pending() bool {
 /// Generates the checked translation units into module m (wasm: for a
 /// WebAssembly target), and the start-up's call of main if one defines it;
 /// `site` makes the call-site records of native stack traces (codegen.ax).
-/// False after an error (reported).
-pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut ir.Value) bool {
+/// `ax_exit`: an Axiom module defines exit (an `export fn`), which, as a
+/// unit's would, the start-up calls when main returns. False after an
+/// error (reported).
+pub fn gen_ir(m: *mut ir.Module, wasm: bool, site: fn(u.Span, []u8, []u8) *mut ir.Value, ax_exit: bool) bool {
     cg.call_site = site;
+    cg.defined_here = defines;
     let mut ok = true;
     for cu in g_units.items() {
         ok = cgs.generate(m, cu, wasm) and ok;
     }
     let mu = main_unit();
     if ok and u.notnil(mu) {
-        ok = cg.generate_start(m, mu, wasm);
+        ok = cg.generate_start(m, mu, wasm, ax_exit or defines("exit"));
     }
     g_units.clear();
     return ok;

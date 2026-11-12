@@ -90,7 +90,8 @@ cmd/axiom/src/c/cconst.ax   constant expressions                        (+ ccomp
 cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree
 cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conventions
                             (cgen_complex.ax: complex arithmetic)
-cmd/axiom/src/c/cc.ax       the driver
+cmd/axiom/src/c/cc.ax       the driver, and the link of the units (with Axiom's)
+cmd/axiom/src/c/cstrip.ax   leaves out of an executable what the units define and nothing reaches
 std/c/include/              the compiler's headers
 cmd/axiom/internal/tests/c/ tests
 ```
@@ -145,9 +146,9 @@ records, so stack traces show C frames with their lines; on WebAssembly they hav
 `-g` (accepted: this compiler writes line tables for no code), `-l`, `-L`, `--link=`
 (objects, libraries, and C sources for the system's C compiler), `--subsystem`, `--icon`,
 `--pdb`. Those of Axiom code (`--overflow`, `--sanitize`, `--coverage`,
-`--units`, `--emit-header`, `--link=file.ax`) are errors with C sources, as are the
-C options without one, Axiom and C sources together, and `axiom test`, `profile`,
-`ide` and `fmt` of a C source. A missing source or include directory and an
+`--units`, `--emit-header`) are errors with C sources (an Axiom program with C units
+takes `--overflow` and `--emit-header`), as are the C options without one, and `axiom
+test`, `profile`, `ide` and `fmt` of a C source. A missing source or include directory and an
 output that is a directory are errors before anything is compiled.
 
 Several sources are the translation units of one program. Each is preprocessed,
@@ -160,6 +161,40 @@ a reference in one unit to another's definition is to that definition. An object
 or IR (`--emit=obj|ir`) of units without `main` holds their code alone (its root
 module is `std/internal/runtime/c_object.ax`: no start-up, no runtime), to be
 linked into another program; with `main` it is the whole program's, as for Axiom.
+
+## C and Axiom in one program
+
+`axiom build main.ax x.c` checks the Axiom program (sema), then the C units
+(`main.ax`: `check_c_units`), links the units (`link_check`, with no `main` required)
+and checks the names both define (`cc.boundary_check`: `C3065`, `C3066`); the units'
+IR joins the Axiom program's module as it joins a C program's start-up module.
+`axiom build main.c rt.ax` is a C program whose start-up module has the Axiom modules
+beside it (sema's extra files). In both, every unit and module is one IR module:
+
+- C's references go to the module's functions by name (`cgen.func_of`): a declaration
+  of a function that Axiom defines (an `export fn`) is that function; an Axiom
+  `extern "C"` declaration that a unit defines is given the definition's signature
+  (`ir.retype_decl`: a variadic definition has more parameters) and body.
+- The Axiom modules under `<std>/c/rt/` are a library's (`codegen.ax`:
+  `lazy_export`): their exports are not roots, and are generated when something
+  reaches them (`define_lazy`), unless a C unit defines the name. The C sources under
+  `<std>/c/lib/` are a library's units (`cc.check` with `lib`), whose definitions give
+  way to the program's (`link_check`). `main.ax`'s `c_library` adds both; nothing is
+  there yet.
+- An executable that our own linkers link is stripped (`cstrip.ax`) before the
+  optimizer: the roots are everything Axiom generated (which it generates only when
+  reachable or exported), the start-up's call of `main`, and the functions code
+  generation calls by name; everything the units define that the roots do not reach,
+  through instructions' operands, call-site records and initializers, is removed.
+- `exit`: when the program defines it (a unit, or an Axiom export), the start-up calls
+  it with `main`'s value (`cgen.generate_start`), as it calls the C library's on
+  Windows.
+
+Tests: each directory of `cmd/axiom/internal/tests/c/mix/` is a program of both
+languages (`[c-mix]` in `run.mjs`: its `main.ax` or `main.c` with the directory's
+sources, built and run on each target, printing through `c/mix/print.ax`); the `C
+programs` section has the command line, a package's `c-sources`, the size of what is
+linked, the library directories, the Windows and macOS builds.
 
 ## Programs
 

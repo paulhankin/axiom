@@ -4,6 +4,8 @@
 //   axiom build <file.ax> [options] -o <out>
 //   axiom check <file.ax> [options]
 //   axiom build|check <file.c>... [options]   a C program (c/cc.ax; docs/c-frontend.md)
+//   axiom build|check <file.ax> <file.c>...    an Axiom program with C units
+//   axiom build|check <file.c>... <file.ax>... a C program with Axiom modules
 //   axiom lsp [options]          language server for editors (lsp.ax)
 //   axiom ide <file.ax> --query=<q> [options]   one question from it (ide.ax)
 //
@@ -63,6 +65,8 @@ import "wobj.ax" as wo;
 fn usage() void {
     u.eprint("usage: axiom <build|check|test> [<file.ax> | <package dir>] [options]\n");
     u.eprint("       axiom <build|check> <file.c>... [options]   a C program (its translation units)\n");
+    u.eprint("       axiom <build|check> <file.ax> <file.c>...   an Axiom program and C units, one program\n");
+    u.eprint("       axiom <build|check> <file.c>... <file.ax>...   a C program and Axiom modules, one program\n");
     u.eprint("       axiom profile [<file.ax> | <package dir>] [--rate=<hz>] [--folded=<path>] [-- <program args>]\n");
     u.eprint("       axiom fmt <file.ax | dir>... [--check] [--stdout]   canonical layout, tidy imports\n");
     u.eprint("       axiom new <name>      create a package skeleton\n");
@@ -285,6 +289,7 @@ struct Options {
     inc_flags: u.List.[[]u8],   // -I, for C sources
     c_args: u.List.[[]u8],      // the C front end's options (c_option)
     c_inputs: u.List.[[]u8],    // the C sources after the first (input)
+    c_freestanding: bool,       // --c-freestanding: no C library (c_library)
     header_path: []u8,
     test_filter: []u8,
     test_timeout: []u8,
@@ -308,9 +313,9 @@ fn new_options(cmd: []u8) Options {
                      emit: "exe", json: false, co: co, link_inputs: u.List.[[]u8].empty(),
                      ax_links: u.List.[[]u8].empty(), feature_args: u.List.[[]u8].empty(),
                      link_flags: u.List.[[]u8].empty(), inc_flags: u.List.[[]u8].empty(), c_args: u.List.[[]u8].empty(),
-                     c_inputs: u.List.[[]u8].empty(), header_path: u.nosym(), test_filter: u.nosym(),
-                     test_timeout: u.nosym(), show_output: false, prof_hz: 999, units_mode: -1, verbose: false,
-                     folded_path: u.nosym(), prog_args: u.List.[[]u8].empty() };
+                     c_inputs: u.List.[[]u8].empty(), c_freestanding: false, header_path: u.nosym(),
+                     test_filter: u.nosym(), test_timeout: u.nosym(), show_output: false, prof_hz: 999, units_mode: -1,
+                     verbose: false, folded_path: u.nosym(), prog_args: u.List.[[]u8].empty() };
 }
 
 // An object of C code alone (build_c): no runtime, so no system call stubs.
@@ -329,6 +334,11 @@ fn fatal(json: bool, code: []u8, msg: []u8) i32 {
 // implementation makes, and macros. True if `a` is one (kept in o.c_args, for
 // c_options to read once the target is known).
 fn c_option(o: *mut Options, a: []u8) bool {
+    if u.str_eq(a, "--c-freestanding") {
+        o.c_args.push(a);
+        o.c_freestanding = true;  // (no C library: c_library)
+        return true;
+    }
     if u.starts(a, "--c-std=") or u.starts(a, "--c-char=") or u.starts(a, "--c-int=") or u.starts(a, "--c-long=") or
        ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
         o.c_args.push(a);
@@ -374,7 +384,9 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     for k in 0..o.c_args.len {
         let a = o.c_args.get(k);
         let mut ok = true;
-        if u.starts(a, "--c-std=") {
+        if u.str_eq(a, "--c-freestanding") {
+            // (main.ax's: c_library)
+        } else if u.starts(a, "--c-std=") {
             c.std = cop.std_named(a[8..]);
             if c.std < 0 {
                 dg.emit_fatal(o.json, "E9001",
@@ -421,12 +433,17 @@ fn is_c_source(path: []u8) bool {
     return (path.len > 2) and u.ends(path, ".c");
 }
 
+// Is `path` an Axiom source (its name ends in .ax)?
+fn is_ax_source(path: []u8) bool {
+    return (path.len > 3) and u.ends(path, ".ax");
+}
+
 // The options that are the Axiom compiler's and mean nothing for C sources
 // (C code has no overflow modes, heap checks or coverage counters, and an
 // Axiom header or source is of Axiom code): false after reporting one.
 // Without C sources, the C front end's options are errors.
 fn check_c_options(o: *Options) bool {
-    let c_input = is_c_source(o.input);
+    let c_input = is_c_source(o.input) or (o.c_inputs.len > 0);
     if not c_input {
         if o.c_args.len > 0 {
             dg.emit_fatal(o.json, "E9001", u.f1("'%s' is an option for C sources, and the input is not one (*.c)",
@@ -435,22 +452,34 @@ fn check_c_options(o: *Options) bool {
         }
         return true;
     }
+    // An Axiom program with C units (its root is the .ax input) takes the
+    // options of Axiom code that change only its own code; a C program (the
+    // first input is C) takes none of them.
+    let ax_root = not is_c_source(o.input);
     let mut bad = u.nosym();
-    if o.co.overflow != cg.OVF_WRAP {
+    if (o.co.overflow != cg.OVF_WRAP) and not ax_root {
         bad = "--overflow";  // (C's signed overflow is undefined; unsigned wraps)
     } else if o.co.sanitize_address {
         bad = "--sanitize=address";
     } else if o.co.coverage {
         bad = "--coverage=afl";
-    } else if not u.isnos(o.header_path) {
+    } else if not u.isnos(o.header_path) and not ax_root {
         bad = "--emit-header";
-    } else if o.ax_links.len > 0 {
+    } else if (o.ax_links.len > 0) and ax_root {
         bad = "--link=<file.ax>";
     } else if o.units_mode >= 0 {
         bad = "--units";
     }
     if not u.isnos(bad) {
         dg.emit_fatal(o.json, "E9001", u.f1("%s is an option for Axiom code, and not for C sources", bad));
+        return false;
+    }
+    if ax_root and (o.testing or o.profiling or o.ide_mode) {
+        dg.emit_fatal(o.json, "E9001", u.f1("axiom %s does not take C sources", o.cmd));
+        return false;
+    }
+    if ax_root and cfront.text_emit(o.emit) {
+        dg.emit_fatal(o.json, "E9001", u.f1("--emit=%s takes one C source, and no Axiom source", o.emit));
         return false;
     }
     if cfront.text_emit(o.emit) and (o.c_inputs.len > 0) {
@@ -572,13 +601,10 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             return false;
         } else if u.isnos(o.input) {
             o.input = a;
-        } else if is_c_source(o.input) and is_c_source(a) {
+        } else if is_c_source(a) {
             o.c_inputs.push(a);  // another translation unit of the program
-        } else if is_c_source(o.input) or is_c_source(a) {
-            dg.emit_fatal(o.json, "E9001",
-                          u.f2("'%s' and '%s' cannot be built together: a build is of C sources or of an Axiom program (an Axiom program links C code with --link=<file.c>)",
-                               o.input, a));
-            return false;
+        } else if is_c_source(o.input) and is_ax_source(a) {
+            o.ax_links.push(a);  // an Axiom module of a C program
         } else {
             dg.emit_fatal(o.json, "E9001", u.f1("unexpected argument '%s'", a));
             return false;
@@ -610,6 +636,7 @@ fn package_input(o: *mut Options, files: *mut u.List.[[]u8]) i32 {
         return 1;
     }
     o.input = pk.entry;
+    pkg.c_sources(&mut o.c_inputs);  // (c-sources: C units beside the Axiom program)
     if o.testing {
         pkg.source_files(pk, files);
     }
@@ -844,11 +871,31 @@ fn compile(args: [][]u8) i32 {
     if o.build and not runtime_sources(&o, &mut pkg_files) {
         return 2;
     }
+    if (o.c_inputs.len > 0) and u.str_eq(o.emit, "exe") and not o.c_freestanding {
+        // the C library's run-time layer (c_library)
+        let rt = u.f1("%s/c/rt", o.std_dir);
+        let start = pkg_files.len;
+        pkg.files_under(rt, ".ax", &mut pkg_files);
+        if pkg_files.len > start {
+            let r = u.real_path(rt);
+            cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
+        }
+    }
     let so = sema.SemaOptions.{ std_dir: o.std_dir, extra_files: pkg_files.items() };
-    let ok = sema.run(o.input, &so);
+    let mut ok = sema.run(o.input, &so);
     u.phase("parse and check");
     if ok and not u.isnos(o.header_path) and not write_header(&mut o) {
         return 2;
+    }
+    if ok and (o.c_inputs.len > 0) {
+        // C units beside the Axiom program (after the header, which they
+        // may include)
+        let mut c = u.new.[cop.COptions]();
+        if not c_options(&o, c) {
+            return 2;
+        }
+        ok = check_c_units(&o, c, true);
+        o.units_mode = 0;  // (the units join the program's module)
     }
     if not ok or not o.build {
         dg.emit(o.json, o.json);
@@ -872,15 +919,19 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     if o.testing or o.profiling or o.ide_mode {
         return fatal(o.json, "E9001", u.f1("axiom %s does not take a C source", o.cmd));
     }
-    let mut ok = cfront.check(o.input, c);
+    let mut ok = cfront.check(o.input, c, false);
     for k in 0..o.c_inputs.len {
-        ok = cfront.check(o.c_inputs.get(k), c) and ok;
+        ok = cfront.check(o.c_inputs.get(k), c, false) and ok;
     }
     let exe = u.str_eq(o.emit, "exe");
+    let mut lib_modules = u.List.[[]u8].empty();
+    if ok and exe {
+        ok = c_library(o, c, &mut lib_modules);
+    }
     if ok {
         ok = cfront.link_check(o.build and exe);
     }
-    if not ok or not o.build {
+    if not ok or (not o.build and (o.ax_links.len == 0)) {
         dg.emit(o.json, o.json);
         if ok {
             return 0;
@@ -895,16 +946,107 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
     }
     o.units_mode = 0;
     let mut files = u.List.[[]u8].empty();
-    if not object and not runtime_sources(o, &mut files) {
+    if o.build and not object and not runtime_sources(o, &mut files) {
         return 2;
     }
+    for k in 0..o.ax_links.len {
+        files.push(o.ax_links.get(k));  // (with an object's root too)
+    }
+    for k in 0..lib_modules.len {
+        files.push(lib_modules.get(k));
+    }
+    set_strip(o);
     let so = sema.SemaOptions.{ std_dir: o.std_dir, extra_files: files.items() };
-    if not sema.run(start, &so) {
+    if not sema.run(start, &so) or not cfront.boundary_check(axiom_names(o).items(), false) {
         dg.emit(o.json, o.json);
         return 1;
     }
     u.phase("parse and check");
+    if not o.build {
+        dg.emit(o.json, o.json);
+        return 0;
+    }
     return build_program(o);
+}
+
+// The C library (docs/c.md, "The C library"), linked into a hosted
+// program's executable unless --c-freestanding: every C source under
+// <std>/c/lib/ is a library's translation unit (cfront.check with lib: a
+// program's definition of a name is used instead of the library's), and
+// every Axiom module under <std>/c/rt/ (the library's run-time layer, whose
+// `export fn`s give it functions with C names) is added to the program
+// (into *modules) as a library's, whose exports are generated only when
+// referred to (codegen.ax: lazy_export). Either directory may be absent.
+// False after an error (reported).
+fn c_library(o: *Options, c: *cop.COptions, modules: *mut u.List.[[]u8]) bool {
+    if o.c_freestanding {
+        return true;
+    }
+    let mut ok = true;
+    let mut srcs = u.List.[[]u8].empty();
+    pkg.files_under(u.f1("%s/c/lib", o.std_dir), ".c", &mut srcs);
+    for k in 0..srcs.len {
+        ok = cfront.check(srcs.get(k), c, true) and ok;
+    }
+    let rt = u.f1("%s/c/rt", o.std_dir);
+    let start = modules.len;
+    pkg.files_under(rt, ".ax", modules);
+    if modules.len > start {
+        let r = u.real_path(rt);
+        cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
+    }
+    return ok;
+}
+
+// With C units, an executable that our own linkers link (no --link inputs
+// or -l libraries, whose code could refer to anything) is stripped of what
+// the units define and nothing reaches (c/cstrip.ax).
+fn set_strip(o: *Options) void {
+    cg.g_strip = u.str_eq(o.emit, "exe") and (o.link_inputs.len == 0) and (o.link_flags.len == 0);
+}
+
+// The C units of an Axiom program (o.c_inputs): checked, linked with each
+// other (cfront.link_check) and with the Axiom program (boundary_check).
+// The C library's units come after them (c_library: its run-time modules
+// are already in the program, lib_modules). False after an error
+// (reported).
+fn check_c_units(o: *Options, c: *cop.COptions, lib_modules: bool) bool {
+    let mut ok = true;
+    for k in 0..o.c_inputs.len {
+        ok = cfront.check(o.c_inputs.get(k), c, false) and ok;
+    }
+    if ok and u.str_eq(o.emit, "exe") and not o.c_freestanding {
+        let mut srcs = u.List.[[]u8].empty();
+        pkg.files_under(u.f1("%s/c/lib", o.std_dir), ".c", &mut srcs);
+        for k in 0..srcs.len {
+            ok = cfront.check(srcs.get(k), c, true) and ok;
+        }
+    }
+    _ = lib_modules;
+    set_strip(o);
+    let mut ax_main = false;
+    for i in 0..sema.g_prog.fns.len {
+        let d = sema.g_prog.fns.get(i);
+        if d.is_export and u.str_eq(d.name, "main") and (d.module == sema.g_prog.root) {
+            ax_main = true;
+        }
+    }
+    return ok and cfront.link_check(false) and cfront.boundary_check(axiom_names(o).items(), ax_main);
+}
+
+// The external names the Axiom program's own modules define (their `export
+// fn`s, outside the standard library, whose runtime names C3062 reports),
+// for cfront.boundary_check.
+fn axiom_names(o: *Options) u.List.[cfront.AxName] {
+    _ = o;
+    let mut xs = u.List.[cfront.AxName].empty();
+    for i in 0..sema.g_prog.fns.len {
+        let d = sema.g_prog.fns.get(i);
+        if d.is_export and not u.str_eq(d.name, "main") and not sema.is_std_module(d.module) {
+            xs.push(cfront.AxName.{ name: d.name, span: d.name_span });
+        }
+    }
+    return xs;
 }
 
 // Sets the output kind from --emit; false on an error (reported).

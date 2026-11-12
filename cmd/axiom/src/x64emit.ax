@@ -911,11 +911,13 @@ fn dyn_stack() bool {
 // _LARGE), xmm saves (UWOP_SAVE_XMM128_FAR, at an unscaled offset from rsp).
 // Offsets past 255 (only in prologues with large frames' probes) are
 // clamped. A function whose stack pointer moves after the prologue
-// (DYNSTACK) has rbp as its frame register (UWOP_SET_FPREG after the push of
-// rbp), from which the walk finds the frame's top and return address (the
-// callee-saved registers it reads relative to rsp before that: right only
-// while the stack pointer is where the prologue left it).
+// (DYNSTACK) has rbp as its frame register: see dyn_unwind_codes.
 fn unwind_info() bn.Bytes {
+    for k0 in 0..nuw {
+        if uw[k0].op == UW_SETFP {
+            return dyn_unwind_info();
+        }
+    }
     let mut codes = bn.new_bytes();
     let mut n: u64 = 0;
     let mut k = nuw;
@@ -971,6 +973,108 @@ fn unwind_info() bn.Bytes {
     b.put(codes.view());
     codes.free();
     return b;
+}
+
+// The UNWIND_INFO of a function whose stack pointer moves after the
+// prologue (a variable length array, alloca): the system's walk must not
+// read anything relative to rsp, which is not where the prologue left it.
+// The x64 unwinding rules: with a frame register, the frame's base is
+// FrameRegister - 16 * FrameOffset (from the header); UWOP_SAVE_NONVOL_FAR
+// and UWOP_SAVE_XMM128_FAR restore a register from base + offset,
+// UWOP_SET_FPREG sets rsp to the base, UWOP_ALLOC_* adds to rsp,
+// UWOP_PUSH_NONVOL pops; the codes are applied in the order they are listed
+// (the reverse of the prologue's), each once the code before its offset has
+// run. The prologue keeps rbp at the frame's top (push rbp; mov rbp, rsp:
+// rbp-relative slots and the frame chain of stack traces rely on it), and
+// saves the callee-saved registers below it, within 216 bytes (7 pushes, 10
+// xmm registers), so the codes describe it from a base 16 * FrameOffset
+// bytes below rbp (FrameOffset at most 15): each saved register at its
+// offset above the base, then rsp = the base, plus 16 * FrameOffset is rbp,
+// then rbp's push. All of it is relative to rbp, which the function does not
+// change: right wherever the stack pointer is, in the body and from the
+// prologue's second instruction on.
+fn dyn_unwind_info() bn.Bytes {
+    let mut setfp_off: u64 = 0;
+    let mut push_off: u64 = 0;
+    for k in 0..nuw {
+        if uw[k].op == UW_SETFP {
+            setfp_off = uw[k].off;
+        } else if (uw[k].op == UW_PUSH) and (uw[k].reg == @bit_cast(u32, xe.RBP)) {
+            push_off = uw[k].off;
+        }
+    }
+    let below = (8 * @bit_cast(u64, nsaved)) + (16 * @bit_cast(u64, nxsaved));
+    let fo = (below + 15) / 16;
+    let mut codes = bn.new_bytes();
+    let mut n: u64 = 0;
+    let mut k = nuw;
+    while k > 0 {
+        k -= 1;
+        let s = uw[k];
+        let off = @min(s.off, 255);
+        if (s.op == UW_PUSH) and (s.reg != @bit_cast(u32, xe.RBP)) {
+            // the k-th push after rbp's: at rbp - 8 * (its place + 1)
+            let mut place: u64 = 0;
+            for j in 0..k {
+                if (uw[j].op == UW_PUSH) and (uw[j].reg != @bit_cast(u32, xe.RBP)) {
+                    place += 1;
+                }
+            }
+            codes.u8_(@truncate(u8, off));
+            codes.u8_(@truncate(u8, 5 | (@as(u64, s.reg) << 4)));  // UWOP_SAVE_NONVOL_FAR
+            codes.u32_((16 * fo) - (8 * (place + 1)));
+            n += 3;
+        } else if s.op == UW_XMM {
+            // at rsp + val after the prologue, rsp = rbp - 8 * nsaved - sub:
+            // rbp - (8 * nsaved + sub - val)
+            let sub = alloc_of();
+            let depth = ((8 * @bit_cast(u64, nsaved)) + sub) - s.val;
+            codes.u8_(@truncate(u8, off));
+            codes.u8_(@truncate(u8, 9 | (@as(u64, s.reg) << 4)));  // UWOP_SAVE_XMM128_FAR
+            codes.u32_((16 * fo) - depth);
+            n += 3;
+        }
+    }
+    let sf = @min(setfp_off, 255);
+    codes.u8_(@truncate(u8, sf));
+    codes.u8_(3);  // UWOP_SET_FPREG: rsp = rbp - 16 * fo
+    n += 1;
+    let lift = 16 * fo;
+    if lift > 0 {
+        codes.u8_(@truncate(u8, sf));
+        if lift <= 128 {
+            codes.u8_(@truncate(u8, 2 | (((lift / 8) - 1) << 4)));  // UWOP_ALLOC_SMALL
+            n += 1;
+        } else {
+            codes.u8_(1);  // UWOP_ALLOC_LARGE, in 8-byte units
+            codes.u16_(lift / 8);
+            n += 2;
+        }
+    }
+    codes.u8_(@truncate(u8, @min(push_off, 255)));
+    codes.u8_(@truncate(u8, 0 | (@as(u64, @bit_cast(u32, xe.RBP)) << 4)));  // UWOP_PUSH_NONVOL rbp
+    n += 1;
+    if (n & 1) != 0 {
+        codes.u16_(0);  // an even number of slots
+    }
+    let mut b = bn.new_bytes();
+    b.u8_(1);
+    b.u8_(@truncate(u8, @min(prologue_end, 255)));
+    b.u8_(@truncate(u8, n));
+    b.u8_(@truncate(u8, 5 | (fo << 4)));  // rbp, at the offset fo
+    b.put(codes.view());
+    codes.free();
+    return b;
+}
+
+// The prologue's allocation (UW_ALLOC's bytes), or 0.
+fn alloc_of() u64 {
+    for k in 0..nuw {
+        if uw[k].op == UW_ALLOC {
+            return uw[k].val;
+        }
+    }
+    return 0;
 }
 
 // Windows: the function placed at `base` in .text with `size` bytes gets its

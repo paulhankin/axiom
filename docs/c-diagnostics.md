@@ -236,7 +236,10 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3085` | `[*]` outside the parameters of a function prototype that is not a definition. |
 | `C3062` | An external name that is the name of one of the runtime's functions (`ax_write`, ...). Reported when code is generated, so `axiom check` does not report it. |
 | `C3063` | The program has no function `main` (reported for an executable, not by `axiom check`). |
-| `C3064` | An external name defined in two translation units; a note points to the other definition. |
+| `C3064` | An external name defined in two translation units; a note points to the other definition. A library's unit gives way to the program's, and a weak definition to one that is not weak, without this error. |
+| `C3065` | An external name defined by a C translation unit and by an Axiom `export fn` of the same program; a note points to the Axiom definition. |
+| `C3066` | A C translation unit defines `main` in a program whose root module is Axiom's (`axiom build main.ax x.c`), which has the program's `main`. |
+| `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
 | `C3901` | A feature that this implementation does not support: `_Atomic` (qualifier or specifier), `_Imaginary` (the imaginary types), and (C23) the decimal floating types. |
 
 ## C4xxx: warnings

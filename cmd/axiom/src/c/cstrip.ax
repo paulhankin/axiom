@@ -1,0 +1,216 @@
+// =============================================================================
+// cstrip.ax - leaves out of an executable what C translation units define
+// and nothing reaches: functions, objects and string literals that no
+// Axiom code, and no C code that is kept, refers to (docs/c.md, "What is
+// linked"). The C units of a program (a C library's among them) are
+// generated whole into the module (cgen.ax); this runs before the optimizer,
+// so what is left out costs nothing after it.
+//
+// (A call's call-site records, ir.Chain, are reached with it.)
+//
+// An Axiom library module's export (the hosted C library's run-time layer)
+// is generated when this reaches a declaration of its name (codegen.ax:
+// define_lazy), as an archive's member is linked when a reference to it is,
+// and what it refers to is reached in turn.
+//
+// The roots are everything that is not C's: the Axiom program's functions
+// and globals (generated because they are reachable, or exported), and the
+// functions code generation may call by name (memcpy, memmove, memset,
+// memcmp). From them, every function and global that an instruction's
+// operand or a global's initial value names is reached. A C declaration
+// that nothing reaches goes too, so that a function the program does not
+// call is not imported (WebAssembly) or looked for in a library.
+//
+// Only executables our own linkers link are stripped: an object, or a
+// program linked with other code (--link, -l), keeps every definition, which
+// that code may refer to.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+
+// Functions code generation may call by name (a structure copy, ...): kept
+// when C defines them.
+let BY_NAME: [4][]u8 = ["memcpy", "memmove", "memset", "memcmp"];
+
+// The state of one strip: the marks, by function and global id.
+struct Strip {
+    m: *mut ir.Module,
+    fmark: u.List.[bool],
+    gmark: u.List.[bool],
+    work: u.List.[*mut ir.Value],   // functions and globals reached, to scan
+    define: fn(*mut ir.Func) bool,  // generates a library's definition of a declaration reached
+}
+
+/// Strips module m of the C units' functions m.funcs[f0..f1) and globals
+/// m.globals[g0..g1) (those gen_ir added) that nothing reaches. A
+/// declaration reached is given to `define`, which may generate its
+/// definition (an Axiom library module's export: codegen.ax, define_lazy);
+/// what that adds to the module is reached.
+pub fn strip(m: *mut ir.Module, f0: usize, f1: usize, g0: usize, g1: usize, define: fn(*mut ir.Func) bool) void {
+    let mut S = Strip.{ m: m, fmark: u.List.[bool].empty(), gmark: u.List.[bool].empty(),
+                        work: u.List.[*mut ir.Value].empty(), define: define };
+    grow(&mut S);
+    for i in 0..m.funcs.len {
+        let f = m.funcs.get(i);
+        if (i < f0) or (i >= f1) or by_name(f.name) {
+            reach(&mut S, f.val);
+        }
+    }
+    for i in 0..m.globals.len {
+        if (i < g0) or (i >= g1) {
+            reach(&mut S, m.globals.get(i).val);
+        }
+    }
+    while S.work.len > 0 {
+        let v = S.work.pop();
+        if v.kind == ir.V_FUNC {
+            let f = ir.fnp_of(v);
+            if ir.is_decl(f) {
+                let nf = m.funcs.len;
+                let ng = m.globals.len;
+                if S.define(f) {
+                    // (new code: the Axiom program's, reached)
+                    grow(&mut S);
+                    for i in nf..m.funcs.len {
+                        reach(&mut S, m.funcs.get(i).val);
+                    }
+                    for i in ng..m.globals.len {
+                        reach(&mut S, m.globals.get(i).val);
+                    }
+                }
+            }
+            scan_func(&mut S, f);
+        } else {
+            let g = ir.gv_of(v);
+            if u.notnil(g.init) {
+                operand(&mut S, g.init);
+            }
+        }
+    }
+    let nf = m.funcs.len;
+    let ng = m.globals.len;
+    // A C library import (plink.ax reads axiom.import.<name>) is kept with
+    // its function or object.
+    for i in g0..g1 {
+        let g = m.globals.get(i);
+        if u.starts(g.name, "axiom.import.") {
+            let f = ir.get_function(m, g.name[13..]);
+            let x = ir.get_global(m, g.name[13..]);  // (a DLL's object: cgen.dll_object)
+            if (u.notnil(f) and S.fmark.get(@int_cast(usize, f.id))) or
+               (u.notnil(x) and S.gmark.get(@int_cast(usize, x.id))) {
+                S.gmark.set(i, true);
+            }
+        }
+    }
+    let mut fs = u.List.[*mut ir.Func].empty();
+    let mut fmap = u.SymMap.[*mut ir.Func].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Func](), cap: 0, len: 0 };
+    for i in 0..nf {
+        let f = m.funcs.get(i);
+        if not S.fmark.get(i) {
+            if not ir.is_decl(f) {
+                ir.drop_body(f);
+            }
+            continue;
+        }
+        f.id = @int_cast(i32, fs.len);
+        fs.push(f);
+        if not fmap.has(f.name) {
+            fmap.put(f.name, f);
+        }
+    }
+    let mut gs = u.List.[*mut ir.Global].empty();
+    let mut gmap = u.SymMap.[*mut ir.Global].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Global](), cap: 0, len: 0 };
+    for i in 0..ng {
+        let g = m.globals.get(i);
+        if not S.gmark.get(i) {
+            continue;
+        }
+        g.id = @int_cast(i32, gs.len);
+        gs.push(g);
+        if not gmap.has(g.name) {
+            gmap.put(g.name, g);
+        }
+    }
+    m.funcs = fs;
+    m.fmap = fmap;
+    m.globals = gs;
+    m.gmap = gmap;
+}
+
+// Numbers the module's functions and globals not yet marked (their ids are
+// their places) and gives them marks.
+fn grow(S: *mut Strip) void {
+    let m = S.m;
+    for i in S.fmark.len..m.funcs.len {
+        m.funcs.get(i).id = @int_cast(i32, i);
+        S.fmark.push(false);
+    }
+    for i in S.gmark.len..m.globals.len {
+        m.globals.get(i).id = @int_cast(i32, i);
+        S.gmark.push(false);
+    }
+}
+
+fn by_name(name: []u8) bool {
+    for x in BY_NAME {
+        if u.str_eq(x, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Marks the function or global v is the address of (once), to be scanned.
+fn reach(S: *mut Strip, v: *mut ir.Value) void {
+    if v.kind == ir.V_FUNC {
+        let i = @int_cast(usize, ir.fnp_of(v).id);
+        if not S.fmark.get(i) {
+            S.fmark.set(i, true);
+            S.work.push(ir.fnp_of(v).val);
+        }
+    } else {
+        let i = @int_cast(usize, ir.gv_of(v).id);
+        if not S.gmark.get(i) {
+            S.gmark.set(i, true);
+            S.work.push(ir.gv_of(v).val);
+        }
+    }
+}
+
+// What operand v (of an instruction, or a constant's element) names.
+fn operand(S: *mut Strip, v: *mut ir.Value) void {
+    if u.isnil(v) {
+        return;
+    }
+    if (v.kind == ir.V_FUNC) or (v.kind == ir.V_GLOBAL) {
+        reach(S, v);
+    } else if v.kind == ir.V_CAGG {
+        for k in 0..v.xs.len {
+            operand(S, v.xs.get(k));
+        }
+    }
+}
+
+// What f's instructions name.
+fn scan_func(S: *mut Strip, f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut x = b.first;
+        while u.notnil(x) {
+            operand(S, x.a);
+            operand(S, x.b);
+            operand(S, x.c);
+            for k in 0..x.xs.len {
+                operand(S, x.xs.get(k));
+            }
+            // a call's call-site records (stack traces)
+            let mut ch = ir.chain_of(x);
+            while u.notnil(ch) {
+                operand(S, ch.site);
+                ch = ch.next;
+            }
+            x = x.next;
+        }
+        b = b.next;
+    }
+}
