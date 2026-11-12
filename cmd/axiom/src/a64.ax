@@ -22,6 +22,7 @@ import "isel.ax" as is;
 import "lower.ax" as lower;
 import "mach.ax" as mc;
 import "opt.ax" as opt;
+import "switches.ax" as swl;
 import "target.ax" as tg;
 import "util.ax" as u;
 
@@ -61,6 +62,10 @@ const PRFM: i32 = 19;   // mem; cc: the operation (0 pldl1keep, 0x10 pstl1keep)
 // The stack pointer moved (ir.IN_STACK_ALLOC ...), sp an operand: cc 0: r(UD) bytes allocated (probing each
 // page), r(D) <- their address above the outgoing arguments; 1: r(D) <- sp; 2: sp <- r(U)
 const DYNSTACK: i32 = 20;
+// An indirect jump through a jump table (gen_jump_table): ops r(U) the index, two scratch r(D, E),
+// then the targets' labels; sz 4: a 32-bit index (zero-extended by the load), 8: 64-bit; aux: the
+// table's symbol (enc_jtab)
+const JTAB: i32 = 64;
 
 const LOCAL_BASE: i32 = 1_000_000;
 
@@ -2996,12 +3001,19 @@ fn gen_term(b: *mut ir.Block) void {
         }
         return;
     }
+    if (o == ir.OP_SWITCH) and (t.cv == ir.SW_TABLE) {
+        gen_jump_table(b, t);
+        return;
+    }
     if o == ir.OP_SWITCH {
         let x = t.a;
         let r = reg_ext(x, true);
         let sf = sfv(x.ty);
-        let tr = vgpr();
-        copy(tr, r, GPR);
+        let mut tr = r;
+        if ir.is_op(x, ir.OP_PHI) {
+            tr = vgpr();
+            copy(tr, r, GPR);  // (the phi copies may overwrite a phi's register)
+        }
         is.phi_copies(MF, b, reg, vreg, class_of, copy);
         for k in 0..t.xs.len {
             let c = t.xs.get(k);
@@ -3048,6 +3060,47 @@ fn gen_term(b: *mut ir.Block) void {
     }
     raw_none(ae.UDF);
 }
+// A switch lowering made a jump table (switches.ax: its value is less than
+// its number of cases, 0, 1, ...): one instruction, JTAB, `adrp t, table;
+// add t, t, :lo12:table; ldrsw u, [t, index, uxtw|lsl #2]; add t, t, u; br
+// t`. The table, in .rodata, holds each target's offset from the table's
+// start (filled in once the code is laid out: enc_jtab), position-
+// independent and never in the code. (No branch-target landing pads: the
+// code has none.)
+fn gen_jump_table(b: *mut ir.Block, t: *mut ir.Value) void {
+    let x = t.a;
+    let mut r = reg(x);
+    let mut sz: u8 = 8;
+    if x.ty.bits < 64 {
+        sz = 4;
+        if x.ty.bits < 32 {
+            r = reg_ext(x, false);
+        }
+    }
+    let mut ix = r;
+    if ir.is_op(x, ir.OP_PHI) {
+        ix = vgpr();
+        copy(ix, r, GPR);  // (the phi copies may overwrite a phi's register)
+    }
+    is.phi_copies(MF, b, reg, vreg, class_of, copy);
+    let n = t.xs.len;
+    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    s.data.align(4);
+    let off = @as(u64, s.data.len());
+    s.data.zeros(4 * n);
+    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LJT", sec: RODATA, value: off, size: @as(u64, 4 * n),
+                                         bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false });
+    let ops = u.newn.[mc.MOp](n + 3);
+    ops[0] = R(ix);
+    ops[1] = mc.reg(vgpr(), mc.RD | mc.RE);
+    ops[2] = mc.reg(vgpr(), mc.RD | mc.RE);
+    for k in 0..n {
+        ops[k + 3] = mc.label(is.blk(ir.bs_of(t).get(k)));
+    }
+    let i = emit(JTAB, sz, ops[0..(n + 3)]);
+    i.aux = @as(i64, @bit_cast(i32, sym));
+}
+
 // Is argument k of i a memory operand? (A prefetch's address is.)
 fn prefetch_arg(i: *ir.Value, _k: usize) bool {
     return (i.op == ir.OP_INTR) and ir.is_prefetch(@truncate(i32, @bit_cast(i64, i.cv)));
@@ -3289,6 +3342,7 @@ fn compile_func(f: *mut ir.Func) void {
     nlocal = 0;
     out_area = 0;
     dyn_frame = false;
+    swl.lower(f);  // (jump tables, bit tests, a search: switches.ax)
     opt.split_critical_edges(f);
     lower.scalarize(f, legal);
     opt.compute_preds(f);
@@ -3349,10 +3403,7 @@ fn compile_func(f: *mut ir.Func) void {
             i = i.next;
         }
         gen_term(ib);
-        let t = ir.terminator(ib);
-        for k in 0..ir.succ_count(t) {
-            CB.succs.push(is.blk(ir.succ(t, k)));
-        }
+        is.push_succs(CB, ir.terminator(ib));
     }
     order.deinit();
     if errors {
@@ -3804,11 +3855,70 @@ fn enc_dynstack(i: *mut mc.MInst) void {
     add_disp(d, SP, @bit_cast(i64, (out_area + 15) & ~@as(u64, 15)));
 }
 
+// Jump tables: the jumps through one encoded so far, whose tables are
+// filled in once the function's place is known (fill_jump_tables), and a
+// local symbol at the start of .text for their entries (once per object).
+let mut jtabs: u.List.[*mut mc.MInst] = u.List.[*mut mc.MInst].{ data: @ptr_from_int(*mut *mut mc.MInst, 0), len: 0,
+                                                                 cap: 0 };
+let mut JT_OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
+let mut JT_TEXT: u32 = 0;
+
+fn enc_jtab(i: *mut mc.MInst) void {
+    let ix = ae.r5(P(i.ops[0].reg));
+    let t = P(i.ops[1].reg);
+    let tr = ae.r5(t);
+    let v = ae.r5(P(i.ops[2].reg));
+    let sym = @truncate(i32, i.aux);
+    reloc(elf.R_AARCH64_ADR_PREL_PG_HI21, sym, 0);
+    w32(ae.adrp(t));
+    reloc(elf.R_AARCH64_ADD_ABS_LO12_NC, sym, 0);
+    w32(ae.addsub_imm(1, false, false, t, t, 0, false));
+    let mut option: u64 = 2;  // uxtw
+    if i.sz == 8 {
+        option = 3;  // lsl
+    }
+    w32(0xb8a0_1800 | (ix << 16) | (option << 13) | (tr << 5) | v);  // ldrsw v, [t, ix, <option> #2]
+    w32(0x8b00_0000 | (v << 16) | (tr << 5) | tr);                   // add t, t, v
+    w32(0xd61f_0000 | (tr << 5));                                    // br t
+    jtabs.push(i);
+}
+
+// The entries of the tables of the function's jumps through one (encoded
+// at base in .text, its blocks at boff): each the 32-bit offset of its
+// target from the table's start, a PC-relative relocation against .text
+// with the entry's own offset added back (S + A - P, P the entry's address).
+fn fill_jump_tables(base: u64, boff: []u64) void {
+    if jtabs.len == 0 {
+        return;
+    }
+    if JT_OBJ != OBJ {
+        JT_OBJ = OBJ;
+        JT_TEXT = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: TEXT, value: 0, size: 0, bind: elf.B_LOCAL,
+                                             ty: elf.T_NOTYPE, hidden: false });
+    }
+    for j in jtabs.items() {
+        let ts = OBJ.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
+        let sec = OBJ.secs.get(@int_cast(usize, ts.sec));
+        for k in 3..j.ops.len {
+            let eo = 4 * @as(u64, k - 3);
+            let target = base + boff[@int_cast(usize, j.ops[k].label)];
+            sec.relocs.push(
+                elf.Rel.{
+                    off: ts.value + eo, ty: elf.R_AARCH64_PREL32, sym: JT_TEXT, addend: @bit_cast(i64, target + eo) });
+        }
+    }
+    jtabs.clear();
+}
+
 fn enc_inst(i: *mut mc.MInst) void {
     let op = i.op;
     let sz = i.sz;
     if op == DYNSTACK {
         enc_dynstack(i);
+        return;
+    }
+    if op == JTAB {
+        enc_jtab(i);
         return;
     }
     if op == RAW {
@@ -4042,6 +4152,7 @@ fn encode_func(f: *mut ir.Func) void {
     code = bn.new_bytes();
     rls.clear();
     fxs.clear();
+    jtabs.clear();
     local_off.clear();
     frameless = not needs_frame();
     prologue();
@@ -4090,6 +4201,7 @@ fn encode_func(f: *mut ir.Func) void {
     text.data.align(16);
     let base = @as(u64, text.data.len());
     text.data.put(code.view());
+    fill_jump_tables(base, boff);
     for k in 0..rls.len {
         let r = rls.get(k);
         text.relocs.push(elf.Rel.{ off: base + r.off, ty: r.ty, sym: @bit_cast(u32, r.sym), addend: r.addend });
@@ -4109,6 +4221,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     errors = false;
     LSE_ = tg.has(tg.A_LSE);
     OBJ = elf.new_obj(elf.EM_AARCH64);
+    JT_OBJ = u.nil.[elf.Obj]();
     tls_key_si = -1;
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     libsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };

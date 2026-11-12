@@ -2700,18 +2700,62 @@ fn edge_facts(b: *mut ir.Block) void {
     if (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) {
         assume(t.a, t.t1 == b, 0);
     } else if (t.op == ir.OP_SWITCH) and (t.t1 != b) and not ir.is_const(t.a) {
+        let c = switch_case_to(t, b);
+        if u.notnil(c) {
+            add_known(t.a, c);
+        }
+    }
+}
+
+// The case of switch t that is its only edge to block b, or nil. For a
+// large switch, from a table by block id made once per switch (its cases
+// do not change during the walk): one scan for all its successors rather
+// than one each.
+let mut sw_of: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+let mut sw_case: u.List.[*mut ir.Value] = u.List.[*mut ir.Value].{ data: @ptr_from_int(*mut *mut ir.Value, 0), len: 0,
+                                                                   cap: 0 };
+let mut sw_many: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
+
+fn switch_case_to(t: *mut ir.Value, b: *mut ir.Block) *mut ir.Value {
+    let bs = ir.bs_of(t);
+    let nid = @int_cast(usize, g_fn.nblocks);
+    if (bs.len <= 16) or (@int_cast(usize, b.id) >= nid) {
         let mut n: i32 = 0;
         let mut c = vnil();
-        for k in 0..ir.bs_of(t).len {
-            if ir.bs_of(t).get(k) == b {
+        for k in 0..bs.len {
+            if bs.get(k) == b {
                 n += 1;
                 c = t.xs.get(k);
             }
         }
         if n == 1 {
-            add_known(t.a, c);
+            return c;
         }
+        return vnil();
     }
+    if (sw_of != t) or (sw_case.len != nid) {
+        sw_case.clear();
+        sw_many.clear();
+        for _k in 0..nid {
+            sw_case.push(vnil());
+            sw_many.push(false);
+        }
+        for k in 0..bs.len {
+            let id = @int_cast(usize, bs.get(k).id);
+            if id < nid {
+                if u.notnil(sw_case.get(id)) {
+                    sw_many.set(id, true);
+                }
+                sw_case.set(id, t.xs.get(k));
+            }
+        }
+        sw_of = t;
+    }
+    let id = @int_cast(usize, b.id);
+    if sw_many.get(id) {
+        return vnil();
+    }
+    return sw_case.get(id);
 }
 
 // Writes on paths from b's immediate dominator to b that avoid it.
@@ -2937,6 +2981,7 @@ pub fn gvn(f: *mut ir.Func) bool {
         B = ir.new_builder();
     }
     g_fn = f;
+    sw_of = vnil();  // (switch_case_to's table: made again in each walk)
     changed = false;
     opt.compute_preds(f);
     let order = opt.dominators(f);

@@ -22,6 +22,7 @@ import "combine.ax" as cb;
 import "ir.ax" as ir;
 import "isel.ax" as is;
 import "opt.ax" as opt;
+import "switches.ax" as swl;
 import "target.ax" as tg;
 import "util.ax" as u;
 import "wobj.ax" as wo;
@@ -3039,7 +3040,50 @@ fn emit_block(x: *mut ir.Block) *mut ir.Block {
     return u.nil.[ir.Block]();
 }
 
+// A jump table (switches.ax, ir.SW_TABLE: the cases 0..n-1, the value less
+// than n): one br_table, with a nested block per distinct target (depth k:
+// the k-th, in the order the cases first name them).
+fn emit_table(x: *mut ir.Block, t: *mut ir.Value) void {
+    let n = t.xs.len;
+    let bs = ir.bs_of(t);
+    let at = u.calloc_slice.[u32](@int_cast(usize, F.nblocks) + 1);  // by block id: 1 + its depth
+    let mut ts = u.List.[*mut ir.Block].empty();
+    for k in 0..n {
+        let s = bs.get(k);
+        if at[@int_cast(usize, s.id)] == 0 {
+            ts.push(s);
+            at[@int_cast(usize, s.id)] = @int_cast(u32, ts.len);
+        }
+    }
+    for _k in 0..ts.len {
+        op(0x02);
+        op(0x40);
+        ctx.push(Ctx.{ kind: CTX_OTHER, target: u.nil.[ir.Block]() });
+    }
+    push_ext(t.a, false);
+    if is64(t.a.ty) {
+        op(0xa7);  // (less than n: the low half)
+    }
+    op(0x0e);
+    C.uleb(@as(u64, n));
+    for k in 0..n {
+        C.uleb(@as(u64, at[@int_cast(usize, bs.get(k).id)] - 1));
+    }
+    C.uleb(0);
+    for k in 0..ts.len {
+        _ = ctx.pop();
+        op(0x0b);
+        do_branch(x, ts.get(k));
+    }
+    ts.deinit();
+    u.free_slice(at);
+}
+
 fn emit_switch(x: *mut ir.Block, t: *mut ir.Value) void {
+    if t.cv == ir.SW_TABLE {
+        emit_table(x, t);
+        return;
+    }
     let n = t.xs.len;
     // dense range of case values?
     let mut lo: i64 = 0;
@@ -3279,6 +3323,7 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     LT = u.List.[u8].empty();
     ctx.clear();
     nparams = @int_cast(u32, f.params.len);
+    swl.lower(f);  // (br_tables, bit tests, a search: switches.ax)
     opt.compute_preds(f);
     let order = opt.dominators(f);
     let nb = order.len;
