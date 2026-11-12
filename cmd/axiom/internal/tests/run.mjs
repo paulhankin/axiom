@@ -529,8 +529,13 @@ function cDriverCases() {
       }
       const d = await ax(['build', 'std.c', '--emit=c-pp']);
       if (d.stdout.trim() !== 'long v = 201710L;') return `the default is not c17: ${d.stdout}`;
-      for (const bad of ['--c-std=gnu99', '--c-char=yes', '--c-int=8', '--c-long=16']) {
+      for (const bad of ['--c-std=gnu99', '--c-char=yes', '--c-int=8', '--c-long=16', '--c-long-double=96']) {
         const p = await fatal(['build', 'std.c', bad], /E9001/);
+        if (p) return p;
+      }
+      // (long double's formats where the target's ABIs have them: the x87's on x86-64 Linux only)
+      for (const [t, bad] of [['wasm32', '80'], ['aarch64', '80'], ['x86_64-windows', '128'], ['aarch64-macos', '80']]) {
+        const p = await fatal(['build', 'std.c', `--target=${t}`, `--c-long-double=${bad}`], /--c-long-double=\d+ is not supported for --target=/);
         if (p) return p;
       }
       return fatal(['build', 'std.c', '--c-int=64', '--c-long=32'], /--c-long must be at least --c-int/);

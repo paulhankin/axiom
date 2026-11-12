@@ -31,6 +31,7 @@
 // C sources (c_option, c_options, build_c):
 //   --c-std=c89|c90|c95|c99|c11|c17|c18|c23   (default c17)
 //   --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64   (default: the target's C ABI)
+//   --c-long-double=64|80|128  long double's format (default: the target's C ABI)
 //   -DNAME[=value]  -UNAME  -I<dir> (also -D NAME, -U NAME, -I <dir>)
 //   --emit=c-pp|c-tokens|c-ast   preprocessed text, tokens, syntax tree
 // =============================================================================
@@ -90,6 +91,7 @@ fn usage() void {
     u.eprint("  C sources:\n");
     u.eprint("  --c-std=c89|c90|c95|c99|c11|c17|c18|c23   the standard (default c17)\n");
     u.eprint("  --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64   (default: the target's C ABI)\n");
+    u.eprint("  --c-long-double=64|80|128   long double's format (default: the target's C ABI)\n");
     u.eprint("  -DNAME[=value]  -UNAME  -I<dir>   macros and include directories, in order\n");
     u.eprint("  --emit=c-pp|c-tokens|c-ast   the preprocessed text, the tokens or the syntax tree\n");
     u.eprint("  --emit=obj|ir without a main: the units' code alone, to link into another program\n");
@@ -340,7 +342,7 @@ fn c_option(o: *mut Options, a: []u8) bool {
         return true;
     }
     if u.starts(a, "--c-std=") or u.starts(a, "--c-char=") or u.starts(a, "--c-int=") or u.starts(a, "--c-long=") or
-       ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
+       u.starts(a, "--c-long-double=") or ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
         o.c_args.push(a);
         return true;
     }
@@ -366,6 +368,16 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     }
     c.wchar_bits = 32;
     c.wchar_signed = not a64_linux;
+    // (long double: the x87's 80-bit format on x86-64 Linux (System V),
+    // binary128 on AArch64 Linux (AAPCS64) and WebAssembly; double on
+    // Windows and macOS)
+    let x64_linux = (tg.g_arch == tg.ARCH_X64) and (tg.g_os == tg.OS_LINUX) and not ty.g_target.is_wasm;
+    c.ld_bits = 64;
+    if x64_linux {
+        c.ld_bits = 80;
+    } else if a64_linux or ty.g_target.is_wasm {
+        c.ld_bits = 128;
+    }
     if win {
         c.wchar_bits = 16;
         c.wchar_signed = false;
@@ -402,6 +414,18 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         } else if u.starts(a, "--c-long=") {
             c.long_bits = @truncate(i32, u.atol(a[9..]));
             ok = (c.long_bits == 32) or (c.long_bits == 64);
+        } else if u.starts(a, "--c-long-double=") {
+            // 80 only where the ABI has the x87 (x86-64 System V); 128 where
+            // an ABI says how binary128 travels (as __float128 on x86-64
+            // System V; a quad-precision register on AArch64)
+            c.ld_bits = @truncate(i32, u.atol(a[16..]));
+            ok = (c.ld_bits == 64) or ((c.ld_bits == 80) and x64_linux) or
+                 ((c.ld_bits == 128) and (x64_linux or a64_linux or ty.g_target.is_wasm));
+            if not ok and ((c.ld_bits == 80) or (c.ld_bits == 128)) {
+                dg.emit_fatal(o.json, "E9001", u.f2("--c-long-double=%s is not supported for --target=%s", a[16..],
+                                                    o.target));
+                return false;
+            }
         } else if a[1] == 'U' {
             defs.push(cop.Define.{ name: a[2..], body: "", undef: true });
         } else {
@@ -884,6 +908,11 @@ fn compile(args: [][]u8) i32 {
             cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
         }
     }
+    if (o.c_inputs.len > 0) and not has_ldouble(&pkg_files) {
+        // (the C units' long double arithmetic, where it is wider than
+        // double: cgen_ld.ax; the C options are read after the program is)
+        pkg_files.push(u.f1("%s/c/rt/ldouble.ax", o.std_dir));
+    }
     let so = sema.SemaOptions.{ std_dir: o.std_dir, extra_files: pkg_files.items() };
     let mut ok = sema.run(o.input, &so);
     u.phase("parse and check");
@@ -959,6 +988,12 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
         files.push(lib_modules.get(k));
     }
     set_strip(o);
+    if (c.ld_bits != 64) and not has_ldouble(&lib_modules) {
+        // long double's arithmetic in software (cgen_ld.ax calls it; only
+        // the functions called are generated, objects included): with the
+        // C library's run-time layer, else on its own
+        files.push(u.f1("%s/c/rt/ldouble.ax", o.std_dir));
+    }
     let so = sema.SemaOptions.{ std_dir: o.std_dir, extra_files: files.items() };
     if not sema.run(start, &so) or not cfront.boundary_check(axiom_names(o).items(), false) {
         dg.emit(o.json, o.json);
@@ -970,6 +1005,17 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
         return 0;
     }
     return build_program(o);
+}
+
+// Is std/c/rt/ldouble.ax among the modules ps (the C library's run-time
+// layer)?
+fn has_ldouble(ps: *u.List.[[]u8]) bool {
+    for k in 0..ps.len {
+        if u.ends(ps.get(k), "/c/rt/ldouble.ax") {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The C library (docs/c.md, "The C library"), linked into a hosted

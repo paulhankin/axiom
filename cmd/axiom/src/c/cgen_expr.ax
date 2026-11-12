@@ -2,7 +2,8 @@
 // cgen_expr.ax - IR generation for C expressions (the typed tree: csema.ax).
 //
 // rv(e) is e's value: a scalar's IR value, a structure's, union's or
-// complex value's address (memory holding the value: cgen_complex.ax),
+// complex value's address (memory holding the value: cgen_complex.ax), and
+// so a wide long double's (cgen_ld.ax),
 // nothing for void; lv(e) is the address of
 // lvalue e (and of a structure member reached from a structure value). The
 // implicit conversions are CAST nodes, so each node does one thing.
@@ -11,13 +12,16 @@ import "../divconst.ax" as divc;
 import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "cconst.ax" as cc;
 import "cgen.ax" as cg;
 import "cgen_bitint.ax" as cgbi;
 import "cgen_bits.ax" as cgb;
 import "cgen_complex.ax" as gcx;
 import "cgen_debug.ax" as cdbg;
+import "cgen_ld.ax" as gld;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
+import "cldbl.ax" as cl;
 import "csema_attr.ax" as catr;
 import "csema_builtin.ax" as csb;
 import "ctok.ax" as ct;
@@ -81,8 +85,14 @@ pub fn zero(p: *mut ir.Value, n: u64) void {
 
 /// The constant value of e (is_const, of arithmetic type).
 pub fn const_value(e: *cast.Expr) *mut ir.Value {
+    if cty.is_complex(e.ty) and cty.is_wide(e.ty.unq.elem) {
+        return gcx.constant_wide(e.ty, e.xv, e.xvim);
+    }
     if cty.is_complex(e.ty) {
         return gcx.constant(e.ty, e.fcval, e.fcimag);
+    }
+    if cty.is_wide(e.ty) {
+        return gld.constant(e.xv);
     }
     let t = lty(e.ty);
     if cty.is_floating(e.ty) {
@@ -99,6 +109,9 @@ fn i1_to(t: *mut cty.CType, c: *mut ir.Value) *mut ir.Value {
 pub fn truth(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     if cty.is_complex(t) {
         return gcx.truth(gcx.parts(t, v));
+    }
+    if cty.is_wide(t) {
+        return gld.truth(v);
     }
     if cty.is_floating(t) {
         return ir.fcmp(cg.B, ir.RealUNE, v, ir.cfp(v.ty, 0.0));
@@ -163,6 +176,9 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
     if cty.is_complex(t) or cty.is_complex(f) {
         return complex_convert(v, f, t);
     }
+    if cty.is_wide(f) or cty.is_wide(t) {
+        return gld.convert(v, f, t);
+    }
     let tt = lty(t);
     if t.kind == cty.TK_BOOL {
         if cty.is_integer(f) and is_01(v) {
@@ -221,6 +237,9 @@ fn complex_convert(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut 
         if cty.is_complex(f) {
             let p = gcx.parts(f, v);
             return gcx.make(t, gcx.Pair.{ re: convert(p.re, f.elem, el), im: convert(p.im, f.elem, el) });
+        }
+        if cty.is_wide(el) {
+            return gcx.make(t, gcx.Pair.{ re: convert(v, f, el), im: gld.constant(cl.zero()) });
         }
         return gcx.make(t, gcx.Pair.{ re: convert(v, f, el), im: ir.cfp(lty(el), 0.0) });
     }
@@ -326,11 +345,15 @@ fn compound_literal(e: *mut cast.Expr) *mut ir.Value {
     return p;
 }
 
-// The value of lvalue e at p (a bit-field's too).
+// The value of lvalue e at p (a bit-field's too; a wide long double's
+// copied, as the object may change before the value is used).
 fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
     let m = cgb.of(e);
     if u.notnil(m) {
         return cgb.load(m, e.ty, p);
+    }
+    if cty.is_wide(e.ty) {
+        return gld.snapshot(p, is_volatile(e.ty));
     }
     return load(e.ty, p);
 }
@@ -340,6 +363,10 @@ fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.V
     let m = cgb.of(e);
     if u.notnil(m) {
         return cgb.store(m, e.ty, v, p);
+    }
+    if cty.is_wide(t) {
+        gld.copy(p, v, is_volatile(e.ty));
+        return v;
     }
     store(t, v, p);
     return v;
@@ -414,7 +441,7 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
     if (k == cast.ExprKind.MEMBER) or (k == cast.ExprKind.INDEX) or (k == cast.ExprKind.IDENT) {
         // (the member of a structure value; lvalues are converted by CV_LOAD)
         let p = lv(e);
-        if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) {
+        if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) or cty.is_wide(e.ty) {
             return p;
         }
         return load_lv(e, p);
@@ -488,6 +515,9 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
         return v;
     }
     if op == ct.P_MINUS {
+        if cty.is_wide(e.ty) {
+            return gld.negate(v);
+        }
         if cty.is_floating(e.ty) {
             return ir.fneg(cg.B, v);
         }
@@ -501,6 +531,9 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
 
 // x op y in arithmetic type t (both of type t; a shift's y converted to x's width).
 fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    if cty.is_wide(t) {
+        return gld.arith(op, x, y);
+    }
     if cty.is_floating(t) {
         let mut fo = ir.OP_FADD;
         if op == ct.P_MINUS {
@@ -604,6 +637,9 @@ fn compare(e: *mut cast.Expr) *mut ir.Value {
     }
     let mut x = rv(e.a);
     let mut y = rv(e.b);
+    if cty.is_wide(t) {
+        return i1_to(e.ty, gld.compare(op, x, y));
+    }
     if cty.is_floating(t) {
         let mut p = ir.RealOEQ;
         if op == ct.P_NE {
@@ -643,12 +679,7 @@ fn compare(e: *mut cast.Expr) *mut ir.Value {
 /// Branches to t if scalar expression e is nonzero, else to f.
 pub fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
     if e.is_const and cty.is_arith(e.ty) {
-        let mut c = e.cval != 0;
-        if cty.is_floating(e.ty) {
-            c = e.fcval != 0.0;
-        } else if cty.is_complex(e.ty) {
-            c = (e.fcval != 0.0) or (e.fcimag != 0.0);
-        }
+        let c = cc.truth(e);
         if c {
             cg.br(t);
         } else {
@@ -749,6 +780,10 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
     if e.op == ct.P_ASSIGN {
         let v = rv(e.b);
         let p = lv(e.a);
+        if cty.is_wide(lt) {
+            gld.copy(p, v, is_volatile(lt));
+            return p;
+        }
         if cty.is_record(lt) {
             copy(lt, p, v);
             return p;
@@ -796,7 +831,9 @@ fn incdec(e: *mut cast.Expr) *mut ir.Value {
     } else {
         let x = convert(old, t, ot);
         let mut one = ir.vnil();
-        if cty.is_floating(ot) {
+        if cty.is_wide(ot) {
+            one = gld.one_value();
+        } else if cty.is_floating(ot) {
             one = ir.cfp(lty(ot), 1.0);
         } else {
             one = ir.cint(lty(ot), 1);
@@ -847,7 +884,7 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
         return gcx.make(e.ty, gcx.Pair.{ re: pr, im: pi });
     }
     let mut pt = cg.T_ptr;
-    if cty.is_scalar(e.ty) {
+    if cty.is_scalar(e.ty) and not cty.is_wide(e.ty) {
         pt = lty(e.ty);
     }
     let ph = ir.phi(cg.B, pt);

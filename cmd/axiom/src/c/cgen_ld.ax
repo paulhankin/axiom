@@ -1,0 +1,300 @@
+// =============================================================================
+// cgen_ld.ax - IR generation for long double where it is wider than double
+// (cty.is_wide: --c-long-double=80, the x87's format, or 128, binary128):
+// its arithmetic, comparisons and conversions as calls of
+// std/c/rt/ldouble.ax's functions, which codegen.ax generates into the
+// module (cg.ld_fn), so that only those a program uses are in it.
+//
+// A value is 16 bytes of memory, as a structure's is (cgen.ax): rv gives its
+// address, an object's own or a temporary's, never written through; each
+// operation writes its result into a new temporary, which scalar
+// replacement takes apart again where it can. The x87 format's six bytes of
+// padding are zero in every result (constants included).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cconst.ax" as cc;
+import "cgen.ax" as cg;
+import "cldbl.ax" as cl;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+import "std/c/rt/ldouble" as ld;
+
+fn fmt() u32 {
+    return cc.ld_fmt();
+}
+
+fn i32t() *mut ir.Ty {
+    return ir.t_int(32);
+}
+
+fn i64t() *mut ir.Ty {
+    return ir.t_int(64);
+}
+
+fn fmt_arg() *mut ir.Value {
+    return ir.cint(i32t(), @as(u64, fmt()));
+}
+
+/// A new temporary for a long double value.
+pub fn temp() *mut ir.Value {
+    return cg.alloca(cty.t_ldouble, "ld");
+}
+
+// A call of ldouble.ax's function `name` with arguments xs.
+fn call(name: []u8, xs: []mut *mut ir.Value) *mut ir.Value {
+    let f = cg.ld_fn(name);
+    let fty = ir.fnp_of(f).ty;
+    return ir.call(cg.B, fty, f, xs);
+}
+
+// The constants made so far, by value (a constant global each).
+struct Const {
+    w: ld.W,
+    g: *mut ir.Value,
+}
+
+let mut consts: u.List.[Const] = u.List.[Const].{ data: @ptr_from_int(*mut Const, 0), len: 0, cap: 0 };
+let mut consts_m: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+
+/// The address of constant w (in memory that is never written).
+pub fn constant(w: ld.W) *mut ir.Value {
+    if consts_m != cg.M {
+        consts.clear();
+        consts_m = cg.M;
+    }
+    for c in consts.items() {
+        if (c.w.lo == w.lo) and (c.w.hi == w.hi) {
+            return c.g;
+        }
+    }
+    let bs = cl.bytes(w);
+    let xs = u.newn.[*mut ir.Value](17);
+    for i in @as(usize, 0)..16 {
+        xs[i] = ir.cint(cg.T_i8, @as(u64, bs[i]));
+    }
+    let init = ir.carray(cg.T_i8, xs[0..16]);
+    let g = ir.add_global(cg.M, init.ty, ".ldconst");
+    g.init = init;
+    g.linkage = ir.LINK_INTERNAL;
+    g.is_const = true;
+    g.align = 16;
+    consts.push(Const.{ w: w, g: g.val });
+    return g.val;
+}
+
+/// Copies the value at src to dst (volatile: the object at dst or src is
+/// volatile, and is read or written as two volatile 8-byte accesses).
+pub fn copy(dst: *mut ir.Value, src: *mut ir.Value, volatile: bool) void {
+    if not volatile {
+        let m = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(16));
+        m.cv = ir.MEMMOVE_SAME_OR_APART;
+        return;
+    }
+    for k in @as(u64, 0)..2 {
+        let x = ir.load(cg.B, i64t(), ir.ptradd(cg.B, src, cg.usz(k * 8)));
+        x.align = 8;
+        x.flags = x.flags | ir.F_VOLATILE;
+        let s = ir.store(cg.B, x, ir.ptradd(cg.B, dst, cg.usz(k * 8)));
+        s.align = 8;
+        s.flags = s.flags | ir.F_VOLATILE;
+    }
+}
+
+/// A copy of the value at p in a new temporary (the value an object has
+/// now, which stores into the object do not change).
+pub fn snapshot(p: *mut ir.Value, volatile: bool) *mut ir.Value {
+    let t = temp();
+    copy(t, p, volatile);
+    return t;
+}
+
+/// x op y (+ - * /).
+pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let mut name: []u8 = "add";
+    if op == ct.P_MINUS {
+        name = "sub";
+    } else if op == ct.P_STAR {
+        name = "mul";
+    } else if op == ct.P_SLASH {
+        name = "div";
+    }
+    let r = temp();
+    let mut xs: [4]*mut ir.Value = [r, x, y, fmt_arg()];
+    _ = call(name, xs[..]);
+    return r;
+}
+
+/// The product (name "cmul") or quotient ("cdiv") of the complex values
+/// a + ib and c + id, as ldouble.ax computes them (C99 G.5.1): the
+/// addresses of its parts.
+pub fn complex_call(name: []u8, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value,
+                    d: *mut ir.Value) [2]*mut ir.Value {
+    let re = temp();
+    let im = temp();
+    let mut xs: [7]*mut ir.Value = [re, im, a, b, c, d, fmt_arg()];
+    _ = call(name, xs[..]);
+    return [re, im];
+}
+
+/// -x: the sign bit changed (the sign is bit 15 of the second eight bytes
+/// in the x87 format, their bit 63 in binary128).
+pub fn negate(x: *mut ir.Value) *mut ir.Value {
+    let r = temp();
+    let lo = ir.load(cg.B, i64t(), x);
+    lo.align = 8;
+    let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
+    hi.align = 8;
+    let mut nh = ir.vnil();
+    if fmt() == ld.FMT_X {
+        nh = ir.xor(cg.B, ir.and_(cg.B, hi, ir.cint(i64t(), 0xFFFF)), ir.cint(i64t(), 0x8000));
+    } else {
+        nh = ir.xor(cg.B, hi, ir.cint(i64t(), 0x8000_0000_0000_0000));
+    }
+    let s0 = ir.store(cg.B, lo, r);
+    s0.align = 8;
+    let s1 = ir.store(cg.B, nh, ir.ptradd(cg.B, r, cg.usz(8)));
+    s1.align = 8;
+    return r;
+}
+
+/// x != 0, as an i1: a bit other than the sign set (in the x87 format, of
+/// its ten bytes; a NaN is not zero, nor is an invalid encoding).
+pub fn truth(x: *mut ir.Value) *mut ir.Value {
+    let lo = ir.load(cg.B, i64t(), x);
+    lo.align = 8;
+    let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
+    hi.align = 8;
+    let mut h = ir.vnil();
+    if fmt() == ld.FMT_X {
+        h = ir.and_(cg.B, hi, ir.cint(i64t(), 0x7FFF));
+    } else {
+        h = ir.binop(cg.B, ir.OP_SHL, hi, ir.cint(i64t(), 1));
+    }
+    return ir.icmp(cg.B, ir.IntNE, ir.or_(cg.B, h, lo), ir.cint(i64t(), 0));
+}
+
+/// x op y (< > <= >= == !=), as an i1: false when unordered, but for !=.
+pub fn compare(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let mut xs: [3]*mut ir.Value = [x, y, fmt_arg()];
+    let c = call("cmp", xs[..]);  // -1, 0, 1, or 2 (unordered)
+    let m1 = ir.cint(i32t(), 0xFFFF_FFFF);
+    let z = ir.cint(i32t(), 0);
+    let one = ir.cint(i32t(), 1);
+    if op == ct.P_LT {
+        return ir.icmp(cg.B, ir.IntEQ, c, m1);
+    }
+    if op == ct.P_GT {
+        return ir.icmp(cg.B, ir.IntEQ, c, one);
+    }
+    if op == ct.P_LE {
+        // (-1 or 0: as unsigned, c + 1 <= 1)
+        return ir.icmp(cg.B, ir.IntULE, ir.add(cg.B, c, one), one);
+    }
+    if op == ct.P_GE {
+        return ir.icmp(cg.B, ir.IntULE, c, one);
+    }
+    if op == ct.P_EQ {
+        return ir.icmp(cg.B, ir.IntEQ, c, z);
+    }
+    return ir.icmp(cg.B, ir.IntNE, c, z);
+}
+
+/// Scalar value v of type `from` converted to type `to`, one of them a
+/// wide long double (6.3.1.4, 6.3.1.5): a value's address for one, an IR
+/// scalar for others.
+pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
+    let f = from.unq;
+    let t = to.unq;
+    if cty.is_wide(f) and cty.is_wide(t) {
+        return v;
+    }
+    if cty.is_wide(t) {
+        let r = temp();
+        if cty.is_integer(f) {
+            // (exact: every format here holds every 64-bit integer)
+            let mut x = v;
+            let sg = f.is_signed and (f.kind != cty.TK_BOOL);
+            if x.ty.bits < 64 {
+                if sg {
+                    x = ir.sext(cg.B, x, i64t());
+                } else {
+                    x = ir.zext(cg.B, x, i64t());
+                }
+            }
+            let mut xs: [3]*mut ir.Value = [r, x, fmt_arg()];
+            _ = call(u.pick(sg, "from_i64", "from_u64"), xs[..]);
+            return r;
+        }
+        // float or double: exact
+        if v.ty.bits == 32 {
+            let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i32t()), fmt_arg()];
+            _ = call("from_f32", xs[..]);
+            return r;
+        }
+        let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i64t()), fmt_arg()];
+        _ = call("from_f64", xs[..]);
+        return r;
+    }
+    let tt = cg.lty(t);
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(cg.B, truth(v), tt);
+    }
+    let mut xs: [2]*mut ir.Value = [v, fmt_arg()];
+    if cty.is_integer(t) {
+        // (truncated toward zero; a value out of range is undefined,
+        // 6.3.1.4p1: saturated, as for float and double)
+        let mut r = ir.vnil();
+        let w = cty.storage_bits(t);
+        if t.is_signed {
+            r = call("to_i64", xs[..]);
+            if w < 64 {
+                let hi = ir.cint(i64t(), cty.int_max(t));
+                let lo = ir.cint(i64t(), 0 -% (cty.int_max(t) + 1));
+                r = ir.select(cg.B, ir.icmp(cg.B, ir.IntSGT, r, hi), hi, r);
+                r = ir.select(cg.B, ir.icmp(cg.B, ir.IntSLT, r, lo), lo, r);
+            }
+        } else {
+            r = call("to_u64", xs[..]);
+            if w < 64 {
+                let hi = ir.cint(i64t(), cty.int_max(t));
+                r = ir.select(cg.B, ir.icmp(cg.B, ir.IntUGT, r, hi), hi, r);
+            }
+        }
+        if tt.bits < 64 {
+            r = ir.trunc(cg.B, r, tt);
+        }
+        return r;
+    }
+    if t.kind == cty.TK_FLOAT {
+        return ir.bitcast(cg.B, call("to_f32", xs[..]), tt);
+    }
+    return ir.bitcast(cg.B, call("to_f64", xs[..]), tt);
+}
+
+/// The constant 1, for ++ and --.
+pub fn one_value() *mut ir.Value {
+    return constant(cl.of_u64(1, fmt()));
+}
+
+/// The 16 bytes of w (for an object's initial value).
+pub fn bytes(w: ld.W) [16]u8 {
+    return cl.bytes(w);
+}
+
+// -----------------------------------------------------------------------------
+// The x87 register stack at calls and returns (x86-64 System V: a long
+// double result is in st(0); ir.IN_X87_LOAD, IN_X87_STORE)
+// -----------------------------------------------------------------------------
+
+/// Pushes the 80-bit value at p onto the x87 stack (before a return).
+pub fn x87_push(p: *mut ir.Value) void {
+    let mut xs: [1]*mut ir.Value = [p];
+    _ = ir.intr(cg.B, ir.IN_X87_LOAD, cg.T_void, xs[..]);
+}
+
+/// Pops st(0) into p (after a call).
+pub fn x87_pop(p: *mut ir.Value) void {
+    let mut xs: [1]*mut ir.Value = [p];
+    _ = ir.intr(cg.B, ir.IN_X87_STORE, cg.T_void, xs[..]);
+}

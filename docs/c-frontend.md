@@ -37,13 +37,12 @@ lists the diagnostics.
   follow Annex G.5.1 (`ccomplex.ax` folds constants, `cgen_complex.ax` generates the
   same operations, with helper functions of the module for the slow paths).
 - **Not supported, and said so by the feature macros**: `_Atomic` (`__STDC_NO_ATOMICS__`), threads
-  (`__STDC_NO_THREADS__`), decimal floating types, `long double` wider than `double`
-  (it is `double`). Annex F is not claimed (`__STDC_IEC_559__` and
+  (`__STDC_NO_THREADS__`), decimal floating types. Annex F is not claimed (`__STDC_IEC_559__` and
   `__STDC_IEC_60559_BFP__` are not defined): the floating types have IEC 60559's
   formats (`FLT_IS_IEC_60559`), but without a library there is no `<fenv.h>` or
   `<math.h>`, and no exception flags or rounding modes.
 - **Implementation-defined choices** a build can make: `--c-char=signed|unsigned`,
-  `--c-int=16|32|64`, `--c-long=32|64`. `short` is 16 bits, `long long` 64, pointers
+  `--c-int=16|32|64`, `--c-long=32|64`, `--c-long-double=64|80|128`. `short` is 16 bits, `long long` 64, pointers
   and `size_t` the target's. The defaults are the target's C ABI:
 
   | target | plain `char` | `long` | `wchar_t` |
@@ -54,6 +53,8 @@ lists the diagnostics.
   | `x86_64-windows` (Windows x64) | signed | 32 | `unsigned short` |
   | `wasm32`, `wasm64` (the WebAssembly C ABI) | signed | 32, 64 | `int` |
 
+  `long double` is the x87's 80-bit format on `x86_64` Linux, binary128 on `aarch64`
+  Linux and WebAssembly, and binary64 elsewhere (`c/run/hdr_float_ld.c`).
   (`c/run/target_*.c` check them.) Where the platforms' headers choose between
   types of the same width, this implementation's may choose the other (`size_t` is
   `unsigned int` on wasm32, `int64_t` is `long` on macOS): the representation and
@@ -87,9 +88,12 @@ cmd/axiom/src/c/cast.ax     the syntax tree                          (+ cast_dum
 cmd/axiom/src/c/cparse.ax   parser
 cmd/axiom/src/c/ctypes.ax   C types, layout, conversions
 cmd/axiom/src/c/cconst.ax   constant expressions                        (+ ccomplex.ax)
+cmd/axiom/src/c/cldbl.ax    long double constants wider than double: read exactly, folded
 cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree
 cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conventions
-                            (cgen_complex.ax: complex arithmetic)
+                            (cgen_complex.ax: complex arithmetic; cgen_ld.ax: long double
+                            wider than double)
+std/c/rt/ldouble.ax         that long double's arithmetic, in software (the compiler's too)
 cmd/axiom/src/c/cc.ax       the driver, and the link of the units (with Axiom's)
 cmd/axiom/src/c/cstrip.ax   leaves out of an executable what the units define and nothing reaches
 std/c/include/              the compiler's headers
@@ -116,6 +120,16 @@ cmd/axiom/internal/tests/c/ tests
   `std/internal/runtime/c_start.ax`, built as an Axiom program; the C unit's
   IR joins its module (`codegen.ax` calls `cc.gen_ir`) before the optimizer
   runs. C's `main` is `axiom.c.main`, called through `__axiom_c_main`.
+- `long double` wider than `double` (`cty.is_wide`): a value is 16 bytes of memory,
+  which cgen handles as it does a structure's (its address), its operations are calls
+  of `std/c/rt/ldouble.ax`'s functions (binary128 and the x87's format, written from IEEE
+  754-2019; codegen.ax generates those a program calls, `cg.ld_fn`, into its module),
+  and its constants are values of that format (`Expr.xv`): floating constants read
+  exactly (`cldbl.ax`, in arbitrary precision), folded with the same functions. The ABIs
+  pass it in memory or as pieces (cgen_abi.ax): a 128-bit vector for a register that
+  holds a binary128 (`v`, `xmm`), and, for an x87 result in `st(0)`, the intrinsics
+  `IN_X87_LOAD` and `IN_X87_STORE` (`fld`, `fstp`: the x86-64 backend's only x87 code)
+  just before the return and just after the call.
 - Diagnostics go through `diag.ax` with spans into the source files (`util.load_file`).
   Codes: `C1xxx` preprocessing and lexing, `C2xxx` syntax, `C3xxx` constraints and
   semantics, `C4xxx` warnings. A constraint violation is an error; the messages name
@@ -131,7 +145,7 @@ cmd/axiom/internal/tests/c/ tests
 axiom build file.c... [-o out] [--target=...] [-O0..-O3]
 axiom check file.c...           the units are analyzed and linked, nothing is written
     --c-std=c89|c90|c95|c99|c11|c17|c18|c23      (default c17)
-    --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64
+    --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64  --c-long-double=64|80|128
     -DNAME[=value]  -UNAME  -Idir   (also -D NAME, -U NAME, -I dir; in order)
     --emit=c-pp     the preprocessed text           (one source; standard output
     --emit=c-tokens the tokens, one to a line        without -o)

@@ -96,3 +96,78 @@ double h_cva(int n, ...) {
 double _Complex h_ccall(double _Complex (*f)(double _Complex, float _Complex, ...)) {
     return f(CMPLX(1, 2), CMPLXF(3, 4), CMPLX(5, 6), CMPLXF(7, 8));
 }
+
+/* For c/run/ldouble_abi_host.c: long double (the platform's format: the
+   x87's on x86-64, binary128 on AArch64) passed and returned alone, in
+   structures and unions, among many arguments, as variadic arguments and
+   through function pointers. */
+#include <float.h>
+typedef struct { long double x; } h_l1;
+typedef struct { char c; long double x; } h_cl;
+typedef struct { long double a, b; } h_l2;
+typedef struct { double d; long double x; } h_dl;
+typedef union { long double x; long long l[2]; } h_ul;
+long double h_ld_many(int i1, long double a, double d1, long double b, int i2, long double c, long double d,
+                      long double e, long double f, long double g, long double h, long double i, long double j,
+                      float f1, long double k) {
+    return i1 + a + d1 + b * 2 + i2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + i * 9 + j * 10 + f1 + k * 11;
+}
+h_l1 h_ld_l1(h_l1 s) { s.x = s.x * 2 + 1; return s; }
+h_cl h_ld_cl(h_cl s) { s.x = s.x + s.c; s.c = 'z'; return s; }
+h_l2 h_ld_l2(h_l2 s) { h_l2 r = { s.b - 1, s.a + 1 }; return r; }
+h_dl h_ld_dl(h_dl s) { s.x = s.x - s.d; s.d = 4.5; return s; }
+h_ul h_ld_ul(h_ul u) { u.x = u.x / 4; return u; }
+long double h_ld_va(int n, ...) {
+    va_list ap;
+    long double s = 0;
+    int k;
+    va_start(ap, n);
+    for (k = 0; k < n; k++) {
+        if (k % 4 == 0) s = s * 2 + va_arg(ap, long double);
+        else if (k % 4 == 1) s = s * 2 + va_arg(ap, double);
+        else if (k % 4 == 2) s = s * 2 + va_arg(ap, int);
+        else s = s * 2 + va_arg(ap, h_l2).b;
+    }
+    va_end(ap);
+    return s;
+}
+long double h_ld_call(long double (*f)(long double, int, long double), long double a, long double b) {
+    return f(a, 3, b) * 2;
+}
+long double h_ld_vcall(long double (*f)(int, ...)) {
+    h_l2 p = { 0.5L, 1.75L };
+    return f(4, 1.25L, 2.5, 3, p);
+}
+h_l2 h_ld_scall(h_l2 (*f)(h_l2, long double)) {
+    h_l2 p = { 0.5L, 1.75L };
+    h_l2 r = f(p, 0.25L);
+    r.a = r.a * 100;
+    return r;
+}
+int h_ld_order(long double a, long double b) { return (a < b) + (a == b) * 2 + (a > b) * 4; }
+int h_ld_eps(long double x) { return x - 1 == LDBL_EPSILON; }
+
+/* For c/run/ldouble_complex_host.c: long double _Complex (x86-64
+   System V's COMPLEX_X87: in memory, the result in st(0) and st(1); an
+   AArch64 homogeneous aggregate of two binary128 values). */
+typedef struct { long double _Complex z; int k; } h_lcs;
+long double _Complex h_lc_add(long double _Complex a, long double _Complex b) { return a + b * 2; }
+long double _Complex h_lc_many(int i, long double _Complex a, double d, long double _Complex b, long double _Complex c,
+                               long double _Complex e, long double _Complex f, long double g, long double _Complex h) {
+    return i + a + d + b * 2 + c * 3 + e * 4 + f * 5 + g + h * 7;
+}
+h_lcs h_lc_s(h_lcs s) { s.z = s.z * 2; s.k++; return s; }
+long double _Complex h_lc_va(int n, ...) {
+    va_list ap;
+    long double _Complex s = 0;
+    va_start(ap, n);
+    while (n-- > 0) {
+        s = s * 2 + va_arg(ap, long double _Complex);
+        s += va_arg(ap, double);
+    }
+    va_end(ap);
+    return s;
+}
+long double _Complex h_lc_call(long double _Complex (*f)(long double _Complex, long double)) {
+    return f(CMPLXL(1.5L, -2.25L), 0.5L) * 3;
+}

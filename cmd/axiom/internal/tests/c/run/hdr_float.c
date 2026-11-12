@@ -1,4 +1,4 @@
-/* flags: --c-std=c23 */
+/* flags: --c-std=c23 --c-long-double=64 */
 /* <float.h>: binary32 and binary64 (long double is double), with C23's
    additions (*_NORM_MAX, *_IS_IEC_60559, INFINITY, NAN). */
 #include <float.h>

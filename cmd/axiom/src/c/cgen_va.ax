@@ -22,6 +22,7 @@ import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_abi.ax" as abi;
 import "cgen_debug.ax" as cdbg;
+import "cgen_ld.ax" as gld;
 import "csema_builtin.ax" as csb;
 import "ctypes.ax" as cty;
 
@@ -178,7 +179,7 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
                 x = ir.bitcast(B(), v, i64t());
             }
             if a.slot[0] < 0 {
-                va_store_scalar(vb, a, x);
+                va_store_scalar(vb, a, 0, x);
             } else {
                 args[@int_cast(usize, a.slot[0])] = x;
             }
@@ -197,7 +198,7 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
                 let pc = a.pieces[k];
                 let x = ld(pc.ty, at(src, pc.off), align_at(al, pc.off));
                 if a.slot[k] < 0 {
-                    va_store_scalar(vb, a, x);
+                    va_store_scalar(vb, a, pc.off, x);
                 } else {
                     args[@int_cast(usize, a.slot[k])] = x;
                 }
@@ -220,6 +221,17 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
     }
     if p.ret == abi.R_SRET {
         return res;
+    }
+    if p.ret == abi.R_X87 {
+        // st(0) (and st(1)) popped into the result's memory (padding zero)
+        let tmp = cg.alloca(p.rty, "ret");
+        let sz = cty.size_of(p.rty) / @as(u64, p.rn);
+        for k in 0..p.rn {
+            let part = at(tmp, @as(u64, k) * sz);
+            st(c64(0), at(part, 8), 8);
+            gld.x87_pop(part);
+        }
+        return tmp;
     }
     if (p.ret == abi.R_PIECE) or (p.ret == abi.R_REGS) {
         // the registers' pieces stored into an object (which scalar
@@ -244,9 +256,9 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
     return r;
 }
 
-// A WebAssembly variadic argument (a scalar, or a structure's one piece)
-// into the buffer, in a slot of at least 4 bytes.
-fn va_store_scalar(vb: *mut ir.Value, a: *abi.ArgPlan, x0: *mut ir.Value) void {
+// A WebAssembly variadic argument (a scalar, or a structure's one piece; a
+// binary128's piece at off) into the buffer, in a slot of at least 4 bytes.
+fn va_store_scalar(vb: *mut ir.Value, a: *abi.ArgPlan, off: u64, x0: *mut ir.Value) void {
     let mut x = x0;
     if (x.ty.kind == ir.T_INT) and (x.ty.bits < 32) {
         if (a.kind == abi.A_SCALAR) and a.ty.is_signed and (a.ty.kind != cty.TK_BOOL) {
@@ -255,7 +267,7 @@ fn va_store_scalar(vb: *mut ir.Value, a: *abi.ArgPlan, x0: *mut ir.Value) void {
             x = ir.zext(B(), x, i32t());
         }
     }
-    st(x, at(vb, a.va_off), x.ty.size);
+    st(x, at(vb, a.va_off + off), x.ty.size);
 }
 
 // -----------------------------------------------------------------------------
@@ -350,7 +362,7 @@ fn save_registers(p: *mut abi.Plan, f: *mut ir.Func) void {
     }
     for j in 0..p.pads_fp.len {
         let x = f.params[@int_cast(usize, p.pads_fp.get(j))];
-        st(x, at(VA.save, gsize + ((p.va_fp + @as(u64, j)) * 16)), 8);
+        st(x, at(VA.save, gsize + ((p.va_fp + @as(u64, j)) * 16)), 16);
     }
 }
 
@@ -367,6 +379,10 @@ pub fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
     }
     if p.ret == abi.R_SCALAR {
         ir.ret(B(), v);
+        return;
+    }
+    if p.ret == abi.R_X87 {
+        x87_return(p, v);
         return;
     }
     let size = cty.size_of(p.rty);
@@ -401,6 +417,11 @@ pub fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
 pub fn ret_default(p: *mut abi.Plan, res: *mut ir.Value) void {
     if p.ret == abi.R_SCALAR {
         ir.ret(B(), ir.czero(p.rpieces[0].ty));
+    } else if p.ret == abi.R_X87 {
+        // (the caller pops what it expects: zeros pushed)
+        let z = cg.alloca(p.rty, "ret");
+        _ = ir.memop(B(), ir.OP_MEMSET, z, ir.cint(ir.t_int(8), 0), cg.usz(cty.size_of(p.rty)));
+        x87_return(p, z);
     } else if p.ret == abi.R_PIECE {
         ir.ret(B(), ir.undef(p.rpieces[0].ty));
     } else if p.ret == abi.R_REGS {
@@ -414,6 +435,18 @@ pub fn ret_default(p: *mut abi.Plan, res: *mut ir.Value) void {
     } else {
         ir.ret_void(B());
     }
+}
+
+// A return of the value at v on the x87 stack: st(0) (and st(1), the second
+// part: COMPLEX_X87), pushed last first.
+fn x87_return(p: *abi.Plan, v: *mut ir.Value) void {
+    let sz = cty.size_of(p.rty) / @as(u64, p.rn);
+    let mut k = p.rn;
+    while k > 0 {
+        k -= 1;
+        gld.x87_push(at(v, @as(u64, k) * sz));
+    }
+    ir.ret_void(B());
 }
 
 // A return of the result in registers whose pieces are xs[0..p.rn].
@@ -493,6 +526,9 @@ fn slot_va_arg(ap: *mut ir.Value, t: *mut cty.CType, ab: i32) *mut ir.Value {
         let a = one_arg(t, true);
         by_ref = a.kind == abi.A_REF;
         slot = a.pieces[0].ty.size;
+        if a.n == 2 {
+            slot = 16;  // (binary128: cgen_abi.wasm_arg)
+        }
         if slot < 4 {
             slot = 4;
         }
@@ -516,7 +552,8 @@ fn sysv_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
     // MEMORY: then its pieces follow the six integer fillers)
     let regs_ok = a.slot[0] < 6;
     for k in 0..a.n {
-        if a.pieces[k].ty.kind == ir.T_FLOAT {
+        let pk = a.pieces[k].ty.kind;
+        if (pk == ir.T_FLOAT) or (pk == ir.T_VEC) {
             f += 1;
         } else {
             g += 1;
@@ -546,6 +583,13 @@ fn sysv_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
     for k in 0..a.n {
         let pc = a.pieces[k];
         let mut src = ir.vnil();
+        if pc.ty.kind == ir.T_VEC {
+            // (SSE and SSEUP: the whole register)
+            src = ir.ptradd(B(), rsa, ir.zext(B(), ir.add(B(), fp, c32(@bit_cast(i64, fi * 16))), cg.T_isz));
+            fi += 1;
+            st(ld(pc.ty, src, 16), buf, 16);
+            continue;
+        }
         if pc.ty.kind == ir.T_FLOAT {
             src = ir.ptradd(B(), rsa, ir.zext(B(), ir.add(B(), fp, c32(@bit_cast(i64, fi * 16))), cg.T_isz));
             fi += 1;
@@ -594,7 +638,7 @@ fn one_arg(t: *mut cty.CType, variadic: bool) abi.ArgPlan {
 fn a64_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
     let size = cty.size_of(t);
     let a = one_arg(t, false);
-    let fpa = (a.kind != abi.A_REF) and (a.pieces[0].ty.kind == ir.T_FLOAT);
+    let fpa = (a.kind != abi.A_REF) and ((a.pieces[0].ty.kind == ir.T_FLOAT) or (a.pieces[0].ty.kind == ir.T_VEC));
     let by_ref = a.kind == abi.A_REF;
     let mut n = @as(u64, a.n);
     let mut es: u64 = 8;
@@ -633,7 +677,7 @@ fn a64_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
     let mut addr = base;
     if fpa {
         // (an HFA's members are each in a 16-byte register slot)
-        let buf = buffer(32, 16);
+        let buf = buffer(64, 16);
         for k in 0..n {
             let ft = a.pieces[0].ty;
             st(ld(ft, at(base, k * 16), es), at(buf, k * es), es);

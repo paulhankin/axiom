@@ -1,0 +1,476 @@
+// =============================================================================
+// cldbl.ax - long double in the C front end, where it is wider than double
+// (--c-long-double=80 or 128: ctypes.ld_bits): the values of constants in the
+// target's format, read from floating constants (correctly rounded, from the
+// decimal or hexadecimal digits, exactly in arbitrary precision) and folded
+// with the same software arithmetic the program's code calls at run time
+// (std/c/rt/ldouble.ax), so that a constant expression has the value the
+// program would compute.
+// =============================================================================
+import "../util.ax" as u;
+import "std/c/rt/ldouble" as ld;
+
+/// The format (ld.FMT_Q or ld.FMT_X) of a long double of `bits` (80 or 128).
+pub fn fmt_of(bits: i32) u32 {
+    if bits == 80 {
+        return ld.FMT_X;
+    }
+    return ld.FMT_Q;
+}
+
+pub fn zero() ld.W {
+    return ld.W.{ lo: 0, hi: 0 };
+}
+
+pub fn add(a: ld.W, b: ld.W, f: u32) ld.W {
+    let mut r = zero();
+    ld.add(&mut r, &a, &b, f);
+    return r;
+}
+
+pub fn sub(a: ld.W, b: ld.W, f: u32) ld.W {
+    let mut r = zero();
+    ld.sub(&mut r, &a, &b, f);
+    return r;
+}
+
+pub fn mul(a: ld.W, b: ld.W, f: u32) ld.W {
+    let mut r = zero();
+    ld.mul(&mut r, &a, &b, f);
+    return r;
+}
+
+pub fn div(a: ld.W, b: ld.W, f: u32) ld.W {
+    let mut r = zero();
+    ld.div(&mut r, &a, &b, f);
+    return r;
+}
+
+pub fn negate(a: ld.W, f: u32) ld.W {
+    let mut r = zero();
+    ld.negate(&mut r, &a, f);
+    return r;
+}
+
+/// (a + ib)(c + id) and (a + ib) / (c + id), complex (G.5.1): [re, im].
+pub fn cmul(a: ld.W, b: ld.W, c: ld.W, d: ld.W, f: u32) [2]ld.W {
+    let mut re = zero();
+    let mut im = zero();
+    ld.cmul(&mut re, &mut im, &a, &b, &c, &d, f);
+    return [re, im];
+}
+
+pub fn cdiv(a: ld.W, b: ld.W, c: ld.W, d: ld.W, f: u32) [2]ld.W {
+    let mut re = zero();
+    let mut im = zero();
+    ld.cdiv(&mut re, &mut im, &a, &b, &c, &d, f);
+    return [re, im];
+}
+
+/// -1, 0, 1, or 2 (unordered).
+pub fn cmp(a: ld.W, b: ld.W, f: u32) i32 {
+    return ld.cmp(&a, &b, f);
+}
+
+pub fn nonzero(a: ld.W, f: u32) bool {
+    return ld.nonzero(&a, f);
+}
+
+pub fn is_nan(a: ld.W, f: u32) bool {
+    return ld.cmp(&a, &a, f) == 2;
+}
+
+pub fn of_i64(x: i64, f: u32) ld.W {
+    let mut r = zero();
+    ld.from_i64(&mut r, x, f);
+    return r;
+}
+
+pub fn of_u64(x: u64, f: u32) ld.W {
+    let mut r = zero();
+    ld.from_u64(&mut r, x, f);
+    return r;
+}
+
+/// x (a double: a float's value is one too), exactly.
+pub fn of_f64(x: f64, f: u32) ld.W {
+    let mut r = zero();
+    ld.from_f64(&mut r, @bit_cast(u64, x), f);
+    return r;
+}
+
+/// a rounded to double.
+pub fn to_f64(a: ld.W, f: u32) f64 {
+    return @bit_cast(f64, ld.to_f64(&a, f));
+}
+
+/// a rounded to float (once: not through double).
+pub fn to_f32(a: ld.W, f: u32) f32 {
+    return @bit_cast(f32, ld.to_f32(&a, f));
+}
+
+pub fn to_i64(a: ld.W, f: u32) i64 {
+    return ld.to_i64(&a, f);
+}
+
+pub fn to_u64(a: ld.W, f: u32) u64 {
+    return ld.to_u64(&a, f);
+}
+
+/// Is a's value, truncated toward zero, one of an integer type of `bits`
+/// bits (signed: two's complement)? (C17 6.3.1.4p1: otherwise the
+/// conversion is undefined.)
+pub fn fits_int(a: ld.W, bits: i32, signed_: bool, f: u32) bool {
+    let mut hi = zero();  // 2^(bits - 1) or 2^bits: above every value of the type
+    let mut k = @bit_cast(u32, bits);
+    if signed_ {
+        k -= 1;
+    }
+    if k >= 64 {
+        hi = mul(of_u64(@as(u64, 1) << 63, f), of_u64(2, f), f);
+    } else {
+        hi = of_u64(@as(u64, 1) << k, f);
+    }
+    let mut lo = of_i64(-1, f);  // -2^(bits - 1) - 1 or -1: below every value
+    if signed_ {
+        lo = sub(negate(hi, f), of_u64(1, f), f);
+    }
+    return (cmp(a, hi, f) == -1) and (cmp(a, lo, f) == 1);
+}
+
+/// The 16 bytes of a, little-endian.
+pub fn bytes(a: ld.W) [16]u8 {
+    let mut b: [16]u8 = [0; 16];
+    for i in @as(usize, 0)..8 {
+        b[i] = @truncate(u8, a.lo >> @truncate(u32, i * 8));
+        b[i + 8] = @truncate(u8, a.hi >> @truncate(u32, i * 8));
+    }
+    return b;
+}
+
+// -----------------------------------------------------------------------------
+// Floating constants (C17 6.4.4.2): the value of the digits, correctly
+// rounded to the nearest value of the format (ties to even)
+// -----------------------------------------------------------------------------
+
+// A natural number in 32-bit limbs, least significant first.
+struct Big {
+    d: []mut u32,
+    n: usize,  // limbs in use (no leading zero limb)
+}
+
+fn big(cap: usize) Big {
+    let d = u.newn.[u32](cap + 1);
+    @mem_set(d, 0);
+    return Big.{ d: d, n: 0 };
+}
+
+fn grow(x: *mut Big, n: usize) void {
+    if n <= x.d.len {
+        return;
+    }
+    let mut c = x.d.len * 2;
+    if c < n {
+        c = n;
+    }
+    let d = u.newn.[u32](c + 1);
+    @mem_set(d, 0);
+    for i in 0..x.n {
+        d[i] = x.d[i];
+    }
+    x.d = d;
+}
+
+// x = x * m + a.
+fn mul_add(x: *mut Big, m: u32, a: u32) void {
+    let mut c = @as(u64, a);
+    for i in 0..x.n {
+        let p = (@as(u64, x.d[i]) * @as(u64, m)) + c;
+        x.d[i] = @truncate(u32, p);
+        c = p >> 32;
+    }
+    if c != 0 {
+        grow(x, x.n + 1);
+        x.d[x.n] = @truncate(u32, c);
+        x.n += 1;
+    }
+}
+
+fn bitlen(x: *Big) u64 {
+    if x.n == 0 {
+        return 0;
+    }
+    return (@as(u64, x.n - 1) * 32) + (32 - @as(u64, @clz(x.d[x.n - 1])));
+}
+
+fn bit(x: *Big, k: u64) bool {
+    let w = @truncate(usize, k / 32);
+    if w >= x.n {
+        return false;
+    }
+    return ((x.d[w] >> @truncate(u32, k % 32)) & 1) != 0;
+}
+
+// x << k, as a new number.
+fn shifted(x: *Big, k: u64) Big {
+    let words = @truncate(usize, k / 32);
+    let b = @truncate(u32, k % 32);
+    let mut r = big(x.n + words + 2);
+    for i in 0..x.n {
+        let v = @as(u64, x.d[i]) << b;
+        r.d[i + words] = r.d[i + words] | @truncate(u32, v);
+        r.d[i + words + 1] = r.d[i + words + 1] | @truncate(u32, v >> 32);
+    }
+    r.n = x.n + words + 2;
+    trim(&mut r);
+    return r;
+}
+
+fn trim(x: *mut Big) void {
+    while (x.n > 0) and (x.d[x.n - 1] == 0) {
+        x.n -= 1;
+    }
+}
+
+// x >> 1, in place.
+fn half(x: *mut Big) void {
+    for i in 0..x.n {
+        let mut v = x.d[i] >> 1;
+        if ((i + 1) < x.n) and ((x.d[i + 1] & 1) != 0) {
+            v = v | 0x8000_0000;
+        }
+        x.d[i] = v;
+    }
+    trim(x);
+}
+
+// a >= b?
+fn ge(a: *Big, b: *Big) bool {
+    if a.n != b.n {
+        return a.n > b.n;
+    }
+    let mut i = a.n;
+    while i > 0 {
+        i -= 1;
+        if a.d[i] != b.d[i] {
+            return a.d[i] > b.d[i];
+        }
+    }
+    return true;
+}
+
+// a -= b (a >= b).
+fn sub_in(a: *mut Big, b: *Big) void {
+    let mut borrow: u64 = 0;
+    for i in 0..a.n {
+        let mut bv: u64 = 0;
+        if i < b.n {
+            bv = @as(u64, b.d[i]);
+        }
+        let x = @as(u64, a.d[i]);
+        let s = (x -% bv) -% borrow;
+        if x < (bv + borrow) {
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        a.d[i] = @truncate(u32, s);
+    }
+    trim(a);
+}
+
+// The 128 bits of x from bit `from` down (bit from - 127 at the bottom).
+fn top128(x: *Big, from: u64) [2]u64 {
+    let mut h: u64 = 0;
+    let mut l: u64 = 0;
+    for j in @as(u64, 0)..128 {
+        let k = from - j;
+        let mut b: u64 = 0;
+        if bit(x, k) {
+            b = 1;
+        }
+        if j < 64 {
+            h = h | (b << @truncate(u32, 63 - j));
+        } else {
+            l = l | (b << @truncate(u32, 127 - j));
+        }
+    }
+    return [h, l];
+}
+
+fn any_below(x: *Big, k: u64) bool {
+    for i in @as(u64, 0)..k {
+        if bit(x, i) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The value of a floating constant's digits `ds` (decimal, or hexadecimal
+/// if hex; with at most one '.', and no separators) times 10^exp (2^exp
+/// for hex), in format f; `inf` set when it is too large for the format.
+pub fn parse(ds: []u8, hex: bool, exp: i64, f: u32, inf: *mut bool) ld.W {
+    inf.* = false;
+    let mut n = big(8);
+    let mut frac: i64 = 0;
+    let mut point = false;
+    let mut nd: i64 = 0;  // significant digits (after leading zeros)
+    for c in ds {
+        if c == '.' {
+            point = true;
+            continue;
+        }
+        let mut v: u32 = 0;
+        if (c >= '0') and (c <= '9') {
+            v = @as(u32, c - '0');
+        } else if (c >= 'a') and (c <= 'f') {
+            v = @as(u32, c - 'a') + 10;
+        } else {
+            v = @as(u32, c - 'A') + 10;
+        }
+        if hex {
+            mul_add(&mut n, 16, v);
+        } else {
+            mul_add(&mut n, 10, v);
+        }
+        if point {
+            frac += 1;
+        }
+        if n.n > 0 {
+            nd += 1;
+        }
+    }
+    if n.n == 0 {
+        return zero();
+    }
+    let mut b2: i64 = 0;  // value = n / d * 2^b2
+    let mut d = big(1);
+    d.d[0] = 1;
+    d.n = 1;
+    if hex {
+        b2 = exp - (4 * frac);
+    } else {
+        let s10 = exp - frac;
+        // (far outside every format's range: no need for the digits)
+        if (s10 + nd) > 6000 {
+            inf.* = true;
+            return zero();
+        }
+        if (s10 + nd) < -6000 {
+            return zero();
+        }
+        if s10 >= 0 {
+            for k in @as(i64, 0)..s10 {
+                _ = k;
+                mul_add(&mut n, 10, 0);
+            }
+        } else {
+            for k in @as(i64, 0)..(0 - s10) {
+                _ = k;
+                mul_add(&mut d, 10, 0);
+            }
+        }
+    }
+    if (b2 + @bit_cast(i64, bitlen(&n))) > 40000 {
+        inf.* = true;
+        return zero();
+    }
+    if (b2 + @bit_cast(i64, bitlen(&n))) < -40000 {
+        return zero();
+    }
+    // q = floor(n * 2^k / d), of 128 or 129 bits, and whether a remainder is left
+    let mut k = (129 - @bit_cast(i64, bitlen(&n))) + @bit_cast(i64, bitlen(&d));
+    if k < 0 {
+        k = 0;
+    }
+    let mut a = shifted(&n, @bit_cast(u64, k));
+    let mut qh: u64 = 0;
+    let mut ql: u64 = 0;
+    let mut sticky = false;
+    let mut e: i64 = 0;
+    if (d.n == 1) and (d.d[0] == 1) {
+        // (an integer: its top 128 bits)
+        let bl = bitlen(&a);
+        let t = top128(&a, bl - 1);
+        qh = t[0];
+        ql = t[1];
+        sticky = (bl > 128) and any_below(&a, bl - 128);
+        // value = a * 2^(b2 - k) = (q * 2^(bl - 128)) * 2^(b2 - k)
+        e = (((b2 - k) + @bit_cast(i64, bl)) - 128) + 127;
+    } else {
+        let sh = bitlen(&a) - bitlen(&d);
+        let mut dd = shifted(&d, sh);
+        let mut q = big(8);
+        let mut i = sh + 1;
+        while i > 0 {
+            i -= 1;
+            mul_add(&mut q, 2, 0);
+            if ge(&a, &dd) {
+                sub_in(&mut a, &dd);
+                if q.n == 0 {
+                    q.n = 1;
+                    q.d[0] = 0;
+                }
+                q.d[0] = q.d[0] | 1;
+            }
+            half(&mut dd);
+        }
+        trim(&mut q);
+        let bl = bitlen(&q);
+        let t = top128(&q, bl - 1);
+        qh = t[0];
+        ql = t[1];
+        sticky = (a.n != 0) or ((bl > 128) and any_below(&q, bl - 128));
+        e = (((b2 - k) + @bit_cast(i64, bl)) - 128) + 127;
+    }
+    let mut r = zero();
+    ld.from_parts(&mut r, false, @truncate(i32, e), qh, ql, sticky, f);
+    if ld.is_inf(&r, f) {
+        inf.* = true;
+    }
+    return r;
+}
+
+/// The value of floating constant `s` (its spelling, as the preprocessor
+/// checked it: digits, separators, exponent and suffix) in format f; `inf`
+/// set when it is too large for the format.
+pub fn parse_literal(s: []u8, f: u32, inf: *mut bool) ld.W {
+    let hex = (s.len > 1) and (s[0] == '0') and ((s[1] == 'x') or (s[1] == 'X'));
+    let mut i: usize = 0;
+    if hex {
+        i = 2;
+    }
+    let mut ds = u.Buf.init();
+    defer ds.b.deinit();
+    while i < s.len {
+        let c = s[i];
+        let digit = ((c >= '0') and (c <= '9')) or
+                    (hex and (((c >= 'a') and (c <= 'f')) or ((c >= 'A') and (c <= 'F'))));
+        if (c == '.') or digit {
+            ds.c(c);
+        } else if c != '\'' {
+            break;
+        }
+        i += 1;
+    }
+    let mut exp: i64 = 0;
+    if (i < s.len) and ((s[i] == 'e') or (s[i] == 'E') or (s[i] == 'p') or (s[i] == 'P')) {
+        i += 1;
+        let mut neg = false;
+        if (i < s.len) and ((s[i] == '+') or (s[i] == '-')) {
+            neg = s[i] == '-';
+            i += 1;
+        }
+        while (i < s.len) and (((s[i] >= '0') and (s[i] <= '9')) or (s[i] == '\'')) {
+            if (s[i] != '\'') and (exp < 1000000) {
+                exp = (exp * 10) + @as(i64, s[i] - '0');
+            }
+            i += 1;
+        }
+        if neg {
+            exp = 0 - exp;
+        }
+    }
+    return parse(ds.view(), hex, exp, f, inf);
+}

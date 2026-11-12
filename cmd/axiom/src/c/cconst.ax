@@ -7,7 +7,9 @@
 // An expression's value is in its Expr: is_const, and cval (an integer's
 // bits, sign- or zero-extended from its type's width: ctypes.wrap) or
 // fcval (a floating value; a float's is rounded to float; a complex value's
-// real part, its imaginary part in fcimag). fold runs on a
+// real part, its imaginary part in fcimag), or xv (a long double's wider
+// than double: cldbl.ax, in the target's format, which fcval approximates;
+// a complex long double's imaginary part in xvim). fold runs on a
 // node once its operands are typed and converted, so constness is found
 // bottom-up; operations whose result is undefined (division by zero, an
 // overflowing conversion of a floating value) are left to run time. A
@@ -18,9 +20,11 @@
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "ccomplex.ax" as ccx;
+import "cldbl.ax" as cl;
 import "copts.ax" as co;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
+import "std/c/rt/ldouble" as ld;
 
 /// Sets e's value (is_const, cval or fcval) from its operands', if they are
 /// constant and e's operation can be done now.
@@ -99,13 +103,64 @@ fn set_from(e: *mut cast.Expr, x: *cast.Expr) void {
     e.cval = x.cval;
     e.fcval = x.fcval;
     e.fcimag = x.fcimag;
+    e.xv = x.xv;
+    e.xvim = x.xvim;
+}
+
+/// The format of a wide long double (cty.is_wide).
+pub fn ld_fmt() u32 {
+    return cl.fmt_of(cty.ld_bits());
+}
+
+// Sets e (of a wide long double type) to w.
+fn set_wide(e: *mut cast.Expr, w: ld.W) void {
+    e.is_const = true;
+    e.xv = w;
+    e.fcval = cl.to_f64(w, ld_fmt());
+}
+
+// Sets e (of a complex type whose parts are wide long doubles) to re + i im.
+fn set_cwide(e: *mut cast.Expr, re: ld.W, im: ld.W) void {
+    e.is_const = true;
+    e.xv = re;
+    e.xvim = im;
+    e.fcval = cl.to_f64(re, ld_fmt());
+    e.fcimag = cl.to_f64(im, ld_fmt());
+}
+
+/// Is t a complex type whose parts are wide long doubles?
+pub fn is_cwide(t: *cty.CType) bool {
+    return cty.is_complex(t) and cty.is_wide(t.unq.elem);
+}
+
+/// The value of constant x (of arithmetic type) as a wide long double:
+/// exact, from an integer, a float or a double (a complex value's real
+/// part).
+pub fn wide_value(x: *cast.Expr) ld.W {
+    let f = ld_fmt();
+    if cty.is_wide(x.ty) or is_cwide(x.ty) {
+        return x.xv;
+    }
+    if cty.is_floating(x.ty) or cty.is_complex(x.ty) {
+        return cl.of_f64(x.fcval, f);
+    }
+    if x.ty.is_signed and (x.ty.kind != cty.TK_BOOL) {
+        return cl.of_i64(@bit_cast(i64, x.cval), f);
+    }
+    return cl.of_u64(x.cval, f);
 }
 
 /// Is constant x (of arithmetic type) nonzero? (A complex value is when
 /// either part is: 6.3.1.2.)
 pub fn truth(x: *cast.Expr) bool {
+    if cty.is_complex(x.ty) and cty.is_wide(x.ty.elem) {
+        return cl.nonzero(x.xv, ld_fmt()) or cl.nonzero(x.xvim, ld_fmt());
+    }
     if cty.is_complex(x.ty) {
         return (x.fcval != 0.0) or (x.fcimag != 0.0);
+    }
+    if cty.is_wide(x.ty) {
+        return cl.nonzero(x.xv, ld_fmt());
     }
     if cty.is_floating(x.ty) {
         return x.fcval != 0.0;
@@ -124,10 +179,47 @@ fn as_float(x: *cast.Expr) f64 {
     return @float_from_int(f64, x.cval);
 }
 
+// The imaginary part of constant x (a complex value, or 0 for a real one)
+// as a wide long double.
+fn wide_imag(x: *cast.Expr) ld.W {
+    if is_cwide(x.ty) {
+        return x.xvim;
+    }
+    if cty.is_complex(x.ty) {
+        return cl.of_f64(x.fcimag, ld_fmt());
+    }
+    return cl.zero();
+}
+
+// Wide long double w as a value of real floating type t (rounded once).
+fn narrow_wide(w: ld.W, t: *cty.CType) f64 {
+    if t.kind == cty.TK_FLOAT {
+        return @as(f64, cl.to_f32(w, ld_fmt()));
+    }
+    return cl.to_f64(w, ld_fmt());
+}
+
 /// e (a conversion to an arithmetic type) of constant x: 6.3.1.
 fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
     let to = e.ty;
     let from = x.ty;
+    // (the parts of complex values as real ones, where a wide long double is one)
+    if is_cwide(to) {
+        set_cwide(e, wide_value(x), wide_imag(x));
+        return;
+    }
+    if cty.is_complex(to) and (is_cwide(from) or cty.is_wide(from)) {
+        set_complex(e, narrow_wide(wide_value(x), to.elem), narrow_wide(wide_imag(x), to.elem));
+        return;
+    }
+    if is_cwide(from) {
+        if to.kind == cty.TK_BOOL {
+            set_int(e, selu(truth(x), 1, 0));
+            return;
+        }
+        convert_wide(e, x);  // (the real part: 6.3.1.7p1)
+        return;
+    }
     if cty.is_complex(to) {
         // (6.3.1.6, 6.3.1.7: the parts converted as the real types are; a
         // real value's imaginary part is +0)
@@ -145,6 +237,10 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
             }
         }
         set_complex(e, re, 0.0);
+        return;
+    }
+    if cty.is_wide(from) or cty.is_wide(to) {
+        convert_wide(e, x);
         return;
     }
     if cty.is_integer(to) {
@@ -198,6 +294,39 @@ fn int_to_f32(x: *cast.Expr) f64 {
     return @as(f64, @float_from_int(f32, x.cval));
 }
 
+// convert, from or to a wide long double: correctly rounded (to float
+// once, not through double); to an integer only when the value fits.
+fn convert_wide(e: *mut cast.Expr, x: *cast.Expr) void {
+    let to = e.ty;
+    let f = ld_fmt();
+    if cty.is_wide(to) {
+        set_wide(e, wide_value(x));
+        return;
+    }
+    let w = x.xv;
+    if to.kind == cty.TK_BOOL {
+        set_int(e, selu(cl.nonzero(w, f), 1, 0));
+        return;
+    }
+    if cty.is_integer(to) {
+        if not cl.fits_int(w, to.bits, to.is_signed, f) {
+            return;  // (left to run time: 6.3.1.4p1)
+        }
+        if to.is_signed {
+            set_int(e, @bit_cast(u64, cl.to_i64(w, f)));
+        } else {
+            set_int(e, cl.to_u64(w, f));
+        }
+        return;
+    }
+    e.is_const = true;
+    if to.kind == cty.TK_FLOAT {
+        e.fcval = @as(f64, cl.to_f32(w, f));
+    } else {
+        e.fcval = cl.to_f64(w, f);
+    }
+}
+
 fn trunc_f(f: f64) f64 {
     if f < 0.0 {
         return -@floor(-f);
@@ -222,6 +351,17 @@ fn unary(e: *mut cast.Expr) void {
         set_int(e, selu(truth(x), 0, 1));
         return;
     }
+    if is_cwide(e.ty) {
+        let f = ld_fmt();
+        if op == ct.P_MINUS {
+            set_cwide(e, cl.negate(x.xv, f), cl.negate(x.xvim, f));
+        } else if op == ct.P_PLUS {
+            set_cwide(e, x.xv, x.xvim);
+        } else if op == ct.P_TILDE {
+            set_cwide(e, x.xv, cl.negate(x.xvim, f));
+        }
+        return;
+    }
     if cty.is_complex(e.ty) {
         if op == ct.P_MINUS {
             set_complex(e, -x.fcval, -x.fcimag);
@@ -229,6 +369,14 @@ fn unary(e: *mut cast.Expr) void {
             set_complex(e, x.fcval, x.fcimag);
         } else if op == ct.P_TILDE {
             set_complex(e, x.fcval, -x.fcimag);  // (the conjugate: an extension)
+        }
+        return;
+    }
+    if cty.is_wide(e.ty) {
+        if op == ct.P_MINUS {
+            set_wide(e, cl.negate(x.xv, ld_fmt()));
+        } else if op == ct.P_PLUS {
+            set_wide(e, x.xv);
         }
         return;
     }
@@ -282,6 +430,19 @@ fn binary(e: *mut cast.Expr) void {
     }
     if cty.is_complex(e.ty) {
         complex_op(e, op, a, b);
+        return;
+    }
+    if cty.is_wide(e.ty) {
+        let f = ld_fmt();
+        if op == ct.P_PLUS {
+            set_wide(e, cl.add(a.xv, b.xv, f));
+        } else if op == ct.P_MINUS {
+            set_wide(e, cl.sub(a.xv, b.xv, f));
+        } else if op == ct.P_STAR {
+            set_wide(e, cl.mul(a.xv, b.xv, f));
+        } else if op == ct.P_SLASH {
+            set_wide(e, cl.div(a.xv, b.xv, f));
+        }
         return;
     }
     if cty.is_floating(e.ty) {
@@ -353,10 +514,34 @@ pub fn is_compare(op: i32) bool {
 
 fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
     let t = a.ty;
+    if is_cwide(t) {
+        let f = ld_fmt();
+        let same = (cl.cmp(wide_value(a), wide_value(b), f) == 0) and (cl.cmp(wide_imag(a), wide_imag(b), f) == 0);
+        return same == (op == ct.P_EQ);
+    }
     if cty.is_complex(t) {
         // (== and != only: both parts equal, 6.5.9p4)
         let same = (a.fcval == b.fcval) and (a.fcimag == b.fcimag);
         return same == (op == ct.P_EQ);
+    }
+    if cty.is_wide(t) {
+        let c = cl.cmp(a.xv, b.xv, ld_fmt());  // (2: unordered, a NaN)
+        if op == ct.P_LT {
+            return c == -1;
+        }
+        if op == ct.P_GT {
+            return c == 1;
+        }
+        if op == ct.P_LE {
+            return (c == -1) or (c == 0);
+        }
+        if op == ct.P_GE {
+            return (c == 1) or (c == 0);
+        }
+        if op == ct.P_EQ {
+            return c == 0;
+        }
+        return c != 0;
     }
     if cty.is_floating(t) {
         let x = a.fcval;
@@ -404,7 +589,63 @@ fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
 
 // e = a op b in complex type e.ty, where a real operand stays real (G.5):
 // the parts as cgen_complex.ax computes them.
+// complex_op where the parts are wide long doubles: the same operations
+// (G.5: a real operand stays real), in that arithmetic.
+fn complex_wide_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
+    let f = ld_fmt();
+    let acx = cty.is_complex(a.ty);
+    let bcx = cty.is_complex(b.ty);
+    let x = wide_value(a);
+    let y = wide_value(b);
+    let xi = wide_imag(a);
+    let yi = wide_imag(b);
+    if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
+        let is_add = op == ct.P_PLUS;
+        let mut re = cl.sub(x, y, f);
+        if is_add {
+            re = cl.add(x, y, f);
+        }
+        let mut im = xi;
+        if acx and bcx {
+            im = cl.sub(xi, yi, f);
+            if is_add {
+                im = cl.add(xi, yi, f);
+            }
+        } else if bcx {
+            im = yi;
+            if not is_add {
+                im = cl.negate(yi, f);
+            }
+        }
+        set_cwide(e, re, im);
+        return;
+    }
+    if op == ct.P_STAR {
+        if not acx {
+            set_cwide(e, cl.mul(x, y, f), cl.mul(x, yi, f));
+        } else if not bcx {
+            set_cwide(e, cl.mul(x, y, f), cl.mul(xi, y, f));
+        } else {
+            let r = cl.cmul(x, xi, y, yi, f);
+            set_cwide(e, r[0], r[1]);
+        }
+        return;
+    }
+    if op == ct.P_SLASH {
+        if not bcx {
+            set_cwide(e, cl.div(x, y, f), cl.div(xi, y, f));
+        } else {
+            let r = cl.cdiv(x, xi, y, yi, f);
+            set_cwide(e, r[0], r[1]);
+        }
+    }
+}
+
 fn complex_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
+    if is_cwide(e.ty) {
+        complex_wide_op(e, op, a, b);
+        return;
+    }
     let s = e.ty.elem.kind == cty.TK_FLOAT;
     let acx = cty.is_complex(a.ty);
     let bcx = cty.is_complex(b.ty);

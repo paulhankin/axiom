@@ -72,6 +72,7 @@ Axiom in one program").
 | `--c-char=signed\|unsigned` | Whether plain `char` is signed (default: the target's C ABI). |
 | `--c-int=16\|32\|64` | The width of `int` (default 32). |
 | `--c-long=32\|64` | The width of `long` (default: the target's C ABI; at least `--c-int`). |
+| `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI; see "Floating types"). `80` is for `x86_64` (Linux) only; `128` for `x86_64` and `aarch64` (Linux) and WebAssembly. |
 | `-DNAME`, `-DNAME=value` | Define a macro (`NAME` is `NAME=1`). `-D'F(x)=x+1'` defines a function-like macro. |
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
 | `-Idir` | Add a directory to the include path. |
@@ -273,8 +274,10 @@ library's sources with the program, unless `--c-freestanding` is given:
   whose `export fn`s are generated only when something reaches them, and give way to a
   C unit's definition of the same name.
 
-Either directory may be missing: today `std/c/` holds only the headers, so a C program
-calls the system's library as before. A unit of the library is analyzed with the
+Either directory may be missing: today `std/c/` holds the headers and, in `std/c/rt/`,
+only `ldouble.ax` (the arithmetic of a `long double` wider than `double`, which every C
+program whose `long double` is wider loads, freestanding or not, and which exports no
+names), so a C program calls the system's library as before. A unit of the library is analyzed with the
 program's C options (`--c-std`, `--c-int`, ...).
 
 ## Standards
@@ -332,6 +335,7 @@ The compiler's own macros say what the build chose:
 |---|---|
 | `__AXIOM__` | 1 |
 | `__AXIOM_INT_WIDTH__`, `__AXIOM_LONG_WIDTH__` | The widths of `int` and `long` in bits. |
+| `__AXIOM_LDBL_WIDTH__` | The format of `long double`: 64 (binary64), 80 (the x87's) or 128 (binary128). |
 | `__AXIOM_PTR_WIDTH__` | The width of a pointer: 32 or 64. |
 | `__AXIOM_WCHAR_WIDTH__` | The width of `wchar_t`: 16 or 32. |
 | `__AXIOM_WCHAR_SIGNED__` | 1 if `wchar_t` is signed, else 0. |
@@ -351,7 +355,7 @@ files.
 
 ### Per target
 
-The defaults, which `--c-char`, `--c-int` and `--c-long` change. Types of the same width
+The defaults, which `--c-char`, `--c-int`, `--c-long` and `--c-long-double` change. Types of the same width
 may be spelled differently from the platform's headers (`size_t` is `unsigned int` on
 wasm32, `int64_t` is `long` on macOS): representation and calling convention are the
 same.
@@ -364,6 +368,21 @@ same.
 | `x86_64-windows` | signed | 32 | 32 | 64 | 64 | `unsigned long long` | `long long` | `unsigned short` | `long long` |
 | `wasm32` | signed | 32 | 32 | 64 | 32 | `unsigned int` | `int` | `int` | `long long` |
 | `wasm64` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long` |
+
+`long double` is the format of the target's C ABI:
+
+| Target | `long double` | Size, alignment | `LDBL_MANT_DIG` |
+|---|---|---|---|
+| `x86_64` (Linux) | the x87's 80-bit extended format | 16, 16 (10 bytes of value, 6 of padding) | 64 |
+| `aarch64` (Linux), `wasm32`, `wasm64` | IEEE 754 binary128 | 16, 16 | 113 |
+| `aarch64-macos`, `x86_64-windows` | binary64 (`double`'s) | 8, 8 | 53 |
+
+The WebAssembly C ABI makes `long double` binary128 too; this implementation follows it, so
+that the type has the size, alignment and range that C code built for WebAssembly
+expects. `--c-long-double=64` makes it `double` (as on the others), `=128` binary128
+(on `x86_64` Linux it then travels as the ABI's `__float128` does), `=80` the x87's.
+As with `--c-int`, the platform's library keeps its own: a program built with another
+format than the ABI's cannot pass `long double` values to it.
 
 `short` is 16 bits on every target. `intmax_t` is `int64_t`, and `intptr_t` is the signed
 type of `size_t`'s width. With `--c-int=16` or `--c-int=64` the headers choose types by width:
@@ -382,9 +401,9 @@ its own: a program built with other widths cannot pass such values to it.
 | Right shift of a negative value | Arithmetic (sign-extending): `-8 >> 1` is `-4`. |
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
 | Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. There are no imaginary types. |
-| Floating types | `float` and `double` are IEEE 754 binary32 and binary64. `long double` is `double`: the same size, alignment and `LDBL_*` values. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest); the rounding mode cannot be changed. |
+| Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest); the rounding mode cannot be changed. A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals; constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that. `#pragma pack` is ignored. |
-| `max_align_t` | A structure of a `long long` and a `long double`: size 16, alignment 8. |
+| `max_align_t` | A structure of a `long long` and a `long double`: size 32, alignment 16 where `long double` is 16 bytes, else size 16, alignment 8. |
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |
 | Bit-fields | Allocated from the least significant bit of a storage unit of the declared type; one never straddles two units. A plain `int` bit-field is signed. A `char` bit-field has `char`'s signedness. An unnamed bit-field takes space and adds nothing to the alignment of the structure; one of width 0 moves the next member to the next unit. |
 | Enumerations | The type is `unsigned int` if no enumerator is negative, else `int`, when all fit; the enumeration constants are `int`. In C23, if some enumerator does not fit `int`, the first of `long`, `long long` (`unsigned long`, `unsigned long long` for an unsigned type) that holds all of them, and then the constants have the enumerated type. Before C23 a value outside `int` is `C3013`. With a fixed underlying type (C23), that type. |
@@ -417,7 +436,7 @@ in an earlier mode is an `#error`.
 
 | Header | Modes | Notes |
 |---|---|---|
-| `<float.h>` | all | `FLT_`, `DBL_` and `LDBL_` macros. No `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`. |
+| `<float.h>` | all | `FLT_`, `DBL_` and `LDBL_` macros (the `LDBL_` ones and `DECIMAL_DIG` of the format of `long double`). No `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`. |
 | `<limits.h>` | all | `LLONG_` from C99; `*_WIDTH`, `BOOL_MAX` and `BITINT_MAXWIDTH` (64) in C23. |
 | `<stdarg.h>` | all | `va_list`, `va_start`, `va_arg`, `va_copy`, `va_end`. In C23 `va_start` needs no second argument. |
 | `<stddef.h>` | all | `size_t`, `ptrdiff_t`, `wchar_t`, `NULL`, `offsetof`; `max_align_t` from C11; `nullptr_t` and `unreachable` in C23. |
@@ -443,7 +462,6 @@ as the standard says.
 - Threads (`__STDC_NO_THREADS__`; there is no `<threads.h>`). `thread_local` and
   `_Thread_local` are accepted and checked, and such an object has static storage
   duration, as it would in a program with one thread.
-- `long double` wider than `double`.
 - The library, and Annex F, `<fenv.h>` and `<math.h>`: exception flags and rounding modes.
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions of any kind. These are all errors: `__attribute__`, `asm` and `__asm__`,
@@ -502,6 +520,13 @@ x86-64 System V, a homogeneous aggregate in two floating-point registers on AArc
 value in an integer register or by reference on Windows, by reference on WebAssembly);
 checked against the system's C compiler on `x86_64` and `aarch64` Linux.
 
+A `long double` travels as the ABI says for its format: the x87's in memory (System V's
+classes X87 and X87UP; a structure or union holding one is classified with them), its
+result in the x87 register `st(0)`; binary128 as AAPCS64's quad-precision type (in a `v`
+register, homogeneous aggregates of up to four included), as System V's `__float128` (SSE
+and SSEUP: one `xmm` register), and on WebAssembly as two `i64`s, its result through a
+pointer first parameter.
+
 `va_list` is the ABI's: an array of one structure on x86-64 System V, the AAPCS64
 structure on AArch64 Linux, and `char *` elsewhere, so it can be passed to the library's
 `v...` functions.
@@ -526,7 +551,12 @@ Known limits:
 
 Verified with a program that calls the C library's `ldiv` (a structure returned by
 value), `snprintf` and `printf` (variadic, `double` and `long long`) on `x86_64` Linux;
-the other targets are tested by the suite, not run by hand.
+the other targets are tested by the suite, not run by hand. `long double` (alone, in
+structures and unions, variadic, through function pointers, both ways, and the C
+library's `printf("%Lg")` and `strtold`) is tested against the system's C compiler on
+`x86_64` Linux and on `aarch64` Linux (under emulation), and with `--c-long-double=128`
+on `x86_64` against its `_Float128`; the WebAssembly signatures were compared with
+another compiler's for that target.
 
 ## Stack traces
 
@@ -619,7 +649,6 @@ claims less than the standard allows. None is hidden: each is said above or here
 - Annex F is not claimed. The floating types have IEC 60559 formats (`FLT_IS_IEC_60559`
   in `<float.h>`), but there are no exception flags or rounding modes; signaling NaNs are
   not guaranteed to stay signaling, so `<float.h>` has no `FLT_SNAN`.
-- `long double` is `double`.
 - Annex G is not claimed (`__STDC_IEC_559_COMPLEX__` is not defined): it needs Annex F,
   and before C23 the imaginary types, which are absent. Complex arithmetic follows it
   all the same where it can: a real operand of `+ - * /` with a complex one is not made

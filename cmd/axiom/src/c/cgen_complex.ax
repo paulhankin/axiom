@@ -20,11 +20,21 @@
 // internal linkage: no library or runtime provides them. ccomplex.ax is
 // the same algorithms for constant folding; the two must stay alike, one
 // operation for one.
+//
+// Where long double is wider than double (cty.is_wide), a long double
+// _Complex's parts are values as cgen_ld.ax has them: each the address of
+// its 16 bytes (a Pair of pointers), its arithmetic cgen_ld.ax's, and its
+// multiplication and division calls of std/c/rt/ldouble.ax's cmul and cdiv
+// (the same algorithms, which the compiler folds constants with too).
 // =============================================================================
 import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cgen.ax" as cg;
+import "cgen_ld.ax" as gld;
+import "cldbl.ax" as cl;
+import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
+import "std/c/rt/ldouble" as ld;
 
 /// The parts of a complex value (im nil: a real operand).
 pub struct Pair {
@@ -44,9 +54,18 @@ fn mark(v: *mut ir.Value, t: *cty.CType, al: u64) void {
     }
 }
 
+// Are v's parts wide long doubles (addresses)?
+fn wide(v: Pair) bool {
+    return v.re.ty.kind == ir.T_PTR;
+}
+
 /// The parts of the complex value of type t at p (volatile: as t says).
 pub fn parts(t: *cty.CType, p: *mut ir.Value) Pair {
     let el = t.unq.elem;
+    if cty.is_wide(el) {
+        let vol = (t.quals & cty.Q_VOLATILE) != 0;
+        return Pair.{ re: gld.snapshot(p, vol), im: gld.snapshot(ir.ptradd(cg.B, p, cg.usz(16)), vol) };
+    }
     let rt = cg.lty(el);
     let al = cty.align_of(el);
     let re = ir.load(cg.B, rt, p);
@@ -59,6 +78,12 @@ pub fn parts(t: *cty.CType, p: *mut ir.Value) Pair {
 /// Stores the complex value v (both parts) as one of type t at p.
 pub fn put(t: *cty.CType, v: Pair, p: *mut ir.Value) void {
     let el = t.unq.elem;
+    if cty.is_wide(el) {
+        let vol = (t.quals & cty.Q_VOLATILE) != 0;
+        gld.copy(p, v.re, vol);
+        gld.copy(ir.ptradd(cg.B, p, cg.usz(16)), v.im, vol);
+        return;
+    }
     let al = cty.align_of(el);
     let s1 = ir.store(cg.B, v.re, p);
     mark(s1, t, al);
@@ -71,6 +96,11 @@ pub fn make(t: *mut cty.CType, v: Pair) *mut ir.Value {
     let tmp = cg.alloca(t.unq, "cx");
     put(t.unq, v, tmp);
     return tmp;
+}
+
+/// The constant re + i im of complex type t whose parts are wide long doubles.
+pub fn constant_wide(t: *mut cty.CType, re: ld.W, im: ld.W) *mut ir.Value {
+    return make(t, Pair.{ re: gld.constant(re), im: gld.constant(im) });
 }
 
 /// The constant re + i im of complex type t.
@@ -87,12 +117,21 @@ pub fn snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
 
 /// The truth of complex value v (6.3.1.2: unequal to 0, either part), as an i1.
 pub fn truth(v: Pair) *mut ir.Value {
+    if wide(v) {
+        return ir.or_(cg.B, gld.truth(v.re), gld.truth(v.im));
+    }
     let z = ir.cfp(v.re.ty, 0.0);
     return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, v.re, z), ir.fcmp(cg.B, ir.RealUNE, v.im, z));
 }
 
 /// x == y (both complex: both parts equal, 6.5.9p4), as an i1; ne: x != y.
 pub fn equal(x: Pair, y: Pair, ne: bool) *mut ir.Value {
+    if wide(x) {
+        if ne {
+            return ir.or_(cg.B, gld.compare(ct.P_NE, x.re, y.re), gld.compare(ct.P_NE, x.im, y.im));
+        }
+        return ir.and_(cg.B, gld.compare(ct.P_EQ, x.re, y.re), gld.compare(ct.P_EQ, x.im, y.im));
+    }
     if ne {
         return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, x.re, y.re), ir.fcmp(cg.B, ir.RealUNE, x.im, y.im));
     }
@@ -101,11 +140,17 @@ pub fn equal(x: Pair, y: Pair, ne: bool) *mut ir.Value {
 
 /// -v.
 pub fn negate(v: Pair) Pair {
+    if wide(v) {
+        return Pair.{ re: gld.negate(v.re), im: gld.negate(v.im) };
+    }
     return Pair.{ re: ir.fneg(cg.B, v.re), im: ir.fneg(cg.B, v.im) };
 }
 
 /// The conjugate of v.
 pub fn conj(v: Pair) Pair {
+    if wide(v) {
+        return Pair.{ re: v.re, im: gld.negate(v.im) };
+    }
     return Pair.{ re: v.re, im: ir.fneg(cg.B, v.im) };
 }
 
@@ -122,6 +167,9 @@ pub const OP_DIV: i32 = 4;
 /// x op y in complex type t (op: OP_ADD ... OP_DIV), either operand maybe
 /// real (G.5).
 pub fn arith(op: i32, t: *mut cty.CType, x: Pair, y: Pair) Pair {
+    if wide(x) {
+        return arith_wide(op, x, y);
+    }
     let xr = u.isnil(x.im);
     let yr = u.isnil(y.im);
     if op == OP_ADD {
@@ -159,6 +207,54 @@ pub fn arith(op: i32, t: *mut cty.CType, x: Pair, y: Pair) Pair {
         xi = ir.cfp(x.re.ty, 0.0);  // (x / (u + iv) as (x + i0) / (u + iv))
     }
     return call_helper(t, false, x.re, xi, y.re, y.im);
+}
+
+// arith where the parts are wide long doubles: the same operations, in
+// cgen_ld.ax's arithmetic; a complex product or quotient by ldouble.ax's
+// cmul and cdiv (ccomplex.ax's algorithms).
+fn arith_wide(op: i32, x: Pair, y: Pair) Pair {
+    let xr = u.isnil(x.im);
+    let yr = u.isnil(y.im);
+    let mut cop = ct.P_PLUS;
+    if op == OP_SUB {
+        cop = ct.P_MINUS;
+    } else if op == OP_MUL {
+        cop = ct.P_STAR;
+    } else if op == OP_DIV {
+        cop = ct.P_SLASH;
+    }
+    if (op == OP_ADD) or (op == OP_SUB) {
+        let re = gld.arith(cop, x.re, y.re);
+        if xr {
+            if op == OP_SUB {
+                return Pair.{ re: re, im: gld.negate(y.im) };
+            }
+            return Pair.{ re: re, im: y.im };
+        }
+        if yr {
+            return Pair.{ re: re, im: x.im };
+        }
+        return Pair.{ re: re, im: gld.arith(cop, x.im, y.im) };
+    }
+    if op == OP_MUL {
+        if xr {
+            return Pair.{ re: gld.arith(cop, x.re, y.re), im: gld.arith(cop, x.re, y.im) };
+        }
+        if yr {
+            return Pair.{ re: gld.arith(cop, x.re, y.re), im: gld.arith(cop, x.im, y.re) };
+        }
+        let r = gld.complex_call("cmul", x.re, x.im, y.re, y.im);
+        return Pair.{ re: r[0], im: r[1] };
+    }
+    if yr {
+        return Pair.{ re: gld.arith(cop, x.re, y.re), im: gld.arith(cop, x.im, y.re) };
+    }
+    let mut xi = x.im;
+    if xr {
+        xi = gld.constant(cl.zero());  // (x / (u + iv) as (x + i0) / (u + iv))
+    }
+    let r = gld.complex_call("cdiv", x.re, xi, y.re, y.im);
+    return Pair.{ re: r[0], im: r[1] };
 }
 
 // (a + ib)(c + id) in line; the helper when both parts are NaN.

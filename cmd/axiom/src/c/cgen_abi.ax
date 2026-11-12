@@ -27,9 +27,17 @@
 // a structure (float _Complex: one SSE eightbyte, double _Complex: two),
 // AAPCS64 makes it a homogeneous aggregate of two members, Windows x64 and
 // the WebAssembly C ABI pass it as they pass the structure (by value in 8
-// bytes, else by reference; by reference). (System V gives long double
-// _Complex the class COMPLEX_X87 when long double is the x87 type: not so
-// here, where long double is double.)
+// bytes, else by reference; by reference). System V gives long double
+// _Complex the class COMPLEX_X87 when long double is the x87 type: in
+// memory as an argument, its result in st(0) and st(1) (R_X87).
+//
+// A long double wider than double (cty.is_wide) is a value in memory, as a
+// structure is, and travels as the ABIs say for its format: the x87's
+// (System V classes X87 and X87UP) in memory, its result in st(0)
+// (R_X87); binary128 as System V's SSE and SSEUP (one xmm register), as
+// AAPCS64's quad-precision floating-point type (a v register, members of
+// homogeneous aggregates too), and on WebAssembly as two i64s, its result
+// through the pointer, as that platform's C convention has it.
 //
 // The backends pass scalar IR parameters as the C ABIs do (rdi, rsi, ...; in
 // order of each register class, then the stack), so a structure here is
@@ -92,6 +100,7 @@ pub const R_SCALAR: i32 = 1;  // a scalar: the IR result
 pub const R_PIECE: i32 = 2;   // a structure or union: one scalar, the IR result
 pub const R_REGS: i32 = 3;    // a structure or union in several registers: IN_CALL_RESULT (ir.EXT_REGS)
 pub const R_SRET: i32 = 4;    // a structure or union in the caller's memory, whose address is parameter 0
+pub const R_X87: i32 = 5;     // on the x87 stack: st(0) (rn 1), or st(0) and st(1) (rn 2: COMPLEX_X87)
 
 // What an IR parameter is (Plan.what).
 pub const SL_ARG: i32 = 0;     // (a piece of) an argument
@@ -145,6 +154,12 @@ pub struct Plan {
     fty: *mut ir.Ty,
 }
 
+/// The IR type of a 16-byte floating-point piece (binary128): a 128-bit
+/// vector, which the backends pass in a vector register.
+pub fn quad_ty() *mut ir.Ty {
+    return ir.t_vec(ir.t_int(64), 2);
+}
+
 // The IR type of a scalar C type.
 fn scalar_ty(t0: *cty.CType) *mut ir.Ty {
     let t = t0.unq;
@@ -189,9 +204,9 @@ fn int_piece(n: u64) *mut ir.Ty {
 }
 
 /// Does a value of type t travel as an aggregate (its memory: a structure,
-/// a union, or a complex type)?
+/// a union, a complex type, or a wide long double)?
 pub fn aggregate(t: *cty.CType) bool {
-    return cty.is_record(t) or cty.is_complex(t);
+    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t);
 }
 
 // -----------------------------------------------------------------------------
@@ -204,6 +219,7 @@ struct Leaf {
     off: u64,
     size: u64,
     fp: bool,
+    x87: bool,  // the x87's long double (its 16 bytes)
 }
 
 const MAX_LEAVES: usize = 64;
@@ -245,7 +261,8 @@ fn add_leaves(t0: *cty.CType, off: u64, l: *mut Leaves) void {
         l.ok = false;
         return;
     }
-    l.xs[l.n] = Leaf.{ off: off, size: cty.size_of(t), fp: cty.is_floating(t) };
+    l.xs[l.n] = Leaf.{ off: off, size: cty.size_of(t), fp: cty.is_floating(t), x87: cty.is_wide(t) and
+                       (cty.ld_bits() == 80) };
     l.n += 1;
 }
 
@@ -255,8 +272,18 @@ fn leaves_of(t: *cty.CType, l: *mut Leaves) void {
     add_leaves(t, 0, l);
 }
 
-// The members of a homogeneous floating-point aggregate (AAPCS64): its
-// count (1 to 4) and their size (4 or 8), or count 0.
+// The IR type of an HFA's members: a float, a double, or a binary128 (a
+// quad-precision register: a 128-bit vector).
+fn hfa_elem(h: Hfa) *mut ir.Ty {
+    if h.es == 16 {
+        return quad_ty();
+    }
+    return ir.t_float(@truncate(i32, @bit_cast(i64, h.es * 8)));
+}
+
+// The members of a homogeneous floating-point aggregate (AAPCS64, a
+// binary128 long double alone counted as one): its count (1 to 4) and
+// their size (4, 8 or 16), or count 0.
 struct Hfa {
     n: u64,
     es: u64,
@@ -265,7 +292,7 @@ struct Hfa {
 fn hfa_of(t: *cty.CType) Hfa {
     let none = Hfa.{ n: 0, es: 0 };
     let size = cty.size_of(t);
-    if not aggregate(t) or (size == 0) or (size > 32) {
+    if not aggregate(t) or (size == 0) or (size > 64) {
         return none;
     }
     let l = u.new.[Leaves]();
@@ -304,15 +331,43 @@ fn hfa_of(t: *cty.CType) Hfa {
 const C_NONE: u8 = 0;
 const C_INT: u8 = 1;
 const C_SSE: u8 = 2;
+const C_SSEUP: u8 = 3;
+const C_X87: u8 = 4;
+const C_X87UP: u8 = 5;
+const C_MEM: u8 = 6;
 
 struct Classes {
     n: usize,  // 0: MEMORY
     c: [2]u8,
     fsize: [2]u64,  // the bytes of floating-point data in each SSE eightbyte
+    x87: bool,      // X87 and X87UP: MEMORY as an argument, st(0) as a result
+}
+
+// Two classes of one eightbyte merged (System V ABI 3.2.3, "merge").
+fn merge(a: u8, b: u8) u8 {
+    if a == b {
+        return a;
+    }
+    if a == C_NONE {
+        return b;
+    }
+    if b == C_NONE {
+        return a;
+    }
+    if (a == C_MEM) or (b == C_MEM) {
+        return C_MEM;
+    }
+    if (a == C_INT) or (b == C_INT) {
+        return C_INT;
+    }
+    if (a == C_X87) or (a == C_X87UP) or (b == C_X87) or (b == C_X87UP) {
+        return C_MEM;
+    }
+    return C_SSE;
 }
 
 fn classify_sysv(t: *cty.CType) Classes {
-    let mem = Classes.{ n: 0, c: [C_NONE, C_NONE], fsize: [0, 0] };
+    let mem = Classes.{ n: 0, c: [C_NONE, C_NONE], fsize: [0, 0], x87: false };
     let size = cty.size_of(t);
     if (size == 0) or (size > 16) {
         return mem;
@@ -322,7 +377,7 @@ fn classify_sysv(t: *cty.CType) Classes {
     if not l.ok {
         return mem;
     }
-    let mut r = Classes.{ n: @truncate(usize, (size + 7) / 8), c: [C_NONE, C_NONE], fsize: [0, 0] };
+    let mut r = Classes.{ n: @truncate(usize, (size + 7) / 8), c: [C_NONE, C_NONE], fsize: [0, 0], x87: false };
     for i in 0..l.n {
         let x = l.xs[i];
         if (x.size > 0) and ((x.off % x.size) != 0) {
@@ -332,17 +387,46 @@ fn classify_sysv(t: *cty.CType) Classes {
         if k >= r.n {
             continue;
         }
-        if x.fp {
-            if r.c[k] == C_NONE {
-                r.c[k] = C_SSE;
+        if x.size == 16 {
+            // a long double: X87 and X87UP, or binary128's SSE and SSEUP
+            if x.x87 {
+                r.c[0] = merge(r.c[0], C_X87);
+                r.c[1] = merge(r.c[1], C_X87UP);
+            } else {
+                r.c[0] = merge(r.c[0], C_SSE);
+                r.c[1] = merge(r.c[1], C_SSEUP);
+                r.fsize[0] = 8;
             }
+        } else if x.fp {
+            r.c[k] = merge(r.c[k], C_SSE);
             let end = (x.off % 8) + x.size;
             if end > r.fsize[k] {
                 r.fsize[k] = end;
             }
         } else {
-            r.c[k] = C_INT;
+            r.c[k] = merge(r.c[k], C_INT);
         }
+    }
+    // post-merger cleanup: MEMORY if any is; X87UP only after X87, SSEUP
+    // only after SSE (or else SSE)
+    for k in 0..r.n {
+        if r.c[k] == C_MEM {
+            return mem;
+        }
+    }
+    if (r.n == 2) and (r.c[1] == C_X87UP) {
+        if r.c[0] != C_X87 {
+            return mem;
+        }
+        r.x87 = true;
+        return r;
+    }
+    if (r.c[0] == C_X87) or (r.c[0] == C_X87UP) {
+        return mem;
+    }
+    if (r.n == 2) and (r.c[1] == C_SSEUP) and (r.c[0] != C_SSE) {
+        r.c[1] = C_SSE;
+        r.fsize[1] = 8;
     }
     // (an eightbyte of padding only: the last is left out, another passed as INTEGER)
     if (r.n == 2) and (r.c[1] == C_NONE) {
@@ -354,6 +438,26 @@ fn classify_sysv(t: *cty.CType) Classes {
         }
     }
     return r;
+}
+
+// Is t a binary128 long double, or a structure or union that is one (a
+// WebAssembly single-element structure of that type)?
+fn wasm_quad(t: *cty.CType) bool {
+    if not aggregate(t) or (cty.size_of(t) != 16) {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return false;
+    }
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if (x.off != 0) or (x.size != 16) or not x.fp {
+            return false;
+        }
+    }
+    return true;
 }
 
 // The type of a WebAssembly single-scalar structure or union (a member, or
@@ -416,8 +520,9 @@ fn item(ty: *mut ir.Ty, ext: u8, what: i32, arg: i32, piece: usize) Item {
     return Item.{ ty: ty, ext: ext, what: what, arg: arg, piece: piece };
 }
 
+// A floating-point piece (in a floating-point or vector register).
 fn is_fp_ty(t: *ir.Ty) bool {
-    return t.kind == ir.T_FLOAT;
+    return (t.kind == ir.T_FLOAT) or (t.kind == ir.T_VEC);
 }
 
 fn new_plan(ret: *mut cty.CType, n: usize) *mut Plan {
@@ -439,6 +544,13 @@ fn new_plan(ret: *mut cty.CType, n: usize) *mut Plan {
 fn eightbyte_pieces(a: *mut ArgPlan, t: *cty.CType, cl: *Classes) void {
     let size = cty.size_of(t);
     a.kind = A_PIECES;
+    if (cl.n == 2) and (cl.c[0] == C_SSE) and (cl.c[1] == C_SSEUP) {
+        // (SSE and SSEUP: one 16-byte piece in one register)
+        set_n(a, 1);
+        a.pieces[0] = Piece.{ ty: quad_ty(), off: 0 };
+        a.span = 16;
+        return;
+    }
     set_n(a, cl.n);
     for k in 0..cl.n {
         let off = @as(u64, k) * 8;
@@ -553,13 +665,13 @@ fn sysv_arg(b: *mut Builder, i: usize) void {
         return;
     }
     let cl = classify_sysv(t);
-    if cl.n > 0 {
+    if (cl.n > 0) and not cl.x87 {
         let mut g: u64 = 0;
         let mut f: u64 = 0;
         for k in 0..cl.n {
             if cl.c[k] == C_SSE {
                 f += 1;
-            } else {
+            } else if cl.c[k] == C_INT {
                 g += 1;
             }
         }
@@ -571,7 +683,8 @@ fn sysv_arg(b: *mut Builder, i: usize) void {
             return;
         }
     }
-    // MEMORY, or no registers left for all of it: its image on the stack
+    // MEMORY (X87 and X87UP too), or no registers left for all of it: its
+    // image on the stack
     chunk_pieces(a, t);
     pad_stack(b, cty.align_of(t), false, true);
     b.soff += @as(u64, a.n) * 8;
@@ -641,7 +754,7 @@ fn a64_arg(b: *mut Builder, i: usize, darwin_va: bool) void {
         if (b.nf + h.n) <= 8 {
             a.kind = A_PIECES;
             set_n(a, @truncate(usize, h.n));
-            let et = ir.t_float(@truncate(i32, @bit_cast(i64, h.es * 8)));
+            let et = hfa_elem(h);
             for k in 0..a.n {
                 a.pieces[k] = Piece.{ ty: et, off: @as(u64, k) * h.es };
             }
@@ -731,6 +844,25 @@ fn stack_bytes(b: *mut Builder, size: u64, packed: bool) void {
 fn wasm_arg(b: *mut Builder, i: usize, in_buffer: bool) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
+    if wasm_quad(t) {
+        // binary128 (alone, or all of a structure): two i64s
+        a.kind = A_PIECES;
+        set_n(a, 2);
+        a.pieces[0] = Piece.{ ty: ir.t_int(64), off: 0 };
+        a.pieces[1] = Piece.{ ty: ir.t_int(64), off: 8 };
+        a.span = 16;
+        if in_buffer {
+            // (16 bytes, aligned to 16)
+            let off = cty.round_up(b.soff, 16);
+            a.va_off = off;
+            a.slot[0] = -1;
+            a.slot[1] = -1;
+            b.soff = off + 16;
+            return;
+        }
+        push_pieces(b, i, false);
+        return;
+    }
     if not aggregate(t) {
         set_scalar(a, t);
     } else {
@@ -777,7 +909,20 @@ fn set_result(b: *mut Builder) void {
     let a = u.new.[ArgPlan]();
     a.ty = t;
     if ab == ABI_SYSV {
+        if cty.is_complex(t) and cty.is_wide(t.unq.elem) and (cty.ld_bits() == 80) {
+            // (COMPLEX_X87: the real part in st(0), the imaginary part in
+            // st(1); as an argument, MEMORY, as classify_sysv finds)
+            p.ret = R_X87;
+            p.rn = 2;
+            return;
+        }
         let cl = classify_sysv(t);
+        if cl.x87 {
+            // (X87 and X87UP: in st(0))
+            p.ret = R_X87;
+            p.rn = 1;
+            return;
+        }
         if cl.n > 0 {
             eightbyte_pieces(a, t, &cl);
             set_pieces_result(b, a);
@@ -805,7 +950,7 @@ fn set_result(b: *mut Builder) void {
         let h = hfa_of(t);
         if h.n > 0 {
             set_n(a, @truncate(usize, h.n));
-            let et = ir.t_float(@truncate(i32, @bit_cast(i64, h.es * 8)));
+            let et = hfa_elem(h);
             for k in 0..a.n {
                 a.pieces[k] = Piece.{ ty: et, off: @as(u64, k) * h.es };
             }
@@ -826,7 +971,7 @@ fn set_result(b: *mut Builder) void {
         return;
     }
     let st = single_scalar(t);
-    if u.notnil(st) {
+    if u.notnil(st) and not wasm_quad(t) {
         set_n(a, 1);
         a.pieces[0] = Piece.{ ty: st, off: 0 };
         a.span = st.size;
@@ -983,7 +1128,10 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
 fn pads(b: *mut Builder, fp: bool, n: u64) void {
     for k in 0..n {
         _ = k;
-        if fp {
+        if fp and (cty.ld_bits() == 128) {
+            // (a binary128 variadic argument fills the whole register)
+            b.regs.push(item(quad_ty(), 0, SL_PAD_FP, -1, 0));
+        } else if fp {
             b.regs.push(item(ir.t_float(64), 0, SL_PAD_FP, -1, 0));
         } else {
             b.regs.push(item(ir.t_int(64), 0, SL_PAD_GP, -1, 0));
