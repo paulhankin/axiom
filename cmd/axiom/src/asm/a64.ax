@@ -1,5 +1,5 @@
 // =============================================================================
-// asm/a64.ax - an AArch64 assembler: the GNU assembler's syntax for A64
+// asm/a64.ax - an AArch64 assembler: the conventional assembler's syntax for A64
 // (`op dst, src...`, registers x0-x30, w0-w30, sp, xzr; v0-v31 as b, h, s,
 // d, q or with an arrangement; immediates with or without '#'; addressing
 // [xn], [xn, #imm], [xn, #imm]!, [xn], #imm, [xn, xm, lsl #s], [xn, wm,
@@ -26,6 +26,7 @@ import "../a64enc.ax" as ae;
 import "../elf.ax" as elf;
 import "../target.ax" as tg;
 import "../util.ax" as u;
+import "a64sysreg.ax" as sr;
 import "core.ax" as cr;
 import "inline.ax" as ai;
 
@@ -2076,16 +2077,11 @@ fn lse(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
 // -----------------------------------------------------------------------------
 // The system registers programs read and write: their o0:op1:CRn:CRm:op2
 // (op0's low bit first: 15 bits).
-let SYSREGS: [14][]u8 = ["tpidr_el0", "tpidrro_el0", "fpcr", "fpsr", "nzcv", "cntvct_el0", "cntfrq_el0", "cntpct_el0",
-                         "dczid_el0", "ctr_el0", "midr_el1", "mpidr_el1", "dit", "rndr"];
-let SYSENC: [14]u64 = [0x5e82, 0x5e83, 0x5a20, 0x5a21, 0x5a10, 0x5f02, 0x5f00, 0x5f01, 0x5807, 0x5801, 0x4000, 0x4005,
-                       0x5a15, 0x5920];
-
 // A system register's encoding (the 15 bits of mrs/msr from bit 5), or -1.
 fn sysreg(n: []u8) i64 {
-    for k in 0..SYSREGS.len {
-        if u.str_eq(n, SYSREGS[k]) {
-            return @bit_cast(i64, SYSENC[k]);
+    for k in 0..sr.NAMES.len {
+        if u.str_eq(n, sr.NAMES[k]) {
+            return @bit_cast(i64, sr.ENC[k]);
         }
     }
     // s<op0>_<op1>_c<n>_c<m>_<op2>
@@ -2199,6 +2195,28 @@ fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
         let base = u64_pick(m[1] == 'm', 0xd50330bf, u64_pick(m[0] == 'd', 0xd503309f, 0xd50330df));
         w32(A, base | (crm << 8));
         return true;
+    }
+    if u.str_eq(m, "msr") and (ops.len == 2) and (ops[1].kind == AK_IMM) {
+        // the pstate-immediate form: msr <field>, #imm
+        let fields = ["spsel", "daifset", "daifclr", "uao", "pan", "dit", "ssbs", "tco", "allint", "svcrsm", "svcrza",
+                      "svcrsmza"];
+        let fop1: [12]u64 = [0, 3, 3, 0, 0, 3, 3, 3, 1, 3, 3, 3];
+        let fop2: [12]u64 = [5, 6, 7, 3, 4, 6, 6, 7, 0, 3, 4, 5];
+        let mut fi: i64 = -1;
+        for k in 0..fields.len {
+            if u.str_eq(ops[0].name, fields[k]) {
+                fi = @int_cast(i64, k);
+            }
+        }
+        if fi >= 0 {
+            let x = konst(A, &ops[1], "the pstate immediate");
+            if not range(A, x, 0, 15, "the pstate immediate") {
+                return true;
+            }
+            let k = @int_cast(usize, fi);
+            w32(A, (((0xd500401f | (fop1[k] << 16)) | (@bit_cast(u64, x) << 8)) | (fop2[k] << 5)));
+            return true;
+        }
     }
     if u.str_eq(m, "mrs") or u.str_eq(m, "msr") {
         if not n_ops(A, ops, 2, m) {

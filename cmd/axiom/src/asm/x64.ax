@@ -1,5 +1,5 @@
 // =============================================================================
-// asm/x64.ax - an x86-64 assembler: the AT&T syntax of the GNU assembler
+// asm/x64.ax - an x86-64 assembler: the AT&T syntax of the conventional assembler
 // (operands source first, `%reg`, `$imm`, `disp(base, index, scale)`,
 // `%fs:` segment overrides, `*` for indirect jumps and calls, operand-size
 // suffixes b, w, l, q), into machine code, for inline assembly and
@@ -25,14 +25,29 @@ import "../target.ax" as tg;
 import "../util.ax" as u;
 import "core.ax" as cr;
 import "inline.ax" as ai;
+import "x64tab.ax" as xt;
 
 // Operand kinds
 const XK_NONE: u8 = 0;
 const XK_REG: u8 = 1;
 const XK_IMM: u8 = 2;
 const XK_MEM: u8 = 3;
+const XK_RC: u8 = 4;  // an AVX-512 rounding operand: {rn-sae} {rd-sae} {ru-sae} {rz-sae} (v.k 0-3), {sae} (4)
 
-const RIP: i32 = 99;
+const RIP: i32 = 999;
+
+// Register numbers beyond the general ones (XOp.reg), each class at a
+// multiple of 16 so that the low four bits are the encoding's: vector
+// registers xmm/ymm/zmm 0-31 from 16, mask registers k0-k7 from 48, MMX
+// from 64, x87 st(0)-st(7) from 80, segment registers (es cs ss ds fs gs)
+// from 96, control registers from 112, debug registers from 128.
+const R_VEC: i32 = 16;
+const R_K: i32 = 48;
+const R_MM: i32 = 64;
+const R_ST: i32 = 80;
+const R_SEG: i32 = 96;
+const R_CR: i32 = 112;
+const R_DR: i32 = 128;
 
 struct XOp {
     kind: u8,
@@ -47,20 +62,74 @@ struct XOp {
     a32: bool,   // 32-bit address registers (prefix 0x67)
     v: cr.Val,   // XK_MEM: the displacement; XK_IMM: the value
     bare: bool,  // XK_MEM written as an expression alone (a jump's or call's target)
+    mask: i32,   // {%kN}: N (0 none)
+    zero: bool,  // {z}
+    bcst: u32,   // XK_MEM {1toN}: N (0 none)
+    vix: bool,   // XK_MEM: the index is a vector register (VSIB)
 }
 
 fn none_op() XOp {
     return XOp.{ kind: XK_NONE, reg: -1, bits: 0, hi8: false, star: false, base: -1, index: -1, scale: 1, seg: 0,
-                 a32: false, v: cr.konst(0), bare: false };
+                 a32: false, v: cr.konst(0), bare: false, mask: 0, zero: false, bcst: 0, vix: false };
 }
 
 // -----------------------------------------------------------------------------
 // Operands
 // -----------------------------------------------------------------------------
+// A register of the classes beyond the general ones and xmm0-15: its
+// number (R_VEC ...) and width, or -1.
+fn xreg(n: []u8, bits: *mut u32) i32 {
+    let pre = ["xmm", "ymm", "zmm"];
+    let w: [3]u32 = [128, 256, 512];
+    for k in @as(usize, 0)..3 {
+        if u.starts(n, pre[k]) {
+            let x = ai.num(n[3..]);
+            if (x >= 0) and (x < 32) {
+                bits.* = w[k];
+                return R_VEC + @int_cast(i32, x);
+            }
+        }
+    }
+    let one = [["k", "8"], ["mm", "8"], ["cr", "16"], ["dr", "16"], ["db", "16"]];
+    let base: [5]i32 = [R_K, R_MM, R_CR, R_DR, R_DR];
+    for k in @as(usize, 0)..5 {
+        let p = one[k][0];
+        if u.starts(n, p) and (n.len > p.len) {
+            let x = ai.num(n[p.len..]);
+            let lim = u.atol(one[k][1]);
+            if (x >= 0) and (x < lim) {
+                bits.* = 64;
+                return base[k] + @int_cast(i32, x);
+            }
+        }
+    }
+    let segs = ["es", "cs", "ss", "ds", "fs", "gs"];
+    for k in @as(usize, 0)..6 {
+        if u.str_eq(n, segs[k]) {
+            bits.* = 16;
+            return R_SEG + @int_cast(i32, k);
+        }
+    }
+    if u.str_eq(n, "st") {
+        bits.* = 80;
+        return R_ST;
+    }
+    return -1;
+}
+
 fn reg_of(A: *mut cr.Asm, n: []u8, op: *mut XOp) bool {
     let r = ai.x86_reg(n);
     if r.reg < 0 {
-        return false;
+        let mut bits: u32 = 0;
+        let x = xreg(n, &mut bits);
+        if x < 0 {
+            return false;
+        }
+        op.kind = XK_REG;
+        op.reg = x;
+        op.bits = bits;
+        _ = A;
+        return true;
     }
     op.kind = XK_REG;
     op.reg = r.reg;
@@ -104,6 +173,45 @@ fn parse_op(A: *mut cr.Asm, s0: []u8) XOp {
         cr.fail(A, "an operand is missing");
         return op;
     }
+    // AVX-512 decorations: {%kN}, {z}, {1toN}; a rounding operand {rn-sae}
+    while (s.len > 0) and (s[s.len - 1] == '}') {
+        let ob = u.rfind(s, '{');
+        if ob < 0 {
+            break;
+        }
+        let d = cr.lower(cr.trim(s[@int_cast(usize, ob) + 1..s.len - 1]));
+        s = cr.trim(s[0..@int_cast(usize, ob)]);
+        if s.len == 0 {
+            let rcs = ["rn-sae", "rd-sae", "ru-sae", "rz-sae", "sae"];
+            for k in 0..rcs.len {
+                if u.str_eq(d, rcs[k]) {
+                    op.kind = XK_RC;
+                    op.v = cr.konst(@int_cast(i64, k));
+                    return op;
+                }
+            }
+            cr.fail(A, u.f1("'{%s}' is not an operand", d));
+            return op;
+        }
+        if u.str_eq(d, "z") {
+            op.zero = true;
+        } else if (d.len == 3) and (d[0] == '%') and (d[1] == 'k') and (d[2] >= '0') and (d[2] <= '7') {
+            op.mask = @as(i32, d[2] - '0');
+            if op.mask == 0 {
+                cr.fail(A, "{%k0} is not a mask (k0 means no masking)");
+                return op;
+            }
+        } else if u.starts(d, "1to") and (ai.num(d[3..]) > 0) {
+            op.bcst = @truncate(u32, @bit_cast(u64, ai.num(d[3..])));
+        } else {
+            cr.fail(A, u.f1("'{%s}' is not a decoration of an operand", d));
+            return op;
+        }
+    }
+    if s.len == 0 {
+        cr.fail(A, "an operand is missing");
+        return op;
+    }
     if s[0] == '*' {
         op.star = true;
         s = cr.trim(s[1..]);
@@ -125,6 +233,13 @@ fn parse_op(A: *mut cr.Asm, s0: []u8) XOp {
             }
             s = cr.trim(rest[1..]);
         } else {
+            if u.str_eq(n, "st") and (rest.len == 3) and (rest[0] == '(') and (rest[2] == ')') and (rest[1] >= '0') and
+               (rest[1] <= '7') {
+                op.kind = XK_REG;
+                op.reg = R_ST + @as(i32, rest[1] - '0');
+                op.bits = 80;
+                return op;
+            }
             if rest.len > 0 {
                 cr.fail(A, u.f1("unexpected '%s' after a register", rest));
                 return op;
@@ -188,6 +303,17 @@ fn parse_op(A: *mut cr.Asm, s0: []u8) XOp {
                     continue;
                 }
                 let r = ai.x86_reg(n);
+                if p == 1 {
+                    // a vector index (VSIB: gathers and scatters)
+                    let mut vb: u32 = 0;
+                    let vx = xreg(n, &mut vb);
+                    if (vx >= R_VEC) and (vx < R_K) {
+                        op.index = vx;
+                        op.vix = true;
+                        op.bits = vb;
+                        continue;
+                    }
+                }
                 if (r.reg < 0) or (r.reg >= 16) or ((r.bits != 64) and (r.bits != 32)) or r.hi8 {
                     cr.fail(A, u.f1("'%s' is not an address register", x));
                     return op;
@@ -567,7 +693,7 @@ fn is_gpr(o: *XOp) bool {
 }
 
 fn is_xmm(o: *XOp) bool {
-    return (o.kind == XK_REG) and (o.reg >= 16);
+    return (o.kind == XK_REG) and (o.reg >= 16) and (o.reg < 32) and (o.bits == 128);
 }
 
 fn is_rm(o: *XOp) bool {
@@ -677,6 +803,27 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
     g_sse_built = false;
     let mut m = st.op;
     let mut rest = st.args;
+    // pseudo-prefixes: {vex} {vex2} {vex3} {evex} (the encoding to choose)
+    let mut evex = false;
+    let mut vex3 = false;
+    while (m.len > 2) and (m[0] == '{') and (m[m.len - 1] == '}') {
+        let pn = m[1..m.len - 1];
+        if u.str_eq(pn, "evex") {
+            evex = true;
+        } else if u.str_eq(pn, "vex3") {
+            vex3 = true;
+        } else if not u.str_eq(pn, "vex") and not u.str_eq(pn, "vex2") {
+            cr.fail(A, u.f1("the pseudo-prefix '%s' is not supported", m));
+            return;
+        }
+        let t = cr.trim(rest);
+        let mut k: usize = 0;
+        while (k < t.len) and not cr.is_space(t[k]) {
+            k += 1;
+        }
+        m = cr.lower(t[0..k]);
+        rest = cr.trim(t[k..]);
+    }
     // prefixes: lock, rep, repe, repz, repne, repnz (alone or before the instruction)
     loop {
         let p = prefix_byte(m);
@@ -724,6 +871,13 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
                 return;
             }
         }
+    }
+    if table_insn(A, m, ops, evex, vex3) {
+        return;
+    }
+    if evex {
+        cr.fail(A, u.f1("'%s' has no EVEX form with these operands", m));
+        return;
     }
     if general(A, st, m, ops) {
         return;
@@ -2988,4 +3142,896 @@ pub fn assemble_file(text: []u8) *mut cr.Asm {
     let ar = arch();
     cr.run(A, &ar);
     return A;
+}
+
+// -----------------------------------------------------------------------------
+// The instruction table (asm/x64tab.ax): x87, MMX, the SSE instructions the
+// code above does not encode, VEX (AVX, AVX2, FMA, F16C, the VEX forms of
+// AES, PCLMULQDQ, GFNI, VAES ...), EVEX (AVX-512) and the system
+// instructions, as Intel SDM vol. 2 writes them: a line of the table is
+//     mnemonic  operand-encoding  operand-types  encoding  attributes...
+// with the operands in Intel's order (the destination first: the AT&T
+// order reversed). The operand encoding gives each operand's field: R the
+// ModRM reg field, M ModRM r/m, V VEX/EVEX.vvvv, I an imm8, S a register
+// in imm8[7:4], O a register added to the last opcode byte, - an implicit
+// operand. The types (alternatives joined by '/'): V a vector register of
+// the form's length, H Q O one of half, a quarter, an eighth of it (at
+// least xmm), x y z xmm ymm zmm, k a mask register, mm, st (st(i)), st0
+// (%st), sreg cr dr, r8 r16 r32 r64 general registers (r: r32 or r64),
+// al ax eax rax cl dx xmm0 those registers, m memory, vx vy vz memory with
+// a vector index (VSIB) of that width, i an immediate. The encoding is
+// L (legacy), V (VEX) or E (EVEX) with the mandatory prefix (np 66 f3 f2),
+// the map (- 0f 0f38 0f3a) and W (w0 w1 wig; wr: from the general
+// register's size), then the opcode bytes and /r or /digit. Attributes:
+// the lengths (lx lxy lxyz lyz lz lig; by default lx for legacy forms, lxy
+// for VEX, lxyz for EVEX), EVEX's tuple for compressed displacements (fv hv
+// fvm hvm qvm ovm dup m128, or nN: N bytes), its broadcast element (b2 b4
+// b8), masking (k; z: zeroing too), embedded rounding (er) or
+// suppress-all-exceptions (sae), imm=N: a fixed imm8 (the predicates of
+// vcmpeqps ...), and nomodrm.
+// -----------------------------------------------------------------------------
+const TE_L: u8 = 0;
+const TE_V: u8 = 1;
+const TE_E: u8 = 2;
+
+// Operand types (bits of TForm.ty)
+const TT_V: u32 = 1;
+const TT_H: u32 = 2;
+const TT_Q: u32 = 4;
+const TT_O: u32 = 8;
+const TT_X: u32 = 0x10;
+const TT_Y: u32 = 0x20;
+const TT_Z: u32 = 0x40;
+const TT_K: u32 = 0x80;
+const TT_MM: u32 = 0x100;
+const TT_ST: u32 = 0x200;
+const TT_ST0: u32 = 0x400;
+const TT_SREG: u32 = 0x800;
+const TT_CR: u32 = 0x1000;
+const TT_DR: u32 = 0x2000;
+const TT_R8: u32 = 0x4000;
+const TT_R16: u32 = 0x8000;
+const TT_R32: u32 = 0x1_0000;
+const TT_R64: u32 = 0x2_0000;
+const TT_FIX: u32 = 0x4_0000;  // a specific register (TForm.fix)
+const TT_M: u32 = 0x8_0000;
+const TT_VX: u32 = 0x10_0000;
+const TT_VY: u32 = 0x20_0000;
+const TT_VZ: u32 = 0x40_0000;
+const TT_I: u32 = 0x80_0000;
+
+struct TForm {
+    name: []u8,
+    n: usize,
+    role: [5]u8,
+    ty: [5]u32,
+    fix: [5]i32,  // TT_FIX: the register (XOp.reg) and its width in fixb
+    fixb: [5]u32,
+    enc: u8,
+    pp: u8,   // 0 np, 1 66, 2 f3, 3 f2
+    map: u8,  // 0 none, 1 0f, 2 0f38, 3 0f3a
+    w: u8,    // 0, 1, 2 ignored, 3 from the general register
+    opc: [4]u8,
+    nopc: usize,
+    digit: i32,  // /digit, -1 /r, -2 no ModRM
+    lens: u8,    // 1 128, 2 256, 4 512, 8 ignored (scalar)
+    tuple: u8,   // TU_*
+    tn: u32,     // TU_N: N
+    bc: u32,     // broadcast element bytes (0 none)
+    kmask: bool,
+    kzero: bool,
+    er: bool,
+    sae: bool,
+    fimm: i32,  // a fixed imm8, or -1
+}
+
+const TU_NONE: u8 = 0;
+const TU_FV: u8 = 1;
+const TU_HV: u8 = 2;
+const TU_FVM: u8 = 3;
+const TU_HVM: u8 = 4;
+const TU_QVM: u8 = 5;
+const TU_OVM: u8 = 6;
+const TU_DUP: u8 = 7;
+const TU_N: u8 = 8;
+
+let mut g_tforms: u.List.[TForm] = u.List.[TForm].{ data: @ptr_from_int(*mut TForm, 0), len: 0, cap: 0 };
+let mut g_tnames: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+// for each mnemonic (g_tnames' value - 1), its forms' indexes
+let mut g_tlists: u.List.[u.List.[i32]] = u.List.[u.List.[i32]].{ data: @ptr_from_int(*mut u.List.[i32], 0), len: 0,
+                                                                  cap: 0 };
+let mut g_tbuilt: bool = false;
+
+fn hexv(c: u8) i32 {
+    if u.is_digit(c) {
+        return @as(i32, c - '0');
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return @as(i32, c - 'a') + 10;
+    }
+    return -1;
+}
+
+// The words of a table line (separated by spaces), without allocating.
+fn tword(s: []u8, i: *mut usize) []u8 {
+    while (i.* < s.len) and (s[i.*] == ' ') {
+        i.* += 1;
+    }
+    let st = i.*;
+    while (i.* < s.len) and (s[i.*] != ' ') {
+        i.* += 1;
+    }
+    return s[st..i.*];
+}
+
+// The type bits of one operand's alternatives (`V/m`), its fixed register.
+fn ttype(t: []u8, fix: *mut i32, fixb: *mut u32) u32 {
+    let mut bits: u32 = 0;
+    let mut st: usize = 0;
+    for k in 0..t.len + 1 {
+        if (k < t.len) and (t[k] != '/') {
+            continue;
+        }
+        let a = t[st..k];
+        st = k + 1;
+        let names = ["V", "H", "Q", "O", "x", "y", "z", "k", "mm", "st", "st0", "sreg", "cr", "dr", "r8", "r16", "r32",
+                     "r64", "m", "vx", "vy", "vz", "i"];
+        let vals: [23]u32 = [TT_V, TT_H, TT_Q, TT_O, TT_X, TT_Y, TT_Z, TT_K, TT_MM, TT_ST, TT_ST0, TT_SREG, TT_CR,
+                             TT_DR, TT_R8, TT_R16, TT_R32, TT_R64, TT_M, TT_VX, TT_VY, TT_VZ, TT_I];
+        let mut found = false;
+        for j in 0..names.len {
+            if u.str_eq(a, names[j]) {
+                bits = bits | vals[j];
+                found = true;
+            }
+        }
+        if u.str_eq(a, "r") {
+            bits = bits | (TT_R32 | TT_R64);
+            found = true;
+        }
+        if not found {
+            // a specific register: al ax eax rax cl dx xmm0 ...
+            let r = ai.x86_reg(a);
+            if r.reg < 0 {
+                u.die(u.f1("asm/x64tab.ax: the operand type '%s'", a));
+            }
+            fix.* = r.reg;
+            fixb.* = r.bits;
+            bits = bits | TT_FIX;
+        }
+    }
+    return bits;
+}
+
+fn build_table() void {
+    g_tforms = u.List.[TForm].empty();
+    g_tlists = u.List.[u.List.[i32]].empty();
+    for line in xt.TABLE {
+        let mut i: usize = 0;
+        let name = tword(line, &mut i);
+        let roles = tword(line, &mut i);
+        let types = tword(line, &mut i);
+        let enc = tword(line, &mut i);
+        let mut f = TForm.{ name: u.intern(name), n: 0, role: [0; 5], ty: [0; 5], fix: [-1; 5], fixb: [0; 5], enc: TE_L,
+                            pp: 0, map: 0, w: 0, opc: [0; 4], nopc: 0, digit: -2, lens: 1, tuple: TU_NONE, tn: 0, bc: 0,
+                            kmask: false, kzero: false, er: false, sae: false, fimm: -1 };
+        if not u.str_eq(roles, "-0") {
+            f.n = roles.len;
+            for k in 0..roles.len {
+                f.role[k] = roles[k];
+            }
+            let mut st: usize = 0;
+            let mut j: usize = 0;
+            for k in 0..types.len + 1 {
+                if (k < types.len) and (types[k] != ',') {
+                    continue;
+                }
+                let mut fx: i32 = -1;
+                let mut fb: u32 = 0;
+                f.ty[j] = ttype(types[st..k], &mut fx, &mut fb);
+                f.fix[j] = fx;
+                f.fixb[j] = fb;
+                j += 1;
+                st = k + 1;
+            }
+            if j != f.n {
+                u.die(u.f1("asm/x64tab.ax: the operands of '%s'", line));
+            }
+        }
+        // the encoding: E.66.0f38.w0
+        if enc[0] == 'V' {
+            f.enc = TE_V;
+            f.lens = 3;
+        } else if enc[0] == 'E' {
+            f.enc = TE_E;
+            f.lens = 7;
+        }
+        let mut fields: [4][]u8 = ["", "", "", ""];
+        let mut nf: usize = 0;
+        let mut fs: usize = 0;
+        for k in 0..enc.len + 1 {
+            if (k == enc.len) or (enc[k] == '.') {
+                if nf < 4 {
+                    fields[nf] = enc[fs..k];
+                }
+                nf += 1;
+                fs = k + 1;
+            }
+        }
+        let pps = ["np", "66", "f3", "f2"];
+        for k in @as(usize, 0)..4 {
+            if u.str_eq(fields[1], pps[k]) {
+                f.pp = @truncate(u8, k);
+            }
+        }
+        let maps = ["-", "0f", "0f38", "0f3a"];
+        for k in @as(usize, 0)..4 {
+            if u.str_eq(fields[2], maps[k]) {
+                f.map = @truncate(u8, k);
+            }
+        }
+        let ws = ["w0", "w1", "wig", "wr"];
+        for k in @as(usize, 0)..4 {
+            if u.str_eq(fields[3], ws[k]) {
+                f.w = @truncate(u8, k);
+            }
+        }
+        let mut past_opc = false;
+        loop {
+            let a = tword(line, &mut i);
+            if a.len == 0 {
+                break;
+            }
+            if not past_opc and (a.len == 2) and (hexv(a[0]) >= 0) and (hexv(a[1]) >= 0) {
+                f.opc[f.nopc] = @truncate(u8, @bit_cast(u32, (hexv(a[0]) * 16) + hexv(a[1])));
+                f.nopc += 1;
+            } else if u.str_eq(a, "/r") {
+                f.digit = -1;
+                past_opc = true;
+            } else if (a.len == 2) and (a[0] == '/') {
+                f.digit = @as(i32, a[1] - '0');
+                past_opc = true;
+            } else if u.str_eq(a, "lx") {
+                f.lens = 1;
+            } else if u.str_eq(a, "lxy") {
+                f.lens = 3;
+            } else if u.str_eq(a, "lxyz") {
+                f.lens = 7;
+            } else if u.str_eq(a, "lyz") {
+                f.lens = 6;
+            } else if u.str_eq(a, "ly") {
+                f.lens = 2;
+            } else if u.str_eq(a, "lz") {
+                f.lens = 4;
+            } else if u.str_eq(a, "lig") {
+                f.lens = 8;
+            } else if u.str_eq(a, "fv") {
+                f.tuple = TU_FV;
+            } else if u.str_eq(a, "hv") {
+                f.tuple = TU_HV;
+            } else if u.str_eq(a, "fvm") {
+                f.tuple = TU_FVM;
+            } else if u.str_eq(a, "hvm") {
+                f.tuple = TU_HVM;
+            } else if u.str_eq(a, "qvm") {
+                f.tuple = TU_QVM;
+            } else if u.str_eq(a, "ovm") {
+                f.tuple = TU_OVM;
+            } else if u.str_eq(a, "dup") {
+                f.tuple = TU_DUP;
+            } else if u.str_eq(a, "m128") {
+                f.tuple = TU_N;
+                f.tn = 16;
+            } else if (a[0] == 'n') and (ai.num(a[1..]) > 0) {
+                f.tuple = TU_N;
+                f.tn = @truncate(u32, @bit_cast(u64, ai.num(a[1..])));
+            } else if (a[0] == 'b') and (ai.num(a[1..]) > 0) {
+                f.bc = @truncate(u32, @bit_cast(u64, ai.num(a[1..])));
+            } else if u.str_eq(a, "k") {
+                f.kmask = true;
+            } else if u.str_eq(a, "z") {
+                f.kmask = true;
+                f.kzero = true;
+            } else if u.str_eq(a, "er") {
+                f.er = true;
+            } else if u.str_eq(a, "sae") {
+                f.sae = true;
+            } else if u.starts(a, "imm=") {
+                f.fimm = @truncate(i32, u.atol(a[4..]));
+            } else {
+                u.die(u.f2("asm/x64tab.ax: '%s' in '%s'", a, line));
+            }
+        }
+        if (f.digit == -2) and (f.enc != TE_L) {
+            f.digit = -1;
+        }
+        let mut has_m = false;
+        for k in 0..f.n {
+            if f.role[k] == 'M' {
+                has_m = true;
+            }
+        }
+        if has_m and (f.digit == -2) {
+            f.digit = -1;
+        }
+        g_tforms.push(f);
+        let key = f.name;
+        let mut li = g_tnames.get(key);
+        if li == 0 {
+            g_tlists.push(u.List.[i32].empty());
+            li = @int_cast(i32, g_tlists.len);
+            g_tnames.put(key, li);
+        }
+        g_tlists.at(@int_cast(usize, li - 1)).push(@int_cast(i32, g_tforms.len - 1));
+    }
+}
+
+fn reg_class_bits(o: *XOp) u32 {
+    if o.kind != XK_REG {
+        return 0;
+    }
+    let r = o.reg;
+    if r < 16 {
+        if o.bits == 8 {
+            return TT_R8;
+        }
+        if o.bits == 16 {
+            return TT_R16;
+        }
+        if o.bits == 32 {
+            return TT_R32;
+        }
+        return TT_R64;
+    }
+    if r < R_K {
+        return 0;  // (vectors: by width)
+    }
+    if r < R_MM {
+        return TT_K;
+    }
+    if r < R_ST {
+        return TT_MM;
+    }
+    if r < R_SEG {
+        return TT_ST;
+    }
+    if r < R_CR {
+        return TT_SREG;
+    }
+    if r < R_DR {
+        return TT_CR;
+    }
+    return TT_DR;
+}
+
+// The width a vector type has in a form of length L.
+fn vwidth(t: u32, L: u32) u32 {
+    if (t & TT_V) != 0 {
+        return L;
+    }
+    if (t & TT_H) != 0 {
+        return @max(L / 2, 128);
+    }
+    if (t & TT_Q) != 0 {
+        return @max(L / 4, 128);
+    }
+    if (t & TT_O) != 0 {
+        return @max(L / 8, 128);
+    }
+    return 0;
+}
+
+// Does operand o match type t in form f of length L (k: its position)?
+fn tmatch(f: *TForm, k: usize, o: *XOp, L: u32) bool {
+    let t = f.ty[k];
+    if (o.mask != 0) or o.zero {
+        if (k != 0) or not f.kmask or (o.zero and not f.kzero) {
+            return false;
+        }
+        if o.zero and (o.kind == XK_MEM) {
+            return false;  // (no zeroing of memory)
+        }
+    }
+    if o.kind == XK_IMM {
+        return (t & TT_I) != 0;
+    }
+    if o.kind == XK_MEM {
+        if o.vix {
+            let w = o.bits;
+            return (((t & TT_VX) != 0) and (w == 128)) or (((t & TT_VY) != 0) and (w == 256)) or
+                   (((t & TT_VZ) != 0) and (w == 512));
+        }
+        if (t & TT_M) == 0 {
+            return false;
+        }
+        if o.bcst != 0 {
+            if (f.bc == 0) or ((L / 8 / f.bc) != o.bcst) {
+                return false;
+            }
+            // (a broadcast is the third operand's, or the second's of two)
+        }
+        return true;
+    }
+    if o.kind != XK_REG {
+        return false;
+    }
+    if (t & TT_FIX) != 0 {
+        if (o.reg == f.fix[k]) and (o.bits == f.fixb[k]) and not o.hi8 {
+            return true;
+        }
+    }
+    if (t & TT_ST0) != 0 {
+        if o.reg == R_ST {
+            return true;
+        }
+    }
+    let rb = reg_class_bits(o);
+    if rb != 0 {
+        if o.hi8 and (f.enc != TE_L) {
+            return false;
+        }
+        return (t & rb) != 0;
+    }
+    // a vector register
+    let n = o.reg - R_VEC;
+    if (n >= 16) and (f.enc != TE_E) {
+        return false;
+    }
+    let mut w = vwidth(t, L);
+    if (w != 0) and (o.bits == w) {
+        return true;
+    }
+    if (((t & TT_X) != 0) and (o.bits == 128)) or (((t & TT_Y) != 0) and (o.bits == 256)) or
+       (((t & TT_Z) != 0) and (o.bits == 512)) {
+        return true;
+    }
+    _ = w;
+    return false;
+}
+
+// The register number an encoding field takes (its low five bits).
+fn fnum(o: *XOp) i32 {
+    if o.kind != XK_REG {
+        return 0;
+    }
+    if o.reg < 16 {
+        return o.reg;
+    }
+    return (o.reg - R_VEC) & 31;
+}
+
+// Tries the table's forms of mnemonic m with operands ops (AT&T order):
+// true when one matched (and was encoded, or failed with an error).
+// evex: {evex} was written (EVEX forms only); vex3: {vex3} (no C5).
+fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool) bool {
+    if not g_tbuilt {
+        build_table();
+        g_tbuilt = true;
+    }
+    let li = g_tnames.get(u.intern(m));
+    if li == 0 {
+        return false;
+    }
+    // Intel's order, without a rounding operand
+    let mut rc: i64 = -1;
+    let ops = u.newn.[XOp](ops0.len + 1);
+    let mut n: usize = 0;
+    let mut k = ops0.len;
+    while k > 0 {
+        k -= 1;
+        if ops0[k].kind == XK_RC {
+            if rc >= 0 {
+                return false;
+            }
+            rc = ops0[k].v.k;
+            continue;
+        }
+        ops[n] = ops0[k];
+        n += 1;
+    }
+    let lens: [4]u32 = [128, 256, 512, 128];
+    let forms = g_tlists.at(@int_cast(usize, li - 1));
+    let mut best_fi: i32 = -1;
+    let mut best_len: i64 = -1;
+    let mut best_L: u32 = 128;
+    let mut best_enc: i32 = 9;
+    // the forms that need no EVEX first (as the conventional assembler chooses), then EVEX
+    for pass in @as(i32, 0)..2 {
+        for fi in forms.items() {
+            let f = g_tforms.at(@int_cast(usize, fi));
+            if (f.enc == TE_E) != (pass == 1) {
+                continue;
+            }
+            if evex and (f.enc != TE_E) {
+                continue;
+            }
+            if f.n != n {
+                continue;
+            }
+            if (rc >= 0) and not ((f.er and (rc < 4)) or (f.sae and (rc == 4)) or (f.er and (rc == 4) and false)) {
+                continue;
+            }
+            for li2 in @as(usize, 0)..4 {
+                let lb: u8 = @truncate(u8, @as(u32, 1) << @truncate(u32, li2));
+                if (f.lens & lb) == 0 {
+                    continue;
+                }
+                let L = lens[li2];
+                // (a rounding operand implies the 512-bit form, or a scalar one)
+                if (rc >= 0) and (rc < 4) and (L != 512) and (f.lens != 8) {
+                    continue;
+                }
+                let mut ok = true;
+                for j in 0..n {
+                    if not tmatch(f, j, &ops[j], L) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if not ok {
+                    continue;
+                }
+                let before = A.secs.at(@int_cast(usize, A.cur)).data.len;
+                let nr = A.relocs.len;
+                tencode(A, f, ops[0..n], L, rc, vex3);
+                if cr.failed(A) {
+                    return true;
+                }
+                let len = A.secs.at(@int_cast(usize, A.cur)).data.len - before;
+                // gas prefers a lower encoding class (legacy < VEX < EVEX), then
+                // the shortest within a class (the 2-byte VEX, the store form)
+                let better = (best_fi < 0) or (@int_cast(i32, f.enc) < best_enc) or
+                             ((@int_cast(i32, f.enc) == best_enc) and (@int_cast(i64, len) < best_len));
+                if better {
+                    best_len = @int_cast(i64, len);
+                    best_fi = fi;
+                    best_L = L;
+                    best_enc = @int_cast(i32, f.enc);
+                }
+                // roll back (the winner is re-emitted once, after the loop)
+                A.secs.at(@int_cast(usize, A.cur)).data.len = before;
+                while A.relocs.len > nr {
+                    _ = A.relocs.pop();
+                }
+            }
+        }
+    }
+    if best_fi >= 0 {
+        tencode(A, g_tforms.at(@int_cast(usize, best_fi)), ops[0..n], best_L, rc, vex3);
+        return true;
+    }
+    return false;
+}
+
+fn tencode(A: *mut cr.Asm, f: *TForm, ops: []XOp, L: u32, rc: i64, vex3: bool) void {
+    let mut regf: i32 = 0;
+    let mut regx = none_op();
+    let mut rm = none_op();
+    let mut vv: i32 = 0;
+    let mut have_v = false;
+    let mut iv = cr.konst(0);
+    let mut isz: u32 = 0;
+    let mut is4: i32 = -1;
+    let mut plus: i32 = -1;
+    let mut mask: i32 = 0;
+    let mut zero = false;
+    let mut bcst = false;
+    let mut w64 = false;
+    let mut osz = false;
+    let mut byte8 = false;
+    for k in 0..f.n {
+        let o = ops[k];
+        if k == 0 {
+            mask = o.mask;
+            zero = o.zero;
+        }
+        if (o.kind == XK_REG) and (o.reg < 16) {
+            if o.bits == 64 {
+                w64 = true;
+            }
+            if o.bits == 16 {
+                osz = true;
+            }
+            if o.bits == 8 {
+                byte8 = true;
+            }
+        }
+        let r = f.role[k];
+        if r == 'R' {
+            regf = fnum(&o);
+            regx = o;
+        } else if r == 'M' {
+            rm = o;
+            if o.bcst != 0 {
+                bcst = true;
+            }
+        } else if r == 'V' {
+            vv = fnum(&o);
+            have_v = true;
+        } else if r == 'I' {
+            iv = o.v;
+            isz = 1;
+        } else if r == 'S' {
+            is4 = fnum(&o);
+        } else if r == 'O' {
+            plus = o.reg & 7;
+        }
+    }
+    if f.digit >= 0 {
+        regf = f.digit;
+    }
+    if f.fimm >= 0 {
+        iv = cr.konst(@as(i64, f.fimm));
+        isz = 1;
+    }
+    if is4 >= 0 {
+        iv = cr.konst(@as(i64, is4) << 4);
+        isz = 1;
+    }
+    let mut W = f.w == 1;
+    if f.w == 3 {
+        W = w64;
+    }
+    // prefixes of the memory operand
+    if rm.kind == XK_MEM {
+        if rm.seg != 0 {
+            cr.emit8(A, @as(u64, rm.seg));
+        }
+        if rm.a32 {
+            cr.emit8(A, 0x67);
+        }
+    }
+    let ppv: [4]u8 = [0, 0x66, 0xf3, 0xf2];
+    if f.enc == TE_L {
+        if osz and (f.w == 3) {
+            cr.emit8(A, 0x66);
+        }
+        for p in pfxs() {
+            cr.emit8(A, @as(u64, p));
+        }
+        if f.pp != 0 {
+            cr.emit8(A, @as(u64, ppv[@as(usize, f.pp)]));
+        }
+        let mut rex: u64 = 0;
+        if W {
+            rex = rex | 8;
+        }
+        if f.digit < 0 {
+            rex = rex | (hibit(regf) << 2);
+        }
+        if rm.kind == XK_REG {
+            rex = rex | hibit(fnum(&rm));
+        } else if rm.kind == XK_MEM {
+            rex = rex | (hibit(rm.base) | (hibit(rm.index) << 1));
+        }
+        if plus >= 0 {
+            let po = ops[0];
+            for o in ops {
+                if f.role[0] == 'O' {
+                    _ = o;
+                }
+            }
+            if (po.kind == XK_REG) and (po.reg < 16) {
+                rex = rex | hibit(po.reg);
+            }
+        }
+        let mut force = false;
+        for o in ops {
+            if (o.kind == XK_REG) and (o.reg < 16) and uses_rex_byte(o.reg, o.bits, o.hi8) {
+                force = true;
+            }
+        }
+        if (rex != 0) or force {
+            cr.emit8(A, 0x40 | rex);
+        }
+        _ = byte8;
+        if f.map >= 1 {
+            cr.emit8(A, 0x0f);
+        }
+        if f.map == 2 {
+            cr.emit8(A, 0x38);
+        } else if f.map == 3 {
+            cr.emit8(A, 0x3a);
+        }
+    } else if f.enc == TE_V {
+        for p in pfxs() {
+            cr.emit8(A, @as(u64, p));
+        }
+        let r = hibit(regf) & bx(f.digit < 0);
+        let mut x: u64 = 0;
+        let mut b: u64 = 0;
+        if rm.kind == XK_REG {
+            b = hibit(fnum(&rm));
+        } else if rm.kind == XK_MEM {
+            b = hibit(rm.base);
+            x = hibit(rm.index);
+        }
+        let v = (~@as(u64, @bit_cast(u32, vv & 15))) & 15;
+        let l: u64 = bx(L == 256);
+        let pp = @as(u64, f.pp);
+        if (x == 0) and (b == 0) and (f.map == 1) and not W and not vex3 {
+            cr.emit8(A, 0xc5);
+            cr.emit8(A, (((((~r) & 1) << 7) | (v << 3)) | (l << 2)) | pp);
+        } else {
+            cr.emit8(A, 0xc4);
+            cr.emit8(A, ((((~r) & 1) << 7) | (((~x) & 1) << 6)) | ((((~b) & 1) << 5) | @as(u64, f.map)));
+            cr.emit8(A, (((bx(W) << 7) | (v << 3)) | (l << 2)) | pp);
+        }
+    } else {
+        for p in pfxs() {
+            cr.emit8(A, @as(u64, p));
+        }
+        let rn = @bit_cast(u64, @as(i64, regf));
+        let r = (rn >> 3) & bx(f.digit < 0);
+        let r2 = (rn >> 4) & bx(f.digit < 0);
+        let mut x: u64 = 0;
+        let mut b: u64 = 0;
+        let mut v2: u64 = (@bit_cast(u64, @as(i64, vv)) >> 4) & 1;
+        if rm.kind == XK_REG {
+            let mn = @bit_cast(u64, @as(i64, fnum(&rm)));
+            b = (mn >> 3) & 1;
+            x = (mn >> 4) & 1;
+        } else if rm.kind == XK_MEM {
+            b = hibit(rm.base);
+            if rm.vix {
+                let ix = @bit_cast(u64, @as(i64, rm.index - R_VEC));
+                x = (ix >> 3) & 1;
+                v2 = (ix >> 4) & 1;
+            } else {
+                x = hibit(rm.index);
+            }
+        }
+        _ = have_v;
+        let v = (~@bit_cast(u64, @as(i64, vv))) & 15;
+        let mut ll: u64 = 0;
+        if L == 256 {
+            ll = 1;
+        } else if L == 512 {
+            ll = 2;
+        }
+        if f.lens == 8 {
+            ll = 0;
+        }
+        let mut bbit: u64 = bx(bcst);
+        if rc >= 0 {
+            bbit = 1;
+            if rc < 4 {
+                ll = @bit_cast(u64, rc);
+            }
+        }
+        cr.emit8(A, 0x62);
+        cr.emit8(
+            A, ((((~r) & 1) << 7) | (((~x) & 1) << 6)) | (((((~b) & 1) << 5) | (((~r2) & 1) << 4)) | @as(u64, f.map)));
+        cr.emit8(A, (((bx(W) << 7) | (v << 3)) | 4) | @as(u64, f.pp));
+        cr.emit8(
+            A, (((bx(zero) << 7) | (ll << 5)) | ((bbit << 4) | (((~v2) & 1) << 3))) | @bit_cast(u64, @as(i64, mask)));
+    }
+    for k in 0..f.nopc {
+        let mut c = @as(u64, f.opc[k]);
+        if ((k + 1) == f.nopc) and (plus >= 0) {
+            c += @bit_cast(u64, @as(i64, plus));
+        }
+        cr.emit8(A, c);
+    }
+    if f.digit != -2 {
+        if (rm.kind == XK_MEM) and (f.enc == TE_E) {
+            modrm_evex(A, regf, &rm, isz, disp_n(f, L, bcst, W));
+        } else {
+            let mut r2 = rm;
+            if rm.kind == XK_REG {
+                r2.reg = fnum(&rm) & 7;
+            }
+            modrm(A, regf, &r2, isz);
+        }
+    }
+    _ = regx;
+    if isz > 0 {
+        imm(A, iv, isz, false);
+    }
+}
+
+fn bx(c: bool) u64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
+// EVEX's N: the scale of a compressed 8-bit displacement.
+fn disp_n(f: *TForm, L: u32, bcst: bool, W: bool) u32 {
+    let vl = L / 8;
+    let t = f.tuple;
+    if t == TU_FV {
+        if bcst {
+            return f.bc;
+        }
+        return vl;
+    }
+    if t == TU_HV {
+        if bcst {
+            return f.bc;
+        }
+        return vl / 2;
+    }
+    if t == TU_FVM {
+        return vl;
+    }
+    if t == TU_HVM {
+        return vl / 2;
+    }
+    if t == TU_QVM {
+        return vl / 4;
+    }
+    if t == TU_OVM {
+        return vl / 8;
+    }
+    if t == TU_DUP {
+        if L == 128 {
+            return 8;
+        }
+        return vl;
+    }
+    if t == TU_N {
+        return f.tn;
+    }
+    _ = W;
+    return 1;
+}
+
+// ModRM, SIB and displacement of an EVEX instruction's memory operand: an
+// 8-bit displacement is scaled by n when the displacement is a multiple of it.
+fn modrm_evex(A: *mut cr.Asm, regf: i32, m: *XOp, imm_after: u32, n: u32) void {
+    let v = cr.settle(A, m.v);
+    if not v.ok {
+        return;
+    }
+    let nn = @as(i64, n);
+    if (m.base < 0) or (m.base == RIP) or (v.sym >= 0) or (v.k == 0) or (nn <= 1) {
+        modrm(A, regf, m, imm_after);
+        return;
+    }
+    if ((v.k % nn) == 0) and fits8(v.k / nn) {
+        // mod 01 with disp8 = k / n
+        let rf = rr(regf) << 3;
+        let base = m.base;
+        if (m.index >= 0) or ((base & 7) == 4) {
+            cr.emit8(A, ((1 << 6) | rf) | 4);
+            let mut ix: u64 = 4;
+            if m.index >= 0 {
+                ix = rr(m.index);
+            }
+            cr.emit8(A, ((scale_bits(m.scale) << 6) | (ix << 3)) | rr(base));
+        } else {
+            cr.emit8(A, ((1 << 6) | rf) | rr(base));
+        }
+        cr.emit8(A, @bit_cast(u64, v.k / nn));
+        return;
+    }
+    // (no 8-bit displacement: a 32-bit one)
+    let mut m2 = m.*;
+    if fits8(v.k) {
+        m2.v = cr.konst(v.k);
+        modrm_disp32(A, regf, &m2);
+        return;
+    }
+    modrm(A, regf, m, imm_after);
+}
+
+// ModRM with a 32-bit displacement (an EVEX displacement that fits in 8 bits
+// but is not a multiple of N).
+fn modrm_disp32(A: *mut cr.Asm, regf: i32, m: *XOp) void {
+    let rf = rr(regf) << 3;
+    let base = m.base;
+    if (m.index >= 0) or ((base & 7) == 4) {
+        cr.emit8(A, ((2 << 6) | rf) | 4);
+        let mut ix: u64 = 4;
+        if m.index >= 0 {
+            ix = rr(m.index);
+        }
+        cr.emit8(A, ((scale_bits(m.scale) << 6) | (ix << 3)) | rr(base));
+    } else {
+        cr.emit8(A, ((2 << 6) | rf) | rr(base));
+    }
+    cr.emit32(A, @bit_cast(u64, m.v.k));
 }

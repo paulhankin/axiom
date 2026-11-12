@@ -12,7 +12,7 @@
 // Two kinds of text are assembled: an asm statement's template (`inline_`:
 // its bytes go into its function's code, it defines no symbols and
 // switches to no section) and file-scope asm (sections and symbols of the
-// object). The syntax is the GNU assembler's for the architecture (AT&T for
+// object). The syntax is the conventional assembler's for the architecture (AT&T for
 // x86-64); what an instruction or directive this does not know is, is an
 // error naming it, never silently wrong bytes.
 // =============================================================================
@@ -67,10 +67,31 @@ pub struct Def {
     intext: bool,   // a label this text defines
 }
 
+/// A statement of the text before the expander: its text (labels and all).
+pub struct Raw {
+    text: []u8,
+    line: i32,
+}
+
+/// A macro (.macro name params ... .endm).
+struct Macro {
+    name: []u8,
+    params: [][]u8,
+    defaults: [][]u8,
+    req: []bool,
+    vararg: bool,  // the last parameter takes the rest of the arguments
+    body: []Raw,
+}
+
 pub struct Asm {
     arch: i32,
     inline_: bool,
     text: []u8,
+    raw: u.List.[Raw],
+    macros: u.List.[Macro],
+    nmacro: i64,   // macros expanded so far (\@)
+    xline: i32,    // the line the expander is at (for its errors)
+    dirs: [][]u8,  // where .incbin looks for files (the first: the source's directory)
     stmts: u.List.[Stmt],
     secs: u.List.[Sec],
     cur: i32,
@@ -98,6 +119,8 @@ pub fn new_asm(arch: i32, text: []u8, inline_: bool, comment: u8) *mut Asm {
     A.comment = comment;
     A.names = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     A.err_line = -1;
+    A.pass = -1;
+    A.dirs = u.no_strs();
     return A;
 }
 
@@ -106,8 +129,8 @@ pub fn fail(A: *mut Asm, msg: []u8) void {
     if A.err.len > 0 {
         return;
     }
-    let mut line: i32 = 0;
-    if A.si < A.stmts.len {
+    let mut line: i32 = A.xline;
+    if (A.pass >= 0) and (A.si < A.stmts.len) {
         line = A.stmts.get(A.si).line;
     }
     A.err_line = line;
@@ -172,8 +195,8 @@ pub fn lower(s: []u8) []u8 {
     return b[0..s.len];
 }
 
-// Splits the text into statements (at newlines and ';', outside strings),
-// without comments.
+// Splits the text into raw statements (at newlines and ';', outside
+// strings), without comments: what the expander (below) reads.
 fn split(A: *mut Asm) void {
     let t = A.text;
     let mut line: i32 = 1;
@@ -182,7 +205,7 @@ fn split(A: *mut Asm) void {
     let mut st_line: i32 = 1;
     while i <= t.len {
         if i == t.len {
-            add_stmt(A, b.done(), st_line);
+            A.raw.push(Raw.{ text: b.done(), line: st_line });
             break;
         }
         let c = t[i];
@@ -200,6 +223,20 @@ fn split(A: *mut Asm) void {
             }
             if (i < t.len) and (t[i] == '"') {
                 b.c('"');
+                i += 1;
+            }
+            continue;
+        }
+        if (c == '\'') and ((i + 1) < t.len) {
+            // a character constant ('c, 'c', '\n'): its character is not a separator
+            b.c(c);
+            i += 1;
+            if (t[i] == '\\') and ((i + 1) < t.len) {
+                b.c(t[i]);
+                i += 1;
+            }
+            if t[i] != '\n' {
+                b.c(t[i]);
                 i += 1;
             }
             continue;
@@ -225,7 +262,7 @@ fn split(A: *mut Asm) void {
             continue;
         }
         if (c == '\n') or (c == ';') {
-            add_stmt(A, b.done(), st_line);
+            A.raw.push(Raw.{ text: b.done(), line: st_line });
             b = u.Buf.init();
             if c == '\n' {
                 line += 1;
@@ -282,6 +319,695 @@ fn add_stmt(A: *mut Asm, s0: []u8, line: i32) void {
         return;
     }
     A.stmts.push(Stmt.{ line: line, labels: labels.items(), op: op, args: args, long_: false, aux: 0 });
+}
+
+// -----------------------------------------------------------------------------
+// The expander: macros (.macro ... .endm, with parameters, defaults, :req,
+// :vararg, \@ and \()), repetitions (.rept, .irp, .irpc ... .endr) and
+// conditional assembly (.if and its kin, .else, .elseif, .endif), as the
+// conventional assembler's manual describes them, before the passes. Conditions are
+// evaluated where they are read, with the constants .set and .equ have
+// given so far and the labels defined so far (.ifdef); a value that
+// depends on where labels are placed is an error there.
+// -----------------------------------------------------------------------------
+struct Cond {
+    active: bool,  // its current branch is assembled (and so are its parents')
+    done: bool,    // a branch was taken (the rest are not)
+    else_: bool,   // .else seen
+    outer: bool,   // the enclosing conditions' state
+}
+
+// A raw statement split: the text of its labels, its directive or
+// mnemonic (lower case) and the rest.
+struct Parts {
+    labels: []u8,
+    op: []u8,
+    args: []u8,
+}
+
+fn parts(s0: []u8) Parts {
+    let s = trim(s0);
+    let mut at: usize = 0;
+    loop {
+        let t = s[at..];
+        let mut k: usize = 0;
+        if (t.len > 0) and u.is_digit(t[0]) {
+            while (k < t.len) and u.is_digit(t[k]) {
+                k += 1;
+            }
+        } else if (t.len > 0) and is_sym_start(t[0]) {
+            while (k < t.len) and is_sym_char(t[k]) {
+                k += 1;
+            }
+        }
+        if (k == 0) or (k >= t.len) or (t[k] != ':') {
+            break;
+        }
+        at += k + 1;
+        while (at < s.len) and is_space(s[at]) {
+            at += 1;
+        }
+    }
+    let t = s[at..];
+    let mut k: usize = 0;
+    while (k < t.len) and not is_space(t[k]) {
+        k += 1;
+    }
+    let mut op = lower(t[0..k]);
+    let mut args = trim(t[k..]);
+    // `name = value` and `name=value`
+    let eq = u.find(t, '=');
+    if (eq > 0) and ((@int_cast(usize, eq) + 1) < t.len) and (t[@int_cast(usize, eq) + 1] != '=') {
+        let nm = trim(t[0..@int_cast(usize, eq)]);
+        let mut all = nm.len > 0;
+        for c in nm {
+            if not is_sym_char(c) {
+                all = false;
+            }
+        }
+        if all {
+            op = "=";
+            args = u.cat3(nm, ",", t[@int_cast(usize, eq) + 1..]);
+        }
+    }
+    return Parts.{ labels: s[0..at], op: op, args: args };
+}
+
+fn is_cond_op(op: []u8) bool {
+    return u.starts(op, ".if") or u.str_eq(op, ".else") or u.str_eq(op, ".elseif") or u.str_eq(op, ".endif");
+}
+
+// Is the assembly being read assembled (no enclosing condition is false)?
+fn cond_active(conds: *u.List.[Cond]) bool {
+    if conds.len == 0 {
+        return true;
+    }
+    return conds.get(conds.len - 1).active;
+}
+
+fn macro_of(A: *Asm, name: []u8) i32 {
+    let mut k = A.macros.len;
+    while k > 0 {
+        k -= 1;
+        if u.str_eq(A.macros.get(k).name, name) {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+// Expands A.raw into A.stmts.
+fn expand(A: *mut Asm) void {
+    let mut conds = u.List.[Cond].empty();
+    let mut exitm = false;
+    expand_lines(A, A.raw.items(), 0, &mut conds, &mut exitm);
+    if not failed(A) and (conds.len > 0) {
+        fail(A, ".if without .endif");
+    }
+}
+
+// The body of a block that starts at lines[i] (.macro or .rept ...) up to
+// its end (`end`: .endm or .endr), nested blocks of the same kind
+// included; *next is the line after its end.
+fn block(A: *mut Asm, lines: []Raw, i: usize, end: []u8, next: *mut usize) []Raw {
+    let mut depth: i32 = 0;
+    let mut j = i + 1;
+    let mut out = u.List.[Raw].empty();
+    while j < lines.len {
+        let p = parts(lines[j].text);
+        let mut opens = u.str_eq(p.op, ".rept") or u.str_eq(p.op, ".irp") or u.str_eq(p.op, ".irpc") or
+                        u.str_eq(p.op, ".rep");
+        if u.str_eq(end, ".endm") {
+            opens = u.str_eq(p.op, ".macro");
+        }
+        if opens {
+            depth += 1;
+        } else if u.str_eq(p.op, end) or (u.str_eq(end, ".endm") and u.str_eq(p.op, ".endmacro")) {
+            if depth == 0 {
+                next.* = j + 1;
+                return out.items();
+            }
+            depth -= 1;
+        }
+        out.push(lines[j]);
+        j += 1;
+    }
+    A.xline = lines[i].line;
+    fail(A, u.f2("%s without %s", parts(lines[i].text).op, end));
+    next.* = lines.len;
+    return out.items();
+}
+
+fn expand_lines(A: *mut Asm, lines: []Raw, depth: i32, conds: *mut u.List.[Cond], exitm: *mut bool) void {
+    if depth > 200 {
+        fail(A, "macros or repetitions nested too deeply (200 levels)");
+        return;
+    }
+    let mut i: usize = 0;
+    while (i < lines.len) and not failed(A) and not exitm.* {
+        let r = lines[i];
+        A.xline = r.line;
+        let p = parts(r.text);
+        if is_cond_op(p.op) {
+            conditional(A, p, conds);
+            i += 1;
+            continue;
+        }
+        if not cond_active(conds) {
+            i += 1;
+            continue;
+        }
+        if (p.labels.len > 0) and
+           (u.str_eq(p.op, ".macro") or u.str_eq(p.op, ".rept") or u.str_eq(p.op, ".rep") or u.str_eq(p.op, ".irp") or
+            u.str_eq(p.op, ".irpc") or (macro_of(A, p.op) >= 0)) {
+            add_stmt(A, p.labels, r.line);
+        }
+        if u.str_eq(p.op, ".macro") {
+            let mut next: usize = 0;
+            let body = block(A, lines, i, ".endm", &mut next);
+            define_macro(A, p.args, body);
+            i = next;
+            continue;
+        }
+        if u.str_eq(p.op, ".rept") or u.str_eq(p.op, ".rep") or u.str_eq(p.op, ".irp") or u.str_eq(p.op, ".irpc") {
+            let mut next: usize = 0;
+            let body = block(A, lines, i, ".endr", &mut next);
+            if failed(A) {
+                return;
+            }
+            A.xline = r.line;
+            repeat(A, p, body, depth, conds, exitm);
+            i = next;
+            continue;
+        }
+        if u.str_eq(p.op, ".endm") or u.str_eq(p.op, ".endr") or u.str_eq(p.op, ".endmacro") {
+            fail(A, u.f1("%s without its beginning", p.op));
+            return;
+        }
+        if u.str_eq(p.op, ".exitm") {
+            exitm.* = true;
+            return;
+        }
+        if u.str_eq(p.op, ".purgem") {
+            let k = macro_of(A, lower(trim(p.args)));
+            if k < 0 {
+                fail(A, u.f1("the macro '%s' is not defined", trim(p.args)));
+                return;
+            }
+            A.macros.at(@int_cast(usize, k)).name = "";
+            i += 1;
+            continue;
+        }
+        let mk = macro_of(A, p.op);
+        if mk >= 0 {
+            invoke(A, mk, p.args, depth, conds);
+            i += 1;
+            continue;
+        }
+        if u.str_eq(p.op, ".err") {
+            fail(A, ".err");
+            return;
+        }
+        if u.str_eq(p.op, ".error") {
+            let a = trim(p.args);
+            if (a.len >= 2) and (a[0] == '"') {
+                fail(A, string(A, a));
+            } else {
+                fail(A, ".error");
+            }
+            return;
+        }
+        if u.str_eq(p.op, ".warning") or u.str_eq(p.op, ".print") {
+            i += 1;  // (messages for the person assembling: no effect on the object)
+            continue;
+        }
+        if u.str_eq(p.op, ".include") {
+            fail(A, ".include is not supported (the template or source must hold all of its text)");
+            return;
+        }
+        add_stmt(A, r.text, r.line);
+        if u.str_eq(p.op, ".set") or u.str_eq(p.op, ".equ") or u.str_eq(p.op, ".equiv") or u.str_eq(p.op, ".eqv") or
+           u.str_eq(p.op, "=") {
+            preset(A, p.op, p.args);
+        }
+        i += 1;
+    }
+}
+
+// .set and its kin while expanding: a constant's value, for conditions and
+// counts that follow (the passes assign it again in order); .equiv of a
+// symbol already defined is an error.
+fn preset(A: *mut Asm, op: []u8, args: []u8) void {
+    let xs = split_args(args);
+    if xs.len != 2 {
+        return;
+    }
+    let d = sym(A, trim(xs[0]));
+    let def = A.defs.get(@int_cast(usize, d));
+    if u.str_eq(op, ".equiv") and (def.abs or def.intext) {
+        fail(A, u.f1("the symbol '%s' is already defined (.equiv)", def.name));
+        return;
+    }
+    let saved = A.err;
+    let v = settle(A, eval(A, xs[1]));
+    A.err = saved;  // (not a constant yet: the passes give it its value)
+    let p = A.defs.at(@int_cast(usize, d));
+    if v.ok and is_const(v) {
+        p.abs = true;
+        p.off = @bit_cast(u64, v.k);
+    } else {
+        p.intext = true;
+    }
+}
+
+// .if and its kin, .else, .elseif, .endif.
+fn conditional(A: *mut Asm, p: Parts, conds: *mut u.List.[Cond]) void {
+    let op = p.op;
+    if u.str_eq(op, ".endif") {
+        if conds.len == 0 {
+            fail(A, ".endif without .if");
+            return;
+        }
+        _ = conds.pop();
+        return;
+    }
+    if u.str_eq(op, ".else") or u.str_eq(op, ".elseif") {
+        if conds.len == 0 {
+            fail(A, u.f1("%s without .if", op));
+            return;
+        }
+        let c = conds.at(conds.len - 1);
+        if c.else_ {
+            fail(A, u.f1("%s after .else", op));
+            return;
+        }
+        if u.str_eq(op, ".else") {
+            c.else_ = true;
+            c.active = c.outer and not c.done;
+            c.done = true;
+            return;
+        }
+        if c.done or not c.outer {
+            c.active = false;
+            return;
+        }
+        let t = eval_const(A, p.args, "the condition of .elseif") != 0;
+        c.active = t;
+        c.done = t;
+        return;
+    }
+    let outer = cond_active(conds);
+    let mut t = false;
+    if outer {
+        t = cond_true(A, op, p.args);
+    }
+    conds.push(Cond.{ active: outer and t, done: t, else_: false, outer: outer });
+}
+
+// Is the condition of `.if`-kind op with args true?
+fn cond_true(A: *mut Asm, op: []u8, args: []u8) bool {
+    let a = trim(args);
+    if u.str_eq(op, ".ifdef") or u.str_eq(op, ".ifndef") or u.str_eq(op, ".ifnotdef") {
+        let found = A.names.get(u.intern(a));
+        let mut def = false;
+        if found != 0 {
+            let d = A.defs.get(@int_cast(usize, found - 1));
+            def = d.abs or d.intext;
+        }
+        return def == u.str_eq(op, ".ifdef");
+    }
+    if u.str_eq(op, ".ifb") or u.str_eq(op, ".ifnb") {
+        return (a.len == 0) == u.str_eq(op, ".ifb");
+    }
+    if u.str_eq(op, ".ifc") or u.str_eq(op, ".ifnc") {
+        let xs = split_args(a);
+        let mut x = "";
+        let mut y = "";
+        if xs.len > 0 {
+            x = unquote1(xs[0]);
+        }
+        if xs.len > 1 {
+            y = unquote1(xs[1]);
+        }
+        return u.str_eq(x, y) == u.str_eq(op, ".ifc");
+    }
+    if u.str_eq(op, ".ifeqs") or u.str_eq(op, ".ifnes") {
+        let xs = split_args(a);
+        if xs.len != 2 {
+            fail(A, u.f1("%s needs two strings", op));
+            return false;
+        }
+        return u.str_eq(string(A, xs[0]), string(A, xs[1])) == u.str_eq(op, ".ifeqs");
+    }
+    let names = [".if", ".ifne", ".ifeq", ".iflt", ".ifle", ".ifgt", ".ifge"];
+    for k in 0..names.len {
+        if u.str_eq(op, names[k]) {
+            let v = eval_const(A, a, u.f1("the condition of %s", op));
+            if k <= 1 {
+                return v != 0;
+            }
+            if k == 2 {
+                return v == 0;
+            }
+            if k == 3 {
+                return v < 0;
+            }
+            if k == 4 {
+                return v <= 0;
+            }
+            if k == 5 {
+                return v > 0;
+            }
+            return v >= 0;
+        }
+    }
+    fail(A, u.f1("the directive '%s' is not supported", op));
+    return false;
+}
+
+// A .ifc operand: its text, or what is between its single quotes.
+fn unquote1(s0: []u8) []u8 {
+    let s = trim(s0);
+    if (s.len >= 2) and (s[0] == '\'') and (s[s.len - 1] == '\'') {
+        return s[1..s.len - 1];
+    }
+    return s;
+}
+
+// .macro name params: the macro is defined (body: its lines).
+fn define_macro(A: *mut Asm, args: []u8, body: []Raw) void {
+    let a = trim(args);
+    let mut k: usize = 0;
+    while (k < a.len) and not is_space(a[k]) and (a[k] != ',') {
+        k += 1;
+    }
+    let name = lower(a[0..k]);
+    if name.len == 0 {
+        fail(A, ".macro needs a name");
+        return;
+    }
+    let mut rest = trim(a[k..]);
+    if (rest.len > 0) and (rest[0] == ',') {
+        rest = trim(rest[1..]);
+    }
+    let mut params = u.List.[[]u8].empty();
+    let mut defs = u.List.[[]u8].empty();
+    let mut req = u.List.[bool].empty();
+    let mut vararg = false;
+    for x in macro_words(rest) {
+        let mut pn = x;
+        let mut dflt = "";
+        let eq = u.find(x, '=');
+        if eq >= 0 {
+            pn = trim(x[0..@int_cast(usize, eq)]);
+            dflt = unquote_arg(trim(x[@int_cast(usize, eq) + 1..]));
+        }
+        let mut rq = false;
+        let colon = u.find(pn, ':');
+        if colon >= 0 {
+            let q = lower(pn[@int_cast(usize, colon) + 1..]);
+            pn = pn[0..@int_cast(usize, colon)];
+            if u.str_eq(q, "req") {
+                rq = true;
+            } else if u.str_eq(q, "vararg") {
+                vararg = true;
+            } else {
+                fail(A, u.f1("':%s' is not a qualifier of a macro parameter (req, vararg)", q));
+                return;
+            }
+        }
+        params.push(pn);
+        defs.push(dflt);
+        req.push(rq);
+    }
+    A.macros.push(Macro.{ name: name, params: params.items(), defaults: defs.items(), req: req.items(), vararg: vararg,
+                          body: body });
+}
+
+// The words of a parameter or argument list: separated by commas, or by
+// spaces outside quotes and parentheses (`a, b=2` and `a b=2` alike).
+fn macro_words(s: []u8) [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    let mut i: usize = 0;
+    while i < s.len {
+        while (i < s.len) and (is_space(s[i]) or (s[i] == ',')) {
+            if s[i] == ',' {
+                // an empty argument between two commas
+                let mut j = i + 1;
+                while (j < s.len) and is_space(s[j]) {
+                    j += 1;
+                }
+                if (j < s.len) and (s[j] == ',') {
+                    out.push("");
+                }
+            }
+            i += 1;
+        }
+        if i >= s.len {
+            break;
+        }
+        let st = i;
+        let mut depth: i32 = 0;
+        while i < s.len {
+            let c = s[i];
+            if c == '"' {
+                i += 1;
+                while (i < s.len) and (s[i] != '"') {
+                    if (s[i] == '\\') and ((i + 1) < s.len) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            } else if (c == '(') or (c == '[') {
+                depth += 1;
+            } else if ((c == ')') or (c == ']')) and (depth > 0) {
+                depth -= 1;
+            } else if (depth == 0) and (c == ',') {
+                break;
+            } else if (depth == 0) and is_space(c) {
+                // a space ends the word unless an operator joins it to the next
+                let mut j = i;
+                while (j < s.len) and is_space(s[j]) {
+                    j += 1;
+                }
+                let prev = s[i - 1];
+                let joins = (j < s.len) and (is_op_char(s[j]) or is_op_char(prev) or (s[j] == '='));
+                if not joins {
+                    break;
+                }
+            }
+            if i < s.len {
+                i += 1;
+            }
+        }
+        out.push(trim(s[st..@min(i, s.len)]));
+    }
+    return out.items();
+}
+
+fn is_op_char(c: u8) bool {
+    return (c == '+') or (c == '-') or (c == '*') or (c == '/') or (c == '|') or (c == '&') or (c == '^') or
+           (c == '<') or (c == '>') or (c == '=') or (c == '%') or (c == '!');
+}
+
+// A macro argument without its quotes ("a b" is a b).
+fn unquote_arg(s: []u8) []u8 {
+    if (s.len >= 2) and (s[0] == '"') and (s[s.len - 1] == '"') {
+        return s[1..s.len - 1];
+    }
+    return s;
+}
+
+// The macro mk invoked with args.
+fn invoke(A: *mut Asm, mk: i32, args: []u8, depth: i32, conds: *mut u.List.[Cond]) void {
+    let m = A.macros.get(@int_cast(usize, mk));
+    let n = m.params.len;
+    let vals = u.newn.[[]u8](n + 1);
+    let set = u.newn.[bool](n + 1);
+    for k in 0..n {
+        vals[k] = m.defaults[k];
+        set[k] = false;
+    }
+    let words = macro_words(args);
+    let mut pos: usize = 0;
+    let mut w: usize = 0;
+    while w < words.len {
+        let x = words[w];
+        // a keyword argument: param=value
+        let eq = u.find(x, '=');
+        if (eq > 0) and (((@int_cast(usize, eq) + 1) >= x.len) or (x[@int_cast(usize, eq) + 1] != '=')) {
+            let pn = trim(x[0..@int_cast(usize, eq)]);
+            let mut found = false;
+            for k in 0..n {
+                if u.str_eq(m.params[k], pn) {
+                    vals[k] = unquote_arg(trim(x[@int_cast(usize, eq) + 1..]));
+                    set[k] = true;
+                    found = true;
+                }
+            }
+            if found {
+                w += 1;
+                continue;
+            }
+        }
+        if m.vararg and (n > 0) and (pos == (n - 1)) {
+            // the rest, as written
+            let mut b = u.Buf.init();
+            for j in w..words.len {
+                if j > w {
+                    b.s(", ");
+                }
+                b.s(words[j]);
+            }
+            vals[pos] = b.done();
+            set[pos] = true;
+            pos += 1;
+            break;
+        }
+        if pos >= n {
+            fail(A, u.f1("too many arguments for the macro '%s'", m.name));
+            return;
+        }
+        vals[pos] = unquote_arg(x);
+        set[pos] = true;
+        pos += 1;
+        w += 1;
+    }
+    for k in 0..n {
+        if m.req[k] and not set[k] {
+            fail(A, u.f2("the macro '%s' needs its argument '%s'", m.name, m.params[k]));
+            return;
+        }
+    }
+    let count = A.nmacro;
+    A.nmacro += 1;
+    let body = u.newn.[Raw](m.body.len + 1);
+    for k in 0..m.body.len {
+        body[k] = Raw.{ text: subst(m.body[k].text, m.params, vals[0..n], u.dec(count)), line: A.xline };
+    }
+    let line = A.xline;
+    let mut exitm = false;
+    let before = conds.len;
+    expand_lines(A, body[0..m.body.len], depth + 1, conds, &mut exitm);
+    if not failed(A) and (conds.len != before) and not exitm {
+        A.xline = line;
+        fail(A, u.f1("a .if of the macro '%s' without its .endif", m.name));
+    }
+    while conds.len > before {
+        _ = conds.pop();
+    }
+    A.xline = line;
+}
+
+// Text s with \param replaced by its value, \@ by `count` and \() by
+// nothing.
+fn subst(s: []u8, params: [][]u8, vals: [][]u8, count: []u8) []u8 {
+    if u.find(s, '\\') < 0 {
+        return s;
+    }
+    let mut b = u.Buf.init();
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if (c != '\\') or ((i + 1) >= s.len) {
+            b.c(c);
+            i += 1;
+            continue;
+        }
+        let n = s[i + 1];
+        if n == '@' {
+            b.s(count);
+            i += 2;
+            continue;
+        }
+        if (n == '(') and ((i + 2) < s.len) and (s[i + 2] == ')') {
+            i += 3;
+            continue;
+        }
+        let mut j = i + 1;
+        while (j < s.len) and is_sym_char(s[j]) and (s[j] != '.') and (s[j] != '$') {
+            j += 1;
+        }
+        let w = s[i + 1..j];
+        let mut done = false;
+        for k in 0..params.len {
+            if (w.len > 0) and u.str_eq(params[k], w) {
+                b.s(vals[k]);
+                done = true;
+                break;
+            }
+        }
+        if done {
+            i = j;
+            continue;
+        }
+        b.c(c);
+        i += 1;
+    }
+    return b.done();
+}
+
+// .rept n, .irp sym, values..., .irpc sym, chars: the body, repeated.
+fn repeat(A: *mut Asm, p: Parts, body: []Raw, depth: i32, conds: *mut u.List.[Cond], exitm: *mut bool) void {
+    if u.str_eq(p.op, ".rept") or u.str_eq(p.op, ".rep") {
+        let n = eval_const(A, p.args, "the count of .rept");
+        if failed(A) {
+            return;
+        }
+        if (n < 0) or (n > 1000000) {
+            fail(A, u.f1("a .rept count of %s", u.dec(n)));
+            return;
+        }
+        for _k in @as(i64, 0)..n {
+            expand_lines(A, body, depth + 1, conds, exitm);
+            if failed(A) or exitm.* {
+                return;
+            }
+        }
+        return;
+    }
+    let a = trim(p.args);
+    let mut k: usize = 0;
+    while (k < a.len) and is_sym_char(a[k]) {
+        k += 1;
+    }
+    let name = a[0..k];
+    if name.len == 0 {
+        fail(A, u.f1("%s needs a name", p.op));
+        return;
+    }
+    let mut rest = trim(a[k..]);
+    if (rest.len > 0) and (rest[0] == ',') {
+        rest = trim(rest[1..]);
+    }
+    let one: [1][]u8 = [name];
+    let mut vals = u.List.[[]u8].empty();
+    if u.str_eq(p.op, ".irpc") {
+        let t = unquote_arg(rest);
+        for c in t {
+            let cb = u.newn.[u8](1);
+            cb[0] = c;
+            vals.push(cb[0..1]);
+        }
+    } else {
+        for w in macro_words(rest) {
+            vals.push(unquote_arg(w));
+        }
+        if vals.len == 0 {
+            vals.push("");
+        }
+    }
+    for v in vals.items() {
+        let vs: [1][]u8 = [v];
+        let lines = u.newn.[Raw](body.len + 1);
+        for j in 0..body.len {
+            lines[j] = Raw.{ text: subst(body[j].text, one[..], vs[..], u.dec(A.nmacro)), line: body[j].line };
+        }
+        expand_lines(A, lines[0..body.len], depth + 1, conds, exitm);
+        if failed(A) or exitm.* {
+            return;
+        }
+    }
 }
 
 // The Def of label `name` defined at the statement being read (numeric:
@@ -461,75 +1187,210 @@ pub fn def_off(A: *Asm, d: Def) u64 {
     return d.prev_off;
 }
 
+// The conventional precedence, lowest first: || and && (results 1 or
+// 0; && binds tighter), the comparisons (== != <> < <= > >=: -1 if true),
+// + and -, the bitwise | & ^ and ! (or not), and * / % << >>.
+fn next_ch(E: *Ex) u8 {
+    if (E.i + 1) < E.s.len {
+        return E.s[E.i + 1];
+    }
+    return 0;
+}
+
+fn bit(c: bool) i64 {
+    if c {
+        return 1;
+    }
+    return 0;
+}
+
 fn ex_or(E: *mut Ex) Val {
-    let mut a = ex_xor(E);
-    while a.ok and (ex_peek(E) == '|') and not (((E.i + 1) < E.s.len) and (E.s[E.i + 1] == '|')) {
-        E.i += 1;
-        let b = ex_xor(E);
-        a = arith(E.A, a, b, '|');
+    let mut a = ex_land(E);
+    while a.ok and (ex_peek(E) == '|') and ((E.i + 1) < E.s.len) and (E.s[E.i + 1] == '|') {
+        E.i += 2;
+        let b = ex_land(E);
+        a = arith(E.A, a, b, 'O');
     }
     return a;
 }
 
-fn ex_xor(E: *mut Ex) Val {
-    let mut a = ex_and(E);
-    while a.ok and (ex_peek(E) == '^') {
-        E.i += 1;
-        let b = ex_and(E);
-        a = arith(E.A, a, b, '^');
+fn ex_land(E: *mut Ex) Val {
+    let mut a = ex_cmp(E);
+    while a.ok and (ex_peek(E) == '&') and ((E.i + 1) < E.s.len) and (E.s[E.i + 1] == '&') {
+        E.i += 2;
+        let b = ex_cmp(E);
+        a = arith(E.A, a, b, 'A');
     }
     return a;
 }
 
-fn ex_and(E: *mut Ex) Val {
+fn ex_cmp(E: *mut Ex) Val {
     let mut a = ex_add(E);
-    while a.ok and (ex_peek(E) == '&') and not (((E.i + 1) < E.s.len) and (E.s[E.i + 1] == '&')) {
-        E.i += 1;
+    loop {
+        let c = ex_peek(E);
+        let n = next_ch(E);
+        let mut op: u8 = 0;
+        let mut len: usize = 2;
+        if (c == '=') and (n == '=') {
+            op = 'e';
+        } else if (c == '!') and (n == '=') {
+            op = 'n';
+        } else if (c == '<') and (n == '>') {
+            op = 'n';
+        } else if (c == '<') and (n == '=') {
+            op = 'l';
+        } else if (c == '>') and (n == '=') {
+            op = 'g';
+        } else if (c == '<') and (n != '<') {
+            op = '<';
+            len = 1;
+        } else if (c == '>') and (n != '>') {
+            op = '>';
+            len = 1;
+        } else if (c == '=') {
+            op = 'e';  // (a single '=' compares too)
+            len = 1;
+        }
+        if (op == 0) or not a.ok {
+            break;
+        }
+        E.i += len;
         let b = ex_add(E);
-        a = arith(E.A, a, b, '&');
+        a = compare(E.A, a, b, op);
     }
     return a;
+}
+
+// a op b of the comparisons: -1 if true, else 0 (also of two addresses in
+// one section, once placed).
+fn compare(A: *mut Asm, a0: Val, b0: Val, op: u8) Val {
+    if not a0.ok or not b0.ok {
+        return bad_val();
+    }
+    let mut a = settle(A, a0);
+    let mut b = settle(A, b0);
+    if (a.sym >= 0) and (b.sym >= 0) and (a.neg < 0) and (b.neg < 0) {
+        // two addresses: their difference
+        let d = settle(A, Val.{ ok: true, k: a.k - b.k, sym: a.sym, neg: b.sym, rm: RM_NONE });
+        a = d;
+        b = konst(0);
+    }
+    if not is_const(a) or not is_const(b) {
+        fail(A, "a comparison of a symbol's address with a constant");
+        return bad_val();
+    }
+    let x = a.k;
+    let y = b.k;
+    let mut t = false;
+    if op == 'e' {
+        t = x == y;
+    } else if op == 'n' {
+        t = x != y;
+    } else if op == '<' {
+        t = x < y;
+    } else if op == '>' {
+        t = x > y;
+    } else if op == 'l' {
+        t = x <= y;
+    } else {
+        t = x >= y;
+    }
+    if t {
+        return konst(-1);
+    }
+    return konst(0);
 }
 
 fn ex_add(E: *mut Ex) Val {
-    let mut a = ex_mul(E);
+    let mut a = ex_bit(E);
     loop {
         let c = ex_peek(E);
         if not a.ok or ((c != '+') and (c != '-')) {
             break;
         }
         E.i += 1;
-        let b = ex_mul(E);
+        let b = ex_bit(E);
         if not b.ok {
             return b;
         }
-        if c == '+' {
-            if (a.sym >= 0) and (b.sym >= 0) {
-                fail(E.A, "an expression adds two symbols");
-                return bad_val();
-            }
-            if b.sym >= 0 {
-                a.sym = b.sym;
-                a.rm = b.rm;
-            }
-            if b.neg >= 0 {
-                a.neg = b.neg;
-            }
-            a.k = a.k +% b.k;
-        } else {
-            if b.neg >= 0 {
-                fail(E.A, "an expression subtracts a difference of symbols");
-                return bad_val();
-            }
-            if b.sym >= 0 {
-                if a.neg >= 0 {
-                    fail(E.A, "an expression subtracts two symbols");
-                    return bad_val();
-                }
-                a.neg = b.sym;
-            }
-            a.k = a.k -% b.k;
+        a = add_vals(E.A, a, b, c == '-');
+        if not a.ok {
+            return a;
         }
+    }
+    return a;
+}
+
+// a + b or a - b of values with symbols: a symbol plus a constant, a
+// difference of two symbols (plus a constant).
+fn add_vals(A: *mut Asm, a0: Val, b: Val, minus: bool) Val {
+    let mut a = a0;
+    if not minus {
+        if (a.sym >= 0) and (b.sym >= 0) {
+            fail(A, "an expression adds two symbols");
+            return bad_val();
+        }
+        if b.sym >= 0 {
+            a.sym = b.sym;
+            a.rm = b.rm;
+        }
+        if b.neg >= 0 {
+            if a.neg >= 0 {
+                fail(A, "an expression subtracts two symbols");
+                return bad_val();
+            }
+            a.neg = b.neg;
+        }
+        a.k = a.k +% b.k;
+        return settle(A, a);
+    }
+    if b.neg >= 0 {
+        // a - (x - y) = a + y - x
+        if (a.sym >= 0) or (a.neg >= 0) {
+            fail(A, "an expression subtracts a difference of symbols");
+            return bad_val();
+        }
+        a.sym = b.neg;
+        a.neg = b.sym;
+        a.k = a.k -% b.k;
+        return settle(A, a);
+    }
+    if b.sym >= 0 {
+        if a.neg >= 0 {
+            fail(A, "an expression subtracts two symbols");
+            return bad_val();
+        }
+        if a.sym < 0 {
+            fail(A, "the negation of a symbol's address");
+            return bad_val();
+        }
+        a.neg = b.sym;
+    }
+    a.k = a.k -% b.k;
+    return settle(A, a);
+}
+
+fn ex_bit(E: *mut Ex) Val {
+    let mut a = ex_mul(E);
+    loop {
+        let c = ex_peek(E);
+        let n = next_ch(E);
+        let mut op: u8 = 0;
+        if (c == '|') and (n != '|') {
+            op = '|';
+        } else if (c == '&') and (n != '&') {
+            op = '&';
+        } else if c == '^' {
+            op = '^';
+        } else if (c == '!') and (n != '=') {
+            op = '!';
+        }
+        if (op == 0) or not a.ok {
+            break;
+        }
+        E.i += 1;
+        let b = ex_mul(E);
+        a = arith(E.A, a, b, op);
     }
     return a;
 }
@@ -572,6 +1433,15 @@ fn arith(A: *mut Asm, a0: Val, b0: Val, op: u8) Val {
     let y = b.k;
     if op == '|' {
         return konst(x | y);
+    }
+    if op == '!' {
+        return konst(x | ~y);
+    }
+    if op == 'O' {
+        return konst(bit((x != 0) or (y != 0)));
+    }
+    if op == 'A' {
+        return konst(bit((x != 0) and (y != 0)));
     }
     if op == '^' {
         return konst(x ^ y);
@@ -997,6 +1867,7 @@ pub struct Arch {
 /// Assembles A's text: passes until no label moves (at most 12).
 pub fn run(A: *mut Asm, arch: *Arch) void {
     split(A);
+    expand(A);
     if failed(A) {
         return;
     }
@@ -1081,6 +1952,49 @@ fn one_pass(A: *mut Asm, arch: *Arch) void {
     }
 }
 
+// The multi-byte NOP sequences the conventional assembler pads x86-64 code with (one
+// NOP of up to 11 bytes, longer runs as 11-byte NOPs then a shorter one), so
+// that .p2align and .balign in a text section give the same bytes.
+fn x86_nop_pad(A: *mut Asm, pad: u64) void {
+    // NOP encodings of lengths 1..11, as the conventional assembler's table has them
+    let nops = ["90", "6690", "0f1f00", "0f1f4000", "0f1f440000", "660f1f440000", "0f1f8000000000", "0f1f840000000000",
+                "660f1f840000000000", "662e0f1f840000000000", "66662e0f1f840000000000"];
+    if pad == 0 {
+        return;
+    }
+    // (the assembler emits a single leading 0x90, then NOPs of up to 11 bytes)
+    emit_nop(A, nops, 1);
+    let mut left = pad - 1;
+    while left > 0 {
+        let mut n = left;
+        if n > 11 {
+            n = 11;
+        }
+        emit_nop(A, nops, @int_cast(usize, n));
+        left -= n;
+    }
+}
+
+fn emit_nop(A: *mut Asm, nops: [11][]u8, n: usize) void {
+    let h = nops[n - 1];
+    let mut i: usize = 0;
+    while i < h.len {
+        emit8(A, @bit_cast(u64, (hexd(h[i]) * 16) + hexd(h[i + 1])));
+        i += 2;
+    }
+}
+
+fn hexd(c: u8) i64 {
+    if is_digit_core(c) {
+        return @as(i64, c - '0');
+    }
+    return @as(i64, c - 'a') + 10;
+}
+
+fn is_digit_core(c: u8) bool {
+    return (c >= '0') and (c <= '9');
+}
+
 // The alignment padding to a multiple of n (a power of two).
 fn align_to(A: *mut Asm, n: u64, fill: i64, has_fill: bool, arch: *Arch, max: u64) void {
     if (n == 0) or ((n & (n - 1)) != 0) {
@@ -1101,9 +2015,7 @@ fn align_to(A: *mut Asm, n: u64, fill: i64, has_fill: bool, arch: *Arch, max: u6
     }
     if (s.kind == elf.S_TEXT) and not has_fill {
         if arch.nop != 0 {
-            for _k in @as(u64, 0)..pad {
-                emit8(A, @as(u64, arch.nop));
-            }
+            x86_nop_pad(A, pad);
         } else {
             let mut p = pad;
             while (p % 4) != 0 {
@@ -1209,7 +2121,7 @@ fn pcrel_type(A: *Asm, n: u32) u32 {
     return elf.R_AARCH64_PREL32;
 }
 
-// A string literal's bytes (in the GNU assembler's escapes).
+// A string literal's bytes (in the conventional assembler's escapes).
 pub fn string(A: *mut Asm, s0: []u8) []u8 {
     let s = trim(s0);
     if (s.len < 2) or (s[0] != '"') or (s[s.len - 1] != '"') {
@@ -1254,7 +2166,18 @@ pub fn string(A: *mut Asm, s0: []u8) []u8 {
     return b.done();
 }
 
-fn kind_of_section(name: []u8, flags: []u8, ty: []u8) i32 {
+fn kind_of_section(name: []u8, flags0: []u8, ty: []u8) i32 {
+    let flags = flags0;
+    if u.contains(ty, "note") or u.starts(name, ".debug") or u.starts(name, ".comment") or
+       (not u.contains(flags, "a") and (flags.len > 2) and not u.contains(flags, "x") and not u.contains(flags, "w")) {
+        if not u.starts(name, ".text") and not u.starts(name, ".data") and not u.starts(name, ".rodata") and
+           not u.starts(name, ".bss") and not u.starts(name, ".init_array") and not u.starts(name, ".fini_array") {
+            return elf.S_DEBUG;  // (not loaded: notes, debug information, comments)
+        }
+    }
+    if u.contains(ty, "init_array") or u.contains(ty, "fini_array") or u.contains(ty, "preinit_array") {
+        return elf.S_DATA;
+    }
     if u.starts(name, ".text") {
         return elf.S_TEXT;
     }
@@ -1283,6 +2206,266 @@ fn kind_of_section(name: []u8, flags: []u8, ty: []u8) i32 {
         return elf.S_DATA;
     }
     return elf.S_RODATA;
+}
+
+// The bits of a .float (or .double: dbl) operand: a decimal number
+// (correctly rounded to the format), with an optional 0f, 0e or 0d
+// prefix, an integer, inf or nan (all mantissa bits set, as the GNU
+// assembler writes it), with a sign.
+fn float_bits(A: *mut Asm, s0: []u8, dbl: bool) u64 {
+    let mut s = trim(s0);
+    let mut neg = false;
+    if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
+        neg = s[0] == '-';
+        s = trim(s[1..]);
+    }
+    if (s.len > 2) and (s[0] == '0') and (u.find("fFeEdDrRsSxXpP", s[1]) >= 0) and
+       not ((s[1] == 'x') or (s[1] == 'X')) {
+        s = s[2..];
+        if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
+            if s[0] == '-' {
+                neg = not neg;
+            }
+            s = s[1..];
+        }
+    }
+    let l = lower(s);
+    let mut sign: u64 = 0;
+    if neg {
+        sign = 1;
+    }
+    if u.str_eq(l, "inf") or u.str_eq(l, "infinity") or u.str_eq(l, "nan") {
+        let nan = u.str_eq(l, "nan");
+        if dbl {
+            let mut b: u64 = 0x7ff0_0000_0000_0000;
+            if nan {
+                b = 0x7fff_ffff_ffff_ffff;
+            }
+            return b | (sign << 63);
+        }
+        let mut b: u64 = 0x7f80_0000;
+        if nan {
+            b = 0x7fff_ffff;
+        }
+        return b | (sign << 31);
+    }
+    let mut fl = false;
+    for c in l {
+        if (c == '.') or (c == 'e') {
+            fl = true;
+        }
+    }
+    if (l.len > 1) and (l[0] == '0') and (l[1] == 'x') {
+        fl = false;
+    }
+    if not fl {
+        let mut ok = true;
+        let n = number(l, &mut ok);
+        if not ok {
+            fail(A, u.f1("'%s' is not a floating-point number", s0));
+            return 0;
+        }
+        let mut f = @float_from_int(f64, n);
+        if neg {
+            f = -f;
+        }
+        if dbl {
+            return @bit_cast(u64, f);
+        }
+        return @as(u64, @bit_cast(u32, @float_cast(f32, f)));
+    }
+    if not float_text(l) {
+        fail(A, u.f1("'%s' is not a floating-point number", s0));
+        return 0;
+    }
+    if dbl {
+        let f = u.parse_f64(l);
+        let b = @bit_cast(u64, f);
+        if (b & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000 {
+            fail(A, u.f1("the number '%s' is out of the range of a double", s0));
+            return 0;
+        }
+        return b | (sign << 63);
+    }
+    let f = u.parse_f32(l);
+    let b = @as(u64, @bit_cast(u32, f));
+    if (b & 0x7f80_0000) == 0x7f80_0000 {
+        fail(A, u.f1("the number '%s' is out of the range of a float", s0));
+        return 0;
+    }
+    return b | (sign << 31);
+}
+
+// Is s (lower case) digits with at most one '.' and an exponent?
+fn float_text(s: []u8) bool {
+    let mut i: usize = 0;
+    let mut digits: i32 = 0;
+    while (i < s.len) and u.is_digit(s[i]) {
+        i += 1;
+        digits += 1;
+    }
+    if (i < s.len) and (s[i] == '.') {
+        i += 1;
+        while (i < s.len) and u.is_digit(s[i]) {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if (i < s.len) and (s[i] == 'e') {
+        i += 1;
+        if (i < s.len) and ((s[i] == '+') or (s[i] == '-')) {
+            i += 1;
+        }
+        let st = i;
+        while (i < s.len) and u.is_digit(s[i]) {
+            i += 1;
+        }
+        if i == st {
+            return false;
+        }
+    }
+    return i == s.len;
+}
+
+// A .octa operand: a 128-bit integer literal (decimal, hexadecimal, binary
+// or octal, with a sign), or an expression (sign-extended).
+fn octa(A: *mut Asm, s0: []u8, lo: *mut u64, hi: *mut u64) void {
+    let mut s = s0;
+    let mut neg = false;
+    if (s.len > 0) and (s[0] == '-') {
+        neg = true;
+        s = trim(s[1..]);
+    }
+    let mut base: u64 = 10;
+    let mut i: usize = 0;
+    if (s.len > 2) and (s[0] == '0') and ((s[1] == 'x') or (s[1] == 'X')) {
+        base = 16;
+        i = 2;
+    } else if (s.len > 2) and (s[0] == '0') and ((s[1] == 'b') or (s[1] == 'B')) {
+        base = 2;
+        i = 2;
+    } else if (s.len > 1) and (s[0] == '0') {
+        base = 8;
+        i = 1;
+    }
+    let mut literal = (s.len > 0) and u.is_digit(s[0]);
+    for k in i..s.len {
+        if digit_val(s[k]) >= @bit_cast(i64, base) {
+            literal = false;
+        }
+    }
+    if not literal {
+        let v = eval_const(A, s0, "the value of .octa");
+        lo.* = @bit_cast(u64, v);
+        hi.* = 0;
+        if v < 0 {
+            hi.* = 0xffff_ffff_ffff_ffff;
+        }
+        return;
+    }
+    let mut l: u64 = 0;
+    let mut h: u64 = 0;
+    while i < s.len {
+        let d = @bit_cast(u64, digit_val(s[i]));
+        // (h:l) = (h:l) * base + d, in 32-bit pieces
+        let p0 = (l & 0xffff_ffff) * base + d;
+        let p1 = (l >> 32) * base + (p0 >> 32);
+        let p2 = (h & 0xffff_ffff) * base + (p1 >> 32);
+        let p3 = (h >> 32) * base + (p2 >> 32);
+        l = (p0 & 0xffff_ffff) | (p1 << 32);
+        h = (p2 & 0xffff_ffff) | (p3 << 32);
+        i += 1;
+    }
+    if neg {
+        l = ~l;
+        h = ~h;
+        l +%= 1;
+        if l == 0 {
+            h +%= 1;
+        }
+    }
+    lo.* = l;
+    hi.* = h;
+}
+
+// x in the LEB128 encoding (DWARF's), unsigned or signed.
+fn leb(A: *mut Asm, x0: i64, signed: bool) void {
+    let mut x = x0;
+    if not signed {
+        let mut v = @bit_cast(u64, x0);
+        loop {
+            let mut b = v & 0x7f;
+            v = v >> 7;
+            if v != 0 {
+                b = b | 0x80;
+            }
+            emit8(A, b);
+            if v == 0 {
+                return;
+            }
+        }
+    }
+    loop {
+        let b = @bit_cast(u64, x) & 0x7f;
+        x = x >> 7;
+        let done = ((x == 0) and ((b & 0x40) == 0)) or ((x == -1) and ((b & 0x40) != 0));
+        if done {
+            emit8(A, b);
+            return;
+        }
+        emit8(A, b | 0x80);
+    }
+}
+
+// .incbin "file"[, skip[, count]]: the file's bytes, found as the C
+// preprocessor finds `#include "file"`: in the source's directory, then the
+// include directories (A.dirs); an absolute name, or one that leaves them
+// with "..", is not looked for.
+fn incbin(A: *mut Asm, args: []u8) void {
+    let xs = split_args(args);
+    if xs.len == 0 {
+        fail(A, ".incbin needs a file name");
+        return;
+    }
+    let name = string(A, xs[0]);
+    if failed(A) {
+        return;
+    }
+    if (name.len == 0) or (name[0] == '/') or (name[0] == '\\') or u.contains(name, "..") or
+       ((name.len > 1) and (name[1] == ':')) {
+        fail(A, u.f1(".incbin of '%s': the name must be relative to the include directories", name));
+        return;
+    }
+    let mut bytes = u.nosym();
+    for d in A.dirs {
+        let p = u.f2("%s/%s", d, name);
+        if u.is_file(p) {
+            bytes = u.read_file(p);
+            break;
+        }
+    }
+    if u.isnos(bytes) {
+        fail(A, u.f1(".incbin: the file '%s' is not in the include directories", name));
+        return;
+    }
+    let mut skip: i64 = 0;
+    let mut count = @int_cast(i64, bytes.len);
+    if xs.len > 1 {
+        skip = eval_const(A, xs[1], "the skip of .incbin");
+    }
+    if xs.len > 2 {
+        count = eval_const(A, xs[2], "the count of .incbin");
+    }
+    if (skip < 0) or (skip > @int_cast(i64, bytes.len)) or (count < 0) or ((skip + count) > @int_cast(i64, bytes.len)) {
+        fail(A, ".incbin's skip and count are outside the file");
+        return;
+    }
+    for k in @int_cast(usize, skip)..@int_cast(usize, skip + count) {
+        emit8(A, @as(u64, bytes[k]));
+    }
 }
 
 // Directives every architecture has.
@@ -1321,13 +2504,39 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
         return;
     }
     if u.str_eq(op, ".float") or u.str_eq(op, ".single") or u.str_eq(op, ".double") {
+        let dbl = u.str_eq(op, ".double");
         for s in split_args(args) {
-            let f = u.parse_f64(trim(s));
-            if u.str_eq(op, ".double") {
-                emit64(A, @bit_cast(u64, f));
+            let bits = float_bits(A, s, dbl);
+            if dbl {
+                emit64(A, bits);
             } else {
-                emit32(A, @as(u64, @bit_cast(u32, @float_cast(f32, f))));
+                emit32(A, bits);
             }
+        }
+        return;
+    }
+    if u.str_eq(op, ".octa") {
+        for s in split_args(args) {
+            let mut lo: u64 = 0;
+            let mut hi: u64 = 0;
+            octa(A, trim(s), &mut lo, &mut hi);
+            emit64(A, lo);
+            emit64(A, hi);
+        }
+        return;
+    }
+    if u.str_eq(op, ".uleb128") or u.str_eq(op, ".sleb128") {
+        let signed = op[1] == 's';
+        for s in split_args(args) {
+            let v = settle(A, eval(A, s));
+            if not v.ok {
+                return;
+            }
+            if not is_const(v) {
+                fail(A, u.f1("%s of a value that is not a constant here", op));
+                return;
+            }
+            leb(A, v.k, signed);
         }
         return;
     }
@@ -1472,6 +2681,60 @@ fn directive(A: *mut Asm, st: *mut Stmt, arch: *Arch) void {
                 d.global = false;
             }
         }
+        return;
+    }
+    if u.str_eq(op, ".comm") or u.str_eq(op, ".lcomm") {
+        // a zero-initialized object of its own in .bss (global for .comm:
+        // a definition, as with -fno-common; local for .lcomm)
+        let xs = split_args(args);
+        if xs.len < 2 {
+            fail(A, u.f1("%s needs a name and a size", op));
+            return;
+        }
+        let size = eval_const(A, xs[1], "the size");
+        let mut al: i64 = 1;
+        if xs.len > 2 {
+            al = eval_const(A, xs[2], "the alignment");
+        } else if u.str_eq(op, ".comm") {
+            // (the conventional assembler's default: the largest power of two up to 16 that divides the size)
+            al = 16;
+            while (al > 1) and ((size % al) != 0) {
+                al = al / 2;
+            }
+        }
+        if failed(A) or (size < 0) or (al <= 0) or ((al & (al - 1)) != 0) {
+            fail(A, u.f1("%s of a bad size or alignment", op));
+            return;
+        }
+        let save = A.cur;
+        A.cur = section(A, ".bss", elf.S_BSS);
+        align_to(A, @bit_cast(u64, al), 0, true, arch, 0);
+        let d = A.defs.at(@int_cast(usize, sym(A, trim(xs[0]))));
+        if d.defined and (d.sec >= 0) {
+            fail(A, u.f1("the symbol '%s' is defined twice", d.name));
+            return;
+        }
+        d.defined = true;
+        d.intext = true;
+        d.sec = A.cur;
+        d.off = here(A);
+        d.ty = elf.T_OBJECT;
+        d.size = size;
+        d.has_size = true;
+        if u.str_eq(op, ".comm") {
+            d.global = true;
+        }
+        A.secs.at(@int_cast(usize, A.cur)).size += @bit_cast(u64, size);
+        A.cur = save;
+        return;
+    }
+    if u.str_eq(op, ".incbin") {
+        incbin(A, args);
+        return;
+    }
+    if u.str_eq(op, ".subsection") {
+        // (one subsection per section here: the text keeps its order)
+        _ = eval_const(A, args, "the subsection");
         return;
     }
     if u.str_eq(op, ".type") {
