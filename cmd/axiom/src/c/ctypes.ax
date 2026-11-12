@@ -106,6 +106,10 @@ pub struct TagInfo {
     // TK_ENUM: the fixed underlying type (C23 `enum E : T`), or nil; whether its list was seen
     fixed: *mut CType,
     listed: bool,
+    // TK_ENUM: its constants' names and values (C23's compatibility of
+    // enumerations with the same tag: same_enum)
+    consts: u.List.[[]u8],
+    cvals: u.List.[u64],
     id: i32,
     // a GNU dialect: the attribute packed, a #pragma pack value (0: none),
     // the alignment the attribute aligned asks for (0: none)
@@ -254,15 +258,10 @@ pub fn init(o: *co.COptions) void {
         _ = i;
         g_bitint.push(u.nil.[CType]());
     }
-    // size_t and ptrdiff_t: the first of int, long and long long at least as
-    // wide as a pointer; wchar_t: (unsigned) short when 16 bits, else int,
-    // or long when int is 16 bits (as <stddef.h> says)
-    t_size = t_ullong;
-    if t_uint.bits >= o.ptr_bits {
-        t_size = t_uint;
-    } else if t_ulong.bits >= o.ptr_bits {
-        t_size = t_ulong;
-    }
+    // size_t and ptrdiff_t: the platform's type as wide as a pointer
+    // (copts.size_type, as <stddef.h> has it); wchar_t: (unsigned) short
+    // when 16 bits, else int, or long when int is 16 bits (as <stddef.h> says)
+    t_size = of_rank(co.size_type(o), false);
     t_ptrdiff = to_signed(t_size);
     if o.wchar_bits == 16 {
         t_wchar = pick_sign(t_short, o.wchar_signed);
@@ -280,10 +279,17 @@ pub fn init(o: *co.COptions) void {
             t_char32 = t_uint;
         }
     }
-    t_int64 = t_llong;
-    if t_long.bits == 64 {
-        t_int64 = t_long;
+    t_int64 = of_rank(co.int64_type(o), true);
+}
+
+// The standard integer type of copts rank code r, signed or unsigned.
+fn of_rank(r: i32, signed: bool) *mut CType {
+    let ts: [5]*mut CType = [t_schar, t_short, t_int, t_long, t_llong];
+    let t = ts[@int_cast(usize, r - co.R_CHAR)];
+    if signed {
+        return t;
     }
+    return to_unsigned(t);
 }
 
 const RANK_STEP: i32 = 100;
@@ -373,6 +379,11 @@ pub fn storage_bits(t: *CType) i32 {
 /// The standard in force.
 pub fn std() i32 {
     return g_opts.std;
+}
+
+/// The target's layout of bit-fields (copts.BF_).
+pub fn bitfield_rule() i32 {
+    return g_opts.bitfields;
 }
 
 // -----------------------------------------------------------------------------
@@ -983,7 +994,9 @@ pub fn compatible(a: *mut CType, b: *mut CType) bool {
     if (a.kind == TK_ERROR) or (b.kind == TK_ERROR) {
         return true;
     }
-    if a.quals != b.quals {
+    // (an array's qualifiers are its element's, which compatible_unq
+    // compares: C23 6.7.4.1p3 marks them on the array type too)
+    if (a.quals != b.quals) and (a.kind != TK_ARRAY) {
         return false;
     }
     return compatible_unq(a.unq, b.unq);
@@ -1074,9 +1087,39 @@ pub fn compatible_unq(a0: *mut CType, b0: *mut CType) bool {
         return (a.tag == b.tag) or same_content(a.tag, b.tag);
     }
     if k == TK_ENUM {
-        return a.tag == b.tag;
+        return (a.tag == b.tag) or same_enum(a.tag, b.tag);
     }
     return false;
+}
+
+// C23 6.2.7p1: two enumerations with the same tag (in different scopes, or
+// one redefining the other) are compatible if their constants correspond:
+// the same names with the same values, and fixed underlying types that are
+// compatible if either has one.
+fn same_enum(x: *TagInfo, y: *TagInfo) bool {
+    if (g_opts.std < co.C23) or (x.name.len == 0) or not u.same(x.name, y.name) or not x.listed or not y.listed or
+       (x.consts.len != y.consts.len) {
+        return false;
+    }
+    if u.notnil(x.fixed) != u.notnil(y.fixed) {
+        return false;
+    }
+    if u.notnil(x.fixed) and not compatible_unq(x.fixed, y.fixed) {
+        return false;
+    }
+    for i in 0..x.consts.len {
+        let mut found = false;
+        for j in 0..y.consts.len {
+            if u.same(x.consts.get(i), y.consts.get(j)) {
+                found = x.cvals.get(i) == y.cvals.get(j);
+                break;
+            }
+        }
+        if not found {
+            return false;
+        }
+    }
+    return true;
 }
 
 // The pairs of structures or unions whose members same_content is comparing

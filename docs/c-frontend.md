@@ -11,23 +11,25 @@ lists the diagnostics.
   `--c-std=`. Each mode accepts its standard's language and rejects what a later one
   added or its own removed (C99 has no implicit `int` or implicit function
   declarations, C23 no K&R definitions).
-- **Freestanding**: no C library. The compiler provides the headers a freestanding
-  implementation must (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`,
-  `<stdarg.h>`, `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdatomic.h>`,
-  `<stdnoreturn.h>`, and C23's `<stdbit.h>` and `<stdckdint.h>`), in `std/c/include/`. C23 (4p7) also asks a
-  freestanding implementation for most of `<string.h>` and some functions of
-  `<stdlib.h>` (and `<fenv.h>`, `<math.h>` when it claims Annex F): those are a
-  library's, and not provided. `<float.h>` has no `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`
+- **Freestanding**: the compiler provides the headers a freestanding implementation
+  must (`<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`, `<stdarg.h>`,
+  `<iso646.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdatomic.h>`, `<stdnoreturn.h>`, and C23's `<stdbit.h>`
+  and `<stdckdint.h>`), in `std/c/include/`, and of the library what C23 (4p7) asks of a
+  freestanding implementation in `<string.h>` (all but `strdup`, `strndup`, `strcoll`,
+  `strxfrm` and `strerror`): `std/c/include/string.h`, with one C source per function in
+  `std/c/lib/string/`, units of the C library (main.ax `c_library`; kept with
+  `--c-freestanding`). C23's `<stdlib.h>` part (and `<fenv.h>`, `<math.h>` when it claims
+  Annex F) is not provided. `<float.h>` has no `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`
   (signaling NaNs are not guaranteed to stay signaling).
 - **Calling convention**: each target's C ABI (x86-64 System V, Windows x64,
   AAPCS64 and its macOS variant, the WebAssembly C ABI), for structures and
   unions by value and variadic functions too (`cgen_abi.ax`, `cgen_va.ax`), so
-  that C compiled here calls and is called by the platform's C libraries. Not
-  matched: on x86-64 System V, a variadic argument of a type aligned to more than 16
-  bytes that goes on the stack (it must be at an address aligned as its type is,
-  which needs the caller's frame realigned: the stack keeps 16 bytes' alignment); on
-  macOS, a variadic argument of a type aligned to 16 bytes gets no padding before it
-  (the platform aligns its stack slot to 16).
+  that C compiled here calls and is called by the platform's C libraries, arguments
+  aligned to more than 16 bytes included (an x86-64 System V call that puts one on the
+  stack aligns its stack pointer for it: `IN_STACK_SAVE`, `IN_STACK_ALLOC` and
+  `IN_STACK_RESTORE` around the call). Bit-fields are laid out by the target's ABI
+  (`csema_bits.ax`: System V, AAPCS64, Windows x64). `tools/gen_c_abi.py` writes random
+  tests of all of it, whose units can be built by different compilers.
 - **Extensions only in the GNU dialects** (`--c-std=gnu89` ... `gnu23`, COptions.gnu:
   docs/c.md lists them): the keywords of `ctok.keyword_id_in`, the GNU attributes
   (`csema_gnu.ax`; `cfeat.ax` names them for `__has_attribute`), the builtins
@@ -68,10 +70,10 @@ lists the diagnostics.
 
   `long double` is the x87's 80-bit format on `x86_64` Linux, binary128 on `aarch64`
   Linux and WebAssembly, and binary64 elsewhere (`c/run/hdr_float_ld.c`).
-  (`c/run/target_*.c` check them.) Where the platforms' headers choose between
-  types of the same width, this implementation's may choose the other (`size_t` is
-  `unsigned int` on wasm32, `int64_t` is `long` on macOS): the representation and
-  calling convention are the same.
+  (`c/run/target_*.c` check them.) The typedefs of `<stddef.h>` and `<stdint.h>` are
+  the platform's types (`copts.set_platform`; the headers read them from predefined
+  `__AXIOM_*_TYPE__` macros), so that `size_t` is `unsigned long` on wasm32 and
+  `int64_t` is `long long` on macOS, as there.
 - **Fixed choices**: `BITINT_MAXWIDTH` is 64 (a `_BitInt(N)` is stored in the
   smallest of 8, 16, 32 and 64 bits that holds it); an inline definition (6.7.4p7)
   is compiled with internal linkage for the unit's own calls, so the external
@@ -113,6 +115,7 @@ std/c/rt/ldouble.ax         that long double's arithmetic, in software (the comp
 cmd/axiom/src/c/cc.ax       the driver, and the link of the units (with Axiom's)
 cmd/axiom/src/c/cstrip.ax   leaves out of an executable what the units define and nothing reaches
 std/c/include/              the compiler's headers
+std/c/lib/                  the library's sources (C), one function to a file
 cmd/axiom/internal/tests/c/ tests
 ```
 
@@ -253,6 +256,7 @@ comments, so that they are valid in every standard:
 /* expect-error: C3022 */   the build must fail with this code
 /* expect-warning: C4040 */ the build must warn with this code
 /* check-only */            only checked (axiom check, with the flags' --target)
+/* units: abi/x.c */        more translation units, relative to the test
 /* linux-only */            natively, only where host_native.c is linked
 ```
 
@@ -269,7 +273,8 @@ optimization level; they may say `/* native-only */` or `/* wasm-only */`. The
 each standard and with `--c-int`/`--c-long` choices), built and run the same way
 (`[c-prog]`); their expected output was checked against another implementation.
 `tools/gen_c_programs.py` writes random programs free of undefined behaviour for
-differential testing.
+differential testing, and `tools/gen_c_abi.py` random tests of the calling conventions
+(its `--host` output is `c/run/abi_gen_*.c`, with their callees in `c/run/abi/`).
 Preprocessor tests compare `--emit=c-pp` output with a `.pp` file next to them; parser
 tests compare `--emit=c-ast` with a `.ast` file.
 

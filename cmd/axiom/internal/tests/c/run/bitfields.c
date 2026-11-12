@@ -1,5 +1,6 @@
 /* Bit-fields: their layout (packed into units of their type, a new unit
-   when one would straddle, zero-width and unnamed ones), loads and stores
+   when one would straddle, zero-width and unnamed ones; the layouts that
+   differ between the targets' ABIs are in layout_bitfields_*.c), loads and stores
    with sign extension, compound assignment and ++/--, the value of an
    assignment, the promotion of narrow ones to int, _Bool and long long
    bit-fields, unions, static and automatic initializers. */
@@ -27,14 +28,11 @@ int main(void) {
     struct C c = { 3, 1 };
     int k;
     unsigned x;
+    /* (the sizes that are the same in every target's ABI: the others are
+       in layout_bitfields_*.c) */
     print_i64(sizeof(struct A));
-    print_i64(sizeof(struct B));
-    print_i64(sizeof(struct C));
-    print_i64(sizeof(struct D));
-    print_i64(sizeof(struct E));
     print_i64(sizeof(struct G));
     print_i64(sizeof(union U));
-    print_i64(_Alignof(struct D));
     print_i64(a.a + a.b * 10 + a.c * 1000);
     print_i64(a.d);
     print_i64(a.e + a.f);
@@ -93,11 +91,6 @@ int main(void) {
 /* expect: 8 */
 /* expect: 8 */
 /* expect: 4 */
-/* expect: 5 */
-/* expect: 3 */
-/* expect: 8 */
-/* expect: 4 */
-/* expect: 1 */
 /* expect: -2825 */
 /* expect: 703710 */
 /* expect: 103 */

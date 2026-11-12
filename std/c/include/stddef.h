@@ -7,21 +7,14 @@
 #define __STDC_VERSION_STDDEF_H__ 202311L
 #endif
 
-/* size_t and ptrdiff_t: the first of int, long and long long as wide as a
-   pointer (the type of sizeof and of a pointer difference) */
-#if __AXIOM_INT_WIDTH__ >= __AXIOM_PTR_WIDTH__
-typedef unsigned int size_t;
-typedef int ptrdiff_t;
-#elif __AXIOM_LONG_WIDTH__ >= __AXIOM_PTR_WIDTH__
-typedef unsigned long size_t;
-typedef long ptrdiff_t;
-#elif __STDC_VERSION__ >= 199901L
-typedef unsigned long long size_t;
-typedef long long ptrdiff_t;
-#else
-typedef unsigned __axiom_int64 size_t;
-typedef __axiom_int64 ptrdiff_t;
+/* size_t and ptrdiff_t: the platform's types as wide as a pointer (the
+   compiler's macros: unsigned long and long, or on Windows unsigned long
+   long and long long) */
+#ifndef __AXIOM_SIZE_T_DEFINED
+#define __AXIOM_SIZE_T_DEFINED
+typedef __AXIOM_SIZE_TYPE__ size_t;
 #endif
+typedef __AXIOM_PTRDIFF_TYPE__ ptrdiff_t;
 
 /* wchar_t: as the literals L"..." are (16 or 32 bits: the narrowest type of
    at least 32 when none has 32) */
@@ -46,10 +39,15 @@ typedef unsigned long wchar_t;
 #endif
 
 #if __STDC_VERSION__ >= 201112L
+/* the platforms' choices: aligned to 16 bytes, or to 8 (Windows, macOS) */
+#if __AXIOM_MAX_ALIGN__ == 16
 typedef struct {
     long long __axiom_ll;
-    long double __axiom_ld;
+    _Alignas(16) long double __axiom_ld;
 } max_align_t;
+#else
+typedef long double max_align_t;
+#endif
 #endif
 
 #if __STDC_VERSION__ >= 202311L

@@ -9,7 +9,6 @@ struct B { char x; int y : 12; };
 
 int main(void) {
     struct A s = { 0, -4096, 0, 255, 0 };
-    print_i64(sizeof(struct A));
     print_i64(sizeof(struct B));
     print_i64(s.b);
     s.b = -4097;
@@ -27,7 +26,6 @@ int main(void) {
     print_i64(s.e);
     return 0;
 }
-/* expect: 8 */
 /* expect: 4 */
 /* expect: -4096 */
 /* expect: 4095 */

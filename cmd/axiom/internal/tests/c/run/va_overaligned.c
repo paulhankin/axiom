@@ -1,9 +1,8 @@
 /* flags: --c-std=c23 */
-/* wasm-only */
-/* va_arg of structures aligned to more than 16 bytes. (Not run natively:
-   on x86-64 System V such an argument on the stack must be at an address
-   aligned as its type is, which needs the caller's frame realigned; the
-   compiler keeps the stack at 16 bytes' alignment.) */
+/* va_arg of structures aligned to more than 16 bytes: on x86-64 System V
+   such an argument on the stack is at an address aligned as its type is
+   (the caller aligns its stack pointer for the call); AAPCS64, Windows and
+   macOS pass them by reference, the copy aligned to 16 at most. */
 #include "host.h"
 #include <stdarg.h>
 

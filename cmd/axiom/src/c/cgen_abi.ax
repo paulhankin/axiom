@@ -145,6 +145,7 @@ pub struct Plan {
     vararg: bool,   // the IR signature is variadic (a call of a variadic function, but on WebAssembly)
     vabuf: i32,     // the IR parameter of the variadic buffer, or -1
     vabuf_size: u64,
+    stack_align: u64,  // a call's stack arguments need the stack aligned to this (more than 16; or 0)
     // a variadic definition: what the named parameters use (va_start)
     va_gp: u64,             // integer registers
     va_fp: u64,             // floating-point (vector) registers
@@ -514,6 +515,7 @@ struct Builder {
     nf: u64,
     pos: u64,   // Windows: positions used
     soff: u64,  // bytes of stack used by the named arguments
+    voff: u64,  // macOS: the next variadic argument's offset on the stack
 }
 
 fn item(ty: *mut ir.Ty, ext: u8, what: i32, arg: i32, piece: usize) Item {
@@ -684,9 +686,15 @@ fn sysv_arg(b: *mut Builder, i: usize) void {
         }
     }
     // MEMORY (X87 and X87UP too), or no registers left for all of it: its
-    // image on the stack
+    // image on the stack, at an offset aligned as its type is; a stricter
+    // alignment than the stack's 16 bytes needs the caller's stack pointer
+    // aligned to it too (psABI 3.2.2: the end of the argument area is
+    // aligned to the alignment of what is passed on the stack)
     chunk_pieces(a, t);
     pad_stack(b, cty.align_of(t), false, true);
+    if cty.align_of(t) > @max(b.p.stack_align, 16) {
+        b.p.stack_align = cty.align_of(t);
+    }
     b.soff += @as(u64, a.n) * 8;
     push_pieces(b, i, true);
 }
@@ -725,6 +733,7 @@ fn a64_arg(b: *mut Builder, i: usize, darwin_va: bool) void {
     if not aggregate(t) {
         set_scalar(a, t);
         if darwin_va {
+            darwin_va_slots(b, cty.align_of(t), 1);
             push_pieces(b, i, false);
             return;
         }
@@ -743,8 +752,10 @@ fn a64_arg(b: *mut Builder, i: usize, darwin_va: bool) void {
     if darwin_va {
         if size > 16 {
             set_ref(a);
+            darwin_va_slots(b, 8, 1);
         } else {
             chunk_pieces(a, t);
+            darwin_va_slots(b, cty.align_of(t), @as(u64, a.n));
         }
         push_pieces(b, i, false);
         return;
@@ -802,6 +813,18 @@ fn a64_arg(b: *mut Builder, i: usize, darwin_va: bool) void {
         stack_bytes(b, n * 8, false);
     }
     push_pieces(b, i, false);
+}
+
+// macOS: a variadic argument of alignment al in n 8-byte stack slots.
+// Apple's arm64 ABI puts each variadic argument on the stack at the next
+// offset aligned to its alignment (at least 8, at most 16): a filler slot
+// before one aligned to 16 when the offset is not.
+fn darwin_va_slots(b: *mut Builder, al: u64, n: u64) void {
+    if ((b.voff % 16) != 0) and (al >= 16) {
+        b.regs.push(item(ir.t_int(64), 0, SL_FILL, -1, 0));
+        b.voff += 8;
+    }
+    b.voff += n * 8;
 }
 
 // Fillers that land on the stack (the registers of their class are used
@@ -1025,10 +1048,15 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
     set_result(b);
     let ab = p.abi;
     let mut nfixed_items: usize = 0;
+    let mut seen_va = false;
     for i in 0..ps.len {
         let va = i >= nnamed;
-        if va and (nfixed_items == 0) {
+        if va and not seen_va {
+            seen_va = true;
             nfixed_items = b.regs.len + b.stack.len;
+            // (macOS: the variadic arguments follow the named ones' stack,
+            // from an 8-byte boundary)
+            b.voff = cty.round_up(b.soff, 8);
         }
         if ab == ABI_SYSV {
             sysv_arg(b, i);
@@ -1040,7 +1068,7 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
             wasm_arg(b, i, va);
         }
     }
-    if (nnamed >= ps.len) or (nfixed_items == 0) {
+    if not seen_va {
         nfixed_items = b.regs.len + b.stack.len;
     }
     // the named arguments' use, for va_start

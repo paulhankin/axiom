@@ -5,21 +5,38 @@
 // bit-field's value (6.3.1.1p2). It imports only the types, so that both
 // declarations and expressions can use it.
 //
-// Layout (the implementation's choices, the same on every target): a
-// bit-field of type T (of size and alignment S bytes) goes at the next bit
-// if it fits in the S-byte unit, aligned to S, that holds that bit;
-// otherwise it starts the next such unit. A bit-field never straddles two
-// units, so it is reached by loading and storing its unit (Member.offset,
-// .bit_off: bits from the least significant end). An unnamed bit-field of
-// width 0 moves the next member to the next unit of its type; unnamed
-// bit-fields take space but do not add to the alignment of the structure
-// (a named one adds its type's). A plain `int` bit-field is signed (6.7.2p5
-// leaves it to the implementation), as every other int is. Other members
-// go at the next byte that is a multiple of their alignment (with an
-// alignment specifier: the stricter of its and their type's).
+// Layout (the target's C ABI's; the implementation's choices where the
+// standard leaves them, 6.7.2.1p11): a bit-field of type T (of size and
+// alignment S bytes) is in a storage unit of S bytes aligned to S (its
+// Member.offset; .bit_off: its bits from the least significant end), never
+// straddling two, so that it is reached by loading and storing its unit.
+// Other members go at the next byte that is a multiple of their alignment
+// (with an alignment specifier: the stricter of its and their type's).
+//
+//   System V (x86-64 psABI 3.1.2; also Apple's arm64 ABI and WebAssembly):
+//     a bit-field goes at the next bit if it fits in the S-byte unit that
+//     holds that bit, else it starts the next such unit; one of width 0
+//     moves the next member to the next unit of its type. A named
+//     bit-field's type adds to the alignment of the structure or union;
+//     an unnamed one's does not.
+//   AAPCS64 (Linux; 10.1.8): as System V, but every bit-field's type adds
+//     to the alignment, named or not, of width 0 too.
+//   Windows x64: bit-fields are allocated in runs; a run is a unit of its
+//     first bit-field's type size, aligned to it, and a bit-field joins the
+//     run if its type has that size and it fits, else it starts a new run
+//     after the unit; any other member closes the run. One of width 0 closes
+//     a run (the next member aligned to its type) and is ignored where no
+//     run is open. Every bit-field's type that starts or ends a run adds to
+//     the alignment of a structure; a union's bit-fields add to its size
+//     (their type's size; one of width 0 only after another bit-field) but
+//     not to its alignment.
+//
+// A plain `int` bit-field is signed (6.7.2p5 leaves it to the
+// implementation), as every other int is.
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "copts.ax" as co;
 import "ctypes.ax" as cty;
 
 /// The bit-field that expression e designates (a member access), or nil.
@@ -89,13 +106,18 @@ fn placed_align(ti: *cty.TagInfo, m: *cty.Member) u64 {
 ///
 /// In a GNU dialect a structure or member may be packed, or laid out under
 /// `#pragma pack(n)`: a member's alignment is then 1, or at most n
-/// (placed_align); a bit-field whose unit is so aligned (A bytes) goes at the
-/// next bit if it fits in the S bytes from the last multiple of A at or
-/// before it, else at the next multiple of A. Such a bit-field is reached
+/// (placed_align); a bit-field whose unit is so aligned goes at the next bit
+/// (System V, AAPCS64; Windows keeps whole units, aligned so: layout_ms).
+/// Such a bit-field is reached
 /// through the smallest unit of 1, 2, 4 or 8 bytes that holds it and lies in
 /// the structure (unit_bits), loaded with alignment 1; one that has none is
 /// C3901.
 pub fn layout(ti: *mut cty.TagInfo) void {
+    if cty.bitfield_rule() == co.BF_MS {
+        layout_ms(ti);
+        return;
+    }
+    let all_bf_align = cty.bitfield_rule() == co.BF_AAPCS64;
     let is_union = ti.kind == cty.TK_UNION;
     let mut pos: u64 = 0;  // a structure: the next free bit
     let mut al: u64 = 1;
@@ -106,12 +128,25 @@ pub fn layout(ti: *mut cty.TagInfo) void {
             let ub = cty.size_of(m.ty) * 8;  // the unit's bits
             let w = @as(u64, @bit_cast(u32, m.bit_width));
             let a = placed_align(ti, m);
-            let natural = a >= cty.size_of(m.ty);
+            // (packed, or under any #pragma pack: placed at the next bit,
+            // whatever its alignment)
+            let natural = (a >= cty.size_of(m.ty)) and not (ti.packed or m.packed or (ti.pack != 0));
             if not natural {
                 m.place_align = a;
             }
             if (m.name.len > 0) and (a > al) {
                 al = a;
+            }
+            // (AAPCS64: an unnamed one's type adds its own alignment, one of
+            // width 0 even in a packed structure or under #pragma pack)
+            if all_bf_align and (m.name.len == 0) {
+                let mut ua = a;
+                if m.bit_width == 0 {
+                    ua = cty.align_of(m.ty);
+                }
+                if ua > al {
+                    al = ua;
+                }
             }
             if is_union {
                 m.offset = 0;
@@ -139,11 +174,8 @@ pub fn layout(ti: *mut cty.TagInfo) void {
                 m.offset = unit / 8;
                 m.bit_off = @bit_cast(i32, @truncate(u32, pos - unit));
             } else {
-                let ab = a * 8;
-                let start = pos / ab * ab;
-                if pos + w > start + ub {
-                    pos = cty.round_up(pos, ab);
-                }
+                // (packed or under #pragma pack: at the next bit, wherever
+                // it ends, as the platforms' compilers place it)
                 m.offset = pos / 8;
                 m.bit_off = @bit_cast(i32, @truncate(u32, pos % 8));
                 fix = true;
@@ -151,28 +183,44 @@ pub fn layout(ti: *mut cty.TagInfo) void {
             pos += w;
             continue;
         }
-        let ma = placed_align(ti, m);
-        if ma < member_align(m) {
-            m.place_align = ma;
-        }
-        let ms = cty.size_of(m.ty);
-        if ma > al {
-            al = ma;
-        }
-        if is_union {
-            m.offset = 0;
-            if ms > size {
-                size = ms;
-            }
-        } else {
-            let off = cty.round_up((pos + 7) / 8, ma);
-            m.offset = off;
-            pos = (off + ms) * 8;
-            if (m.ty.kind == cty.TK_ARRAY) and not m.ty.has_len {
-                ti.has_flex = true;
-            }
-        }
+        place(ti, m, is_union, &mut pos, &mut al, &mut size);
     }
+    finish(ti, is_union, pos, al, size, fix);
+}
+
+// A member that is not a bit-field, at the next multiple of the alignment
+// it is placed at (placed_align) after bit pos (a structure) or at 0 (a
+// union).
+fn place(ti: *mut cty.TagInfo, m: *mut cty.Member, is_union: bool, pos: *mut u64, al: *mut u64, size: *mut u64) void {
+    let ma = placed_align(ti, m);
+    if ma < member_align(m) {
+        m.place_align = ma;
+    }
+    let ms = cty.size_of(m.ty);
+    if ma > al.* {
+        al.* = ma;
+    }
+    if is_union {
+        m.offset = 0;
+        if ms > size.* {
+            size.* = ms;
+        }
+        return;
+    }
+    let off = cty.round_up((pos.* + 7) / 8, ma);
+    m.offset = off;
+    pos.* = (off + ms) * 8;
+    if (m.ty.kind == cty.TK_ARRAY) and not m.ty.has_len {
+        ti.has_flex = true;
+    }
+}
+
+// The size and alignment of ti, its members placed (pos: a structure's next
+// bit; size0: a union's largest member); fix: bit-fields to be given units
+// of their own (packed_units).
+fn finish(ti: *mut cty.TagInfo, is_union: bool, pos: u64, al0: u64, size0: u64, fix: bool) void {
+    let mut size = size0;
+    let mut al = al0;
     if not is_union {
         size = (pos + 7) / 8;
     }
@@ -203,6 +251,11 @@ fn packed_units(ti: *mut cty.TagInfo) void {
         while ub < n {
             ub *= 2;
         }
+        // (no unit wider than 8 bytes: such a bit-field spans more than one)
+        if ub > 8 {
+            cs_not_supported(m, ub);
+            continue;
+        }
         let mut off = b0;
         if off + ub > ti.size {
             if ub > ti.size {
@@ -225,4 +278,83 @@ pub let mut cs_not_supported: fn(*cty.Member, u64) void = no_report;
 fn no_report(m: *cty.Member, n: u64) void {
     _ = m;
     _ = n;
+}
+
+// The Windows x64 layout (see the header): bit-fields in runs of units of
+// one size.
+fn layout_ms(ti: *mut cty.TagInfo) void {
+    let is_union = ti.kind == cty.TK_UNION;
+    let mut pos: u64 = 0;
+    let mut al: u64 = 1;
+    let mut size: u64 = 0;
+    let mut run = false;      // a run of bit-fields is open
+    let mut run_at: u64 = 0;  // its unit's offset (bytes) and size
+    let mut run_size: u64 = 0;
+    let mut used: u64 = 0;  // the bits of the unit used
+    let mut fix = false;
+    for m in ti.members.items() {
+        if not m.is_bitfield {
+            if run and not is_union {
+                pos = (run_at + run_size) * 8;
+            }
+            run = false;
+            place(ti, m, is_union, &mut pos, &mut al, &mut size);
+            continue;
+        }
+        let s = cty.size_of(m.ty);
+        // (#pragma pack and packed lower a unit's alignment, not its size:
+        // such a unit is reached as packed_units says)
+        let a = placed_align(ti, m);
+        if a < s {
+            m.place_align = a;
+            fix = true;
+        }
+        let w = @as(u64, @bit_cast(u32, m.bit_width));
+        m.bit_off = 0;
+        if is_union {
+            // (one of width 0 counts only after another bit-field)
+            m.offset = 0;
+            if ((w > 0) or run) and (s > size) {
+                size = s;
+            }
+            run = w > 0;
+            continue;
+        }
+        if w == 0 {
+            m.offset = pos / 8;
+            if run {
+                // (it closes the run: the next member is aligned to its type)
+                pos = cty.round_up(run_at + run_size, a) * 8;
+                m.offset = pos / 8;
+                run = false;
+                if a > al {
+                    al = a;
+                }
+            }
+            continue;
+        }
+        if run and (s == run_size) and ((used + w) <= (s * 8)) {
+            m.offset = run_at;
+            m.bit_off = @bit_cast(i32, @truncate(u32, used));
+            used += w;
+            continue;
+        }
+        let mut end = (pos + 7) / 8;
+        if run {
+            end = run_at + run_size;
+        }
+        run = true;
+        run_at = cty.round_up(end, a);
+        run_size = s;
+        used = w;
+        m.offset = run_at;
+        pos = (run_at + s) * 8;
+        if a > al {
+            al = a;
+        }
+    }
+    if run {
+        pos = (run_at + run_size) * 8;
+    }
+    finish(ti, is_union, pos, al, size, fix);
 }

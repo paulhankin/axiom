@@ -390,7 +390,8 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // print through host.h (next to run/); natively its functions are
 // c/host_native.c's, compiled by the system's C compiler, or for Windows and
 // macOS c/host_c.c's, a second translation unit over the platform's C library
-// (tests marked /* linux-only */ need the former). AXIOM_C_TARGET=wasm64
+// (tests marked /* linux-only */ need the former). /* units: a.c */ names more
+// translation units, next to the test (c/run/abi/). AXIOM_C_TARGET=wasm64
 // builds them for wasm64 instead of wasm32. A test marked /* check-only */ is
 // only checked (axiom check, with its own --target), not built or run.
 // The larger programs of c/prog/ are built and run the same way ([c-prog]).
@@ -402,6 +403,8 @@ const cRunTest = async (f) => {
   const src = fs.readFileSync(f, 'utf8');
   if (native && noC && /\/\* linux-only \*\//.test(src)) return { skip: true, reason: 'links C code' };
   const flags = [...src.matchAll(/\/\* flags: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/));
+  // (/* units: a.c b.c */: more translation units, next to the test)
+  flags.push(...[...src.matchAll(/\/\* units: (.*?) \*\//g)].flatMap((m) => m[1].trim().split(/\s+/)).map((u) => path.join(path.dirname(f), u)));
   const errors = [...src.matchAll(/\/\* expect-error: (C\d+) \*\//g)].map((m) => m[1]);
   const warnings = [...src.matchAll(/\/\* expect-warning: (C\d+) \*\//g)].map((m) => m[1]);
   const expect = [...src.matchAll(/^\/\* expect: ?(.*?) \*\/$/gm)].map((m) => m[1]);

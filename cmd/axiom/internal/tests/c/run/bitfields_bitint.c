@@ -8,11 +8,10 @@ static struct S g = { 100, -2000, -5, 3 };
 int main(void) {
     struct S s = { 127, 2047, 1, -1 };
     s.a++; s.b++;
-    print_i64(sizeof(struct S)); print_i64(s.a); print_i64(s.b); print_i64((long long)s.c); print_i64(s.d);
+    print_i64(s.a); print_i64(s.b); print_i64((long long)s.c); print_i64(s.d);
     print_i64(g.a); print_i64(g.b); print_i64((long long)g.c); print_i64(g.d);
     return 0;
 }
-/* expect: 8 */
 /* expect: 0 */
 /* expect: -2048 */
 /* expect: 1 */

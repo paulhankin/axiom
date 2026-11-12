@@ -10,10 +10,8 @@ int main(void) {
     print_i64(a.c);
     print_i64(a.i);
     print_i64(a.s);
-    print_i64(sizeof a);
     return 0;
 }
 /* expect: 15 */
 /* expect: -1 */
 /* expect: -1 */
-/* expect: 4 */

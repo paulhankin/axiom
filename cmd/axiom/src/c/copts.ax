@@ -2,6 +2,7 @@
 // copts.ax - the C front end's options: the language standard and the
 // implementation-defined choices a build can make (docs/c.md).
 // =============================================================================
+import "../util.ax" as u;
 
 // The standards, in order: a feature is on from the one that added it.
 pub const C89: i32 = 0;  // ISO/IEC 9899:1990 (and ANSI X3.159-1989)
@@ -26,6 +27,17 @@ pub struct COptions {
     ptr_bits: i32,      // the target's
     wchar_bits: i32,    // 32, or 16 for Windows targets
     wchar_signed: bool,
+    // the platform C library's choices among types of a width (set_platform):
+    // each an R_ code, used when that type has the width the role needs
+    size_pref: i32,    // size_t (ptrdiff_t, intptr_t: its signed type)
+    int64_pref: i32,   // int64_t
+    intmax_pref: i32,  // intmax_t
+    fast16_pref: i32,  // int_fast16_t
+    fast32_pref: i32,  // int_fast32_t
+    wint_pref: i32,    // wint_t
+    wint_signed: bool,
+    max_align: i32,        // the alignment of max_align_t
+    bitfields: i32,        // how bit-fields are laid out (BF_)
     defines: []Define,     // -D and -U, in order
     include_dirs: [][]u8,  // -I, in order (then the compiler's own headers)
     sys_include: []u8,     // the compiler's own headers (<std>/c/include)
@@ -75,6 +87,231 @@ pub fn std_named(s: []u8) i32 {
         }
     }
     return -1;
+}
+
+// -----------------------------------------------------------------------------
+// The types of the headers' typedefs
+// -----------------------------------------------------------------------------
+
+// The standard integer types by rank, as the typedefs' choices name them.
+pub const R_CHAR: i32 = 1;  // signed char
+pub const R_SHORT: i32 = 2;
+pub const R_INT: i32 = 3;
+pub const R_LONG: i32 = 4;
+pub const R_LLONG: i32 = 5;
+
+// The platforms whose C libraries the typedefs follow.
+pub const PLAT_LINUX: i32 = 1;    // x86-64 and AArch64 Linux
+pub const PLAT_DARWIN: i32 = 2;   // AArch64 macOS
+pub const PLAT_WINDOWS: i32 = 3;  // x86-64 Windows
+pub const PLAT_WASM: i32 = 4;     // WebAssembly (32 and 64 bits)
+
+// How bit-fields are laid out (csema_bits.ax).
+pub const BF_SYSV: i32 = 0;     // x86-64 System V (also Apple's arm64 ABI, WebAssembly)
+pub const BF_AAPCS64: i32 = 1;  // AAPCS64: as System V, but every bit-field's type adds to the alignment
+pub const BF_MS: i32 = 2;       // Windows x64: in runs of units of one size
+
+/// Sets o's preferred types for the typedefs of <stddef.h> and <stdint.h>
+/// on platform plat (a64: an AArch64 one), and its layout of bit-fields:
+/// those of the platform's C ABI and C library, so that
+/// a declaration that uses them is the same type as the platform's (the
+/// x86-64 System V and AAPCS64 ABIs, Apple's arm64 ABI, Windows x64 and the
+/// WebAssembly C ABI; the int_fast types as the platforms' libraries
+/// declare them).
+pub fn set_platform(o: *mut COptions, plat: i32, a64: bool) void {
+    o.bitfields = BF_SYSV;
+    if (plat == PLAT_LINUX) and a64 {
+        o.bitfields = BF_AAPCS64;
+    } else if plat == PLAT_WINDOWS {
+        o.bitfields = BF_MS;
+    }
+    o.size_pref = R_LONG;
+    o.int64_pref = R_LONG;
+    o.intmax_pref = R_LONG;
+    o.fast16_pref = R_INT;
+    o.fast32_pref = R_INT;
+    o.wint_pref = R_INT;
+    o.wint_signed = false;
+    o.max_align = 16;
+    if plat == PLAT_LINUX {
+        o.fast16_pref = R_LONG;
+        o.fast32_pref = R_LONG;
+    } else if plat == PLAT_DARWIN {
+        o.int64_pref = R_LLONG;
+        o.fast16_pref = R_SHORT;
+        o.wint_signed = true;
+        o.max_align = 8;
+    } else if plat == PLAT_WINDOWS {
+        o.size_pref = R_LLONG;
+        o.int64_pref = R_LLONG;
+        o.intmax_pref = R_LLONG;
+        o.wint_pref = R_SHORT;
+        o.max_align = 8;
+    } else {
+        o.int64_pref = R_LLONG;
+        o.intmax_pref = R_LLONG;
+        o.wint_signed = true;
+    }
+}
+
+/// The width in bits of the integer type of rank code r.
+pub fn width_of(o: *COptions, r: i32) i32 {
+    if r == R_CHAR {
+        return 8;
+    }
+    if r == R_SHORT {
+        return 16;
+    }
+    if r == R_INT {
+        return o.int_bits;
+    }
+    if r == R_LONG {
+        return o.long_bits;
+    }
+    return 64;
+}
+
+// The preferred type if it is exactly w bits wide, else the first of int,
+// long and long long that is (or, none being, the first wider).
+fn exact(o: *COptions, pref: i32, w: i32) i32 {
+    if width_of(o, pref) == w {
+        return pref;
+    }
+    for r in R_INT..(R_LLONG + 1) {
+        if width_of(o, r) == w {
+            return r;
+        }
+    }
+    for r in R_INT..(R_LLONG + 1) {
+        if width_of(o, r) >= w {
+            return r;
+        }
+    }
+    return R_LLONG;
+}
+
+/// size_t's type (unsigned), and ptrdiff_t's and intptr_t's (signed).
+pub fn size_type(o: *COptions) i32 {
+    return exact(o, o.size_pref, o.ptr_bits);
+}
+
+/// int64_t's type.
+pub fn int64_type(o: *COptions) i32 {
+    return exact(o, o.int64_pref, 64);
+}
+
+/// intmax_t's type (64 bits: the widest).
+pub fn intmax_type(o: *COptions) i32 {
+    return exact(o, o.intmax_pref, 64);
+}
+
+// The preferred type if it is at least w bits wide, else the narrowest
+// standard type that is.
+fn at_least(o: *COptions, pref: i32, w: i32) i32 {
+    if width_of(o, pref) >= w {
+        return pref;
+    }
+    for r in R_CHAR..(R_LLONG + 1) {
+        if width_of(o, r) >= w {
+            return r;
+        }
+    }
+    return R_LLONG;
+}
+
+/// The spelling of the type of rank code r (unsigned: its unsigned type)
+/// in standard std: long long before C99 is the keyword __axiom_int64.
+pub fn spelling(r: i32, unsigned: bool, std: i32) []u8 {
+    if (r == R_LLONG) and (std < C99) {
+        return u.pick(unsigned, "unsigned __axiom_int64", "__axiom_int64");
+    }
+    let names = ["signed char", "short", "int", "long", "long long"];
+    let unames = ["unsigned char", "unsigned short", "unsigned int", "unsigned long", "unsigned long long"];
+    let k = @int_cast(usize, r - R_CHAR);
+    if unsigned {
+        return unames[k];
+    }
+    return names[k];
+}
+
+// The suffix of an integer constant of the type of rank code r ("" when a
+// constant of the type is written without one: int and narrower).
+fn suffix(r: i32, unsigned: bool) []u8 {
+    return suffix_in(r, unsigned, false);
+}
+
+// As suffix; wide: a narrower type that int cannot hold (--c-int=16:
+// unsigned short promotes to unsigned int, whose constants have a U).
+fn suffix_in(r: i32, unsigned: bool, wide: bool) []u8 {
+    if unsigned and wide and (r < R_INT) {
+        return "U";
+    }
+    let mut s = "";
+    if r == R_LONG {
+        s = "L";
+    } else if r == R_LLONG {
+        s = "LL";
+    }
+    if unsigned and (r >= R_INT) {
+        return u.cat2("U", s);
+    }
+    return s;
+}
+
+// The largest value of a w-bit type, signed or not, as decimal digits.
+fn max_digits(w: i32, signed: bool) []u8 {
+    let mut m: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    if w < 64 {
+        m = (@as(u64, 1) << @as(u64, @bit_cast(u32, w))) - 1;
+    }
+    if signed {
+        m = m >> 1;
+    }
+    return u.udec(m);
+}
+
+// The definitions of the macros of one typedef's type: NAME_TYPE__ (and
+// UNAME_TYPE__ for its unsigned type), NAME_MIN__, NAME_MAX__,
+// UNAME_MAX__, NAME_WIDTH__ and the constant macro NAME_C__(c) (UNAME_C__).
+fn type_macros(b: *mut u.Buf, o: *COptions, name: []u8, uname: []u8, r: i32) void {
+    let w = width_of(o, r);
+    let p = "#define __AXIOM_";
+    b.s(u.f3("%s%s_TYPE__ %s\n", p, name, spelling(r, false, o.std)));
+    b.s(u.f3("%s%s_TYPE__ %s\n", p, uname, spelling(r, true, o.std)));
+    b.s(u.f3("%s%s_WIDTH__ %s\n", p, name, u.idec(w)));
+    let mx = u.cat2(max_digits(w, true), suffix(r, false));
+    b.s(u.f3("%s%s_MAX__ %s\n", p, name, mx));
+    b.s(u.f3("%s%s_MIN__ (-%s - 1)\n", p, name, mx));
+    let wide = (r < R_INT) and (w >= o.int_bits);
+    b.s(u.f3("%s%s_MAX__ %s\n", p, uname, u.cat2(max_digits(w, false), suffix_in(r, true, wide))));
+    b.s(u.f4("%s%s_C__(c) c%s%s\n", p, name, u.pick(suffix(r, false).len > 0, "##", ""), suffix(r, false)));
+    b.s(u.f4("%s%s_C__(c) c%s%s\n", p, uname, u.pick(suffix(r, true).len > 0, "##", ""), suffix(r, true)));
+}
+
+/// The predefined macros that tell the headers the typedefs' types (and
+/// their limits): __AXIOM_SIZE_TYPE__, __AXIOM_INT64_TYPE__, ...
+pub fn type_macros_text(o: *COptions) []u8 {
+    let mut b = u.Buf.init();
+    type_macros(&mut b, o, "PTRDIFF", "SIZE", size_type(o));
+    type_macros(&mut b, o, "INT64", "UINT64", int64_type(o));
+    type_macros(&mut b, o, "INTMAX", "UINTMAX", intmax_type(o));
+    type_macros(&mut b, o, "INT_FAST16", "UINT_FAST16", at_least(o, o.fast16_pref, 16));
+    type_macros(&mut b, o, "INT_FAST32", "UINT_FAST32", at_least(o, o.fast32_pref, 32));
+    // wint_t: at least as wide as wchar_t (7.31.1p2: it holds every value of it)
+    let wr = at_least(o, o.wint_pref, o.wchar_bits);
+    b.s(u.f1("#define __AXIOM_WINT_TYPE__ %s\n", spelling(wr, not o.wint_signed, o.std)));
+    b.s(u.f1("#define __AXIOM_WINT_WIDTH__ %s\n", u.idec(width_of(o, wr))));
+    if o.wint_signed {
+        let mx = max_digits(width_of(o, wr), true);
+        b.s(u.f2("#define __AXIOM_WINT_MIN__ (-%s%s - 1)\n", mx, suffix(wr, false)));
+        b.s(u.f2("#define __AXIOM_WINT_MAX__ %s%s\n", mx, suffix(wr, false)));
+    } else {
+        let wide = (wr < R_INT) and (width_of(o, wr) >= o.int_bits);
+        b.s(u.f1("#define __AXIOM_WINT_MIN__ 0%s\n", suffix_in(wr, true, wide)));
+        b.s(u.f2("#define __AXIOM_WINT_MAX__ %s%s\n", max_digits(width_of(o, wr), false), suffix_in(wr, true, wide)));
+    }
+    b.s(u.f1("#define __AXIOM_MAX_ALIGN__ %s\n", u.idec(o.max_align)));
+    return b.done();
 }
 
 /// Does a --c-std= value name a GNU dialect (gnu89 ... gnu23)?

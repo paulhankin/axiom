@@ -86,62 +86,40 @@ typedef _Atomic unsigned long long atomic_ullong;
 typedef _Atomic unsigned char atomic_char8_t;
 #endif
 
-/* 8 and 16 bits; 64 bits (int64_t); at least 32 bits (int_least32_t) */
+/* 8 and 16 bits; 64 bits (int64_t); at least 32 bits (int_least32_t); the fast types */
 typedef _Atomic signed char atomic_int_least8_t;
 typedef _Atomic unsigned char atomic_uint_least8_t;
 typedef _Atomic short atomic_int_least16_t;
 typedef _Atomic unsigned short atomic_uint_least16_t;
 typedef _Atomic signed char atomic_int_fast8_t;
 typedef _Atomic unsigned char atomic_uint_fast8_t;
-typedef _Atomic short atomic_int_fast16_t;
-typedef _Atomic unsigned short atomic_uint_fast16_t;
+/* (the types <stdint.h> has, from the compiler's macros: the platform's) */
+typedef _Atomic __AXIOM_INT_FAST16_TYPE__ atomic_int_fast16_t;
+typedef _Atomic __AXIOM_UINT_FAST16_TYPE__ atomic_uint_fast16_t;
 typedef _Atomic unsigned short atomic_char16_t;
-#if __AXIOM_LONG_WIDTH__ == 64
-typedef _Atomic long atomic_int_least64_t;
-typedef _Atomic unsigned long atomic_uint_least64_t;
-typedef _Atomic long atomic_int_fast64_t;
-typedef _Atomic unsigned long atomic_uint_fast64_t;
-typedef _Atomic long atomic_intmax_t;
-typedef _Atomic unsigned long atomic_uintmax_t;
-#else
-typedef _Atomic long long atomic_int_least64_t;
-typedef _Atomic unsigned long long atomic_uint_least64_t;
-typedef _Atomic long long atomic_int_fast64_t;
-typedef _Atomic unsigned long long atomic_uint_fast64_t;
-typedef _Atomic long long atomic_intmax_t;
-typedef _Atomic unsigned long long atomic_uintmax_t;
-#endif
+typedef _Atomic __AXIOM_INT64_TYPE__ atomic_int_least64_t;
+typedef _Atomic __AXIOM_UINT64_TYPE__ atomic_uint_least64_t;
+typedef _Atomic __AXIOM_INT64_TYPE__ atomic_int_fast64_t;
+typedef _Atomic __AXIOM_UINT64_TYPE__ atomic_uint_fast64_t;
+typedef _Atomic __AXIOM_INTMAX_TYPE__ atomic_intmax_t;
+typedef _Atomic __AXIOM_UINTMAX_TYPE__ atomic_uintmax_t;
 #if __AXIOM_INT_WIDTH__ == 32 || (__AXIOM_LONG_WIDTH__ != 32 && __AXIOM_INT_WIDTH__ == 64)
 typedef _Atomic int atomic_int_least32_t;
 typedef _Atomic unsigned int atomic_uint_least32_t;
-typedef _Atomic int atomic_int_fast32_t;
-typedef _Atomic unsigned int atomic_uint_fast32_t;
 typedef _Atomic unsigned int atomic_char32_t;
 #else
 typedef _Atomic long atomic_int_least32_t;
 typedef _Atomic unsigned long atomic_uint_least32_t;
-typedef _Atomic long atomic_int_fast32_t;
-typedef _Atomic unsigned long atomic_uint_fast32_t;
 typedef _Atomic unsigned long atomic_char32_t;
 #endif
+typedef _Atomic __AXIOM_INT_FAST32_TYPE__ atomic_int_fast32_t;
+typedef _Atomic __AXIOM_UINT_FAST32_TYPE__ atomic_uint_fast32_t;
 
-/* as wide as a pointer: the first of int, long and long long */
-#if __AXIOM_INT_WIDTH__ >= __AXIOM_PTR_WIDTH__
-typedef _Atomic int atomic_intptr_t;
-typedef _Atomic unsigned int atomic_uintptr_t;
-typedef _Atomic unsigned int atomic_size_t;
-typedef _Atomic int atomic_ptrdiff_t;
-#elif __AXIOM_LONG_WIDTH__ >= __AXIOM_PTR_WIDTH__
-typedef _Atomic long atomic_intptr_t;
-typedef _Atomic unsigned long atomic_uintptr_t;
-typedef _Atomic unsigned long atomic_size_t;
-typedef _Atomic long atomic_ptrdiff_t;
-#else
-typedef _Atomic long long atomic_intptr_t;
-typedef _Atomic unsigned long long atomic_uintptr_t;
-typedef _Atomic unsigned long long atomic_size_t;
-typedef _Atomic long long atomic_ptrdiff_t;
-#endif
+/* as wide as a pointer: the platform's (<stddef.h>, <stdint.h>) */
+typedef _Atomic __AXIOM_PTRDIFF_TYPE__ atomic_intptr_t;
+typedef _Atomic __AXIOM_SIZE_TYPE__ atomic_uintptr_t;
+typedef _Atomic __AXIOM_SIZE_TYPE__ atomic_size_t;
+typedef _Atomic __AXIOM_PTRDIFF_TYPE__ atomic_ptrdiff_t;
 
 /* as wchar_t (<stddef.h>) */
 #if __AXIOM_WCHAR_WIDTH__ == 16

@@ -21,6 +21,7 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_abi.ax" as abi;
+import "cgen_bitint.ax" as cbi;
 import "cgen_debug.ax" as cdbg;
 import "cgen_gbuiltin.ax" as gbg;
 import "cgen_ld.ax" as gld;
@@ -207,6 +208,18 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
             }
         }
     }
+    // (x86-64 System V: an argument aligned to more than 16 bytes on the
+    // stack needs the stack pointer aligned to that at the call, as the
+    // offsets of the plan assume; the stack is moved down by the remainder
+    // and back after the call)
+    let mut sp0 = ir.vnil();
+    if p.stack_align > 16 {
+        let none = u.newn.[*mut ir.Value](1);
+        sp0 = ir.intr(B(), ir.IN_STACK_SAVE, cg.T_ptr, none[0..0]);
+        let pad = ir.and_(B(), ir.ptrtoint(B(), sp0, cg.T_isz), cg.usz(p.stack_align - 1));
+        let mut one: [1]*mut ir.Value = [pad];
+        _ = ir.intr(B(), ir.IN_STACK_ALLOC, cg.T_ptr, one[..]);
+    }
     let r = ir.call(B(), fty, callee, args[0..nt]);
     if u.notnil(cg.next_site) {
         let ch = ir.chain1(cg.next_site);
@@ -221,6 +234,16 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
             ex[k + 1] = p.exts.get(k);
         }
     }
+    let out = call_result(p, r, res);
+    if u.notnil(sp0) {
+        let mut one: [1]*mut ir.Value = [sp0];
+        _ = ir.intr(B(), ir.IN_STACK_RESTORE, cg.T_void, one[..]);
+    }
+    return out;
+}
+
+// The C value of the result of call r (plan p; res: the result's memory, R_SRET).
+fn call_result(p: *mut abi.Plan, r: *mut ir.Value, res: *mut ir.Value) *mut ir.Value {
     if p.ret == abi.R_SRET {
         return res;
     }
@@ -255,7 +278,8 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
     if p.ret == abi.R_VOID {
         return ir.vnil();
     }
-    return r;
+    // (a _BitInt result as a parameter: see enter_function)
+    return cbi.norm(r, p.rty);
 }
 
 // A WebAssembly variadic argument (a scalar, or a structure's one piece; a
@@ -303,8 +327,17 @@ pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, v
         let s = ps[i];
         let a = &p.args[i];
         if a.kind == abi.A_REF {
-            // (the caller's copy: this function's own)
-            s.ir = @ptr_cast(*mut void, f.params[@int_cast(usize, a.slot[0])]);
+            // (the caller's copy: this function's own; but the ABIs align
+            // it to 16 bytes at most (AAPCS64 B.4, Windows x64), so a type
+            // aligned more strictly is copied into an object aligned as it is)
+            let pr = f.params[@int_cast(usize, a.slot[0])];
+            if cty.align_of(s.ty) > 16 {
+                let o = cg.alloca(s.ty, "arg");
+                copy(o, pr, cty.size_of(s.ty));
+                s.ir = @ptr_cast(*mut void, o);
+            } else {
+                s.ir = @ptr_cast(*mut void, pr);
+            }
             continue;
         }
         let o = alloc_of(s.ty, a.span);
@@ -313,8 +346,10 @@ pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, v
         if a.kind == abi.A_SCALAR {
             // (a parameter of a definition with an identifier list arrives
             // promoted: cgen_stmt converts it)
+            // (a _BitInt's bits beyond its width are unspecified in the
+            // ABIs: the value is brought to this implementation's form)
             if a.ty == cty.unqual(s.ty) {
-                st(f.params[@int_cast(usize, a.slot[0])], o, cty.align_of(s.ty));
+                st(cbi.norm(f.params[@int_cast(usize, a.slot[0])], a.ty), o, cty.align_of(s.ty));
             }
             continue;
         }
@@ -522,6 +557,11 @@ fn slot_va_arg(ap: *mut ir.Value, t: *mut cty.CType, ab: i32) *mut ir.Value {
         by_ref = abi.aggregate(t) and (size > 16);
         if not by_ref {
             slot = cty.round_up(size, 8);
+            // (at an offset aligned to its alignment, up to 16:
+            // cgen_abi.darwin_va_slots)
+            if cty.align_of(t) >= 16 {
+                p = round_ptr(p, 16);
+            }
         }
     } else {
         // (as cgen_abi.wasm_arg puts them: at least 4 bytes, aligned to the size)
@@ -612,6 +652,8 @@ fn sysv_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
     // the overflow area (aligned to 16 for a type that is)
     cg.at_end(stackb);
     let mut ov = ld(cg.T_ptr, at(ap, 8), 8);
+    // (the caller aligned its stack pointer to an alignment over 16: see
+    // emit_call)
     if cty.align_of(t) > 8 {
         ov = round_ptr(ov, cty.align_of(t));
     }

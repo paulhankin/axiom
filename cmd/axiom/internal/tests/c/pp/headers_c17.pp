@@ -1,9 +1,9 @@
-typedef unsigned int size_t;
-typedef int ptrdiff_t;
+typedef unsigned long size_t;
+typedef long ptrdiff_t;
 typedef int wchar_t;
 typedef struct {
 long long __axiom_ll;
-long double __axiom_ld;
+_Alignas(16) long double __axiom_ld;
 } max_align_t;
 typedef __builtin_va_list va_list;
 typedef signed char int8_t;
@@ -22,18 +22,18 @@ typedef int64_t int_least64_t;
 typedef uint64_t uint_least64_t;
 typedef int8_t int_fast8_t;
 typedef uint8_t uint_fast8_t;
-typedef int16_t int_fast16_t;
-typedef uint16_t uint_fast16_t;
 typedef int64_t int_fast64_t;
 typedef uint64_t uint_fast64_t;
+typedef int int_fast16_t;
+typedef unsigned int uint_fast16_t;
+typedef int int_fast32_t;
+typedef unsigned int uint_fast32_t;
 typedef int32_t int_least32_t;
 typedef uint32_t uint_least32_t;
-typedef int32_t int_fast32_t;
-typedef uint32_t uint_fast32_t;
-typedef int intptr_t;
-typedef unsigned int uintptr_t;
-typedef int64_t intmax_t;
-typedef uint64_t uintmax_t;
+typedef long intptr_t;
+typedef unsigned long uintptr_t;
+typedef long long intmax_t;
+typedef unsigned long long uintmax_t;
 x___STDC_VERSION_STDDEF_H__ = __STDC_VERSION_STDDEF_H__
 x_unreachable = unreachable()
 x_NULL = ((void *)0)
@@ -167,21 +167,21 @@ x_UINT_LEAST64_MAX = 18446744073709551615ULL
 x_INT_FAST8_MIN = (-127 - 1)
 x_INT_FAST8_MAX = 127
 x_UINT_FAST8_MAX = 255
-x_INT_FAST16_MIN = (-32767 - 1)
-x_INT_FAST16_MAX = 32767
-x_UINT_FAST16_MAX = 65535
+x_INT_FAST16_MIN = (-2147483647 - 1)
+x_INT_FAST16_MAX = 2147483647
+x_UINT_FAST16_MAX = 4294967295U
 x_INT_FAST32_MIN = (-2147483647 - 1)
 x_INT_FAST32_MAX = 2147483647
 x_UINT_FAST32_MAX = 4294967295U
 x_INT_FAST64_MIN = (-9223372036854775807LL - 1)
 x_INT_FAST64_MAX = 9223372036854775807LL
 x_UINT_FAST64_MAX = 18446744073709551615ULL
-x_INTPTR_MIN = (-2147483647 - 1)
-x_INTPTR_MAX = 2147483647
-x_UINTPTR_MAX = 4294967295U
-x_PTRDIFF_MIN = (-2147483647 - 1)
-x_PTRDIFF_MAX = 2147483647
-x_SIZE_MAX = 4294967295U
+x_INTPTR_MIN = (-2147483647L - 1)
+x_INTPTR_MAX = 2147483647L
+x_UINTPTR_MAX = 4294967295UL
+x_PTRDIFF_MIN = (-2147483647L - 1)
+x_PTRDIFF_MAX = 2147483647L
+x_SIZE_MAX = 4294967295UL
 x_INTMAX_MIN = (-9223372036854775807LL - 1)
 x_INTMAX_MAX = 9223372036854775807LL
 x_UINTMAX_MAX = 18446744073709551615ULL

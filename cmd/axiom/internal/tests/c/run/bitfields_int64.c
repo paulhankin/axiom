@@ -9,7 +9,6 @@ int main(void) {
     struct A s = { -1, 536870911, 18446744073709551615u };
     print_i64(sizeof(struct A));
     print_i64(_Alignof(struct A));
-    print_i64(sizeof(struct B));
     print_i64(s.a);
     print_i64(s.b);
     s.b += 1;
@@ -22,7 +21,6 @@ int main(void) {
     return 0;
 }
 /* expect: 24 */
-/* expect: 8 */
 /* expect: 8 */
 /* expect: -1 */
 /* expect: 536870911 */

@@ -6,8 +6,8 @@ is built for every target of the compiler (WebAssembly, x86-64 and AArch64 Linux
 Windows, AArch64 macOS) with no C compiler and no external linker, except to link to the
 platform's C library on Linux (see "What a C program is here").
 
-It is a freestanding implementation, in C's terms: it has the freestanding headers and no
-library. It reads C89, C95, C99, C11, C17 and C23 (`--c-std=`; C17 by default), each
+It is a freestanding implementation, in C's terms: it has the freestanding headers and
+the functions of `<string.h>` that C23 asks of one, and no other library. It reads C89, C95, C99, C11, C17 and C23 (`--c-std=`; C17 by default), each
 mode accepting its standard's language and diagnosing what a later standard added or its
 own removed, and their GNU dialects (`--c-std=gnu89` ... `gnu23`), which add the widely
 used GNU extensions ("GNU dialects", below). Under an ISO standard there are no extensions,
@@ -28,8 +28,10 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
 
 ## What a C program is here
 
-- **No library.** There is no `<stdio.h>`, `<stdlib.h>`, `<string.h>` or any other
-  library header, and no library code. `#include <stdio.h>` is the error `C1081`.
+- **No library but `<string.h>`.** There is no `<stdio.h>`, `<stdlib.h>` or any other
+  library header. `#include <stdio.h>` is the error `C1081`. `<string.h>` has the
+  functions a freestanding implementation has in C23 (see "Headers"), from the C library
+  (below).
 - **Undefined functions are the platform's.** A function a program declares and does not
   define is looked up outside the program:
   - On Linux, by the linker, in the system's C library: such a program is linked by the
@@ -45,8 +47,10 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
     module `axiom` (`ax_write`, ...), which `std/internal/runtime/host.mjs` provides:
     `node std/internal/runtime/host.mjs prog.wasm` runs a program, with no `env`
     functions, so calling one fails with "host import env.name is not available".
-- **A program may define the library's functions.** `memcpy`, `memmove` and `memset`
-  among them: the runtime's own copies (on AArch64 Linux, which needs them) are weak.
+- **A program may define the library's functions.** `memcpy`, `strlen` and the others of
+  `<string.h>` among them: a function the program defines is not taken from the library,
+  whose functions then call the program's, and the runtime's own copies of `memcpy`,
+  `memmove` and `memset` (on AArch64 Linux, which needs them) are weak.
 - **Calls cross the boundary correctly.** Arguments and results follow the target's C
   ABI, so C compiled here calls the platform's library and is called from it ("Calling
   conventions", below).
@@ -279,11 +283,16 @@ library's sources with the program, unless `--c-freestanding` is given:
   whose `export fn`s are generated only when something reaches them, and give way to a
   C unit's definition of the same name.
 
-Either directory may be missing: today `std/c/` holds the headers and, in `std/c/rt/`,
-only `ldouble.ax` (the arithmetic of a `long double` wider than `double`, which every C
-program whose `long double` is wider loads, freestanding or not, and which exports no
-names), so a C program calls the system's library as before. A unit of the library is analyzed with the
-program's C options (`--c-std`, `--c-int`, ...).
+Either directory may be missing. Today `std/c/lib/` holds `<string.h>`'s functions
+(`std/c/lib/string/`, one function to a file), which `--c-freestanding` keeps (C23 asks a
+freestanding implementation for them), and `std/c/rt/` only `ldouble.ax` (the arithmetic
+of a `long double` wider than `double`, which every C program whose `long double` is wider
+loads, freestanding or not, and which exports no names); a C program calls the system's
+library for the rest. A unit of the library is analyzed as C17, with the program's
+`--c-int`, `--c-long`, `--c-char` and `--c-long-double` and none of its `-D` and `-I`
+options. What an executable does not reach is left out of it when the compiler's own
+linker links it (no `--link` inputs or `-l` libraries); otherwise all of the library's
+functions are in it.
 
 ## Standards
 
@@ -346,6 +355,7 @@ The compiler's own macros say what the build chose:
 | `__AXIOM_PTR_WIDTH__` | The width of a pointer: 32 or 64. |
 | `__AXIOM_WCHAR_WIDTH__` | The width of `wchar_t`: 16 or 32. |
 | `__AXIOM_WCHAR_SIGNED__` | 1 if `wchar_t` is signed, else 0. |
+| `__AXIOM_<T>_TYPE__`, `__AXIOM_<T>_MIN__`, `__AXIOM_<T>_MAX__`, `__AXIOM_<T>_WIDTH__`, `__AXIOM_<T>_C__(c)` | For `<T>` one of `SIZE`, `PTRDIFF`, `INT64`, `UINT64`, `INTMAX`, `UINTMAX`, `INT_FAST16`, `UINT_FAST16`, `INT_FAST32`, `UINT_FAST32`: the type the platform gives that typedef (`__AXIOM_SIZE_TYPE__` is `unsigned long`, ...), its limits, width and constant macro, which the headers use. `__AXIOM_WINT_TYPE__`, `_MIN__`, `_MAX__` and `_WIDTH__` are `wint_t`'s; `__AXIOM_MAX_ALIGN__` is `max_align_t`'s alignment. |
 | `__CHAR_UNSIGNED__` | 1, defined only if plain `char` is unsigned. |
 | `__AXIOM_GNU__` | 1, defined only in a GNU dialect. |
 
@@ -363,19 +373,37 @@ files.
 
 ### Per target
 
-The defaults, which `--c-char`, `--c-int`, `--c-long` and `--c-long-double` change. Types of the same width
-may be spelled differently from the platform's headers (`size_t` is `unsigned int` on
-wasm32, `int64_t` is `long` on macOS): representation and calling convention are the
-same.
+The defaults, which `--c-char`, `--c-int`, `--c-long` and `--c-long-double` change. The
+typedefs of `<stddef.h>` and `<stdint.h>` are the types the platform's C ABI and C library
+give them, so that a declaration that uses them is the platform's (the same type, not only
+the same width):
 
 | Target | `char` | `int` | `long` | `long long` | pointer | `size_t` | `ptrdiff_t` | `wchar_t` | `int64_t` |
 |---|---|---|---|---|---|---|---|---|---|
 | `x86_64` (Linux) | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long` |
 | `aarch64` (Linux) | unsigned | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `unsigned int` | `long` |
-| `aarch64-macos` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long` |
+| `aarch64-macos` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long long` |
 | `x86_64-windows` | signed | 32 | 32 | 64 | 64 | `unsigned long long` | `long long` | `unsigned short` | `long long` |
-| `wasm32` | signed | 32 | 32 | 64 | 32 | `unsigned int` | `int` | `int` | `long long` |
-| `wasm64` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long` |
+| `wasm32` | signed | 32 | 32 | 64 | 32 | `unsigned long` | `long` | `int` | `long long` |
+| `wasm64` | signed | 32 | 64 | 64 | 64 | `unsigned long` | `long` | `int` | `long long` |
+
+| Target | `intmax_t` | `int_fast16_t` | `int_fast32_t` | `wint_t` (its limits) | `max_align_t` |
+|---|---|---|---|---|---|
+| `x86_64`, `aarch64` (Linux) | `long` | `long` | `long` | `unsigned int` | aligned to 16 |
+| `aarch64-macos` | `long` | `short` | `int` | `int` | `long double` (8) |
+| `x86_64-windows` | `long long` | `int` | `int` | `unsigned short` | `long double` (8) |
+| `wasm32`, `wasm64` | `long long` | `int` | `int` | `int` | aligned to 16 |
+
+`short` is 16 bits on every target; `intptr_t` and `uintptr_t` are `ptrdiff_t` and
+`size_t`, `int_fast8_t` is `signed char` and `int_fast64_t` is `int64_t`. The headers learn
+these types from the compiler's macros (`__AXIOM_SIZE_TYPE__`, `__AXIOM_INT64_TYPE__`,
+... with their limits and constant macros). With `--c-int` or `--c-long` the platform's
+type is kept when it still has the width its role needs; otherwise `size_t` is the first of
+`int`, `long` and `long long` as wide as a pointer, `int64_t` and `intmax_t` the first of
+64 bits, the fast types the narrowest wide enough, and there is no `int32_t` if neither
+`int` nor `long` is 32 bits wide. Changing `--c-int` or `--c-long` changes the sizes in the
+program and in calls, but the platform's library keeps its own: a program built with other
+widths cannot pass such values to it.
 
 `long double` is the format of the target's C ABI:
 
@@ -392,13 +420,6 @@ expects. `--c-long-double=64` makes it `double` (as on the others), `=128` binar
 As with `--c-int`, the platform's library keeps its own: a program built with another
 format than the ABI's cannot pass `long double` values to it.
 
-`short` is 16 bits on every target. `intmax_t` is `int64_t`, and `intptr_t` is the signed
-type of `size_t`'s width. With `--c-int=16` or `--c-int=64` the headers choose types by width:
-`size_t` is the first of `int`, `long` and `long long` as wide as a pointer, and there is
-no `int32_t` if neither `int` nor `long` is 32 bits wide. Changing `--c-int` or
-`--c-long` changes the sizes in the program and in calls, but the platform's library keeps
-its own: a program built with other widths cannot pass such values to it.
-
 ### On every target
 
 | | |
@@ -411,11 +432,11 @@ its own: a program built with other widths cannot pass such values to it.
 | Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. There are no imaginary types. |
 | Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest); the rounding mode cannot be changed. A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals; constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
-| `max_align_t` | A structure of a `long long` and a `long double`: size 32, alignment 16 where `long double` is 16 bytes, else size 16, alignment 8. |
+| `max_align_t` | Aligned as the platform's (above): a structure of a `long long` and a `long double` aligned to 16 (size 32 where `long double` is 16 bytes), or `long double` (8 bytes). |
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |
-| Bit-fields | Allocated from the least significant bit of a storage unit of the declared type; one never straddles two units. A plain `int` bit-field is signed. A `char` bit-field has `char`'s signedness. An unnamed bit-field takes space and adds nothing to the alignment of the structure; one of width 0 moves the next member to the next unit. |
+| Bit-fields | Laid out as the target's ABI lays them out: allocated from the least significant bit of a storage unit of the declared type, never straddling two units. On x86-64 Linux, macOS and WebAssembly (the System V rules) a bit-field goes at the next bit if it fits in the unit that holds it, an unnamed one adds nothing to the alignment of the structure, and one of width 0 moves the next member to the next unit of its type. On AArch64 Linux (AAPCS64) the same, but every bit-field's type adds to the alignment, unnamed ones and those of width 0 too. On Windows (x64) bit-fields are allocated in runs: a bit-field joins the open unit only if its type has the unit's size and it fits, else it starts a new unit after it; another member closes the unit; one of width 0 closes it (and aligns the next member to its type) and is ignored when no unit is open; in a union, bit-fields add their type's size but not its alignment. In a packed structure or under `#pragma pack` (GNU dialects; any `pack(n)`), a bit-field goes at the next bit (System V, AAPCS64; AAPCS64 still aligns the structure to a zero-width one's type), while Windows keeps its units, aligned to at most n. A plain `int` bit-field is signed. A `char` bit-field has `char`'s signedness. |
 | Enumerations | The type is `unsigned int` if no enumerator is negative, else `int`, when all fit; the enumeration constants are `int`. In C23, if some enumerator does not fit `int`, the first of `long`, `long long` (`unsigned long`, `unsigned long long` for an unsigned type) that holds all of them, and then the constants have the enumerated type. Before C23 a value outside `int` is `C3013`. With a fixed underlying type (C23), that type. |
-| `_BitInt(N)` | `BITINT_MAXWIDTH` is 64. An object is stored in the smallest of 8, 16, 32 or 64 bits that holds N, extended to it. |
+| `_BitInt(N)` | `BITINT_MAXWIDTH` is 64. An object is stored in the smallest of 8, 16, 32 or 64 bits that holds N (aligned as that integer type, as the x86-64 and AArch64 ABIs specify), extended to it. As an argument or result it is that integer; the bits beyond N that arrive are not relied on (the ABIs leave them unspecified). |
 | Null pointer | All bits zero. |
 | Source and execution character sets | UTF-8. Narrow string literals are UTF-8 bytes (invalid UTF-8 in a literal is `C1024`). `L"..."` is UTF-16 on Windows (`wchar_t` is 16 bits) and UTF-32 elsewhere; `u"..."` is UTF-16 and `U"..."` UTF-32. |
 | Multi-character constants | `'ab'` is `'a' * 256 + 'b'` as an `int` of the build's width (the first character is the most significant); a warning, `C4102`. A wide one has the value of its last character. More characters than the type holds is `C1011`. |
@@ -458,11 +479,15 @@ in an earlier mode is an `#error`.
 | `<stdbit.h>` | C23 | The `stdc_` functions as `static inline` functions and type-generic macros. |
 | `<stdckdint.h>` | C23 | `ckd_add`, `ckd_sub`, `ckd_mul`. |
 
-Every other header, the C library's included, is `C1081`. C23 (4p7) also asks a
-freestanding implementation for most of `<string.h>` and some functions of `<stdlib.h>`
-(and `<fenv.h>` and `<math.h>` if it claims Annex F). These are a library's, and the
-compiler does not provide them. The C23 headers also define `__STDC_VERSION_<NAME>_H__`
-as the standard says.
+| `<string.h>` | all | The functions C23 (4p7) asks of a freestanding implementation: all but `strdup`, `strndup`, `strcoll`, `strxfrm` and `strerror`. `memccpy` and `memset_explicit` from C23; in C23 `memchr`, `strchr`, `strpbrk`, `strrchr` and `strstr` are also generic macros whose result points to `const` when the argument does. |
+
+Every other header is `C1081`. The functions of `<string.h>` are C sources in
+`std/c/lib/string/` (`memcpy.c`, ...), units of the C library ("The C library"): an
+executable gets those it does not define itself; `memcpy`, `memmove`, `memset`,
+`memcmp`, `memchr` and `strlen` work a word at a time. C23 (4p7) also asks a
+freestanding implementation for some of `<stdlib.h>`, and for `<fenv.h>` and `<math.h>`
+if it claims Annex F; those are not provided. The C23 headers also define
+`__STDC_VERSION_<NAME>_H__` as the standard says.
 
 ## Not supported
 
@@ -470,7 +495,7 @@ as the standard says.
   constants: each is `C3901` (a decimal constant is `C1019`).
 - `<threads.h>` (`__STDC_NO_THREADS__`). Thread-local objects and atomics work with the
   threads a program has (see "Atomics and threads").
-- The library, and Annex F, `<fenv.h>` and `<math.h>`: exception flags and rounding modes.
+- The library but `<string.h>`, and Annex F, `<fenv.h>` and `<math.h>`: exception flags and rounding modes.
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
   and `__asm__`, `__int128`, `__typeof__` (and `typeof` before C23), statement
@@ -764,17 +789,22 @@ array) has unwind information that finds its saved registers from its frame poin
 so the system's stack walks (exceptions, debuggers) go through it while the array is
 live.
 
-Known limits:
+Arguments aligned more strictly than the stack: on x86-64 System V a call that passes one
+aligned to more than 16 bytes on the stack aligns its stack pointer to that alignment,
+named and variadic arguments alike; AAPCS64 and Windows pass such structures by reference,
+and a function copies one into an object aligned as its type is (the caller's copy is
+aligned to 16 at most). On macOS each variadic argument is on the stack at the next offset
+aligned to its alignment, at most 16. On AAPCS64 a structure aligned to 16 starts at an
+even register or a 16-byte stack offset.
 
-- On x86-64 System V, a variadic argument whose type is aligned to more than 16 bytes and
-  that goes on the stack is not placed at an address aligned as its type is: that would
-  need the caller's frame realigned, and the stack keeps 16 bytes' alignment.
-- On macOS, a variadic argument of a type aligned to 16 bytes gets no padding before it,
-  where the platform aligns its stack slot to 16.
-
-Verified with a program that calls the C library's `ldiv` (a structure returned by
-value), `snprintf` and `printf` (variadic, `double` and `long long`) on `x86_64` Linux;
-the other targets are tested by the suite, not run by hand. `long double` (alone, in
+Verified against the system's C compiler on x86-64 and AArch64 Linux, with
+callers and callees compiled by either and at different optimization levels: thousands of
+random structure and union shapes (`cmd/axiom/internal/tests/tools/gen_c_abi.py`: nested,
+arrays, bit-fields, floating and integer members, `long double` and `long double
+_Complex` ones (`--ld`), over-aligned members, 1 to about 64 bytes) passed and returned by value, through pointers and as variadic arguments read with
+`va_arg`, `va_copy` and a `va_list` passed on; the layouts of bit-fields on every target
+against the platforms' C compilers. The suite runs a subset (`c/run/abi_gen_*.c`). Windows
+and macOS output is built but not run here. `long double` (alone, in
 structures and unions, variadic, through function pointers, both ways, and the C
 library's `printf("%Lg")` and `strtold`) is tested against the system's C compiler on
 `x86_64` Linux and on `aarch64` Linux (under emulation), and with `--c-long-double=128`
@@ -866,9 +896,8 @@ complete a stack trace is after a crash.
 These are the places where the implementation does not follow the standard it claims, or
 claims less than the standard allows. None is hidden: each is said above or here.
 
-- The implementation is freestanding (`__STDC_HOSTED__` is 0), and misses the parts of
-  the library that C23 4p7 asks a freestanding one for: most of `<string.h>`, some of
-  `<stdlib.h>`.
+- The implementation is freestanding (`__STDC_HOSTED__` is 0), and misses the part of
+  `<stdlib.h>` that C23 4p7 asks a freestanding one for.
 - Annex F is not claimed. The floating types have IEC 60559 formats (`FLT_IS_IEC_60559`
   in `<float.h>`), but there are no exception flags or rounding modes; signaling NaNs are
   not guaranteed to stay signaling, so `<float.h>` has no `FLT_SNAN`.
@@ -885,7 +914,6 @@ claims less than the standard allows. None is hidden: each is said above or here
   macros say.
 - `restrict` has no effect on the generated code; `#pragma STDC FENV_ACCESS ON` is not
   honoured (C4113).
-- The variadic-argument placement limits on x86-64 System V and macOS above.
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;
   a program must not rely on it.
 - An object from `--emit=obj` of units with no `main` does not link into an Axiom
