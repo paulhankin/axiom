@@ -10,6 +10,7 @@ import "asm/core.ax" as acr;
 import "asm/inline.ax" as ai;
 import "asm/x64.ax" as ax;
 import "bin.ax" as bn;
+import "dloc.ax" as dloc;
 import "dwarf.ax" as dw;
 import "elf.ax" as elf;
 import "ftab.ax" as ft;
@@ -29,7 +30,7 @@ pub let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: fal
                                              b: bn.Bytes.{
                                                  b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
                                              fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
-                                                                   cap: 0 } }; 7],
+                                                                   cap: 0 } }; 9],
                                      strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
                                      lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
@@ -41,7 +42,12 @@ pub let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: fal
                                      nfuncs: 0, first_src: 0, text_sym: 0,
                                      trefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
                                      gsyms: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 } };  // -g: DWARF (dwarf.ax; not on Windows)
+                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                     toff: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                                     drefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                     gdone: u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
+                                     voffs: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                                     tls_rel: 0 };  // -g: DWARF (dwarf.ax; not on Windows)
 pub let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
 pub let mut PDATA: i32 = -1;
 pub let mut XDATA_SYM: u32 = 0;
@@ -1344,6 +1350,11 @@ fn enc_call(t: mc.MOp) void {
     }
     DIRTY = false;  // (the callee returns with the upper halves clear)
     let nf = frameless or in_noframe;
+    if nf and WIN {
+        // (every call on Windows has its shadow space, which gives the function
+        // a frame: one without has no unwind information for this)
+        fail("internal compiler error: a call in a function without a frame (Windows)");
+    }
     if nf {
         // sub rsp, 8: the call (which does not return) needs rsp aligned
         E.b.put("\x48\x83\xec\x08");
@@ -2803,6 +2814,7 @@ fn dup_exit_test(skip: []bool, bi: usize) void {
         c.cc = ins[k].cc;
         c.aux = ins[k].aux;
         c.src = ins[k].src;
+        c.scope = ins[k].scope;
         if moved and (k == 1) {
             c.cc = cc;
             c.ops[0] = mc.label(other);
@@ -3115,6 +3127,30 @@ fn var_slot_off(a: *ir.Value) i64 {
     return MF.slots.at(k).offset;
 }
 
+// What dloc.ax needs of x86-64's machine code (variables' locations).
+let DLOC: dloc.Tgt = dloc.Tgt.{ dw_reg: dw_reg, is_exit: is_ret, is_tail: is_tail, slot_off: slot_cfa_off,
+                                alloc: 0xffff_ffcf };
+
+// A physical register's DWARF number (System V psABI 3.6.2): rax, rdx, ...,
+// then xmm0-15 at 17; -1 for others.
+fn dw_reg(r: i32) i32 {
+    if (r >= 0) and (r < 16) {
+        return @bit_cast(i32, DW_GPR[@as(usize, @bit_cast(u32, r))]);
+    }
+    if (r >= xe.XMM0) and (r < xe.XMM0 + 16) {
+        return 17 + (r - xe.XMM0);
+    }
+    return -1;
+}
+
+// A frame slot's offset from the CFA (rbp + 16).
+fn slot_cfa_off(k: i32) i64 {
+    if (k < 0) or (@as(usize, @bit_cast(u32, k)) >= MF.slots.len) or frameless {
+        return dloc.NO_LOC;
+    }
+    return MF.slots.at(@as(usize, @bit_cast(u32, k))).offset - 16;
+}
+
 // The location of f's first instruction that has one (or f's own).
 fn first_src(f: *ir.Func) u32 {
     for bi in 0..MF.blocks.len {
@@ -3149,6 +3185,8 @@ pub fn encode_func(f: *mut ir.Func) void {
     let boff = u.newn.[u64](nb + 1);
     // the line table: (code offset, source location) where the location changes
     let mut rows = u.List.[u64].empty();
+    // -g (full): (code offset, lexical block) where the block changes
+    let mut scopes = u.List.[u64].empty();
     // frame tables: (offset after each call, its chain)
     let mut calls = u.List.[u64].empty();
     jshort.clear();
@@ -3170,6 +3208,7 @@ pub fn encode_func(f: *mut ir.Func) void {
         jfix.clear();
         jtabs.clear();
         rows.clear();
+        scopes.clear();
         calls.clear();
         noframe.clear();
         cfis.clear();
@@ -3179,6 +3218,7 @@ pub fn encode_func(f: *mut ir.Func) void {
         }
         let lines = WIN or DBG.on;
         let mut last_src = f.src;
+        let mut last_scope: u32 = 0;
         if lines and (f.src != 0) {
             rows.push(@as(u64, f.src));
         }
@@ -3204,6 +3244,7 @@ pub fn encode_func(f: *mut ir.Func) void {
                 }
             }
             boff[bi] = @as(u64, E.b.len());
+            dloc.block_at(bi, boff[bi], bi == 0);
             if @as(i32, @int_cast(i32, bi)) == sw {
                 in_noframe = true;
                 cfi_entry();
@@ -3234,6 +3275,11 @@ pub fn encode_func(f: *mut ir.Func) void {
                     rows.push((@as(u64, E.b.len()) << 32) | @as(u64, i.src));
                     last_src = i.src;
                 }
+                if DBG.full and (i.src != 0) and (i.scope != mc.SCOPE_KEEP) and (i.scope != last_scope) {
+                    scopes.push((@as(u64, E.b.len()) << 32) | @as(u64, i.scope));
+                    last_scope = i.scope;
+                }
+                dloc.inst_at(i, @as(u64, E.b.len()));
                 let last = enc_at(i, bi, skip, lal, sw);
                 if FT.on and (i.op == xe.CALL) and not is_tail(i) {
                     let mut at = @as(u64, E.b.len());
@@ -3296,14 +3342,15 @@ pub fn encode_func(f: *mut ir.Func) void {
         }
         let df = dw.Func.{ sym: fsym.get(@int_cast(usize, f.id)), name: dbg_name(f, s.name),
                            external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
-                           cfi: cfis.items(), regs: regs[0..@int_cast(usize, nsaved) + 1], irf: f,
-                           vars: dw.var_locs(f, var_slot_off, 16) };
+                           scopes: scopes.items(), cfi: cfis.items(), regs: regs[0..@int_cast(usize, nsaved) + 1],
+                           irf: f, vars: dw.var_locs(f, var_slot_off, 16), vlocs: dloc.compute(MF, &DLOC, s.size) };
         dw.add_func(&mut DBG, &df);
     }
     E.b.free();
     E.relocs.deinit();
     E.fixups.deinit();
     rows.deinit();
+    scopes.deinit();
     calls.deinit();
 }
 

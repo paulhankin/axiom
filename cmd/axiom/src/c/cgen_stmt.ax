@@ -56,6 +56,7 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     for a in cu.asms.items() {
         gasm.toplevel(a);
     }
+    cdbg.vla_len_slot = gv.len_slot;
     return cg.generate(m, cu, wasm);
 }
 
@@ -91,6 +92,7 @@ fn function_body(s: *mut cast.CSym) void {
     F.entry = cg.new_block("entry");
     let start = cg.new_block("start");
     cg.at_end(start);
+    cdbg.begin_function(f);
     F.sret = gva.enter_function(F.sig.plan, f, s.params.items(), s.ty.variadic);
     // (a parameter of a definition with an identifier list arrives promoted)
     let pts = cg.param_types(s);
@@ -127,6 +129,7 @@ fn function_body(s: *mut cast.CSym) void {
     if cg.is_wasm {
         flow.make_reducible(f);
     }
+    cdbg.end_function();
     BD = u.nil.[Body]();
 }
 
@@ -157,10 +160,12 @@ fn stmt(s: *mut cast.Stmt) void {
     let k = s.kind;
     if k == cast.StmtKind.COMPOUND {
         let d = gv.depth();
+        let sc = cdbg.open_block(s.items.items());
         for x in s.items.items() {
             stmt(x);
         }
         gv.leave(d);
+        cdbg.close_scope(sc);
     } else if k == cast.StmtKind.DECL {
         decl(s.decl);
     } else if k == cast.StmtKind.EXPR {
@@ -269,6 +274,7 @@ fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
     let s = e.body;
     let d = gv.depth();
     let xs = s.items.items();
+    let sc = cdbg.open_block(xs);
     let mut v = ir.vnil();
     for i in 0..xs.len {
         let x = xs[i];
@@ -284,6 +290,7 @@ fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
         stmt(x);
     }
     gv.leave(d);
+    cdbg.close_scope(sc);
     cg.continue_after();
     if u.isnil(v) and not cty.is_void(e.ty) {
         // (the block ended in a jump: the value is never used)
@@ -341,6 +348,7 @@ fn decl(d: *mut cast.Decl) void {
     if d.kind != cast.DeclKind.DECL {
         return;
     }
+    cdbg.note_block_decl(d);
     if (d.decls.len > 0) and has_vm_typeof(d.specs) {
         cg.continue_after();
         gv.eval_specs(d.specs, gx.rv, gx.effects);
@@ -358,6 +366,10 @@ fn decl(d: *mut cast.Decl) void {
             cg.continue_after();
             let p = gv.allocate(s.ty, cg.object_align(s));
             s.ir = @ptr_cast(*mut void, p);
+            // (its address in an object of its own: -O0 keeps it there, for debuggers)
+            let a = cg.alloca(cty.pointer_to(s.ty.elem), "vla.addr");
+            _ = ir.store(cg.B, p, a);
+            cdbg.note_indirect(cg.F.f, s, a);
             if u.notnil(s.init) {
                 _ = ir.memop(cg.B, ir.OP_MEMSET, p, ir.cint(cg.T_i8, 0), gv.size_value(s.ty));  // (C23: `= {}`)
             }
@@ -481,6 +493,7 @@ fn do_stmt(s: *mut cast.Stmt) void {
 
 fn for_stmt(s: *mut cast.Stmt) void {
     let d0 = gv.depth();
+    let sc = cdbg.open_for(s.decl);
     if u.notnil(s.decl) {
         decl(s.decl);
     } else if u.notnil(s.first) {
@@ -520,6 +533,7 @@ fn for_stmt(s: *mut cast.Stmt) void {
         gv.leave(d0);
         cg.br(done);
     }
+    cdbg.close_scope(sc);
     cg.at_end(done);
 }
 

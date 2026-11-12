@@ -380,6 +380,9 @@ types share a module.
 | `version.ax` | `version.h` | the compiler's version (`docs/releasing.md`) |
 | `bin.ax` | | byte buffers for object files (little-endian integers, LEB128) and a reader for them |
 | `pdb.ax` | | the program database (`<out>.pdb`) of a Windows executable: symbols and line tables for debuggers |
+| `dwarf.ax`, `dbginfo.ax` | | DWARF 5 debug information (`-g`): line tables, frames, types, variables, lexical blocks, location lists |
+| `axdebug.ax` | | what an Axiom program's debug information says of its types and variables |
+| `dloc.ax` | | where variables are in optimized machine code (location lists), after register allocation |
 | `main.ax` | `main.c` | the driver: `build`, `check`, `test`, `profile`, `new`, `cache`, `ide`, `lsp`; argument parsing, target resolution, separate compilation, linking |
 | `tester.ax` | `main.c` | `axiom test`: runs the test binary and reports its results, humanly or as agent-json |
 | `profiler.ax` | `main.c` | `axiom profile`: runs a program under the sampling profiler and reports hot functions, call sites and folded stacks |

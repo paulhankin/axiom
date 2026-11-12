@@ -19,6 +19,7 @@ import "asm/inline.ax" as ai;
 import "asm/obj.ax" as aob;
 import "bin.ax" as bn;
 import "combine.ax" as cb;
+import "dloc.ax" as dloc;
 import "dwarf.ax" as dw;
 import "elf.ax" as elf;
 import "ftab.ax" as ft;
@@ -3883,8 +3884,10 @@ fn compile_func(f: *mut ir.Func) void {
     opt.layout(&mut order);
     prepare(f);
     MF = is.new_mfunc(f, &order);
+    dloc.begin(f, DBG.full);
     // parameters
     mc.cur_src = f.src;
+    mc.cur_scope = 0;
     CB = MF.blocks.get(0);
     let mut ng: i32 = 0;
     let mut nv: i32 = 0;
@@ -3902,13 +3905,16 @@ fn compile_func(f: *mut ir.Func) void {
             copy(d, X8, GPR);
         } else if (c == GPR) and (ng < 8) {
             copy(d, ng, GPR);
+            dloc.param(p, ng, dloc.NO_LOC);
             ng += 1;
         } else if (c == VR) and (nv < 8) {
             copy(d, V0 + nv, VR);
+            dloc.param(p, V0 + nv, dloc.NO_LOC);
             nv += 1;
         } else {
             let sz = @bit_cast(i64, stack_arg_size(p.ty));
             soff = (soff + sz - 1) & ~(sz - 1);
+            dloc.param(p, -1, soff - 16);  // (x29 is the CFA - 16)
             let m = mc.mem(FP, -1, 0, soff);
             if c == GPR {
                 _ = e2(LDR, @truncate(u8, sz), W(d), m);
@@ -3925,9 +3931,13 @@ fn compile_func(f: *mut ir.Func) void {
         while u.notnil(i) {
             if i.src != 0 {
                 mc.cur_src = i.src;  // (the line of the instructions made for it)
+                mc.cur_scope = i.scope;
             }
             if not ir.is_term(i.op) {
                 gen_inst(i);
+                if dloc.active {
+                    dloc.selected(i, CB, i.loc);
+                }
             }
             i = i.next;
         }
@@ -3935,6 +3945,7 @@ fn compile_func(f: *mut ir.Func) void {
         is.push_succs(CB, ir.terminator(ib));
     }
     mc.cur_src = 0;
+    mc.cur_scope = 0;
     order.deinit();
     if errors {
         return;
@@ -4328,7 +4339,7 @@ let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, 
                                          b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
                                                                         cap: 0 } },
                                          fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
-                                                               cap: 0 } }; 7],
+                                                               cap: 0 } }; 9],
                                  strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
                                  lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
@@ -4340,7 +4351,11 @@ let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, 
                                  first_src: 0, text_sym: 0,
                                  trefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
                                  gsyms: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
-                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 } };
+                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
+                                 toff: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 },
+                                 drefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                 gdone: u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
+                                 voffs: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, tls_rel: 0 };
 let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
@@ -4756,6 +4771,9 @@ fn encode_func(f: *mut ir.Func) void {
     let mut rows = u.List.[u64].empty();
     let mut last_src: u32 = 0;
     let mut pe_done = false;
+    // -g (full): (code offset, lexical block) where the block changes
+    let mut scopes = u.List.[u64].empty();
+    let mut last_scope: u32 = 0;
     if DBG.on {
         if f.src != 0 {
             rows.push(@as(u64, f.src));
@@ -4766,6 +4784,7 @@ fn encode_func(f: *mut ir.Func) void {
     for bi in 0..nb {
         let b = MF.blocks.get(bi);
         boff[bi] = here();
+        dloc.block_at(bi, boff[bi], bi == 0);
         let mut i = b.first;
         while u.notnil(i) {
             // (the prologue ends, for a debugger, at the first instruction of
@@ -4778,6 +4797,11 @@ fn encode_func(f: *mut ir.Func) void {
                 rows.push((here() << 32) | @as(u64, i.src));
                 last_src = i.src;
             }
+            if DBG.full and (i.src != 0) and (i.scope != mc.SCOPE_KEEP) and (i.scope != last_scope) {
+                scopes.push((here() << 32) | @as(u64, i.scope));
+                last_scope = i.scope;
+            }
+            dloc.inst_at(i, here());
             enc_inst(i);
             if FT.on and (i.op == CALL) and not is_tail(i) {
                 calls.push(here());
@@ -4837,13 +4861,43 @@ fn encode_func(f: *mut ir.Func) void {
         }
         let df = dw.Func.{ sym: fsym.get(@int_cast(usize, f.id)), name: dw.func_name(f, elf.display_name(s.name)),
                            external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
-                           cfi: cfis.items(), regs: regs[0..nsaved + 2], irf: f,
-                           vars: dw.var_locs(f, var_slot_off, 16 + frame) };
+                           scopes: scopes.items(), cfi: cfis.items(), regs: regs[0..nsaved + 2], irf: f,
+                           vars: dw.var_locs(f, var_slot_off, 16 + frame), vlocs: dloc.compute(MF, &DLOC, s.size) };
         dw.add_func(&mut DBG, &df);
     }
     rows.deinit();
+    scopes.deinit();
     code.free();
     calls.deinit();
+}
+
+// What dloc.ax needs of AArch64's machine code (variables' locations): the
+// allocatable registers x0-x15, x19-x27, v0-v31.
+let DLOC: dloc.Tgt = dloc.Tgt.{ dw_reg: dw_reg, is_exit: is_exit, is_tail: is_tail, slot_off: slot_cfa_off,
+                                alloc: 0xffff_ffff_0ff8_ffff };
+
+// A physical register's DWARF number (DWARF for the Arm 64-bit
+// architecture, 4.1): x0-x30 0-30, v0-v31 64-95.
+fn dw_reg(r: i32) i32 {
+    if (r >= 0) and (r <= 30) {
+        return r;
+    }
+    if (r >= V0) and (r < V0 + 32) {
+        return 64 + (r - V0);
+    }
+    return -1;
+}
+
+fn is_exit(i: *mc.MInst) bool {
+    return (i.op == RET) or is_tail(i);
+}
+
+// A frame slot's offset from the CFA (the frame's bottom is 16 + frame below it).
+fn slot_cfa_off(k: i32) i64 {
+    if (k < 0) or (@as(usize, @bit_cast(u32, k)) >= MF.slots.len) or frameless {
+        return dloc.NO_LOC;
+    }
+    return MF.slots.at(@as(usize, @bit_cast(u32, k))).offset - (16 + frame);
 }
 
 // The offset from the frame's bottom (the stack pointer after the
@@ -4906,6 +4960,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     FT = ft.begin(OBJ, m, TEXT, relro, &mut gsym, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
     DBG = dw.begin(dw.ARCH_A64, 8, tg.g_debug);
     DBG.lang = dw.module_lang(m);
+    if not tg.is_darwin() {
+        DBG.tls_rel = elf.R_AARCH64_TLS_DTPREL64;
+    }
     for i in 0..m.globals.len {
         dw.add_data_sym(&mut DBG, m.globals.get(i).name, gsym.get(i));
     }

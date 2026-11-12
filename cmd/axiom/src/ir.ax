@@ -1031,6 +1031,7 @@ pub struct Value {
     flag: i32,
     grave: u32,  // 1 + its index in the graveyard (0: not there)
     src: u32,    // where in the source it comes from (src_loc), 0: not known
+    scope: u32,  // -g: the lexical block it is in (dbginfo.ax's scopes), 0: its function's outermost
 }
 
 // The fields of a Value that few values have: phis' and switches' blocks,
@@ -2284,6 +2285,140 @@ let mut fwd_epoch: u64 = 1;
 pub fn forward(v: *mut Value, r: *mut Value) void {
     v.fwd = r;
     fwd_epoch += 1;
+    if dbg_on {
+        dbg_replace(v, r);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Debug information of optimized code (-g, -O1 and up: dbginfo.ax): the
+// values that are a variable's (one assigned once: the value it was
+// assigned), followed as passes replace them (a forwarded value's role
+// goes to its replacement: the same value where it is used), and given up
+// when one is copied (the copies would be the variable too, in other
+// places: unrolled, inlined, duplicated code). An alloca that takes
+// another's place (sharing a slot, a copy made the same object) is marked:
+// its memory holds another variable's contents too. Values are told apart
+// by their ids (a dead value's memory is reused, an id is not).
+// -----------------------------------------------------------------------------
+pub struct DbgRef {
+    v: *mut Value,  // nil: given up
+    id: i32,
+    copied: bool,
+    next: i32,  // the next entry following the same value (-1: none)
+}
+
+pub let mut dbg_on: bool = false;
+pub let mut dbg_refs: u.List.[DbgRef] = u.List.[DbgRef].{ data: @ptr_from_int(*mut DbgRef, 0), len: 0, cap: 0 };
+// an instruction (its address) -> the first entry of dbg_refs following it + 1
+let mut dbg_at: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                  cap: 0, len: 0 };
+// an alloca (its address) -> its id + 1, if another's uses went to it
+let mut dbg_merged: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+fn dbg_key(v: *Value) []u8 {
+    return u.addr_key(@int_from_ptr(v));
+}
+
+/// Follows value v (an instruction or a constant) for the debug
+/// information: its index in dbg_refs.
+pub fn dbg_track(v: *mut Value) i32 {
+    let k = @int_cast(i32, dbg_refs.len);
+    dbg_refs.push(DbgRef.{ v: v, id: v.id, copied: false, next: -1 });
+    dbg_link(k, v);
+    return k;
+}
+
+fn dbg_link(k: i32, v: *mut Value) void {
+    if (v.kind == V_INST) or (v.kind == V_PARAM) {
+        let key = dbg_key(v);
+        dbg_refs.at(@int_cast(usize, k)).next = dbg_at.get(key) - 1;
+        dbg_at.put(key, k + 1);
+    }
+}
+
+/// The value dbg_refs[k] stands for now (nil: none, or given up).
+pub fn dbg_value(k: i32) *mut Value {
+    if (k < 0) or (@int_cast(usize, k) >= dbg_refs.len) {
+        return vnil();
+    }
+    let r = dbg_refs.get(@int_cast(usize, k));
+    if u.isnil(r.v) or r.copied {
+        return vnil();
+    }
+    if (r.v.kind == V_INST) and ((r.v.id != r.id) or (r.v.grave != 0) or u.isnil(r.v.blk)) {
+        return vnil();
+    }
+    return r.v;
+}
+
+/// Is the instruction dbg_refs[k] follows still where it was (in a block,
+/// not dead), copied or not?
+pub fn dbg_present(k: i32) bool {
+    let r = dbg_refs.get(@int_cast(usize, k));
+    return u.notnil(r.v) and (r.v.kind == V_INST) and (r.v.id == r.id) and (r.v.grave == 0) and u.notnil(r.v.blk);
+}
+
+/// Has alloca a (whose id is id) taken another's place (dbg_merged)?
+pub fn dbg_was_merged(a: *Value, id: i32) bool {
+    return dbg_merged.get(dbg_key(a)) == id + 1;
+}
+
+// The entries following v: each one's v and id are v's still (the others,
+// stale, leave the chain).
+fn dbg_chain(v: *Value) i32 {
+    if ((v.kind != V_INST) and (v.kind != V_PARAM)) or (dbg_at.len == 0) {
+        return -1;
+    }
+    return dbg_at.get(dbg_key(v)) - 1;
+}
+
+// v's uses go to r.
+fn dbg_replace(v: *mut Value, r0: *mut Value) void {
+    if (v.kind == V_INST) and (v.op == OP_ALLOCA) {
+        let mut a = resolve(r0);
+        while u.notnil(a) and (a.kind == V_INST) and (a.op == OP_PTRADD) {
+            a = a.a;
+        }
+        if u.notnil(a) and (a.kind == V_INST) and (a.op == OP_ALLOCA) {
+            dbg_merged.put(dbg_key(a), a.id + 1);
+        }
+    }
+    let mut j = dbg_chain(v);
+    if j < 0 {
+        return;
+    }
+    dbg_at.put(dbg_key(v), 0);
+    let r = resolve(r0);
+    let ok = u.notnil(r) and (r != v) and
+             ((r.kind == V_INST) or (r.kind == V_CINT) or (r.kind == V_CFP) or (r.kind == V_ZERO));
+    while j >= 0 {
+        let ref = dbg_refs.at(@int_cast(usize, j));
+        let nx = ref.next;
+        if (ref.v == v) and (ref.id == v.id) {
+            if ok {
+                ref.v = r;
+                ref.id = r.id;
+                dbg_link(j, r);
+            } else {
+                ref.v = vnil();
+            }
+        }
+        j = nx;
+    }
+}
+
+// v is copied (copy_inst): the entries following it give up.
+fn dbg_copied(v: *Value) void {
+    let mut j = dbg_chain(v);
+    while j >= 0 {
+        let ref = dbg_refs.at(@int_cast(usize, j));
+        if (@int_from_ptr(ref.v) == @int_from_ptr(v)) and (ref.id == v.id) {
+            ref.copied = true;
+        }
+        j = ref.next;
+    }
 }
 
 // Rewrites every operand of f's instructions through resolve().
@@ -2537,6 +2672,9 @@ pub fn nops(v: *Value) usize {
 
 // Replaces every use of `old` by `new` in function f (operands only).
 pub fn replace_uses(f: *mut Func, old: *mut Value, new: *mut Value) void {
+    if dbg_on {
+        dbg_replace(old, new);
+    }
     let mut b = f.first;
     while u.notnil(b) {
         let mut i = b.first;
@@ -2837,6 +2975,9 @@ pub fn insert_block(bd: *Builder) *mut Block {
 // every instruction. Code generation sets cur_src as it goes; instructions
 // passes insert before another take that one's.
 pub let mut cur_src: u32 = 0;
+// (and the lexical block they are in, which goes with the location: C's
+// block scopes, dbginfo.ax; 0: none)
+pub let mut cur_scope: u32 = 0;
 
 pub fn src_loc(file: i32, line: i32) u32 {
     if (file < 0) or (file >= 4095) or (line <= 0) or (line >= 0x10_0000) {
@@ -2857,8 +2998,10 @@ fn emit(bd: *mut Builder, op: i32, t: *mut Ty) *mut Value {
     let v = new_val(V_INST, t);
     v.op = op;
     v.src = cur_src;
+    v.scope = cur_scope;
     if (v.src == 0) and u.notnil(bd.before) {
         v.src = bd.before.src;
+        v.scope = bd.before.scope;
     }
     let f = bd.blk.fnp;
     v.id = f.nvals;
@@ -2887,6 +3030,10 @@ pub fn copy_inst(f: *mut Func, v: *Value) *mut Value {
     y.cv = v.cv;
     y.flags = v.flags;
     y.src = v.src;
+    y.scope = v.scope;
+    if dbg_on and not (u.notnil(v.blk) and (@int_from_ptr(v.blk.fnp) != @int_from_ptr(f))) {
+        dbg_copied(v);  // (a copy in another function, inlined there, is not this variable)
+    }
     y.align = v.align;
     copy_more(y, v);  // (with a block list of its own, filled below)
     y.a = v.a;

@@ -5,6 +5,7 @@
 // simplification.
 // =============================================================================
 import "combine.ax" as cb;
+import "dbginfo.ax" as dbi;
 import "ir.ax" as ir;
 import "switches.ax" as swl;
 import "util.ax" as u;
@@ -456,7 +457,12 @@ pub fn mem2reg(f: *mut ir.Func) void {
         }
         b = b.next;
     }
+    let mut once = u.List.[VarOnce].empty();
+    if ir.dbg_on {
+        once = vars_before(f);
+    }
     if slots.len == 0 {
+        once.deinit();
         return;
     }
     compute_preds(f);
@@ -548,6 +554,124 @@ pub fn mem2reg(f: *mut ir.Func) void {
     }
     slots.deinit();
     ir.apply_forwarding(f);
+    if once.len > 0 {
+        vars_after(once.items());
+    }
+    once.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Debug information (-g, optimized code; dbginfo.ax): at a function's first
+// promotion, what becomes of the objects of its variables. One promoted is
+// followed as a value when it is assigned once (the variable's value: one
+// store, whose value every load gets: the store dominates them); one left in
+// memory has its stores remembered (where all of them remain, the memory
+// holds the variable).
+// -----------------------------------------------------------------------------
+struct VarOnce {
+    v: *mut dbi.DVar,
+    store: *mut ir.Value,
+    loads: u.List.[*mut ir.Value],
+}
+
+// The root object of address p (through offsets), or nil.
+fn object_of(p: *mut ir.Value) *mut ir.Value {
+    let mut x = p;
+    while u.notnil(x) and (x.kind == ir.V_INST) and (x.op == ir.OP_PTRADD) {
+        x = x.a;
+    }
+    if u.notnil(x) and (x.kind == ir.V_INST) and (x.op == ir.OP_ALLOCA) {
+        return x;
+    }
+    return ir.vnil();
+}
+
+fn writes_object(i: *ir.Value, a: *mut ir.Value) bool {
+    if i.op == ir.OP_STORE {
+        return object_of(i.b) == a;
+    }
+    if (i.op == ir.OP_MEMSET) or (i.op == ir.OP_MEMCPY) or (i.op == ir.OP_MEMMOVE) {
+        return object_of(i.a) == a;
+    }
+    return false;
+}
+
+// Before f's allocas are promoted (the promoted ones: aux > 0): the
+// variables of f not looked at yet, with the store and loads of the ones
+// promoted now that are stored once; the stores of the others, followed.
+fn vars_before(f: *mut ir.Func) u.List.[VarOnce] {
+    let mut out = u.List.[VarOnce].empty();
+    let vl = dbi.vars_mut(f.name);
+    if u.isnil(vl) {
+        return out;
+    }
+    for k in 0..vl.len {
+        let v = vl.at(k);
+        let a = v.alloca;
+        if v.seen or v.artificial or u.notnil(v.global) {
+            continue;
+        }
+        v.seen = true;
+        if u.isnil(a) or (a.op != ir.OP_ALLOCA) or (a.id != v.alloca_id) or (a.grave != 0) or u.isnil(a.blk) or
+           (@int_from_ptr(a.blk.fnp) != @int_from_ptr(f)) {
+            continue;
+        }
+        if v.indirect {
+            continue;
+        }
+        let mut st = ir.vnil();
+        let mut nst: i32 = 0;
+        let mut loads = u.List.[*mut ir.Value].empty();
+        let first = @int_cast(i32, ir.dbg_refs.len);
+        let mut b = f.first;
+        while u.notnil(b) {
+            let mut i = b.first;
+            while u.notnil(i) {
+                if writes_object(i, a) {
+                    nst += 1;
+                    st = i;
+                    if a.aux <= 0 {
+                        _ = ir.dbg_track(i);
+                    }
+                } else if (a.aux > 0) and (i.op == ir.OP_LOAD) and (i.a == a) {
+                    loads.push(i);
+                }
+                i = i.next;
+            }
+            b = b.next;
+        }
+        if a.aux <= 0 {
+            // (left in memory)
+            v.stores = first;
+            v.nstores = nst;
+            loads.deinit();
+            continue;
+        }
+        if (nst != 1) or (st.op != ir.OP_STORE) or (st.b != a) {
+            loads.deinit();
+            continue;
+        }
+        out.push(VarOnce.{ v: v, store: st, loads: loads });
+    }
+    return out;
+}
+
+// After the promotion: a variable stored once whose every load became the
+// stored value is that value.
+fn vars_after(once: []VarOnce) void {
+    for x in once {
+        let val = ir.resolve(x.store.a);
+        let mut ok = u.notnil(val);
+        for l in x.loads.items() {
+            if ir.resolve(l) != val {
+                ok = false;
+            }
+        }
+        if ok {
+            x.v.track = ir.dbg_track(val);
+        }
+        x.loads.deinit();
+    }
 }
 
 fn slot_of_ptr(slots: []mut *mut Slot, p: *mut ir.Value) *mut Slot {
@@ -1974,6 +2098,7 @@ fn clone_inst(f: *mut ir.Func, i: *ir.Value, before: *mut ir.Value) *mut ir.Valu
     y.a = i.a;
     y.b = i.b;
     y.src = i.src;
+    y.scope = i.scope;
     ir.insert_before(before, y);
     return y;
 }

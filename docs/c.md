@@ -1144,30 +1144,64 @@ not change the code generated, at any optimization level, and two builds are the
 - **Frames**: call frame information for every instruction of every function
   (prologues, epilogues, sibling calls, code run before the frame is set up), so that
   a debugger can unwind the stack wherever it stops.
-- **Types and variables** (`full`): the program's types (base types, pointers,
-  qualifiers, arrays, structures and unions with their bit-fields, enumerations and
-  their constants, function types); each function's result type, parameters and local
-  variables; objects of static storage duration (a block-scope `static` one appears
-  at the top level, beside the file's). A variable declared with a typedef name has
-  the type the name stands for: typedefs are not described. All of a function's
-  variables are in its scope: there are no lexical blocks, so two variables of the
-  same name in one function cannot be told apart. At `-O0` every variable is in
-  memory, in its frame slot, and has a location; at `-O1` and above variables have
-  none ("optimized out"), never a wrong one. The object of a variable length array
-  has no location, and its type no bound.
+- **Types and variables** (`full`): the program's types (base types, `_BitInt` with its
+  width in bits, pointers, qualifiers, arrays, structures and unions with their
+  bit-fields, enumerations and their constants, function types, typedefs); each
+  function's result type, parameters and local variables; objects of static storage
+  duration, thread-local ones included (by their offset in the thread's TLS block;
+  not on macOS). A variable, parameter, typedef or object declared with a typedef name
+  has the typedef as its type (or one derived from it: `T *p`).
+- **Scopes**: a block that declares something is a lexical block, with the code of its
+  statements (in pieces at `-O2`, `.debug_rnglists`), its variables, its block-scope
+  `static` objects, typedefs, structures, unions and enumerations: a name declared
+  again inside a block is told apart from the outer one.
+- **Locations at `-O0`**: every variable is in memory, in its frame slot (`-O0` keeps
+  it there, with or without `-g`), from the end of the prologue on. A parameter passed
+  by reference (a large structure on AArch64 and Windows) and a variable length array
+  are found through the address an object of the frame holds; a variable length
+  array's bound is the variable holding its length.
+- **Locations at `-O1` and above**, never a wrong one; what has none is "optimized out":
+  - a variable assigned once (its initializer, and no assignment after) is its value,
+    which the optimizer is followed through: in the registers and spill slots that
+    hold it, from the instruction that makes it, where every path since has made it
+    and nothing has written the register since (a location list), or a constant
+    everywhere. One whose value was copied in its function (unrolled, duplicated
+    code), or that is a merge of values (a phi), has none;
+  - a parameter never assigned is also in its argument's register at the function's
+    entry (where a breakpoint on the function stops), or for the whole function in its
+    stack slot (but in a function with a call in tail position);
+  - a variable left in memory (its address taken, a structure not taken apart) is in
+    its frame slot when all its stores remain where they were and no other object
+    shares the slot;
+  - a variable assigned more than once and kept in registers has none.
 
+  What this relies on of the register allocator (`cmd/axiom/src/dloc.ax`): a machine
+  instruction's operands, clobbers, copies, spills and reloads say every register and
+  spill slot it changes, and two values live at the same time are in different
+  registers. `cmd/axiom/internal/tests/dwarf.mjs` checks the location lists' shapes
+  (inside their blocks, in order, in registers that hold values, a parameter's entry
+  in its argument register); in development, stepping randomly generated functions
+  instruction by instruction in the system's debuggers and comparing every value they
+  show with the program's own printing found no difference (x86-64 at `-O1` and
+  `-O2`; AArch64 under emulation, but at a few epilogue instructions where that
+  debugger's own reading of the innermost frame's code moves the frame base).
 Where it goes, per target:
 
 | Target | |
 |---|---|
-| `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`. |
-| `aarch64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable is the same as without `-g`. |
-| `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`; no types or variables. |
+| `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`, and when needed `.debug_rnglists` and `.debug_loclists`. |
+| `aarch64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable is the same as without `-g`. It has no unwind information (`__unwind_info`, `__eh_frame`): the platform's ABI keeps a frame record (x29, x30) in every function that calls, and the crash reporter and `backtrace(3)` walk those records, so stack traces through our frames need none (a leaf without a frame has its caller in x30). Only an unwinder that needs the tables (C++ exceptions through our frames, which do not happen) would. |
+| `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`; no types or variables. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame). |
 | `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section (lines; no frames, which WebAssembly has no use for). |
 
 The objects of `--emit=obj` carry the same sections (ELF targets), with relocations,
-for the system's linker. Axiom functions in the same program get lines and frames but
-no variables.
+for the system's linker. Axiom functions in the same program are described in the same
+compilation unit, whose language is C's (an Axiom program's own units have Axiom's:
+`docs/cli.md`, `-g`).
+
+The line of a crash's faulting instruction is not in the stack trace (above): run the
+program in a debugger, which stops there and reads its line from the line tables, or
+load the core dump into one.
 
 ## Optimization
 

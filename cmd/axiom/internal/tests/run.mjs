@@ -38,7 +38,7 @@ import os from 'os';
 import { Worker } from 'worker_threads';
 import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
-import { loadImage, checkDebug, addrsOfLine, subprogramAt } from './dwarf.mjs';
+import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -1975,13 +1975,13 @@ if (!skipPlatform) {
   };
   const dcases = {};
   const targets = ['x86_64', 'aarch64', 'aarch64-macos', 'wasm32', 'wasm64'];
-  for (const lang of ['c', 'ax']) {
-    const src = path.join(ddir, `frames.${lang}`);
+  for (const [lang, file] of [['c', 'frames.c'], ['ax', 'frames.ax'], ['c', 'vars.c'], ['ax', 'vars.ax'], ['ax', 'shared.ax']]) {
+    const src = path.join(ddir, file);
     for (const t of targets) {
       for (const lvl of ['-O0', '-O2']) {
         for (const obj of t.endsWith('64') && !t.startsWith('wasm') ? [false, true] : [false]) {
-          dcases[`frames.${lang} ${t} ${lvl}${obj ? ' object' : ''}`] = async () => {
-            const base = path.join(tmp, `debug-${lang}-${t}${lvl}${obj ? '-o' : ''}`);
+          dcases[`${file} ${t} ${lvl}${obj ? ' object' : ''}`] = async () => {
+            const base = path.join(tmp, `debug-${file}-${t}${lvl}${obj ? '-o' : ''}`);
             // (the same name: a Mach-O executable's signature names it)
             const outs = ['g1', 'g2', 'n'].map((k) => { fs.mkdirSync(`${base}-${k}`, { recursive: true }); return path.join(`${base}-${k}`, 'prog'); });
             const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
@@ -2005,6 +2005,18 @@ if (!skipPlatform) {
             const r = checkDebug(img, { cfi: !t.startsWith('wasm') });
             if (r.errs.length) return r.errs.join('\n');
             if (obj && !r.nrets) return 'no frame table entries checked';
+            if (file === 'vars.c') {
+              // (types and variables: not on WebAssembly, which has lines only)
+              if (t.startsWith('wasm')) return r.nblocks || r.nvars ? 'variables on WebAssembly' : null;
+              const errs = checkVars(r.dw, { O0: lvl === '-O0', tls: !mac, src, markLine, machine: t.startsWith('x86') ? 'x64' : 'a64' });
+              return errs.length ? errs.join('\n') : null;
+            }
+            if (file === 'shared.ax') return null;  // (checkDebug: every function has its subprogram)
+            if (file === 'vars.ax') {
+              if (t.startsWith('wasm') || lvl !== '-O0') return null;
+              const errs = checkAxVars(r.dw);
+              return errs.length ? errs.join('\n') : null;
+            }
             const lines = lang === 'c' ? ['add-sum', 'many-loop', 'vla-decl', 'tail-call'] : ['many-loop', 'tail-call'];
             for (const m of lines) {
               const at = addrsOfLine(r.dw, `frames.${lang}`, markLine(src, m));
@@ -2202,6 +2214,40 @@ if (!skipPlatform) {
       if (p || !wine) return p;
       const r = run('c', ['x']);
       return r.status === 3 && r.stdout === 'x 42 2.50\r\nbye\r\n' ? null : `status ${r.status}: ${JSON.stringify(r.stdout)}${r.stderr}`;
+    },
+    // The function table (.pdata): entries sorted, apart, each in .text with
+    // its unwind information, not overlapping the TLS directory; under Wine a
+    // stack walk from a C function through its callers, our start-up and the
+    // system's code (windows/walk.c).
+    'the function table and a stack walk': () => {
+      for (const o of ['-O0', '-O1', '-O2']) {
+        const c = build(path.join(root, 'cmd/axiom/internal/tests/windows/walk.c'), `walk${o}`, [o, '--pdb=off']);
+        if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+        const b = fs.readFileSync(out(`walk${o}`));
+        const { off, dir } = peLayout(b);
+        const ex = dir(3), tls = dir(9);
+        if (!ex.size) return `${o}: no function table`;
+        if (tls.size && tls.rva < ex.rva + ex.size && ex.rva < tls.rva + tls.size) return `${o}: the TLS directory overlaps the function table`;
+        let prev = 0;
+        for (let e = off(ex.rva); e < off(ex.rva) + ex.size; e += 12) {
+          const s0 = b.readUInt32LE(e), e0 = b.readUInt32LE(e + 4), u = b.readUInt32LE(e + 8);
+          if (!(s0 >= prev && e0 > s0)) return `${o}: function table entry [0x${s0.toString(16)}, 0x${e0.toString(16)}) out of order`;
+          if (b[off(u)] !== 1) return `${o}: unwind information of version ${b[off(u)]} at 0x${s0.toString(16)}`;
+          prev = e0;
+        }
+        if (!wine) continue;
+        const r = run(`walk${o}`);
+        const m = /leaf (?:0x)?([0-9A-F]+) main (?:0x)?([0-9A-F]+) die (?:0x)?([0-9A-F]+)/i.exec(r.stdout);
+        if (!m) return `${o}: status ${r.status}: ${r.stdout}${r.stderr}`;
+        const [leaf, main] = [parseInt(m[1], 16), parseInt(m[2], 16)];
+        const fr = [...r.stdout.matchAll(/frame (?:0x)?([0-9A-F]+)/gi)].map((x) => parseInt(x[1], 16)).filter((a) => a !== 0);
+        const li = fr.findIndex((a) => a > leaf && a < main), mi = fr.findIndex((a) => a > main && a < main + 0x400);
+        // (at -O2 leaf and main are inlined into the start-up's call of main)
+        if (o !== '-O2' && (li < 0 || mi !== li + 1)) return `${o}: the walk does not go from leaf to main:\n${r.stdout}`;
+        if (!fr.some((a) => a >= 0x200000000)) return `${o}: the walk does not reach the system's code:\n${r.stdout}`;
+        if (new Set(fr).size !== fr.length) return `${o}: the walk repeats a frame:\n${r.stdout}`;
+      }
+      return null;
     },
     'debug symbols (a PDB)': () => {
       const c = build(path.join(root, 'examples/pi/pi.ax'), 'pdb', ['-O2']);

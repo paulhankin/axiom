@@ -9,7 +9,11 @@
 //     the frame pointer, by the right amounts);
 //   - each call's return address in the frame tables (axiom_rets, in an
 //     object) is in code whose CFA rule is the frame pointer's (or, for a
-//     call made without a frame, the stack pointer's).
+//     call made without a frame, the stack pointer's);
+//   - lexical blocks lie inside their parents' code (ranges: low and high
+//     pc, or a list of .debug_rnglists); variables' locations are
+//     expressions of the forms the compiler writes, and a location list's
+//     ranges lie inside the variable's block.
 // Files: ELF executables and relocatable objects (x86-64, AArch64), a
 // Mach-O debug bundle's DWARF file, WebAssembly modules (the DWARF custom
 // sections, code-section offsets). Formats as in the DWARF 5 standard.
@@ -81,7 +85,7 @@ function loadElf(d) {
     }
     for (const x of rel) {
       const v = symVal(x.sym) + x.add;
-      if (x.ty === 1 || x.ty === 257) buf.writeBigUInt64LE(BigInt(v), x.off);
+      if (x.ty === 1 || x.ty === 257 || x.ty === 17 || x.ty === 1028) buf.writeBigUInt64LE(BigInt(v), x.off);
       else if (x.ty === 10 || x.ty === 258) buf.writeUInt32LE(v >>> 0, x.off);
       else throw new Error(`relocation type ${x.ty} in ${target.name}`);
     }
@@ -350,14 +354,15 @@ export function frameAt(fde, a) {
 export function readDwarf(img) {
   const g = (n) => img.sections.get(n) || Buffer.alloc(0);
   const S = { info: g('.debug_info'), abbrev: g('.debug_abbrev'), str: g('.debug_str'), lstr: g('.debug_line_str'),
-              line: g('.debug_line'), frame: g('.debug_frame'), aranges: g('.debug_aranges') };
+              line: g('.debug_line'), frame: g('.debug_frame'), aranges: g('.debug_aranges'),
+              rnglists: g('.debug_rnglists'), loclists: g('.debug_loclists') };
   return { S, units: readInfo(S), seqs: readLines(S), fdes: S.frame.length ? readFrames(S) : [] };
 }
 
 // -----------------------------------------------------------------------------
 // Checks
 // -----------------------------------------------------------------------------
-const AT_NAME = 0x03, AT_LOW = 0x11, AT_HIGH = 0x12, AT_DECL_LINE = 0x3b;
+const AT_NAME = 0x03, AT_LOW = 0x11, AT_HIGH = 0x12, AT_DECL_LINE = 0x3b, AT_RANGES = 0x55;
 const TAG_SUBPROGRAM = 0x2e;
 
 // The problems found in img's debug information (an empty list: none).
@@ -449,7 +454,137 @@ export function checkDebug(img, opts = {}) {
       if (st.cfa[0] !== want) E(`the call returning to 0x${e.ret.toString(16)}: CFA = r${st.cfa[0]} + ${st.cfa[1]}, not by r${want}`);
     }
   }
-  return { errs, nsubs: subs.length, nfuncs: nf, nseqs: dw.seqs.length, nfdes: dw.fdes.length, nrets: img.rets.length, dw };
+  const sc = checkScopes(dw, img.machine === 'wasm' ? null : img.machine);
+  for (const m of sc.errs) E(m);
+  return { errs, nsubs: subs.length, nfuncs: nf, nseqs: dw.seqs.length, nfdes: dw.fdes.length, nrets: img.rets.length, dw,
+           nblocks: sc.blocks, nvars: sc.vars, nlocated: sc.located };
+}
+
+// The ranges [[lo, hi)] of a DIE with low/high pc or DW_AT_ranges (DWARF 5,
+// 2.17; .debug_rnglists entries DW_RLE_start_length, start_end, offset_pair
+// with base_address), null if it has none.
+export function dieRanges(dw, die) {
+  const lo = die.attrs.get(AT_LOW);
+  if (lo !== undefined) return [[lo, lo + die.attrs.get(AT_HIGH)]];
+  const off = die.attrs.get(AT_RANGES);
+  if (off === undefined) return null;
+  const r = new Rd(dw.S.rnglists, off), out = [];
+  let base = 0;
+  for (;;) {
+    const k = r.u8();
+    if (k === 0) return out;
+    if (k === 7) { const a = r.u64(); out.push([a, a + r.uleb()]); }
+    else if (k === 6) { const a = r.u64(); out.push([a, r.u64()]); }
+    else if (k === 5) base = r.u64();
+    else if (k === 4) { const a = r.uleb(); out.push([base + a, base + r.uleb()]); }
+    else throw new Error(`range list entry ${k}`);
+  }
+}
+
+// A location list (.debug_loclists at off): [{ lo, hi, expr }] (DW_LLE_start_length,
+// start_end, offset_pair with base_address).
+export function locList(dw, off) {
+  const r = new Rd(dw.S.loclists, off), out = [];
+  let base = 0;
+  const ex = () => { const n = r.uleb(); const b = r.d.subarray(r.p, r.p + n); r.p += n; return b; };
+  for (;;) {
+    const k = r.u8();
+    if (k === 0) return out;
+    if (k === 8) { const a = r.u64(), n = r.uleb(); out.push({ lo: a, hi: a + n, expr: ex() }); }
+    else if (k === 7) { const a = r.u64(), b = r.u64(); out.push({ lo: a, hi: b, expr: ex() }); }
+    else if (k === 6) base = r.u64();
+    else if (k === 4) { const a = r.uleb(), b = r.uleb(); out.push({ lo: base + a, hi: base + b, expr: ex() }); }
+    else throw new Error(`location list entry ${k}`);
+  }
+}
+
+// Is expr a location expression of the forms the compiler writes: one of
+// DW_OP_fbreg n [DW_OP_deref], DW_OP_addr a, DW_OP_const8u n
+// DW_OP_form_tls_address, DW_OP_regN, DW_OP_regx n, DW_OP_bregN n, or
+// pieces of registers (DW_OP_regN DW_OP_piece n ...)?
+export function knownLocation(expr) {
+  const r = new Rd(expr);
+  const op = r.u8();
+  if (op === 0x91) { r.sleb(); if (r.p < expr.length && r.u8() !== 0x06) return false; return r.p === expr.length; }
+  if (op === 0x03) { r.p += expr.length - 1; return expr.length === 9 || expr.length === 5; }
+  if (op === 0x0e) { r.u64(); return r.u8() === 0x9b && r.p === expr.length; }
+  r.p = 0;
+  while (r.p < expr.length) {
+    const o = r.u8();
+    if (o >= 0x50 && o <= 0x6f) { /* DW_OP_regN */ }
+    else if (o === 0x90) r.uleb();
+    else if (o >= 0x70 && o <= 0x8f) r.sleb();
+    else return false;
+    if (r.p === expr.length) return true;
+    if (r.u8() !== 0x93) return false;
+    r.uleb();
+  }
+  return true;
+}
+
+// The registers a variable may be in (DW_OP_regN): those the register
+// allocators give values, never the stack, frame or link register, nor the
+// scratch ones (x86-64: rax-rdi but rbp, rsp, r8-r15, xmm0-15; AArch64:
+// x0-x15, x19-x27, v0-v31).
+function allocatable(machine, r) {
+  if (machine === 'x64') return (r >= 0 && r <= 5) || (r >= 8 && r <= 15) || (r >= 17 && r <= 32);
+  return (r >= 0 && r <= 15) || (r >= 19 && r <= 27) || (r >= 64 && r <= 95);
+}
+
+function exprReg(expr) {
+  if (expr[0] >= 0x50 && expr[0] <= 0x6f && expr.length === 1) return expr[0] - 0x50;
+  if (expr[0] === 0x90) return new Rd(expr, 1).uleb();
+  return -1;
+}
+
+// The lexical blocks and variables of the subprograms: each block's ranges
+// inside its parent's; each location known (knownLocation), a list's
+// ranges inside its block, in order, apart, in allocatable registers
+// (machine: 'x64', 'a64'). Returns { errs, blocks, vars, located }.
+export function checkScopes(dw, machine) {
+  const errs = [];
+  let blocks = 0, vars = 0, located = 0;
+  const E = (m) => { if (errs.length < 40) errs.push(m); };
+  const inside = (rs, outer) => rs.every(([a, b]) => outer.some(([c, d]) => a >= c && b <= d));
+  const walk = (die, rs, fname) => {
+    for (const c of die.children) {
+      if (c.tag === 0x0b) {
+        blocks++;
+        let r;
+        try { r = dieRanges(dw, c); } catch (e) { E(`${fname}: ${e.message}`); continue; }
+        if (!r || !r.length) { E(`${fname}: a lexical block without code at 0x${c.off.toString(16)}`); continue; }
+        if (r.some(([a, b]) => !(b > a))) E(`${fname}: an empty range in a lexical block`);
+        if (!inside(r, rs)) E(`${fname}: a lexical block at 0x${c.off.toString(16)} outside its parent's code`);
+        walk(c, r, fname);
+      } else if (c.tag === 0x34 || c.tag === 0x05) {
+        vars++;
+        const loc = c.attrs.get(0x02);
+        if (loc === undefined) continue;
+        located++;
+        const name = c.attrs.get(AT_NAME) || '(artificial)';
+        if (typeof loc === 'number') {
+          let l;
+          try { l = locList(dw, loc); } catch (e) { E(`${fname}.${name}: ${e.message}`); continue; }
+          if (!l.length) E(`${fname}.${name}: an empty location list`);
+          for (let k = 1; k < l.length; k++) if (l[k].lo < l[k - 1].hi) E(`${fname}.${name}: location ranges out of order or overlapping`);
+          for (const x of l) {
+            const r = exprReg(x.expr);
+            if (r >= 0 && machine && !allocatable(machine, r)) E(`${fname}.${name}: in register ${r}, which holds no values`);
+            if (!(x.hi > x.lo)) E(`${fname}.${name}: an empty location range`);
+            if (!inside([[x.lo, x.hi]], rs)) E(`${fname}.${name}: a location at [0x${x.lo.toString(16)}, 0x${x.hi.toString(16)}) outside its block`);
+            if (!knownLocation(x.expr)) E(`${fname}.${name}: location ${x.expr.toString('hex')}`);
+          }
+        } else if (!knownLocation(loc)) E(`${fname}.${name}: location ${loc.toString('hex')}`);
+      }
+    }
+  };
+  for (const un of dw.units) {
+    for (const c of un.die.children) {
+      if (c.tag !== TAG_SUBPROGRAM) continue;
+      walk(c, dieRanges(dw, c), c.attrs.get(AT_NAME));
+    }
+  }
+  return { errs, blocks, vars, located };
 }
 
 // The addresses of the rows of line `line` of a file whose name ends in `file`.
@@ -471,4 +606,116 @@ export function subprogramAt(dw, a) {
     }
   }
   return null;
+}
+
+// -----------------------------------------------------------------------------
+// The variables of debug/vars.c (run.mjs): what its entries must say.
+// -----------------------------------------------------------------------------
+// opts: O0 (every variable has a location), tls (the thread-local has one).
+export function checkVars(dw, opts) {
+  const errs = [];
+  const E = (m) => errs.push(m);
+  const dieAt = (un, off) => un.dies.get(off);
+  const typeName = (un, die) => { const t = die && dieAt(un, die.attrs.get(0x49)); return t ? `${t.tag.toString(16)}:${t.attrs.get(AT_NAME) || ''}` : 'none'; };
+  const kids = (die, tag, name) => die.children.filter((c) => c.tag === tag && (name === undefined || c.attrs.get(AT_NAME) === name));
+  let un = null, sub = null;
+  for (const u of dw.units) for (const c of u.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'shadow') { un = u; sub = c; }
+  if (!sub) return ['no subprogram shadow'];
+  const TD = '16:', V = 0x34, P = 0x05, LB = 0x0b;
+  const n = kids(sub, P, 'n')[0], x = kids(sub, V, 'x')[0], px = kids(sub, V, 'px')[0];
+  if (!n || typeName(un, n) !== `${TD}count_t`) E(`shadow: the parameter n is not of type count_t (${typeName(un, n)})`);
+  if (!x || typeName(un, x) !== `${TD}count_t`) E('shadow: x is not of type count_t');
+  if (!px || typeName(un, px) !== `${TD}count_ptr`) E('shadow: px is not of type count_ptr');
+  const blocks = kids(sub, LB);
+  if (opts.O0) {
+    if (blocks.length !== 2) E(`shadow: ${blocks.length} lexical blocks at its top, not 2 (the loop's, the block's)`);
+    const loop = blocks.find((b) => kids(b, V, 'i').length);
+    const inner = loop && kids(loop, LB)[0];
+    if (!loop || !inner) E('shadow: no block of the loop with i, and its body\'s');
+    else {
+      const ix = kids(inner, V, 'x')[0];
+      if (!ix || ix.attrs.get(AT_DECL_LINE) !== opts.markLine(opts.src, 'inner-x')) E('shadow: the inner x is not in the loop body\'s block');
+      const w = kids(inner, V, 'w')[0], pr = kids(inner, V, 'pr')[0], calls = kids(inner, V, 'calls')[0];
+      if (!w || typeName(un, w) !== `${TD}wide_t`) E('shadow: w is not of type wide_t');
+      if (!kids(inner, 0x16, 'wide_t').length) E('shadow: the typedef wide_t is not in its block');
+      if (!kids(inner, 0x13, 'pair').length) E('shadow: struct pair is not in its block');
+      if (!pr || typeName(un, pr) !== '13:pair') E('shadow: pr is not a struct pair');
+      if (!calls || !(calls.attrs.get(0x02) instanceof Uint8Array) || calls.attrs.get(0x02)[0] !== 0x03) E('shadow: the static calls is not in its block, at its address');
+    }
+    const other = blocks.find((b) => kids(b, V, 'x').length && !kids(b, V, 'i').length);
+    if (!other) E('shadow: no block with the second inner x');
+    const walk = (d) => { for (const c of d.children) { if ((c.tag === V || c.tag === P) && c.attrs.get(0x02) === undefined) E(`shadow: ${c.attrs.get(AT_NAME)} has no location at -O0`); walk(c); } };
+    walk(sub);
+    // the VLA: through its address, its bound an artificial variable's
+    let vsub = null;
+    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'vla') vsub = c;
+    const v = vsub && kids(vsub, LB).concat([vsub]).flatMap((b) => kids(b, V, 'v'))[0];
+    const loc = v && v.attrs.get(0x02);
+    if (!v || !(loc instanceof Uint8Array) || loc[0] !== 0x91 || loc[loc.length - 1] !== 0x06) E('vla: v has no location through its address');
+    else {
+      const at = dieAt(un, v.attrs.get(0x49));
+      const sr = at && at.tag === 0x01 && at.children.find((c) => c.tag === 0x21);
+      const cnt = sr && dieAt(un, sr.attrs.get(0x37));
+      if (!cnt || cnt.tag !== V || !cnt.attrs.get(0x34) || !cnt.attrs.get(0x02)) E('vla: the bound of v\'s type is not a variable with a location');
+    }
+  }
+  if (!opts.O0) {
+    // optimized: the parameters of once in their argument registers at its entry, s somewhere
+    let osub = null;
+    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'once') osub = c;
+    if (!osub) E('no subprogram once');
+    else {
+      const regs = opts.machine === 'x64' ? [5, 4] : [0, 1];
+      for (const [k, pn] of ['a', 'b'].entries()) {
+        const p = kids(osub, P, pn)[0];
+        const loc = p && p.attrs.get(0x02);
+        const l = typeof loc === 'number' ? locList(dw, loc) : [];
+        if (!l.length || l[0].lo !== osub.attrs.get(AT_LOW) || exprReg(l[0].expr) !== regs[k]) E(`once: the parameter ${pn} is not in its argument register at the entry`);
+      }
+      const sv = kids(osub, V, 's')[0];
+      if (!sv || sv.attrs.get(0x02) === undefined) E('once: s has no location');
+    }
+  }
+  const tl = un.die.children.find((c) => c.tag === V && c.attrs.get(AT_NAME) === 'per_thread');
+  if (opts.tls) {
+    const loc = tl && tl.attrs.get(0x02);
+    if (!loc || loc[0] !== 0x0e || loc[9] !== 0x9b) E('per_thread: no location in the TLS block');
+  } else if (tl && tl.attrs.get(0x02) !== undefined) E('per_thread: a location where none can be given');
+  return errs;
+}
+
+// The types and variables of debug/vars.ax (run.mjs): at -O0, main's
+// variables with their types (a structure, an enumeration, a union's
+// variant part, a slice's structure), the block of `inner`, the global
+// COUNT; the units' language Axiom's (0x8a78).
+export function checkAxVars(dw) {
+  const errs = [];
+  const E = (m) => errs.push(m);
+  let un = null, sub = null;
+  for (const u of dw.units) {
+    for (const c of u.die.children) {
+      if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'main' && c.children.some((x) => x.attrs.get(AT_NAME) === 'sh')) { un = u; sub = c; }
+    }
+  }
+  if (!sub) return ['no subprogram main with variables'];
+  if (un.die.attrs.get(0x13) !== 0x8a78) E(`the unit's language is ${un.die.attrs.get(0x13)}`);
+  const ty = (die) => un.dies.get(die.attrs.get(0x49));
+  const v = (name, d = sub) => d.children.find((c) => c.tag === 0x34 && c.attrs.get(AT_NAME) === name);
+  const want = [['p', 0x13, 'Point'], ['c', 0x04, 'Color'], ['sh', 0x13, 'Shape'], ['sl', 0x13, '[]i32'], ['arr', 0x01, undefined]];
+  for (const [n, tag, tn] of want) {
+    const x = v(n);
+    if (!x) { E(`main: no variable ${n}`); continue; }
+    if (x.attrs.get(0x02) === undefined) E(`main: ${n} has no location at -O0`);
+    const t = ty(x);
+    if (!t || t.tag !== tag || (tn && t.attrs.get(AT_NAME) !== tn)) E(`main: ${n} is not of type ${tn || 'an array'}`);
+  }
+  const sh = v('sh') && ty(v('sh'));
+  const vp = sh && sh.children.find((c) => c.tag === 0x33);
+  if (!vp || vp.children.filter((c) => c.tag === 0x19).length !== 3) E('Shape: no variant part with its 3 variants');
+  const color = v('c') && ty(v('c'));
+  if (!color || !color.children.some((c) => c.attrs.get(AT_NAME) === 'Green' && c.attrs.get(0x1c) === 5)) E('Color: no Green = 5');
+  const blk = sub.children.find((c) => c.tag === 0x0b && v('inner', c));
+  if (!blk) E('main: inner is not in a lexical block');
+  if (!dw.units.some((u) => u.die.children.some((c) => c.tag === 0x34 && String(c.attrs.get(AT_NAME)).endsWith('.COUNT') && c.attrs.get(0x02)))) E('no global COUNT');
+  return errs;
 }

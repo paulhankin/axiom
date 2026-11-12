@@ -15,6 +15,8 @@
 //   .debug_line_str  the line table's directory and file names
 //   .debug_aranges   the unit's address range (its .text)
 //   .debug_frame     call frame information: a CIE, an FDE per function
+//   .debug_rnglists  the address ranges of lexical blocks in more than one piece
+//   .debug_loclists  the locations of variables that move (optimized code)
 // References from one section to another and to code are relocations
 // (R_X86_64_32 / R_AARCH64_ABS32 against the section's symbol, R_X86_64_64
 // / R_AARCH64_ABS64 against the function's), which the system's linker and
@@ -27,6 +29,7 @@
 // =============================================================================
 import "bin.ax" as bn;
 import "dbginfo.ax" as dbi;
+import "dloc.ax" as dloc;
 import "elf.ax" as elf;
 import "ir.ax" as ir;
 import "util.ax" as u;
@@ -40,10 +43,12 @@ pub const D_LINE: usize = 3;
 pub const D_LINE_STR: usize = 4;
 pub const D_ARANGES: usize = 5;
 pub const D_FRAME: usize = 6;
-pub const NSEC: usize = 7;
+pub const D_RNGLISTS: usize = 7;
+pub const D_LOCLISTS: usize = 8;
+pub const NSEC: usize = 9;
 
-pub let SEC_NAMES: [7][]u8 = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line", ".debug_line_str",
-                              ".debug_aranges", ".debug_frame"];
+pub let SEC_NAMES: [9][]u8 = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line", ".debug_line_str",
+                              ".debug_aranges", ".debug_frame", ".debug_rnglists", ".debug_loclists"];
 
 // Is it the name of a debug section this module writes (and the linkers merge)?
 pub fn is_debug_name(name: []u8) bool {
@@ -58,6 +63,7 @@ pub fn is_debug_name(name: []u8) bool {
 // Fixups: where a section refers to code or to another section.
 pub const FX_ADDR: u8 = 0;  // 8 bytes (4 on wasm32): the address of function `sym` + addend
 pub const FX_SEC: u8 = 1;   // 4 bytes: offset `addend` in this unit's debug section `sym` (a D_*)
+pub const FX_TLS: u8 = 2;   // 8 bytes: the offset of thread-local datum `sym` + addend in the TLS block
 
 pub struct Fix {
     off: u64,
@@ -92,7 +98,7 @@ pub struct Unit {
     addr_size: u64,
     full: bool,  // DEBUG_FULL: types and variables too
     lang: u32,   // DW_LANG_* (0: none named)
-    parts: [7]Part,
+    parts: [9]Part,
     strs: u.SymMap.[u32],   // interned string -> its .debug_str offset + 1
     lstrs: u.SymMap.[u32],  // interned string -> its .debug_line_str offset + 1
     files: u.List.[u32],    // the line table's files: their names' .debug_line_str offsets
@@ -105,16 +111,23 @@ pub struct Unit {
     // dbginfo index), and the data's symbols (name -> symbol index + 1)
     trefs: u.List.[Fix],
     gsyms: u.SymMap.[u32],
+    toff: u.List.[u64],    // each type's offset in the .debug_info part + 1 (0: not written yet)
+    drefs: u.List.[Fix],   // references to entries in the part (addend: its offset), which finish moves
+    gdone: u.List.[bool],  // per dbinfo global: written in a lexical block
+    voffs: u.List.[u64],   // (while a function is written: its variables' entries' offsets + 1)
+    tls_rel: u32,          // the relocation of an offset in the TLS block (FX_TLS), 0: thread-locals have no location
 }
 
 pub fn none() Unit {
-    return Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0, parts: [new_part(); 7],
+    return Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0, parts: [new_part(); 9],
                   strs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   lstrs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   files: u.List.[u32].empty(), fmap: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](),
                                                                       cap: 0, len: 0 }, by_id: u.List.[u32].empty(),
                   nfuncs: 0, first_src: 0, text_sym: 0, trefs: u.List.[Fix].empty(),
-                  gsyms: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 } };
+                  gsyms: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
+                  toff: u.List.[u64].empty(), drefs: u.List.[Fix].empty(), gdone: u.List.[bool].empty(),
+                  voffs: u.List.[u64].empty(), tls_rel: 0 };
 }
 
 fn new_part() Part {
@@ -273,12 +286,14 @@ pub struct Func {
     name: []u8,  // for people
     external: bool,
     size: u64,
-    src: u32,       // its declaration
-    rows: []u64,    // ROW_* (in code order)
-    cfi: []u64,     // cfi_state (in code order; empty: none)
-    regs: []u64,    // saved_reg
-    irf: *ir.Func,  // (DEBUG_FULL: its variables, dbginfo.ax)
-    vars: []i64,    // DEBUG_FULL: per variable of dbinfo.vars_of(irf), its frame offset from the CFA, or NO_LOC
+    src: u32,            // its declaration
+    rows: []u64,         // ROW_* (in code order)
+    scopes: []u64,       // DEBUG_FULL: where the lexical block changes: code offset << 32 | its scope (dbginfo)
+    cfi: []u64,          // cfi_state (in code order; empty: none)
+    regs: []u64,         // saved_reg
+    irf: *ir.Func,       // (DEBUG_FULL: its variables, dbginfo.ax)
+    vars: []i64,         // DEBUG_FULL: per variable of dbinfo.vars_of(irf), its frame offset from the CFA, or NO_LOC
+    vlocs: []dloc.VLoc,  // optimized code: the variables' location pieces and constant values (dloc.ax)
 }
 
 // Is source location `src` in the standard library?
@@ -295,9 +310,15 @@ pub fn name_of(sym: []u8) []u8 {
     return dbi.func_name(sym, elf.display_name(sym));
 }
 
-/// The name of IR function f (symbol name `sym` for people) in its source.
+/// The name of IR function f (symbol name `sym` for people) in its source:
+/// an Axiom function's module.function, an exported one's own name (but the
+/// standard library's: a C program's start-up exports a main too).
 pub fn func_name(f: *ir.Func, sym: []u8) []u8 {
-    return dbi.func_name(f.name, sym);
+    let n = dbi.func_name(f.name, sym);
+    if u.starts(n, "axiom.export.") and (n.len > 13) and not from_std(f.src) {
+        return n[13..];
+    }
+    return n;
 }
 
 /// Adds function `f`'s line table, subprogram and frame description.
@@ -467,6 +488,7 @@ pub const FORM_DATA2: u64 = 0x05;
 pub const FORM_DATA4: u64 = 0x06;
 pub const FORM_DATA8: u64 = 0x07;
 pub const FORM_DATA1: u64 = 0x0b;
+pub const FORM_BLOCK1: u64 = 0x0a;
 pub const FORM_FLAG: u64 = 0x0c;
 pub const FORM_SDATA: u64 = 0x0d;
 pub const FORM_STRP: u64 = 0x0e;
@@ -531,13 +553,19 @@ pub fn abbrev(b: *mut bn.Bytes, code: u64, tag: u64, children: bool, attrs: [][2
 }
 
 // The function's DW_TAG_subprogram (after the unit's DIE: finish_elf puts
-// the header and that DIE before these).
+// the header and that DIE before these), with its variables and types in
+// its lexical blocks.
 fn subprogram(d: *mut Unit, f: *Func) void {
     let mut vs: []dbi.DVar = u.nil_slice.[dbi.DVar]();
+    let mut sc: [2]u32 = [0, 0];
     if d.full and u.notnil(f.irf) {
         vs = dbi.vars_of(f.irf.name);
+        sc = dbi.scopes_of(f.irf.name);
     }
-    let kids = vs.len > 0;
+    let mut kids = vs.len > 0;
+    if sc[0] != 0 {
+        kids = kids or (dbi.scopes.at(@as(usize, sc[0])).types.len > 0);
+    }
     let mut rt: i32 = -2;
     if d.full and u.notnil(f.irf) {
         rt = dbi.result_of(f.irf.name);
@@ -567,9 +595,129 @@ fn subprogram(d: *mut Unit, f: *Func) void {
         tref(d, rt);
     }
     if kids {
-        local_vars(d, f, vs);
+        d.voffs.clear();
+        for _k in 0..vs.len {
+            d.voffs.push(0);
+        }
+        if sc[0] == 0 {
+            for k in 0..vs.len {
+                var_die(d, f, k, vs[k], u.nil_slice.[Piece]());
+            }
+        } else {
+            let rg = scope_ranges(f, sc);
+            scope_body(d, f, vs, sc, rg, sc[0]);
+        }
+        d.voffs.clear();
         d.parts[D_INFO].b.u8_(0);
     }
+}
+
+// A piece of code of a lexical block: [start, end) offsets in its function.
+struct Piece {
+    start: u64,
+    end: u64,
+}
+
+// The code of each of f's scopes sc[0]..sc[1] (by index - sc[0]): the
+// pieces whose instructions are in it or in a block inside it (f.scopes;
+// code of another function's scopes, inlined, is its root's).
+fn scope_ranges(f: *Func, sc: [2]u32) []u.List.[Piece] {
+    let n = @as(usize, sc[1] - sc[0]) + 1;
+    let out = u.newn.[u.List.[Piece]](n + 1);
+    for k in 0..n {
+        out[k] = u.List.[Piece].empty();
+    }
+    let mut k: usize = 0;
+    while k < f.scopes.len {
+        let start = f.scopes[k] >> 32;
+        let mut end = f.size;
+        if k + 1 < f.scopes.len {
+            end = f.scopes[k + 1] >> 32;
+        }
+        let mut s = @truncate(u32, f.scopes[k]);
+        k += 1;
+        if (end <= start) or (start >= f.size) {
+            continue;
+        }
+        if (s < sc[0]) or (s > sc[1]) {
+            s = sc[0];
+        }
+        while (s >= sc[0]) and (s <= sc[1]) {
+            let l = &mut out[@as(usize, s - sc[0])];
+            if (l.len > 0) and (l.last().end == start) {
+                l.at(l.len - 1).end = @min(end, f.size);
+            } else {
+                l.push(Piece.{ start: start, end: @min(end, f.size) });
+            }
+            s = dbi.scopes.at(@as(usize, s)).parent;
+            if s == 0 {
+                break;
+            }
+        }
+    }
+    return out[0..n];
+}
+
+// The entries in scope s of f (sc: f's scopes, rg: their code): its
+// variables, its types, then its lexical blocks that have code (a block
+// without any is left out with what it declares: no code is in its scope).
+fn scope_body(d: *mut Unit, f: *Func, vs: []dbi.DVar, sc: [2]u32, rg: []u.List.[Piece], s: u32) void {
+    for k in 0..vs.len {
+        let mut vsc = vs[k].scope;
+        if (vsc < sc[0]) or (vsc > sc[1]) {
+            vsc = sc[0];
+        }
+        if vsc == s {
+            let mut clip = u.nil_slice.[Piece]();
+            if s != sc[0] {
+                clip = rg[@as(usize, s - sc[0])].items();
+            }
+            var_die(d, f, k, vs[k], clip);
+        }
+    }
+    for t in dbi.scopes.at(@as(usize, s)).types.items() {
+        write_type(d, t);
+    }
+    for c in (s + 1)..(sc[1] + 1) {
+        if dbi.scopes.at(@as(usize, c)).parent != s {
+            continue;
+        }
+        let ps = rg[@as(usize, c - sc[0])].items();
+        if ps.len == 0 {
+            continue;
+        }
+        if ps.len == 1 {
+            ib(d).uleb(AB_LEX);
+            addr_ref(d, &mut d.parts[D_INFO], f.sym, ps[0].start);
+            ib(d).u32_(ps[0].end - ps[0].start);
+        } else {
+            ib(d).uleb(AB_LEX_RANGES);
+            sec_ref(d, &mut d.parts[D_INFO], D_RNGLISTS, @as(u64, list_start(d, D_RNGLISTS)));
+            let r = &mut d.parts[D_RNGLISTS];
+            for pc in ps {
+                r.b.u8_(RLE_START_LENGTH);
+                addr_ref(d, r, f.sym, pc.start);
+                r.b.uleb(pc.end - pc.start);
+            }
+            r.b.u8_(RLE_END_OF_LIST);
+        }
+        scope_body(d, f, vs, sc, rg, c);
+        ib(d).u8_(0);
+    }
+}
+
+// Where the next list of .debug_rnglists or .debug_loclists (sec) starts:
+// after the unit's header (DWARF 5, 7.28, 7.29), written with the first.
+fn list_start(d: *mut Unit, sec: usize) usize {
+    let b = &mut d.parts[sec].b;
+    if b.len() == 0 {
+        b.u32_(0);  // (the length: finish)
+        b.u16_(5);
+        b.u8_(@truncate(u8, d.addr_size));
+        b.u8_(0);
+        b.u32_(0);  // offset_entry_count: lists are referred to by their offsets
+    }
+    return b.len();
 }
 
 // -----------------------------------------------------------------------------
@@ -594,6 +742,15 @@ pub const TAG_VARIABLE: u64 = 0x34;
 pub const TAG_VOLATILE_TYPE: u64 = 0x35;
 pub const TAG_RESTRICT_TYPE: u64 = 0x37;
 pub const TAG_ATOMIC_TYPE: u64 = 0x47;
+pub const TAG_LEXICAL_BLOCK: u64 = 0x0b;
+pub const TAG_TYPEDEF: u64 = 0x16;
+pub const AT_RANGES: u64 = 0x55;
+pub const AT_ARTIFICIAL: u64 = 0x34;
+pub const OP_DEREF: u8 = 0x06;
+pub const OP_CONST8U: u8 = 0x0e;
+pub const OP_FORM_TLS_ADDRESS: u8 = 0x9b;
+const RLE_END_OF_LIST: u8 = 0x00;
+const RLE_START_LENGTH: u8 = 0x07;
 pub const AT_LOCATION: u64 = 0x02;
 pub const AT_BYTE_SIZE: u64 = 0x0b;
 pub const AT_BIT_SIZE: u64 = 0x0d;
@@ -629,6 +786,26 @@ const AB_FPARAM: u64 = 46;
 const AB_UNSPEC: u64 = 47;
 const AB_LVAR: u64 = 48;  // + 0 a variable, 1 a parameter; + 2: optimized out (no location)
 const AB_GVAR: u64 = 52;  // + 1: not external
+const AB_LEX: u64 = 54;
+const AB_LEX_RANGES: u64 = 55;
+const AB_TYPEDEF: u64 = 56;
+const AB_TYPEDEF_VOID: u64 = 57;
+const AB_SUBRANGE_V: u64 = 58;  // the count: a reference to a variable (a VLA's length)
+const AB_ART: u64 = 59;         // an artificial variable (the length of a VLA)
+const AB_BASE_BITS: u64 = 60;   // a base type narrower than its storage
+const AB_LVAR_LIST: u64 = 61;   // + 0 a variable, 1 a parameter: a location list
+const AB_LVAR_CONST: u64 = 63;  // + 0 a variable, 1 a parameter: a constant value
+const AB_VPART: u64 = 65;
+const AB_VARIANT: u64 = 66;
+const AB_VARIANT_EMPTY: u64 = 67;
+pub const TAG_VARIANT: u64 = 0x19;
+pub const TAG_VARIANT_PART: u64 = 0x33;
+pub const AT_DISCR: u64 = 0x15;
+pub const AT_DISCR_VALUE: u64 = 0x16;
+const LLE_END_OF_LIST: u8 = 0x00;
+const LLE_START_LENGTH: u8 = 0x08;
+const OP_REG0: u8 = 0x50;
+const OP_REGX: u8 = 0x90;
 
 fn type_abbrevs(b: *mut bn.Bytes) void {
     let base: [3][2]u64 = [[AT_NAME, FORM_STRP], [AT_BYTE_SIZE, FORM_UDATA], [AT_ENCODING, FORM_DATA1]];
@@ -682,13 +859,44 @@ fn type_abbrevs(b: *mut bn.Bytes) void {
                          [AT_TYPE, FORM_REF4], [AT_LOCATION, FORM_EXPRLOC], [AT_EXTERNAL, FORM_FLAG_PRESENT]];
     abbrev(b, AB_GVAR, TAG_VARIABLE, false, gv[..]);
     abbrev(b, AB_GVAR + 1, TAG_VARIABLE, false, gv[0..5]);
+    let lex: [2][2]u64 = [[AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4]];
+    abbrev(b, AB_LEX, TAG_LEXICAL_BLOCK, true, lex[..]);
+    let lexr: [1][2]u64 = [[AT_RANGES, FORM_SEC_OFFSET]];
+    abbrev(b, AB_LEX_RANGES, TAG_LEXICAL_BLOCK, true, lexr[..]);
+    let td: [4][2]u64 = [
+        [AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA], [AT_TYPE, FORM_REF4]];
+    abbrev(b, AB_TYPEDEF, TAG_TYPEDEF, false, td[..]);
+    abbrev(b, AB_TYPEDEF_VOID, TAG_TYPEDEF, false, td[0..3]);
+    let cref: [1][2]u64 = [[AT_COUNT, FORM_REF4]];
+    abbrev(b, AB_SUBRANGE_V, TAG_SUBRANGE_TYPE, false, cref[..]);
+    let art: [3][2]u64 = [[AT_TYPE, FORM_REF4], [AT_LOCATION, FORM_EXPRLOC], [AT_ARTIFICIAL, FORM_FLAG_PRESENT]];
+    abbrev(b, AB_ART, TAG_VARIABLE, false, art[..]);
+    let bb: [4][2]u64 = [
+        [AT_NAME, FORM_STRP], [AT_BYTE_SIZE, FORM_UDATA], [AT_ENCODING, FORM_DATA1], [AT_BIT_SIZE, FORM_UDATA]];
+    abbrev(b, AB_BASE_BITS, TAG_BASE_TYPE, false, bb[..]);
+    let ll: [5][2]u64 = [[AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                         [AT_TYPE, FORM_REF4], [AT_LOCATION, FORM_SEC_OFFSET]];
+    abbrev(b, AB_LVAR_LIST, TAG_VARIABLE, false, ll[..]);
+    abbrev(b, AB_LVAR_LIST + 1, TAG_FORMAL_PARAMETER, false, ll[..]);
+    let cv: [5][2]u64 = [[AT_NAME, FORM_STRP], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                         [AT_TYPE, FORM_REF4], [AT_CONST_VALUE, FORM_BLOCK1]];
+    abbrev(b, AB_LVAR_CONST, TAG_VARIABLE, false, cv[..]);
+    abbrev(b, AB_LVAR_CONST + 1, TAG_FORMAL_PARAMETER, false, cv[..]);
+    let vp: [1][2]u64 = [[AT_DISCR, FORM_REF4]];
+    abbrev(b, AB_VPART, TAG_VARIANT_PART, true, vp[..]);
+    let vv: [1][2]u64 = [[AT_DISCR_VALUE, FORM_SDATA]];
+    abbrev(b, AB_VARIANT, TAG_VARIANT, true, vv[..]);
+    abbrev(b, AB_VARIANT_EMPTY, TAG_VARIANT, false, vv[..]);
 }
 
 /// The locations of function f's variables (dbginfo.vars_of), as offsets
 /// from the CFA: its object's frame slot's (slot_off: from the register the
-/// frame is addressed from, which is `base` below the CFA), or NO_LOC. Only
-/// at -O0 (dbginfo.locations), where each variable stays in its slot
-/// (ir.F_VAR), and only for an object still in the function.
+/// frame is addressed from, which is `base` below the CFA), or NO_LOC. At
+/// -O0 (dbginfo.locations), where each variable stays in its slot
+/// (ir.F_VAR), for an object still in the function; in optimized code, for
+/// an object left in memory (its address taken, an aggregate not taken
+/// apart) whose every store remains and which shares its memory with no
+/// other (in_memory).
 pub fn var_locs(f: *ir.Func, slot_off: fn(*ir.Value) i64, base: i64) []i64 {
     let vs = dbi.vars_of(f.name);
     if vs.len == 0 {
@@ -698,8 +906,11 @@ pub fn var_locs(f: *ir.Func, slot_off: fn(*ir.Value) i64, base: i64) []i64 {
     for k in 0..vs.len {
         out[k] = NO_LOC;
         let a = vs[k].alloca;
-        if not dbi.locations or u.isnil(a) or (a.op != ir.OP_ALLOCA) or (a.grave != 0) or u.isnil(a.blk) or
-           (@int_from_ptr(a.blk.fnp) != @int_from_ptr(f)) {
+        if u.isnil(a) or (a.op != ir.OP_ALLOCA) or (a.grave != 0) or u.isnil(a.blk) or
+           (@int_from_ptr(a.blk.fnp) != @int_from_ptr(f)) or (a.id != vs[k].alloca_id) {
+            continue;
+        }
+        if not dbi.locations and not in_memory(&vs[k]) {
             continue;
         }
         let o = slot_off(a);
@@ -708,6 +919,25 @@ pub fn var_locs(f: *ir.Func, slot_off: fn(*ir.Value) i64, base: i64) []i64 {
         }
     }
     return out[0..vs.len];
+}
+
+// Optimized code: does variable v's object hold its value wherever it is
+// in scope? Its stores (dbginfo: those at the first promotion, when it was
+// left in memory) are all still there, and no other object's uses were
+// given to it (sharing a slot: ir.dbg_was_merged).
+fn in_memory(v: *dbi.DVar) bool {
+    if not ir.dbg_on or not v.seen or (v.track >= 0) or v.artificial or v.indirect {
+        return false;
+    }
+    if ir.dbg_was_merged(v.alloca, v.alloca_id) {
+        return false;
+    }
+    for k in v.stores..(v.stores + v.nstores) {
+        if not ir.dbg_present(k) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Datum `name` of the object is symbol `sym` (DEBUG_FULL: the locations of
@@ -746,36 +976,234 @@ fn decl_at(d: *mut Unit, src: u32) void {
     ib(d).uleb(@as(u64, w.line));
 }
 
-// Function f's parameters and local variables vs, at the frame offsets
-// f.vars (from the CFA: DW_OP_fbreg, the frame base being the CFA), or
-// without a location (optimized out).
-fn local_vars(d: *mut Unit, f: *Func, vs: []dbi.DVar) void {
-    for k in 0..vs.len {
-        let v = vs[k];
-        if v.ty < 0 {
-            continue;
+// Variable k of function f, v: at its frame offset f.vars[k] (from the CFA:
+// DW_OP_fbreg, the frame base being the CFA; through the address there,
+// for one held by reference), or without a location (optimized out); a
+// block-scope static at its address.
+fn var_die(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, clip: []Piece) void {
+    if v.ty < 0 {
+        return;
+    }
+    if u.notnil(v.global) {
+        let sym = d.gsyms.get(u.intern(v.global.name));
+        if (sym == 0) or (v.global.tls and (d.tls_rel == 0)) {
+            return;  // (written at the top level: types_and_data)
         }
-        let mut loc = NO_LOC;
-        if k < f.vars.len {
-            loc = f.vars[k];
-        }
-        let mut code = AB_LVAR + pk(v.param, @as(u64, 1), @as(u64, 0));
-        if loc == NO_LOC {
-            code += 2;
-        }
-        ib(d).uleb(code);
+        ib(d).uleb(AB_GVAR + 1);
         strp(d, v.name);
         decl_at(d, v.src);
         tref(d, v.ty);
-        if loc != NO_LOC {
-            let mut e = bn.new_bytes();
-            e.u8_(OP_FBREG);
-            e.sleb(loc);
-            ib(d).uleb(@as(u64, e.len()));
-            ib(d).put(e.view());
-            e.free();
+        global_loc(d, v.global, sym - 1);
+        if v.gidx >= 0 {
+            let g = @int_cast(usize, v.gidx);
+            while d.gdone.len <= g {
+                d.gdone.push(false);
+            }
+            d.gdone.set(g, true);
+        }
+        return;
+    }
+    let mut loc = NO_LOC;
+    if k < f.vars.len {
+        loc = f.vars[k];
+    }
+    if v.artificial {
+        if loc == NO_LOC {
+            return;
+        }
+        d.voffs.set(k, @as(u64, ib(d).len()) + 1);
+        ib(d).uleb(AB_ART);
+        tref(d, v.ty);
+        fbreg_expr(d, loc, false);
+        return;
+    }
+    let pv = pk(v.param, @as(u64, 1), @as(u64, 0));
+    if (loc == NO_LOC) and (f.vlocs.len > 0) and optimized_var(d, f, k, v, pv, clip) {
+        return;
+    }
+    let mut code = AB_LVAR + pv;
+    if loc == NO_LOC {
+        code += 2;
+    }
+    ib(d).uleb(code);
+    strp(d, v.name);
+    decl_at(d, v.src);
+    tref(d, v.ty);
+    if loc != NO_LOC {
+        fbreg_expr(d, loc, v.indirect);
+    }
+}
+
+// The location of datum g (symbol sym): its address; a thread-local's,
+// its offset in the TLS block, which DW_OP_form_tls_address makes the
+// current thread's address (ELF's local-exec TLS: the offset in the
+// executable's PT_TLS template, which the system's thread library gives
+// debuggers the thread's block of).
+fn global_loc(d: *mut Unit, g: *ir.Global, sym: u32) void {
+    if g.tls {
+        ib(d).uleb(10);
+        ib(d).u8_(OP_CONST8U);
+        let p = &mut d.parts[D_INFO];
+        p.fx.push(Fix.{ off: @as(u64, p.b.len()), kind: FX_TLS, sym: sym, addend: 0 });
+        p.b.u64_(0);
+        ib(d).u8_(OP_FORM_TLS_ADDRESS);
+        return;
+    }
+    ib(d).uleb(1 + d.addr_size);
+    ib(d).u8_(OP_ADDR);
+    addr_ref(d, &mut d.parts[D_INFO], sym, 0);
+}
+
+// Variable k of function f, v, in optimized code: a constant, or its
+// location list (dloc.ax) within its block's code `clip` (empty: the
+// function's), if it has either (true: written).
+fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: []Piece) bool {
+    let mut n: usize = 0;
+    for x in f.vlocs {
+        if @as(usize, x.var) != k {
+            continue;
+        }
+        if x.kind == dloc.LK_CONST {
+            let size = type_size(v.ty);
+            if (size == 0) or (size > 8) {
+                return false;
+            }
+            ib(d).uleb(AB_LVAR_CONST + pv);
+            strp(d, v.name);
+            decl_at(d, v.src);
+            tref(d, v.ty);
+            ib(d).u8_(@truncate(u8, size));
+            let bits = @bit_cast(u64, x.off);
+            for j in 0..size {
+                ib(d).u8_(@truncate(u8, bits >> @as(u32, @truncate(u32, 8 * j))));
+            }
+            return true;
+        }
+        if clipped(x, clip, 0).end > 0 {
+            n += 1;
         }
     }
+    if n == 0 {
+        return false;
+    }
+    ib(d).uleb(AB_LVAR_LIST + pv);
+    strp(d, v.name);
+    decl_at(d, v.src);
+    tref(d, v.ty);
+    sec_ref(d, &mut d.parts[D_INFO], D_LOCLISTS, @as(u64, list_start(d, D_LOCLISTS)));
+    for x in f.vlocs {
+        if (@as(usize, x.var) != k) or (x.kind != dloc.LK_PIECE) {
+            continue;
+        }
+        let mut ci: usize = 0;
+        loop {
+            let c = clipped(x, clip, ci);
+            if c.end == 0 {
+                break;
+            }
+            ci = @truncate(usize, c.next);
+            loc_entry(d, f, x, c.start, c.end);
+        }
+    }
+    d.parts[D_LOCLISTS].b.u8_(LLE_END_OF_LIST);
+    return true;
+}
+
+// A piece of location x, clipped to the block's code (clip, from its piece
+// `from` on): start, end (0: no more), and the clip piece to go on from.
+struct Clip {
+    start: u64,
+    end: u64,
+    next: u64,
+}
+
+fn clipped(x: dloc.VLoc, clip: []Piece, from: usize) Clip {
+    if clip.len == 0 {
+        if from > 0 {
+            return Clip.{ start: 0, end: 0, next: 0 };
+        }
+        return Clip.{ start: x.start, end: x.end, next: 1 };
+    }
+    for j in from..clip.len {
+        let a = @max(x.start, clip[j].start);
+        let b = @min(x.end, clip[j].end);
+        if b > a {
+            return Clip.{ start: a, end: b, next: @as(u64, j + 1) };
+        }
+    }
+    return Clip.{ start: 0, end: 0, next: 0 };
+}
+
+// A location list entry: x's place from offset start to end of f.
+fn loc_entry(d: *mut Unit, f: *Func, x: dloc.VLoc, start: u64, end: u64) void {
+    let p = &mut d.parts[D_LOCLISTS];
+    {
+        p.b.u8_(LLE_START_LENGTH);
+        addr_ref(d, p, f.sym, start);
+        p.b.uleb(end - start);
+        let mut e = bn.new_bytes();
+        if x.reg < 0 {
+            e.u8_(OP_FBREG);
+            e.sleb(x.off);
+        } else if x.reg < 32 {
+            e.u8_(OP_REG0 + @truncate(u8, @bit_cast(u32, x.reg)));
+        } else {
+            e.u8_(OP_REGX);
+            e.uleb(@as(u64, @bit_cast(u32, x.reg)));
+        }
+        p.b.uleb(@as(u64, e.len()));
+        p.b.put(e.view());
+        e.free();
+    }
+}
+
+// The size of type t's values (through typedefs and qualifiers).
+fn type_size(t: i32) u64 {
+    let mut k = t;
+    let mut n: i32 = 0;
+    while (k >= 0) and (n < 64) {
+        let x = dbi.types.at(@int_cast(usize, k));
+        if (x.kind != dbi.DK_TYPEDEF) and (x.kind != dbi.DK_CONST) and (x.kind != dbi.DK_VOLATILE) and
+           (x.kind != dbi.DK_RESTRICT) and (x.kind != dbi.DK_ATOMIC) {
+            return x.size;
+        }
+        k = x.target;
+        n += 1;
+    }
+    return 0;
+}
+
+// The expression of a location `off` bytes from the frame base (deref: the
+// variable is at the address held there).
+fn fbreg_expr(d: *mut Unit, off: i64, deref: bool) void {
+    let mut e = bn.new_bytes();
+    e.u8_(OP_FBREG);
+    e.sleb(off);
+    if deref {
+        e.u8_(OP_DEREF);
+    }
+    ib(d).uleb(@as(u64, e.len()));
+    ib(d).put(e.view());
+    e.free();
+}
+
+// Type t's entry, here, if not written yet.
+fn write_type(d: *mut Unit, t: i32) void {
+    let k = @int_cast(usize, t);
+    while d.toff.len <= k {
+        d.toff.push(0);
+    }
+    if d.toff.get(k) != 0 {
+        return;
+    }
+    d.toff.set(k, @as(u64, ib(d).len()) + 1);
+    type_die(d, dbi.types.at(k));
+}
+
+// A reference to the entry at offset `at` of the part (finish moves it).
+fn dref(d: *mut Unit, at: u64) void {
+    d.drefs.push(Fix.{ off: @as(u64, ib(d).len()), kind: FX_SEC, sym: 0, addend: @bit_cast(i64, at) });
+    ib(d).u32_(0);
 }
 
 // The unit's static variables (those of the object's data) and every type,
@@ -784,10 +1212,14 @@ fn types_and_data(d: *mut Unit) []u64 {
     if not d.full {
         return u.nil_slice.[u64]();
     }
-    for v in dbi.globals.items() {
-        if u.isnil(v.global) or (v.ty < 0) or v.global.tls {
-            // (a thread-local's address is the thread's: DW_OP_addr would
-            // give the template's, so it is not described)
+    for gi in 0..dbi.globals.len {
+        let v = dbi.globals.get(gi);
+        if (v.scope != 0) and (gi < d.gdone.len) and d.gdone.get(gi) {
+            continue;  // (in its lexical block)
+        }
+        if u.isnil(v.global) or (v.ty < 0) or (v.global.tls and (d.tls_rel == 0)) {
+            // (a thread-local's address is the thread's: where the offset
+            // in the TLS block is not known, it is not described)
             continue;
         }
         let sym = d.gsyms.get(u.intern(v.global.name));
@@ -798,15 +1230,15 @@ fn types_and_data(d: *mut Unit) []u64 {
         strp(d, v.name);
         decl_at(d, v.src);
         tref(d, v.ty);
-        ib(d).uleb(1 + d.addr_size);
-        ib(d).u8_(OP_ADDR);
-        addr_ref(d, &mut d.parts[D_INFO], sym - 1, 0);
+        global_loc(d, v.global, sym - 1);
     }
     let n = dbi.types.len;
+    for k in 0..n {
+        write_type(d, @int_cast(i32, k));
+    }
     let offs = u.newn.[u64](n + 1);
     for k in 0..n {
-        offs[k] = @as(u64, ib(d).len());
-        type_die(d, dbi.types.at(k));
+        offs[k] = d.toff.get(k) - 1;
     }
     return offs[0..n];
 }
@@ -814,10 +1246,13 @@ fn types_and_data(d: *mut Unit) []u64 {
 fn type_die(d: *mut Unit, t: *dbi.DType) void {
     let k = t.kind;
     if k == dbi.DK_BASE {
-        ib(d).uleb(AB_BASE);
+        ib(d).uleb(pk(t.bits > 0, AB_BASE_BITS, AB_BASE));
         strp(d, t.name);
         ib(d).uleb(t.size);
         ib(d).u8_(t.enc);
+        if t.bits > 0 {
+            ib(d).uleb(@as(u64, @bit_cast(u32, t.bits)));
+        }
     } else if k == dbi.DK_POINTER {
         ib(d).uleb(pk(t.target < 0, AB_PTR_VOID, AB_PTR));
         ib(d).uleb(t.size);
@@ -835,15 +1270,28 @@ fn type_die(d: *mut Unit, t: *dbi.DType) void {
     } else if k == dbi.DK_ARRAY {
         ib(d).uleb(AB_ARRAY);
         tref(d, t.target);
+        let cv = t.count_var;
         if t.count >= 0 {
             ib(d).uleb(AB_SUBRANGE_N);
             ib(d).uleb(@bit_cast(u64, t.count));
+        } else if (cv >= 0) and (@int_cast(usize, cv) < d.voffs.len) and (d.voffs.get(@int_cast(usize, cv)) != 0) {
+            ib(d).uleb(AB_SUBRANGE_V);  // (a variable length array: its length's variable, in this function)
+            dref(d, d.voffs.get(@int_cast(usize, cv)) - 1);
         } else {
             ib(d).uleb(AB_SUBRANGE);  // (a bound not known: incomplete, or a variable length array)
         }
         ib(d).u8_(0);
     } else if (k == dbi.DK_STRUCT) or (k == dbi.DK_UNION) {
         record_die(d, t);
+    } else if k == dbi.DK_TAGGED {
+        tagged_die(d, t);
+    } else if k == dbi.DK_TYPEDEF {
+        ib(d).uleb(pk(t.target < 0, AB_TYPEDEF_VOID, AB_TYPEDEF));
+        strp(d, t.name);
+        decl_at(d, t.src);
+        if t.target >= 0 {
+            tref(d, t.target);
+        }
     } else if k == dbi.DK_ENUM {
         ib(d).uleb(pk(t.name.len > 0, AB_ENUM, AB_ENUM_ANON));
         if t.name.len > 0 {
@@ -905,6 +1353,9 @@ fn record_die(d: *mut Unit, t: *dbi.DType) void {
             ib(d).uleb((m.off * 8) + @as(u64, @bit_cast(u32, m.bit_off)));
             continue;
         }
+        if m.ty < 0 {
+            continue;  // (a field of no size)
+        }
         ib(d).uleb(pk(m.name.len > 0, AB_MEMBER, AB_MEMBER_ANON));
         if m.name.len > 0 {
             strp(d, m.name);
@@ -912,6 +1363,40 @@ fn record_die(d: *mut Unit, t: *dbi.DType) void {
         tref(d, m.ty);
         ib(d).uleb(m.off);
     }
+    ib(d).u8_(0);
+}
+
+// A tagged union (DK_TAGGED): a structure of its tag (members[0]) and a
+// variant part (DWARF 5, 5.7.10) whose discriminant is the tag, a variant
+// per value with its payload's member (none for one without a payload).
+fn tagged_die(d: *mut Unit, t: *dbi.DType) void {
+    ib(d).uleb(AB_RECORD);
+    strp(d, t.name);
+    ib(d).uleb(t.size);
+    decl_at(d, t.src);
+    let ms = t.members.items();
+    let tag_at = @as(u64, ib(d).len());
+    ib(d).uleb(AB_MEMBER);
+    strp(d, ms[0].name);
+    tref(d, ms[0].ty);
+    ib(d).uleb(ms[0].off);
+    ib(d).uleb(AB_VPART);
+    dref(d, tag_at);
+    for m in ms[1..] {
+        if m.ty < 0 {
+            ib(d).uleb(AB_VARIANT_EMPTY);
+            ib(d).sleb(m.value);
+            continue;
+        }
+        ib(d).uleb(AB_VARIANT);
+        ib(d).sleb(m.value);
+        ib(d).uleb(AB_MEMBER);
+        strp(d, m.name);
+        tref(d, m.ty);
+        ib(d).uleb(m.off);
+        ib(d).u8_(0);
+    }
+    ib(d).u8_(0);  // (the variant part)
     ib(d).u8_(0);
 }
 
@@ -1077,9 +1562,12 @@ fn fde(d: *mut Unit, f: *Func) void {
 pub const LANG_C89: u32 = 0x01;
 pub const LANG_C99: u32 = 0x0c;
 pub const LANG_C11: u32 = 0x1d;
+/// Axiom's: a code of the range DWARF leaves to users (DW_LANG_lo_user 0x8000 ..
+/// DW_LANG_hi_user 0xffff), 0x8a78 ("ax").
+pub const LANG_AXIOM: u32 = 0x8a78;
 
 /// The language of module m's unit: C's, for a C program (its start-up and
-/// runtime are Axiom's, which DWARF has no code for); none for Axiom's.
+/// runtime are Axiom's, in the same unit); else Axiom's (LANG_AXIOM).
 pub fn module_lang(m: *ir.Module) u32 {
     return lang();
 }
@@ -1095,7 +1583,7 @@ pub fn lang() u32 {
     if dbi.c_version >= 0 {
         return LANG_C89;
     }
-    return 0;
+    return LANG_AXIOM;
 }
 
 // The bytes of the unit's sections and their fixups, complete: the unit
@@ -1146,6 +1634,16 @@ fn finish(d: *mut Unit, text_size: u64) void {
         info.b.set_u32(@truncate(usize, x.off + hn), v);
     }
     d.trefs.deinit();
+    for x in d.drefs.items() {
+        info.b.set_u32(@truncate(usize, x.off + hn), @bit_cast(u64, x.addend) + hn);
+    }
+    d.drefs.deinit();
+    for sec in [D_RNGLISTS, D_LOCLISTS] {
+        let lb = &mut d.parts[sec].b;
+        if lb.len() > 0 {
+            lb.set_u32(0, @as(u64, lb.len() - 4));
+        }
+    }
     info.b.u8_(0);  // the end of the unit's children
     info.b.set_u32(0, @as(u64, info.b.len() - 4));
     // .debug_line: the header, then the program
@@ -1241,20 +1739,28 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
                                           hidden: false });
     let text_size = elf.sec_size(o.secs.get(@int_cast(usize, text)));
     finish(d, text_size);
-    let mut secs: [7]i32 = [0; 7];
-    let mut ssym: [7]u32 = [0; 7];
+    let mut secs: [9]i32 = [0; 9];
+    let mut ssym: [9]u32 = [0; 9];
     for k in 0..NSEC {
+        if (d.parts[k].b.len() == 0) and (k >= D_RNGLISTS) {
+            continue;  // (none: not written)
+        }
         secs[k] = elf.add_sec(o, SEC_NAMES[k], elf.S_DEBUG, 1);
         ssym[k] = elf.add_sym(o, elf.Sym.{ name: "", sec: secs[k], value: 0, size: 0, bind: elf.B_LOCAL,
                                            ty: elf.T_NOTYPE, hidden: false });
     }
     for k in 0..NSEC {
         let p = &mut d.parts[k];
+        if (p.b.len() == 0) and (k >= D_RNGLISTS) {
+            continue;
+        }
         let s = o.secs.get(@int_cast(usize, secs[k]));
         s.data.put(p.b.view());
         for x in p.fx.items() {
             if x.kind == FX_ADDR {
                 s.relocs.push(elf.Rel.{ off: x.off, ty: abs64, sym: x.sym, addend: x.addend });
+            } else if x.kind == FX_TLS {
+                s.relocs.push(elf.Rel.{ off: x.off, ty: d.tls_rel, sym: x.sym, addend: x.addend });
             } else {
                 s.relocs.push(elf.Rel.{ off: x.off, ty: abs32, sym: ssym[@as(usize, x.sym)], addend: x.addend });
             }
@@ -1268,8 +1774,8 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
 /// The unit's sections with their fixups resolved, for a linker that knows
 /// each function's address (addr_of(sym)) and places the code at text_addr
 /// (text_size bytes): wlink.ax's custom sections.
-pub fn finish_linked(d: *mut Unit, text_addr: u64, text_size: u64, addr_of: fn(u32) u64) [7]bn.Bytes {
-    let mut out: [7]bn.Bytes = [bn.new_bytes(); 7];
+pub fn finish_linked(d: *mut Unit, text_addr: u64, text_size: u64, addr_of: fn(u32) u64) [9]bn.Bytes {
+    let mut out: [9]bn.Bytes = [bn.new_bytes(); 9];
     if not d.on or (d.nfuncs == 0) {
         return out;
     }

@@ -2,11 +2,15 @@
 // cgen_debug.ax - what the debug information (dwarf.ax, through dbginfo.ax)
 // is told of a C program at -g: its types, each function's parameters and
 // local variables (and their objects, which -O0 keeps in memory: ir.F_VAR),
-// its objects of static storage duration, and its enumerations' constants.
+// its objects of static storage duration, its enumerations' constants, and
+// its block scopes (lexical blocks: each instruction carries the one it is
+// generated in, ir.Value.scope).
 //
-// Types are described as they are, not as they were named: a variable
-// declared with a typedef name has the type the name stands for (the
-// typedefs themselves are not described).
+// Types are described as they are, and a typedef name as a DW_TAG_typedef:
+// a variable, parameter or static object declared with one has it as its
+// type (or derived from it: `T *p`), and so does a typedef declared with
+// another. A block-scope typedef, structure, union or enumeration is
+// described in its block.
 // =============================================================================
 import "../dbginfo.ax" as dbi;
 import "../ir.ax" as ir;
@@ -20,9 +24,38 @@ let mut by_id: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), l
 // an enumeration's tag id (TagInfo.id) -> its constants
 let mut enum_consts: u.List.[*mut u.List.[*mut cast.CSym]] =
     u.List.[*mut u.List.[*mut cast.CSym]].{ data: @ptr_from_int(*mut *mut u.List.[*mut cast.CSym], 0), len: 0, cap: 0 };
+// a symbol (its address) -> the typedef name it was declared with (semantic analysis: note_typedef_use)
+let mut tdefs: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                       vals: @ptr_from_int(*mut *mut cast.CSym, 0),
+                                                                       cap: 0, len: 0 };
+// a typedef (its address) -> its dbinfo index + 1
+let mut td_ids: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                  cap: 0, len: 0 };
+// an object of static storage duration (its address) -> its index in dbi.globals + 1
+let mut static_at: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+// the function being generated: its IR name and its root scope
+let mut cur_func: []u8 = "";
+let mut root: u32 = 0;
 
 fn on() bool {
     return tg.g_debug == tg.DEBUG_FULL;
+}
+
+fn key(s: *cast.CSym) []u8 {
+    return u.addr_key(@int_from_ptr(s));
+}
+
+// -----------------------------------------------------------------------------
+// Semantic analysis: the typedef names declarations use
+// -----------------------------------------------------------------------------
+
+/// Object, parameter or typedef s was declared with the typedef name td
+/// among its specifiers (nil: none).
+pub fn note_typedef_use(s: *cast.CSym, td: *mut cast.CSym) void {
+    if on() and u.notnil(td) and u.notnil(s) {
+        tdefs.put(key(s), td);
+    }
 }
 
 /// Records the constants of the enumeration with tag `tag` (csema_dspec).
@@ -48,9 +81,126 @@ pub fn note_func(f: *ir.Func, s: *cast.CSym) void {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Scopes (lexical blocks): ir.cur_scope while a function is generated
+// -----------------------------------------------------------------------------
+
+/// Function f's code begins: its parameters and the variables at the top of
+/// its body are in its root scope.
+pub fn begin_function(f: *ir.Func) void {
+    if not on() {
+        return;
+    }
+    cur_func = f.name;
+    root = dbi.add_scope(f.name, 0);
+    ir.cur_scope = root;
+}
+
+/// The function's code ends.
+pub fn end_function() void {
+    ir.cur_scope = 0;
+    root = 0;
+}
+
+// Does declaration d declare something a debugger shows (an identifier, a
+// structure, union or enumeration with its members)?
+fn declares(d: *cast.Decl) bool {
+    if u.isnil(d) or (d.kind != cast.DeclKind.DECL) {
+        return false;
+    }
+    if d.decls.len > 0 {
+        return true;
+    }
+    for x in d.specs.items.items() {
+        if (x.kind == cast.SpecKind.TAG) and x.tag.has_body {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A block (its items) begins: a lexical block if it declares anything
+/// (C 6.8.2: a compound statement is a block). The scope to give back to
+/// close_scope.
+pub fn open_block(items: []*mut cast.Stmt) u32 {
+    let saved = ir.cur_scope;
+    if (root == 0) or (saved == 0) {
+        return saved;
+    }
+    for x in items {
+        if (x.kind == cast.StmtKind.DECL) and declares(x.decl) {
+            ir.cur_scope = dbi.add_scope(cur_func, saved);
+            break;
+        }
+    }
+    return saved;
+}
+
+/// A for statement with declaration d begins (6.8.5p5: a block).
+pub fn open_for(d: *cast.Decl) u32 {
+    let saved = ir.cur_scope;
+    if (root != 0) and (saved != 0) and declares(d) {
+        ir.cur_scope = dbi.add_scope(cur_func, saved);
+    }
+    return saved;
+}
+
+/// The block opened with open_block or open_for ends.
+pub fn close_scope(saved: u32) void {
+    if root != 0 {
+        ir.cur_scope = saved;
+    }
+}
+
+/// Declaration d is reached in the current block: its typedefs, its
+/// structure, union and enumeration types, its static objects are of it.
+pub fn note_block_decl(d: *cast.Decl) void {
+    if not on() or (ir.cur_scope == 0) or not declares(d) {
+        return;
+    }
+    let sc = ir.cur_scope;
+    for x in d.specs.items.items() {
+        if (x.kind == cast.SpecKind.TAG) and x.tag.has_body and u.notnil(x.tag.ty) {
+            dbi.set_type_scope(type_id(x.tag.ty), sc);
+        }
+    }
+    for x in d.decls.items() {
+        let s = x.sym;
+        if u.isnil(s) {
+            continue;
+        }
+        if s.kind == cast.SK_TYPEDEF {
+            dbi.set_type_scope(typedef_id(s), sc);
+        } else if (s.kind == cast.SK_OBJECT) and (s.duration == cast.SD_STATIC) and (s.linkage == cast.LK_NONE) {
+            let k = static_at.get(key(s));
+            if k > 0 {
+                let g = dbi.globals.at(@int_cast(usize, k - 1));
+                g.scope = sc;
+                let mut v = g.*;
+                v.gidx = k - 1;
+                _ = dbi.add_var(cur_func, v);
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Variables
+// -----------------------------------------------------------------------------
+
 /// Object `a` (an alloca) holds variable s of function f: it is kept in
 /// memory at -O0, and, with -g, described.
 pub fn note_var(f: *ir.Func, s: *cast.CSym, a: *mut ir.Value) void {
+    note_object(f, s, a, false);
+}
+
+/// Object `a` (an alloca) holds the address of variable s of function f (a
+/// parameter passed by reference, a variable length array).
+pub fn note_indirect(f: *ir.Func, s: *cast.CSym, a: *mut ir.Value) void {
+    note_object(f, s, a, true);
+}
+
+fn note_object(f: *ir.Func, s: *cast.CSym, a: *mut ir.Value, indirect: bool) void {
     if u.isnil(a) or (a.kind != ir.V_INST) or (a.op != ir.OP_ALLOCA) {
         return;
     }
@@ -58,23 +208,115 @@ pub fn note_var(f: *ir.Func, s: *cast.CSym, a: *mut ir.Value) void {
     if not on() or (s.name.len == 0) {
         return;
     }
-    dbi.add_var(f.name, dbi.DVar.{ name: s.name, ty: type_id(s.ty), src: src_of(s.span), alloca: a,
-                                   global: u.nil.[ir.Global](), param: s.is_param, external: false });
+    let mut sc = ir.cur_scope;
+    if s.is_param or (sc == 0) {
+        sc = root;
+    }
+    _ = dbi.add_var(f.name, dbi.DVar.{ name: s.name, ty: var_type(s), src: src_of(s.span), alloca: a, alloca_id: a.id,
+                                       global: u.nil.[ir.Global](), param: s.is_param, external: false, scope: sc,
+                                       indirect: indirect, gidx: -1, artificial: false, track: -1, stores: 0,
+                                       nstores: 0, seen: false });
 }
 
-/// Datum g is the object s of static storage duration (in function f, for
-/// a block-scope one; nil: at file scope).
+/// Datum g is the object s of static storage duration (described at the
+/// top level; a block-scope one is moved into its block by note_block_decl).
 pub fn note_static(f: *ir.Func, s: *cast.CSym, g: *mut ir.Global) void {
+    _ = f;
     if not on() or (s.name.len == 0) {
         return;
     }
-    let v = dbi.DVar.{ name: s.name, ty: type_id(s.ty), src: src_of(s.span), alloca: u.nil.[ir.Value](), global: g,
-                       param: false, external: s.linkage == cast.LK_EXTERNAL };
-    if u.notnil(f) and (s.linkage == cast.LK_NONE) {
-        dbi.add_var(f.name, v);
-    } else {
-        dbi.globals.push(v);
+    let v = dbi.DVar.{ name: s.name, ty: var_type(s), src: src_of(s.span), alloca: u.nil.[ir.Value](), alloca_id: 0,
+                       global: g, param: false, external: s.linkage == cast.LK_EXTERNAL, scope: 0, indirect: false,
+                       gidx: -1, artificial: false, track: -1, stores: 0, nstores: 0, seen: false };
+    dbi.globals.push(v);
+    static_at.put(key(s), @int_cast(i32, dbi.globals.len));
+}
+
+// The type of variable s: through the typedef name it was declared with.
+fn var_type(s: *cast.CSym) i32 {
+    let td = tdefs.get(key(s));
+    if u.notnil(td) {
+        let t = via(s.ty, td.ty, td);
+        if t != -2 {
+            return t;
+        }
     }
+    return type_id(s.ty);
+}
+
+// Type t, if it is typedef td's type (td_ty) with qualifiers or pointer or
+// array derivations added: in terms of the typedef; -2 if not.
+fn via(t: *cty.CType, td_ty: *cty.CType, td: *cast.CSym) i32 {
+    if u.isnil(t) or u.isnil(td_ty) {
+        return -2;
+    }
+    if t == td_ty {
+        return typedef_id(td);
+    }
+    if (t.quals != 0) and (t.unq == td_ty.unq) and ((t.quals & td_ty.quals) == td_ty.quals) {
+        return qualified(t.quals & ~td_ty.quals, typedef_id(td));
+    }
+    if t.quals != 0 {
+        let inner = via(t.unq, td_ty, td);
+        if inner == -2 {
+            return -2;
+        }
+        return qualified(t.quals, inner);
+    }
+    if t.kind == cty.TK_POINTER {
+        let inner = via(t.elem, td_ty, td);
+        if inner == -2 {
+            return -2;
+        }
+        return dbi.add_type(derived(dbi.DK_POINTER, inner, cty.size_of(t)));
+    }
+    if (t.kind == cty.TK_ARRAY) and not t.vla {
+        let inner = via(t.elem, td_ty, td);
+        if inner == -2 {
+            return -2;
+        }
+        let mut d = derived(dbi.DK_ARRAY, inner, 0);
+        if t.has_len {
+            d.count = @bit_cast(i64, t.len);
+            d.size = cty.size_of(t);
+        }
+        return dbi.add_type(d);
+    }
+    return -2;
+}
+
+// The DW_TAG_typedef of typedef td (made once).
+fn typedef_id(td: *cast.CSym) i32 {
+    let at = td_ids.get(key(td));
+    if at != 0 {
+        return at - 1;
+    }
+    let mut d = derived(dbi.DK_TYPEDEF, -1, 0);
+    d.name = td.name;
+    d.src = src_of(td.span);
+    let id = dbi.add_type(d);
+    td_ids.put(key(td), id + 1);
+    let target = var_type(td);  // (which may add types: the list moves)
+    dbi.types.at(@int_cast(usize, id)).target = target;
+    return id;
+}
+
+/// The object holding the length of a variable length array type t (as
+/// size_t), slot, is kept in memory at -O0 (a debugger reads the type's
+/// bound from it).
+pub fn note_vla_len(slot: *mut ir.Value) void {
+    if u.notnil(slot) and (slot.kind == ir.V_INST) and (slot.op == ir.OP_ALLOCA) {
+        slot.flags = slot.flags | ir.F_VAR;
+    }
+}
+
+/// The objects holding the lengths of variable length array types (by their
+/// length expressions: cgen_vla.ax), for the bounds of their descriptions.
+pub let mut vla_len_slot: fn(*cty.CType) *mut ir.Value = no_slot;
+
+fn no_slot(t: *cty.CType) *mut ir.Value {
+    _ = t;
+    return ir.vnil();
 }
 
 fn src_of(sp: u.Span) u32 {
@@ -86,7 +328,8 @@ fn src_of(sp: u.Span) u32 {
 
 fn base(name: []u8, size: u64, enc: u8) dbi.DType {
     return dbi.DType.{ kind: dbi.DK_BASE, name: name, size: size, enc: enc, target: -1, count: -1,
-                       members: u.List.[dbi.DMember].empty(), variadic: false, proto: false, complete: true, src: 0 };
+                       members: u.List.[dbi.DMember].empty(), variadic: false, proto: false, complete: true, src: 0,
+                       scope: 0, bits: 0, count_var: -1 };
 }
 
 fn derived(kind: u8, target: i32, size: u64) dbi.DType {
@@ -100,7 +343,7 @@ fn derived(kind: u8, target: i32, size: u64) dbi.DType {
 pub fn type_id(t: *cty.CType) i32 {
     if u.isnil(t) or (t.kind == cty.TK_VOID) or (t.kind == cty.TK_ERROR) {
         if u.notnil(t) and (t.quals != 0) and (t.kind == cty.TK_VOID) {
-            return qualified(t, -1);
+            return qualified(t.quals, -1);
         }
         return -1;
     }
@@ -112,7 +355,7 @@ pub fn type_id(t: *cty.CType) i32 {
         return by_id.get(k) - 1;
     }
     if t.quals != 0 {
-        let id = qualified(t, type_id(t.unq));
+        let id = qualified(t.quals, type_id(t.unq));
         by_id.set(k, id + 1);
         return id;
     }
@@ -134,6 +377,21 @@ pub fn type_id(t: *cty.CType) i32 {
         if t.has_len {
             d.count = @bit_cast(i64, t.len);
             d.size = cty.size_of(t);
+        } else if t.vla and (root != 0) {
+            // (its length, in its slot: an artificial variable of the
+            // function, which the type is described in)
+            let slot = vla_len_slot(t);
+            if u.notnil(slot) {
+                d.count_var = dbi.add_var(cur_func, dbi.DVar.{ name: "", ty: type_id(cty.t_size), src: 0, alloca: slot,
+                                                               alloca_id: slot.id, global: u.nil.[ir.Global](),
+                                                               param: false, external: false, scope: root,
+                                                               indirect: false, gidx: -1, artificial: true, track: -1,
+                                                               stores: 0, nstores: 0, seen: false });
+                let id = dbi.add_type(d);
+                by_id.set(k, id + 1);
+                dbi.set_type_scope(id, root);
+                return id;
+            }
         }
     } else if kind == cty.TK_FUNCTION {
         d = derived(dbi.DK_FUNC, type_id(t.ret), 0);
@@ -148,6 +406,9 @@ pub fn type_id(t: *cty.CType) i32 {
         // (a name made here is kept: the syntax tree's memory is released before the
         // debug information is written)
         d = base(u.perm_dup(base_name(t)), cty.size_of(t), encoding(t));
+        if (kind == cty.TK_BITINT) and (@as(u64, @bit_cast(u32, t.bits)) < (8 * d.size)) {
+            d.bits = t.bits;  // (DWARF 5, 5.1: DW_AT_bit_size, the value's width in its storage)
+        }
     }
     let id = dbi.add_type(d);
     by_id.set(k, id + 1);
@@ -156,12 +417,12 @@ pub fn type_id(t: *cty.CType) i32 {
 
 // A qualified version of the type `inner` (t's qualifiers, outermost the
 // first of const, volatile, restrict, _Atomic).
-fn qualified(t: *cty.CType, inner: i32) i32 {
+fn qualified(quals: i32, inner: i32) i32 {
     let mut id = inner;
     let qs: [4]i32 = [cty.Q_ATOMIC, cty.Q_RESTRICT, cty.Q_VOLATILE, cty.Q_CONST];
     let ks: [4]u8 = [dbi.DK_ATOMIC, dbi.DK_RESTRICT, dbi.DK_VOLATILE, dbi.DK_CONST];
     for j in @as(usize, 0)..4 {
-        if (t.quals & qs[j]) != 0 {
+        if (quals & qs[j]) != 0 {
             id = dbi.add_type(derived(ks[j], id, 0));
         }
     }

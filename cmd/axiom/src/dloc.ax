@@ -1,0 +1,554 @@
+// =============================================================================
+// dloc.ax - where the variables of optimized code are (-g, -O1 and up: the
+// location lists of dwarf.ax), for the native code generators (x64.ax,
+// a64.ax), from their machine code after register allocation.
+//
+// The variables followed are those the passes left a value for (dbginfo.ax,
+// ir.dbg_refs): a variable assigned once is that value wherever the value
+// is, from the instruction that makes it on (its value is the variable's
+// from its declaration until its block is left, and the variable is not in
+// scope elsewhere), or a constant everywhere; a parameter never assigned is
+// also in its argument's register at the function's entry, or for the whole
+// function in its argument's stack slot.
+//
+// What is relied on (the invariant): after register allocation, a machine
+// instruction's register operands written (RD, RUD, RE), its clobbers (a
+// call's) and the copies (is_move), spills and reloads (MInst.spill) say
+// all that changes the allocatable registers and spill slots; the
+// allocator gives two values live at the same time different registers.
+// Then where every path from the function's entry has run the defining
+// instruction, and no instruction since has written the register, the
+// register holds the value (a must-be-available analysis: forward, over the
+// machine CFG, meeting by intersection), and so does a register or spill
+// slot it was copied to since. A range of code (one machine instruction's,
+// or a few encoded together) gets the registers that hold the value before
+// it and that it does not write: a debugger stopped in it, or in a call it
+// makes (at its return address), reads the value. Code the encoder adds
+// around instructions (a prologue, alignment) writes none of the
+// allocatable registers; a return or a call in tail position takes the
+// frame down (restoring the callee-saved registers): no location there.
+// Values never made by one instruction into one register (phis, values
+// folded into their uses, wider than a register) are not followed.
+// =============================================================================
+import "dbginfo.ax" as dbi;
+import "ir.ax" as ir;
+import "mach.ax" as mc;
+import "util.ax" as u;
+
+/// A location piece of variable `var` (an index in its function's dbinfo
+/// variables): from code offset start to end, in DWARF register reg, or (reg
+/// -1) at `off` from the CFA; kind LK_CONST: the variable's value is the
+/// constant `off` (its bits, as many bytes as its type has) everywhere.
+pub struct VLoc {
+    var: u32,
+    kind: u8,
+    start: u64,
+    end: u64,
+    reg: i32,
+    off: i64,
+}
+
+pub const LK_PIECE: u8 = 0;
+pub const LK_CONST: u8 = 1;
+
+/// What the target tells of its machine code.
+pub struct Tgt {
+    dw_reg: fn(i32) i32,          // a physical register's DWARF number (-1: none)
+    is_exit: fn(*mc.MInst) bool,  // a return or a call in tail position
+    is_tail: fn(*mc.MInst) bool,  // a call in tail position (it writes the stack arguments' area)
+    slot_off: fn(i32) i64,        // a frame slot's offset from the CFA (NO_LOC: none)
+    alloc: u64,                   // the allocatable physical registers
+}
+
+pub const NO_LOC: i64 = -0x7fff_ffff_ffff_ffff;
+
+// A variable followed in the function being compiled.
+struct Var {
+    var: u32,
+    v: *mut ir.Value,
+    def: *mut mc.MInst,  // the instruction that makes v (nil: none found)
+    def_op: usize,       // its operand v's register is
+    entry_reg: i32,      // a parameter: the physical register it arrives in (-1: none)
+    stack_off: i64,      // a parameter: its stack slot's offset from the CFA (NO_LOC: none)
+}
+
+let mut VS: u.List.[Var] = u.List.[Var].{ data: @ptr_from_int(*mut Var, 0), len: 0, cap: 0 };
+let mut CONSTS: u.List.[VLoc] = u.List.[VLoc].{ data: @ptr_from_int(*mut VLoc, 0), len: 0, cap: 0 };
+// a value (its address) -> its index in VS + 1
+let mut by_val: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                  cap: 0, len: 0 };
+// the code offset of each machine instruction the encoder visited (its address -> offset + 1), and of each block
+let mut offs: u.SymMap.[u64] = u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                cap: 0, len: 0 };
+let mut boffs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+/// Are variables followed in the function being compiled?
+pub let mut active: bool = false;
+
+fn key(p: usize) []u8 {
+    return u.addr_key(p);
+}
+
+// Can a variable of the type `ty` (a dbinfo type) be held by value v (an
+// integer, pointer or floating value of its size in one register)?
+fn fits(v: *ir.Value, ty: i32) bool {
+    if ty < 0 {
+        return false;
+    }
+    let t = v.ty;
+    let k = t.kind;
+    if (k != ir.T_INT) and (k != ir.T_PTR) and (k != ir.T_FLOAT) {
+        return false;
+    }
+    if (k == ir.T_INT) and ((t.bits < 8) or (t.bits > 64)) {
+        return false;
+    }
+    let d = dbi.types.at(@int_cast(usize, ty));
+    let mut dk = d.kind;
+    let mut dd = d;
+    while (dk == dbi.DK_TYPEDEF) or (dk == dbi.DK_CONST) or (dk == dbi.DK_VOLATILE) or (dk == dbi.DK_RESTRICT) {
+        if dd.target < 0 {
+            return false;
+        }
+        dd = dbi.types.at(@int_cast(usize, dd.target));
+        dk = dd.kind;
+    }
+    if (dk != dbi.DK_BASE) and (dk != dbi.DK_POINTER) and (dk != dbi.DK_ENUM) {
+        return false;
+    }
+    if (dk == dbi.DK_BASE) and (dd.bits > 0) {
+        return false;  // (a bit-precise integer: its bits beyond its width are not kept)
+    }
+    return dd.size == t.size;
+}
+
+/// Function f's code is selected next: the values of its variables to find.
+pub fn begin(f: *ir.Func, on: bool) void {
+    VS.clear();
+    CONSTS.clear();
+    by_val = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
+    boffs.clear();
+    active = false;
+    if not ir.dbg_on or not on {
+        return;
+    }
+    let vs = dbi.vars_of(f.name);
+    for k in 0..vs.len {
+        let x = vs[k];
+        if (x.track < 0) or x.artificial {
+            continue;
+        }
+        let v = ir.dbg_value(x.track);
+        if u.isnil(v) or not fits(v, x.ty) {
+            continue;
+        }
+        let vk = v.kind;
+        if (vk == ir.V_CINT) or (vk == ir.V_ZERO) or (vk == ir.V_CFP) {
+            let mut bits: u64 = 0;
+            if vk == ir.V_CINT {
+                bits = ir.cint_val(v);
+            } else if vk == ir.V_CFP {
+                let fv = ir.fv_of(v);
+                if v.ty.size == 4 {
+                    bits = @as(u64, @bit_cast(u32, @float_cast(f32, fv)));
+                } else {
+                    bits = @bit_cast(u64, fv);
+                }
+            }
+            CONSTS.push(
+                VLoc.{ var: @truncate(u32, k), kind: LK_CONST, start: 0, end: 0, reg: -1, off: @bit_cast(i64, bits) });
+            continue;
+        }
+        if vk == ir.V_INST {
+            if (v.op == ir.OP_PHI) or u.isnil(v.blk) or (@int_from_ptr(v.blk.fnp) != @int_from_ptr(f)) {
+                continue;
+            }
+        } else if vk == ir.V_PARAM {
+            let mut mine = false;
+            for p in f.params {
+                mine = mine or (p == v);
+            }
+            if not mine {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        VS.push(Var.{ var: @truncate(u32, k), v: v, def: u.nil.[mc.MInst](), def_op: 0, entry_reg: -1,
+                      stack_off: NO_LOC });
+        by_val.put(key(@int_from_ptr(v)), @int_cast(i32, VS.len));
+    }
+    active = (VS.len > 0) or (CONSTS.len > 0);
+}
+
+fn find(v: *ir.Value) *mut Var {
+    if not active {
+        return u.nil.[Var]();
+    }
+    let k = by_val.get(key(@int_from_ptr(v)));
+    if k == 0 {
+        return u.nil.[Var]();
+    }
+    return VS.at(@int_cast(usize, k - 1));
+}
+
+/// Parameter p arrives in physical register reg (-1: none), or at stack_off
+/// from the CFA (NO_LOC: not there).
+pub fn param(p: *ir.Value, reg: i32, stack_off: i64) void {
+    let x = find(p);
+    if u.notnil(x) {
+        x.entry_reg = reg;
+        x.stack_off = stack_off;
+    }
+}
+
+/// The code of IR instruction i was selected into block b, its value in
+/// virtual register r (-1: none): the last instruction of b writing r makes
+/// it.
+pub fn selected(i: *ir.Value, b: *mc.MBlock, r: i32) void {
+    let x = find(i);
+    if u.isnil(x) or (r < 0) {
+        return;
+    }
+    let mut m = b.last;
+    while u.notnil(m) {
+        for k in 0..m.ops.len {
+            let o = m.ops[k];
+            if (o.kind == mc.K_REG) and (o.reg == r) and ((o.role & (mc.RD | mc.RE)) != 0) {
+                x.def = m;
+                x.def_op = k;
+                return;
+            }
+        }
+        m = m.prev;
+    }
+}
+
+/// The encoder: block bi starts at code offset `off` (before any code the
+/// encoder puts there: a prologue); `restart` starts the offsets again (an
+/// encoding pass over).
+pub fn block_at(bi: usize, off: u64, restart: bool) void {
+    if not active {
+        return;
+    }
+    if restart {
+        boffs.clear();
+        offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
+    }
+    while boffs.len <= bi {
+        boffs.push(0xffff_ffff_ffff_ffff);
+    }
+    boffs.set(bi, off);
+}
+
+/// The encoder: machine instruction i (and those it encodes with it, up to
+/// the next one given) starts at code offset `off`.
+pub fn inst_at(i: *mc.MInst, off: u64) void {
+    if active {
+        offs.put(key(@int_from_ptr(i)), off + 1);
+    }
+}
+
+fn bit(r: i32) u64 {
+    if (r < 0) or (r >= 64) {
+        return 0;
+    }
+    return @as(u64, 1) << @as(u32, @bit_cast(u32, r));
+}
+
+// The physical registers i writes.
+fn written(mf: *mc.MFunc, i: *mc.MInst) u64 {
+    let mut w = i.clobber;
+    for o in i.ops {
+        if (o.kind == mc.K_REG) and ((o.role & (mc.RD | mc.RE)) != 0) {
+            w = w | bit(mc.phys(mf, o.reg));
+        }
+    }
+    return w;
+}
+
+fn move_regs(mf: *mc.MFunc, i: *mc.MInst) [2]i32 {
+    let mut d: i32 = -1;
+    let mut s: i32 = -1;
+    for o in i.ops {
+        if o.kind != mc.K_REG {
+            continue;
+        }
+        if (o.role & mc.RD) != 0 {
+            d = mc.phys(mf, o.reg);
+        } else if (o.role & mc.RU) != 0 {
+            s = mc.phys(mf, o.reg);
+        }
+    }
+    return [d, s];
+}
+
+// State: the registers (r) and spill slots (s, by index) holding x.v.
+struct St {
+    r: u64,
+    s: u64,
+}
+
+// The state after instruction i, from st before it.
+fn step(mf: *mc.MFunc, t: *Tgt, x: *Var, i: *mc.MInst, st: St) St {
+    if t.is_exit(i) {
+        return St.{ r: 0, s: 0 };
+    }
+    let mut r = st.r;
+    let mut s = st.s;
+    if i.spill == 2 {
+        // a spill store: the slot gets the register's contents
+        let sb = bit(i.sslot);
+        if (r & bit(mc.phys(mf, i.sreg))) != 0 {
+            s = s | sb;
+        } else {
+            s = s & ~sb;
+        }
+        return St.{ r: r & ~written(mf, i), s: s };
+    }
+    let w = written(mf, i);
+    if (i.spill == 1) and (i.sslot >= 0) {
+        // a reload: the register gets the slot's contents
+        let d = mc.phys(mf, i.sreg);
+        let held = (s & bit(i.sslot)) != 0;
+        r = r & ~w;
+        if held {
+            r = r | bit(d);
+        }
+        return St.{ r: r, s: s };
+    }
+    if i.is_move {
+        let ds = move_regs(mf, i);
+        let held = (ds[1] >= 0) and ((r & bit(ds[1])) != 0);
+        r = r & ~w;
+        if held {
+            r = r | bit(ds[0]);
+        }
+    } else {
+        r = r & ~w;
+        for o in i.ops {
+            if (o.kind == mc.K_MEM) and (o.slot >= 0) {
+                s = s & ~bit(o.slot);  // (a slot read or written by another: not followed further)
+            }
+        }
+    }
+    if @int_from_ptr(i) == @int_from_ptr(x.def) {
+        r = r | bit(mc.phys(mf, i.ops[x.def_op].reg));
+    }
+    return St.{ r: r & t.alloc, s: s };
+}
+
+/// The location pieces of the function's variables, from its machine code
+/// mf (allocated, encoded: block_at, inst_at), `size` bytes of it.
+pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
+    let mut out = u.List.[VLoc].empty();
+    if not active {
+        return out.items();
+    }
+    for c in CONSTS.items() {
+        out.push(c);
+    }
+    let nb = mf.blocks.len;
+    if (nb == 0) or (boffs.len < nb) {
+        return out.items();
+    }
+    // (a call in tail position writes the stack arguments' area)
+    let mut tails = false;
+    for bi in 0..nb {
+        let mut i = mf.blocks.get(bi).first;
+        while u.notnil(i) {
+            tails = tails or t.is_tail(i);
+            i = i.next;
+        }
+    }
+    let ins = u.newn.[St](nb + 1);
+    let outs = u.newn.[St](nb + 1);
+    for xi in 0..VS.len {
+        let x = VS.at(xi);
+        if x.stack_off != NO_LOC {
+            if not tails and (size > 0) {
+                out.push(VLoc.{ var: x.var, kind: LK_PIECE, start: 0, end: size, reg: -1, off: x.stack_off });
+            }
+            continue;
+        }
+        if u.isnil(x.def) and (x.entry_reg < 0) {
+            continue;
+        }
+        // the dataflow: every block but the entry starts as all (the meet's identity)
+        for bi in 0..nb {
+            ins[bi] = St.{ r: ~@as(u64, 0), s: ~@as(u64, 0) };
+            outs[bi] = St.{ r: ~@as(u64, 0), s: ~@as(u64, 0) };
+        }
+        let entry = St.{ r: bit(x.entry_reg) & t.alloc, s: 0 };
+        let mut changed = true;
+        let mut rounds: i32 = 0;
+        while changed and (rounds < 100) {
+            changed = false;
+            rounds += 1;
+            for bi in 0..nb {
+                let b = mf.blocks.get(bi);
+                let mut st = entry;
+                if bi != 0 {
+                    st = St.{ r: ~@as(u64, 0), s: ~@as(u64, 0) };
+                    if b.preds.len == 0 {
+                        st = St.{ r: 0, s: 0 };
+                    }
+                    for p in b.preds.items() {
+                        let o = outs[@int_cast(usize, p)];
+                        st = St.{ r: st.r & o.r, s: st.s & o.s };
+                    }
+                } else {
+                    for p in b.preds.items() {
+                        let o = outs[@int_cast(usize, p)];
+                        st = St.{ r: st.r & o.r, s: st.s & o.s };
+                    }
+                }
+                ins[bi] = st;
+                let mut i = b.first;
+                while u.notnil(i) {
+                    st = step(mf, t, x, i, st);
+                    i = i.next;
+                }
+                if (st.r != outs[bi].r) or (st.s != outs[bi].s) {
+                    outs[bi] = st;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            continue;  // (did not settle: nothing said)
+        }
+        pieces(mf, t, x, ins[0..nb], entry, size, &mut out);
+    }
+    return out.items();
+}
+
+// The pieces of x's location over the encoded code: each block's start (the
+// state it is entered with) and each visited instruction's group (the state
+// before it, less what the group writes), the best place in each.
+fn pieces(mf: *mc.MFunc, t: *Tgt, x: *Var, ins: []St, entry: St, size: u64, out: *mut u.List.[VLoc]) void {
+    // the ranges in code order: (offset, state); then each one's end is the next one's start
+    let mut at = u.List.[u64].empty();
+    let mut sr = u.List.[u64].empty();
+    let mut ss = u.List.[u64].empty();
+    // (the code before the first block's: the prologue, at the entry)
+    at.push(0);
+    sr.push(entry.r);
+    ss.push(entry.s);
+    for bi in 0..mf.blocks.len {
+        let b = mf.blocks.get(bi);
+        let bo = boffs.get(bi);
+        let mut st = ins[bi];
+        let mut i = b.first;
+        let mut first = true;
+        while u.notnil(i) {
+            let o = offs.get(key(@int_from_ptr(i)));
+            if o == 0 {
+                // (encoded with the one before: the group's state loses what it writes)
+                if at.len > 0 {
+                    sr.set(sr.len - 1, sr.last() & ~written(mf, i));
+                    if t.is_exit(i) {
+                        sr.set(sr.len - 1, 0);
+                        ss.set(ss.len - 1, 0);
+                    }
+                }
+                st = step(mf, t, x, i, st);
+                i = i.next;
+                continue;
+            }
+            if first and (bo != 0xffff_ffff_ffff_ffff) and (bo < o - 1) {
+                at.push(bo);
+                sr.push(st.r);
+                ss.push(st.s);
+            }
+            first = false;
+            at.push(o - 1);
+            let mut gr = st.r & ~written(mf, i);
+            let mut gs = st.s;
+            if t.is_exit(i) {
+                gr = 0;
+                gs = 0;
+            }
+            sr.push(gr);
+            ss.push(gs);
+            st = step(mf, t, x, i, st);
+            i = i.next;
+        }
+        if first and (bo != 0xffff_ffff_ffff_ffff) {
+            at.push(bo);
+            sr.push(st.r);
+            ss.push(st.s);
+        }
+    }
+    // in code order (blocks are laid out in order; sorted for safety)
+    let n = at.len;
+    let idx = u.newn.[usize](n + 1);
+    for k in 0..n {
+        idx[k] = k;
+    }
+    for k in 1..n {
+        let mut j = k;
+        while (j > 0) and (at.get(idx[j - 1]) > at.get(idx[j])) {
+            let y = idx[j];
+            idx[j] = idx[j - 1];
+            idx[j - 1] = y;
+            j -= 1;
+        }
+    }
+    let mut cur_reg: i32 = -2;
+    let mut cur_off: i64 = NO_LOC;
+    let mut cur_start: u64 = 0;
+    for kk in 0..n {
+        let k = idx[kk];
+        let start = at.get(k);
+        let mut end = size;
+        if kk + 1 < n {
+            end = at.get(idx[kk + 1]);
+        }
+        if end <= start {
+            continue;
+        }
+        // the place: the lowest-numbered register, else a spill slot
+        let mut reg: i32 = -2;
+        let mut off: i64 = NO_LOC;
+        let r = sr.get(k);
+        for p in @as(usize, 0)..64 {
+            if (r & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
+                let dr = t.dw_reg(@int_cast(i32, p));
+                if dr >= 0 {
+                    reg = dr;
+                    break;
+                }
+            }
+        }
+        if reg == -2 {
+            let s = ss.get(k);
+            for p in @as(usize, 0)..64 {
+                if (s & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
+                    let so = t.slot_off(@int_cast(i32, p));
+                    if so != NO_LOC {
+                        reg = -1;
+                        off = so;
+                        break;
+                    }
+                }
+            }
+        }
+        if (reg == cur_reg) and (off == cur_off) and (out.len > 0) and (out.last().var == x.var) and
+           (out.last().end == start) and (reg != -2) {
+            out.at(out.len - 1).end = end;
+            continue;
+        }
+        cur_reg = reg;
+        cur_off = off;
+        cur_start = start;
+        if reg != -2 {
+            out.push(VLoc.{ var: x.var, kind: LK_PIECE, start: start, end: end, reg: reg, off: off });
+        }
+    }
+    _ = cur_start;
+    at.deinit();
+    sr.deinit();
+    ss.deinit();
+}

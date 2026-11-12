@@ -48,6 +48,7 @@ pub const DK_UNION: u8 = 9;
 pub const DK_ENUM: u8 = 10;
 pub const DK_TYPEDEF: u8 = 11;
 pub const DK_FUNC: u8 = 12;
+pub const DK_TAGGED: u8 = 13;  // a tagged union: members[0] the tag, the others its variants (value: the tag's)
 
 // Base type encodings (DWARF 5, 7.8: DW_ATE_*)
 pub const ATE_BOOLEAN: u8 = 2;
@@ -81,7 +82,10 @@ pub struct DType {
     variadic: bool,  // DK_FUNC
     proto: bool,
     complete: bool,  // DK_STRUCT, DK_UNION, DK_ENUM
-    src: u32,        // where it is declared (structures, unions, enumerations)
+    src: u32,        // where it is declared (structures, unions, enumerations, typedefs)
+    scope: u32,      // the lexical block (scopes) it is declared in; 0: the unit's top level
+    bits: i32,       // DK_BASE: the width in bits, if less than the size's (a bit-precise integer); else 0
+    count_var: i32,  // DK_ARRAY of variable length: its length's variable, an index in its function's vars (-1: none)
 }
 
 /// A variable: a function's (alloca: its object, for its location at -O0),
@@ -91,9 +95,75 @@ pub struct DVar {
     ty: i32,
     src: u32,
     alloca: *mut ir.Value,
+    alloca_id: i32,  // (the alloca's id: values are reused, an id is not)
     global: *mut ir.Global,
     param: bool,
     external: bool,
+    scope: u32,        // the lexical block it is declared in (scopes; its function's root for one at the top)
+    indirect: bool,    // the object holds the variable's address (a parameter passed by reference, a VLA)
+    gidx: i32,         // a block-scope static: its index in `globals` (written there if its block is not)
+    artificial: bool,  // made by the compiler (a VLA's length: DType.count_var)
+    // optimized code (track_vars): the value of a variable assigned once
+    // (an ir.dbg_refs index, -1: none); or the stores to its object, one
+    // left in memory (dbg_refs [stores, stores + nstores))
+    track: i32,
+    stores: i32,
+    nstores: i32,
+    seen: bool,  // (track_vars has looked at it)
+}
+
+/// A lexical block of a function (C's block scopes; DWARF's
+/// DW_TAG_lexical_block), or its root (the function's outermost scope,
+/// parent 0). Index 0 of `scopes` is no scope.
+pub struct DScope {
+    parent: u32,
+    func: []u8,           // its function's IR name (interned)
+    types: u.List.[i32],  // the types declared in it (DType.scope)
+}
+
+pub let mut scopes: u.List.[DScope] = u.List.[DScope].{ data: @ptr_from_int(*mut DScope, 0), len: 0, cap: 0 };
+
+// IR function name (interned) -> its scopes, which are consecutive: the
+// first << 32 | the last
+let mut func_scopes: u.SymMap.[u64] = u.SymMap.[u64].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 };
+
+/// A new lexical block of function `ir_name` in block `parent` (0: a
+/// function's root, made before its other scopes, which are made one after
+/// the other); its index (from 1).
+pub fn add_scope(ir_name: []u8, parent: u32) u32 {
+    if scopes.len == 0 {
+        scopes.push(DScope.{ parent: 0, func: "", types: u.List.[i32].empty() });
+    }
+    let k = u.intern(ir_name);
+    scopes.push(DScope.{ parent: parent, func: k, types: u.List.[i32].empty() });
+    let id = @as(u64, scopes.len - 1);
+    let at = func_scopes.get(k);
+    if (parent == 0) or (at == 0) {
+        func_scopes.put(k, (id << 32) | id);
+    } else {
+        func_scopes.put(k, (at & ~@as(u64, 0xffff_ffff)) | id);
+    }
+    return @truncate(u32, id);
+}
+
+/// The scopes of function `ir_name`: [first, last] (0, 0: none).
+pub fn scopes_of(ir_name: []u8) [2]u32 {
+    let at = func_scopes.get(u.intern(ir_name));
+    return [@truncate(u32, at >> 32), @truncate(u32, at)];
+}
+
+/// Type t is declared in lexical block `scope`.
+pub fn set_type_scope(t: i32, scope: u32) void {
+    if (t < 0) or (scope == 0) or (@as(usize, scope) >= scopes.len) {
+        return;
+    }
+    let d = types.at(@int_cast(usize, t));
+    if d.scope != 0 {
+        return;
+    }
+    d.scope = scope;
+    scopes.at(@as(usize, scope)).types.push(t);
 }
 
 pub let mut types: u.List.[DType] = u.List.[DType].{ data: @ptr_from_int(*mut DType, 0), len: 0, cap: 0 };
@@ -123,8 +193,8 @@ pub fn add_type(t: DType) i32 {
     return @int_cast(i32, types.len - 1);
 }
 
-/// Adds variable v to the function named `ir_name`.
-pub fn add_var(ir_name: []u8, v: DVar) void {
+/// Adds variable v to the function named `ir_name`; its index there.
+pub fn add_var(ir_name: []u8, v: DVar) i32 {
     let k = u.intern(ir_name);
     let mut l = vars.get(k);
     if u.isnil(l) {
@@ -132,6 +202,12 @@ pub fn add_var(ir_name: []u8, v: DVar) void {
         vars.put(k, l);
     }
     l.push(v);
+    return @int_cast(i32, l.len - 1);
+}
+
+/// The variables of the function named `ir_name`, to change (nil: none).
+pub fn vars_mut(ir_name: []u8) *mut u.List.[DVar] {
+    return vars.get(u.intern(ir_name));
 }
 
 /// The variables of the function named `ir_name` (none: empty).

@@ -1,0 +1,302 @@
+// =============================================================================
+// axdebug.ax - what the debug information (dwarf.ax, through dbginfo.ax) is
+// told of an Axiom program at -g (codegen.ax calls it): its types, each
+// function's result, parameters and local variables (and their objects,
+// which -O0 keeps in memory: ir.F_VAR), its globals, and its blocks
+// (lexical blocks: ir.Value.scope).
+//
+// Types as DWARF describes them, as near as it can:
+//   - integers, floats, bool: base types named as Axiom writes them (i32,
+//     usize, f64, ...); an error code (an error set's values): a 16-bit base
+//     type named `error`;
+//   - pointers (`*T` to a const T), arrays, vectors (arrays of their lanes),
+//     function types (`fn(...)` values point to a subroutine type);
+//   - a slice: a structure `[]T` of `ptr` and `len`;
+//   - a structure: its fields at their offsets; an enumeration: its members'
+//     values over its representation;
+//   - a union: a structure of its tag (an enumeration of the variants'
+//     names) and a variant part (DWARF 5, 5.7.10) whose variants, chosen by
+//     the tag, hold the payloads;
+//   - an error union `!T`: a structure of `error` (0: none) and `value`.
+// =============================================================================
+import "ast.ax" as ast;
+import "dbginfo.ax" as dbi;
+import "ir.ax" as ir;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+
+// a type's id (ast.Type.id) -> its dbinfo index + 1
+let mut by_id: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+let mut cur_func: []u8 = "";
+let mut root: u32 = 0;
+let mut body_next: bool = false;  // the next block is the function's body (its root's)
+
+/// Are types and variables described (-g)?
+pub fn on() bool {
+    return tg.g_debug == tg.DEBUG_FULL;
+}
+
+fn src_of(sp: u.Span) u32 {
+    if (sp.file < 0) or (@int_cast(usize, sp.file) >= u.g_files.len) {
+        return 0;
+    }
+    return ir.src_loc(sp.file, u.span_line(sp));
+}
+
+fn dtype(kind: u8, name: []u8, size: u64, enc: u8, target: i32) dbi.DType {
+    return dbi.DType.{ kind: kind, name: name, size: size, enc: enc, target: target, count: -1,
+                       members: u.List.[dbi.DMember].empty(), variadic: false, proto: true, complete: true, src: 0,
+                       scope: 0, bits: 0, count_var: -1 };
+}
+
+fn member(name: []u8, t: i32, off: i64) dbi.DMember {
+    return dbi.DMember.{ name: name, ty: t, off: @bit_cast(u64, off), bits: 0, bit_off: 0, value: 0 };
+}
+
+fn size_of(t: *mut ast.Type) u64 {
+    return @bit_cast(u64, ty.type_size(t));
+}
+
+// The index of the type made from d, which is t's (cached first, for types
+// that refer to themselves).
+fn put(t: *mut ast.Type, d: dbi.DType) i32 {
+    let id = dbi.add_type(d);
+    set(t, id);
+    return id;
+}
+
+fn set(t: *mut ast.Type, id: i32) void {
+    let k = @int_cast(usize, @max(t.id, 0));
+    while by_id.len <= k {
+        by_id.push(0);
+    }
+    by_id.set(k, id + 1);
+}
+
+/// The dbinfo index of Axiom type t (a concrete one; -1: void, never, or
+/// one not described).
+pub fn type_id(t: *mut ast.Type) i32 {
+    if u.isnil(t) or t.has_params {
+        return -1;
+    }
+    let k0 = t.kind;
+    if (k0 == ast.TY_VOID) or (k0 == ast.TY_NEVER) or (k0 == ast.TY_INVALID) {
+        return -1;
+    }
+    let k = @int_cast(usize, @max(t.id, 0));
+    if (t.id >= 0) and (k < by_id.len) and (by_id.get(k) != 0) {
+        return by_id.get(k) - 1;
+    }
+    let size = size_of(t);
+    let name = u.perm_dup(ty.type_str(t));
+    if k0 == ast.TY_BOOL {
+        return put(t, dtype(dbi.DK_BASE, name, 1, dbi.ATE_BOOLEAN, -1));
+    }
+    if k0 == ast.TY_INT {
+        let mut enc = dbi.ATE_UNSIGNED;
+        if t.is_signed {
+            enc = dbi.ATE_SIGNED;
+        }
+        return put(t, dtype(dbi.DK_BASE, name, size, enc, -1));
+    }
+    if k0 == ast.TY_FLOAT {
+        return put(t, dtype(dbi.DK_BASE, name, size, dbi.ATE_FLOAT, -1));
+    }
+    if k0 == ast.TY_ERROR {
+        let id = error_type();
+        set(t, id);
+        return id;
+    }
+    if k0 == ast.TY_PTR {
+        // (before the target: a structure may point to itself)
+        let id = put(t, dtype(dbi.DK_POINTER, "", size, 0, -1));
+        let mut target = type_id(t.elem);
+        if not t.is_mut {
+            target = dbi.add_type(dtype(dbi.DK_CONST, "", 0, 0, target));
+        }
+        dbi.types.at(@int_cast(usize, id)).target = target;
+        return id;
+    }
+    if k0 == ast.TY_FN {
+        let id = put(t, dtype(dbi.DK_POINTER, "", size, 0, -1));
+        let mut f = dtype(dbi.DK_FUNC, "", 0, 0, -1);
+        for p in t.params {
+            f.members.push(member("", type_id(p), 0));
+        }
+        f.target = type_id(t.ret);
+        let fid = dbi.add_type(f);
+        dbi.types.at(@int_cast(usize, id)).target = fid;
+        return id;
+    }
+    if (k0 == ast.TY_ARRAY) or (k0 == ast.TY_VEC) or (k0 == ast.TY_V128) {
+        let mut d = dtype(dbi.DK_ARRAY, "", size, 0, type_id(t.elem));
+        d.count = t.len;
+        if k0 != ast.TY_ARRAY {
+            d.count = @as(i64, t.lanes);
+        }
+        return put(t, d);
+    }
+    if k0 == ast.TY_SLICE {
+        let id = put(t, dtype(dbi.DK_STRUCT, name, size, 0, -1));
+        let mut ms = u.List.[dbi.DMember].empty();
+        let mut pt = dtype(dbi.DK_POINTER, "", size / 2, 0, type_id(t.elem));
+        if not t.is_mut {
+            pt.target = dbi.add_type(dtype(dbi.DK_CONST, "", 0, 0, pt.target));
+        }
+        ms.push(member("ptr", dbi.add_type(pt), 0));
+        ms.push(member("len", type_id(ty.type_int(@int_cast(i32, size * 4), false, true)), @bit_cast(i64, size / 2)));
+        dbi.types.at(@int_cast(usize, id)).members = ms;
+        return id;
+    }
+    if k0 == ast.TY_ENUM {
+        let mut d = dtype(dbi.DK_ENUM, name, size, 0, type_id(t.elem));
+        d.src = src_of(t.decl.span);
+        for v in t.decl.variants.items() {
+            d.members.push(
+                dbi.DMember.{ name: v.name, ty: -1, off: 0, bits: 0, bit_off: 0, value: @bit_cast(i64, v.value.lo) });
+        }
+        return put(t, d);
+    }
+    if k0 == ast.TY_STRUCT {
+        let mut d = dtype(dbi.DK_STRUCT, name, size, 0, -1);
+        d.src = src_of(t.decl.span);
+        let id = put(t, d);
+        let mut ms = u.List.[dbi.DMember].empty();
+        for i in 0..t.decl.fields.len {
+            let ft = ty.type_field(t, i);
+            ms.push(member(t.decl.fields.at(i).name, type_id(ft), ty.type_field_offset(t, i)));
+        }
+        dbi.types.at(@int_cast(usize, id)).members = ms;
+        return id;
+    }
+    if k0 == ast.TY_UNION {
+        return union_type(t, name, size);
+    }
+    if k0 == ast.TY_ERRUNION {
+        let id = put(t, dtype(dbi.DK_STRUCT, name, size, 0, -1));
+        let mut ms = u.List.[dbi.DMember].empty();
+        ms.push(member("error", error_type(), 0));
+        if t.elem.kind != ast.TY_VOID {
+            let ea = ty.type_align(t.elem);
+            let off = ((2 + ea) - 1) / ea * ea;
+            ms.push(member("value", type_id(t.elem), off));
+        }
+        dbi.types.at(@int_cast(usize, id)).members = ms;
+        return id;
+    }
+    return -1;
+}
+
+// The type of error codes (made once).
+let mut err_id: i32 = -1;
+
+fn error_type() i32 {
+    if err_id < 0 {
+        err_id = dbi.add_type(dtype(dbi.DK_BASE, "error", 2, dbi.ATE_UNSIGNED, -1));
+    }
+    return err_id;
+}
+
+// A union: its tag (an enumeration of its variants' names, the tag's
+// values being their indexes) and its variants (dbinfo.DK_TAGGED).
+fn union_type(t: *mut ast.Type, name: []u8, size: u64) i32 {
+    let tag_t = ty.union_tag_type(t);
+    let mut d = dtype(dbi.DK_TAGGED, name, size, 0, -1);
+    d.src = src_of(t.decl.span);
+    let id = put(t, d);
+    let mut en = dtype(dbi.DK_ENUM, u.perm_dup(u.f1("%s.tag", name)), size_of(tag_t), 0, type_id(tag_t));
+    let vs = t.decl.variants.items();
+    for i in 0..vs.len {
+        en.members.push(
+            dbi.DMember.{ name: vs[i].name, ty: -1, off: 0, bits: 0, bit_off: 0, value: @int_cast(i64, i) });
+    }
+    let mut ms = u.List.[dbi.DMember].empty();
+    ms.push(member("tag", dbi.add_type(en), 0));
+    let off = ty.union_payload_offset(t);
+    for i in 0..vs.len {
+        let p = ty.type_variant(t, i);
+        let mut pt: i32 = -1;
+        if u.notnil(p) {
+            pt = type_id(p);
+        }
+        ms.push(dbi.DMember.{ name: vs[i].name, ty: pt, off: @bit_cast(u64, off), bits: 0, bit_off: 0,
+                              value: @int_cast(i64, i) });
+    }
+    dbi.types.at(@int_cast(usize, id)).members = ms;
+    return id;
+}
+
+// -----------------------------------------------------------------------------
+// Functions, variables, blocks
+// -----------------------------------------------------------------------------
+
+/// Function f's code begins: it returns type ret; its parameters and the
+/// variables at the top of its body are in its root scope.
+pub fn begin_function(f: *ir.Func, ret: *mut ast.Type) void {
+    if not on() {
+        return;
+    }
+    cur_func = f.name;
+    root = dbi.add_scope(f.name, 0);
+    ir.cur_scope = root;
+    body_next = true;
+    dbi.note_result(f.name, type_id(ret));
+}
+
+/// The function's code ends.
+pub fn end_function() void {
+    ir.cur_scope = 0;
+    root = 0;
+}
+
+/// A block begins (a lexical block if it binds a variable: `let` among its
+/// statements, or a loop's variable); the scope to give back to close_scope.
+pub fn open_block(binds: bool) u32 {
+    let saved = ir.cur_scope;
+    let body = body_next;
+    body_next = false;
+    if (root != 0) and (saved != 0) and binds and not body {
+        ir.cur_scope = dbi.add_scope(cur_func, saved);
+    }
+    return saved;
+}
+
+/// The block opened with open_block ends.
+pub fn close_scope(saved: u32) void {
+    if root != 0 {
+        ir.cur_scope = saved;
+    }
+}
+
+/// Object `a` (an alloca) holds local l (of type t) of function f: it is
+/// kept in memory at -O0, and, with -g, described; `indirect`: it holds its
+/// address (a parameter passed by pointer).
+pub fn note_local(f: *ir.Func, l: *ast.Local, t: *mut ast.Type, a: *mut ir.Value, indirect: bool) void {
+    if u.isnil(a) or (a.kind != ir.V_INST) or (a.op != ir.OP_ALLOCA) or tg.is_wasm() {
+        return;  // (WebAssembly's debug information has lines only: its locals stay wasm locals)
+    }
+    a.flags = a.flags | ir.F_VAR;
+    if not on() or (l.name.len == 0) or (root == 0) or (l.name[0] == '_') {
+        return;
+    }
+    let mut sc = ir.cur_scope;
+    if l.is_param or (sc == 0) {
+        sc = root;
+    }
+    _ = dbi.add_var(f.name, dbi.DVar.{ name: l.name, ty: type_id(t), src: src_of(l.span), alloca: a, alloca_id: a.id,
+                                       global: u.nil.[ir.Global](), param: l.is_param, external: false, scope: sc,
+                                       indirect: indirect, gidx: -1, artificial: false, track: -1, stores: 0,
+                                       nstores: 0, seen: false });
+}
+
+/// Datum g is global d (named `name` for people, of type t).
+pub fn note_global(d: *ast.Decl, name: []u8, t: *mut ast.Type, g: *mut ir.Global) void {
+    if not on() {
+        return;
+    }
+    dbi.globals.push(dbi.DVar.{ name: u.perm_dup(name), ty: type_id(t), src: src_of(d.name_span),
+                                alloca: u.nil.[ir.Value](), alloca_id: 0, global: g, param: false, external: d.is_pub,
+                                scope: 0, indirect: false, gidx: -1, artificial: false, track: -1, stores: 0,
+                                nstores: 0, seen: false });
+}

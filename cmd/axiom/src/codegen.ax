@@ -6,6 +6,7 @@
 // type-checked body by substituting the type arguments.
 // =============================================================================
 import "ast.ax" as ast;
+import "axdebug.ax" as axd;
 import "backend.ax" as be;
 import "c/cc.ax" as cfront;
 import "c/cstrip.ax" as cstrip;
@@ -1459,8 +1460,18 @@ fn local_ptr(l: *mut ast.Local) *mut ir.Value {
         let a = alloca_in_entry(lty(t), u.cz(l.name));
         set_align(a, @int_cast(u32, ty.type_align(t)));
         F.locals[i] = a;
+        axd.note_local(ir.fnp_of(F.fnv), l, debug_type(l.ty), a, false);
     }
     return F.locals[i];
+}
+
+// Type t in the function being generated, for the debug information: as
+// ct gives it, but an enumeration's own.
+fn debug_type(t: *mut ast.Type) *mut ast.Type {
+    if u.isnil(t) or u.isnil(F) or not t.has_params {
+        return t;
+    }
+    return ty.subst(t, F.from, F.to);
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,7 +1794,8 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
         return found;
     }
     let t = d.ty;
-    let g = ir.add_global(M, lty(t), u.f2("%s.%s", mangle_prefix(d), d.name)).val;
+    let gname = u.f2("%s.%s", mangle_prefix(d), d.name);
+    let g = ir.add_global(M, lty(t), gname).val;
     set_align(g, @int_cast(u32, ty.type_align(t)));
     global_vals.put(k, g);
     // (on wasm a thread-local lives in the thread's block instead: tls_addr)
@@ -1791,6 +1803,7 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
     if O.unit == CG_MODULE {
         return g;  // defined by the link unit
     }
+    axd.note_global(d, gname, t, ir.gv_of(g));
     if O.unit == CG_WHOLE {
         set_linkage(g, ir.LINK_INTERNAL);
     }
@@ -5014,6 +5027,13 @@ fn gen_inner(e: *mut ast.Expr) *mut ir.Value {
 // ---------------------------------------------------------------------------
 fn gen_block(b: *mut ast.Stmt) void {
     let height = F.defers.len;
+    let mut binds = false;
+    if axd.on() {
+        for i in 0..b.stmts.len {
+            binds = binds or (b.stmts.get(i).kind == ast.S_LET);
+        }
+    }
+    let sc = axd.open_block(binds);
     for i in 0..b.stmts.len {
         if terminated() {
             break;
@@ -5024,6 +5044,7 @@ fn gen_block(b: *mut ast.Stmt) void {
         emit_defers(height, vnil(), false);
     }
     F.defers.len = height;
+    axd.close_scope(sc);
 }
 
 fn gen_if(s: *mut ast.Stmt) void {
@@ -5377,7 +5398,9 @@ fn gen_stmt_inner(s: *mut ast.Stmt) void {
         }
         at_end(end);
     } else if k == ast.S_FOR {
+        let sc = axd.open_block(true);  // (the loop's variable)
         gen_for(s);
+        axd.close_scope(sc);
     } else if k == ast.S_MATCH {
         gen_match(s);
     } else if k == ast.S_RETURN {
@@ -5461,6 +5484,7 @@ fn gen_fn_body_of(fi: *mut FnInst) void {
     stt.entry = ir.append_block(ir.fnp_of(fi.fnv), "entry");
     let start = ir.append_block(ir.fnp_of(fi.fnv), "start");
     at_end(start);
+    axd.begin_function(ir.fnp_of(fi.fnv), fi.fnty.ret);
     let mut k: u32 = 0;
     if fi.sret {
         stt.sret_ptr = param(fi.fnv, k);
@@ -5473,6 +5497,10 @@ fn gen_fn_body_of(fi: *mut FnInst) void {
         k += 1;
         if by_ptr(pt) {
             stt.locals[@int_cast(usize, l.index)] = p;  // params are immutable: use the caller's copy directly
+            // (its address in an object of its own: -O0 keeps it there, for debuggers)
+            let pa = alloca_in_entry(T_ptr, "arg.addr".ptr);
+            _ = st(p, pa);
+            axd.note_local(ir.fnp_of(fi.fnv), l, debug_type(l.ty), pa, true);
         } else {
             store(pt, p, local_ptr(l), false);
         }
@@ -5498,6 +5526,7 @@ fn gen_fn_body_of(fi: *mut FnInst) void {
     } else {
         br(start);
     }
+    axd.end_function();
     // Delete blocks with no predecessors (continuations after return/break/trap).
     ir.remove_unreachable(ir.fnp_of(stt.fnv));
     stt.defers.deinit();
