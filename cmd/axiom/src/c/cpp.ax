@@ -12,11 +12,13 @@
 // =============================================================================
 import "../diag.ax" as dg;
 import "../util.ax" as u;
+import "cfeat.ax" as cf;
 import "copts.ax" as co;
 import "cpp_conv.ax" as cv;
 import "cpp_expr.ax" as ce;
 import "cpp_lex.ax" as lx;
 import "cpp_out.ax" as cout;
+import "cpragma.ax" as cp;
 import "ctok.ax" as ct;
 
 // Macros the preprocessor itself replaces.
@@ -27,6 +29,15 @@ const B_PRAGMA: i32 = 3;       // _Pragma (an operator; C99)
 const B_HAS_INCLUDE: i32 = 4;  // __has_include (C23; in #if)
 const B_HAS_EMBED: i32 = 5;    // __has_embed
 const B_HAS_ATTR: i32 = 6;     // __has_c_attribute
+// The compiler's in every mode (reserved identifiers): __has_include above,
+// and __has_attribute, __has_builtin; in the GNU dialects only, the rest.
+const B_HAS_GNU_ATTR: i32 = 7;      // __has_attribute
+const B_HAS_BUILTIN: i32 = 8;       // __has_builtin
+const B_HAS_INCLUDE_NEXT: i32 = 9;  // __has_include_next
+const B_COUNTER: i32 = 10;          // __COUNTER__: 0, 1, 2 ... at each use
+const B_INCLUDE_LEVEL: i32 = 11;    // __INCLUDE_LEVEL__: how deep the current file is included (0: the source)
+const B_BASE_FILE: i32 = 12;        // __BASE_FILE__: the source file's name
+const B_TIMESTAMP: i32 = 13;        // __TIMESTAMP__: the time the current file was last modified
 
 const MAX_INCLUDE_DEPTH: usize = 200;
 const MAX_ARG_DEPTH: i32 = 400;        // macro invocations nested in arguments
@@ -53,6 +64,7 @@ struct Ctx {
 struct Src {
     L: *mut lx.Lx,
     path: []u8,       // the file's path (its directory is searched for "..." includes)
+    dir_index: i32,   // where the include path found it (find_file; -1: not by the path)
     presumed: []u8,   // __FILE__
     line_delta: i64,  // #line: the presumed line less the physical line
     cond_base: usize,
@@ -92,6 +104,25 @@ struct PP {
     inject: []lx.PTok,  // tokens a directive made (#embed), read before the file's
     inject_pos: usize,
     eof_tok: lx.PTok,
+    found_index: i32,                    // find_file: where it found the file (-1: not by the include path)
+    counter: i64,                        // __COUNTER__'s next value
+    base_file: []u8,                     // __BASE_FILE__
+    once: u.SymMap.[i32],                // the files of `#pragma once` (real paths)
+    pushed: u.SymMap.[*mut MacroStack],  // #pragma push_macro: each name's saved definitions
+    poisoned: u.SymMap.[i32],            // #pragma GCC poison
+    packs: u.List.[Pack],                // #pragma pack(push): the values saved
+    pack: u64,                           // the #pragma pack value in force (0: none)
+    vis: u.List.[u64],                   // #pragma GCC visibility push: the values saved
+}
+
+// The definitions #pragma push_macro saved for a name (nil: it was not defined).
+struct MacroStack {
+    defs: u.List.[*mut Macro],
+}
+
+struct Pack {
+    value: u64,
+    id: []u8,  // `push, identifier`: the name of the entry (empty if none)
 }
 
 fn nilmac() *mut Macro {
@@ -465,7 +496,7 @@ fn collect_args(P: *mut PP, m: *mut Macro, inv: *lx.PTok, args: *mut u.List.[Arg
     let std = P.o.std;
     if m.variadic and ((n + 1) == np) {
         // the variable arguments left out
-        if (std < co.C23) and (np >= 2) {
+        if (std < co.C23) and (np >= 2) and not P.o.gnu {
             _ = dg.err(inv.span, "C1064", u.f1("macro '%s' requires at least one argument for '...' before C23",
                                                inv.name));
             return false;
@@ -481,7 +512,7 @@ fn collect_args(P: *mut PP, m: *mut Macro, inv: *lx.PTok, args: *mut u.List.[Arg
         _ = dg.err(inv.span, "C1064", msg);
         return false;
     }
-    if std < co.C99 {
+    if (std < co.C99) and not P.o.gnu {
         for k in 0..n {
             if args.at(k).raw.len == 0 {
                 _ = dg.err(inv.span, "C1065",
@@ -639,6 +670,26 @@ fn substitute(P: *mut PP, m: *Macro, args: []mut Arg, inv: *lx.PTok, lo: usize, 
     let mut i = lo;
     while i < hi {
         let t = &body[i];
+        if lx.is_punct(t, lx.PP_HASHHASH) and (out.len > 0) and ((i + 1) < hi) and P.o.gnu and m.variadic and
+           (body[i + 1].kind == lx.PK_PARAM) and (@int_cast(usize, body[i + 1].id) == (m.params.len - 1)) and
+           lx.is_punct(out.at(out.len - 1), ct.P_COMMA) {
+            // (a GNU dialect: `, ## __VA_ARGS__` is the comma and the
+            // variable arguments, or nothing if there are none)
+            let a = args[m.params.len - 1].raw;
+            if a.len == 0 {
+                _ = out.pop();
+            } else {
+                for k in 0..a.len {
+                    let mut c = a[k];
+                    if k == 0 {
+                        c.space = body[i + 1].space;
+                    }
+                    out.push(c);
+                }
+            }
+            i += 2;
+            continue;
+        }
         if lx.is_punct(t, lx.PP_HASHHASH) and (out.len > 0) and ((i + 1) < hi) {
             let mut nx: usize = 0;
             let rhs = operand(P, m, args, inv, i + 1, &mut nx);
@@ -711,11 +762,11 @@ fn if_operator(P: *mut PP, t: *mut lx.PTok) bool {
         t.* = number_tok(@as(i64, u.notnil(lookup(P, n.name))), t.span);
         return true;
     }
-    if P.o.std < co.C23 {
-        return false;
-    }
+    // (the operators are registered as macros in the modes that have them)
     let m = lookup(P, name);
-    if u.isnil(m) or ((m.builtin != B_HAS_INCLUDE) and (m.builtin != B_HAS_EMBED) and (m.builtin != B_HAS_ATTR)) {
+    if u.isnil(m) or
+       ((m.builtin != B_HAS_INCLUDE) and (m.builtin != B_HAS_EMBED) and (m.builtin != B_HAS_ATTR) and
+        (m.builtin != B_HAS_GNU_ATTR) and (m.builtin != B_HAS_BUILTIN) and (m.builtin != B_HAS_INCLUDE_NEXT)) {
         return false;
     }
     let sp = t.span;
@@ -749,14 +800,28 @@ fn if_operator(P: *mut PP, t: *mut lx.PTok) bool {
     let mut v: i64 = 0;
     if m.builtin == B_HAS_ATTR {
         v = has_attribute(expand_list(P, items), sp);
+    } else if m.builtin == B_HAS_GNU_ATTR {
+        v = has_gnu_attribute(P, expand_list(P, items), sp);
+    } else if m.builtin == B_HAS_BUILTIN {
+        let bs = expand_list(P, items);
+        if (bs.len != 1) or (bs[0].kind != lx.PK_IDENT) {
+            _ = dg.err(sp, "C1048", "'__has_builtin' requires the name of a builtin");
+        } else {
+            v = @as(i64, cf.has_builtin(bs[0].name, P.o.gnu));
+        }
     } else {
         // the resource, and (for __has_embed) the parameters
         let mut k: usize = 0;
         let hn = header_operand(P, items, &mut k, m.builtin == B_HAS_EMBED, sp);
         if not u.isnos(hn) {
-            let path = find_file(P, hn[1..hn.len - 1], hn[0] == '"');
-            if m.builtin == B_HAS_INCLUDE {
-                extra(items, k, "__has_include");
+            let mut path = u.nosym();
+            if m.builtin == B_HAS_INCLUDE_NEXT {
+                path = find_file_from(P, hn[1..hn.len - 1], next_index(P));
+            } else {
+                path = find_file(P, hn[1..hn.len - 1], hn[0] == '"');
+            }
+            if (m.builtin == B_HAS_INCLUDE) or (m.builtin == B_HAS_INCLUDE_NEXT) {
+                extra(items, k, name);
                 v = @as(i64, not u.isnos(path));
             } else {
                 let mut ep = no_params();
@@ -801,6 +866,35 @@ fn has_attribute(ts: []lx.PTok, sp: u.Span) i64 {
     return 0;
 }
 
+// __has_attribute (the compiler's, in every mode): nonzero for the
+// attributes that work in the mode: a standard attribute in C23 (its
+// __has_c_attribute value), and in a GNU dialect the GNU attributes
+// (cfeat.ax), as `name`, `__name__`, `gnu::name` or `__gnu__::name`.
+fn has_gnu_attribute(P: *PP, ts: []lx.PTok, sp: u.Span) i64 {
+    let gnu = P.o.gnu;
+    // (`prefix::name`; before C23 '::' is two ':')
+    let scoped = ((ts.len == 3) and lx.is_punct(&ts[1], ct.P_COLONCOLON)) or
+                 ((ts.len == 4) and lx.is_punct(&ts[1], ct.P_COLON) and lx.is_punct(&ts[2], ct.P_COLON));
+    if scoped and (ts[0].kind == lx.PK_IDENT) and (ts[ts.len - 1].kind == lx.PK_IDENT) {
+        let n = ts[ts.len - 1].name;
+        if gnu and (u.str_eq(ts[0].name, "gnu") or u.str_eq(ts[0].name, "__gnu__")) and cf.gnu_attribute(n) {
+            return 1;
+        }
+        return 0;
+    }
+    if (ts.len != 1) or (ts[0].kind != lx.PK_IDENT) {
+        _ = dg.err(sp, "C1048", "'__has_attribute' requires an attribute name");
+        return 0;
+    }
+    if gnu and cf.gnu_attribute(ts[0].name) {
+        return 1;
+    }
+    if P.o.std >= co.C23 {
+        return has_attribute(ts, sp);
+    }
+    return 0;
+}
+
 // The macros the preprocessor replaces itself.
 fn builtin(P: *mut PP, m: *mut Macro, inv: *lx.PTok) bool {
     let b = m.builtin;
@@ -816,29 +910,57 @@ fn builtin(P: *mut PP, m: *mut Macro, inv: *lx.PTok) bool {
         t.space = inv.space;
         t.bol = inv.bol;
         l.push(t);
+    } else if (b == B_COUNTER) or (b == B_INCLUDE_LEVEL) {
+        let mut v = @int_cast(i64, P.files.len) - 1;
+        if b == B_COUNTER {
+            v = P.counter;
+            P.counter += 1;
+        }
+        let mut t = number_tok(v, inv.span);
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
+    } else if (b == B_BASE_FILE) or (b == B_TIMESTAMP) {
+        let mut t = string_tok(P.base_file, inv.span);
+        if b == B_TIMESTAMP {
+            t = string_tok(timestamp(cur_src(P).path), inv.span);
+        }
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
     } else if b == B_PRAGMA {
-        // _Pragma ( string-literal ): the pragma is ignored, as #pragma is
+        // _Pragma ( string-literal ): destringized, the pragma (6.10.9)
         let mut ok = next_is_lparen(P);
-        if P.o.std < co.C99 {
+        if (P.o.std < co.C99) and not P.o.gnu {
             if not ok {
                 return false;
             }
             _ = dg.err(inv.span, "C1051", "the '_Pragma' operator is a C99 feature");
         }
+        let mut text: []u8 = "";
         if ok {
             _ = raw_next(P);
             let s = raw_next(P);
             ok = (s.kind == lx.PK_STRING) and ((s.id == ct.ENC_NONE) or (s.id == ct.ENC_WIDE));
             if ok {
+                text = destringize(s.text);
                 let c = raw_next(P);
                 ok = lx.is_punct(&c, ct.P_RPAREN);
             }
         }
         if not ok {
             _ = dg.err(inv.span, "C1051", "'_Pragma' takes a parenthesized string literal");
+        } else {
+            let pt = do_pragma(P, lx.lex_all(text, P.o.std, inv.span), inv.span);
+            if pt.kind == lx.PK_PRAGMA {
+                l.push(pt);
+            }
         }
         P.pend_bol = P.pend_bol or inv.bol;
         P.pend_space = P.pend_space or inv.space;
+        if l.len > 0 {
+            push_ctx(P, frozen(&mut l), nilmac());
+        }
         return true;
     } else {
         _ = dg.err(inv.span, "C1049", u.f1("'%s' can appear only in #if and #elif", inv.name));
@@ -905,7 +1027,7 @@ fn define_params(P: *mut PP, m: *mut Macro, line: []lx.PTok, i0: usize, params: 
         }
         let p = &line[i];
         if lx.is_punct(p, ct.P_ELLIPSIS) {
-            if std < co.C99 {
+            if (std < co.C99) and not P.o.gnu {
                 _ = dg.err(p.span, "C1054", "variadic macros are a C99 feature");
                 return false;
             }
@@ -929,6 +1051,14 @@ fn define_params(P: *mut PP, m: *mut Macro, line: []lx.PTok, i0: usize, params: 
         }
         params.push(p.name);
         i += 1;
+        if (i < line.len) and lx.is_punct(&line[i], ct.P_ELLIPSIS) and P.o.gnu {
+            // `name...` (a GNU dialect): the variable arguments, named
+            m.variadic = true;
+            i += 1;
+            ok = (i < line.len) and lx.is_punct(&line[i], ct.P_RPAREN);
+            i += 1;
+            break;
+        }
         if (i < line.len) and lx.is_punct(&line[i], ct.P_RPAREN) {
             i += 1;
             break;
@@ -1045,10 +1175,22 @@ fn define_body(P: *mut PP, m: *mut Macro, line: []lx.PTok, i: usize, sp: u.Span)
     return true;
 }
 
+fn poisoned(sp: u.Span, name: []u8) void {
+    _ = dg.err(sp, "C1086", u.f1("'%s' is poisoned (#pragma GCC poison)", name));
+}
+
 fn do_define(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
     if line.len == 0 {
         _ = dg.err(sp, "C1052", "macro names must be identifiers, after #define");
         return;
+    }
+    if P.poisoned.len > 0 {
+        for t in line {
+            if (t.kind == lx.PK_IDENT) and (P.poisoned.get(t.name) != 0) {
+                poisoned(t.span, t.name);
+                return;
+            }
+        }
     }
     let nt = &line[0];
     if not definable(P, nt, "define") {
@@ -1285,6 +1427,21 @@ fn join(d: []u8, name: []u8) []u8 {
 // or nil: "..." is looked for next to the including file first, then both
 // forms in the -I directories and the compiler's headers.
 fn find_file(P: *mut PP, name: []u8, quoted: bool) []u8 {
+    P.found_index = -1;
+    if (name.len > 0) and (name[0] != '/') and quoted {
+        let p = join(dir_of(cur_src(P).path), name);
+        if u.is_file(p) {
+            return p;
+        }
+    }
+    return find_file_from(P, name, 0);
+}
+
+// The file `name` in the include path, from its entry `from` on: the -I
+// directories in order (0, 1, ...), then the compiler's headers; or nil.
+// P.found_index is where it was found (-1: an absolute path).
+fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
+    P.found_index = -1;
     if name.len == 0 {
         return u.nosym();
     }
@@ -1294,23 +1451,32 @@ fn find_file(P: *mut PP, name: []u8, quoted: bool) []u8 {
         }
         return u.nosym();
     }
-    if quoted {
-        let p = join(dir_of(cur_src(P).path), name);
-        if u.is_file(p) {
-            return p;
+    let n = @int_cast(i32, P.o.include_dirs.len);
+    let mut k = from;
+    while k <= n {
+        let mut d = P.o.sys_include;
+        if k < n {
+            d = P.o.include_dirs[@int_cast(usize, k)];
         }
-    }
-    for d in P.o.include_dirs {
         let p = join(d, name);
         if u.is_file(p) {
+            P.found_index = k;
             return p;
         }
-    }
-    let p = join(P.o.sys_include, name);
-    if u.is_file(p) {
-        return p;
+        k += 1;
     }
     return u.nosym();
+}
+
+// Where #include_next (and __has_include_next) searches from: the entry of
+// the include path after the current file's, or (a file not found by the
+// path) the first.
+fn next_index(P: *mut PP) i32 {
+    let d = cur_src(P).dir_index;
+    if d < 0 {
+        return 0;
+    }
+    return d + 1;
 }
 
 // The header name of #include, #embed, __has_include or __has_embed from
@@ -1379,18 +1545,36 @@ fn load(P: *mut PP, path: []u8) *mut u.SourceFile {
 
 fn push_file(P: *mut PP, sf: *mut u.SourceFile, presumed: []u8) void {
     let L = lx.open(sf, P.o.std);
-    P.files.push(Src.{ L: L, path: sf.path, presumed: presumed, line_delta: 0, cond_base: P.conds.len });
+    P.files.push(Src.{ L: L, path: sf.path, dir_index: -1, presumed: presumed, line_delta: 0, cond_base: P.conds.len });
+    cp.enter_file(sf.id);
 }
 
-fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
+// The key of a file for #pragma once: its real path.
+fn once_key(path: []u8) []u8 {
+    let r = u.real_path(path);
+    if u.isnos(r) {
+        return u.intern(path);
+    }
+    return u.intern(r);
+}
+
+// #include, or (next: a GNU dialect's #include_next) the next file of the
+// name in the include path after the current file's directory.
+fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
     let mut k: usize = 0;
     let hn = header_operand(P, line, &mut k, false, sp);
     if u.isnos(hn) {
         return;
     }
-    extra(line, k, "include");
+    extra(line, k, u.pick(next, "include_next", "include"));
     let name = hn[1..hn.len - 1];
-    let path = find_file(P, name, hn[0] == '"');
+    let mut path = u.nosym();
+    if next {
+        path = find_file_from(P, name, next_index(P));
+    } else {
+        path = find_file(P, name, hn[0] == '"');
+    }
+    let found = P.found_index;
     if u.isnos(path) {
         let mut msg = u.f1("cannot find include file %s", hn);
         if (name.len > 0) and u.is_dir(join(dir_of(cur_src(P).path), name)) {
@@ -1405,6 +1589,9 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
         P.fatal = true;
         return;
     }
+    if (P.once.len > 0) and (P.once.get(once_key(path)) != 0) {
+        return;  // (#pragma once)
+    }
     let sf = load(P, path);
     if u.isnil(sf) {
         _ = dg.err(sp, "C1081", u.f1("cannot read include file %s", hn));
@@ -1412,6 +1599,7 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
         return;
     }
     push_file(P, sf, path);
+    cur_src(P).dir_index = found;
 }
 
 struct EmbedParams {
@@ -1597,6 +1785,416 @@ fn do_embed(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
 }
 
 // -----------------------------------------------------------------------------
+// Pragmas (6.10.6 and 6.10.9; docs/c.md lists them), in every mode. One that
+// changes a value the parser needs (pack, GCC visibility) gives a token for
+// it (lx.PK_PRAGMA); the others act here, or are recorded (cpragma.ax).
+// Unknown pragmas are ignored, with the warning C4111 under
+// --c-warn-unknown-pragmas; a malformed known one is ignored with C4112.
+// -----------------------------------------------------------------------------
+fn no_tok() lx.PTok {
+    return lx.mktok(lx.PK_EOF, 0, "", u.mkspan(0, 0, 0));
+}
+
+fn pragma_tok(kind: i32, value: u64, sp: u.Span) lx.PTok {
+    return lx.mktok(lx.PK_PRAGMA, cp.event(kind, value), "", sp);
+}
+
+fn malformed(sp: u.Span, what: []u8) lx.PTok {
+    _ = dg.warning(sp, "C4112", u.f1("malformed '#pragma %s', ignored", what));
+    return no_tok();
+}
+
+// The characters of a string literal's spelling as _Pragma takes them
+// (6.10.9): the prefix and the quotes dropped, \" and \\ made " and \.
+fn destringize(text: []u8) []u8 {
+    let mut a: usize = 0;
+    while (a < text.len) and (text[a] != '"') {
+        a += 1;
+    }
+    let mut b = u.Buf.init();
+    let mut i = a + 1;
+    while (i + 1) < text.len {
+        let c = text[i];
+        if (c == '\\') and ((i + 2) < text.len) and ((text[i + 1] == '"') or (text[i + 1] == '\\')) {
+            b.c(text[i + 1]);
+            i += 2;
+            continue;
+        }
+        b.c(c);
+        i += 1;
+    }
+    return b.done();
+}
+
+// The characters of a narrow string literal's spelling (escape sequences decoded).
+fn string_text(P: *PP, t: *lx.PTok) []u8 {
+    let mut units = u.List.[u32].empty();
+    _ = cv.decode(t.text[1..t.text.len - 1], ct.ENC_NONE, P.o, t.span, &mut units, false);
+    let mut b = u.Buf.init();
+    for x in units.items() {
+        b.c(@truncate(u8, x));
+    }
+    units.deinit();
+    return b.done();
+}
+
+// `( "text" )` or `"text"` (adjacent strings joined): the text, or nil.
+fn pragma_string(P: *PP, ts0: []lx.PTok) []u8 {
+    let mut ts = ts0;
+    if (ts.len >= 2) and lx.is_punct(&ts[0], ct.P_LPAREN) and lx.is_punct(&ts[ts.len - 1], ct.P_RPAREN) {
+        ts = ts[1..ts.len - 1];
+    }
+    if ts.len == 0 {
+        return u.nosym();
+    }
+    let mut b = u.Buf.init();
+    for k in 0..ts.len {
+        if (ts[k].kind != lx.PK_STRING) or (ts[k].id != ct.ENC_NONE) {
+            return u.nosym();
+        }
+        b.s(string_text(P, &ts[k]));
+    }
+    return b.done();
+}
+
+// A pragma's tokens ts (its name first) at sp: what it says done or recorded.
+fn do_pragma(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    if (ts.len == 0) or (ts[0].kind != lx.PK_IDENT) {
+        if ts.len > 0 {
+            unknown_pragma(P, ts, sp);
+        }
+        return no_tok();
+    }
+    let n = ts[0].name;
+    if u.str_eq(n, "once") {
+        P.once.put(once_key(cur_src(P).path), 1);
+        return no_tok();
+    }
+    if u.str_eq(n, "pack") {
+        return pragma_pack(P, ts[1..], sp);
+    }
+    if u.str_eq(n, "push_macro") or u.str_eq(n, "pop_macro") {
+        let name = pragma_string(P, ts[1..]);
+        if u.isnos(name) or (name.len == 0) {
+            return malformed(sp, n);
+        }
+        macro_stack(P, u.intern(name), u.str_eq(n, "push_macro"));
+        return no_tok();
+    }
+    if u.str_eq(n, "weak") {
+        if (ts.len == 2) and (ts[1].kind == lx.PK_IDENT) {
+            cp.add_weak(ts[1].name, "", sp);
+        } else if (ts.len == 4) and (ts[1].kind == lx.PK_IDENT) and lx.is_punct(&ts[2], ct.P_ASSIGN) and
+                  (ts[3].kind == lx.PK_IDENT) {
+            cp.add_weak(ts[1].name, ts[3].name, sp);
+        } else {
+            return malformed(sp, "weak");
+        }
+        return no_tok();
+    }
+    if u.str_eq(n, "message") {
+        // (its operand is macro-replaced)
+        let text = pragma_string(P, expand_list(P, ts[1..]));
+        if u.isnos(text) {
+            return malformed(sp, "message");
+        }
+        _ = dg.warning(sp, "C4110", u.cat2("#pragma message: ", text));
+        return no_tok();
+    }
+    if u.str_eq(n, "STDC") {
+        pragma_stdc(P, ts[1..], sp);
+        return no_tok();
+    }
+    if u.str_eq(n, "GCC") and (ts.len >= 2) and (ts[1].kind == lx.PK_IDENT) {
+        return pragma_gcc(P, ts[1..], sp);
+    }
+    unknown_pragma(P, ts, sp);
+    return no_tok();
+}
+
+fn unknown_pragma(P: *PP, ts: []lx.PTok, sp: u.Span) void {
+    if P.o.warn_pragmas {
+        _ = dg.warning(sp, "C4111", u.f1("unknown pragma '%s', ignored", spelling(ts)));
+    }
+}
+
+// #pragma push_macro("name") and pop_macro("name"): name's definition (or
+// that it has none) saved, or the last one saved made its definition again.
+fn macro_stack(P: *mut PP, name: []u8, push: bool) void {
+    let mut st = P.pushed.get(name);
+    if push {
+        if u.isnil(st) {
+            st = u.new.[MacroStack]();
+            P.pushed.put(name, st);
+        }
+        st.defs.push(lookup(P, name));
+        return;
+    }
+    if u.notnil(st) and (st.defs.len > 0) {
+        let m = st.defs.pop();
+        let cur = lookup(P, name);
+        if u.notnil(cur) and cur.protected {
+            return;
+        }
+        P.macros.put(name, m);
+    }
+}
+
+// The value of `#pragma pack(n)`: 1, 2, 4, 8 or 16, or 0 if t is none.
+fn pack_value(t: *lx.PTok) u64 {
+    if (t.kind != lx.PK_NUMBER) or not all_digits(t.text) {
+        return 0;
+    }
+    let v = u.atol(t.text);
+    if (v == 1) or (v == 2) or (v == 4) or (v == 8) or (v == 16) {
+        return @bit_cast(u64, v);
+    }
+    return 0;
+}
+
+// #pragma pack(): `()`, `(n)`, `(push)`, `(push, n)`, `(push, id)`,
+// `(push, id, n)`, `(pop)`, `(pop, id)`, `(pop, n)`, `(show)`. The value
+// it sets: the strictest alignment a structure's members then get.
+fn pragma_pack(P: *mut PP, ts0: []lx.PTok, sp: u.Span) lx.PTok {
+    if (ts0.len < 2) or not lx.is_punct(&ts0[0], ct.P_LPAREN) or not lx.is_punct(&ts0[ts0.len - 1], ct.P_RPAREN) {
+        return malformed(sp, "pack");
+    }
+    // the operands, without their commas
+    let mut ops = u.List.[lx.PTok].empty();
+    let inner = ts0[1..ts0.len - 1];
+    for k in 0..inner.len {
+        if (k % 2) == 1 {
+            if not lx.is_punct(&inner[k], ct.P_COMMA) {
+                return malformed(sp, "pack");
+            }
+            continue;
+        }
+        ops.push(inner[k]);
+    }
+    if (inner.len > 0) and ((inner.len % 2) == 0) {
+        return malformed(sp, "pack");
+    }
+    let os = ops.items();
+    if os.len == 0 {
+        P.pack = 0;
+        return pragma_tok(cp.EV_PACK, 0, sp);
+    }
+    if (os[0].kind == lx.PK_NUMBER) and (os.len == 1) {
+        let v = pack_value(&os[0]);
+        if v == 0 {
+            return malformed(sp, "pack");
+        }
+        P.pack = v;
+        return pragma_tok(cp.EV_PACK, v, sp);
+    }
+    if os[0].kind != lx.PK_IDENT {
+        return malformed(sp, "pack");
+    }
+    let what = os[0].name;
+    if u.str_eq(what, "show") and (os.len == 1) {
+        let mut v = "the types' alignments (no value)";
+        if P.pack != 0 {
+            v = u.udec(P.pack);
+        }
+        _ = dg.warning(sp, "C4114", u.cat2("#pragma pack: ", v));
+        return no_tok();
+    }
+    if u.str_eq(what, "push") and (os.len <= 3) {
+        let mut id: []u8 = "";
+        let mut v = P.pack;
+        for k in 1..os.len {
+            if (os[k].kind == lx.PK_IDENT) and (k == 1) {
+                id = os[k].name;
+            } else if (os[k].kind == lx.PK_NUMBER) and (k == (os.len - 1)) {
+                v = pack_value(&os[k]);
+                if v == 0 {
+                    return malformed(sp, "pack");
+                }
+            } else {
+                return malformed(sp, "pack");
+            }
+        }
+        P.packs.push(Pack.{ value: P.pack, id: id });
+        P.pack = v;
+        return pragma_tok(cp.EV_PACK, v, sp);
+    }
+    if u.str_eq(what, "pop") and (os.len <= 2) {
+        if (os.len == 2) and (os[1].kind == lx.PK_IDENT) {
+            // (back to the entry pushed with that name, and past it)
+            let mut k = P.packs.len;
+            while k > 0 {
+                k -= 1;
+                if u.str_eq(P.packs.get(k).id, os[1].name) {
+                    P.pack = P.packs.get(k).value;
+                    P.packs.len = k;
+                    break;
+                }
+            }
+        } else if P.packs.len > 0 {
+            P.pack = P.packs.pop().value;
+        }
+        if (os.len == 2) and (os[1].kind == lx.PK_NUMBER) {
+            let v = pack_value(&os[1]);
+            if v == 0 {
+                return malformed(sp, "pack");
+            }
+            P.pack = v;
+        }
+        return pragma_tok(cp.EV_PACK, P.pack, sp);
+    }
+    return malformed(sp, "pack");
+}
+
+// #pragma STDC FP_CONTRACT, FENV_ACCESS, CX_LIMITED_RANGE (on-off-switch),
+// and C23's FENV_ROUND (a direction). Not macro-replaced (6.10.6p2).
+// No floating operations are ever contracted (an FMA is only made where the
+// program calls fma), so FP_CONTRACT ON and OFF both hold; the
+// floating-point environment cannot be changed or tested, so FENV_ACCESS
+// OFF holds and ON is warned about (C4113: the optimizer assumes the
+// default environment); CX_LIMITED_RANGE is accepted (it allows what the
+// implementation may then do, and asks for nothing); FENV_ROUND
+// FE_TONEAREST and FE_DYNAMIC hold, the other directions are C4113.
+fn pragma_stdc(P: *PP, ts: []lx.PTok, sp: u.Span) void {
+    _ = P;
+    if (ts.len != 2) or (ts[0].kind != lx.PK_IDENT) or (ts[1].kind != lx.PK_IDENT) {
+        _ = malformed(sp, "STDC");
+        return;
+    }
+    let n = ts[0].name;
+    let v = ts[1].name;
+    if u.str_eq(n, "FENV_ROUND") {
+        if u.str_eq(v, "FE_TONEAREST") or u.str_eq(v, "FE_DYNAMIC") {
+            return;
+        }
+        if u.str_eq(v, "FE_UPWARD") or u.str_eq(v, "FE_DOWNWARD") or u.str_eq(v, "FE_TOWARDZERO") or
+           u.str_eq(v, "FE_TONEARESTFROMZERO") {
+            _ = dg.warning(sp, "C4113",
+                           u.f1("'#pragma STDC FENV_ROUND %s' is not honoured: floating operations round to nearest",
+                                v));
+            return;
+        }
+        _ = malformed(sp, "STDC FENV_ROUND");
+        return;
+    }
+    let sw = u.str_eq(v, "ON") or u.str_eq(v, "OFF") or u.str_eq(v, "DEFAULT");
+    if not sw or not (u.str_eq(n, "FP_CONTRACT") or u.str_eq(n, "FENV_ACCESS") or u.str_eq(n, "CX_LIMITED_RANGE")) {
+        _ = malformed(sp, "STDC");
+        return;
+    }
+    if u.str_eq(n, "FENV_ACCESS") and u.str_eq(v, "ON") {
+        _ = dg.warning(sp, "C4113",
+                       "'#pragma STDC FENV_ACCESS ON' is not honoured: the floating-point environment is the default one, which the optimizer assumes");
+    }
+}
+
+// #pragma GCC diagnostic, visibility, poison, system_header, warning, error;
+// the other `#pragma GCC` forms (optimization settings, loop hints) are ignored.
+fn pragma_gcc(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    let n = ts[0].name;
+    if u.str_eq(n, "diagnostic") {
+        if (ts.len == 2) and (ts[1].kind == lx.PK_IDENT) and
+           (u.str_eq(ts[1].name, "push") or u.str_eq(ts[1].name, "pop")) {
+            cp.diagnostic(sp, ts[1].name, "");
+            return no_tok();
+        }
+        if (ts.len == 3) and (ts[1].kind == lx.PK_IDENT) and (ts[2].kind == lx.PK_STRING) and
+           (u.str_eq(ts[1].name, "ignored") or u.str_eq(ts[1].name, "warning") or u.str_eq(ts[1].name, "error")) {
+            let code = cp.option_code(string_text(P, &ts[2]));
+            if not u.isnos(code) {
+                cp.diagnostic(sp, ts[1].name, code);
+            }
+            return no_tok();
+        }
+        if (ts.len >= 2) and (ts[1].kind == lx.PK_IDENT) and u.str_eq(ts[1].name, "ignored_attributes") {
+            return no_tok();
+        }
+        return malformed(sp, "GCC diagnostic");
+    }
+    if u.str_eq(n, "visibility") {
+        if (ts.len == 2) and (ts[1].kind == lx.PK_IDENT) and u.str_eq(ts[1].name, "pop") {
+            let mut v: u64 = 0;
+            if P.vis.len > 0 {
+                _ = P.vis.pop();
+            }
+            if P.vis.len > 0 {
+                v = P.vis.last();
+            }
+            return pragma_tok(cp.EV_VISIBILITY, v, sp);
+        }
+        if (ts.len == 5) and (ts[1].kind == lx.PK_IDENT) and u.str_eq(ts[1].name, "push") and
+           lx.is_punct(&ts[2], ct.P_LPAREN) and (ts[3].kind == lx.PK_IDENT) and lx.is_punct(&ts[4], ct.P_RPAREN) {
+            let names = ["default", "hidden", "protected", "internal"];
+            for k in 0..names.len {
+                if u.str_eq(ts[3].name, names[k]) {
+                    P.vis.push(@as(u64, k));
+                    return pragma_tok(cp.EV_VISIBILITY, @as(u64, k), sp);
+                }
+            }
+        }
+        return malformed(sp, "GCC visibility");
+    }
+    if u.str_eq(n, "poison") {
+        for k in 1..ts.len {
+            if ts[k].kind != lx.PK_IDENT {
+                return malformed(sp, "GCC poison");
+            }
+        }
+        for k in 1..ts.len {
+            P.poisoned.put(ts[k].name, 1);
+        }
+        return no_tok();
+    }
+    if u.str_eq(n, "system_header") {
+        // (not in the main file, where it means nothing)
+        if P.files.len > 1 {
+            cp.system_header(sp);
+        }
+        return no_tok();
+    }
+    if u.str_eq(n, "warning") or u.str_eq(n, "error") {
+        let text = pragma_string(P, expand_list(P, ts[1..]));
+        if u.isnos(text) {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+        if u.str_eq(n, "error") {
+            _ = dg.err(sp, "C1040", u.cat2("#pragma GCC error: ", text));
+        } else {
+            _ = dg.warning(sp, "C4103", u.cat2("#pragma GCC warning: ", text));
+        }
+        return no_tok();
+    }
+    let known = ["push_options", "pop_options", "reset_options", "optimize", "target", "unroll", "ivdep", "novector",
+                 "dependency"];
+    for k in known {
+        if u.str_eq(n, k) {
+            return no_tok();
+        }
+    }
+    unknown_pragma(P, ts, sp);
+    return no_tok();
+}
+
+// __TIMESTAMP__ of the file at path: when it was last modified, in UTC, as
+// asctime writes a time ("Sun Sep 16 01:03:52 1973").
+fn timestamp(path: []u8) []u8 {
+    let ns = u.file_mtime(path);
+    if ns < 0 {
+        return "??? ??? ?? ??:??:?? ????";
+    }
+    let secs = ns / 1000000000;
+    let mut date = "";
+    let mut time = "";
+    date_time(secs, &mut date, &mut time);
+    let days = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let mut d = (secs / 86400) % 7;
+    if d < 0 {
+        d += 7;
+    }
+    // (date is "Mmm dd yyyy")
+    return u.f4("%s %s %s %s", days[@int_cast(usize, d)], date[0..6], time, date[7..]);
+}
+
+// -----------------------------------------------------------------------------
 // #line, the others
 // -----------------------------------------------------------------------------
 fn all_digits(s: []u8) bool {
@@ -1683,15 +2281,28 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
     } else if u.str_eq(name, "undef") {
         do_undef(P, ts, sp);
     } else if u.str_eq(name, "include") {
-        do_include(P, ts, sp);
+        do_include(P, ts, sp, false);
+    } else if u.str_eq(name, "include_next") and P.o.gnu {
+        do_include(P, ts, sp, true);
     } else if u.str_eq(name, "line") {
         do_line(P, ts, sp);
     } else if u.str_eq(name, "error") {
         _ = dg.err(sp, "C1040", u.cat2("#error ", spelling(ts)));
-    } else if u.str_eq(name, "warning") and (std >= co.C23) {
+    } else if u.str_eq(name, "warning") and ((std >= co.C23) or P.o.gnu) {
         _ = dg.warning(sp, "C4103", u.cat2("#warning ", spelling(ts)));
+    } else if u.str_eq(name, "ident") and P.o.gnu {
+        // (a GNU dialect's #ident "text": the text is not kept)
+        if (ts.len != 1) or (ts[0].kind != lx.PK_STRING) {
+            _ = dg.err(sp, "C1041", "#ident takes a string literal");
+        }
     } else if u.str_eq(name, "pragma") {
-        // (pragmas are ignored, the standard ones too)
+        let pt = do_pragma(P, ts, sp);
+        if pt.kind == lx.PK_PRAGMA {
+            let one = u.newn.[lx.PTok](1);
+            one[0] = pt;
+            P.inject = one;
+            P.inject_pos = 0;
+        }
     } else if u.str_eq(name, "embed") and (std >= co.C23) {
         do_embed(P, ts, sp);
     } else {
@@ -1793,6 +2404,14 @@ fn predefined_text(P: *PP) []u8 {
         b.s("#define __STDC_EMBED_NOT_FOUND__ 0\n#define __STDC_EMBED_FOUND__ 1\n#define __STDC_EMBED_EMPTY__ 2\n");
     }
     b.s("#define __AXIOM__ 1\n");
+    if o.gnu {
+        // (a GNU dialect: its extensions, but no __GNUC__, which would claim
+        // every extension of another compiler: docs/c.md)
+        b.s("#define __AXIOM_GNU__ 1\n");
+        // (the memory orders of the __atomic builtins)
+        b.s("#define __ATOMIC_RELAXED 0\n#define __ATOMIC_CONSUME 1\n#define __ATOMIC_ACQUIRE 2\n");
+        b.s("#define __ATOMIC_RELEASE 3\n#define __ATOMIC_ACQ_REL 4\n#define __ATOMIC_SEQ_CST 5\n");
+    }
     if not o.char_signed {
         b.s("#define __CHAR_UNSIGNED__ 1\n");
     }
@@ -1842,6 +2461,9 @@ fn text_file(name: []u8, text: []u8) *mut u.SourceFile {
 
 fn out_tok(P: *mut PP, t0: lx.PTok) void {
     let mut t = t0;
+    if (P.poisoned.len > 0) and (t.kind == lx.PK_IDENT) and not t.exp and (P.poisoned.get(t.name) != 0) {
+        poisoned(t.span, t.name);
+    }
     if P.pend_bol {
         t.bol = true;
         P.pend_bol = false;
@@ -1889,14 +2511,28 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     P.eof_tok = lx.mktok(lx.PK_EOF, 0, "", u.mkspan(0, 0, 0));
     P.eof_tok.bol = true;
     P.inject = u.nil_slice.[lx.PTok]();
+    lx.gnu = o.gnu;
     add_builtin(P, "__LINE__", B_LINE);
     add_builtin(P, "__FILE__", B_FILE);
     // (before C99 _Pragma is a reserved identifier: an operator there is reported)
     add_builtin(P, "_Pragma", B_PRAGMA);
+    cp.begin_unit();
+    P.base_file = path;
+    add_builtin(P, "__has_include", B_HAS_INCLUDE);
+    add_builtin(P, "__has_attribute", B_HAS_GNU_ATTR);
+    add_builtin(P, "__has_builtin", B_HAS_BUILTIN);
     if o.std >= co.C23 {
-        add_builtin(P, "__has_include", B_HAS_INCLUDE);
         add_builtin(P, "__has_embed", B_HAS_EMBED);
+    }
+    if (o.std >= co.C23) or o.gnu {
         add_builtin(P, "__has_c_attribute", B_HAS_ATTR);
+    }
+    if o.gnu {
+        add_builtin(P, "__has_include_next", B_HAS_INCLUDE_NEXT);
+        add_builtin(P, "__COUNTER__", B_COUNTER);
+        add_builtin(P, "__INCLUDE_LEVEL__", B_INCLUDE_LEVEL);
+        add_builtin(P, "__BASE_FILE__", B_BASE_FILE);
+        add_builtin(P, "__TIMESTAMP__", B_TIMESTAMP);
     }
     // the predefined macros, then -D and -U
     push_file(P, text_file("<built-in>", predefined_text(P)), "<built-in>");
@@ -1924,9 +2560,10 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
 }
 
 /// The preprocessed text of `toks`, as --emit=c-pp writes it: the tokens'
-/// spellings, on the lines and with the spacing they had.
+/// spellings, on the lines and with the spacing they had, and the pragmas
+/// later phases read (pack, GCC visibility, weak).
 pub fn text_of(toks: []ct.Token) []u8 {
-    return cout.text(toks);
+    return cout.text(toks, cp.lines());
 }
 
 /// The tokens, one to a line with their values (--emit=c-tokens, for tests).

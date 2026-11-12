@@ -1,0 +1,454 @@
+// =============================================================================
+// cgen_gbuiltin.ax - IR generation for the GNU dialects' builtins
+// (csema_gbuiltin.ax types them; the atomic ones are cgen_gatomic.ax's):
+// a call's arguments are evaluated in order (vs), then the operation.
+//
+//   clz, ctz           IN_CTLZ, IN_CTTZ (of 0: the type's width; the builtins leave it undefined)
+//   popcount, parity   IN_CTPOP (and its low bit)
+//   ffs, clrsb         from them; bswap by shifts and masks (the optimizer may make one instruction)
+//   memcpy, memmove, memset   the IR's memory operations; their value is the destination
+//   abs, fabs, sqrt, floor, ceil, trunc, rint, nearbyint, copysign, fma   the IR's operations (sqrt sets no errno)
+//   alloca             IN_STACK_ALLOC: memory of the function's frame, until it returns
+//   frame_address(0)   the frame record's address (native), or the stack pointer (WebAssembly)
+//   return_address(0)  the frame record's return address (native), or a null pointer (WebAssembly)
+//   expect, prefetch, assume_aligned   their (first) operand, or nothing
+//   isnan ... fpclassify, isgreater ... isunordered   comparisons that raise no exception on a quiet NaN
+//
+// A long double wider than double (cty.is_wide: in memory, cgen_ld.ax) has
+// no IR operations: fabs and copysign change its sign bit, the classifiers
+// read its exponent and significand, the comparisons are cgen_ld.ax's, and
+// csema_gbuiltin.ax makes the others calls of the library's functions.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "cgen_gatomic.ax" as gat;
+import "cgen_ld.ax" as gld;
+import "csema_gbuiltin.ax" as gb;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+fn B() *mut ir.Builder {
+    return cg.B;
+}
+
+fn none() []mut *mut ir.Value {
+    let xs = u.newn.[*mut ir.Value](1);
+    return xs[0..0];
+}
+
+fn intr1(id: i32, x: *mut ir.Value) *mut ir.Value {
+    let mut a: [1]*mut ir.Value = [x];
+    return ir.intr(B(), id, x.ty, a[..]);
+}
+
+fn intr2(id: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let mut a: [2]*mut ir.Value = [x, y];
+    return ir.intr(B(), id, x.ty, a[..]);
+}
+
+// Integer v as one of IR type t (cut, or extended: sg).
+fn resize(v: *mut ir.Value, t: *mut ir.Ty, sg: bool) *mut ir.Value {
+    if v.ty.bits == t.bits {
+        return v;
+    }
+    if v.ty.bits > t.bits {
+        return ir.trunc(B(), v, t);
+    }
+    if sg {
+        return ir.sext(B(), v, t);
+    }
+    return ir.zext(B(), v, t);
+}
+
+fn i1_int(c: *mut ir.Value) *mut ir.Value {
+    return ir.zext(B(), c, cg.lty(cty.t_int));
+}
+
+/// Computes the counts, checks and stores of <stdckdint.h>'s ckd_ operation
+/// `id` (csema_builtin.BI_CKD_*) into *r of type rt (set by cgen_va.ax).
+pub let mut ckd: fn(i32, *mut ir.Value, *mut cty.CType, *mut ir.Value, *mut cty.CType, *mut ir.Value,
+                    *mut cty.CType) *mut ir.Value = no_ckd;
+
+fn no_ckd(id: i32, r: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, at: *mut cty.CType, b: *mut ir.Value,
+          bt: *mut cty.CType) *mut ir.Value {
+    _ = id;
+    _ = r;
+    _ = rt;
+    _ = a;
+    _ = at;
+    _ = b;
+    _ = bt;
+    return ir.vnil();
+}
+
+/// The value of GNU builtin call e (e.op: a GB_ number) with argument values vs.
+pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    let id = e.op;
+    if id >= gb.GB_ATOMIC {
+        return gat.gen(e, vs);
+    }
+    if (id == gb.GB_EXPECT) or (id == gb.GB_ASSUME_ALIGNED) {
+        return vs[0];
+    }
+    if id == gb.GB_PREFETCH {
+        return ir.vnil();
+    }
+    if id == gb.GB_TRAP {
+        _ = ir.intr(B(), ir.IN_TRAP, cg.T_void, none());
+        ir.unreachable(B());
+        cg.continue_after();
+        return ir.vnil();
+    }
+    if (id >= gb.GB_CLZ) and (id <= gb.GB_BSWAP) {
+        return bits(id, vs[0], e.ty);
+    }
+    if (id >= gb.GB_OV_P) and (id <= gb.GB_OV_P + 2) {
+        // (into a temporary of the third operand's type)
+        let rt = cty.unqual(e.args.get(2).ty);
+        let tmp = cg.alloca(rt, "overflow");
+        return ckd(30 + (id - gb.GB_OV_P), tmp, rt, vs[0], e.args.get(0).ty, vs[1], e.args.get(1).ty);
+    }
+    if (id == gb.GB_MEMCPY) or (id == gb.GB_MEMMOVE) {
+        let mut op = ir.OP_MEMMOVE;
+        if id == gb.GB_MEMCPY {
+            op = ir.OP_MEMCPY;
+        }
+        _ = ir.memop(B(), op, vs[0], vs[1], vs[2]);
+        return vs[0];
+    }
+    if id == gb.GB_MEMSET {
+        _ = ir.memop(B(), ir.OP_MEMSET, vs[0], ir.trunc(B(), vs[1], cg.T_i8), vs[2]);
+        return vs[0];
+    }
+    if id == gb.GB_ABS {
+        return intr1(ir.IN_ABS, vs[0]);
+    }
+    if (id >= gb.GB_FABS) and (id <= gb.GB_FMA) {
+        let ops: [9]i32 = [ir.IN_FABS, ir.IN_SQRT, ir.IN_FLOOR, ir.IN_CEIL, ir.IN_FTRUNC, ir.IN_NEAREST, ir.IN_COPYSIGN,
+                           ir.IN_FMA, 0];
+        let k = @int_cast(usize, id - gb.GB_FABS);
+        if cty.is_wide(e.ty) and (id == gb.GB_FABS) {
+            return wide_sign(vs[0], ir.vnil());
+        }
+        if cty.is_wide(e.ty) and (id == gb.GB_COPYSIGN) {
+            return wide_sign(vs[0], vs[1]);
+        }
+        if id == gb.GB_COPYSIGN {
+            return intr2(ir.IN_COPYSIGN, vs[0], vs[1]);
+        }
+        if id == gb.GB_FMA {
+            let mut a: [3]*mut ir.Value = [vs[0], vs[1], vs[2]];
+            return ir.intr(B(), ir.IN_FMA, vs[0].ty, a[..]);
+        }
+        return intr1(ops[k], vs[0]);
+    }
+    if id == gb.GB_ALLOCA {
+        return alloca(e, vs);
+    }
+    if (id == gb.GB_FRAME_ADDR) or (id == gb.GB_RETURN_ADDR) {
+        if cg.is_wasm {
+            if id == gb.GB_RETURN_ADDR {
+                return ir.czero(cg.T_ptr);
+            }
+            return ir.intr(B(), ir.IN_GET_SP, cg.T_ptr, none());
+        }
+        let fa = ir.intr(B(), ir.IN_FRAME_ADDR, cg.T_ptr, none());
+        if id == gb.GB_FRAME_ADDR {
+            return fa;
+        }
+        // (the frame record: the caller's frame address, then the return address)
+        let ra = ir.load(B(), cg.T_ptr, ir.ptradd(B(), fa, cg.usz(cty.ptr_bytes)));
+        ra.align = @truncate(u32, cty.ptr_bytes);
+        return ra;
+    }
+    if cty.is_wide(e.args.get(e.args.len - 1).ty) {
+        return wide_classify(id, vs);
+    }
+    return classify(id, vs);
+}
+
+fn bits(id: i32, x: *mut ir.Value, rt: *mut cty.CType) *mut ir.Value {
+    let t = x.ty;
+    let w = t.bits;
+    let it = cg.lty(rt);
+    if id == gb.GB_CLZ {
+        return resize(intr1(ir.IN_CTLZ, x), it, false);
+    }
+    if id == gb.GB_CTZ {
+        return resize(intr1(ir.IN_CTTZ, x), it, false);
+    }
+    if id == gb.GB_POPCOUNT {
+        return resize(intr1(ir.IN_CTPOP, x), it, false);
+    }
+    if id == gb.GB_PARITY {
+        return resize(ir.and_(B(), intr1(ir.IN_CTPOP, x), ir.cint(t, 1)), it, false);
+    }
+    if id == gb.GB_FFS {
+        // 0 for 0, else the place of the lowest bit set, from 1
+        let z = ir.icmp(B(), ir.IntEQ, x, ir.cint(t, 0));
+        let k = ir.add(B(), intr1(ir.IN_CTTZ, x), ir.cint(t, 1));
+        return resize(ir.select(B(), z, ir.cint(t, 0), k), it, false);
+    }
+    if id == gb.GB_CLRSB {
+        // the bits after the sign bit equal to it: clz(x ^ (x >> (w - 1))) - 1
+        let s = ir.binop(B(), ir.OP_ASHR, x, ir.cint(t, @as(u64, @bit_cast(u32, w - 1))));
+        let c = intr1(ir.IN_CTLZ, ir.xor(B(), x, s));
+        return resize(ir.sub(B(), c, ir.cint(t, 1)), it, false);
+    }
+    // bswap: byte i to byte n - 1 - i
+    let n = w / 8;
+    let mut r = ir.cint(t, 0);
+    for i in 0..n {
+        let byte = ir.and_(
+            B(), ir.binop(B(), ir.OP_LSHR, x, ir.cint(t, @as(u64, @bit_cast(u32, 8 * i)))), ir.cint(t, 0xFF));
+        let sh = 8 * (n - 1 - i);
+        let mut placed = byte;
+        if sh > 0 {
+            placed = ir.binop(B(), ir.OP_SHL, byte, ir.cint(t, @as(u64, @bit_cast(u32, sh))));
+        }
+        r = ir.or_(B(), r, placed);
+    }
+    return r;
+}
+
+// __builtin_alloca(n) and __builtin_alloca_with_align(n, bits): n bytes of
+// the frame (16-aligned, or more: the room for it taken).
+fn alloca(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    let mut al: u64 = 16;
+    if e.args.len == 2 {
+        let b = e.args.get(1).cval / 8;
+        if b > al {
+            al = b;
+        }
+    }
+    let mut n = vs[0];
+    if al > 16 {
+        n = ir.add(B(), n, cg.usz(al - 16));
+    }
+    let mut a: [1]*mut ir.Value = [n];
+    let mut p = ir.intr(B(), ir.IN_STACK_ALLOC, cg.T_ptr, a[..]);
+    if al > 16 {
+        let x = ir.ptrtoint(B(), p, cg.T_isz);
+        p = ir.ptradd(B(), p, ir.and_(B(), ir.sub(B(), cg.usz(0), x), cg.usz(al - 1)));
+    }
+    return p;
+}
+
+fn fp(t: *mut ir.Ty, v: f64) *mut ir.Value {
+    return ir.cfp(t, v);
+}
+
+fn is_nan(x: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(B(), ir.RealUNE, x, x);
+}
+
+fn sign_bit(x: *mut ir.Value) *mut ir.Value {
+    let it = ir.t_int(x.ty.bits);
+    let b = ir.bitcast(B(), x, it);
+    return ir.icmp(B(), ir.IntSLT, b, ir.cint(it, 0));
+}
+
+// The smallest normal number of x's type.
+fn min_normal(t: *mut ir.Ty) *mut ir.Value {
+    if t.bits == 32 {
+        return fp(t, 1.17549435082228750797e-38);
+    }
+    return fp(t, 2.22507385850720138309e-308);
+}
+
+fn classify(id: i32, vs: []mut *mut ir.Value) *mut ir.Value {
+    let z: f64 = 0.0;
+    if id >= gb.GB_ISGREATER {
+        let x = vs[0];
+        let y = vs[1];
+        let mut c = ir.vnil();
+        if id == gb.GB_ISGREATER {
+            c = ir.fcmp(B(), ir.RealOGT, x, y);
+        } else if id == gb.GB_ISGREATEREQUAL {
+            c = ir.fcmp(B(), ir.RealOGE, x, y);
+        } else if id == gb.GB_ISLESS {
+            c = ir.fcmp(B(), ir.RealOLT, x, y);
+        } else if id == gb.GB_ISLESSEQUAL {
+            c = ir.fcmp(B(), ir.RealOLE, x, y);
+        } else if id == gb.GB_ISLESSGREATER {
+            c = ir.or_(B(), ir.fcmp(B(), ir.RealOLT, x, y), ir.fcmp(B(), ir.RealOGT, x, y));
+        } else {
+            c = ir.or_(B(), is_nan(x), is_nan(y));
+        }
+        return i1_int(c);
+    }
+    let x = vs[vs.len - 1];
+    let t = x.ty;
+    let ax = intr1(ir.IN_FABS, x);
+    let inf = fp(t, 1.0 / z);
+    let is_inf = ir.fcmp(B(), ir.RealOEQ, ax, inf);
+    let normal = ir.and_(B(), ir.fcmp(B(), ir.RealOGE, ax, min_normal(t)), ir.fcmp(B(), ir.RealOLT, ax, inf));
+    if id == gb.GB_ISNAN {
+        return i1_int(is_nan(x));
+    }
+    if id == gb.GB_ISINF {
+        return i1_int(is_inf);
+    }
+    if id == gb.GB_ISFINITE {
+        return i1_int(ir.fcmp(B(), ir.RealOLT, ax, inf));
+    }
+    if id == gb.GB_SIGNBIT {
+        return i1_int(sign_bit(x));
+    }
+    if id == gb.GB_ISNORMAL {
+        return i1_int(normal);
+    }
+    let it = cg.lty(cty.t_int);
+    if id == gb.GB_ISINF_SIGN {
+        let s = ir.select(B(), sign_bit(x), ir.cint(it, 0xFFFF_FFFF_FFFF_FFFF), ir.cint(it, 1));
+        return ir.select(B(), is_inf, s, ir.cint(it, 0));
+    }
+    // fpclassify(nan, inf, normal, subnormal, zero, x)
+    let zero = ir.fcmp(B(), ir.RealOEQ, x, fp(t, 0.0));
+    let mut r = ir.select(B(), zero, vs[4], vs[3]);
+    r = ir.select(B(), normal, vs[2], r);
+    r = ir.select(B(), is_inf, vs[1], r);
+    return ir.select(B(), is_nan(x), vs[0], r);
+}
+
+// -----------------------------------------------------------------------------
+// Wide long doubles (cty.is_wide): 16 bytes, little-endian. The x87 format:
+// the significand (its integer bit explicit, bit 63) in the low eight bytes,
+// the sign and the 15-bit exponent in the next two. binary128: the sign,
+// exponent and the significand's top 48 bits in the high eight bytes.
+// -----------------------------------------------------------------------------
+
+fn i64t() *mut ir.Ty {
+    return ir.t_int(64);
+}
+
+fn x87() bool {
+    return cty.ld_bits() == 80;
+}
+
+// The eight bytes at p + off.
+fn load8(p: *mut ir.Value, off: u64) *mut ir.Value {
+    let v = ir.load(B(), i64t(), ir.ptradd(B(), p, cg.usz(off)));
+    v.align = 8;
+    return v;
+}
+
+fn store8(v: *mut ir.Value, p: *mut ir.Value, off: u64) void {
+    let s = ir.store(B(), v, ir.ptradd(B(), p, cg.usz(off)));
+    s.align = 8;
+}
+
+fn c64(x: u64) *mut ir.Value {
+    return ir.cint(i64t(), x);
+}
+
+// fabs(x) (y nil) or copysign(x, y): x with its sign bit clear, or y's.
+fn wide_sign(x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let mut sb: u64 = 0x8000_0000_0000_0000;
+    if x87() {
+        sb = 0x8000;  // (the mask clears the padding too)
+    }
+    let r = gld.temp();
+    store8(load8(x, 0), r, 0);
+    let mut hi = ir.and_(B(), load8(x, 8), c64(sb - 1));
+    if u.notnil(y) {
+        hi = ir.or_(B(), hi, ir.and_(B(), load8(y, 8), c64(sb)));
+    }
+    store8(hi, r, 8);
+    return r;
+}
+
+// What a wide value is (each an i1).
+struct Class {
+    nan: *mut ir.Value,
+    inf: *mut ir.Value,
+    finite: *mut ir.Value,
+    normal: *mut ir.Value,
+    zero: *mut ir.Value,
+    sign: *mut ir.Value,
+}
+
+// The class of wide value x: by its exponent (all ones: an infinity or a
+// NaN; zero: a zero or a subnormal number) and its significand (in the x87
+// format, the bits after the integer bit for an infinity or NaN; all of
+// them for a zero, so that an encoding the x87 treats as invalid is no
+// zero and no infinity).
+fn wide_class(x: *mut ir.Value) Class {
+    let lo = load8(x, 0);
+    let hi = load8(x, 8);
+    let mut ex = ir.vnil();
+    let mut frac = ir.vnil();
+    let mut all = ir.vnil();
+    let mut sign = ir.vnil();
+    if x87() {
+        ex = ir.and_(B(), hi, c64(0x7FFF));
+        frac = ir.and_(B(), lo, c64(0x7FFF_FFFF_FFFF_FFFF));
+        all = lo;
+        sign = ir.icmp(B(), ir.IntNE, ir.and_(B(), hi, c64(0x8000)), c64(0));
+    } else {
+        ex = ir.and_(B(), ir.binop(B(), ir.OP_LSHR, hi, c64(48)), c64(0x7FFF));
+        frac = ir.or_(B(), ir.and_(B(), hi, c64(0xFFFF_FFFF_FFFF)), lo);
+        all = frac;
+        sign = ir.icmp(B(), ir.IntSLT, hi, c64(0));
+    }
+    let top = ir.icmp(B(), ir.IntEQ, ex, c64(0x7FFF));
+    let bottom = ir.icmp(B(), ir.IntEQ, ex, c64(0));
+    let fz = ir.icmp(B(), ir.IntEQ, frac, c64(0));
+    let az = ir.icmp(B(), ir.IntEQ, all, c64(0));
+    let t = ir.cint(ir.t_int(1), 1);
+    let finite = ir.xor(B(), top, t);
+    return Class.{ nan: ir.and_(B(), top, ir.xor(B(), fz, t)), inf: ir.and_(B(), top, fz), finite: finite,
+                   normal: ir.and_(B(), finite, ir.xor(B(), bottom, t)), zero: ir.and_(B(), bottom, az), sign: sign };
+}
+
+// classify's operations on wide values.
+fn wide_classify(id: i32, vs: []mut *mut ir.Value) *mut ir.Value {
+    if id >= gb.GB_ISGREATER {
+        let x = vs[0];
+        let y = vs[1];
+        if id == gb.GB_ISGREATER {
+            return i1_int(gld.compare(ct.P_GT, x, y));
+        }
+        if id == gb.GB_ISGREATEREQUAL {
+            return i1_int(gld.compare(ct.P_GE, x, y));
+        }
+        if id == gb.GB_ISLESS {
+            return i1_int(gld.compare(ct.P_LT, x, y));
+        }
+        if id == gb.GB_ISLESSEQUAL {
+            return i1_int(gld.compare(ct.P_LE, x, y));
+        }
+        if id == gb.GB_ISLESSGREATER {
+            return i1_int(ir.or_(B(), gld.compare(ct.P_LT, x, y), gld.compare(ct.P_GT, x, y)));
+        }
+        return i1_int(ir.or_(B(), wide_class(x).nan, wide_class(y).nan));
+    }
+    let c = wide_class(vs[vs.len - 1]);
+    if id == gb.GB_ISNAN {
+        return i1_int(c.nan);
+    }
+    if id == gb.GB_ISINF {
+        return i1_int(c.inf);
+    }
+    if id == gb.GB_ISFINITE {
+        return i1_int(c.finite);
+    }
+    if id == gb.GB_SIGNBIT {
+        return i1_int(c.sign);
+    }
+    if id == gb.GB_ISNORMAL {
+        return i1_int(c.normal);
+    }
+    let it = cg.lty(cty.t_int);
+    if id == gb.GB_ISINF_SIGN {
+        let s = ir.select(B(), c.sign, ir.cint(it, 0xFFFF_FFFF_FFFF_FFFF), ir.cint(it, 1));
+        return ir.select(B(), c.inf, s, ir.cint(it, 0));
+    }
+    // fpclassify(nan, inf, normal, subnormal, zero, x)
+    let mut r = ir.select(B(), c.zero, vs[4], vs[3]);
+    r = ir.select(B(), c.normal, vs[2], r);
+    r = ir.select(B(), c.inf, vs[1], r);
+    return ir.select(B(), c.nan, vs[0], r);
+}

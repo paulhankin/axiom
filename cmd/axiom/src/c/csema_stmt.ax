@@ -15,6 +15,7 @@ import "csema_decl.ax" as cd;
 import "csema_desig.ax" as cdi;
 import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
+import "csema_gnu.ax" as cgn;
 import "csema_marks.ax" as csm;
 import "csema_vla.ax" as vla;
 import "ctypes.ax" as cty;
@@ -25,7 +26,14 @@ struct Switch {
     ty: *mut cty.CType,  // the promoted type of its controlling expression
     values: u.SymMap.[i32],
     has_default: bool,
-    scope: *mut void,  // the scope its body starts in (csema_vla.mark)
+    scope: *mut void,                 // the scope its body starts in (csema_vla.mark)
+    ranges: u.List.[*mut cast.Stmt],  // its case ranges (a GNU dialect)
+}
+
+// A local label (`__label__`, a GNU dialect), in its block.
+struct Local {
+    name: []u8,
+    sym: *mut cast.CSym,
 }
 
 struct Body {
@@ -34,11 +42,36 @@ struct Body {
     labels: u.SymMap.[*mut cast.CSym],
     label_list: u.List.[*mut cast.CSym],
     switches: u.List.[*mut Switch],
-    loops: i32,      // loops around the current statement
-    breakable: i32,  // loops and switches around it
+    loops: i32,                            // loops around the current statement
+    breakable: i32,                        // loops and switches around it
+    locals: u.List.[Local],                // the local labels in scope, innermost last
+    addr_labels: u.List.[*mut cast.Stmt],  // the computed gotos (`goto *p`)
 }
 
 let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
+
+// The labels whose addresses are taken (`&&label`), by function: IR
+// generation's, for `goto *` (cgen_stmt.ax).
+let mut g_addr_labels: u.SymMap.[*mut u.List.[*mut cast.CSym]] =
+    u.SymMap.[*mut u.List.[*mut cast.CSym]].{ keys: @ptr_from_int(*mut usize, 0),
+                                              vals: @ptr_from_int(*mut *mut u.List.[*mut cast.CSym], 0), cap: 0,
+                                              len: 0 };
+
+fn addr_label_list(f: *cast.CSym) *mut u.List.[*mut cast.CSym] {
+    let k = u.addr_key(@int_from_ptr(f));
+    let mut l = g_addr_labels.get(k);
+    if u.isnil(l) {
+        l = u.new.[u.List.[*mut cast.CSym]]();
+        g_addr_labels.put(k, l);
+    }
+    return l;
+}
+
+/// The labels of function f whose addresses are taken (`&&label`, a GNU
+/// dialect), in the order of their indexes (CSym.value).
+pub fn addr_labels(f: *cast.CSym) []mut *mut cast.CSym {
+    return addr_label_list(f).items();
+}
 
 /// Analyzes the translation unit: the typed tree (csema.ax).
 pub fn analyze(t: *mut cast.Unit, o: *co.COptions) *mut cs.CUnit {
@@ -46,8 +79,12 @@ pub fn analyze(t: *mut cast.Unit, o: *co.COptions) *mut cs.CUnit {
     cs.hooks.type_name = cd.type_name;
     cs.hooks.body = function_body;
     csb.install();
+    cgn.install();
     cs.hooks.compound = cdi.compound_literal;
+    cs.hooks.stmt_expr = stmt_expr;
+    cs.hooks.label_addr = label_addr;
     let cu = cs.run(t, o);
+    cgn.pragma_weaks();
     csm.finish();
     return cu;
 }
@@ -83,6 +120,10 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
             cs.err(l.span, "C3043", u.f1("the label '%s' is used but not defined", l.name));
         } else if not l.used and not catr.maybe_unused(l) {
             cs.warn(l.span, "C4040", u.f1("the label '%s' is defined but not used", l.name));
+        } else if l.label_addr and (vla.depth(l) != 0) {
+            cs.not_supported(l.span,
+                             u.f1("the address of the label '%s', in the scope of a variable length array or of an object with a cleanup",
+                                  l.name));
         }
     }
     vla.end_body();
@@ -91,6 +132,14 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
 }
 
 fn label_sym(name: []u8, sp: u.Span) *mut cast.CSym {
+    // (a local label of a block around it first: a GNU dialect)
+    let mut k = BD.locals.len;
+    while k > 0 {
+        k -= 1;
+        if u.same(BD.locals.get(k).name, name) {
+            return BD.locals.get(k).sym;
+        }
+    }
     let mut l = BD.labels.get(name);
     if u.isnil(l) {
         l = cs.new_sym(cast.SK_LABEL, name, sp, cty.t_void);
@@ -116,13 +165,17 @@ fn stmt(s: *mut cast.Stmt) void {
     if k == cast.StmtKind.COMPOUND {
         cs.push_scope();
         let m = vla.mark();
+        let nl = BD.locals.len;
         let xs = s.items.items();
         for i in 0..xs.len {
             stmt(xs[i]);
             fallthrough(xs, i);
         }
+        BD.locals.len = nl;
         vla.leave(m);
         cs.pop_scope();
+    } else if (k == cast.StmtKind.DECL) and (s.decl.kind == cast.DeclKind.LABELS) {
+        local_labels(s.decl);
     } else if k == cast.StmtKind.DECL {
         cd.block_decl(s.decl);
         vla.declared(s.decl);
@@ -172,6 +225,8 @@ fn stmt(s: *mut cast.Stmt) void {
         loop_body(s.body);
         vla.leave(m);
         cs.pop_scope();
+    } else if (k == cast.StmtKind.GOTO) and u.notnil(s.e) {
+        computed_goto(s);
     } else if k == cast.StmtKind.GOTO {
         let l = label_sym(s.label, s.label_span);
         l.used = true;
@@ -216,7 +271,8 @@ fn is_fallthrough(s0: *cast.Stmt) bool {
         return false;
     }
     for a in s.decl.attrs.items() {
-        if (a.prefix.len == 0) and (u.str_eq(a.name, "fallthrough") or u.str_eq(a.name, "__fallthrough__")) {
+        let gnu = u.str_eq(a.prefix, "gnu") and cs.opts().gnu;
+        if ((a.prefix.len == 0) or gnu) and (u.str_eq(a.name, "fallthrough") or u.str_eq(a.name, "__fallthrough__")) {
             return true;
         }
     }
@@ -287,25 +343,177 @@ fn switch_stmt(s: *mut cast.Stmt) void {
 fn case_stmt(s: *mut cast.Stmt) void {
     let r = cx.ice(s.e, "a case label");
     s.e = r.e;
+    let mut hi = r;
+    if u.notnil(s.hi) {
+        hi = cx.ice(s.hi, "the end of a case range");
+        s.hi = hi.e;
+    }
     if BD.switches.len == 0 {
         cs.err(s.span, "C3040", "'case' is not in a switch statement");
-    } else if r.ok {
+    } else if r.ok and hi.ok {
         let sw = BD.switches.last();
         if not cty.is_error(sw.ty) {
             // the value converted to the promoted controlling type (6.8.4.2p5)
             s.cval = cty.wrap(sw.ty, r.v);
-            let key = u.intern(u.udec(s.cval));
-            if sw.values.get(key) != 0 {
-                cs.err(s.e.span, "C3041",
-                       u.f1("a second case with the value %s", u.pick(sw.ty.is_signed, u.dec(@bit_cast(i64, s.cval)),
-                                                                      u.udec(s.cval))));
+            s.cval_hi = cty.wrap(sw.ty, hi.v);
+            if u.notnil(s.hi) {
+                case_range(sw, s);
+            } else {
+                let key = u.intern(u.udec(s.cval));
+                if (sw.values.get(key) != 0) or in_range(sw, s.cval) {
+                    cs.err(s.e.span, "C3041", u.f1("a second case with the value %s", val_text(sw, s.cval)));
+                }
+                sw.values.put(key, 1);
+                sw.s.cases.push(s);
             }
-            sw.values.put(key, 1);
-            sw.s.cases.push(s);
         }
         vla.case_label(s, BD.switches.last().scope);
     }
     stmt(s.body);
+}
+
+fn val_text(sw: *Switch, v: u64) []u8 {
+    return u.pick(sw.ty.is_signed, u.dec(@bit_cast(i64, v)), u.udec(v));
+}
+
+// a <= b in the switch's promoted type.
+fn le(sw: *Switch, a: u64, b: u64) bool {
+    if sw.ty.is_signed {
+        return @bit_cast(i64, a) <= @bit_cast(i64, b);
+    }
+    return a <= b;
+}
+
+// Is v in one of the case ranges of the switch?
+fn in_range(sw: *Switch, v: u64) bool {
+    for c in sw.ranges.items() {
+        if le(sw, c.cval, v) and le(sw, v, c.cval_hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// `case lo ... hi:` (a GNU dialect): the values lo to hi, none of them
+// another case's (C3041); an empty range (lo > hi) is warning C4120 and
+// matches nothing.
+fn case_range(sw: *mut Switch, s: *mut cast.Stmt) void {
+    if not le(sw, s.cval, s.cval_hi) {
+        cs.warn(s.span, "C4120", "an empty case range: its first value is greater than its last");
+        return;
+    }
+    for c in sw.ranges.items() {
+        if le(sw, c.cval, s.cval_hi) and le(sw, s.cval, c.cval_hi) {
+            cs.err_note(s.e.span, "C3041", "a case range that overlaps another", c.span, "the other");
+            return;
+        }
+    }
+    for c in sw.s.cases.items() {
+        if (c.kind == cast.StmtKind.CASE) and u.isnil(c.hi) and le(sw, s.cval, c.cval) and le(sw, c.cval, s.cval_hi) {
+            cs.err_note(s.e.span, "C3041",
+                        u.f1("a case range that holds the value %s of another case", val_text(sw, c.cval)), c.span,
+                        "the other");
+            return;
+        }
+    }
+    sw.ranges.push(s);
+    sw.s.cases.push(s);
+}
+
+// `__label__ a, b;` (a GNU dialect): labels of the enclosing block.
+fn local_labels(d: *mut cast.Decl) void {
+    let start = BD.locals.len;
+    for dc in d.decls.items() {
+        for k in start..BD.locals.len {
+            if u.same(BD.locals.get(k).name, dc.name) {
+                cs.err(dc.name_span, "C3002", u.f1("the local label '%s' is declared twice", dc.name));
+            }
+        }
+        let l = cs.new_sym(cast.SK_LABEL, dc.name, dc.name_span, cty.t_void);
+        BD.label_list.push(l);
+        BD.locals.push(Local.{ name: dc.name, sym: l });
+    }
+}
+
+// `goto *e;` (a GNU dialect): e a pointer, to one of the function's labels
+// (`&&label`); not where a variable length array or an object with a
+// cleanup is in scope (C3901).
+fn computed_goto(s: *mut cast.Stmt) void {
+    let e = cx.rv(s.e);
+    s.e = e;
+    if u.notnil(e.ty) and not cty.is_error(e.ty) and (e.ty.kind != cty.TK_POINTER) {
+        cs.err(e.span, "C3020", u.f1("the operand of 'goto *' has type %s, not a pointer type", cs.tq(e.ty)));
+    }
+    if vla.in_scope() {
+        cs.not_supported(s.span, "'goto *' in the scope of a variable length array or of an object with a cleanup");
+    }
+    BD.addr_labels.push(s);
+}
+
+// `&&label` (a GNU dialect): the label's address, a `void *`.
+fn label_addr(e: *mut cast.Expr) *mut cast.Expr {
+    if u.isnil(BD) {
+        cs.err(e.span, "C3090", "the address of a label outside a function");
+        e.ty = cty.t_error;
+        return e;
+    }
+    let l = label_sym(e.name, e.name_span);
+    l.used = true;
+    if not l.label_addr {
+        // (its index among the function's labels whose addresses are taken)
+        l.label_addr = true;
+        l.owner = BD.f;
+        l.value = BD.f.value;
+        BD.f.value += 1;
+        addr_label_list(BD.f).push(l);
+    }
+    e.sym = l;
+    e.ty = cty.pointer_to(cty.t_void);
+    return e;
+}
+
+/// The expression statement statement s is, after its labels (the last
+/// statement of a statement expression gives its value then), or nil.
+pub fn value_stmt(s0: *mut cast.Stmt) *mut cast.Stmt {
+    let mut s = s0;
+    while ((s.kind == cast.StmtKind.LABEL) or (s.kind == cast.StmtKind.CASE) or (s.kind == cast.StmtKind.DEFAULT)) and
+          u.notnil(s.body) {
+        s = s.body;
+    }
+    if (s.kind == cast.StmtKind.EXPR) and u.notnil(s.e) and (s.attrs.len == 0) {
+        return s;
+    }
+    return u.nil.[cast.Stmt]();
+}
+
+// `({ ... })` (a GNU dialect): the block's items, in a scope of their own;
+// its value and type are those of its last item if that is an expression
+// statement, else void.
+fn stmt_expr(e: *mut cast.Expr) *mut cast.Expr {
+    if u.isnil(BD) {
+        cs.err(e.span, "C3090", "a statement expression outside a function");
+        e.ty = cty.t_error;
+        return e;
+    }
+    let s = e.body;
+    cs.push_scope();
+    let m = vla.mark();
+    let nl = BD.locals.len;
+    let xs = s.items.items();
+    e.ty = cty.t_void;
+    for i in 0..xs.len {
+        let x = xs[i];
+        stmt(x);
+        fallthrough(xs, i);
+        let v = value_stmt(x);
+        if (i + 1 == xs.len) and u.notnil(v) and u.notnil(v.e.ty) {
+            e.ty = cty.unqual(v.e.ty);
+        }
+    }
+    BD.locals.len = nl;
+    vla.leave(m);
+    cs.pop_scope();
+    return e;
 }
 
 fn default_stmt(s: *mut cast.Stmt) void {

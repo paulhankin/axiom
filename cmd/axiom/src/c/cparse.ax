@@ -51,6 +51,7 @@ import "../diag.ax" as dg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "copts.ax" as co;
+import "cpragma.ax" as cpg;
 import "ctok.ax" as ct;
 
 /// Expressions, declarators, statements and initializers nest at most this
@@ -86,6 +87,7 @@ struct Parser {
     pos: usize,
     n: usize,
     std: i32,
+    gnu: bool,     // a GNU dialect (docs/c.md lists its extensions)
     err_pos: i64,  // the token of the last syntax error (one per token)
     depth: i32,
     too_deep: bool,
@@ -209,10 +211,13 @@ fn line_comments(ts: []ct.Token) []ct.Token {
            (is_punct(&ts[i + 1], ct.P_SLASH) or is_punct(&ts[i + 1], ct.P_DIV_EQ)) and adjacent(t, &ts[i + 1]) {
             error_at(t.span, "C2003", "'//' comments are a C99 feature");
             found = true;
+            let from = i;
             i += 2;
             while (i < ts.len) and not ts[i].bol and (ts[i].kind != ct.T_EOF) {
                 i += 1;
             }
+            // (the pragmas' positions after them move back)
+            cpg.shift(out.len, i - from);
             continue;
         }
         out.push(ts[i]);
@@ -268,9 +273,23 @@ fn error_at(sp: u.Span, code: []u8, msg: []u8) void {
 // An error if the standard in force is older than `since`: "<what> a C99
 // feature" (what: "compound literals are").
 fn feature(P: *Parser, since: i32, sp: u.Span, code: []u8, what: []u8) void {
-    if P.std < since {
+    if (P.std < since) and not (P.gnu and gnu_has(code)) {
         error_at(sp, code, u.f2("%s a %s feature", what, std_name(since)));
     }
+}
+
+// The features of later standards the GNU dialects have in every mode:
+// long long, mixed declarations and code, designated initializers,
+// compound literals, a trailing comma in an enumerator list, anonymous
+// structures and unions, attributes `[[...]]`, empty initializers `{}`.
+fn gnu_has(code: []u8) bool {
+    let codes = ["C2101", "C2106", "C2108", "C2109", "C2112", "C2127", "C2130", "C2136"];
+    for c in codes {
+        if u.str_eq(c, code) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn expect_p(P: *mut Parser, id: i32) bool {
@@ -463,7 +482,8 @@ fn is_type_kw(id: i32) bool {
     return (id == ct.K_VOID) or (id == ct.K_CHAR) or (id == ct.K_SHORT) or (id == ct.K_INT) or (id == ct.K_LONG) or
            (id == ct.K_FLOAT) or (id == ct.K_DOUBLE) or (id == ct.K_SIGNED) or (id == ct.K_UNSIGNED) or
            (id == ct.K_BOOL) or (id == ct.K_COMPLEX) or (id == ct.K_IMAGINARY) or (id == ct.K_DECIMAL32) or
-           (id == ct.K_DECIMAL64) or (id == ct.K_DECIMAL128) or (id == ct.K_BUILTIN_VA_LIST) or (id == ct.K_INT64);
+           (id == ct.K_DECIMAL64) or (id == ct.K_DECIMAL128) or (id == ct.K_BUILTIN_VA_LIST) or (id == ct.K_INT64) or
+           (id == ct.K_INT128) or (id == ct.K_EXT_FLOAT) or (id == ct.K_AUTO_TYPE);
 }
 
 fn is_qual_kw(id: i32) bool {
@@ -477,11 +497,17 @@ fn is_typename_kw(id: i32) bool {
 }
 
 fn is_spec_kw(id: i32) bool {
-    return is_typename_kw(id) or is_storage_kw(id) or (id == ct.K_INLINE) or (id == ct.K_NORETURN);
+    return is_typename_kw(id) or is_storage_kw(id) or (id == ct.K_INLINE) or (id == ct.K_NORETURN) or
+           (id == ct.K_ATTRIBUTE);
 }
 
-// The token at offset k begins declaration specifiers.
-fn starts_specs(P: *mut Parser, k: usize) bool {
+// The token at offset k begins declaration specifiers (after any
+// `__extension__`).
+fn starts_specs(P: *mut Parser, k0: usize) bool {
+    let mut k = k0;
+    while kw_at(P, k) == ct.K_EXTENSION {
+        k += 1;
+    }
     let id = kw_at(P, k);
     if id != 0 {
         return is_spec_kw(id);
@@ -500,8 +526,12 @@ fn starts_type_name(P: *mut Parser, k: usize) bool {
 
 // The token at offset k begins a declaration (not an attribute
 // declaration): a typedef name followed by ':' is a label instead.
-fn starts_decl_at(P: *mut Parser, k: usize) bool {
-    if kw_at(P, k) == ct.K_STATIC_ASSERT {
+fn starts_decl_at(P: *mut Parser, k0: usize) bool {
+    let mut k = k0;
+    while kw_at(P, k) == ct.K_EXTENSION {
+        k += 1;
+    }
+    if (kw_at(P, k) == ct.K_STATIC_ASSERT) or (kw_at(P, k) == ct.K_LABEL) {
         return true;
     }
     if is_typedef_tok(P, peek(P, k)) and is_p(peek(P, k + 1), ct.P_COLON) {
@@ -588,31 +618,14 @@ fn parse_attr_spec(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
             }
             a.prefix = a.name;
             a.name = advance(P).text;
+            if P.gnu and u.str_eq(a.prefix, "__gnu__") {
+                a.prefix = "gnu";
+            }
         }
-        if at_p(P, ct.P_LPAREN) {
-            // a balanced token sequence
-            a.has_args = true;
-            _ = advance(P);
-            let from = P.pos;
-            let mut depth: i32 = 0;
-            while not at_eof(P) {
-                let t = cur(P);
-                if is_p(t, ct.P_LPAREN) or is_p(t, ct.P_LBRACKET) or is_p(t, ct.P_LBRACE) {
-                    depth += 1;
-                } else if is_p(t, ct.P_RPAREN) or is_p(t, ct.P_RBRACKET) or is_p(t, ct.P_RBRACE) {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                }
-                _ = advance(P);
-            }
-            let toks = u.newn.[ct.Token](P.pos - from);
-            for k in 0..toks.len {
-                toks[k] = P.t[from + k];
-            }
-            a.args = toks;
-            _ = expect_p(P, ct.P_RPAREN);
+        if (a.prefix.len == 3) and u.str_eq(a.prefix, "gnu") and gnu_expr_args(a.name) and at_p(P, ct.P_LPAREN) {
+            gnu_exprs(P, a);
+        } else {
+            attr_args(P, a);
         }
         a.span = span_from(P, a.span);
         out.push(a);
@@ -634,11 +647,186 @@ fn parse_attr_spec(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
     _ = advance(P);
 }
 
+// An attribute's argument clause, if it has one: a balanced token sequence
+// in parentheses.
+fn attr_args(P: *mut Parser, a: *mut cast.Attr) void {
+    if not at_p(P, ct.P_LPAREN) {
+        return;
+    }
+    a.has_args = true;
+    _ = advance(P);
+    let from = P.pos;
+    let mut depth: i32 = 0;
+    while not at_eof(P) {
+        let t = cur(P);
+        if is_p(t, ct.P_LPAREN) or is_p(t, ct.P_LBRACKET) or is_p(t, ct.P_LBRACE) {
+            depth += 1;
+        } else if is_p(t, ct.P_RPAREN) or is_p(t, ct.P_RBRACKET) or is_p(t, ct.P_RBRACE) {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        _ = advance(P);
+    }
+    let toks = u.newn.[ct.Token](P.pos - from);
+    for k in 0..toks.len {
+        toks[k] = P.t[from + k];
+    }
+    a.args = toks;
+    _ = expect_p(P, ct.P_RPAREN);
+}
+
+// The GNU attributes whose arguments are expressions (to be parsed where
+// they are: they may name types), not tokens.
+fn gnu_expr_args(name0: []u8) bool {
+    let mut name = name0;
+    if (name.len > 4) and u.starts(name, "__") and u.ends(name, "__") {
+        name = name[2..name.len - 2];
+    }
+    let names = ["aligned", "vector_size", "constructor", "destructor", "alloc_size", "alloc_align", "assume_aligned",
+                 "nonnull", "format_arg", "sentinel"];
+    for n in names {
+        if u.str_eq(n, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The arguments of such an attribute (at its '('): assignment expressions.
+fn gnu_exprs(P: *mut Parser, a: *mut cast.Attr) void {
+    a.has_args = true;
+    _ = advance(P);
+    if not at_p(P, ct.P_RPAREN) {
+        loop {
+            a.exprs.push(parse_assign(P));
+            if not accept_p(P, ct.P_COMMA) {
+                break;
+            }
+        }
+    }
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+}
+
 // An attribute specifier sequence, if there is one, into `out`.
 fn parse_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
     while at_attr(P) {
         parse_attr_spec(P, out);
     }
+}
+
+// An attribute specifier sequence, with (a GNU dialect) `__attribute__`
+// specifiers among it, where both appertain to the same thing: a
+// declaration's entities, a statement, a label, an enumerator, a tag.
+fn parse_attrs_g(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    while at_attr(P) or at_kw(P, ct.K_ATTRIBUTE) {
+        if at_attr(P) {
+            parse_attr_spec(P, out);
+        } else {
+            parse_gnu_attrs(P, out);
+        }
+    }
+}
+
+// `__attribute__ (( attribute-list ))` (a GNU dialect), as many as there
+// are: each attribute (a name, maybe a keyword, and its arguments) into
+// `out` with the prefix "gnu"; an empty one is none.
+fn parse_gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    while at_kw(P, ct.K_ATTRIBUTE) {
+        _ = advance(P);
+        if not expect_p(P, ct.P_LPAREN) {
+            return;
+        }
+        if not expect_p(P, ct.P_LPAREN) {
+            skip_to_rparen(P);
+            return;
+        }
+        loop {
+            if at_p(P, ct.P_RPAREN) or at_eof(P) {
+                break;
+            }
+            if accept_p(P, ct.P_COMMA) {
+                continue;
+            }
+            if not attr_word(cur(P)) {
+                syntax(P, "an attribute");
+                break;
+            }
+            let a = u.new.[cast.Attr]();
+            let w = advance(P);
+            a.span = w.span;
+            a.prefix = "gnu";
+            a.name = w.text;
+            if gnu_expr_args(a.name) and at_p(P, ct.P_LPAREN) {
+                gnu_exprs(P, a);
+            } else {
+                attr_args(P, a);
+            }
+            a.span = span_from(P, a.span);
+            out.push(a);
+            if not at_p(P, ct.P_COMMA) {
+                break;
+            }
+        }
+        if not expect_p(P, ct.P_RPAREN) or not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+    }
+}
+
+// GNU attributes, if there are any, into `out`.
+fn gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    if at_kw(P, ct.K_ATTRIBUTE) {
+        parse_gnu_attrs(P, out);
+    }
+}
+
+// `asm ( string-literal )` after a declarator (a GNU dialect): the
+// declared entity's symbol name.
+fn asm_label(P: *mut Parser, d: *mut cast.Declarator) void {
+    if not at_kw(P, ct.K_ASM) {
+        return;
+    }
+    let sp = advance(P).span;
+    d.asm_span = sp;
+    if not expect_p(P, ct.P_LPAREN) {
+        return;
+    }
+    let t = cur(P);
+    if (t.kind == ct.T_STRING) and (t.prefix == ct.ENC_NONE) {
+        _ = advance(P);
+        let mut b = u.Buf.init();
+        for x in t.units {
+            b.c(@truncate(u8, x));
+        }
+        d.asm_name = u.intern(b.done());
+        if d.asm_name.len == 0 {
+            error_at(t.span, "C2001", "an 'asm' label must not be empty");
+        }
+    } else {
+        syntax(P, "a string literal (the symbol name)");
+    }
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    d.asm_span = span_from(P, sp);
+}
+
+// An `asm` statement or file-scope `asm(...)` (a GNU dialect): not
+// supported (C3901); skipped to its ';'.
+fn asm_statement(P: *mut Parser) void {
+    let sp = advance(P).span;
+    error_at(sp, "C3901", "inline assembly ('asm' statements) is not supported");
+    while not at_eof(P) and not at_p(P, ct.P_LPAREN) and not at_p(P, ct.P_SEMI) {
+        _ = advance(P);
+    }
+    if accept_p(P, ct.P_LPAREN) {
+        skip_to_rparen(P);
+    }
+    _ = expect_p(P, ct.P_SEMI);
 }
 
 // Attributes where none can appear: reported and skipped.
@@ -749,6 +937,14 @@ fn parse_specs(P: *mut Parser, ctx: i32) *mut cast.DeclSpec {
                 parse_attrs(P, &mut ds.attrs);
             }
             break;
+        }
+        if at_kw(P, ct.K_ATTRIBUTE) {
+            parse_gnu_attrs(P, &mut ds.gattrs);
+            continue;
+        }
+        if at_kw(P, ct.K_EXTENSION) {
+            _ = advance(P);
+            continue;
         }
         let t = cur(P);
         let id = kw_at(P, 0);
@@ -885,7 +1081,7 @@ fn parse_tag(P: *mut Parser, kw: i32) *mut cast.TagSpec {
     let start = advance(P).span;
     tg.span = start;
     tg.name = "";
-    parse_attrs(P, &mut tg.attrs);
+    parse_attrs_g(P, &mut tg.attrs);
     if cur(P).kind == ct.T_IDENT {
         let t = advance(P);
         tg.name = t.text;
@@ -924,13 +1120,18 @@ fn parse_tag(P: *mut Parser, kw: i32) *mut cast.TagSpec {
                 _ = advance(P);
             }
         }
-        if tg.members.len == 0 {
+        // (a GNU dialect has structures and unions without members: of size 0)
+        if (tg.members.len == 0) and not P.gnu {
             error_at(span_from(P, lb), "C2021",
                      u.f1("a %s needs at least one member", u.pick(kw == ct.K_STRUCT, "structure", "union")));
         }
+        // (#pragma pack as it is where the members end)
+        tg.pack = cpg.pack_at(P.pos);
     }
     leave(P);
     _ = expect_p(P, ct.P_RBRACE);
+    // (a GNU dialect: attributes after the '}' appertain to the type)
+    gnu_attrs(P, &mut tg.attrs);
     tg.span = span_from(P, start);
     return tg;
 }
@@ -953,7 +1154,7 @@ fn parse_enumerators(P: *mut Parser, tg: *mut cast.TagSpec, lb: u.Span) void {
         let en = u.new.[cast.Enumerator]();
         en.name = t.text;
         en.span = t.span;
-        parse_attrs(P, &mut en.attrs);
+        parse_attrs_g(P, &mut en.attrs);
         if accept_p(P, ct.P_ASSIGN) {
             en.value = parse_cond(P);
         }
@@ -1035,6 +1236,11 @@ fn parse_declarator_into(P: *mut Parser, d: *mut cast.Declarator, mode: i32) voi
         let mut pd = new_deriv(cast.DerivKind.POINTER, advance(P).span);
         parse_attrs(P, &mut pd.attrs);
         parse_quals(P, &mut pd, false);
+        while P.gnu and at_kw(P, ct.K_ATTRIBUTE) {
+            // (a GNU dialect: attributes among the qualifiers appertain to the declaration)
+            parse_gnu_attrs(P, &mut d.attrs);
+            parse_quals(P, &mut pd, false);
+        }
         pd.span = span_from(P, pd.span);
         ptrs.push(pd);
     }
@@ -1043,9 +1249,10 @@ fn parse_declarator_into(P: *mut Parser, d: *mut cast.Declarator, mode: i32) voi
         _ = advance(P);
         d.name = t.text;
         d.name_span = t.span;
-        parse_attrs(P, &mut d.attrs);
+        parse_attrs_g(P, &mut d.attrs);
     } else if at_p(P, ct.P_LPAREN) and ((mode == D_CONCRETE) or not paren_is_params(P)) {
         _ = advance(P);
+        gnu_attrs(P, &mut d.attrs);
         parse_declarator_into(P, d, mode);
         if not expect_p(P, ct.P_RPAREN) {
             skip_to_rparen(P);
@@ -1158,7 +1365,7 @@ fn parse_params(P: *mut Parser, fd: *mut cast.Deriv) void {
         }
         let pm = u.new.[cast.Param]();
         let start = cur(P).span;
-        parse_attrs(P, &mut pm.attrs);
+        parse_attrs_g(P, &mut pm.attrs);
         pm.specs = parse_specs(P, CTX_PARAM);
         if pm.specs.items.len == 0 {
             syntax(P, "a parameter declaration");
@@ -1166,6 +1373,7 @@ fn parse_params(P: *mut Parser, fd: *mut cast.Deriv) void {
         }
         check_implicit_int(P, pm.specs);
         pm.decl = parse_declarator(P, D_EITHER);
+        gnu_attrs(P, &mut pm.decl.attrs);
         declare(P, pm.decl.name, false);
         pm.span = span_from(P, start);
         fd.params.push(pm);
@@ -1299,11 +1507,54 @@ fn is_function_declarator(d: *cast.Declarator) bool {
 fn parse_declaration(P: *mut Parser, ctx: i32) *mut cast.Decl {
     let start = cur(P).span;
     let mut attrs = u.List.[*mut cast.Attr].empty();
-    parse_attrs(P, &mut attrs);
+    while at_kw(P, ct.K_EXTENSION) {
+        _ = advance(P);
+    }
+    if at_kw(P, ct.K_ASM) and (ctx == CTX_FILE) {
+        asm_statement(P);
+        return u.nil.[cast.Decl]();
+    }
+    parse_attrs_g(P, &mut attrs);
     return parse_declaration_after(P, ctx, attrs, start);
 }
 
+// `__label__ identifier-list ;` (a GNU dialect: labels local to the block).
+fn parse_local_labels(P: *mut Parser, ctx: i32, start: u.Span) *mut cast.Decl {
+    let d = cast.new_decl(cast.DeclKind.LABELS, start);
+    _ = advance(P);
+    if ctx != CTX_BLOCK {
+        error_at(start, "C2001", "a local label declaration ('__label__') can appear only in a block");
+    }
+    loop {
+        let t = cur(P);
+        if t.kind != ct.T_IDENT {
+            syntax(P, "a label name");
+            break;
+        }
+        _ = advance(P);
+        let dc = u.new.[cast.Declarator]();
+        dc.name = t.text;
+        dc.name_span = t.span;
+        dc.span = t.span;
+        d.decls.push(dc);
+        if not accept_p(P, ct.P_COMMA) {
+            break;
+        }
+    }
+    if not expect_p(P, ct.P_SEMI) {
+        sync(P);
+    }
+    d.span = span_from(P, start);
+    return d;
+}
+
 fn parse_declaration_after(P: *mut Parser, ctx: i32, attrs: u.List.[*mut cast.Attr], start: u.Span) *mut cast.Decl {
+    while at_kw(P, ct.K_EXTENSION) {
+        _ = advance(P);
+    }
+    if kw_at(P, 0) == ct.K_LABEL {
+        return parse_local_labels(P, ctx, start);
+    }
     if kw_at(P, 0) == ct.K_STATIC_ASSERT {
         if attrs.len > 0 {
             error_at(start, "C2005", "an attribute cannot appear before a static assertion");
@@ -1384,6 +1635,10 @@ fn parse_init_declarators(P: *mut Parser, d: *mut cast.Decl, ctx: i32, start: u.
             dc.name_span = dc.span;
         } else {
             dc = parse_declarator(P, D_CONCRETE);
+            if P.gnu {
+                asm_label(P, dc);
+                gnu_attrs(P, &mut dc.attrs);
+            }
         }
         if (d.decls.len == 0) and is_function_declarator(dc) and (ctx != CTX_MEMBER) and (ctx != CTX_KR) and
            (ctx != CTX_FOR) and (at_p(P, ct.P_LBRACE) or (dc.derivs.at(0).id_list and starts_specs(P, 0))) {
@@ -1396,6 +1651,7 @@ fn parse_init_declarators(P: *mut Parser, d: *mut cast.Decl, ctx: i32, start: u.
         if ctx == CTX_MEMBER {
             if accept_p(P, ct.P_COLON) {
                 dc.width = parse_cond(P);
+                gnu_attrs(P, &mut dc.attrs);
                 dc.span = span_from(P, dc.span);
             }
         } else if at_p(P, ct.P_ASSIGN) {
@@ -1504,8 +1760,17 @@ fn parse_initializer(P: *mut Parser) *mut cast.Init {
             if at_p(P, ct.P_LBRACKET) {
                 let sp = advance(P).span;
                 let e = parse_cond(P);
+                let mut e2 = u.nil.[cast.Expr]();
+                if P.gnu and accept_p(P, ct.P_ELLIPSIS) {
+                    // `[first ... last]` (a GNU dialect)
+                    e2 = parse_cond(P);
+                }
                 _ = expect_p(P, ct.P_RBRACKET);
-                desigs.push(cast.Designator.{ kind: cast.DesigKind.INDEX, span: span_from(P, sp), e: e, name: "" });
+                let mut k = cast.DesigKind.INDEX;
+                if u.notnil(e2) {
+                    k = cast.DesigKind.RANGE;
+                }
+                desigs.push(cast.Designator.{ kind: k, span: span_from(P, sp), e: e, name: "", e2: e2 });
                 continue;
             }
             if at_p(P, ct.P_DOT) {
@@ -1519,12 +1784,21 @@ fn parse_initializer(P: *mut Parser) *mut cast.Init {
                     syntax(P, "a member name");
                 }
                 desigs.push(cast.Designator.{ kind: cast.DesigKind.MEMBER, span: span_from(P, sp),
-                                              e: u.nil.[cast.Expr](), name: name });
+                                              e: u.nil.[cast.Expr](), name: name, e2: u.nil.[cast.Expr]() });
                 continue;
             }
             break;
         }
-        if desigs.len > 0 {
+        let mut old_style = false;
+        if P.gnu and (desigs.len == 0) and (cur(P).kind == ct.T_IDENT) and is_p(peek(P, 1), ct.P_COLON) {
+            // `member: value` (the GNU dialects' old designator)
+            let t = advance(P);
+            _ = advance(P);
+            desigs.push(cast.Designator.{ kind: cast.DesigKind.MEMBER, span: t.span, e: u.nil.[cast.Expr](),
+                                          name: t.text, e2: u.nil.[cast.Expr]() });
+            old_style = true;
+        }
+        if (desigs.len > 0) and not old_style {
             if not said_desig {
                 said_desig = true;
                 feature(P, co.C99, desigs.at(0).span, "C2108", "designated initializers are");
@@ -1667,7 +1941,11 @@ fn parse_cond(P: *mut Parser) *mut cast.Expr {
         leave(P);
         return error_expr(P);
     }
-    let a = parse_expr(P);
+    let mut a = u.nil.[cast.Expr]();
+    if not (P.gnu and at_p(P, ct.P_COLON)) {
+        // (a GNU dialect: `c ?: b` has no middle operand)
+        a = parse_expr(P);
+    }
     let mut b = error_expr(P);
     if expect_p(P, ct.P_COLON) {
         b = parse_cond(P);
@@ -1788,6 +2066,27 @@ fn compound_literal(P: *mut Parser, tn: *mut cast.TypeName, start: u.Span) *mut 
 
 fn parse_unary(P: *mut Parser) *mut cast.Expr {
     let t = cur(P);
+    if at_kw(P, ct.K_EXTENSION) {
+        // (`__extension__ expression`: the expression)
+        _ = advance(P);
+        if not enter(P) {
+            leave(P);
+            return error_expr(P);
+        }
+        let x = parse_cast(P);
+        leave(P);
+        return x;
+    }
+    if P.gnu and is_p(t, ct.P_ANDAND) and (peek(P, 1).kind == ct.T_IDENT) {
+        // `&&label` (a GNU dialect): the label's address
+        _ = advance(P);
+        let l = advance(P);
+        let e = cast.new_expr(cast.ExprKind.LABEL_ADDR, t.span);
+        e.name = l.text;
+        e.name_span = l.span;
+        e.span = span_from(P, t.span);
+        return e;
+    }
     if t.kind == ct.T_PUNCT {
         let id = t.id;
         let pre = (id == ct.P_INC) or (id == ct.P_DEC);
@@ -1855,6 +2154,17 @@ fn parse_unary(P: *mut Parser) *mut cast.Expr {
         _ = take_kw(P);
         let e = cast.new_expr(cast.ExprKind.ALIGNOF, t.span);
         e.name = t.text;
+        if P.gnu and not (at_p(P, ct.P_LPAREN) and starts_type_name(P, 1)) {
+            // (a GNU dialect: __alignof__ of an expression)
+            if not enter(P) {
+                leave(P);
+                return error_expr(P);
+            }
+            e.a = parse_unary(P);
+            leave(P);
+            e.span = span_from(P, t.span);
+            return grown(P, e);
+        }
         if expect_p(P, ct.P_LPAREN) {
             e.tname = parse_type_name(P, CTX_TYPENAME);
             if not expect_p(P, ct.P_RPAREN) {
@@ -1961,6 +2271,9 @@ fn parse_primary(P: *mut Parser) *mut cast.Expr {
            is_p(peek(P, 1), ct.P_LPAREN) {
             return parse_type_builtin(P);
         }
+        if P.gnu and u.str_eq(t.text, "__builtin_types_compatible_p") and is_p(peek(P, 1), ct.P_LPAREN) {
+            return parse_types_compatible(P);
+        }
         if is_typedef(P, t.text) {
             syntax(P, "an expression");
             let e = error_expr(P);
@@ -2015,6 +2328,22 @@ fn parse_primary(P: *mut Parser) *mut cast.Expr {
         if t.id == ct.K_GENERIC {
             return parse_generic(P);
         }
+    }
+    if is_p(t, ct.P_LPAREN) and P.gnu and is_p(peek(P, 1), ct.P_LBRACE) {
+        // `({ ... })` (a GNU dialect): a statement expression
+        _ = advance(P);
+        let e = cast.new_expr(cast.ExprKind.STMT_EXPR, t.span);
+        if not enter(P) {
+            leave(P);
+            return error_expr(P);
+        }
+        e.body = parse_compound(P, true);
+        leave(P);
+        if not expect_p(P, ct.P_RPAREN) {
+            skip_to_rparen(P);
+        }
+        e.span = span_from(P, t.span);
+        return e;
     }
     if is_p(t, ct.P_LPAREN) {
         _ = advance(P);
@@ -2107,6 +2436,32 @@ fn parse_type_builtin(P: *mut Parser) *mut cast.Expr {
     }
     e.span = span_from(P, t.span);
     return grown(P, e);
+}
+
+// `__builtin_types_compatible_p ( type-name , type-name )` (a GNU dialect).
+fn parse_types_compatible(P: *mut Parser) *mut cast.Expr {
+    let t = advance(P);
+    let e = cast.new_expr(cast.ExprKind.TYPES_COMPAT, t.span);
+    e.name = t.text;
+    _ = advance(P);  // (the '(')
+    if not enter(P) {
+        leave(P);
+        return error_expr(P);
+    }
+    e.tname = parse_type_name(P, CTX_TYPENAME);
+    let ok = expect_p(P, ct.P_COMMA);
+    if ok {
+        e.tname2 = parse_type_name(P, CTX_TYPENAME);
+    }
+    leave(P);
+    if not ok {
+        e.kind = cast.ExprKind.ERROR;
+        skip_to_rparen(P);
+    } else if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
+    }
+    e.span = span_from(P, t.span);
+    return e;
 }
 
 // `_Generic ( assignment-expression , generic-association-list )`.
@@ -2206,7 +2561,7 @@ fn decl_stmt(d: *mut cast.Decl) *mut cast.Stmt {
 fn parse_block_item(P: *mut Parser, seen_stmt: *mut i32) *mut cast.Stmt {
     let start = cur(P).span;
     let mut attrs = u.List.[*mut cast.Attr].empty();
-    parse_attrs(P, &mut attrs);
+    parse_attrs_g(P, &mut attrs);
     unknown_type_name(P);
     if not at_label(P) and (starts_decl(P) or ((attrs.len > 0) and at_p(P, ct.P_SEMI))) {
         if seen_stmt.* == 1 {
@@ -2230,7 +2585,7 @@ fn parse_block_item(P: *mut Parser, seen_stmt: *mut i32) *mut cast.Stmt {
 fn parse_statement(P: *mut Parser) *mut cast.Stmt {
     let start = cur(P).span;
     let mut attrs = u.List.[*mut cast.Attr].empty();
-    parse_attrs(P, &mut attrs);
+    parse_attrs_g(P, &mut attrs);
     return parse_statement_after(P, attrs, start, false);
 }
 
@@ -2299,6 +2654,10 @@ fn statement_body(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt 
         _ = advance(P);
         return cast.new_stmt(cast.StmtKind.EXPR, span_from(P, start));
     }
+    if at_kw(P, ct.K_ASM) {
+        asm_statement(P);
+        return cast.new_stmt(cast.StmtKind.EXPR, span_from(P, start));
+    }
     if t.kind == ct.T_KEYWORD {
         let id = t.id;
         if id == ct.K_IF {
@@ -2357,6 +2716,12 @@ fn statement_body(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt 
             let s = cast.new_stmt(cast.StmtKind.GOTO, start);
             s.label = "";
             let x = cur(P);
+            if P.gnu and is_p(x, ct.P_STAR) {
+                // `goto *expression;` (a GNU dialect)
+                _ = advance(P);
+                s.e = parse_expr(P);
+                return end_stmt(P, s, start);
+            }
             if x.kind == ct.T_IDENT {
                 _ = advance(P);
                 s.label = x.text;
@@ -2403,6 +2768,10 @@ fn parse_labeled(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt {
     if (t.kind == ct.T_KEYWORD) and (t.id == ct.K_CASE) {
         s.kind = cast.StmtKind.CASE;
         s.e = parse_cond(P);
+        if P.gnu and accept_p(P, ct.P_ELLIPSIS) {
+            // `case low ... high:` (a GNU dialect)
+            s.hi = parse_cond(P);
+        }
     } else if t.kind == ct.T_KEYWORD {
         s.kind = cast.StmtKind.DEFAULT;
     } else {
@@ -2415,6 +2784,10 @@ fn parse_labeled(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt {
         return s;
     }
     let head = span_from(P, start);
+    if (s.kind == cast.StmtKind.LABEL) and at_kw(P, ct.K_ATTRIBUTE) {
+        // (a GNU dialect: `label: __attribute__((unused))` appertain to the label)
+        parse_gnu_attrs(P, &mut s.attrs);
+    }
     // (attributes after the label appertain to what follows it)
     let k = attrs_ahead(P);
     let nx = peek(P, k);
@@ -2430,7 +2803,7 @@ fn parse_labeled(P: *mut Parser, start: u.Span, in_block: bool) *mut cast.Stmt {
     }
     let bstart = cur(P).span;
     let mut attrs = u.List.[*mut cast.Attr].empty();
-    parse_attrs(P, &mut attrs);
+    parse_attrs_g(P, &mut attrs);
     s.body = parse_statement_after(P, attrs, bstart, in_block);
     s.span = span_from(P, start);
     return s;
@@ -2482,7 +2855,7 @@ pub fn parse(toks0: []ct.Token, o: *co.COptions) *mut cast.Unit {
         return unit;
     }
     let mut toks = toks0;
-    if o.std < co.C99 {
+    if (o.std < co.C99) and not o.gnu {
         toks = line_comments(toks0);
     }
     let mut P = Parser.{
@@ -2490,6 +2863,7 @@ pub fn parse(toks0: []ct.Token, o: *co.COptions) *mut cast.Unit {
         pos: 0,
         n: toks.len,
         std: o.std,
+        gnu: o.gnu,
         err_pos: -1,
         depth: 0,
         too_deep: false,

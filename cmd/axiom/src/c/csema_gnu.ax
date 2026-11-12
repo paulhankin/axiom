@@ -1,0 +1,819 @@
+// =============================================================================
+// csema_gnu.ax - the GNU attributes (`__attribute__((...))` and
+// `[[gnu::...]]`, in the GNU dialects: cfeat.ax lists them): where each may
+// appertain, its arguments, and what it says of the entity, which semantic
+// analysis and IR generation then ask for (note_of).
+//
+// The diagnostics-related ones join the standard attributes' records
+// (csema_attr.ax: record maps them): deprecated (C4050), warn_unused_result
+// (as nodiscard: C4051), unused (as maybe_unused), noreturn (C4053),
+// fallthrough. The others:
+//
+//   aligned(n)       an object's, member's or structure's alignment at least n
+//                    (no n: the strictest a scalar has, 16); on a typedef, only
+//                    its type's own alignment (another is C3901); on a
+//                    function, accepted (functions are aligned as the target's
+//                    code is)
+//   packed           a structure's or union's members at byte alignment (and its
+//                    bit-fields at the next bit); a member's; an enumeration's
+//                    type the smallest integer type that holds its values
+//   section("s")     the object (or function) in section s of an ELF object
+//   used, weak, alias("t"), visibility("v"), constructor(p), destructor(p),
+//   cleanup(f), mode(m), transparent_union, error("m"), warning("m"),
+//   nonnull(i...), format(...): as docs/c.md says.
+//   noinline, always_inline, cold: the IR function's; hot, const, pure,
+//   malloc and the other hints are accepted and change nothing.
+//
+// An unknown attribute, or one where it cannot appertain, is warning C4052
+// and is ignored; vector_size is C3901 (vector types are not supported).
+// Invalid arguments are C3077.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cfeat.ax" as cf;
+import "cpragma.ax" as cpg;
+import "csema.ax" as cs;
+import "csema_bits.ax" as cb;
+import "csema_dspec.ax" as dsp;
+import "csema_expr.ax" as cx;
+import "csema_marks.ax" as csm;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+/// What GNU attributes said of an entity (a CSym, a TagInfo or a Member).
+pub struct Note {
+    section: []u8,
+    alias: []u8,  // alias("target"): the entity is another name for target
+    alias_span: u.Span,
+    weak: bool,
+    used: bool,
+    visibility: i32,  // cpragma.VIS_
+    noinline: bool,
+    always_inline: bool,
+    cold: bool,
+    ctor: bool,
+    ctor_prio: i32,  // 65535 without a priority (after those with one)
+    dtor: bool,
+    dtor_prio: i32,
+    cleanup: *mut cast.CSym,  // an automatic object's cleanup function
+    nonnull: u64,             // bit k: parameter k + 1 must not be a null pointer
+    nonnull_all: bool,        // nonnull without indexes: every pointer parameter
+    error_msg: []u8,          // error("m"): a call is an error
+    warning_msg: []u8,        // warning("m"): a call is warned about
+    packed: bool,
+    aligned: u64,
+    transparent: bool,             // a union: transparent_union
+    format_index: i32,             // format(archetype, index, first): the format string's parameter (from 1), or 0
+    cleanup_call: *mut cast.Expr,  // the call `cleanup(&object)`, typed
+}
+
+let mut g_notes: u.SymMap.[*mut Note] = u.SymMap.[*mut Note].{ keys: @ptr_from_int(*mut usize, 0),
+                                                               vals: @ptr_from_int(*mut *mut Note, 0), cap: 0, len: 0 };
+
+fn note_at(p: usize, make: bool) *mut Note {
+    let k = u.addr_key(p);
+    let mut n = g_notes.get(k);
+    if u.isnil(n) and make {
+        n = u.new.[Note]();
+        n.ctor_prio = 65535;
+        n.dtor_prio = 65535;
+        g_notes.put(k, n);
+    }
+    return n;
+}
+
+fn note_if(p: usize) *mut Note {
+    if g_notes.len == 0 {
+        return u.nil.[Note]();
+    }
+    return note_at(p, false);
+}
+
+/// What GNU attributes said of symbol s, or nil.
+pub fn note_of(s: *cast.CSym) *mut Note {
+    return note_if(@int_from_ptr(s));
+}
+
+/// What GNU attributes said of a structure, union or enumeration, or nil.
+pub fn note_of_tag(ti: *cty.TagInfo) *mut Note {
+    return note_if(@int_from_ptr(ti));
+}
+
+/// What GNU attributes said of a member, or nil.
+pub fn note_of_member(m: *cty.Member) *mut Note {
+    return note_if(@int_from_ptr(m));
+}
+
+/// Installs the check of GNU attributes in csema_dspec.ax.
+pub fn install() void {
+    dsp.gnu_hook = check;
+    cx.call_check = call_check;
+    cx.transparent = transparent;
+    cb.cs_not_supported = packed_unit_error;
+}
+
+fn packed_unit_error(m: *cty.Member, n: u64) void {
+    cs.not_supported(m.span, u.f2("the bit-field '%s' of a packed structure, which no unit of %s bytes in it holds",
+                                  m.name, u.udec(n)));
+}
+
+fn is_gnu(a: *cast.Attr) bool {
+    return u.str_eq(a.prefix, "gnu") and cs.opts().gnu;
+}
+
+// -----------------------------------------------------------------------------
+// Where they may appertain, and their arguments
+// -----------------------------------------------------------------------------
+
+fn ignored(a: *cast.Attr, why: []u8) void {
+    cs.warn(a.span, "C4052", u.f2("the attribute '%s' %s, and is ignored", a.name, why));
+}
+
+fn bad_args(a: *cast.Attr, want: []u8) void {
+    cs.err(a.span, "C3077", u.f2("the attribute '%s' takes %s", a.name, want));
+}
+
+// The string literal that is the attribute's one argument, or nil.
+fn string_arg(a: *cast.Attr) []u8 {
+    if not a.has_args or (a.args.len == 0) {
+        return u.nosym();
+    }
+    let mut b = u.Buf.init();
+    for t in a.args {
+        if (t.kind != ct.T_STRING) or (t.prefix != ct.ENC_NONE) {
+            return u.nosym();
+        }
+        for x in t.units {
+            b.c(@truncate(u8, x));
+        }
+    }
+    return b.done();
+}
+
+// The identifier that is the attribute's one argument, or nil.
+fn ident_arg(a: *cast.Attr) []u8 {
+    if not a.has_args or (a.args.len != 1) or (a.args[0].kind != ct.T_IDENT) {
+        return u.nosym();
+    }
+    return a.args[0].text;
+}
+
+// The integer constant expression argument k of an attribute (parsed: exprs);
+// ok false after an error (reported).
+fn int_arg(a: *cast.Attr, k: usize, ok: *mut bool) u64 {
+    let r = cx.ice(a.exprs.get(k), u.f1("the argument of the attribute '%s'", a.name));
+    a.exprs.set(k, r.e);
+    if not r.ok {
+        ok.* = false;
+        return 0;
+    }
+    return r.v;
+}
+
+fn one_of(n: []u8, names: [][]u8) bool {
+    for x in names {
+        if u.str_eq(x, n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The attributes of functions only.
+let FUNC_ATTRS: [31][]u8 = ["noreturn", "noinline", "always_inline", "const", "pure", "malloc", "format", "format_arg",
+                            "nonnull", "returns_nonnull", "warn_unused_result", "constructor", "destructor",
+                            "gnu_inline", "artificial", "nothrow", "leaf", "externally_visible",
+                            "no_instrument_function", "flatten", "noclone", "noipa", "sentinel", "alloc_size",
+                            "alloc_align", "assume_aligned", "error", "warning", "nodiscard", "returns_twice",
+                            "optimize"];
+
+/// Checks GNU attribute a, which appertains to `what` (a dsp.AP_ constant):
+/// its place and its arguments. In a mode that is no GNU dialect, an
+/// attribute with the prefix gnu is a vendor's: ignored.
+pub fn check(a: *mut cast.Attr, what: i32) void {
+    if not is_gnu(a) {
+        return;
+    }
+    let n = cf.plain(a.name);
+    if u.str_eq(n, "vector_size") {
+        cs.not_supported(a.span, "the attribute 'vector_size' (vector types)");
+        return;
+    }
+    if not cf.gnu_attribute(n) {
+        cs.warn(a.span, "C4052", u.f1("'%s' is not a GNU attribute this compiler knows, and is ignored", a.name));
+        return;
+    }
+    let obj = what == dsp.AP_OBJECT;
+    let func = what == dsp.AP_FUNC;
+    let ent = obj or func or (what == dsp.AP_TYPEDEF) or (what == dsp.AP_TAG) or (what == dsp.AP_MEMBER) or
+              (what == dsp.AP_ENUMERATOR);
+    let mut ok = true;
+    let mut where: []u8 = "";
+    if one_of(n, FUNC_ATTRS[..]) {
+        ok = func;
+        where = "applies only to functions";
+    } else if u.str_eq(n, "cold") or u.str_eq(n, "hot") {
+        ok = func or (what == dsp.AP_LABEL);
+        where = "applies only to functions and labels";
+    } else if u.str_eq(n, "aligned") {
+        ok = obj or func or (what == dsp.AP_MEMBER) or (what == dsp.AP_TAG) or (what == dsp.AP_TYPEDEF);
+        where = "applies only to objects, members, structures, unions and typedefs";
+    } else if u.str_eq(n, "packed") {
+        ok = (what == dsp.AP_TAG) or (what == dsp.AP_MEMBER);
+        where = "applies only to structures, unions, enumerations and members";
+    } else if u.str_eq(n, "section") or u.str_eq(n, "used") or u.str_eq(n, "weak") or u.str_eq(n, "alias") or
+              u.str_eq(n, "visibility") {
+        ok = obj or func;
+        where = "applies only to objects and functions";
+    } else if u.str_eq(n, "unused") or u.str_eq(n, "maybe_unused") {
+        ok = ent or (what == dsp.AP_LABEL);
+        where = "does not apply here";
+    } else if u.str_eq(n, "deprecated") or u.str_eq(n, "unavailable") {
+        ok = ent;
+        where = "applies only to declarations";
+    } else if u.str_eq(n, "fallthrough") {
+        ok = what == dsp.AP_BLOCK_DECL;
+        where = "applies only to a null statement before a case or default label";
+    } else if u.str_eq(n, "cleanup") {
+        ok = obj;
+        where = "applies only to automatic objects";
+    } else if u.str_eq(n, "transparent_union") or u.str_eq(n, "may_alias") {
+        ok = (what == dsp.AP_TAG) or (what == dsp.AP_TYPEDEF);
+        where = "applies only to types";
+    } else if u.str_eq(n, "mode") {
+        ok = obj or (what == dsp.AP_TYPEDEF) or (what == dsp.AP_MEMBER);
+        where = "applies only to declarations of objects, members and typedefs";
+    }
+    if not ok {
+        ignored(a, where);
+        return;
+    }
+    check_args(a, n);
+}
+
+fn check_args(a: *mut cast.Attr, n: []u8) void {
+    let strs = ["section", "alias", "visibility", "error", "warning"];
+    if one_of(n, strs[..]) {
+        let s = string_arg(a);
+        if u.isnos(s) {
+            bad_args(a, "a string literal");
+        } else if u.str_eq(n, "visibility") {
+            let vs = ["default", "hidden", "protected", "internal"];
+            if not one_of(s, vs[..]) {
+                cs.err(a.span, "C3077", u.f1("the visibility '%s' is none of default, hidden, protected and internal",
+                                             s));
+            }
+        } else if (s.len == 0) and not u.str_eq(n, "error") and not u.str_eq(n, "warning") {
+            cs.err(a.span, "C3077", u.f1("the attribute '%s' takes a name that is not empty", a.name));
+        }
+        return;
+    }
+    if u.str_eq(n, "deprecated") or u.str_eq(n, "unavailable") {
+        if a.has_args and u.isnos(string_arg(a)) {
+            bad_args(a, "a string literal, or nothing");
+        }
+        return;
+    }
+    if u.str_eq(n, "aligned") {
+        if a.exprs.len > 1 {
+            bad_args(a, "one alignment, or nothing");
+            return;
+        }
+        if a.exprs.len == 1 {
+            let mut ok = true;
+            let v = int_arg(a, 0, &mut ok);
+            if ok and ((v == 0) or ((v & (v - 1)) != 0) or (v > dsp.MAX_ALIGN)) {
+                cs.err(a.span, "C3071", u.f2("the alignment %s is not a power of two up to %s", u.udec(v),
+                                             u.udec(dsp.MAX_ALIGN)));
+            }
+        }
+        return;
+    }
+    if u.str_eq(n, "constructor") or u.str_eq(n, "destructor") {
+        if a.exprs.len > 1 {
+            bad_args(a, "a priority, or nothing");
+        } else if a.exprs.len == 1 {
+            let mut ok = true;
+            let v = int_arg(a, 0, &mut ok);
+            if ok and (v > 65535) {
+                cs.err(a.span, "C3077", u.f2("the priority of '%s' is %s; it must be at most 65535", a.name,
+                                             u.udec(v)));
+            }
+        }
+        return;
+    }
+    if u.str_eq(n, "nonnull") or u.str_eq(n, "alloc_size") or u.str_eq(n, "alloc_align") or
+       u.str_eq(n, "assume_aligned") or u.str_eq(n, "format_arg") or u.str_eq(n, "sentinel") {
+        let mut ok = true;
+        for k in 0..a.exprs.len {
+            _ = int_arg(a, k, &mut ok);
+        }
+        return;
+    }
+    if u.str_eq(n, "cleanup") {
+        if u.isnos(ident_arg(a)) {
+            bad_args(a, "the name of a function");
+        }
+        return;
+    }
+    if u.str_eq(n, "mode") {
+        let m = ident_arg(a);
+        if u.isnos(m) or (mode_bits(m) == 0) {
+            bad_args(a, "a mode: QI, HI, SI, DI, TI, word, pointer or byte (or __QI__ ...)");
+        }
+        return;
+    }
+    if u.str_eq(n, "format") {
+        if not a.has_args or (a.args.len != 5) or (a.args[0].kind != ct.T_IDENT) or (a.args[2].kind != ct.T_INT) or
+           (a.args[4].kind != ct.T_INT) {
+            bad_args(a, "(archetype, format-index, first-to-check)");
+        }
+        return;
+    }
+    if u.str_eq(n, "optimize") {
+        return;
+    }
+    if a.has_args and ((a.args.len > 0) or (a.exprs.len > 0)) {
+        bad_args(a, "no arguments");
+    }
+}
+
+// The width in bits of a machine mode of mode(m), or 0 if m is none.
+fn mode_bits(m0: []u8) i32 {
+    let m = cf.plain(m0);
+    if u.str_eq(m, "QI") or u.str_eq(m, "byte") {
+        return 8;
+    }
+    if u.str_eq(m, "HI") {
+        return 16;
+    }
+    if u.str_eq(m, "SI") {
+        return 32;
+    }
+    if u.str_eq(m, "DI") {
+        return 64;
+    }
+    if u.str_eq(m, "TI") {
+        return 128;
+    }
+    if u.str_eq(m, "word") or u.str_eq(m, "pointer") or u.str_eq(m, "unwind_word") {
+        return @int_cast(i32, cty.ptr_bytes * 8);
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// What they say
+// -----------------------------------------------------------------------------
+
+/// The type of a declaration with base type t whose attributes are among
+/// the lists: mode(m) makes an integer type of m's width with t's
+/// signedness (an error, C3077, for a type that is no integer type).
+pub fn mode_type(t: *mut cty.CType, l1: *u.List.[*mut cast.Attr], l2: *u.List.[*mut cast.Attr],
+                 l3: *u.List.[*mut cast.Attr]) *mut cty.CType {
+    let lists: [3]*u.List.[*mut cast.Attr] = [l1, l2, l3];
+    let mut r = t;
+    for l in lists {
+        for a in l.items() {
+            if not is_gnu(a) or not u.str_eq(cf.plain(a.name), "mode") {
+                continue;
+            }
+            let bits = mode_bits(ident_arg(a));
+            if bits == 0 {
+                continue;
+            }
+            if not cty.is_integer(t) or cty.is_bitint(t) or (t.kind == cty.TK_BOOL) {
+                if not cty.is_error(t) {
+                    cs.err(a.span, "C3077", u.f1("the attribute 'mode' on %s, which is not an integer type", cs.tq(t)));
+                }
+                continue;
+            }
+            let sg = t.is_signed;
+            let mut x = u.nil.[cty.CType]();
+            if bits == 8 {
+                x = cty.t_uchar;
+                if sg {
+                    x = cty.t_schar;
+                }
+            } else if bits == 16 {
+                x = cty.t_ushort;
+                if sg {
+                    x = cty.t_short;
+                }
+            } else if bits == 128 {
+                x = cty.int128(sg);
+                if u.isnil(x) {
+                    cs.not_supported(a.span, "mode(TI) (__int128)");
+                    continue;
+                }
+            } else {
+                let cands: [3]*mut cty.CType = [cty.t_int, cty.t_long, cty.t_llong];
+                for c in cands {
+                    if u.isnil(x) and (c.bits == bits) {
+                        x = c;
+                    }
+                }
+                if sg {
+                    x = cty.to_signed(x);
+                } else {
+                    x = cty.to_unsigned(x);
+                }
+            }
+            r = cty.qualify(x, t.quals);
+        }
+    }
+    return r;
+}
+
+// Records what GNU attribute a says of the entity at p (kind: what it is).
+fn record(p: usize, a: *mut cast.Attr, what: i32) void {
+    let n = cf.plain(a.name);
+    let rec = ["section", "alias", "weak", "used", "visibility", "noinline", "always_inline", "cold", "constructor",
+               "destructor", "cleanup", "nonnull", "error", "warning", "packed", "aligned", "transparent_union",
+               "format"];
+    if not one_of(n, rec[..]) {
+        return;
+    }
+    let x = note_at(p, true);
+    if u.str_eq(n, "section") {
+        x.section = string_arg(a);
+    } else if u.str_eq(n, "alias") {
+        x.alias = u.intern(string_arg(a));
+        x.alias_span = a.span;
+    } else if u.str_eq(n, "weak") {
+        x.weak = true;
+    } else if u.str_eq(n, "used") {
+        x.used = true;
+    } else if u.str_eq(n, "visibility") {
+        let vs = ["default", "hidden", "protected", "internal"];
+        let s = string_arg(a);
+        for k in 0..vs.len {
+            if u.str_eq(vs[k], s) {
+                x.visibility = @int_cast(i32, k);
+            }
+        }
+    } else if u.str_eq(n, "noinline") {
+        x.noinline = true;
+    } else if u.str_eq(n, "always_inline") {
+        x.always_inline = true;
+    } else if u.str_eq(n, "cold") {
+        x.cold = true;
+    } else if u.str_eq(n, "constructor") or u.str_eq(n, "destructor") {
+        let mut prio: i32 = 65535;
+        if a.exprs.len == 1 and u.notnil(a.exprs.get(0).ty) and a.exprs.get(0).is_const {
+            prio = @int_cast(i32, a.exprs.get(0).cval & 0xFFFF);
+        }
+        if u.str_eq(n, "constructor") {
+            x.ctor = true;
+            x.ctor_prio = prio;
+        } else {
+            x.dtor = true;
+            x.dtor_prio = prio;
+        }
+    } else if u.str_eq(n, "cleanup") {
+        let f = cs.lookup(ident_arg(a));
+        if u.isnil(f) or (f.kind != cast.SK_FUNC) {
+            cs.err(a.span, "C3077", u.f1("the cleanup '%s' is not a function", ident_arg(a)));
+        } else {
+            x.cleanup = f;
+            f.used = true;
+        }
+    } else if u.str_eq(n, "nonnull") {
+        if a.exprs.len == 0 {
+            x.nonnull_all = true;
+        }
+        for e in a.exprs.items() {
+            if u.notnil(e.ty) and e.is_const and (e.cval >= 1) and (e.cval <= 64) {
+                x.nonnull = x.nonnull | (@as(u64, 1) << @truncate(u32, e.cval - 1));
+            }
+        }
+    } else if u.str_eq(n, "error") {
+        x.error_msg = string_arg(a);
+    } else if u.str_eq(n, "warning") {
+        x.warning_msg = string_arg(a);
+    } else if u.str_eq(n, "packed") {
+        x.packed = true;
+    } else if u.str_eq(n, "aligned") {
+        let mut v: u64 = 16;  // (no argument: the strictest alignment of a scalar on the targets)
+        if a.exprs.len == 1 {
+            let e = a.exprs.get(0);
+            v = 0;
+            if u.notnil(e.ty) and e.is_const {
+                v = e.cval;
+            }
+        }
+        if (v != 0) and ((v & (v - 1)) == 0) and (v <= dsp.MAX_ALIGN) and (v > x.aligned) {
+            x.aligned = v;
+        }
+    } else if u.str_eq(n, "transparent_union") {
+        x.transparent = true;
+    } else if u.str_eq(n, "format") {
+        if (a.args.len == 5) and (a.args[2].kind == ct.T_INT) {
+            x.format_index = @truncate(i32, @bit_cast(i64, a.args[2].ival));
+        }
+    }
+    _ = what;
+}
+
+/// Records what the GNU attributes among `list` say of symbol s.
+pub fn mark_sym(s: *cast.CSym, list: *u.List.[*mut cast.Attr]) void {
+    if u.isnil(s) {
+        return;
+    }
+    for a in list.items() {
+        if is_gnu(a) {
+            record(@int_from_ptr(s), a, 0);
+        }
+    }
+}
+
+/// Records what the GNU attributes among `list` say of the tag of t.
+pub fn mark_tag(t: *cty.CType, list: *u.List.[*mut cast.Attr]) void {
+    if u.isnil(t) or u.isnil(t.tag) {
+        return;
+    }
+    for a in list.items() {
+        if is_gnu(a) {
+            record(@int_from_ptr(t.tag), a, 0);
+        }
+    }
+}
+
+/// Records what the GNU attributes among `list` say of member m.
+pub fn mark_member(m: *cty.Member, list: *u.List.[*mut cast.Attr]) void {
+    if u.isnil(m) {
+        return;
+    }
+    for a in list.items() {
+        if is_gnu(a) {
+            record(@int_from_ptr(m), a, 0);
+        }
+    }
+}
+
+/// Is there a GNU attribute `name` among `list`?
+pub fn has(list: *u.List.[*mut cast.Attr], name: []u8) bool {
+    for a in list.items() {
+        if is_gnu(a) and u.str_eq(cf.plain(a.name), name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// What a GNU dialect's declarator dcl of s says that is not an attribute
+/// (its asm label), and what its attributes ask of s once it is declared:
+/// an object's alignment, a cleanup's call, the places of weak and alias.
+pub fn entity(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
+    if u.isnil(s) {
+        return;
+    }
+    if dcl.asm_name.len > 0 {
+        asm_label(s, dcl);
+    }
+    let n = note_of(s);
+    if u.isnil(n) {
+        return;
+    }
+    if s.kind == cast.SK_OBJECT {
+        if n.aligned > s.align {
+            s.align = n.aligned;
+        }
+        if u.notnil(n.cleanup) and u.isnil(n.cleanup_call) {
+            cleanup_call(s, n, dcl);
+        }
+    } else if (s.kind == cast.SK_TYPEDEF) and (n.aligned != 0) and (n.aligned != cty.align_of(s.ty)) {
+        cs.not_supported(dcl.name_span,
+                         u.f2("the attribute 'aligned' on a typedef, for an alignment (%s) other than its type's (%s)",
+                              u.udec(n.aligned), u.udec(cty.align_of(s.ty))));
+        n.aligned = 0;
+    }
+    if n.transparent and (s.kind == cast.SK_TYPEDEF) {
+        // (a typedef's union is transparent)
+        if (s.ty.kind == cty.TK_UNION) and cty.is_complete(s.ty) {
+            note_at(@int_from_ptr(s.ty.tag), true).transparent = true;
+        } else {
+            cs.err(dcl.name_span, "C3090", u.f1("'%s' is not a complete union type: it cannot be transparent", s.name));
+        }
+    }
+    if (n.weak or (n.alias.len > 0)) and (s.linkage == cast.LK_NONE) {
+        cs.err(dcl.name_span, "C3090", u.f1("'%s' has no linkage: it cannot be weak or an alias", s.name));
+        n.weak = false;
+        n.alias = "";
+    }
+    if n.weak {
+        s.weak = true;  // (a definition gives way to one that is not weak: cc.ax, link_check)
+    }
+    if (n.alias.len > 0) and (s.kind == cast.SK_FUNC) {
+        s.defined = true;  // (an alias is a definition: of another name for its target)
+    }
+    if (n.section.len > 0) and (s.kind == cast.SK_OBJECT) and (s.duration != cast.SD_STATIC) {
+        cs.err(dcl.name_span, "C3090", u.f1("the automatic object '%s' cannot be in a section", s.name));
+        n.section = "";
+    }
+    if (n.ctor or n.dtor) and (s.kind == cast.SK_FUNC) and ((s.ty.params.len != 0) or not s.ty.proto) and
+       (s.ty.params.len != 0) {
+        cs.err(dcl.name_span, "C3090", u.f1("the constructor or destructor '%s' must take no arguments", s.name));
+    }
+}
+
+// `asm("name")` after the declarator of s: its symbol, for an object with
+// static storage duration or a function (an explicit register variable,
+// `register int x asm("r")`, is C3901).
+fn asm_label(s: *mut cast.CSym, dcl: *mut cast.Declarator) void {
+    if (s.kind == cast.SK_OBJECT) and (s.duration != cast.SD_STATIC) {
+        if s.is_param or csm.is_register(s) {
+            cs.not_supported(dcl.asm_span, "an explicit register variable ('register ... asm(\"reg\")')");
+        } else {
+            cs.err(dcl.asm_span, "C3090", u.f1("the automatic object '%s' cannot have an asm label", s.name));
+        }
+        return;
+    }
+    if (s.kind != cast.SK_OBJECT) and (s.kind != cast.SK_FUNC) {
+        cs.err(dcl.asm_span, "C3090", u.f1("'%s' is not an object or function: it cannot have an asm label", s.name));
+        return;
+    }
+    if (s.asm_name.len > 0) and not u.str_eq(s.asm_name, dcl.asm_name) {
+        cs.err(dcl.asm_span, "C3090", u.f3("'%s' has the asm label '%s', declared before as '%s'", s.name, dcl.asm_name,
+                                           s.asm_name));
+        return;
+    }
+    if (s.asm_name.len == 0) and s.used {
+        cs.err(dcl.asm_span, "C3090", u.f1("the asm label of '%s' comes after a use of it", s.name));
+    }
+    s.asm_name = dcl.asm_name;
+}
+
+// cleanup(f) on automatic object s: the call f(&s), typed (its argument
+// converted to f's parameter as by assignment: C3022 if it cannot be).
+fn cleanup_call(s: *mut cast.CSym, n: *mut Note, dcl: *mut cast.Declarator) void {
+    if (s.duration != cast.SD_AUTO) or s.is_param {
+        cs.err(dcl.name_span, "C3090", u.f1("'%s' has a cleanup, but is not an automatic object", s.name));
+        n.cleanup = u.nil.[cast.CSym]();
+        return;
+    }
+    let f = n.cleanup;
+    let ft = f.ty;
+    if ft.proto and (ft.params.len != 1) {
+        cs.err(dcl.name_span, "C3090", u.f1("the cleanup '%s' must take one argument", f.name));
+        n.cleanup = u.nil.[cast.CSym]();
+        return;
+    }
+    let sp = dcl.name_span;
+    let id = cast.new_expr(cast.ExprKind.IDENT, sp);
+    id.name = s.name;
+    id.sym = s;
+    id.ty = s.ty;
+    id.lvalue = true;
+    let addr = cast.new_expr(cast.ExprKind.UNARY, sp);
+    addr.op = ct.P_AMP;
+    addr.a = id;
+    addr.ty = cty.pointer_to(s.ty);
+    addr.height = 2;
+    let callee = cast.new_expr(cast.ExprKind.IDENT, sp);
+    callee.name = f.name;
+    let call = cast.new_expr(cast.ExprKind.CALL, sp);
+    call.a = callee;
+    call.args.push(addr);
+    call.height = 3;
+    n.cleanup_call = cx.check(call);
+}
+
+// The function call e's callee designates (through the decay to a
+// pointer), or nil.
+fn called(e: *cast.Expr) *cast.CSym {
+    let mut f = e.a;
+    while u.notnil(f) and (f.kind == cast.ExprKind.CAST) and u.isnil(f.tname) {
+        f = f.a;
+    }
+    if u.notnil(f) and (f.kind == cast.ExprKind.IDENT) and u.notnil(f.sym) and (f.sym.kind == cast.SK_FUNC) {
+        return f.sym;
+    }
+    return u.nil.[cast.CSym]();
+}
+
+// A call of a function with the attributes error("m") (an error, C3091),
+// warning("m") (C4123), or nonnull (a null pointer constant for one of the
+// parameters it names: warning C4121).
+fn call_check(e: *mut cast.Expr) void {
+    if g_notes.len == 0 {
+        return;
+    }
+    let f = called(e);
+    if u.isnil(f) {
+        return;
+    }
+    let n = note_of(f);
+    if u.isnil(n) {
+        return;
+    }
+    if not u.isnos(n.error_msg) and (n.error_msg.len > 0) {
+        cs.err(e.span, "C3091", u.f2("a call of '%s', declared with the attribute error: %s", f.name, n.error_msg));
+    } else if not u.isnos(n.warning_msg) and (n.warning_msg.len > 0) {
+        cs.warn(e.span, "C4123", u.f2("a call of '%s', declared with the attribute warning: %s", f.name,
+                                      n.warning_msg));
+    }
+    if (n.nonnull == 0) and not n.nonnull_all {
+        return;
+    }
+    for k in 0..e.args.len {
+        let a = e.args.get(k);
+        let named = (k < 64) and ((n.nonnull & (@as(u64, 1) << @truncate(u32, k))) != 0);
+        if (named or n.nonnull_all) and cty.is_pointer(a.ty) and cx.is_npc(strip(a)) {
+            cs.warn(a.span, "C4121", u.f2("a null pointer is passed as argument %s of '%s', declared nonnull",
+                                          u.zdec(k + 1), f.name));
+        }
+    }
+}
+
+// e without the conversions semantic analysis made (to see a null pointer constant).
+fn strip(e: *mut cast.Expr) *mut cast.Expr {
+    let mut x = e;
+    while (x.kind == cast.ExprKind.CAST) and u.isnil(x.tname) and (x.op == cast.CV_VALUE) {
+        x = x.a;
+    }
+    return x;
+}
+
+// Can argument a (typed) be member m's value of a transparent union?
+fn member_takes(m: *cty.Member, a: *cast.Expr) bool {
+    let t = m.ty;
+    if cty.compatible_unq(t, a.ty) {
+        return true;
+    }
+    if cty.is_pointer(t) {
+        if cx.is_npc(a) {
+            return true;
+        }
+        return cty.is_pointer(a.ty) and
+               (cty.is_void_ptr(a.ty) or cty.is_void_ptr(t) or cty.compatible_unq(t.elem, a.ty.elem));
+    }
+    return false;
+}
+
+// A transparent union parameter of type t (the attribute transparent_union)
+// takes an argument of one of its members' types: `(t){ .m = a }`.
+fn transparent(a: *mut cast.Expr, t: *mut cty.CType) *mut cast.Expr {
+    if (t.kind != cty.TK_UNION) or u.isnil(a.ty) or cty.is_error(a.ty) or cty.compatible_unq(t, a.ty) {
+        return a;
+    }
+    let n = note_of_tag(t.tag);
+    if u.isnil(n) or not n.transparent {
+        return a;
+    }
+    for m in t.tag.members.items() {
+        if (m.name.len == 0) or not member_takes(m, a) {
+            continue;
+        }
+        // (a compound literal of the union, its member m given a)
+        let it = u.new.[cast.Init]();
+        it.kind = cast.InitKind.EXPR;
+        it.e = a;
+        it.span = a.span;
+        it.desigs.push(cast.Designator.{ kind: cast.DesigKind.MEMBER, span: a.span, e: u.nil.[cast.Expr](),
+                                         name: m.name, e2: u.nil.[cast.Expr]() });
+        let list = u.new.[cast.Init]();
+        list.kind = cast.InitKind.LIST;
+        list.span = a.span;
+        list.items.push(it);
+        let c = cast.new_expr(cast.ExprKind.COMPOUND, a.span);
+        c.init = list;
+        c.tname = type_name_of(t, a.span);
+        c.height = a.height + 2;
+        return cx.rv(c);
+    }
+    return a;
+}
+
+// A type name that names t (already typed).
+fn type_name_of(t: *mut cty.CType, sp: u.Span) *mut cast.TypeName {
+    let tn = u.new.[cast.TypeName]();
+    tn.span = sp;
+    tn.specs = u.new.[cast.DeclSpec]();
+    tn.decl = u.new.[cast.Declarator]();
+    tn.decl.name = "";
+    tn.ty = t;
+    return tn;
+}
+
+/// The unit's `#pragma weak name` and `#pragma weak name = target` (every
+/// mode): name, if the unit declares it, is weak (and another name for
+/// target); a name it does not declare is ignored.
+pub fn pragma_weaks() void {
+    for w in cpg.weaks() {
+        let s = cs.linked(w.name);
+        if u.isnil(s) or ((s.kind != cast.SK_FUNC) and (s.kind != cast.SK_OBJECT)) {
+            continue;
+        }
+        let n = note_at(@int_from_ptr(s), true);
+        n.weak = true;
+        s.weak = true;
+        if w.target.len > 0 {
+            n.alias = w.target;
+            n.alias_span = w.span;
+            if s.kind == cast.SK_FUNC {
+                s.defined = true;
+            }
+        }
+    }
+}

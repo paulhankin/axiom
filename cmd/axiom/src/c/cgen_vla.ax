@@ -16,6 +16,11 @@
 // block, a break, a continue, a goto out) moves the stack pointer back to the
 // value saved before the first of them (ir.IN_STACK_RESTORE); returning
 // releases all with the frame.
+//
+// An object with a cleanup (a GNU dialect: the attribute cleanup) takes a
+// place in the same chain, holding its cleanup's call instead of a stack
+// pointer: leaving its scope (as above, and returning) makes the call, the
+// innermost first.
 // =============================================================================
 import "../ir.ax" as ir;
 import "../util.ax" as u;
@@ -25,7 +30,16 @@ import "ctypes.ax" as cty;
 
 struct State {
     lens: u.SymMap.[*mut ir.Value],  // a length's slot, by its expression's address
-    chain: u.List.[*mut ir.Value],   // the stack pointers saved before the allocations in scope
+    chain: u.List.[*mut ir.Value],   // the stack pointers saved before the allocations in scope (nil: a cleanup's place)
+    calls: u.List.[*mut cast.Expr],  // for each place in chain, a cleanup's call (nil: an allocation's)
+}
+
+/// Generates an expression (cgen_expr.rv; set by cgen_stmt.ax).
+pub let mut gen_expr: fn(*mut cast.Expr) *mut ir.Value = no_expr;
+
+fn no_expr(e: *mut cast.Expr) *mut ir.Value {
+    _ = e;
+    return ir.vnil();
 }
 
 let mut VS: *mut State = @ptr_from_int(*mut State, 0);
@@ -128,6 +142,9 @@ fn len(t: *cty.CType) *mut ir.Value {
 /// The size of an object of type t, in bytes, as a pointer-sized integer:
 /// a constant unless t is a variable length array type.
 pub fn size_value(t: *cty.CType) *mut ir.Value {
+    if cty.is_void(t) or cty.is_func(t) {
+        return cg.usz(1);  // (a GNU dialect's arithmetic on pointers to them: csema_expr.ax)
+    }
     if not cty.is_vla(t) {
         return cg.usz(cty.size_of(t));
     }
@@ -153,6 +170,7 @@ pub fn depth() i32 {
 pub fn allocate(t: *cty.CType, al: u64) *mut ir.Value {
     let size = size_value(t);
     VS.chain.push(ir.intr(cg.B, ir.IN_STACK_SAVE, cg.T_ptr, none()));
+    VS.calls.push(u.nil.[cast.Expr]());
     let mut n = size;
     if al > 16 {
         n = ir.add(cg.B, n, cg.usz(al - 16));  // (the stack keeps 16 bytes' alignment)
@@ -167,12 +185,39 @@ pub fn allocate(t: *cty.CType, al: u64) *mut ir.Value {
     return p;
 }
 
-/// Releases the allocations beyond the first d in scope (before a jump to
-/// where only those are, or at the end of a block).
+/// An object with a cleanup comes in scope: its call (typed: csema_gnu.ax)
+/// is made when the scope is left.
+pub fn push_cleanup(call: *mut cast.Expr) void {
+    VS.chain.push(ir.vnil());
+    VS.calls.push(call);
+}
+
+/// Releases the allocations beyond the first d in scope, and makes the
+/// cleanups' calls among them, the innermost first (before a jump to where
+/// only those are, at the end of a block, or before a return: d 0).
 pub fn release_to(d: i32) void {
-    if (depth() > d) and not cg.terminated() {
-        let mut args: [1]*mut ir.Value = [VS.chain.get(@int_cast(usize, d))];
-        _ = ir.intr(cg.B, ir.IN_STACK_RESTORE, cg.T_void, args[..]);
+    if (depth() <= d) or cg.terminated() {
+        return;
+    }
+    let mut k = VS.chain.len;
+    while k > @int_cast(usize, d) {
+        k -= 1;
+        let c = VS.calls.get(k);
+        if u.notnil(c) {
+            _ = gen_expr(c);
+            if cg.terminated() {
+                return;  // (a cleanup that does not return)
+            }
+        }
+    }
+    // the stack pointer back to before the first allocation among them
+    for j in @int_cast(usize, d)..VS.chain.len {
+        let sp = VS.chain.get(j);
+        if u.notnil(sp) {
+            let mut args: [1]*mut ir.Value = [sp];
+            _ = ir.intr(cg.B, ir.IN_STACK_RESTORE, cg.T_void, args[..]);
+            return;
+        }
     }
 }
 
@@ -182,5 +227,16 @@ pub fn leave(d: i32) void {
     release_to(d);
     while depth() > d {
         _ = VS.chain.pop();
+        _ = VS.calls.pop();
     }
+}
+
+/// Are there cleanups in scope (a return must make their calls)?
+pub fn has_cleanups() bool {
+    for c in VS.calls.items() {
+        if u.notnil(c) {
+            return true;
+        }
+    }
+    return false;
 }

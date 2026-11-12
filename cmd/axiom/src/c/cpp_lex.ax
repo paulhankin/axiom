@@ -21,9 +21,14 @@ pub const PK_HEADER: i32 = 7;       // a header name, <...> or "..." (after #inc
 pub const PK_PLACEMARKER: i32 = 8;  // (macro replacement)
 pub const PK_PARAM: i32 = 9;        // a parameter in a replacement list; id: its index
 pub const PK_VAOPT: i32 = 10;       // __VA_OPT__ in a replacement list
+pub const PK_PRAGMA: i32 = 11;      // a pragma's change of a value (id: its number, cpragma.event)
 
 pub const PP_HASH: i32 = 100;      // # %:
 pub const PP_HASHHASH: i32 = 101;  // ## %:%:
+
+/// A GNU dialect is in force (cpp.ax sets it): from gnu89 on, `//` comments
+/// and hexadecimal floating constants (p exponents) are C99's.
+pub let mut gnu: bool = false;
 
 pub struct PTok {
     kind: i32,
@@ -825,7 +830,7 @@ fn scan_number(L: *mut Lx, i0: usize) usize {
     let mut i = i0;
     loop {
         let c = s[i];
-        if ((c == 'e') or (c == 'E') or (((c == 'p') or (c == 'P')) and (L.std >= co.C99))) and
+        if ((c == 'e') or (c == 'E') or (((c == 'p') or (c == 'P')) and ((L.std >= co.C99) or gnu))) and
            ((s[i + 1] == '+') or (s[i + 1] == '-')) {
             i += 2;
         } else if is_alpha_(c) or is_digit(c) or (c == '.') {
@@ -869,17 +874,20 @@ fn scan_quoted(L: *Lx, i0: usize, q: u8, ok: *mut bool) usize {
     }
 }
 
-// Whether a header name may come next: after `#include` or `#embed`, or
-// after `__has_include(` or `__has_embed(` in #if and #elif (C23).
+// Whether a header name may come next: after `#include`, `#include_next` or
+// `#embed`, or after `__has_include(` (`__has_include_next(`) or (C23)
+// `__has_embed(` in #if and #elif.
 fn header_next(L: *Lx) bool {
     if not L.first_hash {
         return false;
     }
     if L.ntok == 2 {
-        return u.str_eq(L.dname, "include") or u.str_eq(L.dname, "embed");
+        return u.str_eq(L.dname, "include") or u.str_eq(L.dname, "embed") or u.str_eq(L.dname, "include_next");
     }
-    if (L.std >= co.C23) and (L.ntok >= 3) and is_punct(&L.prev, ct.P_LPAREN) and
-       (is_ident(&L.prev2, "__has_include") or is_ident(&L.prev2, "__has_embed")) {
+    // (__has_include is the compiler's in every mode; __has_include_next a GNU dialect's)
+    if (L.ntok >= 3) and is_punct(&L.prev, ct.P_LPAREN) and
+       (is_ident(&L.prev2, "__has_include") or is_ident(&L.prev2, "__has_include_next") or
+        ((L.std >= co.C23) and is_ident(&L.prev2, "__has_embed"))) {
         return u.str_eq(L.dname, "if") or u.str_eq(L.dname, "elif");
     }
     return false;
@@ -917,7 +925,7 @@ fn skip_space(L: *mut Lx) bool {
                 i += 1;
             }
             L.pos = i;
-        } else if (c == '/') and (s[L.pos + 1] == '/') and (L.std >= co.C99) {
+        } else if (c == '/') and (s[L.pos + 1] == '/') and ((L.std >= co.C99) or gnu) {
             while s[L.pos] != '\n' {
                 L.pos += 1;
             }
@@ -1158,4 +1166,43 @@ pub fn lex_one(text: []u8, std: i32, sp: u.Span, whole: *mut bool) PTok {
     t.text = text[0..@min(t.text.len, text.len)];
     L.adj.deinit();
     return t;
+}
+
+/// Lexes `text` (one line: the string of a _Pragma operator, destringized)
+/// into its tokens, each at sp, without diagnostics.
+pub fn lex_all(text: []u8, std: i32, sp: u.Span) []mut PTok {
+    let sf = u.new.[u.SourceFile]();
+    let mut b = u.Buf.init();
+    b.s(text);
+    b.c('\n');
+    sf.text = b.done();
+    sf.id = sp.file;
+    sf.path = "";
+    sf.display = "";
+    let L = u.new.[Lx]();
+    L.sf = sf;
+    L.s = sf.text;
+    L.std = std;
+    L.quiet = true;
+    L.scratch = true;
+    L.bol = false;
+    L.prev = ret_tok();
+    L.prev2 = ret_tok();
+    L.la = ret_tok();
+    L.dname = u.nosym();
+    L.adj.push(Adj.{ at: 0, orig: 0 });
+    let mut l = u.List.[PTok].empty();
+    loop {
+        let mut t = lex1(L);
+        if t.kind == PK_EOF {
+            break;
+        }
+        t.span = sp;
+        t.bol = false;
+        l.push(t);
+    }
+    let r = u.newn.[PTok](l.len);
+    @mem_copy(r, l.items());
+    l.deinit();
+    return r;
 }

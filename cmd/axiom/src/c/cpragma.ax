@@ -1,0 +1,317 @@
+// =============================================================================
+// cpragma.ax - what the pragmas of a translation unit say to the phases after
+// the preprocessor (cpp.ax reads them: #pragma and _Pragma, in every mode):
+//
+//   - `#pragma pack` and `#pragma GCC visibility`: a value that changes at
+//     points of the token stream. The preprocessor makes a change (event)
+//     and a token for it (lx.PK_PRAGMA), which phase 7 (cpp_conv.ax) drops,
+//     placing the change at the index of the next token (place); the parser
+//     asks for the value where a structure's member list ends (pack_at);
+//   - `#pragma weak name` and `#pragma weak name = target`: a list, which
+//     semantic analysis applies at the end of the unit;
+//   - `#pragma GCC diagnostic` and `#pragma GCC system_header`: rules that
+//     change the severity of warnings by where they are (the diagnostics'
+//     filter, installed in diag.ax).
+//
+// Positions are the unit's (begin_unit starts them again); the rules about
+// diagnostics are kept by file for the whole build, since diagnostics are
+// shown at its end.
+// =============================================================================
+import "../diag.ax" as dg;
+import "../util.ax" as u;
+
+// A value that changes at a token position.
+struct Change {
+    kind: i32,  // EV_
+    value: u64,
+    pos: usize,  // it holds from the token at this index on
+    placed: bool,
+}
+
+/// The values that change at positions.
+pub const EV_PACK: i32 = 1;        // #pragma pack: members aligned to at most `value` bytes (0: as their types are)
+pub const EV_VISIBILITY: i32 = 2;  // #pragma GCC visibility: a VIS_ value
+
+/// Visibilities (`#pragma GCC visibility push(...)`, the attribute visibility).
+pub const VIS_DEFAULT: u64 = 0;
+pub const VIS_HIDDEN: u64 = 1;
+pub const VIS_PROTECTED: u64 = 2;
+pub const VIS_INTERNAL: u64 = 3;
+
+/// A `#pragma weak`.
+pub struct Weak {
+    name: []u8,
+    target: []u8,  // `name = target`: name is another name for target (empty: none)
+    span: u.Span,
+}
+
+// A #pragma GCC diagnostic or system_header, in the order read.
+struct Rule {
+    file: i32,
+    off: u32,    // where it is in its file
+    kind: i32,   // R_
+    code: []u8,  // the warning code it is about (empty: all of them)
+}
+
+const R_IGNORED: i32 = 1;
+const R_WARNING: i32 = 2;
+const R_ERROR: i32 = 3;
+const R_PUSH: i32 = 4;
+const R_POP: i32 = 5;
+const R_SYSTEM: i32 = 6;  // the rest of the file is a system header's: no warnings
+const R_ENTER: i32 = 7;   // the file is entered (included) here
+
+let mut g_changes: u.List.[Change] = u.List.[Change].{ data: @ptr_from_int(*mut Change, 0), len: 0, cap: 0 };
+let mut g_weak: u.List.[Weak] = u.List.[Weak].{ data: @ptr_from_int(*mut Weak, 0), len: 0, cap: 0 };
+let mut g_rules: u.List.[Rule] = u.List.[Rule].{ data: @ptr_from_int(*mut Rule, 0), len: 0, cap: 0 };
+let mut g_installed: bool = false;
+
+/// Starts a translation unit's pragmas (the preprocessor calls it).
+pub fn begin_unit() void {
+    g_changes.clear();
+    g_weak.clear();
+    if not g_installed {
+        g_installed = true;
+        dg.filter = filter;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Values by position
+// -----------------------------------------------------------------------------
+
+/// A change of a value (kind: EV_) the preprocessor makes; its number,
+/// which the token for it (lx.PK_PRAGMA) carries to `place`.
+pub fn event(kind: i32, value: u64) i32 {
+    g_changes.push(Change.{ kind: kind, value: value, pos: 0, placed: false });
+    return @int_cast(i32, g_changes.len - 1);
+}
+
+/// The change numbered id holds from the token at index pos on.
+pub fn place(id: i32, pos: usize) void {
+    if (id >= 0) and (@int_cast(usize, id) < g_changes.len) {
+        let c = g_changes.at(@int_cast(usize, id));
+        c.pos = pos;
+        c.placed = true;
+    }
+}
+
+// The value of kind `kind` at the token at index pos: the last change placed
+// at or before it (0 if none).
+fn value_at(kind: i32, pos: usize) u64 {
+    let mut v: u64 = 0;
+    let mut best: usize = 0;
+    let mut any = false;
+    for c in g_changes.items() {
+        if (c.kind == kind) and c.placed and (c.pos <= pos) and (not any or (c.pos >= best)) {
+            v = c.value;
+            best = c.pos;
+            any = true;
+        }
+    }
+    return v;
+}
+
+/// The `#pragma pack` value at the token at index pos (0: none).
+pub fn pack_at(pos: usize) u64 {
+    return value_at(EV_PACK, pos);
+}
+
+/// The `#pragma GCC visibility` value at the token at index pos.
+pub fn visibility_at(pos: usize) u64 {
+    return value_at(EV_VISIBILITY, pos);
+}
+
+/// Tokens were dropped from the stream before the parser saw it: the
+/// positions after `from` move back by n.
+pub fn shift(from: usize, n: usize) void {
+    for k in 0..g_changes.len {
+        let c = g_changes.at(k);
+        if c.pos >= (from + n) {
+            c.pos -= n;
+        } else if c.pos > from {
+            c.pos = from;
+        }
+    }
+}
+
+/// A pragma's line for the preprocessed text (--emit=c-pp): what it is
+/// written as, before the token at index pos.
+pub struct Line {
+    pos: usize,
+    text: []u8,
+}
+
+/// The pragmas the phases after the preprocessor need, as lines for the
+/// preprocessed text, in the order of their positions: each change of the
+/// pack value as `pack(n)`, of the visibility as `GCC visibility push(v)`
+/// or `pop`, then the `weak` ones at the end (pos: max).
+pub fn lines() []Line {
+    let mut l = u.List.[Line].empty();
+    for c in g_changes.items() {
+        if not c.placed {
+            continue;
+        }
+        let mut t = "";
+        if c.kind == EV_PACK {
+            t = "pack()";
+            if c.value != 0 {
+                t = u.f1("pack(%s)", u.udec(c.value));
+            }
+        } else {
+            let names = ["default", "hidden", "protected", "internal"];
+            t = "GCC visibility pop";
+            if c.value != 0 {
+                t = u.f1("GCC visibility push(%s)", names[@truncate(usize, c.value & 3)]);
+            }
+        }
+        // (in order of position: few of them)
+        let mut k = l.len;
+        l.push(Line.{ pos: c.pos, text: t });
+        while (k > 0) and (l.get(k - 1).pos > c.pos) {
+            let x = l.get(k - 1);
+            l.set(k - 1, l.get(k));
+            l.set(k, x);
+            k -= 1;
+        }
+    }
+    for w in g_weak.items() {
+        let mut t = u.cat2("weak ", w.name);
+        if w.target.len > 0 {
+            t = u.f2("weak %s = %s", w.name, w.target);
+        }
+        l.push(Line.{ pos: 0xFFFF_FFFF, text: t });
+    }
+    return l.items();
+}
+
+/// A `#pragma weak`.
+pub fn add_weak(name: []u8, target: []u8, sp: u.Span) void {
+    g_weak.push(Weak.{ name: name, target: target, span: sp });
+}
+
+/// The unit's `#pragma weak`s.
+pub fn weaks() []Weak {
+    return g_weak.items();
+}
+
+// -----------------------------------------------------------------------------
+// Diagnostics
+// -----------------------------------------------------------------------------
+
+/// `#pragma GCC diagnostic ignored|warning|error|push|pop` at sp, about the
+/// warning `code` (empty: every warning).
+pub fn diagnostic(sp: u.Span, kind: []u8, code: []u8) void {
+    let mut k = R_IGNORED;
+    if u.str_eq(kind, "warning") {
+        k = R_WARNING;
+    } else if u.str_eq(kind, "error") {
+        k = R_ERROR;
+    } else if u.str_eq(kind, "push") {
+        k = R_PUSH;
+    } else if u.str_eq(kind, "pop") {
+        k = R_POP;
+    }
+    g_rules.push(Rule.{ file: sp.file, off: sp.start, kind: k, code: code });
+}
+
+/// `#pragma GCC system_header` at sp: the rest of its file gives no warnings.
+pub fn system_header(sp: u.Span) void {
+    g_rules.push(Rule.{ file: sp.file, off: sp.start, kind: R_SYSTEM, code: "" });
+}
+
+/// The preprocessor enters file `file` (its first lines are read next).
+pub fn enter_file(file: i32) void {
+    if g_rules.len > 0 {
+        g_rules.push(Rule.{ file: file, off: 0, kind: R_ENTER, code: "" });
+    }
+}
+
+// The severity a warning `code` at sp has under the rules (-1: it is not
+// shown). The rules that count are those read before sp: the last one in
+// sp's file before it and all before that one; or, if its file has none
+// before sp, those read before the file was first entered.
+fn filter(sev: i32, sp: u.Span, code: []u8) i32 {
+    if (g_rules.len == 0) or (sev != dg.SEV_WARNING) {
+        return sev;
+    }
+    let rs = g_rules.items();
+    let mut last: usize = 0;
+    let mut found = false;
+    for i in 0..rs.len {
+        if (rs[i].file == sp.file) and (rs[i].off <= sp.start) and (rs[i].kind != R_ENTER) {
+            last = i;
+            found = true;
+        }
+    }
+    if not found {
+        for i in 0..rs.len {
+            if (rs[i].file == sp.file) and (rs[i].kind == R_ENTER) {
+                if i == 0 {
+                    return sev;
+                }
+                last = i - 1;
+                found = true;
+                break;
+            }
+        }
+    }
+    if not found {
+        return sev;
+    }
+    // replayed: the action for the code, with push and pop; system headers
+    let mut stack = u.List.[i32].empty();
+    let mut act: i32 = 0;
+    let mut system = false;
+    for i in 0..last + 1 {
+        let r = &rs[i];
+        if r.kind == R_PUSH {
+            stack.push(act);
+        } else if r.kind == R_POP {
+            if stack.len > 0 {
+                act = stack.pop();
+            }
+        } else if r.kind == R_SYSTEM {
+            if r.file == sp.file {
+                system = true;
+            }
+        } else if r.kind != R_ENTER {
+            if (r.code.len == 0) or u.str_eq(r.code, code) {
+                act = r.kind;
+            }
+        }
+    }
+    stack.deinit();
+    if system or (act == R_IGNORED) {
+        return -1;
+    }
+    if act == R_ERROR {
+        return dg.SEV_ERROR;
+    }
+    return sev;
+}
+
+/// The warning code a `#pragma GCC diagnostic` option names: one of the
+/// compiler's codes (written as itself, "C4050"), or an option of the usual
+/// spelling that stands for one ("-Wdeprecated-declarations"); empty for
+/// "-Wall", "-Wextra" and "-Wpedantic" (every warning); nil for any other.
+pub fn option_code(opt: []u8) []u8 {
+    if (opt.len == 5) and (opt[0] == 'C') and (opt[1] == '4') {
+        return u.intern(opt);
+    }
+    if u.str_eq(opt, "-Wall") or u.str_eq(opt, "-Wextra") or u.str_eq(opt, "-Wpedantic") {
+        return "";
+    }
+    let names = ["-Wdeprecated-declarations", "-Wdeprecated", "-Wunused-result", "-Wattributes", "-Wunknown-attributes",
+                 "-Winvalid-noreturn", "-Wimplicit-function-declaration", "-Wimplicit", "-Wunused-label", "-Wvarargs",
+                 "-Wmultichar", "-Wcpp", "-Wunknown-pragmas", "-Wpragmas", "-Wnonnull", "-Wunused-value",
+                 "-Wswitch-outside-range", "-Wattribute-warning"];
+    let codes = ["C4050", "C4050", "C4051", "C4052", "C4052", "C4053", "C4001", "C4001", "C4040", "C4080", "C4102",
+                 "C4103", "C4111", "C4112", "C4121", "C4051", "C4120", "C4123"];
+    for k in 0..names.len {
+        if u.str_eq(opt, names[k]) {
+            return codes[k];
+        }
+    }
+    return u.nosym();
+}

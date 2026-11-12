@@ -28,9 +28,14 @@ lists the diagnostics.
   which needs the caller's frame realigned: the stack keeps 16 bytes' alignment); on
   macOS, a variadic argument of a type aligned to 16 bytes gets no padding before it
   (the platform aligns its stack slot to 16).
-- **No extensions**: no GNU or Microsoft extensions, and `#pragma` lines are ignored
-  (as are `_Pragma` operators). Identifiers the compiler needs for its own headers are
-  in the reserved namespace (`__builtin_va_list`, `__axiom_int64`, ...).
+- **Extensions only in the GNU dialects** (`--c-std=gnu89` ... `gnu23`, COptions.gnu:
+  docs/c.md lists them): the keywords of `ctok.keyword_id_in`, the GNU attributes
+  (`csema_gnu.ax`; `cfeat.ax` names them for `__has_attribute`), the builtins
+  (`csema_gbuiltin.ax`, `cgen_gbuiltin.ax`, the atomic ones `cgen_gatomic.ax`), statement
+  expressions, labels as values, case ranges and the rest (each where its construct is).
+  No Microsoft extensions. Pragmas are read in every mode (`cpp.ax`; what the later phases
+  need is in `cpragma.ax`). Identifiers the compiler needs for its own headers are in the
+  reserved namespace (`__builtin_va_list`, `__axiom_int64`, ...).
 - **Complex types** (C99): `float`, `double` and `long double _Complex`, with
   `<complex.h>` (the library's functions only declared). No imaginary types, and
   `__STDC_IEC_559_COMPLEX__` is not defined, though multiplication and division
@@ -81,7 +86,9 @@ lists the diagnostics.
 ## Layout
 
 ```
-cmd/axiom/src/c/copts.ax    options: the standard, the implementation's choices
+cmd/axiom/src/c/copts.ax    options: the standard (and GNU dialect), the implementation's choices
+cmd/axiom/src/c/cpragma.ax  what pragmas say after preprocessing (pack, weak, GCC diagnostic)
+cmd/axiom/src/c/cfeat.ax    the GNU attributes and builtins implemented (__has_attribute, __has_builtin)
 cmd/axiom/src/c/ctok.ax     the tokens the preprocessor hands the parser
 cmd/axiom/src/c/cpp.ax      preprocessor and lexer (phases 1-6)            (+ cpp_*.ax)
 cmd/axiom/src/c/cast.ax     the syntax tree                          (+ cast_dump.ax)
@@ -145,6 +152,8 @@ cmd/axiom/internal/tests/c/ tests
 axiom build file.c... [-o out] [--target=...] [-O0..-O3]
 axiom check file.c...           the units are analyzed and linked, nothing is written
     --c-std=c89|c90|c95|c99|c11|c17|c18|c23      (default c17)
+            gnu89|gnu90|gnu99|gnu11|gnu17|gnu18|gnu23   the GNU dialects
+    --c-warn-unknown-pragmas
     --c-char=signed|unsigned  --c-int=16|32|64  --c-long=32|64  --c-long-double=64|80|128
     -DNAME[=value]  -UNAME  -Idir   (also -D NAME, -U NAME, -I dir; in order)
     --emit=c-pp     the preprocessed text           (one source; standard output

@@ -522,14 +522,15 @@ function cDriverCases() {
       if (skip()) return skip();
       write({ 'std.c': 'long v = __STDC_VERSION__;\n' });
       const want = { c89: '__STDC_VERSION__', c90: '__STDC_VERSION__', c95: '199409L', c99: '199901L', c11: '201112L',
-        c17: '201710L', c18: '201710L', c23: '202311L' };
+        c17: '201710L', c18: '201710L', c23: '202311L', gnu89: '__STDC_VERSION__', gnu90: '__STDC_VERSION__',
+        gnu99: '199901L', gnu11: '201112L', gnu17: '201710L', gnu18: '201710L', gnu23: '202311L' };
       for (const [n, v] of Object.entries(want)) {
         const c = await ax(['build', 'std.c', '--emit=c-pp', `--c-std=${n}`]);
         if (c.status !== 0 || c.stdout.trim() !== `long v = ${v};`) return `--c-std=${n}: ${c.stdout}${c.stderr}`;
       }
       const d = await ax(['build', 'std.c', '--emit=c-pp']);
       if (d.stdout.trim() !== 'long v = 201710L;') return `the default is not c17: ${d.stdout}`;
-      for (const bad of ['--c-std=gnu99', '--c-char=yes', '--c-int=8', '--c-long=16', '--c-long-double=96']) {
+      for (const bad of ['--c-std=gnu95', '--c-std=GNU99', '--c-char=yes', '--c-int=8', '--c-long=16', '--c-long-double=96']) {
         const p = await fatal(['build', 'std.c', bad], /E9001/);
         if (p) return p;
       }
@@ -756,9 +757,10 @@ function cDriverCases() {
         if (/expect-error|linux-only|windows-only/.test(src)) continue;
         const others = fs.readdirSync(d).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || (!axMain && n.endsWith('.ax')))).map((n) => path.join(d, n));
         const uses = [...src.matchAll(/(?:\/\/ |\/\* )uses: (.*?)(?: \*\/)?$/gm)].flatMap((m) => m[1].trim().split(/\s+/)).map((x) => path.resolve(d, x));
+        const flags = [...src.matchAll(/(?:\/\/ |\/\* )flags: (.*?)(?: \*\/)?$/gm)].flatMap((m) => m[1].trim().split(/\s+/));
         for (const t of ['aarch64-macos', 'x86_64-windows']) {
           const out = path.join(dir, `mix-${path.basename(d)}-${t}`);
-          const c = await ax(['build', main, ...others, ...uses, `--target=${t}`, '--pdb=off', '-o', out]);
+          const c = await ax(['build', main, ...others, ...uses, ...flags, `--target=${t}`, '--pdb=off', '-o', out]);
           if (c.status !== 0) return `${path.basename(d)} for ${t}: ${c.stdout}${c.stderr}`;
           const bytes = fs.readFileSync(out);
           if (t === 'aarch64-macos') {

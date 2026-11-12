@@ -9,7 +9,9 @@ platform's C library on Linux (see "What a C program is here").
 It is a freestanding implementation, in C's terms: it has the freestanding headers and no
 library. It reads C89, C95, C99, C11, C17 and C23 (`--c-std=`; C17 by default), each
 mode accepting its standard's language and diagnosing what a later standard added or its
-own removed. It has no extensions of any kind.
+own removed, and their GNU dialects (`--c-std=gnu89` ... `gnu23`), which add the widely
+used GNU extensions ("GNU dialects", below). Under an ISO standard there are no extensions,
+but the pragmas, which every mode has.
 
 ```
 axiom build prog.c -o prog                       # wasm32: prog.wasm
@@ -68,19 +70,20 @@ Axiom in one program").
 
 | Option | |
 |---|---|
-| `--c-std=<std>` | The standard (see "Standards"; default `c17`). |
+| `--c-std=<std>` | The standard (see "Standards"; default `c17`), or a GNU dialect (`gnu89` ... `gnu23`: "GNU dialects"). |
 | `--c-char=signed\|unsigned` | Whether plain `char` is signed (default: the target's C ABI). |
 | `--c-int=16\|32\|64` | The width of `int` (default 32). |
 | `--c-long=32\|64` | The width of `long` (default: the target's C ABI; at least `--c-int`). |
 | `--c-long-double=64\|80\|128` | The format of `long double` (default: the target's C ABI; see "Floating types"). `80` is for `x86_64` (Linux) only; `128` for `x86_64` and `aarch64` (Linux) and WebAssembly. |
 | `-DNAME`, `-DNAME=value` | Define a macro (`NAME` is `NAME=1`). `-D'F(x)=x+1'` defines a function-like macro. |
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
+| `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111` (it is ignored either way). |
 | `-Idir` | Add a directory to the include path. |
 | `--c-freestanding` | Link no C library into the program ("The C library"). |
 
 `-D`, `-U` and `-I` apply in the order given. The C options are errors for an Axiom
 source. The unknown ones are errors too: there are no `-W...`, `-std=`, `-c` or `-f...`
-options, and no way to silence a warning.
+options; a warning is silenced only by `#pragma GCC diagnostic` ("Pragmas").
 
 ### Options of `axiom build` that apply
 
@@ -224,7 +227,9 @@ definitions are (6.9p5), and there are no "common" objects.
 An executable holds what its `main` (and the Axiom program's exports) can reach, and
 nothing else the C units define: a function that nothing calls or takes the address of,
 an object that nothing refers to, and a string literal only they use are left out, at
-every optimization level, before the optimizer runs. So a C library given in full (a
+every optimization level, before the optimizer runs. In a GNU dialect, what has the
+attribute `used`, and an object placed in a section (`section`), are kept too, and so
+are the constructors and destructors, which the start-up calls. So a C library given in full (a
 unit of 200 functions, say) adds nothing to a program that calls none of its functions,
 and the size of one that calls one function is that of the program with that function
 alone. An object (`--emit=obj`) and a program that the system's linker links (with
@@ -290,6 +295,7 @@ program's C options (`--c-std`, `--c-int`, ...).
 | `c11`, `iso9899:2011` | ISO/IEC 9899:2011 |
 | `c17`, `c18`, `iso9899:2017`, `iso9899:2018` | ISO/IEC 9899:2018 (the default) |
 | `c23`, `iso9899:2024` | ISO/IEC 9899:2024 |
+| `gnu89`, `gnu90`, `gnu99`, `gnu11`, `gnu17`, `gnu18`, `gnu23` | The standard of the number (C89, C99, C11, C17, C23) and the GNU extensions ("GNU dialects") |
 
 Other names, and upper case ones, are errors. `__STDC_VERSION__` is not
 defined for C89, and is `199409L`, `199901L`, `201112L`, `201710L` and `202311L` for the
@@ -315,8 +321,8 @@ and `noreturn` also give warnings (`C4050`, `C4051`, `C4053`). An attribute with
 (`[[vendor::x]]`) is ignored; one without a prefix that is not a standard attribute is
 ignored with the warning `C4052`.
 
-`#pragma` lines are ignored in every mode, the standard `STDC` ones included, and so are
-`_Pragma` operators.
+`#pragma` lines and `_Pragma` operators are read in every mode ("Pragmas"): those this
+implementation knows act, the others are ignored.
 
 ### Predefined macros
 
@@ -340,6 +346,7 @@ The compiler's own macros say what the build chose:
 | `__AXIOM_WCHAR_WIDTH__` | The width of `wchar_t`: 16 or 32. |
 | `__AXIOM_WCHAR_SIGNED__` | 1 if `wchar_t` is signed, else 0. |
 | `__CHAR_UNSIGNED__` | 1, defined only if plain `char` is unsigned. |
+| `__AXIOM_GNU__` | 1, defined only in a GNU dialect. |
 
 No macro names the target (`__linux__`, `_WIN32`, `__x86_64__` and the like are not
 defined): pass `-D` for what a program needs to know.
@@ -402,7 +409,7 @@ its own: a program built with other widths cannot pass such values to it.
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
 | Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. There are no imaginary types. |
 | Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest); the rounding mode cannot be changed. A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals; constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
-| Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that. `#pragma pack` is ignored. |
+| Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
 | `max_align_t` | A structure of a `long long` and a `long double`: size 32, alignment 16 where `long double` is 16 bytes, else size 16, alignment 8. |
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |
 | Bit-fields | Allocated from the least significant bit of a storage unit of the declared type; one never straddles two units. A plain `int` bit-field is signed. A `char` bit-field has `char`'s signedness. An unnamed bit-field takes space and adds nothing to the alignment of the structure; one of width 0 moves the next member to the next unit. |
@@ -464,11 +471,160 @@ as the standard says.
   duration, as it would in a program with one thread.
 - The library, and Annex F, `<fenv.h>` and `<math.h>`: exception flags and rounding modes.
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
-- Extensions of any kind. These are all errors: `__attribute__`, `asm` and `__asm__`,
-  `__declspec`, `__int128`, `__typeof__` (and `typeof` before C23), statement expressions,
-  `?:` with an omitted middle operand, case ranges, computed `goto` and labels as values,
-  `__builtin_*` functions other than those below, `#include_next`, `#ident`,
-  `#import`, `#assert`.
+- Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
+  and `__asm__`, `__int128`, `__typeof__` (and `typeof` before C23), statement
+  expressions, `?:` with an omitted middle operand, case ranges, computed `goto` and labels
+  as values, `__builtin_*` functions other than those below ("Reserved identifiers"),
+  `#include_next`, `#ident`. A GNU dialect has them ("GNU dialects"), but for those it
+  rejects too.
+- In every mode: inline assembly (`asm` statements, C3901), `__declspec`, `#import`,
+  `#assert`, `__int128`, the floating types `_Float16`, `_FloatN`, `_FloatNx` and
+  `__float128`, and vector types (the attribute `vector_size`): C3901 in a GNU dialect.
+
+## GNU dialects
+
+`--c-std=gnu89`, `gnu90`, `gnu99`, `gnu11`, `gnu17`, `gnu18` and `gnu23` are the standard
+of their number with the extensions below, each checked as the rest of the language is
+(constraint violations are errors). `__GNUC__` is not defined: it claims every extension of
+another compiler and its version's builtins, which programs then rely on; a program tests
+`__AXIOM_GNU__`, `__has_attribute`, `__has_builtin` and `__has_include` instead, which say
+exactly what works (there is no option that defines `__GNUC__`).
+
+### Language
+
+| Extension | |
+|---|---|
+| Keywords | `__extension__` (ignored), `__inline`, `__inline__`, `__const`, `__const__`, `__volatile`, `__volatile__`, `__restrict`, `__restrict__`, `__signed`, `__signed__`, `__alignof`, `__alignof__` (also of an expression: `__alignof__ x`, a member's own alignment), `__typeof`, `__typeof__` and `typeof` in every dialect, `__thread`, `asm`, `__asm`, `__asm__`; `inline` in gnu89. |
+| C99 and C11 in older dialects | From gnu89: `//` comments, `long long`, mixed declarations and code, designated initializers, compound literals, a trailing comma in an enumerator list, variable length arrays, flexible array members, variadic macros and empty macro arguments, hexadecimal floating constants, `_Pragma`, `__func__`, initializers of aggregates that are not constants; from gnu89 and gnu99: anonymous structures and unions; in every dialect: attributes `[[...]]` and `{}`. |
+| `__auto_type x = e;` | x has e's type (as C23's `auto`). |
+| `__label__ a, b;` | Labels local to the block (a statement expression in a macro can have its own). |
+| `({ ... })` | A statement expression: its value is that of its last statement if that is an expression statement (after its labels), else none (void); its objects with cleanups are cleaned up after it is computed. Not outside a function (C3090). `break`, `continue`, `goto` and `return` may leave it. |
+| `&&label`, `goto *p` | Labels as values: `&&label` is a `void *`, an address constant (so it may initialize a static object: `static void *t[] = { &&a, &&b };`), equal only to itself; `goto *p` jumps to the label whose address p is. A label's address is an address in a table of its function's (one byte for each label whose address is taken), and `goto *` is a switch on the distance from the table's start; so the values compare and subtract as addresses (`&&a - &&b` of one function's labels is an integer constant), and stay valid when the function is inlined. Not where a variable length array or an object with a cleanup is in scope (C3901). |
+| `case lo ... hi:` | A case range (inclusive); an empty one (lo > hi) is the warning C4120; overlapping another case is C3041. |
+| `a ?: b` | `a ? a : b` with a evaluated once. |
+| `[lo ... hi] = v` | A designator range (several in one designation too); v must have no effects if the range has more than one element (it would be evaluated once: C3901). |
+| `member: v` | The old designator `.member = v`. |
+| Zero-length arrays | `T a[0]`: size 0 (as a structure's last member, a flexible array member's place). |
+| Flexible array members | May be initialized in an object with static storage duration: `static struct s v = { 2, { 1, 2 } };` makes v as large as its initializer (sizeof still gives the type's size). |
+| Structures and unions without members | Of size 0. |
+| Compound literals of constants | May initialize an object with static storage duration as their lists would (`static struct p v = (struct p){ 1, 2 };`). |
+| `void *` and function pointers | Arithmetic on them as on `char *`; `sizeof` and `__alignof__` of `void` and of a function type are 1. |
+| Constants | Binary constants (`0b101`) and the escape `\e` (27) in every dialect. |
+| `__FUNCTION__`, `__PRETTY_FUNCTION__` | Other names of `__func__` (`""` outside a function). |
+| `T f(...) asm("name");` | The function's or object's symbol is `name` (an asm label; with external linkage). On an automatic object it is C3090, on a `register` one (an explicit register variable) C3901. |
+
+### Preprocessor
+
+`#include_next <file>` (and `__has_include_next`): the next file of the name in the
+include path after the directory the current file was found in; `#warning` before C23
+(C4103); `#ident "text"` (ignored). Variadic macros may name their variable arguments
+(`#define F(fmt, args...) f(fmt, args)`), may be invoked without them before C23, and
+`, ## __VA_ARGS__` is the comma and the variable arguments, or nothing when there are none.
+`__COUNTER__` (0, 1, 2, ... at each use), `__INCLUDE_LEVEL__`, `__BASE_FILE__`,
+`__TIMESTAMP__` (the current file's modification time, in UTC, as asctime writes it);
+`__ATOMIC_RELAXED` ... `__ATOMIC_SEQ_CST` (0 to 5). In every mode, `__has_include`,
+`__has_attribute` (1 for the GNU attributes below in a GNU dialect, and the standard ones'
+values in C23) and `__has_builtin` (1 for the builtins that work in the mode).
+
+### Attributes
+
+`__attribute__((...))` in the places a GNU dialect allows them: among declaration
+specifiers and after a declarator (they appertain to the declared entities, every one of
+a declaration's), after `struct`, `union` or `enum` and after the closing brace of its list
+(to the type), on members and bit-fields, parameters, enumerators, labels (`l:
+__attribute__((unused));`) and statements (`__attribute__((fallthrough));`), after `*`.
+`[[gnu::name]]` and `[[__gnu__::name]]` are the same in a GNU dialect (under an ISO
+standard they are a vendor's: ignored). Each name may be written `__name__`. Arguments are
+checked (C3077, C3071). An unknown attribute, or one where it cannot appertain, is warning
+C4052 and is ignored.
+
+| Attribute | Of | What it does |
+|---|---|---|
+| `aligned`, `aligned(n)` | objects, members, structures and unions | At least n bytes (no n: 16). On a typedef only its type's own alignment (another: C3901); on a function accepted (code is aligned as the target's). |
+| `packed` | structures, unions, members, enumerations | Members at byte alignment (but those with an alignment of their own); bit-fields at the next bit, each reached through the smallest unit of 1, 2, 4 or 8 bytes in the structure that holds it (none: C3901); an enumeration's type is the smallest integer type of its values. Members of a packed structure are loaded and stored with the alignment they have. |
+| `section("s")` | objects with static storage duration, functions | The object goes in section s of an ELF object (Linux); elsewhere, and for functions, accepted with no effect. The compiler's own linker does not define `__start_s` and `__stop_s`. |
+| `used` | objects, functions | Kept though nothing refers to it. |
+| `unused` | any declaration, labels | As `[[maybe_unused]]`. |
+| `weak` | objects and functions with linkage | A weak definition, which gives way to another unit's that is not weak ("C and Axiom in one program"), or a weak reference (a null pointer if no unit defines it; on WebAssembly the host's import). `#pragma weak` too. |
+| `alias("target")` | functions and objects | Another name for target, defined in the same unit (else C3090): references to it are to target. It has no symbol of its own: another unit cannot refer to it. |
+| `visibility("v")` | objects, functions | default, hidden, protected or internal: accepted (no effect: programs are static executables, and objects are linked into them). |
+| `noreturn` | functions | As `[[noreturn]]` (C4053). |
+| `noinline`, `always_inline`, `cold` | functions | Given to the optimizer. |
+| `hot`, `const`, `pure`, `malloc`, `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `sentinel`, `format_arg`, `may_alias` | | Accepted; no effect (none is needed for correct code). |
+| `format(archetype, i, j)` | functions | Arguments checked; the calls are not. |
+| `nonnull`, `nonnull(i, ...)` | functions | A null pointer constant passed for one of those parameters (all pointers without indexes) is warning C4121. |
+| `warn_unused_result` | functions | As `[[nodiscard]]` (C4051). |
+| `deprecated`, `deprecated("m")`, `unavailable` | declarations | As `[[deprecated]]` (C4050). |
+| `error("m")`, `warning("m")` | functions | A call is error C3091, or warning C4123. |
+| `fallthrough` | an attribute statement | As `[[fallthrough]]`. |
+| `gnu_inline` | functions | GNU89's inline semantics (below) in a later dialect. |
+| `constructor`, `constructor(p)`, `destructor`, `destructor(p)` | functions without parameters | Called by the program's start-up before `main` (lowest priority first; without one, 65535; then in the order defined), and after `main` returns (highest priority first, the last defined first). A program that ends otherwise (calling `exit`) does not run the destructors, and an object without `main` (`--emit=obj`), or a program whose `main` is Axiom's, runs neither. |
+| `cleanup(f)` | automatic objects | `f(&object)` when its scope is left: the end of its block, `break`, `continue`, `goto` out, `return` (after the value is computed), the end of a statement expression; innermost first. A jump into its scope is C3083. |
+| `transparent_union` | unions (and their typedefs) | A parameter of the type takes an argument of any member's type (or a null pointer constant, or a pointer to void for a pointer member). It is passed as the union is (the platform ABIs pass a union of one pointer or integer as that member). |
+| `mode(m)` | integer objects, members, typedefs | The integer type of m's width with the declared type's signedness: QI, HI, SI, DI, `byte`, `word`, `pointer` (also `__QI__` ...); TI (128 bits) is C3901. |
+| `vector_size(n)` | | C3901: vector types are not supported. |
+
+In gnu89 and gnu90 `inline` has GNU89's meaning: `inline` alone defines the external
+function, `extern inline` is an inline definition (C99's `inline`).
+
+### Builtins
+
+In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); each name
+`__has_builtin` gives 1 for. Their operands are checked (C3023, C3082).
+
+| Builtins | |
+|---|---|
+| `__builtin_expect(x, c)`, `__builtin_expect_with_probability(x, c, p)` | x. |
+| `__builtin_unreachable()`, `__builtin_trap()` | Undefined if reached; a trap. |
+| `__builtin_constant_p(x)` | 1 if x is an arithmetic or address constant (it is not evaluated), else 0: a constant. |
+| `__builtin_choose_expr(c, a, b)` | a if the integer constant c is nonzero, else b (unconverted; the other is not checked). |
+| `__builtin_types_compatible_p(T1, T2)` | 1 if the types are compatible (top-level qualifiers aside). |
+| `__builtin_offsetof(T, m)` | As `offsetof`. |
+| `__builtin_object_size(p, t)`, `__builtin_dynamic_object_size` | The size is never known: `(size_t)-1` for t 0 and 1, 0 for 2 and 3. |
+| `__builtin_clz`, `ctz`, `popcount`, `parity`, `ffs`, `clrsb`, with `l` and `ll` | Of `unsigned int` (ffs, clrsb: `int`) ... `unsigned long long`; clz and ctz of 0 give the type's width. |
+| `__builtin_bswap16`, `bswap32`, `bswap64` | |
+| `__builtin_add_overflow`, `sub_overflow`, `mul_overflow(a, b, r)` | As `ckd_add(r, a, b)`; the typed `__builtin_sadd_overflow` ... `umulll_overflow`; `__builtin_add_overflow_p(a, b, c)` ... (whether the result overflows c's type). |
+| `__builtin_memcpy`, `memmove`, `memset` | The IR's operations; their value is the destination. |
+| `__builtin_abs`, `fabs`, `sqrt`, `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, `copysign`, `fma` (with `f` and `l`) | The IR's operations (`sqrt` of a negative number is a NaN; errno is not set; `fma` on WebAssembly calls the library's). Where `long double` is wider than `double`, the `l` forms but `fabsl` and `copysignl` (which change the sign bit) call the library's function of that name. |
+| `__builtin_memcmp`, `strlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strchr`, `strrchr`, `strstr`, `memchr`, `printf`, `sprintf`, `snprintf`, `puts`, `putchar`, `malloc`, `calloc`, `realloc`, `free`, `abort`, `exit`, `labs`, `llabs`, and the math functions (`sin`, `cos`, `tan`, `exp`, `log`, `pow`, `round`, `fmin`, `fmax`, `fmod`, `hypot`, `ldexp`, `frexp`, `modf`, `lround` ... with `f` and `l` where the library has them) | Calls of the C library's function of that name. |
+| `__builtin_alloca(n)`, `__builtin_alloca_with_align(n, bits)` | n bytes of the function's frame, until it returns. |
+| `__builtin_frame_address(0)`, `__builtin_return_address(0)` | The frame record's address and the return address (natively); on WebAssembly the stack pointer and a null pointer. Another level is C3090. |
+| `__builtin_prefetch(p, ...)`, `__builtin_assume_aligned(p, a [, o])` | Nothing; p. |
+| `__builtin_inf`, `huge_val`, `nan("")`, `nans("")` (with `f` and `l`) | Constants (a NaN's payload is not kept; a signaling NaN is quiet; a NaN is positive). |
+| `__builtin_isnan`, `isinf`, `isfinite`, `isnormal`, `signbit`, `isinf_sign`, `fpclassify(a, b, c, d, e, x)`, `isgreater`, `isgreaterequal`, `isless`, `islessequal`, `islessgreater`, `isunordered` | Of the floating type of the operands (an integer is a double). |
+| `__sync_fetch_and_op`, `__sync_op_and_fetch` (op: add, sub, or, and, xor, nand), `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, `__sync_lock_release`, `__sync_synchronize` | Atomic, sequentially consistent. |
+| `__atomic_load_n`, `store_n`, `exchange_n`, `compare_exchange_n`, `fetch_op`, `op_fetch`, `test_and_set`, `clear`, `thread_fence`, `signal_fence`, the generic `load`, `store`, `exchange`, `compare_exchange`, `always_lock_free`, `is_lock_free` | Every memory order is taken as `__ATOMIC_SEQ_CST` (a stronger order is a valid one). |
+
+The atomic builtins take a pointer to an integer or pointer type of 1, 2, 4 or 8 bytes
+(the generic ones: to any object of those sizes, aligned to its size), with the IR's
+atomic operations (nand: a compare-and-swap loop); they are lock-free on every target.
+
+## Pragmas
+
+Every mode reads `#pragma` and `_Pragma("...")`. The operands are not macro-replaced,
+but those of `message`, `GCC warning` and `GCC error`. A known pragma that is malformed
+is the warning C4112 and is ignored; an unknown one is ignored (the warning C4111 with
+`--c-warn-unknown-pragmas`).
+
+| Pragma | |
+|---|---|
+| `once` | The file is not included again. |
+| `pack(n)`, `pack()`, `pack(push [, id] [, n])`, `pack(pop [, id or n])`, `pack(show)` | Members of the structures and unions whose member lists end after it are aligned to at most n bytes (1, 2, 4, 8 or 16; bit-fields as in a packed structure, in units aligned to at most n); `show` is the warning C4114 with the value. |
+| `push_macro("M")`, `pop_macro("M")` | M's definition (or that it has none) saved, and made M's again. |
+| `weak name`, `weak name = target` | As the attribute weak (and alias), if the unit declares name. |
+| `message("text")` | The warning C4110 with the text. |
+| `STDC FP_CONTRACT ON/OFF/DEFAULT` | Accepted: no floating operations are contracted (an FMA is only the `fma` the program calls), so both hold. |
+| `STDC FENV_ACCESS ON/OFF/DEFAULT` | OFF holds; ON is the warning C4113: the floating-point environment cannot be changed or tested, and the optimizer assumes the default one. |
+| `STDC CX_LIMITED_RANGE ON/OFF/DEFAULT` | Accepted (it allows, and asks for nothing). |
+| `STDC FENV_ROUND dir` (C23) | FE_TONEAREST and FE_DYNAMIC hold; the other directions are C4113. |
+| `GCC diagnostic push`, `pop`, `ignored "-Wx"`, `warning "-Wx"`, `error "-Wx"` | The warnings after it (in its file, and in the files it includes) that -Wx names are not shown, shown, or errors (keeping their codes). -Wx is one of the compiler's codes (`"C4050"`), `-Wall`, `-Wextra` and `-Wpedantic` (every warning), or a usual name that stands for one: `-Wdeprecated-declarations` and `-Wdeprecated` (C4050), `-Wunused-result` and `-Wunused-value` (C4051), `-Wattributes` (C4052), `-Winvalid-noreturn` (C4053), `-Wimplicit-function-declaration` (C4001), `-Wunused-label` (C4040), `-Wvarargs` (C4080), `-Wmultichar` (C4102), `-Wcpp` (C4103), `-Wunknown-pragmas` (C4111), `-Wpragmas` (C4112), `-Wnonnull` (C4121), `-Wswitch-outside-range` (C4120), `-Wattribute-warning` (C4123); others are ignored. An error is never made a warning. |
+| `GCC visibility push(v)`, `pop` | Accepted (as the attribute visibility). |
+| `GCC poison x y` | A later use of x or y is the error C1086 (not one a macro defined before makes). |
+| `GCC system_header` | The rest of the file gives no warnings (in the main file it means nothing). |
+| `GCC warning "m"`, `GCC error "m"` | The warning C4103, or the error C1040. |
+| `GCC push_options`, `pop_options`, `optimize`, `target`, `unroll`, `ivdep`, `novector`, `dependency` | Ignored. |
+
+`--emit=c-pp` writes the pragmas the later phases read, where they change what they say: `pack(n)` (the value then in force), `GCC visibility`, and the `weak` ones at the end; the others have acted already.
 
 ## Reserved identifiers
 
@@ -661,11 +817,14 @@ claims less than the standard allows. None is hidden: each is said above or here
 - `_Atomic`, decimal floating types and threads are absent, as the feature
   macros say.
 - `thread_local` objects have static storage duration.
-- `restrict` has no effect on the generated code; `#pragma` (the `STDC` ones included)
-  is ignored, so `FP_CONTRACT`, `FENV_ACCESS` and `CX_LIMITED_RANGE` have no effect.
+- `restrict` has no effect on the generated code; `#pragma STDC FENV_ACCESS ON` is not
+  honoured (C4113).
 - The variadic-argument placement limits on x86-64 System V and macOS above.
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;
   a program must not rely on it.
 - An object from `--emit=obj` of units with no `main` does not link into an Axiom
   program with `--link=` (above); the C sources build with it instead. There are no
   static archives of the compiler's own objects.
+- In a GNU dialect: `__int128` and the `_FloatN` types are not supported; the
+  destructors run only when `main` returns; an alias is another name in its unit only; the
+  attribute `section` places only data, and only in ELF objects.

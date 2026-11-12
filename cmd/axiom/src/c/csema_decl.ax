@@ -23,6 +23,7 @@ import "csema_builtin.ax" as csbi;
 import "csema_desig.ax" as cdi;
 import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
+import "csema_gnu.ax" as cgn;
 import "csema_ice.ax" as csi;
 import "csema_marks.ax" as csm;
 import "csema_vla.ax" as vla;
@@ -79,6 +80,7 @@ struct Counts {
     valist: i32,
     complex_: i32,  // _Complex
     bitint: i32,    // _BitInt(width)
+    int128: i32,    // __int128 (a GNU dialect)
     width: i32,     // its width (0: in error, reported)
     width_sp: u.Span,
     other: i32,  // a tag, typedef name or other type specifier
@@ -89,13 +91,14 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
                         align: 0, has_align: false, align_sp: ds.span, constexpr_: false, infer: false };
     let mut scs: i32 = 0;
     let mut c = Counts.{ void_: 0, char_: 0, short_: 0, int_: 0, long_: 0, float_: 0, double_: 0, signed_: 0,
-                         unsigned_: 0, bool_: 0, int64: 0, valist: 0, complex_: 0, bitint: 0, width: 0,
+                         unsigned_: 0, bool_: 0, int64: 0, valist: 0, complex_: 0, bitint: 0, int128: 0, width: 0,
                          width_sp: ds.span, other: 0 };
     let mut other = cty.t_error;
     let mut td_seen = false;  // a typedef name, at td_span
     let mut td_span = ds.span;
     let mut qual_seen: i32 = 0;
     let mut bad = false;
+    let mut auto_type = false;
     dsp.attrs(&ds.attrs, dsp.AP_TYPE);
     for si in 0..ds.items.len {
         let s = ds.items.at(si);
@@ -143,6 +146,13 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
                 // implementation does not claim)
                 cs.not_supported(s.span, "'_Imaginary' (the imaginary types)");
                 bad = true;
+            } else if kw == ct.K_AUTO_TYPE {
+                auto_type = true;  // (a GNU dialect: the type of the initializer)
+            } else if kw == ct.K_INT128 {
+                c.int128 += 1;
+            } else if kw == ct.K_EXT_FLOAT {
+                cs.not_supported(s.span, "the floating types _FloatN, _FloatNx and __float128");
+                bad = true;
             } else {
                 cs.not_supported(s.span, u.f1("'%s'", cast.kw_text(kw)));
                 bad = true;
@@ -152,7 +162,7 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
             if q == cty.Q_ATOMIC {
                 cs.not_supported(s.span, "_Atomic");
                 bad = true;
-            } else if ((qual_seen & q) != 0) and (cs.std() < co.C99) {
+            } else if ((qual_seen & q) != 0) and (cs.std() < co.C99) and not cs.opts().gnu {
                 cs.err(s.span, "C3006", u.f1("'%s' is repeated (allowed from C99)", cast.kw_text(s.kw)));
             }
             qual_seen = qual_seen | q;
@@ -215,13 +225,25 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
     while oq.kind == cty.TK_ARRAY {
         oq = oq.elem;  // (an array type's qualifiers are its elements')
     }
-    if td_seen and ((oq.quals & qual_seen) != 0) and (cs.std() < co.C99) {
+    if td_seen and ((oq.quals & qual_seen) != 0) and (cs.std() < co.C99) and not cs.opts().gnu {
         cs.err(td_span, "C3006", "a type qualifier is repeated, through a typedef name (allowed from C99)");
     }
     let st = dsp.storage(scs, ds);
     r.sc = st.sc;
     r.constexpr_ = st.constexpr_;
     r.infer = st.infer;
+    if auto_type {
+        let kws = c.void_ + c.char_ + c.short_ + c.int_ + c.long_ + c.float_ + c.double_ + c.signed_ + c.unsigned_ +
+                  c.bool_ + c.int64 + c.valist + c.bitint + c.other + c.int128 + c.complex_;
+        if kws > 0 {
+            cs.err(ds.span, "C3005", "'__auto_type' with another type specifier");
+            r.ty = cty.t_error;
+            return r;
+        }
+        r.infer = true;
+        r.quals = qual_seen & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT);
+        return r;
+    }
     if r.thread and (ctx != CTX_MEMBER) and (ctx != CTX_TYPENAME) {
         dsp.thread_local(ds, st, (ctx == CTX_BLOCK) or (ctx == CTX_FOR), ctx == CTX_PARAM);
     }
@@ -317,7 +339,7 @@ fn base_type(c: *Counts, other: *mut cty.CType, sp: u.Span) *mut cty.CType {
         // float _Complex, double _Complex, long double _Complex, in any
         // order (6.7.2p2)
         let rest = c.void_ + c.char_ + c.short_ + c.int_ + c.signed_ + c.unsigned_ + c.bool_ + c.int64 + c.valist +
-                   c.other + c.bitint;
+                   c.other + c.bitint + c.int128;
         if (c.complex_ > 1) or (rest > 0) or ((c.float_ + c.double_) != 1) or (c.long_ > c.double_) {
             if (c.complex_ == 1) and (rest == 0) and (c.float_ + c.double_ + c.long_ == 0) {
                 cs.err(sp, "C3005", "'_Complex' needs a real floating type: float, double or long double _Complex");
@@ -336,10 +358,22 @@ fn base_type(c: *Counts, other: *mut cty.CType, sp: u.Span) *mut cty.CType {
     let kws = c.void_ + c.char_ + c.short_ + c.int_ + c.long_ + c.float_ + c.double_ + c.signed_ + c.unsigned_ +
               c.bool_ + c.int64 + c.valist;
     if c.other > 0 {
-        if (c.other > 1) or (kws > 0) or (c.bitint > 0) {
+        if (c.other > 1) or (kws > 0) or (c.bitint > 0) or (c.int128 > 0) {
             return bad_combination(sp);
         }
         return other;
+    }
+    if c.int128 > 0 {
+        // __int128, signed or unsigned (a GNU dialect)
+        if (c.int128 > 1) or (kws != c.signed_ + c.unsigned_) or (kws > 1) or (c.bitint > 0) {
+            return bad_combination(sp);
+        }
+        let t = cty.int128(c.unsigned_ == 0);
+        if u.isnil(t) {
+            cs.not_supported(sp, "'__int128'");
+            return cty.t_error;
+        }
+        return t;
     }
     if c.bitint > 0 {
         if (c.bitint > 1) or (kws != c.signed_ + c.unsigned_) or (kws > 1) {
@@ -551,6 +585,7 @@ fn tag_attrs(ts: *mut cast.TagSpec, t: *mut cty.CType, declares: bool) void {
     }
     if declares {
         catr.mark_tag(t, &ts.attrs);
+        cgn.mark_tag(t, &ts.attrs);
         return;
     }
     if ts.attrs.len > 0 {
@@ -583,6 +618,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         }
         let sp = specifiers(md.specs, CTX_MEMBER, md.decls.len == 0);
         dsp.attrs(&md.attrs, dsp.AP_MEMBER);
+        dsp.attrs(&md.specs.gattrs, dsp.AP_MEMBER);
         if md.decls.len == 0 {
             // an anonymous structure or union (C11)
             let at = sp.ty;
@@ -600,8 +636,9 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         }
         for d in md.decls.items() {
             dsp.attrs(&d.attrs, dsp.AP_MEMBER);
+            let mbase = cgn.mode_type(sp.ty, &md.specs.gattrs, &md.attrs, &d.attrs);
             if u.notnil(d.width) {
-                let bt = derive(sp.ty, d, CTX_MEMBER);
+                let bt = derive(mbase, d, CTX_MEMBER);
                 d.ty = bt;
                 let w = dsp.bit_width(bt, d);
                 if sp.has_align {
@@ -628,11 +665,12 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                 let bm = ti.members.last();
                 catr.mark_member(bm, &md.attrs);
                 catr.mark_member(bm, &d.attrs);
+                gnu_member(bm, md, d);
                 bm.is_bitfield = true;
                 bm.bit_width = w;
                 continue;
             }
-            let mt = derive(sp.ty, d, CTX_MEMBER);
+            let mt = derive(mbase, d, CTX_MEMBER);
             d.ty = mt;
             if cty.is_error(mt) or not vla.check_member(d, mt) {
                 continue;
@@ -646,7 +684,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
                 continue;
             }
             let is_flex = (mt.kind == cty.TK_ARRAY) and not mt.has_len and not mt.vla and cty.is_complete(mt.elem);
-            if is_flex and (cs.std() < co.C99) {
+            if is_flex and (cs.std() < co.C99) and not cs.opts().gnu {
                 cs.err(d.name_span, "C3007",
                        u.f1("the member '%s' has incomplete type (flexible array members are a C99 feature)", d.name));
                 continue;
@@ -666,6 +704,7 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
             add_member(ti, d.name, d.name_span, mt);
             catr.mark_member(ti.members.last(), &md.attrs);
             catr.mark_member(ti.members.last(), &d.attrs);
+            gnu_member(ti.members.last(), md, d);
             named += 1;
             if sp.has_align and dsp.check_alignment(sp.align, sp.align_sp, mt, d.name) {
                 ti.members.last().align = sp.align;
@@ -680,7 +719,37 @@ fn record_body(t: *mut cty.CType, ts: *mut cast.TagSpec) void {
         }
     }
     ti.defining = false;
+    if cs.opts().gnu {
+        // (a GNU dialect: packed, aligned, #pragma pack: csema_bits.ax)
+        let n = cgn.note_of_tag(ti);
+        if u.notnil(n) {
+            ti.packed = n.packed;
+            ti.min_align = n.aligned;
+        }
+        ti.pack = ts.pack;
+    } else if ts.pack != 0 {
+        ti.pack = ts.pack;
+    }
     cb.layout(ti);
+}
+
+// What the GNU attributes of member declaration md and its declarator d
+// say of member m: packed, aligned (a GNU dialect).
+fn gnu_member(m: *mut cty.Member, md: *mut cast.Decl, d: *mut cast.Declarator) void {
+    if not cs.opts().gnu {
+        return;
+    }
+    cgn.mark_member(m, &md.attrs);
+    cgn.mark_member(m, &d.attrs);
+    cgn.mark_member(m, &md.specs.gattrs);
+    let n = cgn.note_of_member(m);
+    if u.isnil(n) {
+        return;
+    }
+    m.packed = n.packed;
+    if n.aligned > m.align {
+        m.align = n.aligned;
+    }
 }
 
 fn check_dup(names: *mut u.SymMap.[i32], name: []u8, sp: u.Span) void {
@@ -727,7 +796,7 @@ fn derive(base: *mut cty.CType, d: *mut cast.Declarator, ctx: i32) *mut cty.CTyp
             if (dv.quals & cast.Q_ATOMIC) != 0 {
                 cs.not_supported(dv.span, "_Atomic");
             }
-            if dv.dup_quals and (cs.std() < co.C99) {
+            if dv.dup_quals and (cs.std() < co.C99) and not cs.opts().gnu {
                 cs.err(dv.span, "C3006", "a repeated type qualifier (allowed from C99)");
             }
             t = cty.qualify(cty.pointer_to(t), dv.quals & (cty.Q_CONST | cty.Q_VOLATILE | cty.Q_RESTRICT));
@@ -788,6 +857,9 @@ fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool, in_par
     if not cx.const_in_range(x) {
         return cty.t_error;
     }
+    if (x.cval == 0) and cs.opts().gnu {
+        return cty.array_of(t, 0, true);  // (a GNU dialect's zero-length array)
+    }
     if (x.ty.is_signed and (@bit_cast(i64, x.cval) < 0)) or (x.cval == 0) {
         cs.err(x.span, "C3009",
                u.f1(
@@ -838,7 +910,7 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             if (sp.sc != 0) and (sp.sc != cast.SC_REGISTER) {
                 cs.err(p.specs.span, "C3006", "a parameter's only storage-class specifier can be 'register'");
             }
-            let pt = derive(sp.ty, p.decl, CTX_PARAM);
+            let pt = derive(cgn.mode_type(sp.ty, &p.specs.gattrs, &p.attrs, &p.decl.attrs), p.decl, CTX_PARAM);
             p.decl.ty = pt;
             if cty.is_void(pt) and (ps.len == 1) and (p.decl.name.len == 0) and (p.decl.derivs.len == 0) and
                (pt.quals == 0) and not dv.variadic {
@@ -855,9 +927,11 @@ fn function_deriv(ret: *mut cty.CType, dv: *mut cast.Deriv, at_name: bool) *mut 
             }
             dsp.attrs(&p.attrs, dsp.AP_OBJECT);
             dsp.attrs(&p.decl.attrs, dsp.AP_OBJECT);
+            dsp.attrs(&p.specs.gattrs, dsp.AP_OBJECT);
             p.decl.sym = s;
             catr.mark_sym(s, &p.attrs);
             catr.mark_sym(s, &p.decl.attrs);
+            catr.mark_sym(s, &p.specs.gattrs);
             if p.decl.name.len > 0 {
                 let prior = cs.lookup_here(p.decl.name);
                 if u.notnil(prior) {
@@ -900,6 +974,7 @@ pub fn type_name(tn: *mut cast.TypeName) *mut cty.CType {
     if u.notnil(tn.ty) {
         return tn.ty;
     }
+    dsp.attrs(&tn.specs.gattrs, dsp.AP_TYPE);
     let sp = specifiers(tn.specs, CTX_TYPENAME, false);
     let t = derive(sp.ty, tn.decl, CTX_TYPENAME);
     tn.ty = t;
@@ -996,7 +1071,9 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
     if sp.infer {
         t = dsp.inferred(dcl, sp.quals, d.decls.len > 1, dcl == d.decls.get(0));
     } else {
-        t = derive(sp.ty, dcl, ctx);
+        // (a GNU dialect: mode(m) changes the specifiers' integer type)
+        let base = cgn.mode_type(sp.ty, &d.specs.gattrs, &d.attrs, &dcl.attrs);
+        t = derive(base, dcl, ctx);
     }
     dcl.ty = t;
     let name = dcl.name;
@@ -1008,6 +1085,9 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
     }
     dsp.attrs(&d.attrs, what);
     dsp.attrs(&dcl.attrs, what);
+    if dcl == d.decls.get(0) {
+        dsp.attrs(&d.specs.gattrs, what);  // (GNU attributes among the specifiers: checked once)
+    }
     if sp.has_align and ((sp.sc == cast.SC_TYPEDEF) or cty.is_func(t) or (sp.sc == cast.SC_REGISTER)) {
         let kind = u.pick(
             sp.sc == cast.SC_TYPEDEF, "the typedef", u.pick(cty.is_func(t), "the function", "the register object"));
@@ -1056,7 +1136,7 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
             cs.err(dcl.name_span, "C3076", u.f2("the function '%s' cannot be declared '%s'", name,
                                                 dsp.sc_name(cast.SC_THREAD_LOCAL)));
         }
-        func_decl(sp, dcl, t, ctx);
+        func_decl(sp, dcl, t, ctx, d);
         if (sp.funcs & cast.FS_NORETURN) != 0 {
             catr.set_noreturn(dcl.sym);
         }
@@ -1070,6 +1150,13 @@ fn declare_one(sp: *Specs, dcl: *mut cast.Declarator, ctx: i32, d: *mut cast.Dec
 fn mark_decl(d: *mut cast.Decl, dcl: *mut cast.Declarator) void {
     catr.mark_sym(dcl.sym, &d.attrs);
     catr.mark_sym(dcl.sym, &dcl.attrs);
+    catr.mark_sym(dcl.sym, &d.specs.gattrs);
+    if cs.opts().gnu {
+        cgn.mark_sym(dcl.sym, &d.attrs);
+        cgn.mark_sym(dcl.sym, &dcl.attrs);
+        cgn.mark_sym(dcl.sym, &d.specs.gattrs);
+        cgn.entity(dcl.sym, dcl);
+    }
 }
 
 // The entity a declaration of `name` with linkage `lk` declares: the one of
@@ -1121,7 +1208,20 @@ fn new_entity(name: []u8, sp: u.Span, kind: i32, t: *mut cty.CType, lk: i32, lin
     return s;
 }
 
-fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32) void {
+// Has declaration d of a function (its declarator dcl) the GNU89 inline
+// semantics: gnu89 or gnu90, or the attribute gnu_inline (csema_marks.ax)?
+fn gnu89_inline(d: *mut cast.Decl, dcl: *mut cast.Declarator) bool {
+    if not cs.opts().gnu {
+        return false;
+    }
+    if cs.std() < co.C99 {
+        return true;
+    }
+    return cgn.has(&d.attrs, "gnu_inline") or cgn.has(&dcl.attrs, "gnu_inline") or
+           cgn.has(&d.specs.gattrs, "gnu_inline");
+}
+
+fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32, d: *mut cast.Decl) void {
     let sc = sp.sc;
     if cs.at_file_scope() {
         if (sc != 0) and (sc != cast.SC_EXTERN) and (sc != cast.SC_STATIC) {
@@ -1143,7 +1243,9 @@ fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32)
     let lk = cs.linkage_of(dcl.name, sc2, true);
     dcl.sym = entity(dcl.name, dcl.name_span, cast.SK_FUNC, t, lk);
     if cs.at_file_scope() and (dcl.sym.kind == cast.SK_FUNC) {
+        csm.gnu89_inline = gnu89_inline(d, dcl);
         csm.function_declared(dcl.sym, sp.funcs, sc, dcl.name_span);
+        csm.gnu89_inline = false;
     }
 }
 
@@ -1295,6 +1397,7 @@ fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
 fn function_def(d: *mut cast.Decl) void {
     let sp = specifiers(d.specs, CTX_FILE, false);
     dsp.attrs(&d.attrs, dsp.AP_FUNC);
+    dsp.attrs(&d.specs.gattrs, dsp.AP_FUNC);
     let dcl = d.decls.get(0);
     g_params = u.List.[*mut cast.CSym].empty();
     g_kr_ids = false;
@@ -1362,7 +1465,9 @@ fn function_def(d: *mut cast.Decl) void {
     if u.str_eq(dcl.name, "main") and (lk == cast.LK_EXTERNAL) {
         check_main(s, dcl);
     }
+    csm.gnu89_inline = gnu89_inline(d, dcl);
     csm.function_declared(s, sp.funcs, sp.sc, dcl.name_span);
+    csm.gnu89_inline = false;
     cs.add_function(s);
     csm.begin_body(s);
     cs.hooks.body(s, d);

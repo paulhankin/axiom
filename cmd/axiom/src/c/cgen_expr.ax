@@ -51,12 +51,17 @@ pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
 
 /// Stores scalar v of type t at p.
 pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
+    store_al(t, v, p, cty.align_of(t));
+}
+
+// Stores scalar v of type t at p, known to be aligned to al.
+fn store_al(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value, al: u64) void {
     if cty.is_complex(t) {
         gcx.put(t, gcx.parts(t.unq, v), p);
         return;
     }
     let s = ir.store(cg.B, v, p);
-    s.align = @truncate(u32, cty.align_of(t));
+    s.align = @truncate(u32, @min(al, cty.align_of(t)));
     if is_volatile(t) {
         s.flags = s.flags | ir.F_VOLATILE;
     }
@@ -345,6 +350,39 @@ fn compound_literal(e: *mut cast.Expr) *mut ir.Value {
     return p;
 }
 
+// The largest power of two that divides both a (a power of two) and off.
+fn common_align(a: u64, off: u64) u64 {
+    let mut r = a;
+    while (r > 1) and ((off % r) != 0) {
+        r = r / 2;
+    }
+    return r;
+}
+
+// The alignment lvalue e is known to have: its type's, or less for a member
+// of a packed structure (a GNU dialect: csema_bits.ax), whose offset is
+// only as aligned as the structure it is in.
+fn lv_align(e: *cast.Expr) u64 {
+    let a = cty.align_of(e.ty);
+    if (e.kind == cast.ExprKind.MEMBER) and u.notnil(e.mem) {
+        let mut base = e.a.ty;
+        let mut ba: u64 = 0;
+        if e.op == ct.P_ARROW {
+            base = e.a.ty.elem;
+        } else if e.a.lvalue {
+            ba = lv_align(e.a);
+        }
+        if ba == 0 {
+            ba = cty.align_of(base);
+        }
+        return @min(a, common_align(ba, e.cval));
+    }
+    if (e.kind == cast.ExprKind.INDEX) and (e.a.kind == cast.ExprKind.CAST) and (e.a.op == cast.CV_ADECAY) {
+        return @min(a, lv_align(e.a.a));
+    }
+    return a;
+}
+
 // The value of lvalue e at p (a bit-field's too; a wide long double's
 // copied, as the object may change before the value is used).
 fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
@@ -355,7 +393,12 @@ fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
     if cty.is_wide(e.ty) {
         return gld.snapshot(p, is_volatile(e.ty));
     }
-    return load(e.ty, p);
+    let v = load(e.ty, p);
+    let al = lv_align(e);
+    if ir.is_op(v, ir.OP_LOAD) and (al < @as(u64, v.align)) {
+        v.align = @truncate(u32, al);
+    }
+    return v;
 }
 
 // Stores v in lvalue e at p (of type t, e's unqualified); returns the value e then has.
@@ -368,7 +411,7 @@ fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.V
         gld.copy(p, v, is_volatile(e.ty));
         return v;
     }
-    store(t, v, p);
+    store_al(t, v, p, lv_align(e));
     return v;
 }
 
@@ -434,6 +477,12 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
     }
     if k == cast.ExprKind.VA_ARG {
         return gva.va_arg(rv(e.a), e.ty);
+    }
+    if k == cast.ExprKind.STMT_EXPR {
+        return cg.hooks.stmt_expr(e);
+    }
+    if k == cast.ExprKind.LABEL_ADDR {
+        return cg.label_address(e.sym);
     }
     if (k == cast.ExprKind.SIZEOF_EXPR) or (k == cast.ExprKind.SIZEOF_TYPE) {
         return vla_sizeof(e);
@@ -851,12 +900,21 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
     let yes = cg.new_block("then");
     let no = cg.new_block("else");
     let done = cg.new_block("cond");
-    branch(e.a, yes, no);
     let cplx = cty.is_complex(e.ty);
     let mut px = gcx.real(ir.vnil());
     let mut py = gcx.real(ir.vnil());
-    cg.at_end(yes);
-    let x = rv(e.b);
+    let mut x = ir.vnil();
+    if u.isnil(e.b) {
+        // `a ?: c` (a GNU dialect): a once, its value if nonzero
+        let v = rv(e.a);
+        ir.condbr(cg.B, truth(v, e.a.ty), yes, no);
+        cg.at_end(yes);
+        x = convert(v, e.a.ty, e.ty);
+    } else {
+        branch(e.a, yes, no);
+        cg.at_end(yes);
+        x = rv(e.b);
+    }
     if cplx {
         px = gcx.parts(e.ty, x);  // (the parts, which the phis join)
     }
@@ -901,7 +959,7 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
         for i in 0..n {
             vs[i] = rv(e.args.get(i));
         }
-        if e.op >= csb.BI_COMPLEX {
+        if (e.op >= csb.BI_COMPLEX) and (e.op <= csb.BI_CONJ) {
             return complex_builtin(e, vs[0..n]);
         }
         return gva.builtin(e, vs[0..n]);

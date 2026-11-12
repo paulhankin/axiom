@@ -43,6 +43,7 @@ import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
 import "csema_marks.ax" as csm;
 import "csema_named.ax" as cn;
+import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
 struct Filler {
@@ -56,6 +57,7 @@ struct Filler {
     starts: u.SymMap.[i32],  // (desig) how many items start at each offset
     unions: u.SymMap.[u64],  // the member (index + 1) each union subobject was last given through, by place
     copies: i32,             // (desig) the items that copy a structure or union
+    top_level: bool,         // filling the object itself (not one of its subobjects, for flex_ok)
 }
 
 /// What initializer returns: the normal form, and the object's type (an
@@ -98,6 +100,7 @@ pub fn initializer(t: *mut cty.CType, it: *mut cast.Init, is_static: bool, const
     F.unions = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
     F.starts = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     F.desig = has_designator(it);
+    F.top_level = true;
     let mut ty = t;
     if it.kind == cast.InitKind.EXPR {
         let e = it.e;
@@ -115,7 +118,7 @@ pub fn initializer(t: *mut cty.CType, it: *mut cast.Init, is_static: bool, const
         return Result.{ list: F.list, ty: ty };
     }
     F.list.zero = true;
-    F.c89_list = (cs.std() < co.C99) and not cty.is_scalar(t);
+    F.c89_list = (cs.std() < co.C99) and not cty.is_scalar(t) and not cs.opts().gnu;
     if not cty.is_scalar(t) and not cty.is_record(t) and (t.kind != cty.TK_ARRAY) {
         cs.err(it.span, "C3033", u.f1("an initializer for an object of type %s", cs.tq(t)));
         return Result.{ list: F.list, ty: ty };
@@ -302,6 +305,10 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
             return;
         }
     }
+    if F.is_static and not F.constexpr_ and cs.opts().gnu and (x.kind == cast.ExprKind.CAST) and
+       (x.op == cast.CV_LOAD) and (x.a.kind == cast.ExprKind.COMPOUND) and literal_items(F, s, x.a) {
+        return;  // (a GNU dialect: a compound literal of constants initializes an object as its list would)
+    }
     if F.constexpr_ {
         if not constexpr_value(e, x, t) {
             F.errors = true;
@@ -321,6 +328,33 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
         drop_inside(F, s.off, cty.size_of(t));
     }
     push(F, cast.InitItem.{ off: s.off, ty: t, e: x, bits: s.bits });
+}
+
+// The items of compound literal c (of subobject s's type) for subobject s
+// of an object with static storage duration, if every one is a constant
+// (a GNU dialect); false (nothing done) if one is not.
+fn literal_items(F: *mut Filler, s: Sub, c: *mut cast.Expr) bool {
+    let l = c.sym.init;
+    if u.isnil(l) or u.notnil(s.bits) {
+        return false;
+    }
+    for it in l.items.items() {
+        if u.notnil(it.e) and not constant(it.e, it.ty) and
+           not ((it.ty.kind == cty.TK_ARRAY) and (it.e.kind == cast.ExprKind.STRING)) {
+            return false;
+        }
+    }
+    let size = cty.size_of(s.t);
+    drop_inside(F, s.off, size);
+    if not l.zero and (l.items.len == 0) {
+        return true;
+    }
+    push(F, cast.InitItem.{ off: s.off, ty: cty.array_of(cty.t_uchar, size, true), e: u.nil.[cast.Expr](),
+                            bits: no_bits() });
+    for it in l.items.items() {
+        push(F, cast.InitItem.{ off: s.off + it.off, ty: it.ty, e: it.e, bits: it.bits });
+    }
+    return true;
 }
 
 // Is x a constant initializer for a subobject of type t (6.6p7)?
@@ -422,12 +456,25 @@ fn is_flex(m: *cty.Member) bool {
     return (m.ty.kind == cty.TK_ARRAY) and not m.ty.has_len;
 }
 
+// May the flexible array member m at level lv be initialized here? In a
+// GNU dialect, that of the object itself (not of a member) with static
+// storage duration, by a brace-enclosed list or a string (the object then
+// is as large as its initializer: InitList.size).
+fn flex_ok(F: *Filler, lv: *Level) bool {
+    return cs.opts().gnu and F.is_static and (lv.off == 0) and F.top_level and (lv.t.kind == cty.TK_STRUCT);
+}
+
 fn takes_part(m: *cty.Member) bool {
     return not (m.is_bitfield and (m.name.len == 0));
 }
 
 // Moves lv's position past members that take no part; is it at a subobject?
 fn valid(lv: *mut Level) bool {
+    return valid_in(u.nil.[Filler](), lv);
+}
+
+// valid, where (F not nil) a flexible array member may be initialized (flex_ok).
+fn valid_in(F: *Filler, lv: *mut Level) bool {
     let t = lv.t;
     if t.kind == cty.TK_ARRAY {
         return not t.has_len or (lv.idx < t.len);
@@ -439,7 +486,7 @@ fn valid(lv: *mut Level) bool {
     if lv.idx >= @as(u64, ms.len) {
         return false;
     }
-    return not is_flex(ms[@truncate(usize, lv.idx)]);
+    return not is_flex(ms[@truncate(usize, lv.idx)]) or (u.notnil(F) and flex_ok(F, lv));
 }
 
 // Past the subobject at lv's position (a union: past all of it).
@@ -453,9 +500,9 @@ fn step(lv: *mut Level) void {
 
 // The next subobject to initialize, leaving levels that are done; false if
 // the list's object is done.
-fn next(st: *mut u.List.[Level]) bool {
+fn next(F: *Filler, st: *mut u.List.[Level]) bool {
     loop {
-        if valid(st.at(st.len - 1)) {
+        if valid_in(F, st.at(st.len - 1)) {
             return true;
         }
         if st.len == 1 {
@@ -502,21 +549,110 @@ fn member_path(t: *mut cty.CType, name: []u8, out: *mut u.List.[u64]) bool {
     return false;
 }
 
+// The ranges `[lo ... hi]` among item's designators (a GNU dialect): how
+// many subobjects they designate (0 after an error, reported; 1 if none).
+fn range_count(item: *mut cast.Init) u64 {
+    let mut n: u64 = 1;
+    for k in 0..item.desigs.len {
+        let d = item.desigs.at(k);
+        if d.kind != cast.DesigKind.RANGE {
+            continue;
+        }
+        let lo = cx.ice(d.e, "the first index of a designator range");
+        d.e = lo.e;
+        let hi = cx.ice(d.e2, "the last index of a designator range");
+        d.e2 = hi.e;
+        if not lo.ok or not hi.ok {
+            return 0;
+        }
+        if (lo.e.ty.is_signed and (@bit_cast(i64, lo.v) < 0)) or (hi.e.ty.is_signed and (@bit_cast(i64, hi.v) < 0)) or
+           (hi.v < lo.v) or ((hi.v - lo.v) > (@as(u64, 1) << 24)) {
+            cs.err(d.span, "C3072", u.f2("the designator range [%s ... %s] is empty, negative or too large",
+                                         u.udec(lo.v), u.udec(hi.v)));
+            return 0;
+        }
+        n = n * ((hi.v - lo.v) + 1);
+        if n > (@as(u64, 1) << 24) {
+            cs.err(d.span, "C3072", "the designator ranges designate too many subobjects");
+            return 0;
+        }
+    }
+    return n;
+}
+
+// The index in its range of the k-th range designator of item for the r-th
+// subobject the ranges designate (the last range varies fastest).
+fn range_digit(item: *mut cast.Init, k: usize, r0: u64) u64 {
+    let mut r = r0;
+    let mut j = item.desigs.len;
+    while j > 0 {
+        j -= 1;
+        let d = item.desigs.at(j);
+        if d.kind != cast.DesigKind.RANGE {
+            continue;
+        }
+        let n = (d.e2.cval - d.e.cval) + 1;
+        if j == k {
+            return r % n;
+        }
+        r = r / n;
+    }
+    return 0;
+}
+
+// Is e free of effects (so that a range's elements may each get its value)?
+fn no_effects(e: *cast.Expr) bool {
+    if u.isnil(e) or e.is_const {
+        return true;
+    }
+    let k = e.kind;
+    if (k == cast.ExprKind.CALL) or (k == cast.ExprKind.ASSIGN) or (k == cast.ExprKind.POSTFIX) or
+       (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.VA_ARG) or
+       ((k == cast.ExprKind.UNARY) and ((e.op == ct.P_INC) or (e.op == ct.P_DEC))) {
+        return false;
+    }
+    if u.notnil(e.ty) and ((e.ty.quals & cty.Q_VOLATILE) != 0) {
+        return false;
+    }
+    for x in e.args.items() {
+        if not no_effects(x) {
+            return false;
+        }
+    }
+    return no_effects(e.a) and no_effects(e.b) and no_effects(e.c);
+}
+
+fn init_no_effects(it: *cast.Init) bool {
+    if it.kind == cast.InitKind.EXPR {
+        return no_effects(it.e);
+    }
+    for x in it.items.items() {
+        if not init_no_effects(x) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Follows the designation of `item` from the list's object (st[0]): st
-// ends at the designated subobject. False after an error (reported).
-fn designate(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) bool {
+// ends at the designated subobject; a range designator stands for its
+// first index plus `r`. False after an error (reported).
+fn designate(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init, ri: u64) bool {
     st.len = 1;
     let n = item.desigs.len;
     for k in 0..n {
         let d = item.desigs.at(k);
         let lv = st.at(st.len - 1);
         let t = lv.t;
-        if d.kind == cast.DesigKind.INDEX {
+        if (d.kind == cast.DesigKind.INDEX) or (d.kind == cast.DesigKind.RANGE) {
             if t.kind != cty.TK_ARRAY {
                 cs.err(d.span, "C3072", u.f1("an array designator for an object of type %s, not an array", cs.tq(t)));
                 return false;
             }
-            let r = cx.ice(d.e, "the index of an array designator");
+            let mut r = cx.ice(d.e, "the index of an array designator");
+            if d.kind == cast.DesigKind.RANGE {
+                r = cx.Ice.{ ok: true, v: d.e.cval + range_digit(item, k, ri), e: d.e };
+            }
             d.e = r.e;
             if not r.ok {
                 return false;
@@ -560,7 +696,7 @@ fn designate(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) bool
             }
             let last = st.at(st.len - 1);
             let m = last.t.unq.tag.members.get(@truncate(usize, last.idx));
-            if is_flex(m) {
+            if is_flex(m) and not ((st.len == 1) and flex_ok(F, last)) {
                 cs.err(d.span, "C3033", u.f1("an initializer for the flexible array member '%s'", d.name));
                 return false;
             }
@@ -605,14 +741,46 @@ fn fill_list(F: *mut Filler, s: Sub, it: *mut cast.Init) u64 {
     let mut st = u.List.[Level].empty();
     st.push(Level.{ t: t, off: s.off, idx: 0 });
     let mut count: u64 = 0;
+    let top_lvl = F.top_level;
     for item in items {
+        F.top_level = top_lvl;
         if item.desigs.len > 0 {
-            if not designate(F, &mut st, item) {
+            let n = range_count(item);
+            if n == 0 {
                 F.errors = true;
                 st.len = 1;
                 continue;
             }
-        } else if not next(&mut st) {
+            if (n > 1) and not init_no_effects(item) {
+                cs.not_supported(item.span,
+                                 "a designator range whose initializer has effects (it would be evaluated once)");
+                F.errors = true;
+                st.len = 1;
+                continue;
+            }
+            let mut ok = true;
+            for r in 0..n {
+                if not designate(F, &mut st, item, r) {
+                    ok = false;
+                    break;
+                }
+                if (r + 1) < n {
+                    // (the range's elements but the last: placed here, the last below)
+                    if t.kind == cty.TK_ARRAY {
+                        let at = st.at(0).idx + 1;
+                        if at > count {
+                            count = at;
+                        }
+                    }
+                    place(F, &mut st, item);
+                }
+            }
+            if not ok {
+                F.errors = true;
+                st.len = 1;
+                continue;
+            }
+        } else if not next(F, &mut st) {
             if not F.errors {
                 let top = st.at(0);
                 let flex = (t.kind == cty.TK_STRUCT) and (top.idx < @as(u64, t.tag.members.len));
@@ -634,6 +802,7 @@ fn fill_list(F: *mut Filler, s: Sub, it: *mut cast.Init) u64 {
         }
         place(F, &mut st, item);
     }
+    F.top_level = top_lvl;
     return count;
 }
 
@@ -680,6 +849,13 @@ fn place(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) void {
     loop {
         let lv = st.at(st.len - 1);
         let s = subobject(lv);
+        if (st.len == 1) and (lv.t.kind == cty.TK_STRUCT) and flex_ok(F, lv) and
+           is_flex(lv.t.unq.tag.members.get(@truncate(usize, lv.idx))) {
+            flex_item(F, s, item);
+            step(lv);
+            return;
+        }
+        F.top_level = false;
         if item.kind == cast.InitKind.LIST {
             if not cty.is_scalar(s.t) and u.isnil(s.bits) {
                 drop_inside(F, s.off, cty.size_of(s.t));
@@ -731,6 +907,28 @@ fn place(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) void {
         if top.t.kind == cty.TK_UNION {
             union_member(F, top);
         }
+    }
+}
+
+// The flexible array member s (of an object with static storage duration,
+// a GNU dialect: flex_ok) initialized by `item`, a list or a string: the
+// object's size grows to hold the elements given.
+fn flex_item(F: *mut Filler, s: Sub, item: *mut cast.Init) void {
+    F.top_level = false;
+    let et = s.t.elem;
+    let mut n: u64 = 0;
+    if (item.kind == cast.InitKind.EXPR) and is_char_array(s.t) and is_string_for(s.t, item.e) {
+        n = string_item(F, s.t, s.off, item.e).len;
+    } else if item.kind == cast.InitKind.LIST {
+        n = fill_list(F, s, item);
+    } else {
+        cs.err(item.span, "C3033", "a flexible array member is initialized by a brace-enclosed list or a string");
+        F.errors = true;
+        return;
+    }
+    let end = s.off + (n * cty.size_of(et));
+    if end > F.list.size {
+        F.list.size = end;
     }
 }
 

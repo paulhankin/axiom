@@ -36,13 +36,16 @@ import "std/c/rt/ldouble" as ld;
 
 /// One attribute of an attribute specifier `[[...]]`: `name`, or
 /// `prefix::name`, with its argument clause kept as the balanced tokens
-/// between its parentheses.
+/// between its parentheses. In a GNU dialect an attribute of
+/// `__attribute__((...))`, and one written `[[gnu::name]]` or
+/// `[[__gnu__::name]]`, has the prefix "gnu".
 pub struct Attr {
     span: u.Span,
     prefix: []u8,  // the vendor prefix of `prefix::name`; empty if none
     name: []u8,
-    has_args: bool,    // an argument clause, maybe empty: `name()`
-    args: []ct.Token,  // its tokens, without the outer parentheses
+    has_args: bool,             // an argument clause, maybe empty: `name()`
+    args: []ct.Token,           // its tokens, without the outer parentheses
+    exprs: u.List.[*mut Expr],  // a GNU attribute whose arguments are expressions (aligned(8), ...): them, parsed
 }
 
 // -----------------------------------------------------------------------------
@@ -63,7 +66,7 @@ pub enum ExprKind {
     POSTFIX,      // a op: postfix ++ -- (op P_INC, P_DEC)
     BINARY,       // a op b: * / % + - << >> < > <= >= == != & ^ | && ||
     ASSIGN,       // a op b: = *= /= %= += -= <<= >>= &= ^= |=
-    COND,         // a ? b : c
+    COND,         // a ? b : c; b nil: `a ?: c` (a GNU dialect: a is evaluated once, and is the value if nonzero)
     COMMA,        // a , b
     CALL,         // a(args)
     INDEX,        // a[b]
@@ -77,6 +80,10 @@ pub enum ExprKind {
     VA_ARG,       // __builtin_va_arg(a, tname): <stdarg.h>'s va_arg
     OFFSETOF,     // __builtin_offsetof(tname, args): <stddef.h>'s offsetof; args: the member designator, as
                   // MEMBER nodes (`.name`, the first one too) and INDEX nodes (`[b]`), without operands a
+    // The GNU dialects':
+    STMT_EXPR,     // ({ body }): a statement expression; its value is that of its last statement, an expression
+    LABEL_ADDR,    // &&name: the address of a label (a `void *`)
+    TYPES_COMPAT,  // __builtin_types_compatible_p(tname, tname2)
 }
 
 /// One association of a generic selection: `type-name: e`, or `default: e`
@@ -98,7 +105,10 @@ pub struct Expr {
     assocs: u.List.[GenericAssoc],  // GENERIC
     name: []u8,                     // IDENT, MEMBER (interned); ALIGNOF: the keyword as written
     name_span: u.Span,              // MEMBER: the member's name
-    tname: *mut TypeName,           // CAST, SIZEOF_TYPE, ALIGNOF, COMPOUND, VA_ARG, OFFSETOF
+    tname: *mut TypeName,           // CAST, SIZEOF_TYPE, ALIGNOF, COMPOUND, VA_ARG, OFFSETOF, TYPES_COMPAT;
+                                    // ALIGNOF of an expression a (a GNU dialect's __alignof__): nil
+    tname2: *mut TypeName,          // TYPES_COMPAT: the second type
+    body: *mut Stmt,                // STMT_EXPR: the compound statement
     init: *mut Init,                // COMPOUND: a brace-enclosed list
     tok: *ct.Token,                 // INT, FLOAT, CHAR, STRING: (a copy of) the token
     bval: bool,                     // BOOL
@@ -177,11 +187,12 @@ pub struct Spec {
 pub struct DeclSpec {
     span: u.Span,
     items: u.List.[Spec],
-    storage: i32,               // SC_ bits
-    quals: i32,                 // Q_ bits
-    funcs: i32,                 // FS_ bits
-    has_type: bool,             // a type specifier is among the items (TYPE, TAG, TYPEDEF_NAME, TYPEOF, BITINT, ATOMIC)
-    attrs: u.List.[*mut Attr],  // the attributes after the specifiers (C23): they appertain to the type
+    storage: i32,                // SC_ bits
+    quals: i32,                  // Q_ bits
+    funcs: i32,                  // FS_ bits
+    has_type: bool,              // a type specifier is among the items (TYPE, TAG, TYPEDEF_NAME, TYPEOF, BITINT, ATOMIC)
+    attrs: u.List.[*mut Attr],   // the attributes after the specifiers (C23): they appertain to the type
+    gattrs: u.List.[*mut Attr],  // GNU attributes among the specifiers: they appertain to the declared entities
 }
 
 /// A struct, union or enum specifier.
@@ -196,6 +207,7 @@ pub struct TagSpec {
     enumerators: u.List.[*mut Enumerator],  // enum
     fixed: *mut TypeName,                   // enum: the fixed underlying type `enum E : T` (C23), or nil
     trailing_comma: bool,                   // enum: the list ends with ','
+    pack: u64,                              // struct, union: `#pragma pack` at the end of its members (0: none)
     // set by semantic analysis
     ty: *mut cty.CType,
     sym: *mut CSym,
@@ -251,6 +263,8 @@ pub struct Declarator {
     derivs: u.List.[Deriv],     // from the identifier outward
     init: *mut Init,            // `= initializer`, or nil
     width: *mut Expr,           // a member's bit-field width, or nil
+    asm_name: []u8,             // a GNU dialect's `asm("name")` after the declarator: its symbol (empty: none)
+    asm_span: u.Span,
     // set by semantic analysis
     ty: *mut cty.CType,
     sym: *mut CSym,
@@ -278,6 +292,7 @@ pub enum DeclKind {
     FUNC_DEF,       // specs decls[0] kr_decls body: a function definition
     STATIC_ASSERT,  // _Static_assert(cond, msg) / static_assert(cond) in C23 (msg nil)
     ATTR,           // an attribute declaration `[[...]];` (C23): attrs
+    LABELS,         // `__label__ a, b;` (a GNU dialect): local labels, in decls (their names)
 }
 
 /// A declaration, function definition, static assertion or attribute
@@ -307,7 +322,8 @@ pub enum InitKind {
 
 pub enum DesigKind {
     INDEX,   // [e]
-    MEMBER,  // .name
+    MEMBER,  // .name (in a GNU dialect also `name:` before the element)
+    RANGE,   // [e ... e2] (a GNU dialect)
 }
 
 pub struct Designator {
@@ -315,6 +331,7 @@ pub struct Designator {
     span: u.Span,
     e: *mut Expr,
     name: []u8,
+    e2: *mut Expr,  // RANGE: the last index
 }
 
 pub struct Init {
@@ -339,12 +356,12 @@ pub enum StmtKind {
     WHILE,     // while (e) body
     DO,        // do body while (e);
     FOR,       // for (first or decl; e; step) body: any of first, decl, e, step may be nil
-    GOTO,      // goto label;
+    GOTO,      // goto label; or (a GNU dialect) goto *e;
     CONTINUE,
     BREAK,
     RETURN,   // return e; (e nil without a value)
     LABEL,    // label: body (body nil for a label at the end of a block, C23)
-    CASE,     // case e: body (body nil at the end of a block, C23)
+    CASE,     // case e: body (body nil at the end of a block, C23); case e ... hi: (a GNU dialect)
     DEFAULT,  // default: body (likewise)
 }
 
@@ -361,10 +378,12 @@ pub struct Stmt {
     items: u.List.[*mut Stmt],  // COMPOUND
     label: []u8,                // LABEL, GOTO (interned)
     label_span: u.Span,
+    hi: *mut Expr,  // CASE: the last value of a case range, or nil
     // set by semantic analysis
     sym: *mut CSym,             // LABEL, GOTO: the label
     cases: u.List.[*mut Stmt],  // SWITCH: its CASE and DEFAULT statements, in order
     cval: u64,                  // CASE: the value, converted to the promoted type of the controlling expression
+    cval_hi: u64,               // CASE of a range: its last value, likewise
 }
 
 /// A translation unit: its external declarations, in order.
@@ -409,7 +428,8 @@ pub fn kw_text(kw: i32) []u8 {
                  "inline", "restrict", "_Bool", "_Complex", "_Imaginary", "_Alignas", "_Alignof", "_Atomic", "_Generic",
                  "_Noreturn", "_Static_assert", "_Thread_local", "constexpr", "false", "nullptr", "true", "typeof",
                  "typeof_unqual", "_BitInt", "_Decimal32", "_Decimal64", "_Decimal128", "__builtin_va_list",
-                 "__axiom_int64"];
+                 "__axiom_int64", "__extension__", "__attribute__", "asm", "__auto_type", "__label__", "__int128",
+                 "_Float128"];
     if (kw < 0) or (@int_cast(usize, kw) >= names.len) {
         return "?";
     }
@@ -483,6 +503,9 @@ pub struct CSym {
     align: u64,                  // objects: the alignment an alignment specifier gives (_Alignas), or 0
     weak: bool,                  // a weak definition (an extension's): another unit's definition wins (cc.ax)
     ir: *mut void,               // IR generation's: the object's address, the function, the label's block
+    asm_name: []u8,              // a GNU dialect's `asm("name")`: the symbol name (empty: its own)
+    label_addr: bool,            // a label whose address is taken (`&&label`, a GNU dialect): value is its index
+    owner: *mut CSym,            // such a label: its function
 }
 
 /// One element of an initializer's normal form: the subobject at `off`
@@ -500,4 +523,5 @@ pub struct InitItem {
 pub struct InitList {
     items: u.List.[InitItem],
     zero: bool,  // a brace-enclosed initializer: what no item covers is zero (6.7.9p21)
+    size: u64,   // a GNU dialect's static object whose flexible array member is initialized: its size (0: its type's)
 }

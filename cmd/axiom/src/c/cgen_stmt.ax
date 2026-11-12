@@ -25,6 +25,8 @@ import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "csema.ax" as cs;
 import "csema_attr.ax" as catr;
+import "csema_gnu.ax" as cgn;
+import "csema_stmt.ax" as css;
 import "csema_vla.ax" as svla;
 import "ctypes.ax" as cty;
 
@@ -48,6 +50,8 @@ let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
 pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     cg.hooks.body = function_body;
     cg.hooks.local_init = init_local;
+    cg.hooks.stmt_expr = stmt_expr;
+    gv.gen_expr = gx.rv;
     return cg.generate(m, cu, wasm);
 }
 
@@ -95,8 +99,14 @@ fn function_body(s: *mut cast.CSym) void {
     }
     if not cg.terminated() {
         // the end of the body: main returns 0 (5.1.2.2.3); the value of
-        // any other is undefined (6.9.1p12)
-        gva.ret_default(F.sig.plan, F.sret);
+        // any other is undefined (6.9.1p12); the cleanups of its outermost
+        // block's objects first
+        if gv.has_cleanups() {
+            gv.release_to(0);
+        }
+        if not cg.terminated() {
+            gva.ret_default(F.sig.plan, F.sret);
+        }
     }
     cg.at_end(F.entry);
     ir.br(cg.B, start);
@@ -159,6 +169,8 @@ fn stmt(s: *mut cast.Stmt) void {
         do_stmt(s);
     } else if k == cast.StmtKind.FOR {
         for_stmt(s);
+    } else if (k == cast.StmtKind.GOTO) and u.notnil(s.e) {
+        computed_goto(s);
     } else if k == cast.StmtKind.GOTO {
         gv.release_to(svla.depth(s.sym));
         cg.br(label_block(s.sym));
@@ -189,6 +201,82 @@ fn stmt(s: *mut cast.Stmt) void {
         cg.at_end(b);
         stmt(s.body);
     }
+}
+
+// `goto *p` (a GNU dialect): p is the address of one of the function's
+// labels (`&&label`: cgen.label_address), found by its distance from their
+// table's start; any other value is undefined (the switch's default).
+fn computed_goto(s: *mut cast.Stmt) void {
+    cg.continue_after();
+    let p = gx.rv(s.e);
+    let f = cg.F.sym;
+    let ls = css.addr_labels(f);
+    let base = cg.label_table(f);
+    let k = ir.sub(cg.B, ir.ptrtoint(cg.B, p, cg.T_isz), ir.ptrtoint(cg.B, base, cg.T_isz));
+    let dead = cg.new_block("badgoto");
+    let vs = u.newn.[u64](ls.len + 1);
+    let bs = u.newn.[*mut ir.Block](ls.len + 1);
+    for i in 0..ls.len {
+        vs[i] = ls[i].value;
+        bs[i] = label_block(ls[i]);
+    }
+    flow.switch_to(k, false, vs[0..ls.len], bs[0..ls.len], dead);
+    cg.at_end(dead);
+    ir.unreachable(cg.B);
+}
+
+// `({ ... })` (a GNU dialect): its block, and the value of its last
+// statement, an expression's (or none); the objects of the block with
+// cleanups are cleaned up after it is computed (a structure's value
+// copied first).
+fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
+    let s = e.body;
+    let d = gv.depth();
+    let xs = s.items.items();
+    let mut v = ir.vnil();
+    for i in 0..xs.len {
+        let x = xs[i];
+        if (i + 1 == xs.len) and u.notnil(css.value_stmt(x)) and not cty.is_void(e.ty) {
+            v = last_value(x);
+            if cty.is_record(e.ty) and (gv.depth() > d) {
+                let tmp = cg.alloca(e.ty, "stmtexpr");
+                gx.copy(e.ty, tmp, v);
+                v = tmp;
+            }
+            continue;
+        }
+        stmt(x);
+    }
+    gv.leave(d);
+    cg.continue_after();
+    if u.isnil(v) and not cty.is_void(e.ty) {
+        // (the block ended in a jump: the value is never used)
+        if cty.is_record(e.ty) {
+            return cg.alloca(e.ty, "stmtexpr");
+        }
+        return ir.czero(cg.lty(e.ty));
+    }
+    return v;
+}
+
+// The labels of statement s, then the value of its expression statement
+// (a statement expression's last: css.value_stmt).
+fn last_value(s: *mut cast.Stmt) *mut ir.Value {
+    cg.set_span(s.span);
+    if s.kind == cast.StmtKind.LABEL {
+        let b = label_block(s.sym);
+        cg.br(b);
+        cg.at_end(b);
+        return last_value(s.body);
+    }
+    if (s.kind == cast.StmtKind.CASE) or (s.kind == cast.StmtKind.DEFAULT) {
+        let b = BD.cases.get(u.addr_key(@int_from_ptr(s)));
+        cg.br(b);
+        cg.at_end(b);
+        return last_value(s.body);
+    }
+    cg.continue_after();
+    return gx.rv(s.e);
 }
 
 fn label_block(l: *mut cast.CSym) *mut ir.Block {
@@ -237,6 +325,7 @@ fn decl(d: *mut cast.Decl) void {
             if u.notnil(s.init) {
                 _ = ir.memop(cg.B, ir.OP_MEMSET, p, ir.cint(cg.T_i8, 0), gv.size_value(s.ty));  // (C23: `= {}`)
             }
+            push_cleanup(s);
             continue;
         }
         if u.isvnil(s.ir) {
@@ -247,6 +336,15 @@ fn decl(d: *mut cast.Decl) void {
             cg.continue_after();
             init_local(s, @ptr_cast(*mut ir.Value, s.ir));
         }
+        push_cleanup(s);
+    }
+}
+
+// An automatic object with a cleanup (a GNU dialect) comes in scope.
+fn push_cleanup(s: *cast.CSym) void {
+    let n = cgn.note_of(s);
+    if u.notnil(n) and u.notnil(n.cleanup_call) {
+        gv.push_cleanup(n.cleanup_call);
     }
 }
 
@@ -404,19 +502,31 @@ fn switch_stmt(s: *mut cast.Stmt) void {
             dflt = b;
         }
     }
-    let vs = u.newn.[u64](s.cases.len + 1);
-    let bs = u.newn.[*mut ir.Block](s.cases.len + 1);
-    let mut n: usize = 0;
+    let mut vs = u.List.[u64].empty();
+    let mut bs = u.List.[*mut ir.Block].empty();
     let mask = ~@as(u64, 0) >> @int_cast(u32, 64 - v.ty.bits);
     for i in 0..s.cases.len {
         let c = s.cases.get(i);
-        if c.kind == cast.StmtKind.CASE {
-            vs[n] = c.cval & mask;
-            bs[n] = blocks[i];
-            n += 1;
+        if (c.kind == cast.StmtKind.CASE) and u.notnil(c.hi) {
+            // a case range (a GNU dialect): its values, if few; else a test first
+            let span = (c.cval_hi -% c.cval) & mask;
+            if span < 256 {
+                for k in 0..span + 1 {
+                    vs.push((c.cval +% k) & mask);
+                    bs.push(blocks[i]);
+                }
+            } else {
+                let next = cg.new_block("range");
+                let d = ir.sub(cg.B, v, ir.cint(v.ty, c.cval & mask));
+                ir.condbr(cg.B, ir.icmp(cg.B, ir.IntULE, d, ir.cint(v.ty, span)), blocks[i], next);
+                cg.at_end(next);
+            }
+        } else if c.kind == cast.StmtKind.CASE {
+            vs.push(c.cval & mask);
+            bs.push(blocks[i]);
         }
     }
-    flow.switch_to(v, s.e.ty.is_signed, vs[0..n], bs[0..n], dflt);
+    flow.switch_to(v, s.e.ty.is_signed, vs.items(), bs.items(), dflt);
     cg.at_end(cg.new_block("switchbody"));
     BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: gv.depth(), cont_depth: gv.depth() });
     stmt(s.body);
@@ -429,13 +539,30 @@ fn return_stmt(s: *mut cast.Stmt) void {
     let F = cg.F;
     cg.continue_after();
     if u.isnil(s.e) {
+        cleanups();
         gva.ret_default(F.sig.plan, F.sret);
         return;
     }
-    let v = gx.rv(s.e);
+    let mut v = gx.rv(s.e);
     if cty.is_void(F.ret) {
+        cleanups();
         ir.ret_void(cg.B);
         return;
     }
+    if gv.has_cleanups() and cty.is_record(F.ret) {
+        // (the value copied before the cleanups run)
+        let tmp = cg.alloca(F.ret, "retval");
+        gx.copy(F.ret, tmp, v);
+        v = tmp;
+    }
+    cleanups();
     gva.ret_value(F.sig.plan, F.sret, v);
+}
+
+// Before a return: the calls of the cleanups in scope (a GNU dialect).
+fn cleanups() void {
+    if gv.has_cleanups() {
+        gv.release_to(0);
+        cg.continue_after();
+    }
 }

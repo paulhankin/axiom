@@ -34,6 +34,7 @@ import "cast.ax" as cast;
 import "copts.ax" as co;
 import "csema.ax" as cs;
 import "csema_expr.ax" as cx;
+import "csema_gnu.ax" as cgn;
 import "ctypes.ax" as cty;
 
 // -----------------------------------------------------------------------------
@@ -41,7 +42,7 @@ import "ctypes.ax" as cty;
 // -----------------------------------------------------------------------------
 
 fn pre_c99(sp: u.Span) bool {
-    if cs.std() < co.C99 {
+    if (cs.std() < co.C99) and not cs.opts().gnu {
         cs.err(sp, "C3080",
                "a variable length array (an array size that is not an integer constant expression) is a C99 feature");
         return true;
@@ -147,7 +148,22 @@ struct VNode {
     parent: *mut VNode,
     name: []u8,
     span: u.Span,
-    depth: i32,  // the automatic variable length arrays in this scope and those around it
+    depth: i32,     // the automatic variable length arrays in this scope and those around it (and cleanups)
+    cleanup: bool,  // the scope of an object with a cleanup (a GNU dialect), not of a variably modified type
+}
+
+/// Has s (an object) a cleanup (the attribute cleanup, a GNU dialect)?
+pub fn has_cleanup(s: *cast.CSym) bool {
+    if u.isnil(s) or (s.kind != cast.SK_OBJECT) {
+        return false;
+    }
+    let n = cgn.note_of(s);
+    return u.notnil(n) and u.notnil(n.cleanup_call);
+}
+
+/// Is a variable length array or an object with a cleanup in scope here?
+pub fn in_scope() bool {
+    return cur_depth() > 0;
 }
 
 struct Goto {
@@ -195,12 +211,27 @@ fn cur_depth() i32 {
 }
 
 /// A declaration in a block (or a for statement), analyzed: each declarator
-/// with a variably modified type opens a scope.
+/// with a variably modified type opens a scope, and (a GNU dialect) each
+/// object with a cleanup, which IR generation counts as it does the
+/// variable length arrays (its call is made where the scope is left).
 pub fn declared(d: *cast.Decl) void {
     if d.kind != cast.DeclKind.DECL {
         return;
     }
     for x in d.decls.items() {
+        if has_cleanup(x.sym) {
+            let n = u.new.[VNode]();
+            n.parent = SC.cur;
+            n.name = x.name;
+            n.span = x.name_span;
+            n.depth = cur_depth() + 1;
+            if allocates(x.sym) {
+                n.depth += 1;  // (a variable length array with a cleanup: both)
+            }
+            n.cleanup = true;
+            SC.cur = n;
+            continue;
+        }
         if u.isnil(x.ty) or not cty.is_vm(x.ty) {
             continue;
         }
@@ -251,9 +282,9 @@ pub fn case_label(s: *cast.Stmt, at: *mut void) void {
         n = n.parent;
     }
     let what = u.pick(s.kind == cast.StmtKind.CASE, "case", "default");
-    cs.err_note(s.span, "C3084",
-                u.f2("a '%s' label in the scope of '%s', which has a variably modified type: the switch jumps past it",
-                     what, n.name), n.span, "declared here");
+    cs.err_note(s.span, "C3084", u.f3("a '%s' label in the scope of '%s', which has %s: the switch jumps past it", what,
+                                      n.name, u.pick(n.cleanup, "a cleanup", "a variably modified type")), n.span,
+                "declared here");
 }
 
 /// The end of the body: the gotos jump to labels in their scope.
@@ -284,9 +315,9 @@ pub fn end_body() void {
             }
             x = x.parent;
         }
-        cs.err_note(g.s.span, "C3083",
-                    u.f2("'goto %s' jumps into the scope of '%s', which has a variably modified type", l.name, x.name),
-                    x.span, "declared here");
+        cs.err_note(g.s.span, "C3083", u.f3("'goto %s' jumps into the scope of '%s', which has %s", l.name, x.name,
+                                            u.pick(x.cleanup, "a cleanup", "a variably modified type")), x.span,
+                    "declared here");
     }
     SC = u.nil.[Scopes]();
 }

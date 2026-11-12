@@ -68,12 +68,12 @@ accepted as if the mode allowed it (so that one use gives one message).
 | Code | Meaning |
 |---|---|
 | `C1040` | An `#error` directive; the message is its text. |
-| `C1041` | An invalid preprocessing directive: an unknown name, or one of a later standard (`#elifdef`, `#elifndef`, `#warning`, `#embed` before C23). |
+| `C1041` | An invalid preprocessing directive: an unknown name, or one of a later standard (`#elifdef`, `#elifndef`, `#warning`, `#embed` before C23) or of a GNU dialect (`#include_next`, `#ident`, `#warning` before C23) under an ISO standard. |
 | `C1043` | A preprocessing directive inside the arguments of a macro invocation. |
 | `C1044` | `defined` made by macro replacement in an `#if` expression. |
 | `C1045` | `defined` with no identifier, or with no closing `)`. |
 | `C1046` | `__has_include`, `__has_embed` or `__has_c_attribute` with no `(` or no `)`. |
-| `C1048` | `__has_c_attribute` with no attribute name. |
+| `C1048` | `__has_c_attribute` or `__has_attribute` with no attribute name, or `__has_builtin` with no builtin's. |
 | `C1049` | `__has_include`, `__has_embed` or `__has_c_attribute` outside `#if` and `#elif`. |
 | `C1050` | A conditional directive (`#if`, `#ifdef`, `#ifndef`) that is not closed by `#endif`. |
 | `C1051` | A misused `_Pragma`: before C99, or without a parenthesized string literal. |
@@ -102,6 +102,7 @@ accepted as if the mode allowed it (so that one use gives one message).
 | `C1083` | An invalid `#embed` parameter: not an identifier, a repeated one, one with unbalanced parentheses, one without its parenthesized clause, a bad `limit`. |
 | `C1084` | An `#embed` parameter that no standard has. |
 | `C1085` | An invalid `#line`: a line number that is not a positive decimal number or is out of range, or a file name that is not a string literal. |
+| `C1086` | A use of an identifier that `#pragma GCC poison` poisoned. |
 
 ## C2xxx: syntax
 
@@ -230,8 +231,8 @@ array checks and the builtin checks were numbered apart. The message says which.
 |---|---|
 | `C3080` | A `va_list` builtin used wrongly: outside a variadic function, with an operand that is not a `va_list`, or `va_arg` of a type that cannot be fetched. Also: a variable length array before C99. |
 | `C3081` | `offsetof` of a bit-field, or with a member designator that does not designate a member. Also: a variably modified type where none can be (file scope, a member, static storage duration, a function's result, an `extern` object). |
-| `C3082` | An operand of a `<stdbit.h>`, `<stdckdint.h>` or `<complex.h>` builtin of a type it does not take (`__builtin_complex` takes two operands of one real floating type; `__builtin_creal`, `__builtin_cimag` and `__builtin_conj` a complex one). Also: an initializer of a variable length array (from C23, other than `{}`). |
-| `C3083` | A `goto` into the scope of an identifier with a variably modified type. |
+| `C3082` | An operand of a `<stdbit.h>`, `<stdckdint.h>` or `<complex.h>` builtin (or of a GNU dialect's builtin) of a type it does not take (`__builtin_complex` takes two operands of one real floating type; `__builtin_creal`, `__builtin_cimag` and `__builtin_conj` a complex one). Also: an initializer of a variable length array (from C23, other than `{}`). |
+| `C3083` | A `goto` into the scope of an identifier with a variably modified type (or, in a GNU dialect, of an object with a cleanup). |
 | `C3084` | A `case` or `default` label in the scope of such an identifier declared in its `switch` statement. |
 | `C3085` | `[*]` outside the parameters of a function prototype that is not a definition. |
 | `C3062` | An external name that is the name of one of the runtime's functions (`ax_write`, ...). Reported when code is generated, so `axiom check` does not report it. |
@@ -240,7 +241,14 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3065` | An external name defined by a C translation unit and by an Axiom `export fn` of the same program; a note points to the Axiom definition. |
 | `C3066` | A C translation unit defines `main` in a program whose root module is Axiom's (`axiom build main.ax x.c`), which has the program's `main`. |
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
-| `C3901` | A feature that this implementation does not support: `_Atomic` (qualifier or specifier), `_Imaginary` (the imaginary types), and (C23) the decimal floating types. |
+| `C3901` | A feature that this implementation does not support: `_Atomic` (qualifier or specifier), `_Imaginary` (the imaginary types), and (C23) the decimal floating types; in a GNU dialect inline assembly, `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), explicit register variables, `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
+
+### The GNU dialects
+
+| Code | Meaning |
+|---|---|
+| `C3090` | An invalid use of a GNU extension: a statement expression or a label's address outside a function, an asm label on an automatic object or after a use, two asm labels for one entity, weak or alias without linkage, an alias whose target the unit does not define, a section for an automatic object, a constructor or destructor with parameters, a cleanup on an object that is not automatic or with a function of more than one parameter, `__builtin_frame_address` or `__builtin_return_address` of a level other than 0. |
+| `C3091` | A call of a function declared with the attribute `error("message")`. |
 
 ## C4xxx: warnings
 
@@ -250,10 +258,21 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4040` | A label that is defined and not used. |
 | `C4050` | A use of a name or entity declared `[[deprecated]]`, with its message if it has one. |
 | `C4051` | The result of a call of a `[[nodiscard]]` function is discarded, with its message if it has one. |
-| `C4052` | An attribute with no prefix that is not a standard attribute: it is ignored. |
+| `C4052` | An attribute with no prefix that is not a standard attribute; in a GNU dialect, a GNU attribute this compiler does not know, or one where it cannot appertain: it is ignored. |
 | `C4053` | A function declared `_Noreturn` or `[[noreturn]]` that can return. Reported when code is generated. |
 | `C4080` | The second argument of `va_start` is not the function's last parameter. |
 | `C4081` | `va_arg` of a type that the default argument promotions change. |
 | `C4101` | A backslash-newline at the end of a file. |
 | `C4102` | A multi-character character constant. (Its value is implementation-defined; see [`docs/c.md`](c.md).) |
-| `C4103` | A `#warning` directive (C23); the message is its text. |
+| `C4103` | A `#warning` directive (C23, and the GNU dialects), or `#pragma GCC warning`; the message is its text. |
+| `C4110` | `#pragma message`; the message is its text. |
+| `C4111` | An unknown pragma (only with `--c-warn-unknown-pragmas`); it is ignored. |
+| `C4112` | A known pragma that is malformed (`#pragma pack(3)`, ...); it is ignored. |
+| `C4113` | A pragma that is not honoured: `#pragma STDC FENV_ACCESS ON`, `FENV_ROUND` of a direction other than to nearest. |
+| `C4114` | `#pragma pack(show)`: the value in force. |
+| `C4120` | An empty case range (`case 5 ... 3:`); it matches nothing. |
+| `C4121` | A null pointer constant passed for a parameter declared `nonnull`. |
+| `C4123` | A call of a function declared with the attribute `warning("message")`. |
+
+`#pragma GCC diagnostic` can hide a warning, or make it an error (with its code)
+([`docs/c.md`](c.md), "Pragmas").
