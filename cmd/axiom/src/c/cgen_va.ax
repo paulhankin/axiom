@@ -26,6 +26,7 @@ import "cgen_bitint.ax" as cbi;
 import "cgen_debug.ax" as cdbg;
 import "cgen_gbuiltin.ax" as gbg;
 import "cgen_ld.ax" as gld;
+import "cgen_wint.ax" as cgw;
 import "csema_builtin.ax" as csb;
 import "csema_gbuiltin.ax" as gbi;
 import "ctypes.ax" as cty;
@@ -251,6 +252,9 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
 // The C value of the result of call r (plan p; res: the result's memory, R_SRET).
 fn call_result(p: *mut abi.Plan, r: *mut ir.Value, res: *mut ir.Value) *mut ir.Value {
     if p.ret == abi.R_SRET {
+        if cty.is_wint(p.rty) {
+            cgw.norm(p.rty, res);  // (see enter_function)
+        }
         return res;
     }
     if p.ret == abi.R_X87 {
@@ -271,6 +275,9 @@ fn call_result(p: *mut abi.Plan, r: *mut ir.Value, res: *mut ir.Value) *mut ir.V
         let al = cty.align_of(p.rty);
         if p.ret == abi.R_PIECE {
             st(r, tmp, al);
+            if cty.is_wint(p.rty) {
+                cgw.norm(p.rty, tmp);
+            }
             return tmp;
         }
         for k in 0..p.rn {
@@ -278,6 +285,9 @@ fn call_result(p: *mut abi.Plan, r: *mut ir.Value, res: *mut ir.Value) *mut ir.V
             let mut ka: [2]*mut ir.Value = [r, c32(@bit_cast(i64, @as(u64, k)))];
             let x = ir.intr(B(), ir.IN_CALL_RESULT, pc.ty, ka[..]);
             st(x, at(tmp, pc.off), align_at(al, pc.off));
+        }
+        if cty.is_wint(p.rty) {
+            cgw.norm(p.rty, tmp);
         }
         return tmp;
     }
@@ -349,6 +359,9 @@ pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, v
                 st(pr, o, 8);
                 cdbg.note_indirect(f, s, o);
             }
+            if cty.is_wint(s.ty) {
+                cgw.norm(s.ty, @ptr_cast(*mut ir.Value, s.ir));  // (the copy is the callee's)
+            }
             continue;
         }
         let o = alloc_of(s.ty, a.span);
@@ -377,6 +390,12 @@ pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, v
         for k in 0..a.n {
             let pc = a.pieces[k];
             st(f.params[@int_cast(usize, a.slot[k])], at(o, pc.off), align_at(al, pc.off));
+        }
+        if cty.is_wint(s.ty) {
+            // (an integer wider than 64 bits: the bits beyond its width are
+            // unspecified in the ABIs, as a _BitInt's narrower than its
+            // storage are; brought to this implementation's form)
+            cgw.norm(s.ty, o);
         }
     }
     if variadic {
@@ -607,13 +626,17 @@ fn slot_va_arg(ap: *mut ir.Value, t: *mut cty.CType, ab: i32) *mut ir.Value {
         let a = one_arg(t, true);
         by_ref = a.kind == abi.A_REF;
         slot = a.pieces[0].ty.size;
+        let mut al = slot;
         if a.n == 2 {
-            slot = 16;  // (binary128: cgen_abi.wasm_arg)
+            // (binary128 or a 128-bit integer: 16 bytes, at its alignment, cgen_abi.wasm_arg)
+            slot = 16;
+            al = @max(cty.align_of(t), 8);
         }
         if slot < 4 {
             slot = 4;
+            al = 4;
         }
-        p = round_ptr(p, slot);
+        p = round_ptr(p, al);
     }
     st(at(p, slot), ap, cty.ptr_bytes);
     if by_ref {
@@ -821,6 +844,9 @@ pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
         return ir.vnil();
     }
     if id < csb.BI_CKD_ADD {
+        if cty.is_wint(e.args.get(0).ty) {
+            return cgw.stdbit(id, vs[0], e.args.get(0).ty, e.ty);
+        }
         return stdbit(id, vs[0], e.args.get(0).ty, e.ty);
     }
     let rp = e.args.get(0);
@@ -964,6 +990,9 @@ fn max_of(t: *cty.CType) u64 {
 // wrapped into *r (of type rt), and whether it did not fit.
 fn ckd(id: i32, rp: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, at_: *mut cty.CType, b: *mut ir.Value,
        bt: *mut cty.CType) *mut ir.Value {
+    if cty.is_wint(rt) or cty.is_wint(at_) or cty.is_wint(bt) {
+        return cgw.ckd(id == csb.BI_CKD_ADD, id == csb.BI_CKD_SUB, rp, rt, a, at_, b, bt);
+    }
     let wa = widen(a, at_);
     let wb = widen(b, bt);
     let w = rt.bits;

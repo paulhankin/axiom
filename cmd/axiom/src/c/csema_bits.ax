@@ -130,7 +130,8 @@ pub fn layout(ti: *mut cty.TagInfo) void {
             let a = placed_align(ti, m);
             // (packed, or under any #pragma pack: placed at the next bit,
             // whatever its alignment)
-            let natural = (a >= cty.size_of(m.ty)) and not (ti.packed or m.packed or (ti.pack != 0));
+            let natural = ((a >= cty.size_of(m.ty)) or (cty.is_wint(m.ty) and (a >= cty.align_of(m.ty)))) and
+                          not (ti.packed or m.packed or (ti.pack != 0));
             if not natural {
                 m.place_align = a;
             }
@@ -160,12 +161,29 @@ pub fn layout(ti: *mut cty.TagInfo) void {
                 continue;
             }
             if w == 0 {
-                pos = cty.round_up(pos, ub);
+                if cty.is_wint(m.ty) {
+                    pos = cty.round_up(pos, cty.align_of(m.ty) * 8);
+                } else {
+                    pos = cty.round_up(pos, ub);
+                }
                 m.offset = pos / 8;
                 m.bit_off = 0;
                 continue;
             }
-            if natural {
+            if natural and cty.is_wint(m.ty) and (a < cty.size_of(m.ty)) {
+                // (a type wider than 64 bits aligned to less than its size:
+                // in a window of its size from a multiple of its alignment,
+                // the last at or before the next bit, else the next one; as
+                // System V's compilers lay out _BitInt(N) bit-fields)
+                let ab = a * 8;
+                let mut unit = pos / ab * ab;
+                if pos + w > unit + ub {
+                    pos = cty.round_up(pos, ab);
+                    unit = pos;
+                }
+                m.offset = unit / 8;
+                m.bit_off = @bit_cast(i32, @truncate(u32, pos - unit));
+            } else if natural {
                 let mut unit = pos / ub * ub;
                 if pos + w > unit + ub {
                     pos = cty.round_up(pos, ub);
@@ -305,7 +323,9 @@ fn layout_ms(ti: *mut cty.TagInfo) void {
         // (#pragma pack and packed lower a unit's alignment, not its size:
         // such a unit is reached as packed_units says)
         let a = placed_align(ti, m);
-        if a < s {
+        // (a type wider than 64 bits aligned to less than its size: its unit
+        // at a multiple of its alignment, reached through its limbs)
+        if (a < s) and not (cty.is_wint(m.ty) and (a >= cty.align_of(m.ty))) {
             m.place_align = a;
             fix = true;
         }

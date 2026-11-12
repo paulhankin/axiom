@@ -1032,6 +1032,10 @@ fn nonzero_at(x0: *mut ir.Value, b0: *mut ir.Block) bool {
 
 // d = a op b (add, sub, and, or, xor, mul)
 fn gen_alu(v: *mut ir.Value) void {
+    if (v.flag & F_ADC) != 0 {
+        gen_carry(v);
+        return;
+    }
     let o = v.op;
     let sz = isz(v.ty);
     let mut a = v.a;
@@ -1642,6 +1646,9 @@ const F_BT: i32 = 2097152;     // a 1 << k that its only user, an and tested aga
 const F_SCALE: i32 = 4194304;  // an x << 1-3 that its only user (an add, or an or of disjoint bits) computes as lea
 const F_BTX: i32 = 8388608;    // a 1 << k that its only user, an xor or or, computes as btc or bts
 const F_BTR: i32 = 16777216;   // a y >> k that its only user, an & 1 tested against 0, computes as bt y, k
+
+const F_CSKIP: i32 = 33554432;  // a p <u q, its zero-extension or a y +/- w that its only user computes (F_ADC)
+const F_ADC: i32 = 67108864;    // x + (p <u q) or x - (p <u q): cmp p, q; adc / sbb (mark_carry)
 
 // Is s a 1 << k that v (an xor or or) computes as btc or bts: one it
 // computes alone (F_BTX), or one computed for other users too?
@@ -7161,7 +7168,8 @@ fn gen_inst_at(v: *mut ir.Value) void {
         gen_remat(v);
         return;
     }
-    if (v.flag & (((((((((16 | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | F_BTX) | F_BTR)) != 0 {
+    if (v.flag &
+        ((((((((((16 | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | F_BTX) | F_BTR) | F_CSKIP)) != 0 {
         return;  // (part of its user: a blend, a compare into a mask register, a masked instruction)
     }
     if (v.flag & 64) != 0 {
@@ -7375,6 +7383,18 @@ fn gen_intr(v: *mut ir.Value) void {
             p.cc = 1;
         }
         p.keep = true;
+        return;
+    }
+    if id == ir.IN_UDIV128 {
+        // div: rax = rdx:rax / d (rdx < d: ir.ax)
+        let hi = reg(v.xs.get(0));
+        let lo = reg(v.xs.get(1));
+        let dv = reg(v.xs.get(2));
+        _ = e2(xe.MOV_RR, 8, W(xe.RAX), R(lo));
+        _ = e2(xe.MOV_RR, 8, W(xe.RDX), R(hi));
+        let i = e4(xe.DIV, 8, RW(xe.RAX), RW(xe.RDX), R(dv), NONE());
+        i.cc = 6;
+        copy(vreg(v), xe.RAX, GPR);
         return;
     }
     if (id == ir.IN_X87_LOAD) or (id == ir.IN_X87_STORE) {
@@ -7640,6 +7660,7 @@ fn prepare(f: *mut ir.Func) void {
     each_inst(f, mark_btx);
     each_inst(f, mark_vandn);
     each_inst(f, mark_lea);
+    each_inst(f, mark_carry);
     if not tg.has(tg.X_LZCNT) {
         mark_bsr(f);
     }
@@ -7844,6 +7865,109 @@ fn mark_lea(i: *mut ir.Value) void {
             i.a.flag = i.a.flag | F_SCALE;
         }
     }
+}
+
+// The carry (or borrow) of a multi-word addition (subtraction): x + (p <u q)
+// and x - (p <u q) of 64-bit integers, where the comparison and its
+// zero-extension are used only there, as adc and sbb after cmp p, q (CF is
+// p <u q); x itself, if it is y + w (y - w) used only there, the adc's
+// (sbb's) operands. The idiom of a sum's carry is lo = a + b, lo <u a (of a
+// difference's borrow, a <u b): cgen_wint.ax makes it.
+fn carry_part(z: *mut ir.Value, i: *ir.Value) bool {
+    if not ir.is_op(z, ir.OP_ZEXT) or (z.uses != 1) or (z.blk != i.blk) or (z.ty != i.ty) or (z.flag != 0) {
+        return false;
+    }
+    let c = z.a;
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.cv != @as(u64, @bit_cast(u32, ir.IntULT))) or
+       (c.uses != 1) or (c.blk != i.blk) {
+        return false;
+    }
+    let t = c.a.ty;
+    if (t.kind != ir.T_INT) or (t.bits != 64) or is.is_c(c.a) or folded_load(c.a) or folded_load(c.b) {
+        return false;
+    }
+    return not is.is_c(c.b) or imm_ok(c.b);
+}
+
+fn mark_carry(i: *mut ir.Value) void {
+    let sub = i.op == ir.OP_SUB;
+    if (not sub and (i.op != ir.OP_ADD)) or (i.ty.kind != ir.T_INT) or (i.ty.bits != 64) or (i.flag != 0) {
+        return;
+    }
+    let mut z = i.b;
+    let mut x = i.a;
+    if not carry_part(z, i) {
+        if sub or not carry_part(i.a, i) {
+            return;
+        }
+        z = i.a;
+        x = i.b;
+    }
+    if folded_load(x) {
+        return;
+    }
+    z.flag = z.flag | F_CSKIP;
+    z.a.flag = z.a.flag | F_CSKIP;
+    i.flag = i.flag | F_ADC;
+    if (x.kind == ir.V_INST) and (x.op == i.op) and (x.uses == 1) and (x.blk == i.blk) and (x.flag == 0) and
+       (x.ty == i.ty) and plain_operand(x.a) and plain_operand(x.b) {
+        x.flag = x.flag | F_CSKIP;
+    }
+}
+
+// Is v a value its user reads from a register (not a load or an operation
+// that the user computes itself: folded, lea, bmi, bt)?
+fn plain_operand(v: *ir.Value) bool {
+    let m = ((((((((8 | 16) | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | (F_BTX | F_BTR);
+    return (v.kind != ir.V_INST) or ((v.flag & m) == 0);
+}
+
+fn gen_carry(v: *mut ir.Value) void {
+    let sub = v.op == ir.OP_SUB;
+    let mut z = v.b;
+    let mut x = v.a;
+    if not sub and ((v.b.kind != ir.V_INST) or ((v.b.flag & F_CSKIP) == 0)) {
+        z = v.a;
+        x = v.b;
+    }
+    let c = z.a;
+    // (every register first: materializing a constant may set flags)
+    let last0 = CB.last;
+    let rp = reg(c.a);
+    let mut q = I(0);
+    if is.is_c(c.b) {
+        q = I(narrow_imm(is.cval(c.b), 8));
+    } else {
+        q = R(reg(c.b));
+    }
+    let mut y = x;
+    let mut w = I(0);
+    if (x.kind == ir.V_INST) and ((x.flag & F_CSKIP) != 0) {
+        y = x.a;
+        if is.is_c(x.b) and imm_ok(x.b) {
+            w = I(narrow_imm(is.cval(x.b), 8));
+        } else {
+            w = R(reg(x.b));
+        }
+    }
+    let ry = reg(y);
+    // p = q + r made by the add just emitted: its CF is already p <u q
+    let fresh = u.notnil(last0) and (CB.last == last0) and (last0.op == xe.ALU) and (last0.cc == xe.ALU_ADD) and
+                (last0.sz == 8) and (last0.ops[0].kind == mc.K_REG) and (last0.ops[0].reg == rp) and
+                ir.is_op(c.a, ir.OP_ADD) and ((c.a.a == c.b) or (c.a.b == c.b));
+    let d = vreg(v);
+    copy(d, ry, GPR);
+    if not fresh {
+        _ = alu(xe.ALU_CMP, 8, R(rp), q);
+    }
+    _ = alu(pick_i32(sub, xe.ALU_SBB, xe.ALU_ADC), 8, RW(d), w);
+}
+
+fn pick_i32(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 // ctlz(x) used only as k - ctlz(x) or ctlz(x) + k: bsr(x), the index of

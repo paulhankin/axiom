@@ -3,7 +3,8 @@
 //
 // rv(e) is e's value: a scalar's IR value, a structure's, union's or
 // complex value's address (memory holding the value: cgen_complex.ax), and
-// so a wide long double's (cgen_ld.ax),
+// so a wide long double's (cgen_ld.ax) and an integer's wider than 64 bits
+// (cgen_wint.ax),
 // nothing for void; lv(e) is the address of
 // lvalue e (and of a structure member reached from a structure value). The
 // implicit conversions are CAST nodes, so each node does one thing.
@@ -26,6 +27,7 @@ import "cgen_ld.ax" as gld;
 import "cgen_tls.ax" as cgt;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
+import "cgen_wint.ax" as cgw;
 import "cldbl.ax" as cl;
 import "csema_atomic.ax" as catm;
 import "csema_attr.ax" as catr;
@@ -33,6 +35,7 @@ import "csema_builtin.ax" as csb;
 import "csema_fp.ax" as cfp;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
 
 fn lty(t: *mut cty.CType) *mut ir.Ty {
     return cg.lty(t);
@@ -52,6 +55,9 @@ pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
     if cty.is_complex(t) {
         return gcx.snapshot(t, p);
     }
+    if cty.is_wint(t) {
+        return cgw.snapshot(t, p, is_volatile(t));
+    }
     let v = ir.load(cg.B, lty(t), p);
     v.align = @truncate(u32, cty.align_of(t));
     if is_volatile(t) {
@@ -69,6 +75,10 @@ pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
 fn store_al(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value, al: u64) void {
     if cty.is_complex(t) {
         gcx.put(t, gcx.parts(t.unq, v), p);
+        return;
+    }
+    if cty.is_wint(t) {
+        cgw.copy(t, p, v, is_volatile(t));
         return;
     }
     let s = ir.store(cg.B, v, p);
@@ -110,6 +120,9 @@ pub fn const_value(e: *cast.Expr) *mut ir.Value {
     if cty.is_wide(e.ty) {
         return gld.constant(e.xv);
     }
+    if cty.is_wint(e.ty) {
+        return cgw.constant(e.ty, cw.value(e, cty.limbs(e.ty)));
+    }
     let t = lty(e.ty);
     if cty.is_floating(e.ty) {
         return ir.cfp(t, e.fcval);
@@ -128,6 +141,9 @@ pub fn truth(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     }
     if cty.is_wide(t) {
         return gld.truth(v);
+    }
+    if cty.is_wint(t) {
+        return cgw.truth(t, v);
     }
     if cty.is_floating(t) {
         return ir.fcmp(cg.B, ir.RealUNE, v, ir.cfp(v.ty, 0.0));
@@ -191,6 +207,9 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
     }
     if cty.is_complex(t) or cty.is_complex(f) {
         return complex_convert(v, f, t);
+    }
+    if cty.is_wint(f) or cty.is_wint(t) {
+        return cgw.convert(v, f, t);
     }
     if cty.is_wide(f) or cty.is_wide(t) {
         return gld.convert(v, f, t);
@@ -335,7 +354,7 @@ pub fn lv(e: *mut cast.Expr) *mut ir.Value {
     }
     if k == cast.ExprKind.INDEX {
         let p = rv(e.a);
-        let i = rv(e.b);
+        let i = index_of(rv(e.b), e.b.ty);
         return offset(p, i, gv.size_value(e.ty), false);
     }
     if k == cast.ExprKind.MEMBER {
@@ -407,6 +426,9 @@ fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
     if cty.is_wide(e.ty) {
         return gld.snapshot(p, is_volatile(e.ty));
     }
+    if cty.is_wint(e.ty) {
+        return cgw.snapshot(e.ty, p, is_volatile(e.ty));
+    }
     let v = load(e.ty, p);
     let al = lv_align(e);
     if ir.is_op(v, ir.OP_LOAD) and (al < @as(u64, v.align)) {
@@ -429,6 +451,10 @@ pub fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut 
         gld.copy(p, v, is_volatile(e.ty));
         return v;
     }
+    if cty.is_wint(t) {
+        cgw.copy(t, p, v, is_volatile(e.ty));
+        return v;
+    }
     store_al(t, v, p, lv_align(e));
     return v;
 }
@@ -438,6 +464,15 @@ fn rv_or_lv(e: *mut cast.Expr, want_lv: bool) *mut ir.Value {
         return lv(e);
     }
     return rv(e);
+}
+
+// An integer value v of type t as an index (an integer wider than 64 bits:
+// its low limb; its value beyond that leaves every object).
+fn index_of(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if cty.is_wint(t) {
+        return cgw.limb(v, 0);
+    }
+    return v;
 }
 
 // p + i * size (i: a pointer-sized integer; size: the elements', cgen_vla.size_value), or minus.
@@ -508,7 +543,7 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
     if (k == cast.ExprKind.MEMBER) or (k == cast.ExprKind.INDEX) or (k == cast.ExprKind.IDENT) {
         // (the member of a structure value; lvalues are converted by CV_LOAD)
         let p = lv(e);
-        if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) or cty.is_wide(e.ty) {
+        if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) or cty.is_wide(e.ty) or cty.is_wint(e.ty) {
             return p;
         }
         return load_lv(e, p);
@@ -585,6 +620,15 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
         }
         return v;
     }
+    if cty.is_wint(e.ty) {
+        if op == ct.P_MINUS {
+            return cgw.negate(e.ty, v);
+        }
+        if op == ct.P_TILDE {
+            return cgw.bitnot(e.ty, v);
+        }
+        return v;
+    }
     if op == ct.P_MINUS {
         if cty.is_wide(e.ty) {
             return gld.negate(v);
@@ -600,8 +644,19 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
     return v;
 }
 
-// x op y in arithmetic type t (both of type t; a shift's y converted to x's width).
-fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+// x op y in arithmetic type t (both of type t but a shift's y, of type yt,
+// converted to x's width).
+fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt: *mut cty.CType) *mut ir.Value {
+    if cty.is_wint(t) {
+        if (op == ct.P_SHL) or (op == ct.P_SHR) {
+            return cgw.shift(op, t, x, y0, yt);
+        }
+        return cgw.arith(op, t, x, y0);
+    }
+    let mut y = y0;
+    if cty.is_wint(yt) {
+        y = cgw.limb(y0, 0);  // (a shift count: its low bits, or it is out of range)
+    }
     if cty.is_wide(t) {
         return gld.arith(op, x, y);
     }
@@ -710,6 +765,9 @@ fn compare(e: *mut cast.Expr) *mut ir.Value {
     let mut y = rv(e.b);
     if cty.is_wide(t) {
         return i1_to(e.ty, gld.compare(op, x, y));
+    }
+    if cty.is_wint(t) {
+        return i1_to(e.ty, cgw.compare(op, t, x, y));
     }
     if cty.is_floating(t) {
         let mut p = ir.RealOEQ;
@@ -833,7 +891,7 @@ fn binary(e: *mut cast.Expr) *mut ir.Value {
             let n = ir.binop(cg.B, ir.OP_SDIV, d, sz);
             return int_resize(n, true, lty(e.ty));
         }
-        let i = rv(e.b);
+        let i = index_of(rv(e.b), e.b.ty);
         return offset(p, i, gv.size_value(ta.elem), op == ct.P_MINUS);
     }
     if cty.is_complex(e.ty) {
@@ -843,7 +901,7 @@ fn binary(e: *mut cast.Expr) *mut ir.Value {
     }
     let x = rv(e.a);
     let y = rv(e.b);
-    return arith_op(op, e.ty, x, y);
+    return arith_op(op, e.ty, x, y, e.b.ty);
 }
 
 fn assign(e: *mut cast.Expr) *mut ir.Value {
@@ -857,6 +915,10 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
         }
         if cty.is_wide(lt) {
             gld.copy(p, v, is_volatile(lt));
+            return p;
+        }
+        if cty.is_wint(lt) and u.isnil(cgb.of(e.a)) {
+            cgw.copy(lt, p, v, is_volatile(lt));
             return p;
         }
         if cty.is_record(lt) {
@@ -881,7 +943,7 @@ fn compound_value(e: *mut cast.Expr, old: *mut ir.Value, r: *mut ir.Value) *mut 
     let ot = e.opty;
     let mut nv = ir.vnil();
     if ot.kind == cty.TK_POINTER {
-        nv = offset(old, r, gv.size_value(ot.elem), e.op == ct.P_SUB_EQ);
+        nv = offset(old, index_of(r, e.b.ty), gv.size_value(ot.elem), e.op == ct.P_SUB_EQ);
     } else if cty.is_complex(ot) {
         // (each operand in its type domain, as csema_expr.compound_arith says)
         let xt = cty.domain_type(lt, ot);
@@ -898,7 +960,7 @@ fn compound_value(e: *mut cast.Expr, old: *mut ir.Value, r: *mut ir.Value) *mut 
         nv = convert(res, ot, lt);
     } else {
         let x = convert(old, lt, ot);
-        nv = convert(arith_op(base_op(e.op), ot, x, r), ot, lt);
+        nv = convert(arith_op(base_op(e.op), ot, x, r, e.b.ty), ot, lt);
     }
     return nv;
 }
@@ -921,12 +983,14 @@ fn incdec(e: *mut cast.Expr) *mut ir.Value {
         let mut one = ir.vnil();
         if cty.is_wide(ot) {
             one = gld.one_value();
+        } else if cty.is_wint(ot) {
+            one = cgw.one_value(ot);
         } else if cty.is_floating(ot) {
             one = ir.cfp(lty(ot), 1.0);
         } else {
             one = ir.cint(lty(ot), 1);
         }
-        nv = convert(arith_op(pick(dec, ct.P_MINUS, ct.P_PLUS), ot, x, one), ot, t);
+        nv = convert(arith_op(pick(dec, ct.P_MINUS, ct.P_PLUS), ot, x, one, ot), ot, t);
     }
     let stored = store_lv(e.a, t, nv, p);
     if e.kind == cast.ExprKind.POSTFIX {
@@ -967,7 +1031,7 @@ fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
         if ptr_ok {
             let mut n = cg.usz(1);
             if u.notnil(r) {
-                n = int_resize(r, true, cg.T_isz);
+                n = int_resize(index_of(r, e.b.ty), true, cg.T_isz);
             }
             x = no_wrap(ir.mul(cg.B, n, gv.size_value(ot.elem)), ir.OP_MUL);
         } else if u.isnil(r) {
@@ -1008,13 +1072,17 @@ fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
         nv = offset(old, cg.usz(1), gv.size_value(ot.elem), op == ct.P_MINUS);
     } else {
         let x = convert(old, t, ot);
-        let mut one = ir.cint(lty(ot), 1);
+        let mut one = ir.vnil();
         if cty.is_wide(ot) {
             one = gld.one_value();
+        } else if cty.is_wint(ot) {
+            one = cgw.one_value(ot);
         } else if cty.is_floating(ot) {
             one = ir.cfp(lty(ot), 1.0);
+        } else {
+            one = ir.cint(lty(ot), 1);
         }
-        nv = convert(arith_op(op, ot, x, one), ot, t);
+        nv = convert(arith_op(op, ot, x, one, ot), ot, t);
     }
     cga.update_end(up, nv);
     if post {
@@ -1077,7 +1145,7 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
         return gcx.make(e.ty, gcx.Pair.{ re: pr, im: pi });
     }
     let mut pt = cg.T_ptr;
-    if cty.is_scalar(e.ty) and not cty.is_wide(e.ty) {
+    if cty.is_scalar(e.ty) and not cty.is_wide(e.ty) and not cty.is_wint(e.ty) {
         pt = lty(e.ty);
     }
     let ph = ir.phi(cg.B, pt);

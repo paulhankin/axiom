@@ -6,7 +6,7 @@ value, directly, through function pointers and as variadic arguments (read
 with va_arg, va_copy and a va_list passed on), with the callers in one
 translation unit and the callees in another:
 
-    gen_c_abi.py SEED COUNT DIR [--prefix=NAME] [--no-align] [--ld] [--atomic] [--host]
+    gen_c_abi.py SEED COUNT DIR [--prefix=NAME] [--no-align] [--ld] [--atomic] [--int128] [--bitint] [--host]
 
 writes DIR/NAME.h (the types and the functions that fill and check them),
 DIR/NAME_callee.c (the functions called) and DIR/NAME.c (main, the calls).
@@ -25,9 +25,13 @@ output, and the other two files go in DIR/abi/. The suite's tests are
     gen_c_abi.py 101 8 cmd/axiom/internal/tests/c/run --host
     gen_c_abi.py 102 8 cmd/axiom/internal/tests/c/run --host
     gen_c_abi.py 103 8 cmd/axiom/internal/tests/c/run --host --no-align
+    gen_c_abi.py 104 8 cmd/axiom/internal/tests/c/run --host --int128 --bitint
 
 With --atomic they also have _Atomic members (scalars, and records set
-and read whole). With --ld the shapes also have long double and long double _Complex members
+and read whole). With --int128 they have __int128 and unsigned __int128
+members and arguments (a GNU dialect: gnu11 or later), with --bitint
+_BitInt(N) ones for N of 65 to 256 (C23; --bitint=128: to 128), whose
+values use all their bits. With --ld the shapes also have long double and long double _Complex members
 and arguments (C99; <complex.h>), with values that double cannot hold.
 
 The shapes stay within what the C standard defines and every target
@@ -60,7 +64,21 @@ LONG_DOUBLES = {
     'ld': ('long double', 'f', 128, True),
     'cld': ('long double _Complex', 'c', 256, True),
 }
-ALL = {**SCALARS, **LONG_DOUBLES}
+# with --int128 and --bitint, the integers wider than 64 bits (kind w), and
+# the unsigned type of their width
+INT128S = {
+    'q': ('__int128', 'w', 128, True),
+    'uq': ('unsigned __int128', 'w', 128, False),
+}
+BITINTS = {
+    'b65': ('_BitInt(65)', 'w', 65, True),
+    'ub100': ('unsigned _BitInt(100)', 'w', 100, False),
+    'b128': ('_BitInt(128)', 'w', 128, True),
+    'ub129': ('unsigned _BitInt(129)', 'w', 129, False),
+    'b192': ('_BitInt(192)', 'w', 192, True),
+    'ub256': ('unsigned _BitInt(256)', 'w', 256, False),
+}
+ALL = {**SCALARS, **LONG_DOUBLES, **INT128S, **BITINTS}
 # the promoted type of a variadic argument
 PROMOTE = {'c': 'i', 'uc': 'i', 's': 'i', 'us': 'i', 'b': 'i', 'f': 'd'}
 
@@ -105,11 +123,12 @@ class Record:
 
 
 class Gen:
-    def __init__(self, seed, align, ld=False, atomic=False):
+    def __init__(self, seed, align, ld=False, atomic=False, int128=False, bitint=False):
         self.r = random.Random(seed)
         self.align = align
         self.atomic = atomic
-        self.kinds = list(SCALARS) + (list(LONG_DOUBLES) if ld else [])
+        self.kinds = list(SCALARS) + (list(LONG_DOUBLES) if ld else []) + (list(INT128S) if int128 else []) + \
+            (list(BITINTS) if bitint else [])
         self.records = []
 
     def scalar(self):
@@ -214,6 +233,8 @@ def max_align(t):
             n *= 2
         return max(max_align(t.t), min(n, 16))
     if isinstance(t, Scalar):
+        if ALL[t.k][1] == 'w':
+            return 16
         return 8 if t.k == 'p' else min(16, max(1, ALL[t.k][2] // 8))
     if isinstance(t, Array):
         return max_align(t.elem)
@@ -227,6 +248,8 @@ def max_size(t):
     if isinstance(t, Atomic):
         return max_size(t.t) + 16
     if isinstance(t, Scalar):
+        if ALL[t.k][1] == 'w':
+            return (ALL[t.k][2] + 127) // 128 * 16
         return 8 if t.k == 'p' else max(1, ALL[t.k][2] // 8)
     if isinstance(t, Array):
         return t.n * max_size(t.elem)
@@ -277,6 +300,13 @@ def value(k, w, s, j):
         return f'(long double _Complex)({re} + {im} * I)'
     if kind == 'f':
         return f'({sp})((double)(long long)({m} % 4001u) / 8.0 - 250.0)'
+    if kind == 'w':
+        # (every limb's bits: three 64-bit words, in the unsigned type of the width)
+        ut = sp if not signed else ('unsigned __int128' if sp == '__int128' else 'unsigned ' + sp)
+        m2 = f'abi_mix({s}, {j}u + 2000u)'
+        m3 = f'abi_mix({s}, {j}u + 3000u)'
+        hi = f' ^ (({ut}){m3} << {bits - 64})' if bits > 128 else ''
+        return f'({sp})(({ut}){m} ^ (({ut}){m2} << {min(bits - 1, 64)}){hi})'
     if kind == 'p':
         return f'(abi_anchor + ({m} % 8u))'
     if w is not None:
@@ -349,7 +379,11 @@ def main():
         if o.startswith('--prefix='):
             prefix = o[len('--prefix='):]
     ld = '--ld' in opts
-    g = Gen(seed, '--no-align' not in opts, ld, '--atomic' in opts)
+    if '--bitint=128' in opts:
+        for k in [k for k in BITINTS if BITINTS[k][2] > 128]:
+            del BITINTS[k]
+    bitint = '--bitint' in opts or '--bitint=128' in opts
+    g = Gen(seed, '--no-align' not in opts, ld, '--atomic' in opts, '--int128' in opts, bitint)
     host = '--host' in opts
     tests = []
     for k in range(count):
@@ -470,6 +504,8 @@ def main():
           f'   functions of {prefix}_callee.c, directly, through pointers and with',
           '   variadic arguments; prints the failures and the calls made. */']
     if host:
+        if '--int128' in opts or bitint:
+            ma.append('/* flags: --c-std=gnu23 */')
         ma.append(f'/* units: abi/{prefix}_callee.c */')
         ma.append('#include "host.h"')
         ma.append(f'#include "abi/{prefix}.h"')

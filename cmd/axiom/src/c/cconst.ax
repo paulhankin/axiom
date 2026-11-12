@@ -5,7 +5,8 @@
 // initializers of objects with static storage duration (address).
 //
 // An expression's value is in its Expr: is_const, and cval (an integer's
-// bits, sign- or zero-extended from its type's width: ctypes.wrap) or
+// bits, sign- or zero-extended from its type's width: ctypes.wrap; of a
+// type wider than 64 bits, the low 64, the value in cwide.ax) or
 // fcval (a floating value; a float's is rounded to float; a complex value's
 // real part, its imaginary part in fcimag), or xv (a long double's wider
 // than double: cldbl.ax, in the target's format, which fcval approximates;
@@ -16,6 +17,7 @@
 // signed integer operation that overflows gives the wrapped value, and
 // marks the expression (ovf, carried up through the operands evaluated):
 // where a constant expression is required that is an error (6.6p4).
+// The integers wider than 64 bits (cty.is_wint) are cwide.ax's.
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
@@ -24,6 +26,7 @@ import "cldbl.ax" as cl;
 import "copts.ax" as co;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
 import "std/c/rt/ldouble" as ld;
 
 /// Sets e's value (is_const, cval or fcval) from its operands', if they are
@@ -155,6 +158,9 @@ pub fn wide_value(x: *cast.Expr) ld.W {
     if cty.is_floating(x.ty) or cty.is_complex(x.ty) {
         return cl.of_f64(x.fcval, f);
     }
+    if cty.is_wint(x.ty) {
+        return cw.to_ld(x, f);
+    }
     if x.ty.is_signed and (x.ty.kind != cty.TK_BOOL) {
         return cl.of_i64(@bit_cast(i64, x.cval), f);
     }
@@ -176,6 +182,9 @@ pub fn truth(x: *cast.Expr) bool {
     if cty.is_floating(x.ty) {
         return x.fcval != 0.0;
     }
+    if cty.is_wint(x.ty) {
+        return cw.truth(x);
+    }
     return x.cval != 0;
 }
 
@@ -183,6 +192,9 @@ pub fn truth(x: *cast.Expr) bool {
 fn as_float(x: *cast.Expr) f64 {
     if cty.is_floating(x.ty) {
         return x.fcval;
+    }
+    if cty.is_wint(x.ty) {
+        return cw.to_f64(x);
     }
     if x.ty.is_signed {
         return @float_from_int(f64, @bit_cast(i64, x.cval));
@@ -214,6 +226,26 @@ fn narrow_wide(w: ld.W, t: *cty.CType) f64 {
 fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
     let to = e.ty;
     let from = x.ty;
+    if cty.is_wint(to) {
+        // (from a floating value: only when it fits, 6.3.1.4p1)
+        if cty.is_integer(from) {
+            cw.convert_int(e, x);
+        } else if cty.is_wide(from) or is_cwide(from) {
+            cw.convert_ld(e, x.xv, ld_fmt());
+        } else {
+            cw.convert_f64(e, x.fcval);
+        }
+        return;
+    }
+    if cty.is_wint(from) and cty.is_integer(to) {
+        // (cval is the value's low 64 bits)
+        if to.kind == cty.TK_BOOL {
+            set_int(e, selu(truth(x), 1, 0));
+        } else {
+            set_int(e, x.cval);
+        }
+        return;
+    }
     // (the parts of complex values as real ones, where a wide long double is one)
     if is_cwide(to) {
         set_cwide(e, wide_value(x), wide_imag(x));
@@ -299,6 +331,9 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
 
 // The integer constant x as a float (rounded once).
 fn int_to_f32(x: *cast.Expr) f64 {
+    if cty.is_wint(x.ty) {
+        return @as(f64, cw.to_f32(x));
+    }
     if x.ty.is_signed {
         return @as(f64, @float_from_int(f32, @bit_cast(i64, x.cval)));
     }
@@ -399,6 +434,10 @@ fn unary(e: *mut cast.Expr) void {
         }
         return;
     }
+    if cty.is_wint(e.ty) {
+        cw.fold_unary(e, op, x, ct.P_MINUS, ct.P_TILDE);
+        return;
+    }
     if op == ct.P_MINUS {
         set_int(e, 0 -% x.cval);
         e.ovf = e.ty.is_signed and (x.cval != 0) and (e.cval == x.cval);  // (the most negative value)
@@ -470,6 +509,16 @@ fn binary(e: *mut cast.Expr) void {
         }
         return;
     }
+    if cty.is_wint(e.ty) {
+        let wo = wide_op(op);
+        if wo >= 0 {
+            cw.fold_binary(e, wo, a, b);
+        }
+        return;
+    }
+    if not cw.fits64(b) {
+        return;  // (a shift count of a wider type, out of range)
+    }
     let r = int_op(op, e.ty, a.cval, b.cval);
     if r.ok {
         set_int(e, r.v);
@@ -516,6 +565,18 @@ fn overflows(op: i32, t: *cty.CType, x: u64, y: u64) bool {
         return a > (hi >> @truncate(u32, y));
     }
     return false;
+}
+
+// The cwide.OP_ of operator op, or -1.
+fn wide_op(op: i32) i32 {
+    let ops: [10]i32 = [ct.P_PLUS, ct.P_MINUS, ct.P_STAR, ct.P_SLASH, ct.P_PERCENT, ct.P_SHL, ct.P_SHR, ct.P_AMP,
+                        ct.P_PIPE, ct.P_CARET];
+    for k in 0..ops.len {
+        if ops[k] == op {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
 }
 
 pub fn is_compare(op: i32) bool {
@@ -573,6 +634,25 @@ fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
             return x == y;
         }
         return x != y;
+    }
+    if cty.is_wint(t) {
+        let c = cw.compare(t, a, b);
+        if op == ct.P_LT {
+            return c < 0;
+        }
+        if op == ct.P_GT {
+            return c > 0;
+        }
+        if op == ct.P_LE {
+            return c <= 0;
+        }
+        if op == ct.P_GE {
+            return c >= 0;
+        }
+        if op == ct.P_EQ {
+            return c == 0;
+        }
+        return c != 0;
     }
     if op == ct.P_EQ {
         return a.cval == b.cval;

@@ -24,6 +24,7 @@ import "csema_marks.ax" as csm;
 import "csema_named.ax" as cn;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -151,6 +152,17 @@ pub struct Ice {
 
 /// Types e, which must be an integer constant expression (what: for the message).
 pub fn ice(e: *mut cast.Expr, what: []u8) Ice {
+    return ice_of(e, what, false);
+}
+
+/// Types e, an integer constant expression of any value (what: for the
+/// message): as ice, but a value wider than 64 bits is accepted, and is the
+/// Expr's alone (cwide.ax; v: its low 64 bits).
+pub fn ice_wide(e: *mut cast.Expr, what: []u8) Ice {
+    return ice_of(e, what, true);
+}
+
+fn ice_of(e: *mut cast.Expr, what: []u8, wide_ok: bool) Ice {
     let x = rv(e);
     if is_err(x) {
         return Ice.{ ok: false, v: 0, e: x };
@@ -164,6 +176,12 @@ pub fn ice(e: *mut cast.Expr, what: []u8) Ice {
         return Ice.{ ok: false, v: 0, e: x };
     }
     if not const_in_range(x) {
+        return Ice.{ ok: false, v: 0, e: x };
+    }
+    if not wide_ok and not cw.fits64(x) {
+        // (a value wider than 64 bits, of __int128 or a _BitInt: none of
+        // the places that need a value take one so large)
+        cs.err(x.span, "C3212", u.f2("%s is too large (%s)", what, cw.text(x)));
         return Ice.{ ok: false, v: 0, e: x };
     }
     return Ice.{ ok: true, v: x.cval, e: x };
@@ -192,7 +210,8 @@ pub fn is_npc(e: *cast.Expr) bool {
     if is_err(e) {
         return false;
     }
-    if cty.is_integer(e.ty) and e.is_const and (e.cval == 0) and csi.is_ice(e) {
+    if cty.is_integer(e.ty) and e.is_const and (e.cval == 0) and csi.is_ice(e) and
+       (not cty.is_wint(e.ty) or not cw.truth(e)) {
         return true;
     }
     if e.kind == cast.ExprKind.NULLPTR {
@@ -382,13 +401,10 @@ pub fn assign_convert(e: *mut cast.Expr, t: *mut cty.CType, what: []u8) *mut cas
 fn int_const(e: *mut cast.Expr) *mut cast.Expr {
     let t = e.tok;
     if t.bitint {
-        let bt = csb.const_type(t, e.span);
+        let bt = csb.const_type(t, e.span, e);
         if cty.is_error(bt) {
             return bad(e);
         }
-        e.ty = bt;
-        e.is_const = true;
-        e.cval = cty.wrap(bt, t.ival);
         return e;
     }
     let dec = t.base == 10;

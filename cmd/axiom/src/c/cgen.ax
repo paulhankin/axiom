@@ -8,7 +8,8 @@
 // code of functions; cgen_stmt.generate is the entry point.
 //
 // Representation: a C scalar is an IR value of the type lty gives (_Bool an
-// i8 that is 0 or 1; every integer its width); an object is memory, reached
+// i8 that is 0 or 1; every integer its width, but those wider than 64 bits,
+// which are values in memory: cgen_wint.ax); an object is memory, reached
 // by its address; the value of a structure or union is the address of
 // memory holding it (an object's own, or a temporary's), and so is the value
 // of a complex type (cgen_complex.ax). Functions take and
@@ -34,6 +35,7 @@ import "csema.ax" as cs;
 import "csema_gnu.ax" as cgn;
 import "csema_marks.ax" as csm;
 import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
 
 /// The symbol C's main is generated under, and the one the start-up calls.
 pub let MAIN_SYMBOL: []u8 = "axiom.c.main";
@@ -107,7 +109,8 @@ fn no_ld_fn(name: []u8) *mut ir.Value {
 }
 
 /// The IR function of std/c/rt/ldouble.ax's function `name` (codegen.ax
-/// generates it), which cgen_ld.ax calls for long double arithmetic.
+/// generates it), which cgen_ld.ax calls for long double arithmetic, or of
+/// std/c/rt/wideint.ax's (a name that begins with wi_: cgen_wint.ax).
 pub let mut ld_fn: fn([]u8) *mut ir.Value = no_ld_fn;
 pub let mut next_site: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
@@ -141,6 +144,9 @@ fn internal_error(msg: []u8) void {
 pub fn lty(t0: *mut cty.CType) *mut ir.Ty {
     let t = t0.unq;
     let k = t.kind;
+    if cty.is_wint(t) {
+        return ir.t_array(ir.t_int(64), @as(u64, cty.limbs(t)));  // (memory only: cgen_wint.ax)
+    }
     if cty.is_integer(t) {
         return ir.t_int(cty.storage_bits(t));
     }
@@ -705,6 +711,28 @@ fn put_item(im: *mut Image, it: *cast.InitItem) void {
     if cty.is_complex(t) {
         put_float(im, it.off, t.elem, e.fcval);
         put_float(im, it.off + cty.size_of(t.elem), t.elem, e.fcimag);
+        return;
+    }
+    if cty.is_wint(t) and e.is_const and u.notnil(it.bits) {
+        // (a bit-field: its bits, from the unit's bit_off, csema_bits.ax)
+        let m = it.bits;
+        let v = cw.value(e, cty.limbs(t));
+        let base = (it.off * 8) + @as(u64, @bit_cast(u32, m.bit_off));
+        for k in @as(u64, 0)..@as(u64, @bit_cast(u32, m.bit_width)) {
+            let bit = (v[@truncate(usize, k / 64)] >> @truncate(u32, k % 64)) & 1;
+            let at = @truncate(usize, (base + k) / 8);
+            if at < im.bytes.len {
+                let sh = @truncate(u32, (base + k) % 8);
+                im.bytes[at] = (im.bytes[at] & ~(@as(u8, 1) << sh)) | (@truncate(u8, bit) << sh);
+            }
+        }
+        return;
+    }
+    if cty.is_wint(t) and e.is_const {
+        let v = cw.value(e, cty.limbs(t));
+        for k in 0..v.len {
+            put_le(im, it.off + (@as(u64, k) * 8), v[k], 8);
+        }
         return;
     }
     if cty.is_integer(t) and e.is_const {

@@ -1,0 +1,358 @@
+// =============================================================================
+// cwide.ax - integer constants of the types wider than 64 bits (cty.is_wint:
+// __int128, _BitInt(N) for N > 64): their values, and the folding of the
+// operations on them (cconst.ax calls fold_* here). The arithmetic is
+// std/c/rt/wideint.ax's, which the generated code calls too, so that a
+// constant expression and the same operation at run time agree.
+//
+// A value is the type's limbs (ctypes.limbs: 64 bits each, the least
+// significant first), in the form wideint.wi_norm gives: reduced to the
+// type's width and sign- or zero-extended from there. A constant Expr of
+// such a type has its first limb in cval and the whole value in a table
+// (g_vals), whose index plus one is in xv.hi (which only a wide long
+// double's constant uses otherwise); an Expr with xv.hi 0 has the value of
+// cval extended as its type's signedness says (the constants the rest of
+// the front end makes of these types: never more than 64 bits).
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "ctypes.ax" as cty;
+import "std/c/rt/ldouble" as ld;
+import "std/c/rt/wideint" as wi;
+
+let mut g_vals: u.List.[[]mut u64] = u.List.[[]mut u64].{ data: @ptr_from_int(*mut []mut u64, 0), len: 0, cap: 0 };
+
+/// n limbs of zeros.
+pub fn zeros(n: usize) []mut u64 {
+    let v = u.newn.[u64](n + 1)[0..n];
+    for i in 0..n {
+        v[i] = 0;
+    }
+    return v;
+}
+
+// The extension of 64-bit x to n limbs (signed: sg).
+fn of_u64(x: u64, sg: bool, n: usize) []mut u64 {
+    let v = zeros(n);
+    v[0] = x;
+    if sg and ((x >> 63) != 0) {
+        for i in 1..n {
+            v[i] = 0xFFFF_FFFF_FFFF_FFFF;
+        }
+    }
+    return v;
+}
+
+fn is_sg(t: *cty.CType) bool {
+    return t.is_signed and (t.unq.kind != cty.TK_BOOL);
+}
+
+/// The value of integer constant x as n limbs: extended (sign-extended
+/// when x's type is signed) or truncated.
+pub fn value(x: *cast.Expr, n: usize) []mut u64 {
+    let sg = is_sg(x.ty);
+    if cty.is_wint(x.ty) and (x.xv.hi != 0) {
+        let v = g_vals.get(@truncate(usize, x.xv.hi - 1));
+        let r = zeros(n);
+        wi.wi_ext(&mut r[0], n, &v[0], v.len, sg);
+        return r;
+    }
+    return of_u64(x.cval, sg, n);
+}
+
+/// Sets e (of a type wider than 64 bits) to the constant v (its type's
+/// limbs), reduced to the type's width.
+pub fn set(e: *mut cast.Expr, v: []mut u64) void {
+    let t = e.ty.unq;
+    wi.wi_norm(&mut v[0], v.len, @bit_cast(u32, t.bits), is_sg(t));
+    e.is_const = true;
+    e.cval = v[0];
+    g_vals.push(v);
+    e.xv = ld.W.{ lo: 0, hi: @as(u64, g_vals.len) };
+}
+
+/// Does constant x (of an integer type) have a value that a 64-bit
+/// integer of its signedness holds (cval, as the rest of the front end
+/// reads it)?
+pub fn fits64(x: *cast.Expr) bool {
+    if not cty.is_wint(x.ty) or (x.xv.hi == 0) {
+        return true;
+    }
+    let n = cty.limbs(x.ty);
+    let v = value(x, n);
+    let w = of_u64(v[0], is_sg(x.ty), n);
+    return wi.wi_cmp(&v[0], &w[0], n, false) == 0;
+}
+
+/// Is constant x not zero?
+pub fn truth(x: *cast.Expr) bool {
+    let n = cty.limbs(x.ty);
+    let v = value(x, n);
+    return wi.wi_nonzero(&v[0], n) != 0;
+}
+
+/// The decimal digits of constant x (with a sign).
+pub fn text(x: *cast.Expr) []u8 {
+    let n = cty.limbs(x.ty);
+    let v = value(x, n);
+    let mut neg = false;
+    if is_sg(x.ty) and ((v[n - 1] >> 63) != 0) {
+        neg = true;
+        let m = zeros(n);
+        wi.wi_neg(&mut m[0], &v[0], n);
+        for i in 0..n {
+            v[i] = m[i];
+        }
+    }
+    let mut ds = u.List.[u8].empty();
+    let ten = of_u64(10, false, n);
+    let q = zeros(n);
+    let r = zeros(n);
+    let s = zeros((4 * n) + 4);
+    while wi.wi_nonzero(&v[0], n) != 0 {
+        wi.wi_divmod(&mut q[0], &mut r[0], &v[0], &ten[0], n, false, &mut s[0]);
+        ds.push(@truncate(u8, r[0]) + '0');
+        for i in 0..n {
+            v[i] = q[i];
+        }
+    }
+    if ds.len == 0 {
+        ds.push('0');
+    }
+    let mut b = u.Buf.init();
+    if neg {
+        b.c('-');
+    }
+    let mut k = ds.len;
+    while k > 0 {
+        k -= 1;
+        b.c(ds.get(k));
+    }
+    return b.done();
+}
+
+/// e = x converted to e's type (wider than 64 bits), from an integer.
+pub fn convert_int(e: *mut cast.Expr, x: *cast.Expr) void {
+    set(e, value(x, cty.limbs(e.ty)));
+}
+
+/// e = the double f converted to e's type (wider than 64 bits), if its
+/// value fits (6.3.1.4p1: otherwise left to run time).
+pub fn convert_f64(e: *mut cast.Expr, f: f64) void {
+    let t = e.ty.unq;
+    let n = cty.limbs(t);
+    let v = zeros(n);
+    if wi.wi_from_f64(&mut v[0], n, @bit_cast(u32, t.bits), is_sg(t), @bit_cast(u64, f)) {
+        set(e, v);
+    }
+}
+
+/// e = the wide long double w (format f) converted to e's type, if its
+/// value fits.
+pub fn convert_ld(e: *mut cast.Expr, w: ld.W, f: u32) void {
+    let t = e.ty.unq;
+    let n = cty.limbs(t);
+    let v = zeros(n);
+    if ld.to_int(&mut v[0], n, @bit_cast(u32, t.bits), is_sg(t), &w, f) {
+        set(e, v);
+    }
+}
+
+/// Constant x (of a type wider than 64 bits) rounded to double.
+pub fn to_f64(x: *cast.Expr) f64 {
+    let n = cty.limbs(x.ty);
+    let v = value(x, n);
+    let s = zeros(n);
+    return @bit_cast(f64, wi.wi_to_f64(&v[0], n, is_sg(x.ty), &mut s[0]));
+}
+
+/// Constant x (of a type wider than 64 bits) rounded to float.
+pub fn to_f32(x: *cast.Expr) f32 {
+    let n = cty.limbs(x.ty);
+    let v = value(x, n);
+    let s = zeros(n);
+    return @bit_cast(f32, wi.wi_to_f32(&v[0], n, is_sg(x.ty), &mut s[0]));
+}
+
+/// Constant x (of a type wider than 64 bits) as a wide long double of
+/// format f (correctly rounded).
+pub fn to_ld(x: *cast.Expr, f: u32) ld.W {
+    let n = cty.limbs(x.ty);
+    let v = value(x, n);
+    let mut w = ld.W.{ lo: 0, hi: 0 };
+    ld.from_int(&mut w, &v[0], n, is_sg(x.ty), f);
+    return w;
+}
+
+/// e = op x (- ~ +) in e's type; a signed negation of the least value
+/// overflows (ovf).
+pub fn fold_unary(e: *mut cast.Expr, op: i32, x: *cast.Expr, minus: i32, tilde: i32) void {
+    let n = cty.limbs(e.ty);
+    let a = value(x, n);
+    let r = zeros(n);
+    if op == minus {
+        wi.wi_neg(&mut r[0], &a[0], n);
+        set(e, r);
+        if is_sg(e.ty) and (wi.wi_nonzero(&a[0], n) != 0) {
+            let b = value(e, n);
+            e.ovf = wi.wi_cmp(&a[0], &b[0], n, false) == 0;
+        }
+        return;
+    }
+    if op == tilde {
+        wi.wi_not(&mut r[0], &a[0], n);
+        set(e, r);
+        return;
+    }
+    set(e, a);
+}
+
+// The operations of fold_binary.
+pub const OP_ADD: i32 = 0;
+pub const OP_SUB: i32 = 1;
+pub const OP_MUL: i32 = 2;
+pub const OP_DIV: i32 = 3;
+pub const OP_REM: i32 = 4;
+pub const OP_SHL: i32 = 5;
+pub const OP_SHR: i32 = 6;
+pub const OP_AND: i32 = 7;
+pub const OP_OR: i32 = 8;
+pub const OP_XOR: i32 = 9;
+
+// Does v (m limbs, the exact result) fit `bits` bits (signed: sg)?
+fn fits_bits(v: []mut u64, bits: i32, sg: bool) bool {
+    let m = v.len;
+    let w = zeros(m);
+    for i in 0..m {
+        w[i] = v[i];
+    }
+    wi.wi_norm(&mut w[0], m, @bit_cast(u32, bits), sg);
+    return wi.wi_cmp(&v[0], &w[0], m, false) == 0;
+}
+
+/// e = a op b (OP_) in e's type, wider than 64 bits (a shift's b is a
+/// count of its own type), wrapping: a signed result that does not fit is
+/// marked (ovf, 6.6p4); nothing for a division by zero or a shift count out
+/// of range (left to run time).
+pub fn fold_binary(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
+    let t = e.ty.unq;
+    let n = cty.limbs(t);
+    let sg = is_sg(t);
+    let x = value(a, n);
+    let r = zeros(n);
+    if (op == OP_SHL) or (op == OP_SHR) {
+        let nb = cty.limbs(b.ty) + 1;
+        let k = value(b, nb);
+        if (is_sg(b.ty) and ((k[nb - 1] >> 63) != 0)) or not fits_bits(k, 32, false) or
+           (k[0] >= @as(u64, @bit_cast(u32, t.bits))) {
+            return;
+        }
+        if op == OP_SHL {
+            wi.wi_shl(&mut r[0], &x[0], k[0], n);
+            set(e, r);
+            if sg {
+                // (C99 6.5.7p4: a negative value, or one whose product with
+                // 2^k the type does not hold, is undefined)
+                let neg = (x[n - 1] >> 63) != 0;
+                let len = (@as(u64, n) * 64) - wi.wi_clz(&x[0], n);
+                e.ovf = e.ovf or neg or ((len + k[0]) > @as(u64, @bit_cast(u32, t.bits - 1)));
+            }
+        } else {
+            wi.wi_shr(&mut r[0], &x[0], k[0], n, sg);
+            set(e, r);
+        }
+        return;
+    }
+    let y = value(b, n);
+    if (op == OP_DIV) or (op == OP_REM) {
+        if wi.wi_nonzero(&y[0], n) == 0 {
+            return;
+        }
+        let q = zeros(n);
+        let s = zeros((4 * n) + 4);
+        wi.wi_divmod(&mut q[0], &mut r[0], &x[0], &y[0], n, sg, &mut s[0]);
+        if op == OP_DIV {
+            set(e, q);
+        } else {
+            set(e, r);
+        }
+        if sg {
+            // (the least value divided by -1)
+            let m1 = of_u64(0xFFFF_FFFF_FFFF_FFFF, true, n);
+            let lo = zeros(n);
+            wi.wi_shl(&mut lo[0], &m1[0], @as(u64, @bit_cast(u32, t.bits - 1)), n);
+            e.ovf = e.ovf or ((wi.wi_cmp(&y[0], &m1[0], n, false) == 0) and (wi.wi_cmp(&x[0], &lo[0], n, false) == 0));
+        }
+        return;
+    }
+    if (op == OP_AND) or (op == OP_OR) or (op == OP_XOR) {
+        wi.wi_bitop(&mut r[0], &x[0], &y[0], n, @bit_cast(u32, op - OP_AND));
+        set(e, r);
+        return;
+    }
+    if op == OP_ADD {
+        wi.wi_add(&mut r[0], &x[0], &y[0], n);
+    } else if op == OP_SUB {
+        wi.wi_sub(&mut r[0], &x[0], &y[0], n);
+    } else {
+        wi.wi_mul(&mut r[0], &x[0], &y[0], n);
+    }
+    set(e, r);
+    if sg {
+        // the exact result, in twice the limbs (and one more)
+        let m = (2 * n) + 1;
+        let xx = value(a, m);
+        let yy = value(b, m);
+        let p = zeros(m);
+        if op == OP_ADD {
+            wi.wi_add(&mut p[0], &xx[0], &yy[0], m);
+        } else if op == OP_SUB {
+            wi.wi_sub(&mut p[0], &xx[0], &yy[0], m);
+        } else {
+            wi.wi_mul(&mut p[0], &xx[0], &yy[0], m);
+        }
+        e.ovf = e.ovf or not fits_bits(p, t.bits, true);
+    }
+}
+
+/// -1, 0 or 1 as constant a is less than, equal to or greater than b (both
+/// of type t, wider than 64 bits).
+pub fn compare(t: *cty.CType, a: *cast.Expr, b: *cast.Expr) i32 {
+    let n = cty.limbs(t);
+    let x = value(a, n);
+    let y = value(b, n);
+    return wi.wi_cmp(&x[0], &y[0], n, is_sg(t));
+}
+
+/// Does integer type t (not _Bool) hold the value of integer constant x?
+pub fn fits_type(t: *cty.CType, x: *cast.Expr) bool {
+    let mut m: usize = 1;
+    if cty.is_wint(t) {
+        m = cty.limbs(t);
+    }
+    if cty.is_wint(x.ty) {
+        m = @max(m, cty.limbs(x.ty));
+    }
+    m += 1;
+    let v = value(x, m);
+    let w = zeros(m);
+    for i in 0..m {
+        w[i] = v[i];
+    }
+    wi.wi_norm(&mut w[0], m, @bit_cast(u32, t.unq.bits), is_sg(t));
+    return wi.wi_cmp(&v[0], &w[0], m, false) == 0;
+}
+
+/// Is constant x (of a type wider than 64 bits) exactly a double: at most
+/// 53 significant bits?
+pub fn exact_double(x: *cast.Expr) bool {
+    let n = cty.limbs(x.ty);
+    let mut v = value(x, n);
+    if is_sg(x.ty) and ((v[n - 1] >> 63) != 0) {
+        let m = zeros(n);
+        wi.wi_neg(&mut m[0], &v[0], n);
+        v = m;
+    }
+    let len = (@as(u64, n) * 64) - wi.wi_clz(&v[0], n);
+    return (len <= 53) or (wi.wi_ctz(&v[0], n) >= (len - 53));
+}

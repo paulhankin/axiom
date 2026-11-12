@@ -171,3 +171,38 @@ long double _Complex h_lc_va(int n, ...) {
 long double _Complex h_lc_call(long double _Complex (*f)(long double _Complex, long double)) {
     return f(CMPLXL(1.5L, -2.25L), 0.5L) * 3;
 }
+
+/* For c/run/wint_abi_host.c: __int128 (x86-64 System V: two INTEGER
+   eightbytes, both in registers or both on the stack, aligned to 16 there;
+   AAPCS64: a pair of x registers from an even one, the stack aligned to
+   16), alone, in structures, beyond the registers, variadic. */
+#ifdef __SIZEOF_INT128__
+typedef struct { __int128 x; } h_q1;
+typedef struct { char c; __int128 x; } h_cq;
+typedef struct { long l; unsigned __int128 x; } h_lq;
+__int128 h_q_many(int i1, __int128 a, long l1, __int128 b, int i2, __int128 c, __int128 d, int i3, __int128 e,
+                  double f, __int128 g) {
+    return i1 + a * 2 + l1 * 3 + b * 4 + i2 * 5 + c * 6 + d * 7 + i3 * 8 + e * 9 + (__int128)f * 10 + g * 11;
+}
+unsigned __int128 h_q_shift(unsigned __int128 x, int k) { return (x << k) | (x >> (128 - k)); }
+h_q1 h_q_q1(h_q1 s) { s.x = s.x * 3 - 1; return s; }
+h_cq h_q_cq(h_cq s) { s.x += s.c; s.c = 'q'; return s; }
+h_lq h_q_lq(h_lq s) { s.x = s.x * s.l; s.l = -1; return s; }
+__int128 h_q_va(int n, ...) {
+    va_list ap;
+    __int128 s = 0;
+    va_start(ap, n);
+    while (n-- > 0) {
+        s = s * 3 + va_arg(ap, __int128);
+        s += va_arg(ap, int);
+    }
+    va_end(ap);
+    return s;
+}
+__int128 h_q_call(__int128 (*f)(__int128, int, __int128)) {
+    return f((__int128)1 << 100, 7, -((__int128)3 << 70)) + 1;
+}
+__int128 h_q_vcall(__int128 (*f)(int, ...)) {
+    return f(3, (__int128)5 << 64, 1, (__int128)-7, 2, (__int128)1 << 120, 3);
+}
+#endif

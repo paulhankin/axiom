@@ -1,0 +1,1132 @@
+// =============================================================================
+// cgen_wint.ax - IR generation for the integer types wider than 64 bits
+// (cty.is_wint: __int128 of the GNU dialects, C23's _BitInt(N) for N > 64).
+// The backends have no integers wider than 64 bits: a value is its limbs
+// (cty.limbs of them, 64 bits each, the least significant first) in memory,
+// as a structure's value is (cgen.ax): rv gives its address, an object's
+// own or a temporary's, never written through; each operation writes its
+// result into a new temporary, which scalar replacement takes apart into
+// SSA values again (sroa.ax), so that a two-limb value lives in two
+// registers.
+//
+// A value is kept in the form std/c/rt/wideint.ax's wi_norm gives: reduced
+// to its type's width and sign- or zero-extended from there through its
+// storage (norm, after every operation whose result may leave it; the bits
+// beyond the width of a value that arrives as an argument or result are
+// unspecified in the ABIs, and are brought to it there: cgen_va.ax).
+//
+// Two limbs (__int128, _BitInt(65..128)) are computed inline: + and -
+// with a carry, * from the 64x64->128 product (IN_UMULH on the native
+// targets, four 32-bit products on WebAssembly), shifts by any count with
+// selects, comparisons, the bitwise operations; / and % inline when both
+// operands are below 2^64, else by wideint.ax's wi_divmod. Wider types call
+// wideint.ax's functions for everything but the bitwise operations and
+// moves (generated only when called: cgen.ld_fn). Conversions to and from
+// float and double are wideint.ax's (correctly rounded), from and to a
+// wide long double ldouble.ax's (from_int, to_int). <stdbit.h>'s functions
+// count the bits of the limbs (stdbit), <stdckdint.h>'s compute the exact
+// result in more limbs (ckd).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "cconst.ax" as cc;
+import "cgen.ax" as cg;
+import "cgen_bitint.ax" as cgbi;
+import "csema_builtin.ax" as csb;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+fn i64t() *mut ir.Ty {
+    return ir.t_int(64);
+}
+
+fn c64(v: u64) *mut ir.Value {
+    return ir.cint(i64t(), v);
+}
+
+fn sg_of(t: *cty.CType) bool {
+    return t.unq.is_signed and (t.unq.kind != cty.TK_BOOL);
+}
+
+/// A new temporary for a value of type t (wider than 64 bits).
+pub fn temp(t: *mut cty.CType) *mut ir.Value {
+    return cg.alloca(t.unq, "wint");
+}
+
+// p + 8k.
+fn at(p: *mut ir.Value, k: usize) *mut ir.Value {
+    if k == 0 {
+        return p;
+    }
+    return ir.ptradd(cg.B, p, cg.usz(@as(u64, k) * 8));
+}
+
+/// Limb k of the value at p.
+pub fn limb(p: *mut ir.Value, k: usize) *mut ir.Value {
+    let v = ir.load(cg.B, i64t(), at(p, k));
+    v.align = 8;
+    return v;
+}
+
+fn set_limb(p: *mut ir.Value, k: usize, v: *mut ir.Value) void {
+    let s = ir.store(cg.B, v, at(p, k));
+    s.align = 8;
+}
+
+// The sign of 64-bit x as a limb of 0s or 1s.
+fn sign_fill(x: *mut ir.Value) *mut ir.Value {
+    return ir.binop(cg.B, ir.OP_ASHR, x, c64(63));
+}
+
+// A call of wideint.ax's (or ldouble.ax's) function `name` with arguments
+// xs, each integer argument resized to the parameter's IR type.
+fn call(name: []u8, xs: []mut *mut ir.Value) *mut ir.Value {
+    let f = cg.ld_fn(name);
+    let fty = ir.fnp_of(f).ty;
+    for i in 0..xs.len {
+        let pt = fty.params[i];
+        let x = xs[i];
+        if (pt.kind == ir.T_INT) and (x.ty.kind == ir.T_INT) and (pt.bits != x.ty.bits) {
+            if pt.bits < x.ty.bits {
+                xs[i] = ir.trunc(cg.B, x, pt);
+            } else {
+                xs[i] = ir.zext(cg.B, x, pt);
+            }
+        }
+    }
+    return ir.call(cg.B, fty, f, xs);
+}
+
+fn cbool(b: bool) *mut ir.Value {
+    if b {
+        return ir.cint(ir.t_int(8), 1);
+    }
+    return ir.cint(ir.t_int(8), 0);
+}
+
+fn usz_of(n: usize) *mut ir.Value {
+    return cg.usz(@as(u64, n));
+}
+
+/// Reduces the value at p (of type t, in a temporary) to t's width: the
+/// limb with the top bit sign- or zero-extended from it, and the limbs
+/// above it (AArch64's storage in pairs) filled.
+pub fn norm(t: *cty.CType, p: *mut ir.Value) void {
+    let b = t.unq;
+    let n = cty.limbs(b);
+    if b.bits == cty.storage_bits(b) {
+        return;
+    }
+    let top = @int_cast(usize, (b.bits - 1) / 64);
+    let used = b.bits - (@int_cast(i32, top) * 64);
+    let mut v = limb(p, top);
+    if used < 64 {
+        v = norm_limb(v, used, sg_of(b));
+        set_limb(p, top, v);
+    }
+    let mut fill = c64(0);
+    if sg_of(b) {
+        fill = sign_fill(v);
+    }
+    for k in (top + 1)..n {
+        set_limb(p, k, fill);
+    }
+}
+
+// The low `used` bits of limb v, sign- or zero-extended.
+fn norm_limb(v: *mut ir.Value, used: i32, sg: bool) *mut ir.Value {
+    if used >= 64 {
+        return v;
+    }
+    if not sg {
+        let mask = (@as(u64, 1) << @as(u32, @bit_cast(u32, used))) - 1;
+        return ir.and_(cg.B, v, c64(mask));
+    }
+    let k = c64(@as(u64, @bit_cast(u32, 64 - used)));
+    return ir.binop(cg.B, ir.OP_ASHR, ir.binop(cg.B, ir.OP_SHL, v, k), k);
+}
+
+// A new temporary of type t (two limbs) holding lo and hi, hi reduced to
+// t's width.
+fn pair(t: *mut cty.CType, lo: *mut ir.Value, hi: *mut ir.Value) *mut ir.Value {
+    let r = temp(t);
+    set_limb(r, 0, lo);
+    set_limb(r, 1, norm_limb(hi, t.unq.bits - 64, sg_of(t)));
+    return r;
+}
+
+// The constants made so far (n > 4 limbs: a constant global each).
+struct Const {
+    v: []u64,
+    g: *mut ir.Value,
+}
+
+let mut consts: u.List.[Const] = u.List.[Const].{ data: @ptr_from_int(*mut Const, 0), len: 0, cap: 0 };
+let mut consts_m: *mut ir.Module = @ptr_from_int(*mut ir.Module, 0);
+
+/// The value v (t's limbs) of type t: a temporary the limbs are stored
+/// into (constants again after scalar replacement), or for a value of more
+/// than four limbs a constant global's memory, never written.
+pub fn constant(t: *mut cty.CType, v: []u64) *mut ir.Value {
+    let n = v.len;
+    if n <= 4 {
+        let r = temp(t);
+        for k in 0..n {
+            set_limb(r, k, c64(v[k]));
+        }
+        return r;
+    }
+    if consts_m != cg.M {
+        consts.clear();
+        consts_m = cg.M;
+    }
+    for c in consts.items() {
+        if c.v.len == n {
+            let mut same = true;
+            for k in 0..n {
+                if c.v[k] != v[k] {
+                    same = false;
+                    break;
+                }
+            }
+            if same {
+                return c.g;
+            }
+        }
+    }
+    let xs = u.newn.[*mut ir.Value](n + 1);
+    for k in 0..n {
+        xs[k] = c64(v[k]);
+    }
+    let init = ir.carray(i64t(), xs[0..n]);
+    let g = ir.add_global(cg.M, init.ty, ".wiconst");
+    g.init = init;
+    g.linkage = ir.LINK_INTERNAL;
+    g.is_const = true;
+    g.align = 16;
+    consts.push(Const.{ v: v, g: g.val });
+    return g.val;
+}
+
+/// Copies the value of type t at src to dst (volatile: the object at dst or
+/// src is volatile, and is accessed as 8-byte volatile loads and stores).
+pub fn copy(t: *cty.CType, dst: *mut ir.Value, src: *mut ir.Value, volatile: bool) void {
+    let n = cty.limbs(t);
+    if not volatile {
+        let m = ir.memop(cg.B, ir.OP_MEMMOVE, dst, src, cg.usz(@as(u64, n) * 8));
+        m.cv = ir.MEMMOVE_SAME_OR_APART;
+        return;
+    }
+    for k in 0..n {
+        let x = limb(src, k);
+        x.flags = x.flags | ir.F_VOLATILE;
+        let s = ir.store(cg.B, x, at(dst, k));
+        s.align = 8;
+        s.flags = s.flags | ir.F_VOLATILE;
+    }
+}
+
+/// A copy of the value of type t at p in a new temporary (the value an
+/// object has now, which stores into the object do not change), reduced to
+/// t's width: the bits beyond it in an object are unspecified in the ABIs,
+/// and code compiled elsewhere may not store them.
+pub fn snapshot(t: *mut cty.CType, p: *mut ir.Value, volatile: bool) *mut ir.Value {
+    let r = temp(t);
+    copy(t, r, p, volatile);
+    norm(t, r);
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// Arithmetic
+// -----------------------------------------------------------------------------
+
+// The high 64 bits of the unsigned 128-bit product of x and y.
+fn umulh(x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    if not cg.is_wasm {
+        let mut xs: [2]*mut ir.Value = [x, y];
+        return ir.intr(cg.B, ir.IN_UMULH, i64t(), xs[..]);
+    }
+    // (four 32-bit products)
+    let m = c64(0xFFFF_FFFF);
+    let k32 = c64(32);
+    let x0 = ir.and_(cg.B, x, m);
+    let x1 = ir.binop(cg.B, ir.OP_LSHR, x, k32);
+    let y0 = ir.and_(cg.B, y, m);
+    let y1 = ir.binop(cg.B, ir.OP_LSHR, y, k32);
+    let p00 = ir.mul(cg.B, x0, y0);
+    let p01 = ir.mul(cg.B, x0, y1);
+    let p10 = ir.mul(cg.B, x1, y0);
+    let p11 = ir.mul(cg.B, x1, y1);
+    let mid = ir.add(
+        cg.B, ir.add(cg.B, ir.binop(cg.B, ir.OP_LSHR, p00, k32), ir.and_(cg.B, p01, m)), ir.and_(cg.B, p10, m));
+    let hi = ir.add(cg.B, p11, ir.binop(cg.B, ir.OP_LSHR, p01, k32));
+    return ir.add(cg.B, ir.add(cg.B, hi, ir.binop(cg.B, ir.OP_LSHR, p10, k32)), ir.binop(cg.B, ir.OP_LSHR, mid, k32));
+}
+
+// The operation of a binary operator for wideint.ax: its function, or for
+// the bitwise ones wi_bitop's op.
+fn bitop_code(op: i32) i64 {
+    if op == ct.P_AMP {
+        return 0;
+    }
+    if op == ct.P_PIPE {
+        return 1;
+    }
+    if op == ct.P_CARET {
+        return 2;
+    }
+    return -1;
+}
+
+/// x op y in type t (+ - * / % & | ^; both operands of type t), a new
+/// temporary's address.
+pub fn arith(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    if (op == ct.P_SLASH) or (op == ct.P_PERCENT) {
+        return divide(op == ct.P_SLASH, t, x, y);
+    }
+    let bop = bitop_code(op);
+    if (n == 2) or ((bop >= 0) and (n <= 4)) {
+        let a0 = limb(x, 0);
+        let a1 = limb(x, 1);
+        let b0 = limb(y, 0);
+        let b1 = limb(y, 1);
+        if bop >= 0 {
+            let r = temp(t);
+            for k in 0..n {
+                let mut io = ir.OP_AND;
+                if bop == 1 {
+                    io = ir.OP_OR;
+                } else if bop == 2 {
+                    io = ir.OP_XOR;
+                }
+                set_limb(r, k, ir.binop(cg.B, io, limb(x, k), limb(y, k)));
+            }
+            return r;
+        }
+        if op == ct.P_PLUS {
+            let lo = ir.add(cg.B, a0, b0);
+            let c = ir.zext(cg.B, ir.icmp(cg.B, ir.IntULT, lo, a0), i64t());
+            return pair(t, lo, ir.add(cg.B, ir.add(cg.B, a1, b1), c));
+        }
+        if op == ct.P_MINUS {
+            let lo = ir.sub(cg.B, a0, b0);
+            let c = ir.zext(cg.B, ir.icmp(cg.B, ir.IntULT, a0, b0), i64t());
+            return pair(t, lo, ir.sub(cg.B, ir.sub(cg.B, a1, b1), c));
+        }
+        // the low 128 bits of the product (the same signed or unsigned)
+        let lo = ir.mul(cg.B, a0, b0);
+        let hi = ir.add(cg.B, umulh(a0, b0), ir.add(cg.B, ir.mul(cg.B, a0, b1), ir.mul(cg.B, a1, b0)));
+        return pair(t, lo, hi);
+    }
+    let r = temp(t);
+    if bop >= 0 {
+        let mut xs: [5]*mut ir.Value = [r, x, y, usz_of(n), ir.cint(ir.t_int(32), @bit_cast(u64, bop))];
+        _ = call("wi_bitop", xs[..]);
+        return r;
+    }
+    let mut name: []u8 = "wi_add";
+    if op == ct.P_MINUS {
+        name = "wi_sub";
+    } else if op == ct.P_STAR {
+        name = "wi_mul";
+    }
+    let mut xs: [4]*mut ir.Value = [r, x, y, usz_of(n)];
+    _ = call(name, xs[..]);
+    norm(t, r);
+    return r;
+}
+
+// x / y (quot) or x % y in type t. Two limbs: when both are below 2^64
+// (nonnegative and below it, signed), the 64-bit division, else wi_divmod
+// (whose result is the same there); a division by zero is undefined.
+fn divide(quot: bool, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    let sg = sg_of(t);
+    let q = temp(t);
+    let r = temp(t);
+    let mut done = u.nil.[ir.Block]();
+    if n == 2 {
+        let small = cg.new_block("wdiv.small");
+        let big = cg.new_block("wdiv.big");
+        done = cg.new_block("wdiv.done");
+        let a1 = limb(x, 1);
+        let b1 = limb(y, 1);
+        let z = ir.icmp(cg.B, ir.IntEQ, ir.or_(cg.B, a1, b1), c64(0));
+        ir.condbr(cg.B, z, small, big);
+        cg.at_end(small);
+        let a0 = limb(x, 0);
+        let b0 = limb(y, 0);
+        if quot {
+            set_limb(q, 0, ir.binop(cg.B, ir.OP_UDIV, a0, b0));
+            set_limb(q, 1, c64(0));
+        } else {
+            set_limb(r, 0, ir.binop(cg.B, ir.OP_UREM, a0, b0));
+            set_limb(r, 1, c64(0));
+        }
+        ir.br(cg.B, done);
+        cg.at_end(big);
+    }
+    if (n == 2) and hw_div() {
+        div2(sg, q, r, x, y);
+    } else {
+        let s = cg.alloca(cty.array_of(cty.t_ullong, @as(u64, (4 * n) + 4), true), "wdiv");
+        let mut xs: [7]*mut ir.Value = [q, r, x, y, usz_of(n), cbool(sg), s];
+        _ = call("wi_divmod", xs[..]);
+    }
+    if n == 2 {
+        ir.br(cg.B, done);
+        cg.at_end(done);
+    }
+    // (the quotient of the least value and -1 is undefined; a remainder has
+    // the dividend's width: no reduction needed but for that quotient)
+    if quot {
+        norm(t, q);
+        return q;
+    }
+    return r;
+}
+
+// Does the target divide 128 bits by 64 (x86-64's div: ir.IN_UDIV128)?
+fn hw_div() bool {
+    return not cg.is_wasm and (tg.g_arch == tg.ARCH_X64);
+}
+
+// The pair lo, hi negated if c.
+fn neg_if(c: *mut ir.Value, lo: *mut ir.Value, hi: *mut ir.Value) [2]*mut ir.Value {
+    let nl = ir.sub(cg.B, c64(0), lo);
+    let nh = ir.sub(cg.B, ir.sub(cg.B, c64(0), hi), ir.zext(cg.B, ir.icmp(cg.B, ir.IntNE, lo, c64(0)), i64t()));
+    return [ir.select(cg.B, c, nl, lo), ir.select(cg.B, c, nh, hi)];
+}
+
+// q = x / y, r = x % y of two limbs (signed: sg), by UDIV_FN on the
+// magnitudes (C17 6.5.5p6: the quotient truncated, the remainder with the
+// dividend's sign).
+fn div2(sg: bool, q: *mut ir.Value, r: *mut ir.Value, x: *mut ir.Value, y: *mut ir.Value) void {
+    let mut a0 = limb(x, 0);
+    let mut a1 = limb(x, 1);
+    let mut b0 = limb(y, 0);
+    let mut b1 = limb(y, 1);
+    let mut na = ir.cint(cg.T_i1, 0);
+    let mut nb = ir.cint(cg.T_i1, 0);
+    if sg {
+        na = ir.icmp(cg.B, ir.IntSLT, a1, c64(0));
+        nb = ir.icmp(cg.B, ir.IntSLT, b1, c64(0));
+        let ma = neg_if(na, a0, a1);
+        let mb = neg_if(nb, b0, b1);
+        a0 = ma[0];
+        a1 = ma[1];
+        b0 = mb[0];
+        b1 = mb[1];
+    }
+    let f = udiv_fn();
+    let mut xs: [6]*mut ir.Value = [q, r, a0, a1, b0, b1];
+    _ = ir.call(cg.B, f.ty, f.val, xs[..]);
+    if sg {
+        let qn = neg_if(ir.xor(cg.B, na, nb), limb(q, 0), limb(q, 1));
+        set_limb(q, 0, qn[0]);
+        set_limb(q, 1, qn[1]);
+        let rn = neg_if(na, limb(r, 0), limb(r, 1));
+        set_limb(r, 0, rn[0]);
+        set_limb(r, 1, rn[1]);
+    }
+}
+
+// The function of the unsigned division of two limbs by two (x86-64): q, r
+// = (a1:a0) / (b1:b0), (a1:a0) % (b1:b0) (b not 0), stored at its first
+// two parameters. A divisor below 2^64: the high limb's 64-bit division,
+// then the 128-by-64 division of the remainder and the low limb; else the
+// quotient is below 2^64: the dividend halved, divided by the divisor's
+// leading 64 bits (normalized), gives it or one more (the estimate of
+// Knuth's Algorithm D, 4.3.1), which the remainder corrects. Made once per
+// module (linkonce).
+let UDIV_FN: []u8 = "__axiom_c_udivmod128";
+
+fn udiv_fn() *mut ir.Func {
+    let f0 = ir.get_function(cg.M, UDIV_FN);
+    if u.notnil(f0) and not ir.is_decl(f0) {
+        return f0;
+    }
+    let mut ps: [6]*mut ir.Ty = [cg.T_ptr, cg.T_ptr, i64t(), i64t(), i64t(), i64t()];
+    let mut f = f0;
+    if u.isnil(f) {
+        f = ir.add_function(cg.M, UDIV_FN, ir.t_fn(cg.T_void, ps[..], false));
+    }
+    f.linkage = ir.LINK_LINKONCE;
+    let saved = cg.B;
+    let B = ir.new_builder();
+    cg.B = B;
+    let entry = ir.append_block(f, "entry");
+    let small = ir.append_block(f, "small");
+    let big = ir.append_block(f, "big");
+    ir.at_end(B, entry);
+    let qp = f.params[0];
+    let rp = f.params[1];
+    let a0 = f.params[2];
+    let a1 = f.params[3];
+    let b0 = f.params[4];
+    let b1 = f.params[5];
+    ir.condbr(B, ir.icmp(B, ir.IntEQ, b1, c64(0)), small, big);
+    // b < 2^64
+    ir.at_end(B, small);
+    let q1 = ir.binop(B, ir.OP_UDIV, a1, b0);
+    let r1 = ir.sub(B, a1, ir.mul(B, q1, b0));
+    let q0 = udiv128(r1, a0, b0);
+    set_limb(qp, 0, q0);
+    set_limb(qp, 1, q1);
+    set_limb(rp, 0, ir.sub(B, a0, ir.mul(B, q0, b0)));
+    set_limb(rp, 1, c64(0));
+    ir.ret_void(B);
+    // b >= 2^64: the quotient is below 2^64
+    ir.at_end(B, big);
+    let mut one: [1]*mut ir.Value = [b1];
+    let nz = ir.intr(B, ir.IN_CTLZ, i64t(), one[..]);
+    let inv = ir.sub(B, c64(63), nz);
+    let v1 = ir.or_(B, ir.binop(B, ir.OP_SHL, b1, nz), ir.binop(B, ir.OP_LSHR, ir.binop(B, ir.OP_LSHR, b0, c64(1)),
+                                                                inv));
+    let u1 = ir.binop(B, ir.OP_LSHR, a1, c64(1));
+    let u0 = ir.or_(B, ir.binop(B, ir.OP_LSHR, a0, c64(1)), ir.binop(B, ir.OP_SHL, a1, c64(63)));
+    let e = ir.binop(B, ir.OP_LSHR, udiv128(u1, u0, v1), inv);
+    let est = ir.sub(B, e, ir.zext(B, ir.icmp(B, ir.IntNE, e, c64(0)), i64t()));
+    // a - est * b, and est + 1 if that is still at least b
+    let p0 = ir.mul(B, est, b0);
+    let ph = ir.add(B, umulh(est, b0), ir.mul(B, est, b1));
+    let l = ir.sub(B, a0, p0);
+    let h = ir.sub(B, ir.sub(B, a1, ph), ir.zext(B, ir.icmp(B, ir.IntULT, a0, p0), i64t()));
+    let gt = ir.icmp(B, ir.IntUGT, h, b1);
+    let eq = ir.and_(B, ir.icmp(B, ir.IntEQ, h, b1), ir.icmp(B, ir.IntUGE, l, b0));
+    let ge = ir.or_(B, gt, eq);
+    let l2 = ir.sub(B, l, b0);
+    let h2 = ir.sub(B, ir.sub(B, h, b1), ir.zext(B, ir.icmp(B, ir.IntULT, l, b0), i64t()));
+    set_limb(qp, 0, ir.add(B, est, ir.zext(B, ge, i64t())));
+    set_limb(qp, 1, c64(0));
+    set_limb(rp, 0, ir.select(B, ge, l2, l));
+    set_limb(rp, 1, ir.select(B, ge, h2, h));
+    ir.ret_void(B);
+    cg.B = saved;
+    return f;
+}
+
+fn udiv128(hi: *mut ir.Value, lo: *mut ir.Value, d: *mut ir.Value) *mut ir.Value {
+    let mut xs: [3]*mut ir.Value = [hi, lo, d];
+    return ir.intr(cg.B, ir.IN_UDIV128, i64t(), xs[..]);
+}
+
+/// x << y or x >> y (op) in type t; y, the count, of type yt (any integer
+/// type: the operand's value, a count of t's width or more is undefined).
+pub fn shift(op: i32, t: *mut cty.CType, x: *mut ir.Value, y: *mut ir.Value, yt: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    let sg = sg_of(t);
+    let k = count64(y, yt);
+    if n == 2 {
+        let a0 = limb(x, 0);
+        let a1 = limb(x, 1);
+        let s = ir.and_(cg.B, k, c64(63));
+        let big = ir.icmp(cg.B, ir.IntNE, ir.and_(cg.B, k, c64(64)), c64(0));
+        let inv = ir.sub(cg.B, c64(63), s);  // (63 - s: the bits of the other limb, in two shifts)
+        if op == ct.P_SHL {
+            let lo_s = ir.binop(cg.B, ir.OP_SHL, a0, s);
+            let carry = ir.binop(cg.B, ir.OP_LSHR, ir.binop(cg.B, ir.OP_LSHR, a0, c64(1)), inv);
+            let hi_s = ir.or_(cg.B, ir.binop(cg.B, ir.OP_SHL, a1, s), carry);
+            let lo = ir.select(cg.B, big, c64(0), lo_s);
+            let hi = ir.select(cg.B, big, lo_s, hi_s);
+            return pair(t, lo, hi);
+        }
+        let carry = ir.binop(cg.B, ir.OP_SHL, ir.binop(cg.B, ir.OP_SHL, a1, c64(1)), inv);
+        let lo_s = ir.or_(cg.B, ir.binop(cg.B, ir.OP_LSHR, a0, s), carry);
+        let mut hi_s = ir.vnil();
+        let mut fill = c64(0);
+        if sg {
+            hi_s = ir.binop(cg.B, ir.OP_ASHR, a1, s);
+            fill = sign_fill(a1);
+        } else {
+            hi_s = ir.binop(cg.B, ir.OP_LSHR, a1, s);
+        }
+        let lo = ir.select(cg.B, big, hi_s, lo_s);
+        let hi = ir.select(cg.B, big, fill, hi_s);
+        return pair(t, lo, hi);
+    }
+    let r = temp(t);
+    if op == ct.P_SHL {
+        let mut xs: [4]*mut ir.Value = [r, x, k, usz_of(n)];
+        _ = call("wi_shl", xs[..]);
+        norm(t, r);
+    } else {
+        let mut xs: [5]*mut ir.Value = [r, x, k, usz_of(n), cbool(sg)];
+        _ = call("wi_shr", xs[..]);
+    }
+    return r;
+}
+
+// Integer value v of type t as a 64-bit count (a wider one's low limb).
+fn count64(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if cty.is_wint(t) {
+        return limb(v, 0);
+    }
+    if v.ty.bits < 64 {
+        return ir.zext(cg.B, v, i64t());
+    }
+    return v;
+}
+
+/// -x in type t.
+pub fn negate(t: *mut cty.CType, x: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    if n == 2 {
+        let a0 = limb(x, 0);
+        let a1 = limb(x, 1);
+        let lo = ir.sub(cg.B, c64(0), a0);
+        let c = ir.zext(cg.B, ir.icmp(cg.B, ir.IntNE, a0, c64(0)), i64t());
+        return pair(t, lo, ir.sub(cg.B, ir.sub(cg.B, c64(0), a1), c));
+    }
+    let r = temp(t);
+    let mut xs: [3]*mut ir.Value = [r, x, usz_of(n)];
+    _ = call("wi_neg", xs[..]);
+    norm(t, r);
+    return r;
+}
+
+/// ~x in type t.
+pub fn bitnot(t: *mut cty.CType, x: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    let r = temp(t);
+    if n <= 4 {
+        for k in 0..n {
+            set_limb(r, k, ir.xor(cg.B, limb(x, k), c64(0xFFFF_FFFF_FFFF_FFFF)));
+        }
+    } else {
+        let mut xs: [3]*mut ir.Value = [r, x, usz_of(n)];
+        _ = call("wi_not", xs[..]);
+    }
+    norm(t, r);
+    return r;
+}
+
+/// x != 0 (x of type t), as an i1.
+pub fn truth(t: *cty.CType, x: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    if n <= 4 {
+        let mut a = limb(x, 0);
+        for k in 1..n {
+            a = ir.or_(cg.B, a, limb(x, k));
+        }
+        return ir.icmp(cg.B, ir.IntNE, a, c64(0));
+    }
+    let mut xs: [2]*mut ir.Value = [x, usz_of(n)];
+    let c = call("wi_nonzero", xs[..]);
+    return ir.icmp(cg.B, ir.IntNE, c, ir.cint(c.ty, 0));
+}
+
+/// x op y (< > <= >= == !=) of type t, as an i1.
+pub fn compare(op: i32, t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    let sg = sg_of(t);
+    if (n <= 4) and ((op == ct.P_EQ) or (op == ct.P_NE)) {
+        let mut d = ir.xor(cg.B, limb(x, 0), limb(y, 0));
+        for k in 1..n {
+            d = ir.or_(cg.B, d, ir.xor(cg.B, limb(x, k), limb(y, k)));
+        }
+        return ir.icmp(cg.B, pick(op == ct.P_EQ, ir.IntEQ, ir.IntNE), d, c64(0));
+    }
+    if n == 2 {
+        let a0 = limb(x, 0);
+        let a1 = limb(x, 1);
+        let b0 = limb(y, 0);
+        let b1 = limb(y, 1);
+        // a < b: the high limbs' order (signed or not), or equal high limbs
+        // and the low limbs' unsigned order; > likewise; <= is not >
+        let mut swap = false;
+        if (op == ct.P_GT) or (op == ct.P_LE) {
+            swap = true;
+        }
+        let mut p0 = a0;
+        let mut p1 = a1;
+        let mut q0 = b0;
+        let mut q1 = b1;
+        if swap {
+            p0 = b0;
+            p1 = b1;
+            q0 = a0;
+            q1 = a1;
+        }
+        let hl = ir.icmp(cg.B, pick(sg, ir.IntSLT, ir.IntULT), p1, q1);
+        let he = ir.icmp(cg.B, ir.IntEQ, p1, q1);
+        let ll = ir.icmp(cg.B, ir.IntULT, p0, q0);
+        let lt = ir.or_(cg.B, hl, ir.and_(cg.B, he, ll));
+        if (op == ct.P_LT) or (op == ct.P_GT) {
+            return lt;
+        }
+        return ir.not_(cg.B, lt);
+    }
+    let mut xs: [4]*mut ir.Value = [x, y, usz_of(n), cbool(sg)];
+    let c = call("wi_cmp", xs[..]);
+    let z = ir.cint(c.ty, 0);
+    let mut p = ir.IntNE;
+    if op == ct.P_LT {
+        p = ir.IntSLT;
+    } else if op == ct.P_GT {
+        p = ir.IntSGT;
+    } else if op == ct.P_LE {
+        p = ir.IntSLE;
+    } else if op == ct.P_GE {
+        p = ir.IntSGE;
+    } else if op == ct.P_EQ {
+        p = ir.IntEQ;
+    }
+    return ir.icmp(cg.B, p, c, z);
+}
+
+fn pick(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+/// The constant 1 of type t, for ++ and --.
+pub fn one_value(t: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    let v = u.newn.[u64](n + 1)[0..n];
+    for k in 0..n {
+        v[k] = 0;
+    }
+    v[0] = 1;
+    return constant(t, v);
+}
+
+// -----------------------------------------------------------------------------
+// Conversions
+// -----------------------------------------------------------------------------
+
+/// Scalar value v of type `from` converted to type `to`, one of them wider
+/// than 64 bits (6.3.1.3, 6.3.1.4, 6.3.1.5, 6.3.2.3): its address for such a
+/// type, an IR scalar for the others (a wide long double: its address).
+pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
+    let f = from.unq;
+    let t = to.unq;
+    if cty.is_wint(t) {
+        return to_wide(v, f, t);
+    }
+    let tt = cg.lty(t);
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(cg.B, truth(f, v), tt);
+    }
+    if cty.is_integer(t) {
+        // (the low bits: 6.3.1.3, a signed result wraps, as the
+        // implementation defines)
+        let lo = limb(v, 0);
+        if tt.bits < 64 {
+            return cgbi.norm(ir.trunc(cg.B, lo, tt), t);
+        }
+        return cgbi.norm(lo, t);
+    }
+    if (t.kind == cty.TK_POINTER) or (t.kind == cty.TK_NULLPTR) {
+        let mut lo = limb(v, 0);
+        if cg.T_isz.bits < 64 {
+            lo = ir.trunc(cg.B, lo, cg.T_isz);
+        }
+        return ir.inttoptr(cg.B, lo);
+    }
+    let n = cty.limbs(f);
+    let sg = sg_of(f);
+    if cty.is_wide(t) {
+        let r = cg.alloca(cty.t_ldouble, "ld");
+        let mut xs: [5]*mut ir.Value = [r, v, usz_of(n), cbool(sg), ir.cint(ir.t_int(32), @as(u64, cc.ld_fmt()))];
+        _ = call("from_int", xs[..]);
+        return r;
+    }
+    // float or double: correctly rounded
+    let s = temp(f);
+    let mut xs: [4]*mut ir.Value = [v, usz_of(n), cbool(sg), s];
+    if t.kind == cty.TK_FLOAT {
+        return ir.bitcast(cg.B, call("wi_to_f32", xs[..]), tt);
+    }
+    return ir.bitcast(cg.B, call("wi_to_f64", xs[..]), tt);
+}
+
+// v of type f converted to t, wider than 64 bits.
+fn to_wide(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    if cty.is_wint(f) {
+        // (the limbs there are, and the sign's beyond them)
+        let m = cty.limbs(f);
+        if (f == t) or ((m == n) and (f.bits <= t.bits) and (f.is_signed == t.is_signed)) {
+            return v;
+        }
+        let r = temp(t);
+        if n <= 4 {
+            let mut fill = c64(0);
+            if sg_of(f) {
+                fill = sign_fill(limb(v, m - 1));
+            }
+            for k in 0..n {
+                if k < m {
+                    set_limb(r, k, limb(v, k));
+                } else {
+                    set_limb(r, k, fill);
+                }
+            }
+        } else {
+            let mut xs: [5]*mut ir.Value = [r, usz_of(n), v, usz_of(m), cbool(sg_of(f))];
+            _ = call("wi_ext", xs[..]);
+        }
+        norm(t, r);
+        return r;
+    }
+    if cty.is_integer(f) or (f.kind == cty.TK_POINTER) or (f.kind == cty.TK_NULLPTR) {
+        let mut x = v;
+        let mut sg = sg_of(f);
+        if x.ty.kind == ir.T_PTR {
+            x = ir.ptrtoint(cg.B, x, cg.T_isz);
+            sg = false;
+        }
+        if x.ty.bits < 64 {
+            if sg {
+                x = ir.sext(cg.B, x, i64t());
+            } else {
+                x = ir.zext(cg.B, x, i64t());
+            }
+        }
+        let mut fill = c64(0);
+        if sg {
+            fill = sign_fill(x);
+        }
+        let r = temp(t);
+        if n <= 4 {
+            set_limb(r, 0, x);
+            for k in 1..n {
+                set_limb(r, k, fill);
+            }
+        } else {
+            let one = cg.alloca(cty.t_ullong, "wint1");
+            set_limb(one, 0, x);
+            let mut xs: [5]*mut ir.Value = [r, usz_of(n), one, usz_of(1), cbool(sg)];
+            _ = call("wi_ext", xs[..]);
+        }
+        norm(t, r);
+        return r;
+    }
+    let r = temp(t);
+    let bits = ir.cint(ir.t_int(32), @as(u64, @bit_cast(u32, t.bits)));
+    if cty.is_wide(f) {
+        // (truncated toward zero; out of range, which is undefined,
+        // saturated, as for float and double: 6.3.1.4p1)
+        let mut xs: [6]*mut ir.Value = [
+            r, usz_of(n), bits, cbool(sg_of(t)), v, ir.cint(ir.t_int(32), @as(u64, cc.ld_fmt()))];
+        _ = call("to_int", xs[..]);
+        return r;
+    }
+    let mut d = v;
+    if v.ty.bits == 32 {
+        d = ir.cast(cg.B, ir.OP_FPEXT, v, ir.t_float(64));  // (exact)
+    }
+    let mut xs: [5]*mut ir.Value = [r, usz_of(n), bits, cbool(sg_of(t)), ir.bitcast(cg.B, d, i64t())];
+    _ = call("wi_from_f64", xs[..]);
+    return r;
+}
+
+/// <stdbit.h>'s function id (a csema_builtin BI_ number) of x, of an
+/// unsigned type t wider than 64 bits, whose width is that of its value
+/// (the bits of the storage above it are zero); rt: the result's type.
+pub fn stdbit(id: i32, x: *mut ir.Value, t: *mut cty.CType, rt: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    let w = @as(u64, @bit_cast(u32, t.unq.bits));
+    let wv = c64(w);
+    let extra = c64((@as(u64, n) * 64) - w);  // (zero bits above the width)
+    if (id == csb.BI_BIT_FLOOR) or (id == csb.BI_BIT_CEIL) {
+        return floor_ceil(id == csb.BI_BIT_FLOOR, x, t);
+    }
+    let mut r = ir.vnil();
+    if (id == csb.BI_LEADING_ZEROS) or (id == csb.BI_FIRST_LEADING_ONE) or (id == csb.BI_BIT_WIDTH) {
+        r = ir.sub(cg.B, count(ir.IN_CTLZ, x, n), extra);
+        if id == csb.BI_FIRST_LEADING_ONE {
+            r = first(r, wv);
+        } else if id == csb.BI_BIT_WIDTH {
+            r = ir.sub(cg.B, wv, r);
+        }
+    } else if (id == csb.BI_LEADING_ONES) or (id == csb.BI_FIRST_LEADING_ZERO) {
+        r = ir.sub(cg.B, count(ir.IN_CTLZ, bitnot(t, x), n), extra);
+        if id == csb.BI_FIRST_LEADING_ZERO {
+            r = first(r, wv);
+        }
+    } else if (id == csb.BI_TRAILING_ZEROS) or (id == csb.BI_FIRST_TRAILING_ONE) {
+        r = umin(count(ir.IN_CTTZ, x, n), wv);
+        if id == csb.BI_FIRST_TRAILING_ONE {
+            r = first(r, wv);
+        }
+    } else if (id == csb.BI_TRAILING_ONES) or (id == csb.BI_FIRST_TRAILING_ZERO) {
+        r = umin(count(ir.IN_CTTZ, bitnot(t, x), n), wv);
+        if id == csb.BI_FIRST_TRAILING_ZERO {
+            r = first(r, wv);
+        }
+    } else if id == csb.BI_COUNT_ONES {
+        r = count(ir.IN_CTPOP, x, n);
+    } else if id == csb.BI_COUNT_ZEROS {
+        r = ir.sub(cg.B, wv, count(ir.IN_CTPOP, x, n));
+    } else {
+        let one = ir.icmp(cg.B, ir.IntEQ, count(ir.IN_CTPOP, x, n), c64(1));
+        return ir.zext(cg.B, one, ir.t_int(8));  // (has_single_bit)
+    }
+    let tt = cg.lty(rt);
+    if tt.bits < 64 {
+        return ir.trunc(cg.B, r, tt);
+    }
+    return r;
+}
+
+// k + 1, or 0 where k is the width w (none found): the first_* functions.
+fn first(k: *mut ir.Value, w: *mut ir.Value) *mut ir.Value {
+    let none = ir.icmp(cg.B, ir.IntEQ, k, w);
+    return ir.select(cg.B, none, c64(0), ir.add(cg.B, k, c64(1)));
+}
+
+fn umin(a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    return ir.select(cg.B, ir.icmp(cg.B, ir.IntULT, a, b), a, b);
+}
+
+// The leading zeros (IN_CTLZ), trailing zeros (IN_CTTZ) or bits set
+// (IN_CTPOP) of the n limbs at x, as an i64.
+fn count(id: i32, x: *mut ir.Value, n: usize) *mut ir.Value {
+    if n == 2 {
+        let lo = limb(x, 0);
+        let hi = limb(x, 1);
+        let cl = intr1(id, lo);
+        let ch = intr1(id, hi);
+        if id == ir.IN_CTPOP {
+            return ir.add(cg.B, cl, ch);
+        }
+        if id == ir.IN_CTLZ {
+            let z = ir.icmp(cg.B, ir.IntEQ, hi, c64(0));
+            return ir.select(cg.B, z, ir.add(cg.B, cl, c64(64)), ch);
+        }
+        let z = ir.icmp(cg.B, ir.IntEQ, lo, c64(0));
+        return ir.select(cg.B, z, ir.add(cg.B, ch, c64(64)), cl);
+    }
+    let mut name: []u8 = "wi_popcount";
+    if id == ir.IN_CTLZ {
+        name = "wi_clz";
+    } else if id == ir.IN_CTTZ {
+        name = "wi_ctz";
+    }
+    let mut xs: [2]*mut ir.Value = [x, usz_of(n)];
+    let c = call(name, xs[..]);
+    if c.ty.bits < 64 {
+        return ir.zext(cg.B, c, i64t());
+    }
+    return c;
+}
+
+fn intr1(id: i32, x: *mut ir.Value) *mut ir.Value {
+    let mut a: [1]*mut ir.Value = [x];
+    return ir.intr(cg.B, id, x.ty, a[..]);
+}
+
+// stdc_bit_floor (floor) or stdc_bit_ceil of x (unsigned, of type t): 0 for
+// 0, else the highest bit set; 1 for 0 and 1, else 2 to the bits of x - 1
+// (0 when that is the width: not representable).
+fn floor_ceil(floor: bool, x: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
+    let n = cty.limbs(t);
+    let w = @as(u64, @bit_cast(u32, t.unq.bits));
+    let extra = c64((@as(u64, n) * 64) - w);
+    let one = one_value(t);
+    let zero = constant(t, zeros(n));
+    let mut src = x;
+    if not floor {
+        src = arith(ct.P_MINUS, t, x, one);
+    }
+    let bw = ir.sub(cg.B, c64(w), ir.sub(cg.B, count(ir.IN_CTLZ, src, n), extra));
+    if floor {
+        let z = truth(t, x);
+        let k = ir.select(cg.B, z, ir.sub(cg.B, bw, c64(1)), c64(0));
+        let p = shift(ct.P_SHL, t, one, k, cty.t_ullong);
+        return select_value(t, z, p, zero);
+    }
+    let small = compare(ct.P_LE, t, x, one);
+    let over = ir.icmp(cg.B, ir.IntUGE, bw, c64(w));
+    let k = ir.select(cg.B, over, c64(0), bw);
+    let p = select_value(t, over, zero, shift(ct.P_SHL, t, one, k, cty.t_ullong));
+    return select_value(t, small, one, p);
+}
+
+fn zeros(n: usize) []u64 {
+    let v = u.newn.[u64](n + 1)[0..n];
+    for k in 0..n {
+        v[k] = 0;
+    }
+    return v;
+}
+
+// c ? a : b, of type t (a new temporary).
+fn select_value(t: *mut cty.CType, c: *mut ir.Value, a: *mut ir.Value, b: *mut ir.Value) *mut ir.Value {
+    let n = cty.limbs(t);
+    let r = temp(t);
+    for k in 0..n {
+        set_limb(r, k, ir.select(cg.B, c, limb(a, k), limb(b, k)));
+    }
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// <stdckdint.h>
+// -----------------------------------------------------------------------------
+
+// Integer value v of type t (any integer type) as m limbs in a new
+// temporary, extended as t's signedness says.
+fn widened(v: *mut ir.Value, t: *mut cty.CType, m: usize) *mut ir.Value {
+    let r = cg.alloca(cty.array_of(cty.t_ullong, @as(u64, m), true), "ckd");
+    let mut src = v;
+    let mut n: usize = 1;
+    if cty.is_wint(t) {
+        n = cty.limbs(t);
+    } else {
+        let mut x = v;
+        if x.ty.bits < 64 {
+            if sg_of(t) {
+                x = ir.sext(cg.B, x, i64t());
+            } else {
+                x = ir.zext(cg.B, x, i64t());
+            }
+        }
+        src = cg.alloca(cty.t_ullong, "ckd1");
+        set_limb(src, 0, x);
+    }
+    let mut xs: [5]*mut ir.Value = [r, usz_of(m), src, usz_of(n), cbool(sg_of(t))];
+    _ = call("wi_ext", xs[..]);
+    return r;
+}
+
+/// ckd_add (add), ckd_sub (sub) or ckd_mul of a and b (of types at and bt)
+/// into *rp (of type rt), where one of the types is wider than 64 bits
+/// (C23 7.20): the exact result in limbs enough for it, wrapped into rt;
+/// whether it did not fit (an i8, 0 or 1).
+pub fn ckd(add: bool, sub: bool, rp: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, at_: *mut cty.CType,
+           b: *mut ir.Value, bt: *mut cty.CType) *mut ir.Value {
+    let mut m: usize = 1;
+    let ts: [3]*mut cty.CType = [rt, at_, bt];
+    for t in ts {
+        if cty.is_wint(t) {
+            m = @max(m, cty.limbs(t));
+        }
+    }
+    m = m + 1;
+    if not add and not sub {
+        m = 2 * m;  // (a product: twice the limbs)
+    }
+    let xa = widened(a, at_, m);
+    let xb = widened(b, bt, m);
+    let ex = cg.alloca(cty.array_of(cty.t_ullong, @as(u64, m), true), "ckd");
+    let mut xs: [4]*mut ir.Value = [ex, xa, xb, usz_of(m)];
+    _ = call(u.pick(add, "wi_add", u.pick(sub, "wi_sub", "wi_mul")), xs[..]);
+    // the result: the exact value converted to rt; it fits if it converts back
+    let mut back = ir.vnil();
+    if cty.is_wint(rt) {
+        let r = temp(rt);
+        let mut ys: [5]*mut ir.Value = [r, usz_of(cty.limbs(rt)), ex, usz_of(m), cbool(false)];
+        _ = call("wi_ext", ys[..]);
+        norm(rt, r);
+        copy(rt, rp, r, false);
+        back = widened(r, rt, m);
+    } else {
+        let lo = limb(ex, 0);
+        let tt = cg.lty(rt);
+        let mut r = lo;
+        if tt.bits < 64 {
+            r = cgbi.norm(ir.trunc(cg.B, lo, tt), rt);
+        }
+        let s = ir.store(cg.B, r, rp);
+        s.align = @truncate(u32, cty.align_of(rt));
+        back = widened(r, rt, m);
+    }
+    let mut zs: [4]*mut ir.Value = [ex, back, usz_of(m), cbool(false)];
+    let c = call("wi_cmp", zs[..]);
+    return ir.zext(cg.B, ir.icmp(cg.B, ir.IntNE, c, ir.cint(c.ty, 0)), ir.t_int(8));
+}
+
+// -----------------------------------------------------------------------------
+// Bit-fields
+// -----------------------------------------------------------------------------
+
+// The limbs of bit-field m that hold its bits, from the unit at p (at an
+// 8-byte boundary: these types are aligned to 8 at least), as a value of
+// an unsigned type of as many limbs (two at least); their first limb's
+// index, their number and that type.
+struct BfUnit {
+    k: usize,
+    n: usize,
+    ut: *mut cty.CType,
+    v: *mut ir.Value,
+}
+
+fn bf_unit(m: *cty.Member, p: *mut ir.Value, volatile: bool) BfUnit {
+    let off = @as(u64, @bit_cast(u32, m.bit_off));
+    let w = @as(u64, @bit_cast(u32, m.bit_width));
+    let k = @truncate(usize, off / 64);
+    let n = @truncate(usize, ((off % 64) + w + 63) / 64);
+    let nl = @max(n, 2);
+    let ut = cty.bitint(@int_cast(i32, nl * 64), false);
+    let r = temp(ut);
+    for j in 0..nl {
+        if j < n {
+            let x = limb(p, k + j);
+            if volatile {
+                x.flags = x.flags | ir.F_VOLATILE;
+            }
+            set_limb(r, j, x);
+        } else {
+            set_limb(r, j, c64(0));
+        }
+    }
+    return BfUnit.{ k: k, n: n, ut: ut, v: r };
+}
+
+/// The value of bit-field m (of a type wider than 64 bits, t) in the unit
+/// at p (cgen_bits.ax: the window csema_bits.ax places it in).
+pub fn bf_load(m: *cty.Member, t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    let un = bf_unit(m, p, (t.quals & cty.Q_VOLATILE) != 0);
+    let s = c64(@as(u64, @bit_cast(u32, m.bit_off % 64)));
+    let x = shift(ct.P_SHR, un.ut, un.v, s, cty.t_ullong);
+    let ft = cty.bitint(m.bit_width, sg_of(t));
+    return convert(convert(x, un.ut, ft), ft, t);
+}
+
+/// Stores v (of t) into bit-field m in the unit at p; returns the value
+/// the bit-field then has, as a value of t.
+pub fn bf_store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
+    let volatile = (t.quals & cty.Q_VOLATILE) != 0;
+    let un = bf_unit(m, p, volatile);
+    let nl = @max(un.n, 2);
+    let sh = @as(u64, @bit_cast(u32, m.bit_off % 64));
+    let w = @as(u64, @bit_cast(u32, m.bit_width));
+    // the bits of the field in the unit's limbs
+    let mk = u.newn.[u64](nl + 1)[0..nl];
+    for j in 0..nl {
+        let lo = @as(u64, j) * 64;
+        let mut x: u64 = 0;
+        for b in @as(u64, 0)..64 {
+            if ((lo + b) >= sh) and ((lo + b) < (sh + w)) {
+                x = x | (@as(u64, 1) << @truncate(u32, b));
+            }
+        }
+        mk[j] = x;
+    }
+    let keep = u.newn.[u64](nl + 1)[0..nl];
+    for j in 0..nl {
+        keep[j] = ~mk[j];
+    }
+    let uf = cty.bitint(m.bit_width, false);
+    let bits = convert(convert(v, t, uf), uf, un.ut);
+    let placed = shift(ct.P_SHL, un.ut, bits, c64(sh), cty.t_ullong);
+    let nv = arith(ct.P_PIPE, un.ut, arith(ct.P_AMP, un.ut, un.v, constant(un.ut, keep)), placed);
+    for j in 0..un.n {
+        let x = limb(nv, j);
+        let st = ir.store(cg.B, x, at(p, un.k + j));
+        st.align = 8;
+        if volatile {
+            st.flags = st.flags | ir.F_VOLATILE;
+        }
+    }
+    let ft = cty.bitint(m.bit_width, sg_of(t));
+    return convert(convert(v, t, ft), ft, t);
+}

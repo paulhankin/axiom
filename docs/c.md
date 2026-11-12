@@ -737,7 +737,9 @@ format than the ABI's cannot pass `long double` values to it.
 | Alignment specifiers | `_Alignas` takes any power of two up to 4096 (more is `C3071`). |
 | Bit-fields | Laid out as the target's ABI lays them out: allocated from the least significant bit of a storage unit of the declared type, never straddling two units. On x86-64 Linux, macOS and WebAssembly (the System V rules) a bit-field goes at the next bit if it fits in the unit that holds it, an unnamed one adds nothing to the alignment of the structure, and one of width 0 moves the next member to the next unit of its type. On AArch64 Linux (AAPCS64) the same, but every bit-field's type adds to the alignment, unnamed ones and those of width 0 too. On Windows (x64 and ARM64) bit-fields are allocated in runs: a bit-field joins the open unit only if its type has the unit's size and it fits, else it starts a new unit after it; another member closes the unit; one of width 0 closes it (and aligns the next member to its type) and is ignored when no unit is open; in a union, bit-fields add their type's size but not its alignment. In a packed structure or under `#pragma pack` (GNU dialects; any `pack(n)`), a bit-field goes at the next bit (System V, AAPCS64; AAPCS64 still aligns the structure to a zero-width one's type), while Windows keeps its units, aligned to at most n. A plain `int` bit-field is signed. A `char` bit-field has `char`'s signedness. |
 | Enumerations | The type is `unsigned int` if no enumerator is negative, else `int`, when all fit; the enumeration constants are `int`. In C23, if some enumerator does not fit `int`, the first of `long`, `long long` (`unsigned long`, `unsigned long long` for an unsigned type) that holds all of them, and then the constants have the enumerated type. Before C23 a value outside `int` is `C3013`. With a fixed underlying type (C23), that type. |
-| `_BitInt(N)` | `BITINT_MAXWIDTH` is 64. An object is stored in the smallest of 8, 16, 32 or 64 bits that holds N (aligned as that integer type, as the x86-64 and AArch64 ABIs specify), extended to it. As an argument or result it is that integer; the bits beyond N that arrive are not relied on (the ABIs leave them unspecified). |
+| `_BitInt(N)` | `BITINT_MAXWIDTH` is 65535. For N up to 64 an object is stored in the smallest of 8, 16, 32 or 64 bits that holds N (aligned as that integer type, as the x86-64 and AArch64 ABIs specify), extended to it; as an argument or result it is that integer. Wider, it is stored in 64-bit limbs, the least significant first, as many as hold N, aligned to 8 (the x86-64 System V psABI's and Windows' array of 8-byte chunks; WebAssembly the same), or on AArch64 (Linux and macOS) in 16-byte units aligned to 16 (AAPCS64: `_BitInt(65)` to `_BitInt(128)` as `__int128`): `sizeof(_BitInt(129))` is 24, 32 on AArch64. The value is sign- or zero-extended through its storage; the bits beyond N that arrive (arguments, results, and objects in memory, which code compiled elsewhere writes) are not relied on: the ABIs leave them unspecified. |
+| `__int128` | GNU dialects: `__int128` and `unsigned __int128` are 16 bytes aligned to 16 on every target, an extended integer type whose rank is above `long long` and above `_BitInt(128)`'s, below `_BitInt(129)`'s. `__AXIOM_INT128__` is defined (1). `intmax_t` stays 64 bits (C23 7.22.1.5 lets an extended type be wider), and so does the preprocessor's arithmetic. |
+| Integers wider than 64 bits | `__int128` and `_BitInt(N)` for N > 64. Their arithmetic is exact to the type's width: two-limb values (up to 128 bits) inline (+ and - as add/adc and sub/sbb on x86-64, adds/adc and subs/sbc on AArch64, * with the 64-by-64-bit product's high half, shifts, comparisons, the bitwise operations; / and % inline when both operands are below 2^64, else a function: on x86-64 one generated into the program that uses the 128-by-64-bit `div`, elsewhere a run-time function), wider ones by the functions of `std/c/rt/wideint.ax` (generated into a program only when it calls them); division is Knuth's Algorithm D. Constant expressions are folded with the same functions, in the type's precision. Conversions to `float` and `double` are correctly rounded (to nearest, ties to even), as are those to a wide `long double` (`std/c/rt/ldouble.ax`); from them they truncate toward zero and saturate (undefined when the value does not fit, 6.3.1.4). A signed result that overflows wraps, as for the narrower types (undefined: a program must not rely on it), but in a constant expression it is `C3036`. Bit-fields of these types are laid out as the ABIs say: in a unit of the type's size aligned as the type is, the last such window at or before the next free bit that holds it, else the next (System V, and for `__int128` AAPCS64; checked against the system's compilers on x86-64 and, for `__int128`, AArch64 Linux), on Windows in its runs of units of the type's size at its alignment; in a packed structure one that no 8-byte unit holds is `C3901`. Not supported (`C3901`): an enumeration whose underlying type is `__int128` (one that is a `_BitInt` is `C3075`, C23 6.7.2.2p5), case ranges in a `switch` on them; an integer constant expression where a value of at most 64 bits is needed (an alignment, a bit-field's width, an array's length: `C3009`) whose value is wider is `C3212`. `<stdbit.h>`'s type-generic functions take `unsigned __int128` and the unsigned `_BitInt` types (C23 7.18.1p4: those whose width is a standard or extended type's; here any above 64 bits too), `<stdckdint.h>`'s and the GNU `__builtin_*_overflow` functions any of them. An `_Atomic` one is accessed under the lock (not lock-free: 16 bytes or more); the GNU `__atomic` builtins' generic forms take them, the others only objects of 1, 2, 4 or 8 bytes. `printf` and `scanf` have no conversion for them: C23's `%wN` length modifiers are for the widths of the `intN_t` types `<stdint.h>` defines, which stop at 64. `intmax_t` and `uintmax_t` stay 64 bits on every target (C23 7.22.1.5 lets an extended or bit-precise type be wider), as do `INTMAX_WIDTH`, `%jd` and the preprocessor's arithmetic, in which a `wb` constant wider than 64 bits is `C1016`. |
 | Null pointer | All bits zero. |
 | Source and execution character sets | UTF-8. Narrow string literals are UTF-8 bytes (invalid UTF-8 in a literal is `C1024`). `L"..."` is UTF-16 on Windows (`wchar_t` is 16 bits) and UTF-32 elsewhere; `u"..."` is UTF-16 and `U"..."` UTF-32. |
 | Multi-character constants | `'ab'` is `'a' * 256 + 'b'` as an `int` of the build's width (the first character is the most significant); a warning, `C4102`. A wide one has the value of its last character. More characters than the type holds is `C1011`. |
@@ -769,7 +771,7 @@ library's are `C1081`.
 | Header | Modes | Notes |
 |---|---|---|
 | `<float.h>` | all | `FLT_`, `DBL_` and `LDBL_` macros (the `LDBL_` ones and `DECIMAL_DIG` of the format of `long double`). No `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`. |
-| `<limits.h>` | all | `LLONG_` from C99; `*_WIDTH`, `BOOL_MAX` and `BITINT_MAXWIDTH` (64) in C23. |
+| `<limits.h>` | all | `LLONG_` from C99; `*_WIDTH`, `BOOL_MAX` and `BITINT_MAXWIDTH` (65535) in C23. |
 | `<stdarg.h>` | all | `va_list`, `va_start`, `va_arg`, `va_copy`, `va_end`. In C23 `va_start` needs no second argument. |
 | `<stddef.h>` | all | `size_t`, `ptrdiff_t`, `wchar_t`, `NULL`, `offsetof`; `max_align_t` from C11; `nullptr_t` and `unreachable` in C23. |
 | `<iso646.h>` | C95 and later | |
@@ -819,7 +821,7 @@ as the standard says.
   `#include_next`, `#ident`. A GNU dialect has them ("GNU dialects"), but for those it
   rejects too.
 - In every mode: inline assembly on WebAssembly targets (C3901), `__declspec`, `#import`,
-  `#assert`, `__int128`, the floating types `_Float16`, `_FloatN`, `_FloatNx` and
+  `#assert`, the floating types `_Float16`, `_FloatN`, `_FloatNx` and
   `__float128`, and vector types (the attribute `vector_size`): C3901 in a GNU dialect.
 
 ## GNU dialects
@@ -904,7 +906,7 @@ C4052 and is ignored.
 | `constructor`, `constructor(p)`, `destructor`, `destructor(p)` | functions without parameters | Called by the program's start-up before `main` (lowest priority first; without one, 65535; then in the order defined), and after `main` returns (highest priority first, the last defined first). `exit` (the C library's) runs the destructors too, after the `atexit` functions, once; a program whose `main` is Axiom's runs the constructors before it and the destructors when it returns; an object without `main` (`--emit=obj`), and a freestanding program that ends by calling the system's `exit`, run neither, or no destructors. |
 | `cleanup(f)` | automatic objects | `f(&object)` when its scope is left: the end of its block, `break`, `continue`, `goto` out, `return` (after the value is computed), the end of a statement expression; innermost first. A jump into its scope is C3083. |
 | `transparent_union` | unions (and their typedefs) | A parameter of the type takes an argument of any member's type (or a null pointer constant, or a pointer to void for a pointer member). It is passed as the union is (the platform ABIs pass a union of one pointer or integer as that member). |
-| `mode(m)` | integer objects, members, typedefs | The integer type of m's width with the declared type's signedness: QI, HI, SI, DI, `byte`, `word`, `pointer` (also `__QI__` ...); TI (128 bits) is C3901. |
+| `mode(m)` | integer objects, members, typedefs | The integer type of m's width with the declared type's signedness: QI, HI, SI, DI, TI (`__int128`), `byte`, `word`, `pointer` (also `__QI__` ...). |
 | `vector_size(n)` | | C3901: vector types are not supported. |
 
 In gnu89 and gnu90 `inline` has GNU89's meaning: `inline` alone defines the external
@@ -1256,6 +1258,24 @@ x86-64 System V, a homogeneous aggregate in two floating-point registers on AArc
 value in an integer register or by reference on Windows, by reference on WebAssembly);
 checked against the system's C compiler on `x86_64` and `aarch64` Linux.
 
+An integer wider than 64 bits travels as the structure of its 64-bit limbs would, aligned
+as it is (16 bytes for `__int128` everywhere and for `_BitInt` on AArch64, else 8): on
+x86-64 System V in two integer registers when it is 16 bytes (both or none: the psABI's
+INTEGER, INTEGER; on the stack aligned as it is), in memory when larger; on AArch64 in a
+pair of `x` registers that starts at an even-numbered one (AAPCS64's rounded NGRN; the
+stack aligned to 16), by reference when larger; on Windows x64 by reference (not 1, 2, 4
+or 8 bytes), its result through the hidden pointer, but an `__int128` result in `xmm0`
+(the platform's convention for that type); on WebAssembly as two `i64`s when it is 16
+bytes, by reference when larger, its result through a pointer first parameter (variadic:
+in the buffer, at the type's alignment). Variadic arguments are read the same way.
+`__int128` is checked against the system's C compiler on `x86_64` and `aarch64` Linux,
+both ways (`c/run/wint_abi_host.c`, and `gen_c_abi.py --int128`). `_BitInt(65)` to
+`_BitInt(128)` (`gen_c_abi.py --bitint=128`) were compared with another compiler on
+x86-64 (Linux), both ways; wider ones only where that compiler agrees with the psABI (it
+lays out arrays of them with another stride), and on AArch64 the alignment of 16 follows
+AAPCS64, which that compiler does not. The Windows and WebAssembly signatures were compared
+with another compiler's for those targets.
+
 A `long double` travels as the ABI says for its format: the x87's in memory (System V's
 classes X87 and X87UP; a structure or union holding one is classified with them), its
 result in the x87 register `st(0)`; binary128 as AAPCS64's quad-precision type (in a `v`
@@ -1469,7 +1489,7 @@ claims less than the standard allows. None is hidden: each is said above or here
 - An object from `--emit=obj` of units with no `main` does not link into an Axiom
   program with `--link=` (above); the C sources build with it instead. There are no
   static archives of the compiler's own objects.
-- In a GNU dialect: `__int128` and the `_FloatN` types are not supported; the
+- In a GNU dialect: the `_FloatN` types are not supported; the
   destructors run when `main` returns and from the library's `exit`, not when the
   process ends otherwise (`_Exit`, `quick_exit`, a signal); an alias is another name in its unit only; the
   attribute `section` places only data, and only in ELF objects.

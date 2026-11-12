@@ -74,7 +74,7 @@
 #define ULONG_WIDTH __AXIOM_LONG_WIDTH__
 #define LLONG_WIDTH 64
 #define ULLONG_WIDTH 64
-#define BITINT_MAXWIDTH 64
+#define BITINT_MAXWIDTH 65535
 #endif
 
 #endif

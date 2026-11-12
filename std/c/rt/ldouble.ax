@@ -721,6 +721,171 @@ pub fn to_u64(a: *W, f: u32) u64 {
     return x.s.h >> @bit_cast(u32, 63 - x.e);
 }
 
+// Limb i of the n limbs at p (0 past them).
+fn limb(p: *u64, n: usize, i: usize) u64 {
+    if i >= n {
+        return 0;
+    }
+    return @ptr_add(p, i).*;
+}
+
+/// r = the integer of n 64-bit limbs at p (least significant first; two's
+/// complement when sg), correctly rounded: C's integers wider than 64 bits
+/// (cmd/axiom/src/c/cgen_wint.ax).
+pub fn from_int(r: *mut W, p: *u64, n: usize, sg: bool, f: u32) void {
+    let neg = sg and ((limb(p, n, n - 1) >> 63) != 0);
+    // the magnitude's limbs, one at a time: -x is ~x + 1, the carry ends at
+    // the first limb that is not 0
+    let mut top: usize = n;
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        if mag(p, n, i, neg) != 0 {
+            top = i;
+            break;
+        }
+    }
+    if top == n {
+        pack_zero(r, false, f);
+        return;
+    }
+    // the leading 128 bits (from limbs top and below), and whether any
+    // bits below them are set
+    let h = mag(p, n, top, neg);
+    let z = @truncate(u32, @clz(h));
+    let mut w = u2(h, 0);
+    let mut sticky = false;
+    if top >= 1 {
+        w = u2(h, mag(p, n, top - 1, neg));
+    }
+    let mut x: u64 = 0;
+    if top >= 2 {
+        x = mag(p, n, top - 2, neg);
+    }
+    w = shl(w, z);
+    if z != 0 {
+        w = u2(w.h, w.l | (x >> (64 - z)));
+        sticky = (x << z) != 0;
+    } else {
+        sticky = x != 0;
+    }
+    if top >= 3 {
+        for k in 0..(top - 2) {
+            if mag(p, n, k, neg) != 0 {
+                sticky = true;
+            }
+        }
+    }
+    let e = ((@bit_cast(i32, @truncate(u32, top)) * 64) + 63) - @bit_cast(i32, z);
+    finish(r, neg, e, w, sticky, f);
+}
+
+// Limb i of the magnitude of the integer at p (n limbs; negative: neg).
+fn mag(p: *u64, n: usize, i: usize, neg: bool) u64 {
+    let v = limb(p, n, i);
+    if not neg {
+        return v;
+    }
+    // (~v, plus the carry of the limbs below: 1 when they are all 0)
+    for k in 0..i {
+        if limb(p, n, k) != 0 {
+            return ~v;
+        }
+    }
+    return (~v) +% 1;
+}
+
+/// r (n limbs) = a truncated toward zero, saturated to the range of an
+/// integer of `bits` bits (signed: sg; NaN: 0), extended to the n limbs;
+/// whether its value fitted.
+pub fn to_int(r: *mut u64, n: usize, bits: u32, sg: bool, a: *W, f: u32) bool {
+    for i in 0..n {
+        @ptr_add(r, i).* = 0;
+    }
+    let x = unpack(a, f);
+    if x.cls == C_NAN {
+        return false;
+    }
+    if (x.cls == C_ZERO) or ((x.cls == C_FIN) and (x.e < 0)) {
+        return true;
+    }
+    let mut lim = @bit_cast(i32, bits);
+    if sg {
+        lim -= 1;
+    }
+    let exact_min = sg and x.neg and (x.cls == C_FIN) and (x.e == lim) and int_bits_zero(x.s, x.e);
+    if (x.cls == C_INF) or (x.e >= lim) or (x.neg and not sg) {
+        // the least or the largest value
+        if x.neg and sg {
+            let k = bits - 1;
+            @ptr_add(r, @as(usize, k / 64)).* = @as(u64, 1) << (k % 64);
+            for i in (@as(usize, k / 64) + 1)..n {
+                @ptr_add(r, i).* = 0xFFFF_FFFF_FFFF_FFFF;
+            }
+            // (the bits above, within the limb, are the sign's)
+            let t = @as(usize, k / 64);
+            @ptr_add(r, t).* = @ptr_add(r, t).* | ~((@as(u64, 1) << (k % 64)) -% 1);
+        } else if not x.neg {
+            let k = @as(u32, @bit_cast(u32, lim));
+            for i in 0..n {
+                let lo = @truncate(u32, i * 64);
+                if (lo + 64) <= k {
+                    @ptr_add(r, i).* = 0xFFFF_FFFF_FFFF_FFFF;
+                } else if lo < k {
+                    @ptr_add(r, i).* = (@as(u64, 1) << (k - lo)) - 1;
+                }
+            }
+        }
+        return exact_min;
+    }
+    // the integer part of s * 2^(e - 127)
+    if x.e <= 127 {
+        let v = shr(x.s, @bit_cast(u32, 127 - x.e));
+        @ptr_add(r, 0).* = v.l;
+        if n > 1 {
+            @ptr_add(r, 1).* = v.h;
+        }
+    } else {
+        let k = @bit_cast(u32, x.e - 127);
+        let q = @as(usize, k / 64);
+        let b = k % 64;
+        if q < n {
+            @ptr_add(r, q).* = x.s.l << b;
+        }
+        if (q + 1) < n {
+            let mut v = x.s.h << b;
+            if b != 0 {
+                v = v | (x.s.l >> (64 - b));
+            }
+            @ptr_add(r, q + 1).* = v;
+        }
+        if ((q + 2) < n) and (b != 0) {
+            @ptr_add(r, q + 2).* = x.s.h >> (64 - b);
+        }
+    }
+    if x.neg {
+        let mut c: u64 = 1;
+        for i in 0..n {
+            let v = (~@ptr_add(r, i).*) +% c;
+            if v != 0 {
+                c = 0;
+            }
+            @ptr_add(r, i).* = v;
+        }
+    }
+    return true;
+}
+
+// Are the bits of the integer part of s * 2^(e - 127) (s normalized, e >=
+// 0) below the leading one all 0?
+fn int_bits_zero(s: U2, e: i32) bool {
+    if e >= 127 {
+        return is0(u2(s.h & 0x7FFF_FFFF_FFFF_FFFF, s.l));
+    }
+    let v = shr(s, @bit_cast(u32, 127 - e));
+    return is0(sub2(v, shl(u2(0, 1), @bit_cast(u32, e))));
+}
+
 /// r = the double whose bits are `bits` (exact; a NaN quieted).
 pub fn from_f64(r: *mut W, bits: u64, f: u32) void {
     from_bin(r, (bits >> 63) != 0, @bit_cast(i32, @truncate(u32, (bits >> 52) & 0x7FF)), bits & 0xF_FFFF_FFFF_FFFF, 53,

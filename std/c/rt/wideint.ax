@@ -1,0 +1,775 @@
+// =============================================================================
+// std/c/rt/wideint.ax - C's integers wider than 64 bits (__int128 of the GNU
+// dialects, C23's _BitInt(N) for N > 64), in software: the operations the C
+// front end (cmd/axiom/src/c/cgen_wint.ax) does not generate inline, and
+// with which it folds constants (cconst.ax), so that a constant expression
+// and the same operation at run time agree.
+//
+// A value is an array of n 64-bit limbs, least significant first (the
+// object's memory on every target, which are all little-endian), in two's
+// complement. Every operation takes the limb count n (at least 1) and reads
+// and writes whole limbs; the result is not reduced to the type's width
+// (the front end does that: wi_norm). A result never overlaps an operand.
+// Signed operations (sg) read the top bit of limb n - 1 as the sign.
+//
+// Division is Knuth's Algorithm D (The Art of Computer Programming, vol. 2,
+// 4.3.1) on 32-bit digits, with 64-bit arithmetic for the estimates.
+// Conversions to float and double are correctly rounded (to nearest, ties
+// to even); from them, truncated toward zero and saturated to the type's
+// range (a NaN gives 0), as the code generator's conversions of float and
+// double to narrower integers are (C17 6.3.1.4: undefined when the value
+// does not fit).
+// =============================================================================
+
+fn get(p: *u64, i: usize) u64 {
+    return @ptr_add(p, i).*;
+}
+
+fn put(p: *mut u64, i: usize, v: u64) void {
+    @ptr_add(p, i).* = v;
+}
+
+fn sign_of(p: *u64, n: usize) bool {
+    return (get(p, n - 1) >> 63) != 0;
+}
+
+fn fill_of(neg: bool) u64 {
+    if neg {
+        return 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    return 0;
+}
+
+/// r = a + b (mod 2^(64n)).
+pub fn wi_add(r: *mut u64, a: *u64, b: *u64, n: usize) void {
+    let mut c: u64 = 0;
+    for i in 0..n {
+        let x = get(a, i);
+        let s = x +% get(b, i);
+        let s2 = s +% c;
+        c = 0;
+        if (s < x) or (s2 < s) {
+            c = 1;
+        }
+        put(r, i, s2);
+    }
+}
+
+/// r = a - b (mod 2^(64n)).
+pub fn wi_sub(r: *mut u64, a: *u64, b: *u64, n: usize) void {
+    let mut c: u64 = 0;
+    for i in 0..n {
+        let x = get(a, i);
+        let y = get(b, i);
+        let d = x -% y;
+        let d2 = d -% c;
+        let mut out: u64 = 0;
+        if (x < y) or (d < c) {
+            out = 1;
+        }
+        c = out;
+        put(r, i, d2);
+    }
+}
+
+/// r = -a (mod 2^(64n)).
+pub fn wi_neg(r: *mut u64, a: *u64, n: usize) void {
+    let mut c: u64 = 1;
+    for i in 0..n {
+        let s = (~get(a, i)) +% c;
+        if s != 0 {
+            c = 0;
+        }
+        put(r, i, s);
+    }
+}
+
+/// r = ~a.
+pub fn wi_not(r: *mut u64, a: *u64, n: usize) void {
+    for i in 0..n {
+        put(r, i, ~get(a, i));
+    }
+}
+
+/// r = a & b (op 0), a | b (1), a ^ b (2).
+pub fn wi_bitop(r: *mut u64, a: *u64, b: *u64, n: usize, op: u32) void {
+    for i in 0..n {
+        let x = get(a, i);
+        let y = get(b, i);
+        if op == 0 {
+            put(r, i, x & y);
+        } else if op == 1 {
+            put(r, i, x | y);
+        } else {
+            put(r, i, x ^ y);
+        }
+    }
+}
+
+// The 128-bit product of x and y: [low, high].
+fn mul64(x: u64, y: u64) [2]u64 {
+    let m: u64 = 0xFFFF_FFFF;
+    let x0 = x & m;
+    let x1 = x >> 32;
+    let y0 = y & m;
+    let y1 = y >> 32;
+    let p00 = x0 *% y0;
+    let p01 = x0 *% y1;
+    let p10 = x1 *% y0;
+    let p11 = x1 *% y1;
+    let mid = ((p00 >> 32) +% (p01 & m)) +% (p10 & m);
+    let lo = (p00 & m) | (mid << 32);
+    let hi = ((p11 +% (p01 >> 32)) +% (p10 >> 32)) +% (mid >> 32);
+    return [lo, hi];
+}
+
+/// r = a * b (mod 2^(64n)): signed and unsigned products have the same
+/// low bits.
+pub fn wi_mul(r: *mut u64, a: *u64, b: *u64, n: usize) void {
+    for i in 0..n {
+        put(r, i, 0);
+    }
+    for i in 0..n {
+        let x = get(a, i);
+        if x == 0 {
+            continue;
+        }
+        let mut c: u64 = 0;
+        for j in 0..(n - i) {
+            let p = mul64(x, get(b, j));
+            let t = get(r, i + j);
+            let s = t +% p[0];
+            let mut h = p[1];
+            if s < t {
+                h +%= 1;
+            }
+            let s2 = s +% c;
+            if s2 < s {
+                h +%= 1;
+            }
+            put(r, i + j, s2);
+            c = h;
+        }
+    }
+}
+
+/// r = a << k (0 when k >= 64n).
+pub fn wi_shl(r: *mut u64, a: *u64, k: u64, n: usize) void {
+    let w = @as(u64, n) * 64;
+    if k >= w {
+        for i in 0..n {
+            put(r, i, 0);
+        }
+        return;
+    }
+    let q = @truncate(usize, k / 64);
+    let s = @truncate(u32, k % 64);
+    var_shl(r, a, q, s, n);
+}
+
+fn var_shl(r: *mut u64, a: *u64, q: usize, s: u32, n: usize) void {
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        if i < q {
+            put(r, i, 0);
+            continue;
+        }
+        let mut v = get(a, i - q) << s;
+        if (s != 0) and (i > q) {
+            v = v | (get(a, (i - q) - 1) >> (64 - s));
+        }
+        put(r, i, v);
+    }
+}
+
+/// r = a >> k, arithmetic (sg) or logical; k >= 64n gives the sign's fill.
+pub fn wi_shr(r: *mut u64, a: *u64, k: u64, n: usize, sg: bool) void {
+    let f = fill_of(sg and sign_of(a, n));
+    let w = @as(u64, n) * 64;
+    if k >= w {
+        for i in 0..n {
+            put(r, i, f);
+        }
+        return;
+    }
+    let q = @truncate(usize, k / 64);
+    let s = @truncate(u32, k % 64);
+    for i in 0..n {
+        let j = i + q;
+        let mut lo = f;
+        if j < n {
+            lo = get(a, j);
+        }
+        let mut hi = f;
+        if (j + 1) < n {
+            hi = get(a, j + 1);
+        }
+        let mut v = lo;
+        if s != 0 {
+            v = (lo >> s) | (hi << (64 - s));
+        }
+        put(r, i, v);
+    }
+}
+
+/// -1, 0 or 1 as a < b, a == b or a > b (signed: sg).
+pub fn wi_cmp(a: *u64, b: *u64, n: usize, sg: bool) i32 {
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        let mut x = get(a, i);
+        let mut y = get(b, i);
+        if sg and (i == (n - 1)) {
+            x = x ^ 0x8000_0000_0000_0000;
+            y = y ^ 0x8000_0000_0000_0000;
+        }
+        if x < y {
+            return -1;
+        }
+        if x > y {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// 1 if a is not 0, else 0.
+pub fn wi_nonzero(a: *u64, n: usize) u32 {
+    for i in 0..n {
+        if get(a, i) != 0 {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// r (n limbs) = a (m limbs) truncated or extended (sign-extended: sg).
+pub fn wi_ext(r: *mut u64, n: usize, a: *u64, m: usize, sg: bool) void {
+    let f = fill_of(sg and sign_of(a, m));
+    for i in 0..n {
+        if i < m {
+            put(r, i, get(a, i));
+        } else {
+            put(r, i, f);
+        }
+    }
+}
+
+/// Reduces r (n limbs) to `bits` bits, sign-extended (sg) or zero-extended
+/// from there to all n limbs: the form a value of _BitInt(bits) or
+/// unsigned _BitInt(bits) has.
+pub fn wi_norm(r: *mut u64, n: usize, bits: u32, sg: bool) void {
+    let top = @int_cast(usize, (bits - 1) / 64);
+    let used = bits - (@as(u32, @truncate(u32, top)) * 64);
+    let mut v = get(r, top);
+    if used < 64 {
+        let sh = 64 - used;
+        if sg {
+            v = @bit_cast(u64, @bit_cast(i64, v << sh) >> sh);
+        } else {
+            v = (v << sh) >> sh;
+        }
+        put(r, top, v);
+    }
+    let f = fill_of(sg and ((v >> 63) != 0));
+    for i in (top + 1)..n {
+        put(r, i, f);
+    }
+}
+
+/// The leading zero bits of a (64n for 0).
+pub fn wi_clz(a: *u64, n: usize) u64 {
+    let mut i = n;
+    let mut z: u64 = 0;
+    while i > 0 {
+        i -= 1;
+        let v = get(a, i);
+        if v != 0 {
+            return z + @clz(v);
+        }
+        z += 64;
+    }
+    return z;
+}
+
+/// The trailing zero bits of a (64n for 0).
+pub fn wi_ctz(a: *u64, n: usize) u64 {
+    let mut z: u64 = 0;
+    for i in 0..n {
+        let v = get(a, i);
+        if v != 0 {
+            return z + @ctz(v);
+        }
+        z += 64;
+    }
+    return z;
+}
+
+/// The bits of a that are set.
+pub fn wi_popcount(a: *u64, n: usize) u64 {
+    let mut c: u64 = 0;
+    for i in 0..n {
+        c += @popcount(get(a, i));
+    }
+    return c;
+}
+
+// -----------------------------------------------------------------------------
+// Division
+// -----------------------------------------------------------------------------
+
+fn dget(p: *u32, i: usize) u64 {
+    return @as(u64, @ptr_add(p, i).*);
+}
+
+fn dput(p: *mut u32, i: usize, v: u64) void {
+    @ptr_add(p, i).* = @truncate(u32, v);
+}
+
+// The significant 32-bit digits of the n limbs at a (0 for 0).
+fn digits(a: *u64, n: usize) usize {
+    let mut k = n * 2;
+    while k > 0 {
+        let v = get(a, (k - 1) / 2);
+        let d = (v >> @truncate(u32, ((k - 1) % 2) * 32)) & 0xFFFF_FFFF;
+        if d != 0 {
+            return k;
+        }
+        k -= 1;
+    }
+    return 0;
+}
+
+fn digit(a: *u64, i: usize) u64 {
+    return (get(a, i / 2) >> @truncate(u32, (i % 2) * 32)) & 0xFFFF_FFFF;
+}
+
+// The unsigned division of wi_divmod: of two limbs by udivmod2.
+fn divmod_u(q: *mut u64, rem: *mut u64, a: *u64, b: *u64, n: usize, s: *mut u64) void {
+    if (n == 2) and ((get(b, 0) | get(b, 1)) != 0) {
+        udivmod2(q, rem, get(a, 0), get(a, 1), get(b, 0), get(b, 1));
+        return;
+    }
+    udivmod(q, rem, a, b, n, s);
+}
+
+// q = u / v, rem = u % v, unsigned (v not 0), with s's 4n + 4 limbs of
+// scratch space (s[2n..]: the normalized digits).
+fn udivmod(q: *mut u64, rem: *mut u64, a: *u64, b: *u64, n: usize, s: *mut u64) void {
+    for i in 0..n {
+        put(q, i, 0);
+        put(rem, i, 0);
+    }
+    let nb = digits(b, n);
+    let na = digits(a, n);
+    if (nb == 0) or (na < nb) {
+        // (a division by zero, which is undefined: 0, and a as the remainder)
+        for i in 0..n {
+            put(rem, i, get(a, i));
+        }
+        return;
+    }
+    let m: u64 = 0xFFFF_FFFF;
+    if nb == 1 {
+        // short division by one digit
+        let d = digit(b, 0);
+        let mut r: u64 = 0;
+        let mut i = na;
+        while i > 0 {
+            i -= 1;
+            let x = (r << 32) | digit(a, i);
+            let qd = x / d;
+            r = x % d;
+            put(q, i / 2, get(q, i / 2) | (qd << @truncate(u32, (i % 2) * 32)));
+        }
+        put(rem, 0, r);
+        return;
+    }
+    // D1: normalize, so that the divisor's top digit has its top bit set
+    let sh = @truncate(u32, @clz(digit(b, nb - 1)) - 32);
+    let un = @ptr_cast(*mut u32, @ptr_add(s, 2 * n));
+    let vn = @ptr_add(un, (2 * n) + 2);
+    for i in 0..nb {
+        let mut x = (digit(b, i) << sh) & m;
+        if (sh != 0) and (i > 0) {
+            x = x | (digit(b, i - 1) >> (32 - sh));
+        }
+        dput(vn, i, x);
+    }
+    dput(un, na, 0);
+    if sh != 0 {
+        dput(un, na, digit(a, na - 1) >> (32 - sh));
+    }
+    for i in 0..na {
+        let mut x = (digit(a, i) << sh) & m;
+        if (sh != 0) and (i > 0) {
+            x = x | (digit(a, i - 1) >> (32 - sh));
+        }
+        dput(un, i, x);
+    }
+    let vt = dget(vn, nb - 1);
+    let vt2 = dget(vn, nb - 2);
+    let mut j = (na - nb) + 1;
+    while j > 0 {
+        j -= 1;
+        // D3: the estimate of the quotient digit, at most one too large
+        let num = (dget(un, j + nb) << 32) | dget(un, (j + nb) - 1);
+        let mut qhat = num / vt;
+        let mut rhat = num % vt;
+        while (qhat > m) or ((qhat * vt2) > ((rhat << 32) | dget(un, (j + nb) - 2))) {
+            qhat -= 1;
+            rhat += vt;
+            if rhat > m {
+                break;
+            }
+        }
+        // D4: multiply and subtract
+        let mut carry: u64 = 0;
+        let mut borrow: u64 = 0;
+        for i in 0..nb {
+            let p = (qhat * dget(vn, i)) + carry;
+            carry = p >> 32;
+            let sub = (p & m) + borrow;
+            let x = dget(un, i + j);
+            if x >= sub {
+                dput(un, i + j, x - sub);
+                borrow = 0;
+            } else {
+                dput(un, i + j, (x + (m + 1)) - sub);
+                borrow = 1;
+            }
+        }
+        let sub = carry + borrow;
+        let x = dget(un, j + nb);
+        let mut neg = false;
+        if x >= sub {
+            dput(un, j + nb, x - sub);
+        } else {
+            dput(un, j + nb, ((x + (m + 1)) - sub) & m);
+            neg = true;
+        }
+        // D6: add back (rarely: the estimate was one too large)
+        if neg {
+            qhat -= 1;
+            let mut c: u64 = 0;
+            for i in 0..nb {
+                let t = (dget(un, i + j) + dget(vn, i)) + c;
+                dput(un, i + j, t & m);
+                c = t >> 32;
+            }
+            dput(un, j + nb, (dget(un, j + nb) + c) & m);
+        }
+        put(q, j / 2, get(q, j / 2) | (qhat << @truncate(u32, (j % 2) * 32)));
+    }
+    // D8: the remainder, unnormalized
+    for i in 0..nb {
+        let mut x = dget(un, i) >> sh;
+        if sh != 0 {
+            x = x | ((dget(un, i + 1) << (32 - sh)) & m);
+        }
+        put(rem, i / 2, get(rem, i / 2) | (x << @truncate(u32, (i % 2) * 32)));
+    }
+}
+
+// (u1:u0) / v for u1 < v (the quotient fits 64 bits), the remainder into
+// r: Algorithm D for four 32-bit digits by two, v normalized first.
+fn div128by64(u1: u64, u0: u64, v0: u64, r: *mut u64) u64 {
+    let m: u64 = 0xFFFF_FFFF;
+    let s = @truncate(u32, @clz(v0));
+    let v = v0 << s;
+    let mut un32 = u1 << s;
+    if s != 0 {
+        un32 = un32 | (u0 >> (64 - s));
+    }
+    let un10 = u0 << s;
+    let vn1 = v >> 32;
+    let vn0 = v & m;
+    let un1 = un10 >> 32;
+    let un0 = un10 & m;
+    let mut q1 = un32 / vn1;
+    let mut rhat = un32 - (q1 * vn1);
+    while (q1 > m) or ((q1 * vn0) > ((rhat << 32) | un1)) {
+        q1 -= 1;
+        rhat += vn1;
+        if rhat > m {
+            break;
+        }
+    }
+    let un21 = ((un32 << 32) | un1) -% (q1 *% v);
+    let mut q0 = un21 / vn1;
+    rhat = un21 - (q0 * vn1);
+    while (q0 > m) or ((q0 * vn0) > ((rhat << 32) | un0)) {
+        q0 -= 1;
+        rhat += vn1;
+        if rhat > m {
+            break;
+        }
+    }
+    r.* = (((un21 << 32) | un0) -% (q0 *% v)) >> s;
+    return (q1 << 32) | q0;
+}
+
+// q = a / b, rem = a % b for two limbs, unsigned (b not 0): the quotient
+// from one 128-by-64 division of a shifted, for a divisor of two limbs
+// (the estimate from its leading 64 bits is the quotient or one more).
+fn udivmod2(q: *mut u64, rem: *mut u64, a0: u64, a1: u64, b0: u64, b1: u64) void {
+    let mut r: u64 = 0;
+    if b1 == 0 {
+        let mut qh: u64 = 0;
+        let mut k = a1;
+        if a1 >= b0 {
+            qh = a1 / b0;
+            k = a1 % b0;
+        }
+        put(q, 0, div128by64(k, a0, b0, &mut r));
+        put(q, 1, qh);
+        put(rem, 0, r);
+        put(rem, 1, 0);
+        return;
+    }
+    let n = @truncate(u32, @clz(b1));
+    let mut v1 = b1 << n;
+    if n != 0 {
+        v1 = v1 | (b0 >> (64 - n));
+    }
+    // a >> 1, whose high limb is below v1 (at least 2^63)
+    let q1 = div128by64(a1 >> 1, (a0 >> 1) | (a1 << 63), v1, &mut r);
+    // (undo the normalization and the halving: q1 * 2^n / 2^63)
+    let mut q0 = q1 >> (63 - n);
+    if q0 != 0 {
+        q0 -= 1;
+    }
+    // a - q0 * b, and one more if that is still at least b
+    let p = mul64(q0, b0);
+    let ph = p[1] +% (q0 *% b1);
+    let mut l = a0 -% p[0];
+    let mut h = a1 -% ph;
+    if a0 < p[0] {
+        h -%= 1;
+    }
+    if (h > b1) or ((h == b1) and (l >= b0)) {
+        q0 += 1;
+        h = h -% b1;
+        if l < b0 {
+            h -%= 1;
+        }
+        l = l -% b0;
+    }
+    put(q, 0, q0);
+    put(q, 1, 0);
+    put(rem, 0, l);
+    put(rem, 1, h);
+}
+
+/// q = a / b and rem = a % b, signed (sg: truncated toward zero, the
+/// remainder with a's sign, C17 6.5.5p6) or unsigned, with s's 4n + 4
+/// limbs of scratch space. Division by zero, which is undefined, gives 0
+/// and a.
+pub fn wi_divmod(q: *mut u64, rem: *mut u64, a: *u64, b: *u64, n: usize, sg: bool, s: *mut u64) void {
+    if not sg {
+        divmod_u(q, rem, a, b, n, s);
+        return;
+    }
+    let na = sign_of(a, n);
+    let nb = sign_of(b, n);
+    let ua = s;
+    let ub = @ptr_add(s, n);
+    if na {
+        wi_neg(ua, a, n);
+    } else {
+        wi_ext(ua, n, a, n, false);
+    }
+    if nb {
+        wi_neg(ub, b, n);
+    } else {
+        wi_ext(ub, n, b, n, false);
+    }
+    divmod_u(q, rem, ua, ub, n, s);
+    if na != nb {
+        wi_ext(ua, n, q, n, false);
+        wi_neg(q, ua, n);
+    }
+    if na {
+        wi_ext(ua, n, rem, n, false);
+        wi_neg(rem, ua, n);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Floating conversions
+// -----------------------------------------------------------------------------
+
+// The magnitude of a (signed: sg) into s (n limbs); whether a is negative.
+fn magnitude(s: *mut u64, a: *u64, n: usize, sg: bool) bool {
+    let neg = sg and sign_of(a, n);
+    if neg {
+        wi_neg(s, a, n);
+    } else {
+        wi_ext(s, n, a, n, false);
+    }
+    return neg;
+}
+
+// The bits of a binary floating-point value of p bits of precision (1 sign
+// bit, eb exponent bits, p - 1 fraction bits) nearest to the magnitude m
+// (n limbs) with sign neg: rounded to nearest, ties to even.
+fn round_to(m: *u64, n: usize, neg: bool, p: u32, eb: u32) u64 {
+    let mut sign: u64 = 0;
+    if neg {
+        sign = @as(u64, 1) << (eb + (p - 1));
+    }
+    let lz = wi_clz(m, n);
+    let w = @as(u64, n) * 64;
+    if lz == w {
+        return sign;
+    }
+    let top = (w - lz) - 1;  // the position of the leading bit
+    let bias = (@as(u64, 1) << (eb - 1)) - 1;
+    if top > bias {
+        return sign | (((@as(u64, 1) << eb) - 1) << (p - 1));  // (an infinity)
+    }
+    // the leading 64 bits, with a sticky bit for any below them
+    let mut sticky = false;
+    let li = @truncate(usize, top / 64);
+    let lb = @truncate(u32, top % 64);
+    let mut hi = get(m, li) << (63 - lb);
+    if (lb != 63) and (li > 0) {
+        hi = hi | (get(m, li - 1) >> (lb + 1));
+    }
+    let mut below = li;
+    if lb != 63 {
+        if li > 0 {
+            if (get(m, li - 1) << (63 - lb)) != 0 {
+                sticky = true;
+            }
+            below = li - 1;
+        }
+    }
+    for i in 0..below {
+        if get(m, i) != 0 {
+            sticky = true;
+        }
+    }
+    // hi's bit 63 is the leading bit: keep p bits, round on the rest
+    let drop = 64 - p;
+    let mut f = hi >> drop;
+    let rest = hi << p;
+    let half: u64 = 0x8000_0000_0000_0000;
+    let mut e = top;
+    if (rest > half) or ((rest == half) and (sticky or ((f & 1) != 0))) {
+        f += 1;
+        if (f >> p) != 0 {
+            f = f >> 1;
+            e += 1;
+        }
+    }
+    if e > bias {
+        return sign | (((@as(u64, 1) << eb) - 1) << (p - 1));
+    }
+    let fr = f & ((@as(u64, 1) << (p - 1)) - 1);
+    return (sign | ((e + bias) << (p - 1))) | fr;
+}
+
+/// a (signed: sg) rounded to double: its bits. s: n limbs of scratch.
+pub fn wi_to_f64(a: *u64, n: usize, sg: bool, s: *mut u64) u64 {
+    let neg = magnitude(s, a, n, sg);
+    return round_to(s, n, neg, 53, 11);
+}
+
+/// a (signed: sg) rounded to float: its bits. s: n limbs of scratch.
+pub fn wi_to_f32(a: *u64, n: usize, sg: bool, s: *mut u64) u32 {
+    let neg = magnitude(s, a, n, sg);
+    return @truncate(u32, round_to(s, n, neg, 24, 8));
+}
+
+// r = the largest (or, neg, the least) value of `bits` bits.
+fn saturate(r: *mut u64, n: usize, bits: u32, sg: bool, neg: bool) void {
+    for i in 0..n {
+        put(r, i, 0);
+    }
+    if neg {
+        if sg {
+            // -2^(bits - 1)
+            let k = @as(u64, bits - 1);
+            put(r, @truncate(usize, k / 64), @as(u64, 1) << @truncate(u32, k % 64));
+            wi_norm(r, n, bits, true);
+        }
+        return;
+    }
+    let mut k = @as(u64, bits);
+    if sg {
+        k -= 1;
+    }
+    // 2^k - 1
+    for i in 0..n {
+        let lo = @as(u64, i) * 64;
+        if (lo + 64) <= k {
+            put(r, i, 0xFFFF_FFFF_FFFF_FFFF);
+        } else if lo < k {
+            put(r, i, (@as(u64, 1) << @truncate(u32, k - lo)) - 1);
+        }
+    }
+}
+
+/// r (n limbs) = the double whose bits are `fb`, truncated toward zero and
+/// saturated to the range of an integer of `bits` bits (signed: sg; a NaN
+/// gives 0), sign- or zero-extended to the n limbs; whether it fitted.
+pub fn wi_from_f64(r: *mut u64, n: usize, bits: u32, sg: bool, fb: u64) bool {
+    let neg = (fb >> 63) != 0;
+    let ef = (fb >> 52) & 0x7FF;
+    let fr = fb & 0xF_FFFF_FFFF_FFFF;
+    for i in 0..n {
+        put(r, i, 0);
+    }
+    if ef == 0x7FF {
+        if fr != 0 {
+            return false;  // (a NaN: 0)
+        }
+        saturate(r, n, bits, sg, neg);
+        return false;
+    }
+    if ef < 1023 {
+        return true;  // (less than 1 in magnitude: 0)
+    }
+    // the value is m * 2^(e - 52), m of 53 bits
+    let m = fr | (@as(u64, 1) << 52);
+    let e = ef - 1023;
+    let mut lim = @as(u64, bits);
+    if sg {
+        lim -= 1;
+    }
+    if neg and not sg {
+        saturate(r, n, bits, sg, true);
+        return false;
+    }
+    if e >= lim {
+        // (only -2^(bits - 1) fits of these)
+        let exact = neg and sg and (e == lim) and (fr == 0);
+        saturate(r, n, bits, sg, neg);
+        return exact;
+    }
+    if e <= 52 {
+        put(r, 0, m >> @truncate(u32, 52 - e));
+    } else {
+        let k = e - 52;
+        let q = @truncate(usize, k / 64);
+        let s = @truncate(u32, k % 64);
+        put(r, q, m << s);
+        if (s != 0) and ((q + 1) < n) {
+            put(r, q + 1, m >> (64 - s));
+        }
+    }
+    if neg {
+        // (negated in place: the limbs from the lowest nonzero one)
+        let mut c: u64 = 1;
+        for i in 0..n {
+            let v = (~get(r, i)) +% c;
+            if v != 0 {
+                c = 0;
+            }
+            put(r, i, v);
+        }
+    }
+    return true;
+}

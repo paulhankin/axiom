@@ -103,7 +103,7 @@ int main(void) {
     return 0;
 }
 
-/* expect: 64 */
+/* expect: 65535 */
 /* expect: 1248 */
 /* expect: 4 */
 /* expect: 10 */

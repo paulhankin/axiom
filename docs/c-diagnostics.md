@@ -184,8 +184,9 @@ names the feature and the standard that has it (or removed it).
 | `C3201` | An association of a generic selection whose type is not a complete object type, or is variably modified. |
 | `C3202` | Two associations of a generic selection with compatible types. |
 | `C3203` | No association of a generic selection matches the controlling expression's type, and there is no `default`. |
-| `C3210` | A `_BitInt` width out of range (at least 2, or 1 for `unsigned _BitInt`; at most `BITINT_MAXWIDTH`, 64). |
+| `C3210` | A `_BitInt` width out of range (at least 2, or 1 for `unsigned _BitInt`; at most `BITINT_MAXWIDTH`, 65535). |
 | `C3211` | An integer constant with a `wb` or `uwb` suffix that is too large for any bit-precise type. |
+| `C3212` | An integer constant expression whose value is wider than 64 bits (of `__int128` or a `_BitInt`) where a value of at most 64 bits is needed: an alignment, a bit-field's width, an enumeration constant, a designator's index. |
 | `C3220` | `main` declared `inline` or `_Noreturn`. |
 | `C3221` | An inline definition that defines a modifiable object with static storage duration or refers to an identifier with internal linkage (6.7.4p3). |
 | `C3222` | The address of an object declared `register` taken, or a `register` array used as a pointer. |

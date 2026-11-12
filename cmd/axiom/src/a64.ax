@@ -565,6 +565,10 @@ fn logic_opc(o: i32) u64 {
 }
 
 fn gen_alu(v: *mut ir.Value) void {
+    if (v.flag & F_ADC) != 0 {
+        gen_carry(v);
+        return;
+    }
     let o = v.op;
     let t = v.ty;
     let sf = sfv(t);
@@ -3542,6 +3546,141 @@ fn prepare(f: *mut ir.Func) void {
             i = i.next;
         }
         b = b.next;
+    }
+    // the carries and borrows of multi-word additions and subtractions (adc, sbc)
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            mark_carry(i);
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+// x + (p <u q) where p = q + r (the carry of a sum, which cmn q, r sets as
+// C) and x - (p <u q) (the borrow of p - q: cmp p, q leaves C clear when
+// p <u q), of 64-bit integers, the comparison and its zero-extension used
+// only there: adc and sbc (F_ADC; the parts marked 4); x itself, if it is y
+// + w (y - w) used only there, the adc's (sbc's) operands. cgen_wint.ax
+// makes these idioms.
+const F_ADC: i32 = 4096;
+
+fn carry_part(z: *mut ir.Value, i: *ir.Value, sub: bool) bool {
+    if not ir.is_op(z, ir.OP_ZEXT) or (z.uses != 1) or (z.blk != i.blk) or (z.ty != i.ty) or (z.flag != 0) {
+        return false;
+    }
+    let c = z.a;
+    if (c.kind != ir.V_INST) or (c.op != ir.OP_ICMP) or (c.cv != @as(u64, @bit_cast(u32, ir.IntULT))) or
+       (c.uses != 1) or (c.blk != i.blk) or (c.flag != 0) {
+        return false;
+    }
+    let p = c.a;
+    if (p.ty.kind != ir.T_INT) or (p.ty.bits != 64) {
+        return false;
+    }
+    if sub {
+        return true;
+    }
+    if not ir.is_op(p, ir.OP_ADD) or ((p.a != c.b) and (p.b != c.b)) {
+        return false;
+    }
+    // (cmn reads p's other operand, which must have a register: not a part
+    // of another carry's adc, which is marked before)
+    let mut r = p.b;
+    if p.b == c.b {
+        r = p.a;
+    }
+    return (r.kind != ir.V_INST) or ((r.flag & 4) == 0);
+}
+
+fn mark_carry(i: *mut ir.Value) void {
+    let sub = i.op == ir.OP_SUB;
+    if (not sub and (i.op != ir.OP_ADD)) or (i.ty.kind != ir.T_INT) or (i.ty.bits != 64) or (i.flag != 0) {
+        return;
+    }
+    let mut z = i.b;
+    let mut x = i.a;
+    if not carry_part(z, i, sub) {
+        if sub or not carry_part(i.a, i, sub) {
+            return;
+        }
+        z = i.a;
+        x = i.b;
+    }
+    z.flag = z.flag | 4;
+    z.a.flag = z.a.flag | 4;
+    i.flag = i.flag | F_ADC;
+    if (x.kind == ir.V_INST) and (x.op == i.op) and (x.uses == 1) and (x.blk == i.blk) and (x.flag == 0) and
+       (x.ty == i.ty) and ((x.a.kind != ir.V_INST) or (x.a.flag == 0)) and
+       ((x.b.kind != ir.V_INST) or (x.b.flag == 0)) {
+        x.flag = x.flag | 4;
+    }
+}
+
+fn gen_carry(v: *mut ir.Value) void {
+    let sub = v.op == ir.OP_SUB;
+    let mut z = v.b;
+    let mut x = v.a;
+    if not sub and ((v.b.kind != ir.V_INST) or ((v.b.flag & 4) == 0)) {
+        z = v.a;
+        x = v.b;
+    }
+    let c = z.a;
+    let mut y = x;
+    let mut w = ir.vnil();
+    if (x.kind == ir.V_INST) and ((x.flag & 4) != 0) {
+        y = x.a;
+        w = x.b;
+    }
+    // (every register first: then the flags, then the instruction that reads them)
+    let mut f1 = c.a;
+    let mut f2 = c.b;
+    if not sub {
+        // cmn q, r: C is the carry of q + r = p
+        f1 = c.b;
+        f2 = c.a.b;
+        if c.a.b == c.b {
+            f2 = c.a.a;
+        }
+    }
+    let r1 = reg(f1);
+    let r2 = reg(f2);
+    let ry = reg(y);
+    let mut rw: i32 = -1;
+    if u.notnil(w) {
+        rw = reg(w);
+    }
+    let d = vreg(v);
+    // (p = q + r or p - q just made by a plain add or sub of these registers:
+    // that instruction sets the flags instead, adds or subs)
+    let last = CB.last;
+    let mut fresh = false;
+    if u.notnil(last) and (last.op == RAW) and (last.ops.len >= 3) and (last.ops[1].kind == mc.K_REG) and
+       (last.ops[2].kind == mc.K_REG) and (last.ops[0].kind == mc.K_REG) {
+        let wd = @bit_cast(u64, last.aux);
+        let n = last.ops[1].reg;
+        let m = last.ops[2].reg;
+        // (adds of q and r: C is the carry of q + r; subs of p and q: C is p >= q;
+        // whichever register gets the result)
+        let ops_ok = ((n == r1) and (m == r2)) or (not sub and (n == r2) and (m == r1));
+        fresh = (wd == ae.addsub_reg(1, sub, false, 0, 0, 0, 0, 0)) and ops_ok;
+    }
+    if fresh {
+        last.aux = last.aux | (@as(i64, 1) << 29);
+    } else {
+        _ = raw(ae.addsub_reg(1, sub, true, 31, 0, 0, 0, 0), NONE(), R(r1), R(r2), NONE());
+    }
+    // adc (sbc) d, y, w (or xzr)
+    let mut word: u64 = 0x9A00_0000;
+    if sub {
+        word = 0xDA00_0000;
+    }
+    if rw < 0 {
+        _ = raw(word | (31 << 16), W(d), R(ry), NONE(), NONE());
+    } else {
+        raw3(word, d, ry, rw);
     }
 }
 

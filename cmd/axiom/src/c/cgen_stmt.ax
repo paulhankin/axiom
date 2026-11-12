@@ -24,12 +24,14 @@ import "cgen_flow.ax" as flow;
 import "cgen_ld.ax" as gld;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
+import "cgen_wint.ax" as cgw;
 import "csema.ax" as cs;
 import "csema_attr.ax" as catr;
 import "csema_gnu.ax" as cgn;
 import "csema_stmt.ax" as css;
 import "csema_vla.ax" as svla;
 import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
 
 struct Jump {
     brk: *mut ir.Block,
@@ -422,6 +424,8 @@ fn init_local(s: *mut cast.CSym, p: *mut ir.Value) void {
             _ = ir.memop(cg.B, ir.OP_MEMCPY, at, cg.string_addr(it.e), cg.usz(n * es));
         } else if cty.is_wide(t) {
             gld.copy(at, gx.rv(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
+        } else if cty.is_wint(t) and u.isnil(it.bits) {
+            cgw.copy(t, at, gx.rv(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
         } else if cty.is_record(t) {
             gx.copy(t, at, gx.rv(it.e));
         } else if u.notnil(it.bits) {
@@ -540,6 +544,10 @@ fn for_stmt(s: *mut cast.Stmt) void {
 fn switch_stmt(s: *mut cast.Stmt) void {
     cg.continue_after();
     let v = gx.rv(s.e);
+    if cty.is_wint(s.e.ty) {
+        wide_switch(s, v);
+        return;
+    }
     let done = cg.new_block("endswitch");
     let mut dflt = done;
     let blocks = u.newn.[*mut ir.Block](s.cases.len + 1);
@@ -585,6 +593,84 @@ fn switch_stmt(s: *mut cast.Stmt) void {
     cg.at_end(done);
 }
 
+// A switch on a value v wider than 64 bits (its address): for each value of
+// the limbs above the first that some case has, a comparison of those, then
+// a switch on the first limb among those cases (csema_stmt.wide_case: no
+// ranges).
+fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
+    let t = s.e.ty;
+    let n = cty.limbs(t);
+    let done = cg.new_block("endswitch");
+    let mut dflt = done;
+    let nc = s.cases.len;
+    let blocks = u.newn.[*mut ir.Block](nc + 1);
+    let vals = u.newn.[[]u64](nc + 1);
+    for i in 0..nc {
+        let c = s.cases.get(i);
+        let b = cg.new_block(u.pick(c.kind == cast.StmtKind.CASE, "case", "default"));
+        blocks[i] = b;
+        BD.cases.put(u.addr_key(@int_from_ptr(c)), b);
+        if c.kind == cast.StmtKind.DEFAULT {
+            dflt = b;
+        } else {
+            vals[i] = cw.value(c.e, n);
+        }
+    }
+    let lo = cgw.limb(v, 0);
+    let mut seen = u.List.[usize].empty();  // (a case of each group: its first)
+    for i in 0..nc {
+        if s.cases.get(i).kind != cast.StmtKind.CASE {
+            continue;
+        }
+        let mut grouped = false;
+        for j in seen.items() {
+            if same_upper(vals[i], vals[j], n) {
+                grouped = true;
+            }
+        }
+        if grouped {
+            continue;
+        }
+        seen.push(i);
+        // the limbs above the first equal to this group's?
+        let mut d = ir.cint(ir.t_int(64), 0);
+        for k in 1..n {
+            d = ir.or_(cg.B, d, ir.xor(cg.B, cgw.limb(v, k), ir.cint(ir.t_int(64), vals[i][k])));
+        }
+        let yes = cg.new_block("wcase");
+        let no = cg.new_block("wnext");
+        ir.condbr(cg.B, ir.icmp(cg.B, ir.IntEQ, d, ir.cint(ir.t_int(64), 0)), yes, no);
+        cg.at_end(yes);
+        let mut vs = u.List.[u64].empty();
+        let mut bs = u.List.[*mut ir.Block].empty();
+        for k in i..nc {
+            if (s.cases.get(k).kind == cast.StmtKind.CASE) and same_upper(vals[k], vals[i], n) {
+                vs.push(vals[k][0]);
+                bs.push(blocks[k]);
+            }
+        }
+        flow.switch_to(lo, false, vs.items(), bs.items(), dflt);
+        cg.at_end(no);
+    }
+    cg.br(dflt);
+    cg.at_end(cg.new_block("switchbody"));
+    BD.jumps.push(Jump.{ brk: done, cont: u.nil.[ir.Block](), brk_depth: gv.depth(), cont_depth: gv.depth() });
+    stmt(s.body);
+    _ = BD.jumps.pop();
+    cg.br(done);
+    cg.at_end(done);
+}
+
+// Are the limbs of a and b above the first the same?
+fn same_upper(a: []u64, b: []u64, n: usize) bool {
+    for k in 1..n {
+        if a[k] != b[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn return_stmt(s: *mut cast.Stmt) void {
     let F = cg.F;
     cg.continue_after();
@@ -599,7 +685,7 @@ fn return_stmt(s: *mut cast.Stmt) void {
         ir.ret_void(cg.B);
         return;
     }
-    if gv.has_cleanups() and cty.is_record(F.ret) {
+    if gv.has_cleanups() and (cty.is_record(F.ret) or cty.is_wint(F.ret)) {
         // (the value copied before the cleanups run)
         let tmp = cg.alloca(F.ret, "retval");
         gx.copy(F.ret, tmp, v);

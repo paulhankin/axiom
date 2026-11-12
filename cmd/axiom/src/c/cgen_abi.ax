@@ -38,6 +38,18 @@
 // _Complex the class COMPLEX_X87 when long double is the x87 type: in
 // memory as an argument, its result in st(0) and st(1) (R_X87).
 //
+// An integer wider than 64 bits (cty.is_wint: __int128, _BitInt(N) for N >
+// 64) is a value in memory too, and travels as a structure of its 64-bit
+// limbs would, aligned as it is (16 bytes for __int128 on every target and
+// _BitInt on AArch64, else 8): x86-64 System V's two INTEGER eightbytes in
+// two registers (both or neither) or MEMORY when larger (psABI 3.2.3, the
+// rules of __int128 and _BitInt(N)); AAPCS64's two general registers from
+// an even-numbered one (NGRN rounded up, the stack 16-aligned: C.8, C.12),
+// by reference when larger; Windows x64 by reference (not 1, 2, 4 or 8
+// bytes), its result through the hidden pointer, but __int128's in xmm0;
+// WebAssembly as two i64s when 16 bytes, by reference when larger, its
+// result through the pointer.
+//
 // A long double wider than double (cty.is_wide) is a value in memory, as a
 // structure is, and travels as the ABIs say for its format: the x87's
 // (System V classes X87 and X87UP) in memory, its result in st(0)
@@ -218,7 +230,7 @@ fn int_piece(n: u64) *mut ir.Ty {
 /// Does a value of type t travel as an aggregate (its memory: a structure,
 /// a union, a complex type, or a wide long double)?
 pub fn aggregate(t: *cty.CType) bool {
-    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t);
+    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t) or cty.is_wint(t);
 }
 
 // -----------------------------------------------------------------------------
@@ -392,11 +404,22 @@ fn classify_sysv(t: *cty.CType) Classes {
     let mut r = Classes.{ n: @truncate(usize, (size + 7) / 8), c: [C_NONE, C_NONE], fsize: [0, 0], x87: false };
     for i in 0..l.n {
         let x = l.xs[i];
-        if (x.size > 0) and ((x.off % x.size) != 0) {
+        if (x.size > 0) and (x.size <= 16) and ((x.off % x.size) != 0) and (x.fp or (x.size <= 8)) {
             return mem;  // (an unaligned member)
         }
         let k = @truncate(usize, x.off / 8);
         if k >= r.n {
+            continue;
+        }
+        if not x.fp and (x.size > 8) {
+            // an integer wider than 64 bits: INTEGER eightbytes (an
+            // unaligned one: MEMORY)
+            if (x.off % 8) != 0 {
+                return mem;
+            }
+            for j in k..@min(r.n, k + @truncate(usize, x.size / 8)) {
+                r.c[j] = merge(r.c[j], C_INT);
+            }
             continue;
         }
         if x.size == 16 {
@@ -472,6 +495,32 @@ fn wasm_quad(t: *cty.CType) bool {
     return true;
 }
 
+// Is t an integer of 16 bytes (wider than 64 bits), or a structure or union
+// that is one (a WebAssembly single-element structure): two i64s there?
+fn wasm_wint(t: *cty.CType) bool {
+    if cty.size_of(t) != 16 {
+        return false;
+    }
+    if cty.is_wint(t) {
+        return true;
+    }
+    if not cty.is_record(t) {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    if not l.ok or (l.n == 0) {
+        return false;
+    }
+    for i in 0..l.n {
+        let x = l.xs[i];
+        if (x.off != 0) or (x.size != 16) or x.fp {
+            return false;
+        }
+    }
+    return true;
+}
+
 // The type of a WebAssembly single-scalar structure or union (a member, or
 // a member of one, that is all of it), or nil.
 fn single_scalar(t: *cty.CType) *mut ir.Ty {
@@ -486,7 +535,7 @@ fn single_scalar(t: *cty.CType) *mut ir.Ty {
             return u.nil.[ir.Ty]();
         }
     }
-    if (x.off != 0) or (x.size != cty.size_of(t)) {
+    if (x.off != 0) or (x.size != cty.size_of(t)) or (x.size > 8) {
         return u.nil.[ir.Ty]();
     }
     // (a union of a float and an int of one size is not one scalar)
@@ -911,16 +960,16 @@ fn stack_bytes(b: *mut Builder, size: u64, packed: bool) void {
 fn wasm_arg(b: *mut Builder, i: usize, in_buffer: bool) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
-    if wasm_quad(t) {
-        // binary128 (alone, or all of a structure): two i64s
+    if wasm_quad(t) or wasm_wint(t) {
+        // binary128 or a 128-bit integer (alone, or all of a structure): two i64s
         a.kind = A_PIECES;
         set_n(a, 2);
         a.pieces[0] = Piece.{ ty: ir.t_int(64), off: 0 };
         a.pieces[1] = Piece.{ ty: ir.t_int(64), off: 8 };
         a.span = 16;
         if in_buffer {
-            // (16 bytes, aligned to 16)
-            let off = cty.round_up(b.soff, 16);
+            // (16 bytes, aligned to 16; an integer's to its alignment)
+            let off = cty.round_up(b.soff, @max(cty.align_of(t), 8));
             a.va_off = off;
             a.slot[0] = -1;
             a.slot[1] = -1;
@@ -1001,6 +1050,15 @@ fn set_result(b: *mut Builder) void {
         return;
     }
     if ab == ABI_WIN {
+        let k = t.unq.kind;
+        if (k == cty.TK_INT128) or (k == cty.TK_UINT128) {
+            // (__int128's result is in xmm0 on Windows x64)
+            set_n(a, 1);
+            a.pieces[0] = Piece.{ ty: quad_ty(), off: 0 };
+            a.span = 16;
+            set_pieces_result(b, a);
+            return;
+        }
         if (size == 1) or (size == 2) or (size == 4) or (size == 8) {
             set_n(a, 1);
             a.pieces[0] = Piece.{ ty: int_piece(size), off: 0 };
@@ -1038,7 +1096,7 @@ fn set_result(b: *mut Builder) void {
         return;
     }
     let st = single_scalar(t);
-    if u.notnil(st) and not wasm_quad(t) {
+    if u.notnil(st) and not wasm_quad(t) and not wasm_wint(t) {
         set_n(a, 1);
         a.pieces[0] = Piece.{ ty: st, off: 0 };
         a.span = st.size;

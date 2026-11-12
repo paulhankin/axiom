@@ -1,18 +1,23 @@
 // =============================================================================
 // csema_bitint.ax - the bit-precise integer types of C23 (6.2.5p6, 6.7.2):
 // the type specifier _BitInt(N) with its width's constraints, and the type
-// of an integer constant with a wb or uwb suffix (6.4.4.1p5). The types
-// themselves, their ranks and storage, are ctypes.ax's (bitint); BITINT_MAXWIDTH
-// is 64, as <limits.h> says.
+// of an integer constant with a wb or uwb suffix (6.4.4.1p5), whose value
+// may be wider than 64 bits (read here from its digits: cwide.ax holds it).
+// The types themselves, their ranks and storage, are ctypes.ax's (bitint);
+// BITINT_MAXWIDTH is 65535, as <limits.h> says.
 //
 // Diagnostics:
 //   C3210  a _BitInt width out of range (at least 2, 1 for unsigned _BitInt; at most BITINT_MAXWIDTH)
 //   C3211  an integer constant with a wb or uwb suffix too large for any bit-precise type
+//   C3212  (csema_expr.ice) an integer constant expression wider than 64 bits where at most 64 are needed
 // =============================================================================
 import "../util.ax" as u;
+import "cast.ax" as cast;
 import "csema.ax" as cs;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
+import "std/c/rt/wideint" as wi;
 
 /// The width of _BitInt(e) as an i32, from e's value v (signed: sg), with
 /// anything out of range mapped to -1 or BITINT_MAXWIDTH + 1.
@@ -48,23 +53,52 @@ pub fn bitint_type(n: i32, sg: bool, sp: u.Span) *mut cty.CType {
     return cty.bitint(n, sg);
 }
 
-// The number of bits value v needs (0 for 0).
-fn bit_length(v: u64) i32 {
-    let mut n: i32 = 0;
-    let mut x = v;
-    while x != 0 {
-        n += 1;
-        x = x >> 1;
+// The value of the digits of integer constant t (base t.base, after its
+// prefix, with digit separators) as limbs, enough of them to hold it.
+fn digits_value(t: *ct.Token) []mut u64 {
+    let s = t.text;
+    let n = (s.len / 16) + 2;  // (4 bits a digit at most: 16 digits a limb)
+    let v = cw.zeros(n);
+    let b = @as(u64, @bit_cast(u32, t.base));
+    let mut i: usize = 0;
+    if (t.base == 16) or (t.base == 2) {
+        i = 2;
     }
-    return n;
+    while i < s.len {
+        let c = s[i];
+        i += 1;
+        if c == '\'' {
+            continue;
+        }
+        let mut d: u64 = 0;
+        if (c >= '0') and (c <= '9') {
+            d = @as(u64, c - '0');
+        } else if (t.base == 16) and (c >= 'a') and (c <= 'f') {
+            d = @as(u64, (c - 'a') + 10);
+        } else if (t.base == 16) and (c >= 'A') and (c <= 'F') {
+            d = @as(u64, (c - 'A') + 10);
+        } else {
+            break;  // (the suffix)
+        }
+        // v = v * b + d, a 32-bit half at a time
+        let mut carry = d;
+        for k in 0..n {
+            let lo = ((v[k] & 0xFFFF_FFFF) * b) + carry;
+            let hi = ((v[k] >> 32) * b) + (lo >> 32);
+            v[k] = (lo & 0xFFFF_FFFF) | (hi << 32);
+            carry = hi >> 32;
+        }
+    }
+    return v;
 }
 
 /// The type of integer constant t with a wb suffix (_BitInt of the least
 /// width, at least 2, that holds its value, which is not negative) or uwb
 /// (unsigned _BitInt of the least width, at least 1); the error type if
-/// there is none (reported at sp).
-pub fn const_type(t: *ct.Token, sp: u.Span) *mut cty.CType {
-    let mut n = bit_length(t.ival);
+/// there is none (reported at sp). e: the constant, whose value is set.
+pub fn const_type(t: *ct.Token, sp: u.Span, e: *mut cast.Expr) *mut cty.CType {
+    let v = digits_value(t);
+    let mut n = @int_cast(i32, (@as(u64, v.len) * 64) - wi.wi_clz(&v[0], v.len));
     if t.unsigned_ {
         if n == 0 {
             n = 1;
@@ -82,5 +116,17 @@ pub fn const_type(t: *ct.Token, sp: u.Span) *mut cty.CType {
                    u.pick(t.unsigned_, "unsigned _BitInt(BITINT_MAXWIDTH)", "_BitInt(BITINT_MAXWIDTH)")));
         return cty.t_error;
     }
-    return cty.bitint(n, not t.unsigned_);
+    let bt = cty.bitint(n, not t.unsigned_);
+    e.ty = bt;
+    if cty.is_wint(bt) {
+        let r = cw.zeros(cty.limbs(bt));
+        for k in 0..@min(r.len, v.len) {
+            r[k] = v[k];
+        }
+        cw.set(e, r);
+    } else {
+        e.is_const = true;
+        e.cval = cty.wrap(bt, v[0]);
+    }
+    return bt;
 }

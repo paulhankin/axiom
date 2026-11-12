@@ -16,9 +16,13 @@
 // signed or unsigned, int is 16, 32 or 64 bits, long 32 or 64; short is 16
 // bits and long long 64. The bit-precise integer types (C23 _BitInt(N),
 // TK_BITINT, made once per width and signedness) have N bits, N at most
-// BITINT_MAXWIDTH (64); an object of one is stored in the smallest of 8, 16,
-// 32 and 64 bits that holds it (storage_bits), its value sign- or
-// zero-extended there. A complex type (TK_COMPLEX, made once for each real
+// BITINT_MAXWIDTH (65535); an object of one is stored in the smallest of 8,
+// 16, 32 and 64 bits that holds it, or for N > 64 in 64-bit limbs (as many as
+// hold it, an even number on AArch64: storage_bits), its value sign- or
+// zero-extended there. The GNU dialects' __int128 and unsigned __int128
+// (TK_INT128, TK_UINT128) are 128 bits, an extended integer type ranked
+// above long long. An integer type wider than 64 bits (is_wint) is a value
+// in memory to cgen (cgen_wint.ax), as a structure is. A complex type (TK_COMPLEX, made once for each real
 // floating type: complex_of) is laid out as an array of two elements of its
 // corresponding real type (`elem`), the real part first (6.2.5p13). Integer sizes and alignments are their storage widths in bytes,
 // as for every scalar on the targets (wasm32, wasm64, x86-64, AArch64), so a
@@ -57,9 +61,11 @@ pub const TK_UNION: i32 = 22;
 pub const TK_BITINT: i32 = 23;   // _BitInt(N), unsigned _BitInt(N) (C23): an integer type of `bits` bits
 pub const TK_NULLPTR: i32 = 24;  // nullptr_t (C23): a scalar type whose one value is a null pointer
 pub const TK_COMPLEX: i32 = 25;  // float/double/long double _Complex (C99 6.2.5p11): `elem` is the real type
+pub const TK_INT128: i32 = 26;   // __int128 (a GNU dialect): an extended integer type of 128 bits
+pub const TK_UINT128: i32 = 27;  // unsigned __int128
 
 /// The largest N of _BitInt(N) (<limits.h>'s BITINT_MAXWIDTH).
-pub const BITINT_MAXWIDTH: i32 = 64;
+pub const BITINT_MAXWIDTH: i32 = 65535;
 
 // Qualifiers (CType.quals): as cast.Q_.
 pub const Q_CONST: i32 = 1;
@@ -182,10 +188,19 @@ pub let mut t_nullptr: *mut CType = @ptr_from_int(*mut CType, 0);  // nullptr_t 
 pub let mut t_cfloat: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_cdouble: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_cldouble: *mut CType = @ptr_from_int(*mut CType, 0);
+// __int128, unsigned __int128 (a GNU dialect)
+pub let mut t_int128: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_uint128: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut ptr_bytes: u64 = 8;
 // the bit-precise integer types made so far, by width (signed, unsigned)
-// [n]: _BitInt(n); [65 + n]: unsigned _BitInt(n)
+// [n]: _BitInt(n); [65 + n]: unsigned _BitInt(n), for n <= 64; the wider
+// ones in g_wide_bitint
 let mut g_bitint: u.List.[*mut CType] = u.List.[*mut CType].{ data: @ptr_from_int(*mut *mut CType, 0), len: 0, cap: 0 };
+let mut g_wide_bitint: u.List.[*mut CType] = u.List.[*mut CType].{ data: @ptr_from_int(*mut *mut CType, 0), len: 0,
+                                                                   cap: 0 };
+/// Whether the unit has used an integer type wider than 64 bits (whose
+/// operations may need std/c/rt/wideint.ax).
+pub let mut g_used_wint: bool = false;
 
 fn new_type(k: i32) *mut CType {
     let t = u.new.[CType]();
@@ -258,6 +273,10 @@ pub fn init(o: *co.COptions) void {
         _ = i;
         g_bitint.push(u.nil.[CType]());
     }
+    g_wide_bitint = u.List.[*mut CType].empty();
+    // (above long long, and above _BitInt(128): bitint)
+    t_int128 = int_type(TK_INT128, 128, true, WIDE_RANK + (2 * 128) + 1);
+    t_uint128 = int_type(TK_UINT128, 128, false, WIDE_RANK + (2 * 128) + 1);
     // size_t and ptrdiff_t: the platform's type as wide as a pointer
     // (copts.size_type, as <stddef.h> has it); wchar_t: (unsigned) short
     // when 16 bits, else int, or long when int is 16 bits (as <stddef.h> says)
@@ -293,6 +312,11 @@ fn of_rank(r: i32, signed: bool) *mut CType {
 }
 
 const RANK_STEP: i32 = 100;
+// The ranks of the integer types wider than 64 bits: WIDE_RANK + 2N for
+// _BitInt(N), one more for __int128 (C23 6.3.1.1p1 leaves the order of a
+// bit-precise and an extended integer type of one width to the
+// implementation).
+const WIDE_RANK: i32 = 7 * RANK_STEP;
 
 fn complex_type(r: *mut CType) *mut CType {
     let t = new_type(TK_COMPLEX);
@@ -328,6 +352,17 @@ pub fn real_of(t: *mut CType) *mut CType {
 /// standard integer type narrower than n bits and below every other's, and
 /// grows with n.
 pub fn bitint(n: i32, sg: bool) *mut CType {
+    if n > 64 {
+        g_used_wint = true;
+        for t in g_wide_bitint.items() {
+            if (t.bits == n) and (t.is_signed == sg) {
+                return t;
+            }
+        }
+        let t = int_type(TK_BITINT, n, sg, WIDE_RANK + (2 * n));
+        g_wide_bitint.push(t);
+        return t;
+    }
     let mut k = @int_cast(usize, n);
     if not sg {
         k += 65;
@@ -358,15 +393,26 @@ pub fn bitint(n: i32, sg: bool) *mut CType {
 /// The type __int128 (sg) or unsigned __int128 of a GNU dialect, or nil
 /// if the implementation has none.
 pub fn int128(sg: bool) *mut CType {
-    _ = sg;
-    return u.nil.[CType]();
+    g_used_wint = true;
+    if sg {
+        return t_int128;
+    }
+    return t_uint128;
 }
 
 /// The width of the storage of an integer, floating or pointer type's
 /// values (a bit-precise integer type's: the smallest of 8, 16, 32 and 64
-/// bits that holds it).
+/// bits that holds it; wider, a number of 64-bit limbs: the x86-64 System V
+/// psABI's and Windows' "array of 8-byte chunks", AAPCS64's of 16-byte ones).
 pub fn storage_bits(t: *CType) i32 {
     if t.kind == TK_BITINT {
+        if t.bits > 64 {
+            let mut n = (t.bits + 63) / 64;
+            if (g_opts.bitint_align == 16) and ((n % 2) == 1) {
+                n += 1;
+            }
+            return n * 64;
+        }
         let mut w: i32 = 8;
         while w < t.bits {
             w *= 2;
@@ -374,6 +420,18 @@ pub fn storage_bits(t: *CType) i32 {
         return w;
     }
     return t.bits;
+}
+
+/// Is t an integer type wider than 64 bits (__int128, _BitInt(N) with N >
+/// 64)? Its values are 64-bit limbs in memory (cgen_wint.ax).
+pub fn is_wint(t: *CType) bool {
+    let k = t.unq.kind;
+    return (k == TK_INT128) or (k == TK_UINT128) or ((k == TK_BITINT) and (t.unq.bits > 64));
+}
+
+/// The 64-bit limbs of a value of an integer type wider than 64 bits.
+pub fn limbs(t: *CType) usize {
+    return @int_cast(usize, storage_bits(t.unq) / 64);
 }
 
 /// The standard in force.
@@ -598,7 +656,7 @@ pub fn round_up(x: u64, a: u64) u64 {
 
 /// An integer type (6.2.5p17: char, the signed and unsigned integer types, enumerations).
 pub fn is_integer(t: *CType) bool {
-    return ((t.kind >= TK_BOOL) and (t.kind <= TK_ENUM)) or (t.kind == TK_BITINT);
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_ENUM)) or (t.kind == TK_BITINT) or (t.kind >= TK_INT128);
 }
 
 /// A bit-precise integer type (_BitInt).
@@ -636,18 +694,19 @@ pub fn is_complex(t: *CType) bool {
 
 /// A real type (6.2.5p18): an integer or real floating type.
 pub fn is_real(t: *CType) bool {
-    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT);
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT) or (t.kind >= TK_INT128);
 }
 
 /// An arithmetic type: integer or floating (real or complex).
 pub fn is_arith(t: *CType) bool {
-    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT) or (t.kind == TK_COMPLEX);
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT) or (t.kind == TK_COMPLEX) or
+           (t.kind >= TK_INT128);
 }
 
 /// A scalar type: arithmetic, pointer or nullptr_t.
 pub fn is_scalar(t: *CType) bool {
     return ((t.kind >= TK_BOOL) and (t.kind <= TK_POINTER)) or (t.kind == TK_BITINT) or (t.kind == TK_NULLPTR) or
-           (t.kind == TK_COMPLEX);
+           (t.kind == TK_COMPLEX) or (t.kind >= TK_INT128);
 }
 
 pub fn is_pointer(t: *CType) bool {
@@ -749,6 +808,12 @@ pub fn align_of(t: *CType) u64 {
     let mut a = size_of(t);
     if (k == TK_STRUCT) or (k == TK_UNION) {
         a = t.tag.align;
+    } else if (k == TK_INT128) or (k == TK_UINT128) {
+        a = 16;  // (every ABI's __int128)
+    } else if (k == TK_BITINT) and (t.bits > 64) {
+        // (8 bytes on x86-64 and Windows, whose psABIs make it an array of
+        // 8-byte chunks, and on WebAssembly; 16 on AArch64: AAPCS64)
+        a = @as(u64, @bit_cast(u32, g_opts.bitint_align));
     } else if k == TK_COMPLEX {
         a = align_of(t.elem);
     } else if a == 0 {
@@ -815,10 +880,14 @@ pub fn wrap(t: *CType, x: u64) u64 {
     return wrap_bits(x, t.bits, t.is_signed);
 }
 
-/// The largest value of integer type t, as bits.
+/// The largest value of integer type t, as bits (of a type wider than 64
+/// bits: the largest u64, which every such type holds).
 pub fn int_max(t: *CType) u64 {
     if t.kind == TK_BOOL {
         return 1;
+    }
+    if t.bits > 64 {
+        return 0xFFFF_FFFF_FFFF_FFFF;
     }
     if t.is_signed {
         return (@as(u64, 1) << @as(u32, @bit_cast(u32, t.bits - 1))) - 1;
@@ -832,6 +901,9 @@ pub fn int_max(t: *CType) u64 {
 /// Does integer type t hold the value v (the bits of a value of type `from`)?
 pub fn fits(t: *CType, v: u64, from_signed: bool) bool {
     let neg = from_signed and (@bit_cast(i64, v) < 0);
+    if t.bits > 64 {
+        return t.is_signed or not neg;
+    }
     if neg {
         if not t.is_signed {
             return false;
@@ -864,6 +936,9 @@ pub fn to_signed(t: *mut CType) *mut CType {
     if k == TK_ULLONG {
         return t_llong;
     }
+    if k == TK_UINT128 {
+        return t_int128;
+    }
     if k == TK_ENUM {
         return to_signed(t.unq.tag.base);
     }
@@ -890,6 +965,9 @@ pub fn to_unsigned(t: *mut CType) *mut CType {
     }
     if k == TK_LLONG {
         return t_ullong;
+    }
+    if k == TK_INT128 {
+        return t_uint128;
     }
     if k == TK_ENUM {
         return to_unsigned(t.unq.tag.base);
@@ -1256,6 +1334,12 @@ fn base_name(t: *CType) []u8 {
     }
     if k == TK_BITINT {
         return u.f2("%s_BitInt(%s)", u.pick(t.is_signed, "", "unsigned "), u.idec(t.bits));
+    }
+    if k == TK_INT128 {
+        return "__int128";
+    }
+    if k == TK_UINT128 {
+        return "unsigned __int128";
     }
     if k == TK_NULLPTR {
         return "nullptr_t";
