@@ -14,6 +14,9 @@
 - Bit-fields are laid out as the target's ABI lays them out: on AArch64 Linux unnamed
   bit-fields add to a structure's alignment, and on Windows bit-fields of different type
   sizes no longer share a storage unit. Structures with bit-fields change size there.
+- `__AXIOM_BITFIELD_LAYOUT__` says whose rules lay out bit-fields (0 System V, 1 AAPCS64,
+  2 Windows x64). Packed structures and `#pragma pack` follow the target's rules too: on
+  Windows, bit-fields keep units of their type there (now run and checked under Wine).
 - Variadic and other arguments aligned to more than 16 bytes are passed as the platforms'
   C ABIs pass them (x86-64 Linux, macOS), and `_BitInt` arguments and results from other
   compilers are read correctly.

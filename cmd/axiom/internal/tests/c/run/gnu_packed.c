@@ -1,9 +1,14 @@
 /* flags: --c-std=gnu11 */
 /* Packed structures, unions and members (the attribute packed), their
    layout, and accesses to their members at any address: through '.',
-   '->', arrays in them, nested structures, bit-fields, initializers. */
+   '->', arrays in them, nested structures, bit-fields, initializers. The
+   bit-fields' layout is the target's (Windows x64 keeps units of their
+   type): the layout numbers expected are System V's and AAPCS64's, or
+   Windows's, confirmed against the platforms' compilers. */
 #include "host.h"
 #include <stddef.h>
+
+#define LAYOUT(v, sysv, win) print_i64((v) == (__AXIOM_BITFIELD_LAYOUT__ == 2 ? (win) : (sysv)) ? 1 : -(long long)(v))
 
 struct inner { short s; int i; };
 struct __attribute__((packed)) P {
@@ -25,13 +30,14 @@ static int sum(struct P *p) {
 }
 
 int main(void) {
-    print_i64(sizeof(struct P) * 10 + _Alignof(struct P));
-    print_i64(offsetof(struct P, in) * 1000 + offsetof(struct P, l) * 100 + offsetof(struct P, arr) * 10 +
-              offsetof(struct P, tail));
+    LAYOUT(sizeof(struct P) * 10 + _Alignof(struct P), 351, 381);
+    LAYOUT(offsetof(struct P, in) * 1000 + offsetof(struct P, l) * 100 + offsetof(struct P, arr) * 10 +
+               offsetof(struct P, tail),
+           2104, 2107);
     print_i64(sizeof(union U) * 10 + _Alignof(union U));
     print_i64(sizeof(struct M) * 100 + offsetof(struct M, i) * 10 + offsetof(struct M, s));
     print_i64(sizeof(struct PA) * 10 + _Alignof(struct PA));
-    print_i64(sizeof(struct H) * 10 + offsetof(struct H, p));
+    LAYOUT(sizeof(struct H) * 10 + offsetof(struct H, p), 361, 391);
     print_i64(sum(&gp));
     struct H h;
     h.c = 0;
@@ -51,12 +57,12 @@ int main(void) {
     print_i64(un.i + un.c);
     return 0;
 }
-/* expect: 351 */
-/* expect: 2104 */
+/* expect: 1 */
+/* expect: 1 */
 /* expect: 81 */
 /* expect: 816 */
 /* expect: 84 */
-/* expect: 361 */
+/* expect: 1 */
 /* expect: 139306 */
 /* expect: 9373 */
 /* expect: 9219 */

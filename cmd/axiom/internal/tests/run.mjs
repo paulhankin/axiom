@@ -401,7 +401,8 @@ await section('', byFile(cFiles, '[c-pp]', async (f) => {
 // print through host.h (next to run/); natively its functions are
 // c/host_native.c's, compiled by the system's C compiler, or for Windows and
 // macOS c/host_c.c's, a second translation unit over the platform's C library
-// (tests marked /* linux-only */ need the former). /* units: a.c */ names more
+// (tests marked /* linux-only */ need the former; /* not-windows */ ones are
+// skipped for a Windows target). /* units: a.c */ names more
 // translation units, next to the test (c/run/abi/). AXIOM_C_TARGET=wasm64
 // builds them for wasm64 instead of wasm32. A test marked /* check-only */ is
 // only checked (axiom check, with its own --target), not built or run.
@@ -420,6 +421,8 @@ const cRunTest = async (f) => {
   const warnings = [...src.matchAll(/\/\* expect-warning: (C\d+) \*\//g)].map((m) => m[1]);
   const expect = [...src.matchAll(/^\/\* expect: ?(.*?) \*\/$/gm)].map((m) => m[1]);
   if ((native && /\/\* wasm-only \*\//.test(src)) || (!native && /\/\* native-only \*\//.test(src))) return { skip: true, reason: native ? 'wasm only' : 'native only' };
+  // (/* not-windows */: a rule of the other ABIs, whose Windows counterpart is another test)
+  if (native && /windows/.test(process.env.AXIOM_NATIVE_TARGET || '') && /\/\* not-windows \*\//.test(src)) return { skip: true, reason: 'not for Windows' };
   const out = path.join(tmp, `c-${path.basename(f, '.c')}${native ? '' : '.wasm'}`);
   if (/\/\* check-only \*\//.test(src)) {
     const c = await spawnAsync(compiler, ['check', f, `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, ...flags], { encoding: 'utf8', timeout: compileTimeout });

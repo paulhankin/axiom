@@ -1,9 +1,14 @@
 /* flags: --c-std=c11 */
 /* #pragma pack in a mode that is no GNU dialect (pragmas are in every
    mode): members aligned to at most n bytes, bit-fields placed at the next
-   bit that keeps them in an aligned unit of their own type; push and pop. */
+   bit (Windows: in units of their type aligned to at most n, whose layout
+   numbers the test expects there instead); push and pop. */
 #include "host.h"
 #include <stddef.h>
+
+/* the layout expected: System V's and AAPCS64's, or Windows x64's
+   (confirmed against the platforms' compilers) */
+#define LAYOUT(v, sysv, win) print_i64((v) == (__AXIOM_BITFIELD_LAYOUT__ == 2 ? (win) : (sysv)) ? 1 : -(long long)(v))
 
 #pragma pack(push, 2)
 struct A { char c; int b : 20; int d : 12; char e; };
@@ -16,9 +21,9 @@ struct A3 { char c; long long q; };
 struct N { char c; int x; };
 
 int main(void) {
-    print_i64(sizeof(struct A) * 10 + _Alignof(struct A));
+    LAYOUT(sizeof(struct A) * 10 + _Alignof(struct A), 62, 82);
     print_i64(sizeof(struct A2) * 100 + _Alignof(struct A2) * 10 + offsetof(struct A2, y));
-    print_i64(sizeof(struct D) * 100 + _Alignof(struct D) * 10 + offsetof(struct D, q));
+    LAYOUT(sizeof(struct D) * 100 + _Alignof(struct D) * 10 + offsetof(struct D, q), 1214, 1315);
     print_i64(sizeof(struct A3) * 10 + _Alignof(struct A3));
     print_i64(sizeof(struct N));
     struct A a = { 0 };
@@ -29,7 +34,7 @@ int main(void) {
     long long bytes = 0;
     for (unsigned i = 0; i < sizeof a; i++)
         bytes = bytes * 256 + p[i];
-    print_i64(bytes);
+    LAYOUT(bytes, 296955772681LL, 76020677806336LL);
     print_i64(a.b + a.d + a.e);
     struct D d = { 1, -5, 0x123456789abLL };
     d.q += 1;
@@ -41,12 +46,12 @@ int main(void) {
     print_i64(s);
     return 0;
 }
-/* expect: 62 */
+/* expect: 1 */
 /* expect: 826 */
-/* expect: 1214 */
+/* expect: 1 */
 /* expect: 102 */
 /* expect: 8 */
-/* expect: 296955772681 */
+/* expect: 1 */
 /* expect: 76621 */
 /* expect: -4999 */
 /* expect: 624 */

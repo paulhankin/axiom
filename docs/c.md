@@ -540,6 +540,7 @@ The compiler's own macros say what the build chose:
 | `__AXIOM_PTR_WIDTH__` | The width of a pointer: 32 or 64. |
 | `__AXIOM_WCHAR_WIDTH__` | The width of `wchar_t`: 16 or 32. |
 | `__AXIOM_WCHAR_SIGNED__` | 1 if `wchar_t` is signed, else 0. |
+| `__AXIOM_BITFIELD_LAYOUT__` | Whose rules lay out bit-fields ("Implementation-defined behavior"): 0 the System V ABI's (x86-64 Linux, macOS, WebAssembly), 1 AAPCS64's (AArch64 Linux), 2 Windows x64's. |
 | `__AXIOM_<T>_TYPE__`, `__AXIOM_<T>_MIN__`, `__AXIOM_<T>_MAX__`, `__AXIOM_<T>_WIDTH__`, `__AXIOM_<T>_C__(c)` | For `<T>` one of `SIZE`, `PTRDIFF`, `INT64`, `UINT64`, `INTMAX`, `UINTMAX`, `INT_FAST16`, `UINT_FAST16`, `INT_FAST32`, `UINT_FAST32`: the type the platform gives that typedef (`__AXIOM_SIZE_TYPE__` is `unsigned long`, ...), its limits, width and constant macro, which the headers use. `__AXIOM_WINT_TYPE__`, `_MIN__`, `_MAX__` and `_WIDTH__` are `wint_t`'s; `__AXIOM_MAX_ALIGN__` is `max_align_t`'s alignment. |
 | `__CHAR_UNSIGNED__` | 1, defined only if plain `char` is unsigned. |
 | `__AXIOM_GNU__` | 1, defined only in a GNU dialect. |
