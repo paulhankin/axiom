@@ -18,7 +18,9 @@
 // TK_BITINT, made once per width and signedness) have N bits, N at most
 // BITINT_MAXWIDTH (64); an object of one is stored in the smallest of 8, 16,
 // 32 and 64 bits that holds it (storage_bits), its value sign- or
-// zero-extended there. Integer sizes and alignments are their storage widths in bytes,
+// zero-extended there. A complex type (TK_COMPLEX, made once for each real
+// floating type: complex_of) is laid out as an array of two elements of its
+// corresponding real type (`elem`), the real part first (6.2.5p13). Integer sizes and alignments are their storage widths in bytes,
 // as for every scalar on the targets (wasm32, wasm64, x86-64, AArch64), so a
 // structure's layout is the natural one: each member at the next offset
 // that is a multiple of its alignment, the structure's alignment the largest
@@ -54,6 +56,7 @@ pub const TK_STRUCT: i32 = 21;
 pub const TK_UNION: i32 = 22;
 pub const TK_BITINT: i32 = 23;   // _BitInt(N), unsigned _BitInt(N) (C23): an integer type of `bits` bits
 pub const TK_NULLPTR: i32 = 24;  // nullptr_t (C23): a scalar type whose one value is a null pointer
+pub const TK_COMPLEX: i32 = 25;  // float/double/long double _Complex (C99 6.2.5p11): `elem` is the real type
 
 /// The largest N of _BitInt(N) (<limits.h>'s BITINT_MAXWIDTH).
 pub const BITINT_MAXWIDTH: i32 = 64;
@@ -159,6 +162,10 @@ pub let mut t_char16: *mut CType = @ptr_from_int(*mut CType, 0);   // char16_t (
 pub let mut t_char32: *mut CType = @ptr_from_int(*mut CType, 0);   // char32_t (uint_least32_t)
 pub let mut t_int64: *mut CType = @ptr_from_int(*mut CType, 0);    // __axiom_int64: long or long long
 pub let mut t_nullptr: *mut CType = @ptr_from_int(*mut CType, 0);  // nullptr_t (C23)
+// the complex types (C99): float _Complex, double _Complex, long double _Complex
+pub let mut t_cfloat: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_cdouble: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_cldouble: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut ptr_bytes: u64 = 8;
 // the bit-precise integer types made so far, by width (signed, unsigned)
 // [n]: _BitInt(n); [65 + n]: unsigned _BitInt(n)
@@ -227,6 +234,9 @@ pub fn init(o: *co.COptions) void {
     t_ldouble.bits = 64;
     t_nullptr = new_type(TK_NULLPTR);
     t_nullptr.bits = o.ptr_bits;
+    t_cfloat = complex_type(t_float);
+    t_cdouble = complex_type(t_double);
+    t_cldouble = complex_type(t_ldouble);
     g_bitint = u.List.[*mut CType].empty();
     for i in @as(usize, 0)..130 {
         _ = i;
@@ -265,6 +275,35 @@ pub fn init(o: *co.COptions) void {
 }
 
 const RANK_STEP: i32 = 100;
+
+fn complex_type(r: *mut CType) *mut CType {
+    let t = new_type(TK_COMPLEX);
+    t.elem = r;
+    t.bits = r.bits;
+    return t;
+}
+
+/// The complex type whose corresponding real type is the real floating
+/// type r (6.2.5p11).
+pub fn complex_of(r: *mut CType) *mut CType {
+    let k = r.unq.kind;
+    if k == TK_FLOAT {
+        return t_cfloat;
+    }
+    if k == TK_LDOUBLE {
+        return t_cldouble;
+    }
+    return t_cdouble;
+}
+
+/// The corresponding real type (6.2.5p11, 6.3.1.8) of an arithmetic type:
+/// a complex type's element type, a real type itself (unqualified).
+pub fn real_of(t: *mut CType) *mut CType {
+    if t.unq.kind == TK_COMPLEX {
+        return t.unq.elem;
+    }
+    return t.unq;
+}
 
 /// The bit-precise integer type _BitInt(n) (signed) or unsigned _BitInt(n),
 /// 1 <= n <= BITINT_MAXWIDTH. Its rank (6.3.1.1p1) is above that of every
@@ -542,18 +581,31 @@ pub fn is_nullptr(t: *CType) bool {
     return t.kind == TK_NULLPTR;
 }
 
+/// A real floating type: float, double, long double (not a complex type,
+/// although C calls those floating too: 6.2.5p11).
 pub fn is_floating(t: *CType) bool {
     return (t.kind >= TK_FLOAT) and (t.kind <= TK_LDOUBLE);
 }
 
-/// An arithmetic type: integer or floating.
-pub fn is_arith(t: *CType) bool {
+/// A complex type (float, double or long double _Complex).
+pub fn is_complex(t: *CType) bool {
+    return t.kind == TK_COMPLEX;
+}
+
+/// A real type (6.2.5p18): an integer or real floating type.
+pub fn is_real(t: *CType) bool {
     return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT);
+}
+
+/// An arithmetic type: integer or floating (real or complex).
+pub fn is_arith(t: *CType) bool {
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT) or (t.kind == TK_COMPLEX);
 }
 
 /// A scalar type: arithmetic, pointer or nullptr_t.
 pub fn is_scalar(t: *CType) bool {
-    return ((t.kind >= TK_BOOL) and (t.kind <= TK_POINTER)) or (t.kind == TK_BITINT) or (t.kind == TK_NULLPTR);
+    return ((t.kind >= TK_BOOL) and (t.kind <= TK_POINTER)) or (t.kind == TK_BITINT) or (t.kind == TK_NULLPTR) or
+           (t.kind == TK_COMPLEX);
 }
 
 pub fn is_pointer(t: *CType) bool {
@@ -628,6 +680,9 @@ pub fn size_of(t: *CType) u64 {
     if (k == TK_DOUBLE) or (k == TK_LDOUBLE) {
         return 8;
     }
+    if k == TK_COMPLEX {
+        return 2 * size_of(t.elem);  // (6.2.5p13: an array of two of the real type)
+    }
     if k == TK_ARRAY {
         if not t.has_len {
             return 0;
@@ -643,7 +698,7 @@ pub fn size_of(t: *CType) u64 {
 /// The alignment of an object type (1 for others).
 pub fn align_of(t: *CType) u64 {
     let k = t.kind;
-    if k == TK_ARRAY {
+    if (k == TK_ARRAY) or (k == TK_COMPLEX) {
         return align_of(t.elem);
     }
     if (k == TK_STRUCT) or (k == TK_UNION) {
@@ -797,9 +852,29 @@ pub fn arg_promote(t: *mut CType) *mut CType {
     return promote(t);
 }
 
-/// The common real type of the usual arithmetic conversions (6.3.1.8) of
-/// two arithmetic types.
+/// The common type of the usual arithmetic conversions (6.3.1.8) of two
+/// arithmetic types: their common real type, or with a complex operand the
+/// complex type of the common real type of their corresponding real types.
+/// (An operand is converted to the common real type in its own type domain:
+/// domain_type.)
 pub fn common_type(a0: *mut CType, b0: *mut CType) *mut CType {
+    if (a0.unq.kind == TK_COMPLEX) or (b0.unq.kind == TK_COMPLEX) {
+        return complex_of(common_real(real_of(a0), real_of(b0)));
+    }
+    return common_real(a0, b0);
+}
+
+/// The type an operand of type t is converted to by the usual arithmetic
+/// conversions whose common type is c (6.3.1.8p1: "without change of type
+/// domain"): c's corresponding real type for a real operand, else c.
+pub fn domain_type(t: *mut CType, c: *mut CType) *mut CType {
+    if (c.unq.kind == TK_COMPLEX) and (t.unq.kind != TK_COMPLEX) {
+        return c.unq.elem;
+    }
+    return c;
+}
+
+fn common_real(a0: *mut CType, b0: *mut CType) *mut CType {
     let a = promote(a0);
     let b = promote(b0);
     if (a.kind == TK_LDOUBLE) or (b.kind == TK_LDOUBLE) {
@@ -1077,6 +1152,9 @@ fn base_name(t: *CType) []u8 {
     }
     if k == TK_NULLPTR {
         return "nullptr_t";
+    }
+    if k == TK_COMPLEX {
+        return u.cat2(base_name(t.elem), " _Complex");
     }
     if (k == TK_STRUCT) or (k == TK_UNION) or (k == TK_ENUM) {
         let kw = u.pick(k == TK_STRUCT, "struct", u.pick(k == TK_UNION, "union", "enum"));

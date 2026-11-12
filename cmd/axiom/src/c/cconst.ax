@@ -6,7 +6,8 @@
 //
 // An expression's value is in its Expr: is_const, and cval (an integer's
 // bits, sign- or zero-extended from its type's width: ctypes.wrap) or
-// fcval (a floating value; a float's is rounded to float). fold runs on a
+// fcval (a floating value; a float's is rounded to float; a complex value's
+// real part, its imaginary part in fcimag). fold runs on a
 // node once its operands are typed and converted, so constness is found
 // bottom-up; operations whose result is undefined (division by zero, an
 // overflowing conversion of a floating value) are left to run time. A
@@ -16,6 +17,7 @@
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "ccomplex.ax" as ccx;
 import "copts.ax" as co;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
@@ -74,21 +76,37 @@ fn set_int(e: *mut cast.Expr, v: u64) void {
 
 fn set_float(e: *mut cast.Expr, f: f64) void {
     e.is_const = true;
-    if e.ty.kind == cty.TK_FLOAT {
-        e.fcval = @as(f64, @float_cast(f32, f));
-    } else {
-        e.fcval = f;
+    e.fcval = round_to(e.ty, f);
+}
+
+// f rounded to the (corresponding real) type of t.
+fn round_to(t: *cty.CType, f: f64) f64 {
+    if (t.kind == cty.TK_FLOAT) or ((t.kind == cty.TK_COMPLEX) and (t.elem.kind == cty.TK_FLOAT)) {
+        return @as(f64, @float_cast(f32, f));
     }
+    return f;
+}
+
+// e (of a complex type) is the constant re + i im (rounded to its type).
+fn set_complex(e: *mut cast.Expr, re: f64, im: f64) void {
+    e.is_const = true;
+    e.fcval = round_to(e.ty, re);
+    e.fcimag = round_to(e.ty, im);
 }
 
 fn set_from(e: *mut cast.Expr, x: *cast.Expr) void {
     e.is_const = true;
     e.cval = x.cval;
     e.fcval = x.fcval;
+    e.fcimag = x.fcimag;
 }
 
-/// Is constant x (of arithmetic type) nonzero?
+/// Is constant x (of arithmetic type) nonzero? (A complex value is when
+/// either part is: 6.3.1.2.)
 pub fn truth(x: *cast.Expr) bool {
+    if cty.is_complex(x.ty) {
+        return (x.fcval != 0.0) or (x.fcimag != 0.0);
+    }
     if cty.is_floating(x.ty) {
         return x.fcval != 0.0;
     }
@@ -110,14 +128,34 @@ fn as_float(x: *cast.Expr) f64 {
 fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
     let to = e.ty;
     let from = x.ty;
+    if cty.is_complex(to) {
+        // (6.3.1.6, 6.3.1.7: the parts converted as the real types are; a
+        // real value's imaginary part is +0)
+        if cty.is_complex(from) {
+            set_complex(e, x.fcval, x.fcimag);
+            return;
+        }
+        let mut re = x.fcval;
+        if cty.is_integer(from) {
+            if to.elem.kind == cty.TK_FLOAT {
+                // (rounded once, from the integer)
+                re = int_to_f32(x);
+            } else {
+                re = as_float(x);
+            }
+        }
+        set_complex(e, re, 0.0);
+        return;
+    }
     if cty.is_integer(to) {
         if cty.is_integer(from) {
             set_int(e, x.cval);
             return;
         }
+        // (a complex value: its real part, 6.3.1.7p1; to _Bool, its truth)
         let f = x.fcval;
         if to.kind == cty.TK_BOOL {
-            set_int(e, selu(f != 0.0, 1, 0));
+            set_int(e, selu(truth(x), 1, 0));
             return;
         }
         // the value must fit (6.3.1.4p1); otherwise left to run time
@@ -138,22 +176,26 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
         }
         return;
     }
-    // to a floating type
-    if cty.is_floating(from) {
+    // to a real floating type (from a complex one: the real part)
+    if cty.is_floating(from) or cty.is_complex(from) {
         set_float(e, x.fcval);
         return;
     }
     if to.kind == cty.TK_FLOAT {
         // (rounded once, from the integer)
         e.is_const = true;
-        if from.is_signed {
-            e.fcval = @as(f64, @float_from_int(f32, @bit_cast(i64, x.cval)));
-        } else {
-            e.fcval = @as(f64, @float_from_int(f32, x.cval));
-        }
+        e.fcval = int_to_f32(x);
         return;
     }
     set_float(e, as_float(x));
+}
+
+// The integer constant x as a float (rounded once).
+fn int_to_f32(x: *cast.Expr) f64 {
+    if x.ty.is_signed {
+        return @as(f64, @float_from_int(f32, @bit_cast(i64, x.cval)));
+    }
+    return @as(f64, @float_from_int(f32, x.cval));
 }
 
 fn trunc_f(f: f64) f64 {
@@ -178,6 +220,16 @@ fn unary(e: *mut cast.Expr) void {
     let op = e.op;
     if op == ct.P_BANG {
         set_int(e, selu(truth(x), 0, 1));
+        return;
+    }
+    if cty.is_complex(e.ty) {
+        if op == ct.P_MINUS {
+            set_complex(e, -x.fcval, -x.fcimag);
+        } else if op == ct.P_PLUS {
+            set_complex(e, x.fcval, x.fcimag);
+        } else if op == ct.P_TILDE {
+            set_complex(e, x.fcval, -x.fcimag);  // (the conjugate: an extension)
+        }
         return;
     }
     if cty.is_floating(e.ty) {
@@ -226,6 +278,10 @@ fn binary(e: *mut cast.Expr) void {
     e.ovf = a.ovf or b.ovf;
     if is_compare(op) {
         set_int(e, selu(compare(op, a, b), 1, 0));
+        return;
+    }
+    if cty.is_complex(e.ty) {
+        complex_op(e, op, a, b);
         return;
     }
     if cty.is_floating(e.ty) {
@@ -297,6 +353,11 @@ pub fn is_compare(op: i32) bool {
 
 fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
     let t = a.ty;
+    if cty.is_complex(t) {
+        // (== and != only: both parts equal, 6.5.9p4)
+        let same = (a.fcval == b.fcval) and (a.fcimag == b.fcimag);
+        return same == (op == ct.P_EQ);
+    }
     if cty.is_floating(t) {
         let x = a.fcval;
         let y = b.fcval;
@@ -339,6 +400,60 @@ fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
         return not gt;
     }
     return not lt;
+}
+
+// e = a op b in complex type e.ty, where a real operand stays real (G.5):
+// the parts as cgen_complex.ax computes them.
+fn complex_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
+    let s = e.ty.elem.kind == cty.TK_FLOAT;
+    let acx = cty.is_complex(a.ty);
+    let bcx = cty.is_complex(b.ty);
+    let x = a.fcval;
+    let y = b.fcval;
+    if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
+        let is_add = op == ct.P_PLUS;
+        let mut re = x - y;
+        if is_add {
+            re = x + y;
+        }
+        let mut im = a.fcimag;
+        if acx and bcx {
+            im = a.fcimag - b.fcimag;
+            if is_add {
+                im = a.fcimag + b.fcimag;
+            }
+        } else if bcx {
+            im = b.fcimag;
+            if not is_add {
+                im = -b.fcimag;
+            }
+        }
+        set_complex(e, re, im);
+        return;
+    }
+    if op == ct.P_STAR {
+        if not acx {
+            set_complex(e, x * y, x * b.fcimag);
+        } else if not bcx {
+            set_complex(e, x * y, a.fcimag * y);
+        } else {
+            let r = ccx.cmul(x, a.fcimag, y, b.fcimag, s);
+            set_complex(e, r.re, r.im);
+        }
+        return;
+    }
+    if op == ct.P_SLASH {
+        if not bcx {
+            set_complex(e, x / y, a.fcimag / y);
+        } else {
+            let mut ai: f64 = 0.0;
+            if acx {
+                ai = a.fcimag;
+            }
+            let r = ccx.cdiv(x, ai, y, b.fcimag, s);
+            set_complex(e, r.re, r.im);
+        }
+    }
 }
 
 pub struct IntResult {

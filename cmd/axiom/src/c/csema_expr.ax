@@ -624,6 +624,10 @@ fn func_name(e: *mut cast.Expr) *mut cast.Expr {
     return e;
 }
 
+/// Is `~` on a complex operand its conjugate (an extension, which the GNU
+/// dialects set; ISO C has no such operator: 6.5.3.3p1)?
+pub let mut complex_tilde_conjugates: bool = false;
+
 fn unary(e: *mut cast.Expr) *mut cast.Expr {
     let op = e.op;
     if (op == ct.P_INC) or (op == ct.P_DEC) {
@@ -685,8 +689,18 @@ fn unary(e: *mut cast.Expr) *mut cast.Expr {
         cc.fold(e);
         return e;
     }
+    if (op == ct.P_TILDE) and cty.is_complex(t) and complex_tilde_conjugates {
+        // (an extension: ~z is the complex conjugate of z)
+        e.ty = cty.unqual(t);
+        cc.fold(e);
+        return e;
+    }
     if (op == ct.P_TILDE) and not cty.is_integer(t) {
-        cs.err(e.span, "C3020", u.f1("the operand of '~' has type %s, not an integer type", cs.tq(t)));
+        let mut why: []u8 = "";
+        if cty.is_complex(t) {
+            why = " (the conjugate is conj(z), of <complex.h>)";
+        }
+        cs.err(e.span, "C3020", u.f2("the operand of '~' has type %s, not an integer type%s", cs.tq(t), why));
         return bad(e);
     }
     if (op != ct.P_TILDE) and not cty.is_arith(t) {
@@ -709,7 +723,8 @@ fn incdec(e: *mut cast.Expr) *mut cast.Expr {
         return bad(e);
     }
     let t = a.ty;
-    if cty.is_arith(t) {
+    // (6.5.2.4p1, 6.5.3.1p1: a real or pointer type, so not a complex one)
+    if cty.is_real(t) {
         e.opty = cb.promote_lvalue(a);
     } else if object_pointer(t) {
         e.opty = cty.unqual(t);
@@ -811,11 +826,14 @@ fn bad_operands(e: *mut cast.Expr) *mut cast.Expr {
     return bad(e);
 }
 
-// The usual arithmetic conversions, the result in the common type.
+// The usual arithmetic conversions, the result in the common type. With a
+// complex operand each operand keeps its type domain (6.3.1.8p1): a real one
+// is converted to the common real type only, and the operation is done on
+// it as such (G.5: x * (u + iv) is xu + ixv, without x's imaginary zero).
 fn arith(e: *mut cast.Expr) *mut cast.Expr {
     let t = cty.common_type(e.a.ty, e.b.ty);
-    e.a = convert(e.a, t);
-    e.b = convert(e.b, t);
+    e.a = convert(e.a, cty.domain_type(e.a.ty, t));
+    e.b = convert(e.b, cty.domain_type(e.b.ty, t));
     e.ty = t;
     cc.fold(e);
     return e;
@@ -837,6 +855,14 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
     let ta = e.a.ty;
     let tb = e.b.ty;
     e.ty = cty.t_int;
+    let eq = (op == ct.P_EQ) or (op == ct.P_NE);
+    if not eq and (cty.is_complex(ta) or cty.is_complex(tb)) and cty.is_arith(ta) and cty.is_arith(tb) {
+        // (6.5.8p2: the relational operators take real types)
+        cs.err(e.span, "C3020",
+               u.f3("comparison with '%s' of a complex value (%s and %s): complex numbers are not ordered",
+                    cast.punct_text(op), cs.tq(ta), cs.tq(tb)));
+        return bad(e);
+    }
     if cty.is_arith(ta) and cty.is_arith(tb) {
         let t = cty.common_type(ta, tb);
         e.a = convert(e.a, t);
@@ -844,7 +870,6 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
         cc.fold(e);
         return e;
     }
-    let eq = (op == ct.P_EQ) or (op == ct.P_NE);
     if eq and (cty.is_nullptr(ta) or cty.is_nullptr(tb)) {
         // (C23 6.5.10p2: two nullptr_t values, or one and a pointer or a null pointer constant)
         if cty.is_nullptr(ta) and cty.is_nullptr(tb) {
@@ -947,10 +972,12 @@ fn assign(e: *mut cast.Expr) *mut cast.Expr {
     return bad(e);
 }
 
+// (with a complex opty, each operand in its own type domain, as arith says:
+// cgen converts the left one so too)
 fn compound_arith(e: *mut cast.Expr) *mut cast.Expr {
     let t = cty.common_type(cb.promote_lvalue(e.a), e.b.ty);
     e.opty = t;
-    e.b = convert(e.b, t);
+    e.b = convert(e.b, cty.domain_type(e.b.ty, t));
     return e;
 }
 
@@ -1261,7 +1288,10 @@ fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
                                      cs.tq(t)));
         return bad(e);
     }
-    if ((t.kind == cty.TK_POINTER) and cty.is_floating(s)) or ((s.kind == cty.TK_POINTER) and cty.is_floating(t)) {
+    // (6.5.4p4: and not to or from a complex type, which is floating too)
+    let tf = cty.is_floating(t) or cty.is_complex(t);
+    let sf = cty.is_floating(s) or cty.is_complex(s);
+    if ((t.kind == cty.TK_POINTER) and sf) or ((s.kind == cty.TK_POINTER) and tf) {
         cs.err(e.span, "C3028", u.f2("a cast between a pointer and a floating type (%s to %s)", cs.tq(s), cs.tq(t)));
         return bad(e);
     }

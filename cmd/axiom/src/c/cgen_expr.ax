@@ -1,8 +1,9 @@
 // =============================================================================
 // cgen_expr.ax - IR generation for C expressions (the typed tree: csema.ax).
 //
-// rv(e) is e's value: a scalar's IR value, a structure's or union's address
-// (memory holding the value), nothing for void; lv(e) is the address of
+// rv(e) is e's value: a scalar's IR value, a structure's, union's or
+// complex value's address (memory holding the value: cgen_complex.ax),
+// nothing for void; lv(e) is the address of
 // lvalue e (and of a structure member reached from a structure value). The
 // implicit conversions are CAST nodes, so each node does one thing.
 // =============================================================================
@@ -13,9 +14,11 @@ import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_bitint.ax" as cgbi;
 import "cgen_bits.ax" as cgb;
+import "cgen_complex.ax" as gcx;
 import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "csema_attr.ax" as catr;
+import "csema_builtin.ax" as csb;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
@@ -27,8 +30,12 @@ fn is_volatile(t: *cty.CType) bool {
     return (t.quals & cty.Q_VOLATILE) != 0;
 }
 
-/// Loads a scalar of type t from p (volatile: as its type says).
+/// Loads a scalar of type t from p (volatile: as its type says); a complex
+/// value is copied to a temporary (its address).
 pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    if cty.is_complex(t) {
+        return gcx.snapshot(t, p);
+    }
     let v = ir.load(cg.B, lty(t), p);
     v.align = @truncate(u32, cty.align_of(t));
     if is_volatile(t) {
@@ -39,6 +46,10 @@ pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
 
 /// Stores scalar v of type t at p.
 pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
+    if cty.is_complex(t) {
+        gcx.put(t, gcx.parts(t.unq, v), p);
+        return;
+    }
     let s = ir.store(cg.B, v, p);
     s.align = @truncate(u32, cty.align_of(t));
     if is_volatile(t) {
@@ -69,6 +80,9 @@ pub fn zero(p: *mut ir.Value, n: u64) void {
 
 /// The constant value of e (is_const, of arithmetic type).
 pub fn const_value(e: *cast.Expr) *mut ir.Value {
+    if cty.is_complex(e.ty) {
+        return gcx.constant(e.ty, e.fcval, e.fcimag);
+    }
     let t = lty(e.ty);
     if cty.is_floating(e.ty) {
         return ir.cfp(t, e.fcval);
@@ -82,6 +96,9 @@ fn i1_to(t: *mut cty.CType, c: *mut ir.Value) *mut ir.Value {
 
 /// The truth of scalar value v of type t, as an i1.
 pub fn truth(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if cty.is_complex(t) {
+        return gcx.truth(gcx.parts(t, v));
+    }
     if cty.is_floating(t) {
         return ir.fcmp(cg.B, ir.RealUNE, v, ir.cfp(v.ty, 0.0));
     }
@@ -142,6 +159,9 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
     if f == t {
         return v;
     }
+    if cty.is_complex(t) or cty.is_complex(f) {
+        return complex_convert(v, f, t);
+    }
     let tt = lty(t);
     if t.kind == cty.TK_BOOL {
         if cty.is_integer(f) and is_01(v) {
@@ -189,6 +209,47 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
         return v;
     }
     return v;
+}
+
+// v of type f converted to t, one of them complex (6.3.1.6, 6.3.1.7): the
+// parts as real values are; a real value's imaginary part is +0; a complex
+// value to a real type is its real part's, to _Bool its truth.
+fn complex_convert(v: *mut ir.Value, f: *mut cty.CType, t: *mut cty.CType) *mut ir.Value {
+    if cty.is_complex(t) {
+        let el = t.elem;
+        if cty.is_complex(f) {
+            let p = gcx.parts(f, v);
+            return gcx.make(t, gcx.Pair.{ re: convert(p.re, f.elem, el), im: convert(p.im, f.elem, el) });
+        }
+        return gcx.make(t, gcx.Pair.{ re: convert(v, f, el), im: ir.cfp(lty(el), 0.0) });
+    }
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(cg.B, truth(v, f), lty(t));
+    }
+    return convert(gcx.parts(f, v).re, f.elem, t);
+}
+
+// The operand value of e: a complex value's parts, or a real value.
+fn operand(e: *mut cast.Expr) gcx.Pair {
+    let v = rv(e);
+    if cty.is_complex(e.ty) {
+        return gcx.parts(e.ty, v);
+    }
+    return gcx.real(v);
+}
+
+// The operation of the arithmetic operator op on complex values.
+fn complex_op(op: i32) i32 {
+    if op == ct.P_PLUS {
+        return gcx.OP_ADD;
+    }
+    if op == ct.P_MINUS {
+        return gcx.OP_SUB;
+    }
+    if op == ct.P_STAR {
+        return gcx.OP_MUL;
+    }
+    return gcx.OP_DIV;
 }
 
 fn int_resize(v: *mut ir.Value, from_signed: bool, tt: *mut ir.Ty) *mut ir.Value {
@@ -415,6 +476,15 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
     if op == ct.P_BANG {
         return i1_to(e.ty, ir.not_(cg.B, truth(v, e.a.ty)));
     }
+    if cty.is_complex(e.ty) {
+        if op == ct.P_MINUS {
+            return gcx.make(e.ty, gcx.negate(gcx.parts(e.ty, v)));
+        }
+        if op == ct.P_TILDE {
+            return gcx.make(e.ty, gcx.conj(gcx.parts(e.ty, v)));  // (an extension: csema_expr)
+        }
+        return v;
+    }
     if op == ct.P_MINUS {
         if cty.is_floating(e.ty) {
             return ir.fneg(cg.B, v);
@@ -525,6 +595,11 @@ fn base_op(op: i32) i32 {
 fn compare(e: *mut cast.Expr) *mut ir.Value {
     let op = e.op;
     let t = e.a.ty;
+    if cty.is_complex(t) {
+        let cx = operand(e.a);
+        let cy = operand(e.b);
+        return i1_to(e.ty, gcx.equal(cx, cy, op == ct.P_NE));
+    }
     let mut x = rv(e.a);
     let mut y = rv(e.b);
     if cty.is_floating(t) {
@@ -569,6 +644,8 @@ pub fn branch(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
         let mut c = e.cval != 0;
         if cty.is_floating(e.ty) {
             c = e.fcval != 0.0;
+        } else if cty.is_complex(e.ty) {
+            c = (e.fcval != 0.0) or (e.fcimag != 0.0);
         }
         if c {
             cg.br(t);
@@ -655,6 +732,11 @@ fn binary(e: *mut cast.Expr) *mut ir.Value {
         let i = rv(e.b);
         return offset(p, i, gv.size_value(ta.elem), op == ct.P_MINUS);
     }
+    if cty.is_complex(e.ty) {
+        let cx = operand(e.a);
+        let cy = operand(e.b);
+        return gcx.make(e.ty, gcx.arith(complex_op(op), e.ty, cx, cy));
+    }
     let x = rv(e.a);
     let y = rv(e.b);
     return arith_op(op, e.ty, x, y);
@@ -678,6 +760,20 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
     let mut nv = ir.vnil();
     if ot.kind == cty.TK_POINTER {
         nv = offset(old, r, gv.size_value(ot.elem), e.op == ct.P_SUB_EQ);
+    } else if cty.is_complex(ot) {
+        // (each operand in its type domain, as csema_expr.compound_arith says)
+        let xt = cty.domain_type(lt, ot);
+        let x = convert(old, lt, xt);
+        let mut cx = gcx.real(x);
+        if cty.is_complex(xt) {
+            cx = gcx.parts(xt, x);
+        }
+        let mut cy = gcx.real(r);
+        if cty.is_complex(e.b.ty) {
+            cy = gcx.parts(e.b.ty, r);
+        }
+        let res = gcx.make(ot, gcx.arith(complex_op(base_op(e.op)), ot, cx, cy));
+        nv = convert(res, ot, lt);
     } else {
         let x = convert(old, lt, ot);
         nv = convert(arith_op(base_op(e.op), ot, x, r), ot, lt);
@@ -717,17 +813,36 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
     let no = cg.new_block("else");
     let done = cg.new_block("cond");
     branch(e.a, yes, no);
+    let cplx = cty.is_complex(e.ty);
+    let mut px = gcx.real(ir.vnil());
+    let mut py = gcx.real(ir.vnil());
     cg.at_end(yes);
     let x = rv(e.b);
+    if cplx {
+        px = gcx.parts(e.ty, x);  // (the parts, which the phis join)
+    }
     let xb = ir.insert_block(cg.B);
     ir.br(cg.B, done);
     cg.at_end(no);
     let y = rv(e.c);
+    if cplx {
+        py = gcx.parts(e.ty, y);
+    }
     let yb = ir.insert_block(cg.B);
     ir.br(cg.B, done);
     cg.at_end(done);
     if cty.is_void(e.ty) {
         return ir.vnil();
+    }
+    if cplx {
+        let rt = px.re.ty;
+        let pr = ir.phi(cg.B, rt);
+        ir.add_incoming(pr, px.re, xb);
+        ir.add_incoming(pr, py.re, yb);
+        let pi = ir.phi(cg.B, rt);
+        ir.add_incoming(pi, px.im, xb);
+        ir.add_incoming(pi, py.im, yb);
+        return gcx.make(e.ty, gcx.Pair.{ re: pr, im: pi });
     }
     let mut pt = cg.T_ptr;
     if cty.is_scalar(e.ty) {
@@ -746,6 +861,9 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
         // a builtin (csema_builtin.ax)
         for i in 0..n {
             vs[i] = rv(e.args.get(i));
+        }
+        if e.op >= csb.BI_COMPLEX {
+            return complex_builtin(e, vs[0..n]);
         }
         return gva.builtin(e, vs[0..n]);
     }
@@ -791,6 +909,21 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
         cg.continue_after();
     }
     return r;
+}
+
+// A <complex.h> builtin (csema_builtin.ax) of the argument values vs.
+fn complex_builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    if e.op == csb.BI_COMPLEX {
+        return gcx.make(e.ty, gcx.Pair.{ re: vs[0], im: vs[1] });
+    }
+    let p = gcx.parts(e.args.get(0).ty, vs[0]);
+    if e.op == csb.BI_CREAL {
+        return p.re;
+    }
+    if e.op == csb.BI_CIMAG {
+        return p.im;
+    }
+    return gcx.make(e.ty, gcx.conj(p));
 }
 
 fn same_sig(a: *ir.Ty, b: *ir.Ty) bool {

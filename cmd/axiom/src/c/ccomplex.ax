@@ -1,0 +1,186 @@
+// =============================================================================
+// ccomplex.ax - complex multiplication and division of constants (C99 6.5.5,
+// Annex G.5.1), for constant folding (cconst.ax). cgen_complex.ax generates
+// the same algorithms for run time, operation for operation, so that a
+// folded value is the value the program would compute.
+//
+// The values are f64; for float _Complex every operation's result is
+// rounded to float (`single`), which gives float arithmetic's results: the
+// operands are floats, and rounding an exact double result of + - * / of
+// two floats to float rounds once (53 >= 2 * 24 + 2).
+//
+// Multiplication of two complex operands: (ac - bd) + i(ad + bc), and when
+// both parts are NaN, the recovery of the infinities that G.5.1 describes
+// (an infinite operand or an overflowing product gives an infinite result).
+// Division: Smith's method (the larger part of the divisor divided into
+// the other, which keeps c*c + d*d from overflowing), with the zero and
+// infinity recovery of G.5.1. A real operand is not made complex (G.5):
+// x(u + iv) = xu + ixv, (u + iv)/x = u/x + iv/x; x/(u + iv) is divided as
+// x + i0.
+// =============================================================================
+
+/// A complex value.
+pub struct Cx {
+    re: f64,
+    im: f64,
+}
+
+fn rnd(x: f64, single: bool) f64 {
+    if single {
+        return @as(f64, @float_cast(f32, x));
+    }
+    return x;
+}
+
+fn mul(x: f64, y: f64, s: bool) f64 {
+    return rnd(x * y, s);
+}
+
+fn add(x: f64, y: f64, s: bool) f64 {
+    return rnd(x + y, s);
+}
+
+fn sub(x: f64, y: f64, s: bool) f64 {
+    return rnd(x - y, s);
+}
+
+fn div(x: f64, y: f64, s: bool) f64 {
+    return rnd(x / y, s);
+}
+
+fn inf() f64 {
+    let z: f64 = 0.0;
+    return 1.0 / z;
+}
+
+fn is_nan(x: f64) bool {
+    return x != x;
+}
+
+fn is_inf(x: f64) bool {
+    return @abs(x) == inf();
+}
+
+fn is_finite(x: f64) bool {
+    return @abs(x) < inf();
+}
+
+// copysign(isinf(x) ? 1 : 0, x): an infinity "boxed" to a unit, other values to a zero.
+fn boxed(x: f64) f64 {
+    if is_inf(x) {
+        return @copysign(1.0, x);
+    }
+    return @copysign(0.0, x);
+}
+
+// A NaN made a zero (of its sign), other values unchanged.
+fn nan0(x: f64) f64 {
+    if is_nan(x) {
+        return @copysign(0.0, x);
+    }
+    return x;
+}
+
+/// (a + ib)(c + id), both complex.
+pub fn cmul(a: f64, b: f64, c: f64, d: f64, s: bool) Cx {
+    let ac = mul(a, c, s);
+    let bd = mul(b, d, s);
+    let ad = mul(a, d, s);
+    let bc = mul(b, c, s);
+    let x = sub(ac, bd, s);
+    let y = add(ad, bc, s);
+    if not is_nan(x) or not is_nan(y) {
+        return Cx.{ re: x, im: y };
+    }
+    return cmul_recover(a, b, c, d, ac, bd, ad, bc, x, y, s);
+}
+
+// G.5.1: the infinities of a product that computed as NaN + iNaN.
+fn cmul_recover(a0: f64, b0: f64, c0: f64, d0: f64, ac: f64, bd: f64, ad: f64, bc: f64, x: f64, y: f64, s: bool) Cx {
+    let mut a = a0;
+    let mut b = b0;
+    let mut c = c0;
+    let mut d = d0;
+    let mut recalc = false;
+    if is_inf(a) or is_inf(b) {
+        a = boxed(a);
+        b = boxed(b);
+        c = nan0(c);
+        d = nan0(d);
+        recalc = true;
+    }
+    if is_inf(c) or is_inf(d) {
+        c = boxed(c);
+        d = boxed(d);
+        a = nan0(a);
+        b = nan0(b);
+        recalc = true;
+    }
+    if not recalc and (is_inf(ac) or is_inf(bd) or is_inf(ad) or is_inf(bc)) {
+        a = nan0(a);
+        b = nan0(b);
+        c = nan0(c);
+        d = nan0(d);
+        recalc = true;
+    }
+    if not recalc {
+        return Cx.{ re: x, im: y };
+    }
+    let re = mul(inf(), sub(mul(a, c, s), mul(b, d, s), s), s);
+    let im = mul(inf(), add(mul(a, d, s), mul(b, c, s), s), s);
+    return Cx.{ re: re, im: im };
+}
+
+/// (a + ib) / (c + id), both complex (b is +0 for a real dividend).
+pub fn cdiv(a0: f64, b0: f64, c0: f64, d0: f64, s: bool) Cx {
+    let mut a = a0;
+    let mut b = b0;
+    let mut c = c0;
+    let mut d = d0;
+    let mut x: f64 = 0.0;
+    let mut y: f64 = 0.0;
+    if @abs(c) >= @abs(d) {
+        let r = div(d, c, s);
+        let den = add(c, mul(d, r, s), s);
+        if r != 0.0 {
+            x = div(add(a, mul(b, r, s), s), den, s);
+            y = div(sub(b, mul(a, r, s), s), den, s);
+        } else {
+            x = div(add(a, mul(d, div(b, c, s), s), s), den, s);
+            y = div(sub(b, mul(d, div(a, c, s), s), s), den, s);
+        }
+    } else {
+        let r = div(c, d, s);
+        let den = add(mul(c, r, s), d, s);
+        if r != 0.0 {
+            x = div(add(mul(a, r, s), b, s), den, s);
+            y = div(sub(mul(b, r, s), a, s), den, s);
+        } else {
+            x = div(add(mul(c, div(a, d, s), s), b, s), den, s);
+            y = div(sub(mul(c, div(b, d, s), s), a, s), den, s);
+        }
+    }
+    if not is_nan(x) or not is_nan(y) {
+        return Cx.{ re: x, im: y };
+    }
+    // G.5.1: the infinities and zeros of a quotient that computed as NaN + iNaN
+    if (c == 0.0) and (d == 0.0) and (not is_nan(a) or not is_nan(b)) {
+        let k = @copysign(inf(), c);
+        return Cx.{ re: mul(k, a, s), im: mul(k, b, s) };
+    }
+    if (is_inf(a) or is_inf(b)) and is_finite(c) and is_finite(d) {
+        a = boxed(a);
+        b = boxed(b);
+        let re = mul(inf(), add(mul(a, c, s), mul(b, d, s), s), s);
+        let im = mul(inf(), sub(mul(b, c, s), mul(a, d, s), s), s);
+        return Cx.{ re: re, im: im };
+    }
+    if (is_inf(c) or is_inf(d)) and is_finite(a) and is_finite(b) {
+        c = boxed(c);
+        d = boxed(d);
+        let re = mul(0.0, add(mul(a, c, s), mul(b, d, s), s), s);
+        let im = mul(0.0, sub(mul(b, c, s), mul(a, d, s), s), s);
+        return Cx.{ re: re, im: im };
+    }
+    return Cx.{ re: x, im: y };
+}

@@ -31,8 +31,12 @@ lists the diagnostics.
 - **No extensions**: no GNU or Microsoft extensions, and `#pragma` lines are ignored
   (as are `_Pragma` operators). Identifiers the compiler needs for its own headers are
   in the reserved namespace (`__builtin_va_list`, `__axiom_int64`, ...).
-- **Not supported, and said so by the feature macros**: `_Complex`
-  (`__STDC_NO_COMPLEX__`), `_Atomic` (`__STDC_NO_ATOMICS__`), threads
+- **Complex types** (C99): `float`, `double` and `long double _Complex`, with
+  `<complex.h>` (the library's functions only declared). No imaginary types, and
+  `__STDC_IEC_559_COMPLEX__` is not defined, though multiplication and division
+  follow Annex G.5.1 (`ccomplex.ax` folds constants, `cgen_complex.ax` generates the
+  same operations, with helper functions of the module for the slow paths).
+- **Not supported, and said so by the feature macros**: `_Atomic` (`__STDC_NO_ATOMICS__`), threads
   (`__STDC_NO_THREADS__`), decimal floating types, `long double` wider than `double`
   (it is `double`). Annex F is not claimed (`__STDC_IEC_559__` and
   `__STDC_IEC_60559_BFP__` are not defined): the floating types have IEC 60559's
@@ -82,9 +86,10 @@ cmd/axiom/src/c/cpp.ax      preprocessor and lexer (phases 1-6)            (+ cp
 cmd/axiom/src/c/cast.ax     the syntax tree                          (+ cast_dump.ax)
 cmd/axiom/src/c/cparse.ax   parser
 cmd/axiom/src/c/ctypes.ax   C types, layout, conversions
-cmd/axiom/src/c/cconst.ax   constant expressions
+cmd/axiom/src/c/cconst.ax   constant expressions                        (+ ccomplex.ax)
 cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree
 cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conventions
+                            (cgen_complex.ax: complex arithmetic)
 cmd/axiom/src/c/cc.ax       the driver
 std/c/include/              the compiler's headers
 cmd/axiom/internal/tests/c/ tests

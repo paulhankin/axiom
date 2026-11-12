@@ -22,6 +22,15 @@
 //                    first parameter; variadic arguments in a buffer whose
 //                    address is the last parameter
 //
+// A complex type travels as the structure of its two parts would, on every
+// target (aggregate): the x86-64 System V ABI classifies `complex T` as such
+// a structure (float _Complex: one SSE eightbyte, double _Complex: two),
+// AAPCS64 makes it a homogeneous aggregate of two members, Windows x64 and
+// the WebAssembly C ABI pass it as they pass the structure (by value in 8
+// bytes, else by reference; by reference). (System V gives long double
+// _Complex the class COMPLEX_X87 when long double is the x87 type: not so
+// here, where long double is double.)
+//
 // The backends pass scalar IR parameters as the C ABIs do (rdi, rsi, ...; in
 // order of each register class, then the stack), so a structure here is
 // split into scalar pieces loaded from its memory, and its place is chosen
@@ -179,6 +188,12 @@ fn int_piece(n: u64) *mut ir.Ty {
     return ir.t_int(64);
 }
 
+/// Does a value of type t travel as an aggregate (its memory: a structure,
+/// a union, or a complex type)?
+pub fn aggregate(t: *cty.CType) bool {
+    return cty.is_record(t) or cty.is_complex(t);
+}
+
 // -----------------------------------------------------------------------------
 // The scalars of a type
 // -----------------------------------------------------------------------------
@@ -220,6 +235,12 @@ fn add_leaves(t0: *cty.CType, off: u64, l: *mut Leaves) void {
         }
         return;
     }
+    if t.kind == cty.TK_COMPLEX {
+        // (the real part and the imaginary part)
+        add_leaves(t.elem, off, l);
+        add_leaves(t.elem, off + cty.size_of(t.elem), l);
+        return;
+    }
     if l.n >= MAX_LEAVES {
         l.ok = false;
         return;
@@ -244,7 +265,7 @@ struct Hfa {
 fn hfa_of(t: *cty.CType) Hfa {
     let none = Hfa.{ n: 0, es: 0 };
     let size = cty.size_of(t);
-    if not cty.is_record(t) or (size == 0) or (size > 32) {
+    if not aggregate(t) or (size == 0) or (size > 32) {
         return none;
     }
     let l = u.new.[Leaves]();
@@ -516,7 +537,7 @@ fn fill(b: *mut Builder, fp: bool, n: u64) void {
 fn sysv_arg(b: *mut Builder, i: usize) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
-    if not cty.is_record(t) {
+    if not aggregate(t) {
         set_scalar(a, t);
         let fp = is_fp_ty(a.pieces[0].ty);
         if fp and (b.nf < 8) {
@@ -561,7 +582,7 @@ fn sysv_arg(b: *mut Builder, i: usize) void {
 fn win_arg(b: *mut Builder, i: usize, variadic: bool) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
-    if not cty.is_record(t) {
+    if not aggregate(t) {
         set_scalar(a, t);
         a.as_int = variadic and (b.pos < 4) and is_fp_ty(a.pieces[0].ty);
     } else {
@@ -588,7 +609,7 @@ fn a64_arg(b: *mut Builder, i: usize, darwin_va: bool) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
     let darwin = b.p.abi == ABI_DARWIN;
-    if not cty.is_record(t) {
+    if not aggregate(t) {
         set_scalar(a, t);
         if darwin_va {
             push_pieces(b, i, false);
@@ -710,7 +731,7 @@ fn stack_bytes(b: *mut Builder, size: u64, packed: bool) void {
 fn wasm_arg(b: *mut Builder, i: usize, in_buffer: bool) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
-    if not cty.is_record(t) {
+    if not aggregate(t) {
         set_scalar(a, t);
     } else {
         let st = single_scalar(t);
@@ -745,7 +766,7 @@ fn set_result(b: *mut Builder) void {
         p.ret = R_VOID;
         return;
     }
-    if not cty.is_record(t) {
+    if not aggregate(t) {
         p.ret = R_SCALAR;
         p.rn = 1;
         p.rpieces[0] = Piece.{ ty: scalar_ty(t), off: 0 };

@@ -68,3 +68,31 @@ long long h_vlist(int n, va_list ap) {
     while (n-- > 0) s = s * 10 + va_arg(ap, int) + (long long)va_arg(ap, double);
     return s;
 }
+
+/* For c/run/complex_abi_host.c: complex arguments, results, variadic
+   arguments and callbacks of the system's C compiler. */
+#include <complex.h>
+typedef struct { float _Complex z; double d; } h_cs;
+float _Complex h_cf(float _Complex a, double _Complex b, int k) {
+    return a * k + (float _Complex)b;
+}
+double _Complex h_cd(double x, double _Complex a, float _Complex b, h_cs s, double _Complex c, double _Complex d,
+                     double _Complex e, double _Complex f) {
+    return x * a + b + s.z * s.d + c - d + e * 2 + f * I;
+}
+h_cs h_mk(float _Complex z, double d) { h_cs r = { z, d }; return r; }
+double h_cva(int n, ...) {
+    va_list ap;
+    double s = 0;
+    va_start(ap, n);
+    while (n-- > 0) {
+        double _Complex a = va_arg(ap, double _Complex);
+        float _Complex b = va_arg(ap, float _Complex);
+        s = s * 10 + creal(a) + cimag(a) * 2 + crealf(b) * 3 + cimagf(b) * 4;
+    }
+    va_end(ap);
+    return s;
+}
+double _Complex h_ccall(double _Complex (*f)(double _Complex, float _Complex, ...)) {
+    return f(CMPLX(1, 2), CMPLXF(3, 4), CMPLX(5, 6), CMPLXF(7, 8));
+}

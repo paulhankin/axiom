@@ -9,6 +9,13 @@
 //   __builtin_unreachable()                                          <stddef.h>
 //   __builtin_stdc_leading_zeros(x) ... __builtin_stdc_bit_ceil(x)   <stdbit.h>
 //   __builtin_ckd_add(r, a, b)  __builtin_ckd_sub  __builtin_ckd_mul  <stdckdint.h>
+//   __builtin_complex(x, y)  __builtin_creal(z)  __builtin_cimag(z)
+//   __builtin_conj(z)                                                <complex.h>
+//
+// __builtin_complex(x, y) is the complex value x + iy of the complex type of
+// x and y, which have one real floating type (CMPLX, CMPLXF, CMPLXL, and
+// _Complex_I as __builtin_complex(0.0f, 1.0f)): a constant expression when
+// both are; so are creal, cimag and conj of a constant (a complex operand).
 //
 // A call of a builtin is a CALL node whose op is its BI_ number (0 for any
 // other call), with its arguments typed (and converted as BI_ says) and no
@@ -26,7 +33,7 @@
 // Diagnostics:
 //   C3080  a va builtin used wrongly: outside a variadic function, an operand that is not a va_list
 //   C3081  offsetof of a bit-field, or a member designator that does not designate a member
-//   C3082  an operand of a <stdbit.h> or <stdckdint.h> builtin of a type it does not take
+//   C3082  an operand of a <stdbit.h>, <stdckdint.h> or <complex.h> builtin of a type it does not take
 //   C4080  va_start's second argument is not the function's last parameter
 //   C4081  va_arg of a type that the default argument promotions change
 // =============================================================================
@@ -64,6 +71,11 @@ pub const BI_BIT_CEIL: i32 = 23;
 pub const BI_CKD_ADD: i32 = 30;
 pub const BI_CKD_SUB: i32 = 31;
 pub const BI_CKD_MUL: i32 = 32;
+// <complex.h>
+pub const BI_COMPLEX: i32 = 40;
+pub const BI_CREAL: i32 = 41;
+pub const BI_CIMAG: i32 = 42;
+pub const BI_CONJ: i32 = 43;
 
 let stdc_names: [14][]u8 = ["leading_zeros", "leading_ones", "trailing_zeros", "trailing_ones", "first_leading_zero",
                             "first_leading_one", "first_trailing_zero", "first_trailing_one", "count_zeros",
@@ -223,6 +235,18 @@ fn builtin_id(name: []u8) i32 {
     if u.str_eq(name, "__builtin_ckd_mul") {
         return BI_CKD_MUL;
     }
+    if u.str_eq(name, "__builtin_complex") {
+        return BI_COMPLEX;
+    }
+    if u.str_eq(name, "__builtin_creal") {
+        return BI_CREAL;
+    }
+    if u.str_eq(name, "__builtin_cimag") {
+        return BI_CIMAG;
+    }
+    if u.str_eq(name, "__builtin_conj") {
+        return BI_CONJ;
+    }
     return 0;
 }
 
@@ -242,10 +266,74 @@ fn builtin_call(e: *mut cast.Expr) bool {
         }
     } else if id < BI_CKD_ADD {
         stdc_call(e, id);
-    } else {
+    } else if id < BI_COMPLEX {
         ckd_call(e, id);
+    } else {
+        complex_call(e, id);
     }
     return true;
+}
+
+// __builtin_complex(x, y), __builtin_creal(z), __builtin_cimag(z),
+// __builtin_conj(z): typed, and folded when the operands are constants.
+fn complex_call(e: *mut cast.Expr, id: i32) void {
+    let mut n: usize = 1;
+    if id == BI_COMPLEX {
+        n = 2;
+    }
+    if not arity(e, n, n) {
+        _ = bad(e);
+        return;
+    }
+    for i in 0..n {
+        let x = cx.rv(e.args.get(i));
+        e.args.set(i, x);
+        if is_err(x) {
+            _ = bad(e);
+            return;
+        }
+    }
+    let a = e.args.get(0);
+    if id == BI_COMPLEX {
+        let b = e.args.get(1);
+        if not cty.is_floating(a.ty) or (cty.unqual(a.ty) != cty.unqual(b.ty)) {
+            cs.err(e.span, "C3082",
+                   u.f2("the operands of __builtin_complex have types %s and %s, not one real floating type",
+                        cs.tq(a.ty), cs.tq(b.ty)));
+            _ = bad(e);
+            return;
+        }
+        e.ty = cty.complex_of(a.ty);
+        if a.is_const and b.is_const {
+            e.is_const = true;
+            e.fcval = a.fcval;
+            e.fcimag = b.fcval;
+            e.ovf = a.ovf or b.ovf;
+        }
+        return;
+    }
+    if not cty.is_complex(a.ty) {
+        cs.err(a.span, "C3082", u.f2("the operand of %s has type %s, not a complex type", e.a.name, cs.tq(a.ty)));
+        _ = bad(e);
+        return;
+    }
+    if id == BI_CONJ {
+        e.ty = cty.unqual(a.ty);
+    } else {
+        e.ty = a.ty.unq.elem;
+    }
+    if a.is_const {
+        e.is_const = true;
+        e.ovf = a.ovf;
+        if id == BI_CREAL {
+            e.fcval = a.fcval;
+        } else if id == BI_CIMAG {
+            e.fcval = a.fcimag;
+        } else {
+            e.fcval = a.fcval;
+            e.fcimag = -a.fcimag;
+        }
+    }
 }
 
 fn va_call(e: *mut cast.Expr, id: i32) void {

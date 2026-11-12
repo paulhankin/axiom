@@ -159,7 +159,7 @@ names the feature and the standard that has it (or removed it).
 | `C3002` | A redefinition of an object, function, tag, label, member, parameter or enumeration constant. |
 | `C3003` | Conflicting types, or kinds of declaration, for one identifier. |
 | `C3004` | Conflicting linkage (declared `static` after a declaration with external linkage, ...). |
-| `C3005` | An invalid combination of type specifiers. |
+| `C3005` | An invalid combination of type specifiers (`_Complex` too: only `float`, `double` and `long double _Complex`, in any order). |
 | `C3006` | An invalid storage-class or function specifier, or type qualifier: repeated where that is not allowed, or on a type that cannot take it. |
 | `C3007` | An incomplete type where a complete one is needed. |
 | `C3008` | An invalid declarator or member: arrays of functions, functions returning arrays, a flexible array member that is not last, a member of function type, and so on. |
@@ -230,14 +230,14 @@ array checks and the builtin checks were numbered apart. The message says which.
 |---|---|
 | `C3080` | A `va_list` builtin used wrongly: outside a variadic function, with an operand that is not a `va_list`, or `va_arg` of a type that cannot be fetched. Also: a variable length array before C99. |
 | `C3081` | `offsetof` of a bit-field, or with a member designator that does not designate a member. Also: a variably modified type where none can be (file scope, a member, static storage duration, a function's result, an `extern` object). |
-| `C3082` | An operand of a `<stdbit.h>` or `<stdckdint.h>` builtin of a type it does not take. Also: an initializer of a variable length array (from C23, other than `{}`). |
+| `C3082` | An operand of a `<stdbit.h>`, `<stdckdint.h>` or `<complex.h>` builtin of a type it does not take (`__builtin_complex` takes two operands of one real floating type; `__builtin_creal`, `__builtin_cimag` and `__builtin_conj` a complex one). Also: an initializer of a variable length array (from C23, other than `{}`). |
 | `C3083` | A `goto` into the scope of an identifier with a variably modified type. |
 | `C3084` | A `case` or `default` label in the scope of such an identifier declared in its `switch` statement. |
 | `C3085` | `[*]` outside the parameters of a function prototype that is not a definition. |
 | `C3062` | An external name that is the name of one of the runtime's functions (`ax_write`, ...). Reported when code is generated, so `axiom check` does not report it. |
 | `C3063` | The program has no function `main` (reported for an executable, not by `axiom check`). |
 | `C3064` | An external name defined in two translation units; a note points to the other definition. |
-| `C3901` | A feature that this implementation does not support: `_Atomic` (qualifier or specifier), `_Complex`, `_Imaginary`, and (C23) the decimal floating types. |
+| `C3901` | A feature that this implementation does not support: `_Atomic` (qualifier or specifier), `_Imaginary` (the imaginary types), and (C23) the decimal floating types. |
 
 ## C4xxx: warnings
 

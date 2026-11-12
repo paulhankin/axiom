@@ -193,10 +193,11 @@ ignored with the warning `C4052`.
 `__STDC__` (1), `__STDC_VERSION__` (above), `__DATE__`, `__TIME__` (the build's time, or
 the `SOURCE_DATE_EPOCH` environment variable's, in UTC), `__FILE__`, `__LINE__`. From C99,
 `__STDC_HOSTED__` is 0. From C11, `__STDC_UTF_16__`, `__STDC_UTF_32__`,
-`__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__` and `__STDC_NO_THREADS__` are 1. In C23,
+`__STDC_NO_ATOMICS__` and `__STDC_NO_THREADS__` are 1 (`__STDC_NO_COMPLEX__` is not defined:
+complex types are supported). In C23,
 `__STDC_EMBED_NOT_FOUND__`, `__STDC_EMBED_FOUND__` and `__STDC_EMBED_EMPTY__` are 0, 1
 and 2. `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__` and `__STDC_ISO_10646__` are not
-defined (see "Known deviations").
+defined, nor is `__STDC_IEC_559_COMPLEX__` (see "Known deviations").
 
 The compiler's own macros say what the build chose:
 
@@ -253,6 +254,7 @@ its own: a program built with other widths cannot pass such values to it.
 | Signed overflow | Undefined. The code generated wraps, at every optimization level tried. |
 | Right shift of a negative value | Arithmetic (sign-extending): `-8 >> 1` is `-4`. |
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
+| Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. There are no imaginary types. |
 | Floating types | `float` and `double` are IEEE 754 binary32 and binary64. `long double` is `double`: the same size, alignment and `LDBL_*` values. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest); the rounding mode cannot be changed. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that. `#pragma pack` is ignored. |
 | `max_align_t` | A structure of a `long long` and a `long double`: size 16, alignment 8. |
@@ -295,6 +297,7 @@ in an earlier mode is an `#error`.
 | `<iso646.h>` | C95 and later | |
 | `<stdbool.h>` | C99 and later | In C23, `bool`, `true` and `false` are keywords and the header only defines `__bool_true_false_are_defined`. |
 | `<stdint.h>` | C99 and later | No `int32_t` family when no type is 32 bits wide. |
+| `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are a library's, which is not provided. No `imaginary` or `_Imaginary_I`. |
 | `<stdalign.h>` | C11 and later | |
 | `<stdnoreturn.h>` | C11 and later | |
 | `<stdbit.h>` | C23 | The `stdc_` functions as `static inline` functions and type-generic macros. |
@@ -308,7 +311,7 @@ as the standard says.
 
 ## Not supported
 
-- `_Complex` and `_Imaginary` (`__STDC_NO_COMPLEX__`), `_Atomic` (`__STDC_NO_ATOMICS__`),
+- `_Imaginary` (the imaginary types, which are optional), `_Atomic` (`__STDC_NO_ATOMICS__`),
   decimal floating types and constants: each is `C3901` (a decimal constant is `C1019`).
 - Threads (`__STDC_NO_THREADS__`; there is no `<threads.h>`). `thread_local` and
   `_Thread_local` are accepted and checked, and such an object has static storage
@@ -335,6 +338,8 @@ Programs should not use them.
 | `__builtin_stdc_...` | The operations of `<stdbit.h>`. |
 | `__builtin_ckd_add`, `__builtin_ckd_sub`, `__builtin_ckd_mul` | `<stdckdint.h>`. |
 | `__builtin_inff`, `__builtin_nanf` | `<float.h>`. |
+| `__builtin_complex`, `__builtin_creal`, `__builtin_cimag`, `__builtin_conj` | `<complex.h>`: `__builtin_complex(x, y)` is `x + iy` for `x` and `y` of one real floating type. |
+| `__axiom_cmul_f32`, `__axiom_cdiv_f64`, ... | The compiler's own functions for complex multiplication and division (internal to the program). |
 | `__axiom_int64` | A keyword for a 64-bit integer type (`unsigned __axiom_int64` too) in every mode, for `size_t` in headers before C99 and for programs that need one in C89. |
 | `__AXIOM_...`, `__axiom_...` | Macros and members of the headers. |
 
@@ -363,6 +368,12 @@ library and is called by it:
 | `aarch64` | AAPCS64. |
 | `aarch64-macos` | Apple's variant of AAPCS64. |
 | `wasm32`, `wasm64` | The WebAssembly C ABI. |
+
+A complex value is passed and returned as the structure of its two parts would be, as
+each ABI says (`float _Complex` in one SSE register and `double _Complex` in two on
+x86-64 System V, a homogeneous aggregate in two floating-point registers on AArch64, by
+value in an integer register or by reference on Windows, by reference on WebAssembly);
+checked against the system's C compiler on `x86_64` and `aarch64` Linux.
 
 `va_list` is the ABI's: an array of one structure on x86-64 System V, the AAPCS64
 structure on AArch64 Linux, and `char *` elsewhere, so it can be passed to the library's
@@ -423,7 +434,16 @@ claims less than the standard allows. None is hidden: each is said above or here
   in `<float.h>`), but there are no exception flags or rounding modes; signaling NaNs are
   not guaranteed to stay signaling, so `<float.h>` has no `FLT_SNAN`.
 - `long double` is `double`.
-- `_Complex`, `_Atomic`, decimal floating types and threads are absent, as the feature
+- Annex G is not claimed (`__STDC_IEC_559_COMPLEX__` is not defined): it needs Annex F,
+  and before C23 the imaginary types, which are absent. Complex arithmetic follows it
+  all the same where it can: a real operand of `+ - * /` with a complex one is not made
+  complex (G.5: `2.0 * z` is `2.0 * creal(z) + 2.0 * cimag(z) * I`, and signed zeros of
+  the other part are kept), and multiplication and division recover the infinities and
+  zeros G.5.1 describes when the formulas give NaN + iNaN. Division uses Smith's method
+  (no overflow forming the divisor's squared magnitude); it may differ in the last bit
+  from other implementations' choices. `CX_LIMITED_RANGE` has no effect (the full
+  algorithms are always used).
+- `_Atomic`, decimal floating types and threads are absent, as the feature
   macros say.
 - `thread_local` objects have static storage duration.
 - `restrict` has no effect on the generated code; `#pragma` (the `STDC` ones included)

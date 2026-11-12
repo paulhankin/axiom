@@ -1,0 +1,389 @@
+// =============================================================================
+// cgen_complex.ax - IR generation for complex arithmetic (C99 6.2.5p13,
+// 6.3.1.6-6.3.1.8, 6.5, Annex G.5).
+//
+// A value of a complex type is, as a structure's is, the address of memory
+// holding it: the real part, then the imaginary part, each of the
+// corresponding real type (cgen.lty: an IR struct of the two). The memory is
+// a temporary that is written once (make), or an object; scalar replacement
+// (sroa.ax) turns the temporaries into registers. The operations take the
+// parts as a Pair; a Pair whose `im` is nil is a real operand, which the
+// usual arithmetic conversions leave real (csema_expr.arith; G.5: x(u + iv)
+// is xu + ixv, and x + (u + iv) is (x + u) + iv, so an imaginary -0 stays).
+//
+// Multiplication of two complex values is (ac - bd) + i(ad + bc) in line,
+// and when both parts come out NaN a call of a helper recovers the
+// infinities G.5.1 asks for. Division of two complex values is a call of a
+// helper (Smith's method, which does not overflow forming c*c + d*d, and
+// G.5.1's recovery of infinities and zeros). The helpers are functions of
+// the module, made once for each real type (`__axiom_cmul_f64`, ...), with
+// internal linkage: no library or runtime provides them. ccomplex.ax is
+// the same algorithms for constant folding; the two must stay alike, one
+// operation for one.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cgen.ax" as cg;
+import "ctypes.ax" as cty;
+
+/// The parts of a complex value (im nil: a real operand).
+pub struct Pair {
+    re: *mut ir.Value,
+    im: *mut ir.Value,
+}
+
+/// The value v of a real type as an operand.
+pub fn real(v: *mut ir.Value) Pair {
+    return Pair.{ re: v, im: ir.vnil() };
+}
+
+fn mark(v: *mut ir.Value, t: *cty.CType, al: u64) void {
+    v.align = @truncate(u32, al);
+    if (t.quals & cty.Q_VOLATILE) != 0 {
+        v.flags = v.flags | ir.F_VOLATILE;
+    }
+}
+
+/// The parts of the complex value of type t at p (volatile: as t says).
+pub fn parts(t: *cty.CType, p: *mut ir.Value) Pair {
+    let el = t.unq.elem;
+    let rt = cg.lty(el);
+    let al = cty.align_of(el);
+    let re = ir.load(cg.B, rt, p);
+    mark(re, t, al);
+    let im = ir.load(cg.B, rt, ir.ptradd(cg.B, p, cg.usz(cty.size_of(el))));
+    mark(im, t, al);
+    return Pair.{ re: re, im: im };
+}
+
+/// Stores the complex value v (both parts) as one of type t at p.
+pub fn put(t: *cty.CType, v: Pair, p: *mut ir.Value) void {
+    let el = t.unq.elem;
+    let al = cty.align_of(el);
+    let s1 = ir.store(cg.B, v.re, p);
+    mark(s1, t, al);
+    let s2 = ir.store(cg.B, v.im, ir.ptradd(cg.B, p, cg.usz(cty.size_of(el))));
+    mark(s2, t, al);
+}
+
+/// The value v of complex type t: the address of a new temporary holding it.
+pub fn make(t: *mut cty.CType, v: Pair) *mut ir.Value {
+    let tmp = cg.alloca(t.unq, "cx");
+    put(t.unq, v, tmp);
+    return tmp;
+}
+
+/// The constant re + i im of complex type t.
+pub fn constant(t: *mut cty.CType, re: f64, im: f64) *mut ir.Value {
+    let rt = cg.lty(t.unq.elem);
+    return make(t, Pair.{ re: ir.cfp(rt, re), im: ir.cfp(rt, im) });
+}
+
+/// A complex copy of the complex value at p (of type t): an object's value,
+/// taken now (lvalue conversion).
+pub fn snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    return make(t, parts(t, p));
+}
+
+/// The truth of complex value v (6.3.1.2: unequal to 0, either part), as an i1.
+pub fn truth(v: Pair) *mut ir.Value {
+    let z = ir.cfp(v.re.ty, 0.0);
+    return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, v.re, z), ir.fcmp(cg.B, ir.RealUNE, v.im, z));
+}
+
+/// x == y (both complex: both parts equal, 6.5.9p4), as an i1; ne: x != y.
+pub fn equal(x: Pair, y: Pair, ne: bool) *mut ir.Value {
+    if ne {
+        return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, x.re, y.re), ir.fcmp(cg.B, ir.RealUNE, x.im, y.im));
+    }
+    return ir.and_(cg.B, ir.fcmp(cg.B, ir.RealOEQ, x.re, y.re), ir.fcmp(cg.B, ir.RealOEQ, x.im, y.im));
+}
+
+/// -v.
+pub fn negate(v: Pair) Pair {
+    return Pair.{ re: ir.fneg(cg.B, v.re), im: ir.fneg(cg.B, v.im) };
+}
+
+/// The conjugate of v.
+pub fn conj(v: Pair) Pair {
+    return Pair.{ re: v.re, im: ir.fneg(cg.B, v.im) };
+}
+
+fn bin(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    return ir.binop(cg.B, op, x, y);
+}
+
+// The operators (ctok's P_ codes, which cgen_expr passes).
+pub const OP_ADD: i32 = 1;
+pub const OP_SUB: i32 = 2;
+pub const OP_MUL: i32 = 3;
+pub const OP_DIV: i32 = 4;
+
+/// x op y in complex type t (op: OP_ADD ... OP_DIV), either operand maybe
+/// real (G.5).
+pub fn arith(op: i32, t: *mut cty.CType, x: Pair, y: Pair) Pair {
+    let xr = u.isnil(x.im);
+    let yr = u.isnil(y.im);
+    if op == OP_ADD {
+        if xr {
+            return Pair.{ re: bin(ir.OP_FADD, x.re, y.re), im: y.im };
+        }
+        if yr {
+            return Pair.{ re: bin(ir.OP_FADD, x.re, y.re), im: x.im };
+        }
+        return Pair.{ re: bin(ir.OP_FADD, x.re, y.re), im: bin(ir.OP_FADD, x.im, y.im) };
+    }
+    if op == OP_SUB {
+        if xr {
+            return Pair.{ re: bin(ir.OP_FSUB, x.re, y.re), im: ir.fneg(cg.B, y.im) };
+        }
+        if yr {
+            return Pair.{ re: bin(ir.OP_FSUB, x.re, y.re), im: x.im };
+        }
+        return Pair.{ re: bin(ir.OP_FSUB, x.re, y.re), im: bin(ir.OP_FSUB, x.im, y.im) };
+    }
+    if op == OP_MUL {
+        if xr {
+            return Pair.{ re: bin(ir.OP_FMUL, x.re, y.re), im: bin(ir.OP_FMUL, x.re, y.im) };
+        }
+        if yr {
+            return Pair.{ re: bin(ir.OP_FMUL, x.re, y.re), im: bin(ir.OP_FMUL, x.im, y.re) };
+        }
+        return multiply(t, x, y);
+    }
+    if yr {
+        return Pair.{ re: bin(ir.OP_FDIV, x.re, y.re), im: bin(ir.OP_FDIV, x.im, y.re) };
+    }
+    let mut xi = x.im;
+    if xr {
+        xi = ir.cfp(x.re.ty, 0.0);  // (x / (u + iv) as (x + i0) / (u + iv))
+    }
+    return call_helper(t, false, x.re, xi, y.re, y.im);
+}
+
+// (a + ib)(c + id) in line; the helper when both parts are NaN.
+fn multiply(t: *mut cty.CType, x: Pair, y: Pair) Pair {
+    let ac = bin(ir.OP_FMUL, x.re, y.re);
+    let bd = bin(ir.OP_FMUL, x.im, y.im);
+    let ad = bin(ir.OP_FMUL, x.re, y.im);
+    let bc = bin(ir.OP_FMUL, x.im, y.re);
+    let re = bin(ir.OP_FSUB, ac, bd);
+    let im = bin(ir.OP_FADD, ad, bc);
+    if (re.kind == ir.V_CFP) and (im.kind == ir.V_CFP) {
+        // (both folded: the IR folds no NaN, so neither is one)
+        return Pair.{ re: re, im: im };
+    }
+    let both = ir.and_(cg.B, is_nan(cg.B, re), is_nan(cg.B, im));
+    let from = ir.insert_block(cg.B);
+    let slow = cg.new_block("cmul.nan");
+    let done = cg.new_block("cmul");
+    ir.condbr(cg.B, both, slow, done);
+    cg.at_end(slow);
+    let r = call_helper(t, true, x.re, x.im, y.re, y.im);
+    let slow_end = ir.insert_block(cg.B);
+    ir.br(cg.B, done);
+    cg.at_end(done);
+    let pr = ir.phi(cg.B, re.ty);
+    ir.add_incoming(pr, re, from);
+    ir.add_incoming(pr, r.re, slow_end);
+    let pi = ir.phi(cg.B, re.ty);
+    ir.add_incoming(pi, im, from);
+    ir.add_incoming(pi, r.im, slow_end);
+    return Pair.{ re: pr, im: pi };
+}
+
+// A call of the multiplication (mul) or division helper of t's real type.
+fn call_helper(t: *mut cty.CType, mul: bool, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value,
+               d: *mut ir.Value) Pair {
+    let f = helper(mul, a.ty);
+    let out = cg.alloca(t.unq, "cres");
+    let mut args: [5]*mut ir.Value = [out, a, b, c, d];
+    _ = ir.call(cg.B, f.ty, f.val, args[..]);
+    return parts(t.unq, out);
+}
+
+// -----------------------------------------------------------------------------
+// The helpers
+// -----------------------------------------------------------------------------
+
+fn is_nan(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(bd, ir.RealUNE, x, x);
+}
+
+fn fabs(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    let mut a: [1]*mut ir.Value = [x];
+    return ir.intr(bd, ir.IN_FABS, x.ty, a[..]);
+}
+
+fn copysign(bd: *mut ir.Builder, m: *mut ir.Value, s: *mut ir.Value) *mut ir.Value {
+    let mut a: [2]*mut ir.Value = [m, s];
+    return ir.intr(bd, ir.IN_COPYSIGN, m.ty, a[..]);
+}
+
+fn infinity(t: *mut ir.Ty) *mut ir.Value {
+    let z: f64 = 0.0;
+    return ir.cfp(t, 1.0 / z);
+}
+
+fn is_inf(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(bd, ir.RealOEQ, fabs(bd, x), infinity(x.ty));
+}
+
+fn is_finite(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    return ir.fcmp(bd, ir.RealOLT, fabs(bd, x), infinity(x.ty));
+}
+
+// copysign(isinf(x) ? 1 : 0, x)
+fn boxed(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    let one = ir.cfp(x.ty, 1.0);
+    let zero = ir.cfp(x.ty, 0.0);
+    return copysign(bd, ir.select(bd, is_inf(bd, x), one, zero), x);
+}
+
+// isnan(x) ? copysign(0, x) : x
+fn nan0(bd: *mut ir.Builder, x: *mut ir.Value) *mut ir.Value {
+    return ir.select(bd, is_nan(bd, x), copysign(bd, ir.cfp(x.ty, 0.0), x), x);
+}
+
+fn sel(bd: *mut ir.Builder, c: *mut ir.Value, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    return ir.select(bd, c, x, y);
+}
+
+fn fb(bd: *mut ir.Builder, op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    return ir.binop(bd, op, x, y);
+}
+
+// The helper `__axiom_cmul_fN` (mul) or `__axiom_cdiv_fN` of real IR type
+// rt: void(ptr out, a, b, c, d), storing the result's parts at out.
+fn helper(mul: bool, rt: *mut ir.Ty) *mut ir.Func {
+    let name = u.f2("__axiom_%s_f%s", u.pick(mul, "cmul", "cdiv"), u.idec(rt.bits));
+    let found = ir.get_function(cg.M, name);
+    if u.notnil(found) {
+        return found;
+    }
+    let mut ps: [5]*mut ir.Ty = [cg.T_ptr, rt, rt, rt, rt];
+    let f = ir.add_function(cg.M, name, ir.t_fn(cg.T_void, ps[..], false));
+    f.linkage = ir.LINK_INTERNAL;
+    f.src = ir.cur_src;
+    // (one copy: the multiplication's is called only for NaN results)
+    f.noinline = true;
+    f.cold = mul;
+    let bd = ir.new_builder();
+    ir.at_end(bd, ir.append_block(f, "entry"));
+    let a = f.params[1];
+    let b = f.params[2];
+    let c = f.params[3];
+    let d = f.params[4];
+    let mut r = Pair.{ re: ir.vnil(), im: ir.vnil() };
+    if mul {
+        r = mul_body(bd, a, b, c, d);
+    } else {
+        r = div_body(bd, a, b, c, d);
+    }
+    let s1 = ir.store(bd, r.re, f.params[0]);
+    s1.align = @truncate(u32, rt.align);
+    let s2 = ir.store(bd, r.im, ir.ptradd(bd, f.params[0], cg.usz(rt.size)));
+    s2.align = @truncate(u32, rt.align);
+    ir.ret_void(bd);
+    return f;
+}
+
+// (a + ib)(c + id) with G.5.1's recovery (ccomplex.cmul): the steps, each a
+// select on the condition the example's `if` tests.
+fn mul_body(bd: *mut ir.Builder, a0: *mut ir.Value, b0: *mut ir.Value, c0: *mut ir.Value, d0: *mut ir.Value) Pair {
+    let ac = fb(bd, ir.OP_FMUL, a0, c0);
+    let bd_ = fb(bd, ir.OP_FMUL, b0, d0);
+    let ad = fb(bd, ir.OP_FMUL, a0, d0);
+    let bc = fb(bd, ir.OP_FMUL, b0, c0);
+    let x = fb(bd, ir.OP_FSUB, ac, bd_);
+    let y = fb(bd, ir.OP_FADD, ad, bc);
+    // an infinite first operand: boxed, and NaNs in the other made zeros
+    let zinf = ir.or_(bd, is_inf(bd, a0), is_inf(bd, b0));
+    let a1 = sel(bd, zinf, boxed(bd, a0), a0);
+    let b1 = sel(bd, zinf, boxed(bd, b0), b0);
+    let c1 = sel(bd, zinf, nan0(bd, c0), c0);
+    let d1 = sel(bd, zinf, nan0(bd, d0), d0);
+    // an infinite second operand: likewise
+    let winf = ir.or_(bd, is_inf(bd, c1), is_inf(bd, d1));
+    let c2 = sel(bd, winf, boxed(bd, c1), c1);
+    let d2 = sel(bd, winf, boxed(bd, d1), d1);
+    let a2 = sel(bd, winf, nan0(bd, a1), a1);
+    let b2 = sel(bd, winf, nan0(bd, b1), b1);
+    // neither, but a product overflowed: every NaN made a zero
+    let some = ir.or_(bd, zinf, winf);
+    let prods = ir.or_(bd, ir.or_(bd, is_inf(bd, ac), is_inf(bd, bd_)), ir.or_(bd, is_inf(bd, ad), is_inf(bd, bc)));
+    let ovf = ir.and_(bd, ir.not_(bd, some), prods);
+    let a3 = sel(bd, ovf, nan0(bd, a2), a2);
+    let b3 = sel(bd, ovf, nan0(bd, b2), b2);
+    let c3 = sel(bd, ovf, nan0(bd, c2), c2);
+    let d3 = sel(bd, ovf, nan0(bd, d2), d2);
+    let recalc = ir.or_(bd, some, ovf);
+    let inf = infinity(a0.ty);
+    let rx = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, a3, c3), fb(bd, ir.OP_FMUL, b3, d3)));
+    let ry = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, a3, d3), fb(bd, ir.OP_FMUL, b3, c3)));
+    // (the helper is called when x and y are both NaN; recovery only then)
+    let both = ir.and_(bd, is_nan(bd, x), is_nan(bd, y));
+    let pick = ir.and_(bd, both, recalc);
+    return Pair.{ re: sel(bd, pick, rx, x), im: sel(bd, pick, ry, y) };
+}
+
+// (a + ib) / (c + id) (ccomplex.cdiv): Smith's method, then G.5.1's
+// recovery when both parts are NaN.
+fn div_body(bd: *mut ir.Builder, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value, d: *mut ir.Value) Pair {
+    let t = a.ty;
+    let zero = ir.cfp(t, 0.0);
+    // |c| >= |d|: r = d/c, den = c + d*r
+    let r1 = fb(bd, ir.OP_FDIV, d, c);
+    let den1 = fb(bd, ir.OP_FADD, c, fb(bd, ir.OP_FMUL, d, r1));
+    let x1 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, a, fb(bd, ir.OP_FMUL, b, r1)), den1);
+    let y1 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, b, fb(bd, ir.OP_FMUL, a, r1)), den1);
+    // (r underflowed to 0: d*(b/c) keeps what d*r lost)
+    let x1z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, a, fb(bd, ir.OP_FMUL, d, fb(bd, ir.OP_FDIV, b, c))), den1);
+    let y1z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, b, fb(bd, ir.OP_FMUL, d, fb(bd, ir.OP_FDIV, a, c))), den1);
+    let nz1 = ir.fcmp(bd, ir.RealUNE, r1, zero);
+    let xa = sel(bd, nz1, x1, x1z);
+    let ya = sel(bd, nz1, y1, y1z);
+    // |c| < |d|: r = c/d, den = c*r + d
+    let r2 = fb(bd, ir.OP_FDIV, c, d);
+    let den2 = fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, c, r2), d);
+    let x2 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, a, r2), b), den2);
+    let y2 = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, b, r2), a), den2);
+    let x2z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, c, fb(bd, ir.OP_FDIV, a, d)), b), den2);
+    let y2z = fb(bd, ir.OP_FDIV, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, c, fb(bd, ir.OP_FDIV, b, d)), a), den2);
+    let nz2 = ir.fcmp(bd, ir.RealUNE, r2, zero);
+    let xb = sel(bd, nz2, x2, x2z);
+    let yb = sel(bd, nz2, y2, y2z);
+    let first = ir.fcmp(bd, ir.RealOGE, fabs(bd, c), fabs(bd, d));
+    let x = sel(bd, first, xa, xb);
+    let y = sel(bd, first, ya, yb);
+    // the recovery
+    let inf = infinity(t);
+    let both = ir.and_(bd, is_nan(bd, x), is_nan(bd, y));
+    // a zero divisor and a dividend that is not NaN + iNaN: an infinity
+    let wzero = ir.and_(bd, ir.fcmp(bd, ir.RealOEQ, c, zero), ir.fcmp(bd, ir.RealOEQ, d, zero));
+    let znum = ir.or_(bd, ir.not_(bd, is_nan(bd, a)), ir.not_(bd, is_nan(bd, b)));
+    let k1 = ir.and_(bd, both, ir.and_(bd, wzero, znum));
+    let ci = copysign(bd, inf, c);
+    let xk1 = fb(bd, ir.OP_FMUL, ci, a);
+    let yk1 = fb(bd, ir.OP_FMUL, ci, b);
+    // an infinite dividend and a finite divisor: an infinity
+    let zinf = ir.or_(bd, is_inf(bd, a), is_inf(bd, b));
+    let wfin = ir.and_(bd, is_finite(bd, c), is_finite(bd, d));
+    let k2 = ir.and_(bd, ir.and_(bd, both, ir.not_(bd, k1)), ir.and_(bd, zinf, wfin));
+    let ab = boxed(bd, a);
+    let bb = boxed(bd, b);
+    let xk2 = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, ab, c), fb(bd, ir.OP_FMUL, bb, d)));
+    let yk2 = fb(bd, ir.OP_FMUL, inf, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, bb, c), fb(bd, ir.OP_FMUL, ab, d)));
+    // a finite dividend and an infinite divisor: a zero
+    let winf = ir.or_(bd, is_inf(bd, c), is_inf(bd, d));
+    let zfin = ir.and_(bd, is_finite(bd, a), is_finite(bd, b));
+    let not12 = ir.and_(bd, ir.not_(bd, k1), ir.not_(bd, k2));
+    let k3 = ir.and_(bd, ir.and_(bd, both, not12), ir.and_(bd, winf, zfin));
+    let cb = boxed(bd, c);
+    let db = boxed(bd, d);
+    let xk3 = fb(bd, ir.OP_FMUL, zero, fb(bd, ir.OP_FADD, fb(bd, ir.OP_FMUL, a, cb), fb(bd, ir.OP_FMUL, b, db)));
+    let yk3 = fb(bd, ir.OP_FMUL, zero, fb(bd, ir.OP_FSUB, fb(bd, ir.OP_FMUL, b, cb), fb(bd, ir.OP_FMUL, a, db)));
+    let rx = sel(bd, k1, xk1, sel(bd, k2, xk2, sel(bd, k3, xk3, x)));
+    let ry = sel(bd, k1, yk1, sel(bd, k2, yk2, sel(bd, k3, yk3, y)));
+    return Pair.{ re: rx, im: ry };
+}
