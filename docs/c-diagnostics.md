@@ -167,7 +167,7 @@ names the feature and the standard that has it (or removed it).
 | `C3009` | An invalid array size: not an integer, not positive, or too large (more than 2^47 bytes). |
 | `C3010` | A declaration that declares nothing, a member declaration that declares no member, or a name where none can be. |
 | `C3011` | The wrong kind of tag (`union S` for a structure), or an enumeration that is not defined. |
-| `C3013` | An enumeration constant out of range (of `int`, before C23; of the fixed underlying type). |
+| `C3013` | An enumeration constant out of range (of `int`, before C23; of the fixed underlying type), or values that no integer type an enumeration may have holds. |
 | `C3033` | An invalid initializer: of a typedef, a function or a parameter, an `extern` object in a block, or too many braces around a scalar. |
 | `C3045` | A function with internal linkage that is used and not defined (6.9p3). |
 | `C3050` | A static assertion that fails. |
@@ -186,7 +186,7 @@ names the feature and the standard that has it (or removed it).
 | `C3203` | No association of a generic selection matches the controlling expression's type, and there is no `default`. |
 | `C3210` | A `_BitInt` width out of range (at least 2, or 1 for `unsigned _BitInt`; at most `BITINT_MAXWIDTH`, 65535). |
 | `C3211` | An integer constant with a `wb` or `uwb` suffix that is too large for any bit-precise type. |
-| `C3212` | An integer constant expression whose value is wider than 64 bits (of `__int128` or a `_BitInt`) where a value of at most 64 bits is needed: an alignment, a bit-field's width, an enumeration constant, a designator's index. |
+| `C3212` | An integer constant expression whose value is wider than 64 bits (of `__int128` or a `_BitInt`) where a value of at most 64 bits is needed: an alignment, a bit-field's width, a designator's index. |
 | `C3220` | `main` declared `inline` or `_Noreturn`. |
 | `C3221` | An inline definition that defines a modifiable object with static storage duration or refers to an identifier with internal linkage (6.7.4p3). |
 | `C3222` | The address of an object declared `register` taken, or a `register` array used as a pointer. |

@@ -34,6 +34,8 @@ import "csema_attr.ax" as catr;
 import "csema_expr.ax" as cx;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
+import "std/c/rt/wideint" as wi;
 
 /// The strictest alignment an alignment specifier may ask for.
 pub const MAX_ALIGN: u64 = 4096;
@@ -403,21 +405,100 @@ pub fn enum_tag(ts: *mut cast.TagSpec, lone: bool) *mut cty.CType {
     return t;
 }
 
-// The value of an enumeration constant: its bits, and whether negative.
+// The value of an enumeration constant, exact: 192 bits of two's
+// complement, more than any type an enumeration can have (so that one more
+// than the largest value of unsigned __int128, or a wider _BitInt's value,
+// is told apart from them); huge: a value that does not fit even those.
 struct Val {
-    v: u64,
-    neg: bool,
-    ok: bool,
+    w: [3]u64,
+    huge: bool,
+}
+
+const VL: usize = 3;
+
+fn neg(x: Val) bool {
+    return (x.w[2] >> 63) != 0;
+}
+
+// The value of integer constant e.
+fn val_of(e: *cast.Expr) Val {
+    let mut n: usize = VL;
+    if cty.is_wint(e.ty) {
+        n = @max(n, cty.limbs(e.ty));
+    }
+    let v = cw.value(e, n);
+    let mut x = Val.{ w: [v[0], v[1], v[2]], huge: false };
+    let mut ext: u64 = 0;
+    if neg(x) {
+        ext = 0xFFFF_FFFF_FFFF_FFFF;
+    }
+    for i in VL..n {
+        if v[i] != ext {
+            x.huge = true;
+        }
+    }
+    return x;
+}
+
+// Does integer type t hold x?
+fn fitsv(t: *cty.CType, x: Val) bool {
+    if x.huge {
+        return false;
+    }
+    if t.unq.kind == cty.TK_BOOL {
+        return (x.w[0] <= 1) and (x.w[1] == 0) and (x.w[2] == 0);
+    }
+    let mut c: [3]u64 = x.w;
+    wi.wi_norm(&mut c[0], VL, @bit_cast(u32, t.unq.bits), t.unq.is_signed);
+    return (c[0] == x.w[0]) and (c[1] == x.w[1]) and (c[2] == x.w[2]);
+}
+
+// x + 1 (never past the range of Val's 192 bits from an enumeration's values).
+fn plus1(x: Val) Val {
+    let one: [3]u64 = [1, 0, 0];
+    let mut r = Val.{ w: [0, 0, 0], huge: x.huge };
+    wi.wi_add(&mut r.w[0], &x.w[0], &one[0], VL);
+    return r;
+}
+
+fn same_val(a: Val, b: Val) bool {
+    return (a.w[0] == b.w[0]) and (a.w[1] == b.w[1]) and (a.w[2] == b.w[2]);
+}
+
+// The exact value of enumeration constant s.
+fn sym_val(s: *cast.CSym) Val {
+    return Val.{ w: [s.wide[0], s.wide[1], s.wide[2]], huge: false };
 }
 
 // The first of the types `cands` that holds v; nil if none.
 fn first_fit(cands: []mut *mut cty.CType, x: Val) *mut cty.CType {
     for c in cands {
-        if cty.fits(c, x.v, x.neg) {
+        if fitsv(c, x) {
             return c;
         }
     }
     return u.nil.[cty.CType]();
+}
+
+// The integer types wider than int an enumeration's type (or a constant's
+// in its list) may be, of a signedness (C23 6.7.2.2p11-12): long, long long
+// and, in a GNU dialect, __int128, which is an extended integer type there.
+fn wider_types(signed: bool) []mut *mut cty.CType {
+    let mut l = u.List.[*mut cty.CType].empty();
+    if signed {
+        l.push(cty.t_long);
+        l.push(cty.t_llong);
+        if cs.opts().gnu {
+            l.push(cty.t_int128);
+        }
+    } else {
+        l.push(cty.t_ulong);
+        l.push(cty.t_ullong);
+        if cs.opts().gnu {
+            l.push(cty.t_uint128);
+        }
+    }
+    return l.items();
 }
 
 // The constants of the enumeration t that tag specifier ts defines, declared
@@ -442,54 +523,47 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
     let mut k: usize = 0;
     let c23 = cs.std() >= co.C23;
     let mut syms = u.List.[*mut cast.CSym].empty();
-    let mut prev = Val.{ v: 0, neg: false, ok: false };
+    let zero = Val.{ w: [0, 0, 0], huge: false };
+    let mut prev = zero;
     let mut prev_ty = cty.t_int;
     let mut all_int = true;
-    let mut min = Val.{ v: 0, neg: false, ok: false };
-    let mut max = Val.{ v: 0, neg: false, ok: false };
+    let mut min = zero;
+    let mut max = zero;
     let mut first = true;
     for en in ts.enumerators.items() {
         attrs(&en.attrs, AP_ENUMERATOR);
-        let mut x = Val.{ v: 0, neg: false, ok: true };
+        let mut x = zero;
         let mut ety = cty.t_int;
         if u.notnil(en.value) {
-            let r = cx.ice(en.value, "an enumeration constant's value");
+            let r = cx.ice_wide(en.value, "an enumeration constant's value");
             en.value = r.e;
             if r.ok {
-                x = Val.{ v: r.v, neg: r.e.ty.is_signed and (@bit_cast(i64, r.v) < 0), ok: true };
+                x = val_of(r.e);
                 if u.notnil(fixed) {
-                    if not cty.fits(fixed, x.v, x.neg) {
+                    if not fitsv(fixed, x) {
                         cs.err(en.span, "C3013",
                                u.f2("the value of '%s' is outside the range of its underlying type %s", en.name,
                                     cs.tq(fixed)));
-                        x = Val.{ v: 0, neg: false, ok: true };
+                        x = zero;
                     }
-                } else if not cty.fits(cty.t_int, x.v, x.neg) {
+                } else if not fitsv(cty.t_int, x) {
                     if not c23 {
                         cs.err(en.span, "C3013", u.f1("the value of '%s' is outside the range of int", en.name));
-                        x = Val.{ v: 0, neg: false, ok: true };
+                        x = zero;
                     } else {
+                        // (6.7.2.2p11: the type of the integer constant expression)
                         ety = cty.promote(r.e.ty);
-                        if cty.is_wint(ety) {
-                            // (an enumeration's values are at most 64 bits:
-                            // cx.ice; long long or unsigned long long holds it)
-                            ety = cty.t_llong;
-                            if not cty.fits(ety, x.v, x.neg) {
-                                ety = cty.t_ullong;
-                            }
-                        }
                     }
                 }
             }
         } else if not first {
             // the previous value plus one
-            x = Val.{ v: prev.v +% 1, neg: prev.neg and (prev.v != 0xFFFF_FFFF_FFFF_FFFF), ok: true };
-            let wrapped = not prev.neg and (prev.v == 0xFFFF_FFFF_FFFF_FFFF);  // (past every type's range)
+            x = plus1(prev);
             let mut lim = prev_ty;
             if u.notnil(fixed) {
                 lim = fixed;
             }
-            if wrapped or not cty.fits(lim, x.v, x.neg) {
+            if not fitsv(lim, x) {
                 if u.notnil(fixed) or not c23 {
                     let mut what: []u8 = "int";
                     if u.notnil(fixed) {
@@ -500,13 +574,10 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
                                 what));
                     x = prev;
                 } else {
-                    // (6.7.2.2p11: a wider type of the previous constant's signedness)
-                    let mut cands: [2]*mut cty.CType = [cty.t_long, cty.t_llong];
-                    if not prev_ty.is_signed {
-                        cands = [cty.t_ulong, cty.t_ullong];
-                    }
-                    let nt = first_fit(cands[..], x);
-                    if u.isnil(nt) or wrapped {
+                    // (6.7.2.2p11: a wider type of the previous constant's
+                    // signedness, not a bit-precise one)
+                    let nt = first_fit(wider_types(prev_ty.is_signed), x);
+                    if u.isnil(nt) {
                         cs.err(en.span, "C3013",
                                u.f1("the value of '%s' (the previous one plus 1) is outside the range of every integer type",
                                     en.name));
@@ -519,7 +590,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
                 ety = lim;
             }
         }
-        if u.isnil(fixed) and not cty.fits(cty.t_int, x.v, x.neg) {
+        if u.isnil(fixed) and not fitsv(cty.t_int, x) {
             all_int = false;
         } else if u.isnil(fixed) and (ety.rank > cty.t_int.rank) {
             ety = cty.t_int;  // (back in int's range)
@@ -535,8 +606,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
         prev_ty = ety;
         if again {
             // (the k-th constant of the earlier list: the same name and value)
-            if (k < old.len) and u.same(old.get(k).name, en.name) and
-               ((old.get(k).value == x.v) or (old.get(k).value == cty.wrap(old.get(k).ty, x.v))) {
+            if (k < old.len) and u.same(old.get(k).name, en.name) and same_val(sym_val(old.get(k)), x) {
                 en.sym = old.get(k);
             } else {
                 same = false;
@@ -553,7 +623,11 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
             st = t;  // (C23: the constants of an enumeration with a fixed type have the enumerated type)
         }
         let s = cs.new_sym(cast.SK_ENUMCONST, en.name, en.span, st);
-        s.value = cty.wrap(st, x.v);
+        s.wide = u.newn.[u64](VL);
+        for i in 0..VL {
+            s.wide[i] = x.w[i];
+        }
+        s.value = cty.wrap(st, x.w[0]);
         en.sym = s;
         catr.mark_sym(s, &en.attrs);
         syms.push(s);
@@ -571,27 +645,29 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
     // the compatible type: unsigned int if no value is negative, else int,
     // or (C23) the first wider type that holds them all
     let mut base = u.nil.[cty.CType]();
+    let mut cands = u.List.[*mut cty.CType].empty();
     if gnu_packed(&ts.attrs) {
         // (a GNU dialect's packed enumeration: the smallest type, from char on)
-        let mut cands: [5]*mut cty.CType = [cty.t_uchar, cty.t_ushort, cty.t_uint, cty.t_ulong, cty.t_ullong];
-        if min.neg {
-            cands = [cty.t_schar, cty.t_short, cty.t_int, cty.t_long, cty.t_llong];
+        if neg(min) {
+            cands.push(cty.t_schar);
+            cands.push(cty.t_short);
+        } else {
+            cands.push(cty.t_uchar);
+            cands.push(cty.t_ushort);
         }
-        for c in cands {
-            if u.isnil(base) and cty.fits(c, min.v, min.neg) and cty.fits(c, max.v, max.neg) {
-                base = c;
-            }
-        }
-    } else if min.neg {
-        let mut cands: [3]*mut cty.CType = [cty.t_int, cty.t_long, cty.t_llong];
-        for c in cands {
-            if u.isnil(base) and cty.fits(c, min.v, true) and cty.fits(c, max.v, max.neg) {
-                base = c;
-            }
-        }
+    }
+    if neg(min) {
+        cands.push(cty.t_int);
     } else {
-        let mut cands: [3]*mut cty.CType = [cty.t_uint, cty.t_ulong, cty.t_ullong];
-        base = first_fit(cands[..], max);
+        cands.push(cty.t_uint);
+    }
+    for c in wider_types(neg(min)) {
+        cands.push(c);
+    }
+    for c in cands.items() {
+        if u.isnil(base) and fitsv(c, min) and fitsv(c, max) {
+            base = c;
+        }
     }
     if u.isnil(base) {
         cs.err(ts.span, "C3013", "no integer type can represent all the values of the enumeration's constants");
@@ -602,7 +678,7 @@ fn enumerators(t: *mut cty.CType, ts: *mut cast.TagSpec, again: bool) bool {
         // (C23: when some value is outside int, the constants have the enumerated type)
         for s in syms.items() {
             s.ty = t;
-            s.value = cty.wrap(base, s.value);
+            s.value = cty.wrap(base, s.wide[0]);
         }
     }
     record_consts(t, &syms);
@@ -615,7 +691,10 @@ fn record_consts(t: *mut cty.CType, syms: *u.List.[*mut cast.CSym]) void {
     for s in syms.items() {
         ti.consts.push(s.name);
         // (as a value of the compatible type: the same bits for the same value)
-        ti.cvals.push(cty.wrap(ti.base, s.value));
+        let mut c: [3]u64 = [s.wide[0], s.wide[1], s.wide[2]];
+        wi.wi_norm(&mut c[0], VL, @bit_cast(u32, ti.base.unq.bits), ti.base.unq.is_signed);
+        ti.cvals.push(c[0]);
+        ti.chis.push(c[1]);
     }
 }
 
@@ -632,15 +711,9 @@ fn gnu_packed(list: *u.List.[*mut cast.Attr]) bool {
     return false;
 }
 
-// a < b, for values given as bits and sign.
+// a < b.
 fn less(a: Val, b: Val) bool {
-    if a.neg != b.neg {
-        return a.neg;
-    }
-    if a.neg {
-        return @bit_cast(i64, a.v) < @bit_cast(i64, b.v);
-    }
-    return a.v < b.v;
+    return wi.wi_cmp(&a.w[0], &b.w[0], VL, true) < 0;
 }
 
 // -----------------------------------------------------------------------------
