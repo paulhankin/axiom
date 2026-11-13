@@ -1,0 +1,1089 @@
+// =============================================================================
+// vectorize.ax - counted loops over arrays as vector loops (x86-64: SSE2, or
+// AVX2 when the function may use it; AArch64: Advanced SIMD), at -O2 and -O3.
+//
+// The loops are those idioms.ax reads (a header of phis, the test and the
+// branch; one body block), whose body computes lane by lane:
+//
+//     H: j = phi [j0, pre], [j + 1, B]    (and pointers stepping by |T|)
+//        acc = phi [a0, pre], [acc op x, B] ...   (reductions)
+//        condbr (j <cmp> end) -> B, exit
+//     B: x = load T, src(t) ...;  y = ops of the loads, invariants and
+//        constants;  [store y, dst(t)];  acc' = acc op y;  br H
+//
+// with every load and the store (at most one) at dst0 + t * |T| for the
+// iteration t (idioms.ax: sequence), all of one element type T (integers of
+// 8 to 64 bits, f32, f64), and no other memory access, call or trap. The
+// reductions are integer +, -, *, &, |, ^ and min / max (a select of a
+// comparison of acc with the element): associative and commutative modulo
+// 2^w, so their lanes may be summed in any order. Floating-point reductions
+// are not made: they would change the order of the operations (and so the
+// rounding); a floating operation lane by lane is the scalar one.
+//
+// A loop of a known count below 4 VF is left as it is (unroll.ax unrolls
+// small ones). The vector loop runs VF = (vector bits) / |T| iterations at a time, n - n
+// mod VF of the n the loop runs (idioms.counted_trips); then the original
+// loop runs the rest from where it left (its phis start from the values the
+// vector loop reached: the counters advanced by its iterations, each
+// reduction its start and the vector accumulator's lanes combined). It is
+// skipped when n < VF, or when the store's region begins within VF elements
+// after a load's (d = dst0 - src0, 0 < d < VF * |T|: a later iteration would
+// read what an earlier one in the same vector stores; d <= 0, or the regions
+// apart, are safe, as each chunk is loaded before it is stored), unless C's
+// restrict says the two are apart (ir.restrict_apart).
+//
+// Searches (search_loop): a loop that leaves when an element equals (or
+// differs from) an invariant,
+//
+//     H: i = phi ...;  condbr (i <cmp> end) -> T, done
+//     T: x = load T, src(t);  condbr (x == c) -> found, L
+//     L: (the steps);  br H
+//
+// first runs over the aligned vectors of 16 bytes that hold the elements:
+// a vector compare and any-true per vector, until one has a match or the
+// next vector would end past the loop's last element; then the scalar loop
+// resumes at the first element of that vector (or where the vectors
+// stopped), and finds the match itself. The first vector may begin before
+// the loop's first element: a match there only resumes the scalar loop
+// earlier. Reading the whole vectors is safe: each lies in one 16-byte
+// aligned block, so in the page of an element the scalar loop reads (the
+// first element of the first one, the match of the last one; when the loop
+// runs no iteration none is read); the values read past the match are not
+// used. Elements of 1, 2 and 4 bytes at addresses aligned to their size.
+//
+// Lane operations are taken only where the target has them as instructions
+// (vec_ok): not 64-bit or byte multiplies, nor 64-bit minimum and maximum,
+// nor byte shifts, on either target (and on x86-64 32-bit multiplies,
+// 8- and 32-bit min and max only with SSE4.1).
+// =============================================================================
+import "idioms.ax" as idm;
+import "ir.ax" as ir;
+import "opt.ax" as opt;
+import "target.ax" as tg;
+import "util.ax" as u;
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+let mut tag_base: i64 = 0x3800_0000_0000;
+
+// A reduction: a header phi and the operation of its next value.
+struct Red {
+    phi: *mut ir.Value,
+    start: *mut ir.Value,
+    next: *mut ir.Value,  // acc op x (or the select of min / max)
+    op: i32,              // ir.OP_ADD ... or for min / max an IN_ intrinsic, as `kind`
+    minmax: i32,          // 0, or the IN_SMIN ... intrinsic of a select
+    x: *mut ir.Value,     // the element operand
+}
+
+// The vector width for lanes of type t, in bits (0: none).
+fn vec_bits() u64 {
+    if tg.g_arch == tg.ARCH_X64 {
+        if tg.has(tg.X_AVX2) {
+            return 256;
+        }
+        return 128;
+    }
+    if tg.g_arch == tg.ARCH_A64 {
+        return 128;
+    }
+    return 0;
+}
+
+fn sse41() bool {
+    return (tg.g_arch != tg.ARCH_X64) or tg.has(tg.X_SSE41);
+}
+
+// Can the operation op (an ir.OP_, or with intr an IN_ min / max) be made
+// lane by lane on lanes of type t as an instruction of the target?
+// Is i pure (idioms.pure) and not an asm statement or one's result? A loop
+// with asm in it is left as it is: its statements are copied neither into a
+// vector loop nor next to the scalar one (ir.ASM_NODUP), even pure ones.
+fn plain(i: *ir.Value) bool {
+    if (i.op == ir.OP_INTR) and ((ir.intr_id(i) == ir.IN_ASM) or (ir.intr_id(i) == ir.IN_CALL_RESULT)) {
+        return false;
+    }
+    return idm.pure(i);
+}
+
+fn vec_ok(op: i32, intr: i32, t: *ir.Ty) bool {
+    let fl = t.kind == ir.T_FLOAT;
+    let b = t.bits;
+    if intr != 0 {
+        if fl or (b == 64) {
+            return false;
+        }
+        if tg.g_arch == tg.ARCH_X64 and not sse41() {
+            // (SSE2 has pminsw, pmaxsw, pminub, pmaxub only)
+            return ((b == 16) and ((intr == ir.IN_SMIN) or (intr == ir.IN_SMAX))) or
+                   ((b == 8) and ((intr == ir.IN_UMIN) or (intr == ir.IN_UMAX)));
+        }
+        return true;
+    }
+    if fl {
+        return (op == ir.OP_FADD) or (op == ir.OP_FSUB) or (op == ir.OP_FMUL) or (op == ir.OP_FDIV);
+    }
+    if (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR) {
+        return true;
+    }
+    if op == ir.OP_MUL {
+        return (b == 16) or ((b == 32) and sse41());
+    }
+    if (op == ir.OP_SHL) or (op == ir.OP_LSHR) {
+        return b >= 16;
+    }
+    if op == ir.OP_ASHR {
+        return (b == 16) or (b == 32);
+    }
+    return false;
+}
+
+// The loop being vectorized.
+struct Lp {
+    tag: i64,
+    h: *mut ir.Block,
+    body: *mut ir.Block,
+    pre: *mut ir.Block,
+    exit: *mut ir.Block,
+    ivs: u.List.[idm.Iv],
+    reds: u.List.[Red],
+    ci: i32,  // the counter tested
+    pred: i32,
+    end: *mut ir.Value,
+    t: *mut ir.Ty,  // the lane type
+    loads: u.List.[*mut ir.Value],
+    st: *mut ir.Value,
+    vals: u.List.[*mut ir.Value],  // the body's instructions done in vector lanes, in order
+}
+
+fn in_list(l: *u.List.[*mut ir.Value], v: *mut ir.Value) bool {
+    for x in l.items() {
+        if x == v {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The reduction phi p would be (next its value from the body), if it is one.
+fn reduction(lp: *mut Lp, p: *mut ir.Value, start: *mut ir.Value, next: *mut ir.Value) bool {
+    if (p.ty.kind != ir.T_INT) or (p.ty.bits > 64) or (p.ty.bits < 8) or u.isnil(next) or (next.kind != ir.V_INST) or
+       (next.blk != lp.body) {
+        return false;
+    }
+    let op = next.op;
+    if (op == ir.OP_ADD) or (op == ir.OP_MUL) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR) {
+        let mut x = vnil();
+        if next.a == p {
+            x = next.b;
+        } else if next.b == p {
+            x = next.a;
+        }
+        if u.isnil(x) or (x == p) {
+            return false;
+        }
+        lp.reds.push(Red.{ phi: p, start: start, next: next, op: op, minmax: 0, x: x });
+        return true;
+    }
+    if (op == ir.OP_SUB) and (next.a == p) and (next.b != p) {
+        lp.reds.push(Red.{ phi: p, start: start, next: next, op: op, minmax: 0, x: next.b });
+        return true;
+    }
+    // min / max: select (x <cmp> acc, x, acc) or with the operands the other way
+    if (op == ir.OP_SELECT) and ir.is_op(next.a, ir.OP_ICMP) and (next.a.blk == lp.body) {
+        let c = next.a;
+        let mut x = vnil();
+        let mut pr = ir.pred_of(c);
+        if (c.a == p) and (c.b != p) {
+            x = c.b;
+            pr = ir.swap_pred(pr);
+        } else if (c.b == p) and (c.a != p) {
+            x = c.a;
+        } else {
+            return false;
+        }
+        // now: select (x pr acc, sx, sacc)
+        let mut take_x = false;
+        if (next.b == x) and (next.c == p) {
+            take_x = true;
+        } else if (next.b == p) and (next.c == x) {
+            take_x = false;
+        } else {
+            return false;
+        }
+        // (the result is x when `x pr acc` holds, and acc otherwise)
+        if not take_x {
+            pr = ir.inv_pred(pr);
+        }
+        let mut k: i32 = 0;
+        if (pr == ir.IntSGT) or (pr == ir.IntSGE) {
+            k = ir.IN_SMAX;
+        } else if (pr == ir.IntSLT) or (pr == ir.IntSLE) {
+            k = ir.IN_SMIN;
+        } else if (pr == ir.IntUGT) or (pr == ir.IntUGE) {
+            k = ir.IN_UMAX;
+        } else if (pr == ir.IntULT) or (pr == ir.IntULE) {
+            k = ir.IN_UMIN;
+        } else {
+            return false;
+        }
+        if c.uses != 1 {
+            return false;
+        }
+        lp.reds.push(Red.{ phi: p, start: start, next: next, op: ir.OP_SELECT, minmax: k, x: x });
+        return true;
+    }
+    return false;
+}
+
+fn find_red(lp: *Lp, v: *mut ir.Value) i32 {
+    for k in 0..lp.reds.len {
+        if lp.reds.get(k).phi == v {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+// Is v a value of the body done in lanes (a load, or an operation in vals)?
+fn lane_value(lp: *Lp, v: *mut ir.Value) bool {
+    return in_list(&lp.loads, v) or in_list(&lp.vals, v);
+}
+
+// Reads the loop at h; false if it is not one of the above.
+fn analyze(f: *mut ir.Func, lp: *mut Lp, members: *u.List.[*mut ir.Block]) bool {
+    let h = lp.h;
+    let tag = lp.tag;
+    if (members.len != 2) or h.guarded {
+        return false;
+    }
+    let mut body = members.get(0);
+    if body == h {
+        body = members.get(1);
+    }
+    lp.body = body;
+    let ht = ir.terminator(h);
+    let bt = ir.terminator(body);
+    if u.isnil(ht) or u.isnil(bt) or (ht.op != ir.OP_CONDBR) or (bt.op != ir.OP_BR) or (bt.t1 != h) {
+        return false;
+    }
+    let mut cont = true;
+    if (ht.t1 == body) and (ht.t2 != body) {
+        lp.exit = ht.t2;
+    } else if (ht.t2 == body) and (ht.t1 != body) {
+        lp.exit = ht.t1;
+        cont = false;
+    } else {
+        return false;
+    }
+    for k in 0..h.preds.len {
+        let q = h.preds.get(k);
+        if q.mark != tag {
+            if u.notnil(lp.pre) {
+                return false;
+            }
+            lp.pre = q;
+        }
+    }
+    if u.isnil(lp.pre) or (ir.succ_count(ir.terminator(lp.pre)) != 1) {
+        return false;
+    }
+    // the phis: counters and reductions
+    let mut x = h.first;
+    while u.notnil(x) and (x.op == ir.OP_PHI) {
+        if x.xs.len != 2 {
+            return false;
+        }
+        let mut start = vnil();
+        let mut next = vnil();
+        for k in @as(usize, 0)..2 {
+            if ir.bs_of(x).get(k) == body {
+                next = x.xs.get(k);
+            } else {
+                start = x.xs.get(k);
+            }
+        }
+        if u.isnil(start) or u.isnil(next) or not idm.invariant(start, tag) {
+            return false;
+        }
+        let mut iv = idm.Iv.{ phi: x, start: start, next: next, step: 0 };
+        if idm.step_of(x, next, &mut iv.step) and not idm.invariant(next, tag) {
+            lp.ivs.push(iv);
+        } else if not reduction(lp, x, start, next) {
+            return false;
+        }
+        x = x.next;
+    }
+    let c = ht.a;
+    while u.notnil(x) and (x != c) and (x != ht) and plain(x) {
+        x = x.next;
+    }
+    if u.isnil(x) or (x != c) or (c.next != ht) or not ir.is_op(c, ir.OP_ICMP) {
+        return false;
+    }
+    lp.pred = ir.pred_of(c);
+    lp.ci = idm.find_iv(&lp.ivs, c.a);
+    lp.end = c.b;
+    if lp.ci < 0 {
+        lp.ci = idm.find_iv(&lp.ivs, c.b);
+        lp.end = c.a;
+        lp.pred = ir.swap_pred(lp.pred);
+    }
+    if not cont {
+        lp.pred = ir.inv_pred(lp.pred);
+    }
+    if (lp.ci < 0) or not idm.invariant(lp.end, tag) {
+        return false;
+    }
+    // (a reduction's or counter's phi is not tested otherwise, and is used
+    // in the body only by its own step or operation)
+    // the body
+    let mut y = body.first;
+    while u.notnil(y) and (y != bt) {
+        if y.op == ir.OP_LOAD {
+            if (y.flags != 0) or u.notnil(lp.st) {
+                return false;
+            }
+            lp.loads.push(y);
+        } else if y.op == ir.OP_STORE {
+            if (y.flags != 0) or u.notnil(lp.st) {
+                return false;
+            }
+            lp.st = y;
+        } else if (y.op == ir.OP_PHI) or not plain(y) {
+            return false;
+        }
+        y = y.next;
+    }
+    if (lp.loads.len == 0) and u.isnil(lp.st) {
+        return false;
+    }
+    // the lane type: the loads' and the stored value's, all one
+    if lp.loads.len > 0 {
+        lp.t = lp.loads.get(0).ty;
+    } else {
+        lp.t = lp.st.a.ty;
+    }
+    let t = lp.t;
+    if not (((t.kind == ir.T_INT) and ((t.bits == 8) or (t.bits == 16) or (t.bits == 32) or (t.bits == 64))) or
+            ((t.kind == ir.T_FLOAT) and ((t.bits == 32) or (t.bits == 64)))) {
+        return false;
+    }
+    for r in lp.reds.items() {
+        if r.phi.ty != t {
+            return false;  // (a widening reduction: not made)
+        }
+        if (r.minmax != 0) and not vec_ok(0, r.minmax, t) {
+            return false;
+        }
+        if (r.minmax == 0) and not vec_ok(r.op, 0, t) {
+            return false;
+        }
+    }
+    let mut dummy = vnil();
+    let bld0 = ir.new_builder();
+    for ld in lp.loads.items() {
+        if (ld.ty != t) or not idm.sequence(bld0, ld.a, &lp.ivs, t.size, tag, false, &mut dummy) {
+            return false;
+        }
+    }
+    if u.notnil(lp.st) and
+       ((lp.st.a.ty != t) or not idm.sequence(bld0, lp.st.b, &lp.ivs, t.size, tag, false, &mut dummy)) {
+        return false;
+    }
+    // the lane values: in order, each of loads, other lane values,
+    // invariants and constants, of type t; the others (addresses, steps,
+    // the counter's test) must not use lane values
+    let mut z = body.first;
+    while u.notnil(z) and (z != bt) {
+        if (z.op != ir.OP_LOAD) and (z.op != ir.OP_STORE) {
+            let mut lane = false;
+            let ops: [3]*mut ir.Value = [z.a, z.b, z.c];
+            for o in ops {
+                if u.notnil(o) and (lane_value(lp, o) or (find_red(lp, o) >= 0)) {
+                    lane = true;
+                }
+            }
+            if lane {
+                if not lane_op(lp, z) {
+                    return false;
+                }
+                lp.vals.push(z);
+            }
+        }
+        z = z.next;
+    }
+    // the store's value and each reduction's element: lane values (not a
+    // reduction's running value: a prefix sum stays scalar)
+    if u.notnil(lp.st) and (not lane_value(lp, lp.st.a) or red_use(lp, lp.st.a) or (find_red(lp, lp.st.a) >= 0)) {
+        return false;
+    }
+    for r in lp.reds.items() {
+        if not lane_value(lp, r.x) or (r.next.uses > 1) {
+            return false;
+        }
+        // (the phi's only use in the loop: its own operation; others are
+        // outside, which the scalar loop after serves)
+        if not used_once_in(r.phi, r.next, tag) {
+            return false;
+        }
+    }
+    // a lane value is used only by lane values, the store, the reductions
+    for v in lp.loads.items() {
+        if not lane_users(f, lp, v) {
+            return false;
+        }
+    }
+    for v in lp.vals.items() {
+        // (a reduction's next value is used by its phi only: checked above)
+        if not red_use(lp, v) and not lane_users(f, lp, v) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Is lane value z (an operation of the body with a lane operand) one that
+// is made in lanes? A reduction's own operation (its next) is, apart.
+fn lane_op(lp: *mut Lp, z: *mut ir.Value) bool {
+    let t = lp.t;
+    for r in lp.reds.items() {
+        if (z == r.next) or ((r.minmax != 0) and (z == r.next.a)) {
+            return true;
+        }
+    }
+    if z.ty != t {
+        return false;
+    }
+    if ir.is_binop(z.op) {
+        // (both operands lanes, invariants or constants of type t)
+        if (find_red(lp, z.a) >= 0) or (find_red(lp, z.b) >= 0) {
+            return false;
+        }
+        if not lane_value(lp, z.a) and not idm.invariant(z.a, lp.tag) {
+            return false;
+        }
+        if not lane_value(lp, z.b) and not idm.invariant(z.b, lp.tag) {
+            return false;
+        }
+        if (z.op == ir.OP_SHL) or (z.op == ir.OP_LSHR) or (z.op == ir.OP_ASHR) {
+            // (a shift by a constant below the width: the vector shift's count)
+            if not ir.is_cint(z.b) or (ir.cint_val(z.b) >= @as(u64, @bit_cast(u32, t.bits))) {
+                return false;
+            }
+        }
+        return vec_ok(z.op, 0, t);
+    }
+    return false;
+}
+
+// Is every use of lane value v a lane value, the store's value or a
+// reduction's element (none outside the body)?
+fn lane_users(f: *mut ir.Func, lp: *Lp, v: *mut ir.Value) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+            let mut uses = false;
+            for o in ops {
+                if o == v {
+                    uses = true;
+                }
+            }
+            for k in 0..i.xs.len {
+                if i.xs.get(k) == v {
+                    uses = true;
+                }
+            }
+            if uses {
+                let ok = in_list(&lp.vals, i) or ((i == lp.st) and (i.a == v) and (i.b != v)) or red_use(lp, i);
+                if not ok {
+                    return false;
+                }
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    return true;
+}
+
+fn red_use(lp: *Lp, i: *mut ir.Value) bool {
+    for r in lp.reds.items() {
+        if (i == r.next) or ((r.minmax != 0) and (i == r.next.a)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is the phi used in the loop only by `by` (and its compare, for a select)?
+fn used_once_in(p: *mut ir.Value, by: *mut ir.Value, tag: i64) bool {
+    let mut b = by.blk.fnp.first;
+    while u.notnil(b) {
+        if b.mark == tag {
+            let mut i = b.first;
+            while u.notnil(i) {
+                if (i != by) and not (ir.is_op(by, ir.OP_SELECT) and (i == by.a)) {
+                    let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+                    for o in ops {
+                        if o == p {
+                            return false;
+                        }
+                    }
+                    for k in 0..i.xs.len {
+                        if (i.xs.get(k) == p) and (i.op != ir.OP_PHI) {
+                            return false;
+                        }
+                    }
+                }
+                i = i.next;
+            }
+        }
+        b = b.next;
+    }
+    return true;
+}
+
+// The identity of reduction r's operation, as a scalar of type t.
+fn identity(r: Red, t: *mut ir.Ty) *mut ir.Value {
+    if r.minmax != 0 {
+        return r.start;  // (min and max: the start itself, idempotent)
+    }
+    if r.op == ir.OP_MUL {
+        return ir.cint(t, 1);
+    }
+    if r.op == ir.OP_AND {
+        return ir.cint(t, 0xFFFF_FFFF_FFFF_FFFF);
+    }
+    return ir.cint(t, 0);
+}
+
+// Vectorizes the loop read into lp (analyze). True if it was.
+fn transform(f: *mut ir.Func, lp: *mut Lp) bool {
+    let t = lp.t;
+    let vf = vec_bits() / (t.size * 8);
+    if vf < 2 {
+        return false;
+    }
+    let vt = ir.t_vec(t, @truncate(u32, vf));
+    let w = ir.isz();
+    let size = t.size;
+    let pre = lp.pre;
+    let h = lp.h;
+    let bld = ir.new_builder();
+    ir.at_before(bld, ir.terminator(pre));
+    let n = idm.counted_trips(bld, lp.ivs.get(@int_cast(usize, lp.ci)), lp.pred, lp.end);
+    if u.isnil(n) {
+        return false;
+    }
+    if ir.is_cint(n) and (ir.cint_val(n) < (4 * vf)) {
+        return false;  // (a few iterations, known: unroll.ax unrolls them; what was made is dead)
+    }
+    // the starts of the accesses
+    let mut lstart = u.List.[*mut ir.Value].empty();
+    defer lstart.deinit();
+    for ld in lp.loads.items() {
+        let mut s0 = vnil();
+        _ = idm.sequence(bld, ld.a, &lp.ivs, size, lp.tag, true, &mut s0);
+        lstart.push(s0);
+    }
+    let mut d0 = vnil();
+    if u.notnil(lp.st) {
+        _ = idm.sequence(bld, lp.st.b, &lp.ivs, size, lp.tag, true, &mut d0);
+    }
+    // (with reductions, two vectors an iteration, each with its own
+    // accumulators: the additions of one do not wait for the other's)
+    let mut ic: u64 = 1;
+    if lp.reds.len > 0 {
+        ic = 2;
+    }
+    let chunk = ic * vf;
+    let nv = ir.and_(bld, n, ir.cint(w, ~(chunk - 1)));
+    // the guard: at least one iteration, and no store into a load's next VF elements
+    let mut ok = ir.icmp(bld, ir.IntUGE, n, ir.cint(w, chunk));
+    if u.notnil(lp.st) {
+        for s0 in lstart.items() {
+            if (ir.resolve(d0) == ir.resolve(s0)) or ir.restrict_apart(idm.root(d0), idm.root(s0)) {
+                continue;  // (the same elements, each loaded before it is stored; or apart)
+            }
+            let d = ir.sub(bld, ir.ptrtoint(bld, d0, w), ir.ptrtoint(bld, s0, w));
+            let safe = ir.icmp(bld, ir.IntUGE, ir.sub(bld, d, ir.cint(w, 1)), ir.cint(w, (vf * size) - 1));
+            ok = ir.and_(bld, ok, safe);
+        }
+    }
+    // blocks: pre -> vh (vector loop) -> mid -> H (the scalar loop, the rest)
+    let vh = ir.append_block(f, "vec.loop");
+    let vb = ir.append_block(f, "vec.body");
+    let mid = ir.append_block(f, "vec.end");
+    let skip = ir.append_block(f, "vec.skip");
+    let pt = ir.terminator(pre);
+    ir.condbr(bld, ok, vh, skip);
+    ir.remove_inst(pt);
+    // (a builder for what is made once before the loop: splats)
+    let pb = ir.new_builder();
+    ir.at_before(pb, ir.terminator(pre));
+    // skip: straight to the scalar loop with the original starts
+    ir.at_end(bld, skip);
+    ir.br(bld, h);
+    // vh: k = phi [0, pre], [k + chunk, vb]; vector accumulators (ic of each)
+    ir.at_end(bld, vh);
+    let k = ir.phi(bld, w);
+    ir.add_incoming(k, ir.cint(w, 0), pre);
+    let mut vacc = u.List.[*mut ir.Value].empty();
+    defer vacc.deinit();
+    for r in lp.reds.items() {
+        for c in @as(u64, 0)..ic {
+            _ = c;
+            let a = ir.phi(bld, vt);
+            let init = ir.splat(pb, vt, identity(r, t));
+            ir.add_incoming(a, init, pre);
+            vacc.push(a);
+        }
+    }
+    ir.condbr(bld, ir.icmp(bld, ir.IntULT, k, nv), vb, mid);
+    // vb: the lanes, ic vectors
+    ir.at_end(bld, vb);
+    let mut map_from = u.List.[*mut ir.Value].empty();
+    let mut map_to = u.List.[*mut ir.Value].empty();
+    defer map_from.deinit();
+    defer map_to.deinit();
+    for c in @as(u64, 0)..ic {
+        map_from.clear();
+        map_to.clear();
+        let off = ir.mul(bld, ir.add(bld, k, ir.cint(w, c * vf)), ir.cint(w, size));
+        for j in 0..lp.loads.len {
+            let ld = lp.loads.get(j);
+            let v = ir.load(bld, vt, ir.ptradd(bld, lstart.get(j), off));
+            v.align = ld.align;
+            map_from.push(ld);
+            map_to.push(v);
+        }
+        for z in lp.vals.items() {
+            if red_use(lp, z) {
+                continue;
+            }
+            let a = vec_operand(pb, vt, z.a, &map_from, &map_to);
+            let b = vec_operand(pb, vt, z.b, &map_from, &map_to);
+            let v = ir.binop(bld, z.op, a, b);
+            map_from.push(z);
+            map_to.push(v);
+        }
+        if u.notnil(lp.st) {
+            let s = ir.store(bld, lookup(lp.st.a, &map_from, &map_to), ir.ptradd(bld, d0, off));
+            s.align = lp.st.align;
+        }
+        for ri in 0..lp.reds.len {
+            let r = lp.reds.get(ri);
+            let x = lookup(r.x, &map_from, &map_to);
+            let a = vacc.get((ri * @truncate(usize, ic)) + @truncate(usize, c));
+            let mut nx = vnil();
+            if r.minmax != 0 {
+                let mut args: [2]*mut ir.Value = [a, x];
+                nx = ir.intr(bld, r.minmax, vt, args[..]);
+            } else {
+                nx = ir.binop(bld, r.op, a, x);
+            }
+            ir.add_incoming(a, nx, vb);
+        }
+    }
+    let k2 = ir.add(bld, k, ir.cint(w, chunk));
+    ir.add_incoming(k, k2, vb);
+    ir.br(bld, vh);
+    // mid: the counters after nv iterations, the reductions' lanes combined
+    ir.at_end(bld, mid);
+    let mut starts = u.List.[*mut ir.Value].empty();
+    defer starts.deinit();
+    for iv in lp.ivs.items() {
+        let p = iv.phi;
+        let mut s = vnil();
+        if p.ty.kind == ir.T_PTR {
+            s = ir.ptradd(bld, iv.start, ir.mul(bld, k, ir.cint(w, @bit_cast(u64, iv.step))));
+        } else {
+            let mut kk = k;
+            if p.ty.bits < w.bits {
+                kk = ir.trunc(bld, k, p.ty);
+            }
+            s = ir.add(bld, iv.start, ir.mul(bld, kk, ir.cint(p.ty, @bit_cast(u64, iv.step))));
+        }
+        starts.push(s);
+    }
+    for ri in 0..lp.reds.len {
+        let r = lp.reds.get(ri);
+        let mut acc = r.start;
+        for c in @as(usize, 0)..@truncate(usize, ic) {
+            let a = vacc.get((ri * @truncate(usize, ic)) + c);
+            for l in 0..vf {
+                let e = ir.extract_elem(bld, a, l);
+                if r.op == ir.OP_SUB {
+                    // (start - x0 - x1 ...: start + the lanes, which hold 0 - their x's)
+                    acc = ir.add(bld, acc, e);
+                } else if r.minmax != 0 {
+                    let mut args: [2]*mut ir.Value = [acc, e];
+                    acc = ir.intr(bld, r.minmax, t, args[..]);
+                } else {
+                    acc = ir.binop(bld, r.op, acc, e);
+                }
+            }
+        }
+        starts.push(acc);
+    }
+    ir.br(bld, h);
+    // the scalar loop starts from mid's values (or, by skip, the originals)
+    let mut x = h.first;
+    while u.notnil(x) and (x.op == ir.OP_PHI) {
+        for j in 0..x.xs.len {
+            if ir.bs_of(x).get(j) == pre {
+                ir.bs_of(x).set(j, skip);
+            }
+        }
+        // (the phis' order: the counters' and the reductions' as analyze read them)
+        let mut from_mid = vnil();
+        let ki = idm.find_iv(&lp.ivs, x);
+        if ki >= 0 {
+            from_mid = starts.get(@int_cast(usize, ki));
+        } else {
+            let ri = find_red(lp, x);
+            from_mid = starts.get(lp.ivs.len + @int_cast(usize, ri));
+        }
+        ir.add_incoming(x, from_mid, mid);
+        x = x.next;
+    }
+    h.guarded = true;
+    return true;
+}
+
+// The vector of operand o of a lane operation: its lanes' vector, or a
+// splat of an invariant or constant (made by pb, before the loop).
+fn vec_operand(pb: *mut ir.Builder, vt: *mut ir.Ty, o: *mut ir.Value, from: *u.List.[*mut ir.Value],
+               to: *u.List.[*mut ir.Value]) *mut ir.Value {
+    let m = lookup(o, from, to);
+    if u.notnil(m) {
+        return m;
+    }
+    return ir.splat(pb, vt, o);  // (an invariant or a constant: before the loop)
+}
+
+fn lookup(v: *mut ir.Value, from: *u.List.[*mut ir.Value], to: *u.List.[*mut ir.Value]) *mut ir.Value {
+    for k in 0..from.len {
+        if from.get(k) == v {
+            return to.get(k);
+        }
+    }
+    return vnil();
+}
+
+// The search loop at h (above), made a vector search before it. True if it was.
+fn search_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    if (members.len != 3) or h.guarded {
+        return false;
+    }
+    let ht = ir.terminator(h);
+    if u.isnil(ht) or (ht.op != ir.OP_CONDBR) {
+        return false;
+    }
+    let mut tb = ir.bnil();
+    let mut done = ir.bnil();
+    let mut cont = true;
+    if (ht.t1.mark == tag) and (ht.t2.mark != tag) {
+        tb = ht.t1;
+        done = ht.t2;
+    } else if (ht.t2.mark == tag) and (ht.t1.mark != tag) {
+        tb = ht.t2;
+        done = ht.t1;
+        cont = false;
+    } else {
+        return false;
+    }
+    _ = done;
+    let tt = ir.terminator(tb);
+    if u.isnil(tt) or (tt.op != ir.OP_CONDBR) {
+        return false;
+    }
+    let mut lb = ir.bnil();
+    let mut found_on_true = true;
+    if (tt.t2.mark == tag) and (tt.t1.mark != tag) {
+        lb = tt.t2;
+    } else if (tt.t1.mark == tag) and (tt.t2.mark != tag) {
+        lb = tt.t1;
+        found_on_true = false;
+    } else {
+        return false;
+    }
+    let lt = ir.terminator(lb);
+    if (lb == h) or (lb == tb) or u.isnil(lt) or (lt.op != ir.OP_BR) or (lt.t1 != h) {
+        return false;
+    }
+    // the preheader
+    let mut pre = ir.bnil();
+    for k in 0..h.preds.len {
+        let q = h.preds.get(k);
+        if q.mark != tag {
+            if u.notnil(pre) {
+                return false;
+            }
+            pre = q;
+        }
+    }
+    if u.isnil(pre) or (ir.succ_count(ir.terminator(pre)) != 1) {
+        return false;
+    }
+    // H: counters only, the test
+    let mut ivs = u.List.[idm.Iv].empty();
+    defer ivs.deinit();
+    let mut x = h.first;
+    while u.notnil(x) and (x.op == ir.OP_PHI) {
+        if x.xs.len != 2 {
+            return false;
+        }
+        let mut iv = idm.Iv.{ phi: x, start: vnil(), next: vnil(), step: 0 };
+        for k in @as(usize, 0)..2 {
+            if ir.bs_of(x).get(k) == lb {
+                iv.next = x.xs.get(k);
+            } else {
+                iv.start = x.xs.get(k);
+            }
+        }
+        if u.isnil(iv.start) or u.isnil(iv.next) or not idm.invariant(iv.start, tag) or
+           not idm.step_of(x, iv.next, &mut iv.step) or idm.invariant(iv.next, tag) {
+            return false;
+        }
+        ivs.push(iv);
+        x = x.next;
+    }
+    let c = ht.a;
+    while u.notnil(x) and (x != c) and (x != ht) and plain(x) {
+        x = x.next;
+    }
+    if u.isnil(x) or (x != c) or (c.next != ht) or not ir.is_op(c, ir.OP_ICMP) {
+        return false;
+    }
+    let mut pred = ir.pred_of(c);
+    let mut ci = idm.find_iv(&ivs, c.a);
+    let mut end = c.b;
+    if ci < 0 {
+        ci = idm.find_iv(&ivs, c.b);
+        end = c.a;
+        pred = ir.swap_pred(pred);
+    }
+    if not cont {
+        pred = ir.inv_pred(pred);
+    }
+    if (ci < 0) or not idm.invariant(end, tag) {
+        return false;
+    }
+    // T: one load, pure instructions, the compare; L: pure instructions
+    let mut ld = vnil();
+    let mut y = tb.first;
+    while u.notnil(y) and (y != tt) {
+        if y.op == ir.OP_LOAD {
+            if u.notnil(ld) or (y.flags != 0) {
+                return false;
+            }
+            ld = y;
+        } else if (y.op == ir.OP_PHI) or not plain(y) {
+            return false;
+        }
+        y = y.next;
+    }
+    let mut z = lb.first;
+    while u.notnil(z) and (z != lt) {
+        if (z.op == ir.OP_PHI) or not plain(z) {
+            return false;
+        }
+        z = z.next;
+    }
+    if u.isnil(ld) {
+        return false;
+    }
+    let t = ld.ty;
+    if (t.kind != ir.T_INT) or ((t.bits != 8) and (t.bits != 16) and (t.bits != 32)) {
+        return false;
+    }
+    let size = t.size;
+    let mut dummy = vnil();
+    if not idm.sequence(ir.new_builder(), ld.a, &ivs, size, tag, false, &mut dummy) {
+        return false;
+    }
+    // the compare: of the element (or its extension) with an invariant
+    let cc = tt.a;
+    if not ir.is_op(cc, ir.OP_ICMP) or (cc.blk != tb) {
+        return false;
+    }
+    let cp = ir.pred_of(cc);
+    if (cp != ir.IntEQ) and (cp != ir.IntNE) {
+        return false;
+    }
+    let mut e = cc.a;
+    let mut o = cc.b;
+    if not idm.invariant(o, tag) {
+        e = cc.b;
+        o = cc.a;
+    }
+    if not idm.invariant(o, tag) {
+        return false;
+    }
+    let mut key = vnil();
+    if e == ld {
+        key = o;
+    } else if (ir.is_op(e, ir.OP_ZEXT) or ir.is_op(e, ir.OP_SEXT)) and (e.a == ld) {
+        if ir.is_op(o, e.op) and (o.a.ty == t) {
+            key = o.a;
+        } else if ir.is_cint(o) {
+            // (a constant the narrow values can equal: its extension's)
+            let kv = ir.cint(t, ir.cint_val(o));
+            let back = ir.fold_cast(e.op, kv, o.ty);
+            if u.notnil(back) and ir.is_cint(back) and (ir.cint_val(back) == ir.cint_val(o)) {
+                key = kv;
+            }
+        }
+    }
+    if u.isnil(key) or (key.ty != t) {
+        return false;
+    }
+    // (the lanes that would leave the loop: equal, or with != different)
+    let mut vp = ir.IntEQ;
+    if (cp == ir.IntEQ) != found_on_true {
+        vp = ir.IntNE;
+    }
+    // before the loop: the count, the start, the aligned vectors
+    let bld = ir.new_builder();
+    let pt = ir.terminator(pre);
+    ir.at_before(bld, pt);
+    let n = idm.counted_trips(bld, ivs.get(@int_cast(usize, ci)), pred, end);
+    if u.isnil(n) {
+        return false;
+    }
+    let w = ir.isz();
+    let vb: u64 = 16;
+    let vf = vb / size;
+    let vt = ir.t_vec(t, @truncate(u32, vf));
+    let mut s0 = vnil();
+    _ = idm.sequence(bld, ld.a, &ivs, size, tag, true, &mut s0);
+    let a0 = ir.ptrtoint(bld, s0, w);
+    let mis = ir.and_(bld, a0, ir.cint(w, vb - 1));
+    let base = ir.ptradd(bld, s0, ir.sub(bld, ir.cint(w, 0), mis));
+    let limit = ir.add(bld, mis, ir.mul(bld, n, ir.cint(w, size)));  // (bytes from base to the end)
+    let elem_ok = ir.icmp(bld, ir.IntEQ, ir.and_(bld, a0, ir.cint(w, size - 1)), ir.cint(w, 0));
+    let splat = ir.splat(bld, vt, key);
+    let vh = ir.append_block(f, "vsearch");
+    let vbody = ir.append_block(f, "vsearch.body");
+    let vnext = ir.append_block(f, "vsearch.next");
+    let resume = ir.append_block(f, "vsearch.end");
+    let skip = ir.append_block(f, "vsearch.skip");
+    ir.condbr(bld, elem_ok, vh, skip);
+    ir.remove_inst(pt);
+    ir.at_end(bld, skip);
+    ir.br(bld, h);
+    // vh: q = phi [0, pre], [q + 16, vnext]; while q + 16 <= limit
+    ir.at_end(bld, vh);
+    let q = ir.phi(bld, w);
+    ir.add_incoming(q, ir.cint(w, 0), pre);
+    ir.condbr(bld, ir.icmp(bld, ir.IntULE, ir.add(bld, q, ir.cint(w, vb)), limit), vbody, resume);
+    ir.at_end(bld, vbody);
+    let v = ir.load(bld, vt, ir.ptradd(bld, base, q));
+    v.align = @truncate(u32, vb);
+    let m = ir.icmp(bld, vp, v, splat);
+    let mut args: [1]*mut ir.Value = [m];
+    let any = ir.intr(bld, ir.IN_ANYTRUE, ir.t_int(1), args[..]);
+    ir.condbr(bld, any, resume, vnext);
+    ir.at_end(bld, vnext);
+    let q2 = ir.add(bld, q, ir.cint(w, vb));
+    ir.add_incoming(q, q2, vnext);
+    ir.br(bld, vh);
+    // resume: the scalar loop from the vector's first element (at least the first)
+    ir.at_end(bld, resume);
+    let back = ir.sub(bld, q, mis);
+    let neg = ir.icmp(bld, ir.IntSLT, back, ir.cint(w, 0));
+    let bytes = ir.select(bld, neg, ir.cint(w, 0), back);
+    let el = ir.binop(bld, ir.OP_UDIV, bytes, ir.cint(w, size));
+    let mut starts = u.List.[*mut ir.Value].empty();
+    defer starts.deinit();
+    for iv in ivs.items() {
+        let p = iv.phi;
+        if p.ty.kind == ir.T_PTR {
+            starts.push(ir.ptradd(bld, iv.start, ir.mul(bld, el, ir.cint(w, @bit_cast(u64, iv.step)))));
+        } else {
+            let mut kk = el;
+            if p.ty.bits < w.bits {
+                kk = ir.trunc(bld, el, p.ty);
+            }
+            starts.push(ir.add(bld, iv.start, ir.mul(bld, kk, ir.cint(p.ty, @bit_cast(u64, iv.step)))));
+        }
+    }
+    ir.br(bld, h);
+    let mut px = h.first;
+    let mut k: usize = 0;
+    while u.notnil(px) and (px.op == ir.OP_PHI) {
+        for j in 0..px.xs.len {
+            if ir.bs_of(px).get(j) == pre {
+                ir.bs_of(px).set(j, skip);
+            }
+        }
+        ir.add_incoming(px, starts.get(k), resume);
+        k += 1;
+        px = px.next;
+    }
+    h.guarded = true;
+    return true;
+}
+
+/// The loops of f made vector loops (above), at -O2 and -O3. True if any was.
+/// Not those of a function with strict floating point (Func's strict_fp:
+/// its floating-point operations stay as the program has them, in number and
+/// order, as for slp.ax and unroll.ax).
+pub fn vectorize(f: *mut ir.Func) bool {
+    if u.isnil(f.first) or (vec_bits() == 0) or idm.implements_memops(f) or f.strict_fp {
+        return false;
+    }
+    let mut any = false;
+    let mut rounds: i32 = 0;
+    ir.apply_forwarding(f);
+    loop {
+        opt.compute_preds(f);
+        ir.count_uses(f);  // (the checks read uses: kept current here only)
+        let order = opt.dominators(f);
+        let hs = opt.loop_headers(&order);
+        let mut members = u.List.[*mut ir.Block].empty();
+        let mut changed = false;
+        for j in 0..hs.len {
+            tag_base += 1;
+            opt.members_of(hs.get(j), tag_base, &mut members);
+            let mut lp = Lp.{ tag: tag_base, h: hs.get(j), body: ir.bnil(), pre: ir.bnil(), exit: ir.bnil(),
+                              ivs: u.List.[idm.Iv].empty(), reds: u.List.[Red].empty(), ci: -1, pred: 0, end: vnil(),
+                              t: u.nil.[ir.Ty](), loads: u.List.[*mut ir.Value].empty(), st: vnil(),
+                              vals: u.List.[*mut ir.Value].empty() };
+            let mut done = analyze(f, &mut lp, &members) and transform(f, &mut lp);
+            if not done {
+                lp.h = hs.get(j);
+                done = search_loop(f, hs.get(j), tag_base, &members);
+            }
+            lp.ivs.deinit();
+            lp.reds.deinit();
+            lp.loads.deinit();
+            lp.vals.deinit();
+            if done {
+                changed = true;
+                break;
+            }
+        }
+        members.deinit();
+        order.deinit();
+        hs.deinit();
+        if not changed {
+            break;
+        }
+        any = true;
+        rounds += 1;
+        if rounds >= 16 {
+            break;
+        }
+    }
+    if any {
+        opt.compute_preds(f);
+    }
+    return any;
+}

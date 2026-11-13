@@ -1,42 +1,62 @@
 // =============================================================================
 // cgen_atomic.ax - IR generation of atomic operations on C objects: the
 // accesses of lvalues of atomic type (csema_atomic.ax) and the <stdatomic.h>
-// builtins. Every operation is sequentially consistent (C11 7.17.3): the
-// IR's atomics have that order only, which is a valid implementation of
-// every memory_order.
+// builtins, each with its memory order (C11 7.17.3): the IR's atomic
+// operations carry it (ir.set_order), and the backends choose instructions
+// by it (a stronger order is always a valid implementation of a weaker one).
+// An order that is not a constant is sequentially consistent.
 //
-// An atomic object of 1, 2, 4 or 8 bytes (ctypes.ax aligns it to its size)
-// is accessed lock-free, as an integer of its width: a float's or pointer's
-// bits, a structure's or union's bytes (the IR's atomic loads, stores,
-// read-modify-write operations and compare-exchanges, which each backend
-// lowers: x86-64 lock-prefixed instructions and xchg, AArch64 LSE or
-// exclusive pairs, wasm's atomic instructions with the atomics feature and
-// plain accesses without it, where a module has one thread). Other sizes
-// take a lock: a table of spinlocks indexed by a hash of the object's
-// address (lock_table), defined once in every module and object that uses
-// it, with linkonce linkage so that the objects of one program share it.
+// An atomic object of 1, 2, 4 or 8 bytes (ctypes.ax aligns it to its size,
+// and on some platforms pads a smaller one up to such a size: its padding is
+// zeros, written so here) is accessed lock-free, as an integer of its width:
+// a float's or pointer's bits, a structure's or union's bytes (the IR's
+// atomic loads, stores, read-modify-write operations and compare-exchanges,
+// which each backend lowers: x86-64 lock-prefixed instructions, xchg and
+// plain moves, AArch64 LSE or exclusive pairs, wasm's atomic instructions
+// with the atomics feature and plain accesses without it, where a module
+// has one thread). One of 16 bytes aligned to 16 is lock-free on AArch64
+// (exclusive pairs, or LSE's CASP) and on x86-64 (cmpxchg16b: inline where
+// the target's extensions have it, else through __axiom_atomic_cas16, which
+// asks the processor once and takes the lock where it lacks it): every
+// operation is a compare-exchange of 16 bytes (ir.IN_CAS16) or a loop of
+// them. Other sizes take a lock: a table of spinlocks indexed by a hash of
+// the object's address (lock_table), defined once in every module and
+// object that uses it, with linkonce linkage so that the objects of one
+// program share it.
+//
+// Code that the platform's compilers made, linked into the program, does
+// atomic operations on objects that are not lock-free by calls of the
+// standard out-of-line interface (__atomic_load, __atomic_store,
+// __atomic_exchange, __atomic_compare_exchange, with the size first). When
+// such code may be linked (g_outline: an object is emitted, or the system's
+// linker links C sources, objects or libraries) this code calls them too,
+// and defines them (linkonce, global: outline_fn) over the lock table, so
+// that both sides take one lock, whichever definition the linker keeps;
+// the definitions route the lock-free sizes to the lock-free operations.
 //
 // The interface (which the builtins of other modes may share):
 //
 //   lock_free(t)                  accessed without a lock?
-//   load(t, p)                    the value of the atomic object at p
-//   store(t, v, p)                stores v
-//   exchange(t, v, p)             stores v, returns the old value
-//   compare_exchange(t, p, e, v)  the strong compare-and-exchange: an i1
-//   fetch(t, op, p, x)            a read-modify-write (ir.RMW_*), old value
+//   load(t, p, o)                 the value of the atomic object at p
+//   store(t, v, p, o)             stores v
+//   exchange(t, v, p, o)          stores v, returns the old value
+//   compare_exchange(t, p, e, v, so, fo, weak)  an i1: whether it stored
+//   fetch(t, op, p, x, o)         a read-modify-write (ir.RMW_*), old value
 //   update_begin(t, p) / update_end(u, v)   any other read-modify-write:
 //                                 a loop of compare-exchanges, or the lock
-//   compare_exchange_value(t, p, e, v)  the same of values: the old value
-//   fence()                       a full fence
+//   compare_exchange_value(t, p, e, v, so, fo)  of values: the old value
+//   fence(o, signal)              a fence
 //   value_at(t, p) / put_value(t, v, p)  a value read or written plainly
 //                                 (the GNU dialects' builtins: cgen_gatomic.ax)
 //
-// t is the C type of the atomic object (its qualifiers are ignored), p its
-// address; a value is as cgen_expr.ax has one: a scalar's IR value of
-// cgen.lty(t), a structure's, union's, complex number's or wide long
-// double's address.
+// t is the C type of the atomic object (its qualifiers are ignored but for
+// the size of an atomic type's object, ctypes.ax: size_of, which may exceed
+// its values' value_size), p its address; o, so and fo are orders (ir.ORD_);
+// a value is as cgen_expr.ax has one: a scalar's IR value of cgen.lty(t), a
+// structure's, union's, complex number's or wide long double's address.
 // =============================================================================
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
@@ -47,23 +67,135 @@ import "csema_atomic.ax" as catm;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 
-/// Whether the atomic objects of type t are accessed lock-free (what
-/// atomic_is_lock_free says; <stdatomic.h>'s ATOMIC_*_LOCK_FREE agree).
-pub fn lock_free(t: *cty.CType) bool {
-    let n = cty.size_of(t);
+/// Set by the driver when code that the platform's compilers made may be
+/// linked into the program (an object is emitted, or the system's linker
+/// links C sources, objects or libraries): the operations on objects that
+/// are not lock-free then call the standard out-of-line interface.
+pub let mut g_outline: bool = false;
+/// And the program is an executable that the system's linker links with
+/// such code: the sized 16-byte forms are defined too (define_sized).
+pub let mut g_outline_exe: bool = false;
+
+// -----------------------------------------------------------------------------
+// Memory orders
+// -----------------------------------------------------------------------------
+
+/// The IR order (ir.ORD_) of memory order argument x: its value if it is a
+/// constant (C's memory_order and the GNU dialects' __ATOMIC_ values are the
+/// same: 0 relaxed, 1 consume, 2 acquire, 3 release, 4 acq_rel, 5 seq_cst;
+/// consume is acquire, 7.17.3p2's dependency ordering being implied by
+/// it), else, and for any other value, sequentially consistent.
+pub fn order_of(x: *cast.Expr) u32 {
+    if u.isnil(x) or not x.is_const {
+        return ir.ORD_SEQ_CST;
+    }
+    let c = x.cval & 0xffff;  // (the GNU dialects' bits above, hints, are ignored)
+    if c == 0 {
+        return ir.ORD_RELAXED;
+    }
+    if (c == 1) or (c == 2) {
+        return ir.ORD_ACQUIRE;
+    }
+    if c == 3 {
+        return ir.ORD_RELEASE;
+    }
+    if c == 4 {
+        return ir.ORD_ACQ_REL;
+    }
+    return ir.ORD_SEQ_CST;
+}
+
+// The C value of order o (for the out-of-line interface).
+fn c_order(o: u32) u64 {
+    if o == ir.ORD_RELAXED {
+        return 0;
+    }
+    if o == ir.ORD_ACQUIRE {
+        return 2;
+    }
+    if o == ir.ORD_RELEASE {
+        return 3;
+    }
+    if o == ir.ORD_ACQ_REL {
+        return 4;
+    }
+    return 5;
+}
+
+// The order of a load that is part of a read-modify-write of order o: its
+// acquire part (a load cannot release).
+fn load_part(o: u32) u32 {
+    if (o == ir.ORD_RELEASE) or (o == ir.ORD_RELAXED) {
+        return ir.ORD_RELAXED;
+    }
+    if o == ir.ORD_ACQ_REL {
+        return ir.ORD_ACQUIRE;
+    }
+    return o;
+}
+
+// -----------------------------------------------------------------------------
+// Sizes and kinds
+// -----------------------------------------------------------------------------
+
+// The size of the object (an atomic type's may be padded) and of its values.
+fn obj_size(t: *cty.CType) u64 {
+    return cty.size_of(t);
+}
+
+fn val_size(t: *cty.CType) u64 {
+    return cty.value_size(t);
+}
+
+/// Is the object of type t accessed as an integer of its size (1, 2, 4 or 8
+/// bytes; aligned so: ctypes.ax, and the GNU builtins check it)?
+pub fn int_free(t: *cty.CType) bool {
+    let n = obj_size(t);
     return (n == 1) or (n == 2) or (n == 4) or (n == 8);
+}
+
+// An object of 16 bytes aligned to 16 on a target that compares and
+// exchanges 16 bytes: AArch64 always, x86-64 with cmpxchg16b (wide_inline)
+// or after asking the processor (__axiom_atomic_cas16).
+fn wide(t: *cty.CType) bool {
+    return (obj_size(t) == 16) and (cty.align_of(t) >= 16) and
+           ((tg.g_arch == tg.ARCH_A64) or (tg.g_arch == tg.ARCH_X64));
+}
+
+fn wide_inline() bool {
+    return (tg.g_arch == tg.ARCH_A64) or tg.has(tg.X_CMPXCHG16B);
+}
+
+/// Whether the atomic objects of type t are accessed lock-free (what
+/// atomic_is_lock_free says, but for those of 16 bytes on an x86-64 target
+/// without cmpxchg16b, which depend on the processor: lock_free_value;
+/// <stdatomic.h>'s ATOMIC_*_LOCK_FREE agree).
+pub fn lock_free(t: *cty.CType) bool {
+    return int_free(t) or (wide(t) and wide_inline());
+}
+
+/// atomic_is_lock_free of an object of type t: an i8.
+pub fn lock_free_value(t: *cty.CType) *mut ir.Value {
+    if wide(t) and not wide_inline() {
+        let f = cas16_fn();
+        let mut a: [3]*mut ir.Value = [ir.czero(cg.T_ptr), ir.czero(cg.T_ptr), ir.czero(cg.T_ptr)];
+        return ir.call(cg.B, f.ty, f.val, a[..]);  // (a null object: only the answer)
+    }
+    return ir.cint(cg.T_i8, @as(u64, lock_free(t)));
 }
 
 // The integer type a lock-free atomic object of type t is accessed as.
 fn int_ty(t: *cty.CType) *mut ir.Ty {
-    return ir.t_int(@int_cast(i32, cty.size_of(t) * 8));
+    return ir.t_int(@int_cast(i32, obj_size(t) * 8));
 }
 
 // Whether a value of type t is in memory (cgen_expr.ax): a structure's,
 // union's, complex number's, wide long double's (cgen_ld.ax), wide
-// integer's (cgen_wint.ax) or _Decimal128's (cgen_dec.ax) value is its address.
+// integer's (cgen_wint.ax), _Decimal128's (cgen_dec.ax) or vector's
+// (cgen_vec.ax) value is its address.
 fn is_mem(t: *cty.CType) bool {
-    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t) or cty.is_wint(t) or cty.is_dec128(t);
+    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t) or cty.is_wint(t) or cty.is_dec128(t) or
+           cty.is_vector(t);
 }
 
 // Scalar value v of type t (IR type cg.lty(t)) as the integer of its bits.
@@ -92,29 +224,30 @@ fn from_bits(t: *mut cty.CType, x: *mut ir.Value) *mut ir.Value {
     return x;
 }
 
-// An atomic load of the integer at p.
-fn atomic_ld(it: *mut ir.Ty, p: *mut ir.Value) *mut ir.Value {
+// An atomic load of the integer at p, of order o.
+fn atomic_ld(it: *mut ir.Ty, p: *mut ir.Value, o: u32) *mut ir.Value {
     let v = ir.load(cg.B, it, p);
     v.align = @int_cast(u32, it.size);
     v.flags = ir.F_ATOMIC;
+    ir.set_order(v, o, o);
     return v;
 }
 
-fn atomic_st(x: *mut ir.Value, p: *mut ir.Value) void {
+fn atomic_st(x: *mut ir.Value, p: *mut ir.Value, o: u32) void {
     let s = ir.store(cg.B, x, p);
     s.align = @int_cast(u32, x.ty.size);
     s.flags = ir.F_ATOMIC;
+    ir.set_order(s, o, o);
 }
 
-// A structure's or union's value at a new temporary (aligned as the atomic
-// type is): its address.
+// A new temporary of the object's size (aligned as the atomic type is): its address.
 fn temp(t: *mut cty.CType) *mut ir.Value {
     return cg.alloca(t, "atomic");
 }
 
-// A load or store of the bits of a value of t's non-atomic type (at an
-// address that need not be aligned: an object of another type of its size,
-// for the GNU dialects' generic builtins).
+// A load or store of the bits of a value of t's object size (at an address
+// that need not be aligned: an object of another type of its size, for the
+// GNU dialects' generic builtins).
 fn bits_ld(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
     let v = ir.load(cg.B, int_ty(t), p);
     v.align = 1;
@@ -126,8 +259,22 @@ fn bits_st(t: *mut cty.CType, x: *mut ir.Value, p: *mut ir.Value) void {
     s.align = 1;
 }
 
-fn copy(t: *cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
-    _ = ir.memop(cg.B, ir.OP_MEMCPY, dst, src, cg.usz(cty.size_of(t)));
+fn copy_n(dst: *mut ir.Value, src: *mut ir.Value, n: u64) void {
+    _ = ir.memop(cg.B, ir.OP_MEMCPY, dst, src, cg.usz(n));
+}
+
+// Value v (in memory) of type t at a new temporary of the object's size,
+// its padding zeros (an atomic object's padding is: ctypes.ax, atomic_size);
+// v itself when there is no padding.
+fn padded(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+    let n = val_size(t);
+    if n == obj_size(t) {
+        return v;
+    }
+    let r = temp(t);
+    _ = ir.memop(cg.B, ir.OP_MEMSET, r, ir.cint(cg.T_i8, 0), cg.usz(obj_size(t)));
+    copy_n(r, v, n);
+    return r;
 }
 
 // A plain (non-atomic) load or store of a value of type t, under the lock
@@ -135,7 +282,7 @@ fn copy(t: *cty.CType, dst: *mut ir.Value, src: *mut ir.Value) void {
 fn plain_ld(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
     if is_mem(t) {
         let r = temp(t);
-        copy(t, r, p);
+        copy_n(r, p, val_size(t));
         return r;
     }
     let v = ir.load(cg.B, cg.lty(t), p);
@@ -145,23 +292,24 @@ fn plain_ld(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
 
 fn plain_st(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
     if is_mem(t) {
-        copy(t, p, v);
+        copy_n(p, v, val_size(t));
         return;
     }
     let s = ir.store(cg.B, v, p);
     s.align = @truncate(u32, cty.align_of(t));
 }
 
-// Value v of type t as the integer of its bits (a value in memory: loaded
-// from its address).
+// Value v of type t as the integer of the object's bits (a value in memory:
+// loaded from its address, padded).
 fn bits_of(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
     if is_mem(t) {
-        return bits_ld(t, v);
+        return bits_ld(t, padded(t, v));
     }
     return to_bits(t, v);
 }
 
-// The value of type t whose bits are integer x (a value in memory: at a temporary).
+// The value of type t whose (object's) bits are integer x (a value in
+// memory: at a temporary).
 fn value_of(t: *mut cty.CType, x: *mut ir.Value) *mut ir.Value {
     if is_mem(t) {
         let r = temp(t);
@@ -171,10 +319,44 @@ fn value_of(t: *mut cty.CType, x: *mut ir.Value) *mut ir.Value {
     return from_bits(t, x);
 }
 
-/// The value of the atomic object of type t at p (6.3.2.1p2: an atomic load).
-pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
-    if lock_free(t) {
-        return value_of(t, atomic_ld(int_ty(t), p));
+// A value of type t (in memory) as a temporary of t's object for a 16-byte
+// compare-exchange to read or write.
+fn wide_temp(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+    let r = temp(t);
+    if val_size(t) != obj_size(t) {
+        _ = ir.memop(cg.B, ir.OP_MEMSET, r, ir.cint(cg.T_i8, 0), cg.usz(obj_size(t)));
+    }
+    copy_n(r, v, val_size(t));
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// The operations
+// -----------------------------------------------------------------------------
+
+/// The value of the atomic object of type t at p (6.3.2.1p2: an atomic
+/// load), of order o.
+pub fn load(t: *mut cty.CType, p: *mut ir.Value, o: u32) *mut ir.Value {
+    if int_free(t) {
+        return value_of(t, atomic_ld(int_ty(t), p, o));
+    }
+    if wide(t) {
+        // (a compare-exchange with what it finds: either the object holds
+        // the zeros it compares with, which it stores again, or the
+        // temporary gets its value)
+        let e = temp(t);
+        _ = ir.memop(cg.B, ir.OP_MEMSET, e, ir.cint(cg.T_i8, 0), cg.usz(16));
+        _ = cas16(p, e, e, o, o);
+        return e;
+    }
+    if g_outline {
+        let r = temp(t);
+        let mut a: [4]*mut ir.Value = [cg.usz(obj_size(t)), p, r, corder(o)];
+        _ = call_outline(OL_LOAD, a[..]);
+        if is_mem(t) {
+            return r;
+        }
+        return plain_ld(t, r);
     }
     lock(p);
     let v = plain_ld(t, p);
@@ -182,10 +364,19 @@ pub fn load(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
     return v;
 }
 
-/// Stores v in the atomic object of type t at p.
-pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
-    if lock_free(t) {
-        atomic_st(bits_of(t, v), p);
+/// Stores v in the atomic object of type t at p, with order o.
+pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value, o: u32) void {
+    if int_free(t) {
+        atomic_st(bits_of(t, v), p, o);
+        return;
+    }
+    if wide(t) {
+        _ = wide_swap(t, v, p, o);
+        return;
+    }
+    if g_outline {
+        let mut a: [4]*mut ir.Value = [cg.usz(obj_size(t)), p, mem_value(t, v), corder(o)];
+        _ = call_outline(OL_STORE, a[..]);
         return;
     }
     lock(p);
@@ -193,11 +384,57 @@ pub fn store(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
     unlock(p);
 }
 
+// Value v of type t in memory of the object's size (for the out-of-line
+// interface): its address.
+fn mem_value(t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+    if is_mem(t) {
+        return padded(t, v);
+    }
+    let r = temp(t);
+    plain_st(t, v, r);
+    return r;
+}
+
+// Stores v in the 16-byte object at p by a loop of compare-exchanges;
+// returns the temporary that holds the value it replaced.
+fn wide_swap(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value, o: u32) *mut ir.Value {
+    let d = wide_temp(t, v);
+    let e = temp(t);
+    _ = ir.memop(cg.B, ir.OP_MEMSET, e, ir.cint(cg.T_i8, 0), cg.usz(16));
+    let head = cg.new_block("atomic.swap");
+    let done = cg.new_block("atomic.swapped");
+    ir.br(cg.B, head);
+    cg.at_end(head);
+    // (a failure finds the value, which the next attempt expects)
+    let ok = cas16(p, e, d, o, ir.ORD_RELAXED);
+    ir.condbr(cg.B, ok, done, head);
+    cg.at_end(done);
+    return e;
+}
+
 /// Stores v in the atomic object of type t at p and returns the value it
-/// had (atomic_exchange).
-pub fn exchange(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) *mut ir.Value {
-    if lock_free(t) {
-        return value_of(t, ir.rmw(cg.B, ir.RMW_XCHG, p, bits_of(t, v)));
+/// had (atomic_exchange), with order o.
+pub fn exchange(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value, o: u32) *mut ir.Value {
+    if int_free(t) {
+        let r = ir.rmw(cg.B, ir.RMW_XCHG, p, bits_of(t, v));
+        ir.set_order(r, o, o);
+        return value_of(t, r);
+    }
+    if wide(t) {
+        let old = wide_swap(t, v, p, o);
+        if is_mem(t) {
+            return old;
+        }
+        return plain_ld(t, old);
+    }
+    if g_outline {
+        let r = temp(t);
+        let mut a: [5]*mut ir.Value = [cg.usz(obj_size(t)), p, mem_value(t, v), r, corder(o)];
+        _ = call_outline(OL_EXCHANGE, a[..]);
+        if is_mem(t) {
+            return r;
+        }
+        return plain_ld(t, r);
     }
     lock(p);
     let old = plain_ld(t, p);
@@ -218,7 +455,7 @@ pub fn value_at(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
 /// Stores value v of type t at p (as value_at reads it).
 pub fn put_value(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
     if is_mem(t) {
-        copy(t, p, v);
+        copy_n(p, v, val_size(t));
         return;
     }
     bits_st(t, to_bits(t, v), p);
@@ -226,28 +463,67 @@ pub fn put_value(t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
 
 /// The compare-and-exchange of a lock-free atomic object of integer or
 /// pointer type t at p with the values e (expected) and v: the value it
-/// had (it stored v if that is e).
-pub fn compare_exchange_value(t: *mut cty.CType, p: *mut ir.Value, e: *mut ir.Value, v: *mut ir.Value) *mut ir.Value {
-    return from_bits(t, ir.cmpxchg(cg.B, p, to_bits(t, e), to_bits(t, v)));
+/// had (it stored v if that is e). Orders so on success, fo on failure.
+pub fn compare_exchange_value(t: *mut cty.CType, p: *mut ir.Value, e: *mut ir.Value, v: *mut ir.Value, so: u32,
+                              fo: u32) *mut ir.Value {
+    let c = ir.cmpxchg(cg.B, p, to_bits(t, e), to_bits(t, v));
+    ir.set_order(c, so, fo);
+    return from_bits(t, c);
 }
 
-/// The strong compare-and-exchange (7.17.7.4): if the atomic object of type
-/// t at p holds the bytes at `expected` (an object of t's non-atomic type),
-/// stores `desired` there; otherwise copies its value to `expected`.
-/// Returns whether it stored (an i1). The comparison is of the objects'
-/// bytes (7.17.7.4p4, note: a structure's padding included).
-pub fn compare_exchange(t: *mut cty.CType, p: *mut ir.Value, expected: *mut ir.Value,
-                        desired: *mut ir.Value) *mut ir.Value {
+/// The compare-and-exchange (7.17.7.4): if the atomic object of type t at p
+/// holds the bytes at `expected` (an object of t's non-atomic type), stores
+/// `desired` there; otherwise copies its value to `expected`. Returns
+/// whether it stored (an i1). The comparison is of the objects' bytes
+/// (7.17.7.4p4, note: a structure's padding included). so and fo are the
+/// orders on success and on failure; `weak`: it may fail spuriously
+/// (7.17.7.4p4), which only AArch64's exclusive pair does (one attempt,
+/// IN_CMPXCHG_OK), every other form being the strong one.
+pub fn compare_exchange(t: *mut cty.CType, p: *mut ir.Value, expected: *mut ir.Value, desired: *mut ir.Value, so: u32,
+                        fo: u32, weak: bool) *mut ir.Value {
+    let n = val_size(t);
+    if g_outline and not int_free(t) and not wide(t) {
+        // (expected is updated by the callee on failure)
+        let e = padded(t, expected);
+        let mut a: [6]*mut ir.Value = [cg.usz(obj_size(t)), p, e, mem_value(t, desired), corder(so), corder(fo)];
+        let r = call_outline(OL_CMPXCHG, a[..]);
+        if e != expected {
+            copy_n(expected, e, n);
+        }
+        return ir.icmp(cg.B, ir.IntNE, r, ir.cint(cg.T_i8, 0));
+    }
     let done = cg.new_block("cas.done");
     let failed = cg.new_block("cas.failed");
-    if lock_free(t) {
-        let e = bits_ld(t, expected);
+    if int_free(t) {
+        let e = bits_ld(t, padded(t, expected));
         let old = ir.cmpxchg(cg.B, p, e, bits_of(t, desired));
-        let ok = ir.icmp(cg.B, ir.IntEQ, old, e);
+        ir.set_order(old, so, fo);
+        let mut ok = ir.vnil();
+        if weak and (tg.g_arch == tg.ARCH_A64) {
+            old.flags = old.flags | ir.F_WEAK;
+            let mut a: [1]*mut ir.Value = [old];
+            ok = ir.intr(cg.B, ir.IN_CMPXCHG_OK, cg.T_i1, a[..]);
+        } else {
+            ok = ir.icmp(cg.B, ir.IntEQ, old, e);
+        }
         let from = ir.insert_block(cg.B);
         ir.condbr(cg.B, ok, done, failed);
         cg.at_end(failed);
-        bits_st(t, old, expected);
+        put_found(t, old, expected);
+        ir.br(cg.B, done);
+        cg.at_end(done);
+        let ph = ir.phi(cg.B, cg.T_i1);
+        ir.add_incoming(ph, ir.cint(cg.T_i1, 1), from);
+        ir.add_incoming(ph, ir.cint(cg.T_i1, 0), failed);
+        return ph;
+    }
+    if wide(t) {
+        let e = wide_temp(t, expected);
+        let ok = cas16(p, e, wide_temp(t, desired), so, fo);
+        let from = ir.insert_block(cg.B);
+        ir.condbr(cg.B, ok, done, failed);
+        cg.at_end(failed);
+        copy_n(expected, e, val_size(t));
         ir.br(cg.B, done);
         cg.at_end(done);
         let ph = ir.phi(cg.B, cg.T_i1);
@@ -257,14 +533,13 @@ pub fn compare_exchange(t: *mut cty.CType, p: *mut ir.Value, expected: *mut ir.V
     }
     let same = cg.new_block("cas.same");
     lock(p);
-    let n = cty.size_of(t);
     let ok = bytes_equal(p, expected, n);
     ir.condbr(cg.B, ok, same, failed);
     cg.at_end(same);
     plain_st(t, desired, p);
     ir.br(cg.B, done);
     cg.at_end(failed);
-    _ = ir.memop(cg.B, ir.OP_MEMCPY, expected, p, cg.usz(n));
+    copy_n(expected, p, n);
     ir.br(cg.B, done);
     cg.at_end(done);
     let ph = ir.phi(cg.B, cg.T_i1);
@@ -272,6 +547,18 @@ pub fn compare_exchange(t: *mut cty.CType, p: *mut ir.Value, expected: *mut ir.V
     ir.add_incoming(ph, ir.cint(cg.T_i1, 0), failed);
     unlock(p);
     return ph;
+}
+
+// The value a failed compare-exchange found (the object's bits x) stored
+// at `expected`, an object of t's value size.
+fn put_found(t: *mut cty.CType, x: *mut ir.Value, expected: *mut ir.Value) void {
+    if val_size(t) == obj_size(t) {
+        bits_st(t, x, expected);
+        return;
+    }
+    let r = temp(t);
+    bits_st(t, x, r);
+    copy_n(expected, r, val_size(t));
 }
 
 // Whether the n bytes at a and b are the same (an i1): compared 8, then 1
@@ -296,33 +583,37 @@ fn bytes_equal(a: *mut ir.Value, b: *mut ir.Value, n: u64) *mut ir.Value {
 }
 
 /// A read-modify-write of the lock-free atomic object of type t (an integer
-/// or pointer type) at p: op is ir.RMW_ADD, _SUB, _AND, _OR, _XOR or _XCHG,
-/// x the operand (an integer of t's width: for a pointer, the change in
-/// bytes). Returns the old value.
-pub fn fetch(t: *mut cty.CType, op: i32, p: *mut ir.Value, x: *mut ir.Value) *mut ir.Value {
-    return from_bits(t, ir.rmw(cg.B, op, p, x));
+/// or pointer type of at most 8 bytes) at p: op is ir.RMW_ADD, _SUB, _AND,
+/// _OR, _XOR or _XCHG, x the operand (an integer of t's width: for a
+/// pointer, the change in bytes), o the order. Returns the old value.
+pub fn fetch(t: *mut cty.CType, op: i32, p: *mut ir.Value, x: *mut ir.Value, o: u32) *mut ir.Value {
+    let r = ir.rmw(cg.B, op, p, x);
+    ir.set_order(r, o, o);
+    return from_bits(t, r);
 }
 
 /// A read-modify-write in progress (update_begin).
 pub struct Update {
     t: *mut cty.CType,
     p: *mut ir.Value,
+    o: u32,               // the order
     old: *mut ir.Value,   // the value read, which the new one is computed from
-    bits: *mut ir.Value,  // its bits (lock-free: the loop's phi)
+    bits: *mut ir.Value,  // its bits (lock-free: the loop's phi; 16 bytes: the temporary)
     head: *mut ir.Block,  // the loop's head (lock-free)
 }
 
-/// Begins an atomic read-modify-write of the object of type t at p that
-/// computes the new value from the old (u.old) with any operation: a
+/// Begins an atomic read-modify-write of order o of the object of type t at
+/// p that computes the new value from the old (u.old) with any operation: a
 /// compound assignment, ++ or -- (6.5.16.2p3). The code that computes it
 /// may run more than once, and must have no other effect.
-pub fn update_begin(t: *mut cty.CType, p: *mut ir.Value) *mut Update {
+pub fn update_begin(t: *mut cty.CType, p: *mut ir.Value, o: u32) *mut Update {
     let r = u.new.[Update]();
     r.t = t;
     r.p = p;
-    if lock_free(t) {
+    r.o = o;
+    if int_free(t) {
         // (6.5.16.2p3, note: a loop of compare-exchanges)
-        let first = atomic_ld(int_ty(t), p);
+        let first = atomic_ld(int_ty(t), p, load_part(o));
         let entry = ir.insert_block(cg.B);
         r.head = cg.new_block("atomic.retry");
         ir.br(cg.B, r.head);
@@ -330,6 +621,22 @@ pub fn update_begin(t: *mut cty.CType, p: *mut ir.Value) *mut Update {
         r.bits = ir.phi(cg.B, first.ty);
         ir.add_incoming(r.bits, first, entry);
         r.old = value_of(t, r.bits);
+        return r;
+    }
+    if wide(t) or g_outline {
+        // (the value read in a temporary, which a failed compare-exchange
+        // updates: the loop computes the new value from it again)
+        r.bits = load(t, p, load_part(o));
+        if not wide(t) and not is_mem(t) {
+            let tmp = temp(t);
+            plain_st(t, r.bits, tmp);
+            r.bits = tmp;
+        }
+        r.head = cg.new_block("atomic.retry");
+        ir.br(cg.B, r.head);
+        cg.at_end(r.head);
+        // (a copy: the operation's code may keep the value's address)
+        r.old = plain_ld(t, r.bits);
         return r;
     }
     lock(p);
@@ -341,22 +648,50 @@ pub fn update_begin(t: *mut cty.CType, p: *mut ir.Value) *mut Update {
 /// object still holds r.old (else computes it again from the value it
 /// holds).
 pub fn update_end(r: *mut Update, v: *mut ir.Value) void {
-    if not lock_free(r.t) {
-        plain_st(r.t, v, r.p);
-        unlock(r.p);
+    let t = r.t;
+    let done = cg.new_block("atomic.done");
+    if int_free(t) {
+        let cur = ir.cmpxchg(cg.B, r.p, r.bits, bits_of(t, v));
+        ir.set_order(cur, r.o, load_part(r.o));
+        let ok = ir.icmp(cg.B, ir.IntEQ, cur, r.bits);
+        ir.add_incoming(r.bits, cur, ir.insert_block(cg.B));
+        ir.condbr(cg.B, ok, done, r.head);
+        cg.at_end(done);
         return;
     }
-    let cur = ir.cmpxchg(cg.B, r.p, r.bits, bits_of(r.t, v));
-    let ok = ir.icmp(cg.B, ir.IntEQ, cur, r.bits);
-    let done = cg.new_block("atomic.done");
-    ir.add_incoming(r.bits, cur, ir.insert_block(cg.B));
-    ir.condbr(cg.B, ok, done, r.head);
+    if wide(t) {
+        let ok = cas16(r.p, r.bits, wide_temp(t, v), r.o, load_part(r.o));
+        ir.condbr(cg.B, ok, done, r.head);
+        cg.at_end(done);
+        return;
+    }
+    if g_outline {
+        let mut a: [6]*mut ir.Value = [cg.usz(obj_size(t)), r.p, r.bits, mem_value(t, v), corder(r.o),
+                                       corder(load_part(r.o))];
+        let ok = ir.icmp(cg.B, ir.IntNE, call_outline(OL_CMPXCHG, a[..]), ir.cint(cg.T_i8, 0));
+        ir.condbr(cg.B, ok, done, r.head);
+        cg.at_end(done);
+        return;
+    }
+    plain_st(t, v, r.p);
+    unlock(r.p);
+    ir.br(cg.B, done);
     cg.at_end(done);
 }
 
-/// A full memory fence (atomic_thread_fence of any order but relaxed).
-pub fn fence() void {
-    ir.fence(cg.B);
+/// A fence of order o (atomic_thread_fence; a relaxed one is nothing,
+/// 7.17.4.1p2), or with `signal` one for the thread's signal handlers only
+/// (atomic_signal_fence, 7.17.4.2: no instruction, but nothing moves across
+/// it: ir.F_SIGNAL).
+pub fn fence(o: u32, signal: bool) void {
+    if o == ir.ORD_RELAXED {
+        return;
+    }
+    let f = ir.fence(cg.B);
+    ir.set_order(f, o, o);
+    if signal {
+        f.flags = f.flags | ir.F_SIGNAL;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -367,34 +702,39 @@ pub fn fence() void {
 pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let id = e.op;
     if (id == catm.BI_ATOMIC_THREAD_FENCE) or (id == catm.BI_ATOMIC_SIGNAL_FENCE) {
-        // (every order is made sequentially consistent; a signal fence is a
-        // thread fence, which orders more)
-        fence();
+        fence(order_of(e.args.get(0)), id == catm.BI_ATOMIC_SIGNAL_FENCE);
         return ir.vnil();
     }
     let a = e.args.get(0).ty.elem;
     let p = vs[0];
     if id == catm.BI_ATOMIC_IS_LOCK_FREE {
-        return ir.cint(cg.T_i8, @as(u64, lock_free(a)));
+        return lock_free_value(a);
     }
     if id == catm.BI_ATOMIC_LOAD {
-        return load(a, p);
+        return load(a, p, order_of(e.args.get(1)));
     }
     if id == catm.BI_ATOMIC_INIT {
-        // (7.17.2.2p2: not an atomic operation)
-        plain_st(a, vs[1], p);
+        // (7.17.2.2p2: not an atomic operation; an atomic object's padding zeros)
+        if is_mem(a) and (val_size(a) != obj_size(a)) {
+            copy_n(p, padded(a, vs[1]), obj_size(a));
+        } else {
+            plain_st(a, vs[1], p);
+        }
         return ir.vnil();
     }
     if id == catm.BI_ATOMIC_STORE {
-        store(a, vs[1], p);
+        store(a, vs[1], p, order_of(e.args.get(2)));
         return ir.vnil();
     }
     if id == catm.BI_ATOMIC_EXCHANGE {
-        return exchange(a, vs[1], p);
+        return exchange(a, vs[1], p, order_of(e.args.get(2)));
     }
-    if id == catm.BI_ATOMIC_CMPXCHG {
-        return ir.zext(cg.B, compare_exchange(a, p, vs[1], vs[2]), cg.T_i8);
+    if (id == catm.BI_ATOMIC_CMPXCHG) or (id == catm.BI_ATOMIC_CMPXCHG_WEAK) {
+        let ok = compare_exchange(a, p, vs[1], vs[2], order_of(e.args.get(3)), order_of(e.args.get(4)),
+                                  id == catm.BI_ATOMIC_CMPXCHG_WEAK);
+        return ir.zext(cg.B, ok, cg.T_i8);
     }
+    let o = order_of(e.args.get(2));
     // fetch_*: the old value
     let mut op = ir.RMW_ADD;
     let mut io = ir.OP_ADD;
@@ -416,13 +756,14 @@ pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     if c.kind == cty.TK_POINTER {
         // (an operand of elements: 7.17.7.5p3, as pointer arithmetic)
         x = ir.mul(cg.B, x, gv.size_value(c.elem));
-        return fetch(a, op, p, x);
+        return fetch(a, op, p, x, o);
     }
-    if lock_free(a) and (cty.storage_bits(c) == c.bits) {
-        return fetch(a, op, p, x);
+    if int_free(a) and (cty.storage_bits(c) == c.bits) {
+        return fetch(a, op, p, x, o);
     }
     if cty.is_wint(c) {
-        // (an integer wider than 64 bits: under the lock, cgen_wint.ax's operation)
+        // (an integer wider than 64 bits: a loop of 16-byte compare-exchanges,
+        // or under the lock, of cgen_wint.ax's operation)
         let ops: [5]i32 = [ct.P_PLUS, ct.P_MINUS, ct.P_PIPE, ct.P_CARET, ct.P_AMP];
         let rmws: [5]i32 = [ir.RMW_ADD, ir.RMW_SUB, ir.RMW_OR, ir.RMW_XOR, ir.RMW_AND];
         let mut cop = ct.P_PLUS;
@@ -431,14 +772,384 @@ pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
                 cop = ops[k];
             }
         }
-        let up = update_begin(a, p);
+        let up = update_begin(a, p, o);
         update_end(up, cgw.arith(cop, c, up.old, x));
         return up.old;
     }
     // (a _BitInt narrower than its storage: the result is narrowed again)
-    let up = update_begin(a, p);
+    let up = update_begin(a, p, o);
     update_end(up, cgbi.norm(ir.binop(cg.B, io, up.old, x), c));
     return up.old;
+}
+
+// -----------------------------------------------------------------------------
+// 16-byte compare-exchange
+// -----------------------------------------------------------------------------
+
+// The compare-exchange of the 16 bytes at p (aligned to 16) with those at
+// e (expected; it gets the value found if they differ) and d (desired), of
+// orders so and fo: an i1, whether it stored. Inline (ir.IN_CAS16) where
+// the target has the instruction, else a call of __axiom_atomic_cas16.
+fn cas16(p: *mut ir.Value, e: *mut ir.Value, d: *mut ir.Value, so: u32, fo: u32) *mut ir.Value {
+    let mut a: [3]*mut ir.Value = [p, e, d];
+    if wide_inline() {
+        let v = ir.intr(cg.B, ir.IN_CAS16, cg.T_i1, a[..]);
+        ir.set_order(v, so, fo);
+        return v;
+    }
+    let f = cas16_fn();
+    let r = ir.call(cg.B, f.ty, f.val, a[..]);
+    return ir.icmp(cg.B, ir.IntNE, r, ir.cint(cg.T_i8, 0));
+}
+
+let CAS16_FN: []u8 = "__axiom_atomic_cas16";
+let CX16_FLAG: []u8 = "__axiom_atomic_cx16";
+
+// __axiom_atomic_cas16(p, e, d) -> i8 (x86-64 targets without cmpxchg16b):
+// asks the processor once whether it has cmpxchg16b (cpuid leaf 1, ecx bit
+// 13: remembered in a linkonce byte, 1 no, 2 yes), then compares and
+// exchanges with it, or under the lock of p (as every operation on an
+// object that is not lock-free). With a null p, only the answer: whether it
+// has it (atomic_is_lock_free). Sequentially consistent (the instruction
+// and the lock both are).
+fn cas16_fn() *mut ir.Func {
+    let f0 = ir.get_function(cg.M, CAS16_FN);
+    if u.notnil(f0) and not ir.is_decl(f0) {
+        return f0;
+    }
+    let mut f = f0;
+    if u.isnil(f) {
+        let mut ps: [3]*mut ir.Ty = [cg.T_ptr, cg.T_ptr, cg.T_ptr];
+        f = ir.add_function(cg.M, CAS16_FN, ir.t_fn(cg.T_i8, ps[..], false));
+    }
+    f.linkage = ir.LINK_LINKONCE;
+    let mut flag = ir.get_global(cg.M, CX16_FLAG);
+    if u.isnil(flag) {
+        flag = ir.add_global(cg.M, cg.T_i8, CX16_FLAG);
+        flag.init = ir.czero(cg.T_i8);
+        flag.linkage = ir.LINK_LINKONCE;
+    }
+    let saved = cg.B;
+    let B = ir.new_builder();
+    cg.B = B;
+    let entry = ir.append_block(f, "entry");
+    let ask = ir.append_block(f, "ask");
+    let known = ir.append_block(f, "known");
+    let answer = ir.append_block(f, "answer");
+    let fast = ir.append_block(f, "cx16");
+    let slow = ir.append_block(f, "locked");
+    let same = ir.append_block(f, "same");
+    let differ = ir.append_block(f, "differ");
+    ir.at_end(B, entry);
+    let p = f.params[0];
+    let e = f.params[1];
+    let d = f.params[2];
+    let k0 = atomic_ld(cg.T_i8, flag.val, ir.ORD_RELAXED);
+    ir.condbr(B, ir.icmp(B, ir.IntEQ, k0, ir.cint(cg.T_i8, 0)), ask, known);
+    ir.at_end(B, ask);
+    let mut leaf: [2]*mut ir.Value = [ir.cint(cg.T_i32, 1), ir.cint(cg.T_i32, 0)];
+    let regs = ir.intr(B, ir.IN_CPUID, ir.t_vec(cg.T_i32, 4), leaf[..]);
+    let ecx = ir.extract_elem(B, regs, 2);
+    let bit = ir.and_(B, ir.binop(B, ir.OP_LSHR, ecx, ir.cint(cg.T_i32, 13)), ir.cint(cg.T_i32, 1));
+    let k1 = ir.add(B, ir.trunc(B, bit, cg.T_i8), ir.cint(cg.T_i8, 1));
+    atomic_st(k1, flag.val, ir.ORD_RELAXED);
+    ir.br(B, known);
+    ir.at_end(B, known);
+    let k = ir.phi(B, cg.T_i8);
+    ir.add_incoming(k, k0, entry);
+    ir.add_incoming(k, k1, ask);
+    let has = ir.icmp(B, ir.IntEQ, k, ir.cint(cg.T_i8, 2));
+    let pi = ir.ptrtoint(B, p, cg.T_isz);
+    ir.condbr(B, ir.icmp(B, ir.IntEQ, pi, cg.usz(0)), answer, fast);
+    ir.at_end(B, answer);
+    ir.ret(B, ir.zext(B, has, cg.T_i8));
+    // (the instruction: the function is compiled with the target's
+    // extensions, which lack it, but only reaches it on a processor that has it)
+    ir.at_end(B, fast);
+    let check = ir.append_block(f, "check");
+    ir.condbr(B, has, check, slow);
+    ir.at_end(B, check);
+    let mut a: [3]*mut ir.Value = [p, e, d];
+    let v = ir.intr(B, ir.IN_CAS16, cg.T_i1, a[..]);
+    ir.ret(B, ir.zext(B, v, cg.T_i8));
+    ir.at_end(B, slow);
+    let mut lp: [1]*mut ir.Value = [p];
+    let lf = helper(LOCK_FN);
+    let uf = helper(UNLOCK_FN);
+    cg.B = B;
+    _ = ir.call(B, lf.ty, lf.val, lp[..]);
+    ir.condbr(B, bytes_equal(p, e, 16), same, differ);
+    ir.at_end(B, same);
+    _ = ir.memop(B, ir.OP_MEMCPY, p, d, cg.usz(16));
+    _ = ir.call(B, uf.ty, uf.val, lp[..]);
+    ir.ret(B, ir.cint(cg.T_i8, 1));
+    ir.at_end(B, differ);
+    _ = ir.memop(B, ir.OP_MEMCPY, e, p, cg.usz(16));
+    _ = ir.call(B, uf.ty, uf.val, lp[..]);
+    ir.ret(B, ir.cint(cg.T_i8, 0));
+    cg.B = saved;
+    f.ret_ext = 1;
+    return f;
+}
+
+// -----------------------------------------------------------------------------
+// The out-of-line interface (g_outline)
+// -----------------------------------------------------------------------------
+
+const OL_LOAD: usize = 0;
+const OL_STORE: usize = 1;
+const OL_EXCHANGE: usize = 2;
+const OL_CMPXCHG: usize = 3;
+let OL_NAMES: [4][]u8 = ["__atomic_load", "__atomic_store", "__atomic_exchange", "__atomic_compare_exchange"];
+
+fn corder(o: u32) *mut ir.Value {
+    return ir.cint(cg.T_i32, c_order(o));
+}
+
+// Calls helper k with arguments a: its result (an i8 for OL_CMPXCHG).
+fn call_outline(k: usize, a: []mut *mut ir.Value) *mut ir.Value {
+    let f = outline_fn(k);
+    return ir.call(cg.B, f.ty, f.val, a);
+}
+
+// The function of the standard out-of-line interface k, defined once per
+// module (linkonce, so global: foreign code linked into the program calls
+// it too), over the lock table:
+//   void __atomic_load(size_t n, void *p, void *ret, int order)
+//   void __atomic_store(size_t n, void *p, void *val, int order)
+//   void __atomic_exchange(size_t n, void *p, void *val, void *ret, int order)
+//   bool __atomic_compare_exchange(size_t n, void *p, void *expected, void *desired, int success, int failure)
+// The sizes this code accesses lock-free (1, 2, 4, 8 and, where it does,
+// 16, at an address aligned to the size) are done so, as this code does
+// them; every other under the lock of p. Each is sequentially consistent.
+fn outline_fn(k: usize) *mut ir.Func {
+    let name = OL_NAMES[k];
+    let f0 = ir.get_function(cg.M, name);
+    if u.notnil(f0) and not ir.is_decl(f0) {
+        return f0;
+    }
+    let mut f = f0;
+    if u.isnil(f) {
+        let P = cg.T_ptr;
+        let I = cg.T_i32;
+        let N = cg.T_isz;
+        let mut ps = u.List.[*mut ir.Ty].empty();
+        ps.push(N);
+        ps.push(P);
+        ps.push(P);
+        if k >= OL_EXCHANGE {
+            ps.push(P);
+        }
+        ps.push(I);
+        if k == OL_CMPXCHG {
+            ps.push(I);
+        }
+        let mut rt = cg.T_void;
+        if k == OL_CMPXCHG {
+            rt = cg.T_i8;
+        }
+        f = ir.add_function(cg.M, name, ir.t_fn(rt, ps.items(), false));
+    }
+    f.linkage = ir.LINK_LINKONCE;
+    if k == OL_CMPXCHG {
+        f.ret_ext = 1;
+    }
+    let lf = helper(LOCK_FN);
+    let uf = helper(UNLOCK_FN);
+    let saved = cg.B;
+    let B = ir.new_builder();
+    cg.B = B;
+    let entry = ir.append_block(f, "entry");
+    ir.at_end(B, entry);
+    let n = f.params[0];
+    let p = f.params[1];
+    let pi = ir.ptrtoint(B, p, cg.T_isz);
+    // the lock-free sizes, each where the address is aligned to it
+    let mut sizes = u.List.[u64].empty();
+    sizes.push(1);
+    sizes.push(2);
+    sizes.push(4);
+    sizes.push(8);
+    if (tg.g_arch == tg.ARCH_A64) or (tg.g_arch == tg.ARCH_X64) {
+        sizes.push(16);
+    }
+    for w in sizes.items() {
+        let this = ir.append_block(f, "size");
+        let next = ir.append_block(f, "next");
+        let aligned = ir.icmp(B, ir.IntEQ, ir.and_(B, pi, cg.usz(w - 1)), cg.usz(0));
+        ir.condbr(B, ir.and_(B, ir.icmp(B, ir.IntEQ, n, cg.usz(w)), aligned), this, next);
+        ir.at_end(B, this);
+        outline_free(f, k, w);
+        ir.at_end(B, next);
+    }
+    // the others under the lock
+    let mut lp: [1]*mut ir.Value = [p];
+    _ = ir.call(B, lf.ty, lf.val, lp[..]);
+    if k == OL_LOAD {
+        _ = ir.memop(B, ir.OP_MEMCPY, f.params[2], p, n);
+    } else if k == OL_STORE {
+        _ = ir.memop(B, ir.OP_MEMCPY, p, f.params[2], n);
+    } else if k == OL_EXCHANGE {
+        // (byte by byte: val and ret may be one object)
+        byte_loop(f, n, p, f.params[2], f.params[3]);
+    } else {
+        let same = ir.append_block(f, "same");
+        let differ = ir.append_block(f, "differ");
+        let eq = bytes_equal_n(f, p, f.params[2], n);
+        ir.condbr(B, eq, same, differ);
+        ir.at_end(B, same);
+        _ = ir.memop(B, ir.OP_MEMCPY, p, f.params[3], n);
+        _ = ir.call(B, uf.ty, uf.val, lp[..]);
+        ir.ret(B, ir.cint(cg.T_i8, 1));
+        ir.at_end(B, differ);
+        _ = ir.memop(B, ir.OP_MEMCPY, f.params[2], p, n);
+        _ = ir.call(B, uf.ty, uf.val, lp[..]);
+        ir.ret(B, ir.cint(cg.T_i8, 0));
+        cg.B = saved;
+        return f;
+    }
+    _ = ir.call(B, uf.ty, uf.val, lp[..]);
+    ir.ret_void(B);
+    cg.B = saved;
+    return f;
+}
+
+// Helper k's operation on an object of w bytes, lock-free (at the builder's
+// block, which it ends with a return).
+fn outline_free(f: *mut ir.Func, k: usize, w: u64) void {
+    let B = cg.B;
+    let p = f.params[1];
+    if w == 16 {
+        // (16-byte temporaries in the frame, for the compare-exchange)
+        let t = ir.t_array(cg.T_i8, 16);
+        let e = entry_alloca(f, t);
+        let d = entry_alloca(f, t);
+        if k == OL_CMPXCHG {
+            _ = ir.memop(B, ir.OP_MEMCPY, e, f.params[2], cg.usz(16));
+            _ = ir.memop(B, ir.OP_MEMCPY, d, f.params[3], cg.usz(16));
+            let ok = cas16(p, e, d, ir.ORD_SEQ_CST, ir.ORD_SEQ_CST);
+            _ = ir.memop(B, ir.OP_MEMCPY, f.params[2], e, cg.usz(16));
+            ir.ret(B, ir.zext(B, ok, cg.T_i8));
+            return;
+        }
+        _ = ir.memop(B, ir.OP_MEMSET, e, ir.cint(cg.T_i8, 0), cg.usz(16));
+        if k == OL_LOAD {
+            _ = cas16(p, e, e, ir.ORD_SEQ_CST, ir.ORD_SEQ_CST);
+            _ = ir.memop(B, ir.OP_MEMCPY, f.params[2], e, cg.usz(16));
+            ir.ret_void(B);
+            return;
+        }
+        _ = ir.memop(B, ir.OP_MEMCPY, d, f.params[2], cg.usz(16));
+        let head = ir.append_block(f, "swap");
+        let done = ir.append_block(f, "swapped");
+        ir.br(B, head);
+        ir.at_end(B, head);
+        ir.condbr(B, cas16(p, e, d, ir.ORD_SEQ_CST, ir.ORD_RELAXED), done, head);
+        ir.at_end(B, done);
+        if k == OL_EXCHANGE {
+            _ = ir.memop(B, ir.OP_MEMCPY, f.params[3], e, cg.usz(16));
+        }
+        ir.ret_void(B);
+        return;
+    }
+    let it = ir.t_int(@int_cast(i32, w * 8));
+    if k == OL_LOAD {
+        bits_st_b(atomic_ld(it, p, ir.ORD_SEQ_CST), f.params[2]);
+        ir.ret_void(B);
+        return;
+    }
+    if k == OL_STORE {
+        atomic_st(bits_ld_b(it, f.params[2]), p, ir.ORD_SEQ_CST);
+        ir.ret_void(B);
+        return;
+    }
+    if k == OL_EXCHANGE {
+        let old = ir.rmw(B, ir.RMW_XCHG, p, bits_ld_b(it, f.params[2]));
+        bits_st_b(old, f.params[3]);
+        ir.ret_void(B);
+        return;
+    }
+    let e = bits_ld_b(it, f.params[2]);
+    let old = ir.cmpxchg(B, p, e, bits_ld_b(it, f.params[3]));
+    bits_st_b(old, f.params[2]);
+    ir.ret(B, ir.zext(B, ir.icmp(B, ir.IntEQ, old, e), cg.T_i8));
+}
+
+fn bits_ld_b(it: *mut ir.Ty, p: *mut ir.Value) *mut ir.Value {
+    let v = ir.load(cg.B, it, p);
+    v.align = 1;
+    return v;
+}
+
+fn bits_st_b(x: *mut ir.Value, p: *mut ir.Value) void {
+    let s = ir.store(cg.B, x, p);
+    s.align = 1;
+}
+
+// An object of IR type t in f's frame (an alloca in its entry block), aligned to 16.
+fn entry_alloca(f: *mut ir.Func, t: *mut ir.Ty) *mut ir.Value {
+    let B = cg.B;
+    let cur = ir.insert_block(B);
+    let first = f.first.first;
+    if u.notnil(first) {
+        ir.at_before(B, first);
+    } else {
+        ir.at_end(B, f.first);
+    }
+    let a = ir.alloca(B, t, "atomic");
+    a.align = 16;
+    ir.at_end(B, cur);
+    return a;
+}
+
+// Copies the n bytes at p to ret and those at val to p, a byte at a time (val
+// and ret may be one object): ends at a new block.
+fn byte_loop(f: *mut ir.Func, n: *mut ir.Value, p: *mut ir.Value, val: *mut ir.Value, ret: *mut ir.Value) void {
+    let B = cg.B;
+    let entry = ir.insert_block(B);
+    let head = ir.append_block(f, "byte");
+    let body = ir.append_block(f, "body");
+    let done = ir.append_block(f, "bytes.done");
+    ir.br(B, head);
+    ir.at_end(B, head);
+    let i = ir.phi(B, cg.T_isz);
+    ir.add_incoming(i, cg.usz(0), entry);
+    ir.condbr(B, ir.icmp(B, ir.IntULT, i, n), body, done);
+    ir.at_end(B, body);
+    let pa = ir.ptradd(B, p, i);
+    let old = ir.load(B, cg.T_i8, pa);
+    let nv = ir.load(B, cg.T_i8, ir.ptradd(B, val, i));
+    _ = ir.store(B, nv, pa);
+    _ = ir.store(B, old, ir.ptradd(B, ret, i));
+    ir.add_incoming(i, ir.add(B, i, cg.usz(1)), body);
+    ir.br(B, head);
+    ir.at_end(B, done);
+}
+
+// Whether the n bytes (a value) at a and b are the same: an i1, by a loop
+// (at a new block).
+fn bytes_equal_n(f: *mut ir.Func, a: *mut ir.Value, b: *mut ir.Value, n: *mut ir.Value) *mut ir.Value {
+    let B = cg.B;
+    let entry = ir.insert_block(B);
+    let head = ir.append_block(f, "cmp");
+    let body = ir.append_block(f, "cmp.body");
+    let done = ir.append_block(f, "cmp.done");
+    ir.br(B, head);
+    ir.at_end(B, head);
+    let i = ir.phi(B, cg.T_isz);
+    ir.add_incoming(i, cg.usz(0), entry);
+    ir.condbr(B, ir.icmp(B, ir.IntULT, i, n), body, done);
+    ir.at_end(B, body);
+    let x = ir.load(B, cg.T_i8, ir.ptradd(B, a, i));
+    let y = ir.load(B, cg.T_i8, ir.ptradd(B, b, i));
+    ir.add_incoming(i, ir.add(B, i, cg.usz(1)), body);
+    ir.condbr(B, ir.icmp(B, ir.IntEQ, x, y), head, done);
+    ir.at_end(B, done);
+    // (equal when the loop ran out: i == n at the head)
+    let r = ir.phi(B, cg.T_i1);
+    ir.add_incoming(r, ir.cint(cg.T_i1, 1), head);
+    ir.add_incoming(r, ir.cint(cg.T_i1, 0), body);
+    return r;
 }
 
 // -----------------------------------------------------------------------------
@@ -486,8 +1197,8 @@ fn lock_table() *mut ir.Value {
     return g.val;
 }
 
-// The function `name`, made once: lock(p) waits for p's lock and takes it,
-// unlock(p) releases it.
+// The function `name`, made once: lock(p) waits for p's lock and takes it
+// (an acquire exchange), unlock(p) releases it (a release store).
 fn helper(name: []u8) *mut ir.Func {
     let f0 = ir.get_function(cg.M, name);
     if u.notnil(f0) and not ir.is_decl(f0) {
@@ -511,7 +1222,7 @@ fn helper(name: []u8) *mut ir.Func {
     let k = ir.and_(B, h, cg.usz(LOCKS - 1));
     let w = ir.ptradd(B, tab, ir.mul(B, k, cg.usz(64)));
     if u.str_eq(name, UNLOCK_FN) {
-        atomic_st(ir.cint(cg.T_i32, 0), w);
+        atomic_st(ir.cint(cg.T_i32, 0), w, ir.ORD_RELEASE);
         ir.ret_void(B);
     } else {
         // take it (exchange 1 for 0); while it is held, wait reading it
@@ -521,13 +1232,212 @@ fn helper(name: []u8) *mut ir.Func {
         ir.br(B, take);
         ir.at_end(B, take);
         let was = ir.rmw(B, ir.RMW_XCHG, w, ir.cint(cg.T_i32, 1));
+        ir.set_order(was, ir.ORD_ACQUIRE, ir.ORD_ACQUIRE);
         ir.condbr(B, ir.icmp(B, ir.IntEQ, was, ir.cint(cg.T_i32, 0)), done, wait);
         ir.at_end(B, wait);
-        let held = atomic_ld(cg.T_i32, w);
+        let held = atomic_ld(cg.T_i32, w, ir.ORD_RELAXED);
         ir.condbr(B, ir.icmp(B, ir.IntEQ, held, ir.cint(cg.T_i32, 0)), take, wait);
         ir.at_end(B, done);
         ir.ret_void(B);
     }
     cg.B = saved;
     return f;
+}
+
+// -----------------------------------------------------------------------------
+// The sized 16-byte forms of the out-of-line interface (g_outline)
+// -----------------------------------------------------------------------------
+
+// The 16-byte operations the platforms' compilers call for 16-byte atomic
+// objects (__int128, structures of 16 bytes), by these names:
+//   __int128 __atomic_load_16(const volatile void *p, int order)
+//   void __atomic_store_16(volatile void *p, __int128 v, int order)
+//   __int128 __atomic_exchange_16(volatile void *p, __int128 v, int order)
+//   bool __atomic_compare_exchange_16(volatile void *p, __int128 *e, __int128 d, int s, int f)
+//   __int128 __atomic_fetch_OP_16(volatile void *p, __int128 v, int order),
+//   __int128 __atomic_OP_fetch_16(...), OP add, sub, and, or, xor, nand
+// defined (weak, global) in an executable that is linked with such code
+// (g_outline_exe: the system's linker links C sources, objects or libraries
+// with it), so that it needs no other definition of them (they are
+// lock-free on both sides: an object that does not define them, as an
+// --emit=obj one, may take the system's), on the System V x86-64 and
+// AAPCS64 targets (Linux, macOS),
+// over the same 16-byte compare-exchange as this code's (cgen_atomic.ax:
+// cas16), so that both are atomic with each other. An __int128 argument is
+// two registers, the low half first (AAPCS64: from an even register, so the
+// store's and the others' value skips one), a result rax:rdx or x0:x1.
+// (Windows passes __int128 otherwise: not defined there.)
+let SIZED_OPS: [6][]u8 = ["add", "sub", "and", "or", "xor", "nand"];
+
+/// Defines the sized 16-byte forms in the module, once (see above).
+pub fn define_sized() void {
+    if not g_outline_exe or tg.is_windows() or ((tg.g_arch != tg.ARCH_X64) and (tg.g_arch != tg.ARCH_A64)) {
+        return;
+    }
+    let f0 = ir.get_function(cg.M, "__atomic_load_16");
+    if u.notnil(f0) and not ir.is_decl(f0) {
+        return;
+    }
+    sized_fn("__atomic_load_16", 0, -1, false);
+    sized_fn("__atomic_store_16", 1, -1, false);
+    sized_fn("__atomic_exchange_16", 2, -1, false);
+    sized_fn("__atomic_compare_exchange_16", 3, -1, false);
+    for k in 0..SIZED_OPS.len {
+        sized_fn(u.f1("__atomic_fetch_%s_16", SIZED_OPS[k]), 4, @int_cast(i32, k), false);
+        sized_fn(u.f1("__atomic_%s_fetch_16", SIZED_OPS[k]), 4, @int_cast(i32, k), true);
+    }
+}
+
+// Sized form `name`: kind 0 load, 1 store, 2 exchange, 3 compare-exchange,
+// 4 the read-modify-write op (SIZED_OPS), its old value (or with `after`
+// the new one).
+fn sized_fn(name: []u8, kind: i32, op: i32, after: bool) void {
+    let I = cg.T_i32;
+    let L = ir.t_int(64);
+    let P = cg.T_ptr;
+    let mut ps = u.List.[*mut ir.Ty].empty();
+    ps.push(P);
+    let pad = tg.g_arch == tg.ARCH_A64;  // (AAPCS64: the value from an even register)
+    if kind == 3 {
+        ps.push(P);
+        ps.push(L);
+        ps.push(L);
+        ps.push(I);
+        ps.push(I);
+    } else if kind != 0 {
+        if pad {
+            ps.push(L);
+        }
+        ps.push(L);
+        ps.push(L);
+        ps.push(I);
+    } else {
+        ps.push(I);
+    }
+    let mut rt = cg.T_void;
+    if kind == 3 {
+        rt = cg.T_i8;
+    }
+    let mut f = ir.get_function(cg.M, name);
+    if u.isnil(f) {
+        f = ir.add_function(cg.M, name, ir.t_fn(rt, ps.items(), false));
+    }
+    f.linkage = ir.LINK_LINKONCE;
+    if kind == 3 {
+        f.ret_ext = 1;
+    } else if kind != 1 {
+        f.ret_ext = ir.EXT_REGS | 1;  // (two integer registers)
+    }
+    let saved = cg.B;
+    let B = ir.new_builder();
+    cg.B = B;
+    let entry = ir.append_block(f, "entry");
+    ir.at_end(B, entry);
+    let t16 = ir.t_array(cg.T_i8, 16);
+    let e = entry_alloca(f, t16);
+    let d = entry_alloca(f, t16);
+    let p = f.params[0];
+    if kind == 3 {
+        let ep = f.params[1];
+        _ = ir.memop(B, ir.OP_MEMCPY, e, ep, cg.usz(16));
+        put_halves(d, f.params[2], f.params[3]);
+        let ok = cas16(p, e, d, ir.ORD_SEQ_CST, ir.ORD_SEQ_CST);
+        _ = ir.memop(B, ir.OP_MEMCPY, ep, e, cg.usz(16));
+        ir.ret(B, ir.zext(B, ok, cg.T_i8));
+        cg.B = saved;
+        return;
+    }
+    _ = ir.memop(B, ir.OP_MEMSET, e, ir.cint(cg.T_i8, 0), cg.usz(16));
+    if kind == 0 {
+        _ = cas16(p, e, e, ir.ORD_SEQ_CST, ir.ORD_SEQ_CST);
+        let mut xs: [2]*mut ir.Value = [half(e, 0), half(e, 8)];
+        ir.ret_regs(B, xs[..]);
+        cg.B = saved;
+        return;
+    }
+    let mut base: usize = 1;
+    if pad {
+        base = 2;
+    }
+    let vlo = f.params[base];
+    let vhi = f.params[base + 1];
+    // a loop of compare-exchanges: e holds the value found, d the new one
+    _ = cas16(p, e, e, ir.ORD_SEQ_CST, ir.ORD_SEQ_CST);
+    let head = ir.append_block(f, "retry");
+    let done = ir.append_block(f, "done");
+    ir.br(B, head);
+    ir.at_end(B, head);
+    let olo = half(e, 0);
+    let ohi = half(e, 8);
+    let mut nlo = vlo;
+    let mut nhi = vhi;
+    if kind == 4 {
+        let r = op128(op, olo, ohi, vlo, vhi);
+        nlo = r.lo;
+        nhi = r.hi;
+    }
+    put_halves(d, nlo, nhi);
+    ir.condbr(B, cas16(p, e, d, ir.ORD_SEQ_CST, ir.ORD_RELAXED), done, head);
+    ir.at_end(B, done);
+    if kind == 1 {
+        ir.ret_void(B);
+    } else if after {
+        let mut xs: [2]*mut ir.Value = [nlo, nhi];
+        ir.ret_regs(B, xs[..]);
+    } else {
+        let mut xs: [2]*mut ir.Value = [olo, ohi];
+        ir.ret_regs(B, xs[..]);
+    }
+    cg.B = saved;
+}
+
+fn half(p: *mut ir.Value, off: u64) *mut ir.Value {
+    let v = ir.load(cg.B, ir.t_int(64), ir.ptradd(cg.B, p, cg.usz(off)));
+    v.align = 8;
+    return v;
+}
+
+fn put_halves(p: *mut ir.Value, lo: *mut ir.Value, hi: *mut ir.Value) void {
+    let a = ir.store(cg.B, lo, p);
+    a.align = 8;
+    let b = ir.store(cg.B, hi, ir.ptradd(cg.B, p, cg.usz(8)));
+    b.align = 8;
+}
+
+struct Halves {
+    lo: *mut ir.Value,
+    hi: *mut ir.Value,
+}
+
+// The 128-bit operation SIZED_OPS[op] of (ahi:alo) and (bhi:blo), in halves.
+fn op128(op: i32, alo: *mut ir.Value, ahi: *mut ir.Value, blo: *mut ir.Value, bhi: *mut ir.Value) Halves {
+    let B = cg.B;
+    let L = ir.t_int(64);
+    if (op == 0) or (op == 1) {
+        // (the carry or borrow of the low halves into the high ones)
+        let mut lo = ir.vnil();
+        let mut c = ir.vnil();
+        let mut hi = ir.vnil();
+        if op == 0 {
+            lo = ir.add(B, alo, blo);
+            c = ir.zext(B, ir.icmp(B, ir.IntULT, lo, alo), L);
+            hi = ir.add(B, ir.add(B, ahi, bhi), c);
+        } else {
+            lo = ir.sub(B, alo, blo);
+            c = ir.zext(B, ir.icmp(B, ir.IntULT, alo, blo), L);
+            hi = ir.sub(B, ir.sub(B, ahi, bhi), c);
+        }
+        return Halves.{ lo: lo, hi: hi };
+    }
+    if op == 2 {
+        return Halves.{ lo: ir.and_(B, alo, blo), hi: ir.and_(B, ahi, bhi) };
+    }
+    if op == 3 {
+        return Halves.{ lo: ir.or_(B, alo, blo), hi: ir.or_(B, ahi, bhi) };
+    }
+    if op == 4 {
+        return Halves.{ lo: ir.xor(B, alo, blo), hi: ir.xor(B, ahi, bhi) };
+    }
+    let m = ir.cint(L, 0xFFFF_FFFF_FFFF_FFFF);
+    return Halves.{ lo: ir.xor(B, ir.and_(B, alo, blo), m), hi: ir.xor(B, ir.and_(B, ahi, bhi), m) };
 }

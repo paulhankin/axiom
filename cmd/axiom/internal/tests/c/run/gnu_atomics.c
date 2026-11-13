@@ -71,7 +71,7 @@ int main(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     P(__atomic_always_lock_free(sizeof(long long), 0));
-    P(__atomic_is_lock_free(16, 0));
+    P(__atomic_is_lock_free(32, 0));
     return 0;
 }
 /* expect: 5 */

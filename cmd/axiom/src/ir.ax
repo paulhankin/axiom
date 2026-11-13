@@ -638,6 +638,22 @@ pub const IN_UDIV128: i32 = 111;
 pub const IN_SJLJ_TOKEN: i32 = 112;
 pub const IN_SJLJ_CAUGHT: i32 = 113;
 pub const IN_SJLJ_ENV: i32 = 114;
+// IN_CMPXCHG_OK(cas) -> i1: whether cas (a cmpxchg with F_WEAK, which may
+// fail spuriously: C's compare_exchange_weak) stored its new value. Kept
+// where it is made, right after its cmpxchg (like IN_CALL_RESULT), so that
+// copies of the block copy it with it; the backend defines its value at the
+// cmpxchg. Only the C front end makes it, for AArch64 (cgen_atomic.ax); a
+// backend whose compare-exchange never fails spuriously computes it as the
+// old value's equality with the expected one.
+pub const IN_CMPXCHG_OK: i32 = 115;
+// IN_CAS16(p, e, d) -> i1: the atomic compare-exchange of the 16 bytes at p
+// (aligned to 16) with the 16 bytes at e (expected) and d (desired): if p's
+// equal e's, d's are stored at p (1), else p's are copied to e (0); its
+// order in its flags (set_order). e and d are ordinary memory. Only the C
+// front end makes it, for x86-64 (lock cmpxchg16b, which the processor
+// must have: cgen_atomic.ax checks) and AArch64 (an exclusive pair, or
+// LSE's CASP). Opaque: never moved or removed.
+pub const IN_CAS16: i32 = 116;
 
 pub fn is_widen(id: i32) bool {
     return (id >= IN_SWIDEN_LO) and (id <= IN_UWIDEN_HI);
@@ -773,7 +789,7 @@ pub const INF_LANEWISE: u32 = 32;   // PURE, and the same operation on each lane
 
 const INF_LANES: u32 = INF_PURE | INF_LANEWISE;
 
-let IN_PROPS: [115]u32 = [
+let IN_PROPS: [117]u32 = [
     0,               // (no intrinsic 0)
     INF_LANES,       // IN_CTLZ
     INF_LANES,       // IN_CTTZ
@@ -889,6 +905,8 @@ let IN_PROPS: [115]u32 = [
     INF_OPAQUE,      // IN_SJLJ_TOKEN
     INF_OPAQUE,      // IN_SJLJ_CAUGHT
     INF_OPAQUE,      // IN_SJLJ_ENV
+    INF_HINT,        // IN_CMPXCHG_OK
+    INF_OPAQUE,      // IN_CAS16
 ];
 
 // Inline assembly (IN_ASM, whose first operand is its index in asm/inline.ax's
@@ -993,7 +1011,7 @@ pub fn can_copy_block(b: *Block) bool {
 }
 
 pub fn intr_props(id: i32) u32 {
-    if (id < 0) or (id > IN_SJLJ_ENV) {
+    if (id < 0) or (id > IN_CAS16) {
         return 0;
     }
     return IN_PROPS[@int_cast(usize, id)];
@@ -1073,7 +1091,170 @@ pub const EXT_REGS_FP0: u8 = 0x08;  // shifted left by the register's place (0 t
 
 // Load/store flags
 pub const F_VOLATILE: u32 = 1;
-pub const F_ATOMIC: u32 = 2;  // sequentially consistent
+pub const F_ATOMIC: u32 = 2;  // atomic (of the memory order the F_ORD bits give: 0 is sequentially consistent)
+// The memory order of an atomic load, store, rmw, cmpxchg (its success's) or
+// fence: (flags >> F_ORD_SHIFT) & 7, one of the ORD_ values, 0 (seq_cst)
+// by default; a cmpxchg's order on failure in the bits F_FAIL_SHIFT (an
+// order no stronger than what the backends use is always valid: they may
+// implement any order by a stronger one). Only the backends weaken their
+// instructions by them; the optimizer treats every atomic operation and
+// fence, whatever its order, as it treats a sequentially consistent one
+// (it does not move memory accesses across it, merge it or remove it):
+// valid for every order, since a weaker order only allows more behaviours.
+pub const F_ORD_SHIFT: u32 = 8;
+pub const F_ORD_MASK: u32 = 0x700;
+pub const F_FAIL_SHIFT: u32 = 11;
+pub const F_FAIL_MASK: u32 = 0x3800;
+// A cmpxchg that may fail spuriously (C's compare_exchange_weak): its
+// success is IN_CMPXCHG_OK(cas) (an i1), not old == expected.
+pub const F_WEAK: u32 = 0x4000;
+// A fence that orders the thread's accesses only for its own signal
+// handlers (atomic_signal_fence): no instruction, but the optimizer and
+// the backends keep accesses on their side of it.
+pub const F_SIGNAL: u32 = 0x8000;
+pub const ORD_SEQ_CST: u32 = 0;
+pub const ORD_RELAXED: u32 = 1;
+pub const ORD_ACQUIRE: u32 = 2;  // (and consume, which is implemented as acquire)
+pub const ORD_RELEASE: u32 = 3;
+pub const ORD_ACQ_REL: u32 = 4;
+
+/// The parameter p is based on (through ptradds, and the phis and selects
+/// whose operands all are based on it, or step from the phi itself), or nil.
+pub fn based_param(p0: *mut Value) *mut Value {
+    return based_rec(p0, 0);
+}
+
+fn based_rec(p0: *mut Value, depth: i32) *mut Value {
+    let mut p = resolve(p0);
+    let mut n: i32 = 0;
+    while is_op(p, OP_PTRADD) and (n < 32) {
+        p = resolve(p.a);
+        n += 1;
+    }
+    if u.isnil(p) {
+        return p;
+    }
+    if p.kind == V_PARAM {
+        return p;
+    }
+    if (depth >= 4) or (p.kind != V_INST) or ((p.op != OP_PHI) and (p.op != OP_SELECT)) {
+        return u.nil.[Value]();
+    }
+    let mut r = u.nil.[Value]();
+    let mut k: usize = 0;
+    let mut n_ops: usize = 2;
+    if p.op == OP_PHI {
+        n_ops = p.xs.len;
+    }
+    while k < n_ops {
+        let mut x = u.nil.[Value]();
+        if p.op == OP_PHI {
+            x = p.xs.get(k);
+        } else if k == 0 {
+            x = p.b;
+        } else {
+            x = p.c;
+        }
+        // (a step from the phi itself: p + k ...)
+        let mut y = resolve(x);
+        let mut m: i32 = 0;
+        while is_op(y, OP_PTRADD) and (m < 32) {
+            y = resolve(y.a);
+            m += 1;
+        }
+        if y != p {
+            let q = based_rec(x, depth + 1);
+            if u.isnil(q) or (u.notnil(r) and (q != r)) {
+                return u.nil.[Value]();
+            }
+            r = q;
+        }
+        k += 1;
+    }
+    return r;
+}
+
+/// Are accesses through pointers based on a and on b apart: two different
+/// objects (objects_apart), or by C's restrict (F_NOALIAS: see above), one
+/// based on a noalias parameter and the other on another parameter, a
+/// global or a stack slot (resolved roots ra and rb, from based_param or the
+/// objects under the ptradds)?
+pub fn restrict_apart(ra: *Value, rb: *Value) bool {
+    if u.isnil(ra) or u.isnil(rb) or (ra == rb) {
+        return false;
+    }
+    if objects_apart(ra, rb) {
+        return true;
+    }
+    let na = (ra.kind == V_PARAM) and ((ra.flags & F_NOALIAS) != 0);
+    let nb = (rb.kind == V_PARAM) and ((rb.flags & F_NOALIAS) != 0);
+    if not na and not nb {
+        return false;
+    }
+    return distinct_root(ra) and distinct_root(rb);
+}
+
+/// Are a and b two different objects: globals (not aliases of one another)
+/// or stack slots? Accesses through addresses based on them are apart.
+pub fn objects_apart(a: *Value, b: *Value) bool {
+    if u.isnil(a) or u.isnil(b) or (a == b) {
+        return false;
+    }
+    let ao = (a.kind == V_GLOBAL) or is_op(a, OP_ALLOCA);
+    let bo = (b.kind == V_GLOBAL) or is_op(b, OP_ALLOCA);
+    return ao and bo;
+}
+
+fn distinct_root(r: *Value) bool {
+    return (r.kind == V_PARAM) or (r.kind == V_GLOBAL) or is_op(r, OP_ALLOCA);
+}
+
+/// The memory order of atomic operation or fence v (ORD_).
+pub fn order(v: *Value) u32 {
+    return (v.flags & F_ORD_MASK) >> F_ORD_SHIFT;
+}
+
+/// The memory order of cmpxchg v on failure (ORD_).
+pub fn fail_order(v: *Value) u32 {
+    return (v.flags & F_FAIL_MASK) >> F_FAIL_SHIFT;
+}
+
+/// Sets the memory order of atomic operation or fence v (and, of a cmpxchg,
+/// its order on failure).
+pub fn set_order(v: *mut Value, o: u32, fail: u32) void {
+    v.flags = (v.flags & ~(F_ORD_MASK | F_FAIL_MASK)) | ((o << F_ORD_SHIFT) & F_ORD_MASK) |
+              ((fail << F_FAIL_SHIFT) & F_FAIL_MASK);
+}
+
+/// Does order o (ORD_) make an operation acquire (its reads)?
+pub fn ord_acquires(o: u32) bool {
+    return (o == ORD_SEQ_CST) or (o == ORD_ACQUIRE) or (o == ORD_ACQ_REL);
+}
+
+/// Does order o make an operation release (its writes)?
+pub fn ord_releases(o: u32) bool {
+    return (o == ORD_SEQ_CST) or (o == ORD_RELEASE) or (o == ORD_ACQ_REL);
+}
+
+/// The one order at least as strong as both a cmpxchg's success order s and
+/// its failure order f (what one instruction for it must have).
+pub fn ord_join(s: u32, f: u32) u32 {
+    if (s == ORD_SEQ_CST) or (f == ORD_SEQ_CST) {
+        return ORD_SEQ_CST;
+    }
+    let acq = ord_acquires(s) or ord_acquires(f);
+    let rel = ord_releases(s) or ord_releases(f);
+    if acq and rel {
+        return ORD_ACQ_REL;
+    }
+    if acq {
+        return ORD_ACQUIRE;
+    }
+    if rel {
+        return ORD_RELEASE;
+    }
+    return ORD_RELAXED;
+}
 // Call flags
 pub const F_TAIL: u32 = 4;  // a sibling call: the backend may jump to the callee (tailrec.ax: mark_sibling_calls)
 // Flags of add, sub, mul and shl (integers): the operation does not overflow
@@ -1092,6 +1273,17 @@ pub const F_TAIL: u32 = 4;  // a sibling call: the backend may jump to the calle
 pub const F_NSW: u32 = 8;
 pub const F_NUW: u32 = 16;
 pub const F_NO_WRAP: u32 = 24;
+// Parameter flags
+// F_NOALIAS: a pointer parameter whose pointee, while the function runs, is
+// not accessed through a pointer that is not based on it when either
+// access writes (C's restrict, 6.7.3.1; the front ends set it only where
+// the language says so). Passes may then take an access through the
+// parameter plus offsets (based_param) as apart from one through another
+// parameter, a global or a stack slot (based_param, gvn.may_alias,
+// idioms.ax); nothing else (a pointer loaded from memory may be based on
+// it). A copy of the function's body elsewhere (inlining) has no
+// parameter, so the fact is not carried there.
+pub const F_NOALIAS: u32 = 0x10000;
 // Alloca flags
 pub const F_VAR: u32 = 32;  // a C variable: -O0 keeps it in memory (opt.mem2reg), where debuggers find it
 // An fcmp of an ordered relation (<, <=, >, >=) that signals: "invalid" for
@@ -1715,8 +1907,9 @@ pub struct Block {
     dom_run: i32,
     grave: u32,  // 1 + its index in the graveyard (0: not there)
     loop_depth: i32,
-    split: bool,  // a loop header whose range was split (gvn.split_loops)
-    cold: bool,   // seldom run, a front end says (C's __builtin_expect, the attribute cold): laid out apart
+    split: bool,    // a loop header whose range was split (gvn.split_loops)
+    guarded: bool,  // a loop that idioms.loop_copies keeps for the case its memmove cannot take
+    cold: bool,     // seldom run, a front end says (C's __builtin_expect, the attribute cold): laid out apart
 }
 
 pub const LINK_EXTERNAL: i32 = 0;
@@ -4055,8 +4248,8 @@ pub fn cmpxchg(bd: *mut Builder, p: *mut Value, e: *mut Value, n: *mut Value) *m
     return v;
 }
 
-pub fn fence(bd: *mut Builder) void {
-    _ = emit(bd, OP_FENCE, t_void());
+pub fn fence(bd: *mut Builder) *mut Value {
+    return emit(bd, OP_FENCE, t_void());
 }
 
 pub fn extract(bd: *mut Builder, agg: *mut Value, i: u32) *mut Value {
@@ -4335,8 +4528,26 @@ pub fn inst_str(v: *Value) []u8 {
         b.s(".");
         b.s(u.udec(v.cv));
     }
-    if (v.flags & F_ATOMIC) != 0 {
-        b.s(" atomic");
+    if ((v.flags & F_ATOMIC) != 0) or (v.op == OP_FENCE) {
+        if v.op != OP_FENCE {
+            b.s(" atomic");
+        }
+        if (v.flags & F_WEAK) != 0 {
+            b.s(" weak");
+        }
+        if (v.flags & F_SIGNAL) != 0 {
+            b.s(" signal");
+        }
+        let names: [5][]u8 = ["", " relaxed", " acquire", " release", " acq_rel"];
+        let o = @as(usize, order(v));
+        if o < 5 {
+            b.s(names[o]);
+        }
+        let fo = @as(usize, fail_order(v));
+        if (v.op == OP_CMPXCHG) and (fo != o) and (fo < 5) {
+            b.s(" fail");
+            b.s(u.pick(fo == 0, " seq_cst", names[fo]));
+        }
     }
     if (v.flags & F_VOLATILE) != 0 {
         b.s(" volatile");

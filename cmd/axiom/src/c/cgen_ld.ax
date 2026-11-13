@@ -179,10 +179,87 @@ pub fn truth(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     return ir.icmp(cg.B, ir.IntNE, ir.or_(cg.B, h, lo), ir.cint(i64t(), 0));
 }
 
+// Is v the address of a constant zero (of either sign: constant())?
+fn zero_const(v: *mut ir.Value, t: *cty.CType) bool {
+    for c in consts.items() {
+        if c.g == v {
+            let mut sign: u64 = 0x8000_0000_0000_0000;
+            if fmt(t) == ld.FMT_X {
+                sign = 0x8000;
+            }
+            return (c.w.lo == 0) and ((c.w.hi & ~sign) == 0);
+        }
+    }
+    return false;
+}
+
+// What ldouble.ax's cmp gives for x against zero, inline (an i32: -1, 0,
+// 1, or 2 when x is a NaN or an encoding the x87 format does not have,
+// which it compares as unordered: ldouble.ax, unpack), from x's bits.
+fn sign_of(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    let lo = ir.load(cg.B, i64t(), x);
+    lo.align = 8;
+    let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
+    hi.align = 8;
+    let L = i64t();
+    let mut unordered = ir.vnil();
+    let mut zero = ir.vnil();
+    let mut neg = ir.vnil();
+    if fmt(t) == ld.FMT_X {
+        // (exponent e, explicit integer bit j: e == 0x7fff and not
+        // infinity (j and no other bit), or 0 < e < 0x7fff without j)
+        let e = ir.and_(cg.B, hi, ir.cint(L, 0x7FFF));
+        let j = ir.icmp(cg.B, ir.IntSLT, lo, ir.cint(L, 0));
+        let top = ir.icmp(cg.B, ir.IntEQ, e, ir.cint(L, 0x7FFF));
+        let not_inf = ir.icmp(cg.B, ir.IntNE, lo, ir.cint(L, 0x8000_0000_0000_0000));
+        let e_nz = ir.icmp(cg.B, ir.IntNE, e, ir.cint(L, 0));
+        let unnormal = ir.and_(cg.B, e_nz, ir.xor(cg.B, j, ir.cint(cg.T_i1, 1)));
+        unordered = ir.or_(cg.B, ir.and_(cg.B, top, not_inf), unnormal);
+        zero = ir.icmp(cg.B, ir.IntEQ, ir.or_(cg.B, e, lo), ir.cint(L, 0));
+        neg = ir.icmp(cg.B, ir.IntNE, ir.and_(cg.B, hi, ir.cint(L, 0x8000)), ir.cint(L, 0));
+    } else {
+        // (binary128: exponent 0x7fff with a fraction is a NaN)
+        let mag = ir.and_(cg.B, hi, ir.cint(L, 0x7FFF_FFFF_FFFF_FFFF));
+        let inf_hi = ir.cint(L, 0x7FFF_0000_0000_0000);
+        let above = ir.icmp(cg.B, ir.IntUGT, mag, inf_hi);
+        let at = ir.and_(cg.B, ir.icmp(cg.B, ir.IntEQ, mag, inf_hi), ir.icmp(cg.B, ir.IntNE, lo, ir.cint(L, 0)));
+        unordered = ir.or_(cg.B, above, at);
+        zero = ir.icmp(cg.B, ir.IntEQ, ir.or_(cg.B, mag, lo), ir.cint(L, 0));
+        neg = ir.icmp(cg.B, ir.IntSLT, hi, ir.cint(L, 0));
+    }
+    let I = i32t();
+    let sgn = ir.select(cg.B, neg, ir.cint(I, 0xFFFF_FFFF), ir.cint(I, 1));
+    let nz = ir.select(cg.B, zero, ir.cint(I, 0), sgn);
+    return ir.select(cg.B, unordered, ir.cint(I, 2), nz);
+}
+
 /// x op y (< > <= >= == !=), as an i1: false when unordered, but for !=.
-pub fn compare(op: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
-    let mut xs: [3]*mut ir.Value = [x, y, fmt_arg(t)];
-    let c = call("cmp", xs[..]);  // -1, 0, 1, or 2 (unordered)
+/// Against a constant zero, inline (sign_of); otherwise ldouble.ax's cmp.
+pub fn compare(op0: i32, x0: *mut ir.Value, y0: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    let mut op = op0;
+    let mut x = x0;
+    let mut y = y0;
+    if zero_const(x, t) and not zero_const(y, t) {
+        // (0 op y is y op' 0)
+        x = y0;
+        y = x0;
+        if op == ct.P_LT {
+            op = ct.P_GT;
+        } else if op == ct.P_GT {
+            op = ct.P_LT;
+        } else if op == ct.P_LE {
+            op = ct.P_GE;
+        } else if op == ct.P_GE {
+            op = ct.P_LE;
+        }
+    }
+    let mut c = ir.vnil();
+    if zero_const(y, t) {
+        c = sign_of(x, t);
+    } else {
+        let mut xs: [3]*mut ir.Value = [x, y, fmt_arg(t)];
+        c = call("cmp", xs[..]);  // -1, 0, 1, or 2 (unordered)
+    }
     let m1 = ir.cint(i32t(), 0xFFFF_FFFF);
     let z = ir.cint(i32t(), 0);
     let one = ir.cint(i32t(), 1);

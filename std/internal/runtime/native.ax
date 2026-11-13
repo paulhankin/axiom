@@ -1008,6 +1008,14 @@ struct ThreadStart {
 let mut next_thread_id: i32 = 1;
 let mut threads: usize = 0;  // ThreadStart records of threads not yet reclaimed
 let mut threads_lock: u32 = 0;
+// Mappings of exited threads kept for the next ones (their guard pages still
+// in place): at most CACHED, each of cache_size bytes (every thread's is
+// the same size), so that a thread's start and end cost no mmap, mprotect
+// and munmap while threads come and go.
+const CACHED: usize = 4;
+let mut cache: [4]usize = [0, 0, 0, 0];
+let mut ncache: usize = 0;
+let mut cache_size: usize = 0;
 
 // The calling thread's ThreadStart (0 on a thread the runtime did not
 // start: the main thread), for ax_thread_exit.
@@ -1020,8 +1028,10 @@ fn thread_run(p: *mut void) void {
     cur_start = @int_from_ptr(st);
     _ = sys.sigaltstack(st.alt, ALT);
     st.entry(st.arg);
-    @atomic_store(st.exited, 1);
-    _ = ax_notify32(st.exited, 1);
+    // (std/thread's join sets 2 before it waits: no wake-up is needed otherwise)
+    if @atomic_xchg(st.exited, 1) == 2 {
+        _ = ax_notify32(st.exited, 1);
+    }
 }
 
 /// Ends the calling thread, which ax_thread_spawn started, as its entry
@@ -1082,7 +1092,13 @@ fn reclaim() void {
             } else {
                 @ptr_from_int(*mut ThreadStart, prev).next = next;
             }
-            _ = sys.munmap(st.base, st.size);
+            if (ncache < CACHED) and ((ncache == 0) or (st.size == cache_size)) {
+                cache[ncache] = st.base;
+                cache_size = st.size;
+                ncache += 1;
+            } else {
+                _ = sys.munmap(st.base, st.size);
+            }
         } else {
             prev = t;
         }
@@ -1104,11 +1120,28 @@ export fn ax_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: 
     // code of other compilers that reads its stack guard at %fs:0x28)
     let tls_size = align_up(ti.memsz, tls_align) + (2 * tls_align) + 64;
     let size = align_up(GUARD + STACK + ALT + tls_size + @size_of(ThreadStart) + 64, 65536);
-    let base = sys.mmap_anon(size);
-    if base == 0 {
-        return AX_ERR;
+    let mut base: usize = 0;
+    while @atomic_xchg(&mut threads_lock, 1) != 0 {
+        _ = sys.sched_yield();
     }
-    _ = sys.protect_none(base, GUARD);
+    if (ncache > 0) and (cache_size == size) {
+        ncache -= 1;
+        base = cache[ncache];
+    }
+    @atomic_store(&mut threads_lock, 0);
+    if base != 0 {
+        // (a cached mapping: its guard is in place; what follows the stack
+        // and the signal stack must be as a new mapping's, zeros, before the
+        // TLS block is made)
+        let from = base + GUARD + STACK + ALT;
+        @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, from), size - (GUARD + STACK + ALT)), 0);
+    } else {
+        base = sys.mmap_anon(size);
+        if base == 0 {
+            return AX_ERR;
+        }
+        _ = sys.protect_none(base, GUARD);
+    }
     let stack_top_addr = base + GUARD + STACK;  // 16-aligned
     let alt = stack_top_addr;
     let tls_area = alt + ALT;

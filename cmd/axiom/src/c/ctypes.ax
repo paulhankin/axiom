@@ -1071,6 +1071,15 @@ pub fn is_void_ptr(t: *CType) bool {
 
 /// The size of a complete object type (0 for others).
 pub fn size_of(t: *CType) u64 {
+    if (t.quals & Q_ATOMIC) != 0 {
+        return atomic_size(value_size(t));
+    }
+    return value_size(t);
+}
+
+/// The size of t's non-atomic version (its values' size: an atomic object
+/// may be larger, atomic_size).
+pub fn value_size(t: *CType) u64 {
     let k = t.kind;
     if is_integer(t) or (k == TK_POINTER) or (k == TK_NULLPTR) {
         return @as(u64, @bit_cast(u32, storage_bits(t) / 8));
@@ -1121,7 +1130,7 @@ pub fn align_of(t: *CType) u64 {
     if k == TK_ARRAY {
         return align_of(t.elem);
     }
-    let mut a = size_of(t);
+    let mut a = value_size(t);
     if (k == TK_STRUCT) or (k == TK_UNION) {
         a = t.tag.align;
     } else if (k == TK_INT128) or (k == TK_UINT128) {
@@ -1155,15 +1164,39 @@ fn vector_align(size: u64) u64 {
     return size;
 }
 
-// The alignment of atomic type t, whose non-atomic version is aligned to a
-// (6.2.5p27 lets them differ). The size is the same; one of 1, 2, 4, 8 or 16
-// bytes is aligned to its size, so that it can be accessed with one
-// instruction (the rule of the x86-64 System V and AAPCS64 psABIs for
-// _Atomic, used on every target; 16-byte objects are aligned so too, though
-// this implementation does not access them lock-free: cgen_atomic.ax).
+// The size of an atomic type whose non-atomic version's size is s
+// (6.2.5p27 lets them differ; copts.ax: set_platform says which platform
+// does what): s, or where the platform pads atomic types (macOS, Windows,
+// WebAssembly), a size up to atomic_pad rounded up to a power of two, so
+// that the object is accessed with one instruction of that width (its
+// padding bytes are zeros: cgen_atomic.ax).
+fn atomic_size(s: u64) u64 {
+    let pad = @as(u64, @bit_cast(u32, g_opts.atomic_pad));
+    if (s == 0) or (s > pad) {
+        return s;
+    }
+    let mut p: u64 = 1;
+    while p < s {
+        p = p * 2;
+    }
+    return p;
+}
+
+// The alignment of atomic type t, whose non-atomic version is aligned to a:
+// a size of 1, 2, 4, 8 or 16 bytes (up to atomic_max: 8 on WebAssembly) is
+// aligned to its size, so that it can be accessed with one instruction (the
+// rule of the x86-64 System V and AAPCS64 psABIs for _Atomic, and of the
+// other platforms' compilers after the padding of atomic_size); any other
+// keeps its alignment. A wide _BitInt(N) of 16 bytes is aligned as the
+// atomic __int128 is, on every target (16: the platforms' compilers have no
+// atomic _BitInt to follow).
 fn atomic_align(t: *CType, a: u64) u64 {
     let s = size_of(t);
-    if ((s == 1) or (s == 2) or (s == 4) or (s == 8) or (s == 16)) and (s > a) {
+    let mut mx = @as(u64, @bit_cast(u32, g_opts.atomic_max));
+    if (t.kind == TK_BITINT) and (s == 16) {
+        mx = 16;
+    }
+    if ((s == 1) or (s == 2) or (s == 4) or (s == 8) or (s == 16)) and (s <= mx) and (s > a) {
         return s;
     }
     return a;

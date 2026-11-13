@@ -353,6 +353,10 @@ fn imm_ok(v: *ir.Value) bool {
 fn vreg(v: *mut ir.Value) i32 {
     if v.loc < 0 {
         v.loc = mc.new_vreg(em.MF, class_of(v.ty));
+        if v.ty.kind == ir.T_FLOAT {
+            // (a scalar: spilled as 8 bytes, spill_store; a 4-byte one too)
+            mc.set_bytes(em.MF, v.loc, @truncate(u8, @max(v.ty.size, 8)));
+        }
     }
     return v.loc;
 }
@@ -2153,9 +2157,19 @@ fn gen_cast(v: *mut ir.Value) void {
             return;
         }
         let sg = o == ir.OP_SEXT;
-        let r = reg(v.a);
         let fb = from.bits;
         let to64 = to.bits > 32;
+        if sg and folded_load(v.a) {
+            // movsx / movsxd from memory (mark_folded_load)
+            let mut sz: u8 = 4;
+            if to64 {
+                sz = 8;
+            }
+            let i = e2(xe.EXT, sz, W(d), addr(v.a.a));
+            i.cc = ext_kind(fb, true);
+            return;
+        }
+        let r = reg(v.a);
         if not sg and zext_known(v.a, 4) {
             copy(d, r, GPR);  // (e.g. byte and halfword loads, 32-bit operations)
             return;
@@ -2891,8 +2905,11 @@ fn gen_store(v: *mut ir.Value) void {
     let t = x.ty;
     let m = addr(v.b);
     let k = t.kind;
-    if (v.flags & ir.F_ATOMIC) != 0 {
-        // sequentially consistent store: xchg (a full barrier)
+    if ((v.flags & ir.F_ATOMIC) != 0) and (ir.order(v) == ir.ORD_SEQ_CST) {
+        // sequentially consistent store: xchg (a full barrier). A weaker
+        // one is a plain mov (below): x86-64's stores are not reordered
+        // with earlier loads or stores (a release store), and an aligned
+        // access of up to 8 bytes is single-copy atomic.
         let r = vgpr();
         copy(r, reg(x), GPR);
         _ = e2(xe.XCHG, is.mem_size(t), m, RW(r));
@@ -2966,6 +2983,14 @@ fn gen_memop(v: *mut ir.Value) void {
     let dst = reg(v.a);
     let src = reg(v.b);
     let n = reg(v.c);
+    // (up to 32 bytes inline: rep movsb and stosb take tens of cycles to start)
+    let big = new_label();
+    let done = new_label();
+    let known_big = is.is_c(v.c) and (is.cval(v.c) > 32);
+    if not known_big {
+        small_var(o, dst, src, n, big, done);
+    }
+    place(big);
     _ = e2(xe.MOV_RR, 8, W(xe.RDI), R(dst));
     if o == ir.OP_MEMSET {
         _ = e2(xe.MOV_RR, 8, W(xe.RAX), R(src));
@@ -2984,6 +3009,112 @@ fn gen_memop(v: *mut ir.Value) void {
         let i = emit(xe.REP, 0, ops[..]);
         i.cc = 2;
     }
+    place(done);
+}
+
+// A memory operation of n bytes (a register: not a constant), d the
+// destination, s the source (or, for memset, the byte), of at most 32 bytes:
+// as two accesses of a width w with n/2 < w <= n each, at the start and at
+// the end (overlapping in the middle), or for 1 to 3 bytes three byte
+// accesses at 0, n/2 and n - 1. Every load is made before any store, so the
+// operands may overlap (memmove). Longer ones jump to `big`; the others to
+// `done` (labels in the block).
+fn small_var(o: i32, d: i32, s: i32, n: i32, big: i32, done: i32) void {
+    let lt8 = new_label();
+    let lt4 = new_label();
+    let mid = new_label();
+    let set = o == ir.OP_MEMSET;
+    // memset: the byte repeated across 8 bytes
+    let mut pat: i32 = -1;
+    if set {
+        let b = vgpr();
+        let z = e2(xe.EXT, 4, W(b), R(s));
+        z.cc = 1;  // movzx8
+        pat = vgpr();
+        _ = e2(xe.MOV_RI, 8, W(pat), I(0x0101_0101_0101_0101));
+        _ = e2(xe.IMUL, 8, RW(pat), R(b));
+    }
+    _ = alu(xe.ALU_CMP, 8, R(n), I(32));
+    jcc(xe.CC_A, big);
+    _ = alu(xe.ALU_CMP, 8, R(n), I(16));
+    jcc(xe.CC_BE, mid);
+    // 17 to 32 bytes: 16 at the start, 16 at the end
+    if set {
+        let ws: [4]i64 = [0, 8, -16, -8];
+        for k in @as(usize, 0)..4 {
+            if k < 2 {
+                _ = e2(xe.STORE, 8, mc.mem(d, -1, 0, ws[k]), R(pat));
+            } else {
+                _ = e2(xe.STORE, 8, mc.mem(d, n, 1, ws[k]), R(pat));
+            }
+        }
+    } else {
+        let outer_vl = VL;
+        VL = chunk_vl(16);
+        let a = vxmm();
+        let b = vxmm();
+        _ = sse2(xe.MOVDQU_LD, W(a), mc.mem(s, -1, 0, 0));
+        _ = sse2(xe.MOVDQU_LD, W(b), mc.mem(s, n, 1, -16));
+        _ = sse2(xe.MOVDQU_ST, R(a), mc.mem(d, -1, 0, 0));
+        _ = sse2(xe.MOVDQU_ST, R(b), mc.mem(d, n, 1, -16));
+        VL = outer_vl;
+    }
+    jmp(done);
+    place(mid);
+    // 8 to 16, 4 to 7: two accesses of 8 or 4 bytes
+    _ = alu(xe.ALU_CMP, 8, R(n), I(8));
+    jcc(xe.CC_B, lt8);
+    two_ends(set, d, s, n, pat, 8);
+    jmp(done);
+    place(lt8);
+    _ = alu(xe.ALU_CMP, 8, R(n), I(4));
+    jcc(xe.CC_B, lt4);
+    two_ends(set, d, s, n, pat, 4);
+    jmp(done);
+    place(lt4);
+    // 1 to 3 bytes (0: nothing)
+    _ = e2(xe.TEST, 8, R(n), R(n));
+    jcc(xe.CC_E, done);
+    let h = vgpr();
+    _ = e2(xe.MOV_RR, 8, W(h), R(n));
+    let sh = e3(xe.SHIFT, 8, RW(h), NONE(), I(1));
+    sh.cc = 5;  // shr
+    if set {
+        _ = e2(xe.STORE, 1, mc.mem(d, -1, 0, 0), R(pat));
+        _ = e2(xe.STORE, 1, mc.mem(d, h, 1, 0), R(pat));
+        _ = e2(xe.STORE, 1, mc.mem(d, n, 1, -1), R(pat));
+    } else {
+        let x0 = vgpr();
+        let x1 = vgpr();
+        let x2 = vgpr();
+        let l0 = e2(xe.LOAD, 1, W(x0), mc.mem(s, -1, 0, 0));
+        l0.cc = 1;
+        let l1 = e2(xe.LOAD, 1, W(x1), mc.mem(s, h, 1, 0));
+        l1.cc = 1;
+        let l2 = e2(xe.LOAD, 1, W(x2), mc.mem(s, n, 1, -1));
+        l2.cc = 1;
+        _ = e2(xe.STORE, 1, mc.mem(d, -1, 0, 0), R(x0));
+        _ = e2(xe.STORE, 1, mc.mem(d, h, 1, 0), R(x1));
+        _ = e2(xe.STORE, 1, mc.mem(d, n, 1, -1), R(x2));
+    }
+    jmp(done);
+}
+
+// n bytes, w <= n <= 2w: w at d and w at d + n - w, loaded first from s
+// (memset: the pattern's low w bytes).
+fn two_ends(set: bool, d: i32, s: i32, n: i32, pat: i32, w: i64) void {
+    let sz = @truncate(u8, @bit_cast(u64, w));
+    if set {
+        _ = e2(xe.STORE, sz, mc.mem(d, -1, 0, 0), R(pat));
+        _ = e2(xe.STORE, sz, mc.mem(d, n, 1, -w), R(pat));
+        return;
+    }
+    let a = vgpr();
+    let b = vgpr();
+    _ = e2(xe.LOAD, sz, W(a), mc.mem(s, -1, 0, 0));
+    _ = e2(xe.LOAD, sz, W(b), mc.mem(s, n, 1, -w));
+    _ = e2(xe.STORE, sz, mc.mem(d, -1, 0, 0), R(a));
+    _ = e2(xe.STORE, sz, mc.mem(d, n, 1, -w), R(b));
 }
 
 // The widest vector moves for memory operations (memop_chunk), in bytes.
@@ -3262,6 +3393,29 @@ fn gen_rmw(v: *mut ir.Value) void {
     let back = loop_jcc(xe.CC_NE, lp, m, x);
     _ = back;
     copy(d, xe.RAX, GPR);
+}
+
+// IN_CAS16(p, e, d): lock cmpxchg16b [p] with rdx:rax the 16 bytes at e and
+// rcx:rbx those at d; ZF is the result, and rdx:rax (the value found, or e's
+// own when it stored) go back to e. Locked, it is a full barrier: every
+// order.
+fn gen_cas16(v: *mut ir.Value) void {
+    let m = addr(v.xs.get(0));
+    let e = reg(v.xs.get(1));
+    let d = reg(v.xs.get(2));
+    _ = e2(xe.LOAD, 8, W(xe.RAX), mc.mem(e, -1, 0, 0));
+    _ = e2(xe.LOAD, 8, W(xe.RDX), mc.mem(e, -1, 0, 8));
+    _ = e2(xe.LOAD, 8, W(xe.RBX), mc.mem(d, -1, 0, 0));
+    _ = e2(xe.LOAD, 8, W(xe.RCX), mc.mem(d, -1, 0, 8));
+    let ops: [5]mc.MOp = [m, RW(xe.RAX), RW(xe.RDX), R(xe.RBX), R(xe.RCX)];
+    let c = emit(xe.CMPXCHG16B, 8, ops[..]);
+    c.keep = true;
+    let r = vgpr();
+    setcc(r, xe.CC_E);
+    _ = e2(xe.STORE, 8, mc.mem(e, -1, 0, 0), R(xe.RAX));
+    _ = e2(xe.STORE, 8, mc.mem(e, -1, 0, 8), R(xe.RDX));
+    let z = e2(xe.EXT, 4, W(vreg(v)), R(r));
+    z.cc = 1;
 }
 
 // A backward jcc within a block, with fake reads of what the loop uses so
@@ -7283,7 +7437,15 @@ fn gen_inst_at(v: *mut ir.Value) void {
         return;
     }
     if o == ir.OP_FENCE {
-        _ = e0(xe.MFENCE, 0);
+        // Only a sequentially consistent fence needs an instruction (a
+        // store followed by a load is the one reordering x86-64 makes); the
+        // others, and signal fences, order nothing the processor reorders:
+        // a label then keeps hoist_reads_of from moving loads across it.
+        if (ir.order(v) == ir.ORD_SEQ_CST) and ((v.flags & ir.F_SIGNAL) == 0) {
+            _ = e0(xe.MFENCE, 0);
+        } else if ir.order(v) != ir.ORD_RELAXED {
+            place(new_label());
+        }
         return;
     }
     if o == ir.OP_EXTRACTELEM {
@@ -7410,6 +7572,10 @@ fn gen_intr(v: *mut ir.Value) void {
             p.cc = 1;
         }
         p.keep = true;
+        return;
+    }
+    if id == ir.IN_CAS16 {
+        gen_cas16(v);
         return;
     }
     if id == ir.IN_UDIV128 {
@@ -7810,6 +7976,9 @@ fn mark_folded_load(i: *mut ir.Value) void {
                     end = end.user;
                 }
             }
+        } else if (us.op == ir.OP_SEXT) and (us.ty.kind == ir.T_INT) and (us.ty.bits <= 64) and (us.ty.bits > bits) and
+                  ((bits == 8) or (bits == 16) or (bits == 32)) {
+            ok = true;  // (movsx / movsxd with a memory operand: gen_cast)
         } else if ((bits == 32) or (bits == 64)) and ((us.flag & (4 | F_RMW)) == 0) and (us.a != us.b) and
                   ((us.op == ir.OP_ADD) or (us.op == ir.OP_SUB) or (us.op == ir.OP_AND) or (us.op == ir.OP_OR) or
                    (us.op == ir.OP_XOR) or (us.op == ir.OP_MUL)) {
@@ -7956,7 +8125,9 @@ fn gen_carry(v: *mut ir.Value) void {
     let sub = v.op == ir.OP_SUB;
     let mut z = v.b;
     let mut x = v.a;
-    if not sub and ((v.b.kind != ir.V_INST) or ((v.b.flag & F_CSKIP) == 0)) {
+    // (the carry is the zext marked F_CSKIP: the other operand may be a
+    // chained add marked so too, mark_carry)
+    if not sub and not (ir.is_op(v.b, ir.OP_ZEXT) and ((v.b.flag & F_CSKIP) != 0)) {
         z = v.a;
         x = v.b;
     }
@@ -8321,6 +8492,12 @@ fn spill_load(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
         return mc.new_inst(xe.LOAD, 8, ops[..]);
     }
     let ops = mk4(W(r), mc.mem_slot(slot, 0), NONE(), NONE());
+    if (slot >= 0) and (f.slots.get(@int_cast(usize, slot)).size == 8) {
+        // (a scalar float's slot, mc.set_bytes: movsd)
+        let s8 = mc.new_inst(xe.SSE, 16, ops[..]);
+        s8.cc = xe.MOVSD_LD;
+        return s8;
+    }
     let i = mc.new_inst(xe.SSE, class_bytes(@truncate(u8, @bit_cast(u32, class))), ops[..]);
     i.cc = xe.MOVDQU_LD;
     return i;
@@ -8332,6 +8509,11 @@ fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
         return mc.new_inst(xe.STORE, 8, ops[..]);
     }
     let ops = mk4(R(r), mc.mem_slot(slot, 0), NONE(), NONE());
+    if (slot >= 0) and (f.slots.get(@int_cast(usize, slot)).size == 8) {
+        let s8 = mc.new_inst(xe.SSE, 16, ops[..]);
+        s8.cc = xe.MOVSD_ST;
+        return s8;
+    }
     let i = mc.new_inst(xe.SSE, class_bytes(@truncate(u8, @bit_cast(u32, class))), ops[..]);
     i.cc = xe.MOVDQU_ST;
     return i;

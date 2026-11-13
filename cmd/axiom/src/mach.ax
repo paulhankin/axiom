@@ -141,6 +141,7 @@ pub struct MFunc {
     has_calls: bool,
     level: u.List.[u8],   // how far each vreg has been split (see split)
     vslot: u.List.[i32],  // its spill slot, shared by the pieces of a split vreg (-1: none yet)
+    vbytes: u.List.[u8],  // the bytes its value takes when fewer than its class's (0: all; set_bytes)
     noframe_regs: u64,    // registers the noframe blocks must not use (shrink_wrap)
 }
 
@@ -163,6 +164,7 @@ pub fn free_func(f: *mut MFunc) void {
     f.slots.deinit();
     f.level.deinit();
     f.vslot.deinit();
+    f.vbytes.deinit();
 }
 
 pub fn new_vreg(f: *mut MFunc, class: u8) i32 {
@@ -172,7 +174,18 @@ pub fn new_vreg(f: *mut MFunc, class: u8) i32 {
     f.hint.push(-1);
     f.level.push(0);
     f.vslot.push(-1);
+    f.vbytes.push(0);
     return VREG0 + @int_cast(i32, f.vclass.len - 1);
+}
+
+/// Vreg v's value takes only n bytes of its register (a scalar float in a
+/// vector register): its spill slot is that size, and the target's spill
+/// code moves only those bytes (its spill_load and spill_store see the
+/// slot's size). The pieces of v when it is split share v's slot.
+pub fn set_bytes(f: *mut MFunc, v: i32, n: u8) void {
+    if is_vreg(v) {
+        f.vbytes.set(@int_cast(usize, v - VREG0), n);
+    }
 }
 
 // Register r is a good choice for vreg v (the first hint stands).
@@ -1676,6 +1689,10 @@ fn slot_of(f: *mut MFunc, x: usize) i32 {
         let mut sz: u64 = 8;
         if c >= 1 {
             sz = @as(u64, 16) << @truncate(u32, @as(u64, c) - 1);  // (16, 32 or 64 bytes)
+        }
+        let nb = @as(u64, f.vbytes.get(x));
+        if (nb > 0) and (nb < sz) {
+            sz = nb;  // (set_bytes)
         }
         s = new_slot(f, sz, sz);
         f.vslot.set(x, s);
@@ -3289,6 +3306,10 @@ fn coalesce(f: *mut MFunc) void {
         // b joins a; the copy defined b
         if debug_ra {
             u.eprint(u.f4("merge v%s v%s (%s %s)\n", u.idec(a), u.idec(b), u.idec(iv[ax].size), u.idec(iv[bx].size)));
+        }
+        // (the joined value is as wide as the wider: set_bytes)
+        if f.vbytes.get(ax) != f.vbytes.get(bx) {
+            f.vbytes.set(ax, 0);
         }
         let un = ranges_union(&iv[ax].ranges, &iv[bx].ranges);
         u.free(@ptr_cast(*mut void, iv[ax].ranges.data));

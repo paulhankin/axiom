@@ -18,8 +18,8 @@
 //
 // The atomic builtins take a pointer to an integer or pointer type of 1, 2,
 // 4 or 8 bytes (the generic __atomic_load ... any object type of those
-// sizes); their memory orders are evaluated and every operation is
-// sequentially consistent (a stronger order is a valid one).
+// sizes); a constant memory order is the operation's (an order it does
+// not take is the warning C4092), any other is sequentially consistent.
 //
 // Diagnostics: C3023 (arguments), C3082 (an operand of the wrong type),
 // C3090 (a builtin used where it cannot be: frame_address of a level above
@@ -32,6 +32,7 @@ import "cconst.ax" as cc;
 import "cfeat.ax" as cf;
 import "cldbl.ax" as cl;
 import "csema.ax" as cs;
+import "csema_atomic.ax" as catm;
 import "csema_builtin.ax" as csb;
 import "csema_expr.ax" as cx;
 import "ctok.ax" as ct;
@@ -1449,7 +1450,10 @@ fn library(e: *mut cast.Expr, name0: []u8, code: []u8) void {
 }
 
 // __atomic_always_lock_free(size, p), __atomic_is_lock_free: 1 for 1, 2, 4
-// and 8 bytes (every target has those), else 0.
+// and 8 bytes (every target has those), and for 16 on AArch64 and on
+// x86-64 with cmpxchg16b among the target's extensions (cgen_atomic.ax; on
+// one without, whether the processor has it is known only when the program
+// runs, which atomic_is_lock_free asks), else 0.
 fn lock_free(e: *mut cast.Expr) void {
     if not arity(e, 2, 2) {
         _ = bad(e);
@@ -1462,7 +1466,8 @@ fn lock_free(e: *mut cast.Expr) void {
         return;
     }
     let v = r.v;
-    fold_int(e, cty.t_bool, pick_u((v == 1) or (v == 2) or (v == 4) or (v == 8), 1, 0));
+    let wide = (v == 16) and ((tg.g_arch == tg.ARCH_A64) or ((tg.g_arch == tg.ARCH_X64) and tg.has(tg.X_CMPXCHG16B)));
+    fold_int(e, cty.t_bool, pick_u((v == 1) or (v == 2) or (v == 4) or (v == 8) or wide, 1, 0));
 }
 
 // The type an atomic builtin works on: what argument k points to, an
@@ -1545,6 +1550,21 @@ fn atomic_call(e: *mut cast.Expr, at: Atomic) void {
             cs.err(e.args.get(i).span, "C3082", u.f1("a memory order of '%s' is not an integer", e.a.name));
             _ = bad(e);
             return;
+        }
+    }
+    if orders > 0 {
+        // (the orders each takes, as C11's: C4092)
+        let what = u.f1("'%s'", e.a.name);
+        let o = e.args.get(n);
+        if (k == A_LOAD) or (k == A_LOAD_G) {
+            catm.check_order(o, catm.OK_LOAD, what, true);
+        } else if (k == A_STORE) or (k == A_STORE_G) or (k == A_CLEAR) {
+            catm.check_order(o, catm.OK_STORE, what, true);
+        } else {
+            catm.check_order(o, catm.OK_ANY, what, true);
+        }
+        if orders == 2 {
+            catm.check_failure(o, e.args.get(n + 1), what, true);
         }
     }
     if k == A_FENCE {

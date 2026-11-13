@@ -61,6 +61,7 @@ struct Write {
     off: i64,
     size: i64,  // -1: unknown
     rok: bool,
+    lmin: i32,  // a lower bound of the offset (from obj, or from base) whatever rok says; LMIN_NONE: none
     rlo: i64,
     rhi: i64,
 }
@@ -71,9 +72,14 @@ struct Loc {
     off: i64,            // from base
     size: i64,
     rok: bool,  // the offset from obj is known to lie in [rlo, rhi]
+    lmin: i32,  // the offset from obj (or base) is at least lmin (min_offset), or LMIN_NONE
     rlo: i64,
     rhi: i64,
 }
+
+// (no lower bound known; lmin sits in the padding after rok, so the
+// structures are no larger for it)
+const LMIN_NONE: i32 = -0x7fff_ffff - 1;
 
 // (read entries with ents.get, a copy: a pointer from ents.at dangles once a
 // recursive proof pushes facts and the list grows)
@@ -332,6 +338,112 @@ fn range_of(v: *ir.Value, depth: i32) Range {
     return none;
 }
 
+// A lower bound of the offset of address p0 from its object (an alloca or
+// global under its ptradds) or, with none, from its base (as loc_of finds
+// them): the sum of the constant offsets and of the lower bounds of the
+// others (min_of). Its ok is false when one has none.
+fn min_offset(p0: *mut ir.Value) Range {
+    let mut p = p0;
+    let mut lo: i64 = 0;
+    let mut n: i32 = 0;
+    while ir.is_op(p, ir.OP_PTRADD) and (n < 16) {
+        let m = min_of(p.b, 0);
+        if not m.ok {
+            return Range.{ ok: false, lo: 0, hi: 0 };
+        }
+        lo = lo + m.lo;
+        p = p.a;
+        n += 1;
+    }
+    if (lo < -RLIM) or (lo > RLIM) {
+        return Range.{ ok: false, lo: 0, hi: 0 };
+    }
+    return Range.{ ok: true, lo: lo, hi: 0 };
+}
+
+// A lower bound of the signed integer v (its lo; hi is not used), from
+// operations that cannot wrap: constants, adds and constant multiples and
+// shifts marked F_NSW of operands with lower bounds (multiples of operands
+// at least 0), sign extensions, and counters: a phi each of whose inputs
+// has a lower bound or adds a constant >= 0 to the phi itself (with F_NSW:
+// the counter only grows from its starts). Valid for every value v takes:
+// a value without a bound has none.
+fn min_of(v: *mut ir.Value, depth: i32) Range {
+    let none = Range.{ ok: false, lo: 0, hi: 0 };
+    if ir.is_cint(v) and (v.ty.kind == ir.T_INT) and (v.ty.bits <= 64) {
+        let x = ir.sval(v);
+        if (x < -RLIM) or (x > RLIM) {
+            return none;
+        }
+        return Range.{ ok: true, lo: x, hi: 0 };
+    }
+    if (depth > 6) or (v.kind != ir.V_INST) or (v.ty.kind != ir.T_INT) {
+        return none;
+    }
+    let op = v.op;
+    if op == ir.OP_SEXT {
+        return min_of(v.a, depth + 1);
+    }
+    if (op == ir.OP_ADD) and ir.no_wrap(v, ir.F_NSW) {
+        let x = min_of(v.a, depth + 1);
+        let y = min_of(v.b, depth + 1);
+        if x.ok and y.ok and ((x.lo + y.lo) >= -RLIM) and ((x.lo + y.lo) <= RLIM) {
+            return Range.{ ok: true, lo: x.lo + y.lo, hi: 0 };
+        }
+        return none;
+    }
+    if ((op == ir.OP_MUL) or (op == ir.OP_SHL)) and ir.no_wrap(v, ir.F_NSW) and ir.is_cint(v.b) {
+        let x = min_of(v.a, depth + 1);
+        let mut c = ir.sval(v.b);
+        if op == ir.OP_SHL {
+            if (c < 0) or (c > 30) {
+                return none;
+            }
+            c = @as(i64, 1) << @truncate(u32, @bit_cast(u64, c));
+        }
+        if x.ok and (x.lo >= 0) and (c >= 0) and (c <= RLIM) and (x.lo <= (RLIM / @max(c, 1))) {
+            return Range.{ ok: true, lo: x.lo * c, hi: 0 };
+        }
+        return none;
+    }
+    if (op == ir.OP_PHI) and (v.xs.len > 0) {
+        let mut lo: i64 = RLIM;
+        for k in 0..v.xs.len {
+            let x = ir.resolve(v.xs.get(k));
+            if ir.is_op(x, ir.OP_ADD) and ir.no_wrap(x, ir.F_NSW) and (ir.resolve(x.a) == v) and ir.is_cint(x.b) and
+               (ir.sval(x.b) >= 0) {
+                continue;  // (the counter's step: it grows)
+            }
+            let m = min_of(x, depth + 1);
+            if not m.ok {
+                return none;
+            }
+            lo = @min(lo, m.lo);
+        }
+        return Range.{ ok: true, lo: lo, hi: 0 };
+    }
+    return none;
+}
+
+fn lmin_of(r: Range) i32 {
+    if not r.ok {
+        return LMIN_NONE;
+    }
+    return @int_cast(i32, r.lo);  // (|r.lo| <= RLIM)
+}
+
+// A lower bound moved by d (still one, or none past the range).
+fn lmin_add(m: i32, d: i64) i32 {
+    if m == LMIN_NONE {
+        return m;
+    }
+    let x = @as(i64, m) + d;
+    if (x < -RLIM) or (x > RLIM) {
+        return LMIN_NONE;
+    }
+    return @int_cast(i32, x);
+}
+
 fn loc_of(p0: *mut ir.Value, size: i64) Loc {
     let mut p = p0;
     let mut off: i64 = 0;
@@ -361,7 +473,9 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
         // wasm: the thread's shadow stack record, or the main thread's
         obj = p.b;
     }
-    return Loc.{ base: base, obj: obj, off: off, size: size, rok: r.ok and u.notnil(obj), rlo: r.lo, rhi: r.hi };
+    let lm = min_offset(p0);
+    return Loc.{ base: base, obj: obj, off: off, size: size, rok: r.ok and
+                 u.notnil(obj), lmin: lmin_of(lm), rlo: r.lo, rhi: r.hi };
 }
 
 // Where in the shadow stack record: 0 the depth, 2 the call site slots.
@@ -422,6 +536,17 @@ fn may_alias(x: *Loc, w: *Write) bool {
     if u.notnil(x.obj) and u.notnil(w.obj) and (x.obj != w.obj) {
         return false;
     }
+    // (one access's offsets bounded above, the other's below them: a field
+    // before an array indexed from 0 by a counter that only grows)
+    if (((u.notnil(x.obj) and (x.obj == w.obj)) or (u.isnil(x.obj) and (x.base == w.base))) and (x.size >= 0) and
+        (w.size >= 0)) {
+        if x.rok and (w.lmin != LMIN_NONE) and (@as(i64, w.lmin) >= (x.rhi + x.size)) {
+            return false;
+        }
+        if w.rok and (x.lmin != LMIN_NONE) and (@as(i64, x.lmin) >= (w.rhi + w.size)) {
+            return false;
+        }
+    }
     // a pointer the function was given cannot point into its own stack
     // slots (they did not exist yet)
     if (u.notnil(x.obj) and ir.is_op(x.obj, ir.OP_ALLOCA) and from_param(w.base)) or
@@ -434,7 +559,24 @@ fn may_alias(x: *Loc, w: *Write) bool {
     if (noalias_global(x.obj) and (w.obj != x.obj)) or (noalias_global(w.obj) and (x.obj != w.obj)) {
         return false;
     }
+    // C's restrict: one through a noalias parameter, the other through a
+    // different parameter, a global or a stack slot (ir.restrict_apart)
+    if ir.restrict_apart(root_of(x.base, x.obj), root_of(w.base, w.obj)) {
+        return false;
+    }
     return true;
+}
+
+// The root an access's address is based on, for ir.restrict_apart: its
+// object (an alloca or global), or the parameter it is based on.
+fn root_of(base: *mut ir.Value, obj: *mut ir.Value) *mut ir.Value {
+    if u.notnil(obj) {
+        return obj;
+    }
+    if u.isnil(base) {
+        return base;
+    }
+    return ir.based_param(base);
 }
 
 // Can the store st not write what the load ld reads? (Their objects differ,
@@ -650,12 +792,12 @@ fn from_param(p0: *ir.Value) bool {
 }
 
 fn push_write(kind: i32, l: Loc) void {
-    writes.push(Write.{ kind: kind, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo,
-                        rhi: l.rhi });
+    writes.push(Write.{ kind: kind, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, lmin: l.lmin,
+                        rlo: l.rlo, rhi: l.rhi });
 }
 
 fn nowhere() Loc {
-    return Loc.{ base: vnil(), obj: vnil(), off: 0, size: -1, rok: false, rlo: 0, rhi: 0 };
+    return Loc.{ base: vnil(), obj: vnil(), off: 0, size: -1, rok: false, lmin: LMIN_NONE, rlo: 0, rhi: 0 };
 }
 
 // Marks allocas whose address stays private (aux2 = 1): used only as the
@@ -926,8 +1068,8 @@ fn narrowed_load(i: *mut ir.Value, l: *Loc) *mut ir.Value {
         // (the wider value starting at a multiple of the load's size before it)
         let mut d: i64 = 0;
         while (d + size) <= w {
-            let wl = Loc.{ base: l.base, obj: l.obj, off: l.off - d, size: w, rok: l.rok, rlo: l.rlo - d,
-                           rhi: l.rhi - d };
+            let wl = Loc.{ base: l.base, obj: l.obj, off: l.off - d, size: w, rok: l.rok, lmin: lmin_add(l.lmin, 0 - d),
+                           rlo: l.rlo - d, rhi: l.rhi - d };
             let x = find_mem(&wl, ir.t_int(@truncate(i32, w * 8)));
             if u.notnil(x) {
                 if u.isnil(B) {
@@ -1030,8 +1172,8 @@ fn quiet_since(h: usize, l: *Loc) bool {
 }
 
 fn sub_loc(l: *Loc, off: i64, size: i64) Loc {
-    return Loc.{ base: l.base, obj: l.obj, off: l.off + off, size: size, rok: l.rok, rlo: l.rlo + off,
-                 rhi: l.rhi + off };
+    return Loc.{ base: l.base, obj: l.obj, off: l.off + off, size: size, rok: l.rok, lmin: lmin_add(l.lmin, off),
+                 rlo: l.rlo + off, rhi: l.rhi + off };
 }
 
 // The value of load i (at l) from its copy's source, or nil.
@@ -1071,7 +1213,8 @@ fn forward_copy(i: *mut ir.Value, l: *Loc) *mut ir.Value {
         }
         let src = loc_of(c.b, n);
         let sl = sub_loc(&src, from, size);
-        let dw = Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: x.off, size: n, rok: false, rlo: 0, rhi: 0 };
+        let dw = Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: x.off, size: n, rok: false, lmin: LMIN_NONE,
+                         rlo: 0, rhi: 0 };
         if may_alias(&sl, &dw) or not quiet_since(x.height, &sl) {
             return vnil();
         }
@@ -3353,8 +3496,8 @@ fn pre_load(f: *mut ir.Func, b: *mut ir.Block, i: *mut ir.Value, vals: []mut *mu
 // function returns.
 // -----------------------------------------------------------------------------
 fn loc_write(l: *Loc) Write {
-    return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, rlo: l.rlo,
-                   rhi: l.rhi };
+    return Write.{ kind: W_LOC, base: l.base, obj: l.obj, off: l.off, size: l.size, rok: l.rok, lmin: l.lmin,
+                   rlo: l.rlo, rhi: l.rhi };
 }
 
 // Is a covered by b (both exact)?

@@ -1,12 +1,12 @@
 /* flags: --c-std=c23 */
 /* <stdatomic.h> (C11 7.17): the generic functions on an atomic int and on
-   a structure of 16 bytes (under the lock), the atomic_flag functions, the
+   a structure of 20 bytes (under the lock), the atomic_flag functions, the
    fences and kill_dependency, in C23 (which has no ATOMIC_VAR_INIT). */
 #include <stdatomic.h>
 #include "host.h"
 atomic_int n = 3;
 atomic_flag fl = ATOMIC_FLAG_INIT;
-struct S { int a[4]; };
+struct S { int a[5]; };  /* 20 bytes: under the lock on every target */
 _Atomic struct S big;
 int main(void) {
     int e = 3;

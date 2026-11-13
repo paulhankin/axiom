@@ -1446,23 +1446,31 @@ await section('', byFile(files(path.join(root, 'cmd/axiom/internal/tests/sanitiz
 // --emit=asm (the compiler) is checked on its object file as
 // objdump disassembles it (AT&T syntax, as LLVM's): its x86-64 lines, where
 // objdump is installed; it skips the others. "// lower-selfhost:" lines
-// check selection only the compiler's backends make (LLVM's differs).
-await section('', byFile(files(path.join(root, 'cmd/axiom/internal/tests/lowering')), '[instruction selection]', async (f) => {
+// check selection only the compiler's backends make (LLVM's differs). C
+// sources (*.c) there are checked alike; lines for --target=aarch64 are
+// checked where aarch64-linux-gnu-objdump is installed.
+const lowerFiles = fs.readdirSync(path.join(root, 'cmd/axiom/internal/tests/lowering'))
+  .filter((f) => f.endsWith('.ax') || f.endsWith('.c')).map((f) => path.join(root, 'cmd/axiom/internal/tests/lowering', f)).sort();
+await section('', byFile(lowerFiles, '[instruction selection]', async (f) => {
   let checked = 0, reason = 'no line applies to this host';
   for (const [, only, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower(-selfhost)?: (.+?) \| (.+?) \| (\d+)$/gm)) {
     const fl = flags.trim().split(/\s+/);
     if (fl.includes('--target=native') && (process.arch !== 'x64' || process.env.AXIOM_NATIVE_TARGET)) continue;
-    const out = path.join(tmp, `lower-${path.basename(f, '.ax')}.s`);
+    const a64 = fl.includes('--target=aarch64');
+    const base = path.basename(f).replace(/\.(ax|c)$/, '');
+    const out = path.join(tmp, `lower-${base}.s`);
     const c = await spawnAsync(compiler, ['build', f, '--emit=asm', '-o', out, ...fl], { encoding: 'utf8' });
     let text = null;
     if (c.status !== 0 && /--emit=asm is not supported/.test(c.stderr + c.stdout)) {
-      if (!fl.includes('--target=native')) { reason = 'the compiler has no --emit=asm for this target'; continue; }
-      const obj = path.join(tmp, `lower-${path.basename(f, '.ax')}.o`);
+      if (!fl.includes('--target=native') && !a64) { reason = 'the compiler has no --emit=asm for this target'; continue; }
+      const obj = path.join(tmp, `lower-${base}.o`);
       const o = await spawnAsync(compiler, ['build', f, '--emit=obj', '-o', obj, ...fl], { encoding: 'utf8' });
       if (o.status !== 0) return `${flags}: build failed:\n${o.stdout}${o.stderr}`;
-      const d = await spawnAsync('objdump', ['-d', '--no-show-raw-insn', obj]);
+      const d = await spawnAsync(a64 ? 'aarch64-linux-gnu-objdump' : 'objdump', ['-d', '--no-show-raw-insn', obj]);
       if (d.error || d.status !== 0) { reason = 'no objdump'; continue; }
-      text = d.stdout;
+      // (the file's own functions: the object also holds std's and the run
+      // time's, named std/... and ax_..., whose instructions are not the test's)
+      text = d.stdout.split(/\n(?=[0-9a-f]+ <[^>]+>:\n)/).filter((b) => !/^[0-9a-f]+ <(std\/|ax_)/.test(b)).join('\n');
     } else if (c.status !== 0) {
       return `${flags}: build failed:\n${c.stdout}${c.stderr}`;
     } else if (only) {

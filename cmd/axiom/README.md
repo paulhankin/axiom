@@ -364,8 +364,13 @@ The test suite's own variables (`AXIOM_TEST_JOBS`, `AXIOM_TEST_SKIP_PLATFORM`,
 `-O0` runs mem2reg, constant folding, CFG simplification and dead code
 elimination. `-O1` adds, per function: instruction combining, jump threading,
 if-conversion, scalar replacement of aggregates, global value numbering,
-dead store elimination, shadow stack push/pop removal, memset idioms,
-loop-invariant code motion and code sinking. `-O2` and `-O3` add cold
+dead store elimination, shadow stack push/pop removal, copy and fill loops
+as memory operations (memmove when the destination does not start inside
+the source, memcpy for C's restrict, memset), loop-invariant code motion and
+code sinking. `-O2` and `-O3` add loop vectorization (counted loops of
+element-wise arithmetic and integer reductions over arrays, with a runtime
+dependence check; searches over aligned vectors; x86-64 and AArch64), switches
+of constants as table lookups, cold
 region outlining, interprocedural constant propagation and inlining
 (whole-program units by default), after which each function is simplified
 again, then unroll loops with a constant trip count (fully when small,

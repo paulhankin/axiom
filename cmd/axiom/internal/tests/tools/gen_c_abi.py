@@ -31,7 +31,8 @@ output, and the other two files go in DIR/abi/. The suite's tests are
     gen_c_abi.py 105 8 cmd/axiom/internal/tests/c/run --host --f16 --f128 --vec --prefix=abi_gen_106
 
 With --atomic they also have _Atomic members (scalars, and records set
-and read whole). With --int128 they have __int128 and unsigned __int128
+and read whole, among them records of the sizes some platforms pad as
+atomic types: 3 to 15 bytes, 16 and 24). With --int128 they have __int128 and unsigned __int128
 members and arguments (a GNU dialect: gnu11 or later), with --bitint
 _BitInt(N) ones for N of 65 to 256 (C23; --bitint=128: to 128), whose
 values use all their bits. With --dec they have _Decimal32, _Decimal64 and
@@ -179,6 +180,10 @@ class Gen:
             # platforms align to their size, and others)
             if depth < 2 and self.r.random() < 0.3:
                 return Atomic(self.record(depth + 1, False))
+            if self.r.random() < 0.3:
+                # (a record of a size the platforms pad, or keep, as atomic:
+                # 3 to 7 and 9 to 15 bytes, 16, 24; its own alignment 1 to 8)
+                return Atomic(self.sized_record())
             return Atomic(self.scalar())
         x = self.r.random()
         if x < 0.55 or depth >= 2:
@@ -217,6 +222,13 @@ class Gen:
                     al = None  # (an alignment specifier cannot weaken one)
             rec.members.append((name, mt, None, al))
         # (named once its members are: those that are records come first)
+        return self.name(rec)
+
+    def sized_record(self):
+        n = self.r.choice([3, 5, 6, 7, 9, 10, 12, 12, 14, 15, 16, 24])
+        el = self.r.choice([k for k in ('c', 's', 'i', 'll') if n % (SCALARS[k][2] // 8) == 0])
+        rec = Record('', False)
+        rec.members.append(('m0', Array(Scalar(el), n // (SCALARS[el][2] // 8)), None, None))
         return self.name(rec)
 
     def homogeneous(self):

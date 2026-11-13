@@ -7,11 +7,14 @@
 //         only read (copies.ax), scalar replacement of aggregates (sroa.ax),
 //         global value numbering, dead stores, bounds and loop-invariant code
 //         motion and globals kept in registers across loops (gvn.ax), loop
-//         counters narrower than a pointer widened (loops.ax), calls of a
-//         function itself in tail position as a loop (tailrec.ax); at the
-//         end, stack slots whose contents are never needed at the same time
-//         sharing their bytes (slots.ax)
-//   -O2+  also interprocedural constant propagation and inlining
+//         counters narrower than a pointer widened (loops.ax), loops that
+//         copy or fill consecutive elements as memmove / memcpy / memset
+//         (idioms.ax), calls of a function itself in tail position as a loop
+//         (tailrec.ax); at the end, stack slots whose contents are never
+//         needed at the same time sharing their bytes (slots.ax)
+//   -O2+  also counted loops over arrays as vector loops, and searches as
+//         vector searches (vectorize.ax), switches that give constants as
+//         table lookups (switches.ax), interprocedural constant propagation and inlining
 //         (inline.ax), bottom-up over the call graph, each function simplified
 //         again after its calls are inlined; then small loops with a constant
 //         trip count unrolled (unroll.ax), and small loops whose trip count
@@ -23,6 +26,7 @@ import "copies.ax" as copies;
 import "cover.ax" as cover;
 import "divconst.ax" as divc;
 import "gvn.ax" as gvn;
+import "idioms.ax" as idioms;
 import "inline.ax" as inl;
 import "ir.ax" as ir;
 import "loops.ax" as loops;
@@ -31,11 +35,13 @@ import "outline.ax" as outl;
 import "slots.ax" as slots;
 import "slp.ax" as slp;
 import "sroa.ax" as sroa;
+import "switches.ax" as sw;
 import "tailrec.ax" as tre;
 import "target.ax" as tg;
 import "thread.ax" as thr;
 import "unroll.ax" as unr;
 import "util.ax" as u;
+import "vectorize.ax" as vec;
 
 // Runs the sub-passes in turn until each has run on the current IR without
 // changing it (a pass that changed nothing need not run again until another
@@ -175,6 +181,14 @@ pub fn optimize_func(f: *mut ir.Func, level: i32) void {
         }
         licm(f, level);
         widen(f, level);
+        if idioms.loop_copies(f) {
+            opt.dce(f);
+            _ = cleanup(f, level);
+        }
+        if (level >= 2) and vec.vectorize(f) {
+            opt.dce(f);
+            _ = cleanup(f, level);
+        }
         if slp.compare_masks(f) {
             _ = cleanup(f, level);
         }
@@ -293,6 +307,10 @@ pub fn finish_funcs(m: *mut ir.Module, level: i32, sel: []bool) void {
         }
         if level >= 2 {
             finish_func(f, level);
+        }
+        if level >= 2 {
+            // switches that give constants: table lookups (switches.ax)
+            _ = sw.lookup_tables(m, f);
         }
         if level > 0 {
             // divisions by constants as multiplications (last: the passes

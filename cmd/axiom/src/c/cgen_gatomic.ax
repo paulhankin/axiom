@@ -1,13 +1,17 @@
 // =============================================================================
 // cgen_gatomic.ax - IR generation for the GNU dialects' atomic builtins
-// (`__sync_...`, `__atomic_...`: csema_gbuiltin.ax types them), all
-// sequentially consistent, through cgen_atomic.ax's operations (those of C11's
-// atomics): lock-free on objects of 1, 2, 4 and 8 bytes, under its lock for
-// other sizes (the generic forms, on any object). A pointer is operated on as
+// (`__sync_...`, `__atomic_...`: csema_gbuiltin.ax types them), through
+// cgen_atomic.ax's operations (those of C11's atomics): lock-free on objects
+// of 1, 2, 4 and 8 bytes (and 16 where cgen_atomic.ax does them so), under
+// its lock for other sizes (the generic forms, on any object). The
+// __atomic_ builtins have the orders they are given (cgen_atomic.ax:
+// order_of); the __sync_ builtins are sequentially consistent but
+// __sync_lock_test_and_set (an acquire) and __sync_lock_release (a release). A pointer is operated on as
 // an integer of its width (in bytes, unscaled); nand, which the IR has no
 // read-modify-write for, is cgen_atomic's loop of compare-exchanges.
 // =============================================================================
 import "../ir.ax" as ir;
+import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_atomic.ax" as cga;
@@ -61,11 +65,11 @@ fn apply(op: u64, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
 
 // The atomic read-modify-write `op` of the object of type t at p with
 // integer v: the old value, as an integer.
-fn rmw(op: u64, t: *mut cty.CType, p: *mut ir.Value, v: *mut ir.Value) *mut ir.Value {
+fn rmw(op: u64, t: *mut cty.CType, p: *mut ir.Value, v: *mut ir.Value, o: u32) *mut ir.Value {
     if op != gb.OP_NAND {
-        return as_int(cga.fetch(t, @truncate(i32, @bit_cast(i64, op)), p, v), t);
+        return as_int(cga.fetch(t, @truncate(i32, @bit_cast(i64, op)), p, v, o), t);
     }
-    let up = cga.update_begin(t, p);
+    let up = cga.update_begin(t, p, o);
     let old = as_int(up.old, t);
     cga.update_end(up, from_int(apply(op, old, v), t));
     return old;
@@ -75,8 +79,37 @@ fn rmw(op: u64, t: *mut cty.CType, p: *mut ir.Value, v: *mut ir.Value) *mut ir.V
 /// e.cval: the RMW operation) with argument values vs.
 pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let k = e.op - gb.GB_ATOMIC;
+    // (the orders follow the operands: csema_gbuiltin.ax's atomic_call)
+    let sync = (e.a.kind == cast.ExprKind.IDENT) and u.starts(e.a.name, "__sync_");
+    let mut n: usize = 1;
+    if (k == gb.A_FETCH_OP) or (k == gb.A_OP_FETCH) or (k == gb.A_XCHG) or (k == gb.A_STORE) or (k == gb.A_LOAD_G) or
+       (k == gb.A_STORE_G) {
+        n = 2;
+    } else if k == gb.A_XCHG_G {
+        n = 3;
+    } else if (k == gb.A_CMPXCHG) or (k == gb.A_CMPXCHG_G) {
+        n = 4;
+    } else if k == gb.A_FENCE {
+        n = 0;
+    }
+    let mut o = ir.ORD_SEQ_CST;
+    let mut fo = ir.ORD_SEQ_CST;
+    if sync {
+        if k == gb.A_XCHG {
+            o = ir.ORD_ACQUIRE;  // (__sync_lock_test_and_set)
+        } else if k == gb.A_RELEASE {
+            o = ir.ORD_RELEASE;
+        }
+    } else {
+        if n < e.args.len {
+            o = cga.order_of(e.args.get(n));
+        }
+        if n + 1 < e.args.len {
+            fo = cga.order_of(e.args.get(n + 1));
+        }
+    }
     if k == gb.A_FENCE {
-        cga.fence();
+        cga.fence(o, not sync and u.ends(e.a.name, "signal_fence"));
         return ir.vnil();
     }
     let p = vs[0];
@@ -84,62 +117,64 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     let it = int_ty(t);
     if (k == gb.A_FETCH_OP) or (k == gb.A_OP_FETCH) {
         let v = resize(vs[1], it);
-        let old = rmw(e.cval, t, p, v);
+        let old = rmw(e.cval, t, p, v, o);
         if k == gb.A_FETCH_OP {
             return from_int(old, t);
         }
         return from_int(apply(e.cval, old, v), t);
     }
     if k == gb.A_XCHG {
-        return cga.exchange(t, vs[1], p);
+        return cga.exchange(t, vs[1], p, o);
     }
     if (k == gb.A_CAS_BOOL) or (k == gb.A_CAS_VAL) {
-        let old = cga.compare_exchange_value(t, p, vs[1], vs[2]);
+        let old = cga.compare_exchange_value(t, p, vs[1], vs[2], o, o);
         if k == gb.A_CAS_VAL {
             return old;
         }
         return ir.zext(B(), ir.icmp(B(), ir.IntEQ, as_int(old, t), as_int(vs[1], t)), cg.T_i8);
     }
     if k == gb.A_LOAD {
-        return cga.load(t, p);
+        return cga.load(t, p, o);
     }
     if k == gb.A_STORE {
-        cga.store(t, vs[1], p);
+        cga.store(t, vs[1], p, o);
         return ir.vnil();
     }
     if k == gb.A_RELEASE {
-        cga.store(t, from_int(ir.cint(it, 0), t), p);
+        cga.store(t, from_int(ir.cint(it, 0), t), p, o);
         return ir.vnil();
     }
     if (k == gb.A_TEST_SET) or (k == gb.A_CLEAR) {
         // (on the object's first byte, whatever its type)
         let flag = cty.t_uchar;
         if k == gb.A_CLEAR {
-            cga.store(flag, ir.cint(cg.T_i8, 0), p);
+            cga.store(flag, ir.cint(cg.T_i8, 0), p, o);
             return ir.vnil();
         }
-        let old = cga.exchange(flag, ir.cint(cg.T_i8, 1), p);
+        let old = cga.exchange(flag, ir.cint(cg.T_i8, 1), p, o);
         return ir.zext(B(), ir.icmp(B(), ir.IntNE, old, ir.cint(cg.T_i8, 0)), cg.T_i8);
     }
+    // (a weak one: argument 3 a constant other than 0)
+    let weak = ((k == gb.A_CMPXCHG) or (k == gb.A_CMPXCHG_G)) and e.args.get(3).is_const and (e.args.get(3).cval != 0);
     if k == gb.A_CMPXCHG {
         // (*expected gets the value found)
-        return ir.zext(B(), cga.compare_exchange(t, p, vs[1], vs[2]), cg.T_i8);
+        return ir.zext(B(), cga.compare_exchange(t, p, vs[1], vs[2], o, fo, weak), cg.T_i8);
     }
     // the generic forms: values at addresses (objects of the same size)
     if k == gb.A_LOAD_G {
-        cga.put_value(t, cga.load(t, p), vs[1]);
+        cga.put_value(t, cga.load(t, p, o), vs[1]);
         return ir.vnil();
     }
     if k == gb.A_STORE_G {
-        cga.store(t, cga.value_at(t, vs[1]), p);
+        cga.store(t, cga.value_at(t, vs[1]), p, o);
         return ir.vnil();
     }
     if k == gb.A_XCHG_G {
-        cga.put_value(t, cga.exchange(t, cga.value_at(t, vs[1]), p), vs[2]);
+        cga.put_value(t, cga.exchange(t, cga.value_at(t, vs[1]), p, o), vs[2]);
         return ir.vnil();
     }
     // A_CMPXCHG_G (p, expected *, desired *)
-    return ir.zext(B(), cga.compare_exchange(t, p, vs[1], cga.value_at(t, vs[2])), cg.T_i8);
+    return ir.zext(B(), cga.compare_exchange(t, p, vs[1], cga.value_at(t, vs[2]), o, fo, weak), cg.T_i8);
 }
 
 fn resize(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {

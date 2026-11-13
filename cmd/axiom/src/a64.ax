@@ -352,6 +352,10 @@ let mut vc_blk: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 fn vreg(v: *mut ir.Value) i32 {
     if v.loc < 0 {
         v.loc = mc.new_vreg(MF, class_of(v.ty));
+        if v.ty.kind == ir.T_FLOAT {
+            // (a scalar: spilled as 8 bytes, spill_store)
+            mc.set_bytes(MF, v.loc, @truncate(u8, @max(v.ty.size, 8)));
+        }
     }
     return v.loc;
 }
@@ -1284,9 +1288,18 @@ fn gen_load(v: *mut ir.Value) void {
     let d = vreg(v);
     let m = addr(v.a);
     let k = t.kind;
-    if ((v.flags & ir.F_ATOMIC) != 0) and (k != ir.T_VEC) and (k != ir.T_FLOAT) {
+    if ((v.flags & ir.F_ATOMIC) != 0) and (k != ir.T_VEC) and (k != ir.T_FLOAT) and (ir.order(v) != ir.ORD_RELAXED) {
+        // (the C11 mapping: a sequentially consistent load is LDAR, which
+        // the STLR of a seq_cst store before it waits for; an acquire one
+        // LDAPR where RCpc is (no such wait), else LDAR. A relaxed one is
+        // a plain LDR, below: aligned, it is single-copy atomic.)
         let b = base_reg(m);
-        _ = raw(ae.ldar(size_code(is.mem_size(t)), 0, 0), W(d), R(b), NONE(), NONE());
+        let sc = size_code(is.mem_size(t));
+        if (ir.order(v) == ir.ORD_ACQUIRE) and tg.has(tg.A_RCPC) {
+            _ = raw(ae.ldapr(sc, 0, 0), W(d), R(b), NONE(), NONE());
+        } else {
+            _ = raw(ae.ldar(sc, 0, 0), W(d), R(b), NONE(), NONE());
+        }
         return;
     }
     if k == ir.T_VEC {
@@ -1305,7 +1318,8 @@ fn gen_store(v: *mut ir.Value) void {
     let t = x.ty;
     let m = addr(v.b);
     let k = t.kind;
-    if ((v.flags & ir.F_ATOMIC) != 0) and (k != ir.T_VEC) and (k != ir.T_FLOAT) {
+    if ((v.flags & ir.F_ATOMIC) != 0) and (k != ir.T_VEC) and (k != ir.T_FLOAT) and (ir.order(v) != ir.ORD_RELAXED) {
+        // (a relaxed store is a plain STR, below)
         let b = base_reg(m);
         let r = reg(x);
         // STLR alone: with LDAR for atomic loads and the *AL read-modify-writes, it is
@@ -1483,9 +1497,13 @@ fn gen_rmw(v: *mut ir.Value) void {
     let d = vreg(v);
     let a = base_reg(addr(v.a));
     let mut x = reg(v.b);
+    // (the order: acquire, release or both on the instruction, or on the
+    // exclusive load and store of the loop)
+    let acq = ir.ord_acquires(ir.order(v));
+    let rel = ir.ord_releases(ir.order(v));
     if LSE_ {
         if o == ir.RMW_XCHG {
-            _ = raw(ae.swpal(sc, 0, 0, 0), W(d), R(a), R(x), NONE());
+            _ = raw(ae.swp(sc, acq, rel, 0, 0, 0), W(d), R(a), R(x), NONE());
             return;
         }
         let mut op: u64 = 0;
@@ -1511,7 +1529,7 @@ fn gen_rmw(v: *mut ir.Value) void {
         } else if o == ir.RMW_UMIN {
             op = 7;
         }
-        _ = raw(ae.ldopal(sc, op, 0, 0, 0), W(d), R(a), R(x), NONE());
+        _ = raw(ae.ldop(sc, op, acq, rel, 0, 0, 0), W(d), R(a), R(x), NONE());
         return;
     }
     // load-exclusive / store-exclusive loop
@@ -1521,7 +1539,7 @@ fn gen_rmw(v: *mut ir.Value) void {
     }
     let lp = new_label();
     place(lp);
-    _ = raw(ae.ldxr(sc, true, 0, 0), W(d), R(a), NONE(), NONE());
+    _ = raw(ae.ldxr(sc, acq, 0, 0), W(d), R(a), NONE(), NONE());
     let mut nv = x;
     if o != ir.RMW_XCHG {
         nv = vgpr();
@@ -1553,7 +1571,7 @@ fn gen_rmw(v: *mut ir.Value) void {
         }
     }
     let st = vgpr();
-    _ = raw(ae.stxr(sc, true, 0, 0, 0), R(nv), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
+    _ = raw(ae.stxr(sc, rel, 0, 0, 0), R(nv), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
     let uses: [2]i32 = [a, x];
     loop_branch(CBZ, 1, st, lp, uses[..]);
 }
@@ -1567,9 +1585,13 @@ fn gen_cmpxchg(v: *mut ir.Value) void {
     let e = reg(v.b);
     let n = reg(v.c);
     let d = vreg(v);
+    // (one instruction for both orders: at least as strong as each)
+    let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
+    let acq = ir.ord_acquires(ord);
+    let rel = ir.ord_releases(ord);
     if LSE_ {
         copy(d, e, GPR);
-        _ = raw(ae.casal(sc, 0, 0, 0), R(n), R(a), RW(d), NONE());
+        _ = raw(ae.cas(sc, acq, rel, 0, 0, 0), R(n), R(a), RW(d), NONE());
         return;
     }
     let mut ex = e;
@@ -1579,14 +1601,129 @@ fn gen_cmpxchg(v: *mut ir.Value) void {
     let lp = new_label();
     let done = new_label();
     place(lp);
-    _ = raw(ae.ldxr(sc, true, 0, 0), W(d), R(a), NONE(), NONE());
+    _ = raw(ae.ldxr(sc, acq, 0, 0), W(d), R(a), NONE(), NONE());
     cmp_reg(sf, d, ex);
     let u1: [3]i32 = [a, ex, n];
+    let weak = (v.flags & ir.F_WEAK) != 0;
+    if weak {
+        // C's compare_exchange_weak: one attempt, which fails (IN_CMPXCHG_OK
+        // 0) when the values differ or the exclusive store does: no loop.
+        // The status is 0 on success; ok is 1 - status, or 0 when they differ.
+        let ok = cas_ok_vreg(v);
+        let st = vgpr();
+        movi(ok, 0, 0);
+        let u2: [4]i32 = [a, ex, n, ok];
+        loop_branch(BCC, NE, 0, done, u2[..]);
+        _ = raw(ae.stxr(sc, rel, 0, 0, 0), R(n), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
+        raw3(ae.logic_reg(0, 2, false, 0, 0, 0, 0, 0), ok, st, one_reg());  // eor ok, st, #1 (st is 0 or 1)
+        place(done);
+        // (on a mismatch the exclusive monitor is left open: harmless, the
+        // next exclusive load resets it; CLREX would only shorten that)
+        return;
+    }
     loop_branch(BCC, NE, 0, done, u1[..]);
     let st = vgpr();
-    _ = raw(ae.stxr(sc, true, 0, 0, 0), R(n), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
+    _ = raw(ae.stxr(sc, rel, 0, 0, 0), R(n), R(a), mc.reg(st, mc.RD | mc.RE), NONE());
     loop_branch(CBZ, 1, st, lp, u1[..]);
     place(done);
+}
+
+// IN_CAS16(p, e, d): an exclusive pair loop. LDAXP / LDXP reads the 16
+// bytes; if they are e's, STLXP / STXP stores d's (again if the store
+// fails); if not, the same instruction stores back what was read, which
+// makes the read single-copy atomic (an exclusive pair's load alone is not,
+// before LSE2), and the value goes to e. (LSE's CASP would do it in one
+// instruction, but takes fixed even-odd register pairs, two of which the
+// register allocator does not see: not used.)
+fn gen_cas16(v: *mut ir.Value) void {
+    let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
+    let acq = ir.ord_acquires(ord);
+    let rel = ir.ord_releases(ord);
+    let a = reg(v.xs.get(0));
+    let e = reg(v.xs.get(1));
+    let d = reg(v.xs.get(2));
+    let el = vgpr();
+    let eh = vgpr();
+    let dl = vgpr();
+    let dh = vgpr();
+    _ = e2(LDR, 8, W(el), mc.mem(e, -1, 0, 0));
+    _ = e2(LDR, 8, W(eh), mc.mem(e, -1, 0, 8));
+    _ = e2(LDR, 8, W(dl), mc.mem(d, -1, 0, 0));
+    _ = e2(LDR, 8, W(dh), mc.mem(d, -1, 0, 8));
+    let ok = vreg(v);
+    movi(ok, 0, 0);
+    let lo = vgpr();
+    let hi = vgpr();
+    let t1 = vgpr();
+    let t2 = vgpr();
+    let st = vgpr();
+    let lp = new_label();
+    let differ = new_label();
+    let done = new_label();
+    let uses: [9]i32 = [a, e, el, eh, dl, dh, ok, lo, hi];
+    place(lp);
+    _ = raw(ae.ldxp(acq, 0, 0, 0), W(lo), R(a), NONE(), W(hi));
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t1, lo, el);  // eor
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t2, hi, eh);
+    raw3(ae.logic_reg(1, 1, false, 0, 0, 0, 0, 0), t1, t1, t2);  // orr
+    loop_branch(CBZ, 1, t1, differ, uses[..]);
+    _ = raw(ae.stxp(rel, 0, 0, 0, 0), R(dl), R(a), mc.reg(st, mc.RD | mc.RE), R(dh));
+    loop_branch(CBZ, 1, st, lp, uses[..]);
+    movi(ok, 1, 0);
+    loop_branch(CBZ, 1, ok, done, uses[..]);  // (taken: ok is 1)
+    place(differ);
+    _ = raw(ae.stxp(rel, 0, 0, 0, 0), R(lo), R(a), mc.reg(st, mc.RD | mc.RE), R(hi));
+    loop_branch(CBZ, 1, st, lp, uses[..]);
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 0), R(lo));
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 8), R(hi));
+    place(done);
+}
+
+// The success flags of weak compare-exchanges (IN_CMPXCHG_OK), made when the
+// cmpxchg is selected.
+struct CasOk {
+    cas: *ir.Value,
+    r: i32,
+}
+
+let mut cas_oks: u.List.[CasOk] = u.List.[CasOk].{ data: @ptr_from_int(*mut CasOk, 0), len: 0, cap: 0 };
+
+fn cas_ok_vreg(v: *ir.Value) i32 {
+    for x in cas_oks.items() {
+        if x.cas == v {
+            return x.r;
+        }
+    }
+    let r = vgpr();
+    cas_oks.push(CasOk.{ cas: v, r: r });
+    return r;
+}
+
+// A register holding 1.
+fn one_reg() i32 {
+    let r = vgpr();
+    movi(r, 1, 0);
+    return r;
+}
+
+// IN_CMPXCHG_OK(cas): whether the compare-exchange stored. Of a weak one
+// that the exclusive pair made (gen_cmpxchg), its flag; else (LSE's CAS,
+// which does not fail spuriously) whether the old value is the expected one.
+fn gen_cas_ok(v: *mut ir.Value) void {
+    let c = ir.resolve(v.xs.get(0));
+    if ((c.flags & ir.F_WEAK) != 0) and not LSE_ {
+        copy(vreg(v), cas_ok_vreg(c), GPR);
+        return;
+    }
+    let t = c.ty;
+    let mut e = reg(c.b);
+    let mut d = reg(c);
+    if is.mem_size(t) < 4 {
+        e = ext_reg(e, t.bits, false, false);
+        d = ext_reg(d, t.bits, false, false);
+    }
+    cmp_reg(sfv(t), d, e);
+    cset(vreg(v), EQ);
 }
 
 // -----------------------------------------------------------------------------
@@ -3209,7 +3346,18 @@ fn gen_inst(v: *mut ir.Value) void {
         return;
     }
     if o == ir.OP_FENCE {
-        raw_none(ae.DMB_ISH);
+        // (the C11 mapping: an acquire fence orders earlier loads, DMB
+        // ISHLD; a release, acq_rel or seq_cst one all accesses, DMB ISH;
+        // a relaxed or signal fence none: nothing at this level moves
+        // accesses within a block)
+        let fo = ir.order(v);
+        if ((v.flags & ir.F_SIGNAL) == 0) and (fo != ir.ORD_RELAXED) {
+            if fo == ir.ORD_ACQUIRE {
+                raw_none(ae.DMB_ISHLD);
+            } else {
+                raw_none(ae.DMB_ISH);
+            }
+        }
         return;
     }
     if o == ir.OP_EXTRACTELEM {
@@ -3246,6 +3394,14 @@ fn gen_inst(v: *mut ir.Value) void {
         }
         if id == ir.IN_CALL_RESULT {
             gen_call_result(v);
+            return;
+        }
+        if id == ir.IN_CMPXCHG_OK {
+            gen_cas_ok(v);
+            return;
+        }
+        if id == ir.IN_CAS16 {
+            gen_cas16(v);
             return;
         }
         if id == ir.IN_ASM {
@@ -4075,6 +4231,9 @@ fn spill_load(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
     if class == 0 {
         return mc.new_inst(LDR, 8, ops[..]);
     }
+    if (slot >= 0) and (f.slots.get(@int_cast(usize, slot)).size == 8) {
+        return mc.new_inst(FLDR, 8, ops[..]);  // (a scalar float's slot: mc.set_bytes)
+    }
     return mc.new_inst(FLDR, 16, ops[..]);
 }
 
@@ -4082,6 +4241,9 @@ fn spill_store(f: *mut mc.MFunc, r: i32, class: i32, slot: i32) *mut mc.MInst {
     let ops = is.mk2(mc.mem_slot(slot, 0), R(r));
     if class == 0 {
         return mc.new_inst(STR, 8, ops[..]);
+    }
+    if (slot >= 0) and (f.slots.get(@int_cast(usize, slot)).size == 8) {
+        return mc.new_inst(FSTR, 8, ops[..]);
     }
     return mc.new_inst(FSTR, 16, ops[..]);
 }
@@ -4150,6 +4312,7 @@ fn compile_func(f: *mut ir.Func) void {
         soff += 64;  // (Windows: x0-x7's home area, win_prologue)
     }
     call_results.clear();
+    cas_oks.clear();
     for pi in 0..f.params.len {
         let p = f.params[pi];
         let c = class_of(p.ty);

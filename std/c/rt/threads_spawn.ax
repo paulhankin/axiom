@@ -10,9 +10,9 @@
 // A thread's record (Spawned) holds threads.ax's CThread first (thrd_t
 // points to it) and the std/thread handle. It ends (`end`) after the
 // return of its start function or at thrd_exit: its tss destructors run,
-// its result is stored and `done` set (which thrd_join waits for), and the
-// count of running threads goes down (which thrd_exit on the main thread
-// waits for). thrd_join then joins the std/thread handle (which waits
+// its result is stored and `done` set (which thrd_join waits for). thrd_exit
+// on the main thread waits until every thread std/thread started has ended
+// (thrd_create's and those Axiom code started: std/thread.wait_all). thrd_join then joins the std/thread handle (which waits
 // until the thread is off its stack, and frees that), and frees the record.
 // A detached thread's record is put on a list, from which the next
 // thrd_create, thrd_detach or end of a thread frees those that are off
@@ -44,8 +44,6 @@ struct Spawned {
     next: *mut Spawned,
 }
 
-// the threads thrd_create started that have not ended
-let mut running: u32 = 0;
 // detached threads not yet freed, and its lock (threads.ax's lock word)
 let mut detached: *mut Spawned = @ptr_from_int(*mut Spawned, 0);
 let mut ndetached: u32 = 0;
@@ -65,13 +63,24 @@ fn run(s: *mut Spawned) void {
 fn end(s: *mut Spawned, res: i64) void {
     th.run_dtors();
     s.rec.result = res;
-    @atomic_store(&mut s.rec.done, 1);
-    _ = @atomic_notify(&s.rec.done, 0xFFFF_FFFF);
+    set_flag(&mut s.rec.done);
     reap();
     // (after this the record may be gone: a detached one's is freed once
     // the thread is off its stack)
-    if @atomic_sub(&mut running, 1) == 1 {
-        _ = @atomic_notify(&running, 0xFFFF_FFFF);
+}
+
+// The flags `done` and `ready`: 0, 2 once a thread waits for them (so that
+// setting one makes the system call of a wake-up only then), 1 set.
+fn set_flag(f: *mut u32) void {
+    if @atomic_xchg(f, 1) == 2 {
+        _ = @atomic_notify(f, 0xFFFF_FFFF);
+    }
+}
+
+fn wait_flag(f: *mut u32) void {
+    while @atomic_load(f) != 1 {
+        _ = @atomic_cas(f, 0, 2);
+        _ = th.wait(f, 2, -1);
     }
 }
 
@@ -85,7 +94,7 @@ fn reap() void {
     let mut s = detached;
     while @int_from_ptr(s) != 0 {
         let next = s.next;
-        if (@atomic_load(&s.ready) != 0) and s.handle.is_finished() {
+        if (@atomic_load(&s.ready) == 1) and s.handle.is_finished() {
             if @int_from_ptr(prev) == 0 {
                 detached = next;
             } else {
@@ -117,9 +126,7 @@ export fn __axc_thrd_spawn(func: fn(*mut void) i64, arg: *mut void, out: *mut *m
     s.ready = 0;
     s.joined = 0;
     s.next = null_spawned();
-    _ = @atomic_add(&mut running, 1);
     let h = thread.spawn(run, s) catch |e| {
-        _ = @atomic_sub(&mut running, 1);
         mem.destroy(s);
         if e == error.OutOfMemory {
             return th.NOMEM;
@@ -127,8 +134,7 @@ export fn __axc_thrd_spawn(func: fn(*mut void) i64, arg: *mut void, out: *mut *m
         return th.ERROR;
     };
     s.handle = h;
-    @atomic_store(&mut s.ready, 1);
-    _ = @atomic_notify(&s.ready, 0xFFFF_FFFF);
+    set_flag(&mut s.ready);
     out.* = &mut s.rec;
     return th.SUCCESS;
 }
@@ -152,16 +158,12 @@ export fn __axc_thrd_join(t: *mut th.CThread, res: *mut i64) i64 {
     if (@int_from_ptr(s) != 0) and (@atomic_xchg(&mut s.joined, 1) != 0) {
         return th.ERROR;
     }
-    while @atomic_load(&t.done) == 0 {
-        _ = th.wait(&t.done, 0, -1);
-    }
+    wait_flag(&mut t.done);
     res.* = t.result;
     if @int_from_ptr(s) != 0 {
         // (thrd_current's value may reach a joiner before thrd_create has
         // returned it)
-        while @atomic_load(&s.ready) == 0 {
-            _ = th.wait(&s.ready, 0, -1);
-        }
+        wait_flag(&mut s.ready);
         s.handle.join();
         mem.destroy(s);
     }
@@ -198,17 +200,12 @@ export fn __axc_thrd_exit(res: i64) void {
     }
     th.run_dtors();
     t.result = res;
-    @atomic_store(&mut t.done, 1);
-    _ = @atomic_notify(&t.done, 0xFFFF_FFFF);
+    set_flag(&mut t.done);
     // (a thread something else started with std/thread ends here)
     thread.exit();
-    loop {
-        let n = @atomic_load(&running);
-        if n == 0 {
-            return;
-        }
-        _ = th.wait(&running, n, -1);
-    }
+    // the main thread: every thread std/thread started (thrd_create's, and
+    // those Axiom code started) has ended, then the C side calls exit
+    thread.wait_all();
 }
 
 // exit's hook (core.ax): one thread runs exit.

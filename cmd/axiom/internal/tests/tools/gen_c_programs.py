@@ -2,10 +2,16 @@
 """Writes a random C program free of undefined behaviour, for differential
 testing of the C front end against another implementation:
 
-    gen_c_programs.py SEED [--no-long] [--hosted]
+    gen_c_programs.py SEED [--no-long] [--loops] [--hosted]
 
 The program is freestanding (it prints through host.h's print_u64) and
-prints a checksum of its globals after each call from main. Undefined
+prints a checksum of its globals after each call from main. With --loops
+it also has larger arrays and loops over them of the shapes the optimizer
+turns into memory operations and vector code: copies within and between
+arrays (overlapping either way, up and down, by index and by pointer),
+fills, reductions (sums, products, xor, min and max, dot products, in
+integers and in floating point, whose order is kept), searches and
+histograms, with bounds computed at run time. Undefined
 behaviour is excluded by construction: signed arithmetic is done in the
 corresponding unsigned type and converted back, division and remainder are
 guarded, shift counts are reduced modulo the width, floating values are
@@ -94,9 +100,10 @@ def common(a, b):
 
 
 class Gen:
-    def __init__(self, seed, no_long):
+    def __init__(self, seed, no_long, loops=False):
         self.r = random.Random(seed)
         self.no_long = no_long
+        self.loops = loops
         self.ints = [t for t in INTS if not (no_long and t in ('long', 'ulong'))]
         self.scalars = self.ints + list(FLOATS)
         self.out = []
@@ -464,6 +471,16 @@ class Gen:
                 self.out.append('static %s *%s = &%s[%d];' % (spell(t), pn, name, off) if self.chance(0.5) else
                                 'static %s *%s = %s + %d;' % (spell(t), pn, name, off))
                 env['ptrs'].append((pn, t, ln - off, name))
+        if self.loops:
+            env['big'] = []
+            for i in range(self.r.randint(2, 4)):
+                t = self.pick(self.scalars)
+                ln = self.pick([17, 33, 64, 100, 257])
+                name = 'gb%d' % i
+                init = ', '.join(self.const(t) for _ in range(self.r.randint(0, min(ln, 40))))
+                self.out.append('static %s %s[%d] = { %s };' % (spell(t), name, ln, init or '0'))
+                env['big'].append((name, t, ln))
+                self.globals.append((name, 'array', (t, ln)))
         for i, (sn, _) in enumerate(self.structs):
             st = 'struct ' + sn
             name = 'gs%d' % i
@@ -597,6 +614,8 @@ class Gen:
             if self.chance(0.5):
                 lines += ['%s} else {' % ind] + self.block(env, self.r.randint(1, 3), depth - 1, ind + '    ')
             return lines + ['%s}' % ind]
+        if self.loops and env.get('big') and r < 0.62:
+            return self.array_loop(env, ind)
         if r < 0.7 and env['loopvars']:
             v = env['loopvars'].pop()
             k = self.r.randint(1, 6)
@@ -648,6 +667,84 @@ class Gen:
 
     # ---- functions ----
 
+    def array_loop(self, env, ind):
+        # a loop over the big arrays (--loops): indices kept in bounds by
+        # construction (lo and hi reduced to 0..n - m, the offsets < m)
+        name, t, ln = self.pick(env['big'])
+        others = [a for a in env['big'] if a[1] == t]
+        src, _, sln = self.pick(others)
+        m = self.r.randint(0, 3)
+        n = min(ln, sln) - m
+        e1, t1 = self.int_expr(env, 2)
+        e2, t2 = self.int_expr(env, 2)
+        lo = '(%s %% %du)' % (self.conv_to(e1, t1, 'uint'), n + 1)
+        hi = '(%s %% %du)' % (self.conv_to(e2, t2, 'uint'), n + 1)
+        if self.chance(0.3):
+            lo = '0'
+        if self.chance(0.3):
+            hi = '%du' % n
+        dx, dy = self.r.randint(0, m), self.r.randint(0, m)
+        T = spell(t)
+        kind = self.r.randint(0, 9)
+        b = ['%s{' % ind, '%s    unsigned lo_ = %s, hi_ = %s, ii;' % (ind, lo, hi)]
+        i2 = ind + '    '
+        if kind == 0:
+            b.append('%sfor (ii = lo_; ii < hi_; ii++) %s[ii + %d] = %s[ii + %d];' % (i2, name, dx, src, dy))
+        elif kind == 1:
+            b.append('%sfor (ii = hi_; ii > lo_; ii--) %s[ii - 1 + %d] = %s[ii - 1 + %d];' % (i2, name, dx, src, dy))
+        elif kind == 2:
+            b.append('%s{ %s *d_ = %s + lo_ + %d; const %s *s_ = %s + lo_ + %d; unsigned k_ = hi_ > lo_ ? hi_ - lo_ : 0;'
+                     % (i2, T, name, dx, T, src, dy))
+            b.append('%s  while (k_--) *d_++ = *s_++; }' % i2)
+        elif kind == 3:
+            v, vt = self.expr(t, env, 1)
+            b.append('%s{ %s v_ = %s; for (ii = lo_; ii < hi_; ii++) %s[ii] = v_; }' % (i2, T, self.conv_to(v, vt, t), name))
+        elif kind == 4:
+            c = self.const(t)
+            b.append('%sfor (ii = lo_; ii != hi_ && ii < %du; ii++) %s[ii] = %s;' % (i2, n, name, c))
+        elif kind in (5, 6):
+            # a reduction: integers in unsigned long long, floating in order
+            acc = 'double' if (is_float(t) and kind == 6) else 'unsigned long long'
+            if is_float(t):
+                acc = T if self.chance(0.5) else 'double'
+                op = self.pick(['+', '*', '-'])
+                b.append('%s{ %s a_ = %s; for (ii = lo_; ii < hi_; ii++) a_ = a_ %s %s[ii]; ckf((double)a_); }'
+                         % (i2, acc, self.pick(['0', '1', '0.5']), op, name))
+            else:
+                op = self.pick(['+', '^', '|', '&', '*', 'dot', 'min', 'max'])
+                if op == 'dot':
+                    b.append('%s{ unsigned long long a_ = 0; for (ii = lo_; ii < hi_; ii++) a_ += (unsigned long long)%s[ii] * (unsigned long long)%s[ii]; ck(a_); }'
+                             % (i2, name, src))
+                elif op in ('min', 'max'):
+                    cmp = '<' if op == 'min' else '>'
+                    b.append('%s{ %s a_ = %s[0]; for (ii = lo_; ii < hi_; ii++) if (%s[ii] %s a_) a_ = %s[ii]; ck((unsigned long long)a_); }'
+                             % (i2, T, name, name, cmp, name))
+                else:
+                    init = '1' if op in ('*', '&') else '0'
+                    if op == '&':
+                        init = '~0ULL'
+                    b.append('%s{ unsigned long long a_ = %s; for (ii = lo_; ii < hi_; ii++) a_ = a_ %s (unsigned long long)%s[ii]; ck(a_); }'
+                             % (i2, init, op, name))
+        elif kind == 7:
+            v, vt = self.expr(t, env, 1)
+            b.append('%s{ %s c_ = %s; for (ii = lo_; ii < hi_; ii++) if (%s[ii] == c_) break; ck(ii); }'
+                     % (i2, T, self.conv_to(v, vt, t), name))
+        elif kind == 8 and is_int(t):
+            b.append('%s{ static unsigned hist_[17]; for (ii = lo_; ii < hi_; ii++) hist_[(unsigned long long)%s[ii] %% 17u]++;'
+                     % (i2, name))
+            b.append('%s  for (ii = 0; ii < 17; ii++) ck(hist_[ii]); }' % i2)
+        else:
+            # element-wise arithmetic in unsigned types (or floating), into another array
+            if is_float(t):
+                b.append('%sfor (ii = lo_; ii < hi_; ii++) %s[ii + %d] = %s[ii] * (%s)0.5 + (%s)%s;'
+                         % (i2, name, dx, src, T, T, self.const(t)))
+            else:
+                ut = 'unsigned long long'
+                b.append('%sfor (ii = lo_; ii < hi_; ii++) %s[ii + %d] = (%s)((%s)%s[ii] * 3u + (%s)%s[ii + %d]);'
+                         % (i2, name, dx, T, ut, src, ut, name, dy))
+        b.append('%s}' % ind)
+        return b
+
     def gen_func(self, idx, genv):
         pure = self.chance(0.5)
         ret = self.pick(self.scalars + (['struct ' + s[0] for s in self.structs] if self.structs and self.chance(0.2) else []))
@@ -668,6 +765,7 @@ class Gen:
                   for _ in range(self.r.randint(1, 5))] if variadic else []
         f = {'name': name, 'ret': ret, 'params': params, 'pure': pure, 'variadic': variadic, 'vtypes': vtypes}
         env = {
+            'big': [] if pure else list(genv.get('big', [])),
             'vars': [], 'arrays': list(genv['arrays']) if not pure else [], 'fields': [], 'ptrs': [],
             'svars': [], 'struct_globals': genv['struct_globals'], 'pure': [] if pure else list(genv['pure']),
             'impure': [] if pure else list(genv['impure']), 'readonly': set(), 'loopvars': [], 'pure_mode': pure,
@@ -912,7 +1010,7 @@ class Gen:
 def main():
     seed = int(sys.argv[1])
     no_long = '--no-long' in sys.argv
-    g = Gen(seed, no_long)
+    g = Gen(seed, no_long, '--loops' in sys.argv)
     g.hosted = '--hosted' in sys.argv
     sys.stdout.write(g.program())
 

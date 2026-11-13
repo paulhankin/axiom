@@ -1,0 +1,526 @@
+// =============================================================================
+// idioms.ax - counted loops that copy or fill consecutive elements, made one
+// memory operation (after loops.ax has widened their counters):
+//
+//     H: p = phi [p0, pre], [p + k, B] ...          (pointers, step k)
+//        i = phi [i0, pre], [i + 1 | i - 1, B]      (the counter tested)
+//        condbr (i <cmp> end) -> B, exit
+//     B: x = load T, src(t);  store x, dst(t)    or    store v, dst(t)
+//        (address arithmetic, the steps);  br H
+//
+// where t counts the iterations from 0, dst(t) and src(t) are dst0 + t * |T|
+// (a pointer phi stepping by |T|, or base + j * |T| for a counter j stepping
+// by 1), v is a loop invariant whose bytes are all one byte b (or v an i8),
+// and nothing else in the loop reads or writes memory, calls or traps.
+//
+// The number of iterations n is a function of the counter's start, its step
+// and the test, computed before the loop (counted_trips: exact in the
+// counter's width, as the loop itself counts, wrapping included). Then
+//
+//   - the fill is memset(dst0, b, n * |T|): the loop's stores, in any order,
+//     write the same bytes;
+//   - the copy is memcpy(dst0, src0, n * |T|) when the regions are apart by
+//     C's restrict (ir.restrict_apart), else memmove(dst0, src0, n * |T|)
+//     when (dst0 - src0) mod 2^w
+//     >= n * |T|: then dst0 <= src0 or the regions are apart, and a forward
+//     copy of elements (each loaded before it is stored, the loads ahead of
+//     the stores) has memmove's result; otherwise (the destination starts
+//     inside the source, where the forward copy repeats elements) the loop
+//     runs as it was.
+//
+// Validity: the loop's blocks are only H and B; H has nothing but its phis,
+// pure instructions, the test and the branch, B nothing but the access(es), pure instructions
+// and the steps; no value the loop computes is used after it (the exit
+// block's phis take invariants only); the accesses are neither volatile nor
+// atomic. Memory operations need no alignment, and a count of 0 is nothing.
+// =============================================================================
+import "ir.ax" as ir;
+import "opt.ax" as opt;
+import "util.ax" as u;
+
+fn vnil() *mut ir.Value {
+    return u.nil.[ir.Value]();
+}
+
+let mut tag_base: i64 = 0x3000_0000_0000;
+
+/// Is v outside the loop whose blocks are marked tag (or not an instruction)?
+pub fn invariant(v: *ir.Value, tag: i64) bool {
+    return u.isnil(v) or (v.kind != ir.V_INST) or u.isnil(v.blk) or (v.blk.mark != tag);
+}
+
+/// Does i compute its result from its operands alone, with no effect (no trap)?
+/// (Not a floating-point operation of a function with strict floating point:
+/// ir.fp_pinned; it reads the environment and raises exceptions.)
+pub fn pure(i: *ir.Value) bool {
+    if ir.fp_pinned(i) {
+        return false;
+    }
+    if i.op == ir.OP_INTR {
+        return ir.inst_pure(i);  // (an asm statement by its own properties: ir.inst_props)
+    }
+    return ir.op_pure(i.op) and (i.op != ir.OP_EXTRACTVALUE) and (i.op != ir.OP_INSERTVALUE) and
+           not ir.is_int_div(i.op);
+}
+
+/// A phi of the header and its start (from pre) and next (from the body) values.
+pub struct Iv {
+    phi: *mut ir.Value,
+    start: *mut ir.Value,
+    next: *mut ir.Value,
+    step: i64,  // the constant added each iteration (an integer's, or a pointer's bytes)
+}
+
+/// The constant step of phi p whose next value is `next`, or false.
+pub fn step_of(p: *mut ir.Value, next: *ir.Value, out: *mut i64) bool {
+    if u.isnil(next) or (next.kind != ir.V_INST) {
+        return false;
+    }
+    if (next.op == ir.OP_ADD) and (ir.resolve(next.a) == p) and ir.is_cint(next.b) {
+        out.* = sext_of(next.b);
+        return true;
+    }
+    if (next.op == ir.OP_SUB) and (ir.resolve(next.a) == p) and ir.is_cint(next.b) {
+        out.* = 0 - sext_of(next.b);
+        return true;
+    }
+    if (next.op == ir.OP_PTRADD) and (ir.resolve(next.a) == p) and ir.is_cint(next.b) {
+        out.* = sext_of(next.b);
+        return true;
+    }
+    return false;
+}
+
+fn sext_of(c: *ir.Value) i64 {
+    let bits = c.ty.bits;
+    let x = ir.cint_val(c);
+    if (bits <= 0) or (bits >= 64) {
+        return @bit_cast(i64, x);
+    }
+    let sh = @as(u32, @bit_cast(u32, 64 - bits));
+    return @bit_cast(i64, x << sh) >> sh;
+}
+
+/// The index of phi v among ivs, or -1.
+pub fn find_iv(ivs: *u.List.[Iv], v: *mut ir.Value) i32 {
+    for k in 0..ivs.len {
+        if ivs.get(k).phi == v {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+/// The address of element t of a sequence of `size`-byte elements: a
+/// pointer phi stepping by size (*start: its start), or base + j * size for
+/// an integer phi j stepping by 1 (*start, with `emit`: base + j0 * size,
+/// made before the loop by the builder at `bld`). False otherwise.
+pub fn sequence(bld: *mut ir.Builder, p: *mut ir.Value, ivs: *u.List.[Iv], size: u64, tag: i64, emit: bool,
+                start: *mut *mut ir.Value) bool {
+    let k = find_iv(ivs, p);
+    if k >= 0 {
+        let iv = ivs.get(@int_cast(usize, k));
+        if (iv.phi.ty.kind != ir.T_PTR) or (iv.step != @bit_cast(i64, size)) {
+            return false;
+        }
+        start.* = iv.start;
+        return true;
+    }
+    if not ir.is_op(p, ir.OP_PTRADD) or not invariant(p.a, tag) {
+        return false;
+    }
+    let off = p.b;
+    let mut j = vnil();
+    if (size == 1) and (find_iv(ivs, off) >= 0) {
+        j = off;
+    } else if ir.is_op(off, ir.OP_MUL) and ir.is_cint(off.b) and (ir.cint_val(off.b) == size) {
+        j = off.a;
+    } else if ir.is_op(off, ir.OP_SHL) and ir.is_cint(off.b) and (ir.cint_val(off.b) < 8) and
+              ((@as(u64, 1) << @truncate(u32, ir.cint_val(off.b))) == size) {
+        j = off.a;
+    } else {
+        return false;
+    }
+    let jk = find_iv(ivs, j);
+    if jk < 0 {
+        return false;
+    }
+    let jv = ivs.get(@int_cast(usize, jk));
+    if (jv.step != 1) or (jv.phi.ty.kind != ir.T_INT) or (jv.phi.ty != ir.isz()) {
+        return false;
+    }
+    if emit {
+        start.* = ir.ptradd(bld, p.a, ir.mul(bld, jv.start, ir.cint(ir.isz(), size)));
+    }
+    return true;
+}
+
+// The bytes of v if they are all one byte (an i8: itself), else nil.
+fn fill_byte(v: *mut ir.Value) *mut ir.Value {
+    if (v.ty.kind == ir.T_INT) and (v.ty.bits == 8) {
+        return v;
+    }
+    if ir.is_zero(v) and (v.kind != ir.V_INST) {
+        return ir.cint(ir.t_int(8), 0);
+    }
+    if (v.ty.kind != ir.T_INT) or not ir.is_cint(v) or ((v.ty.bits % 8) != 0) {
+        return vnil();
+    }
+    let x = ir.cint_val(v);
+    let b = x & 0xff;
+    let n = @as(u64, @bit_cast(u32, v.ty.bits / 8));
+    for k in @as(u64, 1)..n {
+        if ((x >> @truncate(u32, k * 8)) & 0xff) != b {
+            return vnil();
+        }
+    }
+    return ir.cint(ir.t_int(8), b);
+}
+
+/// The number of iterations of a loop whose counter iv is tested `iv pred
+/// end` before each (the loop runs while that holds), as a pointer-sized
+/// integer made by bld; nil when this form is not one known here. With a
+/// step of 1: <u and <s give max(end - start, 0) (signed: of the operands
+/// extended), != gives end - start in the counter's width (the loop counts
+/// so, wrapping); with -1: >u, >s and != likewise from start down to end.
+pub fn counted_trips(bld: *mut ir.Builder, iv: Iv, pred: i32, end: *mut ir.Value) *mut ir.Value {
+    let t = iv.phi.ty;
+    let w = ir.isz();
+    if (t.kind != ir.T_INT) or (t.bits > w.bits) or (end.ty != t) {
+        return vnil();
+    }
+    let mut lo = iv.start;
+    let mut hi = end;
+    if iv.step == -1 {
+        lo = end;
+        hi = iv.start;
+    } else if iv.step != 1 {
+        return vnil();
+    }
+    if (pred == ir.IntNE) or ((pred == ir.IntULT) and (iv.step == 1)) or ((pred == ir.IntUGT) and (iv.step == -1)) {
+        let d = ir.sub(bld, hi, lo);
+        let mut n = d;
+        if t.bits < w.bits {
+            n = ir.cast(bld, ir.OP_ZEXT, d, w);
+        }
+        if pred == ir.IntNE {
+            return n;
+        }
+        let lt = ir.icmp(bld, ir.IntULT, lo, hi);
+        return ir.select(bld, lt, n, ir.cint(w, 0));
+    }
+    if ((pred == ir.IntSLT) and (iv.step == 1)) or ((pred == ir.IntSGT) and (iv.step == -1)) {
+        let mut a = lo;
+        let mut b = hi;
+        if t.bits < w.bits {
+            a = ir.cast(bld, ir.OP_SEXT, lo, w);
+            b = ir.cast(bld, ir.OP_SEXT, hi, w);
+        }
+        let lt = ir.icmp(bld, ir.IntSLT, a, b);
+        return ir.select(bld, lt, ir.sub(bld, b, a), ir.cint(w, 0));
+    }
+    return vnil();
+}
+
+// Is a value the loop computes used outside it (but by the exit block's
+// phis' incoming from h, which only invariants may be)?
+fn used_outside(f: *mut ir.Func, tag: i64) bool {
+    let mut b = f.first;
+    while u.notnil(b) {
+        if b.mark != tag {
+            let mut i = b.first;
+            while u.notnil(i) {
+                let ops: [3]*mut ir.Value = [i.a, i.b, i.c];
+                for o in ops {
+                    if not invariant(o, tag) {
+                        return true;
+                    }
+                }
+                for k in 0..i.xs.len {
+                    if not invariant(i.xs.get(k), tag) {
+                        return true;
+                    }
+                }
+                i = i.next;
+            }
+        }
+        b = b.next;
+    }
+    return false;
+}
+
+fn try_loop(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    if (members.len != 2) or h.guarded {
+        return false;
+    }
+    let mut body = members.get(0);
+    if body == h {
+        body = members.get(1);
+    }
+    let ht = ir.terminator(h);
+    let bt = ir.terminator(body);
+    if u.isnil(ht) or u.isnil(bt) or (ht.op != ir.OP_CONDBR) or (bt.op != ir.OP_BR) or (bt.t1 != h) {
+        return false;
+    }
+    let mut exit = ir.bnil();
+    let mut cont = true;  // (the loop continues when the test holds)
+    if (ht.t1 == body) and (ht.t2 != body) {
+        exit = ht.t2;
+    } else if (ht.t2 == body) and (ht.t1 != body) {
+        exit = ht.t1;
+        cont = false;
+    } else {
+        return false;
+    }
+    // the preheader
+    let mut pre = ir.bnil();
+    for k in 0..h.preds.len {
+        let q = h.preds.get(k);
+        if q.mark != tag {
+            if u.notnil(pre) {
+                return false;
+            }
+            pre = q;
+        }
+    }
+    if u.isnil(pre) or (ir.succ_count(ir.terminator(pre)) != 1) {
+        return false;
+    }
+    // the header: phis (induction variables), the test, the branch
+    let mut ivs = u.List.[Iv].empty();
+    defer ivs.deinit();
+    let mut x = h.first;
+    while u.notnil(x) and (x.op == ir.OP_PHI) {
+        if x.xs.len != 2 {
+            return false;
+        }
+        let mut iv = Iv.{ phi: x, start: vnil(), next: vnil(), step: 0 };
+        for k in @as(usize, 0)..2 {
+            if ir.bs_of(x).get(k) == body {
+                iv.next = x.xs.get(k);
+            } else {
+                iv.start = x.xs.get(k);
+            }
+        }
+        if u.isnil(iv.start) or u.isnil(iv.next) or not invariant(iv.start, tag) or
+           not step_of(x, iv.next, &mut iv.step) or invariant(iv.next, tag) {
+            return false;
+        }
+        ivs.push(iv);
+        x = x.next;
+    }
+    // (pure instructions may come before the test: a step made there)
+    let c = ht.a;
+    while u.notnil(x) and (x != c) and (x != ht) and pure(x) {
+        x = x.next;
+    }
+    if u.isnil(x) or (x != c) or (c.next != ht) or not ir.is_op(c, ir.OP_ICMP) {
+        return false;
+    }
+    let mut pred = ir.pred_of(c);
+    let mut ci = find_iv(&ivs, c.a);
+    let mut end = c.b;
+    if ci < 0 {
+        ci = find_iv(&ivs, c.b);
+        end = c.a;
+        pred = ir.swap_pred(pred);
+    }
+    if not cont {
+        pred = ir.inv_pred(pred);
+    }
+    if (ci < 0) or not invariant(end, tag) {
+        return false;
+    }
+    // the body: one store, perhaps one load, pure instructions
+    let mut st = vnil();
+    let mut ld = vnil();
+    let mut y = body.first;
+    while u.notnil(y) and (y != bt) {
+        if y.op == ir.OP_STORE {
+            if u.notnil(st) {
+                return false;
+            }
+            st = y;
+        } else if y.op == ir.OP_LOAD {
+            if u.notnil(ld) or u.notnil(st) {
+                return false;  // (the load first)
+            }
+            ld = y;
+        } else if (y.op == ir.OP_PHI) or not pure(y) {
+            return false;
+        }
+        y = y.next;
+    }
+    if u.isnil(st) or (st.flags != 0) {
+        return false;
+    }
+    let t = st.a.ty;
+    let size = t.size;
+    if (size == 0) or (t.kind == ir.T_VOID) or (t.kind == ir.T_STRUCT) or (t.kind == ir.T_ARRAY) {
+        return false;
+    }
+    let copy = u.notnil(ld);
+    let mut byte = vnil();
+    if copy {
+        if (ld.flags != 0) or (st.a != ld) or (ld.uses != 1) or (ld.ty != t) {
+            return false;
+        }
+    } else {
+        if not invariant(st.a, tag) {
+            return false;
+        }
+        byte = fill_byte(st.a);
+        if u.isnil(byte) {
+            return false;
+        }
+    }
+    let mut dummy = vnil();
+    if not sequence(ir.new_builder(), st.b, &ivs, size, tag, false, &mut dummy) or
+       (copy and not sequence(ir.new_builder(), ld.a, &ivs, size, tag, false, &mut dummy)) {
+        return false;
+    }
+    if used_outside(f, tag) {
+        return false;
+    }
+    // (the exit's phis: invariants from h, which the new path gives too)
+    let mut ep = exit.first;
+    while u.notnil(ep) and (ep.op == ir.OP_PHI) {
+        for k in 0..ep.xs.len {
+            if (ir.bs_of(ep).get(k) == h) and not invariant(ep.xs.get(k), tag) {
+                return false;
+            }
+        }
+        ep = ep.next;
+    }
+    // before the loop: the count, the bytes, the starts
+    let bld = ir.new_builder();
+    let pt = ir.terminator(pre);
+    ir.at_before(bld, pt);
+    let n = counted_trips(bld, ivs.get(@int_cast(usize, ci)), pred, end);
+    if u.isnil(n) {
+        return false;  // (what was made is unused: dce)
+    }
+    let w = ir.isz();
+    let bytes = ir.mul(bld, n, ir.cint(w, size));
+    let mut d0 = vnil();
+    let mut s0 = vnil();
+    _ = sequence(bld, st.b, &ivs, size, tag, true, &mut d0);
+    let fast = ir.append_block(f, "idiom");
+    if not copy {
+        // (always: pre goes to the fill, then to the exit)
+        ir.at_end(bld, fast);
+        _ = ir.memop(bld, ir.OP_MEMSET, d0, byte, bytes);
+        ir.br(bld, exit);
+        ir.retarget(pre, h, fast);
+        ir.remove_phi_input(h, pre);
+        add_exit_incoming(exit, h, fast);
+        return true;
+    }
+    _ = sequence(bld, ld.a, &ivs, size, tag, true, &mut s0);
+    if ir.restrict_apart(root(d0), root(s0)) {
+        // (C's restrict: the regions are apart, ir.F_NOALIAS)
+        ir.at_end(bld, fast);
+        _ = ir.memop(bld, ir.OP_MEMCPY, d0, s0, bytes);
+        ir.br(bld, exit);
+        ir.retarget(pre, h, fast);
+        ir.remove_phi_input(h, pre);
+        add_exit_incoming(exit, h, fast);
+        return true;
+    }
+    let diff = ir.sub(bld, ir.ptrtoint(bld, d0, w), ir.ptrtoint(bld, s0, w));
+    let ok = ir.icmp(bld, ir.IntUGE, diff, bytes);
+    // pre: condbr ok -> fast, guard -> H (the loop as it was)
+    let guard = ir.edge_block(f, "idiom.loop", pre, h);
+    h.guarded = true;
+    ir.retarget(pre, h, guard);
+    let pt2 = ir.terminator(pre);
+    ir.at_before(bld, pt2);
+    ir.condbr(bld, ok, fast, guard);
+    ir.remove_inst(pt2);
+    ir.at_end(bld, fast);
+    _ = ir.memop(bld, ir.OP_MEMMOVE, d0, s0, bytes);
+    ir.br(bld, exit);
+    add_exit_incoming(exit, h, fast);
+    return true;
+}
+
+/// What the address p is based on: a stack slot or global under its
+/// ptradds, or a parameter (ir.based_param).
+pub fn root(p0: *mut ir.Value) *mut ir.Value {
+    let mut p = ir.resolve(p0);
+    while ir.is_op(p, ir.OP_PTRADD) {
+        p = ir.resolve(p.a);
+    }
+    if u.notnil(p) and ((p.kind == ir.V_GLOBAL) or ir.is_op(p, ir.OP_ALLOCA)) {
+        return p;
+    }
+    return ir.based_param(p0);
+}
+
+// The exit's phis take from `from` what they take from h.
+fn add_exit_incoming(exit: *mut ir.Block, h: *mut ir.Block, from: *mut ir.Block) void {
+    let mut p = exit.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        let mut v = vnil();
+        for k in 0..p.xs.len {
+            if ir.bs_of(p).get(k) == h {
+                v = p.xs.get(k);
+            }
+        }
+        if u.notnil(v) {
+            ir.add_incoming(p, v, from);
+        }
+        p = p.next;
+    }
+}
+
+/// Is f one of the functions that memory operations become calls of (on
+/// AArch64, and wherever a C library's own are used: std/c/lib/string), whose
+/// loops made memory operations would call themselves?
+pub fn implements_memops(f: *ir.Func) bool {
+    let n = f.name;
+    return u.str_eq(n, "memcpy") or u.str_eq(n, "memmove") or u.str_eq(n, "memset") or u.str_eq(n, "memset_explicit");
+}
+
+/// The copy and fill loops of f made memmove and memset (above). True if
+/// any was.
+pub fn loop_copies(f: *mut ir.Func) bool {
+    if u.isnil(f.first) or implements_memops(f) {
+        return false;
+    }
+    let mut any = false;
+    let mut rounds: i32 = 0;
+    ir.apply_forwarding(f);
+    loop {
+        opt.compute_preds(f);
+        ir.count_uses(f);  // (the checks read uses: kept current here only)
+        let order = opt.dominators(f);
+        let hs = opt.loop_headers(&order);
+        let mut members = u.List.[*mut ir.Block].empty();
+        let mut changed = false;
+        for k in 0..hs.len {
+            tag_base += 1;
+            opt.members_of(hs.get(k), tag_base, &mut members);
+            if try_loop(f, hs.get(k), tag_base, &members) {
+                changed = true;
+                break;  // (the CFG changed: again)
+            }
+        }
+        members.deinit();
+        order.deinit();
+        hs.deinit();
+        if not changed {
+            break;
+        }
+        any = true;
+        rounds += 1;
+        if rounds >= 16 {
+            break;
+        }
+    }
+    if any {
+        opt.compute_preds(f);
+        ir.remove_unreachable(f);
+    }
+    return any;
+}

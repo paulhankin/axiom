@@ -1,6 +1,6 @@
 /* flags: --c-std=gnu11 */
 /* The GNU dialects' generic atomic builtins on objects that are not 1, 2,
-   4 or 8 bytes: under the lock table of C11's atomics (cgen_atomic.ax), so
+   4 or 8 bytes (and a 16-byte one aligned to 8): under the lock table of C11's atomics (cgen_atomic.ax), so
    that they are atomic with each other and with _Atomic objects, across
    threads. */
 #include <threads.h>
@@ -37,7 +37,7 @@ int main(void) {
     x.c[0] = 4;
     __atomic_store(&o, &x, __ATOMIC_RELAXED);
     print_i64(o.c[0]);
-    print_i64(__atomic_always_lock_free(sizeof w, 0) * 10 + __atomic_always_lock_free(sizeof(long long), 0));
+    print_i64(__atomic_always_lock_free(24, 0) * 10 + __atomic_always_lock_free(sizeof(long long), 0));
     for (i = 0; i < 4; i++)
         thrd_create(&t[i], work, 0);
     for (i = 0; i < 4; i++)

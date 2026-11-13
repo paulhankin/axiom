@@ -2,14 +2,21 @@
    front end. The generic functions are the compiler's builtins (their
    argument is a pointer to any atomic type); atomic_flag's functions,
    atomic_thread_fence and atomic_signal_fence are static inline functions
-   over them. Every operation is sequentially consistent, whatever
-   memory_order it is given: a valid implementation of each order.
+   over them, and macros of the same names, so that a constant order stays
+   one. Each operation has the order it is given when that is a constant
+   (an order an operation does not take is a warning, and is made at least
+   as strong as it); one that is not a constant is memory_order_seq_cst.
+   memory_order_consume is memory_order_acquire. atomic_compare_exchange_weak
+   fails spuriously only on AArch64 without LSE (one exclusive attempt);
+   atomic_signal_fence is a barrier to the compiler only.
 
    Atomic objects of 1, 2, 4 and 8 bytes are lock-free (the integer types
-   and pointers among them, so every ATOMIC_*_LOCK_FREE is 2). Other sizes
-   (structures of 3 bytes, or of 16) take a lock from a table of spinlocks
-   indexed by address, which a signal handler must not use while the
-   interrupted thread may hold it. On WebAssembly without the atomics
+   and pointers among them, so every ATOMIC_*_LOCK_FREE is 2), and of 16
+   bytes on AArch64 and x86-64 (where the processor has cmpxchg16b:
+   atomic_is_lock_free asks it unless the target's extensions include it).
+   Other sizes (structures of 3 bytes, or of 32) take a lock from a table of
+   spinlocks indexed by address, which a signal handler must not use while
+   the interrupted thread may hold it. On WebAssembly without the atomics
    feature, a module has one thread and the operations are ordinary loads
    and stores. */
 #ifndef __AXIOM_STDATOMIC_H
@@ -23,7 +30,7 @@
 #define __STDC_VERSION_STDATOMIC_H__ 202311L
 #endif
 
-/* 7.17.3: the orders (their values are not used) */
+/* 7.17.3: the orders (the GNU dialects' __ATOMIC_ values are the same) */
 typedef enum memory_order {
     memory_order_relaxed,
     memory_order_consume,
@@ -64,6 +71,8 @@ static inline void atomic_thread_fence(memory_order __axiom_order) {
 static inline void atomic_signal_fence(memory_order __axiom_order) {
     __builtin_atomic_signal_fence(__axiom_order);
 }
+#define atomic_thread_fence(order) __builtin_atomic_thread_fence(order)
+#define atomic_signal_fence(order) __builtin_atomic_signal_fence(order)
 
 /* 7.17.5.1 */
 #define atomic_is_lock_free(obj) __builtin_atomic_is_lock_free(obj)
@@ -149,15 +158,14 @@ typedef _Atomic unsigned long atomic_wchar_t;
 #define atomic_load_explicit(obj, order) __builtin_atomic_load((obj), (order))
 #define atomic_exchange(obj, desired) __builtin_atomic_exchange((obj), (desired), memory_order_seq_cst)
 #define atomic_exchange_explicit(obj, desired, order) __builtin_atomic_exchange((obj), (desired), (order))
-/* (the weak form never fails spuriously: it is the strong one) */
 #define atomic_compare_exchange_strong(obj, expected, desired) \
     __builtin_atomic_compare_exchange((obj), (expected), (desired), memory_order_seq_cst, memory_order_seq_cst)
 #define atomic_compare_exchange_strong_explicit(obj, expected, desired, success, failure) \
     __builtin_atomic_compare_exchange((obj), (expected), (desired), (success), (failure))
 #define atomic_compare_exchange_weak(obj, expected, desired) \
-    __builtin_atomic_compare_exchange((obj), (expected), (desired), memory_order_seq_cst, memory_order_seq_cst)
+    __builtin_atomic_compare_exchange_weak((obj), (expected), (desired), memory_order_seq_cst, memory_order_seq_cst)
 #define atomic_compare_exchange_weak_explicit(obj, expected, desired, success, failure) \
-    __builtin_atomic_compare_exchange((obj), (expected), (desired), (success), (failure))
+    __builtin_atomic_compare_exchange_weak((obj), (expected), (desired), (success), (failure))
 #define atomic_fetch_add(obj, operand) __builtin_atomic_fetch_add((obj), (operand), memory_order_seq_cst)
 #define atomic_fetch_add_explicit(obj, operand, order) __builtin_atomic_fetch_add((obj), (operand), (order))
 #define atomic_fetch_sub(obj, operand) __builtin_atomic_fetch_sub((obj), (operand), memory_order_seq_cst)
@@ -187,5 +195,8 @@ static inline void atomic_flag_clear(volatile atomic_flag *__axiom_f) {
 static inline void atomic_flag_clear_explicit(volatile atomic_flag *__axiom_f, memory_order __axiom_order) {
     __builtin_atomic_store(&__axiom_f->__axiom_set, 0, __axiom_order);
 }
+#define atomic_flag_test_and_set_explicit(f, order) \
+    (__builtin_atomic_exchange(&(f)->__axiom_set, 1, (order)) != 0)
+#define atomic_flag_clear_explicit(f, order) __builtin_atomic_store(&(f)->__axiom_set, 0, (order))
 
 #endif

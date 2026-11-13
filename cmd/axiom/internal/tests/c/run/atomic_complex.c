@@ -23,7 +23,8 @@ int main(void) {
     double _Complex e = 9.0;
     print_i64(atomic_compare_exchange_strong(&z, &e, 0.0));
     print_f64(cimag(e));
-    print_i64(_Alignof(_Atomic double _Complex) * 100 + _Alignof(_Atomic float _Complex));
+    /* (double _Complex: 16, or on WebAssembly, whose widest atomic access is 8 bytes, 8) */
+    print_i64((_Alignof(_Atomic double _Complex) >= 8) * 1600 + _Alignof(_Atomic float _Complex));
     return 0;
 }
 /* expect: 1 */

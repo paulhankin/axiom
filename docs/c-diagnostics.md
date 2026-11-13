@@ -270,6 +270,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4053` | A function declared `_Noreturn` or `[[noreturn]]` that can return. Reported when code is generated. |
 | `C4090` | A member of an object of atomic structure or union type accessed (undefined, 6.5.2.3p5): it is accessed as an ordinary object. |
 | `C4091` | A pointer to an atomic type converted to a pointer to `void` that does not have the `_Atomic` qualifier (6.5.16.1p1 asks for it): the conversion is made. |
+| `C4092` | A constant memory order that the atomic operation does not take (C17 7.17.7.1p2, 7.17.7.2p2, 7.17.7.4p2): a store's consume, acquire or acq_rel, a load's release or acq_rel, a compare-exchange's failure order of release or acq_rel or (before C23, and for the GNU `__atomic` builtins) stronger than its success order, or a value that is no order. The operation is made at least as strong as asked. |
 | `C4080` | The second argument of `va_start` is not the function's last parameter. |
 | `C4081` | `va_arg` of a type that the default argument promotions change. |
 | `C4101` | A backslash-newline at the end of a file. |

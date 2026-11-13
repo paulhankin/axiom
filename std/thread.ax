@@ -15,7 +15,8 @@ import "mem.ax" as mem;
 pub error ThreadError { SpawnFailed, OutOfMemory }
 
 import host "axiom" {
-    // `exited` is set to 1 (and notified) once the thread has left its stack
+    // `exited` is set to 1 once the thread has left its stack (and notified,
+    // at least when a joiner has set it to 2 first)
     fn ax_thread_spawn(entry: fn(*mut void) void, arg: *mut void, stack_top: usize, exited: *mut u32) i32;
     fn ax_thread_stack_size() usize;  // 0: the host provides stacks
     fn ax_cpu_count() u32;
@@ -33,10 +34,36 @@ struct Start[T] {
 // Whether the calling thread was started by spawn (for exit).
 threadlocal let mut spawned: bool = false;
 
+// The threads spawn started whose function has not returned (nor exit
+// ended), and whether something waits for it to reach 0 (wait_all).
+let mut live: u32 = 0;
+let mut live_waiters: u32 = 0;
+
+fn ended() void {
+    if (@atomic_sub(&mut live, 1) == 1) and (@atomic_load(&live_waiters) != 0) {
+        _ = @atomic_notify(&live, 0xFFFF_FFFF);
+    }
+}
+
+/// Waits until every thread spawn started has ended (its function returned,
+/// or it called exit): C's thrd_exit on the main thread (std/c/rt).
+pub fn wait_all() void {
+    _ = @atomic_add(&mut live_waiters, 1);
+    loop {
+        let n = @atomic_load(&live);
+        if n == 0 {
+            break;
+        }
+        _ = @atomic_wait(&live, n, -1);
+    }
+    _ = @atomic_sub(&mut live_waiters, 1);
+}
+
 fn trampoline[T](ctx: *mut void) void {
     spawned = true;
     let s = @ptr_cast(*mut Start.[T], ctx);
     s.f(s.arg);
+    ended();
     mem.thread_exit();  // the thread's cached free memory goes back
 }
 
@@ -49,6 +76,7 @@ pub fn exit() void {
     if not spawned {
         return;
     }
+    ended();
     mem.thread_exit();
     ax_thread_exit();
 }
@@ -59,8 +87,10 @@ pub struct Thread[T] {
 
     /// Blocks until the thread has finished, then releases its resources.
     pub fn join(self: Self) void {
-        while @atomic_load(&self.start.exited) == 0 {
-            _ = @atomic_wait(&self.start.exited, 0, -1);
+        // (2: a joiner waits, for the hosts that notify only then; 1: done)
+        while @atomic_load(&self.start.exited) != 1 {
+            _ = @atomic_cas(&mut self.start.exited, 0, 2);
+            _ = @atomic_wait(&self.start.exited, 2, -1);
         }
         if self.start.stack.len > 0 {
             mem.free(self.start.stack);
@@ -70,7 +100,7 @@ pub struct Thread[T] {
 
     /// Whether the thread has finished (then join returns at once).
     pub fn is_finished(self: Self) bool {
-        return @atomic_load(&self.start.exited) != 0;
+        return @atomic_load(&self.start.exited) == 1;
     }
 }
 
@@ -93,8 +123,10 @@ pub fn spawn[T](f: fn(T) void, arg: T) ThreadError!Thread.[T] {
         @ptr_from_int(*mut usize, top).* = @int_from_ptr(stack.ptr);
     }
     s.* = Start.[T].{ f: f, arg: arg, exited: 0, stack: stack };
+    _ = @atomic_add(&mut live, 1);
     let id = ax_thread_spawn(trampoline.[T], @ptr_cast(*mut void, s), top, &mut s.exited);
     if id < 0 {
+        ended();
         if stack.len > 0 {
             mem.free(stack);
         }

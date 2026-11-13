@@ -25,7 +25,7 @@ void __axc_thrd_exit(long long __res);
 
 /* std/c/rt/threads.ax */
 thrd_t __axc_thrd_current(void);
-long long __axc_thrd_sleep(long long __ns);
+long long __axc_thrd_sleep(long long __ns, long long *__rem);
 void __axc_thrd_yield(void);
 long long __axc_mtx_init(mtx_t *__m, long long __type);
 long long __axc_mtx_lock(mtx_t *__m);

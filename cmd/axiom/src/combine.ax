@@ -1419,6 +1419,12 @@ fn narrowed(v: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
     return vnil();
 }
 
+// Are v's low `bits` bits all zero (v = z << k with k >= bits)?
+fn low_zero(v: *mut ir.Value, bits: i32) bool {
+    return ir.is_op(v, ir.OP_SHL) and ir.is_cint(v.b) and (ir.cint_val(v.b) >= @as(u64, @bit_cast(u32, bits))) and
+           (ir.cint_val(v.b) < @as(u64, @bit_cast(u32, v.ty.bits)));
+}
+
 // Is v, an integer, known to be below 2^bits?
 fn fits_unsigned(v: *mut ir.Value, bits: i32) bool {
     if bits >= 64 {
@@ -1432,6 +1438,10 @@ fn fits_unsigned(v: *mut ir.Value, bits: i32) bool {
     }
     if ir.is_op(v, ir.OP_AND) and ir.is_cint(v.b) {
         return fits_unsigned(v.b, bits);
+    }
+    if ir.is_op(v, ir.OP_LSHR) and ir.is_cint(v.b) and (ir.cint_val(v.b) < @as(u64, @bit_cast(u32, v.ty.bits))) {
+        // (the top k bits of x >> k are 0)
+        return (@as(u64, @bit_cast(u32, v.ty.bits)) - ir.cint_val(v.b)) <= @as(u64, @bit_cast(u32, bits));
     }
     if ir.is_op(v, ir.OP_INTR) {
         // a count of bits is at most the width (which needs 7 bits)
@@ -1475,6 +1485,13 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
              (ir.cint_val(a.b) < @as(u64, @bit_cast(u32, a.ty.bits))))) {
             return ir.zext(B, a, t);
         }
+        // sext (trunc (y >> k)) where the shift leaves the narrow type's top
+        // bit 0 (k > y's bits - the narrow bits): zext
+        if (op == ir.OP_SEXT) and ir.is_op(a, ir.OP_TRUNC) and ir.is_op(a.a, ir.OP_LSHR) and ir.is_cint(a.a.b) and
+           (ir.cint_val(a.a.b) < @as(u64, @bit_cast(u32, a.a.ty.bits))) and
+           (ir.cint_val(a.a.b) > @as(u64, @bit_cast(u32, a.a.ty.bits - a.ty.bits))) {
+            return ir.zext(B, a, t);
+        }
         if (op == ir.OP_SEXT) and (ir.is_op(a, ir.OP_SEXT) or ir.is_op(a, ir.OP_ZEXT)) {
             // sext (zext x) = zext x: the top bit is 0
             if a.op == ir.OP_ZEXT {
@@ -1483,10 +1500,35 @@ fn simplify_cast(B: *mut ir.Builder, i: *mut ir.Value) *mut ir.Value {
             i.a = a.a;
             return vnil();
         }
+        // zext (x <s 0) = x's sign bit: x >> (bits - 1) (in x's type, then
+        // to t: the value is 0 or 1 either way)
+        if (op == ir.OP_ZEXT) and ir.is_op(a, ir.OP_ICMP) and (ir.pred_of(a) == ir.IntSLT) and ir.is_zero(a.b) and
+           (a.b.kind != ir.V_INST) and (a.a.ty.kind == ir.T_INT) and (a.a.ty.bits <= 64) and (a.a.ty.bits > 1) {
+            let x = a.a;
+            let sb = ir.binop(B, ir.OP_LSHR, x, ir.cint(x.ty, @as(u64, @bit_cast(u32, x.ty.bits - 1))));
+            if x.ty == t {
+                return sb;
+            }
+            if x.ty.bits > t.bits {
+                return ir.trunc(B, sb, t);
+            }
+            return ir.zext(B, sb, t);
+        }
         if op == ir.OP_TRUNC {
             if ir.is_op(a, ir.OP_TRUNC) {
                 i.a = a.a;
                 return vnil();
+            }
+            // the low bits of x + y, x - y, x | y, x ^ y where y's low bits
+            // (as many as t has) are zeros (y = z << k, k >= t's bits) are
+            // x's: no carry or borrow comes out of them
+            if ir.is_op(a, ir.OP_ADD) or ir.is_op(a, ir.OP_SUB) or ir.is_op(a, ir.OP_OR) or ir.is_op(a, ir.OP_XOR) {
+                if low_zero(a.b, t.bits) {
+                    return ir.trunc(B, a.a, t);
+                }
+                if (a.op != ir.OP_SUB) and low_zero(a.a, t.bits) {
+                    return ir.trunc(B, a.b, t);
+                }
             }
             // the low bits of +, -, *, &, |, ^ depend only on the operands' low
             // bits: compute in the narrow type

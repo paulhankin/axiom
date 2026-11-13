@@ -1,12 +1,12 @@
 /* flags: --c-std=c17 */
 /* <stdatomic.h> (C11 7.17): the generic functions on an atomic int and on
-   a structure of 16 bytes (under the lock), the atomic_flag functions, the
+   a structure of 20 bytes (under the lock), the atomic_flag functions, the
    fences, ATOMIC_VAR_INIT and kill_dependency. */
 #include <stdatomic.h>
 #include "host.h"
 atomic_int n = ATOMIC_VAR_INIT(3);
 atomic_flag fl = ATOMIC_FLAG_INIT;
-struct S { int a[4]; };
+struct S { int a[5]; };  /* 20 bytes: under the lock on every target */
 _Atomic struct S big;
 int main(void) {
     int e = 3;

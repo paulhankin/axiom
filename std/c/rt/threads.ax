@@ -40,6 +40,14 @@ extern "C" {
     fn ax_syscall(n: isize, a: isize, b: isize, c: isize, d: isize, e: isize, f: isize) isize;
     fn sched_yield() i32;
     fn SwitchToThread() i32;
+    // thrd_sleep's on macOS (libSystem): -1 when a signal ended it
+    fn nanosleep(req: *Timespec, rem: *mut Timespec) i32;
+}
+
+// struct timespec of the system calls (Linux, macOS: 64-bit fields)
+struct Timespec {
+    sec: i64,
+    nsec: i64,
 }
 
 pub const SUCCESS: i64 = 0;
@@ -396,7 +404,11 @@ fn no_dtor(p: *mut void) void {
 }
 
 // the keys (keys_p[0..nkeys)), and their lock; the calling thread's
-// values (vals_p[0..nvals))
+// values (vals_p[0..nvals)). tss_get reads a key's generation without the
+// lock: the array, once published, is never given back (a larger one
+// replaces it, with the same keys: at most twice the largest's size is
+// kept), and tss_delete moves the generation on, so that a deleted key's
+// values are not seen (tss_get of it is null, tss_set of it an error).
 let mut keys_p: *mut Key = @ptr_from_int(*mut Key, 0);
 let mut nkeys: usize = 0;
 let mut keys_lock: u32 = 0;
@@ -430,13 +442,14 @@ export fn __axc_tss_create(key: *mut u64, dtor: fn(*mut void) void, has_dtor: i6
         }
         if nkeys > 0 {
             @mem_copy(nk[0..nkeys], keys());
-            mem.free(keys());
         }
-        keys_p = nk.ptr;
-        nkeys = n;
+        // (published for tss_get: the keys, then the count; the old array stays)
+        @atomic_store(@ptr_cast(*mut usize, &mut keys_p), @int_from_ptr(nk.ptr));
+        @atomic_store(&mut nkeys, n);
     }
     let g = keys()[k].gen +% 1;
-    keys()[k] = Key.{ dtor: dtor, has_dtor: has_dtor != 0, used: true, gen: g };
+    keys()[k] = Key.{ dtor: dtor, has_dtor: has_dtor != 0, used: true, gen: 0 };
+    @atomic_store(&mut keys()[k].gen, g);
     key.* = (@as(u64, g) << 32) | @as(u64, k);
     return SUCCESS;
 }
@@ -447,14 +460,25 @@ export fn __axc_tss_delete(key: u64) void {
     _ = acquire(&mut keys_lock, FOREVER);
     if (k < nkeys) and keys()[k].used and (keys()[k].gen == @truncate(u32, key >> 32)) {
         keys()[k].used = false;
+        @atomic_store(&mut keys()[k].gen, keys()[k].gen +% 1);
     }
     release(&mut keys_lock);
+}
+
+// Is key (created, perhaps deleted since) a key now? Without the lock (above).
+fn live(key: u64) bool {
+    let k = @int_cast(usize, key & 0xFFFF_FFFF);
+    if k >= @atomic_load(&nkeys) {
+        return false;
+    }
+    let p = @ptr_from_int(*mut Key, @atomic_load(@ptr_cast(*usize, &keys_p)));
+    return @atomic_load(&@ptr_add(p, k).*.gen) == @truncate(u32, key >> 32);
 }
 
 /// tss_get (7.26.6.4): the calling thread's value for key (null if none).
 export fn __axc_tss_get(key: u64) *mut void {
     let k = @int_cast(usize, key & 0xFFFF_FFFF);
-    if (k < nvals) and (vals()[k].gen == @truncate(u32, key >> 32)) {
+    if (k < nvals) and (vals()[k].gen == @truncate(u32, key >> 32)) and live(key) {
         return vals()[k].p;
     }
     return @ptr_from_int(*mut void, 0);
@@ -463,6 +487,9 @@ export fn __axc_tss_get(key: u64) *mut void {
 /// tss_set (7.26.6.5): sets the calling thread's value for key.
 export fn __axc_tss_set(key: u64, p: *mut void) i64 {
     let k = @int_cast(usize, key & 0xFFFF_FFFF);
+    if not live(key) {
+        return ERROR;
+    }
     if k >= nvals {
         let n = @max(@max(nvals * 2, k + 1), 8);
         let nv = mem.alloc.[Val](n) catch {
@@ -531,10 +558,38 @@ pub fn run_dtors() void {
 // thrd_sleep, thrd_yield
 // -----------------------------------------------------------------------------
 
-/// thrd_sleep (7.26.5.7): sleeps for ns nanoseconds; 0 (it is not ended
-/// early by a signal: the runtime's sleep resumes after one).
-export fn __axc_thrd_sleep(ns: i64) i64 {
+/// thrd_sleep (7.26.5.7): sleeps for ns nanoseconds; 0, or -1 when a
+/// signal handler ran and ended it early (Linux and macOS: their nanosleep),
+/// the time left then in *rem. Windows and WebAssembly have no signals that
+/// end it.
+export fn __axc_thrd_sleep(ns: i64, rem: *mut i64) i64 {
+    rem.* = 0;
     if ns <= 0 {
+        return 0;
+    }
+    if @target_os("linux") or @target_os("macos") {
+        let req = Timespec.{ sec: ns / 1_000_000_000, nsec: ns % 1_000_000_000 };
+        let mut left = Timespec.{ sec: 0, nsec: 0 };
+        let mut r: isize = 0;
+        if @target_os("linux") {
+            let mut n: isize = 35;  // nanosleep
+            if @target_arch("aarch64") {
+                n = 101;
+            }
+            r = ax_syscall(n, @bit_cast(isize, @int_from_ptr(&req)), @bit_cast(isize, @int_from_ptr(&mut left)), 0, 0,
+                           0, 0);
+            if r == -4 {
+                r = -1;  // (EINTR: a signal handler ran)
+            } else {
+                r = 0;
+            }
+        } else {
+            r = @as(isize, nanosleep(&req, &mut left));
+        }
+        if r == -1 {
+            rem.* = left.sec * 1_000_000_000 + left.nsec;
+            return -1;
+        }
         return 0;
     }
     ax_sleep_ns(@bit_cast(u64, ns));

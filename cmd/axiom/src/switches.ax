@@ -601,3 +601,251 @@ fn test_one(b: *mut ir.Block, c: Cl, lo: i64, hi: i64, els: *mut ir.Block) void 
         cur = next;
     }
 }
+
+// -----------------------------------------------------------------------------
+// Switches of constants as lookup tables
+// -----------------------------------------------------------------------------
+// A switch whose cases and default each only give a constant, either
+//
+//     case blocks that are `ret c` (the default too), or
+//     case blocks that are `br J` (or J itself) and J's phis take constants
+//     from them (the default's edge too),
+//
+// is a load from a table of the constants (one per phi) indexed by x - lo
+// (the default's constant where no case is, and out of the span; the cases
+// read as signed or as unsigned values, whichever spans fewer: an i8 switch
+// over 0..254 spans 255 unsigned, 256 signed): no
+// branches, which beat compares and jump tables alike when the value is
+// not predictable. A read-only global holds each table; the index is
+// clamped into it (a select) before the load, which is then always in
+// bounds, and a select gives the default outside (none where the span is
+// every value of the type: x - lo <u 2^bits would wrap). Taken for 3 cases or
+// more spanning at most 1024 values, at least a third of them cases, of
+// integer constants of at most 64 bits.
+// -----------------------------------------------------------------------------
+const LT_MIN: usize = 3;
+const LT_SPAN: i64 = 1024;
+let mut lt_count: i32 = 0;
+
+// The constant block b gives (its value when it is `ret c`), or nil.
+fn ret_const(b: *mut ir.Block) *mut ir.Value {
+    let i = b.first;
+    if u.isnil(i) or (i.op != ir.OP_RET) or u.isnil(i.a) or (i.xs.len != 0) or not ir.is_small_cint(i.a) {
+        return ir.vnil();
+    }
+    return i.a;
+}
+
+// Does b only jump to j?
+fn only_br(b: *mut ir.Block, j: *mut ir.Block) bool {
+    let i = b.first;
+    return u.notnil(i) and (i.op == ir.OP_BR) and (i.t1 == j);
+}
+
+/// The switches of f that give constants as table lookups (above); m gets
+/// the tables. True if any was.
+pub fn lookup_tables(m: *mut ir.Module, f: *mut ir.Func) bool {
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_SWITCH) and (t.cv != ir.SW_TABLE) and (t.a.ty.kind == ir.T_INT) and
+           (t.a.ty.bits >= 8) and (t.a.ty.bits <= 64) and not ir.is_const(t.a) and (t.xs.len >= LT_MIN) and
+           (f.ret_ext < ir.EXT_REGS) and not f.sret {
+            if table_one(m, f, b, t) {
+                any = true;
+            }
+        }
+        b = b.next;
+    }
+    if any {
+        ir.remove_unreachable(f);
+    }
+    return any;
+}
+
+// Case k's value, read as unsigned (below 64 bits) when uns.
+fn case_val(t: *ir.Value, k: usize, uns: bool) i64 {
+    let v = ir.sval(t.xs.get(k));
+    if uns and (t.a.ty.bits < 64) {
+        return v & @bit_cast(i64, (@as(u64, 1) << @int_cast(u32, t.a.ty.bits)) - 1);
+    }
+    return v;
+}
+
+fn table_one(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, t: *mut ir.Value) bool {
+    let n = t.xs.len;
+    let dflt = t.t1;
+    // the span: of the values read as signed, or as unsigned where that is
+    // shorter (both below 2^63 for less than 64 bits; 64 bits are signed)
+    let mut lo: i64 = 0x7fff_ffff_ffff_ffff;
+    let mut hi: i64 = 0 - 0x7fff_ffff_ffff_ffff - 1;
+    let mut ulo: i64 = 0x7fff_ffff_ffff_ffff;
+    let mut uhi: i64 = 0 - 0x7fff_ffff_ffff_ffff - 1;
+    for k in 0..n {
+        lo = @min(lo, case_val(t, k, false));
+        hi = @max(hi, case_val(t, k, false));
+        ulo = @min(ulo, case_val(t, k, true));
+        uhi = @max(uhi, case_val(t, k, true));
+    }
+    let uns = (t.a.ty.bits < 64) and ((uhi - ulo) < (hi - lo));
+    if uns {
+        lo = ulo;
+        hi = uhi;
+    }
+    if ((hi - lo) >= LT_SPAN) or ((hi - lo) < 0) or ((((hi - lo) + 1) / 3) > @int_cast(i64, n)) {
+        return false;
+    }
+    let span = @bit_cast(u64, (hi - lo) + 1);
+    // the form: returns of constants, or jumps to one block J
+    let mut j = ir.bnil();
+    let dc = ret_const(dflt);
+    let mut rets = u.notnil(dc);
+    if rets {
+        for k in 0..n {
+            if u.isnil(ret_const(ir.bs_of(t).get(k))) or (ret_const(ir.bs_of(t).get(k)).ty != dc.ty) {
+                rets = false;
+            }
+        }
+    }
+    if not rets {
+        // J: the default's target (dflt itself, or the block dflt only jumps to)
+        j = dflt;
+        if only_br(dflt, ir.terminator(dflt).t1) and (dflt.first == ir.terminator(dflt)) {
+            j = ir.terminator(dflt).t1;
+        }
+        if u.isnil(j.first) or (j.first.op != ir.OP_PHI) {
+            return false;
+        }
+        for k in 0..n {
+            let cb = ir.bs_of(t).get(k);
+            if (cb != j) and not only_br(cb, j) {
+                return false;
+            }
+        }
+        // every phi of J: an integer constant from each way in from the switch
+        let mut p = j.first;
+        while u.notnil(p) and (p.op == ir.OP_PHI) {
+            if (p.ty.kind != ir.T_INT) or (p.ty.bits > 64) {
+                return false;
+            }
+            for k in 0..n {
+                let cb = ir.bs_of(t).get(k);
+                let mut from = cb;
+                if cb == j {
+                    from = b;
+                }
+                let x = ir.incoming(p, from);
+                if u.isnil(x) or not ir.is_small_cint(x) {
+                    return false;
+                }
+            }
+            let mut from_d = dflt;
+            if dflt == j {
+                from_d = b;
+            }
+            let xd = ir.incoming(p, from_d);
+            if u.isnil(xd) or not ir.is_small_cint(xd) {
+                return false;
+            }
+            p = p.next;
+        }
+        // (a case to J directly, or the default: J's phis take b's input
+        // for it, which given() reads)
+    }
+    // the tables and the lookup at the end of b
+    let bld = ir.new_builder();
+    ir.at_before(bld, t);
+    let x = t.a;
+    let isz = ir.isz();
+    let idx = ir.sub(bld, x, ir.cint(x.ty, @bit_cast(u64, lo)));
+    let mut wide = idx;
+    if x.ty.bits < isz.bits {
+        wide = ir.cast(bld, ir.OP_ZEXT, idx, isz);
+    } else if x.ty.bits > isz.bits {
+        wide = ir.trunc(bld, idx, isz);
+    }
+    let mut inr = ir.cint(ir.t_int(1), 1);
+    if (x.ty.bits >= 64) or (span < (@as(u64, 1) << @int_cast(u32, x.ty.bits))) {
+        inr = ir.icmp(bld, ir.IntULT, idx, ir.cint(x.ty, span));
+    }
+    let at = ir.select(bld, inr, wide, ir.cint(isz, 0));
+    if rets {
+        let v = lookup(m, bld, t, dflt, at, inr, lo, uns, span, dc.ty, ir.vnil(), ir.bnil(), b);
+        ir.remove_inst(t);
+        ir.at_end(bld, b);
+        ir.ret(bld, v);
+        return true;
+    }
+    let mut vals = u.List.[*mut ir.Value].empty();
+    let mut p = j.first;
+    while u.notnil(p) and (p.op == ir.OP_PHI) {
+        vals.push(lookup(m, bld, t, dflt, at, inr, lo, uns, span, p.ty, p, j, b));
+        p = p.next;
+    }
+    ir.remove_inst(t);
+    ir.at_end(bld, b);
+    ir.br(bld, j);
+    // J's phis: b's input is the lookup (the case blocks no longer come from b)
+    let mut q = j.first;
+    let mut k: usize = 0;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        let mut found = false;
+        for e in 0..ir.bs_of(q).len {
+            if ir.bs_of(q).get(e) == b {
+                q.xs.set(e, vals.get(k));
+                found = true;
+            }
+        }
+        if not found {
+            ir.add_incoming(q, vals.get(k), b);
+        }
+        k += 1;
+        q = q.next;
+    }
+    vals.deinit();
+    return true;
+}
+
+// The value of the table of the constants a switch gives (returns, or phi
+// p's inputs at J), looked up at `at` (in the span when inr), the default's
+// outside: made by bld before the switch.
+fn lookup(m: *mut ir.Module, bld: *mut ir.Builder, t: *mut ir.Value, dflt: *mut ir.Block, at: *mut ir.Value,
+          inr: *mut ir.Value, lo: i64, uns: bool, span: u64, et: *mut ir.Ty, p: *mut ir.Value, j: *mut ir.Block,
+          b: *mut ir.Block) *mut ir.Value {
+    let d = given(t, dflt, p, j, b);
+    let xs = u.newn.[*mut ir.Value](@truncate(usize, span) + 1);
+    for k in @as(u64, 0)..span {
+        xs[@truncate(usize, k)] = d;
+    }
+    // (the first of repeated values counts, as the switch tests them)
+    let n = t.xs.len;
+    let mut k = n;
+    while k > 0 {
+        k -= 1;
+        let off = @bit_cast(u64, case_val(t, k, uns) - lo);
+        xs[@truncate(usize, off)] = given(t, ir.bs_of(t).get(k), p, j, b);
+    }
+    let at_ty = ir.t_array(et, span);
+    lt_count += 1;
+    let g = ir.add_global(m, at_ty, u.f1("switch.table.%s", u.idec(lt_count)));
+    g.init = ir.carray(et, xs[0..@truncate(usize, span)]);
+    g.is_const = true;
+    g.linkage = ir.LINK_INTERNAL;
+    let v = ir.load(bld, et, ir.ptradd(bld, g.val, ir.mul(bld, at, ir.cint(ir.isz(), et.size))));
+    v.align = @truncate(u32, et.size);
+    return ir.select(bld, inr, v, d);
+}
+
+// The constant the switch gives going to block cb (a return's, or phi p's
+// input on the way to J).
+fn given(t: *ir.Value, cb: *mut ir.Block, p: *mut ir.Value, j: *mut ir.Block, b: *mut ir.Block) *mut ir.Value {
+    _ = t;
+    if u.isnil(p) {
+        return ret_const(cb);
+    }
+    if cb == j {
+        return ir.incoming(p, b);
+    }
+    return ir.incoming(p, cb);
+}

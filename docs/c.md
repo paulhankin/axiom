@@ -1311,14 +1311,14 @@ format than the ABI's cannot pass `long double` values to it.
 | Enumerations | The type is `unsigned int` if no enumerator is negative, else `int`, when all fit; the enumeration constants are `int`. In C23, if some enumerator does not fit `int`, the first of `long`, `long long` (`unsigned long`, `unsigned long long` for an unsigned type) that holds all of them, and then the constants have the enumerated type. Before C23 a value outside `int` is `C3013`. With a fixed underlying type (C23), that type. |
 | `_BitInt(N)` | `BITINT_MAXWIDTH` is 65535. For N up to 64 an object is stored in the smallest of 8, 16, 32 or 64 bits that holds N (aligned as that integer type, as the x86-64 and AArch64 ABIs specify), extended to it; as an argument or result it is that integer. Wider, it is stored in 64-bit limbs, the least significant first, as many as hold N, aligned to 8 (the x86-64 System V psABI's and Windows' array of 8-byte chunks; WebAssembly the same), or on AArch64 (Linux and macOS) in 16-byte units aligned to 16 (AAPCS64: `_BitInt(65)` to `_BitInt(128)` as `__int128`): `sizeof(_BitInt(129))` is 24, 32 on AArch64. The value is sign- or zero-extended through its storage; the bits beyond N that arrive (arguments, results, and objects in memory, which code compiled elsewhere writes) are not relied on: the ABIs leave them unspecified. |
 | `__int128` | GNU dialects: `__int128` and `unsigned __int128` are 16 bytes aligned to 16 on every target, an extended integer type whose rank is above `long long` and above `_BitInt(128)`'s, below `_BitInt(129)`'s. `__AXIOM_INT128__` is defined (1). `intmax_t` stays 64 bits (C23 7.22.1.5 lets an extended type be wider), and so does the preprocessor's arithmetic. |
-| Integers wider than 64 bits | `__int128` and `_BitInt(N)` for N > 64. Their arithmetic is exact to the type's width: two-limb values (up to 128 bits) inline (+ and - as add/adc and sub/sbb on x86-64, adds/adc and subs/sbc on AArch64, * with the 64-by-64-bit product's high half, shifts, comparisons, the bitwise operations; / and % inline when both operands are below 2^64, else a function: on x86-64 one generated into the program that uses the 128-by-64-bit `div`, elsewhere a run-time function), wider ones by the functions of `std/c/rt/wideint.ax` (generated into a program only when it calls them); division is Knuth's Algorithm D. Constant expressions are folded with the same functions, in the type's precision. Conversions to `float` and `double` are correctly rounded (to nearest, ties to even), as are those to a wide `long double` (`std/c/rt/ldouble.ax`); from them they truncate toward zero and saturate (undefined when the value does not fit, 6.3.1.4). A signed result that overflows wraps, as for the narrower types (undefined: a program must not rely on it), but in a constant expression it is `C3036`. Bit-fields of these types are laid out as the ABIs say: in a unit of the type's size aligned as the type is, the last such window at or before the next free bit that holds it, else the next (System V, and for `__int128` AAPCS64; checked against the system's compilers on x86-64 and, for `__int128`, AArch64 Linux), on Windows in its runs of units of the type's size at its alignment; in a packed structure one that no 8-byte unit holds is `C3901`. Not supported (`C3901`): an enumeration whose underlying type is `__int128` (one that is a `_BitInt` is `C3075`, C23 6.7.2.2p5), case ranges in a `switch` on them; an integer constant expression where a value of at most 64 bits is needed (an alignment, a bit-field's width, an array's length: `C3009`) whose value is wider is `C3212`. `<stdbit.h>`'s type-generic functions take `unsigned __int128` and the unsigned `_BitInt` types (C23 7.18.1p4: those whose width is a standard or extended type's; here any above 64 bits too), `<stdckdint.h>`'s and the GNU `__builtin_*_overflow` functions any of them. An `_Atomic` one is accessed under the lock (not lock-free: 16 bytes or more); the GNU `__atomic` builtins' generic forms take them, the others only objects of 1, 2, 4 or 8 bytes. `printf` and `scanf` have no conversion for them: C23's `%wN` length modifiers are for the widths of the `intN_t` types `<stdint.h>` defines, which stop at 64. `intmax_t` and `uintmax_t` stay 64 bits on every target (C23 7.22.1.5 lets an extended or bit-precise type be wider), as do `INTMAX_WIDTH`, `%jd` and the preprocessor's arithmetic, in which a `wb` constant wider than 64 bits is `C1016`. |
+| Integers wider than 64 bits | `__int128` and `_BitInt(N)` for N > 64. Their arithmetic is exact to the type's width: two-limb values (up to 128 bits) inline (+ and - as add/adc and sub/sbb on x86-64, adds/adc and subs/sbc on AArch64, * with the 64-by-64-bit product's high half, shifts, comparisons, the bitwise operations; / and % inline when both operands are below 2^64, else a function: on x86-64 one generated into the program that uses the 128-by-64-bit `div`, elsewhere a run-time function), wider ones by the functions of `std/c/rt/wideint.ax` (generated into a program only when it calls them); division is Knuth's Algorithm D. Constant expressions are folded with the same functions, in the type's precision. Conversions to `float` and `double` are correctly rounded (to nearest, ties to even), as are those to a wide `long double` (`std/c/rt/ldouble.ax`); from them they truncate toward zero and saturate (undefined when the value does not fit, 6.3.1.4). A signed result that overflows wraps, as for the narrower types (undefined: a program must not rely on it), but in a constant expression it is `C3036`. Bit-fields of these types are laid out as the ABIs say: in a unit of the type's size aligned as the type is, the last such window at or before the next free bit that holds it, else the next (System V, and for `__int128` AAPCS64; checked against the system's compilers on x86-64 and, for `__int128`, AArch64 Linux), on Windows in its runs of units of the type's size at its alignment; in a packed structure one that no 8-byte unit holds is `C3901`. Not supported (`C3901`): an enumeration whose underlying type is `__int128` (one that is a `_BitInt` is `C3075`, C23 6.7.2.2p5), case ranges in a `switch` on them; an integer constant expression where a value of at most 64 bits is needed (an alignment, a bit-field's width, an array's length: `C3009`) whose value is wider is `C3212`. `<stdbit.h>`'s type-generic functions take `unsigned __int128` and the unsigned `_BitInt` types (C23 7.18.1p4: those whose width is a standard or extended type's; here any above 64 bits too), `<stdckdint.h>`'s and the GNU `__builtin_*_overflow` functions any of them. An `_Atomic` one of 16 bytes is lock-free where 16-byte atomics are ("Atomics and threads"), a wider one under the lock; the GNU `__atomic` builtins' generic forms take them, the others only objects of 1, 2, 4 or 8 bytes. `printf` and `scanf` have no conversion for them: C23's `%wN` length modifiers are for the widths of the `intN_t` types `<stdint.h>` defines, which stop at 64. `intmax_t` and `uintmax_t` stay 64 bits on every target (C23 7.22.1.5 lets an extended or bit-precise type be wider), as do `INTMAX_WIDTH`, `%jd` and the preprocessor's arithmetic, in which a `wb` constant wider than 64 bits is `C1016`. |
 | Null pointer | All bits zero. |
 | Source and execution character sets | UTF-8. Narrow string literals are UTF-8 bytes (invalid UTF-8 in a literal is `C1024`). `L"..."` is UTF-16 on Windows (`wchar_t` is 16 bits) and UTF-32 elsewhere; `u"..."` is UTF-16 and `U"..."` UTF-32. |
 | Multi-character constants | `'ab'` is `'a' * 256 + 'b'` as an `int` of the build's width (the first character is the most significant); a warning, `C4102`. A wide one has the value of its last character. More characters than the type holds is `C1011`. |
 | `main` | `int main(void)` and `int main(int, char **)` only (`C3061`). Reaching the end of `main` returns 0, in every mode. |
 | Inline functions | An inline definition (6.7.4p7) is compiled with internal linkage, for the unit's own calls: the external function is another unit's. |
 | `volatile` | Accesses are marked volatile for the optimizer. |
-| `restrict` | Accepted; the code generator does not use it. |
+| `restrict` | A pointer parameter's tells the optimizer what it reaches is not reached otherwise ("Optimization"); others are accepted and have no effect. |
 
 ### Translation limits
 
@@ -1354,7 +1354,7 @@ library's are `C1081`.
 | `<fenv.h>` | C99 and later | All of C17 7.6; C23's `fegetmode`, `fesetmode`, `fesetexcept`, `fetestexceptflag`. |
 | `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. Decimal arguments choose the `d32`, `d64` and `d128` functions (C23 7.27p3); arguments of the interchange and extended types (Annex H.11) their common real type's: `_Float16`'s and `_Float128`'s `f16` and `f128` functions (declared with `__STDC_WANT_IEC_60559_TYPES_EXT__`; without it float's function for `_Float16`), and for `_Float32`, `_Float64` and `_Float32x` the standard function of their format, whose result has the standard type. |
 | `<stdalign.h>` | C11 and later | |
-| `<stdatomic.h>` | C11 and later | All of 7.17 (see "Atomics and threads"). `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
+| `<stdatomic.h>` | C11 and later | All of 7.17 (see "Atomics and threads"), with memory orders. `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
 | `<stdnoreturn.h>` | C11 and later | |
 | `<stdbit.h>` | C23 | The `stdc_` functions as `static inline` functions and type-generic macros. |
 | `<stdckdint.h>` | C23 | `ckd_add`, `ckd_sub`, `ckd_mul`. |
@@ -1787,13 +1787,14 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__builtin_inf`, `huge_val`, `nan("")`, `nans("")` (with `f`, `l`, `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` and `q`) | Constants (a NaN's payload is not kept; a signaling NaN is quiet; a NaN is positive). |
 | `__builtin_isnan`, `isinf`, `isfinite`, `isnormal`, `signbit`, `isinf_sign`, `fpclassify(a, b, c, d, e, x)`, `isgreater`, `isgreaterequal`, `isless`, `islessequal`, `islessgreater`, `isunordered` | Of the floating type of the operands (an integer is a double). |
 | `__sync_fetch_and_op`, `__sync_op_and_fetch` (op: add, sub, or, and, xor, nand), `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, `__sync_lock_release`, `__sync_synchronize` | Atomic, sequentially consistent. |
-| `__atomic_load_n`, `store_n`, `exchange_n`, `compare_exchange_n`, `fetch_op`, `op_fetch`, `test_and_set`, `clear`, `thread_fence`, `signal_fence`, the generic `load`, `store`, `exchange`, `compare_exchange`, `always_lock_free`, `is_lock_free` | Every memory order is taken as `__ATOMIC_SEQ_CST` (a stronger order is a valid one). |
+| `__atomic_load_n`, `store_n`, `exchange_n`, `compare_exchange_n`, `fetch_op`, `op_fetch`, `test_and_set`, `clear`, `thread_fence`, `signal_fence`, the generic `load`, `store`, `exchange`, `compare_exchange`, `always_lock_free`, `is_lock_free` | A constant memory order (`__ATOMIC_RELAXED` ... `__ATOMIC_SEQ_CST`, hint bits above the low 16 ignored) is the operation's, as for C11's atomics; another is `__ATOMIC_SEQ_CST`. The weak argument of `compare_exchange` makes the weak form when it is a nonzero constant. `__sync_lock_test_and_set` is an acquire, `__sync_lock_release` a release. |
 
 The atomic builtins take a pointer to an integer or pointer type of 1, 2, 4 or 8 bytes,
 aligned to its size (the generic ones: to any complete object), and are the operations
 of C11's atomics (see "Atomics and threads"; nand is a compare-and-swap loop): lock-free
-on objects of 1, 2, 4 and 8 bytes on every target, and for other sizes (the generic
-forms) under the same table of locks as `_Atomic` objects, so the two agree.
+on objects of 1, 2, 4 and 8 bytes on every target, of 16 aligned to 16 where `_Atomic`
+ones are, and for other sizes (the generic forms) under the same table of locks as
+`_Atomic` objects, so the two agree.
 
 ## Pragmas
 
@@ -1863,12 +1864,16 @@ defined: `C3062` (reported by `build`).
 
 ## Atomics and threads
 
-`_Atomic` qualifies a type, and `_Atomic(T)` names the same atomic type. An atomic type
-has the size of its non-atomic version; one of 1, 2, 4, 8 or 16 bytes is aligned to its
-size (so `_Atomic struct { char c[2]; }` is aligned to 2), any other keeps its
-alignment, on every target: the rule of the x86-64 and AArch64 psABIs, so atomic
-objects are laid out as the platform's C compilers lay them out (checked against them on
-Linux). An atomic type cannot be an array or function type (`C3092`), `_Atomic(T)`
+`_Atomic` qualifies a type, and `_Atomic(T)` names the same atomic type. Its layout is the
+platform's C compilers' (checked against them: `c/run/atomic_layout_<target>.c`): on
+Linux (x86-64 and AArch64, the psABIs' rule) an atomic type has the size of its
+non-atomic version, and one of 1, 2, 4, 8 or 16 bytes is aligned to its size (so
+`_Atomic struct { char c[2]; }` is aligned to 2); on macOS and Windows a size up to 16
+bytes is also padded to the next of those sizes and aligned to it
+(`_Atomic(struct of 12 bytes)` is 16 bytes aligned to 16, one of 3 bytes is 4), and on
+WebAssembly the same up to 8 bytes (16 bytes keep their alignment); any other keeps its
+size and alignment. The padding of an atomic object is zeros, which every operation
+here writes. An atomic type cannot be an array or function type (`C3092`), `_Atomic(T)`
 cannot be of an array, function, atomic or qualified type (`C3092`), and a bit-field
 cannot be atomic (implementation-defined, 6.7.2.1p5: `C3070`). An atomic type is not a
 qualified version of its non-atomic type: `int *` and `_Atomic int *` are incompatible
@@ -1878,28 +1883,90 @@ member of an atomic structure or union accessed (undefined) is the warning `C409
 
 Reading an atomic object (its value used), assigning it, `++`, `--` and the compound
 assignments are atomic operations (6.5.2.4, 6.5.16.2), all sequentially consistent.
-`+=`, `-=`, `&=`, `|=`, `^=`, `++` and `--` on an atomic integer or pointer are one
-read-modify-write instruction; the others (`*=`, `/=`, shifts, floating types, `_Bool`)
-are a loop of compare-exchanges that computes the new value again if another thread
-changed the object meanwhile. There is no floating-point environment, so the loop has no
-exceptions to discard (6.5.16.2p3, note).
+`+=`, `-=`, `&=`, `|=`, `^=`, `++` and `--` on an atomic integer or pointer of up to 8
+bytes are one read-modify-write instruction; the others (`*=`, `/=`, shifts, floating
+types, `_Bool`, 16-byte integers) are a loop of compare-exchanges that computes the new
+value again if another thread changed the object meanwhile. There is no floating-point
+environment, so the loop has no exceptions to discard (6.5.16.2p3, note).
 
-Objects of 1, 2, 4 and 8 bytes (every integer type and pointer) are lock-free: x86-64's
-locked instructions, AArch64's exclusive or LSE instructions, WebAssembly's atomic
-instructions. Others (a structure of 3 or of 16 bytes, a `double _Complex`) take one of 64 spinlocks, chosen
-by the object's address, in a table that every module and object holding such code
-defines once (linkonce). A signal handler must not touch such an object while the
-interrupted thread may hold its lock, and the platform C compilers' code uses its own
-library's locks for them: an object of this kind is atomic only among code compiled here.
+**Memory orders.** The functions of `<stdatomic.h>` (and the GNU dialects' `__atomic`
+builtins) have the order they are given when it is a constant: the compiler's IR carries
+it, and the backends choose instructions by the C11 mappings. On x86-64 a store that is
+not sequentially consistent is a plain `mov` (a sequentially consistent one `xchg`),
+loads are plain `mov`s, read-modify-writes are locked instructions, and only a
+sequentially consistent fence is `mfence`. On AArch64 a relaxed load or store is `LDR`
+or `STR`, an acquire load `LDAR` (`LDAPR` where the target has RCpc: `--cpu=neoverse-n1`
+and later), a sequentially consistent one `LDAR`, a release or stronger store `STLR`; a
+read-modify-write's exclusive pair (`LDXR`/`LDAXR`, `STXR`/`STLXR`) or LSE instruction
+(`LDADD`, `LDADDA`, `LDADDL`, `LDADDAL`, `SWP`..., `CAS`...) has the acquire and release
+forms its order needs; an acquire fence is `DMB ISHLD`, a release, acq_rel or
+sequentially consistent one `DMB ISH`. A compare-exchange's instruction is as strong as
+both its orders. WebAssembly's atomic instructions are all sequentially consistent.
+`memory_order_consume` is `memory_order_acquire`; an order that is not a constant (a
+variable) is `memory_order_seq_cst`; a relaxed fence is nothing. `atomic_signal_fence`
+is no instruction, but a barrier to the compiler (nothing is moved across it). The
+optimizer treats every atomic operation and fence, whatever its order, as a sequentially
+consistent one: it does not remove, merge or move memory accesses across any of them
+(valid for every order, since a weaker one only allows more behaviours; it forgoes the
+optimizations relaxed atomics would allow). An order that an operation does not take is
+the warning `C4092`, and the operation is made at least as strong as asked: a store's
+consume, acquire or acq_rel (7.17.7.1p2), a load's release or acq_rel (7.17.7.2p2), a
+compare-exchange's failure order of release or acq_rel, and before C23 (and always for
+the `__atomic` builtins) a failure order stronger than the success order (7.17.7.4p2),
+and a value that is no order. `atomic_compare_exchange_weak` fails spuriously only on
+AArch64 without LSE (one exclusive attempt, no loop: it returns false when the
+exclusive store fails); elsewhere it is the strong form. Axiom's own atomics
+(`@atomic_load` ...) have no orders (spec §12.8.3: sequentially consistent only).
+
+**Lock-free sizes.** Objects of 1, 2, 4 and 8 bytes (every integer type and pointer) are
+lock-free on every target: x86-64's locked instructions, AArch64's exclusive or LSE
+instructions, WebAssembly's atomic instructions. Objects of 16 bytes aligned to 16 (a
+structure of two `long long`, `__int128`, an 80-bit or 128-bit `long double`, `double
+_Complex`) are lock-free on AArch64 (an exclusive pair `LDAXP`/`STLXP` loop; a load
+stores back what it read, which makes the read single-copy atomic; LSE's `CASP` is not
+used) and on x86-64 (`lock cmpxchg16b`): inline when the target's extensions have it
+(`--cpu=x86-64-v2` and later, or `--features=+cmpxchg16b`); otherwise through a function
+that asks the processor once (cpuid) and uses the instruction, or the lock where the
+processor lacks it, so `atomic_is_lock_free` of such an object asks the processor (and
+`__atomic_always_lock_free(16, 0)` is 0, `__atomic_is_lock_free(16, 0)` 0 too: they are
+constants). Every 16-byte operation is a compare-exchange of 16 bytes or a loop of them,
+so an atomic load writes the object (one in read-only memory faults). Other objects (a
+structure of 3 bytes on Linux, or of 24) take one of 64 spinlocks, chosen by the
+object's address, in a table that every module and object holding such code defines
+once (linkonce). A signal handler must not touch such an object while the interrupted
+thread may hold its lock. `ATOMIC_*_LOCK_FREE` are 2 (the types they name are 8 bytes at
+most).
+
+**Code from the platform's compilers.** It does atomic operations on objects that are not
+lock-free by calls of the standard out-of-line interface: `void __atomic_load(size_t n,
+void *p, void *ret, int order)`, `__atomic_store(n, p, val, order)`,
+`__atomic_exchange(n, p, val, ret, order)`, `bool __atomic_compare_exchange(n, p,
+expected, desired, success, failure)`. When such code may be linked into the program
+(`--emit=obj`, or any `--link=` input or `-l` library, which the system's linker or ours
+links),
+this compiler's code calls them too for such objects, and defines them (weak, global: in
+every object that calls them) over its lock table; they route sizes of 1, 2, 4, 8 and 16
+bytes at addresses aligned to the size to the lock-free operations, as this compiler's
+code does them. So both sides take the same lock: the program's definitions come before
+the system's atomic library, which the program then does not need (and if an object of
+ours is linked with that library and without our definitions, all calls go to the
+library's). Of the sized forms, the 16-byte ones (`__atomic_load_16`,
+`__atomic_compare_exchange_16`, `__atomic_fetch_add_16` and the other read-modify-writes)
+are defined too in an executable linked with such code on the System V x86-64 and AAPCS64
+targets, over the same 16-byte compare-exchange as this compiler's code, so that both
+sides' operations on a 16-byte object are atomic with each other (Windows passes
+`__int128` otherwise: not there); the smaller sizes are lock-free on both sides, which
+share nothing but the object. The objects of every type are covered: the decimal floating
+types, `_Float128` and the other `_FloatN` types, imaginary and vector types are accessed
+as any other object of their size (lock-free at 1, 2, 4, 8 or 16 bytes aligned so). An
+executable that only this compiler's code makes uses the lock directly.
 
 `<stdatomic.h>` has all of 7.17. Its generic functions are the compiler's builtins
-(`__builtin_atomic_load` and the others); atomic_flag's functions and the fences are
-`static inline` functions in the header. Every `memory_order` is made sequentially
-consistent, which is a valid implementation of each; `atomic_compare_exchange_weak` is
-the strong form (it never fails spuriously); `atomic_signal_fence` is a full fence. The
-`ATOMIC_*_LOCK_FREE` macros are 2 and `atomic_is_lock_free` says what the size gives.
-On WebAssembly without the atomics feature (`--features=-atomics`) a module has one
-thread, and the operations are ordinary loads and stores.
+(`__builtin_atomic_load`, `__builtin_atomic_compare_exchange_weak` and the others);
+atomic_flag's functions and the fences are `static inline` functions in the header and
+also macros of the same names (so that a constant order stays one). On WebAssembly
+without the atomics feature (`--features=-atomics`) a module has one thread, and the
+operations are ordinary loads and stores.
 
 `_Thread_local` (C23: `thread_local`) objects have one instance per thread, each starting
 with the object's initial value (which may hold addresses). On Linux they are ELF TLS
@@ -1947,7 +2014,8 @@ main ones:
   recorded (another thread may `thrd_join` it), then it waits until every thread
   `thrd_create` started has ended, joined or detached, and calls `exit(EXIT_SUCCESS)`
   (the `atexit` functions run then, on the main thread). The main thread does not end
-  before the others (threads that Axiom code started are not waited for).
+  before the others; threads that Axiom code started (`std/thread.spawn`) are waited
+  for too (`std/thread.wait_all`).
 - **`exit` from any thread**: the first thread to call it runs the `atexit` functions
   (once), the destructors and the flushing, and ends the process with its status; a
   second thread's `exit` meanwhile waits for the end. The end is at once, whatever the
@@ -1962,15 +2030,28 @@ main ones:
 - **Time**: the deadlines of `mtx_timedlock` and `cnd_timedwait` are `TIME_UTC` (the
   real-time clock) times, checked against it after each wake; one that has passed is a
   timeout at once; a `timespec` whose `tv_nsec` is outside 0..999999999 is `thrd_error`.
-  `thrd_sleep` returns 0 (no signal ends it early; it never stores the remaining time)
-  or -2 for a negative or invalid duration; `thrd_yield` is `sched_yield`
-  (`SwitchToThread` on Windows; on WebAssembly a sleep of no time).
+  `thrd_sleep` returns 0, or on Linux and macOS -1 when a signal handler ran and ended
+  it early, storing the time left in `*remaining` (if not null), or -2 for a negative or
+  invalid duration (Windows and WebAssembly have no signals that end it); `thrd_yield`
+  is `sched_yield` (`SwitchToThread` on Windows; on WebAssembly a sleep of no time).
 - **Thread-specific storage**: any number of keys; a key reused after `tss_delete` does
   not see the values of the deleted one. At a thread's end, for each key with a
   destructor whose value is not null, in the order of the keys, the value is set to null
   and the destructor called with it; again while the destructors set values, at most
   `TSS_DTOR_ITERATIONS` (4) rounds. They do not run at `exit` or `main`'s return
-  (7.26.6.1). A key must not be used after `tss_delete` (7.26.6.3).
+  (7.26.6.1). A key used after `tss_delete` (undefined, 7.26.6.3) is defined here:
+  `tss_get` gives null and `tss_set` `thrd_error`, in every thread.
+- **Stacks**: a thread of `thrd_create` has 8 MiB of stack on Linux (the runtime's own
+  threads: below it a guard region of 64 KiB that is never mapped, and a signal stack
+  of its own for the report of a stack overflow; with the system C library linked, its
+  threads' default stack and guard), macOS (8 MiB, `pthread_attr_setstacksize`; the
+  system's guard page) and Windows (8 MiB reserved); on WebAssembly 1 MiB of the
+  memory, which the compiler's stack checks guard. There is no option to change it.
+  Ended threads' stacks are kept for the next ones (up to four, Linux), so that a
+  thread's start and end take no system calls but its creation's and the waits'.
+- **Mutexes** are not fair (a thread that unlocks may take the mutex again before a
+  waiter woken for it) and not robust (one that a thread holds when it ends stays
+  locked; there is no owner-death detection); a recursive one counts its owner's locks.
 - **Without threads**: on WebAssembly without the atomics extension (`--features=-atomics`)
   `thrd_create` returns `thrd_error`, `thrd_join` and `thrd_detach` too
   (`threads_spawn_none.ax` is linked instead), and the rest works on the one thread. A
@@ -1997,7 +2078,8 @@ Measured on x86-64 Linux against the system's C library and its threads (at -O2,
 loaded machine, best of five runs): an uncontended `mtx_lock` and `mtx_unlock` take
 about 0.25 times its time in a program that has not started a thread and about 1.1
 times once one has; a `thrd_create` and `thrd_join` of a thread that returns at once,
-about 1.8 times.
+about the same processor time (0.97 times, down from 1.8: cached stacks, and wake-ups
+only when a thread waits).
 
 ## Calling conventions and interoperability
 
@@ -2268,7 +2350,12 @@ line tables (above).
 
 `-O0` (the default) to `-O3` are the compiler's: C goes through the same passes as Axiom
 code (README of `cmd/axiom/`, "Optimization"). All the units of a program are one module,
-so `-O2` and `-O3` inline across them. The levels do not change the behavior of a
+so `-O2` and `-O3` inline across them. A `restrict`-qualified pointer parameter (passed in
+a register) tells the optimizer that what it reaches is not reached through another
+parameter, a global or a local object while the function runs (6.7.3.1): loads move out
+of loops past stores through it, and copy and vector loops need no overlap check. A
+pointer loaded from memory may hold its value, and is not taken as apart from it. Type-based
+aliasing is not used (an `int *` and a `float *` may reach the same bytes). The levels do not change the behavior of a
 program that has no undefined behavior; they differ in speed and size, and in how
 complete a stack trace is after a crash.
 
@@ -2301,8 +2388,7 @@ claims less than the standard allows. None is hidden: each is said above or here
   types); `fprintf`'s decimal conversions round half to even, as its binary ones
   do; on WebAssembly their exceptions are not recorded (no flags there, as for binary);
   a NaN's n-char-sequence in `strtod64` and `fscanf` is read and ignored.
-- `restrict` has no effect on the generated code; `#pragma STDC FENV_ACCESS ON` is not
-  honoured (C4113).
+- `#pragma STDC FENV_ACCESS ON` is not honoured (C4113).
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;
   a program must not rely on it.
 - Annex H is not claimed (`__STDC_IEC_60559_TYPES__` is not defined): it needs Annex F.

@@ -20,7 +20,9 @@
 //   __builtin_atomic_store(obj, v, order)         atomic_store_explicit
 //   __builtin_atomic_exchange(obj, v, order)      atomic_exchange_explicit
 //   __builtin_atomic_compare_exchange(obj, expected, desired, success, failure)
-//                                                 ..._strong_explicit and _weak_explicit
+//                                                 ..._strong_explicit
+//   __builtin_atomic_compare_exchange_weak(obj, expected, desired, success, failure)
+//                                                 ..._weak_explicit
 //   __builtin_atomic_fetch_add(obj, v, order) ... _sub, _or, _xor, _and
 //   __builtin_atomic_is_lock_free(obj)            atomic_is_lock_free
 //   __builtin_atomic_thread_fence(order)          atomic_thread_fence
@@ -29,9 +31,13 @@
 // obj is a pointer to an atomic type A, whose non-atomic version is C; a
 // value v is converted to C as by assignment (for fetch_add and fetch_sub
 // on an atomic pointer, to ptrdiff_t: the operand counts elements, as in
-// pointer arithmetic). A memory order is any integer expression (its value
-// is not used: every operation is sequentially consistent, which every
-// order allows).
+// pointer arithmetic). A memory order is any integer expression; a
+// constant one is the operation's order (cgen_atomic.ax: order_of), and one
+// the operation does not take is the warning C4092 (7.17.7.1p2: a store's
+// is not consume, acquire or acq_rel; 7.17.7.2p2: a load's not release or
+// acq_rel; 7.17.7.4p2: a compare-exchange's failure order not release or
+// acq_rel, and before C23 no stronger than its success order; a value
+// that is no memory_order). Any other is sequentially consistent.
 //
 // Diagnostics:
 //   C3092  an invalid atomic type: _Atomic on an array or function type,
@@ -40,9 +46,12 @@
 //   C4090  a member of an object of atomic type accessed (undefined, 6.5.2.3p5)
 //   C4091  a pointer to an atomic type converted to a pointer to void
 //          without the _Atomic qualifier (csema_expr.ax: assign_convert)
+//   C4092  a memory order the operation does not take (above; also the
+//          GNU dialects' __atomic builtins: csema_gbuiltin.ax)
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "copts.ax" as co;
 import "csema.ax" as cs;
 import "csema_expr.ax" as cx;
 import "ctypes.ax" as cty;
@@ -63,17 +72,20 @@ pub const BI_ATOMIC_FETCH_AND: i32 = 69;
 pub const BI_ATOMIC_IS_LOCK_FREE: i32 = 70;
 pub const BI_ATOMIC_THREAD_FENCE: i32 = 71;
 pub const BI_ATOMIC_SIGNAL_FENCE: i32 = 72;
-pub const BI_ATOMIC_LAST: i32 = 72;
+pub const BI_ATOMIC_CMPXCHG_WEAK: i32 = 73;  // (as BI_ATOMIC_CMPXCHG, but may fail spuriously)
+pub const BI_ATOMIC_LAST: i32 = 73;
 
 // Their names after "__builtin_atomic_", by BI_ number, and the standard's
 // names of the functions (for messages).
-let names: [13][]u8 = ["init", "load", "store", "exchange", "compare_exchange", "fetch_add", "fetch_sub", "fetch_or",
-                       "fetch_xor", "fetch_and", "is_lock_free", "thread_fence", "signal_fence"];
-let std_names: [13][]u8 = ["atomic_init", "atomic_load", "atomic_store", "atomic_exchange", "atomic_compare_exchange",
-                           "atomic_fetch_add", "atomic_fetch_sub", "atomic_fetch_or", "atomic_fetch_xor",
-                           "atomic_fetch_and", "atomic_is_lock_free", "atomic_thread_fence", "atomic_signal_fence"];
+let names: [14][]u8 = ["init", "load", "store", "exchange", "compare_exchange", "fetch_add", "fetch_sub", "fetch_or",
+                       "fetch_xor", "fetch_and", "is_lock_free", "thread_fence", "signal_fence",
+                       "compare_exchange_weak"];
+let std_names: [14][]u8 = ["atomic_init", "atomic_load", "atomic_store", "atomic_exchange",
+                           "atomic_compare_exchange_strong", "atomic_fetch_add", "atomic_fetch_sub", "atomic_fetch_or",
+                           "atomic_fetch_xor", "atomic_fetch_and", "atomic_is_lock_free", "atomic_thread_fence",
+                           "atomic_signal_fence", "atomic_compare_exchange_weak"];
 // the number of arguments of each
-let arities: [13]usize = [2, 2, 3, 3, 5, 3, 3, 3, 3, 3, 1, 1, 1];
+let arities: [14]usize = [2, 2, 3, 3, 5, 3, 3, 3, 3, 3, 1, 1, 1, 5];
 
 // -----------------------------------------------------------------------------
 // Atomic types
@@ -173,7 +185,9 @@ pub fn call(e: *mut cast.Expr, id: i32) void {
     }
     e.ty = cty.t_void;
     if (id == BI_ATOMIC_THREAD_FENCE) or (id == BI_ATOMIC_SIGNAL_FENCE) {
-        _ = order(e, 0, what);
+        if order(e, 0, what) {
+            check_order(e.args.get(0), OK_ANY, what, false);
+        }
         return;
     }
     // the object: a pointer to an atomic type (7.17.1p5: A)
@@ -200,6 +214,7 @@ pub fn call(e: *mut cast.Expr, id: i32) void {
         if not order(e, 1, what) {
             return;
         }
+        check_order(e.args.get(1), OK_LOAD, what, false);
         e.ty = c;
         return;
     }
@@ -208,12 +223,15 @@ pub fn call(e: *mut cast.Expr, id: i32) void {
         if (id != BI_ATOMIC_INIT) and not order(e, 2, what) {
             return;
         }
+        if id == BI_ATOMIC_STORE {
+            check_order(e.args.get(2), OK_STORE, what, false);
+        }
         if id == BI_ATOMIC_EXCHANGE {
             e.ty = c;
         }
         return;
     }
-    if id == BI_ATOMIC_CMPXCHG {
+    if (id == BI_ATOMIC_CMPXCHG) or (id == BI_ATOMIC_CMPXCHG_WEAK) {
         // (7.17.7.4: C *expected, C desired)
         let x = e.args.get(1);
         if (x.ty.kind != cty.TK_POINTER) or not cty.compatible_unq(x.ty.elem, c) or (x.ty.elem.quals != 0) {
@@ -226,6 +244,8 @@ pub fn call(e: *mut cast.Expr, id: i32) void {
         if not order(e, 3, what) or not order(e, 4, what) {
             return;
         }
+        check_order(e.args.get(3), OK_ANY, what, false);
+        check_failure(e.args.get(3), e.args.get(4), what, false);
         e.ty = cty.t_bool;
         return;
     }
@@ -253,6 +273,7 @@ pub fn call(e: *mut cast.Expr, id: i32) void {
     if not order(e, 2, what) {
         return;
     }
+    check_order(e.args.get(2), OK_ANY, what, false);
     e.ty = c;
 }
 
@@ -267,4 +288,123 @@ fn order(e: *mut cast.Expr, i: usize, what: []u8) bool {
         return false;
     }
     return true;
+}
+
+// -----------------------------------------------------------------------------
+// Memory orders (C4092)
+// -----------------------------------------------------------------------------
+
+// What an operation takes as its order (check_order).
+pub const OK_ANY: i32 = 0;    // any (a read-modify-write, a fence)
+pub const OK_LOAD: i32 = 1;   // a load's: not release or acq_rel (7.17.7.2p2)
+pub const OK_STORE: i32 = 2;  // a store's: not consume, acquire or acq_rel (7.17.7.1p2)
+pub const OK_FAIL: i32 = 3;   // a failed compare-exchange's: not release or acq_rel (7.17.7.4p2)
+
+let order_names: [6][]u8 = ["memory_order_relaxed", "memory_order_consume", "memory_order_acquire",
+                            "memory_order_release", "memory_order_acq_rel", "memory_order_seq_cst"];
+let gnu_order_names: [6][]u8 = ["__ATOMIC_RELAXED", "__ATOMIC_CONSUME", "__ATOMIC_ACQUIRE", "__ATOMIC_RELEASE",
+                                "__ATOMIC_ACQ_REL", "__ATOMIC_SEQ_CST"];
+
+// The order a constant x is (0 to 5), or -1 (not a constant), or 6 (no order).
+fn order_value(x: *cast.Expr) i32 {
+    if not x.is_const {
+        return -1;
+    }
+    let v = x.cval;
+    if v > 5 {
+        return 6;  // (a negative value too: the bits of a large unsigned one)
+    }
+    return @int_cast(i32, v);
+}
+
+fn order_name(k: i32, gnu: bool) []u8 {
+    if gnu {
+        return gnu_order_names[@int_cast(usize, k)];
+    }
+    return order_names[@int_cast(usize, k)];
+}
+
+/// Warns (C4092) where the constant memory order x is not one an operation
+/// that takes the orders `kind` (OK_) takes, or not an order at all (what:
+/// the operation, for the message; gnu: the GNU dialects' builtins, whose
+/// orders are named __ATOMIC_ and may carry hint bits above the low 16).
+pub fn check_order(x: *cast.Expr, kind: i32, what: []u8, gnu: bool) void {
+    let mut k = order_value(x);
+    if gnu and x.is_const {
+        k = order_value_low(x);
+    }
+    if k < 0 {
+        return;
+    }
+    if k == 6 {
+        cs.warn(x.span, "C4092",
+                u.f2("the memory order of %s is %s, which is no memory order: memory_order_seq_cst is used", what,
+                     u.udec(x.cval)));
+        return;
+    }
+    let mut wrong = false;
+    let mut rule = "";
+    if (kind == OK_LOAD) and ((k == 3) or (k == 4)) {
+        wrong = true;
+        rule = "7.17.7.2p2";
+    } else if (kind == OK_STORE) and ((k == 1) or (k == 2) or (k == 4)) {
+        wrong = true;
+        rule = "7.17.7.1p2";
+    } else if (kind == OK_FAIL) and ((k == 3) or (k == 4)) {
+        wrong = true;
+        rule = "7.17.7.4p2";
+    }
+    if wrong {
+        cs.warn(x.span, "C4092", u.f3("%s does not take %s (%s): the operation is made at least as strong",
+                                      u.pick(kind == OK_FAIL, u.f1("the failure order of %s", what), what),
+                                      order_name(k, gnu), rule));
+    }
+}
+
+fn order_value_low(x: *cast.Expr) i32 {
+    let v = x.cval & 0xffff;
+    if v > 5 {
+        return 6;
+    }
+    return @int_cast(i32, v);
+}
+
+/// Warns (C4092) where a compare-exchange's constant failure order f is one
+/// it does not take: release or acq_rel, or (before C23, and in the GNU
+/// dialects' builtins) stronger than its success order s (7.17.7.4p2 of
+/// C11 and C17; C23 dropped that rule). Strength: seq_cst > acq_rel >
+/// acquire > consume > relaxed, and acq_rel > release > relaxed.
+pub fn check_failure(s: *cast.Expr, f: *cast.Expr, what: []u8, gnu: bool) void {
+    check_order(f, OK_FAIL, what, gnu);
+    let mut ks = order_value(s);
+    let mut kf = order_value(f);
+    if gnu {
+        if s.is_const {
+            ks = order_value_low(s);
+        }
+        if f.is_const {
+            kf = order_value_low(f);
+        }
+    }
+    if (ks < 0) or (kf < 0) or (ks == 6) or (kf == 6) or ((cs.std() >= co.C23) and not gnu) {
+        return;
+    }
+    // (the parts of each order: 1 acquire, 2 release, 4 seq_cst, 8 consume
+    // alone, which only acquire or stronger exceed)
+    let parts: [6]i32 = [0, 8, 1, 2, 3, 7];
+    let ps = parts[@int_cast(usize, ks)];
+    let pf = parts[@int_cast(usize, kf)];
+    let mut stronger = false;
+    if (pf & 4) != 0 {
+        stronger = (ps & 4) == 0;
+    } else if (pf & 1) != 0 {
+        stronger = (ps & 1) == 0;
+    } else if (pf & 8) != 0 {
+        stronger = ((ps & 1) == 0) and ((ps & 8) == 0);
+    }
+    if stronger {
+        cs.warn(f.span, "C4092",
+                u.f3("the failure order of %s, %s, is stronger than its success order, %s (7.17.7.4p2): the operation is made at least as strong as both",
+                     what, order_name(kf, gnu), order_name(ks, gnu)));
+    }
 }
