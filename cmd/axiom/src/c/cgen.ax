@@ -543,7 +543,7 @@ pub fn object_addr(s: *mut cast.CSym) *mut ir.Value {
             g.linkage = ir.LINK_EXTWEAK;  // a weak reference: no unit defines it (a weak definition: s.weak)
         }
         if n.section.len > 0 {
-            g.section = n.section;
+            g.section = u.perm_dup(n.section);  // (the syntax tree is given back before code generation)
         }
         g.visibility = @truncate(u8, @bit_cast(u32, n.visibility));  // (for the object writers)
         if n.used and s.defined {
@@ -582,6 +582,25 @@ fn alias_target(s: *mut cast.CSym) *mut cast.CSym {
     return t;
 }
 
+// An alias of external linkage (the attribute alias, a GNU dialect) is a
+// symbol of its own at its target's place, which other units' references to
+// its name are references to (ir.Alias).
+fn note_alias(s: *mut cast.CSym) void {
+    let n = cgn.note_of(s);
+    if u.isnil(n) or (n.alias.len == 0) or (s.linkage != cast.LK_EXTERNAL) {
+        return;
+    }
+    let mut tv = u.nil.[ir.Value]();
+    if s.kind == cast.SK_FUNC {
+        tv = func_of(s, func_sig(s)).val;
+    } else {
+        tv = object_addr(s);
+    }
+    if n.alias.len > 0 {
+        ir.add_alias(M, symbol_name(s), tv, n.weak, @truncate(u8, @bit_cast(u32, n.visibility)));
+    }
+}
+
 // The IR function f of C function s: what its GNU attributes ask.
 fn gnu_func(s: *mut cast.CSym, f: *mut ir.Func) void {
     let n = cgn.note_of(s);
@@ -601,7 +620,7 @@ fn gnu_func(s: *mut cast.CSym, f: *mut ir.Func) void {
         f.hot = true;
     }
     if n.section.len > 0 {
-        f.section = n.section;  // (for the object writers)
+        f.section = u.perm_dup(n.section);  // (for the object writers; the syntax tree is given back first)
     }
     f.visibility = @truncate(u8, @bit_cast(u32, n.visibility));
     if n.weak and (s.linkage == cast.LK_EXTERNAL) and u.isnil(s.def) and ir.is_decl(f) and not defined_here(s.name) {
@@ -1122,6 +1141,10 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     for s in cu.objects.items() {
         define_object(s);
     }
+    // the aliases of external linkage: symbols of their own (ir.Alias)
+    for s in cu.aliases.items() {
+        note_alias(s);
+    }
     for s in cu.funcs.items() {
         let f = func_of(s, func_sig(s));
         let st = u.new.[FnState]();
@@ -1138,7 +1161,7 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
             hooks.trampolines(s);
         }
     }
-    if g_object_output and not is_wasm {
+    if g_object_output {
         put_in_arrays();
     }
     return dg.error_count() == 0;
@@ -1351,13 +1374,48 @@ fn put_in_arrays() void {
             if u.notnil(ir.get_global(M, name)) {
                 continue;
             }
+            let mut fv = f.val;
+            if is_wasm and not ctor {
+                // (WebAssembly objects have constructors only, the tool
+                // conventions' INIT_FUNCS: one of the destructor's priority
+                // registers it with atexit, which runs it in the reverse
+                // order of registration, the higher priorities first)
+                fv = atexit_registrar(f, i);
+                sec = u.cat2(".init_array", sec[11..]);
+            }
             let g = ir.add_global(M, T_ptr, name);
-            g.init = f.val;
+            g.init = fv;
             g.linkage = ir.LINK_INTERNAL;
-            g.section = sec;
+            g.section = u.perm_dup(sec);
             g.align = 8;
         }
     }
+}
+
+// A function that registers destructor f (the i-th of g_ctors) with atexit.
+fn atexit_registrar(f: *mut ir.Func, i: usize) *mut ir.Value {
+    let saved_b = B;
+    let saved_f = F;
+    let fty = ir.t_fn(T_void, u.nil_slice.[*mut ir.Ty](), false);
+    let rf = ir.add_function(M, u.f1("axiom.c.atexit_dtor.%s", u.zdec(i)), fty);
+    rf.linkage = ir.LINK_INTERNAL;
+    let mut pa: [1]*mut ir.Ty = [T_ptr];
+    let aty = ir.t_fn(lty(cty.t_int), pa[..], false);
+    let mut af = ir.get_function(M, "atexit");
+    if u.isnil(af) {
+        af = ir.add_function(M, "atexit", aty);
+    }
+    B = ir.new_builder();
+    let st = u.new.[FnState]();
+    st.f = rf;
+    F = st;
+    at_end(new_block("entry"));
+    let mut args: [1]*mut ir.Value = [f.val];
+    _ = ir.call(B, af.ty, af.val, args[..]);
+    ir.ret_void(B);
+    B = saved_b;
+    F = saved_f;
+    return rf.val;
 }
 
 /// Defines CTORS_FN and DTORS_FN if the program has constructors or
@@ -1399,8 +1457,10 @@ pub fn define_runners() bool {
     at_end(run);
     _ = ir.store(B, ir.cint(T_i8, 1), done.val);
     call_ctors(false);
-    if g_init_arrays {
-        walk_array("__fini_array_start", "__fini_array_end", false);
+    if g_init_arrays and not is_wasm {
+        // (backward, the generic ABI's order; forward on Windows, as the C
+        // runtime runs .CRT$XT*, whose suffixes say the order: coff.ax)
+        walk_array("__fini_array_start", "__fini_array_end", tg.is_windows());
     }
     ir.br(B, out);
     at_end(out);
@@ -1413,7 +1473,15 @@ pub fn define_runners() bool {
     if u.notnil(hook) {
         _ = ir.store(B, df.val, hook.val);
     }
-    if g_init_arrays {
+    if g_init_arrays and is_wasm {
+        // (the objects' constructors on WebAssembly: their INIT_FUNCS, which
+        // the linker's __wasm_call_ctors calls, the tool conventions' name)
+        let mut wf = ir.get_function(M, "__wasm_call_ctors");
+        if u.isnil(wf) {
+            wf = ir.add_function(M, "__wasm_call_ctors", fty);
+        }
+        _ = ir.call(B, wf.ty, wf.val, u.nil_slice.[*mut ir.Value]());
+    } else if g_init_arrays {
         walk_array("__preinit_array_start", "__preinit_array_end", true);
         walk_array("__init_array_start", "__init_array_end", true);
     }

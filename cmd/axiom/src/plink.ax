@@ -1007,6 +1007,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     A64 = (inputs.len > 0) and (inputs[0].machine == elf.EM_AARCH64);
     pdb.g_arm64 = A64;
     nl.begin(inputs);
+    nl.g_gc_exports = g_dll;  // (--gc-sections: a DLL's exports are kept)
     n_inputs = inputs.len;
     imp_map = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     for k in 0..g_imports.len {
@@ -1238,6 +1239,7 @@ fn write_contents(b: []mut u8, ly: *Layout) u64 {
         abs_at(b, got_addr + (@as(u64, k) * 8), sym_addr(@as(usize, nl.got_obj.get(k)), nl.got_sym.get(k)));
     }
     apply_relocs(b);
+    nl.sort_rets(b, file_of);
     sort_pdata(b, ly.pdata_start, ly.pdata_end);
     if g_pdb {
         // IMAGE_DEBUG_DIRECTORY: characteristics, time, version, type
@@ -1622,10 +1624,28 @@ fn pdb_input(text_rva: u64, files: *mut u.List.[[]u8]) PdbIn {
         }
         let mi = @truncate(u32, r.mods.len);
         let nf = r.funcs.len;
+        // one function per place: of the names of one (an alias, a weak
+        // definition's default) the one its line table or symbols are under,
+        // else the first
+        let mut place = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+        for si in 0..o.syms.len {
+            let sy = o.syms.at(si);
+            if (sy.ty != elf.T_FUNC) or (sy.sec < 0) or (sy.name.len == 0) or lost_copy(oi, si) {
+                continue;
+            }
+            let pk = u.intern(u.f2("%s:%s", u.idec(sy.sec), u.hex16(sy.value)));
+            let fk = u.intern(cvw.func_key(sy.name, sy.value));
+            if (place.get(pk) == 0) or u.notnil(lines.get(fk)) or (procs.get(fk) != 0) {
+                place.put(pk, @truncate(u32, si) + 1);
+            }
+        }
         for si in 0..o.syms.len {
             let sy = o.syms.at(si);
             if (sy.ty != elf.T_FUNC) or (sy.sec < 0) or (sy.name.len == 0) {
                 continue;
+            }
+            if place.get(u.intern(u.f2("%s:%s", u.idec(sy.sec), u.hex16(sy.value)))) != @truncate(u32, si) + 1 {
+                continue;  // (another name of the function)
             }
             if nl.sec_cls.get(oi)[@as(usize, @bit_cast(u32, sy.sec))] != nl.C_TEXT {
                 continue;
@@ -1640,7 +1660,7 @@ fn pdb_input(text_rva: u64, files: *mut u.List.[[]u8]) PdbIn {
             let addr = nl.sym_addr_in(oi, @truncate(u32, si));
             let mut ls = u.nil_slice.[pdb.Line]();
             let name = elf.display_name(sy.name);
-            let found = lines.get(u.intern(cvw.func_key(sy.sec, sy.value)));  // (by its place: winlines.emit)
+            let found = lines.get(u.intern(cvw.func_key(sy.name, sy.value)));  // (by its symbol: winlines.emit)
             if u.notnil(found) {
                 ls = found.items();
             }
@@ -1648,7 +1668,7 @@ fn pdb_input(text_rva: u64, files: *mut u.List.[[]u8]) PdbIn {
             let mut f = pdb.Func.{ name: name, sec: 1, off: off, size: @truncate(u32, sy.size), lines: ls,
                                    syms: u.nil_slice.[u8](), self_fix: u.nil_slice.[u32](), module: mi,
                                    external: sy.bind != elf.B_LOCAL, file_fix: u.nil_slice.[u32]() };
-            let bk = procs.get(u.intern(cvw.func_key(sy.sec, sy.value)));
+            let bk = procs.get(u.intern(cvw.func_key(sy.name, sy.value)));
             if bk != 0 {
                 let p = patch_syms(cv.blobs.at(@as(usize, bk - 1)), &cv, off);
                 f.syms = p.data;
@@ -1689,6 +1709,17 @@ fn module_name(fs: []pdb.Func, files: [][]u8, mi: u32) []u8 {
         }
     }
     return u.f1("axiom-module-%s", u.idec(@bit_cast(i32, mi)));
+}
+
+// Is symbol si of object oi a global one whose definition the link did not
+// keep (another object's won)?
+fn lost_copy(oi: usize, si: usize) bool {
+    let gi = nl.global_of(oi, @truncate(u32, si));
+    if gi < 0 {
+        return false;
+    }
+    let g = nl.gsyms.at(@int_cast(usize, gi));
+    return (g.obj != @int_cast(i32, oi)) or (g.sym != @truncate(u32, si));
 }
 
 // An object's .axiom.cv, read (codeview.ax describes it).

@@ -3482,11 +3482,29 @@ fn arg_reg(i: usize, c: u8, ng: *mut usize, nx: *mut usize) i32 {
         ng.* += 1;
         return arg_gprs[ng.* - 1];
     }
-    if (c == XMM) and (nx.* < 8) {
+    // (a vector of 32 or 64 bytes: ymm or zmm, the psABI's SSE and SSEUP
+    // classes, as the C front end passes it with AVX or AVX-512F:
+    // c/cgen_abi.ax, sysv_wide_vec)
+    if (c != GPR) and (nx.* < 8) {
         nx.* += 1;
         return xe.XMM0 + @int_cast(i32, nx.* - 1);
     }
     return -1;
+}
+
+// Does call v pass or return a vector of 32 or 64 bytes in a register (the
+// upper halves of the vector registers then live across the call)?
+fn wide_call(v: *ir.Value) bool {
+    let fty = ir.fty_of(v);
+    if vl_of(fty.ret) > 0 {
+        return true;
+    }
+    for x in v.xs.items() {
+        if vl_of(x.ty) > 0 {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn gen_call(v: *mut ir.Value) void {
@@ -3538,6 +3556,7 @@ fn gen_call(v: *mut ir.Value) void {
         if dest[i] >= 0 {
             if dest[i] >= xe.XMM0 {
                 let m = sse2(xe.MOVAPS, W(dest[i]), R(regs[i]));
+                m.sz = class_bytes(class_of(v.xs.get(i).ty));  // (ymm, zmm: the whole register)
                 m.is_move = true;
             } else {
                 let m = e2(xe.MOV_RR, 8, W(dest[i]), R(regs[i]));
@@ -3555,7 +3574,7 @@ fn gen_call(v: *mut ir.Value) void {
     let mut rreg: i32 = -1;
     if rt.kind != ir.T_VOID {
         rreg = xe.RAX;
-        if class_of(rt) == XMM {
+        if class_of(rt) != GPR {
             rreg = xe.XMM0;
         }
     }
@@ -3565,6 +3584,9 @@ fn gen_call(v: *mut ir.Value) void {
         c_result_regs(rcode, &mut ops);
     }
     let ci = emit(xe.CALL, 0, ops.items());
+    if wide_call(v) {
+        ci.sz = 32;  // (no vzeroupper before it, and the upper halves in use after it: x64emit.ax)
+    }
     is.finish_call(em.MF, ci, v, ft.call_aux(v), caller_saved());  // (frame tables)
     if rcode != 0 {
         // the registers, for the IN_CALL_RESULTs
@@ -3578,7 +3600,7 @@ fn gen_call(v: *mut ir.Value) void {
         }
     }
     if rreg == xe.XMM0 {
-        copy(vreg(v), xe.XMM0, XMM);
+        copy(vreg(v), xe.XMM0, class_of(rt));
     } else if (rreg >= 0) and is.foreign_bool(v) {
         let t = vgpr();
         copy(t, xe.RAX, GPR);
@@ -3748,6 +3770,9 @@ fn stack_bytes(f: *ir.Func, v: *ir.Value) u64 {
 
 // Call v as a jump to its callee, if its stack arguments fit (see above).
 fn gen_tail_call(v: *mut ir.Value) bool {
+    if wide_call(v) or (vl_of(em.F.ty.ret) > 0) {
+        return false;  // (ymm and zmm arguments and results: an ordinary call)
+    }
     let need = stack_bytes(em.F, v);
     if need > stack_bytes(em.F, u.nil.[ir.Value]()) {
         return false;  // (the callee needs more of the stack than the caller was given)
@@ -3799,6 +3824,7 @@ fn gen_tail_call(v: *mut ir.Value) bool {
         if dest[i] >= 0 {
             if dest[i] >= xe.XMM0 {
                 let m = sse2(xe.MOVAPS, W(dest[i]), R(regs[i]));
+                m.sz = class_bytes(class_of(v.xs.get(i).ty));  // (ymm, zmm: the whole register)
                 m.is_move = true;
             } else {
                 let m = e2(xe.MOV_RR, 8, W(dest[i]), R(regs[i]));
@@ -4295,6 +4321,9 @@ pub fn wide_legal(v: *mut ir.Value) bool {
     if (o == ir.OP_LOAD) or (o == ir.OP_STORE) or (o == ir.OP_PHI) or (o == ir.OP_SELECT) or (o == ir.OP_COPY) or
        (o == ir.OP_SPLAT) or (o == ir.OP_EXTRACTELEM) or (o == ir.OP_INSERTELEM) {
         return true;
+    }
+    if (o == ir.OP_CALL) or (o == ir.OP_RET) {
+        return true;  // (a C function's ymm or zmm argument or result: arg_reg)
     }
     if o == ir.OP_SHUFFLE {
         return vs.plumbing(v) or perm_shuffle_ok(v);
@@ -7771,10 +7800,12 @@ fn gen_term(b: *mut ir.Block) void {
             } else {
                 r = reg(x);
             }
-            if class_of(x.ty) == XMM {
+            if class_of(x.ty) != GPR {
                 let m = sse2(xe.MOVAPS, W(xe.XMM0), R(r));
+                m.sz = class_bytes(class_of(x.ty));
                 m.is_move = true;
-                _ = e1(xe.RET, 0, R(xe.XMM0));
+                let ri = e1(xe.RET, 0, R(xe.XMM0));
+                ri.sz = m.sz;  // (a ymm or zmm result: no vzeroupper before it, x64emit.ax)
             } else {
                 let m = e2(xe.MOV_RR, 8, W(xe.RAX), R(r));
                 m.is_move = true;
@@ -7809,11 +7840,12 @@ fn gen_jump_table(b: *mut ir.Block, t: *mut ir.Value) void {
     }
     is.phi_copies(em.MF, b, reg, vreg, class_of, copy);
     let n = t.xs.len;
-    let s = em.OBJ.secs.get(@int_cast(usize, RODATA));
+    let jsec = is.group_rodata(em.OBJ, em.TEXT, RODATA);  // (with the code, in its COMDAT group if it is in one)
+    let s = em.OBJ.secs.get(@int_cast(usize, jsec));
     s.data.align(4);
     let off = @as(u64, s.data.len());
     s.data.zeros(4 * n);
-    let sym = elf.add_sym(em.OBJ, elf.Sym.{ name: ".LJT", sec: RODATA, value: off, size: @as(u64, 4 * n),
+    let sym = elf.add_sym(em.OBJ, elf.Sym.{ name: ".LJT", sec: jsec, value: off, size: @as(u64, 4 * n),
                                             bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false });
     let ops = u.newn.[mc.MOp](n + 3);
     ops[0] = R(ix);
@@ -9684,9 +9716,13 @@ fn compile_func(f: *mut ir.Func) void {
         soff += @bit_cast(i64, WIN_SHADOW);
     }
     call_results.clear();
+    em.WIDE_IN = false;
     for pi in 0..f.params.len {
         let p = f.params[pi];
         let c = class_of(p.ty);
+        if vl_of(p.ty) > 0 {
+            em.WIDE_IN = true;  // (a ymm or zmm argument: the upper halves in use on entry)
+        }
         let d = vreg(p);
         let ar = arg_reg(pi, c, &mut ng, &mut nx);
         if ar >= 0 {
@@ -9818,9 +9854,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     tls_index_si = -1;
     tls_key_si = -1;
     em.OBJ = elf.new_obj(elf.EM_X86_64);
-    em.JT_OBJ = u.nil.[elf.Obj]();
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     em.TEXT = elf.add_sec(em.OBJ, ".text", elf.S_TEXT, 64);
+    let text0 = em.TEXT;
     RODATA = elf.add_sec(em.OBJ, ".rodata", elf.S_RODATA, 16);
     em.XDATA = -1;
     em.PDATA = -1;
@@ -9889,7 +9925,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             dw.add_func(&mut em.DBG, &df);
             if em.WIN and (em.LINES >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
                 let ps = em.OBJ.syms.at(@as(usize, p.sym));
-                wlines.emit(em.OBJ, em.LINES, codeview.func_key(ps.sec, ps.value), p.rows);
+                wlines.emit(em.OBJ, em.LINES, codeview.func_key(ps.name, ps.value), p.rows);
             }
         }
     }
@@ -9910,7 +9946,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             u.scratch_begin();
             let outer = tg.begin_fn(f);  // (its own extensions: @features, @multiversion)
             em.AVX = tg.has(tg.X_AVX);
+            em.TEXT = em.OBJ.syms.get(@as(usize, em.fsym.get(@int_cast(usize, f.id)))).sec;  // (its section: isel.ax)
             compile_func(f);
+            em.TEXT = text0;
             tg.end_fn(outer);
             u.scratch_end();
             ir.release_lists(f);
@@ -9919,6 +9957,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             }
         }
     }
+    is.finish_aliases(em.OBJ);
     let msg = aob.resolve(em.OBJ);
     if msg.len > 0 {
         em.fail(msg);

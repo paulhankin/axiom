@@ -172,6 +172,15 @@ pub struct Sec {
     align: u64,
     relocs: u.List.[Rel],
     index: u32,  // section header index when written
+    sym1: u32,   // a local symbol at its start (sec_sym) + 1, 0: none yet
+    // a COMDAT group it belongs to when written (its signature: the name of
+    // a symbol of the object), or empty; read objects' groups are Obj.groups
+    group: []u8,
+    // the section it describes + 1 (0: none): written as SHF_LINK_ORDER with
+    // sh_link (a frame table's for its code: ftab.ax), read likewise; a
+    // link's garbage collection keeps it only with that section (nlink.ax)
+    link1: i32,
+    retain: bool,  // never collected by a link (SHF_GNU_RETAIN: C's attribute used, retain)
 }
 
 pub struct Sym {
@@ -190,7 +199,16 @@ pub struct Sym {
 pub struct Group {
     sig: []u8,
     secs: u.List.[i32],
+    // which copy a link keeps (the PE/COFF specification's COMDAT
+    // selections: SEL_*; ELF's groups are SEL_ANY)
+    sel: u8,
 }
+
+pub const SEL_NODUPLICATES: u8 = 1;  // another copy is an error
+pub const SEL_ANY: u8 = 2;           // the first object's
+pub const SEL_SAME_SIZE: u8 = 3;     // the first, the others of the same size
+pub const SEL_EXACT_MATCH: u8 = 4;   // the first, the others the same
+pub const SEL_LARGEST: u8 = 6;       // the largest (the first of those)
 
 pub struct Obj {
     machine: u32,
@@ -222,12 +240,35 @@ pub fn release(o: *mut Obj) void {
 }
 
 pub fn add_sec(o: *mut Obj, name: []u8, kind: i32, align: u64) i32 {
-    let s = u.new.[Sec]();
+    // (not in a scratch scope's memory: a code generator may add one while
+    // it compiles a function, x64.ax and a64.ax doing that in such a scope)
+    let s = u.perm_new.[Sec]();
     s.name = name;
     s.kind = kind;
     s.align = align;
     o.secs.push(s);
     return @int_cast(i32, o.secs.len - 1);
+}
+
+/// A local symbol at the start of section `sec` of `o` (made once), for
+/// relocations against the section.
+pub fn sec_sym(o: *mut Obj, sec: i32) u32 {
+    let s = o.secs.get(@int_cast(usize, sec));
+    if s.sym1 == 0 {
+        s.sym1 = add_sym(o, Sym.{ name: "", sec: sec, value: 0, size: 0, bind: B_LOCAL, ty: T_NOTYPE,
+                                  hidden: false }) + 1;
+    }
+    return s.sym1 - 1;
+}
+
+/// The section of `o` named `name` (the first, if several are), or -1.
+pub fn find_sec(o: *Obj, name: []u8) i32 {
+    for k in 0..o.secs.len {
+        if u.str_eq(o.secs.get(k).name, name) {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
 }
 
 pub fn sec_size(s: *Sec) u64 {
@@ -305,6 +346,12 @@ pub fn merge(dst: *mut Obj, src: *mut Obj) void {
             let r = s.relocs.at(j);
             r.sym = map.get(@as(usize, r.sym));
         }
+        if s.sym1 != 0 {
+            s.sym1 = map.get(@as(usize, s.sym1 - 1)) + 1;
+        }
+        if s.link1 != 0 {
+            s.link1 += base;
+        }
         dst.secs.push(s);
     }
     map.deinit();
@@ -381,6 +428,15 @@ struct Shdr {
     entsize: u64,
 }
 
+fn has_name(names: [][]u8, n: []u8) bool {
+    for x in names {
+        if u.str_eq(x, n) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // An object file being written: its bytes, section headers and their names.
 struct Writer {
     out: bn.Bytes,
@@ -402,6 +458,29 @@ pub fn write(o: *mut Obj) []u8 {
     w.out.zeros(64);
     w.shstr.u8_(0);
     w.shdrs.push(Shdr.{ name: 0, ty: 0, flags: 0, off: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 });
+    // COMDAT groups (Sec.group): each a SHT_GROUP section, before its members
+    // (the generic ABI wants a group's header before its members' headers),
+    // so the content sections are numbered from 1 + the number of groups;
+    // each group's signature is a symbol of the object (one is made if none
+    // is there)
+    let mut gsigs = u.List.[[]u8].empty();
+    for i in 0..o.secs.len {
+        let g = o.secs.get(i).group;
+        if (g.len > 0) and not has_name(gsigs.items(), g) {
+            gsigs.push(g);
+            if o.symmap.get(u.intern(g)) == 0 {
+                let first = @int_cast(i32, i);
+                _ = add_sym(o, Sym.{ name: g, sec: first, value: 0, size: 0, bind: B_GLOBAL, ty: T_NOTYPE,
+                                     hidden: true });
+            }
+        }
+    }
+    let nm_group = sec_name(&mut w, "", ".group");
+    for _g in gsigs.items() {
+        w.shdrs.push(Shdr.{ name: nm_group, ty: 17, flags: 0, off: 0, size: 0, link: 0, info: 0, align: 4,
+                            entsize: 4 });
+    }
+    let first_content = @int_cast(u32, w.shdrs.len);
     // content sections
     for i in 0..o.secs.len {
         let s = o.secs.get(i);
@@ -423,8 +502,20 @@ pub fn write(o: *mut Obj) []u8 {
         } else if (s.kind == S_DATA) and (u.str_eq(s.name, ".fini_array") or u.starts(s.name, ".fini_array.")) {
             sty = 15;  // SHT_FINI_ARRAY
         }
-        w.shdrs.push(Shdr.{ name: nm, ty: sty, flags: sec_flags(s.kind), off: off, size: sec_size(s), link: 0, info: 0,
-                            align: al, entsize: 0 });
+        let mut fl = sec_flags(s.kind);
+        let mut link: u32 = 0;
+        if s.group.len > 0 {
+            fl = fl | 0x200;  // SHF_GROUP
+        }
+        if s.link1 > 0 {
+            fl = fl | 0x80;  // SHF_LINK_ORDER: sh_link names the section it goes with
+            link = first_content + @bit_cast(u32, s.link1 - 1);
+        }
+        if s.retain {
+            fl = fl | 0x20_0000;  // SHF_GNU_RETAIN
+        }
+        w.shdrs.push(Shdr.{ name: nm, ty: sty, flags: fl, off: off, size: sec_size(s), link: link, info: 0, align: al,
+                            entsize: 0 });
     }
     let mut strtab = bn.new_bytes();
     let mut symtab = bn.new_bytes();
@@ -444,11 +535,34 @@ pub fn write(o: *mut Obj) []u8 {
         }
     }
     let symtab_index = @int_cast(u32, w.shdrs.len) + nrel;
+    let relidx = u.newn.[u32](o.secs.len + 1);  // each section's relocation section's header (0: none)
     for i in 0..o.secs.len {
         let s = o.secs.get(i);
         if s.relocs.len > 0 {
+            relidx[i] = @int_cast(u32, w.shdrs.len);
             rela_section(&mut w, s, map, symtab_index);
         }
+    }
+    // the groups' contents: GRP_COMDAT, then the members (and their
+    // relocation sections, which are members too)
+    for gi in 0..gsigs.len {
+        w.out.align(4);
+        let goff = @as(u64, w.out.len());
+        w.out.u32_(1);
+        for i in 0..o.secs.len {
+            let s = o.secs.get(i);
+            if u.str_eq(s.group, gsigs.get(gi)) {
+                w.out.u32_(@as(u64, s.index));
+                if relidx[i] != 0 {
+                    w.out.u32_(@as(u64, relidx[i]));
+                }
+            }
+        }
+        let h = w.shdrs.at(gi + 1);
+        h.off = goff;
+        h.size = @as(u64, w.out.len()) - goff;
+        h.link = symtab_index;
+        h.info = map[@as(usize, o.symmap.get(u.intern(gsigs.get(gi))) - 1)];
     }
     // .symtab, .strtab, .note.GNU-stack, .shstrtab
     let n_symtab = sec_name(&mut w, "", ".symtab");
@@ -533,7 +647,11 @@ fn rela_section(w: *mut Writer, s: *Sec, map: []u32, symtab_index: u32) void {
         w.out.u64_((@as(u64, map[@as(usize, r.sym)]) << 32) | @as(u64, r.ty));
         w.out.u64_(@bit_cast(u64, r.addend));
     }
-    w.shdrs.push(Shdr.{ name: nm, ty: 4, flags: 0x40, off: off, size: @as(u64, s.relocs.len) * 24, link: symtab_index,
+    let mut fl: u64 = 0x40;  // SHF_INFO_LINK
+    if s.group.len > 0 {
+        fl = fl | 0x200;  // SHF_GROUP: in its section's group
+    }
+    w.shdrs.push(Shdr.{ name: nm, ty: 4, flags: fl, off: off, size: @as(u64, s.relocs.len) * 24, link: symtab_index,
                         info: s.index, align: 8, entsize: 24 });
 }
 
@@ -667,6 +785,15 @@ pub fn read(d: []u8) *mut Obj {
             return u.nil.[Obj]();
         }
         secmap[i] = si;
+        s.retain = (flags & 0x20_0000) != 0;  // SHF_GNU_RETAIN
+    }
+    // SHF_LINK_ORDER: the section each goes with (sh_link)
+    for i in 0..shnum {
+        let h = sh(shoff, i);
+        let ln = @truncate(usize, bn.rd32(d, h + 40));
+        if (secmap[i] >= 0) and ((bn.rd64(d, h + 8) & 0x80) != 0) and (ln < shnum) and (secmap[ln] >= 0) {
+            o.secs.get(@int_cast(usize, secmap[i])).link1 = secmap[ln] + 1;
+        }
     }
     // symbols
     let mut elf2us = u.List.[u32].empty();
@@ -748,7 +875,7 @@ pub fn read(d: []u8) *mut Obj {
                 sig = o.secs.get(@int_cast(usize, sy.sec)).name;  // (a section symbol: that section's name)
             }
         }
-        let mut g = Group.{ sig: u.intern(sig), secs: u.List.[i32].empty() };
+        let mut g = Group.{ sig: u.intern(sig), secs: u.List.[i32].empty(), sel: SEL_ANY };
         let mut k: usize = 4;
         while (k + 4) <= size {
             let m = @truncate(usize, bn.rd32(d, off + k));

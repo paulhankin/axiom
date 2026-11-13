@@ -57,21 +57,25 @@ pub let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: fal
                                      abs_fns: u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 },
                                      abs_map: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                                vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                     arefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 } };  // -g: DWARF (dwarf.ax; not on Windows)
+                                     arefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                     ranges: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 } };  // -g: DWARF (dwarf.ax; not on Windows)
 pub let mut XDATA: i32 = -1;  // Windows: unwind information, and the function table
 pub let mut PDATA: i32 = -1;
 pub let mut XDATA_SYM: u32 = 0;
 pub let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
-                                  chains_sym: 0, rel32: 0, abs64: 0, empty: 0, lines: false,
+                                  chains_sym: 0, text0: -1, rets0: -1, cur_text: -1,
+                                  others: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, rel32: 0,
+                                  abs64: 0, empty: 0, lines: false,
                                   line_recs: u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0),
                                                               vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 } };  // frame tables (ftab.ax)
 pub let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 pub let mut errors: bool = false;
 pub let mut AVX: bool = false;
-pub let mut UPPER: bool = false;  // the function uses ymm or zmm registers (vzeroupper before calls and returns)
-let mut DIRTY: bool = true;       // ... and may have written one since it was entered or last made a call
-pub let mut WIN: bool = false;    // Windows x64: its calling convention, and thread-locals through the TEB
-pub let mut MACOS: bool = false;  // macOS: thread-locals in a block a TSD slot (gs-relative) holds
+pub let mut UPPER: bool = false;    // the function uses ymm or zmm registers (vzeroupper before calls and returns)
+pub let mut WIDE_IN: bool = false;  // it takes a ymm or zmm argument (the upper halves in use on entry)
+let mut DIRTY: bool = true;         // ... and may have written one since it was entered or last made a call
+pub let mut WIN: bool = false;      // Windows x64: its calling convention, and thread-locals through the TEB
+pub let mut MACOS: bool = false;    // macOS: thread-locals in a block a TSD slot (gs-relative) holds
 pub let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 pub let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 pub let mut out_area: u64 = 0;  // outgoing stack-argument bytes
@@ -262,7 +266,8 @@ fn writes_wide(i: *mc.MInst) bool {
 
 // For each block: may the upper halves be in use on entry (vzeroupper
 // before a call or return only then)? The function is entered with them
-// clear, and a call returns with them clear.
+// clear (but with a ymm or zmm argument: WIDE_IN), and a call returns with
+// them clear (but one with a ymm or zmm result: wide_cr).
 fn upper_dirty() []mut bool {
     let nb = MF.blocks.len;
     let din = u.newn.[bool](nb + 1);
@@ -270,6 +275,7 @@ fn upper_dirty() []mut bool {
     if not UPPER {
         return din;
     }
+    din[0] = WIDE_IN;
     let mut changed = true;
     while changed {
         changed = false;
@@ -281,7 +287,7 @@ fn upper_dirty() []mut bool {
                 if writes_wide(i) {
                     d = true;
                 } else if i.op == xe.CALL {
-                    d = false;
+                    d = wide_cr(i);
                 }
                 i = i.next;
             }
@@ -298,6 +304,12 @@ fn upper_dirty() []mut bool {
         }
     }
     return din;
+}
+
+// A call or return with a ymm or zmm argument or result (x64.ax: wide_call):
+// the upper halves are its, not cleared before it.
+fn wide_cr(i: *mc.MInst) bool {
+    return ((i.op == xe.CALL) or (i.op == xe.RET)) and (i.sz >= 32);
 }
 
 fn vzeroupper() void {
@@ -1565,11 +1577,10 @@ fn enc_dynstack(i: *mut mc.MInst) void {
 
 // Jump tables (x64.ax gen_jump_table): the jumps of the pass being encoded,
 // whose tables are filled in once the function's place is known
-// (fill_jump_tables), and a local symbol at the start of .text for their
-// entries (made once per object: JT_OBJ).
+// (fill_jump_tables), and a local symbol at the start of the function's
+// section for their entries (elf.sec_sym).
 let mut jtabs: u.List.[*mut mc.MInst] = u.List.[*mut mc.MInst].{ data: @ptr_from_int(*mut *mut mc.MInst, 0), len: 0,
                                                                  cap: 0 };
-pub let mut JT_OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);  // (x64.ax compile resets it)
 let mut JT_TEXT: u32 = 0;
 
 // lea t, [rip + table]; movsxd u, dword [t + index*4]; add t, u; jmp t
@@ -1592,11 +1603,7 @@ fn fill_jump_tables(base: u64, boff: []u64) void {
     if jtabs.len == 0 {
         return;
     }
-    if JT_OBJ != OBJ {
-        JT_OBJ = OBJ;
-        JT_TEXT = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: TEXT, value: 0, size: 0, bind: elf.B_LOCAL,
-                                             ty: elf.T_NOTYPE, hidden: false });
-    }
+    JT_TEXT = elf.sec_sym(OBJ, TEXT);  // (the code's section: the function's)
     for j in jtabs.items() {
         let ts = OBJ.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
         let sec = OBJ.secs.get(@int_cast(usize, ts.sec));
@@ -1913,11 +1920,17 @@ fn enc_inst(i: *mut mc.MInst) void {
         return;
     }
     if op == xe.CALL {
+        if wide_cr(i) {
+            DIRTY = false;  // (no vzeroupper before it: enc_call)
+            enc_call(i.ops[0]);
+            DIRTY = true;
+            return;
+        }
         enc_call(i.ops[0]);
         return;
     }
     if op == xe.RET {
-        if UPPER and DIRTY {
+        if UPPER and DIRTY and not wide_cr(i) {
             vzeroupper();
         }
         epilogue();
@@ -3471,18 +3484,32 @@ pub fn encode_func(f: *mut ir.Func) void {
         let r = E.relocs.get(k);
         text.relocs.push(elf.Rel.{ off: base + r.off, ty: r.ty, sym: @bit_cast(u32, r.sym), addend: r.addend });
     }
-    let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
+    let mut s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     aob.inline_place(OBJ, TEXT, base);
     s.size = @as(u64, E.b.len());
-    ft.func(&mut FT, base, s.size, frameless, noframe.items(), calls.items(), rows.items(), scopes.items(),
+    ft.func(&mut FT, TEXT, base, s.size, frameless, noframe.items(), calls.items(), rows.items(), scopes.items(),
             dw.func_name(f, elf.display_name(s.name)));
     noframe.deinit();
     if WIN and not frameless {
+        // (code in a COMDAT group: its group's own unwind sections)
+        let sx = XDATA;
+        let sp = PDATA;
+        let ss = XDATA_SYM;
+        XDATA = is.group_unwind(OBJ, TEXT, ".xdata", XDATA);
+        PDATA = is.group_unwind(OBJ, TEXT, ".pdata", PDATA);
+        if XDATA != sx {
+            XDATA_SYM = elf.sec_sym(OBJ, XDATA);
+        }
         emit_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, E.b.len()));
+        XDATA = sx;
+        PDATA = sp;
+        XDATA_SYM = ss;
     }
+    // (the symbol again: a section symbol made since may have moved the list)
+    s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     if WIN and (rows.len > 0) {
-        wlines.emit(OBJ, LINES, codeview.func_key(s.sec, s.value), rows.items());
+        wlines.emit(OBJ, LINES, codeview.func_key(s.name, s.value), rows.items());
     }
     if DBG.on {
         let mut regs: [8]u64 = [0; 8];

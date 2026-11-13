@@ -27,9 +27,9 @@ axiom check prog.c                               # diagnostics only
 [`docs/c-conformance.md`](c-conformance.md) is the clause-by-clause account against the
 standards, with every implementation-defined choice of their Annex J.3. How the front end is
 built is in [`docs/c-frontend.md`](c-frontend.md). C units and Axiom modules build into
-one program ("C and Axiom in one program", below). Axiom programs that link C code
-compiled by the system's C compiler (`--link=file.c`), and with its objects and libraries,
-are in "Objects and libraries", below.
+one program ("C and Axiom in one program", below). Programs linked with further C
+sources (`--link=file.c`), and with objects and libraries, are in "Objects and libraries",
+below.
 
 ## What a C program is here
 
@@ -104,10 +104,12 @@ options; a warning is silenced only by `#pragma GCC diagnostic` ("Pragmas").
 `--target`, `--cpu`, `--features`, `-O0`..`-O3` (see "Optimization"), `--stack-traces`
 (see "Stack traces"), `--format=agent-json`, `--std=<dir>` (the standard library's
 directory, where the compiler finds the C headers in `c/include/`), `-o`, `--emit`,
-`--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, and `-g` /
+`--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, `--function-sections`,
+`--data-sections`, `--gc-sections` (see "Code in sections"), and `-g` /
 `--debug-info=` (see "Debugging"). The default
-target is `wasm32`. `--link=file.c` links a further C source, compiled by the system's C
-compiler; `--link=` with an object, an archive or a shared library, or such a file among
+target is `wasm32`. `--link=file.c` links a further C source, compiled to an object by
+the system's C compiler for Linux, by this compiler for macOS and Windows, by `clang` for
+WebAssembly; `--link=` with an object, an archive or a shared library, or such a file among
 the inputs (`x.o`, `libx.a`, `libx.so`), links it, and `-l` and `-L` name libraries and
 the directories to find them in ("Objects and libraries").
 
@@ -347,7 +349,7 @@ with no linker of the system's:
 ```
 axiom build main.c util.o libparse.a -o prog          # inputs by their names
 axiom build main.ax --link=fast.o -L/opt/x/lib -lx    # --link=, -l and -L
-axiom build main.c --link=helper.c -o prog            # compiled by the system's cc first
+axiom build main.c --link=helper.c -o prog            # compiled to an object first (Linux: by cc)
 axiom build util.c parse.c --emit=lib -o libutil.a    # a static library of this compiler's
 ```
 
@@ -380,9 +382,14 @@ An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dy
   another command is an error. The program is linked dynamically against the libraries
   it uses (`DT_NEEDED`), with the symbol versions they define, eagerly bound; the dynamic
   linker's own symbols (`__tls_get_addr`, AArch64's `__stack_chk_guard`) are found too.
-- **C sources** given with `--link=` are compiled by the system's C compiler (`cc`, or
-  the cross compiler for the target: `aarch64-linux-gnu-gcc`) with `-O2` and the `-I`
-  directories, after `--emit-header`'s header is written, which they may include.
+- **C sources** given with `--link=` are compiled, after `--emit-header`'s header is
+  written (which they may include), for Linux by the system's C compiler (`cc`, or the
+  cross compiler for the target: `aarch64-linux-gnu-gcc`) with `-O2` and the `-I`
+  directories: code of the platform's toolchain, which is what such a source is for (a
+  library's helper, a test's oracle); for macOS and Windows, which have no C compiler
+  here, by this compiler, in a process of its own, into an object in the target's format
+  (`--emit=obj`: Mach-O, COFF), with `-O2`, the build's C options (`--c-std`, `--c-lib`,
+  `-D`, `-U`, the `-I` directories, ...), `--cpu` and `--features`.
 
 When objects of the platform's toolchain are linked, so are its C compiler's run-time
 archives (`libgcc.a` and `libgcc_eh.a` of its newest version, under `/usr/lib/gcc` or
@@ -398,8 +405,12 @@ On WebAssembly the compiler's linker takes relocatable objects of the tool conve
 format (this compiler's, and `clang`'s for the same target) and archives of them, found
 with `-L` and `-l` (`libname.a`), with the same member selection; a C source given with
 `--link=` is compiled by `clang` first. The constructors of such objects (their
-`INIT_FUNCS`) are not run: on WebAssembly a constructor must be in a C unit of the
-program. On macOS (`mlink.ax`) and Windows (`plink.ax`) the compiler's linkers take the objects and
+linking sections' `INIT_FUNCS`) are run before `main`, by priority (of one priority in
+the order of the objects), by `__wasm_call_ctors`, which the linker makes when an
+object has some (the tool conventions' name: the C start-up calls it). This compiler's
+WebAssembly objects list their C units' constructors so, and their destructors as
+constructors of their priorities that register them with `atexit` (which runs them in
+the reverse order: after `main`, by `exit`), so that `wasm-ld` runs them too. On macOS (`mlink.ax`) and Windows (`plink.ax`) the compiler's linkers take the objects and
 static archives of the platform's toolchain and of this compiler, in the platform's
 format, for both processors (`macho.ax`, `coff.ax` read them), with the same member
 selection; what the objects refer to and do not define comes from the libraries:
@@ -421,12 +432,12 @@ selection; what the objects refer to and do not define comes from the libraries:
   it is `libSystem`'s.
 - **COFF objects** (x64, ARM64; the big format too): every relocation type of both
   (`IMAGE_REL_AMD64_*`, `IMAGE_REL_ARM64_*`, with their implicit addends), COMDAT sections
-  (the first object's copy of a symbol's section is kept, its associative sections with
-  it; every selection is taken as "any"), weak externals (a weak definition where the
+  (one copy of a symbol's section is kept by its selection, its associative sections
+  with it: "Code in sections"), weak externals (a weak definition where the
   default is defined, else a weak reference), common symbols, grouped sections
   (`name$suffix`) by their names, `.CRT$XC*`/`.CRT$XI*` as initialization arrays and
-  `.CRT$XT*`/`.CRT$XP*` as termination ones in their suffixes' order (the C runtime's
-  bounds dropped), `.tls$` as the thread-local template (`IMAGE_REL_*_SECREL` offsets in
+  `.CRT$XT*`/`.CRT$XP*` as termination ones in their suffixes' order, which the
+  start-up runs forward as the C runtime does (the C runtime's bounds dropped), `.tls$` as the thread-local template (`IMAGE_REL_*_SECREL` offsets in
   it, `_tls_index` the linker's). Not kept: `.drectve`, `.debug$S`, `.debug$T`, and the
   sections the linker is to remove. The linker supplies `__chkstk` (both processors'
   stack probes), `_fltused` and `__ImageBase`.
@@ -441,8 +452,8 @@ selection; what the objects refer to and do not define comes from the libraries:
 A program has one C library: the compiler's (`--c-lib=axiom`, the default), or the
 system's (`--c-lib=system`).
 
-**The compiler's.** The code compiled by the system's C compiler, against the system's
-headers, uses this library: its calls of the standard's functions are this library's
+**The compiler's.** The code compiled by the system's C compiler (its objects and
+libraries), against the system's headers, uses this library: its calls of the standard's functions are this library's
 functions, whose interfaces the C standard fixes, and the names the system's headers
 expand to that the Linux Standard Base specifies are this library's too
 (`std/c/lib/compat/`): `stdin`, `stdout` and `stderr` as objects of type `FILE *`;
@@ -542,8 +553,11 @@ The objects are in the target's format (`--emit=obj`, `--emit=lib`):
   unused (arm64 14 and 15, x86-64 15), which only this compiler's linker reads: the
   system's refuses an object that uses them.
 - **COFF** (`coff.ax`): `.text`, `.rdata`, `.data`, `.bss`, `.tls$` (the thread-local
-  template, the zero-filled part as zeros), `.pdata` and `.xdata`, `.CRT$XCU` and `.CRT$XTU`
-  (`.CRT$XCT<NNNNN>` and `.CRT$XTT<NNNNN>` for a priority), a C identifier's section as
+  template, the zero-filled part as zeros), `.pdata` and `.xdata`, `.CRT$XCU` (`.CRT$XCT<NNNNN>`
+  for a priority) and `.CRT$XTT<65535 - priority>` (`.CRT$XTT00000` without one: the C
+  runtime runs the tables forward, in the order of the names, so the destructors run in
+  the reverse order of their priorities, the plain ones first, under the system's
+  linker as under the compiler's), a C identifier's section as
   `X$m` with its bounds' symbols in `X$a` and `X$z` (selected once), `.axiom.lines` and
   `.axiom.cv` (the line tables and CodeView records for the program database,
   `IMAGE_SCN_LNK_REMOVE`). A weak definition is a
@@ -593,15 +607,64 @@ thread-local blocks), so Axiom modules and the default C library are an error (`
   (the runtime that makes their blocks is an executable's). Built and checked only: nothing
   here runs macOS.
 
+### Code in sections
+
+A function's code goes in a section of the object as a data object's does:
+
+- The attribute `section` names it (a GNU dialect): every function naming one section is
+  in it, between `__start_<name>` and `__stop_<name>` when the name is a C identifier and
+  something refers to those. Mach-O takes `"segment,section"` (and a C identifier as
+  `__TEXT,<name>`); COFF names a C identifier's section `<name>$m`.
+- A cold function (the attribute `cold`, and the paths the optimizer moves out of a
+  function into one of their own because they are seldom run) is in `.text.unlikely`, a
+  hot one (`hot`) in `.text.hot`; the compiler's linkers place those after and before
+  the rest of the code. (Mach-O and COFF have one section of code: there they are
+  `__text` and `.text`.)
+- `--function-sections` puts each function in a section of its own (`.text.<name>`,
+  `.text.unlikely.<name>`, ...), `--data-sections` each datum (`.data.<name>`,
+  `.bss.<name>`, `.rodata.<name>`, `.tdata.<name>`, ...). In COFF such a function's
+  section is a COMDAT section with the selection "no duplicates", so that the system's
+  linker may leave it out (`/OPT:REF`); a Mach-O object's functions and data are each
+  an atom anyway.
+- An object for other links (`--emit=obj`, `--emit=lib`, `--emit=shared`) has each
+  link-once definition (the runtime's helpers, the C units' helpers of atomics wider
+  than the processor's and of 128-bit division) in a section of its own in a COMDAT
+  group named after it (ELF `SHT_GROUP`; COFF a COMDAT section of the selection "any"),
+  with what only that code refers to: its jump tables, its frame table and (Windows)
+  its unwind information (in COFF associative to it). A link keeps one group of a name,
+  whichever linker it is. In Mach-O it is a weak definition.
+
+What describes code follows it into its section: the frame tables (one `axiom_rets`
+section per section of code, `SHF_LINK_ORDER` to it; the compiler's linkers sort the
+whole table by address, and a system linker places them in their code's order), the
+DWARF (a unit whose code is in several sections has `DW_AT_ranges`, and
+`.debug_aranges` an entry per section), the line tables of the Windows program database
+(keyed by symbol, not by section number) and the Windows unwind information (`.pdata`
+and `.xdata` that go with their code's section).
+
+`--gc-sections` makes the compiler's linkers leave out the sections nothing they keep
+refers to (the system's linkers have their own: `-Wl,--gc-sections`, `/OPT:REF`,
+`-dead_strip`). Kept are the sections that define what the linker itself needs
+(`main`, the start-up, the runtime's thread-local records), a shared library's or a DLL's
+exports, the initialization and termination arrays, sections named as C identifiers,
+sections of `SHF_GNU_RETAIN`, and everything that is not code or data; then whatever a
+relocation in a kept section refers to, the sections that go with a kept one
+(`SHF_LINK_ORDER`), and the other sections of a kept one's COMDAT group. The unwind
+tables (`.eh_frame`, `.pdata`, `.xdata`) of other compilers' objects are kept whole, but
+keep nothing themselves. A program's own C units and Axiom modules are compiled as one
+unit, whose unreferenced functions are not made at all: `--gc-sections` matters for the
+objects and archives a program links.
+
+Of a COFF object's COMDAT sections a link keeps one copy by its selection: "any" the
+first object's, "largest" the largest, "same size" and "exact match" the first, the
+others then having to be of its size or its bytes, and a second copy of one of "no
+duplicates" is an error (`duplicate symbol`).
+
 ### Not done yet
 
-- On WebAssembly the constructors of objects (`INIT_FUNCS`) are not run, and a weak
-  reference to a function nothing defines, while null, is still an import of `env` for
-  its calls.
-- A GNU dialect's `alias` names its target in its own unit only (no second symbol), and
-  the attribute `section` places only data (a function's is recorded, `ir.Func.section`,
-  but its code stays in `.text`: the backends lay out one text section, which the frame
-  tables, unwind and debug information refer to). `visibility` is written to ELF objects
+- On WebAssembly a weak reference to a function nothing defines, while null, is still an
+  import of `env` for its calls.
+- `visibility` is written to ELF objects
   as `hidden` (hidden, internal) or default (protected, default: a shared library binds
   its references to its own definitions, as protected ones are), to Mach-O objects as
   private externs, and a hidden symbol is not a DLL's or a shared library's export.
@@ -680,8 +743,8 @@ library's heap (`__libc_malloc` and its kin), as they always do on macOS
 needs nothing of the system's (a static one on Linux; Windows; WebAssembly) they use the
 Axiom allocator. `errno` is then that library's too (its `__errno_location`, on macOS
 `__error`: `std/c/rt/core_errno.ax`), so that both libraries' functions set one object.
-Code compiled by the system's C compiler (`--link=file.c`, its objects and libraries)
-uses this library, the program's: "Objects and libraries" says how. On
+Code compiled by the system's C compiler (its objects and libraries) uses this library,
+the program's: "Objects and libraries" says how. On
 Windows nothing comes from `msvcrt.dll` (the suite checks every Windows executable's
 imports) unless `--c-lib=system` makes it the program's library. On macOS the runtime reaches
 `libSystem`'s `exit`, `getenv`, `raise`, `malloc`, `calloc` and `free` under names of
@@ -1526,11 +1589,11 @@ C4052 and is ignored.
 |---|---|---|
 | `aligned`, `aligned(n)` | objects, members, structures and unions, typedefs | At least n bytes (no n: 16). On a typedef the type it names has that alignment (an array of an over-aligned element whose size is not a multiple of it is C3008); on a function accepted (code is aligned as the target's). |
 | `packed` | structures, unions, members, enumerations | Members at byte alignment (but those with an alignment of their own); bit-fields at the next bit, each reached through the smallest unit of 1, 2, 4 or 8 bytes in the structure that holds it (none: C3901); an enumeration's type is the smallest integer type of its values. Members of a packed structure are loaded and stored with the alignment they have. |
-| `section("s")` | objects with static storage duration, functions | The object goes in section s of an ELF object (Linux); elsewhere accepted with no effect. A function's section is recorded in the IR (`ir.Func.section`) and not yet placed. The compiler's own linker does not define `__start_s` and `__stop_s`. |
+| `section("s")` | objects with static storage duration, functions | The object or the function's code goes in section s ("Code in sections": Mach-O's `"segment,section"`, COFF's `s$m`); the linkers define `__start_s` and `__stop_s` for a C identifier's. Not on WebAssembly (accepted with no effect). |
 | `used` | objects, functions | Kept though nothing refers to it. |
 | `unused` | any declaration, labels | As `[[maybe_unused]]`. |
 | `weak` | objects and functions with linkage | A weak definition, which gives way to another unit's that is not weak ("C and Axiom in one program"), or a weak reference (a null pointer if no unit defines it; on WebAssembly the host's import). `#pragma weak` too. |
-| `alias("target")` | functions and objects | Another name for target, defined in the same unit (else C3090): references to it are to target. It has no symbol of its own: another unit cannot refer to it. |
+| `alias("target")` | functions and objects | Another name for target, defined in the same unit (else C3090): a symbol of its own (with `weak`, a weak one) at target's place in every object format, which other objects refer to; the program's other units' references to the name are to target (unless a weak alias's name is defined otherwise, which then wins). An object for other links keeps target for it. |
 | `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to `--emit=obj` and `--emit=lib` objects (ELF: `STV_HIDDEN` for hidden and internal, `STV_DEFAULT` for the others), where another link sees it; no effect on an executable's own code. |
 | `noreturn` | functions | As `[[noreturn]]` (C4053). |
 | `noinline`, `always_inline` | functions | Given to the optimizer. |
@@ -2208,8 +2271,9 @@ the hidden pointer), and on WebAssembly passes them as `f32`, `f64` and binary12
 ways (`gen_c_abi.py --dec`, thousands of random shapes).
 
 A vector travels as the ABI says: on x86-64 System V one SSE eightbyte of 8 bytes, SSE and
-SSEUP of 16 (32 and 64 bytes in memory: "Known deviations"), lanes of smaller ones as a
-structure's; on AArch64 a short vector (8 or 16 bytes) in a `v` register, homogeneous
+SSEUP of 16, and with AVX (`--cpu`, `--features`) one of 32 bytes in a `ymm` register,
+with AVX-512F one of 64 in a `zmm` register (SSE and SSEUP; in memory without the
+extension, and as a variadic argument), lanes of smaller ones as a structure's; on AArch64 a short vector (8 or 16 bytes) in a `v` register, homogeneous
 aggregates of them included, larger ones by reference; on Windows x64 by reference (an 8
 byte one in a register), a 16-byte result in `xmm0`; on WebAssembly a 16-byte vector as
 `v128` with `simd128`, else as its bytes would be. `_Float16` is passed as a `float`
@@ -2500,12 +2564,6 @@ claims less than the standard allows. None is hidden: each is said above or here
   once; `complexf128.c`, `complex_impl.h`'s methods in binary128's precision; macros for
   the others); `<tgmath.h>` chooses `_Float16`'s and `_Float128`'s, real and complex, and the
   standard ones for the others.
-- Vectors of 32 and 64 bytes are passed and returned in memory on x86-64 System V even
-  with AVX (the psABI passes them in `ymm` and `zmm` registers then); a C library that
-  takes `__m256` arguments is not callable with them. Smaller vectors, and every vector
-  on AArch64, Windows and WebAssembly (`v128` with `simd128`), follow the ABI, checked
-  against the system's C compiler on `x86_64` and `aarch64` Linux.
 - In a GNU dialect: the
   destructors run when `main` returns and from the library's `exit`, not when the
-  process ends otherwise (`_Exit`, `quick_exit`, a signal); an alias is another name in its unit only; the
-  attribute `section` places only data, and only in ELF objects.
+  process ends otherwise (`_Exit`, `quick_exit`, a signal).

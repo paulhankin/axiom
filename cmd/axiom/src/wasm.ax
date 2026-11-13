@@ -3817,6 +3817,19 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
 // -----------------------------------------------------------------------------
 // Module
 // -----------------------------------------------------------------------------
+// A constructor's place among the initialization arrays (.init_array.N: N;
+// .init_array: 65535), or -1 for any other global.
+fn init_priority(g: *ir.Global) i64 {
+    if u.isnil(g.init) or not u.starts(g.section, ".init_array") {
+        return -1;
+    }
+    let rest = g.section[11..];
+    if (rest.len > 1) and (rest[0] == '.') {
+        return @min(u.atol(rest[1..]), 65535);
+    }
+    return 65535;
+}
+
 fn sym_flags_for(linkage: i32, defined: bool) u32 {
     let mut fl: u32 = 0;
     if not defined {
@@ -3921,6 +3934,8 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
             UN.globals.push(wo.Global.{ vt: vt(g.ty), mutable: true, init: init });
             gsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_GLOBAL, flags: sym_flags_for(g.linkage, true),
                                                  name: g.name, index: gi, seg: 0, off: 0, size: 0 }));
+        } else if not g.wasm_global and (init_priority(g) >= 0) {
+            continue;  // (a constructor: INIT_FUNCS, below)
         } else if not g.wasm_global {
             if u.isnil(g.init) {
                 gsyms.set(i, wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: sym_flags_for(g.linkage, false),
@@ -3982,6 +3997,40 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
                                          size: 0 });
         fsyms.set(i, wf.sym);
         UN.funcs.push(wf);
+    }
+    // a C unit's constructors in an object (an entry of .init_array.N, a
+    // pointer: cgen.ax put_in_arrays), as the linking section's INIT_FUNCS:
+    // their priorities and symbols, which a linker calls in that order
+    // before the program starts (wlink.ax: __wasm_call_ctors)
+    for i in 0..m.globals.len {
+        let g = m.globals.get(i);
+        let pr = init_priority(g);
+        if (pr >= 0) and (g.init.kind == ir.V_FUNC) {
+            let cf = ir.fnp_of(g.init);
+            if not ir.is_decl(cf) {
+                UN.inits.push((@bit_cast(u64, pr) << 32) | @as(u64, fsyms.get(@int_cast(usize, cf.id))));
+            }
+        }
+    }
+    // aliases (ir.Alias): symbols of their own for their targets' function
+    // or data
+    for k in 0..m.aliases.len {
+        let a = m.aliases.at(k);
+        let af = ir.alias_func(m, a);
+        let ag = ir.alias_global(m, a);
+        let mut fl = wo.F_HIDDEN;
+        if a.weak {
+            fl = fl | wo.F_WEAK;
+        }
+        if u.notnil(af) and not ir.is_decl(af) {
+            let t = UN.syms.get(@as(usize, fsyms.get(@int_cast(usize, af.id))));
+            _ = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_FUNC, flags: fl, name: a.name, index: t.index, seg: 0, off: 0,
+                                        size: 0 });
+        } else if u.notnil(ag) and u.notnil(ag.init) and not ag.wasm_global {
+            let t = UN.syms.get(@as(usize, gsyms.get(@int_cast(usize, ag.id))));
+            _ = wo.add_sym(UN, wo.Sym.{ kind: wo.SYM_DATA, flags: fl, name: a.name, index: 0, seg: t.seg, off: t.off,
+                                        size: t.size });
+        }
     }
     // data
     for i in 0..m.globals.len {

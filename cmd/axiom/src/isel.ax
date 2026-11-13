@@ -753,6 +753,172 @@ fn emit_data(obj: *mut elf.Obj, s: *mut elf.Sec, base: u64, x: *mut ir.Value, ab
 
 // The section of a global given one by name (C's attribute section, on
 // Linux): made the first time, read-only or written data.
+// The aliases' symbols whose places are their target functions' (once the
+// code is placed: finish_aliases): alias symbol << 32 | target's symbol.
+let mut alias_fix: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+
+// The symbols of m's aliases (ir.Alias) whose targets this object defines:
+// a global (or weak) symbol of the alias's name at the target's place, a
+// function's once its code is placed (finish_aliases).
+fn add_aliases(obj: *mut elf.Obj, m: *mut ir.Module, fsym: *mut u.List.[u32], gsym: *mut u.List.[u32]) void {
+    alias_fix.clear();
+    for k in 0..m.aliases.len {
+        let a = m.aliases.at(k);
+        let mut bind = elf.B_GLOBAL;
+        if a.weak {
+            bind = elf.B_WEAK;
+        }
+        let af = ir.alias_func(m, a);
+        let ag = ir.alias_global(m, a);
+        let mut t: u32 = LAZY;
+        if u.notnil(af) and not ir.is_decl(af) {
+            t = fsym.get(@int_cast(usize, af.id));
+        } else if u.notnil(ag) and u.notnil(ag.init) {
+            t = gsym.get(@int_cast(usize, ag.id));
+        }
+        if t == LAZY {
+            continue;  // (its target is not this object's: another part's)
+        }
+        let ts = obj.syms.get(@as(usize, t));
+        let s = elf.add_sym(obj, elf.Sym.{ name: a.name, sec: ts.sec, value: ts.value, size: ts.size, bind: bind,
+                                           ty: ts.ty, hidden: hidden_vis(a.visibility) });
+        if u.notnil(af) {
+            alias_fix.push((@as(u64, s) << 32) | @as(u64, t));
+        }
+    }
+}
+
+/// The symbols of aliases of functions get their targets' places, once the
+/// code generator has placed the functions' code.
+pub fn finish_aliases(obj: *mut elf.Obj) void {
+    for x in alias_fix.items() {
+        let t = obj.syms.get(@truncate(usize, x & 0xffff_ffff));
+        let s = obj.syms.at(@truncate(usize, x >> 32));
+        s.sec = t.sec;
+        s.value = t.value;
+        s.size = t.size;
+    }
+    alias_fix.clear();
+}
+
+/// Each function in a section of its own (--function-sections), each
+/// datum likewise (--data-sections): a link may then leave out what nothing
+/// refers to (nlink.ax: --gc-sections).
+pub let mut g_function_sections: bool = false;
+pub let mut g_data_sections: bool = false;
+/// An object for other links (--emit=obj, lib, shared): a definition any
+/// unit may repeat (ir.LINK_LINKONCE) is in a section of its own, in a
+/// COMDAT group named after its symbol (Sec.group), so that a link keeps
+/// one group of the name, whichever linker it is.
+pub let mut g_comdat: bool = false;
+
+// A section of its own for one function's code or one datum (named after
+// its symbol), in COMDAT group `group` if that is not empty.
+fn own_section(obj: *mut elf.Obj, name: []u8, kind: i32, align: u64, group: []u8) i32 {
+    let k = elf.add_sec(obj, u.perm_dup(name), kind, align);
+    obj.secs.get(@int_cast(usize, k)).group = u.perm_dup(group);
+    return k;
+}
+
+// The code section named `name` (made once).
+fn code_section(obj: *mut elf.Obj, name: []u8) i32 {
+    let k = elf.find_sec(obj, name);
+    if (k >= 0) and (obj.secs.get(@int_cast(usize, k)).kind == elf.S_TEXT) {
+        return k;
+    }
+    return elf.add_sec(obj, u.perm_dup(name), elf.S_TEXT, 16);
+}
+
+// The section of function f's code (its symbol: nm). The section attribute
+// names it (functions naming one name share it: the Mach-O
+// "segment,section" form and COFF names are the object writers'); else a
+// cold function's code (C's attribute cold, the outlined cold paths of
+// outline.ax) is in .text.unlikely and a hot one's in .text.hot, which
+// the linkers place after and before the rest (nlink.ax: place); and the
+// code of a link-once function of an object for other links, or of every
+// function with --function-sections, is in a section of its own
+// (.text.<name>, .text.unlikely.<name>, ...).
+fn func_section(obj: *mut elf.Obj, f: *ir.Func, text: i32, nm: []u8) i32 {
+    if f.section.len > 0 {
+        return code_section(obj, f.section);
+    }
+    let mut pre = ".text";
+    if f.cold {
+        pre = ".text.unlikely";
+    } else if f.hot {
+        pre = ".text.hot";
+    }
+    let once = g_comdat and (f.linkage == ir.LINK_LINKONCE);
+    if g_function_sections or once {
+        let mut g: []u8 = "";
+        if once {
+            g = nm;
+        }
+        return own_section(obj, u.f2("%s.%s", pre, nm), elf.S_TEXT, 16, g);
+    }
+    if u.str_eq(pre, ".text") {
+        return text;
+    }
+    return code_section(obj, pre);
+}
+
+// The section of datum g (its symbol: nm), given the one its kind goes in
+// (sec): that, or with --data-sections, or for a link-once datum of an
+// object for other links, a section of its own (<sec's name>.<name>, the
+// link-once one in a COMDAT group of the name).
+fn data_section(obj: *mut elf.Obj, g: *ir.Global, sec: i32, nm: []u8) i32 {
+    let once = g_comdat and (g.linkage == ir.LINK_LINKONCE);
+    if not (g_data_sections or once) {
+        return sec;
+    }
+    let base = obj.secs.get(@int_cast(usize, sec));
+    let mut grp: []u8 = "";
+    if once {
+        grp = nm;
+    }
+    return own_section(obj, u.f2("%s.%s", base.name, nm), base.kind, 1, grp);
+}
+
+/// The read-only data section for what only the code of section `text`
+/// refers to (a jump table, whose entries refer to that code): `rodata`,
+/// or for code in a COMDAT group, a section of the group (a link that drops
+/// the group drops it too; a relocation from outside a group into a dropped
+/// one is an error to the system linkers).
+pub fn group_rodata(obj: *mut elf.Obj, text: i32, rodata: i32) i32 {
+    let g = obj.secs.get(@int_cast(usize, text)).group;
+    if g.len == 0 {
+        return rodata;
+    }
+    let name = u.cat2(".rodata.", g);
+    let k = elf.find_sec(obj, name);
+    if k >= 0 {
+        return k;
+    }
+    return own_section(obj, name, elf.S_RODATA, 4, g);
+}
+
+/// Windows: the unwind information's section `name` (.xdata, .pdata) for
+/// the code of section `text`: the object's (`base`) for .text's, else one
+/// that goes with the code (Sec.link1), in its COMDAT group if it has one
+/// (COFF's associative COMDAT section, coff.ax), so that a link that drops
+/// the code (a COMDAT copy, --gc-sections) drops its entries.
+pub fn group_unwind(obj: *mut elf.Obj, text: i32, name: []u8, base: i32) i32 {
+    let ts = obj.secs.get(@int_cast(usize, text));
+    let g = ts.group;
+    if u.str_eq(ts.name, ".text") {
+        return base;
+    }
+    for k in 0..obj.secs.len {
+        let s = obj.secs.get(k);
+        if u.str_eq(s.name, name) and (s.link1 == text + 1) {
+            return @int_cast(i32, k);
+        }
+    }
+    let k = own_section(obj, name, elf.S_RODATA, 4, g);
+    obj.secs.get(@int_cast(usize, k)).link1 = text + 1;
+    return k;
+}
+
 fn named_section(obj: *mut elf.Obj, name: []u8, ro: bool) i32 {
     for k in 0..obj.secs.len {
         if u.str_eq(obj.secs.get(k).name, name) {
@@ -794,8 +960,9 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         if ir.is_decl(f) {
             fsym.push(LAZY);
         } else {
-            fsym.push(elf.add_sym(obj, elf.Sym.{ name: sym_name(f.name, f.linkage, "f", i), sec: text, value: 0,
-                                                 size: 0, bind: sym_bind(f.linkage, "f", i), ty: elf.T_FUNC,
+            let nm = sym_name(f.name, f.linkage, "f", i);
+            fsym.push(elf.add_sym(obj, elf.Sym.{ name: nm, sec: func_section(obj, f, text, nm), value: 0, size: 0,
+                                                 bind: sym_bind(f.linkage, "f", i), ty: elf.T_FUNC,
                                                  hidden: hidden_vis(f.visibility) }));
         }
     }
@@ -819,8 +986,11 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         } else if ir.is_zero(g.init) {
             sec = bss;
         }
+        let gname = sym_name(g.name, g.linkage, "g", i);
         if (g.section.len > 0) and not g.tls {
             sec = named_section(obj, g.section, sec == rodata);
+        } else {
+            sec = data_section(obj, g, sec, gname);
         }
         let s = obj.secs.get(@int_cast(usize, sec));
         let mut al = g.align;
@@ -831,7 +1001,7 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
             s.align = al;  // the section is at least as aligned as its contents
         }
         let mut off: u64 = 0;
-        if (sec == bss) or (sec == tbss) {
+        if (s.kind == elf.S_BSS) or (s.kind == elf.S_TBSS) {
             s.size = (s.size + al - 1) & ~(al - 1);
             off = s.size;
             s.size += g.ty.size;
@@ -844,10 +1014,11 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         if g.tls {
             ty = elf.T_TLS;
         }
-        gsym.push(elf.add_sym(obj, elf.Sym.{ name: sym_name(g.name, g.linkage, "g", i), sec: sec, value: off,
-                                             size: g.ty.size, bind: sym_bind(g.linkage, "g", i), ty: ty,
+        gsym.push(elf.add_sym(obj, elf.Sym.{ name: gname, sec: sec, value: off, size: g.ty.size,
+                                             bind: sym_bind(g.linkage, "g", i), ty: ty,
                                              hidden: hidden_vis(g.visibility) }));
     }
+    add_aliases(obj, m, fsym, gsym);
     for i in 0..m.globals.len {
         let g = m.globals.get(i);
         if u.isnil(g.init) {

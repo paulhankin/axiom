@@ -11,8 +11,9 @@
 // relocations that the ELF and Mach-O linkers both apply.
 //
 // The objects may be the platform toolchain's too (elf.read): of COMDAT
-// groups with one signature only the first object's is kept (the others'
-// sections are dropped: S_DISCARD); the initialization and termination
+// groups with one signature one is kept, by their selection
+// (drop_comdat_copies; the others' sections are dropped: S_DISCARD); with
+// --gc-sections what nothing kept refers to is dropped too (collect_garbage); the initialization and termination
 // arrays (.preinit_array, .init_array[.N], .fini_array[.N]) are placed
 // together, sorted by priority, between the symbols the generic ABI's
 // dynamic linking and the start-up use (__init_array_start, ...); and the
@@ -92,6 +93,14 @@ pub fn align_up(x: u64, a: u64) u64 {
     return (x + a - 1) & ~(a - 1);
 }
 
+/// --gc-sections: a link leaves out the sections that nothing it keeps
+/// refers to (collect_garbage). g_gc_exports (a shared library's link):
+/// what it exports is kept.
+pub let mut g_gc_sections: bool = false;
+pub let mut g_gc_exports: bool = false;
+// (the objects given to the link: those after them are the linker's own)
+let mut n_inputs: usize = 0;
+
 // A new link of `inputs` (the linker adds its own objects after them).
 pub fn begin(inputs: []*mut elf.Obj) void {
     objs = u.List.[*mut elf.Obj].empty();
@@ -113,6 +122,7 @@ pub fn begin(inputs: []*mut elf.Obj) void {
     for i in 0..inputs.len {
         objs.push(inputs[i]);
     }
+    n_inputs = inputs.len;
     drop_comdat_copies();
     for n in ARRAY_SYMS {
         _ = lnk_sym(n);
@@ -164,32 +174,73 @@ fn set_lnk(name: []u8, value: u64) void {
     }
 }
 
-// COMDAT groups (elf.Group): the first object's group of each signature is
-// kept, the sections of the others' are dropped, and their symbols are
-// then references to the kept group's.
+// COMDAT groups (elf.Group): of the groups of one signature one is kept, by
+// their selection (COFF's; ELF's are "any"): the first object's, or with
+// "largest" the largest (by its first section's size); the sections of the
+// others are dropped, and their symbols are then references to the kept
+// group's. Another copy of a "no duplicates" one is an error (a duplicate
+// definition), and so is one of a "same size" or "exact match" one that is
+// not (its first section's size or bytes).
 fn drop_comdat_copies() void {
-    let mut seen = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    let mut seen = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
     for oi in 0..objs.len {
         let o = objs.get(oi);
         for gi in 0..o.groups.len {
             let g = o.groups.at(gi);
-            if seen.get(g.sig) == 0 {
-                seen.put(g.sig, @int_cast(u32, oi) + 1);
+            let prev = seen.get(g.sig);
+            if prev == 0 {
+                seen.put(g.sig, ((@as(u64, oi) << 32) | @as(u64, gi)) + 1);
                 continue;
             }
-            for si in g.secs.items() {
-                let s = o.secs.get(@int_cast(usize, si));
-                s.kind = elf.S_DISCARD;
-                s.relocs.deinit();
-                s.relocs = u.List.[elf.Rel].empty();
+            let po = @truncate(usize, (prev - 1) >> 32);
+            let pg = objs.get(po).groups.at(@truncate(usize, (prev - 1) & 0xffff_ffff));
+            let sel = @max(g.sel, pg.sel);
+            let what = elf.display_name(g.sig);
+            if (g.sel == elf.SEL_NODUPLICATES) or (pg.sel == elf.SEL_NODUPLICATES) {
+                err(u.f3("duplicate symbol '%s' (%s and %s: a COMDAT section that may not have copies)", what,
+                         obj_name(po), obj_name(oi)));
+                continue;
             }
-            for k in 0..o.syms.len {
-                let sy = o.syms.at(k);
-                if (sy.sec >= 0) and (o.secs.get(@int_cast(usize, sy.sec)).kind == elf.S_DISCARD) and
-                   (sy.bind != elf.B_LOCAL) {
-                    sy.sec = -1;
-                }
+            let ps = group_first(objs.get(po), pg);
+            let s = group_first(o, g);
+            if (sel == elf.SEL_SAME_SIZE) and (elf.sec_size(ps) != elf.sec_size(s)) {
+                err(u.f3("the copies of '%s' (%s and %s) differ in size, which their COMDAT selection forbids", what,
+                         obj_name(po), obj_name(oi)));
+                continue;
             }
+            if (sel == elf.SEL_EXACT_MATCH) and
+               ((elf.sec_size(ps) != elf.sec_size(s)) or not u.str_eq(ps.data.view(), s.data.view())) {
+                err(u.f3("the copies of '%s' (%s and %s) differ, which their COMDAT selection forbids", what,
+                         obj_name(po), obj_name(oi)));
+                continue;
+            }
+            if (sel == elf.SEL_LARGEST) and (elf.sec_size(s) > elf.sec_size(ps)) {
+                drop_group(objs.get(po), pg);  // (this one is kept instead)
+                seen.put(g.sig, ((@as(u64, oi) << 32) | @as(u64, gi)) + 1);
+                continue;
+            }
+            drop_group(o, g);
+        }
+    }
+}
+
+// The first section of group g of o (what its selection compares).
+fn group_first(o: *elf.Obj, g: *elf.Group) *elf.Sec {
+    return o.secs.get(@int_cast(usize, g.secs.get(0)));
+}
+
+// Drops group g of o: its sections, and its symbols' definitions.
+fn drop_group(o: *mut elf.Obj, g: *elf.Group) void {
+    for si in g.secs.items() {
+        let s = o.secs.get(@int_cast(usize, si));
+        s.kind = elf.S_DISCARD;
+        s.relocs.deinit();
+        s.relocs = u.List.[elf.Rel].empty();
+    }
+    for k in 0..o.syms.len {
+        let sy = o.syms.at(k);
+        if (sy.sec >= 0) and (o.secs.get(@int_cast(usize, sy.sec)).kind == elf.S_DISCARD) and (sy.bind != elf.B_LOCAL) {
+            sy.sec = -1;
         }
     }
 }
@@ -599,8 +650,12 @@ pub fn got_slot(oi: usize, si: u32) i32 {
 // -----------------------------------------------------------------------------
 
 // Each object's section classes (by class_of), and room for the section
-// addresses and local GOT slots.
+// addresses and local GOT slots. With --gc-sections, the sections nothing
+// kept refers to are left out first (collect_garbage).
 pub fn classify(class_of: fn(*elf.Sec) i32) void {
+    if g_gc_sections {
+        collect_garbage();
+    }
     for oi in 0..objs.len {
         let o = objs.get(oi);
         let cls = u.newn.[i32](o.secs.len + 1);
@@ -617,6 +672,297 @@ pub fn classify(class_of: fn(*elf.Sec) i32) void {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Garbage collection of sections (--gc-sections)
+//
+// A section is kept if it is a root or something kept refers to it: a
+// relocation in a kept section to a symbol defined in it (a global by its
+// definition, the one the link chose), a section that goes with it
+// (SHF_LINK_ORDER: elf.Sec.link1, as a frame table's axiom_rets goes with its
+// code) or one in its COMDAT group. The roots: the sections of the objects
+// the linker adds (its own symbols, the start-up, the stubs), those defining
+// the names the linkers look for (ROOT_NAMES) and, for a shared library,
+// what it exports; the initialization and termination arrays; sections a
+// program keeps by their names (C identifiers, which __start_ and __stop_
+// symbols may bound: as the system linkers have it, whether or not they are
+// referred to) or by SHF_GNU_RETAIN (C's attribute retain, used); and every
+// section that is not code or data (debug information: what it describes
+// may go, its relocations to that are not applied: sym_dropped). The
+// unwind tables (.eh_frame, .pdata, .xdata) and exception tables are kept
+// but keep nothing themselves (an entry for left-out code describes code
+// that is not there, and is not relocated). What is left out is as a
+// dropped COMDAT copy is (S_DISCARD).
+// -----------------------------------------------------------------------------
+let ROOT_NAMES: [14][]u8 = ["main", "_start", "axiom.start_sp", "axiom.tls_info", "axiom.tls_key", "axiom.tls_index",
+                            "axiom.entry", "axiom.dll_entry", "DllMain", "ax_unavailable", "__libc_start_main",
+                            "_tls_used", "__dso_handle", "axiom_frame_table"];
+
+// May the section be left out (when nothing refers to it)?
+fn collectable(oi: usize, s: *elf.Sec) bool {
+    let k = s.kind;
+    if (oi >= n_inputs) or s.retain or (array_rank(s) != 0) or c_ident(s.name) {
+        return false;
+    }
+    if s.link1 > 0 {
+        return true;  // (kept with the section it goes with)
+    }
+    if (k != elf.S_TEXT) and (k != elf.S_RODATA) and (k != elf.S_DATA) and (k != elf.S_BSS) and (k != elf.S_TDATA) and
+       (k != elf.S_TBSS) {
+        return false;
+    }
+    if (elf.rets_rank(s) >= 0) and (s.link1 == 0) {
+        return false;  // (an object's one frame table, for all of its code)
+    }
+    return not inert(s) and not u.starts(s.name, ".gcc_except_table");
+}
+
+// A section kept that keeps nothing (an unwind table: see above).
+fn inert(s: *elf.Sec) bool {
+    return u.str_eq(s.name, ".eh_frame") or u.str_eq(s.name, ".pdata") or u.str_eq(s.name, ".xdata");
+}
+
+struct Gc {
+    live: u.List.[[]mut bool],  // per object, per section
+    work: u.List.[u64],         // object << 32 | section, to scan
+}
+
+fn gc_mark(g: *mut Gc, oi: usize, k: i32) void {
+    if k < 0 {
+        return;
+    }
+    let lv = g.live.get(oi);
+    let ku = @int_cast(usize, k);
+    if lv[ku] or (objs.get(oi).secs.get(ku).kind == elf.S_DISCARD) {
+        return;
+    }
+    lv[ku] = true;
+    g.work.push((@as(u64, oi) << 32) | @as(u64, ku));
+}
+
+// The section the symbol si of object oi refers to is in: its own, or for
+// a global its definition's (as resolved); marked.
+fn gc_mark_sym(g: *mut Gc, oi: usize, si: u32) void {
+    let o = objs.get(oi);
+    let s = o.syms.at(@as(usize, si));
+    if (s.bind != elf.B_LOCAL) and (s.name.len > 0) {
+        let gi = gmap.get(u.intern(s.name));
+        if gi != 0 {
+            let d = gsyms.get(@as(usize, gi - 1));
+            if d.obj >= 0 {
+                let du = @as(usize, @bit_cast(u32, d.obj));
+                gc_mark(g, du, objs.get(du).syms.get(@as(usize, d.sym)).sec);
+            }
+        }
+    }
+    if s.sec >= 0 {
+        gc_mark(g, oi, s.sec);
+    }
+}
+
+fn collect_garbage() void {
+    let mut g = Gc.{ live: u.List.[[]mut bool].empty(), work: u.List.[u64].empty() };
+    for oi in 0..objs.len {
+        g.live.push(u.newn.[bool](objs.get(oi).secs.len + 1));
+    }
+    // the roots
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            if (s.kind != elf.S_DISCARD) and not collectable(oi, s) {
+                gc_mark(&mut g, oi, @int_cast(i32, k));
+            }
+        }
+        if g_gc_exports and (oi < n_inputs) {
+            for si in 0..o.syms.len {
+                let sy = o.syms.get(si);
+                if (sy.bind != elf.B_LOCAL) and not sy.hidden and (sy.sec >= 0) {
+                    gc_mark(&mut g, oi, sy.sec);
+                }
+            }
+        }
+    }
+    for n in ROOT_NAMES {
+        let gi = gmap.get(u.intern(n));
+        if gi != 0 {
+            let d = gsyms.get(@as(usize, gi - 1));
+            if d.obj >= 0 {
+                let du = @as(usize, @bit_cast(u32, d.obj));
+                gc_mark(&mut g, du, objs.get(du).syms.get(@as(usize, d.sym)).sec);
+            }
+        }
+    }
+    // what goes with each section (SHF_LINK_ORDER), and the groups'
+    // members: lists through `next`, from heads by section (dhead) and by
+    // group (ghead); each section's group entry (gof)
+    let mut ents = u.List.[u64].empty();  // object << 32 | section
+    let mut next = u.List.[u32].empty();  // the list's next entry + 1
+    let mut dhead = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    let mut ghead = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    let mut gof = u.SymMap.[[]u8].{ keys: u.nil.[usize](), vals: u.nil.[[]u8](), cap: 0, len: 0 };
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            if s.link1 > 0 {
+                let key = sec_key(oi, @as(usize, @bit_cast(u32, s.link1 - 1)));
+                ents.push((@as(u64, oi) << 32) | @as(u64, k));
+                next.push(dhead.get(key));
+                dhead.put(key, @int_cast(u32, ents.len));
+            }
+            if s.group.len > 0 {
+                gc_member(
+                    &mut ents, &mut next, &mut ghead, &mut gof, oi, k, u.intern(u.f2("%s/%s", u.zdec(oi), s.group)));
+            }
+        }
+        for gi in 0..o.groups.len {
+            let gk = u.intern(u.f2("%s/#%s", u.zdec(oi), u.zdec(gi)));
+            for k in o.groups.at(gi).secs.items() {
+                gc_member(&mut ents, &mut next, &mut ghead, &mut gof, oi, @as(usize, @bit_cast(u32, k)), gk);
+            }
+        }
+    }
+    // the closure
+    while g.work.len > 0 {
+        let x = g.work.pop();
+        let oi = @truncate(usize, x >> 32);
+        let k = @truncate(usize, x & 0xffff_ffff);
+        let o = objs.get(oi);
+        let s = o.secs.get(k);
+        if not inert(s) and (s.kind != elf.S_DEBUG) {
+            for r in s.relocs.items() {
+                if @as(usize, r.sym) < o.syms.len {
+                    gc_mark_sym(&mut g, oi, r.sym);
+                }
+            }
+        }
+        let key = sec_key(oi, k);
+        let mut d = dhead.get(key);
+        while d != 0 {
+            let e = ents.get(@as(usize, d - 1));
+            gc_mark(&mut g, @truncate(usize, e >> 32), @truncate(i32, @bit_cast(i64, e & 0xffff_ffff)));
+            d = next.get(@as(usize, d - 1));
+        }
+        let gk = gof.get(key);
+        if gk.len > 0 {
+            let mut m = ghead.get(gk);
+            while m != 0 {
+                let e = ents.get(@as(usize, m - 1));
+                gc_mark(&mut g, @truncate(usize, e >> 32), @truncate(i32, @bit_cast(i64, e & 0xffff_ffff)));
+                m = next.get(@as(usize, m - 1));
+            }
+        }
+    }
+    // the rest is left out
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        let lv = g.live.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            if not lv[k] and (s.kind != elf.S_DISCARD) {
+                s.kind = elf.S_DISCARD;
+                s.relocs.deinit();
+                s.relocs = u.List.[elf.Rel].empty();
+            }
+        }
+    }
+    ents.deinit();
+    next.deinit();
+    g.work.deinit();
+}
+
+// A name for section k of object oi (interned).
+fn sec_key(oi: usize, k: usize) []u8 {
+    return u.intern(u.f2("%s:%s", u.zdec(oi), u.zdec(k)));
+}
+
+// Section k of object oi is in the group named gk (interned).
+fn gc_member(ents: *mut u.List.[u64], next: *mut u.List.[u32], ghead: *mut u.SymMap.[u32], gof: *mut u.SymMap.[[]u8],
+             oi: usize, k: usize, gk: []u8) void {
+    ents.push((@as(u64, oi) << 32) | @as(u64, k));
+    next.push(ghead.get(gk));
+    ghead.put(gk, @int_cast(u32, ents.len));
+    gof.put(sec_key(oi, k), gk);
+}
+
+// -----------------------------------------------------------------------------
+// The frame table
+// -----------------------------------------------------------------------------
+struct RetEnt {
+    ret: u64,    // the return address (or the place of a marker)
+    chain: u64,  // the chain's address, plus the flags
+    idx: u64,    // its place before (ties keep their order)
+}
+
+fn ret_cmp(a: RetEnt, b: RetEnt) i32 {
+    if a.ret != b.ret {
+        if a.ret < b.ret {
+            return -1;
+        }
+        return 1;
+    }
+    if a.idx < b.idx {
+        return -1;
+    }
+    return 1;
+}
+
+fn sx32(x: u64) u64 {
+    return @bit_cast(u64, @as(i64, @bit_cast(i32, @truncate(u32, x))));
+}
+
+/// Sorts the frame table (ftab.ax) of the image b (file_of: an address's
+/// offset in it) by return address, once its relocations are applied: the
+/// sections of code are not placed in the order of their tables (the cold
+/// code after the rest: place), and the runtime searches it by halves.
+/// Both fields of an entry are relative to themselves, so a moved entry
+/// gets them again for its new place.
+pub fn sort_rets(b: []mut u8, file_of: fn(u64) u64) void {
+    if (gmap.get(u.intern("__start_axiom_rets")) == 0) or (gmap.get(u.intern("__stop_axiom_rets")) == 0) {
+        return;
+    }
+    let a = global_addr("__start_axiom_rets");
+    let z = global_addr("__stop_axiom_rets");
+    if (a == 0) or (z <= a + 8) {
+        return;
+    }
+    let n = @truncate(usize, (z - a) / 8);
+    let fo = @truncate(usize, file_of(a));
+    let es = u.newn.[RetEnt](n);
+    let mut sorted = true;
+    for i in 0..n {
+        let e = a + (8 * @as(u64, i));
+        let p = fo + (8 * i);
+        es[i] = RetEnt.{ ret: e +% sx32(bn.rd32(b, p)), chain: (e + 4) +% sx32(bn.rd32(b, p + 4)), idx: @as(u64, i) };
+        if (i > 0) and (es[i].ret < es[i - 1].ret) {
+            sorted = false;
+        }
+    }
+    if sorted {
+        return;
+    }
+    u.sort(es, ret_cmp);
+    for i in 0..n {
+        let e = a + (8 * @as(u64, i));
+        let p = @as(u64, fo + (8 * i));
+        bn.w32(b, p, (es[i].ret -% e) & 0xffff_ffff);
+        bn.w32(b, p + 4, (es[i].chain -% (e + 4)) & 0xffff_ffff);
+    }
+}
+
+// A section of code's place: 0 hot (.text.hot), 1 the rest, 2 cold
+// (.text.unlikely, and their per-function forms .text.hot.<name>, ...).
+fn text_rank(s: *elf.Sec) i32 {
+    let n = s.name;
+    if u.str_eq(n, ".text.hot") or u.starts(n, ".text.hot.") {
+        return 0;
+    }
+    if u.str_eq(n, ".text.unlikely") or u.starts(n, ".text.unlikely.") {
+        return 2;
+    }
+    return 1;
+}
+
 // Places the sections of class `cls` from address `at`; returns the end.
 // First the class's ordinary sections (of read-only data, the frame tables
 // last, together: elf.rets_rank), then the initialization and termination
@@ -627,6 +973,8 @@ pub fn place(cls: i32, at: u64) u64 {
     let mut passes: i32 = 1;
     if cls == C_CONST {
         passes = 4;
+    } else if cls == C_TEXT {
+        passes = 3;  // (hot, the rest, cold: text_rank)
     }
     let mut arrays = u.List.[u64].empty();  // rank << 40 | object << 20 | section
     let mut named = u.List.[u64].empty();   // object << 20 | section
@@ -641,7 +989,10 @@ pub fn place(cls: i32, at: u64) u64 {
                 if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
                     continue;
                 }
-                if pass == 0 {
+                if (cls == C_TEXT) and (text_rank(s) != pass) {
+                    continue;
+                }
+                if (pass == 0) or (cls == C_TEXT) {
                     let r = array_rank(s);
                     if r != 0 {
                         arrays.push((r << 40) | (@as(u64, oi) << 20) | @as(u64, k));

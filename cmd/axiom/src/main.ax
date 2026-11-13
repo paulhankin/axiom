@@ -28,6 +28,8 @@
 //                              GUI program with no console window
 //   --icon=<file.ico>          Windows: the program's icon (in its resources)
 //   --stack-size=<n>[K|M|G]    the main thread's stack (nl.g_stack_size)
+//   --function-sections --data-sections   a section per function, per datum
+//   --gc-sections --no-gc-sections        the link leaves out unreferenced sections
 //   -o <path>                  output path
 //
 // C sources (c_option, c_options, build_c):
@@ -53,6 +55,7 @@ import "elink.ax" as el;
 import "fmt.ax" as fmt;
 import "header.ax" as header;
 import "ide.ax" as ide;
+import "isel.ax" as isel;
 import "jstub.ax" as jstub;
 import "linkin.ax" as linkin;
 import "lsp.ax" as lsp;
@@ -102,6 +105,8 @@ fn usage() void {
     u.eprint("  --icon=<file.ico>        Windows: the program's icon, shown by Explorer and the taskbar\n");
     u.eprint("  --stack-size=<n>[K|M|G]  the main thread's stack (Windows: and its threads'; default 8M;\n");
     u.eprint("                           WebAssembly 1M; Linux: the system's limit)\n");
+    u.eprint("  --function-sections, --data-sections   native: each function, each datum in a section of its own\n");
+    u.eprint("  --gc-sections, --no-gc-sections        native: the link leaves out the sections nothing refers to\n");
     u.eprint("  --units=module|program   compile modules separately (cached) or as one unit\n");
     u.eprint("                           (default: module at -O0/-O1, program at -O2/-O3)  --verbose\n");
     u.eprint("  C sources:\n");
@@ -415,7 +420,7 @@ fn remove_cabi_unit() void {
 let mut g_own_inputs: bool = false;
 // --c-lib=system: the system's C library is the program's (docs/c.md).
 let mut g_c_lib_system: bool = false;
-// Objects compiled from --link=<file.c> by the system's C compiler (removed
+// Objects compiled from --link=<file.c> (cc_compile, own_cc_compile; removed
 // after the link).
 let mut g_cc_objs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 
@@ -442,10 +447,10 @@ fn own_inputs(o: *Options) bool {
 // The objects, archives and libraries an executable is linked with
 // (o.link_inputs but Axiom sources, and -l, -L), read before anything is
 // compiled (linkin.ax): what they refer to the program defines, our own
-// linker then linking them. A C source among them is compiled by the
-// system's C compiler first. Where our linkers do not read them yet (the
-// targets but Linux), the system's toolchain links (link). False after an
-// error (reported).
+// linker then linking them. A C source among them is compiled first: by
+// the system's C compiler for Linux (cc_compile), by this compiler for
+// macOS and Windows (own_cc_compile), by clang for WebAssembly. False after
+// an error (reported).
 fn load_link_inputs(o: *mut Options) bool {
     if not own_inputs(o) {
         return true;
@@ -460,7 +465,12 @@ fn load_link_inputs(o: *mut Options) bool {
             }
             paths.push(obj);
         } else if is_c_source(p) {
-            let obj = cc_compile(o, p, k);
+            let mut obj: []u8 = "";
+            if tg.g_os == tg.OS_LINUX {
+                obj = cc_compile(o, p, k);
+            } else {
+                obj = own_cc_compile(o, p, k);
+            }
             if u.isnos(obj) {
                 return false;
             }
@@ -505,6 +515,53 @@ fn cc_compile(o: *Options, p: []u8, k: usize) []u8 {
     av.push(obj);
     if u.run_status(av.items(), u.OUT_INHERIT) != 0 {
         dg.emit_fatal(o.json, "E9004", u.f1("the system's C compiler failed on %s", p));
+        return u.nosym();
+    }
+    g_cc_objs.push(obj);
+    return obj;
+}
+
+// Compiles C source p (--link=) into an object for a macOS or Windows
+// target, which have no C compiler here (the system's compiles for Linux);
+// its path, or nosym after an error (reported). The compiler is this one
+// (its C front end, in a process of its own: axiom build p --emit=obj), for
+// the build's target, with -O2 and the build's C options (--c-std, --c-lib,
+// -D, -U, -I, ...), --std, --cpu and --features: an object in the target's
+// format, of the program's C dialect, ABI and C library.
+fn own_cc_compile(o: *Options, p: []u8, k: usize) []u8 {
+    let mut tmp = o.out;
+    if u.isnos(tmp) {
+        tmp = strip_ph(u.basename(o.input));
+    }
+    let obj = u.f3("%s.c%s.%s.o", tmp, u.zdec(k), u.idec(u.getpid()));
+    let mut av = u.List.[[]u8].empty();
+    av.push(u.self_path());
+    av.push("build");
+    av.push(p);
+    av.push("--emit=obj");
+    av.push(u.cat2("--target=", o.target));
+    av.push("-O2");
+    if not u.isnos(o.std_dir) and (o.std_dir.len > 0) {
+        av.push(u.cat2("--std=", o.std_dir));
+    }
+    if not u.isnos(o.co.cpu) {
+        av.push(u.cat2("--cpu=", o.co.cpu));
+    }
+    for f in o.feature_args.items() {
+        av.push(u.cat2("--features=", f));
+    }
+    for a in o.c_args.items() {
+        av.push(a);
+    }
+    for j in 0..o.inc_flags.len {
+        av.push(o.inc_flags.get(j));
+    }
+    av.push("-o");
+    av.push(obj);
+    // (its diagnostics on stderr, in human form: the build's own report,
+    // with --format=agent-json the one document on stdout, says it failed)
+    if u.run_status(av.items(), u.OUT_INHERIT) != 0 {
+        dg.emit_fatal(o.json, "E9004", u.f1("compiling %s (--link=) failed", p));
         return u.nosym();
     }
     g_cc_objs.push(obj);
@@ -1006,6 +1063,14 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             o.json = false;
         } else if u.starts(a, "--std=") {
             o.std_dir = a[6..];
+        } else if u.str_eq(a, "--function-sections") {
+            isel.g_function_sections = true;
+        } else if u.str_eq(a, "--data-sections") {
+            isel.g_data_sections = true;
+        } else if u.str_eq(a, "--gc-sections") {
+            nl.g_gc_sections = true;
+        } else if u.str_eq(a, "--no-gc-sections") {
+            nl.g_gc_sections = false;
         } else if u.str_eq(a, "--pic") {
             tg.g_pic = true;  // (code for a shared library: target.ax)
         } else if u.str_eq(a, "--subsystem=console") {
@@ -1949,6 +2014,7 @@ fn set_emit(o: *Options, final_link: bool) bool {
     if u.str_eq(o.emit, "obj") or u.str_eq(o.emit, "lib") or u.str_eq(o.emit, "shared") {
         co.emit = cg.EMIT_OBJ;
         cg.g_object_output = true;
+        isel.g_comdat = true;  // (link-once definitions in COMDAT groups)
         cfront.set_object_output(true);
         be.g_native_format = true;
         be.g_stubs = not ty.g_target.is_wasm and (tg.g_os == tg.OS_LINUX) and not g_c_object;

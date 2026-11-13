@@ -2002,6 +2002,55 @@ pub struct Module {
     // (cover.ax), or nil
     cov_area: *mut Value,
     cov_prev: *mut Value,
+    // other names of functions and globals (C's attribute alias): each a
+    // symbol of its own at its target's place (isel.ax), and a declaration
+    // of the name is its target (merge_same_named)
+    aliases: u.List.[Alias],
+}
+
+/// Another name for a function or global (C's attribute alias, a GNU
+/// dialect): a symbol `name`, weak or not, of visibility `visibility`
+/// (VIS_), at the place of `target` (a function's value or a global's).
+pub struct Alias {
+    name: []u8,
+    target: *mut Value,
+    weak: bool,
+    visibility: u8,
+}
+
+/// Adds alias `name` of `target` to m.
+pub fn add_alias(m: *mut Module, name: []u8, target: *mut Value, weak: bool, visibility: u8) void {
+    m.aliases.push(Alias.{ name: u.intern(name), target: target, weak: weak, visibility: visibility });
+}
+
+/// The function an alias names, or nil (it names a global, or a definition
+/// of its name overrides it: a weak alias).
+pub fn alias_func(m: *mut Module, a: *Alias) *mut Func {
+    if (a.target.kind != V_FUNC) or alias_overridden(m, a) {
+        return u.nil.[Func]();
+    }
+    return fnp_of(a.target);
+}
+
+/// The global an alias names, or nil (likewise).
+pub fn alias_global(m: *mut Module, a: *Alias) *mut Global {
+    if (a.target.kind != V_GLOBAL) or alias_overridden(m, a) {
+        return u.nil.[Global]();
+    }
+    return gv_of(a.target);
+}
+
+// Is a weak alias's name defined otherwise (a strong definition wins)?
+fn alias_overridden(m: *mut Module, a: *Alias) bool {
+    if not a.weak {
+        return false;
+    }
+    let f = m.fmap.get(a.name);
+    if u.notnil(f) and not is_decl(f) {
+        return true;
+    }
+    let g = m.gmap.get(a.name);
+    return u.notnil(g) and u.notnil(g.init);
 }
 
 pub fn vnil() *mut Value {
@@ -4796,6 +4845,21 @@ pub fn merge_same_named(m: *mut Module) void {
         }
     }
     let mut any = false;
+    // an alias's name, declared (by another C unit): its target, unless a
+    // definition of the name overrides a weak alias
+    for k in 0..m.aliases.len {
+        let a = m.aliases.at(k);
+        let af = alias_func(m, a);
+        if u.notnil(af) and u.isnil(defs.get(a.name)) {
+            defs.put(a.name, af);
+        }
+        let ag = alias_global(m, a);
+        let dg = m.gmap.get(a.name);
+        if u.notnil(ag) and u.notnil(dg) and u.isnil(dg.init) and (dg != ag) {
+            forward(dg.val, ag.val);
+            any = true;
+        }
+    }
     let mut kept = u.List.[*mut Func].empty();
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);

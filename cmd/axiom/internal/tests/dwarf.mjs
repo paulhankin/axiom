@@ -44,8 +44,24 @@ function loadElf(d) {
   const secs = [];
   for (let i = 0; i < shnum; i++) {
     const h = sh(i);
-    secs.push({ name: cstr(d, strOff + u32(d, h)), type: u32(d, h + 4), addr: u64(d, h + 16), off: u64(d, h + 24),
-                size: u64(d, h + 32), link: u32(d, h + 40), info: u32(d, h + 44) });
+    secs.push({ name: cstr(d, strOff + u32(d, h)), type: u32(d, h + 4), flags: u64(d, h + 8), addr: u64(d, h + 16),
+                off: u64(d, h + 24), size: u64(d, h + 32), link: u32(d, h + 40), info: u32(d, h + 44),
+                align: u64(d, h + 48) });
+  }
+  // an object's sections of code one after the other (from address 0, in
+  // their order: a function in a section of its own, a COMDAT group's, a
+  // cold one's), its other sections at 0
+  if (type === 1) {
+    let at = 0;
+    for (const s of secs) {
+      s.base = 0;
+      if ((s.flags & 6) === 6 && s.type === 1) {
+        const al = Math.max(s.align, 1);
+        at = Math.ceil(at / al) * al;
+        s.base = at;
+        at += s.size;
+      }
+    }
   }
   const data = (s) => Buffer.from(d.subarray(s.off, s.off + (s.type === 8 ? 0 : s.size)));
   const sections = new Map();
@@ -61,16 +77,20 @@ function loadElf(d) {
     }
   }
   const text = secs.findIndex((s) => s.name === '.text');
-  const funcs = syms.filter((s) => (s.info & 15) === 2 && s.shndx === text && s.size > 0)
-    .map((s) => ({ name: s.name, addr: s.value, size: s.size }));
+  // (an object's: its symbols at their sections' places)
+  const code = (i) => i === text || (type === 1 && i > 0 && i < secs.length && (secs[i].flags & 6) === 6);
+  const symBase = (sy) => (type === 1 && sy.shndx > 0 && sy.shndx < secs.length ? secs[sy.shndx].base : 0);
+  const funcs = syms.filter((s) => (s.info & 15) === 2 && code(s.shndx) && s.size > 0)
+    .map((s) => ({ name: s.name, addr: s.value + symBase(s), size: s.size }));
   const img = { kind: type === 1 ? 'elf-rel' : 'elf-exec', machine, sections, funcs, rets: [] };
   if (type !== 1) return img;
-  // an object: its sections at address 0, the debug sections' relocations applied
-  const symVal = (i) => syms[i].value;
+  // an object: its sections of code one after the other (above), the debug
+  // sections' relocations applied
+  const symVal = (i) => syms[i].value + symBase(syms[i]);
   for (const r of secs.filter((s) => s.type === 4)) {
     const target = secs[r.info];
     const buf = sections.get(target.name);
-    const isRets = target.name === 'axiom_rets';
+    const isRets = target.name === 'axiom_rets';  // (one per section of code: all together)
     if (!buf && !isRets) continue;
     const rel = [];
     for (let k = 0; k < r.size / 24; k++) {
@@ -457,7 +477,8 @@ export function checkDebug(img, opts = {}) {
   for (const un of dw.units) {
     const cu = un.die;
     if (!cu || cu.tag !== 0x11) { E(`unit at 0x${un.off.toString(16)} is not a compile unit`); continue; }
-    const lo = cu.attrs.get(AT_LOW), hi = lo + cu.attrs.get(AT_HIGH);
+    // (low and high pc, or DW_AT_ranges: code in several sections)
+    const cur = dieRanges(dw, cu) || [];
     for (const c of cu.children) {
       if (c.tag !== TAG_SUBPROGRAM) continue;
       if (c.attrs.has(AT_INLINE)) {
@@ -473,7 +494,7 @@ export function checkDebug(img, opts = {}) {
       if (img.kind === 'wasm' && (low === 0xffffffff || low >= 2 ** 64 - 2 ** 16)) continue;
       if (!name) E(`a subprogram without a name at 0x${c.off.toString(16)}`);
       if (!(high > low)) E(`${name}: empty range`);
-      if (low < lo || high > hi) E(`${name}: [0x${low.toString(16)}, 0x${high.toString(16)}) outside its unit`);
+      if (!cur.some(([lo, hi]) => low >= lo && high <= hi)) E(`${name}: [0x${low.toString(16)}, 0x${high.toString(16)}) outside its unit`);
       if (!(c.attrs.get(AT_DECL_LINE) >= 0)) E(`${name}: no declaration line`);
       subs.push({ name, low, high, die: c, unit: un });
     }
@@ -484,7 +505,7 @@ export function checkDebug(img, opts = {}) {
   }
   // every function of the image in a unit's range has its subprogram
   const byLow = new Map(subs.map((s) => [s.low, s]));
-  const ranges = dw.units.map((un) => [un.die.attrs.get(AT_LOW), un.die.attrs.get(AT_LOW) + un.die.attrs.get(AT_HIGH)]);
+  const ranges = dw.units.flatMap((un) => dieRanges(dw, un.die) || []);
   const fns = img.funcs || (img.bodies || []).map((b) => ({ name: `(body at 0x${b.addr.toString(16)})`, addr: b.addr, size: b.size }));
   let nf = 0;
   for (const f of fns) {
@@ -580,13 +601,13 @@ export function checkDebug(img, opts = {}) {
 // with base_address), null if it has none.
 export function dieRanges(dw, die) {
   const lo = die.attrs.get(AT_LOW);
-  if (lo !== undefined) return [[lo, lo + die.attrs.get(AT_HIGH)]];
   const off = die.attrs.get(AT_RANGES);
-  if (off === undefined) return null;
+  if (off === undefined) return lo === undefined ? null : [[lo, lo + die.attrs.get(AT_HIGH)]];
   const r = new Rd(dw.S.rnglists, off), out = [];
-  // (addresses of the units' size: 4 on wasm32)
+  // (addresses of the units' size: 4 on wasm32; a low pc with ranges is
+  // their base address)
   const asz = dw.units.length ? dw.units[0].asz : 8, A = () => r.addr(asz);
-  let base = 0;
+  let base = lo || 0;
   for (;;) {
     const k = r.u8();
     if (k === 0) return out;

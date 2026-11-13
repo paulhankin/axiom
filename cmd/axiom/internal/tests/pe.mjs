@@ -491,7 +491,12 @@ function checkArm64Code(d, { E, off, text, pdata, iat, entry, funcs, r }) {
         const imm = w & 0x3ffffff, t = a + (imm >= 0x2000000 ? imm - 0x4000000 : imm) * 4;
         const bl = ((w & 0xfc000000) >>> 0) === 0x94000000;
         if (bl) { calls = true; ncalls++; }
-        const ok = fstart.has(t) || thunks.has(t) || (!bl && t >= a0 && t < end);
+        // (a cold part, outline.ax's <f>.cold<n>, goes back into the code it
+        // was taken out of: f's, or, f inlined, that of the function f was
+        // inlined into)
+        const cold = /\.cold\d+(\.\d+)?$/.test(f.name);
+        const ok = fstart.has(t) || thunks.has(t) || (!bl && t >= a0 && t < end) ||
+          (!bl && cold && all.some((g) => g !== f && t > g.at && t < g.at + g.size));
         if (!ok) E(`${f.name}+0x${(a - a0).toString(16)}: a ${bl ? 'bl' : 'b'} to 0x${t.toString(16)}, no function's start${bl ? '' : ' and not within the function'}`);
       } else if (((w & 0xfffffc1f) >>> 0) === 0xd63f0000) calls = true;  // blr
       if (w >>> 0 === 0xd65f03c0) rets.push(a);

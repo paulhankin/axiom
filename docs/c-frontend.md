@@ -260,7 +260,7 @@ The other options of `axiom build` that apply: `--target`, `--cpu`, `--features`
 records, so stack traces show C frames with their lines; on WebAssembly they have none),
 `-g` (debug information: `cgen_debug.ax` describes the types and variables, which
 `dwarf.ax` writes; at `-O0` the objects of variables stay in memory, `ir.F_VAR`), `-l`, `-L`, `--link=`
-(objects, libraries, and C sources for the system's C compiler), `--subsystem`, `--icon`,
+(objects, libraries, and C sources compiled to objects first), `--subsystem`, `--icon`,
 `--pdb`. Those of Axiom code (`--overflow`, `--sanitize`, `--coverage`,
 `--units`, `--emit-header`) are errors with C sources (an Axiom program with C units
 takes `--overflow` and `--emit-header`), as are the C options without one, and `axiom

@@ -20,9 +20,17 @@
 //                              thread-local's offset in the program's
 //                              block is its offset in the .tls output
 //                              section: IMAGE_REL_*_SECREL)
-//   .init_array, .fini_array   .CRT$XCU and .CRT$XTU (those of a priority:
-//                              .CRT$XCT<NNNNN>, .CRT$XTT<NNNNN>, before the
-//                              plain ones, as the generic ABI orders them)
+//   .init_array, .fini_array   .CRT$XCU (those of a priority: .CRT$XCT<NNNNN>,
+//                              before the plain ones, as the generic ABI
+//                              orders them) and .CRT$XTT<65535 - priority>
+//                              (the plain ones .CRT$XTT00000): the C
+//                              runtime runs either table forward, in the
+//                              order of the names, so the destructors run
+//                              in the reverse order of their priorities,
+//                              the plain ones first, as on ELF systems,
+//                              whichever linker links them (plink.ax too:
+//                              read below, and the start-up walks this
+//                              table forward on Windows: cgen.ax)
 //   a C-identifier section X   X$m, with its bounds (when the object refers
 //                              to __start_X or __stop_X) the symbols
 //                              __start_X in X$a and __stop_X in X$z, empty
@@ -51,7 +59,8 @@
 //
 // read() takes the sections (grouped ones, "name$suffix", by their names;
 // .CRT$XC*/.CRT$XI* become initialization arrays and .CRT$XT*/.CRT$XP*
-// termination ones, in their suffixes' order, the CRT's own bounds .CRT$XCA,
+// termination ones, in their suffixes' order (the termination array run
+// forward on Windows), the CRT's own bounds .CRT$XCA,
 // .CRT$XCZ and kin dropped), COMDAT sections as groups (every selection is
 // taken as "any": the first object's copy; associative sections go with
 // theirs), weak externals as weak symbols, common symbols as weak zero-fill
@@ -90,6 +99,7 @@ const SYM_CLASS_SECTION: u8 = 104;
 const SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
 
 // COMDAT selections
+const SELECT_NODUPLICATES: u8 = 1;
 const SELECT_ANY: u8 = 2;
 const SELECT_ASSOCIATIVE: u8 = 5;
 
@@ -283,11 +293,16 @@ fn place_of(s: *elf.Sec) CSec {
     } else if u.starts(n, ".init_array") or u.starts(n, ".fini_array") {
         let init_ = u.starts(n, ".init_array");
         let rest = n[11..];
+        let mut prio: u64 = 65535;  // (plain)
         if (rest.len > 1) and (rest[0] == '.') {
-            c.name = u.cat3(u.pick(init_, ".CRT$XCT", ".CRT$XTT"), digits5(@as(u64, @bit_cast(u64, u.atol(rest[1..])))),
-                            "");
+            prio = @min(@bit_cast(u64, u.atol(rest[1..])), 65535);
+        }
+        if not init_ {
+            c.name = u.cat2(".CRT$XTT", digits5(65535 - prio));
+        } else if prio < 65535 {
+            c.name = u.cat2(".CRT$XCT", digits5(prio));
         } else {
-            c.name = u.pick(init_, ".CRT$XCU", ".CRT$XTU");
+            c.name = ".CRT$XCU";
         }
         c.flags = init | al;
     } else if c_ident(n) {
@@ -604,6 +619,8 @@ pub fn write(o: *mut elf.Obj) []u8 {
                     labels: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                     refptrs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                     tag: object_tag(o), ok: true };
+    // the COMDAT sections (comdat_kinds), not merged with others
+    let cd = comdat_kinds(o);
     // the sections: the thread-local template (initialized, then zeros)
     // is one; the others one each (those of one name, merged)
     for pass in @as(u32, 0)..2 {
@@ -623,8 +640,8 @@ pub fn write(o: *mut elf.Obj) []u8 {
                 continue;
             }
             let c = place_of(s);
-            let merge = (tls_part != 2) or u.starts(c.name, ".CRT$") or u.str_eq(c.name, ".pdata") or
-                        u.str_eq(c.name, ".xdata");
+            let merge = (tls_part != 2) or u.starts(c.name, ".CRT$") or
+                        ((u.str_eq(c.name, ".pdata") or u.str_eq(c.name, ".xdata")) and (cd[k] == 0));
             let cs = csec_of(&mut w, c, merge);
             let x = w.secs.at(@as(usize, @bit_cast(u32, cs)));
             w.smap[k] = cs;
@@ -675,7 +692,10 @@ pub fn write(o: *mut elf.Obj) []u8 {
             w.ymap[i] = @bit_cast(i32, add_sym(&mut w, c));
             continue;
         }
-        if s.bind == elf.B_WEAK {
+        // (a COMDAT section's own symbol, a link-once definition: a plain
+        // external, the section's COMDAT symbol; the selection keeps one)
+        let own = (s.sec >= 0) and u.str_eq(o.secs.get(@as(usize, @bit_cast(u32, s.sec))).group, s.name);
+        if (s.bind == elf.B_WEAK) and not own {
             // a weak external with a default: the definition (another
             // name), or an absolute 0
             let mut dflt = c;
@@ -699,6 +719,20 @@ pub fn write(o: *mut elf.Obj) []u8 {
             func_aux(&mut c, s.size);
         }
         w.ymap[i] = @bit_cast(i32, add_sym(&mut w, c));
+    }
+    // the COMDAT sections' selections, and the sections associative to them
+    for k in 0..o.secs.len {
+        if (cd[k] == 0) or (w.smap[k] < 0) {
+            continue;
+        }
+        let x = w.secs.at(@as(usize, @bit_cast(u32, w.smap[k])));
+        x.flags = x.flags | SCN_LNK_COMDAT;
+        if cd[k] == SELECT_ASSOCIATIVE {
+            x.comdat = SELECT_ASSOCIATIVE;
+            x.assoc = @bit_cast(u32, w.smap[@as(usize, @bit_cast(u32, comdat_owner(o, cd, k)))]) + 1;
+        } else {
+            x.comdat = cd[k];
+        }
     }
     // the bounds of the C-identifier sections referred to: __start_X in
     // X$a, __stop_X in X$z
@@ -749,6 +783,79 @@ pub fn write(o: *mut elf.Obj) []u8 {
     return encode(&mut w);
 }
 
+// Each section's COMDAT selection (0: not a COMDAT section). A COMDAT
+// group's (elf.Sec.group) section of the symbol that names it is the COMDAT
+// section, "any" (a link keeps one object's); a section of code with one
+// function, at its start (--function-sections: isel.ax), is one with "no
+// duplicates" (so that a system linker may leave it out when nothing
+// refers to it); a section that goes with one of those (elf.Sec.link1: its
+// unwind information, frame table) or in such a group (its jump tables) is
+// associative to it (comdat_owner), as the PE/COFF specification's
+// "COMDAT Sections" has it.
+fn comdat_kinds(o: *elf.Obj) []mut u8 {
+    let cd = u.newn.[u8](o.secs.len + 1);
+    for si in 0..o.syms.len {
+        let sy = o.syms.at(si);
+        if (sy.sec < 0) or (sy.name.len == 0) {
+            continue;
+        }
+        let k = @as(usize, @bit_cast(u32, sy.sec));
+        let s = o.secs.get(k);
+        if (s.group.len > 0) and u.str_eq(s.group, sy.name) {
+            cd[k] = SELECT_ANY;
+        }
+    }
+    for k in 0..o.secs.len {
+        let s = o.secs.get(k);
+        if (cd[k] == 0) and (s.group.len == 0) and (s.kind == elf.S_TEXT) and u.starts(s.name, ".text.") and
+           (one_function(o, @int_cast(i32, k)) and (s.data.len() > 0)) {
+            cd[k] = SELECT_NODUPLICATES;
+        }
+    }
+    for k in 0..o.secs.len {
+        if (cd[k] == 0) and (comdat_owner(o, cd, k) >= 0) {
+            cd[k] = SELECT_ASSOCIATIVE;
+        }
+    }
+    return cd;
+}
+
+// The COMDAT section (by comdat_kinds' first two rules) a section goes with,
+// or -1.
+fn comdat_owner(o: *elf.Obj, cd: []u8, k: usize) i32 {
+    let s = o.secs.get(k);
+    if (s.link1 > 0) and
+       ((cd[@as(usize, @bit_cast(u32, s.link1 - 1))] == SELECT_ANY) or
+        (cd[@as(usize, @bit_cast(u32, s.link1 - 1))] == SELECT_NODUPLICATES)) {
+        return s.link1 - 1;
+    }
+    if s.group.len > 0 {
+        for j in 0..o.secs.len {
+            if (cd[j] == SELECT_ANY) and u.str_eq(o.secs.get(j).group, s.group) {
+                return @int_cast(i32, j);
+            }
+        }
+    }
+    return -1;
+}
+
+// Has section k one function, at its start, not weak, and no other symbol
+// there?
+fn one_function(o: *elf.Obj, k: i32) bool {
+    let mut n: usize = 0;
+    for si in 0..o.syms.len {
+        let sy = o.syms.at(si);
+        if (sy.sec != k) or (sy.name.len == 0) {
+            continue;
+        }
+        if (sy.ty != elf.T_FUNC) or (sy.value != 0) or (sy.bind == elf.B_WEAK) {
+            return false;  // (a weak definition: written as a weak external's default, not one)
+        }
+        n += 1;
+    }
+    return n == 1;
+}
+
 // A function's definition record (the specification's auxiliary format
 // 1): its size, so a reader knows it without the next symbol.
 fn func_aux(c: *mut CSym, size: u64) void {
@@ -792,7 +899,9 @@ fn encode(w: *mut W) []u8 {
             if (x.comdat != 0) and (x.comdat != SELECT_ASSOCIATIVE) {
                 for j in i + 1..w.syms.len {
                     let t = w.syms.get(j);
-                    if not placed[j] and (t.sec == s.sec) and (t.class == SYM_CLASS_EXTERNAL) {
+                    // (the function's symbol, which may be a static one)
+                    if not placed[j] and (t.sec == s.sec) and
+                       ((t.class == SYM_CLASS_EXTERNAL) or ((t.class == SYM_CLASS_STATIC) and (t.aux.len() == 0))) {
                         placed[j] = true;
                         order.push(@truncate(u32, j));
                         break;
@@ -1039,16 +1148,30 @@ fn classify(x: *ISec, name: *mut []u8) i32 {
         if not init_ and (g != 'T') and (g != 'P') {
             return -1;  // (.CRT$XL*: the thread-local callbacks, the loader's)
         }
-        // the order of the suffixes: XI before XC, each by its suffix;
-        // T<NNNNN> (this compiler's priorities) as they are; U and later
-        // plain
+        // the order of the suffixes, in which the C runtime runs the
+        // entries (forward): of the initializers XI before XC, each by its
+        // suffix, T<NNNNN> (this compiler's priorities) as they are, U and
+        // later plain; of the terminators (which the start-up runs forward
+        // on Windows: cgen.ax) XP first, then XT by its suffix, T<NNNNN>
+        // (this compiler's 65535 - priority) as they are, U, then the rest
         let mut prio: u64 = 0x10000;
-        if (rest.len == 6) and (rest[0] == 'T') and u.is_digit(rest[1]) {
-            prio = @bit_cast(u64, u.atol(rest[1..]));
-        } else if (g == 'I') or (g == 'P') {
-            prio = 50;
-        } else if u.str_cmp(rest, "U") < 0 {
-            prio = 100;
+        let numbered = (rest.len == 6) and (rest[0] == 'T') and u.is_digit(rest[1]);
+        if init_ {
+            if numbered {
+                prio = @bit_cast(u64, u.atol(rest[1..]));
+            } else if g == 'I' {
+                prio = 50;
+            } else if u.str_cmp(rest, "U") < 0 {
+                prio = 100;
+            }
+        } else if g == 'P' {
+            prio = 0;
+        } else if numbered {
+            prio = 2 + @min(@bit_cast(u64, u.atol(rest[1..])), 65532);
+        } else if u.str_cmp(rest, "T") < 0 {
+            prio = 1;
+        } else if u.str_eq(rest, "U") {
+            prio = 65535;
         }
         let a = u.pick(init_, ".init_array", ".fini_array");
         if prio < 0x10000 {
@@ -1265,7 +1388,12 @@ pub fn read(d: []u8) *mut elf.Obj {
                 }
             }
             if (x.comdat != 0) and (x.sig.len == 0) {
-                x.sig = s.name;  // (the section's COMDAT symbol: the first after it)
+                // (the section's COMDAT symbol: the first after it; a static
+                // one's section is the object's own, the copy of no other's)
+                x.sig = s.name;
+                if s.bind == elf.B_LOCAL {
+                    x.sig = u.f2("%s:%s", s.name, u.dec(secn));
+                }
             }
         } else if secn == -1 {
             s.sec = elf.SEC_ABS;
@@ -1320,7 +1448,7 @@ pub fn read(d: []u8) *mut elf.Obj {
         if sig.len == 0 {
             sig = u.f2("%s:%s", x.name, u.zdec(xi));  // (no symbol: never a copy of another's)
         }
-        let mut g = elf.Group.{ sig: u.intern(sig), secs: u.List.[i32].empty() };
+        let mut g = elf.Group.{ sig: u.intern(sig), secs: u.List.[i32].empty(), sel: x.comdat };
         g.secs.push(x.elf);
         o.groups.push(g);
     }
@@ -1557,6 +1685,7 @@ fn sizes(o: *mut elf.Obj) void {
             continue;  // (known)
         }
         let mut end = elf.sec_size(o.secs.get(@as(usize, @bit_cast(u32, x.sec))));
+        let mut next = false;
         let mut j = k + 1;
         while j < xs.len {
             let y = xs.get(j);
@@ -1565,12 +1694,15 @@ fn sizes(o: *mut elf.Obj) void {
             }
             if y.value > x.value {
                 end = y.value;
+                next = true;
                 break;
             }
             j += 1;
         }
         let sec = o.secs.get(@as(usize, @bit_cast(u32, x.sec)));
-        if sec.kind == elf.S_TEXT {
+        if (sec.kind == elf.S_TEXT) and next {
+            // (the last at its section's end has no padding after it: a
+            // trap's udf #0 that ends it is its own)
             // (not the padding to the next function: zeros, or int3 on x64)
             let dv = sec.data.view();
             while (end > x.value + 4) and (@truncate(usize, end) <= dv.len) and

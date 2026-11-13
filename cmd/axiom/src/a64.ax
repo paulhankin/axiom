@@ -100,7 +100,8 @@ const GT: i32 = 12;
 const LE: i32 = 13;
 
 let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
-let mut TEXT: i32 = 0;
+let mut TEXT: i32 = 0;   // the section of the code being made
+let mut TEXT0: i32 = 0;  // .text
 let mut RODATA: i32 = 0;
 let mut fsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 let mut gsym: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
@@ -3581,12 +3582,13 @@ fn gen_jump_table(b: *mut ir.Block, t: *mut ir.Value) void {
     }
     is.phi_copies(MF, b, reg, vreg, class_of, copy);
     let n = t.xs.len;
-    let s = OBJ.secs.get(@int_cast(usize, RODATA));
+    let jsec = is.group_rodata(OBJ, TEXT, RODATA);  // (with the code, in its COMDAT group if it is in one)
+    let s = OBJ.secs.get(@int_cast(usize, jsec));
     s.data.align(4);
     let off = @as(u64, s.data.len());
     s.data.zeros(4 * n);
-    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LJT", sec: RODATA, value: off, size: @as(u64, 4 * n),
-                                         bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false });
+    let sym = elf.add_sym(OBJ, elf.Sym.{ name: ".LJT", sec: jsec, value: off, size: @as(u64, 4 * n), bind: elf.B_LOCAL,
+                                         ty: elf.T_OBJECT, hidden: false });
     let ops = u.newn.[mc.MOp](n + 3);
     ops[0] = R(ix);
     ops[1] = mc.reg(vgpr(), mc.RD | mc.RE);
@@ -4738,7 +4740,9 @@ fn save_restore(load: bool) void {
 // walk needs the caller's return address, it does not).
 let mut frameless: bool = false;
 let mut FT: ft.Tab = ft.Tab.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), rets: -1, chains: -1, text_sym: 0,
-                              chains_sym: 0, rel32: 0, abs64: 0, empty: 0, lines: false,
+                              chains_sym: 0, text0: -1, rets0: -1, cur_text: -1,
+                              others: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, rel32: 0,
+                              abs64: 0, empty: 0, lines: false,
                               line_recs: u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0),
                                                           vals: @ptr_from_int(*mut u64, 0), cap: 0, len: 0 } };  // frame tables (ftab.ax)
 
@@ -4802,7 +4806,8 @@ let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, 
                                  abs_fns: u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 },
                                  abs_map: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                            vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
-                                 arefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 } };
+                                 arefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
+                                 ranges: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 } };
 let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 let mut xcfis: u.List.[dw.XCfi] = u.List.[dw.XCfi].{ data: @ptr_from_int(*mut dw.XCfi, 0), len: 0, cap: 0 };
 
@@ -5119,10 +5124,9 @@ fn enc_dynstack(i: *mut mc.MInst) void {
 
 // Jump tables: the jumps through one encoded so far, whose tables are
 // filled in once the function's place is known (fill_jump_tables), and a
-// local symbol at the start of .text for their entries (once per object).
+// local symbol at the start of the function's section for their entries.
 let mut jtabs: u.List.[*mut mc.MInst] = u.List.[*mut mc.MInst].{ data: @ptr_from_int(*mut *mut mc.MInst, 0), len: 0,
                                                                  cap: 0 };
-let mut JT_OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
 let mut JT_TEXT: u32 = 0;
 
 fn enc_jtab(i: *mut mc.MInst) void {
@@ -5153,11 +5157,7 @@ fn fill_jump_tables(base: u64, boff: []u64) void {
     if jtabs.len == 0 {
         return;
     }
-    if JT_OBJ != OBJ {
-        JT_OBJ = OBJ;
-        JT_TEXT = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: TEXT, value: 0, size: 0, bind: elf.B_LOCAL,
-                                             ty: elf.T_NOTYPE, hidden: false });
-    }
+    JT_TEXT = elf.sec_sym(OBJ, TEXT);  // (the code's section: the function's)
     for j in jtabs.items() {
         let ts = OBJ.syms.at(@as(usize, @bit_cast(u32, @truncate(i32, j.aux))));
         let sec = OBJ.secs.get(@int_cast(usize, ts.sec));
@@ -5546,17 +5546,31 @@ fn encode_func(f: *mut ir.Func) void {
         let r = rls.get(k);
         text.relocs.push(elf.Rel.{ off: base + r.off, ty: r.ty, sym: @bit_cast(u32, r.sym), addend: r.addend });
     }
-    let s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
+    let mut s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     s.value = base;
     s.size = @as(u64, code.len());
     aob.inline_place(OBJ, TEXT, base);
-    ft.func(&mut FT, base, s.size, frameless, calls.items()[0..0], calls.items(), rows.items(), scopes.items(),
+    ft.func(&mut FT, TEXT, base, s.size, frameless, calls.items()[0..0], calls.items(), rows.items(), scopes.items(),
             dw.func_name(f, elf.display_name(s.name)));
     if WIN_ and not frameless {
-        win_unwind(fsym.get(@int_cast(usize, f.id)), base, s.size);
+        // (code in a COMDAT group: its group's own unwind sections)
+        let sx = XDATA;
+        let sp = PDATA;
+        let ss = XDATA_SYM;
+        XDATA = is.group_unwind(OBJ, TEXT, ".xdata", XDATA);
+        PDATA = is.group_unwind(OBJ, TEXT, ".pdata", PDATA);
+        if XDATA != sx {
+            XDATA_SYM = elf.sec_sym(OBJ, XDATA);
+        }
+        win_unwind(fsym.get(@int_cast(usize, f.id)), base, @as(u64, code.len()));
+        XDATA = sx;
+        PDATA = sp;
+        XDATA_SYM = ss;
     }
+    // (the symbol again: a section symbol made since may have moved the list)
+    s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
     if WIN_ and (rows.len > 0) {
-        wlines.emit(OBJ, LINES, codeview.func_key(s.sec, s.value), rows.items());
+        wlines.emit(OBJ, LINES, codeview.func_key(s.name, s.value), rows.items());
     }
     if DBG.on {
         let mut regs: [20]u64 = [0; 20];
@@ -5676,12 +5690,12 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     LSE_ = tg.has(tg.A_LSE);
     WIN_ = tg.is_windows();
     OBJ = elf.new_obj(elf.EM_AARCH64);
-    JT_OBJ = u.nil.[elf.Obj]();
     tls_key_si = -1;
     tls_index_si = -1;
     consts = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     libsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     TEXT = elf.add_sec(OBJ, ".text", elf.S_TEXT, 16);
+    TEXT0 = TEXT;
     RODATA = elf.add_sec(OBJ, ".rodata", elf.S_RODATA, 16);
     XDATA = -1;
     PDATA = -1;
@@ -5757,7 +5771,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             dw.add_func(&mut DBG, &df);
             if WIN_ and (LINES >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
                 let ps = OBJ.syms.at(@as(usize, p.sym));
-                wlines.emit(OBJ, LINES, codeview.func_key(ps.sec, ps.value), p.rows);
+                wlines.emit(OBJ, LINES, codeview.func_key(ps.name, ps.value), p.rows);
             }
         }
     }
@@ -5777,7 +5791,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             u.scratch_begin();
             let outer = tg.begin_fn(f);  // (its own extensions: @features, @multiversion)
             LSE_ = tg.has(tg.A_LSE);
+            TEXT = OBJ.syms.get(@as(usize, fsym.get(@int_cast(usize, f.id)))).sec;  // (its section: isel.ax)
             compile_func(f);
+            TEXT = TEXT0;
             tg.end_fn(outer);
             u.scratch_end();
             ir.release_lists(f);
@@ -5786,6 +5802,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
             }
         }
     }
+    is.finish_aliases(OBJ);
     let msg = aob.resolve(OBJ);
     if msg.len > 0 {
         u.eprint(u.f1("axiom: AArch64 code generation: %s\n", msg));

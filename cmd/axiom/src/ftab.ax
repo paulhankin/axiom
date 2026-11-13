@@ -11,9 +11,14 @@
 //   i32  the return address (the end of the call instruction)
 //   i32  the chain, with flags in its two low bits (the chain is 8-aligned
 //        and the field is at 4 mod 8, so its offset is 4 mod 8)
-// Entries are in code order within an object, and the linkers place the
-// objects' sections in the same order as their code, so the table is sorted
-// (the runtime checks). Only calls that record something have an entry, and
+// Entries are in code order within a section of code: each section of code
+// (isel.ax: func_section) has its own axiom_rets section, the first one's
+// plain and the others' (and then the first's too) SHF_LINK_ORDER ones
+// that go with their code (elf.Sec.link1: a link that leaves the code out
+// leaves its entries out, and a system linker places them in the order of
+// their code), in the code's COMDAT group if it is in one. The compiler's
+// linkers sort the whole table by return address (nlink.ax: sort_rets), so
+// the table is sorted (the runtime checks). Only calls that record something have an entry, and
 // the calls in functions without a frame (x86-64: a leaf whose only calls do
 // not return): F_FRAMELESS says that the caller's own return address is
 // further up the stack (above the call's, past 8 bytes of alignment). A
@@ -57,10 +62,14 @@ pub const CALL_FRAMELESS: u64 = @as(u64, 1) << 63;
 pub struct Tab {
     on: bool,
     obj: *mut elf.Obj,
-    rets: i32,      // the section axiom_rets
+    rets: i32,      // the section axiom_rets of the function being done (select)
     chains: i32,    // where the chains go (.data.rel.ro)
-    text_sym: u32,  // local symbols at the start of .text and of `chains`
+    text_sym: u32,  // local symbols at the start of its code's section and of `chains`
     chains_sym: u32,
+    text0: i32,  // the first section of code (.text): its rets
+    rets0: i32,
+    cur_text: i32,              // the section of the function being done (select)
+    others: u.List.[u64],       // each other section of code << 32 | its axiom_rets
     rel32: u32,                 // R_X86_64_PC32 / R_AARCH64_PREL32
     abs64: u32,                 // R_X86_64_64 / R_AARCH64_ABS64
     empty: u64,                 // the empty chain's offset in `chains`
@@ -69,14 +78,9 @@ pub struct Tab {
 }
 
 pub fn off() Tab {
-    return Tab.{ on: false, obj: u.nil.[elf.Obj](), rets: -1, chains: -1, text_sym: 0, chains_sym: 0, rel32: 0,
-                 abs64: 0, empty: 0, lines: false,
+    return Tab.{ on: false, obj: u.nil.[elf.Obj](), rets: -1, chains: -1, text_sym: 0, chains_sym: 0, text0: -1,
+                 rets0: -1, cur_text: -1, others: u.List.[u64].empty(), rel32: 0, abs64: 0, empty: 0, lines: false,
                  line_recs: u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 } };
-}
-
-fn local_sym(o: *mut elf.Obj, sec: i32) u32 {
-    return elf.add_sym(o, elf.Sym.{ name: "", sec: sec, value: 0, size: 0, bind: elf.B_LOCAL, ty: elf.T_NOTYPE,
-                                    hidden: false });
 }
 
 // The module's frame table, if it has one (m.frame_tables), and the chains
@@ -92,9 +96,12 @@ pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut 
     t.lines = tg.g_debug != tg.DEBUG_NONE;
     t.obj = o;
     t.rets = elf.add_sec(o, "axiom_rets", elf.S_RODATA, 4);
+    t.rets0 = t.rets;
+    t.text0 = text;
+    t.cur_text = text;
     t.chains = chains;
-    t.text_sym = local_sym(o, text);
-    t.chains_sym = local_sym(o, chains);
+    t.text_sym = elf.sec_sym(o, text);
+    t.chains_sym = elf.sec_sym(o, chains);
     t.rel32 = rel32;
     t.abs64 = abs64;
     let cs = o.secs.get(@int_cast(usize, chains));
@@ -160,7 +167,10 @@ pub fn call_aux(v: *ir.Value) i64 {
     return ir.chain_of(v).off;
 }
 
-fn entry(t: *Tab, at: u64, chain: u64, flags: u64) void {
+fn entry(t: *mut Tab, at: u64, chain: u64, flags: u64) void {
+    if t.rets < 0 {
+        select_rets(t);
+    }
     let s = t.obj.secs.get(@int_cast(usize, t.rets));
     let o = @as(u64, s.data.len());
     s.relocs.push(elf.Rel.{ off: o, ty: t.rel32, sym: t.text_sym, addend: @bit_cast(i64, at) });
@@ -338,15 +348,45 @@ fn line_rec(t: *mut Tab, src: u32, name: []u8) u64 {
     return rec;
 }
 
-// A function's entries, once its code is at `base` in .text (`size` bytes):
+// Makes the entries that follow those of section `text`'s code (its
+// axiom_rets made with the first of them: entry).
+fn select(t: *mut Tab, text: i32) void {
+    t.cur_text = text;
+    t.rets = -1;
+}
+
+fn select_rets(t: *mut Tab) void {
+    let text = t.cur_text;
+    t.text_sym = elf.sec_sym(t.obj, text);
+    if text == t.text0 {
+        t.rets = t.rets0;
+        return;
+    }
+    for x in t.others.items() {
+        if @truncate(i32, @bit_cast(i64, x >> 32)) == text {
+            t.rets = @truncate(i32, @bit_cast(i64, x & 0xffff_ffff));
+            return;
+        }
+    }
+    // (a second section of code: the first's entries go with it too)
+    t.obj.secs.get(@int_cast(usize, t.rets0)).link1 = t.text0 + 1;
+    t.rets = elf.add_sec(t.obj, "axiom_rets", elf.S_RODATA, 4);
+    let r = t.obj.secs.get(@int_cast(usize, t.rets));
+    r.link1 = text + 1;
+    r.group = t.obj.secs.get(@int_cast(usize, text)).group;
+    t.others.push((@as(u64, @bit_cast(u32, text)) << 32) | @as(u64, @bit_cast(u32, t.rets)));
+}
+
+// A function's entries, once its code is at `base` in section `text` (`size` bytes):
 // `calls` holds pairs of the offset after a call and its MInst.aux; `rows`
 // its line table's rows when it has one (else empty), `scopes` where its
 // scope changes (dwarf.Func.scopes: the inline instances), `name` its name.
-pub fn func(t: *mut Tab, base: u64, size: u64, frameless: bool, noframe: []u64, calls: []u64, rows: []u64,
+pub fn func(t: *mut Tab, text: i32, base: u64, size: u64, frameless: bool, noframe: []u64, calls: []u64, rows: []u64,
             scopes: []u64, name: []u8) void {
     if not t.on {
         return;
     }
+    select(t, text);
     // (an exported function by its own name: C's main, say)
     let mut nm = name;
     if u.starts(nm, "axiom.export.") and (nm.len > 13) {

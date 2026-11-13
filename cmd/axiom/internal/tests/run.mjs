@@ -611,13 +611,13 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // compiled by the system's C compiler, loads (its path the program's
 // argument) and must print the dl-expect: lines; cc_main.c, if there is one,
 // compiled and linked by the system's C compiler with the ours_ objects and
-// libours.a into a second program, which must print the cc-expect: lines.
-// Directives of the main file, in // or /* */ comments: expect:,
+// libours.a into a second program (with the cc-flags: given), which must
+// print the cc-expect: lines. Directives of the main file, in // or /* */ comments: expect:,
 // expect-error: (E or C codes), expect-stderr:, expect-status:, flags:
 // (--link=x paths are the directory's), cc-variants: flags | flags | ...
 // (the sys_, arch_ and so_ files are compiled with each, the test run
 // once per variant; -x86_64 and -aarch64 suffixes on the directive give a
-// target's own), needs: c++.
+// target's own), needs: c++, cc-flags: (for cc_main.c's link), x86-64-only.
 const cLinkDir = path.join(root, 'cmd/axiom/internal/tests/c/link');
 const cLinkDirs = fs.existsSync(cLinkDir) ? fs.readdirSync(cLinkDir).filter((n) => fs.statSync(path.join(cLinkDir, n)).isDirectory()).sort().map((n) => path.join(cLinkDir, n)) : [];
 const linkArch = (process.env.AXIOM_NATIVE_TARGET || process.arch === 'arm64' && 'aarch64' || 'x86_64').replace(/^native$/, process.arch === 'arm64' ? 'aarch64' : 'x86_64');
@@ -632,6 +632,7 @@ const cLinkTest = async (dir) => {
   if (!native || noC || process.platform !== 'linux' || !/^(x86_64|aarch64)$/.test(linkArch)) return { skip: true, reason: 'Linux natively' };
   const cc = sysTool(false);
   if (!cc) return { skip: true, reason: 'no system C compiler for the target' };
+  if (linkArch !== 'x86_64' && /(?:\/\/ |\/\* )x86-64-only\b/m.test(fs.readFileSync(path.join(dir, fs.existsSync(path.join(dir, 'main.ax')) ? 'main.ax' : 'main.c'), 'utf8'))) return { skip: true, reason: 'x86-64 only' };
   const axMain = fs.existsSync(path.join(dir, 'main.ax'));
   const main = path.join(dir, axMain ? 'main.ax' : 'main.c');
   const src = fs.readFileSync(main, 'utf8');
@@ -745,7 +746,8 @@ const cLinkTest = async (dir) => {
   const ccMain = path.join(dir, 'cc_main.c');
   if (fs.existsSync(ccMain)) {
     const out2 = path.join(work, 'cc-prog');
-    const p = await run(cc, [ccMain, ...ours, ...(ourlib.length ? [`-L${work}`, '-lours'] : []), '-o', out2], `${cc} (linking the compiler's objects)`);
+    const ccFlags = dv('cc-flags').flatMap((x) => x.trim().split(/\s+/)).filter((x) => x);
+    const p = await run(cc, [ccMain, ...ours, ...(ourlib.length ? [`-L${work}`, '-lours'] : []), ...ccFlags, '-o', out2], `${cc} (linking the compiler's objects)`);
     if (p) return p;
     const r = await spawnExeAsync(out2, [], { encoding: 'utf8', timeout: runTimeout });
     const got = r.stdout.split('\n');
@@ -1305,6 +1307,124 @@ await section('C programs', {
   },
   // (C's attribute visibility in the ELF object's symbols: hidden and
   // internal are STV_HIDDEN, protected and default STV_DEFAULT)
+  // Sections (docs/c.md, "Code in sections"): --gc-sections leaves out
+  // what nothing refers to; a COFF COMDAT section's selection is honoured
+  // ("no duplicates": a second copy is an error, "any": one is kept).
+  'sections: --function-sections, --gc-sections and COMDAT selections': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    // (an object's: what a program's own units do not reach is never compiled)
+    const f = path.join(tmp, 'c-gc.c'), lib = path.join(tmp, 'c-gcl.c'), exe = path.join(tmp, 'c-gc'), obj = path.join(tmp, 'c-gc.o');
+    fs.writeFileSync(lib, 'int gc_dead_fn(int x) { return x * 3; }\nint gc_dead_data[100] = {1};\nint gc_live_fn(int x) { return x + 1; }\n');
+    fs.writeFileSync(f, '#include <stdio.h>\nint gc_live_fn(int x);\nint main(void) { printf("%d\\n", gc_live_fn(1)); return 0; }\n');
+    const lo = await spawnAsync(compiler, ['build', lib, '--target=x86_64', '--function-sections', '--data-sections', '--emit=obj', '-o', obj], { encoding: 'utf8' });
+    if (lo.status !== 0) return `--emit=obj failed:\n${lo.stdout}${lo.stderr}`;
+    const syms = (file) => {
+      const b = fs.readFileSync(file);
+      const shoff = Number(b.readBigUInt64LE(0x28)), shentsize = b.readUInt16LE(0x3a), shnum = b.readUInt16LE(0x3c);
+      const sh = (k) => { const o = shoff + k * shentsize; return { name: b.readUInt32LE(o), type: b.readUInt32LE(o + 4), off: Number(b.readBigUInt64LE(o + 0x18)), size: Number(b.readBigUInt64LE(o + 0x20)), link: b.readUInt32LE(o + 0x28) }; };
+      const names = new Set(), secs = [];
+      const shstr = sh(b.readUInt16LE(0x3e));
+      for (let k = 0; k < shnum; k++) {
+        const s = sh(k);
+        secs.push(b.toString('latin1', shstr.off + s.name, b.indexOf(0, shstr.off + s.name)));
+        if (s.type !== 2) continue;
+        const str = sh(s.link);
+        for (let o = s.off; o < s.off + s.size; o += 24) {
+          const n = b.readUInt32LE(o);
+          names.add(b.toString('latin1', str.off + n, b.indexOf(0, str.off + n)));
+        }
+      }
+      return { names, secs };
+    };
+    for (const gc of [false, true]) {
+      const c = await spawnAsync(compiler, ['build', f, obj, '--target=x86_64', ...(gc ? ['--gc-sections'] : []), '-o', exe], { encoding: 'utf8' });
+      if (c.status !== 0) return `the build failed:\n${c.stdout}${c.stderr}`;
+      const y = syms(exe).names;
+      for (const n of ['gc_dead_fn', 'gc_dead_data']) if (y.has(n) === gc) return `${n} ${gc ? 'kept with' : 'left out without'} --gc-sections`;
+      for (const n of ['main', 'gc_live_fn']) if (!y.has(n)) return `no ${n}${gc ? ' with --gc-sections' : ''}`;
+      if (native && process.arch === 'x64') {
+        const r = spawnSync(exe, [], { encoding: 'utf8' });
+        if (r.stdout !== '2\n') return `the program printed ${JSON.stringify(r.stdout)}`;
+      }
+    }
+    const secs = syms(obj).secs;
+    for (const n of ['.text.gc_dead_fn', '.text.gc_live_fn', '.data.gc_dead_data']) if (!secs.includes(n)) return `no section ${n} in the object: ${secs.join(' ')}`;
+    // COFF: two objects' "no duplicates" COMDAT sections of one function
+    const dup = path.join(tmp, 'c-dup.c'), m = path.join(tmp, 'c-dupm.c');
+    fs.writeFileSync(dup, 'int dup_fn(int x) { return x + 2; }\n');
+    fs.writeFileSync(m, 'int dup_fn(int x);\nint main(void) { return dup_fn(-2); }\n');
+    const objs = [];
+    for (const k of [1, 2]) {
+      const ok = path.join(tmp, `c-dup${k}.obj`);
+      const r = await spawnAsync(compiler, ['build', dup, '--target=x86_64-windows', '--function-sections', '--emit=obj', '-o', ok], { encoding: 'utf8' });
+      if (r.status !== 0) return `--emit=obj (COFF) failed:\n${r.stdout}${r.stderr}`;
+      objs.push(ok);
+    }
+    const l = await spawnAsync(compiler, ['build', m, ...objs, '--target=x86_64-windows', '-o', path.join(tmp, 'c-dup.exe')], { encoding: 'utf8' });
+    if (l.status === 0 || !/dup_fn.*COMDAT section that may not have copies/.test(l.stderr)) return `two copies of a "no duplicates" COMDAT section: ${l.status === 0 ? 'linked' : l.stderr}`;
+    const one = await spawnAsync(compiler, ['build', m, objs[0], '--target=x86_64-windows', '-o', path.join(tmp, 'c-dup.exe')], { encoding: 'utf8' });
+    if (one.status !== 0) return `one copy:\n${one.stdout}${one.stderr}`;
+    // COFF: the destructors' .CRT$XT* names order them as the C runtime
+    // runs them (forward): the plain one, then by decreasing priority
+    const dt = path.join(tmp, 'c-dtors.c'), dto = path.join(tmp, 'c-dtors.obj');
+    fs.writeFileSync(dt, '__attribute__((destructor(150))) static void d150(void) {}\n__attribute__((destructor)) static void dd(void) {}\n' +
+      '__attribute__((destructor(200))) static void d200(void) {}\n__attribute__((constructor(150))) static void c150(void) {}\n');
+    const dr = await spawnAsync(compiler, ['build', dt, '--c-std=gnu17', '--target=x86_64-windows', '--emit=obj', '-o', dto], { encoding: 'utf8' });
+    if (dr.status !== 0) return `--emit=obj (COFF) failed:\n${dr.stdout}${dr.stderr}`;
+    const cb = fs.readFileSync(dto), nsec = cb.readUInt16LE(2), opt = cb.readUInt16LE(16);
+    const crt = [];
+    for (let k = 0; k < nsec; k++) {
+      let n = cb.toString('latin1', 20 + opt + 40 * k, 20 + opt + 40 * k + 8).replace(/\0+$/, '');
+      if (n.startsWith('/')) {  // (a long name: in the string table, after the symbols)
+        const st = cb.readUInt32LE(8) + 18 * cb.readUInt32LE(12) + Number(n.slice(1));
+        n = cb.toString('latin1', st, cb.indexOf(0, st));
+      }
+      if (n.startsWith('.CRT$')) crt.push(n);
+    }
+    const wantCrt = ['.CRT$XCT00150', '.CRT$XTT00000', '.CRT$XTT65335', '.CRT$XTT65385'];
+    if (crt.sort().join(' ') !== wantCrt.join(' ')) return `the .CRT$ sections: ${crt.join(' ')}, not ${wantCrt.join(' ')}`;
+    return null;
+  },
+  // WebAssembly objects' constructors (the linking section's INIT_FUNCS):
+  // this compiler's and clang's, run by priority before main by the
+  // compiler's linker (__wasm_call_ctors), the destructors (registered
+  // with atexit) after it; and this compiler's run so by wasm-ld too.
+  'WebAssembly: the constructors of objects (INIT_FUNCS)': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    if (native) return { skip: true, reason: 'WebAssembly' };
+    const d = path.join(tmp, 'wasm-ctors');
+    fs.mkdirSync(d, { recursive: true });
+    const w = (n, t) => { fs.writeFileSync(path.join(d, n), t); return path.join(d, n); };
+    const oc = w('oc.c', '#include <stdio.h>\n__attribute__((constructor(200))) static void c200(void) { puts("ctor 200"); }\n' +
+      '__attribute__((constructor)) static void cdef(void) { puts("ctor default"); }\n' +
+      '__attribute__((constructor(150))) static void c150(void) { puts("ctor 150"); }\n' +
+      '__attribute__((destructor(150))) static void d150(void) { puts("dtor 150"); }\n' +
+      '__attribute__((destructor)) static void ddef(void) { puts("dtor default"); }\nint oc_val(void) { return 7; }\n');
+    const m = w('m.c', '#include <stdio.h>\nint oc_val(void);\n__attribute__((constructor(170))) static void m170(void) { puts("main ctor 170"); }\n' +
+      'int main(void) { printf("main %d\\n", oc_val()); return 0; }\n');
+    const o = path.join(d, 'oc.o'), exe = path.join(d, 'm.wasm');
+    let r = await spawnAsync(compiler, ['build', oc, '--c-std=gnu17', '--emit=obj', '-o', o], { encoding: 'utf8' });
+    if (r.status !== 0) return `--emit=obj failed:\n${r.stdout}${r.stderr}`;
+    r = await spawnAsync(compiler, ['build', m, o, '--c-std=gnu17', '-o', exe], { encoding: 'utf8' });
+    if (r.status !== 0) return `the build failed:\n${r.stdout}${r.stderr}`;
+    const run = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), exe], { encoding: 'utf8' });
+    const want = 'ctor 150\nctor 200\nctor default\nmain ctor 170\nmain 7\ndtor default\ndtor 150\n';
+    if (run.stdout !== want) return `the program printed\n${run.stdout}${run.stderr}\nnot\n${want}`;
+    const wasmLd = ['wasm-ld', 'wasm-ld-18'].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
+    if (!wasmLd) return { skip: true, reason: 'no wasm-ld (the compiler\'s own link passed)' };
+    const fo = w('fo.c', 'static int order[8];\nstatic int n;\n__attribute__((constructor(200))) static void c200(void) { order[n++] = 200; }\n' +
+      '__attribute__((constructor)) static void cdef(void) { order[n++] = 65535; }\n' +
+      '__attribute__((constructor(150))) static void c150(void) { order[n++] = 150; }\nint get(int i) { return i < n ? order[i] : -1; }\n');
+    r = await spawnAsync(compiler, ['build', fo, '--c-std=gnu17', '--c-freestanding', '--emit=obj', '-o', path.join(d, 'fo.o')], { encoding: 'utf8' });
+    if (r.status !== 0) return `--emit=obj (freestanding) failed:\n${r.stdout}${r.stderr}`;
+    r = await spawnAsync(wasmLd, ['--no-entry', '--export=get', '--export=__wasm_call_ctors', path.join(d, 'fo.o'), '-o', path.join(d, 'fo.wasm')], { encoding: 'utf8' });
+    if (r.status !== 0) return `wasm-ld failed:\n${r.stdout}${r.stderr}`;
+    const inst = await WebAssembly.instantiate(fs.readFileSync(path.join(d, 'fo.wasm')), {});
+    inst.instance.exports.__wasm_call_ctors();
+    const got = [0, 1, 2, 3].map((i) => inst.instance.exports.get(i)).join(' ');
+    if (got !== '150 200 65535 -1') return `wasm-ld's program ran its constructors as ${got}`;
+    return null;
+  },
   'visibility in --emit=obj': async () => {
     if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const f = path.join(tmp, 'c-vis.c'), obj = path.join(tmp, 'c-vis.o');
@@ -2565,6 +2685,55 @@ if (!skipPlatform) {
       }
     }
   }
+  // code in several sections (debug/sections.c, --function-sections): a cold
+  // function, one with a section attribute and main, each with an inline
+  // instance of the same function; checkDebug (each subprogram and inline
+  // instance in its function's code, the unit's ranges over the sections,
+  // the line rows, the frame table of each section), the inline instances
+  // where their callers are, and on Windows the PDB's inline sites
+  for (const t of ['x86_64', 'aarch64', 'x86_64-windows', 'aarch64-windows']) {
+    for (const lvl of ['-O0', '-O2']) {
+      for (const obj of t.endsWith('windows') ? [false] : [false, true]) {
+        dcases[`sections.c ${t} ${lvl}${obj ? ' object' : ''}`] = async () => {
+          const src = path.join(ddir, 'sections.c');
+          const win = t.endsWith('windows');
+          const dir = path.join(tmp, `debug-sections-${t}${lvl}${obj ? '-o' : ''}`);
+          fs.mkdirSync(dir, { recursive: true });
+          const o = path.join(dir, win ? 'prog.exe' : 'prog');
+          const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+          const r = await spawnAsync(compiler, ['build', src, `--target=${t}`, lvl, '-g', '--c-std=gnu17', '--function-sections',
+            ...(obj ? ['--emit=obj'] : []), '-o', o], { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+          if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+          if (win) {
+            const pe = checkPEFile(o, { arm64: t.startsWith('aarch64') });
+            if (pe.errs.length) return pe.errs.slice(0, 20).join('\n');
+            const p = checkPDB(fs.readFileSync(path.join(dir, 'prog.pdb')));
+            if (p.errs.length) return p.errs.slice(0, 20).join('\n');
+            for (const fn of ['rare', 'mine', 'main']) if (!p.procs.some((x) => x.name === fn)) return `no procedure ${fn}`;
+            if (lvl !== '-O0' && p.sites < 3) return `${p.sites} inline sites, not one in each of rare, mine and main`;
+            return null;
+          }
+          const img = loadImage(fs.readFileSync(o));
+          const c = checkDebug(img, { cfi: true });
+          if (c.errs.length) return c.errs.slice(0, 20).join('\n');
+          if (obj && !c.nrets) return 'no frame table entries checked';
+          const cu = c.dw.units[0].die;
+          if (obj && !cu.attrs.has(0x55)) return 'the unit has no ranges (its code is in several sections)';
+          const at = addrsOfLine(c.dw, 'sections.c', markLine(src, 'twice-body'));
+          const subs = new Set(at.map((a) => (subprogramAt(c.dw, a) || { attrs: new Map() }).attrs.get(0x03)));
+          if (lvl !== '-O0') {
+            // (C's main is __axiom_c_main, which the start-up may inline)
+            for (const fn of ['rare', 'mine', 'main']) {
+              const names = fn === 'main' ? ['main', '__axiom_c_main', 'axiom.export.main'] : [fn];
+              if (!names.some((x) => subs.has(x))) return `twice's line has no code in ${fn} (${[...subs].join(', ')})`;
+            }
+            if (c.ninlined < 3) return `${c.ninlined} inline instances`;
+          }
+          return null;
+        };
+      }
+    }
+  }
   // call frame information of assembly (debug/asm_cfi.c): a file-scope asm
   // procedure's .cfi_* directives, and an inline template's saved register
   for (const t of ['x86_64', 'aarch64', 'x86_64-macos', 'aarch64-macos']) {
@@ -3169,6 +3338,7 @@ if (!skipPlatform) {
 // against nothing, symbols looked up when loaded), and for x86_64-windows
 // run, printing the cc-expect: lines. Directives (// comments of main.c):
 // expect:, expect-status:, targets:, flags:, ours-flags:, cc-imports:,
+// (flags' --link=x paths are the directory's),
 // dlltool: <dll> <names> (an import library of that DLL, given to the
 // build), wine-dlls: <names> (-l of those DLLs, found in Wine's own
 // directory, which -L names).
@@ -3289,7 +3459,7 @@ if (!skipPlatform && !native) {
     const others = names.filter((n) => n !== 'main.c' && /\.c$/.test(n) && !/^(sys|arch|dylib|ours|ourlib|oursso|cc)_/.test(n)).map((n) => path.join(dir, n));
     const out = path.join(work, win ? 'prog.exe' : 'prog');
     const c = await spawnAsync(compiler, ['build', path.join(dir, 'main.c'), ...others, ...inputs, ...ours, ...libFlags, '-o', out, target,
-      ...words('flags'), ...extraFlags.filter((a) => !a.startsWith('--units='))], { encoding: 'utf8', timeout: compileTimeout });
+      ...words('flags').map((x) => x.startsWith('--link=') ? `--link=${path.resolve(dir, x.slice(7))}` : x), ...extraFlags.filter((a) => !a.startsWith('--units='))], { encoding: 'utf8', timeout: compileTimeout });
     if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
     const want = dv('expect').join('\n'), status = dv('expect-status').length ? Number(dv('expect-status')[0]) : 0;
     const checkOut = (f) => {

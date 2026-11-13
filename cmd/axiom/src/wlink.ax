@@ -164,6 +164,9 @@ fn liveness(o: *Options) void {
                 }
             }
         }
+        for x in un.inits.items() {
+            mark(ui, @truncate(u32, x & 0xffff_ffff));  // (constructors: called by __wasm_call_ctors)
+        }
     }
     while work.len > 0 {
         let w = work.pop();
@@ -411,7 +414,8 @@ struct Mod {
     init_body: bn.Bytes,
 }
 
-pub fn link(us: []mut *mut wo.Unit, o: *Options) []u8 {
+pub fn link(us0: []mut *mut wo.Unit, o: *Options) []u8 {
+    let us = with_ctors_unit(us0);
     units_p = us.ptr;
     nunits = us.len;
     failed = false;
@@ -431,6 +435,7 @@ pub fn link(us: []mut *mut wo.Unit, o: *Options) []u8 {
     add_imports();
     m.nimp = imports.len;
     number_funcs(&mut m);
+    ctors_body();
     if not lay_out_memory(&mut m, o) {
         return u.nosym();
     }
@@ -448,6 +453,94 @@ pub fn link(us: []mut *mut wo.Unit, o: *Options) []u8 {
         return u.nosym();
     }
     return res;
+}
+
+// -----------------------------------------------------------------------------
+// Constructors: the units' INIT_FUNCS (the tool conventions' linking
+// section: wobj.Unit.inits), called by __wasm_call_ctors, which the linker
+// defines when a unit refers to it or has some (the C start-up calls it:
+// cgen.ax), in the order of their priorities (of one priority, in the
+// order of the units and of their lists). They are kept whatever refers
+// to them (liveness).
+// -----------------------------------------------------------------------------
+let CTORS_NAME: []u8 = "__wasm_call_ctors";
+let mut ctors_unit: i64 = -1;  // the unit defining __wasm_call_ctors, -1: none
+
+// The units, and the linker's own defining __wasm_call_ctors when needed.
+fn with_ctors_unit(us: []mut *mut wo.Unit) []mut *mut wo.Unit {
+    ctors_unit = -1;
+    let mut need = false;
+    for un in us {
+        if un.inits.len > 0 {
+            need = true;
+        }
+        let k = un.symmap.get(u.intern(CTORS_NAME));
+        if k != 0 {
+            let sy = un.syms.get(@as(usize, k - 1));
+            if (sy.kind == wo.SYM_FUNC) and ((sy.flags & wo.F_UNDEFINED) == 0) {
+                return us;  // (a unit's own)
+            }
+            need = true;
+        }
+    }
+    if not need {
+        return us;
+    }
+    let cu = wo.new_unit((us.len > 0) and us[0].wasm64);
+    let f = u.new.[wo.Func]();
+    f.ty = wo.type_index(cu, "", "");
+    f.name = CTORS_NAME;
+    f.body.u8_(0);     // no locals (the calls: ctors_body)
+    f.body.u8_(0x0b);  // end
+    f.sym = wo.add_sym(cu, wo.Sym.{ kind: wo.SYM_FUNC, flags: wo.F_HIDDEN, name: CTORS_NAME, index: 0, seg: 0, off: 0,
+                                    size: 0 });
+    cu.funcs.push(f);
+    let out = u.newn.[*mut wo.Unit](us.len + 1);
+    for i in 0..us.len {
+        out[i] = us[i];
+    }
+    out[us.len] = cu;
+    ctors_unit = @bit_cast(i64, @as(u64, us.len));
+    return out;
+}
+
+// __wasm_call_ctors's body, once the functions are numbered: a call of each
+// constructor (live: liveness marks them), by priority.
+fn ctors_body() void {
+    if ctors_unit < 0 {
+        return;
+    }
+    let mut es = u.List.[u64].empty();  // priority << 32 | order
+    let mut fs = u.List.[i64].empty();
+    for ui in 0..nunits {
+        let un = U()[ui];
+        for x in un.inits.items() {
+            es.push(((x >> 32) << 32) | @as(u64, es.len));
+            fs.push(func_index(ui, @truncate(u32, x & 0xffff_ffff)));
+        }
+    }
+    u.sort.[u64](es.items(), cmp_u64);
+    let f = U()[@int_cast(usize, ctors_unit)].funcs.get(0);
+    f.body.free();
+    f.body = bn.new_bytes();
+    f.body.u8_(0);
+    for e in es.items() {
+        f.body.u8_(0x10);  // call
+        f.body.uleb(@bit_cast(u64, fs.get(@truncate(usize, e & 0xffff_ffff))));
+    }
+    f.body.u8_(0x0b);
+    es.deinit();
+    fs.deinit();
+}
+
+fn cmp_u64(a: u64, b: u64) i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
 }
 
 // Each unit's maps, empty.
