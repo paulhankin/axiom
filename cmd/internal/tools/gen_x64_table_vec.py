@@ -601,3 +601,85 @@ for n, r, pp in [('outb', 'al', 'np'), ('outw', 'ax', '66'), ('outl', 'eax', 'np
     ln('out', '--', 'dx,%s' % r, 'L.%s.-.w0' % pp, op2)
 for n, c in [('insb', '6c'), ('insw', '6d'), ('insl', '6d'), ('outsb', '6e'), ('outsw', '6f'), ('outsl', '6f')]:
     none(n, 'L.%s.-.w0' % ('66' if n.endswith('w') else 'np'), c)
+
+# -- Stage C: the AVX (VEX) forms of the SSE3/SSSE3/SSE4.1/SSE4.2 instructions
+# the legacy encoder (asm/x64.ax's sse()) has but whose VEX forms were absent,
+# with the AVX-512BW/F (EVEX) forms where the architecture has them. Written
+# from Intel SDM vol. 2's opcode tables; base encodings taken from the oracle.
+# SSE3 horizontal and add/subtract, and the reciprocal estimates
+for n, pp, c in [('haddpd', '66', '7c'), ('haddps', 'f2', '7c'), ('hsubpd', '66', '7d'), ('hsubps', 'f2', '7d'),
+                 ('addsubpd', '66', 'd0'), ('addsubps', 'f2', 'd0')]:
+    ln('v' + n, 'RVM', 'V,V,V/m', 'V.%s.0f.wig' % pp, c, '/r', 'lxy')
+ln('vrcpps', 'RM', 'V,V/m', 'V.np.0f.wig', '53', '/r', 'lxy')
+ln('vrsqrtps', 'RM', 'V,V/m', 'V.np.0f.wig', '52', '/r', 'lxy')
+ln('vrcpss', 'RVM', 'x,x,x/m', 'V.f3.0f.wig', '53', '/r', 'lig')
+ln('vrsqrtss', 'RVM', 'x,x,x/m', 'V.f3.0f.wig', '52', '/r', 'lig')
+# the replicating and unaligned loads
+ln('vmovddup', 'RM', 'x,x/m', 'V.f2.0f.wig', '12', '/r', 'lx')
+ln('vmovddup', 'RM', 'y,y/m', 'V.f2.0f.wig', '12', '/r', 'ly')
+ln('vmovshdup', 'RM', 'V,V/m', 'V.f3.0f.wig', '16', '/r', 'lxy')
+ln('vmovsldup', 'RM', 'V,V/m', 'V.f3.0f.wig', '12', '/r', 'lxy')
+ln('vlddqu', 'RM', 'V,m', 'V.f2.0f.wig', 'f0', '/r', 'lxy')
+# the high/low quadword moves (load, store, and the register-only hl/lh forms)
+for n, pp, ld, st in [('movhps', 'np', '16', '17'), ('movlps', 'np', '12', '13'), ('movhpd', '66', '16', '17'),
+                      ('movlpd', '66', '12', '13')]:
+    ln('v' + n, 'RVM', 'x,x,m', 'V.%s.0f.wig' % pp, ld, '/r', 'lig')
+    ln('v' + n, 'MR', 'm,x', 'V.%s.0f.wig' % pp, st, '/r', 'lig')
+ln('vmovhlps', 'RVM', 'x,x,x', 'V.np.0f.wig', '12', '/r', 'lig')
+ln('vmovlhps', 'RVM', 'x,x,x', 'V.np.0f.wig', '16', '/r', 'lig')
+# SSSE3 three-operand integer (0F38): VEX; EVEX where AVX-512BW adds it
+for n, c in [('phaddw', '01'), ('phaddd', '02'), ('phaddsw', '03'), ('phsubw', '05'), ('phsubd', '06'),
+             ('phsubsw', '07'), ('psignb', '08'), ('psignw', '09'), ('psignd', '0a')]:
+    ln('v' + n, 'RVM', 'V,V,V/m', 'V.66.0f38.wig', c, '/r', 'lxy')
+for n, c in [('pmaddubsw', '04'), ('pmulhrsw', '0b')]:
+    ln('v' + n, 'RVM', 'V,V,V/m', 'V.66.0f38.wig', c, '/r', 'lxy')
+    ln('v' + n, 'RVM', 'V,V,V/m', 'E.66.0f38.w0', c, '/r', 'lxyz', 'fvm', 'z')
+# SSSE3 absolute value (0F38): VEX; EVEX (byte/word BW, dword/qword F)
+for n, c in [('pabsb', '1c'), ('pabsw', '1d'), ('pabsd', '1e')]:
+    ln('v' + n, 'RM', 'V,V/m', 'V.66.0f38.wig', c, '/r', 'lxy')
+ln('vpabsb', 'RM', 'V,V/m', 'E.66.0f38.w0', '1c', '/r', 'lxyz', 'fvm', 'z')
+ln('vpabsw', 'RM', 'V,V/m', 'E.66.0f38.w0', '1d', '/r', 'lxyz', 'fvm', 'z')
+ln('vpabsd', 'RM', 'V,V/m', 'E.66.0f38.w0', '1e', '/r', 'lxyz', 'fv', 'b4', 'z')
+ln('vpabsq', 'RM', 'V,V/m', 'E.66.0f38.w1', '1f', '/r', 'lxyz', 'fv', 'b8', 'z')
+# SSE4.1 rounding (0F3A): VEX only (AVX-512 uses vrndscale* instead)
+ln('vroundps', 'RMI', 'V,V/m,i', 'V.66.0f3a.wig', '08', '/r', 'lxy')
+ln('vroundpd', 'RMI', 'V,V/m,i', 'V.66.0f3a.wig', '09', '/r', 'lxy')
+ln('vroundss', 'RVMI', 'x,x,x/m,i', 'V.66.0f3a.wig', '0a', '/r', 'lig')
+ln('vroundsd', 'RVMI', 'x,x,x/m,i', 'V.66.0f3a.wig', '0b', '/r', 'lig')
+# SSE4.1 palignr (0F3A): VEX and EVEX (BW)
+ln('vpalignr', 'RVMI', 'V,V,V/m,i', 'V.66.0f3a.wig', '0f', '/r', 'lxy')
+ln('vpalignr', 'RVMI', 'V,V,V/m,i', 'E.66.0f3a.w0', '0f', '/r', 'lxyz', 'fvm', 'z')
+ln('vmpsadbw', 'RVMI', 'V,V,V/m,i', 'V.66.0f3a.wig', '42', '/r', 'lxy')
+# SSE4.1 test and pack (0F38)
+ln('vptest', 'RM', 'V,V/m', 'V.66.0f38.wig', '17', '/r', 'lxy')
+ln('vphminposuw', 'RM', 'x,x/m', 'V.66.0f38.wig', '41', '/r', 'lx')
+ln('vpackusdw', 'RVM', 'V,V,V/m', 'V.66.0f38.wig', '2b', '/r', 'lxy')
+ln('vpackusdw', 'RVM', 'V,V,V/m', 'E.66.0f38.w0', '2b', '/r', 'lxyz', 'fv', 'b4', 'z')
+# the byte->word sign/zero extends missing in VEX, with EVEX (BW, half tuple)
+ln('vpmovsxbw', 'RM', 'V,H/m', 'V.66.0f38.wig', '20', '/r', 'lxy')
+ln('vpmovzxbw', 'RM', 'V,H/m', 'V.66.0f38.wig', '30', '/r', 'lxy')
+ln('vpmovsxbw', 'RM', 'V,H/m', 'E.66.0f38.w0', '20', '/r', 'lxyz', 'hvm', 'z')
+ln('vpmovzxbw', 'RM', 'V,H/m', 'E.66.0f38.w0', '30', '/r', 'lxyz', 'hvm', 'z')
+# the byte/word min/max missing in VEX, with EVEX (BW)
+for n, c in [('pminsb', '38'), ('pminuw', '3a'), ('pmaxsb', '3c'), ('pmaxuw', '3e')]:
+    ln('v' + n, 'RVM', 'V,V,V/m', 'V.66.0f38.wig', c, '/r', 'lxy')
+    ln('v' + n, 'RVM', 'V,V,V/m', 'E.66.0f38.w0', c, '/r', 'lxyz', 'fvm', 'z')
+# AVX conditional (masked) vector moves
+ln('vmaskmovps', 'RVM', 'V,V,m', 'V.66.0f38.w0', '2c', '/r', 'lxy')
+ln('vmaskmovps', 'MVR', 'm,V,V', 'V.66.0f38.w0', '2e', '/r', 'lxy')
+ln('vmaskmovpd', 'RVM', 'V,V,m', 'V.66.0f38.w0', '2d', '/r', 'lxy')
+ln('vmaskmovpd', 'MVR', 'm,V,V', 'V.66.0f38.w0', '2f', '/r', 'lxy')
+ln('vpmaskmovd', 'RVM', 'V,V,m', 'V.66.0f38.w0', '8c', '/r', 'lxy')
+ln('vpmaskmovd', 'MVR', 'm,V,V', 'V.66.0f38.w0', '8e', '/r', 'lxy')
+ln('vpmaskmovq', 'RVM', 'V,V,m', 'V.66.0f38.w1', '8c', '/r', 'lxy')
+ln('vpmaskmovq', 'MVR', 'm,V,V', 'V.66.0f38.w1', '8e', '/r', 'lxy')
+# the mask-register unpack instructions (AVX-512, 256-bit VEX)
+ln('kunpckbw', 'RVM', 'k,k,k', 'V.66.0f.w0', '4b', '/r', 'ly')
+ln('kunpckwd', 'RVM', 'k,k,k', 'V.np.0f.w0', '4b', '/r', 'ly')
+ln('kunpckdq', 'RVM', 'k,k,k', 'V.np.0f.w1', '4b', '/r', 'ly')
+# scalar int->float conversions with an explicit source-size suffix (a memory
+# source has no register to size VEX.W from, so these name it)
+ln('vcvtsi2ssl', 'RVM', 'x,x,r32/m', 'V.f3.0f.w0', '2a', '/r', 'lig')
+ln('vcvtsi2ssq', 'RVM', 'x,x,r64/m', 'V.f3.0f.w1', '2a', '/r', 'lig')
+ln('vcvtsi2sdl', 'RVM', 'x,x,r32/m', 'V.f2.0f.w0', '2a', '/r', 'lig')
+ln('vcvtsi2sdq', 'RVM', 'x,x,r64/m', 'V.f2.0f.w1', '2a', '/r', 'lig')
