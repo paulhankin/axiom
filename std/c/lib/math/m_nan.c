@@ -1,7 +1,7 @@
 /* m_nan.c - nan, nanf, nanl (C17 7.12.11.2): a quiet NaN whose payload is
    the n-char-sequence read as an unsigned integer (decimal, or hexadecimal
    after 0x, or octal after 0, as strtoull reads it with base 0), reduced
-   to the payload's bits (51 for double, 22 for float); 0 for any other
+   to the payload's bits (51 for double, 22 for float, 9 for _Float16); 0 for any other
    sequence. This is the library's reading of "NAN(n-char-sequence)" (7.22.1.3). */
 #if __STDC_VERSION__ >= 199901L
 static unsigned long long payload(const char *s)
@@ -50,6 +50,24 @@ float nanf(const char *tag)
 long double nanl(const char *tag)
 {
     return (long double)nan(tag);
+}
+
+/* C23 Annex H.11: binary16 and binary128, the payload's low bits (9 and
+   111; the sequence's 64 at most) */
+_Float16 nanf16(const char *tag)
+{
+    union { unsigned short u; _Float16 h; } r;
+    r.u = (unsigned short)(0x7e00u | (unsigned)(payload(tag) & 0x1ffu));
+    return r.h;
+}
+
+_Float128 nanf128(const char *tag)
+{
+    /* (the low word first: every target is little-endian) */
+    union { unsigned long long u[2]; _Float128 q; } r;
+    r.u[0] = payload(tag);
+    r.u[1] = 0x7fff800000000000ULL;
+    return r.q;
 }
 #else
 typedef int __axc_nan_c89;

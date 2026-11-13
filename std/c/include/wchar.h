@@ -87,6 +87,15 @@ unsigned long wcstoul(const wchar_t *__AXIOM_WR __nptr, wchar_t **__AXIOM_WR __e
 #if __STDC_VERSION__ >= 199901L
 float wcstof(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
 long double wcstold(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+#if defined(__STDC_WANT_IEC_60559_TYPES_EXT__) && __STDC_VERSION__ >= 199901L
+/* C23 Annex H.12 (std/c/lib/math/fn_str.c) */
+_Float16 wcstof16(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+_Float32 wcstof32(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+_Float64 wcstof64(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+_Float128 wcstof128(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+_Float32x wcstof32x(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+_Float64x wcstof64x(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+#endif
 #ifdef __STDC_IEC_60559_DFP__
 _Decimal32 wcstod32(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
 _Decimal64 wcstod64(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);

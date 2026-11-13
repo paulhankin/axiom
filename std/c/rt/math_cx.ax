@@ -1,0 +1,251 @@
+// =============================================================================
+// std/c/rt/math_cx.ax - the real functions of <complex.h>'s double functions
+// (std/c/lib/math/complex.c, complex_impl.h) in more than double's precision:
+// e^x, e^x - 1, sin and cos, log1p, atan2 and log|x + iy|, each as a
+// double-double hi + lo within 2^-60 of its value or better, so that the
+// complex functions compute their parts in pairs of doubles and round once:
+// e^x from the parts of the double exponential (std/internal/math/exp.ax,
+// before its last rounding: within about 2^-60), sin and cos from the exact
+// reduction and the double-double kernels of trig.ax (2^-66), the logarithms
+// from log.ax's double-double logarithm (2^-75; near 1 math_ldx.ax's series
+// of log1p, 2^-93), atan2 from atrig.ax's
+// double-double arctangent, e^x - 1 for |x| <= 1 from exp.ax's expm1 before
+// its last rounding (2^-56).
+//
+// __axc_cx1(op, x, r) and __axc_cx2(op, y, x, r) write r[0] + r[1] (and the
+// cosine in r[2] + r[3]); the arguments are finite (the complex functions
+// take the special values first), the ranges as each op says.
+// =============================================================================
+import "../../internal/math/atrig.ax" as at;
+import "../../internal/math/core.ax" as m;
+import "../../internal/math/exp.ax" as ek;
+import "../../internal/math/log.ax" as lg;
+import "../../internal/math/tables.ax" as t;
+import "../../internal/math/trig.ax" as tr;
+import "math_ldx.ax" as xk;
+
+// pi and pi/2 as double-doubles
+const PI_H: f64 = 3.141592653589793;
+const PI_L: f64 = 1.2246467991473532e-16;
+const PIO2_H: f64 = 1.5707963267948966;
+const PIO2_L: f64 = 6.123233995736766e-17;
+// ln 2 as a double-double whose head has 11 trailing zeros (k ln2_hi exact)
+const LN2_H: f64 = 0.6931471805598903;
+const LN2_L: f64 = 5.497923018708371e-14;
+const LN2_L2: f64 = 1.94704509238075e-31;
+
+inline fn put(r: *mut [4]f64, i: usize, v: m.DD) void {
+    r[i] = v.hi;
+    r[i + 1] = v.lo;
+}
+
+/// 2^k for -1022 <= k <= 1023.
+inline fn p2(k: i32) f64 {
+    return m.from_bits(@as(u64, @bit_cast(u32, k + 1023)) << 52);
+}
+
+/// v 2^k as a double-double: exact while the result is normal; below, the
+/// sum rounded once to the subnormal (or zero) result.
+fn scaled(v: m.DD, k: i32) m.DD {
+    if (k >= -1021) and (k <= 1023) {
+        let s = p2(k);
+        let h = v.hi * s;
+        if @abs(h) >= 2.2250738585072014e-308 {
+            return m.dd(h, v.lo * s);
+        }
+    }
+    if k > 0 {
+        return m.dd((v.hi * p2(1000)) * p2(k - 1000), 0.0);
+    }
+    let s1 = @max(k + 600, -1022);
+    return m.dd(((v.hi + v.lo) * p2(s1)) * p2(k - s1), 0.0);
+}
+
+/// The exponent of a finite nonzero double: |x| in [2^e, 2^(e+1)).
+fn expo(x: f64) i32 {
+    let b = m.abits(x);
+    let ef = @bit_cast(i32, @truncate(u32, b >> 52));
+    if ef == 0 {
+        return -1011 - @bit_cast(i32, @truncate(u32, @clz(b)));  // (b < 2^52)
+    }
+    return ef - 1023;
+}
+
+/// x 2^k exactly (or rounded once where the result is subnormal).
+fn ldx(x: f64, k: i32) f64 {
+    if k > 1023 {
+        return (x * p2(1023)) * p2(k - 1023);
+    }
+    if k < -1022 {
+        return (x * p2(-1022)) * p2(@max(k + 1022, -1022));
+    }
+    return x * p2(k);
+}
+
+/// The sum of five doubles as a double-double (two passes of the error-free
+/// vector sum: the leading part then holds the sum to within an ulp of the
+/// rest, which nothing cancels).
+fn sum5(a: f64, b: f64, c: f64, d: f64, e: f64) m.DD {
+    let mut v: [5]f64 = [a, b, c, d, e];
+    for _pass in @as(usize, 0)..2 {
+        let mut i: usize = 4;
+        while i > 0 {
+            let s = m.two_sum(v[i - 1], v[i]);
+            v[i - 1] = s.hi;
+            v[i] = s.lo;
+            i -= 1;
+        }
+    }
+    return m.two_sum(v[0], ((v[4] + v[3]) + v[2]) + v[1]);
+}
+
+/// The functions of one argument: 0 e^x (any finite x: inf beyond the
+/// overflow, 0 far below), 1 e^x - 1 (|x| <= 1), 2 sin x and cos x (any
+/// finite x), 3 log1p x (x > -1).
+export fn __axc_cx1(op: u32, x: f64, r: *mut [4]f64) void @multiversion("fma") {
+    if op == 0 {
+        if x > 709.8 {
+            put(r, 0, m.dd(m.inf(), 0.0));
+            return;
+        }
+        if x < -746.0 {
+            put(r, 0, m.dd(0.0, 0.0));
+            return;
+        }
+        let p = ek.parts(x, 0.0);
+        put(r, 0, scaled(m.fast_two_sum(p.s, p.e), p.k));
+        return;
+    }
+    if op == 1 {
+        // (exp.ax's expm1 before its last rounding: within 2^-56)
+        let ax = @abs(x);
+        if ax <= 0.0625 {
+            let z = x * x;
+            let w = z * z;
+            let q = ((t.EXPM1_P0 + (x * t.EXPM1_P1)) + (z * (t.EXPM1_P2 + (x * t.EXPM1_P3)))) +
+                    (w *
+                     (((t.EXPM1_P4 + (x * t.EXPM1_P5)) + (z * (t.EXPM1_P6 + (x * t.EXPM1_P7)))) + (w * t.EXPM1_P8)));
+            put(r, 0, m.fast_two_sum(x, z * q));
+            return;
+        }
+        let p = ek.parts(x, 0.0);
+        let sc = p2(p.k);
+        let a = m.two_sum(sc * p.s, -1.0);
+        put(r, 0, m.fast_two_sum(a.hi, a.lo + (sc * p.e)));
+        return;
+    }
+    if op == 2 {
+        let mut n: i32 = 0;
+        let mut a = m.dd(x, 0.0);
+        if @abs(x) > 0.7853981633974483 {
+            // (the exact reduction: Cody and Waite's near the multiples of
+            // pi/2, Payne and Hanek's beyond)
+            let rb = tr.reduce(x);
+            n = rb.n;
+            a = m.dd(rb.hi, rb.lo);
+        }
+        let sv = tr.sin_dd(a.hi, a.lo);
+        let cv = tr.cos_dd(a.hi, a.lo);
+        let q = n & 3;
+        if q == 0 {
+            put(r, 0, sv);
+            put(r, 2, cv);
+        } else if q == 1 {
+            put(r, 0, cv);
+            put(r, 2, m.dd_neg(sv));
+        } else if q == 2 {
+            put(r, 0, m.dd_neg(sv));
+            put(r, 2, m.dd_neg(cv));
+        } else {
+            put(r, 0, m.dd_neg(cv));
+            put(r, 2, sv);
+        }
+        return;
+    }
+    // log1p
+    put(r, 0, log1p_v(m.dd(x, 0.0)));
+}
+
+/// log1p v for a double-double v > -1: near 0 math_ldx.ax's series (log.ax's
+/// table-driven logarithm of 1 + v would cancel there), else log.ax's.
+fn log1p_v(v: m.DD) m.DD {
+    if @abs(v.hi) < 0.0029 {
+        return xk.log1p_k(v);
+    }
+    return lg.log1p_dd(v);
+}
+
+/// e ln2 as a double-double (|e| < 2^11).
+inline fn eln2(e: i32) m.DD {
+    let ef = @float_from_int(f64, e);
+    return m.fast_two_sum(ef * LN2_H, (ef * LN2_L) + (ef * LN2_L2));
+}
+
+/// log sqrt(a^2 + b^2) for a >= b >= 0, a in [2^-510, 2^510): near |z| = 1
+/// log1p of the squares' sum minus 1, summed exactly, so that nothing cancels.
+fn half_log(a: f64, b: f64) m.DD {
+    let p = m.two_sqr(a);
+    let q = m.two_sqr(b);
+    let s = p.hi + q.hi;
+    let mut l = m.dd(0.0, 0.0);
+    if (s > 0.5) and (s < 2.0) {
+        let d0 = m.two_sum(p.hi, -1.0);
+        l = log1p_v(sum5(d0.hi, q.hi, d0.lo, p.lo, q.lo));
+    } else {
+        l = lg.log_dd2(sum5(p.hi, q.hi, p.lo, q.lo, 0.0));
+    }
+    return m.dd(0.5 * l.hi, 0.5 * l.lo);
+}
+
+/// The functions of two arguments: 0 atan2(y, x) (finite, not both 0), 1
+/// log|x + iy| for x >= y >= 0 finite, x > 0 (the arguments in that order).
+export fn __axc_cx2(op: u32, y: f64, x: f64, r: *mut [4]f64) void @multiversion("fma") {
+    if op == 1 {
+        let e = expo(y);
+        if (e > 500) or (e < -500) {
+            let a = ldx(y, -e);
+            let b = ldx(x, -e);
+            put(r, 0, m.dd_add(eln2(e), half_log(a, b)));
+            return;
+        }
+        put(r, 0, half_log(y, x));
+        return;
+    }
+    let ay = @abs(y);
+    let ax = @abs(x);
+    let mut v = m.dd(0.0, 0.0);
+    if ay == 0.0 {
+        v = m.dd(0.0, 0.0);
+    } else if ax == 0.0 {
+        v = m.dd(PIO2_H, PIO2_L);
+    } else {
+        let ey = expo(ay);
+        let ex = expo(ax);
+        if (ey - ex) < -900 {
+            v = m.dd_div(m.dd(ay, 0.0), m.dd(ax, 0.0));  // (atan a = a within 2^-1800)
+        } else if (ey - ex) > 900 {
+            v = m.dd_add(m.dd(PIO2_H, PIO2_L), m.dd_neg(m.dd_div(m.dd(ax, 0.0), m.dd(ay, 0.0))));
+        } else {
+            // the smaller over the larger (scaled near 1: exact) as a
+            // double-double from one division and its exact residual, its
+            // arctangent from atrig.ax's kernel
+            let e = @max(ey, ex);
+            let sy = ldx(ay, -e);
+            let sx = ldx(ax, -e);
+            let small = @min(sy, sx);
+            let big = @max(sy, sx);
+            let q = small / big;
+            v = at.atan_pos(q, m.residual(small, q, big) / big);
+            if sy > sx {
+                v = m.dd_add(m.dd(PIO2_H, PIO2_L), m.dd_neg(v));
+            }
+        }
+    }
+    if (m.bits(x) >> 63) != 0 {
+        v = m.dd_add(m.dd(PI_H, PI_L), m.dd_neg(v));
+    }
+    if (m.bits(y) >> 63) != 0 {
+        v = m.dd_neg(v);
+    }
+    put(r, 0, v);
+}

@@ -13,11 +13,11 @@
 #define INF ((double)__builtin_inff())
 #define FN(n) n
 #define M(n) n
-#define K_MAX DBL_MAX
 #define K_EXP_BIG 700.0
-#define K_TINY 0x1p-1020
-#define K_UP 0x1p600
-#define K_DOWN_HALF 0x1p-300
+#define K_SQ_HI 500
+#define K_SQ_LO (-450)
+#define K_SQ_HIV 0x1p500
+#define K_SQ_LOV 0x1p-450
 #define K_TANH_BIG 22.0
 #define K_ASIN_BIG 0x1p60
 #define K_ATANH_BIG 0x1p500
@@ -25,27 +25,28 @@
 #define K_PIO2 1.57079632679489661923
 #define K_3PIO4 2.35619449019234492885
 #define K_PI 3.14159265358979323846
-#define K_LN2 0.69314718055994530942
+#define K_LN2 0x1.62e42fefa39efp-1
+#define K_LN2_LO 0x1.abc9e3b39803fp-56
 
-double __axc_half_log(double s, double e);
+/* the real functions in double-double (std/c/rt/math_cx.ax) */
+void __axc_cx1(unsigned op, double x, double *r);
+void __axc_cx2(unsigned op, double y, double x, double *r);
+#define XK1(op, x, r) __axc_cx1((unsigned)(op), (x), (r))
+#define XK2(op, y, x, r) __axc_cx2((unsigned)(op), (y), (x), (r))
 
-/* log|z| (ax >= ay >= 0, ax > 0): log(x^2 + y^2) / 2 from the squares'
-   exact sum s + e (fma), in double-double (math_log.ax): nothing cancels
-   near |z| = 1 */
-static double clog_re(double ax, double ay)
+/* a b - p exactly (p = a b rounded, finite and nonzero): Dekker's product
+   of Veltkamp's halves where nothing overflows or underflows, else fma */
+static double prod_err(double a, double b, double p)
 {
-    double p, pe, q, qe, sum, bb, se;
-    if (ax > 1e300 || ax < 1e-300)
-        return log(ax) + 0.5 * log1p((ay / ax) * (ay / ax));
-    p = ax * ax;
-    pe = fma(ax, ax, -p);
-    q = ay * ay;
-    qe = fma(ay, ay, -q);
-    sum = p + q;
-    bb = sum - p;
-    se = (p - (sum - bb)) + (q - bb);
-    return __axc_half_log(sum, se + (pe + qe));
+    double fa = fabs(a), fb = fabs(b), fp = fabs(p);
+    if (fa < 0x1p995 && fb < 0x1p995 && fa > 0x1p-920 && fb > 0x1p-920 && fp > 0x1p-960 && fp < 0x1p995) {
+        double t = 134217729.0 * a, ah = t - (t - a), al = a - ah;
+        double u = 134217729.0 * b, bh = u - (u - b), bl = b - bh;
+        return (((ah * bh - p) + ah * bl) + al * bh) + al * bl;
+    }
+    return fma(a, b, -p);
 }
+#define PROD_ERR(a, b, p) prod_err((a), (b), (p))
 
 #include "complex_impl.h"
 #else

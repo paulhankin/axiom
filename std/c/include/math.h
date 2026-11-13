@@ -567,10 +567,10 @@ int totalordermagd32(const _Decimal32 *__x, const _Decimal32 *__y);
 _Decimal32 getpayloadd32(const _Decimal32 *__x);
 int setpayloadd32(_Decimal32 *__res, _Decimal32 __pl);
 int setpayloadsigd32(_Decimal32 *__res, _Decimal32 __pl);
-void encodedecd32(_Decimal32 *restrict __enc, const _Decimal32 *restrict __x);
-void decodedecd32(_Decimal32 *restrict __x, const _Decimal32 *restrict __enc);
-void encodebind32(_Decimal32 *restrict __enc, const _Decimal32 *restrict __x);
-void decodebind32(_Decimal32 *restrict __x, const _Decimal32 *restrict __enc);
+void encodedecd32(unsigned char __enc[restrict static 4], const _Decimal32 *restrict __x);
+void decodedecd32(_Decimal32 *restrict __x, const unsigned char __enc[restrict static 4]);
+void encodebind32(unsigned char __enc[restrict static 4], const _Decimal32 *restrict __x);
+void decodebind32(_Decimal32 *restrict __x, const unsigned char __enc[restrict static 4]);
 /* _Decimal64 */
 _Decimal64 cosd64(_Decimal64 __x);
 _Decimal64 sind64(_Decimal64 __x);
@@ -672,10 +672,10 @@ int totalordermagd64(const _Decimal64 *__x, const _Decimal64 *__y);
 _Decimal64 getpayloadd64(const _Decimal64 *__x);
 int setpayloadd64(_Decimal64 *__res, _Decimal64 __pl);
 int setpayloadsigd64(_Decimal64 *__res, _Decimal64 __pl);
-void encodedecd64(_Decimal64 *restrict __enc, const _Decimal64 *restrict __x);
-void decodedecd64(_Decimal64 *restrict __x, const _Decimal64 *restrict __enc);
-void encodebind64(_Decimal64 *restrict __enc, const _Decimal64 *restrict __x);
-void decodebind64(_Decimal64 *restrict __x, const _Decimal64 *restrict __enc);
+void encodedecd64(unsigned char __enc[restrict static 8], const _Decimal64 *restrict __x);
+void decodedecd64(_Decimal64 *restrict __x, const unsigned char __enc[restrict static 8]);
+void encodebind64(unsigned char __enc[restrict static 8], const _Decimal64 *restrict __x);
+void decodebind64(_Decimal64 *restrict __x, const unsigned char __enc[restrict static 8]);
 /* _Decimal128 */
 _Decimal128 cosd128(_Decimal128 __x);
 _Decimal128 sind128(_Decimal128 __x);
@@ -777,10 +777,10 @@ int totalordermagd128(const _Decimal128 *__x, const _Decimal128 *__y);
 _Decimal128 getpayloadd128(const _Decimal128 *__x);
 int setpayloadd128(_Decimal128 *__res, _Decimal128 __pl);
 int setpayloadsigd128(_Decimal128 *__res, _Decimal128 __pl);
-void encodedecd128(_Decimal128 *restrict __enc, const _Decimal128 *restrict __x);
-void decodedecd128(_Decimal128 *restrict __x, const _Decimal128 *restrict __enc);
-void encodebind128(_Decimal128 *restrict __enc, const _Decimal128 *restrict __x);
-void decodebind128(_Decimal128 *restrict __x, const _Decimal128 *restrict __enc);
+void encodedecd128(unsigned char __enc[restrict static 16], const _Decimal128 *restrict __x);
+void decodedecd128(_Decimal128 *restrict __x, const unsigned char __enc[restrict static 16]);
+void encodebind128(unsigned char __enc[restrict static 16], const _Decimal128 *restrict __x);
+void decodebind128(_Decimal128 *restrict __x, const unsigned char __enc[restrict static 16]);
 /* the narrowing operations (7.12.14): one rounding, to the narrower type */
 _Decimal32 d32addd64(_Decimal64 __x, _Decimal64 __y);
 _Decimal32 d32subd64(_Decimal64 __x, _Decimal64 __y);
@@ -804,493 +804,29 @@ _Decimal64 d64sqrtd128(_Decimal128 __x);
 
 #if defined(__STDC_WANT_IEC_60559_TYPES_EXT__) && __STDC_VERSION__ >= 199901L
 /* ISO/IEC TS 18661-3 (C23 Annex H): the functions of the interchange and
-   extended floating types. _Float16's and _Float128's are the library's
-   (std/c/lib/math/m_f16.c, m_f128.c); those of _Float32, _Float64 and
-   _Float32x are the float and double functions, and _Float64x's the long
-   double functions where long double is wider than double, else
-   _Float128's: macros that name them (their results have those types,
-   which have the same format). */
+   extended floating types (axc/math_floatn.h). _Float16's and _Float128's
+   are the library's (std/c/lib/math/m_f16.c, m_f128.c, m_f16_c23.c,
+   m_f128_c23.c); those of _Float32, _Float64 and _Float32x call the float
+   and double functions, and _Float64x's the long double functions where
+   long double is wider than double, else _Float128's (fn_f32.c ...). */
 #define HUGE_VAL_F16 ((_Float16)__builtin_inff())
 #define HUGE_VAL_F32 ((_Float32)__builtin_inff())
 #define HUGE_VAL_F64 ((_Float64)__builtin_inff())
 #define HUGE_VAL_F128 ((_Float128)__builtin_inff())
 #define HUGE_VAL_F32X ((_Float32x)__builtin_inff())
 #define HUGE_VAL_F64X ((_Float64x)__builtin_inff())
-/* _Float16 */
-_Float16 acosf16(_Float16 __x);
-_Float16 asinf16(_Float16 __x);
-_Float16 atanf16(_Float16 __x);
-_Float16 cosf16(_Float16 __x);
-_Float16 sinf16(_Float16 __x);
-_Float16 tanf16(_Float16 __x);
-_Float16 acoshf16(_Float16 __x);
-_Float16 asinhf16(_Float16 __x);
-_Float16 atanhf16(_Float16 __x);
-_Float16 coshf16(_Float16 __x);
-_Float16 sinhf16(_Float16 __x);
-_Float16 tanhf16(_Float16 __x);
-_Float16 expf16(_Float16 __x);
-_Float16 exp2f16(_Float16 __x);
-_Float16 exp10f16(_Float16 __x);
-_Float16 expm1f16(_Float16 __x);
-_Float16 logf16(_Float16 __x);
-_Float16 log10f16(_Float16 __x);
-_Float16 log1pf16(_Float16 __x);
-_Float16 log2f16(_Float16 __x);
-_Float16 logbf16(_Float16 __x);
-_Float16 cbrtf16(_Float16 __x);
-_Float16 sqrtf16(_Float16 __x);
-_Float16 erff16(_Float16 __x);
-_Float16 erfcf16(_Float16 __x);
-_Float16 lgammaf16(_Float16 __x);
-_Float16 tgammaf16(_Float16 __x);
-_Float16 ceilf16(_Float16 __x);
-_Float16 floorf16(_Float16 __x);
-_Float16 nearbyintf16(_Float16 __x);
-_Float16 rintf16(_Float16 __x);
-_Float16 roundf16(_Float16 __x);
-_Float16 roundevenf16(_Float16 __x);
-_Float16 truncf16(_Float16 __x);
-_Float16 fabsf16(_Float16 __x);
-_Float16 nextupf16(_Float16 __x);
-_Float16 nextdownf16(_Float16 __x);
-_Float16 atan2f16(_Float16 __x, _Float16 __y);
-_Float16 powf16(_Float16 __x, _Float16 __y);
-_Float16 hypotf16(_Float16 __x, _Float16 __y);
-_Float16 fmodf16(_Float16 __x, _Float16 __y);
-_Float16 remainderf16(_Float16 __x, _Float16 __y);
-_Float16 copysignf16(_Float16 __x, _Float16 __y);
-_Float16 fdimf16(_Float16 __x, _Float16 __y);
-_Float16 fmaxf16(_Float16 __x, _Float16 __y);
-_Float16 fminf16(_Float16 __x, _Float16 __y);
-_Float16 fmaximumf16(_Float16 __x, _Float16 __y);
-_Float16 fminimumf16(_Float16 __x, _Float16 __y);
-_Float16 fmaximum_magf16(_Float16 __x, _Float16 __y);
-_Float16 fminimum_magf16(_Float16 __x, _Float16 __y);
-_Float16 fmaximum_numf16(_Float16 __x, _Float16 __y);
-_Float16 fminimum_numf16(_Float16 __x, _Float16 __y);
-_Float16 fmaximum_mag_numf16(_Float16 __x, _Float16 __y);
-_Float16 fminimum_mag_numf16(_Float16 __x, _Float16 __y);
-_Float16 nextafterf16(_Float16 __x, _Float16 __y);
-_Float16 fmaf16(_Float16 __x, _Float16 __y, _Float16 __z);
-_Float16 frexpf16(_Float16 __x, int *__e);
-_Float16 ldexpf16(_Float16 __x, int __n);
-_Float16 scalbnf16(_Float16 __x, int __n);
-_Float16 scalblnf16(_Float16 __x, long __n);
-int ilogbf16(_Float16 __x);
-long lrintf16(_Float16 __x);
-long long llrintf16(_Float16 __x);
-long lroundf16(_Float16 __x);
-long long llroundf16(_Float16 __x);
-_Float16 remquof16(_Float16 __x, _Float16 __y, int *__q);
-_Float16 modff16(_Float16 __x, _Float16 *__ip);
-/* _Float128 */
-_Float128 acosf128(_Float128 __x);
-_Float128 asinf128(_Float128 __x);
-_Float128 atanf128(_Float128 __x);
-_Float128 cosf128(_Float128 __x);
-_Float128 sinf128(_Float128 __x);
-_Float128 tanf128(_Float128 __x);
-_Float128 acoshf128(_Float128 __x);
-_Float128 asinhf128(_Float128 __x);
-_Float128 atanhf128(_Float128 __x);
-_Float128 coshf128(_Float128 __x);
-_Float128 sinhf128(_Float128 __x);
-_Float128 tanhf128(_Float128 __x);
-_Float128 expf128(_Float128 __x);
-_Float128 exp2f128(_Float128 __x);
-_Float128 exp10f128(_Float128 __x);
-_Float128 expm1f128(_Float128 __x);
-_Float128 logf128(_Float128 __x);
-_Float128 log10f128(_Float128 __x);
-_Float128 log1pf128(_Float128 __x);
-_Float128 log2f128(_Float128 __x);
-_Float128 logbf128(_Float128 __x);
-_Float128 cbrtf128(_Float128 __x);
-_Float128 sqrtf128(_Float128 __x);
-_Float128 erff128(_Float128 __x);
-_Float128 erfcf128(_Float128 __x);
-_Float128 lgammaf128(_Float128 __x);
-_Float128 tgammaf128(_Float128 __x);
-_Float128 ceilf128(_Float128 __x);
-_Float128 floorf128(_Float128 __x);
-_Float128 nearbyintf128(_Float128 __x);
-_Float128 rintf128(_Float128 __x);
-_Float128 roundf128(_Float128 __x);
-_Float128 roundevenf128(_Float128 __x);
-_Float128 truncf128(_Float128 __x);
-_Float128 fabsf128(_Float128 __x);
-_Float128 nextupf128(_Float128 __x);
-_Float128 nextdownf128(_Float128 __x);
-_Float128 atan2f128(_Float128 __x, _Float128 __y);
-_Float128 powf128(_Float128 __x, _Float128 __y);
-_Float128 hypotf128(_Float128 __x, _Float128 __y);
-_Float128 fmodf128(_Float128 __x, _Float128 __y);
-_Float128 remainderf128(_Float128 __x, _Float128 __y);
-_Float128 copysignf128(_Float128 __x, _Float128 __y);
-_Float128 fdimf128(_Float128 __x, _Float128 __y);
-_Float128 fmaxf128(_Float128 __x, _Float128 __y);
-_Float128 fminf128(_Float128 __x, _Float128 __y);
-_Float128 fmaximumf128(_Float128 __x, _Float128 __y);
-_Float128 fminimumf128(_Float128 __x, _Float128 __y);
-_Float128 fmaximum_magf128(_Float128 __x, _Float128 __y);
-_Float128 fminimum_magf128(_Float128 __x, _Float128 __y);
-_Float128 fmaximum_numf128(_Float128 __x, _Float128 __y);
-_Float128 fminimum_numf128(_Float128 __x, _Float128 __y);
-_Float128 fmaximum_mag_numf128(_Float128 __x, _Float128 __y);
-_Float128 fminimum_mag_numf128(_Float128 __x, _Float128 __y);
-_Float128 nextafterf128(_Float128 __x, _Float128 __y);
-_Float128 fmaf128(_Float128 __x, _Float128 __y, _Float128 __z);
-_Float128 frexpf128(_Float128 __x, int *__e);
-_Float128 ldexpf128(_Float128 __x, int __n);
-_Float128 scalbnf128(_Float128 __x, int __n);
-_Float128 scalblnf128(_Float128 __x, long __n);
-int ilogbf128(_Float128 __x);
-long lrintf128(_Float128 __x);
-long long llrintf128(_Float128 __x);
-long lroundf128(_Float128 __x);
-long long llroundf128(_Float128 __x);
-_Float128 remquof128(_Float128 __x, _Float128 __y, int *__q);
-_Float128 modff128(_Float128 __x, _Float128 *__ip);
-/* _Float32, _Float64, _Float32x, _Float64x */
-#define acosf32 acosf
-#define asinf32 asinf
-#define atanf32 atanf
-#define cosf32 cosf
-#define sinf32 sinf
-#define tanf32 tanf
-#define acoshf32 acoshf
-#define asinhf32 asinhf
-#define atanhf32 atanhf
-#define coshf32 coshf
-#define sinhf32 sinhf
-#define tanhf32 tanhf
-#define expf32 expf
-#define exp2f32 exp2f
-#define exp10f32 exp10f
-#define expm1f32 expm1f
-#define logf32 logf
-#define log10f32 log10f
-#define log1pf32 log1pf
-#define log2f32 log2f
-#define logbf32 logbf
-#define cbrtf32 cbrtf
-#define sqrtf32 sqrtf
-#define erff32 erff
-#define erfcf32 erfcf
-#define lgammaf32 lgammaf
-#define tgammaf32 tgammaf
-#define ceilf32 ceilf
-#define floorf32 floorf
-#define nearbyintf32 nearbyintf
-#define rintf32 rintf
-#define roundf32 roundf
-#define roundevenf32 roundevenf
-#define truncf32 truncf
-#define fabsf32 fabsf
-#define nextupf32 nextupf
-#define nextdownf32 nextdownf
-#define atan2f32 atan2f
-#define powf32 powf
-#define hypotf32 hypotf
-#define fmodf32 fmodf
-#define remainderf32 remainderf
-#define copysignf32 copysignf
-#define fdimf32 fdimf
-#define fmaxf32 fmaxf
-#define fminf32 fminf
-#define fmaximumf32 fmaximumf
-#define fminimumf32 fminimumf
-#define fmaximum_magf32 fmaximum_magf
-#define fminimum_magf32 fminimum_magf
-#define fmaximum_numf32 fmaximum_numf
-#define fminimum_numf32 fminimum_numf
-#define fmaximum_mag_numf32 fmaximum_mag_numf
-#define fminimum_mag_numf32 fminimum_mag_numf
-#define nextafterf32 nextafterf
-#define fmaf32 fmaf
-#define frexpf32 frexpf
-#define ldexpf32 ldexpf
-#define scalbnf32 scalbnf
-#define scalblnf32 scalblnf
-#define ilogbf32 ilogbf
-#define lrintf32 lrintf
-#define llrintf32 llrintf
-#define lroundf32 lroundf
-#define llroundf32 llroundf
-#define remquof32 remquof
-#define modff32 modff
-#define acosf64 acos
-#define asinf64 asin
-#define atanf64 atan
-#define cosf64 cos
-#define sinf64 sin
-#define tanf64 tan
-#define acoshf64 acosh
-#define asinhf64 asinh
-#define atanhf64 atanh
-#define coshf64 cosh
-#define sinhf64 sinh
-#define tanhf64 tanh
-#define expf64 exp
-#define exp2f64 exp2
-#define exp10f64 exp10
-#define expm1f64 expm1
-#define logf64 log
-#define log10f64 log10
-#define log1pf64 log1p
-#define log2f64 log2
-#define logbf64 logb
-#define cbrtf64 cbrt
-#define sqrtf64 sqrt
-#define erff64 erf
-#define erfcf64 erfc
-#define lgammaf64 lgamma
-#define tgammaf64 tgamma
-#define ceilf64 ceil
-#define floorf64 floor
-#define nearbyintf64 nearbyint
-#define rintf64 rint
-#define roundf64 round
-#define roundevenf64 roundeven
-#define truncf64 trunc
-#define fabsf64 fabs
-#define nextupf64 nextup
-#define nextdownf64 nextdown
-#define atan2f64 atan2
-#define powf64 pow
-#define hypotf64 hypot
-#define fmodf64 fmod
-#define remainderf64 remainder
-#define copysignf64 copysign
-#define fdimf64 fdim
-#define fmaxf64 fmax
-#define fminf64 fmin
-#define fmaximumf64 fmaximum
-#define fminimumf64 fminimum
-#define fmaximum_magf64 fmaximum_mag
-#define fminimum_magf64 fminimum_mag
-#define fmaximum_numf64 fmaximum_num
-#define fminimum_numf64 fminimum_num
-#define fmaximum_mag_numf64 fmaximum_mag_num
-#define fminimum_mag_numf64 fminimum_mag_num
-#define nextafterf64 nextafter
-#define fmaf64 fma
-#define frexpf64 frexp
-#define ldexpf64 ldexp
-#define scalbnf64 scalbn
-#define scalblnf64 scalbln
-#define ilogbf64 ilogb
-#define lrintf64 lrint
-#define llrintf64 llrint
-#define lroundf64 lround
-#define llroundf64 llround
-#define remquof64 remquo
-#define modff64 modf
-#define acosf32x acos
-#define asinf32x asin
-#define atanf32x atan
-#define cosf32x cos
-#define sinf32x sin
-#define tanf32x tan
-#define acoshf32x acosh
-#define asinhf32x asinh
-#define atanhf32x atanh
-#define coshf32x cosh
-#define sinhf32x sinh
-#define tanhf32x tanh
-#define expf32x exp
-#define exp2f32x exp2
-#define exp10f32x exp10
-#define expm1f32x expm1
-#define logf32x log
-#define log10f32x log10
-#define log1pf32x log1p
-#define log2f32x log2
-#define logbf32x logb
-#define cbrtf32x cbrt
-#define sqrtf32x sqrt
-#define erff32x erf
-#define erfcf32x erfc
-#define lgammaf32x lgamma
-#define tgammaf32x tgamma
-#define ceilf32x ceil
-#define floorf32x floor
-#define nearbyintf32x nearbyint
-#define rintf32x rint
-#define roundf32x round
-#define roundevenf32x roundeven
-#define truncf32x trunc
-#define fabsf32x fabs
-#define nextupf32x nextup
-#define nextdownf32x nextdown
-#define atan2f32x atan2
-#define powf32x pow
-#define hypotf32x hypot
-#define fmodf32x fmod
-#define remainderf32x remainder
-#define copysignf32x copysign
-#define fdimf32x fdim
-#define fmaxf32x fmax
-#define fminf32x fmin
-#define fmaximumf32x fmaximum
-#define fminimumf32x fminimum
-#define fmaximum_magf32x fmaximum_mag
-#define fminimum_magf32x fminimum_mag
-#define fmaximum_numf32x fmaximum_num
-#define fminimum_numf32x fminimum_num
-#define fmaximum_mag_numf32x fmaximum_mag_num
-#define fminimum_mag_numf32x fminimum_mag_num
-#define nextafterf32x nextafter
-#define fmaf32x fma
-#define frexpf32x frexp
-#define ldexpf32x ldexp
-#define scalbnf32x scalbn
-#define scalblnf32x scalbln
-#define ilogbf32x ilogb
-#define lrintf32x lrint
-#define llrintf32x llrint
-#define lroundf32x lround
-#define llroundf32x llround
-#define remquof32x remquo
-#define modff32x modf
-#if __AXIOM_LDBL_WIDTH__ != 64
-#define acosf64x acosl
-#define asinf64x asinl
-#define atanf64x atanl
-#define cosf64x cosl
-#define sinf64x sinl
-#define tanf64x tanl
-#define acoshf64x acoshl
-#define asinhf64x asinhl
-#define atanhf64x atanhl
-#define coshf64x coshl
-#define sinhf64x sinhl
-#define tanhf64x tanhl
-#define expf64x expl
-#define exp2f64x exp2l
-#define exp10f64x exp10l
-#define expm1f64x expm1l
-#define logf64x logl
-#define log10f64x log10l
-#define log1pf64x log1pl
-#define log2f64x log2l
-#define logbf64x logbl
-#define cbrtf64x cbrtl
-#define sqrtf64x sqrtl
-#define erff64x erfl
-#define erfcf64x erfcl
-#define lgammaf64x lgammal
-#define tgammaf64x tgammal
-#define ceilf64x ceill
-#define floorf64x floorl
-#define nearbyintf64x nearbyintl
-#define rintf64x rintl
-#define roundf64x roundl
-#define roundevenf64x roundevenl
-#define truncf64x truncl
-#define fabsf64x fabsl
-#define nextupf64x nextupl
-#define nextdownf64x nextdownl
-#define atan2f64x atan2l
-#define powf64x powl
-#define hypotf64x hypotl
-#define fmodf64x fmodl
-#define remainderf64x remainderl
-#define copysignf64x copysignl
-#define fdimf64x fdiml
-#define fmaxf64x fmaxl
-#define fminf64x fminl
-#define fmaximumf64x fmaximuml
-#define fminimumf64x fminimuml
-#define fmaximum_magf64x fmaximum_magl
-#define fminimum_magf64x fminimum_magl
-#define fmaximum_numf64x fmaximum_numl
-#define fminimum_numf64x fminimum_numl
-#define fmaximum_mag_numf64x fmaximum_mag_numl
-#define fminimum_mag_numf64x fminimum_mag_numl
-#define nextafterf64x nextafterl
-#define fmaf64x fmal
-#define frexpf64x frexpl
-#define ldexpf64x ldexpl
-#define scalbnf64x scalbnl
-#define scalblnf64x scalblnl
-#define ilogbf64x ilogbl
-#define lrintf64x lrintl
-#define llrintf64x llrintl
-#define lroundf64x lroundl
-#define llroundf64x llroundl
-#define remquof64x remquol
-#define modff64x modfl
-#else
-#define acosf64x acosf128
-#define asinf64x asinf128
-#define atanf64x atanf128
-#define cosf64x cosf128
-#define sinf64x sinf128
-#define tanf64x tanf128
-#define acoshf64x acoshf128
-#define asinhf64x asinhf128
-#define atanhf64x atanhf128
-#define coshf64x coshf128
-#define sinhf64x sinhf128
-#define tanhf64x tanhf128
-#define expf64x expf128
-#define exp2f64x exp2f128
-#define exp10f64x exp10f128
-#define expm1f64x expm1f128
-#define logf64x logf128
-#define log10f64x log10f128
-#define log1pf64x log1pf128
-#define log2f64x log2f128
-#define logbf64x logbf128
-#define cbrtf64x cbrtf128
-#define sqrtf64x sqrtf128
-#define erff64x erff128
-#define erfcf64x erfcf128
-#define lgammaf64x lgammaf128
-#define tgammaf64x tgammaf128
-#define ceilf64x ceilf128
-#define floorf64x floorf128
-#define nearbyintf64x nearbyintf128
-#define rintf64x rintf128
-#define roundf64x roundf128
-#define roundevenf64x roundevenf128
-#define truncf64x truncf128
-#define fabsf64x fabsf128
-#define nextupf64x nextupf128
-#define nextdownf64x nextdownf128
-#define atan2f64x atan2f128
-#define powf64x powf128
-#define hypotf64x hypotf128
-#define fmodf64x fmodf128
-#define remainderf64x remainderf128
-#define copysignf64x copysignf128
-#define fdimf64x fdimf128
-#define fmaxf64x fmaxf128
-#define fminf64x fminf128
-#define fmaximumf64x fmaximumf128
-#define fminimumf64x fminimumf128
-#define fmaximum_magf64x fmaximum_magf128
-#define fminimum_magf64x fminimum_magf128
-#define fmaximum_numf64x fmaximum_numf128
-#define fminimum_numf64x fminimum_numf128
-#define fmaximum_mag_numf64x fmaximum_mag_numf128
-#define fminimum_mag_numf64x fminimum_mag_numf128
-#define nextafterf64x nextafterf128
-#define fmaf64x fmaf128
-#define frexpf64x frexpf128
-#define ldexpf64x ldexpf128
-#define scalbnf64x scalbnf128
-#define scalblnf64x scalblnf128
-#define ilogbf64x ilogbf128
-#define lrintf64x lrintf128
-#define llrintf64x llrintf128
-#define lroundf64x lroundf128
-#define llroundf64x llroundf128
-#define remquof64x remquof128
-#define modff64x modff128
+/* the evaluation types of H.11 (FLT_EVAL_METHOD and DEC_EVAL_METHOD 0) */
+typedef long double long_double_t;
+typedef float _Float16_t;
+typedef _Float32 _Float32_t;
+typedef _Float64 _Float64_t;
+typedef _Float128 _Float128_t;
+#if __STDC_VERSION__ >= 202311L
+typedef _Decimal32 _Decimal32_t;
+typedef _Decimal64 _Decimal64_t;
+typedef _Decimal128 _Decimal128_t;
 #endif
+#include <axc/math_floatn.h>
 #endif
 
 #endif

@@ -1144,16 +1144,29 @@ functions are C (`std/c/lib/math/`).
   `std/math` has the same kernels: against its former functions, every one is as fast or
   faster, or within 15% (`atan`, `atan2`, `tan`, `cbrt`, `lgamma`; their former versions
   were less accurate: up to 2 ulps for `tan` and `sinh`).
-- **The complex functions** follow Annex G's special values (G.6) and Kahan's methods;
-  each part is within a few ulps, not correctly rounded: the steps where roundings
-  add up (Kahan's `1 + t^2` and `1 + b s^2` of `ctanh`, the products of the square roots
-  in `casin` and `cacos`, `catanh`'s denominators, `csqrt`'s sum and its Newton step) are
-  computed in pairs of the type (Dekker's error-free products, from `fma`), so that the
-  error is mostly that of the real functions called (double, measured on 20000 arguments
-  each: `clog` 0.5; `csqrt` 0.84; `catan`, `catanh` 1.35; `cexp`, `csin`, `ccos`, `csinh`,
-  `ccosh` 2.1; `casin`, `cacos`, `casinh`, `cacosh` 2.5; `ctan`, `ctanh` 2.7; the float
-  forms are the double ones rounded, within half an ulp and a fraction). `cpow` is `cexp(w clog z)`, whose error grows with
-  the size of the result's exponent.
+- **The complex functions** follow Annex G's special values (G.6) and Kahan's methods
+  (`std/c/lib/math/complex_impl.h`, one text for every type), in the forms where nothing
+  cancels: `ctanh` from `sinh x cosh x / (sinh^2 x + cos^2 y)` and `sin y cos y / (sinh^2 x
+  + cos^2 y)`, `casin` and `cacos` from the square roots of `1 - z` and `1 + z`, `catanh`'s
+  real part from `log1p` (near +-1 from the difference of two logarithms), `e^x` beyond the
+  overflow of its products as `(e^(x/2))^2`. Each part is computed in pairs of the real
+  type (Dekker's error-free transformations) from real functions that give their values
+  in such pairs (double: `std/c/rt/math_cx.ax`, from the kernels of `std/internal/math`
+  before their last rounding, within 2^-56 or better; the wider types: `math_ld.ax`'s
+  `__axc_ldcx`, its triple-double kernels), and rounded once. Measured against an
+  arbitrary-precision reference (24,000 arguments per double function over the plane:
+  random bits, the unit circle, near +-1 and +-i, along and across the branch cuts, the
+  poles and zeros of `ctan` and `ccos`, the overflow and underflow thresholds of `e^x`,
+  huge and mixed magnitudes): each part within 0.5 to 0.93 ulp where it is normal, up to
+  1.4 ulps where it is subnormal (rounded twice there); the float, `_Float16`, `long double`
+  and `_Float128` forms within half an ulp and a small fraction (600 to 6,000 arguments
+  each). The float and `_Float16` functions are the double ones' values
+  rounded to the type. `cpow` is `e^(w log z)` with `log z` and its product with `w` in
+  pairs: within an ulp while `|w log z|` is below about 2^40 (beyond, the error grows as
+  `|w log z| 2^-2p`: the angle `w log z` would need `log z` to more than twice the type's
+  precision), and for a real `w` and an argument of `z` too small for the angle's pair,
+  that angle scaled. A double complex function takes 1.2 to 2.5 times the time of the
+  former, less accurate one (`cexp` 90 ns, `csqrt` 140, `casin` 460).
 - **`long double`** where it is `double` (Windows, macOS; and with `--c-long-double=64`) has
   the double functions. Where it is wider (the 80-bit x87 format on x86-64 Linux, binary128
   on AArch64 Linux and WebAssembly), the exact `l` functions (`fabsl`, `copysignl`, the
@@ -1180,9 +1193,8 @@ functions are C (`std/c/lib/math/`).
   system library): `sinl`, `cosl`, `tanl`, `powl`, `tgammal` 0.4 to 0.8 times their time,
   most others 1.3 to 3.4 (`expl` 1.9, `logl` 3.4, `atanl` 2.2), `asinl` 4.5 and
   `lgammal` 3.9; binary128's (triple-double only) take 0.2 to 1.2 times the system
-  library's `_Float128` functions (most 0.3 to 0.7). The complex `l` functions are the
-  double ones' methods on these (each part within
-  3.3 ulps of the format, measured). `erfl` and `erfcl` (Taylor's series below 1/2, by
+  library's `_Float128` functions (most 0.3 to 0.7). The complex `l` functions are
+  `complex_impl.h`'s on these (above). `erfl` and `erfcl` (Taylor's series below 1/2, by
   Horner's rule on a table of its coefficients; above, `erfc x = e^-x^2 erfcx(x)` with
   `erfcx` from Taylor polynomials of degree 31 about the middles of 64 pieces of
   [1/2, 128), whose coefficients `cmd/internal/tools/gen_math_tables.py` computes from
@@ -1475,7 +1487,7 @@ format than the ABI's cannot pass `long double` values to it.
 | Right shift of a negative value | Arithmetic (sign-extending): `-8 >> 1` is `-4`. |
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
 | Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later; also of `_Float16` ... `_Float64x`) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. The imaginary types (`float _Imaginary`, `double _Imaginary`, `long double _Imaginary`, C99 and later, Annex G) have their real type's representation (the imaginary part); their arithmetic is G.5's (an imaginary times an imaginary is real, a real plus an imaginary complex, ...), their conversions G.4's (an imaginary converted to a real type is 0, a complex one to an imaginary type its imaginary part). |
-| Interchange and extended floating types | (C23 Annex H, and in every mode before C23.) `_Float16` is binary16, `_Float32` binary32, `_Float64` and `_Float32x` binary64, `_Float128` binary128 (`__float128` in a GNU dialect), `_Float64x` the x87 format where `long double` has it, else binary128; each a type of its own. `_Float16`'s operations are rounded to binary16 each (`FLT_EVAL_METHOD` 0: computed in `float`, which is exact enough that the one rounding is correct), `_Float128`'s and `_Float64x`'s are `long double`'s software arithmetic in that format. The usual arithmetic conversions take the type with more values, then of two with the same values an interchange type over a standard one over an extended one (`float + _Float32` is `_Float32`, `double + _Float32x` is `double`). Constants take `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` (either case). `<float.h>` has their macros (`FLT16_MAX` ...) under `__STDC_WANT_IEC_60559_TYPES_EXT__`; `__STDC_IEC_60559_TYPES__` is not defined (it needs Annex F). |
+| Interchange and extended floating types | (C23 Annex H, and in every mode before C23.) `_Float16` is binary16, `_Float32` binary32, `_Float64` and `_Float32x` binary64, `_Float128` binary128 (`__float128` in a GNU dialect), `_Float64x` the x87 format where `long double` has it, else binary128; each a type of its own. `_Float16`'s operations are rounded to binary16 each (`FLT_EVAL_METHOD` 0: computed in `float`, which is exact enough that the one rounding is correct), `_Float128`'s and `_Float64x`'s are `long double`'s software arithmetic in that format. The usual arithmetic conversions take the type with more values, then of two with the same values an interchange type over a standard one over an extended one (`float + _Float32` is `_Float32`, `double + _Float32x` is `double`). Constants take `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` (either case). `<float.h>` has their macros (`FLT16_MAX` ...) under `__STDC_WANT_IEC_60559_TYPES_EXT__`; `__STDC_IEC_60559_TYPES__` is not defined ("Known deviations"). |
 | Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest): it is the start-up's mode, which `fesetround` changes on x86-64 and AArch64 (`<fenv.h>`, below; `FLT_ROUNDS` itself stays 1). A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals (`+ - * /` of normal operands with a normal result by 64-bit integer fast paths, division by Knuth's Algorithm D); constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
 | `max_align_t` | Aligned as the platform's (above): a structure of a `long long` and a `long double` aligned to 16 (size 32 where `long double` is 16 bytes), or `long double` (8 bytes). |
@@ -1525,7 +1537,7 @@ library's are `C1081`.
 | `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `imaginary` and `_Imaginary_I` (of type `const float _Imaginary`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `I` is `_Imaginary_I` where Annex G is claimed (x86-64, AArch64: `__STDC_IEC_559_COMPLEX__`), else `_Complex_I`. `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are the library's ("`<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions"). |
 | `<math.h>` | all | C89's double functions; from C99 everything of C17 7.12, in the three types, and C23's listed below. |
 | `<fenv.h>` | C99 and later | All of C17 7.6; C23's `fegetmode`, `fesetmode`, `fesetexcept`, `fetestexceptflag`. |
-| `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. Decimal arguments choose the `d32`, `d64` and `d128` functions (C23 7.27p3); arguments of the interchange and extended types (Annex H.11) their common real type's: `_Float16`'s and `_Float128`'s `f16` and `f128` functions (declared with `__STDC_WANT_IEC_60559_TYPES_EXT__`; without it float's function for `_Float16`), and for `_Float32`, `_Float64` and `_Float32x` the standard function of their format, whose result has the standard type. |
+| `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. Decimal arguments choose the `d32`, `d64` and `d128` functions (C23 7.27p3); arguments of the interchange and extended types (Annex H.11) their common real type's own functions (`sqrtf16` ... `sqrtf64x`, `cexpf32` ..., declared with `__STDC_WANT_IEC_60559_TYPES_EXT__`; without it float's function for `_Float16` and the standard function of the format for `_Float32` ... `_Float64x`). |
 | `<stdalign.h>` | C11 and later | |
 | `<stdatomic.h>` | C11 and later | All of 7.17 (see "Atomics and threads"), with memory orders. `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
 | `<stdnoreturn.h>` | C11 and later | |
@@ -2824,22 +2836,34 @@ claims less than the standard allows. None is hidden: each is said above or here
   there, as for binary).
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;
   a program must not rely on it.
-- Annex H is not claimed (`__STDC_IEC_60559_TYPES__` is not defined): C23's additions to
-  7.12 have no `_Float16` or `_Float128` forms (`exp2m1f128`, `sinpif16`, `totalorderf128`,
-  ..., `nanf16`, `nanf128`), nor are there the narrowing operations between the
-  interchange types; and see below for `_Float32` .... The `_Float16` and `_Float128` functions of `<math.h>` and the conversions of
-  `<stdlib.h>` are the library's under `__STDC_WANT_IEC_60559_TYPES_EXT__`: binary128's
-  exact functions correctly rounded, its elementary functions in its precision;
-  binary16's elementary ones correctly rounded (the double function's value rounded once,
-  or the `_Float128` function's where that value is too near a rounding boundary: checked
-  for every binary16 argument); those of
-  `_Float32`, `_Float64`, `_Float32x` and `_Float64x` are macros for the `float`,
-  `double`, `long double` or `_Float128` functions, whose results have those types (a
-  `_Generic` on one sees `float`, not `_Float32`). The complex ones are `<complex.h>`'s
-  likewise (`cexpf16`, `cexpf128`: `complexf16.c`, the double functions' parts rounded
-  once; `complexf128.c`, `complex_impl.h`'s methods in binary128's precision; macros for
-  the others); `<tgmath.h>` chooses `_Float16`'s and `_Float128`'s, real and complex, and the
-  standard ones for the others.
+- Annex H is not claimed (`__STDC_IEC_60559_TYPES__` is not defined) for want of
+  `_Decimal64x` (H.2.4: an implementation with decimal floating types that claims the
+  annex provides it), and with it the `d64x` functions, `strtod64x`, `strfromd64x`,
+  `wcstod64x`, `DEC64X_` macros and `HUGE_VAL_D64X`; nor are there H.12.4 and H.12.5's
+  string conversions of encodings (`strfromencf16`, `strtoencf32`, `wcstoencdecd64`
+  ...). The rest of the annex is the library's under `__STDC_WANT_IEC_60559_TYPES_EXT__`:
+  every function of H.11.2 for `_Float16`, `_Float32`, `_Float64`, `_Float128`,
+  `_Float32x` and `_Float64x` (`std/c/include/axc/math_floatn.h`, generated by
+  `cmd/internal/tools/gen_floatn.py`, as are the definitions and the test
+  `c/lib/math/floatn_names.c`): `_Float16`'s and `_Float128`'s the library's own
+  (binary128's exact functions correctly rounded, its elementary ones in its precision;
+  binary16's elementary ones correctly rounded: the double function's value rounded
+  once, or the `_Float128` function's where that value is too near a rounding boundary;
+  `m_f16_c23.c`, `m_f128_c23.c` for C23's additions, `nanf16` and `nanf128` in
+  `m_nan.c`); those of `_Float32`, `_Float64`, `_Float32x` and `_Float64x` functions of
+  their types that call the `float`, `double`, `long double` or `_Float128` function of
+  their format (`fn_f32.c` ...). The narrowing operations between them (`f16addf32` ...
+  `f32xsqrtf64x`, the 90 of H.11.2's 7.12.14) are exact and rounded once in the current
+  direction (`fn_narrow.c`, `math_narrow.ax` to binary16, 32, 64 and the x87 format);
+  the encoding functions `encodefN`, `decodefN`, `fMencfN`, `dMencdecdN` and
+  `dMencbindN` (H.11.3; `fn_enc.c`) exist, and `encodedecdN` ... `decodebindN` take
+  `unsigned char` arrays as C23 7.12.16 says. `<stdlib.h>`'s `strtofN` and `strfromfN`
+  and `<wchar.h>`'s `wcstofN` exist for every binary type (`fn_str.c`; `wcstof16` and
+  `wcstof128` read the wide string's characters below 128). `<complex.h>` has every
+  complex function of each type (`fn_cx_f32.c` ...), and `<tgmath.h>` chooses each type's
+  own functions, real and complex, whose results have that type. `<math.h>` has
+  `long_double_t`, `_Float16_t` (`float`), `_Float32_t` ... `_Float128_t` and
+  `_Decimal32_t` ... `_Decimal128_t` (H.11, `FLT_EVAL_METHOD` and `DEC_EVAL_METHOD` 0).
 - In a GNU dialect: the
   destructors run when `main` returns and from the library's `exit`, not when the
   process ends otherwise (`_Exit`, `quick_exit`, a signal).

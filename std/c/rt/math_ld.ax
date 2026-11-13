@@ -2673,3 +2673,181 @@ pub fn bq23(op: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void {
 pub fn bqsf(op: u64, r: *mut ld.W, x: *ld.W) void {
     __axc_ld_sf(op, 0, r, x);
 }
+
+// -----------------------------------------------------------------------------
+// The real functions of <complex.h>'s wide long double and _Float128 functions
+// -----------------------------------------------------------------------------
+
+/// r[i] + r[i+1] = v 2^k: the value rounded to the format, and the rest
+/// rounded (the pair holds about twice the format's precision).
+fn put_pair(r: *mut [4]ld.W, i: usize, v: TD, k: i32, f: u32) void {
+    td_to_ld(&mut r[i], v, k, f);
+    let h = decode(&r[i], f);
+    if (h.cls != C_FIN) or (v.h == 0.0) {
+        ld.from_f64(&mut r[i + 1], 0, f);
+        return;
+    }
+    let mut hv = tscale(sig_td(h), p2(h.e - k));
+    if h.neg {
+        hv = tneg(hv);
+    }
+    td_to_ld(&mut r[i + 1], tsub(v, hv), k, f);
+}
+
+/// x (finite) into r[i] + r[i+1] as it is.
+fn put_same(r: *mut [4]ld.W, i: usize, x: *ld.W, f: u32) void {
+    r[i] = x.*;
+    ld.from_f64(&mut r[i + 1], 0, f);
+}
+
+/// The complex functions' real functions in format f, each as a pair of the
+/// format (complex_impl.h; the arguments finite, in the ranges it gives
+/// them): op 0 e^x (inf beyond the overflow), 1 e^x - 1 (|x| <= 1), 2 sin x
+/// in r[0..2] and cos x in r[2..4], 3 log1p x (x >= 0), 4 atan2(x, y) (x the
+/// ordinate, not both 0), 5 log|x + iy| (x >= y >= 0, x > 0).
+export fn __axc_ldcx(op: u64, f64fmt: u64, r: *mut [4]ld.W, x: *ld.W, y: *ld.W) void @multiversion("fma") {
+    let f = @truncate(u32, f64fmt);
+    let xv = decode(x, f);
+    let tiny = (xv.cls == C_ZERO) or (xv.e < -900);
+    if op == 0 {
+        if tiny {
+            ld.from_f64(&mut r[0], m.bits(1.0), f);
+            r[1] = x.*;  // (e^x = 1 + x within 2^-1800)
+            return;
+        }
+        if (xv.e > 14) or (@abs(val_td(xv).h) > 11450.0) {
+            ld.from_f64(&mut r[1], 0, f);
+            if xv.neg {
+                ld.from_f64(&mut r[0], 0, f);
+            } else {
+                ld.from_f64(&mut r[0], 0x7ff0000000000000, f);
+            }
+            return;
+        }
+        let ec = exp_core(val_td(xv));
+        put_pair(r, 0, ec.v, ec.k, f);
+        return;
+    }
+    if op == 1 {
+        if tiny {
+            put_same(r, 0, x, f);
+            return;
+        }
+        let tk = expm1_tk(val_td(xv));
+        put_pair(r, 0, tk.v, tk.k, f);
+        return;
+    }
+    if op == 2 {
+        if tiny {
+            put_same(r, 0, x, f);
+            ld.from_f64(&mut r[2], m.bits(1.0), f);
+            ld.from_f64(&mut r[3], 0, f);
+            return;
+        }
+        let mut n: i32 = 0;
+        let mut rr = tdd(0.0);
+        if (xv.e < 0) and (@abs(val_td(xv).h) <= 0.7853981633974483) {
+            rr = val_td(xv);
+        } else {
+            let red = reduce(xv);
+            n = red.n;
+            rr = red.r;
+        }
+        let sc = sincos_k(rr);
+        let q = n & 3;
+        let mut s = sc.s;
+        let mut c = sc.c;
+        if q == 1 {
+            s = sc.c;
+            c = tneg(sc.s);
+        } else if q == 2 {
+            s = tneg(sc.s);
+            c = tneg(sc.c);
+        } else if q == 3 {
+            s = tneg(sc.c);
+            c = sc.s;
+        }
+        put_pair(r, 0, s, 0, f);
+        put_pair(r, 2, c, 0, f);
+        return;
+    }
+    if op == 3 {
+        if tiny {
+            put_same(r, 0, x, f);
+            return;
+        }
+        if xv.e > 900 {
+            put_pair(r, 0, log_x(xv), 0, f);  // (1 is below 2^-900 of x)
+            return;
+        }
+        put_pair(r, 0, log1p_td(val_td(xv)), 0, f);
+        return;
+    }
+    let yv = decode(y, f);
+    if op == 5 {
+        // log(a^2 + b^2)/2 + e ln2, a and b scaled by 2^-e (as ld2's clog
+        // part: the squares' sum to 2^-150, nothing cancels near 1)
+        let e = xv.e;
+        let a = sig_td(xv);
+        let mut b = tdd(0.0);
+        if (yv.cls == C_FIN) and ((e - yv.e) < 600) {
+            b = tscale(sig_td(yv), p2(yv.e - e));
+        }
+        let mut s2 = tadd(tmul(a, a), tmul(b, b));
+        let mut e2: i32 = 0;
+        if s2.h >= 4.0 {
+            s2 = tscale(s2, 0.25);
+            e2 = 2;
+        } else if s2.h >= 2.0 {
+            s2 = tscale(s2, 0.5);
+            e2 = 1;
+        }
+        let l = tadd(tscale(log_core(s2, e2), 0.5), tmul_d(td(lt.LN2_H, lt.LN2_M, lt.LN2_L), @float_from_int(f64, e)));
+        put_pair(r, 0, l, 0, f);
+        return;
+    }
+    // atan2(x, y): x the ordinate
+    let dy = xv;
+    let dx = yv;
+    let mut v = tdd(0.0);
+    if dy.cls == C_ZERO {
+        v = tdd(0.0);
+    } else if dx.cls == C_ZERO {
+        v = td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L);
+    } else if (dy.e - dx.e) < -600 {
+        // |y/x| below 2^-600: atan2 = y/x (or pi - |y/x|)
+        if not dx.neg {
+            let mut q = tdiv(sig_td(dy), sig_td(dx));
+            if dy.neg {
+                q = tneg(q);
+            }
+            put_pair(r, 0, q, dy.e - dx.e, f);
+            return;
+        }
+        v = tdd(0.0);
+    } else {
+        let e = @max(dy.e, dx.e);
+        let mut ay = tdd(0.0);
+        let mut ax = tdd(0.0);
+        if (e - dy.e) < 600 {
+            ay = tscale(sig_td(dy), p2(dy.e - e));
+        }
+        if (e - dx.e) < 600 {
+            ax = tscale(sig_td(dx), p2(dx.e - e));
+        }
+        if ax.h == 0.0 {
+            v = td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L);
+        } else if ay.h <= ax.h {
+            v = atan_core(tdiv(ay, ax));
+        } else {
+            v = tsub(td(lt.PIO2_H, lt.PIO2_M, lt.PIO2_L), atan_core(tdiv(ax, ay)));
+        }
+    }
+    if dx.neg {
+        v = tsub(td(lt.PI_H, lt.PI_M, lt.PI_L), v);
+    }
+    if dy.neg {
+        v = tneg(v);
+    }
+    put_pair(r, 0, v, 0, f);
+}

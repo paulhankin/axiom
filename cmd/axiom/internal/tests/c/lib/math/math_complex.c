@@ -32,7 +32,7 @@ int main(void)
 /* expect: -0 */
     pc(cexp(CMPLX(710.0, 0.5)));
 /* expect: inf */
-/* expect: 1.071034144006049e+308 */
+/* expect: 1.0710341440060488e+308 */
     pc(clog(CMPLX(-z0, z0)));
 /* expect: -inf */
 /* expect: 3.141592653589793 */
@@ -71,7 +71,7 @@ int main(void)
 /* expect: 1.2984575814159773 */
 /* expect: 0.6349639147847361 */
     pc(ccos(CMPLX(1.0, 1.0)));
-/* expect: 0.8337300251311491 */
+/* expect: 0.833730025131149 */
 /* expect: -0.9888977057628651 */
     pc(ctan(CMPLX(1.0, 1.0)));
 /* expect: 0.27175258531951174 */
@@ -81,19 +81,19 @@ int main(void)
 /* expect: 0 */
     pc(casin(CMPLX(2.0, z0)));
 /* expect: 1.5707963267948966 */
-/* expect: 1.3169578969248166 */
+/* expect: 1.3169578969248168 */
     pc(casin(CMPLX(2.0, -z0)));
 /* expect: 1.5707963267948966 */
-/* expect: -1.3169578969248166 */
+/* expect: -1.3169578969248168 */
     pc(cacos(CMPLX(2.0, z0)));
 /* expect: 0 */
-/* expect: -1.3169578969248166 */
+/* expect: -1.3169578969248168 */
     pc(catan(CMPLX(z0, 2.0)));
 /* expect: 1.5707963267948966 */
 /* expect: 0.5493061443340549 */
     pc(casinh(CMPLX(1.0, 1.0)));
 /* expect: 1.0612750619050357 */
-/* expect: 0.6662394324925152 */
+/* expect: 0.6662394324925153 */
     pc(cacosh(CMPLX(z0, z0)));
 /* expect: 0 */
 /* expect: 1.5707963267948966 */

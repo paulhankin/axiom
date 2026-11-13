@@ -16,11 +16,11 @@
 #define INF ((_Float128)__builtin_inff())
 #define FN(n) n##f128
 #define M(n) n##f128
-#define K_MAX FLT128_MAX
 #define K_EXP_BIG 11350.0F128
-#define K_TINY 0x1p-16380F128
-#define K_UP 0x1p8000F128
-#define K_DOWN_HALF 0x1p-4000F128
+#define K_SQ_HI 8000
+#define K_SQ_LO (-8000)
+#define K_SQ_HIV 0x1p8000F128
+#define K_SQ_LOV 0x1p-8000F128
 #define K_TANH_BIG 45.0F128
 #define K_ASIN_BIG 0x1p120F128
 #define K_ATANH_BIG 0x1p8000F128
@@ -29,16 +29,24 @@
 #define K_3PIO4 2.35619449019234492884698253745962716F128
 #define K_PI 3.14159265358979323846264338327950288F128
 #define K_LN2 0.693147180559945309417232121458176568F128
+#define K_LN2_LO (-7.008139474549585163412662008771625674e-36F128)
 
-void __axc_ld2(unsigned long long op, unsigned long long f, _Float128 *r, const _Float128 *x, const _Float128 *y);
+/* the real functions in pairs of binary128 values (std/c/rt/math_ld.ax,
+   format 0) */
+void __axc_ldcx(unsigned long long op, unsigned long long f, _Float128 *r, const _Float128 *x, const _Float128 *y);
 
-/* log|z| (ax >= ay >= 0, ax > 0): math_ld.ax's, in binary128 (format 0) */
-static _Float128 clog_re(_Float128 ax, _Float128 ay)
+static void xk1_q(int op, _Float128 x, _Float128 *r)
 {
-    _Float128 r;
-    __axc_ld2(3, 0, &r, &ax, &ay);
-    return r;
+    __axc_ldcx((unsigned long long)op, 0, r, &x, &x);
 }
+
+static void xk2_q(int op, _Float128 y, _Float128 x, _Float128 *r)
+{
+    __axc_ldcx((unsigned long long)op + 4, 0, r, &y, &x);
+}
+#define XK1(op, x, r) xk1_q((op), (x), (r))
+#define XK2(op, y, x, r) xk2_q((op), (y), (x), (r))
+#define PROD_ERR(a, b, p) fmaf128((a), (b), -(p))
 
 #include "complex_impl.h"
 #else

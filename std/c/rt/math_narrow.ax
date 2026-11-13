@@ -289,13 +289,29 @@ struct Fmt {
     p: i32,
     emin: i32,
     emax: i32,
+    sb: u64,  // the sign bit's position
+    x: u64,   // 0, or the x87 format's part the result is: 3 the significand, 4 the sign and exponent
 }
 
 inline fn fmt_of(dbl: bool) Fmt {
     if dbl {
-        return Fmt.{ p: 53, emin: -1022, emax: 1023 };
+        return Fmt.{ p: 53, emin: -1022, emax: 1023, sb: 63, x: 0 };
     }
-    return Fmt.{ p: 24, emin: -126, emax: 127 };
+    return Fmt.{ p: 24, emin: -126, emax: 127, sb: 31, x: 0 };
+}
+
+/// The result format of __axc_narrow's dst: 0 binary32, 1 binary64, 2
+/// binary16, 3 and 4 the x87 format's significand (64 bits, the integer bit
+/// explicit) and its sign and exponent field (C23 Annex H's f16addf32 ...,
+/// f64xaddf128).
+inline fn fmt_dst(dst: u64) Fmt {
+    if dst == 2 {
+        return Fmt.{ p: 11, emin: -14, emax: 15, sb: 15, x: 0 };
+    }
+    if dst >= 3 {
+        return Fmt.{ p: 64, emin: -16382, emax: 16383, sb: 15, x: dst };
+    }
+    return fmt_of(dst != 0);
 }
 
 /// The current rounding direction: 0 to nearest, 1 upward, 2 downward, 3
@@ -334,21 +350,27 @@ fn up(dir: u32, neg: bool, lsb: bool, guard: bool, sticky: bool) bool {
 /// subnormal rounded up to the smallest normal does).
 fn encode(t: Fmt, neg: bool, ef: i32, frac: u64) u64 {
     let s = b2u(neg);
-    let sh = @as(u64, @bit_cast(u32, t.p - 1));
-    return ((s << if_dbl(t, 63, 31)) | (@as(u64, @bit_cast(u32, ef)) << sh)) + frac;
-}
-
-inline fn if_dbl(t: Fmt, a: u64, b: u64) u64 {
-    if t.p == 53 {
-        return a;
+    if t.x == 3 {
+        // (the x87's integer bit, explicit: set but for zeros and subnormals)
+        if ef != 0 {
+            return frac | 0x8000000000000000;
+        }
+        return frac;
     }
-    return b;
+    if t.x == 4 {
+        return (s << 15) | @as(u64, @bit_cast(u32, ef));
+    }
+    let sh = @as(u64, @bit_cast(u32, t.p - 1));
+    return ((s << t.sb) | (@as(u64, @bit_cast(u32, ef)) << sh)) + frac;
 }
 
 /// The value (sh:sl) 2^(ex - 127) (bit 127 set), with the bits below it
 /// that sticky stands for, rounded to t in the current direction, with its
 /// exceptions: the bits of the result.
 fn round_to(t: Fmt, neg: bool, ex: i32, sh: u64, sl: u64, sticky0: bool) u64 {
+    if t.p == 64 {
+        return round_x87(t, neg, ex, sh, sl, sticky0);
+    }
     let dir = direction();
     let one: u64 = 1;
     // the number of bits kept: p, fewer for a subnormal result
@@ -419,6 +441,81 @@ fn round_to(t: Fmt, neg: bool, ex: i32, sh: u64, sl: u64, sticky0: bool) u64 {
         __axc_math_err(err, flags);
     }
     return encode(t, neg, 0, mant);  // a subnormal (or zero, or the smallest normal)
+}
+
+/// round_to for the x87 format's 64 bits (encode's parts of it): the
+/// significand's bits from sh and sl, the same rules.
+fn round_x87(t: Fmt, neg: bool, ex: i32, sh: u64, sl: u64, sticky0: bool) u64 {
+    let dir = direction();
+    let one: u64 = 1;
+    let mut keep: i32 = 64;
+    if ex < t.emin {
+        keep = 64 - (t.emin - ex);
+    }
+    let mut mant: u64 = 0;
+    let mut guard = false;
+    let mut sticky = sticky0;
+    if keep >= 64 {
+        mant = sh;
+        guard = (sl >> 63) != 0;
+        sticky = sticky or ((sl << 1) != 0);
+    } else if keep >= 1 {
+        let k = @as(u64, @bit_cast(u32, keep));
+        mant = sh >> (64 - k);
+        guard = ((sh >> (63 - k)) & 1) != 0;
+        sticky = sticky or (sl != 0) or ((sh & ((one << (63 - k)) - 1)) != 0);
+    } else if keep == 0 {
+        guard = true;
+        sticky = sticky or (sl != 0) or ((sh << 1) != 0);
+    } else {
+        sticky = true;
+    }
+    let inexact = guard or sticky;
+    let mut tiny = ex < t.emin;
+    if ex == (t.emin - 1) {
+        // (rounded to 64 bits with an unbounded exponent: 2^emin?)
+        if (sh == 0xFFFF_FFFF_FFFF_FFFF) and up(dir, neg, true, (sl >> 63) != 0, sticky0 or ((sl << 1) != 0)) {
+            tiny = false;
+        }
+    }
+    let mut e2 = ex;
+    if up(dir, neg, (mant & 1) != 0, guard, sticky) {
+        if mant == 0xFFFF_FFFF_FFFF_FFFF {
+            mant = 0x8000000000000000;  // (keep is 64: the carry out)
+            e2 += 1;
+        } else {
+            mant += 1;
+        }
+    }
+    let mut flags: u32 = 0;
+    let mut err: i32 = 0;
+    if inexact {
+        flags = 0x20;
+    }
+    if tiny and inexact {
+        flags = flags | 0x10;
+        err = m.ERANGE;
+    }
+    if ex >= t.emin {
+        if e2 > t.emax {
+            __axc_math_err(m.ERANGE, 0x08 | 0x20);
+            if (dir == 0) or ((dir == 1) and not neg) or ((dir == 2) and neg) {
+                return encode(t, neg, (2 * t.emax) + 1, 0);
+            }
+            return encode(t, neg, 2 * t.emax, 0x7FFF_FFFF_FFFF_FFFF);
+        }
+        if flags != 0 {
+            __axc_math_err(err, flags);
+        }
+        return encode(t, neg, e2 + t.emax, mant & 0x7FFF_FFFF_FFFF_FFFF);
+    }
+    if flags != 0 {
+        __axc_math_err(err, flags);
+    }
+    if (mant >> 63) != 0 {
+        return encode(t, neg, 1, mant & 0x7FFF_FFFF_FFFF_FFFF);  // (rounded up to the smallest normal)
+    }
+    return encode(t, neg, 0, mant);  // a subnormal or zero
 }
 
 /// w (nonzero) rounded to t: its top 128 bits and a sticky bit for the rest.
@@ -671,6 +768,16 @@ fn op_sqrt(t: Fmt, a: Opnd) u64 {
         }
     }
     let sticky = (remc | remh | reml) != 0;
+    if t.p == 64 {
+        // (the x87's 64 bits: the half below s is the remainder above s, as
+        // (s + 1/2)^2 = s^2 + s + 1/4; never exactly: the bits beyond it are
+        // not zero then)
+        let above = (remc != 0) or (remh != 0) or (reml > s);
+        if above {
+            return round_to(t, false, e2 + 63, s, 0x8000000000000001, false);
+        }
+        return round_to(t, false, e2 + 63, s, 0, sticky);
+    }
     // sqrt(a) = s 2^(E2 - 63) + ..., bit 63 of s set
     return round_to(t, false, e2 + 63, s, 0, sticky);
 }
@@ -744,12 +851,15 @@ export fn fsqrt(x: f64) f32 {
     return f32_of(op_sqrt(fmt_of(false), num_f64(m.bits(x))));
 }
 
-/// The long double forms (std/c/lib/math/m_narrow.c): op 0 add, 1 subtract,
-/// 2 multiply, 3 divide, 4 fma, 5 sqrt of the format f's operands, to double
-/// (dbl) or float: the result's bits.
-export fn __axc_narrow(op: u64, f: u64, dbl: u64, x: *ld.W, y: *ld.W, z: *ld.W) u64 {
+/// The long double forms (std/c/lib/math/m_narrow.c) and Annex H's
+/// (m_narrow_fn.c): op 0 add, 1 subtract, 2 multiply, 3 divide, 4 fma, 5 sqrt
+/// of the format f's operands (ldouble.ax's FMT_Q or FMT_X), to dst (0
+/// float, 1 double, 2 _Float16, 3 and 4 the x87 format's significand and its
+/// sign and exponent: the operation computed again for each): the result's
+/// bits.
+export fn __axc_narrow(op: u64, f: u64, dst: u64, x: *ld.W, y: *ld.W, z: *ld.W) u64 {
     let fm = @truncate(u32, f);
-    let t = fmt_of(dbl != 0);
+    let t = fmt_dst(dst);
     let a = num_ld(x, fm);
     if op == 5 {
         return op_sqrt(t, a);

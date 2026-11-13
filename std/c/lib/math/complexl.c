@@ -16,11 +16,11 @@
 #define INF ((long double)__builtin_inff())
 #define FN(n) n##l
 #define M(n) n##l
-#define K_MAX LDBL_MAX
 #define K_EXP_BIG 11350.0L
-#define K_TINY 0x1p-16380L
-#define K_UP 0x1p8000L
-#define K_DOWN_HALF 0x1p-4000L
+#define K_SQ_HI 8000
+#define K_SQ_LO (-8000)
+#define K_SQ_HIV 0x1p8000L
+#define K_SQ_LOV 0x1p-8000L
 #define K_TANH_BIG 45.0L
 #define K_ASIN_BIG 0x1p120L
 #define K_ATANH_BIG 0x1p8000L
@@ -29,18 +29,28 @@
 #define K_3PIO4 2.35619449019234492884698253745962716L
 #define K_PI 3.14159265358979323846264338327950288L
 #define K_LN2 0.693147180559945309417232121458176568L
+#if __AXIOM_LDBL_WIDTH__ == 80
+#define K_LN2_LO (-1.145835272679873281093529986196612039e-20L)
+#else
+#define K_LN2_LO (-7.008139474549585163412662008771625674e-36L)
+#endif
 
-void __axc_ld2(unsigned long long op, unsigned long long f, long double *r, const long double *x,
-               const long double *y);
+/* the real functions in pairs of long doubles (std/c/rt/math_ld.ax) */
+void __axc_ldcx(unsigned long long op, unsigned long long f, long double *r, const long double *x,
+                const long double *y);
 
-/* log|z| (ax >= ay >= 0, ax > 0): math_ld.ax's, from x^2 + y^2 in
-   triple-double */
-static long double clog_re(long double ax, long double ay)
+static void xk1_ld(int op, long double x, long double *r)
 {
-    long double r;
-    __axc_ld2(3, __AXIOM_LDBL_WIDTH__ == 80, &r, &ax, &ay);
-    return r;
+    __axc_ldcx((unsigned long long)op, __AXIOM_LDBL_WIDTH__ == 80, r, &x, &x);
 }
+
+static void xk2_ld(int op, long double y, long double x, long double *r)
+{
+    __axc_ldcx((unsigned long long)op + 4, __AXIOM_LDBL_WIDTH__ == 80, r, &y, &x);
+}
+#define XK1(op, x, r) xk1_ld((op), (x), (r))
+#define XK2(op, y, x, r) xk2_ld((op), (y), (x), (r))
+#define PROD_ERR(a, b, p) fmal((a), (b), -(p))
 
 #include "complex_impl.h"
 #else

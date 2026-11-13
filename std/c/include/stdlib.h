@@ -109,10 +109,10 @@ unsigned long __axc_strtoul_c23(const char *restrict __nptr, char **restrict __e
 unsigned long long __axc_strtoull_c23(const char *restrict __nptr, char **restrict __endptr, int __base);
 #endif
 #if defined(__STDC_WANT_IEC_60559_TYPES_EXT__) && __STDC_VERSION__ >= 199901L
-/* ISO/IEC TS 18661-3 (C23 Annex H): _Float16's and _Float128's conversions
-   are the library's; _Float32's, _Float64's and _Float32x's those of float
-   and double, _Float64x's long double's where it is wider than double,
-   else _Float128's (macros that name them) */
+/* ISO/IEC TS 18661-3 (C23 Annex H.12): _Float16's and _Float128's
+   conversions are the library's; _Float32's, _Float64's and _Float32x's
+   call those of float and double, _Float64x's long double's where it is
+   wider than double, else _Float128's (std/c/lib/math/fn_str.c) */
 _Float16 strtof16(const char *restrict nptr, char **restrict endptr);
 _Float128 strtof128(const char *restrict nptr, char **restrict endptr);
 int strfromf16(char *restrict s, size_t n, const char *restrict format, _Float16 fp);
@@ -120,19 +120,14 @@ int strfromf128(char *restrict s, size_t n, const char *restrict format, _Float1
 int strfromd(char *restrict s, size_t n, const char *restrict format, double fp);
 int strfromf(char *restrict s, size_t n, const char *restrict format, float fp);
 int strfroml(char *restrict s, size_t n, const char *restrict format, long double fp);
-#define strtof32 strtof
-#define strtof64 strtod
-#define strtof32x strtod
-#define strfromf32 strfromf
-#define strfromf64 strfromd
-#define strfromf32x strfromd
-#if __AXIOM_LDBL_WIDTH__ != 64
-#define strtof64x strtold
-#define strfromf64x strfroml
-#else
-#define strtof64x strtof128
-#define strfromf64x strfromf128
-#endif
+_Float32 strtof32(const char *restrict nptr, char **restrict endptr);
+_Float64 strtof64(const char *restrict nptr, char **restrict endptr);
+_Float32x strtof32x(const char *restrict nptr, char **restrict endptr);
+_Float64x strtof64x(const char *restrict nptr, char **restrict endptr);
+int strfromf32(char *restrict s, size_t n, const char *restrict format, _Float32 fp);
+int strfromf64(char *restrict s, size_t n, const char *restrict format, _Float64 fp);
+int strfromf32x(char *restrict s, size_t n, const char *restrict format, _Float32x fp);
+int strfromf64x(char *restrict s, size_t n, const char *restrict format, _Float64x fp);
 #endif
 #if __STDC_VERSION__ >= 202311L
 int strfromd(char *restrict __s, size_t __n, const char *restrict __format, double __fp);

@@ -109,19 +109,20 @@ int main(void) {
     nl();
     /* encodings: DPD and BID */
     {
-        _Decimal64 x = 1.dd, y, enc;
+        _Decimal64 x = 1.dd, y;
+        _Decimal128 big = 9.999999999999999999999999999999999E6144dl, back;
+        unsigned char enc[9], eb[16];
         unsigned long long u;
-        encodedecd64(&enc, &x);
-        memcpy(&u, &enc, 8);
+        encodedecd64(enc + 1, &x); /* (any alignment) */
+        memcpy(&u, enc + 1, 8);
         printf("%llx ", u);
-        decodedecd64(&y, &enc);
+        decodedecd64(&y, enc + 1);
         S(y);
-        _Decimal128 big = 9.999999999999999999999999999999999E6144dl, eb, back;
-        encodedecd128(&eb, &big);
-        decodedecd128(&back, &eb);
+        encodedecd128(eb, &big);
+        decodedecd128(&back, eb);
         printf("%d ", memcmp(&back, &big, 16) == 0);
-        encodebind64(&enc, &x);
-        printf("%d ", memcmp(&enc, &x, 8) == 0);
+        encodebind64(enc, &x);
+        printf("%d ", memcmp(enc, &x, 8) == 0);
 /* expect: 2238000000000001 1 1 1  */
         nl();
     }
