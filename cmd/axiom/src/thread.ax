@@ -714,6 +714,11 @@ fn thread_marked(f: *mut ir.Func, order: *u.List.[*mut ir.Block], b: *mut ir.Blo
     }
     outside_uses(b);
     thread(f, b, p, s, cond);
+    mark_dirty(r);
+}
+
+// Marks r's dominator subtree dirty, and its dominators as above it.
+fn mark_dirty(r: *mut ir.Block) void {
     let mut d = r.idom;
     while (d != r) and not above.get(@int_cast(usize, d.rpo)) {
         above.set(@int_cast(usize, d.rpo), true);
@@ -736,6 +741,940 @@ fn thread_marked(f: *mut ir.Func, order: *u.List.[*mut ir.Block], b: *mut ir.Blo
         }
     }
     work.deinit();
+}
+
+// -----------------------------------------------------------------------------
+// Threading through several blocks. B branches on a condition that is known
+// on the edge from P into H, a block further up that dominates (some of) B's
+// predecessors: `t ? t->h : 0` twice, with another such diamond between
+// the two tests of t. R, the blocks on the paths from H to B that H
+// dominates, is entered only through H (each of them but H has all its
+// predecessors in R) and has no cycle; R and B are copied for P (H's copy
+// has P as its only predecessor, B's goes straight to the successor S the
+// condition selects), the copies' edges out of R go to the blocks they
+// went to, and the values R and B define are repaired where they are used
+// beyond them, as for one block. Valid because the copy runs exactly the
+// instructions the original did on the paths from P, and on all of them
+// the condition is what the edge from P says (it is computed from values
+// defined before H, from H's phis as P gives them, and from phis inside R
+// whose inputs on all the copied paths agree).
+// -----------------------------------------------------------------------------
+const MAX_REGION: i32 = 16;      // instructions copied for one edge
+const MAX_RBLOCKS: usize = 8;    // blocks of R
+const MAX_UP: i32 = 4;           // dominators of B's predecessor tried as H
+const MAX_RUSES: usize = 64;     // uses beyond R and B of their values (each is repaired)
+const REGION_FN_BASE: i32 = 64;  // instructions a function may grow by (and a 64th of its size,
+const REGION_FN_MAX: i32 = 192;  // up to this)
+
+let mut rblocks: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                   cap: 0 };
+let mut rcopy: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                 cap: 0 };
+let mut rwork: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                 cap: 0 };
+let mut rh: *mut ir.Block = @ptr_from_int(*mut ir.Block, 0);  // H
+let mut rb: *mut ir.Block = @ptr_from_int(*mut ir.Block, 0);  // B (last in rblocks)
+let mut rp: *mut ir.Block = @ptr_from_int(*mut ir.Block, 0);  // P
+let mut rcost: i32 = 0;
+// what the function being threaded may still grow by
+let mut budget_fn: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
+let mut budget_left: i32 = 0;
+
+// x's place in rblocks (R, then B), or -1.
+fn rindex(x: *mut ir.Block) i64 {
+    for k in 0..rblocks.len {
+        if rblocks.get(k) == x {
+            return @as(i64, @int_cast(i64, k));
+        }
+    }
+    return -1;
+}
+
+fn in_region(v: *ir.Value) bool {
+    return u.notnil(v) and (v.kind == ir.V_INST) and (rindex(v.blk) >= 0);
+}
+
+// R for H and B (in reverse postorder, then B) in rblocks; false if there is
+// none, or it is too large, has a cycle, or holds what cannot be copied.
+fn build_region(h: *mut ir.Block, b: *mut ir.Block) bool {
+    rblocks.clear();
+    rwork.clear();
+    for k in 0..b.preds.len {
+        let x = b.preds.get(k);
+        if (x.rpo >= 0) and (x != b) and opt.dominates(h, x) and (rindex(x) < 0) {
+            if x.rpo >= b.rpo {
+                return false;  // (a cycle through B)
+            }
+            rblocks.push(x);
+            rwork.push(x);
+        }
+    }
+    if rblocks.len == 0 {
+        return false;
+    }
+    while rwork.len > 0 {
+        let x = rwork.pop();
+        if x == h {
+            continue;
+        }
+        // (x is strictly dominated by H, and so are its predecessors)
+        for k in 0..x.preds.len {
+            let z = x.preds.get(k);
+            if z.rpo < 0 {
+                continue;  // (unreachable: the copy does without it)
+            }
+            if z.rpo >= x.rpo {
+                return false;  // a cycle
+            }
+            if rindex(z) < 0 {
+                if rblocks.len >= MAX_RBLOCKS {
+                    return false;
+                }
+                rblocks.push(z);
+                rwork.push(z);
+            }
+        }
+    }
+    // reverse postorder (H, which dominates the others, first)
+    for i in 1..rblocks.len {
+        let mut j = i;
+        while (j > 0) and (rblocks.get(j - 1).rpo > rblocks.get(j).rpo) {
+            let t = rblocks.get(j);
+            rblocks.set(j, rblocks.get(j - 1));
+            rblocks.set(j - 1, t);
+            j -= 1;
+        }
+    }
+    if rblocks.get(0) != h {
+        return false;
+    }
+    for k in 0..h.preds.len {
+        if rindex(h.preds.get(k)) >= 0 {
+            return false;  // (a cycle through H)
+        }
+    }
+    rblocks.push(b);
+    rcost = 0;
+    for k in 0..rblocks.len {
+        let y = rblocks.get(k);
+        if not ir.can_copy_block(y) {
+            return false;
+        }
+        rcost += copy_cost(y);
+    }
+    return rcost <= MAX_REGION;
+}
+
+// The value v has on every copied path, as a value defined before H (H's
+// phis take P's input; a phi inside R or B, the input its copied
+// predecessors agree on), or nil (one computed inside R or B).
+fn rval(v0: *mut ir.Value, depth: i32) *mut ir.Value {
+    let v = ir.resolve(v0);
+    if not in_region(v) {
+        return v;
+    }
+    if (v.op != ir.OP_PHI) or (depth > 8) {
+        return vnil();
+    }
+    if v.blk == rh {
+        let x = ir.incoming(v, rp);
+        if u.isnil(x) {
+            return vnil();
+        }
+        return ir.resolve(x);
+    }
+    let mut r = vnil();
+    for k in 0..v.xs.len {
+        if rindex(ir.bs_of(v).get(k)) < 0 {
+            continue;  // (from outside R: a predecessor of B the copy does not have)
+        }
+        let x = rval(v.xs.get(k), depth + 1);
+        if u.isnil(x) or (u.notnil(r) and (x != r)) {
+            return vnil();
+        }
+        r = x;
+    }
+    return r;
+}
+
+// The constant v is on every copied path from P, or nil.
+fn rknown(v0: *mut ir.Value, depth: i32) *mut ir.Value {
+    let v = ir.resolve(v0);
+    if ir.is_small_cint(v) {
+        return v;
+    }
+    if depth > 6 {
+        return vnil();
+    }
+    let w = rval(v, depth);
+    if u.notnil(w) {
+        if ir.is_small_cint(w) {
+            return w;
+        }
+        if (w.kind == ir.V_INST) and (w.ty.kind == ir.T_INT) and (w.ty.bits == 1) {
+            return implied(w, rh, rp);  // (what the branches into H from P say)
+        }
+        return vnil();
+    }
+    if v.kind != ir.V_INST {
+        return vnil();
+    }
+    let op = v.op;
+    if op == ir.OP_PHI {
+        // a phi of constants along the copied paths
+        let mut r = vnil();
+        for k in 0..v.xs.len {
+            if (v.blk != rh) and (rindex(ir.bs_of(v).get(k)) < 0) {
+                continue;
+            }
+            if (v.blk == rh) and (ir.bs_of(v).get(k) != rp) {
+                continue;
+            }
+            let x = rknown(v.xs.get(k), depth + 1);
+            if u.isnil(x) or (u.notnil(r) and (ir.cint_val(x) != ir.cint_val(r))) {
+                return vnil();
+            }
+            r = x;
+        }
+        return r;
+    }
+    if (op == ir.OP_AND) or (op == ir.OP_OR) {
+        let x = rknown(v.a, depth + 1);
+        let y = rknown(v.b, depth + 1);
+        if u.notnil(x) and u.notnil(y) {
+            return ir.fold_int_bin(op, v.ty, x, y);
+        }
+        let zero_decides = op == ir.OP_AND;
+        if v.ty.bits == 1 {
+            if u.notnil(x) and ((ir.cint_val(x) == 0) == zero_decides) {
+                return x;
+            }
+            if u.notnil(y) and ((ir.cint_val(y) == 0) == zero_decides) {
+                return y;
+            }
+        }
+        return vnil();
+    }
+    if ir.is_int_binop(op) {
+        if (v.ty.kind != ir.T_INT) or (v.ty.bits > 64) {
+            return vnil();
+        }
+        let x = rknown(v.a, depth + 1);
+        if u.isnil(x) {
+            return vnil();
+        }
+        let y = rknown(v.b, depth + 1);
+        if u.isnil(y) {
+            return vnil();
+        }
+        return ir.fold_int_bin(op, v.ty, x, y);
+    }
+    if (op == ir.OP_ICMP) and ((ir.pred_of(v) == ir.IntEQ) or (ir.pred_of(v) == ir.IntNE)) and
+       ((v.b.kind == ir.V_ZERO) or (v.a.kind == ir.V_ZERO)) {
+        // a test against null (or zero) of a value from before H
+        let mut o = v.a;
+        if o.kind == ir.V_ZERO {
+            o = v.b;
+        }
+        let ow = rval(o, depth + 1);
+        if u.isnil(ow) {
+            return vnil();
+        }
+        let z = null_on_edge(ow, rh, rp);
+        if z < 0 {
+            if (ow.ty.kind == ir.T_INT) and (ow.ty.bits <= 64) {
+                return implied_by(v, true, ow, ir.pred_of(v), 0, rh, rp);
+            }
+            return vnil();
+        }
+        return ir.kbool((z == 1) == (ir.pred_of(v) == ir.IntEQ));
+    }
+    if op == ir.OP_ICMP {
+        if (v.ty.kind != ir.T_INT) or (v.a.ty.kind != ir.T_INT) or (v.a.ty.bits > 64) {
+            return vnil();
+        }
+        let x = rknown(v.a, depth + 1);
+        let y = rknown(v.b, depth + 1);
+        if u.notnil(x) and u.notnil(y) {
+            return ir.fold_icmp(ir.pred_of(v), x, y);
+        }
+        // x p k with x from before H: what the branches into H say of x
+        if u.isnil(x) and u.notnil(y) {
+            let w2 = rval(v.a, depth + 1);
+            if u.notnil(w2) and not ir.is_small_cint(w2) and (w2.ty == v.a.ty) {
+                return implied_by(v, true, w2, ir.pred_of(v), ir.cint_val(y), rh, rp);
+            }
+        }
+        if u.notnil(x) and u.isnil(y) {
+            let w3 = rval(v.b, depth + 1);
+            if u.notnil(w3) and not ir.is_small_cint(w3) and (w3.ty == v.b.ty) {
+                return implied_by(v, true, w3, ir.swap_pred(ir.pred_of(v)), ir.cint_val(x), rh, rp);
+            }
+        }
+        return vnil();
+    }
+    if op == ir.OP_SELECT {
+        let c = rknown(v.a, depth + 1);
+        if u.isnil(c) {
+            return vnil();
+        }
+        if ir.cint_val(c) != 0 {
+            return rknown(v.b, depth + 1);
+        }
+        return rknown(v.c, depth + 1);
+    }
+    if ((op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC)) and (v.ty.kind == ir.T_INT) and
+       (v.ty.bits <= 64) {
+        let x = rknown(v.a, depth + 1);
+        if u.isnil(x) {
+            return vnil();
+        }
+        return ir.fold_cast(op, x, v.ty);
+    }
+    return vnil();
+}
+
+// v as seen in the copies.
+fn rmapped(v: *mut ir.Value) *mut ir.Value {
+    if in_region(v) {
+        return @ptr_cast(*mut ir.Value, v.auxp);
+    }
+    return v;
+}
+
+fn rcopy_of(x: *mut ir.Block) *mut ir.Block {
+    let k = rindex(x);
+    if k < 0 {
+        return x;
+    }
+    return rcopy.get(@int_cast(usize, k));
+}
+
+// Every use beyond R and B of a value defined there (in the dominator
+// subtrees of H and B), as outside_uses does for one block.
+fn region_uses() void {
+    uses.clear();
+    let mut work = u.List.[*mut ir.Block].empty();
+    work.push(rh);
+    if not opt.dominates(rh, rb) {
+        work.push(rb);
+    }
+    while work.len > 0 {
+        let x = work.pop();
+        for k in 0..x.dom_kids.len {
+            work.push(x.dom_kids.get(k));
+        }
+        if rindex(x) >= 0 {
+            continue;  // (inside: the copies see the copies' values)
+        }
+        let mut i = x.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_PHI {
+                for k in 0..i.xs.len {
+                    let from = ir.bs_of(i).get(k);
+                    if rindex(from) < 0 {
+                        rnote(i.xs.get(k), i, from);
+                    }
+                }
+            } else {
+                rnote(i.a, i, x);
+                rnote(i.b, i, x);
+                rnote(i.c, i, x);
+                for k in 0..i.xs.len {
+                    rnote(i.xs.get(k), i, x);
+                }
+            }
+            i = i.next;
+        }
+        // phis of the blocks it leads to beyond the subtrees
+        let t = ir.terminator(x);
+        for j in 0..ir.succ_count(t) {
+            let sb = ir.succ(t, j);
+            if ((j > 0) and (ir.succ(t, j - 1) == sb)) or
+               ((sb.rpo >= 0) and (opt.dominates(rh, sb) or opt.dominates(rb, sb))) {
+                continue;
+            }
+            let mut p = sb.first;
+            while u.notnil(p) and (p.op == ir.OP_PHI) {
+                for k in 0..p.xs.len {
+                    if ir.bs_of(p).get(k) == x {
+                        rnote(p.xs.get(k), p, x);
+                    }
+                }
+                p = p.next;
+            }
+        }
+    }
+    work.deinit();
+}
+
+fn rnote(o: *mut ir.Value, i: *mut ir.Value, at: *mut ir.Block) void {
+    if in_region(o) {
+        uses.push(Use.{ user: i, at: at, phi_from_b: false });
+    }
+}
+
+// SSA repair after threading a region: the value of v that reaches the end,
+// or the entry, of block x (v from its block, the copy's from the copy, a
+// phi where both reach), memoised like at_end's.
+fn r_at_end(v: *mut ir.Value, x0: *mut ir.Block) *mut ir.Value {
+    let mut x = x0;
+    let cb = rcopy_of(v.blk);
+    let mut r = vnil();
+    let start = rchain.len;
+    while true {
+        if x == v.blk {
+            r = v;
+            break;
+        }
+        if x == cb {
+            r = rmapped(v);
+            break;
+        }
+        if x.aux == memo_key(v) {
+            r = @ptr_cast(*mut ir.Value, x.auxp);
+            break;
+        }
+        if x.preds.len != 1 {
+            break;  // (r: v at x's entry)
+        }
+        rchain.push(x);
+        x = x.preds.get(0);
+    }
+    let own = rchain.len;  // (the recursion pushes more after the chain's own blocks)
+    if u.isnil(r) {
+        r = r_at_entry(v, x);
+    }
+    // (the blocks of the chain, which do not define v, have it at their
+    // entry as at their end: remembered, for the other uses)
+    for k in start..own {
+        let y = rchain.get(k);
+        y.aux = memo_key(v);
+        y.auxp = @ptr_cast(*mut void, r);
+    }
+    return r;
+}
+
+let mut rchain: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                  cap: 0 };
+
+fn r_at_entry(v: *mut ir.Value, x: *mut ir.Block) *mut ir.Value {
+    if x.aux == memo_key(v) {
+        return @ptr_cast(*mut ir.Value, x.auxp);
+    }
+    if x.preds.len == 0 {
+        return ir.undef(v.ty);
+    }
+    if x.preds.len == 1 {
+        return r_at_end(v, x.preds.get(0));
+    }
+    if u.isnil(repair_bld) {
+        repair_bld = ir.new_builder();
+    }
+    if u.notnil(x.first) {
+        ir.at_before(repair_bld, x.first);
+    } else {
+        ir.at_end(repair_bld, x);
+    }
+    let ph = ir.phi(repair_bld, v.ty);
+    x.aux = memo_key(v);
+    x.auxp = @ptr_cast(*mut void, ph);
+    for k in 0..x.preds.len {
+        let q = x.preds.get(k);
+        let mut y = vnil();
+        if q.rpo < 0 {
+            y = ir.undef(v.ty);
+        } else {
+            y = r_at_end(v, q);
+        }
+        ir.add_incoming(ph, y, q);
+    }
+    repaired.push(ph);
+    return ph;
+}
+
+fn is_copy(x: *mut ir.Block) bool {
+    for k in 0..rcopy.len {
+        if rcopy.get(k) == x {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_pred(x: *mut ir.Block, p: *mut ir.Block) bool {
+    for k in 0..x.preds.len {
+        if x.preds.get(k) == p {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Copies R and B for the edge from P (rp) into H (rh); B's copy goes to s.
+fn thread_region(f: *mut ir.Func, s: *mut ir.Block) void {
+    rcopy.clear();
+    let mut after = rp;
+    for k in 0..rblocks.len {
+        let n = ir.append_block(f, "thread");
+        ir.move_block_after(n, after);
+        after = n;
+        n.rpo = rp.rpo;  // (not in the order: not clean)
+        n.cold = rblocks.get(k).cold;
+        rcopy.push(n);
+    }
+    // the instructions, in reverse postorder (each operand's copy is made
+    // before its uses: its block dominates theirs, or precedes the phi's
+    // predecessor)
+    for k in 0..rblocks.len {
+        let y = rblocks.get(k);
+        let n = rcopy.get(k);
+        let mut i = y.first;
+        while u.notnil(i) {
+            if i.op == ir.OP_PHI {
+                if y == rh {
+                    i.auxp = @ptr_cast(*mut void, ir.incoming(i, rp));
+                } else {
+                    let c = ir.copy_inst(f, i);
+                    c.xs.clear();
+                    ir.bs_mut(c).clear();
+                    for j in 0..i.xs.len {
+                        let from = ir.bs_of(i).get(j);
+                        if rindex(from) >= 0 {
+                            ir.add_incoming(c, rmapped(i.xs.get(j)), rcopy_of(from));
+                        }
+                    }
+                    i.auxp = @ptr_cast(*mut void, c);
+                    ir.append_inst(n, c);
+                }
+            } else if ir.is_term(i.op) {
+                if y == rb {
+                    let br = ir.new_inst(f, ir.OP_BR, ir.t_void());
+                    br.t1 = s;
+                    ir.append_inst(n, br);
+                } else {
+                    let c = ir.copy_inst(f, i);
+                    c.a = rmapped(i.a);
+                    c.b = rmapped(i.b);
+                    c.c = rmapped(i.c);
+                    for j in 0..c.xs.len {
+                        c.xs.set(j, rmapped(i.xs.get(j)));
+                    }
+                    for j in 0..ir.succ_count(c) {
+                        ir.set_succ(c, j, rcopy_of(ir.succ(c, j)));
+                    }
+                    ir.append_inst(n, c);
+                }
+            } else {
+                let c = ir.copy_inst(f, i);
+                c.a = rmapped(i.a);
+                c.b = rmapped(i.b);
+                c.c = rmapped(i.c);
+                for j in 0..c.xs.len {
+                    c.xs.set(j, rmapped(i.xs.get(j)));
+                }
+                i.auxp = @ptr_cast(*mut void, c);
+                ir.append_inst(n, c);
+            }
+            i = i.next;
+        }
+    }
+    if ir.dbg_on {
+        region_marks();
+    }
+    // predecessors of the copies, and the edges out of them: the phis of
+    // the blocks they lead to take the copies' values from them
+    for k in 0..rblocks.len {
+        let y = rblocks.get(k);
+        let n = rcopy.get(k);
+        n.preds.clear();
+        if y == rh {
+            n.preds.push(rp);
+        } else {
+            for j in 0..y.preds.len {
+                let z = y.preds.get(j);
+                if rindex(z) >= 0 {
+                    n.preds.push(rcopy_of(z));
+                }
+            }
+        }
+        let t = ir.terminator(n);
+        for j in 0..ir.succ_count(t) {
+            let sb = ir.succ(t, j);
+            if ((j > 0) and (ir.succ(t, j - 1) == sb)) or is_copy(sb) or has_pred(sb, n) {
+                continue;
+            }
+            // (sb is a block outside: B's copy goes to s)
+            let mut q = sb.first;
+            while u.notnil(q) and (q.op == ir.OP_PHI) {
+                let x = ir.incoming(q, y);
+                if u.notnil(x) {
+                    ir.add_incoming(q, rmapped(x), n);
+                }
+                q = q.next;
+            }
+            sb.preds.push(n);
+        }
+    }
+    // P goes to H's copy
+    ir.retarget(rp, rh, rcopy.get(0));
+    let mut k: usize = 0;
+    while k < rh.preds.len {
+        if rh.preds.get(k) == rp {
+            rh.preds.set(k, rh.preds.get(rh.preds.len - 1));
+            rh.preds.len -= 1;
+        } else {
+            k += 1;
+        }
+    }
+    ir.remove_phi_input(rh, rp);
+    // the uses beyond R and B
+    for k2 in 0..uses.len {
+        let us = uses.get(k2);
+        if us.at.rpo < 0 {
+            continue;
+        }
+        let user = us.user;
+        if user.op == ir.OP_PHI {
+            for j in 0..user.xs.len {
+                let o = user.xs.get(j);
+                if in_region(o) and (ir.bs_of(user).get(j) == us.at) {
+                    user.xs.set(j, r_at_end(o, us.at));
+                }
+            }
+            continue;
+        }
+        if in_region(user.a) {
+            user.a = r_at_entry_of(user.a, us.at);
+        }
+        if in_region(user.b) {
+            user.b = r_at_entry_of(user.b, us.at);
+        }
+        if in_region(user.c) {
+            user.c = r_at_entry_of(user.c, us.at);
+        }
+        for j in 0..user.xs.len {
+            let o = user.xs.get(j);
+            if in_region(o) {
+                user.xs.set(j, r_at_entry_of(o, us.at));
+            }
+        }
+    }
+    for k3 in 0..repaired.len {
+        repaired.get(k3).blk.aux = 0;
+    }
+    repaired.clear();
+    for k4 in 0..rchain.len {
+        rchain.get(k4).aux = 0;
+    }
+    rchain.clear();
+}
+
+// (-g) The copies' marks give the copies of the values (as thread does for
+// one block), and the marks before each block's branch and at its end are
+// copied before its copy's.
+fn region_marks() void {
+    for k in 0..rblocks.len {
+        let y = rblocks.get(k);
+        let n = rcopy.get(k);
+        let mut i = n.first;
+        while u.notnil(i) {
+            let mut mk = ir.dbg_marks_at(i);
+            while mk >= 0 {
+                let src = ir.dbg_mark_src(mk);
+                if src >= 0 {
+                    let v = ir.dbg_mark_value(src);
+                    if u.notnil(v) {
+                        ir.dbg_mark_set(mk, rmapped(v), ir.dbg_mark_low(src), ir.dbg_mark_add(src));
+                    }
+                }
+                mk = ir.dbg_mark_next(mk);
+            }
+            i = i.next;
+        }
+        let nt = ir.terminator(n);
+        r_copy_marks(nt, ir.dbg_marks_at(ir.terminator(y)));
+        r_copy_marks(nt, ir.dbg_marks_end(y));
+    }
+}
+
+fn r_copy_marks(at: *mut ir.Value, k0: i32) void {
+    let mut k = k0;
+    while k >= 0 {
+        let m = ir.dbg_marks.get(@int_cast(usize, k));
+        let v = ir.dbg_mark_value(k);
+        let mut w = vnil();
+        if u.notnil(v) {
+            w = rmapped(v);
+        }
+        ir.dbg_mark(at, m.owner, m.var, m.off, m.size, w, m.inst);
+        if u.notnil(w) {
+            ir.dbg_mark_set(@int_cast(i32, ir.dbg_marks.len) - 1, w, ir.dbg_mark_low(k), ir.dbg_mark_add(k));
+        }
+        k = m.next;
+    }
+}
+
+// (a use in x itself of a value of x's own: none outside R and B)
+fn r_at_entry_of(v: *mut ir.Value, x: *mut ir.Block) *mut ir.Value {
+    return r_at_entry(v, x);
+}
+
+// The successor of B (ending in t) the region's condition selects from P,
+// or nil.
+fn region_target(t: *ir.Value) *mut ir.Block {
+    let c = rknown(t.a, 0);
+    if u.isnil(c) {
+        return u.nil.[ir.Block]();
+    }
+    if ir.cint_val(c) != 0 {
+        return t.t1;
+    }
+    return t.t2;
+}
+
+// Is everything threading the region from P reads clean?
+fn rclean(order: *u.List.[*mut ir.Block]) bool {
+    if not region_clean(order, rh) or not region_clean(order, rb) {
+        return false;
+    }
+    for k in 0..rblocks.len {
+        if not region_clean(order, rblocks.get(k)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The values B's condition tests (of itself, or against a constant or
+// null, or a phi's inputs, a level down) as keys: what a branch above must
+// test for its edge to say anything of the condition.
+// marks the blocks thread_region_of found nothing for (Block.mark), one tag
+// per jump_thread (above other passes' tags)
+let mut region_tag: i64 = 0x5245_0000_0000_0000;
+
+// Forgets what thread_region_of found nothing for where a threading of this
+// round may have changed it: in and below the dirty blocks and above them.
+fn forget_failures(order: *u.List.[*mut ir.Block]) void {
+    for k in 0..order.len {
+        let x = order.get(k);
+        if x.mark != region_tag {
+            continue;
+        }
+        let mut stale = dirty.get(k) or above.get(k);
+        for j in 0..x.preds.len {
+            let p = x.preds.get(j);
+            if (p.rpo >= 0) and not clean(order, p) {
+                stale = true;
+            }
+        }
+        if stale {
+            x.mark = 0;
+        }
+    }
+}
+
+let mut rkeys: u.List.[usize] = u.List.[usize].{ data: @ptr_from_int(*mut usize, 0), len: 0, cap: 0 };
+
+fn add_keys(v0: *mut ir.Value, depth: i32) void {
+    let v = ir.resolve(v0);
+    if (v.kind != ir.V_INST) or (rkeys.len >= 16) {
+        return;
+    }
+    rkeys.push(@int_from_ptr(v));
+    let k = cond_key(v);
+    if u.notnil(k) and (k != v) {
+        rkeys.push(@int_from_ptr(k));
+    }
+    if depth >= 2 {
+        return;
+    }
+    if v.op == ir.OP_PHI {
+        for j in 0..v.xs.len {
+            add_keys(v.xs.get(j), depth + 1);
+        }
+    } else if u.notnil(k) and ir.is_op(k, ir.OP_PHI) {
+        for j in 0..k.xs.len {
+            add_keys(k.xs.get(j), depth + 1);
+        }
+    } else if (v.op == ir.OP_AND) or (v.op == ir.OP_OR) {
+        add_keys(v.a, depth + 1);
+        add_keys(v.b, depth + 1);
+    }
+}
+
+// The value c compares with a constant or null, or nil.
+fn cond_key(c: *mut ir.Value) *mut ir.Value {
+    let mut x = vnil();
+    let mut p: i32 = 0;
+    let mut k: u64 = 0;
+    if split_cmp(c, &mut x, &mut p, &mut k) {
+        return x;
+    }
+    if ir.is_op(c, ir.OP_ICMP) and ((c.a.kind == ir.V_ZERO) or (c.b.kind == ir.V_ZERO)) {
+        if c.a.kind == ir.V_ZERO {
+            return ir.resolve(c.b);
+        }
+        return ir.resolve(c.a);
+    }
+    return vnil();
+}
+
+fn is_key(v: *mut ir.Value) bool {
+    let x = @int_from_ptr(v);
+    for k in 0..rkeys.len {
+        if rkeys.get(k) == x {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Could an edge into h say anything of B's condition: does h have a phi of
+// a constant, or a branch on the way into it from a predecessor test one of
+// the condition's keys?
+fn edge_facts(h: *mut ir.Block) bool {
+    let mut q = h.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        for j in 0..q.xs.len {
+            if ir.is_small_cint(ir.resolve(q.xs.get(j))) {
+                return true;
+            }
+        }
+        q = q.next;
+    }
+    for k in 0..h.preds.len {
+        let mut to = h;
+        let mut from = h.preds.get(k);
+        for _depth in @as(i32, 0)..4 {
+            let t = ir.terminator(from);
+            if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and ((t.t1 == to) or (t.t2 == to)) {
+                let c = ir.resolve(t.a);
+                if is_key(c) {
+                    return true;
+                }
+                let x = cond_key(c);
+                if u.notnil(x) and is_key(x) {
+                    return true;
+                }
+            }
+            if (from.preds.len != 1) or (from.rpo < 0) {
+                break;
+            }
+            to = from;
+            from = from.preds.get(0);
+        }
+    }
+    return false;
+}
+
+// Tries to thread B through a region from one of the predecessors of a
+// block H above it; true if it did.
+fn thread_region_of(f: *mut ir.Func, order: *u.List.[*mut ir.Block], b: *mut ir.Block, t: *mut ir.Value,
+                    done: i32) bool {
+    if budget_fn != f {
+        budget_fn = f;
+        budget_left = REGION_FN_BASE + (f.nvals / 64);
+        if budget_left > REGION_FN_MAX {
+            budget_left = REGION_FN_MAX;
+        }
+    }
+    if not regions_on or (budget_left < 4) or (b.mark == region_tag) {
+        return false;
+    }
+    rb = b;
+    // (what the condition is about, to look for in the branches above)
+    rkeys.clear();
+    add_keys(t.a, 0);
+    if not keys_elsewhere(b) {
+        b.mark = region_tag;
+        return false;
+    }
+    if b.preds.len == 1 {
+        // B is entered only from its predecessor: what the branches on the
+        // way there decide of its condition, it is
+        let c = known_on_edge(t.a, b, b.preds.get(0));
+        if u.notnil(c) and (b.preds.get(0).rpo >= 0) {
+            t.a = c;
+            return true;
+        }
+    }
+    for xk in 0..b.preds.len {
+        let x = b.preds.get(xk);
+        if (x == b) or (x.rpo < 0) or (x.rpo >= b.rpo) {
+            continue;
+        }
+        let mut h = x;
+        for _up in @as(i32, 0)..MAX_UP {
+            if h == h.idom {
+                break;  // (the entry: no predecessors)
+            }
+            if not edge_facts(h) {
+                h = h.idom;
+                continue;
+            }
+            if (h.preds.len == 1) and opt.dominates(h, b) and build_region(h, b) {
+                // B is entered only through the edge from P into H: when
+                // that decides B's condition, it is that constant
+                rh = h;
+                rp = h.preds.get(0);
+                let c = rknown(t.a, 0);
+                let ok = (done == 0) or (rclean(order) and clean(order, rp));
+                rblocks.clear();
+                if u.notnil(c) and (rp.rpo >= 0) and ok {
+                    t.a = c;
+                    return true;
+                }
+            }
+            if (h.preds.len >= 2) and not opt.is_loop_header(h) {
+                if not build_region(h, b) {
+                    break;  // (a larger H gives a larger region)
+                }
+                rh = h;
+                if (rcost <= budget_left) and ((done == 0) or rclean(order)) {
+                    for pk in 0..h.preds.len {
+                        let p = h.preds.get(pk);
+                        if p.rpo < 0 {
+                            continue;
+                        }
+                        rp = p;
+                        let s = region_target(t);
+                        if u.isnil(s) or (rindex(s) >= 0) or not clean(order, s) or not clean(order, p) {
+                            continue;
+                        }
+                        let mut r = nca(h.idom, p);
+                        r = nca(r, s);
+                        if not opt.dominates(h, b) {
+                            r = nca(r, b);
+                        }
+                        for k in 0..rblocks.len {
+                            let tk = ir.terminator(rblocks.get(k));
+                            for j in 0..ir.succ_count(tk) {
+                                let sb = ir.succ(tk, j);
+                                if rindex(sb) < 0 {
+                                    r = nca(r, sb);
+                                }
+                            }
+                        }
+                        region_uses();
+                        if uses.len > MAX_RUSES {
+                            continue;  // (the repair would cost too much)
+                        }
+                        thread_region(f, s);
+                        mark_dirty(r);
+                        budget_left -= rcost;
+                        region_copies += 1;
+                        rblocks.clear();
+                        return true;
+                    }
+                }
+            }
+            h = h.idom;
+        }
+    }
+    rblocks.clear();
+    b.mark = region_tag;  // (not tried again in this jump_thread unless what it reads changes)
+    return false;
 }
 
 // Threads edges in f, at most max; how many.
@@ -785,10 +1724,7 @@ fn thread_some(f: *mut ir.Func, preds_ok: bool, max: i32) i32 {
             }
             continue;
         }
-        if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) or (b.preds.len < 2) {
-            continue;
-        }
-        if (t.a.kind != ir.V_INST) or (copy_cost(b) > MAX_COPY) {
+        if u.isnil(t) or (t.op != ir.OP_CONDBR) or (t.t1 == t.t2) or (b.preds.len == 0) or (t.a.kind != ir.V_INST) {
             continue;
         }
         if (done > 0) and not region_clean(&order, b) {
@@ -798,34 +1734,49 @@ fn thread_some(f: *mut ir.Func, preds_ok: bool, max: i32) i32 {
         if opt.is_loop_header(b) {
             continue;
         }
-        for k in 0..b.preds.len {
-            let p = b.preds.get(k);
-            if (p == b) or (p.rpo < 0) {
-                continue;
+        if (b.preds.len < 2) or (copy_cost(b) > MAX_COPY) or not thread_one_block(f, &order, b, t) {
+            // through the blocks above it
+            if thread_region_of(f, &order, b, t, done) {
+                done += 1;
             }
-            let c = known_on_edge(t.a, b, p);
-            if u.isnil(c) {
-                if phi_branch(b, t, p) {
-                    thread_marked(f, &order, b, p, u.nil.[ir.Block](), true);
-                    done += 1;
-                    break;
-                }
-                continue;
-            }
-            let mut s = t.t2;
-            if ir.cint_val(c) != 0 {
-                s = t.t1;
-            }
-            if s == b {
-                continue;
-            }
-            thread_marked(f, &order, b, p, s, false);
-            done += 1;
-            break;
+            continue;
         }
+        done += 1;
+    }
+    if done > 0 {
+        forget_failures(&order);
     }
     order.deinit();
     return done;
+}
+
+// Threads one edge into b (ending in condbr t) through a copy of b; true
+// if it did.
+fn thread_one_block(f: *mut ir.Func, order: *u.List.[*mut ir.Block], b: *mut ir.Block, t: *mut ir.Value) bool {
+    for k in 0..b.preds.len {
+        let p = b.preds.get(k);
+        if (p == b) or (p.rpo < 0) {
+            continue;
+        }
+        let c = known_on_edge(t.a, b, p);
+        if u.isnil(c) {
+            if phi_branch(b, t, p) {
+                thread_marked(f, order, b, p, u.nil.[ir.Block](), true);
+                return true;
+            }
+            continue;
+        }
+        let mut s = t.t2;
+        if ir.cint_val(c) != 0 {
+            s = t.t1;
+        }
+        if s == b {
+            continue;
+        }
+        thread_marked(f, order, b, p, s, false);
+        return true;
+    }
+    return false;
 }
 
 // The block switch t goes to for the constant c.
@@ -907,16 +1858,151 @@ fn candidates(f: *mut ir.Func) bool {
     return false;
 }
 
+// Could thread_region_of find anything: does a branch test a condition (or
+// a value against a constant) that another branch tests too, or a phi of
+// a constant from another block? (bkeys: the keys and their blocks)
+fn region_candidates(f: *mut ir.Func) bool {
+    bkeys.clear();
+    let mut found = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) {
+            let c = ir.resolve(t.a);
+            if c.kind == ir.V_INST {
+                bkeys.push(KeyAt.{ k: @int_from_ptr(c), b: b });
+                let x = cond_key(c);
+                if u.notnil(x) {
+                    bkeys.push(KeyAt.{ k: @int_from_ptr(x), b: b });
+                    found = found or const_phi(x, b);
+                } else {
+                    found = found or const_phi(c, b);
+                }
+            }
+        }
+        b = b.next;
+    }
+    if bkeys.len > 1 {
+        u.sort(bkeys.items(), key_cmp);
+        for k in 1..bkeys.len {
+            if bkeys.get(k).k == bkeys.get(k - 1).k {
+                found = true;
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+struct KeyAt {
+    k: usize,
+    b: *mut ir.Block,
+}
+
+fn key_cmp(x: KeyAt, y: KeyAt) i32 {
+    if x.k < y.k {
+        return -1;
+    }
+    if x.k > y.k {
+        return 1;
+    }
+    return 0;
+}
+
+// The keys of the conditions of f's branches and the branches' blocks
+// (region_candidates), sorted by key.
+let mut bkeys: u.List.[KeyAt] = u.List.[KeyAt].{ data: @ptr_from_int(*mut KeyAt, 0), len: 0, cap: 0 };
+let mut regions_on: bool = false;
+let mut regions_allowed: bool = false;
+/// How many regions the last thread_regions copied (besides the branches it
+/// folded and the single blocks it threaded).
+pub let mut region_copies: i32 = 0;  // (thread_regions, not every cleanup: the search costs)
+
+/// Jump threading with threading through several blocks (thread_region_of)
+/// besides one; true if anything changed. It costs more than jump_thread
+/// (the cleanups run that), so the passes run it once a function is done.
+pub fn thread_regions(f: *mut ir.Func) bool {
+    region_copies = 0;
+    if u.isnil(f.first) or not region_candidates(f) {
+        return false;
+    }
+    regions_allowed = true;
+    let c = jump_thread(f);
+    regions_allowed = false;
+    return c;
+}
+
+// Does a branch in a block other than b that dominates one of b's
+// predecessors test key x? (The facts thread_region_of uses come from such
+// branches, above the H it finds.)
+fn key_above(x: usize, b: *mut ir.Block) bool {
+    let mut lo: usize = 0;
+    let mut hi = bkeys.len;
+    while lo < hi {
+        let m = (lo + hi) / 2;
+        if bkeys.get(m).k < x {
+            lo = m + 1;
+        } else {
+            hi = m;
+        }
+    }
+    while (lo < bkeys.len) and (bkeys.get(lo).k == x) {
+        let d = bkeys.get(lo).b;
+        if (d != b) and (d.rpo >= 0) {
+            for j in 0..b.preds.len {
+                let p = b.preds.get(j);
+                if (p.rpo >= 0) and opt.dominates(d, p) {
+                    return true;
+                }
+            }
+        }
+        lo += 1;
+    }
+    return false;
+}
+
+// Is one of B's keys (rkeys) tested by a branch above it, or a phi of a
+// constant in another block: could anything above decide B's condition?
+fn keys_elsewhere(b: *mut ir.Block) bool {
+    for k in 0..rkeys.len {
+        let kv = rkeys.get(k);
+        if key_above(kv, b) or const_phi(@ptr_from_int(*mut ir.Value, kv), b) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is v a phi outside block b with a constant input?
+fn const_phi(v: *mut ir.Value, b: *mut ir.Block) bool {
+    if not ir.is_op(v, ir.OP_PHI) or (v.blk == b) {
+        return false;
+    }
+    for k in 0..v.xs.len {
+        if ir.is_small_cint(ir.resolve(v.xs.get(k))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Threads edges until none is left (or a limit); true if any. When it
 // returns false, f's predecessor lists are up to date.
 pub fn jump_thread(f: *mut ir.Func) bool {
     let pc = phi_conditions(f);
-    if u.isnil(f.first) or not candidates(f) {
+    if u.isnil(f.first) {
+        return pc;
+    }
+    // (candidates brings the predecessor lists up to date)
+    let cands = candidates(f);
+    regions_on = regions_allowed and region_candidates(f);
+    if not regions_on and not cands {
         return pc;
     }
     // (dead phis, of a value set in each iteration of a loop, would count as
     // uses that keep blocks from being threaded)
     opt.dce(f);
+    region_tag += 1;
     let mut n: i32 = 0;
     let mut first = true;
     while n < 256 {
@@ -929,8 +2015,47 @@ pub fn jump_thread(f: *mut ir.Func) bool {
     }
     if n > 0 {
         ir.remove_unreachable(f);
+        merge_phis(f);
     }
     return n > 0;
+}
+
+// Phis of a block with the same inputs from the same blocks are one (the
+// SSA repair of several threadings makes them, for a value and its copies).
+fn merge_phis(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut p = b.first;
+        let mut np: i32 = 0;
+        while u.notnil(p) and (p.op == ir.OP_PHI) and (np < 32) {
+            let nx = p.next;
+            let mut q = b.first;
+            while q != p {
+                if same_phi(q, p) {
+                    ir.forward(p, q);
+                    ir.remove_inst(p);
+                    break;
+                }
+                q = q.next;
+            }
+            np += 1;
+            p = nx;
+        }
+        b = b.next;
+    }
+}
+
+fn same_phi(q: *mut ir.Value, p: *mut ir.Value) bool {
+    if (q.ty != p.ty) or (q.xs.len != p.xs.len) {
+        return false;
+    }
+    for k in 0..p.xs.len {
+        let x = ir.incoming(q, ir.bs_of(p).get(k));
+        if u.isnil(x) or (ir.resolve(x) != ir.resolve(p.xs.get(k))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // -----------------------------------------------------------------------------
