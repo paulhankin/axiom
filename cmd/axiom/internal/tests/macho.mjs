@@ -6,7 +6,7 @@
 // signature; and the code's links: every stub jumps through a __got slot
 // that dyld binds, and every call that the frame table records (each one's
 // return address) goes to a function's start (a symbol) or a stub (on arm64
-// every bl in __text, too).
+// every bl in __text, too); and the unwind tables (checkUnwind).
 // Returns a list of problems (empty when the file is sound) and a summary.
 import crypto from 'node:crypto';
 
@@ -149,7 +149,9 @@ export function checkMachO(d, opts = {}) {
   }
   if (bad) E(`${bad} page hashes are wrong`);
   const links = checkLinks(d, { x64, E, tsect, text, bound, defined, starts });
-  return { errs, imports: names.slice(iu), rebases: rebased.size, binds: nbinds, pages: ncode, ...links };
+  const unwind = checkUnwind(d, { x64, E, sects, text, tsect, starts, stubs: links.stubAddrs });
+  delete links.stubAddrs;
+  return { errs, imports: names.slice(iu), rebases: rebased.size, binds: nbinds, pages: ncode, ...links, unwind };
 }
 
 // The stubs at the end of __text (adrp x16, ldr x16, br x16 on arm64; jmp
@@ -206,5 +208,130 @@ function checkLinks(d, { x64, E, tsect, text, bound, defined, starts }) {
       if (!ok(t)) E(`the bl at 0x${a.toString(16)} goes to 0x${t.toString(16)}, no function's start`);
     }
   }
-  return { stubs: stubs.size, calls };
+  return { stubs: stubs.size, calls, stubAddrs: stubs };
+}
+
+// The unwind tables (cmd/axiom/src/macunwind.ax): __unwind_info decoded as
+// the system's unwinder reads it (<mach-o/compact_unwind_encoding.h>): the
+// header, the first-level index (in order, its sentinel the end of the
+// code), each second-level page (regular or compressed: in bounds, its
+// entries in order and within its range) and each encoding (a mode of the
+// architecture with well-formed fields; the DWARF mode's offset an FDE of
+// __eh_frame that starts at the function and covers it); __eh_frame's
+// entries (lengths, each FDE's CIE, augmentations); and every function (a
+// symbol in __text before the stubs) has an entry with an encoding.
+function checkUnwind(d, { x64, E, sects, text, tsect, starts, stubs }) {
+  const ui = sects.find((s) => s.sn === '__unwind_info'), eh = sects.find((s) => s.sn === '__eh_frame');
+  if (!ui) { E('there is no __unwind_info'); return {}; }
+  const u32 = (o) => d.readUInt32LE(o), u16 = (o) => d.readUInt16LE(o);
+  const base = text.vmaddr, uo = ui.soff, n = ui.ssize;
+  const inUi = (o, len) => o >= 0 && o + len <= n;
+  // __eh_frame: CIEs and FDEs (pc-relative 4-byte addresses: "zR" 0x1b)
+  const fdes = new Map();
+  if (eh && eh.ssize) {
+    const cies = new Map();
+    for (let at = 0; at < eh.ssize;) {
+      const len = u32(eh.soff + at);
+      if (len === 0 || len === 0xffffffff || at + 4 + len > eh.ssize) { E(`__eh_frame entry at ${at} has length ${len}`); break; }
+      const id = u32(eh.soff + at + 4);
+      if (id === 0) {
+        const z = d.indexOf(0, eh.soff + at + 9), aug = d.subarray(eh.soff + at + 9, z).toString();
+        if (d[eh.soff + at + 8] !== 1 || !/^z[PLR]*S?$/.test(aug)) { E(`__eh_frame CIE at ${at}: version ${d[eh.soff + at + 8]}, augmentation "${aug}"`); break; }
+        // (code and data alignment, the return address register, the
+        // augmentation data's length; then 'R': the FDEs' pointer encoding)
+        const s = { i: z + 1 };
+        const leb = () => { let x; do { x = d[s.i++]; } while (x & 0x80); };
+        leb(); leb(); s.i++; leb();
+        let enc = 0;
+        for (const c of aug.slice(1)) {
+          if (c === 'R') enc = d[s.i++];
+          else if (c === 'L') s.i++;
+          else if (c === 'P') { const pe = d[s.i++]; s.i += (pe & 0xf) === 3 || (pe & 0xf) === 0xb ? 4 : 8; }
+        }
+        if ((enc & 0x70) !== 0x10 || ![0, 3, 4, 0xb, 0xc].includes(enc & 0xf)) E(`__eh_frame CIE at ${at}: FDE pointer encoding 0x${enc.toString(16)}`);
+        cies.set(at, enc);
+      } else {
+        const enc = cies.get(at + 4 - id);
+        if (enc === undefined) E(`__eh_frame FDE at ${at} has no CIE at ${at + 4 - id}`);
+        else if ((enc & 0xf) === 3 || (enc & 0xf) === 0xb) {
+          fdes.set(at, { pc: eh.addr + at + 8 + d.readInt32LE(eh.soff + at + 8), range: u32(eh.soff + at + 12) });
+        } else {
+          fdes.set(at, { pc: eh.addr + at + 8 + Number(d.readBigInt64LE(eh.soff + at + 8)), range: Number(d.readBigUInt64LE(eh.soff + at + 16)) });
+        }
+      }
+      at += 4 + len;
+    }
+  }
+  if (u32(uo) !== 1) E(`__unwind_info version ${u32(uo)}`);
+  const [ceo, cen, peo, pen, io, icount] = [4, 8, 12, 16, 20, 24].map((k) => u32(uo + k));
+  if (!inUi(ceo, 4 * cen) || !inUi(peo, 4 * pen) || !inUi(io, 12 * icount) || icount < 2) { E('__unwind_info header is out of bounds'); return {}; }
+  const common = Array.from({ length: cen }, (_, k) => u32(uo + ceo + 4 * k));
+  const ents = [];
+  const tlo = tsect.addr - base, thi = tsect.addr + tsect.ssize - base;
+  let prev = -1;
+  for (let k = 0; k < icount; k++) {
+    const e = uo + io + 12 * k, fo = u32(e), po = u32(e + 4);
+    if (fo <= prev) E(`__unwind_info index entry ${k} is out of order`);
+    prev = fo;
+    if (fo < tlo || fo > thi) E(`__unwind_info index entry ${k} is outside __text`);
+    if (k === icount - 1) { if (po !== 0) E('the index sentinel has a page'); break; }
+    const next = u32(e + 12);
+    if (!inUi(po, 8)) { E(`second-level page ${k} is out of bounds`); continue; }
+    const kind = u32(uo + po);
+    if (kind === 2) {
+      const eo = u16(uo + po + 4), cnt = u16(uo + po + 6);
+      if (!inUi(po + eo, 8 * cnt) || eo < 8) { E(`regular page ${k} is out of bounds`); continue; }
+      for (let j = 0; j < cnt; j++) ents.push({ off: u32(uo + po + eo + 8 * j), enc: u32(uo + po + eo + 8 * j + 4), page: k, first: fo, next });
+    } else if (kind === 3) {
+      const eo = u16(uo + po + 4), cnt = u16(uo + po + 6), xo = u16(uo + po + 8), xn = u16(uo + po + 10);
+      if (!inUi(po + eo, 4 * cnt) || !inUi(po + xo, 4 * xn)) { E(`compressed page ${k} is out of bounds`); continue; }
+      for (let j = 0; j < cnt; j++) {
+        const w = u32(uo + po + eo + 4 * j), ix = w >>> 24;
+        const enc = ix < cen ? common[ix] : ix - cen < xn ? u32(uo + po + xo + 4 * (ix - cen)) : undefined;
+        if (enc === undefined) E(`compressed page ${k} entry ${j} has no encoding ${ix}`);
+        ents.push({ off: fo + (w & 0xffffff), enc: enc ?? 0, page: k, first: fo, next });
+      }
+    } else E(`second-level page ${k} has kind ${kind}`);
+  }
+  const end = prev;
+  let dwarf = 0, none = 0;
+  for (let j = 0; j < ents.length; j++) {
+    const e = ents[j];
+    if (j > 0 && e.off <= ents[j - 1].off) E(`unwind entry ${j} (0x${e.off.toString(16)}) is out of order`);
+    if (e.off < e.first || e.off >= e.next) E(`unwind entry 0x${e.off.toString(16)} is outside its page's range`);
+    const mode = e.enc & 0x0f000000, x = e.enc & 0x00ffffff;
+    if (e.enc === 0) { none++; continue; }
+    const fend = j + 1 < ents.length ? ents[j + 1].off : end;
+    if ((x64 && mode === 0x04000000) || (!x64 && mode === 0x03000000)) {
+      dwarf++;
+      const f = fdes.get(x);
+      if (!f) E(`unwind entry 0x${e.off.toString(16)} names no FDE at ${x} of __eh_frame`);
+      else if (f.pc !== base + e.off || f.pc + f.range > base + fend) E(`the FDE of the function at 0x${e.off.toString(16)} covers 0x${f.pc.toString(16)}+${f.range}`);
+    } else if (x64 && mode === 0x01000000) {
+      const regs = [0, 1, 2, 3, 4].map((k) => (e.enc >> (3 * k)) & 7), used = regs.filter((r) => r);
+      if ((e.enc & 0x8000) || used.some((r) => r > 5) || new Set(used).size !== used.length || ((e.enc >> 16) & 0xff) < used.length) E(`the RBP_FRAME encoding 0x${e.enc.toString(16)} is malformed`);
+    } else if (x64 && mode === 0x02000000) {
+      if (((e.enc >> 16) & 0xff) === 0) E(`the STACK_IMMD encoding 0x${e.enc.toString(16)} has no return address`);
+    } else if (!x64 && mode === 0x04000000) {
+      if (x & ~0xf1f) E(`the FRAME encoding 0x${e.enc.toString(16)} is malformed`);
+    } else if (!x64 && mode === 0x02000000) {
+      if (x & 0xfff) E(`the FRAMELESS encoding 0x${e.enc.toString(16)} saves registers`);
+    } else E(`unwind entry 0x${e.off.toString(16)} has encoding 0x${e.enc.toString(16)}`);
+  }
+  // every function has an entry: its own, or the one of the function it is
+  // a label in (with an encoding)
+  const stubLo = stubs.size ? Math.min(...stubs) : tsect.addr + tsect.ssize;
+  let funcs = 0;
+  for (const a of starts) {
+    if (a < tsect.addr || a >= stubLo) continue;
+    funcs++;
+    let lo = 0, hi = ents.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (ents[m].off <= a - base) lo = m + 1; else hi = m; }
+    // (an entry of encoding 0 says there is no information: an assembly
+    // source's function without .cfi_ directives; macho.mjs's callers that
+    // know there is none such check `none`)
+    if (lo === 0 || (ents[lo - 1].enc === 0 && ents[lo - 1].off !== a - base)) E(`the function at 0x${a.toString(16)} has no unwind entry`);
+  }
+  if (end > stubLo - base) E('__unwind_info covers the stubs');
+  return { entries: ents.length, dwarf, none, funcs, fdes: fdes.size };
 }

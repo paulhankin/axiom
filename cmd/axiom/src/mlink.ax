@@ -46,6 +46,7 @@ import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
 import "macho.ax" as mo;
+import "macunwind.ax" as mu;
 import "nlink.ax" as nl;
 import "std/crypto/sha2" as sha2;
 import "util.ax" as u;
@@ -156,12 +157,32 @@ const C_INIT: i32 = 13;
 const C_FINI: i32 = 14;
 const C_TLV_DATA: i32 = 11;
 const C_TLV_BSS: i32 = 12;
+// the unwind tables (macunwind.ax): the objects' FDEs, placed together in
+// __eh_frame, and their compact entries, which make __unwind_info
+const C_EH: i32 = 15;
+const C_CU: i32 = 16;
+// the debugger's descriptors of thread-locals (-g: dwarf.ax finish_elf), in
+// the platform's form (a function, the key, the offset): the key is the
+// runtime's, written there at start-up, the offset in our block the
+// linker's (macOS's debugger reads a thread-local's address as the TSD value
+// of the key plus the offset)
+const C_TLVD: i32 = 17;
+let mut unwind: bn.Bytes = bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
 let mut has_tlv: bool = false;
 let mut tlv_start: u64 = 0;  // the template's
 
 // A section's place: read-only data that holds addresses goes in __DATA,
 // since dyld rebases (or binds) them.
 fn class_of(s: *elf.Sec) i32 {
+    if u.str_eq(s.name, ".eh_frame") {
+        return C_EH;
+    }
+    if u.str_eq(s.name, "axiom_tlvd") {
+        return C_TLVD;
+    }
+    if u.str_eq(s.name, ".compact_unwind") {
+        return C_CU;
+    }
     if u.str_eq(s.name, ".macho.thread_vars") {
         return C_TLV;
     }
@@ -383,8 +404,8 @@ fn scan_relocs() void {
         let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
-            if nl.sec_cls.get(oi)[k] == nl.C_DEBUG {
-                continue;  // (nl.debug_sections)
+            if (nl.sec_cls.get(oi)[k] == nl.C_DEBUG) or (nl.sec_cls.get(oi)[k] == C_CU) {
+                continue;  // (nl.debug_sections; unwind_entries)
             }
             for r in s.relocs.items() {
                 if nl.is_got_reloc(X64, r.ty) {
@@ -436,7 +457,7 @@ fn apply_relocs(b: []mut u8) void {
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
             let cls = nl.sec_cls.get(oi)[k];
-            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) or (cls == C_TLV_BSS) {
+            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) or (cls == C_TLV_BSS) or (cls == C_CU) {
                 continue;
             }
             let base = nl.sec_addr.get(oi)[k];
@@ -444,6 +465,14 @@ fn apply_relocs(b: []mut u8) void {
                 let p = base + r.off;
                 let fo = file_of(p);
                 let t = r.ty;
+                if (cls == C_TLVD) and nl.sym_dropped(oi, r.sym) {
+                    continue;  // (a thread-local the link left out: the descriptor's offset 0)
+                }
+                if (cls == C_TLVD) and is_abs64(t) {
+                    // a descriptor's offset of its variable in our block
+                    bn.w64(b, fo, (nl.sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend)) -% tls_addr);
+                    continue;
+                }
                 if (cls == C_TLV) and ((r.off % 24) == 16) and is_abs64(t) {
                     // a descriptor's offset of its variable in the template
                     bn.w64(b, fo, (nl.sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend)) -% tlv_start);
@@ -513,6 +542,8 @@ fn rel32(b: []mut u8, fo: u64, p: u64, target: u64) void {
 fn x64_reloc(b: []mut u8, fo: u64, p: u64, t: u32, sa: u64) void {
     if nl.is_call_reloc(true, t) {
         rel32(b, fo, p, sa);
+    } else if t == elf.R_X86_64_PC64 {
+        bn.w64(b, fo, sa -% p);  // (a place-relative 8-byte address: __eh_frame's)
     } else if t == elf.R_X86_64_TPOFF32 {
         let v = @bit_cast(i64, sa -% tls_addr);
         if (v < 0) or (v > 0x7fff_ffff) {
@@ -535,8 +566,8 @@ fn own_object() *mut elf.Obj {
     let text = elf.add_sec(o, ".text", elf.S_TEXT, 4);
     let data = elf.add_sec(o, ".data", elf.S_DATA, 8);
     let ds = o.secs.get(@int_cast(usize, data));
-    ds.data.zeros(40);
-    let info = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_key", sec: data, value: 0, size: 40, bind: elf.B_GLOBAL,
+    ds.data.zeros(56);
+    let info = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_key", sec: data, value: 0, size: 56, bind: elf.B_GLOBAL,
                                         ty: elf.T_OBJECT, hidden: true });
     _ = elf.add_sym(o, elf.Sym.{ name: "ax_tls_info", sec: text, value: 0, size: 12, bind: elf.B_GLOBAL, ty: elf.T_FUNC,
                                  hidden: true });
@@ -901,9 +932,9 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     nl.g_gc_exports = g_dylib;  // (--gc-sections: a library's exports are kept)
     dylibs = u.List.[[]u8].empty();
     import_ord = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
-    nl.objs.push(own_object());
+    nl.objs.push(leaf_entries(own_object()));  // (its ax_tls_info: a leaf)
     if not g_dylib {
-        nl.objs.push(jstub.build(machine(), false));  // (C's setjmp and longjmp)
+        nl.objs.push(leaf_entries(jstub.build(machine(), false)));  // (C's setjmp and longjmp)
     }
     nl.objs.push(elf.rets_bounds(machine()));
     collect_dylibs();
@@ -946,7 +977,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     let mut fileb = bn.new_bytes();
     fileb.zeros(@truncate(usize, data_off + ly.data_filesize));
     let b = fileb.view();
-    write_contents(b);
+    write_contents(b, &ly);
     if nl.errors != 0 {
         return 1;
     }
@@ -1074,6 +1105,190 @@ fn write_new(out: []u8, d: []u8) i32 {
     return 0;
 }
 
+// -----------------------------------------------------------------------------
+// Unwind tables (macunwind.ax)
+// -----------------------------------------------------------------------------
+// o, with unwind entries for its functions, which are leaves without a
+// frame (jstub.ax's: setjmp's return address in the link register or at the
+// stack pointer throughout; longjmp's until it leaves for setjmp's caller).
+fn leaf_entries(o: *mut elf.Obj) *mut elf.Obj {
+    let mut out = mu.begin(true, o, X64);
+    let mut enc = mu.A64_FRAMELESS;
+    if X64 {
+        enc = mu.x64_frameless();
+    }
+    for si in 0..o.syms.len {
+        let y = o.syms.get(si);
+        if (y.ty != elf.T_FUNC) or (y.sec < 0) {
+            continue;
+        }
+        // (its end: the next function's start, or its section's)
+        let mut end = elf.sec_size(o.secs.get(@as(usize, @bit_cast(u32, y.sec))));
+        let mut dup = false;
+        for z in o.syms.items() {
+            if (z.ty == elf.T_FUNC) and (z.sec == y.sec) and (z.value > y.value) and (z.value < end) {
+                end = z.value;
+            }
+        }
+        for sj in 0..si {
+            let z = o.syms.get(sj);
+            if (z.ty == elf.T_FUNC) and (z.sec == y.sec) and (z.value == y.value) {
+                dup = true;  // (another name of a function already given)
+            }
+        }
+        if not dup {
+            mu.add(&mut out, @truncate(u32, si), 0, end - y.value, enc, u.nil_slice.[u8](), false, false);
+        }
+    }
+    return o;
+}
+
+let mut unwind_addr: u64 = 0;
+let mut unwind_eh_end: u64 = 0;
+
+// The relocation of section s at offset off (nil: none).
+fn reloc_at(s: *elf.Sec, off: u64) *elf.Rel {
+    for k in 0..s.relocs.len {
+        let r = s.relocs.at(k);
+        if r.off == off {
+            return r;
+        }
+    }
+    return u.nil.[elf.Rel]();
+}
+
+// __unwind_info for the code placed so far, __eh_frame (C_EH) being at
+// eh_addr: an entry per function of the objects' compact entries (C_CU),
+// those of the DWARF mode with the offset of their function's FDE in
+// __eh_frame (a function an object has an FDE for and no compact entry:
+// the DWARF mode too), up to code_end (the stubs, which have none).
+fn unwind_info(eh_addr: u64, code_end: u64) bn.Bytes {
+    let x64 = X64;
+    // the FDEs: their functions' addresses and offsets in __eh_frame
+    let mut fde_fn = u.List.[u64].empty();
+    let mut fde_off = u.List.[u64].empty();
+    let mut fde_len = u.List.[u64].empty();
+    unwind_eh_end = eh_addr;
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
+        for k in 0..o.secs.len {
+            if nl.sec_cls.get(oi)[k] != C_EH {
+                continue;
+            }
+            let s = o.secs.get(k);
+            let d = s.data.view();
+            let base = nl.sec_addr.get(oi)[k];
+            unwind_eh_end = @max(unwind_eh_end, base + @as(u64, d.len));
+            let mut at: usize = 0;
+            while (at + 8) <= d.len {
+                let n = @truncate(usize, bn.rd32(d, at));
+                if (n == 0) or (n == 0xffff_ffff) or ((at + 4 + n) > d.len) {
+                    break;  // (a terminator; 64-bit lengths are not written for code)
+                }
+                let id = @truncate(usize, bn.rd32(d, at + 4));
+                if (id != 0) and (id <= (at + 4)) {
+                    // (an FDE: its function's address by its relocation, place-relative)
+                    let w = mu.enc_size(mu.fde_encoding(d, (at + 4) - id));
+                    let r = reloc_at(s, @as(u64, at + 8));
+                    if (w > 0) and ((at + 8 + (2 * w)) <= d.len) and u.notnil(r) and not nl.sym_dropped(oi, r.sym) {
+                        fde_fn.push(nl.sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend));
+                        fde_off.push((base + @as(u64, at)) - eh_addr);
+                        if w == 8 {
+                            fde_len.push(bn.rd64(d, at + 16));
+                        } else {
+                            fde_len.push(bn.rd32(d, at + 12));
+                        }
+                    }
+                }
+                at += 4 + n;
+            }
+        }
+    }
+    let mut ents = u.List.[mu.Ent].empty();
+    let mut covered = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
+        for k in 0..o.secs.len {
+            if nl.sec_cls.get(oi)[k] != C_CU {
+                continue;
+            }
+            let s = o.secs.get(k);
+            let d = s.data.view();
+            let mut at: usize = 0;
+            while (at + 32) <= d.len {
+                let r = reloc_at(s, @as(u64, at));
+                if u.isnil(r) or nl.sym_dropped(oi, r.sym) {
+                    at += 32;
+                    continue;
+                }
+                let addr = nl.sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend);
+                // (no personality function or LSDA: the table has none)
+                let mut enc = @truncate(u32, bn.rd32(d, at + 12)) & ~@as(u32, 0x7000_0000);
+                if mu.is_dwarf(enc, x64) {
+                    enc = 0;
+                    for j in 0..fde_fn.len {
+                        if fde_fn.get(j) == addr {
+                            enc = mu.dwarf_mode(x64) | @truncate(u32, fde_off.get(j));
+                            break;
+                        }
+                    }
+                }
+                ents.push(mu.Ent.{ off: addr - image_base, len: bn.rd32(d, at + 8), enc: enc });
+                covered.put(u.intern(u.hex16(addr)), 1);
+                at += 32;
+            }
+        }
+    }
+    for j in 0..fde_fn.len {
+        let a = fde_fn.get(j);
+        if covered.get(u.intern(u.hex16(a))) == 0 {
+            ents.push(
+                mu.Ent.{
+                    off: a - image_base, len: fde_len.get(j),
+                    enc: mu.dwarf_mode(x64) | @truncate(u32, fde_off.get(j)) });
+        }
+    }
+    if (fde_off.len > 0) and (fde_off.last() >= 0x100_0000) {
+        nl.err("__eh_frame is larger than the 16 MiB the compact entries can reach");
+    }
+    let mut all = mu.sorted(ents.items());
+    // the functions without an entry: encoding 0
+    let mut more = u.List.[mu.Ent].empty();
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
+        for si in 0..o.syms.len {
+            let y = o.syms.get(si);
+            if (y.ty != elf.T_FUNC) or (y.sec < 0) or
+               (nl.sec_cls.get(oi)[@as(usize, @bit_cast(u32, y.sec))] != nl.C_TEXT) or
+               nl.sym_dropped(oi, @truncate(u32, si)) {
+                continue;
+            }
+            let off = nl.sym_addr(oi, @truncate(u32, si)) - image_base;
+            if not mu.covers(all.items(), off) {
+                more.push(mu.Ent.{ off: off, len: y.size, enc: 0 });
+            }
+        }
+    }
+    if (more.len > 0) or (all.len == 0) {
+        for e in all.items() {
+            more.push(e);
+        }
+        if more.len == 0 {
+            more.push(mu.Ent.{ off: text_addr - image_base, len: code_end - text_addr, enc: 0 });
+        }
+        all.deinit();
+        all = mu.sorted(more.items());
+    }
+    more.deinit();
+    let b = mu.info(all.items());
+    ents.deinit();
+    all.deinit();
+    fde_fn.deinit();
+    fde_off.deinit();
+    fde_len.deinit();
+    return b;
+}
+
 // Where the link puts things (beyond the addresses relocation uses).
 struct Layout {
     ncmds: u64,  // the load commands
@@ -1081,6 +1296,7 @@ struct Layout {
     text_end: u64,  // __text (code, stubs) ends
     const_addr: u64,
     const_end: u64,
+    eh_addr: u64,     // __eh_frame (then __unwind_info at unwind_addr)
     text_size: u64,   // __TEXT's
     ngot: u64,        // GOT slots
     data_start: u64,  // __data
@@ -1090,6 +1306,8 @@ struct Layout {
     tlv_data_end: u64,
     tlv_bss: u64,
     tlv_bss_end: u64,
+    tlvd_at: u64,  // the thread-locals' descriptors (in __data, after the template)
+    tlvd_end: u64,
     init_at: u64,  // a dynamic library's __mod_init_func, then __mod_term_func
     init_end: u64,
     fini_end: u64,
@@ -1103,7 +1321,7 @@ struct Layout {
 fn lay_out() Layout {
     // the load commands' size, which places everything after them
     let mut ncmds: u64 = 13;
-    let mut sizeofcmds: u64 = (72 + (72 + (2 * 80)) + (72 + (3 * 80)) + 72) + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 56 +
+    let mut sizeofcmds: u64 = (72 + (72 + (4 * 80)) + (72 + (3 * 80)) + 72) + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 56 +
                               16;
     if has_tlv {
         sizeofcmds += 3 * 80;
@@ -1126,7 +1344,11 @@ fn lay_out() Layout {
     let text_end = stub_addr + (@as(u64, stubs.len) * stub_size());
     let const_addr = nl.align_up(text_end, nl.class_align(nl.C_CONST));
     let const_end = nl.place(nl.C_CONST, const_addr);
-    let text_size = nl.align_up(const_end - image_base, PAGE);
+    let eh_addr = nl.align_up(const_end, 8);
+    let eh_end = nl.place(C_EH, eh_addr);
+    unwind_addr = nl.align_up(eh_end, 4);
+    unwind = unwind_info(eh_addr, stub_addr);
+    let text_size = nl.align_up((unwind_addr + @as(u64, unwind.len())) - image_base, PAGE);
 
     // __DATA: GOT slots that dyld binds (libSystem) or rebases (our own
     // symbols), data, the thread-local template, then .bss
@@ -1143,6 +1365,9 @@ fn lay_out() Layout {
     tls_filesz = tdata_end - tls_addr;
     tls_memsz = tbss_end - tls_addr;
     data_end = tdata_end;
+    let tlvd_at = nl.align_up(data_end, 8);
+    data_end = nl.place(C_TLVD, tlvd_at);
+    let tlvd_end = data_end;
     let init_at = nl.align_up(data_end, 8);
     let init_end = nl.place(C_INIT, init_at);
     let fini_end = nl.place(C_FINI, init_end);
@@ -1163,10 +1388,11 @@ fn lay_out() Layout {
     let bss_addr = nl.align_up(u64_pick(has_tlv, tlv_bss_end, data_end), nl.class_align(nl.C_BSS));
     let bss_end = nl.place(nl.C_BSS, bss_addr);
     return Layout.{ ncmds: ncmds, sizeofcmds: sizeofcmds, text_end: text_end, const_addr: const_addr,
-                    const_end: const_end, text_size: text_size, ngot: ngot, data_start: data_start, data_end: tdata_end,
-                    tlv_vars: tlv_vars, tlv_vars_end: tlv_vars_end, tlv_data_end: tlv_data_end, tlv_bss: tlv_bss,
-                    tlv_bss_end: tlv_bss_end, init_at: init_at, init_end: init_end, fini_end: fini_end,
-                    bss_addr: bss_addr, bss_end: bss_end, data_filesize: nl.align_up(data_end - data_addr, PAGE),
+                    const_end: const_end, eh_addr: eh_addr, text_size: text_size, ngot: ngot, data_start: data_start,
+                    data_end: tlvd_end, tlv_vars: tlv_vars, tlv_vars_end: tlv_vars_end, tlv_data_end: tlv_data_end,
+                    tlv_bss: tlv_bss, tlv_bss_end: tlv_bss_end, tlvd_at: tlvd_at, tlvd_end: tlvd_end, init_at: init_at,
+                    init_end: init_end, fini_end: fini_end, bss_addr: bss_addr, bss_end: bss_end,
+                    data_filesize: nl.align_up(data_end - data_addr, PAGE),
                     data_vmsize: nl.align_up(bss_end - data_addr, PAGE) };
 }
 
@@ -1179,15 +1405,18 @@ fn u64_pick(c: bool, a: u64, b: u64) u64 {
 
 // __TEXT and __DATA's contents in b: the sections, the stubs, the GOT and
 // the runtime's TLS record, relocated (noting what dyld rebases and binds).
-fn write_contents(b: []mut u8) void {
+fn write_contents(b: []mut u8, ly: *Layout) void {
     nl.copy_class(b, nl.C_TEXT, file_of);
     nl.copy_class(b, nl.C_CONST, file_of);
+    nl.copy_class(b, C_EH, file_of);
+    bn.put_at(b, file_of(unwind_addr), unwind.view());
     nl.copy_class(b, nl.C_DATA, file_of);
     nl.copy_class(b, nl.C_TDATA, file_of);
     nl.copy_class(b, C_TLV, file_of);
     nl.copy_class(b, C_TLV_DATA, file_of);
     nl.copy_class(b, C_INIT, file_of);
     nl.copy_class(b, C_FINI, file_of);
+    nl.copy_class(b, C_TLVD, file_of);
 
     // stubs: adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16
     // (x86-64: jmp [rip + slot]; int3; int3)
@@ -1230,6 +1459,13 @@ fn write_contents(b: []mut u8) void {
     bn.w64(b, ifo + 16, tls_filesz);
     bn.w64(b, ifo + 24, tls_memsz);
     bn.w64(b, ifo + 32, @max(tls_align, 16));
+    // (with -g: the debugger's descriptors of the thread-locals, dwarf.ax
+    // finish_elf: the runtime writes their keys)
+    if ly.tlvd_end > ly.tlvd_at {
+        bn.w64(b, ifo + 40, ly.tlvd_at);
+        rebase_at(info + 40);
+        bn.w64(b, ifo + 48, (ly.tlvd_end - ly.tlvd_at) / 24);
+    }
 }
 
 struct NSym {
@@ -1321,13 +1557,17 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
                     continue;  // a weak definition that lost
                 }
             }
+            // (the sections in load command order: __text, __const,
+            // __eh_frame, __unwind_info, __got, __data, ..., __bss)
             let mut sect: u8 = 1;  // __text
             if cls == nl.C_CONST {
                 sect = 2;
-            } else if cls == nl.C_DATA {
-                sect = 4;
+            } else if cls == C_EH {
+                sect = 3;
+            } else if (cls == nl.C_DATA) or (cls == nl.C_TDATA) or (cls == C_TLVD) {
+                sect = 6;
             } else if cls == nl.C_BSS {
-                sect = @truncate(u8, 5 + u64_pick(has_tlv, 3, 0) + u64_pick(g_dylib, 2, 0));
+                sect = @truncate(u8, 7 + u64_pick(has_tlv, 3, 0) + u64_pick(g_dylib, 2, 0));
             }
             syms.push(
                 NSym.{
@@ -1386,10 +1626,12 @@ fn load_commands(h: *mut bn.Bytes, ly: *Layout, le: *LinkEdit) usize {
     if not g_dylib {
         segment(h, "__PAGEZERO", 0, image_base, 0, 0, 0, 0);
     }
-    segment(h, "__TEXT", image_base, ly.text_size, 0, ly.text_size, 5, 2);
+    segment(h, "__TEXT", image_base, ly.text_size, 0, ly.text_size, 5, 4);
     section(h, "__text", "__TEXT", text_addr, ly.text_end - text_addr, file_of(text_addr), 16, 0x8000_0400);
     section(h, "__const", "__TEXT", ly.const_addr, ly.const_end - ly.const_addr, file_of(ly.const_addr),
             @max(nl.class_align(nl.C_CONST), 1), 0);
+    section(h, "__eh_frame", "__TEXT", ly.eh_addr, unwind_eh_end - ly.eh_addr, file_of(ly.eh_addr), 8, 0x6800_000b);  // S_COALESCED, no TOC, strip static symbols, live support
+    section(h, "__unwind_info", "__TEXT", unwind_addr, @as(u64, unwind.len()), file_of(unwind_addr), 4, 0);
     segment(h, "__DATA", data_addr, ly.data_vmsize, data_off, ly.data_filesize, 3,
             3 + u64_pick(has_tlv, 3, 0) + u64_pick(g_dylib, 2, 0));
     section(h, "__got", "__DATA", got_addr, ly.ngot * 8, data_off, 8, 0);

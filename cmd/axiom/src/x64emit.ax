@@ -19,6 +19,7 @@ import "ftab.ax" as ft;
 import "ir.ax" as ir;
 import "isel.ax" as is;
 import "mach.ax" as mc;
+import "macunwind.ax" as mu;
 import "util.ax" as u;
 import "winlines.ax" as wlines;
 import "x64enc.ax" as xe;
@@ -76,6 +77,12 @@ pub let mut WIDE_IN: bool = false;  // it takes a ymm or zmm argument (the upper
 let mut DIRTY: bool = true;         // ... and may have written one since it was entered or last made a call
 pub let mut WIN: bool = false;      // Windows x64: its calling convention, and thread-locals through the TEB
 pub let mut MACOS: bool = false;    // macOS: thread-locals in a block a TSD slot (gs-relative) holds
+// macOS: the unwind tables (macunwind.ax), from the call frame states
+// (recorded for every function there, with or without -g), and the ends of
+// the function's sibling calls' jumps
+pub let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: true, cu: -1, eh: -1,
+                                  cies: [0; 4] };
+let mut tail_ends: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 pub let mut F: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 pub let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 pub let mut out_area: u64 = 0;  // outgoing stack-argument bytes
@@ -771,6 +778,52 @@ fn epilogue() void {
     cfi_body();
 }
 
+// The function's save list (dwarf.saved_reg): rbp at CFA - 16, then the
+// pushed callee-saved registers below it.
+fn save_list(regs: *mut [8]u64) void {
+    regs[0] = dw.saved_reg(dw.X64_RBP, -16);
+    for k in 0..@int_cast(usize, nsaved) {
+        regs[k + 1] = dw.saved_reg(
+            DW_GPR[@as(usize, @bit_cast(u32, saved[k] & 15))], -24 - (8 * @as(i64, @int_cast(i64, k))));
+    }
+}
+
+// macOS: the function's unwind entry (macunwind.ax): STACK_IMMD without a
+// frame, RBP_FRAME, or an FDE where code runs before the frame is set up
+// (`early`: shrink-wrapping), the stack pointer moves after the prologue,
+// a sibling call's jump is not the function's end, or the encoding cannot
+// describe the saves.
+fn mac_unwind(fs: u32, size: u64, early: bool) void {
+    if frameless {
+        mu.add(&mut MU, fs, 0, size, mu.x64_frameless(), u.nil_slice.[u8](), false, false);
+        return;
+    }
+    let mut regs: [8]u64 = [0; 8];
+    save_list(&mut regs);
+    let n = @int_cast(usize, nsaved) + 1;
+    let mut enc = mu.x64_frame(regs[0..n]);
+    if early or dyn_stack() or (nxsaved > 0) {
+        enc = 0;
+    }
+    for e in tail_ends.items() {
+        if e != size {
+            enc = 0;
+        }
+    }
+    if enc != 0 {
+        mu.add(&mut MU, fs, 0, size, enc, u.nil_slice.[u8](), false, false);
+        return;
+    }
+    let df = dw.Func.{ xcfi: xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+                       irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
+                       frame_local: -1 };
+    let mut prog = bn.new_bytes();
+    dw.cfa_program(&mut prog, false, &df);
+    mu.add(&mut MU, fs, 0, size, 0, prog.view(), false, false);
+    prog.free();
+}
+
 // -g: the call frame states as the function is encoded (dwarf.cfi_state;
 // none unless DBG is on), and the registers the frame saves (dwarf.saved_reg):
 // rbp at CFA - 16, then the pushed callee-saved registers below it.
@@ -782,7 +835,7 @@ let DW_GPR: [16]u32 = [0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(reg: u32, k: u64, mask: u64) void {
-    if not DBG.on {
+    if not DBG.on and not MACOS {
         return;
     }
     let at = @as(u64, E.b.len());
@@ -884,6 +937,9 @@ fn enc_tail(i: *mut mc.MInst) void {
     }
     if WIN and not frameless {
         tail_jumps.push((jmp_at << 32) | @as(u64, E.b.len()));
+    }
+    if MACOS {
+        tail_ends.push(@as(u64, E.b.len()));
     }
     cfi_body();
 }
@@ -3374,6 +3430,7 @@ pub fn encode_func(f: *mut ir.Func) void {
         xcfis.clear();
         aob.inline_pass(OBJ);
         tail_jumps.clear();
+        tail_ends.clear();
         in_noframe = false;
         if sw < 0 {
             prologue(sub);
@@ -3490,6 +3547,9 @@ pub fn encode_func(f: *mut ir.Func) void {
     s.size = @as(u64, E.b.len());
     ft.func(&mut FT, TEXT, base, s.size, frameless, noframe.items(), calls.items(), rows.items(), scopes.items(),
             dw.func_name(f, elf.display_name(s.name)));
+    if MACOS {
+        mac_unwind(fsym.get(@int_cast(usize, f.id)), s.size, noframe.len > 0);
+    }
     noframe.deinit();
     if WIN and not frameless {
         // (code in a COMDAT group: its group's own unwind sections)
@@ -3513,11 +3573,7 @@ pub fn encode_func(f: *mut ir.Func) void {
     }
     if DBG.on {
         let mut regs: [8]u64 = [0; 8];
-        regs[0] = dw.saved_reg(dw.X64_RBP, -16);
-        for k in 0..@int_cast(usize, nsaved) {
-            regs[k + 1] = dw.saved_reg(
-                DW_GPR[@as(usize, @bit_cast(u32, saved[k] & 15))], -24 - (8 * @as(i64, @int_cast(i64, k))));
-        }
+        save_list(&mut regs);
         let df = dw.Func.{ xcfi: xcfis.items(), sym: fsym.get(@int_cast(usize, f.id)), name: dbg_name(f, s.name),
                            external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
                            scopes: scopes.items(), cfi: cfis.items(), regs: regs[0..@int_cast(usize, nsaved) + 1],

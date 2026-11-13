@@ -1178,6 +1178,7 @@ function cDriverCases() {
     },
     'C: C and Axiom built for Windows and macOS': async () => {
       if (skip()) return skip();
+      fs.mkdirSync(dir, { recursive: true });  // (run alone, --filter: no other case made it)
       // the c/mix programs, built (not run: that needs the systems)
       for (const d of cMixDirs) {
         const axMain = fs.existsSync(path.join(d, 'main.ax'));
@@ -2588,7 +2589,7 @@ if (!skipPlatform) {
               // thread-local has no one location)
               const wasm = t.startsWith('wasm');
               if (wasm && lvl !== '-O0') return r.nvars ? null : 'no variables';
-              const errs = checkVars(r.dw, { O0: lvl === '-O0', tls: !mac && !wasm, src, markLine, machine: t.startsWith('x86') ? 'x64' : 'a64' });
+              const errs = checkVars(r.dw, { O0: lvl === '-O0', tls: !wasm, src, markLine, machine: t.startsWith('x86') ? 'x64' : 'a64' });
               return errs.length ? errs.join('\n') : null;
             }
             if (file === 'shared.ax') return null;  // (checkDebug: every function has its subprogram)
@@ -2912,6 +2913,51 @@ if (!skipPlatform) {
       if (p || !onMac) return p;
       const r = spawnSync(out('c'), ['x'], { encoding: 'utf8' });
       return r.status === 3 && r.stdout === 'x 42 2.50\nbye\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
+    },
+    // the unwind tables (macunwind.ax; macho.mjs checkUnwind decodes them in
+    // every check): compact entries, and FDEs in __eh_frame for a function
+    // whose stack pointer moves, one with a sibling call before its end and
+    // an assembly procedure with .cfi_ rules; the same through Mach-O
+    // objects of this compiler (written, read back, linked). And the DWARF of
+    // two objects with -g, carried into the .dSYM each at its place
+    // (dwrebase.ax): every unit's line table and strings are its own.
+    'unwind tables and the .dSYM of several objects (arm64, x86-64)': () => {
+      const a = path.join(tmp, 'macos-uw-a.c'), b = path.join(tmp, 'macos-uw-b.c');
+      fs.writeFileSync(a, 'int printf(const char *, ...);\nlong g(long);\nlong pr(long);\n' +
+        '__attribute__((noinline)) long dyn(int n) { char *p = __builtin_alloca(n); p[0] = (char)n; return g(p[0]) + 1; }\n' +
+        '__attribute__((noinline)) long sib(long a) { if (a > 3) return g(a + 1); return g(a) * 2; }\n' +
+        'int main(void) { printf("%ld\\n", dyn(10) + sib(5) + pr(2)); return 0; }\n');
+      fs.writeFileSync(b, 'struct Q { double d; char c; };\nlong g(long v) { struct Q q = { 1.5, \'a\' }; return v * 2 + q.c; }\n' +
+        '__asm__(".globl _pr\\n_pr:\\n.cfi_startproc\\n' +
+        '#ifdef __x86_64__\\npushq %rbp\\n.cfi_def_cfa_offset 16\\n.cfi_offset %rbp, -16\\npopq %rbp\\n.cfi_def_cfa_offset 8\\nret\\n' +
+        '#else\\nstp x29, x30, [sp, #-16]!\\n.cfi_def_cfa_offset 16\\n.cfi_offset x29, -16\\n.cfi_offset x30, -8\\nldp x29, x30, [sp], #16\\n.cfi_def_cfa_offset 0\\nret\\n#endif\\n' +
+        '.cfi_endproc\\n");\n');
+      for (const t of ['aarch64-macos', 'x86_64-macos']) {
+        const x64 = t.startsWith('x86_64');
+        // (the assembly: the C source's asm statement holds both forms; the
+        // preprocessor does not reach inside a string, so each target's file says which)
+        const bt = path.join(tmp, `macos-uw-b-${t}.c`);
+        const src = fs.readFileSync(b, 'utf8').replace(/\\n#ifdef __x86_64__([^]*?)#else([^]*?)#endif/, (m, x, y) => x64 ? x : y);
+        fs.writeFileSync(bt, src);
+        const obj = out(`uw-b-${t}.o`);
+        const c = spawnSync(compiler, ['build', bt, `--target=${t}`, '--c-std=gnu17', '-O2', '-g', '--emit=obj', '-o', obj],
+          { encoding: 'utf8', cwd: root });
+        if (c.status !== 0) return `${t}: the object: ${c.stdout}${c.stderr}`;
+        for (const [n, extra] of [[`uw-${t}`, [bt]], [`uw-o-${t}`, [`--link=${obj}`]]]) {
+          const p = check(a, n, ['--c-std=gnu17', '-O2', '-g', ...extra], t);
+          if (p) return `${t} ${n}: ${p}`;
+          // (the entries of dyn, sib and pr: DWARF's)
+          const r = checkMachO(fs.readFileSync(out(n)), { x86_64: x64 });
+          if (!r.unwind || r.unwind.dwarf < 3 || r.unwind.none !== 0) return `${t} ${n}: ${JSON.stringify(r.unwind)}`;
+          const img = loadImage(fs.readFileSync(path.join(`${out(n)}.dSYM/Contents/Resources/DWARF`, path.basename(out(n)))));
+          const { errs } = checkDebug(img);
+          if (errs.length) return `${t} ${n}: the .dSYM: ${errs.slice(0, 5).join('\n')}`;
+          const names = readDwarf(img).units.map((u) => path.basename(String(u.die.attrs.get(0x03))));
+          const want = n.startsWith('uw-o') ? ['macos-uw-a.c', `macos-uw-b-${t}.c`] : ['macos-uw-a.c'];
+          if (want.some((w) => !names.includes(w))) return `${t} ${n}: the units are ${names.join(', ')}`;
+        }
+      }
+      return null;
     },
     'axiom test': () => {
       const r = spawnSync(compiler, ['test', path.join(root, 'std/str.ax'), '--target=aarch64-macos'], { encoding: 'utf8', cwd: root });

@@ -31,6 +31,7 @@ import "ir.ax" as ir;
 import "isel.ax" as is;
 import "lower.ax" as lower;
 import "mach.ax" as mc;
+import "macunwind.ax" as mu;
 import "opt.ax" as opt;
 import "switches.ax" as swl;
 import "target.ax" as tg;
@@ -128,7 +129,14 @@ let mut MF: *mut mc.MFunc = @ptr_from_int(*mut mc.MFunc, 0);
 let mut strict_fp: bool = false;
 let mut CB: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
 let mut nlocal: i32 = 0;
-let mut out_area: u64 = 0;        // outgoing stack-argument bytes
+let mut out_area: u64 = 0;  // outgoing stack-argument bytes
+// macOS: the unwind tables (macunwind.ax), whose entries come from the
+// call frame states (recorded for every function there, with or without
+// -g), and the ends of the function's sibling calls' jumps
+let mut MACOS_: bool = false;
+let mut MU: mu.Out = mu.Out.{ on: false, obj: @ptr_from_int(*mut elf.Obj, 0), x64: false, cu: -1, eh: -1,
+                              cies: [0; 4] };
+let mut tail_ends: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 let mut dyn_frame: bool = false;  // sp moves after the prologue (DYNSTACK): the slots are addressed from x29
 
 fn fail(msg: []u8) void {
@@ -2144,6 +2152,9 @@ fn enc_tail(i: *mut mc.MInst) void {
         w32(ae.B);
     } else {
         w32(0xD61F_0000 | (ae.r5(P(t.reg)) << 5));  // br
+    }
+    if MACOS_ {
+        tail_ends.push(here());
     }
     cfi_body();
 }
@@ -4818,7 +4829,7 @@ pub const CFI_NONE: u64 = 7;
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(cfa_reg: u32, k: u64, mask: u64) void {
-    if not DBG.on {
+    if not DBG.on and not MACOS_ {
         return;
     }
     let pc = here();
@@ -5426,6 +5437,9 @@ fn encode_func(f: *mut ir.Func) void {
             nsaved += 1;
         }
     }
+    if MACOS_ {
+        mac_save_order();
+    }
     // frame layout from sp: outgoing arguments, slots, saved registers
     let mut cur = @bit_cast(i64, (out_area + 15) & ~@as(u64, 15));
     for k in 0..MF.slots.len {
@@ -5434,6 +5448,9 @@ fn encode_func(f: *mut ir.Func) void {
         cur = (cur + a - 1) & ~(a - 1);
         s.offset = cur;
         cur += @bit_cast(i64, s.size);
+    }
+    if MACOS_ {
+        cur = (cur + 15) & ~@as(i64, 15);  // (the saves end at the frame's top: mac_save_order)
     }
     for k in 0..nsaved {
         if saved[k] >= V0 {
@@ -5460,6 +5477,7 @@ fn encode_func(f: *mut ir.Func) void {
     frameless = not needs_frame();
     cfis.clear();
     xcfis.clear();
+    tail_ends.clear();
     aob.inline_pass(OBJ);
     prologue();
     let nb = MF.blocks.len;
@@ -5569,21 +5587,15 @@ fn encode_func(f: *mut ir.Func) void {
     }
     // (the symbol again: a section symbol made since may have moved the list)
     s = OBJ.syms.at(@as(usize, fsym.get(@int_cast(usize, f.id))));
+    if MACOS_ {
+        mac_unwind(fsym.get(@int_cast(usize, f.id)), s.size);
+    }
     if WIN_ and (rows.len > 0) {
         wlines.emit(OBJ, LINES, codeview.func_key(s.name, s.value), rows.items());
     }
     if DBG.on {
         let mut regs: [20]u64 = [0; 20];
-        regs[0] = dw.saved_reg(dw.A64_FP, -16);
-        regs[1] = dw.saved_reg(dw.A64_LR, -8);
-        for k in 0..nsaved {
-            let r = saved[k];
-            let mut dr = @bit_cast(u32, r);
-            if r >= V0 {
-                dr = 64 + @bit_cast(u32, r - V0);  // (v8..v15: their low halves are the callee-saved d8..d15)
-            }
-            regs[k + 2] = dw.saved_reg(dr, -16 - frame + save_off[k]);
-        }
+        _ = save_list(&mut regs);
         let df = dw.Func.{ xcfi: xcfis.items(), sym: fsym.get(@int_cast(usize, f.id)),
                            name: dw.func_name(f, elf.display_name(s.name)), external: s.bind != elf.B_LOCAL,
                            size: s.size, src: f.src, rows: rows.items(), scopes: scopes.items(), cfi: cfis.items(),
@@ -5599,6 +5611,90 @@ fn encode_func(f: *mut ir.Func) void {
     scopes.deinit();
     code.free();
     calls.deinit();
+}
+
+// macOS: the callee-saved registers in the order the compact unwind
+// encoding's FRAME mode has them (macunwind.ax): saved in pairs (x19 and
+// x20, ..., x27 and x28: a register's partner too), at the frame's top, x19
+// highest, from the frame record down (the list is in address order: the
+// vector registers, which the encoding cannot describe saved whole, then
+// x28, x27, ..., x20, x19).
+fn mac_save_order() void {
+    let mut xs: u64 = 0;
+    let mut vs = u.List.[i32].empty();
+    for k in 0..nsaved {
+        if saved[k] >= V0 {
+            vs.push(saved[k]);
+        } else {
+            xs = xs | (@as(u64, 1) << @int_cast(u32, saved[k]));
+        }
+    }
+    nsaved = 0;
+    for v in vs.items() {
+        saved[nsaved] = v;
+        nsaved += 1;
+    }
+    vs.deinit();
+    let mut p: i32 = 27;
+    while p >= 19 {
+        let pair = (@as(u64, 3) << @int_cast(u32, p));
+        if (xs & pair) != 0 {
+            saved[nsaved] = p + 1;
+            saved[nsaved + 1] = p;
+            nsaved += 2;
+        }
+        p -= 2;
+    }
+}
+
+// The function's save list (dwarf.saved_reg): x29 at CFA - 16, x30 at
+// CFA - 8, then the callee-saved registers in their slots.
+fn save_list(regs: *mut [20]u64) usize {
+    regs[0] = dw.saved_reg(dw.A64_FP, -16);
+    regs[1] = dw.saved_reg(dw.A64_LR, -8);
+    for k in 0..nsaved {
+        let r = saved[k];
+        let mut dr = @bit_cast(u32, r);
+        if r >= V0 {
+            dr = 64 + @bit_cast(u32, r - V0);  // (v8..v15: their low halves are the callee-saved d8..d15)
+        }
+        regs[k + 2] = dw.saved_reg(dr, -16 - frame + save_off[k]);
+    }
+    return nsaved + 2;
+}
+
+// macOS: the function's unwind entry (macunwind.ax): FRAMELESS, FRAME, or
+// an FDE where the encoding cannot describe the frame, the stack pointer
+// moves after the prologue (DYNSTACK) or a sibling call's jump is not the
+// function's end.
+fn mac_unwind(fs: u32, size: u64) void {
+    if frameless {
+        mu.add(&mut MU, fs, 0, size, mu.A64_FRAMELESS, u.nil_slice.[u8](), false, false);
+        return;
+    }
+    let mut regs: [20]u64 = [0; 20];
+    let n = save_list(&mut regs);
+    let mut enc = mu.a64_frame(regs[0..n]);
+    if dyn_frame {
+        enc = 0;
+    }
+    for e in tail_ends.items() {
+        if e != size {
+            enc = 0;
+        }
+    }
+    if enc != 0 {
+        mu.add(&mut MU, fs, 0, size, enc, u.nil_slice.[u8](), false, false);
+        return;
+    }
+    let df = dw.Func.{ xcfi: xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
+                       rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
+                       irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
+                       frame_local: -1 };
+    let mut prog = bn.new_bytes();
+    dw.cfa_program(&mut prog, true, &df);
+    mu.add(&mut MU, fs, 0, size, 0, prog.view(), false, false);
+    prog.free();
 }
 
 // What dloc.ax needs of AArch64's machine code (variables' locations): the
@@ -5689,6 +5785,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     errors = false;
     LSE_ = tg.has(tg.A_LSE);
     WIN_ = tg.is_windows();
+    MACOS_ = tg.is_darwin();
     OBJ = elf.new_obj(elf.EM_AARCH64);
     tls_key_si = -1;
     tls_index_si = -1;
@@ -5709,6 +5806,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         XDATA_SYM = elf.add_sym(OBJ, elf.Sym.{ name: "", sec: XDATA, value: 0, size: 0, bind: elf.B_LOCAL,
                                                ty: elf.T_NOTYPE, hidden: false });
     }
+    MU = mu.begin(MACOS_, OBJ, false);
     let relro = is.add_symbols(OBJ, m, TEXT, RODATA, elf.R_AARCH64_ABS64, &mut fsym, &mut gsym);
     // file-scope asm (the C front end's GNU dialects): its sections and symbols
     for b in ai.toplevel.items() {
@@ -5759,6 +5857,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     }
     for p in aob.procs.items() {
         dw.add_asm_fde(&mut DBG, p.sym, 0, p.size, p.prog, p.simple, p.signal);
+        mu.add_proc(&mut MU, p.sym, p.size, p.prog, p.simple, p.signal);
     }
     aob.procs.clear();
     // (assembly sources' line information: DWARF, or on Windows the PDB's)
@@ -5777,7 +5876,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     }
     aob.funcs.clear();
     DBG.lang = dw.module_lang(m);
-    if not tg.is_darwin() {
+    if tg.is_darwin() {
+        DBG.tls_rel = dw.TLS_DESC;
+    } else {
         DBG.tls_rel = elf.R_AARCH64_TLS_DTPREL64;
     }
     for i in 0..m.globals.len {

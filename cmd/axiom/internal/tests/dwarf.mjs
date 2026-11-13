@@ -397,8 +397,14 @@ export function readDwarf(img) {
 }
 
 // The hash of .debug_names (DWARF 5, 6.1.1.4.5).
-// (DWARF 5 6.1.1.4.5: of the name case-folded; ASCII capitals as small letters)
-const djb = (s) => { let h = 5381; for (const c of Buffer.from(s, 'latin1')) h = (h * 33 + (c >= 65 && c <= 90 ? c + 32 : c)) >>> 0; return h; };
+// (DWARF 5, 6.1.1.4.5: of the name case-folded; a code point's lower case
+// stands for its simple folding here)
+const djb = (s) => {
+  let h = 5381;
+  const t = [...Buffer.from(s, 'latin1').toString('utf8')].map((c) => { const l = c.toLowerCase(); return [...l].length === 1 ? l : c; }).join('');
+  for (const c of Buffer.from(t, 'utf8')) h = (h * 33 + c) >>> 0;
+  return h;
+};
 
 // The name indexes of .debug_names, checked as read (errs): [{ cus, names:
 // [{ name, entries: [{ tag, die (an offset in .debug_info) }] }] }]. Every

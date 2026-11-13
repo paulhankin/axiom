@@ -58,11 +58,13 @@
 // ELF), and the relocations of both architectures with their pairs
 // (ARM64_RELOC_ADDEND, a SUBTRACTOR and its UNSIGNED), extern and
 // section-relative, addends from the instruction or data where Mach-O keeps
-// them. __LD,__compact_unwind and __TEXT,__eh_frame are not kept (the
-// linker writes no unwind tables).
+// them; the unwind tables __LD,__compact_unwind and __TEXT,__eh_frame as
+// the sections ".compact_unwind" and ".eh_frame" (macunwind.ax), which
+// mlink.ax makes __unwind_info and __eh_frame of.
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "macunwind.ax" as mu;
 import "util.ax" as u;
 
 const MH_MAGIC_64: u64 = 0xfeed_facf;
@@ -242,6 +244,14 @@ fn has_abs(s: *elf.Sec, x64: bool) bool {
 fn place_of(s: *elf.Sec, x64: bool) Place {
     let n = s.name;
     let k = s.kind;
+    // the unwind tables (macunwind.ax), as the platform's assembler writes them
+    if u.str_eq(n, ".compact_unwind") {
+        return Place.{ seg: "__LD", sect: "__compact_unwind", flags: S_ATTR_DEBUG };
+    }
+    if u.str_eq(n, ".eh_frame") {
+        // S_COALESCED, S_ATTR_NO_TOC, S_ATTR_STRIP_STATIC_SYMS, S_ATTR_LIVE_SUPPORT
+        return Place.{ seg: "__TEXT", sect: "__eh_frame", flags: 0x6800_000b };
+    }
     let comma = u.find(n, ',');
     if (comma > 0) and (k != elf.S_DEBUG) {
         // "segment,section" (the section attribute's Mach-O form)
@@ -1045,7 +1055,19 @@ fn classify(x: *ISec, name: *mut []u8) i32 {
     let t = sec_type(x.flags);
     let seg = x.seg;
     let sect = x.sect;
+    if u.str_eq(seg, "__LD") and u.str_eq(sect, "__compact_unwind") {
+        name.* = ".compact_unwind";
+        return elf.S_DATA;
+    }
+    if u.str_eq(seg, "__TEXT") and u.str_eq(sect, "__eh_frame") {
+        name.* = ".eh_frame";
+        return elf.S_RODATA;
+    }
     if u.str_eq(seg, "__DWARF") or ((x.flags & S_ATTR_DEBUG) != 0) {
+        if u.str_eq(sect, "__debug_str_offs") {
+            name.* = ".debug_str_offsets";  // (a name cut to Mach-O's 16 characters)
+            return elf.S_DEBUG;
+        }
         if u.starts(sect, "__debug_") {
             name.* = u.cat2(".debug_", sect[8..]);
             return elf.S_DEBUG;
@@ -1055,9 +1077,6 @@ fn classify(x: *ISec, name: *mut []u8) i32 {
             return elf.S_DEBUG;
         }
         return -1;  // (__apple_names and the like: the debugger's indexes)
-    }
-    if (u.str_eq(seg, "__LD") and u.str_eq(sect, "__compact_unwind")) or u.str_eq(sect, "__eh_frame") {
-        return -1;
     }
     if u.str_eq(sect, "__axiom_tdata") {
         name.* = ".tdata";
@@ -1201,6 +1220,7 @@ pub fn read(d: []u8) *mut elf.Obj {
     }
     let x64 = machine == elf.EM_X86_64;
     let o = elf.new_obj(machine);
+    o.debug_numbers = true;  // (the platform's convention: dwrebase.ax)
     let ncmds = bn.rd32(d, 16);
     let mut at: usize = 32;
     let mut secs = u.List.[ISec].empty();
@@ -1519,7 +1539,63 @@ pub fn read(d: []u8) *mut elf.Obj {
             s.relocs.push(r);
         }
     }
+    for xi in 0..secs.len {
+        let x = secs.get(xi);
+        if (x.elf >= 0) and u.str_eq(x.sect, "__eh_frame") {
+            eh_targets(o, secs.items(), &x, x64);
+        }
+    }
     return o;
+}
+
+// The FDEs of __eh_frame section x whose function's address the platform's
+// assembler leaves without a relocation (a pc-relative difference within
+// the object, which its linker resolves from the sections' addresses) get
+// one, place-relative, to the section the address is in: the linker
+// (mlink.ax) finds an FDE's function by its relocation.
+fn eh_targets(o: *mut elf.Obj, secs: []ISec, x: *ISec, x64: bool) void {
+    let s = o.secs.get(@int_cast(usize, x.elf));
+    let d = s.data.view();
+    let mut at: usize = 0;
+    while (at + 8) <= d.len {
+        let n = @truncate(usize, bn.rd32(d, at));
+        if (n == 0) or (n == 0xffff_ffff) or ((at + 4 + n) > d.len) {
+            return;
+        }
+        let id = @truncate(usize, bn.rd32(d, at + 4));
+        if (id != 0) and (id <= (at + 4)) {
+            let enc = mu.fde_encoding(d, (at + 4) - id);
+            let k = mu.enc_size(enc);
+            let f = @as(u64, at + 8);
+            let mut has = false;
+            for r in s.relocs.items() {
+                if r.off == f {
+                    has = true;
+                }
+            }
+            if (enc != 0xff) and ((enc & 0x70) == 0x10) and (k > 0) and ((at + 8 + k) <= d.len) and not has {
+                let mut v: i64 = 0;
+                if k == 8 {
+                    v = @bit_cast(i64, bn.rd64(d, at + 8));
+                } else if (enc & 0x0f) == 0xb {
+                    v = @as(i64, @bit_cast(i32, @truncate(u32, bn.rd32(d, at + 8))));
+                } else {
+                    v = @bit_cast(i64, bn.rd32(d, at + 8));
+                }
+                let t = @bit_cast(u64, @bit_cast(i64, x.addr + f) + v);
+                for y in secs {
+                    if (y.elf >= 0) and (t >= y.addr) and (t < (y.addr + y.size)) {
+                        let ty = u32_pick(k == 8, u32_pick(x64, elf.R_X86_64_PC64, elf.R_AARCH64_PREL64),
+                                          u32_pick(x64, elf.R_X86_64_PC32, elf.R_AARCH64_PREL32));
+                        s.relocs.push(elf.Rel.{ off: f, ty: ty, sym: y.secsym, addend: @bit_cast(i64, t - y.addr) });
+                        zero(d, at + 8, u64_pick(k == 8, 3, 2));
+                        break;
+                    }
+                }
+            }
+        }
+        at += 4 + n;
+    }
 }
 
 fn zero(d: []mut u8, at: usize, len: u64) void {

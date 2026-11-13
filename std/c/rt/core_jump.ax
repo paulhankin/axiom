@@ -19,9 +19,14 @@
 // offset, which its unwind information names (a function whose stack
 // pointer moves, or that makes sibling calls: rbp; x64emit.ax), else its
 // stack pointer in its body, which is the one __axc_setjmp saved (after
-// its return). Elsewhere, and if the caller has no function table entry,
-// the registers are restored at once (the frames in between are the
-// program's, which have no handlers).
+// its return). On Windows ARM64 the same, the jump buffer being ARM64's
+// _JUMP_BUFFER (jstub.ax) and the establisher frame the one the system's
+// RtlVirtualUnwind gives for the caller at the point setjmp returned to (a
+// context of the registers env holds: x19-x28, x29, the stack pointer, the
+// return address as the pc). Elsewhere, and if the caller has no function
+// table entry, the registers are restored at once (the frames in between
+// are the program's, which have no handlers). (Windows ARM64: built and
+// checked for its structure only; nothing here runs it.)
 // =============================================================================
 
 extern "C" {
@@ -29,10 +34,13 @@ extern "C" {
     // Windows (ntdll.dll)
     fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, history: *mut void) *u32;
     fn RtlUnwindEx(frame: u64, target: u64, rec: *mut u64, result: u64, context: *mut u8, history: *mut void) void;
+    fn RtlVirtualUnwind(kind: u32, base: u64, pc: u64, entry: *u32, context: *mut u8, data: *mut *mut void,
+                        frame: *mut u64, pointers: *mut void) *mut void;
 }
 
 const STATUS_LONGJUMP: u64 = 0x8000_0026;
-const CONTEXT_SIZE: usize = 0x4d0;  // the x64 CONTEXT, 16-aligned
+const CONTEXT_SIZE: usize = 0x4d0;      // the x64 CONTEXT, 16-aligned
+const A64_CONTEXT_SIZE: usize = 0x390;  // ARM64's
 
 /// longjmp(env, val), val not 0.
 export fn __axc_longjmp(env: *mut u64, val: i64) void {
@@ -62,5 +70,45 @@ export fn __axc_longjmp(env: *mut u64, val: i64) void {
             }
         }
     }
+    if @target_os("windows") and @target_arch("aarch64") {
+        arm64_unwind(env, val);
+    }
     __axc_longjmp_restore(env, val);
+}
+
+// Windows ARM64: the unwind to the frame of env's setjmp caller (see the
+// header); returns if that caller has no function table entry.
+fn arm64_unwind(env: *mut u64, val: i64) void {
+    let jb = @slice_from_ptr(env, 32);
+    let pc = jb[13];  // (x30: where setjmp returned to)
+    let mut base: u64 = 0;
+    let f = RtlLookupFunctionEntry(pc, &mut base, @ptr_from_int(*mut void, 0));
+    if @int_from_ptr(f) == 0 {
+        return;
+    }
+    // the ARM64 CONTEXT: x0-x28 from 8, x29 at 240, x30 at 248, sp at
+    // 256, pc at 264; ContextFlags (CONTEXT_ARM64 | CONTROL | INTEGER) at 0
+    let mut ctx: [A64_CONTEXT_SIZE + 16]u8 = [0; A64_CONTEXT_SIZE + 16];
+    let at = (@int_from_ptr(&ctx[0]) + 15) & ~@as(usize, 15);
+    let c = @slice_from_ptr(@ptr_from_int(*mut u64, at), A64_CONTEXT_SIZE / 8);
+    @ptr_from_int(*mut u32, at).* = 0x0040_0003;
+    for k in @as(usize, 0)..10 {
+        c[1 + 19 + k] = jb[2 + k];
+    }
+    c[240 / 8] = jb[12];
+    c[248 / 8] = jb[13];
+    c[256 / 8] = jb[14];
+    c[264 / 8] = pc;
+    let mut data = @ptr_from_int(*mut void, 0);
+    let mut frame: u64 = 0;
+    _ = RtlVirtualUnwind(
+        0, base, pc, f, @ptr_from_int(*mut u8, at), &mut data, &mut frame, @ptr_from_int(*mut void, 0));
+    jb[0] = frame;
+    // EXCEPTION_RECORD: code, flags, record, address, one parameter: env
+    let mut rec: [19]u64 = [0; 19];
+    rec[0] = STATUS_LONGJUMP;
+    rec[3] = 1;
+    rec[4] = @as(u64, @int_from_ptr(env));
+    @mem_set(@slice_from_ptr(@ptr_from_int(*mut u8, at), A64_CONTEXT_SIZE), 0);
+    RtlUnwindEx(frame, pc, &mut rec[0], @bit_cast(u64, val), @ptr_from_int(*mut u8, at), @ptr_from_int(*mut void, 0));
 }

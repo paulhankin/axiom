@@ -22,6 +22,7 @@
 // =============================================================================
 import "bin.ax" as bn;
 import "dwarf.ax" as dw;
+import "dwrebase.ax" as dr;
 import "elf.ax" as elf;
 import "util.ax" as u;
 
@@ -718,7 +719,10 @@ fn collectable(oi: usize, s: *elf.Sec) bool {
 
 // A section kept that keeps nothing (an unwind table: see above).
 fn inert(s: *elf.Sec) bool {
-    return u.str_eq(s.name, ".eh_frame") or u.str_eq(s.name, ".pdata") or u.str_eq(s.name, ".xdata");
+    // (and macOS's compact entries and the debugger's thread-local
+    // descriptors: macunwind.ax, dwarf.ax finish_elf)
+    return u.str_eq(s.name, ".eh_frame") or u.str_eq(s.name, ".pdata") or u.str_eq(s.name, ".xdata") or
+           u.str_eq(s.name, ".compact_unwind") or u.str_eq(s.name, "axiom_tlvd");
 }
 
 struct Gc {
@@ -1143,7 +1147,17 @@ pub let mut tls_start: u64 = 0;
 
 pub fn debug_sections() u.List.[DebugSec] {
     let mut out = u.List.[DebugSec].empty();
+    // (the sections this compiler writes, then the others it knows of)
+    let mut all = u.List.[[]u8].empty();
     for name in dw.SEC_NAMES {
+        all.push(name);
+    }
+    for name in dr.NAMES {
+        if not dw.is_debug_name(name) {
+            all.push(name);
+        }
+    }
+    for name in all.items() {
         let mut d = bn.new_bytes();
         for oi in 0..objs.len {
             let o = objs.get(oi);
@@ -1187,6 +1201,34 @@ pub fn debug_sections() u.List.[DebugSec] {
             }
         }
     }
+    // the objects whose offsets into each other's debug sections are numbers
+    let mut parts = u.newn.[dr.Part](dr.NSECS);
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        if not o.debug_numbers {
+            continue;
+        }
+        for j in 0..dr.NSECS {
+            parts[j] = dr.Part.{ data: u.nil_slice.[u8](), base: 0, size: 0 };
+        }
+        for k in 0..o.secs.len {
+            if sec_cls.get(oi)[k] != C_DEBUG {
+                continue;
+            }
+            let j = dr.index_of(o.secs.get(k).name);
+            let mut at: usize = 0;
+            while (at < out.len) and not u.str_eq(out.get(at).name, o.secs.get(k).name) {
+                at += 1;
+            }
+            if (j < 0) or (at == out.len) or (parts[@int_cast(usize, j)].size > 0) {
+                continue;
+            }
+            parts[@int_cast(usize, j)] = dr.Part.{ data: out.at(at).data.view(), base: sec_addr.get(oi)[k],
+                                                   size: @as(u64, o.secs.get(k).data.len()) };
+        }
+        dr.rebase(parts);
+    }
+    all.deinit();
     let mut n: usize = 0;
     for k in 0..out.len {
         if out.get(k).data.len() > 0 {

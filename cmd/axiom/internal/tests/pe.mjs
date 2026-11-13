@@ -380,6 +380,7 @@ function decodeCodes(c, i0, E) {
     else if (b === 0xe1) x = { op: 'set_fp', n: 1 };
     else if (b === 0xe2) x = { op: 'add_fp', off: b1 * 8, n: 2 };
     else if (b === 0xe3) x = { op: 'nop', n: 1 };
+    else if (b === 0xea) x = { op: 'context', n: 1 };  // MSFT_OP_CONTEXT (a fault's trampoline)
     else if (b === 0xe4) return ops;
     else { E(`unwind code 0x${b.toString(16)} (not one the compiler writes)`); return ops; }
     ops.push(x);
@@ -432,6 +433,8 @@ function matches(w, x, epi, x16) {
       // (a q register, whose low half is the d register; or d itself)
       return rn === SP && rt === x.reg && ((((w & 0xffc00000) >>> 0) === (epi ? 0x3dc00000 : 0x3d800000) && imm12 * 16 === x.off) ||
         (((w & 0xffc00000) >>> 0) === (epi ? 0xfd400000 : 0xfd000000) && imm12 * 8 === x.off));
+    case 'context':
+      return (w >>> 0) === 0xd503201f;  // (the trampoline's nop: the CONTEXT is at sp from its entry)
     case 'nop': {
       // (anything but an add or sub of an immediate to sp or x29)
       const addsub = ((w >>> 23) & 0x3f) === 0x22;
@@ -526,7 +529,7 @@ function checkArm64Code(d, { E, off, text, pdata, iat, entry, funcs, r }) {
       x16 = movx16(w, x16);
       if (!matches(w, pro[k], false, x16)) { E(`${f.name}+0x${(4 * k).toString(16)}: the prologue's instruction ${(w >>> 0).toString(16)} is not its code's ${pro[k].op}`); break; }
     }
-    if (!pro.length || pro.findIndex((x) => x.op === 'save_fplr_x') < 0) E(`${f.name}: the prologue saves no frame record`);
+    if (!pro.length || pro.findIndex((x) => x.op === 'save_fplr_x' || x.op === 'context') < 0) E(`${f.name}: the prologue saves no frame record`);
     // the epilogues: their codes from their index, in order, then a return or branch
     const ended = new Set();
     for (const s of scopes) {

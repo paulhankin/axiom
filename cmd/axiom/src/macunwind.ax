@@ -1,0 +1,510 @@
+// =============================================================================
+// macunwind.ax - macOS unwind tables, from the call frame states the native
+// code generators record (dwarf.ax cfi_state) for every function.
+//
+// An object (macho.ax writes its sections as the platform's) has:
+//   __LD,__compact_unwind   an entry per function, 32 bytes: its address
+//                           (a relocation), its length (u32), its compact
+//                           encoding (u32), a personality and an LSDA
+//                           (0: none; this compiler's code has neither)
+//   __TEXT,__eh_frame       call frame information in the .eh_frame form
+//                           (CIEs with augmentation "zR", pc-relative
+//                           4-byte addresses) for the functions that a
+//                           compact encoding cannot describe; their compact
+//                           entry says so (the DWARF mode, offset 0: the
+//                           linker finds the FDE by its address)
+// In the objects of this compiler these are the ELF sections
+// ".compact_unwind" and ".eh_frame" until macho.write names them; macho.read
+// reads the platform toolchain's back into the same.
+//
+// An executable (mlink.ax) has __TEXT,__eh_frame (the objects' FDEs) and
+// __TEXT,__unwind_info, the table the system's unwinder reads (the format of
+// <mach-o/compact_unwind_encoding.h>):
+//   a header: version 1, then the section offsets and counts of the common
+//   encodings (none here), the personalities (none) and the first-level
+//   index;
+//   the first-level index: an entry per second-level page (the offset from
+//   the image's start of the page's first function, the page's offset, the
+//   offset of its part of the LSDA index), then a sentinel (the end of the
+//   last function, no page);
+//   the LSDA index (empty);
+//   second-level pages of the regular kind (2): a header (kind, the offset
+//   of the entries, their count) and entries of (function offset, encoding)
+//   in address order, at most 511 a page so that each fits 4 KiB.
+// A function an object gives no entry for (a symbol of a function's type
+// outside the functions it gives entries for) has an entry of encoding 0
+// (no unwind information): the unwinder's lookup takes the last entry at or
+// before an address, which would be the function's before it.
+//
+// The compact encodings (what the unwinder does at a call site):
+//   arm64   FRAMELESS (0x02000000, stack size 0): the return address in lr,
+//           sp unchanged; FRAME (0x04000000): x29 holds the frame record
+//           (the caller's x29 and the return address, CFA = x29 + 16), and
+//           the pairs flagged (x19/x20 0x1, x21/x22 0x2, x23/x24 0x4,
+//           x25/x26 0x8, x27/x28 0x10, d8/d9 0x100, ... d14/d15 0x800) are
+//           saved just below it, in that order, the first of each pair the
+//           higher (x19 at x29 - 8, x20 at x29 - 16, x21 at x29 - 24, ...);
+//           DWARF (0x03000000 | the FDE's offset in __eh_frame).
+//   x86-64  RBP_FRAME (0x01000000): push rbp; mov rbp, rsp, and up to five
+//           registers saved from rbp - 8 * offset (bits 16-23) up, each a
+//           3-bit field from the lowest (rbx 1, r12 2, r13 3, r14 4, r15 5);
+//           STACK_IMMD (0x02000000, the stack size in 8-byte units in bits
+//           16-23): no frame, the return address at rsp + 8 * size - 8;
+//           DWARF (0x04000000 | the FDE's offset).
+// A compact encoding is right at every call the function makes; the
+// unwinder is asked about a frame only there (an exception, a walk of the
+// callers), and in the prologue and epilogue it is only approximately right
+// for an asynchronous walk, which is the platform's convention. The
+// functions given an FDE instead (exact at every instruction): those whose
+// frame a compact encoding cannot say (registers saved elsewhere than
+// below the frame record, vector registers saved whole), those that run
+// code outside their frame in the middle (a sibling call's epilogue and
+// jump before the end, blocks run before the frame is set up), those whose
+// stack pointer moves after the prologue, and assembly procedures with
+// .cfi_ directives.
+// =============================================================================
+import "bin.ax" as bn;
+import "elf.ax" as elf;
+import "util.ax" as u;
+
+pub const A64_FRAMELESS: u32 = 0x0200_0000;
+pub const A64_DWARF: u32 = 0x0300_0000;
+pub const A64_FRAME: u32 = 0x0400_0000;
+pub const X64_RBP_FRAME: u32 = 0x0100_0000;
+pub const X64_STACK_IMMD: u32 = 0x0200_0000;
+pub const X64_DWARF: u32 = 0x0400_0000;
+pub const MODE_MASK: u32 = 0x0f00_0000;
+
+/// The DWARF mode's encoding of an architecture (FDE offset 0).
+pub fn dwarf_mode(x64: bool) u32 {
+    if x64 {
+        return X64_DWARF;
+    }
+    return A64_DWARF;
+}
+
+/// Is `enc` the DWARF mode's?
+pub fn is_dwarf(enc: u32, x64: bool) bool {
+    return (enc & MODE_MASK) == dwarf_mode(x64);
+}
+
+// A saved register (dwarf.saved_reg's form): its DWARF number and its
+// offset from the CFA.
+fn sreg(x: u64) u32 {
+    return @truncate(u32, x >> 32);
+}
+
+fn soff(x: u64) i64 {
+    return @as(i64, @truncate(i32, @bit_cast(i64, x & 0xffff_ffff)));
+}
+
+// The offset from the CFA at which `regs` saves DWARF register r (1: not saved).
+fn saved_at(regs: []u64, r: u32) i64 {
+    for x in regs {
+        if sreg(x) == r {
+            return soff(x);
+        }
+    }
+    return 1;
+}
+
+/// The arm64 compact encoding of a function with a frame record whose save
+/// list is `regs` (dwarf.saved_reg: x29 and x30 first, then the
+/// callee-saved registers; DWARF numbers, d8-d15 as 72-79), or 0 when the
+/// FRAME mode cannot say where they are (see the header).
+pub fn a64_frame(regs: []u64) u32 {
+    if (saved_at(regs, 29) != -16) or (saved_at(regs, 30) != -8) {
+        return 0;
+    }
+    let mut enc = A64_FRAME;
+    let mut loc: i64 = -24;  // x29 - 8
+    let mut found: usize = 2;
+    let pairs: [9]u32 = [19, 21, 23, 25, 27, 72, 74, 76, 78];
+    let flags: [9]u32 = [0x1, 0x2, 0x4, 0x8, 0x10, 0x100, 0x200, 0x400, 0x800];
+    for k in @as(usize, 0)..9 {
+        let a = saved_at(regs, pairs[k]);
+        let b = saved_at(regs, pairs[k] + 1);
+        if (a == 1) and (b == 1) {
+            continue;
+        }
+        if (a != loc) or (b != (loc - 8)) {
+            return 0;
+        }
+        enc = enc | flags[k];
+        loc -= 16;
+        found += 2;
+    }
+    if found != regs.len {
+        return 0;  // (a register the encoding has no place for)
+    }
+    return enc;
+}
+
+/// The x86-64 compact encoding of a function that pushes rbp, sets rbp to
+/// rsp and pushes the callee-saved registers of `regs` (dwarf.saved_reg: rbp
+/// first), or 0 when the RBP_FRAME mode cannot describe it.
+pub fn x64_frame(regs: []u64) u32 {
+    if (regs.len == 0) or (sreg(regs[0]) != 6) or (soff(regs[0]) != -16) or (regs.len > 6) {
+        return 0;
+    }
+    let n = regs.len - 1;
+    let mut fields: u32 = 0;
+    // (the field of the register at the lowest address first: rbp - 8n)
+    for i in 0..n {
+        let want = -16 - (8 * @as(i64, @int_cast(i32, n - i)));
+        let mut code: u32 = 0;
+        for x in regs[1..] {
+            if soff(x) == want {
+                let r = sreg(x);
+                if r == 3 {
+                    code = 1;
+                } else if (r >= 12) and (r <= 15) {
+                    code = r - 10;
+                }
+            }
+        }
+        if code == 0 {
+            return 0;
+        }
+        fields = fields | (code << @truncate(u32, 3 * i));
+    }
+    return (X64_RBP_FRAME | (@truncate(u32, n) << 16)) | fields;
+}
+
+/// The x86-64 encoding of a function without a frame (the return address
+/// at the stack pointer).
+pub fn x64_frameless() u32 {
+    return X64_STACK_IMMD | (1 << 16);
+}
+
+// -----------------------------------------------------------------------------
+// Objects
+// -----------------------------------------------------------------------------
+/// The unwind sections of an object being made.
+pub struct Out {
+    on: bool,
+    obj: *mut elf.Obj,
+    x64: bool,
+    cu: i32,       // .compact_unwind
+    eh: i32,       // .eh_frame
+    cies: [4]u64,  // per CIE kind (bit 0 simple, bit 1 a signal frame): its offset + 1
+}
+
+/// The unwind sections of object `obj` (made now, before any function is
+/// compiled: the sections outlive the functions' scratch scopes), if `on`
+/// (a macOS target).
+pub fn begin(on: bool, obj: *mut elf.Obj, x64: bool) Out {
+    if not on {
+        return Out.{ on: false, obj: obj, x64: x64, cu: -1, eh: -1, cies: [0; 4] };
+    }
+    let cu = elf.add_sec(obj, ".compact_unwind", elf.S_DATA, 8);
+    let eh = elf.add_sec(obj, ".eh_frame", elf.S_RODATA, 8);
+    return Out.{ on: true, obj: obj, x64: x64, cu: cu, eh: eh, cies: [0; 4] };
+}
+
+// DWARF's register numbers and call frame instructions used here
+const CFA_DEF_CFA: u8 = 0x0c;
+const CFA_OFFSET: u8 = 0x80;
+const CFA_NOP: u8 = 0;
+
+// Pads the entry at `at` of b to a multiple of 8 with nops and sets its length.
+fn pad_entry(b: *mut bn.Bytes, at: usize) void {
+    while ((b.len() - at) % 8) != 0 {
+        b.u8_(CFA_NOP);
+    }
+    b.set_u32(at, @as(u64, b.len() - at - 4));
+}
+
+// The CIE of a kind (its offset in .eh_frame): version 1, augmentation
+// "zR" (and "S" for a signal frame) with pc-relative 4-byte addresses
+// (DW_EH_PE_pcrel | DW_EH_PE_sdata4), code alignment 4 (arm64) or 1,
+// data alignment -8, the return address register (x30, or 16), and the
+// state at a function's entry (dwarf.ax's CIE: arm64 CFA = sp; x86-64
+// CFA = rsp + 8 with the return address at CFA - 8), unless `simple`.
+fn cie(o: *mut Out, simple: bool, signal: bool) u64 {
+    let mut k: usize = 0;
+    if simple {
+        k = 1;
+    }
+    if signal {
+        k += 2;
+    }
+    if o.cies[k] != 0 {
+        return o.cies[k] - 1;
+    }
+    let b = &mut o.obj.secs.get(@int_cast(usize, o.eh)).data;
+    let at = b.len();
+    b.u32_(0);
+    b.u32_(0);  // (a CIE)
+    b.u8_(1);
+    b.u8_('z');
+    b.u8_('R');
+    if signal {
+        b.u8_('S');
+    }
+    b.u8_(0);
+    if o.x64 {
+        b.uleb(1);
+    } else {
+        b.uleb(4);
+    }
+    b.sleb(-8);
+    if o.x64 {
+        b.u8_(16);
+    } else {
+        b.u8_(30);
+    }
+    b.uleb(1);
+    b.u8_(0x1b);
+    if not simple {
+        if o.x64 {
+            b.u8_(CFA_DEF_CFA);
+            b.uleb(7);
+            b.uleb(8);
+            b.u8_(CFA_OFFSET | 16);
+            b.uleb(1);
+        } else {
+            b.u8_(CFA_DEF_CFA);
+            b.uleb(31);
+            b.uleb(0);
+        }
+    }
+    pad_entry(b, at);
+    o.cies[k] = @as(u64, at) + 1;
+    return @as(u64, at);
+}
+
+fn prel32(x64: bool) u32 {
+    if x64 {
+        return elf.R_X86_64_PC32;
+    }
+    return elf.R_AARCH64_PREL32;
+}
+
+fn abs64(x64: bool) u32 {
+    if x64 {
+        return elf.R_X86_64_64;
+    }
+    return elf.R_AARCH64_ABS64;
+}
+
+/// Adds the unwind entry of the function at symbol `sym` + `add` (of
+/// `size` bytes): compact encoding `enc`, or, if `prog` is not empty, an
+/// FDE of those call frame instructions (after the CIE's of its kind) and
+/// the DWARF mode.
+pub fn add(o: *mut Out, sym: u32, addend: u64, size: u64, enc0: u32, prog: []u8, simple: bool, signal: bool) void {
+    if not o.on {
+        return;
+    }
+    let mut enc = enc0;
+    if prog.len > 0 {
+        let c = cie(o, simple, signal);
+        let s = o.obj.secs.get(@int_cast(usize, o.eh));
+        let b = &mut s.data;
+        let at = b.len();
+        b.u32_(0);
+        b.u32_(@as(u64, at + 4) - c);  // (the CIE pointer: back from here)
+        s.relocs.push(elf.Rel.{ off: @as(u64, b.len()), ty: prel32(o.x64), sym: sym, addend: @bit_cast(i64, addend) });
+        b.u32_(0);
+        b.u32_(size);
+        b.uleb(0);  // (no augmentation data)
+        b.put(prog);
+        pad_entry(b, at);
+        enc = dwarf_mode(o.x64);
+    }
+    let s = o.obj.secs.get(@int_cast(usize, o.cu));
+    s.relocs.push(elf.Rel.{ off: @as(u64, s.data.len()), ty: abs64(o.x64), sym: sym, addend: @bit_cast(i64, addend) });
+    s.data.u64_(0);
+    s.data.u32_(size);
+    s.data.u32_(@as(u64, enc));
+    s.data.u64_(0);
+    s.data.u64_(0);
+}
+
+/// Adds the entry of an assembly procedure (.cfi_startproc ... .cfi_endproc:
+/// asm/core.ax Proc) of call frame instructions `prog`: an FDE, or, when it
+/// has none and starts from the entry's state, no frame.
+pub fn add_proc(o: *mut Out, sym: u32, size: u64, prog: []u8, simple: bool, signal: bool) void {
+    if (prog.len == 0) and not simple and not signal {
+        let mut enc = A64_FRAMELESS;
+        if o.x64 {
+            enc = x64_frameless();
+        }
+        add(o, sym, 0, size, enc, prog, false, false);
+        return;
+    }
+    add(o, sym, 0, size, 0, prog, simple, signal);
+}
+
+// -----------------------------------------------------------------------------
+// Reading .eh_frame (the platform toolchain's objects, and the linker)
+// -----------------------------------------------------------------------------
+/// The pointer encoding of the FDEs of the CIE at `at` of .eh_frame
+/// contents d (its augmentation's 'R'; DW_EH_PE_absptr without one), or
+/// 0xff when the CIE is not one this reads (a version or augmentation it
+/// does not know).
+pub fn fde_encoding(d: []u8, at: usize) u8 {
+    if (at + 9) > d.len {
+        return 0xff;
+    }
+    let n = @truncate(usize, bn.rd32(d, at));
+    let end = at + 4 + n;
+    if (end > d.len) or (bn.rd32(d, at + 4) != 0) or ((d[at + 8] != 1) and (d[at + 8] != 3)) {
+        return 0xff;
+    }
+    let mut z = at + 9;
+    while (z < end) and (d[z] != 0) {
+        z += 1;
+    }
+    if z >= end {
+        return 0xff;
+    }
+    let aug = d[at + 9..z];
+    let mut r = bn.reader(d[0..end]);
+    r.pos = z + 1;
+    if (aug.len == 0) or (aug[0] != 'z') {
+        if aug.len == 0 {
+            return 0;
+        }
+        return 0xff;
+    }
+    _ = r.uleb();  // code alignment
+    _ = r.sleb();  // data alignment
+    if d[at + 8] == 1 {
+        _ = r.u8_();
+    } else {
+        _ = r.uleb();
+    }
+    _ = r.uleb();  // the augmentation data's length
+    for c in aug[1..] {
+        if c == 'R' {
+            return r.u8_();
+        } else if c == 'P' {
+            let e = r.u8_();
+            let k = enc_size(e);
+            if k == 0 {
+                return 0xff;
+            }
+            _ = r.bytes(k);
+        } else if c == 'L' {
+            _ = r.u8_();
+        } else if c != 'S' {
+            return 0xff;
+        }
+    }
+    return 0;
+}
+
+/// The size of a pointer of encoding e (DW_EH_PE_*; 0: one not read here).
+pub fn enc_size(e: u8) usize {
+    let f = e & 0x0f;
+    if (f == 0) or (f == 4) or (f == 0xc) {
+        return 8;
+    }
+    if (f == 3) or (f == 0xb) {
+        return 4;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Executables
+// -----------------------------------------------------------------------------
+/// A function's entry in an executable: its offset from the image's start,
+/// its length and its encoding (a DWARF mode's with its FDE's offset).
+pub struct Ent {
+    off: u64,
+    len: u64,
+    enc: u32,
+}
+
+const PAGE_ENTS: usize = 511;
+
+fn cmp_ent(a: Ent, b: Ent) i32 {
+    if a.off < b.off {
+        return -1;
+    }
+    if a.off > b.off {
+        return 1;
+    }
+    return 0;
+}
+
+/// The entries of `ents` in address order, one per function (the first
+/// of those given for one address).
+pub fn sorted(ents: []mut Ent) u.List.[Ent] {
+    u.sort.[Ent](ents, cmp_ent);
+    let mut out = u.List.[Ent].empty();
+    for e in ents {
+        if (out.len == 0) or (out.last().off != e.off) {
+            out.push(e);
+        }
+    }
+    return out;
+}
+
+/// Is offset `off` in a function of the entries `ents` (sorted's)?
+pub fn covers(ents: []Ent, off: u64) bool {
+    let mut lo: usize = 0;
+    let mut hi = ents.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ents[mid].off <= off {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return false;
+    }
+    let e = ents[lo - 1];
+    return (off >= e.off) and ((off < (e.off + e.len)) or (off == e.off));
+}
+
+/// The size of the __unwind_info of n entries (sorted's).
+pub fn info_size(n: usize) u64 {
+    let pages = (n + PAGE_ENTS - 1) / PAGE_ENTS;
+    return @as(u64, 28 + (12 * (pages + 1)) + (8 * pages) + (8 * n));
+}
+
+/// __unwind_info for the entries `ents` (sorted's, at least one).
+pub fn info(ents: []Ent) bn.Bytes {
+    let n = ents.len;
+    let pages = (n + PAGE_ENTS - 1) / PAGE_ENTS;
+    let mut b = bn.new_bytes();
+    let index_at: u64 = 28;
+    let lsda_at = index_at + (12 * @as(u64, pages + 1));
+    b.u32_(1);   // version
+    b.u32_(28);  // common encodings: none
+    b.u32_(0);
+    b.u32_(28);  // personalities: none
+    b.u32_(0);
+    b.u32_(index_at);  // the first-level index
+    b.u32_(@as(u64, pages + 1));
+    let mut page_at = lsda_at;  // (the LSDA index is empty)
+    for p in 0..pages {
+        let first = p * PAGE_ENTS;
+        let cnt = @min(PAGE_ENTS, n - first);
+        b.u32_(ents[first].off);
+        b.u32_(page_at);
+        b.u32_(lsda_at);
+        page_at += 8 + (8 * @as(u64, cnt));
+    }
+    let last = ents[n - 1];
+    b.u32_(last.off + last.len);
+    b.u32_(0);
+    b.u32_(lsda_at);
+    for p in 0..pages {
+        let first = p * PAGE_ENTS;
+        let cnt = @min(PAGE_ENTS, n - first);
+        b.u32_(2);  // UNWIND_SECOND_LEVEL_REGULAR
+        b.u16_(8);  // the entries' offset in the page
+        b.u16_(@as(u64, cnt));
+        for e in ents[first..first + cnt] {
+            b.u32_(e.off);
+            b.u32_(@as(u64, e.enc));
+        }
+    }
+    return b;
+}

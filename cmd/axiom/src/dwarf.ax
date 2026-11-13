@@ -37,6 +37,7 @@ import "dloc.ax" as dloc;
 import "elf.ax" as elf;
 import "ir.ax" as ir;
 import "std/crypto/md5" as md5;
+import "std/unicode" as uni;
 import "util.ax" as u;
 import "version.ax" as ver;
 
@@ -2061,18 +2062,76 @@ fn named(d: *mut Unit, name: []u8, tag: u64, off: u64) void {
 }
 
 // The hash of the name index (DWARF 5, 6.1.1.4.5: Bernstein's, from 5381,
-// of the name case-folded: its ASCII capitals as small letters; a byte
-// beyond ASCII as it is, which folds a name in Latin, Greek or Cyrillic
-// capitals differently from the specification's Unicode folding, but no
-// name the compilers make has those).
+// of the name case-folded, so that a lookup may ignore case: each code
+// point's simple case folding, in UTF-8; a byte not of a valid sequence as
+// it is).
 pub fn djb_hash(s: []u8) u32 {
     let mut h: u32 = 5381;
-    for c in s {
-        let mut x = c;
-        if (x >= 'A') and (x <= 'Z') {
-            x += 32;
+    let mut i: usize = 0;
+    while i < s.len {
+        let c = s[i];
+        if c < 0x80 {
+            let mut l = c;
+            if (c >= 'A') and (c <= 'Z') {
+                l = c + 32;
+            }
+            h = (h *% 33) +% @as(u32, l);
+            i += 1;
+            continue;
         }
-        h = (h *% 33) +% @as(u32, x);
+        let mut n: usize = 0;
+        let mut cp: u32 = 0;
+        if (c & 0xe0) == 0xc0 {
+            n = 2;
+            cp = @as(u32, c & 0x1f);
+        } else if (c & 0xf0) == 0xe0 {
+            n = 3;
+            cp = @as(u32, c & 0x0f);
+        } else if (c & 0xf8) == 0xf0 {
+            n = 4;
+            cp = @as(u32, c & 0x07);
+        }
+        let mut ok = (n > 0) and ((i + n) <= s.len);
+        if ok {
+            for k in 1..n {
+                if (s[i + k] & 0xc0) != 0x80 {
+                    ok = false;
+                } else {
+                    cp = (cp << 6) | @as(u32, s[i + k] & 0x3f);
+                }
+            }
+        }
+        if not ok {
+            h = (h *% 33) +% @as(u32, c);
+            i += 1;
+            continue;
+        }
+        let f = uni.fold(cp);
+        let mut enc: [4]u8 = [0; 4];
+        let mut m: usize = 0;
+        if f < 0x80 {
+            enc[0] = @truncate(u8, f);
+            m = 1;
+        } else if f < 0x800 {
+            enc[0] = @truncate(u8, 0xc0 | (f >> 6));
+            enc[1] = @truncate(u8, 0x80 | (f & 0x3f));
+            m = 2;
+        } else if f < 0x10000 {
+            enc[0] = @truncate(u8, 0xe0 | (f >> 12));
+            enc[1] = @truncate(u8, 0x80 | ((f >> 6) & 0x3f));
+            enc[2] = @truncate(u8, 0x80 | (f & 0x3f));
+            m = 3;
+        } else {
+            enc[0] = @truncate(u8, 0xf0 | (f >> 18));
+            enc[1] = @truncate(u8, 0x80 | ((f >> 12) & 0x3f));
+            enc[2] = @truncate(u8, 0x80 | ((f >> 6) & 0x3f));
+            enc[3] = @truncate(u8, 0x80 | (f & 0x3f));
+            m = 4;
+        }
+        for k in 0..m {
+            h = (h *% 33) +% @as(u32, enc[k]);
+        }
+        i += n;
     }
     return h;
 }
@@ -2334,15 +2393,7 @@ fn pad_entry(b: *mut bn.Bytes, at: usize) void {
     b.set_u32(at, @as(u64, b.len() - at - 4));
 }
 
-fn cfa_entry_state(d: *Unit) u64 {
-    if d.arch == ARCH_A64 {
-        return cfi_state(0, A64_SP, 0, 0);
-    }
-    return cfi_state(0, X64_RSP, 1, 0);
-}
-
-// The function's FDE: its range, then for each change of state the advance
-// to it and what changed (the CFA rule, registers saved and given back).
+// The function's FDE: its range, then its call frame instructions.
 fn fde(d: *mut Unit, f: *Func) void {
     let p = &mut d.parts[D_FRAME];
     let at = p.b.len();
@@ -2354,9 +2405,23 @@ fn fde(d: *mut Unit, f: *Func) void {
     } else {
         p.b.u64_(f.size);
     }
-    let b = &mut p.b;
-    let ca = code_align(d);
-    let mut cur = cfa_entry_state(d);
+    cfa_program(&mut p.b, d.arch == ARCH_A64, f);
+    pad_entry(&mut p.b, at);
+}
+
+/// The call frame instructions of function f (its cfi states, save list
+/// and instructions of its own) after a CIE's initial ones (the state at
+/// the entry: x86-64 CFA = rsp + 8, the return address at CFA - 8;
+/// AArch64 CFA = sp): for each change of state the advance to it and what
+/// changed (the CFA rule, registers saved and given back). Also the
+/// programs of macOS's __eh_frame (macunwind.ax).
+pub fn cfa_program(b: *mut bn.Bytes, a64: bool, f: *Func) void {
+    let mut ca: u64 = 1;
+    let mut cur = cfi_state(0, X64_RSP, 1, 0);
+    if a64 {
+        ca = 4;
+        cur = cfi_state(0, A64_SP, 0, 0);
+    }
     let mut loc: u64 = 0;
     let mut xi: usize = 0;
     for s in f.cfi {
@@ -2424,7 +2489,6 @@ fn fde(d: *mut Unit, f: *Func) void {
         }
         xi += 1;
     }
-    pad_entry(b, at);
 }
 
 // The advance of an FDE's program from `loc` to code offset `off`.
@@ -2677,6 +2741,11 @@ fn prepend(p: *mut Part, h: *mut Part) void {
     p.* = h.*;
 }
 
+/// Unit.tls_rel of macOS: a thread-local's location is the address of a
+/// descriptor of it (finish_elf, mlink.ax), DW_OP_form_tls_address taking
+/// it as the platform's debugger does (the key the runtime set, the offset).
+pub const TLS_DESC: u32 = 0xffff_ffff;
+
 /// Writes the unit into object `o` as its debug sections (relocations:
 /// abs64 for addresses, abs32 for offsets into the sections), its code
 /// being section `text` (text_size bytes).
@@ -2709,6 +2778,12 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
         ssym[k] = elf.add_sym(o, elf.Sym.{ name: "", sec: secs[k], value: 0, size: 0, bind: elf.B_LOCAL,
                                            ty: elf.T_NOTYPE, hidden: false });
     }
+    // (macOS: each thread-local's descriptor, three words: 0, the key, and
+    // the offset of the variable in the thread's block, which a relocation
+    // to it says)
+    let mut tlvd: i32 = -1;
+    let mut tlvd_sym: u32 = 0;
+    let mut descs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
     for k in 0..NSEC {
         let p = &mut d.parts[k];
         if (p.b.len() == 0) and (k >= D_RNGLISTS) {
@@ -2719,6 +2794,22 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
         for x in p.fx.items() {
             if x.kind == FX_ADDR {
                 s.relocs.push(elf.Rel.{ off: x.off, ty: abs64, sym: x.sym, addend: x.addend });
+            } else if (x.kind == FX_TLS) and (d.tls_rel == TLS_DESC) {
+                if tlvd < 0 {
+                    tlvd = elf.add_sec(o, "axiom_tlvd", elf.S_DATA, 8);
+                    tlvd_sym = elf.add_sym(o, elf.Sym.{ name: "", sec: tlvd, value: 0, size: 0, bind: elf.B_LOCAL,
+                                                        ty: elf.T_NOTYPE, hidden: false });
+                }
+                let key = u.intern(u.f2("%s+%s", u.udec(@as(u64, x.sym)), u.udec(@bit_cast(u64, x.addend))));
+                let mut at = descs.get(key);
+                if at == 0 {
+                    let t = o.secs.get(@int_cast(usize, tlvd));
+                    at = @as(u64, t.data.len()) + 1;
+                    t.data.zeros(24);
+                    t.relocs.push(elf.Rel.{ off: at + 15, ty: abs64, sym: x.sym, addend: x.addend });
+                    descs.put(key, at);
+                }
+                s.relocs.push(elf.Rel.{ off: x.off, ty: abs64, sym: tlvd_sym, addend: @bit_cast(i64, at - 1) });
             } else if x.kind == FX_TLS {
                 s.relocs.push(elf.Rel.{ off: x.off, ty: d.tls_rel, sym: x.sym, addend: x.addend });
             } else {

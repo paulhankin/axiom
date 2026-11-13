@@ -1,0 +1,579 @@
+// =============================================================================
+// dwrebase.ax - the DWARF of an object whose debug sections refer to each
+// other by numbers (Mach-O's convention, macho.ax: an offset into another
+// debug section is that section's offset in the object, with no relocation),
+// made right where nlink.debug_sections has put the object's sections in the
+// linked ones: each such offset is moved by where the section it refers to
+// starts. The structure is DWARF 5's (versions 2 to 5 are read):
+//   .debug_info      each unit's abbreviation offset; in its entries, the
+//                    attributes of the forms that are offsets into another
+//                    section (DW_FORM_strp, DW_FORM_line_strp, DW_FORM_ref_addr,
+//                    and DW_FORM_sec_offset by the attribute: DW_AT_stmt_list
+//                    .debug_line, DW_AT_ranges .debug_rnglists (version 5) or
+//                    .debug_ranges, the location attributes .debug_loclists or
+//                    .debug_loc, DW_AT_str_offsets_base, DW_AT_addr_base,
+//                    DW_AT_rnglists_base, DW_AT_loclists_base, DW_AT_macros
+//                    .debug_macro, DW_AT_macro_info .debug_macinfo)
+//   .debug_line      a version 5 header's DW_FORM_line_strp and DW_FORM_strp
+//                    directory and file names
+//   .debug_aranges   each set's unit offset
+//   .debug_names     each index's units and its names' string offsets
+//   .debug_frame     each FDE's CIE
+//   .debug_str_offsets  each offset (version 5 contributions)
+//   .debug_macro     each unit's line table offset and its DW_FORM_strp
+//                    strings (DW_MACRO_define_strp, DW_MACRO_undef_strp)
+// Offsets within a section (a unit's own references, ranges and location
+// lists' entries, an index's entry pool) need nothing. A unit in the 64-bit
+// format, or an attribute form not known here, ends the walk of that unit
+// (what follows is kept as it is).
+// =============================================================================
+import "bin.ax" as bn;
+import "util.ax" as u;
+
+/// The sections a rebase knows of (indexes into Sec lists).
+pub const S_INFO: usize = 0;
+pub const S_ABBREV: usize = 1;
+pub const S_STR: usize = 2;
+pub const S_LINE_STR: usize = 3;
+pub const S_LINE: usize = 4;
+pub const S_ARANGES: usize = 5;
+pub const S_FRAME: usize = 6;
+pub const S_RNGLISTS: usize = 7;
+pub const S_LOCLISTS: usize = 8;
+pub const S_NAMES: usize = 9;
+pub const S_STR_OFFSETS: usize = 10;
+pub const S_ADDR: usize = 11;
+pub const S_RANGES: usize = 12;
+pub const S_LOC: usize = 13;
+pub const S_MACRO: usize = 14;
+pub const S_MACINFO: usize = 15;
+pub const NSECS: usize = 16;
+
+pub let NAMES: [16][]u8 = [".debug_info", ".debug_abbrev", ".debug_str", ".debug_line_str", ".debug_line",
+                           ".debug_aranges", ".debug_frame", ".debug_rnglists", ".debug_loclists", ".debug_names",
+                           ".debug_str_offsets", ".debug_addr", ".debug_ranges", ".debug_loc", ".debug_macro",
+                           ".debug_macinfo"];
+
+/// The index in NAMES of a section name (-1: not one).
+pub fn index_of(name: []u8) i32 {
+    for k in 0..NAMES.len {
+        if u.str_eq(NAMES[k], name) {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+/// One object's part of a linked section: where it starts and its size
+/// (size 0: the object has none).
+pub struct Part {
+    data: []mut u8,  // the linked section
+    base: u64,
+    size: u64,
+}
+
+// The walk of one object.
+struct W {
+    p: []Part,
+}
+
+fn add32(w: *W, s: usize, at: usize, to: usize) void {
+    let d = w.p[s].data;
+    if (at + 4) > d.len {
+        return;
+    }
+    bn.w32(d, @as(u64, at), (bn.rd32(d, at) + w.p[to].base) & 0xffff_ffff);
+}
+
+fn uleb(d: []u8, at: *mut usize) u64 {
+    let mut r: u64 = 0;
+    let mut sh: u32 = 0;
+    while at.* < d.len {
+        let b = d[at.*];
+        at.* += 1;
+        if sh < 64 {
+            r = r | (@as(u64, b & 0x7f) << sh);
+        }
+        sh += 7;
+        if (b & 0x80) == 0 {
+            break;
+        }
+    }
+    return r;
+}
+
+fn skip_leb(d: []u8, at: *mut usize) void {
+    while (at.* < d.len) and ((d[at.*] & 0x80) != 0) {
+        at.* += 1;
+    }
+    at.* += 1;
+}
+
+/// Rebases one object's parts (indexed as NAMES).
+pub fn rebase(parts: []Part) void {
+    let w = W.{ p: parts };
+    if parts[S_INFO].size > 0 {
+        info(&w);
+    }
+    if parts[S_LINE].size > 0 {
+        line(&w);
+    }
+    if parts[S_ARANGES].size > 0 {
+        aranges(&w);
+    }
+    if parts[S_NAMES].size > 0 {
+        names(&w);
+    }
+    if parts[S_FRAME].size > 0 {
+        frame(&w);
+    }
+    if parts[S_STR_OFFSETS].size > 0 {
+        str_offsets(&w);
+    }
+    if parts[S_MACRO].size > 0 {
+        macro(&w);
+    }
+}
+
+// The section a DW_FORM_sec_offset attribute refers to (-1: none known).
+fn sec_of(attr: u64, version: u64) i32 {
+    if attr == 0x10 {
+        return @int_cast(i32, S_LINE);
+    }
+    if attr == 0x55 {
+        if version >= 5 {
+            return @int_cast(i32, S_RNGLISTS);
+        }
+        return @int_cast(i32, S_RANGES);
+    }
+    // DW_AT_location, string_length, return_addr, data_member_location,
+    // frame_base, segment, static_link, use_location, vtable_elem_location
+    if (attr == 0x02) or (attr == 0x19) or (attr == 0x2a) or (attr == 0x38) or (attr == 0x40) or (attr == 0x46) or
+       (attr == 0x48) or (attr == 0x4a) or (attr == 0x4d) {
+        if version >= 5 {
+            return @int_cast(i32, S_LOCLISTS);
+        }
+        return @int_cast(i32, S_LOC);
+    }
+    if attr == 0x72 {
+        return @int_cast(i32, S_STR_OFFSETS);
+    }
+    if attr == 0x73 {
+        return @int_cast(i32, S_ADDR);
+    }
+    if attr == 0x74 {
+        return @int_cast(i32, S_RNGLISTS);
+    }
+    if attr == 0x8c {
+        return @int_cast(i32, S_LOCLISTS);
+    }
+    if (attr == 0x79) or (attr == 0x2119) {
+        return @int_cast(i32, S_MACRO);
+    }
+    if attr == 0x43 {
+        return @int_cast(i32, S_MACINFO);
+    }
+    return -1;
+}
+
+// An abbreviation: its attributes' (name, form) pairs from `at` in the
+// abbreviation table, and whether it has children.
+struct Abbrev {
+    code: u64,
+    at: usize,
+}
+
+// The abbreviation declarations of the table at `off` of .debug_abbrev: code -> where its attributes start.
+fn abbrevs(w: *W, off: u64, out: *mut u.List.[Abbrev]) void {
+    let d = w.p[S_ABBREV].data;
+    let mut at = @truncate(usize, w.p[S_ABBREV].base + off);
+    let end = @truncate(usize, w.p[S_ABBREV].base + w.p[S_ABBREV].size);
+    while at < end {
+        let code = uleb(d, &mut at);
+        if code == 0 {
+            return;
+        }
+        _ = uleb(d, &mut at);  // the tag
+        let here = at;         // (the children flag, then the attributes)
+        at += 1;
+        loop {
+            let a = uleb(d, &mut at);
+            let f = uleb(d, &mut at);
+            if f == 0x21 {
+                skip_leb(d, &mut at);  // (DW_FORM_implicit_const's value)
+            }
+            if (a == 0) and (f == 0) {
+                break;
+            }
+            if at >= end {
+                return;
+            }
+        }
+        out.push(Abbrev.{ code: code, at: here });
+    }
+}
+
+fn info(w: *W) void {
+    let d = w.p[S_INFO].data;
+    let mut at = @truncate(usize, w.p[S_INFO].base);
+    let end = @truncate(usize, w.p[S_INFO].base + w.p[S_INFO].size);
+    let mut abs = u.List.[Abbrev].empty();
+    while (at + 11) <= end {
+        let len = bn.rd32(d, at);
+        if (len == 0xffff_ffff) or (len < 7) {
+            break;  // (the 64-bit format: not read)
+        }
+        let uend = at + 4 + @truncate(usize, len);
+        if uend > end {
+            break;
+        }
+        let version = bn.rd16(d, at + 4);
+        let mut p = at + 6;
+        let mut asize: u64 = 8;
+        let mut aoff: u64 = 0;
+        if version >= 5 {
+            let ut = d[p];
+            asize = @as(u64, d[p + 1]);
+            aoff = bn.rd32(d, p + 2);
+            add32(w, S_INFO, p + 2, S_ABBREV);
+            p += 6;
+            if (ut == 2) or (ut == 6) {
+                p += 12;
+            } else if (ut == 4) or (ut == 5) {
+                p += 8;
+            }
+        } else {
+            aoff = bn.rd32(d, p);
+            add32(w, S_INFO, p, S_ABBREV);
+            asize = @as(u64, d[p + 4]);
+            p += 5;
+        }
+        abs.clear();
+        abbrevs(w, aoff, &mut abs);
+        dies(w, p, uend, version, asize, abs.items());
+        at = uend;
+    }
+    abs.deinit();
+}
+
+fn find_abbrev(abs: []Abbrev, code: u64) i32 {
+    // (codes are usually 1, 2, ...: try that place first)
+    if (code >= 1) and (code <= @as(u64, abs.len)) and (abs[@truncate(usize, code - 1)].code == code) {
+        return @int_cast(i32, code - 1);
+    }
+    for k in 0..abs.len {
+        if abs[k].code == code {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+// The entries of a unit from `at` to `end`.
+fn dies(w: *W, at0: usize, end: usize, version: u64, asize: u64, abs: []Abbrev) void {
+    let d = w.p[S_INFO].data;
+    let ad = w.p[S_ABBREV].data;
+    let mut at = at0;
+    while at < end {
+        let code = uleb(d, &mut at);
+        if code == 0 {
+            continue;
+        }
+        let k = find_abbrev(abs, code);
+        if k < 0 {
+            return;
+        }
+        let mut q = abs[@int_cast(usize, k)].at + 1;
+        loop {
+            let a = uleb(ad, &mut q);
+            let mut f = uleb(ad, &mut q);
+            if f == 0x21 {
+                skip_leb(ad, &mut q);
+            }
+            if (a == 0) and (f == 0) {
+                break;
+            }
+            while f == 0x16 {
+                f = uleb(d, &mut at);  // DW_FORM_indirect
+            }
+            if not form(w, f, a, version, asize, &mut at) {
+                return;
+            }
+            if at > end {
+                return;
+            }
+        }
+    }
+}
+
+// Steps over (and rebases) one attribute value of form f; false: a form not known.
+fn form(w: *W, f: u64, a: u64, version: u64, asize: u64, at: *mut usize) bool {
+    let d = w.p[S_INFO].data;
+    let p = at.*;
+    if (f == 0x01) or ((f == 0x10) and (version <= 2)) {
+        at.* = p + @truncate(usize, asize);  // addr; a version 2 ref_addr
+    } else if (f == 0x0b) or (f == 0x11) or (f == 0x0c) or (f == 0x25) or (f == 0x29) {
+        at.* = p + 1;  // data1, ref1, flag, strx1, addrx1
+    } else if (f == 0x05) or (f == 0x12) or (f == 0x26) or (f == 0x2a) {
+        at.* = p + 2;
+    } else if (f == 0x27) or (f == 0x2b) {
+        at.* = p + 3;
+    } else if (f == 0x06) or (f == 0x13) or (f == 0x28) or (f == 0x2c) or (f == 0x1c) or (f == 0x1d) {
+        at.* = p + 4;  // data4, ref4, strx4, addrx4, ref_sup4, strp_sup
+    } else if (f == 0x07) or (f == 0x14) or (f == 0x20) or (f == 0x24) {
+        at.* = p + 8;  // data8, ref8, ref_sig8, ref_sup8
+    } else if f == 0x1e {
+        at.* = p + 16;
+    } else if (f == 0x0d) or (f == 0x0f) or (f == 0x15) or (f == 0x1a) or (f == 0x1b) or (f == 0x22) or (f == 0x23) {
+        skip_leb(d, at);  // sdata, udata, ref_udata, strx, addrx, loclistx, rnglistx
+    } else if f == 0x19 {
+        // flag_present: nothing
+    } else if f == 0x0a {
+        at.* = p + 1 + @as(usize, d[p]);
+    } else if f == 0x03 {
+        at.* = p + 2 + @truncate(usize, bn.rd16(d, p));
+    } else if f == 0x04 {
+        at.* = p + 4 + @truncate(usize, bn.rd32(d, p));
+    } else if (f == 0x09) or (f == 0x18) {
+        let n = uleb(d, at);
+        at.* += @truncate(usize, n);
+    } else if f == 0x08 {
+        while (at.* < d.len) and (d[at.*] != 0) {
+            at.* += 1;
+        }
+        at.* += 1;
+    } else if f == 0x0e {
+        add32(w, S_INFO, p, S_STR);
+        at.* = p + 4;
+    } else if f == 0x1f {
+        add32(w, S_INFO, p, S_LINE_STR);
+        at.* = p + 4;
+    } else if f == 0x10 {
+        add32(w, S_INFO, p, S_INFO);
+        at.* = p + 4;
+    } else if f == 0x17 {
+        let s = sec_of(a, version);
+        if s >= 0 {
+            add32(w, S_INFO, p, @int_cast(usize, s));
+        }
+        at.* = p + 4;
+    } else if f == 0x21 {
+        // implicit_const: in the abbreviation
+    } else {
+        return false;
+    }
+    return true;
+}
+
+fn line(w: *W) void {
+    let d = w.p[S_LINE].data;
+    let mut at = @truncate(usize, w.p[S_LINE].base);
+    let end = @truncate(usize, w.p[S_LINE].base + w.p[S_LINE].size);
+    while (at + 10) <= end {
+        let len = bn.rd32(d, at);
+        if (len == 0xffff_ffff) or (len < 6) {
+            return;
+        }
+        let uend = at + 4 + @truncate(usize, len);
+        if uend > end {
+            return;
+        }
+        if bn.rd16(d, at + 4) >= 5 {
+            // address size, selector size, header length, minimum
+            // instruction length, maximum operations, default is_stmt,
+            // line base, line range, opcode base, the standard opcodes' lengths
+            let mut p = at + 18;
+            let opbase = @as(usize, d[at + 17]);
+            if opbase > 0 {
+                p += opbase - 1;
+            }
+            for _pass in @as(u32, 0)..2 {
+                // the directories', then the files' formats and entries
+                let nf = @as(usize, d[p]);
+                p += 1;
+                let fmt = p;
+                for _k in 0..nf {
+                    skip_leb(d, &mut p);
+                    skip_leb(d, &mut p);
+                }
+                let n = uleb(d, &mut p);
+                for _e in @as(u64, 0)..n {
+                    let mut q = fmt;
+                    for _k in 0..nf {
+                        _ = uleb(d, &mut q);
+                        let f = uleb(d, &mut q);
+                        if f == 0x1f {
+                            add32(w, S_LINE, p, S_LINE_STR);
+                            p += 4;
+                        } else if f == 0x0e {
+                            add32(w, S_LINE, p, S_STR);
+                            p += 4;
+                        } else if f == 0x08 {
+                            while (p < uend) and (d[p] != 0) {
+                                p += 1;
+                            }
+                            p += 1;
+                        } else if (f == 0x0f) or (f == 0x0d) {
+                            skip_leb(d, &mut p);
+                        } else if f == 0x0b {
+                            p += 1;
+                        } else if f == 0x05 {
+                            p += 2;
+                        } else if f == 0x06 {
+                            p += 4;
+                        } else if f == 0x07 {
+                            p += 8;
+                        } else if f == 0x1e {
+                            p += 16;
+                        } else if f == 0x09 {
+                            let m = uleb(d, &mut p);
+                            p += @truncate(usize, m);
+                        } else {
+                            break;  // (a form not known: the rest of the header as it is)
+                        }
+                        if p > uend {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        at = uend;
+    }
+}
+
+fn aranges(w: *W) void {
+    let d = w.p[S_ARANGES].data;
+    let mut at = @truncate(usize, w.p[S_ARANGES].base);
+    let end = @truncate(usize, w.p[S_ARANGES].base + w.p[S_ARANGES].size);
+    while (at + 10) <= end {
+        let len = bn.rd32(d, at);
+        if (len == 0xffff_ffff) or (len < 6) {
+            return;
+        }
+        add32(w, S_ARANGES, at + 6, S_INFO);
+        at += 4 + @truncate(usize, len);
+    }
+}
+
+fn names(w: *W) void {
+    let d = w.p[S_NAMES].data;
+    let mut at = @truncate(usize, w.p[S_NAMES].base);
+    let end = @truncate(usize, w.p[S_NAMES].base + w.p[S_NAMES].size);
+    while (at + 36) <= end {
+        let len = bn.rd32(d, at);
+        if (len == 0xffff_ffff) or (len < 32) {
+            return;
+        }
+        let cus = @truncate(usize, bn.rd32(d, at + 8));
+        let ltus = @truncate(usize, bn.rd32(d, at + 12));
+        let ftus = @truncate(usize, bn.rd32(d, at + 16));
+        let buckets = @truncate(usize, bn.rd32(d, at + 20));
+        let nnames = @truncate(usize, bn.rd32(d, at + 24));
+        let aug = @truncate(usize, bn.rd32(d, at + 32));
+        let mut p = at + 36 + ((aug + 3) & ~@as(usize, 3));
+        for _k in 0..(cus + ltus) {
+            add32(w, S_NAMES, p, S_INFO);
+            p += 4;
+        }
+        p += 8 * ftus;
+        p += 4 * buckets;
+        if buckets > 0 {
+            p += 4 * nnames;
+        }
+        for _k in 0..nnames {
+            add32(w, S_NAMES, p, S_STR);
+            p += 4;
+        }
+        at += 4 + @truncate(usize, len);
+    }
+}
+
+fn frame(w: *W) void {
+    let d = w.p[S_FRAME].data;
+    let mut at = @truncate(usize, w.p[S_FRAME].base);
+    let end = @truncate(usize, w.p[S_FRAME].base + w.p[S_FRAME].size);
+    while (at + 8) <= end {
+        let len = bn.rd32(d, at);
+        if (len == 0xffff_ffff) or (len < 4) {
+            return;
+        }
+        if bn.rd32(d, at + 4) != 0xffff_ffff {
+            add32(w, S_FRAME, at + 4, S_FRAME);  // (an FDE: its CIE)
+        }
+        at += 4 + @truncate(usize, len);
+    }
+}
+
+fn str_offsets(w: *W) void {
+    let d = w.p[S_STR_OFFSETS].data;
+    let mut at = @truncate(usize, w.p[S_STR_OFFSETS].base);
+    let end = @truncate(usize, w.p[S_STR_OFFSETS].base + w.p[S_STR_OFFSETS].size);
+    while (at + 8) <= end {
+        let len = bn.rd32(d, at);
+        if (len == 0xffff_ffff) or (len < 4) {
+            return;
+        }
+        let uend = at + 4 + @truncate(usize, len);
+        let mut p = at + 8;
+        while (p + 4) <= @min(uend, end) {
+            add32(w, S_STR_OFFSETS, p, S_STR);
+            p += 4;
+        }
+        at = uend;
+    }
+}
+
+// .debug_macro (DWARF 5, 6.3): each unit's header (version, flags: bit 0
+// the 64-bit format, bit 1 a line table offset, bit 2 an opcode table),
+// then its entries to a 0.
+fn macro(w: *W) void {
+    let d = w.p[S_MACRO].data;
+    let mut at = @truncate(usize, w.p[S_MACRO].base);
+    let end = @truncate(usize, w.p[S_MACRO].base + w.p[S_MACRO].size);
+    while (at + 3) <= end {
+        let flags = d[at + 2];
+        if ((flags & 1) != 0) or ((flags & 4) != 0) {
+            return;  // (the 64-bit format, or opcodes of its own: not read)
+        }
+        at += 3;
+        if (flags & 2) != 0 {
+            add32(w, S_MACRO, at, S_LINE);
+            at += 4;
+        }
+        loop {
+            if at >= end {
+                return;
+            }
+            let op = d[at];
+            at += 1;
+            if op == 0 {
+                break;
+            }
+            if (op == 1) or (op == 2) {
+                // define, undef: a line, a string
+                skip_leb(d, &mut at);
+                while (at < end) and (d[at] != 0) {
+                    at += 1;
+                }
+                at += 1;
+            } else if (op == 5) or (op == 6) {
+                // define_strp, undef_strp: a line, a string offset
+                skip_leb(d, &mut at);
+                add32(w, S_MACRO, at, S_STR);
+                at += 4;
+            } else if op == 3 {
+                // start_file: a line, a file
+                skip_leb(d, &mut at);
+                skip_leb(d, &mut at);
+            } else if op == 4 {
+                // end_file
+            } else if op == 7 {
+                add32(w, S_MACRO, at, S_MACRO);  // import: another unit of .debug_macro
+                at += 4;
+            } else {
+                return;
+            }
+        }
+    }
+}

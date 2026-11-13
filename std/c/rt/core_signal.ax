@@ -21,7 +21,7 @@
 // Windows: SIGINT is the console's Ctrl-C and Ctrl-Break, through a console
 // control handler (which the system calls on a thread of its own). SIGSEGV,
 // SIGFPE and SIGILL are the processor's exceptions in the program's own
-// code (x64; see win_fault), while a handler is set: else they stay the
+// code (x64 and ARM64; see win_fault), while a handler is set: else they stay the
 // crash reporter's (std/internal/runtime/windows.ax). raise sends nothing
 // through the system (-1: the C side calls the handler at once).
 // WebAssembly: none (-1).
@@ -42,7 +42,8 @@ extern "C" {
     fn GetModuleHandleW(name: *u16) usize;
     fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize) void;
     fn RtlRestoreContext(context: *mut u8, rec: *mut u8) void;
-    // (cmd/axiom/src/plink.ax: a frame on rbp, rsp aligned, call r8)
+    // (cmd/axiom/src/plink.ax: x64, a frame on rbp, rsp aligned, call r8;
+    // ARM64, its unwind information the CONTEXT at sp, blr x2)
     fn __axc_sig_trampoline() void;
 }
 
@@ -133,6 +134,9 @@ fn win_fault(ep: *mut usize) i32 {
     if (sig == 0) or (fault_action[@as(usize, @bit_cast(u32, sig))] != 2) or (at < image_lo) or (at >= image_hi) {
         return 0;  // EXCEPTION_CONTINUE_SEARCH
     }
+    if @target_arch("aarch64") {
+        return arm64_fault(ctx, sig);
+    }
     let r = @slice_from_ptr(@ptr_from_int(*mut u64, @int_from_ptr(ctx)), 0x4d0 / 8);
     let rsp = @truncate(usize, r[0x98 / 8]);
     let mut low: usize = 0;
@@ -152,15 +156,40 @@ fn win_fault(ep: *mut usize) i32 {
     return -1;                                              // EXCEPTION_CONTINUE_EXECUTION
 }
 
+// ARM64: the same, but the copy of the context is on the faulting thread's
+// stack, just below its stack pointer (ARM64 Windows keeps nothing below
+// sp), and __axc_sig_trampoline is entered with sp at it: its unwind
+// information is the code that says the CONTEXT at sp holds the caller's
+// registers (MSFT_OP_CONTEXT), so that the system's walks go on in the
+// faulting function with every register as it was there (x30 too, whatever
+// the function). The ARM64 CONTEXT: x0-x28 from 8, sp at 256, pc at 264,
+// 0x390 bytes. (Built and checked for its structure only: nothing here runs
+// Windows on ARM64.)
+fn arm64_fault(ctx: *mut u8, sig: i32) i32 {
+    let r = @slice_from_ptr(@ptr_from_int(*mut u64, @int_from_ptr(ctx)), 0x390 / 8);
+    let sp = @truncate(usize, r[256 / 8]);
+    let mut low: usize = 0;
+    let mut high: usize = 0;
+    GetCurrentThreadStackLimits(&mut low, &mut high);
+    if sp < low + 32768 {
+        return 0;
+    }
+    let copy = (sp - 0x390) & ~@as(usize, 15);
+    @mem_copy(@slice_from_ptr(@ptr_from_int(*mut u8, copy), 0x390), @slice_from_ptr(ctx, 0x390));
+    r[256 / 8] = @as(u64, copy);
+    r[264 / 8] = trampoline();
+    r[8 / 8] = @as(u64, @bit_cast(u32, sig));             // x0
+    r[16 / 8] = @as(u64, copy);                           // x1
+    r[24 / 8] = @as(u64, @bit_cast(usize, win_deliver));  // x2
+    return -1;                                            // EXCEPTION_CONTINUE_EXECUTION
+}
+
 // the context of the fault being delivered on this thread (16-aligned within)
 threadlocal let mut fault_ctx: [0x4e0]u8 = [0; 0x4e0];
 
-// __axc_sig_trampoline's address (plink.ax defines it for x86-64 only)
+// __axc_sig_trampoline's address (plink.ax)
 fn trampoline() u64 {
-    if @target_arch("x86_64") {
-        return @as(u64, @bit_cast(usize, __axc_sig_trampoline));
-    }
-    return 0;
+    return @as(u64, @bit_cast(usize, __axc_sig_trampoline));
 }
 
 fn win_deliver(sig: u64, context: *mut u8) void {
@@ -169,9 +198,6 @@ fn win_deliver(sig: u64, context: *mut u8) void {
 }
 
 fn win_fault_signal(sig: i32, action: i32) i32 {
-    if not @target_arch("x86_64") {
-        return -1;  // (ARM64: the crash reporter's)
-    }
     fault_action[@as(usize, @bit_cast(u32, sig))] = action;
     if not fault_set {
         let base = GetModuleHandleW(@ptr_from_int(*u16, 0));

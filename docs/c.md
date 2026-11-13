@@ -421,8 +421,10 @@ selection; what the objects refer to and do not define comes from the libraries:
   `__mod_init_func` and `__mod_term_func` (run by the start-up as the initialization
   arrays are), and the platform's thread-local variables (`__thread_vars`,
   `__thread_data`, `__thread_bss`: the executable gets the sections and dyld makes the
-  blocks). `__compact_unwind` and `__eh_frame` are not kept (the executable has no
-  unwind tables of other compilers' code), nor is a universal object read (give the slice).
+  blocks); `__compact_unwind` and `__eh_frame` go into the executable's unwind tables
+  (a function's FDE found by the address it covers, which the platform's assembler
+  leaves without a relocation; personality functions and LSDAs, C++'s exceptions, are
+  not carried: the table has none). A universal object is not read (give the slice).
 - **Dynamic libraries**: a `.dylib` given (or found by `-l` in the `-L` directories; of a
   universal file, the target's slice) is read for its install name and exports, and the
   program is bound to it by its ordinal (two-level namespace). A library named with `-l`
@@ -668,9 +670,6 @@ duplicates" is an error (`duplicate symbol`).
   as `hidden` (hidden, internal) or default (protected, default: a shared library binds
   its references to its own definitions, as protected ones are), to Mach-O objects as
   private externs, and a hidden symbol is not a DLL's or a shared library's export.
-- The DWARF of Mach-O objects given to a link is not carried into the dSYM correctly when
-  several objects have some (their offsets into each other's debug sections are numbers,
-  the platform's convention, which the linker would have to rebase by parsing them).
 - `.eh_frame` is kept without `.eh_frame_hdr` and `PT_GNU_EH_FRAME`.
 
 ## The C library
@@ -1008,10 +1007,12 @@ modified between `setjmp` and `longjmp` have their values after the jump (C17
 7.13.2.1p3), as do volatile ones that were. Its address cannot be taken (`C3301`): a
 call through a pointer would not be known to return twice.
 
-- `longjmp` unwinds nothing on Linux, macOS and Windows ARM64: the restored stack
-  pointer drops the frames. On Windows x64 the hosted library's `longjmp` has the
-  system unwind the frames in between first (`RtlUnwindEx` to the `setjmp` caller's
-  frame, with `STATUS_LONGJUMP`; `jmp_buf` is the system's `_JUMP_BUFFER`), so that the
+- `longjmp` unwinds nothing on Linux and macOS: the restored stack pointer drops the
+  frames. On Windows (x64 and ARM64) the hosted library's `longjmp` has the system
+  unwind the frames in between first (`RtlUnwindEx` to the `setjmp` caller's frame,
+  with `STATUS_LONGJUMP`; `jmp_buf` is the system's `_JUMP_BUFFER` of each; on ARM64 the
+  caller's frame is the one `RtlVirtualUnwind` gives at the point `setjmp` returned
+  to), so that the
   termination handlers of system frames in between run (a callback a DLL called, left
   by `longjmp`); the registers are then restored from `jmp_buf`
   (`std/c/rt/core_jump.ax`). A freestanding program's `longjmp` restores them at once,
@@ -1051,7 +1052,7 @@ with `signal` stays set while it runs, and its signal waits until it returns
   `SIGILL` replaces the runtime's crash report while it is set; `SIG_DFL` puts back
   the action the program started with (the crash report).
 - Windows: `SIGINT` is the console's Ctrl-C and Ctrl-Break (a console control
-  handler, which the system calls on a thread of its own). On x64, `SIGSEGV`,
+  handler, which the system calls on a thread of its own). On x64 and ARM64, `SIGSEGV`,
   `SIGFPE` and `SIGILL` handlers get the processor's exceptions in the program's own
   code (an access violation, an integer division fault or an unmasked floating-point
   exception, an illegal instruction): a vectored exception handler redirects the
@@ -1059,7 +1060,12 @@ with `signal` stays set while it runs, and its signal waits until it returns
   information lets the system's walks, and `longjmp`, go on through the faulting
   function); a handler that returns runs the instruction again. A stack overflow, a
   fault in a DLL, and any fault while the signal's action is `SIG_DFL` or `SIG_IGN`
-  are the crash reporter's. On ARM64 the faults stay the crash reporter's. The others
+  are the crash reporter's. (On ARM64 the trampoline is entered with the stack pointer
+  at a copy of the faulting thread's `CONTEXT`, which its unwind code
+  `MSFT_OP_CONTEXT` names, so the walks have every register of the faulting function.
+  The ARM64 forms of `longjmp`'s unwinding and of the fault delivery are built and
+  checked for their structure (`pe.mjs` decodes the unwind codes), but nothing here runs
+  Windows on ARM64: they have not been executed.) The others
   arrive only from `raise`, which calls the handler at once. The default action of a raised signal ends the process with status 3
   for `SIGABRT` (as `abort`'s) and 128 + the signal's number for the others.
 - WebAssembly: `raise` alone, as on Windows.
@@ -2481,8 +2487,11 @@ either, where the debug information itself is in the `.dSYM`).
   width in bits, pointers, qualifiers, arrays, structures and unions with their
   bit-fields, enumerations and their constants, function types, typedefs); each
   function's result type, parameters and local variables; objects of static storage
-  duration, thread-local ones included (by their offset in the thread's TLS block;
-  not on macOS). A variable, parameter, typedef or object declared with a typedef name
+  duration, thread-local ones included (by their offset in the thread's TLS block; on
+  macOS, where the thread's block is the value of a pthread key, through a descriptor
+  of the platform's form, three words: 0, the key, which the runtime writes at
+  start-up, and the offset, which the platform's debugger reads for
+  `DW_OP_form_tls_address`: not tried in that debugger, which needs a Mac). A variable, parameter, typedef or object declared with a typedef name
   has the typedef as its type (or one derived from it: `T *p`).
 - **Scopes**: a block that declares something is a lexical block, with the code of its
   statements (in pieces at `-O2`, `.debug_rnglists`), its variables, its block-scope
@@ -2554,7 +2563,7 @@ Where it goes, per target:
 | Target | |
 |---|---|
 | `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`, `.debug_names` (an index of the unit's subprograms, static variables, named types and enumerators), and when needed `.debug_rnglists` and `.debug_loclists`. |
-| `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable's instructions are those without `-g`, but for the addresses of the data its frame table's line rows move. It has no unwind information (`__unwind_info`, `__eh_frame`): the platform's ABI keeps a frame record (x29, x30; on x86-64 rbp and the return address) in every function that calls, and the crash reporter and `backtrace(3)` walk those records, so stack traces through our frames need none (a leaf without a frame has its caller in x30, or on x86-64 at the stack pointer). Only an unwinder that needs the tables (C++ exceptions through our frames, which do not happen) would. |
+| `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable's instructions are those without `-g`, but for the addresses of the data its frame table's line rows move. The DWARF of each object given to the link (this compiler's, or the platform's compilers' with DWARF 2 to 5) is carried in at its place: Mach-O objects refer from one debug section into another by offsets without relocations, which the linker moves by where each object's sections land (`cmd/axiom/src/dwrebase.ax`). The executable has unwind tables, with or without `-g` (`cmd/axiom/src/macunwind.ax`): `__unwind_info` gives every function a compact encoding (arm64: no frame, or the frame record with the callee-saved pairs below it, which the code lays out as the encoding has them; x86-64: no frame, or rbp's frame with up to five pushed registers), or one that names its entry in `__eh_frame` (DWARF's call frame information, exact at every instruction) where the encoding cannot say the frame (vector registers saved whole), where the stack pointer moves after the prologue, where a sibling call's jump is before the function's end, where code runs before the frame is set up, and for assembly procedures with `.cfi_` rules. Mach-O objects carry `__compact_unwind` and `__eh_frame` in the form the platform's assembler writes, and the linker merges those of the platform's compilers' objects too (a function an object gives no entry has an entry without information). `macho.mjs` decodes the tables of every macOS executable the suite builds; nothing here has run an unwinder over them. |
 | `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`, a module per object, every function's procedure and public symbol. With `-g` also, in CodeView form (`codeview.ax`, from the same description of the program as DWARF), the types (TPI, with its hash stream: a forward reference to a structure is found by its name), ids (IPI: the functions' ids, where each structure is defined), each function's type, frame, lexical blocks (a block in several pieces of code is a block per piece) and variables, and the static objects (`S_GDATA32`, `S_LDATA32`, thread-locals as `S_GTHREAD32` at their offset in the template, which starts `.data`) and typedefs and tags (`S_UDT`) at file and block scope. At `-O0` a local is at its offset from the frame pointer (`S_REGREL32`), a parameter an `S_LOCAL` located from the call frame's register at each instruction; in optimized code a variable is an `S_LOCAL` with the ranges where it is all in a register, in a frame slot or in memory at an address held in a register, or an `S_CONSTANT` where it is one constant throughout. Not described ("optimized out" there, never a wrong value): a structure taken apart into registers (the system's symbol handler reads CodeView's subfield ranges as the whole variable), a value computed from a register (a register plus a constant, an address of a frame object or a datum), the value at an address held in a frame slot (at `-O0`: a variable length array, a parameter passed by reference); a variable length array's bound. Typedefs are `S_UDT` names (what is declared with one has the type it names); `_Atomic T` is `T`; a base type CodeView has no primitive for (decimal floating types, a bit-precise integer narrower than its storage) is a structure of its name and size holding its bytes; an Axiom union a structure of its tag and each payload at its offset. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame), right at every instruction: a large frame's stack probe does not move `rsp`, and a function with sibling calls uses the frame-register form with an entry of its own for each jump (the code after it chained), so that the unwinder is right whether or not it takes a jump out of a function for the end of an epilogue. The suite decodes every unwind record as the system does before each Windows program runs (`pe.mjs`) and single-steps a walk through every kind of frame (`c/mix/win_walk`). |
 | `aarch64-windows` | As `x86_64-windows`; the function table's ARM64 records describe every function with a frame (on Windows every function that calls has one). |
 | `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section, a compilation unit per unit compiled (each object carries its own, which the linker merges; a function it did not keep is at the tombstone address -1). With `-g` the types and variables too: at `-O0` each variable in its frame slot (`DW_OP_fbreg`), the frame base being the local that holds the frame's address (`DW_OP_WASM_location`); optimized code's variables have no location, and a thread-local none (each thread's instance is elsewhere). No call frame information, which WebAssembly has no use for. |
