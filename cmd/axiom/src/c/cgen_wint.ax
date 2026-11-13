@@ -1080,7 +1080,103 @@ struct BfUnit {
     v: *mut ir.Value,
 }
 
+// The largest piece of 4, 2 or 1 bytes that fits in c bytes.
+fn piece(c: u64) u64 {
+    if c >= 4 {
+        return 4;
+    }
+    if c >= 2 {
+        return 2;
+    }
+    return 1;
+}
+
+/// The bytes [8k, 8k+c) of the run at p (c from 1 to 8) as the low bytes of
+/// a 64-bit integer, read in pieces of 8, 4, 2 and 1 bytes from the lowest
+/// address (alignment 1; each a volatile access if `volatile`).
+pub fn run_limb(p: *mut ir.Value, k: usize, c: u64, volatile: bool) *mut ir.Value {
+    let base = at(p, k);
+    if c == 8 {
+        let v = ir.load(cg.B, i64t(), base);
+        v.align = 1;
+        if volatile {
+            v.flags = v.flags | ir.F_VOLATILE;
+        }
+        return v;
+    }
+    let mut r = c64(0);
+    let mut o: u64 = 0;
+    while o < c {
+        let n = piece(c - o);
+        let v = ir.load(cg.B, ir.t_int(@truncate(i32, n * 8)), ir.ptradd(cg.B, base, cg.usz(o)));
+        v.align = 1;
+        if volatile {
+            v.flags = v.flags | ir.F_VOLATILE;
+        }
+        let mut x = ir.zext(cg.B, v, i64t());
+        if o > 0 {
+            x = ir.binop(cg.B, ir.OP_SHL, x, c64(o * 8));
+        }
+        r = ir.or_(cg.B, r, x);
+        o += n;
+    }
+    return r;
+}
+
+/// Writes the low c bytes of 64-bit x at bytes [8k, 8k+c) of the run at p,
+/// in the pieces run_limb reads.
+pub fn run_set_limb(p: *mut ir.Value, k: usize, c: u64, x: *mut ir.Value, volatile: bool) void {
+    let base = at(p, k);
+    if c == 8 {
+        let s = ir.store(cg.B, x, base);
+        s.align = 1;
+        if volatile {
+            s.flags = s.flags | ir.F_VOLATILE;
+        }
+        return;
+    }
+    let mut o: u64 = 0;
+    while o < c {
+        let n = piece(c - o);
+        let mut y = x;
+        if o > 0 {
+            y = ir.binop(cg.B, ir.OP_LSHR, y, c64(o * 8));
+        }
+        let s = ir.store(cg.B, ir.trunc(cg.B, y, ir.t_int(@truncate(i32, n * 8))), ir.ptradd(cg.B, base, cg.usz(o)));
+        s.align = 1;
+        if volatile {
+            s.flags = s.flags | ir.F_VOLATILE;
+        }
+        o += n;
+    }
+}
+
+// The bytes of limb j of a run of nb bytes.
+fn run_count(nb: u64, j: usize) u64 {
+    let lo = @as(u64, j) * 8;
+    if lo >= nb {
+        return 0;
+    }
+    return @min(nb - lo, 8);
+}
+
 fn bf_unit(m: *cty.Member, p: *mut ir.Value, volatile: bool) BfUnit {
+    if m.unit_bits != 0 {
+        // (a packed structure's: the run of the bytes it spans, csema_bits.is_run)
+        let nb = @as(u64, @bit_cast(u32, m.unit_bits)) / 8;
+        let n = @truncate(usize, (nb + 7) / 8);
+        let nl = @max(n, 2);
+        let ut = cty.bitint(@int_cast(i32, nl * 64), false);
+        let r = temp(ut);
+        for j in 0..nl {
+            if j < n {
+                set_limb(r, j, run_limb(p, j, run_count(nb, j), volatile));
+            } else {
+                set_limb(r, j, c64(0));
+            }
+        }
+        return BfUnit.{ k: 0, n: n, ut: ut, v: r };
+    }
     let off = @as(u64, @bit_cast(u32, m.bit_off));
     let w = @as(u64, @bit_cast(u32, m.bit_width));
     let k = @truncate(usize, off / 64);
@@ -1142,6 +1238,10 @@ pub fn bf_store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.
     let nv = arith(ct.P_PIPE, un.ut, arith(ct.P_AMP, un.ut, un.v, constant(un.ut, keep)), placed);
     for j in 0..un.n {
         let x = limb(nv, j);
+        if m.unit_bits != 0 {
+            run_set_limb(p, j, run_count(@as(u64, @bit_cast(u32, m.unit_bits)) / 8, j), x, volatile);
+            continue;
+        }
         let st = ir.store(cg.B, x, at(p, un.k + j));
         st.align = 8;
         if volatile {

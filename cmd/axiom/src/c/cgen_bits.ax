@@ -10,6 +10,7 @@
 // cgen_wint.ax's (bf_load, bf_store: the 64-bit limbs that hold it).
 // =============================================================================
 import "../ir.ax" as ir;
+import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_wint.ax" as cgw;
@@ -76,6 +77,9 @@ pub fn load(m: *cty.Member, t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
     if cty.is_wint(t) {
         return cgw.bf_load(m, t, p);
     }
+    if cb.is_run(m) {
+        return run_load(m, t, p);
+    }
     let u_ = unit_load(m, t, p);
     let ut = u_.ty;
     let ub = ut.bits;
@@ -108,6 +112,10 @@ pub fn store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Val
     if cty.is_wint(t) {
         return cgw.bf_store(m, t, v, p);
     }
+    if cb.is_run(m) {
+        run_store(m, t, v, p);
+        return stored_value(m, t, v);
+    }
     let ut = unit_ty(m, t);
     let ub = ut.bits;
     let w = m.bit_width;
@@ -130,6 +138,12 @@ pub fn store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Val
     if (t.quals & cty.Q_VOLATILE) != 0 {
         s.flags = s.flags | ir.F_VOLATILE;
     }
+    return stored_value(m, t, v);
+}
+
+// The value bit-field m (of type t) has after v was stored in it, as a value of t.
+fn stored_value(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value) *mut ir.Value {
+    let w = m.bit_width;
     let tt = cg.lty(t);
     let tb = tt.bits;
     if w >= tb {
@@ -141,4 +155,84 @@ pub fn store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Val
         return ir.binop(cg.B, ir.OP_ASHR, ir.binop(cg.B, ir.OP_SHL, v, sh), sh);
     }
     return ir.and_(cg.B, v, ir.cint(tt, mask(w)));
+}
+
+// -----------------------------------------------------------------------------
+// Runs: a packed structure's bit-field that no unit of 1, 2, 4 or 8 bytes in
+// it holds (csema_bits.is_run), reached through the bytes it spans and no
+// others (so that no other member's bytes are read or written), at most 9
+// for a type of at most 64 bits: a low limb of 8 bytes, and the high one's
+// byte; each read and written in pieces of 8, 4, 2 and 1 bytes from the
+// lowest address (cgen_wint.run_limb). A volatile bit-field's access is
+// those pieces' volatile accesses, in that order (a store reads them all,
+// then writes them).
+// -----------------------------------------------------------------------------
+
+struct Run {
+    lo: *mut ir.Value,
+    hi: *mut ir.Value,  // (nil: the run has at most 8 bytes)
+    nb: u64,
+}
+
+fn read_run(m: *cty.Member, t: *cty.CType, p: *mut ir.Value) Run {
+    let vol = (t.quals & cty.Q_VOLATILE) != 0;
+    let nb = @as(u64, @bit_cast(u32, m.unit_bits)) / 8;
+    let lo = cgw.run_limb(p, 0, @min(nb, 8), vol);
+    let mut hi = ir.vnil();
+    if nb > 8 {
+        hi = cgw.run_limb(p, 1, nb - 8, vol);
+    }
+    return Run.{ lo: lo, hi: hi, nb: nb };
+}
+
+fn i64c(v: u64) *mut ir.Value {
+    return ir.cint(ir.t_int(64), v);
+}
+
+fn run_load(m: *cty.Member, t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
+    let r = read_run(m, t, p);
+    let off = @as(u64, @bit_cast(u32, m.bit_off));
+    let w = @as(u64, @bit_cast(u32, m.bit_width));
+    let mut v = r.lo;
+    if off > 0 {
+        v = ir.binop(cg.B, ir.OP_LSHR, v, i64c(off));
+        if u.notnil(r.hi) {
+            v = ir.or_(cg.B, v, ir.binop(cg.B, ir.OP_SHL, r.hi, i64c(64 - off)));
+        }
+    }
+    let tt = cg.lty(t);
+    if w < 64 {
+        if signed_field(t) {
+            let sh = i64c(64 - w);
+            v = ir.binop(cg.B, ir.OP_ASHR, ir.binop(cg.B, ir.OP_SHL, v, sh), sh);
+            return resize(v, tt, true);
+        }
+        v = ir.and_(cg.B, v, i64c(mask(m.bit_width)));
+    }
+    return resize(v, tt, false);
+}
+
+fn run_store(m: *cty.Member, t: *mut cty.CType, v: *mut ir.Value, p: *mut ir.Value) void {
+    let vol = (t.quals & cty.Q_VOLATILE) != 0;
+    let r = read_run(m, t, p);
+    let off = @as(u32, @bit_cast(u32, m.bit_off));
+    let w = m.bit_width;
+    let bits = ir.and_(cg.B, resize(v, ir.t_int(64), false), i64c(mask(w)));
+    let mut placed = bits;
+    if off > 0 {
+        placed = ir.binop(cg.B, ir.OP_SHL, bits, i64c(@as(u64, off)));
+    }
+    let mut keep = ~(mask(w) << off);
+    if r.nb < 8 {
+        keep = keep & mask(@bit_cast(i32, @truncate(u32, r.nb * 8)));
+    }
+    let lo = ir.or_(cg.B, ir.and_(cg.B, r.lo, i64c(keep)), placed);
+    cgw.run_set_limb(p, 0, @min(r.nb, 8), lo, vol);
+    if u.notnil(r.hi) {
+        // (the bits above the low limb's: off > 0, as the field crosses it)
+        let hb = ir.binop(cg.B, ir.OP_LSHR, bits, i64c(64 - @as(u64, off)));
+        let hkeep = ~(mask(w) >> (64 - off)) & mask(@bit_cast(i32, @truncate(u32, (r.nb - 8) * 8)));
+        let hi = ir.or_(cg.B, ir.and_(cg.B, r.hi, i64c(hkeep)), hb);
+        cgw.run_set_limb(p, 1, r.nb - 8, hi, vol);
+    }
 }

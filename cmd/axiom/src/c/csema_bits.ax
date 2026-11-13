@@ -110,8 +110,8 @@ fn placed_align(ti: *cty.TagInfo, m: *cty.Member) u64 {
 /// (System V, AAPCS64; Windows keeps whole units, aligned so: layout_ms).
 /// Such a bit-field is reached
 /// through the smallest unit of 1, 2, 4 or 8 bytes that holds it and lies in
-/// the structure (unit_bits), loaded with alignment 1; one that has none is
-/// C3901.
+/// the structure (unit_bits), loaded with alignment 1; one that has none,
+/// or of a type wider than 64 bits, through the bytes it spans (is_run).
 pub fn layout(ti: *mut cty.TagInfo) void {
     if cty.bitfield_rule() == co.BF_MS {
         layout_ms(ti);
@@ -255,7 +255,10 @@ fn finish(ti: *mut cty.TagInfo, is_union: bool, pos: u64, al0: u64, size0: u64, 
 
 // The units of the bit-fields placed at any bit (layout): the smallest of
 // 1, 2, 4 or 8 bytes from the byte of their first bit, moved back to end in
-// the structure if need be.
+// the structure if need be. One that has none (it spans more than 8 bytes,
+// or the structure is smaller than the unit), and one of a type wider than
+// 64 bits, is reached through the bytes it spans and no others: a run
+// (is_run), of any length, read and written in pieces (cgen_bits.ax).
 fn packed_units(ti: *mut cty.TagInfo) void {
     for m in ti.members.items() {
         if not m.is_bitfield or (m.place_align == 0) or (m.bit_width == 0) {
@@ -269,17 +272,15 @@ fn packed_units(ti: *mut cty.TagInfo) void {
         while ub < n {
             ub *= 2;
         }
-        // (no unit wider than 8 bytes: such a bit-field spans more than one)
-        if ub > 8 {
-            cs_not_supported(m, ub);
+        if (ub > 8) or (ub > ti.size) or cty.is_wint(m.ty) {
+            // (a run: its own bytes)
+            m.offset = b0;
+            m.bit_off = @bit_cast(i32, @truncate(u32, bit - (b0 * 8)));
+            m.unit_bits = @bit_cast(i32, @truncate(u32, n * 8));
             continue;
         }
         let mut off = b0;
         if off + ub > ti.size {
-            if ub > ti.size {
-                cs_not_supported(m, ub);
-                continue;
-            }
             off = ti.size - ub;
         }
         m.offset = off;
@@ -288,14 +289,11 @@ fn packed_units(ti: *mut cty.TagInfo) void {
     }
 }
 
-/// Reports a bit-field of a packed structure that no unit of 1, 2, 4 or 8
-/// bytes within the structure holds (set by csema_decl.ax: it imports the
-/// diagnostics).
-pub let mut cs_not_supported: fn(*cty.Member, u64) void = no_report;
-
-fn no_report(m: *cty.Member, n: u64) void {
-    _ = m;
-    _ = n;
+/// Is bit-field m reached through a run of the bytes it spans
+/// (packed_units), not through a unit of its type or of 1, 2, 4 or 8 bytes?
+pub fn is_run(m: *cty.Member) bool {
+    let b = m.unit_bits;
+    return (b != 0) and (cty.is_wint(m.ty) or ((b != 8) and (b != 16) and (b != 32) and (b != 64)));
 }
 
 // The Windows x64 layout (see the header): bit-fields in runs of units of

@@ -102,7 +102,8 @@ struct PP {
     list_mode: bool,  // reading a list (an argument, a directive's line): it ends at its end
     conds: u.List.[Cond],
     out: u.List.[lx.PTok],
-    in_if: bool,      // expanding an #if expression: defined and __has_include are operators
+    in_if: bool,  // expanding an #if expression: defined and __has_include are operators
+    asserts: u.SymMap.[*mut u.List.[[]u8]],  // a GNU dialect's assertions: each predicate's answers (answer_key)
     collecting: i32,  // reading a macro invocation's arguments
     pend_bol: bool,   // a macro at the start of a line was replaced by nothing
     pend_space: bool,
@@ -1352,7 +1353,197 @@ fn if_tokens(P: *mut PP, line: []lx.PTok, sp: u.Span) []lx.PTok {
 
 // The value of an #if or #elif line.
 fn if_value(P: *mut PP, line: []lx.PTok, sp: u.Span) bool {
+    if P.o.gnu {
+        return ce.eval(if_tokens(P, assertion_tests(P, line), sp), P.o, sp);
+    }
     return ce.eval(if_tokens(P, line, sp), P.o, sp);
+}
+
+// -----------------------------------------------------------------------------
+// Assertions (a GNU dialect): `#assert pred(answer)` gives predicate pred the
+// answer, `#unassert pred(answer)` takes it back (`#unassert pred`: every
+// answer), and in an #if expression `#pred(answer)` is 1 if pred has that
+// answer, `#pred` 1 if it has any, else 0 (before macro replacement: the
+// predicate and the answer are not expanded). An answer is its tokens, compared
+// one by one, whatever whitespace is between them. The predicates cpu and
+// machine have the target's architecture (x86_64, aarch64, wasm32) and, on
+// Linux, system has linux, unix and posix.
+// -----------------------------------------------------------------------------
+
+// The tokens of an answer as one string: their spellings, one space between.
+fn answer_key(ts: []lx.PTok) []u8 {
+    let mut b = u.Buf.init();
+    for k in 0..ts.len {
+        if k > 0 {
+            b.c(' ');
+        }
+        b.s(ts[k].text);
+    }
+    return u.intern(b.done());
+}
+
+// A predicate and its answer (if it has one) at ts[i..]: next, the index
+// after them; ok false after an error (reported).
+struct Pred {
+    ok: bool,
+    name: []u8,
+    answer: []u8,
+    has_answer: bool,
+    next: usize,
+}
+
+fn parse_pred(ts: []lx.PTok, i0: usize, sp: u.Span, what: []u8) Pred {
+    let mut r = Pred.{ ok: false, name: "", answer: "", has_answer: false, next: i0 };
+    let mut i = i0;
+    if (i >= ts.len) or (ts[i].kind != lx.PK_IDENT) {
+        _ = dg.err(sp, "C1087", u.f1("%s needs a predicate (an identifier)", what));
+        return r;
+    }
+    r.name = ts[i].name;
+    i += 1;
+    if (i < ts.len) and lx.is_punct(&ts[i], ct.P_LPAREN) {
+        let start = i + 1;
+        let mut depth: i32 = 1;
+        let mut j = start;
+        while j < ts.len {
+            if lx.is_punct(&ts[j], ct.P_LPAREN) {
+                depth += 1;
+            } else if lx.is_punct(&ts[j], ct.P_RPAREN) {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if j >= ts.len {
+            _ = dg.err(ts[i].span, "C1087", u.f2("missing ')' after the answer of '%s' in %s", r.name, what));
+            return r;
+        }
+        if j == start {
+            _ = dg.err(ts[i].span, "C1087", u.f2("the answer of '%s' in %s is empty", r.name, what));
+            return r;
+        }
+        r.answer = answer_key(ts[start..j]);
+        r.has_answer = true;
+        i = j + 1;
+    }
+    r.ok = true;
+    r.next = i;
+    return r;
+}
+
+fn answers_of(P: *mut PP, name0: []u8) *mut u.List.[[]u8] {
+    let name = u.intern(name0);  // (the map's keys are interned strings)
+    let mut l = P.asserts.get(name);
+    if u.isnil(l) {
+        l = u.new.[u.List.[[]u8]]();
+        P.asserts.put(name, l);
+    }
+    return l;
+}
+
+fn do_assert(P: *mut PP, ts: []lx.PTok, sp: u.Span) void {
+    let p = parse_pred(ts, 0, sp, "#assert");
+    if not p.ok {
+        return;
+    }
+    if not p.has_answer {
+        _ = dg.err(sp, "C1087", u.f1("#assert needs an answer: #assert %s(answer)", p.name));
+        return;
+    }
+    extra(ts, p.next, "assert");
+    add_answer(P, p.name, p.answer);
+}
+
+fn add_answer(P: *mut PP, name: []u8, answer: []u8) void {
+    let l = answers_of(P, name);
+    for a in l.items() {
+        if u.str_eq(a, answer) {
+            return;
+        }
+    }
+    l.push(answer);
+}
+
+fn do_unassert(P: *mut PP, ts: []lx.PTok, sp: u.Span) void {
+    let p = parse_pred(ts, 0, sp, "#unassert");
+    if not p.ok {
+        return;
+    }
+    extra(ts, p.next, "unassert");
+    let l = answers_of(P, p.name);
+    if not p.has_answer {
+        l.clear();
+        return;
+    }
+    let mut k: usize = 0;
+    while k < l.len {
+        if u.str_eq(l.get(k), p.answer) {
+            l.set(k, l.get(l.len - 1));
+            _ = l.pop();
+            continue;
+        }
+        k += 1;
+    }
+}
+
+// line (an #if's) with each assertion test (`#pred(answer)`, `#pred`) its value.
+fn assertion_tests(P: *mut PP, line: []lx.PTok) []lx.PTok {
+    let mut has = false;
+    for t in line {
+        if lx.is_punct(&t, lx.PP_HASH) {
+            has = true;
+        }
+    }
+    if not has {
+        return line;
+    }
+    let mut out = u.List.[lx.PTok].empty();
+    let mut i: usize = 0;
+    while i < line.len {
+        let t = line[i];
+        if lx.is_punct(&t, lx.PP_HASH) and ((i + 1) < line.len) and (line[i + 1].kind == lx.PK_IDENT) {
+            let p = parse_pred(line, i + 1, t.span, "an assertion test");
+            if not p.ok {
+                out.push(number_tok(0, t.span));
+                i = line.len;
+                continue;
+            }
+            let l = P.asserts.get(u.intern(p.name));
+            let mut v: i64 = 0;
+            if u.notnil(l) {
+                for a in l.items() {
+                    if not p.has_answer or u.str_eq(a, p.answer) {
+                        v = 1;
+                    }
+                }
+            }
+            out.push(number_tok(v, t.span));
+            i = p.next;
+            continue;
+        }
+        out.push(t);
+        i += 1;
+    }
+    return out.items();
+}
+
+// The target's assertions (cpu, machine, system: a GNU dialect).
+fn target_assertions(P: *mut PP) void {
+    let mut arch = "wasm32";
+    if tg.g_arch == tg.ARCH_X64 {
+        arch = "x86_64";
+    } else if tg.g_arch == tg.ARCH_A64 {
+        arch = "aarch64";
+    }
+    add_answer(P, "cpu", arch);
+    add_answer(P, "machine", arch);
+    if not tg.is_wasm() and (tg.g_os == tg.OS_LINUX) {
+        add_answer(P, "system", "linux");
+        add_answer(P, "system", "unix");
+        add_answer(P, "system", "posix");
+    }
 }
 
 // The identifier of #ifdef, #ifndef, #elifdef and #elifndef: whether it
@@ -2668,6 +2859,10 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
         _ = dg.err(sp, "C1040", u.cat2("#error ", spelling(ts)));
     } else if u.str_eq(name, "warning") and ((std >= co.C23) or P.o.gnu) {
         _ = dg.warning(sp, "C4103", u.cat2("#warning ", spelling(ts)));
+    } else if u.str_eq(name, "assert") and P.o.gnu {
+        do_assert(P, ts, sp);
+    } else if u.str_eq(name, "unassert") and P.o.gnu {
+        do_unassert(P, ts, sp);
     } else if u.str_eq(name, "ident") and P.o.gnu {
         // (a GNU dialect's #ident "text": the text is not kept)
         if (ts.len != 1) or (ts[0].kind != lx.PK_STRING) {
@@ -2834,6 +3029,19 @@ fn predefined_text(P: *PP) []u8 {
         b.s("#define __AXIOM_GNU__ 1\n");
         // (__int128 and unsigned __int128: ctypes.ax)
         b.s("#define __AXIOM_INT128__ 1\n");
+        // (__bf16, bfloat16, and the characteristics of its format, in
+        // <float.h>'s terms: 5.2.4.2.2; FLT_EVAL_METHOD's 0 holds for it,
+        // each operation rounded to it: cgen_half.ax)
+        b.s("#define __AXIOM_BF16__ 1\n#define __BFLT16_MANT_DIG__ 8\n#define __BFLT16_DIG__ 2\n");
+        b.s("#define __BFLT16_DECIMAL_DIG__ 4\n#define __BFLT16_MIN_EXP__ (-125)\n");
+        b.s("#define __BFLT16_MIN_10_EXP__ (-37)\n#define __BFLT16_MAX_EXP__ 128\n#define __BFLT16_MAX_10_EXP__ 38\n");
+        b.s("#define __BFLT16_MAX__ ((__bf16)3.38953138925153547590470800371487867e+38F)\n");
+        b.s("#define __BFLT16_NORM_MAX__ __BFLT16_MAX__\n");
+        b.s("#define __BFLT16_MIN__ ((__bf16)1.17549435082228750796873653722224568e-38F)\n");
+        b.s("#define __BFLT16_EPSILON__ ((__bf16)7.81250000000000000000000000000000000e-3F)\n");
+        b.s("#define __BFLT16_DENORM_MIN__ ((__bf16)9.18354961579912115600575419704879436e-41F)\n");
+        b.s("#define __BFLT16_HAS_DENORM__ 1\n#define __BFLT16_HAS_INFINITY__ 1\n#define __BFLT16_HAS_QUIET_NAN__ 1\n");
+        b.s("#define __BFLT16_IS_IEC_60559__ 0\n");
         // (the memory orders of the __atomic builtins)
         b.s("#define __ATOMIC_RELAXED 0\n#define __ATOMIC_CONSUME 1\n#define __ATOMIC_ACQUIRE 2\n");
         b.s("#define __ATOMIC_RELEASE 3\n#define __ATOMIC_ACQ_REL 4\n#define __ATOMIC_SEQ_CST 5\n");
@@ -2959,7 +3167,7 @@ fn protect_all(P: *mut PP) void {
 // starting with `#` is a comment)?
 fn known_directive(name: []u8) bool {
     let ds = ["define", "undef", "include", "include_next", "import", "line", "error", "warning", "ident", "pragma",
-              "embed", "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif"];
+              "embed", "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif", "assert", "unassert"];
     for d in ds {
         if u.str_eq(name, d) {
             return true;
@@ -3053,6 +3261,11 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     P.inject = u.nil_slice.[lx.PTok]();
     lx.gnu = o.gnu;
     ct.g_no_ext_float = o.system_lib;
+    P.asserts = u.SymMap.[*mut u.List.[[]u8]].{ keys: u.nil.[usize](), vals: u.nil.[*mut u.List.[[]u8]](), cap: 0,
+                                                len: 0 };
+    if o.gnu {
+        target_assertions(P);
+    }
     add_builtin(P, "__LINE__", B_LINE);
     add_builtin(P, "__FILE__", B_FILE);
     // (before C99 _Pragma is a reserved identifier: an operator there is reported)

@@ -486,7 +486,7 @@ fn is_type_kw(id: i32) bool {
            (id == ct.K_BOOL) or (id == ct.K_COMPLEX) or (id == ct.K_IMAGINARY) or (id == ct.K_DECIMAL32) or
            (id == ct.K_DECIMAL64) or (id == ct.K_DECIMAL128) or (id == ct.K_DECIMAL64X) or
            (id == ct.K_BUILTIN_VA_LIST) or (id == ct.K_INT64) or (id == ct.K_INT128) or
-           ((id >= ct.K_FLOAT128) and (id <= ct.K_FLOAT64X)) or (id == ct.K_AUTO_TYPE);
+           ((id >= ct.K_FLOAT128) and (id <= ct.K_FLOAT64X)) or (id == ct.K_AUTO_TYPE) or (id == ct.K_BF16);
 }
 
 fn is_qual_kw(id: i32) bool {
@@ -725,7 +725,8 @@ fn parse_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
 // specifiers among it, where both appertain to the same thing: a
 // declaration's entities, a statement, a label, an enumerator, a tag.
 fn parse_attrs_g(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
-    while at_attr(P) or at_kw(P, ct.K_ATTRIBUTE) {
+    // (a __declspec is left to the declaration specifiers it begins: parse_declspec)
+    while at_attr(P) or (at_kw(P, ct.K_ATTRIBUTE) and not u.str_eq(cur(P).text, "__declspec")) {
         if at_attr(P) {
             parse_attr_spec(P, out);
         } else {
@@ -738,7 +739,17 @@ fn parse_attrs_g(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
 // are: each attribute (a name, maybe a keyword, and its arguments) into
 // `out` with the prefix "gnu"; an empty one is none.
 fn parse_gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
+    parse_gnu_attrs_ds(P, out, u.nil.[cast.DeclSpec]());
+}
+
+// parse_gnu_attrs among declaration specifiers ds (nil: elsewhere), where
+// `__declspec(thread)` is a storage-class specifier.
+fn parse_gnu_attrs_ds(P: *mut Parser, out: *mut u.List.[*mut cast.Attr], ds: *mut cast.DeclSpec) void {
     while at_kw(P, ct.K_ATTRIBUTE) {
+        if u.str_eq(cur(P).text, "__declspec") {
+            parse_declspec(P, out, ds);
+            continue;
+        }
         // (the compiler's headers' __axiom_attribute__, in every mode: prefix __axiom)
         let pre = u.pick(u.str_eq(advance(P).text, "__axiom_attribute__"), "__axiom", "gnu");
         if not expect_p(P, ct.P_LPAREN) {
@@ -778,6 +789,78 @@ fn parse_gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
         if not expect_p(P, ct.P_RPAREN) or not expect_p(P, ct.P_RPAREN) {
             skip_to_rparen(P);
         }
+    }
+}
+
+// `__declspec ( extended-decl-modifiers )`: the Windows spelling of
+// attributes (a GNU dialect's, on every target), each a name
+// with its arguments, separated by spaces (or commas), as the GNU attributes
+// that do what it says:
+//   align(n) aligned(n); allocate("s"), code_seg("s") section("s");
+//   deprecated, deprecated("text"); naked; noinline; noreturn; nothrow;
+//   restrict (of a function: its result is no other pointer's) malloc;
+//   selectany (a definition other units may make too) weak; thread (among
+//   declaration specifiers: elsewhere C2143) the storage-class specifier
+//   _Thread_local;
+//   dllexport, dllimport and noalias change nothing (a DLL exports its
+//   definitions of default visibility, and objects defined in another
+//   module are imported whatever their declarations say: docs/c.md);
+// any other name is kept as it is, which semantic analysis warns of as an
+// unknown attribute (C4052).
+fn parse_declspec(P: *mut Parser, out: *mut u.List.[*mut cast.Attr], ds: *mut cast.DeclSpec) void {
+    _ = advance(P);
+    if not expect_p(P, ct.P_LPAREN) {
+        return;
+    }
+    loop {
+        if at_p(P, ct.P_RPAREN) or at_eof(P) {
+            break;
+        }
+        if accept_p(P, ct.P_COMMA) {
+            continue;
+        }
+        if not attr_word(cur(P)) {
+            syntax(P, "a __declspec modifier");
+            break;
+        }
+        let w = advance(P);
+        let a = u.new.[cast.Attr]();
+        a.span = w.span;
+        a.prefix = "gnu";
+        let n = w.text;
+        a.name = n;
+        if u.str_eq(n, "align") {
+            a.name = "aligned";
+        } else if u.str_eq(n, "allocate") or u.str_eq(n, "code_seg") {
+            a.name = "section";
+        } else if u.str_eq(n, "restrict") {
+            a.name = "malloc";
+        } else if u.str_eq(n, "selectany") {
+            a.name = "weak";
+        }
+        if gnu_expr_args(a.name) and at_p(P, ct.P_LPAREN) {
+            gnu_exprs(P, a);
+        } else {
+            attr_args(P, a);
+        }
+        a.span = span_from(P, a.span);
+        if u.str_eq(n, "thread") {
+            if u.isnil(ds) {
+                error_at(a.span, "C2143",
+                         "'__declspec(thread)' is a storage-class specifier: only among a declaration's specifiers");
+            } else {
+                _ = add_spec(ds, cast.SpecKind.STORAGE, ct.K_THREAD_LOCAL, a.span);
+                ds.storage |= storage_bit(ct.K_THREAD_LOCAL);
+            }
+            continue;
+        }
+        if u.str_eq(n, "dllexport") or u.str_eq(n, "dllimport") or u.str_eq(n, "noalias") {
+            continue;
+        }
+        out.push(a);
+    }
+    if not expect_p(P, ct.P_RPAREN) {
+        skip_to_rparen(P);
     }
 }
 
@@ -1089,7 +1172,7 @@ fn parse_specs(P: *mut Parser, ctx: i32) *mut cast.DeclSpec {
             break;
         }
         if at_kw(P, ct.K_ATTRIBUTE) {
-            parse_gnu_attrs(P, &mut ds.gattrs);
+            parse_gnu_attrs_ds(P, &mut ds.gattrs, ds);
             continue;
         }
         if at_kw(P, ct.K_EXTENSION) {
@@ -1232,6 +1315,10 @@ fn parse_tag(P: *mut Parser, kw: i32) *mut cast.TagSpec {
     tg.span = start;
     tg.name = "";
     parse_attrs_g(P, &mut tg.attrs);
+    while at_kw(P, ct.K_ATTRIBUTE) {
+        parse_declspec(P, &mut tg.attrs, u.nil.[cast.DeclSpec]());  // (`struct __declspec(align(16)) S`)
+        parse_attrs_g(P, &mut tg.attrs);
+    }
     if cur(P).kind == ct.T_IDENT {
         let t = advance(P);
         tg.name = t.text;

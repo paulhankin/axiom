@@ -103,6 +103,7 @@ accepted as if the mode allowed it (so that one use gives one message).
 | `C1084` | An `#embed` parameter that no standard has. |
 | `C1085` | An invalid `#line`: a line number that is not a positive decimal number or is out of range, or a file name that is not a string literal. |
 | `C1086` | A use of an identifier that `#pragma GCC poison` poisoned. |
+| `C1087` | A malformed assertion (a GNU dialect): `#assert` without a predicate or an answer, `#unassert` without a predicate, an empty answer or one without its `)`, in a directive or an `#if` expression's `#pred(answer)`. |
 
 ## C2xxx: syntax
 
@@ -149,6 +150,7 @@ names the feature and the standard that has it (or removed it).
 | `C2140` | A storage-class specifier in a compound literal (C23). |
 | `C2141` | A static assertion without a message (C23). |
 | `C2142` | An identifier list (a K&R parameter list), removed in C23. |
+| `C2143` | `__declspec(thread)` (a GNU dialect) elsewhere than among a declaration's specifiers (after `struct`, `union` or `enum`). |
 
 ## C3xxx: constraints and semantics
 
@@ -191,6 +193,7 @@ names the feature and the standard that has it (or removed it).
 | `C3221` | An inline definition that defines a modifiable object with static storage duration or refers to an identifier with internal linkage (6.7.4p3). |
 | `C3222` | The address of an object declared `register` taken, or a `register` array used as a pointer. |
 | `C3230` | A decimal floating operand (`_Decimal32`, `_Decimal64`, `_Decimal128`, `_Decimal64x`) with a binary floating (standard or interchange: `_Float32` ...), complex or imaginary one in an operation that converts both to a common type (C23 6.3.1.8p1: the arithmetic, relational, equality and conditional operators, compound assignment, `<math.h>`'s comparison macros, `<tgmath.h>`'s macros; and a narrowing macro of `<tgmath.h>` with an argument of the other radix than its prefix's, H.13p5). |
+| `C3231` | A `__bf16` operand (a GNU dialect) with a `_Float16` one, real or complex, in an operation that needs their common type: neither's values hold the other's (C23 6.3.1.8p1). |
 
 ### Expressions and initializers
 
@@ -247,7 +250,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
 | `C3300` | A call of `setjmp` (`<setjmp.h>`, or `__builtin_setjmp`, `__builtin_longjmp`) or a non-local `goto` (from a nested function), in a program for a WebAssembly target without its exception-handling extension (`--features=+exception-handling`), which it needs to return to a frame. Reported by `build`. |
 | `C3301` | The address of `setjmp`'s function (`__axc_setjmp`) taken: it can only be called, so that the compiler knows the function calling it. Reported by `build`. |
-| `C3901` | A feature that this implementation does not support: in a GNU dialect constraints it does not know (on WebAssembly a machine constraint of another target), an explicit register variable on WebAssembly, a packed bit-field no unit in its structure holds. |
+| `C3901` | A feature that this implementation does not support: in a GNU dialect constraints it does not know (on WebAssembly a machine constraint of another target), an explicit register variable on WebAssembly. |
 
 ### The GNU dialects
 

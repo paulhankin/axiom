@@ -39,3 +39,16 @@
 - `goto *` and `&&label` where variable length arrays or objects with cleanups are in
   scope: the jump frees the arrays and calls the cleanups of the scopes it leaves, and
   traps when it would jump into such a scope; it was the error `C3901` before.
+- A bit-field of a packed structure that no unit of 1, 2, 4 or 8 bytes holds (one that
+  spans 9 bytes, an `__int128` or `_BitInt` one across 8-byte boundaries, one in a
+  structure smaller than its unit) is reached through the bytes it spans; it was the
+  error `C3901`. Packed bit-fields wider than 64 bits no longer read or write the bytes
+  after them.
+- `__bf16` in the GNU dialects: bfloat16, with conversions rounded once from every
+  type, arithmetic in float rounded after each operation, the platforms' ABI on x86-64 and
+  AArch64, and `__BFLT16_*__` characteristic macros.
+- `#assert`, `#unassert` and `#if #pred(answer)` in the GNU dialects, with the target's
+  `cpu`, `machine` and (on Linux) `system` predicates.
+- `__declspec(...)` in the GNU dialects, on every target: `align`, `thread`, `selectany`,
+  `noinline`, `noreturn`, `naked`, `deprecated`, `restrict`, `allocate` ... as the GNU
+  attributes that do the same; `dllexport` and `dllimport` are accepted.
