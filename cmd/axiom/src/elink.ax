@@ -365,10 +365,16 @@ fn is_tls_got(ty: u32, dynamic: bool) bool {
         return (ty == elf.R_X86_64_GOTTPOFF) or
                (dynamic and ((ty == elf.R_X86_64_TLSGD) or (ty == elf.R_X86_64_GOTPC32_TLSDESC)));
     }
+    // (AArch64 also the large model's initial-exec movz/movk of the slot's
+    // offset from the GOT, and of a shared library's variable the
+    // descriptor's movz/movk, ldr literal and adr, relaxed to initial exec)
     return (ty == elf.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21) or (ty == elf.R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC) or
+           (ty == elf.R_AARCH64_TLSIE_MOVW_GOTTPREL_G1) or (ty == elf.R_AARCH64_TLSIE_MOVW_GOTTPREL_G0_NC) or
            (dynamic and
             ((ty == elf.R_AARCH64_TLSDESC_ADR_PAGE21) or (ty == elf.R_AARCH64_TLSDESC_LD64_LO12) or
-             (ty == elf.R_AARCH64_TLSGD_ADR_PAGE21) or (ty == elf.R_AARCH64_TLSGD_ADD_LO12_NC)));
+             (ty == elf.R_AARCH64_TLSGD_ADR_PAGE21) or (ty == elf.R_AARCH64_TLSGD_ADD_LO12_NC) or
+             (ty == elf.R_AARCH64_TLSDESC_OFF_G1) or (ty == elf.R_AARCH64_TLSDESC_OFF_G0_NC) or
+             (ty == elf.R_AARCH64_TLSDESC_LD_PREL19) or (ty == elf.R_AARCH64_TLSDESC_ADR_PREL21)));
 }
 
 // The parts of a TLS descriptor sequence that are rewritten whatever the
@@ -377,7 +383,8 @@ fn is_tls_aux(ty: u32) bool {
     if is_x64() {
         return ty == elf.R_X86_64_TLSDESC_CALL;
     }
-    return (ty == elf.R_AARCH64_TLSDESC_ADD_LO12) or (ty == elf.R_AARCH64_TLSDESC_CALL);
+    return (ty == elf.R_AARCH64_TLSDESC_ADD_LO12) or (ty == elf.R_AARCH64_TLSDESC_CALL) or
+           (ty == elf.R_AARCH64_TLSDESC_LDR) or (ty == elf.R_AARCH64_TLSDESC_ADD);
 }
 
 // Thread-local references that need the variable in the executable (the
@@ -387,8 +394,10 @@ fn is_tls_local(ty: u32) bool {
         return (ty == elf.R_X86_64_TPOFF32) or (ty == elf.R_X86_64_TPOFF64) or (ty == elf.R_X86_64_TLSLD) or
                (ty == elf.R_X86_64_DTPOFF32);
     }
+    // (and the local-dynamic model's module, :tlsldm:, which is the executable's block)
     return ((ty >= elf.R_AARCH64_TLSLE_MOVW_TPREL_G2) and (ty <= elf.R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC)) or
-           (ty == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12) or (ty == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC);
+           (ty == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12) or (ty == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC) or
+           ((ty >= elf.R_AARCH64_TLSLD_ADR_PREL21) and (ty <= elf.R_AARCH64_TLSLD_ADD_LO12_NC));
 }
 
 // The calls to __tls_get_addr of the general- and local-dynamic sequences
@@ -398,13 +407,17 @@ fn is_tls_local(ty: u32) bool {
 // __tls_get_addr@plt` (16 bytes), LD `lea x@tlsld(%rip), %rdi; call
 // __tls_get_addr@plt` (12 bytes).
 // AArch64's traditional general-dynamic sequence likewise: `adrp x0,
-// :tlsgd:x; add x0, x0, :tlsgd_lo12:x; bl __tls_get_addr; nop`.
+// :tlsgd:x; add x0, x0, :tlsgd_lo12:x; bl __tls_get_addr; nop`, and the
+// local-dynamic one's `adrp x0, :tlsldm:x; add x0, x0, :tlsldm_lo12_nc:x;
+// bl __tls_get_addr; nop` (its module: also `adr x0, :tlsldm:x`).
 fn prepare_tls(o: *mut elf.Obj) void {
     if o.machine == elf.EM_AARCH64 {
         for k in 0..o.secs.len {
             let rs = o.secs.get(k).relocs.items();
             for i in 0..rs.len {
-                if (rs[i].ty != elf.R_AARCH64_TLSGD_ADD_LO12_NC) or (i + 1 >= rs.len) {
+                let t0 = rs[i].ty;
+                if ((t0 != elf.R_AARCH64_TLSGD_ADD_LO12_NC) and (t0 != elf.R_AARCH64_TLSLD_ADD_LO12_NC) and
+                    (t0 != elf.R_AARCH64_TLSLD_ADR_PREL21)) or (i + 1 >= rs.len) {
                     continue;
                 }
                 let n = rs[i + 1];
@@ -892,7 +905,102 @@ fn a64_apply(b: []mut u8, oi: usize, r: elf.Rel, p: u64, fo: u64, sa: u64, dynam
         } else {
             bn.w32(b, fo, 0xf280_0000 | ((uv & 0xffff) << 5));
         }
-    } else if (t == elf.R_AARCH64_TLSDESC_ADD_LO12) or (t == elf.R_AARCH64_TLSDESC_CALL) {
+    } else if (t == elf.R_AARCH64_TLSIE_MOVW_GOTTPREL_G1) or (t == elf.R_AARCH64_TLSIE_MOVW_GOTTPREL_G0_NC) {
+        // the large model's initial exec: `movz xd, #:gottprel_g1:v, lsl #16;
+        // movk xd, #:gottprel_g0_nc:v; ldr xd, [xgot, xd]`, the slot's offset
+        // from the GOT (_GLOBAL_OFFSET_TABLE_), G(GTPREL(S+A)) - GOT
+        let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+        let v = ga - got_addr;
+        if t == elf.R_AARCH64_TLSIE_MOVW_GOTTPREL_G1 {
+            if v > 0xffff_ffff {
+                nl.err("relocation out of range (gottprel_g1)");
+            }
+            bn.w32(b, fo, (ins(b, fo) & 0xffe0_001f) | (((v >> 16) & 0xffff) << 5));
+        } else {
+            bn.w32(b, fo, (ins(b, fo) & 0xffe0_001f) | ((v & 0xffff) << 5));
+        }
+    } else if (t == elf.R_AARCH64_TLSDESC_OFF_G1) or (t == elf.R_AARCH64_TLSDESC_OFF_G0_NC) {
+        // the large model's descriptor: `movz x0, #:tlsdesc_off_g1:v, lsl #16;
+        // movk x0, #:tlsdesc_off_g0_nc:v; ldr x1, [xg, x0] (.tlsdescldr); add x0,
+        // xg, x0 (.tlsdescadd); blr x1 (.tlsdesccall)`: the movz/movk give the
+        // thread-pointer offset (local exec) or, for a shared library's
+        // variable, the initial-exec slot's offset from the GOT, which the ldr
+        // then loads into x0 (TLSDESC_LDR, below)
+        let mut v: u64 = 0;
+        if dynamic {
+            let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+            v = ga - got_addr;
+        } else {
+            let x = tp_offset(sa);
+            if (x < 0) or (x > 0xffff_ffff) {
+                nl.err("TLS offset out of range");
+            }
+            v = @bit_cast(u64, x);
+        }
+        if t == elf.R_AARCH64_TLSDESC_OFF_G1 {
+            bn.w32(b, fo, (ins(b, fo) & 0xffe0_001f) | (((v >> 16) & 0xffff) << 5));
+        } else {
+            bn.w32(b, fo, (ins(b, fo) & 0xffe0_001f) | ((v & 0xffff) << 5));
+        }
+    } else if t == elf.R_AARCH64_TLSDESC_LDR {
+        // `ldr x1, [xg, x0]`: `ldr x0, [xg, x0]` (initial exec) or a nop
+        if dynamic {
+            bn.w32(b, fo, ins(b, fo) & ~@as(u64, 0x1f));
+        } else {
+            bn.w32(b, fo, 0xd503_201f);
+        }
+    } else if (t == elf.R_AARCH64_TLSDESC_LD_PREL19) or (t == elf.R_AARCH64_TLSDESC_ADR_PREL21) {
+        // the tiny model's descriptor: `ldr x1, :tlsdesc:v; adr x0, :tlsdesc:v;
+        // blr x1`: local exec `movz x0, #:tprel_g1:v, lsl #16; movk x0,
+        // #:tprel_g0_nc:v`, initial exec `ldr x0, slot; nop`
+        if dynamic {
+            if t == elf.R_AARCH64_TLSDESC_LD_PREL19 {
+                let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+                let d = @bit_cast(i64, ga -% p);
+                if (d < -0x10_0000) or (d >= 0x10_0000) {
+                    nl.err("relocation out of range (19-bit)");
+                }
+                bn.w32(b, fo, 0x5800_0000 | (((@bit_cast(u64, d) >> 2) & 0x7_ffff) << 5));
+            } else {
+                bn.w32(b, fo, 0xd503_201f);
+            }
+            return;
+        }
+        let x = tp_offset(sa);
+        if (x < 0) or (x > 0xffff_ffff) {
+            nl.err("TLS offset out of range");
+        }
+        let uv = @bit_cast(u64, x);
+        if t == elf.R_AARCH64_TLSDESC_LD_PREL19 {
+            bn.w32(b, fo, 0xd2a0_0000 | (((uv >> 16) & 0xffff) << 5));
+        } else {
+            bn.w32(b, fo, 0xf280_0000 | ((uv & 0xffff) << 5));
+        }
+    } else if (t >= elf.R_AARCH64_TLSLD_ADR_PREL21) and (t <= elf.R_AARCH64_TLSLD_ADD_LO12_NC) {
+        // the local-dynamic model's module, an executable's own block: its
+        // start is the thread pointer plus the TCB's 16 bytes (aligned as the
+        // block), so `adrp x0, :tlsldm:x; add x0, x0, :tlsldm_lo12_nc:x; bl
+        // __tls_get_addr` becomes `mrs x0, tpidr_el0; add x0, x0, #off; nop`
+        // (and `adr x0, :tlsldm:x; bl __tls_get_addr` the same in two)
+        let off = @bit_cast(u64, tp_offset(tls_addr));
+        let mut add = 0x9100_0000 | ((off & 0xfff) << 10);
+        if off >= 0x1000 {
+            if ((off & 0xfff) != 0) or (off >= 0x100_0000) {
+                nl.err("TLS block alignment out of range for the local-dynamic sequence");
+            }
+            add = 0x9140_0000 | (((off >> 12) & 0xfff) << 10);
+        }
+        if t == elf.R_AARCH64_TLSLD_ADR_PAGE21 {
+            bn.w32(b, fo, 0xd53b_d040);
+        } else if t == elf.R_AARCH64_TLSLD_ADD_LO12_NC {
+            bn.w32(b, fo, add);
+            bn.w32(b, fo + 4, 0xd503_201f);
+        } else {
+            bn.w32(b, fo, 0xd53b_d040);
+            bn.w32(b, fo + 4, add);
+        }
+    } else if (t == elf.R_AARCH64_TLSDESC_ADD_LO12) or (t == elf.R_AARCH64_TLSDESC_CALL) or
+              (t == elf.R_AARCH64_TLSDESC_ADD) {
         bn.w32(b, fo, 0xd503_201f);  // nop
     } else if (t == elf.R_AARCH64_TLSGD_ADR_PAGE21) or (t == elf.R_AARCH64_TLSGD_ADD_LO12_NC) {
         // the traditional general-dynamic sequence (prepare_tls): to

@@ -6,8 +6,9 @@
 // generation (cgen_asm.ax). The labels of `asm goto` are checked as gotos
 // (csema_stmt.ax). Diagnostics: C3096 for a statement the GNU dialect's
 // rules reject (a constraint, an operand, a clobber, a template reference),
-// C3901 for what this implementation does not support (inline assembly on
-// WebAssembly, constraints it does not know).
+// C3901 for what this implementation does not support (constraints it does
+// not know). On WebAssembly an operand is a local, a constant or a symbol
+// (asm/wasm.ax), and the template's names are looked up here (wasm_lookup).
 //
 // The rules (the GNU dialect's extended asm): an output's constraint begins with '='
 // or '+' and its operand is a modifiable lvalue; '+' makes it an input too
@@ -21,24 +22,93 @@
 // =============================================================================
 import "../asm/check.ax" as ack;
 import "../asm/inline.ax" as ai;
+import "../asm/wasm.ax" as aw;
+import "../ir.ax" as ir;
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
+import "cgen_abi.ax" as cab;
 import "csema.ax" as cs;
 import "csema_bits.ax" as cb;
 import "csema_expr.ax" as cx;
 import "csema_marks.ax" as csm;
 import "ctypes.ax" as cty;
 
-// Is the target's assembly supported (x86-64 and AArch64)? Reported (C3901)
-// once per statement otherwise.
+// Is the target's assembly supported (x86-64, AArch64, WebAssembly)? The
+// names a WebAssembly text names are looked up as declared where it is.
 fn arch_ok(sp: u.Span) bool {
-    if (tg.g_arch == tg.ARCH_X64) or (tg.g_arch == tg.ARCH_A64) {
-        return true;
+    _ = sp;
+    aw.g_lookup = wasm_lookup;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// WebAssembly: what the text's names are (asm/wasm.ax's g_lookup)
+// -----------------------------------------------------------------------------
+// (the functions of the unit's file-scope asm so far: name, parameters, results)
+let mut g_wasm_defs: u.List.[aw.Ref] = u.List.[aw.Ref].{ data: @ptr_from_int(*mut aw.Ref, 0), len: 0, cap: 0 };
+let mut g_wasm_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+// A C function or object of static duration declared here, or a function
+// of file-scope asm before: its signature as WebAssembly value types.
+fn wasm_lookup(n: []u8) aw.Ref {
+    let mut s = cs.lookup(u.intern(n));
+    if u.isnil(s) {
+        s = cs.linked(u.intern(n));
     }
-    cs.not_supported(sp, "inline assembly on WebAssembly targets");
-    return false;
+    if u.notnil(s) and (s.kind == cast.SK_FUNC) {
+        return wasm_sig(s.ty);
+    }
+    if u.notnil(s) and (s.kind == cast.SK_OBJECT) and (s.duration != cast.SD_AUTO) {
+        return aw.Ref.{ kind: aw.RF_DATA, params: "", results: "" };
+    }
+    for k in 0..g_wasm_names.len {
+        if u.str_eq(g_wasm_names.get(k), n) {
+            return g_wasm_defs.get(k);
+        }
+    }
+    return aw.Ref.{ kind: aw.RF_NONE, params: "", results: "" };
+}
+
+/// The WebAssembly signature of a C function of type t (as the C ABI makes
+/// it: cgen_abi.ax's plan; a variadic function's arguments buffer last).
+pub fn wasm_sig(t: *cty.CType) aw.Ref {
+    let p = cab.plan(t.ret, t.params, t.params.len, t.variadic, false);
+    let f = p.fty;
+    let mut ps = u.List.[u8].empty();
+    for x in f.params {
+        ps.push(ir_vt(x));
+    }
+    if f.vararg or t.variadic {
+        ps.push(u8_pick(tg.g_arch == tg.ARCH_WASM64, aw.I64, aw.I32));
+    }
+    let mut rs = u.List.[u8].empty();
+    if f.ret.kind != ir.T_VOID {
+        rs.push(ir_vt(f.ret));
+    }
+    return aw.Ref.{ kind: aw.RF_FUNC, params: u.perm_dup(ps.items()), results: u.perm_dup(rs.items()) };
+}
+
+// The value type of IR type t on WebAssembly (as wasm.ax's vt).
+fn ir_vt(t: *ir.Ty) u8 {
+    if t.kind == ir.T_INT {
+        return u8_pick(t.bits > 32, aw.I64, aw.I32);
+    }
+    if t.kind == ir.T_PTR {
+        return u8_pick(tg.g_arch == tg.ARCH_WASM64, aw.I64, aw.I32);
+    }
+    if t.kind == ir.T_FLOAT {
+        return u8_pick(t.bits == 32, aw.F32, aw.F64);
+    }
+    return aw.V128;
+}
+
+fn u8_pick(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 fn bad(sp: u.Span, msg: []u8) void {
@@ -61,6 +131,13 @@ pub fn toplevel(a: *mut cast.Asm) void {
     let b = new_blob(a);
     if template_ok(a, ack.check_text(b.arch, b.text, false, b.intel)) {
         a.blob = b;
+        if tg.is_wasm() {
+            // (its functions: what later asm may call)
+            for f in ack.g_wasm_funcs.items() {
+                g_wasm_names.push(u.perm_dup(f.name));
+                g_wasm_defs.push(aw.Ref.{ kind: aw.RF_FUNC, params: f.params, results: f.results });
+            }
+        }
     }
     cs.unit().asm_tops.push(a);
 }
@@ -227,8 +304,26 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         if ad.ok and (u.notnil(ad.sym) or u.notnil(ad.str)) {
             op.kind = ai.OK_IMM;
             op.sym = true;
+            if tg.is_wasm() and u.notnil(ad.sym) and (ad.sym.kind == cast.SK_FUNC) {
+                // (a function: its table index, and `call` of it with its signature)
+                let r = wasm_sig(ad.sym.ty);
+                op.wfunc = true;
+                op.wparams = r.params;
+                op.wresults = r.results;
+                if ad.off != 0 {
+                    bad(o.span, "the address of a function plus a constant is no function on WebAssembly");
+                    return false;
+                }
+            }
             return true;
         }
+    }
+    if tg.is_wasm() and c.reg and cty.is_vector(t) and (cty.size_of(t) == 16) and (rv < 0) {
+        // (a 16-byte vector: a v128 local)
+        op.kind = ai.OK_REG;
+        op.cls = ai.CL_VEC;
+        op.bits = 128;
+        return true;
     }
     if c.reg and ((op.bits != 0) or not c.mem) {
         if op.bits == 0 {
@@ -237,6 +332,21 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         }
         if (c.cls == ai.CL_VEC) and (op.bits < 32) {
             bad(o.span, u.f1("the operand of type %s cannot be in a floating-point or vector register", cs.tq(e.ty)));
+            return false;
+        }
+        if (tg.g_arch == tg.ARCH_A64) and ((c.fixed == 31) or (rv == 31)) and
+           (output or (rv != 31) or (c.fixed != 31)) {
+            // the stack pointer (k): only read, and only as the register
+            // variable that names it, whose value as an operand it is (the
+            // compiler moves nothing into the stack pointer)
+            if output {
+                bad(o.span, "the stack pointer cannot be an asm output");
+            } else if (rv == 31) and (c.fixed != 31) {
+                bad(o.span, u.f1("the register variable '%s' is the stack pointer: its constraint is 'k'", e.sym.name));
+            } else {
+                bad(o.span,
+                    "the constraint 'k' is the stack pointer: its operand is a register variable declared asm(\"sp\")");
+            }
             return false;
         }
         op.cls = c.cls;
@@ -367,6 +477,10 @@ pub fn stmt(a: *mut cast.Asm) void {
     if not arch_ok(a.span) {
         return;
     }
+    if a.basic and g_naked_wasm {
+        a.blob = new_blob(a);  // (checked with the function: naked_body)
+        return;
+    }
     if a.basic {
         let bb = new_blob(a);
         if template_ok(a, ack.check(bb)) {
@@ -395,7 +509,7 @@ pub fn stmt(a: *mut cast.Asm) void {
         let c = ai.constraint(arch, alt_of(o.constraint, alt), true);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: true, early: false, tie: -1, bits: 0, fp: false,
                              name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
-                             hi: false, zero: false };
+                             hi: false, zero: false, wfunc: false, wparams: "", wresults: "" };
         if not c.ok {
             report_con(o, c.msg);
             ok = false;
@@ -421,7 +535,7 @@ pub fn stmt(a: *mut cast.Asm) void {
         let c = ai.constraint(arch, alt_of(o.constraint, alt), false);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: false, early: false, tie: -1, bits: 0, fp: false,
                              name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
-                             hi: false, zero: false };
+                             hi: false, zero: false, wfunc: false, wparams: "", wresults: "" };
         let mut e = o.e;
         if not c.ok {
             report_con(o, c.msg);
@@ -1015,6 +1129,39 @@ pub fn naked_body(f: *cast.CSym, body: *cast.Stmt) void {
         bad(x.span, u.f1("the body of the naked function '%s' can only be asm statements", f.name));
         return;
     }
+    if tg.is_wasm() {
+        let msg = ack.check_text(tg.g_arch, naked_text(f.name, f.ty, body), false, false);
+        if msg.len > 0 {
+            cs.err(body.span, "C3097", msg);
+        }
+    }
+}
+
+/// On WebAssembly, asm statements in a naked function (a GNU dialect)
+/// are its code: the function `name` of C type t as file-scope asm,
+/// `(func $name (param ...) (result ...) <the templates>)`, its
+/// parameters the locals 0 up (as the C ABI passes them: wasm_sig).
+pub let mut g_naked_wasm: bool = false;
+
+pub fn naked_text(name: []u8, t: *cty.CType, body: *cast.Stmt) []u8 {
+    let r = wasm_sig(t);
+    let mut b = u.Buf.init();
+    b.s(u.f1("(func $%s", name));
+    for p in r.params {
+        b.s(u.f1(" (param %s)", aw.vt_name(p)));
+    }
+    for p in r.results {
+        b.s(u.f1(" (result %s)", aw.vt_name(p)));
+    }
+    b.c('\n');
+    for x in body.items.items() {
+        if (x.kind == cast.StmtKind.ASM) and u.notnil(x.asm) {
+            b.s(x.asm.tmpl);
+            b.c('\n');
+        }
+    }
+    b.s(")\n");
+    return b.done();
 }
 
 fn pick_us(c: bool, a: usize, b: usize) usize {

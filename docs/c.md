@@ -189,16 +189,22 @@ All the units are one program for the optimizer, so calls are inlined across the
 axiom build main.c memops.S table.s -o prog
 ```
 
-On x86-64 and AArch64 targets (Linux, macOS, Windows; on WebAssembly C3901) a source
-whose name ends in `.s` or `.S` is a translation unit of assembly, beside C units and an
+On every target a source whose name ends in `.s` or `.S` is a translation unit of
+assembly (on WebAssembly in the text format: below), beside C units and an
 Axiom program (`axiom build main.ax x.s`), or alone (`--emit=obj`). Its text is assembled
 as file-scope asm is ("Inline assembly"): AT&T syntax, or Intel under
 `--c-asm-dialect=intel` and after `.intel_syntax`. A `.S` source is first preprocessed
 by the C preprocessor with `__ASSEMBLER__` defined as 1, `-D`, `-U` and `-I`, the
-predefined macros (`__AXIOM_ASM_X86_64__` or `__AXIOM_ASM_AARCH64__` in any mode), its
+predefined macros (`__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__` or `__AXIOM_ASM_WASM__` in any mode), its
 directives done and its macros replaced, its other text as written; a line whose `#`
 does not begin a directive is a comment (as is `#` first on a line on AArch64, `//`
-anywhere there, and `#` anywhere on x86-64). A `.s` source is not preprocessed.
+anywhere there, `#` anywhere on x86-64, and `;;` and `(; ;)` on WebAssembly). A `.s`
+source is not preprocessed. On WebAssembly (`__AXIOM_ASM_WASM__`) the source is module
+fields in the specification's text format, `(func ...)` and `(import ...)`, optionally
+inside `(module ...)`, as file-scope asm is there ("Inline assembly"); it sees no C
+declarations, so it imports what it calls: `(import "env" "name" (func $id ...))` is the
+program's function `name` (another unit's, the C library's), another module's import the
+host's function.
 
 - Its global symbols (`.globl`, `.weak`) are external names of the program: C and
   Axiom (`extern "C"`) call its functions and read its data; a name it defines that a
@@ -1365,7 +1371,7 @@ The compiler's own macros say what the build chose:
 | `__AXIOM_WASM__` | 1, defined only for a WebAssembly target. |
 | `__AXIOM_WASM_BULK_MEMORY__`, `__AXIOM_WASM_EXCEPTION_HANDLING__` | 1, defined only for a WebAssembly target with that extension (`--features`): the C library's `memcpy`, `memmove` and `memset` are `memory.copy` and `memory.fill` with the first; `setjmp` needs the second. |
 | `__AXIOM_GNU__` | 1, defined only in a GNU dialect. |
-| `__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__` | 1, defined only in a GNU dialect on x86-64 or AArch64 targets: the language of inline assembly's templates ("Inline assembly"). |
+| `__AXIOM_ASM_X86_64__`, `__AXIOM_ASM_AARCH64__`, `__AXIOM_ASM_WASM__` | 1, defined only in a GNU dialect on x86-64, AArch64 or WebAssembly targets: the language of inline assembly's templates ("Inline assembly"). |
 
 No macro names the target (`__linux__`, `_WIN32`, `__x86_64__` and the like are not
 defined): pass `-D` for what a program needs to know.
@@ -1530,7 +1536,7 @@ as the standard says.
   as values, `__builtin_*` functions other than those below ("Reserved identifiers"),
   `#include_next`, `#ident`. A GNU dialect has them ("GNU dialects"), but for those it
   rejects too.
-- In every mode: inline assembly on WebAssembly targets (C3901), `__declspec`, `#import`,
+- In every mode: `__declspec`, `#import`,
   `#assert`. In a GNU dialect: a jump from a nested function to a label of its enclosing
   function (C3901), and the decimal and `__bf16`/`__ibm128`
   types.
@@ -1635,13 +1641,9 @@ function, `extern inline` is an inline definition (C99's `inline`).
 
 ### Inline assembly
 
-On x86-64 (Linux, Windows) and AArch64 (Linux, macOS) targets; on WebAssembly an asm
-statement is C3901: file-scope asm and `asm goto` have nothing to map to there (a module
-is not free-form code, and its control flow is structured: a template cannot jump to a
-C label), and templates in the WebAssembly text instructions with operands as locals
-(`r`), linear-memory addresses (`m`) and constants (`i`), which would map soundly, are
-not implemented. The compiler has its own assemblers (`cmd/axiom/src/asm/`), so no
-other tool is needed:
+On x86-64 (Linux, macOS, Windows), AArch64 (Linux, macOS, Windows) and WebAssembly
+(wasm32, wasm64) targets. The compiler has its own assemblers (`cmd/axiom/src/asm/`), so
+no other tool is needed:
 
 - **x86-64**: the AT&T syntax (source operands first; `%reg`, `$imm`,
   `disp(base, index, scale)`, `%fs:`/`%gs:` overrides, `*` for indirect jumps and calls,
@@ -1718,20 +1720,32 @@ other tool is needed:
   the move-wide groups `:abs_g0:`-`:abs_g3:` with `_nc` and `_s`, `:prel_g0:`-`:prel_g3:`
   with `_nc`, and the thread-local ones: `:tprel_hi12:`, `:tprel_lo12:`,
   `:tprel_lo12_nc:`, `:tprel_g2:`-`:tprel_g0_nc:`, the same of `:dtprel_...:`,
-  `:gottprel:`, `:gottprel_lo12:`, `:gottprel_g1:`, `:gottprel_g0_nc:`, `:tlsdesc:`,
-  `:tlsdesc_lo12:`, `:tlsdesc_off_g1:`, `:tlsdesc_off_g0_nc:`, `.tlsdesccall`, `:tlsgd:`
-  and `:tlsgd_lo12:` (the ELF linker's general-dynamic sequence); the
+  `:gottprel:`, `:gottprel_lo12:`, `:gottprel_g1:`, `:gottprel_g0_nc:` (the large model's
+  initial exec), `:tlsdesc:` (in `adrp`, and the tiny model's literal `ldr` and `adr`),
+  `:tlsdesc_lo12:`, `:tlsdesc_off_g1:`, `:tlsdesc_off_g0_nc:`, `.tlsdesccall`,
+  `.tlsdescldr` and `.tlsdescadd` (the large model's descriptor), `:tlsgd:` and
+  `:tlsgd_lo12:` (the ELF linker's general-dynamic sequence), `:tlsldm:` and
+  `:tlsldm_lo12_nc:` (local dynamic's module: `adrp`/`add` or `adr`, then `bl
+  __tls_get_addr`); the
   Mach-O spellings `sym@PAGE`, `@PAGEOFF`, `@GOTPAGE`, `@GOTPAGEOFF` (the same
-  relocations), and COFF's `:secrel_lo12:`/`:secrel_hi12:` (a thread-local's offset in
+  relocations) and `@TLVPPAGE`/`@TLVPPAGEOFF` (a thread-local's descriptor, a GOT slot
+  holding the descriptor's address, as the platform toolchain addresses one), and
+  COFF's `:secrel_lo12:`/`:secrel_hi12:` (a thread-local's offset in
   its block). `adr`, `adrp`, `b`, `bl`, `b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz`, `prfm`
   and literal loads reach symbols of other sections and units (and `adrp`/`adr` labels
   of the template) through relocations. The linkers apply them all, with the ABI's
   range checks as link errors; an executable's own thread-locals are reached by local
   exec, the initial-exec and TLS-descriptor sequences relaxed to it (an initial-exec
   `ldr` whose register is not its base's cannot be, and is an error), and `:dtprel_*:`
-  is the offset in the module's block. The absolute move-wide groups and `.word`/
-  `.hword` of addresses are the ELF linker's only (Mach-O and PE images are
-  position-independent). An operator in an instruction it does not fit is an error
+  is the offset in the module's block; the large and tiny models' sequences and local
+  dynamic's module are relaxed likewise (local dynamic's module is the thread pointer
+  plus the TCB's 16 bytes). On Mach-O and PE, whose images the loader puts at an
+  address only it knows (above 4 GiB) and whose formats have no relocation of a
+  move-wide group, the complete absolute sequence of an address (`movz` of one of
+  `:abs_g3:` ... `:abs_g0_nc:` and three `movk` of the others, one symbol to one
+  register) becomes `adrp`, `add` and two `nop`s, which give the same value; another
+  absolute move-wide group, and `.word`/`.hword` of an address, are C3097 there (a
+  difference, `.word a - b`, is not an address). An operator in an instruction it does not fit is an error
   (where the conventional assembler makes some other relocation of it). SVE and SVE2
   (the `z0`-`z31`, `p0`-`p15` and `ffr` registers, the element-size suffixes, `/m` and
   `/z` predication): the integer arithmetic (predicated and unpredicated, the immediate
@@ -1762,11 +1776,71 @@ other tool is needed:
   The `mov` aliases follow the architecture's preferred-alias rules (`mov Zd.T, #imm`
   stands for `dupm` only where no `dup` immediate gives the value). Not yet: SVE2.1 and
   SME2's additions (predicate-as-counter `pn` registers, register-pair `while*`,
-  `psel`, `*clamp`, the two-way dot products). Not yet either:
-  `@TLVPPAGE`/`@TLVPPAGEOFF` (Mach-O's thread-local descriptors), `:tlsldm:` (local
-  dynamic's module base), `:gottprel_g1:`/
-  `:gottprel_g0_nc:` and `:tlsdesc_off_*:` at link time (they assemble; the linkers
-  reject them).
+  predicate-as-counter `pn` registers, the register-pair `while*`, `psel`, the two-way
+  dot products and `bfmlslb`/`bfmlslt`, `pext`, the `sqrshrn` pairs, and the ZA array,
+  tile, outer-product, `mova`, load/store and multi-vector forms; `addsvl`, `addspl`,
+  `rdsvl`, `revd` and `sclamp`/`uclamp`/`fclamp` are done).
+- **WebAssembly**: the text format of the WebAssembly specification (Core Specification
+  2.0, chapter 6): plain instructions and folded ones (`(i32.add (local.get %1) (i32.const
+  1))`, `(if (result i32) cond (then ...) (else ...))`), `block`, `loop`, `if`/`else`,
+  `end` with symbolic labels (`block $out ... br $out`, `end $out`) or depths, `br`,
+  `br_if`, `br_table`, block types `(result t)` and with the multivalue extension any
+  `(param ...) (result ...)`, the integer literals (decimal, `0x`, `_` between digits,
+  signed or not), the floating ones (decimal, hexadecimal `0x1.8p3` rounded once to the
+  type, `inf`, `nan`, `nan:0x...`), memargs `offset=N align=N` (the alignment at most the
+  access's size, an atomic access's its size), lane indices, `v128.const` of every shape,
+  `i8x16.shuffle`, `;;` and `(; ;)` comments. Instructions: the numeric, conversion,
+  memory, `memory.size`/`memory.grow`, `select` (and `select (result t)`), `drop`,
+  `nop`, `unreachable`, `call`, `call_indirect (param ...) (result ...)` (of the
+  program's function table; the index is an `i32`, also on wasm64), `local.get`/`set`/
+  `tee`, `global.get`/`global.set $__stack_pointer`; and of the extensions `--features`
+  enables (another's instruction is C3097, naming the flag): sign-ext, nontrapping-fptoint,
+  bulk-memory's `memory.copy` and `memory.fill`, simd128 (all of it), relaxed-simd,
+  atomics (`memory.atomic.notify`, `wait32`/`wait64`, `atomic.fence`, the atomic loads,
+  stores and read-modify-writes), tail-call (`return_call`, `return_call_indirect`) and
+  exception-handling (`try_table` with `catch_all` and `catch_all_ref`, `throw_ref`, the
+  `exnref` type). A table of them is generated from the specification's opcode tables by
+  `cmd/internal/tools/gen_wasm_table.py`. Not: what names what C has none of (`throw`
+  and `catch` of a tag, `memory.init` and `data.drop` of a data segment, the reference
+  types' table and `ref.*` instructions, which no extension of the target has). Every
+  template is validated as the specification's validation algorithm says, its operands'
+  types known: an operand of the wrong type, a stack left with values, a block not
+  ended, a label that is not there are C3097, so that the module is always valid. The
+  names a text uses (`$name`) are the program's: `call $f` calls C's (or file-scope
+  asm's) function f, with its signature as the C ABI gives it (a variadic function's
+  arguments buffer last), and `i32.const $x` (`i64.const` on wasm64) is the address of
+  object x or the table index of function f (C's pointer to it); a name not declared
+  where the asm is is C3097. In an asm statement:
+  - the operands in locals: `r` (and `g`, `X`) is a local of the operand's type (`i32`
+    for integers of up to 32 bits, extended as their type's signedness says, and for
+    pointers on wasm32; `i64` for 64-bit ones and pointers on wasm64; `f32`, `f64`; a
+    16-byte vector a `v128`); `m` (`o`, `V`) a local holding the object's address (the
+    template loads and stores through it: `local.get %0 i32.load`); outputs are locals
+    the template sets (`=`; `+` is set from the value first), an input's local may not be
+    written (C3097), and one tied to an output (`"0"`) is the output's local (of the same
+    type: C3097 otherwise). `%0` and `%[name]` write the local where an instruction
+    takes one (`local.get %0`);
+  - constants: `i` and `n` are a number (`i32.const %1`, `offset=%1`, a lane), and `i`
+    and `s` of an address are that symbol (`i32.const %1` gives it; `call %1` of a
+    function calls it, with the signature of its C type);
+  - the clobbers `"memory"` and `"cc"` (which means nothing here); WebAssembly has no
+    registers (another clobber, a machine constraint of another target and an
+    explicit register variable are errors); the modifier `%c` (a constant as itself);
+  - the template is a block of no parameters or results (`br 0` at its top leaves it);
+    it must leave the stack empty (its results are its outputs' locals), and cannot
+    `return` or `return_call` (the function's epilogue would not run); `asm goto`'s
+    `%l0`, `%l[name]` are labels around the template, `br %l[name]` (or `br_if`) goes to
+    that C label;
+  - a template that calls a function (`call`, `call_indirect`) is as one that calls on
+    the other targets (its function makes no sibling calls).
+  File-scope asm is module fields: `(func $name (export "n")? (param $p? t)* (result
+  t)* (local $l? t)* instructions)`, a function of the program named `name` (C declares
+  it to call it; `(export "n")` exports it from the module too), whose body may also
+  `return`, and `(import "module" "name" (func $id (param ...) (result ...)))` (as in an
+  assembly source: above); data is defined in C. A function of file-scope asm is never
+  stripped, and one that C or Axiom code defines too is an error. A naked function
+  (`__attribute__((naked))`) has its asm statements, without operands, as its code: its
+  parameters are the locals 0 up, and it returns what it leaves on the stack.
 - Directives: `.byte`, `.short`/`.hword`/`.2byte`, `.word` (2 bytes on x86-64, 4 on
   AArch64), `.long`/`.int`, `.quad`/`.xword`, `.octa`, `.ascii`, `.asciz`/`.string`,
   `.float`, `.double`, `.uleb128`, `.sleb128`, `.zero`/`.skip`/`.space`, `.fill`,
@@ -1829,7 +1903,9 @@ The GNU dialect's documentation describes extended asm, with these rules:
   `v`, `Y`, `I J K M N O e Z` (constants in their ranges); AArch64 `w` (any v register),
   `x` (v0-v15), `y` (v0-v7), `Q`, `Ump`, `Umq` and the SVE memory forms `Utf`, `Utr`,
   `Utv`, `Utq`, `Uty` (memory: an operand is always `[xn]`, which each of those forms
-  takes), `I J K L M N Z`, `Y` and `Dz` (the constant zero, also the floating `0.0`,
+  takes), `k` (the stack pointer: an input whose operand is the register variable
+  declared `asm("sp")`, written `sp`; the compiler moves nothing into it), `I J K L M
+  N Z`, `Y` and `Dz` (the constant zero, also the floating `0.0`,
   written `#0.0`), `Dn Dh Dq Ds Dd Dl Dr` and `Uc0`-`Uc2` (integer constants: the
   instruction that uses one checks it), `S`, `Usa` and `Ush` (a symbol's address, plus a
   constant), and `Upa` (any SVE predicate register), `Upl` (p0-p7). An operand
@@ -1865,12 +1941,15 @@ The GNU dialect's documentation describes extended asm, with these rules:
 - Explicit register variables, `register long x asm("rax")` (or `"x8"`, `"w19"`, `"d0"`
   ...): such a variable is in that register when it is an asm operand in a register (the
   usual way to pass system call arguments); elsewhere it is an ordinary variable. The stack
-  and frame pointers, and on AArch64 x16, x17 and x18, cannot be.
+  and frame pointers, and on AArch64 x16, x17 and x18, cannot be, but AArch64's `sp`,
+  which is the operand of the constraint `k` only (its value there is the stack pointer;
+  it is never written). On WebAssembly, which has no registers, there are none.
 - Clobbers: registers (with or without `%` on x86-64; `ymm0-15` and `zmm0-15` are their
   xmm register; `xmm16-31`, `ymm16-31`, `zmm16-31`, `k0-7` and `mm0-7`, which the compiler
   keeps no value in across an asm statement, are accepted; `st` and `st(n)` say which x87
   inputs the template pops), `"cc"` (always assumed on x86-64), `"memory"`; not the stack or frame pointer, nor on macOS and Windows for AArch64 x18,
-  the platform's (C3096). A clobbered callee-saved register is saved by the function.
+  the platform's (C3096); on AArch64 also `za` (the ZA array) and `zt0` (the ZT0
+  table), the SME state, which the compiler keeps nothing in across an asm. A clobbered callee-saved register is saved by the function.
 - Template modifiers: x86-64 `%b %w %k %q %h` (a register's widths, its high byte), `%x`
   (xmm), `%t` (ymm), `%g` (zmm), `%c %P %p %a` (a constant without `$`, an address), `%n` (negated), `%A` (`*`),
   `%H` (memory 8 bytes on), `%V`, `%z` (the size suffix); AArch64 `%w %x` (also of the

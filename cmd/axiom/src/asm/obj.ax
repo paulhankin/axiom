@@ -660,3 +660,134 @@ fn loc_file_id(name: []u8) i32 {
     loc_files.put(k, f.id + 1);
     return f.id;
 }
+
+// -----------------------------------------------------------------------------
+// Absolute addresses in move-wide groups on Mach-O and PE
+// -----------------------------------------------------------------------------
+/// On Mach-O and PE (the images are position-independent, loaded at an
+/// address only the loader knows, and their formats have no relocation of
+/// a move-wide group), the complete absolute sequence of an address,
+/// `movz xd, #:abs_g3:s; movk xd, #:abs_g2_nc:s; movk xd, #:abs_g1_nc:s;
+/// movk xd, #:abs_g0_nc:s` (the four groups of one symbol and addend, in
+/// any order, to one register, the movz first, four consecutive
+/// instructions), becomes `adrp xd, s; add xd, xd, :lo12:s; nop; nop`,
+/// which gives the same value wherever the image is. Returns why another
+/// absolute move-wide group cannot be ("" if none is left).
+pub fn relax_abs_movw(obj: *mut elf.Obj) []u8 {
+    for k in 0..obj.secs.len {
+        let s = obj.secs.get(k);
+        let rs = s.relocs.items();
+        let drop = u.newn.[bool](rs.len + 1);
+        let mut any = false;
+        for i in 0..rs.len {
+            let r = rs[i];
+            if not is_uabs(r.ty) or drop[i] {
+                continue;
+            }
+            // the other three, at the next three instructions
+            let mut at: [4]usize = [i, 0, 0, 0];
+            let mut seen: u32 = @as(u32, 1) << uabs_group(r.ty);
+            let mut ok = true;
+            for j in @as(usize, 1)..4 {
+                let mut f: i64 = -1;
+                for x in 0..rs.len {
+                    let q = rs[x];
+                    if is_uabs(q.ty) and not drop[x] and (q.off == (r.off + @as(u64, 4 * j))) and
+                       same_sym(obj, q.sym, r.sym) and (q.addend == r.addend) {
+                        f = @int_cast(i64, x);
+                    }
+                }
+                if f < 0 {
+                    ok = false;
+                    break;
+                }
+                at[j] = @int_cast(usize, f);
+                seen = seen | (@as(u32, 1) << uabs_group(rs[at[j]].ty));
+            }
+            if not ok or (seen != 15) {
+                continue;
+            }
+            let d = s.data.view();
+            let w0 = rd32(d, r.off);
+            let rd = w0 & 0x1f;
+            if (w0 & 0xff80_0000) != 0xd280_0000 {
+                continue;  // (the first a movz of a 64-bit register)
+            }
+            for j in @as(usize, 1)..4 {
+                let w = rd32(d, r.off + @as(u64, 4 * j));
+                if ((w & 0xff80_0000) != 0xf280_0000) or ((w & 0x1f) != rd) {
+                    ok = false;
+                }
+            }
+            if not ok {
+                continue;
+            }
+            wr32(d, r.off, 0x9000_0000 | rd);
+            wr32(d, r.off + 4, 0x9100_0000 | (rd << 5) | rd);
+            wr32(d, r.off + 8, 0xd503_201f);
+            wr32(d, r.off + 12, 0xd503_201f);
+            rs[at[0]].ty = elf.R_AARCH64_ADR_PREL_PG_HI21;
+            rs[at[1]].ty = elf.R_AARCH64_ADD_ABS_LO12_NC;
+            rs[at[1]].off = r.off + 4;  // (the add's: the second instruction, whichever group it had)
+            drop[at[2]] = true;
+            drop[at[3]] = true;
+            any = true;
+        }
+        if any {
+            let mut kept = u.List.[elf.Rel].empty();
+            for i in 0..rs.len {
+                if not drop[i] {
+                    kept.push(rs[i]);
+                }
+            }
+            s.relocs.clear();
+            for x in kept.items() {
+                s.relocs.push(x);
+            }
+        }
+        for r in s.relocs.items() {
+            let sy = obj.syms.get(@as(usize, r.sym));
+            let dbg = (s.kind == elf.S_DEBUG) or
+                      ((sy.sec >= 0) and (obj.secs.get(@int_cast(usize, sy.sec)).kind == elf.S_DEBUG));
+            if ((r.ty == elf.R_AARCH64_ABS32) or (r.ty == elf.R_AARCH64_ABS16)) and not dbg {
+                return u.f1("an address in %s bits (.word, .hword or .short of a symbol): a Mach-O or PE image is loaded above 4 GiB, at an address only the loader knows (an address is a .quad; a difference of two, `.word a - b`, fits)",
+                            u.pick(r.ty == elf.R_AARCH64_ABS32, "32", "16"));
+            }
+            if is_uabs(r.ty) or ((r.ty >= 270) and (r.ty <= 272)) {
+                return "an absolute address in a move-wide group (:abs_g*:) that is not the four groups of one address to one register (movz, then three movk): Mach-O and PE images have no relocation of it";
+            }
+        }
+    }
+    return "";
+}
+
+// (one symbol: the same entry, or entries of one name)
+fn same_sym(obj: *elf.Obj, a: u32, b: u32) bool {
+    if a == b {
+        return true;
+    }
+    let x = obj.syms.get(@as(usize, a));
+    let y = obj.syms.get(@as(usize, b));
+    return (x.name.len > 0) and u.str_eq(x.name, y.name) and (x.sec == y.sec) and (x.value == y.value);
+}
+
+fn is_uabs(t: u32) bool {
+    return (t >= 263) and (t <= 269);  // MOVW_UABS_G0 .. G3 (AAELF64)
+}
+
+fn uabs_group(t: u32) u32 {
+    return (t - 263) / 2;  // G0 263 264, G1 265 266, G2 267 268, G3 269
+}
+
+fn rd32(d: []u8, off: u64) u64 {
+    let o = @truncate(usize, off);
+    return @as(u64, d[o]) | (@as(u64, d[o + 1]) << 8) | (@as(u64, d[o + 2]) << 16) | (@as(u64, d[o + 3]) << 24);
+}
+
+fn wr32(d: []mut u8, off: u64, x: u64) void {
+    let o = @truncate(usize, off);
+    d[o] = @truncate(u8, x);
+    d[o + 1] = @truncate(u8, x >> 8);
+    d[o + 2] = @truncate(u8, x >> 16);
+    d[o + 3] = @truncate(u8, x >> 24);
+}

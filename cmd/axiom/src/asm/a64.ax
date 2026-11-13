@@ -402,14 +402,14 @@ fn is_float_text(s: []u8) bool {
 // makes depends on the instruction (rel_for).
 // -----------------------------------------------------------------------------
 const RO_BASE: u8 = 32;
-let ROPS: [50][]u8 = ["lo12", "got", "got_lo12", "pg_hi21", "pg_hi21_nc", "abs_g0", "abs_g0_nc", "abs_g1", "abs_g1_nc",
+let ROPS: [52][]u8 = ["lo12", "got", "got_lo12", "pg_hi21", "pg_hi21_nc", "abs_g0", "abs_g0_nc", "abs_g1", "abs_g1_nc",
                       "abs_g2", "abs_g2_nc", "abs_g3", "abs_g0_s", "abs_g1_s", "abs_g2_s", "prel_g0", "prel_g0_nc",
                       "prel_g1", "prel_g1_nc", "prel_g2", "prel_g2_nc", "prel_g3", "gottprel", "gottprel_lo12",
                       "gottprel_g1", "gottprel_g0_nc", "tprel_hi12", "tprel_lo12", "tprel_lo12_nc", "tprel_g2",
                       "tprel_g1", "tprel_g1_nc", "tprel_g0", "tprel_g0_nc", "dtprel_hi12", "dtprel_lo12",
                       "dtprel_lo12_nc", "dtprel_g2", "dtprel_g1", "dtprel_g1_nc", "dtprel_g0", "dtprel_g0_nc",
                       "tlsdesc", "tlsdesc_lo12", "tlsdesc_off_g1", "tlsdesc_off_g0_nc", "secrel_lo12", "secrel_hi12",
-                      "tlsgd", "tlsgd_lo12"];
+                      "tlsgd", "tlsgd_lo12", "tlsldm", "tlsldm_lo12_nc"];
 
 fn ro_index(n: []u8) i64 {
     for k in 0..ROPS.len {
@@ -462,23 +462,28 @@ fn rel_for(A: *mut cr.Asm, rm: u8, cl: u32, sz: i64, m: []u8) u32 {
     let n = ro_name(rm);
     let mut t: u32 = 0;
     if cl == CL_ADRP {
-        let names = ["", "pg_hi21", "pg_hi21_nc", "got", "gottprel", "tlsdesc", "tlsgd"];
-        let ty: [7]u32 = [275, 275, 276, 311, 541, 562, 513];
+        let names = ["", "pg_hi21", "pg_hi21_nc", "got", "gottprel", "tlsdesc", "tlsgd", "tlsldm"];
+        let ty: [8]u32 = [275, 275, 276, 311, 541, 562, 513, 518];
         for k in 0..names.len {
             if u.str_eq(n, names[k]) {
                 t = ty[k];
             }
+        }
+        if u.str_eq(n, "@tlvppage") {
+            t = elf.R_AARCH64_AXIOM_TLVP_PAGE;  // (Mach-O only: checked below)
         }
     } else if cl == CL_ADR {
         if n.len == 0 {
             t = elf.R_AARCH64_ADR_PREL_LO21;
         } else if u.str_eq(n, "tlsdesc") {
             t = elf.R_AARCH64_TLSDESC_ADR_PREL21;
+        } else if u.str_eq(n, "tlsldm") {
+            t = elf.R_AARCH64_TLSLD_ADR_PREL21;
         }
     } else if cl == CL_ADD {
         let names = ["lo12", "tprel_hi12", "tprel_lo12", "tprel_lo12_nc", "dtprel_hi12", "dtprel_lo12",
-                     "dtprel_lo12_nc", "tlsdesc_lo12", "secrel_lo12", "secrel_hi12", "tlsgd_lo12"];
-        let ty: [11]u32 = [277, 549, 550, 551, 528, 529, 530, 564, 551, 549, 514];
+                     "dtprel_lo12_nc", "tlsdesc_lo12", "secrel_lo12", "secrel_hi12", "tlsgd_lo12", "tlsldm_lo12_nc"];
+        let ty: [12]u32 = [277, 549, 550, 551, 528, 529, 530, 564, 551, 549, 514, 519];
         for k in 0..names.len {
             if u.str_eq(n, names[k]) {
                 t = ty[k];
@@ -486,7 +491,9 @@ fn rel_for(A: *mut cr.Asm, rm: u8, cl: u32, sz: i64, m: []u8) u32 {
         }
     } else if cl == CL_LDST {
         let s = @bit_cast(u32, @truncate(i32, sz));
-        if u.str_eq(n, "lo12") {
+        if u.str_eq(n, "@tlvppageoff") and (sz == 3) {
+            t = elf.R_AARCH64_AXIOM_TLVP_PAGEOFF;
+        } else if u.str_eq(n, "lo12") {
             t = LO12_TYPES[@int_cast(usize, sz)];
         } else if (u.str_eq(n, "got_lo12") or u.str_eq(n, "gottprel_lo12") or u.str_eq(n, "tlsdesc_lo12")) and
                   (sz == 3) {
@@ -519,6 +526,12 @@ fn rel_for(A: *mut cr.Asm, rm: u8, cl: u32, sz: i64, m: []u8) u32 {
                 t = ty[k];
             }
         }
+    }
+    if ((t == elf.R_AARCH64_AXIOM_TLVP_PAGE) or (t == elf.R_AARCH64_AXIOM_TLVP_PAGEOFF)) and not tg.is_darwin() {
+        cr.fail(A,
+                u.f1("'%s' is a thread-local descriptor reference of Mach-O (macOS); other targets use :tlsdesc: or :gottprel:",
+                     m));
+        return 0;
     }
     if (t == 0) and not cr.failed(A) {
         if n.len == 0 {
@@ -1196,13 +1209,21 @@ fn finish(A: *mut cr.Asm) void {
 }
 
 fn directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
-    if u.str_eq(st.op, ".tlsdesccall") {
-        // R_AARCH64_TLSDESC_CALL at the next instruction (the descriptor's blr)
+    if u.str_eq(st.op, ".tlsdesccall") or u.str_eq(st.op, ".tlsdescldr") or u.str_eq(st.op, ".tlsdescadd") {
+        // R_AARCH64_TLSDESC_CALL at the next instruction (the descriptor's
+        // blr), and the large model's TLSDESC_LDR and TLSDESC_ADD (its
+        // `ldr x1, [xg, x0]` and `add x0, xg, x0`: AAELF64's TLS descriptors)
         let v = cr.settle(A, cr.eval(A, st.args));
+        let mut ty = elf.R_AARCH64_TLSDESC_CALL;
+        if u.str_eq(st.op, ".tlsdescldr") {
+            ty = elf.R_AARCH64_TLSDESC_LDR;
+        } else if u.str_eq(st.op, ".tlsdescadd") {
+            ty = elf.R_AARCH64_TLSDESC_ADD;
+        }
         if v.ok and ((v.sym < 0) or (v.neg >= 0)) {
-            cr.fail(A, ".tlsdesccall needs a symbol");
+            cr.fail(A, u.f1("%s needs a symbol", st.op));
         } else if v.ok {
-            cr.reloc(A, cr.here(A), elf.R_AARCH64_TLSDESC_CALL, v, v.k);
+            cr.reloc(A, cr.here(A), ty, v, v.k);
         }
         return true;
     }
@@ -7207,10 +7228,10 @@ fn count_tail(A: *mut cr.Asm, m: []u8, ops: []AOp, k: usize, pat: *mut u64, mulm
 // The element-count instructions (cntb/h/w/d, inc*/dec* and their saturating
 // forms, on a scalar or a vector) and addvl/addpl/rdvl.
 fn sve_count(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
-    if u.str_eq(m, "addvl") or u.str_eq(m, "addpl") {
+    if u.str_eq(m, "addvl") or u.str_eq(m, "addpl") or u.str_eq(m, "addsvl") or u.str_eq(m, "addspl") {
         return sve_addvl(A, m, ops, false);
     }
-    if u.str_eq(m, "rdvl") {
+    if u.str_eq(m, "rdvl") or u.str_eq(m, "rdsvl") {
         return sve_addvl(A, m, ops, true);
     }
     // split the mnemonic into a stem and an element letter (b h w d)
@@ -7340,19 +7361,24 @@ fn sve_addvl(A: *mut cr.Asm, m: []u8, ops: []AOp, rd: bool) bool {
         return false;
     }
     let imm = (@bit_cast(u64, v.k) & 0x3f) << 5;
+    // the streaming-vector-length forms (FEAT_SME: addsvl, addspl, rdsvl,
+    // whose names hold "svl" or "spl") set bit 11, the plain ones (SVE:
+    // addvl, addpl, rdvl) clear it
+    let svl = u64_pick(u.contains(m, "svl") or u.contains(m, "spl"), @as(u64, 0x800), 0);
     if rd {
-        // rdvl: Xd not SP
+        // rdvl / rdsvl: Xd not SP
         if d.sp {
             return false;
         }
-        w32(A, 0x04bf5000 | imm | r5(d.reg));
+        w32(A, (0x04bf5000 | svl) | imm | r5(d.reg));
         return true;
     }
     let n = ops[1];
     if (n.kind != AK_REG) or not n.x {
         return false;
     }
-    let base = u64_pick(u.str_eq(m, "addpl"), @as(u64, 0x04605000), 0x04205000);
+    let pl = (m.len >= 5) and (m[m.len - 2] == 'p');  // addpl / addspl
+    let base = u64_pick(pl, @as(u64, 0x04605000), 0x04205000) | svl;
     w32(A, base | imm | (r5(n.reg) << 16) | r5(d.reg));
     return true;
 }
@@ -7644,6 +7670,9 @@ pub fn render(o: *ai.ROp, mod: u8, err: *mut []u8) []u8 {
         } else if mod != 0 {
             err.* = u.f1("the modifier '%s' of a general register", ai.ch_text(mod));
             return "";
+        }
+        if o.reg == 31 {
+            return u.pick(x, "sp", "wsp");  // (the constraint 'k': the stack pointer)
         }
         return u.cat2(u.pick(x, "x", "w"), u.idec(o.reg));
     }

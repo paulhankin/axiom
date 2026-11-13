@@ -1,0 +1,2338 @@
+// =============================================================================
+// asm/wasm.ax - the WebAssembly assembler: instructions in the text format
+// of the WebAssembly specification (Core Specification 2.0, chapter 6, with
+// the threads, relaxed SIMD, tail-call and exception-handling extensions),
+// validated as the specification's validation algorithm (its appendix,
+// "Validation Algorithm") does and encoded in the binary format, for asm
+// statements (an instruction sequence whose operands are locals, constants
+// and symbols: c/csema_asm.ax, wasm.ax) and for file-scope asm and assembly
+// sources (module fields: functions and their imports).
+//
+// The text is the specification's: plain and folded instructions, symbolic
+// labels (`block $l ... br $l`) and numeric depths, `;;` and `(; ;)`
+// comments, the integer, floating-point and v128 literals, memargs
+// (`offset=` and `align=`), block types of `(param ...)` and `(result ...)`.
+// What the text names that a module of its own would declare is the
+// program's instead: `call $f` calls function f of the program (a C
+// function, or one of file-scope asm), `i32.const $x` (`i64.const` on
+// memory64) is the address of object x or the table index of function x
+// (C's pointer to it), `global.get $__stack_pointer` the stack pointer. In
+// an asm statement the operands are `$__op<k>` (the local holding operand
+// k: its value, or a memory operand's address), `$__sym<k>` (a symbol) and
+// numbers (a constant), the labels of asm goto `$__lbl<k>` (the backend
+// writes them so for %k, %[name] and %l[name]).
+//
+// The result is the code and its fixups (Fix: what the backend or the
+// object writer resolves to a symbol's index, a type's index or an
+// address), or the message of the first error.
+// =============================================================================
+import "../bin.ax" as bn;
+import "../target.ax" as tg;
+import "../util.ax" as u;
+import "wasmtab.ax" as wt;
+
+// Value types (the binary format's codes); ANY is the validation
+// algorithm's unknown type, of values in unreachable code.
+pub const I32: u8 = 0x7f;
+pub const I64: u8 = 0x7e;
+pub const F32: u8 = 0x7d;
+pub const F64: u8 = 0x7c;
+pub const V128: u8 = 0x7b;
+pub const EXNREF: u8 = 0x69;
+const ANY: u8 = 0;
+
+// An operand of an asm statement (Env.ops).
+pub const EO_LOCAL: u8 = 1;  // a local of type vt (`$__op<k>`): an input, an output (out), or a memory operand's address
+pub const EO_CONST: u8 = 2;  // a constant (written as a number)
+pub const EO_SYM: u8 = 3;    // a symbol (`$__sym<k>`): a function (func, of signature params -> results) or an object
+
+pub struct EnvOp {
+    kind: u8,
+    vt: u8,
+    out: bool,   // the template may write it
+    local: u32,  // its local's index
+    func: bool,
+    params: []u8,
+    results: []u8,
+}
+
+/// What an asm statement's template may name: its operands, the labels of
+/// asm goto, and (goto_local) the local of asm goto's result.
+pub struct Env {
+    ops: []EnvOp,
+    nlabels: i32,
+    goto_local: u32,
+}
+
+/// What a name in the text refers to, as the program defines it (g_lookup).
+pub const RF_NONE: u8 = 0;
+pub const RF_FUNC: u8 = 1;
+pub const RF_DATA: u8 = 2;
+
+pub struct Ref {
+    kind: u8,
+    params: []u8,
+    results: []u8,
+}
+
+fn no_lookup(n: []u8) Ref {
+    _ = n;
+    return Ref.{ kind: RF_NONE, params: "", results: "" };
+}
+
+/// How the text's names of functions and objects are resolved (`call $f`,
+/// `i32.const $x`): the front end's declarations (csema_asm.ax), or the
+/// program's IR (wasm.ax). Unknown names are errors.
+pub let mut g_lookup: fn([]u8) Ref = no_lookup;
+
+// Fixups (Fix.kind): each a 5-byte LEB128 in the code (10 bytes for a
+// 64-bit address or table index: wide).
+pub const FX_FUNC: u8 = 1;   // a function's index (call)
+pub const FX_TABLE: u8 = 2;  // a function's table index (i32.const $f): a signed LEB
+pub const FX_DATA: u8 = 3;   // an object's address plus addend: a signed LEB
+pub const FX_TYPE: u8 = 4;   // the index of the function type params -> results (call_indirect, block types)
+pub const FX_SP: u8 = 5;     // the stack pointer global's index
+
+pub struct Fix {
+    kind: u8,
+    off: u32,
+    op: i32,     // the operand it names (`$__sym<k>`), or -1: then name
+    name: []u8,  // a name of the program, or (file-scope asm) of a function the text defines or imports
+    wide: bool,
+    params: []u8,
+    results: []u8,
+}
+
+/// A function of file-scope asm: `(func $name ...)`.
+pub struct AFunc {
+    name: []u8,
+    exp: []u8,  // `(export "name")`: exported from the module under that name
+    params: []u8,
+    results: []u8,
+    locals: []u8,         // the types of its locals after its parameters
+    code: bn.Bytes,       // its locals' declarations and its instructions, ending with `end`
+    fixes: u.List.[Fix],  // (offsets in `code`)
+    pnames: [][]u8,
+    first: usize,  // its body's first token
+    line: i32,
+}
+
+/// A function file-scope asm imports: `(import "module" "name" (func $id ...))`.
+/// Module "env" names a function of the program (C's, another unit's): an
+/// undefined symbol; another module, the host's function.
+pub struct AImport {
+    module: []u8,
+    name: []u8,
+    id: []u8,
+    params: []u8,
+    results: []u8,
+}
+
+/// The result of assembling.
+pub struct Asm {
+    err: []u8,
+    line: i32,
+    code: bn.Bytes,
+    fixes: u.List.[Fix],
+    funcs: u.List.[*mut AFunc],
+    imports: u.List.[AImport],
+    sp: bool,     // the text names the stack pointer
+    calls: bool,  // it calls a function
+    table: bool,  // it uses the function table (call_indirect, a table index)
+}
+
+/// Did assembling fail?
+pub fn failed(x: *Asm) bool {
+    return x.err.len > 0;
+}
+
+// -----------------------------------------------------------------------------
+// The instruction table (wasmtab.ax)
+// -----------------------------------------------------------------------------
+struct Ins {
+    name: []u8,
+    pre: u8,    // 0, or the prefix byte (0xfc, 0xfd, 0xfe)
+    code: u32,  // the opcode (after the prefix: its LEB128 number)
+    imm: u8,    // '-' 'm' 'L' 'l' 'c' 'V' 'S' 'z' 'Z'
+    n: u32,     // 'm' 'L': the natural alignment in bytes; 'l': the lanes
+    params: []u8,
+    results: []u8,
+    feat: u8,
+}
+
+let mut g_tab: u.List.[Ins] = u.List.[Ins].{ data: @ptr_from_int(*mut Ins, 0), len: 0, cap: 0 };
+let mut g_names: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                   cap: 0, len: 0 };
+
+fn hexval(s: []u8) u64 {
+    let mut v: u64 = 0;
+    for c in s {
+        v = (v << 4) | hex_digit(c);
+    }
+    return v;
+}
+
+fn hex_digit(c: u8) u64 {
+    if (c >= '0') and (c <= '9') {
+        return @as(u64, c - '0');
+    }
+    if (c >= 'a') and (c <= 'f') {
+        return @as(u64, c - 'a') + 10;
+    }
+    if (c >= 'A') and (c <= 'F') {
+        return @as(u64, c - 'A') + 10;
+    }
+    return 99;
+}
+
+fn sig_types(s: []u8) []u8 {
+    let out = u.perm_newn.[u8](s.len + 1);
+    for k in 0..s.len {
+        out[k] = sig_vt(s[k]);
+    }
+    return out[0..s.len];
+}
+
+fn sig_vt(c: u8) u8 {
+    if c == 'i' {
+        return I32;
+    }
+    if c == 'I' {
+        return I64;
+    }
+    if c == 'f' {
+        return F32;
+    }
+    if c == 'F' {
+        return F64;
+    }
+    if c == 'v' {
+        return V128;
+    }
+    return 'p';  // (an address: i32, or i64 on memory64; resolved when used)
+}
+
+fn load_table() void {
+    if g_tab.len > 0 {
+        return;
+    }
+    for line in wt.TABLE {
+        let f = u.split(line, ' ', 5);
+        let name = f.get(0);
+        let code = f.get(1);
+        let mut x = Ins.{ name: name, pre: 0, code: 0, imm: f.get(2)[0], n: 0, params: "", results: "",
+                          feat: f.get(4)[0] };
+        if (code.len > 2) and ((code[0] == 'f') and ((code[1] == 'c') or (code[1] == 'd') or (code[1] == 'e'))) {
+            x.pre = @truncate(u8, hexval(code[0..2]));
+            x.code = @truncate(u32, hexval(code[2..]));
+        } else {
+            x.code = @truncate(u32, hexval(code));
+        }
+        let im = f.get(2);
+        if im.len > 1 {
+            x.n = @truncate(u32, @bit_cast(u64, dnum(im[1..])));
+        }
+        let sg = f.get(3);
+        let c = u.find(sg, ':');
+        x.params = sig_types(sg[0..@int_cast(usize, c)]);
+        x.results = sig_types(sg[@int_cast(usize, c) + 1..]);
+        g_tab.push(x);
+        g_names.put(u.intern(name), @int_cast(u32, g_tab.len));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tokens (6.2: the text format's lexical format)
+// -----------------------------------------------------------------------------
+const TK_EOF: u8 = 0;
+const TK_LP: u8 = 1;
+const TK_RP: u8 = 2;
+const TK_KW: u8 = 3;   // a keyword (or a number: an idchars token that is not an identifier)
+const TK_ID: u8 = 4;   // $name (text: the name without '$')
+const TK_STR: u8 = 5;  // a string (text: its bytes)
+
+struct Tok {
+    kind: u8,
+    text: []u8,
+    line: i32,
+}
+
+fn idchar(c: u8) bool {
+    if u.is_alnum(c) {
+        return true;
+    }
+    return u.find("!#$%&'*+-./:<=>?@\\^_`|~", c) >= 0;
+}
+
+// The tokens of text t, or an error (set_err).
+fn lex(t: []u8) void {
+    TOKS.clear();
+    let mut i: usize = 0;
+    let mut line: i32 = 1;
+    while i < t.len {
+        let c = t[i];
+        if c == '\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if (c == ' ') or (c == '\t') or (c == '\r') {
+            i += 1;
+            continue;
+        }
+        if (c == ';') and ((i + 1) < t.len) and (t[i + 1] == ';') {
+            while (i < t.len) and (t[i] != '\n') {
+                i += 1;
+            }
+            continue;
+        }
+        if (c == '(') and ((i + 1) < t.len) and (t[i + 1] == ';') {
+            // a block comment, which nests
+            let mut depth: i32 = 0;
+            while i < t.len {
+                if (t[i] == '(') and ((i + 1) < t.len) and (t[i + 1] == ';') {
+                    depth += 1;
+                    i += 2;
+                } else if (t[i] == ';') and ((i + 1) < t.len) and (t[i + 1] == ')') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    if t[i] == '\n' {
+                        line += 1;
+                    }
+                    i += 1;
+                }
+            }
+            if depth != 0 {
+                err_at(line, "a block comment without its end ';)'");
+                return;
+            }
+            continue;
+        }
+        if c == '(' {
+            TOKS.push(Tok.{ kind: TK_LP, text: "(", line: line });
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            TOKS.push(Tok.{ kind: TK_RP, text: ")", line: line });
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            let mut b = u.Buf.init();
+            i += 1;
+            while (i < t.len) and (t[i] != '"') {
+                if t[i] == '\n' {
+                    err_at(line, "a string without its closing '\"'");
+                    return;
+                }
+                if t[i] != '\\' {
+                    b.c(t[i]);
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                if i >= t.len {
+                    break;
+                }
+                let e = t[i];
+                if e == 'n' {
+                    b.c('\n');
+                } else if e == 't' {
+                    b.c('\t');
+                } else if e == 'r' {
+                    b.c('\r');
+                } else if (e == '\\') or (e == '\'') or (e == '"') {
+                    b.c(e);
+                } else if ((i + 1) < t.len) and (hex_digit(e) < 16) and (hex_digit(t[i + 1]) < 16) {
+                    b.c(@truncate(u8, (hex_digit(e) << 4) | hex_digit(t[i + 1])));
+                    i += 1;
+                } else {
+                    err_at(line, u.f1("'\\%s' is not an escape of a string", ch(e)));
+                    return;
+                }
+                i += 1;
+            }
+            if i >= t.len {
+                err_at(line, "a string without its closing '\"'");
+                return;
+            }
+            i += 1;
+            TOKS.push(Tok.{ kind: TK_STR, text: b.done(), line: line });
+            continue;
+        }
+        if idchar(c) {
+            let st = i;
+            while (i < t.len) and idchar(t[i]) {
+                i += 1;
+            }
+            let w = t[st..i];
+            if (w[0] == '$') and (w.len > 1) {
+                TOKS.push(Tok.{ kind: TK_ID, text: w[1..], line: line });
+            } else {
+                TOKS.push(Tok.{ kind: TK_KW, text: w, line: line });
+            }
+            continue;
+        }
+        err_at(line, u.f1("'%s' cannot be in WebAssembly text", ch(c)));
+        return;
+    }
+    TOKS.push(Tok.{ kind: TK_EOF, text: "", line: line });
+}
+
+// A decimal number (all of s), or -1.
+fn dnum(s: []u8) i64 {
+    if (s.len == 0) or (s.len > 9) {
+        return -1;
+    }
+    let mut v: i64 = 0;
+    for c in s {
+        if not u.is_digit(c) {
+            return -1;
+        }
+        v = (v * 10) + @as(i64, c - '0');
+    }
+    return v;
+}
+
+fn ch(c: u8) []u8 {
+    let b = u.newn.[u8](1);
+    b[0] = c;
+    return b[0..1];
+}
+
+// -----------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------
+let mut TOKS: u.List.[Tok] = u.List.[Tok].{ data: @ptr_from_int(*mut Tok, 0), len: 0, cap: 0 };
+let mut P: usize = 0;
+let mut A: *mut Asm = @ptr_from_int(*mut Asm, 0);
+let mut ENV: *Env = @ptr_from_int(*Env, 0);
+let mut INLINE: bool = false;
+let mut W64: bool = false;
+let mut O: *mut bn.Bytes = @ptr_from_int(*mut bn.Bytes, 0);  // the code being made
+let mut FX: *mut u.List.[Fix] = @ptr_from_int(*mut u.List.[Fix], 0);
+let mut CUR: *mut AFunc = @ptr_from_int(*mut AFunc, 0);  // file-scope asm: the function being made
+let mut LTYPES: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };  // its locals (parameters first)
+let mut LNAMES: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+// The validation algorithm's stacks.
+const CF_BLOCK: u8 = 0;
+const CF_LOOP: u8 = 1;
+const CF_IF: u8 = 2;
+const CF_ELSE: u8 = 3;
+const CF_TRY: u8 = 4;
+const CF_FUNC: u8 = 5;
+const CF_OUTER: u8 = 6;  // asm goto: a label of the statement (a block around the template)
+
+struct Frame {
+    kind: u8,
+    params: []u8,
+    results: []u8,
+    height: usize,
+    unreach: bool,
+    label: []u8,
+    folded: bool,
+}
+
+let mut VALS: u.List.[u8] = u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 };
+let mut CTRL: u.List.[Frame] = u.List.[Frame].{ data: @ptr_from_int(*mut Frame, 0), len: 0, cap: 0 };
+
+fn err_at(line: i32, msg: []u8) void {
+    if A.err.len == 0 {
+        A.err = msg;
+        A.line = line;
+    }
+}
+
+fn err(msg: []u8) void {
+    err_at(cur_line(), msg);
+}
+
+fn bad() bool {
+    return A.err.len > 0;
+}
+
+fn cur_line() i32 {
+    if P < TOKS.len {
+        return TOKS.get(P).line;
+    }
+    return 0;
+}
+
+fn peek() Tok {
+    return TOKS.get(@min(P, TOKS.len - 1));
+}
+
+fn peek2() Tok {
+    return TOKS.get(@min(P + 1, TOKS.len - 1));
+}
+
+fn next() Tok {
+    let t = peek();
+    if P < (TOKS.len - 1) {
+        P += 1;
+    }
+    return t;
+}
+
+fn is_kw(t: Tok, w: []u8) bool {
+    return (t.kind == TK_KW) and u.str_eq(t.text, w);
+}
+
+// Is the next token '(' and the one after it keyword w?
+fn at_group(w: []u8) bool {
+    return (peek().kind == TK_LP) and is_kw(peek2(), w);
+}
+
+fn expect_rp() void {
+    if bad() {
+        return;
+    }
+    let t = next();
+    if t.kind != TK_RP {
+        err_at(t.line, u.f1("expected ')' before '%s'", tok_text(t)));
+    }
+}
+
+fn tok_text(t: Tok) []u8 {
+    if t.kind == TK_EOF {
+        return "the end";
+    }
+    if t.kind == TK_ID {
+        return u.cat2("$", t.text);
+    }
+    if t.kind == TK_STR {
+        return "a string";
+    }
+    return t.text;
+}
+
+/// The text of value type t.
+pub fn vt_name(t: u8) []u8 {
+    if t == I32 {
+        return "i32";
+    }
+    if t == I64 {
+        return "i64";
+    }
+    if t == F32 {
+        return "f32";
+    }
+    if t == F64 {
+        return "f64";
+    }
+    if t == V128 {
+        return "v128";
+    }
+    if t == EXNREF {
+        return "exnref";
+    }
+    return "any";
+}
+
+fn ptr_vt() u8 {
+    if W64 {
+        return I64;
+    }
+    return I32;
+}
+
+fn feat_ok(f: u8, what: []u8) bool {
+    let mut bit: u64 = 0;
+    let mut name: []u8 = "";
+    if f == 's' {
+        bit = tg.W_SIMD128;
+        name = "simd128";
+    } else if f == 'r' {
+        bit = tg.W_RELAXED_SIMD;
+        name = "relaxed-simd";
+    } else if f == 'b' {
+        bit = tg.W_BULK_MEMORY;
+        name = "bulk-memory";
+    } else if f == 'n' {
+        bit = tg.W_NONTRAPPING_FPTOINT;
+        name = "nontrapping-fptoint";
+    } else if f == 'x' {
+        bit = tg.W_SIGN_EXT;
+        name = "sign-ext";
+    } else if f == 'a' {
+        bit = tg.W_ATOMICS;
+        name = "atomics";
+    } else if f == 't' {
+        bit = tg.W_TAIL_CALL;
+        name = "tail-call";
+    } else if f == 'e' {
+        bit = tg.W_EXCEPTION_HANDLING;
+        name = "exception-handling";
+    } else if f == 'm' {
+        bit = tg.W_MULTIVALUE;
+        name = "multivalue";
+    } else {
+        return true;
+    }
+    if tg.has(bit) {
+        return true;
+    }
+    err(u.f3("'%s' needs the %s extension (--features=+%s)", what, name, name));
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Validation (the specification's appendix: Validation Algorithm)
+// -----------------------------------------------------------------------------
+fn push_val(t: u8) void {
+    VALS.push(t);
+}
+
+fn pop_val(want: u8, what: []u8) u8 {
+    let f = CTRL.at(CTRL.len - 1);
+    if VALS.len == f.height {
+        if f.unreach {
+            return want;
+        }
+        if want == ANY {
+            err(u.f1("'%s' has no operand on the stack", what));
+        } else {
+            err(u.f2("'%s' needs an operand of type %s on the stack, which has none", what, vt_name(want)));
+        }
+        return want;
+    }
+    let t = VALS.pop();
+    if (want != ANY) and (t != ANY) and (t != want) {
+        err(u.f3("'%s' needs an operand of type %s, not %s", what, vt_name(want), vt_name(t)));
+    }
+    if t == ANY {
+        return want;
+    }
+    return t;
+}
+
+fn pop_vals(ts: []u8, what: []u8) void {
+    let mut k = ts.len;
+    while (k > 0) and not bad() {
+        k -= 1;
+        _ = pop_val(ts[k], what);
+    }
+}
+
+fn push_vals(ts: []u8) void {
+    for t in ts {
+        push_val(t);
+    }
+}
+
+fn push_ctrl(kind: u8, params: []u8, results: []u8, label: []u8, folded: bool) void {
+    CTRL.push(Frame.{ kind: kind, params: params, results: results, height: VALS.len, unreach: false, label: label,
+                      folded: folded });
+    push_vals(params);
+}
+
+fn pop_ctrl(what: []u8) Frame {
+    let f = CTRL.get(CTRL.len - 1);
+    pop_vals(f.results, what);
+    if not bad() and (VALS.len != f.height) {
+        err(u.f1("'%s' leaves values on the stack that its block does not return", what));
+    }
+    _ = CTRL.pop();
+    return f;
+}
+
+fn label_types(f: Frame) []u8 {
+    if f.kind == CF_LOOP {
+        return f.params;
+    }
+    return f.results;
+}
+
+fn set_unreachable() void {
+    let f = CTRL.at(CTRL.len - 1);
+    VALS.len = f.height;
+    f.unreach = true;
+}
+
+// The frame a label names: a depth (a number) or a name; its index in CTRL,
+// or -1 (reported).
+fn label_of(t: Tok, what: []u8) i64 {
+    if t.kind == TK_ID {
+        let mut k = CTRL.len;
+        while k > 0 {
+            k -= 1;
+            if u.str_eq(CTRL.get(k).label, t.text) {
+                return @int_cast(i64, k);
+            }
+        }
+        if INLINE and u.starts(t.text, "__lbl") {
+            err_at(t.line, u.f1("'%s' names no label of the statement (labels are asm goto's)", what));
+        } else {
+            err_at(t.line, u.f2("'%s': no enclosing block is labelled $%s", what, t.text));
+        }
+        return -1;
+    }
+    let d = nat(t, 0xffff_ffff);
+    if bad() {
+        return -1;
+    }
+    let nf = CTRL.len;
+    if d >= @as(u64, nf) {
+        err_at(t.line, u.f2("'%s' to depth %s: there is no such enclosing block", what, u.udec(d)));
+        return -1;
+    }
+    return @int_cast(i64, nf - 1 - @int_cast(usize, d));
+}
+
+fn depth_of(k: i64) u64 {
+    return @as(u64, CTRL.len - 1 - @int_cast(usize, k));
+}
+
+// -----------------------------------------------------------------------------
+// Numbers (6.3: integers and floating-point numbers)
+// -----------------------------------------------------------------------------
+// A natural number (decimal or 0x hexadecimal, with '_' between digits) of
+// at most max; reported if not.
+fn nat(t: Tok, max: u64) u64 {
+    let r = parse_uint(t.text);
+    if (t.kind != TK_KW) or not r.ok {
+        err_at(t.line, u.f1("'%s' is not a number", tok_text(t)));
+        return 0;
+    }
+    if r.big or (r.v > max) {
+        err_at(t.line, u.f2("%s is out of range (at most %s)", t.text, u.udec(max)));
+        return 0;
+    }
+    return r.v;
+}
+
+struct UInt {
+    ok: bool,
+    big: bool,
+    v: u64,
+}
+
+fn parse_uint(s: []u8) UInt {
+    let mut r = UInt.{ ok: false, big: false, v: 0 };
+    let mut i: usize = 0;
+    let mut base: u64 = 10;
+    if (s.len > 2) and (s[0] == '0') and (s[1] == 'x') {
+        base = 16;
+        i = 2;
+    }
+    let mut prev_digit = false;
+    let mut any = false;
+    while i < s.len {
+        let c = s[i];
+        if c == '_' {
+            if not prev_digit {
+                return r;
+            }
+            prev_digit = false;
+            i += 1;
+            continue;
+        }
+        let d = hex_digit(c);
+        if d >= base {
+            return r;
+        }
+        let nv = (r.v *% base) +% d;
+        if (r.v > (0xffff_ffff_ffff_ffff / base)) or (nv < (r.v *% base)) {
+            r.big = true;
+        }
+        r.v = nv;
+        prev_digit = true;
+        any = true;
+        i += 1;
+    }
+    r.ok = any and prev_digit;
+    return r;
+}
+
+// An integer literal for a `bits`-wide value: its bits (a signed literal down
+// to -2^(bits-1), an unsigned one up to 2^bits - 1).
+fn int_lit(t: Tok, bits: u32) u64 {
+    let mut s = t.text;
+    let mut neg = false;
+    if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
+        neg = s[0] == '-';
+        s = s[1..];
+    }
+    let r = parse_uint(s);
+    if (t.kind != TK_KW) or not r.ok {
+        err_at(t.line, u.f2("'%s' is not an integer of %s bits", tok_text(t), u.udec(@as(u64, bits))));
+        return 0;
+    }
+    let mut lim: u64 = 0xffff_ffff_ffff_ffff;
+    if bits < 64 {
+        lim = (@as(u64, 1) << bits) - 1;
+    }
+    let half = @as(u64, 1) << (bits - 1);
+    if r.big or (neg and (r.v > half)) or (not neg and (r.v > lim)) {
+        err_at(t.line, u.f2("%s is out of the range of a %s-bit integer", t.text, u.udec(@as(u64, bits))));
+        return 0;
+    }
+    let mut v = r.v;
+    if neg {
+        v = 0 -% v;
+    }
+    return v & lim;
+}
+
+// The sign-extended value of x's low `bits` bits.
+fn sext(x: u64, bits: u32) i64 {
+    if bits >= 64 {
+        return @bit_cast(i64, x);
+    }
+    let sh = 64 - bits;
+    return @bit_cast(i64, x << sh) >> sh;
+}
+
+// A floating-point literal's bits: f32 (dbl false) or f64.
+fn float_lit(t: Tok, dbl: bool) u64 {
+    let mut s = t.text;
+    let mut neg = false;
+    let mbits: u32 = u32_pick(dbl, 53, 24);
+    let ebits: u32 = u32_pick(dbl, 11, 8);
+    let sign = @as(u64, 1) << (mbits + ebits - 1);
+    let expmask = ((@as(u64, 1) << ebits) - 1) << (mbits - 1);
+    if t.kind != TK_KW {
+        err_at(t.line, u.f1("'%s' is not a floating-point number", tok_text(t)));
+        return 0;
+    }
+    if (s.len > 0) and ((s[0] == '-') or (s[0] == '+')) {
+        neg = s[0] == '-';
+        s = s[1..];
+    }
+    let mut bits: u64 = 0;
+    if u.str_eq(s, "inf") {
+        bits = expmask;
+    } else if u.str_eq(s, "nan") {
+        bits = expmask | (@as(u64, 1) << (mbits - 2));
+    } else if u.starts(s, "nan:0x") {
+        let r = parse_uint(s[4..]);
+        if not r.ok or r.big or (r.v == 0) or (r.v >= (@as(u64, 1) << (mbits - 1))) {
+            err_at(t.line, u.f1("'%s' is not a NaN payload of the type", t.text));
+            return 0;
+        }
+        bits = expmask | r.v;
+    } else if u.starts(s, "0x") {
+        bits = hex_float(t, s[2..], dbl);
+    } else {
+        // a decimal number: digits [. [digits]] [e [+-] digits]
+        let mut b = u.Buf.init();
+        let mut i: usize = 0;
+        let mut ok = (s.len > 0) and u.is_digit(s[0]);
+        let mut prev: u8 = ' ';
+        while ok and (i < s.len) {
+            let c = s[i];
+            if c == '_' {
+                ok = u.is_digit(prev) and ((i + 1) < s.len) and u.is_digit(s[i + 1]);
+            } else if u.is_digit(c) or (c == '.') or (c == 'e') or (c == 'E') {
+                b.c(c);
+            } else if ((c == '+') or (c == '-')) and ((prev == 'e') or (prev == 'E')) {
+                b.c(c);
+            } else {
+                ok = false;
+            }
+            prev = c;
+            i += 1;
+        }
+        if not ok {
+            err_at(t.line, u.f1("'%s' is not a floating-point number", t.text));
+            return 0;
+        }
+        let txt = b.done();
+        if dbl {
+            let f = u.parse_f64(txt);
+            bits = @bit_cast(u64, f);
+        } else {
+            let f = u.parse_f32(txt);
+            bits = @as(u64, @bit_cast(u32, f));
+        }
+        if (bits & expmask) == expmask {
+            err_at(t.line, u.f1("%s is out of the range of the type", t.text));
+            return 0;
+        }
+    }
+    if bad() {
+        return 0;
+    }
+    if neg {
+        bits = bits | sign;
+    }
+    return bits;
+}
+
+fn u32_pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// m >> sh, rounded to nearest, ties to even (sticky: bits below m that are
+// not zero).
+fn round_shift(m: u64, sticky: bool, sh: u32) u64 {
+    if sh == 0 {
+        return m;
+    }
+    if sh > 64 {
+        return 0;
+    }
+    let mut q: u64 = 0;
+    let mut rem = m;
+    if sh < 64 {
+        q = m >> sh;
+        rem = m & ((@as(u64, 1) << sh) - 1);
+    }
+    let half = @as(u64, 1) << (sh - 1);
+    if (rem > half) or ((rem == half) and (sticky or ((q & 1) != 0))) {
+        q += 1;
+    }
+    return q;
+}
+
+// A hexadecimal floating-point number (after "0x"): hexdigits [. [hexdigits]]
+// [p [+-] digits], rounded once to the type (6.3.2).
+fn hex_float(t: Tok, s: []u8, dbl: bool) u64 {
+    let mbits: u32 = u32_pick(dbl, 53, 24);
+    let ebits: u32 = u32_pick(dbl, 11, 8);
+    let bias: i64 = (@as(i64, 1) << (ebits - 1)) - 1;
+    let emin: i64 = 1 - bias;
+    let mut m: u64 = 0;
+    let mut sticky = false;
+    let mut exp: i64 = 0;
+    let mut i: usize = 0;
+    let mut dot = false;
+    let mut digits: i32 = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '_' {
+            i += 1;
+            continue;
+        }
+        if (c == '.') and not dot {
+            dot = true;
+            i += 1;
+            continue;
+        }
+        let d = hex_digit(c);
+        if d >= 16 {
+            break;
+        }
+        digits += 1;
+        if (m >> 60) == 0 {
+            m = (m << 4) | d;
+            if dot {
+                exp -= 4;
+            }
+        } else {
+            if d != 0 {
+                sticky = true;
+            }
+            if not dot {
+                exp += 4;
+            }
+        }
+        i += 1;
+    }
+    if (digits == 0) or ((i < s.len) and (s[i] != 'p') and (s[i] != 'P')) {
+        err_at(t.line, u.f1("'%s' is not a floating-point number", t.text));
+        return 0;
+    }
+    if i < s.len {
+        i += 1;
+        let mut eneg = false;
+        if (i < s.len) and ((s[i] == '+') or (s[i] == '-')) {
+            eneg = s[i] == '-';
+            i += 1;
+        }
+        let r = parse_uint(s[i..]);
+        if not r.ok {
+            err_at(t.line, u.f1("'%s' is not a floating-point number", t.text));
+            return 0;
+        }
+        let mut e = @bit_cast(i64, @min(r.v, 100000));
+        if r.big {
+            e = 100000;
+        }
+        if eneg {
+            e = -e;
+        }
+        exp += e;
+    }
+    if m == 0 {
+        return 0;
+    }
+    // value = m * 2^exp; its leading bit's exponent e
+    let p = 63 - @int_cast(i64, @clz(m));
+    let mut e = p + exp;
+    let mut sh = p - @as(i64, mbits - 1);
+    if e < emin {
+        sh += emin - e;
+    }
+    let mut q: u64 = 0;
+    if sh >= 0 {
+        q = round_shift(m, sticky, @truncate(u32, @as(u64, @bit_cast(u64, @min(sh, 100)))));
+    } else {
+        q = m << @truncate(u32, @bit_cast(u64, -sh));
+    }
+    let lead = @as(u64, 1) << (mbits - 1);
+    if q >= (lead << 1) {
+        q = q >> 1;
+        e += 1;
+    }
+    if e < emin {
+        // subnormal (or rounded up to the smallest normal number)
+        if q >= lead {
+            return (@as(u64, 1) << (mbits - 1)) | (q - lead);
+        }
+        return q;
+    }
+    if e > bias {
+        err_at(t.line, u.f1("%s is out of the range of the type", t.text));
+        return 0;
+    }
+    return (@bit_cast(u64, e + bias) << (mbits - 1)) | (q - lead);
+}
+
+// -----------------------------------------------------------------------------
+// Encoding
+// -----------------------------------------------------------------------------
+fn op_byte(b: u8) void {
+    O.u8_(b);
+}
+
+fn fix(kind: u8, opk: i32, name: []u8, wide: bool, params: []u8, results: []u8) void {
+    FX.push(Fix.{ kind: kind, off: @int_cast(u32, O.len()), op: opk, name: name, wide: wide, params: params,
+                  results: results });
+    if (kind == FX_TABLE) or (kind == FX_DATA) {
+        if wide {
+            O.sleb10(0);
+        } else {
+            O.sleb5(0);
+        }
+    } else {
+        O.uleb5(0);
+    }
+}
+
+// A value type keyword.
+fn valtype(t: Tok) u8 {
+    if t.kind == TK_KW {
+        let names = ["i32", "i64", "f32", "f64", "v128", "exnref"];
+        let codes: [6]u8 = [I32, I64, F32, F64, V128, EXNREF];
+        for k in @as(usize, 0)..6 {
+            if u.str_eq(t.text, names[k]) {
+                if (codes[k] == V128) and not feat_ok('s', "v128") {
+                    return I32;
+                }
+                if (codes[k] == EXNREF) and not feat_ok('e', "exnref") {
+                    return I32;
+                }
+                return codes[k];
+            }
+        }
+    }
+    err_at(t.line, u.f1("'%s' is not a value type (i32, i64, f32, f64, v128)", tok_text(t)));
+    return I32;
+}
+
+// (param t*)* (result t*)*: the types (names of parameters when names is
+// not nil: a function's own; else none allowed).
+struct Sig {
+    params: []u8,
+    results: []u8,
+}
+
+fn typeuse(names: *mut u.List.[[]u8], what: []u8) Sig {
+    let mut ps = u.List.[u8].empty();
+    let mut rs = u.List.[u8].empty();
+    if at_group("type") {
+        err(u.f1("'%s': write the type as (param ...) (result ...): this text has no type section", what));
+        return Sig.{ params: "", results: "" };
+    }
+    while at_group("param") and not bad() {
+        _ = next();
+        _ = next();
+        if peek().kind == TK_ID {
+            let id = next();
+            if u.isnil(names) {
+                err_at(id.line, u.f1("'%s': only a function's parameters have names", what));
+                break;
+            }
+            names.push(id.text);
+            ps.push(valtype(next()));
+        } else {
+            while (peek().kind == TK_KW) and not bad() {
+                if not u.isnil(names) {
+                    names.push("");
+                }
+                ps.push(valtype(next()));
+            }
+        }
+        expect_rp();
+    }
+    while at_group("result") and not bad() {
+        _ = next();
+        _ = next();
+        while (peek().kind == TK_KW) and not bad() {
+            rs.push(valtype(next()));
+        }
+        expect_rp();
+    }
+    return Sig.{ params: perm(ps.items()), results: perm(rs.items()) };
+}
+
+fn perm(s: []u8) []u8 {
+    return u.perm_dup(s);
+}
+
+// A block type (`(result t)`, or with the multivalue extension any
+// (param ...) (result ...)), encoded.
+fn blocktype(what: []u8) Sig {
+    let s = typeuse(u.nil.[u.List.[[]u8]](), what);
+    if bad() {
+        return s;
+    }
+    if (s.params.len == 0) and (s.results.len == 0) {
+        op_byte(0x40);
+    } else if (s.params.len == 0) and (s.results.len == 1) {
+        op_byte(s.results[0]);
+    } else {
+        if not feat_ok('m', u.cat2(what, " with parameters or several results")) {
+            return s;
+        }
+        fix(FX_TYPE, -1, "", false, s.params, s.results);
+    }
+    return s;
+}
+
+fn opt_label() []u8 {
+    if peek().kind == TK_ID {
+        return next().text;
+    }
+    return "";
+}
+
+// `end $l` / `else $l`: the label repeated must be the block's.
+fn check_end_label(f: Frame, what: []u8) void {
+    if peek().kind == TK_ID {
+        let t = next();
+        if not u.str_eq(t.text, f.label) {
+            err_at(t.line, u.f2("'%s $%s' does not end the block of that label", what, t.text));
+        }
+    }
+}
+
+// The local a token names: an operand of an asm statement, or a function's
+// parameter or local; its index and type (write: the instruction writes it).
+struct LocalRef {
+    index: u32,
+    vt: u8,
+}
+
+fn local_ref(t: Tok, what: []u8, write: bool) LocalRef {
+    let none = LocalRef.{ index: 0, vt: I32 };
+    if INLINE {
+        if (t.kind == TK_ID) and u.starts(t.text, "__op") {
+            let k = dnum(t.text[4..]);
+            if (k >= 0) and (@int_cast(usize, k) < ENV.ops.len) {
+                let o = ENV.ops[@int_cast(usize, k)];
+                if o.kind == EO_LOCAL {
+                    if write and not o.out {
+                        err_at(t.line, u.f2("'%s' writes operand %s, which is an input (an output is '=' or '+')", what,
+                                            u.dec(k)));
+                    }
+                    return LocalRef.{ index: o.local, vt: o.vt };
+                }
+            }
+        }
+        err_at(t.line, u.f1("'%s': the locals of an asm statement are its operands in locals (%%0 of 'r' or 'm' ...)",
+                            what));
+        return none;
+    }
+    if t.kind == TK_ID {
+        for k in 0..LNAMES.len {
+            if u.str_eq(LNAMES.get(k), t.text) {
+                return LocalRef.{ index: @int_cast(u32, k), vt: LTYPES.get(k) };
+            }
+        }
+        err_at(t.line, u.f2("'%s': the function has no local $%s", what, t.text));
+        return none;
+    }
+    let k = nat(t, 0xffff_ffff);
+    if bad() {
+        return none;
+    }
+    if k >= @as(u64, LTYPES.len) {
+        err_at(t.line, u.f2("'%s': the function has no local %s", what, u.udec(k)));
+        return none;
+    }
+    return LocalRef.{ index: @truncate(u32, k), vt: LTYPES.get(@int_cast(usize, k)) };
+}
+
+// A function a token names (call, return_call, i32.const $f): Ref, and the
+// fixup's operand and name.
+struct FuncRef {
+    ok: bool,
+    op: i32,
+    name: []u8,
+    data: bool,  // an object (i32.const $x)
+    params: []u8,
+    results: []u8,
+}
+
+fn sym_ref(t: Tok, what: []u8, want_func: bool) FuncRef {
+    let mut r = FuncRef.{ ok: false, op: -1, name: "", data: false, params: "", results: "" };
+    if t.kind != TK_ID {
+        err_at(t.line, u.f2("'%s' needs a symbol ($name), not '%s'", what, tok_text(t)));
+        return r;
+    }
+    if INLINE and u.starts(t.text, "__sym") {
+        let k = dnum(t.text[5..]);
+        if (k >= 0) and (@int_cast(usize, k) < ENV.ops.len) and (ENV.ops[@int_cast(usize, k)].kind == EO_SYM) {
+            let o = ENV.ops[@int_cast(usize, k)];
+            r.op = @truncate(i32, k);
+            r.data = not o.func;
+            r.params = o.params;
+            r.results = o.results;
+            r.ok = true;
+        }
+    } else if INLINE and u.starts(t.text, "__op") {
+        err_at(t.line, u.f1("'%s' needs a symbol: the operand is in a local (constraint 's' or 'i' for a symbol)",
+                            what));
+        return r;
+    } else {
+        // (file-scope asm: its own functions and imports first)
+        if not INLINE {
+            for f in A.funcs.items() {
+                if u.str_eq(f.name, t.text) {
+                    r.ok = true;
+                    r.name = f.name;
+                    r.params = f.params;
+                    r.results = f.results;
+                }
+            }
+            for im in A.imports.items() {
+                if not r.ok and u.str_eq(im.id, t.text) {
+                    r.ok = true;
+                    r.name = im.id;
+                    r.params = im.params;
+                    r.results = im.results;
+                }
+            }
+        }
+        if not r.ok {
+            let x = g_lookup(t.text);
+            if x.kind != RF_NONE {
+                r.ok = true;
+                r.name = t.text;
+                r.data = x.kind == RF_DATA;
+                r.params = x.params;
+                r.results = x.results;
+            }
+        }
+    }
+    if not r.ok {
+        err_at(t.line, u.f2("'%s': $%s is no function or object of the program declared here", what, t.text));
+        return r;
+    }
+    if want_func and r.data {
+        err_at(t.line, u.f2("'%s': $%s is an object, not a function", what, t.text));
+        r.ok = false;
+    }
+    return r;
+}
+
+// A memarg: [offset=N] [align=N], of natural alignment n bytes (exact for
+// atomic accesses).
+fn memarg(n: u32, what: []u8, atomic: bool) void {
+    let mut off: u64 = 0;
+    let mut al: u64 = @as(u64, n);
+    if (peek().kind == TK_KW) and u.starts(peek().text, "offset=") {
+        let t = next();
+        let mut max: u64 = 0xffff_ffff;
+        if W64 {
+            max = 0xffff_ffff_ffff_ffff;
+        }
+        off = nat(Tok.{ kind: TK_KW, text: t.text[7..], line: t.line }, max);
+    }
+    if (peek().kind == TK_KW) and u.starts(peek().text, "align=") {
+        let t = next();
+        al = nat(Tok.{ kind: TK_KW, text: t.text[6..], line: t.line }, 0x1_0000);
+        if (al == 0) or ((al & (al - 1)) != 0) {
+            err_at(t.line, u.f1("'%s': the alignment must be a power of 2", what));
+        } else if al > @as(u64, n) {
+            err_at(t.line, u.f2("'%s': the alignment is at most the access's size, %s", what, u.udec(@as(u64, n))));
+        } else if atomic and (al != @as(u64, n)) {
+            err_at(t.line, u.f2("'%s': an atomic access's alignment is its size, %s", what, u.udec(@as(u64, n))));
+        }
+    }
+    let mut lg: u64 = 0;
+    while (@as(u64, 1) << @truncate(u32, lg)) < al {
+        lg += 1;
+    }
+    O.uleb(lg);
+    O.uleb(off);
+}
+
+// -----------------------------------------------------------------------------
+// Instructions
+// -----------------------------------------------------------------------------
+// (an instruction parsed into its own buffer before the operands of its
+// folded form are emitted: Pending)
+struct Pending {
+    bytes: bn.Bytes,
+    fixes: u.List.[Fix],
+    pops: []u8,
+    pushes: []u8,
+    kind: u8,              // PD_* (how its stack effect is applied)
+    frame: i64,            // PD_BR...: the label's frame
+    frames: u.List.[i64],  // PD_BR_TABLE: all the labels' frames (the default last)
+    what: []u8,
+}
+
+const PD_PLAIN: u8 = 0;
+const PD_BR: u8 = 1;
+const PD_BR_IF: u8 = 2;
+const PD_BR_TABLE: u8 = 3;
+const PD_RETURN: u8 = 4;
+const PD_UNREACH: u8 = 5;
+const PD_SELECT: u8 = 6;  // untyped: two values of one numeric or vector type
+const PD_TAIL: u8 = 7;    // return_call: pops, then the function's results must be the callee's
+const PD_THROW_REF: u8 = 8;
+const PD_DROP: u8 = 9;
+
+fn types_eq(a: []u8, b: []u8) bool {
+    return u.str_eq(a, b);
+}
+
+fn types_text(ts: []u8) []u8 {
+    let mut b = u.Buf.init();
+    b.c('[');
+    for k in 0..ts.len {
+        if k > 0 {
+            b.c(' ');
+        }
+        b.s(vt_name(ts[k]));
+    }
+    b.c(']');
+    return b.done();
+}
+
+fn resolve_p(ts: []u8) []u8 {
+    let out = u.perm_newn.[u8](ts.len + 1);
+    for k in 0..ts.len {
+        out[k] = ts[k];
+        if ts[k] == 'p' {
+            out[k] = ptr_vt();
+        }
+    }
+    return out[0..ts.len];
+}
+
+// Parses the immediates of plain instruction `w` (a keyword token) into pd;
+// false if `w` is a block instruction (block, loop, if, try_table, else,
+// end), which the caller handles.
+fn parse_plain(w: Tok, pd: *mut Pending) void {
+    let name = w.text;
+    pd.what = name;
+    pd.kind = PD_PLAIN;
+    pd.pops = "";
+    pd.pushes = "";
+    let saveO = O;
+    let saveFX = FX;
+    O = &mut pd.bytes;
+    FX = &mut pd.fixes;
+    parse_plain_in(w, pd);
+    O = saveO;
+    FX = saveFX;
+}
+
+fn one(t: u8) []u8 {
+    let b = u.perm_newn.[u8](1);
+    b[0] = t;
+    return b[0..1];
+}
+
+fn parse_plain_in(w: Tok, pd: *mut Pending) void {
+    let name = w.text;
+    if u.str_eq(name, "unreachable") {
+        op_byte(0x00);
+        pd.kind = PD_UNREACH;
+        return;
+    }
+    if u.str_eq(name, "nop") {
+        op_byte(0x01);
+        return;
+    }
+    if u.str_eq(name, "drop") {
+        op_byte(0x1a);
+        pd.kind = PD_DROP;
+        return;
+    }
+    if u.str_eq(name, "select") {
+        if at_group("result") {
+            let s = typeuse(u.nil.[u.List.[[]u8]](), name);
+            if s.results.len != 1 {
+                err_at(w.line, "'select (result t)' has one result type");
+                return;
+            }
+            op_byte(0x1c);
+            O.uleb(1);
+            op_byte(s.results[0]);
+            let t = s.results[0];
+            let ps = u.perm_newn.[u8](3);
+            ps[0] = t;
+            ps[1] = t;
+            ps[2] = I32;
+            pd.pops = ps[0..3];
+            pd.pushes = one(t);
+            return;
+        }
+        op_byte(0x1b);
+        pd.kind = PD_SELECT;
+        return;
+    }
+    if u.str_eq(name, "br") or u.str_eq(name, "br_if") {
+        let k = label_of(next(), name);
+        if k < 0 {
+            return;
+        }
+        op_byte(u8_pick(u.str_eq(name, "br"), 0x0c, 0x0d));
+        O.uleb(depth_of(k));
+        pd.frame = k;
+        pd.kind = u8_pick(u.str_eq(name, "br"), PD_BR, PD_BR_IF);
+        return;
+    }
+    if u.str_eq(name, "br_table") {
+        op_byte(0x0e);
+        pd.frames = u.List.[i64].empty();
+        while ((peek().kind == TK_ID) or ((peek().kind == TK_KW) and u.is_digit(peek().text[0]))) and not bad() {
+            let k = label_of(next(), name);
+            if k < 0 {
+                return;
+            }
+            pd.frames.push(k);
+        }
+        if pd.frames.len == 0 {
+            err_at(w.line, "'br_table' needs at least one label (its default)");
+            return;
+        }
+        O.uleb(@as(u64, pd.frames.len - 1));
+        for k in pd.frames.items() {
+            O.uleb(depth_of(k));
+        }
+        pd.kind = PD_BR_TABLE;
+        return;
+    }
+    if u.str_eq(name, "return") {
+        if INLINE {
+            err_at(w.line, "'return' in an asm statement would leave the function without its epilogue");
+            return;
+        }
+        op_byte(0x0f);
+        pd.kind = PD_RETURN;
+        return;
+    }
+    if u.str_eq(name, "call") or u.str_eq(name, "return_call") {
+        let tail = name.len > 4;
+        if tail and INLINE {
+            err_at(w.line, u.f1("'%s' in an asm statement would leave the function without its epilogue", name));
+            return;
+        }
+        if tail and not feat_ok('t', name) {
+            return;
+        }
+        let r = sym_ref(next(), name, true);
+        if not r.ok {
+            return;
+        }
+        op_byte(u8_pick(tail, 0x12, 0x10));
+        fix(FX_FUNC, r.op, r.name, false, "", "");
+        A.calls = true;
+        pd.pops = r.params;
+        pd.pushes = r.results;
+        if tail {
+            pd.kind = PD_TAIL;
+        }
+        return;
+    }
+    if u.str_eq(name, "call_indirect") or u.str_eq(name, "return_call_indirect") {
+        let tail = u.starts(name, "return");
+        if tail and INLINE {
+            err_at(w.line, u.f1("'%s' in an asm statement would leave the function without its epilogue", name));
+            return;
+        }
+        if tail and not feat_ok('t', name) {
+            return;
+        }
+        if (peek().kind == TK_KW) and u.str_eq(peek().text, "0") {
+            _ = next();  // (the table: the program's only one)
+        }
+        let s = typeuse(u.nil.[u.List.[[]u8]](), name);
+        if bad() {
+            return;
+        }
+        op_byte(u8_pick(tail, 0x13, 0x11));
+        fix(FX_TYPE, -1, "", false, s.params, s.results);
+        O.u8_(0);  // (table 0: the program's function table)
+        A.calls = true;
+        A.table = true;
+        // (the function's table index: an i32, also on memory64)
+        let ps = u.perm_newn.[u8](s.params.len + 1);
+        for k in 0..s.params.len {
+            ps[k] = s.params[k];
+        }
+        ps[s.params.len] = I32;
+        pd.pops = ps[0..s.params.len + 1];
+        pd.pushes = s.results;
+        if tail {
+            pd.kind = PD_TAIL;
+        }
+        return;
+    }
+    if u.str_eq(name, "throw_ref") {
+        if not feat_ok('e', name) {
+            return;
+        }
+        op_byte(0x0a);
+        pd.kind = PD_THROW_REF;
+        return;
+    }
+    if u.str_eq(name, "throw") {
+        err_at(w.line,
+               "'throw' names a tag, which C has none of (throw_ref rethrows an exception caught by try_table)");
+        return;
+    }
+    if u.str_eq(name, "local.get") or u.str_eq(name, "local.set") or u.str_eq(name, "local.tee") {
+        let wr = not u.str_eq(name, "local.get");
+        let l = local_ref(next(), name, wr);
+        if bad() {
+            return;
+        }
+        if u.str_eq(name, "local.get") {
+            op_byte(0x20);
+            pd.pushes = one(l.vt);
+        } else if u.str_eq(name, "local.set") {
+            op_byte(0x21);
+            pd.pops = one(l.vt);
+        } else {
+            op_byte(0x22);
+            pd.pops = one(l.vt);
+            pd.pushes = one(l.vt);
+        }
+        O.uleb(@as(u64, l.index));
+        return;
+    }
+    if u.str_eq(name, "global.get") or u.str_eq(name, "global.set") {
+        let t = next();
+        if (t.kind != TK_ID) or not u.str_eq(t.text, "__stack_pointer") {
+            err_at(t.line, u.f1("'%s': the only global the program has is $__stack_pointer", name));
+            return;
+        }
+        A.sp = true;
+        if u.str_eq(name, "global.get") {
+            op_byte(0x23);
+            pd.pushes = one(ptr_vt());
+        } else {
+            op_byte(0x24);
+            pd.pops = one(ptr_vt());
+        }
+        fix(FX_SP, -1, "", false, "", "");
+        return;
+    }
+    if u.str_eq(name, "memory.init") or u.str_eq(name, "data.drop") {
+        err_at(w.line, u.f1("'%s' names a data segment, which C has none of", name));
+        return;
+    }
+    if u.starts(name, "table.") or u.str_eq(name, "elem.drop") or u.starts(name, "ref.") {
+        err_at(w.line, u.f1("'%s' is of the reference types extension, which this target does not have", name));
+        return;
+    }
+    let k = g_names.get(u.intern(name));
+    if k == 0 {
+        if u.str_eq(name, "then") {
+            err_at(w.line, "'then' is only a part of a folded if: (if (then ...) (else ...))");
+        } else {
+            err_at(w.line, u.f1("'%s' is not a WebAssembly instruction", name));
+        }
+        return;
+    }
+    let x = g_tab.get(@as(usize, k - 1));
+    if not feat_ok(x.feat, name) {
+        return;
+    }
+    if x.pre != 0 {
+        op_byte(x.pre);
+        O.uleb(@as(u64, x.code));
+    } else {
+        op_byte(@truncate(u8, x.code));
+    }
+    pd.pops = resolve_p(x.params);
+    pd.pushes = resolve_p(x.results);
+    let im = x.imm;
+    if im == 'm' {
+        memarg(x.n, name, x.feat == 'a');
+    } else if im == 'L' {
+        memarg(x.n, name, false);
+        O.u8_(@truncate(u8, nat(next(), @as(u64, (16 / x.n) - 1))));
+    } else if im == 'l' {
+        O.u8_(@truncate(u8, nat(next(), @as(u64, x.n - 1))));
+    } else if im == 'z' {
+        O.u8_(0);
+    } else if im == 'Z' {
+        O.u8_(0);
+        O.u8_(0);
+    } else if im == 'S' {
+        for _j in @as(usize, 0)..16 {
+            O.u8_(@truncate(u8, nat(next(), 31)));
+        }
+    } else if im == 'V' {
+        v128_const();
+    } else if im == 'c' {
+        const_imm(x.results[0], name);
+    }
+}
+
+fn u8_pick(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// i32.const .. f64.const's immediate: a literal, or (of an address's width)
+// a symbol: an object's address, a function's table index.
+fn const_imm(t: u8, name: []u8) void {
+    let tk = next();
+    if tk.kind == TK_ID {
+        let r = sym_ref(tk, name, false);
+        if not r.ok {
+            return;
+        }
+        if (t != ptr_vt()) {
+            err_at(tk.line, u.f2("'%s $%s': an address is an i64.const on memory64, an i32.const else", name, tk.text));
+            return;
+        }
+        if r.data {
+            fix(FX_DATA, r.op, r.name, W64, "", "");
+        } else {
+            A.table = true;
+            fix(FX_TABLE, r.op, r.name, W64, "", "");
+        }
+        return;
+    }
+    if t == I32 {
+        O.sleb(sext(int_lit(tk, 32), 32));
+    } else if t == I64 {
+        O.sleb(@bit_cast(i64, int_lit(tk, 64)));
+    } else if t == F32 {
+        O.u32_(float_lit(tk, false));
+    } else {
+        O.u64_(float_lit(tk, true));
+    }
+}
+
+// v128.const shape lanes... (16 bytes, little-endian lanes)
+fn v128_const() void {
+    let sh = next();
+    let shapes = ["i8x16", "i16x8", "i32x4", "i64x2", "f32x4", "f64x2"];
+    let mut s: i32 = -1;
+    for k in @as(usize, 0)..6 {
+        if is_kw(sh, shapes[k]) {
+            s = @int_cast(i32, k);
+        }
+    }
+    if s < 0 {
+        err_at(sh.line, u.f1("'v128.const %s': the shape is i8x16, i16x8, i32x4, i64x2, f32x4 or f64x2", tok_text(sh)));
+        return;
+    }
+    let sizes: [6]u32 = [1, 2, 4, 8, 4, 8];
+    let size = sizes[@int_cast(usize, s)];
+    for _j in 0..(16 / size) {
+        let t = next();
+        let mut v: u64 = 0;
+        if s >= 4 {
+            v = float_lit(t, size == 8);
+        } else {
+            v = int_lit(t, size * 8);
+        }
+        for b in 0..size {
+            O.u8_(@truncate(u8, v >> (8 * b)));
+        }
+    }
+}
+
+// Applies pending instruction pd's stack effect and emits it.
+fn emit(pd: *mut Pending) void {
+    if bad() {
+        return;
+    }
+    let base = @int_cast(u32, O.len());
+    O.put(pd.bytes.view());
+    for f in pd.fixes.items() {
+        let mut g = f;
+        g.off += base;
+        FX.push(g);
+    }
+    let what = pd.what;
+    let k = pd.kind;
+    if k == PD_PLAIN {
+        pop_vals(pd.pops, what);
+        push_vals(pd.pushes);
+    } else if k == PD_UNREACH {
+        set_unreachable();
+    } else if k == PD_DROP {
+        _ = pop_val(ANY, what);
+    } else if k == PD_SELECT {
+        _ = pop_val(I32, what);
+        let t1 = pop_val(ANY, what);
+        let t2 = pop_val(ANY, what);
+        if bad() {
+            return;
+        }
+        if (t1 == EXNREF) or (t2 == EXNREF) {
+            err("'select' of references needs its type: select (result t)");
+            return;
+        }
+        if (t1 != t2) and (t1 != ANY) and (t2 != ANY) {
+            err(u.f2("'select' of values of two types, %s and %s", vt_name(t2), vt_name(t1)));
+            return;
+        }
+        push_val(u8_pick(t1 == ANY, t2, t1));
+    } else if (k == PD_BR) or (k == PD_BR_IF) {
+        let f = CTRL.get(@int_cast(usize, pd.frame));
+        if k == PD_BR_IF {
+            _ = pop_val(I32, what);
+        }
+        pop_vals(label_types(f), what);
+        if k == PD_BR {
+            set_unreachable();
+        } else {
+            push_vals(label_types(f));
+        }
+    } else if k == PD_BR_TABLE {
+        _ = pop_val(I32, what);
+        let def = CTRL.get(@int_cast(usize, pd.frames.last()));
+        let arity = label_types(def).len;
+        for fi in pd.frames.items() {
+            let lt = label_types(CTRL.get(@int_cast(usize, fi)));
+            if lt.len != arity {
+                err(u.f2("'br_table' to labels of different arities, %s and %s", u.zdec(lt.len), u.zdec(arity)));
+                return;
+            }
+            // (each label's types against the values, which stay)
+            let h = VALS.len;
+            pop_vals(lt, what);
+            VALS.len = h;
+        }
+        pop_vals(label_types(def), what);
+        set_unreachable();
+    } else if k == PD_RETURN {
+        pop_vals(CTRL.get(0).results, what);
+        set_unreachable();
+    } else if k == PD_TAIL {
+        pop_vals(pd.pops, what);
+        if not types_eq(pd.pushes, CTRL.get(0).results) {
+            err(u.f3("'%s': the callee returns %s, the function %s", what, types_text(pd.pushes),
+                     types_text(CTRL.get(0).results)));
+        }
+        set_unreachable();
+    } else if k == PD_THROW_REF {
+        _ = pop_val(EXNREF, what);
+        set_unreachable();
+    }
+}
+
+fn new_pending() Pending {
+    return Pending.{ bytes: bn.new_bytes(), fixes: u.List.[Fix].empty(), pops: "", pushes: "", kind: 0, frame: -1,
+                     frames: u.List.[i64].empty(), what: "" };
+}
+
+// try_table's catch clauses: (catch_all l) (catch_all_ref l); a clause with a
+// tag names one, which C has none of.
+fn catches() void {
+    let mut cs = u.List.[u8].empty();
+    let mut ls = u.List.[u64].empty();
+    while (peek().kind == TK_LP) and not bad() {
+        let w = peek2();
+        if is_kw(w, "catch") or is_kw(w, "catch_ref") {
+            err_at(w.line, u.f1("'%s' names a tag, which C has none of (catch_all and catch_all_ref catch any)",
+                                w.text));
+            return;
+        }
+        if not is_kw(w, "catch_all") and not is_kw(w, "catch_all_ref") {
+            break;
+        }
+        _ = next();
+        _ = next();
+        let rf = u.str_eq(w.text, "catch_all_ref");
+        let k = label_of(next(), w.text);
+        if k < 0 {
+            return;
+        }
+        // (the label receives nothing, or the exnref: its types must be those)
+        let lt = label_types(CTRL.get(@int_cast(usize, k)));
+        let ok = (not rf and (lt.len == 0)) or (rf and (lt.len == 1) and (lt[0] == EXNREF));
+        if not ok {
+            err_at(w.line, u.f2("'%s': the label's block must take %s", w.text, u.pick(rf, "[exnref]", "[]")));
+            return;
+        }
+        cs.push(u8_pick(rf, 3, 2));
+        // (a depth outside the try_table, whose own label is not yet there)
+        ls.push(depth_of(k));
+        expect_rp();
+    }
+    O.uleb(@as(u64, cs.len));
+    for j in 0..cs.len {
+        O.u8_(cs.get(j));
+        O.uleb(ls.get(j));
+    }
+}
+
+// A block instruction's opening (block, loop, if, try_table): its label and
+// type, the opcode emitted (if: after its condition, which the caller
+// emits first for the folded form).
+fn open_block(w: Tok, folded: bool) void {
+    let name = w.text;
+    let label = opt_label();
+    let mut kind = CF_BLOCK;
+    let mut code: u8 = 0x02;
+    if u.str_eq(name, "loop") {
+        kind = CF_LOOP;
+        code = 0x03;
+    } else if u.str_eq(name, "if") {
+        kind = CF_IF;
+        code = 0x04;
+    } else if u.str_eq(name, "try_table") {
+        if not feat_ok('e', name) {
+            return;
+        }
+        kind = CF_TRY;
+        code = 0x1f;
+    }
+    // (the block type is parsed into a buffer: in the folded if, the
+    // condition comes between it and the opcode)
+    let mut pd = new_pending();
+    let saveO = O;
+    let saveFX = FX;
+    O = &mut pd.bytes;
+    FX = &mut pd.fixes;
+    let s = blocktype(name);
+    O = saveO;
+    FX = saveFX;
+    if bad() {
+        return;
+    }
+    if folded and (kind == CF_IF) {
+        // the condition: folded instructions before (then ...)
+        while (peek().kind == TK_LP) and not is_kw(peek2(), "then") and not bad() {
+            folded_instr();
+        }
+    }
+    op_byte(code);
+    pd.what = name;
+    emit(&mut pd);
+    if kind == CF_IF {
+        _ = pop_val(I32, name);
+    }
+    pop_vals(s.params, name);
+    push_ctrl(kind, s.params, s.results, label, folded);
+    if kind == CF_TRY {
+        // (the catch clauses' labels are outside the try_table's own)
+        let f = CTRL.pop();
+        let h = VALS.len;
+        catches();
+        VALS.len = h;
+        CTRL.push(f);
+    }
+}
+
+fn do_else(line: i32) void {
+    let f = CTRL.get(CTRL.len - 1);
+    if f.kind != CF_IF {
+        err_at(line, "'else' outside an if");
+        return;
+    }
+    _ = pop_ctrl("else");
+    op_byte(0x05);
+    push_ctrl(CF_ELSE, f.params, f.results, f.label, f.folded);
+}
+
+fn do_end(line: i32) void {
+    let f = CTRL.get(CTRL.len - 1);
+    if (f.kind == CF_FUNC) or (f.kind == CF_OUTER) {
+        err_at(line, "'end' with no block to end");
+        return;
+    }
+    _ = pop_ctrl("end");
+    if bad() {
+        return;
+    }
+    if (f.kind == CF_IF) and not types_eq(f.params, f.results) {
+        err_at(line, u.f2("an if without else must return what it takes: it takes %s, returns %s", types_text(f.params),
+                          types_text(f.results)));
+        return;
+    }
+    op_byte(0x0b);
+    push_vals(f.results);
+}
+
+// One plain or block instruction (flat).
+fn flat_instr() void {
+    let w = next();
+    if w.kind != TK_KW {
+        err_at(w.line, u.f1("expected an instruction, not '%s'", tok_text(w)));
+        return;
+    }
+    let n = w.text;
+    if u.str_eq(n, "block") or u.str_eq(n, "loop") or u.str_eq(n, "if") or u.str_eq(n, "try_table") {
+        open_block(w, false);
+        return;
+    }
+    if u.str_eq(n, "else") or u.str_eq(n, "end") {
+        let f = CTRL.get(CTRL.len - 1);
+        if f.folded and (f.kind != CF_FUNC) {
+            err_at(w.line, u.f1("'%s' inside a folded block (its ')' ends it)", n));
+            return;
+        }
+        if u.str_eq(n, "else") {
+            do_else(w.line);
+            check_end_label(CTRL.get(CTRL.len - 1), "else");
+        } else {
+            let lab = CTRL.get(CTRL.len - 1);
+            do_end(w.line);
+            check_end_label(lab, "end");
+        }
+        return;
+    }
+    let mut pd = new_pending();
+    parse_plain(w, &mut pd);
+    emit(&mut pd);
+}
+
+// One folded instruction: ( ... ).
+fn folded_instr() void {
+    _ = next();  // (
+    let w = next();
+    if w.kind != TK_KW {
+        err_at(w.line, u.f1("expected an instruction after '(', not '%s'", tok_text(w)));
+        return;
+    }
+    let n = w.text;
+    if u.str_eq(n, "block") or u.str_eq(n, "loop") or u.str_eq(n, "try_table") {
+        open_block(w, true);
+        let depth = CTRL.len;
+        instrs(true);
+        if bad() {
+            return;
+        }
+        if CTRL.len != depth {
+            err_at(w.line, u.f1("a block in the folded '%s' is not ended", n));
+            return;
+        }
+        expect_rp();
+        do_end(w.line);
+        return;
+    }
+    if u.str_eq(n, "if") {
+        open_block(w, true);
+        if bad() {
+            return;
+        }
+        let depth = CTRL.len;
+        if not at_group("then") {
+            err_at(w.line, "a folded if needs (then ...)");
+            return;
+        }
+        _ = next();
+        _ = next();
+        instrs(true);
+        expect_rp();
+        if at_group("else") {
+            _ = next();
+            _ = next();
+            if CTRL.len != depth {
+                err_at(w.line, "a block in the folded if is not ended");
+                return;
+            }
+            do_else(w.line);
+            instrs(true);
+            expect_rp();
+        }
+        if bad() {
+            return;
+        }
+        if CTRL.len != depth {
+            err_at(w.line, "a block in the folded if is not ended");
+            return;
+        }
+        expect_rp();
+        do_end(w.line);
+        return;
+    }
+    if u.str_eq(n, "else") or u.str_eq(n, "end") or u.str_eq(n, "then") {
+        err_at(w.line, u.f1("'(%s' is not a folded instruction", n));
+        return;
+    }
+    let mut pd = new_pending();
+    parse_plain(w, &mut pd);
+    while (peek().kind == TK_LP) and not bad() {
+        folded_instr();
+    }
+    expect_rp();
+    emit(&mut pd);
+}
+
+// Instructions up to ')' (in_group) or the end of the text.
+fn instrs(in_group: bool) void {
+    while not bad() {
+        let t = peek();
+        if t.kind == TK_EOF {
+            if in_group {
+                err_at(t.line, "a '(' without its ')'");
+            }
+            return;
+        }
+        if t.kind == TK_RP {
+            if in_group {
+                return;
+            }
+            err_at(t.line, "a ')' without its '('");
+            return;
+        }
+        if t.kind == TK_LP {
+            folded_instr();
+        } else {
+            flat_instr();
+        }
+    }
+}
+
+fn reset(text: []u8, wasm64: bool) void {
+    load_table();
+    A = u.new.[Asm]();
+    A.code = bn.new_bytes();
+    A.fixes = u.List.[Fix].empty();
+    A.funcs = u.List.[*mut AFunc].empty();
+    A.imports = u.List.[AImport].empty();
+    W64 = wasm64;
+    VALS.clear();
+    CTRL.clear();
+    P = 0;
+    lex(text);
+}
+
+/// Assembles an asm statement's template (its operands and labels in env):
+/// the instructions, in a block of no parameters or results (its operands
+/// are locals), with asm goto's labels around it, and its fixups. For asm
+/// goto the code is
+///     block            ;; (done)
+///       block ... block   ;; the labels, $__lbl<n-1> outermost
+///         <the template>
+///         i32.const 0  local.set R  br (done)
+///       end i32.const 1  local.set R  br (done) ...
+///     end
+/// so that R (env.goto_local) says which label it went to (0: none).
+pub fn assemble_inline(text: []u8, env: *Env, wasm64: bool) *mut Asm {
+    reset(text, wasm64);
+    if bad() {
+        return A;
+    }
+    INLINE = true;
+    ENV = env;
+    O = &mut A.code;
+    FX = &mut A.fixes;
+    let n = env.nlabels;
+    if n > 0 {
+        op_byte(0x02);
+        op_byte(0x40);
+        push_ctrl(CF_OUTER, "", "", "", false);
+        let mut k = n;
+        while k > 0 {
+            k -= 1;
+            op_byte(0x02);
+            op_byte(0x40);
+            push_ctrl(CF_OUTER, "", "", u.cat2("__lbl", u.idec(k)), false);
+        }
+    }
+    // (the template itself: a block of no parameters or results, which a
+    // `br` to depth 0 at its top level leaves)
+    op_byte(0x02);
+    op_byte(0x40);
+    push_ctrl(CF_FUNC, "", "", "", false);
+    let depth = CTRL.len;
+    instrs(false);
+    if not bad() and (CTRL.len != depth) {
+        err("a block of the template is not ended ('end')");
+    }
+    if bad() {
+        return A;
+    }
+    _ = pop_ctrl("the end of the template");
+    if bad() {
+        A.err = "the template leaves values on the stack (its results are its outputs' locals: local.set them)";
+        return A;
+    }
+    op_byte(0x0b);
+    if n > 0 {
+        for k in 0..(@as(usize, @int_cast(usize, n)) + 1) {
+            if k > 0 {
+                op_byte(0x0b);
+            }
+            if k < @as(usize, @int_cast(usize, n)) {
+                op_byte(0x41);
+                O.sleb(@int_cast(i64, k));
+                op_byte(0x21);
+                O.uleb(@as(u64, env.goto_local));
+                op_byte(0x0c);
+                O.uleb(@as(u64, @int_cast(usize, n) - k));
+            } else {
+                op_byte(0x41);
+                O.sleb(@int_cast(i64, k));
+                op_byte(0x21);
+                O.uleb(@as(u64, env.goto_local));
+            }
+        }
+        op_byte(0x0b);
+    }
+    return A;
+}
+
+// -----------------------------------------------------------------------------
+// File-scope asm: module fields
+// -----------------------------------------------------------------------------
+// Skips a group whose '(' has been read, to its ')'.
+fn skip_group() void {
+    let mut depth: i32 = 1;
+    while depth > 0 {
+        let t = next();
+        if t.kind == TK_EOF {
+            err_at(t.line, "a '(' without its ')'");
+            return;
+        }
+        if t.kind == TK_LP {
+            depth += 1;
+        } else if t.kind == TK_RP {
+            depth -= 1;
+        }
+    }
+}
+
+fn header_func(line: i32) void {
+    let f = u.new.[AFunc]();
+    f.line = line;
+    f.fixes = u.List.[Fix].empty();
+    f.code = bn.new_bytes();
+    let id = next();
+    if id.kind != TK_ID {
+        err_at(id.line, "a function of file-scope asm needs a name: (func $name ...), the symbol C refers to");
+        return;
+    }
+    f.name = id.text;
+    for g in A.funcs.items() {
+        if u.str_eq(g.name, f.name) {
+            err_at(id.line, u.f1("$%s is defined twice", f.name));
+            return;
+        }
+    }
+    while at_group("export") and not bad() {
+        _ = next();
+        _ = next();
+        let s = next();
+        if s.kind != TK_STR {
+            err_at(s.line, "(export \"name\") needs the name as a string");
+            return;
+        }
+        f.exp = s.text;
+        expect_rp();
+    }
+    if at_group("import") {
+        err_at(id.line,
+               "an imported function is a module field of its own here: (import \"module\" \"name\" (func $id ...))");
+        return;
+    }
+    let mut names = u.List.[[]u8].empty();
+    let s = typeuse(&mut names, "func");
+    f.params = s.params;
+    f.results = s.results;
+    if (s.results.len > 1) and not feat_ok('m', "a function of several results") {
+        return;
+    }
+    let mut ls = u.List.[u8].empty();
+    while at_group("local") and not bad() {
+        _ = next();
+        _ = next();
+        if peek().kind == TK_ID {
+            names.push(next().text);
+            ls.push(valtype(next()));
+        } else {
+            while (peek().kind == TK_KW) and not bad() {
+                names.push("");
+                ls.push(valtype(next()));
+            }
+        }
+        expect_rp();
+    }
+    f.locals = perm(ls.items());
+    let pn = u.perm_newn.[[]u8](names.len + 1);
+    for k in 0..names.len {
+        pn[k] = names.get(k);
+    }
+    f.pnames = pn[0..names.len];
+    f.first = P;
+    skip_group();
+    A.funcs.push(f);
+}
+
+fn header_import(line: i32) void {
+    let m = next();
+    let n = next();
+    if (m.kind != TK_STR) or (n.kind != TK_STR) {
+        err_at(line, "(import \"module\" \"name\" (func $id ...)) needs the module and the name as strings");
+        return;
+    }
+    if not at_group("func") {
+        err_at(line, "file-scope asm imports functions only: (import \"module\" \"name\" (func $id ...))");
+        return;
+    }
+    _ = next();
+    _ = next();
+    let id = next();
+    if id.kind != TK_ID {
+        err_at(id.line, "an imported function needs a name: (func $id ...)");
+        return;
+    }
+    let s = typeuse(u.nil.[u.List.[[]u8]](), "import");
+    expect_rp();
+    expect_rp();
+    A.imports.push(AImport.{ module: m.text, name: n.text, id: id.text, params: s.params, results: s.results });
+}
+
+fn body_func(f: *mut AFunc) void {
+    P = f.first;
+    CUR = f;
+    LTYPES.clear();
+    LNAMES.clear();
+    for t in f.params {
+        LTYPES.push(t);
+    }
+    for t in f.locals {
+        LTYPES.push(t);
+    }
+    for n in f.pnames {
+        LNAMES.push(n);
+    }
+    VALS.clear();
+    CTRL.clear();
+    // (the locals, run-length encoded, then the code)
+    let mut groups: u64 = 0;
+    let mut k: usize = 0;
+    while k < f.locals.len {
+        let mut j = k;
+        while (j < f.locals.len) and (f.locals[j] == f.locals[k]) {
+            j += 1;
+        }
+        groups += 1;
+        k = j;
+    }
+    f.code.uleb(groups);
+    k = 0;
+    while k < f.locals.len {
+        let mut j = k;
+        while (j < f.locals.len) and (f.locals[j] == f.locals[k]) {
+            j += 1;
+        }
+        f.code.uleb(@as(u64, j - k));
+        f.code.u8_(f.locals[k]);
+        k = j;
+    }
+    O = &mut f.code;
+    FX = &mut f.fixes;
+    push_ctrl(CF_FUNC, "", f.results, "", true);
+    let depth = CTRL.len;
+    instrs(true);
+    if not bad() and (CTRL.len != depth) {
+        err(u.f1("a block of the function $%s is not ended ('end')", f.name));
+    }
+    if bad() {
+        return;
+    }
+    _ = pop_ctrl("the end of the function");
+    op_byte(0x0b);
+}
+
+/// Assembles file-scope asm (or an assembly source): module fields
+/// `(func ...)` and `(import ...)`, optionally inside `(module ...)`.
+pub fn assemble_file(text: []u8, wasm64: bool) *mut Asm {
+    return file(text, wasm64, true);
+}
+
+/// The functions' names and signatures, and the imports, of file-scope asm
+/// (not their code).
+pub fn assemble_headers(text: []u8, wasm64: bool) *mut Asm {
+    return file(text, wasm64, false);
+}
+
+fn file(text: []u8, wasm64: bool, bodies: bool) *mut Asm {
+    reset(text, wasm64);
+    if bad() {
+        return A;
+    }
+    INLINE = false;
+    // the functions' headers and the imports first (a function may call
+    // one defined after it)
+    let mut in_module = false;
+    while not bad() {
+        let t = next();
+        if t.kind == TK_EOF {
+            if in_module {
+                err_at(t.line, "a '(module' without its ')'");
+            }
+            break;
+        }
+        if (t.kind == TK_RP) and in_module {
+            in_module = false;
+            if peek().kind != TK_EOF {
+                err_at(peek().line, "text after the module");
+            }
+            continue;
+        }
+        if t.kind != TK_LP {
+            err_at(t.line, u.f1("expected a module field, (func ...) or (import ...), not '%s'", tok_text(t)));
+            break;
+        }
+        let w = next();
+        if is_kw(w, "module") and not in_module and (A.funcs.len == 0) and (A.imports.len == 0) {
+            in_module = true;
+            _ = opt_label();
+        } else if is_kw(w, "func") {
+            header_func(w.line);
+        } else if is_kw(w, "import") {
+            header_import(w.line);
+        } else {
+            err_at(w.line, u.f1("'%s' is not a module field of file-scope asm (func, import; define data in C)",
+                                tok_text(w)));
+        }
+    }
+    for f in A.funcs.items() {
+        if bad() or not bodies {
+            break;
+        }
+        body_func(f);
+    }
+    return A;
+}
+
+/// The message of a failed assembly, with its line when the text has
+/// several.
+pub fn message(x: *Asm, many_lines: bool) []u8 {
+    if many_lines and (x.line > 0) {
+        return u.f2("line %s: %s", u.idec(x.line), x.err);
+    }
+    return x.err;
+}

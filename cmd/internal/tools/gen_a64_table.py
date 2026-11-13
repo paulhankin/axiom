@@ -513,6 +513,7 @@ SVSZ['D'] = _sz('d')
 SVSZ['DX'] = 'd:0'
 SVSZ['SX'] = 's:0'
 SVSZ['BX'] = 'b:0'
+SVSZ['QX'] = 'q:0'  # a fixed .q element (SVE2.1 revd): the size bits are in the opcode
 
 
 def sv(name, ops, base, sz):
@@ -522,6 +523,10 @@ def sv(name, ops, base, sz):
 # SVE integer add/subtract (vectors, unpredicated): 00000100 size 1 Zm 000 opc Zn Zd
 for name, opc in (('add', 0), ('sub', 1), ('sqadd', 4), ('uqadd', 5), ('sqsub', 6), ('uqsub', 7)):
     sv(name, 'z0,z5,z16', 0x04200000 | (opc << 10), 'BHSD')
+# the clamps (SVE2.1 / SME): Zd clamped to [Zn, Zm], three same-element vectors
+sv('sclamp', 'z0,z5,z16', 0x4400c000, 'BHSD')
+sv('uclamp', 'z0,z5,z16', 0x4400c400, 'BHSD')
+sv('fclamp', 'z0,z5,z16', 0x64202400, 'HSD')
 # the logical ones (unpredicated): element always .d, the two size bits select the op
 for name, bits in (('and', 0), ('orr', 1), ('eor', 2), ('bic', 3)):
     sv(name, 'z0,z5,z16', 0x04203000 | (bits << 22), 'DX')
@@ -545,6 +550,8 @@ for name, opc, sz in UN:
 # the byte/halfword/word reverses and bit-reverse: 00000101 size 1 opc 100 Pg Zn Zd
 for name, opc, sz in (('revb', 0x0, 'HSD'), ('revh', 0x1, 'SD'), ('revw', 0x2, 'D'), ('rbit', 0x3, 'BHSD')):
     sv(name, 'z0,m10,z5', 0x05248000 | (opc << 16), sz)
+# REVD (SVE2.1): reverse 64-bit doublewords in 128-bit elements, .q only
+sv('revd', 'z0,m10,z5', 0x052e8000, 'QX')
 
 # MOVPRFX: unpredicated (whole register) and predicated (/m sets bit 16, /z clears)
 sv('movprfx', 'u0,u5', 0x0420bc00, 'N')

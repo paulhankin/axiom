@@ -23,6 +23,7 @@ import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_expr.ax" as gx;
+import "csema_asm.ax" as csa;
 import "ctypes.ax" as cty;
 
 /// File-scope asm a: its text joins the program's (asm/inline.ax:
@@ -53,9 +54,20 @@ fn aliases(a: *cast.Asm) [][]u8 {
     return out[0..2 * a.statics.len];
 }
 
-// v (of C type t) as the type a register of op's class holds.
-fn to_class(v: *mut ir.Value, op: ai.Op) *mut ir.Value {
+// v (of C type t) as the type a register of op's class holds. On
+// WebAssembly, a local of the value's own type (an integer narrower than
+// 32 bits extended to an i32 as its C type's signedness says: et).
+fn to_class(v: *mut ir.Value, op: ai.Op, et: *cty.CType) *mut ir.Value {
     let k = v.ty.kind;
+    if tg.is_wasm() {
+        if (k == ir.T_INT) and (v.ty.bits < 32) {
+            if cty.is_signed_int(et) {
+                return ir.sext(cg.B, v, ir.t_int(32));
+            }
+            return ir.zext(cg.B, v, ir.t_int(32));
+        }
+        return v;
+    }
     if (op.cls == ai.CL_GPR) and (k == ir.T_FLOAT) {
         return ir.bitcast(cg.B, v, ir.t_int(v.ty.bits));
     }
@@ -222,12 +234,17 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
             xs.push(ir.cint(ir.isz(), 0));  // (AArch64 Y, Dz: the floating zero, written #0.0)
             continue;
         }
+        if tg.is_wasm() and (op.bits == 128) {
+            // (a vector, which C keeps in memory: its value, for a v128 local)
+            xs.push(ir.load(cg.B, cg.lty(cty.unqual(e.ty)), gx.rv(e)));
+            continue;
+        }
         let v = gx.rv(e);
         if op.kind == ai.OK_IMM {
             xs.push(v);
             continue;
         }
-        xs.push(to_class(v, op));
+        xs.push(to_class(v, op, cty.unqual(e.ty)));
     }
     if exact {
         ir.note_asm_mem(@as(i64, index), mem_list(a, b));
@@ -240,18 +257,23 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
     // (the results first, just after it: then the stores)
     let vs = u.newn.[*mut ir.Value](outk.len + 1);
     for j in 0..outk.len {
-        vs[j] = result(r, outk.get(j), b.ops[outk.get(j)]);
+        vs[j] = result(r, outk.get(j), b.ops[outk.get(j)], cty.unqual(outs.get(j).ty));
     }
     let lo = u.newn.[*mut ir.Value](pouts.len + 1);
     let hi = u.newn.[*mut ir.Value](pouts.len + 1);
     for j in 0..pouts.len {
         let k = pouts.get(j);
-        lo[j] = result(r, k, b.ops[k]);
-        hi[j] = result(r, @int_cast(usize, b.ops[k].pair), b.ops[@int_cast(usize, b.ops[k].pair)]);
+        let pt = cty.unqual(pes.get(j).ty);
+        lo[j] = result(r, k, b.ops[k], pt);
+        hi[j] = result(r, @int_cast(usize, b.ops[k].pair), b.ops[@int_cast(usize, b.ops[k].pair)], pt);
     }
     for j in 0..outk.len {
         let e = outs.get(j);
         let t = cty.unqual(e.ty);
+        if tg.is_wasm() and (b.ops[outk.get(j)].bits == 128) {
+            _ = ir.store(cg.B, vs[j], addrs.get(j));  // (a vector's value to its object)
+            continue;
+        }
         _ = gx.store_lv(e, t, from_class(vs[j], t), addrs.get(j));
     }
     for j in 0..vouts.len {
@@ -346,6 +368,8 @@ fn pure_key(a: *cast.Asm, b: *ai.Blob) []u8 {
             u.f4(
                 ".%s.%s.%s.%s", u.pick(op.fp, "f", "i"), u.udec(@as(u64, op.cls)), u.idec(op.tie),
                 u.pick(op.early, "e", "")));
+        // (WebAssembly: a function's symbol, of its signature, is not an object's)
+        k.s(u.pick(op.wfunc, u.f2(".F%s>%s", op.wparams, op.wresults), ""));
     }
     k.s(u.pick(b.intel, "\x05intel", ""));
     for n in b.aliases {
@@ -355,12 +379,16 @@ fn pure_key(a: *cast.Asm, b: *ai.Blob) []u8 {
     return k.done();
 }
 
-// Output k (op) of asm r: the register its value is in, as the type of its
-// class (an integer of its width, or a floating type of it).
-fn result(r: *mut ir.Value, k: usize, op: ai.Op) *mut ir.Value {
+// Output k (op, of C type t) of asm r: the register its value is in, as
+// the type of its class (an integer of its width, or a floating type of
+// it); on WebAssembly a local of its own type (a vector's, a float's).
+fn result(r: *mut ir.Value, k: usize, op: ai.Op, t: *mut cty.CType) *mut ir.Value {
     let mut ty = ir.t_int(@as(i32, @bit_cast(i32, op.bits)));
     if op.cls == ai.CL_VEC {
         ty = ir.t_float(@as(i32, @bit_cast(i32, op.bits)));
+    }
+    if tg.is_wasm() and (op.fp or (op.bits == 128)) {
+        ty = cg.lty(t);
     }
     let mut args: [2]*mut ir.Value = [r, ir.ci32(@as(u64, k))];
     return ir.intr(cg.B, ir.IN_CALL_RESULT, ty, args[..]);
@@ -382,8 +410,32 @@ fn from_class(v: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
 /// asm statements' text, after a label of its name, is file-scope asm (so
 /// the function has no prologue or epilogue; its symbol is global, an
 /// internal function's name being unique).
-pub fn naked(name: []u8, f: *mut ir.Func, body: *cast.Stmt) void {
+pub fn naked(name: []u8, f: *mut ir.Func, ct: *cty.CType, body: *cast.Stmt) void {
     f.linkage = ir.LINK_EXTERNAL;
+    if tg.is_wasm() {
+        // (WebAssembly: the function's code is its asm, csema_asm.ax)
+        let nb = u.perm_new.[ai.Blob]();
+        nb.arch = tg.g_arch;
+        nb.file_id = -1;
+        nb.basic = true;
+        nb.text = u.perm_dup(csa.naked_text(name, ct, body));
+        nb.loc = u.perm_dup(u.file_of(body.span.file).display);
+        let mut al = u.List.[[]u8].empty();
+        for x in body.items.items() {
+            if (x.kind == cast.StmtKind.ASM) and u.notnil(x.asm) {
+                for n in aliases(x.asm) {
+                    al.push(n);
+                }
+            }
+        }
+        let als = u.perm_newn.[[]u8](al.len + 1);
+        for k in 0..al.len {
+            als[k] = al.get(k);
+        }
+        nb.aliases = als[0..al.len];
+        ai.toplevel.push(nb);
+        return;
+    }
     let mut t = u.Buf.init();
     let mut first = u.nil.[ai.Blob]();
     let mut al = u.List.[[]u8].empty();

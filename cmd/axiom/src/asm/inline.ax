@@ -19,7 +19,8 @@
 // `%l[name]`), `%=` (a number unique to each copy of the statement in the
 // code). Constraints are parsed by `constraint`; registers are numbered as
 // the backends number them: x86-64 rax..r15 0-15 and xmm0-15 16-31; AArch64
-// x0-x30 0-30, sp 31, v0-v31 32-63.
+// x0-x30 0-30, sp 31, v0-v31 32-63. WebAssembly has no registers: an operand
+// in a "register" is a local of its own (wasm.ax, asm/wasm.ax).
 // =============================================================================
 import "../target.ax" as tg;
 import "../util.ax" as u;
@@ -56,6 +57,11 @@ pub struct Op {
     pair: i32,    // x86-64 'A' of a 128-bit value: the operand of its other half (the low half in rax is the one the template names; its high half, in rdx, is `hi`, after all the others), or -1
     hi: bool,
     zero: bool,  // OK_IMM: the constant is 0 (as check.ax's stand-in is then)
+    // WebAssembly, OK_IMM of a symbol: a function's (wfunc), of this
+    // signature (asm/wasm.ax's value types), or an object's
+    wfunc: bool,
+    wparams: []u8,
+    wresults: []u8,
 }
 
 // Registers an operand can be in that the compiler never allocates: the
@@ -469,6 +475,13 @@ fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
             c.mem_q = true;
             return ok;
         }
+        if ch == 'k' {
+            // the stack pointer (an input whose operand is the register
+            // variable of sp: csema_asm.ax)
+            c.reg = true;
+            c.fixed = 31;
+            return ok;
+        }
         if ch == 'I' {
             set_imm(c, 0, 4095, ch);  // an add's immediate (also shifted: checked when used)
             return ok;
@@ -500,7 +513,8 @@ fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
         }
         return no_con(u.f1("'%s' is not a constraint of AArch64 supported here", ch_text(ch)));
     }
-    return no_con("inline assembly is not supported on this target");
+    return no_con(u.f1("'%s' is not a constraint of WebAssembly (r, m, i, n, s, g, X and matching ones are)",
+                       ch_text(ch)));
 }
 
 // One of AArch64's constraints of more than one letter (n), the dialect's
@@ -792,6 +806,12 @@ pub fn clobber_kind(arch: i32, n: []u8) i32 {
         if u.str_eq(n, "nzcv") or u.str_eq(n, "fpsr") or u.str_eq(n, "fpcr") {
             return 1;
         }
+        // the SME state (the ZA array and the ZT0 lookup table): the compiler
+        // keeps no value in them across an asm statement, so a clobber of
+        // either names nothing to save
+        if u.str_eq(n, "za") or u.str_eq(n, "zt0") {
+            return 1;
+        }
         // ffr (and z0-z31, p0-p15 where the caller has not made them a v
         // register's clobber and the predicates kept from operands: csema_asm.ax)
         if u.str_eq(n, "ffr") {
@@ -828,7 +848,7 @@ pub fn reg_reserved(arch: i32, r: i32, pinned: bool) []u8 {
         }
         return "";
     }
-    if r == 31 {
+    if (r == 31) and not pinned {
         return "the stack pointer";
     }
     if r == 29 {
@@ -964,7 +984,10 @@ pub fn modifier_ok(arch: i32, m: u8) bool {
     if arch == tg.ARCH_X64 {
         return u.find("abwkqhcnPpVzxAHtg", m) >= 0;
     }
-    return u.find("wxbhsdqzcnZ", m) >= 0;
+    if arch == tg.ARCH_A64 {
+        return u.find("wxbhsdqzcnZ", m) >= 0;
+    }
+    return m == 'c';  // (WebAssembly: a constant written as itself, as without it)
 }
 
 /// The text of a blob's template with each reference replaced by what

@@ -36,6 +36,7 @@
 import "../asm/a64.ax" as asm64;
 import "../asm/core.ax" as acr;
 import "../asm/inline.ax" as ai;
+import "../asm/wasm.ax" as aw;
 import "../asm/x64.ax" as asm86;
 import "../dbginfo.ax" as dbi;
 import "../diag.ax" as dg;
@@ -369,8 +370,9 @@ pub fn is_asm_source(path: []u8) bool {
 }
 
 /// Reads (and for a .S source preprocesses) the assembly source at `path`
-/// and assembles it for the target, to check it and learn its names; true
-/// if it has no errors (reported: C3097 at its line, C3901 on WebAssembly).
+/// and assembles it for the target (on WebAssembly, the text format: module
+/// fields), to check it and learn its names; true if it has no errors
+/// (reported: C3097 at its line).
 pub fn check_asm(path: []u8, o: *co.COptions) bool {
     let before = dg.error_count();
     let mut text = u.nosym();
@@ -391,9 +393,8 @@ pub fn check_asm(path: []u8, o: *co.COptions) bool {
         return false;
     }
     let sp = u.mkspan(fid, 0, 0);
-    if (tg.g_arch != tg.ARCH_X64) and (tg.g_arch != tg.ARCH_A64) {
-        _ = dg.err(sp, "C3901", "assembly sources are not supported on WebAssembly targets");
-        return false;
+    if tg.is_wasm() {
+        return check_wasm_asm(text, fid);
     }
     let intel = (tg.g_arch == tg.ARCH_X64) and o.asm_intel;
     let mut A = u.nil.[acr.Asm]();
@@ -441,6 +442,53 @@ pub fn check_asm(path: []u8, o: *co.COptions) bool {
     b.volatile_ = true;
     g_asm_blobs.push(b);
     return true;
+}
+
+// A WebAssembly assembly source (text format module fields: asm/wasm.ax),
+// as check_asm: its functions are the names it defines, the functions it
+// imports from "env" those it refers to.
+fn check_wasm_asm(text: []u8, fid: i32) bool {
+    aw.g_lookup = no_wasm_names;
+    let W = aw.assemble_file(text, tg.g_arch == tg.ARCH_WASM64);
+    if aw.failed(W) {
+        let line = @max(W.line, 1);
+        let mut at: u32 = 0;
+        let sf = u.file_of(fid);
+        let mut l: i32 = 1;
+        while (@as(usize, at) < sf.text.len) and (l < line) {
+            if sf.text[@as(usize, at)] == '\n' {
+                l += 1;
+            }
+            at += 1;
+        }
+        _ = dg.err(u.mkspan(fid, at, at), "C3097", W.err);
+        return false;
+    }
+    for f in W.funcs.items() {
+        g_asm_defs.put(u.intern(f.name), 1);
+        g_asm_def_names.push(u.intern(f.name));
+    }
+    for im in W.imports.items() {
+        if u.str_eq(im.module, "env") {
+            g_asm_refs.push(u.intern(im.name));
+        }
+    }
+    let b = u.perm_new.[ai.Blob]();
+    b.arch = tg.g_arch;
+    b.basic = true;
+    b.text = u.perm_dup(text);
+    b.file_id = fid;
+    b.loc = u.perm_dup(u.file_of(fid).display);
+    b.memory = true;
+    b.volatile_ = true;
+    g_asm_blobs.push(b);
+    return true;
+}
+
+// (an assembly source sees no C declarations: it imports what it calls)
+fn no_wasm_names(n: []u8) aw.Ref {
+    _ = n;
+    return aw.Ref.{ kind: aw.RF_NONE, params: "", results: "" };
 }
 
 /// An external name of the Axiom program: an `export fn` (span: its name).

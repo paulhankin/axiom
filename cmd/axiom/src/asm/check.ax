@@ -7,11 +7,13 @@
 // operands it chose (asm/x64.ax, asm/a64.ax), where only what depends on
 // them (a constant out of range) can still fail.
 // =============================================================================
+import "../elf.ax" as elf;
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "a64.ax" as a64;
 import "core.ax" as cr;
 import "inline.ax" as ai;
+import "wasm.ax" as aw;
 import "x64.ax" as x64;
 
 // Stand-in registers: x86-64 rax rcx rdx rbx rsi rdi r8-r15; AArch64 x0-x15
@@ -107,6 +109,9 @@ fn label(k: i32) []u8 {
 
 /// Why blob b's template does not assemble, or "".
 pub fn check(b: *mut ai.Blob) []u8 {
+    if (b.arch == tg.ARCH_WASM32) or (b.arch == tg.ARCH_WASM64) {
+        return wasm_check(b);
+    }
     g_arch = b.arch;
     g_err = "";
     let mut text = ai.expand(b, render, label, 0);
@@ -135,6 +140,18 @@ let mut g_defines: bool = false;
 /// Why asm text does not assemble (inline_: as a template, else as
 /// file-scope asm; intel: x86-64 text that starts in the Intel syntax), or "".
 pub fn check_text(arch: i32, text: []u8, inline_: bool, intel: bool) []u8 {
+    if (arch == tg.ARCH_WASM32) or (arch == tg.ARCH_WASM64) {
+        // (file-scope asm: module fields)
+        let W = aw.assemble_file(text, arch == tg.ARCH_WASM64);
+        g_sp = W.sp;
+        g_calls = W.calls;
+        g_defines = W.funcs.len > 0;
+        g_wasm_funcs = W.funcs;
+        if aw.failed(W) {
+            return aw.message(W, true);
+        }
+        return "";
+    }
     let mut A = u.nil.[cr.Asm]();
     if arch == tg.ARCH_X64 {
         if inline_ {
@@ -158,5 +175,160 @@ pub fn check_text(arch: i32, text: []u8, inline_: bool, intel: bool) []u8 {
     if cr.failed(A) {
         return cr.message(A);
     }
+    if (arch == tg.ARCH_A64) and (tg.is_darwin() or tg.is_windows()) {
+        return image_relocs(A);
+    }
     return "";
+}
+
+// What a Mach-O or PE image cannot hold (asm/obj.ax relax_abs_movw, which
+// the backend applies): an address in 32 or 16 bits, and absolute move-wide
+// groups other than the four of one address.
+fn image_relocs(A: *cr.Asm) []u8 {
+    let rs = A.relocs.items();
+    for r in rs {
+        if (r.ty == elf.R_AARCH64_ABS32) or (r.ty == elf.R_AARCH64_ABS16) {
+            return u.f1("an address in %s bits (.word, .hword or .short of a symbol): a Mach-O or PE image is loaded above 4 GiB, at an address only the loader knows (an address is a .quad; a difference of two, `.word a - b`, fits)",
+                        u.pick(r.ty == elf.R_AARCH64_ABS32, "32", "16"));
+        }
+        if (r.ty >= 270) and (r.ty <= 272) {
+            return "a signed absolute move-wide group (:abs_g*_s:): Mach-O and PE images have no relocation of it";
+        }
+        if (r.ty >= 263) and (r.ty <= 269) {
+            // (one of the four groups of an address, each in the next instruction)
+            let mut seen: u32 = 0;
+            for q in rs {
+                if (q.ty >= 263) and (q.ty <= 269) and (q.sec == r.sec) and u.str_eq(q.name, r.name) and
+                   (q.addend == r.addend) and (q.off + 12 >= r.off) and (q.off <= r.off + 12) {
+                    seen = seen | (@as(u32, 1) << ((q.ty - 263) / 2));
+                }
+            }
+            if seen != 15 {
+                return "an absolute address in a move-wide group (:abs_g*:) that is not the four groups of one address to one register (movz, then three movk): Mach-O and PE images have no relocation of it";
+            }
+        }
+    }
+    return "";
+}
+
+/// The functions the last file-scope asm checked (check_text) defines, on
+/// WebAssembly.
+pub let mut g_wasm_funcs: u.List.[*mut aw.AFunc] = u.List.[*mut aw.AFunc].{
+    data: @ptr_from_int(*mut *mut aw.AFunc, 0), len: 0, cap: 0 };
+
+// A WebAssembly template (asm/wasm.ax) assembled with stand-in locals and
+// constants: its operands' types are known here, so that this is its
+// validation (the backend's assembly, with the real locals and the
+// program's signatures, finds the same).
+fn wasm_check(b: *mut ai.Blob) []u8 {
+    let w64 = b.arch == tg.ARCH_WASM64;
+    let ks = u.newn.[i64](b.ops.len + 1);
+    for k in 0..b.ops.len {
+        ks[k] = 1;
+        if b.ops[k].zero {
+            ks[k] = 0;
+        }
+    }
+    let env = wasm_env(b, w64, ks[0..b.ops.len], @as(u32, @truncate(u32, b.ops.len)));
+    if env.err.len > 0 {
+        return env.err;
+    }
+    let A = aw.assemble_inline(wasm_text(b, ks[0..b.ops.len], 0), &env.env, w64);
+    b.sp = A.sp;
+    b.calls = A.calls;
+    b.defines = false;
+    if aw.failed(A) {
+        return aw.message(A, false);
+    }
+    return "";
+}
+
+/// An asm statement's operands as the WebAssembly assembler's environment
+/// (asm/wasm.ax): each operand's local (`locals`: operand k's index, an
+/// input tied to an output its output's), its type, whether the template may
+/// write it; or why not (`err`: an input tied to an output of another type).
+pub struct WasmEnv {
+    env: aw.Env,
+    err: []u8,
+}
+
+pub fn wasm_op_vt(op: ai.Op, w64: bool) u8 {
+    if op.kind == ai.OK_MEM {
+        return u8_pick(w64, aw.I64, aw.I32);
+    }
+    if op.bits == 128 {
+        return aw.V128;
+    }
+    if op.fp {
+        return u8_pick(op.bits == 32, aw.F32, aw.F64);
+    }
+    return u8_pick(op.bits == 64, aw.I64, aw.I32);
+}
+
+fn u8_pick(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+pub fn wasm_env(b: *ai.Blob, w64: bool, locals: []i64, goto_local: u32) WasmEnv {
+    let n = b.ops.len;
+    let ops = u.newn.[aw.EnvOp](n + 1);
+    let mut msg: []u8 = "";
+    for k in 0..n {
+        let op = b.ops[k];
+        let mut e = aw.EnvOp.{ kind: aw.EO_LOCAL, vt: wasm_op_vt(op, w64), out: op.out, local: 0, func: false,
+                               params: "", results: "" };
+        if op.kind == ai.OK_IMM {
+            e.kind = u8_pick(op.sym, aw.EO_SYM, aw.EO_CONST);
+            e.func = op.wfunc;
+            e.params = op.wparams;
+            e.results = op.wresults;
+        } else if op.kind == ai.OK_MEM {
+            e.out = false;  // (the address: the template reads and writes the memory)
+        }
+        let mut src = k;
+        if op.tie >= 0 {
+            src = @int_cast(usize, op.tie);
+            e.out = true;
+            let tv = wasm_op_vt(b.ops[src], w64);
+            if (tv != e.vt) and (msg.len == 0) {
+                msg = u.f2("operand %s is tied to output %s, a local of another type", u.zdec(k), u.zdec(src));
+            }
+        }
+        e.local = @truncate(u32, @bit_cast(u64, locals[src]));
+        ops[k] = e;
+    }
+    return WasmEnv.{ env: aw.Env.{ ops: ops[0..n], nlabels: b.nlabels, goto_local: goto_local }, err: msg };
+}
+
+// The constants of wasm_text's operands (consts[k]: operand k's).
+let mut g_consts: u.List.[i64] = u.List.[i64].{ data: @ptr_from_int(*mut i64, 0), len: 0, cap: 0 };
+
+fn wasm_render(b: *ai.Blob, k: usize, mod: u8) []u8 {
+    _ = mod;
+    let op = b.ops[k];
+    if op.kind == ai.OK_IMM {
+        if op.sym {
+            return u.cat2("$__sym", u.zdec(k));
+        }
+        return u.dec(g_consts.get(k));
+    }
+    return u.cat2("$__op", u.zdec(k));
+}
+
+fn wasm_label(k: i32) []u8 {
+    return u.cat2("$__lbl", u.idec(k));
+}
+
+/// Blob b's template with its references written as asm/wasm.ax reads them
+/// (operand k a local `$__op<k>`, a symbol `$__sym<k>`, or the constant
+/// consts[k]; label k `$__lbl<k>`).
+pub fn wasm_text(b: *ai.Blob, consts: []i64, unique: u64) []u8 {
+    g_consts.clear();
+    for c in consts {
+        g_consts.push(c);
+    }
+    return ai.expand(b, wasm_render, wasm_label, unique);
 }
