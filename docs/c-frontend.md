@@ -83,7 +83,8 @@ lists the diagnostics.
   restrict parameters a scope.
 - **Format checks**: csema_format.ax, from the attribute `format` (csema_gnu.ax).
 - **Decimal floating types** (C23: `_Decimal32`, `_Decimal64`, `_Decimal128`, `df`
-  `dd` `dl` constants; `__STDC_IEC_60559_DFP__`): IEEE 754-2019's decimal formats in
+  `dd` `dl` constants; `__STDC_IEC_60559_DFP__`; Annex H's `_Decimal64x`, `d64x`,
+  in decimal128's format, `cty.TK_DEC64X`, ranked by `cty.dec_rank`): IEEE 754-2019's decimal formats in
   the BID encoding, computed in software (`std/c/rt/decimal.ax`, below), with the
   decimal rounding direction of `fe_dec_setround` and the exceptions in `<fenv.h>`'s
   flags; the library's decimal functions are `std/c/rt/dfp.ax` and `dfp_math.ax`.
@@ -208,7 +209,7 @@ cmd/axiom/internal/tests/c/ tests
   just before the return and just after the call.
 - The decimal floating types (`cty.is_decimal`): a `_Decimal32` or `_Decimal64` value
   is an integer of its width in the IR (its BID encoding: registers, no memory), a
-  `_Decimal128` 16 bytes of memory as a wide long double is (`cty.is_dec128`). Their
+  `_Decimal128` (or `_Decimal64x`) 16 bytes of memory as a wide long double is (`cty.is_dec128`). Their
   operations are calls of `std/c/rt/decimal.ax`'s `dec_` functions (`cgen_dec.ax`,
   through `cg.ld_fn`; `main.ax` loads the module when a unit operates on them:
   `cty.g_used_dec`), which round in the thread's decimal rounding direction and raise

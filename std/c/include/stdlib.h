@@ -128,6 +128,14 @@ int strfromf32(char *restrict s, size_t n, const char *restrict format, _Float32
 int strfromf64(char *restrict s, size_t n, const char *restrict format, _Float64 fp);
 int strfromf32x(char *restrict s, size_t n, const char *restrict format, _Float32x fp);
 int strfromf64x(char *restrict s, size_t n, const char *restrict format, _Float64x fp);
+/* H.12.4, H.12.5: from and to the interchange formats' encodings
+   (std/c/lib/math/fn_strenc.c) */
+#include <axc/stdlib_floatn.h>
+#if __STDC_VERSION__ >= 202311L && defined(__STDC_IEC_60559_DFP__)
+/* _Decimal64x's (H.12.2, H.12.3): _Decimal128's, whose format it has */
+_Decimal64x strtod64x(const char *restrict __nptr, char **restrict __endptr);
+int strfromd64x(char *restrict __s, size_t __n, const char *restrict __format, _Decimal64x __fp);
+#endif
 #endif
 #if __STDC_VERSION__ >= 202311L
 int strfromd(char *restrict __s, size_t __n, const char *restrict __format, double __fp);

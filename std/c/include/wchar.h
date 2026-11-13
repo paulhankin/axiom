@@ -95,6 +95,11 @@ _Float64 wcstof64(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
 _Float128 wcstof128(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
 _Float32x wcstof32x(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
 _Float64x wcstof64x(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+/* H.12.5: to the interchange formats' encodings (std/c/lib/math/fn_strenc.c) */
+#include <axc/wchar_floatn.h>
+#if __STDC_VERSION__ >= 202311L && defined(__STDC_IEC_60559_DFP__)
+_Decimal64x wcstod64x(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);
+#endif
 #endif
 #ifdef __STDC_IEC_60559_DFP__
 _Decimal32 wcstod32(const wchar_t *restrict __nptr, wchar_t **restrict __endptr);

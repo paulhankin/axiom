@@ -890,9 +890,135 @@ static void test_narrow(void)
     check(T(f32xsqrtf64x((_Float64x)2.5), _Float32x), "f32xsqrtf64x\n");
 }
 
+static void test_d64x(void)
+{
+    int ie = 0;
+    _Decimal64x rp = 0, rv = (_Decimal64x)1.5, rr = 0;
+    (void)rr;
+    check(T(acosd64x((_Decimal64x)0.5), _Decimal64x) && (acosd64x((_Decimal64x)0.5) == acosd128((_Decimal128)0.5) || (acosd64x((_Decimal64x)0.5) != acosd64x((_Decimal64x)0.5))), "acosd64x\n");
+    check(T(asind64x((_Decimal64x)0.5), _Decimal64x) && (asind64x((_Decimal64x)0.5) == asind128((_Decimal128)0.5) || (asind64x((_Decimal64x)0.5) != asind64x((_Decimal64x)0.5))), "asind64x\n");
+    check(T(atand64x((_Decimal64x)0.5), _Decimal64x) && (atand64x((_Decimal64x)0.5) == atand128((_Decimal128)0.5) || (atand64x((_Decimal64x)0.5) != atand64x((_Decimal64x)0.5))), "atand64x\n");
+    check(T(cosd64x((_Decimal64x)0.5), _Decimal64x) && (cosd64x((_Decimal64x)0.5) == cosd128((_Decimal128)0.5) || (cosd64x((_Decimal64x)0.5) != cosd64x((_Decimal64x)0.5))), "cosd64x\n");
+    check(T(sind64x((_Decimal64x)0.5), _Decimal64x) && (sind64x((_Decimal64x)0.5) == sind128((_Decimal128)0.5) || (sind64x((_Decimal64x)0.5) != sind64x((_Decimal64x)0.5))), "sind64x\n");
+    check(T(tand64x((_Decimal64x)0.5), _Decimal64x) && (tand64x((_Decimal64x)0.5) == tand128((_Decimal128)0.5) || (tand64x((_Decimal64x)0.5) != tand64x((_Decimal64x)0.5))), "tand64x\n");
+    check(T(acospid64x((_Decimal64x)0.5), _Decimal64x) && (acospid64x((_Decimal64x)0.5) == acospid128((_Decimal128)0.5) || (acospid64x((_Decimal64x)0.5) != acospid64x((_Decimal64x)0.5))), "acospid64x\n");
+    check(T(asinpid64x((_Decimal64x)0.5), _Decimal64x) && (asinpid64x((_Decimal64x)0.5) == asinpid128((_Decimal128)0.5) || (asinpid64x((_Decimal64x)0.5) != asinpid64x((_Decimal64x)0.5))), "asinpid64x\n");
+    check(T(atanpid64x((_Decimal64x)0.5), _Decimal64x) && (atanpid64x((_Decimal64x)0.5) == atanpid128((_Decimal128)0.5) || (atanpid64x((_Decimal64x)0.5) != atanpid64x((_Decimal64x)0.5))), "atanpid64x\n");
+    check(T(cospid64x((_Decimal64x)0.5), _Decimal64x) && (cospid64x((_Decimal64x)0.5) == cospid128((_Decimal128)0.5) || (cospid64x((_Decimal64x)0.5) != cospid64x((_Decimal64x)0.5))), "cospid64x\n");
+    check(T(sinpid64x((_Decimal64x)0.5), _Decimal64x) && (sinpid64x((_Decimal64x)0.5) == sinpid128((_Decimal128)0.5) || (sinpid64x((_Decimal64x)0.5) != sinpid64x((_Decimal64x)0.5))), "sinpid64x\n");
+    check(T(tanpid64x((_Decimal64x)0.5), _Decimal64x) && (tanpid64x((_Decimal64x)0.5) == tanpid128((_Decimal128)0.5) || (tanpid64x((_Decimal64x)0.5) != tanpid64x((_Decimal64x)0.5))), "tanpid64x\n");
+    check(T(acoshd64x((_Decimal64x)0.5), _Decimal64x) && (acoshd64x((_Decimal64x)0.5) == acoshd128((_Decimal128)0.5) || (acoshd64x((_Decimal64x)0.5) != acoshd64x((_Decimal64x)0.5))), "acoshd64x\n");
+    check(T(asinhd64x((_Decimal64x)0.5), _Decimal64x) && (asinhd64x((_Decimal64x)0.5) == asinhd128((_Decimal128)0.5) || (asinhd64x((_Decimal64x)0.5) != asinhd64x((_Decimal64x)0.5))), "asinhd64x\n");
+    check(T(atanhd64x((_Decimal64x)0.5), _Decimal64x) && (atanhd64x((_Decimal64x)0.5) == atanhd128((_Decimal128)0.5) || (atanhd64x((_Decimal64x)0.5) != atanhd64x((_Decimal64x)0.5))), "atanhd64x\n");
+    check(T(coshd64x((_Decimal64x)0.5), _Decimal64x) && (coshd64x((_Decimal64x)0.5) == coshd128((_Decimal128)0.5) || (coshd64x((_Decimal64x)0.5) != coshd64x((_Decimal64x)0.5))), "coshd64x\n");
+    check(T(sinhd64x((_Decimal64x)0.5), _Decimal64x) && (sinhd64x((_Decimal64x)0.5) == sinhd128((_Decimal128)0.5) || (sinhd64x((_Decimal64x)0.5) != sinhd64x((_Decimal64x)0.5))), "sinhd64x\n");
+    check(T(tanhd64x((_Decimal64x)0.5), _Decimal64x) && (tanhd64x((_Decimal64x)0.5) == tanhd128((_Decimal128)0.5) || (tanhd64x((_Decimal64x)0.5) != tanhd64x((_Decimal64x)0.5))), "tanhd64x\n");
+    check(T(expd64x((_Decimal64x)0.5), _Decimal64x) && (expd64x((_Decimal64x)0.5) == expd128((_Decimal128)0.5) || (expd64x((_Decimal64x)0.5) != expd64x((_Decimal64x)0.5))), "expd64x\n");
+    check(T(exp10d64x((_Decimal64x)0.5), _Decimal64x) && (exp10d64x((_Decimal64x)0.5) == exp10d128((_Decimal128)0.5) || (exp10d64x((_Decimal64x)0.5) != exp10d64x((_Decimal64x)0.5))), "exp10d64x\n");
+    check(T(exp10m1d64x((_Decimal64x)0.5), _Decimal64x) && (exp10m1d64x((_Decimal64x)0.5) == exp10m1d128((_Decimal128)0.5) || (exp10m1d64x((_Decimal64x)0.5) != exp10m1d64x((_Decimal64x)0.5))), "exp10m1d64x\n");
+    check(T(exp2d64x((_Decimal64x)0.5), _Decimal64x) && (exp2d64x((_Decimal64x)0.5) == exp2d128((_Decimal128)0.5) || (exp2d64x((_Decimal64x)0.5) != exp2d64x((_Decimal64x)0.5))), "exp2d64x\n");
+    check(T(exp2m1d64x((_Decimal64x)0.5), _Decimal64x) && (exp2m1d64x((_Decimal64x)0.5) == exp2m1d128((_Decimal128)0.5) || (exp2m1d64x((_Decimal64x)0.5) != exp2m1d64x((_Decimal64x)0.5))), "exp2m1d64x\n");
+    check(T(expm1d64x((_Decimal64x)0.5), _Decimal64x) && (expm1d64x((_Decimal64x)0.5) == expm1d128((_Decimal128)0.5) || (expm1d64x((_Decimal64x)0.5) != expm1d64x((_Decimal64x)0.5))), "expm1d64x\n");
+    check(T(logd64x((_Decimal64x)0.5), _Decimal64x) && (logd64x((_Decimal64x)0.5) == logd128((_Decimal128)0.5) || (logd64x((_Decimal64x)0.5) != logd64x((_Decimal64x)0.5))), "logd64x\n");
+    check(T(log10d64x((_Decimal64x)0.5), _Decimal64x) && (log10d64x((_Decimal64x)0.5) == log10d128((_Decimal128)0.5) || (log10d64x((_Decimal64x)0.5) != log10d64x((_Decimal64x)0.5))), "log10d64x\n");
+    check(T(log10p1d64x((_Decimal64x)0.5), _Decimal64x) && (log10p1d64x((_Decimal64x)0.5) == log10p1d128((_Decimal128)0.5) || (log10p1d64x((_Decimal64x)0.5) != log10p1d64x((_Decimal64x)0.5))), "log10p1d64x\n");
+    check(T(log1pd64x((_Decimal64x)0.5), _Decimal64x) && (log1pd64x((_Decimal64x)0.5) == log1pd128((_Decimal128)0.5) || (log1pd64x((_Decimal64x)0.5) != log1pd64x((_Decimal64x)0.5))), "log1pd64x\n");
+    check(T(logp1d64x((_Decimal64x)0.5), _Decimal64x) && (logp1d64x((_Decimal64x)0.5) == logp1d128((_Decimal128)0.5) || (logp1d64x((_Decimal64x)0.5) != logp1d64x((_Decimal64x)0.5))), "logp1d64x\n");
+    check(T(log2d64x((_Decimal64x)0.5), _Decimal64x) && (log2d64x((_Decimal64x)0.5) == log2d128((_Decimal128)0.5) || (log2d64x((_Decimal64x)0.5) != log2d64x((_Decimal64x)0.5))), "log2d64x\n");
+    check(T(log2p1d64x((_Decimal64x)0.5), _Decimal64x) && (log2p1d64x((_Decimal64x)0.5) == log2p1d128((_Decimal128)0.5) || (log2p1d64x((_Decimal64x)0.5) != log2p1d64x((_Decimal64x)0.5))), "log2p1d64x\n");
+    check(T(logbd64x((_Decimal64x)0.5), _Decimal64x) && (logbd64x((_Decimal64x)0.5) == logbd128((_Decimal128)0.5) || (logbd64x((_Decimal64x)0.5) != logbd64x((_Decimal64x)0.5))), "logbd64x\n");
+    check(T(cbrtd64x((_Decimal64x)0.5), _Decimal64x) && (cbrtd64x((_Decimal64x)0.5) == cbrtd128((_Decimal128)0.5) || (cbrtd64x((_Decimal64x)0.5) != cbrtd64x((_Decimal64x)0.5))), "cbrtd64x\n");
+    check(T(fabsd64x((_Decimal64x)0.5), _Decimal64x) && (fabsd64x((_Decimal64x)0.5) == fabsd128((_Decimal128)0.5) || (fabsd64x((_Decimal64x)0.5) != fabsd64x((_Decimal64x)0.5))), "fabsd64x\n");
+    check(T(sqrtd64x((_Decimal64x)0.5), _Decimal64x) && (sqrtd64x((_Decimal64x)0.5) == sqrtd128((_Decimal128)0.5) || (sqrtd64x((_Decimal64x)0.5) != sqrtd64x((_Decimal64x)0.5))), "sqrtd64x\n");
+    check(T(rsqrtd64x((_Decimal64x)0.5), _Decimal64x) && (rsqrtd64x((_Decimal64x)0.5) == rsqrtd128((_Decimal128)0.5) || (rsqrtd64x((_Decimal64x)0.5) != rsqrtd64x((_Decimal64x)0.5))), "rsqrtd64x\n");
+    check(T(erfd64x((_Decimal64x)0.5), _Decimal64x) && (erfd64x((_Decimal64x)0.5) == erfd128((_Decimal128)0.5) || (erfd64x((_Decimal64x)0.5) != erfd64x((_Decimal64x)0.5))), "erfd64x\n");
+    check(T(erfcd64x((_Decimal64x)0.5), _Decimal64x) && (erfcd64x((_Decimal64x)0.5) == erfcd128((_Decimal128)0.5) || (erfcd64x((_Decimal64x)0.5) != erfcd64x((_Decimal64x)0.5))), "erfcd64x\n");
+    check(T(lgammad64x((_Decimal64x)0.5), _Decimal64x) && (lgammad64x((_Decimal64x)0.5) == lgammad128((_Decimal128)0.5) || (lgammad64x((_Decimal64x)0.5) != lgammad64x((_Decimal64x)0.5))), "lgammad64x\n");
+    check(T(tgammad64x((_Decimal64x)0.5), _Decimal64x) && (tgammad64x((_Decimal64x)0.5) == tgammad128((_Decimal128)0.5) || (tgammad64x((_Decimal64x)0.5) != tgammad64x((_Decimal64x)0.5))), "tgammad64x\n");
+    check(T(ceild64x((_Decimal64x)0.5), _Decimal64x) && (ceild64x((_Decimal64x)0.5) == ceild128((_Decimal128)0.5) || (ceild64x((_Decimal64x)0.5) != ceild64x((_Decimal64x)0.5))), "ceild64x\n");
+    check(T(floord64x((_Decimal64x)0.5), _Decimal64x) && (floord64x((_Decimal64x)0.5) == floord128((_Decimal128)0.5) || (floord64x((_Decimal64x)0.5) != floord64x((_Decimal64x)0.5))), "floord64x\n");
+    check(T(nearbyintd64x((_Decimal64x)0.5), _Decimal64x) && (nearbyintd64x((_Decimal64x)0.5) == nearbyintd128((_Decimal128)0.5) || (nearbyintd64x((_Decimal64x)0.5) != nearbyintd64x((_Decimal64x)0.5))), "nearbyintd64x\n");
+    check(T(rintd64x((_Decimal64x)0.5), _Decimal64x) && (rintd64x((_Decimal64x)0.5) == rintd128((_Decimal128)0.5) || (rintd64x((_Decimal64x)0.5) != rintd64x((_Decimal64x)0.5))), "rintd64x\n");
+    check(T(roundd64x((_Decimal64x)0.5), _Decimal64x) && (roundd64x((_Decimal64x)0.5) == roundd128((_Decimal128)0.5) || (roundd64x((_Decimal64x)0.5) != roundd64x((_Decimal64x)0.5))), "roundd64x\n");
+    check(T(roundevend64x((_Decimal64x)0.5), _Decimal64x) && (roundevend64x((_Decimal64x)0.5) == roundevend128((_Decimal128)0.5) || (roundevend64x((_Decimal64x)0.5) != roundevend64x((_Decimal64x)0.5))), "roundevend64x\n");
+    check(T(truncd64x((_Decimal64x)0.5), _Decimal64x) && (truncd64x((_Decimal64x)0.5) == truncd128((_Decimal128)0.5) || (truncd64x((_Decimal64x)0.5) != truncd64x((_Decimal64x)0.5))), "truncd64x\n");
+    check(T(nextupd64x((_Decimal64x)0.5), _Decimal64x) && (nextupd64x((_Decimal64x)0.5) == nextupd128((_Decimal128)0.5) || (nextupd64x((_Decimal64x)0.5) != nextupd64x((_Decimal64x)0.5))), "nextupd64x\n");
+    check(T(nextdownd64x((_Decimal64x)0.5), _Decimal64x) && (nextdownd64x((_Decimal64x)0.5) == nextdownd128((_Decimal128)0.5) || (nextdownd64x((_Decimal64x)0.5) != nextdownd64x((_Decimal64x)0.5))), "nextdownd64x\n");
+    check(T(quantumd64x((_Decimal64x)0.5), _Decimal64x) && (quantumd64x((_Decimal64x)0.5) == quantumd128((_Decimal128)0.5) || (quantumd64x((_Decimal64x)0.5) != quantumd64x((_Decimal64x)0.5))), "quantumd64x\n");
+    check(T(atan2d64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (atan2d64x((_Decimal64x)0.5, (_Decimal64x)0.5) == atan2d128((_Decimal128)0.5, (_Decimal128)0.5) || (atan2d64x((_Decimal64x)0.5, (_Decimal64x)0.5) != atan2d64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "atan2d64x\n");
+    check(T(atan2pid64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (atan2pid64x((_Decimal64x)0.5, (_Decimal64x)0.5) == atan2pid128((_Decimal128)0.5, (_Decimal128)0.5) || (atan2pid64x((_Decimal64x)0.5, (_Decimal64x)0.5) != atan2pid64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "atan2pid64x\n");
+    check(T(hypotd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (hypotd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == hypotd128((_Decimal128)0.5, (_Decimal128)0.5) || (hypotd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != hypotd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "hypotd64x\n");
+    check(T(powd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (powd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == powd128((_Decimal128)0.5, (_Decimal128)0.5) || (powd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != powd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "powd64x\n");
+    check(T(powrd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (powrd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == powrd128((_Decimal128)0.5, (_Decimal128)0.5) || (powrd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != powrd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "powrd64x\n");
+    check(T(fmodd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmodd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fmodd128((_Decimal128)0.5, (_Decimal128)0.5) || (fmodd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fmodd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fmodd64x\n");
+    check(T(remainderd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (remainderd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == remainderd128((_Decimal128)0.5, (_Decimal128)0.5) || (remainderd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != remainderd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "remainderd64x\n");
+    check(T(copysignd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (copysignd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == copysignd128((_Decimal128)0.5, (_Decimal128)0.5) || (copysignd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != copysignd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "copysignd64x\n");
+    check(T(nextafterd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (nextafterd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == nextafterd128((_Decimal128)0.5, (_Decimal128)0.5) || (nextafterd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != nextafterd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "nextafterd64x\n");
+    check(T(fdimd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fdimd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fdimd128((_Decimal128)0.5, (_Decimal128)0.5) || (fdimd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fdimd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fdimd64x\n");
+    check(T(fmaximumd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmaximumd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fmaximumd128((_Decimal128)0.5, (_Decimal128)0.5) || (fmaximumd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fmaximumd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fmaximumd64x\n");
+    check(T(fminimumd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fminimumd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fminimumd128((_Decimal128)0.5, (_Decimal128)0.5) || (fminimumd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fminimumd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fminimumd64x\n");
+    check(T(fmaximum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmaximum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fmaximum_magd128((_Decimal128)0.5, (_Decimal128)0.5) || (fmaximum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fmaximum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fmaximum_magd64x\n");
+    check(T(fminimum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fminimum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fminimum_magd128((_Decimal128)0.5, (_Decimal128)0.5) || (fminimum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fminimum_magd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fminimum_magd64x\n");
+    check(T(fmaximum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmaximum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fmaximum_numd128((_Decimal128)0.5, (_Decimal128)0.5) || (fmaximum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fmaximum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fmaximum_numd64x\n");
+    check(T(fminimum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fminimum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fminimum_numd128((_Decimal128)0.5, (_Decimal128)0.5) || (fminimum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fminimum_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fminimum_numd64x\n");
+    check(T(fmaximum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmaximum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fmaximum_mag_numd128((_Decimal128)0.5, (_Decimal128)0.5) || (fmaximum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fmaximum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fmaximum_mag_numd64x\n");
+    check(T(fminimum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fminimum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fminimum_mag_numd128((_Decimal128)0.5, (_Decimal128)0.5) || (fminimum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fminimum_mag_numd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fminimum_mag_numd64x\n");
+    check(T(fmaxd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmaxd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fmaxd128((_Decimal128)0.5, (_Decimal128)0.5) || (fmaxd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fmaxd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fmaxd64x\n");
+    check(T(fmind64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmind64x((_Decimal64x)0.5, (_Decimal64x)0.5) == fmind128((_Decimal128)0.5, (_Decimal128)0.5) || (fmind64x((_Decimal64x)0.5, (_Decimal64x)0.5) != fmind64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "fmind64x\n");
+    check(T(quantized64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (quantized64x((_Decimal64x)0.5, (_Decimal64x)0.5) == quantized128((_Decimal128)0.5, (_Decimal128)0.5) || (quantized64x((_Decimal64x)0.5, (_Decimal64x)0.5) != quantized64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "quantized64x\n");
+    check(T(fmad64x((_Decimal64x)0.5, (_Decimal64x)0.5, (_Decimal64x)0.5), _Decimal64x) && (fmad64x((_Decimal64x)0.5, (_Decimal64x)0.5, (_Decimal64x)0.5) == fmad128((_Decimal128)0.5, (_Decimal128)0.5, (_Decimal128)0.5) || (fmad64x((_Decimal64x)0.5, (_Decimal64x)0.5, (_Decimal64x)0.5) != fmad64x((_Decimal64x)0.5, (_Decimal64x)0.5, (_Decimal64x)0.5))), "fmad64x\n");
+    check(T(frexpd64x((_Decimal64x)0.5, &ie), _Decimal64x) && (frexpd64x((_Decimal64x)0.5, &ie) == frexpd128((_Decimal128)0.5, &ie) || (frexpd64x((_Decimal64x)0.5, &ie) != frexpd64x((_Decimal64x)0.5, &ie))), "frexpd64x\n");
+    check(T(modfd64x((_Decimal64x)0.5, &rp), _Decimal64x), "modfd64x\n");
+    check(T(ldexpd64x((_Decimal64x)0.5, 3), _Decimal64x) && (ldexpd64x((_Decimal64x)0.5, 3) == ldexpd128((_Decimal128)0.5, 3) || (ldexpd64x((_Decimal64x)0.5, 3) != ldexpd64x((_Decimal64x)0.5, 3))), "ldexpd64x\n");
+    check(T(scalbnd64x((_Decimal64x)0.5, 3), _Decimal64x) && (scalbnd64x((_Decimal64x)0.5, 3) == scalbnd128((_Decimal128)0.5, 3) || (scalbnd64x((_Decimal64x)0.5, 3) != scalbnd64x((_Decimal64x)0.5, 3))), "scalbnd64x\n");
+    check(T(scalblnd64x((_Decimal64x)0.5, 3L), _Decimal64x) && (scalblnd64x((_Decimal64x)0.5, 3L) == scalblnd128((_Decimal128)0.5, 3L) || (scalblnd64x((_Decimal64x)0.5, 3L) != scalblnd64x((_Decimal64x)0.5, 3L))), "scalblnd64x\n");
+    check(T(rootnd64x((_Decimal64x)0.5, 3LL), _Decimal64x) && (rootnd64x((_Decimal64x)0.5, 3LL) == rootnd128((_Decimal128)0.5, 3LL) || (rootnd64x((_Decimal64x)0.5, 3LL) != rootnd64x((_Decimal64x)0.5, 3LL))), "rootnd64x\n");
+    check(T(pownd64x((_Decimal64x)0.5, 3LL), _Decimal64x) && (pownd64x((_Decimal64x)0.5, 3LL) == pownd128((_Decimal128)0.5, 3LL) || (pownd64x((_Decimal64x)0.5, 3LL) != pownd64x((_Decimal64x)0.5, 3LL))), "pownd64x\n");
+    check(T(compoundnd64x((_Decimal64x)0.5, 3LL), _Decimal64x) && (compoundnd64x((_Decimal64x)0.5, 3LL) == compoundnd128((_Decimal128)0.5, 3LL) || (compoundnd64x((_Decimal64x)0.5, 3LL) != compoundnd64x((_Decimal64x)0.5, 3LL))), "compoundnd64x\n");
+    check(T(ilogbd64x((_Decimal64x)0.5), int) && (ilogbd64x((_Decimal64x)0.5) == ilogbd128((_Decimal128)0.5) || (ilogbd64x((_Decimal64x)0.5) != ilogbd64x((_Decimal64x)0.5))), "ilogbd64x\n");
+    check(T(llogbd64x((_Decimal64x)0.5), long) && (llogbd64x((_Decimal64x)0.5) == llogbd128((_Decimal128)0.5) || (llogbd64x((_Decimal64x)0.5) != llogbd64x((_Decimal64x)0.5))), "llogbd64x\n");
+    check(T(lrintd64x((_Decimal64x)0.5), long) && (lrintd64x((_Decimal64x)0.5) == lrintd128((_Decimal128)0.5) || (lrintd64x((_Decimal64x)0.5) != lrintd64x((_Decimal64x)0.5))), "lrintd64x\n");
+    check(T(lroundd64x((_Decimal64x)0.5), long) && (lroundd64x((_Decimal64x)0.5) == lroundd128((_Decimal128)0.5) || (lroundd64x((_Decimal64x)0.5) != lroundd64x((_Decimal64x)0.5))), "lroundd64x\n");
+    check(T(llrintd64x((_Decimal64x)0.5), long long) && (llrintd64x((_Decimal64x)0.5) == llrintd128((_Decimal128)0.5) || (llrintd64x((_Decimal64x)0.5) != llrintd64x((_Decimal64x)0.5))), "llrintd64x\n");
+    check(T(llroundd64x((_Decimal64x)0.5), long long) && (llroundd64x((_Decimal64x)0.5) == llroundd128((_Decimal128)0.5) || (llroundd64x((_Decimal64x)0.5) != llroundd64x((_Decimal64x)0.5))), "llroundd64x\n");
+    check(T(llquantexpd64x((_Decimal64x)0.5), long long) && (llquantexpd64x((_Decimal64x)0.5) == llquantexpd128((_Decimal128)0.5) || (llquantexpd64x((_Decimal64x)0.5) != llquantexpd64x((_Decimal64x)0.5))), "llquantexpd64x\n");
+    check(T(fromfpd64x((_Decimal64x)0.5, 3, 8u), _Decimal64x) && (fromfpd64x((_Decimal64x)0.5, 3, 8u) == fromfpd128((_Decimal128)0.5, 3, 8u) || (fromfpd64x((_Decimal64x)0.5, 3, 8u) != fromfpd64x((_Decimal64x)0.5, 3, 8u))), "fromfpd64x\n");
+    check(T(ufromfpd64x((_Decimal64x)0.5, 3, 8u), _Decimal64x) && (ufromfpd64x((_Decimal64x)0.5, 3, 8u) == ufromfpd128((_Decimal128)0.5, 3, 8u) || (ufromfpd64x((_Decimal64x)0.5, 3, 8u) != ufromfpd64x((_Decimal64x)0.5, 3, 8u))), "ufromfpd64x\n");
+    check(T(fromfpxd64x((_Decimal64x)0.5, 3, 8u), _Decimal64x) && (fromfpxd64x((_Decimal64x)0.5, 3, 8u) == fromfpxd128((_Decimal128)0.5, 3, 8u) || (fromfpxd64x((_Decimal64x)0.5, 3, 8u) != fromfpxd64x((_Decimal64x)0.5, 3, 8u))), "fromfpxd64x\n");
+    check(T(ufromfpxd64x((_Decimal64x)0.5, 3, 8u), _Decimal64x) && (ufromfpxd64x((_Decimal64x)0.5, 3, 8u) == ufromfpxd128((_Decimal128)0.5, 3, 8u) || (ufromfpxd64x((_Decimal64x)0.5, 3, 8u) != ufromfpxd64x((_Decimal64x)0.5, 3, 8u))), "ufromfpxd64x\n");
+    check(T(nand64x("5"), _Decimal64x) && isnan(nand64x("5")), "nand64x\n");
+    check(T(totalorderd64x(&rv, &rv), int), "totalorderd64x\n");
+    check(T(totalordermagd64x(&rv, &rv), int), "totalordermagd64x\n");
+    check(T(getpayloadd64x(&rv), _Decimal64x), "getpayloadd64x\n");
+    check(T(setpayloadd64x(&rr, (_Decimal64x)5), int), "setpayloadd64x\n");
+    check(T(setpayloadsigd64x(&rr, (_Decimal64x)5), int), "setpayloadsigd64x\n");
+    check(T(canonicalized64x(&rr, &rv), int), "canonicalized64x\n");
+    check(T(samequantumd64x((_Decimal64x)0.5, (_Decimal64x)0.5), _Bool) && (samequantumd64x((_Decimal64x)0.5, (_Decimal64x)0.5) == samequantumd128((_Decimal128)0.5, (_Decimal128)0.5) || (samequantumd64x((_Decimal64x)0.5, (_Decimal64x)0.5) != samequantumd64x((_Decimal64x)0.5, (_Decimal64x)0.5))), "samequantumd64x\n");
+    check(T(d32addd64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal32) && d32addd64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d32addd128((_Decimal128)2.5, (_Decimal128)1.25), "d32addd64x\n");
+    check(T(d32subd64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal32) && d32subd64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d32subd128((_Decimal128)2.5, (_Decimal128)1.25), "d32subd64x\n");
+    check(T(d32muld64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal32) && d32muld64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d32muld128((_Decimal128)2.5, (_Decimal128)1.25), "d32muld64x\n");
+    check(T(d32divd64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal32) && d32divd64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d32divd128((_Decimal128)2.5, (_Decimal128)1.25), "d32divd64x\n");
+    check(T(d32fmad64x((_Decimal64x)2.5, (_Decimal64x)1.25, (_Decimal64x)0.5), _Decimal32) && d32fmad64x((_Decimal64x)2.5, (_Decimal64x)1.25, (_Decimal64x)0.5) == d32fmad128((_Decimal128)2.5, (_Decimal128)1.25, (_Decimal128)0.5), "d32fmad64x\n");
+    check(T(d32sqrtd64x((_Decimal64x)2.5), _Decimal32) && d32sqrtd64x((_Decimal64x)2.5) == d32sqrtd128((_Decimal128)2.5), "d32sqrtd64x\n");
+    check(T(d64addd64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal64) && d64addd64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d64addd128((_Decimal128)2.5, (_Decimal128)1.25), "d64addd64x\n");
+    check(T(d64subd64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal64) && d64subd64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d64subd128((_Decimal128)2.5, (_Decimal128)1.25), "d64subd64x\n");
+    check(T(d64muld64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal64) && d64muld64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d64muld128((_Decimal128)2.5, (_Decimal128)1.25), "d64muld64x\n");
+    check(T(d64divd64x((_Decimal64x)2.5, (_Decimal64x)1.25), _Decimal64) && d64divd64x((_Decimal64x)2.5, (_Decimal64x)1.25) == d64divd128((_Decimal128)2.5, (_Decimal128)1.25), "d64divd64x\n");
+    check(T(d64fmad64x((_Decimal64x)2.5, (_Decimal64x)1.25, (_Decimal64x)0.5), _Decimal64) && d64fmad64x((_Decimal64x)2.5, (_Decimal64x)1.25, (_Decimal64x)0.5) == d64fmad128((_Decimal128)2.5, (_Decimal128)1.25, (_Decimal128)0.5), "d64fmad64x\n");
+    check(T(d64sqrtd64x((_Decimal64x)2.5), _Decimal64) && d64sqrtd64x((_Decimal64x)2.5) == d64sqrtd128((_Decimal128)2.5), "d64sqrtd64x\n");
+    check(T(d64xaddd128((_Decimal128)2.5, (_Decimal128)1.25), _Decimal64x) && d64xaddd128((_Decimal128)2.5, (_Decimal128)1.25) == (_Decimal64x)((_Decimal128)2.5 + (_Decimal128)1.25), "d64xaddd128\n");
+    check(T(d64xsubd128((_Decimal128)2.5, (_Decimal128)1.25), _Decimal64x) && d64xsubd128((_Decimal128)2.5, (_Decimal128)1.25) == (_Decimal64x)((_Decimal128)2.5 - (_Decimal128)1.25), "d64xsubd128\n");
+    check(T(d64xmuld128((_Decimal128)2.5, (_Decimal128)1.25), _Decimal64x) && d64xmuld128((_Decimal128)2.5, (_Decimal128)1.25) == (_Decimal64x)((_Decimal128)2.5 * (_Decimal128)1.25), "d64xmuld128\n");
+    check(T(d64xdivd128((_Decimal128)2.5, (_Decimal128)1.25), _Decimal64x) && d64xdivd128((_Decimal128)2.5, (_Decimal128)1.25) == (_Decimal64x)((_Decimal128)2.5 / (_Decimal128)1.25), "d64xdivd128\n");
+    check(T(d64xfmad128((_Decimal128)2.5, (_Decimal128)1.25, (_Decimal128)0.5), _Decimal64x) && d64xfmad128((_Decimal128)2.5, (_Decimal128)1.25, (_Decimal128)0.5) == (_Decimal64x)fmad128(2.5DL, 1.25DL, 0.5DL), "d64xfmad128\n");
+    check(T(d64xsqrtd128((_Decimal128)2.5), _Decimal64x) && d64xsqrtd128((_Decimal128)2.5) == (_Decimal64x)sqrtd128(2.5DL), "d64xsqrtd128\n");
+    check(iseqsig((_Decimal64x)1.5, 1.5DL), "iseqsig\n");
+}
+
 int main(void)
 {
     test_narrow();
+    test_d64x();
     test_f16();
     test_f32();
     test_f64();
@@ -903,5 +1029,5 @@ int main(void)
     print_i64(ok);
     return 0;
 }
-/* expect: 798 */
+/* expect: 916 */
 /* expect: 1 */

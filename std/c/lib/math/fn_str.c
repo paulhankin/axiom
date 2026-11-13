@@ -138,6 +138,25 @@ _Float64x wcstof64x(const wchar_t *restrict __n, wchar_t **restrict __e)
 }
 
 #endif
+/* _Decimal64x's: _Decimal128's (one format; H.12.2, H.12.3) */
+__axiom_decimal128 strtod128(const char *restrict __n, char **restrict __e);
+int strfromd128(char *restrict __s, size_t __n, const char *restrict __f, __axiom_decimal128 __v);
+__axiom_decimal128 wcstod128(const wchar_t *restrict __n, wchar_t **restrict __e);
+__axiom_decimal64x strtod64x(const char *restrict __n, char **restrict __e)
+{
+    return strtod128(__n, __e);
+}
+
+int strfromd64x(char *restrict __s, size_t __n, const char *restrict __f, __axiom_decimal64x __v)
+{
+    return strfromd128(__s, __n, __f, __v);
+}
+
+__axiom_decimal64x wcstod64x(const wchar_t *restrict __n, wchar_t **restrict __e)
+{
+    return wcstod128(__n, __e);
+}
+
 #else
 typedef int __axc_fn_str_c89;
 #endif

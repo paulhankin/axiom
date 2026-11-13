@@ -190,7 +190,7 @@ names the feature and the standard that has it (or removed it).
 | `C3220` | `main` declared `inline` or `_Noreturn`. |
 | `C3221` | An inline definition that defines a modifiable object with static storage duration or refers to an identifier with internal linkage (6.7.4p3). |
 | `C3222` | The address of an object declared `register` taken, or a `register` array used as a pointer. |
-| `C3230` | A decimal floating operand (`_Decimal32`, `_Decimal64`, `_Decimal128`) with a binary floating (standard or interchange: `_Float32` ...), complex or imaginary one in an operation that converts both to a common type (C23 6.3.1.8p1: the arithmetic, relational, equality and conditional operators, compound assignment, `<math.h>`'s comparison macros, `<tgmath.h>`'s macros). |
+| `C3230` | A decimal floating operand (`_Decimal32`, `_Decimal64`, `_Decimal128`, `_Decimal64x`) with a binary floating (standard or interchange: `_Float32` ...), complex or imaginary one in an operation that converts both to a common type (C23 6.3.1.8p1: the arithmetic, relational, equality and conditional operators, compound assignment, `<math.h>`'s comparison macros, `<tgmath.h>`'s macros; and a narrowing macro of `<tgmath.h>` with an argument of the other radix than its prefix's, H.13p5). |
 
 ### Expressions and initializers
 

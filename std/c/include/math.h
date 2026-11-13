@@ -815,6 +815,11 @@ _Decimal64 d64sqrtd128(_Decimal128 __x);
 #define HUGE_VAL_F128 ((_Float128)__builtin_inff())
 #define HUGE_VAL_F32X ((_Float32x)__builtin_inff())
 #define HUGE_VAL_F64X ((_Float64x)__builtin_inff())
+#if __STDC_VERSION__ >= 202311L && defined(__STDC_IEC_60559_DFP__)
+/* _Decimal64x (H.2.4): decimal128's format, its functions _Decimal128's
+   (std/c/lib/math/fn_d64x.c) */
+#define HUGE_VAL_D64X ((_Decimal64x)HUGE_VAL_D128)
+#endif
 /* the evaluation types of H.11 (FLT_EVAL_METHOD and DEC_EVAL_METHOD 0) */
 typedef long double long_double_t;
 typedef float _Float16_t;

@@ -25,7 +25,8 @@
 // in memory to cgen (cgen_wint.ax), as a structure is. A complex type (TK_COMPLEX, made once for each real
 // floating type: complex_of) is laid out as an array of two elements of its
 // corresponding real type (`elem`), the real part first (6.2.5p13). The
-// decimal floating types (TK_DEC32, TK_DEC64, TK_DEC128: is_decimal) are
+// decimal floating types (TK_DEC32, TK_DEC64, TK_DEC128, and Annex H's
+// TK_DEC64X in decimal128's format: is_decimal) are
 // real floating types too (C23 6.2.5p13), but not is_floating's (the
 // standard floating types, binary), with which the usual arithmetic
 // conversions do not mix them (6.3.1.8); their sizes are 4, 8 and 16 bytes,
@@ -89,6 +90,9 @@ pub const TK_IMAGINARY: i32 = 35;
 pub const TK_DEC32: i32 = 36;   // _Decimal32
 pub const TK_DEC64: i32 = 37;   // _Decimal64
 pub const TK_DEC128: i32 = 38;  // _Decimal128
+// _Decimal64x (C23 Annex H.2.4: the extended type of decimal64), in
+// decimal128's format (H.2.4p4 allows it), a type of its own
+pub const TK_DEC64X: i32 = 39;
 
 /// The largest N of _BitInt(N) (<limits.h>'s BITINT_MAXWIDTH).
 pub const BITINT_MAXWIDTH: i32 = 65535;
@@ -241,6 +245,7 @@ pub let mut t_uint128: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_dec32: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_dec64: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_dec128: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_dec64x: *mut CType = @ptr_from_int(*mut CType, 0);  // _Decimal64x (Annex H)
 pub let mut ptr_bytes: u64 = 8;
 // the bit-precise integer types made so far, by width (signed, unsigned)
 // [n]: _BitInt(n); [65 + n]: unsigned _BitInt(n), for n <= 64; the wider
@@ -340,6 +345,8 @@ pub fn init(o: *co.COptions) void {
     t_dec64.bits = 64;
     t_dec128 = new_type(TK_DEC128);
     t_dec128.bits = 128;
+    t_dec64x = new_type(TK_DEC64X);
+    t_dec64x.bits = 128;
     g_bitint = u.List.[*mut CType].empty();
     for i in @as(usize, 0)..130 {
         _ = i;
@@ -926,10 +933,47 @@ pub fn is_floating(t: *CType) bool {
     return ((t.kind >= TK_FLOAT) and (t.kind <= TK_LDOUBLE)) or ((t.kind >= TK_FLOAT16) and (t.kind <= TK_FLOAT128));
 }
 
-/// A decimal floating type: _Decimal32, _Decimal64, _Decimal128 (C23).
+/// A decimal floating type: _Decimal32, _Decimal64, _Decimal128 (C23),
+/// _Decimal64x (Annex H).
 pub fn is_decimal(t: *CType) bool {
     let k = t.unq.kind;
-    return (k >= TK_DEC32) and (k <= TK_DEC128);
+    return (k >= TK_DEC32) and (k <= TK_DEC64X);
+}
+
+/// The rank of decimal type t among the decimal types by their sets of
+/// values (C23 H.4.3): 1 _Decimal32, 2 _Decimal64, 3 _Decimal64x, 4
+/// _Decimal128 (_Decimal64x's values are _Decimal128's, the same format,
+/// and of two types of the same values the interchange one is the common
+/// type), 0 for another type.
+pub fn dec_rank(t: *CType) i32 {
+    let k = t.unq.kind;
+    if k == TK_DEC32 {
+        return 1;
+    }
+    if k == TK_DEC64 {
+        return 2;
+    }
+    if k == TK_DEC64X {
+        return 3;
+    }
+    if k == TK_DEC128 {
+        return 4;
+    }
+    return 0;
+}
+
+/// The decimal type of rank r (dec_rank).
+pub fn dec_of_rank(r: i32) *mut CType {
+    if r == 1 {
+        return t_dec32;
+    }
+    if r == 2 {
+        return t_dec64;
+    }
+    if r == 3 {
+        return t_dec64x;
+    }
+    return t_dec128;
 }
 
 /// A real floating type in C23's sense (6.2.5p13): a standard floating type
@@ -938,11 +982,12 @@ pub fn is_real_floating(t: *CType) bool {
     return is_floating(t) or is_decimal(t);
 }
 
-/// Is t _Decimal128? Its values are 16 bytes in memory to cgen (as a wide
-/// long double's are: cgen_dec.ax); _Decimal32 and _Decimal64 are integers
-/// of their widths (their bits).
+/// Has t decimal128's format (_Decimal128, _Decimal64x)? Its values are 16
+/// bytes in memory to cgen (as a wide long double's are: cgen_dec.ax);
+/// _Decimal32 and _Decimal64 are integers of their widths (their bits).
 pub fn is_dec128(t: *CType) bool {
-    return t.unq.kind == TK_DEC128;
+    let k = t.unq.kind;
+    return (k == TK_DEC128) or (k == TK_DEC64X);
 }
 
 /// The decimal floating type of a type specifier's keyword width (32, 64,
@@ -1091,7 +1136,7 @@ pub fn value_size(t: *CType) u64 {
     if k == TK_DEC64 {
         return 8;
     }
-    if k == TK_DEC128 {
+    if (k == TK_DEC128) or (k == TK_DEC64X) {
         return 16;
     }
     if is_floating(t) {
@@ -1397,16 +1442,10 @@ fn common_real(a0: *mut CType, b0: *mut CType) *mut CType {
     let b = promote(b0);
     // C23 6.3.1.8p1: a decimal floating operand (whose other operand is
     // decimal or an integer: csema checks that) makes the common type the
-    // wider decimal type
+    // wider decimal type (H.4.3: of _Decimal64x and _Decimal128, whose
+    // values are the same, the interchange type _Decimal128)
     if is_decimal(a) or is_decimal(b) {
-        let mut k = TK_DEC32;
-        if is_decimal(a) {
-            k = a.kind;
-        }
-        if is_decimal(b) and (b.kind > k) {
-            k = b.kind;
-        }
-        return decimal(32 << @bit_cast(u32, k - TK_DEC32));
+        return dec_of_rank(@max(@max(dec_rank(a), dec_rank(b)), 1));
     }
     if is_floating(a) or is_floating(b) {
         // (C23 6.3.1.8: the type of greater floating-point conversion rank,
@@ -1732,6 +1771,9 @@ fn base_name(t: *CType) []u8 {
     }
     if k == TK_DEC128 {
         return "_Decimal128";
+    }
+    if k == TK_DEC64X {
+        return "_Decimal64x";
     }
     if k == TK_NULLPTR {
         return "nullptr_t";

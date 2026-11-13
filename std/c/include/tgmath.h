@@ -138,6 +138,72 @@
 #define dfma(x, y, z) __builtin_axiom_tg(3, dfmal, dfmal, dfmal, 0, 0, 0, x, y, z)
 #define fsqrt(x) __builtin_axiom_tg(1, fsqrt, fsqrt, fsqrtl, 0, 0, 0, x)
 #define dsqrt(x) __builtin_axiom_tg(1, dsqrtl, dsqrtl, dsqrtl, 0, 0, 0, x)
+/* the decimal ones (7.27p11: the d128 function if an argument is a
+   _Decimal128 or the prefix is d64, else the d64 one; H.13p5 with
+   _Decimal64x too: __builtin_axiom_tgn), and the macros of the quantum
+   functions (7.27p12) */
+#define d32add(x, y) __builtin_axiom_tgn(d32add, x, y)
+#define d32sub(x, y) __builtin_axiom_tgn(d32sub, x, y)
+#define d32mul(x, y) __builtin_axiom_tgn(d32mul, x, y)
+#define d32div(x, y) __builtin_axiom_tgn(d32div, x, y)
+#define d32fma(x, y, z) __builtin_axiom_tgn(d32fma, x, y, z)
+#define d32sqrt(x) __builtin_axiom_tgn(d32sqrt, x)
+#define d64add(x, y) __builtin_axiom_tgn(d64add, x, y)
+#define d64sub(x, y) __builtin_axiom_tgn(d64sub, x, y)
+#define d64mul(x, y) __builtin_axiom_tgn(d64mul, x, y)
+#define d64div(x, y) __builtin_axiom_tgn(d64div, x, y)
+#define d64fma(x, y, z) __builtin_axiom_tgn(d64fma, x, y, z)
+#define d64sqrt(x) __builtin_axiom_tgn(d64sqrt, x)
+#define quantize(x, y) __builtin_axiom_tg(2, 0, quantize, 0, 0, 0, 0, x, y)
+#define samequantum(x, y) __builtin_axiom_tg(2, 0, samequantum, 0, 0, 0, 0, x, y)
+#define quantum(x) __builtin_axiom_tg(1, 0, quantum, 0, 0, 0, 0, x)
+#define llquantexp(x) __builtin_axiom_tg(1, 0, llquantexp, 0, 0, 0, 0, x)
 #endif
+
+#if defined(__STDC_WANT_IEC_60559_TYPES_EXT__)
+/* Annex H.13p5: the narrowing macros of the fM, fMx and dMx prefixes (those
+   whose functions exist: <math.h>'s f16addf32 ... f64xsqrtf128,
+   d64xaddd128 ...), the function of the first type wide enough for the
+   arguments' common type (__builtin_axiom_tgn) */
+#define f16add(x, y) __builtin_axiom_tgn(f16add, x, y)
+#define f16sub(x, y) __builtin_axiom_tgn(f16sub, x, y)
+#define f16mul(x, y) __builtin_axiom_tgn(f16mul, x, y)
+#define f16div(x, y) __builtin_axiom_tgn(f16div, x, y)
+#define f16fma(x, y, z) __builtin_axiom_tgn(f16fma, x, y, z)
+#define f16sqrt(x) __builtin_axiom_tgn(f16sqrt, x)
+#define f32add(x, y) __builtin_axiom_tgn(f32add, x, y)
+#define f32sub(x, y) __builtin_axiom_tgn(f32sub, x, y)
+#define f32mul(x, y) __builtin_axiom_tgn(f32mul, x, y)
+#define f32div(x, y) __builtin_axiom_tgn(f32div, x, y)
+#define f32fma(x, y, z) __builtin_axiom_tgn(f32fma, x, y, z)
+#define f32sqrt(x) __builtin_axiom_tgn(f32sqrt, x)
+#define f64add(x, y) __builtin_axiom_tgn(f64add, x, y)
+#define f64sub(x, y) __builtin_axiom_tgn(f64sub, x, y)
+#define f64mul(x, y) __builtin_axiom_tgn(f64mul, x, y)
+#define f64div(x, y) __builtin_axiom_tgn(f64div, x, y)
+#define f64fma(x, y, z) __builtin_axiom_tgn(f64fma, x, y, z)
+#define f64sqrt(x) __builtin_axiom_tgn(f64sqrt, x)
+#define f32xadd(x, y) __builtin_axiom_tgn(f32xadd, x, y)
+#define f32xsub(x, y) __builtin_axiom_tgn(f32xsub, x, y)
+#define f32xmul(x, y) __builtin_axiom_tgn(f32xmul, x, y)
+#define f32xdiv(x, y) __builtin_axiom_tgn(f32xdiv, x, y)
+#define f32xfma(x, y, z) __builtin_axiom_tgn(f32xfma, x, y, z)
+#define f32xsqrt(x) __builtin_axiom_tgn(f32xsqrt, x)
+#define f64xadd(x, y) __builtin_axiom_tgn(f64xadd, x, y)
+#define f64xsub(x, y) __builtin_axiom_tgn(f64xsub, x, y)
+#define f64xmul(x, y) __builtin_axiom_tgn(f64xmul, x, y)
+#define f64xdiv(x, y) __builtin_axiom_tgn(f64xdiv, x, y)
+#define f64xfma(x, y, z) __builtin_axiom_tgn(f64xfma, x, y, z)
+#define f64xsqrt(x) __builtin_axiom_tgn(f64xsqrt, x)
+#if __STDC_VERSION__ >= 202311L
+#define d64xadd(x, y) __builtin_axiom_tgn(d64xadd, x, y)
+#define d64xsub(x, y) __builtin_axiom_tgn(d64xsub, x, y)
+#define d64xmul(x, y) __builtin_axiom_tgn(d64xmul, x, y)
+#define d64xdiv(x, y) __builtin_axiom_tgn(d64xdiv, x, y)
+#define d64xfma(x, y, z) __builtin_axiom_tgn(d64xfma, x, y, z)
+#define d64xsqrt(x) __builtin_axiom_tgn(d64xsqrt, x)
+#endif
+#endif
+
 
 #endif

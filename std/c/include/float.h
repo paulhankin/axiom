@@ -244,6 +244,19 @@
 #define FLT128_SNAN __builtin_axiom_snan(0.0F128)
 #define FLT32X_SNAN __builtin_axiom_snan(0.0F32x)
 #define FLT64X_SNAN __builtin_axiom_snan(0.0F64x)
+#if defined(__STDC_IEC_60559_DFP__)
+/* _Decimal64x (H.2.4): decimal128's format (H.2.4p4 allows it), which
+   exceeds Table H.3's least precision (22 digits) and exponent range
+   (6145) for the extended format of decimal64 */
+#define DEC64X_MANT_DIG 34
+#define DEC64X_MIN_EXP (-6142)
+#define DEC64X_MAX_EXP 6145
+#define DEC64X_MAX 9.999999999999999999999999999999999E6144D64x
+#define DEC64X_EPSILON 1E-33D64x
+#define DEC64X_MIN 1E-6143D64x
+#define DEC64X_TRUE_MIN 0.000000000000000000000000000000001E-6143D64x
+#define DEC64X_SNAN ((_Decimal64x)__builtin_axiom_dec(128, 0x7e00000000000000, 0))
+#endif
 #endif
 
 #endif

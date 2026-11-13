@@ -26,6 +26,12 @@
 //       (carg, cproj, creal, ...: 7.25p6). The call is then an ordinary
 //       call of that function (csema_expr.ax: call), its arguments
 //       converted to its parameters' types.
+//   __builtin_axiom_tgn(m, args...)
+//       <tgmath.h>'s macros of the functions that round to a narrower type
+//       with an fN, fNx, dN or dNx prefix (C23 7.27p11, H.13p5): m is the
+//       macro's name (f32add, d64xsqrt ...); the call is that of m with
+//       the suffix of the type the rules choose from the arguments' types
+//       (tgn_call), an ordinary call then, as __builtin_axiom_tg's.
 //   __builtin_axiom_dec(w, hi, lo)  a constant of the decimal floating type
 //       of w bits (32, 64, 128) whose encoding (BID) is lo (and hi for 128):
 //       for the headers' infinities and NaNs (<float.h>, <math.h>), which
@@ -75,6 +81,7 @@ pub const BI_FENV_GET: i32 = 421;
 pub const BI_FENV_SET: i32 = 422;
 pub const BI_SNAN: i32 = 423;  // __builtin_axiom_snan(x): a signaling NaN of x's (floating) type, a constant
 pub const BI_TG: i32 = 430;
+pub const BI_TGN: i32 = 431;  // __builtin_axiom_tgn(m, args...): a narrowing macro of fN, fNx, dN, dNx (H.13p5)
 pub const BI_DEC: i32 = 440;
 
 // <math.h>'s FP_ classification values
@@ -84,11 +91,11 @@ pub const FP_ZERO: u64 = 2;
 pub const FP_SUBNORMAL: u64 = 3;
 pub const FP_NORMAL: u64 = 4;
 
-let names: [22][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
+let names: [23][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
                        "issignaling", "iscanonical", "isgreater", "isgreaterequal", "isless", "islessequal",
-                       "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "snan", "tg", "dec"];
-let ids: [22]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422, 423,
-                    430, 440];
+                       "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "snan", "tg", "tgn", "dec"];
+let ids: [23]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422, 423,
+                    430, 431, 440];
 
 /// The BI_ number of __builtin_axiom_<rest>, or 0.
 pub fn builtin_id(rest: []u8) i32 {
@@ -125,6 +132,9 @@ pub fn call(e: *mut cast.Expr, id: i32) bool {
     e.op = id;
     if id == BI_TG {
         return tg_call(e);
+    }
+    if id == BI_TGN {
+        return tgn_call(e);
     }
     if id == BI_DEC {
         return dec_call(e);
@@ -408,11 +418,11 @@ fn tg_rank(t: *mut cty.CType) i32 {
     return 1;  // double, and the integer types
 }
 
-// A type-generic macro's call with decimal floating arguments (C23 7.27p3):
-// _Decimal128 if any is one; else _Decimal64 if any is one, or one is an
-// integer and another a _Decimal32; else _Decimal32. The function is the
-// double one's name with d32, d64 or d128 (expd64 for exp), if <math.h>
-// declares it. A standard floating or complex argument among decimal ones
+// A type-generic macro's call with decimal floating arguments (C23 7.27p3,
+// H.13p3): _Decimal128 if any is one; else _Decimal64x if any is one; else
+// _Decimal64 if any is one, or one is an integer and another a _Decimal32;
+// else _Decimal32. The function is the double one's name with d32, d64,
+// d64x or d128 (expd64 for exp), if <math.h> declares it. A standard floating or complex argument among decimal ones
 // has no common type (C3230).
 fn tg_decimal(e: *mut cast.Expr, drank0: i32, ints: bool, bin: bool) bool {
     if bin {
@@ -425,7 +435,7 @@ fn tg_decimal(e: *mut cast.Expr, drank0: i32, ints: bool, bin: bool) bool {
         drank = 2;
     }
     let base = e.args.get(2);
-    let suf = ["d32", "d64", "d128"];
+    let suf = ["d32", "d64", "d64x", "d128"];
     let mut sym = u.nil.[cast.CSym]();
     let mut name: []u8 = "";
     if base.kind == cast.ExprKind.IDENT {
@@ -465,11 +475,20 @@ fn tg_decimal(e: *mut cast.Expr, drank0: i32, ints: bool, bin: bool) bool {
 fn tg_xfloat(e: *mut cast.Expr, ngv: usize, rank: *mut i32, cplx: bool) i32 {
     let mut t = u.nil.[cty.CType]();
     let mut ext = false;
+    // (H.13p3: an integer argument is regarded as a _Float32x if another
+    // has a binary extended type, else as a double)
+    let mut int_ty = cty.t_double;
+    for i in @as(usize, 7)..(7 + ngv) {
+        let k = cty.real_of(e.args.get(i).ty).unq.kind;
+        if (k == cty.TK_FLOAT32X) or (k == cty.TK_FLOAT64X) {
+            int_ty = cty.t_float32x;
+        }
+    }
     for i in @as(usize, 7)..(7 + ngv) {
         let a = e.args.get(i);
         let mut at = a.ty;
         if cty.is_integer(at) {
-            at = cty.t_double;
+            at = int_ty;
         }
         if cty.is_complex(at) {
             at = cty.real_of(at);  // (H.11: the complex functions of the type)
@@ -534,6 +553,182 @@ fn tg_xfloat(e: *mut cast.Expr, ngv: usize, rank: *mut i32, cplx: bool) i32 {
     return 0;
 }
 
+// The suffix of the functions of binary interchange or extended type t
+// (f16 ... f64x), or of decimal type t (d32, d64, d64x, d128); "" for a
+// standard floating type, whose functions have none of these.
+fn type_suffix(t: *cty.CType) []u8 {
+    let k = t.unq.kind;
+    if (k >= cty.TK_FLOAT16) and (k <= cty.TK_FLOAT128) {
+        return xsuffix(k, cty.ffmt(t));
+    }
+    let r = cty.dec_rank(t);
+    if r > 0 {
+        let ds = ["d32", "d64", "d64x", "d128"];
+        return ds[@as(usize, @bit_cast(u32, r - 1))];
+    }
+    return "";
+}
+
+// Are the values of floating type a a subset of (or the same as) those of
+// type b (H.13p5's a ⊆ b), both binary or both decimal? Binary formats
+// nest by width (binary16, 32, 64, the x87's, binary128); decimal ones:
+// decimal32, 64, then _Decimal64x and _Decimal128 (one format).
+fn values_within(a: *cty.CType, b: *cty.CType) bool {
+    if cty.is_decimal(a) {
+        return @min(cty.dec_rank(a), 3) <= @min(cty.dec_rank(b), 3);
+    }
+    return cty.ffmt(a) <= cty.ffmt(b);
+}
+
+// A call of the narrowing type-generic macro m (f32add ... d64xsqrt; C23
+// 7.27p11, H.13p5) with args e.args[1..]: the generic type P is the
+// arguments' common real type (integers regarded as double, or _Decimal64
+// with a decimal prefix, when all are integers; else as H.13p3 says); the
+// function is m with P's suffix if <math.h> declares it, else with that of
+// the first type T, of those the prefix lists in order, whose values
+// include P's (fM: _FloatN for N > M, then _FloatNx for N >= M; fMx:
+// _FloatNx for N > M, then _FloatN for N > M; dM and dMx likewise). The
+// arguments are all real; a decimal one with a binary prefix, or a binary
+// one with a decimal prefix, has no function (C3230).
+fn tgn_call(e: *mut cast.Expr) bool {
+    let n = e.args.len;
+    if n < 2 {
+        cs.err(e.span, "C3023", u.f1("'__builtin_axiom_tgn' takes at least 2 arguments, not %s", u.zdec(n)));
+        return bad(e);
+    }
+    let m = e.args.get(0);
+    if (m.kind != cast.ExprKind.IDENT) or (m.name.len < 5) or ((m.name[0] != 'f') and (m.name[0] != 'd')) {
+        cs.err(e.span, "C3082", "the first argument of __builtin_axiom_tgn is the name of a narrowing macro");
+        return bad(e);
+    }
+    let dec = m.name[0] == 'd';
+    let mut i: usize = 1;
+    let mut mw: i32 = 0;
+    while (i < m.name.len) and (m.name[i] >= '0') and (m.name[i] <= '9') {
+        mw = (mw * 10) + @as(i32, m.name[i] - '0');
+        i += 1;
+    }
+    let mx = (i < m.name.len) and (m.name[i] == 'x');
+    let mut ok = mw > 0;
+    let mut dec_arg = false;
+    let mut bin_arg = false;
+    let mut ext_dec = false;
+    let mut ext_bin = false;
+    for j in @as(usize, 1)..n {
+        let a = cx.rv(e.args.get(j));
+        e.args.set(j, a);
+        if is_err(a) {
+            ok = false;
+        } else if not cty.is_integer(a.ty) and not cty.is_real_floating(a.ty) {
+            cs.err(a.span, "C3082", u.f2("an argument of '%s' has type %s, not a real type", m.name, cs.tq(a.ty)));
+            ok = false;
+        } else if not cty.is_integer(a.ty) {
+            let k = a.ty.unq.kind;
+            dec_arg = dec_arg or cty.is_decimal(a.ty);
+            bin_arg = bin_arg or cty.is_floating(a.ty);
+            ext_dec = ext_dec or (k == cty.TK_DEC64X);
+            ext_bin = ext_bin or (k == cty.TK_FLOAT32X) or (k == cty.TK_FLOAT64X);
+        }
+    }
+    if not ok {
+        return bad(e);
+    }
+    if (dec and bin_arg) or (not dec and dec_arg) {
+        cs.err(e.span, "C3230",
+               u.f1("an argument of '%s' has a floating type of the other radix than its result's: it has no function",
+                    m.name));
+        return bad(e);
+    }
+    // the generic type P
+    let mut int_ty = cty.t_double;
+    if ext_dec {
+        int_ty = cty.t_dec64x;
+    } else if ext_bin {
+        int_ty = cty.t_float32x;
+    } else if dec {
+        int_ty = cty.t_dec64;
+    }
+    let mut p = u.nil.[cty.CType]();
+    for j in @as(usize, 1)..n {
+        let mut at = e.args.get(j).ty;
+        if cty.is_integer(at) {
+            at = int_ty;
+        }
+        if u.isnil(p) {
+            p = at;
+        } else {
+            p = cty.common_type(p, at);
+        }
+    }
+    let mut name = u.intern(u.cat2(m.name, type_suffix(p)));
+    if (type_suffix(p).len == 0) or u.isnil(cs.lookup(name)) {
+        // (the types the prefix names, in the order H.13p5 tries them)
+        let mut cands = u.List.[*mut cty.CType].empty();
+        if dec {
+            let ws: [3]i32 = [32, 64, 128];
+            let ts: [3]*mut cty.CType = [cty.t_dec32, cty.t_dec64, cty.t_dec128];
+            if mx and (64 > mw) {
+                cands.push(cty.t_dec64x);
+            }
+            for k in @as(usize, 0)..3 {
+                if ws[k] > mw {
+                    cands.push(ts[k]);
+                }
+            }
+            if not mx and (64 >= mw) {
+                cands.push(cty.t_dec64x);
+            }
+        } else {
+            let ws: [4]i32 = [16, 32, 64, 128];
+            let ts: [4]*mut cty.CType = [cty.t_float16, cty.t_float32, cty.t_float64, cty.t_float128];
+            let xws: [2]i32 = [32, 64];
+            let xts: [2]*mut cty.CType = [cty.t_float32x, cty.t_float64x];
+            if mx {
+                for k in @as(usize, 0)..2 {
+                    if xws[k] > mw {
+                        cands.push(xts[k]);
+                    }
+                }
+            }
+            for k in @as(usize, 0)..4 {
+                if ws[k] > mw {
+                    cands.push(ts[k]);
+                }
+            }
+            if not mx {
+                for k in @as(usize, 0)..2 {
+                    if xws[k] >= mw {
+                        cands.push(xts[k]);
+                    }
+                }
+            }
+        }
+        let mut t = u.nil.[cty.CType]();
+        for k in 0..cands.len {
+            if u.isnil(t) and values_within(p, cands.get(k)) {
+                t = cands.get(k);
+            }
+        }
+        if u.notnil(t) {
+            name = u.intern(u.cat2(m.name, type_suffix(t)));
+        }
+        if u.isnil(t) or u.isnil(cs.lookup(name)) {
+            cs.err(e.span, "C3082", u.f2("'%s' has no function for arguments of type %s", m.name, cs.tq(p)));
+            return bad(e);
+        }
+    }
+    let callee = cast.new_expr(cast.ExprKind.IDENT, m.span);
+    callee.name = name;
+    let mut args = u.List.[*mut cast.Expr].empty();
+    for j in @as(usize, 1)..n {
+        args.push(e.args.get(j));
+    }
+    e.a = callee;
+    e.args = args;
+    e.op = 0;
+    return false;
+}
+
 /// The rank of the standard type of format f (32, 64, or long double's).
 fn xs_rank(f: i32, rank: *mut i32) void {
     if f == 32 {
@@ -579,7 +774,7 @@ fn tg_call(e: *mut cast.Expr) bool {
     let mut rank: i32 = 0;
     let mut cplx = false;
     let mut ok = true;
-    let mut drank: i32 = 0;  // the widest decimal argument's: 1, 2, 3 for _Decimal32, 64, 128
+    let mut drank: i32 = 0;  // the widest decimal argument's cty.dec_rank
     let mut ints = false;
     let mut bin = false;  // a standard floating or complex argument
     let ngv = @as(usize, @truncate(u32, ng.v));
@@ -593,7 +788,7 @@ fn tg_call(e: *mut cast.Expr) bool {
                                          cs.tq(a.ty)));
             ok = false;
         } else if cty.is_decimal(a.ty) {
-            drank = @max(drank, (a.ty.unq.kind - cty.TK_DEC32) + 1);
+            drank = @max(drank, cty.dec_rank(a.ty));
         } else {
             rank = @max(rank, tg_rank(a.ty));
             cplx = cplx or cty.is_complex(a.ty);
