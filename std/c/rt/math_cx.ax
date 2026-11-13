@@ -24,6 +24,13 @@ import "../../internal/math/tables.ax" as t;
 import "../../internal/math/trig.ax" as tr;
 import "math_ldx.ax" as xk;
 
+extern "C" {
+    fn fma(a: f64, b: f64, c: f64) f64;
+    fn scalbn(x: f64, n: i32) f64;
+    fn ilogb(x: f64) i32;
+    fn atan2(y: f64, x: f64) f64;
+}
+
 // pi and pi/2 as double-doubles
 const PI_H: f64 = 3.141592653589793;
 const PI_L: f64 = 1.2246467991473532e-16;
@@ -85,7 +92,7 @@ fn ldx(x: f64, k: i32) f64 {
 /// The sum of five doubles as a double-double (two passes of the error-free
 /// vector sum: the leading part then holds the sum to within an ulp of the
 /// rest, which nothing cancels).
-fn sum5(a: f64, b: f64, c: f64, d: f64, e: f64) m.DD {
+inline fn sum5(a: f64, b: f64, c: f64, d: f64, e: f64) m.DD {
     let mut v: [5]f64 = [a, b, c, d, e];
     for _pass in @as(usize, 0)..2 {
         let mut i: usize = 4;
@@ -103,6 +110,12 @@ fn sum5(a: f64, b: f64, c: f64, d: f64, e: f64) m.DD {
 /// overflow, 0 far below), 1 e^x - 1 (|x| <= 1), 2 sin x and cos x (any
 /// finite x), 3 log1p x (x > -1).
 export fn __axc_cx1(op: u32, x: f64, r: *mut [4]f64) void @multiversion("fma") {
+    cx1(op, x, r);
+}
+
+/// __axc_cx1's body (inline in the double complex functions below, compiled
+/// with their extensions: no call through a multiversion dispatcher).
+inline fn cx1(op: u32, x: f64, r: *mut [4]f64) void {
     if op == 0 {
         if x > 709.8 {
             put(r, 0, m.dd(m.inf(), 0.0));
@@ -168,7 +181,7 @@ export fn __axc_cx1(op: u32, x: f64, r: *mut [4]f64) void @multiversion("fma") {
 
 /// log1p v for a double-double v > -1: near 0 math_ldx.ax's series (log.ax's
 /// table-driven logarithm of 1 + v would cancel there), else log.ax's.
-fn log1p_v(v: m.DD) m.DD {
+inline fn log1p_v(v: m.DD) m.DD {
     if @abs(v.hi) < 0.0029 {
         return xk.log1p_k(v);
     }
@@ -183,7 +196,7 @@ inline fn eln2(e: i32) m.DD {
 
 /// log sqrt(a^2 + b^2) for a >= b >= 0, a in [2^-510, 2^510): near |z| = 1
 /// log1p of the squares' sum minus 1, summed exactly, so that nothing cancels.
-fn half_log(a: f64, b: f64) m.DD {
+inline fn half_log(a: f64, b: f64) m.DD {
     let p = m.two_sqr(a);
     let q = m.two_sqr(b);
     let s = p.hi + q.hi;
@@ -197,9 +210,29 @@ fn half_log(a: f64, b: f64) m.DD {
     return m.dd(0.5 * l.hi, 0.5 * l.lo);
 }
 
+/// a / b as a double-double, for a far below b (|a/b| < 2^-890): the
+/// quotient and its exact remainder over b, the remainder by a fused
+/// multiply-add (Dekker's product of Veltkamp's halves would overflow for a
+/// b beyond 2^996).
+fn ratio(a: f64, b: f64) m.DD {
+    let q = a / b;
+    let mut e: f64 = 0.0;
+    if @target_has("fma") or @target_arch("aarch64") {
+        e = @fma(-q, b, a);
+    } else {
+        e = fma(-q, b, a);
+    }
+    return m.fast_two_sum(q, e / b);
+}
+
 /// The functions of two arguments: 0 atan2(y, x) (finite, not both 0), 1
 /// log|x + iy| for x >= y >= 0 finite, x > 0 (the arguments in that order).
 export fn __axc_cx2(op: u32, y: f64, x: f64, r: *mut [4]f64) void @multiversion("fma") {
+    cx2(op, y, x, r);
+}
+
+/// __axc_cx2's body (inline, as cx1).
+inline fn cx2(op: u32, y: f64, x: f64, r: *mut [4]f64) void {
     if op == 1 {
         let e = expo(y);
         if (e > 500) or (e < -500) {
@@ -222,9 +255,9 @@ export fn __axc_cx2(op: u32, y: f64, x: f64, r: *mut [4]f64) void @multiversion(
         let ey = expo(ay);
         let ex = expo(ax);
         if (ey - ex) < -900 {
-            v = m.dd_div(m.dd(ay, 0.0), m.dd(ax, 0.0));  // (atan a = a within 2^-1800)
+            v = ratio(ay, ax);  // (atan a = a within 2^-1800)
         } else if (ey - ex) > 900 {
-            v = m.dd_add(m.dd(PIO2_H, PIO2_L), m.dd_neg(m.dd_div(m.dd(ax, 0.0), m.dd(ay, 0.0))));
+            v = m.dd_add(m.dd(PIO2_H, PIO2_L), m.dd_neg(ratio(ax, ay)));
         } else {
             // the smaller over the larger (scaled near 1: exact) as a
             // double-double from one division and its exact residual, its
@@ -248,4 +281,414 @@ export fn __axc_cx2(op: u32, y: f64, x: f64, r: *mut [4]f64) void @multiversion(
         v = m.dd_neg(v);
     }
     put(r, 0, v);
+}
+
+// -----------------------------------------------------------------------------
+// The double complex functions' finite computations (complex_impl.h's, for
+// complex.c): the same operations on the same values in the same order, so
+// that the results are the same bits, without the C units' calls of each
+// pair operation and with fused multiply-adds where the processor has them
+// (two_prod is exact either way).
+// -----------------------------------------------------------------------------
+
+/// A pair of doubles h + l (complex_impl.h's DT).
+struct P {
+    h: f64,
+    l: f64,
+}
+
+inline fn pp(h: f64, l: f64) P {
+    return P.{ h: h, l: l };
+}
+
+inline fn fin(x: f64) bool {
+    return @abs(x) <= 1.7976931348623157e308;
+}
+
+inline fn sgn(x: f64) bool {
+    return (m.bits(x) >> 63) != 0;
+}
+
+inline fn copysign(a: f64, b: f64) f64 {
+    return m.from_bits((m.bits(a) & 0x7FFF_FFFF_FFFF_FFFF) | (m.bits(b) & 0x8000_0000_0000_0000));
+}
+
+/// a b - p exactly (complex.c's prod_err: Dekker's product of Veltkamp's
+/// halves in range, else fma; one fused multiply-add where there is one).
+inline fn prod_err(a: f64, b: f64, p: f64) f64 {
+    if @target_has("fma") or @target_arch("aarch64") {
+        return @fma(a, b, -p);
+    }
+    let fa = @abs(a);
+    let fb = @abs(b);
+    let fp = @abs(p);
+    if (fa < p2(995)) and (fb < p2(995)) and (fa > p2(-920)) and (fb > p2(-920)) and (fp > p2(-960)) and
+       (fp < p2(995)) {
+        let ta = 134217729.0 * a;
+        let ah = ta - (ta - a);
+        let al = a - ah;
+        let u = 134217729.0 * b;
+        let bh = u - (u - b);
+        let bl = b - bh;
+        return ((((ah * bh) - p) + (ah * bl)) + (al * bh)) + (al * bl);
+    }
+    return fma(a, b, -p);
+}
+
+inline fn d_sum(a: f64, b: f64) P {
+    let s = a + b;
+    if not fin(s) {
+        return pp(s, 0.0);
+    }
+    let bb = s - a;
+    return pp(s, (a - (s - bb)) + (b - bb));
+}
+
+inline fn d_prod(a: f64, b: f64) P {
+    let p = a * b;
+    if (not fin(p)) or (p == 0.0) {
+        return pp(p, 0.0);
+    }
+    return pp(p, prod_err(a, b, p));
+}
+
+inline fn d_add(a: P, b: P) P {
+    let s = d_sum(a.h, b.h);
+    if not fin(s.h) {
+        return s;
+    }
+    return d_sum(s.h, s.l + (a.l + b.l));
+}
+
+inline fn d_neg(a: P) P {
+    return pp(-a.h, -a.l);
+}
+
+inline fn d_sub(a: P, b: P) P {
+    return d_add(a, d_neg(b));
+}
+
+inline fn d_mul(a: P, b: P) P {
+    let p = d_prod(a.h, b.h);
+    if not fin(p.h) {
+        return p;
+    }
+    return d_sum(p.h, p.l + ((a.h * b.l) + (a.l * b.h)));
+}
+
+inline fn d_div(a: P, b: P) P {
+    let q = a.h / b.h;
+    if (not fin(q)) or (q == 0.0) {
+        return pp(q, 0.0);
+    }
+    let r = d_add(a, d_mul(b, pp(-q, 0.0)));
+    return d_sum(q, (r.h + r.l) / b.h);
+}
+
+fn d_scale(a: P, k: i32) P {
+    return pp(scalbn(a.h, k), scalbn(a.l, k));
+}
+
+inline fn d_half(a: P) P {
+    return pp(0.5 * a.h, 0.5 * a.l);
+}
+
+inline fn d_sqrt(a: P) P {
+    if a.h <= 0.0 {
+        return pp(0.0, 0.0);
+    }
+    let s = @sqrt(a.h);
+    let e = d_add(a, d_prod(-s, s));
+    return d_sum(s, (e.h + e.l) / (2.0 * s));
+}
+
+inline fn d_round(a: P) f64 {
+    if a.l == 0.0 {
+        return a.h;
+    }
+    return a.h + a.l;
+}
+
+inline fn k1(op: u32, x: f64) P {
+    let mut r: [4]f64 = [0.0; 4];
+    cx1(op, x, &mut r);
+    return pp(r[0], r[1]);
+}
+
+inline fn k2(op: u32, y: f64, x: f64) P {
+    let mut r: [4]f64 = [0.0; 4];
+    cx2(op, y, x, &mut r);
+    return pp(r[0], r[1]);
+}
+
+/// sin y and cos y of a double y (xsincos of a pair without a tail).
+struct SC2 {
+    s: P,
+    c: P,
+}
+
+inline fn d_sincos(y: f64) SC2 {
+    let mut r: [4]f64 = [0.0; 4];
+    cx1(2, y, &mut r);
+    return SC2.{ s: pp(r[0], r[1]), c: pp(r[2], r[3]) };
+}
+
+inline fn d_log1p(x: P) P {
+    let mut l = k1(3, x.h);
+    if x.l != 0.0 {
+        l = d_add(l, pp(x.l / (1.0 + x.h), 0.0));
+    }
+    return l;
+}
+
+inline fn d_halflog(a: f64, b: f64) P {
+    if a >= b {
+        return k2(1, a, b);
+    }
+    return k2(1, b, a);
+}
+
+inline fn d_log(v: P) P {
+    let mut l = k2(1, v.h, 0.0);
+    if v.l != 0.0 {
+        l = d_add(l, pp(v.l / v.h, 0.0));
+    }
+    return l;
+}
+
+inline fn d_atan2(y: P, x: P) P {
+    let mut a = k2(0, y.h, x.h);
+    if (y.l != 0.0) or (x.l != 0.0) {
+        let mut s = @abs(y.h);
+        if @abs(x.h) > @abs(y.h) {
+            s = @abs(x.h);
+        }
+        let mut xn = x.h;
+        let mut yn = y.h;
+        let mut xl = x.l;
+        let mut yl = y.l;
+        if not ((s < p2(500)) and (s > p2(-450))) {
+            let e = ilogb(s);
+            xn = scalbn(x.h, -e);
+            yn = scalbn(y.h, -e);
+            xl = scalbn(x.l, -e);
+            yl = scalbn(y.l, -e);
+        }
+        a = d_add(a, pp(((xn * yl) - (yn * xl)) / ((xn * xn) + (yn * yn)), 0.0));
+    }
+    return a;
+}
+
+inline fn d_asinh(b: P) P {
+    let q = d_mul(b, b);
+    let sq = d_sqrt(d_add(q, pp(1.0, 0.0)));
+    return d_log1p(d_add(b, d_div(q, d_add(sq, pp(1.0, 0.0)))));
+}
+
+struct SH {
+    sh: P,
+    ch: P,
+}
+
+inline fn d_sinhcosh(x: f64) SH {
+    let a = @abs(x);
+    if a < 0.5 {
+        let u = k1(1, a);
+        let u1 = d_add(u, pp(1.0, 0.0));
+        return SH.{ sh: d_half(d_add(u, d_div(u, u1))), ch: d_add(pp(1.0, 0.0), d_half(d_div(d_mul(u, u), u1))) };
+    }
+    let e = k1(0, a);
+    let ei = d_div(pp(1.0, 0.0), e);
+    return SH.{ sh: d_half(d_sub(e, ei)), ch: d_half(d_add(e, ei)) };
+}
+
+/// cs_dt: sqrt(a + ib) for b >= 0, not both 0, as (re, im).
+struct CS {
+    re: P,
+    im: P,
+}
+
+inline fn d_csqrt(a: P, b: P) CS {
+    let mut mx = b.h;
+    if @abs(a.h) > b.h {
+        mx = @abs(a.h);
+    }
+    let mut k: i32 = 0;
+    let mut sa = a;
+    let mut bs = b;
+    if not ((mx < p2(500)) and (mx > p2(-450))) {
+        let e = ilogb(mx);
+        k = e;
+        if (e & 1) != 0 {
+            k = e - 1;
+        }
+        sa = d_scale(a, -k);
+        bs = d_scale(b, -k);
+    }
+    if sa.h < 0.0 {
+        sa = d_neg(sa);
+    }
+    let h = d_sqrt(d_add(d_mul(sa, sa), d_mul(bs, bs)));
+    let mut tq = d_sqrt(d_half(d_add(sa, h)));
+    let mut v = pp(0.0, 0.0);
+    if k == 0 {
+        v = d_div(b, pp(2.0 * tq.h, 2.0 * tq.l));
+    } else {
+        if k < 0 {
+            v = d_scale(d_div(bs, pp(2.0 * tq.h, 2.0 * tq.l)), k / 2);
+        } else {
+            v = d_scale(d_div(b, pp(2.0 * tq.h, 2.0 * tq.l)), -(k / 2));
+        }
+        tq = d_scale(tq, k / 2);
+    }
+    if a.h >= 0.0 {
+        return CS.{ re: tq, im: v };
+    }
+    return CS.{ re: v, im: tq };
+}
+
+/// s12: sqrt(1 - z) and sqrt(1 + z), their imaginary parts signed.
+struct S12 {
+    r1: P,
+    i1: P,
+    r2: P,
+    i2: P,
+}
+
+inline fn d_s12(x: f64, y: f64) S12 {
+    let ay = @abs(y);
+    let a = d_csqrt(d_sum(1.0, -x), pp(ay, 0.0));
+    let b = d_csqrt(d_sum(1.0, x), pp(ay, 0.0));
+    let mut i1 = a.im;
+    let mut i2 = b.im;
+    if not sgn(y) {
+        i1 = d_neg(i1);
+    } else {
+        i2 = d_neg(i2);
+    }
+    return S12.{ r1: a.re, i1: i1, r2: b.re, i2: i2 };
+}
+
+/// The double complex functions' finite computations, from the point where
+/// complex_impl.h's own begins (its special cases taken before): op 0 cexp
+/// (|x| <= 700, y != 0), 1 csinh and 2 ccosh (y != 0), 3 ctanh (y != 0), 4
+/// csqrt (z != 0), 5 casin and 6 cacos (|x|, |y| <= 2^60, not y = 0 with
+/// |x| <= 1), 7 catanh (|x|, |y| <= 2^500, not y = 0 with |x| <= 1). The
+/// result's parts in r.
+export fn __axc_cxd(op: u32, x: f64, y: f64, r: *mut [2]f64) void @multiversion("fma") {
+    if op <= 3 {
+        let scy = d_sincos(y);
+        let s = scy.s;
+        let c = scy.c;
+        if op == 0 {
+            let p = ek.parts(x, 0.0);
+            let ed = scaled(m.fast_two_sum(p.s, p.e), p.k);
+            let e = pp(ed.hi, ed.lo);
+            r[0] = d_round(d_mul(e, c));
+            r[1] = d_round(d_mul(e, s));
+            return;
+        }
+        if op == 3 {
+            if @abs(x) > 22.0 {
+                let e = k1(0, -@abs(x));
+                let sc = d_mul(s, c);
+                r[0] = copysign(1.0, x);
+                r[1] = d_round(d_mul(d_mul(pp(4.0 * sc.h, 4.0 * sc.l), e), e));
+                return;
+            }
+            let hc = d_sinhcosh(x);
+            let mut sh = hc.sh;
+            if sgn(x) {
+                sh = d_neg(sh);
+            }
+            let d = d_add(d_mul(sh, sh), d_mul(c, c));
+            r[0] = d_round(d_div(d_mul(sh, hc.ch), d));
+            r[1] = d_round(d_div(d_mul(s, c), d));
+            return;
+        }
+        if @abs(x) > 700.0 {
+            let e = k1(0, 0.5 * @abs(x));
+            let he = d_half(e);
+            if op == 1 {
+                let re = d_round(d_mul(d_mul(he, c), e));
+                r[0] = re;
+                if x < 0.0 {
+                    r[0] = -re;
+                }
+                r[1] = d_round(d_mul(d_mul(he, s), e));
+            } else {
+                let im = d_round(d_mul(d_mul(he, s), e));
+                r[0] = d_round(d_mul(d_mul(he, c), e));
+                r[1] = im;
+                if x < 0.0 {
+                    r[1] = -im;
+                }
+            }
+            return;
+        }
+        let hc = d_sinhcosh(x);
+        let mut sh = hc.sh;
+        if sgn(x) {
+            sh = d_neg(sh);
+        }
+        if op == 1 {
+            r[0] = d_round(d_mul(sh, c));
+            r[1] = d_round(d_mul(hc.ch, s));
+        } else {
+            r[0] = d_round(d_mul(hc.ch, c));
+            r[1] = d_round(d_mul(sh, s));
+        }
+        return;
+    }
+    if op == 4 {
+        let q = d_csqrt(pp(x, 0.0), pp(@abs(y), 0.0));
+        r[0] = d_round(q.re);
+        r[1] = copysign(d_round(q.im), y);
+        return;
+    }
+    if op <= 6 {
+        let q = d_s12(x, y);
+        if op == 5 {
+            let a = d_sub(d_mul(q.r1, q.r2), d_mul(q.i1, q.i2));
+            let b = d_sub(d_mul(q.r1, q.i2), d_mul(q.i1, q.r2));
+            let mut bb = b;
+            if b.h < 0.0 {
+                bb = d_neg(b);
+            }
+            let im = d_round(d_asinh(bb));
+            r[0] = d_round(d_atan2(pp(x, 0.0), a));
+            r[1] = copysign(im, b.h);
+            return;
+        }
+        let b = d_sub(d_mul(q.r2, q.i1), d_mul(q.i2, q.r1));
+        let mut bb = b;
+        if b.h < 0.0 {
+            bb = d_neg(b);
+        }
+        let im = d_round(d_asinh(bb));
+        let a = d_atan2(q.r1, q.r2);
+        r[0] = d_round(pp(2.0 * a.h, 2.0 * a.l));
+        r[1] = copysign(im, b.h);
+        return;
+    }
+    // catanh
+    let ax = @abs(x);
+    let ay = @abs(y);
+    let mm = d_sum(1.0, -ax);
+    let p = d_sum(1.0, ax);
+    let y2 = d_prod(ay, ay);
+    let den = d_add(d_mul(mm, mm), y2);
+    let b = d_sub(d_mul(mm, p), y2);
+    let mut re: f64 = 0.0;
+    if (ax >= 0.5) and (ax <= 2.0) and (den.h < (4.0 * ax)) {
+        let l1 = d_log(d_add(d_mul(p, p), y2));
+        let l2h = d_halflog(@abs(mm.h), ay);
+        let l2 = pp(2.0 * l2h.h, 2.0 * l2h.l);
+        re = d_round(d_half(d_half(d_sub(l1, l2))));
+    } else {
+        re = d_round(d_half(d_half(d_log1p(d_div(pp(4.0 * ax, 0.0), den)))));
+    }
+    let im = d_round(d_half(d_atan2(pp(2.0 * ay, 0.0), b)));
+    r[0] = copysign(re, x);
+    r[1] = copysign(im, y);
 }

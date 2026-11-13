@@ -1237,8 +1237,14 @@ functions are C (`std/c/lib/math/`).
   150 bits, which would take kernels and tables wider than triple-double (not written).
   Also left to the pairs (and their bound) are a `w` with a part of 2^800 or more and a
   complex `w` with `|arg z|` below 2^-600 or `|log |z||` below 2^-600; a real `w` and an
-  argument of `z` too small for the angle's pair take that angle scaled. A double complex function takes 1.2 to 2.5 times the time of the
-  former, less accurate one (`cexp` 90 ns, `csqrt` 140, `casin` 460).
+  argument of `z` too small for the angle's pair take that angle scaled. The double
+  functions' finite computations (`cexp`, `csqrt`, `csinh`, `ccosh`, `ctanh`, `casin`,
+  `cacos`, `catanh` and those made of them) are `complex_impl.h`'s operations in one
+  call of `math_cx.ax`'s `__axc_cxd`, with the processor's fused multiply-add where it
+  has one: the same bits (compared on 1.1 million arguments per function, with and
+  without the extension). Against the former, less accurate functions (`-O2`, x86-64,
+  best of seven): `cexp` and `clog` 1.1 times their time, `csqrt` 1.35, `csinh`,
+  `ccosh`, `ctanh` 1.4 to 1.5, `catanh` 1.7, `cpow` 1.75, `casin` and `cacos` 2.1.
 - **`long double`** where it is `double` (Windows, macOS; and with `--c-long-double=64`) has
   the double functions. Where it is wider (the 80-bit x87 format on x86-64 Linux, binary128
   on AArch64 Linux and WebAssembly), the exact `l` functions (`fabsl`, `copysignl`, the

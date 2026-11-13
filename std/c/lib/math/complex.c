@@ -48,6 +48,22 @@ static double prod_err(double a, double b, double p)
 }
 #define PROD_ERR(a, b, p) prod_err((a), (b), (p))
 
+/* The finite computations of cexp (|x| <= K_EXP_BIG), csinh, ccosh, ctanh,
+   csqrt, casin, cacos and catanh from the point where complex_impl.h's
+   own begin (XCX(op, x, y)): the same operations in one call of
+   std/c/rt/math_cx.ax (its __axc_cxd: the same bits, with the processor's
+   fused multiply-add where it has one, and none of this unit's calls of
+   each pair operation) */
+void __axc_cxd(unsigned op, double x, double y, double *r);
+
+static double complex xcx_d(unsigned op, double x, double y)
+{
+    double r[2];
+    __axc_cxd(op, x, y, r);
+    return __builtin_complex(r[0], r[1]);
+}
+#define XCX(op, x, y) xcx_d((op), (x), (y))
+
 /* cpow where |w| |log z| is beyond 2^12 (the pairs' angle would lose
    more than a tenth of an ulp): w log z in triple-double in binary128
    (std/c/rt/math_ld.ax), each part rounded to binary128 and then to

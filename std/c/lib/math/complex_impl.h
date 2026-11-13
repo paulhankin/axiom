@@ -362,6 +362,10 @@ CT FN(cexp)(CT z)
             return C(x, x + y);
         return C(invalid() + y, invalid() + y); /* x finite, y inf or NaN */
     }
+#ifdef XCX
+    if (M(fabs)(x) <= K_EXP_BIG)
+        return XCX(0, x, y);
+#endif
     return cexp_dt(dt(x, 0.0), dt(y, 0.0));
 }
 
@@ -402,6 +406,9 @@ CT FN(csqrt)(CT z)
         return C(y + x, y + x);
     if (x == 0.0 && y == 0.0)
         return C(0.0, y);
+#ifdef XCX
+    return XCX(4, x, y);
+#endif
     cs_dt(dt(x, 0.0), dt(M(fabs)(y), 0.0), &re, &im);
     return C(dt_round(re), M(copysign)(dt_round(im), y));
 }
@@ -479,6 +486,9 @@ CT FN(csinh)(CT z)
     }
     if (y == 0.0)
         return C(M(sinh)(x), y);
+#ifdef XCX
+    return XCX(1, x, y);
+#endif
     xsincos(dt(y, 0.0), &s, &c);
     if (M(fabs)(x) > K_EXP_BIG) {
         /* e^|x| / 2 overflows before its products might not: e^(|x|/2) twice */
@@ -513,6 +523,9 @@ CT FN(ccosh)(CT z)
     }
     if (y == 0.0)
         return C(M(cosh)(x), M(copysign)(0.0, x) * y);
+#ifdef XCX
+    return XCX(2, x, y);
+#endif
     xsincos(dt(y, 0.0), &s, &c);
     if (M(fabs)(x) > K_EXP_BIG) {
         DT e = xk1(0, 0.5 * M(fabs)(x)), he = dt_half(e);
@@ -548,6 +561,9 @@ CT FN(ctanh)(CT z)
     }
     if (y == 0.0)
         return C(M(tanh)(x), y);
+#ifdef XCX
+    return XCX(3, x, y);
+#endif
     xsincos(dt(y, 0.0), &s, &c);
     if (M(fabs)(x) > K_TANH_BIG) {
         /* tanh x is 1 to T's precision; the imaginary part 4 sin y cos y
@@ -630,6 +646,9 @@ CT FN(casin)(CT z)
     }
     if (y == 0.0 && M(fabs)(x) <= 1.0)
         return C(M(asin)(x), y);
+#ifdef XCX
+    return XCX(5, x, y);
+#endif
     s12(x, y, &r1, &i1, &r2, &i2);
     a = dt_sub(dt_mul(r1, r2), dt_mul(i1, i2));
     b = dt_sub(dt_mul(r1, i2), dt_mul(i1, r2));
@@ -668,6 +687,9 @@ CT FN(cacos)(CT z)
     }
     if (y == 0.0 && M(fabs)(x) <= 1.0)
         return C(M(acos)(x), -y);
+#ifdef XCX
+    return XCX(6, x, y);
+#endif
     s12(x, y, &r1, &i1, &r2, &i2);
     b = dt_sub(dt_mul(r2, i1), dt_mul(i2, r1));
     im = dt_round(xasinh(b.h < 0.0 ? dt_neg(b) : b));
@@ -721,6 +743,9 @@ CT FN(catanh)(CT z)
     }
     if (y == 0.0 && ax < 1.0)
         return C(M(atanh)(x), y);
+#ifdef XCX
+    return XCX(7, x, y);
+#endif
     {
         /* (1 - |x|)^2 + y^2, (1 + |x|)^2 + y^2 and (1 - |x|)(1 + |x|) - y^2
            in pairs (1 -+ |x| exact as pairs) */

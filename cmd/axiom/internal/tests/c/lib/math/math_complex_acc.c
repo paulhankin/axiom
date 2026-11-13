@@ -87,6 +87,11 @@ int main(void)
     pc(catanh(CMPLX(-1.4528790515853155e-139, 1.0766867645456593e-11)));
 /* expect: -1.4528790515853155e-139 */
 /* expect: 1.0766867645456593e-11 */
+    /* (atan2 of a very small part over a part beyond 2^996: without fused
+       multiply-add, Dekker's product of its quotient overflowed) */
+    pc(catanh(CMPLX(3e150, 1e-182)));
+/* expect: 3.3333333333333334e-151 */
+/* expect: 1.5707963267948966 */
     pc(catan(CMPLX(1e-20, 0.9999999999999999)));
 /* expect: 0.00004503599615191316 */
 /* expect: 18.714973873090283 */
