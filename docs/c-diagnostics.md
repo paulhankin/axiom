@@ -247,7 +247,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
 | `C3300` | A call of `setjmp` (`<setjmp.h>`, or `__builtin_setjmp`, `__builtin_longjmp`) or a non-local `goto` (from a nested function), in a program for a WebAssembly target without its exception-handling extension (`--features=+exception-handling`), which it needs to return to a frame. Reported by `build`. |
 | `C3301` | The address of `setjmp`'s function (`__axc_setjmp`) taken: it can only be called, so that the compiler knows the function calling it. Reported by `build`. |
-| `C3901` | A feature that this implementation does not support: in a GNU dialect constraints it does not know (on WebAssembly a machine constraint of another target), an explicit register variable on WebAssembly, a variadic nested function, a jump from a nested function to a label of its enclosing function, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
+| `C3901` | A feature that this implementation does not support: in a GNU dialect constraints it does not know (on WebAssembly a machine constraint of another target), an explicit register variable on WebAssembly, a packed bit-field no unit in its structure holds. |
 
 ### The GNU dialects
 

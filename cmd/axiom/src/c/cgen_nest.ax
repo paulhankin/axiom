@@ -7,8 +7,14 @@
 //   [0]               its own chain (below), or null
 //   [1 .. 1+n)        the addresses of the objects of its rec: its own, or,
 //                     for its enclosing functions' objects, those its own
-//                     chain gives
-//   [1+n .. 1+n+m)    for each of its nested functions whose address is
+//                     chain gives (its own variable length arrays': stored
+//                     when each is allocated, null before)
+//   [1+n .. 1+n+l)    the addresses of the slots of the lengths of the
+//                     variable length array types it evaluates
+//                     (csema_nest.lengths): a nested function reads the
+//                     length of such a type there (outer_len), through
+//                     record_of
+//   [.. +m)           for each of its nested functions whose address is
 //                     taken (tramps), the trampoline this call of it holds
 //                     (its index plus 1), or 0
 // A nested function is an ordinary IR function of the unit, with one IR
@@ -35,6 +41,14 @@
 // addresses of one nested function at once (in POOL live calls of its
 // enclosing function) traps. A longjmp out of the enclosing function, which
 // unwinds nothing, keeps its slots.
+//
+// A variadic nested function's IR function takes, after its named
+// arguments, the address of a va_list (which its va_start copies:
+// cgen_va.va_from) and then its chain. A direct call calls its entry
+// (entry_of): a variadic function whose named arguments are the nested
+// function's and then the chain, so that the variable arguments come after
+// it on every ABI; the entry, and each trampoline, starts a va_list and calls
+// the nested function with it.
 //
 // Non-local gotos: a goto in a nested function to a local label
 // (`__label__`) of an enclosing function P (cast.CSym.nonlocal) leaves the
@@ -70,6 +84,7 @@ import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_gbuiltin.ax" as ggb;
 import "cgen_sjlj.ax" as sj;
+import "cgen_va.ax" as gva;
 import "cgen_vla.ax" as gv;
 import "csema_nest.ax" as cnest;
 import "csema_vla.ax" as svla;
@@ -118,7 +133,8 @@ pub fn enter(s: *mut cast.CSym) void {
     if not s.has_nested {
         return;
     }
-    let mut n = 1 + @as(u64, s.rec.len) + @as(u64, s.tramps.len);
+    let ls = cnest.lengths(s);
+    let mut n = 1 + @as(u64, s.rec.len) + @as(u64, ls.len) + @as(u64, s.tramps.len);
     if s.nonlocal.len > 0 {
         n += 2;
     }
@@ -131,10 +147,21 @@ pub fn enter(s: *mut cast.CSym) void {
     }
     for k in 0..s.rec.len {
         let x = s.rec.get(k);
-        st(object_addr(x), slot(r, 1 + @as(u64, k)));
+        if (x.owner == s) and cty.is_vla(x.ty) {
+            st(ir.czero(cg.T_ptr), slot(r, 1 + @as(u64, k)));  // (until it is allocated: allocated)
+        } else {
+            st(object_addr(x), slot(r, 1 + @as(u64, k)));
+        }
+    }
+    for k in 0..ls.len {
+        let mut a = ir.czero(cg.T_ptr);
+        if not u.isvnil(ls[k]) {
+            a = gv.len_addr(ls[k]);
+        }
+        st(a, slot(r, lens_field(s) + @as(u64, k)));
     }
     for k in 0..s.tramps.len {
-        st(ir.czero(cg.T_ptr), slot(r, 1 + @as(u64, s.rec.len) + @as(u64, k)));
+        st(ir.czero(cg.T_ptr), slot(r, lens_field(s) + @as(u64, ls.len) + @as(u64, k)));
     }
     if s.nonlocal.len > 0 {
         if cg.is_wasm and not tg.has(tg.W_EXCEPTION_HANDLING) {
@@ -152,7 +179,49 @@ pub fn enter(s: *mut cast.CSym) void {
 // The index of the jmp_buf's address in the record of function s with
 // non-local labels (then that of the jump's number).
 fn jb_field(s: *cast.CSym) u64 {
-    return 1 + @as(u64, s.rec.len) + @as(u64, s.tramps.len);
+    return lens_field(s) + @as(u64, cnest.lengths(s).len) + @as(u64, s.tramps.len);
+}
+
+// The index of the first length slot's address in function s's record.
+fn lens_field(s: *cast.CSym) u64 {
+    return 1 + @as(u64, s.rec.len);
+}
+
+/// Variable length array object s of the function being generated is
+/// allocated (its address in s.ir): its address in the frame record, if a
+/// nested function uses it.
+pub fn allocated(s: *mut cast.CSym) void {
+    let F = cg.F;
+    if u.isnil(F) or u.isnil(F.rec) or u.isnil(F.sym) {
+        return;
+    }
+    let idx = cnest.rec_index(F.sym, s);
+    if idx >= 0 {
+        st(@ptr_cast(*mut ir.Value, s.ir), slot(F.rec, 1 + @as(u64, @bit_cast(u32, idx))));
+    }
+}
+
+/// The address of the slot of length n (a CType.vexpr) that an enclosing
+/// function of the function being generated evaluates, from its record; nil
+/// if the function being generated evaluates it (cgen_vla.slot).
+pub fn outer_len(n: *mut void) *mut ir.Value {
+    let F = cg.F;
+    if u.isnil(F) or u.isnil(F.sym) or u.isnil(F.sym.nest_parent) {
+        return ir.vnil();
+    }
+    let p = cnest.length_owner(n);
+    if u.isnil(p) or (p == F.sym) {
+        return ir.vnil();
+    }
+    let mut x = F.sym.nest_parent;
+    while u.notnil(x) and (x != p) {
+        x = x.nest_parent;
+    }
+    let idx = cnest.length_index(p, n);
+    if u.isnil(x) or (idx < 0) {
+        return ir.vnil();  // (not an enclosing function's)
+    }
+    return ld(slot(record_of(p), lens_field(p) + @as(u64, @bit_cast(u32, idx))));
 }
 
 /// The address of automatic object x of the function being generated, or
@@ -234,7 +303,7 @@ pub fn pool_of(g: *mut cast.CSym) *mut Pool {
     tab.linkage = ir.LINK_INTERNAL;
     tab.align = 8;
     p.chains = tab.val;
-    let sig = cg.sig_of(g.ty.ret, cg.param_types(g), g.ty.params.len, false, true);
+    let sig = cg.sig_of(g.ty.ret, cg.param_types(g), g.ty.params.len, g.ty.variadic, true);
     p.thunks = u.newn.[*mut ir.Func](NPOOL + 1)[0..NPOOL];
     let addrs = u.newn.[*mut ir.Value](NPOOL + 1);
     for i in 0..NPOOL {
@@ -257,12 +326,71 @@ pub fn pool_of(g: *mut cast.CSym) *mut Pool {
     return p;
 }
 
+// The entries of variadic nested functions (entry_of), by function.
+let mut g_entries: u.SymMap.[*mut ir.Func] = u.SymMap.[*mut ir.Func].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                       vals: @ptr_from_int(*mut *mut ir.Func, 0),
+                                                                       cap: 0, len: 0 };
+
+/// The parameter types of variadic nested function g's entry: g's, then
+/// its chain.
+pub fn entry_params(g: *cast.CSym) []mut *mut cty.CType {
+    let ps = cg.param_types(g);
+    let r = u.newn.[*mut cty.CType](ps.len + 2);
+    for i in 0..ps.len {
+        r[i] = ps[i];
+    }
+    r[ps.len] = cty.pointer_to(cty.t_void);
+    return r[0..ps.len + 1];
+}
+
+/// The entry of variadic nested function g (declared once; defined with the
+/// trampolines, cgen_stmt.trampolines): a variadic function whose named
+/// arguments are g's and then its chain (so that va_start in it skips the
+/// chain, on every ABI), which calls g with a va_list of its variable
+/// arguments. A direct call of g calls it.
+pub fn entry_of(g: *mut cast.CSym) *mut ir.Func {
+    let k = key(g);
+    let had = g_entries.get(k);
+    if u.notnil(had) {
+        return had;
+    }
+    let ps = entry_params(g);
+    let sig = cg.sig_of(g.ty.ret, ps, ps.len, true, true);
+    let f = ir.add_function(cg.M, u.f2("%s.%s.entry", g.name, u.idec(g.uid)), sig.ty);
+    f.linkage = ir.LINK_INTERNAL;
+    cg.mark_func(f, sig.plan);
+    g_entries.put(k, f);
+    return f;
+}
+
+/// A direct call of variadic nested function g with arguments vs of types
+/// ats (nnamed of them named) from the function being generated: a call of
+/// its entry, the chain after the named arguments.
+pub fn call_variadic(g: *mut cast.CSym, ats: []mut *mut cty.CType, vs: []mut *mut ir.Value,
+                     nnamed: usize) *mut ir.Value {
+    let n = ats.len;
+    let ts = u.newn.[*mut cty.CType](n + 2);
+    let xs = u.newn.[*mut ir.Value](n + 2);
+    for i in 0..n {
+        let mut j = i;
+        if i >= nnamed {
+            j = i + 1;
+        }
+        ts[j] = ats[i];
+        xs[j] = vs[i];
+    }
+    ts[nnamed] = cty.pointer_to(cty.t_void);
+    xs[nnamed] = chain_for(g);
+    let sig = cg.sig_of(g.ty.ret, ts[0..n + 1], nnamed + 1, true, false);
+    return gva.emit_call(sig.plan, sig.ty, entry_of(g).val, xs[0..n + 1]);
+}
+
 // The index of nested function g's trampoline field in its enclosing function's record.
 fn field(g: *mut cast.CSym) u64 {
     let p = g.nest_parent;
     for k in 0..p.tramps.len {
         if p.tramps.get(k) == g {
-            return 1 + @as(u64, p.rec.len) + @as(u64, k);
+            return lens_field(p) + @as(u64, cnest.lengths(p).len) + @as(u64, k);
         }
     }
     return 0;

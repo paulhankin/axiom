@@ -33,6 +33,7 @@ import "cgen_wint.ax" as cgw;
 import "cpragma.ax" as cpg;
 import "csema.ax" as cs;
 import "csema_attr.ax" as catr;
+import "csema_builtin.ax" as csb;
 import "csema_gnu.ax" as cgn;
 import "csema_stmt.ax" as css;
 import "csema_vla.ax" as svla;
@@ -51,6 +52,18 @@ struct Body {
     jumps: u.List.[Jump],
     cases: u.SymMap.[*mut ir.Block],  // a CASE or DEFAULT statement's block, by its address
     is_main: bool,
+    at_labels: u.SymMap.[*mut void],  // what is in scope at each label whose address is taken (cgen_vla.snapshot)
+    landings: u.List.[Landing],       // the jumps of `goto *` that leave scopes (computed_goto), made at the end
+}
+
+// A jump of a `goto *` to a label whose address is taken, from where
+// variable length arrays or objects with cleanups are in scope (or to where
+// they are): made at the end of the body (landings), when what is in scope
+// at the label is known.
+struct Landing {
+    blk: *mut ir.Block,
+    from: *mut void,  // what is in scope at the goto (cgen_vla.snapshot)
+    to: *mut cast.CSym,
 }
 
 let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
@@ -63,6 +76,7 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     cg.hooks.stmt_expr = stmt_expr;
     cg.hooks.trampolines = trampolines;
     gv.gen_expr = gx.rv;
+    gv.outer_len = gnest.outer_len;
     gvec.install();
     cdbg.vla_len_slot = gv.len_slot;
     let ok = cg.generate(m, cu, wasm);
@@ -97,6 +111,7 @@ fn function_body(s: *mut cast.CSym) void {
     let b = u.new.[Body]();
     b.cases = u.SymMap.[*mut ir.Block].{ keys: u.nil.[usize](), vals: u.nil.[*mut ir.Block](), cap: 0, len: 0 };
     b.is_main = u.str_eq(s.name, "main") and (s.linkage == cast.LK_EXTERNAL);
+    b.at_labels = u.SymMap.[*mut void].{ keys: u.nil.[usize](), vals: u.nil.[*mut void](), cap: 0, len: 0 };
     BD = b;
     gv.begin_function();
     sj.begin_function();
@@ -107,7 +122,12 @@ fn function_body(s: *mut cast.CSym) void {
     let start = cg.new_block("start");
     cg.at_end(start);
     cdbg.begin_function(f);
-    F.sret = gva.enter_function(F.sig.plan, f, s.params.items(), s.ty.variadic);
+    let va_nested = s.ty.variadic and u.notnil(s.nest_parent);
+    F.sret = gva.enter_function(F.sig.plan, f, s.params.items(), s.ty.variadic and not va_nested);
+    if va_nested {
+        // (its variable arguments: its entry's va_list, cgen_nest.ax)
+        gva.va_from(f.params[@int_cast(usize, F.sig.plan.args[s.params.len].slot[0])]);
+    }
     // (a restrict-qualified pointer parameter passed in a register:
     // ir.F_NOALIAS, 6.7.3.1; one the attribute nonnull or `[static n]` says
     // is not null: ir.F_NONNULL, unless --c-keep-null-checks; `[static n]`'s
@@ -166,6 +186,7 @@ fn function_body(s: *mut cast.CSym) void {
             gva.ret_default(F.sig.plan, F.sret);
         }
     }
+    landings();
     gnest.finish(label_block);  // (the non-local gotos' ends)
     if sj.has_sites() {
         sj.end_function(f, start);  // (setjmp on WebAssembly: the dispatch after a longjmp)
@@ -276,6 +297,9 @@ fn stmt(s: *mut cast.Stmt) void {
         cg.br(b);
         cg.at_end(b);
         gnest.label(s.sym);  // (a nested function's non-local goto's target)
+        if s.sym.label_addr {
+            BD.at_labels.put(u.addr_key(@int_from_ptr(s.sym)), gv.snapshot());  // (a `goto *`'s target)
+        }
         stmt(s.body);
     } else if k == cast.StmtKind.ASM {
         asm_stmt(s.asm);
@@ -315,7 +339,13 @@ fn asm_stmt(a: *mut cast.Asm) void {
 
 // `goto *p` (a GNU dialect): p is the address of one of the function's
 // labels (`&&label`: cgen.label_address), found by its distance from their
-// table's start; any other value is undefined (the switch's default).
+// table's start; any other value is undefined (the switch's default). A
+// label in a scope of a variable length array or of an object with a
+// cleanup, or a goto in one, goes through a landing (made at the end:
+// landings) that leaves the scopes the jump leaves as a goto does, freeing
+// the arrays and calling the cleanups; to a label in such a scope the goto
+// is not in (6.8.6.1p1: a jump into it, which the label's address makes
+// possible at run time), it traps.
 fn computed_goto(s: *mut cast.Stmt) void {
     cg.continue_after();
     let p = gx.full(s.e);
@@ -326,13 +356,46 @@ fn computed_goto(s: *mut cast.Stmt) void {
     let dead = cg.new_block("badgoto");
     let vs = u.newn.[u64](ls.len + 1);
     let bs = u.newn.[*mut ir.Block](ls.len + 1);
+    let from = gv.snapshot();
+    let scoped = gv.depth() > 0;
     for i in 0..ls.len {
         vs[i] = ls[i].value;
-        bs[i] = label_block(ls[i]);
+        if scoped or (svla.depth(ls[i]) > 0) {
+            bs[i] = cg.new_block("goto.leave");
+            BD.landings.push(Landing.{ blk: bs[i], from: from, to: ls[i] });
+        } else {
+            bs[i] = label_block(ls[i]);
+        }
     }
     flow.switch_to(k, false, vs[0..ls.len], bs[0..ls.len], dead);
     cg.at_end(dead);
     ir.unreachable(cg.B);
+}
+
+// The landings of the function's `goto *` statements (computed_goto).
+fn landings() void {
+    if BD.landings.len == 0 {
+        return;
+    }
+    let saved = gv.snapshot();
+    for x in BD.landings.items() {
+        cg.at_end(x.blk);
+        let at = BD.at_labels.get(u.addr_key(@int_from_ptr(x.to)));
+        if not u.isvnil(at) and gv.is_prefix(at, x.from) {
+            gv.restore(x.from);
+            gv.release_to(svla.depth(x.to));
+            if not cg.terminated() {
+                cg.br(label_block(x.to));
+            }
+        } else {
+            // (into a scope the goto is not in: undefined, 6.8.6.1p1)
+            let no = u.newn.[*mut ir.Value](1);
+            _ = ir.intr(cg.B, ir.IN_TRAP, cg.T_void, no[0..0]);
+            ir.unreachable(cg.B);
+        }
+    }
+    gv.restore(saved);
+    BD.landings.clear();
 }
 
 // `({ ... })` (a GNU dialect): its block, and the value of its last
@@ -436,6 +499,7 @@ fn decl(d: *mut cast.Decl) void {
             cg.continue_after();
             let p = gv.allocate(s.ty, cg.object_align(s));
             s.ir = @ptr_cast(*mut void, p);
+            gnest.allocated(s);  // (for its nested functions)
             // (its address in an object of its own: -O0 keeps it there, for debuggers)
             let a = cg.alloca(cty.pointer_to(s.ty.elem), "vla.addr");
             _ = ir.store(cg.B, p, a);
@@ -470,6 +534,12 @@ fn push_cleanup(s: *cast.CSym) void {
 fn init_local(s: *mut cast.CSym, p: *mut ir.Value) void {
     let list = s.init;
     let vol = volatile_of(s.ty);
+    for t in list.pre.items() {
+        // (a designator range's value, evaluated once: csema_desig.once)
+        let tp = cg.alloca(t.ty, t.name);
+        t.ir = @ptr_cast(*mut void, tp);
+        init_local(t, tp);
+    }
     if list.zero {
         gx.zero(p, cty.size_of(s.ty));
     }
@@ -818,59 +888,95 @@ fn cleanups() void {
 // function of the nested function's C type that calls it with the chain its
 // slot holds, its arguments as they arrive (cgen_va.ax: the C ABI's both
 // ways).
+//
+// A variadic nested function g (s itself) gets its entry too
+// (gnest.entry_of): the function its direct calls call, whose arguments are
+// g's and its chain as a last named argument (so that the variable
+// arguments start after it, on every ABI); it, and each trampoline of g,
+// starts a va_list of its variable arguments and calls g's IR function
+// with its address (which g's va_start copies: cgen_va.va_from).
 fn trampolines(s: *mut cast.CSym) void {
     let saved = cg.F;
     for g in s.tramps.items() {
         gnest.define_get(g);
         let p = gnest.pool_of(g);
-        let pts = cg.param_types(g);
         for i in 0..p.thunks.len {
-            let f = p.thunks[i];
-            let st = u.new.[cg.FnState]();
-            st.f = f;
-            st.ret = g.ty.ret;
-            st.sig = cg.sig_of(g.ty.ret, pts, pts.len, false, true);
-            cg.F = st;
-            st.entry = cg.new_block("entry");
-            let start = cg.new_block("start");
-            cg.at_end(start);
-            let fakes = u.newn.[*mut cast.CSym](pts.len + 1);
-            for j in 0..pts.len {
-                let x = u.new.[cast.CSym]();
-                x.kind = cast.SK_OBJECT;
-                x.name = "";
-                x.ty = pts[j];
-                x.duration = cast.SD_AUTO;
-                fakes[j] = x;
-            }
-            st.sret = gva.enter_function(st.sig.plan, f, fakes[0..pts.len], false);
-            let vs = u.newn.[*mut ir.Value](pts.len + 1);
-            for j in 0..pts.len {
-                let at = @ptr_cast(*mut ir.Value, fakes[j].ir);
-                if abi.aggregate(pts[j]) {
-                    vs[j] = at;
-                } else {
-                    vs[j] = gx.load(pts[j], at);
-                }
-            }
-            let ch = ir.ptradd(cg.B, p.chains, cg.usz(@as(u64, i) * cty.ptr_bytes));
-            let chain = ir.load(cg.B, cg.T_ptr, ch);
-            chain.flags = chain.flags | ir.F_VOLATILE;
-            let gs = cg.func_sig(g);
-            cg.next_chain = chain;
-            let r = gva.emit_call(gs.plan, gs.ty, cg.func_of(g, gs).val, vs[0..pts.len]);
-            if cty.is_void(g.ty.ret) {
-                gva.ret_value(st.sig.plan, st.sret, ir.vnil());
-            } else {
-                gva.ret_value(st.sig.plan, st.sret, r);
-            }
-            cg.at_end(st.entry);
-            ir.br(cg.B, start);
-            ir.remove_unreachable(f);
-            if cg.is_wasm {
-                flow.make_reducible(f);
-            }
+            forwarder(p.thunks[i], g, p.chains, i);
         }
     }
+    if u.notnil(s.nest_parent) and s.ty.variadic {
+        forwarder(gnest.entry_of(s), s, ir.vnil(), 0);
+    }
     cg.F = saved;
+}
+
+// Defines f, which calls nested function g with its arguments as they
+// arrive (cgen_va.ax: the C ABI's both ways) and the chain in slot i of the
+// table `chains`; or (chains nil: g's variadic entry) the chain its last
+// named argument is.
+fn forwarder(f: *mut ir.Func, g: *mut cast.CSym, chains: *mut ir.Value, i: usize) void {
+    let pts0 = cg.param_types(g);
+    let entry = u.isnil(chains);
+    let mut pts = pts0;
+    if entry {
+        pts = gnest.entry_params(g);
+    }
+    let st = u.new.[cg.FnState]();
+    st.f = f;
+    st.ret = g.ty.ret;
+    st.sig = cg.sig_of(g.ty.ret, pts, pts.len, g.ty.variadic, true);
+    cg.F = st;
+    st.entry = cg.new_block("entry");
+    let start = cg.new_block("start");
+    cg.at_end(start);
+    let fakes = u.newn.[*mut cast.CSym](pts.len + 1);
+    for j in 0..pts.len {
+        let x = u.new.[cast.CSym]();
+        x.kind = cast.SK_OBJECT;
+        x.name = "";
+        x.ty = pts[j];
+        x.duration = cast.SD_AUTO;
+        fakes[j] = x;
+    }
+    st.sret = gva.enter_function(st.sig.plan, f, fakes[0..pts.len], g.ty.variadic);
+    let n = pts0.len;
+    let vs = u.newn.[*mut ir.Value](n + 2);
+    for j in 0..n {
+        let at = @ptr_cast(*mut ir.Value, fakes[j].ir);
+        if abi.aggregate(pts[j]) {
+            vs[j] = at;
+        } else {
+            vs[j] = gx.load(pts[j], at);
+        }
+    }
+    let mut chain = ir.vnil();
+    if entry {
+        chain = gx.load(pts[n], @ptr_cast(*mut ir.Value, fakes[n].ir));
+    } else {
+        let ch = ir.ptradd(cg.B, chains, cg.usz(@as(u64, i) * cty.ptr_bytes));
+        chain = ir.load(cg.B, cg.T_ptr, ch);
+        chain.flags = chain.flags | ir.F_VOLATILE;
+    }
+    let mut nv = n;
+    if g.ty.variadic {
+        // (its variable arguments: a va_list, whose address g takes)
+        let ap = cg.alloca(csb.va_list_type(), "ap");
+        gva.start(ap);
+        vs[n] = ap;
+        nv = n + 1;
+    }
+    let gs = cg.func_sig(g);
+    cg.next_chain = chain;
+    let r = gva.emit_call(gs.plan, gs.ty, cg.func_of(g, gs).val, vs[0..nv]);
+    if cty.is_void(g.ty.ret) {
+        gva.ret_value(st.sig.plan, st.sret, ir.vnil());
+    } else {
+        gva.ret_value(st.sig.plan, st.sret, r);
+    }
+    cg.at_end(st.entry);
+    ir.br(cg.B, start);
+    ir.remove_unreachable(f);
+    if cg.is_wasm {
+        flow.make_reducible(f);
+    }
 }

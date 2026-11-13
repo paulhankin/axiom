@@ -667,6 +667,50 @@ fn init_no_effects(it: *cast.Init) bool {
     return true;
 }
 
+// A designator range's initializer is evaluated once, however many
+// elements it initializes (a GNU dialect's rule: its effects happen once).
+// Each expression in it that has effects is evaluated into a temporary
+// (an automatic object of its value's type, which the list's `pre`
+// initializes before its items: 6.7.9p23 leaves their order unspecified),
+// and the elements are given the temporary's value. (In an object with
+// static storage duration such an expression is not a constant: reported
+// at the first element.)
+fn once(F: *mut Filler, it: *mut cast.Init) void {
+    if it.kind == cast.InitKind.LIST {
+        for x in it.items.items() {
+            once(F, x);
+        }
+        return;
+    }
+    if no_effects(it.e) {
+        return;
+    }
+    let x = cx.rv(it.e);
+    if is_err(x) or (x.ty.kind == cty.TK_VOID) {
+        it.e = x;
+        return;
+    }
+    let t = x.ty;
+    let tmp = cs.new_sym(cast.SK_OBJECT, "__range_value", x.span, t);
+    tmp.owner = cs.cur_fn();
+    let y = u.new.[cast.Init]();
+    y.kind = cast.InitKind.EXPR;
+    y.span = it.span;
+    y.e = x;
+    tmp.init = initializer(t, y, false, false).list;
+    F.list.pre.push(tmp);
+    // (the item keeps its designation; the temporary replaces its expression)
+    let r = u.new.[cast.Expr]();
+    r.kind = cast.ExprKind.IDENT;
+    r.span = x.span;
+    r.height = 1;
+    r.name = tmp.name;
+    r.sym = tmp;
+    r.ty = t;
+    r.lvalue = true;
+    it.e = r;
+}
+
 // Follows the designation of `item` from the list's object (st[0]): st
 // ends at the designated subobject; a range designator stands for its
 // first index plus `r`. False after an error (reported).
@@ -783,18 +827,18 @@ fn fill_list(F: *mut Filler, s: Sub, it: *mut cast.Init) u64 {
     for item in items {
         F.top_level = top_lvl;
         if item.desigs.len > 0 {
-            let n = range_count(item);
+            let mut n = range_count(item);
             if n == 0 {
                 F.errors = true;
                 st.len = 1;
                 continue;
             }
             if (n > 1) and not init_no_effects(item) {
-                cs.not_supported(item.span,
-                                 "a designator range whose initializer has effects (it would be evaluated once)");
-                F.errors = true;
-                st.len = 1;
-                continue;
+                if F.is_static or F.constexpr_ {
+                    n = 1;  // (not a constant: reported once, at the first element)
+                } else {
+                    once(F, item);
+                }
             }
             let mut ok = true;
             for r in 0..n {

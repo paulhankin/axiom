@@ -13,10 +13,16 @@
 //                records of the k functions between its own and the use)
 //   tramps       of such a function, those of its nested functions whose
 //                addresses are taken: a trampoline each (cgen_nest.ax)
-// The objects of a variable length array type cannot be used from a nested
-// function (C3901), nor can a nested function be variadic, nor jump to a
-// label of its enclosing function other than a local one (`__label__`),
-// which is a non-local goto (csema_stmt.goto_label, cgen_nest.ax).
+//   lens         (here, by function) the lengths of variable length array
+//                types (CType.vexpr) each function evaluates: a function
+//                with nested functions keeps their slots' addresses in its
+//                frame record, so that its nested functions (and theirs)
+//                use its variably modified types (cgen_nest.outer_len)
+// An object of variable length array type an enclosing function has is
+// in the records as other objects are, its address stored there when it is
+// allocated. A nested function jumps to no label of its enclosing function
+// but a local one (`__label__`), which is a non-local goto
+// (csema_stmt.goto_label, cgen_nest.ax).
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
@@ -30,12 +36,6 @@ pub fn use_object(s: *mut cast.CSym, sp: u.Span) void {
     let cur = cs.cur_fn();
     let owner = s.owner;
     if u.isnil(cur) or u.isnil(owner) or (owner == cur) or (s.duration != cast.SD_AUTO) {
-        return;
-    }
-    if cty.is_vla(s.ty) {
-        cs.not_supported(sp,
-                         u.f1("the use of '%s', a variable length array of the enclosing function, in a nested function",
-                              s.name));
         return;
     }
     let mut f = cur;
@@ -77,6 +77,122 @@ pub fn finish(f: *mut cast.CSym, nested: []*mut cast.CSym) void {
 pub fn rec_index(p: *cast.CSym, s: *mut cast.CSym) i32 {
     for k in 0..p.rec.len {
         if p.rec.get(k) == s {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
+
+// -----------------------------------------------------------------------------
+// The lengths of variable length array types
+// -----------------------------------------------------------------------------
+
+let mut g_vexpr_fn: u.SymMap.[*mut cast.CSym] = u.SymMap.[*mut cast.CSym].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut *mut cast.CSym, 0), cap: 0, len: 0 };
+let mut g_fn_lens: u.SymMap.[*mut u.List.[*mut void]] =
+    u.SymMap.[*mut u.List.[*mut void]].{ keys: @ptr_from_int(*mut usize, 0),
+                                         vals: @ptr_from_int(*mut *mut u.List.[*mut void], 0), cap: 0, len: 0 };
+
+fn vkey(p: *void) []u8 {
+    return u.addr_key(@int_from_ptr(p));
+}
+
+fn fkey(f: *cast.CSym) []u8 {
+    return u.addr_key(@int_from_ptr(f));
+}
+
+// Notes that function f (nil: none) evaluates length n (a CType.vexpr).
+fn own(n: *mut void, f: *mut cast.CSym) void {
+    let k = vkey(n);
+    let had = g_vexpr_fn.get(k);
+    if had == f {
+        return;
+    }
+    if u.notnil(had) {
+        let l = g_fn_lens.get(fkey(had));
+        for i in 0..l.len {
+            if l.get(i) == n {
+                l.set(i, u.vnil());  // (another function's now: a function definition's parameter)
+            }
+        }
+    }
+    g_vexpr_fn.put(k, f);
+    if u.isnil(f) {
+        return;
+    }
+    let fk = fkey(f);
+    let mut l = g_fn_lens.get(fk);
+    if u.isnil(l) {
+        l = u.new.[u.List.[*mut void]]();
+        g_fn_lens.put(fk, l);
+    }
+    l.push(n);
+}
+
+/// A variable length array type's length n (a CType.vexpr) is made, where
+/// the function being analyzed (if any) evaluates it.
+pub fn note_length(n: *mut void) void {
+    let f = cs.cur_fn();
+    if u.notnil(f) {
+        own(n, f);
+    }
+}
+
+/// At the start of function f's body (f the function being analyzed): the
+/// lengths in its parameters' types are f's (they were made while its
+/// declarator was analyzed, before its body: in the enclosing function, for
+/// a nested one), and so are their uses of objects.
+pub fn own_params(f: *mut cast.CSym) void {
+    for p in f.params.items() {
+        let mut t = p.ty;
+        while u.notnil(t) and ((t.kind == cty.TK_ARRAY) or (t.kind == cty.TK_POINTER)) {
+            if t.vla and not u.isvnil(t.vexpr) {
+                own(t.vexpr, f);
+                if u.notnil(f.nest_parent) {
+                    uses(@ptr_cast(*mut cast.Expr, t.vexpr));
+                }
+            }
+            t = t.elem;
+        }
+    }
+}
+
+// The uses of objects in expression e, in the function being analyzed.
+fn uses(e: *mut cast.Expr) void {
+    if u.isnil(e) {
+        return;
+    }
+    if (e.kind == cast.ExprKind.IDENT) and u.notnil(e.sym) and (e.sym.kind == cast.SK_OBJECT) {
+        use_object(e.sym, e.span);
+    }
+    uses(e.a);
+    uses(e.b);
+    uses(e.c);
+    for x in e.args.items() {
+        uses(x);
+    }
+}
+
+/// The function that evaluates length n (a CType.vexpr), or nil.
+pub fn length_owner(n: *void) *mut cast.CSym {
+    return g_vexpr_fn.get(vkey(n));
+}
+
+/// The lengths function f evaluates (nil entries: taken by a nested
+/// function's definition), in the order of their slots in its record.
+pub fn lengths(f: *cast.CSym) []*mut void {
+    let l = g_fn_lens.get(fkey(f));
+    if u.isnil(l) {
+        return u.nil_slice.[*mut void]();
+    }
+    return l.items();
+}
+
+/// The index of length n among function f's (lengths), or -1.
+pub fn length_index(f: *cast.CSym, n: *void) i32 {
+    let ls = lengths(f);
+    for k in 0..ls.len {
+        if @ptr_cast(*void, ls[k]) == n {
             return @int_cast(i32, k);
         }
     }

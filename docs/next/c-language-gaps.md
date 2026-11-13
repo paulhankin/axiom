@@ -28,3 +28,14 @@
   constants.
 - docs/c.md no longer says that signed overflow wraps: the optimizer takes signed `+`,
   `-` and `*` as not overflowing (as it has since C's arithmetic was marked so).
+- A GNU designator range whose initializer has effects (`[0 ... 9] = f()`) evaluates it
+  once and gives every element its value; it was the error `C3901` before.
+- Nested functions may be variadic (called directly and through pointers, on every
+  target), and may use their enclosing functions' variable length arrays and variably
+  modified types (typedefs, pointers to variable length arrays, their own parameters'
+  types whose lengths name the enclosing function's objects). A pointer to a variable
+  length array or a variably modified parameter in a nested function was miscompiled
+  before; the other cases were the error `C3901`.
+- `goto *` and `&&label` where variable length arrays or objects with cleanups are in
+  scope: the jump frees the arrays and calls the cleanups of the scopes it leaves, and
+  traps when it would jump into such a scope; it was the error `C3901` before.
