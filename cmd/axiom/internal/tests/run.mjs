@@ -1187,7 +1187,7 @@ function cDriverCases() {
         const axMain = fs.existsSync(path.join(d, 'main.ax'));
         const main = path.join(d, axMain ? 'main.ax' : 'main.c');
         const src = fs.readFileSync(main, 'utf8');
-        if (/expect-error|linux-only|windows-only/.test(src)) continue;
+        if (/expect-error|linux-only|windows-only|wasm-only/.test(src)) continue;
         const others = fs.readdirSync(d).filter((n) => n !== path.basename(main) && (n.endsWith('.c') || n.endsWith('.s') || n.endsWith('.S') || (!axMain && n.endsWith('.ax')))).map((n) => path.join(d, n));
         const uses = [...src.matchAll(/(?:\/\/ |\/\* )uses: (.*?)(?: \*\/)?$/gm)].flatMap((m) => m[1].trim().split(/\s+/)).map((x) => path.resolve(d, x));
         const flags = [...src.matchAll(/(?:\/\/ |\/\* )flags: (.*?)(?: \*\/)?$/gm)].flatMap((m) => m[1].trim().split(/\s+/));
@@ -1602,6 +1602,9 @@ await section('', byFile(lowerFiles, '[instruction selection]', async (f) => {
   for (const [, only, flags, re, count] of fs.readFileSync(f, 'utf8').matchAll(/^\/\/ lower(-selfhost)?: (.+?) \| (.+?) \| (\d+)$/gm)) {
     const fl = flags.trim().split(/\s+/);
     if (fl.includes('--target=native') && (process.arch !== 'x64' || process.env.AXIOM_NATIVE_TARGET)) continue;
+    // (the bootstrap compiler compiles no C, and need not accept the flags
+    // of lines that are not for it)
+    if ((only || f.endsWith('.c')) && bootstrapCompiler()) { reason = "the bootstrap compiler's selection differs"; continue; }
     const a64 = fl.includes('--target=aarch64');
     const base = path.basename(f).replace(/\.(ax|c)$/, '');
     const out = path.join(tmp, `lower-${base}.s`);
