@@ -22,6 +22,7 @@ import "asm/inline.ax" as ai;
 import "asm/wasm.ax" as aw;
 import "bin.ax" as bn;
 import "combine.ax" as cb;
+import "dbginfo.ax" as dbi;
 import "dloc.ax" as dloc;
 import "dwarf.ax" as dw;
 import "ir.ax" as ir;
@@ -3758,9 +3759,13 @@ fn var_slot_off(a: *ir.Value) i64 {
 }
 
 fn emit_block(x: *mut ir.Block) *mut ir.Block {
+    wev(3, x.rpo, u.nil.[ir.Value]());
     let mut i = x.first;
     while u.notnil(i) {
         let o = i.op;
+        if WV and not ir.is_term(o) {
+            wev(1, ir.dbg_marks_at(i), u.nil.[ir.Value]());
+        }
         if (o == ir.OP_PHI) or ir.is_term(o) or (i.flag != FL_LOCAL) {
             i = i.next;
             continue;
@@ -3771,6 +3776,7 @@ fn emit_block(x: *mut ir.Block) *mut ir.Block {
         if i.ty.kind != ir.T_VOID {
             if i.uses > 0 {
                 local_set(@int_cast(u32, i.loc));
+                wev(2, i.loc, i);
             } else {
                 op(0x1a);
             }
@@ -3778,6 +3784,11 @@ fn emit_block(x: *mut ir.Block) *mut ir.Block {
         i = i.next;
     }
     let t = ir.terminator(x);
+    if WV {
+        wev(1, ir.dbg_marks_at(t), u.nil.[ir.Value]());
+        wev(1, ir.dbg_marks_end(x), u.nil.[ir.Value]());
+    }
+    wev(4, x.rpo, u.nil.[ir.Value]());
     line_row(t.src);
     scope_row(t.scope);
     let o = t.op;
@@ -4146,6 +4157,335 @@ fn sjlj_end() void {
     op(0x00);
 }
 
+// -----------------------------------------------------------------------------
+// Optimized code's variables (-g, -O1 and up): where each one is, from the
+// IR's marks (ir.dbg_mark) as the blocks' code is emitted. A variable is a
+// value from its mark on: a constant; a parameter, in its local; a value in
+// the local it was given, while that local holds it (locals are shared by
+// values that are not live at once: another's write ends it); a frame
+// object's address. What each local holds and what each variable is are
+// followed over the blocks (a block starts with what all its predecessors
+// agree on, a phi in its local), and within a block's own code in order.
+// -----------------------------------------------------------------------------
+struct WEv {
+    off: u32,  // in C
+    kind: u8,  // 1 the marks of chain a; 2 local a is v; 3 block a starts; 4 its own code ends
+    a: i32,
+    v: *mut ir.Value,
+}
+
+let mut WV: bool = false;  // (this function's variables followed)
+let mut WBASE: u64 = 0;    // (where its code starts in its body)
+let mut WEVS: u.List.[WEv] = u.List.[WEv].{ data: @ptr_from_int(*mut WEv, 0), len: 0, cap: 0 };
+// each function's locations (wo.Func's address -> index + 1 in WVL)
+let mut WVL: u.List.[[]dloc.VLoc] = u.List.[[]dloc.VLoc].{ data: @ptr_from_int(*mut []dloc.VLoc, 0), len: 0, cap: 0 };
+let mut WVL_OF: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                  cap: 0, len: 0 };
+
+fn wev(kind: u8, a: i32, v: *mut ir.Value) void {
+    if WV and ((kind != 1) or (a >= 0)) {
+        WEVS.push(WEv.{ off: @int_cast(u32, C.len()), kind: kind, a: a, v: v });
+    }
+}
+
+// A variable piece followed (ir.DbgMark's owner, var, off, size, inst).
+struct WEnt {
+    owner: *mut ir.Func,
+    var: i32,
+    off: u32,
+    size: u32,
+    inst: u32,
+}
+
+// (a value as the state holds it: the value and its id)
+struct WVal {
+    v: *mut ir.Value,
+    id: i32,
+}
+
+fn wnone() WVal {
+    return WVal.{ v: u.nil.[ir.Value](), id: -1 };
+}
+
+fn wsame(a: WVal, b: WVal) bool {
+    return (a.id == b.id) and (@int_from_ptr(a.v) == @int_from_ptr(b.v));
+}
+
+// The entity of mark k (an index in ents, added if new; -1: not followed).
+fn went(ents: *mut u.List.[WEnt], k: i32) i32 {
+    let m = ir.dbg_marks.get(@int_cast(usize, k));
+    if (@int_from_ptr(m.owner) != @int_from_ptr(F)) and (m.inst == 0) {
+        return -1;
+    }
+    for j in 0..ents.len {
+        let e = ents.get(j);
+        if (e.owner == m.owner) and (e.var == m.var) and (e.off == m.off) and (e.size == m.size) and
+           (e.inst == m.inst) {
+            return @int_cast(i32, j);
+        }
+    }
+    ents.push(WEnt.{ owner: m.owner, var: m.var, off: m.off, size: m.size, inst: m.inst });
+    return @int_cast(i32, ents.len - 1);
+}
+
+// Where entity e (a piece of a variable of type ty) is, as value x (a
+// location of kind 0xff: nowhere), with the locals holding `locs`.
+fn wwhere(e: WEnt, x: WVal, locs: []WVal) dloc.VLoc {
+    let mut r = dloc.VLoc.{ var: @bit_cast(u32, e.var), poff: e.off, psize: e.size, kind: 0xff, start: 0, end: 0,
+                            reg: -1, off: 0, add: 0, size: 0, ind: false, gsym: "", inst: e.inst, expr: "" };
+    let v = x.v;
+    if u.isnil(v) {
+        return r;
+    }
+    let vs = dbi.vars_of(e.owner.name);
+    if (e.var < 0) or (@int_cast(usize, e.var) >= vs.len) {
+        return r;
+    }
+    let dv = vs[@int_cast(usize, e.var)];
+    if dv.indirect or (@int_from_ptr(dv.global) != 0) or not dloc.fits_var(v, dv.ty, e.size) {
+        return r;
+    }
+    r.size = @truncate(u32, v.ty.size);
+    if (v.kind == ir.V_CINT) or (v.kind == ir.V_CFP) or (v.kind == ir.V_ZERO) {
+        if v.ty.size <= 8 {
+            r.kind = dloc.LK_CONST;
+            if v.kind == ir.V_CINT {
+                r.off = @bit_cast(i64, ir.cint_val(v));
+            } else if v.kind == ir.V_CFP {
+                if v.ty.size == 4 {
+                    r.off = @as(i64, ir.f32_bits(ir.fv_of(v)));
+                } else {
+                    r.off = @bit_cast(i64, ir.fv_of(v));
+                }
+            }
+        }
+        return r;
+    }
+    if v.kind == ir.V_PARAM {
+        r.kind = dloc.LK_WLOCAL;
+        r.reg = @truncate(i32, @bit_cast(i64, v.cv));
+        return r;
+    }
+    if v.kind != ir.V_INST {
+        return r;
+    }
+    if (v.op == ir.OP_ALLOCA) and (frame_size > 0) {
+        r.kind = dloc.LK_ADDR;
+        r.off = v.aux;
+        return r;
+    }
+    if (v.flag == FL_LOCAL) and (v.loc >= 0) and (@int_cast(usize, v.loc) < locs.len) and
+       wsame(locs[@int_cast(usize, v.loc)], x) {
+        r.kind = dloc.LK_WLOCAL;
+        r.reg = v.loc;
+    }
+    return r;
+}
+
+// The locations of f's variables over its code (WEVS, its events as its
+// blocks were emitted), offsets from the code's start.
+fn wasm_vlocs(f: *mut ir.Func, order: u.List.[*mut ir.Block]) []dloc.VLoc {
+    let mut out = u.List.[dloc.VLoc].empty();
+    let nb = order.len;
+    let nl = @as(usize, nlocals_total());
+    let mut ents = u.List.[WEnt].empty();
+    for x in WEVS.items() {
+        if x.kind == 1 {
+            let mut k = x.a;
+            while k >= 0 {
+                _ = went(&mut ents, k);
+                k = ir.dbg_mark_next(k);
+            }
+        }
+    }
+    let ne = ents.len;
+    if ne == 0 {
+        return out.items();
+    }
+    // the events of each block (its first one in WEVS: the block start's)
+    let first = u.newn.[i32](nb + 1);
+    for b in 0..nb {
+        first[b] = -1;
+    }
+    for j in 0..WEVS.len {
+        let x = WEVS.get(j);
+        if (x.kind == 3) and (x.a >= 0) and (@int_cast(usize, x.a) < nb) {
+            first[@int_cast(usize, x.a)] = @int_cast(i32, j);
+        }
+    }
+    // the states: at each block's start and end (entities, then locals)
+    let w = ne + nl;
+    let ins = u.newn.[WVal](w * nb + 1);
+    let outs = u.newn.[WVal](w * nb + 1);
+    let seen = u.newn.[bool](nb + 1);
+    for k in 0..(w * nb) {
+        ins[k] = wnone();
+        outs[k] = wnone();
+    }
+    for b in 0..nb {
+        seen[b] = false;
+    }
+    let cur = u.newn.[WVal](w + 1);
+    let mut changed = true;
+    let mut rounds: i32 = 0;
+    while changed and (rounds < 30) {
+        changed = false;
+        rounds += 1;
+        for b in 0..nb {
+            wmeet(order, b, ne, nl, outs, seen, cur);
+            for k in 0..w {
+                ins[b * w + k] = cur[k];
+            }
+            wrun(first[b], ne, nl, &mut ents, cur, u.nil.[u.List.[dloc.VLoc]](), u.nil_slice.[usize]());
+            let mut same = seen[b];
+            for k in 0..w {
+                same = same and wsame(outs[b * w + k], cur[k]);
+                outs[b * w + k] = cur[k];
+            }
+            if not same {
+                seen[b] = true;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        return out.items();  // (did not settle: nothing said)
+    }
+    // the pieces, block by block in code order
+    let open = u.newn.[usize](ne + 1);
+    for e in 0..ne {
+        open[e] = 0;
+    }
+    for j in 0..WEVS.len {
+        let x = WEVS.get(j);
+        if x.kind != 3 {
+            continue;
+        }
+        let b = @int_cast(usize, x.a);
+        for k in 0..w {
+            cur[k] = ins[b * w + k];
+        }
+        wrun(@int_cast(i32, j), ne, nl, &mut ents, cur, &mut out, open);
+    }
+    let end = @as(u64, C.len()) + WBASE;
+    for e in 0..ne {
+        if open[e] != 0 {
+            out.at(open[e] - 1).end = end;
+        }
+    }
+    return out.items();
+}
+
+fn nlocals_total() u32 {
+    return nparams + @int_cast(u32, LT.len);
+}
+
+// The state at the start of block b (order's index), from its predecessors'
+// ends (those seen); its phis in their locals.
+fn wmeet(order: u.List.[*mut ir.Block], b: usize, ne: usize, nl: usize, outs: []WVal, seen: []bool,
+         cur: []mut WVal) void {
+    let w = ne + nl;
+    let blk = order.get(b);
+    let mut n: usize = 0;
+    for p in blk.preds.items() {
+        let pi = @int_cast(usize, p.rpo);
+        if (p.rpo < 0) or (pi >= order.len) or not seen[pi] {
+            continue;
+        }
+        for k in 0..w {
+            if n == 0 {
+                cur[k] = outs[pi * w + k];
+            } else if not wsame(cur[k], outs[pi * w + k]) {
+                cur[k] = wnone();
+            }
+        }
+        n += 1;
+    }
+    if n == 0 {
+        for k in 0..w {
+            cur[k] = wnone();
+        }
+    }
+    let mut q = blk.first;
+    while u.notnil(q) and (q.op == ir.OP_PHI) {
+        if (q.flag == FL_LOCAL) and (q.loc >= 0) and (@int_cast(usize, q.loc) < nl) {
+            cur[ne + @int_cast(usize, q.loc)] = WVal.{ v: q, id: q.id };
+        }
+        q = q.next;
+    }
+}
+
+// Block events from WEVS[j0] (its start) to its end over state cur; with
+// out, the entities' pieces too (open: each one's piece in out + 1).
+fn wrun(j0: i32, ne: usize, nl: usize, ents: *mut u.List.[WEnt], cur: []mut WVal, out: *mut u.List.[dloc.VLoc],
+        open: []mut usize) void {
+    if j0 < 0 {
+        return;
+    }
+    let mut j = @int_cast(usize, j0) + 1;
+    let locs = cur[ne..(ne + nl)];
+    if u.notnil(out) {
+        wemit(ne, ents, cur, locs, WEVS.get(@int_cast(usize, j0)).off, out, open, false);
+    }
+    while j < WEVS.len {
+        let x = WEVS.get(j);
+        if (x.kind == 3) or (x.kind == 4) {
+            if u.notnil(out) {
+                wemit(ne, ents, cur, locs, x.off, out, open, true);
+            }
+            return;
+        }
+        if x.kind == 1 {
+            let mut k = x.a;
+            while k >= 0 {
+                let e = went(ents, k);
+                if e >= 0 {
+                    let v = ir.dbg_mark_value(k);
+                    if u.isnil(v) or ir.dbg_mark_low(k) or (ir.dbg_mark_add(k) != 0) {
+                        cur[@int_cast(usize, e)] = wnone();
+                    } else {
+                        cur[@int_cast(usize, e)] = WVal.{ v: v, id: v.id };
+                    }
+                }
+                k = ir.dbg_mark_next(k);
+            }
+        } else if (x.kind == 2) and (x.a >= 0) and (@int_cast(usize, x.a) < nl) {
+            cur[ne + @int_cast(usize, x.a)] = WVal.{ v: x.v, id: x.v.id };
+        }
+        if u.notnil(out) {
+            wemit(ne, ents, cur, locs, x.off, out, open, false);
+        }
+        j += 1;
+    }
+}
+
+// The entities' locations from code offset `at` on (none: none at all).
+fn wemit(ne: usize, ents: *u.List.[WEnt], cur: []WVal, locs: []WVal, at: u32, out: *mut u.List.[dloc.VLoc],
+         open: []mut usize, none: bool) void {
+    for e in 0..ne {
+        let mut l = wwhere(ents.get(e), cur[e], locs);
+        if none {
+            l.kind = 0xff;
+        }
+        let o = open[e];
+        if o != 0 {
+            let p = out.at(o - 1);
+            if (l.kind != 0xff) and (p.kind == l.kind) and (p.reg == l.reg) and (p.off == l.off) and
+               (p.size == l.size) {
+                continue;
+            }
+            p.end = @as(u64, at) + WBASE;
+            open[e] = 0;
+        }
+        if l.kind != 0xff {
+            l.start = @as(u64, at) + WBASE;
+            l.end = l.start;
+            out.push(l);
+            open[e] = out.len;
+        }
+    }
+}
+
 fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     F = f;
     C = bn.new_bytes();
@@ -4191,6 +4531,8 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
     }
     // locals for values
     alloc_locals(f, order);
+    WEVS.clear();
+    WV = ir.dbg_on and (tg.g_debug == tg.DEBUG_FULL);
     // prologue
     if frame_size > 0 {
         sp_global(0x23);
@@ -4236,6 +4578,12 @@ fn gen_function(f: *mut ir.Func, wf: *mut wo.Func) void {
         wf.frame_local = -1;
         if frame_size > 0 {
             wf.frame_local = @as(i64, fp_local);
+        }
+        if WV {
+            // (offsets in the body: after the locals' declarations)
+            WBASE = @as(u64, base);
+            WVL.push(wasm_vlocs(f, order));
+            WVL_OF.put(u.addr_key(@int_from_ptr(wf)), @int_cast(i32, WVL.len));
         }
     }
     SC.deinit();
@@ -4513,6 +4861,14 @@ pub fn compile(m: *mut ir.Module, wasm64: bool) *mut wo.Unit {
 // declarations included, as WebAssembly's DWARF counts them), variables at
 // offsets from the frame's address in its local (the frame base), the data
 // at its symbols.
+fn wvlocs(wf: *wo.Func) []dloc.VLoc {
+    let k = WVL_OF.get(u.addr_key(@int_from_ptr(wf)));
+    if k == 0 {
+        return u.nil_slice.[dloc.VLoc]();
+    }
+    return WVL.get(@int_cast(usize, k - 1));
+}
+
 fn unit_dwarf() void {
     let mut asz: u64 = 4;
     if W64 {
@@ -4536,7 +4892,7 @@ fn unit_dwarf() void {
                            external: (s.flags & wo.F_LOCAL) == 0, size: @as(u64, wf.body.len()), src: wf.src,
                            rows: wf.lines.items(), scopes: wf.scopes.items(), cfi: u.nil_slice.[u64](),
                            regs: u.nil_slice.[u64](), irf: @ptr_cast(*mut ir.Func, wf.irf), vars: wf.vars,
-                           vlocs: u.nil_slice.[dloc.VLoc](), frame_local: wf.frame_local };
+                           vlocs: wvlocs(wf), frame_local: wf.frame_local, calls: u.nil_slice.[dloc.CallSite]() };
         dw.add_func(&mut d, &df);
     }
     let parts = dw.finish_parts(&mut d);

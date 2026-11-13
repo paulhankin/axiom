@@ -924,10 +924,31 @@ fn site_record_ex(code: i32, sp: u.Span, callee0: []u8) *mut ir.Value {
 // A call made by C code (c/cgen_expr.ax): its call-site record, for native
 // stack traces as Axiom's calls have them (frame_tables), or nil.
 fn c_call_site(sp: u.Span, fname: []u8, callee: []u8) *mut ir.Value {
-    if not frame_tables() {
+    if not frame_tables() and not (ty.g_target.is_wasm and program_traces()) {
         return vnil();
     }
     return site_record_in(SITE_CALL, sp, fname, callee);
+}
+
+// A call made by C code on WebAssembly (c/cgen_va.ax), with C's builder b:
+// its record `site` pushed on the shadow stack, as ss_push pushes Axiom's;
+// the record and the depth ss_pop puts back after the call.
+fn c_ss_push(b: *mut ir.Builder, site: *mut ir.Value) [2]*mut ir.Value {
+    let saved = B;
+    B = b;
+    let ss = ss_ptr();
+    let depth = ir.load(B, T_i32, ss_field(ss, 0));
+    ss_store(site, ss_slot(ss, 2, b_and(depth, ci32(SS_CAP - 1))));
+    ss_store(b_add(depth, ci32(1)), ss_field(ss, 0));
+    B = saved;
+    return [ss, depth];
+}
+
+fn c_ss_pop(b: *mut ir.Builder, ss: *mut ir.Value, depth: *mut ir.Value) void {
+    let saved = B;
+    B = b;
+    ss_store(depth, ss_field(ss, 0));
+    B = saved;
 }
 
 fn site_record_in(code: i32, sp: u.Span, fname: []u8, callee0: []u8) *mut ir.Value {
@@ -6165,6 +6186,7 @@ pub fn codegen_program(o: *mut CgOptions) bool {
     let f0 = M.funcs.len;
     let g0 = M.globals.len;
     let c_main = c_units and cfront.has_main();
+    cfront.set_shadow_stack(c_ss_push, c_ss_pop);
     if c_units and not cfront.gen_ir(M, ty.g_target.is_wasm, c_call_site, exports_exit(), c_ld_fn) {
         return false;
     }

@@ -392,7 +392,8 @@ export function readDwarf(img) {
   const g = (n) => img.sections.get(n) || Buffer.alloc(0);
   const S = { info: g('.debug_info'), abbrev: g('.debug_abbrev'), str: g('.debug_str'), lstr: g('.debug_line_str'),
               line: g('.debug_line'), frame: g('.debug_frame'), aranges: g('.debug_aranges'),
-              rnglists: g('.debug_rnglists'), loclists: g('.debug_loclists'), names: g('.debug_names') };
+              rnglists: g('.debug_rnglists'), loclists: g('.debug_loclists'), names: g('.debug_names'),
+              macro: g('.debug_macro') };
   return { S, units: readInfo(S), seqs: readLines(S), fdes: S.frame.length ? readFrames(S) : [] };
 }
 
@@ -630,13 +631,15 @@ export function dieRanges(dw, die) {
 export function locList(dw, off) {
   const r = new Rd(dw.S.loclists, off), out = [];
   let base = 0;
+  // (addresses of the units' size: 4 on wasm32)
+  const asz = dw.units.length ? dw.units[0].asz : 8, A = () => r.addr(asz);
   const ex = () => { const n = r.uleb(); const b = r.d.subarray(r.p, r.p + n); r.p += n; return b; };
   for (;;) {
     const k = r.u8();
     if (k === 0) return out;
-    if (k === 8) { const a = r.u64(), n = r.uleb(); out.push({ lo: a, hi: a + n, expr: ex() }); }
-    else if (k === 7) { const a = r.u64(), b = r.u64(); out.push({ lo: a, hi: b, expr: ex() }); }
-    else if (k === 6) base = r.u64();
+    if (k === 8) { const a = A(), n = r.uleb(); out.push({ lo: a, hi: a + n, expr: ex() }); }
+    else if (k === 7) { const a = A(), b = A(); out.push({ lo: a, hi: b, expr: ex() }); }
+    else if (k === 6) base = A();
     else if (k === 4) { const a = r.uleb(), b = r.uleb(); out.push({ lo: base + a, hi: base + b, expr: ex() }); }
     else throw new Error(`location list entry ${k}`);
   }
@@ -666,13 +669,48 @@ export function knownLocation(expr) {
   } else if (op === 0x03 && (expr.length === 9 || expr.length === 5)) return true;
   else if (op === 0x0e) { r.u64(); return r.u8() === 0x9b && r.p === expr.length; }
   r.p = 0;
+  // a value computed on the stack (optimized code: from registers, slots,
+  // constants, entry values) up to DW_OP_stack_value, one value left
+  const computed = () => {
+    let depth = 0, n = 0;
+    while (r.p < expr.length) {
+      const o = r.u8();
+      n++;
+      if (o === 0x9f) return depth === 1 && n >= 2;
+      if (o >= 0x70 && o <= 0x8f) { r.sleb(); depth++; }
+      else if (o === 0x92) { r.uleb(); r.sleb(); depth++; }
+      else if (o === 0x91 || o === 0x11) { r.sleb(); depth++; }
+      else if (o === 0x10) { r.uleb(); depth++; }
+      else if (o === 0x08) { r.u8(); depth++; }
+      else if (o >= 0x30 && o <= 0x4f) depth++;
+      else if (o === 0xa3) {
+        // DW_OP_entry_value of a register (DWARF 5, 2.5.1.7)
+        const len = r.uleb(), at = r.p, k = r.u8();
+        if (k === 0x90) r.uleb(); else if (!(k >= 0x50 && k <= 0x6f)) return false;
+        if (r.p !== at + len) return false;
+        depth++;
+      } else if (o === 0x06) { if (depth < 1) return false; }
+      else if (o === 0x94) { r.u8(); if (depth < 1) return false; }
+      else if (o === 0x23) { r.uleb(); if (depth < 1) return false; }
+      else if ([0x22, 0x1c, 0x1a, 0x21, 0x27, 0x24, 0x25, 0x26].includes(o)) { if (depth < 2) return false; depth--; }
+      else return false;
+    }
+    return false;
+  };
   // one piece's location (or none); false if not of the forms
   const one = () => {
     const o = r.d[r.p];
     if (o === 0x93) return true;
+    {
+      const at = r.p;
+      if (computed()) return true;
+      r.p = at;
+    }
     r.p++;
     if (o >= 0x50 && o <= 0x6f) return true;
     if (o === 0x90) { r.uleb(); return true; }
+    // (WebAssembly: DW_OP_WASM_location 0, a local of the function)
+    if (o === 0xed) { if (r.u8() !== 0) return false; r.uleb(); return true; }
     // (a value: DW_OP_stack_value; else the variable is in memory there)
     const sv = () => { if (r.p < expr.length && r.d[r.p] === 0x9f) r.p++; return true; };
     if (o >= 0x70 && o <= 0x8f) { r.sleb(); return sv(); }
@@ -730,6 +768,10 @@ export function exprRegs(expr) {
     else if (o >= 0x70 && o <= 0x8f) { out.push(o - 0x70); r.sleb(); }
     else if (o === 0x92) { out.push(r.uleb()); r.sleb(); }
     else if (o === 0x91 || o === 0x11) r.sleb();
+    else if (o === 0x10 || o === 0x23) r.uleb();
+    else if (o === 0x08) r.u8();
+    else if (o === 0xa3) { const n = r.uleb(); r.p += n; }  // (an entry value: the register at the call)
+    else if (o === 0xed) { if (r.u8() === 3) r.u32(); else r.uleb(); }  // (WebAssembly: a local, a global)
     else if (o === 0x93) r.uleb();
     else if (o === 0x94) r.u8();
     else if (o === 0x9e) { const n = r.uleb(); r.p += n; }
@@ -825,6 +867,114 @@ export function subprogramAt(dw, a) {
   return null;
 }
 
+// The call sites of optimized code (DW_TAG_call_site, DWARF 5, 3.4): each
+// a child of a subprogram with DW_AT_call_all_calls, where its call
+// returns (or, in tail position, is) inside the subprogram's code; its
+// callee's address a function's or read from a datum (DW_OP_addr [deref]);
+// its parameters in registers with values of knownLocation's computed
+// forms. Returns { errs, sites, params }.
+export function checkCallSites(dw) {
+  const errs = [];
+  const E = (m) => { if (errs.length < 20) errs.push(m); };
+  let sites = 0, params = 0;
+  const all = [];
+  const walk = (d, sub) => {
+    for (const c of d.children) {
+      if (c.tag === TAG_SUBPROGRAM) { if (!c.attrs.has(AT_INLINE)) walk(c, c); continue; }
+      if (c.tag === 0x48) {
+        sites++;
+        all.push(c);
+        const name = sub ? sub.attrs.get(AT_NAME) : '?';
+        if (!sub || !sub.attrs.has(0x7a)) E(`${name}: a call site in a subprogram without DW_AT_call_all_calls`);
+        const rs = sub ? dieRanges(dw, sub) : null;
+        const tail = c.attrs.has(0x82);
+        const pc = tail ? c.attrs.get(0x81) : c.attrs.get(0x7d);
+        if (pc === undefined) E(`${name}: a call site without ${tail ? 'DW_AT_call_pc' : 'DW_AT_call_return_pc'}`);
+        else if (rs && !rs.some(([a, b]) => pc > a - (tail ? 1 : 0) && pc <= b)) E(`${name}: call site at ${pc.toString(16)} outside its code`);
+        const t = c.attrs.get(0x83);
+        if (t !== undefined && !(t instanceof Uint8Array && t[0] === 0x03 && (t.length === 1 + dw.units[0].asz || (t.length === 2 + dw.units[0].asz && t[t.length - 1] === 0x06))))
+          E(`${name}: call target ${Buffer.from(t).toString('hex')}`);
+        for (const p of c.children) {
+          if (p.tag !== 0x49) { E(`${name}: a call site's child of tag ${p.tag.toString(16)}`); continue; }
+          params++;
+          if (tail) E(`${name}: a parameter of a call in tail position`);
+          const l = p.attrs.get(0x02), v = p.attrs.get(0x7e);
+          if (!(l instanceof Uint8Array) || l.length !== 1 || l[0] < 0x50 || l[0] > 0x6f) E(`${name}: a call site parameter's location`);
+          if (!(v instanceof Uint8Array) || !knownLocation(v) || v[v.length - 1] !== 0x9f) E(`${name}: a call site parameter's value ${v && Buffer.from(v).toString('hex')}`);
+        }
+      }
+      walk(c, sub);
+    }
+  };
+  for (const un of dw.units) walk(un.die, null);
+  return { errs, sites, params, all };
+}
+
+// A unit's macro information (.debug_macro at off, DWARF 5, 6.3): its
+// header's line table offset and its entries [{ op, line, file, text }]
+// (DW_MACRO_define/undef and their _strp forms, start_file, end_file; the
+// forms this compiler writes and the basic ones).
+export function readMacros(dw, off) {
+  const r = new Rd(dw.S.macro, off);
+  const version = r.u16(), flags = r.u8();
+  if (version !== 5 || (flags & 1) || (flags & 4)) throw new Error(`.debug_macro: version ${version} flags ${flags}`);
+  const lineOff = (flags & 2) ? r.u32() : -1;
+  const out = [];
+  const str = (o) => { let e = o; while (dw.S.str[e]) e++; return dw.S.str.subarray(o, e).toString('latin1'); };
+  for (;;) {
+    const op = r.u8();
+    if (op === 0) break;
+    if (op === 1 || op === 2) { const line = r.uleb(); let e = r.p; while (r.d[e]) e++; out.push({ op, line, text: r.d.subarray(r.p, e).toString('latin1') }); r.p = e + 1; }
+    else if (op === 5 || op === 6) { const line = r.uleb(); out.push({ op: op - 4, line, text: str(r.u32()) }); }
+    else if (op === 3) { const line = r.uleb(); out.push({ op, line, file: r.uleb() }); }
+    else if (op === 4) out.push({ op });
+    else throw new Error(`.debug_macro: entry ${op}`);
+  }
+  return { lineOff, entries: out };
+}
+
+// debug/vars.c's macros (-g): its unit's DW_AT_macros, the unit's own file
+// started at line 0 after the predefined macros (line 0), VARS_DEPTH
+// defined and undefined at their lines, debug/vars_macros.h started at its
+// #include's line with its function-like macro inside, every file ended.
+export function checkMacros(dw, src, markLine) {
+  const errs = [];
+  const un = dw.units.find((u) => u.die.attrs.has(0x79));
+  if (!un) return ['no unit with DW_AT_macros'];
+  let m;
+  try { m = readMacros(dw, un.die.attrs.get(0x79)); } catch (e) { return [e.message]; }
+  if (m.lineOff !== 0) errs.push(`.debug_macro: line table offset ${m.lineOff}`);
+  const files = (dw.seqs.find((s) => s.files && s.files.length) || { files: [] }).files;
+  const fname = (k) => files[k] || '';
+  let depth = 0, sawOwn = false;
+  const at = (p) => m.entries.findIndex(p);
+  const own = at((e) => e.op === 3 && fname(e.file).endsWith('vars.c'));
+  if (own < 0) errs.push('vars.c: no start of its file');
+  else {
+    if (m.entries[own].line !== 0) errs.push(`vars.c: its file started at line ${m.entries[own].line}`);
+    if (!m.entries.slice(0, own).some((e) => e.op === 1 && e.line === 0 && e.text.startsWith('__STDC_VERSION__ '))) errs.push('no predefined __STDC_VERSION__ at line 0 before the file');
+  }
+  for (const e of m.entries) {
+    if (e.op === 3) depth++;
+    else if (e.op === 4) { depth--; if (depth < 0) errs.push('an end of file without its start'); }
+    else if (depth === 0 && e.line !== 0) errs.push(`a macro outside any file at line ${e.line}`);
+    sawOwn = sawOwn || (e.op === 3);
+  }
+  if (depth !== 0) errs.push(`${depth} files not ended`);
+  const def = at((e) => e.op === 1 && e.text === 'VARS_DEPTH 3');
+  if (def < own || m.entries[def].line !== markLine(src, 'macro-def')) errs.push(`VARS_DEPTH: not defined at its line (${def >= 0 ? m.entries[def].line : 'none'})`);
+  const und = at((e) => e.op === 2 && e.text === 'VARS_DEPTH');
+  if (und < def || m.entries[und].line !== markLine(src, 'macro-undef')) errs.push('VARS_DEPTH: not undefined at its line');
+  const inc = at((e) => e.op === 3 && fname(e.file).endsWith('vars_macros.h'));
+  if (inc < own || m.entries[inc].line !== markLine(src, 'macro-include')) errs.push('vars_macros.h: not started at its #include');
+  else {
+    const t = m.entries[inc + 1];
+    if (!t || t.op !== 1 || t.text !== 'VARS_TWICE(x) ((x) + (x))' || t.line !== 2) errs.push(`vars_macros.h: its macro ${t && JSON.stringify(t)}`);
+    if (!m.entries[inc + 2] || m.entries[inc + 2].op !== 4) errs.push('vars_macros.h: not ended after its macro');
+  }
+  return errs;
+}
+
 // -----------------------------------------------------------------------------
 // The variables of debug/vars.c (run.mjs): what its entries must say.
 // -----------------------------------------------------------------------------
@@ -903,7 +1053,7 @@ export function checkVars(dw, opts) {
       const vof = (n) => all(asub).flatMap((d) => kids(d, V, n))[0];
       const ll = (v) => { const loc = v && v.attrs.get(0x02); return typeof loc === 'number' ? locList(dw, loc) : []; };
       const r = ll(vof('r'));
-      if (r.length < 2) E('again: r has not more than one location range');
+      if (r.length < 1) E('again: r has no location');  // (its values may share a register: one range)
       // (taken apart on x86-64 Linux; elsewhere the optimizer may keep it whole)
       const q = vof('q');
       if (!q || q.attrs.get(0x02) === undefined) E('again: q has no location');
@@ -931,6 +1081,19 @@ export function checkVars(dw, opts) {
     const loc = tl && tl.attrs.get(0x02);
     if (!loc || loc[0] !== 0x0e || loc[9] !== 0x9b) E('per_thread: no location in the TLS block');
   } else if (tl && tl.attrs.get(0x02) !== undefined) E('per_thread: a location where none can be given');
+  if (!opts.O0) {
+    // the call sites: entry_of called through entry_fp with 4 and 5 (in
+    // their registers), and its parameters' entry values once not kept
+    const cs = checkCallSites(dw);
+    for (const m of cs.errs) E(m);
+    const val = (p) => Buffer.from(p.attrs.get(0x7e) || []).toString('hex');
+    const ef = cs.all.find((c) => { const t = c.attrs.get(0x83); return t && t[t.length - 1] === 0x06 && c.children.some((p) => val(p) === '10049f') && c.children.some((p) => val(p) === '10059f'); });
+    if (!ef) E('no call site through a pointer with the parameters 4 and 5');
+    const es = un.die.children.find((c) => c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE) && c.attrs.get(AT_NAME) === 'entry_of');
+    const pa = es && kids(es, P, 'a')[0];
+    const ll = pa && typeof pa.attrs.get(0x02) === 'number' ? locList(dw, pa.attrs.get(0x02)) : [];
+    if (!ll.some((x) => x.expr[0] === 0xa3)) E('entry_of: a has no entry value (DW_OP_entry_value)');
+  }
   return errs;
 }
 
@@ -938,6 +1101,49 @@ export function checkVars(dw, opts) {
 // variables with their types (a structure, an enumeration, a union's
 // variant part, a slice's structure), the block of `inner`, the global
 // COUNT; the units' language Axiom's (0x8a78).
+// Optimized debug/vars.c on WebAssembly: again's parameter a and its
+// variable r are in locals of the function (DW_OP_WASM_location 0) at
+// some address, and every such location names a local.
+export function checkWasmLocals(dw) {
+  const errs = [];
+  let sub = null, un = null;
+  for (const u of dw.units) for (const c of u.die.children) if (c.tag === TAG_SUBPROGRAM && !c.attrs.has(AT_INLINE) && c.attrs.get(AT_NAME) === 'again') { sub = c; un = u; }
+  if (!sub) return ['no subprogram again'];
+  const all = (d) => [d, ...d.children.flatMap((c) => (c.tag === 0x0b ? all(c) : []))];
+  for (const nm of ['a', 'r']) {
+    const v = all(sub).flatMap((d) => d.children).find((c) => (c.tag === 0x05 || c.tag === 0x34) && c.attrs.get(AT_NAME) === nm);
+    const loc = v && v.attrs.get(0x02);
+    const ll = typeof loc === 'number' ? locList(dw, loc) : [];
+    if (!ll.some((x) => x.expr[0] === 0xed && x.expr[1] === 0)) errs.push(`again: ${nm} is never in a local`);
+    for (const x of ll) if (!knownLocation(x.expr)) errs.push(`again: ${nm}: location ${Buffer.from(x.expr).toString('hex')}`);
+  }
+  return errs;
+}
+
+// Optimized debug/vars.ax: the vector w of wide (an inline instance's or
+// its own) is in two 16-byte pieces (DW_OP_piece 16 twice) somewhere.
+export function checkAxWide(dw) {
+  let found = false, seen = false;
+  const walk = (d) => {
+    for (const c of d.children) {
+      if (c.tag === 0x34) {
+        let o = c;
+        for (const un of dw.units) { const x = c.attrs.has(AT_ORIGIN) ? un.dies.get(c.attrs.get(AT_ORIGIN)) : null; if (x) o = x; }
+        if (o.attrs.get(AT_NAME) === 'w' && typeof c.attrs.get(0x02) === 'number') {
+          seen = true;
+          for (const x of locList(dw, c.attrs.get(0x02))) {
+            const h = Buffer.from(x.expr).toString('hex');
+            if ((h.match(/9310/g) || []).length === 2) found = true;
+          }
+        }
+      }
+      walk(c);
+    }
+  };
+  for (const un of dw.units) walk(un.die);
+  return found ? [] : [seen ? 'wide: w is never in two 16-byte pieces' : 'wide: w has no location list'];
+}
+
 export function checkAxVars(dw) {
   const errs = [];
   const E = (m) => errs.push(m);

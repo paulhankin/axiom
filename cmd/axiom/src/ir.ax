@@ -3105,6 +3105,18 @@ fn mk_set(v: *Value, first: i32) void {
     mk_inst.put(mk_key(@int_from_ptr(v)), MkAt.{ first: first + 1, id: v.id });
 }
 
+/// The first mark at the end of block b (-1: none).
+pub fn dbg_marks_end(b: *Block) i32 {
+    if not dbg_on or (mk_end.len == 0) {
+        return -1;
+    }
+    let a = mk_end.get(mk_key(@int_from_ptr(b)));
+    if (a.first == 0) or (a.id != b.id) {
+        return -1;
+    }
+    return a.first - 1;
+}
+
 fn mk_block_take(b: *Block) i32 {
     if mk_end.len == 0 {
         return -1;
@@ -3170,6 +3182,40 @@ pub fn dbg_mark_value(k: i32) *mut Value {
         return vnil();
     }
     return x.v;
+}
+
+/// Value v is split into pieces ps of `bytes` bytes each, in order (wide
+/// vectors: vsplit.ax): each mark whose variable v was gives its pieces, a
+/// piece each.
+pub fn dbg_split(v: *mut Value, ps: []*mut Value, bytes: u32) void {
+    let n = dbg_marks.len;
+    for k in 0..n {
+        let m = dbg_marks.get(k);
+        if m.ref < 0 {
+            continue;
+        }
+        let x = dbg_refs.get(@int_cast(usize, m.ref));
+        if (x.v != v) or (x.id != v.id) or x.low or (x.add != 0) {
+            continue;
+        }
+        if (m.size != 0) and (m.size != bytes * @truncate(u32, ps.len)) {
+            dbg_marks.at(k).ref = -1;  // (a piece of another size: not known)
+            continue;
+        }
+        let mut next = m.next;
+        let mut j = ps.len;
+        while j > 1 {
+            j -= 1;
+            let r = dbg_track(ps[j]);
+            dbg_marks.push(DbgMark.{ owner: m.owner, var: m.var, off: m.off + (bytes * @truncate(u32, j)), size: bytes,
+                                     ref: r, src: -1, next: next, inst: m.inst });
+            next = @int_cast(i32, dbg_marks.len) - 1;
+        }
+        let mm = dbg_marks.at(k);
+        mm.ref = dbg_track(ps[0]);
+        mm.size = bytes;
+        mm.next = next;
+    }
 }
 
 /// Mark k (a copy's kill, of mark dbg_mark_src(k)) gives its variable v
@@ -3451,6 +3497,32 @@ pub fn remove_block(b: *mut Block) void {
         mk_block_gone(b);
     }
     unlink_block(b);
+}
+
+// Removes block b, which no path reaches: what its marks say never takes
+// effect (its successors' variables are what their other paths make them).
+fn remove_unreached_block(b: *mut Block) void {
+    if dbg_on {
+        let mut i = b.first;
+        while u.notnil(i) {
+            _ = dbg_take(i);
+            i = i.next;
+        }
+        _ = mk_block_take(b);
+    }
+    unlink_block(b);
+}
+
+/// Block `from`'s marks at its end (after its last instruction) go to the
+/// end of block `to` (merged into it), after those there.
+pub fn dbg_move_end(from: *Block, to: *Block) void {
+    if not dbg_on {
+        return;
+    }
+    let k = mk_block_take(from);
+    if k >= 0 {
+        mk_end.put(mk_key(@int_from_ptr(to)), MkAt.{ first: mk_cat(mk_block_take(to), k) + 1, id: to.id });
+    }
 }
 
 fn unlink_block(b: *mut Block) void {
@@ -4865,15 +4937,50 @@ pub fn func_str(f: *mut Func) []u8 {
         b.s(":\n");
         let mut i = bb.first;
         while u.notnil(i) {
+            marks_str(&mut b, dbg_marks_at(i));
             b.s("    ");
             b.s(inst_str(i));
             b.s("\n");
             i = i.next;
         }
+        marks_str(&mut b, dbg_marks_end(bb));
         bb = bb.next;
     }
     b.s("}\n");
     return b.done();
+}
+
+// The marks of chain k (-g: dbg_mark), one line each: "; var N[.off:size]
+// (inline instance I) = value" (a kill: "?").
+fn marks_str(b: *mut u.Buf, k0: i32) void {
+    let mut k = k0;
+    while k >= 0 {
+        let m = dbg_marks.get(@int_cast(usize, k));
+        b.s("    ; var ");
+        b.s(u.idec(m.var));
+        if m.size != 0 {
+            b.s(u.f2(".%s:%s", u.idec(@bit_cast(i32, m.off)), u.idec(@bit_cast(i32, m.size))));
+        }
+        if m.inst != 0 {
+            b.s(u.f2(" (%s %s)", m.owner.name, u.idec(@bit_cast(i32, m.inst))));
+        }
+        let v = dbg_mark_value(k);
+        if u.isnil(v) {
+            b.s(" = ?\n");
+        } else {
+            b.s(" = ");
+            b.s(val_str(v));
+            if dbg_mark_low(k) {
+                b.s(" (low)");
+            }
+            let a = dbg_mark_add(k);
+            if a != 0 {
+                b.s(u.f1(" + %s", u.idec(@truncate(i32, a))));
+            }
+            b.s("\n");
+        }
+        k = m.next;
+    }
 }
 
 pub fn module_str(m: *mut Module) []u8 {
@@ -4932,7 +5039,7 @@ pub fn remove_unreachable(f: *mut Func) void {
     while u.notnil(b) {
         let next = b.next;
         if b.aux == 0 {
-            remove_block(b);
+            remove_unreached_block(b);
             any = true;
         }
         b = next;

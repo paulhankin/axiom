@@ -86,6 +86,7 @@ struct Arg {
 }
 
 struct PP {
+    mac: bool,   // -g: the macros' definitions and the files recorded (u.g_macros)
     asm_: bool,  // preprocessing assembly (preprocess_asm): `#` and an unknown directive's line are a comment
     o: *co.COptions,
     macros: u.SymMap.[*mut Macro],
@@ -299,6 +300,9 @@ fn file_next(P: *mut PP) lx.PTok {
                 return e;
             }
             end_of_file(P);
+            if P.mac and (P.files.len > 1) {
+                u.g_macros.push(u.MacroEv.{ kind: 4, at: -1, line: 0, file: -1, text: "" });
+            }
             _ = P.files.pop();
             continue;
         }
@@ -1232,6 +1236,57 @@ fn do_define(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
         return;
     }
     P.macros.put(m.name, m);
+    if P.mac {
+        record_macro(P, 1, nt.span, line[line.len - 1].span.end, m.name);
+    }
+}
+
+// -g: a definition (kind 1, its text from the name to `end`) or an
+// undefinition (2) at span sp (u.g_macros).
+fn record_macro(P: *mut PP, kind: u8, sp: u.Span, end: u32, name: []u8) void {
+    if u.str_eq(name, "__DATE__") or u.str_eq(name, "__TIME__") {
+        return;  // (the time of the build: two builds are the same)
+    }
+    let s = cur_src(P);
+    let mut at: i32 = -1;
+    let mut line: i32 = 0;
+    if not u.str_eq(s.presumed, "<built-in>") and not u.str_eq(s.presumed, "<command line>") {
+        at = sp.file;
+        line = u.span_line(sp);
+    }
+    let mut text = name;
+    if kind == 1 {
+        // (the directive's text from the name on, its continued lines
+        // joined, white space as single spaces; an object-like macro's name
+        // and replacement apart by one: DWARF 5, 6.3.2.1)
+        let src = u.file_of(sp.file).text;
+        let mut b = u.Buf.init();
+        let mut k = @as(usize, sp.start);
+        let e = @min(@as(usize, end), src.len);
+        let mut space = false;
+        while k < e {
+            let c = src[k];
+            if (c == '\\') and (k + 1 < e) and (src[k + 1] == '\n') {
+                k += 2;
+                continue;
+            }
+            if (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r') {
+                space = true;
+            } else {
+                if space {
+                    b.s(" ");
+                    space = false;
+                }
+                b.c(c);
+            }
+            k += 1;
+        }
+        text = b.done();
+        if text.len == name.len {
+            text = u.f1("%s ", name);
+        }
+    }
+    u.g_macros.push(u.MacroEv.{ kind: kind, at: at, line: line, file: -1, text: text });
 }
 
 fn do_undef(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
@@ -1245,6 +1300,9 @@ fn do_undef(P: *mut PP, line: []lx.PTok, sp: u.Span) void {
     extra(line, 1, "undef");
     if u.notnil(lookup(P, line[0].name)) {
         P.macros.put(line[0].name, nilmac());
+    }
+    if P.mac {
+        record_macro(P, 2, line[0].span, line[0].span.end, line[0].name);
     }
 }
 
@@ -1601,7 +1659,24 @@ fn load(P: *mut PP, path: []u8) *mut u.SourceFile {
     return g;
 }
 
+/// Is the unit preprocessed next a library's (cc.check)? Its macros are
+/// not described (-g).
+pub let mut g_lib_unit: bool = false;
+
+// (-g: the #include whose file push_file starts next: its line, 0: none)
+let mut INC: u.Span = u.Span.{ file: -1, start: 0, end: 0 };
+let mut INC_LINE: i32 = 0;
+
 fn push_file(P: *mut PP, sf: *mut u.SourceFile, presumed: []u8) void {
+    if P.mac and not u.str_eq(presumed, "<built-in>") and not u.str_eq(presumed, "<command line>") {
+        // (the start of a file: included at INC's line, or the unit's own)
+        let mut at: i32 = -1;
+        if INC_LINE > 0 {
+            at = INC.file;
+        }
+        u.g_macros.push(u.MacroEv.{ kind: 3, at: at, line: INC_LINE, file: sf.id, text: "" });
+    }
+    INC_LINE = 0;
     let L = lx.open(sf, P.o.std);
     P.files.push(Src.{ L: L, path: sf.path, dir_index: -1, presumed: presumed, line_delta: 0, cond_base: P.conds.len });
     cp.enter_file(sf.id);
@@ -1659,6 +1734,8 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
         P.fatal = true;
         return;
     }
+    INC = sp;
+    INC_LINE = u.span_line(sp);
     push_file(P, sf, path);
     cur_src(P).dir_index = found;
     if in_system_header(P) {
@@ -2761,6 +2838,10 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     let P = u.new.[PP]();
     P.o = o;
     P.asm_ = g_asm;
+    // (-g: the program's own units' macros, not the C library's)
+    P.mac = (tg.g_debug == tg.DEBUG_FULL) and tg.g_debug_macros and not g_asm and not g_lib_unit;
+    INC_LINE = 0;
+    let mac0 = u.g_macros.len;
     P.eof_tok = lx.mktok(lx.PK_EOF, 0, "", u.mkspan(0, 0, 0));
     P.eof_tok.bol = true;
     P.inject = u.nil_slice.[lx.PTok]();
@@ -2798,6 +2879,10 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     _ = P.files.pop();
     P.out.clear();
     let sf = load(P, path);
+    if P.mac and u.isnil(sf) {
+        u.g_macros.len = mac0;
+        P.mac = false;
+    }
     if u.isnil(sf) {
         dg.emit_fatal(false, "E0211", u.f1("cannot read '%s'", path));
         cv.convert(P.out.items(), o, &mut toks);
@@ -2805,6 +2890,9 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     }
     push_file(P, sf, path);
     run_file(P);
+    if P.mac {
+        u.g_macros.push(u.MacroEv.{ kind: 4, at: -1, line: 0, file: -1, text: "" });
+    }
     // (the end of the text is the end of the file)
     let mut e = P.eof_tok;
     e.span = u.mkspan(sf.id, @int_cast(u32, sf.text.len), @int_cast(u32, sf.text.len));

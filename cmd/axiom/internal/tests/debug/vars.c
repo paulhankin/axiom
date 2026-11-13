@@ -6,8 +6,12 @@
    a thread-local object, and values a debugger reads at -O1 and above
    (a parameter, a variable assigned once, one whose address is taken; one
    assigned again and again, a structure taken apart, a pointer into a
-   frame object, a variable length array), and a function inlined (its
-   inline instance, its variables). */
+   frame object, a variable length array), a function inlined (its
+   inline instance, its variables), and one called through a pointer with
+   constants (its call site's parameters; its own parameters' entry
+   values); its macros, one from a header of its own (.debug_macro). */
+#include "vars_macros.h"                     /* line: macro-include */
+#define VARS_DEPTH 3                         /* line: macro-def */
 typedef int count_t;
 typedef count_t *count_ptr;
 _Thread_local int per_thread = 3;
@@ -80,9 +84,22 @@ static int scaled(int v, int k) {
     return m + 1;
 }
 
+static void nothing(void) {}
+static void (*volatile nothing_fp)(void) = nothing;
+
+static int entry_of(int a, long b) {
+    sink = a;
+    sink = (int)b;
+    nothing_fp();                                /* (a and b are not kept past it) */
+    return 7;
+}
+static int (*volatile entry_fp)(int, long) = entry_of;
+
+#undef VARS_DEPTH                            /* line: macro-undef */
+
 int main(int argc, char **argv) {
     (void)argv;
     per_thread++;
     int z = scaled(argc, 3);                     /* line: scaled-call */
-    return shadow(argc + 2) + vla(argc + 3) + once(argc, 5) + again(argc, 7) + z == 0;
+    return shadow(argc + 2) + vla(argc + 3) + once(argc, 5) + again(argc, 7) + z + entry_fp(4, 5L) + VARS_TWICE(1) == 0;
 }

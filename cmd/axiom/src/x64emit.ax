@@ -34,7 +34,7 @@ pub let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: fal
                                              b: bn.Bytes.{
                                                  b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } },
                                              fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
-                                                                   cap: 0 } }; 10],
+                                                                   cap: 0 } }; 11],
                                      strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                             vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
                                      lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
@@ -817,7 +817,7 @@ fn mac_unwind(fs: u32, size: u64, early: bool) void {
     let df = dw.Func.{ xcfi: xcfis.items(), sym: fs, name: "", external: false, size: size, src: 0,
                        rows: u.nil_slice.[u64](), scopes: u.nil_slice.[u64](), cfi: cfis.items(), regs: regs[0..n],
                        irf: u.nil.[ir.Func](), vars: u.nil_slice.[i64](), vlocs: u.nil_slice.[dloc.VLoc](),
-                       frame_local: -1 };
+                       frame_local: -1, calls: u.nil_slice.[dloc.CallSite]() };
     let mut prog = bn.new_bytes();
     dw.cfa_program(&mut prog, false, &df);
     mu.add(&mut MU, fs, 0, size, 0, prog.view(), false, false);
@@ -3313,7 +3313,45 @@ fn var_slot_off(a: *ir.Value) i64 {
 
 // What dloc.ax needs of x86-64's machine code (variables' locations).
 let DLOC: dloc.Tgt = dloc.Tgt.{ dw_reg: dw_reg, is_exit: is_ret, is_tail: is_tail, slot_off: slot_cfa_off,
-                                obj_off: obj_cfa_off, imm_of: imm_of, alloc: 0xffff_ffcf };
+                                obj_off: obj_cfa_off, imm_of: imm_of, may_store: dloc_may_store, single: one_insn,
+                                alloc: 0xffff_ffcf };
+
+// For dloc.ax: is i (size bytes of code) one machine instruction (and not
+// a call)? Those of the forms the encoder writes as one.
+fn one_insn(i: *mc.MInst, size: u64) bool {
+    let op = i.op;
+    return (size <= 15) and (i.clobber == 0) and
+           ((op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.LEA) or (op == xe.ALU) or
+            (op == xe.SHIFT) or (op == xe.EXT) or (op == xe.CMOV));
+}
+
+// For dloc.ax: may i write its memory operand? (Comparisons and bit tests
+// of memory only read it.)
+fn dloc_may_store(i: *mc.MInst) bool {
+    if ((i.op == xe.ALU) and (i.cc == xe.ALU_CMP)) or (i.op == xe.BT) or (i.op == xe.TEST) {
+        return false;
+    }
+    return may_store(i);
+}
+
+/// May machine instruction i write memory (else it reads its memory
+/// operand, if any, only)?
+pub fn may_store(i: *mc.MInst) bool {
+    let op = i.op;
+    if (op == xe.MOV_RR) or (op == xe.MOV_RI) or (op == xe.LOAD) or (op == xe.LEA) or (op == xe.EXT) or
+       (op == xe.SETCC) or (op == xe.CMOV) or (op == xe.LABEL) or (op == xe.TEST) or (op == xe.CMP_M) or
+       (op == xe.JCC) or (op == xe.JMP) {
+        return false;
+    }
+    if ((op == xe.ALU) or (op == xe.SHIFT)) and (i.ops.len > 0) and (i.ops[0].kind == mc.K_REG) {
+        return false;
+    }
+    // (an SSE store's first operand is the register it stores, read only)
+    if (op == xe.SSE) and (i.ops.len > 0) and (i.ops[0].kind == mc.K_REG) and ((i.ops[0].role & mc.RD) != 0) {
+        return false;
+    }
+    return true;
+}
 
 // The constant instruction i puts in its register (MOV_RI: a 32-bit one
 // zero-extended), or NO_LOC.
@@ -3578,7 +3616,7 @@ pub fn encode_func(f: *mut ir.Func) void {
                            external: s.bind != elf.B_LOCAL, size: s.size, src: f.src, rows: rows.items(),
                            scopes: scopes.items(), cfi: cfis.items(), regs: regs[0..@int_cast(usize, nsaved) + 1],
                            irf: f, vars: dw.var_locs(f, var_slot_off, 16), vlocs: dloc.compute(MF, &DLOC, s.size),
-                           frame_local: -1 };
+                           frame_local: -1, calls: dloc.calls() };
         if WIN {
             codeview.add_func(&df, s);
         } else {

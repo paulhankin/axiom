@@ -52,10 +52,12 @@ pub const D_FRAME: usize = 6;
 pub const D_RNGLISTS: usize = 7;
 pub const D_LOCLISTS: usize = 8;
 pub const D_NAMES: usize = 9;
-pub const NSEC: usize = 10;
+pub const D_MACRO: usize = 10;
+pub const NSEC: usize = 11;
 
-pub let SEC_NAMES: [10][]u8 = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line", ".debug_line_str",
-                               ".debug_aranges", ".debug_frame", ".debug_rnglists", ".debug_loclists", ".debug_names"];
+pub let SEC_NAMES: [11][]u8 = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line", ".debug_line_str",
+                               ".debug_aranges", ".debug_frame", ".debug_rnglists", ".debug_loclists", ".debug_names",
+                               ".debug_macro"];
 
 // Is it the name of a debug section this module writes (and the linkers merge)?
 pub fn is_debug_name(name: []u8) bool {
@@ -107,7 +109,7 @@ pub struct Unit {
     addr_size: u64,
     full: bool,  // DEBUG_FULL: types and variables too
     lang: u32,   // DW_LANG_* (0: none named)
-    parts: [10]Part,
+    parts: [11]Part,
     strs: u.SymMap.[u32],   // interned string -> its .debug_str offset + 1
     lstrs: u.SymMap.[u32],  // interned string -> its .debug_line_str offset + 1
     files: u.List.[u32],    // the line table's files: their names' .debug_line_str offsets
@@ -150,7 +152,7 @@ pub struct Named {
 }
 
 pub fn none() Unit {
-    return Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0, parts: [new_part(); 10],
+    return Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0, parts: [new_part(); 11],
                   strs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   lstrs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   files: u.List.[u32].empty(), fmap: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](),
@@ -353,6 +355,7 @@ pub struct Func {
     // WebAssembly: the local holding the frame's address (its frame base, from
     // which vars count), or -1 (no frame; natively: the CFA is the frame base)
     frame_local: i64,
+    calls: []dloc.CallSite,  // optimized code (-g): its call sites (dloc.ax)
 }
 
 // Is source location `src` in the standard library?
@@ -573,6 +576,23 @@ pub const AB_SUB_EXT_KIDS: u64 = 5;
 pub const AB_SUB_KIDS: u64 = 6;
 pub const AB_SUB_TYPED: u64 = 7;  // + AB_SUB_EXT .. AB_SUB_KIDS - 3: with DW_AT_type (a C function's result)
 const AB_CU_RANGES: u64 = 82;     // + 0 with the language, 1 without: code in several sections (after AB_IVAR_LIST)
+// call sites (DW_TAG_call_site): + 0 with the callee's address (DW_AT_call_target), 1 without; + 2 with
+// parameters; + 4: a call in tail position (DW_AT_call_pc, DW_AT_call_tail_call; no parameters)
+const AB_CALL: u64 = 84;
+const AB_CPARAM: u64 = 90;  // DW_TAG_call_site_parameter: its register, its value
+// a subprogram with call sites (DW_AT_call_all_calls): + 0 external, 1 not; + 2 with DW_AT_type
+const AB_SUB_CALLS: u64 = 91;
+const AT_CALL_ALL_CALLS: u64 = 0x7a;
+// a unit with macros (DW_AT_macros after DW_AT_stmt_list): AB_CU, AB_CU_NOLANG, AB_CU_RANGES, + 1's
+const AB_CU_MACROS: u64 = 95;
+const AT_MACROS: u64 = 0x79;
+const TAG_CALL_SITE: u64 = 0x48;
+const TAG_CALL_SITE_PARAMETER: u64 = 0x49;
+const AT_CALL_RETURN_PC: u64 = 0x7d;
+const AT_CALL_VALUE: u64 = 0x7e;
+const AT_CALL_PC: u64 = 0x81;
+const AT_CALL_TAIL_CALL: u64 = 0x82;
+const AT_CALL_TARGET: u64 = 0x83;
 
 // The abbreviations: code, tag, children, (attribute, form) pairs, 0 0.
 fn abbrev_table(b: *mut bn.Bytes) void {
@@ -591,6 +611,33 @@ fn abbrev_table(b: *mut bn.Bytes) void {
     let cur2: [6][2]u64 = [[AT_PRODUCER, FORM_STRP], [AT_NAME, FORM_STRP], [AT_COMP_DIR, FORM_STRP],
                            [AT_LOW_PC, FORM_ADDR], [AT_RANGES, FORM_SEC_OFFSET], [AT_STMT_LIST, FORM_SEC_OFFSET]];
     abbrev(b, AB_CU_RANGES + 1, TAG_COMPILE_UNIT, true, cur2[..]);
+    let mcu: [8][2]u64 = [[AT_PRODUCER, FORM_STRP], [AT_LANGUAGE, FORM_DATA2], [AT_NAME, FORM_STRP],
+                          [AT_COMP_DIR, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
+                          [AT_STMT_LIST, FORM_SEC_OFFSET], [AT_MACROS, FORM_SEC_OFFSET]];
+    abbrev(b, AB_CU_MACROS, TAG_COMPILE_UNIT, true, mcu[..]);
+    let mcu2: [7][2]u64 = [[AT_PRODUCER, FORM_STRP], [AT_NAME, FORM_STRP], [AT_COMP_DIR, FORM_STRP],
+                           [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4], [AT_STMT_LIST, FORM_SEC_OFFSET],
+                           [AT_MACROS, FORM_SEC_OFFSET]];
+    abbrev(b, AB_CU_MACROS + 1, TAG_COMPILE_UNIT, true, mcu2[..]);
+    let mcur: [8][2]u64 = [[AT_PRODUCER, FORM_STRP], [AT_LANGUAGE, FORM_DATA2], [AT_NAME, FORM_STRP],
+                           [AT_COMP_DIR, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_RANGES, FORM_SEC_OFFSET],
+                           [AT_STMT_LIST, FORM_SEC_OFFSET], [AT_MACROS, FORM_SEC_OFFSET]];
+    abbrev(b, AB_CU_MACROS + 2, TAG_COMPILE_UNIT, true, mcur[..]);
+    let mcur2: [7][2]u64 = [[AT_PRODUCER, FORM_STRP], [AT_NAME, FORM_STRP], [AT_COMP_DIR, FORM_STRP],
+                            [AT_LOW_PC, FORM_ADDR], [AT_RANGES, FORM_SEC_OFFSET], [AT_STMT_LIST, FORM_SEC_OFFSET],
+                            [AT_MACROS, FORM_SEC_OFFSET]];
+    abbrev(b, AB_CU_MACROS + 3, TAG_COMPILE_UNIT, true, mcur2[..]);
+    let cs: [2][2]u64 = [[AT_CALL_RETURN_PC, FORM_ADDR], [AT_CALL_TARGET, FORM_EXPRLOC]];
+    abbrev(b, AB_CALL, TAG_CALL_SITE, false, cs[..]);
+    abbrev(b, AB_CALL + 1, TAG_CALL_SITE, false, cs[0..1]);
+    abbrev(b, AB_CALL + 2, TAG_CALL_SITE, true, cs[..]);
+    abbrev(b, AB_CALL + 3, TAG_CALL_SITE, true, cs[0..1]);
+    let ts: [3][2]u64 = [
+        [AT_CALL_PC, FORM_ADDR], [AT_CALL_TAIL_CALL, FORM_FLAG_PRESENT], [AT_CALL_TARGET, FORM_EXPRLOC]];
+    abbrev(b, AB_CALL + 4, TAG_CALL_SITE, false, ts[..]);
+    abbrev(b, AB_CALL + 5, TAG_CALL_SITE, false, ts[0..2]);
+    let cp: [2][2]u64 = [[AT_LOCATION, FORM_EXPRLOC], [AT_CALL_VALUE, FORM_EXPRLOC]];
+    abbrev(b, AB_CPARAM, TAG_CALL_SITE_PARAMETER, false, cp[..]);
     let sub: [7][2]u64 = [[AT_NAME, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
                           [AT_FRAME_BASE, FORM_EXPRLOC], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
                           [AT_EXTERNAL, FORM_FLAG_PRESENT]];
@@ -605,6 +652,17 @@ fn abbrev_table(b: *mut bn.Bytes) void {
     abbrev(b, AB_SUB_TYPED + 1, TAG_SUBPROGRAM, false, tsub[0..8]);
     abbrev(b, AB_SUB_TYPED + 2, TAG_SUBPROGRAM, true, tsub[..]);
     abbrev(b, AB_SUB_TYPED + 3, TAG_SUBPROGRAM, true, tsub[0..8]);
+    let csub: [8][2]u64 = [[AT_NAME, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
+                           [AT_FRAME_BASE, FORM_EXPRLOC], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                           [AT_CALL_ALL_CALLS, FORM_FLAG_PRESENT], [AT_EXTERNAL, FORM_FLAG_PRESENT]];
+    abbrev(b, AB_SUB_CALLS, TAG_SUBPROGRAM, true, csub[..]);
+    abbrev(b, AB_SUB_CALLS + 1, TAG_SUBPROGRAM, true, csub[0..7]);
+    let ctsub: [10][2]u64 = [[AT_NAME, FORM_STRP], [AT_LOW_PC, FORM_ADDR], [AT_HIGH_PC, FORM_DATA4],
+                             [AT_FRAME_BASE, FORM_EXPRLOC], [AT_DECL_FILE, FORM_UDATA], [AT_DECL_LINE, FORM_UDATA],
+                             [AT_PROTOTYPED, FORM_FLAG_PRESENT], [AT_TYPE, FORM_REF4],
+                             [AT_CALL_ALL_CALLS, FORM_FLAG_PRESENT], [AT_EXTERNAL, FORM_FLAG_PRESENT]];
+    abbrev(b, AB_SUB_CALLS + 2, TAG_SUBPROGRAM, true, ctsub[..]);
+    abbrev(b, AB_SUB_CALLS + 3, TAG_SUBPROGRAM, true, ctsub[0..9]);
     type_abbrevs(b);
     b.u8_(0);
 }
@@ -637,7 +695,7 @@ fn subprogram(d: *mut Unit, f: *Func) void {
     }
     // (its lexical blocks and the inline instances of the functions inlined into it)
     let mut tr = scope_tree(f, sc);
-    let mut kids = (vs.len > 0) or (tr.kids.get(0).len > 0);
+    let mut kids = (vs.len > 0) or (tr.kids.get(0).len > 0) or (d.full and (f.calls.len > 0));
     if sc[0] != 0 {
         kids = kids or (dbi.scopes.at(@as(usize, sc[0])).types.len > 0);
     }
@@ -654,6 +712,10 @@ fn subprogram(d: *mut Unit, f: *Func) void {
     }
     if rt >= 0 {
         code += AB_SUB_TYPED - AB_SUB_EXT;
+    }
+    if d.full and (f.calls.len > 0) {
+        // (every call it makes is a call site: DWARF 5, 3.3.1.5)
+        code = AB_SUB_CALLS + pk(f.external, 0, 1) + pk(rt >= 0, 2, 0);
     }
     named(d, f.name, TAG_SUBPROGRAM, @as(u64, p.b.len()));
     p.b.uleb(code);
@@ -676,9 +738,68 @@ fn subprogram(d: *mut Unit, f: *Func) void {
         }
         scope_body(d, f, vs, sc, &tr, 0);
         d.voffs.clear();
+        if d.full {
+            call_sites(d, f);
+        }
         d.parts[D_INFO].b.u8_(0);
     }
     free_tree(&mut tr);
+}
+
+// The function's call sites (DWARF 5, 3.4; dloc.ax), as children of its
+// subprogram: where each call returns (a call in tail position: where it
+// is, flagged), its callee's address (a function's; or the pointer a datum
+// holds, read from it), and the arguments known in registers, for the
+// entry values of the callee's parameters.
+fn call_sites(d: *mut Unit, f: *Func) void {
+    for c in f.calls {
+        let mut tsym: u32 = 0;  // (+ 1)
+        if c.sym >= 0 {
+            tsym = @as(u32, @bit_cast(u32, c.sym)) + 1;
+        } else if c.tgsym.len > 0 {
+            tsym = d.gsyms.get(u.intern(c.tgsym));
+        }
+        let has_t = tsym != 0;
+        let mut code = AB_CALL + pk(has_t, 0, 1);
+        if c.tail {
+            code = AB_CALL + 4 + pk(has_t, 0, 1);
+        } else if c.params.len > 0 {
+            code += 2;
+        }
+        ib(d).uleb(code);
+        if c.tail {
+            addr_ref(d, &mut d.parts[D_INFO], f.sym, c.at);
+        } else {
+            addr_ref(d, &mut d.parts[D_INFO], f.sym, c.ret);
+        }
+        if has_t {
+            if c.sym >= 0 {
+                ib(d).uleb(1 + d.addr_size);
+                ib(d).u8_(OP_ADDR);
+                addr_ref(d, &mut d.parts[D_INFO], tsym - 1, 0);
+            } else {
+                // (the pointer at the datum's address + toff)
+                ib(d).uleb(2 + d.addr_size);
+                ib(d).u8_(OP_ADDR);
+                addr_ref(d, &mut d.parts[D_INFO], tsym - 1, @bit_cast(u64, c.toff));
+                ib(d).u8_(OP_DEREF);
+            }
+        }
+        if c.tail or (c.params.len == 0) {
+            continue;
+        }
+        for q in c.params {
+            ib(d).uleb(AB_CPARAM);
+            ib(d).uleb(1);
+            ib(d).u8_(OP_REG0 + @truncate(u8, @as(u32, @bit_cast(u32, q.reg))));
+            ib(d).uleb(@as(u64, q.expr.len) + 1);
+            for b in q.expr {
+                ib(d).u8_(b);
+            }
+            ib(d).u8_(OP_STACK_VALUE);
+        }
+        ib(d).u8_(0);
+    }
 }
 
 // DW_AT_frame_base (an exprloc): the CFA natively; on WebAssembly the value
@@ -1448,7 +1569,7 @@ fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: [
     let mut n: usize = 0;
     for sg in segs.items() {
         let x = dloc.VLoc.{ var: 0, poff: 0, psize: 0, kind: 0, start: sg.start, end: sg.end, reg: 0, off: 0, add: 0,
-                            size: 0, ind: false, gsym: "", inst: 0 };
+                            size: 0, ind: false, gsym: "", inst: 0, expr: "" };
         if clipped(x, clip, 0).end > 0 {
             n += 1;
         }
@@ -1472,7 +1593,7 @@ fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: [
     sec_ref(d, &mut d.parts[D_INFO], D_LOCLISTS, @as(u64, list_start(d, D_LOCLISTS)));
     for sg in segs.items() {
         let x = dloc.VLoc.{ var: 0, poff: 0, psize: 0, kind: 0, start: sg.start, end: sg.end, reg: 0, off: 0, add: 0,
-                            size: 0, ind: false, gsym: "", inst: 0 };
+                            size: 0, ind: false, gsym: "", inst: 0, expr: "" };
         let mut ci: usize = 0;
         loop {
             let c = clipped(x, clip, ci);
@@ -1580,6 +1701,28 @@ fn loc_expr(d: *mut Unit, e: *mut bn.Bytes, fx: *mut u.List.[SFix], x: *dloc.VLo
             if not x.ind {
                 e.u8_(OP_STACK_VALUE);
             }
+        }
+        return true;
+    }
+    if kind == dloc.LK_WLOCAL {
+        // (WebAssembly's DWARF: the variable is the function's local reg)
+        e.u8_(OP_WASM_LOCATION);
+        e.u8_(0);
+        e.uleb(@as(u64, @bit_cast(u32, x.reg)));
+        return true;
+    }
+    if kind == dloc.LK_EXPR {
+        // (computed from other values, plus add: dloc.expr_of)
+        for b in x.expr {
+            e.u8_(b);
+        }
+        if x.add != 0 {
+            e.u8_(OP_CONSTS);
+            e.sleb(x.add);
+            e.u8_(OP_PLUS);
+        }
+        if not x.ind {
+            e.u8_(OP_STACK_VALUE);
         }
         return true;
     }
@@ -2159,16 +2302,45 @@ fn name_index(d: *mut Unit, hn: u64) void {
     }
     let n = names.len;
     let nb = @max(n / 2, 1);
-    // the names in bucket order (stable)
-    let order = u.newn.[usize](n + 1);
-    let mut k: usize = 0;
+    // each name's hash, once
+    let hs = u.newn.[u32](n + 1);
+    for j in 0..n {
+        hs[j] = djb_hash(names.get(j));
+    }
+    // the names in bucket order (stable: a counting sort)
+    let cnt = u.newn.[usize](nb + 1);
+    for b in 0..(nb + 1) {
+        cnt[b] = 0;
+    }
+    for j in 0..n {
+        cnt[(@as(usize, hs[j]) % nb) + 1] += 1;
+    }
     for b in 0..nb {
-        for j in 0..n {
-            if (@as(usize, djb_hash(names.get(j))) % nb) == b {
-                order[k] = j;
-                k += 1;
-            }
+        cnt[b + 1] += cnt[b];
+    }
+    let order = u.newn.[usize](n + 1);
+    for j in 0..n {
+        let b = @as(usize, hs[j]) % nb;
+        order[cnt[b]] = j;
+        cnt[b] += 1;
+    }
+    // each name's entries, in order (a list through `nxt`, from first[name])
+    let first = u.newn.[i32](n + 1);
+    let last = u.newn.[i32](n + 1);
+    let nxt = u.newn.[i32](es.len + 1);
+    for j in 0..n {
+        first[j] = -1;
+        last[j] = -1;
+    }
+    for q in 0..es.len {
+        let j = @as(usize, at.get(es[q].name)) - 1;
+        nxt[q] = -1;
+        if last[j] < 0 {
+            first[j] = @int_cast(i32, q);
+        } else {
+            nxt[@int_cast(usize, last[j])] = @int_cast(i32, q);
         }
+        last[j] = @int_cast(i32, q);
     }
     // the abbreviations: one per tag
     let mut tags = u.List.[u64].empty();
@@ -2197,10 +2369,10 @@ fn name_index(d: *mut Unit, hn: u64) void {
     for x in 0..n {
         let j = order[x];
         eoff[x] = @as(u64, pool.len());
-        for e in es {
-            if e.name.ptr != names.get(j).ptr {
-                continue;
-            }
+        let mut q = first[j];
+        while q >= 0 {
+            let e = es[@int_cast(usize, q)];
+            q = nxt[@int_cast(usize, q)];
             let mut ti: usize = 0;
             while tags.get(ti) != e.tag {
                 ti += 1;
@@ -2225,9 +2397,9 @@ fn name_index(d: *mut Unit, hn: u64) void {
     // the buckets: each its first name's index (from 1), 0 if empty
     let mut x: usize = 0;
     for b in 0..nb {
-        if (x < n) and ((@as(usize, djb_hash(names.get(order[x]))) % nb) == b) {
+        if (x < n) and ((@as(usize, hs[order[x]]) % nb) == b) {
             p.b.u32_(@as(u64, x) + 1);
-            while (x < n) and ((@as(usize, djb_hash(names.get(order[x]))) % nb) == b) {
+            while (x < n) and ((@as(usize, hs[order[x]]) % nb) == b) {
                 x += 1;
             }
         } else {
@@ -2235,7 +2407,7 @@ fn name_index(d: *mut Unit, hn: u64) void {
         }
     }
     for j in 0..n {
-        p.b.u32_(@as(u64, djb_hash(names.get(order[j]))));
+        p.b.u32_(@as(u64, hs[order[j]]));
     }
     for j in 0..n {
         sec_ref(d, p, D_STR, @as(u64, str_off(d, names.get(order[j]))));
@@ -2546,6 +2718,50 @@ pub fn lang() u32 {
 // The bytes of the unit's sections and their fixups, complete: the unit
 // header and DIE before the subprograms, the line program's header, the
 // address ranges (text_size bytes of code from text_sym).
+let mut MACROS_DONE: bool = false;
+
+// DW_MACRO_* (DWARF 5, 6.3.2)
+const MACRO_START_FILE: u8 = 0x03;
+const MACRO_END_FILE: u8 = 0x04;
+const MACRO_DEFINE_STRP: u8 = 0x05;
+const MACRO_UNDEF_STRP: u8 = 0x06;
+
+// The unit's macro information (.debug_macro, DWARF 5, 6.3): the C
+// preprocessor's definitions and undefinitions in order (u.g_macros), each
+// with its line (0: predefined or on the command line, before the unit's
+// own file starts), and the files as they are included, each started at
+// the line of its #include and ended; the files are the line table's
+// (where_of: a file without code is in it all the same), the texts in
+// .debug_str.
+fn macro_unit(d: *mut Unit) void {
+    let p = &mut d.parts[D_MACRO];
+    p.b.u16_(5);
+    p.b.u8_(2);  // (32-bit offsets; the offset of the unit's line table follows)
+    sec_ref(d, &mut d.parts[D_MACRO], D_LINE, 0);
+    for x in u.g_macros.items() {
+        let mut line: u64 = 0;
+        if (x.at >= 0) and (x.line > 0) {
+            let w = where_of(d, ir.src_loc(x.at, x.line));
+            line = @as(u64, w.line);
+        }
+        let mp = &mut d.parts[D_MACRO];
+        if (x.kind == 1) or (x.kind == 2) {
+            mp.b.u8_(@truncate(u8, pk(x.kind == 1, @as(u64, MACRO_DEFINE_STRP), @as(u64, MACRO_UNDEF_STRP))));
+            mp.b.uleb(line);
+            let so = str_off(d, x.text);
+            sec_ref(d, &mut d.parts[D_MACRO], D_STR, @as(u64, so));
+        } else if x.kind == 3 {
+            let w = where_of(d, ir.src_loc(x.file, 1));
+            mp.b.u8_(MACRO_START_FILE);
+            mp.b.uleb(line);
+            d.parts[D_MACRO].b.uleb(@as(u64, w.file));
+        } else {
+            mp.b.u8_(MACRO_END_FILE);
+        }
+    }
+    d.parts[D_MACRO].b.u8_(0);
+}
+
 fn finish(d: *mut Unit, text_size: u64) void {
     // .debug_abbrev
     abbrev_table(&mut d.parts[D_ABBREV].b);
@@ -2566,7 +2782,11 @@ fn finish(d: *mut Unit, text_size: u64) void {
     h.b.u8_(@truncate(u8, d.addr_size));
     sec_ref(d, &mut h, D_ABBREV, 0);
     let ranged = d.ranges.len > 1;
-    if ranged {
+    let macros = d.full and (u.g_macros.len > 0) and not MACROS_DONE;
+    if macros {
+        MACROS_DONE = true;  // (in one unit: the first)
+        h.b.uleb(AB_CU_MACROS + pk(d.lang != 0, 0, 1) + pk(ranged, 2, 0));
+    } else if ranged {
         h.b.uleb(AB_CU_RANGES + pk(d.lang != 0, 0, 1));
     } else if d.lang != 0 {
         h.b.uleb(AB_CU);
@@ -2600,6 +2820,10 @@ fn finish(d: *mut Unit, text_size: u64) void {
         size_ref(d, &mut h, 4, text_size);
     }
     sec_ref(d, &mut h, D_LINE, 0);
+    if macros {
+        sec_ref(d, &mut h, D_MACRO, 0);
+        macro_unit(d);
+    }
     abstracts(d);
     let toff = types_and_data(d);
     let hn = @as(u64, h.b.len());
@@ -2768,8 +2992,8 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
         text_size = d.ranges.get(0) & 0xffff_ffff;
     }
     finish(d, text_size);
-    let mut secs: [10]i32 = [0; 10];
-    let mut ssym: [10]u32 = [0; 10];
+    let mut secs: [11]i32 = [0; 11];
+    let mut ssym: [11]u32 = [0; 11];
     for k in 0..NSEC {
         if (d.parts[k].b.len() == 0) and (k >= D_RNGLISTS) {
             continue;  // (none: not written)
@@ -2827,8 +3051,8 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
 /// or datum `sym`, or of TEXT_SYM (the start of the unit's code), FX_SIZE
 /// (the size of the unit's code), FX_SEC (offset `addend` in the unit's
 /// section `sym`). The parts are the caller's.
-pub fn finish_parts(d: *mut Unit) [10]Part {
-    let mut out: [10]Part = [new_part(); 10];
+pub fn finish_parts(d: *mut Unit) [11]Part {
+    let mut out: [11]Part = [new_part(); 11];
     if not d.on or (d.nfuncs == 0) {
         return out;
     }
@@ -2846,8 +3070,8 @@ pub fn finish_parts(d: *mut Unit) [10]Part {
 /// The unit's sections with their fixups resolved, for a linker that knows
 /// each function's address (addr_of(sym)) and places the code at text_addr
 /// (text_size bytes): wlink.ax's custom sections.
-pub fn finish_linked(d: *mut Unit, text_addr: u64, text_size: u64, addr_of: fn(u32) u64) [10]bn.Bytes {
-    let mut out: [10]bn.Bytes = [bn.new_bytes(); 10];
+pub fn finish_linked(d: *mut Unit, text_addr: u64, text_size: u64, addr_of: fn(u32) u64) [11]bn.Bytes {
+    let mut out: [11]bn.Bytes = [bn.new_bytes(); 11];
     if not d.on or (d.nfuncs == 0) {
         return out;
     }

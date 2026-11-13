@@ -42,7 +42,7 @@ import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
 import { checkPDB } from './pdb.mjs';
 import { checkPE, checkPEFile } from './pe.mjs';
-import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, readDwarf, frameAt } from './dwarf.mjs';
+import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, checkAxWide, checkMacros, checkWasmLocals, readDwarf, frameAt } from './dwarf.mjs';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../../..');
 const compiler = path.resolve(process.env.AXIOM || path.join(root, 'cmd/axiom/bootstrap/build/axiom'));
@@ -1258,6 +1258,23 @@ function cDriverCases() {
       if (c.status !== 0) return `build: ${c.stdout}${c.stderr}`;
       const r = spawnSync(out, [], { encoding: 'utf8' });
       return /at <indirect call>\n\s+at early \(crash2\.c:9:16\) \(inlined into tailer\)\n\s+at tailer \(crash2\.c:15:12\) \(inlined into deep\)\n\s+at deep \(crash2\.c:18:16\) \(inlined into main\)\n\s+at main \(crash2\.c:22:12\)(?: \(inlined into main\))?\n/.test(r.stderr) ? null : `the trace:\n${r.stderr}`;
+    },
+    // WebAssembly: C's calls push their records on the shadow stack, as
+    // Axiom's do, and the optimizer's inlining keeps them: the C frames are
+    // in a trap's trace at -O0 and -O2.
+    'C: WebAssembly stack traces through C functions': async () => {
+      if (skip()) return skip();
+      if (noC) return { skip: true, reason: 'no C' };
+      write({ 'crash3.c': 'static volatile int zero = 0;\nstatic int divide(int *p) {\n    return *p / zero;\n}\n' +
+        'static int middle(int k) {\n    int x = k;\n    return divide(&x) + 1;\n}\nint main(void) {\n    return middle(3) + 2;\n}\n' });
+      for (const o of ['-O0', '-O2']) {
+        const out = path.join(dir, `crash3${o}.wasm`);
+        const c = await ax(['build', 'crash3.c', o, '--target=wasm32', '-o', out]);
+        if (c.status !== 0) return `build ${o}: ${c.stdout}${c.stderr}`;
+        const r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
+        if (!/at divide\n\s+at middle \(crash3\.c:7:12\)\n\s+at main \(crash3\.c:10:12\)\n/.test(r.stderr)) return `the trace (${o}):\n${r.stderr}`;
+      }
+      return null;
     },
     // With line tables (-g, --debug-info=lines) the innermost frame shows
     // the faulting instruction's line too (the frame table's line rows:
@@ -2589,12 +2606,22 @@ if (!skipPlatform) {
               // frame's local; optimized code's are not described there, and a
               // thread-local has no one location)
               const wasm = t.startsWith('wasm');
-              if (wasm && lvl !== '-O0') return r.nvars ? null : 'no variables';
+              if (wasm && lvl !== '-O0') {
+                // (optimized: the variables in the functions' locals, DW_OP_WASM_location 0)
+                const errs = checkWasmLocals(r.dw);
+                return errs.length ? errs.join('\n') : (r.nvars ? null : 'no variables');
+              }
               const errs = checkVars(r.dw, { O0: lvl === '-O0', tls: !wasm, src, markLine, machine: t.startsWith('x86') ? 'x64' : 'a64' });
+              errs.push(...checkMacros(r.dw, src, markLine));
               return errs.length ? errs.join('\n') : null;
             }
             if (file === 'shared.ax') return null;  // (checkDebug: every function has its subprogram)
             if (file === 'vars.ax') {
+              // (-O2 without wide vector registers: the vector in pieces)
+              if (lvl === '-O2' && !t.startsWith('wasm') && !t.startsWith('x86_64-windows') && !t.startsWith('aarch64-windows')) {
+                const errs = checkAxWide(r.dw);
+                return errs.length ? errs.join('\n') : null;
+              }
               if (lvl !== '-O0') return null;
               const errs = checkAxVars(r.dw);
               return errs.length ? errs.join('\n') : null;

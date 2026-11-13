@@ -69,6 +69,7 @@ pub struct VLoc {
     gsym: []u8,  // LK_GADDR: the datum
     inst: u32,   // a variable of a function inlined: its inline instance (ir.DbgMark.inst; var indexes its
                  // function's), 0: the function's own
+    expr: []u8,  // LK_EXPR: a DWARF expression that computes the value (plus add; without DW_OP_stack_value)
 }
 
 pub const LK_REG: u8 = 0;
@@ -76,19 +77,57 @@ pub const LK_CONST: u8 = 1;
 pub const LK_SLOT: u8 = 2;
 pub const LK_ADDR: u8 = 3;
 pub const LK_GADDR: u8 = 4;  // the address of datum gsym, plus off
+pub const LK_EXPR: u8 = 5;
+pub const LK_WLOCAL: u8 = 6;  // WebAssembly: in local `reg` (DW_OP_WASM_location 0)   // computed from other values (expr): a value made from them that no place holds
 
 /// What the target tells of its machine code.
 pub struct Tgt {
-    dw_reg: fn(i32) i32,          // a physical register's DWARF number (-1: none)
-    is_exit: fn(*mc.MInst) bool,  // a return or a call in tail position
-    is_tail: fn(*mc.MInst) bool,  // a call in tail position (it writes the stack arguments' area)
-    slot_off: fn(i32) i64,        // a spill slot's offset from the CFA (NO_LOC: none)
-    obj_off: fn(*ir.Value) i64,   // the frame slot of an alloca: its offset from the CFA (NO_LOC: none)
-    imm_of: fn(*mc.MInst) i64,    // the constant an instruction puts in its register (all of it; NO_LOC: none)
-    alloc: u64,                   // the allocatable physical registers
+    dw_reg: fn(i32) i32,              // a physical register's DWARF number (-1: none)
+    is_exit: fn(*mc.MInst) bool,      // a return or a call in tail position
+    is_tail: fn(*mc.MInst) bool,      // a call in tail position (it writes the stack arguments' area)
+    slot_off: fn(i32) i64,            // a spill slot's offset from the CFA (NO_LOC: none)
+    obj_off: fn(*ir.Value) i64,       // the frame slot of an alloca: its offset from the CFA (NO_LOC: none)
+    imm_of: fn(*mc.MInst) i64,        // the constant an instruction puts in its register (all of it; NO_LOC: none)
+    may_store: fn(*mc.MInst) bool,    // may an instruction write its memory operand (else it only reads it)
+    single: fn(*mc.MInst, u64) bool,  // is an instruction (of that many bytes of code) one machine instruction, not a call
+    alloc: u64,                       // the allocatable physical registers
 }
 
 pub const NO_LOC: i64 = -0x7fff_ffff_ffff_ffff;
+
+/// A call the function makes (DWARF 5, 3.4: a call site): its code offset
+/// after the call (a call in tail position: of the jump), the callee
+/// (`sym`, a symbol; or, called through a pointer that a datum holds,
+/// `tgsym` plus `toff`, the address of the datum holding it; else none),
+/// and the arguments whose values are known where the call returns.
+pub struct CallSite {
+    ret: u64,
+    at: u64,  // (the call's own offset)
+    tail: bool,
+    sym: i32,     // -1: none
+    tgsym: []u8,  // (empty: none)
+    toff: i64,
+    params: []CallParam,
+}
+
+/// An argument of a call site: in DWARF register `reg` at the call, the
+/// value DWARF expression `expr` computes (without DW_OP_stack_value) in
+/// the caller's frame while the callee runs.
+pub struct CallParam {
+    reg: i32,
+    expr: []u8,
+}
+
+/// The call sites of the function compute did last.
+pub fn calls() []CallSite {
+    return CALLS.items();
+}
+
+// (in code order)
+pub let mut CALLS: u.List.[CallSite] = u.List.[CallSite].{ data: @ptr_from_int(*mut CallSite, 0), len: 0, cap: 0 };
+// each call's machine instruction -> its IR call (+ 0: the address)
+let mut call_ir: u.SymMap.[usize] = u.SymMap.[usize].{ keys: @ptr_from_int(*mut usize, 0),
+                                                       vals: @ptr_from_int(*mut usize, 0), cap: 0, len: 0 };
 
 // A variable piece followed in the function being compiled.
 struct Ent {
@@ -114,6 +153,16 @@ struct Val {
     add: i64,
     phi_blk: i32,  // a phi: its machine block (-1: not a phi, or none)
     phi_ops: u.List.[PhiIn],
+    // an integer operation of one or two operands (see expr_of): the IR
+    // operation (0: none), its operands (VALS indexes, -1: the constant ca,
+    // cb), its width and its first operand's in bits
+    xop: i32,
+    xa: i32,
+    xb: i32,
+    ca: i64,
+    cb: i64,
+    bits: u32,
+    abits: u32,
 }
 
 // A phi's input: from IR block `from`, the value (VALS index, -1: none) or
@@ -169,6 +218,12 @@ fn key(p: usize) []u8 {
     return @slice_from_ptr(@ptr_from_int(*u8, p), 1);
 }
 
+/// Can a variable of type ty (or its piece of psize bytes) be value v (in
+/// one register, or a WebAssembly local)?
+pub fn fits_var(v: *ir.Value, ty: i32, psize: u32) bool {
+    return fits(v, ty, psize);
+}
+
 // Can a variable of the type `ty` (a dbinfo type), or the piece of `psize`
 // bytes of one (psize > 0), be held by value v (an integer, pointer or
 // floating value of its size in one register)?
@@ -178,10 +233,15 @@ fn fits(v: *ir.Value, ty: i32, psize: u32) bool {
     }
     let t = v.ty;
     let k = t.kind;
-    if (k != ir.T_INT) and (k != ir.T_PTR) and (k != ir.T_FLOAT) {
+    if (k != ir.T_INT) and (k != ir.T_PTR) and (k != ir.T_FLOAT) and (k != ir.T_VEC) {
         return false;
     }
     if (k == ir.T_INT) and ((t.bits < 8) or (t.bits > 64) or ((t.bits % 8) != 0)) {
+        return false;
+    }
+    // (a vector or a 128-bit floating value: in one vector register, whose
+    // DWARF number names all of it)
+    if ((k == ir.T_VEC) or (k == ir.T_FLOAT)) and (t.size != 4) and (t.size != 8) and (t.size != 16) {
         return false;
     }
     if psize > 0 {
@@ -196,6 +256,9 @@ fn fits(v: *ir.Value, ty: i32, psize: u32) bool {
         }
         dd = dbi.types.at(@int_cast(usize, dd.target));
         dk = dd.kind;
+    }
+    if (dk == dbi.DK_ARRAY) and (k == ir.T_VEC) {
+        return dd.size == t.size;  // (a vector type: its lanes in order, as in memory)
     }
     if (dk != dbi.DK_BASE) and (dk != dbi.DK_POINTER) and (dk != dbi.DK_ENUM) {
         return false;
@@ -315,7 +378,8 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
         return -1;
     }
     VALS.push(Val.{ v: v, def: u.nil.[mc.MInst](), def_op: 0, entry_reg: -1, stack_off: NO_LOC, obj: false, gsym: "",
-                    base: -1, add: 0, phi_blk: -1, phi_ops: u.List.[PhiIn].empty() });
+                    base: -1, add: 0, phi_blk: -1, phi_ops: u.List.[PhiIn].empty(), xop: 0, xa: -1, xb: -1, ca: 0,
+                    cb: 0, bits: 0, abits: 0 });
     let me = @int_cast(i32, VALS.len - 1);
     by_val.put(key(@int_from_ptr(v)), me + 1);
     if vk == ir.V_GLOBAL {
@@ -326,6 +390,9 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
         return me;
     }
     let op = v.op;
+    if depth < 4 {
+        expr_ops(v, me, depth);
+    }
     if op == ir.OP_ALLOCA {
         VALS.at(@int_cast(usize, me)).obj = true;
     } else if (depth < 4) and ((op == ir.OP_PTRADD) or (op == ir.OP_ADD) or (op == ir.OP_SUB)) and u.notnil(v.b) and
@@ -372,6 +439,94 @@ fn val_of(v: *mut ir.Value, depth: i32) i32 {
     return me;
 }
 
+// An integer or pointer value of at most 64 bits (its width, 0: not one).
+fn int_bits(v: *ir.Value) u32 {
+    let t = v.ty;
+    if t.kind == ir.T_PTR {
+        return @truncate(u32, 8 * t.size);
+    }
+    if (t.kind == ir.T_INT) and (t.bits >= 1) and (t.bits <= 64) {
+        return @as(u32, @int_cast(u32, t.bits));
+    }
+    return 0;
+}
+
+// An operand of an expression: its VALS index (-1: a constant, in *c; -2:
+// neither).
+fn expr_operand(o0: *mut ir.Value, depth: i32, c: *mut i64) i32 {
+    let o = ir.resolve(o0);
+    if u.isnil(o) or (int_bits(o) == 0) {
+        return -2;
+    }
+    if (o.kind == ir.V_CINT) or (o.kind == ir.V_ZERO) {
+        let mut x: i64 = 0;
+        if o.kind == ir.V_CINT {
+            x = @bit_cast(i64, ir.cint_val(o));
+            let bits = int_bits(o);
+            if bits < 64 {
+                let sh = 64 - bits;
+                x = (x << sh) >> sh;  // (sign-extended)
+            }
+        }
+        c.* = x;
+        return -1;
+    }
+    if (o.kind != ir.V_INST) and (o.kind != ir.V_PARAM) {
+        return -2;
+    }
+    let k = val_of(o, depth + 1);
+    if k < 0 {
+        return -2;
+    }
+    return k;
+}
+
+// Value v (VALS index me) as an operation on other values and constants,
+// which the debugger computes where no place holds v (expr_of): the
+// integer operations whose low bits the DWARF stack machine's 64-bit
+// arithmetic gives (DWARF 5, 2.5.1.4; narrower values extended where the
+// high bits matter).
+fn expr_ops(v: *mut ir.Value, me: i32, depth: i32) void {
+    let op = v.op;
+    let bits = int_bits(v);
+    if (bits == 0) or u.isnil(v.a) {
+        return;
+    }
+    // (not multiplications: a debugger's DW_OP_mul need not wrap around as
+    // the machine's does)
+    let two = (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR) or
+              (op == ir.OP_SHL) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_PTRADD);
+    let one = (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) or (op == ir.OP_PTRTOINT) or
+              (op == ir.OP_INTTOPTR);
+    if not two and not one {
+        return;
+    }
+    if two and u.isnil(v.b) {
+        return;
+    }
+    let mut ca: i64 = 0;
+    let mut cb: i64 = 0;
+    let xa = expr_operand(v.a, depth, &mut ca);
+    if (xa == -2) or ((xa == -1) and one) {
+        return;
+    }
+    let mut xb: i32 = -1;
+    if two {
+        xb = expr_operand(v.b, depth, &mut cb);
+        if (xb == -2) or ((xa == -1) and (xb == -1)) {
+            return;
+        }
+    }
+    let x = VALS.at(@int_cast(usize, me));
+    x.xop = op;
+    x.xa = xa;
+    x.xb = xb;
+    x.ca = ca;
+    x.cb = cb;
+    x.bits = bits;
+    x.abits = int_bits(ir.resolve(v.a));
+}
+
 // the entities of parameters: at the entry, the parameter (VALS index)
 let mut PENTS: u.List.[[2]i32] = u.List.[[2]i32].{ data: @ptr_from_int(*mut [2]i32, 0), len: 0, cap: 0 };
 
@@ -390,6 +545,8 @@ pub fn begin(f: *mut ir.Func, on: bool) void {
     by_val = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     by_ent = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
+    call_ir = u.SymMap.[usize].{ keys: u.nil.[usize](), vals: u.nil.[usize](), cap: 0, len: 0 };
+    CALLS = u.List.[CallSite].empty();  // (a new one: the last function's stays with it)
     boffs.clear();
     mb_ir.clear();
     pend = 0;
@@ -547,6 +704,16 @@ pub fn selected(i: *ir.Value, b: *mut mc.MBlock, r: i32) void {
         return;
     }
     place(b);
+    if i.op == ir.OP_CALL {
+        // (its machine call: the last instruction of b that calls)
+        let mut m = b.last;
+        while u.notnil(m) and (m.clobber == 0) {
+            m = m.prev;
+        }
+        if u.notnil(m) {
+            call_ir.put(key(@int_from_ptr(m)), @int_from_ptr(i));
+        }
+    }
     let k = by_val.get(key(@int_from_ptr(i)));
     if (k == 0) or (r < 0) {
         return;
@@ -641,20 +808,42 @@ fn move_regs(mf: *mc.MFunc, i: *mc.MInst) [2]i32 {
 // -----------------------------------------------------------------------------
 // The analysis
 // -----------------------------------------------------------------------------
-// Places: the physical registers 0-63, the spill slots 0-63 (64 + slot).
-const NL: usize = 128;
+// Places: the physical registers 0-63, then the frame slots the code
+// spills to or reloads from (64 + their index in SLOTS).
+let mut NL: usize = 64;
+let mut SLOTS: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+const MAX_SLOTS: usize = 448;
+
+// The place of frame slot k (-1: none followed).
+fn slot_place(k: i32) i32 {
+    if k < 0 {
+        return -1;
+    }
+    for j in 0..SLOTS.len {
+        if SLOTS.get(j) == k {
+            return 64 + @int_cast(i32, j);
+        }
+    }
+    return -1;
+}
+
+// The slot of place l (>= 64).
+fn place_slot(l: usize) i32 {
+    return SLOTS.get(l - 64);
+}
 
 // The machine code, flattened: per instruction (in block order), what the
 // analysis needs.
 struct Ins {
     i: *mut mc.MInst,
-    w: u64,      // the registers it writes (allocatable ones)
-    kind: u8,    // 0: other, 1: a spill store, 2: a reload, 3: a copy, 4: an exit, 5: a constant (imm) into d
-    d: i32,      // a copy's, reload's destination (a physical register), a spill store's source
-    s: i32,      // a copy's source register; a spill store's or reload's slot
-    defv: i32,   // the value it makes (a VALS index, -1: none)
-    defr: i32,   // in physical register
-    slots: u64,  // the spill slots it reads or writes otherwise
+    w: u64,       // the registers it writes (allocatable ones)
+    kind: u8,     // 0: other, 1: a spill store, 2: a reload, 3: a copy, 4: an exit, 5: a constant (imm) into d
+    d: i32,       // a copy's, reload's destination (a physical register), a spill store's source
+    s: i32,       // a copy's source register; a spill store's or reload's slot's place (-1: none)
+    defv: i32,    // the value it makes (a VALS index, -1: none)
+    defr: i32,    // in physical register
+    sw: [2]i32,   // the places of the slots it may write otherwise (-1: none)
+    swall: bool,  // (and more: all of them)
     imm: i64,
 }
 
@@ -664,7 +853,11 @@ struct State {
     c: []mut i32,
     d: []mut i32,
     a: []mut i64,
+    x: []mut bool,  // per value: made, and none of the values it is computed from (expr_of) made since
 }
+
+// (the number of values followed: State.x's)
+let mut NX: usize = 0;
 
 // The analysis' tables for the function.
 struct An {
@@ -723,7 +916,7 @@ fn is_held(an: *An, c: i32, d: i32) bool {
 }
 
 fn st_new(ne: usize) State {
-    return State.{ c: u.newn.[i32](NL), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1) };
+    return State.{ c: u.newn.[i32](NL), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1), x: u.newn.[bool](NX + 1) };
 }
 
 fn st_copy(to: *mut State, from: *State, ne: usize) void {
@@ -733,6 +926,9 @@ fn st_copy(to: *mut State, from: *State, ne: usize) void {
     for e in 0..ne {
         to.d[e] = from.d[e];
         to.a[e] = from.a[e];
+    }
+    for k in 0..NX {
+        to.x[k] = from.x[k];
     }
 }
 
@@ -744,6 +940,9 @@ fn st_clear(s: *mut State, ne: usize) void {
         s.d[e] = 0;
         s.a[e] = 0;
     }
+    for k in 0..NX {
+        s.x[k] = false;
+    }
 }
 
 fn st_same(x: *State, y: *State, ne: usize) bool {
@@ -754,6 +953,11 @@ fn st_same(x: *State, y: *State, ne: usize) bool {
     }
     for e in 0..ne {
         if (x.d[e] != y.d[e]) or (x.a[e] != y.a[e]) {
+            return false;
+        }
+    }
+    for k in 0..NX {
+        if x.x[k] != y.x[k] {
             return false;
         }
     }
@@ -897,8 +1101,8 @@ fn step(an: *An, s: *mut State, x: *Ins) void {
     if x.kind == 1 {
         held = get_reg(an, s, x.d);
     } else if x.kind == 2 {
-        if (x.s >= 0) and (x.s < 64) {
-            held = s.c[64 + @int_cast(usize, x.s)];
+        if x.s >= 0 {
+            held = s.c[@int_cast(usize, x.s)];
         }
     } else if x.kind == 3 {
         held = get_reg(an, s, x.s);
@@ -910,16 +1114,19 @@ fn step(an: *An, s: *mut State, x: *Ins) void {
             }
         }
     }
-    if x.slots != 0 {
-        for p in @as(usize, 0)..64 {
-            if (x.slots & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
-                s.c[64 + p] = 0;
-            }
+    for q in @as(usize, 0)..2 {
+        if x.sw[q] >= 0 {
+            s.c[@int_cast(usize, x.sw[q])] = 0;
+        }
+    }
+    if x.swall {
+        for l in 64..NL {
+            s.c[l] = 0;
         }
     }
     if x.kind == 1 {
-        if (x.s >= 0) and (x.s < 64) {
-            s.c[64 + @int_cast(usize, x.s)] = held;
+        if x.s >= 0 {
+            s.c[@int_cast(usize, x.s)] = held;
         }
     } else if (x.kind == 2) or (x.kind == 3) {
         set_reg(an, s, x.d, held);
@@ -944,6 +1151,61 @@ fn step(an: *An, s: *mut State, x: *Ins) void {
             }
         }
         set_reg(an, s, x.defr, id);
+        remade(s, x.defv);
+        s.x[@int_cast(usize, x.defv)] = true;
+    }
+}
+
+// Value k is made (again): the values computed from it are not from this
+// one (State.x).
+fn remade(s: *mut State, k: i32) void {
+    if @int_cast(usize, k) >= DEPS.len {
+        return;
+    }
+    for j in DEPS.get(@int_cast(usize, k)).items() {
+        s.x[@int_cast(usize, j)] = false;
+    }
+}
+
+// each value -> the values computed from it, directly or not (expr_of's)
+let mut DEPS: u.List.[u.List.[i32]] = u.List.[u.List.[i32]].{ data: @ptr_from_int(*mut u.List.[i32], 0), len: 0,
+                                                              cap: 0 };
+
+fn add_deps(k: i32, of: i32, depth: i32) void {
+    if (of < 0) or (depth > 6) {
+        return;
+    }
+    let x = VALS.get(@int_cast(usize, of));
+    if x.xop == 0 {
+        return;
+    }
+    let os: [2]i32 = [x.xa, x.xb];
+    for q in @as(usize, 0)..2 {
+        let o = os[q];
+        if o >= 0 {
+            let l = DEPS.at(@int_cast(usize, o));
+            let mut have = false;
+            for j in l.items() {
+                have = have or (j == k);
+            }
+            if not have {
+                l.push(k);
+            }
+            add_deps(k, o, depth + 1);
+        }
+    }
+}
+
+fn find_deps() void {
+    for k in 0..DEPS.len {
+        DEPS.at(k).deinit();
+    }
+    DEPS.clear();
+    for _k in 0..VALS.len {
+        DEPS.push(u.List.[i32].empty());
+    }
+    for k in 0..VALS.len {
+        add_deps(@int_cast(i32, k), @int_cast(i32, k), 0);
     }
 }
 
@@ -987,17 +1249,19 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
         return;
     }
     let n = ps.len;
+    let pss = ps.items();
     // the entities
-    let rep = u.newn.[i32](an.ne + 1);  // a disagreeing entity's representative (-1: none)
+    let rep = u.newn.[i32](an.ne + 1);      // a disagreeing entity's representative (-1: none)
+    let mut reps = u.List.[usize].empty();  // (the representatives, in order)
     for e in 0..an.ne {
         rep[e] = -1;
-        let d0 = ps.get(0).d[e];
-        let a0 = ps.get(0).a[e];
+        let d0 = pss[0].d[e];
+        let a0 = pss[0].a[e];
         let mut same = not is_syn_of(an, d0, b);
         let mut known = d0 != 0;
         let mut adds = true;
         for j in 1..n {
-            let x = ps.get(j);
+            let x = pss[j];
             if (x.d[e] != d0) or is_syn_of(an, x.d[e], b) {
                 same = false;
             }
@@ -1017,13 +1281,10 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
         }
         // a merge of its own, or of an earlier entity with the same inputs
         let mut r = e;
-        for f in 0..e {
-            if rep[f] != @int_cast(i32, f) {
-                continue;
-            }
+        for f in reps.items() {
             let mut eq = true;
             for j in 0..n {
-                if ps.get(j).d[f] != ps.get(j).d[e] {
+                if pss[j].d[f] != pss[j].d[e] {
                     eq = false;
                 }
             }
@@ -1033,15 +1294,18 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
             }
         }
         rep[e] = @int_cast(i32, r);
+        if r == e {
+            reps.push(e);
+        }
         s.d[e] = syn(an, b, r);
         s.a[e] = a0;
     }
     // the places
     for l in 0..NL {
-        let c0 = ps.get(0).c[l];
+        let c0 = pss[0].c[l];
         let mut same = (c0 != 0) and not is_syn_of(an, c0, b);
         for j in 1..n {
-            if ps.get(j).c[l] != c0 {
+            if pss[j].c[l] != c0 {
                 same = false;
             }
         }
@@ -1049,13 +1313,13 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
             s.c[l] = c0;
             continue;
         }
-        for e in 0..an.ne {
-            if (rep[e] != @int_cast(i32, e)) or (s.d[e] == 0) {
+        for e in reps.items() {
+            if s.d[e] == 0 {
                 continue;
             }
             let mut all = true;
             for j in 0..n {
-                let x = ps.get(j);
+                let x = pss[j];
                 if not is_held(an, x.c[l], x.d[e]) {
                     all = false;
                     break;
@@ -1067,13 +1331,18 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
             }
         }
     }
+    // the values computed from others: so on every path
+    for k in 0..NX {
+        let mut all = true;
+        for j in 0..n {
+            all = all and pss[j].x[k];
+        }
+        s.x[k] = all;
+    }
     // the phis of the block: where each path's input is at its end
     let ib = mb_ir_of(b);
-    for k in 0..VALS.len {
+    for k in PHIS.get(b).items() {
         let x = VALS.at(k);
-        if x.phi_blk != @int_cast(i32, b) {
-            continue;
-        }
         let id = id_val(@int_cast(i32, k));
         let mut ok = u.notnil(ib) and (b != 0);
         let mut at = u.newn.[bool](NL);
@@ -1098,7 +1367,7 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
                 ok = false;
                 break;
             }
-            let ps_j = ps.get(j);
+            let ps_j = pss[j];
             for l in 0..NL {
                 if not is_held(an, ps_j.c[l], inid) {
                     at[l] = false;
@@ -1119,6 +1388,7 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
                 s.d[e] = id;
             }
         }
+        remade(s, @int_cast(i32, k));
         if ok {
             for l in 0..NL {
                 if at[l] {
@@ -1129,7 +1399,12 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
     }
     ps.deinit();
     pb.deinit();
+    reps.deinit();
 }
+
+// each machine block's phis (VALS indexes)
+let mut PHIS: u.List.[u.List.[usize]] = u.List.[u.List.[usize]].{ data: @ptr_from_int(*mut u.List.[usize], 0), len: 0,
+                                                                  cap: 0 };
 
 // The IR block of machine block b (nil: none), through blocks made since
 // with one predecessor.
@@ -1224,6 +1499,18 @@ fn dominators(an: *mut An) void {
 fn flatten(an: *mut An) void {
     let mf = an.mf;
     let t = an.t;
+    // the slots the code spills to and reloads from
+    SLOTS.clear();
+    for bi in 0..an.nb {
+        let mut i = mf.blocks.get(bi).first;
+        while u.notnil(i) {
+            if (i.spill != 0) and (i.sslot >= 0) and (slot_place(i.sslot) < 0) and (SLOTS.len < MAX_SLOTS) {
+                SLOTS.push(i.sslot);
+            }
+            i = i.next;
+        }
+    }
+    NL = 64 + SLOTS.len;
     let mut by_def = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     for k in 0..VALS.len {
         let x = VALS.get(k);
@@ -1238,18 +1525,18 @@ fn flatten(an: *mut An) void {
         let mut i = mf.blocks.get(bi).first;
         while u.notnil(i) {
             an.tails = an.tails or t.is_tail(i);
-            let mut x = Ins.{ i: i, w: written(mf, i) & t.alloc, kind: 0, d: -1, s: -1, defv: -1, defr: -1, slots: 0,
-                              imm: 0 };
+            let mut x = Ins.{ i: i, w: written(mf, i) & t.alloc, kind: 0, d: -1, s: -1, defv: -1, defr: -1,
+                              sw: [-1, -1], swall: false, imm: 0 };
             if t.is_exit(i) {
                 x.kind = 4;
             } else if i.spill == 2 {
                 x.kind = 1;
                 x.d = mc.phys(mf, i.sreg);
-                x.s = i.sslot;
+                x.s = slot_place(i.sslot);
             } else if (i.spill == 1) and (i.sslot >= 0) {
                 x.kind = 2;
                 x.d = mc.phys(mf, i.sreg);
-                x.s = i.sslot;
+                x.s = slot_place(i.sslot);
             } else if i.is_move {
                 let ds = move_regs(mf, i);
                 x.kind = 3;
@@ -1259,10 +1546,18 @@ fn flatten(an: *mut An) void {
                 x.kind = 5;
                 x.d = mc.phys(mf, i.ops[0].reg);
                 x.imm = t.imm_of(i);
-            } else {
+            } else if t.may_store(i) {
+                let mut n: usize = 0;
                 for o in i.ops {
-                    if (o.kind == mc.K_MEM) and (o.slot >= 0) and (o.slot < 64) {
-                        x.slots = x.slots | bit(o.slot);  // (a slot read or written by another: not followed further)
+                    let l = slot_place(o.slot);
+                    if (o.kind == mc.K_MEM) and (l >= 0) {
+                        // (a slot another may write: not followed further)
+                        if n < 2 {
+                            x.sw[n] = l;
+                        } else {
+                            x.swall = true;
+                        }
+                        n += 1;
                     }
                 }
             }
@@ -1285,8 +1580,38 @@ fn flatten(an: *mut An) void {
 
 /// The location pieces of the function's variables, from its machine code
 /// mf (allocated, encoded: block_at, inst_at), `size` bytes of it.
+// debugging: AXIOM_DEBUG_DLOC=<function> (or *) traces the analysis of a
+// function: its entities, values and, per instruction, the state.
+let mut DBGF: bool = false;
 pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     let mut out = u.List.[VLoc].empty();
+    DBGF = u.str_eq(u.env("AXIOM_DEBUG_DLOC"), FN.name) or u.str_eq(u.env("AXIOM_DEBUG_DLOC"), "*");
+    if DBGF {
+        u.eprint(u.f2("func %s nv %s\n", FN.name, u.idec(@int_cast(i32, VALS.len))));
+        for k in 0..VALS.len {
+            let x = VALS.get(k);
+            let mut op: i32 = -1;
+            if x.v.kind == ir.V_INST {
+                op = x.v.op;
+            } else if x.v.kind == ir.V_PARAM {
+                op = -2;
+            }
+            u.eprint(
+                u.f3(
+                    "v%s op=%s ty=%s", u.idec(@int_cast(i32, k) + 1), u.idec(op),
+                    u.idec(@int_cast(i32, @int_from_enum(x.v.ty.kind)))));
+            u.eprint(u.f3(" xop=%s xa=%s xb=%s\n", u.idec(x.xop), u.idec(x.xa + 1), u.idec(x.xb + 1)));
+        }
+    }
+    if DBGF {
+        for e in 0..ENTS.len {
+            let en = ENTS.get(e);
+            let vs = dbi.vars_of(FN.name);
+            if (en.inst == 0) and (@as(usize, en.var) < vs.len) {
+                u.eprint(u.f2("e%s = %s\n", u.idec(@int_cast(i32, e)), vs[@as(usize, en.var)].name));
+            }
+        }
+    }
     if not active or (ENTS.len == 0) {
         return out.items();
     }
@@ -1326,6 +1651,21 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     }
     dominators(&mut an);
     flatten(&mut an);
+    NX = VALS.len;
+    find_deps();
+    for k in 0..PHIS.len {
+        PHIS.at(k).deinit();
+    }
+    PHIS.clear();
+    for _b in 0..(nb + 1) {
+        PHIS.push(u.List.[usize].empty());
+    }
+    for k in 0..VALS.len {
+        let pbk = VALS.get(k).phi_blk;
+        if (pbk >= 0) and (@int_cast(usize, pbk) < nb) {
+            PHIS.at(@int_cast(usize, pbk)).push(k);
+        }
+    }
     // the state at the entry: the parameters in their registers, and the
     // variables they are
     let mut entry = st_new(ne);
@@ -1403,7 +1743,7 @@ fn run_block(an: *An, b: usize, s: *mut State) void {
 fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
     let en = ENTS.get(e);
     let mut r = VLoc.{ var: en.var, poff: en.poff, psize: en.psize, kind: 0xff, start: 0, end: 0, reg: -1, off: 0,
-                       add: s.a[e], size: en.size, ind: en.ind, gsym: "", inst: en.inst };
+                       add: s.a[e], size: en.size, ind: en.ind, gsym: "", inst: en.inst, expr: "" };
     let id = s.d[e];
     if id <= 0 {
         return r;
@@ -1421,7 +1761,19 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
         return r;
     }
     if (id > nv) and (id <= 2 * nv) {
-        return r;  // (waits for its making)
+        // (waits for its making: computed from its operands, if they are
+        // those it will be made from)
+        let k = id - nv - 1;
+        if (VALS.get(@int_cast(usize, k)).xop != 0) and not en.ind and pending_ok(an, k) {
+            let mut ex = u.List.[u8].empty();
+            if expr_op(an, s, k, minus, 0, &mut ex) {
+                r.kind = LK_EXPR;
+                r.expr = ex.items();
+            } else {
+                ex.deinit();
+            }
+        }
+        return r;
     }
     if id <= nv {
         let x = VALS.get(@int_cast(usize, id - 1));
@@ -1457,9 +1809,9 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
         r.reg = best;
         return r;
     }
-    for p in @as(usize, 0)..64 {
-        if s.c[64 + p] == id {
-            let so = an.t.slot_off(@int_cast(i32, p));
+    for p in 64..NL {
+        if s.c[p] == id {
+            let so = an.t.slot_off(place_slot(p));
             if so != NO_LOC {
                 r.kind = LK_SLOT;
                 r.off = so;
@@ -1472,14 +1824,342 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
         if (x.v.kind == ir.V_PARAM) and (x.stack_off != NO_LOC) and not an.tails {
             r.kind = LK_SLOT;
             r.off = x.stack_off;
+            return r;
+        }
+        if (x.v.kind == ir.V_PARAM) and not en.ind {
+            let mut ex = u.List.[u8].empty();
+            if entry_value(an, &x, &mut ex) {
+                r.kind = LK_EXPR;
+                r.expr = ex.items();
+            } else {
+                ex.deinit();
+            }
+            return r;
+        }
+        if (x.xop != 0) and s.x[@int_cast(usize, id - 1)] and not en.ind {
+            let mut ex = u.List.[u8].empty();
+            if expr_of(an, s, id - 1, minus, 0, &mut ex) {
+                r.kind = LK_EXPR;
+                r.expr = ex.items();
+            } else {
+                ex.deinit();
+            }
         }
     }
     return r;
 }
 
+// Call x (at code offset `at`; the next instructions of its block from
+// index g to hi) in state s, before it: a call site.
+fn call_site(an: *An, s: *State, x: *Ins, at: u64, g: usize, hi: usize) void {
+    let tail = an.t.is_tail(x.i);
+    let mut ret: u64 = 0;
+    if not tail {
+        // (the return address: the next instruction's offset)
+        for j in g..hi {
+            let o = offs.get(key(@int_from_ptr(an.ins.get(j).i)));
+            if o != 0 {
+                ret = o - 1;
+                break;
+            }
+        }
+        if ret <= at {
+            return;
+        }
+    }
+    let mut cs = CallSite.{ ret: ret, at: at, tail: tail, sym: -1, tgsym: "", toff: 0,
+                            params: u.nil_slice.[CallParam]() };
+    let i = x.i;
+    if (i.ops.len > 0) and (i.ops[0].kind == mc.K_SYM) {
+        cs.sym = i.ops[0].sym;
+    } else {
+        let c = @ptr_from_int(*mut ir.Value, call_ir.get(key(@int_from_ptr(i))));
+        if u.notnil(c) and u.notnil(c.a) {
+            // (through a pointer loaded from a datum: its address)
+            let t = ir.resolve(c.a);
+            if u.notnil(t) and (t.kind == ir.V_INST) and (t.op == ir.OP_LOAD) and u.notnil(t.a) {
+                let mut a = ir.resolve(t.a);
+                let mut off: i64 = 0;
+                if (a.kind == ir.V_INST) and (a.op == ir.OP_PTRADD) and u.notnil(a.b) and (a.b.kind == ir.V_CINT) {
+                    off = @bit_cast(i64, ir.cint_val(a.b));
+                    a = ir.resolve(a.a);
+                }
+                if a.kind == ir.V_GLOBAL {
+                    let gv = ir.gv_of(a);
+                    if u.notnil(gv) and not gv.tls {
+                        cs.tgsym = gv.name;
+                        cs.toff = off;
+                    }
+                }
+            }
+        }
+    }
+    if not tail {
+        // the arguments in registers, where the caller's frame keeps them
+        let keep = ~(x.w | i.clobber);
+        let mut ps = u.List.[CallParam].empty();
+        for k in 1..i.ops.len {
+            let o = i.ops[k];
+            if (o.kind != mc.K_REG) or (o.role != mc.RU) {
+                continue;
+            }
+            let r = mc.phys(an.mf, o.reg);
+            let dr = an.t.dw_reg(r);
+            let id = get_reg(an, s, r);
+            if (dr < 0) or (dr >= 32) or (id == 0) {
+                continue;  // (integer registers only)
+            }
+            let mut ex = u.List.[u8].empty();
+            let mut ok = false;
+            if id <= -2 {
+                ex.push(OP_CONSTU);
+                put_uleb(&mut ex, @bit_cast(u64, RCS.get(@int_cast(usize, -2 - id))));
+                ok = true;
+            } else if (id > 2 * an.nv) and (@as(i64, id) < an.syn0) {
+                let c = CONSTS.get(@int_cast(usize, id - (2 * an.nv) - 1));
+                ex.push(OP_CONSTU);
+                put_uleb(&mut ex, c.bits);
+                ok = true;
+            } else if (id > 0) and (id <= an.nv) {
+                ok = expr_of(an, s, id - 1, ~keep, 0, &mut ex);
+            }
+            if ok {
+                ps.push(CallParam.{ reg: dr, expr: ex.items() });
+            } else {
+                ex.deinit();
+            }
+        }
+        cs.params = ps.items();
+    }
+    CALLS.push(cs);
+}
+
+// The instruction the locations are found before (ranges: its block and
+// index in an.ins).
+let mut CUR_B: i32 = -1;
+let mut CUR_J: usize = 0;
+
+// Is value k (not made yet) made further on in the block, before which
+// none of the values it is computed from is made again? Then what holds
+// them now holds what it will be made from.
+fn pending_ok(an: *An, k: i32) bool {
+    let ku = @int_cast(usize, k);
+    if (an.defb[ku] != CUR_B) or (CUR_B < 0) or (an.defi[ku] < CUR_J) or (an.defi[ku] > CUR_J + 64) {
+        return false;
+    }
+    for t in CUR_J..an.defi[ku] {
+        let dv = an.ins.get(t).defv;
+        if dv >= 0 {
+            for j in DEPS.get(@int_cast(usize, dv)).items() {
+                if j == k {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// DWARF expression operations (DWARF 5, 7.7.1)
+const OP_CONSTU: u8 = 0x10;
+const OP_CONSTS: u8 = 0x11;
+const OP_DEREF_SIZE: u8 = 0x94;
+const OP_FBREG: u8 = 0x91;
+const OP_BREG0: u8 = 0x70;
+const OP_BREGX: u8 = 0x92;
+const OP_SHL: u8 = 0x24;
+const OP_SHR: u8 = 0x25;
+const OP_SHRA: u8 = 0x26;
+const OP_AND: u8 = 0x1a;
+const OP_CONST1U: u8 = 0x08;
+const OP_ENTRY_VALUE: u8 = 0xa3;
+
+fn put_uleb(o: *mut u.List.[u8], x0: u64) void {
+    let mut x = x0;
+    while true {
+        let b = @truncate(u8, x & 0x7f);
+        x = x >> 7;
+        if x == 0 {
+            o.push(b);
+            return;
+        }
+        o.push(b | 0x80);
+    }
+}
+
+fn put_sleb(o: *mut u.List.[u8], x0: i64) void {
+    let mut x = x0;
+    while true {
+        let b = @truncate(u8, @bit_cast(u64, x) & 0x7f);
+        x = x >> 7;
+        if ((x == 0) and ((b & 0x40) == 0)) or ((x == -1) and ((b & 0x40) != 0)) {
+            o.push(b);
+            return;
+        }
+        o.push(b | 0x80);
+    }
+}
+
+// The top of the stack, its low `bits` bits zero- or sign-extended.
+fn put_ext(o: *mut u.List.[u8], bits: u32, signed: bool) void {
+    if bits >= 64 {
+        return;
+    }
+    if signed {
+        let sh = @as(u8, @truncate(u8, 64 - bits));
+        o.push(OP_CONST1U);
+        o.push(sh);
+        o.push(OP_SHL);
+        o.push(OP_CONST1U);
+        o.push(sh);
+        o.push(OP_SHRA);
+        return;
+    }
+    o.push(OP_CONSTU);
+    put_uleb(o, (@as(u64, 1) << @as(u32, bits)) - 1);
+    o.push(OP_AND);
+}
+
+// Pushes parameter x's value as it arrived, in an integer register: its
+// entry value (DWARF 5, 2.5.1.7), which a debugger finds from the call
+// sites of the callers (call_site).
+fn entry_value(an: *An, x: *Val, out: *mut u.List.[u8]) bool {
+    if x.entry_reg < 0 {
+        return false;
+    }
+    let dr = an.t.dw_reg(x.entry_reg);
+    if (dr < 0) or (dr >= 32) or (int_bits(x.v) == 0) {
+        return false;
+    }
+    out.push(OP_ENTRY_VALUE);
+    out.push(1);
+    out.push(0x50 + @truncate(u8, @as(u32, @bit_cast(u32, dr))));  // (DW_OP_regN)
+    return true;
+}
+
+// Pushes value k's operand (VALS index o, or the constant c).
+fn put_operand(an: *An, s: *State, o: i32, c: i64, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+    if o < 0 {
+        out.push(OP_CONSTS);
+        put_sleb(out, c);
+        return true;
+    }
+    return expr_of(an, s, o, minus, depth + 1, out);
+}
+
+// Pushes value k (a VALS index) in state s, but in registers `minus`: from
+// a register or spill slot that holds it, or (a value of expr_ops, none
+// of whose operands was made again since it was: State.x) computed from
+// its operands. False if it cannot be.
+fn expr_of(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+    let id = id_val(k);
+    let x = VALS.get(@int_cast(usize, k));
+    let ib = int_bits(x.v);
+    if ib == 0 {
+        return false;
+    }
+    let nbytes = (ib + 7) / 8;
+    for p in @as(usize, 0)..64 {
+        if (s.c[p] == id) and ((minus & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) == 0) {
+            let dr = an.t.dw_reg(@int_cast(i32, p));
+            if (dr >= 0) and (dr < 32) {
+                out.push(OP_BREG0 + @truncate(u8, @as(u32, @bit_cast(u32, dr))));
+                put_sleb(out, 0);
+                return true;
+            }
+        }
+    }
+    for p in 64..NL {
+        if s.c[p] == id {
+            let so = an.t.slot_off(place_slot(p));
+            if so != NO_LOC {
+                out.push(OP_FBREG);
+                put_sleb(out, so);
+                out.push(OP_DEREF_SIZE);
+                out.push(@truncate(u8, nbytes));
+                return true;
+            }
+        }
+    }
+    if x.obj {
+        let o = an.t.obj_off(x.v);
+        if o == NO_LOC {
+            return false;
+        }
+        out.push(OP_FBREG);
+        put_sleb(out, o);
+        return true;
+    }
+    if x.v.kind == ir.V_PARAM {
+        if (x.stack_off != NO_LOC) and not an.tails {
+            out.push(OP_FBREG);
+            put_sleb(out, x.stack_off);
+            out.push(OP_DEREF_SIZE);
+            out.push(@truncate(u8, nbytes));
+            return true;
+        }
+        return entry_value(an, &x, out);
+    }
+    if (x.xop == 0) or (depth >= 4) or not s.x[@int_cast(usize, k)] {
+        return false;
+    }
+    return expr_op(an, s, k, minus, depth, out);
+}
+
+// Pushes value k (of expr_ops) computed from its operands.
+fn expr_op(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.[u8]) bool {
+    let x = VALS.get(@int_cast(usize, k));
+    let op = x.xop;
+    if not put_operand(an, s, x.xa, x.ca, minus, depth, out) {
+        return false;
+    }
+    if op == ir.OP_ZEXT {
+        put_ext(out, x.abits, false);
+        return true;
+    }
+    if op == ir.OP_SEXT {
+        put_ext(out, x.abits, true);
+        return true;
+    }
+    if (op == ir.OP_TRUNC) or (op == ir.OP_PTRTOINT) or (op == ir.OP_INTTOPTR) {
+        return true;  // (the low bits: the debugger reads the variable's bytes)
+    }
+    if op == ir.OP_LSHR {
+        put_ext(out, x.bits, false);
+    } else if op == ir.OP_ASHR {
+        put_ext(out, x.bits, true);
+    }
+    if not put_operand(an, s, x.xb, x.cb, minus, depth, out) {
+        return false;
+    }
+    if (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_SHL) {
+        put_ext(out, x.bits, false);  // (the count: what the instruction read of it)
+    }
+    let mut code: u8 = OP_SHRA;
+    if (op == ir.OP_ADD) or (op == ir.OP_PTRADD) {
+        code = 0x22;
+    } else if op == ir.OP_SUB {
+        code = 0x1c;
+    } else if op == ir.OP_MUL {
+        code = 0x1e;
+    } else if op == ir.OP_AND {
+        code = OP_AND;
+    } else if op == ir.OP_OR {
+        code = 0x21;
+    } else if op == ir.OP_XOR {
+        code = 0x27;
+    } else if op == ir.OP_SHL {
+        code = OP_SHL;
+    } else if op == ir.OP_LSHR {
+        code = OP_SHR;
+    }
+    out.push(code);
+    return true;
+}
+
 fn same_loc(a: *VLoc, b: *VLoc) bool {
     return (a.kind == b.kind) and (a.reg == b.reg) and (a.off == b.off) and (a.add == b.add) and (a.size == b.size) and
-           (a.gsym.ptr == b.gsym.ptr);
+           (a.gsym.ptr == b.gsym.ptr) and u.str_eq(a.expr, b.expr);
 }
 
 // The locations of every entity from code offset `at` on (in state s, but
@@ -1488,6 +2168,9 @@ fn same_loc(a: *VLoc, b: *VLoc) bool {
 // out + 1, 0: none open).
 fn emit_at(an: *An, s: *State, minus: u64, none: bool, at: u64, open: []mut usize, out: *mut u.List.[VLoc]) void {
     for e in 0..an.ne {
+        if (s.d[e] <= 0) and (open[e] == 0) {
+            continue;  // (not known, and no piece open: none still)
+        }
         let mut prefer: i32 = -1;
         if (open[e] != 0) and (out.at(open[e] - 1).kind == LK_REG) {
             prefer = out.at(open[e] - 1).reg;
@@ -1540,6 +2223,7 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
     }
     let mut s = st_new(ne);
     // (the code before the first block's: the prologue, at the entry)
+    CUR_B = -1;
     emit_at(an, entry, 0, false, 0, open, out);
     let mut last: u64 = 0;
     for k in 0..nb {
@@ -1561,15 +2245,32 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
                 break;
             }
         }
+        CUR_B = @int_cast(i32, b);
+        CUR_J = lo;
         if (bo >= last) and ((first == 0xffff_ffff_ffff_ffff) or (bo < first)) {
             emit_at(an, &s, 0, unreached, bo, open, out);
             last = bo;
+        }
+        if DBGF {
+            u.eprint(u.f2("block %s at %s\n", u.idec(@int_cast(i32, b)), u.hex16(bo)));
         }
         let mut j = lo;
         while j < hi {
             let x = an.ins.at(j);
             if x.i.mk != 0 {
                 apply_marks(an, &mut s, x.i.mk, @int_cast(i32, b), j);
+            }
+            if DBGF {
+                let mut t = u.f2("  %s k%s", u.hex16(offs.get(key(@int_from_ptr(x.i)))), u.idec(@as(i32, x.kind)));
+                for e in 0..ne {
+                    t = u.f3("%s e%s=%s", t, u.idec(@int_cast(i32, e)), u.idec(s.d[e]));
+                }
+                for l in 0..NL {
+                    if s.c[l] != 0 {
+                        t = u.f3("%s p%s:%s", t, u.idec(@int_cast(i32, l)), u.idec(s.c[l]));
+                    }
+                }
+                u.eprint(u.f1("%s\n", t));
             }
             let o = offs.get(key(@int_from_ptr(x.i)));
             if o != 0 {
@@ -1582,9 +2283,21 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
                     exit = exit or (an.ins.get(g).kind == 4);
                     g += 1;
                 }
+                // (one machine instruction: a debugger stops at its start,
+                // before it writes its registers, and nowhere else in it)
+                if (g == j + 1) and (g < hi) and (x.i.clobber == 0) {
+                    let nx = offs.get(key(@int_from_ptr(an.ins.get(g).i)));
+                    if (nx > o) and an.t.single(x.i, nx - o) {
+                        minus = 0;
+                    }
+                }
                 if o - 1 >= last {
+                    CUR_J = j;
                     emit_at(an, &s, minus, exit or unreached, o - 1, open, out);
                     last = o - 1;
+                }
+                if ((x.i.clobber != 0) or an.t.is_tail(x.i)) and not unreached {
+                    call_site(an, &s, x, o - 1, g, hi);
                 }
             }
             step(an, &mut s, x);
