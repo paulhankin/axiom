@@ -40,7 +40,14 @@
 // copies the template for every thread, using the record that ax_tls_info()
 // returns: [the slot's byte offset (axiom.tls_key, which the runtime sets),
 // the template's address, its initialized size, the block's size, its
-// alignment].
+// alignment]. That is --macos-tls=fast, the default; with
+// --macos-tls=platform (and in objects for the platform's toolchain) the
+// thread-locals are the platform's (isel.ax platform_tlv): descriptors in
+// __thread_vars, whose thunk dyld sets and which makes each thread's block
+// (C_TLV below), the code calling the thunk; the runtime's block is then
+// empty. A link may have both, each variable reached by its own scheme's
+// code; a reference of one scheme's code to the other's variable is an
+// error (tls_scheme_check).
 // =============================================================================
 import "bin.ax" as bn;
 import "elf.ax" as elf;
@@ -143,10 +150,63 @@ fn is_abs64(ty: u32) bool {
     return ty == elf.R_AARCH64_ABS64;
 }
 
-// A thread-local descriptor reference (@TLVPPAGE / @TLVPPAGEOFF): a GOT
-// slot holding the descriptor's address.
+// A thread-local descriptor reference (@TLVPPAGE / @TLVPPAGEOFF, x86-64's
+// sym@TLVP): a GOT slot holding the descriptor's address, or the
+// descriptor itself (tlvp_reloc).
 fn is_tlvp(ty: u32) bool {
-    return (ty == elf.R_AARCH64_AXIOM_TLVP_PAGE) or (ty == elf.R_AARCH64_AXIOM_TLVP_PAGEOFF);
+    return (ty == elf.R_AARCH64_AXIOM_TLVP_PAGE) or (ty == elf.R_AARCH64_AXIOM_TLVP_PAGEOFF) or
+           (ty == elf.R_X86_64_AXIOM_TLV);
+}
+
+// The class of the section that defines symbol si of object oi (-1: none, an import).
+fn def_class(oi: usize, si: u32) i32 {
+    let gi = nl.global_of(oi, si);
+    let mut o = oi;
+    let mut k = si;
+    if gi >= 0 {
+        let g = nl.gsyms.at(@int_cast(usize, gi));
+        if g.obj < 0 {
+            return -1;
+        }
+        o = @as(usize, @bit_cast(u32, g.obj));
+        k = g.sym;
+    }
+    let sy = nl.objs.get(o).syms.get(@as(usize, k));
+    if sy.sec < 0 {
+        return -1;
+    }
+    return nl.sec_cls.get(o)[@as(usize, @bit_cast(u32, sy.sec))];
+}
+
+let mut tls_reported: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0),
+                                                        vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+// A reference of one thread-local scheme's code (TLVP: the platform's
+// descriptors; else the runtime's block of --macos-tls=fast) to a variable
+// of the other: an error, which says how to build the objects alike.
+fn tls_scheme_check(oi: usize, si: u32, tlvp: bool) bool {
+    let c = def_class(oi, si);
+    let fast = (c == nl.C_TDATA) or (c == nl.C_TBSS);
+    let n = nl.objs.get(oi).syms.get(@as(usize, si)).name;
+    // (once for each variable: its code has two relocations, high and low)
+    let key = u.intern(n);
+    if tls_reported.get(key) != 0 {
+        return false;
+    }
+    if (tlvp and fast) or (not tlvp and not fast) {
+        tls_reported.put(key, 1);
+    }
+    if tlvp and fast {
+        nl.err(u.f2("%s reaches thread-local '%s' by its descriptor, but it is one of --macos-tls=fast's: build that code with --macos-tls=platform",
+                    nl.obj_name(oi), n));
+        return false;
+    }
+    if not tlvp and not fast {
+        nl.err(u.f2("%s reaches thread-local '%s' in the runtime's block (--macos-tls=fast), but it is the platform's (a descriptor: of --macos-tls=platform, --emit=obj, a library or the platform's compilers): build that code with --macos-tls=platform",
+                    nl.obj_name(oi), n));
+        return false;
+    }
+    return true;
 }
 
 // The platform's thread-local variables, of the platform toolchain's
@@ -189,13 +249,14 @@ fn class_of(s: *elf.Sec) i32 {
     if u.str_eq(s.name, ".compact_unwind") {
         return C_CU;
     }
-    if u.str_eq(s.name, ".macho.thread_vars") {
+    // (and .macho.thread_vars.<name> ..., of --data-sections)
+    if u.starts(s.name, ".macho.thread_vars") {
         return C_TLV;
     }
-    if u.str_eq(s.name, ".macho.thread_data") {
+    if u.starts(s.name, ".macho.thread_data") {
         return C_TLV_DATA;
     }
-    if u.str_eq(s.name, ".macho.thread_bss") {
+    if u.starts(s.name, ".macho.thread_bss") {
         return C_TLV_BSS;
     }
     if g_dylib and (s.kind == elf.S_DATA) and u.starts(s.name, ".init_array") {
@@ -414,7 +475,23 @@ fn scan_relocs() void {
                 continue;  // (nl.debug_sections; unwind_entries)
             }
             for r in s.relocs.items() {
-                if nl.is_got_reloc(X64, r.ty) or is_tlvp(r.ty) {
+                if is_tlvp(r.ty) {
+                    // a descriptor: the image's own (reached directly), or a
+                    // library's, from its GOT slot
+                    if is_import(oi, r.sym) {
+                        let n = o.syms.get(@as(usize, r.sym)).name;
+                        if (import_ord.get(u.intern(n)) == 0) and not flat and
+                           (r.ty != elf.R_AARCH64_AXIOM_TLVP_PAGEOFF) {
+                            nl.err(u.f1("undefined thread-local '%s' (no library given to the link defines it)", n));
+                        }
+                        _ = nl.got_slot(oi, r.sym);
+                    } else if r.ty != elf.R_AARCH64_AXIOM_TLVP_PAGEOFF {
+                        _ = tls_scheme_check(oi, r.sym, true);
+                    }
+                } else if (X64 and (r.ty == elf.R_X86_64_TPOFF32)) or (not X64 and nl.is_a64_tls(r.ty)) {
+                    // (an offset in the runtime's block: the --macos-tls=fast code's)
+                    _ = tls_scheme_check(oi, r.sym, false);
+                } else if nl.is_got_reloc(X64, r.ty) {
                     _ = nl.got_slot(oi, r.sym);
                 } else if is_import(oi, r.sym) {
                     if nl.is_call_reloc(X64, r.ty) {
@@ -491,17 +568,7 @@ fn apply_relocs(b: []mut u8) void {
                     sv = stub_addr + (@as(u64, @bit_cast(u32, g.stub)) * stub_size());
                 }
                 if is_tlvp(t) {
-                    // @TLVPPAGE / @TLVPPAGEOFF: a GOT slot holding the
-                    // thread-local's descriptor address (bound or rebased
-                    // like an ordinary data address); the code loads the
-                    // descriptor, calls its thunk and reads tpidrro (as the
-                    // platform toolchain does)
-                    let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, r.sym))) * 8);
-                    if t == elf.R_AARCH64_AXIOM_TLVP_PAGE {
-                        nl.a64_got(b, fo, p, elf.R_AARCH64_ADR_GOT_PAGE, ga);
-                    } else {
-                        nl.a64_got(b, fo, p, elf.R_AARCH64_LD64_GOT_LO12_NC, ga);
-                    }
+                    tlvp_reloc(b, fo, p, t, oi, r.sym, imp, sv, r.addend);
                     continue;
                 }
                 if nl.is_got_reloc(X64, t) {
@@ -543,6 +610,44 @@ fn apply_relocs(b: []mut u8) void {
             }
         }
     }
+}
+
+// A thread-local descriptor reference at p (file offset fo): of a
+// descriptor of the image (sv, ours or a platform object's), the address
+// itself, the GOT load relaxed as the platform's linker relaxes it (arm64:
+// the page's ldr becomes an add; x86-64: movq becomes leaq); of a
+// library's, its GOT slot, which dyld binds.
+fn tlvp_reloc(b: []mut u8, fo: u64, p: u64, t: u32, oi: usize, sym: u32, imp: bool, sv: u64, addend: i64) void {
+    let mut target = sv;
+    if imp {
+        target = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot(oi, sym))) * 8);
+    }
+    if t == elf.R_X86_64_AXIOM_TLV {
+        if not imp {
+            if (fo < 2) or (b[@truncate(usize, fo - 2)] != 0x8b) {
+                nl.err("sym@TLVP outside a movq (the descriptor's address is loaded into a register)");
+                return;
+            }
+            b[@truncate(usize, fo - 2)] = 0x8d;  // movq -> leaq
+        }
+        rel32(b, fo, p, target +% @bit_cast(u64, addend));
+        return;
+    }
+    if t == elf.R_AARCH64_AXIOM_TLVP_PAGE {
+        nl.a64_adrp(b, fo, p, target);
+        return;
+    }
+    if not imp {
+        // ldr xt, [xn, #off] (64-bit, unsigned offset) -> add xt, xn, #off
+        let w = bn.rd32(b, @truncate(usize, fo));
+        if (w & 0xffc0_0000) != 0xf940_0000 {
+            nl.err("@TLVPPAGEOFF outside a 64-bit ldr (the descriptor's address is loaded from its GOT slot)");
+            return;
+        }
+        bn.w32(b, fo, 0x9100_0000 | (w & 0x3ff) | ((target & 0xfff) << 10));
+        return;
+    }
+    nl.a64_imm12(b, fo, (target & 0xfff) >> 3);
 }
 
 // A 32-bit displacement at p (file offset fo) to target (x86-64: from the
@@ -952,6 +1057,7 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     nl.g_gc_exports = g_dylib;  // (--gc-sections: a library's exports are kept)
     dylibs = u.List.[[]u8].empty();
     import_ord = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    tls_reported = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     nl.objs.push(leaf_entries(own_object()));  // (its ax_tls_info: a leaf)
     if not g_dylib {
         nl.objs.push(leaf_entries(jstub.build(machine(), false)));  // (C's setjmp and longjmp)

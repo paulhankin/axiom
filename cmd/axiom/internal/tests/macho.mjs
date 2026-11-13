@@ -6,7 +6,8 @@
 // signature; and the code's links: every stub jumps through a __got slot
 // that dyld binds, and every call that the frame table records (each one's
 // return address) goes to a function's start (a symbol) or a stub (on arm64
-// every bl in __text, too); and the unwind tables (checkUnwind).
+// every bl in __text, too); the unwind tables (checkUnwind); and the
+// thread-local variables, which are the platform's (checkTLV).
 // Returns a list of problems (empty when the file is sound) and a summary.
 import crypto from 'node:crypto';
 
@@ -35,7 +36,7 @@ export function checkMachO(d, opts = {}) {
         const so = off + 72 + 80 * k;
         const sn = str(so, 16), sg = str(so + 16, 16);
         const addr = u64(so + 32), ssize = u64(so + 40), soff = u32(so + 48), salign = u32(so + 52), zerofill = [1, 0xc, 0x12].includes(u32(so + 64) & 0xff);
-        sects.push({ sn, addr, ssize, soff });
+        sects.push({ sn, addr, ssize, soff, flags: u32(so + 64) });
         if (sg !== name) E(`section ${sn} has segment name ${sg} in ${name}`);
         if (addr < vmaddr || addr + ssize > vmaddr + vmsize) E(`section ${sn} lies outside its segment`);
         if (!zerofill && ssize && (soff < fileoff || soff + ssize > fileoff + filesize || soff - fileoff !== addr - vmaddr)) E(`section ${sn} file offset disagrees with its address`);
@@ -83,7 +84,7 @@ export function checkMachO(d, opts = {}) {
   let ndylibs = 0;
   for (let k = 0, o = 32; k < ncmds; k++) { if (u32(o) === 0xc) ndylibs++; o += u32(o + 4); }
   let nbinds = 0;
-  const bound = new Set();
+  const bound = new Set(), bindNames = new Map();
   for (let s = { i: bo }, name = '', seg = 0, so = 0; s.i < bo + bs;) {
     const b = d[s.i++], op = b & 0xf0, imm = b & 0xf;
     if (op === 0x00) continue;
@@ -100,6 +101,7 @@ export function checkMachO(d, opts = {}) {
       if (!name.startsWith('_')) E(`bind name ${name} lacks the leading underscore`);
       if (rebased.has(`${seg}:${so}`)) E(`${name} is both rebased and bound`);
       bound.add(data.vmaddr + so);
+      bindNames.set(data.vmaddr + so, name);
       so += 8;
     } else { E(`unexpected bind opcode ${op.toString(16)}`); break; }
   }
@@ -150,8 +152,9 @@ export function checkMachO(d, opts = {}) {
   if (bad) E(`${bad} page hashes are wrong`);
   const links = checkLinks(d, { x64, E, tsect, text, bound, defined, starts });
   const unwind = checkUnwind(d, { x64, E, sects, text, tsect, starts, stubs: links.stubAddrs });
+  const tlv = checkTLV(d, { x64, E, sects, data, tsect, rebased, bindNames, flags: u32(24), platform: opts.platformTLS });
   delete links.stubAddrs;
-  return { errs, imports: names.slice(iu), rebases: rebased.size, binds: nbinds, pages: ncode, ...links, unwind };
+  return { errs, imports: names.slice(iu), rebases: rebased.size, binds: nbinds, pages: ncode, ...links, unwind, tlv };
 }
 
 // The stubs at the end of __text (adrp x16, ldr x16, br x16 on arm64; jmp
@@ -334,4 +337,43 @@ function checkUnwind(d, { x64, E, sects, text, tsect, starts, stubs }) {
   }
   if (end > stubLo - base) E('__unwind_info covers the stubs');
   return { entries: ents.length, dwarf, none, funcs, fdes: fdes.size };
+}
+
+// The thread-local variables (mlink.ax): __thread_vars, __thread_data and
+// __thread_bss of their types, in that order, the template's two parts
+// adjacent, MH_HAS_TLV_DESCRIPTORS in the header; each descriptor three
+// words: its thunk bound to __tlv_bootstrap (dyld replaces it), a zero key,
+// the variable's offset in the template (neither rebased); and with
+// opts.platformTLS (a program of --macos-tls=platform) nothing of the
+// runtime's scheme in the code (arm64: no read of TPIDRRO_EL0, the TSD
+// slots). Returns the number of descriptors.
+function checkTLV(d, { x64, E, sects, data, tsect, rebased, bindNames, flags, platform }) {
+  const vars = sects.find((s) => s.sn === '__thread_vars');
+  const tdata = sects.find((s) => s.sn === '__thread_data'), tbss = sects.find((s) => s.sn === '__thread_bss');
+  if (!x64 && platform) {
+    for (let o = tsect.soff; o + 4 <= tsect.soff + tsect.ssize; o += 4) {
+      if (((d.readUInt32LE(o) & 0xffffffe0) >>> 0) === 0xd53bd060) { E(`mrs of TPIDRRO_EL0 at ${(tsect.addr + o - tsect.soff).toString(16)}`); break; }
+    }
+  }
+  if (!vars) {
+    if (tdata || tbss || (flags & 0x800000)) E('thread-local sections or MH_HAS_TLV_DESCRIPTORS without __thread_vars');
+    return 0;
+  }
+  if (!(flags & 0x800000)) E('__thread_vars without MH_HAS_TLV_DESCRIPTORS');
+  if ((vars.flags & 0xff) !== 0x13) E('__thread_vars is not S_THREAD_LOCAL_VARIABLES');
+  if (!tdata || (tdata.flags & 0xff) !== 0x11) E('__thread_data is missing or not S_THREAD_LOCAL_REGULAR');
+  if (!tbss || (tbss.flags & 0xff) !== 0x12) E('__thread_bss is missing or not S_THREAD_LOCAL_ZEROFILL');
+  if (!tdata || !tbss) return 0;
+  if (tbss.addr < tdata.addr + tdata.ssize || tbss.addr - (tdata.addr + tdata.ssize) >= 4096) E('the template\'s parts are not adjacent');
+  const tsize = tbss.addr + tbss.ssize - tdata.addr;
+  if (vars.ssize % 24) E('__thread_vars is not a whole number of descriptors');
+  const n = vars.ssize / 24, segOff = (a) => a - data.vmaddr;
+  for (let k = 0; k < n; k++) {
+    const a = vars.addr + 24 * k, fo = vars.soff + 24 * k;
+    if (bindNames.get(a) !== '__tlv_bootstrap') E(`descriptor ${k}'s thunk is not bound to __tlv_bootstrap`);
+    if (Number(d.readBigUInt64LE(fo + 8)) !== 0) E(`descriptor ${k}'s key is not 0`);
+    if (Number(d.readBigUInt64LE(fo + 16)) >= Math.max(tsize, 1)) E(`descriptor ${k}'s offset is outside the template`);
+    for (const w of [0, 8, 16]) if (rebased.has(`2:${segOff(a + w)}`)) E(`descriptor ${k}'s word ${w / 8} is rebased`);
+  }
+  return n;
 }

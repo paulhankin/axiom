@@ -1,12 +1,9 @@
 // The shared library: data with addresses, a function pointer, a
-// thread-local (Windows: the DLL's TLS directory), a constructor.
+// thread-local (Windows: the DLL's TLS directory; macOS: its __thread_vars),
+// a constructor.
 int counter = 5;
 static int calls;
-#ifdef _WIN32
 _Thread_local int tcount = 100;
-#else
-int tcount = 100;  // (a macOS dynamic library has no thread-locals of this compiler's)
-#endif
 const char *names[] = {"zero", "one", "two"};
 
 static int twice(int x) { return 2 * x; }

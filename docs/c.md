@@ -555,12 +555,14 @@ The objects are in the target's format (`--emit=obj`, `--emit=lib`):
   an atom; a reference into an atom is to its symbol plus an offset), `LC_BUILD_VERSION`
   (macOS 11.0), the names of C with the underscore, `__start_X`/`__stop_X` as the system
   linker's `section$start$__DATA$X` and `section$end$__DATA$X`, hidden symbols private
-  externs (`N_PEXT`), weak definitions `N_WEAK_DEF`, weak references `N_WEAK_REF`. The
-  thread-locals of this compiler (an offset in the block the runtime makes: they are not
-  the platform's thread-local variables) are in `__DATA,__axiom_tdata` and
-  `__DATA,__axiom_tbss`, and their offsets' relocations have type numbers Mach-O leaves
-  unused (arm64 14 and 15, x86-64 15), which only this compiler's linker reads: the
-  system's refuses an object that uses them.
+  externs (`N_PEXT`), weak definitions `N_WEAK_DEF`, weak references `N_WEAK_REF`.
+  Thread-locals are the platform's thread-local variables, as its compilers write them
+  (an object implies `--macos-tls=platform`: "Thread-locals" below): the variable's symbol is its descriptor in `__DATA,__thread_vars` (three words,
+  relocated to `__tlv_bootstrap` and to the local `<name>$tlv$init`), its initial value
+  in `__DATA,__thread_data` or `__thread_bss`, and code reaches the descriptor with
+  `ARM64_RELOC_TLVP_LOAD_PAGE21`/`_PAGEOFF12` (x86-64: `X86_64_RELOC_TLV`) and calls
+  its first word, which returns the variable's address. The system's linker links them
+  with the platform's objects, and this compiler's linker the platform's with ours.
 - **COFF** (`coff.ax`): `.text`, `.rdata`, `.data`, `.bss`, `.tls$` (the thread-local
   template, the zero-filled part as zeros), `.pdata` and `.xdata`, `.CRT$XCU` (`.CRT$XCT<NNNNN>`
   for a priority) and `.CRT$XTT<65535 - priority>` (`.CRT$XTT00000` without one: the C
@@ -580,8 +582,7 @@ suite's `c/objfmt` tests link them). An object of C units alone has no runtime: 
 by the system's toolchain into a C program (whose C library is the system's), it may use
 only the standard's functions and objects; one that uses this library's private names
 (the macros of `<stdio.h>` for `stdin`, `stdout`, `stderr`, `getc` and `putc`, `errno`'s,
-... `__axc_*` names) needs this library, and on macOS one with thread-locals needs this
-compiler's linker (above). Objects with Axiom modules carry the runtime, which this
+... `__axc_*` names) needs this library. Objects with Axiom modules carry the runtime, which this
 compiler's linkers link.
 
 ### Shared libraries
@@ -612,8 +613,9 @@ thread-local blocks), so Axiom modules and the default C library are an error (`
 - **Mach-O** (`libprog.dylib`; `mlink.ax`): `MH_DYLIB`, its install name
   `@rpath/libprog.dylib`, an export trie of its definitions of default visibility,
   `__mod_init_func` and `__mod_term_func` (dyld runs them), rebase and bind information as
-  for an executable, ad-hoc signed. Thread-locals of this compiler are an error there
-  (the runtime that makes their blocks is an executable's). Built and checked only: nothing
+  for an executable, ad-hoc signed; its thread-locals are the platform's (`--emit=shared`
+  implies `--macos-tls=platform`; dyld makes their blocks), and those it exports are its
+  descriptors. Built and checked only: nothing
   here runs macOS.
 
 ### Code in sections
@@ -1860,8 +1862,11 @@ no other tool is needed:
   `:tlsldm_lo12_nc:` (local dynamic's module: `adrp`/`add` or `adr`, then `bl
   __tls_get_addr`); the
   Mach-O spellings `sym@PAGE`, `@PAGEOFF`, `@GOTPAGE`, `@GOTPAGEOFF` (the same
-  relocations) and `@TLVPPAGE`/`@TLVPPAGEOFF` (a thread-local's descriptor, a GOT slot
-  holding the descriptor's address, as the platform toolchain addresses one), and
+  relocations) and `@TLVPPAGE`/`@TLVPPAGEOFF` (a thread-local's descriptor, as the
+  platform toolchain addresses one: `adrp` and a 64-bit `ldr` of a GOT slot holding its
+  address, which the linker makes an `add` of the descriptor itself where the variable is
+  the image's own; a variable of `--macos-tls=platform`, a library's or the platform's
+  compilers': of the default scheme's, a link error), and
   COFF's `:secrel_lo12:`/`:secrel_hi12:` (a thread-local's offset in
   its block). `adr`, `adrp`, `b`, `bl`, `b.cond`, `cbz`, `cbnz`, `tbz`, `tbnz`, `prfm`
   and literal loads reach symbols of other sections and units (and `adrp`/`adr` labels
@@ -2025,7 +2030,9 @@ no other tool is needed:
   `.comm`, `.lcomm`, `.incbin` (within the include directories). Labels: `name:` and
   numeric local labels (`1:`, `1b`, `1f`).
   Relocations: x86-64 rel32 calls and jumps to symbols (`@PLT`), `sym(%rip)`
-  (`@GOTPCREL`), absolute 32- and 64-bit addresses; AArch64's operators above,
+  (`@GOTPCREL`), on macOS `sym@TLVP(%rip)` in a `movq` (a thread-local's descriptor,
+  which the linker makes a `leaq` for the image's own), absolute 32- and 64-bit
+  addresses; AArch64's operators above,
   `.quad` and `.word` of addresses. `.file`, `.loc`, `.ident`, `.arch` and the like are
   accepted and do nothing. An instruction, operand form or directive that is not
   supported is C3097, naming it, at the statement.
@@ -2432,10 +2439,40 @@ operations are ordinary loads and stores.
 with the object's initial value (which may hold addresses). On Linux they are ELF TLS
 (local-exec, so in an executable or an object linked into one); the system C library's
 threads and the runtime's each get their copies. On Windows they are in the image's TLS
-directory, so every thread has them. On macOS they are the runtime's thread-local
-block, which the main thread and the runtime's threads have: every thread of
-`thrd_create` is one of the runtime's (a thread something else creates, such as the
-system's C code with `pthread_create`, has none). On WebAssembly, in a program
+directory, so every thread has them. On macOS there are two schemes, chosen with
+`--macos-tls=fast|platform`:
+
+- `fast`, the default (and what has run on Macs): the runtime's thread-local block, an
+  offset in a block whose address is in the TSD slot of the runtime's pthread key (arm64:
+  `mrs` of `TPIDRRO_EL0`; x86-64: `gs`), about five instructions an access. The main
+  thread and the runtime's threads have it: every thread of `thrd_create` is one of the
+  runtime's (a thread something else creates, such as the system's C code with
+  `pthread_create`, has none).
+- `platform`: the platform's thread-local variables (descriptors in `__thread_vars`,
+  whose thunk, dyld's, makes a thread's block when the thread first uses one: every
+  thread has them, those of `pthread_create` too, and they interoperate with the
+  platform's objects and libraries both ways). Code finds one by calling the thunk
+  (arm64: `adrp`/`ldr` of the descriptor's address, which the linker makes an `add` for
+  the image's own, and `blr` through its first word; x86-64: `movq v@TLVP(%rip), %rdi`
+  made a `leaq`, and `call *(%rdi)`). **It has never been executed**: it is built and
+  checked here against the platform's object formats, linker and debug information,
+  and nothing here runs macOS. It assumes that the thunk changes no register but x0, x16,
+  x17, the link register and the flags on arm64 (x9 is saved too), and none but rax, rdi
+  and the flags on x86-64, as the platform's compilers' code does; the code saves what
+  else could change around the call, 160 (x86-64: 136 and 24) bytes below the stack
+  pointer. An access costs about 14 instructions and the thunk's call (the thunk's fast
+  path is a few more), against `fast`'s five. A function without a frame of its own that
+  reaches a thread-local cannot be unwound past while the thunk runs (a profiler's
+  sample there). The default may become `platform` once it has run on a Mac.
+
+`--emit=obj`, `--emit=lib` and `--emit=shared` for macOS imply `platform` (their output
+is the platform toolchain's to link, or a library's, whose thread-locals the runtime
+cannot make). A link may have objects of both schemes, each variable reached by its own
+scheme's code; code of one scheme reaching a variable of the other (a `fast` program's
+code using an object's or a library's thread-local, a descriptor reference to a `fast`
+variable) is a link error that says to build with `--macos-tls=platform`, as is an
+undefined thread-local reached by its descriptor that no library given to the link can
+define. On WebAssembly, in a program
 without threads they are ordinary globals; with threads, each thread's start makes its
 block of them. `--emit=obj` objects for WebAssembly have them as ordinary globals.
 The GNU dialects' `__thread` is `_Thread_local`.
@@ -2773,10 +2810,12 @@ itself is in the `.dSYM`).
   in `DW_FORM_data16`, as in memory; function types, typedefs); each
   function's result type, parameters and local variables; objects of static storage
   duration, thread-local ones included (by their offset in the thread's TLS block; on
-  macOS, where the thread's block is the value of a pthread key, through a descriptor
-  of the platform's form, three words: 0, the key, which the runtime writes at
-  start-up, and the offset, which the platform's debugger reads for
-  `DW_OP_form_tls_address`: not tried in that debugger, which needs a Mac). A variable, parameter, typedef or object declared with a typedef name
+  macOS through a descriptor of the platform's form for `DW_OP_form_tls_address`, which
+  the platform's debugger reads: with `--macos-tls=fast`, where the thread's block is the
+  value of a pthread key, one of three words, 0, the key, which the runtime writes at
+  start-up, and the offset; with `platform` the variable's own descriptor in
+  `__thread_vars`, as the platform's compilers write it: neither tried in that debugger,
+  which needs a Mac). A variable, parameter, typedef or object declared with a typedef name
   has the typedef as its type (or one derived from it: `T *p`).
 - **Scopes**: a block that declares something is a lexical block, with the code of its
   statements (in pieces at `-O2`, `.debug_rnglists`), its variables, its block-scope

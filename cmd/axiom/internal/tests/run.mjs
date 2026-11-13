@@ -2978,6 +2978,44 @@ if (!skipPlatform) {
       const r = spawnSync(out('hello'), [], { encoding: 'utf8' });
       return r.status === 0 && r.stdout === 'hello\n' ? null : `status ${r.status}: ${r.stdout}${r.stderr}`;
     },
+    // --macos-tls=platform: the platform's descriptors, no read of the TSD
+    // slots (checkTLV), for both processors; never run (needs a Mac)
+    'thread-locals of --macos-tls=platform': () => {
+      const src = path.join(tmp, 'macos-ptls.ax');
+      fs.writeFileSync(src, 'import "std/io" as io;\n\nthreadlocal let mut tl: u64 = 41;\n\nexport fn main() i32 {\n' +
+        '    tl += 1;\n    io.stdout().println("hello") catch return 1;\n    return @int_cast(i32, tl) - 42;\n}\n');
+      for (const t of ['aarch64-macos', 'x86_64-macos']) {
+        const n = `hello-ptls-${t}`;
+        const c = build(src, n, ['-O2', '--macos-tls=platform'], t);
+        if (c.status !== 0) return `${t}: build failed:\n${c.stdout}${c.stderr}`;
+        const r = checkMachO(fs.readFileSync(out(n)), { x86_64: t === 'x86_64-macos', platformTLS: true });
+        if (r.errs.length) return `${t}: ${r.errs.join('\n')}`;
+        if (!r.tlv) return `${t}: no thread-local descriptors`;
+      }
+      return null;
+    },
+    // code of one scheme reaching a variable of the other: a link error, both
+    // ways; an undefined thread-local no library defines: one too
+    'thread-locals of the two schemes in one link': () => {
+      const def = path.join(tmp, 'macos-tls-def.c'), use = path.join(tmp, 'macos-tls-use.c'), obj = out('tls-def.o');
+      fs.writeFileSync(def, '_Thread_local int shared_tl = 1;\n');
+      fs.writeFileSync(use, 'extern _Thread_local int shared_tl;\nint main(void) { return shared_tl - 1; }\n');
+      const o = spawnSync(compiler, ['build', def, '--emit=obj', '--target=aarch64-macos', '-o', obj], { encoding: 'utf8', cwd: root });
+      if (o.status !== 0) return `--emit=obj failed:\n${o.stdout}${o.stderr}`;
+      const fast = build(use, 'tls-mixed', [obj, '--c-freestanding']);
+      if (fast.status === 0 || !/in the runtime's block \(--macos-tls=fast\), but it is the platform's/.test(fast.stderr)) return `fast code and a descriptor:\n${fast.stdout}${fast.stderr}`;
+      const p = check(use, 'tls-mixed2', [obj, '--c-freestanding', '--macos-tls=platform']);
+      if (p) return `--macos-tls=platform: ${p}`;
+      const asm = path.join(tmp, 'macos-tls-asm.c');
+      fs.writeFileSync(asm, '_Thread_local long tv;\nint main(void) { long *p; __asm__("adrp %0, tv@TLVPPAGE\\n\\tldr %0, [%0, tv@TLVPPAGEOFF]" : "=r"(p)); return p == 0; }\n');
+      const d = build(asm, 'tls-desc-fast', ['--c-std=gnu17', '--c-freestanding']);
+      if (d.status === 0 || !/by its descriptor, but it is one of --macos-tls=fast's/.test(d.stderr)) return `a descriptor of a fast variable:\n${d.stdout}${d.stderr}`;
+      const undef = path.join(tmp, 'macos-tls-undef.c');
+      fs.writeFileSync(undef, 'extern _Thread_local int nowhere_tl;\nint main(void) { return nowhere_tl; }\n');
+      const u = build(undef, 'tls-undef', ['--c-freestanding', '--macos-tls=platform']);
+      if (u.status === 0 || !/undefined thread-local 'nowhere_tl'/.test(u.stderr)) return `an undefined thread-local:\n${u.stdout}${u.stderr}`;
+      return null;
+    },
     'examples': () => {
       for (const e of ['wordcount', 'http_server', 'texmath']) {
         const p = check(path.join(root, `examples/${e}/${e}.ax`), e);
@@ -3628,7 +3666,7 @@ if (!skipPlatform && !native) {
     const checkOut = (f) => {
       const d = fs.readFileSync(f);
       const foreign = pick(/^(sys|arch)_.*\.c$/).length > 0;
-      const r = win ? checkPEFile(f, { arm64: t.startsWith('aarch64'), foreign }) : checkMachO(d, { x86_64: t.startsWith('x86_64') });
+      const r = win ? checkPEFile(f, { arm64: t.startsWith('aarch64'), foreign }) : checkMachO(d, { x86_64: t.startsWith('x86_64'), platformTLS: words('flags').includes('--macos-tls=platform') });
       return r.errs.length ? r.errs.join('\n') : null;
     };
     const bad = checkOut(out);

@@ -5347,7 +5347,45 @@ fn enc_inst(i: *mut mc.MInst) void {
     if op == TLS {
         let d = P(i.ops[0].reg);
         let s = i.ops[1];
-        if tg.is_darwin() {
+        if tg.platform_tls() {
+            // macOS, --macos-tls=platform (the platform's thread-local
+            // descriptors, isel.ax platform_tlv): x0 = the descriptor's
+            // address (@TLVPPAGE, a GOT slot the linker makes an add for
+            // our own), and a call of
+            // its first word, the thunk, which returns the variable's
+            // address in x0 and changes x16, x17 and the flags, as the
+            // platform's code expects of it. What else the call changes is
+            // saved around it (x0, x9, the link register, the flags), below
+            // the red zone, so that the sequence is one instruction to the
+            // register allocator: sub sp, sp, #160; stp x0, x9, [sp];
+            // mrs x16, nzcv; stp x30, x16, [sp, #16]; adrp x0, s@TLVPPAGE;
+            // ldr x0, [x0, s@TLVPPAGEOFF]; ldr x16, [x0]; blr x16;
+            // mov x16, x0; ldp x30, x17, [sp, #16]; msr nzcv, x17;
+            // ldp x0, x9, [sp]; add sp, sp, #160; mov d, x16
+            w32(ae.addsub_imm(1, true, false, 31, 31, 160, false));
+            w32(0xa90027e0);
+            w32(0xd53b4210);
+            w32(0xa90143fe);
+            reloc(elf.R_AARCH64_AXIOM_TLVP_PAGE, s.sym, 0);
+            w32(ae.adrp(0));
+            reloc(elf.R_AARCH64_AXIOM_TLVP_PAGEOFF, s.sym, 0);
+            w32(ae.ldst_uimm(3, false, 1, 0, 0, 0));
+            w32(ae.ldst_uimm(3, false, 1, X16, 0, 0));
+            w32(ae.blr(X16));
+            w32(ae.logic_reg(1, 1, false, X16, 31, 0, 0, 0));
+            w32(0xa94147fe);
+            w32(0xd51b4211);
+            w32(0xa94027e0);
+            w32(ae.addsub_imm(1, false, false, 31, 31, 160, false));
+            w32(ae.logic_reg(1, 1, false, d, 31, X16, 0, 0));
+            let mut k = s.disp;
+            while k != 0 {
+                let part = @min(@max(k, -4095), 4095);
+                w32(ae.addsub_imm(1, part < 0, false, d, d, @bit_cast(u64, @max(part, -part)), false));
+                k -= part;
+            }
+            return;
+        } else if tg.is_darwin() {
             // macOS has no thread pointer for programs: the thread-locals
             // are a block whose address is in a TSD slot (the runtime's
             // pthread key; axiom.tls_key holds the slot's byte offset), and
@@ -5947,6 +5985,9 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     DBG.lang = dw.module_lang(m);
     if tg.is_darwin() {
         DBG.tls_rel = dw.TLS_DESC;
+        if tg.platform_tls() {
+            DBG.tls_rel = dw.TLS_PDESC;
+        }
     } else {
         DBG.tls_rel = elf.R_AARCH64_TLS_DTPREL64;
     }

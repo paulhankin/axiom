@@ -2065,6 +2065,35 @@ fn enc_inst(i: *mut mc.MInst) void {
         E.b.put("\x0f\x01\xd0");
         return;
     }
+    if (op == xe.TLSBASE) and (i.ops.len > 1) and (i.ops[1].kind == mc.K_MEM) {
+        // macOS, --macos-tls=platform: d = the address of thread-local sym, from its descriptor
+        // (isel.ax platform_tlv): rdi = the descriptor's address
+        // (sym@TLVP), and a call of its first word, the thunk, which
+        // returns it in rax and changes the flags, as the platform's code
+        // expects of it. rax, rdi and the flags are saved around it below
+        // the red zone (keeping the stack 16-byte aligned at the call), so
+        // that the sequence is one instruction to the register allocator:
+        // lea rsp, [rsp - 136]; pushfq; push rax; push rdi;
+        // mov rdi, [rip + sym@TLVP]; call [rdi]; then d = rax, and rdi,
+        // rax and the flags restored; lea rsp, [rsp + 136]
+        let d = P(i.ops[0].reg);
+        E.b.put("\x48\x8d\xa4\x24\x78\xff\xff\xff\x9c\x50\x57\x48\x8b\x3d");
+        E.relocs.push(xe.Reloc.{ off: @as(u64, E.b.len()), ty: elf.R_X86_64_AXIOM_TLV, sym: i.ops[1].sym, addend: -4 });
+        E.b.u32_(0);
+        E.b.put("\xff\x17");
+        if d == 0 {
+            E.b.put("\x5f\x48\x8d\x64\x24\x08\x9d");  // pop rdi; lea rsp, [rsp + 8]; popfq
+        } else if d == 7 {
+            E.b.put("\x48\x89\xc7\x48\x8d\x64\x24\x08\x58\x9d");  // mov rdi, rax; lea rsp, [rsp + 8]; pop rax; popfq
+        } else {
+            b8(0x48 | @as(u64, @bit_cast(u32, (d >> 3) & 1)));  // mov d, rax
+            b8(0x89);
+            b8(0xc0 | @as(u64, @bit_cast(u32, d & 7)));
+            E.b.put("\x5f\x58\x9d");  // pop rdi; pop rax; popfq
+        }
+        E.b.put("\x48\x8d\xa4\x24\x88\x00\x00\x00");
+        return;
+    }
     if (op == xe.TLSBASE) and (i.ops.len > 1) {
         // mov d, gs:[k] (macOS: the TSD slot at byte offset k holds the
         // thread's block)

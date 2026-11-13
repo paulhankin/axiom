@@ -1,12 +1,12 @@
-/* flags: --c-std=gnu17 */
+/* flags: --c-std=gnu17 --macos-tls=platform */
 /* native-only */
 /* macos-only */
-/* AArch64 macOS: a thread-local's descriptor through @TLVPPAGE/@TLVPPAGEOFF
-   (an adrp/ldr pair loading the descriptor's address from its GOT slot),
+/* The platform's thread-locals (--macos-tls=platform), AArch64 macOS: a
+   thread-local's descriptor through @TLVPPAGE/@TLVPPAGEOFF (an adrp/ldr pair loading the descriptor's address from its GOT slot),
    then the platform's call through the descriptor's first word, which
    returns the variable's address in x0. It is the address C takes of it,
-   and stores through it are the variable's. On x86-64 macOS the same
-   values are printed. */
+   and stores through it are the variable's. On x86-64 macOS the same with
+   sym@TLVP: movq tv@TLVP(%rip), %rdi; call *(%rdi). */
 #include "host.h"
 
 _Thread_local long tv = 40;
@@ -22,6 +22,13 @@ static long *tlv_address(void) {
                      : "=r"(p)
                      :
                      : "x0", "x1", "x30", "cc", "memory");
+#elif defined(__AXIOM_ASM_X86_64__)
+    __asm__ volatile("movq tv@TLVP(%%rip), %%rdi\n\t"
+                     "call *(%%rdi)\n\t"
+                     "movq %%rax, %0"
+                     : "=r"(p)
+                     :
+                     : "rax", "rdi", "cc", "memory");
 #else
     p = &tv;
 #endif

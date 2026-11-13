@@ -10,6 +10,7 @@ import "elf.ax" as elf;
 import "ir.ax" as ir;
 import "mach.ax" as mc;
 import "opt.ax" as opt;
+import "target.ax" as tg;
 import "util.ax" as u;
 
 // -----------------------------------------------------------------------------
@@ -677,8 +678,8 @@ pub fn gsym_at(obj: *mut elf.Obj, gsym: *mut u.List.[u32], g: *ir.Global) u32 {
         return s;
     }
     let n = elf.ext_sym(obj, u.perm_dup(sym_name(g.name, g.linkage, "g", k)), g.linkage == ir.LINK_EXTWEAK);
-    if g.tls {
-        obj.syms.at(@as(usize, n)).ty = elf.T_TLS;
+    if g.tls and not tg.platform_tls() {
+        obj.syms.at(@as(usize, n)).ty = elf.T_TLS;  // (the platform's: the descriptor, platform_tlv)
     }
     gsym.set(k, n);
     return n;
@@ -941,6 +942,77 @@ fn hidden_vis(vis: u8) bool {
     return (vis == ir.VIS_HIDDEN) or (vis == ir.VIS_INTERNAL);
 }
 
+// A thread-local of macOS in the platform's form (--macos-tls=platform: as
+// its toolchain makes one, which dyld and the platform's linker and
+// debugger read): the variable's symbol is its descriptor in __thread_vars, three words (the
+// thunk that finds it, _tlv_bootstrap until dyld replaces it; a key dyld
+// sets; the address of its initial value, which the linker makes its
+// offset in the template), and the value is <name>$tlv$init in
+// __thread_data (__thread_bss if all zero). Code finds the variable by
+// calling the thunk with the descriptor's address (a64.ax, x64.ax: TLS).
+// Returns the descriptor's symbol.
+fn platform_tlv(obj: *mut elf.Obj, g: *ir.Global, i: usize) u32 {
+    let zero = ir.is_zero(g.init);
+    let gname = sym_name(g.name, g.linkage, "g", i);
+    let base_d = tlv_section(
+        obj, u.pick(zero, ".macho.thread_bss", ".macho.thread_data"), u32_pick_k(zero, elf.S_BSS, elf.S_DATA), 16);
+    let dsec = data_section(obj, g, base_d, gname);
+    let vsec = data_section(obj, g, tlv_section(obj, ".macho.thread_vars", elf.S_DATA, 8), gname);
+    let ds = obj.secs.get(@int_cast(usize, dsec));
+    let mut al = g.align;
+    if al == 0 {
+        al = 1;
+    }
+    if al > ds.align {
+        ds.align = al;
+    }
+    let mut off: u64 = 0;
+    if zero {
+        ds.size = (ds.size + al - 1) & ~(al - 1);
+        off = ds.size;
+        ds.size += g.ty.size;
+    } else {
+        ds.data.align(@truncate(usize, al));
+        off = @as(u64, ds.data.len());
+        ds.data.zeros(@truncate(usize, g.ty.size));
+    }
+    let init = elf.add_sym(obj, elf.Sym.{ name: u.perm_dup(u.cat2(gname, "$tlv$init")), sec: dsec, value: off,
+                                          size: g.ty.size, bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: false });
+    let vs = obj.secs.get(@int_cast(usize, vsec));
+    vs.data.align(8);
+    let at = @as(u64, vs.data.len());
+    vs.data.zeros(24);
+    let boot = elf.ext_sym(obj, "_tlv_bootstrap", false);
+    vs.relocs.push(elf.Rel.{ off: at, ty: tlv_abs64(obj), sym: boot, addend: 0 });
+    vs.relocs.push(elf.Rel.{ off: at + 16, ty: tlv_abs64(obj), sym: init, addend: 0 });
+    return elf.add_sym(obj, elf.Sym.{ name: gname, sec: vsec, value: at, size: 24, bind: sym_bind(g.linkage, "g", i),
+                                      ty: elf.T_OBJECT, hidden: hidden_vis(g.visibility) });
+}
+
+// The section `name` of the platform's thread-locals (made once).
+fn tlv_section(obj: *mut elf.Obj, name: []u8, kind: i32, align: u64) i32 {
+    let k = elf.find_sec(obj, name);
+    if k >= 0 {
+        return k;
+    }
+    return elf.add_sec(obj, name, kind, align);
+}
+
+fn u32_pick_k(c: bool, a: i32, b: i32) i32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// The 8-byte absolute relocation of obj's machine.
+fn tlv_abs64(obj: *elf.Obj) u32 {
+    if obj.machine == elf.EM_X86_64 {
+        return elf.R_X86_64_64;
+    }
+    return elf.R_AARCH64_ABS64;
+}
+
 // The symbols of m's functions (defined in text) and globals, in fsym and
 // gsym (by Func.id and Global.id); each defined global laid out in .data,
 // .bss, .tbss, .tdata, rodata or .data.rel.ro (sections added here), with
@@ -973,7 +1045,10 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
             continue;
         }
         let mut sec = data;
-        if g.tls {
+        if g.tls and tg.platform_tls() {
+            gsym.push(platform_tlv(obj, g, i));
+            continue;
+        } else if g.tls {
             sec = tbss;
             if not ir.is_zero(g.init) {
                 sec = tdata;
@@ -1024,7 +1099,16 @@ pub fn add_symbols(obj: *mut elf.Obj, m: *mut ir.Module, text: i32, rodata: i32,
         if u.isnil(g.init) {
             continue;
         }
-        let s = obj.syms.at(@as(usize, gsym.get(i)));
+        let mut s = obj.syms.at(@as(usize, gsym.get(i)));
+        if g.tls and tg.platform_tls() {
+            // (the variable's initial value: in the template, its descriptor's third word's target)
+            let vs = obj.secs.get(@int_cast(usize, s.sec));
+            for r in vs.relocs.items() {
+                if r.off == (s.value + 16) {
+                    s = obj.syms.at(@as(usize, r.sym));
+                }
+            }
+        }
         let sec = obj.secs.get(@int_cast(usize, s.sec));
         if (sec.kind == elf.S_BSS) or (sec.kind == elf.S_TBSS) {
             continue;

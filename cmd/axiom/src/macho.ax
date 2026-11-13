@@ -30,7 +30,9 @@
 //   .init_array, .fini_array   __DATA,__mod_init_func, __mod_term_func (one
 //                              each, the entries in the order of their
 //                              priorities: Mach-O has none)
-//   thread-local data          __DATA,__axiom_tdata, __DATA,__axiom_tbss
+//   thread-locals              __DATA,__thread_vars (the descriptors),
+//                              __thread_data, __thread_bss (the template):
+//                              the platform's (below)
 //   a section named as a C     __DATA,<name> (16 characters at most)
 //     identifier (axiom_rets, `section` attributes)
 //   a section named "seg,sect" that segment and section (the `section`
@@ -41,15 +43,18 @@
 //                              debug information of objects is linked by
 //                              the debugger's tools, object by object)
 //
-// Thread-locals: the code generators address a thread-local as an offset
-// in a per-thread block that the runtime makes (mlink.ax: the scheme has
-// nothing to do with the platform's thread-local variables, whose code
-// calls a descriptor's function). The offset's relocations have no Mach-O
-// type: they are written with type numbers the format leaves unused, which
-// only this compiler's linker reads (arm64: 14 and 15 for the high and low
-// 12 bits of an add's immediate; x86-64: 15 for a 32-bit displacement),
-// so the system's linker refuses an object whose code uses thread-locals
-// (docs/c.md: "Objects of this compiler").
+// Thread-locals: an object's are the platform's (--emit=obj and the like
+// imply --macos-tls=platform: isel.ax platform_tlv): a variable's symbol is
+// its descriptor in __thread_vars, whose words are relocated to
+// __tlv_bootstrap and to the local <name>$tlv$init in __thread_data or
+// __thread_bss; code reaches a descriptor with ARM64_RELOC_TLVP_LOAD_PAGE21
+// and _PAGEOFF12 (x86-64: X86_64_RELOC_TLV), so that the system's linker
+// and dyld take our objects' thread-locals, and ours theirs. (Objects of
+// earlier versions of this compiler addressed a thread-local as an offset in
+// the runtime's per-thread block, --macos-tls=fast, in __axiom_tdata and
+// __axiom_tbss with relocation types Mach-O leaves unused: arm64 14 and 15
+// for an add's high and low 12 bits, x86-64 15 for a 32-bit displacement.
+// read() still takes them; the system's linker refuses them.)
 //
 // read() takes what the platform's compilers write: the sections (by type:
 // code, literals, zero-fill, initializer and terminator pointers, the
@@ -288,6 +293,16 @@ fn place_of(s: *elf.Sec, x64: bool) Place {
             }
         }
         return Place.{ seg: "__DWARF", sect: b.done(), flags: S_ATTR_DEBUG };
+    }
+    // the platform's thread-locals (isel.ax platform_tlv)
+    if u.starts(n, ".macho.thread_vars") {
+        return Place.{ seg: "__DATA", sect: "__thread_vars", flags: S_THREAD_LOCAL_VARIABLES };
+    }
+    if u.starts(n, ".macho.thread_data") {
+        return Place.{ seg: "__DATA", sect: "__thread_data", flags: S_THREAD_LOCAL_REGULAR };
+    }
+    if u.starts(n, ".macho.thread_bss") {
+        return Place.{ seg: "__DATA", sect: "__thread_bss", flags: S_THREAD_LOCAL_ZEROFILL };
     }
     if k == elf.S_TDATA {
         return Place.{ seg: "__DATA", sect: "__axiom_tdata", flags: S_REGULAR };
@@ -555,6 +570,14 @@ fn convert(w: *mut W, o: *elf.Obj, k: usize, os: i32, r: elf.Rel) void {
             rel(w, os, at, g.sym, true, 2, true, u32_pick(load, X86_64_RELOC_GOT_LOAD, X86_64_RELOC_GOT));
         } else if t == elf.R_X86_64_PC64 {
             sub_pair(w, o, os, at, r, 3, X86_64_RELOC_SUBTRACTOR, X86_64_RELOC_UNSIGNED);
+        } else if t == elf.R_X86_64_AXIOM_TLV {
+            // a thread-local's descriptor (movq sym@TLVP(%rip))
+            let g = target(w, o, r.sym, r.addend, 4);
+            if g.add != -4 {
+                fail(w, "a thread-local descriptor reference with an addend, which Mach-O cannot hold");
+            }
+            put32(w, os, at, 0);
+            rel(w, os, at, g.sym, true, 2, true, X86_64_RELOC_TLV);
         } else if t == elf.R_X86_64_TPOFF32 {
             let g = target(w, o, r.sym, r.addend, 0);
             put32(w, os, at, g.add);
@@ -1498,9 +1521,9 @@ pub fn read(d: []u8) *mut elf.Obj {
                     r.ty = elf.R_X86_64_PC32;
                 } else if ty == X86_64_RELOC_BRANCH {
                     r.ty = elf.R_X86_64_PLT32;
-                } else if (ty == X86_64_RELOC_GOT_LOAD) or (ty == X86_64_RELOC_TLV) {
-                    // (a thread-local variable's descriptor: loaded from a
-                    // GOT slot, as the platform's linker does)
+                } else if ty == X86_64_RELOC_TLV {
+                    r.ty = elf.R_X86_64_AXIOM_TLV;  // (a thread-local's descriptor: mlink.ax tlvp_reloc)
+                } else if ty == X86_64_RELOC_GOT_LOAD {
                     r.ty = elf.R_X86_64_REX_GOTPCRELX;
                     if (off < 3) or (dv[off - 2] != 0x8b) {
                         r.ty = elf.R_X86_64_GOTPCREL;
