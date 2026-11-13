@@ -75,7 +75,12 @@ lists the diagnostics.
   the target has no instruction), cgen_abi.ax (the platforms' classes).
 - **Nested functions** (GNU): csema_nest.ax marks the enclosing objects a nested
   function uses; cgen_nest.ax builds the frame record they are reached through (a chain
-  argument, `abi.add_chain`) and the trampoline pools.
+  argument, `abi.add_chain`) and the trampoline pools, and the non-local gotos to its
+  local labels (a `jmp_buf` armed before each call).
+- **restrict** beyond parameters: cgen_restrict.ax marks a block's restricted pointer
+  objects and restrict-qualified members (`ir.IN_RSCOPE`, `ir.IN_RESTRICT`, which
+  `ir.restrict_apart` reads); inline.ax makes an inlined call of a function with
+  restrict parameters a scope.
 - **Format checks**: csema_format.ax, from the attribute `format` (csema_gnu.ax).
 - **Decimal floating types** (C23: `_Decimal32`, `_Decimal64`, `_Decimal128`, `df`
   `dd` `dl` constants; `__STDC_IEC_60559_DFP__`): IEEE 754-2019's decimal formats in

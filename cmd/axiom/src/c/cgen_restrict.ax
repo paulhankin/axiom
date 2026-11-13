@@ -1,0 +1,264 @@
+// =============================================================================
+// cgen_restrict.ax - IR generation for C's restrict (6.7.3.1) on block-scope
+// pointer objects and on structure members: ir.IN_RSCOPE and ir.IN_RESTRICT
+// (see ir.ax for what they mean to the optimizer). Parameters are marked
+// ir.F_NOALIAS (cgen_stmt.ax), which holds while the function's own body
+// runs, and which inlining makes a scope (inline.ax).
+//
+// A block that declares restrict-qualified pointer objects begins a scope
+// where it begins (a function's body too): an
+// IN_RSCOPE, each object a number in it. A block with a label in it (or a
+// case or default label of a switch around it) has none: a jump into it
+// would bypass the IN_RSCOPE. Then the address of an access through such an
+// object, read in that scope (`*p`, `p[i]`, `p->m`, and the same with
+// `p + n`, `p - n` or a pointer cast for p, n without effects), is based on
+// IN_RESTRICT(p, scope, number) instead of p: the read's value goes nowhere
+// else, so every access based on it is in the block (a copy of p made in it
+// is a plain read, and accesses through the copy are not marked). Likewise
+// a read of a restrict-qualified member of a structure (not a union) for
+// an access: IN_RESTRICT(p, the structure's address, the member's offset).
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+// The scope and number of each restricted pointer object of the function
+// being generated that has one, by its CSym's address.
+let mut g_scope: u.SymMap.[*mut ir.Value] = u.SymMap.[*mut ir.Value].{ keys: @ptr_from_int(*mut usize, 0),
+                                                                       vals: @ptr_from_int(*mut *mut ir.Value, 0),
+                                                                       cap: 0, len: 0 };
+let mut g_num: u.SymMap.[u64] = u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
+                                                 cap: 0, len: 0 };
+
+fn key(s: *cast.CSym) []u8 {
+    return u.addr_key(@int_from_ptr(s));
+}
+
+// Is s a restricted pointer object?
+fn restricted(s: *cast.CSym) bool {
+    return u.notnil(s) and (s.kind == cast.SK_OBJECT) and u.notnil(s.ty) and (s.ty.kind == cty.TK_POINTER) and
+           ((s.ty.quals & cty.Q_RESTRICT) != 0);
+}
+
+fn none() []mut *mut ir.Value {
+    let xs = u.newn.[*mut ir.Value](1);
+    return xs[0..0];
+}
+
+// A new scope here, its objects numbered from 0.
+fn open(syms: []*mut cast.CSym) void {
+    if cg.terminated() {
+        return;
+    }
+    let t = ir.intr(cg.B, ir.IN_RSCOPE, ir.t_int(32), none());
+    let mut k: u64 = 0;
+    for s in syms {
+        g_scope.put(key(s), t);
+        g_num.put(key(s), k);
+        k += 1;
+    }
+}
+
+/// The start of a function's body: a scope for the restricted objects its
+/// outermost block declares (its restrict parameters are ir.F_NOALIAS,
+/// which inlining makes a scope: inline.ax).
+pub fn function(body: []*mut cast.Stmt) void {
+    let mut syms = u.List.[*mut cast.CSym].empty();
+    declared(body, &mut syms);
+    if syms.len > 0 {
+        open(syms.items());
+    }
+}
+
+/// The start of a block of items `items` (a compound statement), or of a
+/// for statement s with a declaration: a scope if it declares restricted
+/// objects and has no label in it.
+pub fn block(items: []*mut cast.Stmt, s: *cast.Stmt) void {
+    let mut syms = u.List.[*mut cast.CSym].empty();
+    if u.notnil(s) {
+        decl_syms(s.decl, &mut syms);
+        if (syms.len == 0) or has_label(s.body, false) {
+            return;
+        }
+    } else {
+        declared(items, &mut syms);
+        if syms.len == 0 {
+            return;
+        }
+        for x in items {
+            if has_label(x, false) {
+                return;
+            }
+        }
+    }
+    open(syms.items());
+}
+
+fn declared(items: []*mut cast.Stmt, syms: *mut u.List.[*mut cast.CSym]) void {
+    for x in items {
+        if u.notnil(x) and (x.kind == cast.StmtKind.DECL) {
+            decl_syms(x.decl, syms);
+        }
+    }
+}
+
+fn decl_syms(d: *cast.Decl, syms: *mut u.List.[*mut cast.CSym]) void {
+    if u.isnil(d) or (d.kind != cast.DeclKind.DECL) {
+        return;
+    }
+    for x in d.decls.items() {
+        if restricted(x.sym) and (x.sym.linkage == cast.LK_NONE) {
+            syms.push(x.sym);
+        }
+    }
+}
+
+// Has s a label in it, or a case or default label not of a switch in it
+// (in_switch: s is in a switch statement's body that is in the block)?
+fn has_label(s: *cast.Stmt, in_switch: bool) bool {
+    if u.isnil(s) {
+        return false;
+    }
+    let k = s.kind;
+    if k == cast.StmtKind.LABEL {
+        return true;
+    }
+    if ((k == cast.StmtKind.CASE) or (k == cast.StmtKind.DEFAULT)) and not in_switch {
+        return true;
+    }
+    let sw = in_switch or (k == cast.StmtKind.SWITCH);
+    for x in s.items.items() {
+        if has_label(x, sw) {
+            return true;
+        }
+    }
+    return has_label(s.body, sw) or has_label(s.els, sw);
+}
+
+// Has e no effects (so that its value cannot hold a pointer it reads)?
+fn no_effects(e: *cast.Expr) bool {
+    if u.isnil(e) or e.is_const {
+        return true;
+    }
+    let k = e.kind;
+    if (k == cast.ExprKind.CALL) or (k == cast.ExprKind.ASSIGN) or (k == cast.ExprKind.POSTFIX) or
+       (k == cast.ExprKind.STMT_EXPR) or (k == cast.ExprKind.COMPOUND) or (k == cast.ExprKind.VA_ARG) or
+       (k == cast.ExprKind.COND) or (k == cast.ExprKind.COMMA) or
+       ((k == cast.ExprKind.UNARY) and ((e.op == ct.P_INC) or (e.op == ct.P_DEC))) {
+        return false;
+    }
+    for x in e.args.items() {
+        if not no_effects(x) {
+            return false;
+        }
+    }
+    return no_effects(e.a) and no_effects(e.b) and no_effects(e.c);
+}
+
+// The read of a restricted pointer that pointer expression e is, plus
+// offsets (a CV_LOAD cast of the object), or nil.
+fn read_of(e: *cast.Expr) *cast.Expr {
+    if u.isnil(e) or u.isnil(e.ty) or (e.ty.kind != cty.TK_POINTER) {
+        return u.nil.[cast.Expr]();
+    }
+    if e.kind == cast.ExprKind.CAST {
+        if e.op == cast.CV_LOAD {
+            let x = e.a;
+            if (x.kind == cast.ExprKind.IDENT) and restricted(x.sym) {
+                return e;
+            }
+            if (x.kind == cast.ExprKind.MEMBER) and u.notnil(x.ty) and ((x.ty.quals & cty.Q_RESTRICT) != 0) and
+               struct_member(x) {
+                return e;
+            }
+            return u.nil.[cast.Expr]();
+        }
+        if (e.op == cast.CV_VALUE) and u.notnil(e.a.ty) and (e.a.ty.kind == cty.TK_POINTER) {
+            return read_of(e.a);
+        }
+        return u.nil.[cast.Expr]();
+    }
+    if (e.kind == cast.ExprKind.BINARY) and ((e.op == ct.P_PLUS) or (e.op == ct.P_MINUS)) {
+        if u.notnil(e.a.ty) and (e.a.ty.kind == cty.TK_POINTER) and no_effects(e.b) {
+            return read_of(e.a);
+        }
+        if (e.op == ct.P_PLUS) and u.notnil(e.b.ty) and (e.b.ty.kind == cty.TK_POINTER) and no_effects(e.a) {
+            return read_of(e.b);
+        }
+    }
+    return u.nil.[cast.Expr]();
+}
+
+// Is member access x (a.m, p->m) a member of a structure (not a union)?
+fn struct_member(x: *cast.Expr) bool {
+    let mut t = x.a.ty;
+    if u.isnil(t) {
+        return false;
+    }
+    if x.op == ct.P_ARROW {
+        if t.kind != cty.TK_POINTER {
+            return false;
+        }
+        t = t.elem;
+    }
+    return u.notnil(t) and (t.unq.kind == cty.TK_STRUCT);
+}
+
+/// The address v of pointer expression e (generated just now, for an
+/// access through it): based on an IN_RESTRICT if e is a restricted
+/// pointer's read in its scope, or a restrict-qualified member's, plus
+/// offsets.
+pub fn wrap(e: *cast.Expr, v: *mut ir.Value) *mut ir.Value {
+    let r = read_of(e);
+    if u.isnil(r) or u.isnil(v) {
+        return v;
+    }
+    // the read: the load under v's ptradds
+    let mut user = u.nil.[ir.Value]();
+    let mut x = v;
+    while ir.is_op(x, ir.OP_PTRADD) {
+        user = x;
+        x = x.a;
+    }
+    if not ir.is_op(x, ir.OP_LOAD) or (x.ty.kind != ir.T_PTR) or ((x.flags & ir.F_VOLATILE) != 0) {
+        return v;
+    }
+    let o = r.a;
+    let mut s = u.nil.[ir.Value]();
+    let mut k: u64 = 0;
+    if o.kind == cast.ExprKind.IDENT {
+        let t = g_scope.get(key(o.sym));
+        if u.isnil(t) or u.isvnil(o.sym.ir) or (x.a != @ptr_cast(*mut ir.Value, o.sym.ir)) or (t.blk.fnp != cg.F.f) {
+            return v;
+        }
+        s = t;
+        k = g_num.get(key(o.sym));
+    } else {
+        // (the structure's address and the member's offset in it)
+        let mut a = x.a;
+        let mut off: u64 = 0;
+        while ir.is_op(a, ir.OP_PTRADD) and ir.is_cint(a.b) {
+            off = off +% ir.cint_val(a.b);
+            a = a.a;
+        }
+        s = a;
+        k = off;
+    }
+    let cur = ir.insert_block(cg.B);
+    if u.notnil(x.next) {
+        ir.at_before(cg.B, x.next);
+    } else {
+        ir.at_end(cg.B, x.blk);
+    }
+    let mut xs: [3]*mut ir.Value = [x, s, ir.cint(ir.t_int(64), k)];
+    let w = ir.intr(cg.B, ir.IN_RESTRICT, x.ty, xs[..]);
+    ir.at_end(cg.B, cur);
+    if u.isnil(user) {
+        return w;
+    }
+    user.a = w;
+    return v;
+}

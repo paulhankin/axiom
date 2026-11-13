@@ -1491,7 +1491,7 @@ format than the ABI's cannot pass `long double` values to it.
 | `main` | `int main(void)` and `int main(int, char **)` only (`C3061`). Reaching the end of `main` returns 0, in every mode. |
 | Inline functions | An inline definition (6.7.4p7) is compiled with internal linkage, for the unit's own calls: the external function is another unit's. |
 | `volatile` | Accesses are marked volatile for the optimizer. |
-| `restrict` | A pointer parameter's tells the optimizer what it reaches is not reached otherwise ("Optimization"); others are accepted and have no effect. |
+| `restrict` | Used by the optimizer on pointer parameters, on block-scope pointer objects and on structure members ("Optimization"); on other pointers (file scope, a pointer to a restricted pointer) accepted with no effect. |
 
 ### Translation limits
 
@@ -2749,6 +2749,20 @@ a register) tells the optimizer that what it reaches is not reached through anot
 parameter, a global or a local object while the function runs (6.7.3.1): loads move out
 of loops past stores through it, and copy and vector loops need no overlap check. A
 pointer loaded from memory may hold its value, and is not taken as apart from it.
+
+Within a block that declares restrict-qualified pointer objects (and has no label in it,
+which a jump could enter it by), an access through one of them, as `*p`, `p[i]`,
+`p->m`, or the same with `p + n`, `p - n` or a cast of p, is taken as apart from one
+through another of them while the block runs (6.7.3.1: neither is based on the other
+there, p4), in each of its executions: a loop's iterations, each a new execution of a
+block in its body, are not taken as apart. When a function with two or more restrict
+parameters is inlined, its call is such a block, with its parameters for those objects,
+so what they tell survives inlining. Likewise an access through a restrict-qualified
+member of a structure (not a union) read for it is apart from one through another such
+member of the same structure object (the same address), and, when that object is a
+local or static one, from an access to the object itself. Accesses through a copy of a
+restricted pointer (`q = p; *q`) are not marked. The IR marks them with `IN_RSCOPE` and
+`IN_RESTRICT` (`ir.ax`), which the last pass removes.
 
 A parameter that the attribute `nonnull` names (a GNU dialect), or that is declared
 `[static n]` (6.7.6.3p7), and the result of a call of a function declared

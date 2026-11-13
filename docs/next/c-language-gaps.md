@@ -14,3 +14,8 @@
 - Conversions between the decimal floating types and `_Float16` round once, directly to
   binary16, in every binary rounding direction (the environment's under strict floating
   point) with that rounding's exceptions; they went through binary128 before.
+- `restrict` on block-scope pointer objects and on structure members is used by the
+  optimizer (accesses through two of a block's restricted pointers, or two
+  restrict-qualified members of one structure object, are apart: loads after stores are
+  forwarded, loops vectorized without an overlap check), and a function's restrict
+  parameters keep telling it once the function is inlined (the call becomes a scope).

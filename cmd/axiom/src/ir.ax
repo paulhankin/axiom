@@ -665,6 +665,31 @@ pub const IN_CAS16: i32 = 116;
 // object, and the last pass over a function (passes.finish_funcs) at every
 // level folds what is left, so no backend sees it. Pure.
 pub const IN_OBJSIZE: i32 = 117;
+// C's restrict on pointers other than parameters (6.7.3.1), made only by the
+// C front end (cgen_expr.ax), and removed by the last pass over a function
+// (passes.finish_funcs, at every level: no backend sees them).
+// IN_RSCOPE() -> i32: an execution of a block of C that declares restricted
+// pointer objects begins (a function's body, for its restrict parameters):
+// each time it runs is another instance of the scope. A hint, kept where it
+// is and never merged with another, copied with its block (inlining,
+// unrolling: each copy is a scope of its own); its value means nothing.
+// IN_RESTRICT(p, s, k) -> ptr: p, read from a restricted pointer object to
+// access memory through it (an address based on it, through ptradds, phis
+// and selects: based_restrict). Pure. Either s is an IN_RSCOPE and k (a
+// constant) numbers the restricted objects of that scope, or s is the
+// address of a structure object and k (a constant) the offset in it of the
+// restrict-qualified member p was read from. Two accesses through
+// addresses based on IN_RESTRICTs a and b (one of them a write) are apart
+// (restrict_apart) when a and b have the same IN_RSCOPE s and different k
+// (two restricted objects of one block, neither based on the other within
+// it, 6.7.3.1p4, and both accesses in the same execution of the block,
+// since the addresses depend on s: an IN_RESTRICT of a scope begun in a
+// loop is not invariant in it), or the same structure address s and
+// different k (two restrict-qualified members of one structure object);
+// and an access through a member's read whose structure address s is a
+// stack slot or a global is apart from one based on s itself.
+pub const IN_RSCOPE: i32 = 118;
+pub const IN_RESTRICT: i32 = 119;
 
 pub fn is_widen(id: i32) bool {
     return (id >= IN_SWIDEN_LO) and (id <= IN_UWIDEN_HI);
@@ -800,7 +825,7 @@ pub const INF_LANEWISE: u32 = 32;   // PURE, and the same operation on each lane
 
 const INF_LANES: u32 = INF_PURE | INF_LANEWISE;
 
-let IN_PROPS: [118]u32 = [
+let IN_PROPS: [120]u32 = [
     0,               // (no intrinsic 0)
     INF_LANES,       // IN_CTLZ
     INF_LANES,       // IN_CTTZ
@@ -919,6 +944,8 @@ let IN_PROPS: [118]u32 = [
     INF_HINT,        // IN_CMPXCHG_OK
     INF_OPAQUE,      // IN_CAS16
     INF_PURE,        // IN_OBJSIZE
+    INF_HINT,        // IN_RSCOPE
+    INF_PURE,        // IN_RESTRICT
 ];
 
 // Inline assembly (IN_ASM, whose first operand is its index in asm/inline.ax's
@@ -1056,7 +1083,7 @@ pub fn can_copy_block(b: *Block) bool {
 }
 
 pub fn intr_props(id: i32) u32 {
-    if (id < 0) or (id > IN_OBJSIZE) {
+    if (id < 0) or (id > IN_RESTRICT) {
         return 0;
     }
     return IN_PROPS[@int_cast(usize, id)];
@@ -1166,10 +1193,19 @@ pub const ORD_ACQ_REL: u32 = 4;
 /// The parameter p is based on (through ptradds, and the phis and selects
 /// whose operands all are based on it, or step from the phi itself), or nil.
 pub fn based_param(p0: *mut Value) *mut Value {
-    return based_rec(p0, 0);
+    return based_rec(p0, 0, false);
 }
 
-fn based_rec(p0: *mut Value, depth: i32) *mut Value {
+/// The IN_RESTRICT that p is based on (as based_param), or nil.
+pub fn based_restrict(p0: *mut Value) *mut Value {
+    return based_rec(p0, 0, true);
+}
+
+fn is_restrict_root(p: *Value) bool {
+    return is_op(p, OP_INTR) and (intr_id(p) == IN_RESTRICT);
+}
+
+fn based_rec(p0: *mut Value, depth: i32, restr: bool) *mut Value {
     let mut p = resolve(p0);
     let mut n: i32 = 0;
     while is_op(p, OP_PTRADD) and (n < 32) {
@@ -1179,8 +1215,17 @@ fn based_rec(p0: *mut Value, depth: i32) *mut Value {
     if u.isnil(p) {
         return p;
     }
-    if p.kind == V_PARAM {
+    if (p.kind == V_PARAM) and not restr {
         return p;
+    }
+    if is_restrict_root(p) {
+        if restr {
+            return p;
+        }
+        if depth < 4 {
+            return based_rec(p.xs.get(0), depth + 1, false);  // (what the pointer read is based on)
+        }
+        return u.nil.[Value]();
     }
     if (depth >= 4) or (p.kind != V_INST) or ((p.op != OP_PHI) and (p.op != OP_SELECT)) {
         return u.nil.[Value]();
@@ -1208,7 +1253,7 @@ fn based_rec(p0: *mut Value, depth: i32) *mut Value {
             m += 1;
         }
         if y != p {
-            let q = based_rec(x, depth + 1);
+            let q = based_rec(x, depth + 1, restr);
             if u.isnil(q) or (u.notnil(r) and (q != r)) {
                 return u.nil.[Value]();
             }
@@ -1224,7 +1269,25 @@ fn based_rec(p0: *mut Value, depth: i32) *mut Value {
 /// based on a noalias parameter and the other on another parameter, a
 /// global or a stack slot (resolved roots ra and rb, from based_param or the
 /// objects under the ptradds)?
-pub fn restrict_apart(ra: *Value, rb: *Value) bool {
+pub fn restrict_apart(ra0: *Value, rb0: *Value) bool {
+    if u.isnil(ra0) or u.isnil(rb0) or (ra0 == rb0) {
+        return false;
+    }
+    let mut ra = ra0;
+    let mut rb = rb0;
+    if is_restrict_root(ra) and is_restrict_root(rb) and scoped_apart(ra, rb) {
+        return true;
+    }
+    if in_own_struct(ra, rb) or in_own_struct(rb, ra) {
+        return true;
+    }
+    // (else what the restricted pointers read are based on)
+    if is_restrict_root(ra) {
+        ra = based_rec(ra.xs.get(0), 1, false);
+    }
+    if is_restrict_root(rb) {
+        rb = based_rec(rb.xs.get(0), 1, false);
+    }
     if u.isnil(ra) or u.isnil(rb) or (ra == rb) {
         return false;
     }
@@ -1237,6 +1300,36 @@ pub fn restrict_apart(ra: *Value, rb: *Value) bool {
         return false;
     }
     return distinct_root(ra) and distinct_root(rb);
+}
+
+// Are IN_RESTRICTs a and b two restricted pointer objects of one scope, or
+// two restrict-qualified members of one structure object (IN_RESTRICT)?
+fn scoped_apart(a: *Value, b: *Value) bool {
+    if (a.xs.len != 3) or (b.xs.len != 3) {
+        return false;
+    }
+    let sa = resolve(a.xs.get(1));
+    let sb = resolve(b.xs.get(1));
+    if (sa != sb) or not is_cint(a.xs.get(2)) or not is_cint(b.xs.get(2)) {
+        return false;
+    }
+    return cint_val(a.xs.get(2)) != cint_val(b.xs.get(2));
+}
+
+// Is r a restrict-qualified member's read (IN_RESTRICT) from a structure
+// object that is the stack slot or global o (whose address is based on no
+// pointer), which accesses based on o reach without it? Then an access
+// through r that writes an object another access reaches without it is
+// undefined (6.7.3.1p4), the structure's own bytes too.
+fn in_own_struct(r: *Value, o: *Value) bool {
+    if not is_restrict_root(r) or (r.xs.len != 3) or u.isnil(o) or not ((o.kind == V_GLOBAL) or is_op(o, OP_ALLOCA)) {
+        return false;
+    }
+    let s = resolve(r.xs.get(1));
+    if is_op(s, OP_INTR) and (intr_id(s) == IN_RSCOPE) {
+        return false;
+    }
+    return @int_from_ptr(s) == @int_from_ptr(o);
 }
 
 /// Are a and b two different objects: globals (not aliases of one another)
