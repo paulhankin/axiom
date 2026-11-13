@@ -45,6 +45,7 @@ import "c/cc.ax" as cfront;
 import "c/copts.ax" as cop;
 import "c/cstrip.ax" as cstrip;
 import "codegen.ax" as cg;
+import "coff.ax" as coff;
 import "diag.ax" as dg;
 import "elf.ax" as elf;
 import "elink.ax" as el;
@@ -55,6 +56,7 @@ import "jstub.ax" as jstub;
 import "linkin.ax" as linkin;
 import "lsp.ax" as lsp;
 import "lstub.ax" as lstub;
+import "macho.ax" as mo;
 import "mlink.ax" as ml;
 import "nlink.ax" as nl;
 import "package.ax" as pkg;
@@ -177,11 +179,21 @@ fn link_native(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
         }
         os.push(o);
     }
-    if tg.is_darwin() {
-        return ml.link(os.items(), out);
-    }
-    if tg.is_windows() {
-        return pl.link(os.items(), out);
+    if tg.is_darwin() or tg.is_windows() {
+        // the objects the program is linked with (linkin.ax), and the
+        // archive members they need
+        for k in 0..linkin.g_objs.len {
+            os.push(linkin.g_objs.get(k));
+        }
+        el.g_members = linkin.g_members;
+        pl.g_imports = linkin.g_imports;
+        ml.g_dylibs = linkin.g_dylibs;
+        ml.g_by_name = linkin.g_names;
+        let all = el.with_members(os.items());
+        if tg.is_darwin() {
+            return ml.link(all.items(), out);
+        }
+        return pl.link(all.items(), out);
     }
     let mut machine = elf.EM_X86_64;
     if tg.g_arch == tg.ARCH_A64 {
@@ -415,8 +427,7 @@ fn has_c(o: *Options) bool {
 // Will the executable be linked with objects and libraries that our own
 // linker reads (load_link_inputs)?
 fn own_inputs(o: *Options) bool {
-    if not u.str_eq(o.emit, "exe") or o.ide_mode or not o.build or
-       ((tg.g_os != tg.OS_LINUX) and not ty.g_target.is_wasm) {
+    if not u.str_eq(o.emit, "exe") or o.ide_mode or not o.build {
         return false;
     }
     for k in 0..o.link_inputs.len {
@@ -994,6 +1005,8 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
             o.json = false;
         } else if u.starts(a, "--std=") {
             o.std_dir = a[6..];
+        } else if u.str_eq(a, "--pic") {
+            tg.g_pic = true;  // (code for a shared library: target.ax)
         } else if u.str_eq(a, "--subsystem=console") {
             pl.g_subsystem = pl.SUBSYSTEM_WINDOWS_CUI;
         } else if u.str_eq(a, "--subsystem=windows") {
@@ -1475,8 +1488,17 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
         }
         return 1;
     }
-    let object = not exe and not cfront.has_main();
+    let shared = u.str_eq(o.emit, "shared");
+    if shared and not g_c_lib_system and not o.c_freestanding {
+        return fatal(o.json, "E9001",
+                     "--emit=shared takes C units with --c-lib=system or --c-freestanding (the compiler's C library, and the runtime it needs, are an executable's)");
+    }
+    if shared and (o.ax_links.len > 0) {
+        return fatal(o.json, "E9001", "--emit=shared takes C units alone (the Axiom runtime is an executable's)");
+    }
+    let object = (not exe and not cfront.has_main()) or shared;
     g_c_object = object;
+    cg.g_bare_object = object and (o.ax_links.len == 0);
     let start = u.f2("%s/internal/runtime/%s", o.std_dir, u.pick(object, "c_object.ax", "c_start.ax"));
     if not u.file_exists(start) {
         return fatal(o.json, "E9003", u.f1("cannot find the C start-up module (%s)", start));
@@ -1635,8 +1657,13 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
     cfront.all_refs(&mut work);
     // what the objects and libraries linked with the program refer to: the
     // program, or the C library, defines it, and it is kept
+    // (the archive members they take are those the program's own code
+    // needs too: its C units' references and its extern "C" functions')
     let mut ext = u.List.[[]u8].empty();
-    linkin.refs(&mut ext);
+    let mut roots = u.List.[[]u8].empty();
+    cfront.all_refs(&mut roots);
+    extern_c_names(o, &mut roots);
+    linkin.refs(roots.items(), &mut ext);
     for k in 0..ext.len {
         work.push(ext.get(k));
         cstrip.add_root(ext.get(k));
@@ -1904,10 +1931,18 @@ fn axiom_names(o: *Options) u.List.[cfront.AxName] {
 // Sets the output kind from --emit; false on an error (reported).
 fn set_emit(o: *Options, final_link: bool) bool {
     let co = o.co;
-    if u.str_eq(o.emit, "obj") or u.str_eq(o.emit, "lib") {
+    if u.str_eq(o.emit, "shared") and not is_c_source(o.input) {
+        dg.emit_fatal(o.json, "E9001", "--emit=shared takes C sources (the Axiom runtime is an executable's)");
+        return false;
+    }
+    if u.str_eq(o.emit, "shared") {
+        tg.g_pic = true;  // (position-independent code: target.ax)
+    }
+    if u.str_eq(o.emit, "obj") or u.str_eq(o.emit, "lib") or u.str_eq(o.emit, "shared") {
         co.emit = cg.EMIT_OBJ;
         cg.g_object_output = true;
         cfront.set_object_output(true);
+        be.g_native_format = true;
         be.g_stubs = not ty.g_target.is_wasm and (tg.g_os == tg.OS_LINUX) and not g_c_object;
     } else if u.str_eq(o.emit, "ir") {
         co.emit = cg.EMIT_IR;
@@ -1982,13 +2017,15 @@ fn build_program(o: *mut Options) i32 {
             ext = ".s";
         } else if u.str_eq(o.emit, "lib") {
             ext = u.pick(tg.is_windows(), ".lib", ".a");
+        } else if u.str_eq(o.emit, "shared") {
+            ext = u.pick(tg.is_windows(), ".dll", u.pick(tg.is_darwin(), ".dylib", ".so"));
         } else if not final_link {
             ext = ".o";
         } else {
             ext = wext;
         }
         o.out = u.cat2(strip_ph(u.basename(o.input)), ext);
-        if u.str_eq(o.emit, "lib") and not tg.is_windows() {
+        if (u.str_eq(o.emit, "lib") or u.str_eq(o.emit, "shared")) and not tg.is_windows() {
             o.out = u.cat2("lib", o.out);
         }
     }
@@ -2008,7 +2045,8 @@ fn build_program(o: *mut Options) i32 {
     }
     let mut objpath = o.out;
     let lib = u.str_eq(o.emit, "lib");
-    if final_link or lib {
+    let shared = u.str_eq(o.emit, "shared");
+    if final_link or lib or shared {
         objpath = u.f2("%s.tmp%s.o", o.out, u.idec(u.getpid()));
         co.out_path = objpath;
     } else {
@@ -2037,6 +2075,13 @@ fn build_program(o: *mut Options) i32 {
             return rc;
         }
     }
+    if shared {
+        rc = link_shared(o, objpath);
+        _ = u.unlink(u.cz(objpath));
+        if rc != CONTINUE {
+            return rc;
+        }
+    }
     if o.testing and not u.isnos(o.test_keep) {
         dg.emit(o.json, o.json);
         return 0;
@@ -2053,6 +2098,70 @@ fn build_program(o: *mut Options) i32 {
     }
     dg.emit(o.json, o.json);
     return 0;
+}
+
+// --emit=shared: a shared library of the program's object (objpath) and
+// the inputs (objects, archives, shared libraries, -l and -L): an ELF
+// shared object (elink.link_shared), a DLL (plink.ax: g_dll) or a Mach-O
+// dynamic library (mlink.ax: g_dylib). CONTINUE, or an exit status after an
+// error (reported).
+fn link_shared(o: *Options, objpath: []u8) i32 {
+    let mut paths = u.List.[[]u8].empty();
+    for k in 0..o.link_inputs.len {
+        if not is_ax_source(o.link_inputs.get(k)) and not is_c_source(o.link_inputs.get(k)) {
+            paths.push(o.link_inputs.get(k));
+        }
+    }
+    if not linkin.load(paths.items(), o.link_flags.items()) {
+        return fatal(o.json, "E9004", "linking failed");
+    }
+    let d = u.read_file(objpath);
+    let mut why: []u8 = "";
+    let ob = linkin.read_any(d, &mut why);
+    if u.isnil(ob) {
+        return fatal(o.json, "E9004", u.f2("cannot read %s %s", objpath, why));
+    }
+    let mut os = u.List.[*mut elf.Obj].empty();
+    os.push(ob);
+    for k in 0..linkin.g_objs.len {
+        os.push(linkin.g_objs.get(k));
+    }
+    let mut names = u.List.[[]u8].empty();
+    for k in 0..linkin.g_names.len {
+        names.push(linkin.g_names.get(k));
+    }
+    if g_c_lib_system {
+        names.push("c");
+    }
+    el.g_members = linkin.g_members;
+    if tg.is_windows() or tg.is_darwin() {
+        let all = el.with_members(os.items());
+        let mut rc: i32 = 0;
+        if tg.is_windows() {
+            pl.g_imports = linkin.g_imports;
+            pl.g_dll = true;
+            rc = pl.link(all.items(), o.out);
+            pl.g_dll = false;
+        } else {
+            ml.g_dylibs = linkin.g_dylibs;
+            ml.g_by_name = linkin.g_names;
+            ml.g_dylib = true;
+            rc = ml.link(all.items(), o.out);
+            ml.g_dylib = false;
+        }
+        if rc != 0 {
+            return fatal(o.json, "E9004", "linking failed");
+        }
+        return CONTINUE;
+    }
+    el.g_shlibs = linkin.g_shlibs;
+    el.g_search_dirs = linkin.g_dirs;
+    el.g_c_lib_axiom = false;
+    el.g_soname = u.basename(o.out);
+    if el.link_shared(os.items(), ob.machine, names.items(), o.out) != 0 {
+        return fatal(o.json, "E9004", "linking failed");
+    }
+    return CONTINUE;
 }
 
 // --emit=lib: a static library (ar.ax) of the program's object (objpath)
@@ -2097,10 +2206,15 @@ fn write_library(o: *Options, objpath: []u8) i32 {
     return CONTINUE;
 }
 
-// The external names an object (ELF or WebAssembly) defines.
+// The external names an object (ELF, Mach-O, COFF or WebAssembly) defines, as
+// its symbol table spells them.
 fn defined_names(d: []u8) [][]u8 {
     let mut out = u.List.[[]u8].empty();
-    if elf.is_object(d) {
+    if mo.is_object(d) {
+        mo.defined_names(d, &mut out);
+    } else if coff.is_object(d) {
+        coff.defined_names(d, &mut out);
+    } else if elf.is_object(d) {
         let ob = elf.read(d);
         if u.notnil(ob) {
             for i in 0..ob.syms.len {

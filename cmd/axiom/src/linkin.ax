@@ -13,8 +13,10 @@
 // shared libraries.
 // =============================================================================
 import "ar.ax" as ar;
+import "coff.ax" as coff;
 import "elf.ax" as elf;
 import "elink.ax" as el;
+import "macho.ax" as mo;
 import "target.ax" as tg;
 import "types.ax" as ty;
 import "util.ax" as u;
@@ -36,6 +38,13 @@ pub let mut g_wmembers: u.List.[*mut wo.Unit] = u.List.[*mut wo.Unit].{ data: @p
 /// not static archives (those are read into g_members).
 pub let mut g_dirs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
 pub let mut g_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+/// Windows: the DLLs' exports that import libraries (their short import
+/// records) and DLLs given to the link name (plink.ax binds to them).
+pub let mut g_imports: u.List.[coff.Import] = u.List.[coff.Import].{ data: @ptr_from_int(*mut coff.Import, 0), len: 0,
+                                                                     cap: 0 };
+/// macOS: the dynamic libraries given to the link (mlink.ax binds to them).
+pub let mut g_dylibs: u.List.[*mut mo.Dylib] = u.List.[*mut mo.Dylib].{ data: @ptr_from_int(*mut *mut mo.Dylib, 0),
+                                                                        len: 0, cap: 0 };
 /// Did load() read anything (objects, members or libraries)?
 pub let mut g_any: bool = false;
 
@@ -85,8 +94,51 @@ pub fn load(paths: [][]u8, flags: [][]u8) bool {
             }
             continue;
         }
-        if (tg.g_os != tg.OS_LINUX) or el_libc_part(name) {
-            g_names.push(name);  // (the other systems' libraries: their linkers)
+        if el_libc_part(name) {
+            g_names.push(name);  // (the C library's own: the program's, or the system's)
+            continue;
+        }
+        if tg.is_windows() {
+            // name.lib, libname.a, libname.dll.a (archives: objects or an
+            // import library), name.dll
+            let mut found = false;
+            for d in g_dirs.items() {
+                for pat in ["%s/%s.lib", "%s/lib%s.a", "%s/lib%s.dll.a", "%s/%s.dll"] {
+                    let p = u.f2(pat, d, name);
+                    if not found and u.file_exists(p) {
+                        ok = add_path(p, 0) and ok;
+                        found = true;
+                    }
+                }
+            }
+            if not found {
+                err(u.f3("cannot find library '%s' (%s.lib, lib%s.a or a DLL in the -L directories)", name, name,
+                         name));
+                ok = false;
+            }
+            continue;
+        }
+        if tg.is_darwin() {
+            // libname.a (an archive), libname.dylib (read: its exports),
+            // else by name (libname.tbd, or nothing here: the system's
+            // libraries; mlink.ax binds by name)
+            let mut found = false;
+            for d in g_dirs.items() {
+                for pat in ["%s/lib%s.a", "%s/lib%s.dylib"] {
+                    let p = u.f2(pat, d, name);
+                    if not found and u.file_exists(p) {
+                        ok = add_path(p, 0) and ok;
+                        found = true;
+                    }
+                }
+            }
+            if not found {
+                g_names.push(name);
+            }
+            continue;
+        }
+        if tg.g_os != tg.OS_LINUX {
+            g_names.push(name);
             continue;
         }
         let p = el.find_library(name, g_dirs.items(), machine());
@@ -101,7 +153,7 @@ pub fn load(paths: [][]u8, flags: [][]u8) bool {
             g_names.push(name);  // (a shared object or script: elink.load_libs reads it)
         }
     }
-    if ((g_objs.len + g_members.len) > 0) and not ty.g_target.is_wasm {
+    if ((g_objs.len + g_members.len) > 0) and (tg.g_os == tg.OS_LINUX) and not ty.g_target.is_wasm {
         // the platform toolchain's compiler runtime, which its objects call
         // (complex arithmetic, 128-bit integers, AArch64's out-of-line
         // atomics, ...): its archives, from which a member is linked only
@@ -111,7 +163,8 @@ pub fn load(paths: [][]u8, flags: [][]u8) bool {
             ok = add_path(a, 0) and ok;
         }
     }
-    g_any = (g_objs.len + g_members.len + g_shlibs.len + g_wunits.len + g_wmembers.len) > 0;
+    g_any = (g_objs.len + g_members.len + g_shlibs.len + g_wunits.len + g_wmembers.len + g_imports.len + g_dylibs.len) >
+            0;
     return ok;
 }
 
@@ -190,6 +243,15 @@ fn add_path(p: []u8, depth: i32) bool {
             return false;
         }
         for m in ms.items() {
+            if coff.is_import(m.data) {
+                let im = coff.read_import(m.data);
+                if im.dll.len == 0 {
+                    err(u.f3("%s(%s): %s", p, m.name, coff.g_error));
+                    return false;
+                }
+                g_imports.push(im);
+                continue;
+            }
             if is_wasm_object(m.data) {
                 let w = read_wasm(m.data, u.f2("%s(%s)", p, m.name));
                 if u.isnil(w) {
@@ -198,7 +260,7 @@ fn add_path(p: []u8, depth: i32) bool {
                 g_wmembers.push(w);
                 continue;
             }
-            if u.ends(m.name, ".o") or elf.is_object(m.data) {
+            if u.ends(m.name, ".o") or u.ends(m.name, ".obj") or is_object(m.data) {
                 let o = read_object(m.data, u.f2("%s(%s)", p, m.name));
                 if u.isnil(o) {
                     return false;
@@ -217,12 +279,34 @@ fn add_path(p: []u8, depth: i32) bool {
         g_wunits.push(w);
         return true;
     }
-    if elf.is_object(d) {
+    if is_object(d) {
         let o = read_object(d, p);
         if u.isnil(o) {
             return false;
         }
         g_objs.push(o);
+        return true;
+    }
+    if mo.is_dylib(d) and tg.is_darwin() {
+        let lib = mo.read_dylib(d, machine() == elf.EM_X86_64);
+        if u.isnil(lib) {
+            err(u.f2("'%s': %s", p, mo.g_error));
+            return false;
+        }
+        g_dylibs.push(lib);
+        return true;
+    }
+    if coff.is_image(d) and tg.is_windows() {
+        // a DLL: what it exports, by name
+        let ims = coff.pe_exports(d, u.basename(p), u64_pick(machine() == elf.EM_AARCH64, coff.MACHINE_ARM64,
+                                                             coff.MACHINE_AMD64));
+        if coff.g_error.len > 0 {
+            err(u.f2("'%s': %s", p, coff.g_error));
+            return false;
+        }
+        for im in ims.items() {
+            g_imports.push(im);
+        }
         return true;
     }
     if (d.len >= 18) and u.str_eq(d[0..4], "\x7fELF") {
@@ -250,14 +334,53 @@ fn add_path(p: []u8, depth: i32) bool {
     return ok;
 }
 
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
 fn bn_rd16(d: []u8, off: usize) u64 {
     return @as(u64, d[off]) | (@as(u64, d[off + 1]) << 8);
 }
 
+/// Is d a relocatable object of a format the linkers read (ELF, Mach-O,
+/// COFF)?
+pub fn is_object(d: []u8) bool {
+    return elf.is_object(d) or mo.is_object(d) or coff.is_object(d);
+}
+
+/// Object d of any format the linkers read, as the linkers take it (with
+/// ELF relocation types), or nil with *why saying why not.
+pub fn read_any(d: []u8, why: *mut []u8) *mut elf.Obj {
+    why.* = "";
+    if mo.is_object(d) {
+        let o = mo.read(d);
+        if u.isnil(o) {
+            why.* = mo.g_error;
+        }
+        return o;
+    }
+    if coff.is_object(d) {
+        let o = coff.read(d);
+        if u.isnil(o) {
+            why.* = coff.g_error;
+        }
+        return o;
+    }
+    return elf.read(d);
+}
+
 fn read_object(d: []u8, name: []u8) *mut elf.Obj {
-    let o = elf.read(d);
+    let mut why: []u8 = "";
+    let o = read_any(d, &mut why);
     if u.isnil(o) {
-        err(u.f1("cannot read the object '%s'", name));
+        if why.len > 0 {
+            err(u.f2("cannot read the object '%s': %s", name, why));
+        } else {
+            err(u.f1("cannot read the object '%s'", name));
+        }
         return o;
     }
     if o.machine != machine() {
@@ -270,8 +393,9 @@ fn read_object(d: []u8, name: []u8) *mut elf.Obj {
 
 /// The names the inputs refer to and do not define (the objects', and
 /// those of the archive members they take), into *out: the program
-/// (the compiler's C library above all) is to define them.
-pub fn refs(out: *mut u.List.[[]u8]) void {
+/// (the compiler's C library above all) is to define them. `roots`: what
+/// the program's own code refers to, which archive members may define.
+pub fn refs(roots: [][]u8, out: *mut u.List.[[]u8]) void {
     let mut defined = u.List.[[]u8].empty();
     let mut undefined = u.List.[[]u8].empty();
     for o in g_objs.items() {
@@ -292,7 +416,14 @@ pub fn refs(out: *mut u.List.[[]u8]) void {
         }
         ms[i] = ar.Syms.{ defs: ds.items(), refs: rs.items() };
     }
-    let take = ar.select(ms[0..nm], undefined.items(), defined.items());
+    let mut wanted = u.List.[[]u8].empty();
+    for n in undefined.items() {
+        wanted.push(n);
+    }
+    for n in roots {
+        wanted.push(n);
+    }
+    let take = ar.select(ms[0..nm], wanted.items(), defined.items());
     let mut have = u.SymMap.[u8].{ keys: u.nil.[usize](), vals: u.nil.[u8](), cap: 0, len: 0 };
     for n in defined.items() {
         have.put(u.intern(n), 1);

@@ -45,17 +45,24 @@
 import "bin.ax" as bn;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
+import "macho.ax" as mo;
 import "nlink.ax" as nl;
 import "std/crypto/sha2" as sha2;
 import "util.ax" as u;
 
-const BASE: u64 = 0x1_0000_0000;  // the image's address before sliding
+const EXEC_BASE: u64 = 0x1_0000_0000;  // an executable's address before sliding (a dynamic library's is 0)
+let mut image_base: u64 = 0x1_0000_0000;
 const PAGE: u64 = 0x4000;
 const CS_PAGE: u64 = 4096;  // the code signature hashes 4 KiB pages
 
-// segment indexes for dyld's opcodes (in load-command order)
-const SEG_TEXT: u64 = 1;
-const SEG_DATA: u64 = 2;
+// __DATA's index for dyld's opcodes (in load-command order: after
+// __PAGEZERO and __TEXT; a dynamic library has no __PAGEZERO)
+fn seg_data() u64 {
+    if g_dylib {
+        return 1;
+    }
+    return 2;
+}
 
 struct Import {
     seg_off: u64,  // offset in __DATA
@@ -71,6 +78,21 @@ let mut dylibs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0
 // function name -> its library's ordinal (from axiom.import.* constants)
 let mut import_ord: u.SymMap.[u32] = u.SymMap.[u32].{
     keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+
+/// The dynamic libraries given to the link (linkin.ax: their install names
+/// and exports), and the libraries named with -l that are not files here
+/// (bound by name: their install names by dylib_path, and the symbols
+/// nothing else names looked up in every library loaded).
+pub let mut g_dylibs: u.List.[*mut mo.Dylib] = u.List.[*mut mo.Dylib].{ data: @ptr_from_int(*mut *mut mo.Dylib, 0),
+                                                                        len: 0, cap: 0 };
+pub let mut g_by_name: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+// a library is bound by name: the symbols of no library known are looked
+// up in all of them (BIND_SPECIAL_DYLIB_FLAT_LOOKUP)
+let mut flat: bool = false;
+const FLAT_LOOKUP: u32 = 0xfe;  // (the symbol table's DYNAMIC_LOOKUP_ORDINAL)
+
+/// Linking a dynamic library (--emit=shared): MH_DYLIB (dylib.ax).
+pub let mut g_dylib: bool = false;
 
 let mut X64: bool = false;  // linking x86-64 objects (else arm64 ones)
 
@@ -120,9 +142,41 @@ fn is_abs64(ty: u32) bool {
     return ty == elf.R_AARCH64_ABS64;
 }
 
+// The platform's thread-local variables, of the platform toolchain's
+// objects (macho.ax reads them as these sections): their descriptors
+// (__thread_vars: a function, a key, the variable's offset in the
+// template; dyld sets the first two), and the template (__thread_data,
+// then __thread_bss), which dyld copies for each thread. The code calls a
+// descriptor's function to find a variable (TLVP relocations: through a
+// GOT slot holding the descriptor's address).
+const C_TLV: i32 = 10;
+// a dynamic library's initializer and terminator pointers (__mod_init_func,
+// __mod_term_func: dyld calls them); an executable's start-up runs them
+const C_INIT: i32 = 13;
+const C_FINI: i32 = 14;
+const C_TLV_DATA: i32 = 11;
+const C_TLV_BSS: i32 = 12;
+let mut has_tlv: bool = false;
+let mut tlv_start: u64 = 0;  // the template's
+
 // A section's place: read-only data that holds addresses goes in __DATA,
 // since dyld rebases (or binds) them.
 fn class_of(s: *elf.Sec) i32 {
+    if u.str_eq(s.name, ".macho.thread_vars") {
+        return C_TLV;
+    }
+    if u.str_eq(s.name, ".macho.thread_data") {
+        return C_TLV_DATA;
+    }
+    if u.str_eq(s.name, ".macho.thread_bss") {
+        return C_TLV_BSS;
+    }
+    if g_dylib and (s.kind == elf.S_DATA) and u.starts(s.name, ".init_array") {
+        return C_INIT;
+    }
+    if g_dylib and (s.kind == elf.S_DATA) and u.starts(s.name, ".fini_array") {
+        return C_FINI;
+    }
     let k = s.kind;
     if k == elf.S_DEBUG {
         return nl.C_DEBUG;
@@ -196,25 +250,44 @@ fn dylib_path(name: []u8) []u8 {
     return u.f3("/System/Library/Frameworks/%s.framework/Versions/%s/%s", name, ver, name);
 }
 
+// A library's ordinal (by its install name; "": libSystem's, 1), the
+// library added if new.
+fn dylib_ordinal(path: []u8) u32 {
+    if (path.len == 0) or u.str_eq(path, "/usr/lib/libSystem.B.dylib") {
+        return 1;
+    }
+    for j in 0..dylibs.len {
+        if u.str_eq(dylibs.get(j), path) {
+            return @int_cast(u32, j) + 2;
+        }
+    }
+    dylibs.push(u.dup(path));
+    return @int_cast(u32, dylibs.len) + 1;
+}
+
 // The libraries that extern blocks named (the functions of Windows DLLs
-// are the runtime's ax_unavailable: nl.use_unavailable).
+// are the runtime's ax_unavailable: nl.use_unavailable), then those given
+// to the link (their exports' ordinals, where no extern block named
+// another library), and those named with -l only.
 fn collect_dylibs() void {
     for f in nl.extern_fns(nl.is_windows_dll).items() {
-        let path = dylib_path(f.lib);
-        let mut ord: u32 = 1;
-        if path.len > 0 {
-            let mut k = dylibs.len;
-            for j in 0..dylibs.len {
-                if u.str_eq(dylibs.get(j), path) {
-                    k = j;
-                }
+        import_ord.put(u.intern(f.name), dylib_ordinal(dylib_path(f.lib)));
+    }
+    for lib in g_dylibs.items() {
+        let ord = dylib_ordinal(lib.install);
+        for n in lib.names.items() {
+            if import_ord.get(n) == 0 {
+                import_ord.put(n, ord);
             }
-            if k == dylibs.len {
-                dylibs.push(u.dup(path));
-            }
-            ord = @int_cast(u32, k) + 2;
         }
-        import_ord.put(u.intern(f.name), ord);
+    }
+    flat = false;
+    for n in g_by_name.items() {
+        let path = dylib_path(n);
+        if path.len > 0 {
+            _ = dylib_ordinal(path);
+            flat = true;
+        }
     }
 }
 
@@ -222,6 +295,9 @@ fn collect_dylibs() void {
 fn ordinal_of(name: []u8) u32 {
     let k = import_ord.get(u.intern(name));
     if k == 0 {
+        if flat {
+            return FLAT_LOOKUP;
+        }
         return 1;
     }
     return k;
@@ -266,6 +342,9 @@ let INODE64_FNS: [16][]u8 = ["stat", "lstat", "fstat", "fstatat", "statfs", "fst
 
 // A function's name from the name it is bound by (bound_name).
 fn unbound_name(b: []u8) []u8 {
+    if not u.starts(b, "_") {
+        return u.cat2("\x01", b);  // (a name as it is)
+    }
     let mut n = b[1..];
     let k = u.find(n, '$');
     if k >= 0 {
@@ -281,6 +360,9 @@ fn unbound_name(b: []u8) []u8 {
 // names (exit, malloc, ...) are a C program's own, which the runtime must
 // not call in their place.
 fn bound_name(name0: []u8) []u8 {
+    if (name0.len > 0) and (name0[0] == 1) {
+        return name0[1..];  // (a name as it is: no underscore)
+    }
     let mut name = name0;
     if u.starts(name, "__axiom_libc_") {
         name = name[13..];
@@ -333,7 +415,7 @@ fn file_of(addr: u64) u64 {
     if addr >= data_addr {
         return data_off + (addr - data_addr);
     }
-    return addr - BASE;
+    return addr - image_base;
 }
 
 // -----------------------------------------------------------------------------
@@ -354,7 +436,7 @@ fn apply_relocs(b: []mut u8) void {
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
             let cls = nl.sec_cls.get(oi)[k];
-            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) {
+            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) or (cls == C_TLV_BSS) {
                 continue;
             }
             let base = nl.sec_addr.get(oi)[k];
@@ -362,6 +444,11 @@ fn apply_relocs(b: []mut u8) void {
                 let p = base + r.off;
                 let fo = file_of(p);
                 let t = r.ty;
+                if (cls == C_TLV) and ((r.off % 24) == 16) and is_abs64(t) {
+                    // a descriptor's offset of its variable in the template
+                    bn.w64(b, fo, (nl.sym_addr(oi, r.sym) +% @bit_cast(u64, r.addend)) -% tlv_start);
+                    continue;
+                }
                 let imp = is_import(oi, r.sym);
                 let mut sv = nl.sym_addr(oi, r.sym);
                 if imp and nl.is_call_reloc(X64, t) {
@@ -414,7 +501,7 @@ fn apply_relocs(b: []mut u8) void {
 fn rel32(b: []mut u8, fo: u64, p: u64, target: u64) void {
     let v = @bit_cast(i64, target) - @bit_cast(i64, p);
     if (v < -0x8000_0000) or (v > 0x7fff_ffff) {
-        nl.err("relocation out of range (pc32)");
+        nl.err(u.f2("relocation out of range (pc32): at %s, to %s", u.hex16(p), u.hex16(target)));
     }
     bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
 }
@@ -558,18 +645,18 @@ fn signature(file: []u8, ident: []u8, limit: u64, text_size: u64) []u8 {
     be32(&mut b, 0);   // nSpecialSlots
     be32(&mut b, npages);
     be32(&mut b, limit);
-    b.u8_(32);                // hashSize
-    b.u8_(2);                 // hashType: SHA-256
-    b.u8_(0);                 // platform
-    b.u8_(12);                // log2 of the page size
-    be32(&mut b, 0);          // spare2
-    be32(&mut b, 0);          // scatterOffset
-    be32(&mut b, 0);          // teamOffset
-    be32(&mut b, 0);          // spare3
-    be64(&mut b, 0);          // codeLimit64
-    be64(&mut b, 0);          // execSegBase
-    be64(&mut b, text_size);  // execSegLimit
-    be64(&mut b, 1);          // CS_EXECSEG_MAIN_BINARY
+    b.u8_(32);                              // hashSize
+    b.u8_(2);                               // hashType: SHA-256
+    b.u8_(0);                               // platform
+    b.u8_(12);                              // log2 of the page size
+    be32(&mut b, 0);                        // spare2
+    be32(&mut b, 0);                        // scatterOffset
+    be32(&mut b, 0);                        // teamOffset
+    be32(&mut b, 0);                        // spare3
+    be64(&mut b, 0);                        // codeLimit64
+    be64(&mut b, 0);                        // execSegBase
+    be64(&mut b, text_size);                // execSegLimit
+    be64(&mut b, u64_pick(g_dylib, 0, 1));  // CS_EXECSEG_MAIN_BINARY (not for a dynamic library)
     b.put(ident);
     b.u8_(0);
     while @as(u64, b.len()) < (24 + hash_off) {
@@ -589,21 +676,140 @@ fn signature(file: []u8, ident: []u8, limit: u64, text_size: u64) []u8 {
 }
 
 // The export trie: __mh_execute_header (at the image's start) only.
+// The exports' trie (dyld's lookups walk it): an executable's
+// __mh_execute_header, a dynamic library's exports; one character an edge
+// (so no two edges of a node share a prefix), each terminal node's
+// information its flags (0: a regular symbol) and the offset from the
+// image's start. The nodes' offsets (ULEB128, whose sizes depend on them)
+// are found by iterating until they stay put.
+struct TNode {
+    term: bool,
+    value: u64,
+    kids: u.List.[u64],  // character << 32 | node
+    at: u64,
+}
+
 fn export_trie() []u8 {
+    let mut names = u.List.[[]u8].empty();
+    let mut values = u.List.[u64].empty();
+    if g_dylib {
+        for gi in dylib_exports.items() {
+            let g = nl.gsyms.get(@as(usize, gi));
+            names.push(bound_name(g.name));
+            values.push(nl.sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym) - image_base);
+        }
+    } else {
+        names.push("__mh_execute_header");
+        values.push(0);
+    }
+    let mut nodes = u.List.[TNode].empty();
+    nodes.push(TNode.{ term: false, value: 0, kids: u.List.[u64].empty(), at: 0 });
+    for k in 0..names.len {
+        let mut n: usize = 0;
+        for c in names.get(k) {
+            let mut next: usize = 0;
+            for x in nodes.at(n).kids.items() {
+                if (x >> 32) == @as(u64, c) {
+                    next = @truncate(usize, x & 0xffff_ffff);
+                }
+            }
+            if next == 0 {
+                nodes.push(TNode.{ term: false, value: 0, kids: u.List.[u64].empty(), at: 0 });
+                next = nodes.len - 1;
+                nodes.at(n).kids.push((@as(u64, c) << 32) | @as(u64, next));
+            }
+            n = next;
+        }
+        nodes.at(n).term = true;
+        nodes.at(n).value = values.get(k);
+    }
+    // the offsets
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut pos: u64 = 0;
+        for i in 0..nodes.len {
+            let x = nodes.at(i);
+            if x.at != pos {
+                x.at = pos;
+                changed = true;
+            }
+            let mut size: u64 = 1;  // (the terminal size: 0, or below)
+            if x.term {
+                let ts = 1 + uleb_size(x.value);
+                size = uleb_size(ts) + ts;
+            }
+            size += 1;  // the number of edges
+            for kd in x.kids.items() {
+                size += 2 + uleb_size(nodes.get(@truncate(usize, kd & 0xffff_ffff)).at);
+            }
+            pos += size;
+        }
+    }
     let mut t = bn.new_bytes();
-    let name = "__mh_execute_header";
-    t.u8_(0);  // the root: no terminal information
-    t.u8_(1);  // one edge
-    t.put(name);
-    t.u8_(0);
-    let child = @as(u64, t.len()) + 1;
-    t.uleb(child);
-    t.u8_(2);  // terminal information: 2 bytes
-    t.u8_(0);  // flags: regular
-    t.u8_(0);  // the offset from the image's start
-    t.u8_(0);  // no edges
+    for i in 0..nodes.len {
+        let x = nodes.get(i);
+        if x.term {
+            t.uleb(1 + uleb_size(x.value));
+            t.u8_(0);  // flags: a regular symbol
+            t.uleb(x.value);
+        } else {
+            t.u8_(0);
+        }
+        t.u8_(@truncate(u8, @as(u64, x.kids.len)));
+        for kd in x.kids.items() {
+            t.u8_(@truncate(u8, kd >> 32));
+            t.u8_(0);
+            t.uleb(nodes.get(@truncate(usize, kd & 0xffff_ffff)).at);
+        }
+    }
     t.align(8);
     return t.view();
+}
+
+fn uleb_size(x: u64) u64 {
+    let mut n: u64 = 1;
+    let mut v = x >> 7;
+    while v != 0 {
+        n += 1;
+        v = v >> 7;
+    }
+    return n;
+}
+
+// The external symbols defined: a dynamic library's exports, or an
+// executable's header and main.
+fn n_extdef() u64 {
+    if g_dylib {
+        return @as(u64, dylib_exports.len);
+    }
+    return 2;
+}
+
+// A dynamic library's exports (see g_dylib), sorted by their Mach-O names.
+let mut dylib_exports: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
+let mut n_inputs: usize = 0;
+let mut install_name: []u8 = "";
+
+fn collect_exports() void {
+    dylib_exports = u.List.[u32].empty();
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.get(gi);
+        if (g.obj < 0) or (@as(usize, @bit_cast(u32, g.obj)) >= n_inputs) {
+            continue;
+        }
+        let sy = nl.objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym));
+        if sy.hidden or (sy.bind == elf.B_LOCAL) or elf.is_part_name(sy.name) or u.starts(sy.name, "axiom.") or
+           u.starts(sy.name, "__start_") or u.starts(sy.name, "__stop_") or (sy.ty == elf.T_TLS) {
+            continue;
+        }
+        dylib_exports.push(@truncate(u32, gi));
+    }
+    u.sort.[u32](dylib_exports.items(), cmp_export);
+}
+
+fn cmp_export(a: u32, b: u32) i32 {
+    return u.str_cmp(bound_name(nl.gsyms.get(@as(usize, a)).name), bound_name(nl.gsyms.get(@as(usize, b)).name));
 }
 
 // Runs of consecutive words are one opcode (programs hold many tables of
@@ -613,7 +819,7 @@ fn rebase_info() []u8 {
     let rs = rebases.items();
     u.sort.[u64](rs, cmp_u64);
     b.u8_(0x11);  // REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER
-    b.u8_(0x20 | @truncate(u8, SEG_DATA));  // REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+    b.u8_(0x20 | @truncate(u8, seg_data()));  // REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
     b.uleb(0);
     let mut cur: u64 = 0;  // the opcodes' address (dyld's), as a segment offset
     let mut i: usize = 0;
@@ -662,7 +868,9 @@ fn bind_info() []u8 {
         let o = ordinal_of(unbound_name(x.name));
         if o != ord {
             ord = o;
-            if o < 16 {
+            if o == FLAT_LOOKUP {
+                b.u8_(0x3e);  // BIND_OPCODE_SET_DYLIB_SPECIAL_IMM: BIND_SPECIAL_DYLIB_FLAT_LOOKUP (-2)
+            } else if o < 16 {
                 b.u8_(0x10 | @truncate(u8, o));  // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM
             } else {
                 b.u8_(0x20);  // BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB
@@ -674,7 +882,7 @@ fn bind_info() []u8 {
         b.u8_(0);
         b.u8_(0x60);  // BIND_OPCODE_SET_ADDEND_SLEB
         b.sleb(x.addend);
-        b.u8_(0x70 | @truncate(u8, SEG_DATA));  // BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+        b.u8_(0x70 | @truncate(u8, seg_data()));  // BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
         b.uleb(x.seg_off);
         b.u8_(0x90);  // BIND_OPCODE_DO_BIND
     }
@@ -686,18 +894,49 @@ fn bind_info() []u8 {
 // Links `inputs` into the executable `out`. 0: done; 1: errors (reported).
 pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     X64 = (inputs.len > 0) and (inputs[0].machine == elf.EM_X86_64);
+    image_base = u64_pick(g_dylib, 0, EXEC_BASE);
+    install_name = u.cat2("@rpath/", u.basename(out));
+    n_inputs = inputs.len;
     nl.begin(inputs);
+    dylibs = u.List.[[]u8].empty();
+    import_ord = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     nl.objs.push(own_object());
-    nl.objs.push(jstub.build(machine(), false));  // (C's setjmp and longjmp)
+    if not g_dylib {
+        nl.objs.push(jstub.build(machine(), false));  // (C's setjmp and longjmp)
+    }
     nl.objs.push(elf.rets_bounds(machine()));
     collect_dylibs();
     collect_symbols();
     let mn = nl.gsym_index("main");
-    if nl.gsyms.at(@as(usize, mn)).obj < 0 {
+    if (nl.gsyms.at(@as(usize, mn)).obj < 0) and not g_dylib {
         nl.err("no 'main' function");
     }
     nl.classify(class_of);
+    has_tlv = false;
+    for oi in 0..nl.objs.len {
+        for c in nl.sec_cls.get(oi) {
+            if (c >= C_TLV) and (c <= C_TLV_BSS) {
+                has_tlv = true;
+            }
+        }
+    }
     scan_relocs();
+    if g_dylib {
+        collect_exports();
+        for oi in 0..n_inputs {
+            for c in nl.sec_cls.get(oi) {
+                if (c == nl.C_TDATA) or (c == nl.C_TBSS) {
+                    let o = nl.objs.get(oi);
+                    for k in 0..o.secs.len {
+                        if (nl.sec_cls.get(oi)[k] == c) and (elf.sec_size(o.secs.get(k)) > 0) {
+                            nl.err(u.f1("%s has thread-locals of this compiler's, which a dynamic library cannot have (the runtime that makes their blocks is an executable's)",
+                                        nl.obj_name(oi)));
+                        }
+                    }
+                }
+            }
+        }
+    }
     if nl.errors != 0 {
         return 1;
     }
@@ -777,7 +1016,7 @@ fn write_dsym(out: []u8, uuid: []u8, ly: *Layout) i32 {
     h.u32_(0x1b);  // LC_UUID
     h.u32_(24);
     h.put(uuid);
-    segment(&mut h, "__TEXT", BASE, ly.text_size, 0, 0, 5, 1);
+    segment(&mut h, "__TEXT", image_base, ly.text_size, 0, 0, 5, 1);
     section(&mut h, "__text", "__TEXT", text_addr, ly.text_end - text_addr, 0, 16, 0x8000_0400);
     let mut size: u64 = 0;
     for k in 0..dbg.len {
@@ -845,6 +1084,14 @@ struct Layout {
     ngot: u64,        // GOT slots
     data_start: u64,  // __data
     data_end: u64,
+    tlv_vars: u64,  // __thread_vars, __thread_data (from tlv_start), __thread_bss
+    tlv_vars_end: u64,
+    tlv_data_end: u64,
+    tlv_bss: u64,
+    tlv_bss_end: u64,
+    init_at: u64,  // a dynamic library's __mod_init_func, then __mod_term_func
+    init_end: u64,
+    fini_end: u64,
     bss_addr: u64,
     bss_end: u64,
     data_filesize: u64,  // __DATA's
@@ -857,24 +1104,33 @@ fn lay_out() Layout {
     let mut ncmds: u64 = 13;
     let mut sizeofcmds: u64 = (72 + (72 + (2 * 80)) + (72 + (3 * 80)) + 72) + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 56 +
                               16;
+    if has_tlv {
+        sizeofcmds += 3 * 80;
+    }
+    if g_dylib {
+        // no __PAGEZERO, LC_LOAD_DYLINKER, LC_MAIN; LC_ID_DYLIB; the
+        // initializers' and terminators' sections
+        ncmds -= 2;
+        sizeofcmds = (sizeofcmds - 72 - 32 - 24) + dylib_cmd_size(install_name) + (2 * 80);
+    }
     for d in dylibs.items() {
         ncmds += 1;
         sizeofcmds += dylib_cmd_size(d);
     }
 
     // __TEXT
-    text_addr = nl.align_up(BASE + 32 + sizeofcmds, 16);
+    text_addr = nl.align_up(image_base + 32 + sizeofcmds, 16);
     let code_end = nl.place(nl.C_TEXT, text_addr);
     stub_addr = nl.align_up(code_end, 4);
     let text_end = stub_addr + (@as(u64, stubs.len) * stub_size());
     let const_addr = nl.align_up(text_end, nl.class_align(nl.C_CONST));
     let const_end = nl.place(nl.C_CONST, const_addr);
-    let text_size = nl.align_up(const_end - BASE, PAGE);
+    let text_size = nl.align_up(const_end - image_base, PAGE);
 
     // __DATA: GOT slots that dyld binds (libSystem) or rebases (our own
     // symbols), data, the thread-local template, then .bss
     let ngot = @as(u64, nl.got_sym.len);
-    data_addr = BASE + text_size;
+    data_addr = image_base + text_size;
     data_off = text_size;
     got_addr = data_addr;
     let data_start = nl.align_up(got_addr + (ngot * 8), 16);
@@ -886,12 +1142,38 @@ fn lay_out() Layout {
     tls_filesz = tdata_end - tls_addr;
     tls_memsz = tbss_end - tls_addr;
     data_end = tdata_end;
-    let bss_addr = nl.align_up(data_end, nl.class_align(nl.C_BSS));
+    let init_at = nl.align_up(data_end, 8);
+    let init_end = nl.place(C_INIT, init_at);
+    let fini_end = nl.place(C_FINI, init_end);
+    if g_dylib {
+        data_end = fini_end;
+    }
+    // the platform's thread-local variables: descriptors, the template's
+    // data, then (zero-filled) the rest of the template
+    let tlv_vars = nl.align_up(data_end, 8);
+    let tlv_vars_end = nl.place(C_TLV, tlv_vars);
+    tlv_start = nl.align_up(tlv_vars_end, @max(nl.class_align(C_TLV_DATA), nl.class_align(C_TLV_BSS)));
+    let tlv_data_end = nl.place(C_TLV_DATA, tlv_start);
+    if has_tlv {
+        data_end = tlv_data_end;
+    }
+    let tlv_bss = nl.align_up(data_end, nl.class_align(C_TLV_BSS));
+    let tlv_bss_end = nl.place(C_TLV_BSS, tlv_bss);
+    let bss_addr = nl.align_up(u64_pick(has_tlv, tlv_bss_end, data_end), nl.class_align(nl.C_BSS));
     let bss_end = nl.place(nl.C_BSS, bss_addr);
     return Layout.{ ncmds: ncmds, sizeofcmds: sizeofcmds, text_end: text_end, const_addr: const_addr,
-                    const_end: const_end, text_size: text_size, ngot: ngot, data_start: data_start, data_end: data_end,
+                    const_end: const_end, text_size: text_size, ngot: ngot, data_start: data_start, data_end: tdata_end,
+                    tlv_vars: tlv_vars, tlv_vars_end: tlv_vars_end, tlv_data_end: tlv_data_end, tlv_bss: tlv_bss,
+                    tlv_bss_end: tlv_bss_end, init_at: init_at, init_end: init_end, fini_end: fini_end,
                     bss_addr: bss_addr, bss_end: bss_end, data_filesize: nl.align_up(data_end - data_addr, PAGE),
                     data_vmsize: nl.align_up(bss_end - data_addr, PAGE) };
+}
+
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 // __TEXT and __DATA's contents in b: the sections, the stubs, the GOT and
@@ -901,6 +1183,10 @@ fn write_contents(b: []mut u8) void {
     nl.copy_class(b, nl.C_CONST, file_of);
     nl.copy_class(b, nl.C_DATA, file_of);
     nl.copy_class(b, nl.C_TDATA, file_of);
+    nl.copy_class(b, C_TLV, file_of);
+    nl.copy_class(b, C_TLV_DATA, file_of);
+    nl.copy_class(b, C_INIT, file_of);
+    nl.copy_class(b, C_FINI, file_of);
 
     // stubs: adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16
     // (x86-64: jmp [rip + slot]; int3; int3)
@@ -1005,10 +1291,10 @@ fn link_edit(ly: *Layout, ident: []u8) LinkEdit {
     let sig_off = nl.align_up(str_off + @as(u64, strtab.len()), 16);
     let sig_size = signature_size(ident, sig_off);
     return LinkEdit.{ rebase: rebase, bind: bind, exports: exports, symtab: symtab, strtab: strtab,
-                      nsyms: @as(u64, syms.len), nlocal: nlocal, nundef: @as(u64, syms.len) - (nlocal + 2), off: le_off,
-                      addr: data_addr + ly.data_vmsize, size: (sig_off + sig_size) - le_off, rebase_off: rebase_off,
-                      bind_off: bind_off, export_off: export_off, sym_off: sym_off, str_off: str_off, sig_off: sig_off,
-                      sig_size: sig_size };
+                      nsyms: @as(u64, syms.len), nlocal: nlocal, nundef: @as(u64, syms.len) - (nlocal + n_extdef()),
+                      off: le_off, addr: data_addr + ly.data_vmsize, size: (sig_off + sig_size) - le_off,
+                      rebase_off: rebase_off, bind_off: bind_off, export_off: export_off, sym_off: sym_off,
+                      str_off: str_off, sig_off: sig_off, sig_size: sig_size };
 }
 
 // The symbol table's symbols: the local ones (every defined symbol), the
@@ -1024,7 +1310,7 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
                 continue;
             }
             let cls = nl.sec_cls.get(oi)[@as(usize, @bit_cast(u32, s.sec))];
-            if (cls == nl.C_TDATA) or (cls == nl.C_TBSS) {
+            if (cls == nl.C_TDATA) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) or (cls >= C_TLV) or (cls < 0) {
                 continue;
             }
             if (s.bind != elf.B_LOCAL) and (nl.global_of(oi, @int_cast(u32, si)) >= 0) {
@@ -1039,7 +1325,7 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
             } else if cls == nl.C_DATA {
                 sect = 4;
             } else if cls == nl.C_BSS {
-                sect = 5;
+                sect = @truncate(u8, 5 + u64_pick(has_tlv, 3, 0) + u64_pick(g_dylib, 2, 0));
             }
             syms.push(
                 NSym.{
@@ -1048,8 +1334,18 @@ fn symbols(nlocal: *mut u64) u.List.[NSym] {
         }
     }
     nlocal.* = @as(u64, syms.len);
-    syms.push(NSym.{ name: "__mh_execute_header", ty: 0x0f, sect: 1, desc: 0x10, value: BASE });
-    syms.push(NSym.{ name: "_main", ty: 0x0f, sect: 1, desc: 0, value: nl.global_addr("main") });
+    if g_dylib {
+        for gi in dylib_exports.items() {
+            let g = nl.gsyms.get(@as(usize, gi));
+            syms.push(
+                NSym.{
+                    name: bound_name(g.name), ty: 0x0f, sect: 1, desc: 0,
+                    value: nl.sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym) });
+        }
+    } else {
+        syms.push(NSym.{ name: "__mh_execute_header", ty: 0x0f, sect: 1, desc: 0x10, value: image_base });
+        syms.push(NSym.{ name: "_main", ty: 0x0f, sect: 1, desc: 0, value: nl.global_addr("main") });
+    }
     let mut undef = u.List.[[]u8].empty();
     for gi in 0..nl.gsyms.len {
         let g = nl.gsyms.at(gi);
@@ -1078,19 +1374,36 @@ fn load_commands(h: *mut bn.Bytes, ly: *Layout, le: *LinkEdit) usize {
     h.u32_(0xfeed_facf);  // MH_MAGIC_64
     h.u32_(cpu_type());
     h.u32_(cpu_subtype());
-    h.u32_(2);  // MH_EXECUTE
+    h.u32_(u64_pick(g_dylib, 6, 2));  // MH_DYLIB, MH_EXECUTE
     h.u32_(ly.ncmds);
     h.u32_(ly.sizeofcmds);
-    h.u32_(0x0020_0085);  // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+    // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE (and MH_HAS_TLV_DESCRIPTORS)
+    // (a dynamic library: MH_NO_REEXPORTED_DYLIBS, not MH_PIE)
+    h.u32_(u64_pick(g_dylib, 0x0010_0085, 0x0020_0085) | u64_pick(has_tlv, 0x0080_0000, 0));
     h.u32_(0);
-    segment(h, "__PAGEZERO", 0, BASE, 0, 0, 0, 0);
-    segment(h, "__TEXT", BASE, ly.text_size, 0, ly.text_size, 5, 2);
+    if not g_dylib {
+        segment(h, "__PAGEZERO", 0, image_base, 0, 0, 0, 0);
+    }
+    segment(h, "__TEXT", image_base, ly.text_size, 0, ly.text_size, 5, 2);
     section(h, "__text", "__TEXT", text_addr, ly.text_end - text_addr, file_of(text_addr), 16, 0x8000_0400);
     section(h, "__const", "__TEXT", ly.const_addr, ly.const_end - ly.const_addr, file_of(ly.const_addr),
             @max(nl.class_align(nl.C_CONST), 1), 0);
-    segment(h, "__DATA", data_addr, ly.data_vmsize, data_off, ly.data_filesize, 3, 3);
+    segment(h, "__DATA", data_addr, ly.data_vmsize, data_off, ly.data_filesize, 3,
+            3 + u64_pick(has_tlv, 3, 0) + u64_pick(g_dylib, 2, 0));
     section(h, "__got", "__DATA", got_addr, ly.ngot * 8, data_off, 8, 0);
     section(h, "__data", "__DATA", ly.data_start, ly.data_end - ly.data_start, file_of(ly.data_start), 16, 0);
+    if g_dylib {
+        section(h, "__mod_init_func", "__DATA", ly.init_at, ly.init_end - ly.init_at, file_of(ly.init_at), 8, 9);       // S_MOD_INIT_FUNC_POINTERS
+        section(h, "__mod_term_func", "__DATA", ly.init_end, ly.fini_end - ly.init_end, file_of(ly.init_end), 8, 0xa);  // S_MOD_TERM_FUNC_POINTERS
+    }
+    if has_tlv {
+        section(h, "__thread_vars", "__DATA", ly.tlv_vars, ly.tlv_vars_end - ly.tlv_vars, file_of(ly.tlv_vars), 8,
+                0x13);  // S_THREAD_LOCAL_VARIABLES
+        section(h, "__thread_data", "__DATA", tlv_start, ly.tlv_data_end - tlv_start, file_of(tlv_start),
+                @max(nl.class_align(C_TLV_DATA), 1), 0x11);  // S_THREAD_LOCAL_REGULAR
+        section(h, "__thread_bss", "__DATA", ly.tlv_bss, ly.tlv_bss_end - ly.tlv_bss, 0,
+                @max(nl.class_align(C_TLV_BSS), 1), 0x12);  // S_THREAD_LOCAL_ZEROFILL
+    }
     section(h, "__bss", "__DATA", ly.bss_addr, ly.bss_end - ly.bss_addr, 0, @max(nl.class_align(nl.C_BSS), 1), 1);
     segment(h, "__LINKEDIT", le.addr, nl.align_up(le.size, PAGE), le.off, le.size, 1, 0);
     h.u32_(0x8000_0022);  // LC_DYLD_INFO_ONLY
@@ -1116,17 +1429,32 @@ fn load_commands(h: *mut bn.Bytes, ly: *Layout, le: *LinkEdit) usize {
     h.u32_(0);  // ilocalsym
     h.u32_(le.nlocal);
     h.u32_(le.nlocal);  // iextdefsym
-    h.u32_(2);
-    h.u32_(le.nlocal + 2);  // iundefsym
+    h.u32_(n_extdef());
+    h.u32_(le.nlocal + n_extdef());  // iundefsym
     h.u32_(le.nundef);
     for _k in @as(u32, 0)..12 {
         h.u32_(0);  // no TOC, modules, external or indirect symbols, relocations
     }
-    h.u32_(0xe);  // LC_LOAD_DYLINKER
-    h.u32_(32);
-    h.u32_(12);
-    name16(h, "/usr/lib/dyld");
-    h.u32_(0);
+    if g_dylib {
+        // LC_ID_DYLIB: the install name programs load it by
+        let size = dylib_cmd_size(install_name);
+        h.u32_(0xd);
+        h.u32_(size);
+        h.u32_(24);
+        h.u32_(1);
+        h.u32_(0x0001_0000);  // current version 1.0
+        h.u32_(0x0001_0000);  // compatibility version 1.0
+        h.put(install_name);
+        for _k in @as(u64, install_name.len) + 24..size {
+            h.u8_(0);
+        }
+    } else {
+        h.u32_(0xe);  // LC_LOAD_DYLINKER
+        h.u32_(32);
+        h.u32_(12);
+        name16(h, "/usr/lib/dyld");
+        h.u32_(0);
+    }
     h.u32_(0x1b);  // LC_UUID (filled in by the caller)
     h.u32_(24);
     let uuid_at = h.len();
@@ -1137,11 +1465,13 @@ fn load_commands(h: *mut bn.Bytes, ly: *Layout, le: *LinkEdit) usize {
     h.u32_(0x000b_0000);  // minos 11.0, the first for Apple silicon (and the runtime's on x86-64: __ulock_wait2)
     h.u32_(0x000b_0000);  // sdk
     h.u32_(0);            // no tools
-    h.u32_(0x8000_0028);  // LC_MAIN
-    h.u32_(24);
-    h.u64_(file_of(nl.global_addr("main")));
-    // the main thread's stack (--stack-size; 0: the system's 8 MiB)
-    h.u64_(nl.align_up(nl.g_stack_size, 0x4000));
+    if not g_dylib {
+        h.u32_(0x8000_0028);  // LC_MAIN
+        h.u32_(24);
+        h.u64_(file_of(nl.global_addr("main")));
+        // the main thread's stack (--stack-size; 0: the system's 8 MiB)
+        h.u64_(nl.align_up(nl.g_stack_size, 0x4000));
+    }
     load_dylib(h, "/usr/lib/libSystem.B.dylib", 0x0547_0000);  // current version 1351
     for d in dylibs.items() {
         load_dylib(h, d, 0x0001_0000);

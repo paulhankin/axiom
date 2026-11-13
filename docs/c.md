@@ -128,8 +128,9 @@ errors before anything is compiled.
 | Value | Output |
 |---|---|
 | `exe` | The default: an executable (a `.wasm` module for WebAssembly targets). |
-| `obj` | An object file. |
+| `obj` | An object file, in the target's format: ELF for Linux, Mach-O for macOS, COFF for Windows (the tool conventions' for WebAssembly). |
 | `lib` | A static library: an archive of the object, and of the objects among the inputs (`libprog.a`, `prog.lib` for Windows). |
+| `shared` | A shared library of C units: `libprog.so` (ELF), `libprog.dylib` (Mach-O), `prog.dll` ("Shared libraries", below). |
 | `ir` | The compiler's IR as text. |
 | `c-pp` | The preprocessed text: the tokens of the translation unit, on their lines. |
 | `c-tokens` | The tokens, one to a line, with their kinds and values. |
@@ -140,7 +141,8 @@ errors before anything is compiled.
 source with `.c` removed: `prog`, `prog.wasm`, `prog.o` or `prog.ir`.
 
 An object or IR of translation units that do not define `main` holds their code alone:
-there is no start-up code and no runtime. Objects link with each other and into programs,
+there is no start-up code and no runtime (not even the runtime's helpers, such as
+`axiom_shadow_stack`). Objects link with each other and into programs,
 by the compiler and by the system's toolchain (`cc main.c lib.o`): "Objects of this
 compiler", below.
 
@@ -289,8 +291,8 @@ unit of 200 functions, say) adds nothing to a program that calls none of its fun
 and the size of one that calls one function is that of the program with that function
 alone. A program linked with objects and libraries ("Objects and libraries") keeps
 besides what those refer to (the compiler's linker reads them before the program is
-compiled). An object (`--emit=obj`), and a program that the system's linker links (on
-the targets where the compiler's does not read such inputs yet), keep every definition
+compiled). An object (`--emit=obj`), a static or shared library (`--emit=lib`,
+`--emit=shared`), and a program that the system's linker links, keep every definition
 of external linkage of the program's own units and what it reaches (a static function
 nothing calls, such as a header's helper, is left out); the C library's units ("The C
 library") are stripped there too.
@@ -397,11 +399,42 @@ format (this compiler's, and `clang`'s for the same target) and archives of them
 with `-L` and `-l` (`libname.a`), with the same member selection; a C source given with
 `--link=` is compiled by `clang` first. The constructors of such objects (their
 `INIT_FUNCS`) are not run: on WebAssembly a constructor must be in a C unit of the
-program. On macOS and Windows the compiler's linkers do not read such inputs yet: an
-Axiom program for them links only the libraries its `extern "C"` blocks name, and a link
-with objects or libraries for them is `E9004` ("linking C code or libraries for ... is
-not supported yet"); their objects of this compiler (ELF ones) are linked by `axiom
-build` from the sources.
+program. On macOS (`mlink.ax`) and Windows (`plink.ax`) the compiler's linkers take the objects and
+static archives of the platform's toolchain and of this compiler, in the platform's
+format, for both processors (`macho.ax`, `coff.ax` read them), with the same member
+selection; what the objects refer to and do not define comes from the libraries:
+
+- **Mach-O objects** (arm64, x86-64): every relocation type of both (`ARM64_RELOC_*`
+  with `ARM64_RELOC_ADDEND`, `X86_64_RELOC_*`, `SUBTRACTOR` pairs to a symbol of the same
+  section, section-relative ones), common symbols, weak definitions and references,
+  `__mod_init_func` and `__mod_term_func` (run by the start-up as the initialization
+  arrays are), and the platform's thread-local variables (`__thread_vars`,
+  `__thread_data`, `__thread_bss`: the executable gets the sections and dyld makes the
+  blocks). `__compact_unwind` and `__eh_frame` are not kept (the executable has no
+  unwind tables of other compilers' code), nor is a universal object read (give the slice).
+- **Dynamic libraries**: a `.dylib` given (or found by `-l` in the `-L` directories; of a
+  universal file, the target's slice) is read for its install name and exports, and the
+  program is bound to it by its ordinal (two-level namespace). A library named with `-l`
+  that is not a file here (`-lz`, the SDK's `.tbd` stubs, which are not read) is loaded by
+  name (`/usr/lib/libz.dylib`, a framework's path, ...), and what no library is known to
+  export is then looked up in every library loaded (flat lookup); without such libraries
+  it is `libSystem`'s.
+- **COFF objects** (x64, ARM64; the big format too): every relocation type of both
+  (`IMAGE_REL_AMD64_*`, `IMAGE_REL_ARM64_*`, with their implicit addends), COMDAT sections
+  (the first object's copy of a symbol's section is kept, its associative sections with
+  it; every selection is taken as "any"), weak externals (a weak definition where the
+  default is defined, else a weak reference), common symbols, grouped sections
+  (`name$suffix`) by their names, `.CRT$XC*`/`.CRT$XI*` as initialization arrays and
+  `.CRT$XT*`/`.CRT$XP*` as termination ones in their suffixes' order (the C runtime's
+  bounds dropped), `.tls$` as the thread-local template (`IMAGE_REL_*_SECREL` offsets in
+  it, `_tls_index` the linker's). Not kept: `.drectve`, `.debug$S`, `.debug$T`, and the
+  sections the linker is to remove. The linker supplies `__chkstk` (both processors'
+  stack probes), `_fltused` and `__ImageBase`.
+- **Import libraries** (their short import records: an archive member that names a DLL's
+  function or object, by name, undecorated name or ordinal) and **DLLs** given (or found by
+  `-l` as `name.dll`: their export tables): the program imports the functions from the
+  DLL they name, `__imp_<name>` being the import address table's slot. A long-format
+  import library (whose members define `__imp_` names in `.idata` sections) is an error.
 
 ### One C library
 
@@ -487,35 +520,94 @@ the platform's toolchain and into programs, whoever links it:
   runs, the compiler's start-up or the platform's.
 
 `--emit=lib` puts the object, and the objects among the inputs, in a static library with
-a symbol table of what each defines, laid out as the target's toolchain lays out its own
-(System V's for Linux and WebAssembly, BSD's `__.SYMDEF SORTED` for macOS, PE/COFF's two
-linker members for Windows). The objects are ELF ones for the native targets (as
-`--emit=obj`'s are): the system's toolchain takes them on Linux; for macOS and Windows the
-compiler's linkers take them.
+a symbol table of what each defines (as the objects spell the names: with the Mach-O
+underscore), laid out as the target's toolchain lays out its own (System V's for Linux
+and WebAssembly, BSD's `__.SYMDEF SORTED` for macOS, PE/COFF's two linker members for
+Windows).
 
-An object of C units that uses this library's private names (`__axc_stdout` for `stdout`,
-...) needs this library: linked by the system's toolchain into a C program (whose C
-library is the system's), it may call only the standard's functions.
+The objects are in the target's format (`--emit=obj`, `--emit=lib`):
+
+- **Mach-O** (`macho.ax`): one segment of the sections (`__TEXT,__text`, `__TEXT,__const`,
+  `__DATA,__const` for read-only data with addresses, `__DATA,__data`, `__DATA,__bss`,
+  `__DATA,__mod_init_func` and `__mod_term_func` with the entries in the order of their
+  priorities, a section attribute's `"segment,section"` or a C identifier's `__DATA,<name>`,
+  the debug information in `__DWARF`), `MH_SUBSECTIONS_VIA_SYMBOLS` (each function and object
+  an atom; a reference into an atom is to its symbol plus an offset), `LC_BUILD_VERSION`
+  (macOS 11.0), the names of C with the underscore, `__start_X`/`__stop_X` as the system
+  linker's `section$start$__DATA$X` and `section$end$__DATA$X`, hidden symbols private
+  externs (`N_PEXT`), weak definitions `N_WEAK_DEF`, weak references `N_WEAK_REF`. The
+  thread-locals of this compiler (an offset in the block the runtime makes: they are not
+  the platform's thread-local variables) are in `__DATA,__axiom_tdata` and
+  `__DATA,__axiom_tbss`, and their offsets' relocations have type numbers Mach-O leaves
+  unused (arm64 14 and 15, x86-64 15), which only this compiler's linker reads: the
+  system's refuses an object that uses them.
+- **COFF** (`coff.ax`): `.text`, `.rdata`, `.data`, `.bss`, `.tls$` (the thread-local
+  template, the zero-filled part as zeros), `.pdata` and `.xdata`, `.CRT$XCU` and `.CRT$XTU`
+  (`.CRT$XCT<NNNNN>` and `.CRT$XTT<NNNNN>` for a priority), a C identifier's section as
+  `X$m` with its bounds' symbols in `X$a` and `X$z` (selected once), `.axiom.lines` and
+  `.axiom.cv` (the line tables and CodeView records for the program database,
+  `IMAGE_SCN_LNK_REMOVE`). A weak definition is a
+  weak external whose default, `.weak.<name>.default.<tag>`, is the definition; a weak
+  reference's default is an absolute 0. A load through the GOT reads the object's
+  `.refptr.<name>` (a pointer in `.rdata$.refptr.<name>`, selected once). Functions carry
+  their sizes (function definition records). No `.drectve` is written.
+
+The system's linkers read these (`ld64.lld`, `lld-link`, the platforms' own: the
+suite's `c/objfmt` tests link them). An object of C units alone has no runtime: linked
+by the system's toolchain into a C program (whose C library is the system's), it may use
+only the standard's functions and objects; one that uses this library's private names
+(the macros of `<stdio.h>` for `stdin`, `stdout`, `stderr`, `getc` and `putc`, `errno`'s,
+... `__axc_*` names) needs this library, and on macOS one with thread-locals needs this
+compiler's linker (above). Objects with Axiom modules carry the runtime, which this
+compiler's linkers link.
+
+### Shared libraries
+
+`--emit=shared` links C units (with `--c-lib=system` or `--c-freestanding`), and the
+objects and libraries given, into a shared library; the compiler's C library and the
+Axiom runtime are an executable's (one per process: its allocator, threads and
+thread-local blocks), so Axiom modules and the default C library are an error (`E9001`).
+
+- **ELF** (`libprog.so`; `elink.ax`): position-independent (`--pic`, which
+  `--emit=shared` implies: thread-locals in the initial-exec model, their offsets in GOT
+  slots that the dynamic linker fills; the rest of the code generators' code is
+  position-independent always), its definitions of default visibility exported (`.dynsym`,
+  a hash table), its own references bound to its own definitions (as protected symbols
+  are: within the library nothing is preempted), every address it holds relocated where
+  it is loaded (`R_*_RELATIVE`), `DT_SONAME` its file name, `DT_INIT_ARRAY` and
+  `DT_FINI_ARRAY` its constructors and destructors, and `DT_NEEDED` the libraries it uses.
+  Code that is not position-independent (an absolute address in code or read-only data,
+  narrower than 64 bits, the local-exec model, a library's object reached without the GOT)
+  is an error that names its object. Programs of this compiler link with it (`-L. -lprog`),
+  and the system's `dlopen` loads it.
+- **DLL** (`prog.dll`; `plink.ax`): its export directory names the definitions of default
+  visibility, by name; its entry point (the linker's) runs the constructors when a process
+  loads it and the destructors when it is unloaded, then calls the program's `DllMain` if
+  it defines one (else it says TRUE); base relocations and the TLS directory as for an
+  executable. Programs link with the DLL itself (it is read for its exports; no import
+  library is written), and `LoadLibrary` and `GetProcAddress` find its functions.
+- **Mach-O** (`libprog.dylib`; `mlink.ax`): `MH_DYLIB`, its install name
+  `@rpath/libprog.dylib`, an export trie of its definitions of default visibility,
+  `__mod_init_func` and `__mod_term_func` (dyld runs them), rebase and bind information as
+  for an executable, ad-hoc signed. Thread-locals of this compiler are an error there
+  (the runtime that makes their blocks is an executable's). Built and checked only: nothing
+  here runs macOS.
 
 ### Not done yet
 
-- The linkers of macOS and Windows (`mlink.ax`, `plink.ax`) take no objects or
-  libraries of the platforms' toolchains (Mach-O and COFF objects, import libraries,
-  `.tbd` stubs), and `--emit=obj` and `--emit=lib` make ELF objects for those targets,
-  which only this compiler links.
-- No shared library is made (`--emit=` has no `so`, `dylib` or `dll`). The code
-  generators reach external data through the GOT and call through PLT-style relocations,
-  but thread-locals (the runtime's shadow stack, C's `_Thread_local`) use the local-exec
-  model and absolute addresses in data would need dynamic relocations.
 - On WebAssembly the constructors of objects (`INIT_FUNCS`) are not run, and a weak
   reference to a function nothing defines, while null, is still an import of `env` for
   its calls.
-- A GNU dialect's `alias` names its target in its own unit only (no second symbol), the
-  attribute `section` places only data and only in ELF objects (a function's is
-  recorded, `ir.Func.section`, but its code stays in `.text`: the backends lay out one
-  text section, which the frame tables, unwind and debug information refer to), and
-  `visibility` is written to ELF objects as `hidden` (hidden, internal) or default
-  (protected, default; no shared object is made from them).
+- A GNU dialect's `alias` names its target in its own unit only (no second symbol), and
+  the attribute `section` places only data (a function's is recorded, `ir.Func.section`,
+  but its code stays in `.text`: the backends lay out one text section, which the frame
+  tables, unwind and debug information refer to). `visibility` is written to ELF objects
+  as `hidden` (hidden, internal) or default (protected, default: a shared library binds
+  its references to its own definitions, as protected ones are), to Mach-O objects as
+  private externs, and a hidden symbol is not a DLL's or a shared library's export.
+- The DWARF of Mach-O objects given to a link is not carried into the dSYM correctly when
+  several objects have some (their offsets into each other's debug sections are numbers,
+  the platform's convention, which the linker would have to rebase by parsing them).
 - `.eh_frame` is kept without `.eh_frame_hdr` and `PT_GNU_EH_FRAME`.
 
 ## The C library

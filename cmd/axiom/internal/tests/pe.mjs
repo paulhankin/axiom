@@ -137,6 +137,9 @@ export function checkPE(d, opts = {}) {
     if (p.begin < text.rva || p.begin >= text.rva + text.vsize) E(`a function table entry at 0x${p.begin.toString(16)} outside .text`);
   }
   const r = { errs, machine, imports, relocs: nrel, functions: pdata.length };
+  // (opts.foreign: code of other compilers is linked too, whose prologues
+  // and unwind information, packed ones among them, are not checked here)
+  if (opts.foreign) return r;
   if (arm64) checkArm64Code(d, { E, off, text, pdata, iat, entry, funcs: opts.pdb ? pdbFunctions(opts.pdb, E) : null, r });
   else checkX64Unwind(d, { E, off, secOf, text, pdata, funcs: opts.pdb ? pdbFunctions(opts.pdb, E) : null, r });
   return r;
@@ -411,8 +414,11 @@ function matches(w, x, epi, x16) {
     case 'alloc':
       if (epi) return ((w & 0xff8003ff) >>> 0) === 0x910003ff && imm === x.size;  // add sp, sp, #n
       return (((w & 0xff8003ff) >>> 0) === 0xd10003ff && imm === x.size) || (w >>> 0 === 0xcb3063ff && x16 === x.size);
-    case 'save_fplr_x':
-      return x.off === 16 && (w >>> 0) === (epi ? 0xa8c17bfd : 0xa9bf7bfd);
+    case 'save_fplr_x': {
+      // stp x29, x30, [sp, #-off]! (ldp x29, x30, [sp], #off)
+      const o7 = ((epi ? x.off : -x.off) / 8) & 0x7f;
+      return (w >>> 0) === (((epi ? 0xa8c00000 : 0xa9800000) | (o7 << 15) | 0x7bfd) >>> 0);
+    }
     case 'set_fp':
       return (w >>> 0) === (epi ? 0x910003bf : 0x910003fd);
     case 'add_fp':

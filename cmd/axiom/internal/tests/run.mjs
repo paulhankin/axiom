@@ -605,7 +605,11 @@ await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, build
 // libso.so (-fPIC -shared), both named with -L and -l (the program runs
 // with LD_LIBRARY_PATH); ours_*.c compiled by this compiler (--emit=obj,
 // with ours-flags:) into objects given to the build, ourlib_*.c into the
-// archive libours.a (--emit=lib, -lours); cc_main.c, if there is one,
+// archive libours.a (--emit=lib, -lours), oursso_*.c into the shared
+// library liboursso.so (--emit=shared --c-lib=system, -loursso; the
+// program runs with LD_LIBRARY_PATH), which cc_dlopen.c, if there is one,
+// compiled by the system's C compiler, loads (its path the program's
+// argument) and must print the dl-expect: lines; cc_main.c, if there is one,
 // compiled and linked by the system's C compiler with the ours_ objects and
 // libours.a into a second program, which must print the cc-expect: lines.
 // Directives of the main file, in // or /* */ comments: expect:,
@@ -663,6 +667,11 @@ const cLinkTest = async (dir) => {
     const p = await run(compiler, ['build', ...ourlib, '--emit=lib', target, ...oursFlags, '-o', path.join(work, 'libours.a')], 'compiling the ourlib_ files (--emit=lib)');
     if (p) return p;
   }
+  const oursso = pick(/^oursso_.*\.c$/);
+  if (oursso.length) {
+    const p = await run(compiler, ['build', ...oursso, '--emit=shared', '--c-lib=system', target, ...oursFlags, '-o', path.join(work, 'liboursso.so')], 'compiling the oursso_ files (--emit=shared)');
+    if (p) return p;
+  }
   for (const v of variants) {
     const vf = v.split(/\s+/).filter((x) => x);
     const objs = [];
@@ -695,8 +704,9 @@ const cLinkTest = async (dir) => {
       libFlags.push('-lso');
     }
     if (ourlib.length) libFlags.push('-lours');
+    if (oursso.length) libFlags.push('-loursso');
     const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/)).filter((x) => x).map((x) => x.startsWith('--link=') ? `--link=${path.resolve(dir, x.slice(7))}` : x);
-    const others = names.filter((n) => n !== path.basename(main) && /\.c$/.test(n) && !/^(sys|arch|so|ours|ourlib|cc)_/.test(n)).map((n) => path.join(dir, n));
+    const others = names.filter((n) => n !== path.basename(main) && /\.c$/.test(n) && !/^(sys|arch|so|ours|ourlib|oursso|cc)_/.test(n)).map((n) => path.join(dir, n));
     const out = path.join(work, 'prog');
     const args = ['build', main, ...others, ...objs, ...ours, `-L${work}`, ...libFlags, '--format=agent-json', '-o', out, target, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
     const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
@@ -717,6 +727,19 @@ const cLinkTest = async (dir) => {
     if (r.status !== status) return { problem: `[${v}] exit status ${r.status} (signal ${r.signal}), expected ${status}; output:\n${got.join('\n')}`, stderr: r.stderr };
     if (want !== got.join('\n')) return { problem: `[${v}] output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
     for (const t of dv('expect-stderr')) if (!r.stderr.includes(t)) return `[${v}] no '${t}' in the program's stderr:\n${r.stderr}`;
+  }
+  // the compiler's shared library loaded by a program of the system's
+  // toolchain (dlopen, dlsym)
+  const ccDl = path.join(dir, 'cc_dlopen.c');
+  if (fs.existsSync(ccDl) && oursso.length) {
+    const out3 = path.join(work, 'dl-prog');
+    const p = await run(cc, [ccDl, '-o', out3, '-ldl'], `${cc} (a program that loads the compiler's shared library)`);
+    if (p) return p;
+    const r = await spawnExeAsync(out3, [path.join(work, 'liboursso.so')], { encoding: 'utf8', timeout: runTimeout });
+    const got = r.stdout.split('\n');
+    if (got[got.length - 1] === '') got.pop();
+    const want3 = dv('dl-expect').join('\n');
+    if (r.status !== 0 || want3 !== got.join('\n')) return { problem: `the program loading the shared library: exit status ${r.status}\n--- expected\n${want3}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
   }
   // the compiler's objects linked by the system's toolchain
   const ccMain = path.join(dir, 'cc_main.c');
@@ -2304,6 +2327,7 @@ if (!skipPlatform) {
   // symbol's name (a section symbol's: its section's), addend (the symbol
   // tables' order and size differ with the debug sections)
   const objRelocs = (d) => {
+    if (isCoff(d)) return coffSecs(d).filter((x) => x.name === '.text').flatMap((x) => x.rels).map((x) => x.replace(/\$L\d+_/, '$L_')).join('\n');
     const shoff = Number(d.readBigUInt64LE(40)), shnum = d.readUInt16LE(60), shstr = d.readUInt16LE(62);
     const sh = (k) => shoff + 64 * k;
     const so = Number(d.readBigUInt64LE(sh(shstr) + 24));
@@ -2324,8 +2348,30 @@ if (!skipPlatform) {
     }
     return out.join('\n');
   };
-  // an ELF object's .text
+  // a COFF object's sections: name, raw data, relocations (offset, type, symbol name)
+  const isCoff = (d) => [0x8664, 0xaa64].includes(d.readUInt16LE(0)) && d.readUInt16LE(16) === 0;
+  const coffSecs = (d) => {
+    const nsec = d.readUInt16LE(2), symoff = d.readUInt32LE(8), nsym = d.readUInt32LE(12), strs = symoff + 18 * nsym;
+    const nameAt = (o) => d.readUInt32LE(o) === 0 ? d.toString('latin1', strs + d.readUInt32LE(o + 4), d.indexOf(0, strs + d.readUInt32LE(o + 4)))
+      : d.toString('latin1', o, o + 8).replace(/\0.*$/, '');
+    const out = [];
+    for (let k = 0; k < nsec; k++) {
+      const h = 20 + 40 * k;
+      let name = d.toString('latin1', h, h + 8).replace(/\0.*$/, '');
+      if (name.startsWith('/')) name = d.toString('latin1', strs + Number(name.slice(1)), d.indexOf(0, strs + Number(name.slice(1))));
+      const raw = d.subarray(d.readUInt32LE(h + 20), d.readUInt32LE(h + 20) + d.readUInt32LE(h + 16));
+      const rels = [];
+      for (let j = 0; j < d.readUInt16LE(h + 32); j++) {
+        const r = d.readUInt32LE(h + 24) + 10 * j;
+        rels.push(`${d.readUInt32LE(r)} ${d.readUInt16LE(r + 8)} ${nameAt(symoff + 18 * d.readUInt32LE(r + 4))}`);
+      }
+      out.push({ name, raw, rels });
+    }
+    return out;
+  };
+  // an ELF (or COFF) object's .text
   const objText = (d) => {
+    if (isCoff(d)) return Buffer.concat(coffSecs(d).filter((x) => x.name === '.text').map((x) => x.raw));
     const shoff = Number(d.readBigUInt64LE(40)), shnum = d.readUInt16LE(60), shstr = d.readUInt16LE(62);
     const so = Number(d.readBigUInt64LE(shoff + 64 * shstr + 24));
     for (let k = 0; k < shnum; k++) {
@@ -3077,6 +3123,208 @@ if (!skipPlatform) {
     note: wine ? '' : 'built, not run: no Wine',
     timed: false,
   });
+}
+
+// Objects and libraries in the platforms' formats (docs/c.md, "Objects and
+// libraries"): each directory of cmd/axiom/internal/tests/c/objfmt/ is a
+// test, for macOS and Windows on both processors (or those its targets:
+// directive names), where the system's clang compiles for them (and
+// ld64.lld, lld-link, llvm-ar, llvm-readobj and llvm-dlltool are there).
+// Its files: main.c, built by the compiler with the others; sys_*.c,
+// compiled by clang for the target (-O2; they declare what they use) into
+// objects given to the build; arch_*.c into a static library (libarch.a, or
+// arch.lib for Windows: -L and -larch); dylib_*.c into a macOS dynamic
+// library linked by ld64.lld (libdy.dylib, install name @rpath/libdy.dylib:
+// -ldy); ours_*.c compiled by this compiler (--emit=obj, with ours-flags:)
+// into objects given to the build, which llvm-readobj reads without a
+// complaint; ourlib_*.c into a library (--emit=lib: -lours); oursso_*.c
+// into a shared library of this compiler (--emit=shared --c-freestanding:
+// a DLL given to the build, which the program loads from its directory,
+// or a dynamic library, -loursso), checked (pe.mjs, llvm-objdump). The program is
+// run under Wine for x86_64-windows and must print the expect: lines; the
+// other targets' programs are checked (macho.mjs, pe.mjs). cc_main.c, if
+// there is one, is compiled by clang and linked by the system's linkers with
+// the ours_ objects and the ourlib_ library (lld-link: with an import
+// library of msvcrt.dll for the cc-imports: names, entry main; ld64.lld:
+// against nothing, symbols looked up when loaded), and for x86_64-windows
+// run, printing the cc-expect: lines. Directives (// comments of main.c):
+// expect:, expect-status:, targets:, flags:, ours-flags:, cc-imports:,
+// dlltool: <dll> <names> (an import library of that DLL, given to the
+// build), wine-dlls: <names> (-l of those DLLs, found in Wine's own
+// directory, which -L names).
+if (!skipPlatform && !native) {
+  const objfmtDir = path.join(root, 'cmd/axiom/internal/tests/c/objfmt');
+  const objfmtDirs = fs.existsSync(objfmtDir) ? fs.readdirSync(objfmtDir).filter((n) => fs.statSync(path.join(objfmtDir, n)).isDirectory()).sort().map((n) => path.join(objfmtDir, n)) : [];
+  const llvmTool = (n) => [n, `${n}-18`, `/usr/lib/llvm-18/bin/${n}`].find((x) => spawnSync('sh', ['-c', `command -v ${x}`]).status === 0);
+  const clang = llvmTool('clang'), ld64 = llvmTool('ld64.lld'), lldLink = llvmTool('lld-link'), llvmAr = llvmTool('llvm-ar');
+  const readobj = llvmTool('llvm-readobj'), dlltool = llvmTool('llvm-dlltool');
+  const wine = ['wine64', 'wine', '/usr/lib/wine/wine64'].find((w) => spawnSync(w, ['--version'], { encoding: 'utf8' }).status === 0);
+  const wineDlls = ['/usr/lib/x86_64-linux-gnu/wine/x86_64-windows', '/usr/lib/wine/x86_64-windows', '/usr/lib64/wine/x86_64-windows'].find((d) => fs.existsSync(path.join(d, 'kernel32.dll')));
+  const triples = { 'x86_64-windows': 'x86_64-pc-windows-msvc', 'aarch64-windows': 'aarch64-pc-windows-msvc', 'x86_64-macos': 'x86_64-apple-macos11', 'aarch64-macos': 'arm64-apple-macos11' };
+  const objfmtTest = async (dir, t) => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    if (!clang || !llvmAr || !readobj) return { skip: true, reason: 'no clang, llvm-ar or llvm-readobj' };
+    const src = fs.readFileSync(path.join(dir, 'main.c'), 'utf8');
+    const dv = (name) => [...src.matchAll(new RegExp(`(?:// |/\\* )${name}: ?(.*?)(?: \\*/)?$`, 'gm'))].map((m) => m[1]);
+    const words = (name) => dv(name).flatMap((x) => x.trim().split(/\s+/)).filter((x) => x);
+    const targets = words('targets');
+    if (targets.length && !targets.includes(t)) return { skip: true, reason: `not for ${t}` };
+    const win = t.endsWith('windows');
+    const names = fs.readdirSync(dir).sort();
+    const pick = (re) => names.filter((n) => re.test(n)).map((n) => path.join(dir, n));
+    if (pick(/^dylib_.*\.c$/).length && !ld64) return { skip: true, reason: 'no ld64.lld' };
+    if ((dv('dlltool').length || dv('cc-imports').length) && !dlltool) return { skip: true, reason: 'no llvm-dlltool' };
+    if (words('wine-dlls').length && !wineDlls) return { skip: true, reason: 'no Wine DLLs' };
+    const work = path.join(tmp, `objfmt-${path.basename(dir)}-${t}`);
+    fs.mkdirSync(work, { recursive: true });
+    const run = async (cmd, args, what) => {
+      const r = await spawnAsync(cmd, args, { encoding: 'utf8', timeout: compileTimeout, cwd: work });
+      return r.status === 0 ? null : `${what} failed:\n${r.stdout}${r.stderr}`;
+    };
+    const target = `--target=${t}`, triple = `--target=${triples[t]}`, ext = win ? '.obj' : '.o';
+    const ccObj = async (f) => {
+      const o = path.join(work, path.basename(f, '.c') + ext);
+      const p = await run(clang, [triple, '-O2', '-c', f, '-o', o], `clang ${path.basename(f)}`);
+      return p ? { p } : { o };
+    };
+    const inputs = [];
+    for (const f of pick(/^sys_.*\.c$/)) {
+      const r = await ccObj(f);
+      if (r.p) return r.p;
+      inputs.push(r.o);
+    }
+    const libFlags = [`-L${work}`];
+    const arch = pick(/^arch_.*\.c$/);
+    if (arch.length) {
+      const aos = [];
+      for (const f of arch) {
+        const r = await ccObj(f);
+        if (r.p) return r.p;
+        aos.push(r.o);
+      }
+      const lib = path.join(work, win ? 'arch.lib' : 'libarch.a');
+      fs.rmSync(lib, { force: true });
+      const p = await run(llvmAr, ['rcs', ...(win ? [] : ['--format=darwin']), lib, ...aos], 'llvm-ar');
+      if (p) return p;
+      libFlags.push('-larch');
+    }
+    const dyl = pick(/^dylib_.*\.c$/);
+    if (dyl.length && !win) {
+      const dos = [];
+      for (const f of dyl) {
+        const r = await ccObj(f);
+        if (r.p) return r.p;
+        dos.push(r.o);
+      }
+      const p = await run(ld64, ['-arch', t.startsWith('x86_64') ? 'x86_64' : 'arm64', '-platform_version', 'macos', '11.0', '11.0', '-dylib',
+        '-install_name', '@rpath/libdy.dylib', '-undefined', 'dynamic_lookup', '-o', path.join(work, 'libdy.dylib'), ...dos], 'ld64.lld -dylib');
+      if (p) return p;
+      libFlags.push('-ldy');
+    }
+    if (win) {
+      for (const d of dv('dlltool')) {
+        const [dll, ...fns] = d.trim().split(/\s+/);
+        const def = path.join(work, `${dll}.def`);
+        fs.writeFileSync(def, `LIBRARY ${dll}.dll\nEXPORTS\n${fns.join('\n')}\n`);
+        const lib = path.join(work, `imp_${dll}.lib`);
+        const p = await run(dlltool, ['-m', t.startsWith('x86_64') ? 'i386:x86-64' : 'arm64', '-d', def, '-l', lib], 'llvm-dlltool');
+        if (p) return p;
+        inputs.push(lib);
+      }
+      const wd = words('wine-dlls');
+      if (wd.length) libFlags.push(`-L${wineDlls}`, ...wd.map((x) => `-l${x}`));
+    }
+    const oursFlags = words('ours-flags');
+    const ours = [];
+    for (const f of pick(/^ours_.*\.c$/)) {
+      const o = path.join(work, path.basename(f, '.c') + ext);
+      const p = await run(compiler, ['build', f, '--emit=obj', target, ...oursFlags, '-o', o], `compiling ${path.basename(f)} (--emit=obj)`);
+      if (p) return p;
+      const r = spawnSync(readobj, ['--all', o], { encoding: 'utf8' });
+      if (r.status !== 0 || /warning|error/i.test(r.stderr)) return `llvm-readobj on ${path.basename(o)}:\n${r.stderr}`;
+      ours.push(o);
+    }
+    const ourlib = pick(/^ourlib_.*\.c$/);
+    const ourlibPath = path.join(work, win ? 'ours.lib' : 'libours.a');
+    if (ourlib.length) {
+      const p = await run(compiler, ['build', ...ourlib, '--emit=lib', target, ...oursFlags, '-o', ourlibPath], 'compiling the ourlib_ files (--emit=lib)');
+      if (p) return p;
+      libFlags.push('-lours');
+    }
+    const oursso = pick(/^oursso_.*\.c$/);
+    if (oursso.length) {
+      const so = path.join(work, win ? 'oursso.dll' : 'liboursso.dylib');
+      const p = await run(compiler, ['build', ...oursso, '--emit=shared', '--c-freestanding', target, ...oursFlags, '-o', so], 'compiling the oursso_ files (--emit=shared)');
+      if (p) return p;
+      if (win) {
+        const r = checkPEFile(so, { arm64: t.startsWith('aarch64') });
+        if (r.errs.length) return `the DLL: ${r.errs.join('\n')}`;
+        inputs.push(so);
+      } else {
+        const r = spawnSync(llvmTool('llvm-objdump'), ['--macho', '--all-headers', '--bind', '--rebase', '--exports-trie', so], { encoding: 'utf8' });
+        if (r.status !== 0 || /error|warning/i.test(r.stderr)) return `llvm-objdump on the dynamic library:\n${r.stderr}`;
+        libFlags.push('-loursso');
+      }
+    }
+    const others = names.filter((n) => n !== 'main.c' && /\.c$/.test(n) && !/^(sys|arch|dylib|ours|ourlib|oursso|cc)_/.test(n)).map((n) => path.join(dir, n));
+    const out = path.join(work, win ? 'prog.exe' : 'prog');
+    const c = await spawnAsync(compiler, ['build', path.join(dir, 'main.c'), ...others, ...inputs, ...ours, ...libFlags, '-o', out, target,
+      ...words('flags'), ...extraFlags.filter((a) => !a.startsWith('--units='))], { encoding: 'utf8', timeout: compileTimeout });
+    if (c.status !== 0) return `compilation failed:\n${c.stdout}${c.stderr}`;
+    const want = dv('expect').join('\n'), status = dv('expect-status').length ? Number(dv('expect-status')[0]) : 0;
+    const checkOut = (f) => {
+      const d = fs.readFileSync(f);
+      const foreign = pick(/^(sys|arch)_.*\.c$/).length > 0;
+      const r = win ? checkPEFile(f, { arm64: t.startsWith('aarch64'), foreign }) : checkMachO(d, { x86_64: t.startsWith('x86_64') });
+      return r.errs.length ? r.errs.join('\n') : null;
+    };
+    const bad = checkOut(out);
+    if (bad) return bad;
+    for (const n of win ? [] : dv('expect-dylib')) {
+      if (!fs.readFileSync(out).includes(Buffer.from(n.trim() + '\0'))) return `the program does not load ${n.trim()}`;
+    }
+    const wenv = { ...process.env, WINEDEBUG: process.env.WINEDEBUG || '-all' };
+    const runs = t === 'x86_64-windows' && wine && !buildOnly;
+    if (runs) {
+      const r = await spawnAsync(wine, [out], { encoding: 'utf8', timeout: runTimeout, env: wenv, cwd: work });
+      const got = r.stdout.split('\n').map((l) => l.replace(/\r$/, ''));
+      if (got[got.length - 1] === '') got.pop();
+      if (r.status !== status) return { problem: `exit status ${r.status}, expected ${status}; output:\n${got.join('\n')}`, stderr: r.stderr };
+      if (want !== got.join('\n')) return { problem: `output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
+    }
+    // this compiler's objects, linked by the system's linker
+    const ccMain = path.join(dir, 'cc_main.c');
+    if (fs.existsSync(ccMain) && (win ? lldLink : ld64)) {
+      const r = await ccObj(ccMain);
+      if (r.p) return r.p;
+      const out2 = path.join(work, win ? 'cc-prog.exe' : 'cc-prog');
+      if (win) {
+        const def = path.join(work, 'msvcrt.def'), imp = path.join(work, 'msvcrt-imp.lib');
+        fs.writeFileSync(def, `LIBRARY msvcrt.dll\nEXPORTS\n${words('cc-imports').join('\n')}\n`);
+        let p = await run(dlltool, ['-m', t.startsWith('x86_64') ? 'i386:x86-64' : 'arm64', '-d', def, '-l', imp], 'llvm-dlltool');
+        if (p) return p;
+        p = await run(lldLink, ['/nologo', '/entry:main', '/subsystem:console', `/out:${out2}`, r.o, ...ours, ...(ourlib.length ? [ourlibPath] : []), imp], 'lld-link');
+        if (p) return p;
+        if (runs) {
+          const x = await spawnAsync(wine, [out2], { encoding: 'utf8', timeout: runTimeout, env: wenv, cwd: work });
+          const got = x.stdout.split('\n').map((l) => l.replace(/\r$/, ''));
+          if (got[got.length - 1] === '') got.pop();
+          const want2 = dv('cc-expect').join('\n');
+          if (x.status !== 0 || want2 !== got.join('\n')) return { problem: `the system linker's program: exit status ${x.status}\n--- expected\n${want2}\n--- got\n${got.join('\n')}`, stderr: x.stderr };
+        }
+      } else {
+        const p = await run(ld64, ['-arch', t.startsWith('x86_64') ? 'x86_64' : 'arm64', '-platform_version', 'macos', '11.0', '11.0', '-undefined', 'dynamic_lookup',
+          '-o', out2, r.o, ...ours, ...(ourlib.length ? [ourlibPath] : [])], 'ld64.lld');
+        if (p) return p;
+      }
+    }
+    return null;
+  };
+  const cases = {};
+  for (const d of objfmtDirs) {
+    for (const t of Object.keys(triples)) cases[`${path.relative(root, d)} [objfmt ${t}]`] = () => objfmtTest(d, t);
+  }
+  await section('objfmt', cases, { parallel: true });
 }
 
 // Packages (spec §4.6): builds from a package directory, dependency

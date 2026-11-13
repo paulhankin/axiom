@@ -59,6 +59,7 @@
 import "a64unwind.ax" as uw;
 import "bin.ax" as bn;
 import "codeview.ax" as cvw;
+import "coff.ax" as coff;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
 import "lstub.ax" as lstub;
@@ -104,7 +105,27 @@ let mut c_library_fns: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mu
                                                          vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
 let C_LIBRARY: []u8 = "msvcrt.dll";  // (with tg.g_system_c_library)
 
+/// What import libraries and DLLs given to the link (linkin.ax) say the
+/// DLLs export: the name code refers to (or __imp_<name>, the import
+/// address table slot), the DLL, the export's name or ordinal.
+pub let mut g_imports: u.List.[coff.Import] = u.List.[coff.Import].{ data: @ptr_from_int(*mut coff.Import, 0), len: 0,
+                                                                     cap: 0 };
+// name -> its g_imports index + 1 (the first of a name)
+let mut imp_map: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                   cap: 0, len: 0 };
+
 let mut A64: bool = false;  // linking ARM64 objects (else x86-64 ones)
+
+/// Linking a DLL (--emit=shared): IMAGE_FILE_DLL, its entry point the
+/// linker's axiom.dll_entry, which runs the initialization arrays when a
+/// process loads it (DLL_PROCESS_ATTACH) and the termination arrays,
+/// backward, when it is unloaded (DLL_PROCESS_DETACH), then calls the
+/// program's DllMain (if it defines one; else the answer is TRUE); the
+/// export directory names the definitions of global symbols of default
+/// visibility of the objects linked (not the linker's own), by name.
+pub let mut g_dll: bool = false;
+let mut n_inputs: usize = 0;  // the objects given to the link (the others are the linker's)
+let mut exports: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };  // gsyms, by name
 
 // An import thunk's size (see the header), and a .pdata entry's.
 fn thunk_size() u64 {
@@ -195,8 +216,30 @@ fn collect_dll_names() void {
     }
 }
 
+// The import of a name (or of __imp_<name>) that an import library or a
+// DLL given to the link names; nil if none.
+fn import_of(name: []u8) *mut coff.Import {
+    let mut n = name;
+    if u.starts(n, "__imp_") {
+        n = n[6..];
+    }
+    let k = imp_map.get(u.intern(n));
+    if k == 0 {
+        return u.nil.[coff.Import]();
+    }
+    return g_imports.at(@as(usize, k - 1));
+}
+
 // The DLL that exports a Windows function (see the header); "" if none.
+// __imp_<name> is <name>'s import address table slot.
 fn dll_of(name: []u8) []u8 {
+    let im = import_of(name);
+    if u.notnil(im) {
+        return im.dll;
+    }
+    if u.starts(name, "__imp_") {
+        return dll_of(name[6..]);
+    }
     let k = import_map.get(u.intern(name));
     if k != 0 {
         return import_dlls.get(@as(usize, k - 1));
@@ -256,10 +299,14 @@ fn is_import(oi: usize, si: u32) bool {
     return (gi >= 0) and (nl.gsyms.at(@int_cast(usize, gi)).obj < 0) and not nl.gsyms.at(@int_cast(usize, gi)).weak;
 }
 
-// A symbol's address; an imported function's is its thunk's.
+// A symbol's address; an imported function's is its thunk's, and
+// __imp_<name>'s its import address table slot.
 fn sym_addr(oi: usize, si: u32) u64 {
     if is_import(oi, si) {
         let g = nl.gsyms.at(@as(usize, @bit_cast(u32, nl.global_of(oi, si))));
+        if u.starts(g.name, "__imp_") {
+            return iat_slot.get(@as(usize, @bit_cast(u32, g.stub)));
+        }
         return thunk_addr + (@as(u64, @bit_cast(u32, g.stub)) * thunk_size());
     }
     return nl.sym_addr(oi, si);  // (0 for a missing weak one: see abs_at)
@@ -268,6 +315,13 @@ fn sym_addr(oi: usize, si: u32) u64 {
 fn add_import(gi: u32) void {
     let g = nl.gsyms.at(@as(usize, gi));
     if g.stub >= 0 {
+        return;
+    }
+    if u.starts(g.name, "__imp_") {
+        // (the slot of <name>'s import)
+        let xi = nl.gsym_index(g.name[6..]);
+        add_import(xi);
+        nl.gsyms.at(@as(usize, gi)).stub = nl.gsyms.get(@as(usize, xi)).stub;
         return;
     }
     g.stub = @int_cast(i32, imports.len);
@@ -444,16 +498,27 @@ fn own_object() *mut elf.Obj {
     let data = elf.add_sec(o, ".data", elf.S_DATA, 8);
     let rodata = elf.add_sec(o, ".rdata", elf.S_RODATA, 8);
     let ds = o.secs.get(@int_cast(usize, data));
-    ds.data.zeros(16);  // axiom.tls_index (u32), the callback list's NULL
+    ds.data.zeros(24);  // axiom.tls_index (u32), the callback list's NULL, _fltused
     _ = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_index", sec: data, value: 0, size: 4, bind: elf.B_GLOBAL,
                                  ty: elf.T_OBJECT, hidden: true });
+    // what the platform's compilers' objects refer to, which their C
+    // runtime defines: the thread-local index (the same), and _fltused
+    // (that floating point is used: nothing here)
+    _ = elf.add_sym(o, elf.Sym.{ name: "_tls_index", sec: data, value: 0, size: 4, bind: elf.B_WEAK, ty: elf.T_OBJECT,
+                                 hidden: true });
+    _ = elf.add_sym(o, elf.Sym.{ name: "_fltused", sec: data, value: 16, size: 4, bind: elf.B_WEAK, ty: elf.T_OBJECT,
+                                 hidden: true });
     let rs = o.secs.get(@int_cast(usize, rodata));
     rs.data.zeros(40);  // IMAGE_TLS_DIRECTORY64
     own_tls_dir = elf.add_sym(o, elf.Sym.{ name: "axiom.tls_directory", sec: rodata, value: 0, size: 40,
                                            bind: elf.B_GLOBAL, ty: elf.T_OBJECT, hidden: true });
+    let ts = o.secs.get(@int_cast(usize, text));
+    if g_dll {
+        dll_entry(o, text);
+        return o;
+    }
     let main_ = elf.ext_sym(o, "main", false);
     let exitp = elf.ext_sym(o, "ExitProcess", false);
-    let ts = o.secs.get(@int_cast(usize, text));
     if A64 {
         own_entry_a64(o, text, main_, exitp);
         return o;
@@ -501,7 +566,237 @@ fn own_object() *mut elf.Obj {
     ps.relocs.push(elf.Rel.{ off: 12, ty: elf.R_X86_64_RVA32, sym: tsym, addend: 0 });
     ps.relocs.push(elf.Rel.{ off: 16, ty: elf.R_X86_64_RVA32, sym: tsym, addend: 17 });
     ps.relocs.push(elf.Rel.{ off: 20, ty: elf.R_X86_64_RVA32, sym: xs, addend: 8 });
+    // __chkstk, which the platform's compilers call before a frame of more
+    // than a page (rax: its size): touches each page from the caller's rsp
+    // down, in order (the stack grows a guard page at a time), and keeps
+    // every register (the caller then moves rsp)
+    ts.data.zeros(15);                                   // (to 64)
+    let chk: [48]u8 = [0x51, 0x50,                       // push rcx; push rax
+                       0x48, 0x8d, 0x4c, 0x24, 0x18,     // lea rcx, [rsp + 24]: the caller's rsp
+                       0x48, 0x3d, 0, 0x10, 0, 0,        // cmp rax, 4096
+                       0x72, 0x18,                       // jb last
+                       0x48, 0x81, 0xe9, 0, 0x10, 0, 0,  // loop: sub rcx, 4096
+                       0x48, 0x85, 0x09,                 // test [rcx], rcx
+                       0x48, 0x2d, 0, 0x10, 0, 0,        // sub rax, 4096
+                       0x48, 0x3d, 0, 0x10, 0, 0,        // cmp rax, 4096
+                       0x77, 0xe8,                       // ja loop
+                       0x48, 0x29, 0xc1,                 // last: sub rcx, rax
+                       0x48, 0x85, 0x09,                 // test [rcx], rcx
+                       0x58, 0x59, 0xc3];                // pop rax; pop rcx; ret
+    ts.data.put(chk[..]);
+    _ = elf.add_sym(o, elf.Sym.{ name: "__chkstk", sec: text, value: 64, size: 48, bind: elf.B_WEAK, ty: elf.T_FUNC,
+                                 hidden: true });
     return o;
+}
+
+// A DLL's entry point, axiom.dll_entry(instance, reason, reserved) (see
+// g_dll), with its unwind information and function table entry; and
+// DllMain's default (weak: the program's wins), which says TRUE.
+fn dll_entry(o: *mut elf.Obj, text: i32) void {
+    let ts = o.secs.get(@int_cast(usize, text));
+    let ia = elf.ext_sym(o, "__init_array_start", true);
+    let ie = elf.ext_sym(o, "__init_array_end", true);
+    let fa = elf.ext_sym(o, "__fini_array_start", true);
+    let fe = elf.ext_sym(o, "__fini_array_end", true);
+    let dm = elf.ext_sym(o, "DllMain", false);
+    let xdata = elf.add_sec(o, ".xdata", elf.S_RODATA, 4);
+    let xs = elf.add_sym(o, elf.Sym.{ name: "", sec: xdata, value: 0, size: 0, bind: elf.B_LOCAL, ty: elf.T_NOTYPE,
+                                      hidden: false });
+    let pdata = elf.add_sec(o, ".pdata", elf.S_RODATA, 4);
+    let ps = o.secs.get(@int_cast(usize, pdata));
+    let mut size: u64 = 0;
+    let mut tsize: u64 = 0;
+    if A64 {
+        let words: [37]u32 = [0xa9bd_7bfd,   // stp x29, x30, [sp, #-48]!
+                              0x9100_03fd,   // mov x29, sp
+                              0xa901_53f3,   // stp x19, x20, [sp, #16]
+                              0xa902_5bf5,   // stp x21, x22, [sp, #32]
+                              0xaa00_03f3,   // mov x19, x0
+                              0x2a01_03f4,   // mov w20, w1
+                              0xaa02_03f5,   // mov x21, x2
+                              0x7100_069f,   // cmp w20, #1 (DLL_PROCESS_ATTACH)
+                              0x5400_0141,   // b.ne detach
+                              0x9000_0016,   // adrp x22, __init_array_start
+                              0x9100_02d6,   // add x22, x22, :lo12:__init_array_start
+                              0x9000_0010,   // init: adrp x16, __init_array_end
+                              0x9100_0210,   // add x16, x16, :lo12:__init_array_end
+                              0xeb10_02df,   // cmp x22, x16
+                              0x5400_01c2,   // b.hs done
+                              0xf840_86d0,   // ldr x16, [x22], #8
+                              0xd63f_0200,   // blr x16
+                              0x17ff_fffa,   // b init
+                              0x3500_0154,   // detach: cbnz w20, done (not DLL_PROCESS_DETACH)
+                              0x9000_0016,   // adrp x22, __fini_array_end
+                              0x9100_02d6,   // add x22, x22, :lo12:__fini_array_end
+                              0x9000_0010,   // fini: adrp x16, __fini_array_start
+                              0x9100_0210,   // add x16, x16, :lo12:__fini_array_start
+                              0xeb10_02df,   // cmp x22, x16
+                              0x5400_0089,   // b.ls done
+                              0xf85f_8ed0,   // ldr x16, [x22, #-8]!
+                              0xd63f_0200,   // blr x16
+                              0x17ff_fffa,   // b fini
+                              0xaa13_03e0,   // done: mov x0, x19
+                              0x2a14_03e1,   // mov w1, w20
+                              0xaa15_03e2,   // mov x2, x21
+                              0xa942_5bf5,   // ldp x21, x22, [sp, #32]
+                              0xa941_53f3,   // ldp x19, x20, [sp, #16]
+                              0xa8c3_7bfd,   // ldp x29, x30, [sp], #48
+                              0x1400_0000,   // b DllMain
+                              0x5280_0020,   // the default DllMain: mov w0, #1
+                              0xd65f_03c0];  // ret
+        for w in words {
+            ts.data.u32_(@as(u64, w));
+        }
+        let pairs: [4][2]u64 = [[36, 0], [44, 1], [76, 3], [84, 2]];
+        let targets: [4]u32 = [ia, ie, fa, fe];
+        for k in @as(usize, 0)..4 {
+            ts.relocs.push(elf.Rel.{ off: pairs[k][0], ty: elf.R_AARCH64_ADR_PREL_PG_HI21, sym: targets[k],
+                                     addend: 0 });
+            ts.relocs.push(elf.Rel.{ off: pairs[k][0] + 4, ty: elf.R_AARCH64_ADD_ABS_LO12_NC, sym: targets[k],
+                                     addend: 0 });
+        }
+        ts.relocs.push(elf.Rel.{ off: 136, ty: elf.R_AARCH64_JUMP26, sym: dm, addend: 0 });
+        size = 140;
+        tsize = 8;
+        let mut pro = uw.new_codes();
+        uw.save_fplr_x(&mut pro, 48);
+        uw.op1(&mut pro, uw.SET_FP);
+        uw.save_regp(&mut pro, 19, 16);
+        uw.save_regp(&mut pro, 21, 32);
+        let mut epi = uw.new_codes();
+        uw.save_regp(&mut epi, 21, 32);
+        uw.save_regp(&mut epi, 19, 16);
+        uw.save_fplr_x(&mut epi, 48);
+        let mut eps = u.List.[u64].empty();
+        eps.push(124);
+        let mut info = uw.xdata(size, &pro, &epi, eps.items());
+        o.secs.get(@int_cast(usize, xdata)).data.put(info.view());
+        info.free();
+    } else {
+        let code: [113]u8 = [0x53, 0x56, 0x57, 0x41, 0x54,        // push rbx, rsi, rdi, r12
+                             0x48, 0x83, 0xec, 0x28,              // sub rsp, 40
+                             0x48, 0x89, 0xcb,                    // mov rbx, rcx
+                             0x89, 0xd6,                          // mov esi, edx
+                             0x4c, 0x89, 0xc7,                    // mov rdi, r8
+                             0x83, 0xfe, 0x01,                    // cmp esi, 1 (DLL_PROCESS_ATTACH)
+                             0x75, 0x1d,                          // jne detach
+                             0x4c, 0x8d, 0x25, 0, 0, 0, 0,        // lea r12, [rip + __init_array_start]
+                             0x48, 0x8d, 0x05, 0, 0, 0, 0,        // init: lea rax, [rip + __init_array_end]
+                             0x49, 0x39, 0xc4,                    // cmp r12, rax
+                             0x73, 0x2b,                          // jae done
+                             0x41, 0xff, 0x14, 0x24,              // call [r12]
+                             0x49, 0x83, 0xc4, 0x08,              // add r12, 8
+                             0xeb, 0xea,                          // jmp init
+                             0x85, 0xf6,                          // detach: test esi, esi (DLL_PROCESS_DETACH)
+                             0x75, 0x1d,                          // jne done
+                             0x4c, 0x8d, 0x25, 0, 0, 0, 0,        // lea r12, [rip + __fini_array_end]
+                             0x48, 0x8d, 0x05, 0, 0, 0, 0,        // fini: lea rax, [rip + __fini_array_start]
+                             0x49, 0x39, 0xc4,                    // cmp r12, rax
+                             0x76, 0x0a,                          // jbe done
+                             0x49, 0x83, 0xec, 0x08,              // sub r12, 8
+                             0x41, 0xff, 0x14, 0x24,              // call [r12]
+                             0xeb, 0xea,                          // jmp fini
+                             0x48, 0x89, 0xd9,                    // done: mov rcx, rbx
+                             0x89, 0xf2,                          // mov edx, esi
+                             0x49, 0x89, 0xf8,                    // mov r8, rdi
+                             0xe8, 0, 0, 0, 0,                    // call DllMain
+                             0x48, 0x83, 0xc4, 0x28,              // add rsp, 40
+                             0x41, 0x5c, 0x5f, 0x5e, 0x5b, 0xc3,  // pop r12, rdi, rsi, rbx; ret
+                             0xb8, 1, 0, 0, 0, 0xc3];             // the default DllMain: mov eax, 1; ret
+        ts.data.put(code[..]);
+        let at: [4]u64 = [25, 32, 58, 65];
+        let targets: [4]u32 = [ia, ie, fe, fa];
+        for k in @as(usize, 0)..4 {
+            ts.relocs.push(elf.Rel.{ off: at[k], ty: elf.R_X86_64_PC32, sym: targets[k], addend: -4 });
+        }
+        ts.relocs.push(elf.Rel.{ off: 93, ty: elf.R_X86_64_PLT32, sym: dm, addend: -4 });
+        size = 107;
+        tsize = 6;
+        // pushes of rbx, rsi, rdi, r12 after 1, 2, 3, 5 bytes; 40 bytes
+        // allocated after 9 (UWOP_PUSH_NONVOL, UWOP_ALLOC_SMALL)
+        let unwind: [16]u8 = [1, 9, 5, 0, 9, 0x42, 5, 0xc0, 3, 0x70, 2, 0x60, 1, 0x30, 0, 0];
+        o.secs.get(@int_cast(usize, xdata)).data.put(unwind[..]);
+    }
+    let es = elf.add_sym(o, elf.Sym.{ name: "axiom.dll_entry", sec: text, value: 0, size: size, bind: elf.B_GLOBAL,
+                                      ty: elf.T_FUNC, hidden: true });
+    _ = elf.add_sym(o, elf.Sym.{ name: "DllMain", sec: text, value: size, size: tsize, bind: elf.B_WEAK, ty: elf.T_FUNC,
+                                 hidden: true });
+    if A64 {
+        ps.data.zeros(8);
+        ps.relocs.push(elf.Rel.{ off: 0, ty: elf.R_AARCH64_RVA32, sym: es, addend: 0 });
+        ps.relocs.push(elf.Rel.{ off: 4, ty: elf.R_AARCH64_RVA32, sym: xs, addend: 0 });
+    } else {
+        ps.data.zeros(12);
+        ps.relocs.push(elf.Rel.{ off: 0, ty: elf.R_X86_64_RVA32, sym: es, addend: 0 });
+        ps.relocs.push(elf.Rel.{ off: 4, ty: elf.R_X86_64_RVA32, sym: es, addend: @bit_cast(i64, size) });
+        ps.relocs.push(elf.Rel.{ off: 8, ty: elf.R_X86_64_RVA32, sym: xs, addend: 0 });
+    }
+}
+
+// The DLL's exports (see g_dll), sorted by name (the export name table's
+// order, which the loader's lookups search).
+fn collect_exports() void {
+    exports = u.List.[u32].empty();
+    for gi in 0..nl.gsyms.len {
+        let g = nl.gsyms.get(gi);
+        if (g.obj < 0) or (@as(usize, @bit_cast(u32, g.obj)) >= n_inputs) {
+            continue;
+        }
+        let s = nl.objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym));
+        if s.hidden or (s.bind == elf.B_LOCAL) or elf.is_part_name(s.name) or u.starts(s.name, "axiom.") or
+           u.starts(s.name, "__start_") or u.starts(s.name, "__stop_") or u.starts(s.name, ".weak.") or
+           (s.ty == elf.T_TLS) {
+            continue;
+        }
+        exports.push(@truncate(u32, gi));
+    }
+    u.sort.[u32](exports.items(), cmp_export);
+}
+
+fn cmp_export(a: u32, b: u32) i32 {
+    return u.str_cmp(nl.gsyms.get(@as(usize, a)).name, nl.gsyms.get(@as(usize, b)).name);
+}
+
+// The export directory's size (with its tables and names), for the DLL
+// file name `dll`.
+fn export_size(dll: []u8) u64 {
+    let n = @as(u64, exports.len);
+    let mut size = 40 + (n * 10) + @as(u64, dll.len) + 1;
+    for gi in exports.items() {
+        size += @as(u64, nl.gsyms.get(@as(usize, gi)).name.len) + 1;
+    }
+    return size;
+}
+
+// The export directory at address `at` (in b): IMAGE_EXPORT_DIRECTORY, the
+// export address table (ordinals from 1, in name order), the name pointer
+// table, the ordinal table, the names.
+fn write_exports(b: []mut u8, at: u64, dll: []u8) void {
+    let n = @as(u64, exports.len);
+    let rva = at - BASE;
+    let eat = rva + 40;
+    let npt = eat + (n * 4);
+    let ot = npt + (n * 4);
+    let mut names = ot + (n * 2);
+    let fo = file_of(at);
+    bn.w32(b, fo + 12, names);  // Name: the DLL's
+    bn.put_at(b, file_of(BASE + names), dll);
+    names += @as(u64, dll.len) + 1;
+    bn.w32(b, fo + 16, 1);  // ordinal base
+    bn.w32(b, fo + 20, n);
+    bn.w32(b, fo + 24, n);
+    bn.w32(b, fo + 28, eat);
+    bn.w32(b, fo + 32, npt);
+    bn.w32(b, fo + 36, ot);
+    for k in 0..exports.len {
+        let g = nl.gsyms.get(@as(usize, exports.get(k)));
+        let kk = @as(u64, k);
+        bn.w32(b, file_of(BASE + eat + (kk * 4)), sym_addr(@as(usize, @bit_cast(u32, g.obj)), g.sym) - BASE);
+        bn.w32(b, file_of(BASE + npt + (kk * 4)), names);
+        bn.w16(b, file_of(BASE + ot + (kk * 2)), kk);
+        bn.put_at(b, file_of(BASE + names), g.name);
+        names += @as(u64, g.name.len) + 1;
+    }
 }
 
 // ARM64: axiom.entry, with its unwind information (the frame record saved,
@@ -538,6 +833,23 @@ fn own_entry_a64(o: *mut elf.Obj, text: i32, main_: u32, exitp: u32) void {
     ps.data.zeros(8);
     ps.relocs.push(elf.Rel.{ off: 0, ty: elf.R_AARCH64_RVA32, sym: es, addend: 0 });
     ps.relocs.push(elf.Rel.{ off: 4, ty: elf.R_AARCH64_RVA32, sym: xs, addend: 0 });
+    // __chkstk (x15: the frame's size in 16-byte units), which the
+    // platform's compilers call before a frame of more than a page: touches
+    // each page below sp, in order, and keeps every register but x16 and
+    // x17 (the caller then moves sp)
+    ts.data.u32_(0);                  // (to 32)
+    let chk: [7]u32 = [0xd37c_edf0,   // lsl x16, x15, #4: the size in bytes
+                       0x9100_03f1,   // mov x17, sp
+                       0xd140_0631,   // loop: sub x17, x17, #4096
+                       0xf140_0610,   // subs x16, x16, #4096
+                       0xf940_023f,   // ldr xzr, [x17]
+                       0x54ff_ffac,   // b.gt loop
+                       0xd65f_03c0];  // ret
+    for w in chk {
+        ts.data.u32_(@as(u64, w));
+    }
+    _ = elf.add_sym(o, elf.Sym.{ name: "__chkstk", sec: text, value: 32, size: 28, bind: elf.B_WEAK, ty: elf.T_FUNC,
+                                 hidden: true });
 }
 
 // The function table must be sorted by start address. It is, as the
@@ -589,10 +901,20 @@ fn import_section(rva: u64) bn.Bytes {
         let dl = dlls.get(d);
         for gi in dl.funcs.items() {
             let g = nl.gsyms.get(@as(usize, gi));
+            let im = import_of(g.name);
+            if u.notnil(im) and (im.ordinal >= 0) {
+                // by ordinal: IMAGE_ORDINAL_FLAG64 and the number
+                hint_name[@as(usize, @bit_cast(u32, g.stub))] = 0x8000_0000_0000_0000 | @bit_cast(u64, im.ordinal);
+                continue;
+            }
             names.align(2);
             hint_name[@as(usize, @bit_cast(u32, g.stub))] = rva + names_at + @as(u64, names.len());
             names.u16_(0);
-            names.put(g.name);
+            if u.notnil(im) {
+                names.put(im.name);
+            } else {
+                names.put(g.name);
+            }
             names.u8_(0);
         }
         names.align(2);
@@ -685,6 +1007,15 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     A64 = (inputs.len > 0) and (inputs[0].machine == elf.EM_AARCH64);
     pdb.g_arm64 = A64;
     nl.begin(inputs);
+    n_inputs = inputs.len;
+    imp_map = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for k in 0..g_imports.len {
+        let key = u.intern(g_imports.get(k).sym);
+        if imp_map.get(key) == 0 {
+            imp_map.put(key, @truncate(u32, k) + 1);
+        }
+    }
+    _ = nl.lnk_sym("__ImageBase");  // (the image's base: its headers)
     own_index = nl.objs.len;
     nl.objs.push(own_object());
     nl.objs.push(jstub.build(machine(), true));  // (C's setjmp and longjmp)
@@ -697,17 +1028,22 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     nl.objs.push(elf.rets_bounds(machine()));
     collect_dll_names();
     collect_symbols();
-    if nl.gsyms.at(@as(usize, nl.gsym_index("main"))).obj < 0 {
+    if (nl.gsyms.at(@as(usize, nl.gsym_index("main"))).obj < 0) and not g_dll {
         nl.err("no 'main' function");
     }
     nl.classify(class_of);
     scan_relocs();
-    add_import(nl.gsym_index("ExitProcess"));
+    if g_dll {
+        collect_exports();
+    } else {
+        add_import(nl.gsym_index("ExitProcess"));
+    }
     let ico = read_icon();
     if nl.errors != 0 {
         return 1;
     }
     let ly = lay_out(out);
+    nl.set_abs("__ImageBase", BASE);
     let mut f = bn.new_bytes();
     f.zeros(@truncate(usize, ly.file_size));
     let tls_dir = write_contents(f.view(), &ly);
@@ -781,6 +1117,8 @@ struct Layout {
     data_file_end: u64,
     bss_end: u64,
     file_size: u64,  // without .reloc and .rsrc
+    export_at: u64,  // a DLL's export directory
+    dll_name: []u8,
 }
 
 // Places the sections (outs[0..4]) and what they hold.
@@ -808,6 +1146,11 @@ fn lay_out(out: []u8) Layout {
     let mut rdata_end = pdata_end;
     if g_pdb {
         rdata_end = rsds_at + 24 + @as(u64, pdb_path.len) + 1;
+    }
+    // a DLL's export directory
+    let export_at = nl.align_up(rdata_end, 4);
+    if g_dll {
+        rdata_end = export_at + export_size(basename(out));
     }
     // .idata
     let idata_rva = nl.align_up(rdata_end - BASE, SECT);
@@ -851,7 +1194,7 @@ fn lay_out(out: []u8) Layout {
     return Layout.{ nsec: nsec, headers: headers, text_rva: text_rva, pdata_start: pdata_start, pdata_end: pdata_end,
                     debug_at: debug_at, rsds_at: rsds_at, pdb_path: pdb_path, rdata_end: rdata_end, idata: idata,
                     tls_align: tls_align, tls_end: tls_end, data_file_end: data_file_end, bss_end: bss_end,
-                    file_size: foff };
+                    file_size: foff, export_at: export_at, dll_name: basename(out) };
 }
 
 // The sections' contents in b (the file without .reloc and .rsrc),
@@ -864,6 +1207,9 @@ fn write_contents(b: []mut u8, ly: *Layout) u64 {
     nl.copy_class(b, nl.C_DATA, file_of);
     nl.copy_class(b, nl.C_TDATA, file_of);
     bn.put_at(b, outs[2].foff, ly.idata.view());
+    if g_dll {
+        write_exports(b, ly.export_at, ly.dll_name);
+    }
     // the import address table holds addresses only once bound: base
     // relocations do not apply to it
     // thunks: jmp [rip + slot] (ARM64: adrp x16, slot; ldr x16, [x16, slot's
@@ -967,8 +1313,13 @@ fn pe_headers(ly: *Layout, tls_dir: u64, image_size: u64) bn.Bytes {
     h.u32_(0);  // TimeDateStamp (deterministic builds)
     h.u32_(0);
     h.u32_(0);
-    h.u16_(240);     // SizeOfOptionalHeader
-    h.u16_(0x0022);  // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+    h.u16_(240);  // SizeOfOptionalHeader
+    // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE (| DLL)
+    if g_dll {
+        h.u16_(0x2022);
+    } else {
+        h.u16_(0x0022);
+    }
     // optional header (PE32+)
     h.u16_(0x20b);
     h.u8_(14);
@@ -977,7 +1328,7 @@ fn pe_headers(ly: *Layout, tls_dir: u64, image_size: u64) bn.Bytes {
     let init_size = nl.align_up(outs[1].fsize, FILEAL) + nl.align_up(outs[2].fsize, FILEAL);
     h.u32_((init_size + nl.align_up(outs[3].fsize, FILEAL)) + nl.align_up(outs[5].fsize, FILEAL));  // initialized
     h.u32_(ly.bss_end - ly.data_file_end);  // uninitialized
-    h.u32_(nl.global_addr("axiom.entry") - BASE);
+    h.u32_(nl.global_addr(u.pick(g_dll, "axiom.dll_entry", "axiom.entry")) - BASE);
     h.u32_(ly.text_rva);  // BaseOfCode
     h.u64_(BASE);
     h.u32_(SECT);
@@ -1016,7 +1367,10 @@ fn pe_headers(ly: *Layout, tls_dir: u64, image_size: u64) bn.Bytes {
     // data directories
     let ndll = @as(u64, dlls.len);
     for d in @as(u64, 0)..16 {
-        if d == 1 {
+        if (d == 0) and g_dll {
+            h.u32_(ly.export_at - BASE);
+            h.u32_(export_size(ly.dll_name));
+        } else if d == 1 {
             h.u32_(outs[2].rva);
             h.u32_((ndll + 1) * 20);
         } else if d == 3 {

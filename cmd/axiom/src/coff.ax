@@ -1,0 +1,1680 @@
+// =============================================================================
+// coff.ax - COFF relocatable objects for Windows on x64 and ARM64 (machine
+// 0x8664 and 0xAA64), as the PE/COFF specification lays them out: write()
+// encodes the native code generators' objects (elf.Obj, with ELF relocation
+// types) in the platform's format (--emit=obj and the members of
+// --emit=lib); read() decodes an object of this compiler or of the
+// platform's toolchain (the regular layout and the big one, /bigobj's) into
+// an elf.Obj that plink.ax links, and read_import() an import library's
+// short import record (an archive member that names a DLL's function or
+// data).
+//
+// Sections written (from elf.Sec's kind and name; the flags are the
+// specification's IMAGE_SCN_ ones, each with its alignment):
+//   code                       .text
+//   read-only data             .rdata (also .data.rel.ro: base relocations
+//                              patch read-only pages too)
+//   data, zero-filled data     .data, .bss
+//   thread-local data          .tls$ (one section: the initialized part,
+//                              then the zero-filled part as zeros; a
+//                              thread-local's offset in the program's
+//                              block is its offset in the .tls output
+//                              section: IMAGE_REL_*_SECREL)
+//   .init_array, .fini_array   .CRT$XCU and .CRT$XTU (those of a priority:
+//                              .CRT$XCT<NNNNN>, .CRT$XTT<NNNNN>, before the
+//                              plain ones, as the generic ABI orders them)
+//   a C-identifier section X   X$m, with its bounds (when the object refers
+//                              to __start_X or __stop_X) the symbols
+//                              __start_X in X$a and __stop_X in X$z, empty
+//                              sections of their own selected once
+//                              (COMDAT "any"): a grouped section's parts
+//                              are placed in the order of their names
+//   .pdata, .xdata             as they are (the function table and unwind
+//                              information)
+//   .axiom.lines, .axiom.cv    the line tables and the CodeView records for
+//                              the program database (IMAGE_SCN_LNK_REMOVE:
+//                              the system's linker drops them; plink.ax
+//                              reads them)
+//
+// A weak definition (the runtime's link-once state and helpers, C's
+// attribute weak) is a weak external whose default is a definition of
+// another name, .weak.<name>.default.<tag> (the tag: the object's first
+// strong definition, else a hash of its contents), as the platform's
+// linkers resolve one: to a strong definition anywhere, else to the first
+// default. A weak reference is a weak external whose default is an
+// absolute 0. COFF has no GOT: a load of an address through the GOT reads
+// a pointer of the object's own, .refptr.<name> in its section
+// .rdata$.refptr.<name> (selected once across objects), which holds the
+// address. An addend that a relocation cannot hold (the ARM64 SECREL pair
+// of an add's immediates, page offsets of loads) is a label at the place,
+// $L<section>_<offset>, and a relocation to it with none.
+//
+// read() takes the sections (grouped ones, "name$suffix", by their names;
+// .CRT$XC*/.CRT$XI* become initialization arrays and .CRT$XT*/.CRT$XP*
+// termination ones, in their suffixes' order, the CRT's own bounds .CRT$XCA,
+// .CRT$XCZ and kin dropped), COMDAT sections as groups (every selection is
+// taken as "any": the first object's copy; associative sections go with
+// theirs), weak externals as weak symbols, common symbols as weak zero-fill
+// definitions, and the relocations of both machines with their implicit
+// addends. Not kept: .drectve (linker directives), .debug$S/.debug$T
+// (CodeView: the program database is written from .axiom.lines),
+// .llvm_addrsig and other sections the linker is to remove.
+// =============================================================================
+import "bin.ax" as bn;
+import "elf.ax" as elf;
+import "util.ax" as u;
+
+pub const MACHINE_AMD64: u64 = 0x8664;
+pub const MACHINE_ARM64: u64 = 0xaa64;
+
+// section characteristics
+const SCN_CNT_CODE: u64 = 0x20;
+const SCN_CNT_INIT: u64 = 0x40;
+const SCN_CNT_UNINIT: u64 = 0x80;
+const SCN_LNK_INFO: u64 = 0x200;
+const SCN_LNK_REMOVE: u64 = 0x800;
+const SCN_LNK_COMDAT: u64 = 0x1000;
+const SCN_LNK_NRELOC_OVFL: u64 = 0x0100_0000;
+const SCN_MEM_DISCARDABLE: u64 = 0x0200_0000;
+const SCN_MEM_EXECUTE: u64 = 0x2000_0000;
+const SCN_MEM_READ: u64 = 0x4000_0000;
+const SCN_MEM_WRITE: u64 = 0x8000_0000;
+
+// storage classes
+const SYM_CLASS_EXTERNAL: u8 = 2;
+const SYM_CLASS_STATIC: u8 = 3;
+const SYM_CLASS_LABEL: u8 = 6;
+const SYM_CLASS_FUNCTION: u8 = 101;
+const SYM_CLASS_FILE: u8 = 103;
+const SYM_CLASS_SECTION: u8 = 104;
+const SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
+
+// COMDAT selections
+const SELECT_ANY: u8 = 2;
+const SELECT_ASSOCIATIVE: u8 = 5;
+
+// x64 relocations
+pub const AMD64_ABSOLUTE: u32 = 0;
+pub const AMD64_ADDR64: u32 = 1;
+pub const AMD64_ADDR32: u32 = 2;
+pub const AMD64_ADDR32NB: u32 = 3;
+pub const AMD64_REL32: u32 = 4;  // REL32_1 .. REL32_5: 5 .. 9
+pub const AMD64_SECTION: u32 = 0xa;
+pub const AMD64_SECREL: u32 = 0xb;
+
+// ARM64 relocations
+pub const ARM64_ABSOLUTE: u32 = 0;
+pub const ARM64_ADDR32: u32 = 1;
+pub const ARM64_ADDR32NB: u32 = 2;
+pub const ARM64_BRANCH26: u32 = 3;
+pub const ARM64_PAGEBASE_REL21: u32 = 4;
+pub const ARM64_REL21: u32 = 5;
+pub const ARM64_PAGEOFFSET_12A: u32 = 6;
+pub const ARM64_PAGEOFFSET_12L: u32 = 7;
+pub const ARM64_SECREL: u32 = 8;
+pub const ARM64_SECREL_LOW12A: u32 = 9;
+pub const ARM64_SECREL_HIGH12A: u32 = 0xa;
+pub const ARM64_SECREL_LOW12L: u32 = 0xb;
+pub const ARM64_TOKEN: u32 = 0xc;
+pub const ARM64_SECTION: u32 = 0xd;
+pub const ARM64_ADDR64: u32 = 0xe;
+pub const ARM64_BRANCH19: u32 = 0xf;
+pub const ARM64_BRANCH14: u32 = 0x10;
+pub const ARM64_REL32: u32 = 0x11;
+
+/// The last error of write or read (a message for people), "" if none.
+pub let mut g_error: []u8 = "";
+
+// The big object format's class identifier (/bigobj), after its signatures.
+let BIGOBJ_CLSID: [16]u8 = [0xc7, 0xa1, 0xba, 0xd1, 0xee, 0xba, 0xa9, 0x4b, 0xaf, 0x20, 0xfa, 0xf6, 0x6a, 0xa4, 0xdc,
+                            0xb8];
+
+fn machine_ok(m: u64) bool {
+    return (m == MACHINE_AMD64) or (m == MACHINE_ARM64);
+}
+
+fn is_bigobj(d: []u8) bool {
+    if (d.len < 56) or (bn.rd16(d, 0) != 0) or (bn.rd16(d, 2) != 0xffff) or (bn.rd16(d, 4) < 2) {
+        return false;
+    }
+    for i in @as(usize, 0)..16 {
+        if d[12 + i] != BIGOBJ_CLSID[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Is d a COFF object for x64 or ARM64 (the regular layout or the big one)?
+pub fn is_object(d: []u8) bool {
+    if is_bigobj(d) {
+        return machine_ok(bn.rd16(d, 6));
+    }
+    return (d.len >= 20) and machine_ok(bn.rd16(d, 0)) and (bn.rd16(d, 16) == 0);
+}
+
+/// Is d a short import record (an import library's member)?
+pub fn is_import(d: []u8) bool {
+    return (d.len >= 20) and (bn.rd16(d, 0) == 0) and (bn.rd16(d, 2) == 0xffff) and (bn.rd16(d, 4) == 0) and
+           machine_ok(bn.rd16(d, 6));
+}
+
+fn c_ident(n: []u8) bool {
+    if n.len == 0 {
+        return false;
+    }
+    for i in 0..n.len {
+        let c = n[i];
+        let alpha = ((c | 0x20) >= 'a') and ((c | 0x20) <= 'z');
+        if not alpha and (c != '_') and not (u.is_digit(c) and (i > 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn align_flag(a: u64) u64 {
+    let mut n: u64 = 0;
+    while ((@as(u64, 1) << n) < a) and (n < 13) {
+        n += 1;
+    }
+    return (n + 1) << 20;
+}
+
+fn pick64(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn pick32(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn digits5(p: u64) []u8 {
+    let d = u.udec(p);
+    let mut b = u.Buf.init();
+    for _k in d.len..5 {
+        b.c('0');
+    }
+    b.s(d);
+    return b.done();
+}
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+struct CSec {
+    name: []u8,
+    flags: u64,
+    data: bn.Bytes,
+    size: u64,  // (an uninitialized section's)
+    uninit: bool,
+    rels: u.List.[CRel],
+    comdat: u8,  // its selection, 0: none
+    assoc: u32,  // (SELECT_ASSOCIATIVE: the section's number)
+    sym: u32,    // its section symbol (CSym index)
+    reloff: u64,
+    dataoff: u64,
+}
+
+struct CRel {
+    off: u64,
+    sym: u32,  // CSym
+    ty: u32,
+}
+
+struct CSym {
+    name: []u8,
+    value: u64,
+    sec: i32,  // section number (1-based), 0 undefined, -1 absolute
+    ty: u64,   // 0x20: a function
+    class: u8,
+    aux: bn.Bytes,  // its auxiliary records (18 bytes each)
+    index: u32,     // in the table (with the aux records before it)
+}
+
+struct W {
+    a64: bool,
+    secs: u.List.[CSec],
+    smap: []mut i32,   // ELF section -> CSec
+    sbase: []mut u64,  // ELF section -> its offset there
+    syms: u.List.[CSym],
+    ymap: []mut i32,          // ELF symbol -> CSym (-1: none)
+    labels: u.SymMap.[u32],   // "$L<sec>_<off>" -> CSym + 1
+    refptrs: u.SymMap.[u32],  // name -> .refptr's CSym + 1
+    tag: []u8,
+    ok: bool,
+}
+
+fn fail(w: *mut W, msg: []u8) void {
+    if w.ok {
+        g_error = msg;
+    }
+    w.ok = false;
+}
+
+// A section's name and flags for ELF section s.
+fn place_of(s: *elf.Sec) CSec {
+    let n = s.name;
+    let k = s.kind;
+    let al = align_flag(@max(s.align, 1));
+    let mut c = CSec.{ name: n, flags: 0, data: bn.new_bytes(), size: 0, uninit: false, rels: u.List.[CRel].empty(),
+                       comdat: 0, assoc: 0, sym: 0, reloff: 0, dataoff: 0 };
+    let r = SCN_MEM_READ;
+    let init = SCN_CNT_INIT | r;
+    if k == elf.S_TEXT {
+        c.name = u.pick(u.starts(n, ".text"), ".text", n);
+        c.flags = SCN_CNT_CODE | SCN_MEM_EXECUTE | r | al;
+    } else if k == elf.S_DEBUG {
+        c.flags = init | SCN_LNK_INFO | SCN_LNK_REMOVE | SCN_MEM_DISCARDABLE | al;
+    } else if (k == elf.S_TDATA) or (k == elf.S_TBSS) {
+        c.name = ".tls$";
+        c.flags = init | SCN_MEM_WRITE | al;
+    } else if k == elf.S_BSS {
+        c.name = u.pick(c_ident(n), u.cat2(n, "$m"), ".bss");
+        c.flags = SCN_CNT_UNINIT | r | SCN_MEM_WRITE | al;
+        c.uninit = true;
+    } else if u.starts(n, ".init_array") or u.starts(n, ".fini_array") {
+        let init_ = u.starts(n, ".init_array");
+        let rest = n[11..];
+        if (rest.len > 1) and (rest[0] == '.') {
+            c.name = u.cat3(u.pick(init_, ".CRT$XCT", ".CRT$XTT"), digits5(@as(u64, @bit_cast(u64, u.atol(rest[1..])))),
+                            "");
+        } else {
+            c.name = u.pick(init_, ".CRT$XCU", ".CRT$XTU");
+        }
+        c.flags = init | al;
+    } else if c_ident(n) {
+        c.name = u.cat2(n, "$m");
+        c.flags = init | pick64(k == elf.S_RODATA, 0, SCN_MEM_WRITE) | al;
+    } else if (u.str_eq(n, ".pdata") or u.str_eq(n, ".xdata")) {
+        c.flags = init | al;
+    } else if k == elf.S_RODATA {
+        c.name = u.pick(u.starts(n, ".rdata"), n, ".rdata");
+        c.flags = init | al;
+    } else if u.starts(n, ".data.rel.ro") {
+        c.name = ".rdata";
+        c.flags = init | al;
+    } else {
+        c.name = u.pick(u.starts(n, ".data"), ".data", n);
+        c.flags = init | SCN_MEM_WRITE | al;
+    }
+    return c;
+}
+
+fn csec_of(w: *mut W, c: CSec, merge: bool) i32 {
+    if merge {
+        for i in 0..w.secs.len {
+            if u.str_eq(w.secs.get(i).name, c.name) {
+                let x = w.secs.at(i);
+                // (the larger alignment)
+                if (c.flags & 0x00f0_0000) > (x.flags & 0x00f0_0000) {
+                    x.flags = (x.flags & ~@as(u64, 0x00f0_0000)) | (c.flags & 0x00f0_0000);
+                }
+                return @int_cast(i32, i);
+            }
+        }
+    }
+    w.secs.push(c);
+    let k = @int_cast(i32, w.secs.len - 1);
+    w.secs.at(@as(usize, @bit_cast(u32, k))).sym = add_sym(w, CSym.{ name: c.name, value: 0, sec: k + 1, ty: 0,
+                                                                     class: SYM_CLASS_STATIC, aux: bn.new_bytes(),
+                                                                     index: 0 });
+    return k;
+}
+
+fn add_sym(w: *mut W, s: CSym) u32 {
+    w.syms.push(s);
+    return @truncate(u32, w.syms.len - 1);
+}
+
+// The CSym of a place: a label symbol at offset `off` of section cs (one per
+// place), for a relocation that cannot hold an addend.
+fn label(w: *mut W, cs: i32, off: u64) u32 {
+    let key = u.intern(u.f2("$L%s_%s", u.idec(cs), u.udec(off)));
+    let prev = w.labels.get(key);
+    if prev != 0 {
+        return prev - 1;
+    }
+    let k = add_sym(w, CSym.{ name: key, value: off, sec: cs + 1, ty: 0, class: SYM_CLASS_STATIC, aux: bn.new_bytes(),
+                              index: 0 });
+    w.labels.put(key, k + 1);
+    return k;
+}
+
+struct Tgt {
+    sym: u32,
+    add: i64,
+}
+
+// A relocation's target: the symbol and addend as COFF writes them (a
+// nameless ELF symbol, a section's, is that section's symbol).
+fn target(w: *mut W, o: *elf.Obj, si: u32, a: i64) Tgt {
+    let m = w.ymap[@as(usize, si)];
+    if m >= 0 {
+        return Tgt.{ sym: @bit_cast(u32, m), add: a };
+    }
+    let s = o.syms.at(@as(usize, si));
+    if (s.sec < 0) or (w.smap[@as(usize, @bit_cast(u32, s.sec))] < 0) {
+        fail(w, u.f1("a relocation refers to '%s', which the object cannot name", s.name));
+        return Tgt.{ sym: 0, add: 0 };
+    }
+    let k = @as(usize, @bit_cast(u32, s.sec));
+    let cs = w.smap[k];
+    return Tgt.{ sym: w.secs.get(@as(usize, @bit_cast(u32, cs))).sym, add: @bit_cast(i64, w.sbase[k] + s.value) + a };
+}
+
+// The target without an addend: the symbol itself, or a label at S + A.
+fn exact(w: *mut W, o: *elf.Obj, si: u32, a: i64) u32 {
+    let t = target(w, o, si, a);
+    if t.add == 0 {
+        return t.sym;
+    }
+    let s = w.syms.get(@as(usize, t.sym));
+    if s.sec <= 0 {
+        fail(w, "a relocation with an addend to a symbol of another object, which COFF cannot hold here");
+        return t.sym;
+    }
+    return label(w, s.sec - 1, @bit_cast(u64, @bit_cast(i64, s.value) + t.add));
+}
+
+// The .refptr.<name> pointer of a symbol (made once): what a load through
+// the GOT reads instead.
+fn refptr(w: *mut W, o: *elf.Obj, si: u32) u32 {
+    let t = target(w, o, si, 0);
+    let s = w.syms.get(@as(usize, t.sym));
+    let mut nm = s.name;
+    if s.class == SYM_CLASS_STATIC {
+        nm = u.f2("%s.%s", w.tag, s.name);  // (a local one's: this object's)
+    }
+    let key = u.intern(nm);
+    let prev = w.refptrs.get(key);
+    if prev != 0 {
+        return prev - 1;
+    }
+    let mut c = CSec.{ name: u.cat2(".rdata$.refptr.", nm),
+                       flags: SCN_CNT_INIT | SCN_MEM_READ | SCN_LNK_COMDAT | align_flag(8), data: bn.new_bytes(),
+                       size: 0, uninit: false, rels: u.List.[CRel].empty(), comdat: SELECT_ANY, assoc: 0, sym: 0,
+                       reloff: 0, dataoff: 0 };
+    c.data.zeros(8);
+    let cs = csec_of(w, c, false);
+    let x = w.secs.at(@as(usize, @bit_cast(u32, cs)));
+    x.rels.push(CRel.{ off: 0, sym: t.sym, ty: pick32(w.a64, ARM64_ADDR64, AMD64_ADDR64) });
+    let k = add_sym(w, CSym.{ name: u.cat2(".refptr.", nm), value: 0, sec: cs + 1, ty: 0, class: SYM_CLASS_EXTERNAL,
+                              aux: bn.new_bytes(), index: 0 });
+    w.refptrs.put(key, k + 1);
+    return k;
+}
+
+fn sec_at(w: *mut W, cs: i32) *mut CSec {
+    return w.secs.at(@as(usize, @bit_cast(u32, cs)));
+}
+
+fn put32(w: *mut W, cs: i32, at: u64, v: i64) void {
+    sec_at(w, cs).data.set_u32(@truncate(usize, at), @bit_cast(u64, v) & 0xffff_ffff);
+}
+
+fn put64(w: *mut W, cs: i32, at: u64, v: i64) void {
+    sec_at(w, cs).data.set_u64(@truncate(usize, at), @bit_cast(u64, v));
+}
+
+fn ins(w: *mut W, cs: i32, at: u64) u64 {
+    return bn.rd32(sec_at(w, cs).data.view(), @truncate(usize, at));
+}
+
+fn set_ins(w: *mut W, cs: i32, at: u64, v: u64) void {
+    sec_at(w, cs).data.set_u32(@truncate(usize, at), v & 0xffff_ffff);
+}
+
+fn rel(w: *mut W, cs: i32, at: u64, sym: u32, ty: u32) void {
+    sec_at(w, cs).rels.push(CRel.{ off: at, sym: sym, ty: ty });
+}
+
+// The size a load or store scales its 12-bit offset by (log2).
+fn ldst_scale(t: u32) u64 {
+    if t == elf.R_AARCH64_LDST16_ABS_LO12_NC {
+        return 1;
+    }
+    if t == elf.R_AARCH64_LDST32_ABS_LO12_NC {
+        return 2;
+    }
+    if t == elf.R_AARCH64_LDST64_ABS_LO12_NC {
+        return 3;
+    }
+    if t == elf.R_AARCH64_LDST128_ABS_LO12_NC {
+        return 4;
+    }
+    return 0;
+}
+
+// One ELF relocation of section k (in CSec cs at offset `at`) as COFF's.
+fn convert(w: *mut W, o: *elf.Obj, k: usize, cs: i32, r: elf.Rel) void {
+    let at = w.sbase[k] + r.off;
+    let t = r.ty;
+    if not w.a64 {
+        if (t == elf.R_X86_64_64) or (t == elf.R_X86_64_32) or (t == elf.R_X86_64_32S) or (t == elf.R_X86_64_RVA32) {
+            let g = target(w, o, r.sym, r.addend);
+            if t == elf.R_X86_64_64 {
+                put64(w, cs, at, g.add);
+                rel(w, cs, at, g.sym, AMD64_ADDR64);
+            } else {
+                put32(w, cs, at, g.add);
+                rel(w, cs, at, g.sym, pick32(t == elf.R_X86_64_RVA32, AMD64_ADDR32NB, AMD64_ADDR32));
+            }
+        } else if (t == elf.R_X86_64_PC32) or (t == elf.R_X86_64_PLT32) {
+            // the displacement from the field's end (+ k bytes: REL32_k)
+            let g = target(w, o, r.sym, r.addend);
+            let kk = -(g.add + 4);
+            if (kk >= 1) and (kk <= 5) and (g.add == r.addend) {
+                put32(w, cs, at, 0);
+                rel(w, cs, at, g.sym, AMD64_REL32 + @truncate(u32, @bit_cast(u64, kk)));
+            } else {
+                put32(w, cs, at, g.add + 4);
+                rel(w, cs, at, g.sym, AMD64_REL32);
+            }
+        } else if (t == elf.R_X86_64_GOTPCREL) or (t == elf.R_X86_64_GOTPCRELX) or (t == elf.R_X86_64_REX_GOTPCRELX) {
+            put32(w, cs, at, r.addend + 4);
+            rel(w, cs, at, refptr(w, o, r.sym), AMD64_REL32);
+        } else if t == elf.R_X86_64_TPOFF32 {
+            let g = target(w, o, r.sym, r.addend);
+            put32(w, cs, at, g.add);
+            rel(w, cs, at, g.sym, AMD64_SECREL);
+        } else {
+            fail(w, u.f1("an x64 relocation of type %s, which COFF has none for", u.udec(@as(u64, t))));
+        }
+        return;
+    }
+    if (t == elf.R_AARCH64_ABS64) or (t == elf.R_AARCH64_ABS32) or (t == elf.R_AARCH64_RVA32) or
+       (t == elf.R_AARCH64_PREL32) {
+        let g = target(w, o, r.sym, r.addend);
+        if t == elf.R_AARCH64_ABS64 {
+            put64(w, cs, at, g.add);
+            rel(w, cs, at, g.sym, ARM64_ADDR64);
+        } else {
+            put32(w, cs, at, g.add);
+            let mut ct = ARM64_ADDR32;
+            if t == elf.R_AARCH64_RVA32 {
+                ct = ARM64_ADDR32NB;
+            } else if t == elf.R_AARCH64_PREL32 {
+                ct = ARM64_REL32;
+            }
+            rel(w, cs, at, g.sym, ct);
+        }
+    } else if (t == elf.R_AARCH64_ADR_PREL_PG_HI21) or (t == elf.R_AARCH64_ADR_GOT_PAGE) {
+        // adrp: the addend in its immediate (bytes)
+        let mut g = Tgt.{ sym: 0, add: 0 };
+        if t == elf.R_AARCH64_ADR_GOT_PAGE {
+            g.sym = refptr(w, o, r.sym);
+        } else {
+            g = target(w, o, r.sym, r.addend);
+        }
+        if (g.add < 0) or (g.add >= 0x10_0000) {
+            g = Tgt.{ sym: exact(w, o, r.sym, r.addend), add: 0 };
+        }
+        let v = @bit_cast(u64, g.add) & 0x1f_ffff;
+        set_ins(w, cs, at, (ins(w, cs, at) & 0x9f00_001f) | ((v & 3) << 29) | ((v >> 2) << 5));
+        rel(w, cs, at, g.sym, ARM64_PAGEBASE_REL21);
+    } else if t == elf.R_AARCH64_ADD_ABS_LO12_NC {
+        let g = target(w, o, r.sym, r.addend);
+        let mut sym = g.sym;
+        let mut a = g.add;
+        if (a < 0) or (a > 0xfff) {
+            sym = exact(w, o, r.sym, r.addend);
+            a = 0;
+        }
+        set_ins(w, cs, at, (ins(w, cs, at) & 0xffc0_03ff) | (@bit_cast(u64, a) << 10));
+        rel(w, cs, at, sym, ARM64_PAGEOFFSET_12A);
+    } else if (t == elf.R_AARCH64_LDST8_ABS_LO12_NC) or (t == elf.R_AARCH64_LDST16_ABS_LO12_NC) or
+              (t == elf.R_AARCH64_LDST32_ABS_LO12_NC) or (t == elf.R_AARCH64_LDST64_ABS_LO12_NC) or
+              (t == elf.R_AARCH64_LDST128_ABS_LO12_NC) or (t == elf.R_AARCH64_LD64_GOT_LO12_NC) {
+        // a load's or store's offset: to the place itself (its immediate,
+        // scaled, is the linker's)
+        let mut sym: u32 = 0;
+        let mut imm: u64 = 0;
+        let sc = ldst_scale(t);
+        let g = target(w, o, r.sym, r.addend);
+        let gs = w.syms.get(@as(usize, g.sym));
+        if t == elf.R_AARCH64_LD64_GOT_LO12_NC {
+            sym = refptr(w, o, r.sym);
+        } else if (gs.sec <= 0) and (g.add >= 0) and (g.add < 0x1000) and
+                  ((@bit_cast(u64, g.add) & ((@as(u64, 1) << sc) - 1)) == 0) {
+            // (another object's symbol: the addend in the immediate, in
+            // the access's units, as the platform's compilers write it)
+            sym = g.sym;
+            imm = @bit_cast(u64, g.add) >> sc;
+        } else {
+            sym = exact(w, o, r.sym, r.addend);
+        }
+        set_ins(w, cs, at, (ins(w, cs, at) & 0xffc0_03ff) | (imm << 10));
+        rel(w, cs, at, sym, ARM64_PAGEOFFSET_12L);
+    } else if (t == elf.R_AARCH64_CALL26) or (t == elf.R_AARCH64_JUMP26) {
+        let g = target(w, o, r.sym, r.addend);
+        set_ins(w, cs, at, (ins(w, cs, at) & 0xfc00_0000) | ((@bit_cast(u64, g.add) >> 2) & 0x3ff_ffff));
+        rel(w, cs, at, g.sym, ARM64_BRANCH26);
+    } else if (t == elf.R_AARCH64_CONDBR19) or (t == elf.R_AARCH64_TSTBR14) {
+        let sym = exact(w, o, r.sym, r.addend);
+        rel(w, cs, at, sym, pick32(t == elf.R_AARCH64_CONDBR19, ARM64_BRANCH19, ARM64_BRANCH14));
+    } else if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12) or (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC) {
+        let sym = exact(w, o, r.sym, r.addend);
+        set_ins(w, cs, at, ins(w, cs, at) & 0xffc0_03ff);
+        rel(w, cs, at, sym, pick32(t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12, ARM64_SECREL_HIGH12A, ARM64_SECREL_LOW12A));
+    } else {
+        fail(w, u.f1("an ARM64 relocation of type %s, which COFF has none for", u.udec(@as(u64, t))));
+    }
+}
+
+fn fnv(h0: u64, d: []u8) u64 {
+    let mut h = h0;
+    for c in d {
+        h = (h ^ @as(u64, c)) *% 0x100_0000_01b3;
+    }
+    return h;
+}
+
+// The tag of the object's weak defaults' names (unique to it).
+fn object_tag(o: *elf.Obj) []u8 {
+    for s in o.syms.items() {
+        if (s.bind == elf.B_GLOBAL) and (s.sec >= 0) and (s.name.len > 0) {
+            return s.name;
+        }
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for k in 0..o.secs.len {
+        h = fnv(h, o.secs.get(k).data.view());
+    }
+    for s in o.syms.items() {
+        h = fnv(h, s.name);
+    }
+    return u.hex16(h);
+}
+
+/// The COFF object of o (its machine EM_X86_64 or EM_AARCH64), or "" with
+/// g_error saying why it cannot be written.
+pub fn write(o: *mut elf.Obj) []u8 {
+    g_error = "";
+    let mut w = W.{ a64: o.machine == elf.EM_AARCH64, secs: u.List.[CSec].empty(), smap: u.newn.[i32](o.secs.len + 1),
+                    sbase: u.newn.[u64](o.secs.len + 1), syms: u.List.[CSym].empty(),
+                    ymap: u.newn.[i32](o.syms.len + 1),
+                    labels: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
+                    refptrs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
+                    tag: object_tag(o), ok: true };
+    // the sections: the thread-local template (initialized, then zeros)
+    // is one; the others one each (those of one name, merged)
+    for pass in @as(u32, 0)..2 {
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            if s.kind == elf.S_DISCARD {
+                if pass == 0 {
+                    w.smap[k] = -1;
+                }
+                continue;
+            }
+            let tls_part = pick32(s.kind == elf.S_TDATA, 0, pick32(s.kind == elf.S_TBSS, 1, 2));
+            if (tls_part != 2) and (tls_part != pass) {
+                continue;
+            }
+            if (tls_part == 2) and (pass == 1) {
+                continue;
+            }
+            let c = place_of(s);
+            let merge = (tls_part != 2) or u.starts(c.name, ".CRT$") or u.str_eq(c.name, ".pdata") or
+                        u.str_eq(c.name, ".xdata");
+            let cs = csec_of(&mut w, c, merge);
+            let x = w.secs.at(@as(usize, @bit_cast(u32, cs)));
+            w.smap[k] = cs;
+            let al = @max(s.align, 1);
+            if x.uninit {
+                x.size = (x.size + al - 1) & ~(al - 1);
+                w.sbase[k] = x.size;
+                x.size += elf.sec_size(s);
+            } else {
+                x.data.align(@truncate(usize, al));
+                w.sbase[k] = @as(u64, x.data.len());
+                if s.kind == elf.S_TBSS {
+                    x.data.zeros(@truncate(usize, s.size));
+                } else {
+                    x.data.put(s.data.view());
+                }
+            }
+        }
+    }
+    // the symbols
+    let tag = w.tag;
+    for i in 0..o.syms.len {
+        w.ymap[i] = -1;
+        let s = o.syms.at(i);
+        if s.name.len == 0 {
+            continue;
+        }
+        let mut c = CSym.{ name: s.name, value: 0, sec: 0, ty: 0, class: SYM_CLASS_EXTERNAL, aux: bn.new_bytes(),
+                           index: 0 };
+        if s.ty == elf.T_FUNC {
+            c.ty = 0x20;
+        }
+        if s.sec >= 0 {
+            let cs = w.smap[@as(usize, @bit_cast(u32, s.sec))];
+            if cs < 0 {
+                continue;
+            }
+            c.sec = cs + 1;
+            c.value = w.sbase[@as(usize, @bit_cast(u32, s.sec))] + s.value;
+        } else if s.sec == elf.SEC_ABS {
+            c.sec = -1;
+            c.value = s.value;
+        } else if s.bind == elf.B_LOCAL {
+            continue;
+        }
+        if s.bind == elf.B_LOCAL {
+            c.class = SYM_CLASS_STATIC;
+            w.ymap[i] = @bit_cast(i32, add_sym(&mut w, c));
+            continue;
+        }
+        if s.bind == elf.B_WEAK {
+            // a weak external with a default: the definition (another
+            // name), or an absolute 0
+            let mut dflt = c;
+            dflt.name = u.f2(".weak.%s.default.%s", s.name, tag);
+            if s.sec == -1 {
+                dflt.sec = -1;
+                dflt.value = 0;
+            } else if (c.ty == 0x20) and (s.size > 0) {
+                func_aux(&mut dflt, s.size);
+            }
+            let di = add_sym(&mut w, dflt);
+            let mut wk = CSym.{ name: s.name, value: 0, sec: 0, ty: c.ty, class: SYM_CLASS_WEAK_EXTERNAL,
+                                aux: bn.new_bytes(), index: 0 };
+            wk.aux.u32_(@as(u64, di));  // TagIndex (an index into w.syms until the table is written)
+            wk.aux.u32_(3);             // IMAGE_WEAK_EXTERN_SEARCH_ALIAS
+            wk.aux.zeros(10);
+            w.ymap[i] = @bit_cast(i32, add_sym(&mut w, wk));
+            continue;
+        }
+        if (c.ty == 0x20) and (c.sec > 0) and (s.size > 0) {
+            func_aux(&mut c, s.size);
+        }
+        w.ymap[i] = @bit_cast(i32, add_sym(&mut w, c));
+    }
+    // the bounds of the C-identifier sections referred to: __start_X in
+    // X$a, __stop_X in X$z
+    for i in 0..o.syms.len {
+        let s = o.syms.at(i);
+        if (s.sec != -1) or (s.bind == elf.B_LOCAL) {
+            continue;
+        }
+        let mut sec: []u8 = "";
+        let mut sfx: []u8 = "";
+        if u.starts(s.name, "__start_") {
+            sec = s.name[8..];
+            sfx = "$a";
+        } else if u.starts(s.name, "__stop_") {
+            sec = s.name[7..];
+            sfx = "$z";
+        }
+        if not c_ident(sec) {
+            continue;
+        }
+        let c = CSec.{ name: u.cat2(sec, sfx), flags: SCN_CNT_INIT | SCN_MEM_READ | SCN_LNK_COMDAT | align_flag(1),
+                       data: bn.new_bytes(), size: 0, uninit: false, rels: u.List.[CRel].empty(), comdat: SELECT_ANY,
+                       assoc: 0, sym: 0, reloff: 0, dataoff: 0 };
+        let cs = csec_of(&mut w, c, false);
+        let m = w.ymap[i];
+        if m >= 0 {
+            // (the weak reference becomes the definition)
+            let y = w.syms.at(@as(usize, @bit_cast(u32, m)));
+            y.class = SYM_CLASS_EXTERNAL;
+            y.sec = cs + 1;
+            y.value = 0;
+            y.aux = bn.new_bytes();
+        }
+    }
+    // the relocations
+    for k in 0..o.secs.len {
+        let cs = w.smap[k];
+        if cs < 0 {
+            continue;
+        }
+        for r in o.secs.get(k).relocs.items() {
+            convert(&mut w, o, k, cs, r);
+        }
+    }
+    if not w.ok {
+        return "";
+    }
+    return encode(&mut w);
+}
+
+// A function's definition record (the specification's auxiliary format
+// 1): its size, so a reader knows it without the next symbol.
+fn func_aux(c: *mut CSym, size: u64) void {
+    c.aux.u32_(0);  // TagIndex
+    c.aux.u32_(size);
+    c.aux.u32_(0);
+    c.aux.u32_(0);
+    c.aux.u16_(0);
+}
+
+// The file: header, section table, contents and relocations, symbols and
+// strings.
+fn encode(w: *mut W) []u8 {
+    // the section symbols' auxiliary records (definitions: their sizes,
+    // relocation counts, COMDAT selections)
+    for i in 0..w.secs.len {
+        let x = w.secs.get(i);
+        let s = w.syms.at(@as(usize, x.sym));
+        s.aux.u32_(pick64(x.uninit, x.size, @as(u64, x.data.len())));
+        s.aux.u16_(@min(@as(u64, x.rels.len), 0xffff));
+        s.aux.u16_(0);
+        s.aux.u32_(0);  // CheckSum
+        s.aux.u16_(@as(u64, x.assoc));
+        s.aux.u8_(x.comdat);
+        s.aux.zeros(3);
+    }
+    // the symbol table's order: each COMDAT section's symbol is followed by
+    // its COMDAT symbol (the first symbol of that section after it), as the
+    // specification requires
+    let mut order = u.List.[u32].empty();
+    let mut placed = u.newn.[bool](w.syms.len + 1);
+    for i in 0..w.syms.len {
+        if placed[i] {
+            continue;
+        }
+        placed[i] = true;
+        order.push(@truncate(u32, i));
+        let s = w.syms.get(i);
+        if (s.class == SYM_CLASS_STATIC) and (s.sec > 0) and (s.aux.len() > 0) {
+            let x = w.secs.get(@as(usize, @bit_cast(u32, s.sec - 1)));
+            if (x.comdat != 0) and (x.comdat != SELECT_ASSOCIATIVE) {
+                for j in i + 1..w.syms.len {
+                    let t = w.syms.get(j);
+                    if not placed[j] and (t.sec == s.sec) and (t.class == SYM_CLASS_EXTERNAL) {
+                        placed[j] = true;
+                        order.push(@truncate(u32, j));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let mut n: u64 = 0;
+    for i in order.items() {
+        let s = w.syms.at(@as(usize, i));
+        s.index = @truncate(u32, n);
+        n += 1 + (@as(u64, s.aux.len()) / 18);
+    }
+    // the weak externals' TagIndex: the default's index in the table
+    for i in 0..w.syms.len {
+        let s = w.syms.at(i);
+        if s.class == SYM_CLASS_WEAK_EXTERNAL {
+            let di = bn.rd32(s.aux.view(), 0);
+            s.aux.set_u32(0, @as(u64, w.syms.get(@truncate(usize, di)).index));
+        }
+    }
+    // the string table (names longer than 8 bytes)
+    let mut strs = bn.new_bytes();
+    strs.u32_(0);
+    let nsec = @as(u64, w.secs.len);
+    let mut off = 20 + (40 * nsec);
+    for i in 0..w.secs.len {
+        let x = w.secs.at(i);
+        x.dataoff = 0;
+        if not x.uninit and (x.data.len() > 0) {
+            off = (off + 3) & ~@as(u64, 3);
+            x.dataoff = off;
+            off += @as(u64, x.data.len());
+        }
+        x.reloff = 0;
+        if x.rels.len > 0 {
+            off = (off + 3) & ~@as(u64, 3);
+            x.reloff = off;
+            off += 10 * (@as(u64, x.rels.len) + pick64(x.rels.len > 0xffff, 1, 0));
+        }
+    }
+    let symoff = (off + 3) & ~@as(u64, 3);
+    let mut h = bn.new_bytes();
+    h.u16_(pick64(w.a64, MACHINE_ARM64, MACHINE_AMD64));
+    h.u16_(nsec);
+    h.u32_(0);  // TimeDateStamp (none: deterministic builds)
+    h.u32_(symoff);
+    h.u32_(n);
+    h.u16_(0);  // no optional header
+    h.u16_(0);
+    for i in 0..w.secs.len {
+        let x = w.secs.get(i);
+        put_name(&mut h, &mut strs, x.name, true);
+        h.u32_(0);  // VirtualSize
+        h.u32_(0);  // VirtualAddress
+        h.u32_(pick64(x.uninit, x.size, @as(u64, x.data.len())));
+        h.u32_(x.dataoff);
+        h.u32_(x.reloff);
+        h.u32_(0);
+        h.u16_(@min(@as(u64, x.rels.len), 0xffff));
+        h.u16_(0);
+        h.u32_(
+            x.flags | pick64(x.rels.len > 0xffff, SCN_LNK_NRELOC_OVFL, 0) | pick64(x.comdat != 0, SCN_LNK_COMDAT, 0));
+    }
+    for i in 0..w.secs.len {
+        let x = w.secs.at(i);
+        if x.dataoff != 0 {
+            while @as(u64, h.len()) < x.dataoff {
+                h.u8_(0);
+            }
+            h.put(x.data.view());
+        }
+        if x.reloff != 0 {
+            while @as(u64, h.len()) < x.reloff {
+                h.u8_(0);
+            }
+            if x.rels.len > 0xffff {
+                h.u32_(@as(u64, x.rels.len) + 1);  // (the count, in the first entry)
+                h.u32_(0);
+                h.u16_(0);
+            }
+            for r in x.rels.items() {
+                h.u32_(r.off);
+                h.u32_(@as(u64, w.syms.get(@as(usize, r.sym)).index));
+                h.u16_(@as(u64, r.ty));
+            }
+        }
+    }
+    while @as(u64, h.len()) < symoff {
+        h.u8_(0);
+    }
+    for i in order.items() {
+        let s = w.syms.get(@as(usize, i));
+        put_name(&mut h, &mut strs, s.name, false);
+        h.u32_(s.value);
+        h.u16_(@bit_cast(u64, @as(i64, s.sec)) & 0xffff);
+        h.u16_(s.ty);
+        h.u8_(s.class);
+        h.u8_(@truncate(u8, @as(u64, s.aux.len()) / 18));
+        h.put(s.aux.view());
+    }
+    strs.set_u32(0, @as(u64, strs.len()));
+    h.put(strs.view());
+    let out = u.heap_dup(h.view());
+    h.free();
+    strs.free();
+    return out;
+}
+
+// An 8-byte name field: the name, or (longer) its place in the string
+// table: "/<decimal>" for a section, 0 and the offset for a symbol.
+fn put_name(h: *mut bn.Bytes, strs: *mut bn.Bytes, name: []u8, section: bool) void {
+    if name.len <= 8 {
+        h.put(name);
+        h.zeros(8 - name.len);
+        return;
+    }
+    let at = @as(u64, strs.len());
+    strs.put(name);
+    strs.u8_(0);
+    if section {
+        let d = u.cat2("/", u.udec(at));
+        h.put(d);
+        h.zeros(8 - d.len);
+        return;
+    }
+    h.u32_(0);
+    h.u32_(at);
+}
+
+// -----------------------------------------------------------------------------
+// Reading
+// -----------------------------------------------------------------------------
+
+/// A function or object a DLL exports, by an import library's short import
+/// record: `sym` is the name code refers to (data only as __imp_<sym>), the
+/// DLL's export `name` (or its ordinal, when ordinal >= 0).
+pub struct Import {
+    sym: []u8,
+    dll: []u8,
+    name: []u8,
+    ordinal: i64,
+    data: bool,
+}
+
+/// The import of short import record d (is_import), or one with an empty
+/// dll after an error (g_error says which).
+pub fn read_import(d: []u8) Import {
+    g_error = "";
+    let mut im = Import.{ sym: "", dll: "", name: "", ordinal: -1, data: false };
+    let size = @truncate(usize, bn.rd32(d, 12));
+    if (20 + size) > d.len {
+        g_error = "a truncated import record";
+        return im;
+    }
+    let hint = bn.rd16(d, 16);
+    let tb = bn.rd16(d, 18);
+    let ty = tb & 3;
+    let nt = (tb >> 2) & 7;
+    let sym = elf.cstr_at(d, 20);
+    let dll = elf.cstr_at(d, 21 + sym.len);
+    if (ty == 2) or (nt > 4) {
+        g_error = "an import record of a kind the linker does not support (IMPORT_OBJECT_CONST)";
+        return im;
+    }
+    im.sym = u.dup(sym);
+    im.data = ty == 1;
+    im.name = im.sym;
+    if nt == 0 {
+        im.ordinal = @as(i64, @bit_cast(i64, hint));
+    } else if (nt == 2) or (nt == 3) {
+        // (without the prefix ?, @ or _; undecorated: before an @ too)
+        let mut n = im.sym;
+        if (n.len > 0) and ((n[0] == '?') or (n[0] == '@') or (n[0] == '_')) {
+            n = n[1..];
+        }
+        if nt == 3 {
+            let k = u.find(n, '@');
+            if k >= 0 {
+                n = n[0..@int_cast(usize, k)];
+            }
+        }
+        im.name = n;
+    } else if nt == 4 {
+        im.name = u.dup(elf.cstr_at(d, 22 + sym.len + dll.len));
+    }
+    im.dll = u.dup(dll);
+    return im;
+}
+
+struct ISec {
+    name: []u8,
+    flags: u64,
+    va: u64,
+    rawsize: u64,
+    rawoff: u64,
+    reloff: u64,
+    nreloc: u64,
+    elf: i32,     // our section, -1: not kept
+    secsym: u32,  // its section symbol
+    comdat: u8,
+    assoc: u64,
+    sig: []u8,    // its COMDAT symbol's name
+    idata: bool,  // an import directory's piece (an import library's)
+}
+
+fn bad(msg: []u8) *mut elf.Obj {
+    g_error = msg;
+    return u.nil.[elf.Obj]();
+}
+
+fn sext(v: u64, bits: u32) i64 {
+    let sh = 64 - bits;
+    return @bit_cast(i64, v << sh) >> sh;
+}
+
+// The kind and name of a section read (-1: not kept). An initialization or
+// termination array's priority (0x10000: none) in *prio.
+fn classify(x: *ISec, name: *mut []u8) i32 {
+    let n = x.name;
+    let f = x.flags;
+    if u.str_eq(n, ".axiom.lines") or u.str_eq(n, ".axiom.cv") {
+        name.* = n;  // (the line tables and CodeView records for the program database)
+        return elf.S_DEBUG;
+    }
+    if ((f & (SCN_LNK_REMOVE | SCN_LNK_INFO)) != 0) or u.starts(n, ".debug") or u.str_eq(n, ".drectve") {
+        return -1;
+    }
+    let mut base = n;
+    let mut sfx: []u8 = "";
+    let k = u.find(n, '$');
+    if k >= 0 {
+        base = n[0..@int_cast(usize, k)];
+        sfx = n[@int_cast(usize, k) + 1..];
+    }
+    if u.str_eq(base, ".CRT") and (sfx.len >= 2) and (sfx[0] == 'X') {
+        let g = sfx[1];
+        let rest = sfx[2..];
+        if u.str_eq(rest, "A") or u.str_eq(rest, "AA") or u.str_eq(rest, "Z") {
+            return -1;  // (the C runtime's bounds of its arrays)
+        }
+        let init_ = (g == 'C') or (g == 'I');
+        if not init_ and (g != 'T') and (g != 'P') {
+            return -1;  // (.CRT$XL*: the thread-local callbacks, the loader's)
+        }
+        // the order of the suffixes: XI before XC, each by its suffix;
+        // T<NNNNN> (this compiler's priorities) as they are; U and later
+        // plain
+        let mut prio: u64 = 0x10000;
+        if (rest.len == 6) and (rest[0] == 'T') and u.is_digit(rest[1]) {
+            prio = @bit_cast(u64, u.atol(rest[1..]));
+        } else if (g == 'I') or (g == 'P') {
+            prio = 50;
+        } else if u.str_cmp(rest, "U") < 0 {
+            prio = 100;
+        }
+        let a = u.pick(init_, ".init_array", ".fini_array");
+        if prio < 0x10000 {
+            name.* = u.cat3(a, ".", digits5(prio));
+        } else {
+            name.* = a;
+        }
+        return elf.S_DATA;
+    }
+    if u.str_eq(base, ".tls") {
+        name.* = ".tdata";
+        return elf.S_TDATA;
+    }
+    if u.str_eq(base, ".pdata") or u.str_eq(base, ".xdata") {
+        name.* = base;
+        return elf.S_RODATA;
+    }
+    if u.str_eq(base, ".idata") {
+        return -2;  // (an import library's import directory: the linker makes its own)
+    }
+    let own = c_ident(base);
+    if ((f & SCN_CNT_CODE) != 0) or ((f & SCN_MEM_EXECUTE) != 0) {
+        name.* = u.pick(own, base, ".text");
+        return elf.S_TEXT;
+    }
+    if (f & SCN_CNT_UNINIT) != 0 {
+        name.* = u.pick(own, base, ".bss");
+        return elf.S_BSS;
+    }
+    if (f & SCN_MEM_WRITE) != 0 {
+        name.* = u.pick(own, base, ".data");
+        return elf.S_DATA;
+    }
+    name.* = u.pick(own, base, ".rodata");
+    return elf.S_RODATA;
+}
+
+/// Decodes the COFF object d (x64 or ARM64), or gives nil (with g_error
+/// saying why) if it is not one or is malformed, or holds what the linkers
+/// do not support.
+pub fn read(d: []u8) *mut elf.Obj {
+    g_error = "";
+    if not is_object(d) {
+        return bad("not a COFF object for x64 or ARM64");
+    }
+    let big = is_bigobj(d);
+    let mut mach: u64 = 0;
+    let mut nsec: usize = 0;
+    let mut symoff: usize = 0;
+    let mut nsyms: usize = 0;
+    let mut shoff: usize = 0;
+    let mut symsize: usize = 18;
+    if big {
+        mach = bn.rd16(d, 6);
+        nsec = @truncate(usize, bn.rd32(d, 44));
+        symoff = @truncate(usize, bn.rd32(d, 48));
+        nsyms = @truncate(usize, bn.rd32(d, 52));
+        shoff = 56;
+        symsize = 20;
+    } else {
+        mach = bn.rd16(d, 0);
+        nsec = @truncate(usize, bn.rd16(d, 2));
+        symoff = @truncate(usize, bn.rd32(d, 8));
+        nsyms = @truncate(usize, bn.rd32(d, 12));
+        shoff = 20 + @truncate(usize, bn.rd16(d, 16));
+    }
+    let a64 = mach == MACHINE_ARM64;
+    let o = elf.new_obj(pick32(a64, elf.EM_AARCH64, elf.EM_X86_64));
+    let stroff = symoff + (nsyms * symsize);
+    if (shoff + (nsec * 40) > d.len) or (stroff > d.len) {
+        return bad("a truncated object");
+    }
+    // the sections
+    let mut secs = u.List.[ISec].empty();
+    for i in 0..nsec {
+        let h = shoff + (i * 40);
+        let mut nm = elf.cstr_at(d[0..h + 8], h);
+        if (nm.len > 1) and (nm[0] == '/') and u.is_digit(nm[1]) {
+            nm = elf.cstr_at(d, stroff + @truncate(usize, @bit_cast(u64, u.atol(nm[1..]))));
+        }
+        let mut x = ISec.{ name: u.dup(nm), flags: bn.rd32(d, h + 36), va: bn.rd32(d, h + 12),
+                           rawsize: bn.rd32(d, h + 16), rawoff: bn.rd32(d, h + 20), reloff: bn.rd32(d, h + 24),
+                           nreloc: bn.rd16(d, h + 32), elf: -1, secsym: 0, comdat: 0, assoc: 0, sig: "", idata: false };
+        let mut name: []u8 = "";
+        let kind = classify(&x, &mut name);
+        if kind == -2 {
+            x.idata = true;  // (not kept; see below)
+        }
+        if kind >= 0 {
+            let an = (x.flags >> 20) & 0xf;
+            let mut al: u64 = 16;
+            if an > 0 {
+                al = @as(u64, 1) << (an - 1);
+            }
+            let si = elf.add_sec(o, name, kind, al);
+            let s = o.secs.get(@int_cast(usize, si));
+            if (x.flags & SCN_CNT_UNINIT) != 0 {
+                s.size = x.rawsize;
+                if kind == elf.S_TDATA {
+                    s.data.zeros(@truncate(usize, x.rawsize));
+                }
+            } else if x.rawsize > 0 {
+                let off = @truncate(usize, x.rawoff);
+                if off + @truncate(usize, x.rawsize) > d.len {
+                    return bad("a section beyond the file's end");
+                }
+                s.data.put(d[off..off + @truncate(usize, x.rawsize)]);
+            }
+            x.elf = si;
+            x.secsym = elf.add_sym(o, elf.Sym.{ name: "", sec: si, value: 0, size: 0, bind: elf.B_LOCAL, ty: 3,
+                                                hidden: false });
+        }
+        secs.push(x);
+    }
+    // the symbols (by their index in the table, aux records included)
+    let ymap = u.newn.[i32](nsyms + 1);
+    let mut weak = u.List.[u64].empty();  // (the weak externals: index << 32 | tag)
+    let mut i: usize = 0;
+    while i < nsyms {
+        let e = symoff + (i * symsize);
+        ymap[i] = -1;
+        if e + symsize > d.len {
+            return bad("a truncated symbol table");
+        }
+        let mut name = elf.cstr_at(d[0..e + 8], e);
+        if bn.rd32(d, e) == 0 {
+            name = elf.cstr_at(d, stroff + @truncate(usize, bn.rd32(d, e + 4)));
+        }
+        let value = bn.rd32(d, e + 8);
+        let mut secn: i64 = 0;
+        let mut ty: u64 = 0;
+        let mut class: u8 = 0;
+        let mut naux: usize = 0;
+        if big {
+            secn = @as(i64, @bit_cast(i32, @truncate(u32, bn.rd32(d, e + 12))));
+            ty = bn.rd16(d, e + 16);
+            class = d[e + 18];
+            naux = @as(usize, d[e + 19]);
+        } else {
+            secn = @as(i64, @bit_cast(i16, @truncate(u16, bn.rd16(d, e + 12))));
+            ty = bn.rd16(d, e + 14);
+            class = d[e + 16];
+            naux = @as(usize, d[e + 17]);
+        }
+        let aux = e + symsize;
+        for k in 1..naux + 1 {
+            if i + k < nsyms {
+                ymap[i + k] = -1;
+            }
+        }
+        let in_sec = (secn > 0) and (@bit_cast(u64, secn) <= @as(u64, secs.len));
+        let mut x = u.nil.[ISec]();
+        if in_sec {
+            x = secs.at(@truncate(usize, @bit_cast(u64, secn)) - 1);
+        }
+        if (class == SYM_CLASS_STATIC) and in_sec and (value == 0) and (naux > 0) and u.str_eq(name, x.name) {
+            // a section's symbol, with its definition: a COMDAT's selection
+            x.comdat = d[aux + 14];
+            x.assoc = bn.rd16(d, aux + 12);
+            if big {
+                x.assoc |= bn.rd16(d, aux + 16) << 16;
+            }
+            if x.elf >= 0 {
+                ymap[i] = @bit_cast(i32, x.secsym);
+            }
+            i += 1 + naux;
+            continue;
+        }
+        if (class == SYM_CLASS_FILE) or (class == SYM_CLASS_FUNCTION) or (class == SYM_CLASS_SECTION) or (secn == -2) {
+            i += 1 + naux;
+            continue;  // (debugging records)
+        }
+        let mut s = elf.Sym.{ name: u.dup(name), sec: -1, value: value, size: 0, bind: elf.B_GLOBAL, ty: elf.T_NOTYPE,
+                              hidden: false };
+        if ty == 0x20 {
+            s.ty = elf.T_FUNC;
+            if (class == SYM_CLASS_EXTERNAL) and in_sec and (naux > 0) {
+                s.size = bn.rd32(d, aux + 4);  // (a function definition record's TotalSize)
+            }
+        }
+        if (class == SYM_CLASS_STATIC) or (class == SYM_CLASS_LABEL) {
+            s.bind = elf.B_LOCAL;
+        } else if class == SYM_CLASS_WEAK_EXTERNAL {
+            s.bind = elf.B_WEAK;
+            s.value = 0;
+            if naux > 0 {
+                weak.push((@as(u64, i) << 32) | bn.rd32(d, aux));
+            }
+        } else if class != SYM_CLASS_EXTERNAL {
+            i += 1 + naux;
+            continue;
+        }
+        if in_sec {
+            if x.elf < 0 {
+                if x.idata and u.starts(s.name, "__imp_") {
+                    // (a long-format import library defines the slots)
+                    return bad("a long-format import library's member (.idata sections): give the DLL's import library in the short format");
+                }
+                if s.bind == elf.B_LOCAL {
+                    i += 1 + naux;
+                    continue;
+                }
+                s.sec = elf.SEC_ABS;  // (defined where the link has no use for it)
+                s.value = 0;
+            } else {
+                s.sec = x.elf;
+                let kind = o.secs.get(@int_cast(usize, x.elf)).kind;
+                if kind == elf.S_TEXT {
+                    s.ty = elf.T_FUNC;
+                } else if kind == elf.S_TDATA {
+                    s.ty = elf.T_TLS;
+                } else if s.ty == elf.T_NOTYPE {
+                    s.ty = elf.T_OBJECT;
+                }
+            }
+            if (x.comdat != 0) and (x.sig.len == 0) {
+                x.sig = s.name;  // (the section's COMDAT symbol: the first after it)
+            }
+        } else if secn == -1 {
+            s.sec = elf.SEC_ABS;
+        } else if (secn == 0) and (value != 0) and (class == SYM_CLASS_EXTERNAL) {
+            // a common symbol: a weak definition of its size
+            let mut al: u64 = 1;
+            while (al < 32) and (al < value) {
+                al *= 2;
+            }
+            let cs = elf.add_sec(o, u.cat2(".bss.common.", s.name), elf.S_BSS, al);
+            o.secs.get(@int_cast(usize, cs)).size = value;
+            s.sec = cs;
+            s.value = 0;
+            s.size = value;
+            s.bind = elf.B_WEAK;
+            s.ty = elf.T_OBJECT;
+        } else {
+            s.value = 0;
+        }
+        if u.str_eq(s.name, "@feat.00") or u.str_eq(s.name, "@comp.id") {
+            i += 1 + naux;
+            continue;  // (the compiler's notes)
+        }
+        ymap[i] = @bit_cast(i32, elf.add_sym(o, s));
+        i += 1 + naux;
+    }
+    // weak externals: a weak definition where the default is one, else a
+    // weak reference
+    for wv in weak.items() {
+        let wi = @truncate(usize, wv >> 32);
+        let ti = @truncate(usize, wv & 0xffff_ffff);
+        if (ymap[wi] < 0) or (ti >= nsyms) or (ymap[ti] < 0) {
+            continue;
+        }
+        let t = o.syms.get(@as(usize, @bit_cast(u32, ymap[ti])));
+        let ws = o.syms.at(@as(usize, @bit_cast(u32, ymap[wi])));
+        if (t.sec >= 0) or ((t.sec == elf.SEC_ABS) and (t.value != 0)) {
+            ws.sec = t.sec;
+            ws.value = t.value;
+            ws.ty = t.ty;
+            o.symmap.put(u.intern(ws.name), @bit_cast(u32, ymap[wi]) + 1);
+        }
+    }
+    // COMDAT groups: each section by its symbol; associative ones with
+    // the section they go with
+    for xi in 0..secs.len {
+        let x = secs.get(xi);
+        if (x.elf < 0) or (x.comdat == 0) or (x.comdat == SELECT_ASSOCIATIVE) {
+            continue;
+        }
+        let mut sig = x.sig;
+        if sig.len == 0 {
+            sig = u.f2("%s:%s", x.name, u.zdec(xi));  // (no symbol: never a copy of another's)
+        }
+        let mut g = elf.Group.{ sig: u.intern(sig), secs: u.List.[i32].empty() };
+        g.secs.push(x.elf);
+        o.groups.push(g);
+    }
+    for xi in 0..secs.len {
+        let x = secs.get(xi);
+        if (x.elf < 0) or (x.comdat != SELECT_ASSOCIATIVE) or (x.assoc == 0) or (x.assoc > @as(u64, secs.len)) {
+            continue;
+        }
+        let owner = secs.get(@truncate(usize, x.assoc) - 1).elf;
+        for gi in 0..o.groups.len {
+            let g = o.groups.at(gi);
+            if (g.secs.len > 0) and (g.secs.get(0) == owner) {
+                g.secs.push(x.elf);
+            }
+        }
+    }
+    // a C-identifier section's bounds of this compiler's objects (X$a,
+    // X$z): the linker's, so not definitions here
+    for k in 0..o.syms.len {
+        let s = o.syms.at(k);
+        if (s.sec >= 0) and (s.bind != elf.B_LOCAL) and (u.starts(s.name, "__start_") or u.starts(s.name, "__stop_")) {
+            let sec = o.secs.get(@as(usize, @bit_cast(u32, s.sec)));
+            if elf.sec_size(sec) == 0 {
+                sec.kind = elf.S_DISCARD;
+                s.sec = -1;
+                s.value = 0;
+                s.bind = elf.B_WEAK;
+            }
+        }
+    }
+    // the relocations
+    for xi in 0..secs.len {
+        let x = secs.get(xi);
+        if (x.elf < 0) or (x.nreloc == 0) {
+            continue;
+        }
+        let s = o.secs.get(@int_cast(usize, x.elf));
+        if s.kind == elf.S_DISCARD {
+            continue;
+        }
+        let mut ro = @truncate(usize, x.reloff);
+        let mut n = @truncate(usize, x.nreloc);
+        if ((x.flags & SCN_LNK_NRELOC_OVFL) != 0) and (n == 0xffff) {
+            n = @truncate(usize, bn.rd32(d, ro)) - 1;
+            ro += 10;
+        }
+        if ro + (n * 10) > d.len {
+            return bad("relocations beyond the file's end");
+        }
+        for j in 0..n {
+            let e = ro + (j * 10);
+            let off = @truncate(usize, bn.rd32(d, e) - x.va);
+            let si = @truncate(usize, bn.rd32(d, e + 4));
+            let t = @truncate(u32, bn.rd16(d, e + 8));
+            if (a64 and (t == ARM64_ABSOLUTE)) or (not a64 and (t == AMD64_ABSOLUTE)) {
+                continue;
+            }
+            if (si >= nsyms) or (ymap[si] < 0) {
+                return bad("a relocation to a symbol that is not there");
+            }
+            if off + 4 > s.data.len() {
+                return bad("a relocation beyond its section");
+            }
+            let sym = @bit_cast(u32, ymap[si]);
+            let dv = s.data.view();
+            let mut r = elf.Rel.{ off: @as(u64, off), ty: 0, sym: sym, addend: 0 };
+            let tsym = o.syms.get(@as(usize, sym));
+            let tls = (tsym.sec >= 0) and (o.secs.get(@as(usize, @bit_cast(u32, tsym.sec))).kind == elf.S_TDATA);
+            if not a64 {
+                let c32 = @as(i64, @bit_cast(i32, @truncate(u32, bn.rd32(dv, off))));
+                if t == AMD64_ADDR64 {
+                    if off + 8 > dv.len {
+                        return bad("a relocation beyond its section");
+                    }
+                    r.ty = elf.R_X86_64_64;
+                    r.addend = @bit_cast(i64, bn.rd64(dv, off));
+                    bn.w64(dv, @as(u64, off), 0);
+                } else if (t == AMD64_ADDR32) or (t == AMD64_ADDR32NB) {
+                    r.ty = pick32(t == AMD64_ADDR32, elf.R_X86_64_32, elf.R_X86_64_RVA32);
+                    r.addend = c32;
+                    bn.w32(dv, @as(u64, off), 0);
+                } else if (t >= AMD64_REL32) and (t <= AMD64_REL32 + 5) {
+                    r.ty = elf.R_X86_64_PC32;
+                    r.addend = c32 - 4 - @as(i64, t - AMD64_REL32);
+                    bn.w32(dv, @as(u64, off), 0);
+                } else if (t == AMD64_SECREL) and tls {
+                    r.ty = elf.R_X86_64_TPOFF32;
+                    r.addend = c32;
+                    bn.w32(dv, @as(u64, off), 0);
+                } else {
+                    return bad(u.f2("an x64 relocation of type %s (to '%s')", u.udec(@as(u64, t)), tsym.name));
+                }
+                s.relocs.push(r);
+                continue;
+            }
+            let insn = bn.rd32(dv, off);
+            if t == ARM64_ADDR64 {
+                if off + 8 > dv.len {
+                    return bad("a relocation beyond its section");
+                }
+                r.ty = elf.R_AARCH64_ABS64;
+                r.addend = @bit_cast(i64, bn.rd64(dv, off));
+                bn.w64(dv, @as(u64, off), 0);
+            } else if (t == ARM64_ADDR32) or (t == ARM64_ADDR32NB) or (t == ARM64_REL32) {
+                r.ty = elf.R_AARCH64_ABS32;
+                if t == ARM64_ADDR32NB {
+                    r.ty = elf.R_AARCH64_RVA32;
+                } else if t == ARM64_REL32 {
+                    r.ty = elf.R_AARCH64_PREL32;
+                }
+                r.addend = @as(i64, @bit_cast(i32, @truncate(u32, insn)));
+                bn.w32(dv, @as(u64, off), 0);
+            } else if t == ARM64_BRANCH26 {
+                r.ty = elf.R_AARCH64_CALL26;
+                r.addend = sext(insn & 0x3ff_ffff, 26) << 2;
+                bn.w32(dv, @as(u64, off), insn & 0xfc00_0000);
+            } else if (t == ARM64_PAGEBASE_REL21) or (t == ARM64_REL21) {
+                r.ty = pick32(t == ARM64_REL21, elf.R_AARCH64_ADR_PREL_LO21, elf.R_AARCH64_ADR_PREL_PG_HI21);
+                r.addend = sext(((insn >> 29) & 3) | (((insn >> 5) & 0x7_ffff) << 2), 21);
+                bn.w32(dv, @as(u64, off), insn & 0x9f00_001f);
+            } else if (t == ARM64_PAGEOFFSET_12A) or (t == ARM64_SECREL_LOW12A) or (t == ARM64_SECREL_HIGH12A) {
+                let imm = @bit_cast(i64, (insn >> 10) & 0xfff);
+                r.ty = elf.R_AARCH64_ADD_ABS_LO12_NC;
+                r.addend = imm;
+                if (t == ARM64_SECREL_LOW12A) or (t == ARM64_SECREL_HIGH12A) {
+                    if not tls {
+                        return bad(u.f1("a section-relative relocation to '%s', which is not thread-local", tsym.name));
+                    }
+                    r.ty = pick32(t == ARM64_SECREL_HIGH12A, elf.R_AARCH64_TLSLE_ADD_TPREL_HI12,
+                                  elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC);
+                    if t == ARM64_SECREL_HIGH12A {
+                        r.addend = imm << 12;
+                    }
+                }
+                bn.w32(dv, @as(u64, off), insn & 0xffc0_03ff);
+            } else if (t == ARM64_SECREL_LOW12L) and tls {
+                // a load's or store's offset in the template: the ELF
+                // types' TLSLE_LDST<n>_TPREL_LO12_NC
+                let ldst = ldst_type(insn);
+                if ldst == 0 {
+                    return bad("IMAGE_REL_ARM64_SECREL_LOW12L on an instruction that is not a load or store");
+                }
+                let sc = ldst_scale(ldst);
+                r.ty = pick32(sc == 4, elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC,
+                              elf.R_AARCH64_TLSLE_LDST8_TPREL_LO12 + 1 + (2 * @truncate(u32, sc)));
+                r.addend = @bit_cast(i64, ((insn >> 10) & 0xfff) << sc);
+                bn.w32(dv, @as(u64, off), insn & 0xffc0_03ff);
+            } else if t == ARM64_PAGEOFFSET_12L {
+                let ldst = ldst_type(insn);
+                if ldst == 0 {
+                    return bad("IMAGE_REL_ARM64_PAGEOFFSET_12L on an instruction that is not a load or store");
+                }
+                r.ty = ldst;
+                r.addend = @bit_cast(i64, ((insn >> 10) & 0xfff) << ldst_scale(ldst));
+                bn.w32(dv, @as(u64, off), insn & 0xffc0_03ff);
+            } else if (t == ARM64_BRANCH19) or (t == ARM64_BRANCH14) {
+                if t == ARM64_BRANCH19 {
+                    r.ty = elf.R_AARCH64_CONDBR19;
+                    r.addend = sext((insn >> 5) & 0x7_ffff, 19) << 2;
+                    bn.w32(dv, @as(u64, off), insn & 0xff00_001f);
+                } else {
+                    r.ty = elf.R_AARCH64_TSTBR14;
+                    r.addend = sext((insn >> 5) & 0x3fff, 14) << 2;
+                    bn.w32(dv, @as(u64, off), insn & 0xfff8_001f);
+                }
+            } else {
+                return bad(u.f2("an ARM64 relocation of type %s (to '%s')", u.udec(@as(u64, t)), tsym.name));
+            }
+            s.relocs.push(r);
+        }
+    }
+    sizes(o);
+    return o;
+}
+
+// The ELF type of a load's or store's 12-bit offset (by its size).
+fn ldst_type(insn: u64) u32 {
+    if (insn & 0x3b00_0000) != 0x3900_0000 {
+        return 0;
+    }
+    let size = insn >> 30;
+    if (((insn >> 26) & 1) == 1) and (size == 0) and (((insn >> 22) & 2) != 0) {
+        return elf.R_AARCH64_LDST128_ABS_LO12_NC;
+    }
+    if size == 0 {
+        return elf.R_AARCH64_LDST8_ABS_LO12_NC;
+    }
+    if size == 1 {
+        return elf.R_AARCH64_LDST16_ABS_LO12_NC;
+    }
+    if size == 2 {
+        return elf.R_AARCH64_LDST32_ABS_LO12_NC;
+    }
+    return elf.R_AARCH64_LDST64_ABS_LO12_NC;
+}
+
+// COFF's function symbols carry no sizes that matter: each defined one's is
+// up to the next symbol of its section (or the section's end).
+struct SymAt {
+    sec: i32,
+    value: u64,
+    i: usize,
+}
+
+fn cmp_at(a: SymAt, b: SymAt) i32 {
+    if a.sec != b.sec {
+        return pick_cmp(@as(u64, @bit_cast(u32, a.sec)), @as(u64, @bit_cast(u32, b.sec)));
+    }
+    return pick_cmp(a.value, b.value);
+}
+
+fn pick_cmp(a: u64, b: u64) i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+fn sizes(o: *mut elf.Obj) void {
+    let mut xs = u.List.[SymAt].empty();
+    for i in 0..o.syms.len {
+        let s = o.syms.get(i);
+        if (s.sec >= 0) and (s.name.len > 0) {
+            xs.push(SymAt.{ sec: s.sec, value: s.value, i: i });
+        }
+    }
+    u.sort.[SymAt](xs.items(), cmp_at);
+    for k in 0..xs.len {
+        let x = xs.get(k);
+        if o.syms.get(x.i).size > 0 {
+            continue;  // (known)
+        }
+        let mut end = elf.sec_size(o.secs.get(@as(usize, @bit_cast(u32, x.sec))));
+        let mut j = k + 1;
+        while j < xs.len {
+            let y = xs.get(j);
+            if y.sec != x.sec {
+                break;
+            }
+            if y.value > x.value {
+                end = y.value;
+                break;
+            }
+            j += 1;
+        }
+        let sec = o.secs.get(@as(usize, @bit_cast(u32, x.sec)));
+        if sec.kind == elf.S_TEXT {
+            // (not the padding to the next function: zeros, or int3 on x64)
+            let dv = sec.data.view();
+            while (end > x.value + 4) and (@truncate(usize, end) <= dv.len) and
+                  ((bn.rd32(dv, @truncate(usize, end - 4)) == 0) or
+                   ((o.machine == elf.EM_X86_64) and (bn.rd32(dv, @truncate(usize, end - 4)) == 0xcccc_cccc))) {
+                end -= 4;
+            }
+        }
+        if end > x.value {
+            o.syms.at(x.i).size = end - x.value;
+        }
+    }
+    xs.deinit();
+}
+
+/// The external names COFF object d defines, as its symbol table spells
+/// them, for an archive's table of contents.
+pub fn defined_names(d: []u8, out: *mut u.List.[[]u8]) void {
+    let o = read(d);
+    if u.isnil(o) {
+        return;
+    }
+    for s in o.syms.items() {
+        if (s.sec != -1) and (s.bind != elf.B_LOCAL) and (s.name.len > 0) {
+            out.push(s.name);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// DLLs given to a link: their exports
+// -----------------------------------------------------------------------------
+
+/// Is d a PE image (a DLL or an executable)?
+pub fn is_image(d: []u8) bool {
+    if (d.len < 0x40) or (d[0] != 'M') or (d[1] != 'Z') {
+        return false;
+    }
+    let pe = @truncate(usize, bn.rd32(d, 0x3c));
+    return (pe + 24 <= d.len) and (bn.rd32(d, pe) == 0x4550);
+}
+
+// The file offset of an RVA of image d (through its section table), or 0.
+fn rva_off(d: []u8, rva: u64) usize {
+    let pe = @truncate(usize, bn.rd32(d, 0x3c));
+    let nsec = @truncate(usize, bn.rd16(d, pe + 6));
+    let opt = @truncate(usize, bn.rd16(d, pe + 20));
+    let sh = pe + 24 + opt;
+    for i in 0..nsec {
+        let h = sh + (i * 40);
+        if h + 40 > d.len {
+            return 0;
+        }
+        let va = bn.rd32(d, h + 12);
+        let size = @max(bn.rd32(d, h + 8), bn.rd32(d, h + 16));
+        if (rva >= va) and (rva < va + size) {
+            return @truncate(usize, bn.rd32(d, h + 20) + (rva - va));
+        }
+    }
+    return 0;
+}
+
+/// The functions and objects DLL d (`file`: its file name, the DLL's name
+/// for the import directory) exports by name, as imports (by the export
+/// directory: the specification's .edata); g_error says why if d is not a
+/// DLL for `machine` (MACHINE_AMD64 or MACHINE_ARM64).
+pub fn pe_exports(d: []u8, file: []u8, machine: u64) u.List.[Import] {
+    g_error = "";
+    let mut out = u.List.[Import].empty();
+    if not is_image(d) {
+        g_error = "not a PE image";
+        return out;
+    }
+    let pe = @truncate(usize, bn.rd32(d, 0x3c));
+    if bn.rd16(d, pe + 4) != machine {
+        g_error = "a DLL for another processor";
+        return out;
+    }
+    let opt = pe + 24;
+    if (opt + 120 > d.len) or (bn.rd16(d, opt) != 0x20b) {
+        g_error = "not a PE32+ image";
+        return out;
+    }
+    let ert = bn.rd32(d, opt + 112);  // the export table's data directory
+    if ert == 0 {
+        return out;
+    }
+    let eo = rva_off(d, ert);
+    if (eo == 0) or (eo + 40 > d.len) {
+        g_error = "a malformed export directory";
+        return out;
+    }
+    let nnames = @truncate(usize, bn.rd32(d, eo + 24));
+    let names = rva_off(d, bn.rd32(d, eo + 32));
+    for i in 0..nnames {
+        if names + (i * 4) + 4 > d.len {
+            break;
+        }
+        let no = rva_off(d, bn.rd32(d, names + (i * 4)));
+        if no == 0 {
+            continue;
+        }
+        let n = u.dup(elf.cstr_at(d, no));
+        out.push(Import.{ sym: n, dll: file, name: n, ordinal: -1, data: false });
+    }
+    return out;
+}

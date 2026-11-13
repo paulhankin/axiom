@@ -2289,9 +2289,12 @@ writes a C header for them with `--emit-header=<path>`. The header contains:
 
 It compiles as C11 and as C++.
 
-On Linux, an object from `--emit=obj` also holds the few machine-code stubs through
-which the runtime makes system calls, which the compiler's own linker otherwise adds,
-so a C program links it with nothing else: `cc main.c lib.o`.
+An object from `--emit=obj` is in the target's format (ELF on Linux, Mach-O on macOS,
+COFF on Windows). On Linux it also holds the few machine-code stubs through which the
+runtime makes system calls, which the compiler's own linker otherwise adds, so a C
+program links it with nothing else: `cc main.c lib.o`. On macOS and Windows such an
+object (one with Axiom code: the runtime) is linked by the compiler's linkers. A shared
+library (`--emit=shared`) holds C units only: the runtime is an executable's.
 
 #### 14.5.3 Types at the boundary
 

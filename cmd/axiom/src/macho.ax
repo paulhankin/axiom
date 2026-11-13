@@ -1,0 +1,1774 @@
+// =============================================================================
+// macho.ax - Mach-O relocatable objects (MH_OBJECT) for macOS on arm64 and
+// x86-64: write() encodes the native code generators' objects (elf.Obj, with
+// ELF relocation types) as the platform's object format (--emit=obj and the
+// members of --emit=lib), and read() decodes an object of this compiler or
+// of the platform's toolchain into an elf.Obj that mlink.ax links, its
+// relocations translated to the ELF types the linkers apply. The format is
+// <mach-o/loader.h>'s, <mach-o/nlist.h>'s and <mach-o/reloc.h>'s (with
+// <mach-o/arm64/reloc.h> and <mach-o/x86_64/reloc.h>).
+//
+// An object written here has one unnamed segment holding every section,
+// LC_BUILD_VERSION (macOS 11.0), LC_SYMTAB and LC_DYSYMTAB, and the flag
+// MH_SUBSECTIONS_VIA_SYMBOLS: a symbol starts an atom, which the system's
+// linker may move or strip as a whole. So the symbols written are those
+// that begin something whole (functions, data objects, the external
+// names); a reference to a place inside an atom is to the atom's symbol
+// plus an offset (or, where a section has no symbol before the place, to
+// the section's start symbol ltmp<N>), as the platform's assembler writes
+// them. The names of C have the leading underscore (main is _main); the
+// bounds of a section the program refers to as __start_<name> and
+// __stop_<name> are the linker's section$start$<segment>$<section> and
+// section$end$<segment>$<section>.
+//
+// Sections (from elf.Sec's kind and name):
+//   code                       __TEXT,__text
+//   read-only data             __TEXT,__const (__DATA,__const if it holds
+//                              addresses, which the loader slides)
+//   data                       __DATA,__data; .data.rel.ro: __DATA,__const
+//   zero-initialized data      __DATA,__bss
+//   .init_array, .fini_array   __DATA,__mod_init_func, __mod_term_func (one
+//                              each, the entries in the order of their
+//                              priorities: Mach-O has none)
+//   thread-local data          __DATA,__axiom_tdata, __DATA,__axiom_tbss
+//   a section named as a C     __DATA,<name> (16 characters at most)
+//     identifier (axiom_rets, `section` attributes)
+//   a section named "seg,sect" that segment and section (the `section`
+//                              attribute's Mach-O form)
+//   debug information          __DWARF,__debug_<name> (S_ATTR_DEBUG); a
+//                              debug section's offsets into another are
+//                              numbers (the platform's convention: the
+//                              debug information of objects is linked by
+//                              the debugger's tools, object by object)
+//
+// Thread-locals: the code generators address a thread-local as an offset
+// in a per-thread block that the runtime makes (mlink.ax: the scheme has
+// nothing to do with the platform's thread-local variables, whose code
+// calls a descriptor's function). The offset's relocations have no Mach-O
+// type: they are written with type numbers the format leaves unused, which
+// only this compiler's linker reads (arm64: 14 and 15 for the high and low
+// 12 bits of an add's immediate; x86-64: 15 for a 32-bit displacement),
+// so the system's linker refuses an object whose code uses thread-locals
+// (docs/c.md: "Objects of this compiler").
+//
+// read() takes what the platform's compilers write: the sections (by type:
+// code, literals, zero-fill, initializer and terminator pointers, the
+// thread-local variables' descriptors and templates), symbols (common ones
+// become weak definitions in a zero-fill section of their own, as for
+// ELF), and the relocations of both architectures with their pairs
+// (ARM64_RELOC_ADDEND, a SUBTRACTOR and its UNSIGNED), extern and
+// section-relative, addends from the instruction or data where Mach-O keeps
+// them. __LD,__compact_unwind and __TEXT,__eh_frame are not kept (the
+// linker writes no unwind tables).
+// =============================================================================
+import "bin.ax" as bn;
+import "elf.ax" as elf;
+import "util.ax" as u;
+
+const MH_MAGIC_64: u64 = 0xfeed_facf;
+const MH_OBJECT: u64 = 1;
+const MH_SUBSECTIONS_VIA_SYMBOLS: u64 = 0x2000;
+const CPU_TYPE_X86_64: u64 = 0x0100_0007;
+const CPU_TYPE_ARM64: u64 = 0x0100_000c;
+
+// section types and attributes
+const S_REGULAR: u64 = 0;
+const S_ZEROFILL: u64 = 1;
+const S_CSTRING_LITERALS: u64 = 2;
+const S_MOD_INIT_FUNC_POINTERS: u64 = 9;
+const S_MOD_TERM_FUNC_POINTERS: u64 = 0xa;
+const S_GB_ZEROFILL: u64 = 0xc;
+const S_THREAD_LOCAL_REGULAR: u64 = 0x11;
+const S_THREAD_LOCAL_ZEROFILL: u64 = 0x12;
+const S_THREAD_LOCAL_VARIABLES: u64 = 0x13;
+const S_THREAD_LOCAL_INIT_FUNCTION_POINTERS: u64 = 0x15;
+const S_ATTR_PURE_INSTRUCTIONS: u64 = 0x8000_0000;
+const S_ATTR_DEBUG: u64 = 0x0200_0000;
+const S_ATTR_SOME_INSTRUCTIONS: u64 = 0x400;
+
+// nlist n_type and n_desc
+const N_STAB: u8 = 0xe0;
+const N_PEXT: u8 = 0x10;
+const N_TYPE: u8 = 0x0e;
+const N_EXT: u8 = 0x01;
+const N_UNDF: u8 = 0x0;
+const N_ABS: u8 = 0x2;
+const N_SECT: u8 = 0xe;
+const N_INDR: u8 = 0xa;
+const N_WEAK_REF: u64 = 0x40;
+const N_WEAK_DEF: u64 = 0x80;
+const N_NO_DEAD_STRIP: u64 = 0x20;
+
+// arm64 relocations
+pub const ARM64_RELOC_UNSIGNED: u32 = 0;
+pub const ARM64_RELOC_SUBTRACTOR: u32 = 1;
+pub const ARM64_RELOC_BRANCH26: u32 = 2;
+pub const ARM64_RELOC_PAGE21: u32 = 3;
+pub const ARM64_RELOC_PAGEOFF12: u32 = 4;
+pub const ARM64_RELOC_GOT_LOAD_PAGE21: u32 = 5;
+pub const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u32 = 6;
+pub const ARM64_RELOC_POINTER_TO_GOT: u32 = 7;
+pub const ARM64_RELOC_TLVP_LOAD_PAGE21: u32 = 8;
+pub const ARM64_RELOC_TLVP_LOAD_PAGEOFF12: u32 = 9;
+pub const ARM64_RELOC_ADDEND: u32 = 10;
+// (this compiler's: a thread-local's offset in the runtime's block, above)
+const ARM64_AXIOM_TPREL_HI12: u32 = 14;
+const ARM64_AXIOM_TPREL_LO12: u32 = 15;
+
+// x86-64 relocations
+pub const X86_64_RELOC_UNSIGNED: u32 = 0;
+pub const X86_64_RELOC_SIGNED: u32 = 1;
+pub const X86_64_RELOC_BRANCH: u32 = 2;
+pub const X86_64_RELOC_GOT_LOAD: u32 = 3;
+pub const X86_64_RELOC_GOT: u32 = 4;
+pub const X86_64_RELOC_SUBTRACTOR: u32 = 5;
+pub const X86_64_RELOC_SIGNED_1: u32 = 6;
+pub const X86_64_RELOC_SIGNED_2: u32 = 7;
+pub const X86_64_RELOC_SIGNED_4: u32 = 8;
+pub const X86_64_RELOC_TLV: u32 = 9;
+const X86_64_AXIOM_TPOFF32: u32 = 15;
+
+/// The last error of write or read (a message for people), "" if none.
+pub let mut g_error: []u8 = "";
+
+/// Is d a 64-bit Mach-O relocatable object?
+pub fn is_object(d: []u8) bool {
+    return (d.len >= 32) and (bn.rd32(d, 0) == MH_MAGIC_64) and (bn.rd32(d, 12) == MH_OBJECT);
+}
+
+/// Is d a Mach-O file of any kind (an object, a dynamic library, a
+/// universal file's header)?
+pub fn is_macho(d: []u8) bool {
+    if d.len < 8 {
+        return false;
+    }
+    let m = bn.rd32(d, 0);
+    return (m == MH_MAGIC_64) or (m == 0xbebafeca) or (m == 0xfeedface);
+}
+
+// Is the name a C identifier (such sections keep their names, and have
+// __start_ and __stop_ symbols)?
+fn c_ident(n: []u8) bool {
+    if n.len == 0 {
+        return false;
+    }
+    for i in 0..n.len {
+        let c = n[i];
+        let alpha = ((c | 0x20) >= 'a') and ((c | 0x20) <= 'z');
+        if not alpha and (c != '_') and not (u.is_digit(c) and (i > 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+// A section of the object being written.
+struct OSec {
+    seg: []u8,
+    sect: []u8,
+    flags: u64,
+    align: u64,
+    data: bn.Bytes,
+    size: u64,  // a zero-fill section's
+    zerofill: bool,
+    debug: bool,
+    addr: u64,
+    offset: u64,
+    rels: u.List.[MRel],
+    reloff: u64,
+}
+
+// A relocation entry being written: sym is a symbol (MSym index) when ext,
+// else the raw r_symbolnum (ARM64_RELOC_ADDEND's addend).
+struct MRel {
+    addr: u64,
+    sym: u32,
+    pcrel: bool,
+    len: u32,
+    ext: bool,
+    ty: u32,
+}
+
+// A symbol of the object being written.
+struct MSym {
+    name: []u8,
+    ntype: u8,
+    osec: i32,  // -1: none
+    off: u64,   // in its section
+    desc: u64,
+    value: u64,  // absolute symbols
+    group: i32,  // 0 local, 1 defined external, 2 undefined
+    index: u32,  // in the symbol table
+}
+
+struct W {
+    x64: bool,
+    secs: u.List.[OSec],
+    smap: []mut i32,   // ELF section -> OSec
+    sbase: []mut u64,  // ELF section -> its offset in the OSec
+    syms: u.List.[MSym],
+    ymap: []mut i32,               // ELF symbol -> MSym (-1: not written)
+    atoms: u.List.[u.List.[u64]],  // per OSec: (offset << 24 | MSym), sorted
+    ok: bool,
+}
+
+fn fail(w: *mut W, msg: []u8) void {
+    if w.ok {
+        g_error = msg;
+    }
+    w.ok = false;
+}
+
+// Where an ELF section goes: segment, section, flags.
+struct Place {
+    seg: []u8,
+    sect: []u8,
+    flags: u64,
+}
+
+fn has_abs(s: *elf.Sec, x64: bool) bool {
+    for r in s.relocs.items() {
+        if (x64 and (r.ty == elf.R_X86_64_64)) or (not x64 and (r.ty == elf.R_AARCH64_ABS64)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn place_of(s: *elf.Sec, x64: bool) Place {
+    let n = s.name;
+    let k = s.kind;
+    let comma = u.find(n, ',');
+    if (comma > 0) and (k != elf.S_DEBUG) {
+        // "segment,section" (the section attribute's Mach-O form)
+        let c = @int_cast(usize, comma);
+        let mut fl: u64 = S_REGULAR;
+        if k == elf.S_TEXT {
+            fl = S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+        } else if k == elf.S_BSS {
+            fl = S_ZEROFILL;
+        }
+        return Place.{ seg: n[0..c], sect: n[c + 1..], flags: fl };
+    }
+    if k == elf.S_TEXT {
+        if c_ident(n) {
+            return Place.{ seg: "__TEXT", sect: n, flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS };
+        }
+        return Place.{ seg: "__TEXT", sect: "__text", flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS };
+    }
+    if k == elf.S_DEBUG {
+        let mut nm = n;
+        if u.starts(nm, ".debug_") {
+            nm = nm[7..];
+        } else if u.starts(nm, ".") {
+            nm = nm[1..];
+        }
+        // .debug_info: __debug_info; .axiom.lines: __axiom_lines
+        let mut b = u.Buf.init();
+        b.s(u.pick(u.starts(n, ".debug_"), "__debug_", "__"));
+        for c in nm {
+            if c == '.' {
+                b.c('_');
+            } else {
+                b.c(c);
+            }
+        }
+        return Place.{ seg: "__DWARF", sect: b.done(), flags: S_ATTR_DEBUG };
+    }
+    if k == elf.S_TDATA {
+        return Place.{ seg: "__DATA", sect: "__axiom_tdata", flags: S_REGULAR };
+    }
+    if k == elf.S_TBSS {
+        return Place.{ seg: "__DATA", sect: "__axiom_tbss", flags: S_ZEROFILL };
+    }
+    if k == elf.S_BSS {
+        if c_ident(n) {
+            return Place.{ seg: "__DATA", sect: n, flags: S_ZEROFILL };
+        }
+        return Place.{ seg: "__DATA", sect: "__bss", flags: S_ZEROFILL };
+    }
+    if u.starts(n, ".init_array") {
+        return Place.{ seg: "__DATA", sect: "__mod_init_func", flags: S_MOD_INIT_FUNC_POINTERS };
+    }
+    if u.starts(n, ".fini_array") {
+        return Place.{ seg: "__DATA", sect: "__mod_term_func", flags: S_MOD_TERM_FUNC_POINTERS };
+    }
+    if c_ident(n) {
+        return Place.{ seg: "__DATA", sect: n, flags: S_REGULAR };
+    }
+    if k == elf.S_RODATA {
+        if has_abs(s, x64) {
+            return Place.{ seg: "__DATA", sect: "__const", flags: S_REGULAR };
+        }
+        return Place.{ seg: "__TEXT", sect: "__const", flags: S_REGULAR };
+    }
+    if u.starts(n, ".data.rel.ro") {
+        return Place.{ seg: "__DATA", sect: "__const", flags: S_REGULAR };
+    }
+    return Place.{ seg: "__DATA", sect: "__data", flags: S_REGULAR };
+}
+
+// An initialization or termination array's priority (.init_array.N: N; the
+// plain section after every numbered one), for their order in Mach-O's one
+// section of each.
+fn array_prio(n: []u8) u64 {
+    let mut rest = n;
+    if u.starts(n, ".init_array") or u.starts(n, ".fini_array") {
+        rest = n[11..];
+    }
+    if (rest.len < 2) or (rest[0] != '.') {
+        return 0x10000;
+    }
+    let mut p: u64 = 0;
+    for c in rest[1..] {
+        if not u.is_digit(c) {
+            return 0x10000;
+        }
+        p = (p * 10) + @as(u64, c - '0');
+    }
+    return @min(p, 0xffff);
+}
+
+fn is_array(s: *elf.Sec) bool {
+    return (s.kind == elf.S_DATA) and (u.starts(s.name, ".init_array") or u.starts(s.name, ".fini_array"));
+}
+
+fn sec_type(flags: u64) u64 {
+    return flags & 0xff;
+}
+
+fn is_zerofill(flags: u64) bool {
+    let t = sec_type(flags);
+    return (t == S_ZEROFILL) or (t == S_GB_ZEROFILL) or (t == S_THREAD_LOCAL_ZEROFILL);
+}
+
+// The OSec of segment and section names (made if new).
+fn osec_of(w: *mut W, p: Place, align: u64) i32 {
+    for i in 0..w.secs.len {
+        let s = w.secs.at(i);
+        if u.str_eq(s.seg, p.seg) and u.str_eq(s.sect, p.sect) {
+            if align > s.align {
+                s.align = align;
+            }
+            return @int_cast(i32, i);
+        }
+    }
+    if (p.sect.len > 16) or (p.seg.len > 16) {
+        fail(w, u.f2("the section name '%s,%s' is longer than Mach-O's 16 characters", p.seg, p.sect));
+    }
+    w.secs.push(OSec.{ seg: p.seg, sect: p.sect, flags: p.flags, align: @max(align, 1), data: bn.new_bytes(), size: 0,
+                       zerofill: is_zerofill(p.flags), debug: (p.flags & S_ATTR_DEBUG) != 0, addr: 0, offset: 0,
+                       rels: u.List.[MRel].empty(), reloff: 0 });
+    w.atoms.push(u.List.[u64].empty());
+    return @int_cast(i32, w.secs.len - 1);
+}
+
+// The section's name for __start_/__stop_ symbols: section$start$SEG$SECT.
+fn bound_name(w: *W, o: *elf.Obj, start: bool, sec: []u8) []u8 {
+    let mut p = Place.{ seg: "__DATA", sect: sec, flags: 0 };
+    for k in 0..o.secs.len {
+        let s = o.secs.get(k);
+        if u.str_eq(s.name, sec) {
+            p = place_of(s, w.x64);
+        }
+    }
+    return u.f3(u.pick(start, "section$start$%s$%s", "section$end$%s$%s"), p.seg, p.sect, "");
+}
+
+// A symbol's Mach-O name.
+fn mangle(w: *W, o: *elf.Obj, s: *elf.Sym) []u8 {
+    let n = s.name;
+    if s.sec == -1 {
+        if u.starts(n, "__start_") and c_ident(n[8..]) {
+            return bound_name(w, o, true, n[8..]);
+        }
+        if u.starts(n, "__stop_") and c_ident(n[7..]) {
+            return bound_name(w, o, false, n[7..]);
+        }
+    }
+    if (n.len > 0) and (n[0] == 1) {
+        return n[1..];  // (a name as it is: the asm label convention)
+    }
+    if (s.bind == elf.B_LOCAL) and (n[0] == '.') {
+        return u.cat2("l", n);  // (a linker-private name: .str, .site)
+    }
+    return u.cat2("_", n);
+}
+
+fn add_msym(w: *mut W, m: MSym) i32 {
+    w.syms.push(m);
+    let k = @int_cast(i32, w.syms.len - 1);
+    if m.osec >= 0 {
+        if w.syms.len >= 0x100_0000 {
+            fail(w, "too many symbols for a Mach-O object");
+        }
+        w.atoms.at(@as(usize, @bit_cast(u32, m.osec))).push((m.off << 24) | @as(u64, @bit_cast(u32, k)));
+    }
+    return k;
+}
+
+// The MSym of the atom holding offset `at` of section os (the last symbol at
+// or before it).
+fn atom_at(w: *W, os: i32, at: i64) u32 {
+    let a = w.atoms.at(@as(usize, @bit_cast(u32, os)));
+    if a.len == 0 {
+        return 0;  // (a debug section: write() fails before using it)
+    }
+    let mut lo: usize = 0;
+    let mut hi = a.len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if @bit_cast(i64, a.get(mid) >> 24) <= at {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return @truncate(u32, a.get(0) & 0xff_ffff);
+    }
+    return @truncate(u32, a.get(lo - 1) & 0xff_ffff);
+}
+
+// A relocation's target: a symbol of the object written, and the addend
+// from it (bias: where the reference points beyond the place S + A, for
+// choosing the atom: x86-64's displacements are from the field's end).
+struct Tgt {
+    sym: u32,
+    add: i64,
+}
+
+fn target(w: *mut W, o: *elf.Obj, si: u32, a: i64, bias: i64) Tgt {
+    let m = w.ymap[@as(usize, si)];
+    if m >= 0 {
+        return Tgt.{ sym: @bit_cast(u32, m), add: a };
+    }
+    let s = o.syms.at(@as(usize, si));
+    if (s.sec < 0) or (w.smap[@as(usize, @bit_cast(u32, s.sec))] < 0) {
+        fail(w, u.f1("a relocation refers to '%s', which the object cannot name", s.name));
+        return Tgt.{ sym: 0, add: 0 };
+    }
+    let k = @as(usize, @bit_cast(u32, s.sec));
+    let os = w.smap[k];
+    let place = @bit_cast(i64, w.sbase[k] + s.value) + a;
+    let at = atom_at(w, os, place + bias);
+    return Tgt.{ sym: at, add: place - @bit_cast(i64, w.syms.get(@as(usize, at)).off) };
+}
+
+fn rel(w: *mut W, os: i32, addr: u64, sym: u32, pcrel: bool, len: u32, ext: bool, ty: u32) void {
+    w.secs.at(@as(usize, @bit_cast(u32, os))).rels.push(MRel.{ addr: addr, sym: sym, pcrel: pcrel, len: len, ext: ext,
+                                                               ty: ty });
+}
+
+// ARM64_RELOC_ADDEND before an instruction's relocation, if it has one.
+fn addend(w: *mut W, os: i32, addr: u64, a: i64) void {
+    if a == 0 {
+        return;
+    }
+    if (a < -0x80_0000) or (a >= 0x80_0000) {
+        fail(w, "an addend beyond ARM64_RELOC_ADDEND's 24 bits");
+        return;
+    }
+    rel(w, os, addr, @truncate(u32, @bit_cast(u64, a) & 0xff_ffff), false, 2, false, ARM64_RELOC_ADDEND);
+}
+
+fn put32(w: *mut W, os: i32, at: u64, v: i64) void {
+    w.secs.at(@as(usize, @bit_cast(u32, os))).data.set_u32(@truncate(usize, at), @bit_cast(u64, v) & 0xffff_ffff);
+}
+
+fn put64(w: *mut W, os: i32, at: u64, v: i64) void {
+    w.secs.at(@as(usize, @bit_cast(u32, os))).data.set_u64(@truncate(usize, at), @bit_cast(u64, v));
+}
+
+// Is the x86-64 instruction before a 32-bit field at `at` a call or a jump
+// (whose displacement then is X86_64_RELOC_BRANCH's)?
+fn x64_branch(d: []u8, at: usize) bool {
+    if at >= 1 {
+        let op = d[at - 1];
+        if (op == 0xe8) or (op == 0xe9) {
+            return true;
+        }
+    }
+    return (at >= 2) and (d[at - 2] == 0x0f) and ((d[at - 1] & 0xf0) == 0x80);
+}
+
+// One ELF relocation of section k (at its OSec os, offset `at` there) as
+// Mach-O entries, with the addend into the contents where Mach-O keeps it.
+fn convert(w: *mut W, o: *elf.Obj, k: usize, os: i32, r: elf.Rel) void {
+    let at = w.sbase[k] + r.off;
+    let sec = w.secs.at(@as(usize, @bit_cast(u32, os)));
+    let s = o.syms.at(@as(usize, r.sym));
+    if sec.debug {
+        // a debug section's offset into another debug section: a number
+        if (s.sec >= 0) and (w.smap[@as(usize, @bit_cast(u32, s.sec))] >= 0) and
+           w.secs.get(@as(usize, @bit_cast(u32, w.smap[@as(usize, @bit_cast(u32, s.sec))]))).debug {
+            let v = @bit_cast(i64, w.sbase[@as(usize, @bit_cast(u32, s.sec))] + s.value) + r.addend;
+            if (r.ty == elf.R_X86_64_64) or (r.ty == elf.R_AARCH64_ABS64) {
+                put64(w, os, at, v);
+            } else {
+                put32(w, os, at, v);
+            }
+            return;
+        }
+    }
+    let t = r.ty;
+    if w.x64 {
+        if (t == elf.R_X86_64_64) or (t == elf.R_X86_64_32) or (t == elf.R_X86_64_32S) {
+            let g = target(w, o, r.sym, r.addend, 0);
+            if t == elf.R_X86_64_64 {
+                put64(w, os, at, g.add);
+                rel(w, os, at, g.sym, false, 3, true, X86_64_RELOC_UNSIGNED);
+            } else {
+                put32(w, os, at, g.add);
+                rel(w, os, at, g.sym, false, 2, true, X86_64_RELOC_UNSIGNED);
+            }
+        } else if (t == elf.R_X86_64_PC32) and (o.secs.get(k).kind != elf.S_TEXT) {
+            // (in data: a difference, as the platform's assembler writes it)
+            sub_pair(w, o, os, at, r, 2, X86_64_RELOC_SUBTRACTOR, X86_64_RELOC_UNSIGNED);
+        } else if (t == elf.R_X86_64_PC32) or (t == elf.R_X86_64_PLT32) {
+            let g = target(w, o, r.sym, r.addend, 4);
+            put32(w, os, at, g.add + 4);
+            let br = (t == elf.R_X86_64_PLT32) or (not sec.debug and x64_branch(sec.data.view(), @truncate(usize, at)));
+            rel(w, os, at, g.sym, true, 2, true, u32_pick(br, X86_64_RELOC_BRANCH, X86_64_RELOC_SIGNED));
+        } else if (t == elf.R_X86_64_GOTPCREL) or (t == elf.R_X86_64_GOTPCRELX) or (t == elf.R_X86_64_REX_GOTPCRELX) {
+            let g = target(w, o, r.sym, r.addend, 4);
+            if g.add != -4 {
+                fail(w, "a GOT reference with an addend, which Mach-O cannot hold");
+            }
+            put32(w, os, at, 0);
+            let d = sec.data.view();
+            let load = (at >= 2) and (d[@truncate(usize, at - 2)] == 0x8b);
+            rel(w, os, at, g.sym, true, 2, true, u32_pick(load, X86_64_RELOC_GOT_LOAD, X86_64_RELOC_GOT));
+        } else if t == elf.R_X86_64_PC64 {
+            sub_pair(w, o, os, at, r, 3, X86_64_RELOC_SUBTRACTOR, X86_64_RELOC_UNSIGNED);
+        } else if t == elf.R_X86_64_TPOFF32 {
+            let g = target(w, o, r.sym, r.addend, 0);
+            put32(w, os, at, g.add);
+            rel(w, os, at, g.sym, false, 2, true, X86_64_AXIOM_TPOFF32);
+        } else {
+            fail(w, u.f1("an x86-64 relocation of type %s, which Mach-O has none for", u.udec(@as(u64, t))));
+        }
+        return;
+    }
+    if (t == elf.R_AARCH64_ABS64) or (t == elf.R_AARCH64_ABS32) {
+        let g = target(w, o, r.sym, r.addend, 0);
+        if t == elf.R_AARCH64_ABS64 {
+            put64(w, os, at, g.add);
+            rel(w, os, at, g.sym, false, 3, true, ARM64_RELOC_UNSIGNED);
+        } else {
+            put32(w, os, at, g.add);
+            rel(w, os, at, g.sym, false, 2, true, ARM64_RELOC_UNSIGNED);
+        }
+    } else if (t == elf.R_AARCH64_PREL32) or (t == elf.R_AARCH64_PREL64) {
+        sub_pair(w, o, os, at, r, u32_pick(t == elf.R_AARCH64_PREL64, 3, 2), ARM64_RELOC_SUBTRACTOR,
+                 ARM64_RELOC_UNSIGNED);
+    } else if t == elf.R_AARCH64_ADR_PREL_PG_HI21 {
+        let g = target(w, o, r.sym, r.addend, 0);
+        addend(w, os, at, g.add);
+        rel(w, os, at, g.sym, true, 2, true, ARM64_RELOC_PAGE21);
+    } else if (t == elf.R_AARCH64_ADD_ABS_LO12_NC) or (t == elf.R_AARCH64_LDST8_ABS_LO12_NC) or
+              (t == elf.R_AARCH64_LDST16_ABS_LO12_NC) or (t == elf.R_AARCH64_LDST32_ABS_LO12_NC) or
+              (t == elf.R_AARCH64_LDST64_ABS_LO12_NC) or (t == elf.R_AARCH64_LDST128_ABS_LO12_NC) {
+        let g = target(w, o, r.sym, r.addend, 0);
+        addend(w, os, at, g.add);
+        rel(w, os, at, g.sym, false, 2, true, ARM64_RELOC_PAGEOFF12);
+    } else if (t == elf.R_AARCH64_CALL26) or (t == elf.R_AARCH64_JUMP26) {
+        let g = target(w, o, r.sym, r.addend, 0);
+        addend(w, os, at, g.add);
+        rel(w, os, at, g.sym, true, 2, true, ARM64_RELOC_BRANCH26);
+    } else if (t == elf.R_AARCH64_ADR_GOT_PAGE) or (t == elf.R_AARCH64_LD64_GOT_LO12_NC) {
+        let g = target(w, o, r.sym, r.addend, 0);
+        if g.add != 0 {
+            fail(w, "a GOT reference with an addend, which Mach-O cannot hold");
+        }
+        let page = t == elf.R_AARCH64_ADR_GOT_PAGE;
+        rel(w, os, at, g.sym, page, 2, true, u32_pick(page, ARM64_RELOC_GOT_LOAD_PAGE21,
+                                                      ARM64_RELOC_GOT_LOAD_PAGEOFF12));
+    } else if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12) or (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC) {
+        let g = target(w, o, r.sym, r.addend, 0);
+        addend(w, os, at, g.add);
+        rel(w, os, at, g.sym, false, 2, true, u32_pick(t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12, ARM64_AXIOM_TPREL_HI12,
+                                                       ARM64_AXIOM_TPREL_LO12));
+    } else {
+        fail(w, u.f1("an AArch64 relocation of type %s, which Mach-O has none for", u.udec(@as(u64, t))));
+    }
+}
+
+fn u32_pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// A place-relative reference (S + A - P) as SUBTRACTOR (the atom of the
+// place) and UNSIGNED (the target), the difference's rest in the contents.
+fn sub_pair(w: *mut W, o: *elf.Obj, os: i32, at: u64, r: elf.Rel, len: u32, sub_ty: u32, uns_ty: u32) void {
+    let g = target(w, o, r.sym, r.addend, 0);
+    let b = atom_at(w, os, @bit_cast(i64, at));
+    let v = g.add - @bit_cast(i64, at - w.syms.get(@as(usize, b)).off);
+    if len == 3 {
+        put64(w, os, at, v);
+    } else {
+        put32(w, os, at, v);
+    }
+    rel(w, os, at, b, false, len, true, sub_ty);
+    rel(w, os, at, g.sym, false, len, true, uns_ty);
+}
+
+fn cmp_name(a: MSym, b: MSym) i32 {
+    return u.str_cmp(a.name, b.name);
+}
+
+fn name16(h: *mut bn.Bytes, s: []u8) void {
+    for i in @as(usize, 0)..16 {
+        if i < s.len {
+            h.u8_(s[i]);
+        } else {
+            h.u8_(0);
+        }
+    }
+}
+
+fn log2(x: u64) u64 {
+    let mut n: u64 = 0;
+    while (@as(u64, 1) << n) < x {
+        n += 1;
+    }
+    return n;
+}
+
+/// The Mach-O object of o (its machine EM_X86_64 or EM_AARCH64), or "" with
+/// g_error saying why it cannot be written.
+pub fn write(o: *mut elf.Obj) []u8 {
+    g_error = "";
+    let mut w = W.{ x64: o.machine == elf.EM_X86_64, secs: u.List.[OSec].empty(), smap: u.newn.[i32](o.secs.len + 1),
+                    sbase: u.newn.[u64](o.secs.len + 1), syms: u.List.[MSym].empty(),
+                    ymap: u.newn.[i32](o.syms.len + 1), atoms: u.List.[u.List.[u64]].empty(), ok: true };
+    // the sections: what holds data, then the debug information, then the
+    // zero-fill ones (the platform's linker wants those last); the arrays
+    // in the order of their priorities
+    let mut order = u.List.[u64].empty();
+    for k in 0..o.secs.len {
+        w.smap[k] = -1;
+        let s = o.secs.get(k);
+        if s.kind == elf.S_DISCARD {
+            continue;
+        }
+        let mut key = @as(u64, k);
+        if is_array(s) {
+            key = (1 << 60) | (array_prio(s.name) << 32) | @as(u64, k);
+        }
+        order.push(key);
+    }
+    sort_u64(order.items());
+    for pass in @as(u32, 0)..3 {
+        for key in order.items() {
+            let k = @truncate(usize, key & 0xffff_ffff);
+            let s = o.secs.get(k);
+            let p = place_of(s, w.x64);
+            let wanted = u32_pick(is_zerofill(p.flags), 2, u32_pick((p.flags & S_ATTR_DEBUG) != 0, 1, 0));
+            if pass != wanted {
+                continue;
+            }
+            let os = osec_of(&mut w, p, s.align);
+            let x = w.secs.at(@as(usize, @bit_cast(u32, os)));
+            w.smap[k] = os;
+            if x.zerofill {
+                x.size = nl_align(x.size, @max(s.align, 1));
+                w.sbase[k] = x.size;
+                x.size += elf.sec_size(s);
+            } else {
+                x.data.align(@truncate(usize, @max(s.align, 1)));
+                w.sbase[k] = @as(u64, x.data.len());
+                x.data.put(s.data.view());
+            }
+        }
+    }
+    // the symbols
+    for i in 0..o.syms.len {
+        w.ymap[i] = -1;
+        let s = o.syms.at(i);
+        if s.name.len == 0 {
+            continue;
+        }
+        let local = s.bind == elf.B_LOCAL;
+        let mut m = MSym.{ name: "", ntype: 0, osec: -1, off: 0, desc: 0, value: 0, group: 0, index: 0 };
+        if s.sec >= 0 {
+            let k = @as(usize, @bit_cast(u32, s.sec));
+            let os = w.smap[k];
+            if os < 0 {
+                continue;
+            }
+            let x = w.secs.get(@as(usize, @bit_cast(u32, os)));
+            if local and (x.debug or ((o.secs.get(k).kind == elf.S_TEXT) and (s.ty != elf.T_FUNC))) {
+                continue;  // (not the start of an atom)
+            }
+            m.osec = os;
+            m.off = w.sbase[k] + s.value;
+            m.ntype = N_SECT;
+        } else if s.sec == elf.SEC_ABS {
+            m.ntype = N_ABS;
+            m.value = s.value;
+        } else if local {
+            continue;
+        } else {
+            m.ntype = N_UNDF;
+            m.group = 2;
+            if s.bind == elf.B_WEAK {
+                m.desc = N_WEAK_REF;
+            }
+        }
+        if not local {
+            m.ntype |= N_EXT;
+            if s.hidden {
+                m.ntype |= N_PEXT;
+            }
+            if m.group == 0 {
+                m.group = 1;
+            }
+            if (s.bind == elf.B_WEAK) and (s.sec != -1) {
+                m.desc = N_WEAK_DEF;
+            }
+        }
+        m.name = mangle(&w, o, s);
+        w.ymap[i] = add_msym(&mut w, m);
+    }
+    // each section's start symbol, where no symbol starts it
+    for i in 0..w.secs.len {
+        let x = w.secs.get(i);
+        if x.debug {
+            continue;
+        }
+        let a = w.atoms.at(i);
+        sort_u64(a.items());
+        if (a.len == 0) or ((a.get(0) >> 24) != 0) {
+            _ = add_msym(&mut w, MSym.{ name: u.f1("ltmp%s", u.zdec(i)), ntype: N_SECT, osec: @int_cast(i32, i), off: 0,
+                                        desc: 0, value: 0, group: 0, index: 0 });
+            sort_u64(a.items());
+        }
+    }
+    // the relocations
+    for k in 0..o.secs.len {
+        let os = w.smap[k];
+        if os < 0 {
+            continue;
+        }
+        let s = o.secs.get(k);
+        for r in s.relocs.items() {
+            convert(&mut w, o, k, os, r);
+        }
+    }
+    if not w.ok {
+        return "";
+    }
+    return encode(&mut w);
+}
+
+fn nl_align(x: u64, a: u64) u64 {
+    if a <= 1 {
+        return x;
+    }
+    return (x + a - 1) & ~(a - 1);
+}
+
+// (insertion sort for the short lists, a merge sort beyond)
+fn sort_u64(a: []mut u64) void {
+    if a.len > 32 {
+        u.sort.[u64](a, cmp_u64);
+        return;
+    }
+    for i in 1..a.len {
+        let x = a[i];
+        let mut j = i;
+        while (j > 0) and (a[j - 1] > x) {
+            a[j] = a[j - 1];
+            j -= 1;
+        }
+        a[j] = x;
+    }
+}
+
+fn cmp_u64(a: u64, b: u64) i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+// The file: header, load commands, section contents, relocations,
+// symbols, strings.
+fn encode(w: *mut W) []u8 {
+    // the symbol table's order: locals, defined externals (by name),
+    // undefined ones (by name)
+    let mut groups: [3]u.List.[u32] = [u.List.[u32].empty(), u.List.[u32].empty(), u.List.[u32].empty()];
+    let mut ext = u.List.[MSym].empty();
+    let mut und = u.List.[MSym].empty();
+    for i in 0..w.syms.len {
+        let m = w.syms.at(i);
+        m.index = @truncate(u32, i);  // (its place in w.syms until sorted)
+        if m.group == 0 {
+            groups[0].push(@truncate(u32, i));
+        } else if m.group == 1 {
+            ext.push(m.*);
+        } else {
+            und.push(m.*);
+        }
+    }
+    u.sort.[MSym](ext.items(), cmp_name);
+    u.sort.[MSym](und.items(), cmp_name);
+    for m in ext.items() {
+        groups[1].push(m.index);
+    }
+    for m in und.items() {
+        groups[2].push(m.index);
+    }
+    let mut fin = u.newn.[u32](w.syms.len + 1);
+    let mut n: u32 = 0;
+    for gi in @as(usize, 0)..3 {
+        for i in groups[gi].items() {
+            fin[@as(usize, i)] = n;
+            n += 1;
+        }
+    }
+    // addresses and file offsets
+    let nsec = @as(u64, w.secs.len);
+    let sizeofcmds = (72 + (80 * nsec)) + 24 + 24 + 80;
+    let mut addr: u64 = 0;
+    let mut off = 32 + sizeofcmds;
+    let mut file_start: u64 = 0;
+    let mut file_end = off;
+    for i in 0..w.secs.len {
+        let x = w.secs.at(i);
+        addr = nl_align(addr, x.align);
+        x.addr = addr;
+        if x.zerofill {
+            addr += x.size;
+            continue;
+        }
+        off = nl_align(off, @min(x.align, 16));
+        if file_start == 0 {
+            file_start = off;
+        }
+        x.offset = off;
+        off += @as(u64, x.data.len());
+        addr += @as(u64, x.data.len());
+        file_end = off;
+    }
+    if file_start == 0 {
+        file_start = file_end;
+    }
+    off = nl_align(off, 8);
+    for i in 0..w.secs.len {
+        let x = w.secs.at(i);
+        x.reloff = 0;
+        if x.rels.len > 0 {
+            x.reloff = off;
+            off += 8 * @as(u64, x.rels.len);
+        }
+    }
+    let symoff = nl_align(off, 8);
+    let stroff = symoff + (16 * @as(u64, n));
+    // the string table
+    let mut strs = bn.new_bytes();
+    strs.u8_(0x20);
+    strs.u8_(0);
+    let mut symtab = bn.new_bytes();
+    for gi in @as(usize, 0)..3 {
+        for i in groups[gi].items() {
+            let m = w.syms.get(@as(usize, i));
+            symtab.u32_(@as(u64, strs.len()));
+            strs.put(m.name);
+            strs.u8_(0);
+            symtab.u8_(m.ntype);
+            if m.osec >= 0 {
+                symtab.u8_(@truncate(u8, @as(u64, @bit_cast(u32, m.osec)) + 1));
+                symtab.u16_(m.desc);
+                symtab.u64_(w.secs.get(@as(usize, @bit_cast(u32, m.osec))).addr + m.off);
+            } else {
+                symtab.u8_(0);
+                symtab.u16_(m.desc);
+                symtab.u64_(m.value);
+            }
+        }
+    }
+    strs.align(8);
+    // header and load commands
+    let mut h = bn.new_bytes();
+    h.u32_(MH_MAGIC_64);
+    h.u32_(u64_pick(w.x64, CPU_TYPE_X86_64, CPU_TYPE_ARM64));
+    h.u32_(u64_pick(w.x64, 3, 0));  // CPU_SUBTYPE_X86_64_ALL, CPU_SUBTYPE_ARM64_ALL
+    h.u32_(MH_OBJECT);
+    h.u32_(4);
+    h.u32_(sizeofcmds);
+    h.u32_(MH_SUBSECTIONS_VIA_SYMBOLS);
+    h.u32_(0);
+    h.u32_(0x19);  // LC_SEGMENT_64
+    h.u32_(72 + (80 * nsec));
+    name16(&mut h, "");
+    h.u64_(0);
+    h.u64_(addr);
+    h.u64_(file_start);
+    h.u64_(file_end - file_start);
+    h.u32_(7);
+    h.u32_(7);
+    h.u32_(nsec);
+    h.u32_(0);
+    for i in 0..w.secs.len {
+        let x = w.secs.get(i);
+        name16(&mut h, x.sect);
+        name16(&mut h, x.seg);
+        h.u64_(x.addr);
+        h.u64_(u64_pick(x.zerofill, x.size, @as(u64, x.data.len())));
+        h.u32_(x.offset);
+        h.u32_(log2(x.align));
+        h.u32_(x.reloff);
+        h.u32_(@as(u64, x.rels.len));
+        h.u32_(x.flags);
+        h.u32_(0);
+        h.u32_(0);
+        h.u32_(0);
+    }
+    h.u32_(0x32);  // LC_BUILD_VERSION
+    h.u32_(24);
+    h.u32_(1);            // PLATFORM_MACOS
+    h.u32_(0x000b_0000);  // minos 11.0 (as mlink.ax's executables)
+    h.u32_(0);            // sdk: none
+    h.u32_(0);            // no tools
+    h.u32_(2);            // LC_SYMTAB
+    h.u32_(24);
+    h.u32_(symoff);
+    h.u32_(@as(u64, n));
+    h.u32_(stroff);
+    h.u32_(@as(u64, strs.len()));
+    h.u32_(0xb);  // LC_DYSYMTAB
+    h.u32_(80);
+    h.u32_(0);
+    h.u32_(@as(u64, groups[0].len));
+    h.u32_(@as(u64, groups[0].len));
+    h.u32_(@as(u64, groups[1].len));
+    h.u32_(@as(u64, groups[0].len + groups[1].len));
+    h.u32_(@as(u64, groups[2].len));
+    for _k in @as(u32, 0)..12 {
+        h.u32_(0);
+    }
+    // contents
+    for i in 0..w.secs.len {
+        let x = w.secs.at(i);
+        if x.zerofill {
+            continue;
+        }
+        while @as(u64, h.len()) < x.offset {
+            h.u8_(0);
+        }
+        h.put(x.data.view());
+    }
+    while @as(u64, h.len()) < nl_align(file_end, 8) {
+        h.u8_(0);
+    }
+    for i in 0..w.secs.len {
+        let x = w.secs.at(i);
+        for r in x.rels.items() {
+            let mut sym = r.sym;
+            if r.ext {
+                sym = fin[@as(usize, r.sym)];
+            }
+            h.u32_(r.addr);
+            h.u32_(
+                @as(u64, sym & 0xff_ffff) | (u64_pick(r.pcrel, 1, 0) << 24) | (@as(u64, r.len) << 25) | (
+                    u64_pick(r.ext, 1, 0) << 27) | (@as(u64, r.ty) << 28));
+        }
+    }
+    while @as(u64, h.len()) < symoff {
+        h.u8_(0);
+    }
+    h.put(symtab.view());
+    h.put(strs.view());
+    let out = u.heap_dup(h.view());
+    h.free();
+    symtab.free();
+    strs.free();
+    for i in 0..w.secs.len {
+        w.secs.at(i).data.free();
+    }
+    return out;
+}
+
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// -----------------------------------------------------------------------------
+// Reading
+// -----------------------------------------------------------------------------
+
+// A section of the object read.
+struct ISec {
+    seg: []u8,
+    sect: []u8,
+    addr: u64,
+    size: u64,
+    reloff: u64,
+    nreloc: u64,
+    flags: u64,
+    elf: i32,     // our section, -1: not kept
+    secsym: u32,  // its section symbol (section-relative relocations)
+}
+
+fn name_at(d: []u8, off: usize) []u8 {
+    let mut e = off;
+    while (e < off + 16) and (d[e] != 0) {
+        e += 1;
+    }
+    return d[off..e];
+}
+
+// Our name for a section's __start_/__stop_ symbols and for nlink.ax's
+// grouping: a C identifier that is not one of the system's names (those
+// begin with "__") keeps its name.
+fn own_name(sect: []u8) bool {
+    return c_ident(sect) and not u.starts(sect, "__");
+}
+
+// The kind and name of a section read (kind -1: not kept).
+fn classify(x: *ISec, name: *mut []u8) i32 {
+    let t = sec_type(x.flags);
+    let seg = x.seg;
+    let sect = x.sect;
+    if u.str_eq(seg, "__DWARF") or ((x.flags & S_ATTR_DEBUG) != 0) {
+        if u.starts(sect, "__debug_") {
+            name.* = u.cat2(".debug_", sect[8..]);
+            return elf.S_DEBUG;
+        }
+        if u.str_eq(sect, "__axiom_lines") {
+            name.* = ".axiom.lines";
+            return elf.S_DEBUG;
+        }
+        return -1;  // (__apple_names and the like: the debugger's indexes)
+    }
+    if (u.str_eq(seg, "__LD") and u.str_eq(sect, "__compact_unwind")) or u.str_eq(sect, "__eh_frame") {
+        return -1;
+    }
+    if u.str_eq(sect, "__axiom_tdata") {
+        name.* = ".tdata";
+        return elf.S_TDATA;
+    }
+    if u.str_eq(sect, "__axiom_tbss") {
+        name.* = ".tbss";
+        return elf.S_TBSS;
+    }
+    if t == S_THREAD_LOCAL_REGULAR {
+        name.* = ".macho.thread_data";
+        return elf.S_DATA;
+    }
+    if t == S_THREAD_LOCAL_ZEROFILL {
+        name.* = ".macho.thread_bss";
+        return elf.S_BSS;
+    }
+    if t == S_THREAD_LOCAL_VARIABLES {
+        name.* = ".macho.thread_vars";
+        return elf.S_DATA;
+    }
+    if t == S_MOD_INIT_FUNC_POINTERS {
+        name.* = ".init_array";
+        return elf.S_DATA;
+    }
+    if t == S_MOD_TERM_FUNC_POINTERS {
+        name.* = ".fini_array";
+        return elf.S_DATA;
+    }
+    let own = own_name(sect);
+    if (t == S_ZEROFILL) or (t == S_GB_ZEROFILL) {
+        name.* = u.pick(own, sect, ".bss");
+        return elf.S_BSS;
+    }
+    if (x.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0 {
+        name.* = u.pick(own, sect, ".text");
+        return elf.S_TEXT;
+    }
+    if own {
+        name.* = sect;
+        if u.str_eq(seg, "__TEXT") {
+            return elf.S_RODATA;
+        }
+        return elf.S_DATA;
+    }
+    if u.str_eq(seg, "__TEXT") {
+        name.* = ".rodata";
+        return elf.S_RODATA;
+    }
+    if u.str_eq(sect, "__const") {
+        name.* = ".data.rel.ro";
+        return elf.S_DATA;
+    }
+    name.* = ".data";
+    return elf.S_DATA;
+}
+
+// Our name for a Mach-O symbol's: without C's underscore; the linker's
+// section bounds as __start_ and __stop_ symbols; another name (no
+// underscore) marked with a leading byte 1, which mlink.ax writes as it is.
+fn demangle(n: []u8, secs: []ISec) []u8 {
+    if u.starts(n, "_") {
+        return n[1..];
+    }
+    for pfx in ["section$start$", "section$end$"] {
+        if u.starts(n, pfx) {
+            let rest = n[pfx.len..];
+            let k = u.find(rest, '$');
+            if k > 0 {
+                let sect = rest[@int_cast(usize, k) + 1..];
+                if own_name(sect) {
+                    return u.cat2(u.pick(pfx.len == 14, "__start_", "__stop_"), sect);
+                }
+            }
+        }
+    }
+    return u.cat2("\x01", n);
+}
+
+fn rd_signed(d: []u8, at: usize, len: u64) i64 {
+    if len == 3 {
+        return @bit_cast(i64, bn.rd64(d, at));
+    }
+    if len == 2 {
+        return @as(i64, @bit_cast(i32, @truncate(u32, bn.rd32(d, at))));
+    }
+    if len == 1 {
+        return @as(i64, @bit_cast(i16, @truncate(u16, bn.rd16(d, at))));
+    }
+    return @as(i64, @bit_cast(i8, d[at]));
+}
+
+fn bad(msg: []u8) *mut elf.Obj {
+    g_error = msg;
+    return u.nil.[elf.Obj]();
+}
+
+// The ELF type of an arm64 PAGEOFF12's instruction: an add's immediate, or
+// a load's or store's scaled offset (by its size).
+fn pageoff_type(ins: u64) u32 {
+    if (ins & 0x1f00_0000) == 0x1100_0000 {
+        return elf.R_AARCH64_ADD_ABS_LO12_NC;
+    }
+    if (ins & 0x3b00_0000) == 0x3900_0000 {
+        let size = ins >> 30;
+        let v = (ins >> 26) & 1;
+        let opc = (ins >> 22) & 3;
+        if (v == 1) and (size == 0) and ((opc & 2) != 0) {
+            return elf.R_AARCH64_LDST128_ABS_LO12_NC;
+        }
+        if size == 0 {
+            return elf.R_AARCH64_LDST8_ABS_LO12_NC;
+        }
+        if size == 1 {
+            return elf.R_AARCH64_LDST16_ABS_LO12_NC;
+        }
+        if size == 2 {
+            return elf.R_AARCH64_LDST32_ABS_LO12_NC;
+        }
+        return elf.R_AARCH64_LDST64_ABS_LO12_NC;
+    }
+    return 0;
+}
+
+/// Decodes the Mach-O relocatable object d (arm64 or x86-64), or gives nil
+/// (with g_error saying why) if it is not one or is malformed, or holds
+/// what the linkers do not support.
+pub fn read(d: []u8) *mut elf.Obj {
+    g_error = "";
+    if not is_object(d) {
+        return bad("not a 64-bit Mach-O object");
+    }
+    let cpu = bn.rd32(d, 4);
+    let mut machine: u32 = 0;
+    if cpu == CPU_TYPE_X86_64 {
+        machine = elf.EM_X86_64;
+    } else if cpu == CPU_TYPE_ARM64 {
+        machine = elf.EM_AARCH64;
+    } else {
+        return bad("a Mach-O object for another processor");
+    }
+    let x64 = machine == elf.EM_X86_64;
+    let o = elf.new_obj(machine);
+    let ncmds = bn.rd32(d, 16);
+    let mut at: usize = 32;
+    let mut secs = u.List.[ISec].empty();
+    let mut symoff: usize = 0;
+    let mut nsyms: usize = 0;
+    let mut stroff: usize = 0;
+    for _c in 0..ncmds {
+        if at + 8 > d.len {
+            return bad("a truncated load command");
+        }
+        let cmd = bn.rd32(d, at);
+        let size = @truncate(usize, bn.rd32(d, at + 4));
+        if (size < 8) or (at + size > d.len) {
+            return bad("a malformed load command");
+        }
+        if cmd == 0x19 {
+            let ns = @truncate(usize, bn.rd32(d, at + 64));
+            for i in 0..ns {
+                let e = at + 72 + (i * 80);
+                if e + 80 > at + size {
+                    return bad("a malformed segment");
+                }
+                secs.push(ISec.{ seg: u.dup(name_at(d, e + 16)), sect: u.dup(name_at(d, e)), addr: bn.rd64(d, e + 32),
+                                 size: bn.rd64(d, e + 40), reloff: bn.rd32(d, e + 56), nreloc: bn.rd32(d, e + 60),
+                                 flags: bn.rd32(d, e + 64), elf: -1, secsym: 0 });
+                let x = secs.at(secs.len - 1);
+                let fo = @truncate(usize, bn.rd32(d, e + 48));
+                let al = @as(u64, 1) << bn.rd32(d, e + 52);
+                let mut nm: []u8 = "";
+                let kind = classify(x, &mut nm);
+                if kind < 0 {
+                    continue;
+                }
+                if sec_type(x.flags) == S_THREAD_LOCAL_INIT_FUNCTION_POINTERS {
+                    return bad("thread-local variables with initializer functions (S_THREAD_LOCAL_INIT_FUNCTION_POINTERS)");
+                }
+                let si = elf.add_sec(o, nm, kind, al);
+                let s = o.secs.get(@int_cast(usize, si));
+                if is_zerofill(x.flags) {
+                    s.size = x.size;
+                } else {
+                    if fo + @truncate(usize, x.size) > d.len {
+                        return bad("a section beyond the file's end");
+                    }
+                    s.data.put(d[fo..fo + @truncate(usize, x.size)]);
+                }
+                x.elf = si;
+                x.secsym = elf.add_sym(o, elf.Sym.{ name: "", sec: si, value: 0, size: 0, bind: elf.B_LOCAL, ty: 3,
+                                                    hidden: false });
+            }
+        } else if cmd == 2 {
+            symoff = @truncate(usize, bn.rd32(d, at + 8));
+            nsyms = @truncate(usize, bn.rd32(d, at + 12));
+            stroff = @truncate(usize, bn.rd32(d, at + 16));
+        }
+        at += size;
+    }
+    if symoff + (nsyms * 16) > d.len {
+        return bad("a symbol table beyond the file's end");
+    }
+    // the symbols
+    let ymap = u.newn.[i32](nsyms + 1);
+    for i in 0..nsyms {
+        ymap[i] = -1;
+        let e = symoff + (i * 16);
+        let ntype = d[e + 4];
+        if (ntype & N_STAB) != 0 {
+            continue;  // (debugging entries)
+        }
+        let nsect = @as(usize, d[e + 5]);
+        let desc = bn.rd16(d, e + 6);
+        let value = bn.rd64(d, e + 8);
+        let raw = elf.cstr_at(d, stroff + @truncate(usize, bn.rd32(d, e)));
+        let t = ntype & N_TYPE;
+        let ext = (ntype & N_EXT) != 0;
+        let mut s = elf.Sym.{ name: "", sec: -1, value: 0, size: 0, bind: elf.B_LOCAL, ty: elf.T_NOTYPE,
+                              hidden: (ntype & N_PEXT) != 0 };
+        if ext {
+            s.bind = elf.B_GLOBAL;
+        }
+        s.name = u.dup(demangle(raw, secs.items()));
+        if t == N_SECT {
+            if (nsect == 0) or (nsect > secs.len) {
+                return bad("a symbol in no section");
+            }
+            let x = secs.get(nsect - 1);
+            if x.elf < 0 {
+                if not ext {
+                    continue;  // (a label of what is not kept: unwind tables)
+                }
+                s.sec = elf.SEC_ABS;  // (defined where the link has no use for it)
+            } else {
+                s.sec = x.elf;
+                s.value = value - x.addr;
+                let kind = o.secs.get(@int_cast(usize, x.elf)).kind;
+                if kind == elf.S_TEXT {
+                    s.ty = elf.T_FUNC;
+                } else if (kind == elf.S_TDATA) or (kind == elf.S_TBSS) {
+                    s.ty = elf.T_TLS;
+                } else {
+                    s.ty = elf.T_OBJECT;
+                }
+            }
+            if ext and ((desc & N_WEAK_DEF) != 0) {
+                s.bind = elf.B_WEAK;
+            }
+        } else if t == N_UNDF {
+            if not ext {
+                continue;
+            }
+            if value != 0 {
+                // a common symbol: a weak definition of its size and alignment
+                let al = @as(u64, 1) << ((desc >> 8) & 0xf);
+                let cs = elf.add_sec(o, u.cat2(".bss.common.", s.name), elf.S_BSS, al);
+                o.secs.get(@int_cast(usize, cs)).size = value;
+                s.sec = cs;
+                s.size = value;
+                s.bind = elf.B_WEAK;
+                s.ty = elf.T_OBJECT;
+            } else if (desc & N_WEAK_REF) != 0 {
+                s.bind = elf.B_WEAK;
+            }
+        } else if t == N_ABS {
+            s.sec = elf.SEC_ABS;
+            s.value = value;
+        } else {
+            return bad(u.f1("the symbol '%s' is an indirect one (N_INDR), which the linker does not support", raw));
+        }
+        ymap[i] = @bit_cast(i32, elf.add_sym(o, s));
+    }
+    sizes(o);
+    // the relocations
+    for xi in 0..secs.len {
+        let x = secs.get(xi);
+        if (x.elf < 0) or (x.nreloc == 0) {
+            continue;
+        }
+        let ro = @truncate(usize, x.reloff);
+        let n = @truncate(usize, x.nreloc);
+        if ro + (n * 8) > d.len {
+            return bad("relocations beyond the file's end");
+        }
+        let s = o.secs.get(@int_cast(usize, x.elf));
+        let mut pend_add: i64 = 0;  // ARM64_RELOC_ADDEND's
+        let mut sub_sym: i32 = -1;  // a SUBTRACTOR's symbol (ours), for the UNSIGNED after it
+        for j in 0..n {
+            let e = ro + (j * 8);
+            let addr = bn.rd32(d, e);
+            if (addr & 0x8000_0000) != 0 {
+                return bad("a scattered relocation (not used on arm64 and x86-64)");
+            }
+            let info = bn.rd32(d, e + 4);
+            let symnum = @truncate(usize, info & 0xff_ffff);
+            let pcrel = ((info >> 24) & 1) != 0;
+            let len = (info >> 25) & 3;
+            let ext = ((info >> 27) & 1) != 0;
+            let ty = @truncate(u32, info >> 28);
+            let off = @as(usize, @truncate(u32, addr));
+            if (off + (@as(usize, 1) << @truncate(u32, len))) > s.data.len() and not is_zerofill(x.flags) {
+                return bad("a relocation beyond its section");
+            }
+            if not x64 and (ty == ARM64_RELOC_ADDEND) {
+                pend_add = @as(i64, @bit_cast(i32, @truncate(u32, symnum << 8))) >> 8;
+                continue;
+            }
+            // the target: a symbol, or (section-relative) a section's
+            // symbol with the address in the contents
+            let mut sym: u32 = 0;
+            let mut tsec_addr: u64 = 0;
+            if ext {
+                if (symnum >= nsyms) or (ymap[symnum] < 0) {
+                    return bad("a relocation to a symbol that is not there");
+                }
+                sym = @bit_cast(u32, ymap[symnum]);
+            } else {
+                if (symnum == 0) or (symnum > secs.len) or (secs.get(symnum - 1).elf < 0) {
+                    return bad("a relocation to a section that is not there");
+                }
+                sym = secs.get(symnum - 1).secsym;
+                tsec_addr = secs.get(symnum - 1).addr;
+            }
+            let dv = s.data.view();
+            let content = rd_signed(dv, off, len);
+            let is_sub = (x64 and (ty == X86_64_RELOC_SUBTRACTOR)) or (not x64 and (ty == ARM64_RELOC_SUBTRACTOR));
+            if is_sub {
+                if not ext {
+                    return bad("a SUBTRACTOR relocation that is not to a symbol");
+                }
+                sub_sym = @bit_cast(i32, sym);
+                continue;
+            }
+            let mut r = elf.Rel.{ off: @as(u64, off), ty: 0, sym: sym, addend: 0 };
+            let unsigned = (x64 and (ty == X86_64_RELOC_UNSIGNED)) or (not x64 and (ty == ARM64_RELOC_UNSIGNED));
+            if sub_sym >= 0 {
+                // the pair's difference: S - B + contents, B a symbol of
+                // this section (so place-relative)
+                if not unsigned {
+                    return bad("a SUBTRACTOR relocation without its UNSIGNED one");
+                }
+                let b = o.syms.get(@as(usize, @bit_cast(u32, sub_sym)));
+                sub_sym = -1;
+                if b.sec != x.elf {
+                    return bad("a difference of two symbols of other sections, which the linker does not support");
+                }
+                let mut a = content;
+                if not ext {
+                    a = content - @bit_cast(i64, tsec_addr);
+                }
+                r.addend = a + @bit_cast(i64, @as(u64, off) - b.value);
+                if len == 3 {
+                    r.ty = u32_pick(x64, elf.R_X86_64_PC64, elf.R_AARCH64_PREL64);
+                } else if len == 2 {
+                    r.ty = u32_pick(x64, elf.R_X86_64_PC32, elf.R_AARCH64_PREL32);
+                } else {
+                    return bad("a difference narrower than 32 bits");
+                }
+                zero(dv, off, len);
+                s.relocs.push(r);
+                continue;
+            }
+            if unsigned {
+                r.addend = content;
+                if not ext {
+                    r.addend = content - @bit_cast(i64, tsec_addr);
+                }
+                if len == 3 {
+                    r.ty = u32_pick(x64, elf.R_X86_64_64, elf.R_AARCH64_ABS64);
+                } else if len == 2 {
+                    r.ty = u32_pick(x64, elf.R_X86_64_32, elf.R_AARCH64_ABS32);
+                } else {
+                    return bad("an absolute address narrower than 32 bits");
+                }
+                zero(dv, off, len);
+                s.relocs.push(r);
+                continue;
+            }
+            if x64 {
+                // displacements from the field's end (+ k bytes for SIGNED_k)
+                let mut k: i64 = 0;
+                if ty == X86_64_RELOC_SIGNED_1 {
+                    k = 1;
+                } else if ty == X86_64_RELOC_SIGNED_2 {
+                    k = 2;
+                } else if ty == X86_64_RELOC_SIGNED_4 {
+                    k = 4;
+                }
+                if ty == X86_64_AXIOM_TPOFF32 {
+                    r.ty = elf.R_X86_64_TPOFF32;
+                    r.addend = content;
+                    zero(dv, off, len);
+                    s.relocs.push(r);
+                    continue;
+                }
+                if not pcrel or (len != 2) {
+                    return bad(
+                        u.f1(
+                            "an x86-64 relocation of type %s that is not a 32-bit displacement", u.udec(@as(u64, ty))));
+                }
+                if ext {
+                    r.addend = content - 4 - k;
+                } else {
+                    let t_addr = @bit_cast(i64, x.addr + @as(u64, off) + 4) + k + content;
+                    r.addend = (t_addr - @bit_cast(i64, tsec_addr)) - 4 - k;
+                }
+                if (ty == X86_64_RELOC_SIGNED) or (k != 0) {
+                    r.ty = elf.R_X86_64_PC32;
+                } else if ty == X86_64_RELOC_BRANCH {
+                    r.ty = elf.R_X86_64_PLT32;
+                } else if (ty == X86_64_RELOC_GOT_LOAD) or (ty == X86_64_RELOC_TLV) {
+                    // (a thread-local variable's descriptor: loaded from a
+                    // GOT slot, as the platform's linker does)
+                    r.ty = elf.R_X86_64_REX_GOTPCRELX;
+                    if (off < 3) or (dv[off - 2] != 0x8b) {
+                        r.ty = elf.R_X86_64_GOTPCREL;
+                    }
+                } else if ty == X86_64_RELOC_GOT {
+                    r.ty = elf.R_X86_64_GOTPCREL;
+                } else {
+                    return bad(u.f1("an x86-64 relocation of type %s", u.udec(@as(u64, ty))));
+                }
+                zero(dv, off, len);
+                s.relocs.push(r);
+                continue;
+            }
+            // arm64: the addend is ARM64_RELOC_ADDEND's (the instruction's
+            // immediate is the linker's to fill)
+            if not ext {
+                return bad("an arm64 instruction's relocation to a section (they are to symbols)");
+            }
+            r.addend = pend_add;
+            pend_add = 0;
+            if ty == ARM64_RELOC_BRANCH26 {
+                r.ty = elf.R_AARCH64_CALL26;
+            } else if ty == ARM64_RELOC_PAGE21 {
+                r.ty = elf.R_AARCH64_ADR_PREL_PG_HI21;
+            } else if ty == ARM64_RELOC_PAGEOFF12 {
+                r.ty = pageoff_type(bn.rd32(dv, off));
+                if r.ty == 0 {
+                    return bad("ARM64_RELOC_PAGEOFF12 on an instruction that has no 12-bit offset");
+                }
+            } else if (ty == ARM64_RELOC_GOT_LOAD_PAGE21) or (ty == ARM64_RELOC_TLVP_LOAD_PAGE21) {
+                r.ty = elf.R_AARCH64_ADR_GOT_PAGE;
+            } else if (ty == ARM64_RELOC_GOT_LOAD_PAGEOFF12) or (ty == ARM64_RELOC_TLVP_LOAD_PAGEOFF12) {
+                r.ty = elf.R_AARCH64_LD64_GOT_LO12_NC;
+            } else if ty == ARM64_AXIOM_TPREL_HI12 {
+                r.ty = elf.R_AARCH64_TLSLE_ADD_TPREL_HI12;
+            } else if ty == ARM64_AXIOM_TPREL_LO12 {
+                r.ty = elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC;
+            } else if ty == ARM64_RELOC_POINTER_TO_GOT {
+                r.ty = elf.R_AARCH64_GOTPCREL32;
+                r.addend = content;
+                zero(dv, off, len);
+            } else {
+                return bad(u.f1("an arm64 relocation of type %s", u.udec(@as(u64, ty))));
+            }
+            s.relocs.push(r);
+        }
+    }
+    return o;
+}
+
+fn zero(d: []mut u8, at: usize, len: u64) void {
+    for i in 0..(@as(usize, 1) << @truncate(u32, len)) {
+        d[at + i] = 0;
+    }
+}
+
+// Mach-O symbols have no sizes: each defined one's is up to the next
+// symbol of its section (or the section's end).
+struct SymAt {
+    sec: i32,
+    value: u64,
+    i: usize,
+}
+
+fn cmp_at(a: SymAt, b: SymAt) i32 {
+    if a.sec != b.sec {
+        return u32_cmp(@bit_cast(u32, a.sec), @bit_cast(u32, b.sec));
+    }
+    return cmp_u64(a.value, b.value);
+}
+
+fn u32_cmp(a: u32, b: u32) i32 {
+    return cmp_u64(@as(u64, a), @as(u64, b));
+}
+
+fn sizes(o: *mut elf.Obj) void {
+    let mut xs = u.List.[SymAt].empty();
+    for i in 0..o.syms.len {
+        let s = o.syms.get(i);
+        if (s.sec >= 0) and (s.name.len > 0) {
+            xs.push(SymAt.{ sec: s.sec, value: s.value, i: i });
+        }
+    }
+    u.sort.[SymAt](xs.items(), cmp_at);
+    for k in 0..xs.len {
+        let x = xs.get(k);
+        let mut end = elf.sec_size(o.secs.get(@as(usize, @bit_cast(u32, x.sec))));
+        let mut j = k + 1;
+        while j < xs.len {
+            let y = xs.get(j);
+            if y.sec != x.sec {
+                break;
+            }
+            if y.value > x.value {
+                end = y.value;
+                break;
+            }
+            j += 1;
+        }
+        if end > x.value {
+            o.syms.at(x.i).size = end - x.value;
+        }
+    }
+    xs.deinit();
+}
+
+/// The external names Mach-O object d defines, as its symbol table spells
+/// them (with C's underscore), for an archive's table of contents.
+pub fn defined_names(d: []u8, out: *mut u.List.[[]u8]) void {
+    if not is_object(d) {
+        return;
+    }
+    let ncmds = bn.rd32(d, 16);
+    let mut at: usize = 32;
+    for _c in 0..ncmds {
+        if at + 24 > d.len {
+            return;
+        }
+        let cmd = bn.rd32(d, at);
+        if cmd == 2 {
+            let symoff = @truncate(usize, bn.rd32(d, at + 8));
+            let nsyms = @truncate(usize, bn.rd32(d, at + 12));
+            let stroff = @truncate(usize, bn.rd32(d, at + 16));
+            for i in 0..nsyms {
+                let e = symoff + (i * 16);
+                if e + 16 > d.len {
+                    return;
+                }
+                let ntype = d[e + 4];
+                let t = ntype & N_TYPE;
+                if ((ntype & N_STAB) != 0) or ((ntype & N_EXT) == 0) {
+                    continue;
+                }
+                if (t == N_SECT) or (t == N_ABS) or ((t == N_UNDF) and (bn.rd64(d, e + 8) != 0)) {
+                    out.push(elf.cstr_at(d, stroff + @truncate(usize, bn.rd32(d, e))));
+                }
+            }
+            return;
+        }
+        at += @truncate(usize, bn.rd32(d, at + 4));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Dynamic libraries given to a link: their install names and exports
+// -----------------------------------------------------------------------------
+
+/// A dynamic library: the install name a program loads it by, its versions
+/// (for LC_LOAD_DYLIB), and the names it exports (ours: without C's
+/// underscore).
+pub struct Dylib {
+    install: []u8,
+    current: u64,
+    compat: u64,
+    names: u.List.[[]u8],
+}
+
+fn be32(d: []u8, at: usize) u64 {
+    return (@as(u64, d[at]) << 24) | (@as(u64, d[at + 1]) << 16) | (@as(u64, d[at + 2]) << 8) | @as(u64, d[at + 3]);
+}
+
+/// The slice of universal (fat) file d for the processor (CPU_TYPE_*), or
+/// d itself if it is not a universal one; "" if it has no such slice.
+pub fn slice_for(d: []u8, x64: bool) []u8 {
+    if (d.len < 8) or (be32(d, 0) != 0xcafe_babe) {
+        return d;
+    }
+    let want = u64_pick(x64, CPU_TYPE_X86_64, CPU_TYPE_ARM64);
+    let n = @truncate(usize, be32(d, 4));
+    for i in 0..n {
+        let e = 8 + (i * 20);
+        if e + 20 > d.len {
+            break;
+        }
+        if be32(d, e) == want {
+            let off = @truncate(usize, be32(d, e + 8));
+            let size = @truncate(usize, be32(d, e + 12));
+            if off + size <= d.len {
+                return d[off..off + size];
+            }
+        }
+    }
+    return "";
+}
+
+/// Is d a dynamic library (MH_DYLIB, or a universal file)?
+pub fn is_dylib(d: []u8) bool {
+    if (d.len >= 8) and (be32(d, 0) == 0xcafe_babe) {
+        return true;
+    }
+    return (d.len >= 32) and (bn.rd32(d, 0) == MH_MAGIC_64) and (bn.rd32(d, 12) == 6);
+}
+
+// The names an export trie holds (each node: its terminal information,
+// then its edges: a string and a child's offset), into *out.
+fn trie_names(t: []u8, at: usize, prefix: []u8, out: *mut u.List.[[]u8], depth: u32) void {
+    if (at >= t.len) or (depth > 128) {
+        return;
+    }
+    let mut r = bn.reader(t[at..]);
+    let term = r.uleb();
+    if term > 0 {
+        out.push(prefix);
+    }
+    let mut p = at + r.pos + @truncate(usize, term);
+    if p >= t.len {
+        return;
+    }
+    let nkids = @as(usize, t[p]);
+    p += 1;
+    for _k in 0..nkids {
+        let edge = elf.cstr_at(t, p);
+        p += edge.len + 1;
+        let mut rr = bn.reader(t[p..]);
+        let child = rr.uleb();
+        p += rr.pos;
+        trie_names(t, @truncate(usize, child), u.cat2(prefix, edge), out, depth + 1);
+    }
+}
+
+/// The dynamic library d (a slice for the processor, if universal), or nil
+/// with g_error saying why not.
+pub fn read_dylib(d0: []u8, x64: bool) *mut Dylib {
+    g_error = "";
+    let d = slice_for(d0, x64);
+    if (d.len < 32) or (bn.rd32(d, 0) != MH_MAGIC_64) or (bn.rd32(d, 12) != 6) {
+        g_error = u.pick(d.len == 0, "a universal file without the target's processor", "not a dynamic library");
+        return u.nil.[Dylib]();
+    }
+    if bn.rd32(d, 4) != u64_pick(x64, CPU_TYPE_X86_64, CPU_TYPE_ARM64) {
+        g_error = "a dynamic library for another processor";
+        return u.nil.[Dylib]();
+    }
+    let lib = u.new.[Dylib]();
+    lib.current = 0x0001_0000;
+    lib.compat = 0x0001_0000;
+    let ncmds = bn.rd32(d, 16);
+    let mut at: usize = 32;
+    let mut trie: []u8 = "";
+    let mut symoff: usize = 0;
+    let mut nsyms: usize = 0;
+    let mut stroff: usize = 0;
+    for _c in 0..ncmds {
+        if at + 8 > d.len {
+            break;
+        }
+        let cmd = bn.rd32(d, at);
+        let size = @truncate(usize, bn.rd32(d, at + 4));
+        if (size < 8) or (at + size > d.len) {
+            break;
+        }
+        if cmd == 0xd {
+            // LC_ID_DYLIB
+            lib.install = u.dup(elf.cstr_at(d[0..at + size], at + @truncate(usize, bn.rd32(d, at + 8))));
+            lib.current = bn.rd32(d, at + 16);
+            lib.compat = bn.rd32(d, at + 20);
+        } else if (cmd == 0x22) or (cmd == 0x8000_0022) {
+            let off = @truncate(usize, bn.rd32(d, at + 40));
+            let n = @truncate(usize, bn.rd32(d, at + 44));
+            if (n > 0) and (off + n <= d.len) {
+                trie = d[off..off + n];
+            }
+        } else if cmd == 0x8000_0033 {
+            // LC_DYLD_EXPORTS_TRIE
+            let off = @truncate(usize, bn.rd32(d, at + 8));
+            let n = @truncate(usize, bn.rd32(d, at + 12));
+            if (n > 0) and (off + n <= d.len) {
+                trie = d[off..off + n];
+            }
+        } else if cmd == 2 {
+            symoff = @truncate(usize, bn.rd32(d, at + 8));
+            nsyms = @truncate(usize, bn.rd32(d, at + 12));
+            stroff = @truncate(usize, bn.rd32(d, at + 16));
+        }
+        at += size;
+    }
+    if lib.install.len == 0 {
+        g_error = "a dynamic library without an install name (LC_ID_DYLIB)";
+        return u.nil.[Dylib]();
+    }
+    let mut raw = u.List.[[]u8].empty();
+    if trie.len > 0 {
+        trie_names(trie, 0, "", &mut raw, 0);
+    } else {
+        for i in 0..nsyms {
+            let e = symoff + (i * 16);
+            if e + 16 > d.len {
+                break;
+            }
+            let ntype = d[e + 4];
+            if ((ntype & N_STAB) == 0) and ((ntype & N_EXT) != 0) and ((ntype & N_TYPE) != N_UNDF) {
+                raw.push(elf.cstr_at(d, stroff + @truncate(usize, bn.rd32(d, e))));
+            }
+        }
+    }
+    for n in raw.items() {
+        lib.names.push(u.intern(demangle(n, u.nil_slice.[ISec]())));
+    }
+    return lib;
+}

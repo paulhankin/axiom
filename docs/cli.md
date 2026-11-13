@@ -149,7 +149,8 @@ that lacks the extensions it was built with.
 | Option | |
 |---|---|
 | `-o <out>` | The output file. |
-| `--emit=exe\|obj\|lib\|ir\|asm` | An executable (or `.wasm` module), one object file, a static library of it (and of the objects among the inputs), the compiler's IR as text, or assembly. |
+| `--emit=exe\|obj\|lib\|shared\|ir\|asm` | An executable (or `.wasm` module), one object file (ELF, Mach-O or COFF: the target's format), a static library of it (and of the objects among the inputs), a shared library of C units (an ELF `.so`, a Mach-O `.dylib` or a DLL: [`docs/c.md`](c.md), "Shared libraries"), the compiler's IR as text, or assembly. |
+| `--pic` | Code for a shared library made by another linker: on Linux, thread-locals use the initial-exec model (`--emit=shared` implies it; the rest of the code is position-independent already). |
 | `--emit-header=<file.h>` | Also write a C header for the program's `export`ed functions (spec §14.5). |
 | `--format=human\|agent-json` | Diagnostics as text on stderr, or as one JSON object on stdout (spec §16.2). |
 
@@ -182,8 +183,8 @@ its C sources with `c-sources = "dir"`.
 
 | Option | |
 |---|---|
-| `--link=<file>` | Link a C source, object, archive, shared library or `.ax` module into the program (an object or library may also be given as an input: `x.o`, `libx.a`, `libx.so`). C sources are compiled with `cc`. On Linux the compiler's own linker links them ([`docs/c.md`](c.md), "Objects and libraries"). |
-| `-l<lib>`, `-L<dir>` | A library to link (`lib<lib>.so`, else `lib<lib>.a`) and a directory to search before the system's. |
+| `--link=<file>` | Link a C source, object, archive, shared library or `.ax` module into the program (an object or library may also be given as an input: `x.o`, `libx.a`, `libx.so`). C sources are compiled with `cc`. The compiler's own linkers link them, on every target ([`docs/c.md`](c.md), "Objects and libraries"). |
+| `-l<lib>`, `-L<dir>` | A library to link and a directory to search before the system's: on Linux `lib<lib>.so`, else `lib<lib>.a`; on macOS `lib<lib>.a`, else `lib<lib>.dylib`, else bound by name; on Windows `<lib>.lib`, `lib<lib>.a`, `lib<lib>.dll.a` or `<lib>.dll` in the `-L` directories. |
 | `-I<dir>` | An include directory, for C sources given with `--link` and for the C front end's inputs. |
 
 Programs for native targets that link no C code are linked by the compiler's own

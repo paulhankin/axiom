@@ -34,7 +34,7 @@ export function checkMachO(d, opts = {}) {
       for (let k = 0; k < u32(off + 64); k++) {
         const so = off + 72 + 80 * k;
         const sn = str(so, 16), sg = str(so + 16, 16);
-        const addr = u64(so + 32), ssize = u64(so + 40), soff = u32(so + 48), salign = u32(so + 52), zerofill = (u32(so + 64) & 0xff) === 1;
+        const addr = u64(so + 32), ssize = u64(so + 40), soff = u32(so + 48), salign = u32(so + 52), zerofill = [1, 0xc, 0x12].includes(u32(so + 64) & 0xff);
         sects.push({ sn, addr, ssize, soff });
         if (sg !== name) E(`section ${sn} has segment name ${sg} in ${name}`);
         if (addr < vmaddr || addr + ssize > vmaddr + vmsize) E(`section ${sn} lies outside its segment`);
@@ -89,6 +89,7 @@ export function checkMachO(d, opts = {}) {
     if (op === 0x00) continue;
     else if (op === 0x10) { if (imm < 1 || imm > ndylibs) E(`bind to library ${imm}, of ${ndylibs}`); }
     else if (op === 0x20) { const o = uleb(s); if (o < 1 || o > ndylibs) E(`bind to library ${o}, of ${ndylibs}`); }
+    else if (op === 0x30) { if (imm !== 0xe) E(`bind to special library ${imm}`); } // BIND_SPECIAL_DYLIB_FLAT_LOOKUP (-2)
     else if (op === 0x40) { name = cstr(s.i); s.i += name.length + 1; }
     else if (op === 0x50) continue;
     else if (op === 0x60) sleb(s);
@@ -114,7 +115,7 @@ export function checkMachO(d, opts = {}) {
     if ((ty & 0x0e) === 0x0e) { defined.set(nm, val); starts.add(val); }
     if (k < nl && ty & 1) E(`local symbol ${nm} is external`);
     if (k >= nl && k < iu && ty !== 0x0f) E(`external symbol ${nm} has type ${ty}`);
-    if (k >= iu && (ty !== 0x01 || (desc >> 8) < 1 || (desc >> 8) > ndylibs)) E(`import ${nm} is malformed`);
+    if (k >= iu && (ty !== 0x01 || (((desc >> 8) < 1 || (desc >> 8) > ndylibs) && (desc >> 8) !== 0xfe))) E(`import ${nm} is malformed`);
     if ((ty & 0x0e) === 0x0e && (val < lo || val >= hi)) E(`symbol ${nm} points outside the image`);
   }
   const sorted = (a) => a.every((x, k) => k === 0 || Buffer.compare(Buffer.from(a[k - 1]), Buffer.from(x)) < 0);
