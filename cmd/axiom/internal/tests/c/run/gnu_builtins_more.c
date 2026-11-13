@@ -41,7 +41,8 @@ int main(void) {
     struct S s;
     struct T t;
     int arr[8];
-    char *p = buf;
+    char *volatile pv = buf;
+    char *p = pv;  /* (read back: where it points is not seen at any level) */
     print_u64(__builtin_object_size(buf, 0));
 /* expect: 100 */
     print_u64(__builtin_object_size(buf + 10, 0) + __builtin_object_size(&buf[99], 1) * 1000);

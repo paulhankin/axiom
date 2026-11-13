@@ -38,6 +38,7 @@ const K_LE: i32 = 3;     // key <= val + off (unsigned, as natural numbers; val 
 const K_FILL: i32 = 4;   // key: base pointer, off; val: a memset of constant bytes there
 const K_COPY: i32 = 5;   // key: base pointer, off: of the destination of val, a memcpy or memmove
 const K_GE: i32 = 6;     // key >= off (unsigned, off a small constant)
+const K_CALL: i32 = 7;   // key: a call that promises no writes (ir.call_fx), val: its result
 
 struct Ent {
     kind: i32,
@@ -247,7 +248,9 @@ fn mem_hash(base: *ir.Value, off: i64, ty: *ir.Ty) u64 {
 // -----------------------------------------------------------------------------
 // Alias analysis
 // -----------------------------------------------------------------------------
-// The result of a call of the allocator: an object of its own.
+// The result of a call of the allocator (ir.Func.allocator: std/mem's, as an
+// integer, or a C function with the attribute malloc, a pointer): an object
+// of its own, apart from every object that existed before the call.
 fn fresh(v: *ir.Value) bool {
     if not ir.is_op(v, ir.OP_CALL) {
         return false;
@@ -469,6 +472,10 @@ fn loc_of(p0: *mut ir.Value, size: i64) Loc {
         obj = p;
     } else if ir.is_op(p, ir.OP_INTTOPTR) and fresh(ir.resolve(p.a)) {
         obj = ir.resolve(p.a);
+    } else if (p.ty.kind == ir.T_PTR) and fresh(p) {
+        // (C's attribute malloc: a pointer to an object nothing else
+        // points into when the call returns)
+        obj = p;
     } else if ir.is_op(p, ir.OP_SELECT) and noalias_global(p.b) {
         // wasm: the thread's shadow stack record, or the main thread's
         obj = p.b;
@@ -551,6 +558,11 @@ fn may_alias(x: *Loc, w: *Write) bool {
     // slots (they did not exist yet)
     if (u.notnil(x.obj) and ir.is_op(x.obj, ir.OP_ALLOCA) and from_param(w.base)) or
        (u.notnil(w.obj) and ir.is_op(w.obj, ir.OP_ALLOCA) and from_param(x.base)) {
+        return false;
+    }
+    // (nor into an object allocated since: fresh)
+    if (u.notnil(x.obj) and fresh(x.obj) and from_param(w.base)) or
+       (u.notnil(w.obj) and fresh(w.obj) and from_param(x.base)) {
         return false;
     }
     if (private_obj(x.obj) and (w.obj != x.obj)) or (private_obj(w.obj) and (x.obj != w.obj)) {
@@ -943,6 +955,9 @@ fn note_writes(i: *mut ir.Value) void {
     } else if (op == ir.OP_MEMCPY) or (op == ir.OP_MEMMOVE) or (op == ir.OP_MEMSET) {
         push_write(W_LOC, loc_of(i.a, size_of(i.c)));
     } else if op == ir.OP_CALL {
+        if ir.call_fx(i) != ir.FX_ANY {
+            return;  // (it writes nothing: ir.call_fx)
+        }
         push_write(W_CALL, nowhere());
         if sret_call(i) {
             // (the result's slot, which calls do not otherwise write)
@@ -1006,6 +1021,85 @@ fn find_mem(l: *Loc, t: *mut ir.Ty) *mut ir.Value {
         e = x.next;
     }
     return vnil();
+}
+
+// An earlier call whose result call i's is (both calls of one function that
+// promises to write nothing, ir.call_fx, with the same arguments, the
+// earlier one dominating i): for FX_NONE always, for FX_READS when nothing
+// since may have written memory the callee could read (unseen_by). Else nil.
+fn find_call(i: *ir.Value, fx: u8) *mut ir.Value {
+    let mut e = bk.get(@truncate(usize, hash_expr(i)) & (nb - 1));
+    while e >= 0 {
+        let x = ents.get(@int_cast(usize, e));
+        if (x.kind == K_CALL) and same_expr(x.key, i) and same_ext(x.key, i) {
+            if fx == ir.FX_NONE {
+                return x.val;
+            }
+            if (writes.len - x.height) > 256 {
+                return vnil();
+            }
+            for w in x.height..writes.len {
+                if not unseen_by(writes.at(w), i) {
+                    return vnil();
+                }
+            }
+            return x.val;
+        }
+        e = x.next;
+    }
+    return vnil();
+}
+
+// Can call c (which writes nothing: ir.call_fx) not read what write w
+// wrote? When w is a store or memory operation on a private stack slot
+// (whose address no call sees), or reached through a restrict parameter
+// (F_NOALIAS) none of c's arguments may be based on: while the function
+// runs, what is modified through that parameter is accessed only through
+// pointers based on it (C 6.7.3.1p4), so not by the callee unless it was
+// given one: an argument that is a pointer but neither a stack slot's nor
+// a global's address may be (a pointer loaded from memory may hold the
+// parameter's value), and so may an integer as wide as a pointer that is
+// not a constant.
+fn unseen_by(w: *Write, c: *ir.Value) bool {
+    if w.kind != W_LOC {
+        return false;
+    }
+    if private_obj(w.obj) {
+        return true;
+    }
+    let r = root_of(w.base, w.obj);
+    if u.isnil(r) or (r.kind != ir.V_PARAM) or ((r.flags & ir.F_NOALIAS) == 0) {
+        return false;
+    }
+    for k in 0..c.xs.len {
+        let x = ir.resolve(c.xs.get(k));
+        if x.ty.kind == ir.T_PTR {
+            let l = loc_of(x, -1);
+            if u.isnil(l.obj) {
+                return false;
+            }
+        } else if (x.ty.kind != ir.T_INT) and (x.ty.kind != ir.T_FLOAT) {
+            return false;
+        } else if (x.ty.kind == ir.T_INT) and (x.ty.bits >= @int_cast(i32, ir.ptr_bytes * 8)) and not ir.is_cint(x) {
+            return false;  // (an integer that may hold an address based on it)
+        }
+    }
+    return true;
+}
+
+// Do calls x and y extend their arguments alike?
+fn same_ext(x: *ir.Value, y: *ir.Value) bool {
+    let a = ir.ext_of(x);
+    let b = ir.ext_of(y);
+    if a.len != b.len {
+        return false;
+    }
+    for k in 0..a.len {
+        if a[k] != b[k] {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn add_mem(l: *Loc, t: *mut ir.Ty, v: *mut ir.Value) void {
@@ -1335,6 +1429,13 @@ fn assume(c: *mut ir.Value, val: bool, depth: i32) void {
         let ptr = c.a.ty.kind == ir.T_PTR;
         if (tp == ir.IntEQ) and ir.is_const(c.b) and not ir.is_const(c.a) and (not ptr or ir.is_zero(c.b)) {
             add_known(c.a, c.b);
+        }
+        // x >> (bits - 1) == 0 (logical: how x >= 0 is tested): x <= smax
+        // as an unsigned number
+        let s = c.a;
+        if (tp == ir.IntEQ) and ir.is_cint(c.b) and (ir.cint_val(c.b) == 0) and ir.is_op(s, ir.OP_LSHR) and
+           ir.is_cint(s.b) and (s.ty.bits <= 64) and (ir.cint_val(s.b) == @as(u64, @bit_cast(u32, s.ty.bits - 1))) {
+            add_le(s.a, vnil(), smax_of(s.ty));
         }
         // x == y: the later of them is the earlier (the lengths of slices
         // known to be equal: then their bounds checks are the same)
@@ -3051,6 +3152,23 @@ fn visit_block(b: *mut ir.Block) void {
                 changed = true;
             }
         }
+        if ((op == ir.OP_SDIV) or (op == ir.OP_SREM)) and (i.ty.kind == ir.T_INT) and (i.ty.bits <= 64) and
+           (i.ty.bits >= 8) and ir.is_cint(i.b) and (ir.sval(i.b) > 0) and not ir.is_const(i.a) {
+            // x / k and x % k (signed, k > 0) of an x known to be at least
+            // 0 (as unsigned, at most the type's largest signed value: a
+            // fact of the paths, e.g. a branch to `unreachable` when x < 0)
+            // are the unsigned division and remainder, which are cheaper
+            prove_budget = 64;
+            let m = ub(i.a, 0);
+            if (m >= 0) and (m <= smax_of(i.ty)) {
+                if op == ir.OP_SDIV {
+                    i.op = ir.OP_UDIV;
+                } else {
+                    i.op = ir.OP_UREM;
+                }
+                changed = true;
+            }
+        }
         if cse_able(i) {
             let mut r = find_expr(i);
             if u.isnil(r) and (op == ir.OP_ICMP) {
@@ -3104,6 +3222,14 @@ fn visit_block(b: *mut ir.Block) void {
                     note_writes(i);
                     add_mem(&l, i.a.ty, i.a);
                 }
+            }
+        } else if (op == ir.OP_CALL) and (ir.call_fx(i) != ir.FX_ANY) and (i.ty.kind != ir.T_VOID) {
+            // (a call that writes nothing: an earlier one's result, ir.call_fx)
+            let r = find_call(i, ir.call_fx(i));
+            if u.notnil(r) {
+                replace(i, r);
+            } else {
+                push_ent(K_CALL, hash_expr(i), i, 0, i.ty, i);
             }
         } else {
             note_writes(i);
@@ -4216,6 +4342,13 @@ pub fn make_preheader(f: *mut ir.Func, h: *mut ir.Block, tag: i64) bool {
 
 // Is the load at l safe to run before the loop without the loop's guard?
 fn deref_ok(l: *Loc, size: i64) bool {
+    if u.isnil(l.obj) and u.notnil(l.base) and (l.base.kind == ir.V_PARAM) and (l.off >= 0) and (size >= 0) {
+        // a parameter declared [static n] (ir.Func.param_bytes): its first
+        // bytes are there whenever the function runs (C 6.7.6.3p7)
+        let f = ir.fnp_of(l.base);
+        let k = @truncate(usize, l.base.cv);
+        return u.notnil(f) and (k < f.param_bytes.len) and ((l.off + size) <= @bit_cast(i64, f.param_bytes[k]));
+    }
     if u.isnil(l.obj) or not l.rok or (l.rlo < 0) {
         return false;
     }
@@ -4669,6 +4802,14 @@ fn guard_wanted(s: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bo
         if (i.op == ir.OP_LOAD) and hoist_ok(i, tag, true) and not hoist_ok(i, tag, false) {
             want = true;
         }
+        // (or a call that writes nothing, ir.call_fx, which runs before the
+        // loop only where the body runs at least once)
+        if (i.op == ir.OP_CALL) and hoist_ok(i, tag, true) {
+            want = true;
+        }
+        if may_stop(i) {
+            break;
+        }
         i = i.next;
     }
     // or a store promote may keep in a register once the body runs
@@ -4937,8 +5078,10 @@ fn invariant(o: *ir.Value, tag: i64) bool {
 // memory access that faults is not counted: a load moved above it that
 // faults instead stops the program the same way.)
 fn may_stop(i: *ir.Value) bool {
-    // (inline assembly may trap, as a call may stop: it is never run where it was not)
-    if (i.op == ir.OP_CALL) or ((i.op == ir.OP_INTR) and (ir.inst_opaque(i) or (ir.intr_id(i) == ir.IN_ASM))) {
+    // (inline assembly may trap, as a call may stop: it is never run where
+    // it was not; but not a call that promises to return, ir.call_fx)
+    if ((i.op == ir.OP_CALL) and (ir.call_fx(i) == ir.FX_ANY)) or
+       ((i.op == ir.OP_INTR) and (ir.inst_opaque(i) or (ir.intr_id(i) == ir.IN_ASM))) {
         return true;
     }
     return ir.is_int_div(i.op) and not licm_speculatable(i);
@@ -4968,6 +5111,29 @@ fn hoist_ok(i: *mut ir.Value, tag: i64, in_header: bool) bool {
         for w in 0..writes.len {
             if may_alias(&l, writes.at(w)) {
                 return false;
+            }
+        }
+        return true;
+    }
+    if i.op == ir.OP_CALL {
+        // A call that promises to return and to write nothing (ir.call_fx),
+        // of invariant arguments: before the loop, when it runs whenever
+        // the loop is entered (in_header: in the header, before anything
+        // that may stop; never one in a block some iterations skip, so the
+        // call runs before the loop only where the program runs it at
+        // least once), and, for one that reads memory (FX_READS), when the
+        // loop writes nothing the callee may read (unseen_by: the loop's
+        // writes are those of note_writes; a call that may write is W_CALL
+        // there).
+        let fx = ir.call_fx(i);
+        if (fx == ir.FX_ANY) or not in_header or (i.ty.kind == ir.T_VOID) {
+            return false;
+        }
+        if fx == ir.FX_READS {
+            for w in 0..writes.len {
+                if not unseen_by(writes.at(w), i) {
+                    return false;
+                }
             }
         }
         return true;

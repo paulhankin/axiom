@@ -35,6 +35,14 @@ struct Note {
     nd_msg: []u8,
     maybe_unused: bool,
     noreturn: bool,  // a function declared _Noreturn or [[noreturn]]
+    // C23's [[unsequenced]] / [[reproducible]] on the function declarator of
+    // a declaration of it (6.7.13.8): its calls' effects (ir.FX_), see fx_of
+    unsequenced: bool,
+    reproducible: bool,
+    // a parameter declared `[static n]`: not null, and its first static_bytes
+    // bytes (0: a variable length) exist when the function is called
+    static_param: bool,
+    static_bytes: u64,
 }
 
 let mut g_notes: u.SymMap.[*mut Note] = u.SymMap.[*mut Note].{ keys: @ptr_from_int(*mut usize, 0),
@@ -139,6 +147,74 @@ pub fn mark_member(m: *cty.Member, list: *u.List.[*mut cast.Attr]) void {
     if u.notnil(m) and (list.len > 0) {
         record(@int_from_ptr(m), list);
     }
+}
+
+/// Records C23's attributes unsequenced and reproducible written after the
+/// parameter list of the declarator dcl of function s (its innermost
+/// derivation: `int f(int) [[unsequenced]];`).
+pub fn mark_functype(s: *cast.CSym, dcl: *cast.Declarator) void {
+    if u.isnil(s) or (dcl.derivs.len == 0) or (dcl.derivs.at(0).kind != cast.DerivKind.FUNCTION) {
+        return;
+    }
+    for a in dcl.derivs.at(0).attrs.items() {
+        if a.prefix.len > 0 {
+            continue;
+        }
+        let n = plain(a.name);
+        if u.str_eq(n, "unsequenced") {
+            note_of(@int_from_ptr(s), true).unsequenced = true;
+        } else if u.str_eq(n, "reproducible") {
+            note_of(@int_from_ptr(s), true).reproducible = true;
+        }
+    }
+}
+
+/// What the optimizer is told of the calls of function s by C23's
+/// unsequenced and reproducible (6.7.13.8): 2 (ir.FX_NONE: they read no
+/// memory and write none) for unsequenced, 1 (ir.FX_READS: they write no
+/// memory) for reproducible, 0 for nothing. Only for a function whose
+/// parameters all have arithmetic types and that is not variadic: the
+/// standard lets such a call access, and an effectless one modify, objects
+/// through lvalues based on its pointer parameters, which ir.Func.fx does
+/// not describe. (A function without either attribute, or with them on a
+/// typedef'd function type only, is told nothing.)
+pub fn fx_of(s: *cast.CSym) u8 {
+    if (g_notes.len == 0) or u.isnil(s) or u.isnil(s.ty) or not cty.is_func(s.ty) {
+        return 0;
+    }
+    let n = note_of(@int_from_ptr(s), false);
+    if u.isnil(n) or not (n.unsequenced or n.reproducible) or n.noreturn or s.ty.variadic or not s.ty.proto {
+        return 0;
+    }
+    for p in s.ty.params {
+        if not cty.is_arith(p) {
+            return 0;
+        }
+    }
+    if n.unsequenced {
+        return 2;
+    }
+    return 1;
+}
+
+/// Parameter s is declared `[static n]`, n elements of `bytes` bytes in all
+/// (0: not known, a variable length array's).
+pub fn set_static_param(s: *cast.CSym, bytes: u64) void {
+    let n = note_of(@int_from_ptr(s), true);
+    n.static_param = true;
+    n.static_bytes = bytes;
+}
+
+/// Was parameter s declared `[static n]`? Its bytes then (0: not known), or -1.
+pub fn static_param(s: *cast.CSym) i64 {
+    if (g_notes.len == 0) or u.isnil(s) {
+        return -1;
+    }
+    let n = note_of(@int_from_ptr(s), false);
+    if u.isnil(n) or not n.static_param {
+        return -1;
+    }
+    return @bit_cast(i64, n.static_bytes);
 }
 
 /// Function s is declared with the function specifier _Noreturn.

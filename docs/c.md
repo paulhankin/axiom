@@ -89,6 +89,7 @@ Axiom in one program").
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
 | `--c-asm-dialect=att\|intel` | The syntax of x86-64 inline and file-scope assembly (default `att`; "Inline assembly"). |
 | `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111` (it is ignored either way). |
+| `--c-keep-null-checks` | The optimizer is not told that a parameter the attribute `nonnull` names, or one declared `[static n]`, and the result of a function with `returns_nonnull`, are not null pointers: tests of them stay ("Optimization"). |
 | `--c-warn-format=0\|1\|2` | The checks of format strings ("Attributes": `format`): 0 none, 1 (the default) what is undefined or fails on any target (C4130, C4131, C4133), 2 also what is suspect (C4132, C4134, C4135). |
 | `-Idir` | Add a directory to the include path. |
 | `--c-freestanding` | A freestanding program: `__STDC_HOSTED__` is 0, only the freestanding headers are found (another is `C1081`), and no C library is linked ("The C library"). |
@@ -1609,11 +1610,15 @@ C4052 and is ignored.
 | `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to `--emit=obj` and `--emit=lib` objects (ELF: `STV_HIDDEN` for hidden and internal, `STV_DEFAULT` for the others), where another link sees it; no effect on an executable's own code. |
 | `noreturn` | functions | As `[[noreturn]]` (C4053). |
 | `noinline`, `always_inline` | functions | Given to the optimizer. |
-| `cold`, `hot` | functions | Given to the optimizer and the code generator: a block that calls a cold function (and the branch `__builtin_expect` says is unlikely) is laid out apart, as cold code. |
+| `cold`, `hot` | functions | Given to the optimizer and the code generator: a block that calls a cold function (and the branch `__builtin_expect` says is unlikely) is laid out apart, as cold code, and a call in it is inlined only when that makes the code smaller; the calls in a hot function, and those of one, are inlined up to twice the usual size. |
+| `optimize(n)`, `optimize("On")` | functions | The optimizer's level for the function (0 to 3; `"O"` and `"Og"` are 1, `"Os"` and `"Oz"` 2; other options are ignored, a malformed argument is C3077): its own passes run at that level, and below 2 it is not inlined, nor is anything inlined into it, nor are its parameters given constants. Code generation is the program's. |
+| `target("a,b")` | functions | Processor extensions its code may use besides the target's (the names of `--features`; one the target does not have is warning C4052, and is ignored): the code generator selects instructions with them, as for Axiom's `@multiversion` versions, and it is not inlined into code compiled for fewer. The optimizer's vector width stays the target's. |
 | `naked` | functions | The function is its asm statements (basic, or extended with no operands: else C3096): their text after a label of its name, with no prologue or epilogue ("Inline assembly"). |
-| `const`, `pure`, `malloc`, `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `sentinel`, `may_alias` | | Accepted; no effect (none is needed for correct code). The optimizer is not told what `const`, `pure`, `malloc`, `returns_nonnull`, `alloc_size`, `assume_aligned` and `nonnull` promise: it would act on a promise a program breaks (a `const` function that writes memory, a null result), and the IR has no way to say them. |
+| `const`, `pure` | functions | Given to the optimizer ("Optimization": what a function that promises to write nothing lets it do). |
+| `malloc`, `alloc_size(i)`, `alloc_size(i, j)`, `returns_nonnull` | functions returning a pointer | Given to the optimizer ("Optimization"). `malloc` with a deallocator argument is a pairing and says nothing to it. |
+| `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `alloc_align`, `assume_aligned`, `sentinel`, `may_alias` | | Accepted; no effect (none is needed for correct code). The alignments `alloc_align` and `assume_aligned` promise are recorded in the IR (`ir.Func.align_arg`, `ret_align`) but no pass uses them yet. |
 | `format(archetype, i, j)`, `format_arg(i)` | functions | The calls' format strings are checked (`--c-warn-format`): archetype `printf`, `scanf` or `strftime` (also `gnu_printf`, ...), the format parameter i, the first argument checked j (0: none, as for `vprintf`). The conversions are C23's (with `b`, `B`, `wN`, `wfN`, and the decimal floating types' `H`, `D` and `DD`) and POSIX's `%n$` positions. A literal format is checked against the arguments' types as this target has them: C4130 (an argument the conversion does not take), C4131 (too few), C4133 (not a conversion specification); at level 2 also C4132 (arguments left over), C4134 (a format that is not a literal) and C4135 (another type of the same size and kind, a flag the conversion ignores, `%n`). A call of a `format_arg` function with a literal is checked as that literal. The C library's declarations (`printf`, `scanf`, `strftime`, their kin) carry the attribute in every mode. |
-| `nonnull`, `nonnull(i, ...)` | functions | A null pointer constant passed for one of those parameters (all pointers without indexes) is warning C4121. |
+| `nonnull`, `nonnull(i, ...)` | functions | A null pointer constant passed for one of those parameters (all pointers without indexes) is warning C4121; in the function's definition the optimizer takes them for pointers that are not null ("Optimization"). |
 | `warn_unused_result` | functions | As `[[nodiscard]]` (C4051). |
 | `deprecated`, `deprecated("m")`, `unavailable` | declarations | As `[[deprecated]]` (C4050). |
 | `error("m")`, `warning("m")` | functions | A call is error C3091, or warning C4123. |
@@ -1955,7 +1960,7 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__builtin_choose_expr(c, a, b)` | a if the integer constant c is nonzero, else b (unconverted; the other is not checked). |
 | `__builtin_types_compatible_p(T1, T2)` | 1 if the types are compatible (top-level qualifiers aside). |
 | `__builtin_offsetof(T, m)` | As `offsetof`. |
-| `__builtin_object_size(p, t)`, `__builtin_dynamic_object_size` | The bytes from p to the end of the object (t 0, 2) or of the closest member (t 1, 3; a member array at the end of its structure counts to the object's end), when the expression shows the object: a declared object of a complete non-VLA type, a string literal or a compound literal, its address, its array decayed, an element at a constant index, a member, or such a pointer converted or offset by a constant (0 past the end). Otherwise unknown: `(size_t)-1` for t 0 and 1, 0 for 2 and 3 (no data flow is followed; an object whose type has a flexible array member is unknown). |
+| `__builtin_object_size(p, t)`, `__builtin_dynamic_object_size` | The bytes from p to the end of the object (t 0, 2) or of the closest member (t 1, 3; a member array at the end of its structure counts to the object's end), when the expression shows the object: a declared object of a complete non-VLA type, a string literal or a compound literal, its address, its array decayed, an element at a constant index, a member, or such a pointer converted or offset by a constant (0 past the end). Otherwise, when the argument has no side effects, the optimizer looks for the object after it has propagated the values (inlined, folded): a stack object, a global no other unit's definition can replace, a variable length array, the result of a call of a function with `alloc_size` (the argument, or the product of the two), with p at a constant offset from its start; for t 3 (the closest member's lower bound) it does not. A size known only when the program runs (a variable length array's, `alloc_size` of arguments that are not constants) is the answer of `__builtin_dynamic_object_size` only, computed there. Else unknown: `(size_t)-1` for t 0 and 1, 0 for 2 and 3 (an object whose type has a flexible array member is unknown; so is everything at `-O0` but what the expression shows and the variable length arrays). |
 | `__builtin_clz`, `ctz`, `popcount`, `parity`, `ffs`, `clrsb`, with `l` and `ll` | Of `unsigned int` (ffs, clrsb: `int`) ... `unsigned long long`; clz and ctz of 0 give the type's width. |
 | `__builtin_bswap16`, `bswap32`, `bswap64` | |
 | `__builtin_add_overflow`, `sub_overflow`, `mul_overflow(a, b, r)` | As `ckd_add(r, a, b)`; the typed `__builtin_sadd_overflow` ... `umulll_overflow`; `__builtin_add_overflow_p(a, b, c)` ... (whether the result overflows c's type). |
@@ -2007,7 +2012,8 @@ is the warning C4112 and is ignored; an unknown one is ignored (the warning C411
 | `GCC poison x y` | A later use of x or y is the error C1086 (not one a macro defined before makes). |
 | `GCC system_header` | The rest of the file gives no warnings (in the main file it means nothing). |
 | `GCC warning "m"`, `GCC error "m"` | The warning C4103, or the error C1040. |
-| `GCC push_options`, `pop_options`, `optimize`, `target`, `unroll`, `ivdep`, `novector`, `dependency` | Ignored: the optimization level and the extensions are the command line's for the whole program (a function that needs more extensions is Axiom's `@features`). |
+| `GCC push_options`, `pop_options`, `reset_options`, `optimize`, `target` | Ignored: they are not applied to the functions after them (the attributes `optimize` and `target` are, to the function they are on); with `--c-warn-unknown-pragmas` each is warning C4111. |
+| `GCC unroll`, `ivdep`, `novector`, `dependency` | Ignored. |
 
 `--emit=c-pp` writes the pragmas the later phases read, where they change what they say: `pack(n)` (the value then in force), `GCC visibility`, and the `weak` ones at the end; the others have acted already.
 
@@ -2111,8 +2117,8 @@ lock-free on every target: x86-64's locked instructions, AArch64's exclusive or 
 instructions, WebAssembly's atomic instructions. Objects of 16 bytes aligned to 16 (a
 structure of two `long long`, `__int128`, an 80-bit or 128-bit `long double`, `double
 _Complex`) are lock-free on AArch64 (an exclusive pair `LDAXP`/`STLXP` loop; a load
-stores back what it read, which makes the read single-copy atomic; LSE's `CASP` is not
-used) and on x86-64 (`lock cmpxchg16b`): inline when the target's extensions have it
+stores back what it read, which makes the read single-copy atomic; with LSE,
+`--features=+lse` or a processor that has it, a compare-exchange is one `CASP`) and on x86-64 (`lock cmpxchg16b`): inline when the target's extensions have it
 (`--cpu=x86-64-v2` and later, or `--features=+cmpxchg16b`); otherwise through a function
 that asks the processor once (cpuid) and uses the instruction, or the lock where the
 processor lacks it, so `atomic_is_lock_free` of such an object asks the processor (and
@@ -2584,7 +2590,50 @@ so `-O2` and `-O3` inline across them. A `restrict`-qualified pointer parameter 
 a register) tells the optimizer that what it reaches is not reached through another
 parameter, a global or a local object while the function runs (6.7.3.1): loads move out
 of loops past stores through it, and copy and vector loops need no overlap check. A
-pointer loaded from memory may hold its value, and is not taken as apart from it. Type-based
+pointer loaded from memory may hold its value, and is not taken as apart from it.
+
+A parameter that the attribute `nonnull` names (a GNU dialect), or that is declared
+`[static n]` (6.7.6.3p7), and the result of a call of a function declared
+`returns_nonnull`, are taken not to be null pointers: a test of one against null is
+folded (`--c-keep-null-checks` keeps them). A `[static n]` parameter's first n elements
+may also be read before a loop that reads them, whether or not the loop runs. The result
+of a function declared `malloc` is taken to point to an object that nothing that exists
+when the call returns points into: accesses through it are apart from accesses through
+the function's parameters, other stack and static objects and other such results
+(not from a pointer read from memory, which may hold its value).
+
+A path that ends in `unreachable()` (C23's `<stddef.h>`) or `__builtin_unreachable()`
+is one the program never takes. What the condition that leads to it says holds below
+the test (a value compared with a constant, or tested for its sign: later tests of it
+fold, and a signed division or remainder by a positive constant of a value that is not
+negative is the unsigned one); a switch whose default is such a path, or whose value
+those conditions keep among its cases' values, has no range check before its table
+or jump table; and once the switches are made, the tests that lead to such a path
+are left out. A path that only reaches a trap (`__builtin_trap()`, a call of a function
+that does not return) is not one of these: its test stays.
+
+A function declared with the attribute `const` (a GNU dialect), or with C23's
+`[[unsequenced]]` after its parameter list, promises that its calls read no memory and
+write none; `pure`, or `[[reproducible]]`, that they write none (they may read any).
+Either promise also says that a call returns: it does not loop forever, end the program
+or `longjmp` out (this compiler's rule for these attributes; a function also declared
+`_Noreturn` or `[[noreturn]]` is not taken at its word). On it the optimizer removes a
+call whose result is unused, makes one call of two with the same arguments (for `pure`
+and `[[reproducible]]` only when nothing that may write what the function can read comes
+between them: a store to a global, through a pointer the program computed, a call that
+may write; not a store to a local whose address is never taken, nor one through a
+`restrict` parameter of the caller that no argument may be based on), and makes a call
+in a loop before the loop when the loop writes nothing it reads and the call runs each
+time the loop is entered (in its first block, before anything that may stop the loop; a
+call on a path that some iterations skip, or in a loop whose body may not run at all, is
+not made where it was not). C23's attributes are used only on the function declarator
+of a declaration or definition of a function whose parameters all have arithmetic
+types and that is not variadic (C23 lets a call of such a function access, and an
+effectless one modify, what its pointer parameters point to); through a pointer to a
+function, or a typedef, they are not used. A call of a function of another type than
+its declaration's, or through a pointer, is not acted on, nor one whose result is a
+structure or union, or that passes one in registers (one passed in memory, which the
+callee reads, makes `const` a `pure`). Type-based
 aliasing is not used (an `int *` and a `float *` may reach the same bytes). The levels do not change the behavior of a
 program that has no undefined behavior; they differ in speed and size, and in how
 complete a stack trace is after a crash.

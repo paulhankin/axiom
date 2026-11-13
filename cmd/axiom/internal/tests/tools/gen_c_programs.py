@@ -2,7 +2,7 @@
 """Writes a random C program free of undefined behaviour, for differential
 testing of the C front end against another implementation:
 
-    gen_c_programs.py SEED [--no-long] [--loops] [--hosted]
+    gen_c_programs.py SEED [--no-long] [--loops] [--hosted] [--attrs]
 
 The program is freestanding (it prints through host.h's print_u64) and
 prints a checksum of its globals after each call from main. With --loops
@@ -25,7 +25,10 @@ is a hosted one, for the C library's differential testing: it prints with
 printf, and each checksum also goes through the library (snprintf's %llx,
 %.17g and %a of the values, strtoull's and strtod's readings back, and the
 string functions over them), which a mismatch with the other implementation
-then shows.
+then shows. With --attrs (for a GNU dialect of C23: --c-std=gnu23) the
+functions that write only their locals are declared with the attribute
+pure, or, when their parameters are all scalars, C23's [[reproducible]],
+for the optimizer to act on (they read globals; they always return).
 """
 import random
 import sys
@@ -101,6 +104,7 @@ def common(a, b):
 
 class Gen:
     def __init__(self, seed, no_long, loops=False):
+        self.attrs = False
         self.r = random.Random(seed)
         self.no_long = no_long
         self.loops = loops
@@ -853,6 +857,11 @@ class Gen:
                 body.append('        (void)%s;' % call)
             body.append('    }')
         body.append('    return %s;' % self.ret_value(ret, env, variadic))
+        if pure and self.attrs and self.chance(0.7):
+            if self.chance(0.5) and not any(pt.startswith('struct ') for (_, pt) in params):
+                sig += ' [[reproducible]]'
+            else:
+                sig = '__attribute__((pure)) ' + sig
         self.out.append('static ' + sig + ' {')
         self.out.extend(body)
         self.out.append('}')
@@ -1012,6 +1021,7 @@ def main():
     no_long = '--no-long' in sys.argv
     g = Gen(seed, no_long, '--loops' in sys.argv)
     g.hosted = '--hosted' in sys.argv
+    g.attrs = '--attrs' in sys.argv
     sys.stdout.write(g.program())
 
 

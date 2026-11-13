@@ -878,6 +878,140 @@ fn fold_float_bin(i: *mut ir.Value) *mut ir.Value {
     return ir.cfp(i.ty, r);
 }
 
+// -----------------------------------------------------------------------------
+// C's object sizes (ir.IN_OBJSIZE(p, kind, dynamic)): the object p points
+// into, at a constant offset from its start (through ptradds of constants):
+// a stack slot (its type's bytes), a global defined in the program that no
+// other definition can replace (internal, or external with its
+// initializer), a variable length array (IN_STACK_ALLOC's bytes), or the
+// result of a direct call of a function with Func.size_args (C's
+// alloc_size: an argument, or the product of two, as size_t). The answer is
+// the object's bytes less the offset (0 before its start or past its end).
+// It is exact for the whole object, so it serves kinds 0 and 2, and kind 1
+// (an upper bound for the closest subobject); kind 3, a lower bound for the
+// subobject, which the IR does not show, is left unknown. A size known only
+// at run time (a variable length array, alloc_size of variables) is
+// computed for dynamic only (__builtin_dynamic_object_size), as soon as the
+// object is found (inlining may take the call of an allocating function
+// away); for the static form it is unknown, and is given only at the end
+// (last: passes.finish_funcs), where the size may have become a constant,
+// as is the unknown answer.
+// -----------------------------------------------------------------------------
+/// The value of object size intrinsic i at the builder bd's place, or nil
+/// (last: the end, where nil is never the answer).
+pub fn objsize(bd: *mut ir.Builder, i: *mut ir.Value, last: bool) *mut ir.Value {
+    let t = i.ty;
+    let kind = ir.cint_val(i.xs.get(1));
+    let dynamic = ir.cint_val(i.xs.get(2)) != 0;
+    make_insts = dynamic;
+    let mut unknown = ir.cint(t, 0);
+    if kind < 2 {
+        unknown = ir.cones(t);
+    }
+    let mut p = ir.resolve(i.xs.get(0));
+    let mut off: i64 = 0;
+    let mut n: i32 = 0;
+    while ir.is_op(p, ir.OP_PTRADD) and ir.is_cint(p.b) and (n < 64) {
+        off = off +% ir.sval(p.b);
+        p = ir.resolve(p.a);
+        n += 1;
+    }
+    let mut size = vnil();  // the object's bytes, as size_t
+    if kind != 3 {
+        if ir.is_op(p, ir.OP_ALLOCA) {
+            size = ir.cint(t, ir.aty_of(p).size);
+        } else if (p.kind == ir.V_GLOBAL) and u.notnil(ir.gv_of(p).init) and
+                  ((ir.gv_of(p).linkage == ir.LINK_INTERNAL) or (ir.gv_of(p).linkage == ir.LINK_EXTERNAL)) {
+            size = ir.cint(t, ir.gv_of(p).ty.size);
+        } else if ir.is_op(p, ir.OP_INTR) and (ir.intr_id(p) == ir.IN_STACK_ALLOC) {
+            size = p.xs.get(0);
+        } else if ir.is_op(p, ir.OP_CALL) {
+            let f = ir.direct_callee(p);
+            if u.notnil(f) and (f.size_args[0] > 0) and (@as(usize, @bit_cast(u8, f.size_args[0])) <= p.xs.len) and
+               (@as(usize, @bit_cast(u8, f.size_args[1])) <= p.xs.len) {
+                size = as_size(bd, p.xs.get(@as(usize, @bit_cast(u8, f.size_args[0])) - 1), t);
+                if u.notnil(size) and (f.size_args[1] > 0) {
+                    let y = as_size(bd, p.xs.get(@as(usize, @bit_cast(u8, f.size_args[1])) - 1), t);
+                    if u.isnil(y) {
+                        size = vnil();
+                    } else if ir.is_cint(size) and ir.is_cint(y) {
+                        size = ir.cint(t, (ir.cint_val(size) *% ir.cint_val(y)) & ir.mask_bits(t.bits));
+                    } else if dynamic {
+                        size = ir.mul(bd, size, y);
+                    } else {
+                        size = vnil();
+                    }
+                }
+            }
+        }
+    }
+    if u.isnil(size) or not (ir.is_cint(size) or dynamic) {
+        if last {
+            return unknown;
+        }
+        return vnil();
+    }
+    if ir.is_cint(size) {
+        let s = ir.cint_val(size);
+        if (off < 0) or (@bit_cast(u64, off) > s) {
+            return ir.cint(t, 0);
+        }
+        return ir.cint(t, s - @bit_cast(u64, off));
+    }
+    if off < 0 {
+        return ir.cint(t, 0);
+    }
+    let k = ir.cint(t, @bit_cast(u64, off));
+    return ir.select(bd, ir.icmp(bd, ir.IntUGE, size, k), ir.sub(bd, size, k), ir.cint(t, 0));
+}
+
+let mut make_insts: bool = false;
+
+/// The object size intrinsics left in f: their values (objsize's last).
+pub fn finish_objsizes(f: *mut ir.Func) void {
+    let mut bd = u.nil.[ir.Builder]();
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let next = i.next;
+            if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_OBJSIZE) {
+                if u.isnil(bd) {
+                    bd = ir.new_builder();
+                }
+                ir.at_before(bd, i);
+                let r = objsize(bd, i, true);
+                ir.forward(i, r);
+                ir.remove_inst(i);
+            }
+            i = next;
+        }
+        b = b.next;
+    }
+    ir.apply_forwarding(f);
+}
+
+// Integer x as a value of size_t t (zero-extended or truncated), or nil
+// (before the end, a variable: no instruction is made then).
+fn as_size(bd: *mut ir.Builder, x: *mut ir.Value, t: *mut ir.Ty) *mut ir.Value {
+    if x.ty.kind != ir.T_INT {
+        return vnil();
+    }
+    if ir.is_cint(x) {
+        return ir.cint(t, ir.cint_val(x) & ir.mask_bits(t.bits));
+    }
+    if not make_insts {
+        return vnil();  // (no instruction made for the static form)
+    }
+    if x.ty.bits < t.bits {
+        return ir.zext(bd, x, t);
+    }
+    if x.ty.bits > t.bits {
+        return ir.trunc(bd, x, t);
+    }
+    return x;
+}
+
 // A constant for i, or nil.
 fn fold(i: *mut ir.Value) *mut ir.Value {
     let op = i.op;
@@ -886,6 +1020,9 @@ fn fold(i: *mut ir.Value) *mut ir.Value {
     }
     let B = FB;
     ir.at_before(B, i);
+    if ir.is_op(i, ir.OP_INTR) and (ir.intr_id(i) == ir.IN_OBJSIZE) {
+        return objsize(B, i, false);
+    }
     if ir.is_int_binop(op) or (op == ir.OP_ICMP) {
         if (i.ty.kind == ir.T_VEC) and u.notnil(i.a) and u.notnil(i.b) {
             return fold_vec(i);
@@ -1119,7 +1256,9 @@ pub fn dce(f: *mut ir.Func) void {
         let mut i = b.first;
         while u.notnil(i) {
             i.aux = 0;
-            if ir.has_effects(i) or (i.op == ir.OP_ALLOCA) {
+            // (a call that promises to return and to write nothing,
+            // ir.call_fx, is removed when its result is unused)
+            if (ir.has_effects(i) and (ir.call_fx(i) == ir.FX_ANY)) or (i.op == ir.OP_ALLOCA) {
                 i.aux = 1;
                 work.push(i);
             }

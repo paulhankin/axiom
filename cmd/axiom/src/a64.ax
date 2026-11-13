@@ -1641,10 +1641,17 @@ fn gen_cmpxchg(v: *mut ir.Value) void {
 // bytes; if they are e's, STLXP / STXP stores d's (again if the store
 // fails); if not, the same instruction stores back what was read, which
 // makes the read single-copy atomic (an exclusive pair's load alone is not,
-// before LSE2), and the value goes to e. (LSE's CASP would do it in one
-// instruction, but takes fixed even-odd register pairs, two of which the
-// register allocator does not see: not used.)
+// before LSE2), and the value goes to e. With LSE, one CASP: its pairs in
+// the fixed registers x0, x1 (e's bytes, then the old ones) and x2, x3
+// (d's), each pair named in the instruction by its first register and all
+// four given to the register allocator as operands of the RAW (whose
+// operands after the fourth are not encoded); e is written only when the
+// old bytes differ.
 fn gen_cas16(v: *mut ir.Value) void {
+    if LSE_ {
+        gen_casp(v);
+        return;
+    }
     let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
     let acq = ir.ord_acquires(ord);
     let rel = ir.ord_releases(ord);
@@ -1683,6 +1690,44 @@ fn gen_cas16(v: *mut ir.Value) void {
     place(differ);
     _ = raw(ae.stxp(rel, 0, 0, 0, 0), R(lo), R(a), mc.reg(st, mc.RD | mc.RE), R(hi));
     loop_branch(CBZ, 1, st, lp, uses[..]);
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 0), R(lo));
+    _ = e2(STR, 8, mc.mem(e, -1, 0, 8), R(hi));
+    place(done);
+}
+
+fn gen_casp(v: *mut ir.Value) void {
+    let ord = ir.ord_join(ir.order(v), ir.fail_order(v));
+    let a = reg(v.xs.get(0));
+    let e = reg(v.xs.get(1));
+    let d = reg(v.xs.get(2));
+    let el = vgpr();
+    let eh = vgpr();
+    _ = e2(LDR, 8, W(el), mc.mem(e, -1, 0, 0));
+    _ = e2(LDR, 8, W(eh), mc.mem(e, -1, 0, 8));
+    copy(X0, el, GPR);
+    copy(X0 + 1, eh, GPR);
+    _ = e2(LDR, 8, W(X0 + 2), mc.mem(d, -1, 0, 0));
+    _ = e2(LDR, 8, W(X0 + 3), mc.mem(d, -1, 0, 8));
+    // (Rt: x2 in bits 0-4, Rn: a, Rs: x0 in bits 16-20; x1 and x3 only for
+    // the allocator)
+    let ops: [6]mc.MOp = [R(X0 + 2), R(a), RW(X0), NONE(), RW(X0 + 1), R(X0 + 3)];
+    let ci = emit(RAW, 0, ops[..]);
+    ci.aux = @bit_cast(i64, ae.casp(ir.ord_acquires(ord), ir.ord_releases(ord), 0, 0, 0));
+    let lo = vgpr();
+    let hi = vgpr();
+    copy(lo, X0, GPR);
+    copy(hi, X0 + 1, GPR);
+    let t1 = vgpr();
+    let t2 = vgpr();
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t1, lo, el);  // eor
+    raw3(ae.logic_reg(1, 2, false, 0, 0, 0, 0, 0), t2, hi, eh);
+    raw3(ae.logic_reg(1, 1, false, 0, 0, 0, 0, 0), t1, t1, t2);  // orr
+    let ok = vreg(v);
+    movi(ok, 1, 0);
+    let done = new_label();
+    let uses: [5]i32 = [e, lo, hi, ok, t1];
+    loop_branch(CBZ, 0, t1, done, uses[..]);  // (cbz: the same, stored)
+    movi(ok, 0, 0);
     _ = e2(STR, 8, mc.mem(e, -1, 0, 0), R(lo));
     _ = e2(STR, 8, mc.mem(e, -1, 0, 8), R(hi));
     place(done);
@@ -5201,7 +5246,7 @@ fn enc_inst(i: *mut mc.MInst) void {
     if op == RAW {
         let mut w = @bit_cast(u64, i.aux);
         let shifts: [4]u64 = [0, 5, 16, 10];
-        for k in 0..i.ops.len {
+        for k in 0..@min(i.ops.len, 4) {
             let o = i.ops[k];
             if o.kind == mc.K_REG {
                 w = w | (ae.r5(P(o.reg)) << shifts[k]);

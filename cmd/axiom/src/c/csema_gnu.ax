@@ -29,6 +29,7 @@
 // and is ignored. vector_size(n) and the vector modes make vector types (csema_vec.ax).
 // Invalid arguments are C3077.
 // =============================================================================
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cfeat.ax" as cf;
@@ -57,7 +58,16 @@ pub struct Note {
     always_inline: bool,
     cold: bool,
     hot: bool,
-    naked: bool,  // a function whose body is basic asm only: no prologue or epilogue (cgen_asm.ax)
+    opt_level: i32,       // optimize(n): the optimizer's level for the function (-1: the program's)
+    target: []u8,         // target("a,b"): the extensions its code may use besides the target's (empty: none)
+    is_const: bool,       // const: a call reads no memory and writes none (ir.FX_NONE)
+    is_pure: bool,        // pure: a call writes no memory (ir.FX_READS)
+    ret_nonnull: bool,    // returns_nonnull: the result is not null (ir.Func.ret_nonnull)
+    malloc: bool,         // malloc: the result points to an object nothing else points into (ir.Func.allocator)
+    alloc_size: [2]i32,   // alloc_size(i [, j]): the parameters (from 1; 0: none) whose product is the result's size
+    alloc_align: i32,     // alloc_align(i): the parameter (from 1) that is the result's alignment, or 0
+    assume_aligned: u64,  // assume_aligned(n): the result's alignment (0: none)
+    naked: bool,          // a function whose body is basic asm only: no prologue or epilogue (cgen_asm.ax)
     ctor: bool,
     ctor_prio: i32,  // 65535 without a priority (after those with one)
     dtor: bool,
@@ -87,6 +97,7 @@ fn note_at(p: usize, make: bool) *mut Note {
         n = u.new.[Note]();
         n.ctor_prio = 65535;
         n.dtor_prio = 65535;
+        n.opt_level = -1;
         g_notes.put(k, n);
     }
     return n;
@@ -197,12 +208,45 @@ fn one_of(n: []u8, names: [][]u8) bool {
 }
 
 // The attributes of functions only.
-let FUNC_ATTRS: [32][]u8 = ["noreturn", "noinline", "always_inline", "const", "pure", "malloc", "format", "format_arg",
+let FUNC_ATTRS: [33][]u8 = ["noreturn", "noinline", "always_inline", "const", "pure", "malloc", "format", "format_arg",
                             "nonnull", "returns_nonnull", "warn_unused_result", "constructor", "destructor",
                             "gnu_inline", "artificial", "nothrow", "leaf", "externally_visible",
                             "no_instrument_function", "flatten", "noclone", "noipa", "sentinel", "alloc_size",
                             "alloc_align", "assume_aligned", "error", "warning", "nodiscard", "returns_twice",
-                            "optimize", "naked"];
+                            "optimize", "naked", "target"];
+
+// The level optimize(...) asks for: 0 to 3 (an integer, or "O0" ... "O3",
+// "-O2", "Os" and "Oz" as 2, "Og" and "O" as 1), -1 for options it does not
+// know (other strings: ignored), -2 when the argument is none of those forms.
+fn opt_level_of(a: *cast.Attr) i32 {
+    if a.has_args and (a.args.len == 1) and (a.args[0].kind == ct.T_INT) {
+        if a.args[0].ival <= 3 {
+            return @truncate(i32, @bit_cast(i64, a.args[0].ival));
+        }
+        return -2;
+    }
+    let s0 = string_arg(a);
+    if u.isnos(s0) {
+        return -2;
+    }
+    let mut s = s0;
+    if (s.len > 0) and (s[0] == '-') {
+        s = s[1..];
+    }
+    if u.str_eq(s, "O") or u.str_eq(s, "Og") or u.str_eq(s, "O1") {
+        return 1;
+    }
+    if u.str_eq(s, "Os") or u.str_eq(s, "Oz") or u.str_eq(s, "O2") {
+        return 2;
+    }
+    if u.str_eq(s, "O0") {
+        return 0;
+    }
+    if u.str_eq(s, "O3") {
+        return 3;
+    }
+    return -1;
+}
 
 /// Checks GNU attribute a, which appertains to `what` (a dsp.AP_ constant):
 /// its place and its arguments. In a mode that is no GNU dialect, an
@@ -357,6 +401,21 @@ fn check_args(a: *mut cast.Attr, n: []u8) void {
         return;
     }
     if u.str_eq(n, "optimize") {
+        if opt_level_of(a) < -1 {
+            bad_args(a, "a level 0 to 3, or \"O0\" ... \"O3\", \"Os\", \"Og\"");
+        }
+        return;
+    }
+    if u.str_eq(n, "target") {
+        let s = string_arg(a);
+        if u.isnos(s) {
+            bad_args(a, "a string literal of extensions");
+            return;
+        }
+        let r = tg.parse_features(s);
+        if not u.isnos(r.bad) {
+            cs.warn(a.span, "C4052", u.f1("the extension '%s' is not one this target has, and is ignored", r.bad));
+        }
         return;
     }
     if a.has_args and ((a.args.len > 0) or (a.exprs.len > 0)) {
@@ -615,7 +674,8 @@ fn record(p: usize, a: *mut cast.Attr, what: i32) void {
     let n = cf.plain(a.name);
     let rec = ["section", "alias", "weak", "used", "visibility", "noinline", "always_inline", "cold", "hot",
                "constructor", "destructor", "cleanup", "nonnull", "error", "warning", "packed", "aligned",
-               "transparent_union", "format", "naked", "format_arg"];
+               "transparent_union", "format", "naked", "format_arg", "const", "pure", "returns_nonnull", "malloc",
+               "alloc_size", "alloc_align", "assume_aligned", "optimize", "target"];
     if not one_of(n, rec[..]) {
         return;
     }
@@ -648,6 +708,41 @@ fn record(p: usize, a: *mut cast.Attr, what: i32) void {
         x.cold = true;
     } else if u.str_eq(n, "hot") {
         x.hot = true;
+    } else if u.str_eq(n, "const") {
+        x.is_const = true;
+    } else if u.str_eq(n, "pure") {
+        x.is_pure = true;
+    } else if u.str_eq(n, "optimize") {
+        if opt_level_of(a) >= 0 {
+            x.opt_level = opt_level_of(a);
+        }
+    } else if u.str_eq(n, "target") {
+        if not u.isnos(string_arg(a)) {
+            x.target = string_arg(a);
+        }
+    } else if u.str_eq(n, "returns_nonnull") {
+        x.ret_nonnull = true;
+    } else if u.str_eq(n, "malloc") {
+        x.malloc = a.exprs.len == 0;  // (malloc(deallocator): a pairing, which says nothing of aliases)
+    } else if u.str_eq(n, "alloc_size") or u.str_eq(n, "alloc_align") or u.str_eq(n, "assume_aligned") {
+        let mut vs: [2]u64 = [0, 0];
+        let mut ok = (a.exprs.len >= 1) and (a.exprs.len <= 2);
+        for k in 0..a.exprs.len {
+            let e = a.exprs.get(k);
+            if ok and (k < 2) and u.notnil(e.ty) and e.is_const and (e.cval <= 0xffff) {
+                vs[k] = e.cval;
+            } else {
+                ok = false;
+            }
+        }
+        if ok and u.str_eq(n, "alloc_size") and (vs[0] >= 1) {
+            x.alloc_size = [@truncate(i32, @bit_cast(i64, vs[0])), @truncate(i32, @bit_cast(i64, vs[1]))];
+        } else if ok and u.str_eq(n, "alloc_align") and (a.exprs.len == 1) and (vs[0] >= 1) {
+            x.alloc_align = @truncate(i32, @bit_cast(i64, vs[0]));
+        } else if ok and u.str_eq(n, "assume_aligned") and (vs[0] != 0) and ((vs[0] & (vs[0] - 1)) == 0) and
+                  ((a.exprs.len == 1) or (vs[1] == 0)) {
+            x.assume_aligned = vs[0];  // (assume_aligned(n, k) with k != 0 says less: not used)
+        }
     } else if u.str_eq(n, "constructor") or u.str_eq(n, "destructor") {
         let mut prio: i32 = 65535;
         if a.exprs.len == 1 and u.notnil(a.exprs.get(0).ty) and a.exprs.get(0).is_const {

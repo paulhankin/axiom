@@ -654,6 +654,17 @@ pub const IN_CMPXCHG_OK: i32 = 115;
 // must have: cgen_atomic.ax checks) and AArch64 (an exclusive pair, or
 // LSE's CASP). Opaque: never moved or removed.
 pub const IN_CAS16: i32 = 116;
+// IN_OBJSIZE(p, kind, dynamic) -> size_t: C's __builtin_object_size(p, kind)
+// (dynamic 0) or __builtin_dynamic_object_size(p, kind) (1), kind and dynamic
+// constants: the bytes from p to the end of the object it points into, when
+// that object is seen in the IR (opt.objsize: a stack slot, a defined
+// global, a variable length array, a call of a function with
+// Func.size_args), else the unknown answer ((size_t)-1 for kinds 0 and 1, 0
+// for 2 and 3). Only the C front end makes it, where the expression does not
+// show the object (csema_gbuiltin.ax); the passes fold it where they find the
+// object, and the last pass over a function (passes.finish_funcs) at every
+// level folds what is left, so no backend sees it. Pure.
+pub const IN_OBJSIZE: i32 = 117;
 
 pub fn is_widen(id: i32) bool {
     return (id >= IN_SWIDEN_LO) and (id <= IN_UWIDEN_HI);
@@ -789,7 +800,7 @@ pub const INF_LANEWISE: u32 = 32;   // PURE, and the same operation on each lane
 
 const INF_LANES: u32 = INF_PURE | INF_LANEWISE;
 
-let IN_PROPS: [117]u32 = [
+let IN_PROPS: [118]u32 = [
     0,               // (no intrinsic 0)
     INF_LANES,       // IN_CTLZ
     INF_LANES,       // IN_CTTZ
@@ -907,6 +918,7 @@ let IN_PROPS: [117]u32 = [
     INF_OPAQUE,      // IN_SJLJ_ENV
     INF_HINT,        // IN_CMPXCHG_OK
     INF_OPAQUE,      // IN_CAS16
+    INF_PURE,        // IN_OBJSIZE
 ];
 
 // Inline assembly (IN_ASM, whose first operand is its index in asm/inline.ax's
@@ -1044,7 +1056,7 @@ pub fn can_copy_block(b: *Block) bool {
 }
 
 pub fn intr_props(id: i32) u32 {
-    if (id < 0) or (id > IN_CAS16) {
+    if (id < 0) or (id > IN_OBJSIZE) {
         return 0;
     }
     return IN_PROPS[@int_cast(usize, id)];
@@ -1317,6 +1329,11 @@ pub const F_NO_WRAP: u32 = 24;
 // it). A copy of the function's body elsewhere (inlining) has no
 // parameter, so the fact is not carried there.
 pub const F_NOALIAS: u32 = 0x10000;
+// F_NONNULL: a pointer parameter that is never null when the function is
+// called (C's attribute nonnull, a parameter declared `[static n]`: a call
+// with a null pointer there is undefined): passes may fold a test of it
+// against null (known_nonnull). Not carried to a copy of the body elsewhere.
+pub const F_NONNULL: u32 = 0x20000;
 // Alloca flags
 pub const F_VAR: u32 = 32;  // a C variable: -O0 keeps it in memory (opt.mem2reg), where debuggers find it
 // An fcmp of an ordered relation (<, <=, >, >=) that signals: "invalid" for
@@ -1988,7 +2005,7 @@ pub struct Func {
     // optimized (its objects stay in memory, their slots apart), not inlined,
     // no sibling calls or shrink-wrapping (passes.ax, inline.ax, the backends)
     returns_twice: bool,
-    hot: bool,       // C's attribute hot: a hint (no pass reads it yet)
+    hot: bool,       // C's attribute hot: the inliner allows its calls, and the calls in it, twice the size
     section: []u8,   // the object file section it goes in (C's attribute section), or empty
     visibility: u8,  // C's attribute visibility (and #pragma GCC visibility): VIS_
     // its floating-point operations read and write the floating-point
@@ -1997,7 +2014,39 @@ pub struct Func {
     // mode of that moment, and raises its exceptions, so the passes do not
     // fold, merge, move or remove them (fp_pinned)
     strict_fp: bool,
+    // what a call of it does besides computing its result, as its
+    // declaration promises (FX_: C's attributes const and pure, C23's
+    // unsequenced and reproducible; call_fx says when a pass may act on it)
+    fx: u8,
+    // the optimizer's level for it, plus one (C's attribute optimize: the
+    // passes over it alone run at that level, passes.level_of; it is not
+    // inlined, nor is anything inlined into it, below 2), or 0: the program's
+    opt_override: u8,
+    ret_nonnull: bool,  // its result is never a null pointer (C's returns_nonnull): known_nonnull
+    // C's alloc_size, alloc_align and assume_aligned: the result's size is
+    // the product of parameters size_args[0] - 1 and (when nonzero)
+    // size_args[1] - 1, its alignment ret_align, or parameter align_arg - 1
+    // (0: none known). Read by the object-size intrinsic's folding (opt.ax)
+    // and for the alignment of accesses (gvn.ax)
+    size_args: [2]i8,
+    align_arg: i8,
+    ret_align: u64,
+    // [static n] parameters: param_bytes[k] bytes from parameter k's address
+    // may be read whenever the function runs (empty: none known); gvn.deref_ok
+    param_bytes: []mut u64,
 }
+
+// Func.fx: what a call may do. A function with FX_READS or FX_NONE is taken
+// to return to its caller (the documented rule of those attributes: a call
+// of it is never the last thing the program does), to write no memory that
+// exists when it is called, and to have no other observable effect: passes
+// may remove a call whose result is unused, take an earlier call's result
+// for a later call with the same arguments (FX_READS: when nothing that may
+// write memory the callee can see came between them), and move a call out
+// of a loop that runs it each time the loop is entered (gvn.ax).
+pub const FX_ANY: u8 = 0;    // anything (no promise)
+pub const FX_READS: u8 = 1;  // reads memory, writes none (pure, reproducible)
+pub const FX_NONE: u8 = 2;   // reads no memory but its arguments' values (const, unsequenced)
 
 // Symbol visibilities (Func.visibility, Global.visibility: the ELF and
 // Mach-O meanings; the object writers decide what each target makes of them).
@@ -4493,6 +4542,59 @@ pub fn direct_callee(v: *Value) *mut Func {
         }
     }
     return f;
+}
+
+/// Is pointer v known not to be null: the address of a stack slot, a
+/// parameter with F_NONNULL, or the result of a direct call of a function
+/// with ret_nonnull? (Not the address of a global or a function: a weak
+/// reference may be null, and on WebAssembly address 0 and table index 0
+/// are where objects or functions may be.)
+pub fn known_nonnull(v0: *mut Value) bool {
+    let v = resolve(v0);
+    if u.isnil(v) or (v.ty.kind != T_PTR) {
+        return false;
+    }
+    if v.kind == V_PARAM {
+        return (v.flags & F_NONNULL) != 0;
+    }
+    if v.kind != V_INST {
+        return false;
+    }
+    if v.op == OP_ALLOCA {
+        return true;
+    }
+    if v.op == OP_CALL {
+        let f = direct_callee(v);
+        return u.notnil(f) and f.ret_nonnull and (ext_of(v).len > 0) and (ext_of(v)[0] == 0);
+    }
+    return false;
+}
+
+/// What call v may do (FX_), as its callee's declaration promises: FX_ANY
+/// unless it is a direct call of a function with Func.fx whose arguments
+/// and result are scalars (no aggregate's memory: a result written to the
+/// caller's slot is a write; an aggregate passed by value is read from its
+/// copy, so FX_NONE is FX_READS then) and that neither returns twice nor is
+/// declared not to return. An indirect call promises nothing.
+pub fn call_fx(v: *Value) u8 {
+    if (v.kind != V_INST) or (v.op != OP_CALL) {
+        return FX_ANY;
+    }
+    let f = direct_callee(v);
+    if u.isnil(f) or (f.fx == FX_ANY) or f.noreturn or f.returns_twice {
+        return FX_ANY;
+    }
+    let mut fx = f.fx;
+    let ext = ext_of(v);
+    for k in 0..ext.len {
+        let e = ext[k];
+        if (e == EXT_BYVAL) and (k > 0) {
+            fx = FX_READS;
+        } else if e > 2 {
+            return FX_ANY;
+        }
+    }
+    return fx;
 }
 
 pub fn intr(bd: *mut Builder, id: i32, t: *mut Ty, args: []mut *mut Value) *mut Value {

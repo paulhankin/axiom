@@ -33,6 +33,7 @@ import "cgen_abi.ax" as abi;
 import "cgen_debug.ax" as cdbg;
 import "cldbl.ax" as cl;
 import "csema.ax" as cs;
+import "csema_attr.ax" as catr;
 import "csema_gnu.ax" as cgn;
 import "csema_marks.ax" as csm;
 import "ctypes.ax" as cty;
@@ -468,6 +469,9 @@ pub fn func_of(s: *mut cast.CSym, sig0: Sig) *mut ir.Func {
         f.import_name = name;
     }
     gnu_func(s, f);
+    if u.notnil(sig.plan) {
+        alloc_facts(s, f, sig.plan);
+    }
     if u.isnil(s.def) and (s.linkage == cast.LK_EXTERNAL) and tg.is_windows() {
         c_library_import(name);
     }
@@ -601,9 +605,22 @@ fn note_alias(s: *mut cast.CSym) void {
     }
 }
 
-// The IR function f of C function s: what its GNU attributes ask.
+// The IR function f of C function s: what its GNU attributes ask, and
+// C23's unsequenced and reproducible (catr.fx_of).
 fn gnu_func(s: *mut cast.CSym, f: *mut ir.Func) void {
+    let mut fx = catr.fx_of(s);
     let n = cgn.note_of(s);
+    // const and pure: ir.Func.fx, the promise of a function that returns
+    // (not one declared not to: catr.is_noreturn, which ir.call_fx would
+    // see only once the IR's noreturn is set)
+    if u.notnil(n) and not catr.is_noreturn(s) {
+        if n.is_const {
+            fx = ir.FX_NONE;
+        } else if n.is_pure and (fx == ir.FX_ANY) {
+            fx = ir.FX_READS;
+        }
+    }
+    f.fx = @max(f.fx, fx_by_abi(s.ty, fx));
     if u.isnil(n) {
         return;
     }
@@ -619,6 +636,15 @@ fn gnu_func(s: *mut cast.CSym, f: *mut ir.Func) void {
     if n.hot {
         f.hot = true;
     }
+    if n.opt_level >= 0 {
+        f.opt_override = @truncate(u8, @bit_cast(u32, n.opt_level + 1));
+    }
+    if n.target.len > 0 {
+        // (the target's extensions and these: the backends compile it so,
+        // and the inliner does not put it into code compiled for less)
+        f.features = tg.fn_features(f) | tg.parse_features(n.target).bits;
+        f.has_features = true;
+    }
     if n.section.len > 0 {
         f.section = u.perm_dup(n.section);  // (for the object writers; the syntax tree is given back first)
     }
@@ -628,6 +654,89 @@ fn gnu_func(s: *mut cast.CSym, f: *mut ir.Func) void {
     }
     if n.used and u.notnil(s.def) {
         keep(f.val);
+    }
+}
+
+// What a call of a function of type t may be said to do (fx, ir.FX_) as the
+// platforms' calling conventions pass it: nothing for a result that is not
+// a plain scalar (a structure, union, complex or long double result may be
+// written to the caller's memory through an address that is an ordinary
+// argument in the IR, which ir.call_fx cannot tell from others); FX_READS at
+// most when a parameter is not one (it may be passed as the address of a
+// copy, which the callee reads).
+fn fx_by_abi(t: *cty.CType, fx: u8) u8 {
+    if (fx == ir.FX_ANY) or u.isnil(t) or not cty.is_func(t) or not plain_scalar(t.ret) {
+        return ir.FX_ANY;
+    }
+    for p in t.params {
+        if not plain_scalar(p) {
+            return @min(fx, ir.FX_READS);
+        }
+    }
+    return fx;
+}
+
+// An integer (no wider than 64 bits), a pointer, float or double.
+fn plain_scalar(t0: *mut cty.CType) bool {
+    let t = cty.unqual(t0);
+    if cty.is_pointer(t) {
+        return true;
+    }
+    if cty.is_integer(t) {
+        return cty.size_of(t) <= 8;
+    }
+    return (t == cty.t_float) or (t == cty.t_double);
+}
+
+// The IR parameter of C parameter k (from 1) of a call by plan, or -1
+// (one not passed as one scalar).
+fn ir_param(plan: *abi.Plan, k: i32) i32 {
+    if (k < 1) or (@int_cast(usize, k) > plan.args.len) {
+        return -1;
+    }
+    let a = plan.args[@int_cast(usize, k - 1)];
+    if a.kind != abi.A_SCALAR {
+        return -1;
+    }
+    return a.slot[0];
+}
+
+// What returns_nonnull, malloc, alloc_size, alloc_align and assume_aligned
+// say of function s's results (ir.Func's ret_nonnull, allocator, size_args,
+// align_arg, ret_align), for a result that is a pointer in a register.
+fn alloc_facts(s: *mut cast.CSym, f: *mut ir.Func, plan: *abi.Plan) void {
+    let n = cgn.note_of(s);
+    if u.isnil(n) or (f.ty.ret.kind != ir.T_PTR) or (f.ret_ext != 0) {
+        return;
+    }
+    if n.ret_nonnull and not cs.opts().keep_null_checks {
+        f.ret_nonnull = true;
+    }
+    if n.malloc {
+        f.allocator = true;  // (gvn.fresh: an object of its own)
+    }
+    if n.alloc_size[0] > 0 {
+        let a = ir_param(plan, n.alloc_size[0]);
+        let mut b: i32 = 0;
+        if n.alloc_size[1] > 0 {
+            b = ir_param(plan, n.alloc_size[1]);
+        }
+        if (a >= 0) and (a < 127) and (b >= 0) and (b < 127) {
+            let mut second: i32 = 0;
+            if n.alloc_size[1] > 0 {
+                second = b + 1;
+            }
+            f.size_args = [@truncate(i8, a + 1), @truncate(i8, second)];
+        }
+    }
+    if n.alloc_align > 0 {
+        let a = ir_param(plan, n.alloc_align);
+        if (a >= 0) and (a < 127) {
+            f.align_arg = @truncate(i8, a + 1);
+        }
+    }
+    if n.assume_aligned > 0 {
+        f.ret_align = n.assume_aligned;
     }
 }
 

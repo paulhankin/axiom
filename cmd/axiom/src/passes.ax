@@ -139,7 +139,16 @@ fn returns_twice(f: *mut ir.Func) bool {
     return true;
 }
 
-pub fn optimize_func(f: *mut ir.Func, level: i32) void {
+/// The optimizer's level for f: its own (ir.Func.opt_override), or level.
+pub fn level_of(f: *ir.Func, level: i32) i32 {
+    if f.opt_override > 0 {
+        return @as(i32, f.opt_override) - 1;
+    }
+    return level;
+}
+
+pub fn optimize_func(f: *mut ir.Func, level0: i32) void {
+    let level = level_of(f, level0);
     if returns_twice(f) {
         return;
     }
@@ -223,7 +232,8 @@ fn resimplify(f: *mut ir.Func) void {
 // replacement, value numbering, the shadow stack's pushes and pops, loop
 // invariants, dead code, sinking). The others (tail calls, the idioms of
 // loops and vectors) already ran on the function before inlining.
-fn light_func(f: *mut ir.Func, level: i32) void {
+fn light_func(f: *mut ir.Func, level0: i32) void {
+    let level = level_of(f, level0);
     if returns_twice(f) {
         return;
     }
@@ -296,15 +306,22 @@ pub fn optimize_module(m: *mut ir.Module, level: i32) void {
 // unrolled and loops fused, vector stores, (-O1 and up) stack slots
 // shared, and with --coverage=afl the coverage counters (cover.ax).
 // optimize_module comes first.
-pub fn finish_funcs(m: *mut ir.Module, level: i32, sel: []bool) void {
-    if level >= 2 {
+pub fn finish_funcs(m: *mut ir.Module, level0: i32, sel: []bool) void {
+    if level0 >= 2 {
         tre.prepare_sibling(m);
     }
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
-        if ir.is_decl(f) or ((sel.len > 0) and not sel[i]) or f.returns_twice {
+        if ir.is_decl(f) or ((sel.len > 0) and not sel[i]) {
+            continue;
+        }
+        // C's object sizes the passes did not find (at every level: no
+        // backend sees them)
+        opt.finish_objsizes(f);
+        if f.returns_twice {
             continue;  // (returns_twice: not optimized, its slots apart, no sibling calls)
         }
+        let level = level_of(f, level0);
         if level >= 2 {
             finish_func(f, level);
         }
@@ -324,7 +341,7 @@ pub fn finish_funcs(m: *mut ir.Module, level: i32, sel: []bool) void {
         if f.coverage {
             cover.instrument(m, f);  // --coverage=afl: last, after the optimizer
         }
-        if level >= 2 {
+        if (level >= 2) and (level0 >= 2) {
             _ = tre.mark_sibling_calls(f);  // (after everything that could put code after a call)
         }
     }

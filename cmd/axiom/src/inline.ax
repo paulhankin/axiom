@@ -27,6 +27,7 @@ const SMALL: i32 = 30;          // always worth inlining
 const ONE_CALLER: i32 = 1200;   // an internal function called once
 const CALLER_MAX: i32 = 20000;  // stop growing a caller beyond this
 const TAIL_MAX: i32 = 120;      // a callee called in tail position, from one place
+const COLD_SMALL: i32 = 8;      // what is inlined into a cold block (about a call's own cost)
 // What inlining recursive callees (see `want`) may add to a caller, beyond
 // its cost when its inlining began, unless the callee has no other caller.
 const RECURSIVE_GROWTH: i32 = 240;
@@ -816,6 +817,11 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32, budget: i32) bool {
     if (tg.fn_features(g) & ~tg.fn_features(n.f)) != 0 {
         return false;
     }
+    // (a function with its own level below 2, C's attribute optimize, keeps
+    // its calls and is not inlined)
+    if ((g.opt_override > 0) and (g.opt_override < 3)) or ((n.f.opt_override > 0) and (n.f.opt_override < 3)) {
+        return false;
+    }
     // (an inline function is inlined whatever its size, spec §9.5; it
     // cannot call itself, nor be on a cycle of inline functions only, so
     // rule (1) bounds it)
@@ -832,6 +838,14 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32, budget: i32) bool {
     let one = (g.linkage == ir.LINK_INTERNAL) and (gn.calls == 1) and not gn.addr_taken and (g.export_name.len == 0);
     if rec and not one and ((fcost + gc) > budget) {
         return false;  // (3)
+    }
+    // a call on a cold path (a block the front end marked cold: a call of
+    // a cold function, the unlikely way of __builtin_expect; or one that
+    // ends in `unreachable`, after a call that does not return) is worth
+    // inlining only when that makes the code smaller
+    let cold = u.notnil(c.blk) and (c.blk.cold or ir.is_op(ir.terminator(c.blk), ir.OP_UNREACHABLE));
+    if cold and not one {
+        return gc <= COLD_SMALL;
     }
     if gc <= SMALL {
         return true;
@@ -855,6 +869,10 @@ fn want(n: *mut Node, c: *mut ir.Value, fcost: i32, budget: i32) bool {
         if ir.is_const(x) or ir.is_op(x, ir.OP_ALLOCA) {
             bonus += 10;
         }
+    }
+    // (a caller or callee with the attribute hot: twice the size)
+    if n.f.hot or g.hot {
+        return gc <= ((2 * SMALL) + bonus);
     }
     return gc <= (SMALL + bonus);
 }
@@ -1147,6 +1165,9 @@ fn propagatable(v: *ir.Value) bool {
 }
 
 fn ipcp_eligible(f: *ir.Func, n: *Node) bool {
+    if (f.opt_override > 0) and (f.opt_override < 3) {
+        return false;  // (its own level below 2: C's attribute optimize)
+    }
     return not (ir.is_decl(f) or (f.linkage != ir.LINK_INTERNAL) or n.addr_taken or (n.calls == 0) or
                 (f.export_name.len > 0));
 }

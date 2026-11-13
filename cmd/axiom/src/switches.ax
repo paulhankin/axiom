@@ -36,6 +36,15 @@
 // range of an interval into a plain jump.
 //
 // A switch with at most LEAF cases is left as it is (a compare chain).
+//
+// What `unreachable` says (C's __builtin_unreachable and unreachable(), a
+// path the program never takes): a switch whose default is a block of
+// nothing but `unreachable`, or whose value the conditional branches above
+// it (each the only way on, its other way such a block) keep within values
+// that all have cases, has no default to go to (dead_default): a table needs
+// no range check and the search knows the value is among the cases. Once
+// the switches are lowered, those branches go straight on (drop_dead_tests):
+// their tests are not made.
 // =============================================================================
 import "ir.ax" as ir;
 import "util.ax" as u;
@@ -141,7 +150,243 @@ fn cmp_case(a: Case, b: Case) i32 {
 }
 
 /// Lowers f's switches for code generation, as the header says.
+// Is b a block of nothing but `unreachable` (no trap before it: a path the
+// program does not take)?
+fn bare_unreachable(b: *ir.Block) bool {
+    return u.notnil(b) and u.notnil(b.first) and (b.first.op == ir.OP_UNREACHABLE);
+}
+
+// The block whose terminator is the only way into b (nil: none, or several).
+fn only_pred(f: *mut ir.Func, b: *mut ir.Block) *mut ir.Block {
+    let mut r = ir.bnil();
+    let mut x = f.first;
+    while u.notnil(x) {
+        let t = ir.terminator(x);
+        for k in 0..ir.succ_count(t) {
+            if ir.succ(t, k) == b {
+                if u.notnil(r) and (r != x) {
+                    return ir.bnil();
+                }
+                r = x;
+            }
+        }
+        x = x.next;
+    }
+    return r;
+}
+
+// The interval lo..hi (signed) value x is known to be in at the end of b
+// from the branches above it whose other way is a bare `unreachable`: on
+// the way from each one only, up to 8 of them. False if none says anything.
+fn known_interval(f: *mut ir.Func, b0: *mut ir.Block, x: *mut ir.Value, lo: *mut i64, hi: *mut i64) bool {
+    let mut b = b0;
+    let mut any = false;
+    for _k in @as(i32, 0)..8 {
+        let p = only_pred(f, b);
+        if u.isnil(p) {
+            break;
+        }
+        let t = ir.terminator(p);
+        if (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and (bare_unreachable(t.t1) or bare_unreachable(t.t2)) {
+            let c = t.a;
+            // the condition holds on our way when the bare block is t2
+            let truth = bare_unreachable(t.t2);
+            if ir.is_op(c, ir.OP_ICMP) and (ir.resolve(c.a) == x) and ir.is_cint(c.b) and (x.ty.bits <= 64) {
+                if narrow(ir.pred_of(c), ir.sval(c.b), truth, x.ty.bits, lo, hi) {
+                    any = true;
+                }
+            } else if ir.is_op(c, ir.OP_ICMP) and ir.is_op(ir.resolve(c.a), ir.OP_LSHR) and ir.is_cint(c.b) and
+                      (ir.cint_val(c.b) == 0) and (ir.resolve(ir.resolve(c.a).a) == x) and
+                      ir.is_cint(ir.resolve(c.a).b) and
+                      (ir.cint_val(ir.resolve(c.a).b) == @as(u64, @bit_cast(u32, x.ty.bits - 1))) and
+                      ((ir.pred_of(c) == ir.IntEQ) or (ir.pred_of(c) == ir.IntNE)) {
+                // x >> (bits - 1) == 0: the sign bit clear, x >= 0
+                if narrow(ir.IntSGE, 0, truth == (ir.pred_of(c) == ir.IntEQ), x.ty.bits, lo, hi) {
+                    any = true;
+                }
+            }
+        }
+        b = p;
+    }
+    return any;
+}
+
+// Narrows lo..hi by `x pred k` being `truth` (x of `bits` bits, k read as
+// signed); true if it did. Unsigned relations narrow only where k is at
+// least 0 and the relation keeps x within 0..smax (x <u k, x <=u k).
+fn narrow(pred: i32, k: i64, truth: bool, bits: i32, lo: *mut i64, hi: *mut i64) bool {
+    let mut p = pred;
+    if not truth {
+        p = ir.inv_pred(p);
+    }
+    let mut l = lo.*;
+    let mut h = hi.*;
+    if p == ir.IntEQ {
+        l = @max(l, k);
+        h = @min(h, k);
+    } else if p == ir.IntSLT {
+        h = @min(h, k -% 1);
+    } else if p == ir.IntSLE {
+        h = @min(h, k);
+    } else if p == ir.IntSGT {
+        l = @max(l, k +% 1);
+    } else if p == ir.IntSGE {
+        l = @max(l, k);
+    } else if ((p == ir.IntULT) or (p == ir.IntULE)) and (k >= 0) and
+              ((bits == 64) or (k < (@as(i64, 1) << @int_cast(u32, bits - 1)))) {
+        l = @max(l, 0);
+        if p == ir.IntULT {
+            h = @min(h, k - 1);
+        } else {
+            h = @min(h, k);
+        }
+    } else {
+        return false;
+    }
+    lo.* = l;
+    hi.* = h;
+    return true;
+}
+
+// Does switch t (ending b) never go to its default: the default is a bare
+// `unreachable`, or the value is known (known_interval) to be one of the
+// cases' values? lo and hi: the interval known (else the type's).
+fn dead_default(f: *mut ir.Func, b: *mut ir.Block, t: *ir.Value, lo: *mut i64, hi: *mut i64) bool {
+    let x = ir.resolve(t.a);
+    let known = known_interval(f, b, x, lo, hi);
+    if bare_unreachable(t.t1) {
+        return true;
+    }
+    if not known or (lo.* > hi.*) or (dist(lo.*, hi.*) >= 4096) {
+        return false;
+    }
+    // every value of lo..hi a case (to another block than the default)
+    let n = @truncate(usize, dist(lo.*, hi.*)) + 1;
+    let seen = u.calloc_slice.[bool](n);
+    let mut cnt: usize = 0;
+    for k in 0..t.xs.len {
+        let v = ir.sval(t.xs.get(k));
+        if (v >= lo.*) and (v <= hi.*) and (ir.bs_of(t).get(k) != t.t1) {
+            let i = @truncate(usize, dist(lo.*, v));
+            if not seen[i] {
+                seen[i] = true;
+                cnt += 1;
+            }
+        }
+    }
+    u.free_slice(seen);
+    return cnt == n;
+}
+
+// The conditional branches whose one way is a bare `unreachable`: a jump
+// the other way (the program never takes the first, so the test changes
+// nothing). After the switches are lowered, which ask about them.
+fn drop_dead_tests(f: *mut ir.Func) void {
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let t = ir.terminator(b);
+        if u.notnil(t) and (t.op == ir.OP_CONDBR) and (t.t1 != t.t2) and
+           (bare_unreachable(t.t1) != bare_unreachable(t.t2)) {
+            let mut keep = t.t1;
+            if bare_unreachable(t.t1) {
+                keep = t.t2;
+            }
+            t.op = ir.OP_BR;
+            t.a = ir.vnil();
+            t.t1 = keep;
+            t.t2 = ir.bnil();
+            any = true;
+        }
+        b = b.next;
+    }
+    if any {
+        ir.remove_unreachable(f);
+        drop_unused(f);
+    }
+}
+
+// Removes the instructions without effects whose values nothing uses
+// (the tests drop_dead_tests left, and what only they used).
+fn drop_unused(f: *mut ir.Func) void {
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            i.aux = 0;
+            i = i.next;
+        }
+        b = b.next;
+    }
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            count_use(i.a);
+            count_use(i.b);
+            count_use(i.c);
+            for k in 0..i.xs.len {
+                count_use(i.xs.get(k));
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    let mut work = u.List.[*mut ir.Value].empty();
+    b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            if removable(i) {
+                work.push(i);
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+    while work.len > 0 {
+        let i = work.pop();
+        if (i.aux != 0) or u.isnil(i.blk) {
+            continue;
+        }
+        let ops: [3]*mut ir.Value = [ir.resolve(i.a), ir.resolve(i.b), ir.resolve(i.c)];
+        ir.remove_inst(i);
+        for o in ops {
+            if u.notnil(o) and (o.kind == ir.V_INST) {
+                o.aux -= 1;
+                if removable(o) {
+                    work.push(o);
+                }
+            }
+        }
+    }
+    work.deinit();
+}
+
+fn count_use(o: *mut ir.Value) void {
+    if u.notnil(o) {
+        let r = ir.resolve(o);
+        if r.kind == ir.V_INST {
+            r.aux += 1;
+        }
+    }
+}
+
+// (an unused instruction of the few kinds a test is made of: compares,
+// shifts and the bitwise operations, without operands in xs)
+fn removable(i: *ir.Value) bool {
+    let op = i.op;
+    return (i.aux == 0) and (i.xs.len == 0) and not ir.has_effects(i) and
+           ((op == ir.OP_ICMP) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_SHL) or (op == ir.OP_AND) or
+            (op == ir.OP_OR) or (op == ir.OP_XOR) or (op == ir.OP_ADD) or (op == ir.OP_SUB));
+}
+
 pub fn lower(f: *mut ir.Func) void {
+    lower_switches(f);
+    drop_dead_tests(f);
+}
+
+fn lower_switches(f: *mut ir.Func) void {
     let mut todo = u.List.[*mut ir.Block].empty();
     let mut b = f.first;
     while u.notnil(b) {
@@ -184,6 +429,11 @@ fn lower_one(b: *mut ir.Block) void {
     let t = ir.terminator(b);
     X = t.a;
     DFLT = t.t1;
+    // (what unreachable paths say: dead_default, and the interval the
+    // search starts from)
+    let mut klo: i64 = 0 - 0x7fff_ffff_ffff_ffff - 1;
+    let mut khi: i64 = 0x7fff_ffff_ffff_ffff;
+    let dead = dead_default(F, b, t, &mut klo, &mut khi);
     ir.cur_src = t.src;
     ir.cur_scope = t.scope;
     // the cases, sorted, without those going to the default and (keeping
@@ -237,6 +487,14 @@ fn lower_one(b: *mut ir.Block) void {
         if bits < 64 {
             tmax = @bit_cast(i64, (@as(u64, 1) << @int_cast(u32, bits - 1)) - 1);
             tmin = 0 - tmax - 1;
+        }
+        if dead {
+            klo = @max(klo, cs[0].v);
+            khi = @min(khi, cs[m - 1].v);
+        }
+        if (klo <= khi) and (klo >= tmin) and (khi <= tmax) {
+            tmin = klo;
+            tmax = khi;
         }
         tree(b, cl.items(), tmin, tmax);
         cl.deinit();
@@ -675,7 +933,15 @@ fn case_val(t: *ir.Value, k: usize, uns: bool) i64 {
 
 fn table_one(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, t: *mut ir.Value) bool {
     let n = t.xs.len;
-    let dflt = t.t1;
+    let mut dflt = t.t1;
+    // a default the switch never goes to (dead_default): no range check,
+    // and the default's values are the first case's (never read)
+    let mut klo: i64 = 0 - 0x7fff_ffff_ffff_ffff - 1;
+    let mut khi: i64 = 0x7fff_ffff_ffff_ffff;
+    let dead = (n > 0) and dead_default(f, b, t, &mut klo, &mut khi);
+    if dead {
+        dflt = ir.bs_of(t).get(0);
+    }
     // the span: of the values read as signed, or as unsigned where that is
     // shorter (both below 2^63 for less than 64 bits; 64 bits are signed)
     let mut lo: i64 = 0x7fff_ffff_ffff_ffff;
@@ -766,7 +1032,7 @@ fn table_one(m: *mut ir.Module, f: *mut ir.Func, b: *mut ir.Block, t: *mut ir.Va
         wide = ir.trunc(bld, idx, isz);
     }
     let mut inr = ir.cint(ir.t_int(1), 1);
-    if (x.ty.bits >= 64) or (span < (@as(u64, 1) << @int_cast(u32, x.ty.bits))) {
+    if not dead and ((x.ty.bits >= 64) or (span < (@as(u64, 1) << @int_cast(u32, x.ty.bits)))) {
         inr = ir.icmp(bld, ir.IntULT, idx, ir.cint(x.ty, span));
     }
     let at = ir.select(bld, inr, wide, ir.cint(isz, 0));
