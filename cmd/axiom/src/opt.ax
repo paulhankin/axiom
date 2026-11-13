@@ -322,6 +322,18 @@ pub fn clone_members(f: *mut ir.Func, members: *u.List.[*mut ir.Block], tag: i64
             }
             y.t1 = member_copy_blk(y.t1, tag);
             y.t2 = member_copy_blk(y.t2, tag);
+            // (-g: the copies of the marks, the values they give mapped alike)
+            let mut mk = ir.dbg_marks_at(y);
+            while mk >= 0 {
+                let src = ir.dbg_mark_src(mk);
+                if src >= 0 {
+                    let v = ir.dbg_mark_value(src);
+                    if u.notnil(v) {
+                        ir.dbg_mark_set(mk, member_copy(v, tag), ir.dbg_mark_low(src), ir.dbg_mark_add(src));
+                    }
+                }
+                mk = ir.dbg_mark_next(mk);
+            }
             y = y.next;
         }
     }
@@ -457,12 +469,10 @@ pub fn mem2reg(f: *mut ir.Func) void {
         }
         b = b.next;
     }
-    let mut once = u.List.[VarOnce].empty();
     if ir.dbg_on {
-        once = vars_before(f);
+        vars_before(f);
     }
     if slots.len == 0 {
-        once.deinit();
         return;
     }
     compute_preds(f);
@@ -531,6 +541,16 @@ pub fn mem2reg(f: *mut ir.Func) void {
                     }
                     let p = ir.phi(B, ir.aty_of(s.a));
                     p.aux2 = tag;  // which slot
+                    let ds = ir.dbg_slot_of(s.a);
+                    if ds >= 0 {
+                        // (-g: the variable is the merge from the block's start)
+                        let d = ir.dbg_slots.get(@int_cast(usize, ds));
+                        let mut at = p;
+                        while (at.op == ir.OP_PHI) and u.notnil(at.next) {
+                            at = at.next;
+                        }
+                        ir.dbg_mark_first(at, d.owner, d.var, d.off, d.size, p);
+                    }
                     if inwork[yi] != tag {
                         inwork[yi] = tag;
                         work.push(y);
@@ -554,26 +574,15 @@ pub fn mem2reg(f: *mut ir.Func) void {
     }
     slots.deinit();
     ir.apply_forwarding(f);
-    if once.len > 0 {
-        vars_after(once.items());
-    }
-    once.deinit();
 }
 
 // -----------------------------------------------------------------------------
-// Debug information (-g, optimized code; dbginfo.ax): at a function's first
-// promotion, what becomes of the objects of its variables. One promoted is
-// followed as a value when it is assigned once (the variable's value: one
-// store, whose value every load gets: the store dominates them); one left in
-// memory has its stores remembered (where all of them remain, the memory
-// holds the variable).
+// Debug information (-g, optimized code; dbginfo.ax): the objects of a
+// function's variables, whose stores and merges promotion marks (ir.dbg_mark:
+// the variable's values from there on); and, at a function's first
+// promotion, the stores of those left in memory (where all of them remain,
+// the memory holds the variable).
 // -----------------------------------------------------------------------------
-struct VarOnce {
-    v: *mut dbi.DVar,
-    store: *mut ir.Value,
-    loads: u.List.[*mut ir.Value],
-}
-
 // The root object of address p (through offsets), or nil.
 fn object_of(p: *mut ir.Value) *mut ir.Value {
     let mut x = p;
@@ -596,81 +605,53 @@ fn writes_object(i: *ir.Value, a: *mut ir.Value) bool {
     return false;
 }
 
-// Before f's allocas are promoted (the promoted ones: aux > 0): the
-// variables of f not looked at yet, with the store and loads of the ones
-// promoted now that are stored once; the stores of the others, followed.
-fn vars_before(f: *mut ir.Func) u.List.[VarOnce] {
-    let mut out = u.List.[VarOnce].empty();
+// Before f's allocas are promoted (the promoted ones: aux > 0): the objects
+// of f's variables noted (ir.dbg_slot_note); of those not looked at yet, the
+// ones promoted now are followed by their marks (track 0), the stores of the
+// others are followed.
+fn vars_before(f: *mut ir.Func) void {
     let vl = dbi.vars_mut(f.name);
     if u.isnil(vl) {
-        return out;
+        return;
     }
     for k in 0..vl.len {
         let v = vl.at(k);
         let a = v.alloca;
-        if v.seen or v.artificial or u.notnil(v.global) {
+        if u.notnil(v.global) {
             continue;
         }
-        v.seen = true;
         if u.isnil(a) or (a.op != ir.OP_ALLOCA) or (a.id != v.alloca_id) or (a.grave != 0) or u.isnil(a.blk) or
            (@int_from_ptr(a.blk.fnp) != @int_from_ptr(f)) {
             continue;
         }
-        if v.indirect {
+        if ir.dbg_slot_of(a) < 0 {
+            ir.dbg_slot_note(a, f, @int_cast(i32, k), 0, 0);
+        }
+        if v.seen {
             continue;
         }
-        let mut st = ir.vnil();
-        let mut nst: i32 = 0;
-        let mut loads = u.List.[*mut ir.Value].empty();
+        v.seen = true;
+        if a.aux > 0 {
+            v.track = 0;  // (promoted: its marks)
+            continue;
+        }
         let first = @int_cast(i32, ir.dbg_refs.len);
+        let mut nst: i32 = 0;
         let mut b = f.first;
         while u.notnil(b) {
             let mut i = b.first;
             while u.notnil(i) {
                 if writes_object(i, a) {
                     nst += 1;
-                    st = i;
-                    if a.aux <= 0 {
-                        _ = ir.dbg_track(i);
-                    }
-                } else if (a.aux > 0) and (i.op == ir.OP_LOAD) and (i.a == a) {
-                    loads.push(i);
+                    _ = ir.dbg_track(i);
                 }
                 i = i.next;
             }
             b = b.next;
         }
-        if a.aux <= 0 {
-            // (left in memory)
-            v.stores = first;
-            v.nstores = nst;
-            loads.deinit();
-            continue;
-        }
-        if (nst != 1) or (st.op != ir.OP_STORE) or (st.b != a) {
-            loads.deinit();
-            continue;
-        }
-        out.push(VarOnce.{ v: v, store: st, loads: loads });
-    }
-    return out;
-}
-
-// After the promotion: a variable stored once whose every load became the
-// stored value is that value.
-fn vars_after(once: []VarOnce) void {
-    for x in once {
-        let val = ir.resolve(x.store.a);
-        let mut ok = u.notnil(val);
-        for l in x.loads.items() {
-            if ir.resolve(l) != val {
-                ok = false;
-            }
-        }
-        if ok {
-            x.v.track = ir.dbg_track(val);
-        }
-        x.loads.deinit();
+        // (left in memory)
+        v.stores = first;
+        v.nstores = nst;
     }
 }
 
@@ -743,6 +724,12 @@ fn rename_block(b: *mut ir.Block, slots: []mut *mut Slot, pushed: *mut u.List.[*
             if u.notnil(s) {
                 s.stack.push(ir.resolve(i.a));
                 pushed.push(s);
+                let ds = ir.dbg_slot_of(s.a);
+                if ds >= 0 {
+                    // (-g: from here on the variable is the stored value)
+                    let d = ir.dbg_slots.get(@int_cast(usize, ds));
+                    ir.dbg_mark(i, d.owner, d.var, d.off, d.size, ir.resolve(i.a));
+                }
                 ir.remove_inst(i);
             }
         }
@@ -1267,8 +1254,10 @@ pub fn simplify_cfg(f: *mut ir.Func) bool {
                 let mut i = s.first;
                 while u.notnil(i) {
                     let nx = i.next;
+                    let mk = ir.dbg_take(i);  // (the marks go along)
                     ir.remove_inst(i);
                     ir.append_inst(b, i);
+                    ir.dbg_put(i, mk);
                     i = nx;
                 }
                 let nt = ir.terminator(b);

@@ -1603,31 +1603,48 @@ longer the same as without `-g`.
   by reference (a large structure on AArch64 and Windows) and a variable length array
   are found through the address an object of the frame holds; a variable length
   array's bound is the variable holding its length.
-- **Locations at `-O1` and above**, never a wrong one; what has none is "optimized out":
-  - a variable assigned once (its initializer, and no assignment after) is its value,
-    which the optimizer is followed through: in the registers and spill slots that
-    hold it, from the instruction that makes it, where every path since has made it
-    and nothing has written the register since (a location list), or a constant
-    everywhere. One whose value was copied in its function (unrolled, duplicated
-    code), or that is a merge of values (a phi), has none;
-  - a parameter never assigned is also in its argument's register at the function's
-    entry (where a breakpoint on the function stops), or for the whole function in its
-    stack slot (but in a function with a call in tail position);
+- **Locations at `-O1` and above**, never a wrong one; what has none is "optimized out".
+  Each assignment of a variable that the optimizer keeps in registers (its
+  initializer, each later store, each merge of the values that reach a join) is a mark
+  in the code that follows the instructions around it as they move
+  (`cmd/axiom/src/ir.ax`, "Assignments of variables"); from each mark on, until the
+  next one on every path, the variable is the value assigned, wherever that value is:
+  - in the registers and spill slots that hold it, at every instruction where every path
+    since has made it and nothing has written the register since; a value made again
+    (a loop's next round) leaves the variable without a location until the next
+    assignment; a value the optimizer moved past the assignment is the variable once it
+    is made;
+  - a constant (`DW_OP_implicit_value`), the address of a frame object or of a datum,
+    a value plus a constant (a value folded into its uses: in its base's register or
+    slot, `DW_OP_breg`), the low bits of a wider value (a loop counter widened to a
+    pointer's width);
+  - at a join, where every path agrees, or for a merge (a phi) in the registers that
+    hold each path's input at its end, else none;
+  - a structure taken apart is in pieces (`DW_OP_piece`), each followed alike; a
+    variable length array is found through the register or slot that holds its address;
+  - in a callee-saved register across a call, which a debugger reads through the
+    callee's frame;
+  - copied code (unrolled loops, duplicated blocks) has its own marks, with the copies
+    of the values where the pass that copied them knows them, else none;
+  - a parameter is also in its argument's register at the function's entry, or (never
+    assigned) in its stack slot (but in a function with a call in tail position);
   - a variable left in memory (its address taken, a structure not taken apart) is in
     its frame slot when all its stores remain where they were and no other object
-    shares the slot;
-  - a variable assigned more than once and kept in registers has none.
+    shares the slot.
 
   What this relies on of the register allocator (`cmd/axiom/src/dloc.ax`): a machine
   instruction's operands, clobbers, copies, spills and reloads say every register and
-  spill slot it changes, and two values live at the same time are in different
-  registers. `cmd/axiom/internal/tests/dwarf.mjs` checks the location lists' shapes
-  (inside their blocks, in order, in registers that hold values, a parameter's entry
-  in its argument register); in development, stepping randomly generated functions
-  instruction by instruction in the system's debuggers and comparing every value they
-  show with the program's own printing found no difference (x86-64 at `-O1` and
-  `-O2`; AArch64 under emulation, but at a few epilogue instructions where that
-  debugger's own reading of the innermost frame's code moves the frame base).
+  spill slot it changes. `cmd/axiom/internal/tests/dwarf.mjs` checks the location
+  lists' shapes (inside their blocks, in order, in registers that hold values, a
+  parameter's entry in its argument register);
+  `cmd/axiom/internal/tests/tools/debug_coverage.mjs` counts the variables with a
+  location. In development, randomly generated functions (assignments in branches,
+  loops and blocks, structures, pointers into frame objects, address-taken variables)
+  stepped instruction by instruction in the system's debuggers, every value they show
+  (in the function, and in its caller at each call) compared with the program's own
+  log of its assignments, showed no difference (x86-64; AArch64 under emulation), and
+  the same comparison catches a deliberately wrong rule for the registers a call
+  changes.
 Where it goes, per target:
 
 | Target | |

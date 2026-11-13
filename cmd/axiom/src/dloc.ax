@@ -3,32 +3,43 @@
 // location lists of dwarf.ax), for the native code generators (x64.ax,
 // a64.ax), from their machine code after register allocation.
 //
-// The variables followed are those the passes left a value for (dbginfo.ax,
-// ir.dbg_refs): a variable assigned once is that value wherever the value
-// is, from the instruction that makes it on (its value is the variable's
-// from its declaration until its block is left, and the variable is not in
-// scope elsewhere), or a constant everywhere; a parameter never assigned is
-// also in its argument's register at the function's entry, or for the whole
-// function in its argument's stack slot.
+// What is followed: the marks of the IR (ir.dbg_mark), each of which says
+// that from its place on a variable (or a piece of one: scalar replacement
+// takes structures apart) is a value, or not known (a kill). Instruction
+// selection puts them before the machine instructions of the IR they came
+// before (before), and they stay there as the instructions around them
+// are removed (mach.remove). A variable's value may be a value an
+// instruction makes, a parameter, a constant, a frame object's address, a
+// value plus a constant (the base it was folded into its uses from: in the
+// base's register, plus the constant), or a phi.
+//
+// The analysis (compute): forward over the machine CFG, what each
+// allocatable register and spill slot holds (C: a value's identity, or
+// nothing known) and what each variable piece is (D: an identity, plus a
+// constant), at each instruction. An identity is a value as its latest
+// making left it: the instruction that makes a value makes every other
+// copy of it stale (a loop's next round), and a variable that was the
+// stale one is no longer known; a mark whose value is made only later on
+// (sunk past it) waits for that making. At a join, what all the paths
+// agree on stays; a phi is in the registers that hold each path's input at
+// the ends of the paths; and a variable the paths disagree on is a merge
+// of its own (an identity of the join's), in the registers that hold the
+// variable on every path. The meet starts from "anything" (paths not seen
+// yet) and settles at a fixed point, every part of which holds by
+// induction over a run of the code.
 //
 // What is relied on (the invariant): after register allocation, a machine
 // instruction's register operands written (RD, RUD, RE), its clobbers (a
 // call's) and the copies (is_move), spills and reloads (MInst.spill) say
-// all that changes the allocatable registers and spill slots; the
-// allocator gives two values live at the same time different registers.
-// Then where every path from the function's entry has run the defining
-// instruction, and no instruction since has written the register, the
-// register holds the value (a must-be-available analysis: forward, over the
-// machine CFG, meeting by intersection), and so does a register or spill
-// slot it was copied to since. A range of code (one machine instruction's,
-// or a few encoded together) gets the registers that hold the value before
-// it and that it does not write: a debugger stopped in it, or in a call it
-// makes (at its return address), reads the value. Code the encoder adds
+// all that changes the allocatable registers and spill slots. A range of
+// code (one machine instruction's, or a few encoded together) gets the
+// places that hold its variables before it and that it does not write: a
+// debugger stopped in it, or in a call it makes (at its return address),
+// reads the value; a callee-saved register keeps its value across a call,
+// which a debugger reads through the callee's frame. Code the encoder adds
 // around instructions (a prologue, alignment) writes none of the
 // allocatable registers; a return or a call in tail position takes the
-// frame down (restoring the callee-saved registers): no location there.
-// Values never made by one instruction into one register (phis, values
-// folded into their uses, wider than a register) are not followed.
+// frame down: no location there.
 // =============================================================================
 import "dbginfo.ax" as dbi;
 import "ir.ax" as ir;
@@ -36,62 +47,128 @@ import "mach.ax" as mc;
 import "util.ax" as u;
 
 /// A location piece of variable `var` (an index in its function's dbinfo
-/// variables): from code offset start to end, in DWARF register reg, or (reg
-/// -1) at `off` from the CFA; kind LK_CONST: the variable's value is the
-/// constant `off` (its bits, as many bytes as its type has) everywhere.
+/// variables; its `psize` bytes at `poff`, psize 0: all of it), from code
+/// offset start to end: LK_REG, in DWARF register `reg` (plus `add`, if not
+/// 0: the value is the register's contents plus add); LK_SLOT, at `off` from
+/// the CFA (plus add: the value is the `size` bytes there plus add);
+/// LK_CONST, the constant `off` (its `size` bytes); LK_ADDR, the address
+/// `off` from the CFA; LK_GADDR, the address of a datum plus `off`. With
+/// `ind`, the variable is in memory at the address that is that value.
 pub struct VLoc {
     var: u32,
+    poff: u32,
+    psize: u32,
     kind: u8,
     start: u64,
     end: u64,
     reg: i32,
     off: i64,
+    add: i64,
+    size: u32,
+    ind: bool,   // the variable is in memory at the value (a variable length array: its address)
+    gsym: []u8,  // LK_GADDR: the datum
 }
 
-pub const LK_PIECE: u8 = 0;
+pub const LK_REG: u8 = 0;
 pub const LK_CONST: u8 = 1;
+pub const LK_SLOT: u8 = 2;
+pub const LK_ADDR: u8 = 3;
+pub const LK_GADDR: u8 = 4;  // the address of datum gsym, plus off
 
 /// What the target tells of its machine code.
 pub struct Tgt {
     dw_reg: fn(i32) i32,          // a physical register's DWARF number (-1: none)
     is_exit: fn(*mc.MInst) bool,  // a return or a call in tail position
     is_tail: fn(*mc.MInst) bool,  // a call in tail position (it writes the stack arguments' area)
-    slot_off: fn(i32) i64,        // a frame slot's offset from the CFA (NO_LOC: none)
+    slot_off: fn(i32) i64,        // a spill slot's offset from the CFA (NO_LOC: none)
+    obj_off: fn(*ir.Value) i64,   // the frame slot of an alloca: its offset from the CFA (NO_LOC: none)
+    imm_of: fn(*mc.MInst) i64,    // the constant an instruction puts in its register (all of it; NO_LOC: none)
     alloc: u64,                   // the allocatable physical registers
 }
 
 pub const NO_LOC: i64 = -0x7fff_ffff_ffff_ffff;
 
-// A variable followed in the function being compiled.
-struct Var {
+// A variable piece followed in the function being compiled.
+struct Ent {
     var: u32,
+    poff: u32,
+    psize: u32,
+    size: u32,  // its values' bytes
+    ind: bool,  // its values are its address (dbinfo's indirect)
+}
+
+// A value the marks name (or a phi's input, or the base of one).
+struct Val {
     v: *mut ir.Value,
-    def: *mut mc.MInst,  // the instruction that makes v (nil: none found)
+    def: *mut mc.MInst,  // the instruction that makes it (nil: none found)
     def_op: usize,       // its operand v's register is
     entry_reg: i32,      // a parameter: the physical register it arrives in (-1: none)
     stack_off: i64,      // a parameter: its stack slot's offset from the CFA (NO_LOC: none)
+    obj: bool,           // an alloca: its value is the frame object's address
+    gsym: []u8,          // a datum's address: its name (empty: not one)
+    base: i32,           // a value that is another plus `add` (folded into its uses): that one (-1: none)
+    add: i64,
+    phi_blk: i32,  // a phi: its machine block (-1: not a phi, or none)
+    phi_ops: u.List.[PhiIn],
 }
 
-let mut VS: u.List.[Var] = u.List.[Var].{ data: @ptr_from_int(*mut Var, 0), len: 0, cap: 0 };
-let mut CONSTS: u.List.[VLoc] = u.List.[VLoc].{ data: @ptr_from_int(*mut VLoc, 0), len: 0, cap: 0 };
-// a value (its address) -> its index in VS + 1
+// A phi's input: from IR block `from`, the value (VALS index, -1: none) or
+// constant (CONSTS index, -1: none).
+struct PhiIn {
+    from: *mut ir.Block,
+    val: i32,
+    cst: i32,
+}
+
+struct Cst {
+    bits: u64,
+    size: u32,
+}
+
+// A mark in the machine code (mc.mk_next chains them): entity `ent` is
+// value `val` (a VALS index), or constant `cst`, or not known (both -1).
+struct MMark {
+    ent: i32,
+    val: i32,
+    cst: i32,
+    add: i64,  // (the value plus this)
+}
+
+let mut ENTS: u.List.[Ent] = u.List.[Ent].{ data: @ptr_from_int(*mut Ent, 0), len: 0, cap: 0 };
+let mut VALS: u.List.[Val] = u.List.[Val].{ data: @ptr_from_int(*mut Val, 0), len: 0, cap: 0 };
+let mut CONSTS: u.List.[Cst] = u.List.[Cst].{ data: @ptr_from_int(*mut Cst, 0), len: 0, cap: 0 };
+let mut MKS: u.List.[MMark] = u.List.[MMark].{ data: @ptr_from_int(*mut MMark, 0), len: 0, cap: 0 };
+// a value (its address) -> its index in VALS + 1
 let mut by_val: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
+                                                  cap: 0, len: 0 };
+// an entity's (var << 40 | poff << 20 | psize... as a key) index + 1
+let mut by_ent: u.SymMap.[i32] = u.SymMap.[i32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0),
                                                   cap: 0, len: 0 };
 // the code offset of each machine instruction the encoder visited (its address -> offset + 1), and of each block
 let mut offs: u.SymMap.[u64] = u.SymMap.[u64].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u64, 0),
                                                 cap: 0, len: 0 };
 let mut boffs: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+// the IR block of each machine block
+let mut mb_ir: u.List.[*mut ir.Block] = u.List.[*mut ir.Block].{ data: @ptr_from_int(*mut *mut ir.Block, 0), len: 0,
+                                                                 cap: 0 };
+// the marks of the IR instruction being selected, not placed yet (a chain
+// of MKS, mach.ax's form), and the instruction they go after
+let mut pend: i32 = 0;
+let mut pend_after: *mut mc.MInst = @ptr_from_int(*mut mc.MInst, 0);
+let mut pend_blk: *mut mc.MBlock = @ptr_from_int(*mut mc.MBlock, 0);
+let mut FN: *mut ir.Func = @ptr_from_int(*mut ir.Func, 0);
 
 /// Are variables followed in the function being compiled?
 pub let mut active: bool = false;
 
 fn key(p: usize) []u8 {
-    return u.addr_key(p);
+    return @slice_from_ptr(@ptr_from_int(*u8, p), 1);
 }
 
-// Can a variable of the type `ty` (a dbinfo type) be held by value v (an
-// integer, pointer or floating value of its size in one register)?
-fn fits(v: *ir.Value, ty: i32) bool {
+// Can a variable of the type `ty` (a dbinfo type), or the piece of `psize`
+// bytes of one (psize > 0), be held by value v (an integer, pointer or
+// floating value of its size in one register)?
+fn fits(v: *ir.Value, ty: i32, psize: u32) bool {
     if ty < 0 {
         return false;
     }
@@ -100,8 +177,11 @@ fn fits(v: *ir.Value, ty: i32) bool {
     if (k != ir.T_INT) and (k != ir.T_PTR) and (k != ir.T_FLOAT) {
         return false;
     }
-    if (k == ir.T_INT) and ((t.bits < 8) or (t.bits > 64)) {
+    if (k == ir.T_INT) and ((t.bits < 8) or (t.bits > 64) or ((t.bits % 8) != 0)) {
         return false;
+    }
+    if psize > 0 {
+        return @as(u64, psize) == t.size;
     }
     let d = dbi.types.at(@int_cast(usize, ty));
     let mut dk = d.kind;
@@ -122,106 +202,365 @@ fn fits(v: *ir.Value, ty: i32) bool {
     return dd.size == t.size;
 }
 
-/// Function f's code is selected next: the values of its variables to find.
-pub fn begin(f: *ir.Func, on: bool) void {
-    VS.clear();
-    CONSTS.clear();
-    by_val = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
-    offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
-    boffs.clear();
-    active = false;
-    if not ir.dbg_on or not on {
-        return;
+// Can a variable of type ty (or its piece of psize bytes) be the low bytes
+// of integer value v (its bytes, 0: no)? An integer variable narrower than v.
+fn low_fits(v: *ir.Value, ty: i32, psize: u32) u32 {
+    if u.isnil(v) or (v.kind == ir.V_CINT) or (v.kind == ir.V_ZERO) or (v.ty.kind != ir.T_INT) or (v.ty.size > 8) or
+       (ty < 0) {
+        return 0;
     }
-    let vs = dbi.vars_of(f.name);
-    for k in 0..vs.len {
-        let x = vs[k];
-        if (x.track < 0) or x.artificial {
-            continue;
+    if psize > 0 {
+        if @as(u64, psize) < v.ty.size {
+            return psize;
         }
-        let v = ir.dbg_value(x.track);
-        if u.isnil(v) or not fits(v, x.ty) {
-            continue;
-        }
-        let vk = v.kind;
-        if (vk == ir.V_CINT) or (vk == ir.V_ZERO) or (vk == ir.V_CFP) {
-            let mut bits: u64 = 0;
-            if vk == ir.V_CINT {
-                bits = ir.cint_val(v);
-            } else if vk == ir.V_CFP {
-                let fv = ir.fv_of(v);
-                if v.ty.size == 4 {
-                    bits = @as(u64, @bit_cast(u32, @float_cast(f32, fv)));
-                } else {
-                    bits = @bit_cast(u64, fv);
-                }
-            }
-            CONSTS.push(
-                VLoc.{ var: @truncate(u32, k), kind: LK_CONST, start: 0, end: 0, reg: -1, off: @bit_cast(i64, bits) });
-            continue;
-        }
-        if vk == ir.V_INST {
-            if (v.op == ir.OP_PHI) or u.isnil(v.blk) or (@int_from_ptr(v.blk.fnp) != @int_from_ptr(f)) {
-                continue;
-            }
-        } else if vk == ir.V_PARAM {
-            let mut mine = false;
-            for p in f.params {
-                mine = mine or (p == v);
-            }
-            if not mine {
-                continue;
-            }
-        } else {
-            continue;
-        }
-        VS.push(Var.{ var: @truncate(u32, k), v: v, def: u.nil.[mc.MInst](), def_op: 0, entry_reg: -1,
-                      stack_off: NO_LOC });
-        by_val.put(key(@int_from_ptr(v)), @int_cast(i32, VS.len));
+        return 0;
     }
-    active = (VS.len > 0) or (CONSTS.len > 0);
+    let mut d = dbi.types.at(@int_cast(usize, ty));
+    let mut n: i32 = 0;
+    while ((d.kind == dbi.DK_TYPEDEF) or (d.kind == dbi.DK_CONST) or (d.kind == dbi.DK_VOLATILE)) and
+          (d.target >= 0) and (n < 16) {
+        d = dbi.types.at(@int_cast(usize, d.target));
+        n += 1;
+    }
+    if ((d.kind != dbi.DK_BASE) and (d.kind != dbi.DK_ENUM)) or (d.bits > 0) or (d.size == 0) or (d.size >= v.ty.size) {
+        return 0;
+    }
+    if (d.kind == dbi.DK_BASE) and (d.enc != dbi.ATE_SIGNED) and (d.enc != dbi.ATE_UNSIGNED) and
+       (d.enc != dbi.ATE_SIGNED_CHAR) and (d.enc != dbi.ATE_UNSIGNED_CHAR) {
+        return 0;
+    }
+    return @truncate(u32, d.size);
 }
 
-fn find(v: *ir.Value) *mut Var {
-    if not active {
-        return u.nil.[Var]();
+fn ent_of(var: i32, poff: u32, psize: u32, size: u32) i32 {
+    let kv = (@as(u64, @bit_cast(u32, var)) << 40) | (@as(u64, poff) << 20) | @as(u64, psize & 0xfffff);
+    let kk = key(@truncate(usize, kv + 1));
+    let k = by_ent.get(kk);
+    if k > 0 {
+        let en = ENTS.at(@int_cast(usize, k - 1));
+        if en.size == 0 {
+            en.size = size;  // (a kill made it first)
+        }
+        return k - 1;
     }
+    ENTS.push(Ent.{ var: @bit_cast(u32, var), poff: poff, psize: psize, size: size, ind: false });
+    by_ent.put(kk, @int_cast(i32, ENTS.len));
+    return @int_cast(i32, ENTS.len - 1);
+}
+
+fn cst_of(v: *ir.Value) i32 {
+    let vk = v.kind;
+    let mut bits: u64 = 0;
+    if vk == ir.V_CINT {
+        bits = ir.cint_val(v);
+    } else if vk == ir.V_CFP {
+        let fv = ir.fv_of(v);
+        if v.ty.size == 4 {
+            bits = @as(u64, @bit_cast(u32, @float_cast(f32, fv)));
+        } else {
+            bits = @bit_cast(u64, fv);
+        }
+    } else if vk != ir.V_ZERO {
+        return -1;
+    }
+    let size = @truncate(u32, v.ty.size);
+    if (size == 0) or (size > 8) {
+        return -1;
+    }
+    for k in 0..CONSTS.len {
+        let c = CONSTS.get(k);
+        if (c.bits == bits) and (c.size == size) {
+            return @int_cast(i32, k);
+        }
+    }
+    CONSTS.push(Cst.{ bits: bits, size: size });
+    return @int_cast(i32, CONSTS.len - 1);
+}
+
+// The VALS index of value v of function f (made for it; -1: one not
+// followed). depth: how far through bases and phis.
+fn val_of(v: *mut ir.Value, depth: i32) i32 {
     let k = by_val.get(key(@int_from_ptr(v)));
-    if k == 0 {
-        return u.nil.[Var]();
+    if k > 0 {
+        return k - 1;
     }
-    return VS.at(@int_cast(usize, k - 1));
+    let vk = v.kind;
+    if vk == ir.V_PARAM {
+        let mut mine = false;
+        for p in FN.params {
+            mine = mine or (p == v);
+        }
+        if not mine {
+            return -1;
+        }
+    } else if vk == ir.V_INST {
+        if u.isnil(v.blk) or (@int_from_ptr(v.blk.fnp) != @int_from_ptr(FN)) {
+            return -1;
+        }
+    } else if vk == ir.V_GLOBAL {
+        let g = ir.gv_of(v);
+        if u.isnil(g) or g.tls {
+            return -1;  // (a thread-local's address is the thread's)
+        }
+    } else {
+        return -1;
+    }
+    VALS.push(Val.{ v: v, def: u.nil.[mc.MInst](), def_op: 0, entry_reg: -1, stack_off: NO_LOC, obj: false, gsym: "",
+                    base: -1, add: 0, phi_blk: -1, phi_ops: u.List.[PhiIn].empty() });
+    let me = @int_cast(i32, VALS.len - 1);
+    by_val.put(key(@int_from_ptr(v)), me + 1);
+    if vk == ir.V_GLOBAL {
+        VALS.at(@int_cast(usize, me)).gsym = ir.gv_of(v).name;
+        return me;
+    }
+    if vk != ir.V_INST {
+        return me;
+    }
+    let op = v.op;
+    if op == ir.OP_ALLOCA {
+        VALS.at(@int_cast(usize, me)).obj = true;
+    } else if (depth < 4) and ((op == ir.OP_PTRADD) or (op == ir.OP_ADD) or (op == ir.OP_SUB)) and u.notnil(v.b) and
+              (v.b.kind == ir.V_CINT) and ((op == ir.OP_PTRADD) or (v.ty.kind == ir.T_INT)) {
+        // (a base plus a constant: in the base's place, if not in one of its own)
+        let mut c = @bit_cast(i64, ir.cint_val(v.b));
+        let bits = v.b.ty.bits;
+        if (bits > 0) and (bits < 64) {
+            let sh = @as(u32, @int_cast(u32, 64 - bits));
+            c = (c << sh) >> sh;  // (sign-extended: the offset is two's complement)
+        }
+        if op == ir.OP_SUB {
+            c = 0 -% c;
+        }
+        let b = val_of(v.a, depth + 1);
+        if b >= 0 {
+            let x = VALS.at(@int_cast(usize, me));
+            x.base = b;
+            x.add = c;
+        }
+    } else if (depth < 4) and (op == ir.OP_TRUNC) and (v.ty.kind == ir.T_INT) and (v.a.ty.kind == ir.T_INT) {
+        // (its low bytes: in the wider value's place)
+        let b = val_of(v.a, depth + 1);
+        if b >= 0 {
+            VALS.at(@int_cast(usize, me)).base = b;
+        }
+    } else if (op == ir.OP_PHI) and (depth < 6) {
+        let bs = ir.bs_of(v);
+        let mut ins = u.List.[PhiIn].empty();
+        for j in 0..v.xs.len {
+            let o = ir.resolve(v.xs.get(j));
+            let mut vi: i32 = -1;
+            let mut ci: i32 = -1;
+            if u.notnil(o) {
+                ci = cst_of(o);
+                if ci < 0 {
+                    vi = val_of(o, depth + 1);
+                }
+            }
+            ins.push(PhiIn.{ from: bs.get(j), val: vi, cst: ci });
+        }
+        VALS.at(@int_cast(usize, me)).phi_ops = ins;
+    }
+    return me;
+}
+
+// the entities of parameters: at the entry, the parameter (VALS index)
+let mut PENTS: u.List.[[2]i32] = u.List.[[2]i32].{ data: @ptr_from_int(*mut [2]i32, 0), len: 0, cap: 0 };
+
+/// Function f's code is selected next: the values of its variables to find.
+pub fn begin(f: *mut ir.Func, on: bool) void {
+    ENTS.clear();
+    for k in 0..VALS.len {
+        VALS.at(k).phi_ops.deinit();
+    }
+    VALS.clear();
+    CONSTS.clear();
+    MKS.clear();
+    PENTS.clear();
+    RCS.clear();
+    mc.mk_next.clear();
+    by_val = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    by_ent = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
+    boffs.clear();
+    mb_ir.clear();
+    pend = 0;
+    pend_after = u.nil.[mc.MInst]();
+    pend_blk = u.nil.[mc.MBlock]();
+    FN = f;
+    active = ir.dbg_on and on;
+    if not active {
+        return;
+    }
+    // the values the marks name (their makings are found as they are selected)
+    let mut b = f.first;
+    while u.notnil(b) {
+        let mut i = b.first;
+        while u.notnil(i) {
+            let mut k = ir.dbg_marks_at(i);
+            while k >= 0 {
+                let m = ir.dbg_marks.get(@int_cast(usize, k));
+                if @int_from_ptr(m.owner) == @int_from_ptr(f) {
+                    let v = ir.dbg_mark_value(k);
+                    if u.notnil(v) and (cst_of(v) < 0) {
+                        _ = val_of(v, 0);
+                    }
+                }
+                k = m.next;
+            }
+            i = i.next;
+        }
+        b = b.next;
+    }
+}
+
+/// Instruction selection starts machine block mb, of IR block b.
+pub fn enter_block(b: *mut ir.Block, mb: *mc.MBlock) void {
+    if not active {
+        return;
+    }
+    let k = @int_cast(usize, mb.id);
+    while mb_ir.len <= k {
+        mb_ir.push(u.nil.[ir.Block]());
+    }
+    mb_ir.set(k, b);
 }
 
 /// Parameter p arrives in physical register reg (-1: none), or at stack_off
 /// from the CFA (NO_LOC: not there).
-pub fn param(p: *ir.Value, reg: i32, stack_off: i64) void {
-    let x = find(p);
-    if u.notnil(x) {
+pub fn param(p: *mut ir.Value, reg: i32, stack_off: i64) void {
+    if not active {
+        return;
+    }
+    let k = val_of(p, 0);
+    if k >= 0 {
+        let x = VALS.at(@int_cast(usize, k));
         x.entry_reg = reg;
         x.stack_off = stack_off;
+    }
+}
+
+/// IR instruction i is selected next, into machine block b: the marks
+/// before it go before the code made for it (or what comes next).
+pub fn before(i: *ir.Value, b: *mut mc.MBlock) void {
+    if not active {
+        return;
+    }
+    let mut k = ir.dbg_marks_at(i);
+    if k < 0 {
+        return;
+    }
+    let vs = dbi.vars_of(FN.name);
+    let mut chain: i32 = 0;
+    while k >= 0 {
+        let m = ir.dbg_marks.get(@int_cast(usize, k));
+        let mk = k;
+        k = m.next;
+        if (@int_from_ptr(m.owner) != @int_from_ptr(FN)) or (m.var < 0) or (@int_cast(usize, m.var) >= vs.len) {
+            continue;  // (an inlined function's)
+        }
+        let x = vs[@int_cast(usize, m.var)];
+        if u.notnil(x.global) {
+            continue;
+        }
+        let v = ir.dbg_mark_value(mk);
+        let madd = ir.dbg_mark_add(mk);
+        let mut vi: i32 = -1;
+        let mut ci: i32 = -1;
+        let mut size = m.size;
+        if x.indirect {
+            // (the address of the variable: it is in memory there)
+            if u.notnil(v) and (v.ty.kind == ir.T_PTR) and (m.size == 0) {
+                size = @truncate(u32, v.ty.size);
+                vi = val_of(v, 0);
+            }
+        } else if ir.dbg_mark_low(mk) {
+            // (the low bits of a wider integer: in its place, read as narrower)
+            let ls = low_fits(v, x.ty, m.size);
+            if ls > 0 {
+                size = ls;
+                vi = val_of(v, 0);
+            }
+        } else if u.notnil(v) and fits(v, x.ty, m.size) {
+            size = @truncate(u32, v.ty.size);
+            ci = cst_of(v);
+            if (ci < 0) or (madd != 0) {
+                ci = -1;
+                vi = val_of(v, 0);
+            }
+        }
+        let e = ent_of(m.var, m.off, m.size, size);
+        ENTS.at(@int_cast(usize, e)).ind = x.indirect;
+        if (vi >= 0) and x.param and (VALS.get(@int_cast(usize, vi)).v.kind == ir.V_PARAM) {
+            PENTS.push([e, vi]);
+        }
+        MKS.push(MMark.{ ent: e, val: vi, cst: ci, add: madd });
+        mc.mk_next.push(0);
+        chain = mc.mk_cat(chain, @int_cast(i32, MKS.len));
+    }
+    if chain == 0 {
+        return;
+    }
+    if (pend != 0) and (pend_blk == b) {
+        pend = mc.mk_cat(pend, chain);
+        return;
+    }
+    pend = chain;
+    pend_after = b.last;
+    pend_blk = b;
+}
+
+// The marks waiting go before the first instruction of b after pend_after.
+fn place(b: *mut mc.MBlock) void {
+    if (pend == 0) or (pend_blk != b) {
+        return;
+    }
+    let mut n = b.first;
+    if u.notnil(pend_after) {
+        n = pend_after.next;
+    }
+    if u.notnil(n) {
+        n.mk = mc.mk_cat(pend, n.mk);
+        pend = 0;
     }
 }
 
 /// The code of IR instruction i was selected into block b, its value in
 /// virtual register r (-1: none): the last instruction of b writing r makes
 /// it.
-pub fn selected(i: *ir.Value, b: *mc.MBlock, r: i32) void {
-    let x = find(i);
-    if u.isnil(x) or (r < 0) {
+pub fn selected(i: *ir.Value, b: *mut mc.MBlock, r: i32) void {
+    if not active {
         return;
     }
+    place(b);
+    let k = by_val.get(key(@int_from_ptr(i)));
+    if (k == 0) or (r < 0) {
+        return;
+    }
+    let x = VALS.at(@int_cast(usize, k - 1));
     let mut m = b.last;
     while u.notnil(m) {
-        for k in 0..m.ops.len {
-            let o = m.ops[k];
+        for j in 0..m.ops.len {
+            let o = m.ops[j];
             if (o.kind == mc.K_REG) and (o.reg == r) and ((o.role & (mc.RD | mc.RE)) != 0) {
                 x.def = m;
-                x.def_op = k;
+                x.def_op = j;
                 return;
             }
         }
         m = m.prev;
+    }
+}
+
+/// Block b's code is selected (its terminator's too): the marks waiting
+/// are at its end.
+pub fn end_block(b: *mut mc.MBlock) void {
+    if not active {
+        return;
+    }
+    place(b);
+    if (pend != 0) and (pend_blk == b) {
+        b.mk_end = mc.mk_cat(b.mk_end, pend);
+        pend = 0;
     }
 }
 
@@ -284,271 +623,972 @@ fn move_regs(mf: *mc.MFunc, i: *mc.MInst) [2]i32 {
     return [d, s];
 }
 
-// State: the registers (r) and spill slots (s, by index) holding x.v.
-struct St {
-    r: u64,
-    s: u64,
+// -----------------------------------------------------------------------------
+// The analysis
+// -----------------------------------------------------------------------------
+// Places: the physical registers 0-63, the spill slots 0-63 (64 + slot).
+const NL: usize = 128;
+
+// The machine code, flattened: per instruction (in block order), what the
+// analysis needs.
+struct Ins {
+    i: *mut mc.MInst,
+    w: u64,      // the registers it writes (allocatable ones)
+    kind: u8,    // 0: other, 1: a spill store, 2: a reload, 3: a copy, 4: an exit, 5: a constant (imm) into d
+    d: i32,      // a copy's, reload's destination (a physical register), a spill store's source
+    s: i32,      // a copy's source register; a spill store's or reload's slot
+    defv: i32,   // the value it makes (a VALS index, -1: none)
+    defr: i32,   // in physical register
+    slots: u64,  // the spill slots it reads or writes otherwise
+    imm: i64,
 }
 
-// The state after instruction i, from st before it.
-fn step(mf: *mc.MFunc, t: *Tgt, x: *Var, i: *mc.MInst, st: St) St {
-    if t.is_exit(i) {
-        return St.{ r: 0, s: 0 };
+// The state at a point: C, what each place holds (0: nothing known, else
+// an identity); D and A, what each entity is (an identity plus A).
+struct State {
+    c: []mut i32,
+    d: []mut i32,
+    a: []mut i64,
+}
+
+// The analysis' tables for the function.
+struct An {
+    mf: *mc.MFunc,
+    t: *Tgt,
+    nb: usize,
+    ne: usize,
+    nv: i32,
+    syn0: i64,
+    ins: u.List.[Ins],
+    bfirst: []mut usize,  // each block's first instruction (in ins), and the end (bfirst[nb])
+    idom: []mut i32,
+    rpo: []mut i32,     // the blocks' order (reverse postorder)
+    rpon: []mut i32,    // each block's place in it (-1: unreachable)
+    defb: []mut i32,    // each value's making's block (-1: none)
+    defi: []mut usize,  // and its index in ins
+    tails: bool,
+    preds: []mut u.List.[i32],  // each block's predecessors (from the successors)
+}
+
+fn id_val(k: i32) i32 {
+    return k + 1;
+}
+
+// The constants machine instructions put in registers (all 64 bits): their
+// identities are -2, -3, ...
+let mut RCS: u.List.[i64] = u.List.[i64].{ data: @ptr_from_int(*mut i64, 0), len: 0, cap: 0 };
+
+fn rc_id(x: i64) i32 {
+    for k in 0..RCS.len {
+        if RCS.get(k) == x {
+            return -2 - @int_cast(i32, k);
+        }
     }
-    let mut r = st.r;
-    let mut s = st.s;
-    if i.spill == 2 {
-        // a spill store: the slot gets the register's contents
-        let sb = bit(i.sslot);
-        if (r & bit(mc.phys(mf, i.sreg))) != 0 {
-            s = s | sb;
+    RCS.push(x);
+    return -1 - @int_cast(i32, RCS.len);
+}
+
+// Does a place holding identity c hold what identity d is (the same one, or
+// constant d's bits)?
+fn is_held(an: *An, c: i32, d: i32) bool {
+    if c == d {
+        return c != 0;
+    }
+    let nv = an.nv;
+    if (c <= -2) and (d > 2 * nv) and (@as(i64, d) < an.syn0) {
+        let k = CONSTS.get(@int_cast(usize, d - (2 * nv) - 1));
+        let v = @bit_cast(u64, RCS.get(@int_cast(usize, -2 - c)));
+        if k.size >= 8 {
+            return v == k.bits;
+        }
+        let mask = (@as(u64, 1) << @as(u32, 8 * k.size)) - 1;
+        return (v & mask) == k.bits;
+    }
+    return false;
+}
+
+fn st_new(ne: usize) State {
+    return State.{ c: u.newn.[i32](NL), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1) };
+}
+
+fn st_copy(to: *mut State, from: *State, ne: usize) void {
+    for l in 0..NL {
+        to.c[l] = from.c[l];
+    }
+    for e in 0..ne {
+        to.d[e] = from.d[e];
+        to.a[e] = from.a[e];
+    }
+}
+
+fn st_clear(s: *mut State, ne: usize) void {
+    for l in 0..NL {
+        s.c[l] = 0;
+    }
+    for e in 0..ne {
+        s.d[e] = 0;
+        s.a[e] = 0;
+    }
+}
+
+fn st_same(x: *State, y: *State, ne: usize) bool {
+    for l in 0..NL {
+        if x.c[l] != y.c[l] {
+            return false;
+        }
+    }
+    for e in 0..ne {
+        if (x.d[e] != y.d[e]) or (x.a[e] != y.a[e]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn holds(s: *State, id: i32) bool {
+    for l in 0..NL {
+        if s.c[l] == id {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Does block a dominate block b?
+fn dominates(an: *An, a: i32, b: i32) bool {
+    if (a < 0) or (b < 0) or (an.rpon[@int_cast(usize, b)] < 0) {
+        return false;
+    }
+    let mut x = b;
+    let mut n: usize = 0;
+    while (x >= 0) and (n <= an.nb) {
+        if x == a {
+            return true;
+        }
+        let y = an.idom[@int_cast(usize, x)];
+        if y == x {
+            return false;
+        }
+        x = y;
+        n += 1;
+    }
+    return false;
+}
+
+// Is value k made where every path to instruction `at` (in block b) has
+// made it last (its making dominates the place)?
+fn made_before(an: *An, k: i32, b: i32, at: usize) bool {
+    let x = VALS.get(@int_cast(usize, k));
+    if x.v.kind == ir.V_PARAM {
+        return true;
+    }
+    if x.phi_blk >= 0 {
+        return dominates(an, x.phi_blk, b);
+    }
+    let db = an.defb[@int_cast(usize, k)];
+    if db < 0 {
+        return false;
+    }
+    if db == b {
+        return an.defi[@int_cast(usize, k)] < at;
+    }
+    return dominates(an, db, b);
+}
+
+// Mark mm takes effect in state s, before instruction `at` of block b.
+fn apply_mark(an: *An, s: *mut State, mm: MMark, b: i32, at: usize) void {
+    if mm.ent < 0 {
+        return;
+    }
+    let e = @int_cast(usize, mm.ent);
+    s.d[e] = 0;
+    s.a[e] = 0;
+    if mm.cst >= 0 {
+        s.d[e] = 2 * an.nv + mm.cst + 1;
+        return;
+    }
+    let k = mm.val;
+    if k < 0 {
+        return;
+    }
+    let x = VALS.get(@int_cast(usize, k));
+    if x.obj or (x.gsym.len > 0) or (x.v.kind == ir.V_PARAM) or holds(s, id_val(k)) {
+        s.d[e] = id_val(k);
+        s.a[e] = mm.add;
+        return;
+    }
+    if x.phi_blk >= 0 {
+        if dominates(an, x.phi_blk, b) {
+            s.d[e] = id_val(k);
+            s.a[e] = mm.add;
+        }
+        return;
+    }
+    // folded into its uses: its base's place, plus the constant
+    let mut bk = x.base;
+    let mut add = x.add +% mm.add;
+    let mut n: i32 = 0;
+    while (bk >= 0) and (n < 8) {
+        let y = VALS.get(@int_cast(usize, bk));
+        if y.obj or (y.gsym.len > 0) or holds(s, id_val(bk)) or ((y.v.kind == ir.V_PARAM) and (y.stack_off != NO_LOC)) {
+            s.d[e] = id_val(bk);
+            s.a[e] = add;
+            return;
+        }
+        add = add +% y.add;
+        bk = y.base;
+        n += 1;
+    }
+    if u.notnil(x.def) {
+        s.a[e] = mm.add;
+        if made_before(an, k, b, at) {
+            s.d[e] = id_val(k);
         } else {
-            s = s & ~sb;
+            s.d[e] = an.nv + k + 1;  // (made later on: waits for the making)
         }
-        return St.{ r: r & ~written(mf, i), s: s };
     }
-    let w = written(mf, i);
-    if (i.spill == 1) and (i.sslot >= 0) {
-        // a reload: the register gets the slot's contents
-        let d = mc.phys(mf, i.sreg);
-        let held = (s & bit(i.sslot)) != 0;
-        r = r & ~w;
-        if held {
-            r = r | bit(d);
-        }
-        return St.{ r: r, s: s };
+}
+
+fn apply_marks(an: *An, s: *mut State, chain: i32, b: i32, at: usize) void {
+    let mut k = chain;
+    while k != 0 {
+        apply_mark(an, s, MKS.get(@int_cast(usize, k - 1)), b, at);
+        k = mc.mk_next.get(@int_cast(usize, k - 1));
     }
-    if i.is_move {
-        let ds = move_regs(mf, i);
-        let held = (ds[1] >= 0) and ((r & bit(ds[1])) != 0);
-        r = r & ~w;
-        if held {
-            r = r | bit(ds[0]);
+}
+
+fn set_reg(an: *An, s: *mut State, r: i32, id: i32) void {
+    if (r >= 0) and (r < 64) and ((an.t.alloc & bit(r)) != 0) {
+        s.c[@int_cast(usize, r)] = id;
+    }
+}
+
+fn get_reg(an: *An, s: *State, r: i32) i32 {
+    if (r >= 0) and (r < 64) and ((an.t.alloc & bit(r)) != 0) {
+        return s.c[@int_cast(usize, r)];
+    }
+    return 0;
+}
+
+// The state after instruction x (from s before it, its marks applied).
+fn step(an: *An, s: *mut State, x: *Ins) void {
+    if x.kind == 4 {
+        for l in 0..NL {
+            s.c[l] = 0;
         }
-    } else {
-        r = r & ~w;
-        for o in i.ops {
-            if (o.kind == mc.K_MEM) and (o.slot >= 0) {
-                s = s & ~bit(o.slot);  // (a slot read or written by another: not followed further)
+        return;
+    }
+    let mut held: i32 = 0;
+    if x.kind == 1 {
+        held = get_reg(an, s, x.d);
+    } else if x.kind == 2 {
+        if (x.s >= 0) and (x.s < 64) {
+            held = s.c[64 + @int_cast(usize, x.s)];
+        }
+    } else if x.kind == 3 {
+        held = get_reg(an, s, x.s);
+    }
+    if x.w != 0 {
+        for p in @as(usize, 0)..64 {
+            if (x.w & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
+                s.c[p] = 0;
             }
         }
     }
-    if @int_from_ptr(i) == @int_from_ptr(x.def) {
-        r = r | bit(mc.phys(mf, i.ops[x.def_op].reg));
+    if x.slots != 0 {
+        for p in @as(usize, 0)..64 {
+            if (x.slots & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
+                s.c[64 + p] = 0;
+            }
+        }
     }
-    return St.{ r: r & t.alloc, s: s };
+    if x.kind == 1 {
+        if (x.s >= 0) and (x.s < 64) {
+            s.c[64 + @int_cast(usize, x.s)] = held;
+        }
+    } else if (x.kind == 2) or (x.kind == 3) {
+        set_reg(an, s, x.d, held);
+    } else if x.kind == 5 {
+        set_reg(an, s, x.d, rc_id(x.imm));
+    }
+    if x.defv >= 0 {
+        // a value made again: its other copies (and what was it) are stale
+        let id = id_val(x.defv);
+        let nx = an.nv + x.defv + 1;
+        for l in 0..NL {
+            if s.c[l] == id {
+                s.c[l] = 0;
+            }
+        }
+        for e in 0..an.ne {
+            if s.d[e] == id {
+                s.d[e] = 0;
+                s.a[e] = 0;
+            } else if s.d[e] == nx {
+                s.d[e] = id;
+            }
+        }
+        set_reg(an, s, x.defr, id);
+    }
+}
+
+// The synthetic identity of entity e's merge at block b (0: none).
+fn syn(an: *An, b: usize, e: usize) i32 {
+    let id = an.syn0 + (@as(i64, @int_cast(i64, b)) * @as(i64, @int_cast(i64, an.ne))) + @as(i64, @int_cast(i64, e));
+    if id >= 0x7fff_0000 {
+        return 0;
+    }
+    return @truncate(i32, id);
+}
+
+fn is_syn_of(an: *An, id: i32, b: usize) bool {
+    let x = @as(i64, id) - an.syn0;
+    if (x < 0) or (an.ne == 0) {
+        return false;
+    }
+    return @as(usize, @int_cast(usize, x)) / an.ne == b;
+}
+
+// The state at the start of block b, from the states at the ends of its
+// predecessors seen so far (outs, seen) and, for the entry, the entry's.
+fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut State) void {
+    let mb = an.mf.blocks.get(b);
+    let mut ps = u.List.[*State].empty();
+    let mut pb = u.List.[i32].empty();
+    if b == 0 {
+        ps.push(entry);
+        pb.push(-1);
+    }
+    for p in an.preds[b].items() {
+        if seen[@int_cast(usize, p)] {
+            ps.push(&outs[@int_cast(usize, p)]);
+            pb.push(p);
+        }
+    }
+    st_clear(s, an.ne);
+    if ps.len == 0 {
+        ps.deinit();
+        pb.deinit();
+        return;
+    }
+    let n = ps.len;
+    // the entities
+    let rep = u.newn.[i32](an.ne + 1);  // a disagreeing entity's representative (-1: none)
+    for e in 0..an.ne {
+        rep[e] = -1;
+        let d0 = ps.get(0).d[e];
+        let a0 = ps.get(0).a[e];
+        let mut same = not is_syn_of(an, d0, b);
+        let mut known = d0 != 0;
+        let mut adds = true;
+        for j in 1..n {
+            let x = ps.get(j);
+            if (x.d[e] != d0) or is_syn_of(an, x.d[e], b) {
+                same = false;
+            }
+            if x.a[e] != a0 {
+                same = false;
+                adds = false;
+            }
+            known = known and (x.d[e] != 0);
+        }
+        if same {
+            s.d[e] = d0;
+            s.a[e] = a0;
+            continue;
+        }
+        if not known or not adds {
+            continue;
+        }
+        // a merge of its own, or of an earlier entity with the same inputs
+        let mut r = e;
+        for f in 0..e {
+            if rep[f] != @int_cast(i32, f) {
+                continue;
+            }
+            let mut eq = true;
+            for j in 0..n {
+                if ps.get(j).d[f] != ps.get(j).d[e] {
+                    eq = false;
+                }
+            }
+            if eq {
+                r = f;
+                break;
+            }
+        }
+        rep[e] = @int_cast(i32, r);
+        s.d[e] = syn(an, b, r);
+        s.a[e] = a0;
+    }
+    // the places
+    for l in 0..NL {
+        let c0 = ps.get(0).c[l];
+        let mut same = (c0 != 0) and not is_syn_of(an, c0, b);
+        for j in 1..n {
+            if ps.get(j).c[l] != c0 {
+                same = false;
+            }
+        }
+        if same {
+            s.c[l] = c0;
+            continue;
+        }
+        for e in 0..an.ne {
+            if (rep[e] != @int_cast(i32, e)) or (s.d[e] == 0) {
+                continue;
+            }
+            let mut all = true;
+            for j in 0..n {
+                let x = ps.get(j);
+                if not is_held(an, x.c[l], x.d[e]) {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                s.c[l] = s.d[e];
+                break;
+            }
+        }
+    }
+    // the phis of the block: where each path's input is at its end
+    let ib = mb_ir_of(b);
+    for k in 0..VALS.len {
+        let x = VALS.at(k);
+        if x.phi_blk != @int_cast(i32, b) {
+            continue;
+        }
+        let id = id_val(@int_cast(i32, k));
+        let mut ok = u.notnil(ib) and (b != 0);
+        let mut at = u.newn.[bool](NL);
+        for l in 0..NL {
+            at[l] = ok;
+        }
+        for j in 0..n {
+            if not ok {
+                break;
+            }
+            let pi = pb.get(j);
+            let from = mb_ir_of(@int_cast(usize, pi));
+            let mut inid: i32 = 0;
+            for q in x.phi_ops.items() {
+                if u.notnil(from) and (q.from == from) and (q.val >= 0) {
+                    inid = id_val(q.val);
+                } else if u.notnil(from) and (q.from == from) and (q.cst >= 0) {
+                    inid = 2 * an.nv + q.cst + 1;
+                }
+            }
+            if inid == 0 {
+                ok = false;
+                break;
+            }
+            let ps_j = ps.get(j);
+            for l in 0..NL {
+                if not is_held(an, ps_j.c[l], inid) {
+                    at[l] = false;
+                }
+            }
+        }
+        for l in 0..NL {
+            if s.c[l] == id {
+                s.c[l] = 0;
+            }
+        }
+        let nx = an.nv + @int_cast(i32, k) + 1;
+        for e in 0..an.ne {
+            if s.d[e] == id {
+                s.d[e] = 0;
+                s.a[e] = 0;
+            } else if s.d[e] == nx {
+                s.d[e] = id;
+            }
+        }
+        if ok {
+            for l in 0..NL {
+                if at[l] {
+                    s.c[l] = id;
+                }
+            }
+        }
+    }
+    ps.deinit();
+    pb.deinit();
+}
+
+// The IR block of machine block b (nil: none), through blocks made since
+// with one predecessor.
+fn mb_ir_of(b: usize) *mut ir.Block {
+    if b < mb_ir.len {
+        return mb_ir.get(b);
+    }
+    return u.nil.[ir.Block]();
+}
+
+// The blocks' immediate dominators (the entry's is itself; an unreachable
+// block's -1), over the machine CFG: the iterative algorithm over reverse
+// postorder (Cooper, Harvey and Kennedy, "A Simple, Fast Dominance
+// Algorithm", 2001).
+fn dominators(an: *mut An) void {
+    let nb = an.nb;
+    let color = u.newn.[u8](nb + 1);
+    let post = u.newn.[i32](nb + 1);
+    let mut np: usize = 0;
+    for b in 0..nb {
+        color[b] = 0;
+        an.rpon[b] = -1;
+        an.idom[b] = -1;
+    }
+    // (an explicit stack of (block, next successor))
+    let mut stk = u.List.[[2]i32].empty();
+    stk.push([0, 0]);
+    color[0] = 1;
+    while stk.len > 0 {
+        let top = stk.last();
+        let b = an.mf.blocks.get(@int_cast(usize, top[0]));
+        let k = @int_cast(usize, top[1]);
+        if k < b.succs.len {
+            stk.set(stk.len - 1, [top[0], top[1] + 1]);
+            let s = b.succs.get(k);
+            if (s >= 0) and (@int_cast(usize, s) < nb) and (color[@int_cast(usize, s)] == 0) {
+                color[@int_cast(usize, s)] = 1;
+                stk.push([s, 0]);
+            }
+        } else {
+            post[np] = top[0];
+            np += 1;
+            _ = stk.pop();
+        }
+    }
+    stk.deinit();
+    for k in 0..np {
+        let b = post[np - 1 - k];
+        an.rpo[k] = b;
+        an.rpon[@int_cast(usize, b)] = @int_cast(i32, k);
+    }
+    for k in np..nb {
+        an.rpo[k] = -1;
+    }
+    an.idom[0] = 0;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for k in 1..np {
+            let b = an.rpo[k];
+            let mut nd: i32 = -1;
+            for p in an.preds[@int_cast(usize, b)].items() {
+                if (p < 0) or (an.idom[@int_cast(usize, p)] < 0) {
+                    continue;
+                }
+                if nd < 0 {
+                    nd = p;
+                    continue;
+                }
+                // intersect
+                let mut x = p;
+                let mut y = nd;
+                while x != y {
+                    while an.rpon[@int_cast(usize, x)] > an.rpon[@int_cast(usize, y)] {
+                        x = an.idom[@int_cast(usize, x)];
+                    }
+                    while an.rpon[@int_cast(usize, y)] > an.rpon[@int_cast(usize, x)] {
+                        y = an.idom[@int_cast(usize, y)];
+                    }
+                }
+                nd = x;
+            }
+            if (nd >= 0) and (an.idom[@int_cast(usize, b)] != nd) {
+                an.idom[@int_cast(usize, b)] = nd;
+                changed = true;
+            }
+        }
+    }
+}
+
+// The flattened code (an.ins, an.bfirst) and each value's making.
+fn flatten(an: *mut An) void {
+    let mf = an.mf;
+    let t = an.t;
+    let mut by_def = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    for k in 0..VALS.len {
+        let x = VALS.get(k);
+        if u.notnil(x.def) {
+            by_def.put(key(@int_from_ptr(x.def)), @int_cast(i32, k) + 1);
+        }
+        an.defb[k] = -1;
+        an.defi[k] = 0;
+    }
+    for bi in 0..an.nb {
+        an.bfirst[bi] = an.ins.len;
+        let mut i = mf.blocks.get(bi).first;
+        while u.notnil(i) {
+            an.tails = an.tails or t.is_tail(i);
+            let mut x = Ins.{ i: i, w: written(mf, i) & t.alloc, kind: 0, d: -1, s: -1, defv: -1, defr: -1, slots: 0,
+                              imm: 0 };
+            if t.is_exit(i) {
+                x.kind = 4;
+            } else if i.spill == 2 {
+                x.kind = 1;
+                x.d = mc.phys(mf, i.sreg);
+                x.s = i.sslot;
+            } else if (i.spill == 1) and (i.sslot >= 0) {
+                x.kind = 2;
+                x.d = mc.phys(mf, i.sreg);
+                x.s = i.sslot;
+            } else if i.is_move {
+                let ds = move_regs(mf, i);
+                x.kind = 3;
+                x.d = ds[0];
+                x.s = ds[1];
+            } else if (t.imm_of(i) != NO_LOC) and (i.ops.len > 0) and (i.ops[0].kind == mc.K_REG) {
+                x.kind = 5;
+                x.d = mc.phys(mf, i.ops[0].reg);
+                x.imm = t.imm_of(i);
+            } else {
+                for o in i.ops {
+                    if (o.kind == mc.K_MEM) and (o.slot >= 0) and (o.slot < 64) {
+                        x.slots = x.slots | bit(o.slot);  // (a slot read or written by another: not followed further)
+                    }
+                }
+            }
+            if by_def.len > 0 {
+                let dv = by_def.get(key(@int_from_ptr(i))) - 1;
+                if dv >= 0 {
+                    let v = VALS.get(@int_cast(usize, dv));
+                    x.defv = dv;
+                    x.defr = mc.phys(mf, i.ops[v.def_op].reg);
+                    an.defb[@int_cast(usize, dv)] = @int_cast(i32, bi);
+                    an.defi[@int_cast(usize, dv)] = an.ins.len;
+                }
+            }
+            an.ins.push(x);
+            i = i.next;
+        }
+    }
+    an.bfirst[an.nb] = an.ins.len;
 }
 
 /// The location pieces of the function's variables, from its machine code
 /// mf (allocated, encoded: block_at, inst_at), `size` bytes of it.
 pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     let mut out = u.List.[VLoc].empty();
-    if not active {
+    if not active or (ENTS.len == 0) {
         return out.items();
-    }
-    for c in CONSTS.items() {
-        out.push(c);
     }
     let nb = mf.blocks.len;
     if (nb == 0) or (boffs.len < nb) {
         return out.items();
     }
-    // (a call in tail position writes the stack arguments' area)
-    let mut tails = false;
-    for bi in 0..nb {
-        let mut i = mf.blocks.get(bi).first;
-        while u.notnil(i) {
-            tails = tails or t.is_tail(i);
-            i = i.next;
+    // the phis' blocks
+    let mut ir_mb = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    for b in 0..mb_ir.len {
+        if u.notnil(mb_ir.get(b)) {
+            ir_mb.put(key(@int_from_ptr(mb_ir.get(b))), @int_cast(i32, b) + 1);
         }
     }
-    let ins = u.newn.[St](nb + 1);
-    let outs = u.newn.[St](nb + 1);
-    for xi in 0..VS.len {
-        let x = VS.at(xi);
-        if x.stack_off != NO_LOC {
-            if not tails and (size > 0) {
-                out.push(VLoc.{ var: x.var, kind: LK_PIECE, start: 0, end: size, reg: -1, off: x.stack_off });
-            }
-            continue;
+    for k in 0..VALS.len {
+        let x = VALS.at(k);
+        if (x.v.kind == ir.V_INST) and (x.v.op == ir.OP_PHI) and u.notnil(x.v.blk) {
+            x.phi_blk = ir_mb.get(key(@int_from_ptr(x.v.blk))) - 1;
         }
-        if u.isnil(x.def) and (x.entry_reg < 0) {
-            continue;
-        }
-        // the dataflow: every block but the entry starts as all (the meet's identity)
-        for bi in 0..nb {
-            ins[bi] = St.{ r: ~@as(u64, 0), s: ~@as(u64, 0) };
-            outs[bi] = St.{ r: ~@as(u64, 0), s: ~@as(u64, 0) };
-        }
-        let entry = St.{ r: bit(x.entry_reg) & t.alloc, s: 0 };
-        let mut changed = true;
-        let mut rounds: i32 = 0;
-        while changed and (rounds < 100) {
-            changed = false;
-            rounds += 1;
-            for bi in 0..nb {
-                let b = mf.blocks.get(bi);
-                let mut st = entry;
-                if bi != 0 {
-                    st = St.{ r: ~@as(u64, 0), s: ~@as(u64, 0) };
-                    if b.preds.len == 0 {
-                        st = St.{ r: 0, s: 0 };
-                    }
-                    for p in b.preds.items() {
-                        let o = outs[@int_cast(usize, p)];
-                        st = St.{ r: st.r & o.r, s: st.s & o.s };
-                    }
-                } else {
-                    for p in b.preds.items() {
-                        let o = outs[@int_cast(usize, p)];
-                        st = St.{ r: st.r & o.r, s: st.s & o.s };
-                    }
-                }
-                ins[bi] = st;
-                let mut i = b.first;
-                while u.notnil(i) {
-                    st = step(mf, t, x, i, st);
-                    i = i.next;
-                }
-                if (st.r != outs[bi].r) or (st.s != outs[bi].s) {
-                    outs[bi] = st;
-                    changed = true;
-                }
+    }
+    let ne = ENTS.len;
+    let nv = @int_cast(i32, VALS.len);
+    let mut an = An.{ mf: mf, t: t, nb: nb, ne: ne, nv: nv,
+                      syn0: (2 * @as(i64, nv)) + @as(i64, @int_cast(i64, CONSTS.len)) + 1, ins: u.List.[Ins].empty(),
+                      bfirst: u.newn.[usize](nb + 1), idom: u.newn.[i32](nb + 1), rpo: u.newn.[i32](nb + 1),
+                      rpon: u.newn.[i32](nb + 1), defb: u.newn.[i32](VALS.len + 1), defi: u.newn.[usize](VALS.len + 1),
+                      tails: false, preds: u.newn.[u.List.[i32]](nb + 1) };
+    for b in 0..nb {
+        an.preds[b] = u.List.[i32].empty();
+    }
+    for b in 0..nb {
+        for sc in mf.blocks.get(b).succs.items() {
+            if (sc >= 0) and (@int_cast(usize, sc) < nb) {
+                an.preds[@int_cast(usize, sc)].push(@int_cast(i32, b));
             }
         }
-        if changed {
-            continue;  // (did not settle: nothing said)
+    }
+    dominators(&mut an);
+    flatten(&mut an);
+    // the state at the entry: the parameters in their registers, and the
+    // variables they are
+    let mut entry = st_new(ne);
+    st_clear(&mut entry, ne);
+    for k in 0..VALS.len {
+        let x = VALS.get(k);
+        if x.entry_reg >= 0 {
+            set_reg(&an, &mut entry, x.entry_reg, id_val(@int_cast(i32, k)));
         }
-        pieces(mf, t, x, ins[0..nb], entry, size, &mut out);
+    }
+    for pe in PENTS.items() {
+        entry.d[@int_cast(usize, pe[0])] = id_val(pe[1]);
+    }
+    let ins_ = u.newn.[State](nb + 1);
+    let outs = u.newn.[State](nb + 1);
+    let seen = u.newn.[bool](nb + 1);
+    for b in 0..nb {
+        ins_[b] = st_new(ne);
+        outs[b] = st_new(ne);
+        st_clear(&mut ins_[b], ne);
+        st_clear(&mut outs[b], ne);
+        seen[b] = false;
+    }
+    let mut cur = st_new(ne);
+    let mut changed = true;
+    let mut rounds: i32 = 0;
+    while changed and (rounds < 50) {
+        changed = false;
+        rounds += 1;
+        for k in 0..nb {
+            let b = an.rpo[k];
+            if b < 0 {
+                break;
+            }
+            let bi = @int_cast(usize, b);
+            meet(&an, bi, outs, seen, &entry, &mut ins_[bi]);
+            st_copy(&mut cur, &ins_[bi], ne);
+            run_block(&an, bi, &mut cur);
+            if not seen[bi] or not st_same(&cur, &outs[bi], ne) {
+                st_copy(&mut outs[bi], &cur, ne);
+                seen[bi] = true;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        an.ins.deinit();
+        return out.items();  // (did not settle: nothing said)
+    }
+    ranges(&an, ins_, &entry, size, &mut out);
+    an.ins.deinit();
+    for b in 0..nb {
+        an.preds[b].deinit();
     }
     return out.items();
 }
 
-// The pieces of x's location over the encoded code: each block's start (the
-// state it is entered with) and each visited instruction's group (the state
-// before it, less what the group writes), the best place in each.
-fn pieces(mf: *mc.MFunc, t: *Tgt, x: *Var, ins: []St, entry: St, size: u64, out: *mut u.List.[VLoc]) void {
-    // the ranges in code order: (offset, state); then each one's end is the next one's start
-    let mut at = u.List.[u64].empty();
-    let mut sr = u.List.[u64].empty();
-    let mut ss = u.List.[u64].empty();
-    // (the code before the first block's: the prologue, at the entry)
-    at.push(0);
-    sr.push(entry.r);
-    ss.push(entry.s);
-    for bi in 0..mf.blocks.len {
-        let b = mf.blocks.get(bi);
-        let bo = boffs.get(bi);
-        let mut st = ins[bi];
-        let mut i = b.first;
-        let mut first = true;
-        while u.notnil(i) {
-            let o = offs.get(key(@int_from_ptr(i)));
-            if o == 0 {
-                // (encoded with the one before: the group's state loses what it writes)
-                if at.len > 0 {
-                    sr.set(sr.len - 1, sr.last() & ~written(mf, i));
-                    if t.is_exit(i) {
-                        sr.set(sr.len - 1, 0);
-                        ss.set(ss.len - 1, 0);
-                    }
-                }
-                st = step(mf, t, x, i, st);
-                i = i.next;
+// Block b's instructions over state s.
+fn run_block(an: *An, b: usize, s: *mut State) void {
+    for j in an.bfirst[b]..an.bfirst[b + 1] {
+        let x = an.ins.at(j);
+        if x.i.mk != 0 {
+            apply_marks(an, s, x.i.mk, @int_cast(i32, b), j);
+        }
+        step(an, s, x);
+    }
+    let mb = an.mf.blocks.get(b);
+    if mb.mk_end != 0 {
+        apply_marks(an, s, mb.mk_end, @int_cast(i32, b), an.bfirst[b + 1]);
+    }
+}
+
+// Where entity e is in state s, but in registers `minus` (written by the
+// code the location is for): a location (its kind 0xff: none).
+fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
+    let en = ENTS.get(e);
+    let mut r = VLoc.{ var: en.var, poff: en.poff, psize: en.psize, kind: 0xff, start: 0, end: 0, reg: -1, off: 0,
+                       add: s.a[e], size: en.size, ind: en.ind, gsym: "" };
+    let id = s.d[e];
+    if id <= 0 {
+        return r;
+    }
+    let nv = an.nv;
+    if (id > 2 * nv) and (@as(i64, id) < an.syn0) {
+        let c = CONSTS.get(@int_cast(usize, id - (2 * nv) - 1));
+        if en.ind {
+            return r;  // (a constant address: not one of a frame's)
+        }
+        r.kind = LK_CONST;
+        r.off = @bit_cast(i64, c.bits);
+        r.add = 0;
+        r.size = c.size;
+        return r;
+    }
+    if (id > nv) and (id <= 2 * nv) {
+        return r;  // (waits for its making)
+    }
+    if id <= nv {
+        let x = VALS.get(@int_cast(usize, id - 1));
+        if x.gsym.len > 0 {
+            r.kind = LK_GADDR;
+            r.gsym = x.gsym;
+            r.off = r.add;
+            r.add = 0;
+            return r;
+        }
+        if x.obj {
+            let o = an.t.obj_off(x.v);
+            if o != NO_LOC {
+                r.kind = LK_ADDR;
+                r.off = o +% r.add;
+                r.add = 0;
+            }
+            return r;
+        }
+    }
+    // (the register it was in, if it still is: fewer pieces; else the lowest)
+    let mut best: i32 = -1;
+    for p in @as(usize, 0)..64 {
+        if (s.c[p] == id) and ((minus & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) == 0) {
+            let dr = an.t.dw_reg(@int_cast(i32, p));
+            if (dr >= 0) and ((best < 0) or (dr == prefer)) {
+                best = dr;
+            }
+        }
+    }
+    if best >= 0 {
+        r.kind = LK_REG;
+        r.reg = best;
+        return r;
+    }
+    for p in @as(usize, 0)..64 {
+        if s.c[64 + p] == id {
+            let so = an.t.slot_off(@int_cast(i32, p));
+            if so != NO_LOC {
+                r.kind = LK_SLOT;
+                r.off = so;
+                return r;
+            }
+        }
+    }
+    if id <= nv {
+        let x = VALS.get(@int_cast(usize, id - 1));
+        if (x.v.kind == ir.V_PARAM) and (x.stack_off != NO_LOC) and not an.tails {
+            r.kind = LK_SLOT;
+            r.off = x.stack_off;
+        }
+    }
+    return r;
+}
+
+fn same_loc(a: *VLoc, b: *VLoc) bool {
+    return (a.kind == b.kind) and (a.reg == b.reg) and (a.off == b.off) and (a.add == b.add) and (a.size == b.size) and
+           (a.gsym.ptr == b.gsym.ptr);
+}
+
+// The locations of every entity from code offset `at` on (in state s, but
+// in registers `minus`; none at all: `none`), each one a piece of out
+// when it differs from the one before (open: each entity's last piece in
+// out + 1, 0: none open).
+fn emit_at(an: *An, s: *State, minus: u64, none: bool, at: u64, open: []mut usize, out: *mut u.List.[VLoc]) void {
+    for e in 0..an.ne {
+        let mut prefer: i32 = -1;
+        if (open[e] != 0) and (out.at(open[e] - 1).kind == LK_REG) {
+            prefer = out.at(open[e] - 1).reg;
+        }
+        let mut w = where(an, s, e, minus, prefer);
+        if none {
+            w.kind = 0xff;
+        }
+        let o = open[e];
+        if o != 0 {
+            let p = out.at(o - 1);
+            if (w.kind != 0xff) and same_loc(p, &w) {
                 continue;
             }
-            if first and (bo != 0xffff_ffff_ffff_ffff) and (bo < o - 1) {
-                at.push(bo);
-                sr.push(st.r);
-                ss.push(st.s);
-            }
-            first = false;
-            at.push(o - 1);
-            let mut gr = st.r & ~written(mf, i);
-            let mut gs = st.s;
-            if t.is_exit(i) {
-                gr = 0;
-                gs = 0;
-            }
-            sr.push(gr);
-            ss.push(gs);
-            st = step(mf, t, x, i, st);
-            i = i.next;
+            p.end = at;
+            open[e] = 0;
         }
-        if first and (bo != 0xffff_ffff_ffff_ffff) {
-            at.push(bo);
-            sr.push(st.r);
-            ss.push(st.s);
+        if w.kind != 0xff {
+            w.start = at;
+            w.end = at;
+            out.push(w);
+            open[e] = out.len;
         }
     }
-    // in code order (blocks are laid out in order; sorted for safety)
-    let n = at.len;
-    let idx = u.newn.[usize](n + 1);
-    for k in 0..n {
-        idx[k] = k;
+}
+
+// The pieces of the entities' locations over the encoded code: each block's
+// start (the state it is entered with) and each visited instruction's group
+// (the state before it, but what the group writes), in code order.
+fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VLoc]) void {
+    let nb = an.nb;
+    let ne = an.ne;
+    let open = u.newn.[usize](ne + 1);
+    for e in 0..ne {
+        open[e] = 0;
     }
-    for k in 1..n {
+    // the blocks in code order
+    let order = u.newn.[usize](nb + 1);
+    for b in 0..nb {
+        order[b] = b;
+    }
+    for k in 1..nb {
         let mut j = k;
-        while (j > 0) and (at.get(idx[j - 1]) > at.get(idx[j])) {
-            let y = idx[j];
-            idx[j] = idx[j - 1];
-            idx[j - 1] = y;
+        while (j > 0) and (boffs.get(order[j - 1]) > boffs.get(order[j])) {
+            let y = order[j];
+            order[j] = order[j - 1];
+            order[j - 1] = y;
             j -= 1;
         }
     }
-    let mut cur_reg: i32 = -2;
-    let mut cur_off: i64 = NO_LOC;
-    let mut cur_start: u64 = 0;
-    for kk in 0..n {
-        let k = idx[kk];
-        let start = at.get(k);
-        let mut end = size;
-        if kk + 1 < n {
-            end = at.get(idx[kk + 1]);
-        }
-        if end <= start {
+    let mut s = st_new(ne);
+    // (the code before the first block's: the prologue, at the entry)
+    emit_at(an, entry, 0, false, 0, open, out);
+    let mut last: u64 = 0;
+    for k in 0..nb {
+        let b = order[k];
+        let bo = boffs.get(b);
+        if bo == 0xffff_ffff_ffff_ffff {
             continue;
         }
-        // the place: the lowest-numbered register, else a spill slot
-        let mut reg: i32 = -2;
-        let mut off: i64 = NO_LOC;
-        let r = sr.get(k);
-        for p in @as(usize, 0)..64 {
-            if (r & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
-                let dr = t.dw_reg(@int_cast(i32, p));
-                if dr >= 0 {
-                    reg = dr;
-                    break;
-                }
+        st_copy(&mut s, &ins_[b], ne);
+        let unreached = an.rpon[b] < 0;
+        let lo = an.bfirst[b];
+        let hi = an.bfirst[b + 1];
+        // the first visited instruction's offset
+        let mut first: u64 = 0xffff_ffff_ffff_ffff;
+        for j in lo..hi {
+            let o = offs.get(key(@int_from_ptr(an.ins.get(j).i)));
+            if o != 0 {
+                first = o - 1;
+                break;
             }
         }
-        if reg == -2 {
-            let s = ss.get(k);
-            for p in @as(usize, 0)..64 {
-                if (s & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
-                    let so = t.slot_off(@int_cast(i32, p));
-                    if so != NO_LOC {
-                        reg = -1;
-                        off = so;
-                        break;
-                    }
+        if (bo >= last) and ((first == 0xffff_ffff_ffff_ffff) or (bo < first)) {
+            emit_at(an, &s, 0, unreached, bo, open, out);
+            last = bo;
+        }
+        let mut j = lo;
+        while j < hi {
+            let x = an.ins.at(j);
+            if x.i.mk != 0 {
+                apply_marks(an, &mut s, x.i.mk, @int_cast(i32, b), j);
+            }
+            let o = offs.get(key(@int_from_ptr(x.i)));
+            if o != 0 {
+                // the group: this instruction and those encoded with it
+                let mut minus = x.w;
+                let mut exit = x.kind == 4;
+                let mut g = j + 1;
+                while (g < hi) and (offs.get(key(@int_from_ptr(an.ins.get(g).i))) == 0) {
+                    minus = minus | an.ins.get(g).w;
+                    exit = exit or (an.ins.get(g).kind == 4);
+                    g += 1;
+                }
+                if o - 1 >= last {
+                    emit_at(an, &s, minus, exit or unreached, o - 1, open, out);
+                    last = o - 1;
                 }
             }
-        }
-        if (reg == cur_reg) and (off == cur_off) and (out.len > 0) and (out.last().var == x.var) and
-           (out.last().end == start) and (reg != -2) {
-            out.at(out.len - 1).end = end;
-            continue;
-        }
-        cur_reg = reg;
-        cur_off = off;
-        cur_start = start;
-        if reg != -2 {
-            out.push(VLoc.{ var: x.var, kind: LK_PIECE, start: start, end: end, reg: reg, off: off });
+            step(an, &mut s, x);
+            j += 1;
         }
     }
-    _ = cur_start;
-    at.deinit();
-    sr.deinit();
-    ss.deinit();
+    for e in 0..ne {
+        if open[e] != 0 {
+            out.at(open[e] - 1).end = size;
+        }
+    }
+    // (pieces of no length out)
+    let mut n: usize = 0;
+    for k in 0..out.len {
+        let p = out.get(k);
+        if p.end > p.start {
+            out.set(n, p);
+            n += 1;
+        }
+    }
+    out.len = n;
 }

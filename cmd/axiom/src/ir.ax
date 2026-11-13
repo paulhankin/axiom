@@ -1754,6 +1754,7 @@ fn bury_value(v: *mut Value) void {
     }
     if dbg_on {
         dbg_buried(v);
+        _ = dbg_take(v);
     }
     v.xs.deinit();
     release_more(v);
@@ -1784,6 +1785,9 @@ pub fn release_lists(f: *mut Func) void {
 }
 
 fn bury_block(b: *mut Block) void {
+    if dbg_on {
+        _ = mk_block_take(b);
+    }
     let mut i = b.first;
     while u.notnil(i) {
         let next = i.next;
@@ -2331,26 +2335,28 @@ let mut fwd_epoch: u64 = 1;
 pub fn forward(v: *mut Value, r: *mut Value) void {
     v.fwd = r;
     fwd_epoch += 1;
-    if dbg_on {
-        dbg_replace(v, r);
+    if dbg_on and u.notnil(r) {
+        dbg_replace(v, r);  // (nil: forwarding stops, v is v again)
     }
 }
 
 // -----------------------------------------------------------------------------
 // Debug information of optimized code (-g, -O1 and up: dbginfo.ax): the
-// values that are a variable's (one assigned once: the value it was
-// assigned), followed as passes replace them (a forwarded value's role
-// goes to its replacement: the same value where it is used), and given up
-// when one is copied (the copies would be the variable too, in other
-// places: unrolled, inlined, duplicated code). An alloca that takes
-// another's place (sharing a slot, a copy made the same object) is marked:
-// its memory holds another variable's contents too. Values are told apart
-// by their ids (a dead value's memory is reused, an id is not).
+// values the variables are given (the marks below; the stores of those left
+// in memory), followed as passes replace them (a forwarded value's role
+// goes to its replacement: the same value where it is used), through a
+// value folded away to the value it was a constant away from, and given up
+// when one is dead. An alloca that takes another's place (sharing a slot, a
+// copy made the same object) is marked: its memory holds another
+// variable's contents too. Values are told apart by their ids (a dead
+// value's memory is reused, an id is not).
 // -----------------------------------------------------------------------------
 pub struct DbgRef {
     v: *mut Value,  // nil: given up
     id: i32,
-    copied: bool,
+    low: bool,  // what it stands for is the low bits of v (a counter widened: loops.ax)
+    add: i64,   // what it stands for is v + add (a value folded away: dbg_buried)
+    alt: i32,   // v as another entry's value plus a constant, or its low bits (dbg_alt; -1: none)
     next: i32,  // the next entry following the same value (-1: none)
 }
 
@@ -2371,7 +2377,7 @@ fn dbg_key(v: *Value) []u8 {
 /// information: its index in dbg_refs.
 pub fn dbg_track(v: *mut Value) i32 {
     let k = @int_cast(i32, dbg_refs.len);
-    dbg_refs.push(DbgRef.{ v: v, id: v.id, copied: false, next: -1 });
+    dbg_refs.push(DbgRef.{ v: v, id: v.id, low: false, add: 0, alt: -1, next: -1 });
     dbg_link(k, v);
     return k;
 }
@@ -2384,23 +2390,8 @@ fn dbg_link(k: i32, v: *mut Value) void {
     }
 }
 
-/// The value dbg_refs[k] stands for now (nil: none, or given up).
-pub fn dbg_value(k: i32) *mut Value {
-    if (k < 0) or (@int_cast(usize, k) >= dbg_refs.len) {
-        return vnil();
-    }
-    let r = dbg_refs.get(@int_cast(usize, k));
-    if u.isnil(r.v) or r.copied {
-        return vnil();
-    }
-    if (r.v.kind == V_INST) and ((r.v.id != r.id) or (r.v.grave != 0) or u.isnil(r.v.blk)) {
-        return vnil();
-    }
-    return r.v;
-}
-
 /// Is the instruction dbg_refs[k] follows still where it was (in a block,
-/// not dead), copied or not?
+/// not dead)?
 pub fn dbg_present(k: i32) bool {
     let r = dbg_refs.get(@int_cast(usize, k));
     return u.notnil(r.v) and (r.v.kind == V_INST) and (r.v.id == r.id) and (r.v.grave == 0) and u.notnil(r.v.blk);
@@ -2438,7 +2429,8 @@ fn dbg_replace(v: *mut Value, r0: *mut Value) void {
     dbg_at.put(dbg_key(v), 0);
     let r = resolve(r0);
     let ok = u.notnil(r) and (r != v) and
-             ((r.kind == V_INST) or (r.kind == V_CINT) or (r.kind == V_CFP) or (r.kind == V_ZERO));
+             ((r.kind == V_INST) or (r.kind == V_CINT) or (r.kind == V_CFP) or (r.kind == V_ZERO) or
+              (r.kind == V_GLOBAL) or (r.kind == V_PARAM));
     while j >= 0 {
         let ref = dbg_refs.at(@int_cast(usize, j));
         let nx = ref.next;
@@ -2455,8 +2447,61 @@ fn dbg_replace(v: *mut Value, r0: *mut Value) void {
     }
 }
 
+// v leaves its place (to go elsewhere, or for good): the entries following
+// it get, where v is a value plus a constant (folded into its uses) or the
+// low bits of one, that one as an entry of their own (alt), for dbg_buried.
+// (Its operands are read now: once v is dead they may be too.)
+fn dbg_alt(v: *Value) void {
+    let mut j = dbg_chain(v);
+    if j < 0 {
+        return;
+    }
+    if (v.kind != V_INST) or u.isnil(v.a) or not ((v.ty.kind == T_INT) or (v.ty.kind == T_PTR)) or (v.ty.size > 8) {
+        return;
+    }
+    let op = v.op;
+    let mut base = vnil();
+    let mut plus: i64 = 0;
+    let mut low = false;
+    if ((op == OP_PTRADD) or (op == OP_ADD) or (op == OP_SUB)) and u.notnil(v.b) and (v.b.kind == V_CINT) {
+        base = resolve(v.a);
+        plus = @bit_cast(i64, cint_val(v.b));
+        let bits = v.b.ty.bits;
+        if (bits > 0) and (bits < 64) {
+            let sh = @as(u32, @int_cast(u32, 64 - bits));
+            plus = (plus << sh) >> sh;
+        }
+        if op == OP_SUB {
+            plus = 0 -% plus;
+        }
+        if u.notnil(base) and (base.ty.kind != v.ty.kind) {
+            base = vnil();
+        }
+    } else if (op == OP_TRUNC) and (v.a.ty.kind == T_INT) {
+        base = resolve(v.a);
+        low = true;
+    }
+    if u.isnil(base) or not ((base.kind == V_INST) or (base.kind == V_PARAM)) or
+       (@int_from_ptr(base) == @int_from_ptr(v)) {
+        return;
+    }
+    while j >= 0 {
+        let ref = dbg_refs.at(@int_cast(usize, j));
+        let nx = ref.next;
+        if (@int_from_ptr(ref.v) == @int_from_ptr(v)) and (ref.id == v.id) and (ref.alt < 0) {
+            let a = dbg_track(base);
+            let x = dbg_refs.at(@int_cast(usize, a));
+            x.add = plus;
+            x.low = low;
+            dbg_refs.at(@int_cast(usize, j)).alt = a;
+        }
+        j = nx;
+    }
+}
+
 // v is dead and its memory about to be reused or poisoned: the entries
-// following it give up (dbg_value must not read it again).
+// following it give up (dbg_value must not read it again), or follow their
+// alternative (dbg_alt): its value, plus its constant, its low bits.
 fn dbg_buried(v: *Value) void {
     let mut j = dbg_chain(v);
     if j < 0 {
@@ -2468,21 +2513,352 @@ fn dbg_buried(v: *Value) void {
         let nx = ref.next;
         if (@int_from_ptr(ref.v) == @int_from_ptr(v)) and (ref.id == v.id) {
             ref.v = vnil();
+            if ref.alt >= 0 {
+                let x = dbg_refs.get(@int_cast(usize, ref.alt));
+                let ok = u.notnil(x.v) and
+                         ((x.v.kind == V_PARAM) or ((x.v.kind == V_INST) and (x.v.id == x.id) and (x.v.grave == 0)));
+                if ok and not (x.low and ref.low) {
+                    ref.v = x.v;
+                    ref.id = x.id;
+                    ref.add = ref.add +% x.add;
+                    ref.low = ref.low or x.low;
+                    ref.alt = x.alt;
+                    dbg_link(j, x.v);
+                }
+            }
         }
         j = nx;
     }
 }
 
-// v is copied (copy_inst): the entries following it give up.
-fn dbg_copied(v: *Value) void {
-    let mut j = dbg_chain(v);
+/// Value p (an integer) is the low bits of value w wherever p is (loops.ax:
+/// a counter and its step widened, w the extension of p): what followed p
+/// follows w's low bits.
+pub fn dbg_low_part(p: *mut Value, w: *mut Value) void {
+    if not dbg_on {
+        return;
+    }
+    let mut j = dbg_chain(p);
+    if j < 0 {
+        return;
+    }
+    dbg_at.put(dbg_key(p), 0);
     while j >= 0 {
         let ref = dbg_refs.at(@int_cast(usize, j));
-        if (@int_from_ptr(ref.v) == @int_from_ptr(v)) and (ref.id == v.id) {
-            ref.copied = true;
+        let nx = ref.next;
+        if (ref.v == p) and (ref.id == p.id) {
+            ref.v = w;
+            ref.id = w.id;
+            ref.low = true;
+            dbg_link(j, w);
         }
-        j = ref.next;
+        j = nx;
     }
+}
+
+/// What mark k's variable is beyond its value (dbg_mark_value): that
+/// value plus this.
+pub fn dbg_mark_add(k: i32) i64 {
+    let r = dbg_marks.get(@int_cast(usize, k)).ref;
+    if r < 0 {
+        return 0;
+    }
+    return dbg_refs.get(@int_cast(usize, r)).add;
+}
+
+/// Is the value mark k gives (dbg_mark_value) its variable's in its low
+/// bits only?
+pub fn dbg_mark_low(k: i32) bool {
+    let r = dbg_marks.get(@int_cast(usize, k)).ref;
+    return (r >= 0) and dbg_refs.get(@int_cast(usize, r)).low;
+}
+
+// -----------------------------------------------------------------------------
+// Assignments of variables in optimized code (-g, -O1 and up; dloc.ax reads
+// them): a mark says that at its place a variable, or a piece of one, takes
+// a value (a dbg_refs entry, which follows the value as passes replace it;
+// one given up is a kill), or that its value is no longer known (a kill).
+// Promotion (opt.mem2reg) makes one for each store to a variable's object
+// and for each phi it places for one. A mark is attached to the
+// instruction it comes before, in order with the others there, or for a
+// while to the end of a block that has no terminator; it stays where it is
+// as code moves around it: removing an instruction (to delete it or to put
+// it elsewhere) moves its marks to the next instruction (or the block's
+// end); a run of instructions moved elsewhere as a whole (blocks merged or
+// split) takes its marks along (dbg_take, dbg_put). A copy of an
+// instruction (duplicated, unrolled code) comes with kills of the
+// variables of the marks before it, and a block taken out of its function
+// leaves kills at the start of its successors: a value that may not be the
+// variable's is never given as its.
+// -----------------------------------------------------------------------------
+pub struct DbgMark {
+    owner: *mut Func,  // the function whose variable it is (dbginfo.vars_of(owner.name))
+    var: i32,          // its index there
+    off: u32,          // the piece: `size` bytes from `off` (size 0: the whole variable)
+    size: u32,
+    ref: i32,   // a dbg_refs index (the value), -1: a kill
+    src: i32,   // a copy's (a kill): the mark it is a copy of, for dbg_mark_set (-1: none)
+    next: i32,  // the next mark at the same place (-1: none)
+}
+
+// The marks at a place (an instruction, or a block's end): the first one
+// + 1, and the id the instruction (block) had when they were attached to it.
+struct MkAt {
+    first: i32,
+    id: i32,
+}
+
+pub let mut dbg_marks: u.List.[DbgMark] = u.List.[DbgMark].{ data: @ptr_from_int(*mut DbgMark, 0), len: 0, cap: 0 };
+let mut mk_inst: u.SymMap.[MkAt] = u.SymMap.[MkAt].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut MkAt, 0), cap: 0, len: 0 };
+let mut mk_end: u.SymMap.[MkAt] = u.SymMap.[MkAt].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut MkAt, 0), cap: 0, len: 0 };
+
+// A map key for an object's address (SymMap keys by the slice's address).
+fn mk_key(p: usize) []u8 {
+    return @slice_from_ptr(@ptr_from_int(*u8, p), 1);
+}
+
+/// The first mark attached to instruction v (-1: none).
+pub fn dbg_marks_at(v: *Value) i32 {
+    if not dbg_on or (mk_inst.len == 0) {
+        return -1;
+    }
+    let a = mk_inst.get(mk_key(@int_from_ptr(v)));
+    if (a.first == 0) or (a.id != v.id) {
+        return -1;
+    }
+    return a.first - 1;
+}
+
+fn mk_set(v: *Value, first: i32) void {
+    if (first < 0) and (mk_inst.len == 0) {
+        return;
+    }
+    mk_inst.put(mk_key(@int_from_ptr(v)), MkAt.{ first: first + 1, id: v.id });
+}
+
+fn mk_block_take(b: *Block) i32 {
+    if mk_end.len == 0 {
+        return -1;
+    }
+    let k = mk_key(@int_from_ptr(b));
+    let a = mk_end.get(k);
+    if (a.first == 0) or (a.id != b.id) {
+        return -1;
+    }
+    mk_end.put(k, MkAt.{ first: 0, id: 0 });
+    return a.first - 1;
+}
+
+// Chain x followed by chain y (either -1: empty).
+fn mk_cat(x: i32, y: i32) i32 {
+    if x < 0 {
+        return y;
+    }
+    let mut k = x;
+    while dbg_marks.get(@int_cast(usize, k)).next >= 0 {
+        k = dbg_marks.get(@int_cast(usize, k)).next;
+    }
+    dbg_marks.at(@int_cast(usize, k)).next = y;
+    return x;
+}
+
+/// A mark before instruction `at`, after the others there: variable `var`
+/// of function `owner` (its piece of `size` bytes at `off`; size 0: all of
+/// it) is v from there on (nil: not known).
+pub fn dbg_mark(at: *mut Value, owner: *mut Func, var: i32, off: u32, size: u32, v: *mut Value) void {
+    let mut r: i32 = -1;
+    if u.notnil(v) {
+        r = dbg_track(v);
+    }
+    let k = @int_cast(i32, dbg_marks.len);
+    dbg_marks.push(DbgMark.{ owner: owner, var: var, off: off, size: size, ref: r, src: -1, next: -1 });
+    mk_set(at, mk_cat(dbg_marks_at(at), k));
+}
+
+/// The same, before the marks at `at` already.
+pub fn dbg_mark_first(at: *mut Value, owner: *mut Func, var: i32, off: u32, size: u32, v: *mut Value) void {
+    let mut r: i32 = -1;
+    if u.notnil(v) {
+        r = dbg_track(v);
+    }
+    let k = @int_cast(i32, dbg_marks.len);
+    dbg_marks.push(DbgMark.{ owner: owner, var: var, off: off, size: size, ref: r, src: -1, next: dbg_marks_at(at) });
+    mk_set(at, k);
+}
+
+/// The value mark k gives its variable (nil: a kill, or a value given up).
+pub fn dbg_mark_value(k: i32) *mut Value {
+    let r = dbg_marks.get(@int_cast(usize, k)).ref;
+    if r < 0 {
+        return vnil();
+    }
+    let x = dbg_refs.get(@int_cast(usize, r));
+    if u.isnil(x.v) {
+        return vnil();
+    }
+    if (x.v.kind == V_INST) and ((x.v.id != x.id) or (x.v.grave != 0) or u.isnil(x.v.blk)) {
+        return vnil();
+    }
+    return x.v;
+}
+
+/// Mark k (a copy's kill, of mark dbg_mark_src(k)) gives its variable v
+/// after all (the pass that copied it knows the copy of the value: its
+/// low bits only, `low`).
+pub fn dbg_mark_set(k: i32, v: *mut Value, low: bool, plus: i64) void {
+    let r = dbg_track(v);
+    dbg_refs.at(@int_cast(usize, r)).low = low;
+    dbg_refs.at(@int_cast(usize, r)).add = plus;
+    let m = dbg_marks.at(@int_cast(usize, k));
+    m.ref = r;
+    m.src = -1;
+}
+
+/// The mark mark k is a copy (a kill) of, -1: none.
+pub fn dbg_mark_src(k: i32) i32 {
+    return dbg_marks.get(@int_cast(usize, k)).src;
+}
+
+/// The next mark after mark k at its place (-1: none).
+pub fn dbg_mark_next(k: i32) i32 {
+    return dbg_marks.get(@int_cast(usize, k)).next;
+}
+
+/// Takes the marks off instruction v, to put them back (dbg_put) where it
+/// goes with them; the first of them (-1: none).
+pub fn dbg_take(v: *Value) i32 {
+    let k = dbg_marks_at(v);
+    if k >= 0 {
+        mk_set(v, -1);
+    }
+    return k;
+}
+
+/// Puts marks `chain` (dbg_take) before instruction v, after those there.
+pub fn dbg_put(v: *Value, chain: i32) void {
+    if chain >= 0 {
+        mk_set(v, mk_cat(dbg_marks_at(v), chain));
+    }
+}
+
+// Instruction v leaves its place: its marks go to the next instruction, or
+// to the end of its block.
+fn mk_leave(v: *Value) void {
+    let k = dbg_take(v);
+    if k < 0 {
+        return;
+    }
+    if u.notnil(v.next) {
+        mk_set(v.next, mk_cat(k, dbg_marks_at(v.next)));
+    } else if u.notnil(v.blk) {
+        let b = v.blk;
+        mk_end.put(mk_key(@int_from_ptr(b)), MkAt.{ first: mk_cat(k, mk_block_take(b)) + 1, id: b.id });
+    }
+}
+
+/// Instruction v is unlinked from its block by a pass of its own (not
+/// remove_inst): its marks stay where it was.
+pub fn dbg_unlinked(v: *Value) void {
+    if dbg_on {
+        mk_leave(v);
+    }
+}
+
+// Kills of the variables of chain k0, before instruction y (a copy).
+fn mk_copy_kills(y: *mut Value, k0: i32) void {
+    let mut k = k0;
+    while k >= 0 {
+        let m = dbg_marks.get(@int_cast(usize, k));
+        dbg_mark(y, m.owner, m.var, m.off, m.size, vnil());
+        dbg_marks.at(dbg_marks.len - 1).src = k;
+        k = m.next;
+    }
+}
+
+// Block b leaves its function: the variables of its marks are not known at
+// its successors' starts (before their marks).
+fn mk_block_gone(b: *mut Block) void {
+    let mut all: i32 = -1;
+    let mut i = b.first;
+    while u.notnil(i) {
+        all = mk_cat(all, dbg_take(i));
+        i = i.next;
+    }
+    all = mk_cat(all, mk_block_take(b));
+    if all < 0 {
+        return;
+    }
+    let mut ks = u.List.[i32].empty();
+    let mut k = all;
+    while k >= 0 {
+        ks.push(k);
+        k = dbg_marks.get(@int_cast(usize, k)).next;
+    }
+    let t = terminator(b);
+    for s in 0..succ_count(t) {
+        let sb = succ(t, s);
+        if (sb == b) or u.isnil(sb.first) {
+            continue;
+        }
+        let mut at = sb.first;
+        while (at.op == OP_PHI) and u.notnil(at.next) {
+            at = at.next;
+        }
+        // (from the last, each one first: in order)
+        let mut j = ks.len;
+        while j > 0 {
+            j -= 1;
+            let m = dbg_marks.get(@int_cast(usize, ks.get(j)));
+            dbg_mark_first(at, m.owner, m.var, m.off, m.size, vnil());
+        }
+    }
+    ks.deinit();
+}
+
+// The objects of variables (allocas), for the marks promotion makes: the
+// variable an alloca holds, or a piece of one (scalar replacement's slots
+// of one's fields).
+pub struct DbgSlot {
+    id: i32,  // the alloca's
+    owner: *mut Func,
+    var: i32,
+    off: u32,
+    size: u32,  // (0: all of the variable)
+}
+
+pub let mut dbg_slots: u.List.[DbgSlot] = u.List.[DbgSlot].{ data: @ptr_from_int(*mut DbgSlot, 0), len: 0, cap: 0 };
+let mut dbg_slot_at: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+
+/// The variable alloca a holds a piece of (an index in dbg_slots; -1: none).
+pub fn dbg_slot_of(a: *Value) i32 {
+    if not dbg_on or (dbg_slot_at.len == 0) {
+        return -1;
+    }
+    let k = dbg_slot_at.get(mk_key(@int_from_ptr(a))) - 1;
+    if (k < 0) or (dbg_slots.get(@int_cast(usize, k)).id != a.id) {
+        return -1;
+    }
+    return k;
+}
+
+/// Alloca a holds variable `var` of `owner` (its `size` bytes from off; 0: all).
+pub fn dbg_slot_note(a: *Value, owner: *mut Func, var: i32, off: u32, size: u32) void {
+    dbg_slots.push(DbgSlot.{ id: a.id, owner: owner, var: var, off: off, size: size });
+    dbg_slot_at.put(mk_key(@int_from_ptr(a)), @int_cast(i32, dbg_slots.len));
+}
+
+/// Alloca `part` holds the `size` bytes at `off` of alloca `whole` (scalar
+/// replacement): of its variable, if it holds one.
+pub fn dbg_slot_part(part: *Value, whole: *Value, off: u64, size: u64) void {
+    let k = dbg_slot_of(whole);
+    if (k < 0) or (off > 0xffff_ffff) or (size > 0xffff_ffff) {
+        return;
+    }
+    let s = dbg_slots.get(@int_cast(usize, k));
+    dbg_slot_note(part, s.owner, s.var, s.off + @truncate(u32, off), @truncate(u32, size));
 }
 
 // Rewrites every operand of f's instructions through resolve().
@@ -2592,6 +2968,13 @@ pub fn drop_body(f: *mut Func) void {
 }
 
 pub fn remove_block(b: *mut Block) void {
+    if dbg_on {
+        mk_block_gone(b);
+    }
+    unlink_block(b);
+}
+
+fn unlink_block(b: *mut Block) void {
     let f = b.fnp;
     block_to_grave(b);
     if u.notnil(b.prev) {
@@ -2613,7 +2996,7 @@ pub fn move_block_after(b: *mut Block, after: *mut Block) void {
     if b == after {
         return;
     }
-    remove_block(b);
+    unlink_block(b);
     let f = after.fnp;
     b.prev = after;
     b.next = after.next;
@@ -2690,6 +3073,12 @@ pub fn insert_before(pos: *mut Value, v: *mut Value) void {
 }
 
 pub fn append_inst(b: *mut Block, v: *mut Value) void {
+    if dbg_on and (mk_end.len > 0) {
+        let k = mk_block_take(b);
+        if k >= 0 {
+            mk_set(v, mk_cat(k, dbg_marks_at(v)));  // (the marks left at the block's end)
+        }
+    }
     v.blk = b;
     v.prev = b.last;
     v.next = vnil();
@@ -2703,6 +3092,10 @@ pub fn append_inst(b: *mut Block, v: *mut Value) void {
 
 pub fn remove_inst(v: *mut Value) void {
     let b = v.blk;
+    if dbg_on {
+        mk_leave(v);
+        dbg_alt(v);
+    }
     to_grave(v, b.fnp);
     if u.notnil(v.prev) {
         v.prev.next = v.next;
@@ -3130,8 +3523,8 @@ pub fn copy_inst(f: *mut Func, v: *Value) *mut Value {
     y.flags = v.flags;
     y.src = v.src;
     y.scope = v.scope;
-    if dbg_on and not (u.notnil(v.blk) and (@int_from_ptr(v.blk.fnp) != @int_from_ptr(f))) {
-        dbg_copied(v);  // (a copy in another function, inlined there, is not this variable)
+    if dbg_on {
+        mk_copy_kills(y, dbg_marks_at(v));
     }
     y.align = v.align;
     copy_more(y, v);  // (with a block list of its own, filled below)

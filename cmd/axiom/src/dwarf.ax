@@ -773,6 +773,7 @@ pub const TAG_STRUCTURE_TYPE: u64 = 0x13;
 pub const TAG_SUBROUTINE_TYPE: u64 = 0x15;
 pub const TAG_UNION_TYPE: u64 = 0x17;
 pub const TAG_UNSPECIFIED_PARAMETERS: u64 = 0x18;
+pub const TAG_UNSPECIFIED_TYPE: u64 = 0x3b;
 pub const TAG_SUBRANGE_TYPE: u64 = 0x21;
 pub const TAG_BASE_TYPE: u64 = 0x24;
 pub const TAG_CONST_TYPE: u64 = 0x26;
@@ -837,6 +838,8 @@ const AB_LVAR_CONST: u64 = 63;  // + 0 a variable, 1 a parameter: a constant val
 const AB_VPART: u64 = 65;
 const AB_VARIANT: u64 = 66;
 const AB_VARIANT_EMPTY: u64 = 67;
+const AB_ART_LIST: u64 = 68;    // an artificial variable with a location list
+const AB_OTHER_TYPE: u64 = 69;  // a type of a kind not described otherwise (DW_TAG_unspecified_type)
 pub const TAG_VARIANT: u64 = 0x19;
 pub const TAG_VARIANT_PART: u64 = 0x33;
 pub const AT_DISCR: u64 = 0x15;
@@ -845,6 +848,13 @@ const LLE_END_OF_LIST: u8 = 0x00;
 const LLE_START_LENGTH: u8 = 0x08;
 const OP_REG0: u8 = 0x50;
 const OP_REGX: u8 = 0x90;
+const OP_BREG0: u8 = 0x70;
+const OP_BREGX: u8 = 0x92;
+const OP_DEREF_SIZE: u8 = 0x94;
+const OP_CONSTS: u8 = 0x11;
+const OP_PLUS: u8 = 0x22;
+const OP_PIECE: u8 = 0x93;
+const OP_IMPLICIT_VALUE: u8 = 0x9e;
 
 fn type_abbrevs(b: *mut bn.Bytes) void {
     let base: [3][2]u64 = [[AT_NAME, FORM_STRP], [AT_BYTE_SIZE, FORM_UDATA], [AT_ENCODING, FORM_DATA1]];
@@ -910,6 +920,10 @@ fn type_abbrevs(b: *mut bn.Bytes) void {
     abbrev(b, AB_SUBRANGE_V, TAG_SUBRANGE_TYPE, false, cref[..]);
     let art: [3][2]u64 = [[AT_TYPE, FORM_REF4], [AT_LOCATION, FORM_EXPRLOC], [AT_ARTIFICIAL, FORM_FLAG_PRESENT]];
     abbrev(b, AB_ART, TAG_VARIABLE, false, art[..]);
+    let artl: [3][2]u64 = [[AT_TYPE, FORM_REF4], [AT_LOCATION, FORM_SEC_OFFSET], [AT_ARTIFICIAL, FORM_FLAG_PRESENT]];
+    abbrev(b, AB_ART_LIST, TAG_VARIABLE, false, artl[..]);
+    let ot: [2][2]u64 = [[AT_NAME, FORM_STRP], [AT_BYTE_SIZE, FORM_UDATA]];
+    abbrev(b, AB_OTHER_TYPE, TAG_UNSPECIFIED_TYPE, false, ot[..]);
     let bb: [4][2]u64 = [
         [AT_NAME, FORM_STRP], [AT_BYTE_SIZE, FORM_UDATA], [AT_ENCODING, FORM_DATA1], [AT_BIT_SIZE, FORM_UDATA]];
     abbrev(b, AB_BASE_BITS, TAG_BASE_TYPE, false, bb[..]);
@@ -1048,6 +1062,11 @@ fn var_die(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, clip: []Piece) void {
     }
     if v.artificial {
         if loc == NO_LOC {
+            // (optimized code: its location list, if it has one)
+            let at = @as(u64, ib(d).len()) + 1;
+            if (f.vlocs.len > 0) and optimized_var(d, f, k, v, 0, clip, true) {
+                d.voffs.set(k, at);
+            }
             return;
         }
         d.voffs.set(k, @as(u64, ib(d).len()) + 1);
@@ -1057,7 +1076,7 @@ fn var_die(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, clip: []Piece) void {
         return;
     }
     let pv = pk(v.param, @as(u64, 1), @as(u64, 0));
-    if (loc == NO_LOC) and (f.vlocs.len > 0) and optimized_var(d, f, k, v, pv, clip) {
+    if (loc == NO_LOC) and (f.vlocs.len > 0) and optimized_var(d, f, k, v, pv, clip, false) {
         return;
     }
     let mut code = AB_LVAR + pv;
@@ -1093,47 +1112,38 @@ fn global_loc(d: *mut Unit, g: *ir.Global, sym: u32) void {
     addr_ref(d, &mut d.parts[D_INFO], sym, 0);
 }
 
-// Variable k of function f, v, in optimized code: a constant, or its
-// location list (dloc.ax) within its block's code `clip` (empty: the
-// function's), if it has either (true: written).
-fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: []Piece) bool {
+// Variable k of function f, v, in optimized code: its location list
+// (dloc.ax) within its block's code `clip` (empty: the function's), if it
+// has one (true: written). A variable taken apart (pieces) is in pieces at
+// each address (DW_OP_piece; one not known there: a piece without a
+// location).
+fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: []Piece, art: bool) bool {
+    let mut segs = var_segments(d, f, k, type_size(v.ty));
     let mut n: usize = 0;
-    for x in f.vlocs {
-        if @as(usize, x.var) != k {
-            continue;
-        }
-        if x.kind == dloc.LK_CONST {
-            let size = type_size(v.ty);
-            if (size == 0) or (size > 8) {
-                return false;
-            }
-            ib(d).uleb(AB_LVAR_CONST + pv);
-            strp(d, v.name);
-            decl_at(d, v.src);
-            tref(d, v.ty);
-            ib(d).u8_(@truncate(u8, size));
-            let bits = @bit_cast(u64, x.off);
-            for j in 0..size {
-                ib(d).u8_(@truncate(u8, bits >> @as(u32, @truncate(u32, 8 * j))));
-            }
-            return true;
-        }
+    for sg in segs.items() {
+        let x = dloc.VLoc.{ var: 0, poff: 0, psize: 0, kind: 0, start: sg.start, end: sg.end, reg: 0, off: 0, add: 0,
+                            size: 0, ind: false, gsym: "" };
         if clipped(x, clip, 0).end > 0 {
             n += 1;
         }
     }
     if n == 0 {
+        free_segments(&mut segs);
         return false;
     }
-    ib(d).uleb(AB_LVAR_LIST + pv);
-    strp(d, v.name);
-    decl_at(d, v.src);
-    tref(d, v.ty);
+    if art {
+        ib(d).uleb(AB_ART_LIST);
+        tref(d, v.ty);
+    } else {
+        ib(d).uleb(AB_LVAR_LIST + pv);
+        strp(d, v.name);
+        decl_at(d, v.src);
+        tref(d, v.ty);
+    }
     sec_ref(d, &mut d.parts[D_INFO], D_LOCLISTS, @as(u64, list_start(d, D_LOCLISTS)));
-    for x in f.vlocs {
-        if (@as(usize, x.var) != k) or (x.kind != dloc.LK_PIECE) {
-            continue;
-        }
+    for sg in segs.items() {
+        let x = dloc.VLoc.{ var: 0, poff: 0, psize: 0, kind: 0, start: sg.start, end: sg.end, reg: 0, off: 0, add: 0,
+                            size: 0, ind: false, gsym: "" };
         let mut ci: usize = 0;
         loop {
             let c = clipped(x, clip, ci);
@@ -1141,11 +1151,264 @@ fn optimized_var(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, pv: u64, clip: [
                 break;
             }
             ci = @truncate(usize, c.next);
-            loc_entry(d, f, x, c.start, c.end);
+            loc_entry(d, f, &sg, c.start, c.end);
         }
     }
     d.parts[D_LOCLISTS].b.u8_(LLE_END_OF_LIST);
+    free_segments(&mut segs);
     return true;
+}
+
+// A stretch of code where a variable's location is `expr`.
+struct Seg {
+    start: u64,
+    end: u64,
+    expr: bn.Bytes,
+    fx: u.List.[SFix],
+}
+
+fn free_segments(l: *mut u.List.[Seg]) void {
+    for k in 0..l.len {
+        l.at(k).expr.free();
+        l.at(k).fx.deinit();
+    }
+    l.deinit();
+}
+
+fn same_fixes(a: *u.List.[SFix], b: *u.List.[SFix]) bool {
+    if a.len != b.len {
+        return false;
+    }
+    for k in 0..a.len {
+        let x = a.get(k);
+        let y = b.get(k);
+        if (x.off != y.off) or (x.sym != y.sym) or (x.add != y.add) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A datum's address in an expression of a stretch: at `off` in it.
+struct SFix {
+    off: u64,
+    sym: u32,
+    add: i64,
+}
+
+// The expression of location x (one piece of it: no DW_OP_piece), with
+// the data addresses in it (fx); false if it has none after all.
+fn loc_expr(d: *mut Unit, e: *mut bn.Bytes, fx: *mut u.List.[SFix], x: *dloc.VLoc) bool {
+    let kind = x.kind;
+    if kind == dloc.LK_GADDR {
+        let sym = d.gsyms.get(u.intern(x.gsym));
+        if sym == 0 {
+            return false;
+        }
+        e.u8_(OP_ADDR);
+        fx.push(SFix.{ off: @as(u64, e.len()), sym: sym - 1, add: x.off });
+        for _j in 0..d.addr_size {
+            e.u8_(0);
+        }
+        if not x.ind {
+            e.u8_(OP_STACK_VALUE);
+        }
+        return true;
+    }
+    if kind == dloc.LK_CONST {
+        e.u8_(OP_IMPLICIT_VALUE);
+        e.uleb(@as(u64, x.size));
+        let bits = @bit_cast(u64, x.off);
+        for j in 0..@as(usize, x.size) {
+            e.u8_(@truncate(u8, bits >> @as(u32, @truncate(u32, 8 * j))));
+        }
+        return true;
+    }
+    if kind == dloc.LK_ADDR {
+        e.u8_(OP_FBREG);
+        e.sleb(x.off);
+        if not x.ind {
+            e.u8_(OP_STACK_VALUE);
+        }
+        return true;
+    }
+    if kind == dloc.LK_SLOT {
+        e.u8_(OP_FBREG);
+        e.sleb(x.off);
+        if (x.add != 0) or x.ind {
+            // (the value there, plus add: a value, or the variable's address)
+            if x.size >= 8 {
+                e.u8_(OP_DEREF);
+            } else {
+                e.u8_(OP_DEREF_SIZE);
+                e.u8_(@truncate(u8, x.size));
+            }
+            if x.add != 0 {
+                e.u8_(OP_CONSTS);
+                e.sleb(x.add);
+                e.u8_(OP_PLUS);
+            }
+            if not x.ind {
+                e.u8_(OP_STACK_VALUE);
+            }
+        }
+        return true;
+    }
+    let r = @as(u64, @bit_cast(u32, x.reg));
+    if (x.add != 0) or x.ind {
+        // (the register's contents plus add: a value, or the variable's address)
+        if r < 32 {
+            e.u8_(OP_BREG0 + @truncate(u8, r));
+        } else {
+            e.u8_(OP_BREGX);
+            e.uleb(r);
+        }
+        e.sleb(x.add);
+        if not x.ind {
+            e.u8_(OP_STACK_VALUE);
+        }
+        return true;
+    }
+    if r < 32 {
+        e.u8_(OP_REG0 + @truncate(u8, r));
+    } else {
+        e.u8_(OP_REGX);
+        e.uleb(r);
+    }
+    return true;
+}
+
+// The stretches of variable k's locations (in f.vlocs), in order: one
+// whole value's, or the pieces' (of a variable of `size` bytes) put
+// together at each address where at least one of them has one.
+fn var_segments(d: *mut Unit, f: *Func, k: usize, size: u64) u.List.[Seg] {
+    let mut out = u.List.[Seg].empty();
+    let mut xs = u.List.[dloc.VLoc].empty();
+    let mut whole = false;
+    for x in f.vlocs {
+        if @as(usize, x.var) == k {
+            xs.push(x);
+            whole = whole or (x.psize == 0);
+        }
+    }
+    if whole {
+        // (a value of all of it: its pieces, if any, are left aside)
+        let mut n: usize = 0;
+        for j in 0..xs.len {
+            if xs.get(j).psize == 0 {
+                xs.set(n, xs.get(j));
+                n += 1;
+            }
+        }
+        xs.len = n;
+    }
+    if xs.len == 0 {
+        xs.deinit();
+        return out;
+    }
+    // the addresses where something changes
+    let mut cut = u.List.[usize].empty();
+    for x in xs.items() {
+        cut.push(@truncate(usize, x.start));
+        cut.push(@truncate(usize, x.end));
+    }
+    u.sort_usize(cut.items());
+    // the pieces' places, in order
+    let mut pcs = u.List.[[2]u32].empty();
+    if not whole {
+        for x in xs.items() {
+            let mut have = false;
+            for p in pcs.items() {
+                have = have or ((p[0] == x.poff) and (p[1] == x.psize));
+            }
+            if not have {
+                pcs.push([x.poff, x.psize]);
+            }
+        }
+        for a in 1..pcs.len {
+            let mut j = a;
+            while (j > 0) and (pcs.get(j - 1)[0] > pcs.get(j)[0]) {
+                let y = pcs.get(j);
+                pcs.set(j, pcs.get(j - 1));
+                pcs.set(j - 1, y);
+                j -= 1;
+            }
+        }
+        // (overlapping pieces: none put together)
+        for a in 1..pcs.len {
+            if pcs.get(a - 1)[0] + pcs.get(a - 1)[1] > pcs.get(a)[0] {
+                xs.deinit();
+                cut.deinit();
+                pcs.deinit();
+                return out;
+            }
+        }
+    }
+    for c in 0..cut.len {
+        if c + 1 >= cut.len {
+            break;
+        }
+        let lo = @as(u64, cut.get(c));
+        let hi = @as(u64, cut.get(c + 1));
+        if hi <= lo {
+            continue;
+        }
+        let mut e = bn.new_bytes();
+        let mut fx = u.List.[SFix].empty();
+        let mut any = false;
+        if whole {
+            for x in xs.items() {
+                if (x.start <= lo) and (x.end >= hi) {
+                    any = loc_expr(d, &mut e, &mut fx, &x);
+                    break;
+                }
+            }
+        } else {
+            let mut at: u64 = 0;
+            for p in pcs.items() {
+                if @as(u64, p[0]) > at {
+                    e.u8_(OP_PIECE);
+                    e.uleb(@as(u64, p[0]) - at);
+                }
+                for x in xs.items() {
+                    if (x.poff == p[0]) and (x.psize == p[1]) and (x.start <= lo) and (x.end >= hi) {
+                        let at0 = e.len();
+                        if loc_expr(d, &mut e, &mut fx, &x) {
+                            any = true;
+                        } else {
+                            e.b.len = at0;
+                        }
+                        break;
+                    }
+                }
+                e.u8_(OP_PIECE);
+                e.uleb(@as(u64, p[1]));
+                at = @as(u64, p[0]) + @as(u64, p[1]);
+            }
+            if (size > at) and any {
+                e.u8_(OP_PIECE);
+                e.uleb(size - at);
+            }
+        }
+        if not any {
+            e.free();
+            fx.deinit();
+            continue;
+        }
+        // (the same as the stretch before it: one)
+        if (out.len > 0) and (out.last().end == lo) and u.str_eq(out.last().expr.view(), e.view()) and
+           same_fixes(&out.at(out.len - 1).fx, &fx) {
+            out.at(out.len - 1).end = hi;
+            e.free();
+            fx.deinit();
+            continue;
+        }
+        out.push(Seg.{ start: lo, end: hi, expr: e, fx: fx });
+    }
+    xs.deinit();
+    cut.deinit();
+    pcs.deinit();
+    return out;
 }
 
 // A piece of location x, clipped to the block's code (clip, from its piece
@@ -1173,26 +1436,19 @@ fn clipped(x: dloc.VLoc, clip: []Piece, from: usize) Clip {
     return Clip.{ start: 0, end: 0, next: 0 };
 }
 
-// A location list entry: x's place from offset start to end of f.
-fn loc_entry(d: *mut Unit, f: *Func, x: dloc.VLoc, start: u64, end: u64) void {
+// A location list entry: stretch sg's expression from offset start to end
+// of f.
+fn loc_entry(d: *mut Unit, f: *Func, sg: *Seg, start: u64, end: u64) void {
     let p = &mut d.parts[D_LOCLISTS];
-    {
-        p.b.u8_(LLE_START_LENGTH);
-        addr_ref(d, p, f.sym, start);
-        p.b.uleb(end - start);
-        let mut e = bn.new_bytes();
-        if x.reg < 0 {
-            e.u8_(OP_FBREG);
-            e.sleb(x.off);
-        } else if x.reg < 32 {
-            e.u8_(OP_REG0 + @truncate(u8, @bit_cast(u32, x.reg)));
-        } else {
-            e.u8_(OP_REGX);
-            e.uleb(@as(u64, @bit_cast(u32, x.reg)));
-        }
-        p.b.uleb(@as(u64, e.len()));
-        p.b.put(e.view());
-        e.free();
+    p.b.u8_(LLE_START_LENGTH);
+    addr_ref(d, p, f.sym, start);
+    p.b.uleb(end - start);
+    let ex = sg.expr.view();
+    p.b.uleb(@as(u64, ex.len));
+    let at = @as(u64, p.b.len());
+    p.b.put(ex);
+    for x in sg.fx.items() {
+        p.fx.push(Fix.{ off: at + x.off, kind: FX_ADDR, sym: x.sym, addend: x.add });
     }
 }
 
@@ -1344,6 +1600,12 @@ fn type_die(d: *mut Unit, t: *dbi.DType) void {
             ib(d).sleb(m.value);
         }
         ib(d).u8_(0);
+    } else if k != dbi.DK_FUNC {
+        // (a kind this writer does not know: a type of its name and size, so
+        // that what refers to it still refers to an entry)
+        ib(d).uleb(AB_OTHER_TYPE);
+        strp(d, t.name);
+        ib(d).uleb(t.size);
     } else {
         // DK_FUNC: its parameters' types (unspecified after them: variadic, or no prototype)
         ib(d).uleb(pk(t.target < 0, AB_FTYPE_VOID, AB_FTYPE));

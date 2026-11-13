@@ -507,24 +507,62 @@ export function locList(dw, off) {
 
 // Is expr a location expression of the forms the compiler writes: one of
 // DW_OP_fbreg n [DW_OP_deref], DW_OP_addr a, DW_OP_const8u n
-// DW_OP_form_tls_address, DW_OP_regN, DW_OP_regx n, DW_OP_bregN n, or
-// pieces of registers (DW_OP_regN DW_OP_piece n ...)?
+// DW_OP_form_tls_address; or (in optimized code) pieces (DW_OP_piece n,
+// each after one of these or after nothing: not known) of DW_OP_regN,
+// DW_OP_regx r, DW_OP_bregN n DW_OP_stack_value (a register plus n),
+// DW_OP_bregx r n DW_OP_stack_value, DW_OP_fbreg n (a slot), DW_OP_fbreg n
+// DW_OP_stack_value (a frame address), DW_OP_fbreg n DW_OP_deref[_size k]
+// [DW_OP_consts c DW_OP_plus] DW_OP_stack_value, DW_OP_implicit_value n
+// bytes, DW_OP_addr a DW_OP_stack_value (a datum's address); without the
+// DW_OP_stack_value, the address of the variable (one held by reference: a
+// variable length array). A piece with a location of its own is followed
+// by DW_OP_piece.
 export function knownLocation(expr) {
   const r = new Rd(expr);
   const op = r.u8();
-  if (op === 0x91) { r.sleb(); if (r.p < expr.length && r.u8() !== 0x06) return false; return r.p === expr.length; }
-  if (op === 0x03) { r.p += expr.length - 1; return expr.length === 9 || expr.length === 5; }
-  if (op === 0x0e) { r.u64(); return r.u8() === 0x9b && r.p === expr.length; }
-  r.p = 0;
-  while (r.p < expr.length) {
-    const o = r.u8();
-    if (o >= 0x50 && o <= 0x6f) { /* DW_OP_regN */ }
-    else if (o === 0x90) r.uleb();
-    else if (o >= 0x70 && o <= 0x8f) r.sleb();
-    else return false;
+  if (op === 0x91 && expr.length > 1) {
+    const at = r.p;
+    r.sleb();
     if (r.p === expr.length) return true;
+    if (r.u8() === 0x06 && r.p === expr.length) return true;
+    r.p = at;
+  } else if (op === 0x03 && (expr.length === 9 || expr.length === 5)) return true;
+  else if (op === 0x0e) { r.u64(); return r.u8() === 0x9b && r.p === expr.length; }
+  r.p = 0;
+  // one piece's location (or none); false if not of the forms
+  const one = () => {
+    const o = r.d[r.p];
+    if (o === 0x93) return true;
+    r.p++;
+    if (o >= 0x50 && o <= 0x6f) return true;
+    if (o === 0x90) { r.uleb(); return true; }
+    // (a value: DW_OP_stack_value; else the variable is in memory there)
+    const sv = () => { if (r.p < expr.length && r.d[r.p] === 0x9f) r.p++; return true; };
+    if (o >= 0x70 && o <= 0x8f) { r.sleb(); return sv(); }
+    if (o === 0x92) { r.uleb(); r.sleb(); return sv(); }
+    if (o === 0x03) { r.p += 8; return sv(); }
+    if (o === 0x9e) { const n = r.uleb(); r.p += n; return n > 0 && n <= 16 && r.p <= expr.length; }
+    if (o === 0x91) {
+      r.sleb();
+      if (r.p === expr.length || r.d[r.p] === 0x93) return true;
+      const k = r.u8();
+      if (k === 0x9f) return true;
+      if (k === 0x94) r.u8(); else if (k !== 0x06) return false;
+      if (r.p === expr.length || r.d[r.p] === 0x93) return true;
+      if (r.u8() !== 0x11) return false;
+      r.sleb();
+      if (r.u8() !== 0x22) return false;
+      return sv();
+    }
+    return false;
+  };
+  let pieces = 0;
+  while (r.p < expr.length) {
+    if (!one()) return false;
+    if (r.p === expr.length) return pieces === 0;
     if (r.u8() !== 0x93) return false;
     r.uleb();
+    pieces++;
   }
   return true;
 }
@@ -542,6 +580,26 @@ function exprReg(expr) {
   if (expr[0] >= 0x50 && expr[0] <= 0x6f && expr.length === 1) return expr[0] - 0x50;
   if (expr[0] === 0x90) return new Rd(expr, 1).uleb();
   return -1;
+}
+
+// The registers an expression of knownLocation's forms reads (DW_OP_regN,
+// regx, bregN, bregx), in each of its pieces.
+export function exprRegs(expr) {
+  const r = new Rd(expr), out = [];
+  while (r.p < expr.length) {
+    const o = r.u8();
+    if (o >= 0x50 && o <= 0x6f) out.push(o - 0x50);
+    else if (o === 0x90) out.push(r.uleb());
+    else if (o >= 0x70 && o <= 0x8f) { out.push(o - 0x70); r.sleb(); }
+    else if (o === 0x92) { out.push(r.uleb()); r.sleb(); }
+    else if (o === 0x91 || o === 0x11) r.sleb();
+    else if (o === 0x93) r.uleb();
+    else if (o === 0x94) r.u8();
+    else if (o === 0x9e) { const n = r.uleb(); r.p += n; }
+    else if (o === 0x03) r.p += 8;
+    else if (o === 0x0e) r.u64();
+  }
+  return out;
 }
 
 // The lexical blocks and variables of the subprograms: each block's ranges
@@ -575,8 +633,7 @@ export function checkScopes(dw, machine) {
           if (!l.length) E(`${fname}.${name}: an empty location list`);
           for (let k = 1; k < l.length; k++) if (l[k].lo < l[k - 1].hi) E(`${fname}.${name}: location ranges out of order or overlapping`);
           for (const x of l) {
-            const r = exprReg(x.expr);
-            if (r >= 0 && machine && !allocatable(machine, r)) E(`${fname}.${name}: in register ${r}, which holds no values`);
+            for (const r of exprRegs(x.expr)) if (machine && !allocatable(machine, r)) E(`${fname}.${name}: in register ${r}, which holds no values`);
             if (!(x.hi > x.lo)) E(`${fname}.${name}: an empty location range`);
             if (!inside([[x.lo, x.hi]], rs)) E(`${fname}.${name}: a location at [0x${x.lo.toString(16)}, 0x${x.hi.toString(16)}) outside its block`);
             if (!knownLocation(x.expr)) E(`${fname}.${name}: location ${x.expr.toString('hex')}`);
@@ -684,6 +741,23 @@ export function checkVars(dw, opts) {
       }
       const sv = kids(osub, V, 's')[0];
       if (!sv || sv.attrs.get(0x02) === undefined) E('once: s has no location');
+    }
+    // a variable assigned again: locations of its values; a
+    // structure in pieces; a pointer into a frame object (its address)
+    let asub = null;
+    for (const c of un.die.children) if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) === 'again') asub = c;
+    if (!asub) E('no subprogram again');
+    else {
+      const all = (d) => [d, ...d.children.flatMap((c) => (c.tag === LB ? all(c) : []))];
+      const vof = (n) => all(asub).flatMap((d) => kids(d, V, n))[0];
+      const ll = (v) => { const loc = v && v.attrs.get(0x02); return typeof loc === 'number' ? locList(dw, loc) : []; };
+      const r = ll(vof('r'));
+      if (r.length < 2) E('again: r has not more than one location range');
+      // (taken apart on x86-64 Linux; elsewhere the optimizer may keep it whole)
+      const q = vof('q');
+      if (!q || q.attrs.get(0x02) === undefined) E('again: q has no location');
+      else if (opts.machine === 'x64' && opts.tls && !ll(q).some((x) => x.expr.includes(0x93))) E('again: q is not in pieces');
+      if (!ll(vof('pa')).some((x) => x.expr[0] === 0x91 && x.expr[x.expr.length - 1] === 0x9f)) E('again: pa is not a frame address');
     }
   }
   const tl = un.die.children.find((c) => c.tag === V && c.attrs.get(AT_NAME) === 'per_thread');

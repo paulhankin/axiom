@@ -4138,11 +4138,15 @@ fn compile_func(f: *mut ir.Func) void {
     for bi in 0..order.len {
         let ib = order.get(bi);
         CB = MF.blocks.get(bi);
+        dloc.enter_block(ib, CB);
         let mut i = ib.first;
         while u.notnil(i) {
             if i.src != 0 {
                 mc.cur_src = i.src;  // (the line of the instructions made for it)
                 mc.cur_scope = i.scope;
+            }
+            if dloc.active {
+                dloc.before(i, CB);  // (-g: the variables' assignments before it)
             }
             if not ir.is_term(i.op) {
                 gen_inst(i);
@@ -4153,6 +4157,7 @@ fn compile_func(f: *mut ir.Func) void {
             i = i.next;
         }
         gen_term(ib);
+        dloc.end_block(CB);
         is.push_succs(CB, ir.terminator(ib));
     }
     mc.cur_src = 0;
@@ -5322,7 +5327,35 @@ fn encode_func(f: *mut ir.Func) void {
 // What dloc.ax needs of AArch64's machine code (variables' locations): the
 // allocatable registers x0-x15, x19-x27, v0-v31.
 let DLOC: dloc.Tgt = dloc.Tgt.{ dw_reg: dw_reg, is_exit: is_exit, is_tail: is_tail, slot_off: slot_cfa_off,
-                                alloc: 0xffff_ffff_0ff8_ffff };
+                                obj_off: obj_cfa_off, imm_of: imm_of, alloc: 0xffff_ffff_0ff8_ffff };
+
+// The constant instruction i puts in its register (MOVI: a 32-bit one
+// zero-extended), or NO_LOC.
+fn imm_of(i: *mc.MInst) i64 {
+    if (i.op != MOVI) or (i.ops.len < 2) or (i.ops[1].kind != mc.K_IMM) {
+        return dloc.NO_LOC;
+    }
+    if i.sz == 8 {
+        return i.ops[1].disp;
+    }
+    if i.sz == 4 {
+        return i.ops[1].disp & 0xffff_ffff;
+    }
+    return dloc.NO_LOC;
+}
+
+// The frame slot of alloca a: its offset from the CFA (the frame's bottom
+// is 16 + frame below it).
+fn obj_cfa_off(a: *ir.Value) i64 {
+    if frameless {
+        return dloc.NO_LOC;
+    }
+    let o = var_slot_off(a);
+    if o == dw.NO_LOC {
+        return dloc.NO_LOC;
+    }
+    return o - (16 + frame);
+}
 
 // A physical register's DWARF number (DWARF for the Arm 64-bit
 // architecture, 4.1): x0-x30 0-30, v0-v31 64-95.

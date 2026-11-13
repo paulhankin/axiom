@@ -15,10 +15,14 @@
   them, block-scope statics, typedefs and tags are in their blocks, thread-local
   objects have locations (ELF), and a variable length array has its bound; a
   parameter passed by reference has a location at `-O0`.
-- Optimized code (`-O1` and above) has locations for the variables assigned once (in
-  the registers and spill slots that hold their values, as location lists, or as
-  constants), for the parameters never assigned (their argument registers at the
-  entry), and for the variables left in memory: never a wrong one.
+- Optimized code (`-O1` and above) has locations for the variables assigned any number
+  of times: each assignment is followed through the optimizer to the machine code, and
+  from there on the variable is where its value is (registers, spill slots, a constant,
+  a frame object's or a datum's address, a value plus a constant, the low bits of a
+  widened loop counter, the merge of the values reaching a join), structures taken
+  apart in pieces, variable length arrays through their addresses; never a wrong one.
+  On the suite's C programs at `-O2` about nine variables in ten have a location
+  somewhere, up from about half.
 - Axiom programs get their types, variables, globals and lexical blocks too (`-O0` now
   keeps an Axiom variable in its frame slot, as it does C's: about 8% more code at
   `-O0`, no measurable change in speed), and a language code of their own.
