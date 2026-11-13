@@ -100,6 +100,13 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
             nout += 1;
         }
     }
+    // memory operands without a "memory" clobber: the asm reads and writes
+    // only their objects (the dialect's rule; not for asm goto, whose
+    // outputs are stored on each path, nor a template that calls a function)
+    let exact = mem_ops and not b.memory and not b.goto_ and not b.calls and not b.basic;
+    if exact {
+        flags = flags | ir.ASM_EXACT;
+    }
     if not mem_ops and not b.volatile_ and (nout > 0) {
         flags = flags | ir.ASM_PURE;
         // (one index for equal pure statements, so that value numbering
@@ -130,6 +137,11 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
     // (the operands in the rdx:rax pair: each low half's temporary or value
     // address, which its high half, 8 bytes on, reads too)
     let pairv = u.newn.[*mut ir.Value](b.ops.len + 1);
+    // (AArch64's outputs in z, p or q registers through memory: each one's
+    // buffer and lvalue's address, copied after the asm)
+    let mut vouts = u.List.[usize].empty();
+    let mut vbufs = u.List.[*mut ir.Value].empty();
+    let mut vaddrs = u.List.[*mut ir.Value].empty();
     for k in 0..b.ops.len {
         let op = b.ops[k];
         let e = a.exprs.get(k);
@@ -155,6 +167,29 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
                 pairv[k] = p;
                 xs.push(ir.load(cg.B, ir.t_int(64), p));
             }
+            continue;
+        }
+        if is_vbuf(op) {
+            // a buffer of the whole register's size (the vector length's
+            // largest for z), holding the value at its start, zeros after
+            let buf = vbuf(op);
+            let t = cty.unqual(e.ty);
+            if op.out {
+                let at = gx.lv(e);
+                if op.inout {
+                    gx.copy(t, buf, at);
+                }
+                vouts.push(k);
+                vbufs.push(buf);
+                vaddrs.push(at);
+            } else if e.lvalue {
+                gx.copy(t, buf, gx.lv(e));
+            } else if cty.is_wide(t) or not cty.is_scalar(t) {
+                gx.copy(t, buf, gx.rv(e));
+            } else {
+                gx.store(t, gx.rv(e), buf);
+            }
+            xs.push(buf);
             continue;
         }
         if op.out {
@@ -183,12 +218,19 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
             }
             continue;
         }
+        if (op.kind == ai.OK_IMM) and op.zero and cty.is_floating(e.ty) {
+            xs.push(ir.cint(ir.isz(), 0));  // (AArch64 Y, Dz: the floating zero, written #0.0)
+            continue;
+        }
         let v = gx.rv(e);
         if op.kind == ai.OK_IMM {
             xs.push(v);
             continue;
         }
         xs.push(to_class(v, op));
+    }
+    if exact {
+        ir.note_asm_mem(@as(i64, index), mem_list(a, b));
     }
     let mut rt = cg.T_void;
     if b.goto_ {
@@ -212,6 +254,10 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
         let t = cty.unqual(e.ty);
         _ = gx.store_lv(e, t, from_class(vs[j], t), addrs.get(j));
     }
+    for j in 0..vouts.len {
+        let t = cty.unqual(a.exprs.get(vouts.get(j)).ty);
+        gx.copy(t, vaddrs.get(j), vbufs.get(j));
+    }
     for j in 0..pouts.len {
         let e = pes.get(j);
         let t = cty.unqual(e.ty);
@@ -221,6 +267,55 @@ pub fn stmt(a: *mut cast.Asm) *mut ir.Value {
         _ = gx.store_lv(e, t, gx.load(t, tmp), paddrs.get(j));
     }
     return r;
+}
+
+// The memory operands of asm a (blob b), for ir.ASM_EXACT: each one's IN_ASM
+// operand (operand k is k + 1), its object's size, and whether the template
+// reads it (an input, or an output that is also one) and writes it (an
+// output). An operand in a register through memory is its temporary.
+fn mem_list(a: *cast.Asm, b: *ai.Blob) []ir.AsmMem {
+    let ms = u.perm_newn.[ir.AsmMem](b.ops.len + 1);
+    let mut n: usize = 0;
+    for k in 0..b.ops.len {
+        let op = b.ops[k];
+        if (op.kind != ai.OK_MEM) or op.hi or (op.pair >= 0) {
+            continue;
+        }
+        let t = cty.unqual(a.exprs.get(k).ty);
+        let mut size: i64 = -1;
+        if is_vbuf(op) {
+            size = @bit_cast(i64, vbuf_bytes(op));
+        } else if (t.kind != cty.TK_FUNCTION) and (t.kind != cty.TK_VOID) and cty.is_complete(t) and not cty.is_vla(t) {
+            size = @bit_cast(i64, cty.size_of(t));
+        }
+        ms[n] = ir.AsmMem.{ arg: @truncate(u32, k + 1), size: size, rd: not op.out or op.inout, wr: op.out };
+        n += 1;
+    }
+    return ms[0..n];
+}
+
+// Is op an AArch64 operand in a z, p or q register through memory (a buffer)?
+fn is_vbuf(op: ai.Op) bool {
+    return (op.via == ai.VIA_V) or (op.via == ai.VIA_P);
+}
+
+// A zeroed buffer for operand op's register: 16 bytes for q, 32 for p, 256 for
+// z (an SVE vector of the architecture's largest length, 2048 bits).
+fn vbuf(op: ai.Op) *mut ir.Value {
+    let n = vbuf_bytes(op);
+    let buf = cg.alloca(cty.array_of(cty.t_ullong, n / 8, true), "asm.reg");
+    gx.zero(buf, n);
+    return buf;
+}
+
+fn vbuf_bytes(op: ai.Op) u64 {
+    if op.via == ai.VIA_P {
+        return 32;
+    }
+    if op.bits <= 128 {
+        return 16;
+    }
+    return 256;
 }
 
 // The pure asm statements so far, by what they are (pure_key): index + 1.

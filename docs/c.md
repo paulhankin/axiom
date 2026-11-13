@@ -1731,13 +1731,27 @@ other tool is needed:
   the `while*` comparisons, `cntp`); the element counts (`cnt[bhwd]`, `inc*`/`dec*` with
   their saturating forms, `addvl`/`addpl`/`rdvl`); the floating point (arithmetic,
   compares, the fused multiply-adds, rounding, the estimates, complex `fcadd`/`fcmla`,
-  and the conversions); and the loads and stores `ldr`/`str` of a `z` or `p` register
-  and the contiguous `ld1`/`st1` (with the sign-extending forms) in the scalar+immediate
-  and scalar+scalar addressing forms. Not yet: the SVE gather/scatter loads and stores,
-  the first-fault and non-fault loads, the structure (`ld2`-`ld4`, `st2`-`st4`) and
-  replicating (`ld1r`, `ld1rq`) loads, the SVE prefetches, and the SVE2 widening,
-  narrowing, saturating, `match`/`nmatch`, histogram, bit-permute, polynomial, complex
-  integer and crypto instructions. Not yet either:
+  and the conversions, the reductions and `fadda`); the dot products (`sdot`, `udot`,
+  `usdot`, `sudot`, vector and by element), the matrix multiplies (`smmla`, `ummla`,
+  `usmmla`, `fmmla`, `bfmmla`) and BF16 arithmetic; `adr` with vector bases; every load,
+  store and prefetch: `ldr`/`str` of a `z` or `p` register, the contiguous `ld1`/`st1`
+  (with the sign-extending forms), the gathers and scatters (scalar plus vector with
+  32-bit `uxtw`/`sxtw` or 64-bit offsets, scaled and unscaled, and vector plus
+  immediate), the first-fault `ldff1*` and non-fault `ldnf1*` loads, the structure
+  loads and stores `ld2`-`ld4`/`st2`-`st4`, the non-temporal `ldnt1*`/`stnt1*` (with
+  SVE2's vector plus scalar), the replicating `ld1r*`, `ld1rq*` and `ld1ro*`, and
+  `prfb`/`prfh`/`prfw`/`prfd` in all their addressing forms; and SVE2: the widening,
+  narrowing and long arithmetic (`saddlb`, `sabdlb`, `smullb`, `addhnb`, `shrnb`,
+  `sqxtnb`, ...), the saturating and rounding forms (`sqadd` predicated, `sqdmulh`,
+  `sqrdmlah`, the `sqshl` family, ...), the pairwise ops, `match`/`nmatch`,
+  `histcnt`/`histseg`, `bdep`/`bext`/`bgrp`, the polynomial (`pmul`, `pmullb`,
+  `eorbt`), complex integer (`cadd`, `sqcadd`, `cmla`, `sqrdcmlah`, `cdot`) and
+  crypto (`aese`, `aesmc`, `sm4e`, `rax1`, ...) instructions, `xar`, `eor3`, `bcax`, the
+  `bsl` family, `sqabs`/`sqneg`, `urecpe`/`ursqrte`, `flogb` and the SVE2 conversions.
+  The `mov` aliases follow the architecture's preferred-alias rules (`mov Zd.T, #imm`
+  stands for `dupm` only where no `dup` immediate gives the value). Not yet: SVE2.1 and
+  SME2's additions (predicate-as-counter `pn` registers, register-pair `while*`,
+  `psel`, `*clamp`, the two-way dot products). Not yet either:
   `@TLVPPAGE`/`@TLVPPAGEOFF` (Mach-O's thread-local descriptors), `:tlsldm:` (local
   dynamic's module base), `:gottprel_g1:`/
   `:gottprel_g0_nc:` and `:tlsdesc_off_*:` at link time (they assemble; the linkers
@@ -1802,7 +1816,12 @@ The GNU dialect's documentation describes extended asm, with these rules:
   operands with different numbers of alternatives are C3096). Letters: `r`, `g`, `X`, `m`, `o`, `V`, `i`, `n`,
   `s`, the digits; x86-64 `a b c d S D` (those registers), `A`, `q`, `R`, `Q`, `U`, `l`, `x`,
   `v`, `Y`, `I J K M N O e Z` (constants in their ranges); AArch64 `w` (any v register),
-  `x` (v0-v15), `y` (v0-v7), `Q` (memory at a base register), `I J K L M N Z S`. An operand
+  `x` (v0-v15), `y` (v0-v7), `Q`, `Ump`, `Umq` and the SVE memory forms `Utf`, `Utr`,
+  `Utv`, `Utq`, `Uty` (memory: an operand is always `[xn]`, which each of those forms
+  takes), `I J K L M N Z`, `Y` and `Dz` (the constant zero, also the floating `0.0`,
+  written `#0.0`), `Dn Dh Dq Ds Dd Dl Dr` and `Uc0`-`Uc2` (integer constants: the
+  instruction that uses one checks it), `S`, `Usa` and `Ush` (a symbol's address, plus a
+  constant), and `Upa` (any SVE predicate register), `Upl` (p0-p7). An operand
   chooses a constant when it is one (and the constraint allows it), else a register, else
   memory. A register operand is an integer, pointer or floating value of 1, 2, 4 or 8
   bytes (a floating value in a general register is its bits, an integer in a vector
@@ -1819,7 +1838,19 @@ The GNU dialect's documentation describes extended asm, with these rules:
   inputs the template left on the stack. An `asm goto` cannot have such outputs. `A`:
   a value of up to 64 bits in rax, a 128-bit integer (`__int128`) in the rdx:rax pair,
   rdx its high half (an output, an input, `+`, or tied with a matching constraint to an
-  output in the pair); the template names the pair as rax.
+  output in the pair); the template names the pair as rax. On AArch64 likewise the
+  registers the compiler does not allocate: an object that is no scalar of 1, 2, 4 or 8
+  bytes (a vector, an array in a structure, a `long double`, ...) under `w`, `x` or `y` is
+  in a vector register through memory: of up to 16 bytes with `ldr q`/`str q` (no SVE
+  needed; written `v<n>` without a modifier), of up to 256 (SVE's largest vector) in an
+  SVE `z` register with the whole-register `ldr z`/`str z` (written `z<n>`); `Upa` and
+  `Upl` put an object of up to 32 bytes in an SVE predicate register (`ldr p`/`str p`).
+  Each is a compiler temporary of the register's largest size (16, 256 or 32 bytes),
+  the value at its start and zeros after it; the `z` registers are chosen from z31 down
+  (within `x`'s z0-z15 and `y`'s z0-z7) among those no clobber or other operand names,
+  and are clobbered (their `v` registers keep nothing across the statement), the `p`
+  registers from p15 (`Upl` p7) down. A `z<n>` clobber is its `v<n>`'s; `p<n>` and
+  `ffr` keep the operands out of those registers. An `asm goto` cannot have such outputs.
 - Explicit register variables, `register long x asm("rax")` (or `"x8"`, `"w19"`, `"d0"`
   ...): such a variable is in that register when it is an asm operand in a register (the
   usual way to pass system call arguments); elsewhere it is an ordinary variable. The stack
@@ -1832,7 +1863,8 @@ The GNU dialect's documentation describes extended asm, with these rules:
 - Template modifiers: x86-64 `%b %w %k %q %h` (a register's widths, its high byte), `%x`
   (xmm), `%t` (ymm), `%g` (zmm), `%c %P %p %a` (a constant without `$`, an address), `%n` (negated), `%A` (`*`),
   `%H` (memory 8 bytes on), `%V`, `%z` (the size suffix); AArch64 `%w %x` (also of the
-  constant 0: `wzr`, `xzr`), `%b %h %s %d %q`, `%c`, `%n`. Without a modifier an x86-64
+  constant 0: `wzr`, `xzr`), `%b %h %s %d %q`, `%z` (a vector register as SVE's `z<n>`),
+  `%c`, `%n`. Without a modifier an x86-64
   register is written at its operand's width, an AArch64 general register as `w` up to 32
   bits and `x` for 64, and a floating-point register as `s` or `d` by its type; an AArch64
   memory operand is `[xn]`. `%%`, `%=` (a number unique to each copy of the statement),
@@ -1850,10 +1882,18 @@ The GNU dialect's documentation describes extended asm, with these rules:
   - `volatile`, no `"memory"` clobber and no memory operands: kept where it is, once
     each time it is reached, but no barrier to memory: values in memory may stay in
     registers across it.
-  - with a `"memory"` clobber or memory operands: kept where it is, and as reading and
-    writing any memory (stores before it are done, loads after it done again; for memory
-    operands this is more than the dialect's rule, that it reads its inputs' objects and
-    writes its outputs', and is always correct).
+  - with memory operands and no `"memory"` clobber: kept where it is, reading exactly
+    its input memory operands' objects and writing its output ones' (`+m` both), as the
+    dialect's rule says, and no other memory: values of other objects stay in registers
+    across it, stores to them before it may be removed when later ones overwrite them,
+    and the objects it names keep their earlier stores and are loaded again after it
+    (value numbering, load forwarding, dead stores and keeping loop values in registers
+    reason this way; the other passes, the vectorizer among them, treat it as below).
+    An operand that goes through memory (mask, MMX, x87, SVE and AArch64 vector
+    operands) is the compiler's own temporary, which only it reads and writes. An
+    `asm goto` and a template that calls a function are as below.
+  - with a `"memory"` clobber (and a basic asm): kept where it is, and as reading and
+    writing any memory (stores before it are done, loads after it done again).
   An output in a register is the statement's result in that register, which the register
   allocator places (no store and load around it), then assigned to its lvalue (in
   `asm goto`, on every path, the label's too). An early-clobber output (`&`) is in no

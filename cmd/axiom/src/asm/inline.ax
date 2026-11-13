@@ -50,10 +50,12 @@ pub struct Op {
     sym: bool,    // OK_IMM: an address (a symbol's, plus a constant)
     via: u8,      // OK_MEM of a register the compiler does not allocate (VIA_*): its value goes through memory
     x87: u8,      // VIA_X87: the constraint ('t' st(0), 'u' st(1), 'f' any)
+                  // (VIA_V, VIA_P: `reg` is the register, chosen by semantic analysis: z<reg - 32> or p<reg>)
     inout: bool,  // an output also read ('+')
     mbits: u32,   // OK_MEM: the object's size in bits when it is 8, 16, 32, 64 or 128 (80: the x87's long double), else 0
     pair: i32,    // x86-64 'A' of a 128-bit value: the operand of its other half (the low half in rax is the one the template names; its high half, in rdx, is `hi`, after all the others), or -1
     hi: bool,
+    zero: bool,  // OK_IMM: the constant is 0 (as check.ax's stand-in is then)
 }
 
 // Registers an operand can be in that the compiler never allocates: the
@@ -63,6 +65,8 @@ pub const VIA_NONE: u8 = 0;
 pub const VIA_K: u8 = 1;    // an AVX-512 mask register (x86-64 'k')
 pub const VIA_MM: u8 = 2;   // an MMX register (x86-64 'y')
 pub const VIA_X87: u8 = 3;  // the x87 register stack (x86-64 't', 'u', 'f')
+pub const VIA_V: u8 = 4;    // AArch64: an object in a vector register, q (16 bytes) or SVE z (up to 256): 'w' 'x' 'y'
+pub const VIA_P: u8 = 5;    // AArch64: an SVE predicate register ('Upa', 'Upl'), up to 32 bytes
 
 /// An operand as the backend placed it (or check.ax's stand-in), which an
 /// architecture's `render` writes in its assembly syntax.
@@ -115,7 +119,7 @@ pub struct Blob {
     goto_: bool,
     loc: []u8,        // "file:line", for the messages of the backends
     stclob: u32,      // x86-64: the x87 registers clobbered (bit n: st(n)): inputs the template pops
-    kclob: u32,       // x86-64: the mask registers clobbered (bit n: kn)
+    kclob: u32,       // x86-64: the mask registers clobbered (bit n: kn); AArch64: the SVE predicate registers
     mmclob: u32,      // x86-64: the MMX registers clobbered
     sp: bool,         // the template uses the stack (pushes, pops, calls or names the stack pointer: asm/core.ax stack_use): its function has a frame
     calls: bool,      // the template calls a function
@@ -197,6 +201,7 @@ pub struct Con {
     imm_hi: i64,
     sym_ok: bool,
     imm_letter: u8,  // the letter that asked for the constant (I, K, ...), for messages
+    fpz: bool,       // AArch64 Y and Dz: the floating constant 0.0 is one too
     tie: i32,        // a matching constraint: the operand number, or -1
     tie_name: []u8,  // a matching constraint by name ([name])
     via: u8,         // VIA_*: a register the compiler does not allocate
@@ -214,7 +219,7 @@ fn no_con(msg: []u8) Con {
 fn new_con() Con {
     return Con.{ ok: true, msg: "", output: false, inout: false, early: false, reg: false, cls: CL_GPR, fixed: -1,
                  subset: 0, mem: false, mem_q: false, imm: false, imm_lo: 0, imm_hi: 0, sym_ok: false, imm_letter: 0,
-                 tie: -1, tie_name: "", via: VIA_NONE, x87: 0, pair: false };
+                 fpz: false, tie: -1, tie_name: "", via: VIA_NONE, x87: 0, pair: false };
 }
 
 fn set_imm(c: *mut Con, lo: i64, hi: i64, which: u8) void {
@@ -287,6 +292,18 @@ pub fn constraint(arch: i32, s: []u8, output: bool) Con {
             c.fixed = 16;
             seen = true;
             i += 1;
+        } else if (arch == tg.ARCH_A64) and ((ch == 'U') or (ch == 'D')) {
+            // AArch64's constraints of three letters (U..) and two (D.)
+            let len = pick_us(ch == 'U', 3, 2);
+            if (i + len) > s.len {
+                return no_con(u.f1("'%s' is not a constraint of AArch64 supported here", s[i..]));
+            }
+            let ok = a64_multi(&mut c, s[i..i + len]);
+            if not ok.ok {
+                return ok;
+            }
+            seen = true;
+            i += len - 1;
         } else {
             let ok = letter(&mut c, arch, ch, x86);
             if not ok.ok {
@@ -468,6 +485,12 @@ fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
             set_imm(c, 0, 0, ch);
             return ok;
         }
+        if ch == 'Y' {
+            // the floating constant zero (or the integer 0)
+            set_imm(c, 0, 0, ch);
+            c.fpz = true;
+            return ok;
+        }
         if (ch == 'S') or (ch == 'U') {
             if ch == 'S' {
                 set_imm(c, I64_MIN, I64_MAX, ch);
@@ -478,6 +501,63 @@ fn letter(c: *mut Con, arch: i32, ch: u8, x86: bool) Con {
         return no_con(u.f1("'%s' is not a constraint of AArch64 supported here", ch_text(ch)));
     }
     return no_con("inline assembly is not supported on this target");
+}
+
+// One of AArch64's constraints of more than one letter (n), the dialect's
+// machine constraints: Upa/Upl an SVE predicate register (any, or p0-p7);
+// Ump, Umq (load/store pair, 128-bit) and the SVE memory forms Utf Utr Utv
+// Utq Uty: memory (an asm's memory operand is always [Xn], which every form
+// takes); Usa, Ush a symbol's address (absolute, or its 4 GiB page for adrp);
+// Dz the constant zero (integer or floating); Dn Dh Dq Ds Dd Dl Dr and Uc0-Uc2
+// integer constants (the immediates of vector moves and shifts: the assembler
+// checks them where the template uses them).
+fn a64_multi(c: *mut Con, n: []u8) Con {
+    let ok = new_con();
+    if u.str_eq(n, "Upa") or u.str_eq(n, "Upl") {
+        c.mem = true;
+        c.via = VIA_P;
+        c.subset = u64_pick(n[2] == 'a', 0xffff, 0xff);
+        return ok;
+    }
+    let mems = ["Ump", "Umq", "Utf", "Utr", "Utv", "Utq", "Uty"];
+    for m in mems {
+        if u.str_eq(n, m) {
+            c.mem = true;
+            return ok;
+        }
+    }
+    if u.str_eq(n, "Usa") or u.str_eq(n, "Ush") {
+        set_imm(c, I64_MIN, I64_MAX, 'S');
+        c.sym_ok = true;
+        return ok;
+    }
+    if u.str_eq(n, "Dz") {
+        set_imm(c, 0, 0, 'Z');
+        c.fpz = true;
+        return ok;
+    }
+    let ints = ["Dn", "Dh", "Dq", "Ds", "Dd", "Dl", "Dr", "Uc0", "Uc1", "Uc2"];
+    for m in ints {
+        if u.str_eq(n, m) {
+            set_imm(c, I64_MIN, I64_MAX, 'N');
+            return ok;
+        }
+    }
+    return no_con(u.f1("'%s' is not a constraint of AArch64 supported here", n));
+}
+
+fn pick_us(c: bool, a: usize, b: usize) usize {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 pub fn ch_text(ch: u8) []u8 {
@@ -712,8 +792,8 @@ pub fn clobber_kind(arch: i32, n: []u8) i32 {
         if u.str_eq(n, "nzcv") or u.str_eq(n, "fpsr") or u.str_eq(n, "fpcr") {
             return 1;
         }
-        // the SVE registers (z0-z31, p0-p15, ffr): the compiler allocates none
-        // of them, so a clobber of one needs nothing preserved across the asm.
+        // ffr (and z0-z31, p0-p15 where the caller has not made them a v
+        // register's clobber and the predicates kept from operands: csema_asm.ax)
         if u.str_eq(n, "ffr") {
             return 1;
         }
@@ -884,7 +964,7 @@ pub fn modifier_ok(arch: i32, m: u8) bool {
     if arch == tg.ARCH_X64 {
         return u.find("abwkqhcnPpVzxAHtg", m) >= 0;
     }
-    return u.find("wxbhsdqcnZ", m) >= 0;
+    return u.find("wxbhsdqzcnZ", m) >= 0;
 }
 
 /// The text of a blob's template with each reference replaced by what
@@ -912,6 +992,8 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
             out.s(u.f3("kmov%s %s, %%k%s\n", kmask_sfx(op.bits), render(b, k, 0), u.idec(vr[k])));
         } else if op.via == VIA_MM {
             out.s(u.f3("mov%s %s, %%mm%s\n", u.pick(op.bits == 32, "d", "q"), render(b, k, 0), u.idec(vr[k])));
+        } else if (op.via == VIA_V) or (op.via == VIA_P) {
+            out.s(u.f2("ldr %s, %s\n", via_text(op, vr[k], false, via_view(op)), render(b, k, 0)));
         } else if vr[k] > maxpos {
             maxpos = vr[k];
         }
@@ -938,7 +1020,7 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
         } else if pc.kind == PK_OP {
             let k = @int_cast(usize, pc.op);
             if (k < n) and (b.ops[k].via != VIA_NONE) {
-                out.s(via_text(b.ops[k], vr[k], b.intel));
+                out.s(via_text(b.ops[k], vr[k], b.intel, pc.mod));
             } else {
                 out.s(render(b, k, pc.mod));
             }
@@ -960,10 +1042,18 @@ pub fn expand(b: *Blob, render: fn(*Blob, usize, u8) []u8, label: fn(i32) []u8, 
         return out.done();
     }
     // (in the dialect's syntax, whatever the template left in force)
-    out.s(u.pick(b.intel, "\n.intel_syntax noprefix\n", "\n.att_syntax\n"));
+    if b.arch == tg.ARCH_X64 {
+        out.s(u.pick(b.intel, "\n.intel_syntax noprefix\n", "\n.att_syntax\n"));
+    } else {
+        out.s("\n");
+    }
     for k in 0..n {
         let op = b.ops[k];
         if not op.out or (op.via == VIA_NONE) {
+            continue;
+        }
+        if (op.via == VIA_V) or (op.via == VIA_P) {
+            out.s(u.f2("str %s, %s\n", via_text(op, vr[k], false, via_view(op)), render(b, k, 0)));
             continue;
         }
         if (op.via == VIA_K) and b.intel {
@@ -1035,6 +1125,10 @@ pub fn via_regs(b: *Blob) []i32 {
             vr[k] = vr[@int_cast(usize, op.tie)];
             continue;
         }
+        if (op.via == VIA_V) or (op.via == VIA_P) {
+            vr[k] = op.reg;  // (chosen by semantic analysis: csema_asm.ax)
+            continue;
+        }
         if op.via == VIA_K {
             while (nextk < 8) and ((b.kclob & (@as(u32, 1) << @int_cast(u32, nextk))) != 0) {
                 nextk += 1;
@@ -1097,7 +1191,21 @@ pub fn x87_survivors(b: *Blob, vr: []i32) i32 {
     return n;
 }
 
-fn via_text(op: Op, r: i32, intel: bool) []u8 {
+// The register of an operand through memory: r as its kind's text (the AT&T
+// syntax's %, unless intel); for AArch64's, mod chooses the view of a vector
+// register (z for one of SVE, q b h s d), whose default is v (an object of
+// 16 bytes or fewer, as a vector register's operand is written) or z.
+fn via_text(op: Op, r: i32, intel: bool, mod: u8) []u8 {
+    if op.via == VIA_P {
+        return u.cat2("p", u.idec(r));
+    }
+    if op.via == VIA_V {
+        let mut v = mod;
+        if (mod == 0) or (u.find("bhsdqzv", mod) < 0) {
+            v = u8_pick(op.bits > 128, 'z', 'v');
+        }
+        return u.cat2(ch_text(v), u.idec(r - 32));
+    }
     let mut t = "";
     if op.via == VIA_K {
         t = u.cat2("%k", u.idec(r));
@@ -1112,6 +1220,19 @@ fn via_text(op: Op, r: i32, intel: bool) []u8 {
         return t[1..];
     }
     return t;
+}
+
+// The view an AArch64 operand through memory is loaded and stored in: q (up
+// to 16 bytes, which needs no SVE), or the whole z (or p) register.
+fn via_view(op: Op) u8 {
+    return u8_pick(op.bits > 128, 'z', 'q');
+}
+
+fn u8_pick(c: bool, a: u8, b: u8) u8 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 fn kmask_sfx(bits: u32) []u8 {

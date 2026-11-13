@@ -844,6 +844,14 @@ fn escapes(f: *mut ir.Func) void {
                 for k in 1..i.xs.len {
                     leak(i.xs.get(k));
                 }
+            } else if exact_asm(i) {
+                // (the addresses of its memory operands are only accessed;
+                // its operands in registers may go anywhere)
+                for k in 0..i.xs.len {
+                    if not asm_mem_arg(i, k) {
+                        leak(i.xs.get(k));
+                    }
+                }
             } else {
                 leak(i.a);
                 leak(i.b);
@@ -946,9 +954,35 @@ fn note_writes(i: *mut ir.Value) void {
         push_write(W_ALL, nowhere());
     } else if ir.intr_id(i) == ir.IN_STORE_PARTIAL {
         push_write(W_LOC, partial_loc(i));
+    } else if exact_asm(i) {
+        for m in ir.asm_mem_of(i) {
+            if m.wr {
+                push_write(W_LOC, asm_loc(i, m));
+            }
+        }
     } else if ir.inst_opaque(i) {
         push_write(W_ALL, nowhere());
     }
+}
+
+// Is i inline assembly that accesses only its memory operands (ir.ASM_EXACT)?
+fn exact_asm(i: *ir.Value) bool {
+    return (i.op == ir.OP_INTR) and ((ir.asm_of(i) & ir.ASM_EXACT) != 0);
+}
+
+// Where the exact asm i's memory operand m is.
+fn asm_loc(i: *ir.Value, m: ir.AsmMem) Loc {
+    return loc_of(i.xs.get(@as(usize, m.arg)), m.size);
+}
+
+// Is operand k of the exact asm i the address of a memory operand?
+fn asm_mem_arg(i: *ir.Value, k: usize) bool {
+    for m in ir.asm_mem_of(i) {
+        if @as(usize, m.arg) == k {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Is the value at l (of type t) known? Returns it or nil.
@@ -3668,6 +3702,19 @@ fn dse_block(b: *mut ir.Block, killed: *mut u.List.[Loc], read_objs: *mut u.List
         } else if (ir.intr_id(i) == ir.IN_STORE_PARTIAL) or ir.is_prefetch(ir.intr_id(i)) {
             // (writes part of its location: nothing it makes dead, nothing it
             // reads; a prefetch neither reads nor writes)
+        } else if exact_asm(i) {
+            // (reads its input memory operands; what it writes it need not
+            // write all of, so it makes nothing dead)
+            for m in ir.asm_mem_of(i) {
+                if m.rd {
+                    let l = asm_loc(i, m);
+                    read_loc(killed, &l);
+                    if u.notnil(l.obj) {
+                        read_objs.push(l.obj);
+                    }
+                }
+            }
+            ss_reads();
         } else if ir.inst_opaque(i) {
             killed.clear();
             at_ret = false;
@@ -4384,6 +4431,13 @@ fn only_accessed_at(members: *u.List.[*mut ir.Block], p: *mut ir.Value, t: *mut 
                 }
             } else if (op == ir.OP_CALL) or (op == ir.OP_RMW) or (op == ir.OP_CMPXCHG) or (op == ir.OP_FENCE) {
                 return false;
+            } else if exact_asm(i) {
+                for m in ir.asm_mem_of(i) {
+                    let x = asm_loc(i, m);
+                    if may_alias(&x, &w) {
+                        return false;
+                    }
+                }
             } else if (op == ir.OP_INTR) and
                       ((ir.inst_props(i) & (ir.INF_READS_MEM | ir.INF_WRITES_MEM | ir.INF_OPAQUE)) != 0) {
                 return false;

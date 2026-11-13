@@ -6,6 +6,8 @@
   reduction, permute, move, index, predicate, element-count, floating-point and
   conversion instructions, with `ldr`/`str` of a `z` or `p` register and the
   contiguous `ld1`/`st1` loads and stores. `z`, `p` and `ffr` may appear in an
-  inline-asm clobber list. The gather/scatter, first/non-fault, structure and
-  replicating loads, the SVE prefetches, and the SVE2 widening, narrowing,
-  saturating and permute families are not yet encoded.
+  inline-asm clobber list. Every SVE load, store and prefetch addressing form
+  (gathers and scatters, first-fault, non-fault, structure, non-temporal and
+  replicating loads), `adr`, the dot products and matrix multiplies, BF16, and the
+  SVE2 instructions (widening, narrowing, saturating, pairwise, complex, bit-permute,
+  polynomial, crypto and ternary) are encoded too.

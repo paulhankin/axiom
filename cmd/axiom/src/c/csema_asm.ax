@@ -189,6 +189,12 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
         op.pair = 0;
         return true;
     }
+    if (tg.g_arch == tg.ARCH_A64) and c.reg and (c.cls == ai.CL_VEC) and (op.bits == 0) and (rv < 0) {
+        // an object that is no scalar of a register's width (a vector, a
+        // structure, a long double, ...): in a vector register through memory,
+        // q for up to 16 bytes, else an SVE z register (asm/inline.ax, expand)
+        return via_object(o, e, c.subset, ai.VIA_V, 256, op);
+    }
     if cty.is_wint(t) and not c.mem {
         // (wider than a register: a pair of registers, as other compilers
         // allow for some constraints, is not chosen here; in memory, "m", it is)
@@ -196,10 +202,18 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
                                       cs.tq(e.ty)));
         return false;
     }
+    if not output and c.imm and c.fpz and e.is_const and cty.is_floating(t) and not cty.is_complex(t) and
+       (e.fcval == 0.0) {
+        // (AArch64 Y, Dz: the floating constant zero)
+        op.kind = ai.OK_IMM;
+        op.zero = true;
+        return true;
+    }
     if not output and c.imm and e.is_const and cty.is_integer(t) and not cty.is_wint(t) {
         let v = @bit_cast(i64, e.cval);
         if (c.imm_letter == 0) or ((v >= c.imm_lo) and (v <= c.imm_hi)) {
             op.kind = ai.OK_IMM;
+            op.zero = v == 0;
             return true;
         }
         if not c.reg and not c.mem {
@@ -244,6 +258,11 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
             op.reg = rv;
         }
         return true;
+    }
+    if (c.via == ai.VIA_V) or (c.via == ai.VIA_P) {
+        // an SVE predicate register (or the vector register of the output an
+        // input is tied to): through memory
+        return via_object(o, e, c.subset, c.via, u64_pick(c.via == ai.VIA_P, 32, 256), op);
     }
     if c.via != ai.VIA_NONE {
         // a mask, MMX or x87 register (its value through memory: asm/inline.ax, expand)
@@ -296,6 +315,44 @@ fn choose(o: *cast.AsmOperand, e: *mut cast.Expr, c: *ai.Con, output: bool, op: 
     return false;
 }
 
+// Operand o (e) of AArch64's registers the compiler does not allocate (via:
+// an SVE z or p register, or a q register of an object), whose value goes
+// through memory: an object of at most `max` bytes (an output an lvalue).
+fn via_object(o: *cast.AsmOperand, e: *mut cast.Expr, subset: u64, via: u8, max: u64, op: *mut ai.Op) bool {
+    let mut t = e.ty;
+    if not e.lvalue {
+        t = value_type(e);
+    }
+    if (t.kind == cty.TK_FUNCTION) or (t.kind == cty.TK_VOID) or not cty.is_complete(t) or (cty.size_of(t) == 0) or
+       (cty.size_of(t) > max) {
+        bad(o.span, u.f2("an operand of type %s cannot be in the registers of the constraint '%s'", cs.tq(e.ty),
+                         o.constraint));
+        return false;
+    }
+    if e.lvalue and u.notnil(cb.member(e)) {
+        bad(o.span, "an operand in a register through memory cannot be a bit-field");
+        return false;
+    }
+    if e.lvalue and u.notnil(csm.register_object(e)) {
+        bad(o.span, "an operand in a register through memory cannot be an object declared register");
+        return false;
+    }
+    op.kind = ai.OK_MEM;
+    op.cls = ai.CL_VEC;
+    op.via = via;
+    op.subset = subset;
+    op.bits = @truncate(u32, cty.size_of(t) * 8);
+    op.mbits = 0;
+    return true;
+}
+
+fn u64_pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
 /// An asm statement in a function: its operands typed (an output an lvalue,
 /// an input a value, or for memory an lvalue), its Blob made (a.blob), its
 /// expressions for IR generation in a.exprs (one for each of the blob's
@@ -338,7 +395,7 @@ pub fn stmt(a: *mut cast.Asm) void {
         let c = ai.constraint(arch, alt_of(o.constraint, alt), true);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: true, early: false, tie: -1, bits: 0, fp: false,
                              name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
-                             hi: false };
+                             hi: false, zero: false };
         if not c.ok {
             report_con(o, c.msg);
             ok = false;
@@ -364,7 +421,7 @@ pub fn stmt(a: *mut cast.Asm) void {
         let c = ai.constraint(arch, alt_of(o.constraint, alt), false);
         let mut op = ai.Op.{ kind: 0, cls: 0, reg: -1, subset: 0, out: false, early: false, tie: -1, bits: 0, fp: false,
                              name: "", q: false, sym: false, via: ai.VIA_NONE, x87: 0, inout: false, mbits: 0, pair: -1,
-                             hi: false };
+                             hi: false, zero: false };
         let mut e = o.e;
         if not c.ok {
             report_con(o, c.msg);
@@ -519,6 +576,19 @@ pub fn stmt(a: *mut cast.Asm) void {
                 continue;
             }
         }
+        if (arch == tg.ARCH_A64) and (c.name.len >= 2) and ((c.name[0] == 'z') or (c.name[0] == 'p')) {
+            // an SVE register: z<n> is v<n> (with its upper bits), p<n> one the
+            // operands through memory avoid
+            let k = ai.num(c.name[1..]);
+            if (c.name[0] == 'z') and (k >= 0) and (k <= 31) {
+                b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, 32 + k));
+                continue;
+            }
+            if (c.name[0] == 'p') and (k >= 0) and (k <= 15) {
+                b.kclob = b.kclob | (@as(u32, 1) << @int_cast(u32, k));
+                continue;
+            }
+        }
         let kind = ai.clobber_kind(arch, c.name);
         if kind == 2 {
             b.memory = true;
@@ -634,6 +704,64 @@ pub fn stmt(a: *mut cast.Asm) void {
                 bad(a.span, u.f2("operands %s and %s are in the same register", u.zdec(j), u.zdec(i)));
                 ok = false;
             }
+        }
+    }
+    // AArch64's operands through memory: their z (v) and p registers, those
+    // of no clobber, fixed operand or other such operand (the z ones then
+    // clobbered: the allocator keeps nothing in them across the asm)
+    if ok and (arch == tg.ARCH_A64) {
+        let mut vtaken = b.clobber >> 32;
+        let mut ptaken = b.kclob;
+        for i in 0..ops.len {
+            let op = ops.get(i);
+            if (op.kind == ai.OK_FIXED) and (op.reg >= 32) {
+                vtaken = vtaken | (@as(u64, 1) << @int_cast(u32, op.reg - 32));
+            }
+        }
+        for i in 0..ops.len {
+            let mut op = ops.get(i);
+            if (op.via != ai.VIA_V) and (op.via != ai.VIA_P) {
+                continue;
+            }
+            if a.goto_ and op.out {
+                bad(a.span, "an asm goto cannot have outputs in SVE or vector registers through memory");
+                ok = false;
+            }
+            if (op.tie >= 0) and (ops.get(@int_cast(usize, op.tie)).via == op.via) {
+                op.reg = ops.get(@int_cast(usize, op.tie)).reg;
+                ops.set(i, op);
+                continue;
+            }
+            let p = op.via == ai.VIA_P;
+            let mut sub = op.subset;
+            if sub == 0 {
+                sub = u64_pick(p, 0xffff, 0xffffffff);
+            }
+            // (from the top: z31 down are caller-saved; p15 down, or p7 down)
+            let mut r: i32 = -1;
+            let mut j: i32 = pick_i32(p, 15, 31);
+            while (j >= 0) and (r < 0) {
+                let bit = @as(u64, 1) << @int_cast(u32, j);
+                let used = u64_pick(p, @as(u64, ptaken), vtaken);
+                if ((sub & bit) != 0) and ((used & bit) == 0) {
+                    r = j;
+                }
+                j -= 1;
+            }
+            if r < 0 {
+                bad(a.span, "an asm statement with more SVE or vector operands through memory than free registers");
+                ok = false;
+                continue;
+            }
+            if p {
+                ptaken = ptaken | (@as(u32, 1) << @int_cast(u32, r));
+                op.reg = r;
+            } else {
+                vtaken = vtaken | (@as(u64, 1) << @int_cast(u32, r));
+                b.clobber = b.clobber | (@as(u64, 1) << @int_cast(u32, 32 + r));
+                op.reg = 32 + r;
+            }
+            ops.set(i, op);
         }
     }
     // the template's references
@@ -890,6 +1018,13 @@ pub fn naked_body(f: *cast.CSym, body: *cast.Stmt) void {
 }
 
 fn pick_us(c: bool, a: usize, b: usize) usize {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn pick_i32(c: bool, a: i32, b: i32) i32 {
     if c {
         return a;
     }
