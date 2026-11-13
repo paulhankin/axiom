@@ -2110,17 +2110,16 @@ fn pragma_pack(P: *mut PP, ts0: []lx.PTok, sp: u.Span) lx.PTok {
 
 // #pragma STDC FP_CONTRACT, FENV_ACCESS, CX_LIMITED_RANGE (on-off-switch),
 // and C23's FENV_ROUND (a direction). Not macro-replaced (6.10.6p2).
-// FENV_ACCESS and FENV_ROUND are honoured (an event at the next token, for
-// the parser: cpragma.ax, EV_FENV_ACCESS, EV_FENV_ROUND; docs/c.md, "The
+// FENV_ACCESS, FENV_ROUND and FENV_DEC_ROUND are honoured (an event at the
+// next token, for the parser: cpragma.ax, EV_FENV_ACCESS, EV_FENV_ROUND,
+// EV_FENV_DEC_ROUND; docs/c.md, "The
 // floating-point environment"). No floating operations are ever
 // contracted (an FMA is only made where the program calls fma), so
 // FP_CONTRACT OFF holds always, and ON allows what is not done;
 // CX_LIMITED_RANGE is accepted (it allows what the implementation may then
 // do, and asks for nothing). WebAssembly has no rounding modes: there
-// FENV_ROUND's directed modes are C4113. FENV_DEC_ROUND's FE_DEC_DYNAMIC
-// and FE_DEC_TONEAREST hold (the decimal floating operations round in the
-// dynamic decimal direction, fe_dec_setround's), its other directions are
-// C4113.
+// FENV_ROUND's directed modes are C4113. FENV_DEC_ROUND (C23 7.6.3) is an
+// event too (EV_FENV_DEC_ROUND), in every direction and on every target.
 fn pragma_stdc(P: *PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
     _ = P;
     if (ts.len != 2) or (ts[0].kind != lx.PK_IDENT) or (ts[1].kind != lx.PK_IDENT) {
@@ -2149,17 +2148,15 @@ fn pragma_stdc(P: *PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
         return malformed(sp, "STDC FENV_ROUND");
     }
     if u.str_eq(n, "FENV_DEC_ROUND") {
-        // (the decimal floating types' direction, C23 7.6.3: the dynamic
-        // one, fe_dec_setround's, is always used)
-        if u.str_eq(v, "FE_DEC_TONEAREST") or u.str_eq(v, "FE_DEC_DYNAMIC") {
-            return no_tok();
-        }
-        if u.str_eq(v, "FE_DEC_UPWARD") or u.str_eq(v, "FE_DEC_DOWNWARD") or u.str_eq(v, "FE_DEC_TOWARDZERO") or
-           u.str_eq(v, "FE_DEC_TONEARESTFROMZERO") {
-            _ = dg.warning(sp, "C4113",
-                           u.f1("'#pragma STDC FENV_DEC_ROUND %s' is not honoured: decimal floating operations round in the dynamic decimal rounding direction",
-                                v));
-            return no_tok();
+        // (the decimal floating types' static direction, C23 7.6.3: an
+        // event for the parser, as FENV_ROUND's; the decimal arithmetic is
+        // software on every target, so every direction is honoured)
+        let names = ["FE_DEC_DYNAMIC", "FE_DEC_TONEAREST", "FE_DEC_DOWNWARD", "FE_DEC_UPWARD", "FE_DEC_TOWARDZERO",
+                     "FE_DEC_TONEARESTFROMZERO"];
+        for k in @as(usize, 0)..names.len {
+            if u.str_eq(v, names[k]) {
+                return pragma_tok(cp.EV_FENV_DEC_ROUND, @as(u64, @truncate(u32, k)), sp);
+            }
         }
         return malformed(sp, "STDC FENV_DEC_ROUND");
     }
@@ -2492,12 +2489,19 @@ fn predefined_text(P: *PP) []u8 {
         b.s(u.f1("#define __STDC_VERSION__ %sL\n", u.dec(co.stdc_version(std))));
     }
     if std >= co.C99 {
-        // (__STDC_IEC_559__ and C23's __STDC_IEC_60559_BFP__ are not
-        // defined: the types have IEC 60559's formats, which float.h's
-        // *_IS_IEC_60559 say, but there is no <fenv.h> or <math.h>, no
-        // exception flags and no rounding modes, which Annex F requires)
         // (hosted unless --c-freestanding: the C library is linked, 4p6)
         b.s(u.f1("#define __STDC_HOSTED__ %s\n", u.pick(o.hosted, "1", "0")));
+        if o.hosted and not o.system_lib and not tg.is_wasm() {
+            // Annex F (IEC 60559 binary floating-point arithmetic) and Annex G
+            // (complex arithmetic) hold where the target has a floating-point
+            // environment and the library is ours (docs/c-conformance.md,
+            // "Annexes F, G and H"): not on WebAssembly, which has no rounding
+            // modes and no exception flags, nor with the system's C library
+            b.s("#define __STDC_IEC_559__ 1\n#define __STDC_IEC_559_COMPLEX__ 1\n");
+            if std >= co.C23 {
+                b.s("#define __STDC_IEC_60559_BFP__ 202311L\n#define __STDC_IEC_60559_COMPLEX__ 202311L\n");
+            }
+        }
         if o.hosted and (o.wchar_bits == 32) {
             // (6.10.8.2: every character of ISO/IEC 10646 is a wchar_t of its
             // code point; the library's classes are Unicode 15.1's, of
@@ -2513,9 +2517,9 @@ fn predefined_text(P: *PP) []u8 {
             // __STDC_WANT_LIB_EXT1__: std/c/include/axc/ext1.h)
             b.s("#define __STDC_LIB_EXT1__ 201112L\n");
         }
-        // (complex types are supported, without __STDC_IEC_559_COMPLEX__:
-        // Annex G needs Annex F, and before C23 the imaginary types too;
-        // atomics are, <stdatomic.h>, and threads, the library's <threads.h>:
+        // (complex types are supported, and the imaginary types: Annex G's
+        // macros are above; atomics are, <stdatomic.h>, and threads, the
+        // library's <threads.h>:
         // no __STDC_NO_ATOMICS__, __STDC_NO_COMPLEX__ or __STDC_NO_THREADS__)
     }
     if std >= co.C23 {

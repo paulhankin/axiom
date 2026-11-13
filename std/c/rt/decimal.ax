@@ -2084,53 +2084,17 @@ pub fn from_bin(w: ld.W, b: u32, f: u32, c: *mut Ctx) ld.W {
 }
 
 // The binary value (-1)^neg * r * 2^e (r nonzero, plus less than a unit of
-// 2^e more when sticky) rounded to nearest (ties to even) in format b.
-fn bin_round(neg: bool, r: U2, e: i32, sticky: bool, b: u32, c: *mut Ctx) ld.W {
+// 2^e more when sticky) rounded in binary direction bmode (ldouble.ax's RN
+// ...) to format b, tininess detected after rounding (ldouble.ax's round).
+fn bin_round(neg: bool, r: U2, e: i32, sticky: bool, b: u32, bmode: u32, c: *mut Ctx) ld.W {
+    let mut be = ld.Env.{ mode: bmode, flags: 0 };
     let p = bprec(b);
-    let l = bitlen2(r);
-    let top = (e + l) - 1;  // the leading bit's exponent
-    // the exponent of the result's last bit
-    let t = @max((top - p) + 1, (bemin(b) - p) + 1);
-    let mut m = r;
-    let mut inexact = sticky;
-    let mut tt = t;
-    if t > e {
-        let s = @bit_cast(u32, t - e);
-        let half = (s <= 128) and bit2(r, s - 1);
-        let mut rest = sticky;
-        if s >= 2 {
-            rest = rest or not is0(low2(r, s - 1));
-        }
-        m = shr2(r, s);
-        inexact = half or rest;
-        if half and (rest or ((m.l & 1) != 0)) {
-            m = add2(m, u2(0, 1));
-            if bitlen2(m) > p {
-                m = shr2(m, 1);
-                tt += 1;
-            }
-        }
-    } else if t < e {
-        m = shl2(r, @bit_cast(u32, e - t));
-    }
-    let tiny = top < bemin(b);
-    if inexact {
-        c.flags = c.flags | F_INEXACT;
-        if tiny {
-            c.flags = c.flags | F_UNDERFLOW;
-        }
-    }
-    let lead = (tt + p) - 1;  // the exponent of bit p - 1 of m
-    if (lead > bemax(b)) and (bitlen2(m) == p) {
-        c.flags = c.flags | (F_OVERFLOW | F_INEXACT);
+    let d = ld.round_bin(neg, e + 127, r.h, r.l, sticky, p, bemax(b), (2 * bemax(b)) + 1, &mut be);
+    c.flags = c.flags | be.flags;
+    if d.ef == (2 * bemax(b)) + 1 {
         return bin_inf(neg, b);
     }
-    // the biased exponent: 0 for a subnormal (m below 2^(p - 1))
-    let mut ef: i32 = 0;
-    if bitlen2(m) == p {
-        ef = lead + bemax(b);
-    }
-    return bin_pack(neg, ef, m, b);
+    return bin_pack(neg, d.ef, u2(d.mh, d.ml), b);
 }
 
 fn bin_inf(neg: bool, b: u32) ld.W {
@@ -2183,6 +2147,11 @@ fn bin_pack(neg: bool, ef: i32, m: U2, b: u32) ld.W {
 /// The decimal value w of format f in binary format b (to nearest, ties to
 /// even).
 pub fn to_bin(w: ld.W, f: u32, b: u32, c: *mut Ctx) ld.W {
+    return to_bin_m(w, f, b, ld.RN, c);
+}
+
+/// to_bin rounding in binary direction bmode (ldouble.ax's RN ...).
+pub fn to_bin_m(w: ld.W, f: u32, b: u32, bmode: u32, c: *mut Ctx) ld.W {
     let x = unpack(w, f);
     if is_nan(x) {
         if x.cls == K_SNAN {
@@ -2230,7 +2199,7 @@ pub fn to_bin(w: ld.W, f: u32, b: u32, c: *mut Ctx) ld.W {
         }
         e2 = -s;
     }
-    return bin_round(x.neg, nat_u2(&a), e2, sticky, b, c);
+    return bin_round(x.neg, nat_u2(&a), e2, sticky, b, bmode, c);
 }
 
 // a = floor(a / 2^s); whether it dropped a nonzero remainder.
@@ -2740,6 +2709,15 @@ fn envc() Ctx {
     return Ctx.{ mode: env.g_round, flags: 0 };
 }
 
+/// Sets the thread's decimal rounding direction to m (an R_ value) and
+/// returns the one it had: the static direction of C's FENV_DEC_ROUND
+/// around a full expression (cmd/axiom/src/c/cgen_expr.ax).
+pub fn dec_round_swap(m: u32) u32 {
+    let o = env.g_round;
+    env.g_round = m;
+    return o;
+}
+
 fn done(c: *Ctx) void {
     env.raise(c.flags);
 }
@@ -2901,6 +2879,23 @@ pub fn dec_to_bin(r: *mut ld.W, p: *ld.W, x: u64, f: u32, b: u32) u64 {
         w = p.*;
     }
     let v = to_bin(w, f, b, &mut c);
+    done(&c);
+    if (b == B_Q) or (b == B_X) {
+        r.* = v;
+    }
+    return v.lo;
+}
+
+/// dec_to_bin rounding in the binary direction of the floating-point
+/// environment's register word at ev (kind k: ldouble.ax's "The
+/// environment"); the flags go with the decimal operations' (dec_env.ax).
+pub fn dec_e_to_bin(r: *mut ld.W, p: *ld.W, x: u64, f: u32, b: u32, ev: *mut u64, k: u32) u64 {
+    let mut c = envc();
+    let mut w = nw(x);
+    if f == D128 {
+        w = p.*;
+    }
+    let v = to_bin_m(w, f, b, ld.env_of(ev.*, k).mode, &mut c);
     done(&c);
     if (b == B_Q) or (b == B_X) {
         r.* = v;

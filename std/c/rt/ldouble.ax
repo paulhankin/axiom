@@ -16,9 +16,15 @@
 // arithmetic, comparisons and conversions, and folds constants with them.
 // The result may be one of the operands.
 //
-// Every operation is correctly rounded, to nearest with ties to even (the
-// only rounding mode C programs have here), with gradual underflow
-// (subnormal results). No exception flags are raised or kept. NaNs: an
+// Every operation is correctly rounded with gradual underflow (subnormal
+// results), in a rounding direction and raising IEEE 754's exceptions
+// (invalid, division by zero, overflow, underflow -- a tiny inexact result,
+// tininess detected after rounding, IEEE 754-2019 7.5 -- and inexact) into
+// an Env. The functions without an Env argument round to nearest with ties
+// to even and discard the flags: the compiler folds constants with them,
+// and C code that is not under FENV_ACCESS calls them (the environment of
+// such code is the default one, C23 7.6.1p2: see "The environment" below).
+// NaNs: an
 // invalid operation (inf - inf, 0 * inf, 0 / 0, inf / inf) gives the
 // default NaN, binary128's positive quiet NaN and the x87's "real
 // indefinite" (negative, significand 0xC000000000000000); otherwise a NaN
@@ -81,6 +87,114 @@ fn prec(f: u32) i32 {
         return 64;
     }
     return 113;
+}
+
+// -----------------------------------------------------------------------------
+// The environment: a rounding direction, and the exceptions raised
+//
+// C code under FENV_ACCESS ON, or in the scope of a static FENV_ROUND
+// direction (cmd/axiom/src/c/cgen_ld.ax: ir.Func's strict_fp), calls the
+// `e_` functions below, which take the floating-point environment's
+// register (MXCSR on x86-64; FPCR, and FPSR in the high half, on AArch64:
+// the word ir.IN_FPENV_GET writes), round in its direction and OR the flags
+// they raise into it, for ir.IN_FPENV_SET. Other C code calls the functions
+// without an Env, which round to nearest and raise nothing: that is exact,
+// not an approximation, because code translated with FENV_ACCESS OFF runs
+// in the default mode (to nearest) or the program's behaviour is undefined,
+// and its flags may not be tested (C23 7.6.1p2; the optimizer folds and
+// removes float and double operations of such code just as freely).
+// -----------------------------------------------------------------------------
+
+/// The rounding directions (in the order of x86-64's MXCSR.RC).
+pub const RN: u32 = 0;  // to nearest, ties to even
+pub const RD: u32 = 1;  // toward -infinity
+pub const RU: u32 = 2;  // toward +infinity
+pub const RZ: u32 = 3;  // toward zero
+
+/// The exception flags (the bits of <fenv.h>'s FE_ values, MXCSR's).
+pub const X_INVALID: u32 = 0x01;
+pub const X_DIVBYZERO: u32 = 0x04;
+pub const X_OVERFLOW: u32 = 0x08;
+pub const X_UNDERFLOW: u32 = 0x10;
+pub const X_INEXACT: u32 = 0x20;
+
+/// The kinds of environment register (cmd/axiom/src/c/csema_fp.ax's
+/// __builtin_axiom_fenv_kind).
+pub const K_NONE: u32 = 0;
+pub const K_X64: u32 = 1;
+pub const K_A64: u32 = 2;
+
+/// A rounding direction, and the flags raised so far.
+pub struct Env {
+    mode: u32,
+    flags: u32,
+}
+
+/// To nearest, no flags.
+pub fn env_nearest() Env {
+    return Env.{ mode: RN, flags: 0 };
+}
+
+/// The environment of register value v (of kind k).
+pub fn env_of(v: u64, k: u32) Env {
+    if k == K_X64 {
+        return Env.{ mode: @truncate(u32, (v >> 13) & 3), flags: 0 };
+    }
+    if k == K_A64 {
+        // (FPCR.RMode: 0 nearest, 1 toward +inf, 2 toward -inf, 3 toward zero)
+        let m = @truncate(u32, (v >> 22) & 3);
+        if (m == 1) or (m == 2) {
+            return Env.{ mode: m ^ 3, flags: 0 };
+        }
+        return Env.{ mode: m, flags: 0 };
+    }
+    return env_nearest();
+}
+
+/// Register value v (of kind k) with the flags of c raised.
+pub fn env_raise(v: u64, k: u32, c: Env) u64 {
+    let f = @as(u64, c.flags);
+    if k == K_X64 {
+        return v | f;
+    }
+    if k == K_A64 {
+        // (FPSR: IOC DZC OFC UFC IXC in bits 0-4)
+        return v | (((f & 1) | ((f >> 1) & 0x1E)) << 32);
+    }
+    return v;
+}
+
+// The environment of the register word at ev, and the flags of c into it.
+fn ein(ev: *u64, k: u32) Env {
+    return env_of(ev.*, k);
+}
+
+fn eout(ev: *mut u64, k: u32, c: Env) void {
+    ev.* = env_raise(ev.*, k, c);
+}
+
+// Does a value that rounding drops `half` (the first bit dropped) and
+// `rest` (any below it) from, with an odd last bit kept (odd), round up in
+// magnitude in direction `mode` (the value negative: neg)?
+fn rounds_up(mode: u32, neg: bool, half: bool, rest: bool, odd: bool) bool {
+    if mode == RN {
+        return half and (rest or odd);
+    }
+    if (mode == RZ) or not (half or rest) {
+        return false;
+    }
+    return neg == (mode == RD);
+}
+
+// Does an overflow give an infinity (not the largest finite value)?
+fn overflows_to_inf(mode: u32, neg: bool) bool {
+    if mode == RN {
+        return true;
+    }
+    if mode == RZ {
+        return false;
+    }
+    return neg == (mode == RD);
 }
 
 // -----------------------------------------------------------------------------
@@ -202,6 +316,12 @@ fn un_cls(c: u32, neg: bool) Un {
     return Un.{ cls: c, neg: neg, e: 0, s: u2(0, 0), snan: false };
 }
 
+// An x87 encoding that is no value: an invalid operand, which signals as a
+// signaling NaN does.
+fn un_invalid() Un {
+    return Un.{ cls: C_NAN, neg: false, e: 0, s: u2(0, 0), snan: true };
+}
+
 // A finite value m * 2^(ef - BIAS - (p - 1)) (m nonzero, at most 128 bits)
 // taken apart.
 fn un_fin(neg: bool, ef: i32, m: U2, p: i32) Un {
@@ -218,7 +338,7 @@ fn unpack(a: *W, f: u32) Un {
         let j = (m >> 63) != 0;
         if ef == MAXEF {
             if not j {
-                return un_cls(C_NAN, false);  // (pseudo-infinity or pseudo-NaN: invalid)
+                return un_invalid();  // (pseudo-infinity or pseudo-NaN)
             }
             if (m << 1) == 0 {
                 return un_cls(C_INF, neg);
@@ -234,7 +354,7 @@ fn unpack(a: *W, f: u32) Un {
             return un_fin(neg, 1, u2(0, m), 64);  // (a denormal or pseudo-denormal)
         }
         if not j {
-            return un_cls(C_NAN, false);  // (an unnormal: invalid)
+            return un_invalid();  // (an unnormal)
         }
         return un_fin(neg, ef, u2(0, m), 64);
     }
@@ -264,16 +384,17 @@ struct Rd {
     m: U2,
 }
 
-// s * 2^(e - 127) (s nonzero: normalized here) rounded to p bits, to
-// nearest with ties to even, for a format with exponent bias `bias` and
-// largest exponent field `maxef` (that of infinities): ef is maxef for an
-// overflow (m 0), 0 for a subnormal (or zero) result. `sticky`: the value
-// is a little more than s * 2^(e - 127).
-fn round(e0: i32, s0: U2, sticky: bool, p: i32, bias: i32, maxef: i32) Rd {
+// (-1)^neg s * 2^(e - 127) (s nonzero: normalized here) rounded to p bits in
+// c's direction, for a format with exponent bias `bias` and largest
+// exponent field `maxef` (that of infinities): ef is maxef for an overflow
+// to infinity (m 0), 0 for a subnormal (or zero) result; the flags into c.
+// `sticky`: the value is a little more than s * 2^(e - 127) in magnitude.
+fn round(neg: bool, e0: i32, s0: U2, sticky: bool, p: i32, bias: i32, maxef: i32, c: *mut Env) Rd {
     let z = clz2(s0);
     let s = shl(s0, z);
     let e = e0 - @bit_cast(i32, z);
-    let mut ef = e + bias;
+    let ef0 = e + bias;
+    let mut ef = ef0;
     let mut drop = 128 - p;
     if ef < 1 {
         // (subnormal: fewer bits are kept)
@@ -289,7 +410,7 @@ fn round(e0: i32, s0: U2, sticky: bool, p: i32, bias: i32, maxef: i32) Rd {
     let mut m = shr(s, d);
     let half = (shr(s, d - 1).l & 1) != 0;
     let rest = low_set(s, d - 1) or sticky;
-    if half and (rest or ((m.l & 1) != 0)) {
+    if rounds_up(c.mode, neg, half, rest, (m.l & 1) != 0) {
         m = add2(m, u2(0, 1));
     }
     let top = shl(u2(0, 1), @bit_cast(u32, p - 1));
@@ -301,10 +422,48 @@ fn round(e0: i32, s0: U2, sticky: bool, p: i32, bias: i32, maxef: i32) Rd {
         m = shr(m, 1);
         ef += 1;
     }
+    if half or rest {
+        c.flags = c.flags | X_INEXACT;
+        // tiny: below 2^emin once rounded to p bits with an unbounded
+        // exponent (IEEE 754-2019 7.5; only a value whose leading bit is
+        // 2^(emin - 1) can round up to 2^emin)
+        let mut tiny = ef0 < 0;
+        if ef0 == 0 {
+            let d2 = @bit_cast(u32, 128 - p);
+            let m2 = shr(s, d2);
+            let up = rounds_up(c.mode, neg, (shr(s, d2 - 1).l & 1) != 0, low_set(s, d2 - 1) or sticky, (m2.l & 1) != 0);
+            let all_ones = sub2(shl(top, 1), u2(0, 1));
+            tiny = not (up and (m2.h == all_ones.h) and (m2.l == all_ones.l));
+        }
+        if tiny {
+            c.flags = c.flags | X_UNDERFLOW;
+        }
+    }
     if ef >= maxef {
-        return Rd.{ ef: maxef, m: u2(0, 0) };
+        c.flags = c.flags | (X_OVERFLOW | X_INEXACT);
+        if overflows_to_inf(c.mode, neg) {
+            return Rd.{ ef: maxef, m: u2(0, 0) };
+        }
+        return Rd.{ ef: maxef - 1, m: sub2(shl(top, 1), u2(0, 1)) };
     }
     return Rd.{ ef: ef, m: m };
+}
+
+/// A value rounded to a binary format: its biased exponent and significand
+/// (ldouble.ax's round: ef = maxef for an infinity).
+pub struct Bin {
+    ef: i32,
+    mh: u64,
+    ml: u64,
+}
+
+/// (-1)^neg (h:l) 2^(e - 127) (h:l nonzero; a little more in magnitude if
+/// sticky) rounded to a binary format of p bits of precision, exponent
+/// bias `bias` and largest exponent field `maxef`, in c's direction,
+/// raising into c (decimal.ax's conversions to binary formats).
+pub fn round_bin(neg: bool, e: i32, h: u64, l: u64, sticky: bool, p: i32, bias: i32, maxef: i32, c: *mut Env) Bin {
+    let d = round(neg, e, u2(h, l), sticky, p, bias, maxef, c);
+    return Bin.{ ef: d.ef, mh: d.m.h, ml: d.m.l };
 }
 
 fn put(r: *mut W, lo: u64, hi: u64) void {
@@ -368,15 +527,24 @@ fn quiet(r: *mut W, a: *W, f: u32) void {
 }
 
 // An exact or rounded finite result (s * 2^(e - 127), sticky) of format f.
-fn finish(r: *mut W, neg: bool, e: i32, s: U2, sticky: bool, f: u32) void {
-    pack(r, neg, round(e, s, sticky, prec(f), BIAS, MAXEF), f);
+fn finish(r: *mut W, neg: bool, e: i32, s: U2, sticky: bool, f: u32, c: *mut Env) void {
+    pack(r, neg, round(neg, e, s, sticky, prec(f), BIAS, MAXEF, c), f);
+}
+
+// The default NaN, and "invalid".
+fn invalid(r: *mut W, f: u32, c: *mut Env) void {
+    c.flags = c.flags | X_INVALID;
+    pack_dnan(r, f);
 }
 
 // The result of an operation with a NaN operand (a or b; ua and ub taken
 // apart), as the format's rule says.
-fn nan_result(r: *mut W, a: *W, ua: Un, b: *W, ub: Un, f: u32) void {
+fn nan_result(r: *mut W, a: *W, ua: Un, b: *W, ub: Un, f: u32, c: *mut Env) void {
     let an = ua.cls == C_NAN;
     let bn = ub.cls == C_NAN;
+    if (an and ua.snan) or (bn and ub.snan) {
+        c.flags = c.flags | X_INVALID;
+    }
     if f == FMT_X {
         // (an invalid encoding is no NaN of its own: the default one)
         let ai = an and not (((a.hi & 0x7FFF) == 0x7FFF) and ((a.lo >> 63) != 0));
@@ -427,19 +595,40 @@ fn nan_result(r: *mut W, a: *W, ua: Un, b: *W, ub: Un, f: u32) void {
 
 /// r = a + b.
 pub fn add(r: *mut W, a: *W, b: *W, f: u32) void {
-    addsub(r, a, b, false, f);
+    let mut c = env_nearest();
+    addsub(r, a, b, false, f, &mut c);
 }
 
 /// r = a - b.
 pub fn sub(r: *mut W, a: *W, b: *W, f: u32) void {
-    addsub(r, a, b, true, f);
+    let mut c = env_nearest();
+    addsub(r, a, b, true, f, &mut c);
 }
 
-fn addsub(r: *mut W, a: *W, b: *W, minus: bool, f: u32) void {
+/// r = a op b (op: 0 +, 1 -, 2 *, 3 /) in the environment of the register
+/// word at ev (of kind k), the exceptions raised into it.
+pub fn e_arith(r: *mut W, a: *W, b: *W, f: u32, op: u32, ev: *mut u64, k: u32) void {
+    let mut c = ein(ev, k);
+    arith_c(r, a, b, f, op, &mut c);
+    eout(ev, k, c);
+}
+
+/// r = a op b (op: 0 +, 1 -, 2 *, 3 /) in c's direction, raising into c.
+pub fn arith_c(r: *mut W, a: *W, b: *W, f: u32, op: u32, c: *mut Env) void {
+    if op <= 1 {
+        addsub(r, a, b, op == 1, f, c);
+    } else if op == 2 {
+        mul_c(r, a, b, f, c);
+    } else {
+        div_c(r, a, b, f, c);
+    }
+}
+
+fn addsub(r: *mut W, a: *W, b: *W, minus: bool, f: u32, c: *mut Env) void {
     let x = unpack(a, f);
     let mut y = unpack(b, f);
     if (x.cls == C_NAN) or (y.cls == C_NAN) {
-        nan_result(r, a, x, b, y, f);
+        nan_result(r, a, x, b, y, f, c);
         return;
     }
     if minus {
@@ -447,7 +636,7 @@ fn addsub(r: *mut W, a: *W, b: *W, minus: bool, f: u32) void {
     }
     if x.cls == C_INF {
         if (y.cls == C_INF) and (y.neg != x.neg) {
-            pack_dnan(r, f);
+            invalid(r, f, c);
         } else {
             pack_inf(r, x.neg, f);
         }
@@ -459,15 +648,20 @@ fn addsub(r: *mut W, a: *W, b: *W, minus: bool, f: u32) void {
     }
     if y.cls == C_ZERO {
         if x.cls == C_ZERO {
-            // (an exact zero sum is +0 unless both are -0: 6.3)
-            pack_zero(r, x.neg and y.neg, f);
+            // (an exact zero sum of operands of opposite signs is +0, -0
+            // when rounding toward -infinity: IEEE 754-2019 6.3)
+            if x.neg == y.neg {
+                pack_zero(r, x.neg, f);
+            } else {
+                pack_zero(r, c.mode == RD, f);
+            }
             return;
         }
-        finish(r, x.neg, x.e, x.s, false, f);
+        finish(r, x.neg, x.e, x.s, false, f, c);
         return;
     }
     if x.cls == C_ZERO {
-        finish(r, y.neg, y.e, y.s, false, f);
+        finish(r, y.neg, y.e, y.s, false, f, c);
         return;
     }
     // the larger magnitude first
@@ -489,29 +683,34 @@ fn addsub(r: *mut W, a: *W, b: *W, minus: bool, f: u32) void {
         ss = shr_jam(ss, @bit_cast(u32, d));
     }
     if big.neg == small.neg {
-        finish(r, big.neg, big.e + 1, add2(bs, ss), false, f);
+        finish(r, big.neg, big.e + 1, add2(bs, ss), false, f, c);
         return;
     }
     let s = sub2(bs, ss);
     if is0(s) {
-        pack_zero(r, false, f);
+        pack_zero(r, c.mode == RD, f);
         return;
     }
-    finish(r, big.neg, big.e + 1, s, false, f);
+    finish(r, big.neg, big.e + 1, s, false, f, c);
 }
 
 /// r = a * b.
 pub fn mul(r: *mut W, a: *W, b: *W, f: u32) void {
+    let mut c = env_nearest();
+    mul_c(r, a, b, f, &mut c);
+}
+
+fn mul_c(r: *mut W, a: *W, b: *W, f: u32, c: *mut Env) void {
     let x = unpack(a, f);
     let y = unpack(b, f);
     if (x.cls == C_NAN) or (y.cls == C_NAN) {
-        nan_result(r, a, x, b, y, f);
+        nan_result(r, a, x, b, y, f, c);
         return;
     }
     let neg = x.neg != y.neg;
     if (x.cls == C_INF) or (y.cls == C_INF) {
         if (x.cls == C_ZERO) or (y.cls == C_ZERO) {
-            pack_dnan(r, f);
+            invalid(r, f, c);
         } else {
             pack_inf(r, neg, f);
         }
@@ -533,21 +732,26 @@ pub fn mul(r: *mut W, a: *W, b: *W, f: u32) void {
     let hi = add2(add2(hh, u2(0, lh.h)), add2(u2(0, hl.h), u2(0, mid.h)));
     let sticky = (lo64 | w1) != 0;
     // value = (hi * 2^128 + low) * 2^(x.e + y.e - 254)
-    finish(r, neg, (x.e + y.e) + 1, hi, sticky, f);
+    finish(r, neg, (x.e + y.e) + 1, hi, sticky, f, c);
 }
 
 /// r = a / b.
 pub fn div(r: *mut W, a: *W, b: *W, f: u32) void {
+    let mut c = env_nearest();
+    div_c(r, a, b, f, &mut c);
+}
+
+fn div_c(r: *mut W, a: *W, b: *W, f: u32, c: *mut Env) void {
     let x = unpack(a, f);
     let y = unpack(b, f);
     if (x.cls == C_NAN) or (y.cls == C_NAN) {
-        nan_result(r, a, x, b, y, f);
+        nan_result(r, a, x, b, y, f, c);
         return;
     }
     let neg = x.neg != y.neg;
     if x.cls == C_INF {
         if y.cls == C_INF {
-            pack_dnan(r, f);
+            invalid(r, f, c);
         } else {
             pack_inf(r, neg, f);
         }
@@ -559,8 +763,9 @@ pub fn div(r: *mut W, a: *W, b: *W, f: u32) void {
     }
     if y.cls == C_ZERO {
         if x.cls == C_ZERO {
-            pack_dnan(r, f);
+            invalid(r, f, c);
         } else {
+            c.flags = c.flags | X_DIVBYZERO;
             pack_inf(r, neg, f);
         }
         return;
@@ -583,15 +788,33 @@ pub fn div(r: *mut W, a: *W, b: *W, f: u32) void {
         carry = (rem.h >> 63) != 0;
         rem = shl(rem, 1);
     }
-    finish(r, neg, x.e - y.e, q, carry or not is0(rem), f);
+    finish(r, neg, x.e - y.e, q, carry or not is0(rem), f, c);
 }
 
 /// The order of a and b: -1 (a < b), 0 (equal), 1 (a > b), or 2
 /// (unordered: a NaN).
 pub fn cmp(a: *W, b: *W, f: u32) i32 {
+    let mut c = env_nearest();
+    return cmp_c(a, b, f, false, &mut c);
+}
+
+/// cmp's order of a and b in the environment of the register word at ev
+/// (kind k): "invalid" for a signaling NaN, and for any NaN if sig (C's
+/// relational operators, F.9.3).
+pub fn e_cmp(a: *W, b: *W, f: u32, sig: u32, ev: *mut u64, k: u32) i32 {
+    let mut c = ein(ev, k);
+    let r = cmp_c(a, b, f, sig != 0, &mut c);
+    eout(ev, k, c);
+    return r;
+}
+
+fn cmp_c(a: *W, b: *W, f: u32, sig: bool, c: *mut Env) i32 {
     let x = unpack(a, f);
     let y = unpack(b, f);
     if (x.cls == C_NAN) or (y.cls == C_NAN) {
+        if sig or ((x.cls == C_NAN) and x.snan) or ((y.cls == C_NAN) and y.snan) {
+            c.flags = c.flags | X_INVALID;
+        }
         return 2;
     }
     if (x.cls == C_ZERO) and (y.cls == C_ZERO) {
@@ -604,36 +827,43 @@ pub fn cmp(a: *W, b: *W, f: u32) i32 {
         return 1;
     }
     // the same sign: by magnitude
-    let mut c: i32 = 0;
+    let mut o: i32 = 0;
     if x.cls != y.cls {
         if x.cls < y.cls {
-            c = -1;
+            o = -1;
         } else {
-            c = 1;
+            o = 1;
         }
     } else if x.cls == C_FIN {
         if x.e != y.e {
             if x.e < y.e {
-                c = -1;
+                o = -1;
             } else {
-                c = 1;
+                o = 1;
             }
         } else if lt2(x.s, y.s) {
-            c = -1;
+            o = -1;
         } else if lt2(y.s, x.s) {
-            c = 1;
+            o = 1;
         }
     }
     if x.neg {
-        return 0 - c;
+        return 0 - o;
     }
-    return c;
+    return o;
 }
 
 /// r = s * 2^(e - 127), rounded, for s = h:l (nonzero) and a little more
 /// if sticky (the compiler reads floating constants so).
 pub fn from_parts(r: *mut W, neg: bool, e: i32, h: u64, l: u64, sticky: bool, f: u32) void {
-    finish(r, neg, e, u2(h, l), sticky, f);
+    let mut c = env_nearest();
+    finish(r, neg, e, u2(h, l), sticky, f, &mut c);
+}
+
+/// from_parts rounded in c's direction, raising into c (the compiler reads
+/// constants under a static rounding direction so).
+pub fn from_parts_c(r: *mut W, neg: bool, e: i32, h: u64, l: u64, sticky: bool, f: u32, c: *mut Env) void {
+    finish(r, neg, e, u2(h, l), sticky, f, c);
 }
 
 /// Is a an infinity?
@@ -665,7 +895,8 @@ pub fn from_u64(r: *mut W, x: u64, f: u32) void {
         pack_zero(r, false, f);
         return;
     }
-    finish(r, false, 63, u2(x, 0), false, f);
+    let mut c = env_nearest();
+    finish(r, false, 63, u2(x, 0), false, f, &mut c);
 }
 
 /// r = x (exact).
@@ -674,7 +905,53 @@ pub fn from_i64(r: *mut W, x: i64, f: u32) void {
         from_u64(r, @bit_cast(u64, x), f);
         return;
     }
-    finish(r, true, 63, u2(0 -% @bit_cast(u64, x), 0), false, f);
+    let mut c = env_nearest();
+    finish(r, true, 63, u2(0 -% @bit_cast(u64, x), 0), false, f, &mut c);
+}
+
+/// a truncated toward zero to an integer of `bits` bits (at most 64; signed:
+/// sg), in the environment of the register word at ev (kind k): out of
+/// range, an infinity or a NaN raises "invalid" and gives the bound the
+/// value is beyond (0 for a NaN), a value that is not an integer "inexact"
+/// (F.4). The result is extended to 64 bits as its type's sign says.
+pub fn e_to_int(a: *W, f: u32, bits: u32, sg: u32, ev: *mut u64, k: u32) u64 {
+    let mut c = ein(ev, k);
+    let mut v: [1]u64 = [0];
+    let x = unpack(a, f);
+    if not to_int(&mut v[0], 1, bits, sg != 0, a, f) {
+        c.flags = c.flags | X_INVALID;
+    } else if frac_nonzero(x) {
+        c.flags = c.flags | X_INEXACT;
+    }
+    eout(ev, k, c);
+    return v[0];
+}
+
+/// to_int (n limbs at r) in the environment of the register word at ev
+/// (kind k), raising "invalid" when the value does not fit and "inexact"
+/// when it is not an integer.
+pub fn e_to_wint(r: *mut u64, n: usize, bits: u32, sg: bool, a: *W, f: u32, ev: *mut u64, k: u32) void {
+    let mut c = ein(ev, k);
+    if not to_int(r, n, bits, sg, a, f) {
+        c.flags = c.flags | X_INVALID;
+    } else if frac_nonzero(unpack(a, f)) {
+        c.flags = c.flags | X_INEXACT;
+    }
+    eout(ev, k, c);
+}
+
+// Has finite x a fraction (bits below its units)?
+fn frac_nonzero(x: Un) bool {
+    if x.cls != C_FIN {
+        return false;
+    }
+    if x.e < 0 {
+        return true;
+    }
+    if x.e >= 127 {
+        return false;
+    }
+    return low_set(x.s, @bit_cast(u32, 127 - x.e));
 }
 
 /// a truncated toward zero, saturated to i64 (NaN: 0).
@@ -738,6 +1015,71 @@ fn limb(p: *u64, n: usize, i: usize) u64 {
 /// complement when sg), correctly rounded: C's integers wider than 64 bits
 /// (cmd/axiom/src/c/cgen_wint.ax).
 pub fn from_int(r: *mut W, p: *u64, n: usize, sg: bool, f: u32) void {
+    let mut c = env_nearest();
+    from_int_c(r, p, n, sg, f, &mut c);
+}
+
+/// from_int in the environment of the register word at ev (kind k).
+pub fn e_from_int(r: *mut W, p: *u64, n: usize, sg: bool, f: u32, ev: *mut u64, k: u32) void {
+    let mut c = ein(ev, k);
+    from_int_c(r, p, n, sg, f, &mut c);
+    eout(ev, k, c);
+}
+
+fn from_int_c(r: *mut W, p: *u64, n: usize, sg: bool, f: u32, c: *mut Env) void {
+    let x = int_parts(p, n, sg);
+    if x.zero {
+        pack_zero(r, false, f);
+        return;
+    }
+    finish(r, x.neg, x.e, x.w, x.sticky, f, c);
+}
+
+/// The integer of n limbs at p (signed: sg) rounded to double (w 64) or
+/// float (w 32), its bits, in the environment of the register word at ev
+/// (kind k).
+pub fn e_wint_to_bin(p: *u64, n: usize, sg: bool, w: u32, ev: *mut u64, k: u32) u64 {
+    let mut c = ein(ev, k);
+    let x = int_parts(p, n, sg);
+    let mut r: u64 = 0;
+    if not x.zero {
+        if w == 32 {
+            let d = round(x.neg, x.e, x.w, x.sticky, 24, 127, 0xFF, &mut c);
+            r = (sgn(x.neg, 31) | (@as(u64, @bit_cast(u32, d.ef)) << 23)) | (d.m.l & 0x7F_FFFF);
+        } else {
+            let d = round(x.neg, x.e, x.w, x.sticky, 53, 1023, 0x7FF, &mut c);
+            r = (sgn(x.neg, 63) | (@as(u64, @bit_cast(u32, d.ef)) << 52)) | (d.m.l & 0xF_FFFF_FFFF_FFFF);
+        }
+    }
+    eout(ev, k, c);
+    return r;
+}
+
+/// The double with bits b truncated toward zero to an integer of n limbs at
+/// r (`bits` bits, signed: sg), as e_to_wint does.
+pub fn e_wint_from_f64(r: *mut u64, n: usize, bits: u32, sg: bool, b: u64, ev: *mut u64, k: u32) void {
+    let mut c = ein(ev, k);
+    let mut w = W.{ lo: 0, hi: 0 };
+    from_f64_c(&mut w, b, FMT_Q, &mut c);  // (exact)
+    if not to_int(r, n, bits, sg, &w, FMT_Q) {
+        c.flags = c.flags | X_INVALID;
+    } else if frac_nonzero(unpack(&w, FMT_Q)) {
+        c.flags = c.flags | X_INEXACT;
+    }
+    eout(ev, k, c);
+}
+
+// An integer's magnitude as s * 2^(e - 127) (its leading 128 bits; sticky:
+// bits below them set).
+struct IntP {
+    zero: bool,
+    neg: bool,
+    e: i32,
+    w: U2,
+    sticky: bool,
+}
+
+fn int_parts(p: *u64, n: usize, sg: bool) IntP {
     let neg = sg and ((limb(p, n, n - 1) >> 63) != 0);
     // the magnitude's limbs, one at a time: -x is ~x + 1, the carry ends at
     // the first limb that is not 0
@@ -751,8 +1093,7 @@ pub fn from_int(r: *mut W, p: *u64, n: usize, sg: bool, f: u32) void {
         }
     }
     if top == n {
-        pack_zero(r, false, f);
-        return;
+        return IntP.{ zero: true, neg: false, e: 0, w: u2(0, 0), sticky: false };
     }
     // the leading 128 bits (from limbs top and below), and whether any
     // bits below them are set
@@ -782,7 +1123,7 @@ pub fn from_int(r: *mut W, p: *u64, n: usize, sg: bool, f: u32) void {
         }
     }
     let e = ((@bit_cast(i32, @truncate(u32, top)) * 64) + 63) - @bit_cast(i32, z);
-    finish(r, neg, e, w, sticky, f);
+    return IntP.{ zero: false, neg: neg, e: e, w: w, sticky: sticky };
 }
 
 // Limb i of the magnitude of the integer at p (n limbs; negative: neg).
@@ -893,22 +1234,49 @@ fn int_bits_zero(s: U2, e: i32) bool {
 
 /// r = the double whose bits are `bits` (exact; a NaN quieted).
 pub fn from_f64(r: *mut W, bits: u64, f: u32) void {
+    let mut c = env_nearest();
+    from_f64_c(r, bits, f, &mut c);
+}
+
+fn from_f64_c(r: *mut W, bits: u64, f: u32, c: *mut Env) void {
     from_bin(r, (bits >> 63) != 0, @bit_cast(i32, @truncate(u32, (bits >> 52) & 0x7FF)), bits & 0xF_FFFF_FFFF_FFFF, 53,
-             1023, 0x7FF, f);
+             1023, 0x7FF, f, c);
 }
 
 /// r = the float whose bits are `bits` (exact; a NaN quieted).
 pub fn from_f32(r: *mut W, bits: u32, f: u32) void {
-    from_bin(r, (bits >> 31) != 0, @bit_cast(i32, (bits >> 23) & 0xFF), @as(u64, bits & 0x7F_FFFF), 24, 127, 0xFF, f);
+    let mut c = env_nearest();
+    from_f32_c(r, bits, f, &mut c);
+}
+
+fn from_f32_c(r: *mut W, bits: u32, f: u32, c: *mut Env) void {
+    from_bin(r, (bits >> 31) != 0, @bit_cast(i32, (bits >> 23) & 0xFF), @as(u64, bits & 0x7F_FFFF), 24, 127, 0xFF, f,
+             c);
+}
+
+/// r = the double (w 64) or float (w 32) with bits `bits`, in the
+/// environment of the register word at ev (kind k): exact, but "invalid"
+/// for a signaling NaN.
+pub fn e_from_bin(r: *mut W, bits: u64, w: u32, f: u32, ev: *mut u64, k: u32) void {
+    let mut c = ein(ev, k);
+    if w == 32 {
+        from_f32_c(r, @truncate(u32, bits), f, &mut c);
+    } else {
+        from_f64_c(r, bits, f, &mut c);
+    }
+    eout(ev, k, c);
 }
 
 // From a binary format of p bits of precision (fraction fr of p - 1 bits).
-fn from_bin(r: *mut W, neg: bool, ef: i32, fr: u64, p: i32, bias: i32, maxef: i32, f: u32) void {
+fn from_bin(r: *mut W, neg: bool, ef: i32, fr: u64, p: i32, bias: i32, maxef: i32, f: u32, c: *mut Env) void {
     let fb = @bit_cast(u32, p - 1);
     if ef == maxef {
         if fr == 0 {
             pack_inf(r, neg, f);
             return;
+        }
+        if ((fr >> (fb - 1)) & 1) == 0 {
+            c.flags = c.flags | X_INVALID;  // (a signaling NaN)
         }
         // the payload at the top of the fraction, quiet
         if f == FMT_X {
@@ -925,25 +1293,41 @@ fn from_bin(r: *mut W, neg: bool, ef: i32, fr: u64, p: i32, bias: i32, maxef: i3
             return;
         }
         // m * 2^(1 - bias - (p - 1)) = (m << 64) * 2^(e - 127)
-        finish(r, neg, ((1 - bias) - (p - 1)) + 63, u2(fr, 0), false, f);
+        finish(r, neg, ((1 - bias) - (p - 1)) + 63, u2(fr, 0), false, f, c);
         return;
     }
     let m = fr | (@as(u64, 1) << fb);
-    finish(r, neg, ((ef - bias) - (p - 1)) + 63, u2(m, 0), false, f);
+    finish(r, neg, ((ef - bias) - (p - 1)) + 63, u2(m, 0), false, f, c);
 }
 
 /// a rounded to double: its bits.
 pub fn to_f64(a: *W, f: u32) u64 {
-    return to_bin(a, 53, 1023, 0x7FF, f);
+    let mut c = env_nearest();
+    return to_bin(a, 53, 1023, 0x7FF, f, &mut c);
 }
 
 /// a rounded to float: its bits.
 pub fn to_f32(a: *W, f: u32) u32 {
-    return @truncate(u32, to_bin(a, 24, 127, 0xFF, f));
+    let mut c = env_nearest();
+    return @truncate(u32, to_bin(a, 24, 127, 0xFF, f, &mut c));
+}
+
+/// a rounded to double (w 64) or float (w 32), its bits, in the
+/// environment of the register word at ev (kind k).
+pub fn e_to_bin(a: *W, f: u32, w: u32, ev: *mut u64, k: u32) u64 {
+    let mut c = ein(ev, k);
+    let mut r: u64 = 0;
+    if w == 32 {
+        r = to_bin(a, 24, 127, 0xFF, f, &mut c);
+    } else {
+        r = to_bin(a, 53, 1023, 0x7FF, f, &mut c);
+    }
+    eout(ev, k, c);
+    return r;
 }
 
 // To a binary format of p bits of precision, 1 + w + (p - 1) bits wide.
-fn to_bin(a: *W, p: i32, bias: i32, maxef: i32, f: u32) u64 {
+fn to_bin(a: *W, p: i32, bias: i32, maxef: i32, f: u32, c: *mut Env) u64 {
     let x = unpack(a, f);
     let fb = @bit_cast(u32, p - 1);
     let eb = @as(u64, @bit_cast(u32, maxef));
@@ -951,6 +1335,9 @@ fn to_bin(a: *W, p: i32, bias: i32, maxef: i32, f: u32) u64 {
     let s = sgn(x.neg, sb);
     let fm = (@as(u64, 1) << fb) - 1;
     if x.cls == C_NAN {
+        if x.snan {
+            c.flags = c.flags | X_INVALID;
+        }
         // the payload's top bits, quiet
         let mut top: u64 = 0;
         if f == FMT_X {
@@ -970,7 +1357,7 @@ fn to_bin(a: *W, p: i32, bias: i32, maxef: i32, f: u32) u64 {
     if x.cls == C_ZERO {
         return s;
     }
-    let d = round(x.e, x.s, false, p, bias, maxef);
+    let d = round(x.neg, x.e, x.s, false, p, bias, maxef, c);
     return (s | (@as(u64, @bit_cast(u32, d.ef)) << fb)) | (d.m.l & fm);
 }
 
@@ -979,12 +1366,27 @@ fn to_bin(a: *W, p: i32, bias: i32, maxef: i32, f: u32) u64 {
 /// NaN keeps the top bits of its payload, quieted (C's _Float128, _Float64x
 /// and long double where two of them have different formats).
 pub fn convert(r: *mut W, a: *W, ff: u32, tf: u32) void {
+    let mut c = env_nearest();
+    convert_c(r, a, ff, tf, &mut c);
+}
+
+/// convert in the environment of the register word at ev (kind k).
+pub fn e_convert(r: *mut W, a: *W, ff: u32, tf: u32, ev: *mut u64, k: u32) void {
+    let mut c = ein(ev, k);
+    convert_c(r, a, ff, tf, &mut c);
+    eout(ev, k, c);
+}
+
+fn convert_c(r: *mut W, a: *W, ff: u32, tf: u32, c: *mut Env) void {
     if ff == tf {
         put(r, a.lo, a.hi);
         return;
     }
     let x = unpack(a, ff);
     if x.cls == C_NAN {
+        if x.snan {
+            c.flags = c.flags | X_INVALID;
+        }
         // the payload below the quiet bit, as many of its top bits as fit
         let mut pl = u2(0, 0);
         if ff == FMT_X {
@@ -1012,7 +1414,7 @@ pub fn convert(r: *mut W, a: *W, ff: u32, tf: u32) void {
         pack_zero(r, x.neg, tf);
         return;
     }
-    finish(r, x.neg, x.e, x.s, false, tf);
+    finish(r, x.neg, x.e, x.s, false, tf, c);
 }
 
 // -----------------------------------------------------------------------------
@@ -1022,53 +1424,23 @@ pub fn convert(r: *mut W, a: *W, ff: u32, tf: u32) void {
 // a NaN keeps the top bits of its payload, quieted.
 // -----------------------------------------------------------------------------
 
-// The binary16 encoding of m * 2^e (m nonzero), rounded (a little more than
-// that if sticky), with sign neg.
-fn half_round(neg: bool, m0: u64, e0: i32, sticky: bool) u64 {
-    let s: u64 = sgn(neg, 15);
-    let z = @truncate(i32, @bit_cast(i64, @clz(m0)));
-    let m = m0 << @bit_cast(u32, z);  // (bit 63 set)
-    let e = e0 - z;                   // value = m * 2^e
-    let top = e + 63;                 // the exponent of the leading bit
-    if top > 15 {
-        return s | 0x7C00;
-    }
-    // the weight of the last bit kept: 2^-24 (subnormal) or top - 10
-    let mut lsb = top - 10;
-    if lsb < -24 {
-        lsb = -24;
-    }
-    let drop = lsb - e;  // the bits of m below it (at least 53)
-    if drop >= 64 {
-        // (below half the smallest subnormal, or just at it)
-        if (drop == 64) and (((m >> 63) != 0) and (((m << 1) != 0) or sticky)) {
-            return s | 1;
-        }
-        return s;
-    }
-    let d = @bit_cast(u32, drop);
-    let mut q = m >> d;
-    let half = ((m >> (d - 1)) & 1) != 0;
-    let rest = ((m << (65 - d)) != 0) or sticky;
-    if half and (rest or ((q & 1) != 0)) {
-        q += 1;
-    }
-    // ((lsb + 25) << 10) + q - 0x400 is the encoding whether q is a normal
-    // significand (0x400 to 0x800: a carry into the next exponent included)
-    // or a subnormal one (lsb -24)
-    let bits = (@as(u64, @bit_cast(u32, lsb + 25)) << 10) +% q -% 0x400;
-    if bits >= 0x7C00 {
-        return s | 0x7C00;
-    }
-    return s | bits;
+// The binary16 encoding of m * 2^e (m nonzero), rounded in c's direction
+// (a little more than that if sticky), with sign neg.
+fn half_round(neg: bool, m0: u64, e0: i32, sticky: bool, c: *mut Env) u64 {
+    // (m * 2^e is (m << 64) * 2^((e + 63) - 127))
+    let d = round(neg, e0 + 63, u2(m0, 0), sticky, 11, 15, 0x1F, c);
+    return (sgn(neg, 15) | (@as(u64, @bit_cast(u32, d.ef)) << 10)) | (d.m.l & 0x3FF);
 }
 
 // The binary16 encoding of a value of a binary format: sign, biased exponent
 // ef, fraction fr of fb bits, its bias and largest exponent field.
-fn half_of(neg: bool, ef: i32, fr: u64, fb: u32, bias: i32, maxef: i32) u64 {
+fn half_of(neg: bool, ef: i32, fr: u64, fb: u32, bias: i32, maxef: i32, c: *mut Env) u64 {
     if ef == maxef {
         if fr == 0 {
             return sgn(neg, 15) | 0x7C00;
+        }
+        if ((fr >> (fb - 1)) & 1) == 0 {
+            c.flags = c.flags | X_INVALID;  // (a signaling NaN)
         }
         return (sgn(neg, 15) | 0x7E00) | ((fr >> (fb - 10)) & 0x1FF);
     }
@@ -1076,35 +1448,22 @@ fn half_of(neg: bool, ef: i32, fr: u64, fb: u32, bias: i32, maxef: i32) u64 {
         if fr == 0 {
             return sgn(neg, 15);
         }
-        return half_round(neg, fr, (1 - bias) - @bit_cast(i32, fb), false);
+        return half_round(neg, fr, (1 - bias) - @bit_cast(i32, fb), false, c);
     }
-    return half_round(neg, fr | (@as(u64, 1) << fb), (ef - bias) - @bit_cast(i32, fb), false);
+    return half_round(neg, fr | (@as(u64, 1) << fb), (ef - bias) - @bit_cast(i32, fb), false, c);
 }
 
-/// The binary16 bits of the float with bits x (its low 32).
-pub fn h_from_f32(x: u64) u64 {
-    return half_of(((x >> 31) & 1) != 0, @bit_cast(i32, @truncate(u32, (x >> 23) & 0xFF)), x & 0x7F_FFFF, 23, 127,
-                   0xFF);
+fn h_f32(x: u64, c: *mut Env) u64 {
+    return half_of(((x >> 31) & 1) != 0, @bit_cast(i32, @truncate(u32, (x >> 23) & 0xFF)), x & 0x7F_FFFF, 23, 127, 0xFF,
+                   c);
 }
 
-/// The binary16 bits of the double with bits x.
-pub fn h_from_f64(x: u64) u64 {
+fn h_f64(x: u64, c: *mut Env) u64 {
     return half_of((x >> 63) != 0, @bit_cast(i32, @truncate(u32, (x >> 52) & 0x7FF)), x & 0xF_FFFF_FFFF_FFFF, 52, 1023,
-                   0x7FF);
+                   0x7FF, c);
 }
 
-/// The binary16 bits of a (of format f).
-pub fn h_from_w(a: *W, f: u32) u64 {
-    return to_bin(a, 11, 15, 0x1F, f);
-}
-
-/// r = the binary16 value with bits h (exact).
-pub fn h_to_w(r: *mut W, h: u64, f: u32) void {
-    from_bin(r, ((h >> 15) & 1) != 0, @bit_cast(i32, @truncate(u32, (h >> 10) & 0x1F)), h & 0x3FF, 11, 15, 0x1F, f);
-}
-
-/// The binary16 bits of the integer x (signed: sg), correctly rounded.
-pub fn h_from_int(x: u64, sg: bool) u64 {
+fn h_int(x: u64, sg: bool, c: *mut Env) u64 {
     let neg = sg and ((x >> 63) != 0);
     let mut m = x;
     if neg {
@@ -1113,16 +1472,81 @@ pub fn h_from_int(x: u64, sg: bool) u64 {
     if m == 0 {
         return 0;
     }
-    return half_round(neg, m, 0, false);
+    return half_round(neg, m, 0, false, c);
+}
+
+/// The binary16 bits of the float with bits x (its low 32).
+pub fn h_from_f32(x: u64) u64 {
+    let mut c = env_nearest();
+    return h_f32(x, &mut c);
+}
+
+/// The binary16 bits of the double with bits x.
+pub fn h_from_f64(x: u64) u64 {
+    let mut c = env_nearest();
+    return h_f64(x, &mut c);
+}
+
+/// The binary16 bits of a (of format f).
+pub fn h_from_w(a: *W, f: u32) u64 {
+    let mut c = env_nearest();
+    return to_bin(a, 11, 15, 0x1F, f, &mut c);
+}
+
+/// r = the binary16 value with bits h (exact).
+pub fn h_to_w(r: *mut W, h: u64, f: u32) void {
+    let mut c = env_nearest();
+    from_bin(r, ((h >> 15) & 1) != 0, @bit_cast(i32, @truncate(u32, (h >> 10) & 0x1F)), h & 0x3FF, 11, 15, 0x1F, f,
+             &mut c);
+}
+
+/// The binary16 bits of the integer x (signed: sg), correctly rounded.
+pub fn h_from_int(x: u64, sg: bool) u64 {
+    let mut c = env_nearest();
+    return h_int(x, sg, &mut c);
 }
 
 /// The binary16 bits of s * 2^(e - 127) (s = h:l, nonzero), rounded (a
 /// little more if sticky): the compiler reads _Float16 constants so.
 pub fn h_from_parts(neg: bool, e: i32, h: u64, l: u64, sticky: bool) u64 {
+    let mut c = env_nearest();
+    return h_from_parts_c(neg, e, h, l, sticky, &mut c);
+}
+
+/// h_from_parts in c's direction, raising into c.
+pub fn h_from_parts_c(neg: bool, e: i32, h: u64, l: u64, sticky: bool, c: *mut Env) u64 {
     let s = u2(h, l);
     let z = clz2(s);
     let n = shl(s, z);
-    return half_round(neg, n.h, (e - @bit_cast(i32, z)) - 63, sticky or (n.l != 0));
+    return half_round(neg, n.h, (e - @bit_cast(i32, z)) - 63, sticky or (n.l != 0), c);
+}
+
+/// A conversion to binary16, in the environment of the register word at ev
+/// (kind k): of the float (from 0) or double (1) with bits x, of the
+/// integer x (2 unsigned, 3 signed), or of the value of format f at a (4).
+pub fn e_h_from(x: u64, a: *W, f: u32, from: u32, ev: *mut u64, k: u32) u64 {
+    let mut c = ein(ev, k);
+    let mut r: u64 = 0;
+    if from == 0 {
+        r = h_f32(x, &mut c);
+    } else if from == 1 {
+        r = h_f64(x, &mut c);
+    } else if from <= 3 {
+        r = h_int(x, from == 3, &mut c);
+    } else {
+        r = to_bin(a, 11, 15, 0x1F, f, &mut c);
+    }
+    eout(ev, k, c);
+    return r;
+}
+
+/// r = the binary16 value with bits h, in the environment of the register
+/// word at ev (kind k): exact, but "invalid" for a signaling NaN.
+pub fn e_h_to_w(r: *mut W, h: u64, f: u32, ev: *mut u64, k: u32) void {
+    let mut c = ein(ev, k);
+    from_bin(r, ((h >> 15) & 1) != 0, @bit_cast(i32, @truncate(u32, (h >> 10) & 0x1F)), h & 0x3FF, 11, 15, 0x1F, f,
+             &mut c);
+    eout(ev, k, c);
 }
 
 // -----------------------------------------------------------------------------
@@ -1132,62 +1556,60 @@ pub fn h_from_parts(neg: bool, e: i32, h: u64, l: u64, sticky: bool) u64 {
 // arithmetic. The compiler folds constants with these functions too.
 // -----------------------------------------------------------------------------
 
-fn wop(op: u32, x: W, y: W, f: u32) W {
+// A format, and the environment the operations round in and raise into.
+struct Fx {
+    f: u32,
+    c: Env,
+}
+
+fn wop(op: u32, x: W, y: W, f: *mut Fx) W {
     let mut r = W.{ lo: 0, hi: 0 };
-    if op == 0 {
-        add(&mut r, &x, &y, f);
-    } else if op == 1 {
-        sub(&mut r, &x, &y, f);
-    } else if op == 2 {
-        mul(&mut r, &x, &y, f);
-    } else {
-        div(&mut r, &x, &y, f);
-    }
+    arith_c(&mut r, &x, &y, f.f, op, &mut f.c);
     return r;
 }
 
-fn wadd(x: W, y: W, f: u32) W {
+fn wadd(x: W, y: W, f: *mut Fx) W {
     return wop(0, x, y, f);
 }
 
-fn wsub(x: W, y: W, f: u32) W {
+fn wsub(x: W, y: W, f: *mut Fx) W {
     return wop(1, x, y, f);
 }
 
-fn wmul(x: W, y: W, f: u32) W {
+fn wmul(x: W, y: W, f: *mut Fx) W {
     return wop(2, x, y, f);
 }
 
-fn wdiv(x: W, y: W, f: u32) W {
+fn wdiv(x: W, y: W, f: *mut Fx) W {
     return wop(3, x, y, f);
 }
 
-fn wcls(x: W, f: u32) u32 {
-    return unpack(&x, f).cls;
+fn wcls(x: W, f: *mut Fx) u32 {
+    return unpack(&x, f.f).cls;
 }
 
-fn w_is_nan(x: W, f: u32) bool {
+fn w_is_nan(x: W, f: *mut Fx) bool {
     return wcls(x, f) == C_NAN;
 }
 
-fn w_is_inf(x: W, f: u32) bool {
+fn w_is_inf(x: W, f: *mut Fx) bool {
     return wcls(x, f) == C_INF;
 }
 
-fn w_is_finite(x: W, f: u32) bool {
+fn w_is_finite(x: W, f: *mut Fx) bool {
     let c = wcls(x, f);
     return (c == C_ZERO) or (c == C_FIN);
 }
 
 // m with the sign of s.
-fn wcopysign(m: W, s: W, f: u32) W {
-    if f == FMT_X {
+fn wcopysign(m: W, s: W, f: *mut Fx) W {
+    if f.f == FMT_X {
         return W.{ lo: m.lo, hi: ((m.hi & 0x7FFF) | (s.hi & 0x8000)) };
     }
     return W.{ lo: m.lo, hi: (m.hi & 0x7FFF_FFFF_FFFF_FFFF) | (s.hi & 0x8000_0000_0000_0000) };
 }
 
-fn wabs(x: W, f: u32) W {
+fn wabs(x: W, f: *mut Fx) W {
     return wcopysign(x, W.{ lo: 0, hi: 0 }, f);
 }
 
@@ -1195,20 +1617,20 @@ fn wzero() W {
     return W.{ lo: 0, hi: 0 };
 }
 
-fn wone(f: u32) W {
+fn wone(f: *mut Fx) W {
     let mut r = wzero();
-    from_u64(&mut r, 1, f);
+    from_u64(&mut r, 1, f.f);
     return r;
 }
 
-fn winf(f: u32) W {
+fn winf(f: *mut Fx) W {
     let mut r = wzero();
-    pack_inf(&mut r, false, f);
+    pack_inf(&mut r, false, f.f);
     return r;
 }
 
 // copysign(isinf(x) ? 1 : 0, x)
-fn wboxed(x: W, f: u32) W {
+fn wboxed(x: W, f: *mut Fx) W {
     if w_is_inf(x, f) {
         return wcopysign(wone(f), x, f);
     }
@@ -1216,19 +1638,37 @@ fn wboxed(x: W, f: u32) W {
 }
 
 // A NaN made a zero (of its sign), other values unchanged.
-fn wnan0(x: W, f: u32) W {
+fn wnan0(x: W, f: *mut Fx) W {
     if w_is_nan(x, f) {
         return wcopysign(wzero(), x, f);
     }
     return x;
 }
 
-fn wcmp(x: W, y: W, f: u32) i32 {
-    return cmp(&x, &y, f);
+fn wcmp(x: W, y: W, f: *mut Fx) i32 {
+    return cmp_c(&x, &y, f.f, false, &mut f.c);
 }
 
 /// re + i im = (a + ib)(c + id), both complex.
 pub fn cmul(re: *mut W, im: *mut W, a0: *W, b0: *W, c0: *W, d0: *W, f: u32) void {
+    let mut x = Fx.{ f: f, c: env_nearest() };
+    cmul_c(re, im, a0, b0, c0, d0, &mut x);
+}
+
+/// cmul and cdiv (div true) in the environment of the register word at ev
+/// (kind k).
+pub fn e_cmuldiv(re: *mut W, im: *mut W, a0: *W, b0: *W, c0: *W, d0: *W, f: u32, is_div: bool, ev: *mut u64,
+                 k: u32) void {
+    let mut x = Fx.{ f: f, c: ein(ev, k) };
+    if is_div {
+        cdiv_c(re, im, a0, b0, c0, d0, &mut x);
+    } else {
+        cmul_c(re, im, a0, b0, c0, d0, &mut x);
+    }
+    eout(ev, k, x.c);
+}
+
+fn cmul_c(re: *mut W, im: *mut W, a0: *W, b0: *W, c0: *W, d0: *W, f: *mut Fx) void {
     let mut a = a0.*;
     let mut b = b0.*;
     let mut c = c0.*;
@@ -1277,6 +1717,11 @@ pub fn cmul(re: *mut W, im: *mut W, a0: *W, b0: *W, c0: *W, d0: *W, f: u32) void
 /// dividend): Smith's method, then G.5.1's recovery of infinities and
 /// zeros.
 pub fn cdiv(re: *mut W, im: *mut W, a0: *W, b0: *W, c0: *W, d0: *W, f: u32) void {
+    let mut x = Fx.{ f: f, c: env_nearest() };
+    cdiv_c(re, im, a0, b0, c0, d0, &mut x);
+}
+
+fn cdiv_c(re: *mut W, im: *mut W, a0: *W, b0: *W, c0: *W, d0: *W, f: *mut Fx) void {
     let mut a = a0.*;
     let mut b = b0.*;
     let mut c = c0.*;

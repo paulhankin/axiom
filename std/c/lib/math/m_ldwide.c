@@ -5,6 +5,13 @@
    std/c/rt/ldouble.ax), so that they are exact (and sqrtl correctly
    rounded). The elementary l functions compute in double (m_ldouble.c).
 
+   The functions whose results depend on the rounding direction (F.10:
+   rint, nearbyint, lrint, llrint, sqrt, scalbn and its kin, fdim) read the
+   current one (__axc_fe_round) and raise their exceptions: their own
+   arithmetic is to nearest (this file is not under FENV_ACCESS ON, but for
+   the steps that must round in the direction, which are), so the direction
+   is applied at the end.
+
    The formats (little-endian): x87, a 64-bit significand with its integer
    bit (bytes 0-7), then the sign and a 15-bit exponent (bytes 8-9), six
    bytes of padding; binary128, a 112-bit fraction (bytes 0-13, the low 64
@@ -30,7 +37,15 @@
 #define BIAS 16383
 
 void __axc_math_err(int e, unsigned int flags);
+int __axc_fe_round(void);
 double sqrt(double);
+
+/* the current rounding direction: 0 to nearest, 1 downward, 2 upward, 3
+   toward zero (fenv.h's FE_ values are these times 0x400) */
+static int dir(void)
+{
+    return (__axc_fe_round() >> 10) & 3;
+}
 
 typedef union {
     LDT v;
@@ -107,6 +122,14 @@ static int is_nan(LDT x)
     return x != x;
 }
 
+/* x + x and x + y in the environment: a NaN operand quieted, with "invalid"
+   for a signaling one (the results of the functions for NaNs, F.10p11) */
+static LDT env_add(LDT x, LDT y)
+{
+#pragma STDC FENV_ACCESS ON
+    return x + y;
+}
+
 static LDT inf_l(void)
 {
     Parts r;
@@ -163,7 +186,7 @@ LDT FN(trunc)(LDT x)
 {
     Parts r = parts(x);
     if (r.e == 0x7fff)
-        return x + x; /* infinities, NaNs */
+        return env_add(x, x); /* infinities, NaNs */
     if (r.e >= BIAS + P - 1)
         return x; /* integers */
     if (r.e < BIAS)
@@ -207,26 +230,45 @@ static int odd(LDT t)
     return (int)((r.lo >> drop) & 1);
 }
 
-/* the arithmetic rounds to nearest: so do FN(rint) and FN(nearbyint) */
-LDT FN(rint)(LDT x)
+/* x rounded to an integer in direction m (dir's numbers): "inexact" if
+   that changed it and raise (F.10.6.4, F.10.6.5) */
+static LDT round_int(LDT x, int m, int raise)
 {
     LDT t = FN(trunc)(x), d;
+    int up;
     if (is_nan(x))
-        return x + x;
+        return env_add(x, x);
+    if (t == x)
+        return x; /* (integers, infinities and zeros, exactly) */
     d = FN(fabs)(x - t);
-    if (d > K(0.5) || (d == K(0.5) && odd(t)))
+    if (m == 0)
+        up = d > K(0.5) || (d == K(0.5) && odd(t));
+    else if (m == 1)
+        up = x < 0;
+    else if (m == 2)
+        up = x > 0;
+    else
+        up = 0;
+    if (raise)
+        __axc_math_err(0, 0x20);
+    if (up)
         return t + FN(copysign)(K(1.0), x);
     return t;
 }
 
+LDT FN(rint)(LDT x)
+{
+    return round_int(x, dir(), 1);
+}
+
 LDT FN(nearbyint)(LDT x)
 {
-    return FN(rint)(x);
+    return round_int(x, dir(), 0);
 }
 
 LDT FN(roundeven)(LDT x)
 {
-    return FN(rint)(x);
+    return round_int(x, 0, 0);
 }
 
 static long long to_ll(LDT r)
@@ -245,14 +287,22 @@ static long to_l(LDT r)
     return LONG_MIN;
 }
 
+/* (out of range only "invalid", else "inexact" if x is not an integer:
+   IEEE 754-2019 5.8) */
 long FN(lrint)(LDT x)
 {
-    return to_l(FN(rint)(x));
+    LDT r = round_int(x, dir(), 0);
+    if (r != x && r >= (LDT)LONG_MIN && r < -(LDT)LONG_MIN)
+        __axc_math_err(0, 0x20);
+    return to_l(r);
 }
 
 long long FN(llrint)(LDT x)
 {
-    return to_ll(FN(rint)(x));
+    LDT r = round_int(x, dir(), 0);
+    if (r != x && r >= -K(0x1p63) && r < K(0x1p63))
+        __axc_math_err(0, 0x20);
+    return to_ll(r);
 }
 
 long FN(lround)(LDT x)
@@ -274,9 +324,12 @@ LDT FN(modf)(LDT x, LDT *ip)
     return FN(copysign)(x - t, x);
 }
 
-/* x 2^n, rounded once (in steps that are exact while the result is normal) */
+/* x 2^n, rounded once (in steps that are exact while the result is normal),
+   in the current direction (the steps under FENV_ACCESS ON: a subnormal or
+   overflowing result rounds as the direction says, with its exceptions) */
 static LDT scale(LDT x, long n)
 {
+#pragma STDC FENV_ACCESS ON
     if (n > 16383) {
         x *= pow2l(16383);
         n -= 16383;
@@ -299,16 +352,31 @@ static LDT scale(LDT x, long n)
     return x * pow2l((int)n);
 }
 
+int FN(ilogb)(LDT x);
+
+/* x 2^n to nearest (exact for a subnormal x scaled up) */
+static LDT unscale(LDT x, long n)
+{
+    while (n > 16383) {
+        x *= pow2l(16383);
+        n -= 16383;
+    }
+    return x * pow2l((int)n);
+}
+
 LDT FN(scalbln)(LDT x, long n)
 {
     LDT r;
     if (parts(x).e == 0x7fff)
-        return x + x;
+        return env_add(x, x);
     if (x == 0 || n == 0)
         return x;
     r = scale(x, n);
-    if (parts(r).e == 0x7fff || (parts(r).e == 0 && scale(r, -n) != x))
-        __axc_math_err(ERANGE, 0); /* overflow, or an inexact underflow */
+    /* (an overflow: the result's exponent beyond the format's, whatever the
+       direction made of it; an underflow: a subnormal or zero result that
+       is not exact) */
+    if ((long)FN(ilogb)(x) + n > 16383 || ((parts(r).e == 0) && unscale(r, -n) != x))
+        __axc_math_err(ERANGE, 0);
     return r;
 }
 
@@ -328,7 +396,7 @@ LDT FN(frexp)(LDT x, int *ep)
     int adj = 0;
     if (x == 0 || r.e == 0x7fff) {
         *ep = 0;
-        return x + x;
+        return env_add(x, x);
     }
     if (r.e == 0) {
         x *= pow2l(P);
@@ -391,7 +459,7 @@ LDT FN(fmod)(LDT x, LDT y)
     unsigned q;
     LDT r;
     if (is_nan(x) || is_nan(y))
-        return x + y;
+        return env_add(x, y);
     if (parts(x).e == 0x7fff || y == 0) {
         volatile LDT z = K(0.0);
         __axc_math_err(EDOM, 0x01);
@@ -410,7 +478,7 @@ LDT FN(remquo)(LDT x, LDT y, int *quo)
     int neg = parts(x).neg ^ parts(y).neg;
     *quo = 0;
     if (is_nan(x) || is_nan(y))
-        return x + y;
+        return env_add(x, y);
     if (parts(x).e == 0x7fff || y == 0) {
         volatile LDT z = K(0.0);
         __axc_math_err(EDOM, 0x01);
@@ -488,7 +556,7 @@ LDT FN(nextafter)(LDT x, LDT y)
 {
     LDT r;
     if (is_nan(x) || is_nan(y))
-        return x + y;
+        return env_add(x, y);
     if (x == y)
         return y;
     if (x == 0) {
@@ -519,14 +587,14 @@ LDT FN(nexttoward)(LDT x, LDT y)
 LDT FN(nextup)(LDT x)
 {
     if (is_nan(x) || x == inf_l())
-        return x + x;
+        return env_add(x, x);
     return FN(nextafter)(x, inf_l());
 }
 
 LDT FN(nextdown)(LDT x)
 {
     if (is_nan(x) || x == -inf_l())
-        return x + x;
+        return env_add(x, x);
     return FN(nextafter)(x, -inf_l());
 }
 
@@ -554,8 +622,9 @@ LDT FN(fmin)(LDT x, LDT y)
 
 LDT FN(fdim)(LDT x, LDT y)
 {
+#pragma STDC FENV_ACCESS ON
     if (is_nan(x) || is_nan(y))
-        return x + y;
+        return env_add(x, y);
     return x > y ? x - y : K(0.0);
 }
 
@@ -585,7 +654,7 @@ LDT FN(sqrt)(LDT x)
     LDT y, d, u;
     int k;
     if (is_nan(x) || x == 0 || x == inf_l())
-        return x + x;
+        return env_add(x, x);
     if (x < 0) {
         volatile LDT z = K(0.0);
         __axc_math_err(EDOM, 0x01);
@@ -610,24 +679,36 @@ LDT FN(sqrt)(LDT x)
             if (d + y * u < K(0.25) * u * u)
                 y = step(y, 0);
         }
-        return scale(y, k);
+        /* y is sqrt(m) rounded to nearest; the residual's sign says on
+           which side of it sqrt(m) is, for the other directions (and
+           whether the result is exact) */
+        d = residual(m, y);
+        if (d != 0) {
+            int r = dir();
+            if (d < 0 && (r == 1 || r == 3))
+                y = step(y, 0);
+            else if (d > 0 && r == 2)
+                y = step(y, 1);
+            __axc_math_err(0, 0x20);
+        }
+        return unscale(y, k);
     }
 }
 /* C23's maximum and minimum (IEEE 754-2019's) */
 LDT FN(fmaximum)(LDT x, LDT y)
 {
-    return is_nan(x) || is_nan(y) ? x + y : FN(fmax)(x, y);
+    return is_nan(x) || is_nan(y) ? env_add(x, y) : FN(fmax)(x, y);
 }
 
 LDT FN(fminimum)(LDT x, LDT y)
 {
-    return is_nan(x) || is_nan(y) ? x + y : FN(fmin)(x, y);
+    return is_nan(x) || is_nan(y) ? env_add(x, y) : FN(fmin)(x, y);
 }
 
 LDT FN(fmaximum_mag)(LDT x, LDT y)
 {
     if (is_nan(x) || is_nan(y))
-        return x + y;
+        return env_add(x, y);
     if (FN(fabs)(x) != FN(fabs)(y))
         return FN(fabs)(x) > FN(fabs)(y) ? x : y;
     return FN(fmax)(x, y);
@@ -636,7 +717,7 @@ LDT FN(fmaximum_mag)(LDT x, LDT y)
 LDT FN(fminimum_mag)(LDT x, LDT y)
 {
     if (is_nan(x) || is_nan(y))
-        return x + y;
+        return env_add(x, y);
     if (FN(fabs)(x) != FN(fabs)(y))
         return FN(fabs)(x) < FN(fabs)(y) ? x : y;
     return FN(fmin)(x, y);

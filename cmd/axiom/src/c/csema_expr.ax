@@ -604,6 +604,9 @@ pub fn check(e: *mut cast.Expr) *mut cast.Expr {
             e.ty = cty.complex_of(r);
             e.fcimag = e.fcval;
             e.fcval = 0.0;
+            if cl.directed() and not cty.is_wide(r) {
+                e.fcimag = cl.parse_dir(e.tok.text, cty.ffmt(r));
+            }
             if cty.is_wide(r) {
                 let mut inf = false;
                 e.xvim = cl.parse_literal(e.tok.text, cc.fmt_t(r), &mut inf);
@@ -614,6 +617,10 @@ pub fn check(e: *mut cast.Expr) *mut cast.Expr {
         }
         if cty.ffmt(e.ty) == 32 {
             e.fcval = @as(f64, @float_cast(f32, e.tok.fval));
+        }
+        if cl.directed() and not cty.is_wide(e.ty) {
+            // (read again in a static FENV_ROUND direction: C23 7.6.2, F.8.2)
+            e.fcval = cl.parse_dir(e.tok.text, cty.ffmt(e.ty));
         }
         if cty.is_wide(e.ty) {
             // (read again, in the type's format: the token has its double value)
@@ -816,10 +823,71 @@ fn func_name(e: *mut cast.Expr) *mut cast.Expr {
 /// dialects set; ISO C has no such operator: 6.5.3.3p1)?
 pub let mut complex_tilde_conjugates: bool = false;
 
+// `__real__ a` and `__imag__ a` (a GNU dialect): a part of a complex value
+// (an lvalue if a is one: the object's part, of a's qualifiers); of a real
+// value, the value and 0; of an imaginary one, 0 and the coefficient.
+fn part_of(e: *mut cast.Expr) *mut cast.Expr {
+    let a = check(e.a);
+    e.a = a;
+    if is_err(a) {
+        return bad(e);
+    }
+    let t = a.ty;
+    let imag = e.op == ct.P_IMAG;
+    if not cty.is_arith(t) {
+        cs.err(e.span, "C3020", u.f2("the operand of '%s' has type %s, not an arithmetic type", cast.punct_text(e.op),
+                                     cs.tq(t)));
+        return bad(e);
+    }
+    if cty.is_complex(t) or cty.is_imaginary(t) {
+        e.ty = cty.qualify(t.unq.elem, t.quals);
+        // (an imaginary value's real part is 0, its imaginary part the object itself)
+        e.lvalue = a.lvalue and (cty.is_complex(t) or imag);
+        if a.is_const {
+            e.is_const = true;
+            if cty.is_imaginary(t) {
+                e.fcval = 0.0;
+                e.xv = cl.zero();
+                if imag {
+                    e.fcval = a.fcval;
+                    e.xv = a.xv;
+                }
+            } else if imag {
+                e.fcval = a.fcimag;
+                e.xv = a.xvim;
+            } else {
+                e.fcval = a.fcval;
+                e.xv = a.xv;
+            }
+        }
+        return e;
+    }
+    e.ty = t;
+    e.lvalue = a.lvalue and not imag;
+    if a.is_const {
+        e.is_const = true;
+        e.cval = a.cval;
+        e.fcval = a.fcval;
+        e.xv = a.xv;
+        if imag {
+            e.cval = 0;
+            e.fcval = 0.0;
+            e.xv = cl.zero();
+        }
+    }
+    if imag {
+        e.ty = cty.unqual(t);
+    }
+    return e;
+}
+
 fn unary(e: *mut cast.Expr) *mut cast.Expr {
     let op = e.op;
     if (op == ct.P_INC) or (op == ct.P_DEC) {
         return incdec(e);
+    }
+    if (op == ct.P_REAL) or (op == ct.P_IMAG) {
+        return part_of(e);
     }
     if op == ct.P_AMP {
         let a = check(e.a);

@@ -12,9 +12,21 @@
 // binary16 round once, from the source's own format (h_from_f64, h_from_w,
 // h_from_int: never through float from double, which could round twice);
 // conversions from binary16 are exact.
+//
+// Under strict floating point (cgen_ld.ax's env_strict) the float operation
+// rounds in the environment's direction and raises its exceptions, and the
+// rounding to binary16 is ldouble.ax's e_h_from, in that direction too:
+// rounding twice in one directed mode, to float and then to fewer bits, is
+// rounding once (the float result lies between the same binary16 neighbours
+// as the exact one, on the side the direction picks); the float step cannot
+// overflow or underflow for binary16 operands (their products and
+// quotients lie within 2^-48 and 2^32), and it is inexact only when the
+// binary16 result is, so the flags are the binary16 operation's.
 // =============================================================================
 import "../ir.ax" as ir;
+import "../util.ax" as u;
 import "cgen.ax" as cg;
+import "cgen_ld.ax" as gld;
 import "cldbl.ax" as cl;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
@@ -45,7 +57,11 @@ fn call(name: []u8, xs: []mut *mut ir.Value) *mut ir.Value {
 
 /// The binary16 bits of the double x (rounded), as an IR constant.
 pub fn constant(x: f64) *mut ir.Value {
-    return ir.cint(i16t(), ld.h_from_f64(@bit_cast(u64, x)));
+    let b = @bit_cast(u64, x);
+    if ((((b >> 52) & 0x7FF) == 0x7FF) and ((b << 12) != 0)) and (((b >> 51) & 1) == 0) {
+        return ir.cint(i16t(), ((b >> 48) & 0x8000) | 0x7D00);  // (a signaling NaN: FLT16_SNAN)
+    }
+    return ir.cint(i16t(), ld.h_from_f64(b));
 }
 
 /// The bits h (an i16) widened to float, exactly: the bits of the sign,
@@ -63,18 +79,43 @@ pub fn to_f32(h: *mut ir.Value) *mut ir.Value {
     let special = ir.or_(cg.B, moved, ir.cint(i32t(), 0x7F80_0000));  // (exponent all ones)
     let is_special = ir.icmp(cg.B, ir.IntUGE, mag, ir.cint(i32t(), 0x7C00));
     let bits = ir.or_(cg.B, ir.select(cg.B, is_special, special, fin), sign);
-    return ir.bitcast(cg.B, bits, f32t());
+    let r = ir.bitcast(cg.B, bits, f32t());
+    if gld.env_strict() {
+        // (a conversion: a signaling NaN raises "invalid" and is quieted,
+        // as times 1 does)
+        return ir.binop(cg.B, ir.OP_FMUL, r, ir.cfp(f32t(), 1.0));
+    }
+    return r;
+}
+
+// ldouble.ax's e_h_from of (x, a, f, from): the conversion in the
+// environment.
+fn env_from(x: *mut ir.Value, a: *mut ir.Value, f: u32, kind: u64) *mut ir.Value {
+    let mut p = a;
+    if u.isnil(p) {
+        p = ir.czero(cg.T_ptr);
+    }
+    let xs: [4]*mut ir.Value = [x, p, ir.cint(i32t(), @as(u64, f)), ir.cint(i32t(), kind)];
+    return ir.trunc(cg.B, gld.env_call("e_h_from", xs[..]), i16t());
 }
 
 /// The float x rounded to binary16 (an i16).
 pub fn from_f32(x: *mut ir.Value) *mut ir.Value {
-    let mut xs: [1]*mut ir.Value = [ir.zext(cg.B, ir.bitcast(cg.B, x, i32t()), i64t())];
+    let bits = ir.zext(cg.B, ir.bitcast(cg.B, x, i32t()), i64t());
+    if gld.env_strict() {
+        return env_from(bits, ir.vnil(), 0, 0);
+    }
+    let mut xs: [1]*mut ir.Value = [bits];
     return ir.trunc(cg.B, call("h_from_f32", xs[..]), i16t());
 }
 
 /// The double x rounded to binary16 (an i16).
 pub fn from_f64(x: *mut ir.Value) *mut ir.Value {
-    let mut xs: [1]*mut ir.Value = [ir.bitcast(cg.B, x, i64t())];
+    let bits = ir.bitcast(cg.B, x, i64t());
+    if gld.env_strict() {
+        return env_from(bits, ir.vnil(), 0, 1);
+    }
+    let mut xs: [1]*mut ir.Value = [bits];
     return ir.trunc(cg.B, call("h_from_f64", xs[..]), i16t());
 }
 
@@ -115,7 +156,11 @@ pub fn compare(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
     } else if op == ct.P_GE {
         p = ir.RealOGE;
     }
-    return ir.fcmp(cg.B, p, to_f32(x), to_f32(y));
+    let c = ir.fcmp(cg.B, p, to_f32(x), to_f32(y));
+    if (op != ct.P_EQ) and (op != ct.P_NE) and (c.kind == ir.V_INST) {
+        c.flags = c.flags | ir.F_SIGNALING;  // (the relational operators: F.9.3)
+    }
+    return c;
 }
 
 /// Scalar v of type f converted to binary16 (t, _Float16), rounded once from
@@ -143,10 +188,16 @@ pub fn from(v: *mut ir.Value, f: *mut cty.CType, to_double: fn(*mut ir.Value,
         if sg {
             b = 1;
         }
+        if gld.env_strict() {
+            return env_from(x, ir.vnil(), 0, 2 + b);
+        }
         let mut xs: [2]*mut ir.Value = [x, ir.cint(ir.t_int(8), b)];
         return ir.trunc(cg.B, call("h_from_int", xs[..]), i16t());
     }
     if cty.is_wide(f) {
+        if gld.env_strict() {
+            return env_from(ir.cint(i64t(), 0), v, cl.fmt_of(cty.ffmt(f)), 4);
+        }
         let mut xs: [2]*mut ir.Value = [v, ir.cint(i32t(), @as(u64, cl.fmt_of(cty.ffmt(f))))];
         return ir.trunc(cg.B, call("h_from_w", xs[..]), i16t());
     }
@@ -161,6 +212,10 @@ pub fn from(v: *mut ir.Value, f: *mut cty.CType, to_double: fn(*mut ir.Value,
 pub fn to_wide(h: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
     let r = cg.alloca(t, "ld");
     let mut xs: [3]*mut ir.Value = [r, ir.zext(cg.B, h, i64t()), ir.cint(i32t(), @as(u64, cl.fmt_of(cty.ffmt(t))))];
+    if gld.env_strict() {
+        _ = gld.env_call("e_h_to_w", xs[..]);
+        return r;
+    }
     _ = call("h_to_w", xs[..]);
     return r;
 }

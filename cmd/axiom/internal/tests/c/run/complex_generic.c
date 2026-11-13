@@ -28,7 +28,7 @@ int main(void) {
     volatile float complex vfc = 8;
     print_i64(KIND(f) * 100000 + KIND(d) * 10000 + KIND(l) * 1000 + KIND(fc) * 100 + KIND(dc) * 10 + KIND(lc));
     print_i64(KIND(cdc) * 10 + KIND(vfc));
-    print_i64(KIND(I) * 10 + KIND(CMPLX(1, 2)));
+    print_i64(KIND(_Complex_I) * 10 + KIND(CMPLX(1, 2))); /* (I is _Imaginary_I with Annex G) */
     print_i64(KIND(CMPLXF(1, 2)) * 10 + KIND(CMPLXL(1, 2)));
     print_i64(KIND2(fc, 1) * 1000 + KIND2(fc, f) * 100 + KIND2(fc, d) * 10 + KIND2(fc, l));
     print_i64(KIND2(dc, fc) * 1000 + KIND2(lc, fc) * 100 + KIND2(d, fc) * 10 + KIND2(1LL, dc));

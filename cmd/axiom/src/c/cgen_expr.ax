@@ -579,6 +579,15 @@ pub fn lv(e: *mut cast.Expr) *mut ir.Value {
     if k == cast.ExprKind.COMPOUND {
         return compound_literal(e);
     }
+    if (k == cast.ExprKind.UNARY) and ((e.op == ct.P_REAL) or (e.op == ct.P_IMAG)) {
+        // (__real__ and __imag__ of an lvalue: its part's address; of a real or
+        // imaginary one, the object itself)
+        let p = lv(e.a);
+        if cty.is_complex(e.a.ty) and (e.op == ct.P_IMAG) {
+            return ir.ptradd(cg.B, p, cg.usz(cty.size_of(e.a.ty.unq.elem)));
+        }
+        return p;
+    }
     if k == cast.ExprKind.UNARY {
         // *p
         return rv(e.a);
@@ -776,6 +785,25 @@ pub let mut fp_state: u32 = 0;
 // otherwise.
 let mut fp_slot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 
+// While a full expression is evaluated under FENV_DEC_ROUND's static
+// direction: the slot that holds the dynamic decimal direction (an i32);
+// nil otherwise.
+let mut fp_dslot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
+
+// The slots before a full expression began (fp_enter, fp_leave).
+struct FpPrev {
+    slot: *mut ir.Value,
+    dslot: *mut ir.Value,
+}
+
+// decimal.ax's dec_round_swap(m): the thread's decimal direction set to m
+// (an i32), the previous one returned.
+fn dec_swap(m: *mut ir.Value) *mut ir.Value {
+    let f = cg.ld_fn("dec_round_swap");
+    let mut xs: [1]*mut ir.Value = [m];
+    return ir.call(cg.B, ir.fnp_of(f).ty, f, xs[..]);
+}
+
 // Under FENV_ACCESS ON or FENV_ROUND (F.8.4, and 7.6.2 for FENV_ROUND's
 // static mode): is e an operation on floating values whose constant value
 // (folded by semantic analysis) is not used, the operation done at run time
@@ -839,12 +867,22 @@ fn with_rounding(r: *mut ir.Value) void {
 
 // Starts a full expression under FENV_ROUND with a static direction: the
 // dynamic mode's rounding bits saved (in a slot of their own, so that full
-// expressions nest: GNU statement expressions), the static ones set. The
-// previous slot, for fp_leave.
-fn fp_enter() *mut ir.Value {
-    let prev = fp_slot;
+// expressions nest: GNU statement expressions), the static ones set; and
+// under FENV_DEC_ROUND's, the decimal direction likewise (decimal.ax's,
+// the software's: on every target). The previous slots, for fp_leave.
+fn fp_enter() FpPrev {
+    let prev = FpPrev.{ slot: fp_slot, dslot: fp_dslot };
+    if u.isnil(cg.F) or cg.terminated() {
+        return prev;
+    }
+    let ddir = cpg.fp_dec_round(fp_state);
+    if (ddir != cpg.FPD_DYNAMIC) and cty.g_used_dec {
+        let ds = cg.alloca(cty.t_int, "fpdround");
+        _ = ir.store(cg.B, dec_swap(ir.cint(ir.t_int(32), @as(u64, ddir - 1))), ds);
+        fp_dslot = ds;
+    }
     let dir = cpg.fp_round(fp_state);
-    if (dir == cpg.FPR_DYNAMIC) or tg.is_wasm() or u.isnil(cg.F) or cg.terminated() {
+    if (dir == cpg.FPR_DYNAMIC) or tg.is_wasm() {
         return prev;
     }
     let t64 = ir.t_int(64);
@@ -857,12 +895,16 @@ fn fp_enter() *mut ir.Value {
 }
 
 // Ends it: the dynamic mode's rounding bits back (the exception flags the
-// expression raised are kept).
-fn fp_leave(prev: *mut ir.Value) void {
-    if (fp_slot != prev) and not cg.terminated() {
+// expression raised are kept), and the dynamic decimal direction.
+fn fp_leave(prev: FpPrev) void {
+    if (fp_slot != prev.slot) and not cg.terminated() {
         with_rounding(ir.load(cg.B, ir.t_int(64), fp_slot));
     }
-    fp_slot = prev;
+    if (fp_dslot != prev.dslot) and not cg.terminated() {
+        _ = dec_swap(ir.load(cg.B, ir.t_int(32), fp_dslot));
+    }
+    fp_slot = prev.slot;
+    fp_dslot = prev.dslot;
 }
 
 /// The value of e, a full expression (a statement's, a condition, an
@@ -876,7 +918,8 @@ pub fn full(e: *mut cast.Expr) *mut ir.Value {
 
 /// Branches on e, a full expression (to t if it is nonzero, else to f).
 pub fn branch_full(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
-    if (cpg.fp_round(fp_state) == cpg.FPR_DYNAMIC) or tg.is_wasm() {
+    let bin_dyn = (cpg.fp_round(fp_state) == cpg.FPR_DYNAMIC) or tg.is_wasm();
+    if bin_dyn and ((cpg.fp_dec_round(fp_state) == cpg.FPD_DYNAMIC) or not cty.g_used_dec) {
         branch(e, t, f);
         return;
     }
@@ -890,29 +933,84 @@ pub fn branch_full(e: *mut cast.Expr, t: *mut ir.Block, f: *mut ir.Block) void {
 // in its scope (C23 7.6.2p4's table: <math.h>'s, and the conversions of
 // <stdlib.h>, <stdio.h> and <wchar.h>): the others run in the dynamic mode.
 fn static_rounding_fn(name: []u8) bool {
-    let mut n = name;
-    let fixed = ["atof", "strtod", "strtof", "strtold", "wcstod", "wcstof", "wcstold", "printf", "fprintf", "sprintf",
-                 "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "scanf", "fscanf", "sscanf", "vscanf",
-                 "vfscanf", "vsscanf", "wprintf", "fwprintf", "swprintf", "vwprintf", "vfwprintf", "vswprintf",
-                 "wscanf", "fwscanf", "swscanf", "vwscanf", "vfwscanf", "vswscanf"];
+    let n = name;
+    if io_conversion_fn(n) {
+        return true;
+    }
+    let fixed = ["atof", "strtod", "strtof", "strtold", "wcstod", "wcstof", "wcstold", "strfromd", "strfromf",
+                 "strfroml", "strtof16", "strtof32", "strtof64", "strtof128", "strtof32x", "strtof64x", "wcstof16",
+                 "wcstof32", "wcstof64", "wcstof128", "wcstof32x", "wcstof64x", "strfromf16", "strfromf32",
+                 "strfromf64", "strfromf128", "strfromf32x", "strfromf64x"];
     for f in fixed {
         if u.str_eq(n, f) {
             return true;
         }
     }
-    let base = ["acos", "asin", "atan", "atan2", "cos", "sin", "tan", "acosh", "asinh", "atanh", "cosh", "sinh", "tanh",
-                "exp", "exp2", "expm1", "exp10", "exp10m1", "exp2m1", "log", "log10", "log1p", "log2", "logp1",
-                "log10p1", "log2p1", "cbrt", "hypot", "pow", "pown", "powr", "rootn", "compoundn", "rsqrt", "sqrt",
-                "erf", "erfc", "lgamma", "tgamma", "rint", "nearbyint", "lrint", "llrint", "fma", "acospi", "asinpi",
-                "atanpi", "atan2pi", "cospi", "sinpi", "tanpi", "fmod", "remainder", "remquo", "fdim", "scalbn",
-                "scalbln", "ldexp", "fadd", "fsub", "fmul", "fdiv", "ffma", "fsqrt", "dadd", "dsub", "dmul", "ddiv",
-                "dfma", "dsqrt"];
+    // (and their forms for the other types, Annex H's included)
+    let sfx = ["f", "l", "f16", "f32", "f64", "f128", "f32x", "f64x"];
+    let base = math_fns();
     for b in base {
         if u.str_eq(n, b) {
             return true;
         }
-        if (n.len == (b.len + 1)) and u.str_eq(n[0..b.len], b) and ((n[b.len] == 'f') or (n[b.len] == 'l')) {
+        if (n.len > b.len) and u.str_eq(n[0..b.len], b) {
+            for x in sfx {
+                if u.str_eq(n[b.len..], x) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// The <math.h> functions of 7.6.2p4's table (without their suffixes).
+fn math_fns() [71][]u8 {
+    return ["acos", "asin", "atan", "atan2", "cos", "sin", "tan", "acosh", "asinh", "atanh", "cosh", "sinh", "tanh",
+            "exp", "exp2", "expm1", "exp10", "exp10m1", "exp2m1", "log", "log10", "log1p", "log2", "logp1", "log10p1",
+            "log2p1", "cbrt", "hypot", "pow", "pown", "powr", "rootn", "compoundn", "rsqrt", "sqrt", "erf", "erfc",
+            "lgamma", "tgamma", "rint", "nearbyint", "lrint", "llrint", "fma", "acospi", "asinpi", "atanpi", "atan2pi",
+            "cospi", "sinpi", "tanpi", "fmod", "remainder", "remquo", "fdim", "scalbn", "scalbln", "ldexp", "fadd",
+            "fsub", "fmul", "fdiv", "ffma", "fsqrt", "dadd", "dsub", "dmul", "ddiv", "dfma", "dsqrt", "quantize"];
+}
+
+// The formatted input/output functions (in both tables).
+fn io_conversion_fn(n: []u8) bool {
+    let io = ["printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf", "scanf",
+              "fscanf", "sscanf", "vscanf", "vfscanf", "vsscanf", "wprintf", "fwprintf", "swprintf", "vwprintf",
+              "vfwprintf", "vswprintf", "wscanf", "fwscanf", "swscanf", "vwscanf", "vfwscanf", "vswscanf"];
+    for f in io {
+        if u.str_eq(n, f) {
             return true;
+        }
+    }
+    return false;
+}
+
+// The functions that FENV_DEC_ROUND's static direction applies to (C23
+// 7.6.3's table: <math.h>'s decimal forms of 7.6.2p4's functions, and
+// quantize; strtodN, wcstodN, strfromdN, and the formatted input/output).
+fn static_dec_rounding_fn(name: []u8) bool {
+    let n = name;
+    if io_conversion_fn(n) {
+        return true;
+    }
+    let fixed = ["strtod32", "strtod64", "strtod128", "wcstod32", "wcstod64", "wcstod128", "strfromd32", "strfromd64",
+                 "strfromd128"];
+    for f in fixed {
+        if u.str_eq(n, f) {
+            return true;
+        }
+    }
+    let sfx = ["d32", "d64", "d128"];
+    let base = math_fns();
+    for b in base {
+        if (n.len > b.len) and u.str_eq(n[0..b.len], b) {
+            for x in sfx {
+                if u.str_eq(n[b.len..], x) {
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -1029,6 +1127,23 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
     let op = e.op;
     if (op == ct.P_INC) or (op == ct.P_DEC) {
         return incdec(e);
+    }
+    if (op == ct.P_REAL) or (op == ct.P_IMAG) {
+        // (a part of a value that is no lvalue: csema_expr's part_of)
+        let a = e.a;
+        let v = rv(a);
+        let imag = op == ct.P_IMAG;
+        if cty.is_complex(a.ty) {
+            let mut p = v;  // (a complex value is the address of its temporary)
+            if imag {
+                p = ir.ptradd(cg.B, p, cg.usz(cty.size_of(a.ty.unq.elem)));
+            }
+            return load(cty.unqual(e.ty), p);
+        }
+        if cty.is_imaginary(a.ty) == imag {
+            return v;
+        }
+        return zero_of(cty.unqual(e.ty));
     }
     if op == ct.P_AMP {
         return lv(e.a);
@@ -1811,7 +1926,16 @@ fn call(e: *mut cast.Expr) *mut ir.Value {
     if dynamic {
         with_rounding(ir.load(cg.B, ir.t_int(64), fp_slot));
     }
+    // (and FENV_DEC_ROUND's likewise, for the functions of C23 7.6.3's table)
+    let ddynamic = u.notnil(fp_dslot) and not static_dec_rounding_fn(callee_name);
+    let mut dstatic = ir.vnil();
+    if ddynamic {
+        dstatic = dec_swap(ir.load(cg.B, ir.t_int(32), fp_dslot));
+    }
     let r = gva.emit_call(sig.plan, sig.ty, callee, vs[0..n]);
+    if ddynamic and not noreturn {
+        _ = ir.store(cg.B, dec_swap(dstatic), fp_dslot);
+    }
     if dynamic and not noreturn {
         let t64 = ir.t_int(64);
         let cur = fenv_get();

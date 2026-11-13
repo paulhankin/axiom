@@ -93,7 +93,7 @@ int main(void)
 /* expect: 0.5493061443340549 */
     pc(casinh(CMPLX(1.0, 1.0)));
 /* expect: 1.0612750619050357 */
-/* expect: 0.6662394324925153 */
+/* expect: 0.6662394324925152 */
     pc(cacosh(CMPLX(z0, z0)));
 /* expect: 0 */
 /* expect: 1.5707963267948966 */

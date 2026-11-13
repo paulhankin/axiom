@@ -523,16 +523,52 @@ int __axc_scan_num(struct __axc_in *in, long width, struct __axc_num *n, size_t 
                 BACK();
                 goto end;
             }
-            for (;;) {
-                if (!NEXT())
-                    goto end;
-                if (c == ')') {
-                    *valid = t;
-                    goto end;
-                }
-                if (!((c >= '0' && c <= '9') || (lower(c) >= 'a' && lower(c) <= 'z') || c == '_')) {
-                    BACK();
-                    goto end;
+            {
+                /* the sequence as an unsigned integer, decimal, 0x hexadecimal
+                   or 0 octal, as nan() reads it: the payload (mhi:mlo, the
+                   decimal types' NaNs keep it; dexp 1 if it is one) */
+                int base = 10, nch = 0, ok = 1;
+                unsigned __axiom_int64 h = 0, l = 0;
+                for (;;) {
+                    int dv;
+                    if (!NEXT())
+                        goto end;
+                    if (c == ')') {
+                        *valid = t;
+                        if (ok && nch > 0) {
+                            n->mhi = h;
+                            n->mlo = l;
+                            n->dexp = 1;
+                        }
+                        goto end;
+                    }
+                    if (!((c >= '0' && c <= '9') || (lower(c) >= 'a' && lower(c) <= 'z') || c == '_')) {
+                        BACK();
+                        goto end;
+                    }
+                    if (nch == 0 && c == '0')
+                        base = 8;
+                    if (nch == 1 && base == 8 && lower(c) == 'x') {
+                        base = 16;
+                        nch++;
+                        continue;
+                    }
+                    dv = (c >= '0' && c <= '9') ? c - '0' : (lower(c) >= 'a' && lower(c) <= 'f') ? lower(c) - 'a' + 10 : 99;
+                    nch++;
+                    if (dv >= base || (h >> 56) != 0) {
+                        ok = 0;
+                        continue;
+                    }
+                    {
+                        /* (h:l) = (h:l) base + dv */
+                        unsigned __axiom_int64 ll = (l & 0xffffffffULL) * (unsigned)base;
+                        unsigned __axiom_int64 lh = (l >> 32) * (unsigned)base + (ll >> 32);
+                        h = h * (unsigned)base + (lh >> 32);
+                        l = (lh << 32) | (ll & 0xffffffffULL);
+                        l += (unsigned)dv;
+                        if (l < (unsigned)dv)
+                            h++;
+                    }
                 }
             }
         }
@@ -1015,6 +1051,24 @@ void __axc_num_dec(struct __axc_num *n, int dfmt, void *dst, int *range) {
     *range = 0;
     if (n->kind == 2 || n->kind == 3) {
         dec_store(f, neg, 0, 0, 0, n->kind - 1, dst);
+        if (n->kind == 3 && n->dexp == 1) {
+            /* the payload in the trailing significand, if canonical (below
+               10^(p - 1)): IEEE 754-2019 3.5.2, 6.2.1 */
+            unsigned __axiom_int64 lim_hi = 0, lim_lo = 1;
+            unsigned char *o = (unsigned char *)dst;
+            int k;
+            for (k = 0; k < f->p - 1; k++) {
+                unsigned __axiom_int64 l8 = lim_lo << 3, l2 = lim_lo << 1, s2 = l8 + l2;
+                lim_hi = (lim_hi << 3) + (lim_hi << 1) + (lim_lo >> 61) + (lim_lo >> 63) + (s2 < l8);
+                lim_lo = s2;
+            }
+            if (n->mhi < lim_hi || (n->mhi == lim_hi && n->mlo < lim_lo)) {
+                for (k = 0; k < f->bytes && k < 8; k++)
+                    o[k] |= (unsigned char)(n->mlo >> (8 * k));
+                for (k = 8; k < f->bytes; k++)
+                    o[k] |= (unsigned char)(n->mhi >> (8 * (k - 8)));
+            }
+        }
         return;
     }
     q = n->dexp - nd;

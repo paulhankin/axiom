@@ -6,9 +6,109 @@
 // with the same software arithmetic the program's code calls at run time
 // (std/c/rt/ldouble.ax), so that a constant expression has the value the
 // program would compute.
+//
+// Constants are read, and folded, in the rounding direction g_dir: to
+// nearest, or a static FENV_ROUND direction in whose scope they are (C23
+// 7.6.2, F.8.2: translation honours the constant rounding modes; semantic
+// analysis sets g_dir for each external declaration and block item). With
+// a directed g_dir, an operation of float, double or _Float16 values is
+// computed in binary128 (where + - * / of operands of 53 bits or fewer
+// round in the same direction) and rounded to its format in the direction:
+// two roundings in one directed mode, the second to fewer bits, are one.
 // =============================================================================
 import "../util.ax" as u;
 import "std/c/rt/ldouble" as ld;
+
+/// The rounding direction of translation (ldouble.ax's RN, RD, RU, RZ).
+pub let mut g_dir: u32 = ld.RN;
+
+/// Is the translation's direction a directed one?
+pub fn directed() bool {
+    return g_dir != ld.RN;
+}
+
+fn ctx() ld.Env {
+    return ld.Env.{ mode: g_dir, flags: 0 };
+}
+
+// The bits of w (format Q, exact or not) rounded in g_dir to the binary
+// format of width bits (64, 32 or 16).
+fn q_to(w: ld.W, bits: i32) f64 {
+    return wide_to_dir(w, ld.FMT_Q, bits);
+}
+
+/// x op y (op: 0 +, 1 -, 2 *, 3 /) of values of the binary format of width
+/// bits (64, 32 or 16), rounded to it in g_dir.
+pub fn op_dir(op: u32, x: f64, y: f64, bits: i32) f64 {
+    if g_dir == ld.RN {
+        let mut r: f64 = 0.0;
+        if op == 0 {
+            r = x + y;
+        } else if op == 1 {
+            r = x - y;
+        } else if op == 2 {
+            r = x * y;
+        } else {
+            r = x / y;
+        }
+        return round_near(r, bits);
+    }
+    let a = of_f64(x, ld.FMT_Q);
+    let b = of_f64(y, ld.FMT_Q);
+    let mut r = zero();
+    let mut c = ctx();
+    ld.arith_c(&mut r, &a, &b, ld.FMT_Q, op, &mut c);
+    return q_to(r, bits);
+}
+
+// (round_to's nearest rounding of a double result)
+fn round_near(r: f64, bits: i32) f64 {
+    let rb = @bit_cast(u64, r);
+    if (((rb >> 52) & 0x7FF) == 0x7FF) and ((rb << 12) != 0) {
+        return r;  // (a NaN as it is: a signaling one stays one, ir.f32_bits)
+    }
+    if bits == 32 {
+        return @as(f64, @float_cast(f32, r));
+    }
+    if bits == 16 {
+        return round_half(r);
+    }
+    return r;
+}
+
+/// The double x rounded to the binary format of width bits (64, 32 or 16)
+/// in g_dir.
+pub fn round_dir(x: f64, bits: i32) f64 {
+    if (g_dir == ld.RN) or (bits == 64) {
+        return round_near(x, bits);
+    }
+    return q_to(of_f64(x, ld.FMT_Q), bits);
+}
+
+/// The integer x (signed: sg) as a value of the binary format of width bits
+/// (64, 32 or 16), rounded in g_dir.
+pub fn int_dir(x: u64, sg: bool, bits: i32) f64 {
+    let mut w = zero();
+    if sg {
+        ld.from_i64(&mut w, @bit_cast(i64, x), ld.FMT_Q);
+    } else {
+        ld.from_u64(&mut w, x, ld.FMT_Q);
+    }
+    return q_to(w, bits);
+}
+
+/// The wide value a (format f) rounded in g_dir to the binary format of
+/// width bits (64, 32 or 16).
+pub fn wide_to_dir(a: ld.W, f: u32, bits: i32) f64 {
+    let mut ev: u64 = @as(u64, g_dir) << 13;
+    if bits == 16 {
+        return half_value(ld.e_h_from(0, &a, f, 4, &mut ev, ld.K_X64));
+    }
+    if bits == 32 {
+        return @as(f64, @bit_cast(f32, @truncate(u32, ld.e_to_bin(&a, f, 32, &mut ev, ld.K_X64))));
+    }
+    return @bit_cast(f64, ld.e_to_bin(&a, f, 64, &mut ev, ld.K_X64));
+}
 
 /// The format (ld.FMT_Q or ld.FMT_X) of a long double of `bits` (80 or 128).
 pub fn fmt_of(bits: i32) u32 {
@@ -18,20 +118,41 @@ pub fn fmt_of(bits: i32) u32 {
     return ld.FMT_Q;
 }
 
-/// a (of format ff) in format tf (ldouble.ax's convert).
+/// a (of format ff) in format tf (ldouble.ax's convert), in g_dir.
 pub fn convert(a: ld.W, ff: u32, tf: u32) ld.W {
     let mut r = zero();
-    ld.convert(&mut r, &a, ff, tf);
+    let mut ev: u64 = @as(u64, g_dir) << 13;
+    ld.e_convert(&mut r, &a, ff, tf, &mut ev, ld.K_X64);
     return r;
 }
 
-/// a (of format f) rounded to binary16: its bits.
+/// a (of format f) rounded to binary16 in g_dir: its bits.
 pub fn to_half(a: ld.W, f: u32) u64 {
-    return ld.h_from_w(&a, f);
+    let mut ev: u64 = @as(u64, g_dir) << 13;
+    return ld.e_h_from(0, &a, f, 4, &mut ev, ld.K_X64);
 }
 
 /// parse's format for _Float16 (binary16): the result's `lo` is its bits.
 pub const FMT_HALF: u32 = 99;
+
+/// parse's formats for double and float: the result's `lo` is the bits of
+/// the double value.
+pub const FMT_F64: u32 = 98;
+pub const FMT_F32: u32 = 97;
+
+/// The value of floating constant `s` read in g_dir, as a double (rounded
+/// to the binary format of width bits: 64, 32 or 16).
+pub fn parse_dir(s: []u8, bits: i32) f64 {
+    let mut inf = false;
+    if bits == 16 {
+        return half_value(parse_half(s, &mut inf));
+    }
+    let mut f = FMT_F64;
+    if bits == 32 {
+        f = FMT_F32;
+    }
+    return @bit_cast(f64, parse_literal(s, f, &mut inf).lo);
+}
 
 /// The binary16 bits of the value of floating constant `s` (correctly
 /// rounded); `inf` when it is too large.
@@ -58,25 +179,29 @@ pub fn zero() ld.W {
 
 pub fn add(a: ld.W, b: ld.W, f: u32) ld.W {
     let mut r = zero();
-    ld.add(&mut r, &a, &b, f);
+    let mut c = ctx();
+    ld.arith_c(&mut r, &a, &b, f, 0, &mut c);
     return r;
 }
 
 pub fn sub(a: ld.W, b: ld.W, f: u32) ld.W {
     let mut r = zero();
-    ld.sub(&mut r, &a, &b, f);
+    let mut c = ctx();
+    ld.arith_c(&mut r, &a, &b, f, 1, &mut c);
     return r;
 }
 
 pub fn mul(a: ld.W, b: ld.W, f: u32) ld.W {
     let mut r = zero();
-    ld.mul(&mut r, &a, &b, f);
+    let mut c = ctx();
+    ld.arith_c(&mut r, &a, &b, f, 2, &mut c);
     return r;
 }
 
 pub fn div(a: ld.W, b: ld.W, f: u32) ld.W {
     let mut r = zero();
-    ld.div(&mut r, &a, &b, f);
+    let mut c = ctx();
+    ld.arith_c(&mut r, &a, &b, f, 3, &mut c);
     return r;
 }
 
@@ -90,14 +215,16 @@ pub fn negate(a: ld.W, f: u32) ld.W {
 pub fn cmul(a: ld.W, b: ld.W, c: ld.W, d: ld.W, f: u32) [2]ld.W {
     let mut re = zero();
     let mut im = zero();
-    ld.cmul(&mut re, &mut im, &a, &b, &c, &d, f);
+    let mut ev: u64 = @as(u64, g_dir) << 13;
+    ld.e_cmuldiv(&mut re, &mut im, &a, &b, &c, &d, f, false, &mut ev, ld.K_X64);
     return [re, im];
 }
 
 pub fn cdiv(a: ld.W, b: ld.W, c: ld.W, d: ld.W, f: u32) [2]ld.W {
     let mut re = zero();
     let mut im = zero();
-    ld.cdiv(&mut re, &mut im, &a, &b, &c, &d, f);
+    let mut ev: u64 = @as(u64, g_dir) << 13;
+    ld.e_cmuldiv(&mut re, &mut im, &a, &b, &c, &d, f, true, &mut ev, ld.K_X64);
     return [re, im];
 }
 
@@ -133,12 +260,12 @@ pub fn of_f64(x: f64, f: u32) ld.W {
     return r;
 }
 
-/// a rounded to double.
+/// a rounded to double (to nearest: an approximation of a wide value).
 pub fn to_f64(a: ld.W, f: u32) f64 {
     return @bit_cast(f64, ld.to_f64(&a, f));
 }
 
-/// a rounded to float (once: not through double).
+/// a rounded to float (once: not through double), to nearest.
 pub fn to_f32(a: ld.W, f: u32) f32 {
     return @bit_cast(f32, ld.to_f32(&a, f));
 }
@@ -388,11 +515,10 @@ pub fn parse(ds: []u8, hex: bool, exp: i64, f: u32, inf: *mut bool) ld.W {
         let s10 = exp - frac;
         // (far outside every format's range: no need for the digits)
         if (s10 + nd) > 6000 {
-            inf.* = true;
-            return zero();
+            return huge(f, inf);
         }
         if (s10 + nd) < -6000 {
-            return zero();
+            return tiny(f, inf);
         }
         if s10 >= 0 {
             for k in @as(i64, 0)..s10 {
@@ -407,11 +533,10 @@ pub fn parse(ds: []u8, hex: bool, exp: i64, f: u32, inf: *mut bool) ld.W {
         }
     }
     if (b2 + @bit_cast(i64, bitlen(&n))) > 40000 {
-        inf.* = true;
-        return zero();
+        return huge(f, inf);
     }
     if (b2 + @bit_cast(i64, bitlen(&n))) < -40000 {
-        return zero();
+        return tiny(f, inf);
     }
     // q = floor(n * 2^k / d), of 128 or 129 bits, and whether a remainder is left
     let mut k = (129 - @bit_cast(i64, bitlen(&n))) + @bit_cast(i64, bitlen(&d));
@@ -458,17 +583,52 @@ pub fn parse(ds: []u8, hex: bool, exp: i64, f: u32, inf: *mut bool) ld.W {
         sticky = (a.n != 0) or ((bl > 128) and any_below(&q, bl - 128));
         e = (((b2 - k) + @bit_cast(i64, bl)) - 128) + 127;
     }
+    return finish_parse(@truncate(i32, e), qh, ql, sticky, f, inf);
+}
+
+// (qh:ql) * 2^(e - 127), a little more if sticky, rounded in g_dir to format
+// f (a wide one, FMT_HALF, FMT_F64 or FMT_F32); inf set if it overflowed to
+// an infinity.
+fn finish_parse(e: i32, qh: u64, ql: u64, sticky: bool, f: u32, inf: *mut bool) ld.W {
+    let mut c = ctx();
     if f == FMT_HALF {
-        let h = ld.h_from_parts(false, @truncate(i32, e), qh, ql, sticky);
+        let h = ld.h_from_parts_c(false, e, qh, ql, sticky, &mut c);
         inf.* = (h & 0x7FFF) == 0x7C00;
         return ld.W.{ lo: h, hi: 0 };
     }
+    if (f == FMT_F64) or (f == FMT_F32) {
+        let mut p: i32 = 53;
+        let mut bias: i32 = 1023;
+        let mut fb: u32 = 52;
+        if f == FMT_F32 {
+            p = 24;
+            bias = 127;
+            fb = 23;
+        }
+        let b = ld.round_bin(false, e, qh, ql, sticky, p, bias, (2 * bias) + 1, &mut c);
+        let bits = (@as(u64, @bit_cast(u32, b.ef)) << fb) | (b.ml & ((@as(u64, 1) << fb) - 1));
+        inf.* = b.ef == (2 * bias) + 1;
+        if f == FMT_F32 {
+            return ld.W.{ lo: @bit_cast(u64, @as(f64, @bit_cast(f32, @truncate(u32, bits)))), hi: 0 };
+        }
+        return ld.W.{ lo: bits, hi: 0 };
+    }
     let mut r = zero();
-    ld.from_parts(&mut r, false, @truncate(i32, e), qh, ql, sticky, f);
+    ld.from_parts_c(&mut r, false, e, qh, ql, sticky, f, &mut c);
     if ld.is_inf(&r, f) {
         inf.* = true;
     }
     return r;
+}
+
+// A value too large for every format, and one too small (rounded in g_dir:
+// an infinity or the largest finite value; zero or the least subnormal).
+fn huge(f: u32, inf: *mut bool) ld.W {
+    return finish_parse(100000, @as(u64, 1) << 63, 0, false, f, inf);
+}
+
+fn tiny(f: u32, inf: *mut bool) ld.W {
+    return finish_parse(-100000, @as(u64, 1) << 63, 0, true, f, inf);
 }
 
 /// The value of floating constant `s` (its spelling, as the preprocessor

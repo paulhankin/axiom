@@ -2,8 +2,7 @@
    but the exact ones of a wide long double: where long double is double
    (Windows, macOS, --c-long-double=64), the double functions; where it is
    wider, the elementary functions in its precision (std/c/rt/math_ld.ax),
-   but erfl, erfcl, lgammal and tgammal, which compute in double (their
-   results have double's precision; docs/c.md); C23's are m_c23.c's. The exact
+   erfl, erfcl, lgammal and tgammal too; C23's are m_c23.c's. The exact
    functions of a wide long double are m_ldwide.c's. */
 #if __STDC_VERSION__ >= 199901L
 
@@ -112,7 +111,21 @@ long double fmal(long double x, long double y, long double z) { return (long dou
 double exp10(double);
 long double exp10l(long double x) { return (long double)exp10((double)x); }
 #endif
-/* (in double in every format) */
+#if __AXIOM_LDBL_WIDTH__ != 64
+/* the error and gamma functions in the format's precision (math_ld.ax) */
+void __axc_ld_sf(unsigned long long op, unsigned long long f, long double *r, const long double *x);
+#define LDSF(name, op) \
+    long double name(long double x) \
+    { \
+        long double r; \
+        __axc_ld_sf(op, F, &r, &x); \
+        return r; \
+    }
+LDSF(erfl, 0)
+LDSF(erfcl, 1)
+LDSF(lgammal, 2)
+LDSF(tgammal, 3)
+#else
 double erf(double);
 long double erfl(long double x) { return (long double)erf((double)x); }
 double erfc(double);
@@ -121,6 +134,7 @@ double lgamma(double);
 long double lgammal(long double x) { return (long double)lgamma((double)x); }
 double tgamma(double);
 long double tgammal(long double x) { return (long double)tgamma((double)x); }
+#endif
 
 #else
 typedef int __axc_ldouble_c89;

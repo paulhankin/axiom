@@ -120,16 +120,25 @@ fn set_float(e: *mut cast.Expr, f: f64) void {
 
 // f rounded to the (corresponding real) type of t (an operation's result
 // computed in double, then rounded: the same as computing in the narrower
-// format, double having more than twice its precision and two bits more).
+// format, double having more than twice its precision and two bits more),
+// in the translation's direction (cldbl.ax's g_dir: a static FENV_ROUND
+// direction's).
 fn round_to(t: *cty.CType, f: f64) f64 {
-    let w = cty.ffmt(t);
-    if w == 32 {
-        return @as(f64, @float_cast(f32, f));
+    return cl.round_dir(f, cty.ffmt(t));
+}
+
+// x op y (+ - * /) of values of real floating type t (float, double or
+// _Float16), rounded to it once in the translation's direction.
+fn fop(op: i32, t: *cty.CType, x: f64, y: f64) f64 {
+    let mut k: u32 = 0;
+    if op == ct.P_MINUS {
+        k = 1;
+    } else if op == ct.P_STAR {
+        k = 2;
+    } else if op == ct.P_SLASH {
+        k = 3;
     }
-    if w == 16 {
-        return cl.round_half(f);
-    }
-    return f;
+    return cl.op_dir(k, x, y, cty.ffmt(t));
 }
 
 // e (of a complex type) is the constant re + i im (rounded to its type).
@@ -241,10 +250,7 @@ fn as_float(x: *cast.Expr) f64 {
     if cty.is_wint(x.ty) {
         return cw.to_f64(x);
     }
-    if x.ty.is_signed {
-        return @float_from_int(f64, @bit_cast(i64, x.cval));
-    }
-    return @float_from_int(f64, x.cval);
+    return cl.int_dir(x.cval, x.ty.is_signed and (x.ty.kind != cty.TK_BOOL), 64);
 }
 
 // The imaginary part of constant x (a complex value, or 0 for a real one)
@@ -262,14 +268,7 @@ fn wide_imag(x: *cast.Expr, f: u32) ld.W {
 // Wide value w of format f as a value of real floating type t (not wide:
 // rounded once).
 fn narrow_wide(w: ld.W, f: u32, t: *cty.CType) f64 {
-    let b = cty.ffmt(t);
-    if b == 32 {
-        return @as(f64, cl.to_f32(w, f));
-    }
-    if b == 16 {
-        return cl.half_value(cl.to_half(w, f));
-    }
-    return cl.to_f64(w, f);
+    return cl.wide_to_dir(w, f, cty.ffmt(t));
 }
 
 // -----------------------------------------------------------------------------
@@ -597,10 +596,7 @@ fn int_to_f32(x: *cast.Expr) f64 {
     if cty.is_wint(x.ty) {
         return @as(f64, cw.to_f32(x));
     }
-    if x.ty.is_signed {
-        return @as(f64, @float_from_int(f32, @bit_cast(i64, x.cval)));
-    }
-    return @as(f64, @float_from_int(f32, x.cval));
+    return cl.int_dir(x.cval, x.ty.is_signed and (x.ty.kind != cty.TK_BOOL), 32);
 }
 
 // convert, from or to a wide long double: correctly rounded (to float
@@ -791,14 +787,8 @@ fn binary(e: *mut cast.Expr) void {
     if cty.is_floating(e.ty) {
         let x = a.fcval;
         let y = b.fcval;
-        if op == ct.P_PLUS {
-            set_float(e, x + y);
-        } else if op == ct.P_MINUS {
-            set_float(e, x - y);
-        } else if op == ct.P_STAR {
-            set_float(e, x * y);
-        } else if op == ct.P_SLASH {
-            set_float(e, x / y);
+        if (op == ct.P_PLUS) or (op == ct.P_MINUS) or (op == ct.P_STAR) or (op == ct.P_SLASH) {
+            set_float(e, fop(op, e.ty, x, y));
         }
         return;
     }
@@ -1039,18 +1029,13 @@ fn complex_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
     let bcx = cty.is_complex(b.ty);
     let x = a.fcval;
     let y = b.fcval;
+    let t = e.ty;
     if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
         let is_add = op == ct.P_PLUS;
-        let mut re = x - y;
-        if is_add {
-            re = x + y;
-        }
+        let re = fop(op, t, x, y);
         let mut im = a.fcimag;
         if acx and bcx {
-            im = a.fcimag - b.fcimag;
-            if is_add {
-                im = a.fcimag + b.fcimag;
-            }
+            im = fop(op, t, a.fcimag, b.fcimag);
         } else if bcx {
             im = b.fcimag;
             if not is_add {
@@ -1062,9 +1047,9 @@ fn complex_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
     }
     if op == ct.P_STAR {
         if not acx {
-            set_complex(e, x * y, x * b.fcimag);
+            set_complex(e, fop(op, t, x, y), fop(op, t, x, b.fcimag));
         } else if not bcx {
-            set_complex(e, x * y, a.fcimag * y);
+            set_complex(e, fop(op, t, x, y), fop(op, t, a.fcimag, y));
         } else {
             let r = ccx.cmul(x, a.fcimag, y, b.fcimag, s);
             set_complex(e, r.re, r.im);
@@ -1073,7 +1058,7 @@ fn complex_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
     }
     if op == ct.P_SLASH {
         if not bcx {
-            set_complex(e, x / y, a.fcimag / y);
+            set_complex(e, fop(op, t, x, y), fop(op, t, a.fcimag, y));
         } else {
             let mut ai: f64 = 0.0;
             if acx {

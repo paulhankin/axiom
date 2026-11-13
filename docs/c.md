@@ -817,9 +817,15 @@ compiler's (`std/c/rt/decimal.ax`), the same on every target:
   many as cancellation needs; trigonometric arguments reduced exactly, up to 10^6145)
   and round once: within 1 ulp (measured against mpmath, a few hundred arguments of
   every magnitude per function and format: the largest error 0.500 ulp). An exact result has the quantum C23 prefers (`sqrtd64(1.44dd)` is `1.2`,
-  `expd64(0)` is `1`, `powd64(2.0dd, 10)` is `1024.0000000000`); errors set `errno` as
+  `expd64(0)` is `1`, `powd64(2.0dd, 10)` is `1024.0000000000`, `atan2pid64(1, -1)` is
+  `0.75`, `exp2d64(-3.0dd)` `0.125`, `tanpid64(0.25dd)` `1`, `powd64(2.25dd, 0.5dd)` `1.5`,
+  `compoundnd64(0.1dd, 2)` `1.21`: the exact values of the `pi` functions, `exp2`,
+  `exp10` and their `m1` forms of integers, `pow` of an exact square root and
+  `compoundn`'s exact powers are found); errors set `errno` as
   for the binary functions (`math_errhandling`). `strtod32`, `strtod64`, `strtod128`
-  and the `wcstod` forms are correctly rounded in the decimal rounding direction, with
+  and the `wcstod` forms (and `fscanf`'s decimal conversions: a NaN's n-char-sequence,
+  read as an unsigned integer as `nan` reads it, is its payload when that is canonical)
+  are correctly rounded in the decimal rounding direction, with
   the quantum as written (`ERANGE` on overflow and underflow); `fprintf` and `fscanf`
   take the length modifiers `H`, `D` and `DD` with `a e f g` and their upper case: `%Da`
   writes the coefficient and the quantum exactly (`1.20`, `1.2e+03`: style f when
@@ -1039,9 +1045,14 @@ functions are C (`std/c/lib/math/`).
   `cbrt`, `tan`, `sinh`, `lgamma` and `atan2` 1.3 to 2 times slower (their former
   versions were less accurate: up to 2 ulps for `tan` and `sinh`).
 - **The complex functions** follow Annex G's special values (G.6) and Kahan's methods;
-  each part is within a few ulps (measured: `clog` 0.5; `cexp`, `csqrt`, `csin`, `ccos`,
-  `csinh`, `ccosh` 1.9; `casin`, `cacos`, `catan`, `casinh`, `cacosh`, `catanh` 3.8; `ctan`,
-  `ctanh` 5.1), not correctly rounded. `cpow` is `cexp(w clog z)`, whose error grows with
+  each part is within a few ulps, not correctly rounded: the steps where roundings
+  add up (Kahan's `1 + t^2` and `1 + b s^2` of `ctanh`, the products of the square roots
+  in `casin` and `cacos`, `catanh`'s denominators, `csqrt`'s sum and its Newton step) are
+  computed in pairs of the type (Dekker's error-free products, from `fma`), so that the
+  error is mostly that of the real functions called (double, measured on 20000 arguments
+  each: `clog` 0.5; `csqrt` 0.84; `catan`, `catanh` 1.35; `cexp`, `csin`, `ccos`, `csinh`,
+  `ccosh` 2.1; `casin`, `cacos`, `casinh`, `cacosh` 2.5; `ctan`, `ctanh` 2.7; the float
+  forms are the double ones rounded, within half an ulp and a fraction). `cpow` is `cexp(w clog z)`, whose error grows with
   the size of the result's exponent.
 - **`long double`** where it is `double` (Windows, macOS; and with `--c-long-double=64`) has
   the double functions. Where it is wider (the 80-bit x87 format on x86-64 Linux, binary128
@@ -1062,8 +1073,13 @@ functions are C (`std/c/lib/math/`).
   x87 format; the software arithmetic of the format is part of a call's cost), 10 to 80
   times the x87 hardware's functions of the system library (`powl` and `fmal` about the
   same). The complex `l` functions are the double ones' methods on these (each part within
-  3.3 ulps of the format, measured); `erfl`, `erfcl`, `lgammal`, `tgammal`, `sinpil` and
-  `cospil` compute in double.
+  3.3 ulps of the format, measured). `erfl` and `erfcl` (Taylor's series below 2, the
+  continued fraction above it), `lgammal` and `tgammal` (Stirling's series from 24 up, the
+  Taylor series of `lgamma(2 + z)` and the recurrence below, the reflection for negative
+  arguments, with the Taylor series about each zero of `lgamma` in (-34, -2) where the
+  reflection cancels) compute in triple-double too: within 0.55 ulp of binary128 and
+  0.5 + 2^-6 of the x87's (measured on 900 arguments each, near the zeros of `lgamma`
+  included); 4 to 15 us a call. `_Float128`'s `erff128` ... `tgammaf128` are the same.
 - **Errors** (7.12.1): `math_errhandling` is `MATH_ERRNO | MATH_ERREXCEPT` on x86-64 and
   AArch64 and `MATH_ERRNO` on WebAssembly. A domain error sets `errno` to `EDOM` and raises
   "invalid"; a pole error `ERANGE` and "divide-by-zero"; an overflow `ERANGE` and
@@ -1115,10 +1131,9 @@ builtins `__builtin_axiom_fenv_get` and `__builtin_axiom_fenv_set`, the backends
 are never trapped. WebAssembly has no floating-point environment: rounding is to nearest,
 `fesetround` fails for the other modes, no flag is ever set (`fetestexcept` is 0) and
 `feraiseexcept` fails for a nonzero argument; the macros are defined all the same. The
-other modes are not done in software: the program's own arithmetic would need it too
-(`FENV_ACCESS` has no effect, so every floating-point operation of every function would
-look at the mode, a cost to all code), and a `fesetround` that succeeded while `a + b`
-still rounded to nearest would mislead the programs that use it (7.6.4.3 lets it fail).
+other modes are not done in software: the program's own arithmetic would need it too, and a `fesetround` that succeeded while
+`a + b` still rounded to nearest would mislead the programs that use it (7.6.4.3 lets it
+fail): so Annexes F and G are not claimed there.
 
 **`#pragma STDC FENV_ACCESS ON`** (7.6.1), and `--c-fenv-access` for every function, is
 honoured. A function with floating operations in its scope (anywhere in its body) has
@@ -1132,11 +1147,16 @@ dead code removal); a function inlined into another makes that one strict, and o
 code stays strict (`inline.ax`, `outline.ax`; `divconst.ax` turns only integer divisions
 into multiplications). In the C front end, an operation on floating values in the
 pragma's scope is done at run time though its operands are constants (F.8.4, F.8.5:
-automatic objects' initializers too; static ones are still folded at translation time).
+automatic objects' initializers too; static ones are folded at translation time, in the
+static direction of a `FENV_ROUND` in whose scope they are).
 Outside its scope, and without the option, the optimizer assumes the default environment
 as before: it folds constants as rounding to nearest with no flags, and may move or drop
 floating operations. The relational operators `<`, `<=`, `>` and `>=` signal "invalid"
-for a NaN operand (F.9.3; `comisd`, `fcmpe`), the macros `isless` ... do not.
+for a NaN operand (F.9.3; `comisd`, `fcmpe`), the macros `isless` ... do not. Vectors (a GNU
+dialect) follow the same rules lane by lane: their arithmetic is strict in a strict
+function, their relational operators signal (`cmpltps`, `fcmgt`; the IR's vector `fcmp`
+carries `F_SIGNALING` as the scalar one does), `==` and `!=` do not
+(`c/lib/math/fenv_vector.c`, float, double and `_Float16` lanes).
 
 **`#pragma STDC FENV_ROUND direction`** (C23 7.6.2) sets the static rounding direction
 of its scope: each full expression in it (a statement's expression, a condition, an
@@ -1144,10 +1164,49 @@ initializer) is evaluated with the direction set in the environment's rounding b
 the dynamic mode's restored after it (the flags it raised kept); a call in it of a
 function that 7.6.2p4's table does not list (other than `<math.h>`'s and the
 conversions of `<stdlib.h>`, `<stdio.h>` and `<wchar.h>`) runs in the dynamic mode, which
-is read again after the call. `FE_DYNAMIC` is the dynamic mode; `FE_TONEARESTFROMZERO`
-is `C4113` (no target has it), and so is any directed rounding on WebAssembly. Not done:
-the translation-time evaluation of floating constants and of static initializers in the
-static direction (they are rounded to nearest).
+is read again after the call (the table's: `<math.h>`'s functions of 7.6.2p4 with every
+suffix, Annex H's `f16` ... `f64x` too, `atof`, `strtod` ... `strtold` and their `_FloatN`
+and `wcs` forms, `strfromd` ... and the formatted input/output functions). The library's
+functions of the table follow the mode they are called in, in every format: `sqrt`,
+`fma`, `rint`, `nearbyint`, `lrint`, `llrint`, `scalbn`, `ldexp`, `fdim`, the narrowing
+operations, the conversions of `<stdlib.h>` and `<stdio.h>` (for a wide `long double` and
+`_Float128`, `m_ldwide.c` and `math_ld.ax`'s `fma` read the direction and raise the
+exceptions). At translation time (F.8.2), floating constants in the scope of a static
+direction are rounded in it, and so are the constant expressions folded there (static
+initializers: `static double x = 1.0 / 3.0;` is the value the division has at run time
+in that direction), every operation and conversion of every floating type, complex ones
+included (`cldbl.ax`'s `g_dir`, which semantic analysis sets for each declaration and
+block item). `FE_DYNAMIC` is the dynamic mode; `FE_TONEARESTFROMZERO` is `C4113` (no
+target has it for binary arithmetic, and C23 asks for it only for the decimal types), and
+so is any directed rounding on WebAssembly.
+
+**`#pragma STDC FENV_DEC_ROUND direction`** (C23 7.6.3) is the same for the decimal
+types, in every direction (`FE_DEC_DOWNWARD`, `FE_DEC_TONEAREST`,
+`FE_DEC_TONEARESTFROMZERO`, `FE_DEC_TOWARDZERO`, `FE_DEC_UPWARD`; `FE_DEC_DYNAMIC`) and
+on every target (the decimal arithmetic is software): decimal constants and folded
+constant expressions round in it at translation time; at run time each full expression
+sets the thread's decimal direction (`fe_dec_setround`'s) to it and restores the dynamic
+one after it, and a call of a function its table does not list (the `d32`, `d64` and
+`d128` functions of `<math.h>`, `strtodN`, `wcstodN`, `strfromdN`, the formatted
+input/output) runs in the dynamic one.
+
+**The software arithmetic** (a `long double` wider than `double`, `_Float128`,
+`_Float64x`, `_Float16`'s rounding steps, the conversions of integers wider than 64 bits
+and of the decimal types to binary ones) follows the environment too: in a function with
+strict floating point (`FENV_ACCESS ON`, `--c-fenv-access`, or a static `FENV_ROUND`
+direction in it) each operation reads the environment's register, rounds in its
+direction and raises its exceptions in it (invalid, divide-by-zero, overflow, underflow
+for a tiny inexact result with tininess detected after rounding, inexact), as the
+hardware's `float` and `double` operations do: `std/c/rt/ldouble.ax`'s `e_` functions.
+Elsewhere it rounds to nearest and raises nothing, at no cost for the environment: code
+translated with `FENV_ACCESS` OFF runs in the default mode or has undefined behaviour,
+and its flags may not be tested (7.6.1p2), so the results are the same. A `_Float16`
+operation is computed in `float` in the dynamic mode and rounded again in it (two
+roundings in one directed mode are one); widening a signaling NaN raises "invalid", and
+`<` `<=` `>` `>=` on `_Float16` signal as on `float`. Tests:
+`c/lib/math/fenv_wide_q.c`, `fenv_wide_x.c`, `fenv_half.c` (every operation in the four
+directions, bits and flags, against exact rational arithmetic:
+`cmd/axiom/internal/tests/tools/gen_fenv_wide_tests.py`).
 
 **FP_CONTRACT**: no floating expression is ever contracted (an FMA is only made where the
 program calls `fma`), so the default is OFF, and both `#pragma STDC FP_CONTRACT ON` and
@@ -1208,8 +1267,10 @@ the `SOURCE_DATE_EPOCH` environment variable's, in UTC), `__FILE__`, `__LINE__`.
 complex types are supported. In C23,
 `__STDC_EMBED_NOT_FOUND__`, `__STDC_EMBED_FOUND__` and `__STDC_EMBED_EMPTY__` are 0, 1
 and 2, and `__STDC_IEC_60559_DFP__` is `202311L` (the decimal floating types, "Decimal
-floating types" below). `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__` and `__STDC_ISO_10646__` are not
-defined, nor is `__STDC_IEC_559_COMPLEX__` (see "Known deviations").
+floating types" below). From C99, on x86-64 and AArch64 with the library (hosted, not
+`--c-lib=system`), `__STDC_IEC_559__` and `__STDC_IEC_559_COMPLEX__` are 1, and in C23
+`__STDC_IEC_60559_BFP__` and `__STDC_IEC_60559_COMPLEX__` are `202311L` (Annexes F and G);
+not on WebAssembly. `__STDC_IEC_60559_TYPES__` is not defined (see "Known deviations").
 
 The compiler's own macros say what the build chose:
 
@@ -1349,7 +1410,7 @@ library's are `C1081`.
 | `<iso646.h>` | C95 and later | |
 | `<stdbool.h>` | C99 and later | In C23, `bool`, `true` and `false` are keywords and the header only defines `__bool_true_false_are_defined`. |
 | `<stdint.h>` | C99 and later | No `int32_t` family when no type is 32 bits wide. |
-| `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `imaginary` and `_Imaginary_I` (of type `const float _Imaginary`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `I` is `_Complex_I` (7.3.1p4 allows `_Imaginary_I` only with Annex G, which is not claimed). `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are the library's ("`<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions"). |
+| `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `imaginary` and `_Imaginary_I` (of type `const float _Imaginary`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `I` is `_Imaginary_I` where Annex G is claimed (x86-64, AArch64: `__STDC_IEC_559_COMPLEX__`), else `_Complex_I`. `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are the library's ("`<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions"). |
 | `<math.h>` | all | C89's double functions; from C99 everything of C17 7.12, in the three types, and C23's listed below. |
 | `<fenv.h>` | C99 and later | All of C17 7.6; C23's `fegetmode`, `fesetmode`, `fesetexcept`, `fetestexceptflag`. |
 | `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. Decimal arguments choose the `d32`, `d64` and `d128` functions (C23 7.27p3); arguments of the interchange and extended types (Annex H.11) their common real type's: `_Float16`'s and `_Float128`'s `f16` and `f128` functions (declared with `__STDC_WANT_IEC_60559_TYPES_EXT__`; without it float's function for `_Float16`), and for `_Float32`, `_Float64` and `_Float32x` the standard function of their format, whose result has the standard type. |
@@ -1379,18 +1440,12 @@ as the standard says.
 
 ## Not supported
 
-- Annex F and Annex G: `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__`,
-  `__STDC_IEC_559_COMPLEX__` and `__STDC_IEC_60559_COMPLEX__` are not defined on any
-  target. What keeps them off: a `long double` wider than `double` (x86-64 Linux, AArch64
-  Linux), and `_Float128` and `_Float64x` everywhere, have software arithmetic that
-  rounds to nearest only and raises no exception flags (F.3, F.8; `_Float16`'s, computed
-  in `float`, follows the environment); `FENV_ROUND`'s static direction does not apply to floating constants
-  and static initializers (F.8.2, 7.6.2); WebAssembly has no floating-point environment;
-  `erfl`, `erfcl`, `lgammal` and `tgammal` of a wide `long double` compute in double;
-  the imaginary types follow G.4 and G.5, but Annex G needs Annex F. The rest is Annex F's: IEC 60559 formats for
-  float and double, the operations correctly rounded in the dynamic mode, the
-  exceptions, `FENV_ACCESS`, signaling relational operators, the functions' special
-  values (F.10) and `math_errhandling` with `MATH_ERREXCEPT` on x86-64 and AArch64.
+- Annex F and Annex G on WebAssembly (no floating-point environment: no rounding modes,
+  no exception flags), and with `--c-lib=system` or `--c-freestanding`: there
+  `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__`, `__STDC_IEC_559_COMPLEX__` and
+  `__STDC_IEC_60559_COMPLEX__` are not defined. On x86-64 and AArch64 with the library
+  they are (`docs/c-conformance.md`, "Annexes"). Annex H (`__STDC_IEC_60559_TYPES__`) is
+  not claimed: the known deviations below.
 - `setjmp` on WebAssembly without its exception-handling extension (`C3300`).
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
@@ -1401,7 +1456,7 @@ as the standard says.
   rejects too.
 - In every mode: inline assembly on WebAssembly targets (C3901), `__declspec`, `#import`,
   `#assert`. In a GNU dialect: a jump from a nested function to a label of its enclosing
-  function (C3901), `__real__` and `__imag__`, and the decimal and `__bf16`/`__ibm128`
+  function (C3901), and the decimal and `__bf16`/`__ibm128`
   types.
 
 ## GNU dialects
@@ -1425,6 +1480,7 @@ exactly what works (there is no option that defines `__GNUC__`).
 | `&&label`, `goto *p` | Labels as values: `&&label` is a `void *`, an address constant (so it may initialize a static object: `static void *t[] = { &&a, &&b };`), equal only to itself; `goto *p` jumps to the label whose address p is. A label's address is an address in a table of its function's (one byte for each label whose address is taken), and `goto *` is a switch on the distance from the table's start; so the values compare and subtract as addresses (`&&a - &&b` of one function's labels is an integer constant), and stay valid when the function is inlined. Not where a variable length array or an object with a cleanup is in scope (C3901). |
 | `case lo ... hi:` | A case range (inclusive); an empty one (lo > hi) is the warning C4120; overlapping another case is C3041. |
 | `a ?: b` | `a ? a : b` with a evaluated once. |
+| `__real__ e`, `__imag__ e` | The real and imaginary parts of a complex value (of every complex type), lvalues when e is one (`__imag__ z = 1;`, `&__real__ z`, of e's qualifiers), constant for a constant e; of a real e, e and 0; of an imaginary one, 0 and its coefficient. |
 | `[lo ... hi] = v` | A designator range (several in one designation too); v must have no effects if the range has more than one element (it would be evaluated once: C3901). |
 | `member: v` | The old designator `.member = v`. |
 | Zero-length arrays | `T a[0]`: size 0 (as a structure's last member, a flexible array member's place). |
@@ -1811,9 +1867,10 @@ is the warning C4112 and is ignored; an unknown one is ignored (the warning C411
 | `weak name`, `weak name = target` | As the attribute weak (and alias), if the unit declares name. |
 | `message("text")` | The warning C4110 with the text. |
 | `STDC FP_CONTRACT ON/OFF/DEFAULT` | Accepted: no floating operations are contracted (an FMA is only the `fma` the program calls), so both hold. |
-| `STDC FENV_ACCESS ON/OFF/DEFAULT` | OFF holds; ON is the warning C4113: the optimizer assumes the default floating-point environment (`<fenv.h>` changes and tests it at run time: see "The floating-point environment"). |
+| `STDC FENV_ACCESS ON/OFF/DEFAULT` | Honoured: see "The floating-point environment". |
 | `STDC CX_LIMITED_RANGE ON/OFF/DEFAULT` | Accepted (it allows, and asks for nothing). |
-| `STDC FENV_ROUND dir` (C23) | FE_TONEAREST and FE_DYNAMIC hold; the other directions are C4113. |
+| `STDC FENV_ROUND dir` (C23) | Honoured, at translation and at run time ("The floating-point environment"); `FE_TONEARESTFROMZERO`, and a directed rounding on WebAssembly, are C4113. |
+| `STDC FENV_DEC_ROUND dir` (C23) | Honoured, every direction, on every target. |
 | `GCC diagnostic push`, `pop`, `ignored "-Wx"`, `warning "-Wx"`, `error "-Wx"` | The warnings after it (in its file, and in the files it includes) that -Wx names are not shown, shown, or errors (keeping their codes). -Wx is one of the compiler's codes (`"C4050"`), `-Wall`, `-Wextra` and `-Wpedantic` (every warning), or a usual name that stands for one: `-Wdeprecated-declarations` and `-Wdeprecated` (C4050), `-Wunused-result` and `-Wunused-value` (C4051), `-Wattributes` (C4052), `-Winvalid-noreturn` (C4053), `-Wimplicit-function-declaration` (C4001), `-Wunused-label` (C4040), `-Wvarargs` (C4080), `-Wmultichar` (C4102), `-Wcpp` (C4103), `-Wunknown-pragmas` (C4111), `-Wpragmas` (C4112), `-Wnonnull` (C4121), `-Wswitch-outside-range` (C4120), `-Wattribute-warning` (C4123), `-Wformat` (C4130 to C4135), `-Wformat-extra-args` (C4132), `-Wformat-nonliteral` and `-Wformat-security` (C4134), `-Wformat-signedness` (C4135); others are ignored. An error is never made a warning (nor a check `--c-warn-format` does not make enabled). |
 | `GCC visibility push(v)`, `pop` | The declarations with external linkage up to the matching `pop` get visibility v (as the attribute, which overrides it). |
 | `GCC poison x y` | A later use of x or y is the error C1086 (not one a macro defined before makes). |
@@ -2364,43 +2421,31 @@ complete a stack trace is after a crash.
 These are the places where the implementation does not follow the standard it claims, or
 claims less than the standard allows. None is hidden: each is said above or here.
 
-- Annex F is not claimed. The floating types have IEC 60559 formats (`FLT_IS_IEC_60559`
-  in `<float.h>`), and `<fenv.h>` has the rounding modes and exception flags on x86-64 and
-  AArch64, but the optimizer assumes the default environment (`FENV_ACCESS` is not
-  honoured), WebAssembly has no environment, and the relational operators are quiet (a
-  quiet NaN operand of `<` raises nothing); signaling NaNs are not guaranteed to stay
-  signaling, so `<float.h>` has no `FLT_SNAN`.
-- `erfl`, `erfcl`, `lgammal`, `tgammal`, `sinpil` and `cospil`, where `long double` is
-  wider than `double`, compute in `double`: their results have `double`'s precision.
-- Annex G is not claimed (`__STDC_IEC_559_COMPLEX__` is not defined): it needs Annex F.
-  The imaginary types are supported, with G.4's conversions and G.5's arithmetic, and
-  complex arithmetic follows it all the same where it can: a real operand of `+ - * /` with a complex one is not made
-  complex (G.5: `2.0 * z` is `2.0 * creal(z) + 2.0 * cimag(z) * I`, and signed zeros of
-  the other part are kept), and multiplication and division recover the infinities and
-  zeros G.5.1 describes when the formulas give NaN + iNaN. Division uses Smith's method
-  (no overflow forming the divisor's squared magnitude); it may differ in the last bit
-  from other implementations' choices. `CX_LIMITED_RANGE` has no effect (the full
-  algorithms are always used).
-- The decimal floating types: `#pragma STDC FENV_DEC_ROUND` with a direction other
-  than `FE_DEC_TONEAREST` and `FE_DEC_DYNAMIC` is `C4113` (operations round in the
-  dynamic direction, `fe_dec_setround`'s, which `FENV_ROUND` does not change; outside
-  `FENV_ACCESS ON` operations of constants are folded to nearest, as for the binary
-  types); `fprintf`'s decimal conversions round half to even, as its binary ones
-  do; on WebAssembly their exceptions are not recorded (no flags there, as for binary);
-  a NaN's n-char-sequence in `strtod64` and `fscanf` is read and ignored.
-- `#pragma STDC FENV_ACCESS ON` is not honoured (C4113).
+- Annexes F and G are claimed on x86-64 and AArch64 (with the library), not on
+  WebAssembly, which has no floating-point environment.
+- Annex G: division uses Smith's method (no overflow forming the divisor's squared
+  magnitude); it may differ in the last bit from other implementations' choices.
+  `CX_LIMITED_RANGE` has no effect (the full algorithms are always used).
+- The decimal floating types: on WebAssembly their exceptions are not recorded (no flags
+  there, as for binary).
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;
   a program must not rely on it.
-- Annex H is not claimed (`__STDC_IEC_60559_TYPES__` is not defined): it needs Annex F.
-  The `_Float16` and `_Float128` functions of `<math.h>` and the conversions of
+- Annex H is not claimed (`__STDC_IEC_60559_TYPES__` is not defined): C23's additions to
+  7.12 have no `_Float16` or `_Float128` forms (`exp2m1f128`, `sinpif16`, `totalorderf128`,
+  ..., `nanf16`, `nanf128`), nor are there the narrowing operations between the
+  interchange types; and see below for `_Float32` .... The `_Float16` and `_Float128` functions of `<math.h>` and the conversions of
   `<stdlib.h>` are the library's under `__STDC_WANT_IEC_60559_TYPES_EXT__`: binary128's
-  exact functions correctly rounded, its elementary functions in its precision, but
-  `erff128`, `erfcf128`, `lgammaf128` and `tgammaf128` in `double`; binary16's through
-  `float` (the elementary ones rounded twice, so not always correctly rounded); those of
+  exact functions correctly rounded, its elementary functions in its precision;
+  binary16's elementary ones correctly rounded (the double function's value rounded once,
+  or the `_Float128` function's where that value is too near a rounding boundary: checked
+  for every binary16 argument); those of
   `_Float32`, `_Float64`, `_Float32x` and `_Float64x` are macros for the `float`,
   `double`, `long double` or `_Float128` functions, whose results have those types (a
-  `_Generic` on one sees `float`, not `_Float32`). There are no complex `_FloatN`
-  functions; `<tgmath.h>` chooses `_Float16`'s and `_Float128`'s, and the standard ones for the others.
+  `_Generic` on one sees `float`, not `_Float32`). The complex ones are `<complex.h>`'s
+  likewise (`cexpf16`, `cexpf128`: `complexf16.c`, the double functions' parts rounded
+  once; `complexf128.c`, `complex_impl.h`'s methods in binary128's precision; macros for
+  the others); `<tgmath.h>` chooses `_Float16`'s and `_Float128`'s, real and complex, and the
+  standard ones for the others.
 - Vectors of 32 and 64 bytes are passed and returned in memory on x86-64 System V even
   with AVX (the psABI passes them in `ymm` and `zmm` registers then); a C library that
   takes `__m256` arguments is not callable with them. Smaller vectors, and every vector

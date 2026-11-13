@@ -12,8 +12,19 @@
 // operation writes its result into a new temporary, which scalar
 // replacement takes apart again where it can. The x87 format's six bytes of
 // padding are zero in every result (constants included).
+//
+// In a function with strict floating point (FENV_ACCESS ON, a static
+// FENV_ROUND direction: ir.Func's strict_fp) on a target with a
+// floating-point environment, the operations are the `e_` functions, which
+// round in the environment's direction and raise their exceptions in it:
+// the register is read (ir.IN_FPENV_GET) into a slot the call reads and
+// ORs the flags into, and written back (IN_FPENV_SET). Elsewhere they are
+// the functions that round to nearest and raise nothing, which is what the
+// standard asks of code with FENV_ACCESS OFF (ldouble.ax, "The
+// environment").
 // =============================================================================
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cconst.ax" as cc;
 import "cgen.ax" as cg;
@@ -35,6 +46,13 @@ fn i64t() *mut ir.Ty {
     return ir.t_int(64);
 }
 
+fn b01(b: bool) u64 {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
 fn fmt_arg(t: *cty.CType) *mut ir.Value {
     return ir.cint(i32t(), @as(u64, fmt(t)));
 }
@@ -51,6 +69,64 @@ fn call(name: []u8, xs: []mut *mut ir.Value) *mut ir.Value {
     let f = cg.ld_fn(name);
     let fty = ir.fnp_of(f).ty;
     return ir.call(cg.B, fty, f, xs);
+}
+
+/// Do the operations generated now honour the floating-point environment
+/// (strict floating point, and a target that has one)?
+pub fn env_strict() bool {
+    return u.notnil(cg.F) and cg.F.f.strict_fp and not tg.is_wasm();
+}
+
+/// The kind of environment register (ldouble.ax's K_), as an i32 constant.
+pub fn env_kind() *mut ir.Value {
+    if tg.g_arch == tg.ARCH_A64 {
+        return ir.cint(i32t(), @as(u64, ld.K_A64));
+    }
+    return ir.cint(i32t(), @as(u64, ld.K_X64));
+}
+
+/// A new slot holding the environment's register (for an `e_` function).
+pub fn env_read() *mut ir.Value {
+    let p = cg.alloca(cty.t_ullong, "fenv");
+    let mut a: [1]*mut ir.Value = [p];
+    _ = ir.intr(cg.B, ir.IN_FPENV_GET, ir.t_void(), a[..]);
+    return p;
+}
+
+/// The slot's value written back to the register (the flags raised).
+pub fn env_write(p: *mut ir.Value) void {
+    let mut a: [1]*mut ir.Value = [p];
+    _ = ir.intr(cg.B, ir.IN_FPENV_SET, ir.t_void(), a[..]);
+}
+
+/// A call of ldouble.ax's `e_` function `name` with arguments xs, followed
+/// by the environment slot and kind (which it adds): the register read
+/// before and written after.
+pub fn env_call(name: []u8, xs: []*mut ir.Value) *mut ir.Value {
+    let ev = env_read();
+    let all = u.newn.[*mut ir.Value](xs.len + 2);
+    for i in 0..xs.len {
+        all[i] = xs[i];
+    }
+    all[xs.len] = ev;
+    all[xs.len + 1] = env_kind();
+    // (integer arguments made the parameters' widths: usize, bool)
+    let f = cg.ld_fn(name);
+    let fty = ir.fnp_of(f).ty;
+    for i in 0..(xs.len + 2) {
+        let pt = fty.params[i];
+        let x = all[i];
+        if (pt.kind == ir.T_INT) and (x.ty.kind == ir.T_INT) and (pt.bits != x.ty.bits) {
+            if pt.bits < x.ty.bits {
+                all[i] = ir.trunc(cg.B, x, pt);
+            } else {
+                all[i] = ir.zext(cg.B, x, pt);
+            }
+        }
+    }
+    let r = ir.call(cg.B, fty, f, all[0..(xs.len + 2)]);
+    env_write(ev);
+    return r;
 }
 
 // The constants made so far, by value (a constant global each).
@@ -117,14 +193,23 @@ pub fn snapshot(p: *mut ir.Value, volatile: bool) *mut ir.Value {
 /// x op y (+ - * /), of wide floating type t.
 pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     let mut name: []u8 = "add";
+    let mut k: u64 = 0;
     if op == ct.P_MINUS {
         name = "sub";
+        k = 1;
     } else if op == ct.P_STAR {
         name = "mul";
+        k = 2;
     } else if op == ct.P_SLASH {
         name = "div";
+        k = 3;
     }
     let r = temp();
+    if env_strict() {
+        let xs: [5]*mut ir.Value = [r, x, y, fmt_arg(t), ir.cint(i32t(), k)];
+        _ = env_call("e_arith", xs[..]);
+        return r;
+    }
     let mut xs: [4]*mut ir.Value = [r, x, y, fmt_arg(t)];
     _ = call(name, xs[..]);
     return r;
@@ -137,6 +222,11 @@ pub fn complex_call(name: []u8, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.V
                     t: *cty.CType) [2]*mut ir.Value {
     let re = temp();
     let im = temp();
+    if env_strict() {
+        let ys: [8]*mut ir.Value = [re, im, a, b, c, d, fmt_arg(t), ir.cint(ir.t_int(8), b01(u.str_eq(name, "cdiv")))];
+        _ = env_call("e_cmuldiv", ys[..]);
+        return [re, im];
+    }
     let mut xs: [7]*mut ir.Value = [re, im, a, b, c, d, fmt_arg(t)];
     _ = call(name, xs[..]);
     return [re, im];
@@ -234,7 +324,8 @@ fn sign_of(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
 }
 
 /// x op y (< > <= >= == !=), as an i1: false when unordered, but for !=.
-/// Against a constant zero, inline (sign_of); otherwise ldouble.ax's cmp.
+/// Against a constant zero, inline (sign_of), unless the function is strict
+/// (the comparison may signal); otherwise ldouble.ax's cmp.
 pub fn compare(op0: i32, x0: *mut ir.Value, y0: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     let mut op = op0;
     let mut x = x0;
@@ -254,7 +345,13 @@ pub fn compare(op0: i32, x0: *mut ir.Value, y0: *mut ir.Value, t: *cty.CType) *m
         }
     }
     let mut c = ir.vnil();
-    if zero_const(y, t) {
+    if env_strict() {
+        // (< <= > >= signal "invalid" for a NaN, == and != only for a
+        // signaling one: F.9.3)
+        let sig = (op != ct.P_EQ) and (op != ct.P_NE);
+        let ys: [4]*mut ir.Value = [x, y, fmt_arg(t), ir.cint(i32t(), b01(sig))];
+        c = env_call("e_cmp", ys[..]);
+    } else if zero_const(y, t) {
         c = sign_of(x, t);
     } else {
         let mut xs: [3]*mut ir.Value = [x, y, fmt_arg(t)];
@@ -295,7 +392,11 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
         // (between the x87's format and binary128: _Float64x, _Float128 and long double)
         let r = temp();
         let mut xs: [4]*mut ir.Value = [r, v, fmt_arg(f), fmt_arg(t)];
-        _ = call("convert", xs[..]);
+        if env_strict() {
+            _ = env_call("e_convert", xs[..]);
+        } else {
+            _ = call("convert", xs[..]);
+        }
         return r;
     }
     if cty.is_wide(t) {
@@ -315,7 +416,14 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
             _ = call(u.pick(sg, "from_i64", "from_u64"), xs[..]);
             return r;
         }
-        // float or double: exact
+        // float or double: exact ("invalid" for a signaling NaN)
+        if env_strict() {
+            let w = @int_cast(u64, v.ty.bits);
+            let ys: [4]*mut ir.Value = [r, ir.zext(cg.B, ir.bitcast(cg.B, v, ir.t_int(v.ty.bits)), i64t()),
+                                        ir.cint(i32t(), w), fmt_arg(t)];
+            _ = env_call("e_from_bin", ys[..]);
+            return r;
+        }
         if v.ty.bits == 32 {
             let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i32t()), fmt_arg(t)];
             _ = call("from_f32", xs[..]);
@@ -330,6 +438,24 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
         return ir.zext(cg.B, truth(v, f), tt);
     }
     let mut xs: [2]*mut ir.Value = [v, fmt_arg(f)];
+    if env_strict() and cty.is_integer(t) {
+        // ("invalid" out of range, "inexact" for a fraction: F.4)
+        let w = @int_cast(u64, cty.storage_bits(t));
+        let ys: [4]*mut ir.Value = [v, fmt_arg(f), ir.cint(i32t(), w), ir.cint(i32t(), b01(t.is_signed))];
+        let mut r = env_call("e_to_int", ys[..]);
+        if tt.bits < 64 {
+            r = ir.trunc(cg.B, r, tt);
+        }
+        return r;
+    }
+    if env_strict() {
+        let ys: [3]*mut ir.Value = [v, fmt_arg(f), ir.cint(i32t(), @int_cast(u64, cty.ffmt(t)))];
+        let r = env_call("e_to_bin", ys[..]);
+        if cty.ffmt(t) == 32 {
+            return ir.bitcast(cg.B, ir.trunc(cg.B, r, i32t()), tt);
+        }
+        return ir.bitcast(cg.B, r, tt);
+    }
     if cty.is_integer(t) {
         // (truncated toward zero; a value out of range is undefined,
         // 6.3.1.4p1: saturated, as for float and double)

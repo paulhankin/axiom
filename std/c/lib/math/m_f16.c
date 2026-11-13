@@ -1,25 +1,53 @@
 /* m_f16.c - <math.h>'s _Float16 functions (ISO/IEC TS 18661-3, C23 Annex
-   H: the f16 suffix), binary16: computed in float, whose result is rounded
-   to _Float16 once. That is exact for the functions whose result is a value
-   of the argument's format (fabs, floor, fmod, frexp, ...) and correctly
-   rounded for sqrt and fdim (float has more than twice binary16's
+   H: the f16 suffix), binary16. The exact ones (fabs, floor, fmod, frexp,
+   ...) are float's, whose results are values of the argument's format;
+   sqrt and fdim are float's rounded (float has more than twice binary16's
    precision and two more bits, so the double rounding is innocuous); fma
-   computes in _Float128, where the product and the sum are exact; the
-   elementary functions are float's, rounded. nextafter and its kin step
-   binary16's bits. */
+   computes in _Float128, where the product and the sum are exact. The
+   elementary functions are correctly rounded: the double function's value
+   r (within 2^-51 of the exact one) rounded once to binary16, unless both
+   ends of [r (1 - 2^-50), r (1 + 2^-50)] do not round alike (the exact
+   value may then be on either side of a rounding boundary), where the
+   _Float128 function's value (within 2^-117: math_ld.ax) is rounded
+   instead; checked against an arbitrary-precision reference for every
+   binary16 argument of the one-argument functions. nextafter and its kin
+   step binary16's bits. */
 #if __STDC_VERSION__ >= 199901L
 #define __STDC_WANT_IEC_60559_TYPES_EXT__ 1
 #include <math.h>
+
+/* r rounds to binary16 alike at both ends of its error interval */
+static int sure(double r)
+{
+    return (_Float16)(r * (1.0 - 0x1p-50)) == (_Float16)(r * (1.0 + 0x1p-50)) || r != r;
+}
 
 #define H1(name) \
     _Float16 name##f16(_Float16 x) { return (_Float16)name##f((float)x); }
 #define H2(name) \
     _Float16 name##f16(_Float16 x, _Float16 y) { return (_Float16)name##f((float)x, (float)y); }
-H1(acos) H1(asin) H1(atan) H1(cos) H1(sin) H1(tan) H1(acosh) H1(asinh) H1(atanh) H1(cosh) H1(sinh) H1(tanh)
-H1(exp) H1(exp2) H1(exp10) H1(expm1) H1(log) H1(log10) H1(log1p) H1(log2) H1(logb) H1(cbrt) H1(sqrt)
-H1(erf) H1(erfc) H1(lgamma) H1(tgamma) H1(ceil) H1(floor) H1(nearbyint) H1(rint) H1(round) H1(roundeven)
-H1(trunc) H1(fabs)
-H2(atan2) H2(pow) H2(hypot) H2(fmod) H2(remainder) H2(copysign) H2(fdim) H2(fmax) H2(fmin) H2(fmaximum)
+#define E1(name) \
+    _Float16 name##f16(_Float16 x) \
+    { \
+        double r = name((double)x); \
+        if (sure(r)) \
+            return (_Float16)r; \
+        return (_Float16)name##f128((_Float128)x); \
+    }
+#define E2(name) \
+    _Float16 name##f16(_Float16 x, _Float16 y) \
+    { \
+        double r = name((double)x, (double)y); \
+        if (sure(r)) \
+            return (_Float16)r; \
+        return (_Float16)name##f128((_Float128)x, (_Float128)y); \
+    }
+E1(acos) E1(asin) E1(atan) E1(cos) E1(sin) E1(tan) E1(acosh) E1(asinh) E1(atanh) E1(cosh) E1(sinh) E1(tanh)
+E1(exp) E1(exp2) E1(exp10) E1(expm1) E1(log) E1(log10) E1(log1p) E1(log2) E1(cbrt) E1(erf) E1(erfc) E1(lgamma)
+E1(tgamma)
+E2(atan2) E2(pow) E2(hypot)
+H1(logb) H1(sqrt) H1(ceil) H1(floor) H1(nearbyint) H1(rint) H1(round) H1(roundeven) H1(trunc) H1(fabs)
+H2(fmod) H2(remainder) H2(copysign) H2(fdim) H2(fmax) H2(fmin) H2(fmaximum)
 H2(fminimum) H2(fmaximum_mag) H2(fminimum_mag) H2(fmaximum_num) H2(fminimum_num) H2(fmaximum_mag_num)
 H2(fminimum_mag_num)
 

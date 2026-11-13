@@ -106,6 +106,11 @@
 #define LDBL_IS_IEC_60559 1
 #define INFINITY __builtin_inff()
 #define NAN __builtin_nanf("")
+/* (signaling NaNs, C23 5.2.4.2.2, F.2.1: constants that stay signaling in
+   objects initialized with them, with a unary + or - too) */
+#define FLT_SNAN __builtin_axiom_snan(0.0F)
+#define DBL_SNAN __builtin_axiom_snan(0.0)
+#define LDBL_SNAN __builtin_axiom_snan(0.0L)
 #endif
 
 #ifdef __STDC_IEC_60559_DFP__
@@ -233,6 +238,12 @@
 #define FLT64X_MAX_EXP 16384
 #define FLT64X_MAX_10_EXP 4932
 #define FLT64X_NORM_MAX FLT64X_MAX
+#define FLT16_SNAN __builtin_axiom_snan(0.0F16)
+#define FLT32_SNAN __builtin_axiom_snan(0.0F32)
+#define FLT64_SNAN __builtin_axiom_snan(0.0F64)
+#define FLT128_SNAN __builtin_axiom_snan(0.0F128)
+#define FLT32X_SNAN __builtin_axiom_snan(0.0F32x)
+#define FLT64X_SNAN __builtin_axiom_snan(0.0F64x)
 #endif
 
 #endif

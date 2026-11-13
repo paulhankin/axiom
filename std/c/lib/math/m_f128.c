@@ -4,8 +4,7 @@
    (computed on binary128's bits, with its arithmetic in software:
    std/c/rt/ldouble.ax); the elementary ones std/c/rt/math_ld.ax's kernels
    in binary128 (format 0), as the long double functions of a binary128
-   long double are (m_ldouble.c); erff128, erfcf128, lgammaf128 and
-   tgammaf128 compute in double. */
+   long double are (m_ldouble.c). */
 #if __STDC_VERSION__ >= 199901L
 #define __STDC_WANT_IEC_60559_TYPES_EXT__ 1
 #define LDT _Float128
@@ -63,15 +62,19 @@ _Float128 fmaf128(_Float128 x, _Float128 y, _Float128 z)
     __axc_ld_fma(0, &r, &x, &y, &z);
     return r;
 }
-/* (in double) */
-double erf(double);
-_Float128 erff128(_Float128 x) { return (_Float128)erf((double)x); }
-double erfc(double);
-_Float128 erfcf128(_Float128 x) { return (_Float128)erfc((double)x); }
-double lgamma(double);
-_Float128 lgammaf128(_Float128 x) { return (_Float128)lgamma((double)x); }
-double tgamma(double);
-_Float128 tgammaf128(_Float128 x) { return (_Float128)tgamma((double)x); }
+/* (math_ld.ax's, in binary128's precision) */
+void __axc_ld_sf(unsigned long long op, unsigned long long f, _Float128 *r, const _Float128 *x);
+#define QSF(name, op) \
+    _Float128 name(_Float128 x) \
+    { \
+        _Float128 r; \
+        __axc_ld_sf(op, 0, &r, &x); \
+        return r; \
+    }
+QSF(erff128, 0)
+QSF(erfcf128, 1)
+QSF(lgammaf128, 2)
+QSF(tgammaf128, 3)
 #else
 typedef int __axc_f128_c89;
 #endif

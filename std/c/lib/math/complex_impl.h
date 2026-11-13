@@ -19,6 +19,56 @@
    K_ATANH_BIG (where 1/z is catanh's), and pi/4, pi/2, 3pi/4, pi and ln 2
    (K_PIO4, K_PIO2, K_3PIO4, K_PI, K_LN2). */
 
+/* Pairs of T (h + l, |l| <= ulp(h)/2: twice T's precision) for the steps
+   where the roundings of T would add up (Dekker's and Knuth's error-free
+   transformations: T. J. Dekker, "A floating-point technique for extending
+   the available precision", Numer. Math. 18, 1971; the products' errors
+   from fma). */
+typedef struct {
+    T h, l;
+} DT;
+
+static DT dt(T h, T l)
+{
+    DT r;
+    r.h = h;
+    r.l = l;
+    return r;
+}
+
+static DT dt_sum(T a, T b)
+{
+    T s = a + b, bb = s - a;
+    return dt(s, (a - (s - bb)) + (b - bb));
+}
+
+static DT dt_prod(T a, T b)
+{
+    T p = a * b;
+    return dt(p, M(fma)(a, b, -p));
+}
+
+static DT dt_add(DT a, DT b)
+{
+    DT s = dt_sum(a.h, b.h);
+    T l = s.l + (a.l + b.l);
+    return dt_sum(s.h, l);
+}
+
+static DT dt_mul(DT a, DT b)
+{
+    DT p = dt_prod(a.h, b.h);
+    T l = p.l + (a.h * b.l + a.l * b.h);
+    return dt_sum(p.h, l);
+}
+
+static DT dt_div(DT a, DT b)
+{
+    T q = a.h / b.h;
+    DT r = dt_add(a, dt_mul(b, dt(-q, 0.0)));
+    return dt_sum(q, (r.h + r.l) / b.h);
+}
+
 /* a quiet NaN made by an invalid operation (raising "invalid") */
 static T invalid(void)
 {
@@ -143,10 +193,26 @@ CT FN(csqrt)(CT z)
         ay *= K_UP;
         sc = K_DOWN_HALF;
     }
-    t = M(sqrt)(0.5 * (ax + M(hypot)(ax, ay)));
-    if (x >= 0.0)
-        return C(t * sc, M(copysign)((ay / (2.0 * t)) * sc, y));
-    return C((ay / (2.0 * t)) * sc, M(copysign)(t * sc, y));
+    {
+        /* t = sqrt((ax + |z|) / 2) with the sum exact and one Newton step
+           in pairs of T, then ay / 2t (each part about one rounding from
+           hypot's) */
+        DT h = dt_sum(ax, M(hypot)(ax, ay)), q;
+        T t0;
+        h.h *= 0.5;
+        h.l *= 0.5;
+        t0 = M(sqrt)(h.h);
+        q = dt_add(h, dt_prod(-t0, t0));
+        {
+            DT tt = dt_sum(t0, (q.h + q.l) / (2.0 * t0));
+            DT v = dt_div(dt(ay, 0.0), dt(2.0 * tt.h, 2.0 * tt.l));
+            T re = tt.h + tt.l, im = v.h + v.l;
+            (void)t;
+            if (x >= 0.0)
+                return C(re * sc, M(copysign)(im * sc, y));
+            return C(im * sc, M(copysign)(re * sc, y));
+        }
+    }
 }
 
 /* z^w = e^(w log z) (G.6.4.1 leaves the special cases to cexp and clog) */
@@ -241,15 +307,25 @@ CT FN(ctanh)(CT z)
     if (M(fabs)(x) > K_TANH_BIG) {
         /* tanh x is 1 to T precision; the imaginary part 4 sin y cos y
            e^(-2|x|), which may underflow */
-        T e = M(exp)(-M(fabs)(x));
-        return C(M(copysign)(1.0, x), 4.0 * M(sin)(y) * M(cos)(y) * e * e);
+        /* (2 sin(2y) e^(-2|x|): one exponential, one sine) */
+        T sy = M(fabs)(y) < K_MAX / 4 ? 2.0 * M(sin)(2.0 * y) : 4.0 * M(sin)(y) * M(cos)(y);
+        return C(M(copysign)(1.0, x), sy * M(exp)(-2.0 * M(fabs)(x)));
     }
+    /* Kahan's: t = tan y, b = 1 + t^2, s = sinh x, r = cosh x,
+       tanh z = (b r s + i t) / (1 + b s^2), b and 1 + b s^2 in pairs of T
+       (each part's error then mostly that of tan, sinh and cosh) */
     t = M(tan)(y);
-    b = 1.0 + t * t;
     s = M(sinh)(x);
-    r = M(sqrt)(1.0 + s * s);
-    d = 1.0 + b * s * s;
-    return C((b * r * s) / d, t / d);
+    r = M(cosh)(x);
+    {
+        DT bb = dt_add(dt_prod(t, t), dt(1.0, 0.0));
+        DT dd = dt_add(dt_mul(bb, dt_prod(s, s)), dt(1.0, 0.0));
+        DT re = dt_div(dt_mul(dt_mul(bb, dt(r, 0.0)), dt(s, 0.0)), dd);
+        DT im = dt_div(dt(t, 0.0), dd);
+        (void)b;
+        (void)d;
+        return C(re.h + re.l, im.h + im.l);
+    }
 }
 
 /* sin z = -i sinh(iz), cos z = cosh(iz), tan z = -i tanh(iz) (G.6.5) */
@@ -306,7 +382,12 @@ CT FN(casin)(CT z)
         return C(M(asin)(x), y);
     s1 = FN(csqrt)(C(1.0 - x, -y));
     s2 = FN(csqrt)(C(1.0 + x, y));
-    return C(M(atan2)(x, RE(s1) * RE(s2) - IM(s1) * IM(s2)), M(asinh)(RE(s1) * IM(s2) - IM(s1) * RE(s2)));
+    {
+        /* (the products' differences, which may cancel, in pairs of T) */
+        DT a = dt_add(dt_prod(RE(s1), RE(s2)), dt_prod(-IM(s1), IM(s2)));
+        DT b = dt_add(dt_prod(RE(s1), IM(s2)), dt_prod(-IM(s1), RE(s2)));
+        return C(M(atan2)(x, a.h + a.l), M(asinh)(b.h + b.l));
+    }
 }
 
 CT FN(cacos)(CT z)
@@ -340,7 +421,10 @@ CT FN(cacos)(CT z)
         return C(M(acos)(x), -y);
     s1 = FN(csqrt)(C(1.0 - x, -y));
     s2 = FN(csqrt)(C(1.0 + x, y));
-    return C(2.0 * M(atan2)(RE(s1), RE(s2)), M(asinh)(RE(s2) * IM(s1) - IM(s2) * RE(s1)));
+    {
+        DT b = dt_add(dt_prod(RE(s2), IM(s1)), dt_prod(-IM(s2), RE(s1)));
+        return C(2.0 * M(atan2)(RE(s1), RE(s2)), M(asinh)(b.h + b.l));
+    }
 }
 
 /* asinh z = -i asin(iz), acosh z = +-i acos z (G.6.2.1-2) */
@@ -386,8 +470,15 @@ CT FN(catanh)(CT z)
     }
     if (y == 0.0 && ax < 1.0)
         return C(M(atanh)(x), y);
-    re = 0.25 * M(log1p)(4.0 * ax / ((1.0 - ax) * (1.0 - ax) + ay * ay));
-    im = 0.5 * M(atan2)(2.0 * ay, (1.0 - ax) * (1.0 + ax) - ay * ay);
+    {
+        /* (1 - ax)^2 + ay^2 and (1 - ax)(1 + ax) - ay^2 in pairs of T */
+        DT m = dt_sum(1.0, -ax), p = dt_sum(1.0, ax), y2 = dt_prod(ay, ay);
+        DT den = dt_add(dt_mul(m, m), y2);
+        DT q = dt_div(dt(4.0 * ax, 0.0), den);
+        DT b = dt_add(dt_mul(m, p), dt(-y2.h, -y2.l));
+        re = 0.25 * M(log1p)(q.h + q.l);
+        im = 0.5 * M(atan2)(2.0 * ay, b.h + b.l);
+    }
     return C(M(copysign)(re, x), M(copysign)(im, y));
 }
 

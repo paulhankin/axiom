@@ -76,6 +76,8 @@ def decode(lo, hi, fmt):
 
 
 def rnd(rng, kind):
+    if kind[0] == 'i':
+        return mp.mpf(rng.randint(kind[1], kind[2]))
     if kind[0] == 'u':
         _, a, b = kind
         return mp.mpf(a) + (mp.mpf(b) - mp.mpf(a)) * mp.mpf(rng.getrandbits(160)) / mp.mpf(2) ** 160
@@ -124,6 +126,32 @@ FUNCS = [
                                            (('u', 1, 2), ('u', 1, 2), ('u', -4, -1))],
      [(1, 1, two(-200)), (two(8000), two(8000), -two(16000)), (two(-8000), two(-8400), two(-16300)),
       ('1.00000000000000000001', '0.99999999999999999999', -1)]),
+    # the error and gamma functions
+    ('erfl', 1, mp.erf, [('u', -6, 6), ('l', -80, 3, 1), ('u', 1.5, 4.5)], [1e-30, 1.999, 2, 3.99, 4, 9.5, -9.5, 12]),
+    ('erfcl', 1, mp.erfc, [('u', -6, 6), ('u', 2, 106), ('l', -80, 6, 1)], [106.5, 27, -3, 1e-25, 2, 1.9999]),
+    ('lgammal', 1, lambda x: mp.log(abs(mp.gamma(x))), [('u', -30, 30), ('l', -60, 13, 0), ('u', 0.4, 2.6), ('u', -34, -2)],
+     [1, 2, 3, 0.5, -2.5, 1e-30, two(-16440), '1e4000', '-2.457024738220800623039454147651179543236597909',
+      '-2.7476826467274126013914884826914996958616393951', '-5.0082181' , '-3.9552942848585979'] ),
+    ('tgammal', 1, mp.gamma, [('u', -30, 30), ('u', 0, 1750), ('l', -60, 0, 1), ('u', -1700, -2)],
+     [0.5, 1, 2, 3, 1755.4, 170.5, -2.5, 1e-30, -1e-30, '1e-4000']),
+    # C23's (math_ld.ax's __axc_ld23)
+    ('exp2m1l', 1, lambda x: mp.expm1(x * mp.log(2)), [('u', -20, 20), ('l', -80, -1, 1)], [16383.5, -16494, 1e-30, 1]),
+    ('exp10m1l', 1, lambda x: mp.expm1(x * mp.log(10)), [('u', -10, 10), ('l', -80, -1, 1)], [4932, 1e-30, -1]),
+    ('log2p1l', 1, lambda x: mp.log1p(x) / mp.log(2), [('l', -70, 60, 0), ('u', -0.99, 2)], [1, 1e-30, '-0.9999999999999999999']),
+    ('log10p1l', 1, lambda x: mp.log1p(x) / mp.log(10), [('l', -70, 60, 0), ('u', -0.99, 2)], [9, 1e-30]),
+    ('rsqrtl', 1, lambda x: 1 / mp.sqrt(x), [('l', -16000, 16000, 0)], [4, 2, two(-16440)]),
+    ('sinpil', 1, lambda x: ('-0' if x < 0 else 0) if x == mp.floor(x) else mp.sinpi(x), [('u', -10, 10), ('l', -40, 120, 1)], [0.5, 1e-30, 0.25, 1e30, '1.5']),
+    ('cospil', 1, mp.cospi, [('u', -10, 10), ('l', -40, 120, 1)], [0.5, 1e-30, 0.25, 1e30, '1.5']),
+    ('tanpil', 1, lambda x: (('-0' if (x < 0) == (int(x) % 2 == 0) else 0) if x == mp.floor(x)
+                             else mp.sinpi(x) / mp.cospi(x)), [('u', -10, 10), ('l', -40, 0, 1)], [0.25, 1e-30, '0.4999999999999999999']),
+    ('asinpil', 1, lambda x: mp.asin(x) / mp.pi, [('u', -1, 1), ('l', -60, 0, 1)], [1, 0.5, 1e-30]),
+    ('acospil', 1, lambda x: mp.acos(x) / mp.pi, [('u', -1, 1), ('l', -60, 0, 1)], [-1, 0.5, 1e-30]),
+    ('atanpil', 1, lambda x: mp.atan(x) / mp.pi, [('l', -40, 40, 1), ('u', -3, 3)], [1, '1e4000', 1e-30]),
+    ('atan2pil', 2, lambda y, x: mp.atan2(y, x) / mp.pi, [(('l', -40, 40, 1), ('l', -40, 40, 1))], [(1, -1), (1, 1), (-1e-30, 1)]),
+    ('rootnl', 2, lambda x, n: mp.sign(x) * abs(x) ** (1 / n) if (n % 2 or x >= 0) else mp.mpc(0, 1),
+     [(('l', -1000, 1000, 1), ('i', -9, 9)), (('l', -16000, 16000, 0), ('i', 2, 40))], [(27, 3), (-32, 5), (2, 2), (16, -4)]),
+    ('compoundnl', 2, lambda x, n: (1 + x) ** n, [(('u', -0.9, 3), ('i', -50, 50)), (('l', -60, -1, 1), ('i', 1, 1000))],
+     [(1, 10), (1e-30, 3), (-0.5, -3)]),
 ]
 
 
@@ -159,7 +187,12 @@ def gen(fmt):
             ws = []
             for x in xs:
                 ws += list(encode(x, fmt))
-            ws += list(encode(ref, fmt))
+            if isinstance(ref, str):
+                # (a negative zero: C23 F.10's sinpi(-n), tanpi(-2n))
+                lo, hi = encode(mp.mpf(0), fmt)
+                ws += [lo, hi | ((1 << 15) if fmt == 'x' else (1 << 63))]
+            else:
+                ws += list(encode(ref, fmt))
             out.append(ws)
         rows[name] = out
     return rows
@@ -170,7 +203,7 @@ def main():
     L = ['/* The wide long double functions\' values (std/c/rt/math_ld.ax), against',
          '   correctly rounded results (written by',
          '   cmd/axiom/internal/tests/tools/gen_ld_math_tests.py; do not edit). */',
-         '/* flags: --c-std=c11 */',
+         '/* flags: --c-std=c23 */',
          '#include "print.h"',
          '#include <float.h>',
          '#include <math.h>',

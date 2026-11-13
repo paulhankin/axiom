@@ -711,23 +711,38 @@ fn exp_base(x0: d.Dec, base: i32, m1: bool, f: u32) R {
         }
         return rv(huge(false, f));
     }
-    if (base == 10) and not m1 and (x0.q >= 0) {
-        // 10^n of an integer n: exact
+    let mut odd = false;
+    let integral = (a <= 5) and is_int(x0, &mut odd);
+    if (base == 10) and integral {
+        // 10^n (and 10^n - 1) of an integer n: exact if it fits (preferred
+        // exponent 0)
         let n = nearest_int(&x);
         let mut r = fint(1);
         r.e = @int_cast(i32, n);
-        return rexact(r, 0);
+        if not m1 {
+            return rexact(r, 0);
+        }
+        if (n >= 0) and (n <= @as(i64, d.prec(f))) {
+            return rexact(sub(r, fint(1), 200), 0);
+        }
     }
-    if (base == 2) and not m1 and (x0.q >= 0) and (a <= 3) {
-        // 2^n of an integer n: exact when it has few enough digits (else rounded)
+    if (base == 2) and integral and (a <= 3) {
+        // 2^n (and 2^n - 1) of an integer n: exact when it has few enough
+        // digits (else rounded): 2^-k = 5^k 10^-k
         let n = nearest_int(&x);
-        if (n >= 0) and (n < 400) {
+        if (n > -400) and (n < 400) {
             let mut r = fint(1);
-            for i in 0..n {
+            for i in 0..@abs(n) {
                 _ = i;
-                r = muli(r, 2, 200);
+                r = muli(r, u_pick(n < 0, 5, 2), 400);
             }
-            if ndig(&r) <= 150 {
+            if n < 0 {
+                r.e = @int_cast(i32, n);
+            }
+            if m1 {
+                r = sub(r, fint(1), 400);
+            }
+            if ndig(&r) <= d.prec(f) {
                 return rexact(r, 0);
             }
         }
@@ -1198,6 +1213,14 @@ fn pow_fn(xd: d.Dec, yd: d.Dec, pow_r: bool, f: u32, c: *mut d.Ctx) R {
         }
         ve = fdec(yd);
     }
+    if (cmp(&fdec(yd), &divi(fint(1), 2, 4)) == 0) and not xd.neg {
+        // x^(1/2): exact for a perfect square, preferred exponent floor(Q(x) / 2)
+        let mut ex = false;
+        let r = sqrt_exact(fdec(xd), d.prec(f), &mut ex);
+        if ex {
+            return rexact(r, floor_div(xd.q, 2));
+        }
+    }
     return pow_general(fdec(xd), fdec(yd), neg_res, f);
 }
 
@@ -1423,6 +1446,14 @@ fn pow_family(op: u64, f: u32, xd: d.Dec, yd: d.Dec, n: i64, c: *mut d.Ctx) R {
     }
     if iszero(&x) {
         return rexact(fint(1), 0);
+    }
+    {
+        // an exact power (1 + x)^n (n > 0), preferred exponent floor(n min(0, Q(x)))
+        let one_x = add(fint(1), x, 400);
+        let mut pw = fzero();
+        if (n > 0) and (n < 1000) and pow_exact(one_x, n, d.prec(f), &mut pw) {
+            return rexact(pw, @int_cast(i32, @max(-100000, n * @as(i64, @min(0, xd.q)))));
+        }
     }
     // e^(n log1p(x)), the logarithm with the digits n's size needs
     let a = adj(&x);
@@ -1775,6 +1806,9 @@ fn trig_pi(xd: d.Dec, which: u64, f: u32, c: *mut d.Ctx) R {
         z.neg = sneg != (cneg and (which == T_TANPI));
         return rexact(z, 0);
     }
+    if (which == T_TANPI) and (cmp(&fr, &divi(one, 4, 4)) == 0) {
+        return rexact(fint(u_pick(sneg != cneg, -1, 1)), 0);  // (tan(pi/4) = 1)
+    }
     if swapped {
         // y = 1/2: sin = +-1, cos = 0, tan a pole
         if which == T_SINPI {
@@ -1955,6 +1989,13 @@ fn atrig(op: u64, xd: d.Dec, yd: d.Dec, f: u32, c: *mut d.Ctx) R {
             }
         } else if d.is_zero(xx) {
             quarters = 2;
+        } else if by_pi {
+            // |y| = |x|: 1/4 or 3/4 (exact; preferred exponent 0)
+            let ay = fdec(yy);
+            let ax = fdec(xx);
+            if cmp_abs(&ay, &ax) == 0 {
+                quarters = u_pick(xx.neg, 3, 1);
+            }
         }
         if quarters != 99 {
             // quarters/4 of pi (or of 1 for atan2pi), the sign of y
@@ -1989,6 +2030,11 @@ fn atrig(op: u64, xd: d.Dec, yd: d.Dec, f: u32, c: *mut d.Ctx) R {
         }
         if d.is_zero(xd) {
             return rw(d.repack(xd, f));
+        }
+        if (op == A_ATANPI) and (cmp_abs(&fdec(xd), &fint(1)) == 0) {
+            let mut q = divi(fint(1), 4, 4);  // (atanpi(+-1) = +-1/4)
+            q.neg = xd.neg;
+            return rexact(q, 0);
         }
         let mut v = atan(fdec(xd), wp);
         if op == A_ATANPI {
@@ -2039,6 +2085,9 @@ fn atrig(op: u64, xd: d.Dec, yd: d.Dec, f: u32, c: *mut d.Ctx) R {
             return rexact(fint(1), 0);
         }
         return rv(pi(wp));
+    }
+    if by_pi and d.is_zero(xd) {
+        return rexact(divi(one, 2, 4), 0);  // (acospi(+-0) = 1/2)
     }
     let num = sub(one, x, 400);
     let den = add(one, x, 400);

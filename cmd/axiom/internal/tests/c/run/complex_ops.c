@@ -141,7 +141,7 @@ int main(void) {
     /* creal, cimag, conj and I */
     print_f64(cimag(I));
     print_f64(creal(I));
-    print_i64(_Generic(I, float complex: 1, default: 0));
+    print_i64(_Generic(_Complex_I, float complex: 1, default: 0)); /* (I is _Imaginary_I with Annex G) */
     pc(conj(a));
     print_f64(crealf(conjf(f)) + cimagf(conjf(f)));
     print_f64(creall(conjl(l)) - cimagl(conjl(l)));

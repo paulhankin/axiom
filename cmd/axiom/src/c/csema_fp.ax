@@ -43,6 +43,7 @@
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "cconst.ax" as cc;
 import "cdec.ax" as cdec;
 import "csema.ax" as cs;
 import "csema_expr.ax" as cx;
@@ -72,6 +73,7 @@ pub const BI_ISUNORDERED: i32 = 415;
 pub const BI_FENV_KIND: i32 = 420;
 pub const BI_FENV_GET: i32 = 421;
 pub const BI_FENV_SET: i32 = 422;
+pub const BI_SNAN: i32 = 423;  // __builtin_axiom_snan(x): a signaling NaN of x's (floating) type, a constant
 pub const BI_TG: i32 = 430;
 pub const BI_DEC: i32 = 440;
 
@@ -82,11 +84,11 @@ pub const FP_ZERO: u64 = 2;
 pub const FP_SUBNORMAL: u64 = 3;
 pub const FP_NORMAL: u64 = 4;
 
-let names: [21][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
+let names: [22][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
                        "issignaling", "iscanonical", "isgreater", "isgreaterequal", "isless", "islessequal",
-                       "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "tg", "dec"];
-let ids: [21]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422, 430,
-                    440];
+                       "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "snan", "tg", "dec"];
+let ids: [22]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422, 423,
+                    430, 440];
 
 /// The BI_ number of __builtin_axiom_<rest>, or 0.
 pub fn builtin_id(rest: []u8) i32 {
@@ -319,7 +321,38 @@ fn dec_call(e: *mut cast.Expr) bool {
     return true;
 }
 
+/// The bits of a signaling NaN (quiet bit clear, the next one set) of each
+/// format: as a double (float's widened as conversions keep a NaN's bits:
+/// ir.f32_bits), binary16's, and the wide formats'.
+pub const SNAN_F64: u64 = 0x7FF4_0000_0000_0000;
+
 fn fenv_call(e: *mut cast.Expr, id: i32) bool {
+    if id == BI_SNAN {
+        // (<float.h>'s FLT_SNAN ...: C23 5.2.4.2.2, F.2.1)
+        if not arity(e, 1, 1) {
+            return bad(e);
+        }
+        let x = cx.rv(e.args.get(0));
+        if is_err(x) {
+            return bad(e);
+        }
+        if not cty.is_real_floating(x.ty) or cty.is_decimal(x.ty) {
+            cs.err(x.span, "C3082", u.f1("the operand of __builtin_axiom_snan has type %s, not a binary floating type",
+                                         cs.tq(x.ty)));
+            return bad(e);
+        }
+        e.ty = cty.unqual(x.ty);
+        e.is_const = true;
+        e.fcval = @bit_cast(f64, SNAN_F64);
+        if cty.is_wide(e.ty) {
+            if cc.fmt_t(e.ty) == ld.FMT_X {
+                e.xv = ld.W.{ lo: 0xA000_0000_0000_0000, hi: 0x7FFF };
+            } else {
+                e.xv = ld.W.{ lo: 0, hi: 0x7FFF_4000_0000_0000 };
+            }
+        }
+        return true;
+    }
     if id == BI_FENV_KIND {
         if not arity(e, 0, 0) {
             return bad(e);
@@ -416,7 +449,8 @@ fn tg_decimal(e: *mut cast.Expr, drank0: i32, ints: bool, bin: bool) bool {
 }
 
 // A type-generic macro's call with an argument of an interchange or
-// extended floating type (C23 H.11; real arguments): the arguments' common
+// extended floating type (C23 H.11; real or complex arguments, cplx if a
+// complex one): the arguments' common
 // real type (an integer one counted as double, 7.27p3). For binary16 and
 // binary128 (_Float16, _Float128, a _Float64x of binary128) the function is
 // the double one's name with f16 or f128 (sqrtf128 for sqrt), which <math.h>
@@ -427,7 +461,7 @@ fn tg_decimal(e: *mut cast.Expr, drank0: i32, ints: bool, bin: bool) bool {
 // the standard function is called (of that format: its result has the
 // standard type). 0: not done here (no such argument, or *rank set); 1: the
 // call is the function's; 2: an error (reported).
-fn tg_xfloat(e: *mut cast.Expr, ngv: usize, rank: *mut i32) i32 {
+fn tg_xfloat(e: *mut cast.Expr, ngv: usize, rank: *mut i32, cplx: bool) i32 {
     let mut t = u.nil.[cty.CType]();
     let mut ext = false;
     for i in @as(usize, 7)..(7 + ngv) {
@@ -435,6 +469,9 @@ fn tg_xfloat(e: *mut cast.Expr, ngv: usize, rank: *mut i32) i32 {
         let mut at = a.ty;
         if cty.is_integer(at) {
             at = cty.t_double;
+        }
+        if cty.is_complex(at) {
+            at = cty.real_of(at);  // (H.11: the complex functions of the type)
         }
         let k = at.unq.kind;
         ext = ext or ((k >= cty.TK_FLOAT16) and (k <= cty.TK_FLOAT128));
@@ -450,7 +487,10 @@ fn tg_xfloat(e: *mut cast.Expr, ngv: usize, rank: *mut i32) i32 {
     let f = cty.ffmt(t);
     let k = t.unq.kind;
     if (f == 16) or ((f == 128) and (k != cty.TK_LDOUBLE)) {
-        let base = e.args.get(2);
+        let mut base = e.args.get(2);
+        if cplx or (base.kind != cast.ExprKind.IDENT) {
+            base = e.args.get(5);  // (the complex function: cexp, cabs for fabs)
+        }
         let mut sym = u.nil.[cast.CSym]();
         let mut name: []u8 = "";
         if base.kind == cast.ExprKind.IDENT {
@@ -537,11 +577,9 @@ fn tg_call(e: *mut cast.Expr) bool {
     if drank > 0 {
         return tg_decimal(e, drank, ints, bin);
     }
-    if not cplx {
-        let x = tg_xfloat(e, ngv, &mut rank);
-        if x != 0 {
-            return x == 2;
-        }
+    let x = tg_xfloat(e, ngv, &mut rank, cplx);
+    if x != 0 {
+        return x == 2;
     }
     // the function: slot 1 + rank (real) or 4 + rank (complex)
     let real = e.args.get(1 + @as(usize, @bit_cast(u32, rank)));

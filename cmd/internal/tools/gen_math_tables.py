@@ -699,6 +699,58 @@ with mp.workprec(800):
     # Taylor coefficients, as double-doubles
     u64_array('EXP_C', [bits(v) for n in range(20) for v in ddv(1 / mp.factorial(n))], '1/n!, n = 0 .. 19 (pairs)')
     u64_array('INV_N', [bits(v) for n in range(40) for v in ddv(mp.mpf(1) / n if n else 0)], '1/n, n = 0 .. 39 (pairs; 0 for n = 0)')
+    # the error function and the gamma functions (erfl, erfcl, lgammal, tgammal)
+    td_const('TWO_SQRTPI', 2 / mp.sqrt(mp.pi), '2 / sqrt(pi)')
+    td_const('INV_SQRTPI', 1 / mp.sqrt(mp.pi), '1 / sqrt(pi)')
+    td_const('LN_SQRT2PI', mp.log(2 * mp.pi) / 2, 'log(2 pi) / 2')
+    td_const('LNPI', mp.log(mp.pi), 'log pi')
+    td_const('EULER', mp.euler, "Euler's constant")
+    tab = []
+    for k in range(1, 31):
+        tab += [bits(v) for v in td(mp.bernoulli(2 * k) / (2 * k * (2 * k - 1)))]
+    u64_array('STIRLING_C', tab, 'B_2k / (2k (2k - 1)), k = 1 .. 30: lgamma(x) = (x - 1/2) log x - x + log(2 pi)/2 '
+              '+ sum of these / x^(2k - 1) (as triple-doubles)')
+    tab = []
+    for k in range(2, 82):
+        tab += [bits(v) for v in td((-1) ** k * (mp.zeta(k) - 1) / k)]
+    u64_array('LGAMMA2_C', tab, '(-1)^k (zeta(k) - 1) / k, k = 2 .. 81: lgamma(2 + z) = (1 - gamma) z + sum of '
+              'these z^k, |z| < 2 (as triple-doubles)')
+    td_const('ONE_MINUS_EULER', 1 - mp.euler, "1 - Euler's constant")
+    # the zeros x0 of lgamma in (-(n+1), -n), n = 2 .. 33 (two each: the one
+    # nearer -(n+1), then the one nearer -n), to about 2^-300 (two
+    # triple-doubles: x0 and what is left), with the Taylor coefficients
+    # psi^(j-1)(x0) / j!, j = 1 .. 16, of lgamma(x0 + d) (each a triple-double)
+    tab = []
+    lg = lambda v: mp.log(abs(mp.gamma(v)))
+    for n in range(2, 34):
+        mid = -n - mp.mpf(1) / 2
+        lo_pole = mp.mpf(-(n + 1))
+        hi_pole = mp.mpf(-n)
+        z = []
+        for a_, b_ in ((lo_pole, mid), (mid, hi_pole)):
+            # bisection: lg > 0 at the pole's side, < 0 at the middle
+            near = a_ if a_ == lo_pole else b_
+            lo, hi = near, mid
+            eps = mp.mpf(1) / 4
+            while lg(near + (eps if near == lo_pole else -eps)) < 0:
+                eps /= 2
+            lo = near + (eps if near == lo_pole else -eps)
+            hi = mid
+            for _ in range(340):
+                c = (lo + hi) / 2
+                if lg(c) > 0:
+                    lo = c
+                else:
+                    hi = c
+            z.append((lo + hi) / 2)
+        for x0 in z:
+            hi = td(x0)
+            row = hi + td(x0 - mp.mpf(hi[0]) - mp.mpf(hi[1]) - mp.mpf(hi[2]))
+            for j in range(1, 17):
+                row += td(mp.polygamma(j - 1, x0) / mp.factorial(j))
+            tab += [bits(v) for v in row]
+    u64_array('LGZERO', tab, 'the zeros of lgamma in (-(n+1), -n), n = 2 .. 33, two each (the one nearer -(n+1) first): '
+              'x0 (two triple-doubles), then psi^(j-1)(x0) / j!, j = 1 .. 16 (18 triple-doubles a row)')
 # 2/pi for the reduction of any binary128 (exponent up to 16383): 16896 bits
 with mp.workprec(17500):
     v = 2 / mp.pi

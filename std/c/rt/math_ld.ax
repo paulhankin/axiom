@@ -35,6 +35,7 @@ import "math_ld_tables.ax" as lt;
 
 extern "C" {
     fn __axc_math_err(e: i32, flags: u32) void;
+    fn __axc_fe_round() i32;
     fn exp(x: f64) f64;
     fn exp2(x: f64) f64;
     fn exp10(x: f64) f64;
@@ -69,6 +70,10 @@ extern "C" {
     fn tanpi(x: f64) f64;
     fn rootn(x: f64, n: i64) f64;
     fn compoundn(x: f64, n: i64) f64;
+    fn erf(x: f64) f64;
+    fn erfc(x: f64) f64;
+    fn lgamma(x: f64) f64;
+    fn tgamma(x: f64) f64;
 }
 
 // -----------------------------------------------------------------------------
@@ -1992,6 +1997,22 @@ fn lt8(a: *[8]u64, b: *[8]u64) bool {
 /// r = x y + z rounded once (fmal in a wide format).
 export fn __axc_ld_fma(f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W) void @multiversion("fma") {
     let f = @truncate(u32, f64fmt);
+    // (in the current rounding direction, F.10.10.1: fegetround's FE_ value
+    // over 0x400 is ldouble.ax's RN, RD, RU, RZ)
+    let mut c = ld.Env.{ mode: @bit_cast(u32, (__axc_fe_round() >> 10) & 3), flags: 0 };
+    fma_c(f, r, x, y, z, &mut c);
+    if c.flags != 0 {
+        let mut e: i32 = 0;
+        if (c.flags & (ld.X_OVERFLOW | ld.X_UNDERFLOW)) != 0 {
+            e = m.ERANGE;
+        } else if (c.flags & ld.X_INVALID) != 0 {
+            e = m.EDOM;
+        }
+        __axc_math_err(e, c.flags);
+    }
+}
+
+fn fma_c(f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, c: *mut ld.Env) void {
     let xv = decode(x, f);
     let yv = decode(y, f);
     let zv = decode(z, f);
@@ -1999,19 +2020,19 @@ export fn __axc_ld_fma(f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W) 
         // NaNs, infinities and zero products: the product is exact (or a
         // NaN), the sum rounds once
         let mut p = ld.W.{ lo: 0, hi: 0 };
-        ld.mul(&mut p, x, y, f);
-        ld.add(r, &p, z, f);
+        ld.arith_c(&mut p, x, y, f, 2, c);
+        ld.arith_c(r, &p, z, f, 0, c);
         return;
     }
     if zv.cls != C_FIN {
         if zv.cls == C_ZERO {
-            ld.mul(r, x, y, f);  // (x y nonzero: the sum is the product)
+            ld.arith_c(r, x, y, f, 2, c);  // (x y nonzero: the sum is the product)
             return;
         }
         // (z inf or NaN: the result is z's, or NaN)
         let mut p = ld.W.{ lo: 0, hi: 0 };
-        ld.mul(&mut p, x, y, f);
-        ld.add(r, &p, z, f);
+        ld.arith_c(&mut p, x, y, f, 2, c);
+        ld.arith_c(r, &p, z, f, 0, c);
         return;
     }
     // the product's 256 bits, P 2^(ex + ey - 254)
@@ -2078,7 +2099,12 @@ export fn __axc_ld_fma(f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W) 
     }
     let tb = msb8(&pp);
     if tb < 0 {
-        ld.from_f64(r, 0, f);  // an exact zero: +0 (to nearest)
+        // an exact zero: +0, -0 rounding downward (IEEE 754-2019 6.3)
+        if c.mode == ld.RD {
+            ld.from_f64(r, @as(u64, 1) << 63, f);
+        } else {
+            ld.from_f64(r, 0, f);
+        }
         return;
     }
     // the top 128 bits, the rest sticky
@@ -2101,35 +2127,411 @@ export fn __axc_ld_fma(f64fmt: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W) 
         k2 += 1;
     }
     let et = (tb + tmax) - 500;  // the exponent of the exact result's leading bit
-    ld.from_parts(r, neg, et, hi, lo, sticky, f);
-    let rv = decode(r, f);
-    if rv.cls == C_INF {
-        __axc_math_err(m.ERANGE, m.FE_OVERFLOW | m.FE_INEXACT);
+    ld.from_parts_c(r, neg, et, hi, lo, sticky, f, c);
+}
+
+// -----------------------------------------------------------------------------
+// The error function and the gamma functions (erfl, erfcl, lgammal, tgammal)
+//
+// erf |x| below 2 from its Taylor series (Abramowitz and Stegun 7.1.5:
+// the terms at most 2^3 times the sum there), to within 2^-156 of the sum;
+// erfc a above 2 from the continued fraction
+//   erfc a = e^(-a^2)/sqrt(pi) 1/(a + (1/2)/(a + 1/(a + (3/2)/(a + ...))))
+// (A&S 7.1.14) evaluated from its depth 1600/a^2 + 40 back (that depth is
+// within 2^-150 for every a >= 2: measured in arbitrary precision), the
+// others as 1 - erf, 2 - erfc, 1 + erf (erfc below 2 loses at most 8 bits).
+// lgamma from Stirling's series with the Bernoulli numbers (A&S 6.1.41) for
+// x >= 24 (to the term below 2^-156 of the sum: at most 30), from
+// x (x + 1) ... up to 24 below it, and from the Taylor series of lgamma(2 +
+// z), sum of (-1)^k (zeta(k) - 1)/k z^k (A&S 6.1.33), on [1.5, 2.5) and,
+// with log x and log(x + 1) taken away, below; the reflection
+// lgamma x = log pi - log|sin(pi x)| - lgamma(1 - x) for x < 0 (near the
+// zeros of lgamma on the negative axis it loses the bits of the
+// cancellation); tgamma = e^lgamma with the sign of sin(pi x) for x < 0.
+// -----------------------------------------------------------------------------
+
+const SF_ERF: u64 = 0;
+const SF_ERFC: u64 = 1;
+const SF_LGAMMA: u64 = 2;
+const SF_TGAMMA: u64 = 3;
+
+fn dsf(op: u64, x: f64) f64 {
+    if op == SF_ERF {
+        return erf(x);
+    }
+    if op == SF_ERFC {
+        return erfc(x);
+    }
+    if op == SF_LGAMMA {
+        return lgamma(x);
+    }
+    return tgamma(x);
+}
+
+/// log v of a positive normal triple-double v.
+fn tlog(v: TD) TD @multiversion("fma") {
+    let e = @bit_cast(i32, @truncate(u32, m.bits(v.h) >> 52)) - 1023;
+    return log_core(tscale(v, p2(-e)), e);
+}
+
+/// erf a, 2^-80 <= a < 2 (a triple-double): the alternating Taylor series
+/// 2/sqrt(pi) sum (-1)^n a^(2n+1) / (n! (2n+1)) (A&S 7.1.5), its terms at
+/// most 2^3 times the sum: within 2^-146, without an exponential.
+fn erf_series(a: TD) TD @multiversion("fma") {
+    let a2 = tmul(a, a);
+    let mut p = a;  // a^(2n+1) / n!, signed
+    let mut sum = a;
+    let mut n: f64 = 1.0;
+    while n < 100.0 {
+        p = tneg(tdiv(tmul(p, a2), tdd(n)));
+        let tm = tdiv(p, tdd((2.0 * n) + 1.0));
+        sum = tadd(sum, tm);
+        if @abs(tm.h) < (sum.h * 1.1479437019748901e-47) {
+            break;  // (2^-156)
+        }
+        n += 1.0;
+    }
+    return tmul(sum, td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L));
+}
+
+/// erfc a = v 2^k, 2 <= a < 107 (a triple-double).
+fn erfc_cf(a: TD) TK @multiversion("fma") {
+    let depth = @int_from_float(i32, 1600.0 / (a.h * a.h)) + 40;
+    let mut tm = tdd(0.0);
+    let mut k = depth;
+    while k > 0 {
+        tm = tdiv(tdd(@float_from_int(f64, k) * 0.5), tadd(a, tm));
+        k -= 1;
+    }
+    let ec = exp_core(tneg(tmul(a, a)));
+    let v = tmul(tdiv(ec.v, tadd(a, tm)), td(lt.INV_SQRTPI_H, lt.INV_SQRTPI_M, lt.INV_SQRTPI_L));
+    return TK.{ v: v, k: ec.k };
+}
+
+/// lgamma(2 + z), |z| <= 1/2: (1 - gamma) z + sum c_k z^k.
+fn lgamma2(z: TD) TD @multiversion("fma") {
+    if z.h == 0.0 {
+        return tdd(0.0);
+    }
+    // (terms below 2^-156 of the result from k = 81 for |z| <= 1/2; fewer
+    // for a smaller z)
+    let mut n: usize = 80;
+    let az = @abs(z.h);
+    if az < 0.0625 {
+        n = 30;
+    }
+    if az < 0.001 {
+        n = 16;
+    }
+    let mut p = tdd(0.0);
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        p = tadd(tab(lt.LGAMMA2_C[..], 3 * i), tmul(z, p));
+    }
+    // lgamma(2 + z) = z (1 - gamma + z p(z))
+    return tmul(z, tadd(td(lt.ONE_MINUS_EULER_H, lt.ONE_MINUS_EULER_M, lt.ONE_MINUS_EULER_L), tmul(z, p)));
+}
+
+/// Stirling's series for v >= 24.
+fn stirling(v: TD) TD @multiversion("fma") {
+    let lv = tlog(v);
+    let base = tadd(tsub(tmul(tsub(v, tdd(0.5)), lv), v), td(lt.LN_SQRT2PI_H, lt.LN_SQRT2PI_M, lt.LN_SQRT2PI_L));
+    let u = tdiv(tdd(1.0), v);
+    let u2 = tmul(u, u);
+    let mut p = u;
+    let mut sum = tdd(0.0);
+    for k in @as(usize, 0)..30 {
+        let term = tmul(tab(lt.STIRLING_C[..], 3 * k), p);
+        sum = tadd(sum, term);
+        if @abs(term.h) < (@abs(base.h) * 1.1479437019748901e-47) {
+            break;
+        }
+        p = tmul(p, u2);
+    }
+    return tadd(base, sum);
+}
+
+/// lgamma v for a triple-double 2^-900 < v < 2^900.
+fn lgamma_pos(v: TD) TD @multiversion("fma") {
+    if v.h >= 24.0 {
+        return stirling(v);
+    }
+    if v.h >= 2.5 {
+        // lgamma v = lgamma(v + n) - log(v (v + 1) ... (v + n - 1))
+        let mut pr = v;
+        let mut w = tadd(v, tdd(1.0));
+        while w.h < 24.0 {
+            pr = tmul(pr, w);
+            w = tadd(w, tdd(1.0));
+        }
+        return tsub(stirling(w), tlog(pr));
+    }
+    if v.h >= 1.5 {
+        return lgamma2(tadd(v, tdd(-2.0)));
+    }
+    if v.h >= 0.5 {
+        // lgamma v = lgamma(v + 1) - log v, log v = log1p(v - 1)
+        let z = tadd(v, tdd(-1.0));
+        return tsub(lgamma2(z), log1p_td(z));
+    }
+    // lgamma v = lgamma(v + 2) - log v - log1p v
+    return tsub(tsub(lgamma2(v), tlog(v)), log1p_td(v));
+}
+
+/// v - (a + b) exactly but for the rounding of the result to a
+/// triple-double: the nine parts' differences summed as an expansion
+/// (Shewchuk's Grow-Expansion: "Adaptive precision floating-point
+/// arithmetic", Discrete Comput. Geom. 18, 1997), however much they cancel.
+fn exact_diff(v: TD, a: TD, b: TD) TD {
+    let xs: [9]f64 = [v.h, -a.h, v.m, -a.m, v.l, -a.l, -b.h, -b.m, -b.l];
+    let mut e: [10]f64 = [0.0; 10];
+    let mut n: usize = 0;
+    for x in xs {
+        let mut q = x;
+        for i in 0..n {
+            let t2 = m.two_sum(q, e[i]);
+            q = t2.hi;
+            e[i] = t2.lo;
+        }
+        e[n] = q;
+        n += 1;
+    }
+    // (increasing magnitude, nonoverlapping: the top three, the rest into the third)
+    let mut rest: f64 = 0.0;
+    for i in 0..(n - 3) {
+        rest += e[i];
+    }
+    return renorm(e[n - 1], e[n - 2], e[n - 3], rest);
+}
+
+/// lgamma v near one of its zeros x0 in (-34, -2): the Taylor series
+/// sum c_j d^j, d = v - x0 (x0 to 2^-300 in two triple-doubles, so that d
+/// keeps its precision however near v is), c_j = psi^(j-1)(x0)/j!
+/// (LGZERO); |d| is then below 2^-11 of the distance to the nearest pole,
+/// so sixteen terms are within 2^-170.
+fn lgamma_near_zero(v: TD) TD @multiversion("fma") {
+    let n = @int_from_float(usize, @floor(-v.h));
+    let base = (n - 2) * 2 * 54;
+    let mut d = exact_diff(v, tab(lt.LGZERO[..], base), tab(lt.LGZERO[..], base + 3));
+    let d2 = exact_diff(v, tab(lt.LGZERO[..], base + 54), tab(lt.LGZERO[..], base + 57));
+    let mut row = base;
+    if @abs(d2.h) < @abs(d.h) {
+        d = d2;
+        row = base + 54;
+    }
+    let mut p = tdd(0.0);
+    let mut j: usize = 16;
+    while j > 0 {
+        p = tmul(tadd(p, tab(lt.LGZERO[..], row + 3 + (3 * j))), d);
+        j -= 1;
+    }
+    return p;
+}
+
+/// sin(pi |x|) (signed) for a finite non-integer x with |x| < 2^(p - 1).
+fn sinpi_abs(x: X) TD @multiversion("fma") {
+    let mut q: u32 = 0;
+    let mut rr = tdd(0.0);
+    if x.e < -2 {
+        rr = tscale(sig_td(x), p2(x.e));
+    } else {
+        let h = halves(x);
+        q = h.q;
+        rr = h.r;
+    }
+    let sc = sincos_k(tmul(rr, td(lt.PI_H, lt.PI_M, lt.PI_L)));
+    if q == 0 {
+        return sc.s;
+    }
+    if q == 1 {
+        return sc.c;
+    }
+    if q == 2 {
+        return tneg(sc.s);
+    }
+    return tneg(sc.c);
+}
+
+// Is the finite x an integer?
+fn is_int(x: X, f: u32) bool {
+    if x.e >= (ld.precision(f) - 1) {
+        return true;
+    }
+    if x.e < 0 {
+        return false;
+    }
+    // the bits below the units: of the 128 at (sh:sl), those after the first e + 1
+    let keep = @bit_cast(u32, x.e + 1);
+    if keep >= 64 {
+        return (x.sl << (keep - 64)) == 0;
+    }
+    return ((x.sh << keep) == 0) and (x.sl == 0);
+}
+
+/// erfl, erfcl, lgammal, tgammal (op: SF_) in format f: r = op(x).
+export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiversion("fma") {
+    let f = @truncate(u32, f64fmt);
+    let xv = decode(x, f);
+    if xv.cls != C_FIN {
+        via_double(r, dsf(op, to_d(x, f)), f);
         return;
     }
-    if et < -16382 {
-        // tiny: an underflow if the rounding was inexact (the bits below
-        // those a subnormal of that exponent keeps)
-        let mut p: i32 = 113;
-        if f == ld.FMT_X {
-            p = 64;
+    let tiny = xv.e < -900;
+    let huge = xv.e > 900;
+    if (op == SF_ERF) or (op == SF_ERFC) {
+        let a = tscale(sig_td(xv), p2(@max(xv.e, -900)));
+        let sg: f64 = @copysign(1.0, to_d(x, f));
+        if op == SF_ERF {
+            if xv.e < -80 {
+                // 2/sqrt(pi) x within 2^-160
+                let mut v = tmul(sig_td(xv), td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L));
+                if xv.neg {
+                    v = tneg(v);
+                }
+                td_to_ld(r, v, xv.e, f);
+                check_range(r, f);
+                return;
+            }
+            if huge or (a.h >= 12.0) {
+                put(r, renorm(sg, -sg * 1.0e-60, 0.0, 0.0), 0, f, false);  // (1 within 2^-150)
+                return;
+            }
+            let mut v = tdd(0.0);
+            if a.h < 2.0 {
+                v = erf_series(a);
+            } else {
+                let c = erfc_cf(a);
+                v = tsub(tdd(1.0), tscale(c.v, p2(c.k)));
+            }
+            if xv.neg {
+                v = tneg(v);
+            }
+            put(r, v, 0, f, false);
+            return;
         }
-        let kept = p - (-16382 - et);
-        let mut inexact = sticky;
-        for k in @as(i32, 0)..128 {
-            if k >= (128 - kept) {
-                break;
+        // erfc
+        if xv.e < -80 {
+            // 1 - 2x/sqrt(pi) within 2^-160 (and 1 - tiny for |x| below 2^-900)
+            if tiny {
+                put(r, renorm(1.0, -sg * 1.0e-300, 0.0, 0.0), 0, f, false);
+            } else {
+                put(r, tsub(tdd(1.0), tmul(val_td(xv), td(lt.TWO_SQRTPI_H, lt.TWO_SQRTPI_M, lt.TWO_SQRTPI_L))), 0, f,
+                    false);
             }
-            let mut bt = (lo >> @bit_cast(u32, k & 63)) & 1;
-            if k >= 64 {
-                bt = (hi >> @bit_cast(u32, k - 64)) & 1;
-            }
-            if bt != 0 {
-                inexact = true;
-            }
+            return;
         }
-        if inexact {
+        if xv.neg {
+            if huge or (a.h >= 12.0) {
+                put(r, renorm(2.0, -1.0e-60, 0.0, 0.0), 0, f, false);
+                return;
+            }
+            if a.h < 2.0 {
+                put(r, tadd(tdd(1.0), erf_series(a)), 0, f, false);
+            } else {
+                let c = erfc_cf(a);
+                put(r, tsub(tdd(2.0), tscale(c.v, p2(c.k))), 0, f, false);
+            }
+            return;
+        }
+        if huge or (a.h >= 107.0) {
             __axc_math_err(m.ERANGE, m.FE_UNDERFLOW | m.FE_INEXACT);
+            ld.from_f64(r, 0, f);
+            return;
         }
+        if a.h < 2.0 {
+            put(r, tsub(tdd(1.0), erf_series(a)), 0, f, false);
+            return;
+        }
+        let c = erfc_cf(a);
+        td_to_ld(r, c.v, c.k, f);
+        check_range(r, f);
+        return;
+    }
+    // lgamma and tgamma
+    let integral = is_int(xv, f);
+    if xv.neg and integral {
+        via_double(r, dsf(op, to_d(x, f)), f);  // (a pole, or a domain error)
+        return;
+    }
+    if op == SF_LGAMMA {
+        if tiny {
+            put(r, tneg(log_x(xv)), 0, f, false);  // -log|x| within 2^-890
+            return;
+        }
+        if huge {
+            // x (log x - 1) within 2^-880 (positive: the negative ones are integers)
+            td_to_ld(r, tmul(sig_td(xv), tsub(log_x(xv), tdd(1.0))), xv.e, f);
+            check_range(r, f);
+            return;
+        }
+        let v = val_td(xv);
+        if integral and ((v.h == 1.0) or (v.h == 2.0)) {
+            ld.from_f64(r, 0, f);  // lgamma 1 = lgamma 2 = +0
+            return;
+        }
+        if not xv.neg {
+            put(r, lgamma_pos(v), 0, f, false);
+            check_range(r, f);
+            return;
+        }
+        let s = sinpi_abs(xv);
+        let mut sa = s;
+        if s.h < 0.0 {
+            sa = tneg(s);
+        }
+        let mut l = tsub(tsub(td(lt.LNPI_H, lt.LNPI_M, lt.LNPI_L), tlog(sa)), lgamma_pos(tsub(tdd(1.0), v)));
+        if (@abs(l.h) < 0.000244140625) and (v.h > -34.0) and (v.h < -2.0) {
+            l = lgamma_near_zero(v);  // (|lgamma| below 2^-12: the cancellation's bits)
+        }
+        put(r, l, 0, f, false);
+        check_range(r, f);
+        return;
+    }
+    // tgamma
+    if tiny {
+        // 1/x within 2^-890
+        let mut v = tdiv(tdd(1.0), sig_td(xv));
+        if xv.neg {
+            v = tneg(v);
+        }
+        td_to_ld(r, v, -xv.e, f);
+        check_range(r, f);
+        return;
+    }
+    if huge {
+        via_double(r, dsf(op, to_d(x, f)), f);  // (an overflow)
+        return;
+    }
+    let v = val_td(xv);
+    if not xv.neg {
+        if v.h > 1800.0 {
+            via_double(r, dsf(op, to_d(x, f)), f);
+            return;
+        }
+        put_exp(r, lgamma_pos(v), f);
+        return;
+    }
+    // x < 0: pi / (sin(pi x) tgamma(1 - x)), sin(pi x) = -sin(pi |x|)
+    if v.h < -1800.0 {
+        // (below every subnormal: the sign of sin(pi x))
+        let s = sinpi_abs(xv);
+        __axc_math_err(m.ERANGE, m.FE_UNDERFLOW | m.FE_INEXACT);
+        if s.h > 0.0 {
+            ld.from_f64(r, m.bits(-0.0), f);
+        } else {
+            ld.from_f64(r, 0, f);
+        }
+        return;
+    }
+    let s = sinpi_abs(xv);
+    let mut sa = s;
+    if s.h < 0.0 {
+        sa = tneg(s);
+    }
+    let l = tsub(tsub(td(lt.LNPI_H, lt.LNPI_M, lt.LNPI_L), tlog(sa)), lgamma_pos(tsub(tdd(1.0), v)));
+    put_exp(r, l, f);
+    if s.h > 0.0 {
+        ld.negate(r, r, f);
     }
 }
