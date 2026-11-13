@@ -66,11 +66,12 @@ struct XOp {
     zero: bool,  // {z}
     bcst: u32,   // XK_MEM {1toN}: N (0 none)
     vix: bool,   // XK_MEM: the index is a vector register (VSIB)
+    bsz: u32,    // XK_MEM `SIZE BCST`: the broadcast element's size in bits (0 not written)
 }
 
 fn none_op() XOp {
     return XOp.{ kind: XK_NONE, reg: -1, bits: 0, hi8: false, star: false, base: -1, index: -1, scale: 1, seg: 0,
-                 a32: false, v: cr.konst(0), bare: false, mask: 0, zero: false, bcst: 0, vix: false };
+                 a32: false, v: cr.konst(0), bare: false, mask: 0, zero: false, bcst: 0, vix: false, bsz: 0 };
 }
 
 // -----------------------------------------------------------------------------
@@ -552,6 +553,7 @@ fn parse_intel_op(A: *mut cr.Asm, s0: []u8, is_br: bool, msize: *mut u32) XOp {
             s = cr.trim(s[e..]);
             if u.str_eq(w2, "bcst") and (op.bcst == 0) {
                 op.bcst = 1;  // (`DWORD BCST [m]`: a broadcast of the instruction's count, found by intel_insn)
+                op.bsz = sz;
             }
         }
         if s.len == 0 {
@@ -858,7 +860,12 @@ fn intel_names(m: []u8, ops: []XOp, msize: u32, bc: u32) [][]u8 {
                 total = msize * bc;
             }
             let s = suffix_bits_name(total);
-            if s.len > 0 {
+            // (vcvtph2psx and vcvtps2phx are instructions of their own,
+            // AVX512-FP16's, not F16C's with a length suffix)
+            let own = u.str_eq(m, "vcvtph2ps") or u.str_eq(m, "vcvtps2ph");
+            if own {
+                _ = s;
+            } else if s.len > 0 {
                 out.push(u.cat2(m, s));
             } else if total == 128 {
                 out.push(u.cat2(m, "x"));
@@ -1495,6 +1502,32 @@ fn intel_insn(A: *mut cr.Asm, st: *mut cr.Stmt, m0: []u8, rest: []u8, evex: bool
         }
     }
     let mut ops2 = ops[0..xs.len];
+    // (a rounding operand is the last in the Intel syntax, `vcvtusi2ss xmm1,
+    // xmm0, eax, {rn-sae}`; in the AT&T order it stands right before the
+    // first vector register)
+    for k in 0..ops2.len {
+        if (ops2[k].kind == XK_RC) and rev {
+            // (only immediates after it: `vrangess xmm0, xmm1, xmm2, {sae}, 0xc`)
+            for j in 0..k {
+                if ops2[j].kind != XK_IMM {
+                    cr.fail(A, "a rounding operand ({rn-sae} ...) must follow the last register");
+                    return;
+                }
+            }
+            let mut j: usize = k + 1;
+            while (j < ops2.len) and not is_vreg(&ops2[j]) {
+                j += 1;
+            }
+            if j < ops2.len {
+                let rc = ops2[k];
+                for i in k..j - 1 {
+                    ops2[i] = ops2[i + 1];
+                }
+                ops2[j - 1] = rc;
+            }
+            break;
+        }
+    }
     let m = intel_x87_swap(m0, ops2);
     if (u.str_eq(m, "ins") or u.str_eq(m, "outs") or u.str_eq(m, "xlat")) and (ops2.len > 0) {
         // (their operands are implicit: es:[rdi], [rsi], [rbx], dx)
@@ -1584,7 +1617,8 @@ let VPCMP_VAL: [6]i64 = [0, 1, 2, 4, 5, 6];
 fn cmp_pseudo(m: []u8, base: *mut []u8) i64 {
     if u.starts(m, "vcmp") and (m.len > 6) {
         let ty = m[m.len - 2..];
-        if u.str_eq(ty, "ps") or u.str_eq(ty, "pd") or u.str_eq(ty, "ss") or u.str_eq(ty, "sd") {
+        if u.str_eq(ty, "ps") or u.str_eq(ty, "pd") or u.str_eq(ty, "ss") or u.str_eq(ty, "sd") or u.str_eq(ty, "ph") or
+           u.str_eq(ty, "sh") {
             let p = m[4..m.len - 2];
             for k in 0..VCMP_PRED.len {
                 if u.str_eq(p, VCMP_PRED[k]) {
@@ -4182,6 +4216,7 @@ const TU_QVM: u8 = 5;
 const TU_OVM: u8 = 6;
 const TU_DUP: u8 = 7;
 const TU_N: u8 = 8;
+const TU_QV: u8 = 9;  // a quarter vector, with broadcast (AVX512-FP16 conversions)
 
 let mut g_tforms: u.List.[TForm] = u.List.[TForm].{ data: @ptr_from_int(*mut TForm, 0), len: 0, cap: 0 };
 let mut g_tnames: u.SymMap.[i32] = u.SymMap.[i32].{
@@ -4313,8 +4348,10 @@ fn build_table() void {
                 f.pp = @truncate(u8, k);
             }
         }
-        let maps = ["-", "0f", "0f38", "0f3a"];
-        for k in @as(usize, 0)..4 {
+        // (m4-m7: the EVEX and VEX maps 4 to 7: APX's promoted legacy
+        // instructions, AVX512-FP16's maps 5 and 6, and VEX map 7)
+        let maps = ["-", "0f", "0f38", "0f3a", "m4", "m5", "m6", "m7"];
+        for k in @as(usize, 0)..8 {
             if u.str_eq(fields[2], maps[k]) {
                 f.map = @truncate(u8, k);
             }
@@ -4366,6 +4403,8 @@ fn build_table() void {
                 f.tuple = TU_QVM;
             } else if u.str_eq(a, "ovm") {
                 f.tuple = TU_OVM;
+            } else if u.str_eq(a, "qv") {
+                f.tuple = TU_QV;
             } else if u.str_eq(a, "dup") {
                 f.tuple = TU_DUP;
             } else if u.str_eq(a, "m128") {
@@ -4520,9 +4559,11 @@ fn tmatch(f: *TForm, k: usize, o: *XOp, L: u32) bool {
                 want = L / 8 / f.bc;
                 if f.tuple == TU_HV {
                     want = want / 2;
+                } else if f.tuple == TU_QV {
+                    want = want / 4;
                 }
             }
-            if (f.bc == 0) or (want != o.bcst) {
+            if (f.bc == 0) or (want != o.bcst) or ((o.bsz != 0) and ((f.bc * 8) != o.bsz)) {
                 return false;
             }
             // (a broadcast is the third operand's, or the second's of two)
@@ -4566,6 +4607,15 @@ fn tmatch(f: *TForm, k: usize, o: *XOp, L: u32) bool {
     return false;
 }
 
+fn is_const_val(v: cr.Val) bool {
+    return v.ok and cr.is_const(v);
+}
+
+// Is o a vector register (xmm, ymm, zmm)?
+fn is_vreg(o: *XOp) bool {
+    return (o.kind == XK_REG) and (o.reg >= R_VEC) and (o.reg < R_K);
+}
+
 // The register number an encoding field takes (its low five bits).
 fn fnum(o: *XOp) i32 {
     if o.kind != XK_REG {
@@ -4591,16 +4641,20 @@ fn table_insn(A: *mut cr.Asm, m: []u8, ops0: []XOp, evex: bool, vex3: bool, vexp
     }
     // Intel's order, without a rounding operand
     let mut rc: i64 = -1;
-    // (the rounding operand comes first, or right after an immediate)
-    let mut nimm: usize = 0;
-    for o in ops0 {
-        if o.kind == XK_IMM {
-            nimm += 1;
-        }
-    }
+    // (the rounding operand stands right before the first vector register:
+    // first, after an immediate, or after a general register's source,
+    // `vcvtusi2ss %eax, {rn-sae}, %xmm0, %xmm1`)
     for k in 0..ops0.len {
-        if (ops0[k].kind == XK_RC) and (k != nimm) {
+        if ops0[k].kind != XK_RC {
+            continue;
+        }
+        if ((k + 1) >= ops0.len) or not is_vreg(&ops0[k + 1]) {
             return false;
+        }
+        for j in 0..k {
+            if is_vreg(&ops0[j]) {
+                return false;
+            }
         }
     }
     let ops = u.newn.[XOp](ops0.len + 1);
@@ -4763,7 +4817,18 @@ fn tencode(A: *mut cr.Asm, f: *TForm, ops: []XOp, L: u32, rc: i64, vex3: bool) v
         isz = 1;
     }
     if is4 >= 0 {
-        iv = cr.konst(@as(i64, is4) << 4);
+        // (a register in imm8[7:4]; with an immediate operand too, its low
+        // four bits are imm8[3:0]: vpermil2ps's selector)
+        let mut low: i64 = 0;
+        if isz > 0 {
+            let c = cr.settle(A, iv);
+            if not is_const_val(c) or (c.k < 0) or (c.k > 15) {
+                cr.fail(A, u.f1("'%s' takes an immediate of 0 to 15", f.name));
+                return;
+            }
+            low = c.k;
+        }
+        iv = cr.konst((@as(i64, is4) << 4) | low);
         isz = 1;
     }
     let mut W = f.w == 1;
@@ -4952,6 +5017,12 @@ fn disp_n(f: *TForm, L: u32, bcst: bool, W: bool) u32 {
         }
         return vl;
     }
+    if t == TU_QV {
+        if bcst {
+            return f.bc;
+        }
+        return vl / 4;
+    }
     if t == TU_HV {
         if bcst {
             return f.bc;
@@ -5038,6 +5109,13 @@ fn modrm_disp32(A: *mut cr.Asm, regf: i32, m: *XOp) void {
         cr.emit8(A, ((2 << 6) | rf) | rr(base));
     }
     cr.emit32(A, @bit_cast(u64, m.v.k));
+}
+
+fn pick_u32(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
 }
 
 fn pick_us(c: bool, a: usize, b: usize) usize {

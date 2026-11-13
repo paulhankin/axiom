@@ -155,6 +155,7 @@ ln('movq2dq', 'RM', 'x,mm', 'L.f3.0f.w0', 'd6', '/r')
 none('femms', 'L.np.0f.w0', '0e')
 
 exec(open(__file__.rsplit("/",1)[0] + "/gen_x64_table_vec.py").read())
+exec(open(__file__.rsplit("/",1)[0] + "/gen_x64_table_more.py").read())
 
 print('''// =============================================================================
 // asm/x64tab.ax - the table of the x86-64 assembler's instruction forms
