@@ -203,6 +203,15 @@ struct X {
 }
 
 fn decode(a: *ld.W, f: u32) X {
+    if f == ld.FMT_T {
+        // (a TArg's significand of 128 bits, or the binary128 that a TRes or a
+        // plain argument holds)
+        let ta = @ptr_cast(*TArg, a);
+        if ta.tag == TAG_ARG {
+            return X.{ cls: C_FIN, neg: ta.neg, e: ta.e, sh: ta.sh, sl: ta.sl };
+        }
+        return decode(a, ld.FMT_Q);
+    }
     if f == ld.FMT_X {
         let ef = @bit_cast(i32, @truncate(u32, a.hi & 0x7FFF));
         let neg = (a.hi & 0x8000) != 0;
@@ -429,6 +438,19 @@ fn td_to_ld(r: *mut ld.W, v: TD, k: i32, f: u32) void {
         }
     }
     // value = (hi:lo) 2^(top - 127) 2^base 2^k = (hi:lo) 2^(e - 127)
+    if f == ld.FMT_T {
+        // (the wide form: the 128 bits as they are, within 2^-127 below the
+        // value; the binary128 +-1 in w, whose sign follows the negations
+        // that come after)
+        let tr = @ptr_cast(*mut TRes, r);
+        tr.neg = neg;
+        tr.e = (top + base) + k;
+        tr.hi = hi;
+        tr.lo = lo;
+        tr.n += 1;
+        ld.from_f64(r, m.bits(1.0) | (@as(u64, neg) << 63), ld.FMT_Q);
+        return;
+    }
     ld.from_parts(r, neg, (top + base) + k, hi, lo, sticky, f);
 }
 
@@ -2742,7 +2764,8 @@ export fn __axc_ld_sf(op: u64, f64fmt: u64, r: *mut ld.W, x: *ld.W) void @multiv
 }
 
 // -----------------------------------------------------------------------------
-// The binary128 functions for the decimal functions' binary path (dfp_fast.ax)
+// The binary128 functions for the decimal functions' binary path (dfp_fast.ax),
+// and their wide form (ld.FMT_T) for _Decimal128's
 // -----------------------------------------------------------------------------
 
 /// __axc_ld1 in binary128.
@@ -2763,6 +2786,70 @@ pub fn bq23(op: u64, r: *mut ld.W, x: *ld.W, y: *ld.W) void {
 /// __axc_ld_sf in binary128.
 pub fn bqsf(op: u64, r: *mut ld.W, x: *ld.W) void {
     __axc_ld_sf(op, 0, r, x);
+}
+
+const TAG_ARG: u32 = 1;
+const TAG_RES: u32 = 2;
+
+/// An argument in the wide form (ld.FMT_T): w its binary128 value (truncated:
+/// what the functions take from it in double), (sh:sl) 2^(e - 127) its
+/// magnitude, the top bit of sh set.
+pub struct TArg {
+    w: ld.W,
+    tag: u32,
+    neg: bool,
+    e: i32,
+    sh: u64,
+    sl: u64,
+}
+
+/// A result in the wide form: the value (-1)^neg (hi:lo) 2^(e - 127) before
+/// the rounding (the top bit of hi set; within 2^-127 below the triple-double
+/// value, which is within about 2^-118 of the function's), n the number of
+/// values rounded into it (1 where a function's value came by td_to_ld; the
+/// special and exact results come otherwise, with n = 0), and in w the
+/// binary128 +-1 that the function's negations after the rounding flip.
+pub struct TRes {
+    w: ld.W,
+    tag: u32,
+    neg: bool,
+    e: i32,
+    hi: u64,
+    lo: u64,
+    n: u32,
+}
+
+/// An argument for the wide form.
+pub fn targ(neg: bool, e: i32, sh: u64, sl: u64) TArg {
+    // w: binary128's 112 fraction bits of (sh:sl), truncated
+    let ef = @as(u64, @bit_cast(u32, e + 16383)) & 0x7FFF;
+    let hi = ((sh >> 15) & 0xFFFF_FFFF_FFFF) | (ef << 48) | (@as(u64, neg) << 63);
+    return TArg.{ w: ld.W.{ lo: (sh << 49) | (sl >> 15), hi: hi }, tag: TAG_ARG, neg: neg, e: e, sh: sh, sl: sl };
+}
+
+/// An empty result for the wide form.
+pub fn tres() TRes {
+    return TRes.{ w: ld.W.{ lo: 0, hi: 0 }, tag: TAG_RES, neg: false, e: 0, hi: 0, lo: 0, n: 0 };
+}
+
+/// __axc_ld1 in the wide form (|e| of the argument below 1000).
+pub fn tq1(op: u64, r: *mut TRes, x: *TArg) void {
+    __axc_ld1(op, @as(u64, ld.FMT_T), @ptr_cast(*mut ld.W, r), @ptr_cast(*ld.W, x));
+}
+
+/// __axc_ld2 in the wide form.
+pub fn tq2(op: u64, r: *mut TRes, x: *TArg, y: *TArg) void {
+    __axc_ld2(op, @as(u64, ld.FMT_T), @ptr_cast(*mut ld.W, r), @ptr_cast(*ld.W, x), @ptr_cast(*ld.W, y));
+}
+
+/// __axc_ld23 in the wide form.
+pub fn tq23(op: u64, r: *mut TRes, x: *TArg, y: *TArg) void {
+    __axc_ld23(op, @as(u64, ld.FMT_T), @ptr_cast(*mut ld.W, r), @ptr_cast(*ld.W, x), @ptr_cast(*ld.W, y));
+}
+
+/// __axc_ld_sf in the wide form.
+pub fn tqsf(op: u64, r: *mut TRes, x: *TArg) void {
+    __axc_ld_sf(op, @as(u64, ld.FMT_T), @ptr_cast(*mut ld.W, r), @ptr_cast(*ld.W, x));
 }
 
 // -----------------------------------------------------------------------------

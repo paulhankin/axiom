@@ -908,7 +908,14 @@ results and flags these paths give bit for bit in every direction):
   results, 38 functions, both formats, the five directions: the only differences from
   the decimal computation were 270 results of tiny arguments in directed modes that it
   rounded wrong, which this path rounds correctly), and the flags are those of the
-  decimal computation. An exact result has the quantum C23 prefers (`sqrtd64(1.44dd)` is `1.2`,
+  decimal computation. `_Decimal128` (and `_Decimal64x`), whose 34 digits binary128 does
+  not hold, takes the same path in `math_ld.ax`'s wide form: the argument's significand
+  to 128 bits (within 2^-126), the functions' triple-double values before their rounding
+  (within about 2^-118, taken as 2^-117) and their top 128 bits, converted by a 256-bit
+  product with the power of ten; the test then cannot decide about once in 5 to 20
+  calls (the bound is a 2^-3 to 2^-6 of the last digit's unit), and those take the
+  decimal computation (the same results, flags and `errno` in the five directions on
+  fixed-seed arguments, 38 functions). An exact result has the quantum C23 prefers (`sqrtd64(1.44dd)` is `1.2`,
   `expd64(0)` is `1`, `powd64(2.0dd, 10)` is `1024.0000000000`, `atan2pid64(1, -1)` is
   `0.75`, `exp2d64(-3.0dd)` `0.125`, `tanpid64(0.25dd)` `1`, `powd64(2.25dd, 0.5dd)` `1.5`,
   `compoundnd64(0.1dd, 2)` `1.21`: the exact values of the `pi` functions, `exp2`,
@@ -932,8 +939,10 @@ results and flags these paths give bit for bit in every direction):
 - **Speed** (x86-64, `-O2`): an operation is a call of the software, about 100 ns for a
   `_Decimal64` multiplication, addition or division, 75 to 200 ns for `_Decimal128`'s
   (were 350 to 630); an elementary function of `_Decimal32` or `_Decimal64` about 0.5 to
-  1 us (were 40 to 140 us), of `_Decimal128` tens of microseconds (the decimal
-  computation: binary128 does not hold its 34 digits with a margin), a trigonometric one
+  1 us (were 40 to 140 us), of `_Decimal128` 2 to 15 us (`expd128` 2.3, `logd128` 4.3,
+  `sind128` 5.5, `powd128` 30; were 25 to 180: most of the time is in the calls the
+  rounding test sends to the decimal computation), `lgammad128` and `tgammad128` 0.3 to
+  0.8 ms (were 1.7), a trigonometric one
   of an argument beyond 10^17 milliseconds (the exact reduction).
 
 ### Annex H: the interchange and extended types

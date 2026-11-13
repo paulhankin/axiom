@@ -1,6 +1,7 @@
 // =============================================================================
-// std/c/rt/dfp_fast.ax - the binary path of the elementary decimal functions of
-// _Decimal32 and _Decimal64 (dfp_math.ax's __axc_dm_exp ... __axc_dm_gamma).
+// std/c/rt/dfp_fast.ax - the binary path of the elementary decimal functions
+// (dfp_math.ax's __axc_dm_exp ... __axc_dm_gamma): _Decimal32's and
+// _Decimal64's below, _Decimal128's (and _Decimal64x's) at the end.
 //
 // The decimal argument is converted to binary128 (within 2^-111: c 10^q from a
 // table of the powers of ten to 128 bits, dfp_tables.ax), the function computed
@@ -461,8 +462,36 @@ fn kappa(fam: u32, op: u64, x: f64, y: f64, v: f64) f64 {
     return k;
 }
 
-/// The decimal function (family fam, op) of x (and y) of format f (D32 or
-/// D64) by the binary path into r, its exceptions raised; false where the
+/// Whether x (and y) are in the domain and the ranges the binary path takes
+/// (so that the binary functions report no error).
+fn in_domain(fam: u32, op: u64, xv: f64, yv: f64) bool {
+    if (fam == FAM_LOG) and (((op == 1) or (op == 2) or (op == 6)) and (xv <= 0.0)) {
+        return false;
+    }
+    if (fam == FAM_LOG) and (xv <= -0.75) {
+        return false;  // (log1p and its kin near the pole: the decimal path)
+    }
+    if (fam == FAM_POW) and (op == 3) and
+       ((xv <= 0.0) or ((@abs(yv) * ((@abs(@float_from_int(f64, m.exponent(xv))) * 0.7) + 1.0)) > 1000.0)) {
+        return false;
+    }
+    if (fam == FAM_ATRIG) and (op <= 6) and (op != 3) and (op != 6) and (@abs(xv) >= 1.0) {
+        return false;
+    }
+    if (fam == FAM_HYP) and (op == 4) and (xv <= 1.0) {
+        return false;
+    }
+    if (fam == FAM_HYP) and (op == 6) and (@abs(xv) >= 1.0) {
+        return false;
+    }
+    if (fam == FAM_EXP) and (@abs(xv) > 2000.0) {
+        return false;
+    }
+    return true;
+}
+
+/// The decimal function (family fam, op) of x (and y) of format f (D32,
+/// D64, D128) by the binary path into r, its exceptions raised; false where the
 /// decimal path must compute it.
 pub fn fast(fam: u32, op: u64, f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W) bool {
     if binary_fn(fam, op).kind == 0 {
@@ -491,6 +520,9 @@ fn fast_k(fam: u32, op: u64, f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W) bool {
     if bf.kind == 0 {
         return false;
     }
+    if f == d.D128 {
+        return fast_t(fam, op, bf, r, x, y);
+    }
     let two = (bf.kind == B2) or ((bf.kind == B23) and (op == 8) and (fam == FAM_ATRIG));
     let xd = d.unpack(x.*, f);
     if (xd.cls != d.K_FIN) or d.is0(xd.c) or (xd.c.h != 0) {
@@ -516,27 +548,7 @@ fn fast_k(fam: u32, op: u64, f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W) bool {
         yv = q_d(yq);
     }
     let xv = q_d(xq);
-    // the domains (so that the binary functions report no error)
-    if (fam == FAM_LOG) and (((op == 1) or (op == 2) or (op == 6)) and (xv <= 0.0)) {
-        return false;
-    }
-    if (fam == FAM_LOG) and (xv <= -0.75) {
-        return false;  // (log1p and its kin near the pole: the decimal path)
-    }
-    if (fam == FAM_POW) and (op == 3) and
-       ((xv <= 0.0) or ((@abs(yv) * ((@abs(@float_from_int(f64, m.exponent(xv))) * 0.7) + 1.0)) > 1000.0)) {
-        return false;
-    }
-    if (fam == FAM_ATRIG) and (op <= 6) and (op != 3) and (op != 6) and (@abs(xv) >= 1.0) {
-        return false;
-    }
-    if (fam == FAM_HYP) and (op == 4) and (xv <= 1.0) {
-        return false;
-    }
-    if (fam == FAM_HYP) and (op == 6) and (@abs(xv) >= 1.0) {
-        return false;
-    }
-    if (fam == FAM_EXP) and (@abs(xv) > 2000.0) {
+    if not in_domain(fam, op, xv, yv) {
         return false;
     }
     let mut rq = ld.W.{ lo: 0, hi: 0 };
@@ -568,5 +580,210 @@ fn fast_k(fam: u32, op: u64, f: u32, r: *mut ld.W, x: *ld.W, y: *ld.W) bool {
     } else {
         r.* = ld.W.{ lo: w.lo, hi: 0 };
     }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// _Decimal128 (and _Decimal64x): the wide form
+// -----------------------------------------------------------------------------
+//
+// binary128 holds fewer digits than _Decimal128's 34, so these take the
+// functions' triple-double values before their rounding (math_ld.ax's wide
+// form, ld.FMT_T): the argument's significand to 128 bits (c 10^q from the
+// same table of the powers of ten, the 241-bit product truncated: within
+// 2^-126), the value within about 2^-118 (math_ld.ax's bound, taken here as
+// 2^-117) and its top 128 bits (2^-127), multiplied by 10^-q to 256 bits
+// (2^-127 for the table): the decimal result is the one that every value
+// within 2^-117 + 2^-125 + 2^-126 (1 + k) of it rounds to, k the bound of
+// the condition number as for the narrower formats. The test cannot decide
+// where the value is within that bound of a decimal of 34 digits or of a
+// midpoint: about once in 5 to 20 calls on arguments near 1 (the bound is
+// 2^-3 to 2^-6 of the last digit's unit; more where the condition number is
+// large, near the zeros of lgamma), and there the decimal path computes it.
+
+/// [a] [b] as four words, the low first ((ah:al) (bh:bl)).
+fn mul128(ah: u64, al: u64, bh: u64, bl: u64) [4]u64 {
+    let p0 = mul64(al, bl);
+    let p1 = mul64(al, bh);
+    let p2 = mul64(ah, bl);
+    let p3 = mul64(ah, bh);
+    // r1 = p0[0] + p1[1] + p2[1]; r2 = p1[0] + p2[0] + p3[1] + carries; r3 = p3[0] + carries
+    let s1 = p0[0] +% p1[1];
+    let c1 = @as(u64, s1 < p0[0]);
+    let r1 = s1 +% p2[1];
+    let c2 = @as(u64, r1 < s1);
+    let t1 = p1[0] +% p2[0];
+    let c3 = @as(u64, t1 < p1[0]);
+    let t2 = t1 +% p3[1];
+    let c4 = @as(u64, t2 < t1);
+    let r2 = t2 +% (c1 + c2);
+    let c5 = @as(u64, r2 < t2);
+    return [p0[1], r1, r2, p3[0] +% ((c3 + c4) + c5)];
+}
+
+/// (-1)^neg c 10^q (0 < c < 2^113, |q| <= 440) in the wide form: within
+/// 2^-126 below (the table's 2^-127 and the truncation's).
+fn to_t(neg: bool, c: d.U2, q: i32) ml.TArg {
+    let t = p10(q);
+    let mut lz: u32 = 0;
+    if c.h == 0 {
+        lz = 64 + @as(u32, @truncate(u32, @clz(c.l)));
+    } else {
+        lz = @as(u32, @truncate(u32, @clz(c.h)));
+    }
+    let n = d.shl2(c, lz);
+    let pr = mul128(n.h, n.l, t.h, t.l);
+    let mut ph = pr[3];
+    let mut pl = pr[2];
+    let mut sh: i32 = 0;
+    if (ph >> 63) == 0 {
+        ph = (ph << 1) | (pl >> 63);
+        pl = (pl << 1) | (pr[1] >> 63);
+        sh = 1;
+    }
+    // c 10^q = n M 2^(t.e - 127 - lz), n M's top bit 255 - sh
+    return ml.targ(neg, (((255 - sh) + t.e) - 127) - @bit_cast(i32, lz), ph, pl);
+}
+
+/// The _Decimal128 that every value within eps (relative) of (-1)^neg (hi:lo)
+/// 2^(e - 127) rounds to in direction mode, if there is one and it is a
+/// normal number of 34 digits and not exact; false otherwise.
+fn from_t(neg: bool, e: i32, hi: u64, lo: u64, eps: f64, mode: u32, res: *mut ld.W) bool {
+    let lo_c = d.p10u2(33);
+    let hi_c = d.p10u2(34);
+    let mut qd = @int_from_float(i32, @floor(@float_from_int(f64, e) * 0.3010299956639812)) - 33;
+    let mut nn = d.u2(0, 0);
+    let mut fr: u64 = 0;
+    let mut tries: u32 = 0;
+    loop {
+        tries += 1;
+        if (tries > 3) or (qd < -440) or (qd > 440) {
+            return false;
+        }
+        let t = p10(-qd);
+        // the value 10^-qd = P 2^(e + t.e - 254): fb fraction bits
+        let pr = mul128(hi, lo, t.h, t.l);
+        let fbi = (254 - e) - t.e;
+        if (fbi <= 64) or (fbi >= 192) {
+            return false;
+        }
+        let fb = @bit_cast(u32, fbi);
+        nn = d.u2(bits_at(&pr, fb + 64, 64), bits_at(&pr, fb, 64));
+        fr = bits_at(&pr, fb - 64, 64);
+        if not d.lt2(nn, hi_c) {
+            qd += 1;
+            continue;
+        }
+        if d.lt2(nn, lo_c) {
+            qd -= 1;
+            continue;
+        }
+        break;
+    }
+    // the bound in units of 2^-64 of the last digit (nn below 2^113.1)
+    let nf = (@float_from_int(f64, nn.h) * 1.8446744073709552e19) + @float_from_int(f64, nn.l);
+    let eu = (eps * nf) * 1.8446744073709552e19;
+    if not (eu < 4.0e18) {
+        return false;
+    }
+    let e64 = @int_from_float(u64, eu) + 2;
+    let half: u64 = 0x8000_0000_0000_0000;
+    if (fr <= e64) or (fr >= (0 -% e64)) {
+        return false;  // (near a decimal of the format: exact, or undecided)
+    }
+    if ((fr -% half) <= e64) or ((half -% fr) <= e64) {
+        return false;  // (near a midpoint)
+    }
+    let mut up = false;
+    if (mode == d.R_NEAREST) or (mode == d.R_AWAY) {
+        up = fr > half;
+    } else if mode == d.R_UP {
+        up = not neg;
+    } else if mode == d.R_DOWN {
+        up = neg;
+    }
+    if up {
+        nn = d.add2(nn, d.u2(0, 1));
+        if d.eq2(nn, hi_c) {
+            nn = lo_c;
+            qd += 1;
+        }
+    }
+    if (qd < d.qmin(d.D128)) or (qd > d.qmax(d.D128)) {
+        return false;
+    }
+    res.* = d.pack(neg, nn, qd, d.D128);
+    return true;
+}
+
+/// The double nearest (a little below) a wide-form argument, for the bounds.
+fn t_d(a: *ml.TArg) f64 {
+    return q_d(a.w);
+}
+
+/// fast_k for _Decimal128 (the format of _Decimal64x too).
+fn fast_t(fam: u32, op: u64, bf: Fn, r: *mut ld.W, x: *ld.W, y: *ld.W) bool {
+    let f = d.D128;
+    let two = (bf.kind == B2) or ((bf.kind == B23) and (op == 8) and (fam == FAM_ATRIG));
+    let xd = d.unpack(x.*, f);
+    if (xd.cls != d.K_FIN) or d.is0(xd.c) {
+        return false;
+    }
+    let xa = xd.q + d.digits2(xd.c);
+    if (xa > 300) or (xa < -300) {
+        return false;
+    }
+    let xt = to_t(xd.neg, xd.c, xd.q);
+    let mut yt = xt;
+    let mut yv: f64 = 0.0;
+    if two {
+        let yd = d.unpack(y.*, f);
+        if (yd.cls != d.K_FIN) or d.is0(yd.c) {
+            return false;
+        }
+        let ya = yd.q + d.digits2(yd.c);
+        if (ya > 300) or (ya < -300) {
+            return false;
+        }
+        yt = to_t(yd.neg, yd.c, yd.q);
+        yv = t_d(&yt);
+    }
+    let xv = t_d(&xt);
+    if not in_domain(fam, op, xv, yv) {
+        return false;
+    }
+    let mut rt = ml.tres();
+    if bf.kind == B1 {
+        ml.tq1(bf.op, &mut rt, &xt);
+    } else if bf.kind == B2 {
+        ml.tq2(bf.op, &mut rt, &xt, &yt);
+    } else if bf.kind == B23 {
+        ml.tq23(bf.op, &mut rt, &xt, &yt);
+    } else {
+        ml.tqsf(bf.op, &mut rt, &xt);
+    }
+    // one value, rounded into rt, and w still the +-1 its negations flip
+    if (rt.n != 1) or (rt.w.lo != 0) or ((rt.w.hi & 0x7FFF_FFFF_FFFF_FFFF) != 0x3FFF_0000_0000_0000) {
+        return false;
+    }
+    if (rt.e < -1000) or (rt.e > 1000) {
+        return false;
+    }
+    let neg = (rt.w.hi >> 63) != 0;
+    let mut rv = m.from_bits((@as(u64, @bit_cast(u32, rt.e + 1023)) << 52) | ((rt.hi >> 11) & 0x000F_FFFF_FFFF_FFFF));
+    if neg {
+        rv = -rv;
+    }
+    let k = kappa(fam, op, xv, yv, rv);
+    if not (k >= 0.0) or not (k < 1.0e15) {
+        return false;
+    }
+    // 2^-117 + 2^-125 + 2^-126 (1 + k)
+    let eps = (6.018531076210112e-36 + 2.350988701644575e-38) + (1.1754943508222875e-38 * (1.0 + k));
+    let mut w = ld.W.{ lo: 0, hi: 0 };
+    if not from_t(neg, rt.e, rt.hi, rt.lo, eps, env.g_round, &mut w) {
+        return false;
+    }
+    r.* = w;
     return true;
 }
