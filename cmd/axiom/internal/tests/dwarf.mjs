@@ -187,6 +187,7 @@ function formValue(r, f, asz, S, unitOff, implicit) {
     case 0x13: return unitOff + r.u32();
     case 0x18: case 0x09: { const n = r.uleb(); const b = r.d.subarray(r.p, r.p + n); r.p += n; return b; }
     case 0x0a: { const n = r.u8(); const b = r.d.subarray(r.p, r.p + n); r.p += n; return b; }
+    case 0x1e: { const b = r.d.subarray(r.p, r.p + 16); r.p += 16; return b; }  // DW_FORM_data16
     case 0x19: return true;
     case 0x21: return implicit;
     default: throw new Error(`form 0x${f.toString(16)}`);
@@ -224,7 +225,8 @@ export function readInfo(S) {
   return units;
 }
 
-// The sequences of .debug_line's programs: [{ rows: [{ addr, file, line, end, pe }], files: [names] }]
+// The sequences of .debug_line's programs: [{ rows: [{ addr, file, line, end, pe }], files: [names], sums:
+// [MD5 checksums, or null] }]
 export function readLines(S) {
   const out = [];
   const d = S.line;
@@ -249,11 +251,13 @@ export function readLines(S) {
       }
       return list;
     };
-    const dirs = entries(), files = entries().map((e) => e[1]);
+    const dirs = entries(), fents = entries(), files = fents.map((e) => e[1]);
+    // (the files' MD5 checksums, DW_LNCT_MD5, when given)
+    const sums = fents.map((e) => e[5] || null);
     r.p = prog;
     let st = null;
     const reset = () => ({ addr: 0, file: 1, line: 1, pe: false });
-    let s = reset(), seq = { rows: [], files };
+    let s = reset(), seq = { rows: [], files, sums };
     const emit = (endSeq) => { seq.rows.push({ addr: s.addr, file: s.file, line: s.line, end: endSeq, pe: s.pe }); s.pe = false; };
     while (r.p < end) {
       const op = r.u8();
@@ -264,7 +268,7 @@ export function readLines(S) {
         emit(false);
       } else if (op === 0) {
         const n = r.uleb(), at = r.p, sub = r.u8();
-        if (sub === 1) { emit(true); out.push(seq); seq = { rows: [], files }; s = reset(); }
+        if (sub === 1) { emit(true); out.push(seq); seq = { rows: [], files, sums }; s = reset(); }
         else if (sub === 2) s.addr = r.addr(asz);
         r.p = at + n;
       } else if (op === 1) emit(false);
@@ -364,8 +368,69 @@ export function readDwarf(img) {
   const g = (n) => img.sections.get(n) || Buffer.alloc(0);
   const S = { info: g('.debug_info'), abbrev: g('.debug_abbrev'), str: g('.debug_str'), lstr: g('.debug_line_str'),
               line: g('.debug_line'), frame: g('.debug_frame'), aranges: g('.debug_aranges'),
-              rnglists: g('.debug_rnglists'), loclists: g('.debug_loclists') };
+              rnglists: g('.debug_rnglists'), loclists: g('.debug_loclists'), names: g('.debug_names') };
   return { S, units: readInfo(S), seqs: readLines(S), fdes: S.frame.length ? readFrames(S) : [] };
+}
+
+// The hash of .debug_names (DWARF 5, 6.1.1.4.5).
+const djb = (s) => { let h = 5381; for (const c of Buffer.from(s, 'latin1')) h = (h * 33 + c) >>> 0; return h; };
+
+// The name indexes of .debug_names, checked as read (errs): [{ cus, names:
+// [{ name, entries: [{ tag, die (an offset in .debug_info) }] }] }]. Every
+// name is in its hash's bucket with its hash.
+export function readNames(S, errs) {
+  const out = [], d = S.names;
+  let off = 0;
+  while (off < d.length) {
+    const r = new Rd(d, off);
+    const len = r.u32(), end = off + 4 + len, version = r.u16(); r.u16();
+    if (version !== 5) { errs.push(`.debug_names version ${version}`); return out; }
+    const ncu = r.u32(), ltu = r.u32(), ftu = r.u32(), nb = r.u32(), nn = r.u32(), absz = r.u32(), augsz = r.u32();
+    r.p += augsz;
+    const cus = []; for (let k = 0; k < ncu; k++) cus.push(r.u32());
+    r.p += 4 * ltu + 8 * ftu;
+    const buckets = []; for (let k = 0; k < nb; k++) buckets.push(r.u32());
+    const hashes = []; for (let k = 0; k < (nb ? nn : 0); k++) hashes.push(r.u32());
+    const strs = []; for (let k = 0; k < nn; k++) strs.push(r.u32());
+    const eoffs = []; for (let k = 0; k < nn; k++) eoffs.push(r.u32());
+    const abStart = r.p, abs = new Map();
+    while (r.p < abStart + absz) {
+      const code = r.uleb();
+      if (!code) break;
+      const tag = r.uleb(), at = [];
+      for (;;) { const i = r.uleb(), f = r.uleb(); if (!i && !f) break; at.push([i, f]); }
+      abs.set(code, { tag, at });
+    }
+    const pool = abStart + absz;
+    const names = [];
+    for (let k = 0; k < nn; k++) {
+      const name = cstr(S.str, strs[k]);
+      if (nb && hashes[k] !== djb(name)) errs.push(`.debug_names: ${name}'s hash`);
+      if (nb) {
+        const b = djb(name) % nb, first = buckets[b];
+        if (!first || first - 1 > k || (k > 0 && first - 1 < k && djb(cstr(S.str, strs[k - 1])) % nb !== b)) errs.push(`.debug_names: ${name} not in its bucket ${b}`);
+      }
+      const e = new Rd(d, pool + eoffs[k]), entries = [];
+      for (;;) {
+        const code = e.uleb();
+        if (!code) break;
+        const a = abs.get(code);
+        if (!a) { errs.push(`.debug_names: ${name}: abbreviation ${code} undefined`); break; }
+        let die = -1, cu = 0;
+        for (const [i, f] of a.at) {
+          const v = f === 0x13 ? e.u32() : f === 0x0b ? e.u8() : f === 0x05 ? e.u16() : f === 0x0f ? e.uleb() : NaN;
+          if (Number.isNaN(v)) { errs.push(`.debug_names: form 0x${f.toString(16)}`); return out; }
+          if (i === 1) cu = v;   // DW_IDX_compile_unit
+          if (i === 3) die = v;  // DW_IDX_die_offset (from its unit's start)
+        }
+        entries.push({ tag: a.tag, die: die < 0 ? -1 : cus[cu] + die });
+      }
+      names.push({ name, entries });
+    }
+    out.push({ cus, names });
+    off = end;
+  }
+  return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -468,6 +533,26 @@ export function checkDebug(img, opts = {}) {
       if (st.cfa[0] !== want) E(`the call returning to 0x${e.ret.toString(16)}: CFA = r${st.cfa[0]} + ${st.cfa[1]}, not by r${want}`);
     }
   }
+  // the name indexes: each entry a DIE of its name and tag; every
+  // subprogram with a name indexed
+  const indexed = new Set();
+  for (const ix of readNames(dw.S, errs)) {
+    for (const n of ix.names) {
+      for (const e of n.entries) {
+        const un = dw.units.find((x) => ix.cus.includes(x.off) && x.dies.has(e.die));
+        const die = un && un.dies.get(e.die);
+        if (!die || die.tag !== e.tag || die.attrs.get(AT_NAME) !== n.name) E(`.debug_names: ${n.name} (tag 0x${e.tag.toString(16)}) is not the DIE at 0x${e.die.toString(16)}`);
+        indexed.add(e.die);
+      }
+    }
+  }
+  if (dw.S.names.length) {
+    for (const un of dw.units) {
+      for (const c of un.die ? un.die.children : []) {
+        if (c.tag === TAG_SUBPROGRAM && c.attrs.get(AT_NAME) && !indexed.has(c.off)) E(`.debug_names: no entry for ${c.attrs.get(AT_NAME)}`);
+      }
+    }
+  } else if (dw.units.length) E('no .debug_names');
   const sc = checkScopes(dw, img.machine === 'wasm' ? null : img.machine);
   for (const m of sc.errs) E(m);
   return { errs, nsubs: subs.length, nfuncs: nf, nseqs: dw.seqs.length, nfdes: dw.fdes.length, nrets: img.rets.length, dw,
@@ -715,6 +800,7 @@ export function checkVars(dw, opts) {
       if (!w || typeName(un, w) !== `${TD}wide_t`) E('shadow: w is not of type wide_t');
       if (!kids(inner, 0x16, 'wide_t').length) E('shadow: the typedef wide_t is not in its block');
       if (!kids(inner, 0x13, 'pair').length) E('shadow: struct pair is not in its block');
+      if (!kids(inner, 0x13, 'held').length) E('shadow: struct held (of struct holder\'s members) is not in its block');
       if (!pr || typeName(un, pr) !== '13:pair') E('shadow: pr is not a struct pair');
       if (!calls || !(calls.attrs.get(0x02) instanceof Uint8Array) || calls.attrs.get(0x02)[0] !== 0x03) E('shadow: the static calls is not in its block, at its address');
     }

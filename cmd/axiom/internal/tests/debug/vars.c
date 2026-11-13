@@ -1,7 +1,8 @@
 /* The variables of a C program in its debug information (run.mjs, "debug
    information"; dwarf.mjs reads it): block scopes (lexical blocks, a name
    declared again inside), typedefs, a block-scope static, structure and
-   typedef declared in a block, a variable length array (its bound),
+   typedef declared in a block (and one in such a structure's members), a
+   variable length array (its bound),
    a thread-local object, and values a debugger reads at -O1 and above
    (a parameter, a variable assigned once, one whose address is taken; one
    assigned again and again, a structure taken apart, a pointer into a
@@ -22,7 +23,8 @@ int shadow(count_t n) {
         struct pair { int a, b; } pr = { x, i };
         static int calls;
         wide_t w = x + calls++;
-        sink = (int)w + pr.a + pr.b;
+        struct holder { struct held { int h; } in; } hd = { { i } };
+        sink = (int)w + pr.a + pr.b + hd.in.h;
     }
     {
         int x = 99;

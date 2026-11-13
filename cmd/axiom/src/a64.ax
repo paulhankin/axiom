@@ -21,6 +21,7 @@ import "asm/core.ax" as acr;
 import "asm/inline.ax" as ai;
 import "asm/obj.ax" as aob;
 import "bin.ax" as bn;
+import "codeview.ax" as codeview;
 import "combine.ax" as cb;
 import "dloc.ax" as dloc;
 import "dwarf.ax" as dw;
@@ -4614,7 +4615,7 @@ let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, 
                                          b: bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0,
                                                                         cap: 0 } },
                                          fx: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0,
-                                                               cap: 0 } }; 9],
+                                                               cap: 0 } }; 10],
                                  strs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
                                                         vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 },
                                  lstrs: u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0),
@@ -4631,9 +4632,17 @@ let mut DBG: dw.Unit = dw.Unit.{ on: false, arch: 0, addr_size: 8, full: false, 
                                  drefs: u.List.[dw.Fix].{ data: @ptr_from_int(*mut dw.Fix, 0), len: 0, cap: 0 },
                                  gdone: u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 },
                                  voffs: u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 }, tls_rel: 0,
-                                 cies: [0; 4], size_fix: false };
+                                 cies: [0; 4], size_fix: false,
+                                 sums: u.List.[[16]u8].{ data: @ptr_from_int(*mut [16]u8, 0), len: 0, cap: 0 },
+                                 nosum: false,
+                                 names: u.List.[dw.Named].{ data: @ptr_from_int(*mut dw.Named, 0), len: 0, cap: 0 } };
 let mut cfis: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
 let mut xcfis: u.List.[dw.XCfi] = u.List.[dw.XCfi].{ data: @ptr_from_int(*mut dw.XCfi, 0), len: 0, cap: 0 };
+
+/// A call frame state of sp + 8 * CFI_NONE: no rule (Windows: in a function
+/// with a register save area, where sp is above the frame record's top by
+/// more than a state can say; codeview.ax describes nothing there).
+pub const CFI_NONE: u64 = 7;
 
 // From here on: CFA = reg + 8k, the save list's registers in mask saved.
 fn cfi(cfa_reg: u32, k: u64, mask: u64) void {
@@ -4765,14 +4774,22 @@ fn win_prologue() void {
     if frameless {
         return;
     }
+    // (the call frame's states, codeview.ax: the frame record's top, x29 +
+    // 16, stands for the CFA, which is 64 bytes above it in a function that
+    // keeps its register arguments in a save area above the record; where
+    // sp is that far above it, the state is CFI_NONE)
     if F.va_home {
+        cfi(dw.A64_SP, CFI_NONE, 0);
         w32(ae.addsub_imm(1, true, false, SP, SP, 64, false));  // sub sp, sp, #64
         _ = uw.alloc(&mut uw_pro, 64);
+        cfi(dw.A64_SP, 0, 0);
     }
     w32(0xA9BF_7BFD);  // stp x29, x30, [sp, #-16]!
     uw.save_fplr_x(&mut uw_pro, 16);
+    cfi(dw.A64_SP, 2, 3);
     w32(0x9100_03FD);  // mov x29, sp
     uw.op1(&mut uw_pro, uw.SET_FP);
+    cfi(dw.A64_FP, 2, 3);
     let top = win_top();
     if top > 0 {
         w32(ae.addsub_imm(1, true, false, SP, SP, @bit_cast(u64, top), false));
@@ -4785,6 +4802,7 @@ fn win_prologue() void {
     }
     let rest = @bit_cast(u64, frame - top);
     if rest == 0 {
+        cfi_body();
         return;
     }
     if rest <= 4096 {
@@ -4794,6 +4812,7 @@ fn win_prologue() void {
             w32(ae.addsub_imm(1, true, false, SP, SP, rest, false));
         }
         _ = uw.alloc(&mut uw_pro, rest);
+        cfi_body();
         return;
     }
     // each page below sp touched in order (the stack's guard page), with
@@ -4813,6 +4832,7 @@ fn win_prologue() void {
     if not uw.alloc(&mut uw_pro, rest) {
         fail("the stack frame is too large for Windows unwind information (256 MiB)");
     }
+    cfi_body();
 }
 
 // The saves (or with load the restores) of the callee-saved registers at
@@ -4869,11 +4889,14 @@ fn win_unframe() void {
         w32(ae.addsub_imm(1, false, false, SP, SP, @bit_cast(u64, top), false));
         _ = uw.alloc(c, @bit_cast(u64, top));
     }
-    w32(0xA8C1_7BFD);  // ldp x29, x30, [sp], #16
+    cfi(dw.A64_FP, 2, 3);  // (the callee-saved registers restored)
+    w32(0xA8C1_7BFD);      // ldp x29, x30, [sp], #16
     uw.save_fplr_x(c, 16);
+    cfi(dw.A64_SP, 0, 0);
     if F.va_home {
         w32(ae.addsub_imm(1, false, false, SP, SP, 64, false));
         _ = uw.alloc(c, 64);
+        cfi(dw.A64_SP, CFI_NONE, 0);
     }
     sink.b.free();
     sink.at.deinit();
@@ -5346,7 +5369,7 @@ fn encode_func(f: *mut ir.Func) void {
         win_unwind(fsym.get(@int_cast(usize, f.id)), base, s.size);
     }
     if WIN_ and (rows.len > 0) {
-        wlines.emit(OBJ, LINES, s.name, rows.items());
+        wlines.emit(OBJ, LINES, codeview.func_key(s.sec, s.value), rows.items());
     }
     if DBG.on {
         let mut regs: [20]u64 = [0; 20];
@@ -5365,7 +5388,11 @@ fn encode_func(f: *mut ir.Func) void {
                            size: s.size, src: f.src, rows: rows.items(), scopes: scopes.items(), cfi: cfis.items(),
                            regs: regs[0..nsaved + 2], irf: f, vars: dw.var_locs(f, var_slot_off, 16 + frame),
                            vlocs: dloc.compute(MF, &DLOC, s.size), frame_local: -1 };
-        dw.add_func(&mut DBG, &df);
+        if WIN_ {
+            codeview.add_func(&df, s);
+        } else {
+            dw.add_func(&mut DBG, &df);
+        }
     }
     rows.deinit();
     scopes.deinit();
@@ -5523,11 +5550,12 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         galign.push(al);
     }
     FT = ft.begin(OBJ, m, TEXT, relro, &mut gsym, elf.R_AARCH64_PREL32, elf.R_AARCH64_ABS64);
-    let mut level = tg.g_debug;
-    if WIN_ {
-        level = tg.DEBUG_NONE;  // (Windows: the PDB, from .axiom.lines)
+    // (Windows: the same records feed CodeView for the PDB, codeview.ax,
+    // and the lines are .axiom.lines)
+    DBG = dw.begin(dw.ARCH_A64, 8, tg.g_debug);
+    if WIN_ and DBG.on {
+        codeview.begin(OBJ, true, DBG.full);
     }
-    DBG = dw.begin(dw.ARCH_A64, 8, level);
     for p in aob.procs.items() {
         dw.add_asm_fde(&mut DBG, p.sym, 0, p.size, p.prog, p.simple, p.signal);
     }
@@ -5541,7 +5569,8 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         if p.rows.len > 0 {
             dw.add_func(&mut DBG, &df);
             if WIN_ and (LINES >= 0) and (tg.g_debug != tg.DEBUG_NONE) and (p.name.len > 0) {
-                wlines.emit(OBJ, LINES, p.name, p.rows);
+                let ps = OBJ.syms.at(@as(usize, p.sym));
+                wlines.emit(OBJ, LINES, codeview.func_key(ps.sec, ps.value), p.rows);
             }
         }
     }
@@ -5552,6 +5581,7 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
     }
     for i in 0..m.globals.len {
         dw.add_data_sym(&mut DBG, m.globals.get(i).name, gsym.get(i));
+        codeview.add_data_sym(m.globals.get(i).name, gsym.get(i));
     }
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
@@ -5574,6 +5604,10 @@ pub fn compile(m: *mut ir.Module) *mut elf.Obj {
         u.eprint(u.f1("axiom: AArch64 code generation: %s\n", msg));
         return u.nil.[elf.Obj]();
     }
-    dw.finish_elf(&mut DBG, OBJ, TEXT, elf.R_AARCH64_ABS64, elf.R_AARCH64_ABS32);
+    if WIN_ {
+        codeview.finish();
+    } else {
+        dw.finish_elf(&mut DBG, OBJ, TEXT, elf.R_AARCH64_ABS64, elf.R_AARCH64_ABS32);
+    }
     return OBJ;
 }

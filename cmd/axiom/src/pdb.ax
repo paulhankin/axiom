@@ -1,27 +1,32 @@
 // =============================================================================
 // pdb.ax - writes a program database (PDB) for an executable plink.ax links:
-// the debug information Windows debuggers (Visual Studio, WinDbg) and the
-// system's own symbol handler (dbghelp) read. The executable names it in a
-// CodeView debug directory entry (plink.ax), by path, GUID and age.
+// the debug information Windows debuggers and the system's own symbol
+// handler (dbghelp) read. The executable names it in a CodeView debug
+// directory entry (plink.ax), by path, GUID and age.
 //
-// What it holds: every function (name, start, size) as a procedure of one
-// module and as a public symbol, with its line table when there is one
+// What it holds: a module per object, with its functions as procedures (and
+// at -g their frames, lexical blocks, variables and their locations, the
+// object's static data and user-defined types: the CodeView symbols
+// codeview.ax made, which plink.ax relocated) and their line tables
 // (DEBUG_S_LINES, files in DEBUG_S_FILECHKSMS through the /names string
-// table), the image's section headers and section map. No types: functions
-// have type 0.
+// table); the types and ids every object described, merged (TPI and IPI,
+// with their hash streams); every function as a public symbol; the global
+// symbols (procedure references, data, user-defined types) and their hash;
+// the image's section headers and section map.
 //
 // The container is an MSF ("multi-stream file") of 4 KiB blocks: block 0 the
 // superblock, blocks 1 and 2 (and every 4096th after them) the free block
 // maps, the rest streams' data, a stream directory listing each stream's
 // size and blocks, and a block listing the directory's blocks. Streams:
-//    0 the old directory (empty)       5 /names (the string table)
-//    1 PDB info (GUID, age, names)     6 the module's symbols and lines
-//    2 TPI (types: none)               7 publics (hash and address map)
-//    3 DBI (modules, sections)         8 globals (hash)
-//    4 IPI (ids: none)                 9 symbol records (publics, globals)
-//                                     10 the section headers
-// Formats as in LLVM's documentation of the PDB file format and its
-// reader/writer (llvm/DebugInfo/PDB), which follow Microsoft's.
+//    0 the old directory (empty)       6 TPI's hash values
+//    1 PDB info (GUID, age, names)     7 IPI's hash values
+//    2 TPI (types)                     8 publics (hash and address map)
+//    3 DBI (modules, sections)         9 globals (hash)
+//    4 IPI (ids)                      10 symbol records (publics, globals)
+//    5 /names (the string table)      11 the section headers
+//                                     12.. each module's symbols and lines
+// Formats as Microsoft publishes them (the PDB and CodeView formats: the
+// MSF container, the streams' headers, cvinfo.h's records).
 // =============================================================================
 import "bin.ax" as bn;
 import "util.ax" as u;
@@ -42,6 +47,16 @@ pub struct Func {
     off: u32,  // offset in the section
     size: u32,
     lines: []Line,
+    syms: []u8,       // its symbols (codeview.ax's, relocated), or none: a procedure record is made
+    self_fix: []u32,  // where syms holds offsets in itself (to become offsets in the module's stream)
+    module: u32,      // its module (an index in write's mods)
+    external: bool,
+}
+
+/// A module (an object): its name and its symbols at the top level.
+pub struct Mod {
+    name: []u8,
+    syms: []u8,
 }
 
 // -----------------------------------------------------------------------------
@@ -357,13 +372,16 @@ fn msf(streams: []bn.Bytes) bn.Bytes {
 // -----------------------------------------------------------------------------
 // The streams
 // -----------------------------------------------------------------------------
+const S_TPI: u64 = 2;
+const S_IPI: u64 = 4;
 const S_NAMES: u64 = 5;
-const S_MODULE: u64 = 6;
-const S_PUBLICS: u64 = 7;
-const S_GLOBALS: u64 = 8;
-const S_SYMRECS: u64 = 9;
-const S_SECHDR: u64 = 10;
-const NSTREAMS: usize = 11;
+const S_TPI_HASH: u64 = 6;
+const S_IPI_HASH: u64 = 7;
+const S_PUBLICS: u64 = 8;
+const S_GLOBALS: u64 = 9;
+const S_SYMRECS: u64 = 10;
+const S_SECHDR: u64 = 11;
+const S_MODULE0: u64 = 12;
 
 fn info_stream(guid: []u8, age: u32) bn.Bytes {
     let mut b = bn.new_bytes();
@@ -388,18 +406,139 @@ fn info_stream(guid: []u8, age: u32) bn.Bytes {
     return b;
 }
 
-fn types_stream() bn.Bytes {
+// -----------------------------------------------------------------------------
+// Types and ids (TPI, IPI)
+// -----------------------------------------------------------------------------
+const TPI_BUCKETS: u32 = 0x3ffff;
+
+let mut crc_table: [256]u32 = [0; 256];
+
+// A CRC-32 (the reflected polynomial 0xEDB88320) from 0, without the final
+// inversion: the hash of type records that have no name to hash.
+fn crc32(s: []u8) u32 {
+    if crc_table[1] == 0 {
+        for i in @as(u32, 0)..256 {
+            let mut c = i;
+            for _k in @as(u32, 0)..8 {
+                if (c & 1) != 0 {
+                    c = 0xedb8_8320 ^ (c >> 1);
+                } else {
+                    c = c >> 1;
+                }
+            }
+            crc_table[@as(usize, i)] = c;
+        }
+    }
+    let mut c: u32 = 0;
+    for x in s {
+        c = crc_table[@as(usize, (c ^ @as(u32, x)) & 0xff)] ^ (c >> 8);
+    }
+    return c;
+}
+
+/// The size of the numeric leaf at `at` of r.
+pub fn numeric_size(r: []u8, at: usize) usize {
+    let v = bn.rd16(r, at);
+    if v < 0x8000 {
+        return 2;
+    }
+    if v == 0x8000 {
+        return 3;
+    }
+    if (v == 0x8001) or (v == 0x8002) {
+        return 4;
+    }
+    if (v == 0x8003) or (v == 0x8004) {
+        return 6;
+    }
+    return 10;
+}
+
+fn cstr_at(r: []u8, at: usize) []u8 {
+    let mut e = at;
+    while (e < r.len) and (r[e] != 0) {
+        e += 1;
+    }
+    return r[@min(at, e)..e];
+}
+
+fn anonymous(n: []u8) bool {
+    return u.str_eq(n, "<unnamed-tag>") or u.str_eq(n, "__unnamed") or u.ends(n, "::<unnamed-tag>") or
+           u.ends(n, "::__unnamed");
+}
+
+/// The hash of a type or id record (its bytes, from its length): a
+/// structure's, union's or enumeration's definition by its name (or, scoped
+/// to a function, its unique name), an LF_UDT_SRC_LINE by its type's index,
+/// others (forward references among them) by a CRC of their bytes.
+pub fn record_hash(r: []u8) u32 {
+    let kind = bn.rd16(r, 2);
+    if (kind == 0x1504) or (kind == 0x1505) or (kind == 0x1506) or (kind == 0x1507) {
+        let prop = bn.rd16(r, 6);
+        let mut at: usize = 0;
+        if kind == 0x1507 {
+            at = 16;
+        } else if kind == 0x1506 {
+            at = 12 + numeric_size(r, 12);
+        } else {
+            at = 20 + numeric_size(r, 20);
+        }
+        let name = cstr_at(r, at);
+        let fwd = (prop & 0x80) != 0;
+        let scoped = (prop & 0x100) != 0;
+        let unique = (prop & 0x200) != 0;
+        let anon = unique and anonymous(name);
+        if not fwd and not scoped and not anon {
+            return hash_v1(name);
+        }
+        if not fwd and unique and not anon {
+            return hash_v1(cstr_at(r, at + name.len + 1));
+        }
+        return crc32(r);
+    }
+    if (kind == 0x1606) or (kind == 0x1607) {
+        return hash_v1(r[4..8]);
+    }
+    return crc32(r);
+}
+
+// A TPI or IPI stream (records: each from its length) and its hash stream
+// (stream number hs): each record's hash, then where every 8 KiB of records
+// starts (index, offset), then an empty hash adjustment table.
+fn types_stream(recs: [][]u8, hs: u64, hash: *mut bn.Bytes) bn.Bytes {
+    let mut body = bn.new_bytes();
+    let mut offs = bn.new_bytes();
+    let mut next_off: usize = 0;
+    for k in 0..recs.len {
+        if body.len() >= next_off {
+            offs.u32_(0x1000 + @as(u64, k));
+            offs.u32_(@as(u64, body.len()));
+            next_off = body.len() + 8192;
+        }
+        hash.u32_(@as(u64, record_hash(recs[k]) % TPI_BUCKETS));
+        body.put(recs[k]);
+    }
+    let nh = hash.len();
+    hash.put(offs.view());
     let mut b = bn.new_bytes();
-    b.u32_(20040203);  // V80
-    b.u32_(56);        // header size
-    b.u32_(0x1000);    // type indexes begin
-    b.u32_(0x1000);    // and end: none
-    b.u32_(0);         // record bytes
-    b.u16_(0xffff);    // hash stream: none
-    b.u16_(0xffff);
-    b.u32_(4);        // hash key size
-    b.u32_(0x3ffff);  // buckets
-    b.zeros(24);      // hash values, index offsets, hash adjusters: empty
+    b.u32_(20040203);                     // V80
+    b.u32_(56);                           // header size
+    b.u32_(0x1000);                       // type indexes begin
+    b.u32_(0x1000 + @as(u64, recs.len));  // and end
+    b.u32_(@as(u64, body.len()));
+    b.u16_(hs);      // hash stream
+    b.u16_(0xffff);  // auxiliary hash stream: none
+    b.u32_(4);       // hash key size
+    b.u32_(@as(u64, TPI_BUCKETS));
+    b.u32_(0);  // hash values: offset, length
+    b.u32_(@as(u64, nh));
+    b.u32_(@as(u64, nh));  // index offsets
+    b.u32_(@as(u64, offs.len()));
+    b.u32_(@as(u64, hash.len()));  // hash adjustments: none
+    b.u32_(0);
+    b.put(body.view());
+    body.free();
+    offs.free();
     return b;
 }
 
@@ -423,43 +562,88 @@ fn cpu_type() u64 {
 
 /// Writes the PDB for an executable to path. guid: 16 bytes; sections: the
 /// image's section headers (40 bytes each); files: the source files lines
-/// refer to; module: the program's name.
-pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, funcs: []Func, module: []u8) bool {
+/// refer to; funcs: the functions, of modules `mods`; tpi, ipi: the type
+/// and id records (from their lengths, indexes from 0x1000).
+pub fn write(path: []u8, guid: []u8, age: u32, sections: []u8, files: [][]u8, funcs: []Func, mods: []Mod, tpi: [][]u8,
+             ipi: [][]u8) bool {
     let mut names = names_new();
-    let md = module_stream(funcs, files, &mut names, module);
-    let mut ps = public_symbols(funcs, md.proc_at);
+    let mut mds = u.List.[Module].empty();
+    let proc_at = u.newn.[u32](funcs.len + 1);
+    let mut gl = u.List.[GlobalSym].empty();
+    for mi in 0..mods.len {
+        mds.push(module_stream(@truncate(u32, mi), funcs, proc_at, &mods[mi], files, &mut names, &mut gl));
+    }
+    let mut ps = public_symbols(funcs, proc_at, gl.items());
     let mut secs = bn.new_bytes();
     secs.put(sections);
-    let mut streams: [11]bn.Bytes = [bn.new_bytes(); 11];
+    let ns = @truncate(usize, S_MODULE0) + mods.len;
+    let streams = u.newn.[bn.Bytes](ns + 1);
+    for k in 0..ns {
+        streams[k] = bn.new_bytes();
+    }
     streams[1] = info_stream(guid, age);
-    streams[2] = types_stream();
-    streams[3] = dbi_stream(age, sections, files, &md, module);
-    streams[4] = types_stream();  // IPI: the same, empty
-    streams[5] = names_stream(&mut names);
-    streams[6] = md.b;
-    streams[7] = ps.publics;
-    streams[8] = ps.globals;
-    streams[9] = ps.recs;
-    streams[10] = secs;
-    let mut f = msf(streams[..]);
+    let mut th = bn.new_bytes();
+    let mut ih = bn.new_bytes();
+    streams[@truncate(usize, S_TPI)] = types_stream(tpi, S_TPI_HASH, &mut th);
+    streams[@truncate(usize, S_IPI)] = types_stream(ipi, S_IPI_HASH, &mut ih);
+    streams[@truncate(usize, S_TPI_HASH)] = th;
+    streams[@truncate(usize, S_IPI_HASH)] = ih;
+    streams[3] = dbi_stream(age, sections, files, funcs, mds.items());
+    streams[@truncate(usize, S_NAMES)] = names_stream(&mut names);
+    streams[@truncate(usize, S_PUBLICS)] = ps.publics;
+    streams[@truncate(usize, S_GLOBALS)] = ps.globals;
+    streams[@truncate(usize, S_SYMRECS)] = ps.recs;
+    streams[@truncate(usize, S_SECHDR)] = secs;
+    for mi in 0..mds.len {
+        streams[@truncate(usize, S_MODULE0) + mi] = mds.get(mi).b;
+    }
+    let mut f = msf(streams[0..ns]);
     return u.write_file(path, f.view());
 }
 
-// The module's stream: its symbols, then its line information.
+// A module's stream: its symbols, then its line information.
 struct Module {
+    name: []u8,
     b: bn.Bytes,
-    proc_at: []mut u32,  // each function's S_GPROC32
     sym_size: usize,
     c13_size: usize,
+    files: u.List.[u32],  // the files its lines are in (indexes in write's files)
+    first: i32,           // its first function (-1: none)
 }
 
-fn module_stream(funcs: []Func, files: [][]u8, names: *mut Names, module: []u8) Module {
+// A symbol of the globals: its record and name.
+struct GlobalSym {
+    rec: []u8,
+    name: []u8,
+}
+
+// The name of a symbol record of the kinds the globals hold (empty:
+// another kind).
+pub fn sym_name(r: []u8) []u8 {
+    let kind = bn.rd16(r, 2);
+    if (kind == 0x110c) or (kind == 0x110d) or (kind == 0x1112) or (kind == 0x1113) {
+        return cstr_at(r, 14);  // S_LDATA32 S_GDATA32 S_LTHREAD32 S_GTHREAD32
+    }
+    if kind == 0x1108 {
+        return cstr_at(r, 8);  // S_UDT
+    }
+    if kind == 0x1107 {
+        return cstr_at(r, 8 + numeric_size(r, 8));  // S_CONSTANT
+    }
+    if (kind == 0x110f) or (kind == 0x1110) {
+        return cstr_at(r, 39);  // S_LPROC32 S_GPROC32
+    }
+    return "";
+}
+
+fn module_stream(mi: u32, funcs: []Func, proc_at: []mut u32, md: *Mod, files: [][]u8, names: *mut Names,
+                 gl: *mut u.List.[GlobalSym]) Module {
     // the symbols: an object name, then each procedure
     let mut m = bn.new_bytes();
     m.u32_(4);  // CV_SIGNATURE_C13
     let r0 = rec_begin(&mut m, 0x1101);  // S_OBJNAME
     m.u32_(0);
-    cstr(&mut m, module);
+    cstr(&mut m, md.name);
     rec_end(&mut m, r0);
     let r1 = rec_begin(&mut m, 0x113c);  // S_COMPILE3
     m.u32_(0);  // language C, no flags
@@ -467,11 +651,38 @@ fn module_stream(funcs: []Func, files: [][]u8, names: *mut Names, module: []u8) 
     m.zeros(16);  // front and back end versions
     cstr(&mut m, "axiom");
     rec_end(&mut m, r1);
-    let proc_at = u.newn.[u32](funcs.len + 1);
+    let mut first: i32 = -1;
+    let mut mfiles = u.List.[u32].empty();
     for fi in 0..funcs.len {
         let f = funcs[fi];
-        let at = rec_begin(&mut m, 0x1110);  // S_GPROC32
-        proc_at[fi] = @truncate(u32, at);
+        if f.module != mi {
+            continue;
+        }
+        if first < 0 {
+            first = @int_cast(i32, fi);
+        }
+        for l in f.lines {
+            let mut seen = false;
+            for x in mfiles.items() {
+                if x == l.file {
+                    seen = true;
+                }
+            }
+            if not seen {
+                mfiles.push(l.file);
+            }
+        }
+        let base = m.len();
+        proc_at[fi] = @truncate(u32, base);
+        if f.syms.len > 0 {
+            m.put(f.syms);
+            for o in f.self_fix {
+                let at = base + @as(usize, o);
+                m.set_u32(at, bn.rd32(m.view(), at) + @as(u64, base));
+            }
+            continue;
+        }
+        let at = rec_begin(&mut m, pick(f.external, 0x1110, 0x110f));  // S_GPROC32, S_LPROC32
         m.u32_(0);  // parent
         let end_field = m.len();
         m.u32_(0);  // end: patched below
@@ -489,15 +700,27 @@ fn module_stream(funcs: []Func, files: [][]u8, names: *mut Names, module: []u8) 
         rec_end(&mut m, e);
         m.set_u32(end_field, @as(u64, e));
     }
+    // the top level's (data, user-defined types): also the globals'
+    m.put(md.syms);
+    let mut at: usize = 0;
+    while (at + 4) <= md.syms.len {
+        let n = @truncate(usize, bn.rd16(md.syms, at)) + 2;
+        let r = md.syms[at..at + n];
+        let name = sym_name(r);
+        if name.len > 0 {
+            gl.push(GlobalSym.{ rec: r, name: name });
+        }
+        at += n;
+    }
     let sym_size = m.len();
     // line information (C13): the files' checksum entries (no checksums),
     // then each function's lines
     let file_entry = u.newn.[u32](files.len + 1);
-    if files.len > 0 {
+    if mfiles.len > 0 {
         let mut c = bn.new_bytes();
-        for k in 0..files.len {
-            file_entry[k] = @truncate(u32, c.len());
-            c.u32_(@as(u64, names_add(names, files[k])));
+        for k in mfiles.items() {
+            file_entry[@as(usize, k)] = @truncate(u32, c.len());
+            c.u32_(@as(u64, names_add(names, files[@as(usize, k)])));
             c.u8_(0);  // checksum size
             c.u8_(0);  // kind: none
             c.align(4);
@@ -507,57 +730,74 @@ fn module_stream(funcs: []Func, files: [][]u8, names: *mut Names, module: []u8) 
         m.put(c.view());
     }
     for f in funcs {
-        if f.lines.len == 0 {
+        if (f.module != mi) or (f.lines.len == 0) {
             continue;
         }
-        let l = line_table(&f, file_entry);
-        m.u32_(0xf2);  // DEBUG_S_LINES
-        m.u32_(@as(u64, l.len()));
-        m.put(l.view());
+        line_tables(&mut m, &f, file_entry);
     }
     let c13_size = m.len() - sym_size;
     m.u32_(0);  // global references: none
-    return Module.{ b: m, proc_at: proc_at, sym_size: sym_size, c13_size: c13_size };
+    return Module.{ name: md.name, b: m, sym_size: sym_size, c13_size: c13_size, files: mfiles, first: first };
 }
 
-// A function's lines, in runs of one file (file_entry: each file's
-// checksum entry).
-fn line_table(f: *Func, file_entry: []u32) bn.Bytes {
-    let mut l = bn.new_bytes();
-    l.u32_(@as(u64, f.off));
-    l.u16_(@as(u64, f.sec));
-    l.u16_(0);  // flags: no columns
-    l.u32_(@as(u64, f.size));
+fn pick(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// A function's lines (DEBUG_S_LINES subsections, into m): a subsection per
+// run of rows in one file, covering the code from the run's first row to
+// the next run's (readers take a subsection's first file block only).
+// file_entry: each file's checksum entry.
+fn line_tables(m: *mut bn.Bytes, f: *Func, file_entry: []u32) void {
     let mut i: usize = 0;
     while i < f.lines.len {
         let mut j = i;
         while (j < f.lines.len) and (f.lines[j].file == f.lines[i].file) {
             j += 1;
         }
-        l.u32_(@as(u64, file_entry[@as(usize, f.lines[i].file)]));
-        l.u32_(@as(u64, j - i));
-        l.u32_(12 + (@as(u64, j - i) * 8));
-        for k in i..j {
-            l.u32_(@as(u64, f.lines[k].off));
-            l.u32_(@as(u64, f.lines[k].line & 0xff_ffff) | 0x8000_0000);  // a statement
+        let start = f.lines[i].off;
+        let mut end = f.size;
+        if j < f.lines.len {
+            end = f.lines[j].off;
+        }
+        if end > start {
+            let mut l = bn.new_bytes();
+            l.u32_(@as(u64, f.off + start));
+            l.u16_(@as(u64, f.sec));
+            l.u16_(0);  // flags: no columns
+            l.u32_(@as(u64, end - start));
+            l.u32_(@as(u64, file_entry[@as(usize, f.lines[i].file)]));
+            l.u32_(@as(u64, j - i));
+            l.u32_(12 + (@as(u64, j - i) * 8));
+            for k in i..j {
+                l.u32_(@as(u64, f.lines[k].off - start));
+                l.u32_(@as(u64, f.lines[k].line & 0xff_ffff) | 0x8000_0000);  // a statement
+            }
+            m.u32_(0xf2);  // DEBUG_S_LINES
+            m.u32_(@as(u64, l.len()));
+            m.put(l.view());
+            l.free();
         }
         i = j;
     }
-    return l;
 }
 
 // The symbol record stream (a public symbol and a procedure reference per
-// function) and its two hash streams.
+// function, the modules' top-level data and user-defined types, each once)
+// and its two hash streams.
 struct Publics {
     recs: bn.Bytes,
     publics: bn.Bytes,
     globals: bn.Bytes,
 }
 
-fn public_symbols(funcs: []Func, proc_at: []u32) Publics {
+fn public_symbols(funcs: []Func, proc_at: []u32, gl: []GlobalSym) Publics {
     let mut recs = bn.new_bytes();
     let pubs = u.newn.[HashEntry](funcs.len + 1);
-    let globs = u.newn.[HashEntry](funcs.len + 1);
+    let mut globs = u.List.[HashEntry].empty();
     let pub_off = u.newn.[u32](funcs.len + 1);
     for fi in 0..funcs.len {
         let f = funcs[fi];
@@ -569,15 +809,31 @@ fn public_symbols(funcs: []Func, proc_at: []u32) Publics {
         rec_end(&mut recs, p);
         pubs[fi] = HashEntry.{ name: f.name, off: @truncate(u32, p), bucket: 0 };
         pub_off[fi] = @truncate(u32, p);
-        let g = rec_begin(&mut recs, 0x1125);  // S_PROCREF
+        let mut pname = f.name;
+        if f.syms.len > 0 {
+            pname = sym_name(f.syms);
+        }
+        let g = rec_begin(&mut recs, pick(f.external, 0x1125, 0x1127));  // S_PROCREF, S_LPROCREF
         recs.u32_(0);
         recs.u32_(@as(u64, proc_at[fi]));
-        recs.u16_(1);  // module 1 (1-based)
-        cstr(&mut recs, f.name);
+        recs.u16_(@as(u64, f.module) + 1);  // (1-based)
+        cstr(&mut recs, pname);
         rec_end(&mut recs, g);
-        globs[fi] = HashEntry.{ name: f.name, off: @truncate(u32, g), bucket: 0 };
+        globs.push(HashEntry.{ name: pname, off: @truncate(u32, g), bucket: 0 });
     }
-    let globals = gsi_hash(globs[0..funcs.len]);
+    // (the same record from several objects once)
+    let mut seen = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for x in gl {
+        let key = u.intern(x.rec);
+        if seen.get(key) != 0 {
+            continue;
+        }
+        seen.put(key, 1);
+        let at = recs.len();
+        recs.put(x.rec);
+        globs.push(HashEntry.{ name: x.name, off: @truncate(u32, at), bucket: 0 });
+    }
+    let globals = gsi_hash(globs.items());
     // the publics: header, hash, then the address map (the records by
     // section and offset)
     let order = u.newn.[usize](funcs.len + 1);
@@ -598,36 +854,71 @@ fn public_symbols(funcs: []Func, proc_at: []u32) Publics {
 }
 
 // DBI: modules, section contributions and map, files, optional streams.
-fn dbi_stream(age: u32, sections: []u8, files: [][]u8, md: *Module, module: []u8) bn.Bytes {
+fn dbi_stream(age: u32, sections: []u8, files: [][]u8, funcs: []Func, mds: []Module) bn.Bytes {
     let mut mi = bn.new_bytes();
-    mi.u32_(0);
-    section_contribution(&mut mi, 1, 0, text_size(sections), 0x6000_0020);
-    mi.u16_(0);  // flags
-    mi.u16_(S_MODULE);
-    mi.u32_(@as(u64, md.sym_size));
-    mi.u32_(0);  // C11 lines
-    mi.u32_(@as(u64, md.c13_size));
-    mi.u16_(@as(u64, @min(files.len, 0xffff)));
-    mi.u16_(0);
-    mi.u32_(0);
-    mi.u32_(0);  // source file name index
-    mi.u32_(0);  // PDB path name index
-    cstr(&mut mi, module);
-    cstr(&mut mi, module);
-    mi.align(4);
+    for k in 0..mds.len {
+        let md = &mds[k];
+        mi.u32_(0);
+        if md.first >= 0 {
+            let f = &funcs[@as(usize, @bit_cast(u32, md.first))];
+            section_contribution(&mut mi, @as(u64, f.sec), @as(u64, f.off), @as(u64, f.size), 0x6000_0020, @as(u64, k));
+        } else {
+            section_contribution(&mut mi, 0, 0, 0, 0, @as(u64, k));
+        }
+        mi.u16_(0);  // flags
+        mi.u16_(S_MODULE0 + @as(u64, k));
+        mi.u32_(@as(u64, md.sym_size));
+        mi.u32_(0);  // C11 lines
+        mi.u32_(@as(u64, md.c13_size));
+        mi.u16_(@as(u64, @min(md.files.len, 0xffff)));
+        mi.u16_(0);
+        mi.u32_(0);
+        mi.u32_(0);  // source file name index
+        mi.u32_(0);  // PDB path name index
+        cstr(&mut mi, md.name);
+        cstr(&mut mi, md.name);
+        mi.align(4);
+    }
+    // the section contributions: each function's, by address
+    let order = u.newn.[usize](funcs.len + 1);
+    for k in 0..funcs.len {
+        order[k] = k;
+    }
+    sort_by_address(order[0..funcs.len], funcs);
     let mut sc = bn.new_bytes();
     sc.u32_(0xeffe_0000 + 19970605);  // version 6.0
-    section_contribution(&mut sc, 1, 0, text_size(sections), 0x6000_0020);
+    for k in 0..funcs.len {
+        let f = &funcs[order[k]];
+        section_contribution(
+            &mut sc, @as(u64, f.sec), @as(u64, f.off), @as(u64, f.size), 0x6000_0020, @as(u64, f.module));
+    }
     let sm = section_map(sections);
+    // the files of each module
     let mut fi_ = bn.new_bytes();
-    fi_.u16_(1);  // modules
-    fi_.u16_(@as(u64, @min(files.len, 0xffff)));
-    fi_.u16_(0);  // the module's first file
-    fi_.u16_(@as(u64, @min(files.len, 0xffff)));
+    let mut nfiles: usize = 0;
+    for md in mds {
+        nfiles += md.files.len;
+    }
+    fi_.u16_(@as(u64, mds.len));
+    fi_.u16_(@as(u64, @min(nfiles, 0xffff)));
+    let mut first: usize = 0;
+    for md in mds {
+        fi_.u16_(@as(u64, @min(first, 0xffff)));
+        first += md.files.len;
+    }
+    for md in mds {
+        fi_.u16_(@as(u64, @min(md.files.len, 0xffff)));
+    }
     let mut fnames = bn.new_bytes();
+    let foff = u.newn.[u32](files.len + 1);
     for k in 0..files.len {
-        fi_.u32_(@as(u64, fnames.len()));
+        foff[k] = @truncate(u32, fnames.len());
         cstr(&mut fnames, files[k]);
+    }
+    for md in mds {
+        for x in md.files.items() {
+            fi_.u32_(@as(u64, foff[@as(usize, x)]));
+        }
     }
     fi_.put(fnames.view());
     fi_.align(4);
@@ -717,23 +1008,16 @@ fn section_map(sections: []u8) bn.Bytes {
 }
 
 // A section contribution: section, offset, size, characteristics, module.
-fn section_contribution(b: *mut bn.Bytes, sec: u64, off: u64, size: u64, flags: u64) void {
+fn section_contribution(b: *mut bn.Bytes, sec: u64, off: u64, size: u64, flags: u64, module: u64) void {
     b.u16_(sec);
     b.u16_(0);
     b.u32_(off);
     b.u32_(size);
     b.u32_(flags);
-    b.u16_(0);  // module 0
+    b.u16_(module);
     b.u16_(0);
     b.u32_(0);  // data and relocation CRCs
     b.u32_(0);
-}
-
-fn text_size(sections: []u8) u64 {
-    if sections.len < 40 {
-        return 0;
-    }
-    return bn.rd32(sections, 8);
 }
 
 fn addr_less(a: *Func, b: *Func) bool {

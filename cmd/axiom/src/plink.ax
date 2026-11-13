@@ -58,6 +58,7 @@
 // =============================================================================
 import "a64unwind.ax" as uw;
 import "bin.ax" as bn;
+import "codeview.ax" as cvw;
 import "elf.ax" as elf;
 import "jstub.ax" as jstub;
 import "lstub.ax" as lstub;
@@ -745,9 +746,9 @@ pub fn link(inputs: []*mut elf.Obj, out: []u8) i32 {
     if g_pdb {
         let sh: usize = 0x40 + 4 + 20 + 240;
         let mut files = u.List.[[]u8].empty();
-        let funcs = pdb_funcs(ly.text_rva, &mut files);
+        let pin = pdb_input(ly.text_rva, &mut files);
         if not pdb.write(pdb_file_of(out), guid[..], 1, hv[sh..sh + @truncate(usize, ly.nsec * 40)], files.items(),
-                         funcs.items(), basename(out)) {
+                         pin.funcs.items(), pin.mods.items(), pin.tpi.items(), pin.ipi.items()) {
             nl.err(u.f1("cannot write %s", pdb_file_of(out)));
             return 1;
         }
@@ -818,13 +819,12 @@ fn lay_out(out: []u8) Layout {
     // .idata
     let idata_rva = nl.align_up(rdata_end - BASE, SECT);
     let idata = import_section(idata_rva);
-    // .data: data, the GOT, the thread-local template, then .bss
+    // .data: the thread-local template (first: a thread-local's offset in
+    // the section is its offset in each thread's block, as the PDB's
+    // S_GTHREAD32 records give it), data, the GOT, then .bss
     let data_rva = nl.align_up(idata_rva + @as(u64, idata.len()), SECT);
-    let mut cur = nl.place(nl.C_DATA, BASE + data_rva);
-    got_addr = nl.align_up(cur, 8);
-    cur = got_addr + (@as(u64, nl.got_sym.len) * 8);
     let tls_align = @max(@max(nl.class_align(nl.C_TDATA), nl.class_align(nl.C_TBSS)), 16);
-    tls_addr = nl.align_up(cur, tls_align);
+    tls_addr = nl.align_up(BASE + data_rva, tls_align);
     let tdata_end = nl.place(nl.C_TDATA, tls_addr);
     let tbss_start = nl.align_up(tdata_end, nl.class_align(nl.C_TBSS));
     // .tbss is part of the template, as zeros in the file: the Windows loader
@@ -832,8 +832,11 @@ fn lay_out(out: []u8) Layout {
     // only the template, so zero-fill variables would be past the end of
     // each thread's block)
     let tls_end = nl.place(nl.C_TBSS, tbss_start);
-    let data_file_end = tls_end;
-    let bss_end = nl.place(nl.C_BSS, nl.align_up(tls_end, nl.class_align(nl.C_BSS)));
+    let mut cur = nl.place(nl.C_DATA, nl.align_up(tls_end, nl.class_align(nl.C_DATA)));
+    got_addr = nl.align_up(cur, 8);
+    cur = got_addr + (@as(u64, nl.got_sym.len) * 8);
+    let data_file_end = cur;
+    let bss_end = nl.place(nl.C_BSS, nl.align_up(cur, nl.class_align(nl.C_BSS)));
 
     outs[0] = Out.{ name: ".text", rva: text_rva, vsize: text_end - (BASE + text_rva), fsize: 0, foff: 0,
                     flags: 0x6000_0020 };
@@ -1225,15 +1228,52 @@ fn basename(p: []u8) []u8 {
     return p[i..];
 }
 
-// Every function the image holds, for the PDB: defined in code, the copy
-// kept of a function more than one object defines; with its line table from
-// the object's .axiom.lines (x64.ax), its files added to `files`.
-fn pdb_funcs(text_rva: u64, files: *mut u.List.[[]u8]) u.List.[pdb.Func] {
-    let mut fs = u.List.[pdb.Func].empty();
+// What the PDB holds of the objects: every function the image holds
+// (defined in code, the copy kept of a function more than one object
+// defines), with its line table from the object's .axiom.lines (x64.ax,
+// a64.ax), its files added to `files`, and its symbols from the object's
+// .axiom.cv (codeview.ax) where it has them (-g); a module per object with
+// functions or symbols; the objects' types and ids, merged.
+struct PdbIn {
+    funcs: u.List.[pdb.Func],
+    mods: u.List.[pdb.Mod],
+    tpi: u.List.[[]u8],
+    ipi: u.List.[[]u8],
+}
+
+fn pdb_input(text_rva: u64, files: *mut u.List.[[]u8]) PdbIn {
+    let mut r = PdbIn.{ funcs: u.List.[pdb.Func].empty(), mods: u.List.[pdb.Mod].empty(), tpi: u.List.[[]u8].empty(),
+                        ipi: u.List.[[]u8].empty() };
     let mut file_map = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    let mut tdedup = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    let mut idedup = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     for oi in 0..nl.objs.len {
         let o = nl.objs.get(oi);
         let mut lines = object_lines(o, files, &mut file_map);
+        let mut cv = CvObj.{ blobs: u.List.[CvBlob].empty(), tmap: u.List.[u32].empty(), imap: u.List.[u32].empty(),
+                             names: u.List.[[]u8].empty(), oi: oi };
+        cv_read(o, &mut cv);
+        // the types, then the ids (which refer to types)
+        for bl in cv.blobs.items() {
+            if bl.tag == 'T' {
+                merge_records(&bl, &mut cv, false, &mut r.tpi, &mut tdedup);
+            }
+        }
+        for bl in cv.blobs.items() {
+            if bl.tag == 'I' {
+                merge_records(&bl, &mut cv, true, &mut r.ipi, &mut idedup);
+            } else if bl.tag == 'N' {
+                cv.names.push(bl.name);
+            }
+        }
+        let mut procs = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+        for k in 0..cv.blobs.len {
+            if cv.blobs.get(k).tag == 'P' {
+                procs.put(u.intern(cv.blobs.get(k).name), @truncate(u32, k) + 1);
+            }
+        }
+        let mi = @truncate(u32, r.mods.len);
+        let nf = r.funcs.len;
         for si in 0..o.syms.len {
             let sy = o.syms.at(si);
             if (sy.ty != elf.T_FUNC) or (sy.sec < 0) or (sy.name.len == 0) {
@@ -1252,21 +1292,275 @@ fn pdb_funcs(text_rva: u64, files: *mut u.List.[[]u8]) u.List.[pdb.Func] {
             let addr = nl.sym_addr_in(oi, @truncate(u32, si));
             let mut ls = u.nil_slice.[pdb.Line]();
             let name = elf.display_name(sy.name);
-            let found = lines.get(u.intern(sy.name));  // (by the symbol's own name: winlines.emit)
+            let found = lines.get(u.intern(cvw.func_key(sy.sec, sy.value)));  // (by its place: winlines.emit)
             if u.notnil(found) {
                 ls = found.items();
             }
-            fs.push(
-                pdb.Func.{
-                    name: name, sec: 1, off: @truncate(u32, addr - BASE - text_rva), size: @truncate(u32, sy.size),
-                    lines: ls });
+            let off = @truncate(u32, addr - BASE - text_rva);
+            let mut f = pdb.Func.{ name: name, sec: 1, off: off, size: @truncate(u32, sy.size), lines: ls,
+                                   syms: u.nil_slice.[u8](), self_fix: u.nil_slice.[u32](), module: mi,
+                                   external: sy.bind != elf.B_LOCAL };
+            let bk = procs.get(u.intern(cvw.func_key(sy.sec, sy.value)));
+            if bk != 0 {
+                let p = patch_syms(cv.blobs.at(@as(usize, bk - 1)), &cv, off);
+                f.syms = p.data;
+                f.self_fix = p.self_fix;
+            }
+            r.funcs.push(f);
+        }
+        let mut gs: []u8 = u.nil_slice.[u8]();
+        for k in 0..cv.blobs.len {
+            if cv.blobs.get(k).tag == 'G' {
+                gs = patch_syms(cv.blobs.at(k), &cv, 0).data;
+            }
+        }
+        if (r.funcs.len > nf) or (gs.len > 0) {
+            r.mods.push(pdb.Mod.{ name: module_name(r.funcs.items()[nf..], files.items(), mi), syms: gs });
         }
     }
-    return fs;
+    return r;
 }
 
-// An object's line tables (.axiom.lines: winlines.ax), by
-// function name; file numbers become indexes in `files`.
+// A module's name: the file of its first line, or one made up.
+fn module_name(fs: []pdb.Func, files: [][]u8, mi: u32) []u8 {
+    for f in fs {
+        if f.lines.len > 0 {
+            return files[@as(usize, f.lines[0].file)];
+        }
+    }
+    return u.f1("axiom-module-%s", u.idec(@bit_cast(i32, mi)));
+}
+
+// An object's .axiom.cv, read (codeview.ax describes it).
+struct CvFix {
+    off: u32,
+    kind: u8,
+    arg: u32,
+}
+
+struct CvBlob {
+    tag: u8,
+    name: []u8,
+    data: []u8,
+    fx: []CvFix,
+}
+
+struct CvObj {
+    blobs: u.List.[CvBlob],
+    tmap: u.List.[u32],    // the object's type index - 0x1000 -> the program's
+    imap: u.List.[u32],    // and its ids'
+    names: u.List.[[]u8],  // its data symbols' names (FK_DATA's arguments)
+    oi: usize,
+}
+
+fn cv_read(o: *mut elf.Obj, cv: *mut CvObj) void {
+    for k in 0..o.secs.len {
+        let sec = o.secs.get(k);
+        if (sec.kind != elf.S_DEBUG) or not u.str_eq(sec.name, ".axiom.cv") {
+            continue;
+        }
+        let d = sec.data.view();
+        let mut at: usize = 0;
+        while (at + 13) <= d.len {
+            let tag = d[at];
+            let nn = @truncate(usize, bn.rd32(d, at + 1));
+            let name = d[at + 5..at + 5 + nn];
+            at += 5 + nn;
+            let nd = @truncate(usize, bn.rd32(d, at));
+            let data = d[at + 4..at + 4 + nd];
+            at += 4 + nd;
+            let nfx = @truncate(usize, bn.rd32(d, at));
+            at += 4;
+            let fx = u.newn.[CvFix](nfx + 1);
+            for j in 0..nfx {
+                let b = at + (j * 9);
+                fx[j] = CvFix.{
+                    off: @truncate(u32, bn.rd32(d, b)), kind: d[b + 4], arg: @truncate(u32, bn.rd32(d, b + 5)) };
+            }
+            at += nfx * 9;
+            cv.blobs.push(CvBlob.{ tag: tag, name: name, data: data, fx: fx[0..nfx] });
+        }
+    }
+}
+
+// An index of the object's (a type's: FK_TYPE, an id's: FK_ID) in the program.
+fn remap(cv: *CvObj, kind: u8, v: u64) u64 {
+    if v < 0x1000 {
+        return v;
+    }
+    let k = @truncate(usize, v - 0x1000);
+    let m = pick_list(kind == cvw.FK_ID, &cv.imap, &cv.tmap);
+    if k >= m.len {
+        nl.err("internal: a debug type index out of range");
+        return 0;
+    }
+    return @as(u64, m.get(k));
+}
+
+fn pick_list(c: bool, a: *u.List.[u32], b: *u.List.[u32]) *u.List.[u32] {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// Adds the object's type (ids: id) records of blob bl to the program's
+// `out`, the same record once (dedup: its bytes -> its index): their
+// indexes, in the object's map.
+fn merge_records(bl: *CvBlob, cv: *mut CvObj, ids: bool, out: *mut u.List.[[]u8], dedup: *mut u.SymMap.[u32]) void {
+    let d = bl.data;
+    let mut at: usize = 0;
+    let mut j: usize = 0;
+    while (at + 4) <= d.len {
+        let n = @truncate(usize, bn.rd16(d, at)) + 2;
+        let r = u.newn.[u8](n);
+        @mem_copy(r, d[at..at + n]);
+        while (j < bl.fx.len) and (@as(usize, bl.fx[j].off) < (at + n)) {
+            let x = bl.fx[j];
+            let o = @as(usize, x.off) - at;
+            bn.w32(r, @as(u64, o), remap(cv, x.kind, bn.rd32(r, o)));
+            j += 1;
+        }
+        let key = u.intern(r);
+        let mut idx = dedup.get(key);
+        if idx == 0 {
+            out.push(key);
+            idx = 0x1000 + @truncate(u32, out.len) - 1;
+            dedup.put(key, idx);
+        }
+        if ids {
+            cv.imap.push(idx);
+        } else {
+            cv.tmap.push(idx);
+        }
+        at += n;
+    }
+}
+
+// A symbol blob with its fixups applied (a function's at offset `off` of
+// .text): the records whose data no longer is in the image left out, the
+// blob's own references (FK_SELF, made offsets in the new blob) for pdb.ax
+// to make offsets in the module's stream.
+struct Patched {
+    data: []u8,
+    self_fix: []u32,
+}
+
+fn patch_syms(bl: *CvBlob, cv: *CvObj, off: u32) Patched {
+    let d = bl.data;
+    // the records, and which are kept
+    let mut starts = u.List.[usize].empty();
+    let mut at: usize = 0;
+    while (at + 4) <= d.len {
+        starts.push(at);
+        at += @truncate(usize, bn.rd16(d, at)) + 2;
+    }
+    starts.push(d.len);
+    let keep = u.newn.[bool](starts.len + 1);
+    let addr = u.newn.[u64](bl.fx.len + 1);
+    for k in 0..starts.len {
+        keep[k] = true;
+    }
+    let mut ri: usize = 0;
+    for j in 0..bl.fx.len {
+        let x = bl.fx[j];
+        while ((ri + 1) < starts.len) and (starts.get(ri + 1) <= @as(usize, x.off)) {
+            ri += 1;
+        }
+        if x.kind == cvw.FK_DATA {
+            addr[j] = data_addr(cv, x.arg);
+            if addr[j] == 0 {
+                keep[ri] = false;  // (a datum not in the image)
+            }
+        }
+    }
+    // the new offsets of the records
+    let newat = u.newn.[usize](starts.len + 1);
+    let mut size: usize = 0;
+    for k in 0..starts.len {
+        newat[k] = size;
+        if (k + 1) < starts.len and keep[k] {
+            size += starts.get(k + 1) - starts.get(k);
+        }
+    }
+    let out = u.newn.[u8](size + 1);
+    let mut self_fix = u.List.[u32].empty();
+    let mut j: usize = 0;
+    for k in 0..(starts.len - 1) {
+        let a = starts.get(k);
+        let e = starts.get(k + 1);
+        let at2 = newat[k];
+        while (j < bl.fx.len) and (@as(usize, bl.fx[j].off) < a) {
+            j += 1;
+        }
+        if not keep[k] {
+            continue;
+        }
+        let r = out[at2..at2 + (e - a)];
+        @mem_copy(r, d[a..e]);
+        while (j < bl.fx.len) and (@as(usize, bl.fx[j].off) < e) {
+            let x = bl.fx[j];
+            let o = @as(usize, x.off) - a;
+            let v = bn.rd32(r, o);
+            if (x.kind == cvw.FK_TYPE) or (x.kind == cvw.FK_ID) {
+                bn.w32(r, @as(u64, o), remap(cv, x.kind, v));
+            } else if x.kind == cvw.FK_CODE {
+                bn.w32(r, @as(u64, o), v + @as(u64, off));
+                bn.w16(r, @as(u64, o + 4), 1);
+            } else if x.kind == cvw.FK_DATA {
+                let so = sec_off(addr[j] - BASE);
+                bn.w32(r, @as(u64, o), so & 0xffff_ffff);
+                bn.w16(r, @as(u64, o + 4), so >> 32);
+            } else if x.kind == cvw.FK_SELF {
+                // (an offset of a record in the blob)
+                let mut t: usize = 0;
+                while (t < starts.len) and (starts.get(t) < @truncate(usize, v)) {
+                    t += 1;
+                }
+                bn.w32(r, @as(u64, o), @as(u64, newat[t]));
+                self_fix.push(@truncate(u32, at2 + o));
+            }
+            j += 1;
+        }
+    }
+    starts.deinit();
+    return Patched.{ data: out[0..size], self_fix: self_fix.items() };
+}
+
+// The address of the object's data symbol named by its 'N' blob `k`
+// (0: not in the image).
+fn data_addr(cv: *CvObj, k: u32) u64 {
+    if @as(usize, k) >= cv.names.len {
+        return 0;
+    }
+    let name = cv.names.get(@as(usize, k));
+    let o = nl.objs.get(cv.oi);
+    for si in 0..o.syms.len {
+        let sy = o.syms.at(si);
+        if (sy.sec < 0) or not u.str_eq(sy.name, name) {
+            continue;
+        }
+        if nl.sec_cls.get(cv.oi)[@as(usize, @bit_cast(u32, sy.sec))] == C_NONE {
+            return 0;
+        }
+        return nl.sym_addr(cv.oi, @truncate(u32, si));
+    }
+    return 0;
+}
+
+// An image address's (an RVA's) section number << 32 | offset in it.
+fn sec_off(rva: u64) u64 {
+    for k in 0..outs.len {
+        let o = outs[k];
+        if (o.vsize > 0) and (rva >= o.rva) and (rva < (o.rva + o.vsize)) {
+            return ((@as(u64, k) + 1) << 32) | (rva - o.rva);
+        }
+    }
+    return 0;
+}
+
+// An object's line tables (.axiom.lines: winlines.ax), by function (its
+// symbol's place: codeview.func_key); file numbers become indexes in `files`.
 fn object_lines(o: *mut elf.Obj, files: *mut u.List.[[]u8],
                 file_map: *mut u.SymMap.[u32]) u.SymMap.[*mut u.List.[pdb.Line]] {
     let mut m = u.SymMap.[*mut u.List.[pdb.Line]].{ keys: u.nil.[usize](), vals: u.nil.[*mut u.List.[pdb.Line]](),

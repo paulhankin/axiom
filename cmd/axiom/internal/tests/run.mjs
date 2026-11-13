@@ -40,6 +40,7 @@ import os from 'os';
 import { Worker } from 'worker_threads';
 import { createHost } from '../../../../std/internal/runtime/host.mjs';
 import { checkMachO } from './macho.mjs';
+import { checkPDB } from './pdb.mjs';
 import { checkPE, checkPEFile } from './pe.mjs';
 import { loadImage, checkDebug, addrsOfLine, subprogramAt, checkVars, checkAxVars, readDwarf, frameAt } from './dwarf.mjs';
 
@@ -2299,6 +2300,30 @@ if (!skipPlatform) {
     }
     return Buffer.concat(out);
   };
+  // an ELF object's .text relocations, normalised: offset, type, the
+  // symbol's name (a section symbol's: its section's), addend (the symbol
+  // tables' order and size differ with the debug sections)
+  const objRelocs = (d) => {
+    const shoff = Number(d.readBigUInt64LE(40)), shnum = d.readUInt16LE(60), shstr = d.readUInt16LE(62);
+    const sh = (k) => shoff + 64 * k;
+    const so = Number(d.readBigUInt64LE(sh(shstr) + 24));
+    const secName = (k) => d.toString('latin1', so + d.readUInt32LE(sh(k)), d.indexOf(0, so + d.readUInt32LE(sh(k))));
+    let text = -1;
+    for (let k = 0; k < shnum; k++) if (secName(k) === '.text') text = k;
+    const out = [];
+    for (let k = 0; k < shnum; k++) {
+      if (d.readUInt32LE(sh(k) + 4) !== 4 || d.readUInt32LE(sh(k) + 44) !== text) continue;  // (SHT_RELA of .text)
+      const symtab = d.readUInt32LE(sh(k) + 40), st = Number(d.readBigUInt64LE(sh(symtab) + 24));
+      const strtab = Number(d.readBigUInt64LE(sh(d.readUInt32LE(sh(symtab) + 40)) + 24));
+      const at = Number(d.readBigUInt64LE(sh(k) + 24)), n = Number(d.readBigUInt64LE(sh(k) + 32)) / 24;
+      for (let j = 0; j < n; j++) {
+        const r = at + 24 * j, info = d.readBigUInt64LE(r + 8), si = Number(info >> 32n), y = st + 24 * si;
+        const nm = d.readUInt32LE(y), name = nm ? d.toString('latin1', strtab + nm, d.indexOf(0, strtab + nm)) : `[${secName(d.readUInt16LE(y + 6))}]`;
+        out.push(`${d.readBigUInt64LE(r)} ${info & 0xffffffffn} ${name} ${d.readBigInt64LE(r + 16)}`);
+      }
+    }
+    return out.join('\n');
+  };
   // an ELF object's .text
   const objText = (d) => {
     const shoff = Number(d.readBigUInt64LE(40)), shnum = d.readUInt16LE(60), shstr = d.readUInt16LE(62);
@@ -2351,11 +2376,13 @@ if (!skipPlatform) {
             if (!a.equals(b)) return 'two builds differ';
             if (mac && fs.existsSync(`${outs[2]}.dSYM`)) return 'a .dSYM without -g';
             const [ea, en] = [fs.readFileSync(outs[0]), fs.readFileSync(outs[2])];
-            // (the code is the same: an object's instructions, with their
-            // relocations; in an executable, where the frame table's line rows
-            // (ftab.ax) move the data after them, its size)
+            // (the instructions are the same: an object's bytes and its
+            // relocations (normalised); an executable's code, where the frame
+            // table's line rows (ftab.ax) move the data after them and so the
+            // addresses its instructions hold, its size)
             const same = mac ? machoText(ea) === machoText(en) : t.startsWith('wasm') ? wasmCode(ea).equals(wasmCode(en))
-              : obj ? objText(ea).equals(objText(en)) : objText(ea).length === objText(en).length && objText(ea).length > 0;
+              : obj ? objText(ea).equals(objText(en)) && objRelocs(ea) === objRelocs(en) && objRelocs(ea).length > 0
+              : objText(ea).length === objText(en).length && objText(ea).length > 0;
             void loaded;
             if (!same) return '-g changed the code';
             if (mac && checkMachO(ea).errs.length) return `the executable: ${checkMachO(ea).errs.join('\n')}`;
@@ -2363,6 +2390,19 @@ if (!skipPlatform) {
             const img = loadImage(a);
             const r = checkDebug(img, { cfi: !t.startsWith('wasm') });
             if (r.errs.length) return r.errs.join('\n');
+            // the line tables' MD5 checksums: each a file's on disk (none in a
+            // unit with a name of C's #line, frames.c's)
+            let summed = 0;
+            for (const sq of r.dw.seqs) {
+              sq.files.forEach((f, k) => {
+                if (sq.sums[k] && fs.existsSync(f)) {
+                  summed++;
+                  if (!crypto.createHash('md5').update(fs.readFileSync(f)).digest().equals(sq.sums[k])) r.errs.push(`${f}: not its MD5`);
+                }
+              });
+            }
+            if (r.errs.length) return r.errs.slice(0, 10).join('\n');
+            if (!summed && file !== 'frames.c') return 'no MD5 checksums';
             if (obj && !r.nrets) return 'no frame table entries checked';
             if (file === 'vars.c') {
               // (WebAssembly: the variables at -O0, in their frame slots from the
@@ -2393,6 +2433,69 @@ if (!skipPlatform) {
             return null;
           };
         }
+      }
+    }
+  }
+  // Windows (x64 and ARM64): the program database (pdb.mjs: its structure,
+  // every type index resolvable, every scope closed, every location's range
+  // in its procedure), two builds the same, -g changing no code, and
+  // vars.c's variables there (at -O0 each with a location).
+  for (const file of ['frames.c', 'frames.ax', 'vars.c', 'vars.ax', 'shared.ax']) {
+    const src = path.join(ddir, file);
+    for (const t of ['x86_64-windows', 'aarch64-windows']) {
+      for (const lvl of ['-O0', '-O2']) {
+        dcases[`${file} ${t} ${lvl}`] = async () => {
+          const dir = path.join(tmp, `debug-${file}-${t}${lvl}`);
+          fs.mkdirSync(dir, { recursive: true });
+          const exe = path.join(dir, 'prog.exe'), pdbf = path.join(dir, 'prog.pdb');
+          const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+          const got = [];
+          for (const g of [true, true, false]) {
+            const r = await spawnAsync(compiler, ['build', src, `--target=${t}`, lvl, ...(g ? ['-g'] : []), '-o', exe],
+              { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+            if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+            if (g && got.length === 0) {
+              const pe = checkPEFile(exe, { arm64: t.startsWith('aarch64') });
+              if (pe.errs.length) return pe.errs.slice(0, 20).join('\n');
+            }
+            got.push([fs.readFileSync(exe), fs.existsSync(pdbf) ? fs.readFileSync(pdbf) : Buffer.alloc(0)]);
+          }
+          if (!got[0][0].equals(got[1][0]) || !got[0][1].equals(got[1][1])) return 'two builds differ';
+          const text = (d) => {
+            const pe = d.readUInt32LE(0x3c), h = pe + 24 + d.readUInt16LE(pe + 20);
+            return d.toString('latin1', h, h + 5) === '.text' ? d.subarray(d.readUInt32LE(h + 20), d.readUInt32LE(h + 20) + d.readUInt32LE(h + 8)) : Buffer.alloc(0);
+          };
+          if (text(got[0][0]).length !== text(got[2][0]).length || !text(got[0][0]).length) return '-g changed the code';
+          // (the objects' instructions and relocations, normalised: the same)
+          const objs = [];
+          for (const g of [true, false]) {
+            const o = path.join(dir, `prog${g ? '-g' : ''}.o`);
+            const r = await spawnAsync(compiler, ['build', src, `--target=${t}`, lvl, ...(g ? ['-g'] : []), '--emit=obj', '-o', o],
+              { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+            if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+            objs.push(fs.readFileSync(o));
+          }
+          if (!objText(objs[0]).equals(objText(objs[1])) || objRelocs(objs[0]) !== objRelocs(objs[1]) || !objRelocs(objs[0]).length) return '-g changed the object\'s code';
+          const r = checkPDB(got[0][1]);
+          if (r.errs.length) return r.errs.slice(0, 20).join('\n');
+          if (file !== 'vars.c') return null;
+          // the variables of vars.c's functions (a block's own x too); at -O0
+          // each with a location (no S_LOCAL without one: the VLA's v, held
+          // through its address, has none)
+          const want = { shadow: ['n', 'x', 'px', 'i', 'pr', 'w'], once: ['a', 'b', 's', 't'], vla: ['n', 'i'] };
+          for (const [fn, names] of Object.entries(want)) {
+            const p = r.procs.find((x) => x.name === fn);
+            if (!p) return `no procedure ${fn}`;
+            for (const n of names) {
+              const l = p.locals.find((x) => x.name === n);
+              if (!l) return `${fn}: no variable ${n}`;
+              if (lvl === '-O0' && (l.flags & 0x100)) return `${fn}: ${n} has no location at -O0`;
+            }
+            if (fn === 'shadow' && p.locals.filter((x) => x.name === 'x').length < 2) return 'shadow: the inner x is missing';
+          }
+          if (!r.types.some((x) => x.readUInt16LE(2) === 0x1505 && x.includes(Buffer.from('pair\0')))) return 'no struct pair';
+          return null;
+        };
       }
     }
   }
@@ -2807,9 +2910,34 @@ if (!skipPlatform) {
       if (p.readUInt32LE(info) !== 20000404) return 'bad info stream';
       if (!p.subarray(info + 12, info + 28).equals(guid)) return 'the GUIDs differ';
       if (p.readUInt32LE(info + 8) !== exe.readUInt32LE(rsds + 20)) return 'the ages differ';
-      // the functions' names are in it (the publics), and their files (/names)
+      // its structure (pdb.mjs); the functions' names are in it (the
+      // publics), and their files (/names)
+      const pr = checkPDB(p);
+      if (pr.errs.length) return pr.errs.slice(0, 20).join('\n');
       const text = p.toString('latin1');
       return text.includes('examples/pi/pi.pi_digits') && /examples[\\/]pi[\\/]pi\.ax/.test(text) ? null : 'names or files missing';
+    },
+    // -g: the program database's types and variables (codeview.ax), its
+    // structure checked (pdb.mjs); under Wine, windows/symbols.c (with an
+    // Axiom function, windows/symbols.ax) reads it
+    // back through the system's symbol handler and compares the values of
+    // its variables where it says they are (at -O0 all of them, at -O2 each
+    // one it locates) with those the program holds.
+    'debug symbols: types and variables (windows/symbols.c)': () => {
+      for (const o of ['-O0', '-O2']) {
+        const n = `symbols${o}`;
+        const c = build(path.join(root, 'cmd/axiom/internal/tests/windows/symbols.c'), n,
+          [path.join(root, 'cmd/axiom/internal/tests/windows/symbols.ax'), o, '-g']);
+        if (c.status !== 0) return `${o}: build failed:\n${c.stdout}${c.stderr}`;
+        const p = checkPE(out(n));
+        if (p) return `${o}: ${p}`;
+        const pr = checkPDB(fs.readFileSync(out(n).replace(/\.exe$/, '.pdb')));
+        if (pr.errs.length) return `${o}: ${pr.errs.slice(0, 20).join('\n')}`;
+        if (!wine) continue;
+        const r = run(n, o === '-O0' ? [] : ['optimized']);
+        if (r.status !== 0 || !/^ok \d+ checks, [1-9]\d* values\r?\n$/.test(r.stdout)) return `${o}: status ${r.status}: ${r.stdout}${r.stderr}`;
+      }
+      return null;
     },
     'pi to 2000 places': () => {
       const c = build(path.join(root, 'examples/pi/pi.ax'), 'pi', ['-O2']);

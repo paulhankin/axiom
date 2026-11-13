@@ -17,13 +17,17 @@
 //   .debug_frame     call frame information: a CIE, an FDE per function
 //   .debug_rnglists  the address ranges of lexical blocks in more than one piece
 //   .debug_loclists  the locations of variables that move (optimized code)
+//   .debug_names     the unit's index of names: its subprograms (and at
+//                    DEBUG_FULL static variables, named types, enumerators)
 // References from one section to another and to code are relocations
 // (R_X86_64_32 / R_AARCH64_ABS32 against the section's symbol, R_X86_64_64
 // / R_AARCH64_ABS64 against the function's), which the system's linker and
 // our own (nlink.ax: debug_sections) resolve.
 //
-// What is recorded never changes the code: the code generators only note
-// offsets and states as they encode (and only when tg.g_debug is on).
+// What is recorded never changes the instructions: the code generators only
+// note offsets and states as they encode (and only when tg.g_debug is on);
+// the frame table's line rows (ftab.ax) move the data after them in an
+// executable, and so the addresses instructions hold.
 // Formats: the DWARF 5 standard (dwarfstd.org), sections 6.2 (line number
 // information), 6.4 (call frame information), 7 (data representation).
 // =============================================================================
@@ -32,6 +36,7 @@ import "dbginfo.ax" as dbi;
 import "dloc.ax" as dloc;
 import "elf.ax" as elf;
 import "ir.ax" as ir;
+import "std/crypto/md5" as md5;
 import "util.ax" as u;
 import "version.ax" as ver;
 
@@ -45,10 +50,11 @@ pub const D_ARANGES: usize = 5;
 pub const D_FRAME: usize = 6;
 pub const D_RNGLISTS: usize = 7;
 pub const D_LOCLISTS: usize = 8;
-pub const NSEC: usize = 9;
+pub const D_NAMES: usize = 9;
+pub const NSEC: usize = 10;
 
-pub let SEC_NAMES: [9][]u8 = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line", ".debug_line_str",
-                              ".debug_aranges", ".debug_frame", ".debug_rnglists", ".debug_loclists"];
+pub let SEC_NAMES: [10][]u8 = [".debug_abbrev", ".debug_info", ".debug_str", ".debug_line", ".debug_line_str",
+                               ".debug_aranges", ".debug_frame", ".debug_rnglists", ".debug_loclists", ".debug_names"];
 
 // Is it the name of a debug section this module writes (and the linkers merge)?
 pub fn is_debug_name(name: []u8) bool {
@@ -100,7 +106,7 @@ pub struct Unit {
     addr_size: u64,
     full: bool,  // DEBUG_FULL: types and variables too
     lang: u32,   // DW_LANG_* (0: none named)
-    parts: [9]Part,
+    parts: [10]Part,
     strs: u.SymMap.[u32],   // interned string -> its .debug_str offset + 1
     lstrs: u.SymMap.[u32],  // interned string -> its .debug_line_str offset + 1
     files: u.List.[u32],    // the line table's files: their names' .debug_line_str offsets
@@ -113,17 +119,28 @@ pub struct Unit {
     // dbginfo index), and the data's symbols (name -> symbol index + 1)
     trefs: u.List.[Fix],
     gsyms: u.SymMap.[u32],
-    toff: u.List.[u64],    // each type's offset in the .debug_info part + 1 (0: not written yet)
-    drefs: u.List.[Fix],   // references to entries in the part (addend: its offset), which finish moves
-    gdone: u.List.[bool],  // per dbinfo global: written in a lexical block
-    voffs: u.List.[u64],   // (while a function is written: its variables' entries' offsets + 1)
-    tls_rel: u32,          // the relocation of an offset in the TLS block (FX_TLS), 0: thread-locals have no location
-    cies: [4]u64,          // file-scope asm's other CIEs (add_asm_fde: bit 0 simple, bit 1 a signal frame): offset + 1
-    size_fix: bool,        // the unit's code size is a fixup (FX_SIZE: finish_parts)
+    toff: u.List.[u64],     // each type's offset in the .debug_info part + 1 (0: not written yet)
+    drefs: u.List.[Fix],    // references to entries in the part (addend: its offset), which finish moves
+    gdone: u.List.[bool],   // per dbinfo global: written in a lexical block
+    voffs: u.List.[u64],    // (while a function is written: its variables' entries' offsets + 1)
+    tls_rel: u32,           // the relocation of an offset in the TLS block (FX_TLS), 0: thread-locals have no location
+    cies: [4]u64,           // file-scope asm's other CIEs (add_asm_fde: bit 0 simple, bit 1 a signal frame): offset + 1
+    size_fix: bool,         // the unit's code size is a fixup (FX_SIZE: finish_parts)
+    sums: u.List.[[16]u8],  // the line table's files' MD5 checksums (in files' order)
+    nosum: bool,            // a file of the line table has none (a presumed name of C's #line): none are given
+    names: u.List.[Named],  // DEBUG_FULL: the entries .debug_names indexes
+}
+
+// An entry of the name index: its name (interned), tag, and offset in the
+// .debug_info part (before the unit's header).
+pub struct Named {
+    name: []u8,
+    tag: u64,
+    off: u64,
 }
 
 pub fn none() Unit {
-    return Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0, parts: [new_part(); 9],
+    return Unit.{ on: false, arch: 0, addr_size: 8, full: false, lang: 0, parts: [new_part(); 10],
                   strs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   lstrs: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   files: u.List.[u32].empty(), fmap: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](),
@@ -131,7 +148,8 @@ pub fn none() Unit {
                   nfuncs: 0, first_src: 0, text_sym: 0, trefs: u.List.[Fix].empty(),
                   gsyms: u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 },
                   toff: u.List.[u64].empty(), drefs: u.List.[Fix].empty(), gdone: u.List.[bool].empty(),
-                  voffs: u.List.[u64].empty(), tls_rel: 0, cies: [0; 4], size_fix: false };
+                  voffs: u.List.[u64].empty(), tls_rel: 0, cies: [0; 4], size_fix: false, sums: u.List.[[16]u8].empty(),
+                  nosum: false, names: u.List.[Named].empty() };
 }
 
 fn new_part() Part {
@@ -233,7 +251,7 @@ pub fn where_of(d: *mut Unit, src: u32) Where {
             d.by_id.push(0);
         }
         if d.by_id.get(k) == 0 {
-            d.by_id.set(k, file_index(d, file_path(file)) + 1);
+            d.by_id.set(k, file_index(d, file_path(file), sf) + 1);
         }
         return Where.{ file: d.by_id.get(k) - 1, line: line };
     }
@@ -246,18 +264,31 @@ pub fn where_of(d: *mut Unit, src: u32) Where {
     if (p.line > 0) and (p.line < 0x7fff_ffff) {
         ln = @truncate(u32, @bit_cast(u64, p.line));
     }
-    return Where.{ file: file_index(d, name), line: ln };
+    let mut of = u.nil.[u.SourceFile]();
+    if not p.marked {
+        of = sf;
+    }
+    return Where.{ file: file_index(d, name, of), line: ln };
 }
 
 // The line table's index of the file named `name` (from 1: DWARF 5's file 0
 // is the unit's primary file, which finish repeats as entry 0).
-fn file_index(d: *mut Unit, name: []u8) u32 {
+// sf: the source file it is (its text, for its checksum), or nil: a name
+// that is not a file read (C's #line).
+fn file_index(d: *mut Unit, name: []u8, sf: *mut u.SourceFile) u32 {
     let k = u.intern(name);
     let at = d.fmap.get(k);
     if at != 0 {
         return at;
     }
     d.files.push(line_str_off(d, name));
+    let mut sum: [16]u8 = [0; 16];
+    if u.notnil(sf) and not u.isnos(sf.text) {
+        md5.md5(sf.text, sum[..]);  // (the text as read: the file's bytes)
+    } else {
+        d.nosum = true;
+    }
+    d.sums.push(sum);
     let idx = @int_cast(u32, d.files.len);
     d.fmap.put(k, idx);
     return idx;
@@ -601,6 +632,7 @@ fn subprogram(d: *mut Unit, f: *Func) void {
     if rt >= 0 {
         code += AB_SUB_TYPED - AB_SUB_EXT;
     }
+    named(d, f.name, TAG_SUBPROGRAM, @as(u64, p.b.len()));
     p.b.uleb(code);
     let so = str_off(d, f.name);
     p.fx.push(Fix.{ off: @as(u64, p.b.len()), kind: FX_SEC, sym: @truncate(u32, D_STR), addend: @as(i64, so) });
@@ -1052,6 +1084,7 @@ fn var_die(d: *mut Unit, f: *Func, k: usize, v: dbi.DVar, clip: []Piece) void {
         if (sym == 0) or (v.global.tls and (d.tls_rel == 0)) {
             return;  // (written at the top level: types_and_data)
         }
+        named(d, v.name, TAG_VARIABLE, @as(u64, ib(d).len()));
         ib(d).uleb(AB_GVAR + 1);
         strp(d, v.name);
         decl_at(d, v.src);
@@ -1502,7 +1535,25 @@ fn write_type(d: *mut Unit, t: i32) void {
         return;
     }
     d.toff.set(k, @as(u64, ib(d).len()) + 1);
-    type_die(d, dbi.types.at(k));
+    let dt = dbi.types.at(k);
+    if dt.name.len > 0 {
+        let mut tag: u64 = 0;
+        if dt.kind == dbi.DK_BASE {
+            tag = TAG_BASE_TYPE;
+        } else if dt.kind == dbi.DK_TYPEDEF {
+            tag = TAG_TYPEDEF;
+        } else if ((dt.kind == dbi.DK_STRUCT) and dt.complete) or (dt.kind == dbi.DK_TAGGED) {
+            tag = TAG_STRUCTURE_TYPE;
+        } else if (dt.kind == dbi.DK_UNION) and dt.complete {
+            tag = TAG_UNION_TYPE;
+        } else if dt.kind == dbi.DK_ENUM {
+            tag = TAG_ENUMERATION_TYPE;
+        }
+        if tag != 0 {
+            named(d, dt.name, tag, @as(u64, ib(d).len()));
+        }
+    }
+    type_die(d, dt);
 }
 
 // A reference to the entry at offset `at` of the part (finish moves it).
@@ -1531,6 +1582,7 @@ fn types_and_data(d: *mut Unit) []u64 {
         if sym == 0 {
             continue;  // (another object's)
         }
+        named(d, v.name, TAG_VARIABLE, @as(u64, ib(d).len()));
         ib(d).uleb(AB_GVAR + pk(v.external, @as(u64, 0), @as(u64, 1)));
         strp(d, v.name);
         decl_at(d, v.src);
@@ -1605,6 +1657,7 @@ fn type_die(d: *mut Unit, t: *dbi.DType) void {
         tref(d, t.target);
         ib(d).uleb(t.size);
         for m in t.members.items() {
+            named(d, m.name, TAG_ENUMERATOR, @as(u64, ib(d).len()));
             ib(d).uleb(AB_ENUMERATOR);
             strp(d, m.name);
             ib(d).sleb(m.value);
@@ -1709,6 +1762,143 @@ fn tagged_die(d: *mut Unit, t: *dbi.DType) void {
     }
     ib(d).u8_(0);  // (the variant part)
     ib(d).u8_(0);
+}
+
+// -----------------------------------------------------------------------------
+// .debug_names
+// -----------------------------------------------------------------------------
+// An entry the name index lists: `name`'s DIE of tag `tag` at offset `off`
+// of the .debug_info part.
+fn named(d: *mut Unit, name: []u8, tag: u64, off: u64) void {
+    if name.len > 0 {
+        d.names.push(Named.{ name: u.intern(name), tag: tag, off: off });
+    }
+}
+
+// The hash of the name index (DWARF 5, 6.1.1.4.5: Bernstein's, from 5381).
+pub fn djb_hash(s: []u8) u32 {
+    let mut h: u32 = 5381;
+    for c in s {
+        h = (h *% 33) +% @as(u32, c);
+    }
+    return h;
+}
+
+const IDX_DIE_OFFSET: u64 = 3;
+
+// The unit's name index (DWARF 5, 6.1.1): the header (one compilation unit,
+// no type units, no augmentation), the unit, the hash table (buckets of
+// names by hash, their hashes), each name's string and entries, the
+// abbreviations (one per tag: a DIE offset from the unit's start, the
+// unit's header being hn bytes), the entries.
+fn name_index(d: *mut Unit, hn: u64) void {
+    let es = d.names.items();
+    if es.len == 0 {
+        return;
+    }
+    // the names, each once, with its entries
+    let mut names = u.List.[[]u8].empty();
+    let mut at = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for e in es {
+        if at.get(e.name) == 0 {
+            names.push(e.name);
+            at.put(e.name, @truncate(u32, names.len));
+        }
+    }
+    let n = names.len;
+    let nb = @max(n / 2, 1);
+    // the names in bucket order (stable)
+    let order = u.newn.[usize](n + 1);
+    let mut k: usize = 0;
+    for b in 0..nb {
+        for j in 0..n {
+            if (@as(usize, djb_hash(names.get(j))) % nb) == b {
+                order[k] = j;
+                k += 1;
+            }
+        }
+    }
+    // the abbreviations: one per tag
+    let mut tags = u.List.[u64].empty();
+    for e in es {
+        let mut have = false;
+        for t in tags.items() {
+            have = have or (t == e.tag);
+        }
+        if not have {
+            tags.push(e.tag);
+        }
+    }
+    let mut ab = bn.new_bytes();
+    for ti in 0..tags.len {
+        ab.uleb(@as(u64, ti) + 1);
+        ab.uleb(tags.get(ti));
+        ab.uleb(IDX_DIE_OFFSET);
+        ab.uleb(FORM_REF4);
+        ab.uleb(0);
+        ab.uleb(0);
+    }
+    ab.uleb(0);
+    // the entries, by name in the table's order
+    let mut pool = bn.new_bytes();
+    let eoff = u.newn.[u64](n + 1);
+    for x in 0..n {
+        let j = order[x];
+        eoff[x] = @as(u64, pool.len());
+        for e in es {
+            if e.name.ptr != names.get(j).ptr {
+                continue;
+            }
+            let mut ti: usize = 0;
+            while tags.get(ti) != e.tag {
+                ti += 1;
+            }
+            pool.uleb(@as(u64, ti) + 1);
+            pool.u32_(e.off + hn);
+        }
+        pool.uleb(0);
+    }
+    let p = &mut d.parts[D_NAMES];
+    p.b.u32_(0);  // (the length, below)
+    p.b.u16_(5);
+    p.b.u16_(0);
+    p.b.u32_(1);  // compilation units
+    p.b.u32_(0);  // local type units
+    p.b.u32_(0);  // foreign type units
+    p.b.u32_(@as(u64, nb));
+    p.b.u32_(@as(u64, n));
+    p.b.u32_(@as(u64, ab.len()));
+    p.b.u32_(0);  // augmentation string: none
+    sec_ref(d, p, D_INFO, 0);
+    // the buckets: each its first name's index (from 1), 0 if empty
+    let mut x: usize = 0;
+    for b in 0..nb {
+        if (x < n) and ((@as(usize, djb_hash(names.get(order[x]))) % nb) == b) {
+            p.b.u32_(@as(u64, x) + 1);
+            while (x < n) and ((@as(usize, djb_hash(names.get(order[x]))) % nb) == b) {
+                x += 1;
+            }
+        } else {
+            p.b.u32_(0);
+        }
+    }
+    for j in 0..n {
+        p.b.u32_(@as(u64, djb_hash(names.get(order[j]))));
+    }
+    for j in 0..n {
+        sec_ref(d, p, D_STR, @as(u64, str_off(d, names.get(order[j]))));
+    }
+    for j in 0..n {
+        p.b.u32_(eoff[j]);
+    }
+    p.b.put(ab.view());
+    p.b.put(pool.view());
+    p.b.set_u32(0, @as(u64, p.b.len() - 4));
+    ab.free();
+    pool.free();
+    names.deinit();
+    tags.deinit();
+    d.names.deinit();
 }
 
 // -----------------------------------------------------------------------------
@@ -2055,6 +2245,7 @@ fn finish(d: *mut Unit, text_size: u64) void {
         }
     }
     info.b.u8_(0);  // the end of the unit's children
+    name_index(d, hn);
     info.b.set_u32(0, @as(u64, info.b.len() - 4));
     // .debug_line: the header, then the program
     let mut lh = new_part();
@@ -2078,14 +2269,21 @@ fn finish(d: *mut Unit, text_size: u64) void {
     lh.b.uleb(FORM_LINE_STRP);
     lh.b.uleb(1);
     sec_ref(d, &mut lh, D_LINE_STR, @as(u64, line_str_off(d, comp_dir)));
-    // files: path and directory; entry 0 (the unit's primary file) is entry 1 again
-    lh.b.u8_(2);
+    // files: path, directory and (when every file has one) the MD5 of its
+    // contents (DWARF 5, 6.2.4.1: DW_LNCT_MD5, DW_FORM_data16); entry 0 (the
+    // unit's primary file) is entry 1 again
+    if d.files.len == 0 {
+        _ = file_index(d, name_s, u.nil.[u.SourceFile]());
+    }
+    let sums = not d.nosum;
+    lh.b.u8_(@truncate(u8, pk(sums, 3, 2)));
     lh.b.uleb(1);
     lh.b.uleb(FORM_LINE_STRP);
     lh.b.uleb(2);  // DW_LNCT_directory_index
     lh.b.uleb(FORM_UDATA);
-    if d.files.len == 0 {
-        _ = file_index(d, name_s);
+    if sums {
+        lh.b.uleb(5);     // DW_LNCT_MD5
+        lh.b.uleb(0x1e);  // DW_FORM_data16
     }
     lh.b.uleb(@as(u64, d.files.len + 1));
     for k in 0..(d.files.len + 1) {
@@ -2095,6 +2293,10 @@ fn finish(d: *mut Unit, text_size: u64) void {
         }
         sec_ref(d, &mut lh, D_LINE_STR, @as(u64, d.files.get(fk)));
         lh.b.uleb(0);
+        if sums {
+            let sm = d.sums.get(fk);
+            lh.b.put(sm[..]);
+        }
     }
     lh.b.set_u32(hstart - 4, @as(u64, lh.b.len() - hstart));
     prepend(&mut d.parts[D_LINE], &mut lh);
@@ -2160,8 +2362,8 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
                                           hidden: false });
     let text_size = elf.sec_size(o.secs.get(@int_cast(usize, text)));
     finish(d, text_size);
-    let mut secs: [9]i32 = [0; 9];
-    let mut ssym: [9]u32 = [0; 9];
+    let mut secs: [10]i32 = [0; 10];
+    let mut ssym: [10]u32 = [0; 10];
     for k in 0..NSEC {
         if (d.parts[k].b.len() == 0) and (k >= D_RNGLISTS) {
             continue;  // (none: not written)
@@ -2197,8 +2399,8 @@ pub fn finish_elf(d: *mut Unit, o: *mut elf.Obj, text: i32, abs64: u32, abs32: u
 /// or datum `sym`, or of TEXT_SYM (the start of the unit's code), FX_SIZE
 /// (the size of the unit's code), FX_SEC (offset `addend` in the unit's
 /// section `sym`). The parts are the caller's.
-pub fn finish_parts(d: *mut Unit) [9]Part {
-    let mut out: [9]Part = [new_part(); 9];
+pub fn finish_parts(d: *mut Unit) [10]Part {
+    let mut out: [10]Part = [new_part(); 10];
     if not d.on or (d.nfuncs == 0) {
         return out;
     }
@@ -2216,8 +2418,8 @@ pub fn finish_parts(d: *mut Unit) [9]Part {
 /// The unit's sections with their fixups resolved, for a linker that knows
 /// each function's address (addr_of(sym)) and places the code at text_addr
 /// (text_size bytes): wlink.ax's custom sections.
-pub fn finish_linked(d: *mut Unit, text_addr: u64, text_size: u64, addr_of: fn(u32) u64) [9]bn.Bytes {
-    let mut out: [9]bn.Bytes = [bn.new_bytes(); 9];
+pub fn finish_linked(d: *mut Unit, text_addr: u64, text_size: u64, addr_of: fn(u32) u64) [10]bn.Bytes {
+    let mut out: [10]bn.Bytes = [bn.new_bytes(); 10];
     if not d.on or (d.nfuncs == 0) {
         return out;
     }

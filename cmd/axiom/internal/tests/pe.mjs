@@ -20,6 +20,7 @@
 // call) or a thunk; every thunk loads an import address table slot.
 // Returns { errs, ... } (errs empty when the file is sound).
 import fs from 'node:fs';
+import { checkPDB } from './pdb.mjs';
 
 export function checkPE(d, opts = {}) {
   const errs = [];
@@ -352,40 +353,11 @@ function checkX64Unwind(d, { E, off, secOf, text, pdata, funcs, r }) {
 }
 
 // The functions a program database lists: [{ off (in section 1), size, name }]
-// from its module's S_GPROC32 records (cmd/axiom/src/pdb.ax writes one
-// module; its symbol stream is the DBI stream's first module's).
+// from its modules' procedure records (pdb.mjs reads them).
 export function pdbFunctions(p, E = () => {}) {
-  if (p.toString('latin1', 0, 24) !== 'Microsoft C/C++ MSF 7.00') { E('the PDB is not an MSF file'); return []; }
-  const bs = p.readUInt32LE(32), ndir = p.readUInt32LE(44);
-  const dirBlocks = [];
-  const map = p.readUInt32LE(52) * bs;
-  for (let k = 0; k < Math.ceil(ndir / bs); k++) dirBlocks.push(p.readUInt32LE(map + 4 * k));
-  const dirData = Buffer.concat(dirBlocks.map((b) => p.subarray(b * bs, (b + 1) * bs)));
-  const nst = dirData.readUInt32LE(0), sizes = [];
-  for (let k = 0; k < nst; k++) sizes.push(dirData.readUInt32LE(4 + 4 * k));
-  let at = 4 + 4 * nst;
-  const stream = (k) => {
-    let a = 4 + 4 * nst;
-    for (let j = 0; j < k; j++) a += 4 * Math.ceil((sizes[j] === 0xffffffff ? 0 : sizes[j]) / bs);
-    const n = Math.ceil(sizes[k] / bs), parts = [];
-    for (let j = 0; j < n; j++) { const b = dirData.readUInt32LE(a + 4 * j); parts.push(p.subarray(b * bs, (b + 1) * bs)); }
-    return Buffer.concat(parts).subarray(0, sizes[k]);
-  };
-  void at;
-  const dbi = stream(3);
-  const modStream = dbi.readUInt16LE(64 + 34), symSize = dbi.readUInt32LE(64 + 36);
-  const m = stream(modStream);
-  const fns = [];
-  for (let o = 4; o < symSize;) {
-    const len = m.readUInt16LE(o), kind = m.readUInt16LE(o + 2);
-    if (kind === 0x1110) {
-      const size = m.readUInt32LE(o + 16), at = m.readUInt32LE(o + 32), sec = m.readUInt16LE(o + 36);
-      const z = m.indexOf(0, o + 39);
-      if (sec === 1) fns.push({ off: at, size, name: m.toString('latin1', o + 39, z) });
-    }
-    o += 2 + len;
-  }
-  return fns.sort((a, b) => a.off - b.off);
+  const r = checkPDB(p);
+  for (const e of r.errs) E(`the PDB: ${e}`);
+  return r.procs.filter((f) => f.sec === 1).map(({ off, size, name }) => ({ off, size, name })).sort((a, b) => a.off - b.off);
 }
 
 // The unwind codes of an ARM64 .xdata record (cmd/axiom/src/a64unwind.ax):

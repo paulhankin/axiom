@@ -3,8 +3,9 @@
 // section .axiom.lines that plink.ax reads to write the program database
 // (pdb.ax). The section is a series of records: 'F', a file's path (u32
 // length, bytes; files are numbered in order), or 'P', a function: its
-// symbol's name (u32 length, bytes), the number of rows, and rows of code
-// offset, file number and line (u32 each). Files and lines are the presumed
+// symbol's place (u32 length, bytes: codeview.func_key, as names are not
+// unique), the number of rows, and rows of code offset, file number and
+// line (u32 each). Files and lines are the presumed
 // ones (C's #line).
 // =============================================================================
 import "elf.ax" as elf;
@@ -61,24 +62,45 @@ fn line_of(o: *mut elf.Obj, sec: i32, src: u32, line: *mut u32) u32 {
     return n - 1;
 }
 
-/// The line table of the function whose symbol is `name` into section sec
-/// of o (from begin); rows: code offset << 32 | ir.src_loc.
+/// The line table of the function whose symbol's place is `name` (its key:
+/// codeview.func_key) into section sec
+/// of o (from begin); rows: code offset << 32 | ir.src_loc (dwarf.ax's
+/// rows: the offset's top bit ROW_PE, which is left out). A row without a
+/// location is left out (its code is the row's before), and of rows at one
+/// offset the last is kept.
 pub fn emit(o: *mut elf.Obj, sec: i32, name: []u8, rows: []u64) void {
+    let mut offs = u.List.[u64].empty();
     let mut files = u.List.[u64].empty();
     for r in rows {
+        let src = @truncate(u32, r);
+        if src == 0 {
+            continue;
+        }
+        let off = (r >> 32) & 0x7fff_ffff;
         let mut line: u32 = 0;
-        let f = line_of(o, sec, @truncate(u32, r), &mut line);
+        let f = line_of(o, sec, src, &mut line);
+        if (offs.len > 0) and (offs.last() == off) {
+            files.set(files.len - 1, (@as(u64, f) << 32) | @as(u64, line));
+            continue;
+        }
+        offs.push(off);
         files.push((@as(u64, f) << 32) | @as(u64, line));
+    }
+    if offs.len == 0 {
+        offs.deinit();
+        files.deinit();
+        return;
     }
     let d = &mut o.secs.get(@int_cast(usize, sec)).data;
     d.u8_('P');
     d.u32_(@as(u64, name.len));
     d.put(name);
-    d.u32_(@as(u64, rows.len));
-    for k in 0..rows.len {
-        d.u32_(rows[k] >> 32);
+    d.u32_(@as(u64, offs.len));
+    for k in 0..offs.len {
+        d.u32_(offs.get(k));
         d.u32_(files.get(k) >> 32);
         d.u32_(files.get(k) & 0xffff_ffff);
     }
+    offs.deinit();
     files.deinit();
 }

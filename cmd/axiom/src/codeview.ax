@@ -1,0 +1,1536 @@
+// =============================================================================
+// codeview.ax - the types and variables of Windows objects (x64.ax, a64.ax)
+// at -g, in CodeView form, in a section .axiom.cv that plink.ax merges into
+// the program database (pdb.ax). It is written from the same debug model as
+// DWARF elsewhere (dbginfo.ax, filled by axdebug.ax and c/cgen_debug.ax; the
+// functions' frames, scopes and variables' locations of dwarf.Func, which
+// dloc.ax computes in optimized code): never from DWARF.
+//
+// The section is a series of blobs: a tag byte, a name (u32 length, bytes),
+// the data (u32 length, bytes), then fixups (u32 count; u32 offset, u8 kind,
+// u32 argument each):
+//   'T' the object's type records (the TPI stream's form; the object's own
+//       indexes, from 0x1000 in order), FK_TYPE fixups only;
+//   'I' its id records (the IPI stream's), from 0x1000: FK_TYPE, FK_ID;
+//   'N' a data symbol's name (no data): FK_DATA's argument numbers them;
+//   'P' a function's symbols (named by its symbol's place, func_key: the
+//       procedure, its frame,
+//       blocks, variables, the S_END), for the module's symbol stream;
+//   'G' symbols at the top level (data, user-defined types): the module's,
+//       and the globals' (pdb.ax).
+// Fixups say where the linker puts what only it knows:
+//   FK_TYPE  a u32 type index: the object's (>= 0x1000) becomes the program's
+//   FK_ID    a u32 id index (IPI) likewise
+//   FK_CODE  a u32 offset in the function (the blob's), then its u16 section:
+//            the offset in the image's section and the section's number
+//   FK_SELF  a u32 offset in the blob: an offset in the module's symbol
+//            stream (a record's parent or end)
+//   FK_DATA  a u32 offset (0), then a u16 section: data symbol `argument`'s
+//            (its 'N' blob's) offset in its section, and the section
+// Records as CodeView defines them (Microsoft's published description of
+// the CodeView and PDB formats: cvinfo.h's records and leaves).
+//
+// What has no CodeView form gets the nearest true one: typedefs are S_UDT
+// symbols (types refer to what they name), _Atomic is its type, a base type
+// without a primitive (decimal floating types, bit-precise integers narrower
+// than their storage, any other new kind) is a structure of its name and
+// size holding its bytes, an Axiom tagged union a structure of its tag and
+// each payload at its offset (they overlap), a variable length array's
+// bound is not known. A variable whose place cannot be stated exactly (held
+// through its address, or where dloc.ax has none) is described without a
+// location: never a wrong value.
+// =============================================================================
+import "bin.ax" as bn;
+import "dbginfo.ax" as dbi;
+import "dloc.ax" as dloc;
+import "dwarf.ax" as dw;
+import "elf.ax" as elf;
+import "ir.ax" as ir;
+import "util.ax" as u;
+
+pub const FK_TYPE: u8 = 0;
+pub const FK_ID: u8 = 1;
+pub const FK_CODE: u8 = 2;
+pub const FK_SELF: u8 = 3;
+pub const FK_DATA: u8 = 4;
+
+// Primitive types (cvinfo.h's CV_PRIMITIVE_TYPE: the type in the low byte,
+// the mode, 6 for 64-bit pointers to it, in the next)
+pub const T_NOTYPE: u32 = 0x0000;
+pub const T_VOID: u32 = 0x0003;
+pub const T_UQUAD: u32 = 0x0023;
+const T_64P: u32 = 0x0600;
+
+// Leaves (type records)
+const LF_MODIFIER: u64 = 0x1001;
+const LF_POINTER: u64 = 0x1002;
+const LF_PROCEDURE: u64 = 0x1008;
+const LF_ARGLIST: u64 = 0x1201;
+const LF_FIELDLIST: u64 = 0x1203;
+const LF_BITFIELD: u64 = 0x1205;
+const LF_INDEX: u64 = 0x1404;
+const LF_ENUMERATE: u64 = 0x1502;
+const LF_ARRAY: u64 = 0x1503;
+const LF_STRUCTURE: u64 = 0x1505;
+const LF_UNION: u64 = 0x1506;
+const LF_ENUM: u64 = 0x1507;
+const LF_MEMBER: u64 = 0x150d;
+const LF_FUNC_ID: u64 = 0x1601;
+const LF_STRING_ID: u64 = 0x1605;
+const LF_UDT_SRC_LINE: u64 = 0x1606;
+
+// Structure properties (CV_prop_t)
+const PROP_FWDREF: u64 = 0x80;
+const PROP_SCOPED: u64 = 0x100;
+const PROP_UNIQUE: u64 = 0x200;
+
+// Symbols
+pub const S_END: u64 = 0x0006;
+pub const S_FRAMEPROC: u64 = 0x1012;
+pub const S_BLOCK32: u64 = 0x1103;
+pub const S_CONSTANT: u64 = 0x1107;
+pub const S_UDT: u64 = 0x1108;
+pub const S_LDATA32: u64 = 0x110c;
+pub const S_GDATA32: u64 = 0x110d;
+pub const S_LPROC32: u64 = 0x110f;
+pub const S_GPROC32: u64 = 0x1110;
+pub const S_REGREL32: u64 = 0x1111;
+pub const S_LTHREAD32: u64 = 0x1112;
+pub const S_GTHREAD32: u64 = 0x1113;
+pub const S_LOCAL: u64 = 0x113e;
+pub const S_DEFRANGE_REGISTER: u64 = 0x1141;
+pub const S_DEFRANGE_FRAMEPOINTER_REL: u64 = 0x1142;
+pub const S_DEFRANGE_REGISTER_REL: u64 = 0x1145;
+
+// S_LOCAL's flags (CV_LVARFLAGS)
+const LV_PARAM: u64 = 0x01;
+const LV_OPTIMIZED_OUT: u64 = 0x100;
+
+// A record being made: its bytes and where type (and id) indexes are in it.
+struct Rec {
+    b: bn.Bytes,
+    fx: u.List.[u64],  // offset << 8 | FK_TYPE or FK_ID
+}
+
+fn rec(kind: u64) Rec {
+    let mut r = Rec.{ b: bn.new_bytes(), fx: u.List.[u64].empty() };
+    r.b.u16_(0);
+    r.b.u16_(kind);
+    return r;
+}
+
+// A type (or id: kind FK_ID) index field.
+fn ti(r: *mut Rec, t: u32, kind: u8) void {
+    if t >= 0x1000 {
+        r.fx.push((@as(u64, r.b.len()) << 8) | @as(u64, kind));
+    }
+    r.b.u32_(@as(u64, t));
+}
+
+fn cstr(b: *mut bn.Bytes, s: []u8) void {
+    b.put(s);
+    b.u8_(0);
+}
+
+/// Pads a record (or a field list's entry) to 4 bytes with LF_PAD bytes
+/// (0xf0 + the bytes left).
+pub fn pad4(b: *mut bn.Bytes) void {
+    while (b.len() % 4) != 0 {
+        b.u8_(0xf0 + @truncate(u8, 4 - (b.len() % 4)));
+    }
+}
+
+/// A numeric leaf: an unsigned value, in 2 bytes when below 0x8000, else
+/// after its leaf (LF_USHORT, LF_ULONG, LF_UQUADWORD).
+pub fn unum(b: *mut bn.Bytes, v: u64) void {
+    if v < 0x8000 {
+        b.u16_(v);
+    } else if v <= 0xffff {
+        b.u16_(0x8002);
+        b.u16_(v);
+    } else if v <= 0xffff_ffff {
+        b.u16_(0x8004);
+        b.u32_(v);
+    } else {
+        b.u16_(0x800a);
+        b.u64_(v);
+    }
+}
+
+/// A numeric leaf of a signed value (LF_CHAR, LF_SHORT, LF_LONG, LF_QUADWORD
+/// for negative ones).
+pub fn snum(b: *mut bn.Bytes, v: i64) void {
+    if v >= 0 {
+        unum(b, @bit_cast(u64, v));
+    } else if v >= -128 {
+        b.u16_(0x8000);
+        b.u8_(@truncate(u8, @bit_cast(u64, v)));
+    } else if v >= -32768 {
+        b.u16_(0x8001);
+        b.u16_(@bit_cast(u64, v) & 0xffff);
+    } else if v >= -0x8000_0000 {
+        b.u16_(0x8003);
+        b.u32_(@bit_cast(u64, v) & 0xffff_ffff);
+    } else {
+        b.u16_(0x8009);
+        b.u64_(@bit_cast(u64, v));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The object's state
+// -----------------------------------------------------------------------------
+let mut on: bool = false;
+let mut A64: bool = false;
+let mut OBJ: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
+let mut SEC: i32 = -1;
+let mut types: bn.Bytes = bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
+let mut tfix: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+let mut ntypes: u32 = 0;
+let mut ids: bn.Bytes = bn.Bytes.{ b: u.List.[u8].{ data: @ptr_from_int(*mut u8, 0), len: 0, cap: 0 } };
+let mut ifix: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+let mut nids: u32 = 0;
+let mut tmap: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };     // dbinfo type -> index (0: not yet)
+let mut fwds: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };     // -> its forward reference
+let mut busy: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };  // its record is being made
+// data symbol (its index in the object) -> its 'N' number + 1
+let mut dnames: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                  cap: 0, len: 0 };
+let mut ndnames: u32 = 0;
+// global name (interned) -> its data symbol's index + 1 (add_data_sym)
+let mut gsyms: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                 cap: 0, len: 0 };
+let mut gdone: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };  // dbinfo global written in a block
+let mut files: u.SymMap.[u32] = u.SymMap.[u32].{ keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0),
+                                                 cap: 0, len: 0 };  // file name -> its LF_STRING_ID
+let mut full: bool = false;
+
+/// Starts object o's section (Windows, -g: full is DEBUG_FULL, else only
+/// the functions' procedure records are made); arm64: the object is ARM64's.
+pub fn begin(o: *mut elf.Obj, arm64: bool, is_full: bool) void {
+    on = true;
+    A64 = arm64;
+    OBJ = o;
+    full = is_full;
+    SEC = elf.add_sec(o, ".axiom.cv", elf.S_DEBUG, 1);
+    types = bn.new_bytes();
+    tfix = u.List.[u64].empty();
+    ntypes = 0;
+    ids = bn.new_bytes();
+    ifix = u.List.[u64].empty();
+    nids = 0;
+    tmap = u.List.[u32].empty();
+    fwds = u.List.[u32].empty();
+    busy = u.List.[bool].empty();
+    dnames = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    ndnames = 0;
+    gsyms = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    gdone = u.List.[bool].empty();
+    files = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+}
+
+/// Datum `name` (an IR global) is symbol `sym` of the object.
+pub fn add_data_sym(name: []u8, sym: u32) void {
+    if on and full {
+        gsyms.put(u.intern(name), sym + 1);
+    }
+}
+
+fn sec_data() *mut bn.Bytes {
+    return &mut OBJ.secs.get(@int_cast(usize, SEC)).data;
+}
+
+// A blob of the section (see the header): fixups are offset << 40 | arg << 8
+// | kind, written in order of their offsets.
+fn blob(tag: u8, name: []u8, data: []u8, fx: []mut u64) void {
+    u.sort.[u64](fx, cmp_u64);
+    let d = sec_data();
+    d.u8_(tag);
+    d.u32_(@as(u64, name.len));
+    d.put(name);
+    d.u32_(@as(u64, data.len));
+    d.put(data);
+    d.u32_(@as(u64, fx.len));
+    for x in fx {
+        d.u32_(x >> 40);
+        d.u8_(@truncate(u8, x));
+        d.u32_((x >> 8) & 0xffff_ffff);
+    }
+}
+
+fn cmp_u64(a: u64, b: u64) i32 {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+fn fix(off: usize, kind: u8, arg: u64) u64 {
+    return ((@as(u64, off) << 40) | (arg << 8)) | @as(u64, kind);
+}
+
+// Appends record r to the types (or the ids): its index.
+fn add_rec(r: *mut Rec, is_id: bool) u32 {
+    pad4(&mut r.b);
+    let n = @as(u64, r.b.len() - 2);
+    r.b.view()[0] = @truncate(u8, n);
+    r.b.view()[1] = @truncate(u8, n >> 8);
+    let mut out = &mut types;
+    let mut fx = &mut tfix;
+    if is_id {
+        out = &mut ids;
+        fx = &mut ifix;
+    }
+    let base = @as(u64, out.len());
+    for x in r.fx.items() {
+        fx.push((((x >> 8) + base) << 8) | (x & 0xff));
+    }
+    out.put(r.b.view());
+    r.b.free();
+    r.fx.deinit();
+    if is_id {
+        nids += 1;
+        return 0x1000 + nids - 1;
+    }
+    ntypes += 1;
+    return 0x1000 + ntypes - 1;
+}
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+fn grow_maps(k: usize) void {
+    while tmap.len <= k {
+        tmap.push(0);
+        fwds.push(0);
+        busy.push(false);
+    }
+}
+
+// t through typedefs and qualifiers (-1: void).
+fn strip(t: i32) i32 {
+    let mut k = t;
+    let mut n: i32 = 0;
+    while (k >= 0) and (n < 64) {
+        let x = dbi.types.at(@int_cast(usize, k));
+        if (x.kind != dbi.DK_TYPEDEF) and (x.kind != dbi.DK_CONST) and (x.kind != dbi.DK_VOLATILE) and
+           (x.kind != dbi.DK_RESTRICT) and (x.kind != dbi.DK_ATOMIC) {
+            return k;
+        }
+        k = x.target;
+        n += 1;
+    }
+    return k;
+}
+
+/// The size of type t's values (through typedefs and qualifiers).
+pub fn type_size(t: i32) u64 {
+    let k = strip(t);
+    if k < 0 {
+        return 0;
+    }
+    return dbi.types.at(@int_cast(usize, k)).size;
+}
+
+// The primitive type of a base type, by its C name (the types C's own
+// keywords name, as Windows' C compilers describe them) or else by its
+// encoding and size; 0: none (bit-precise integers narrower than their
+// storage, decimal floating types, sizes without a primitive).
+fn primitive(d: *dbi.DType) u32 {
+    if d.bits > 0 {
+        return 0;
+    }
+    let names: [15][]u8 = ["char", "signed char", "unsigned char", "short", "unsigned short", "int", "unsigned int",
+                           "long", "unsigned long", "long long", "unsigned long long", "_Bool", "__int128",
+                           "unsigned __int128", "float"];
+    let prims: [15]u32 = [0x70, 0x10, 0x20, 0x11, 0x21, 0x74, 0x75, 0x12, 0x22, 0x13, 0x23, 0x30, 0x14, 0x24, 0x40];
+    for k in @as(usize, 0)..15 {
+        if u.str_eq(d.name, names[k]) and ((k != 7) or (d.size == 4)) and ((k != 8) or (d.size == 4)) {
+            return prims[k];
+        }
+    }
+    let s = d.size;
+    let e = d.enc;
+    if (e == dbi.ATE_SIGNED) or (e == dbi.ATE_UNSIGNED) {
+        let mut p: u32 = 0;
+        if s == 1 {
+            p = 0x68;  // T_INT1
+        } else if s == 2 {
+            p = 0x72;
+        } else if s == 4 {
+            p = 0x74;
+        } else if s == 8 {
+            p = 0x76;
+        } else if s == 16 {
+            p = 0x78;
+        } else {
+            return 0;
+        }
+        if e == dbi.ATE_UNSIGNED {
+            p += 1;  // (T_UINTn)
+        }
+        return p;
+    }
+    if (e == dbi.ATE_SIGNED_CHAR) and (s == 1) {
+        return 0x10;
+    }
+    if (e == dbi.ATE_UNSIGNED_CHAR) and (s == 1) {
+        return 0x20;
+    }
+    if e == dbi.ATE_BOOLEAN {
+        if s == 1 {
+            return 0x30;
+        } else if s == 2 {
+            return 0x31;
+        } else if s == 4 {
+            return 0x32;
+        } else if s == 8 {
+            return 0x33;
+        }
+        return 0;
+    }
+    if e == dbi.ATE_FLOAT {
+        if s == 2 {
+            return 0x46;  // T_REAL16
+        } else if s == 4 {
+            return 0x40;
+        } else if s == 8 {
+            return 0x41;
+        } else if s == 16 {
+            return 0x43;  // T_REAL128 (binary128)
+        }
+        return 0;
+    }
+    if e == dbi.ATE_COMPLEX_FLOAT {
+        if s == 8 {
+            return 0x50;  // T_CPLX32
+        } else if s == 16 {
+            return 0x51;
+        } else if s == 32 {
+            return 0x53;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// The unique name of a structure, union or enumeration: its name and where
+// it is declared (a hash of the file's name and the line), so the same
+// declaration in two objects is one type and two of one name are two.
+fn unique_name(d: *dbi.DType, name: []u8) []u8 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    if d.src != 0 {
+        let file = ir.src_file(d.src);
+        if (file >= 0) and (@int_cast(usize, file) < u.g_files.len) {
+            h = u.hash_fnv(u.file_of(file).path);
+        }
+        h = (h ^ @as(u64, ir.src_line(d.src))) *% 0x100_0000_01b3;
+    }
+    if d.scope != 0 {
+        h = (h ^ (@as(u64, d.scope) << 32)) *% 0x100_0000_01b3;
+    }
+    return u.intern(u.f2("%s@%s", name, u.hex16(h)));
+}
+
+fn record_name(d: *dbi.DType) []u8 {
+    if d.name.len == 0 {
+        return "<unnamed-tag>";
+    }
+    return d.name;
+}
+
+// The leaf of a record type (a structure, a union, an enumeration).
+fn record_leaf(d: *dbi.DType) u64 {
+    if d.kind == dbi.DK_UNION {
+        return LF_UNION;
+    }
+    if d.kind == dbi.DK_ENUM {
+        return LF_ENUM;
+    }
+    return LF_STRUCTURE;
+}
+
+// The head of a structure, union or enumeration record (its field list
+// `fl` with n members, of size `size`; props: PROP_*): through the name.
+fn record_rec(d: *dbi.DType, n: u64, props: u64, fl: u32, utype: u32, size: u64) Rec {
+    let leaf = record_leaf(d);
+    let mut r = rec(leaf);
+    let name = record_name(d);
+    let mut p = props | PROP_UNIQUE;
+    if d.scope != 0 {
+        p = p | PROP_SCOPED;
+    }
+    r.b.u16_(n);
+    r.b.u16_(p);
+    if leaf == LF_ENUM {
+        ti(&mut r, utype, FK_TYPE);
+        ti(&mut r, fl, FK_TYPE);
+    } else {
+        ti(&mut r, fl, FK_TYPE);
+        if leaf == LF_STRUCTURE {
+            r.b.u32_(0);  // derived: none
+            r.b.u32_(0);  // vshape: none
+        }
+        unum(&mut r.b, size);
+    }
+    cstr(&mut r.b, name);
+    cstr(&mut r.b, unique_name(d, name));
+    return r;
+}
+
+// A forward reference to record type t (its definition is found by its
+// name: the TPI hash, pdb.ax).
+fn fwd_ref(t: i32) u32 {
+    let k = @int_cast(usize, t);
+    grow_maps(k);
+    if fwds.get(k) != 0 {
+        return fwds.get(k);
+    }
+    let d = dbi.types.at(k);
+    let mut ut: u32 = 0;
+    if d.kind == dbi.DK_ENUM {
+        ut = enum_base(d);
+    }
+    let mut r = record_rec(d, 0, PROP_FWDREF, 0, ut, 0);
+    let x = add_rec(&mut r, false);
+    fwds.set(k, x);
+    return x;
+}
+
+// An enumeration's integer type.
+fn enum_base(d: *dbi.DType) u32 {
+    if d.target >= 0 {
+        let p = type_index(d.target);
+        if p < 0x1000 {
+            return p;
+        }
+    }
+    if d.size == 1 {
+        return 0x68;
+    } else if d.size == 2 {
+        return 0x72;
+    } else if d.size == 8 {
+        return 0x76;
+    }
+    return 0x74;
+}
+
+/// The (object's) type index of dbinfo type t (-1: void).
+pub fn type_index(t: i32) u32 {
+    if t < 0 {
+        return T_VOID;
+    }
+    let k = @int_cast(usize, t);
+    grow_maps(k);
+    if tmap.get(k) != 0 {
+        return tmap.get(k);
+    }
+    let d = dbi.types.at(k);
+    let kd = d.kind;
+    if ((kd == dbi.DK_STRUCT) or (kd == dbi.DK_UNION) or (kd == dbi.DK_ENUM) or (kd == dbi.DK_TAGGED)) and
+       (busy.get(k) or not d.complete) {
+        return fwd_ref(t);  // (a record that refers to itself, or one declared but not defined)
+    }
+    busy.set(k, true);
+    let x = make_type(t);
+    busy.set(k, false);
+    tmap.set(k, x);
+    return x;
+}
+
+fn make_type(t: i32) u32 {
+    let d = dbi.types.at(@int_cast(usize, t));
+    let k = d.kind;
+    if k == dbi.DK_BASE {
+        let p = primitive(d);
+        if p != 0 {
+            return p;
+        }
+        return opaque(d.name, d.size);
+    }
+    if k == dbi.DK_POINTER {
+        return pointer(type_index(d.target), d.size, 0);
+    }
+    if (k == dbi.DK_CONST) or (k == dbi.DK_VOLATILE) {
+        let inner = type_index(d.target);
+        let mut r = rec(LF_MODIFIER);
+        ti(&mut r, inner, FK_TYPE);
+        r.b.u16_(@as(u64, pick(k == dbi.DK_CONST, 1, 2)));
+        return add_rec(&mut r, false);
+    }
+    if k == dbi.DK_RESTRICT {
+        // (a restrict-qualified pointer: the pointer with its restrict flag)
+        let p = strip(d.target);
+        if (p >= 0) and (dbi.types.at(@int_cast(usize, p)).kind == dbi.DK_POINTER) and (p == d.target) {
+            let pd = dbi.types.at(@int_cast(usize, p));
+            return pointer(type_index(pd.target), pd.size, 0x1000);
+        }
+        return type_index(d.target);
+    }
+    if (k == dbi.DK_ATOMIC) or (k == dbi.DK_TYPEDEF) {
+        return type_index(d.target);
+    }
+    if k == dbi.DK_ARRAY {
+        let el = type_index(d.target);
+        let mut size: u64 = 0;
+        if d.count >= 0 {
+            size = d.size;
+            if size == 0 {
+                size = @bit_cast(u64, d.count) * type_size(d.target);
+            }
+        }
+        let mut r = rec(LF_ARRAY);
+        ti(&mut r, el, FK_TYPE);
+        ti(&mut r, T_UQUAD, FK_TYPE);
+        unum(&mut r.b, size);
+        cstr(&mut r.b, "");
+        return add_rec(&mut r, false);
+    }
+    if (k == dbi.DK_STRUCT) or (k == dbi.DK_UNION) or (k == dbi.DK_TAGGED) {
+        return record(d);
+    }
+    if k == dbi.DK_ENUM {
+        return enumeration(d);
+    }
+    // DK_FUNC
+    let mut ps = u.List.[u32].empty();
+    for m in d.members.items() {
+        ps.push(type_index(m.ty));
+    }
+    if d.variadic {
+        ps.push(T_NOTYPE);  // (the arguments after the parameters)
+    }
+    let x = procedure(type_index(d.target), ps.items());
+    ps.deinit();
+    return x;
+}
+
+fn pick(c: bool, a: u32, b: u32) u32 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// A pointer of `size` bytes to type `to` (flags: CV_ptrattr's const,
+// volatile, restrict bits): a primitive's 64-bit pointer type, or a record.
+fn pointer(to: u32, size: u64, flags: u64) u32 {
+    if (size == 8) and (flags == 0) and (to < 0x100) {
+        return to | T_64P;
+    }
+    let mut r = rec(LF_POINTER);
+    ti(&mut r, to, FK_TYPE);
+    let mut kind: u64 = 0x0c;  // CV_PTR_64
+    if size == 4 {
+        kind = 0x0a;  // CV_PTR_NEAR32
+    }
+    r.b.u32_((kind | flags) | ((size & 0x3f) << 13));
+    return add_rec(&mut r, false);
+}
+
+/// A procedure type: its result's type and its parameters' (T_NOTYPE last:
+/// variadic).
+fn procedure(result: u32, params: []u32) u32 {
+    let mut a = rec(LF_ARGLIST);
+    a.b.u32_(@as(u64, params.len));
+    for p in params {
+        ti(&mut a, p, FK_TYPE);
+    }
+    let al = add_rec(&mut a, false);
+    let mut r = rec(LF_PROCEDURE);
+    ti(&mut r, result, FK_TYPE);
+    r.b.u8_(0);  // CV_CALL_NEAR_C: the platform's convention
+    r.b.u8_(0);
+    r.b.u16_(@as(u64, params.len));
+    ti(&mut r, al, FK_TYPE);
+    return add_rec(&mut r, false);
+}
+
+// A type CodeView has no form for: a structure of its name and size whose
+// one member, `bytes`, is its bytes.
+fn opaque(name: []u8, size: u64) u32 {
+    let arr = byte_array(size);
+    let mut fl = rec(LF_FIELDLIST);
+    member(&mut fl, "bytes", arr, 0);
+    let f = add_rec(&mut fl, false);
+    let mut r = rec(LF_STRUCTURE);
+    r.b.u16_(1);
+    r.b.u16_(0);
+    ti(&mut r, f, FK_TYPE);
+    r.b.u32_(0);
+    r.b.u32_(0);
+    unum(&mut r.b, size);
+    if name.len == 0 {
+        cstr(&mut r.b, "<unnamed-type>");
+    } else {
+        cstr(&mut r.b, name);
+    }
+    return add_rec(&mut r, false);
+}
+
+fn byte_array(size: u64) u32 {
+    let mut r = rec(LF_ARRAY);
+    ti(&mut r, 0x20, FK_TYPE);
+    ti(&mut r, T_UQUAD, FK_TYPE);
+    unum(&mut r.b, size);
+    cstr(&mut r.b, "");
+    return add_rec(&mut r, false);
+}
+
+// An LF_MEMBER of a field list: public, of type t at byte offset off.
+fn member(fl: *mut Rec, name: []u8, t: u32, off: u64) void {
+    fl.b.u16_(LF_MEMBER);
+    fl.b.u16_(3);  // public
+    ti(fl, t, FK_TYPE);
+    unum(&mut fl.b, off);
+    cstr(&mut fl.b, name);
+    pad4(&mut fl.b);
+}
+
+// A field list's longest record before it goes on in another (LF_INDEX).
+const FL_MAX: usize = 0xff00;
+
+// A field list of entries (each already in its own Rec, as field list
+// bytes): in records of at most FL_MAX bytes, each but the last naming the
+// next, which is made first; the first record's index.
+fn field_list(ents: []Rec) u32 {
+    let mut starts = u.List.[usize].empty();
+    let mut size: usize = 4;
+    for k in 0..ents.len {
+        let n = ents[k].b.len();
+        if (k == 0) or ((size + n + 8) > FL_MAX) {
+            starts.push(k);
+            size = 4;
+        }
+        size += n;
+    }
+    let mut next: u32 = 0;
+    let mut c = starts.len;
+    while c > 0 {
+        c -= 1;
+        let from = starts.get(c);
+        let mut to = ents.len;
+        if (c + 1) < starts.len {
+            to = starts.get(c + 1);
+        }
+        let mut fl = rec(LF_FIELDLIST);
+        for k in from..to {
+            let base = @as(u64, fl.b.len());
+            for x in ents[k].fx.items() {
+                fl.fx.push((((x >> 8) + base) << 8) | (x & 0xff));
+            }
+            fl.b.put(ents[k].b.view());
+        }
+        if next != 0 {
+            fl.b.u16_(LF_INDEX);
+            fl.b.u16_(0);
+            ti(&mut fl, next, FK_TYPE);
+        }
+        next = add_rec(&mut fl, false);
+    }
+    if starts.len == 0 {
+        let mut fl = rec(LF_FIELDLIST);
+        next = add_rec(&mut fl, false);
+    }
+    starts.deinit();
+    return next;
+}
+
+fn ent() Rec {
+    return Rec.{ b: bn.new_bytes(), fx: u.List.[u64].empty() };
+}
+
+fn free_ents(es: *mut u.List.[Rec]) void {
+    for k in 0..es.len {
+        es.at(k).b.free();
+        es.at(k).fx.deinit();
+    }
+    es.deinit();
+}
+
+// A structure or union (or a tagged union: its tag and each payload, at
+// their offsets): its members' types first, then its field list, then it.
+// A bit-field's member is an LF_BITFIELD of its declared type: its width,
+// and its place from the least significant bit of the storage unit of that
+// type at the member's offset (these targets are little-endian).
+fn record(d: *dbi.DType) u32 {
+    let ms = d.members.items();
+    let mut es = u.List.[Rec].empty();
+    for m in ms {
+        if (m.ty < 0) and (m.bits == 0) {
+            continue;  // (a field of no size; a tagged union's variant without a payload)
+        }
+        let t = type_index(m.ty);
+        let mut off = m.off;
+        let mut mt = t;
+        if m.bits > 0 {
+            let unit = @max(type_size(m.ty), 1);
+            let mut pos = @as(u64, @bit_cast(u32, m.bit_off));
+            // (the storage unit holding the field's first bit)
+            off += (pos / (8 * unit)) * unit;
+            pos = pos % (8 * unit);
+            let mut bf = rec(LF_BITFIELD);
+            ti(&mut bf, t, FK_TYPE);
+            bf.b.u8_(@truncate(u8, @as(u64, @bit_cast(u32, m.bits))));
+            bf.b.u8_(@truncate(u8, pos));
+            mt = add_rec(&mut bf, false);
+        }
+        let mut e = ent();
+        member(&mut e, m.name, mt, off);
+        es.push(e);
+    }
+    let n = @as(u64, es.len);
+    let fl = field_list(es.items());
+    free_ents(&mut es);
+    let mut r = record_rec(d, n, 0, fl, 0, d.size);
+    let x = add_rec(&mut r, false);
+    udt_src(x, d.src);
+    return x;
+}
+
+fn enumeration(d: *dbi.DType) u32 {
+    let ut = enum_base(d);
+    let mut es = u.List.[Rec].empty();
+    for m in d.members.items() {
+        let mut e = ent();
+        e.b.u16_(LF_ENUMERATE);
+        e.b.u16_(3);
+        snum(&mut e.b, m.value);
+        cstr(&mut e.b, m.name);
+        pad4(&mut e.b);
+        es.push(e);
+    }
+    let n = @as(u64, es.len);
+    let fl = field_list(es.items());
+    free_ents(&mut es);
+    let mut r = record_rec(d, n, 0, fl, ut, 0);
+    let x = add_rec(&mut r, false);
+    udt_src(x, d.src);
+    return x;
+}
+
+// The id of a file's name (LF_STRING_ID).
+fn file_id(name: []u8) u32 {
+    let key = u.intern(name);
+    let at = files.get(key);
+    if at != 0 {
+        return at;
+    }
+    let mut r = rec(LF_STRING_ID);
+    r.b.u32_(0);
+    cstr(&mut r.b, name);
+    let x = add_rec(&mut r, true);
+    files.put(key, x);
+    return x;
+}
+
+// Where a user-defined type x is defined (LF_UDT_SRC_LINE, an id).
+fn udt_src(x: u32, src: u32) void {
+    if src == 0 {
+        return;
+    }
+    let file = ir.src_file(src);
+    if (file < 0) or (@int_cast(usize, file) >= u.g_files.len) {
+        return;
+    }
+    let mut path = u.real_path(u.file_of(file).path);
+    if u.isnos(path) {
+        path = u.file_of(file).path;
+    }
+    let f = file_id(path);
+    let mut r = rec(LF_UDT_SRC_LINE);
+    ti(&mut r, x, FK_TYPE);
+    ti(&mut r, f, FK_ID);
+    r.b.u32_(@as(u64, ir.src_line(src)));
+    _ = add_rec(&mut r, true);
+}
+
+// -----------------------------------------------------------------------------
+// Symbols
+// -----------------------------------------------------------------------------
+// A blob of symbols being made: its bytes and fixups (see blob).
+struct Syms {
+    b: bn.Bytes,
+    fx: u.List.[u64],
+}
+
+fn sym_begin(s: *mut Syms, kind: u64) usize {
+    let at = s.b.len();
+    s.b.u16_(0);
+    s.b.u16_(kind);
+    return at;
+}
+
+fn sym_end(s: *mut Syms, at: usize) void {
+    pad4(&mut s.b);
+    let n = @as(u64, s.b.len() - at - 2);
+    s.b.view()[at] = @truncate(u8, n);
+    s.b.view()[at + 1] = @truncate(u8, n >> 8);
+}
+
+fn sym_type(s: *mut Syms, t: u32) void {
+    if t >= 0x1000 {
+        s.fx.push(fix(s.b.len(), FK_TYPE, 0));
+    }
+    s.b.u32_(@as(u64, t));
+}
+
+// A reference to offset `at` of the blob.
+fn sym_self(s: *mut Syms, at: usize) void {
+    s.fx.push(fix(s.b.len(), FK_SELF, 0));
+    s.b.u32_(@as(u64, at));
+}
+
+// A code address: offset off in the function, and its section.
+fn sym_code(s: *mut Syms, off: u64) void {
+    s.fx.push(fix(s.b.len(), FK_CODE, 0));
+    s.b.u32_(off);
+    s.b.u16_(0);
+}
+
+// The address of the object's data symbol `sym`.
+fn sym_data(s: *mut Syms, sym: u32) void {
+    let key = u.intern(u.idec(@bit_cast(i32, sym)));
+    let mut n = dnames.get(key);
+    if n == 0 {
+        blob('N', OBJ.syms.at(@as(usize, sym)).name, "", u.nil_slice.[u64]());
+        ndnames += 1;
+        n = ndnames;
+        dnames.put(key, n);
+    }
+    s.fx.push(fix(s.b.len(), FK_DATA, @as(u64, n - 1)));
+    s.b.u32_(0);
+    s.b.u16_(0);
+}
+
+/// A CodeView register number for DWARF register `reg` of a value of
+/// `size` bytes (0: none): x86-64's CV_AMD64_*, ARM64's CV_ARM64_*.
+pub fn cv_reg(reg: i32, size: u64) u64 {
+    if A64 {
+        if (reg >= 0) and (reg <= 28) {
+            return 50 + @as(u64, @bit_cast(u32, reg));  // X0..X28
+        }
+        if reg == 29 {
+            return 79;  // FP
+        }
+        if reg == 30 {
+            return 80;  // LR
+        }
+        if reg == 31 {
+            return 81;  // SP
+        }
+        if (reg >= 64) and (reg < 96) {
+            let v = @as(u64, @bit_cast(u32, reg - 64));
+            if size == 4 {
+                return 100 + v;  // S0..
+            }
+            if size == 8 {
+                return 140 + v;  // D0..
+            }
+            return 180 + v;  // Q0..
+        }
+        return 0;
+    }
+    // DWARF: rax rdx rcx rbx rsi rdi rbp rsp r8..r15, xmm0..15 from 17
+    let gpr: [16]u64 = [328, 331, 330, 329, 332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343];
+    if (reg >= 0) and (reg < 16) {
+        return gpr[@as(usize, @bit_cast(u32, reg))];
+    }
+    if (reg >= 17) and (reg < 33) {
+        let x = @as(u64, @bit_cast(u32, reg - 17));
+        if x < 8 {
+            return 154 + x;  // XMM0..7
+        }
+        return 252 + (x - 8);  // XMM8..15
+    }
+    return 0;
+}
+
+// The frame pointer's register: rbp, x29.
+fn fp_reg() u64 {
+    if A64 {
+        return 79;
+    }
+    return 334;
+}
+
+fn dwarf_fp() u32 {
+    if A64 {
+        return dw.A64_FP;
+    }
+    return dw.X64_RBP;
+}
+
+// Does f set up a frame pointer (CFA = it + 16 once set: x64.ax, a64.ax)?
+fn has_fp(f: *dw.Func) bool {
+    for c in f.cfi {
+        if @truncate(u32, (c >> 56) & 31) == dwarf_fp() {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A piece of code: [start, end) in the function.
+struct Piece {
+    start: u64,
+    end: u64,
+}
+
+/// The key of a function's 'P' blob: its symbol's section and offset
+/// (names are not unique: a function's cold part may share its name).
+pub fn func_key(sec: i32, value: u64) []u8 {
+    return u.f2("%s:%s", u.idec(sec), u.hex16(value));
+}
+
+/// Adds function f's symbols (its symbol in the object is `sym`).
+pub fn add_func(f: *dw.Func, sym: *elf.Sym) void {
+    if not on {
+        return;
+    }
+    let mut s = Syms.{ b: bn.new_bytes(), fx: u.List.[u64].empty() };
+    let mut vs: []dbi.DVar = u.nil_slice.[dbi.DVar]();
+    let mut sc: [2]u32 = [0, 0];
+    let mut ftype: u32 = 0;
+    if full and u.notnil(f.irf) {
+        vs = dbi.vars_of(f.irf.name);
+        sc = dbi.scopes_of(f.irf.name);
+        ftype = func_type(f.irf.name, vs);
+    }
+    let fp = has_fp(f);
+    // the procedure
+    let p = sym_begin(&mut s, pk(f.external, S_GPROC32, S_LPROC32));
+    s.b.u32_(0);  // parent: none
+    let end_at = s.b.len();
+    s.b.u32_(0);  // end: below
+    s.b.u32_(0);  // next
+    s.b.u32_(f.size);
+    s.b.u32_(prologue_end(f));
+    s.b.u32_(f.size);
+    sym_type(&mut s, ftype);
+    sym_code(&mut s, 0);
+    s.b.u8_(@truncate(u8, pk(fp, 0x01, 0)));  // CV_PFLAG_NOFPO: a frame pointer
+    cstr(&mut s.b, f.name);
+    sym_end(&mut s, p);
+    // the frame: where locals and parameters are addressed from (CV_FRAMEPROC's
+    // encoded base pointers: 1 the stack pointer, 2 the frame pointer)
+    let fr = sym_begin(&mut s, S_FRAMEPROC);
+    s.b.zeros(20);
+    s.b.u16_(0);
+    let enc = pk(fp, 2, 1);
+    s.b.u32_((enc << 14) | (enc << 16));
+    sym_end(&mut s, fr);
+    if full {
+        let mut pieces = u.List.[u.List.[Piece]].empty();
+        if sc[0] != 0 {
+            scope_pieces(f, sc, &mut pieces);
+        }
+        let all: [1]Piece = [Piece.{ start: 0, end: f.size }];
+        body(&mut s, f, vs, sc, pieces.items(), sc[0], all[..], p, fp);
+        for k in 0..pieces.len {
+            pieces.at(k).deinit();
+        }
+        pieces.deinit();
+    }
+    let e = sym_begin(&mut s, S_END);
+    sym_end(&mut s, e);
+    s.fx.push(fix(end_at, FK_SELF, 0));
+    s.b.set_u32(end_at, @as(u64, e));
+    blob('P', func_key(sym.sec, sym.value), s.b.view(), s.fx.items());
+    s.b.free();
+    s.fx.deinit();
+}
+
+fn pk(c: bool, a: u64, b: u64) u64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// Where f's prologue ends (its ROW_PE row), or 0.
+fn prologue_end(f: *dw.Func) u64 {
+    for r in f.rows {
+        if (r & dw.ROW_PE) != 0 {
+            return @min((r >> 32) & 0x7fff_ffff, f.size);
+        }
+    }
+    return 0;
+}
+
+// The procedure type of function `ir_name`: its result's and its
+// parameters' types (its parameter variables, in order).
+fn func_type(ir_name: []u8, vs: []dbi.DVar) u32 {
+    let rt = dbi.result_of(ir_name);
+    if rt == -2 {
+        return 0;
+    }
+    let mut ps = u.List.[u32].empty();
+    for v in vs {
+        if v.param and not v.artificial and (v.ty >= 0) {
+            ps.push(type_index(v.ty));
+        }
+    }
+    let x = procedure(type_index(rt), ps.items());
+    ps.deinit();
+    let mut r = rec(LF_FUNC_ID);
+    r.b.u32_(0);  // scope: none
+    ti(&mut r, x, FK_TYPE);
+    cstr(&mut r.b, dbi.func_name(ir_name, elf.display_name(ir_name)));
+    _ = add_rec(&mut r, true);
+    return x;
+}
+
+// The code of each of f's scopes sc[0]..sc[1] (by index - sc[0]): the
+// pieces whose instructions are in it or in a block inside it (as dwarf.ax's
+// scope_ranges).
+fn scope_pieces(f: *dw.Func, sc: [2]u32, out: *mut u.List.[u.List.[Piece]]) void {
+    let n = @as(usize, sc[1] - sc[0]) + 1;
+    for _k in 0..n {
+        out.push(u.List.[Piece].empty());
+    }
+    let mut k: usize = 0;
+    while k < f.scopes.len {
+        let start = f.scopes[k] >> 32;
+        let mut end = f.size;
+        if k + 1 < f.scopes.len {
+            end = f.scopes[k + 1] >> 32;
+        }
+        let mut s = @truncate(u32, f.scopes[k]);
+        k += 1;
+        if (end <= start) or (start >= f.size) {
+            continue;
+        }
+        if (s < sc[0]) or (s > sc[1]) {
+            s = sc[0];
+        }
+        while (s >= sc[0]) and (s <= sc[1]) {
+            let l = out.at(@as(usize, s - sc[0]));
+            if (l.len > 0) and (l.last().end == start) {
+                l.at(l.len - 1).end = @min(end, f.size);
+            } else {
+                l.push(Piece.{ start: start, end: @min(end, f.size) });
+            }
+            s = dbi.scopes.at(@as(usize, s)).parent;
+            if s == 0 {
+                break;
+            }
+        }
+    }
+}
+
+// The pieces of `ps` within `clip`.
+fn clip_pieces(ps: []Piece, clip: []Piece, out: *mut u.List.[Piece]) void {
+    for p in ps {
+        for c in clip {
+            let a = @max(p.start, c.start);
+            let b = @min(p.end, c.end);
+            if b > a {
+                out.push(Piece.{ start: a, end: b });
+            }
+        }
+    }
+}
+
+// What is in scope s of f within code `clip` (its variables, the types it
+// declares, then its blocks: an S_BLOCK32 for each piece of a block's code
+// in clip, holding what is in that block there); parent: the enclosing
+// record's offset in the blob.
+fn body(s: *mut Syms, f: *dw.Func, vs: []dbi.DVar, sc: [2]u32, pieces: []u.List.[Piece], scope: u32, clip: []Piece,
+        parent: usize, fp: bool) void {
+    for k in 0..vs.len {
+        let mut vsc = vs[k].scope;
+        if (vsc < sc[0]) or (vsc > sc[1]) {
+            vsc = sc[0];
+        }
+        if vsc == scope {
+            variable(s, f, k, vs[k], clip, fp);
+        }
+    }
+    if scope != 0 {
+        for t in dbi.scopes.at(@as(usize, scope)).types.items() {
+            udt(s, t);
+        }
+    }
+    if scope == 0 {
+        return;
+    }
+    for c in (scope + 1)..(sc[1] + 1) {
+        if dbi.scopes.at(@as(usize, c)).parent != scope {
+            continue;
+        }
+        let mut cp = u.List.[Piece].empty();
+        clip_pieces(pieces[@as(usize, c - sc[0])].items(), clip, &mut cp);
+        for pc in cp.items() {
+            let b = sym_begin(s, S_BLOCK32);
+            sym_self(s, parent);
+            let end_at = s.b.len();
+            s.b.u32_(0);
+            s.b.u32_(pc.end - pc.start);
+            sym_code(s, pc.start);
+            cstr(&mut s.b, "");
+            sym_end(s, b);
+            let one: [1]Piece = [pc];
+            body(s, f, vs, sc, pieces, c, one[..], b, fp);
+            let e = sym_begin(s, S_END);
+            sym_end(s, e);
+            s.fx.push(fix(end_at, FK_SELF, 0));
+            s.b.set_u32(end_at, @as(u64, e));
+        }
+        cp.deinit();
+    }
+}
+
+// A user-defined type's name (S_UDT): a typedef, or a named structure,
+// union or enumeration.
+fn udt(s: *mut Syms, t: i32) void {
+    if t < 0 {
+        return;
+    }
+    let d = dbi.types.at(@int_cast(usize, t));
+    let k = d.kind;
+    let named = (k == dbi.DK_TYPEDEF) or
+                (((k == dbi.DK_STRUCT) or (k == dbi.DK_UNION) or (k == dbi.DK_ENUM) or (k == dbi.DK_TAGGED)) and
+                 (d.name.len > 0));
+    if not named {
+        return;
+    }
+    let x = type_index(t);
+    let at = sym_begin(s, S_UDT);
+    sym_type(s, x);
+    cstr(&mut s.b, d.name);
+    sym_end(s, at);
+}
+
+// Variable k of f (v) in code `clip`: a static one at its address; one in
+// its frame slot (f.vars) relative to the frame pointer for all of its
+// scope (S_REGREL32), or, a parameter or without a frame pointer, from the
+// CFA's register in each of the call frame's states; one of optimized code
+// where dloc.ax places it (S_LOCAL and its ranges: opt_ranges), or its
+// constant value (S_CONSTANT) where it is that constant throughout; else
+// without a location.
+fn variable(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, clip: []Piece, fp: bool) void {
+    if (v.ty < 0) or v.artificial {
+        return;
+    }
+    let t = type_index(v.ty);
+    if u.notnil(v.global) {
+        let sym = gsyms.get(u.intern(v.global.name));
+        if sym == 0 {
+            return;
+        }
+        data_sym(s, v.name, t, v.global.tls, false, sym - 1);
+        if v.gidx >= 0 {
+            let g = @int_cast(usize, v.gidx);
+            while gdone.len <= g {
+                gdone.push(false);
+            }
+            gdone.set(g, true);
+        }
+        return;
+    }
+    let mut loc = dw.NO_LOC;
+    if k < f.vars.len {
+        loc = f.vars[k];
+    }
+    let in_slot = (loc != dw.NO_LOC) and not v.indirect;  // (indirect: the slot holds its address, which no range says)
+    // (a parameter: S_LOCAL, whose flags say so, below; readers take an
+    // S_REGREL32 below the frame pointer for a local)
+    if in_slot and fp and not v.param {
+        let at = sym_begin(s, S_REGREL32);
+        s.b.u32_(@bit_cast(u64, loc + 16) & 0xffff_ffff);  // (the frame pointer is the CFA - 16)
+        sym_type(s, t);
+        s.b.u16_(fp_reg());
+        cstr(&mut s.b, v.name);
+        sym_end(s, at);
+        return;
+    }
+    let size = type_size(v.ty);
+    if (loc == dw.NO_LOC) and constant(s, f, k, v, t, size, clip) {
+        return;
+    }
+    let at = sym_begin(s, S_LOCAL);
+    sym_type(s, t);
+    let flags_at = s.b.len();
+    s.b.u16_(pk(v.param, LV_PARAM, 0));
+    cstr(&mut s.b, v.name);
+    sym_end(s, at);
+    let mut n: usize = 0;
+    if in_slot {
+        n = cfa_ranges(s, f, loc, clip);
+    } else if loc == dw.NO_LOC {
+        n = opt_ranges(s, f, k, size, clip);
+    }
+    if n == 0 {
+        s.b.set_u8(flags_at, @truncate(u8, pk(v.param, LV_PARAM, 0)));
+        s.b.set_u8(flags_at + 1, @truncate(u8, LV_OPTIMIZED_OUT >> 8));
+    }
+}
+
+// Is location x of a variable of `size` bytes its whole value?
+fn whole(x: *dloc.VLoc, size: u64) bool {
+    return (x.psize == 0) or ((x.poff == 0) and (@as(u64, x.psize) == size));
+}
+
+// Variable k of f (v, of type t) as an S_CONSTANT, if its locations are
+// all one constant of all of it, which they give for all of code `clip`.
+fn constant(s: *mut Syms, f: *dw.Func, k: usize, v: dbi.DVar, t: u32, size: u64, clip: []Piece) bool {
+    if (size == 0) or (size > 8) {
+        return false;
+    }
+    let mut bits: u64 = 0;
+    let mut have = false;
+    let mut cover = u.List.[Piece].empty();
+    for x in f.vlocs {
+        if @as(usize, x.var) != k {
+            continue;
+        }
+        if (x.kind != dloc.LK_CONST) or not whole(&x, size) or (have and (@bit_cast(u64, x.off) != bits)) {
+            cover.deinit();
+            return false;
+        }
+        bits = @bit_cast(u64, x.off);
+        have = true;
+        let one: [1]Piece = [Piece.{ start: x.start, end: x.end }];
+        clip_pieces(one[..], clip, &mut cover);
+    }
+    // (the pieces of clip covered: each of its bytes by one of them)
+    let mut all = have;
+    for c in clip {
+        let mut a = c.start;
+        let mut moved = true;
+        while (a < c.end) and moved {
+            moved = false;
+            for p in cover.items() {
+                if (p.start <= a) and (p.end > a) {
+                    a = p.end;
+                    moved = true;
+                }
+            }
+        }
+        all = all and (a >= c.end);
+    }
+    cover.deinit();
+    if not all {
+        return false;
+    }
+    let at = sym_begin(s, S_CONSTANT);
+    sym_type(s, t);
+    let mut val = bits;
+    if size < 8 {
+        val = bits & ((@as(u64, 1) << @truncate(u64, 8 * size)) - 1);
+    }
+    unum(&mut s.b, val);
+    cstr(&mut s.b, v.name);
+    sym_end(s, at);
+    return true;
+}
+
+// The ranges of variable k of f (of `size` bytes) in optimized code, within
+// code `clip`, from its locations (dloc.ax) of all of it that CodeView can
+// state: in a register (S_DEFRANGE_REGISTER), in memory at a register plus
+// an offset (an address in a register, `ind`: S_DEFRANGE_REGISTER_REL) or
+// in a frame slot (from the CFA's register: cfa_ranges_in). Not stated: a
+// value computed from a register or slot (a register plus a constant, a
+// frame or data address), the value in memory at an address held in a
+// slot, a constant for part of the code, and pieces (a structure taken
+// apart): CodeView's subfield ranges are read by the system's symbol
+// handler as the whole variable (a wrong value). Their count.
+fn opt_ranges(s: *mut Syms, f: *dw.Func, k: usize, size: u64, clip: []Piece) usize {
+    let mut n: usize = 0;
+    for x in f.vlocs {
+        if (@as(usize, x.var) != k) or not whole(&x, size) {
+            continue;
+        }
+        let one: [1]Piece = [Piece.{ start: x.start, end: x.end }];
+        let mut cp = u.List.[Piece].empty();
+        clip_pieces(one[..], clip, &mut cp);
+        for pc in cp.items() {
+            if x.kind == dloc.LK_REG {
+                if x.ind {
+                    let r = cv_reg(x.reg, 8);
+                    if r != 0 {
+                        n += rel_range(s, r, x.add, pc.start, pc.end);
+                    }
+                } else if x.add == 0 {
+                    let r = cv_reg(x.reg, size);
+                    if r != 0 {
+                        n += reg_range(s, r, pc.start, pc.end);
+                    }
+                }
+            } else if (x.kind == dloc.LK_SLOT) and (x.add == 0) and not x.ind {
+                let pcs: [1]Piece = [pc];
+                n += cfa_ranges_in(s, f, x.off, pcs[..]);
+            }
+        }
+        cp.deinit();
+    }
+    return n;
+}
+
+// The ranges (S_DEFRANGE_REGISTER_REL) of a variable in memory at register
+// r plus `off`, from start to end; their count.
+fn rel_range(s: *mut Syms, r: u64, off: i64, start: u64, end: u64) usize {
+    let mut a = start;
+    let mut n: usize = 0;
+    while a < end {
+        let len = @min(end - a, 0xffff);
+        let at = sym_begin(s, S_DEFRANGE_REGISTER_REL);
+        s.b.u16_(r);
+        s.b.u16_(0);
+        s.b.u32_(@bit_cast(u64, off) & 0xffff_ffff);
+        sym_code(s, a);
+        s.b.u16_(len);
+        sym_end(s, at);
+        a += len;
+        n += 1;
+    }
+    return n;
+}
+
+// The ranges (S_DEFRANGE_REGISTER) of a value in register r from start to
+// end (a range's length is 16 bits: longer code takes several); their count.
+fn reg_range(s: *mut Syms, r: u64, start: u64, end: u64) usize {
+    let mut a = start;
+    let mut n: usize = 0;
+    while a < end {
+        let len = @min(end - a, 0xffff);
+        let at = sym_begin(s, S_DEFRANGE_REGISTER);
+        s.b.u16_(r);
+        s.b.u16_(0);
+        sym_code(s, a);
+        s.b.u16_(len);
+        sym_end(s, at);
+        a += len;
+        n += 1;
+    }
+    return n;
+}
+
+// The ranges of a value at `off` from the CFA, in code `clip` (empty: all
+// of f): an S_DEFRANGE_REGISTER_REL from the CFA's register in each of the
+// call frame's states (f.cfi; none: the state at the entry).
+fn cfa_ranges(s: *mut Syms, f: *dw.Func, off: i64, clip: []Piece) usize {
+    if clip.len == 0 {
+        let all: [1]Piece = [Piece.{ start: 0, end: f.size }];
+        return cfa_ranges_in(s, f, off, all[..]);
+    }
+    return cfa_ranges_in(s, f, off, clip);
+}
+
+fn cfa_ranges_in(s: *mut Syms, f: *dw.Func, off: i64, clip: []Piece) usize {
+    let mut n: usize = 0;
+    let nst = @max(f.cfi.len, 1);
+    for k in 0..nst {
+        let mut start: u64 = 0;
+        let mut reg: u32 = dw.X64_RSP;
+        let mut cfa: i64 = 8;
+        if A64 {
+            reg = dw.A64_SP;
+            cfa = 0;
+        }
+        if f.cfi.len > 0 {
+            let c = f.cfi[k];
+            start = c & 0xffff_ffff;
+            reg = @truncate(u32, (c >> 56) & 31);
+            cfa = 8 * @as(i64, @bit_cast(i64, (c >> 61) & 7));
+        }
+        let mut end = f.size;
+        if (k + 1) < f.cfi.len {
+            end = f.cfi[k + 1] & 0xffff_ffff;
+        }
+        let mut cr = cv_reg(@bit_cast(i32, reg), 8);
+        if A64 and (reg == dw.A64_SP) and (cfa == 56) {
+            cr = 0;  // (a64.ax's CFI_NONE: no rule)
+        }
+        if cr == 0 {
+            continue;
+        }
+        for c in clip {
+            let mut a = @max(start, c.start);
+            let b = @min(end, c.end);
+            while a < b {
+                let len = @min(b - a, 0xffff);
+                let at = sym_begin(s, S_DEFRANGE_REGISTER_REL);
+                s.b.u16_(cr);
+                s.b.u16_(0);
+                s.b.u32_(@bit_cast(u64, off + cfa) & 0xffff_ffff);
+                sym_code(s, a);
+                s.b.u16_(len);
+                sym_end(s, at);
+                a += len;
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
+// A static object: S_GDATA32 or S_LDATA32 (a thread-local: S_GTHREAD32,
+// S_LTHREAD32, at its offset in the thread-local template, which plink.ax
+// puts at the start of its section) of type t, at data symbol sym.
+fn data_sym(s: *mut Syms, name: []u8, t: u32, tls: bool, external: bool, sym: u32) void {
+    let mut kind = S_LDATA32;
+    if tls {
+        kind = pk(external, S_GTHREAD32, S_LTHREAD32);
+    } else if external {
+        kind = S_GDATA32;
+    }
+    let at = sym_begin(s, kind);
+    sym_type(s, t);
+    sym_data(s, sym);
+    cstr(&mut s.b, name);
+    sym_end(s, at);
+}
+
+/// Writes the object's top-level symbols (its static objects, the
+/// user-defined types of its top level), its types and ids.
+pub fn finish() void {
+    if not on {
+        return;
+    }
+    on = false;
+    if full {
+        let mut s = Syms.{ b: bn.new_bytes(), fx: u.List.[u64].empty() };
+        for gi in 0..dbi.globals.len {
+            let v = dbi.globals.get(gi);
+            if (v.scope != 0) and (gi < gdone.len) and gdone.get(gi) {
+                continue;  // (in its lexical block)
+            }
+            if u.isnil(v.global) or (v.ty < 0) {
+                continue;
+            }
+            let sym = gsyms.get(u.intern(v.global.name));
+            if sym == 0 {
+                continue;  // (another object's)
+            }
+            data_sym(&mut s, v.name, type_index(v.ty), v.global.tls, v.external, sym - 1);
+        }
+        for t in 0..dbi.types.len {
+            if dbi.types.at(t).scope == 0 {
+                udt(&mut s, @int_cast(i32, t));
+            }
+        }
+        blob('G', "", s.b.view(), s.fx.items());
+        s.b.free();
+        s.fx.deinit();
+    }
+    let mut fx = u.List.[u64].empty();
+    for x in tfix.items() {
+        fx.push(fix(@truncate(usize, x >> 8), FK_TYPE, 0));
+    }
+    blob('T', "", types.view(), fx.items());
+    fx.clear();
+    for x in ifix.items() {
+        fx.push(fix(@truncate(usize, x >> 8), @truncate(u8, x), 0));
+    }
+    blob('I', "", ids.view(), fx.items());
+    fx.deinit();
+    types.free();
+    ids.free();
+    tfix.deinit();
+    ifix.deinit();
+}
