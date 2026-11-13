@@ -974,6 +974,157 @@ fn to_bin(a: *W, p: i32, bias: i32, maxef: i32, f: u32) u64 {
     return (s | (@as(u64, @bit_cast(u32, d.ef)) << fb)) | (d.m.l & fm);
 }
 
+/// r = a, of format ff, in format tf: exact from the x87's format to
+/// binary128 (a subset of its values), correctly rounded the other way; a
+/// NaN keeps the top bits of its payload, quieted (C's _Float128, _Float64x
+/// and long double where two of them have different formats).
+pub fn convert(r: *mut W, a: *W, ff: u32, tf: u32) void {
+    if ff == tf {
+        put(r, a.lo, a.hi);
+        return;
+    }
+    let x = unpack(a, ff);
+    if x.cls == C_NAN {
+        // the payload below the quiet bit, as many of its top bits as fit
+        let mut pl = u2(0, 0);
+        if ff == FMT_X {
+            pl = u2(a.lo << 2, 0);  // (62 payload bits, at the top of 128)
+        } else {
+            pl = shl(u2(a.hi & 0x7FFF_FFFF_FFFF, a.lo), 17);  // (111 bits)
+        }
+        if (ff == FMT_X) and (((a.hi & 0x7FFF) != 0x7FFF) or ((a.lo >> 63) == 0)) {
+            pack_dnan(r, tf);  // (an invalid x87 encoding)
+            return;
+        }
+        if tf == FMT_X {
+            put(r, 0xC000_0000_0000_0000 | (pl.h >> 2), sgn(x.neg, 15) | 0x7FFF);
+            return;
+        }
+        let q = shr(pl, 17);
+        put(r, q.l, ((sgn(x.neg, 63) | (@as(u64, 0x7FFF) << 48)) | 0x0000_8000_0000_0000) | (q.h & 0x7FFF_FFFF_FFFF));
+        return;
+    }
+    if x.cls == C_INF {
+        pack_inf(r, x.neg, tf);
+        return;
+    }
+    if x.cls == C_ZERO {
+        pack_zero(r, x.neg, tf);
+        return;
+    }
+    finish(r, x.neg, x.e, x.s, false, tf);
+}
+
+// -----------------------------------------------------------------------------
+// binary16 (C's _Float16): its values are their 16 bits, which the C front
+// end widens to float for each operation and rounds back (cgen_half.ax).
+// Every conversion here is correctly rounded, to nearest with ties to even;
+// a NaN keeps the top bits of its payload, quieted.
+// -----------------------------------------------------------------------------
+
+// The binary16 encoding of m * 2^e (m nonzero), rounded (a little more than
+// that if sticky), with sign neg.
+fn half_round(neg: bool, m0: u64, e0: i32, sticky: bool) u64 {
+    let s: u64 = sgn(neg, 15);
+    let z = @truncate(i32, @bit_cast(i64, @clz(m0)));
+    let m = m0 << @bit_cast(u32, z);  // (bit 63 set)
+    let e = e0 - z;                   // value = m * 2^e
+    let top = e + 63;                 // the exponent of the leading bit
+    if top > 15 {
+        return s | 0x7C00;
+    }
+    // the weight of the last bit kept: 2^-24 (subnormal) or top - 10
+    let mut lsb = top - 10;
+    if lsb < -24 {
+        lsb = -24;
+    }
+    let drop = lsb - e;  // the bits of m below it (at least 53)
+    if drop >= 64 {
+        // (below half the smallest subnormal, or just at it)
+        if (drop == 64) and (((m >> 63) != 0) and (((m << 1) != 0) or sticky)) {
+            return s | 1;
+        }
+        return s;
+    }
+    let d = @bit_cast(u32, drop);
+    let mut q = m >> d;
+    let half = ((m >> (d - 1)) & 1) != 0;
+    let rest = ((m << (65 - d)) != 0) or sticky;
+    if half and (rest or ((q & 1) != 0)) {
+        q += 1;
+    }
+    // ((lsb + 25) << 10) + q - 0x400 is the encoding whether q is a normal
+    // significand (0x400 to 0x800: a carry into the next exponent included)
+    // or a subnormal one (lsb -24)
+    let bits = (@as(u64, @bit_cast(u32, lsb + 25)) << 10) +% q -% 0x400;
+    if bits >= 0x7C00 {
+        return s | 0x7C00;
+    }
+    return s | bits;
+}
+
+// The binary16 encoding of a value of a binary format: sign, biased exponent
+// ef, fraction fr of fb bits, its bias and largest exponent field.
+fn half_of(neg: bool, ef: i32, fr: u64, fb: u32, bias: i32, maxef: i32) u64 {
+    if ef == maxef {
+        if fr == 0 {
+            return sgn(neg, 15) | 0x7C00;
+        }
+        return (sgn(neg, 15) | 0x7E00) | ((fr >> (fb - 10)) & 0x1FF);
+    }
+    if ef == 0 {
+        if fr == 0 {
+            return sgn(neg, 15);
+        }
+        return half_round(neg, fr, (1 - bias) - @bit_cast(i32, fb), false);
+    }
+    return half_round(neg, fr | (@as(u64, 1) << fb), (ef - bias) - @bit_cast(i32, fb), false);
+}
+
+/// The binary16 bits of the float with bits x (its low 32).
+pub fn h_from_f32(x: u64) u64 {
+    return half_of(((x >> 31) & 1) != 0, @bit_cast(i32, @truncate(u32, (x >> 23) & 0xFF)), x & 0x7F_FFFF, 23, 127,
+                   0xFF);
+}
+
+/// The binary16 bits of the double with bits x.
+pub fn h_from_f64(x: u64) u64 {
+    return half_of((x >> 63) != 0, @bit_cast(i32, @truncate(u32, (x >> 52) & 0x7FF)), x & 0xF_FFFF_FFFF_FFFF, 52, 1023,
+                   0x7FF);
+}
+
+/// The binary16 bits of a (of format f).
+pub fn h_from_w(a: *W, f: u32) u64 {
+    return to_bin(a, 11, 15, 0x1F, f);
+}
+
+/// r = the binary16 value with bits h (exact).
+pub fn h_to_w(r: *mut W, h: u64, f: u32) void {
+    from_bin(r, ((h >> 15) & 1) != 0, @bit_cast(i32, @truncate(u32, (h >> 10) & 0x1F)), h & 0x3FF, 11, 15, 0x1F, f);
+}
+
+/// The binary16 bits of the integer x (signed: sg), correctly rounded.
+pub fn h_from_int(x: u64, sg: bool) u64 {
+    let neg = sg and ((x >> 63) != 0);
+    let mut m = x;
+    if neg {
+        m = 0 -% x;
+    }
+    if m == 0 {
+        return 0;
+    }
+    return half_round(neg, m, 0, false);
+}
+
+/// The binary16 bits of s * 2^(e - 127) (s = h:l, nonzero), rounded (a
+/// little more if sticky): the compiler reads _Float16 constants so.
+pub fn h_from_parts(neg: bool, e: i32, h: u64, l: u64, sticky: bool) u64 {
+    let s = u2(h, l);
+    let z = clz2(s);
+    let n = shl(s, z);
+    return half_round(neg, n.h, (e - @bit_cast(i32, z)) - 63, sticky or (n.l != 0));
+}
+
 // -----------------------------------------------------------------------------
 // Complex multiplication and division (C99 6.5.5, Annex G.5.1), of long
 // double _Complex values: the algorithms of the C front end's for float

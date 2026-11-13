@@ -625,6 +625,33 @@ static bool boundary_type_ok(Type *t, bool is_ret) {
     }
 }
 
+// A structure that crosses by value, or the type of a C object (spec
+// section 14.5.6): every member a boundary type (but void, and a function
+// type only as a member), a structure of such members, or an array of one.
+static bool boundary_data_ok(Type *t);
+
+static bool boundary_struct_ok(Type *t) {
+    if (!t->decl || t->decl->fields.len == 0) return false;
+    for (int i = 0; i < t->decl->fields.len; i++)
+        if (!boundary_data_ok(type_field(t, i))) return false;
+    return true;
+}
+
+static bool boundary_data_ok(Type *t) {
+    if (t->kind == TY_STRUCT) return boundary_struct_ok(t);
+    if (t->kind == TY_ARRAY) return t->len > 0 && boundary_data_ok(t->elem);
+    if (t->kind == TY_VOID || t->kind == TY_VEC || t->kind == TY_V128) return false;
+    return boundary_type_ok(t, false);
+}
+
+// A parameter or result of an extern "C" function or an export: a boundary
+// type, or a structure of them passed by value as the C ABI says (spec
+// section 14.5.3); not in `import host` functions.
+static bool boundary_ok_in(Type *t, bool is_ret, bool c_fn) {
+    if (c_fn && t->kind == TY_STRUCT) return boundary_struct_ok(t);
+    return boundary_type_ok(t, is_ret);
+}
+
 static const char *fn_type_hint(Type *t) {
     return t->kind == TY_FN ? " (a function type's parameters and result must be allowed there too)" : "";
 }
@@ -679,11 +706,18 @@ static void resolve_fn(Decl *d) {
     if (d->is_export || d->kind == D_HOST_FN) {
         const char *what = d->is_export ? "exported" : d->extern_c ? "C" : "imported";
         if (d->gparams.len) diag_error(d->name_span, "E0466", "%s functions cannot be generic", what);
-        for (int i = 0; i < d->params.len; i++)
-            if (!boundary_type_ok(d->param_types[i], false) && d->param_types[i]->kind != TY_INVALID)
+        // (structures cross by value in C functions, not in WebAssembly's imports)
+        bool c_fn = d->extern_c || d->is_export;
+        for (int i = 0; i < d->params.len; i++) {
+            if (c_fn && d->param_types[i]->kind == TY_STRUCT) d->cabi = true;
+            if (!boundary_ok_in(d->param_types[i], false, c_fn) && d->param_types[i]->kind != TY_INVALID)
                 diag_error(d->params.data[i].te->span, "E0801", "type %s is not allowed at the %s function boundary%s",
                            type_str(d->param_types[i]), what, fn_type_hint(d->param_types[i]));
-        if (!boundary_type_ok(d->ret_type, true))
+        }
+        if (c_fn && d->ret_type->kind == TY_STRUCT) d->cabi = true;
+        if (d->cabi && d->variadic)
+            diag_error(d->name_span, "E0801", "a variadic C function cannot take or return a structure by value");
+        if (!boundary_ok_in(d->ret_type, true, c_fn))
             diag_error(d->ret_te ? d->ret_te->span : d->name_span, "E0801",
                        "return type %s is not allowed at the %s function boundary%s", type_str(d->ret_type), what,
                        d->ret_type->kind == TY_ERRUNION ? " (handle errors before the export boundary)"
@@ -953,6 +987,12 @@ void resolve_decl(Decl *d) {
             diag_error(d->name_span, "E0354",
                        "thread-local '%s' must be mutable (`threadlocal let mut`; a constant needs no copy per thread)",
                        d->name);
+        if ((d->extern_c || d->is_export) && d->type->kind != TY_INVALID && !boundary_data_ok(d->type))
+            // an object C defines, or one C code may use (spec section 14.5.6)
+            diag_error(d->te->span, "E0801", "type %s is not allowed for %s object '%s'", type_str(d->type),
+                       d->extern_c ? "a C" : "an exported", d->name);
+        if (d->extern_c && d->abi && strcmp(d->abi, "C") != 0)
+            diag_error(d->abi_span, "E0306", "unknown ABI \"%s\" (only \"C\" is supported)", d->abi);
         break;
     }
     default: break;
@@ -1013,6 +1053,7 @@ static bool is_const_init(Expr *e) {
 
 static void check_global(Decl *d) {
     resolve_decl(d);
+    if (d->extern_c) return;  // (C defines it: no initializer)
     FnCtx ctx = {.tc = {d->module, NULL, NULL, NULL}, .const_ctx = true};
     FnCtx *saved = C;
     C = &ctx;

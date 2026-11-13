@@ -24,26 +24,26 @@ typedef int wctrans_t;
 
 #define WEOF ((wint_t)-1)
 
-int iswalnum(wint_t wc);
-int iswalpha(wint_t wc);
+int iswalnum(wint_t __wc);
+int iswalpha(wint_t __wc);
 #if __STDC_VERSION__ >= 199901L
-int iswblank(wint_t wc);
+int iswblank(wint_t __wc);
 #endif
-int iswcntrl(wint_t wc);
-int iswdigit(wint_t wc);
-int iswgraph(wint_t wc);
-int iswlower(wint_t wc);
-int iswprint(wint_t wc);
-int iswpunct(wint_t wc);
-int iswspace(wint_t wc);
-int iswupper(wint_t wc);
-int iswxdigit(wint_t wc);
-int iswctype(wint_t wc, wctype_t desc);
-wctype_t wctype(const char *property);
+int iswcntrl(wint_t __wc);
+int iswdigit(wint_t __wc);
+int iswgraph(wint_t __wc);
+int iswlower(wint_t __wc);
+int iswprint(wint_t __wc);
+int iswpunct(wint_t __wc);
+int iswspace(wint_t __wc);
+int iswupper(wint_t __wc);
+int iswxdigit(wint_t __wc);
+int iswctype(wint_t __wc, wctype_t __desc);
+wctype_t wctype(const char *__property);
 
-wint_t towlower(wint_t wc);
-wint_t towupper(wint_t wc);
-wint_t towctrans(wint_t wc, wctrans_t desc);
-wctrans_t wctrans(const char *property);
+wint_t towlower(wint_t __wc);
+wint_t towupper(wint_t __wc);
+wint_t towctrans(wint_t __wc, wctrans_t __desc);
+wctrans_t wctrans(const char *__property);
 
 #endif

@@ -55,7 +55,7 @@ struct lconv {
 };
 #undef __AXIOM_LCONV_C99
 
-char *setlocale(int category, const char *locale);
+char *setlocale(int __category, const char *__locale);
 struct lconv *localeconv(void);
 
 #endif

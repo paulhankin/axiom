@@ -8,6 +8,11 @@
 #endif
 
 typedef __builtin_va_list va_list;
+#ifdef __AXIOM_SYSTEM_C_LIB__
+/* (--c-lib=system: the system C library's headers name the type so when
+   they include this header for it) */
+typedef __builtin_va_list __gnuc_va_list;
+#endif
 
 #if __STDC_VERSION__ >= 202311L
 /* (C23: the arguments after the first are not evaluated) */

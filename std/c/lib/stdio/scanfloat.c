@@ -11,8 +11,10 @@
    the decimal digits D and exponent E give D * 10^E; for E >= 0 that is an
    integer, for E < 0 the quotient of D * 2^s by 10^-E is taken to more bits
    than the format has, its remainder telling whether the value is above
-   the quotient; then the binary value is rounded once, half to even
-   (W. D. Clinger, "How to read floating point numbers accurately", PLDI
+   the quotient; then the binary value is rounded once, in the current
+   rounding direction (F.5: to nearest with the halfway case to even,
+   toward zero, upward, downward; an overflow toward zero gives the largest
+   finite value, F.7 / IEC 60559 7.4) (W. D. Clinger, "How to read floating point numbers accurately", PLDI
    1990, for the method; the arithmetic here is plain long division). */
 #include "impl.h"
 
@@ -175,22 +177,37 @@ struct res {
     unsigned __axiom_int64 hi, lo;
     long e;
     int inf, inexact;
+    int over; /* overflowed (to infinity, or to the largest finite value) */
 };
 
-/* Rounds q * 2^-s (plus a little more if sticky) to the format: half to
-   even, with the subnormal values below emin. */
-static void round_to(const struct fmt *f, const struct bnum *q, long s, int sticky, struct res *r) {
+/* An overflow's result: infinity, or toward zero the largest finite value */
+static void overflow(const struct fmt *f, struct res *r, int dir) {
+    r->inexact = 1;
+    r->over = 1;
+    if (dir >= 0) {
+        r->inf = 1;
+        return;
+    }
+    r->inf = 0;
+    r->e = f->emax - (f->p - 1);
+    r->lo = f->p >= 64 ? ~(unsigned __axiom_int64)0 : ((unsigned __axiom_int64)1 << f->p) - 1;
+    r->hi = f->p > 64 ? ((unsigned __axiom_int64)1 << (f->p - 64)) - 1 : 0;
+}
+
+/* Rounds q * 2^-s (plus a little more if sticky) to the format, with the
+   subnormal values below emin; dir: 0 half to even, 1 away from zero, -1
+   toward zero (__axc_round_dir). */
+static void round_to(const struct fmt *f, const struct bnum *q, long s, int sticky, struct res *r, int dir) {
     long nb = bn_bits(q), lead, keep, drop, i;
     r->hi = r->lo = 0;
-    r->inf = 0;
+    r->inf = r->over = 0;
     r->inexact = sticky;
     r->e = 0;
     if (nb == 0)
         return;
     lead = nb - 1 - s;
     if (lead > f->emax) {
-        r->inf = 1;
-        r->inexact = 1;
+        overflow(f, r, dir);
         return;
     }
     keep = f->p;
@@ -221,7 +238,10 @@ static void round_to(const struct fmt *f, const struct bnum *q, long s, int stic
             }
         }
         r->inexact = half || rest;
-        up = half && (rest || (r->lo & 1));
+        if (dir == 0)
+            up = half && (rest || (r->lo & 1));
+        else
+            up = dir > 0 && (half || rest);
         if (up) {
             r->lo++;
             if (r->lo == 0)
@@ -236,10 +256,8 @@ static void round_to(const struct fmt *f, const struct bnum *q, long s, int stic
             r->e++;
         }
     }
-    if (r->e + f->p - 1 > f->emax) {
-        r->inf = 1;
-        r->inexact = 1;
-    }
+    if (r->e + f->p - 1 > f->emax)
+        overflow(f, r, dir);
 }
 
 /* -------------------------------------------------------------------------
@@ -253,10 +271,10 @@ static void convert(const struct fmt *f, struct __axc_num *n, struct res *r, int
     size_t heapn = 0;
     struct bnum q, t;
     long s = 0, i, limbs;
-    int sticky = 0;
+    int sticky = 0, dir = __axc_round_dir(n->neg);
     r->hi = r->lo = 0;
     r->e = 0;
-    r->inf = 0;
+    r->inf = r->over = 0;
     r->inexact = 0;
     *range = 0;
     if (n->kind == 1) {
@@ -277,7 +295,7 @@ static void convert(const struct fmt *f, struct __axc_num *n, struct res *r, int
             n->bexp = 100000;
         if (n->bexp < -100000)
             n->bexp = -100000;
-        round_to(f, &q, -n->bexp, n->sticky, r);
+        round_to(f, &q, -n->bexp, n->sticky, r, dir);
         goto done;
     }
     if (n->nd == 0)
@@ -285,11 +303,17 @@ static void convert(const struct fmt *f, struct __axc_num *n, struct res *r, int
     /* out of range at once: above 10^(emax+1)log2.. or below the smallest
        subnormal's half */
     if (n->dexp > (long)(f->emax + 1) * 30103 / 100000 + 1) {
-        r->inf = 1;
+        overflow(f, r, dir);
         *range = 1;
         return;
     }
     if (n->dexp < (long)(f->emin - f->p) * 30103 / 100000 - 1) {
+        /* (0, or away from zero the smallest subnormal) */
+        if (dir > 0) {
+            r->lo = 1;
+            r->e = f->emin - (f->p - 1);
+        }
+        r->inexact = 1;
         *range = 1;
         return;
     }
@@ -337,7 +361,7 @@ static void convert(const struct fmt *f, struct __axc_num *n, struct res *r, int
                     p10 *= 10;
                 bn_muladd(&q, p10, 0);
             }
-            round_to(f, &q, 0, 0, r);
+            round_to(f, &q, 0, 0, r, dir);
         } else {
             /* T = 10^-e10; q = floor(D * 2^s / T), the remainder sticky */
             long k = -e10;
@@ -380,7 +404,7 @@ static void convert(const struct fmt *f, struct __axc_num *n, struct res *r, int
             while (quo.n > 0 && quo.l[quo.n - 1] == 0)
                 quo.n--;
             sticky = q.n != 0;
-            round_to(f, &quo, s, sticky, r);
+            round_to(f, &quo, s, sticky, r, dir);
         }
     }
     if (heap != NULL)
@@ -388,7 +412,7 @@ static void convert(const struct fmt *f, struct __axc_num *n, struct res *r, int
 done:
     /* (7.22.1.3p10: overflow; underflow when the result is not normal and
        inexact, or zero) */
-    if (r->inf)
+    if (r->inf || r->over)
         *range = 1;
     else if (r->inexact && !((f->p > 64 ? r->hi >> (f->p - 1 - 64) : r->lo >> (f->p - 1)) & 1))
         *range = 1;
@@ -640,6 +664,7 @@ end:
 static void to_parts(const struct fmt *f, struct __axc_num *n, struct res *r, int *range) {
     if (n->kind >= 2) {
         r->inf = n->kind == 2;
+        r->over = 0;
         r->hi = r->lo = 0;
         r->e = 0;
         *range = 0;
@@ -664,10 +689,12 @@ double __axc_num_double(struct __axc_num *n, int *range) {
             __axiom_int64 v = 0;
             for (k = 0; k < n->nd; k++)
                 v = v * 10 + n->d[k];
-            x = (double)v;
+            /* (the sign first: the one rounded operation then rounds in
+               the current direction for the signed value) */
+            x = (double)(n->neg ? -v : v);
             x = e10 < 0 ? x / p10[-e10] : x * p10[e10];
             *range = 0;
-            return n->neg ? -x : x;
+            return x;
         }
     }
     to_parts(&F64, n, &r, range);
@@ -756,8 +783,59 @@ long double __axc_num_long_double(struct __axc_num *n, int *range) {
 #endif
 }
 
-/* The digit room a conversion of each format needs (struct __axc_num.cap) */
+/* binary16 and binary128 (_Float16, _Float128: strtof16, strtof128),
+   whatever long double is */
+static const struct fmt F16 = {11, -14, 15, 40};
+static const struct fmt F128 = {113, -16382, 16383, 11600};
+
+/* n in binary16 (which 0) or binary128 (which 1): its 2 or 16 bytes, little-endian, at out */
+void __axc_num_bits(struct __axc_num *n, int *range, int which, unsigned char *out) {
+    struct res r;
+    unsigned __axiom_int64 w0, w1;
+    int k;
+    if (which == 0) {
+        unsigned int bits;
+        to_parts(&F16, n, &r, range);
+        if (n->kind == 3)
+            bits = 0x7e00u;
+        else if (r.inf)
+            bits = 0x7c00u;
+        else if (r.lo >> 10)
+            bits = ((unsigned int)(r.e + 10 + 15) << 10) | ((unsigned int)r.lo & 0x3ffu);
+        else
+            bits = (unsigned int)r.lo;
+        if (n->neg)
+            bits |= 0x8000u;
+        out[0] = (unsigned char)(bits & 0xff);
+        out[1] = (unsigned char)(bits >> 8);
+        return;
+    }
+    to_parts(&F128, n, &r, range);
+    if (n->kind == 3) {
+        w0 = 0;
+        w1 = 0x7fff800000000000ULL;
+    } else if (r.inf) {
+        w0 = 0;
+        w1 = 0x7fff000000000000ULL;
+    } else {
+        w0 = r.lo;
+        w1 = r.hi & 0xffffffffffffULL;
+        if (r.hi >> 48)
+            w1 |= (unsigned __axiom_int64)(r.e + 112 + 16383) << 48;
+    }
+    if (n->neg)
+        w1 |= 0x8000000000000000ULL;
+    for (k = 0; k < 8; k++) {
+        out[k] = (unsigned char)(w0 >> (8 * k));
+        out[8 + k] = (unsigned char)(w1 >> (8 * k));
+    }
+}
+
+/* The digit room a conversion of each format needs (struct __axc_num.cap):
+   ld 0 binary64's (and binary32's), 1 long double's, 2 binary128's */
 int __axc_num_digits(int ld) {
+    if (ld == 2)
+        return F128.digits + 2;
     return ld ? FLD.digits + 2 : F64.digits + 2;
 }
 
@@ -774,13 +852,16 @@ static void text_unget(struct __axc_in *i, int c) {
     i->s--;
 }
 
-long double __axc_strtold(const char *s, char **end, int *range) {
+/* The subject sequence of strtod at s (white space skipped) in the
+   format: 0 float, 1 double, 2 long double (*out of that type), 3
+   binary16, 4 binary128 (the bytes at out: strtof16, strtof128); *end
+   past it (s if there is none); *range on overflow and underflow. */
+static void text_scan(const char *s, char **end, int format, void *out, int *range) {
     struct __axc_in in;
     struct __axc_num n;
-    size_t taken, valid, cap = (size_t)__axc_num_digits(1);
+    size_t taken, valid, cap = (size_t)__axc_num_digits(format == 2 || format == 4);
     const char *p = s;
     char small[804];
-    long double v = 0;
     *range = 0;
     while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
         p++;
@@ -792,6 +873,7 @@ long double __axc_strtold(const char *s, char **end, int *range) {
     in.ws = NULL;
     in.eof = in.error = 0;
     in.c23 = 0;
+    in.viol = NULL;
     n.nohex = 0;
     n.d = small;
     if (cap > sizeof small)
@@ -803,8 +885,24 @@ long double __axc_strtold(const char *s, char **end, int *range) {
         cap = sizeof small;
     }
     n.cap = (int)cap;
+    if (format == 0)
+        *(float *)out = 0;
+    else if (format == 1)
+        *(double *)out = 0;
+    else if (format == 2)
+        *(long double *)out = 0;
+    else
+        for (taken = 0; taken < (format == 4 ? 16u : 2u); taken++)
+            ((unsigned char *)out)[taken] = 0;
     if (__axc_scan_num(&in, -1, &n, &taken, &valid) && valid > 0) {
-        v = __axc_num_long_double(&n, range);
+        if (format == 0)
+            *(float *)out = __axc_num_float(&n, range);
+        else if (format == 1)
+            *(double *)out = __axc_num_double(&n, range);
+        else if (format == 2)
+            *(long double *)out = __axc_num_long_double(&n, range);
+        else
+            __axc_num_bits(&n, range, format - 3, (unsigned char *)out);
         p += valid;
     } else {
         p = s;
@@ -813,6 +911,26 @@ long double __axc_strtold(const char *s, char **end, int *range) {
         __axc_sys_free(n.d, cap);
     if (end != NULL)
         *end = (char *)p;
+}
+
+long double __axc_strtold(const char *s, char **end, int *range) {
+    long double v;
+    text_scan(s, end, 2, &v, range);
+    return v;
+}
+
+/* strtod's and strtof's conversion when the rounding direction is not to
+   nearest (std/c/lib/core/strtod.c, strtof.c: their own parser rounds to
+   nearest only) */
+double __axc_strtod_dir(const char *s, char **end, int *range) {
+    double v;
+    text_scan(s, end, 1, &v, range);
+    return v;
+}
+
+float __axc_strtof_dir(const char *s, char **end, int *range) {
+    float v;
+    text_scan(s, end, 0, &v, range);
     return v;
 }
 
@@ -1011,6 +1129,7 @@ void __axc_strtodec(const char *s, char **end, int dfmt, void *dst, int *range) 
     in.ws = NULL;
     in.eof = in.error = 0;
     in.c23 = 1;
+    in.viol = NULL;
     n.nohex = 1;
     n.d = small;
     n.cap = (int)sizeof small; /* (more than any format's p + 3 digits) */
@@ -1032,4 +1151,10 @@ void __axc_strtodec(const char *s, char **end, int dfmt, void *dst, int *range) 
     }
     if (end != NULL)
         *end = (char *)p;
+}
+
+/* strtof16 and strtof128's work (which 0 binary16, 1 binary128): the
+   result's bytes at out */
+void __axc_strtobits(const char *s, char **end, int *range, int which, unsigned char *out) {
+    text_scan(s, end, 3 + which, out, range);
 }

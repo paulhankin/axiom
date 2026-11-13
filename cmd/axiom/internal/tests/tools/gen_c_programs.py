@@ -2,7 +2,7 @@
 """Writes a random C program free of undefined behaviour, for differential
 testing of the C front end against another implementation:
 
-    gen_c_programs.py SEED [--no-long]
+    gen_c_programs.py SEED [--no-long] [--hosted]
 
 The program is freestanding (it prints through host.h's print_u64) and
 prints a checksum of its globals after each call from main. Undefined
@@ -14,7 +14,12 @@ the length, loops have fixed trip counts, recursion has a depth argument,
 and a global fuel counter bounds the total number of calls. Expressions have
 no side effects (functions called in them are pure), so the order of
 evaluation does not matter. With --no-long the program does not use long, so
-that it prints the same on ILP32 and LP64 targets.
+that it prints the same on ILP32 and LP64 targets. With --hosted the program
+is a hosted one, for the C library's differential testing: it prints with
+printf, and each checksum also goes through the library (snprintf's %llx,
+%.17g and %a of the values, strtoull's and strtod's readings back, and the
+string functions over them), which a mismatch with the other implementation
+then shows.
 """
 import random
 import sys
@@ -835,7 +840,12 @@ class Gen:
     def program(self):
         o = self.out
         o.append('/* generated program */')
-        o.append('#include "host.h"')
+        if self.hosted:
+            o.append('#include <stdio.h>')
+            o.append('#include <stdlib.h>')
+            o.append('#include <string.h>')
+        else:
+            o.append('#include "host.h"')
         o.append('#include <stdarg.h>')
         o.append('#include <stddef.h>')
         o.append('static int fuel = %d;' % self.r.randint(200, 3000))
@@ -846,7 +856,22 @@ class Gen:
         o.append('    x.d = d;')
         o.append('    if (d != d) x.u = 0x7ff8000000000000ULL;')
         o.append('    ck(x.u);')
+        if self.hosted:
+            # (the value as text and back: the formatting and conversion functions)
+            o.append('    if (d == d) {')
+            o.append('        char b[64], c[64];')
+            o.append('        snprintf(b, sizeof b, "%.17g", d);')
+            o.append('        snprintf(c, sizeof c, "%a", d);')
+            o.append('        ck(strtod(b, NULL) == d && strtod(c, NULL) == d);')
+            o.append('        ck(strlen(b) * 131 + (unsigned long long)(strchr(b, \'e\') != NULL));')
+            o.append('    }')
         o.append('}')
+        if self.hosted:
+            o.append('static void out(unsigned long long v) {')
+            o.append('    char b[32];')
+            o.append('    snprintf(b, sizeof b, "%llx", v);')
+            o.append('    printf("%llu %d\\n", strtoull(b, NULL, 16), (int)strlen(b));')
+            o.append('}')
         for i in range(self.r.randint(0, 4)):
             self.gen_struct(i)
         genv = {'vars': [], 'arrays': [], 'fields': [], 'ptrs': [], 'svars': [], 'struct_globals': {}, 'pure': [],
@@ -858,11 +883,11 @@ class Gen:
             self.gen_func(i, genv)
         o.append('static void layout(void) {')
         o.extend(self.layout_lines())
-        o.append('    print_u64(h);')
+        o.append('    %s(h);' % ('out' if self.hosted else 'print_u64'))
         o.append('}')
         o.append('static void checksum(void) {')
         o.extend(self.hash_lines(genv))
-        o.append('    print_u64(h);')
+        o.append('    %s(h);' % ('out' if self.hosted else 'print_u64'))
         o.append('}')
         o.append('')
         o.append('int main(void) {')
@@ -887,7 +912,9 @@ class Gen:
 def main():
     seed = int(sys.argv[1])
     no_long = '--no-long' in sys.argv
-    sys.stdout.write(Gen(seed, no_long).program())
+    g = Gen(seed, no_long)
+    g.hosted = '--hosted' in sys.argv
+    sys.stdout.write(g.program())
 
 
 if __name__ == '__main__':

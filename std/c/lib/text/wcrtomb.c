@@ -7,7 +7,7 @@
 #include <wchar.h>
 
 size_t wcrtomb(char *restrict s, wchar_t wc, mbstate_t *restrict ps) {
-    static mbstate_t internal;
+    static _Thread_local mbstate_t internal; /* (each thread's: free of data races) */
     char buf[4];
     unsigned long c;
     int n;

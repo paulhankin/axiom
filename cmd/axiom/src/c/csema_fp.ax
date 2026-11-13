@@ -415,6 +415,84 @@ fn tg_decimal(e: *mut cast.Expr, drank0: i32, ints: bool, bin: bool) bool {
     return false;
 }
 
+// A type-generic macro's call with an argument of an interchange or
+// extended floating type (C23 H.11; real arguments): the arguments' common
+// real type (an integer one counted as double, 7.27p3). For binary16 and
+// binary128 (_Float16, _Float128, a _Float64x of binary128) the function is
+// the double one's name with f16 or f128 (sqrtf128 for sqrt), which <math.h>
+// declares with __STDC_WANT_IEC_60559_TYPES_EXT__ (without it, float's
+// function for binary16, long double's where that is binary128, else an
+// error: no function keeps a binary128 value); for the others, whose
+// formats are float's, double's or long double's, *rank is that type's, and
+// the standard function is called (of that format: its result has the
+// standard type). 0: not done here (no such argument, or *rank set); 1: the
+// call is the function's; 2: an error (reported).
+fn tg_xfloat(e: *mut cast.Expr, ngv: usize, rank: *mut i32) i32 {
+    let mut t = u.nil.[cty.CType]();
+    let mut ext = false;
+    for i in @as(usize, 7)..(7 + ngv) {
+        let a = e.args.get(i);
+        let mut at = a.ty;
+        if cty.is_integer(at) {
+            at = cty.t_double;
+        }
+        let k = at.unq.kind;
+        ext = ext or ((k >= cty.TK_FLOAT16) and (k <= cty.TK_FLOAT128));
+        if u.isnil(t) {
+            t = at;
+        } else {
+            t = cty.common_type(t, at);
+        }
+    }
+    if not ext {
+        return 0;
+    }
+    let f = cty.ffmt(t);
+    let k = t.unq.kind;
+    if (f == 16) or ((f == 128) and (k != cty.TK_LDOUBLE)) {
+        let base = e.args.get(2);
+        let mut sym = u.nil.[cast.CSym]();
+        let mut name: []u8 = "";
+        if base.kind == cast.ExprKind.IDENT {
+            name = u.intern(u.cat2(base.name, u.pick(f == 16, "f16", "f128")));
+            sym = cs.lookup(name);
+        }
+        if u.isnil(sym) and (f == 16) {
+            rank.* = 0;  // (not declared: float's function, whose format holds binary16's values)
+            return 0;
+        }
+        if u.isnil(sym) and (cty.ld_bits() == 128) {
+            rank.* = 2;  // (not declared: long double's, binary128 too)
+            return 0;
+        }
+        if u.isnil(sym) {
+            cs.err(e.span, "C3082",
+                   u.f1("this type-generic macro has no function for %s arguments (<math.h> declares those of _Float16 and _Float128 with __STDC_WANT_IEC_60559_TYPES_EXT__)",
+                        cs.tq(t)));
+            _ = bad(e);
+            return 2;
+        }
+        let callee = cast.new_expr(cast.ExprKind.IDENT, base.span);
+        callee.name = name;
+        let mut args = u.List.[*mut cast.Expr].empty();
+        for i in @as(usize, 7)..e.args.len {
+            args.push(e.args.get(i));
+        }
+        e.a = callee;
+        e.args = args;
+        e.op = 0;
+        return 1;
+    }
+    if f == 32 {
+        rank.* = 0;
+    } else if f == 64 {
+        rank.* = 1;
+    } else {
+        rank.* = 2;  // (long double's format)
+    }
+    return 0;
+}
+
 fn tg_call(e: *mut cast.Expr) bool {
     let n = e.args.len;
     if n < 8 {
@@ -458,6 +536,12 @@ fn tg_call(e: *mut cast.Expr) bool {
     }
     if drank > 0 {
         return tg_decimal(e, drank, ints, bin);
+    }
+    if not cplx {
+        let x = tg_xfloat(e, ngv, &mut rank);
+        if x != 0 {
+            return x == 2;
+        }
     }
     // the function: slot 1 + rank (real) or 4 + rank (complex)
     let real = e.args.get(1 + @as(usize, @bit_cast(u32, rank)));

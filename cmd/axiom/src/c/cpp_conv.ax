@@ -282,6 +282,7 @@ pub struct PNum {
     wide: bool,  // bitint, its value more than 64 bits (ival: the low 64; semantic analysis reads the digits)
     fval: f64,
     fsuffix: i32,
+    prefix: i32,  // a floating constant: 1 for an imaginary one (a GNU dialect: 2.0i)
 }
 
 fn digit_ok(c: u8, base: i32) bool {
@@ -313,7 +314,7 @@ fn looks_float(s: []u8) bool {
 /// Converts the pp-number `t` to an integer or floating constant.
 pub fn number(t: *lx.PTok, o: *co.COptions, quiet: bool) PNum {
     let mut r = PNum.{ ok: true, is_float: false, ival: 0, base: 10, unsigned_: false, longs: 0, bitint: false,
-                       wide: false, fval: 0.0, fsuffix: 0 };
+                       wide: false, fval: 0.0, fsuffix: 0, prefix: 0 };
     let s = t.text;
     if looks_float(s) {
         r.is_float = true;
@@ -596,13 +597,23 @@ fn float_number(t: *lx.PTok, o: *co.COptions, quiet: bool, r: *mut PNum) void {
         r.ok = false;
         return;
     }
-    let suf = s[i..];
+    let mut suf = s[i..];
+    if o.gnu and (suf.len > 0) and is_imag_char(suf[suf.len - 1]) {
+        // (a GNU dialect's imaginary constant: 2.0i, 1.5fi, 3.0Lj ...; Token.prefix 1)
+        r.prefix = 1;
+        suf = suf[0..suf.len - 1];
+    } else if o.gnu and (suf.len > 1) and is_imag_char(suf[0]) {
+        r.prefix = 1;
+        suf = suf[1..];
+    }
     if suf.len == 0 {
         r.fsuffix = 0;
     } else if u.str_eq(suf, "f") or u.str_eq(suf, "F") {
         r.fsuffix = 1;
     } else if u.str_eq(suf, "l") or u.str_eq(suf, "L") {
         r.fsuffix = 2;
+    } else if xfloat_suffix(suf, o) > 0 {
+        r.fsuffix = xfloat_suffix(suf, o);  // (Annex H.5.2: f16, f32, f64, f128, f32x, f64x, and F...)
     } else if u.str_eq(suf, "df") or u.str_eq(suf, "dd") or u.str_eq(suf, "dl") or u.str_eq(suf, "DF") or
               u.str_eq(suf, "DD") or u.str_eq(suf, "DL") {
         // a decimal floating constant (C23 6.4.4.2: df _Decimal32, dd
@@ -619,13 +630,13 @@ fn float_number(t: *lx.PTok, o: *co.COptions, quiet: bool, r: *mut PNum) void {
         }
         let lw = suf[1];
         let mut fm = dfp.D64;
-        r.fsuffix = 4;
+        r.fsuffix = ct.FS_DEC64;
         if (lw == 'f') or (lw == 'F') {
             fm = dfp.D32;
-            r.fsuffix = 3;
+            r.fsuffix = ct.FS_DEC32;
         } else if (lw == 'l') or (lw == 'L') {
             fm = dfp.D128;
-            r.fsuffix = 5;
+            r.fsuffix = ct.FS_DEC128;
         }
         let mut dinf = false;
         let w = cdec.parse_literal(s, fm, &mut dinf);
@@ -641,14 +652,17 @@ fn float_number(t: *lx.PTok, o: *co.COptions, quiet: bool, r: *mut PNum) void {
         return;
     }
     let mut inf = false;
-    if (r.fsuffix == 2) and (o.ld_bits != 64) {
-        // a long double wider than double: its range (csema reads the value again)
-        let f = cl.fmt_of(o.ld_bits);
+    let wbits = suffix_bits(r.fsuffix, o);
+    if wbits > 64 {
+        // a format wider than double: its range (csema reads the value again)
+        let f = cl.fmt_of(wbits);
         let w = cl.parse_literal(s, f, &mut inf);
         r.fval = cl.to_f64(w, f);
+    } else if wbits == 16 {
+        r.fval = cl.half_value(cl.parse_half(s, &mut inf));
     } else if hex {
         let ex = e2 + exp;
-        if r.fsuffix == 1 {
+        if wbits == 32 {
             let bits = round_bin(mant, ex, sticky, 24, -149, 127);
             inf = bits == 0x7F800000;
             r.fval = @as(f64, @bit_cast(f32, @truncate(u32, bits)));
@@ -660,7 +674,7 @@ fn float_number(t: *lx.PTok, o: *co.COptions, quiet: bool, r: *mut PNum) void {
     } else {
         // (the digits, with a point and an exponent: a form the parser takes)
         let txt = digits.view();
-        if r.fsuffix == 1 {
+        if wbits == 32 {
             let f = u.parse_f32(txt);
             inf = (f - f) != (f - f);
             r.fval = @as(f64, f);
@@ -673,6 +687,51 @@ fn float_number(t: *lx.PTok, o: *co.COptions, quiet: bool, r: *mut PNum) void {
         bad(t.span, "C1018", u.f1("floating constant '%s' is out of range", s), quiet);
         r.ok = false;
     }
+}
+
+fn is_imag_char(c: u8) bool {
+    return (c == 'i') or (c == 'j') or (c == 'I') or (c == 'J');
+}
+
+// The suffix code (ctok.Token.fsuffix) of an interchange or extended floating
+// type's suffix (Annex H.5.2; in every standard, as the types' keywords), or
+// of the GNU dialects' q and Q (__float128); 0 for another.
+fn xfloat_suffix(suf: []u8, o: *co.COptions) i32 {
+    let names = ["f16", "F16", "f32", "F32", "f64", "F64", "f128", "F128", "f32x", "F32x", "f64x", "F64x"];
+    let codes: [12]i32 = [ct.FS_F16, ct.FS_F16, ct.FS_F32, ct.FS_F32, ct.FS_F64, ct.FS_F64, ct.FS_F128, ct.FS_F128,
+                          ct.FS_F32X, ct.FS_F32X, ct.FS_F64X, ct.FS_F64X];
+    for k in 0..names.len {
+        if u.str_eq(suf, names[k]) {
+            return codes[k];
+        }
+    }
+    if o.gnu and (u.str_eq(suf, "q") or u.str_eq(suf, "Q")) {
+        return ct.FS_F128;
+    }
+    return 0;
+}
+
+// The format (ctypes.ffmt) of a floating constant with suffix code fs.
+fn suffix_bits(fs: i32, o: *co.COptions) i32 {
+    if (fs == 1) or (fs == ct.FS_F32) {
+        return 32;
+    }
+    if fs == 2 {
+        return o.ld_bits;
+    }
+    if fs == ct.FS_F16 {
+        return 16;
+    }
+    if fs == ct.FS_F128 {
+        return 128;
+    }
+    if fs == ct.FS_F64X {
+        if o.ld_bits > 64 {
+            return o.ld_bits;
+        }
+        return 128;
+    }
+    return 64;
 }
 
 // -----------------------------------------------------------------------------
@@ -765,6 +824,7 @@ pub fn convert(ts: []lx.PTok, o: *co.COptions, out: *mut u.List.[ct.Token]) void
                 r.kind = ct.T_FLOAT;
                 r.fval = n.fval;
                 r.fsuffix = n.fsuffix;
+                r.prefix = n.prefix;
             } else {
                 r.ival = n.ival;
                 r.base = n.base;

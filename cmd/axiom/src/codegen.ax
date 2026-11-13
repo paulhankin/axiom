@@ -67,6 +67,31 @@ pub let mut g_link_libs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mu
 // own linkers link: c/cstrip.ax).
 pub let mut g_lib_prefix: []u8 = "";
 pub let mut g_strip: bool = false;
+
+/// The output is an object for other links (--emit=obj, --emit=lib), not
+/// an executable's: whatever several such objects may each have, they
+/// share. The program's state (its modules' mutable globals, the runtime's
+/// shadow stack and tables) is link-once (weak global symbols) named after
+/// the declarations
+/// (one object's copy is the program's: two objects that both use the
+/// standard library's allocator use one heap), and the runtime's functions
+/// and the stubs are weak, so that the objects link with each other and
+/// with a program, which then has one runtime (link-once: every copy is the
+/// same definition, so the optimizer treats them as it did). A module's
+/// functions stay
+/// the object's own (internal: their copies may differ in what they
+/// inlined); the program's `export fn`s other than the runtime's are its
+/// strong definitions.
+pub let mut g_object_output: bool = false;
+
+// The linkage of a global the whole program shares (internal in an
+// executable's object, weak in one for other links: g_object_output).
+fn program_linkage() i32 {
+    if g_object_output {
+        return ir.LINK_LINKONCE;
+    }
+    return ir.LINK_INTERNAL;
+}
 // Has the program C units (cfront.pending when code generation starts)?
 let mut g_c_program: bool = false;
 // Build a test binary (axiom test): tests become roots and are exported.
@@ -496,8 +521,21 @@ struct FnLty {
 }
 
 fn fn_lty(fnty: *mut ast.Type) FnLty {
+    return fn_lty_c(fnty, false);
+}
+
+// The wrappers of C functions that take or return structures by value
+// (spec §14.5.3; ast.Decl's cabi): every structure by pointer, a structure
+// result through a pointer first parameter, the rest as Axiom passes them.
+// The wrapper, a C function (cabi_source in header.ax), passes them as the
+// target's C ABI says.
+fn cabi_struct(t: *mut ast.Type, cabi: bool) bool {
+    return by_ptr(t) or (cabi and (t.kind == ast.TY_STRUCT));
+}
+
+fn fn_lty_c(fnty: *mut ast.Type, cabi: bool) FnLty {
     let ret = fnty.ret;
-    let sret = by_ptr(ret);
+    let sret = cabi_struct(ret, cabi);
     let mut n = fnty.params.len;
     if sret {
         n += 1;
@@ -509,7 +547,7 @@ fn fn_lty(fnty: *mut ast.Type) FnLty {
         k += 1;
     }
     for i in 0..fnty.params.len {
-        if by_ptr(fnty.params[i]) {
+        if cabi_struct(fnty.params[i], cabi) {
             ps[k] = T_ptr;
         } else {
             ps[k] = vty(fnty.params[i]);
@@ -1795,7 +1833,21 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
         return found;
     }
     let t = d.ty;
-    let gname = u.f2("%s.%s", mangle_prefix(d), d.name);
+    let mut gname = u.f2("%s.%s", mangle_prefix(d), d.name);
+    if d.extern_c or d.is_export {
+        gname = d.name;  // (C's object, or one for C: spec §14.5.6)
+    }
+    if d.extern_c {
+        // an object C defines: a declaration (C code may have declared or
+        // defined it in the module already)
+        let mut ex = ir.get_global(M, gname);
+        if u.isnil(ex) {
+            ex = ir.add_global(M, lty(t), gname);
+            ex.align = @max(ex.align, @bit_cast(u64, ty.type_align(t)));
+        }
+        global_vals.put(k, ex.val);
+        return ex.val;
+    }
     let g = ir.add_global(M, lty(t), gname).val;
     set_align(g, @int_cast(u32, ty.type_align(t)));
     global_vals.put(k, g);
@@ -1805,8 +1857,16 @@ fn global_ref(d: *mut ast.Decl) *mut ir.Value {
         return g;  // defined by the link unit
     }
     axd.note_global(d, gname, t, ir.gv_of(g));
-    if O.unit == CG_WHOLE {
-        set_linkage(g, ir.LINK_INTERNAL);
+    if d.is_export {
+        // (C's: external, the program's one definition)
+    } else if O.unit == CG_WHOLE {
+        // (a constant one has no state to share: the object's own, whose
+        // value the optimizer may use)
+        if d.is_mut {
+            set_linkage(g, program_linkage());
+        } else {
+            set_linkage(g, ir.LINK_INTERNAL);
+        }
     }
     set_init(g, gen_const(d.init, t));
     if O.coverage and is_cov_decl(d, "area") {
@@ -1908,7 +1968,7 @@ fn shared_global(t: *mut ir.Ty, name: []u8, init: *mut ir.Value, addrspace: u32)
     }
     set_init(g, init);
     if O.unit == CG_WHOLE {
-        set_linkage(g, ir.LINK_INTERNAL);
+        set_linkage(g, program_linkage());
     }
     return g;
 }
@@ -2070,13 +2130,20 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
         fi.fnty = ty.subst(d.ty, d.all_gparams, gargs);
         check_inst_sizes(fi.fnty, fi.site);
     }
-    let fl = fn_lty(fi.fnty);
+    let host_cabi = d.cabi and (d.kind == ast.D_HOST_FN);
+    let fl = fn_lty_c(fi.fnty, host_cabi);
     fi.llty = fl.t;
     fi.sret = fl.sret;
     fi.display = fn_display(d, gargs);
     let mut name = d.name;
-    if d.kind == ast.D_HOST_FN {
+    if host_cabi {
+        name = u.cat2(CABI_PREFIX, d.name);  // (its wrapper: header.ax, cabi_source)
+    } else if d.kind == ast.D_HOST_FN {
         name = d.name;
+    } else if d.cabi {
+        // an export whose C function is a wrapper (cabi_source) that calls
+        // this through emit_cabi_thunks' function
+        name = inst_symbol(d, gargs, feats, own_feats);
     } else if d.is_export {
         // On wasm the symbol gets a private name and the export name comes
         // from the wasm-export-name attribute: LLVM treats a symbol called
@@ -2117,7 +2184,7 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
             // its name (cmd/axiom/src/plink.ax, cmd/axiom/src/mlink.ax); on
             // Linux it tells another system's functions (elink.ax)
             if not u.isnos(d.link_lib) {
-                dll_import(name, d.link_lib);
+                dll_import(d.name, d.link_lib);
             }
         } else if ty.g_target.is_wasm {
             add_str_attr(fi.fnv, "wasm-import-module", d.host_module);
@@ -2137,13 +2204,20 @@ fn get_inst_feats(d: *mut ast.Decl, gargs: []mut *mut ast.Type, feats: u64) *mut
         if lazy_export(d) and cfront.defines(d.name) {
             define = false;  // a library's: a C unit defines the name, and that is the definition
         }
-        if ((O.unit == CG_WHOLE) and not d.is_export) or own_feats {
+        if d.cabi and define {
+            g_cabi_exports.push(fi);
+        }
+        if ((O.unit == CG_WHOLE) and (not d.is_export or d.cabi)) or own_feats {
             set_linkage(fi.fnv, ir.LINK_INTERNAL);
         } else if define and (n > 0) {
             set_linkage(fi.fnv, ir.LINK_LINKONCE);
+        } else if g_object_output and d.is_export and sema.is_std_module(d.module) {
+            // (the runtime's: one per program, every object's copy the same
+            // definition, so the optimizer may inline it as before)
+            set_linkage(fi.fnv, ir.LINK_LINKONCE);
         }
         let asan_main = g_sanitize_main and not g_test_mode and u.str_eq(d.name, "main");
-        if define and d.is_export and ty.g_target.is_wasm and not asan_main and not lazy_export(d) {
+        if define and d.is_export and ty.g_target.is_wasm and not asan_main and not lazy_export(d) and not d.cabi {
             add_str_attr(fi.fnv, "wasm-export-name", d.name);
         }
         if define {
@@ -2305,6 +2379,10 @@ fn ext_attr(v: *mut ir.Value, idx: u32, t0: *mut ast.Type, is_call: bool) void {
 }
 
 fn add_ext_attrs(v: *mut ir.Value, fnty: *mut ast.Type, sret: bool, is_call: bool) void {
+    add_ext_attrs_c(v, fnty, sret, is_call, false);
+}
+
+fn add_ext_attrs_c(v: *mut ir.Value, fnty: *mut ast.Type, sret: bool, is_call: bool, cabi: bool) void {
     if not sret and (fnty.ret.kind != ast.TY_VOID) {
         ext_attr(v, 0, fnty.ret, is_call);
     }
@@ -2318,7 +2396,7 @@ fn add_ext_attrs(v: *mut ir.Value, fnty: *mut ast.Type, sret: bool, is_call: boo
         }
     }
     for i in 0..fnty.params.len {
-        if not by_ptr(fnty.params[i]) {
+        if not cabi_struct(fnty.params[i], cabi) {
             ext_attr(v, first + @int_cast(u32, i), fnty.params[i], is_call);
         } else if is_call {
             // an aggregate passed by value, by address: the callee only reads it
@@ -2919,6 +2997,11 @@ fn gen_addr_inner(e: *mut ast.Expr) *mut ir.Value {
 // ---------------------------------------------------------------------------
 fn emit_call(fty: *mut ir.Ty, fnv: *mut ir.Value, fnty: *mut ast.Type, sret: bool, argv: []mut *mut ir.Value,
              argt: []mut *mut ast.Type, callee: []u8) *mut ir.Value {
+    return emit_call_c(fty, fnv, fnty, sret, argv, argt, callee, false);
+}
+
+fn emit_call_c(fty: *mut ir.Ty, fnv: *mut ir.Value, fnty: *mut ast.Type, sret: bool, argv: []mut *mut ir.Value,
+               argt: []mut *mut ast.Type, callee: []u8, cabi: bool) *mut ir.Value {
     let argc = argv.len;
     let mut n = argc;
     if sret {
@@ -2933,7 +3016,7 @@ fn emit_call(fty: *mut ir.Ty, fnv: *mut ir.Value, fnty: *mut ast.Type, sret: boo
         k += 1;
     }
     for i in 0..argc {
-        if by_ptr(argt[i]) {
+        if cabi_struct(argt[i], cabi) {
             av[k] = spill(argt[i], argv[i]);
         } else {
             av[k] = argv[i];
@@ -2943,7 +3026,7 @@ fn emit_call(fty: *mut ir.Ty, fnv: *mut ir.Value, fnty: *mut ast.Type, sret: boo
     let sf = ss_push(callee);
     let r = call(fty, fnv, av[0..n]);
     ss_pop(sf, r);
-    add_ext_attrs(r, fnty, sret, true);
+    add_ext_attrs_c(r, fnty, sret, true, cabi);
     if sret {
         return load(fnty.ret, ret_tmp, false);
     }
@@ -3017,7 +3100,8 @@ fn gen_call(e: *mut ast.Expr) *mut ir.Value {
             }
         }
     }
-    return emit_call(fi.llty, fi.fnv, fi.fnty, fi.sret, av[0..n], argt, fi.display);
+    return emit_call_c(fi.llty, fi.fnv, fi.fnty, fi.sret, av[0..n], argt, fi.display, d.cabi and
+                       (d.kind == ast.D_HOST_FN));
 }
 
 // ---------------------------------------------------------------------------
@@ -4140,15 +4224,20 @@ fn gen_system_builtin(e: *mut ast.Expr, id: i32, rt: *mut ast.Type) *mut ir.Valu
 
 // A function of std/c/rt/ldouble.ax (loaded with a C program whose long
 // double is wider than double), std/c/rt/wideint.ax (with one that uses
-// integers wider than 64 bits; its names begin with wi_) or
+// integers wider than 64 bits; its names begin with wi_),
 // std/c/rt/decimal.ax (with one that operates on decimal floating values;
-// dec_), which the C front end's code calls: its IR function, generated
-// once the C units are (gen_pending).
-fn c_ld_fn(name: []u8) *mut ir.Value {
+// dec_) or std/os/cpu.ax ("cpu." and the name), which the C front end's
+// code calls: its IR function, generated once the C units are (gen_pending).
+fn c_ld_fn(name0: []u8) *mut ir.Value {
     let P = sema.g_prog;
+    let mut name = name0;
     let mut file = u.pick(u.starts(name, "wi_"), "std/c/rt/wideint.ax", "std/c/rt/ldouble.ax");
     if u.starts(name, "dec_") {
         file = "std/c/rt/decimal.ax";
+    } else if u.starts(name, "cpu.") {
+        // (std/os/cpu.ax, which every build includes: __builtin_cpu_supports)
+        name = name[4..];
+        file = "std/os/cpu.ax";
     }
     for i in 0..P.fns.len {
         let d = P.fns.get(i);
@@ -5542,12 +5631,78 @@ fn gen_fn_body_of(fi: *mut FnInst) void {
 }
 
 // ---------------------------------------------------------------------------
+// C functions with structures by value (spec §14.5.3)
+// ---------------------------------------------------------------------------
+
+/// The prefix of the symbols of the C wrappers: CABI_PREFIX + name is the
+/// wrapper of extern "C" function name, CABI_IMPL + name the function an
+/// export's C function calls (header.ax: cabi_source).
+pub let CABI_PREFIX: []u8 = "__axiom_cabi_";
+pub let CABI_IMPL: []u8 = "__axiom_cabi_impl_";
+
+// The exports whose C functions are wrappers (get_inst).
+let mut g_cabi_exports: u.List.[*mut FnInst] = u.List.[*mut FnInst].{ data: @ptr_from_int(*mut *mut FnInst, 0), len: 0,
+                                                                      cap: 0 };
+
+// For each such export, CABI_IMPL + its name: the export's function with
+// its structures by pointer (fn_lty_c), for its C wrapper to call.
+fn emit_cabi_thunks() void {
+    for fi in g_cabi_exports.items() {
+        let d = fi.decl;
+        let cl = fn_lty_c(fi.fnty, true);
+        let f = ir.add_function(M, u.cat2(CABI_IMPL, d.name), cl.t).val;
+        add_ext_attrs_c(f, fi.fnty, cl.sret, false, true);
+        at_end(ir.append_block(ir.fnp_of(f), "entry"));
+        let np = fi.fnty.params.len;
+        let mut nargs = np;
+        if fi.sret {
+            nargs += 1;
+        }
+        let av = u.newn.[*mut ir.Value](nargs + 1);
+        let mut k: u32 = 0;
+        let mut j: usize = 0;
+        if cl.sret {
+            k = 1;
+        }
+        if fi.sret {
+            av[0] = param(f, 0);  // (the result's memory: the caller's)
+            j = 1;
+        }
+        for i in 0..np {
+            let pt = fi.fnty.params[i];
+            let p = param(f, k);
+            if cabi_struct(pt, true) and not by_ptr(pt) {
+                av[j] = load(pt, p, true);
+            } else {
+                av[j] = p;
+            }
+            j += 1;
+            k += 1;
+        }
+        let r = call(fi.llty, fi.fnv, av[0..nargs]);
+        add_ext_attrs(r, fi.fnty, fi.sret, true);
+        if cl.sret and not fi.sret {
+            store(fi.fnty.ret, r, param(f, 0), true);
+            ir.ret_void(B);
+        } else if fi.sret or (fi.fnty.ret.kind == ast.TY_VOID) {
+            ir.ret_void(B);
+        } else {
+            ir.ret(B, r);
+        }
+    }
+    g_cabi_exports.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 // A small exported function whose body the caller builds.
 fn add_export(name: []u8, ret: *mut ir.Ty, ps: []mut *mut ir.Ty) *mut ir.Value {
     let fty = ir.t_fn(ret, ps, false);
     let f = ir.add_function(M, name, fty).val;
+    if g_object_output and not u.str_eq(name, "main") {
+        set_linkage(f, ir.LINK_LINKONCE);  // (the runtime's helpers: one per program)
+    }
     if ty.g_target.is_wasm {
         add_str_attr(f, "wasm-export-name", name);
     }
@@ -5649,6 +5804,18 @@ fn emit_test_exports() void {
         ir.add_case(sw, ci32(@as(u64, i)), bb);
         at_end(bb);
         let r = call(fi.llty, fi.fnv, no_vals());
+        if cfront.pending() and cfront.hosted() {
+            // (with C code: its streams' output written after each test,
+            // which --show-output shows and a crash after it does not lose)
+            let mut pp: [1]*mut ir.Ty = [T_ptr];
+            let fty = ir.t_fn(T_i32, pp[..], false);
+            let mut fl = ir.get_function(M, "fflush");
+            if u.isnil(fl) {
+                fl = ir.add_function(M, "fflush", fty);
+            }
+            let mut na: [1]*mut ir.Value = [ir.czero(T_ptr)];
+            _ = ir.call(B, fl.ty, fl.val, na[..]);
+        }
         ir.ret(B, zext(extract(r, 0), T_i32));
     }
     at_end(dflt);
@@ -5967,6 +6134,18 @@ pub fn codegen_program(o: *mut CgOptions) bool {
         }
     }
     gen_pending();
+    emit_cabi_thunks();
+    // the objects exported for C (spec §14.5.6), whether Axiom code uses
+    // them or not
+    if O.unit != CG_MODULE {
+        for i in 0..sema.g_prog.globals.len {
+            let gd = sema.g_prog.globals.get(i);
+            if gd.is_export {
+                _ = global_ref(gd);
+            }
+        }
+    }
+    gen_pending();
     // C translation units (main.ax) join the module: a C program's start-up,
     // or an Axiom program; then the functions of std/c/rt/ldouble.ax they
     // call (c_ld_fn)
@@ -5991,15 +6170,25 @@ pub fn codegen_program(o: *mut CgOptions) bool {
     let g1 = M.globals.len;
     if c_units {
         find_lazy_exports();
+        // the library exports that the objects linked with the program refer
+        // to (cstrip.g_roots)
+        for n in cstrip.g_root_list.items() {
+            let d = lazy_fns.get(n);
+            if u.notnil(d) {
+                _ = get_inst(d, ty.no_types());
+            }
+        }
+        gen_pending();
         if g_strip {
             // what nothing reaches goes, and the library exports reached are
             // generated (define_lazy)
             cstrip.strip(M, f0, f1, g0, g1, define_lazy);
         } else {
-            // linked with other code by the system's linker: the program's
-            // units are kept whole, the C library's what they reach (the
-            // other code has the system's C library)
-            cstrip.strip(M, cfront.g_lib_funcs, f1, cfront.g_lib_globals, g1, define_lazy);
+            // linked with other code by another linker: the program's units
+            // keep their external definitions and what those reach, the C
+            // library's what they reach (the other code has the system's C
+            // library)
+            cstrip.strip_kept(M, f0, f1, g0, g1, cfront.g_lib_funcs, cfront.g_lib_globals, define_lazy);
             link_lazy_exports();
         }
     }

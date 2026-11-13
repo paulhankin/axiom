@@ -8,7 +8,9 @@
    and C23's wN, wfN and H, D, DD (the decimal floating types, with a e f g
    and their upper case: fmtfloat.c), the conversions d i o u x X b B (C23) f F e E g G a
    A c s p n %. Characters of the format that are not a conversion are
-   copied a run at a time. */
+   copied a run at a time. For Annex K's functions (o->viol set) %n and a
+   null pointer for %s are runtime-constraint violations (K.3.5.3.1p2):
+   the output stops there. */
 
 /* Writes n characters of the narrow text s (ASCII here) to the output */
 static void PF_TEXT(struct __axc_out *o, const char *s, size_t n) {
@@ -407,6 +409,10 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
             if (wide_char) {
                 /* %ls */
                 const wchar_t *s = va_arg(ap, const wchar_t *);
+                if (s == NULL && o->viol != NULL) {
+                    *o->viol = "a null pointer for %s";
+                    return -1;
+                }
 #if PF_WIDE
                 size_t n = 0, pad;
                 while ((prec < 0 || n < (size_t)prec) && s[n] != 0)
@@ -451,6 +457,10 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
 #endif
             } else {
                 const char *s = va_arg(ap, const char *);
+                if (s == NULL && o->viol != NULL) {
+                    *o->viol = "a null pointer for %s";
+                    return -1;
+                }
 #if PF_WIDE
                 /* a multibyte string, converted as mbrtowc does (7.29.2.1p8) */
                 mbstate_t st;
@@ -460,23 +470,30 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
                 PF_ZERO_STATE(&st);
                 while (s[len] != 0)
                     len++;
-                for (t = s; *t != 0 && (prec < 0 || count < (size_t)prec); count++) {
-                    r = mbrtowc(&w, t, len - (size_t)(t - s), &st);
+                /* (count: wide characters, the precision's unit; a 16-bit
+                   wchar_t's second half of a pair comes from a call that
+                   reads nothing, (size_t)-3) */
+                for (t = s; (*t != 0 || !mbsinit(&st)) && (prec < 0 || count < (size_t)prec); count++) {
+                    size_t avail = len - (size_t)(t - s);
+                    r = mbrtowc(&w, t, avail > 0 ? avail : 1, &st);
                     if (r == (size_t)-1 || r == (size_t)-2) {
                         o->failed = 1;
                         SET_ERRNO(EILSEQ);
                         return -1;
                     }
-                    t += r == 0 ? 1 : r;
+                    if (r != (size_t)-3)
+                        t += r == 0 ? 1 : r;
                 }
                 pad = width > 0 && (size_t)width > count ? (size_t)width - count : 0;
                 if (!left && pad)
                     PF_PAD(o, ' ', pad);
                 PF_ZERO_STATE(&st);
                 for (t = s, i = 0; i < count; i++) {
-                    r = mbrtowc(&w, t, len - (size_t)(t - s), &st);
+                    size_t avail = len - (size_t)(t - s);
+                    r = mbrtowc(&w, t, avail > 0 ? avail : 1, &st);
                     o->put(o, &w, 1);
-                    t += r == 0 ? 1 : r;
+                    if (r != (size_t)-3)
+                        t += r == 0 ? 1 : r;
                 }
                 if (left && pad)
                     PF_PAD(o, ' ', pad);
@@ -520,8 +537,14 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
         case 'n': {
             /* the characters written so far, in an object of the length
                modifier's type */
-            void *dst = va_arg(ap, void *);
+            void *dst;
             size_t c = o->count;
+            if (o->viol != NULL) {
+                /* (K.3.5.3.1p2: no %n in the format of fprintf_s and its kin) */
+                *o->viol = "%n in the format";
+                return -1;
+            }
+            dst = va_arg(ap, void *);
             switch (lm) {
             case 'H':
                 *(signed char *)dst = (signed char)c;

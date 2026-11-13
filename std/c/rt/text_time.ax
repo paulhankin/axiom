@@ -5,8 +5,11 @@
 //
 // The local zone is std/time/tz's Zone.local(): $TZ (a zone name, a TZif
 // file or a POSIX rule), else /etc/localtime, else UTC. It is read the
-// first time a C function needs it and kept for the rest of the program,
-// by every thread.
+// first time a C function needs it, and again when $TZ's value is not the
+// one it was read with (as POSIX's tzset does at each conversion): every
+// conversion looks at $TZ (a hash of its value, compared atomically). A
+// zone read again replaces the old one, which is kept (another thread may
+// still be using it).
 // =============================================================================
 
 import "std/mem" as mem;
@@ -14,32 +17,66 @@ import "std/time/tz" as tz;
 
 import host "axiom" {
     fn ax_clock_ns(clock: u32) i64;
+    fn ax_getenv(name: *u8, len: usize, buf: *mut u8, cap: usize) isize;
 }
 
-// 0 not read, 1 being read, 2 read (zone_addr is the Zone's address)
+// 0 not read, 1 being read, 2 read (zone_addr is the Zone's address,
+// zone_tz the hash of $TZ's value it was read with)
 let mut zone_state: u32 = 0;
 let mut zone_addr: usize = 0;
+let mut zone_tz: u64 = 0;
 
-fn read_zone() void {
+// A hash of $TZ's value (FNV-1a), 0 when it is not set
+fn tz_hash() u64 {
+    let mut buf: [512]u8 = [0; 512];
+    let name = "TZ";
+    let n = ax_getenv(name.ptr, name.len, &mut buf[0], 512);
+    if n < 0 {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let k = @min(@bit_cast(usize, n), 512);
+    for i in 0..k {
+        h = (h ^ @as(u64, buf[i])) *% 0x0000_0100_0000_01b3;
+    }
+    // (the length too: a value longer than the buffer differs by it)
+    h = (h ^ @bit_cast(u64, @as(i64, n))) *% 0x0000_0100_0000_01b3;
+    if h == 0 {
+        h = 1;
+    }
+    return h;
+}
+
+fn read_zone(h: u64) void {
     let z = mem.alloc.[tz.Zone](1) catch {
         return;
     };
     z[0] = tz.Zone.local() catch tz.Zone.utc();
     @atomic_store(&mut zone_addr, @int_from_ptr(z.ptr));
+    @atomic_store(&mut zone_tz, h);
 }
 
 // The local zone; null if there was no memory to read it (then local time
 // is UTC).
 fn zone() *mut tz.Zone {
-    if @atomic_load(&zone_state) != 2 {
-        if @atomic_cas(&mut zone_state, 0, 1) == 0 {
-            read_zone();
+    let h = tz_hash();
+    loop {
+        let s = @atomic_load(&zone_state);
+        if (s == 2) and (@atomic_load(&zone_tz) == h) {
+            break;
+        }
+        if (s != 1) and (@atomic_cas(&mut zone_state, s, 1) == s) {
+            read_zone(h);
             @atomic_store(&mut zone_state, 2);
             _ = @atomic_notify(&zone_state, 0xFFFF_FFFF);
-        } else {
-            while @atomic_load(&zone_state) != 2 {
-                _ = @atomic_wait(&zone_state, 1, -1);
-            }
+            break;
+        }
+        while @atomic_load(&zone_state) == 1 {
+            _ = @atomic_wait(&zone_state, 1, -1);
+        }
+        if @atomic_load(&zone_tz) != h {
+            // (another thread read it for another value: ours wins next)
+            continue;
         }
     }
     return @ptr_from_int(*mut tz.Zone, @atomic_load(&zone_addr));

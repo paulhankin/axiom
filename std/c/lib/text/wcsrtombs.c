@@ -6,7 +6,7 @@
 #include <wchar.h>
 
 size_t wcsrtombs(char *restrict dst, const wchar_t **restrict src, size_t len, mbstate_t *restrict ps) {
-    static mbstate_t internal;
+    static _Thread_local mbstate_t internal; /* (each thread's: free of data races) */
     const wchar_t *w = *src;
     size_t k = 0;
     if (!ps)

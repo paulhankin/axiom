@@ -1,6 +1,8 @@
 /* stdint.h - integer types (C99 7.18, C11 7.20, C23 7.22), for the Axiom
    compiler's C front end. short is 16 bits, int 16, 32 or 64, long 32 or
    64, long long 64; a pointer 32 or 64. */
+/* (Annex K: whether its names are asked for, K.3.1.1) */
+#include <axc/ext1.h>
 #ifndef __AXIOM_STDINT_H
 #define __AXIOM_STDINT_H
 
@@ -140,6 +142,12 @@ typedef __AXIOM_UINTMAX_TYPE__ uintmax_t;
 #define PTRDIFF_MIN __AXIOM_PTRDIFF_MIN__
 #define PTRDIFF_MAX __AXIOM_PTRDIFF_MAX__
 #define SIZE_MAX __AXIOM_SIZE_MAX__
+#if __AXC_EXT1
+/* the largest size the functions of Annex K take (K.3.4): half of SIZE_MAX
+   (as K.3.4p4 recommends), so that a negative value converted to rsize_t
+   is caught */
+#define RSIZE_MAX (__AXIOM_SIZE_MAX__ >> 1)
+#endif
 
 #define INTMAX_MIN __AXIOM_INTMAX_MIN__
 #define INTMAX_MAX __AXIOM_INTMAX_MAX__

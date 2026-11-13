@@ -1002,6 +1002,12 @@ fn definable(P: *mut PP, t: *lx.PTok, what: []u8) bool {
         return false;
     }
     let m = lookup(P, t.name);
+    if u.notnil(m) and m.protected and in_system_header(P) and not u.str_eq(t.name, "defined") {
+        // the system's headers define what the implementation predefines
+        // (they are its headers: --c-lib=system); the compiler's definition
+        // stays
+        return false;
+    }
     if u.str_eq(t.name, "defined") or (u.notnil(m) and m.protected) or
        ((P.o.std >= co.C99) and u.str_eq(t.name, "__VA_ARGS__")) or
        ((P.o.std >= co.C23) and u.str_eq(t.name, "__VA_OPT__")) {
@@ -1454,15 +1460,26 @@ fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
         return u.nosym();
     }
     let n = @int_cast(i32, P.o.include_dirs.len);
+    let ns = @int_cast(i32, P.o.system_dirs.len);
     let mut k = from;
-    while k <= n {
+    while k <= (n + ns) {
         let mut d = P.o.sys_include;
         if k < n {
             d = P.o.include_dirs[@int_cast(usize, k)];
+        } else if k < (n + ns) {
+            // the system's headers (--c-lib=system), but for the compiler's
+            // own freestanding ones, whose types are this compiler's
+            if system_own_header(name) {
+                k += 1;
+                continue;
+            }
+            d = P.o.system_dirs[@int_cast(usize, k - n)];
         }
         let p = join(d, name);
-        // (the compiler's own headers: the library's only when hosted)
-        if u.is_file(p) and ((k < n) or P.o.hosted or freestanding_header(name)) {
+        // (the compiler's own headers: the library's only when hosted, and
+        // with the system's library only the freestanding ones)
+        let ours_ok = (P.o.hosted and not P.o.system_lib) or freestanding_header(name) or system_own_header(name);
+        if u.is_file(p) and ((k < (n + ns)) or ours_ok) {
             P.found_index = k;
             return p;
         }
@@ -1471,14 +1488,36 @@ fn find_file_from(P: *mut PP, name: []u8, from: i32) []u8 {
     return u.nosym();
 }
 
+// With the system's C library (--c-lib=system): is `name` one of the
+// headers that are the compiler's still (those of the language itself that
+// the system's library does not provide: its <limits.h> and <stdint.h>,
+// which have its POSIX limits and use its types, are its own)?
+fn system_own_header(name: []u8) bool {
+    let names = ["float.h", "iso646.h", "stdalign.h", "stdarg.h", "stdbit.h", "stdbool.h", "stdckdint.h", "stddef.h",
+                 "stdnoreturn.h", "stdatomic.h", "complex.h", "tgmath.h", "axc/types.h", "axc/wchar_limits.h"];
+    for x in names {
+        if u.str_eq(x, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is the file being read one of the system's headers (--c-lib=system)?
+fn in_system_header(P: *mut PP) bool {
+    let d = cur_src(P).dir_index;
+    let n = @int_cast(i32, P.o.include_dirs.len);
+    return P.o.system_lib and (d >= n) and (d < (n + @int_cast(i32, P.o.system_dirs.len)));
+}
+
 // Is `name` one of the compiler's headers that a freestanding program has
 // (--c-freestanding)? Those of 4p6 (C23 4p7), and <complex.h>'s macros,
 // which need no library, and the private headers they include (axc/types.h,
-// axc/wchar_limits.h); the others are the hosted library's.
+// axc/wchar_limits.h, axc/ext1.h); the others are the hosted library's.
 fn freestanding_header(name: []u8) bool {
     let names = ["float.h", "iso646.h", "limits.h", "stdalign.h", "stdarg.h", "stdbit.h", "stdbool.h", "stdckdint.h",
                  "stddef.h", "stdint.h", "stdnoreturn.h", "stdatomic.h", "complex.h", "string.h", "axc/types.h",
-                 "axc/wchar_limits.h"];
+                 "axc/wchar_limits.h", "axc/ext1.h"];
     for n in names {
         if u.str_eq(n, name) {
             return true;
@@ -1622,6 +1661,9 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
     }
     push_file(P, sf, path);
     cur_src(P).dir_index = found;
+    if in_system_header(P) {
+        cp.system_file(sf.id);
+    }
 }
 
 struct EmbedParams {
@@ -2149,7 +2191,16 @@ fn pragma_gcc(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
            (u.str_eq(ts[1].name, "ignored") or u.str_eq(ts[1].name, "warning") or u.str_eq(ts[1].name, "error")) {
             let code = cp.option_code(string_text(P, &ts[2]));
             if not u.isnos(code) {
-                cp.diagnostic(sp, ts[1].name, code);
+                // (several codes: a rule for each)
+                let mut start: usize = 0;
+                for k in 0..code.len + 1 {
+                    if (k == code.len) or (code[k] == ',') {
+                        if (k > start) or (code.len == 0) {
+                            cp.diagnostic(sp, ts[1].name, u.intern(code[start..k]));
+                        }
+                        start = k + 1;
+                    }
+                }
             }
             return no_tok();
         }
@@ -2436,6 +2487,7 @@ fn predefined_text(P: *PP) []u8 {
     b.s(u.f1("#define __DATE__ \"%s\"\n", date));
     b.s(u.f1("#define __TIME__ \"%s\"\n", time));
     b.s("#define __STDC__ 1\n");
+    b.s(o.target_macros);  // (--c-lib=system: the system's headers need them)
     if std >= co.C95 {
         b.s(u.f1("#define __STDC_VERSION__ %sL\n", u.dec(co.stdc_version(std))));
     }
@@ -2455,6 +2507,12 @@ fn predefined_text(P: *PP) []u8 {
     }
     if std >= co.C11 {
         b.s("#define __STDC_UTF_16__ 1\n#define __STDC_UTF_32__ 1\n");
+        if o.hosted {
+            // (6.10.8.3: the library has Annex K's bounds-checking
+            // interfaces, which a program asks for with
+            // __STDC_WANT_LIB_EXT1__: std/c/include/axc/ext1.h)
+            b.s("#define __STDC_LIB_EXT1__ 201112L\n");
+        }
         // (complex types are supported, without __STDC_IEC_559_COMPLEX__:
         // Annex G needs Annex F, and before C23 the imaginary types too;
         // atomics are, <stdatomic.h>, and threads, the library's <threads.h>:
@@ -2467,6 +2525,11 @@ fn predefined_text(P: *PP) []u8 {
         b.s("#define __STDC_IEC_60559_DFP__ 202311L\n");
     }
     b.s("#define __AXIOM__ 1\n");
+    if o.hosted {
+        // (in every mode, C89's included, which has no __STDC_HOSTED__: the
+        // headers' test for the library's hosted part)
+        b.s("#define __AXIOM_HOSTED__ 1\n");
+    }
     if o.gnu {
         // (a GNU dialect: its extensions, but no __GNUC__, which would claim
         // every extension of another compiler: docs/c.md)
@@ -2681,6 +2744,7 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
     P.eof_tok.bol = true;
     P.inject = u.nil_slice.[lx.PTok]();
     lx.gnu = o.gnu;
+    ct.g_no_ext_float = o.system_lib;
     add_builtin(P, "__LINE__", B_LINE);
     add_builtin(P, "__FILE__", B_FILE);
     // (before C99 _Pragma is a reserved identifier: an operator there is reported)

@@ -36,8 +36,10 @@ Every category starts as `"C"`. A name is at most 63 bytes of printable ASCII wi
 `setlocale(LC_ALL, ...)` takes back.
 
 Every locale has the `"C"` locale's conventions: `localeconv` gives `"."` as the
-decimal point and `CHAR_MAX` and empty strings for the rest; collation (`wcscoll`,
-`wcsxfrm`) is by value; `strftime`'s names, formats and `AM`/`PM` are the `"C"`
+decimal point and `CHAR_MAX` and empty strings for the rest; collation is by code
+point, so `strcoll` and `strxfrm` (by bytes: UTF-8's order is the code points') agree
+with `wcscoll` and `wcsxfrm` on a string and its wide form (where `wchar_t` is UTF-16
+they compare code points, not code units: a surrogate pair comes after U+E000-U+FFFF); `strftime`'s names, formats and `AM`/`PM` are the `"C"`
 locale's. The locales differ only in `LC_CTYPE`'s encoding:
 
 - **Single-byte** (`"C"`, `"POSIX"`): every byte is a character, whose wide value is the
@@ -48,8 +50,13 @@ locale's. The locales differ only in `LC_CTYPE`'s encoding:
   first byte that cannot follow; `MB_CUR_MAX` is 4.
 
 The other parts of the library ask with `__axc_mb_utf8()` and `__axc_mb_cur_max()`
-(`axc/locale.h`). `setlocale` is not safe to call while other threads use the locale
-(C17 7.11.1.1 allows the data race).
+(`axc/locale.h`). The locale is the program's, one for all threads (C17 7.11.1.1p1);
+`setlocale` is not safe to call while other threads use the locale (7.11.1.1p5 allows
+the data race), and `MB_CUR_MAX` is the program's current `LC_CTYPE`'s. The internal
+conversion states of the functions that take a null `mbstate_t` pointer (`mbrlen`,
+`mbrtowc`, `wcrtomb`, `mbsrtowcs`, `wcsrtombs`, the `<uchar.h>` functions) and of
+`mblen`, `mbtowc` and `wctomb` are each thread's own (`_Thread_local`), so free of data
+races (7.29.6.3p1 allows them; a thread starts in the initial state).
 
 ## Wide characters
 
@@ -85,7 +92,10 @@ function (`strtol`, `strtod`, ...), so that both read numbers alike.
 In a single-byte locale only ASCII characters have classes, those of `<ctype.h>` in the
 `"C"` locale, and only `A`-`Z` and `a`-`z` have case mappings. In a UTF-8 locale every
 code point has these, from Unicode 15.1's properties (the standard library's tables,
-`std/unicode`):
+`std/unicode`, made into two-stage tables of the classes and of the case mappings'
+differences, blocks of 128 code points alike kept once, by
+`cmd/internal/tools/gen_c_wctype.py`: `std/c/lib/text/__axc_wctab.c`, about 50 KB, so a
+classification or mapping is two table loads):
 
 | Class | Code points |
 |---|---|
@@ -112,20 +122,24 @@ one, for every year an `int` `tm_year` holds; beyond that `gmtime` and `localtim
 a null pointer (`EOVERFLOW`) and `mktime` and `timegm` `(time_t)-1`.
 
 - **Clocks.** `time` and `TIME_UTC` are the real-time clock, `TIME_MONOTONIC` a
-  monotonic one and `clock` and `TIME_ACTIVE` the processor time of the process (in
-  microseconds for `clock`: `CLOCKS_PER_SEC` is 1000000): the runtime's clocks 0, 1 and
-  2 (`ax_clock_ns`, `std/README.md`). `TIME_THREAD_ACTIVE` is not provided.
-  `timespec_getres` gives 100 ns on Windows, 1 µs for the real time and processor time
-  on macOS and WebAssembly, and 1 ns otherwise.
+  monotonic one, `clock` and `TIME_ACTIVE` the processor time of the process, every
+  thread's summed (in microseconds for `clock`: `CLOCKS_PER_SEC` is 1000000), and
+  `TIME_THREAD_ACTIVE` (C23) that of the calling thread: the runtime's clocks 0 to 3
+  (`ax_clock_ns`, `std/README.md`; on WebAssembly the thread's time is the process's
+  where node has no per-thread clock). `timespec_getres` gives 100 ns on Windows, 1 µs
+  for the real time and the processor times on macOS and WebAssembly, and 1 ns
+  otherwise; another base is 0 for both.
 - **The local time zone** is the standard library's (`std/time/tz`, `Zone.local`):
   `$TZ` (a zone name, a TZif file or a POSIX rule such as `"EST5EDT,M3.2.0,M11.1.0"`),
-  else `/etc/localtime`, else UTC. It is read the first time a program needs it and kept:
-  a later change of `$TZ` has no effect (there is no `tzset`). On Windows without
-  `$TZ`, it is the system's setting (`GetDynamicTimeZoneInformation`, with each year's
-  rules from 1970 to 2037 from `GetTimeZoneInformationForYear` and the last year's
-  after; `%Z` gives the system's names, such as "Eastern Standard Time"), read once as
-  well. On WebAssembly, where the files are the host's, a host without them (a
-  browser; node on Windows), or a `$TZ` naming a zone that is not in the database,
+  else `/etc/localtime`, else UTC. It is read the first time a program needs it, and
+  again by a conversion that finds `$TZ`'s value changed (as POSIX's `tzset` does at
+  each conversion: a program that changes the environment, with `std/os.setenv` or
+  POSIX's `setenv`, sees the new zone). On Windows without `$TZ`, it is the system's
+  setting (`GetDynamicTimeZoneInformation`, with each year's rules from 1970 to 2037
+  from `GetTimeZoneInformationForYear` and the last year's after; `%Z` gives the
+  system's names, such as "Eastern Standard Time"), read once. On WebAssembly, where
+  the files are the host's, a host without them (a browser; node on Windows), or a
+  `$TZ` naming a zone that is not in the database,
   gives the zone the host knows (`ax_tz_local`, `std/README.md`): the node host's is
   the JavaScript engine's own, for `$TZ` or the system's setting, with its offsets to
   the second from 1900 on and its rule after 2100, and its abbreviations in English
@@ -155,9 +169,20 @@ a null pointer (`EOVERFLOW`) and `mktime` and `timegm` `(time_t)-1`.
 
 ## Not provided, or limits
 
-- The `"C"` conventions only: no locale has other names, grouping or collation.
+- The `"C"` conventions only: no locale has other names, grouping or collation (ISO C
+  requires only the `"C"` locale and `""`; a name with another codeset is refused, so
+  what `setlocale` accepts always has these conventions). `strftime` in any locale
+  writes the `"C"` locale's names and formats.
 - Unicode 15.1: the classes of characters assigned later are those of unassigned ones.
-- `TIME_THREAD_ACTIVE`; `tzset` and a change of `$TZ` while the program runs.
-- Every hosted C program's build analyzes `std/c/rt/text.ax` and `text_time.ax` and the
-  modules they import (`std/unicode`'s tables, `std/time/tz`), whether it uses them or
-  not: about 50 ms of each build.
+- Unicode collation: `strcoll`, `strxfrm`, `wcscoll` and `wcsxfrm` order by code
+  values in every locale (ISO C asks for no other order).
+- Every hosted C program's build analyzes `std/c/rt/text_time.ax` and the modules it
+  imports (`std/time/tz`), whether it uses them or not.
+
+## Speed
+
+Against the system's C library on x86-64 Linux (both at -O2): the classification and
+case mapping functions over the first three planes 0.7 times its time; `wcslen` of
+4096 wide characters 1.1 times, `wmemchr` 1.2 times (`std/c/rt/text_wide.ax`: 64 or
+128 bytes an iteration, with AVX-512 or AVX2 where the processor has them);
+`wmemcpy` and `wmemmove` are `memcpy` and `memmove`.

@@ -5,8 +5,10 @@
    constant expressions when their operands are). creal, cimag and conj
    (each type's) are also macros over builtins, which the compiler expands
    in line; the other functions are declared here and are the library's.
-   There are no imaginary types: no _Imaginary_I or imaginary.
-   __STDC_IEC_559_COMPLEX__ is not defined (Annex G is not claimed). */
+   The imaginary types are supported (7.3.1p3): imaginary and _Imaginary_I,
+   the imaginary unit, a constant of type const float _Imaginary. I is
+   _Complex_I: __STDC_IEC_559_COMPLEX__ is not defined (Annex G, which would
+   make I _Imaginary_I, needs Annex F, which is not claimed). */
 #ifndef __AXIOM_COMPLEX_H
 #define __AXIOM_COMPLEX_H
 
@@ -20,6 +22,8 @@
 
 #define complex _Complex
 #define _Complex_I (__builtin_complex(0.0f, 1.0f))
+#define imaginary _Imaginary
+#define _Imaginary_I __builtin_axiom_imaginary_i
 #define I _Complex_I
 
 #if __STDC_VERSION__ >= 201112L

@@ -149,7 +149,7 @@ that lacks the extensions it was built with.
 | Option | |
 |---|---|
 | `-o <out>` | The output file. |
-| `--emit=exe\|obj\|ir\|asm` | An executable (or `.wasm` module), one object file, the compiler's IR as text, or assembly. |
+| `--emit=exe\|obj\|lib\|ir\|asm` | An executable (or `.wasm` module), one object file, a static library of it (and of the objects among the inputs), the compiler's IR as text, or assembly. |
 | `--emit-header=<file.h>` | Also write a C header for the program's `export`ed functions (spec §14.5). |
 | `--format=human\|agent-json` | Diagnostics as text on stderr, or as one JSON object on stdout (spec §16.2). |
 
@@ -182,8 +182,8 @@ its C sources with `c-sources = "dir"`.
 
 | Option | |
 |---|---|
-| `--link=<file>` | Link a C source, object, archive or `.ax` module into the program. C sources are compiled with `cc`; the compiled runtime objects are cached. |
-| `-l<lib>`, `-L<dir>` | A library to link and a directory to search, passed to the system linker (native targets with C code). |
+| `--link=<file>` | Link a C source, object, archive, shared library or `.ax` module into the program (an object or library may also be given as an input: `x.o`, `libx.a`, `libx.so`). C sources are compiled with `cc`. On Linux the compiler's own linker links them ([`docs/c.md`](c.md), "Objects and libraries"). |
+| `-l<lib>`, `-L<dir>` | A library to link (`lib<lib>.so`, else `lib<lib>.a`) and a directory to search before the system's. |
 | `-I<dir>` | An include directory, for C sources given with `--link` and for the C front end's inputs. |
 
 Programs for native targets that link no C code are linked by the compiler's own

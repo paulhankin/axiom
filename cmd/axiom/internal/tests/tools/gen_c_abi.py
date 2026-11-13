@@ -6,7 +6,8 @@ value, directly, through function pointers and as variadic arguments (read
 with va_arg, va_copy and a va_list passed on), with the callers in one
 translation unit and the callees in another:
 
-    gen_c_abi.py SEED COUNT DIR [--prefix=NAME] [--no-align] [--ld] [--atomic] [--int128] [--bitint] [--dec] [--host]
+    gen_c_abi.py SEED COUNT DIR [--prefix=NAME] [--no-align] [--ld] [--atomic] [--int128] [--bitint] [--dec]
+                 [--f16] [--f128] [--vec[=avx]] [--host]
 
 writes DIR/NAME.h (the types and the functions that fill and check them),
 DIR/NAME_callee.c (the functions called) and DIR/NAME.c (main, the calls).
@@ -27,6 +28,7 @@ output, and the other two files go in DIR/abi/. The suite's tests are
     gen_c_abi.py 103 8 cmd/axiom/internal/tests/c/run --host --no-align
     gen_c_abi.py 104 8 cmd/axiom/internal/tests/c/run --host --int128 --bitint
     gen_c_abi.py 105 8 cmd/axiom/internal/tests/c/run --host --dec
+    gen_c_abi.py 105 8 cmd/axiom/internal/tests/c/run --host --f16 --f128 --vec --prefix=abi_gen_106
 
 With --atomic they also have _Atomic members (scalars, and records set
 and read whole). With --int128 they have __int128 and unsigned __int128
@@ -36,6 +38,10 @@ values use all their bits. With --dec they have _Decimal32, _Decimal64 and
 _Decimal128 members and arguments (C23), homogeneous aggregates of them too.
 With --ld the shapes also have long double and long double _Complex members
 and arguments (C99; <complex.h>), with values that double cannot hold.
+With --f16 they have _Float16 members and arguments, with --f128 _Float128
+ones (values that long double cannot hold), and with --vec vectors (a GNU
+dialect's vector_size: 4 to 16 bytes of integers and floats, 32 with
+--vec=avx, for callers and callees built for AVX), alone and as members.
 
 The shapes stay within what the C standard defines and every target
 implements alike: bit-fields are of int, unsigned int and _Bool, at most
@@ -87,7 +93,29 @@ DECIMALS = {
     'd64': ('_Decimal64', 'f', 64, True),
     'd128': ('_Decimal128', 'f', 128, True),
 }
-ALL = {**SCALARS, **LONG_DOUBLES, **INT128S, **BITINTS, **DECIMALS}
+# with --f16 and --f128, the interchange floating types (Annex H)
+F16S = {
+    'h': ('_Float16', 'f', 16, True),
+}
+F128S = {
+    'q128': ('_Float128', 'f', 128, True),
+}
+# with --vec, vectors (kind v): element kind, size in bytes
+VECS = {
+    'v4c': ('abi_v4c', 'v', ('c', 4), True),
+    'v8uc': ('abi_v8uc', 'v', ('uc', 8), False),
+    'v2f': ('abi_v2f', 'v', ('f', 8), True),
+    'v4i': ('abi_v4i', 'v', ('i', 16), True),
+    'v8s': ('abi_v8s', 'v', ('s', 16), True),
+    'v4f': ('abi_v4f', 'v', ('f', 16), True),
+    'v2d': ('abi_v2d', 'v', ('d', 16), True),
+    'v2ll': ('abi_v2ll', 'v', ('ll', 16), True),
+}
+VECS_AVX = {
+    'v8i': ('abi_v8i', 'v', ('i', 32), True),
+    'v4d': ('abi_v4d', 'v', ('d', 32), True),
+}
+ALL = {**SCALARS, **LONG_DOUBLES, **INT128S, **BITINTS, **DECIMALS, **F16S, **F128S, **VECS, **VECS_AVX}
 # the promoted type of a variadic argument
 PROMOTE = {'c': 'i', 'uc': 'i', 's': 'i', 'us': 'i', 'b': 'i', 'f': 'd'}
 
@@ -132,12 +160,14 @@ class Record:
 
 
 class Gen:
-    def __init__(self, seed, align, ld=False, atomic=False, int128=False, bitint=False, dec=False):
+    def __init__(self, seed, align, ld=False, atomic=False, int128=False, bitint=False, dec=False, f16=False,
+                 f128=False, vec=0):
         self.r = random.Random(seed)
         self.align = align
         self.atomic = atomic
         self.kinds = list(SCALARS) + (list(LONG_DOUBLES) if ld else []) + (list(INT128S) if int128 else []) + \
-            (list(BITINTS) if bitint else []) + (list(DECIMALS) * 2 if dec else [])
+            (list(BITINTS) if bitint else []) + (list(DECIMALS) * 2 if dec else []) + (list(F16S) if f16 else []) + \
+            (list(F128S) if f128 else []) + (list(VECS) if vec else []) + (list(VECS_AVX) if vec > 1 else [])
         self.records = []
 
     def scalar(self):
@@ -193,7 +223,8 @@ class Gen:
         # members of one floating type (AArch64's homogeneous aggregates,
         # x86-64's SSE eightbytes), as scalars, arrays and nested records
         k = self.r.choice(['f', 'd'] + (['ld'] if 'ld' in self.kinds else []) +
-                          (list(DECIMALS) if 'd32' in self.kinds else []))
+                          (list(DECIMALS) if 'd32' in self.kinds else []) + (['h'] if 'h' in self.kinds else []) +
+                          (['q128'] if 'q128' in self.kinds else []) + [v for v in ('v2f', 'v4f', 'v4i') if v in self.kinds])
         rec = Record('', False)
         total = self.r.randint(1, 5)
         j = 0
@@ -245,6 +276,8 @@ def max_align(t):
     if isinstance(t, Scalar):
         if ALL[t.k][1] == 'w':
             return 16
+        if ALL[t.k][1] == 'v':
+            return ALL[t.k][2][1]
         return 8 if t.k == 'p' else min(16, max(1, ALL[t.k][2] // 8))
     if isinstance(t, Array):
         return max_align(t.elem)
@@ -260,6 +293,8 @@ def max_size(t):
     if isinstance(t, Scalar):
         if ALL[t.k][1] == 'w':
             return (ALL[t.k][2] + 127) // 128 * 16
+        if ALL[t.k][1] == 'v':
+            return ALL[t.k][2][1]
         return 8 if t.k == 'p' else max(1, ALL[t.k][2] // 8)
     if isinstance(t, Array):
         return t.n * max_size(t.elem)
@@ -271,6 +306,9 @@ def leaves(t, path):
     """The (lvalue, scalar kind, bit-width) of each scalar a fill sets: of a
     union, its first member's."""
     if isinstance(t, Scalar):
+        if ALL[t.k][1] == 'v':
+            ek, size = ALL[t.k][2]
+            return [(f'{path}[{q}]', ek, None) for q in range(size // max(1, ALL[ek][2] // 8))]
         return [(path, t.k, None)]
     if isinstance(t, Atomic):
         if isinstance(t.t, Scalar):
@@ -304,6 +342,9 @@ def value(k, w, s, j):
     if k == 'ld':
         # (with bits that double has not: 2^-50 beside values up to 250)
         return f'((long double)(long long)({m} % 4001u) / 8.0L - 250.0L + (long double)({m} % 7u) * 0x1p-50L)'
+    if k == 'q128':
+        # (with bits that long double has not either: 2^-100 beside values up to 250)
+        return f'((_Float128)(long long)({m} % 4001u) / 8 - 250 + (_Float128)({m} % 7u) * 0x1p-100f128)'
     if kind == 'c':
         re = value('ld', None, s, j)
         im = value('ld', None, s, f'{j}u + 1000')
@@ -356,16 +397,39 @@ def decl_of(t, name):
     return t.decl(name)
 
 
+def is_vec(t):
+    return isinstance(t, Scalar) and ALL[t.k][1] == 'v'
+
+
 def check_expr(t, name, s):
+    if is_vec(t):
+        return f'check_{t.spell}(&{name}, {s})'
     if isinstance(t, Scalar):
         return f'{name} == {value(t.k, None, s, 0)}'
     return f'check_{t.name}(&{name}, {s})'
 
 
 def fill_stmt(t, name, s, indent):
+    if is_vec(t):
+        return f'{indent}{t.decl(name)}; fill_{t.spell}(&{name}, {s});'
     if isinstance(t, Scalar):
         return f'{indent}{t.decl(name)} = {value(t.k, None, s, 0)};'
     return f'{indent}{t.decl(name)}; fill_{t.name}(&{name}, {s});'
+
+
+def vec_fill_check(k):
+    sp, _, (ek, size), _ = ALL[k]
+    n = size // max(1, ALL[ek][2] // 8)
+    f = [f'typedef {ALL[ek][0]} {sp} __attribute__((vector_size({size})));',
+         f'static void fill_{sp}({sp} *p, unsigned s) {{']
+    c = [f'static int check_{sp}(const {sp} *p, unsigned s) {{', '    int bad = 0;']
+    for j in range(n):
+        f.append(f'    (*p)[{j}] = {value(ek, None, "s", j)};')
+        c.append(f'    bad |= (*p)[{j}] != {value(ek, None, "s", j)};')
+    f.append('}')
+    c.append('    return !bad;')
+    c.append('}')
+    return f + c
 
 
 def promoted(t):
@@ -393,7 +457,9 @@ def main():
         for k in [k for k in BITINTS if BITINTS[k][2] > 128]:
             del BITINTS[k]
     bitint = '--bitint' in opts or '--bitint=128' in opts
-    g = Gen(seed, '--no-align' not in opts, ld, '--atomic' in opts, '--int128' in opts, bitint, '--dec' in opts)
+    vec = 2 if '--vec=avx' in opts else (1 if '--vec' in opts else 0)
+    g = Gen(seed, '--no-align' not in opts, ld, '--atomic' in opts, '--int128' in opts, bitint, '--dec' in opts,
+            '--f16' in opts, '--f128' in opts, vec)
     host = '--host' in opts
     tests = []
     for k in range(count):
@@ -405,7 +471,8 @@ def main():
         t.params = []
         if r.random() < 0.3:
             for q in range(r.randint(1, 8)):
-                t.params.append(Scalar(r.choice(['i', 'd', 'll', 'f'] + (['ld'] if ld else []))))
+                t.params.append(Scalar(r.choice(['i', 'd', 'll', 'f'] + (['ld'] if ld else []) +
+                                                [k for k in ('h', 'q128', 'v4i', 'v2d') if k in g.kinds])))
         for q in range(r.choice([0, 1, 2, 3, 4, 5, 8, 10])):
             t.params.append(g.arg_type())
         t.variadic = r.random() < 0.4
@@ -429,6 +496,9 @@ def main():
          '    x ^= x >> 29;', '    x *= 0x94D049BB133111EBull;', '    return x ^ (x >> 32);', '}', '',
          'static void abi_zero(void *p, unsigned long n) {',
          '    unsigned char *q = (unsigned char *)p;', '    while (n--) *q++ = 0;', '}', '']
+    for k in g.kinds:
+        if ALL[k][1] == 'v':
+            h += vec_fill_check(k)
     for rec in g.records:
         h.append(f'{rec.spell} {{')
         for name, mt, w, al in rec.members:
@@ -514,7 +584,7 @@ def main():
           f'   functions of {prefix}_callee.c, directly, through pointers and with',
           '   variadic arguments; prints the failures and the calls made. */']
     if host:
-        if '--int128' in opts or bitint:
+        if '--int128' in opts or bitint or vec:
             ma.append('/* flags: --c-std=gnu23 */')
         elif '--dec' in opts:
             ma.append('/* flags: --c-std=c23 */')

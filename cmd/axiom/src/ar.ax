@@ -1,0 +1,419 @@
+// =============================================================================
+// ar.ax - static libraries: archives of object files in the common `ar`
+// format ("!<arch>\n", then members each behind a 60-byte header), as the
+// platforms' toolchains read and write them:
+//   - System V / GNU (ELF, WebAssembly): a symbol table member "/" (or
+//     "/SYM64/"), long names in the member "//" ("/<offset>" names), names
+//     ending in "/".
+//   - BSD (Mach-O): names longer than 15 bytes, or with spaces, as "#1/<n>"
+//     followed by the name; the symbol table member "__.SYMDEF SORTED"
+//     (ranlib structures: string offset, member offset).
+//   - COFF (Windows): the GNU layout with a second linker member (the
+//     first "/" big-endian as GNU's, the second little-endian with the
+//     members' offsets, the symbols' member indexes and their names sorted),
+//     as the PE/COFF specification's "Archive (Library) File Format" says.
+// Thin archives ("!<thin>\n": members are other files, named by path) are
+// read too. Which members a link takes (select) is decided from their
+// symbols, not from the archive's symbol table.
+// =============================================================================
+import "bin.ax" as bn;
+import "util.ax" as u;
+
+/// A member of an archive: its name and its bytes.
+pub struct Member {
+    name: []u8,
+    data: []u8,
+}
+
+pub const FLAVOR_GNU: i32 = 0;
+pub const FLAVOR_BSD: i32 = 1;
+pub const FLAVOR_COFF: i32 = 2;
+
+/// Is d an archive (regular or thin)?
+pub fn is_archive(d: []u8) bool {
+    return (d.len >= 8) and (u.str_eq(d[0..8], "!<arch>\n") or u.str_eq(d[0..8], "!<thin>\n"));
+}
+
+fn trim(s: []u8) []u8 {
+    let mut e = s.len;
+    while (e > 0) and (s[e - 1] == ' ') {
+        e -= 1;
+    }
+    return s[0..e];
+}
+
+fn dec(s: []u8) u64 {
+    let mut v: u64 = 0;
+    for c in s {
+        if not u.is_digit(c) {
+            break;
+        }
+        v = (v * 10) + @as(u64, c - '0');
+    }
+    return v;
+}
+
+fn dirname(p: []u8) []u8 {
+    let mut k = p.len;
+    while (k > 0) and (p[k - 1] != '/') {
+        k -= 1;
+    }
+    if k == 0 {
+        return ".";
+    }
+    return p[0..k - 1];
+}
+
+/// The object members of archive d (the file `path`: a thin archive's
+/// members are files relative to it), in order: not the symbol tables and
+/// the long-name table. Returns false in *ok if it is malformed.
+pub fn read(d: []u8, path: []u8, ok: *mut bool) u.List.[Member] {
+    let mut out = u.List.[Member].empty();
+    ok.* = false;
+    if not is_archive(d) {
+        return out;
+    }
+    let thin = u.str_eq(d[0..8], "!<thin>\n");
+    let mut names: []u8 = "";
+    let mut at: usize = 8;
+    while (at + 60) <= d.len {
+        let h = d[at..at + 60];
+        if (h[58] != '`') or (h[59] != '\n') {
+            return out;
+        }
+        let raw = trim(h[0..16]);
+        let size = @truncate(usize, dec(trim(h[48..58])));
+        let mut body = at + 60;
+        let mut name = raw;
+        let mut stored = size;  // (bytes of the member in this file)
+        if u.starts(raw, "#1/") {
+            // BSD: the name follows the header, inside the member's size
+            let n = @truncate(usize, dec(raw[3..]));
+            if (body + n) > d.len {
+                return out;
+            }
+            name = d[body..body + n];
+            let mut z = name.len;
+            while (z > 0) and (name[z - 1] == 0) {
+                z -= 1;
+            }
+            name = name[0..z];
+            body += n;
+            stored = size - n;
+        }
+        let special = u.str_eq(raw, "/") or u.str_eq(raw, "/SYM64/") or u.str_eq(raw, "//") or
+                      u.starts(name, "__.SYMDEF");
+        if u.str_eq(raw, "//") {
+            if (body + size) > d.len {
+                return out;
+            }
+            names = d[body..body + size];
+        }
+        if (raw.len > 1) and (raw[0] == '/') and u.is_digit(raw[1]) {
+            // a long name: "/<offset>" into "//", ending in "/\n"
+            let off = @truncate(usize, dec(raw[1..]));
+            let mut e = off;
+            while (e < names.len) and (names[e] != '\n') and
+                  not ((names[e] == '/') and ((e + 1 == names.len) or (names[e + 1] == '\n'))) {
+                e += 1;
+            }
+            if off <= names.len {
+                name = names[off..e];
+            }
+        } else if not special and (name.len > 1) and (name[name.len - 1] == '/') {
+            name = name[0..name.len - 1];
+        }
+        if thin and not special {
+            // the member is the file it names (relative to the archive)
+            let mut p = name;
+            if (p.len == 0) or (p[0] != '/') {
+                p = u.f2("%s/%s", dirname(path), name);
+            }
+            let md = u.read_file(p);
+            if u.isnos(md) {
+                return out;
+            }
+            out.push(Member.{ name: p, data: md });
+            at = body;  // (no data here)
+        } else {
+            if (body + stored) > d.len {
+                return out;
+            }
+            if not special {
+                out.push(Member.{ name: name, data: d[body..body + stored] });
+            }
+            at = body + stored;
+        }
+        if (at & 1) != 0 {
+            at += 1;  // (members start at even offsets)
+        }
+    }
+    ok.* = true;
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Writing
+// -----------------------------------------------------------------------------
+
+fn header(b: *mut bn.Bytes, name: []u8, size: u64, mode: []u8) void {
+    let mut h = u.Buf.init();
+    h.s(name);
+    while h.len() < 16 {
+        h.c(' ');
+    }
+    h.s("0           ");  // date (0: archives are reproducible)
+    h.s("0     0     ");  // uid, gid
+    h.s(mode);
+    while h.len() < 48 {
+        h.c(' ');
+    }
+    h.s(u.udec(size));
+    while h.len() < 58 {
+        h.c(' ');
+    }
+    h.s("`\n");
+    b.put(h.view());
+}
+
+fn pad(b: *mut bn.Bytes) void {
+    if (b.len() & 1) != 0 {
+        b.u8_('\n');
+    }
+}
+
+fn be32(b: *mut bn.Bytes, x: u64) void {
+    b.u8_(@truncate(u8, x >> 24));
+    b.u8_(@truncate(u8, x >> 16));
+    b.u8_(@truncate(u8, x >> 8));
+    b.u8_(@truncate(u8, x));
+}
+
+/// An archive of `members` in `flavor`'s layout, with a symbol table of
+/// the names each member defines (syms[i]: member i's), so that the
+/// platform's linkers take it as they take their own toolchain's.
+pub fn write(members: []Member, syms: [][][]u8, flavor: i32) []u8 {
+    let mut b = bn.new_bytes();
+    b.put("!<arch>\n");
+    // the symbols in member order, and (COFF) sorted by name
+    let mut nsyms: usize = 0;
+    let mut strsz: u64 = 0;
+    for i in 0..members.len {
+        for n in syms[i] {
+            nsyms += 1;
+            strsz += @as(u64, n.len) + 1;
+        }
+    }
+    // member names: GNU and COFF keep names over 15 bytes in "//"
+    let mut longnames = bn.new_bytes();
+    let hnames = u.newn.[[]u8](members.len + 1);
+    for i in 0..members.len {
+        let n = u.basename(members[i].name);
+        if flavor == FLAVOR_BSD {
+            hnames[i] = n;
+        } else if (n.len > 15) or (u.find(n, ' ') >= 0) {
+            hnames[i] = u.cat2("/", u.udec(@as(u64, longnames.len())));
+            longnames.put(n);
+            longnames.put("/\n");
+        } else {
+            hnames[i] = u.cat2(n, "/");
+        }
+    }
+    // the tables' sizes come first: the members' offsets depend on them
+    let mut tab_size: u64 = 0;
+    if flavor == FLAVOR_BSD {
+        let ss = (strsz + 7) & ~@as(u64, 7);
+        tab_size = 4 + (@as(u64, nsyms) * 8) + 4 + ss;
+        tab_size += 20;  // "__.SYMDEF SORTED" padded to 20, in the member
+    } else {
+        tab_size = 4 + (@as(u64, nsyms) * 4) + strsz;
+    }
+    let mut off: u64 = 8 + 60 + tab_size + (tab_size & 1);
+    let mut second_size: u64 = 0;
+    if flavor == FLAVOR_COFF {
+        second_size = 4 + (@as(u64, members.len) * 4) + 4 + (@as(u64, nsyms) * 2) + strsz;
+        off += 60 + second_size + (second_size & 1);
+    }
+    if longnames.len() > 0 {
+        off += 60 + @as(u64, longnames.len()) + (@as(u64, longnames.len()) & 1);
+    }
+    let offs = u.newn.[u64](members.len + 1);
+    for i in 0..members.len {
+        offs[i] = off;
+        let mut sz = @as(u64, members[i].data.len);
+        if flavor == FLAVOR_BSD {
+            sz += (@as(u64, hnames[i].len) + 8) & ~@as(u64, 7);
+        }
+        off += 60 + sz + (sz & 1);
+    }
+    if flavor == FLAVOR_BSD {
+        // __.SYMDEF SORTED: ranlib entries {name offset, member offset}
+        // sorted by name, then the strings
+        let mut order = sorted_syms(members.len, syms);
+        let mut tb = bn.new_bytes();
+        tb.put("__.SYMDEF SORTED\x00\x00\x00\x00");
+        tb.u32_(@as(u64, nsyms) * 8);
+        let mut so: u64 = 0;
+        for x in order.items() {
+            tb.u32_(so);
+            tb.u32_(offs[x.member]);
+            so += @as(u64, x.name.len) + 1;
+        }
+        let ss = (strsz + 7) & ~@as(u64, 7);
+        tb.u32_(ss);
+        for x in order.items() {
+            tb.put(x.name);
+            tb.u8_(0);
+        }
+        tb.zeros(@truncate(usize, ss - strsz));
+        header(&mut b, "#1/20", @as(u64, tb.len()), "100644");
+        b.put(tb.view());
+        pad(&mut b);
+        order.deinit();
+    } else {
+        // the first linker member: count, offsets (big-endian), names
+        header(&mut b, "/", tab_size, "0");
+        be32(&mut b, @as(u64, nsyms));
+        for i in 0..members.len {
+            for k in 0..syms[i].len {
+                _ = k;
+                be32(&mut b, offs[i]);
+            }
+        }
+        for i in 0..members.len {
+            for n in syms[i] {
+                b.put(n);
+                b.u8_(0);
+            }
+        }
+        pad(&mut b);
+    }
+    if flavor == FLAVOR_COFF {
+        // the second linker member: member offsets, then the symbols sorted
+        // with their (1-based) member indexes, little-endian
+        let mut order = sorted_syms(members.len, syms);
+        header(&mut b, "/", second_size, "0");
+        b.u32_(@as(u64, members.len));
+        for i in 0..members.len {
+            b.u32_(offs[i]);
+        }
+        b.u32_(@as(u64, nsyms));
+        for x in order.items() {
+            b.u16_(@as(u64, x.member) + 1);
+        }
+        for x in order.items() {
+            b.put(x.name);
+            b.u8_(0);
+        }
+        pad(&mut b);
+        order.deinit();
+    }
+    if longnames.len() > 0 {
+        header(&mut b, "//", @as(u64, longnames.len()), "");
+        b.put(longnames.view());
+        pad(&mut b);
+    }
+    for i in 0..members.len {
+        if flavor == FLAVOR_BSD {
+            let nl = (@as(u64, hnames[i].len) + 8) & ~@as(u64, 7);
+            header(&mut b, u.cat2("#1/", u.udec(nl)), nl + @as(u64, members[i].data.len), "100644");
+            b.put(hnames[i]);
+            b.zeros(@truncate(usize, nl) - hnames[i].len);
+        } else {
+            header(&mut b, hnames[i], @as(u64, members[i].data.len), "100644");
+        }
+        b.put(members[i].data);
+        pad(&mut b);
+    }
+    longnames.free();
+    let r = u.heap_dup(b.view());
+    b.free();
+    return r;
+}
+
+struct SymRef {
+    name: []u8,
+    member: usize,
+}
+
+fn sorted_syms(n: usize, syms: [][][]u8) u.List.[SymRef] {
+    let mut out = u.List.[SymRef].empty();
+    for i in 0..n {
+        for s in syms[i] {
+            out.push(SymRef.{ name: s, member: i });
+        }
+    }
+    // (insertion sort by name, bytewise: stable for equal names)
+    let a = out.items();
+    for i in 1..a.len {
+        let x = a[i];
+        let mut j = i;
+        while (j > 0) and (u.str_cmp(a[j - 1].name, x.name) > 0) {
+            a[j] = a[j - 1];
+            j -= 1;
+        }
+        a[j] = x;
+    }
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// Member selection
+// -----------------------------------------------------------------------------
+
+/// What a member gives a link (the linker reads it): the names it defines,
+/// and those it refers to without defining (strong references only: a weak
+/// one takes no member, as the generic ABI says).
+pub struct Syms {
+    defs: [][]u8,
+    refs: [][]u8,
+}
+
+/// Which members to link: starting from the names `undefined` (what the
+/// objects refer to and do not define) and `defined` (what they define),
+/// each member that defines a name still undefined is taken, and what it
+/// refers to is looked for in turn, in every archive (they are one group:
+/// the order of the archives does not matter). members[i]: member i's
+/// symbols (of all the archives). The first member to define a name gives
+/// it.
+pub fn select(members: []Syms, undefined: [][]u8, defined: [][]u8) []mut bool {
+    let take = u.newn.[bool](members.len + 1);
+    let mut by_name = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for i in 0..members.len {
+        for n in members[i].defs {
+            let k = u.intern(n);
+            if by_name.get(k) == 0 {
+                by_name.put(k, @int_cast(u32, i) + 1);
+            }
+        }
+    }
+    let mut have = u.SymMap.[u8].{ keys: u.nil.[usize](), vals: u.nil.[u8](), cap: 0, len: 0 };
+    for n in defined {
+        have.put(u.intern(n), 1);
+    }
+    let mut work = u.List.[[]u8].empty();
+    for n in undefined {
+        work.push(n);
+    }
+    while work.len > 0 {
+        let k = u.intern(work.pop());
+        if have.get(k) != 0 {
+            continue;
+        }
+        have.put(k, 1);
+        let m = by_name.get(k);
+        if (m == 0) or take[@as(usize, m - 1)] {
+            continue;
+        }
+        let mi = @as(usize, m - 1);
+        take[mi] = true;
+        for n in members[mi].defs {
+            have.put(u.intern(n), 1);
+        }
+        for n in members[mi].refs {
+            work.push(n);
+        }
+    }
+    work.deinit();
+    return take;
+}

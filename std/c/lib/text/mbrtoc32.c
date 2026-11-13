@@ -3,7 +3,7 @@
 #include <uchar.h>
 
 size_t mbrtoc32(char32_t *restrict pc32, const char *restrict s, size_t n, mbstate_t *restrict ps) {
-    static mbstate_t internal;
+    static _Thread_local mbstate_t internal; /* (each thread's: free of data races) */
     unsigned long c;
     size_t r;
     if (!ps)

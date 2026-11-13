@@ -16,6 +16,7 @@ import "../target.ax" as tg;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_dec.ax" as gdec;
+import "cgen_half.ax" as ghf;
 import "cgen_ld.ax" as gld;
 import "csema_fp.ax" as fp;
 import "ctok.ax" as ct;
@@ -59,11 +60,15 @@ pub fn builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     if cty.is_wide(t) {
         // a long double wider than double (cgen_ld.ax): in memory
         if id >= fp.BI_ISGREATER {
-            return ir.zext(B(), compare_wide(id, vs[0], vs[1]), it);
+            return ir.zext(B(), compare_wide(id, vs[0], vs[1], t), it);
         }
-        return classify_wide(id, vs[0], it);
+        return classify_wide(id, vs[0], it, cty.ffmt(t) == 80);
     }
     if id >= fp.BI_ISGREATER {
+        if cty.is_half(t) {
+            // (the same values in float)
+            return ir.zext(B(), compare(id, ghf.to_f32(vs[0]), ghf.to_f32(vs[1])), it);
+        }
         return ir.zext(B(), compare(id, vs[0], vs[1]), it);
     }
     return classify(id, vs[0], it);
@@ -108,25 +113,25 @@ fn compare_dec(id: i32, t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut 
     return gdec.compare_q(op, t, x, y, false);
 }
 
-fn compare_wide(id: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+fn compare_wide(id: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     if id == fp.BI_ISGREATER {
-        return gld.compare(ct.P_GT, x, y);
+        return gld.compare(ct.P_GT, x, y, t);
     }
     if id == fp.BI_ISGREATEREQUAL {
-        return gld.compare(ct.P_GE, x, y);
+        return gld.compare(ct.P_GE, x, y, t);
     }
     if id == fp.BI_ISLESS {
-        return gld.compare(ct.P_LT, x, y);
+        return gld.compare(ct.P_LT, x, y, t);
     }
     if id == fp.BI_ISLESSEQUAL {
-        return gld.compare(ct.P_LE, x, y);
+        return gld.compare(ct.P_LE, x, y, t);
     }
     if id == fp.BI_ISLESSGREATER {
-        return ir.binop(B(), ir.OP_OR, gld.compare(ct.P_LT, x, y), gld.compare(ct.P_GT, x, y));
+        return ir.binop(B(), ir.OP_OR, gld.compare(ct.P_LT, x, y, t), gld.compare(ct.P_GT, x, y, t));
     }
     // unordered: neither <, = nor >
-    let o = ir.binop(B(), ir.OP_OR, gld.compare(ct.P_LT, x, y), gld.compare(ct.P_GT, x, y));
-    return ir.icmp(B(), ir.IntEQ, ir.binop(B(), ir.OP_OR, o, gld.compare(ct.P_EQ, x, y)), ir.cint(ir.t_int(1), 0));
+    let o = ir.binop(B(), ir.OP_OR, gld.compare(ct.P_LT, x, y, t), gld.compare(ct.P_GT, x, y, t));
+    return ir.icmp(B(), ir.IntEQ, ir.binop(B(), ir.OP_OR, o, gld.compare(ct.P_EQ, x, y, t)), ir.cint(ir.t_int(1), 0));
 }
 
 // The class of a wide long double at p, from its bits: the x87's 80-bit
@@ -134,11 +139,10 @@ fn compare_wide(id: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
 // exponent: an encoding the x87 treats as invalid, an unnormal or pseudo-
 // infinity or pseudo-NaN, is a NaN) or binary128 (sign, 15-bit exponent,
 // 112-bit fraction).
-fn classify_wide(id: i32, p: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
+fn classify_wide(id: i32, p: *mut ir.Value, it: *mut ir.Ty, x87: bool) *mut ir.Value {
     let t64 = ir.t_int(64);
     let lo = ir.load(B(), t64, p);
     let hi = ir.load(B(), t64, ir.ptradd(B(), p, cg.usz(8)));
-    let x87 = cty.ld_bits() == 80;
     let mut se = ir.binop(B(), ir.OP_LSHR, hi, ir.cint(t64, 48));  // sign and exponent
     let mut frac = ir.binop(B(), ir.OP_OR, ir.binop(B(), ir.OP_AND, hi, ir.cint(t64, 0xffffffffffff)), lo);
     let mut quiet = ir.binop(B(), ir.OP_AND, hi, ir.cint(t64, 0x800000000000));
@@ -222,6 +226,12 @@ fn classify(id: i32, x: *mut ir.Value, it: *mut ir.Ty) *mut ir.Value {
         inf = 0x7f800000;
         minn = 0x00800000;
         quiet = 0x00400000;
+    } else if w == 16 {
+        // (binary16: _Float16's bits)
+        sign = 0x8000;
+        inf = 0x7c00;
+        minn = 0x0400;
+        quiet = 0x0200;
     }
     let one = ir.cint(it, 1);
     if id == fp.BI_SIGNBIT {

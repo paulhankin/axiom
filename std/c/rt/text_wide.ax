@@ -1,0 +1,200 @@
+// =============================================================================
+// std/c/rt/text_wide.ax - the searches of the C library's wide string
+// functions (std/c/lib/text/: wcslen, wmemchr, wmemcmp), 64 bytes at a
+// time with Axiom's vectors (AVX-512 or AVX2 where the processor has them,
+// spec 13.4; else 16-byte vectors), for wchar_t of 32 bits and of 16
+// (Windows).
+//
+// A search for a string's end reads whole aligned groups of 64 bytes,
+// which never cross a page, so reading past the terminating null within
+// its group touches no memory the string's page does not hold.
+// =============================================================================
+
+// The bits of the 64 bytes at s[i..] (whole elements: 16 of 32 bits) that
+// are c: 64 bytes at a time with AVX-512, 32 with AVX2, else 16.
+inline fn eq64_32(s: []u32, i: usize, c: u32) u64 {
+    if @target_has("avx512bw") {
+        let n16: u32x16 = @splat(c);
+        return @as(u64, @bitmask(@lanes_eq(@load(u32x16, s[i..i + 16]), n16)));
+    }
+    if @target_has("avx2") {
+        let n8: u32x8 = @splat(c);
+        let m0 = @as(u64, @bitmask(@lanes_eq(@load(u32x8, s[i..i + 8]), n8)));
+        let m1 = @as(u64, @bitmask(@lanes_eq(@load(u32x8, s[i + 8..i + 16]), n8)));
+        return m0 | (m1 << 8);
+    }
+    let n4: u32x4 = @splat(c);
+    let m0 = @as(u64, @bitmask(@lanes_eq(@load(u32x4, s[i..i + 4]), n4)));
+    let m1 = @as(u64, @bitmask(@lanes_eq(@load(u32x4, s[i + 4..i + 8]), n4)));
+    let m2 = @as(u64, @bitmask(@lanes_eq(@load(u32x4, s[i + 8..i + 12]), n4)));
+    let m3 = @as(u64, @bitmask(@lanes_eq(@load(u32x4, s[i + 12..i + 16]), n4)));
+    return ((m0 | (m1 << 4)) | (m2 << 8)) | (m3 << 12);
+}
+
+// The same for 32 elements of 16 bits.
+inline fn eq64_16(s: []u16, i: usize, c: u16) u64 {
+    if @target_has("avx512bw") {
+        let n32: u16x32 = @splat(c);
+        return @as(u64, @bitmask(@lanes_eq(@load(u16x32, s[i..i + 32]), n32)));
+    }
+    if @target_has("avx2") {
+        let n16: u16x16 = @splat(c);
+        let m0 = @as(u64, @bitmask(@lanes_eq(@load(u16x16, s[i..i + 16]), n16)));
+        let m1 = @as(u64, @bitmask(@lanes_eq(@load(u16x16, s[i + 16..i + 32]), n16)));
+        return m0 | (m1 << 16);
+    }
+    let n8: u16x8 = @splat(c);
+    let m0 = @as(u64, @bitmask(@lanes_eq(@load(u16x8, s[i..i + 8]), n8)));
+    let m1 = @as(u64, @bitmask(@lanes_eq(@load(u16x8, s[i + 8..i + 16]), n8)));
+    let m2 = @as(u64, @bitmask(@lanes_eq(@load(u16x8, s[i + 16..i + 24]), n8)));
+    let m3 = @as(u64, @bitmask(@lanes_eq(@load(u16x8, s[i + 24..i + 32]), n8)));
+    return ((m0 | (m1 << 8)) | (m2 << 16)) | (m3 << 24);
+}
+
+// The first of s's elements that is c, or s.len.
+fn find32(s: []u32, c: u32) usize @multiversion("avx512bw", "avx2") {
+    let mut i: usize = 0;
+    let a = @int_from_ptr(s.ptr);
+    // (128 bytes an iteration while they last, then 64)
+    while (i + 32) <= s.len {
+        let m0 = eq64_32(@slice_from_ptr(@ptr_from_int(*u32, a + (i * 4)), 16), 0, c);
+        let m1 = eq64_32(@slice_from_ptr(@ptr_from_int(*u32, a + (i * 4) + 64), 16), 0, c);
+        if (m0 | m1) != 0 {
+            if m0 != 0 {
+                return i + @truncate(usize, @ctz(m0));
+            }
+            return i + 16 + @truncate(usize, @ctz(m1));
+        }
+        i += 32;
+    }
+    while (i + 16) <= s.len {
+        // (a slice of the group itself: no bounds to check in it)
+        let m = eq64_32(@slice_from_ptr(@ptr_from_int(*u32, a + (i * 4)), 16), 0, c);
+        if m != 0 {
+            return i + @truncate(usize, @ctz(m));
+        }
+        i += 16;
+    }
+    while (i < s.len) and (s[i] != c) {
+        i += 1;
+    }
+    return i;
+}
+
+fn find16(s: []u16, c: u16) usize @multiversion("avx512bw", "avx2") {
+    let mut i: usize = 0;
+    let a = @int_from_ptr(s.ptr);
+    while (i + 64) <= s.len {
+        let m0 = eq64_16(@slice_from_ptr(@ptr_from_int(*u16, a + (i * 2)), 32), 0, c);
+        let m1 = eq64_16(@slice_from_ptr(@ptr_from_int(*u16, a + (i * 2) + 64), 32), 0, c);
+        if (m0 | m1) != 0 {
+            if m0 != 0 {
+                return i + @truncate(usize, @ctz(m0));
+            }
+            return i + 32 + @truncate(usize, @ctz(m1));
+        }
+        i += 64;
+    }
+    while (i + 32) <= s.len {
+        let m = eq64_16(@slice_from_ptr(@ptr_from_int(*u16, a + (i * 2)), 32), 0, c);
+        if m != 0 {
+            return i + @truncate(usize, @ctz(m));
+        }
+        i += 32;
+    }
+    while (i < s.len) and (s[i] != c) {
+        i += 1;
+    }
+    return i;
+}
+
+/// The number of elements of width bits (16 or 32) before the first that
+/// is c at p, within n of them (n: the elements there are); n if none is.
+export fn __axc_wfind(p: *u8, c: u64, n: u64, width: u64) u64 {
+    let k = @int_cast(usize, n);
+    if width == 16 {
+        return @as(u64, find16(@slice_from_ptr(@ptr_cast(*u16, p), k), @truncate(u16, c)));
+    }
+    return @as(u64, find32(@slice_from_ptr(@ptr_cast(*u32, p), k), @truncate(u32, c)));
+}
+
+// A string's length: the elements one at a time up to a 64-byte boundary,
+// then 64 bytes at a time (an aligned group never crosses a page: the
+// slice of each group is made for it).
+fn len32(a: usize) usize @multiversion("avx512bw", "avx2") {
+    let mut i: usize = 0;
+    while ((a + (i * 4)) & 63) != 0 {
+        if @slice_from_ptr(@ptr_from_int(*u32, a), i + 1)[i] == 0 {
+            return i;
+        }
+        i += 1;
+    }
+    loop {
+        let m = eq64_32(@slice_from_ptr(@ptr_from_int(*u32, a + (i * 4)), 16), 0, 0);
+        if m != 0 {
+            return i + @truncate(usize, @ctz(m));
+        }
+        i += 16;
+    }
+}
+
+fn len16(a: usize) usize @multiversion("avx512bw", "avx2") {
+    let mut i: usize = 0;
+    while ((a + (i * 2)) & 63) != 0 {
+        if @slice_from_ptr(@ptr_from_int(*u16, a), i + 1)[i] == 0 {
+            return i;
+        }
+        i += 1;
+    }
+    loop {
+        let m = eq64_16(@slice_from_ptr(@ptr_from_int(*u16, a + (i * 2)), 32), 0, 0);
+        if m != 0 {
+            return i + @truncate(usize, @ctz(m));
+        }
+        i += 32;
+    }
+}
+
+/// The length of the wide string at p (elements of width bits before the
+/// null one).
+export fn __axc_wlen(p: *u8, width: u64) u64 {
+    if width == 16 {
+        return @as(u64, len16(@int_from_ptr(p)));
+    }
+    return @as(u64, len32(@int_from_ptr(p)));
+}
+
+/// The first index below n where the elements of width bits at a and b
+/// differ, or n.
+export fn __axc_wdiff(a: *u8, b: *u8, n: u64, width: u64) u64 {
+    let k = @int_cast(usize, n);
+    let mut i: usize = 0;
+    if width == 16 {
+        let x = @slice_from_ptr(@ptr_cast(*u16, a), k);
+        let y = @slice_from_ptr(@ptr_cast(*u16, b), k);
+        while (i + 8) <= k {
+            let m = @bitmask(@lanes_eq(@load(u16x8, x[i..i + 8]), @load(u16x8, y[i..i + 8])));
+            if m != 0xFF {
+                return @as(u64, i + @as(usize, @ctz(~m)));
+            }
+            i += 8;
+        }
+        while (i < k) and (x[i] == y[i]) {
+            i += 1;
+        }
+        return @as(u64, i);
+    }
+    let x = @slice_from_ptr(@ptr_cast(*u32, a), k);
+    let y = @slice_from_ptr(@ptr_cast(*u32, b), k);
+    while (i + 4) <= k {
+        let m = @bitmask(@lanes_eq(@load(u32x4, x[i..i + 4]), @load(u32x4, y[i..i + 4])));
+        if m != 0xF {
+            return @as(u64, i + @as(usize, @ctz(~m)));
+        }
+        i += 4;
+    }
+    while (i < k) and (x[i] == y[i]) {
+        i += 1;
+    }
+    return @as(u64, i);
+}

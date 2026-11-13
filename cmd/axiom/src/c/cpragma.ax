@@ -276,6 +276,45 @@ pub fn system_header(sp: u.Span) void {
     g_rules.push(Rule.{ file: sp.file, off: sp.start, kind: R_SYSTEM, code: "" });
 }
 
+// The files that are the system C library's headers (--c-lib=system).
+let mut g_system_files: u.SymMap.[u8] = u.SymMap.[u8].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u8, 0), cap: 0, len: 0 };
+
+/// File `file` is a header of the system's C library (--c-lib=system): as
+/// the implementation's own, it gives no warnings, nor the errors that say
+/// a feature is a later standard's (the system's headers use them, guarded
+/// in ways this front end's predefined macros do not tell them of; the
+/// program's own code is checked as always).
+pub fn system_file(file: i32) void {
+    g_system_files.put(u.addr_key(@as(usize, @bit_cast(u32, file)) + 1), 1);
+    if not g_installed {
+        g_installed = true;
+        dg.filter = filter;
+    }
+}
+
+// The codes of "a feature of a later standard" (docs/c-diagnostics.md),
+// and of an empty declaration at file scope, which the system's headers
+// have where their macros expand to nothing.
+let LATER_STD: [28][]u8 = ["C2004", "C1012", "C1015", "C1017", "C1020", "C1021", "C1051", "C1054", "C1065", "C2003",
+                           "C2100", "C2101", "C2106", "C2107", "C2108", "C2109", "C2110", "C2111", "C2112", "C2127",
+                           "C2135", "C2136", "C2137", "C2138", "C2139", "C2140", "C2141", "C2134"];
+
+fn in_system_file(sp: u.Span, sev: i32, code: []u8) bool {
+    if (g_system_files.len == 0) or (g_system_files.get(u.addr_key(@as(usize, @bit_cast(u32, sp.file)) + 1)) == 0) {
+        return false;
+    }
+    if sev == dg.SEV_WARNING {
+        return true;
+    }
+    for c in LATER_STD {
+        if u.str_eq(c, code) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// The preprocessor enters file `file` (its first lines are read next).
 pub fn enter_file(file: i32) void {
     if g_rules.len > 0 {
@@ -288,6 +327,9 @@ pub fn enter_file(file: i32) void {
 // sp's file before it and all before that one; or, if its file has none
 // before sp, those read before the file was first entered.
 fn filter(sev: i32, sp: u.Span, code: []u8) i32 {
+    if in_system_file(sp, sev, code) {
+        return -1;
+    }
     if (g_rules.len == 0) or (sev != dg.SEV_WARNING) {
         return sev;
     }
@@ -351,6 +393,7 @@ fn filter(sev: i32, sp: u.Span, code: []u8) i32 {
 /// compiler's codes (written as itself, "C4050"), or an option of the usual
 /// spelling that stands for one ("-Wdeprecated-declarations"); empty for
 /// "-Wall", "-Wextra" and "-Wpedantic" (every warning); nil for any other.
+/// An option of several codes (-Wformat) gives them separated by commas.
 pub fn option_code(opt: []u8) []u8 {
     if (opt.len == 5) and (opt[0] == 'C') and (opt[1] == '4') {
         return u.intern(opt);
@@ -367,6 +410,14 @@ pub fn option_code(opt: []u8) []u8 {
     for k in 0..names.len {
         if u.str_eq(opt, names[k]) {
             return codes[k];
+        }
+    }
+    // (the format checks, csema_format.ax: several codes, by commas)
+    let fnames = ["-Wformat", "-Wformat-extra-args", "-Wformat-nonliteral", "-Wformat-security", "-Wformat-signedness"];
+    let fcodes = ["C4130,C4131,C4132,C4133,C4134,C4135", "C4132", "C4134", "C4134", "C4135"];
+    for k in 0..fnames.len {
+        if u.str_eq(opt, fnames[k]) {
+            return fcodes[k];
         }
     }
     return u.nosym();

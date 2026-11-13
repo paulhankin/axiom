@@ -6,7 +6,7 @@
 #include <uchar.h>
 
 size_t c16rtomb(char *restrict s, char16_t c16, mbstate_t *restrict ps) {
-    static mbstate_t internal;
+    static _Thread_local mbstate_t internal; /* (each thread's: free of data races) */
     char buf[4];
     unsigned long c = c16;
     int n;

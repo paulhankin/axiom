@@ -926,6 +926,52 @@ fn resolve_named_type(te: *mut ast.TypeExpr, nt: ast.NamedType, tc: *mut TypeCtx
 // ---------------------------------------------------------------------------
 // A function type is allowed when its own parameters and result are: C
 // calls a callback with its own calling convention.
+fn boundary_ok_in(t: *mut ast.Type, is_ret: bool, c_fn: bool) bool {
+    if c_fn {
+        return boundary_value_ok(t, is_ret);
+    }
+    return boundary_type_ok(t, is_ret);
+}
+
+// A parameter or result of an extern "C" function or an export: a boundary
+// type, or a structure of them passed by value as the C ABI says (spec
+// §14.5.3); not in `import host` functions (WebAssembly imports' types are
+// the scalars).
+fn boundary_value_ok(t: *mut ast.Type, is_ret: bool) bool {
+    if t.kind == ast.TY_STRUCT {
+        return boundary_struct_ok(t);
+    }
+    return boundary_type_ok(t, is_ret);
+}
+
+// A structure that crosses by value, or the type of a C object (spec
+// §14.5.6): every member a boundary type (but void, and a function type
+// only as a member), a structure of such members, or an array of one.
+fn boundary_struct_ok(t: *mut ast.Type) bool {
+    if u.isnil(t.decl) or (t.decl.fields.len == 0) {
+        return false;
+    }
+    for i in 0..t.decl.fields.len {
+        if not boundary_data_ok(ty.type_field(t, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn boundary_data_ok(t: *mut ast.Type) bool {
+    if t.kind == ast.TY_STRUCT {
+        return boundary_struct_ok(t);
+    }
+    if t.kind == ast.TY_ARRAY {
+        return (t.len > 0) and boundary_data_ok(t.elem);
+    }
+    if (t.kind == ast.TY_VOID) or (t.kind == ast.TY_VEC) or (t.kind == ast.TY_V128) {
+        return false;  // (a vector's layout in C is not the standard's)
+    }
+    return boundary_type_ok(t, false);
+}
+
 fn boundary_type_ok(t: *ast.Type, is_ret: bool) bool {
     let k = t.kind;
     if k == ast.TY_FN {
@@ -1042,14 +1088,26 @@ fn resolve_fn(d: *mut ast.Decl) void {
         if d.gparams.len != 0 {
             _ = dg.err(d.name_span, "E0466", u.f1("%s functions cannot be generic", what));
         }
+        // (structures cross by value in C functions, not in WebAssembly's
+        // imports: spec §14.5.3)
+        let c_fn = d.extern_c or d.is_export;
         for i in 0..d.params.len {
-            if not boundary_type_ok(d.param_types[i], false) and (d.param_types[i].kind != ast.TY_INVALID) {
+            if c_fn and (d.param_types[i].kind == ast.TY_STRUCT) {
+                d.cabi = true;
+            }
+            if not boundary_ok_in(d.param_types[i], false, c_fn) and (d.param_types[i].kind != ast.TY_INVALID) {
                 _ = dg.err(d.params.at(i).te.span, "E0801", u.f3("type %s is not allowed at the %s function boundary%s",
                                                                  tstr(d.param_types[i]), what,
                                                                  fn_type_hint(d.param_types[i])));
             }
         }
-        if not boundary_type_ok(d.ret_type, true) {
+        if c_fn and (d.ret_type.kind == ast.TY_STRUCT) {
+            d.cabi = true;
+        }
+        if d.cabi and d.variadic {
+            _ = dg.err(d.name_span, "E0801", "a variadic C function cannot take or return a structure by value");
+        }
+        if not boundary_ok_in(d.ret_type, true, c_fn) {
             let mut sp = d.name_span;
             if u.notnil(d.ret_te) {
                 sp = d.ret_te.span;
@@ -1405,6 +1463,14 @@ fn resolve_decl(d: *mut ast.Decl) void {
                        u.f1("thread-local '%s' must be mutable (`threadlocal let mut`; a constant needs no copy per thread)",
                             d.name));
         }
+        if (d.extern_c or d.is_export) and (d.ty.kind != ast.TY_INVALID) and not boundary_data_ok(d.ty) {
+            // an object C defines, or one C code may use (spec §14.5.6)
+            _ = dg.err(d.te.span, "E0801", u.f3("type %s is not allowed for %s object '%s'", tstr(d.ty),
+                                                u.pick(d.extern_c, "a C", "an exported"), d.name));
+        }
+        if d.extern_c and not u.isnos(d.abi) and not u.str_eq(d.abi, "C") {
+            _ = dg.err(d.abi_span, "E0306", u.f1("unknown ABI \"%s\" (only \"C\" is supported)", d.abi));
+        }
     }
     d.state = 2;
 }
@@ -1504,6 +1570,9 @@ fn is_const_init(e: *mut ast.Expr) bool {
 
 fn check_global(d: *mut ast.Decl) void {
     resolve_decl(d);
+    if d.extern_c {
+        return;  // (C defines it: no initializer)
+    }
     let mut ctx = fn_ctx(type_ctx(d.module, dnil(), dnil(), tnil()));
     ctx.const_ctx = true;
     let saved = C;
@@ -1778,6 +1847,13 @@ fn cat_name(c: ast.Cat) []u8 {
 fn func_to_value(e: *mut ast.Expr) void {
     let f = ast.decl_of(e);
     if f.kind == ast.D_HOST_FN {
+        if f.cabi {
+            // (its structures travel as C's ABI says, and Axiom's calls
+            // through a function value do not: spec §14.5.3)
+            _ = dg.err(e.span, "E0801",
+                       u.f1("the C function '%s' takes or returns a structure by value: it can only be called, not used as a function value",
+                            f.name));
+        }
         e.cat = ast.CAT_VALUE;
         e.ty = f.ty;
         return;

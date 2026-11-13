@@ -36,6 +36,7 @@ pub extern "C" {
     fn ReadFile(h: usize, p: *mut u8, n: u32, got: *mut u32, ov: *mut void) i32;
     fn WriteFile(h: usize, p: *u8, n: u32, put: *mut u32, ov: *mut void) i32;
     fn CloseHandle(h: usize) i32;
+    fn LocalFree(p: *void) usize;
     fn GetFileType(h: usize) u32;
     fn GetFileAttributesW(path: *u16) u32;
     fn GetFileAttributesExW(path: *u16, level: u32, out: *mut u8) i32;
@@ -70,6 +71,8 @@ pub extern "C" {
     fn TerminateProcess(h: usize, code: u32) i32;
     fn GetCurrentProcess() usize;
     fn GetProcessTimes(h: usize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) i32;
+    fn GetThreadTimes(h: usize, created: *mut u64, exited: *mut u64, kernel: *mut u64, user: *mut u64) i32;
+    fn GetCurrentThread() usize;
     fn GetCurrentProcessId() u32;
     fn CreateProcessW(app: *u16, cmd: *mut u16, psa: *void, tsa: *void, inherit: i32, flags: u32, env: *void, cwd: *u16,
                       si: *u8, pi: *mut u8) i32;
@@ -119,6 +122,9 @@ pub extern "C" {
     fn SetErrorMode(mode: u32) u32;
     fn AcquireSRWLockExclusive(l: *mut usize) void;
     fn ReleaseSRWLockExclusive(l: *mut usize) void;
+
+    // advapi32
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl: *u16, rev: u32, sd: *mut usize, size: *mut u32) i32;
 
     // ntdll
     fn RtlWaitOnAddress(addr: *void, compare: *void, size: usize, timeout: *i64) u32;
@@ -505,7 +511,33 @@ export fn ax_open(path: *u8, len: usize, flags: u32) i32 {
     if ((flags & 8) != 0) and ((base == 1) or (base == 4)) {
         disp = 1;  // CREATE_NEW: the file must not exist
     }
-    let h = CreateFileW(&w[0], access, SHARE_ALL, @ptr_from_int(*void, 0), disp, FA_NORMAL, 0);
+    // (32: exclusive access, no other handle may open the file meanwhile;
+    // 16: a file created gets an access control list that admits its owner
+    // alone, a protected DACL with one entry: full access for OWNER RIGHTS)
+    let mut share = SHARE_ALL;
+    if (flags & 32) != 0 {
+        share = 0;
+    }
+    let mut sd: usize = 0;
+    let mut sa: [3]usize = [0; 3];  // SECURITY_ATTRIBUTES: nLength, lpSecurityDescriptor, bInheritHandle
+    let mut psa = @ptr_from_int(*void, 0);
+    if (flags & 16) != 0 {
+        let sddl = "D:P(A;;FA;;;OW)";
+        let mut ws: [16]u16 = [0; 16];
+        for i in 0..sddl.len {
+            ws[i] = @as(u16, sddl[i]);
+        }
+        let mut sz: u32 = 0;
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(&ws[0], 1, &mut sd, &mut sz) != 0 {
+            sa[0] = @size_of([3]usize);
+            sa[1] = sd;
+            psa = @ptr_cast(*void, &sa[0]);
+        }
+    }
+    let h = CreateFileW(&w[0], access, share, psa, disp, FA_NORMAL, 0);
+    if sd != 0 {
+        _ = LocalFree(@ptr_from_int(*void, sd));
+    }
     if h == INVALID {
         return fs_err();
     }
@@ -1420,7 +1452,14 @@ export fn ax_proc_spawn(spec: *u8, len: usize, stdio: *mut i32) i32 {
         if argc > 0 {
             wb_unit(&mut cmd, ' ');
         }
-        wb_arg(&mut cmd, a);
+        if (argc > 0) and (a.len > 0) and (a[0] == 1) {
+            // (an argument beginning with byte 1 goes into the command line
+            // as it is: the C library's system, for cmd.exe, which does not
+            // read the quoting of wb_arg)
+            wb_utf8(&mut cmd, a[1..]);
+        } else {
+            wb_arg(&mut cmd, a);
+        }
         argc += 1;
         i += a.len + 1;
     }
@@ -3221,9 +3260,18 @@ export fn ax_random(p: *mut u8, n: usize) i32 {
 
 let mut qpc_freq: i64 = 0;
 
-// Nanoseconds on clock 0 (real time since 1970), 1 (monotonic) or 2 (the
-// processor time of the process: kernel and user, in units of 100 ns).
+// Nanoseconds on clock 0 (real time since 1970), 1 (monotonic), 2 (the
+// processor time of the process: kernel and user, in units of 100 ns) or 3
+// (the processor time of the calling thread, likewise).
 export fn ax_clock_ns(clock: u32) i64 {
+    if clock == 3 {
+        let mut c: u64 = 0;
+        let mut e: u64 = 0;
+        let mut k: u64 = 0;
+        let mut u: u64 = 0;
+        _ = GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u);
+        return @bit_cast(i64, (k + u) * 100);
+    }
     if clock == 2 {
         let mut c: u64 = 0;
         let mut e: u64 = 0;

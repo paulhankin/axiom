@@ -27,9 +27,9 @@
 /* 32 words: the most a platform saves is Windows x64's 256 bytes */
 typedef __axiom_int64 jmp_buf[32];
 
-int __axc_setjmp(jmp_buf env);
+int __axc_setjmp(jmp_buf __env);
 #define setjmp(env) __axc_setjmp(env)
 
-__AXC_NORETURN void longjmp(jmp_buf env, int val);
+__AXC_NORETURN void longjmp(jmp_buf __env, int __val);
 
 #endif

@@ -112,6 +112,8 @@ static void need_buffer(FILE *f) {
 /* Writes n bytes to the file, translating '\n' to "\r\n" in a text stream
    on Windows; 0, or EOF after a failure (the error indicator set). */
 static int write_out(FILE *f, const unsigned char *p, size_t n) {
+    if ((f->__flags & (F_APPEND | F_FDAPPEND)) == F_APPEND && n > 0)
+        __axc_sys_seek(f->__fd, 0, SEEK_END); /* (freopen(NULL, "a", ...)) */
     if (f->__flags & F_TEXT) {
         static const unsigned char crlf[2] = {'\r', '\n'};
         size_t i = 0, start = 0;

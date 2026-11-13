@@ -5,7 +5,7 @@
 
 int timespec_getres(struct timespec *ts, int base) {
     long long ns;
-    if (base < 1 || base > 3)
+    if (base < 1 || base > 4)
         return 0;
     ns = __axc_clock_res((unsigned long long)(base - 1));
     if (ts) {

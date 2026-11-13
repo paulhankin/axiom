@@ -359,7 +359,7 @@ signals, terminals, UDP, Unix-domain sockets, polling, name resolution, file wat
 | Function | Meaning |
 |---|---|
 | `ax_write(fd, p, n) isize`, `ax_read(fd, p, n) isize` | read and write file descriptors; `0` from read means end of file |
-| `ax_open(path, len, flags) i32`, `ax_close(fd)` | `flags`: `0` read, `1` create/truncate, `2` append, `3` read and write, `4` read and write, created or truncated, `5` read and append, created; plus `8` with `1` or `4`: the file must not exist (`-17`) |
+| `ax_open(path, len, flags) i32`, `ax_close(fd)` | `flags`: `0` read, `1` create/truncate, `2` append, `3` read and write, `4` read and write, created or truncated, `5` read and append, created; plus `8` with `1` or `4`: the file must not exist (`-17`); `16`: a file created is its owner's alone (permissions 0600; on Windows an access control list of the owner's); `32`: exclusive access (on Windows no other handle may open it meanwhile; elsewhere no effect) |
 | `ax_seek(fd, off, whence) i64` | moves a file's position (`whence`: `0` start, `1` current, `2` end); returns the new position |
 | `ax_stat(path, len, follow, out) i32` | `out[0..4]` (`i64`): kind (`1` file, `2` directory, `3` symbolic link, `4` other), size, modification time in ns, permission bits; `follow = 0` does not follow a final symbolic link |
 | `ax_fstat(fd, out) i32` | `ax_stat` for an open file |
@@ -379,7 +379,7 @@ signals, terminals, UDP, Unix-domain sockets, polling, name resolution, file wat
 | `ax_thread_spawn(entry, arg, stack_top, exited) i32`, `ax_thread_stack_size() usize`, `ax_thread_exit()` | threads (spec §12.8.5) |
 | `ax_cpu_count() u32`, `ax_sleep_ns(ns)` | |
 | `ax_random(p, n) i32` | fills `p[0..n]` with cryptographically secure random bytes |
-| `ax_clock_ns(clock) i64` | nanoseconds on clock `0` (real time since 1970), `1` (monotonic) or `2` (the processor time of the process) |
+| `ax_clock_ns(clock) i64` | nanoseconds on clock `0` (real time since 1970), `1` (monotonic), `2` (the processor time of the process) or `3` (the processor time of the calling thread; on WebAssembly the process's where node has no per-thread time) |
 | `ax_tz_local(buf, cap) isize` | the host's local time zone as the bytes of a TZif file (RFC 8536, version 2 or later, with a footer rule for later times); `-2` if the host has none (native targets, whose zone is the system's files). `std/time/tz`'s `Zone.local` asks for it when `$TZ` and `/etc/localtime` give no zone: the node host builds one from what the JavaScript engine knows of its zone (`Date`, `Intl`), so that no time zone database is needed |
 
 A negative result means failure. The codes are `-1` general failure, `-2` connection

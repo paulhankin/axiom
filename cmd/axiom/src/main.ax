@@ -38,10 +38,12 @@
 //   -DNAME[=value]  -UNAME  -I<dir> (also -D NAME, -U NAME, -I <dir>)
 //   --emit=c-pp|c-tokens|c-ast   preprocessed text, tokens, syntax tree
 // =============================================================================
+import "ar.ax" as ar;
 import "ast.ax" as ast;
 import "backend.ax" as be;
 import "c/cc.ax" as cfront;
 import "c/copts.ax" as cop;
+import "c/cstrip.ax" as cstrip;
 import "codegen.ax" as cg;
 import "diag.ax" as dg;
 import "elf.ax" as elf;
@@ -49,6 +51,8 @@ import "elink.ax" as el;
 import "fmt.ax" as fmt;
 import "header.ax" as header;
 import "ide.ax" as ide;
+import "jstub.ax" as jstub;
+import "linkin.ax" as linkin;
 import "lsp.ax" as lsp;
 import "lstub.ax" as lstub;
 import "mlink.ax" as ml;
@@ -183,7 +187,19 @@ fn link_native(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
     if tg.g_arch == tg.ARCH_A64 {
         machine = elf.EM_AARCH64;
     }
-    return el.link(os.items(), machine, cg.g_link_libs.items(), out);
+    // the objects the program is linked with (linkin.ax), and the
+    // libraries it names: extern blocks', then -l's
+    for k in 0..linkin.g_objs.len {
+        os.push(linkin.g_objs.get(k));
+    }
+    let mut names = u.List.[[]u8].empty();
+    for k in 0..cg.g_link_libs.len {
+        names.push(cg.g_link_libs.get(k));
+    }
+    for k in 0..linkin.g_names.len {
+        names.push(linkin.g_names.get(k));
+    }
+    return el.link(os.items(), machine, names.items(), out);
 }
 
 fn link_wasm(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
@@ -211,6 +227,15 @@ fn link_wasm(objpath: []u8, unit_objs: [][]u8, out: []u8) i32 {
     }
     if tg.has(tg.W_EXCEPTION_HANDLING) {
         us.push(wl.longjmp_unit(tg.g_arch == tg.ARCH_WASM64));  // (C's longjmp, kept if called)
+    }
+    // the objects the program is linked with (linkin.ax), and the archive
+    // members they need
+    for k in 0..linkin.g_wunits.len {
+        us.push(linkin.g_wunits.get(k));
+    }
+    let ms = linkin.wasm_members(us.items());
+    for k in 0..ms.len {
+        us.push(ms.get(k));
     }
     let o = wl.Options.{ stack_size: wasm_stack_size(), shared_memory: cg.g_threads, max_pages: 16384,
                          exports: cg.g_export_names.items() };
@@ -339,6 +364,192 @@ fn new_options(cmd: []u8) Options {
 // An object of C code alone (build_c): no runtime, so no system call stubs.
 let mut g_c_object: bool = false;
 
+// The C unit of the wrappers of the program's C functions that take or
+// return structures by value (header.ax: cabi_source), if it has any: a
+// file in a private directory, removed after the build.
+let mut g_cabi_path: []u8 = "";
+let mut g_cabi_dir: []u8 = "";
+
+// Writes the wrappers' C unit (g_cabi_path) if the checked program needs
+// one. False after an error (reported).
+fn cabi_unit(o: *Options) bool {
+    if not header.has_cabi() {
+        return true;
+    }
+    g_cabi_dir = u.private_tmp_dir("axiom-cabi-");
+    if u.isnos(g_cabi_dir) {
+        dg.emit_fatal(o.json, "E9001", "cannot make a private directory for the C wrappers");
+        return false;
+    }
+    g_cabi_path = u.cat2(g_cabi_dir, "/cabi.c");
+    if not u.write_file(g_cabi_path, header.cabi_source()) {
+        dg.emit_fatal(o.json, "E9001", u.f1("cannot write %s", g_cabi_path));
+        return false;
+    }
+    return true;
+}
+
+fn remove_cabi_unit() void {
+    if not u.isnos(g_cabi_dir) and (g_cabi_dir.len > 0) {
+        _ = u.unlink(u.cz(g_cabi_path));
+        _ = u.rmdir(g_cabi_dir);
+        g_cabi_dir = "";
+    }
+}
+
+// The objects and libraries the executable is linked with are read
+// (load_link_inputs) and our own linker links them.
+let mut g_own_inputs: bool = false;
+// --c-lib=system: the system's C library is the program's (docs/c.md).
+let mut g_c_lib_system: bool = false;
+// Objects compiled from --link=<file.c> by the system's C compiler (removed
+// after the link).
+let mut g_cc_objs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+// Does the program have C, in its units or in objects it is linked with
+// (which then have the C library as C units would)?
+fn has_c(o: *Options) bool {
+    return (o.c_inputs.len > 0) or linkin.g_any or own_inputs(o);
+}
+
+// Will the executable be linked with objects and libraries that our own
+// linker reads (load_link_inputs)?
+fn own_inputs(o: *Options) bool {
+    if not u.str_eq(o.emit, "exe") or o.ide_mode or not o.build or
+       ((tg.g_os != tg.OS_LINUX) and not ty.g_target.is_wasm) {
+        return false;
+    }
+    for k in 0..o.link_inputs.len {
+        if not is_ax_source(o.link_inputs.get(k)) {
+            return true;
+        }
+    }
+    return o.link_flags.len > 0;
+}
+
+// The objects, archives and libraries an executable is linked with
+// (o.link_inputs but Axiom sources, and -l, -L), read before anything is
+// compiled (linkin.ax): what they refer to the program defines, our own
+// linker then linking them. A C source among them is compiled by the
+// system's C compiler first. Where our linkers do not read them yet (the
+// targets but Linux), the system's toolchain links (link). False after an
+// error (reported).
+fn load_link_inputs(o: *mut Options) bool {
+    if not own_inputs(o) {
+        return true;
+    }
+    let mut paths = u.List.[[]u8].empty();
+    for k in 0..o.link_inputs.len {
+        let p = o.link_inputs.get(k);
+        if is_c_source(p) and ty.g_target.is_wasm {
+            let obj = clang_compile(o, p, k);
+            if u.isnos(obj) {
+                return false;
+            }
+            paths.push(obj);
+        } else if is_c_source(p) {
+            let obj = cc_compile(o, p, k);
+            if u.isnos(obj) {
+                return false;
+            }
+            paths.push(obj);
+        } else {
+            paths.push(p);
+        }
+    }
+    if not linkin.load(paths.items(), o.link_flags.items()) {
+        dg.emit_fatal(o.json, "E9004", "linking failed");
+        return false;
+    }
+    g_own_inputs = true;
+    cfront.set_init_arrays(true);
+    return true;
+}
+
+// Compiles C source p (--link=) with the system's C compiler into an
+// object; its path, or nosym after an error (reported).
+fn cc_compile(o: *Options, p: []u8, k: usize) []u8 {
+    let names = system_cc_names();
+    let cc = u.find_tool(names[..]);
+    if u.isnos(cc) {
+        dg.emit_fatal(o.json, "E9003", "cannot find a C compiler to compile --link= C sources with");
+        return u.nosym();
+    }
+    let mut tmp = o.out;
+    if u.isnos(tmp) {
+        tmp = strip_ph(u.basename(o.input));
+    }
+    let obj = u.f3("%s.c%s.%s.o", tmp, u.zdec(k), u.idec(u.getpid()));
+    let mut av = u.List.[[]u8].empty();
+    av.push(cc);
+    av.push("-c");
+    av.push("-O2");
+    av.push("-fno-omit-frame-pointer");
+    for j in 0..o.inc_flags.len {
+        av.push(o.inc_flags.get(j));
+    }
+    av.push(p);
+    av.push("-o");
+    av.push(obj);
+    if u.run_status(av.items(), u.OUT_INHERIT) != 0 {
+        dg.emit_fatal(o.json, "E9004", u.f1("the system's C compiler failed on %s", p));
+        return u.nosym();
+    }
+    g_cc_objs.push(obj);
+    return obj;
+}
+
+// Compiles C source p (--link=) for WebAssembly with clang; the object's
+// path, or nosym after an error (reported).
+fn clang_compile(o: *Options, p: []u8, k: usize) []u8 {
+    let cc_names = ["clang", "clang-18", "/usr/lib/llvm-18/bin/clang"];
+    let clang = u.find_tool(cc_names[..]);
+    if u.isnos(clang) {
+        dg.emit_fatal(o.json, "E9003", "cannot find clang to compile C sources for wasm");
+        return u.nosym();
+    }
+    let mut tmp = o.out;
+    if u.isnos(tmp) {
+        tmp = strip_ph(u.basename(o.input));
+    }
+    let obj = u.f3("%s.c%s.%s.o", tmp, u.zdec(k), u.idec(u.getpid()));
+    let mut av = u.List.[[]u8].empty();
+    av.push(clang);
+    av.push(u.pick(ty.g_target.ptr_bits == 64, "--target=wasm64-unknown-unknown", "--target=wasm32-unknown-unknown"));
+    for c in ["-O2", "-c", "-ffreestanding", "-mbulk-memory", "-msimd128", "-mnontrapping-fptoint", "-msign-ext",
+              "-mmutable-globals"] {
+        av.push(c);
+    }
+    if cg.g_threads {
+        av.push("-matomics");
+    }
+    for j in 0..o.inc_flags.len {
+        av.push(o.inc_flags.get(j));
+    }
+    av.push(p);
+    av.push("-o");
+    av.push(obj);
+    if u.run_status(av.items(), u.OUT_INHERIT) != 0 {
+        dg.emit_fatal(o.json, "E9004", u.f1("clang failed on %s", p));
+        return u.nosym();
+    }
+    g_cc_objs.push(obj);
+    return obj;
+}
+
+// The system's C compiler (for the target: a cross compiler if need be).
+fn system_cc_names() [3][]u8 {
+    let mut names = ["cc", "clang", "gcc"];
+    if tg.g_arch != tg.host_arch() {
+        if tg.g_arch == tg.ARCH_A64 {
+            names = ["aarch64-linux-gnu-gcc", "aarch64-linux-gnu-cc", "aarch64-linux-gnu-gcc-13"];
+        } else {
+            names = ["x86_64-linux-gnu-gcc", "x86_64-linux-gnu-cc", "x86_64-linux-gnu-gcc-13"];
+        }
+    }
+    return names;
+}
+
 // A step of the driver returns this to go on, or an exit status.
 const CONTINUE: i32 = -1;
 
@@ -357,9 +568,19 @@ fn c_option(o: *mut Options, a: []u8) bool {
         o.c_freestanding = true;  // (no C library: c_library)
         return true;
     }
+    if u.str_eq(a, "--c-lib=system") or u.str_eq(a, "--c-lib=axiom") {
+        o.c_args.push(a);
+        g_c_lib_system = u.str_eq(a, "--c-lib=system");
+        return true;
+    }
+    if u.starts(a, "--c-system-include=") {
+        o.c_args.push(a);
+        return true;
+    }
     if u.starts(a, "--c-std=") or u.starts(a, "--c-char=") or u.starts(a, "--c-int=") or u.starts(a, "--c-long=") or
        u.str_eq(a, "--c-warn-unknown-pragmas") or u.starts(a, "--c-long-double=") or u.starts(a, "--c-asm-dialect=") or
-       u.str_eq(a, "--c-fenv-access") or ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
+       u.starts(a, "--c-warn-format=") or u.str_eq(a, "--c-fenv-access") or
+       ((a.len > 2) and (a[0] == '-') and ((a[1] == 'D') or (a[1] == 'U'))) {
         o.c_args.push(a);
         return true;
     }
@@ -408,8 +629,29 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         plat = cop.PLAT_DARWIN;
     }
     cop.set_platform(c, plat, tg.g_arch == tg.ARCH_A64);
+    // (vector types: their alignment as the platform's compilers give it,
+    // the registers that hold them: csema_vec.ax)
+    c.vec_reg = 16;
+    c.vec_ir = true;
+    c.vec_align = 0;
+    if tg.g_arch == tg.ARCH_A64 {
+        c.vec_align = 16;
+    } else if tg.is_wasm() {
+        c.vec_ir = tg.has(tg.W_SIMD128);
+    } else {
+        if tg.has(tg.X_AVX512F) {
+            c.vec_reg = 64;
+        } else if tg.has(tg.X_AVX) {
+            c.vec_reg = 32;
+        }
+        if not win {
+            c.vec_align = c.vec_reg;
+        }
+    }
+    c.warn_format = 1;
     let mut defs = u.List.[cop.Define].empty();
     let mut dirs = u.List.[[]u8].empty();
+    let mut sys_dirs = u.List.[[]u8].empty();
     for k in 0..o.inc_flags.len {
         let d = o.inc_flags.get(k)[2..];
         if not u.is_dir(d) {
@@ -424,6 +666,15 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         let mut ok = true;
         if u.str_eq(a, "--c-freestanding") {
             // (main.ax's: c_library)
+        } else if u.str_eq(a, "--c-lib=axiom") or u.str_eq(a, "--c-lib=system") {
+            // (system_lib below)
+        } else if u.starts(a, "--c-system-include=") {
+            let d = a[19..];
+            if not u.is_dir(d) {
+                dg.emit_fatal(o.json, "E9001", u.f1("the system include directory '%s' does not exist", d));
+                return false;
+            }
+            sys_dirs.push(d);
         } else if u.starts(a, "--c-std=") {
             c.std = cop.std_named(a[8..]);
             c.gnu = cop.is_gnu(a[8..]);
@@ -440,6 +691,13 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
         } else if u.starts(a, "--c-asm-dialect=") {
             c.asm_intel = u.str_eq(a[16..], "intel");
             ok = c.asm_intel or u.str_eq(a[16..], "att");
+        } else if u.starts(a, "--c-warn-format=") {
+            // (0: no checks of format strings; 1: the clear errors; 2: all: csema_format.ax)
+            let v = a[16..];
+            ok = (v.len == 1) and (v[0] >= '0') and (v[0] <= '2');
+            if ok {
+                c.warn_format = @as(i32, v[0] - '0');
+            }
         } else if u.starts(a, "--c-char=") {
             c.char_signed = u.str_eq(a[9..], "signed");
             ok = c.char_signed or u.str_eq(a[9..], "unsigned");
@@ -485,6 +743,105 @@ fn c_options(o: *Options, c: *mut cop.COptions) bool {
     c.include_dirs = dirs.items();
     c.sys_include = u.cat2(o.std_dir, "/c/include");
     c.hosted = not o.c_freestanding;
+    if g_c_lib_system {
+        return system_c_lib(o, c, &mut sys_dirs);
+    }
+    return true;
+}
+
+// --c-lib=system (docs/c.md, "The system's C library"): the system's C
+// library is the program's, and its headers (the directories `dirs`
+// given with --c-system-include, else the system's own for the target on
+// Linux) are the hosted headers; the compiler's are those of the language's
+// own types and macros (cpp.ax: system_own_header). The headers are given
+// the predefined macros of the platform that they test (the processor and
+// the system, the data model, the sizes of the types, the byte order), and
+// the C options must be the platform's (its C ABI's). False after an error
+// (reported).
+fn system_c_lib(o: *Options, c: *mut cop.COptions, dirs: *mut u.List.[[]u8]) bool {
+    if o.c_freestanding {
+        dg.emit_fatal(o.json, "E9001", "--c-lib=system and --c-freestanding exclude each other");
+        return false;
+    }
+    if ty.g_target.is_wasm {
+        dg.emit_fatal(o.json, "E9001", "--c-lib=system: WebAssembly has no system C library");
+        return false;
+    }
+    let a64 = tg.g_arch == tg.ARCH_A64;
+    if dirs.len == 0 {
+        if tg.g_os != tg.OS_LINUX {
+            dg.emit_fatal(o.json, "E9001",
+                          u.f1("--c-lib=system for %s needs the system's headers: --c-system-include=<dir>",
+                               tg.os_target_name()));
+            return false;
+        }
+        let triple = u.pick(a64, "aarch64-linux-gnu", "x86_64-linux-gnu");
+        let cands = [u.f1("/usr/%s/include", triple), u.f1("/usr/include/%s", triple), "/usr/include"];
+        let native = tg.g_arch == tg.host_arch();
+        for k in 0..cands.len {
+            // (a cross toolchain's headers for another processor than this
+            // machine's, else this machine's)
+            if (k == 0) and native {
+                continue;
+            }
+            if (k > 0) and not native and u.is_dir(cands[0]) {
+                break;
+            }
+            if u.is_dir(cands[k]) {
+                dirs.push(cands[k]);
+            }
+        }
+        if dirs.len == 0 {
+            dg.emit_fatal(o.json, "E9001", "--c-lib=system: the system's C headers are not installed");
+            return false;
+        }
+    }
+    let int_ok = (c.int_bits == 32) and ((c.long_bits == 64) or ((c.long_bits == 32) and tg.is_windows()));
+    if not int_ok {
+        dg.emit_fatal(o.json, "E9001", "--c-lib=system takes the platform's --c-int and --c-long");
+        return false;
+    }
+    if c.std < cop.C99 {
+        // (the system's headers use long long, which C89 has not)
+        dg.emit_fatal(o.json, "E9001", "--c-lib=system takes C99 or a later standard (--c-std=c99 ... gnu23)");
+        return false;
+    }
+    c.system_lib = true;
+    c.system_dirs = dirs.items();
+    let mut m = u.Buf.init();
+    m.s("#define __AXIOM_SYSTEM_C_LIB__ 1\n");
+    if a64 {
+        m.s("#define __aarch64__ 1\n#define __AARCH64EL__ 1\n#define __ARM_64BIT_STATE 1\n");
+    } else {
+        m.s("#define __x86_64__ 1\n#define __x86_64 1\n#define __amd64__ 1\n#define __amd64 1\n");
+    }
+    if tg.g_os == tg.OS_LINUX {
+        m.s("#define __linux__ 1\n#define __linux 1\n#define __gnu_linux__ 1\n#define __unix__ 1\n#define __unix 1\n");
+        m.s("#define __ELF__ 1\n");
+    } else if tg.is_darwin() {
+        m.s("#define __APPLE__ 1\n#define __MACH__ 1\n");
+    } else if tg.is_windows() {
+        m.s("#define _WIN32 1\n#define _WIN64 1\n");
+    }
+    if c.long_bits == 64 {
+        m.s("#define __LP64__ 1\n#define _LP64 1\n");
+    }
+    m.s("#define __CHAR_BIT__ 8\n#define __SIZEOF_SHORT__ 2\n#define __SIZEOF_INT__ 4\n");
+    m.s(u.f1("#define __SIZEOF_LONG__ %s\n", u.idec(c.long_bits / 8)));
+    m.s("#define __SIZEOF_LONG_LONG__ 8\n#define __SIZEOF_POINTER__ 8\n#define __SIZEOF_SIZE_T__ 8\n");
+    m.s("#define __SIZEOF_PTRDIFF_T__ 8\n#define __SIZEOF_FLOAT__ 4\n#define __SIZEOF_DOUBLE__ 8\n");
+    m.s(u.f1("#define __SIZEOF_LONG_DOUBLE__ %s\n", u.pick(c.ld_bits == 64, "8", "16")));
+    // (wint_t is Windows's unsigned short, else 32 bits)
+    m.s(u.f2("#define __SIZEOF_WCHAR_T__ %s\n#define __SIZEOF_WINT_T__ %s\n", u.idec(c.wchar_bits / 8),
+             u.pick(tg.is_windows(), "2", "4")));
+    m.s("#define __ORDER_LITTLE_ENDIAN__ 1234\n#define __ORDER_BIG_ENDIAN__ 4321\n#define __ORDER_PDP_ENDIAN__ 3412\n");
+    m.s("#define __BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__\n");
+    c.target_macros = u.dup(m.view());
+    cfront.set_system_c_lib(true);
+    // the linkers: on Windows, msvcrt.dll's names (plink.ax) and main's end
+    // through its exit (c/cgen.ax); everywhere, its setjmp and longjmp
+    tg.g_system_c_library = true;
+    jstub.g_system_jmp = true;
     return true;
 }
 
@@ -500,6 +857,17 @@ fn check_unit(path: []u8, c: *cop.COptions) bool {
         return cfront.check_asm(path, c);
     }
     return cfront.check(path, c, false);
+}
+
+// An object or library given among the inputs, linked with the program
+// (as with --link=): by its name's extension.
+fn is_link_input(path: []u8) bool {
+    for e in [".o", ".obj", ".a", ".lib", ".so", ".dylib", ".dll", ".tbd"] {
+        if (path.len > e.len) and u.ends(path, e) {
+            return true;
+        }
+    }
+    return u.contains(path, ".so.");
 }
 
 // Is `path` an Axiom source (its name ends in .ax)?
@@ -543,7 +911,7 @@ fn check_c_options(o: *Options) bool {
         dg.emit_fatal(o.json, "E9001", u.f1("%s is an option for Axiom code, and not for C sources", bad));
         return false;
     }
-    if ax_root and (o.testing or o.profiling or o.ide_mode) {
+    if ax_root and o.ide_mode {
         dg.emit_fatal(o.json, "E9001", u.f1("axiom %s does not take C sources", o.cmd));
         return false;
     }
@@ -680,6 +1048,8 @@ fn parse_options(o: *mut Options, args: [][]u8) bool {
         } else if (a.len > 0) and (a[0] == '-') {
             dg.emit_fatal(o.json, "E9001", u.f1("unknown option '%s'", a));
             return false;
+        } else if is_link_input(a) {
+            o.link_inputs.push(a);  // an object or library to link (linkin.ax)
         } else if u.isnos(o.input) {
             o.input = a;
         } else if is_c_source(a) {
@@ -959,6 +1329,7 @@ fn write_header(o: *mut Options) bool {
 
 // The commands that compile: build, check, test, profile and ide.
 fn compile(args: [][]u8) i32 {
+    defer remove_cabi_unit();
     let mut o = new_options(args[1]);
     cg.g_test_mode = o.testing;
     if not o.build and not u.str_eq(o.cmd, "check") and not o.ide_mode {
@@ -1008,6 +1379,9 @@ fn compile(args: [][]u8) i32 {
             // (the C library's index: cmd/internal/tools/gen_c_lib_index.mjs)
             return cfront.lib_defs(o.input, c, o.json);
         }
+        if not load_link_inputs(&mut o) {
+            return 1;
+        }
         return build_c(&mut o, c);
     }
     if o.ide_mode {
@@ -1016,7 +1390,7 @@ fn compile(args: [][]u8) i32 {
     if o.build and not runtime_sources(&o, &mut pkg_files) {
         return 2;
     }
-    if (o.c_inputs.len > 0) and u.str_eq(o.emit, "exe") and not o.c_freestanding {
+    if has_c(&o) and u.str_eq(o.emit, "exe") and not o.c_freestanding and not g_c_lib_system {
         // the C library's run-time layer (c_library)
         let rt = u.f1("%s/c/rt", o.std_dir);
         let start = pkg_files.len;
@@ -1026,7 +1400,7 @@ fn compile(args: [][]u8) i32 {
             cg.g_lib_prefix = u.cat2(u.pick(u.isnos(r), rt, r), "/");
         }
     }
-    if (o.c_inputs.len > 0) and not has_rt(&pkg_files, "ldouble.ax") {
+    if has_c(&o) and not has_rt(&pkg_files, "ldouble.ax") {
         // (the C units' long double arithmetic, where it is wider than
         // double: cgen_ld.ax; the C options are read after the program is;
         // and their integers wider than 64 bits: cgen_wint.ax)
@@ -1043,8 +1417,15 @@ fn compile(args: [][]u8) i32 {
     if ok and not u.isnos(o.header_path) and not write_header(&mut o) {
         return 2;
     }
-    if ok and (o.c_inputs.len > 0) {
-        // C units beside the Axiom program (after the header, which they
+    // (after the header, which a --link=<file.c> may include)
+    if ok and not load_link_inputs(&mut o) {
+        return 1;
+    }
+    if ok and not cabi_unit(&o) {
+        return 1;
+    }
+    if ok and (has_c(&o) or (g_cabi_path.len > 0)) {
+        // C units beside the Axiom program (or objects that are C's) (after the header, which they
         // may include)
         let mut c = u.new.[cop.COptions]();
         if not c_options(&o, c) {
@@ -1112,10 +1493,11 @@ fn build_c(o: *mut Options, c: *cop.COptions) i32 {
         files.push(lib_modules.get(k));
     }
     set_strip(o);
-    if (c.ld_bits != 64) and not has_rt(&lib_modules, "ldouble.ax") {
+    if ((c.ld_bits != 64) or cfront.uses_xfloat()) and not has_rt(&lib_modules, "ldouble.ax") {
         // long double's arithmetic in software (cgen_ld.ax calls it; only
-        // the functions called are generated, objects included): with the
-        // C library's run-time layer, else on its own
+        // the functions called are generated, objects included), and
+        // _Float16's and _Float128's: with the C library's run-time layer,
+        // else on its own
         files.push(u.f1("%s/c/rt/ldouble.ax", o.std_dir));
     }
     if cfront.uses_wint() and not has_rt(&lib_modules, "wideint.ax") {
@@ -1161,7 +1543,7 @@ fn has_rt(ps: *u.List.[[]u8], name: []u8) bool {
 // False after an error (reported).
 fn c_library(o: *Options, c: *cop.COptions, modules: *mut u.List.[[]u8]) bool {
     let ok = c_library_units(o, c);
-    if o.c_freestanding {
+    if o.c_freestanding or g_c_lib_system {
         return ok;
     }
     let rt = u.f1("%s/c/rt", o.std_dir);
@@ -1189,6 +1571,17 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
     let mut ok = true;
     let lo = cfront.lib_options(c);
     g_rt_needed = u.List.[[]u8].empty();
+    if not has_c(o) and not is_c_source(o.input) {
+        // (only the wrappers of C functions with structures by value:
+        // what the code generators call by name, as for a freestanding
+        // program)
+        return c_string_units(o, lo);
+    }
+    if g_c_lib_system {
+        // the system's C library is the program's: none of this one (what
+        // the objects linked with the program refer to is the system's too)
+        return true;
+    }
     let idx = u.read_file(u.f1("%s/c/lib/index", o.std_dir));
     if u.isnos(idx) {
         let mut srcs = u.List.[[]u8].empty();
@@ -1240,6 +1633,14 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
     cfront.defined_names(&mut defined);
     let mut work = u.List.[[]u8].empty();
     cfront.all_refs(&mut work);
+    // what the objects and libraries linked with the program refer to: the
+    // program, or the C library, defines it, and it is kept
+    let mut ext = u.List.[[]u8].empty();
+    linkin.refs(&mut ext);
+    for k in 0..ext.len {
+        work.push(ext.get(k));
+        cstrip.add_root(ext.get(k));
+    }
     if not o.c_freestanding {
         // what code generation calls by name (the start-up's exit; the
         // memory functions the code generators call: c/cstrip.ax)
@@ -1248,13 +1649,27 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
         }
         // and what the program's Axiom modules declare in extern "C" blocks
         extern_c_names(o, &mut work);
+        if not is_c_source(o.input) {
+            // (an Axiom program's main runs exit's handlers when it returns;
+            // a test binary flushes the streams after each test)
+            work.push("__axc_exit_handlers");
+            work.push("fflush");
+            cfront.set_hosted(true);
+        }
     } else {
         for n in ["memcpy", "memmove", "memset", "memcmp"] {
             work.push(n);
         }
     }
+    let dbg = not u.isnos(u.env("AXIOM_CLIB_DEBUG"));
     while work.len > 0 {
         let n = u.intern(work.pop());
+        if dbg {
+            u.eprint(
+                u.f3(
+                    "clib: %s done=%s defined=%s\n", n, u.pick(done.has(n), "y", "n"),
+                    u.pick(defined.has(n), "y", "n")));
+        }
         if done.has(n) or defined.has(n) {
             continue;
         }
@@ -1291,6 +1706,21 @@ fn c_library_units(o: *Options, c: *cop.COptions) bool {
         }
         for r in cfront.last_refs() {
             work.push(r);
+        }
+    }
+    return ok;
+}
+
+// The C library's units of <string.h>'s functions that the code generators
+// call (memcpy, memmove, memset, memcmp), unless the program defines them.
+fn c_string_units(o: *Options, lo: *cop.COptions) bool {
+    let mut ok = true;
+    let mut defined = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
+    cfront.defined_names(&mut defined);
+    for n in ["memcpy", "memmove", "memset", "memcmp"] {
+        let p = u.f2("%s/c/lib/string/%s.c", o.std_dir, n);
+        if not defined.has(u.intern(n)) and u.file_exists(p) {
+            ok = cfront.check(p, lo, true) and ok;
         }
     }
     return ok;
@@ -1376,6 +1806,13 @@ let mut g_rt_needed: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []
 // read as text: `fn name(` in an extern "C" block).
 fn extern_c_names(o: *Options, out: *mut u.List.[[]u8]) void {
     if u.notnil(sema.g_prog) {
+        // (the declarations of extern blocks are the program's host_fns)
+        for i in 0..sema.g_prog.host_fns.len {
+            let d = sema.g_prog.host_fns.get(i);
+            if d.extern_c and not sema.is_std_module(d.module) {
+                out.push(d.name);
+            }
+        }
         for i in 0..sema.g_prog.fns.len {
             let d = sema.g_prog.fns.get(i);
             if d.extern_c and not sema.is_std_module(d.module) {
@@ -1415,7 +1852,7 @@ fn extern_c_names(o: *Options, out: *mut u.List.[[]u8]) void {
 // or -l libraries, whose code could refer to anything) is stripped of what
 // the units define and nothing reaches (c/cstrip.ax).
 fn set_strip(o: *Options) void {
-    cg.g_strip = u.str_eq(o.emit, "exe") and (o.link_inputs.len == 0) and (o.link_flags.len == 0);
+    cg.g_strip = u.str_eq(o.emit, "exe") and (((o.link_inputs.len == 0) and (o.link_flags.len == 0)) or g_own_inputs);
 }
 
 // The C units of an Axiom program (o.c_inputs): checked, linked with each
@@ -1427,6 +1864,10 @@ fn check_c_units(o: *Options, c: *cop.COptions, lib_modules: bool) bool {
     let mut ok = true;
     for k in 0..o.c_inputs.len {
         ok = check_unit(o.c_inputs.get(k), c) and ok;
+    }
+    if g_cabi_path.len > 0 {
+        // (the wrappers of the C functions with structures by value: C17)
+        ok = cfront.check(g_cabi_path, cfront.lib_options(c), false) and ok;
     }
     if ok and u.str_eq(o.emit, "exe") {
         ok = c_library_units(o, c);
@@ -1451,7 +1892,9 @@ fn axiom_names(o: *Options) u.List.[cfront.AxName] {
     let mut xs = u.List.[cfront.AxName].empty();
     for i in 0..sema.g_prog.fns.len {
         let d = sema.g_prog.fns.get(i);
-        if d.is_export and not u.str_eq(d.name, "main") and not sema.is_std_module(d.module) {
+        if d.is_export and not d.cabi and not u.str_eq(d.name, "main") and not sema.is_std_module(d.module) {
+            // (an export with structures by value: its C function is the
+            // wrappers' unit's, header.ax: cabi_source)
             xs.push(cfront.AxName.{ name: d.name, span: d.name_span });
         }
     }
@@ -1461,8 +1904,10 @@ fn axiom_names(o: *Options) u.List.[cfront.AxName] {
 // Sets the output kind from --emit; false on an error (reported).
 fn set_emit(o: *Options, final_link: bool) bool {
     let co = o.co;
-    if u.str_eq(o.emit, "obj") {
+    if u.str_eq(o.emit, "obj") or u.str_eq(o.emit, "lib") {
         co.emit = cg.EMIT_OBJ;
+        cg.g_object_output = true;
+        cfront.set_object_output(true);
         be.g_stubs = not ty.g_target.is_wasm and (tg.g_os == tg.OS_LINUX) and not g_c_object;
     } else if u.str_eq(o.emit, "ir") {
         co.emit = cg.EMIT_IR;
@@ -1535,12 +1980,17 @@ fn build_program(o: *mut Options) i32 {
             ext = ".ir";
         } else if co.emit == cg.EMIT_ASM {
             ext = ".s";
+        } else if u.str_eq(o.emit, "lib") {
+            ext = u.pick(tg.is_windows(), ".lib", ".a");
         } else if not final_link {
             ext = ".o";
         } else {
             ext = wext;
         }
         o.out = u.cat2(strip_ph(u.basename(o.input)), ext);
+        if u.str_eq(o.emit, "lib") and not tg.is_windows() {
+            o.out = u.cat2("lib", o.out);
+        }
     }
     let host_fns = sema.g_prog.host_fns;
     for k in 0..host_fns.len {
@@ -1557,7 +2007,8 @@ fn build_program(o: *mut Options) i32 {
         return fatal(o.json, "E9002", "threads on WebAssembly need the atomics extension (--features=+atomics)");
     }
     let mut objpath = o.out;
-    if final_link {
+    let lib = u.str_eq(o.emit, "lib");
+    if final_link or lib {
         objpath = u.f2("%s.tmp%s.o", o.out, u.idec(u.getpid()));
         co.out_path = objpath;
     } else {
@@ -1579,6 +2030,13 @@ fn build_program(o: *mut Options) i32 {
             return rc;
         }
     }
+    if lib {
+        rc = write_library(o, objpath);
+        _ = u.unlink(u.cz(objpath));
+        if rc != CONTINUE {
+            return rc;
+        }
+    }
     if o.testing and not u.isnos(o.test_keep) {
         dg.emit(o.json, o.json);
         return 0;
@@ -1595,6 +2053,67 @@ fn build_program(o: *mut Options) i32 {
     }
     dg.emit(o.json, o.json);
     return 0;
+}
+
+// --emit=lib: a static library (ar.ax) of the program's object (objpath)
+// and the objects among the inputs, with a symbol table of what each
+// defines, in the layout of the target's toolchain (BSD's for macOS, the
+// PE/COFF one for Windows, else System V's). CONTINUE, or an exit status
+// after an error (reported).
+fn write_library(o: *Options, objpath: []u8) i32 {
+    let mut members = u.List.[ar.Member].empty();
+    let mut syms = u.List.[[][]u8].empty();
+    let mut paths = u.List.[[]u8].empty();
+    paths.push(objpath);
+    for k in 0..o.link_inputs.len {
+        let p = o.link_inputs.get(k);
+        if u.ends(p, ".o") or u.ends(p, ".obj") {
+            paths.push(p);
+        } else if not is_ax_source(p) {
+            return fatal(o.json, "E9001", u.f1("--emit=lib takes objects (.o) besides the sources, not '%s'", p));
+        }
+    }
+    for k in 0..paths.len {
+        let d = u.read_file(paths.get(k));
+        if u.isnos(d) {
+            return fatal(o.json, "E9004", u.f1("cannot read %s", paths.get(k)));
+        }
+        let mut name = u.basename(paths.get(k));
+        if k == 0 {
+            name = u.cat2(strip_ph(u.basename(o.input)), u.pick(tg.is_windows(), ".obj", ".o"));
+        }
+        members.push(ar.Member.{ name: name, data: d });
+        syms.push(defined_names(d));
+    }
+    let mut flavor = ar.FLAVOR_GNU;
+    if tg.is_darwin() {
+        flavor = ar.FLAVOR_BSD;
+    } else if tg.is_windows() {
+        flavor = ar.FLAVOR_COFF;
+    }
+    if not u.write_file(o.out, ar.write(members.items(), syms.items(), flavor)) {
+        return fatal(o.json, "E9004", u.f1("cannot write %s", o.out));
+    }
+    return CONTINUE;
+}
+
+// The external names an object (ELF or WebAssembly) defines.
+fn defined_names(d: []u8) [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    if elf.is_object(d) {
+        let ob = elf.read(d);
+        if u.notnil(ob) {
+            for i in 0..ob.syms.len {
+                let sy = ob.syms.get(i);
+                if (sy.sec != -1) and (sy.bind != elf.B_LOCAL) and (sy.name.len > 0) {
+                    out.push(sy.name);
+                }
+            }
+        }
+    } else {
+        wo.defined_names(d, &mut out);
+    }
+    return out.items();
 }
 
 // Code generation, into objpath, or into a cached object per module (separate
@@ -1640,7 +2159,7 @@ fn generate(o: *mut Options, objpath: []u8, final_link: bool, unit_objs: *mut u.
     }
     // (C code and libraries are linked by the system's linker, which would
     // see the internal symbols of the parts' objects as global)
-    be.g_parts = final_link and not separate and (n_user_inputs == 0) and (o.link_flags.len == 0);
+    be.g_parts = final_link and not separate and (((n_user_inputs == 0) and (o.link_flags.len == 0)) or g_own_inputs);
     if not separate and not cg.codegen_program(co) {
         dg.emit(o.json, o.json);
         if final_link {
@@ -1662,7 +2181,25 @@ fn link(o: *mut Options, objpath: []u8, n_user_inputs: usize, unit_objs: [][]u8)
     let no_c = (n_user_inputs == 0) and (o.link_flags.len == 0);
     let own_link = no_c and (cg.g_link_libs.len == 0);
     let mut native_own = false;
-    if tg.g_os != tg.OS_LINUX {
+    if g_own_inputs and ty.g_target.is_wasm {
+        // our own linker, with the WebAssembly objects and archives read
+        rc = link_wasm(objpath, unit_objs, o.out);
+        for k in 0..g_cc_objs.len {
+            _ = u.unlink(u.cz(g_cc_objs.get(k)));
+        }
+        native_own = true;
+    } else if g_own_inputs {
+        // our own linker, with the objects and libraries read (linkin.ax)
+        el.g_members = linkin.g_members;
+        el.g_shlibs = linkin.g_shlibs;
+        el.g_search_dirs = linkin.g_dirs;
+        el.g_c_lib_axiom = not g_c_lib_system and not o.c_freestanding;
+        rc = link_native(objpath, unit_objs, o.out);
+        native_own = rc != el.LINK_FALLBACK;
+        for k in 0..g_cc_objs.len {
+            _ = u.unlink(u.cz(g_cc_objs.get(k)));
+        }
+    } else if tg.g_os != tg.OS_LINUX {
         // (extern "C" "name" blocks name DLLs on Windows, which plink.ax
         // imports from, and dylibs or frameworks on macOS, which mlink.ax
         // loads)

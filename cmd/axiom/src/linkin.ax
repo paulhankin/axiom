@@ -1,0 +1,361 @@
+// =============================================================================
+// linkin.ax - the inputs a build links besides its own code: relocatable
+// objects, static archives and shared libraries, given on the command line
+// (`x.o`, `--link=lib.a`, ...), by name (-l<name>, looked for in the -L
+// directories and the system's), or compiled from C by the system's C
+// compiler (--link=x.c). They may be the compiler's own (--emit=obj,
+// --emit=lib) or the platform toolchain's for the same target.
+//
+// load() reads them once, before code generation, so that the build knows
+// what they refer to (refs: the compiler's C library supplies those names,
+// and what they reach is kept), and the linker takes what it loaded: the
+// objects, the archives' members (it chooses among them: ar.select), the
+// shared libraries.
+// =============================================================================
+import "ar.ax" as ar;
+import "elf.ax" as elf;
+import "elink.ax" as el;
+import "target.ax" as tg;
+import "types.ax" as ty;
+import "util.ax" as u;
+import "wobj.ax" as wo;
+
+/// The objects (each with a name for messages), the archive members a link
+/// may take, and the shared libraries (by path) loaded (load).
+pub let mut g_objs: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0), len: 0,
+                                                                    cap: 0 };
+pub let mut g_members: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0),
+                                                                       len: 0, cap: 0 };
+pub let mut g_shlibs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+/// WebAssembly targets: the objects (wobj.ax units) and archive members.
+pub let mut g_wunits: u.List.[*mut wo.Unit] = u.List.[*mut wo.Unit].{ data: @ptr_from_int(*mut *mut wo.Unit, 0), len: 0,
+                                                                      cap: 0 };
+pub let mut g_wmembers: u.List.[*mut wo.Unit] = u.List.[*mut wo.Unit].{ data: @ptr_from_int(*mut *mut wo.Unit, 0),
+                                                                        len: 0, cap: 0 };
+/// The -L directories, and the libraries named with -l (in order) that are
+/// not static archives (those are read into g_members).
+pub let mut g_dirs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+pub let mut g_names: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+/// Did load() read anything (objects, members or libraries)?
+pub let mut g_any: bool = false;
+
+fn machine() u32 {
+    if tg.g_arch == tg.ARCH_A64 {
+        return elf.EM_AARCH64;
+    }
+    return elf.EM_X86_64;
+}
+
+fn err(msg: []u8) void {
+    u.eprint(u.f1("axiom: link error: %s\n", msg));
+}
+
+/// Reads the inputs: `paths` (objects, archives, shared libraries, linker
+/// scripts), and `flags` (-L<dir>, -l<name>: a library by name, its
+/// archive's members or its shared object). False after an error
+/// (reported).
+pub fn load(paths: [][]u8, flags: [][]u8) bool {
+    let mut ok = true;
+    for f in flags {
+        if u.starts(f, "-L") {
+            g_dirs.push(f[2..]);
+        }
+    }
+    for p in paths {
+        ok = add_path(p, 0) and ok;
+    }
+    for f in flags {
+        if not u.starts(f, "-l") {
+            continue;
+        }
+        let name = f[2..];
+        if ty.g_target.is_wasm {
+            // (an archive of WebAssembly objects, in the -L directories)
+            let mut found = false;
+            for d in g_dirs.items() {
+                let p = u.f2("%s/lib%s.a", d, name);
+                if not found and u.file_exists(p) {
+                    ok = add_path(p, 0) and ok;
+                    found = true;
+                }
+            }
+            if not found {
+                err(u.f1("cannot find library '%s' (lib%s.a in the -L directories)", name));
+                ok = false;
+            }
+            continue;
+        }
+        if (tg.g_os != tg.OS_LINUX) or el_libc_part(name) {
+            g_names.push(name);  // (the other systems' libraries: their linkers)
+            continue;
+        }
+        let p = el.find_library(name, g_dirs.items(), machine());
+        if u.isnos(p) or (p.len == 0) {
+            err(u.f1("cannot find library '%s'", name));
+            ok = false;
+            continue;
+        }
+        if u.ends(p, ".a") {
+            ok = add_path(p, 0) and ok;
+        } else {
+            g_names.push(name);  // (a shared object or script: elink.load_libs reads it)
+        }
+    }
+    if ((g_objs.len + g_members.len) > 0) and not ty.g_target.is_wasm {
+        // the platform toolchain's compiler runtime, which its objects call
+        // (complex arithmetic, 128-bit integers, AArch64's out-of-line
+        // atomics, ...): its archives, from which a member is linked only
+        // where nothing else defines what an object needs, as the system's
+        // linker links them
+        for a in runtime_archives() {
+            ok = add_path(a, 0) and ok;
+        }
+    }
+    g_any = (g_objs.len + g_members.len + g_shlibs.len + g_wunits.len + g_wmembers.len) > 0;
+    return ok;
+}
+
+fn is_wasm_object(d: []u8) bool {
+    return (d.len >= 8) and u.str_eq(d[0..4], "\x00asm");
+}
+
+fn read_wasm(d: []u8, name: []u8) *mut wo.Unit {
+    let un = wo.read_object(d);
+    if u.isnil(un) {
+        err(u.f1("cannot read the WebAssembly object '%s'", name));
+        return un;
+    }
+    if un.wasm64 != (ty.g_target.ptr_bits == 64) {
+        err(u.f2("'%s' is not an object for %s", name, u.pick(ty.g_target.ptr_bits == 64, "wasm64", "wasm32")));
+        return u.nil.[wo.Unit]();
+    }
+    return un;
+}
+
+// The archives of the system C compiler's runtime for the target
+// (libgcc.a, libgcc_eh.a: the directory of its newest version), if any.
+fn runtime_archives() [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    let triple = u.pick(machine() == elf.EM_AARCH64, "aarch64-linux-gnu", "x86_64-linux-gnu");
+    for base in ["/usr/lib/gcc", "/usr/lib/gcc-cross"] {
+        let dir = u.f2("%s/%s", base, triple);
+        let mut vers = u.List.[[]u8].empty();
+        if not u.list_dir(dir, &mut vers) {
+            continue;
+        }
+        let mut best: []u8 = "";
+        let mut best_v: i64 = -1;
+        for v in vers.items() {
+            let n = u.atol(v);
+            if (n > best_v) and u.file_exists(u.f2("%s/%s/libgcc.a", dir, v)) {
+                best_v = n;
+                best = v;
+            }
+        }
+        if best_v >= 0 {
+            for f in ["libgcc.a", "libgcc_eh.a"] {
+                let p = u.f3("%s/%s/%s", dir, best, f);
+                if u.file_exists(p) {
+                    out.push(p);
+                }
+            }
+            break;
+        }
+    }
+    return out.items();
+}
+
+// The libraries of the system's C library itself (elink.ax: is_libc_part).
+fn el_libc_part(name: []u8) bool {
+    for x in ["c", "m", "pthread", "dl", "rt"] {
+        if u.str_eq(x, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// One input by path: what it is is read from its contents.
+fn add_path(p: []u8, depth: i32) bool {
+    let d = u.read_file(p);
+    if u.isnos(d) {
+        err(u.f1("cannot read '%s'", p));
+        return false;
+    }
+    if ar.is_archive(d) {
+        let mut ok = true;
+        let ms = ar.read(d, p, &mut ok);
+        if not ok {
+            err(u.f1("'%s' is not a valid archive", p));
+            return false;
+        }
+        for m in ms.items() {
+            if is_wasm_object(m.data) {
+                let w = read_wasm(m.data, u.f2("%s(%s)", p, m.name));
+                if u.isnil(w) {
+                    return false;
+                }
+                g_wmembers.push(w);
+                continue;
+            }
+            if u.ends(m.name, ".o") or elf.is_object(m.data) {
+                let o = read_object(m.data, u.f2("%s(%s)", p, m.name));
+                if u.isnil(o) {
+                    return false;
+                }
+                g_members.push(o);
+            }
+            // (other members, such as a toolchain's notes, are not objects)
+        }
+        return true;
+    }
+    if is_wasm_object(d) {
+        let w = read_wasm(d, p);
+        if u.isnil(w) {
+            return false;
+        }
+        g_wunits.push(w);
+        return true;
+    }
+    if elf.is_object(d) {
+        let o = read_object(d, p);
+        if u.isnil(o) {
+            return false;
+        }
+        g_objs.push(o);
+        return true;
+    }
+    if (d.len >= 18) and u.str_eq(d[0..4], "\x7fELF") {
+        if bn_rd16(d, 16) == 3 {
+            g_shlibs.push(p);  // ET_DYN: a shared library
+            return true;
+        }
+        err(u.f1("'%s' is not a relocatable object or a shared library", p));
+        return false;
+    }
+    // a linker script (INPUT, GROUP)
+    let mut ok = true;
+    let files = el.script_inputs(d, g_dirs.items(), machine(), &mut ok);
+    if not ok or (files.len == 0) or (depth > 4) {
+        err(u.f1("'%s' is not an object, an archive or a library this linker reads", p));
+        return false;
+    }
+    for f in files.items() {
+        if u.ends(f, ".a") {
+            ok = add_path(f, depth + 1) and ok;
+        } else {
+            g_shlibs.push(f);
+        }
+    }
+    return ok;
+}
+
+fn bn_rd16(d: []u8, off: usize) u64 {
+    return @as(u64, d[off]) | (@as(u64, d[off + 1]) << 8);
+}
+
+fn read_object(d: []u8, name: []u8) *mut elf.Obj {
+    let o = elf.read(d);
+    if u.isnil(o) {
+        err(u.f1("cannot read the object '%s'", name));
+        return o;
+    }
+    if o.machine != machine() {
+        err(u.f2("'%s' is not an object for %s", name, tg.os_target_name()));
+        return u.nil.[elf.Obj]();
+    }
+    o.name = name;
+    return o;
+}
+
+/// The names the inputs refer to and do not define (the objects', and
+/// those of the archive members they take), into *out: the program
+/// (the compiler's C library above all) is to define them.
+pub fn refs(out: *mut u.List.[[]u8]) void {
+    let mut defined = u.List.[[]u8].empty();
+    let mut undefined = u.List.[[]u8].empty();
+    for o in g_objs.items() {
+        el.object_names(o, &mut defined, &mut undefined);
+    }
+    for w in g_wunits.items() {
+        unit_names(w, &mut defined, &mut undefined);
+    }
+    let nm = g_members.len + g_wmembers.len;
+    let ms = u.newn.[ar.Syms](nm + 1);
+    for i in 0..nm {
+        let mut ds = u.List.[[]u8].empty();
+        let mut rs = u.List.[[]u8].empty();
+        if i < g_members.len {
+            el.object_names(g_members.get(i), &mut ds, &mut rs);
+        } else {
+            unit_names(g_wmembers.get(i - g_members.len), &mut ds, &mut rs);
+        }
+        ms[i] = ar.Syms.{ defs: ds.items(), refs: rs.items() };
+    }
+    let take = ar.select(ms[0..nm], undefined.items(), defined.items());
+    let mut have = u.SymMap.[u8].{ keys: u.nil.[usize](), vals: u.nil.[u8](), cap: 0, len: 0 };
+    for n in defined.items() {
+        have.put(u.intern(n), 1);
+    }
+    for i in 0..nm {
+        if take[i] {
+            for n in ms[i].defs {
+                have.put(u.intern(n), 1);
+            }
+            for n in ms[i].refs {
+                undefined.push(n);
+            }
+        }
+    }
+    for n in undefined.items() {
+        let k = u.intern(n);
+        if have.get(k) == 0 {
+            have.put(k, 1);
+            out.push(k);
+        }
+    }
+}
+
+/// The names a WebAssembly unit defines (into *defs) and refers to strongly
+/// without defining (into *refs), for archive member selection.
+pub fn unit_names(w: *wo.Unit, defs: *mut u.List.[[]u8], uses: *mut u.List.[[]u8]) void {
+    for i in 0..w.syms.len {
+        let s = w.syms.get(i);
+        if ((s.flags & wo.F_LOCAL) != 0) or (s.name.len == 0) or (s.kind == wo.SYM_TABLE) {
+            continue;
+        }
+        if (s.flags & wo.F_UNDEFINED) == 0 {
+            defs.push(s.name);
+        } else if (s.flags & wo.F_WEAK) == 0 {
+            uses.push(s.name);
+        }
+    }
+}
+
+/// The WebAssembly archive members a link takes (ar.select), for units
+/// `us` (the program's and g_wunits).
+pub fn wasm_members(us: []*mut wo.Unit) u.List.[*mut wo.Unit] {
+    let mut out = u.List.[*mut wo.Unit].empty();
+    if g_wmembers.len == 0 {
+        return out;
+    }
+    let mut defined = u.List.[[]u8].empty();
+    let mut undefined = u.List.[[]u8].empty();
+    for w in us {
+        unit_names(w, &mut defined, &mut undefined);
+    }
+    let ms = u.newn.[ar.Syms](g_wmembers.len + 1);
+    for i in 0..g_wmembers.len {
+        let mut ds = u.List.[[]u8].empty();
+        let mut rs = u.List.[[]u8].empty();
+        unit_names(g_wmembers.get(i), &mut ds, &mut rs);
+        ms[i] = ar.Syms.{ defs: ds.items(), refs: rs.items() };
+    }
+    let take = ar.select(ms[0..g_wmembers.len], undefined.items(), defined.items());
+    for i in 0..g_wmembers.len {
+        if take[i] {
+            out.push(g_wmembers.get(i));
+        }
+    }
+    return out;
+}

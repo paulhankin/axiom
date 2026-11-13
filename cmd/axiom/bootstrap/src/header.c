@@ -158,6 +158,15 @@ bool emit_c_header(const char *path, const char *source_name) {
         cat(&protos, ";\n");
         free(ps.data);
     }
+    // the objects the program exports (spec section 14.5.6): const when Axiom
+    // code cannot change them
+    for (int i = 0; i < g_prog.globals.len; i++) {
+        Decl *d = g_prog.globals.data[i];
+        if (!d->is_export) continue;
+        cat(&protos, "extern ");
+        cat(&protos, decl(&g, d->type, d->name, !d->mut));
+        cat(&protos, ";\n");
+    }
     vec_push(protos, 0);
     vec_push(g.defs, 0);
     FILE *f = fopen(path, "w");

@@ -35,7 +35,7 @@ static void file_put(struct __axc_out *o, const void *p, size_t n) {
 /* vfprintf's work, the lock held. An unbuffered stream is given a buffer
    for the call (7.21.3p3: the characters are to appear "as soon as
    possible", which is at the end of the call, and in one write). */
-int __axc_vfprintf_u(FILE *f, const char *fmt, va_list ap) {
+static int vfprintf_with(FILE *f, const char *fmt, va_list ap, const char **viol) {
     struct __axc_out o;
     unsigned char tmp[1024];
     int r;
@@ -49,6 +49,7 @@ int __axc_vfprintf_u(FILE *f, const char *fmt, va_list ap) {
     o.f = f;
     o.s = NULL;
     o.room = 0;
+    o.viol = viol;
     if (f->__flags & F_NBF) {
         unsigned char *buf = f->__buf;
         size_t size = f->__size;
@@ -65,6 +66,19 @@ int __axc_vfprintf_u(FILE *f, const char *fmt, va_list ap) {
         return r;
     }
     r = __axc_vprintf_core(&o, fmt, ap);
+    return r;
+}
+
+int __axc_vfprintf_u(FILE *f, const char *fmt, va_list ap) {
+    return vfprintf_with(f, fmt, ap, NULL);
+}
+
+/* (Annex K's fprintf_s and its kin: std/c/lib/ext1/) */
+int __axc_vfprintf_x(FILE *f, const char *fmt, va_list ap, const char **viol) {
+    int r;
+    LOCK(f);
+    r = vfprintf_with(f, fmt, ap, viol);
+    UNLOCK(f);
     return r;
 }
 
@@ -112,7 +126,7 @@ static void str_put(struct __axc_out *o, const void *p, size_t n) {
 
 /* 7.21.6.12: at most n - 1 characters and a null (none for n 0); the
    count the whole output would have */
-int vsnprintf(char *__AXC_RESTRICT s, size_t n, const char *__AXC_RESTRICT format, va_list arg) {
+int __axc_vsnprintf_x(char *s, size_t n, const char *format, va_list arg, const char **viol) {
     struct __axc_out o;
     int r;
     char dummy;
@@ -122,10 +136,15 @@ int vsnprintf(char *__AXC_RESTRICT s, size_t n, const char *__AXC_RESTRICT forma
     o.f = NULL;
     o.s = (unsigned char *)(n > 0 ? s : &dummy);
     o.room = n > 0 ? n - 1 : 0;
+    o.viol = viol;
     r = __axc_vprintf_core(&o, format, arg);
     if (n > 0)
         *o.s = 0;
     return r;
+}
+
+int vsnprintf(char *__AXC_RESTRICT s, size_t n, const char *__AXC_RESTRICT format, va_list arg) {
+    return __axc_vsnprintf_x(s, n, format, arg, NULL);
 }
 
 int snprintf(char *__AXC_RESTRICT s, size_t n, const char *__AXC_RESTRICT format, ...) {

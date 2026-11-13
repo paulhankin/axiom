@@ -2,6 +2,8 @@
    for the Axiom compiler's hosted C library (std/c/lib/stdio/). Names that
    a standard does not have are not declared in its mode: snprintf, vscanf
    and the other C99 functions from C99, gets before C11 only. */
+/* (Annex K: whether its names are asked for, K.3.1.1) */
+#include <axc/ext1.h>
 #ifndef __AXIOM_STDIO_H
 #define __AXIOM_STDIO_H
 
@@ -13,12 +15,11 @@
 #define __AXIOM_WANT_SIZE_T
 #include <axc/types.h>
 
-/* the format attribute in the GNU dialects (its arguments are checked, the
-   calls not yet), nothing under an ISO standard */
-#ifdef __AXIOM_GNU__
-#define __AXC_FORMAT(kind, f, a) __attribute__((__format__(kind, f, a)))
-#else
-#define __AXC_FORMAT(kind, f, a)
+/* the format attribute, in every mode (the compiler's own spelling, a
+   reserved identifier): the calls' format strings are checked against
+   their arguments (--c-warn-format) */
+#ifndef __AXC_FORMAT
+#define __AXC_FORMAT(kind, f, a) __axiom_attribute__((__format__(kind, f, a)))
 #endif
 
 #ifndef NULL
@@ -138,6 +139,27 @@ int putchar(int);
 int puts(const char *);
 int ungetc(int, FILE *);
 
+/* getc, putc, getchar and putchar's fast paths (7.21.7.5p2, 7.21.7.8p2:
+   getc and putc may be macros): a byte of a byte-oriented stream's buffer
+   is taken or stored in line while the program has one thread (no thread
+   was ever started: nothing else can use the stream); else, and when the
+   buffer is empty or full (or a new-line ends a line-buffered stream's
+   line), the function. Each macro evaluates its arguments once. */
+__axiom_int64 __axc_sys_threaded(void);
+static int __axc_getc_fast(FILE *__f) {
+    return __f->__rpos < __f->__rend && __f->__orient < 0 && !__axc_sys_threaded() ? (int)*__f->__rpos++ : (getc)(__f);
+}
+static int __axc_putc_fast(int __c, FILE *__f) {
+    return __f->__wpos < __f->__wend && __f->__orient < 0 && ((unsigned char)__c != '\n' || !(__f->__flags & 0x20u)) &&
+                   !__axc_sys_threaded()
+               ? (int)(*__f->__wpos++ = (unsigned char)__c)
+               : (putc)(__c, __f);
+}
+#define getc(stream) __axc_getc_fast(stream)
+#define putc(c, stream) __axc_putc_fast((c), (stream))
+#define getchar() __axc_getc_fast(stdin)
+#define putchar(c) __axc_putc_fast((c), stdout)
+
 /* 7.21.8 direct input/output */
 size_t fread(void *__AXC_RESTRICT, size_t, size_t, FILE *__AXC_RESTRICT);
 size_t fwrite(const void *__AXC_RESTRICT, size_t, size_t, FILE *__AXC_RESTRICT);
@@ -154,5 +176,52 @@ void clearerr(FILE *);
 int feof(FILE *);
 int ferror(FILE *);
 void perror(const char *);
+
+#if __AXC_EXT1
+/* Annex K (K.3.5): the bounds-checking interfaces (std/c/lib/ext1/) */
+#define __AXIOM_WANT_ERRNO_T
+#define __AXIOM_WANT_SIZE_T
+#define __AXIOM_WANT_RSIZE_T
+#include <axc/types.h>
+/* (tmpnam_s's names are tmpnam's) */
+#define L_tmpnam_s L_tmpnam
+#define TMP_MAX_S TMP_MAX
+errno_t tmpfile_s(FILE *__AXC_RESTRICT *__AXC_RESTRICT __streamptr);
+errno_t tmpnam_s(char *__s, rsize_t __maxsize);
+errno_t fopen_s(FILE *__AXC_RESTRICT *__AXC_RESTRICT __streamptr, const char *__AXC_RESTRICT __filename,
+                const char *__AXC_RESTRICT __mode);
+errno_t freopen_s(FILE *__AXC_RESTRICT *__AXC_RESTRICT __newstreamptr, const char *__AXC_RESTRICT __filename,
+                  const char *__AXC_RESTRICT __mode, FILE *__AXC_RESTRICT __stream);
+int fprintf_s(FILE *__AXC_RESTRICT __stream, const char *__AXC_RESTRICT __format, ...);
+int fscanf_s(FILE *__AXC_RESTRICT __stream, const char *__AXC_RESTRICT __format, ...);
+int printf_s(const char *__AXC_RESTRICT __format, ...);
+int scanf_s(const char *__AXC_RESTRICT __format, ...);
+int snprintf_s(char *__AXC_RESTRICT __s, rsize_t __n, const char *__AXC_RESTRICT __format, ...);
+int sprintf_s(char *__AXC_RESTRICT __s, rsize_t __n, const char *__AXC_RESTRICT __format, ...);
+int sscanf_s(const char *__AXC_RESTRICT __s, const char *__AXC_RESTRICT __format, ...);
+int vfprintf_s(FILE *__AXC_RESTRICT __stream, const char *__AXC_RESTRICT __format, __builtin_va_list __arg);
+int vfscanf_s(FILE *__AXC_RESTRICT __stream, const char *__AXC_RESTRICT __format, __builtin_va_list __arg);
+int vprintf_s(const char *__AXC_RESTRICT __format, __builtin_va_list __arg);
+int vscanf_s(const char *__AXC_RESTRICT __format, __builtin_va_list __arg);
+int vsnprintf_s(char *__AXC_RESTRICT __s, rsize_t __n, const char *__AXC_RESTRICT __format, __builtin_va_list __arg);
+int vsprintf_s(char *__AXC_RESTRICT __s, rsize_t __n, const char *__AXC_RESTRICT __format, __builtin_va_list __arg);
+int vsscanf_s(const char *__AXC_RESTRICT __s, const char *__AXC_RESTRICT __format, __builtin_va_list __arg);
+char *gets_s(char *__s, rsize_t __n);
+#if __STDC_VERSION__ >= 202311L
+/* (C23 mode: %i takes the 0b prefix, as fscanf's does) */
+int __axc_fscanf_s_c23(FILE *restrict, const char *restrict, ...);
+int __axc_scanf_s_c23(const char *restrict, ...);
+int __axc_sscanf_s_c23(const char *restrict, const char *restrict, ...);
+int __axc_vfscanf_s_c23(FILE *restrict, const char *restrict, __builtin_va_list);
+int __axc_vscanf_s_c23(const char *restrict, __builtin_va_list);
+int __axc_vsscanf_s_c23(const char *restrict, const char *restrict, __builtin_va_list);
+#define fscanf_s(...) __axc_fscanf_s_c23(__VA_ARGS__)
+#define scanf_s(...) __axc_scanf_s_c23(__VA_ARGS__)
+#define sscanf_s(...) __axc_sscanf_s_c23(__VA_ARGS__)
+#define vfscanf_s(...) __axc_vfscanf_s_c23(__VA_ARGS__)
+#define vscanf_s(...) __axc_vscanf_s_c23(__VA_ARGS__)
+#define vsscanf_s(...) __axc_vsscanf_s_c23(__VA_ARGS__)
+#endif
+#endif
 
 #endif

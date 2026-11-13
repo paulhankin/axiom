@@ -15,6 +15,7 @@
 // =============================================================================
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "cldbl.ax" as cl;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 import "cwide.ax" as cw;
@@ -90,13 +91,24 @@ pub fn value(x: *cast.Expr, f: u32, ld_fmt: u32) ld.W {
         return d.from_u64(x.cval, f, &mut c);
     }
     if cty.is_wide(t) or (cty.is_complex(t) and cty.is_wide(t.unq.elem)) {
-        return d.from_bin(x.xv, ld_fmt, f, &mut c);  // (of a complex value: its real part, 6.3.1.7)
+        // (of a complex value: its real part, 6.3.1.7; long double's format,
+        // or _Float128's, _Float64x's: cty.ffmt)
+        return d.from_bin(x.xv, wide_fmt(t, ld_fmt), f, &mut c);
     }
-    if t.unq.kind == cty.TK_FLOAT {
+    if cty.ffmt(t) == 32 {
         let b = @as(u64, @bit_cast(u32, @float_cast(f32, x.fcval)));
         return d.from_bin(ld.W.{ lo: b, hi: 0 }, d.B_F32, f, &mut c);
     }
     return d.from_bin(ld.W.{ lo: @bit_cast(u64, x.fcval), hi: 0 }, d.B_F64, f, &mut c);
+}
+
+// The format (ldouble.ax's) of a wide binary type t: long double's
+// (ld_fmt) or an interchange or extended type's (_Float128, _Float64x).
+fn wide_fmt(t: *cty.CType, ld_fmt: u32) u32 {
+    if cty.ffmt(t) == 0 {
+        return ld_fmt;
+    }
+    return cl.fmt_of(cty.ffmt(t));
 }
 
 /// Is constant x (decimal) nonzero (a NaN is)?
@@ -148,9 +160,9 @@ pub fn convert(e: *mut cast.Expr, x: *cast.Expr, ld_fmt: u32) void {
         e.fcimag = 0.0;
         e.xvim = ld.W.{ lo: 0, hi: 0 };
         if cty.is_wide(el) {
-            e.xv = d.to_bin(x.xv, f, ld_fmt, &mut c);
+            e.xv = d.to_bin(x.xv, f, wide_fmt(el, ld_fmt), &mut c);
             e.fcval = approx(x.xv, f);
-        } else if el.kind == cty.TK_FLOAT {
+        } else if cty.ffmt(el) == 32 {
             e.fcval = @as(f64, @bit_cast(f32, @truncate(u32, d.to_bin(x.xv, f, d.B_F32, &mut c).lo)));
         } else {
             e.fcval = @bit_cast(f64, d.to_bin(x.xv, f, d.B_F64, &mut c).lo);
@@ -159,11 +171,18 @@ pub fn convert(e: *mut cast.Expr, x: *cast.Expr, ld_fmt: u32) void {
     }
     if cty.is_wide(to) {
         e.is_const = true;
-        e.xv = d.to_bin(x.xv, f, ld_fmt, &mut c);
+        e.xv = d.to_bin(x.xv, f, wide_fmt(to, ld_fmt), &mut c);
         e.fcval = approx(x.xv, f);
         return;
     }
-    if to.unq.kind == cty.TK_FLOAT {
+    if cty.is_half(to) {
+        // (through binary128, as at run time: cgen_expr.ax's convert)
+        e.is_const = true;
+        let q = d.to_bin(x.xv, f, ld.FMT_Q, &mut c);
+        e.fcval = cl.half_value(cl.to_half(q, ld.FMT_Q));
+        return;
+    }
+    if cty.ffmt(to) == 32 {
         e.is_const = true;
         e.fcval = @as(f64, @bit_cast(f32, @truncate(u32, d.to_bin(x.xv, f, d.B_F32, &mut c).lo)));
         return;
@@ -237,8 +256,8 @@ pub fn exact(e: *cast.Expr, t: *mut cty.CType, ld_fmt: u32) bool {
                 _ = d.from_u64(e.cval, f, &mut c);
             }
         } else if cty.is_wide(from) {
-            _ = d.from_bin(e.xv, ld_fmt, f, &mut c);
-        } else if from.unq.kind == cty.TK_FLOAT {
+            _ = d.from_bin(e.xv, wide_fmt(from, ld_fmt), f, &mut c);
+        } else if cty.ffmt(from) == 32 {
             let b = @as(u64, @bit_cast(u32, @float_cast(f32, e.fcval)));
             _ = d.from_bin(ld.W.{ lo: b, hi: 0 }, d.B_F32, f, &mut c);
         } else if cty.is_floating(from) {
@@ -252,8 +271,12 @@ pub fn exact(e: *cast.Expr, t: *mut cty.CType, ld_fmt: u32) bool {
     let el = cty.real_of(t);
     let f = fmt(e.ty);
     if cty.is_wide(el) {
-        _ = d.to_bin(e.xv, f, ld_fmt, &mut c);
-    } else if el.kind == cty.TK_FLOAT {
+        _ = d.to_bin(e.xv, f, wide_fmt(el, ld_fmt), &mut c);
+    } else if cty.is_half(el) {
+        // (exact in binary64, and that value a binary16 one)
+        let x = @bit_cast(f64, d.to_bin(e.xv, f, d.B_F64, &mut c).lo);
+        return ((c.flags & d.F_INEXACT) == 0) and ((cl.round_half(x) == x) or (x != x));
+    } else if cty.ffmt(el) == 32 {
         _ = d.to_bin(e.xv, f, d.B_F32, &mut c);
     } else {
         _ = d.to_bin(e.xv, f, d.B_F64, &mut c);

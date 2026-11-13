@@ -45,20 +45,15 @@ char *fgets(char *__AXC_RESTRICT s, int n, FILE *__AXC_RESTRICT stream) {
         unsigned char *r = stream->__rpos;
         if (r < stream->__rend) {
             size_t k = (size_t)(stream->__rend - r);
-            const unsigned char *nl;
+            uint64_t got;
             if (k > left)
                 k = left;
-            nl = __axc_find_byte(r, '\n', k);
-            if (nl != NULL) {
-                k = (size_t)(nl - r) + 1;
-                __axc_sys_copy(p, r, k);
-                p += k;
-                stream->__rpos = r + k;
-                goto done;
-            }
-            __axc_sys_copy(p, r, k);
+            got = __axc_sys_line((unsigned char *)p, r, k);
+            k = (size_t)(got & ~((uint64_t)1 << 63));
             p += k;
             stream->__rpos = r + k;
+            if (got >> 63)
+                goto done;
             left -= k;
             continue;
         }

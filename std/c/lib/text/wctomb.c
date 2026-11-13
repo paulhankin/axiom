@@ -5,7 +5,7 @@
 #include <wchar.h>
 
 int wctomb(char *s, wchar_t wc) {
-    static mbstate_t internal;
+    static _Thread_local mbstate_t internal; /* (each thread's: free of data races) */
     size_t r;
     if (!s) {
         mbstate_t initial = {0};

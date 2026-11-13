@@ -242,6 +242,10 @@ static const char *cat_name(ExprCat c) {
 static void func_to_value(Expr *e) {
     Decl *fn = e->decl;
     if (fn->kind == D_HOST_FN) {
+        if (fn->cabi)
+            diag_error(e->span, "E0801",
+                       "the C function '%s' takes or returns a structure by value: it can only be called, not used as a function value",
+                       fn->name);
         e->cat = CAT_VALUE;
         e->type = fn->type;
         return;

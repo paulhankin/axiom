@@ -32,14 +32,17 @@ import "util.ax" as u;
 
 // The C library's heap, which the hosted C library's malloc uses when the
 // system's C library is linked (std/c/rt/core_alloc.ax), so that the two
-// libraries' allocations are one heap's.
-let HEAP: [5][]u8 = ["__libc_malloc", "__libc_calloc", "__libc_realloc", "__libc_free", "__libc_memalign"];
+// libraries' allocations are one heap's; and its errno's storage, which the
+// hosted library's errno is then (std/c/rt/core_errno.ax: the system's
+// __errno_location, under the name elink.ax binds to it).
+let HEAP: [6][]u8 = ["__libc_malloc", "__libc_calloc", "__libc_realloc", "__libc_free", "__libc_memalign",
+                     "__axiom_libc___errno_location"];
 
 // The C library functions the runtime uses when it is linked (and only then).
 pub fn libc_only(name: []u8) bool {
     let names = ["pthread_create", "pthread_attr_init", "pthread_attr_setdetachstate", "pthread_attr_destroy",
                  "pthread_exit", "__libc_start_main", "__libc_malloc", "__libc_calloc", "__libc_realloc", "__libc_free",
-                 "__libc_memalign"];
+                 "__libc_memalign", "__axiom_libc___errno_location"];
     for n in names {
         if u.str_eq(n, name) {
             return true;
@@ -169,7 +172,8 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
                 bytes(o, text, "\x31\xc0\xc3");  // return 0
             }
         }
-        jstub.add(o, text, machine, false);
+        jstub.add(o, text, machine, false);  // (no longjmp with jstub.g_system_jmp)
+        jmp_aliases(o, false);
         return o;
     }
     // AArch64: x8 = n; x0..x5 = a..f
@@ -214,8 +218,29 @@ pub fn build(machine: u32, static: bool) *mut elf.Obj {
             words(o, text, z[..]);
         }
     }
-    jstub.add(o, text, machine, false);
+    jstub.add(o, text, machine, false);  // (no longjmp with jstub.g_system_jmp)
+    jmp_aliases(o, true);
     return o;
+}
+
+// The names under which an object compiled against the system C library's
+// <setjmp.h> calls setjmp (_setjmp, and __sigsetjmp, whose second argument,
+// whether to save the signal mask, this library's ignores: it saves none)
+// and longjmp with checks (__longjmp_chk): with this compiler's C library
+// they are its (jmp_buf is smaller than the system's: 32 words of the
+// system's 25 on x86-64 and 39 on AArch64, so its objects' buffers hold
+// it). Weak, like the functions.
+fn jmp_aliases(o: *mut elf.Obj, a64: bool) void {
+    _ = a64;
+    let sj = o.symmap.get(u.intern("__axc_setjmp"));
+    if (sj == 0) or jstub.g_system_jmp {
+        return;  // (with the system's C library, its setjmp)
+    }
+    let s = o.syms.get(@as(usize, sj - 1));
+    for n in ["_setjmp", "__sigsetjmp"] {
+        _ = elf.add_sym(o, elf.Sym.{ name: n, sec: s.sec, value: s.value, size: 0, bind: elf.B_WEAK, ty: elf.T_FUNC,
+                                     hidden: false });
+    }
 }
 
 // The static program's entry: saves the stack pointer, sets the thread

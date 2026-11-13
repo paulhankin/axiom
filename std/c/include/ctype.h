@@ -7,21 +7,21 @@
 #ifndef __AXIOM_CTYPE_H
 #define __AXIOM_CTYPE_H
 
-int isalnum(int c);
-int isalpha(int c);
+int isalnum(int __c);
+int isalpha(int __c);
 #if __STDC_VERSION__ >= 199901L
-int isblank(int c);
+int isblank(int __c);
 #endif
-int iscntrl(int c);
-int isdigit(int c);
-int isgraph(int c);
-int islower(int c);
-int isprint(int c);
-int ispunct(int c);
-int isspace(int c);
-int isupper(int c);
-int isxdigit(int c);
-int tolower(int c);
-int toupper(int c);
+int iscntrl(int __c);
+int isdigit(int __c);
+int isgraph(int __c);
+int islower(int __c);
+int isprint(int __c);
+int ispunct(int __c);
+int isspace(int __c);
+int isupper(int __c);
+int isxdigit(int __c);
+int tolower(int __c);
+int toupper(int __c);
 
 #endif

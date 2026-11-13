@@ -22,8 +22,7 @@ static void wfile_put(struct __axc_out *o, const void *p, size_t n) {
     }
 }
 
-int vfwprintf(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format, va_list arg) {
-    FILE *f = stream;
+int __axc_vfwprintf_x(FILE *f, const wchar_t *format, va_list arg, const char **viol) {
     struct __axc_out o;
     unsigned char tmp[1024];
     int r;
@@ -39,6 +38,7 @@ int vfwprintf(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format,
     o.f = f;
     o.s = NULL;
     o.room = 0;
+    o.viol = viol;
     if (f->__flags & F_NBF) {
         /* (a buffer for the call, as vfprintf gives one) */
         unsigned char *buf = f->__buf;
@@ -58,6 +58,10 @@ int vfwprintf(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format,
     }
     UNLOCK(f);
     return r;
+}
+
+int vfwprintf(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format, va_list arg) {
+    return __axc_vfwprintf_x(stream, format, arg, NULL);
 }
 
 int fwprintf(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format, ...) {
@@ -94,21 +98,32 @@ static void wstr_put(struct __axc_out *o, const void *p, size_t n) {
     o->count += n;
 }
 
-/* 7.29.2.7: at most n - 1 wide characters and a null; a negative value if
-   n or more were to be written */
-int vswprintf(wchar_t *__AXC_RESTRICT s, size_t n, const wchar_t *__AXC_RESTRICT format, va_list arg) {
+/* At most n - 1 wide characters and a null (none for n 0); the count the
+   whole output would have (vsnprintf's rules, for Annex K's functions) */
+int __axc_vswprintf_x(wchar_t *s, size_t n, const wchar_t *format, va_list arg, const char **viol) {
     struct __axc_out o;
     int r;
-    if (n == 0)
-        return -1;
+    wchar_t dummy;
     o.put = wstr_put;
     o.count = 0;
     o.failed = 0;
     o.f = NULL;
-    o.s = (unsigned char *)(void *)s;
-    o.room = n - 1;
+    o.s = (unsigned char *)(void *)(n > 0 ? s : &dummy);
+    o.room = n > 0 ? n - 1 : 0;
+    o.viol = viol;
     r = __axc_vwprintf_core(&o, format, arg);
-    *(wchar_t *)(void *)o.s = 0;
+    if (n > 0)
+        *(wchar_t *)(void *)o.s = 0;
+    return r;
+}
+
+/* 7.29.2.7: at most n - 1 wide characters and a null; a negative value if
+   n or more were to be written */
+int vswprintf(wchar_t *__AXC_RESTRICT s, size_t n, const wchar_t *__AXC_RESTRICT format, va_list arg) {
+    int r;
+    if (n == 0)
+        return -1;
+    r = __axc_vswprintf_x(s, n, format, arg, NULL);
     if (r >= 0 && (size_t)r >= n)
         return -1;
     return r;

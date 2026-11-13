@@ -175,6 +175,156 @@ fn need_struct(g: *mut HeaderGen, t: *mut ast.Type) void {
     g.emitted.push(t);
 }
 
+fn join(xs: [][]u8) []u8 {
+    let mut b = u.Buf.init();
+    for i in 0..xs.len {
+        if i != 0 {
+            b.s(", ");
+        }
+        b.s(xs[i]);
+    }
+    return b.done();
+}
+
+// The parameter list of d's C prototype; `names`: with its parameters'
+// names.
+fn params_of(g: *mut HeaderGen, d: *ast.Decl, names: bool) []u8 {
+    let mut ps = u.Buf.init();
+    if d.params.len == 0 {
+        ps.s("void");
+    }
+    for j in 0..d.params.len {
+        if j != 0 {
+            ps.s(", ");
+        }
+        ps.s(decl(g, d.param_types[j], u.pick(names, u.f1("p%s", u.zdec(j)), ""), false));
+    }
+    if d.variadic {
+        ps.s(", ...");
+    }
+    return ps.done();
+}
+
+/// Does the program have C functions with structures by value (spec
+/// §14.5.3: ast.Decl's cabi), which need cabi_source's wrappers?
+pub fn has_cabi() bool {
+    for i in 0..sema.g_prog.fns.len {
+        if sema.g_prog.fns.get(i).cabi {
+            return true;
+        }
+    }
+    for i in 0..sema.g_prog.host_fns.len {
+        if sema.g_prog.host_fns.get(i).cabi {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The C translation unit of the wrappers of the program's C functions that
+/// take or return structures by value (spec §14.5.3), which the compiler's
+/// C front end compiles with the program, so that they travel as the
+/// target's C ABI says (c/cgen_abi.ax): for an extern "C" function f, a
+/// function __axiom_cabi_f that takes the structures by pointer (and the
+/// result's memory first) and calls f; for an export g, the C function g,
+/// which calls the Axiom function the code generator gives the same
+/// pointer convention (__axiom_cabi_impl_g: codegen.ax, emit_cabi_thunks).
+/// The structures are defined as the header defines them (C's layout of
+/// the same members, spec §5.9).
+pub fn cabi_source() []u8 {
+    let g = u.new.[HeaderGen]();
+    let mut fns = u.Buf.init();
+    let mut ds = u.List.[*mut ast.Decl].empty();
+    for i in 0..sema.g_prog.host_fns.len {
+        ds.push(sema.g_prog.host_fns.get(i));
+    }
+    for i in 0..sema.g_prog.fns.len {
+        ds.push(sema.g_prog.fns.get(i));
+    }
+    for d in ds.items() {
+        if not d.cabi {
+            continue;
+        }
+        let sret = d.ret_type.kind == ast.TY_STRUCT;
+        // the wrapper side's parameters (the structures by pointer, the
+        // result's memory first) and the arguments of the call it makes
+        let mut cpl = u.List.[[]u8].empty();
+        let mut al = u.List.[[]u8].empty();
+        if sret {
+            cpl.push(decl(g, d.ret_type, "*r", false));
+        }
+        for j in 0..d.params.len {
+            let pt = d.param_types[j];
+            let pn = u.f1("p%s", u.zdec(j));
+            if pt.kind == ast.TY_STRUCT {
+                cpl.push(decl(g, pt, u.cat2("*", pn), true));
+                al.push(u.cat2("*", pn));
+            } else {
+                cpl.push(decl(g, pt, pn, false));
+                al.push(pn);
+            }
+        }
+        let mut cps = join(cpl.items());
+        if cpl.len == 0 {
+            cps = "void";
+        }
+        let call_args = join(al.items());
+        if d.kind == ast.D_HOST_FN {
+            // f's prototype (the C ABI's), and its wrapper
+            fns.s(decl(g, d.ret_type, u.f2("%s(%s)", d.name, params_of(g, d, false)), false));
+            fns.s(";\n");
+            if sret {
+                fns.s(u.f4("void __axiom_cabi_%s(%s) { *r = %s(%s); }\n", d.name, cps, d.name, call_args));
+            } else if d.ret_type.kind == ast.TY_VOID {
+                fns.s(u.f4("void __axiom_cabi_%s(%s) { %s(%s); }\n", d.name, cps, d.name, call_args));
+            } else {
+                fns.s(decl(g, d.ret_type, u.f2("__axiom_cabi_%s(%s)", d.name, cps), false));
+                fns.s(u.f2(" { return %s(%s); }\n", d.name, call_args));
+            }
+            continue;
+        }
+        // an export: the Axiom function by pointer, and g with C's ABI
+        let mut amps = u.Buf.init();  // the Axiom function's arguments: the structures' addresses
+        if sret {
+            amps.s("&r");
+        }
+        for j in 0..d.params.len {
+            if (j != 0) or sret {
+                amps.s(", ");
+            }
+            if d.param_types[j].kind == ast.TY_STRUCT {
+                amps.s(u.f1("&p%s", u.zdec(j)));
+            } else {
+                amps.s(u.f1("p%s", u.zdec(j)));
+            }
+        }
+        let impl_params = cps;
+        if sret or (d.ret_type.kind == ast.TY_VOID) {
+            fns.s(u.f2("void __axiom_cabi_impl_%s(%s);\n", d.name, impl_params));
+        } else {
+            fns.s(decl(g, d.ret_type, u.f2("__axiom_cabi_impl_%s(%s)", d.name, impl_params), false));
+            fns.s(";\n");
+        }
+        fns.s(decl(g, d.ret_type, u.f2("%s(%s)", d.name, params_of(g, d, true)), false));
+        if sret {
+            fns.s(
+                u.f3(" {\n    %s;\n    __axiom_cabi_impl_%s(%s);\n    return r;\n}\n", decl(g, d.ret_type, "r", false),
+                     d.name, amps.done()));
+        } else if d.ret_type.kind == ast.TY_VOID {
+            fns.s(u.f2(" { __axiom_cabi_impl_%s(%s); }\n", d.name, amps.done()));
+        } else {
+            fns.s(u.f2(" { return __axiom_cabi_impl_%s(%s); }\n", d.name, amps.done()));
+        }
+    }
+    let mut out = u.Buf.init();
+    out.s("/* The wrappers of the program's C functions with structures by value (generated by axiom). */\n");
+    out.s("#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n");
+    out.s("#define AXIOM_STATIC_ASSERT _Static_assert\n#define AXIOM_ALIGNAS(n) _Alignas(n)\n\n");
+    out.s(g.defs.done());
+    out.s(fns.done());
+    return out.done();
+}
+
 fn to_upper(s: []u8) []u8 {
     let r = u.dup(s);
     let m = @slice_from_ptr(@ptr_from_int(*mut u8, @int_from_ptr(r.ptr)), r.len);
@@ -192,8 +342,8 @@ pub fn emit_c_header(path: []u8, source_name: []u8) bool {
     let fns = sema.g_prog.fns;
     for i in 0..fns.len {
         let d = fns.get(i);
-        if not d.is_export {
-            continue;
+        if not d.is_export or sema.is_std_module(d.module) {
+            continue;  // (the standard library's, the C library's run-time layer among them: not the program's)
         }
         let mut ps = u.Buf.init();
         if d.params.len == 0 {
@@ -206,6 +356,17 @@ pub fn emit_c_header(path: []u8, source_name: []u8) bool {
             ps.s(decl(g, d.param_types[j], d.params.at(j).name, false));
         }
         protos.s(decl(g, d.ret_type, u.f2("%s(%s)", d.name, ps.done()), false));
+        protos.s(";\n");
+    }
+    // the objects the program exports (spec §14.5.6): const when Axiom
+    // code cannot change them
+    for i in 0..sema.g_prog.globals.len {
+        let d = sema.g_prog.globals.get(i);
+        if not d.is_export or sema.is_std_module(d.module) {
+            continue;
+        }
+        protos.s("extern ");
+        protos.s(decl(g, d.ty, d.name, not d.is_mut));
         protos.s(";\n");
     }
     let guard = to_upper(u.f1("AXIOM_%s_H", sanitize(source_name)));

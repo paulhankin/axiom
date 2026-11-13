@@ -58,7 +58,8 @@ int32_t ax_open(const uint8_t *path, size_t len, uint32_t flags) {
     int f = b == 1 ? O_WRONLY | O_CREAT | O_TRUNC : b == 2 ? O_WRONLY | O_CREAT | O_APPEND : b == 3 ? O_RDWR
         : b == 4 ? O_RDWR | O_CREAT | O_TRUNC : b == 5 ? O_RDWR | O_CREAT | O_APPEND : O_RDONLY;
     if (flags & 8) f |= O_EXCL;
-    int fd = open(buf, f | O_CLOEXEC, 0644);
+    // (16: a file created can be read and written by its owner alone)
+    int fd = open(buf, f | O_CLOEXEC, (flags & 16) ? 0600 : 0644);
     if (fd >= 0) return fd;
     return errno == ENOENT ? -2 : errno == EACCES ? -13 : errno == EEXIST ? -17 : errno == EISDIR ? -21 : AX_ERR;
 }
@@ -1031,11 +1032,12 @@ int32_t ax_random(uint8_t *p, size_t n) {
     return 0;
 }
 
-// Nanoseconds on clock 0 (real time since 1970), 1 (monotonic) or 2 (the
-// processor time of the process).
+// Nanoseconds on clock 0 (real time since 1970), 1 (monotonic), 2 (the
+// processor time of the process) or 3 (that of the calling thread).
 int64_t ax_clock_ns(uint32_t clock) {
     struct timespec ts;
-    clock_gettime(clock == 1 ? CLOCK_MONOTONIC : clock == 2 ? CLOCK_PROCESS_CPUTIME_ID : CLOCK_REALTIME, &ts);
+    clock_gettime(clock == 1 ? CLOCK_MONOTONIC : clock == 2 ? CLOCK_PROCESS_CPUTIME_ID
+        : clock == 3 ? CLOCK_THREAD_CPUTIME_ID : CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 

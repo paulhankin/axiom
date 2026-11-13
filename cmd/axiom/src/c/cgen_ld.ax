@@ -1,6 +1,8 @@
 // =============================================================================
 // cgen_ld.ax - IR generation for long double where it is wider than double
-// (cty.is_wide: --c-long-double=80, the x87's format, or 128, binary128):
+// (cty.is_wide: --c-long-double=80, the x87's format, or 128, binary128), and
+// _Float128 and _Float64x (Annex H: binary128, or the x87's format), each in
+// its own format:
 // its arithmetic, comparisons and conversions as calls of
 // std/c/rt/ldouble.ax's functions, which codegen.ax generates into the
 // module (cg.ld_fn), so that only those a program uses are in it.
@@ -20,8 +22,9 @@ import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 import "std/c/rt/ldouble" as ld;
 
-fn fmt() u32 {
-    return cc.ld_fmt();
+// The format (ldouble.ax's FMT_) of wide floating type t.
+fn fmt(t: *cty.CType) u32 {
+    return cc.fmt_t(t);
 }
 
 fn i32t() *mut ir.Ty {
@@ -32,15 +35,15 @@ fn i64t() *mut ir.Ty {
     return ir.t_int(64);
 }
 
-fn fmt_arg() *mut ir.Value {
-    return ir.cint(i32t(), @as(u64, fmt()));
+fn fmt_arg(t: *cty.CType) *mut ir.Value {
+    return ir.cint(i32t(), @as(u64, fmt(t)));
 }
 
-/// A new temporary for a long double value (or a _Decimal128's, which
-/// cgen_dec.ax handles as these: 16 bytes aligned to 16, whatever long
-/// double is).
+/// A new temporary for a wide floating value (16 bytes aligned to 16,
+/// whichever format: long double, _Float128, _Float64x; or a _Decimal128's,
+/// which cgen_dec.ax handles as these).
 pub fn temp() *mut ir.Value {
-    return cg.alloca(cty.t_dec128, "ld");
+    return cg.alloca(cty.t_float128, "ld");
 }
 
 // A call of ldouble.ax's function `name` with arguments xs.
@@ -111,8 +114,8 @@ pub fn snapshot(p: *mut ir.Value, volatile: bool) *mut ir.Value {
     return t;
 }
 
-/// x op y (+ - * /).
-pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+/// x op y (+ - * /), of wide floating type t.
+pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     let mut name: []u8 = "add";
     if op == ct.P_MINUS {
         name = "sub";
@@ -122,7 +125,7 @@ pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
         name = "div";
     }
     let r = temp();
-    let mut xs: [4]*mut ir.Value = [r, x, y, fmt_arg()];
+    let mut xs: [4]*mut ir.Value = [r, x, y, fmt_arg(t)];
     _ = call(name, xs[..]);
     return r;
 }
@@ -130,25 +133,25 @@ pub fn arith(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
 /// The product (name "cmul") or quotient ("cdiv") of the complex values
 /// a + ib and c + id, as ldouble.ax computes them (C99 G.5.1): the
 /// addresses of its parts.
-pub fn complex_call(name: []u8, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value,
-                    d: *mut ir.Value) [2]*mut ir.Value {
+pub fn complex_call(name: []u8, a: *mut ir.Value, b: *mut ir.Value, c: *mut ir.Value, d: *mut ir.Value,
+                    t: *cty.CType) [2]*mut ir.Value {
     let re = temp();
     let im = temp();
-    let mut xs: [7]*mut ir.Value = [re, im, a, b, c, d, fmt_arg()];
+    let mut xs: [7]*mut ir.Value = [re, im, a, b, c, d, fmt_arg(t)];
     _ = call(name, xs[..]);
     return [re, im];
 }
 
 /// -x: the sign bit changed (the sign is bit 15 of the second eight bytes
 /// in the x87 format, their bit 63 in binary128).
-pub fn negate(x: *mut ir.Value) *mut ir.Value {
+pub fn negate(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     let r = temp();
     let lo = ir.load(cg.B, i64t(), x);
     lo.align = 8;
     let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
     hi.align = 8;
     let mut nh = ir.vnil();
-    if fmt() == ld.FMT_X {
+    if fmt(t) == ld.FMT_X {
         nh = ir.xor(cg.B, ir.and_(cg.B, hi, ir.cint(i64t(), 0xFFFF)), ir.cint(i64t(), 0x8000));
     } else {
         nh = ir.xor(cg.B, hi, ir.cint(i64t(), 0x8000_0000_0000_0000));
@@ -162,13 +165,13 @@ pub fn negate(x: *mut ir.Value) *mut ir.Value {
 
 /// x != 0, as an i1: a bit other than the sign set (in the x87 format, of
 /// its ten bytes; a NaN is not zero, nor is an invalid encoding).
-pub fn truth(x: *mut ir.Value) *mut ir.Value {
+pub fn truth(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     let lo = ir.load(cg.B, i64t(), x);
     lo.align = 8;
     let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
     hi.align = 8;
     let mut h = ir.vnil();
-    if fmt() == ld.FMT_X {
+    if fmt(t) == ld.FMT_X {
         h = ir.and_(cg.B, hi, ir.cint(i64t(), 0x7FFF));
     } else {
         h = ir.binop(cg.B, ir.OP_SHL, hi, ir.cint(i64t(), 1));
@@ -177,8 +180,8 @@ pub fn truth(x: *mut ir.Value) *mut ir.Value {
 }
 
 /// x op y (< > <= >= == !=), as an i1: false when unordered, but for !=.
-pub fn compare(op: i32, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
-    let mut xs: [3]*mut ir.Value = [x, y, fmt_arg()];
+pub fn compare(op: i32, x: *mut ir.Value, y: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    let mut xs: [3]*mut ir.Value = [x, y, fmt_arg(t)];
     let c = call("cmp", xs[..]);  // -1, 0, 1, or 2 (unordered)
     let m1 = ir.cint(i32t(), 0xFFFF_FFFF);
     let z = ir.cint(i32t(), 0);
@@ -209,7 +212,14 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
     let f = from.unq;
     let t = to.unq;
     if cty.is_wide(f) and cty.is_wide(t) {
-        return v;
+        if fmt(f) == fmt(t) {
+            return v;
+        }
+        // (between the x87's format and binary128: _Float64x, _Float128 and long double)
+        let r = temp();
+        let mut xs: [4]*mut ir.Value = [r, v, fmt_arg(f), fmt_arg(t)];
+        _ = call("convert", xs[..]);
+        return r;
     }
     if cty.is_wide(t) {
         let r = temp();
@@ -224,25 +234,25 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
                     x = ir.zext(cg.B, x, i64t());
                 }
             }
-            let mut xs: [3]*mut ir.Value = [r, x, fmt_arg()];
+            let mut xs: [3]*mut ir.Value = [r, x, fmt_arg(t)];
             _ = call(u.pick(sg, "from_i64", "from_u64"), xs[..]);
             return r;
         }
         // float or double: exact
         if v.ty.bits == 32 {
-            let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i32t()), fmt_arg()];
+            let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i32t()), fmt_arg(t)];
             _ = call("from_f32", xs[..]);
             return r;
         }
-        let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i64t()), fmt_arg()];
+        let mut xs: [3]*mut ir.Value = [r, ir.bitcast(cg.B, v, i64t()), fmt_arg(t)];
         _ = call("from_f64", xs[..]);
         return r;
     }
     let tt = cg.lty(t);
     if t.kind == cty.TK_BOOL {
-        return ir.zext(cg.B, truth(v), tt);
+        return ir.zext(cg.B, truth(v, f), tt);
     }
-    let mut xs: [2]*mut ir.Value = [v, fmt_arg()];
+    let mut xs: [2]*mut ir.Value = [v, fmt_arg(f)];
     if cty.is_integer(t) {
         // (truncated toward zero; a value out of range is undefined,
         // 6.3.1.4p1: saturated, as for float and double)
@@ -268,15 +278,15 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
         }
         return r;
     }
-    if t.kind == cty.TK_FLOAT {
+    if cty.ffmt(t) == 32 {
         return ir.bitcast(cg.B, call("to_f32", xs[..]), tt);
     }
     return ir.bitcast(cg.B, call("to_f64", xs[..]), tt);
 }
 
-/// The constant 1, for ++ and --.
-pub fn one_value() *mut ir.Value {
-    return constant(cl.of_u64(1, fmt()));
+/// The constant 1 of wide floating type t, for ++ and --.
+pub fn one_value(t: *cty.CType) *mut ir.Value {
+    return constant(cl.of_u64(1, fmt(t)));
 }
 
 /// The 16 bytes of w (for an object's initial value).

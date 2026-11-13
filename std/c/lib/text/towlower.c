@@ -1,5 +1,5 @@
 /* towlower (C17 7.30.3.1.1): ASCII's mapping in a single-byte locale, and
-   Unicode's simple one in a UTF-8 locale (std/c/rt/text.ax). */
+   Unicode's simple one in a UTF-8 locale (__axc_wctab.c). */
 #include <axc/text.h>
 #include <wctype.h>
 
@@ -9,5 +9,5 @@ wint_t towlower(wint_t wc) {
         return c >= 'A' && c <= 'Z' ? (wint_t)(c + 32) : wc;
     if (c > 0x10ffff || !__axc_mb_utf8())
         return wc;
-    return (wint_t)__axc_wlower_unicode(c);
+    return (wint_t)(c + (unsigned long)(long)__axc_wct_lo[__AXC_WCT_CASE(c)]);
 }

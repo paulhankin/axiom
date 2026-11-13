@@ -202,6 +202,7 @@ TopDecl       ::= ImportDecl
                 | "pub"? Item
                 | "pub"? ExternDecl
                 | "export" FnDecl
+                | "export" "let" "mut"? IDENT ":" Type "=" Expr ";"   (* §14.5.6 *)
 
 Item          ::= StructDecl | UnionDecl | EnumDecl | FnDecl | ConstDecl | GlobalDecl
 
@@ -209,8 +210,9 @@ ImportDecl    ::= "import" ( STRING_LIT "as" IDENT ";"
                            | "host" STRING_LIT? "{" HostFnDecl* "}" )
 HostFnDecl    ::= "fn" IDENT "(" ParamList? ")" Type ";"
 
-ExternDecl    ::= "extern" STRING_LIT STRING_LIT? "{" ExternFnDecl* "}"   (* §14.5 *)
+ExternDecl    ::= "extern" STRING_LIT STRING_LIT? "{" ( ExternFnDecl | ExternData )* "}"   (* §14.5 *)
 ExternFnDecl  ::= "fn" IDENT "(" ExternParams? ")" Type ";"
+ExternData    ::= "let" "mut"? IDENT ":" Type ";"                  (* an object C defines, §14.5.6 *)
 ExternParams  ::= Param ( "," Param )* ( "," "..." )?
 
 ErrorDecl     ::= "error" "{" ErrorNames "}"                       (* names, §11.1 *)
@@ -2280,7 +2282,7 @@ WebAssembly, which C code cannot call. The compiler
 writes a C header for them with `--emit-header=<path>`. The header contains:
 
 - a prototype for every export, using `<stdint.h>` types and `const` for immutable
-  pointers;
+  pointers, and an `extern` declaration of every exported object (§14.5.6);
 - a definition of every struct reachable from those signatures, with a
   `_Static_assert` on its size;
 - a check of the target's pointer size, because layouts are target-specific.
@@ -2302,14 +2304,21 @@ so a C program links it with nothing else: `cc main.c lib.o`.
 | `fn(A, B) R` | `R (*)(A, B)` |
 | SIMD types | `__attribute__((vector_size(16)))` vectors |
 
-**Structs cross the boundary by pointer only.** Axiom's struct layout rules (§5.9)
-are C's natural layout rules, so a `*Point` is a valid `Point *` in C. The header's
-`_Static_assert`s check this. Passing structs *by value* depends on each platform's C
-calling convention, and is not supported in v0.1 (`E0801`). Slices, error unions,
-tagged unions and `error` also can't appear in boundary signatures directly. Inside
-structs, a slice appears in C as `struct { const T *ptr; size_t len; }`. Tagged and
-error unions appear as opaque byte arrays of the right size and alignment, since C has
-no equivalent.
+**Structs cross the boundary by pointer, and by value.** Axiom's struct layout rules
+(§5.9) are C's natural layout rules, so a `*Point` is a valid `Point *` in C. The
+header's `_Static_assert`s check this. A struct may also be a parameter or the result
+of an `extern "C"` function or an `export fn` (not of an `import host` function, nor
+of a function type, `E0801`): it is passed as the target's C calling convention passes
+the C structure of the same members, in registers or in memory, both ways. Each of its
+members must be a boundary type of the table (but `void` and a SIMD type), a struct of
+such members, or an array of one (`E0801`: a slice, a union or an error union is not
+one). A variadic C function takes no struct (`E0801`), and an `extern "C"` function
+that takes or returns one can only be called: it is not a function value (`E0801`).
+
+Slices, error unions, tagged unions and `error` can't appear in boundary signatures
+directly. Inside structs that cross by pointer, a slice appears in C as `struct { const
+T *ptr; size_t len; }`. Tagged and error unions appear as opaque byte arrays of the
+right size and alignment, since C has no equivalent.
 
 **Small integers and `bool`** are sign- or zero-extended as C requires, on every
 function and every indirect call. Any Axiom function whose signature uses only
@@ -2336,6 +2345,31 @@ twice can corrupt the Axiom program, just as it could corrupt any C program. The
 - On native targets, Axiom's pointers are machine addresses, which is what makes them
   interchangeable with C at no cost, and C code can damage anything in the process, as
   an Axiom access that breaks §12.1's rule can.
+
+#### 14.5.6 Objects at the boundary
+
+```axiom
+extern "C" {
+    let mut errno_copy: i32;      // an object C defines, which Axiom may assign
+    let table: [256]u8;           // one Axiom only reads
+}
+
+export let mut ax_count: u64 = 0;    // an object C code may use, as `ax_count`
+export let ax_version: u32 = 3;      // `extern const uint32_t ax_version;`
+```
+
+- A `let` in an `extern "C"` block declares an object that C code defines, under
+  its name; it has no initializer (`E0100`). Axiom code reads it, and if it is
+  `mut` assigns it, as any module-level `let` (§3.1), with no synchronization: C's other uses of it
+  are C's. `pub` makes it visible to importing modules.
+- `export let` defines a global whose symbol is its name, which C code declares
+  `extern` (the header from `--emit-header` does, `const` when it is not `mut`). It is
+  generated whether or not Axiom code uses it.
+- The type of either is a boundary type (§14.5.3) other than `void`, a struct whose
+  members are, or an array of one (`E0801`). Neither is `threadlocal`.
+- On WebAssembly the object is in the linear memory, which C and Axiom share; an
+  `extern "C"` object that nothing in the module defines is a link error (memory
+  cannot be imported by name).
 
 ## 15. Standard Library Core
 

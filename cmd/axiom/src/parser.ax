@@ -1522,7 +1522,8 @@ fn parse_test(P: *mut Parser, start: u.Span) *mut ast.Decl {
     return d;
 }
 
-// ExternDecl ::= "pub"? "extern" STRING_LIT STRING_LIT? "{" HostFn* "}"
+// ExternDecl ::= "pub"? "extern" STRING_LIT STRING_LIT? "{" ( HostFn | ExternData )* "}"
+// ExternData ::= "let" "mut"? IDENT ":" Type ";"   (an object C defines: spec §14.5.6)
 fn parse_extern(P: *mut Parser, is_pub: bool) void {
     let mdecls = &mut P.mod.decls;
     _ = advance(P);
@@ -1537,8 +1538,28 @@ fn parse_extern(P: *mut Parser, is_pub: bool) void {
         lib = u.intern(l.str);
     }
     _ = expect(P, lx.TK_LBRACE);
-    while pk(P) == lx.KW_FN {
-        let d = parse_host_fn(P);
+    while (pk(P) == lx.KW_FN) or (pk(P) == lx.KW_LET) {
+        let mut d = u.nil.[ast.Decl]();
+        if pk(P) == lx.KW_LET {
+            let start = advance(P).span;
+            d = new_decl(P, ast.D_GLOBAL, start);
+            d.is_mut = accept(P, lx.KW_MUT);
+            parse_decl_name(P, d);
+            if not accept(P, lx.TK_COLON) {
+                syntax_error(P, "':' (a C object's declaration needs its type)");
+            } else {
+                d.te = parse_type(P);
+            }
+            if pk(P) == lx.TK_EQ {
+                syntax_error(P, "';' (C defines the object: it has no initializer here)");
+                sync_stmt(P);
+            } else {
+                _ = expect(P, lx.TK_SEMI);
+            }
+            d.span = sp_from(P, start);
+        } else {
+            d = parse_host_fn(P);
+        }
         d.extern_c = true;
         d.is_pub = is_pub;
         d.abi = abi_s;
@@ -1678,8 +1699,15 @@ fn parse_top(P: *mut Parser) void {
     }
     if t.kind == lx.KW_EXPORT {
         _ = advance(P);
+        if pk(P) == lx.KW_LET {
+            // an object C code may use, under its name (spec §14.5.6)
+            let d = parse_global(P, start, false, false);
+            d.is_export = true;
+            mdecls.push(d);
+            return;
+        }
         if (pk(P) != lx.KW_FN) and not at_inline(P) {
-            syntax_error(P, "'fn' after 'export'");
+            syntax_error(P, "'fn' or 'let' after 'export'");
             sync_stmt(P);
             return;
         }

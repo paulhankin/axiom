@@ -3,8 +3,9 @@
 `axiom build file.c` compiles C. The C front end reads C translation units and hands them
 to the same optimizer, code generators and linkers that Axiom programs use, so a C program
 is built for every target of the compiler (WebAssembly, x86-64 and AArch64 Linux, x86-64
-Windows, AArch64 macOS) with no C compiler and no external linker, except to link to the
-platform's C library on Linux (see "What a C program is here").
+Windows, AArch64 macOS) with no C compiler and no external linker: the compiler's own
+linkers link the platform's C library too, and on Linux the objects, archives and shared
+libraries of the platform's toolchain ("Objects and libraries").
 
 It is a hosted implementation, in C's terms: a C program links the compiler's own C
 library ("The C library"), and `--c-freestanding` makes it a freestanding one, with the
@@ -22,11 +23,13 @@ axiom build a.c b.c --c-std=c99 -DDEBUG=1 -Iinclude -o prog
 axiom check prog.c                               # diagnostics only
 ```
 
-[`docs/c-diagnostics.md`](c-diagnostics.md) lists the diagnostics. How the front end is
+[`docs/c-diagnostics.md`](c-diagnostics.md) lists the diagnostics, and
+[`docs/c-conformance.md`](c-conformance.md) is the clause-by-clause account against the
+standards, with every implementation-defined choice of their Annex J.3. How the front end is
 built is in [`docs/c-frontend.md`](c-frontend.md). C units and Axiom modules build into
 one program ("C and Axiom in one program", below). Axiom programs that link C code
-compiled by the system's C compiler (`--link=file.c`) are a different feature, in
-[`docs/cli.md`](cli.md).
+compiled by the system's C compiler (`--link=file.c`), and with its objects and libraries,
+are in "Objects and libraries", below.
 
 ## What a C program is here
 
@@ -34,15 +37,17 @@ compiled by the system's C compiler (`--link=file.c`) are a different feature, i
   "The C library" (below) are linked into every program that uses them, on every target.
 - **Other undefined functions are the platform's.** A function a program declares and
   that neither it nor the library defines is looked up outside the program:
-  - On Linux, by the linker, in the system's C library: such a program is linked by the
-    system's C compiler (`cc`), which must be installed. A program that defines every
-    function it calls is linked by the compiler's own linker, and is a static executable
-    that needs nothing.
+  - On Linux, by the compiler's linker, in the system's C library (`libc.so.6`,
+    `libm.so.6`, and the libraries `-l` names): the program is then linked dynamically,
+    against them, with no C compiler or linker of the system's. A program that defines
+    every function it calls is a static executable that needs nothing.
   - On macOS, in `libSystem`. On Windows, in a system DLL by the name's rules: a
     capitalized name is `kernel32.dll`'s (`WSA...` and the socket functions are
     `ws2_32.dll`'s, `Rtl...`, `Nt...` and `Nls...` are `ntdll.dll`'s, `BCrypt...` are
-    `bcrypt.dll`'s); any other name is an undefined symbol at link time: nothing
-    comes from the system's C library (`msvcrt.dll`).
+    `bcrypt.dll`'s, `ConvertStringSecurityDescriptor...` are `advapi32.dll`'s); any
+    other name is an undefined symbol at link time: nothing comes from the system's C
+    library (`msvcrt.dll`), unless the program's C library is the system's
+    (`--c-lib=system`, "Objects and libraries"), whose names are then `msvcrt.dll`'s.
   - On WebAssembly, it is an import of the module `env`, with the name of the function.
     A host supplies it. The module also imports the runtime's host functions from the
     module `axiom` (`ax_write`, ...), which `std/internal/runtime/host.mjs` provides:
@@ -84,8 +89,11 @@ Axiom in one program").
 | `-UNAME` | Undefine a macro. The predefined macros of the standard cannot be undefined (`C1053`). |
 | `--c-asm-dialect=att\|intel` | The syntax of x86-64 inline and file-scope assembly (default `att`; "Inline assembly"). |
 | `--c-warn-unknown-pragmas` | An unknown `#pragma` is the warning `C4111` (it is ignored either way). |
+| `--c-warn-format=0\|1\|2` | The checks of format strings ("Attributes": `format`): 0 none, 1 (the default) what is undefined or fails on any target (C4130, C4131, C4133), 2 also what is suspect (C4132, C4134, C4135). |
 | `-Idir` | Add a directory to the include path. |
 | `--c-freestanding` | A freestanding program: `__STDC_HOSTED__` is 0, only the freestanding headers are found (another is `C1081`), and no C library is linked ("The C library"). |
+| `--c-lib=axiom\|system` | Whose C library the program has: the compiler's (the default), or the system's, whose headers are then the hosted headers ("The system's C library", below). |
+| `--c-system-include=dir` | With `--c-lib=system`: a directory of the system's headers (instead of the system's own, `/usr/include` and its target directory on Linux). |
 
 `-D`, `-U` and `-I` apply in the order given. The C options are errors for an Axiom
 source. The unknown ones are errors too: there are no `-W...`, `-std=`, `-c` or `-f...`
@@ -99,15 +107,18 @@ directory, where the compiler finds the C headers in `c/include/`), `-o`, `--emi
 `--link`, `-l`, `-L`, `--subsystem`, `--icon`, `--pdb`, and `-g` /
 `--debug-info=` (see "Debugging"). The default
 target is `wasm32`. `--link=file.c` links a further C source, compiled by the system's C
-compiler, as for Axiom programs; `-l` and `-L` pass libraries and directories to that
-linker.
+compiler; `--link=` with an object, an archive or a shared library, or such a file among
+the inputs (`x.o`, `libx.a`, `libx.so`), links it, and `-l` and `-L` name libraries and
+the directories to find them in ("Objects and libraries").
 
 These are errors with C sources, since they mean something only for Axiom code:
 `--overflow`, `--sanitize`, `--coverage`, `--units`, `--emit-header`. An Axiom program
 with C units takes `--overflow` and `--emit-header`, which apply to its Axiom code (and
 the header is written before the C units are compiled, so they may include it). So are
-`axiom test`, `axiom profile`, `axiom ide` and `axiom fmt` on a C source, and `axiom
-test` and `axiom profile` of an Axiom program with C units.
+`axiom test`, `axiom profile`, `axiom ide` and `axiom fmt` on a C source, and `axiom ide`
+of an Axiom program with C units. `axiom test` and `axiom profile` take an Axiom program
+or package with C units (its tests may call C; the C library's streams are flushed after
+each test).
 
 A missing source, a missing include directory (`-I`) and an output that is a directory are
 errors before anything is compiled.
@@ -118,6 +129,7 @@ errors before anything is compiled.
 |---|---|
 | `exe` | The default: an executable (a `.wasm` module for WebAssembly targets). |
 | `obj` | An object file. |
+| `lib` | A static library: an archive of the object, and of the objects among the inputs (`libprog.a`, `prog.lib` for Windows). |
 | `ir` | The compiler's IR as text. |
 | `c-pp` | The preprocessed text: the tokens of the translation unit, on their lines. |
 | `c-tokens` | The tokens, one to a line, with their kinds and values. |
@@ -128,11 +140,9 @@ errors before anything is compiled.
 source with `.c` removed: `prog`, `prog.wasm`, `prog.o` or `prog.ir`.
 
 An object or IR of translation units that do not define `main` holds their code alone:
-there is no start-up code and no runtime. The system's C compiler links such an object
-into a C program (`cc main.c lib.o`). It cannot be linked into an Axiom program with
-`--link=lib.o`: the link fails on the runtime symbols that the object defines (observed
-with `--target=x86_64`). Give the C sources to the build of the Axiom program instead
-("C and Axiom in one program").
+there is no start-up code and no runtime. Objects link with each other and into programs,
+by the compiler and by the system's toolchain (`cc main.c lib.o`): "Objects of this
+compiler", below.
 
 ### `axiom check`
 
@@ -236,13 +246,18 @@ axiom build pkg/                                  # a package with c-sources (be
   the same name, which a C declaration (a prototype, `--emit-header`'s or one's own)
   calls. An Axiom function passed to C as a function pointer is called with C's calling
   convention, and a C function pointer passed to Axiom is called with an Axiom call.
-- **Structures** cross by pointer: an Axiom `struct` is laid out as C lays out the
-  structure with the same members (spec §5.9), so a `*Point` is a `struct point *`.
-  Passing one by value between Axiom and C is not supported (spec §14.5.3, `E0801`);
-  between C units it is, with the C ABI.
-- **Data** is shared through pointers: the Axiom language has no declarations of
-  external objects, so C's objects are reached through C functions that return their
-  addresses, and Axiom's through exported functions that return theirs.
+- **Structures** cross by pointer and by value: an Axiom `struct` is laid out as C lays
+  out the structure with the same members (spec §5.9), so a `*Point` is a `struct point
+  *`, and a `Point` parameter or result of an `extern "C"` function or an `export fn`
+  is passed as the target's C ABI passes `struct point` (spec §14.5.3), both ways. The
+  C front end does it: for each such function the compiler writes a C unit of wrappers
+  (a C function that takes the structures by pointer and calls the one that takes them
+  by value, or for an export the C function itself, which calls the Axiom function by
+  pointer), which is compiled with the program, so that the structures travel exactly
+  as between C units (`c/cgen_abi.ax`).
+- **Data** is shared both ways: an `extern "C"` block declares C's objects (`let mut
+  count: i32;`) and `export let` defines objects of the program that C code uses by
+  name (spec §14.5.6); the header (`--emit-header`) declares those.
 - **Names**: an external name is one symbol for the whole program, C's and Axiom's. On
   macOS the object files add the leading underscore of Mach-O names to every one of
   them; on WebAssembly a function that the program defines is a function of the module
@@ -272,10 +287,13 @@ attribute `used`, and an object placed in a section (`section`), are kept too, a
 are the constructors and destructors, which the start-up calls. So a C library given in full (a
 unit of 200 functions, say) adds nothing to a program that calls none of its functions,
 and the size of one that calls one function is that of the program with that function
-alone. An object (`--emit=obj`) and a program that the system's linker links (with
-`--link=` inputs or `-l` libraries, whose code may refer to anything) keep every
-definition of the program's own units; the C library's units ("The C library") are
-stripped there too, and the other code has the system's C library.
+alone. A program linked with objects and libraries ("Objects and libraries") keeps
+besides what those refer to (the compiler's linker reads them before the program is
+compiled). An object (`--emit=obj`), and a program that the system's linker links (on
+the targets where the compiler's does not read such inputs yet), keep every definition
+of external linkage of the program's own units and what it reaches (a static function
+nothing calls, such as a header's helper, is left out); the C library's units ("The C
+library") are stripped there too.
 
 ### Start-up and exit
 
@@ -302,12 +320,203 @@ The order in which a program starts and ends is the same with or without C:
    runtime and returns it to the system (on Linux with the C library linked, to the C
    library's start-up, which calls its `exit`).
 
+A program whose `main` is Axiom's does what step 3's `exit` does before the process ends
+when that `main` returns (the atexit functions, the destructors, the streams flushed:
+`__axc_exit_handlers`), so that its C code's output is written. A program linked with
+objects that have initialization and termination arrays (the platform toolchain's, or this
+compiler's objects: "Objects and libraries") runs them too: `.preinit_array` and
+`.init_array` before the C units' constructors, in the order of their priorities, and
+`.fini_array` backward after the destructors; their functions are called with no
+arguments.
+
 A C call of `exit` anywhere is the same function as in step 3. A freestanding C program
 on Linux that calls the system C library's `exit` (it defines none) ends through the C
 library, without the runtime's finishing step, which only writes a profile (`axiom
 profile` does not take C programs). Under WebAssembly a hosted program ends by calling
 the host's `ax_exit` (`std/internal/runtime/host.mjs`: `process.exit`, or the
 embedder's `exit` option) rather than by returning from the module's `main`.
+
+## Objects and libraries
+
+A program (a C program, or an Axiom program, with or without C units) is linked with the
+objects, static libraries and shared libraries it is given, by the compiler's own linker,
+with no linker of the system's:
+
+```
+axiom build main.c util.o libparse.a -o prog          # inputs by their names
+axiom build main.ax --link=fast.o -L/opt/x/lib -lx    # --link=, -l and -L
+axiom build main.c --link=helper.c -o prog            # compiled by the system's cc first
+axiom build util.c parse.c --emit=lib -o libutil.a    # a static library of this compiler's
+```
+
+An input whose name ends in `.o`, `.obj`, `.a`, `.lib`, `.so` (or `.so.N`), `.dylib`,
+`.dll` or `.tbd` is linked, as with `--link=`. What a file is is read from its contents:
+
+- **Relocatable objects** of this compiler (`--emit=obj`) and of the platform's
+  toolchain for the same target, ELF on Linux. The linker applies every relocation the
+  x86-64 and AArch64 psABIs give an executable's objects, at every optimization level
+  and code model (`-fPIC`, `-fno-pie`, `-mcmodel=large`), and the TLS models: local-exec
+  and initial-exec as they are, general- and local-dynamic and TLS descriptors (and
+  AArch64's traditional general-dynamic sequence) relaxed to local-exec for the
+  executable's own thread-locals and to initial-exec for a shared library's. Of COMDAT
+  groups with one signature the first object's is kept. Common symbols are weak
+  definitions in `.bss`. A shared library's data that position-dependent code refers to
+  directly gets a copy relocation. Sections whose names are C identifiers are placed
+  together, between `__start_<name>` and `__stop_<name>` when something refers to those;
+  `.preinit_array`, `.init_array[.N]` and `.fini_array[.N]` are placed by priority between
+  the symbols `__init_array_start` ... `__fini_array_end` and run by the start-up ("Start-up
+  and exit"). `.eh_frame` is kept, relocated (there is no `.eh_frame_hdr`: C++ exceptions
+  thrown through such code are not supported). `STT_GNU_IFUNC` symbols are an error.
+- **Static archives** (the `ar` format of System V and GNU, of BSD and of PE/COFF, and
+  thin ones): a member is linked when it defines a name that is undefined so far (a strong
+  reference: a weak one takes no member), and what it needs is looked for in turn, in every
+  archive given (the archives are one group: their order does not matter).
+- **Shared libraries**, by path or by name: `-lname` finds `libname.so`, else `libname.a`,
+  in the `-L` directories and then the system's (`/lib/x86_64-linux-gnu`, ... or the
+  AArch64 ones, `/usr/aarch64-linux-gnu/lib` among them). A linker script there (as the
+  system's `libc.so` is one) is read for its `INPUT` and `GROUP`, `AS_NEEDED` included;
+  another command is an error. The program is linked dynamically against the libraries
+  it uses (`DT_NEEDED`), with the symbol versions they define, eagerly bound; the dynamic
+  linker's own symbols (`__tls_get_addr`, AArch64's `__stack_chk_guard`) are found too.
+- **C sources** given with `--link=` are compiled by the system's C compiler (`cc`, or
+  the cross compiler for the target: `aarch64-linux-gnu-gcc`) with `-O2` and the `-I`
+  directories, after `--emit-header`'s header is written, which they may include.
+
+When objects of the platform's toolchain are linked, so are its C compiler's run-time
+archives (`libgcc.a` and `libgcc_eh.a` of its newest version, under `/usr/lib/gcc` or
+`/usr/lib/gcc-cross`), from which a member is linked only where nothing else defines
+what an object needs (complex arithmetic, 128-bit division and conversions, AArch64's
+atomics called out of line), as the system's linker links them.
+
+What the inputs refer to and do not define, the program does: the C library ("The C
+library") supplies it, its units and run-time modules compiled with the program as for
+the program's own references, and what the inputs refer to is kept ("What is linked").
+
+On WebAssembly the compiler's linker takes relocatable objects of the tool conventions'
+format (this compiler's, and `clang`'s for the same target) and archives of them, found
+with `-L` and `-l` (`libname.a`), with the same member selection; a C source given with
+`--link=` is compiled by `clang` first. The constructors of such objects (their
+`INIT_FUNCS`) are not run: on WebAssembly a constructor must be in a C unit of the
+program. On macOS and Windows the compiler's linkers do not read such inputs yet: an
+Axiom program for them links only the libraries its `extern "C"` blocks name, and a link
+with objects or libraries for them is `E9004` ("linking C code or libraries for ... is
+not supported yet"); their objects of this compiler (ELF ones) are linked by `axiom
+build` from the sources.
+
+### One C library
+
+A program has one C library: the compiler's (`--c-lib=axiom`, the default), or the
+system's (`--c-lib=system`).
+
+**The compiler's.** The code compiled by the system's C compiler, against the system's
+headers, uses this library: its calls of the standard's functions are this library's
+functions, whose interfaces the C standard fixes, and the names the system's headers
+expand to that the Linux Standard Base specifies are this library's too
+(`std/c/lib/compat/`): `stdin`, `stdout` and `stderr` as objects of type `FILE *`;
+`errno`'s `__errno_location`; the tables of the `<ctype.h>` macros (`__ctype_b_loc`,
+`__ctype_tolower_loc`, `__ctype_toupper_loc`, the "C" locale's classes with the LSB's
+bits); `__assert_fail`; the fortified functions of `_FORTIFY_SOURCE` (`__printf_chk`,
+`__sprintf_chk`, `__snprintf_chk`, `__vfprintf_chk`, `__memcpy_chk`, `__strcpy_chk`, ...,
+which fail through `__chk_fail` as they must); `__isoc99_scanf` and its kin, and C23's
+`__isoc23_strtol`, `__isoc23_scanf` and theirs; `__stack_chk_fail`, AArch64's
+`__stack_chk_guard` (on x86-64 the guard is at `%fs:0x28`, which the runtime's thread
+control blocks keep zero); `_setjmp` and `__sigsetjmp` (this library's `setjmp`: its
+`jmp_buf` is smaller than the system's), `__longjmp_chk`; `_IO_putc`, `_IO_getc`;
+`__getauxval`. The limit is what such code took from the system library's headers that
+this library does not share: a reference to another of that library's own names (those
+reserved to the implementation: `__overflow`, `__uflow`, ...) or to one of POSIX's
+functions of streams (`fileno`, `fdopen`, `popen`, `getline`, ...: they take or give the
+system library's `FILE`) is an error (`E9004`, after `link error: x.o refers to
+'__overflow', a name of the system's C library's own implementation` or `x.o calls
+'fileno', which works on the system's C library's streams`), as is anything else that
+would give the program two C libraries, and so is a call of a function whose objects the
+system's headers lay out smaller than this library does (`fgetpos` and `fsetpos`, whose
+`fpos_t` is 16 bytes there and 40 here; the restartable multibyte functions, `mbrtowc`
+and its kin, whose `mbstate_t` is 8 bytes there and 24 here). Macros the code expanded
+(`BUFSIZ`, `EOF`, the `errno` codes, which are Linux's here too) are its values, and a
+structure it reads that this library fills must be laid out alike: this library's
+`struct tm` has the standard's members, at the system's offsets, without the system's
+`tm_gmtoff` and `tm_zone` after them. The other POSIX functions (`write`, `getpid`,
+`fork`, ...) are the system library's, and `errno` is one object for both ("How the
+library is linked").
+
+**The system's** (`--c-lib=system`, native targets). The compiler's library is left out:
+the C units' and the objects' calls are the system library's, through its shared
+objects (`libc.so.6`, `libm.so.6`). The hosted headers are the system's: `#include <x>`
+looks in the `-I` directories, then in the system's (the `--c-system-include`
+directories, else `/usr/include/<target>` and `/usr/include`, or for another processor
+than the machine's `/usr/<target>/include`), then in the compiler's for the headers of
+the language itself, which are the compiler's whatever the order (`<float.h>`,
+`<stdarg.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdalign.h>`, `<stdnoreturn.h>`,
+`<iso646.h>`, `<stdatomic.h>`, `<stdbit.h>`, `<stdckdint.h>`, `<complex.h>`,
+`<tgmath.h>`; the system's `<limits.h>` and `<stdint.h>` are its, with their POSIX
+limits). Those headers are compiled as the system's: the macros of the platform they
+test are defined (`__x86_64__` or `__aarch64__`, `__linux__`, `__unix__`, `__ELF__`,
+`__LP64__`, `__SIZEOF_<T>__`, `__BYTE_ORDER__`, `__CHAR_BIT__`, and
+`__AXIOM_SYSTEM_C_LIB__`), the definitions they make of the implementation's own macros
+(`__STDC_ISO_10646__`, ...) keep the compiler's, their warnings and the errors that say a
+feature is a later standard's (or an empty declaration) are not shown, and in a GNU
+dialect `_FloatN` and `__float128` are not keywords there (they define them as types).
+`__GNUC__` is not defined, so they use what they have for other compilers. The standard
+must be C99 or later, the C options the platform's ABI's (`--c-int`, `--c-long`), and
+`--c-freestanding` is not given. `setjmp` and the other functions POSIX says return twice
+(`_setjmp`, `sigsetjmp`, `vfork`, `getcontext`) make their callers return twice. The
+program's constructors and destructors run as they do with this library; returning from
+`main` ends the program through the system library's `exit`.
+On macOS and Windows, whose system headers are not on a Linux machine, the
+`--c-system-include` directories name them; the functions are then `libSystem`'s or
+`msvcrt.dll`'s, by name. On every target the program's `setjmp` and `longjmp` are the
+system library's (the compiler's, whose `jmp_buf` is another, are left out:
+`cmd/axiom/src/jstub.ax`).
+
+### Objects of this compiler
+
+`--emit=obj` makes an object that links with other objects of this compiler, with those of
+the platform's toolchain and into programs, whoever links it:
+
+- Whatever several objects may each have, they share. The state of the program (its
+  modules' mutable globals, the runtime's shadow stack and tables, the standard library's
+  allocator) is link-once: weak global symbols named after the declarations, so two
+  objects that use the standard library's allocator use one heap; the runtime's
+  functions, its helpers (`axiom_shadow_stack`, `axiom_frame_table`, ...) and the system
+  call stubs are link-once too, one copy of each linked. A module's own functions stay the
+  object's (their copies may differ in what they inlined), and its constants too; the
+  program's `export fn`s are its strong definitions.
+- C units' constructors and destructors are entries of the object's `.init_array` and
+  `.fini_array` (in `.init_array.NNNNN` for a priority), which the program that links it
+  runs, the compiler's start-up or the platform's.
+
+`--emit=lib` puts the object, and the objects among the inputs, in a static library with
+a symbol table of what each defines, laid out as the target's toolchain lays out its own
+(System V's for Linux and WebAssembly, BSD's `__.SYMDEF SORTED` for macOS, PE/COFF's two
+linker members for Windows). The objects are ELF ones for the native targets (as
+`--emit=obj`'s are): the system's toolchain takes them on Linux; for macOS and Windows the
+compiler's linkers take them.
+
+An object of C units that uses this library's private names (`__axc_stdout` for `stdout`,
+...) needs this library: linked by the system's toolchain into a C program (whose C
+library is the system's), it may call only the standard's functions.
+
+### Not done yet
+
+- The linkers of macOS and Windows (`mlink.ax`, `plink.ax`) take no objects or
+  libraries of the platforms' toolchains (Mach-O and COFF objects, import libraries,
+  `.tbd` stubs), and `--emit=obj` and `--emit=lib` make ELF objects for those targets,
+  which only this compiler links.
+- No shared library is made (`--emit=` has no `so`, `dylib` or `dll`). The code
+  generators reach external data through the GOT and call through PLT-style relocations,
+  but thread-locals (the runtime's shadow stack, C's `_Thread_local`) use the local-exec
+  model and absolute addresses in data would need dynamic relocations.
+- On WebAssembly the constructors of objects (`INIT_FUNCS`) are not run, and a weak
+  reference to a function nothing defines, while null, is still an import of `env` for
+  its calls.
+- A GNU dialect's `alias` names its target in its own unit only (no second symbol), the
+  attribute `section` places only data and only in ELF objects (a function's is
+  recorded, `ir.Func.section`, but its code stays in `.text`: the backends lay out one
+  text section, which the frame tables, unwind and debug information refer to), and
+  `visibility` is written to ELF objects as `hidden` (hidden, internal) or default
+  (protected, default; no shared object is made from them).
+- `.eh_frame` is kept without `.eh_frame_hdr` and `PT_GNU_EH_FRAME`.
 
 ## The C library
 
@@ -324,6 +533,7 @@ parts, each with its sources and its private header:
 | text | `<locale.h>`, `<wchar.h>`, `<wctype.h>`, `<uchar.h>`, `<time.h>`, `<inttypes.h>`, `<stdlib.h>`'s multibyte functions | `std/c/lib/text/`, `std/c/rt/text*.ax`, `axc/text.h`, `axc/locale.h` ([`docs/c-text.md`](c-text.md)) |
 | mathematics | `<math.h>`, `<fenv.h>`, `<tgmath.h>`, `<complex.h>`'s functions | `std/c/lib/math/`, `std/c/rt/math*.ax` (below) |
 | threads | `<threads.h>`, and C23's `call_once` of `<stdlib.h>` | `std/c/lib/threads/`, `std/c/rt/threads.ax`, `std/c/rt/threads_spawn.ax` (`threads_spawn_none.ax`), `axc/threads_impl.h`, `axc/once.h` ("Threads", below) |
+| bounds-checking interfaces | Annex K: the `_s` functions of `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<time.h>` and `<wchar.h>`, `errno_t`, `rsize_t`, `RSIZE_MAX` | `std/c/lib/ext1/`, `axc/ext1.h`, `axc/ext1_impl.h` ("Annex K", below) |
 
 ### How the library is linked
 
@@ -376,12 +586,12 @@ and the library's functions (`exit`, `qsort`, ...) are the ones the program uses
 library's heap (`__libc_malloc` and its kin), as they always do on macOS
 (`libSystem`'s), so that memory one library allocates the other frees; in a program that
 needs nothing of the system's (a static one on Linux; Windows; WebAssembly) they use the
-Axiom allocator. A C source linked with `--link=` (compiled by the system's C compiler,
-against its headers) uses the system library's streams, and the program's code this
-library's, under the same names (`printf`, `fopen`, ...): such a program should be built
-with `--c-freestanding` if both write. On
+Axiom allocator. `errno` is then that library's too (its `__errno_location`, on macOS
+`__error`: `std/c/rt/core_errno.ax`), so that both libraries' functions set one object.
+Code compiled by the system's C compiler (`--link=file.c`, its objects and libraries)
+uses this library, the program's: "Objects and libraries" says how. On
 Windows nothing comes from `msvcrt.dll` (the suite checks every Windows executable's
-imports). On macOS the runtime reaches
+imports) unless `--c-lib=system` makes it the program's library. On macOS the runtime reaches
 `libSystem`'s `exit`, `getenv`, `raise`, `malloc`, `calloc` and `free` under names of
 its own (`__axiom_libc_...`, which the linker binds to those), so that they are never
 the program's.
@@ -395,12 +605,66 @@ The library's core (`std/c/lib/core/`, `std/c/rt/core*.ax`):
 | `<errno.h>` | `errno`, each thread's own (a macro over the function `__axc_errno`, whose object is `_Thread_local`), `EDOM`, `ERANGE`, `EILSEQ` and the codes the library reports (`ENOMEM`, `EINVAL`, ...): the library's own values, the same on every target. |
 | `<setjmp.h>` | `jmp_buf`, `setjmp`, `longjmp` ("setjmp and longjmp", below). |
 | `<signal.h>` | `signal`, `raise`, `sig_atomic_t`, the six signals ("Signals", below). |
-| `<stdlib.h>` | All of it (the multibyte functions and `MB_CUR_MAX` are the text part's). Its header comment lists the choices: `malloc(0)` and the like give a unique pointer; memory is the Axiom allocator's (`std/mem`, thread-safe) or the system C library's (above), aligned to 16, `aligned_alloc` to any power of two; `calloc` checks its product; `rand` is a 64-bit linear congruential generator (`RAND_MAX` 2147483647); `qsort` is an introspective sort (O(n log n) at worst, O(log n) stack); `strtod`, `strtof` and `strtold` (in `long double`'s format, whichever the target has) are correctly rounded for every input, decimal and hexadecimal, and set `ERANGE` on overflow and on a zero or subnormal result; in C23 mode `strtol` and its kin take `0b`; `atexit` and `at_quick_exit` take any number of functions; `getenv`'s strings stay valid until the variable's value is asked for again after it changed; `system` uses `/bin/sh` (Linux, macOS) or `cmd.exe` (Windows); under WebAssembly there is no command processor; `strfromd`, `strfromf` and `strfroml` (C23) format with `snprintf`, the standard I/O's. |
-| `<string.h>` | The hosted functions: `strerror` (the library's messages), `strcoll` and `strxfrm` (the order of the bytes, in every locale), and in C23 `strdup` and `strndup`. |
+| `<stdlib.h>` | All of it (the multibyte functions and `MB_CUR_MAX` are the text part's). Its header comment lists the choices: `malloc(0)` and the like give a unique pointer; memory is the Axiom allocator's (`std/mem`, thread-safe) or the system C library's (above), aligned to 16; `aligned_alloc` takes any power of two as the alignment and any size, a multiple of it or not, in every mode (C11 left another size undefined; C17's DR 460 and C23 take any), and fails (a null pointer, `EINVAL`) for another alignment; `realloc(p, 0)` (implementation-defined in C17, undefined in C23) frees p's object and returns a unique pointer to an object of no bytes, which `free` takes; `calloc` checks its product; `rand` is a 64-bit linear congruential generator (`RAND_MAX` 2147483647: the state's high 31 bits, so the results' low bits are as good as their high ones; the period is 2^64; successive values have a linear congruential generator's lattice structure, so `rand` is no source for cryptography or for simulations that need independent values; one state for every thread, which may race, 7.24.2.1p3); `qsort` is an introspective sort (O(n log n) at worst, O(log n) stack), which a comparison function that is not consistent leaves in an unspecified order without touching anything outside the array; `qsort` and `bsearch` with no elements call no comparison function, null pointers included; `strtod`, `strtof` and `strtold` (in `long double`'s format, whichever the target has) are correctly rounded for every input, decimal and hexadecimal, in the current rounding direction, and set `ERANGE` on overflow and on a zero or subnormal result; their decimal point is `.` in every locale (each has the "C" locale's numeric conventions); in C23 mode `strtol` and its kin take `0b`; `atexit` and `at_quick_exit` take any number of functions, from any thread (their table has a lock); `getenv` is free of data races with other calls of `getenv` (its strings are kept under a lock and stay valid until the variable's value is asked for again after it changed), but not with a change of the environment from another thread (POSIX's `setenv`, `std/os.setenv`), which C23 7.24.4.6p2 allows; `system` uses `/bin/sh -c` (Linux, macOS) or `%ComSpec% /s /c "command"` (Windows, else `cmd.exe`), which receive the command's text as it is, and returns POSIX's encoding of the status (the exit status times 256, or the signal's number) or Windows' exit status; under WebAssembly there is no command processor (`system(NULL)` is 0, a command -1); `strfromd`, `strfromf` and `strfroml` (C23) format with `snprintf`, the standard I/O's. |
+| `<string.h>` | The hosted functions: `strerror` (the library's messages: one of its own for each code of `<errno.h>`, which are those the library sets, and `Unknown error` for another number), `strcoll` and `strxfrm` (the order of the bytes, in every locale), and in C23 `strdup` and `strndup`; in C89 mode too (the headers test `__AXIOM_HOSTED__`). |
 
 Measured on x86-64 Linux against the system's C library (both at their best options):
 `qsort` of integers and of 24-byte records 1.1 times its time, `strtod` 1.0 times,
-`malloc` and `free` of small blocks 0.96 times.
+`malloc` and `free` of small blocks 0.96 times; `fgets` of 1.5 million short lines 0.8
+times, `fscanf("%d")` 0.9 times, `getc` and `putc` 0.5 times (their macros).
+
+### Annex K: the bounds-checking interfaces
+
+All of Annex K (C11 K.3, unchanged in C17 and C23), in every hosted program;
+`__STDC_LIB_EXT1__` is `201112L` from C11 on (not with `--c-freestanding`).
+
+- **Asking for them** (K.3.1.1): a program defines `__STDC_WANT_LIB_EXT1__` as 1
+  before it includes a header to have the header declare its Annex K names
+  (`errno_t` in `<errno.h>`, `rsize_t` in `<stddef.h>`, `RSIZE_MAX` in
+  `<stdint.h>`, and the functions, types and macros of K.3.5 to K.3.9); as 0, or
+  not at all (the implementation's choice), the names are not declared and stay the
+  program's. Another value is an error, and so is an inclusion of one of these
+  headers that sees the macro otherwise than the first did (K.3.1.1p4: `C1040`, as
+  `#error` gives). They are declared in every mode, C89 included, when asked for.
+- **Types and limits**: `errno_t` is `int`, `rsize_t` is `size_t`, `RSIZE_MAX` is
+  `SIZE_MAX >> 1` (K.3.4p4's recommendation); `L_tmpnam_s` and `TMP_MAX_S` are
+  `L_tmpnam` and `TMP_MAX`.
+- **Runtime-constraint violations** call the handler (K.3.1.4): the one
+  `set_constraint_handler_s` registered (atomically, from any thread), or the
+  default, `abort_handler_s` (K.3.6.1.1p3's choice), which writes
+  `runtime-constraint violation: <msg>` to standard error and calls `abort`. The
+  message is `function: what was wrong` (`strcpy_s: s2 does not fit in s1max
+  characters`); `ptr` is a null pointer; `error` is the function's result where it
+  returns an `errno_t` (`EINVAL` for a null pointer, `ERANGE` for a size out of
+  range or too small, `EINVAL` for overlapping objects), else `EINVAL`. When the
+  handler returns (`ignore_handler_s`, or the program's), each function does what
+  K.3 says it does after a violation (stores a null character, zeros, sets
+  `*retval` to `(size_t)-1` ...) and returns its failure. Overlap is checked on
+  the bytes each copy reads and writes.
+- **Formatted I/O**: `%n` in the format, and a null pointer for `%s` or `%ls`, are
+  violations of `fprintf_s` and its kin (the output stops there). In `fscanf_s` and
+  its kin, `%c`, `%s` and `%[` take the receiving array's number of elements (an
+  `rsize_t`) after its pointer (not when assignment is suppressed); an input item
+  that does not fit, with `%s`'s and `%[`'s null character, is a matching failure
+  after which the array holds the empty string; a null pointer to store through is
+  a violation (`EOF`). In C23 mode `%i` takes `0b` as `fscanf`'s does. `sprintf_s`
+  returns 0 after a violation (an output that does not fit included), `swprintf_s`
+  a negative value for an output that does not fit (K.3.9.1.4p4), the `snprintf_s`
+  forms a negative value.
+- **Files**: `fopen_s` and `freopen_s` take a mode that may begin with `u`. A file
+  opened for writing is opened for exclusive access where the system has the
+  notion (Windows: no other handle may open it meanwhile); a file they create is
+  private to its owner (permissions 0600 on Linux and macOS, a protected access
+  control list that admits only the owner on Windows; on WebAssembly the node
+  host's 0600) unless the mode begins with `u`, which gives the system's default
+  permissions. `tmpfile_s` is `tmpfile` (which is exclusive and private too).
+- **Other choices**: `getenv_s` returns `ENOENT` for a name that is not set and
+  `ERANGE` for a value that does not fit; `wctomb_s` keeps its own conversion state
+  (and returns `EILSEQ`, `*status` -1, for a wide character that has no multibyte
+  form); `qsort_s` is `qsort`'s introspective sort; `tmpnam_s` returns `EEXIST`
+  when no name can be made; `strerror_s` cuts a long message with `...`
+  (K.3.7.4.2p4); `asctime_s` takes the years 0 to 9999 and members in their normal
+  ranges (`tm_sec` up to 60).
 
 ### Wide characters, locales and time
 
@@ -443,7 +707,7 @@ compiler's (`std/c/rt/decimal.ax`), the same on every target:
   `long double` (every format: binary64, the x87's, binary128) correctly rounded both
   ways (to a decimal type in the decimal rounding direction, the exact value's exponent
   the one nearest 0; to a binary type to nearest), and between the decimal types. A
-  decimal operand does not mix with a standard floating or complex one in the usual
+  decimal operand does not mix with a binary floating (`_FloatN` too), complex or imaginary one in the usual
   arithmetic conversions (`C3230`, C23 6.3.1.8p1); a cast or an assignment converts
   between them (to a complex type: the real part). `_Generic`, `_Atomic` (lock-free for 4
   and 8 bytes; `+=` and the others a compare-exchange loop), `constexpr` (the value
@@ -468,7 +732,9 @@ compiler's (`std/c/rt/decimal.ax`), the same on every target:
   take the length modifiers `H`, `D` and `DD` with `a e f g` and their upper case: `%Da`
   writes the coefficient and the quantum exactly (`1.20`, `1.2e+03`: style f when
   -(n + 5) <= q <= 0, else e; a precision rounds the coefficient), `e f g` round the
-  value's digits as for `double`; `strfromd32` ... format as `snprintf` does.
+  value's digits as for `double`, both in the decimal rounding direction
+  (`fe_dec_setround`, which has the halfway case away from zero too, not the binary
+  one); `strfromd32` ... format as `snprintf` does.
   `<float.h>` has the `DEC32_` ... macros; `<fenv.h>` `FE_DEC_DOWNWARD`,
   `FE_DEC_TONEAREST`, `FE_DEC_TONEARESTFROMZERO`, `FE_DEC_TOWARDZERO`, `FE_DEC_UPWARD`,
   `fe_dec_getround` and `fe_dec_setround`, and `fenv_t` and `femode_t` hold the decimal
@@ -498,14 +764,37 @@ C17's 7.21 with C23's additions, and the wide-character input/output of `<wchar.
   (`fgetpos`, `fsetpos`, and `fseek`/`ftell` as far as `long` goes: on Windows and
   wasm32, where `long` has 32 bits, `ftell` fails with `EOVERFLOW` past 2 GB).
   `tmpfile` creates a file in the directory for temporary files (`TMPDIR`, else `/tmp`;
-  on Windows `TMP`, `TEMP`, ...) and removes it at once (on Windows when it is closed
-  or the program exits); `tmpnam` gives names there that no file has. `remove`
-  removes an empty directory too. On WebAssembly the files are the host's: the node
-  host's are node's own, or with `--root=dir` those under `dir`, which the program sees
-  as `/` (no path, `..` or symbolic link leads out of it), or with `--files=memory` a
-  file system in memory shared by the program's threads
-  (`std/internal/runtime/memfs.mjs`, which needs nothing of node's: a browser's host
-  can use it as it is).
+  on Windows `TMP`, `TEMP`, ...) exclusively (no file of the name may exist), private
+  to its owner (permissions 0600; on Windows an owner-only access control list and
+  exclusive access), and removes it at once (on Windows when it is closed or the
+  program exits); `tmpnam` gives names there that no file has: `axc-` and 12 random
+  letters and digits (about 62 bits from the system's random source), which another
+  program cannot guess, though it may create a file of the name between the call and
+  its use (`tmpfile` and `fopen`'s `x` exclude that). `rename` replaces a file of the
+  new name, on every target (7.21.4.2p2 leaves it to the implementation), and an
+  empty directory on Linux, macOS and Windows. `remove` removes an empty directory
+  too. On WebAssembly the files are the host's: the node host's are node's own, or
+  with `--root=dir` those under `dir`, which the program sees as `/` (no path, `..` or
+  symbolic link leads out of it), or with `--files=memory` a file system in memory
+  shared by the program's threads (`std/internal/runtime/memfs.mjs`, which needs
+  nothing of node's: a browser's host can use it as it is).
+- **`freopen` with a null file name** (7.21.5.4p3) changes the stream's mode to any
+  whose reading and writing the file was opened for (text and binary may change, and
+  appending, which then seeks to the end before each write where the file was not
+  opened for appending); its position and buffers are as after `fflush`, and its
+  orientation is reset. Another mode fails and closes the stream.
+- **Exit**: `exit` (and the return from `main`) flushes and closes every stream;
+  `_Exit`, `quick_exit` and `abort` write no buffered data and remove no `tmpfile`
+  files (7.22.4.5p2's choice). `fmemopen` and the other POSIX streams are not
+  provided (they are not ISO C's).
+- **Large transfers**: one `fread` or `fwrite` call may move more than 2^31 bytes
+  (the system's calls are made in pieces); a formatted output of more than `INT_MAX`
+  characters fails with `EOVERFLOW` (7.21.6.1p14).
+- **`getc`, `putc`, `getchar` and `putchar`** are also macros (7.21.7.5p2,
+  7.21.7.8p2), which evaluate their arguments once: while the program has one thread
+  a byte of a byte-oriented stream's buffer is taken or stored in line, and the
+  functions are called otherwise (an empty or full buffer, a new-line of a
+  line-buffered stream, any stream once a thread has started).
 - **Pushback**: `ungetc` takes up to 8 bytes, `ungetwc` a wide character as its
   multibyte bytes (one at least). Output after input, and input after output, need no
   `fflush` or seek between them (7.21.5.3p7 asks for one); `fflush` of an input stream
@@ -525,17 +814,20 @@ C17's 7.21 with C23's additions, and the wide-character input/output of `<wchar.
   n-char-sequence: `_PRINTF_NAN_LEN_MAX` is 0); `%a` writes a normal value with the
   leading digit 1 and a subnormal with 0 and the smallest normal's exponent, in every
   floating format; a conversion the standard does not have makes the call fail. The
-  decimal conversions are exact and correctly rounded at any precision, halfway cases
-  to even; the current rounding direction is not consulted. C23's `%b` and `%B` and the
+  decimal and hexadecimal conversions are exact and correctly rounded at any precision
+  in the current rounding direction (F.5: halfway cases to even when to nearest). C23's `%b` and `%B` and the
   `wN` and `wfN` length modifiers are accepted in every mode.
 - **`fscanf`**: an input item is the longest prefix of a matching sequence, and only
   the character after it is given back (7.21.6.2p9), so a prefix that is not a whole
   number is a matching failure: `"0x"` for `%x`, `"1e+"` and `"100ergs"` (the example of
   7.21.6.2p20) for `%f`, and `%3c` when the input ends after two characters. The
   scanset `%[a-z]` is a range when `-` is neither first nor last. `%p` reads what `%p`
-  writes. Floating conversions are correctly rounded for every format; `%i` reads C23's
+  writes. Floating conversions are correctly rounded for every format, in the current
+  rounding direction (as `strtod`'s are; an overflow toward zero gives the largest
+  finite value); `%i` reads C23's
   `0b` prefix in C23 mode (the header maps the functions to `__axc_..._c23` forms) and
-  not before, and `%b` reads binary digits after an optional `0b`.
+  not before, and `%b` reads binary digits after an optional `0b`. C23's digit
+  separators (`1'000`) are a constant's only: neither `fscanf` nor `strtod` reads them.
 - **`perror`** writes `strerror`'s message. The streams are flushed at exit, and the
   files `tmpfile` created removed.
 
@@ -818,7 +1110,8 @@ implementation knows act, the others are ignored.
 `__STDC__` (1), `__STDC_VERSION__` (above), `__DATE__`, `__TIME__` (the build's time, or
 the `SOURCE_DATE_EPOCH` environment variable's, in UTC), `__FILE__`, `__LINE__`. From C99,
 `__STDC_HOSTED__` is 1, or 0 with `--c-freestanding`. From C11, `__STDC_UTF_16__`,
-`__STDC_UTF_32__` are 1; `__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__` and
+`__STDC_UTF_32__` are 1, and in a hosted program `__STDC_LIB_EXT1__` is `201112L`
+("Annex K"); `__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__` and
 `__STDC_NO_THREADS__` are not defined: atomics, threads (see "Atomics and threads") and
 complex types are supported. In C23,
 `__STDC_EMBED_NOT_FOUND__`, `__STDC_EMBED_FOUND__` and `__STDC_EMBED_EMPTY__` are 0, 1
@@ -831,6 +1124,7 @@ The compiler's own macros say what the build chose:
 | Macro | Value |
 |---|---|
 | `__AXIOM__` | 1 |
+| `__AXIOM_HOSTED__` | 1, defined only in a hosted program (not with `--c-freestanding`), in every mode: C89 has no `__STDC_HOSTED__`. |
 | `__AXIOM_INT_WIDTH__`, `__AXIOM_LONG_WIDTH__` | The widths of `int` and `long` in bits. |
 | `__AXIOM_LDBL_WIDTH__` | The format of `long double`: 64 (binary64), 80 (the x87's) or 128 (binary128). |
 | `__AXIOM_PTR_WIDTH__` | The width of a pointer: 32 or 64. |
@@ -915,7 +1209,8 @@ format than the ABI's cannot pass `long double` values to it.
 | Signed overflow | Undefined. The code generated wraps, at every optimization level tried. |
 | Right shift of a negative value | Arithmetic (sign-extending): `-8 >> 1` is `-4`. |
 | Division | Truncates toward zero; `%` has the sign of the dividend. |
-| Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. There are no imaginary types. |
+| Complex types | `float _Complex`, `double _Complex` and `long double _Complex` (C99 and later; also of `_Float16` ... `_Float64x`) are laid out as an array of two elements of the real type, the real part first: the size is twice the real type's, the alignment the real type's. The imaginary types (`float _Imaginary`, `double _Imaginary`, `long double _Imaginary`, C99 and later, Annex G) have their real type's representation (the imaginary part); their arithmetic is G.5's (an imaginary times an imaginary is real, a real plus an imaginary complex, ...), their conversions G.4's (an imaginary converted to a real type is 0, a complex one to an imaginary type its imaginary part). |
+| Interchange and extended floating types | (C23 Annex H, and in every mode before C23.) `_Float16` is binary16, `_Float32` binary32, `_Float64` and `_Float32x` binary64, `_Float128` binary128 (`__float128` in a GNU dialect), `_Float64x` the x87 format where `long double` has it, else binary128; each a type of its own. `_Float16`'s operations are rounded to binary16 each (`FLT_EVAL_METHOD` 0: computed in `float`, which is exact enough that the one rounding is correct), `_Float128`'s and `_Float64x`'s are `long double`'s software arithmetic in that format. The usual arithmetic conversions take the type with more values, then of two with the same values an interchange type over a standard one over an extended one (`float + _Float32` is `_Float32`, `double + _Float32x` is `double`). Constants take `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` (either case). `<float.h>` has their macros (`FLT16_MAX` ...) under `__STDC_WANT_IEC_60559_TYPES_EXT__`; `__STDC_IEC_60559_TYPES__` is not defined (it needs Annex F). |
 | Floating types | `float` and `double` are IEEE 754 binary32 and binary64; `long double` as the table above says. `FLT_EVAL_METHOD` is 0, `FLT_ROUNDS` is 1 (to nearest): it is the start-up's mode, which `fesetround` changes on x86-64 and AArch64 (`<fenv.h>`, below; `FLT_ROUNDS` itself stays 1). A `long double` wider than `double` is computed in software (`std/c/rt/ldouble.ax`, written from IEEE 754-2019): each operation and conversion correctly rounded to nearest, ties to even, with subnormals; constant expressions are folded with the same arithmetic, and floating constants read exactly. Conversions of such a value to an integer type truncate and saturate, as those of `float` and `double` do (the behavior is undefined when the value does not fit). A NaN result of an invalid operation is the format's default NaN (the x87's negative "indefinite"; binary128's positive quiet NaN); a NaN operand gives its own, quieted (of two x87 NaNs, the one with the larger significand). x87 encodings the x87 itself treats as invalid (unnormals, pseudo-infinities, pseudo-NaNs) are invalid operands. The x87 format's six bytes of padding are zero in the values the program computes. |
 | Sizes and alignment | A scalar's alignment is its size. A structure is laid out naturally: each member at the next multiple of its alignment, the structure aligned as its strictest member, its size rounded up to that; `#pragma pack(n)` caps the members' alignments at n ("Pragmas"). |
 | `max_align_t` | Aligned as the platform's (above): a structure of a `long long` and a `long double` aligned to 16 (size 32 where `long double` is 16 bytes), or `long double` (8 bytes). |
@@ -962,10 +1257,10 @@ library's are `C1081`.
 | `<iso646.h>` | C95 and later | |
 | `<stdbool.h>` | C99 and later | In C23, `bool`, `true` and `false` are keywords and the header only defines `__bool_true_false_are_defined`. |
 | `<stdint.h>` | C99 and later | No `int32_t` family when no type is 32 bits wide. |
-| `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are the library's ("`<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions"). No `imaginary` or `_Imaginary_I`. |
+| `<complex.h>` | C99 and later | `complex`, `I` and `_Complex_I` (a constant of type `float _Complex`), `imaginary` and `_Imaginary_I` (of type `const float _Imaginary`), `CMPLX`, `CMPLXF` and `CMPLXL` (C11; constant expressions when the operands are), and the declarations of every function. `I` is `_Complex_I` (7.3.1p4 allows `_Imaginary_I` only with Annex G, which is not claimed). `creal`, `cimag` and `conj` (and their `f` and `l` forms) are also macros the compiler expands in line; the others are the library's ("`<math.h>`, `<fenv.h>`, `<tgmath.h>` and `<complex.h>`'s functions"). |
 | `<math.h>` | all | C89's double functions; from C99 everything of C17 7.12, in the three types, and C23's listed below. |
 | `<fenv.h>` | C99 and later | All of C17 7.6; C23's `fegetmode`, `fesetmode`, `fesetexcept`, `fetestexceptflag`. |
-| `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. |
+| `<tgmath.h>` | C99 and later | Every type-generic macro of C17 7.25 (and of C23's functions the library has), through `__builtin_axiom_tg`, in C99 too. Decimal arguments choose the `d32`, `d64` and `d128` functions (C23 7.27p3); arguments of the interchange and extended types (Annex H.11) their common real type's: `_Float16`'s and `_Float128`'s `f16` and `f128` functions (declared with `__STDC_WANT_IEC_60559_TYPES_EXT__`; without it float's function for `_Float16`), and for `_Float32`, `_Float64` and `_Float32x` the standard function of their format, whose result has the standard type. |
 | `<stdalign.h>` | C11 and later | |
 | `<stdatomic.h>` | C11 and later | All of 7.17 (see "Atomics and threads"). `ATOMIC_VAR_INIT` until C17; `atomic_char8_t` in C23. |
 | `<stdnoreturn.h>` | C11 and later | |
@@ -992,19 +1287,18 @@ as the standard says.
 
 ## Not supported
 
-- `_Imaginary` (the imaginary types, which are optional): `C3901`.
 - Annex F and Annex G: `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__`,
   `__STDC_IEC_559_COMPLEX__` and `__STDC_IEC_60559_COMPLEX__` are not defined on any
   target. What keeps them off: a `long double` wider than `double` (x86-64 Linux, AArch64
-  Linux) has software arithmetic that rounds to nearest only and raises no exception
-  flags (F.3, F.8); `FENV_ROUND`'s static direction does not apply to floating constants
+  Linux), and `_Float128` and `_Float64x` everywhere, have software arithmetic that
+  rounds to nearest only and raises no exception flags (F.3, F.8; `_Float16`'s, computed
+  in `float`, follows the environment); `FENV_ROUND`'s static direction does not apply to floating constants
   and static initializers (F.8.2, 7.6.2); WebAssembly has no floating-point environment;
   `erfl`, `erfcl`, `lgammal` and `tgammal` of a wide `long double` compute in double;
-  there are no imaginary types (Annex G). The rest is Annex F's: IEC 60559 formats for
+  the imaginary types follow G.4 and G.5, but Annex G needs Annex F. The rest is Annex F's: IEC 60559 formats for
   float and double, the operations correctly rounded in the dynamic mode, the
   exceptions, `FENV_ACCESS`, signaling relational operators, the functions' special
-  values (F.10) and `math_errhandling` with `MATH_ERREXCEPT` on x86-64 and AArch64. Annex K is not provided (`__STDC_LIB_EXT1__` is not
-  defined).
+  values (F.10) and `math_errhandling` with `MATH_ERREXCEPT` on x86-64 and AArch64.
 - `setjmp` on WebAssembly without its exception-handling extension (`C3300`).
 - `#embed` parameters other than `limit`, `prefix`, `suffix` and `if_empty` (`C1084`).
 - Extensions, under an ISO standard. These are all errors there: `__attribute__`, `asm`
@@ -1014,8 +1308,9 @@ as the standard says.
   `#include_next`, `#ident`. A GNU dialect has them ("GNU dialects"), but for those it
   rejects too.
 - In every mode: inline assembly on WebAssembly targets (C3901), `__declspec`, `#import`,
-  `#assert`, the floating types `_Float16`, `_FloatN`, `_FloatNx` and
-  `__float128`, and vector types (the attribute `vector_size`): C3901 in a GNU dialect.
+  `#assert`. In a GNU dialect: a jump from a nested function to a label of its enclosing
+  function (C3901), `__real__` and `__imag__`, and the decimal and `__bf16`/`__ibm128`
+  types.
 
 ## GNU dialects
 
@@ -1049,6 +1344,10 @@ exactly what works (there is no option that defines `__GNUC__`).
 | `__FUNCTION__`, `__PRETTY_FUNCTION__` | Other names of `__func__` (`""` outside a function). |
 | `T f(...) asm("name");` | The function's or object's symbol is `name` (an asm label; with external linkage). On an automatic object it is C3090, but on a `register` one: an explicit register variable ("Inline assembly"). |
 | `asm`, `__asm__` statements; file-scope `asm("...")` | Inline assembly on x86-64 and AArch64 ("Inline assembly", below). |
+| Nested functions | A function defined in a block: it sees the enclosing functions' objects (in their frames, through a chain of frame records passed to it as a hidden last argument) and may be called through a pointer while its enclosing call runs (a trampoline: one of a pool of 128 compiled thunks per nested function whose address is taken, claimed atomically and released when the enclosing call returns, so no code is written at run time and no stack is executable; more than 128 live at once traps). `auto` declares one ahead of its definition. Not variadic (C3901); a `goto` to a label of the enclosing function is C3901. |
+| `__float128`, constants `1.0q`/`1.0Q`, `2.0i`/`2.0j` | `__float128` is `_Float128`; `q` is its constant suffix; `i` or `j` makes an imaginary constant of the type (C17 Annex G's imaginary types, which every mode has: "Floating types"). |
+| `enum E : __int128` | An enumeration of a 128-bit underlying type (C23's fixed type); its constants' values must fit 64 bits (C3212). A `switch` on `__int128` takes case ranges. |
+| Vector types | `T __attribute__((vector_size(n)))` (or `mode(V4SI)` ...): n bytes (a power of two times T's size, at most 4096) of lanes of T, an integer or real floating type. The arithmetic, bitwise and shift operators act lane by lane (a scalar operand is converted to the element type, if that keeps its value, and taken for every lane); `==` ... `>=` give the signed integer vector of the same size, -1 where true and 0; `!` is C3020; `v[i]` reads and writes a lane; `?:` with a vector condition selects lane by lane; initializers and compound literals give the lanes in order (missing ones 0; designators are C3072); a cast between vectors, or a vector and an integer, of one size keeps the bytes (another is C3028). `__builtin_shuffle(a, [b,] mask)`, `__builtin_shufflevector(a, b, i...)` and `__builtin_convertvector(v, T)` (below). A vector is aligned to its size, at most 16 bytes on AArch64 and on x86-64 Linux and macOS (32 with AVX, 64 with AVX-512F; on Windows and WebAssembly its size); IR generation uses the target's vector instructions for up to 64 bytes, and lane-by-lane code where there are none (conversions between integer and floating lanes on WebAssembly, a shift by a vector of counts). |
 
 ### Preprocessor
 
@@ -1077,19 +1376,20 @@ C4052 and is ignored.
 
 | Attribute | Of | What it does |
 |---|---|---|
-| `aligned`, `aligned(n)` | objects, members, structures and unions | At least n bytes (no n: 16). On a typedef only its type's own alignment (another: C3901); on a function accepted (code is aligned as the target's). |
+| `aligned`, `aligned(n)` | objects, members, structures and unions, typedefs | At least n bytes (no n: 16). On a typedef the type it names has that alignment (an array of an over-aligned element whose size is not a multiple of it is C3008); on a function accepted (code is aligned as the target's). |
 | `packed` | structures, unions, members, enumerations | Members at byte alignment (but those with an alignment of their own); bit-fields at the next bit, each reached through the smallest unit of 1, 2, 4 or 8 bytes in the structure that holds it (none: C3901); an enumeration's type is the smallest integer type of its values. Members of a packed structure are loaded and stored with the alignment they have. |
-| `section("s")` | objects with static storage duration, functions | The object goes in section s of an ELF object (Linux); elsewhere, and for functions, accepted with no effect. The compiler's own linker does not define `__start_s` and `__stop_s`. |
+| `section("s")` | objects with static storage duration, functions | The object goes in section s of an ELF object (Linux); elsewhere accepted with no effect. A function's section is recorded in the IR (`ir.Func.section`) and not yet placed. The compiler's own linker does not define `__start_s` and `__stop_s`. |
 | `used` | objects, functions | Kept though nothing refers to it. |
 | `unused` | any declaration, labels | As `[[maybe_unused]]`. |
 | `weak` | objects and functions with linkage | A weak definition, which gives way to another unit's that is not weak ("C and Axiom in one program"), or a weak reference (a null pointer if no unit defines it; on WebAssembly the host's import). `#pragma weak` too. |
 | `alias("target")` | functions and objects | Another name for target, defined in the same unit (else C3090): references to it are to target. It has no symbol of its own: another unit cannot refer to it. |
-| `visibility("v")` | objects, functions | default, hidden, protected or internal: accepted (no effect: programs are static executables, and objects are linked into them). |
+| `visibility("v")` | objects, functions | default, hidden, protected or internal (another is C3077): recorded in the IR (`ir.Func.visibility`, `ir.Global.visibility`), as `#pragma GCC visibility` gives it to the declarations it covers, and written to `--emit=obj` and `--emit=lib` objects (ELF: `STV_HIDDEN` for hidden and internal, `STV_DEFAULT` for the others), where another link sees it; no effect on an executable's own code. |
 | `noreturn` | functions | As `[[noreturn]]` (C4053). |
-| `noinline`, `always_inline`, `cold` | functions | Given to the optimizer. |
+| `noinline`, `always_inline` | functions | Given to the optimizer. |
+| `cold`, `hot` | functions | Given to the optimizer and the code generator: a block that calls a cold function (and the branch `__builtin_expect` says is unlikely) is laid out apart, as cold code. |
 | `naked` | functions | The function is its asm statements (basic, or extended with no operands: else C3096): their text after a label of its name, with no prologue or epilogue ("Inline assembly"). |
-| `hot`, `const`, `pure`, `malloc`, `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `sentinel`, `format_arg`, `may_alias` | | Accepted; no effect (none is needed for correct code). |
-| `format(archetype, i, j)` | functions | Arguments checked; the calls are not. |
+| `const`, `pure`, `malloc`, `nothrow`, `leaf`, `artificial`, `flatten`, `noclone`, `noipa`, `externally_visible`, `no_instrument_function`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `sentinel`, `may_alias` | | Accepted; no effect (none is needed for correct code). The optimizer is not told what `const`, `pure`, `malloc`, `returns_nonnull`, `alloc_size`, `assume_aligned` and `nonnull` promise: it would act on a promise a program breaks (a `const` function that writes memory, a null result), and the IR has no way to say them. |
+| `format(archetype, i, j)`, `format_arg(i)` | functions | The calls' format strings are checked (`--c-warn-format`): archetype `printf`, `scanf` or `strftime` (also `gnu_printf`, ...), the format parameter i, the first argument checked j (0: none, as for `vprintf`). The conversions are C23's (with `b`, `B`, `wN`, `wfN`, and the decimal floating types' `H`, `D` and `DD`) and POSIX's `%n$` positions. A literal format is checked against the arguments' types as this target has them: C4130 (an argument the conversion does not take), C4131 (too few), C4133 (not a conversion specification); at level 2 also C4132 (arguments left over), C4134 (a format that is not a literal) and C4135 (another type of the same size and kind, a flag the conversion ignores, `%n`). A call of a `format_arg` function with a literal is checked as that literal. The C library's declarations (`printf`, `scanf`, `strftime`, their kin) carry the attribute in every mode. |
 | `nonnull`, `nonnull(i, ...)` | functions | A null pointer constant passed for one of those parameters (all pointers without indexes) is warning C4121. |
 | `warn_unused_result` | functions | As `[[nodiscard]]` (C4051). |
 | `deprecated`, `deprecated("m")`, `unavailable` | declarations | As `[[deprecated]]` (C4050). |
@@ -1099,8 +1399,8 @@ C4052 and is ignored.
 | `constructor`, `constructor(p)`, `destructor`, `destructor(p)` | functions without parameters | Called by the program's start-up before `main` (lowest priority first; without one, 65535; then in the order defined), and after `main` returns (highest priority first, the last defined first). `exit` (the C library's) runs the destructors too, after the `atexit` functions, once; a program whose `main` is Axiom's runs the constructors before it and the destructors when it returns; an object without `main` (`--emit=obj`), and a freestanding program that ends by calling the system's `exit`, run neither, or no destructors. |
 | `cleanup(f)` | automatic objects | `f(&object)` when its scope is left: the end of its block, `break`, `continue`, `goto` out, `return` (after the value is computed), the end of a statement expression; innermost first. A jump into its scope is C3083. |
 | `transparent_union` | unions (and their typedefs) | A parameter of the type takes an argument of any member's type (or a null pointer constant, or a pointer to void for a pointer member). It is passed as the union is (the platform ABIs pass a union of one pointer or integer as that member). |
-| `mode(m)` | integer objects, members, typedefs | The integer type of m's width with the declared type's signedness: QI, HI, SI, DI, TI (`__int128`), `byte`, `word`, `pointer` (also `__QI__` ...). |
-| `vector_size(n)` | | C3901: vector types are not supported. |
+| `mode(m)` | objects, members, typedefs | The integer type of m's width with the declared type's signedness: QI, HI, SI, DI, TI (`__int128`), `byte`, `word`, `pointer` (also `__QI__` ...); of a floating type: HF (`_Float16`), SF, DF, XF (the x87 format's `long double` or `_Float64x`), TF (binary128: `long double` where that is its format, else `_Float128`), and SC, DC, TC ... their complex types; a vector mode (V4SI, V2DF, ...): the vector of those lanes. |
+| `vector_size(n)` | objects, members, typedefs | The vector type of n bytes of the declared type ("Language": vector types). |
 
 In gnu89 and gnu90 `inline` has GNU89's meaning: `inline` alone defines the external
 function, `extern inline` is an inline definition (C99's `inline`).
@@ -1329,17 +1629,23 @@ In a GNU dialect (under an ISO standard only those of "Reserved identifiers"); e
 | `__builtin_choose_expr(c, a, b)` | a if the integer constant c is nonzero, else b (unconverted; the other is not checked). |
 | `__builtin_types_compatible_p(T1, T2)` | 1 if the types are compatible (top-level qualifiers aside). |
 | `__builtin_offsetof(T, m)` | As `offsetof`. |
-| `__builtin_object_size(p, t)`, `__builtin_dynamic_object_size` | The size is never known: `(size_t)-1` for t 0 and 1, 0 for 2 and 3. |
+| `__builtin_object_size(p, t)`, `__builtin_dynamic_object_size` | The bytes from p to the end of the object (t 0, 2) or of the closest member (t 1, 3; a member array at the end of its structure counts to the object's end), when the expression shows the object: a declared object of a complete non-VLA type, a string literal or a compound literal, its address, its array decayed, an element at a constant index, a member, or such a pointer converted or offset by a constant (0 past the end). Otherwise unknown: `(size_t)-1` for t 0 and 1, 0 for 2 and 3 (no data flow is followed; an object whose type has a flexible array member is unknown). |
 | `__builtin_clz`, `ctz`, `popcount`, `parity`, `ffs`, `clrsb`, with `l` and `ll` | Of `unsigned int` (ffs, clrsb: `int`) ... `unsigned long long`; clz and ctz of 0 give the type's width. |
 | `__builtin_bswap16`, `bswap32`, `bswap64` | |
 | `__builtin_add_overflow`, `sub_overflow`, `mul_overflow(a, b, r)` | As `ckd_add(r, a, b)`; the typed `__builtin_sadd_overflow` ... `umulll_overflow`; `__builtin_add_overflow_p(a, b, c)` ... (whether the result overflows c's type). |
 | `__builtin_memcpy`, `memmove`, `memset` | The IR's operations; their value is the destination. |
-| `__builtin_abs`, `fabs`, `sqrt`, `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, `copysign`, `fma` (with `f` and `l`) | The IR's operations (`sqrt` of a negative number is a NaN; errno is not set; `fma` on WebAssembly calls the library's). Where `long double` is wider than `double`, the `l` forms but `fabsl` and `copysignl` (which change the sign bit) call the library's function of that name. |
+| `__builtin_abs`, `fabs`, `sqrt`, `floor`, `ceil`, `trunc`, `rint`, `nearbyint`, `copysign`, `fma` (with `f` and `l`; `fabs` and `copysign` also with `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` and `q`) | The IR's operations (`sqrt` of a negative number is a NaN; errno is not set; `fma` on WebAssembly calls the library's). Where `long double` is wider than `double`, the `l` forms but `fabsl` and `copysignl` (which change the sign bit) call the library's function of that name. |
 | `__builtin_memcmp`, `strlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strchr`, `strrchr`, `strstr`, `memchr`, `printf`, `sprintf`, `snprintf`, `puts`, `putchar`, `malloc`, `calloc`, `realloc`, `free`, `abort`, `exit`, `labs`, `llabs`, and the math functions (`sin`, `cos`, `tan`, `exp`, `log`, `pow`, `round`, `fmin`, `fmax`, `fmod`, `hypot`, `ldexp`, `frexp`, `modf`, `lround` ... with `f` and `l` where the library has them) | Calls of the C library's function of that name. |
 | `__builtin_alloca(n)`, `__builtin_alloca_with_align(n, bits)` | n bytes of the function's frame, until it returns. |
-| `__builtin_frame_address(0)`, `__builtin_return_address(0)` | The frame record's address and the return address (natively); on WebAssembly the stack pointer and a null pointer. Another level is C3090. |
+| `__builtin_frame_address(n)`, `__builtin_return_address(n)` | The frame record n links up the chain of frame records and its return address (natively: the compiler's functions keep frame records; a caller compiled without them gives what its frame holds, as with other compilers); on WebAssembly the stack pointer for level 0, else a null pointer. A level above 65535 is C3090. |
+| `__builtin_setjmp(buf)`, `__builtin_longjmp(buf, 1)` | `<setjmp.h>`'s setjmp and longjmp with a `jmp_buf` in the calling function's frame, whose address `buf[0]` holds (buf is at least one pointer; five, as other compilers take, is fine): 0, then 1 after the jump; the jump is valid while that function runs. The second argument must be 1 (C3082). Not on WebAssembly (C3300; `__has_builtin` is 0 there). |
+| `__builtin_cpu_supports("name")`, `__builtin_cpu_is("intel" or "amd")`, `__builtin_cpu_init()` | The running processor, as `std/os/cpu.ax` detects it (`@cpu_has`'s answer): a name of its table for the target's architecture (another architecture's is 0; an unknown one C3082), and on x86-64 also `cmov`, `mmx`, `sse`, `sse2`, `x86-64` (1) and the levels `x86-64-v2` ... `x86-64-v4`; an extension the build assumes is the constant 1; on WebAssembly every answer is the build's. `cpu_is` is x86-64's only (cpuid's vendor; another name is C3090); `cpu_init` does nothing (detection is done when first asked). |
+| `__builtin_ia32_pause()`, `__builtin_ia32_mfence()`, `lfence`, `sfence` | On every target: nothing (a spin-wait hint), and a full memory fence. |
+| `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` | The vector of a's (then b's) lanes that mask's lanes (an integer vector of as many lanes and the same lane size) select, modulo their count. |
+| `__builtin_shufflevector(a, b, i, ...)` | The vector of the lanes the constant indexes select from a then b (-1: any value); as many lanes as indexes. |
+| `__builtin_convertvector(v, T)` | v's lanes converted to vector type T's element type (as a cast of each), T of as many lanes. |
 | `__builtin_prefetch(p, ...)`, `__builtin_assume_aligned(p, a [, o])` | Nothing; p. |
-| `__builtin_inf`, `huge_val`, `nan("")`, `nans("")` (with `f` and `l`) | Constants (a NaN's payload is not kept; a signaling NaN is quiet; a NaN is positive). |
+| `__builtin_inf`, `huge_val`, `nan("")`, `nans("")` (with `f`, `l`, `f16`, `f32`, `f64`, `f128`, `f32x`, `f64x` and `q`) | Constants (a NaN's payload is not kept; a signaling NaN is quiet; a NaN is positive). |
 | `__builtin_isnan`, `isinf`, `isfinite`, `isnormal`, `signbit`, `isinf_sign`, `fpclassify(a, b, c, d, e, x)`, `isgreater`, `isgreaterequal`, `isless`, `islessequal`, `islessgreater`, `isunordered` | Of the floating type of the operands (an integer is a double). |
 | `__sync_fetch_and_op`, `__sync_op_and_fetch` (op: add, sub, or, and, xor, nand), `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, `__sync_lock_release`, `__sync_synchronize` | Atomic, sequentially consistent. |
 | `__atomic_load_n`, `store_n`, `exchange_n`, `compare_exchange_n`, `fetch_op`, `op_fetch`, `test_and_set`, `clear`, `thread_fence`, `signal_fence`, the generic `load`, `store`, `exchange`, `compare_exchange`, `always_lock_free`, `is_lock_free` | Every memory order is taken as `__ATOMIC_SEQ_CST` (a stronger order is a valid one). |
@@ -1368,12 +1674,12 @@ is the warning C4112 and is ignored; an unknown one is ignored (the warning C411
 | `STDC FENV_ACCESS ON/OFF/DEFAULT` | OFF holds; ON is the warning C4113: the optimizer assumes the default floating-point environment (`<fenv.h>` changes and tests it at run time: see "The floating-point environment"). |
 | `STDC CX_LIMITED_RANGE ON/OFF/DEFAULT` | Accepted (it allows, and asks for nothing). |
 | `STDC FENV_ROUND dir` (C23) | FE_TONEAREST and FE_DYNAMIC hold; the other directions are C4113. |
-| `GCC diagnostic push`, `pop`, `ignored "-Wx"`, `warning "-Wx"`, `error "-Wx"` | The warnings after it (in its file, and in the files it includes) that -Wx names are not shown, shown, or errors (keeping their codes). -Wx is one of the compiler's codes (`"C4050"`), `-Wall`, `-Wextra` and `-Wpedantic` (every warning), or a usual name that stands for one: `-Wdeprecated-declarations` and `-Wdeprecated` (C4050), `-Wunused-result` and `-Wunused-value` (C4051), `-Wattributes` (C4052), `-Winvalid-noreturn` (C4053), `-Wimplicit-function-declaration` (C4001), `-Wunused-label` (C4040), `-Wvarargs` (C4080), `-Wmultichar` (C4102), `-Wcpp` (C4103), `-Wunknown-pragmas` (C4111), `-Wpragmas` (C4112), `-Wnonnull` (C4121), `-Wswitch-outside-range` (C4120), `-Wattribute-warning` (C4123); others are ignored. An error is never made a warning. |
-| `GCC visibility push(v)`, `pop` | Accepted (as the attribute visibility). |
+| `GCC diagnostic push`, `pop`, `ignored "-Wx"`, `warning "-Wx"`, `error "-Wx"` | The warnings after it (in its file, and in the files it includes) that -Wx names are not shown, shown, or errors (keeping their codes). -Wx is one of the compiler's codes (`"C4050"`), `-Wall`, `-Wextra` and `-Wpedantic` (every warning), or a usual name that stands for one: `-Wdeprecated-declarations` and `-Wdeprecated` (C4050), `-Wunused-result` and `-Wunused-value` (C4051), `-Wattributes` (C4052), `-Winvalid-noreturn` (C4053), `-Wimplicit-function-declaration` (C4001), `-Wunused-label` (C4040), `-Wvarargs` (C4080), `-Wmultichar` (C4102), `-Wcpp` (C4103), `-Wunknown-pragmas` (C4111), `-Wpragmas` (C4112), `-Wnonnull` (C4121), `-Wswitch-outside-range` (C4120), `-Wattribute-warning` (C4123), `-Wformat` (C4130 to C4135), `-Wformat-extra-args` (C4132), `-Wformat-nonliteral` and `-Wformat-security` (C4134), `-Wformat-signedness` (C4135); others are ignored. An error is never made a warning (nor a check `--c-warn-format` does not make enabled). |
+| `GCC visibility push(v)`, `pop` | The declarations with external linkage up to the matching `pop` get visibility v (as the attribute, which overrides it). |
 | `GCC poison x y` | A later use of x or y is the error C1086 (not one a macro defined before makes). |
 | `GCC system_header` | The rest of the file gives no warnings (in the main file it means nothing). |
 | `GCC warning "m"`, `GCC error "m"` | The warning C4103, or the error C1040. |
-| `GCC push_options`, `pop_options`, `optimize`, `target`, `unroll`, `ivdep`, `novector`, `dependency` | Ignored. |
+| `GCC push_options`, `pop_options`, `optimize`, `target`, `unroll`, `ivdep`, `novector`, `dependency` | Ignored: the optimization level and the extensions are the command line's for the whole program (a function that needs more extensions is Axiom's `@features`). |
 
 `--emit=c-pp` writes the pragmas the later phases read, where they change what they say: `pack(n)` (the value then in force), `GCC visibility`, and the `weak` ones at the end; the others have acted already.
 
@@ -1543,9 +1849,10 @@ time zone, the wide character classes' table, the standard streams' first use) a
 done once, whichever threads ask at once, at the cost of an atomic load once done.
 What the standard lets race, races: `rand` (one state, 7.22.2.1p3), `strtok`, `asctime`,
 `ctime`, `gmtime`, `localtime` and `strerror`'s static results, `setlocale` and
-`localeconv` (7.11.1.1p5), the multibyte functions' internal states (`mblen`, `mbtowc`,
-`wctomb`), `signal` (undefined in a program with threads, 7.14.1.1p7), `tmpnam` with a
-null argument.
+`localeconv` (7.11.1.1p5), `signal` (undefined in a program with threads, 7.14.1.1p7),
+`tmpnam` with a null argument. The multibyte functions' internal states (`mblen`,
+`mbtowc`, `wctomb`, and the restartable ones with a null state pointer) are each
+thread's own.
 
 Measured on x86-64 Linux against the system's C library and its threads (at -O2, a
 loaded machine, best of five runs): an uncontended `mtx_lock` and `mtx_unlock` take
@@ -1605,6 +1912,17 @@ compiler that has them on Windows (the integers of their sizes: `_Decimal32` and
 the hidden pointer), and on WebAssembly passes them as `f32`, `f64` and binary128's two
 `i64`s. Checked against the system's C compiler on `x86_64` and `aarch64` Linux, both
 ways (`gen_c_abi.py --dec`, thousands of random shapes).
+
+A vector travels as the ABI says: on x86-64 System V one SSE eightbyte of 8 bytes, SSE and
+SSEUP of 16 (32 and 64 bytes in memory: "Known deviations"), lanes of smaller ones as a
+structure's; on AArch64 a short vector (8 or 16 bytes) in a `v` register, homogeneous
+aggregates of them included, larger ones by reference; on Windows x64 by reference (an 8
+byte one in a register), a 16-byte result in `xmm0`; on WebAssembly a 16-byte vector as
+`v128` with `simd128`, else as its bytes would be. `_Float16` is passed as a `float`
+register holding its bits (System V's and AAPCS64's `_Float16`, in homogeneous
+aggregates too), `_Float128` as the binary128 `long double` below (on Windows x64 by
+reference, its result in `xmm0`). Checked against the system's C compiler on `x86_64`
+and `aarch64` Linux, both ways (`gen_c_abi.py --f16 --f128 --vec`, `c/run/abi_gen_106.c`).
 
 A `long double` travels as the ABI says for its format: the x87's in memory (System V's
 classes X87 and X87UP; a structure or union holding one is classified with them), its
@@ -1822,9 +2140,9 @@ claims less than the standard allows. None is hidden: each is said above or here
   signaling, so `<float.h>` has no `FLT_SNAN`.
 - `erfl`, `erfcl`, `lgammal`, `tgammal`, `sinpil` and `cospil`, where `long double` is
   wider than `double`, compute in `double`: their results have `double`'s precision.
-- Annex G is not claimed (`__STDC_IEC_559_COMPLEX__` is not defined): it needs Annex F,
-  and before C23 the imaginary types, which are absent. Complex arithmetic follows it
-  all the same where it can: a real operand of `+ - * /` with a complex one is not made
+- Annex G is not claimed (`__STDC_IEC_559_COMPLEX__` is not defined): it needs Annex F.
+  The imaginary types are supported, with G.4's conversions and G.5's arithmetic, and
+  complex arithmetic follows it all the same where it can: a real operand of `+ - * /` with a complex one is not made
   complex (G.5: `2.0 * z` is `2.0 * creal(z) + 2.0 * cimag(z) * I`, and signed zeros of
   the other part are kept), and multiplication and division recover the infinities and
   zeros G.5.1 describes when the formulas give NaN + iNaN. Division uses Smith's method
@@ -1842,10 +2160,22 @@ claims less than the standard allows. None is hidden: each is said above or here
   honoured (C4113).
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;
   a program must not rely on it.
-- An object from `--emit=obj` of units with no `main` does not link into an Axiom
-  program with `--link=` (above); the C sources build with it instead. There are no
-  static archives of the compiler's own objects.
-- In a GNU dialect: the `_FloatN` types are not supported; the
+- Annex H is not claimed (`__STDC_IEC_60559_TYPES__` is not defined): it needs Annex F.
+  The `_Float16` and `_Float128` functions of `<math.h>` and the conversions of
+  `<stdlib.h>` are the library's under `__STDC_WANT_IEC_60559_TYPES_EXT__`: binary128's
+  exact functions correctly rounded, its elementary functions in its precision, but
+  `erff128`, `erfcf128`, `lgammaf128` and `tgammaf128` in `double`; binary16's through
+  `float` (the elementary ones rounded twice, so not always correctly rounded); those of
+  `_Float32`, `_Float64`, `_Float32x` and `_Float64x` are macros for the `float`,
+  `double`, `long double` or `_Float128` functions, whose results have those types (a
+  `_Generic` on one sees `float`, not `_Float32`). There are no complex `_FloatN`
+  functions; `<tgmath.h>` chooses `_Float16`'s and `_Float128`'s, and the standard ones for the others.
+- Vectors of 32 and 64 bytes are passed and returned in memory on x86-64 System V even
+  with AVX (the psABI passes them in `ymm` and `zmm` registers then); a C library that
+  takes `__m256` arguments is not callable with them. Smaller vectors, and every vector
+  on AArch64, Windows and WebAssembly (`v128` with `simd128`), follow the ABI, checked
+  against the system's C compiler on `x86_64` and `aarch64` Linux.
+- In a GNU dialect: the
   destructors run when `main` returns and from the library's `exit`, not when the
   process ends otherwise (`_Exit`, `quick_exit`, a signal); an alias is another name in its unit only; the
   attribute `section` places only data, and only in ELF objects.

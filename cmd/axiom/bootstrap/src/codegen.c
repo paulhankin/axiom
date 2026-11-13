@@ -1438,7 +1438,16 @@ static LLVMValueRef global_ref(Decl *d) {
     LLVMValueRef g = symmap_get(&global_vals, k);
     if (g) return g;
     Type *t = d->type;
-    g = LLVMAddGlobal(mod, lty(t), arena_printf("%s.%s", mangle_prefix(d), d->name));
+    if (d->extern_c) {
+        // an object C defines (spec section 14.5.6): a declaration of its symbol
+        g = LLVMGetNamedGlobal(mod, d->name);
+        if (!g) g = LLVMAddGlobal(mod, lty(t), d->name);
+        LLVMSetAlignment(g, (unsigned)type_align(t));
+        symmap_put(&global_vals, k, g);
+        return g;
+    }
+    // (an exported one: its own name, for C)
+    g = LLVMAddGlobal(mod, lty(t), d->is_export ? d->name : arena_printf("%s.%s", mangle_prefix(d), d->name));
     LLVMSetAlignment(g, (unsigned)type_align(t));
     if (d->tls) {
         LLVMSetThreadLocal(g, true);
@@ -1446,7 +1455,7 @@ static LLVMValueRef global_ref(Decl *d) {
     }
     symmap_put(&global_vals, k, g);
     if (O->unit == CG_MODULE) return g;  // defined by the link unit
-    if (O->unit == CG_WHOLE) LLVMSetLinkage(g, LLVMInternalLinkage);
+    if (O->unit == CG_WHOLE && !d->is_export) LLVMSetLinkage(g, LLVMInternalLinkage);
     LLVMSetInitializer(g, gen_const(d->init, t));
     if (!d->mut) LLVMSetGlobalConstant(g, true);
     return g;
@@ -1632,6 +1641,12 @@ static FnInst *get_inst_feats(Decl *d, Type **gargs, int n, uint64_t feats) {
     fi->site = inst_site(d->name_span);
     fi->fnty = n ? type_subst(d->type, d->all_gparams, gargs, n) : d->type;
     if (n) check_inst_sizes(fi->fnty, fi->site);
+    if (d->cabi)
+        // (the structures of C's calling conventions: the compiler's own code
+        // generator passes them, through the C front end's wrappers; this one
+        // never needs to)
+        diag_error(d->name_span, "E9001",
+                   "the bootstrap compiler does not pass structures by value to or from C functions (spec section 14.5.3); build with the compiler");
     fi->llty = fn_lty(fi->fnty, &fi->sret);
     fi->display = fn_display(d, gargs, n);
     const char *name;
@@ -5349,6 +5364,9 @@ bool codegen_program(CgOptions *o) {
             Decl *d = g_prog.fns.data[i];
             if (d->is_export) get_inst(d, NULL, 0);
         }
+        // and the objects exported for C (spec section 14.5.6)
+        for (int i = 0; i < g_prog.globals.len; i++)
+            if (g_prog.globals.data[i]->is_export) global_ref(g_prog.globals.data[i]);
     } else if (O->unit == CG_MODULE) {
         // Every non-generic function of the module (other units may call
         // any of them, directly or from a generic instance).

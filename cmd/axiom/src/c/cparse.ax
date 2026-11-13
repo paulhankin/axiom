@@ -485,7 +485,7 @@ fn is_type_kw(id: i32) bool {
            (id == ct.K_FLOAT) or (id == ct.K_DOUBLE) or (id == ct.K_SIGNED) or (id == ct.K_UNSIGNED) or
            (id == ct.K_BOOL) or (id == ct.K_COMPLEX) or (id == ct.K_IMAGINARY) or (id == ct.K_DECIMAL32) or
            (id == ct.K_DECIMAL64) or (id == ct.K_DECIMAL128) or (id == ct.K_BUILTIN_VA_LIST) or (id == ct.K_INT64) or
-           (id == ct.K_INT128) or (id == ct.K_EXT_FLOAT) or (id == ct.K_AUTO_TYPE);
+           (id == ct.K_INT128) or ((id >= ct.K_FLOAT128) and (id <= ct.K_FLOAT64X)) or (id == ct.K_AUTO_TYPE);
 }
 
 fn is_qual_kw(id: i32) bool {
@@ -738,7 +738,8 @@ fn parse_attrs_g(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
 // `out` with the prefix "gnu"; an empty one is none.
 fn parse_gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
     while at_kw(P, ct.K_ATTRIBUTE) {
-        _ = advance(P);
+        // (the compiler's headers' __axiom_attribute__, in every mode: prefix __axiom)
+        let pre = u.pick(u.str_eq(advance(P).text, "__axiom_attribute__"), "__axiom", "gnu");
         if not expect_p(P, ct.P_LPAREN) {
             return;
         }
@@ -760,7 +761,7 @@ fn parse_gnu_attrs(P: *mut Parser, out: *mut u.List.[*mut cast.Attr]) void {
             let a = u.new.[cast.Attr]();
             let w = advance(P);
             a.span = w.span;
-            a.prefix = "gnu";
+            a.prefix = pre;
             a.name = w.text;
             if gnu_expr_args(a.name) and at_p(P, ct.P_LPAREN) {
                 gnu_exprs(P, a);
@@ -1397,6 +1398,7 @@ fn parse_declarator_into(P: *mut Parser, d: *mut cast.Declarator, mode: i32) voi
         _ = advance(P);
         d.name = t.text;
         d.name_span = t.span;
+        d.vis = cpg.visibility_at(P.pos);
         parse_attrs_g(P, &mut d.attrs);
     } else if at_p(P, ct.P_LPAREN) and ((mode == D_CONCRETE) or not paren_is_params(P)) {
         _ = advance(P);
@@ -1791,6 +1793,8 @@ fn parse_init_declarators(P: *mut Parser, d: *mut cast.Decl, ctx: i32, start: u.
             if P.gnu {
                 asm_label(P, dc);
                 gnu_attrs(P, &mut dc.attrs);
+            } else if at_kw(P, ct.K_ATTRIBUTE) {
+                gnu_attrs(P, &mut dc.attrs);  // (__axiom_attribute__ of the compiler's headers)
             }
         }
         if (d.decls.len == 0) and is_function_declarator(dc) and (ctx != CTX_MEMBER) and (ctx != CTX_KR) and
@@ -1830,7 +1834,8 @@ fn parse_function_def(P: *mut Parser, d: *mut cast.Decl, dc: *mut cast.Declarato
                       start: u.Span) *mut cast.Decl {
     d.kind = cast.DeclKind.FUNC_DEF;
     d.decls.push(dc);
-    if ctx != CTX_FILE {
+    if (ctx != CTX_FILE) and not (P.gnu and (ctx == CTX_BLOCK)) {
+        // (a GNU dialect has nested functions: csema_nest.ax)
         error_at(dc.span, "C2015", "a function cannot be defined inside another function");
     }
     // the function's own name is in scope in its body
@@ -2427,8 +2432,8 @@ fn parse_primary(P: *mut Parser) *mut cast.Expr {
         if (later_kw(P, 0) == ct.K_GENERIC) and is_p(peek(P, 1), ct.P_LPAREN) {
             return parse_generic(P);
         }
-        if (u.str_eq(t.text, "__builtin_va_arg") or u.str_eq(t.text, "__builtin_offsetof")) and
-           is_p(peek(P, 1), ct.P_LPAREN) {
+        if (u.str_eq(t.text, "__builtin_va_arg") or u.str_eq(t.text, "__builtin_offsetof") or
+            (P.gnu and u.str_eq(t.text, "__builtin_convertvector"))) and is_p(peek(P, 1), ct.P_LPAREN) {
             return parse_type_builtin(P);
         }
         if P.gnu and u.str_eq(t.text, "__builtin_types_compatible_p") and is_p(peek(P, 1), ct.P_LPAREN) {
@@ -2532,7 +2537,9 @@ fn parse_primary(P: *mut Parser) *mut cast.Expr {
 // `[ constant-expression ]` (each a MEMBER or an INDEX node in args).
 fn parse_type_builtin(P: *mut Parser) *mut cast.Expr {
     let t = advance(P);
-    let va = u.str_eq(t.text, "__builtin_va_arg");
+    // (a GNU dialect's `__builtin_convertvector ( assignment-expression ,
+    // type-name )` is read as va_arg is, and is a VA_ARG of that name)
+    let va = u.str_eq(t.text, "__builtin_va_arg") or u.str_eq(t.text, "__builtin_convertvector");
     let e = cast.new_expr(cast.ExprKind.OFFSETOF, t.span);
     if va {
         e.kind = cast.ExprKind.VA_ARG;

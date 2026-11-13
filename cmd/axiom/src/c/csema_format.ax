@@ -1,0 +1,815 @@
+// =============================================================================
+// csema_format.ax - the checks of format strings at calls of functions with
+// the attribute format(archetype, string-index, first-to-check): printf,
+// scanf and strftime archetypes (C17 7.21.6.1, 7.21.6.2, 7.27.3.5, with C23's
+// b and B conversions and wN and wfN length modifiers, and the %n$ argument
+// positions of POSIX), and format_arg(n) functions, whose result is a format
+// that their argument n gives. The C library's declarations carry the
+// attribute in every mode (__axiom_attribute__ in the headers: __AXC_FORMAT).
+//
+// Only a format that is a string literal is checked (or a call of a
+// format_arg function with one). The warnings, by --c-warn-format=N
+// (COptions.warn_format; #pragma GCC diagnostic names them -Wformat and the
+// names below):
+//   level 1 (the default: what is undefined, or fails, whatever the target)
+//     C4130  an argument whose type the conversion does not take: another
+//            kind of value (an integer for %s, a pointer for %d ...) or of
+//            another size on this target (a long long for %d)
+//     C4131  too few arguments for the format
+//     C4133  a conversion specification that is not one: an unknown
+//            conversion, a length modifier it does not take, %n$ positions
+//            mixed with plain ones, a missing position
+//   level 2 (and level 1's)
+//     C4132  more arguments than the format uses (-Wformat-extra-args)
+//     C4134  a format that is not a string literal (-Wformat-nonliteral)
+//     C4135  what is defined but suspect: an argument of the right size and
+//            kind but another type (int for %ld where both are 32 bits; a
+//            signedness that differs); a flag the conversion ignores; %n
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "csema.ax" as cs;
+import "ctypes.ax" as cty;
+
+/// The archetypes (the attribute's first argument).
+pub const FK_NONE: i32 = 0;
+pub const FK_PRINTF: i32 = 1;
+pub const FK_SCANF: i32 = 2;
+pub const FK_STRFTIME: i32 = 3;
+
+/// The archetype named `name` (printf, __printf__, gnu_printf, scanf,
+/// gnu_scanf, strftime, gnu_strftime), or FK_NONE.
+pub fn archetype(name0: []u8) i32 {
+    let mut name = name0;
+    if (name.len > 4) and u.starts(name, "__") and u.ends(name, "__") {
+        name = name[2..name.len - 2];
+    }
+    if u.starts(name, "gnu_") {
+        name = name[4..];
+    }
+    if u.str_eq(name, "printf") {
+        return FK_PRINTF;
+    }
+    if u.str_eq(name, "scanf") {
+        return FK_SCANF;
+    }
+    if u.str_eq(name, "strftime") {
+        return FK_STRFTIME;
+    }
+    return FK_NONE;
+}
+
+fn level() i32 {
+    return cs.opts().warn_format;
+}
+
+fn warn(lv: i32, sp: u.Span, code: []u8, msg: []u8) void {
+    if level() >= lv {
+        cs.warn(sp, code, msg);
+    }
+}
+
+// e without the conversions semantic analysis made (array decay, value conversions).
+fn strip(e: *mut cast.Expr) *mut cast.Expr {
+    let mut x = e;
+    while (x.kind == cast.ExprKind.CAST) and u.isnil(x.tname) and
+          ((x.op == cast.CV_VALUE) or (x.op == cast.CV_ADECAY)) {
+        x = x.a;
+    }
+    return x;
+}
+
+/// What the format checker needs of a function's attributes: its format
+/// archetype, the format's parameter (from 1), the first variadic one (0:
+/// a va_list's), or of a format_arg function the parameter its result
+/// comes from.
+pub struct Spec {
+    kind: i32,
+    index: i32,
+    first: i32,
+}
+
+/// Checks call e (typed) of function f, declared with format(kind, index,
+/// first); fa: how to find a format_arg function's argument (the
+/// parameter number of the callee of a call, or 0).
+pub fn check_call(e: *mut cast.Expr, fname: []u8, sp: Spec, fa: fn(*mut cast.Expr) *mut cast.Expr) void {
+    if (level() == 0) or (sp.index < 1) or (@as(usize, @bit_cast(u32, sp.index)) > e.args.len) {
+        return;
+    }
+    let fe = e.args.get(@as(usize, @bit_cast(u32, sp.index - 1)));
+    let mut x = strip(fe);
+    // (a call of a format_arg function: its argument's format)
+    loop {
+        let y = fa(x);
+        if u.isnil(y) {
+            break;
+        }
+        x = strip(y);
+    }
+    if (x.kind != cast.ExprKind.STRING) or (x.tok.prefix != 0) {
+        if (sp.first != 0) and (e.args.len <= @as(usize, @bit_cast(u32, sp.index))) {
+            warn(2, fe.span, "C4134", u.f1("the format of '%s' is not a string literal, and no argument follows it",
+                                           fname));
+        } else {
+            warn(2, fe.span, "C4134", u.f1("the format of '%s' is not a string literal", fname));
+        }
+        return;
+    }
+    let us = x.tok.units;
+    let s = u.newn.[u8](us.len + 1);
+    for k in 0..us.len {
+        s[k] = @truncate(u8, us[k]);
+    }
+    let C = Checker.{ e: e, fname: fname, sp: x.span, kind: sp.kind, first: sp.first, used: 0, max_pos: 0, plain: false,
+                      posit: false, bad: false };
+    let c = u.new.[Checker]();
+    c.* = C;
+    if sp.kind == FK_STRFTIME {
+        strftime(c, s[0..us.len]);
+        return;
+    }
+    directives(c, s[0..us.len]);
+    if c.bad or (sp.first == 0) {
+        return;
+    }
+    let nargs = e.args.len - @min(e.args.len, @as(usize, @bit_cast(u32, sp.first - 1)));
+    let mut used = c.used;
+    if c.posit {
+        used = c.max_pos;
+    }
+    if nargs > used {
+        warn(2, e.args.get(@as(usize, @bit_cast(u32, sp.first - 1)) + used).span, "C4132",
+             u.f2("more arguments than the format of '%s' uses (it uses %s)", fname, u.zdec(used)));
+    }
+}
+
+struct Checker {
+    e: *mut cast.Expr,
+    fname: []u8,
+    sp: u.Span,  // the format string's
+    kind: i32,
+    first: i32,
+    used: usize,     // the arguments the plain directives used
+    max_pos: usize,  // the largest %n$ position
+    plain: bool,     // a directive without a position seen
+    posit: bool,     // one with a position seen
+    bad: bool,       // a directive that is not one: the arguments are not counted
+}
+
+// The argument for the k-th (from 0) value the format uses (nil if there is none: reported).
+fn arg_at(c: *mut Checker, k: usize, what: []u8) *mut cast.Expr {
+    if c.first == 0 {
+        return u.nil.[cast.Expr]();  // (a va_list's: nothing to check)
+    }
+    let i = @as(usize, @bit_cast(u32, c.first - 1)) + k;
+    if i >= c.e.args.len {
+        warn(1, c.sp, "C4131", u.f3("too few arguments for the format of '%s': %s needs argument %s", c.fname, what,
+                                    u.zdec(i + 1)));
+        c.bad = true;
+        return u.nil.[cast.Expr]();
+    }
+    return c.e.args.get(i);
+}
+
+// What a conversion takes (Want.cat).
+const W_INT: i32 = 1;     // an integer (after promotion)
+const W_FLOAT: i32 = 2;   // a floating value (double, or long double)
+const W_PTR: i32 = 3;     // a pointer (to anything: %p)
+const W_STR: i32 = 4;     // a pointer to a character type (or wchar_t: wide)
+const W_INTPTR: i32 = 5;  // a pointer to an integer (%n; scanf's integers)
+const W_FLTPTR: i32 = 6;  // a pointer to a floating object (scanf)
+const W_PTRPTR: i32 = 7;  // a pointer to a void pointer (scanf %p)
+
+struct Want {
+    cat: i32,
+    bits: i32,         // the width the argument (or pointed-to object) has, 0: any
+    signed_: i32,      // 1 signed, 0 unsigned, -1 either
+    name: []u8,        // the type it takes, for the message
+    wide: bool,        // W_STR: wchar_t
+    rank: *cty.CType,  // the exact type, where one is (the same size but another type: level 2)
+}
+
+fn want(cat: i32, bits: i32, sg: i32, name: []u8, rank: *cty.CType) Want {
+    return Want.{ cat: cat, bits: bits, signed_: sg, name: name, wide: false, rank: rank };
+}
+
+fn nil_t() *cty.CType {
+    return u.nil.[cty.CType]();
+}
+
+fn is_digit(ch: u8) bool {
+    return (ch >= '0') and (ch <= '9');
+}
+
+// A number at s[i..]: its value and the index after it (value -1: none).
+fn number(s: []u8, i0: usize, end: *mut usize) i64 {
+    let mut i = i0;
+    let mut v: i64 = -1;
+    while (i < s.len) and is_digit(s[i]) {
+        if v < 0 {
+            v = 0;
+        }
+        if v < 100000000 {
+            v = (v * 10) + @as(i64, s[i] - '0');
+        }
+        i += 1;
+    }
+    end.* = i;
+    return v;
+}
+
+// The format's directives, each checked with its arguments.
+fn directives(c: *mut Checker, s: []u8) void {
+    let mut i: usize = 0;
+    while i < s.len {
+        if s[i] != '%' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        if i >= s.len {
+            warn(1, c.sp, "C4133", u.f1("the format of '%s' ends in the middle of a conversion specification",
+                                        c.fname));
+            c.bad = true;
+            return;
+        }
+        if s[i] == '%' {
+            i += 1;
+            continue;
+        }
+        let next = spec(c, s, start);
+        if c.bad {
+            return;
+        }
+        i = next;
+    }
+}
+
+// The position of a %n$ (or *m$) at s[i..], if there is one: its value
+// (from 1) and the index after the $; 0 if there is none.
+fn position(s: []u8, i: usize, end: *mut usize) usize {
+    let mut j: usize = 0;
+    let v = number(s, i, &mut j);
+    if (v > 0) and (j < s.len) and (s[j] == '$') {
+        end.* = j + 1;
+        return @truncate(usize, @bit_cast(u64, v));
+    }
+    end.* = i;
+    return 0;
+}
+
+// The argument a directive (or its * width or precision) takes: at a %n$
+// position, or the next one.
+fn take(c: *mut Checker, pos: usize, what: []u8) *mut cast.Expr {
+    if pos > 0 {
+        if c.plain {
+            mixed(c);
+            return u.nil.[cast.Expr]();
+        }
+        c.posit = true;
+        if pos > c.max_pos {
+            c.max_pos = pos;
+        }
+        return arg_at(c, pos - 1, what);
+    }
+    if c.posit {
+        mixed(c);
+        return u.nil.[cast.Expr]();
+    }
+    c.plain = true;
+    let k = c.used;
+    c.used += 1;
+    return arg_at(c, k, what);
+}
+
+fn mixed(c: *mut Checker) void {
+    warn(1, c.sp, "C4133", u.f1("the format of '%s' mixes %%n$ argument positions with plain conversions", c.fname));
+    c.bad = true;
+}
+
+// The length modifiers (Spec.len).
+const L_NONE: i32 = 0;
+const L_HH: i32 = 1;
+const L_H: i32 = 2;
+const L_L: i32 = 3;
+const L_LL: i32 = 4;
+const L_J: i32 = 5;
+const L_Z: i32 = 6;
+const L_T: i32 = 7;
+const L_BIGL: i32 = 8;
+const L_W: i32 = 9;     // wN (C23): an intN_t
+const L_WF: i32 = 10;   // wfN (C23): an int_fastN_t
+const L_DH: i32 = 11;   // H (C23): a _Decimal32
+const L_DD: i32 = 12;   // D: a _Decimal64
+const L_DDD: i32 = 13;  // DD: a _Decimal128
+
+// One conversion specification at s[start] ('%'): checked with its
+// argument(s); the index after it.
+fn spec(c: *mut Checker, s: []u8, start: usize) usize {
+    let mut i = start + 1;
+    let pos = position(s, i, &mut i);
+    let scan = c.kind == FK_SCANF;
+    let mut flags: []u8 = "";
+    let mut suppress = false;
+    if scan {
+        if (i < s.len) and (s[i] == '*') {
+            suppress = true;
+            i += 1;
+        }
+    } else {
+        let fs = i;
+        while (i < s.len) and
+              ((s[i] == '-') or (s[i] == '+') or (s[i] == ' ') or (s[i] == '#') or (s[i] == '0') or (s[i] == '\'')) {
+            i += 1;
+        }
+        flags = s[fs..i];
+    }
+    // the width, and the precision (printf)
+    if not scan and (i < s.len) and (s[i] == '*') {
+        i += 1;
+        let p = position(s, i, &mut i);
+        star(c, p, "a '*' width");
+        if c.bad {
+            return i;
+        }
+    } else {
+        let mut j: usize = 0;
+        _ = number(s, i, &mut j);
+        i = j;
+    }
+    let mut has_prec = false;
+    if not scan and (i < s.len) and (s[i] == '.') {
+        has_prec = true;
+        i += 1;
+        if (i < s.len) and (s[i] == '*') {
+            i += 1;
+            let p = position(s, i, &mut i);
+            star(c, p, "a '*' precision");
+            if c.bad {
+                return i;
+            }
+        } else {
+            let mut j: usize = 0;
+            _ = number(s, i, &mut j);
+            i = j;
+        }
+    }
+    // the length modifier
+    let mut len = L_NONE;
+    let mut wbits: i32 = 0;
+    if i < s.len {
+        let ch = s[i];
+        if ch == 'h' {
+            len = L_H;
+            i += 1;
+            if (i < s.len) and (s[i] == 'h') {
+                len = L_HH;
+                i += 1;
+            }
+        } else if ch == 'l' {
+            len = L_L;
+            i += 1;
+            if (i < s.len) and (s[i] == 'l') {
+                len = L_LL;
+                i += 1;
+            }
+        } else if (ch == 'j') or (ch == 'z') or (ch == 't') or (ch == 'L') {
+            let ls: [4]i32 = [L_J, L_Z, L_T, L_BIGL];
+            let cs_ = "jztL";
+            for k in @as(usize, 0)..4 {
+                if cs_[k] == ch {
+                    len = ls[k];
+                }
+            }
+            i += 1;
+        } else if (ch == 'H') or (ch == 'D') {
+            // the decimal floating types' (C23 7.23.6.1p7: H, D, DD with a,
+            // e, f, g)
+            i += 1;
+            len = L_DH;
+            if ch == 'D' {
+                len = L_DD;
+                if (i < s.len) and (s[i] == 'D') {
+                    len = L_DDD;
+                    i += 1;
+                }
+            }
+        } else if ch == 'w' {
+            i += 1;
+            len = L_W;
+            if (i < s.len) and (s[i] == 'f') {
+                len = L_WF;
+                i += 1;
+            }
+            let mut j: usize = 0;
+            let n = number(s, i, &mut j);
+            i = j;
+            wbits = @truncate(i32, n);
+            if (n != 8) and (n != 16) and (n != 32) and (n != 64) {
+                return bad_spec(c, s, start, i, "a length modifier wN or wfN of a width other than 8, 16, 32 or 64");
+            }
+        }
+    }
+    if i >= s.len {
+        warn(1, c.sp, "C4133", u.f1("the format of '%s' ends in the middle of a conversion specification", c.fname));
+        c.bad = true;
+        return i;
+    }
+    let conv = s[i];
+    i += 1;
+    if scan and (conv == '[') {
+        // the scanset: up to the next ']' (one first is a member)
+        if (i < s.len) and (s[i] == '^') {
+            i += 1;
+        }
+        if (i < s.len) and (s[i] == ']') {
+            i += 1;
+        }
+        while (i < s.len) and (s[i] != ']') {
+            i += 1;
+        }
+        if i >= s.len {
+            warn(1, c.sp, "C4133", u.f1("a scanset of the format of '%s' has no closing ']'", c.fname));
+            c.bad = true;
+            return i;
+        }
+        i += 1;
+    }
+    let text = s[start..i];
+    let w = wanted(c, conv, len, wbits, scan);
+    if w.cat == 0 {
+        return bad_spec(c, s, start, i, "");
+    }
+    if not scan {
+        flag_checks(c, text, conv, flags, has_prec);
+    }
+    if conv == 'n' {
+        warn(2, c.sp, "C4135", u.f2("'%s' in the format of '%s' writes the count through its argument", text, c.fname));
+    }
+    if suppress {
+        return i;
+    }
+    let a = take(c, pos, u.f1("'%s'", text));
+    if u.notnil(a) {
+        match_arg(c, a, w, text);
+    }
+    return i;
+}
+
+fn bad_spec(c: *mut Checker, s: []u8, start: usize, i: usize, why: []u8) usize {
+    let mut end = i;
+    if end > s.len {
+        end = s.len;
+    }
+    let mut w = why;
+    if w.len == 0 {
+        w = "an unknown conversion, or a length modifier it does not take";
+    }
+    warn(1, c.sp, "C4133", u.f3("'%s' in the format of '%s' is no conversion specification: %s", s[start..end], c.fname,
+                                w));
+    c.bad = true;
+    return end;
+}
+
+// A '*' width or precision: an int argument.
+fn star(c: *mut Checker, pos: usize, what: []u8) void {
+    let a = take(c, pos, what);
+    if u.notnil(a) {
+        match_arg(c, a, want(W_INT, cty.t_int.bits, -1, "int", cty.t_int), what);
+    }
+}
+
+// The flags a conversion ignores, or whose effect is undefined (7.21.6.1p6).
+fn flag_checks(c: *mut Checker, text: []u8, conv: u8, flags: []u8, prec: bool) void {
+    for f in flags {
+        let num = (conv == 'd') or (conv == 'i') or (conv == 'o') or (conv == 'u') or (conv == 'x') or (conv == 'X') or
+                  (conv == 'b') or (conv == 'B');
+        let fl = is_float_conv(conv);
+        let mut bad = false;
+        if (f == '#') and
+           not (fl or (conv == 'o') or (conv == 'x') or (conv == 'X') or (conv == 'b') or (conv == 'B')) {
+            bad = true;
+        } else if (f == '0') and not (num or fl) {
+            bad = true;
+        } else if ((f == '+') or (f == ' ')) and not ((conv == 'd') or (conv == 'i') or fl) {
+            bad = true;
+        } else if f == '\'' {
+            warn(2, c.sp, "C4135",
+                 u.f2("'%s' in the format of '%s': the flag ' (a POSIX extension) is not one this library's printf takes",
+                      text, c.fname));
+        }
+        if bad {
+            let fs: [1]u8 = [f];
+            warn(2, c.sp, "C4135", u.f3("'%s' in the format of '%s': the flag '%s' means nothing for the conversion",
+                                        text, c.fname, u.dup(fs[..])));
+        }
+    }
+    if prec and ((conv == 'c') or (conv == 'p') or (conv == 'n')) {
+        warn(2, c.sp, "C4135", u.f2("'%s' in the format of '%s': a precision means nothing for the conversion", text,
+                                    c.fname));
+    }
+}
+
+fn is_float_conv(c: u8) bool {
+    return (c == 'f') or (c == 'F') or (c == 'e') or (c == 'E') or (c == 'g') or (c == 'G') or (c == 'a') or (c == 'A');
+}
+
+// The integer type a length modifier names, and its width (signed: sg).
+fn int_want(len: i32, wbits: i32, sg: bool, ptr: bool) Want {
+    let mut t = cty.t_int;
+    let mut name: []u8 = "int";
+    if len == L_HH {
+        t = cty.t_schar;
+        name = "signed char";
+    } else if len == L_H {
+        t = cty.t_short;
+        name = "short";
+    } else if len == L_L {
+        t = cty.t_long;
+        name = "long";
+    } else if len == L_LL {
+        t = cty.t_llong;
+        name = "long long";
+    } else if len == L_J {
+        t = intmax();
+        name = "intmax_t";
+    } else if len == L_Z {
+        t = cty.t_size;
+        name = "size_t";
+    } else if len == L_T {
+        t = cty.t_ptrdiff;
+        name = "ptrdiff_t";
+    } else if (len == L_W) or (len == L_WF) {
+        t = u.nil.[cty.CType]();
+        name = u.f1("int%s_t", u.idec(wbits));
+        if len == L_WF {
+            name = u.f1("int_fast%s_t", u.idec(wbits));
+        }
+    }
+    let mut bits = wbits;
+    if u.notnil(t) {
+        if not sg {
+            t = cty.to_unsigned(t);
+            name = u.cat2("unsigned ", name);
+            if (len == L_Z) {
+                name = "size_t";
+            }
+        } else if len == L_Z {
+            t = cty.to_signed(t);
+        }
+        bits = t.bits;
+    }
+    if len == L_WF {
+        bits = 0;  // (int_fastN_t: the platform's type of at least N bits)
+    }
+    if not ptr and ((len == L_HH) or (len == L_H)) {
+        // (a narrower integer arrives promoted: an int)
+        return want(W_INT, cty.t_int.bits, -1, name, nil_t());
+    }
+    let mut cat = W_INT;
+    if ptr {
+        cat = W_INTPTR;
+        name = u.cat2(name, " *");
+    }
+    let mut s: i32 = 0;
+    if sg {
+        s = 1;
+    }
+    return want(cat, bits, s, name, t);
+}
+
+fn intmax() *mut cty.CType {
+    // (intmax_t: long, or long long, the 64-bit type the platform's <stdint.h> names)
+    if cty.t_long.bits == 64 {
+        return cty.t_long;
+    }
+    return cty.t_llong;
+}
+
+// What conversion conv with length modifier len takes (cat 0: it is no
+// conversion of the archetype).
+fn wanted(c: *Checker, conv: u8, len: i32, wbits: i32, scan: bool) Want {
+    let none = want(0, 0, 0, "", nil_t());
+    if (conv == 'd') or (conv == 'i') {
+        if (len == L_BIGL) or (len >= L_DH) {
+            return none;
+        }
+        return int_want(len, wbits, true, scan);
+    }
+    if (conv == 'o') or (conv == 'u') or (conv == 'x') or (conv == 'X') or (conv == 'b') or (conv == 'B') {
+        if (len == L_BIGL) or (len >= L_DH) or (scan and (conv == 'B')) {
+            return none;
+        }
+        return int_want(len, wbits, false, scan);
+    }
+    if is_float_conv(conv) and (len >= L_DH) {
+        let mut t = cty.t_dec32;
+        let mut name: []u8 = "_Decimal32";
+        if len == L_DD {
+            t = cty.t_dec64;
+            name = "_Decimal64";
+        } else if len == L_DDD {
+            t = cty.t_dec128;
+            name = "_Decimal128";
+        }
+        if scan {
+            return want(W_FLTPTR, 0, -1, u.cat2(name, " *"), t);
+        }
+        return want(W_FLOAT, 0, -1, name, t);
+    }
+    if is_float_conv(conv) {
+        if (len != L_NONE) and (len != L_L) and (len != L_BIGL) {
+            return none;
+        }
+        if scan {
+            let mut t = cty.t_float;
+            let mut name: []u8 = "float *";
+            if len == L_L {
+                t = cty.t_double;
+                name = "double *";
+            } else if len == L_BIGL {
+                t = cty.t_ldouble;
+                name = "long double *";
+            }
+            return want(W_FLTPTR, 0, -1, name, t);
+        }
+        if len == L_BIGL {
+            return want(W_FLOAT, 0, -1, "long double", cty.t_ldouble);
+        }
+        return want(W_FLOAT, 0, -1, "double", cty.t_double);
+    }
+    if conv == 'c' {
+        if (len != L_NONE) and (len != L_L) {
+            return none;
+        }
+        if scan {
+            return str_want(len == L_L);
+        }
+        if len == L_L {
+            return want(W_INT, 0, -1, "wint_t", nil_t());
+        }
+        return want(W_INT, cty.t_int.bits, -1, "int", nil_t());
+    }
+    if (conv == 's') or (scan and (conv == '[')) {
+        if (len != L_NONE) and (len != L_L) {
+            return none;
+        }
+        return str_want(len == L_L);
+    }
+    if conv == 'p' {
+        if len != L_NONE {
+            return none;
+        }
+        if scan {
+            return want(W_PTRPTR, 0, -1, "void **", nil_t());
+        }
+        return want(W_PTR, 0, -1, "void *", nil_t());
+    }
+    if conv == 'n' {
+        if (len == L_BIGL) or (len >= L_DH) {
+            return none;
+        }
+        return int_want(len, wbits, true, true);
+    }
+    _ = c;
+    return none;
+}
+
+fn str_want(wide: bool) Want {
+    let mut w = want(W_STR, 0, -1, "char *", nil_t());
+    if wide {
+        w.name = "wchar_t *";
+        w.wide = true;
+    }
+    return w;
+}
+
+// The argument's type as the call has it, and as it was before the default
+// argument promotions (or the conversion to the parameter's type).
+fn types_of(a: *mut cast.Expr) [2]*mut cty.CType {
+    let mut orig = a;
+    while (orig.kind == cast.ExprKind.CAST) and u.isnil(orig.tname) and (orig.op == cast.CV_VALUE) {
+        orig = orig.a;
+    }
+    return [a.ty, orig.ty];
+}
+
+// Checks argument a against what the conversion `text` takes.
+fn match_arg(c: *mut Checker, a: *mut cast.Expr, w: Want, text: []u8) void {
+    let ts = types_of(a);
+    let t = ts[0].unq;
+    let orig = ts[1];
+    let mut ok = true;     // (level 1: the kind and the size)
+    let mut exact = true;  // (level 2: the type)
+    let cat = w.cat;
+    if cat == W_INT {
+        if not cty.is_integer(t) {
+            ok = false;
+        } else {
+            let mut bits = w.bits;
+            if (bits == 0) and (w.name.len > 0) and u.str_eq(w.name, "wint_t") {
+                bits = cs.opts().wchar_bits;
+                if bits < cty.t_int.bits {
+                    bits = cty.t_int.bits;
+                }
+            }
+            if (bits != 0) and (cty.storage_bits(t) != bits) {
+                ok = false;
+            } else if u.notnil(w.rank) and (t != w.rank.unq) and (cty.to_signed(t) != cty.to_signed(w.rank.unq)) {
+                exact = false;  // (another type of the size: int for %ld where long is 32 bits)
+            } else if (w.signed_ >= 0) and (t.is_signed != (w.signed_ == 1)) and
+                      (cty.storage_bits(orig) >= cty.storage_bits(t)) {
+                exact = false;  // (the signedness: only of a value not promoted)
+            }
+        }
+    } else if cat == W_FLOAT {
+        if cty.is_decimal(w.rank) or cty.is_decimal(t) {
+            ok = t.unq == w.rank.unq;  // (a decimal value is not promoted: 6.5.2.2p6)
+        } else if not cty.is_floating(t) {
+            ok = false;
+        } else if cty.ffmt(t) != cty.ffmt(w.rank) {
+            ok = false;
+        } else if t != w.rank.unq {
+            exact = false;
+        }
+    } else if cat == W_PTR {
+        if not cty.is_pointer(t) and not cty.is_nullptr(t) {
+            ok = false;
+        }
+    } else {
+        if not cty.is_pointer(t) {
+            ok = false;
+        } else {
+            let p = t.elem;
+            if cat == W_STR {
+                if w.wide {
+                    ok = cty.is_integer(p) and (p.bits == cty.t_wchar.bits);
+                    exact = ok and (p.unq == cty.t_wchar);
+                } else {
+                    ok = cty.is_char(p) or cty.is_void(p);
+                    exact = cty.is_char(p);
+                }
+            } else if cat == W_INTPTR {
+                ok = cty.is_integer(p) and ((w.bits == 0) or (cty.storage_bits(p) == w.bits));
+                if ok and u.notnil(w.rank) and (cty.to_signed(p.unq) != cty.to_signed(w.rank.unq)) {
+                    exact = false;
+                } else if ok and (w.signed_ >= 0) and (p.is_signed != (w.signed_ == 1)) and (c.kind != FK_SCANF) {
+                    exact = false;
+                }
+            } else if cat == W_FLTPTR and (cty.is_decimal(w.rank) or cty.is_decimal(p)) {
+                ok = p.unq == w.rank.unq;
+            } else if cat == W_FLTPTR {
+                ok = cty.is_floating(p) and (cty.ffmt(p) == cty.ffmt(w.rank));
+                exact = ok and (p.unq == w.rank.unq);
+            } else {
+                ok = cty.is_pointer(p) or cty.is_void(p);
+            }
+        }
+    }
+    if not ok {
+        warn(1, a.span, "C4130", u.f4("'%s' in the format of '%s' takes an argument of type %s, not %s", text, c.fname,
+                                      w.name, cs.tq(t)));
+    } else if not exact {
+        warn(2, a.span, "C4135",
+             u.f4("'%s' in the format of '%s' takes %s; the argument has type %s (of the same size)", text, c.fname,
+                  w.name, cs.tq(orig)));
+    }
+}
+
+// strftime's conversions (C17 7.27.3.5p3, with the E and O modifiers of p4).
+fn strftime(c: *mut Checker, s: []u8) void {
+    let convs = "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%";
+    let es = "cCxXyY";
+    let os = "deHImMSuUVwWy";
+    let mut i: usize = 0;
+    while i < s.len {
+        if s[i] != '%' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        let mut modi: u8 = 0;
+        if (i < s.len) and ((s[i] == 'E') or (s[i] == 'O')) {
+            modi = s[i];
+            i += 1;
+        }
+        if i >= s.len {
+            warn(1, c.sp, "C4133", u.f1("the format of '%s' ends in the middle of a conversion specifier", c.fname));
+            return;
+        }
+        let ch = s[i];
+        i += 1;
+        let mut ok = u.find(convs, ch) >= 0;
+        if modi == 'E' {
+            ok = u.find(es, ch) >= 0;
+        } else if modi == 'O' {
+            ok = u.find(os, ch) >= 0;
+        }
+        if not ok {
+            warn(1, c.sp, "C4133", u.f2("'%s' in the format of '%s' is no conversion specifier of strftime",
+                                        s[start..i], c.fname));
+        }
+    }
+}

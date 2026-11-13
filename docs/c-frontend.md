@@ -58,17 +58,32 @@ lists the diagnostics.
   threads (cgen_tls.ax). Threads are the C library's `<threads.h>`
   (`std/c/lib/threads/`, `std/c/rt/threads*.ax`), on the runtime's threads.
 - **Complex types** (C99): `float`, `double` and `long double _Complex`, with
-  `<complex.h>` (the library's functions only declared). No imaginary types, and
-  `__STDC_IEC_559_COMPLEX__` is not defined, though multiplication and division
-  follow Annex G.5.1 (`ccomplex.ax` folds constants, `cgen_complex.ax` generates the
-  same operations, with helper functions of the module for the slow paths).
+  `<complex.h>` (the library's functions only declared), and the imaginary types
+  (Annex G: an imaginary value is its real type's coefficient; csema_expr.ax's
+  `imag_domain` gives each operator's domain by G.5, cconst.ax folds, cgen_expr.ax's
+  `imag_arith` generates). `__STDC_IEC_559_COMPLEX__` is not defined, though
+  multiplication and division follow Annex G.5.1 (`ccomplex.ax` folds constants,
+  `cgen_complex.ax` generates the same operations, with helper functions of the module
+  for the slow paths).
+- **Interchange and extended floating types** (Annex H): `_Float16` is held as its
+  bits (an `i16`) and computed in `float`, rounded once (cgen_half.ax, ldouble.ax's
+  `h_from_*`); `_Float128` and `_Float64x` are wide formats as a wide `long double` is
+  (cgen_ld.ax takes the format from the type: `cconst.fmt_t`). Ranks: ctypes.ax
+  `float_rank`.
+- **GNU vector types**: ctypes.ax `vector_of` (TK_VECTOR), csema_vec.ax (the operand
+  rules), cgen_vec.ax (IR vectors in chunks of at most 64 bytes, lane-by-lane code where
+  the target has no instruction), cgen_abi.ax (the platforms' classes).
+- **Nested functions** (GNU): csema_nest.ax marks the enclosing objects a nested
+  function uses; cgen_nest.ax builds the frame record they are reached through (a chain
+  argument, `abi.add_chain`) and the trampoline pools.
+- **Format checks**: csema_format.ax, from the attribute `format` (csema_gnu.ax).
 - **Decimal floating types** (C23: `_Decimal32`, `_Decimal64`, `_Decimal128`, `df`
   `dd` `dl` constants; `__STDC_IEC_60559_DFP__`): IEEE 754-2019's decimal formats in
   the BID encoding, computed in software (`std/c/rt/decimal.ax`, below), with the
   decimal rounding direction of `fe_dec_setround` and the exceptions in `<fenv.h>`'s
   flags; the library's decimal functions are `std/c/rt/dfp.ax` and `dfp_math.ax`.
 - **Not claimed**: Annex F for the binary types (`__STDC_IEC_559__` and
-  `__STDC_IEC_60559_BFP__` are not defined): the standard floating types have IEC 60559's
+  `__STDC_IEC_60559_BFP__` are not defined): the floating types have IEC 60559's
   formats (`FLT_IS_IEC_60559`); the library's `<fenv.h>` reads and sets the rounding
   modes and flags (through `__builtin_axiom_fenv_get`/`_set`: `csema_fp.ax`,
   `cgen_fp.ax`, the intrinsics `IN_FPENV_GET`/`SET`), but the optimizer assumes the
@@ -368,7 +383,16 @@ The hosted C library's tests are `c/lib/<part>/*.c` (`[c-lib]`: programs built w
 the library, which print through it, with directives for standard input, standard
 error and their order, `wasm-flags:` for a WebAssembly build's extensions and
 `host-flags:` for the node host's files, `--files=memory` or `--root=dir`), and `c/mix/stdio_threads/` (streams written by several
-threads).
+threads). `c/lib/prog/` holds larger hosted programs (a text processor with wide
+I/O, a calculator that recovers from errors with `longjmp`, sorting and searching of
+200000 records, date reports, a work queue of `<threads.h>` and atomics, numeric
+programs in `long double`), whose output was compared with the system's compiler and
+library at -O0 and -O2 (the differences, which are implementation-defined, are said in
+each); `tools/gen_c_programs.py --hosted` writes random hosted programs for that
+comparison, which print with `printf` and pass every value through the library's
+conversions. `c/constraints.txt` (`tools/c_constraints.mjs`), `tools/c_limits.mjs`
+and `c/headers/names.txt` (`tools/c_header_names.mjs`) are the conformance checks of
+[`c-conformance.md`](c-conformance.md).
 Preprocessor tests compare `--emit=c-pp` output with a `.pp` file next to them; parser
 tests compare `--emit=c-ast` with a `.ast` file.
 

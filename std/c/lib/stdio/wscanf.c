@@ -21,7 +21,7 @@ static void wfile_unget(struct __axc_in *i, int c) {
     __axc_ungetwc_u((wint_t)c, i->f);
 }
 
-static int vfwscanf_with(FILE *stream, const wchar_t *format, va_list arg, int c23) {
+static int vfwscanf_with(FILE *stream, const wchar_t *format, va_list arg, int c23, const char **viol) {
     struct __axc_in in;
     int r;
     in.get = wfile_get;
@@ -32,6 +32,7 @@ static int vfwscanf_with(FILE *stream, const wchar_t *format, va_list arg, int c
     in.ws = NULL;
     in.eof = in.error = 0;
     in.c23 = c23;
+    in.viol = viol;
     LOCK(stream);
     if (stream->__orient != O_WIDE && __axc_orient(stream, O_WIDE) != O_WIDE) {
         UNLOCK(stream);
@@ -77,7 +78,7 @@ static void wstr_unget(struct __axc_in *i, int c) {
     i->ws--;
 }
 
-static int vswscanf_with(const wchar_t *s, const wchar_t *format, va_list arg, int c23) {
+static int vswscanf_with(const wchar_t *s, const wchar_t *format, va_list arg, int c23, const char **viol) {
     struct __axc_in in;
     in.get = wstr_get;
     in.unget = wstr_unget;
@@ -87,6 +88,7 @@ static int vswscanf_with(const wchar_t *s, const wchar_t *format, va_list arg, i
     in.ws = s;
     in.eof = in.error = 0;
     in.c23 = c23;
+    in.viol = viol;
     return __axc_vwscanf_core(&in, format, arg);
 }
 
@@ -100,31 +102,31 @@ int swscanf(const wchar_t *__AXC_RESTRICT s, const wchar_t *__AXC_RESTRICT forma
 }
 
 int vfwscanf(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format, va_list arg) {
-    return vfwscanf_with(stream, format, arg, 0);
+    return vfwscanf_with(stream, format, arg, 0, NULL);
 }
 
 int vswscanf(const wchar_t *__AXC_RESTRICT s, const wchar_t *__AXC_RESTRICT format, va_list arg) {
-    return vswscanf_with(s, format, arg, 0);
+    return vswscanf_with(s, format, arg, 0, NULL);
 }
 
 /* C23 mode's (<wchar.h> maps the names here): %i takes the 0b prefix */
 int __axc_vfwscanf_c23(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format, va_list arg) {
-    return vfwscanf_with(stream, format, arg, 1);
+    return vfwscanf_with(stream, format, arg, 1, NULL);
 }
 
 int __axc_vswscanf_c23(const wchar_t *__AXC_RESTRICT s, const wchar_t *__AXC_RESTRICT format, va_list arg) {
-    return vswscanf_with(s, format, arg, 1);
+    return vswscanf_with(s, format, arg, 1, NULL);
 }
 
 int __axc_vwscanf_c23(const wchar_t *__AXC_RESTRICT format, va_list arg) {
-    return vfwscanf_with(stdin, format, arg, 1);
+    return vfwscanf_with(stdin, format, arg, 1, NULL);
 }
 
 int __axc_fwscanf_c23(FILE *__AXC_RESTRICT stream, const wchar_t *__AXC_RESTRICT format, ...) {
     va_list ap;
     int r;
     va_start(ap, format);
-    r = vfwscanf_with(stream, format, ap, 1);
+    r = vfwscanf_with(stream, format, ap, 1, NULL);
     va_end(ap);
     return r;
 }
@@ -133,7 +135,7 @@ int __axc_wscanf_c23(const wchar_t *__AXC_RESTRICT format, ...) {
     va_list ap;
     int r;
     va_start(ap, format);
-    r = vfwscanf_with(stdin, format, ap, 1);
+    r = vfwscanf_with(stdin, format, ap, 1, NULL);
     va_end(ap);
     return r;
 }
@@ -142,7 +144,17 @@ int __axc_swscanf_c23(const wchar_t *__AXC_RESTRICT s, const wchar_t *__AXC_REST
     va_list ap;
     int r;
     va_start(ap, format);
-    r = vswscanf_with(s, format, ap, 1);
+    r = vswscanf_with(s, format, ap, 1, NULL);
     va_end(ap);
     return r;
+}
+
+/* Annex K's fwscanf_s and its kin (std/c/lib/ext1/): the engine with its
+   runtime-constraints (viol) */
+int __axc_vfwscanf_x(FILE *f, const wchar_t *fmt, va_list ap, int c23, const char **viol) {
+    return vfwscanf_with(f, fmt, ap, c23, viol);
+}
+
+int __axc_vswscanf_x(const wchar_t *s, const wchar_t *fmt, va_list ap, int c23, const char **viol) {
+    return vswscanf_with(s, fmt, ap, c23, viol);
 }

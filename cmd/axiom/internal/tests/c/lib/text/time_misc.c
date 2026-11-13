@@ -95,7 +95,7 @@ int main(void) {
     print_i64(timespec_get(&b, TIME_MONOTONIC));
     print_bool(b.tv_sec > a.tv_sec || (b.tv_sec == a.tv_sec && b.tv_nsec >= a.tv_nsec));
     print_i64(timespec_get(&a, TIME_ACTIVE));
-    print_i64(timespec_get(&a, 0) + timespec_get(&a, 4));
+    print_i64(timespec_get(&a, 0) + timespec_get(&a, 5));
     print_bool(timespec_getres(&r, TIME_UTC) == TIME_UTC && r.tv_sec == 0 && r.tv_nsec > 0);
     print_bool(timespec_getres(0, TIME_MONOTONIC) == TIME_MONOTONIC && timespec_getres(&r, TIME_ACTIVE) &&
                r.tv_nsec > 0 && timespec_getres(&r, 7) == 0);

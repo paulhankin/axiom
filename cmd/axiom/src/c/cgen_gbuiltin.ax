@@ -9,8 +9,12 @@
 //   memcpy, memmove, memset   the IR's memory operations; their value is the destination
 //   abs, fabs, sqrt, floor, ceil, trunc, rint, nearbyint, copysign, fma   the IR's operations (sqrt sets no errno)
 //   alloca             IN_STACK_ALLOC: memory of the function's frame, until it returns
-//   frame_address(0)   the frame record's address (native), or the stack pointer (WebAssembly)
-//   return_address(0)  the frame record's return address (native), or a null pointer (WebAssembly)
+//   frame_address(n)   the frame record's address n links up the chain of frame records (native);
+//                      on WebAssembly the stack pointer for 0, else a null pointer
+//   return_address(n)  that frame record's return address (native), or a null pointer (WebAssembly)
+//   cpu_supports, cpu_is   std/os/cpu.ax's features() (or cpuid's vendor) tested
+//   setjmp, longjmp    <setjmp.h>'s, with a jmp_buf in the caller's frame whose address is in buf[0]
+//   ia32_pause         nothing (a hint); ia32_mfence, lfence, sfence: a full fence
 //   expect, prefetch, assume_aligned   their (first) operand, or nothing
 //   isnan ... fpclassify, isgreater ... isunordered   comparisons that raise no exception on a quiet NaN
 //
@@ -19,12 +23,16 @@
 // read its exponent and significand, the comparisons are cgen_ld.ax's, and
 // csema_gbuiltin.ax makes the others calls of the library's functions.
 // =============================================================================
+import "../diag.ax" as dg;
 import "../ir.ax" as ir;
+import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cgen.ax" as cg;
 import "cgen_gatomic.ax" as gat;
+import "cgen_half.ax" as ghf;
 import "cgen_ld.ax" as gld;
+import "cgen_sjlj.ax" as sj;
 import "csema_gbuiltin.ax" as gb;
 import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
@@ -66,6 +74,15 @@ fn i1_int(c: *mut ir.Value) *mut ir.Value {
     return ir.zext(B(), c, cg.lty(cty.t_int));
 }
 
+fn no_vec_builtin(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    _ = e;
+    _ = vs;
+    return ir.vnil();
+}
+
+/// The value of a vector builtin (__builtin_shuffle, __builtin_shufflevector): set by cgen_vec.ax.
+pub let mut vec_builtin: fn(*mut cast.Expr, []mut *mut ir.Value) *mut ir.Value = no_vec_builtin;
+
 /// Computes the counts, checks and stores of <stdckdint.h>'s ckd_ operation
 /// `id` (csema_builtin.BI_CKD_*) into *r of type rt (set by cgen_va.ax).
 pub let mut ckd: fn(i32, *mut ir.Value, *mut cty.CType, *mut ir.Value, *mut cty.CType, *mut ir.Value,
@@ -85,15 +102,33 @@ fn no_ckd(id: i32, r: *mut ir.Value, rt: *mut cty.CType, a: *mut ir.Value, at: *
 
 /// The value of GNU builtin call e (e.op: a GB_ number) with argument values vs.
 pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
+    // (the format of a wide floating operand: the last argument's, or the result's)
+    g_wfmt_t = e.ty;
+    if (e.args.len > 0) and cty.is_wide(e.args.get(e.args.len - 1).ty) {
+        g_wfmt_t = e.args.get(e.args.len - 1).ty;
+    }
     let id = e.op;
     if id >= gb.GB_ATOMIC {
         return gat.gen(e, vs);
     }
+    if (id == gb.GB_SHUFFLE) or (id == gb.GB_SHUFFLEVECTOR) {
+        return vec_builtin(e, vs);
+    }
     if (id == gb.GB_EXPECT) or (id == gb.GB_ASSUME_ALIGNED) {
         return vs[0];
     }
-    if id == gb.GB_PREFETCH {
+    if (id == gb.GB_PREFETCH) or (id == gb.GB_PAUSE) {
         return ir.vnil();
+    }
+    if id == gb.GB_FENCE {
+        ir.fence(B());
+        return ir.vnil();
+    }
+    if (id == gb.GB_CPU_HAS) or (id == gb.GB_CPU_VENDOR) {
+        return cpu(e);
+    }
+    if (id == gb.GB_SETJMP) or (id == gb.GB_LONGJMP) {
+        return jump(id, e.span, vs);
     }
     if id == gb.GB_TRAP {
         _ = ir.intr(B(), ir.IN_TRAP, cg.T_void, none());
@@ -129,6 +164,13 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
         let ops: [9]i32 = [ir.IN_FABS, ir.IN_SQRT, ir.IN_FLOOR, ir.IN_CEIL, ir.IN_FTRUNC, ir.IN_NEAREST, ir.IN_COPYSIGN,
                            ir.IN_FMA, 0];
         let k = @int_cast(usize, id - gb.GB_FABS);
+        if cty.is_half(e.ty) and (id == gb.GB_FABS) {
+            return ir.and_(B(), vs[0], ir.cint(ir.t_int(16), 0x7FFF));  // (the sign bit cleared)
+        }
+        if cty.is_half(e.ty) and (id == gb.GB_COPYSIGN) {
+            let m = ir.and_(B(), vs[0], ir.cint(ir.t_int(16), 0x7FFF));
+            return ir.or_(B(), m, ir.and_(B(), vs[1], ir.cint(ir.t_int(16), 0x8000)));
+        }
         if cty.is_wide(e.ty) and (id == gb.GB_FABS) {
             return wide_sign(vs[0], ir.vnil());
         }
@@ -149,12 +191,19 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
     }
     if (id == gb.GB_FRAME_ADDR) or (id == gb.GB_RETURN_ADDR) {
         if cg.is_wasm {
-            if id == gb.GB_RETURN_ADDR {
+            if (id == gb.GB_RETURN_ADDR) or (e.cval > 0) {
                 return ir.czero(cg.T_ptr);
             }
             return ir.intr(B(), ir.IN_GET_SP, cg.T_ptr, none());
         }
-        let fa = ir.intr(B(), ir.IN_FRAME_ADDR, cg.T_ptr, none());
+        let mut fa = ir.intr(B(), ir.IN_FRAME_ADDR, cg.T_ptr, none());
+        // (level n: the frame record n links up the chain)
+        for _k in 0..e.cval {
+            let up = ir.load(B(), cg.T_ptr, fa);
+            up.align = @truncate(u32, cty.ptr_bytes);
+            up.flags = up.flags | ir.F_VOLATILE;
+            fa = up;
+        }
         if id == gb.GB_FRAME_ADDR {
             return fa;
         }
@@ -167,6 +216,81 @@ pub fn gen(e: *mut cast.Expr, vs: []mut *mut ir.Value) *mut ir.Value {
         return wide_classify(id, vs);
     }
     return classify(id, vs);
+}
+
+// __builtin_cpu_supports: (features() & bits) == bits; __builtin_cpu_is:
+// cpuid leaf 0's vendor string (its first four bytes, in ebx).
+fn cpu(e: *mut cast.Expr) *mut ir.Value {
+    let i64_ = ir.t_int(64);
+    let i32_ = ir.t_int(32);
+    if e.op == gb.GB_CPU_VENDOR {
+        let mut a: [2]*mut ir.Value = [ir.cint(i32_, 0), ir.cint(i32_, 0)];
+        let r = ir.intr(B(), ir.IN_CPUID, ir.t_vec(i32_, 4), a[..]);
+        let ebx = ir.extract_elem(B(), r, 1);
+        let mut want: u64 = 0x68747541;  // "Auth" (AMD)
+        if e.cval == 1 {
+            want = 0x756e6547;  // "Genu" (Intel)
+        }
+        return i1_int(ir.icmp(B(), ir.IntEQ, ebx, ir.cint(i32_, want)));
+    }
+    let f = cg.ld_fn("cpu.features");
+    let have = ir.call(B(), ir.fnp_of(f).ty, f, none());
+    let m = ir.cint(i64_, e.cval);
+    return i1_int(ir.icmp(B(), ir.IntEQ, ir.and_(B(), have, m), m));
+}
+
+// An external function of the C library's or the linkers' (cmd/axiom/src/jstub.ax).
+fn extern_fn(name: []u8, ret: *mut ir.Ty, ps: []mut *mut ir.Ty) *mut ir.Func {
+    let mut f = ir.get_function(cg.M, name);
+    if u.isnil(f) {
+        f = ir.add_function(cg.M, name, ir.t_fn(ret, ps, false));
+        if tg.is_windows() {
+            cg.c_library_import(name);
+        }
+    }
+    return f;
+}
+
+// __builtin_setjmp(buf): <setjmp.h>'s setjmp with a jmp_buf of the calling
+// function's frame (whose address buf[0] holds; the rest of buf is not
+// used), which longjmp needs only while the function runs, as
+// __builtin_longjmp requires; 1 after the jump. __builtin_longjmp(buf, 1):
+// the linkers' __axc_longjmp_restore(buf[0], 1) (cmd/axiom/src/jstub.ax:
+// the registers restored at once, as the GNU dialects' builtin does, whichever C
+// library the program has), on WebAssembly longjmp (the linker's unit).
+fn jump(id: i32, sp: u.Span, vs: []mut *mut ir.Value) *mut ir.Value {
+    let i32_ = ir.t_int(32);
+    let mut ps: [2]*mut ir.Ty = [cg.T_ptr, i32_];
+    if cg.is_wasm and not tg.has(tg.W_EXCEPTION_HANDLING) {
+        _ = dg.err(sp, "C3300",
+                   "setjmp and longjmp need WebAssembly's exception-handling extension (--features=+exception-handling)");
+        if id == gb.GB_SETJMP {
+            return ir.cint(i32_, 0);
+        }
+        return ir.vnil();
+    }
+    if id == gb.GB_LONGJMP {
+        let jb = ir.load(B(), cg.T_ptr, vs[0]);
+        let f = extern_fn(u.pick(cg.is_wasm, "longjmp", "__axc_longjmp_restore"), cg.T_void, ps[0..2]);
+        let mut a: [2]*mut ir.Value = [jb, ir.cint(i32_, 1)];
+        _ = ir.call(B(), f.ty, f.val, a[..]);
+        ir.unreachable(B());
+        cg.continue_after();
+        return ir.vnil();
+    }
+    cg.F.f.returns_twice = true;
+    cg.F.f.noinline = true;
+    let jb = cg.alloca(cty.array_of(cty.t_llong, 32, true), "jmpbuf");
+    _ = ir.store(B(), jb, vs[0]);
+    let mut r = ir.vnil();
+    if cg.is_wasm {
+        r = sj.setjmp_call(jb);  // (cgen_sjlj.ax: the exception-handling extension's)
+    } else {
+        let f = extern_fn("__axc_setjmp", i32_, ps[0..1]);
+        let mut a: [1]*mut ir.Value = [jb];
+        r = ir.call(B(), f.ty, f.val, a[..]);
+    }
+    return i1_int(ir.icmp(B(), ir.IntNE, r, ir.cint(i32_, 0)));
 }
 
 fn bits(id: i32, x: *mut ir.Value, rt: *mut cty.CType) *mut ir.Value {
@@ -258,11 +382,19 @@ fn min_normal(t: *mut ir.Ty) *mut ir.Value {
     return fp(t, 2.22507385850720138309e-308);
 }
 
+// v, or a _Float16's bits (an i16) widened to float (exactly).
+fn widen_half(v: *mut ir.Value) *mut ir.Value {
+    if (v.ty.kind == ir.T_INT) and (v.ty.bits == 16) {
+        return ghf.to_f32(v);
+    }
+    return v;
+}
+
 fn classify(id: i32, vs: []mut *mut ir.Value) *mut ir.Value {
     let z: f64 = 0.0;
     if id >= gb.GB_ISGREATER {
-        let x = vs[0];
-        let y = vs[1];
+        let x = widen_half(vs[0]);
+        let y = widen_half(vs[1]);
         let mut c = ir.vnil();
         if id == gb.GB_ISGREATER {
             c = ir.fcmp(B(), ir.RealOGT, x, y);
@@ -279,12 +411,17 @@ fn classify(id: i32, vs: []mut *mut ir.Value) *mut ir.Value {
         }
         return i1_int(c);
     }
-    let x = vs[vs.len - 1];
+    let x0 = vs[vs.len - 1];
+    let x = widen_half(x0);
     let t = x.ty;
     let ax = intr1(ir.IN_FABS, x);
     let inf = fp(t, 1.0 / z);
     let is_inf = ir.fcmp(B(), ir.RealOEQ, ax, inf);
-    let normal = ir.and_(B(), ir.fcmp(B(), ir.RealOGE, ax, min_normal(t)), ir.fcmp(B(), ir.RealOLT, ax, inf));
+    let mut mn = min_normal(t);
+    if x != x0 {
+        mn = fp(t, 0.00006103515625);  // (binary16's smallest normal, 2^-14)
+    }
+    let normal = ir.and_(B(), ir.fcmp(B(), ir.RealOGE, ax, mn), ir.fcmp(B(), ir.RealOLT, ax, inf));
     if id == gb.GB_ISNAN {
         return i1_int(is_nan(x));
     }
@@ -324,8 +461,11 @@ fn i64t() *mut ir.Ty {
     return ir.t_int(64);
 }
 
+// The wide floating type of the builtin being generated (gen).
+let mut g_wfmt_t: *mut cty.CType = @ptr_from_int(*mut cty.CType, 0);
+
 fn x87() bool {
-    return cty.ld_bits() == 80;
+    return cty.ffmt(g_wfmt_t) == 80;
 }
 
 // The eight bytes at p + off.
@@ -409,19 +549,19 @@ fn wide_classify(id: i32, vs: []mut *mut ir.Value) *mut ir.Value {
         let x = vs[0];
         let y = vs[1];
         if id == gb.GB_ISGREATER {
-            return i1_int(gld.compare(ct.P_GT, x, y));
+            return i1_int(gld.compare(ct.P_GT, x, y, g_wfmt_t));
         }
         if id == gb.GB_ISGREATEREQUAL {
-            return i1_int(gld.compare(ct.P_GE, x, y));
+            return i1_int(gld.compare(ct.P_GE, x, y, g_wfmt_t));
         }
         if id == gb.GB_ISLESS {
-            return i1_int(gld.compare(ct.P_LT, x, y));
+            return i1_int(gld.compare(ct.P_LT, x, y, g_wfmt_t));
         }
         if id == gb.GB_ISLESSEQUAL {
-            return i1_int(gld.compare(ct.P_LE, x, y));
+            return i1_int(gld.compare(ct.P_LE, x, y, g_wfmt_t));
         }
         if id == gb.GB_ISLESSGREATER {
-            return i1_int(ir.or_(B(), gld.compare(ct.P_LT, x, y), gld.compare(ct.P_GT, x, y)));
+            return i1_int(ir.or_(B(), gld.compare(ct.P_LT, x, y, g_wfmt_t), gld.compare(ct.P_GT, x, y, g_wfmt_t)));
         }
         return i1_int(ir.or_(B(), wide_class(x).nan, wide_class(y).nan));
     }

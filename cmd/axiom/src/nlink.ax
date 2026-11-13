@@ -9,6 +9,15 @@
 // with classify(), places each class with place(), and copies them into its
 // file with copy_class(). Also here: the AArch64 instruction fields and
 // relocations that the ELF and Mach-O linkers both apply.
+//
+// The objects may be the platform toolchain's too (elf.read): of COMDAT
+// groups with one signature only the first object's is kept (the others'
+// sections are dropped: S_DISCARD); the initialization and termination
+// arrays (.preinit_array, .init_array[.N], .fini_array[.N]) are placed
+// together, sorted by priority, between the symbols the generic ABI's
+// dynamic linking and the start-up use (__init_array_start, ...); and the
+// sections whose names are C identifiers are placed together by name,
+// between __start_<name> and __stop_<name> when something refers to those.
 // =============================================================================
 import "bin.ax" as bn;
 import "dwarf.ax" as dw;
@@ -36,6 +45,8 @@ pub struct GSym {
     dynamic: bool,  // from a shared library
     dynidx: u32,    // .dynsym index
     is_data: bool,  // a data object in its library
+    is_tls: bool,   // a thread-local one
+    copy: bool,     // copied into the executable (a copy relocation): defined there
     lib: i32,       // the library defining it
     ver: []u8,      // its version there ("": unversioned)
     vidx: u32,      // .gnu.version index (1: unversioned)
@@ -84,6 +95,9 @@ pub fn align_up(x: u64, a: u64) u64 {
 // A new link of `inputs` (the linker adds its own objects after them).
 pub fn begin(inputs: []*mut elf.Obj) void {
     objs = u.List.[*mut elf.Obj].empty();
+    tls_got = u.List.[bool].empty();
+    lnk = elf.new_obj(0);
+    lnk.name = "(the linker)";
     gsyms = u.List.[GSym].empty();
     gmap = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     sec_cls = u.List.[[]mut i32].empty();
@@ -93,11 +107,202 @@ pub fn begin(inputs: []*mut elf.Obj) void {
     got_sym = u.List.[u32].empty();
     got_dyn = u.List.[u32].empty();
     foreign = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    tls_slots = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
     gidx = u.List.[[]mut i32].empty();
     errors = 0;
     for i in 0..inputs.len {
         objs.push(inputs[i]);
     }
+    drop_comdat_copies();
+    for n in ARRAY_SYMS {
+        _ = lnk_sym(n);
+    }
+    // room for the copies of shared libraries' data (elink.ax)
+    copy_sec = elf.add_sec(lnk, ".bss.copy", elf.S_BSS, 16);
+    objs.push(lnk);
+}
+
+// The symbols the linker defines (absolute: their values are set once the
+// sections are placed): the arrays' bounds, __start_ and __stop_ symbols.
+pub let mut lnk: *mut elf.Obj = @ptr_from_int(*mut elf.Obj, 0);
+/// lnk's .bss section for copy relocations' copies.
+pub let mut copy_sec: i32 = -1;
+
+/// lnk's index among the objects.
+pub fn lnk_index() usize {
+    for i in 0..objs.len {
+        if objs.get(i) == lnk {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/// Sets lnk's absolute symbol `name` (if something refers to it).
+pub fn set_abs(name: []u8, value: u64) void {
+    set_lnk(name, value);
+}
+
+let ARRAY_SYMS: [6][]u8 = ["__preinit_array_start", "__preinit_array_end", "__init_array_start", "__init_array_end",
+                           "__fini_array_start", "__fini_array_end"];
+
+// A global absolute symbol of lnk (made once); its index there.
+pub fn lnk_sym(name: []u8) u32 {
+    let k = u.intern(name);
+    let prev = lnk.symmap.get(k);
+    if prev != 0 {
+        return prev - 1;
+    }
+    return elf.add_sym(lnk, elf.Sym.{ name: k, sec: elf.SEC_ABS, value: 0, size: 0, bind: elf.B_WEAK, ty: elf.T_NOTYPE,
+                                      hidden: true });
+}
+
+fn set_lnk(name: []u8, value: u64) void {
+    let prev = lnk.symmap.get(u.intern(name));
+    if prev != 0 {
+        lnk.syms.at(@as(usize, prev - 1)).value = value;
+    }
+}
+
+// COMDAT groups (elf.Group): the first object's group of each signature is
+// kept, the sections of the others' are dropped, and their symbols are
+// then references to the kept group's.
+fn drop_comdat_copies() void {
+    let mut seen = u.SymMap.[u32].{ keys: u.nil.[usize](), vals: u.nil.[u32](), cap: 0, len: 0 };
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for gi in 0..o.groups.len {
+            let g = o.groups.at(gi);
+            if seen.get(g.sig) == 0 {
+                seen.put(g.sig, @int_cast(u32, oi) + 1);
+                continue;
+            }
+            for si in g.secs.items() {
+                let s = o.secs.get(@int_cast(usize, si));
+                s.kind = elf.S_DISCARD;
+                s.relocs.deinit();
+                s.relocs = u.List.[elf.Rel].empty();
+            }
+            for k in 0..o.syms.len {
+                let sy = o.syms.at(k);
+                if (sy.sec >= 0) and (o.secs.get(@int_cast(usize, sy.sec)).kind == elf.S_DISCARD) and
+                   (sy.bind != elf.B_LOCAL) {
+                    sy.sec = -1;
+                }
+            }
+        }
+    }
+}
+
+/// Is symbol si of object oi defined in a section the link dropped (a
+/// COMDAT copy)? A relocation against it is not applied (only the dropped
+/// group's own unwind or debug entries refer to it).
+pub fn sym_dropped(oi: usize, si: u32) bool {
+    let o = objs.get(oi);
+    let s = o.syms.at(@as(usize, si));
+    return (s.sec >= 0) and (o.secs.get(@int_cast(usize, s.sec)).kind == elf.S_DISCARD);
+}
+
+// A section's place among the initialization and termination arrays: 0 for
+// any other section, else the kind (1 .preinit_array, 2 .init_array, 3
+// .fini_array) times 0x20000 plus its priority (.init_array.N: N; the plain
+// array after every numbered one), the order the arrays run in.
+fn array_rank(s: *elf.Sec) u64 {
+    let n = s.name;
+    let mut kind: u64 = 0;
+    let mut rest: []u8 = "";
+    if u.starts(n, ".preinit_array") {
+        kind = 1;
+        rest = n[14..];
+    } else if u.starts(n, ".init_array") {
+        kind = 2;
+        rest = n[11..];
+    } else if u.starts(n, ".fini_array") {
+        kind = 3;
+        rest = n[11..];
+    } else {
+        return 0;
+    }
+    let mut prio: u64 = 0x10000;
+    if (rest.len > 1) and (rest[0] == '.') {
+        prio = 0;
+        for c in rest[1..] {
+            if not u.is_digit(c) {
+                return 0;  // (another section)
+            }
+            prio = (prio * 10) + @as(u64, c - '0');
+        }
+        if prio > 0xffff {
+            prio = 0xffff;
+        }
+    } else if rest.len != 0 {
+        return 0;
+    }
+    return (kind * 0x20000) + prio;
+}
+
+// Is the name a C identifier (sections so named have __start_ and __stop_
+// symbols)?
+fn c_ident(n: []u8) bool {
+    if n.len == 0 {
+        return false;
+    }
+    for i in 0..n.len {
+        let c = n[i];
+        let alpha = ((c | 0x20) >= 'a') and ((c | 0x20) <= 'z');
+        if not alpha and (c != '_') and not (u.is_digit(c) and (i > 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The __start_ and __stop_ symbols referred to and not defined: lnk's,
+// for the sections of the name (place sets them).
+fn start_stop_syms() void {
+    let mut names = u.SymMap.[u8].{ keys: u.nil.[usize](), vals: u.nil.[u8](), cap: 0, len: 0 };
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for k in 0..o.secs.len {
+            let s = o.secs.get(k);
+            if (s.kind != elf.S_DISCARD) and (s.kind != elf.S_DEBUG) and c_ident(s.name) {
+                names.put(u.intern(s.name), 1);
+            }
+        }
+    }
+    for oi in 0..objs.len {
+        let o = objs.get(oi);
+        for si in 0..o.syms.len {
+            let sy = o.syms.get(si);
+            if (sy.sec != -1) or (sy.bind == elf.B_LOCAL) {
+                continue;
+            }
+            let mut sec: []u8 = "";
+            if u.starts(sy.name, "__start_") {
+                sec = sy.name[8..];
+            } else if u.starts(sy.name, "__stop_") {
+                sec = sy.name[7..];
+            } else {
+                continue;
+            }
+            if (names.get(u.intern(sec)) != 0) and (lnk.symmap.get(u.intern(sy.name)) == 0) and not rets_section(sec) {
+                _ = lnk_sym(sy.name);
+            }
+        }
+    }
+}
+
+// (axiom_rets has bounds of its own: elf.rets_bounds)
+fn rets_section(n: []u8) bool {
+    return u.str_eq(n, "axiom_rets");
+}
+
+// Does a __start_/__stop_ pair name section s (so that it is placed with
+// the others of its name)?
+fn start_stop_named(s: *elf.Sec) bool {
+    return c_ident(s.name) and
+           ((lnk.symmap.get(u.intern(u.cat2("__start_", s.name))) != 0) or
+            (lnk.symmap.get(u.intern(u.cat2("__stop_", s.name))) != 0));
 }
 
 // -----------------------------------------------------------------------------
@@ -110,13 +315,14 @@ pub fn gsym_index(name: []u8) u32 {
         return prev - 1;
     }
     gsyms.push(GSym.{ name: k, obj: -1, sym: 0, weak: true, got: -1, stub: -1, dynamic: false, dynidx: 0,
-                      is_data: false, lib: -1, ver: "", vidx: 1 });
+                      is_data: false, is_tls: false, copy: false, lib: -1, ver: "", vidx: 1 });
     gmap.put(k, @int_cast(u32, gsyms.len));
     return @int_cast(u32, gsyms.len - 1);
 }
 
 // Every global symbol of the objects, with its definition (if any).
 pub fn define_globals() void {
+    start_stop_syms();
     for oi in 0..objs.len {
         let o = objs.get(oi);
         for si in 0..o.syms.len {
@@ -129,8 +335,12 @@ pub fn define_globals() void {
             if s.bind != elf.B_WEAK {
                 g.weak = false;
             }
-            if s.sec < 0 {
+            if s.sec == -1 {
                 continue;
+            }
+            if s.ty == elf.T_IFUNC {
+                err(u.f2("'%s' (%s) is an indirect function (STT_GNU_IFUNC), which the linker does not support", s.name,
+                         obj_name(oi)));
             }
             if g.obj < 0 {
                 g.obj = @int_cast(i32, oi);
@@ -141,11 +351,22 @@ pub fn define_globals() void {
                     g.obj = @int_cast(i32, oi);
                     g.sym = @int_cast(u32, si);
                 } else {
-                    err(u.f1("duplicate symbol '%s'", s.name));
+                    err(u.f3("duplicate symbol '%s' (%s and %s)", s.name, obj_name(@as(usize, @bit_cast(u32, g.obj))),
+                             obj_name(oi)));
                 }
             }
         }
     }
+}
+
+/// An object's name for messages: its file (or archive member), or
+/// "the program" for the compiler's own.
+pub fn obj_name(oi: usize) []u8 {
+    let o = objs.get(oi);
+    if u.isnos(o.name) or (o.name.len == 0) {
+        return "the program";
+    }
+    return o.name;
 }
 
 // Windows system DLLs (and any name ending in .dll).
@@ -278,6 +499,9 @@ pub fn global_of(oi: usize, si: u32) i32 {
 
 pub fn sym_addr_in(oi: usize, si: u32) u64 {
     let s = objs.get(oi).syms.at(@as(usize, si));
+    if s.sec == elf.SEC_ABS {
+        return s.value;
+    }
     if s.sec < 0 {
         return 0;
     }
@@ -312,7 +536,36 @@ fn new_got(oi: usize, si: u32, dynidx: u32) i32 {
     got_obj.push(@int_cast(u32, oi));
     got_sym.push(si);
     got_dyn.push(dynidx);
+    tls_got.push(false);
     return @int_cast(i32, got_dyn.len - 1);
+}
+
+// per GOT slot: does it hold the symbol's offset from the thread pointer
+// (the initial-exec TLS model) rather than its address?
+pub let mut tls_got: u.List.[bool] = u.List.[bool].{ data: @ptr_from_int(*mut bool, 0), len: 0, cap: 0 };
+// thread-pointer offset slots by symbol: name (or object and index) -> slot + 1
+let mut tls_slots: u.SymMap.[u32] = u.SymMap.[u32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u32, 0), cap: 0, len: 0 };
+
+/// The GOT slot that holds symbol si's (of object oi) offset from the
+/// thread pointer (initial-exec TLS references), allocated on first use;
+/// dynidx: the .dynsym index + 1 of a symbol from a shared library (0: the
+/// program's own).
+pub fn got_slot_tls(oi: usize, si: u32, dynidx: u32) i32 {
+    let gi = global_of(oi, si);
+    let mut key = u.f2("%s:%s", u.zdec(oi), u.udec(@as(u64, si)));
+    if gi >= 0 {
+        key = gsyms.get(@int_cast(usize, gi)).name;
+    }
+    let k = u.intern(key);
+    let prev = tls_slots.get(k);
+    if prev != 0 {
+        return @bit_cast(i32, prev - 1);
+    }
+    let slot = new_got(oi, si, dynidx);
+    tls_got.set(@int_cast(usize, slot), true);
+    tls_slots.put(k, @bit_cast(u32, slot) + 1);
+    return slot;
 }
 
 // The GOT slot of global gi (symbol si of object oi), allocated on first use.
@@ -352,7 +605,11 @@ pub fn classify(class_of: fn(*elf.Sec) i32) void {
         let o = objs.get(oi);
         let cls = u.newn.[i32](o.secs.len + 1);
         for k in 0..o.secs.len {
-            cls[k] = class_of(o.secs.get(k));
+            if o.secs.get(k).kind == elf.S_DISCARD {
+                cls[k] = -1;  // (not placed, not copied, not relocated)
+            } else {
+                cls[k] = class_of(o.secs.get(k));
+            }
         }
         sec_cls.push(cls);
         sec_addr.push(u.newn.[u64](o.secs.len + 1));
@@ -361,13 +618,18 @@ pub fn classify(class_of: fn(*elf.Sec) i32) void {
 }
 
 // Places the sections of class `cls` from address `at`; returns the end.
+// First the class's ordinary sections (of read-only data, the frame tables
+// last, together: elf.rets_rank), then the initialization and termination
+// arrays (array_rank, setting their bounds' symbols), then the sections
+// with __start_ and __stop_ symbols, by name (setting those).
 pub fn place(cls: i32, at: u64) u64 {
     let mut cur = at;
-    // read-only data, then the frame tables together (elf.rets_rank)
     let mut passes: i32 = 1;
     if cls == C_CONST {
         passes = 4;
     }
+    let mut arrays = u.List.[u64].empty();  // rank << 40 | object << 20 | section
+    let mut named = u.List.[u64].empty();   // object << 20 | section
     for pass in 0..passes {
         for oi in 0..objs.len {
             let o = objs.get(oi);
@@ -379,13 +641,93 @@ pub fn place(cls: i32, at: u64) u64 {
                 if (cls == C_CONST) and (elf.rets_rank(s) != (pass - 1)) {
                     continue;
                 }
-                cur = align_up(cur, s.align);
-                sec_addr.get(oi)[k] = cur;
-                cur += elf.sec_size(s);
+                if pass == 0 {
+                    let r = array_rank(s);
+                    if r != 0 {
+                        arrays.push((r << 40) | (@as(u64, oi) << 20) | @as(u64, k));
+                        continue;
+                    }
+                    if start_stop_named(s) {
+                        named.push((@as(u64, oi) << 20) | @as(u64, k));
+                        continue;
+                    }
+                }
+                cur = put_sec(oi, k, cur);
             }
         }
     }
+    if arrays.len > 0 {
+        sort_u64(arrays.items());
+        let mut kind: u64 = 0;
+        for x in arrays.items() {
+            let kd = (x >> 40) / 0x20000;
+            if kd != kind {
+                if kind != 0 {
+                    set_lnk(ARRAY_SYMS[@truncate(usize, kind - 1) * 2 + 1], cur);
+                }
+                kind = kd;
+                cur = align_up(cur, 8);
+                set_lnk(ARRAY_SYMS[@truncate(usize, kind - 1) * 2], cur);
+            }
+            cur = put_sec(@truncate(usize, (x >> 20) & 0xfffff), @truncate(usize, x & 0xfffff), cur);
+        }
+        set_lnk(ARRAY_SYMS[@truncate(usize, kind - 1) * 2 + 1], cur);
+        // (the arrays absent: empty, at their neighbours' end)
+        for kd in @as(u64, 1)..4 {
+            let sa = ARRAY_SYMS[@truncate(usize, kd - 1) * 2];
+            if lnk.syms.get(@as(usize, lnk.symmap.get(u.intern(sa)) - 1)).value == 0 {
+                set_lnk(sa, cur);
+                set_lnk(ARRAY_SYMS[@truncate(usize, kd - 1) * 2 + 1], cur);
+            }
+        }
+    }
+    let mut i: usize = 0;
+    while i < named.len {
+        let first = named.get(i);
+        let nm = objs.get(@truncate(usize, first >> 20)).secs.get(@truncate(usize, first & 0xfffff)).name;
+        let mut start: u64 = 0;
+        let mut started = false;
+        for j in i..named.len {
+            let x = named.get(j);
+            let s = objs.get(@truncate(usize, x >> 20)).secs.get(@truncate(usize, x & 0xfffff));
+            if (x == 0xffff_ffff_ffff_ffff) or not u.str_eq(s.name, nm) {
+                continue;
+            }
+            cur = align_up(cur, s.align);
+            if not started {
+                start = cur;
+                started = true;
+            }
+            cur = put_sec(@truncate(usize, x >> 20), @truncate(usize, x & 0xfffff), cur);
+            named.set(j, 0xffff_ffff_ffff_ffff);
+        }
+        set_lnk(u.cat2("__start_", nm), start);
+        set_lnk(u.cat2("__stop_", nm), cur);
+        while (i < named.len) and (named.get(i) == 0xffff_ffff_ffff_ffff) {
+            i += 1;
+        }
+    }
     return cur;
+}
+
+fn put_sec(oi: usize, k: usize, at: u64) u64 {
+    let s = objs.get(oi).secs.get(k);
+    let cur = align_up(at, s.align);
+    sec_addr.get(oi)[k] = cur;
+    return cur + elf.sec_size(s);
+}
+
+// (insertion sort: the arrays are few)
+fn sort_u64(a: []mut u64) void {
+    for i in 1..a.len {
+        let x = a[i];
+        let mut j = i;
+        while (j > 0) and (a[j - 1] > x) {
+            a[j] = a[j - 1];
+            j -= 1;
+        }
+        a[j] = x;
+    }
 }
 
 pub fn class_align(cls: i32) u64 {

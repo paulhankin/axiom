@@ -1,5 +1,7 @@
 /* stddef.h - common definitions (C89 7.1.6, C99 7.17, C11 7.19, C23 7.21),
    for the Axiom compiler's C front end. */
+/* (Annex K: whether its names are asked for, K.3.1.1) */
+#include <axc/ext1.h>
 #ifndef __AXIOM_STDDEF_H
 #define __AXIOM_STDDEF_H
 
@@ -13,6 +15,12 @@
 #define __AXIOM_WANT_WCHAR_T
 #include <axc/types.h>
 typedef __AXIOM_PTRDIFF_TYPE__ ptrdiff_t;
+#if __AXC_EXT1
+/* rsize_t (K.3.3) */
+#define __AXIOM_WANT_SIZE_T
+#define __AXIOM_WANT_RSIZE_T
+#include <axc/types.h>
+#endif
 
 #if __STDC_VERSION__ >= 201112L
 /* the platforms' choices: aligned to 16 bytes, or to 8 (Windows, macOS) */

@@ -31,12 +31,17 @@
 //
 // This longjmp does not unwind: no handlers run in the frames it leaves. The compiler treats a function calling
 // __axc_setjmp as one where it returns twice (c/cgen_expr.ax: ir.Func's
-// returns_twice). Both are weak: a program's own definitions win.
+// returns_twice). Both are weak: a program's own definitions win. A program whose C
+// library is the system's has that library's longjmp instead (g_system_jmp).
 // =============================================================================
 import "elf.ax" as elf;
 
-/// Are `name`'s the functions this file defines (on every native target)?
+/// Are `name`'s the functions this file defines (on every native target;
+/// with g_system_jmp not longjmp)?
 pub fn provides(name: []u8) bool {
+    if g_system_jmp {
+        return str_eq(name, "__axc_setjmp") or str_eq(name, "__axc_longjmp_restore");
+    }
     return str_eq(name, "__axc_setjmp") or str_eq(name, "longjmp") or str_eq(name, "__axc_longjmp_restore");
 }
 
@@ -77,6 +82,26 @@ fn words(o: *mut elf.Obj, text: i32, ws: []u32) void {
     }
 }
 
+/// The program's C library is the system's (--c-lib=system: main.ax; or a
+/// freestanding program linked with the system's objects and libraries:
+/// elink.ax): setjmp and longjmp are that library's, whose jmp_buf is
+/// another, and `add` leaves out longjmp (and lstub.ax its aliases of
+/// __axc_setjmp), on every target. __axc_setjmp and __axc_longjmp_restore,
+/// names of this compiler's alone, stay: __builtin_setjmp and
+/// __builtin_longjmp use them (c/cgen_gbuiltin.ax).
+pub let mut g_system_jmp: bool = false;
+
+// The restoring function's start: longjmp, also named
+// __axc_longjmp_restore; that name alone with g_system_jmp.
+fn restore_start(o: *mut elf.Obj, text: i32) void {
+    if g_system_jmp {
+        func(o, text, "__axc_longjmp_restore");
+        return;
+    }
+    func(o, text, "longjmp");
+    label(o, text, "__axc_longjmp_restore");
+}
+
 /// Adds the functions to section `text` of o, for `machine` (and the
 /// Windows x64 convention when `windows`).
 pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
@@ -96,8 +121,7 @@ pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
         bytes(o, text, "\x44\x0f\x11\xa1\xc0\x00\x00\x00\x44\x0f\x11\xa9\xd0\x00\x00\x00");
         bytes(o, text, "\x44\x0f\x11\xb1\xe0\x00\x00\x00\x44\x0f\x11\xb9\xf0\x00\x00\x00");
         bytes(o, text, "\x31\xc0\xc3");  // xor eax, eax; ret
-        func(o, text, "longjmp");
-        label(o, text, "__axc_longjmp_restore");
+        restore_start(o, text);
         // mov eax, edx; test eax, eax; jnz 1f; mov eax, 1; 1:
         bytes(o, text, "\x89\xd0\x85\xc0\x75\x05\xb8\x01\x00\x00\x00");
         // mov rbx, [rcx+8]; mov rbp rsi rdi r12 r13 r14 r15, [rcx+24..72]
@@ -125,8 +149,7 @@ pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
         // lea rdx, [rsp+8]; mov [rdi+48], rdx; mov rdx, [rsp]; mov [rdi+56], rdx
         bytes(o, text, "\x48\x8d\x54\x24\x08\x48\x89\x57\x30\x48\x8b\x14\x24\x48\x89\x57\x38");
         bytes(o, text, "\x31\xc0\xc3");  // xor eax, eax; ret
-        func(o, text, "longjmp");
-        label(o, text, "__axc_longjmp_restore");
+        restore_start(o, text);
         // mov eax, esi; test eax, eax; jnz 1f; mov eax, 1; 1:
         bytes(o, text, "\x89\xf0\x85\xc0\x75\x05\xb8\x01\x00\x00\x00");
         bytes(o, text, "\x48\x8b\x1f\x48\x8b\x6f\x08\x4c\x8b\x67\x10\x4c\x8b\x6f\x18\x4c\x8b\x77\x20\x4c\x8b\x7f\x28");
@@ -141,8 +164,7 @@ pub fn add(o: *mut elf.Obj, text: i32, machine: u32, windows: bool) void {
     let sj: [14]u32 = [0xA9005013, 0xA9015815, 0xA9026017, 0xA9036819, 0xA904701B, 0xA905781D, 0x910003F0, 0xF9003010,
                        0x6D06A408, 0x6D07AC0A, 0x6D08B40C, 0x6D09BC0E, 0x52800000, 0xD65F03C0];
     words(o, text, sj[..]);
-    func(o, text, "longjmp");
-    label(o, text, "__axc_longjmp_restore");
+    restore_start(o, text);
     // ldp the same; ldr x16, [x0, 96]; mov sp, x16; cmp w1, 0;
     // csinc w0, w1, wzr, ne (val, or 1); ret (to x30, the saved return address)
     let lj: [15]u32 = [0xA9405013, 0xA9415815, 0xA9426017, 0xA9436819, 0xA944701B, 0xA945781D, 0xF9403010, 0x9100021F,

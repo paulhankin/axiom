@@ -1,0 +1,295 @@
+// =============================================================================
+// cgen_nest.ax - IR generation for the GNU dialects' nested functions
+// (csema_nest.ax).
+//
+// A function with nested functions makes a frame record when it starts: an
+// array of pointers, in its frame, of
+//   [0]               its own chain (below), or null
+//   [1 .. 1+n)        the addresses of the objects of its rec: its own, or,
+//                     for its enclosing functions' objects, those its own
+//                     chain gives
+//   [1+n .. 1+n+m)    for each of its nested functions whose address is
+//                     taken (tramps), the trampoline this call of it holds
+//                     (its index plus 1), or 0
+// A nested function is an ordinary IR function of the unit, with one IR
+// parameter after its C arguments (cgen_abi.add_chain): its chain, the frame
+// record of the call of its enclosing function it belongs to. A direct call
+// passes it: the caller's own record, if the callee is nested in the caller;
+// else the caller's chain, followed up through the [0] slots to the record of
+// the callee's enclosing function (a sibling, or a function nested in one).
+// So no register is reserved for a static chain: every call of a nested
+// function is one the compiler makes, a direct one, or one of its
+// trampolines.
+//
+// Trampolines: a nested function whose address is taken has POOL of them,
+// functions of the unit with the nested function's C type (so any caller,
+// the platform's C code too, calls them by the platform's C ABI), each with
+// a slot in a table of chains; trampoline k calls the nested function with
+// the chain in slot k. Taking the address claims a free slot (with an atomic
+// compare-and-exchange, so threads may share the pool) for the call of the
+// enclosing function the record belongs to, once per such call, and gives
+// the trampoline's address; the slot is given back when that call returns.
+// No code is made or written at run time, so the stack and the heap stay
+// not executable, on every target (WebAssembly included: the trampolines are
+// functions of the module's table). A program that holds more than POOL
+// addresses of one nested function at once (in POOL live calls of its
+// enclosing function) traps. A longjmp out of the enclosing function, which
+// unwinds nothing, keeps its slots.
+// =============================================================================
+import "../ir.ax" as ir;
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cgen.ax" as cg;
+import "csema_nest.ax" as cnest;
+import "ctypes.ax" as cty;
+
+/// The trampolines of each nested function whose address is taken.
+pub const POOL: u64 = 128;
+const NPOOL: usize = 128;  // (POOL, as an index)
+
+fn B() *mut ir.Builder {
+    return cg.B;
+}
+
+fn psz() u64 {
+    return cty.ptr_bytes;
+}
+
+fn slot(r: *mut ir.Value, k: u64) *mut ir.Value {
+    return ir.ptradd(B(), r, cg.usz(k * psz()));
+}
+
+fn ld(p: *mut ir.Value) *mut ir.Value {
+    let v = ir.load(B(), cg.T_ptr, p);
+    v.align = @truncate(u32, psz());
+    return v;
+}
+
+fn st(v: *mut ir.Value, p: *mut ir.Value) void {
+    let s = ir.store(B(), v, p);
+    s.align = @truncate(u32, psz());
+}
+
+/// The start of function s (its parameters' objects made): a nested
+/// function's chain kept in an object of the frame, and the frame record of
+/// a function with nested functions made.
+pub fn enter(s: *mut cast.CSym) void {
+    let F = cg.F;
+    if u.notnil(s.nest_parent) {
+        F.chain = cg.alloca(cty.pointer_to(cty.t_void), "chain");
+        st(F.f.params[@int_cast(usize, F.sig.plan.chain)], F.chain);
+    }
+    if not s.has_nested {
+        return;
+    }
+    let n = 1 + @as(u64, s.rec.len) + @as(u64, s.tramps.len);
+    let r = cg.alloca(cty.array_of(cty.pointer_to(cty.t_void), n, true), "frame.rec");
+    F.rec = r;
+    if u.notnil(F.chain) {
+        st(ld(F.chain), r);
+    } else {
+        st(ir.czero(cg.T_ptr), r);
+    }
+    for k in 0..s.rec.len {
+        let x = s.rec.get(k);
+        st(object_addr(x), slot(r, 1 + @as(u64, k)));
+    }
+    for k in 0..s.tramps.len {
+        st(ir.czero(cg.T_ptr), slot(r, 1 + @as(u64, s.rec.len) + @as(u64, k)));
+    }
+}
+
+/// The address of automatic object x of the function being generated, or
+/// (in a nested function) of an enclosing function: from the chain.
+pub fn object_addr(x: *mut cast.CSym) *mut ir.Value {
+    let F = cg.F;
+    let cur = F.sym;
+    if u.notnil(cur) and u.notnil(x.owner) and (x.owner != cur) and u.notnil(cur.nest_parent) and
+       (x.duration == cast.SD_AUTO) {
+        let idx = cnest.rec_index(cur.nest_parent, x);
+        if idx >= 0 {
+            return ld(slot(ld(F.chain), 1 + @as(u64, @bit_cast(u32, idx))));
+        }
+    }
+    if u.isvnil(x.ir) {
+        x.ir = @ptr_cast(*mut void, cg.aligned_alloca(x.ty, x.name, x.align));
+    }
+    return @ptr_cast(*mut ir.Value, x.ir);
+}
+
+/// Is x an object of an enclosing function, seen from the function being generated?
+pub fn is_outer(x: *cast.CSym) bool {
+    let F = cg.F;
+    return u.notnil(F) and u.notnil(F.sym) and u.notnil(x.owner) and (x.owner != F.sym) and
+           (x.duration == cast.SD_AUTO) and u.notnil(F.sym.nest_parent);
+}
+
+/// The frame record of the enclosing function of nested function g, seen
+/// from the function being generated (g's enclosing function, or a function
+/// nested in it).
+pub fn chain_for(g: *cast.CSym) *mut ir.Value {
+    let F = cg.F;
+    let p = g.nest_parent;
+    let cur = F.sym;
+    if cur == p {
+        return F.rec;
+    }
+    let mut r = ld(F.chain);
+    let mut x = cur.nest_parent;
+    while u.notnil(x) and (x != p) {
+        r = ld(r);  // (slot 0: that function's own chain)
+        x = x.nest_parent;
+    }
+    return r;
+}
+
+// The globals of nested function g's trampolines: the table of chains, and
+// the table of the trampolines' addresses (and the functions, declared).
+struct Pool {
+    chains: *mut ir.Value,
+    fns: *mut ir.Value,
+    get: *mut ir.Func,
+    thunks: []mut *mut ir.Func,
+}
+
+let mut g_pools: u.SymMap.[*mut Pool] = u.SymMap.[*mut Pool].{ keys: @ptr_from_int(*mut usize, 0),
+                                                               vals: @ptr_from_int(*mut *mut Pool, 0), cap: 0, len: 0 };
+
+fn key(g: *cast.CSym) []u8 {
+    return u.addr_key(@int_from_ptr(g));
+}
+
+/// The trampolines of nested function g (made once: their functions declared).
+pub fn pool_of(g: *mut cast.CSym) *mut Pool {
+    let k = key(g);
+    let had = g_pools.get(k);
+    if u.notnil(had) {
+        return had;
+    }
+    let p = u.new.[Pool]();
+    let base = u.f2("%s.%s", g.name, u.idec(g.uid));
+    let tab = ir.add_global(cg.M, ir.t_array(cg.T_ptr, POOL), u.cat2(base, ".chains"));
+    tab.init = ir.czero(tab.ty);
+    tab.linkage = ir.LINK_INTERNAL;
+    tab.align = 8;
+    p.chains = tab.val;
+    let sig = cg.sig_of(g.ty.ret, cg.param_types(g), g.ty.params.len, false, true);
+    p.thunks = u.newn.[*mut ir.Func](NPOOL + 1)[0..NPOOL];
+    let addrs = u.newn.[*mut ir.Value](NPOOL + 1);
+    for i in 0..NPOOL {
+        let f = ir.add_function(cg.M, u.f2("%s.tramp.%s", base, u.zdec(i)), sig.ty);
+        f.linkage = ir.LINK_INTERNAL;
+        cg.mark_func(f, sig.plan);  // (the ABI's marks: a result through x8, in registers ...)
+        p.thunks[i] = f;
+        addrs[i] = f.val;
+    }
+    let fns = ir.add_global(cg.M, ir.t_array(cg.T_ptr, POOL), u.cat2(base, ".tramps"));
+    fns.init = ir.carray(cg.T_ptr, addrs[0..NPOOL]);
+    fns.linkage = ir.LINK_INTERNAL;
+    fns.is_const = true;
+    fns.align = 8;
+    p.fns = fns.val;
+    let mut one: [1]*mut ir.Ty = [cg.T_ptr];
+    p.get = ir.add_function(cg.M, u.cat2(base, ".trampoline"), ir.t_fn(cg.T_ptr, one[..], false));
+    p.get.linkage = ir.LINK_INTERNAL;
+    g_pools.put(k, p);
+    return p;
+}
+
+// The index of nested function g's trampoline field in its enclosing function's record.
+fn field(g: *mut cast.CSym) u64 {
+    let p = g.nest_parent;
+    for k in 0..p.tramps.len {
+        if p.tramps.get(k) == g {
+            return 1 + @as(u64, p.rec.len) + @as(u64, k);
+        }
+    }
+    return 0;
+}
+
+/// The address of nested function g (a trampoline's), in the function
+/// being generated.
+pub fn address(g: *mut cast.CSym) *mut ir.Value {
+    let p = pool_of(g);
+    let mut xs: [1]*mut ir.Value = [chain_for(g)];
+    return ir.call(B(), p.get.ty, p.get.val, xs[..]);
+}
+
+/// Before function s returns: the trampolines its call holds, given back.
+pub fn leave(s: *cast.CSym) void {
+    let F = cg.F;
+    if u.isnil(F) or u.isnil(F.rec) or (s.tramps.len == 0) or cg.terminated() {
+        return;
+    }
+    for g in s.tramps.items() {
+        let p = pool_of(g);
+        let v = ir.ptrtoint(B(), ld(slot(F.rec, field(g))), cg.T_isz);
+        let has = ir.icmp(B(), ir.IntNE, v, cg.usz(0));
+        let yes = cg.new_block("tramp.free");
+        let done = cg.new_block("tramp.done");
+        ir.condbr(B(), has, yes, done);
+        cg.at_end(yes);
+        let at = ir.ptradd(B(), p.chains, ir.mul(B(), ir.sub(B(), v, cg.usz(1)), cg.usz(psz())));
+        let s0 = ir.store(B(), ir.czero(cg.T_ptr), at);
+        s0.align = @truncate(u32, psz());
+        s0.flags = s0.flags | ir.F_VOLATILE;
+        ir.br(B(), done);
+        cg.at_end(done);
+    }
+}
+
+/// The function that gives nested function g's trampoline for a record
+/// (its parameter): the one the record holds, else the first free slot,
+/// claimed with a compare-and-exchange of its chain from null to the
+/// record (a trap if none is free). F is set to a state of its own.
+pub fn define_get(g: *mut cast.CSym) void {
+    let p = pool_of(g);
+    let f = p.get;
+    let fld = field(g);
+    let st0 = u.new.[cg.FnState]();
+    st0.f = f;
+    cg.F = st0;
+    st0.entry = cg.new_block("entry");
+    cg.at_end(st0.entry);
+    let rec = f.params[0];
+    let held = ir.ptrtoint(B(), ld(slot(rec, fld)), cg.T_isz);
+    let fresh = cg.new_block("claim");
+    let found = cg.new_block("found");
+    let have = ir.icmp(B(), ir.IntNE, held, cg.usz(0));
+    let from_entry = ir.insert_block(B());
+    ir.condbr(B(), have, found, fresh);
+    // the claim: slot i from 0, until one is free
+    cg.at_end(fresh);
+    let loop_b = cg.new_block("try");
+    let next = cg.new_block("next");
+    let full = cg.new_block("full");
+    ir.br(B(), loop_b);
+    cg.at_end(loop_b);
+    let i = ir.phi(B(), cg.T_isz);
+    ir.add_incoming(i, cg.usz(0), fresh);
+    let at = ir.ptradd(B(), p.chains, ir.mul(B(), i, cg.usz(psz())));
+    let old = ir.cmpxchg(B(), at, ir.czero(cg.T_ptr), rec);
+    let got = ir.icmp(B(), ir.IntEQ, ir.ptrtoint(B(), old, cg.T_isz), cg.usz(0));
+    let claimed = cg.new_block("claimed");
+    ir.condbr(B(), got, claimed, next);
+    cg.at_end(next);
+    let i1 = ir.add(B(), i, cg.usz(1));
+    ir.add_incoming(i, i1, next);
+    ir.condbr(B(), ir.icmp(B(), ir.IntULT, i1, cg.usz(POOL)), loop_b, full);
+    cg.at_end(full);
+    let none = u.newn.[*mut ir.Value](1);
+    _ = ir.intr(B(), ir.IN_TRAP, cg.T_void, none[0..0]);
+    ir.unreachable(B());
+    cg.at_end(claimed);
+    let num = ir.add(B(), i, cg.usz(1));
+    st(ir.inttoptr(B(), num), slot(rec, fld));
+    ir.br(B(), found);
+    cg.at_end(found);
+    let n = ir.phi(B(), cg.T_isz);
+    ir.add_incoming(n, held, from_entry);
+    ir.add_incoming(n, num, claimed);
+    let fa = ir.ptradd(B(), p.fns, ir.mul(B(), ir.sub(B(), n, cg.usz(1)), cg.usz(psz())));
+    ir.ret(B(), ld(fa));
+    ir.remove_unreachable(f);
+    cg.F = u.nil.[cg.FnState]();
+}

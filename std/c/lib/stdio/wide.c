@@ -15,6 +15,10 @@ typedef char state_fits[sizeof(mbstate_t) <= sizeof(((FILE *)0)->__mbs) ? 1 : -1
 /* The next wide character, or WEOF (the lock held, wide-oriented) */
 wint_t __axc_getwc_u(FILE *f) {
     wchar_t wc;
+    /* (a 16-bit wchar_t: the second half of a surrogate pair waits in the
+       state, and comes without a byte read: mbrtowc's (size_t)-3) */
+    if (STATE(f)->__axiom_npend && mbrtowc(&wc, "", 1, STATE(f)) == (size_t)-3)
+        return (wint_t)wc;
     for (;;) {
         int c = GETC_U(f);
         char b;

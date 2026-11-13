@@ -10,8 +10,12 @@
 
 #ifndef __AXIOM_AXC_TYPES_MACROS
 #define __AXIOM_AXC_TYPES_MACROS
-/* _Noreturn where the standard has it, for the library's declarations */
-#if __STDC_VERSION__ >= 201112L
+/* _Noreturn where the standard has it, for the library's declarations;
+   C23's synopses have the attribute (spelled __noreturn__, which a
+   program's macro noreturn, <stdnoreturn.h>'s, does not touch) */
+#if __STDC_VERSION__ >= 202311L
+#define __AXC_NORETURN [[__noreturn__]]
+#elif __STDC_VERSION__ >= 201112L
 #define __AXC_NORETURN _Noreturn
 #else
 #define __AXC_NORETURN
@@ -24,24 +28,28 @@
 #endif
 
 /* (wchar_t's type: as the literals L"..." are, 16 or 32 bits, the
-   narrowest type of at least 32 when none has 32) */
+   narrowest type of at least 32 when none has 32; __AXC_WCHAR names it
+   for a header that uses the type without declaring wchar_t, as
+   <inttypes.h>) */
+#ifndef __AXC_WCHAR
 #if __AXIOM_WCHAR_WIDTH__ == 16
 #if __AXIOM_WCHAR_SIGNED__
-#define __AXIOM_WCHAR_TYPE short
+#define __AXC_WCHAR short
 #else
-#define __AXIOM_WCHAR_TYPE unsigned short
+#define __AXC_WCHAR unsigned short
 #endif
 #elif __AXIOM_INT_WIDTH__ == 32 || (__AXIOM_LONG_WIDTH__ != 32 && __AXIOM_INT_WIDTH__ >= 32)
 #if __AXIOM_WCHAR_SIGNED__
-#define __AXIOM_WCHAR_TYPE int
+#define __AXC_WCHAR int
 #else
-#define __AXIOM_WCHAR_TYPE unsigned int
+#define __AXC_WCHAR unsigned int
 #endif
 #else
 #if __AXIOM_WCHAR_SIGNED__
-#define __AXIOM_WCHAR_TYPE long
+#define __AXC_WCHAR long
 #else
-#define __AXIOM_WCHAR_TYPE unsigned long
+#define __AXC_WCHAR unsigned long
+#endif
 #endif
 #endif
 
@@ -64,7 +72,7 @@ typedef unsigned __axiom_int64 size_t;
 /* wchar_t: as <stddef.h> has it */
 #if defined(__AXIOM_WANT_WCHAR_T) && !defined(__AXIOM_WCHAR_T_DEFINED)
 #define __AXIOM_WCHAR_T_DEFINED
-typedef __AXIOM_WCHAR_TYPE wchar_t;
+typedef __AXC_WCHAR wchar_t;
 #endif
 
 /* wint_t (C95 7.24.1): the platform's type, which the compiler names; it
@@ -74,7 +82,7 @@ typedef __AXIOM_WCHAR_TYPE wchar_t;
 #ifdef __AXIOM_WINT_TYPE__
 typedef __AXIOM_WINT_TYPE__ wint_t;
 #else
-typedef __AXIOM_WCHAR_TYPE wint_t;
+typedef __AXC_WCHAR wint_t;
 #endif
 #endif
 
@@ -97,7 +105,20 @@ typedef struct {
 } mbstate_t;
 #endif
 
-#undef __AXIOM_WCHAR_TYPE
+/* Annex K (K.3.2, K.3.3): errno_t, an int that holds an errno value;
+   rsize_t, size_t (whose values above RSIZE_MAX the functions take for
+   errors: K.3.4). rsize_t needs __AXIOM_WANT_SIZE_T too. */
+#if defined(__AXIOM_WANT_ERRNO_T) && !defined(__AXIOM_ERRNO_T_DEFINED)
+#define __AXIOM_ERRNO_T_DEFINED
+typedef int errno_t;
+#endif
+#if defined(__AXIOM_WANT_RSIZE_T) && !defined(__AXIOM_RSIZE_T_DEFINED)
+#define __AXIOM_RSIZE_T_DEFINED
+typedef size_t rsize_t;
+#endif
+
+#undef __AXIOM_WANT_ERRNO_T
+#undef __AXIOM_WANT_RSIZE_T
 #undef __AXIOM_WANT_SIZE_T
 #undef __AXIOM_WANT_WCHAR_T
 #undef __AXIOM_WANT_WINT_T

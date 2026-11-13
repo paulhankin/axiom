@@ -5,6 +5,8 @@
    the system's time zone (std/time/tz: $TZ, else /etc/localtime; UTC where
    there is none, as on Windows and WebAssembly), read once
    (docs/c-text.md, "Time"). */
+/* (Annex K: whether its names are asked for, K.3.1.1) */
+#include <axc/ext1.h>
 #ifndef __AXIOM_TIME_H
 #define __AXIOM_TIME_H
 
@@ -56,40 +58,55 @@ struct timespec {
 #if __STDC_VERSION__ >= 202311L
 #define TIME_MONOTONIC 2
 #define TIME_ACTIVE 3
+#define TIME_THREAD_ACTIVE 4
 #endif
 #endif
 
 /* time manipulation (7.27.2) */
 clock_t clock(void);
-double difftime(time_t time1, time_t time0);
-time_t mktime(struct tm *timeptr);
-time_t time(time_t *timer);
+double difftime(time_t __time1, time_t __time0);
+time_t mktime(struct tm *__timeptr);
+time_t time(time_t *__timer);
 #if __STDC_VERSION__ >= 201112L
-int timespec_get(struct timespec *ts, int base);
+int timespec_get(struct timespec *__ts, int __base);
 #endif
 #if __STDC_VERSION__ >= 202311L
-time_t timegm(struct tm *timeptr);
-int timespec_getres(struct timespec *ts, int base);
+time_t timegm(struct tm *__timeptr);
+int timespec_getres(struct timespec *__ts, int __base);
 #endif
 
 /* time conversion (7.27.3) */
 #if __STDC_VERSION__ >= 202311L
-[[deprecated]] char *asctime(const struct tm *timeptr);
-[[deprecated]] char *ctime(const time_t *timer);
+[[deprecated]] char *asctime(const struct tm *__timeptr);
+[[deprecated]] char *ctime(const time_t *__timer);
 #else
-char *asctime(const struct tm *timeptr);
-char *ctime(const time_t *timer);
+char *asctime(const struct tm *__timeptr);
+char *ctime(const time_t *__timer);
 #endif
-struct tm *gmtime(const time_t *timer);
-struct tm *localtime(const time_t *timer);
+struct tm *gmtime(const time_t *__timer);
+struct tm *localtime(const time_t *__timer);
 #if __STDC_VERSION__ >= 202311L
-struct tm *gmtime_r(const time_t *timer, struct tm *buf);
-struct tm *localtime_r(const time_t *timer, struct tm *buf);
+struct tm *gmtime_r(const time_t *__timer, struct tm *__buf);
+struct tm *localtime_r(const time_t *__timer, struct tm *__buf);
 #endif
 #if __STDC_VERSION__ >= 199901L
-size_t strftime(char *restrict s, size_t maxsize, const char *restrict format, const struct tm *restrict timeptr);
+size_t strftime(char *restrict __s, size_t __maxsize, const char *restrict __format, const struct tm *restrict __timeptr)
+    __axiom_attribute__((__format__(strftime, 3, 0)));
 #else
-size_t strftime(char *s, size_t maxsize, const char *format, const struct tm *timeptr);
+size_t strftime(char *__s, size_t __maxsize, const char *__format, const struct tm *__timeptr)
+    __axiom_attribute__((__format__(strftime, 3, 0)));
+#endif
+
+#if __AXC_EXT1
+/* Annex K (K.3.8): the bounds-checking interfaces (std/c/lib/ext1/) */
+#define __AXIOM_WANT_ERRNO_T
+#define __AXIOM_WANT_SIZE_T
+#define __AXIOM_WANT_RSIZE_T
+#include <axc/types.h>
+errno_t asctime_s(char *__s, rsize_t __maxsize, const struct tm *__timeptr);
+errno_t ctime_s(char *__s, rsize_t __maxsize, const time_t *__timer);
+struct tm *gmtime_s(const time_t *__AXC_RESTRICT __timer, struct tm *__AXC_RESTRICT __result);
+struct tm *localtime_s(const time_t *__AXC_RESTRICT __timer, struct tm *__AXC_RESTRICT __result);
 #endif
 
 #endif

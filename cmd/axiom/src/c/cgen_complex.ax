@@ -30,6 +30,7 @@
 import "../ir.ax" as ir;
 import "../util.ax" as u;
 import "cgen.ax" as cg;
+import "cgen_half.ax" as ghf;
 import "cgen_ld.ax" as gld;
 import "cldbl.ax" as cl;
 import "ctok.ax" as ct;
@@ -45,6 +46,25 @@ pub struct Pair {
 /// The value v of a real type as an operand.
 pub fn real(v: *mut ir.Value) Pair {
     return Pair.{ re: v, im: ir.vnil() };
+}
+
+/// The value v of real type t as an operand (a _Float16 widened to float,
+/// as the parts of its complex type are).
+pub fn real_t(v: *mut ir.Value, t: *cty.CType) Pair {
+    if cty.is_half(t) {
+        return real(ghf.to_f32(v));
+    }
+    return real(v);
+}
+
+// The complex type whose arithmetic t's is: t, but complex float for
+// _Float16 _Complex, whose parts are computed in float and rounded to
+// binary16 when the value is stored (put).
+fn compute_type(t: *mut cty.CType) *mut cty.CType {
+    if cty.is_half(t.unq.elem) {
+        return cty.complex_of(cty.t_float);
+    }
+    return t;
 }
 
 fn mark(v: *mut ir.Value, t: *cty.CType, al: u64) void {
@@ -72,6 +92,9 @@ pub fn parts(t: *cty.CType, p: *mut ir.Value) Pair {
     mark(re, t, al);
     let im = ir.load(cg.B, rt, ir.ptradd(cg.B, p, cg.usz(cty.size_of(el))));
     mark(im, t, al);
+    if cty.is_half(el) {
+        return Pair.{ re: ghf.to_f32(re), im: ghf.to_f32(im) };  // (exact)
+    }
     return Pair.{ re: re, im: im };
 }
 
@@ -85,9 +108,15 @@ pub fn put(t: *cty.CType, v: Pair, p: *mut ir.Value) void {
         return;
     }
     let al = cty.align_of(el);
-    let s1 = ir.store(cg.B, v.re, p);
+    let mut re = v.re;
+    let mut im = v.im;
+    if cty.is_half(el) {
+        re = ghf.from_f32(re);  // (each part rounded to binary16)
+        im = ghf.from_f32(im);
+    }
+    let s1 = ir.store(cg.B, re, p);
     mark(s1, t, al);
-    let s2 = ir.store(cg.B, v.im, ir.ptradd(cg.B, p, cg.usz(cty.size_of(el))));
+    let s2 = ir.store(cg.B, im, ir.ptradd(cg.B, p, cg.usz(cty.size_of(el))));
     mark(s2, t, al);
 }
 
@@ -105,7 +134,7 @@ pub fn constant_wide(t: *mut cty.CType, re: ld.W, im: ld.W) *mut ir.Value {
 
 /// The constant re + i im of complex type t.
 pub fn constant(t: *mut cty.CType, re: f64, im: f64) *mut ir.Value {
-    let rt = cg.lty(t.unq.elem);
+    let rt = cg.lty(compute_type(t.unq).elem);
     return make(t, Pair.{ re: ir.cfp(rt, re), im: ir.cfp(rt, im) });
 }
 
@@ -115,22 +144,24 @@ pub fn snapshot(t: *mut cty.CType, p: *mut ir.Value) *mut ir.Value {
     return make(t, parts(t, p));
 }
 
-/// The truth of complex value v (6.3.1.2: unequal to 0, either part), as an i1.
-pub fn truth(v: Pair) *mut ir.Value {
+/// The truth of complex value v of type t (6.3.1.2: unequal to 0, either part), as an i1.
+pub fn truth(t: *cty.CType, v: Pair) *mut ir.Value {
     if wide(v) {
-        return ir.or_(cg.B, gld.truth(v.re), gld.truth(v.im));
+        let el = t.unq.elem;
+        return ir.or_(cg.B, gld.truth(v.re, el), gld.truth(v.im, el));
     }
     let z = ir.cfp(v.re.ty, 0.0);
     return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, v.re, z), ir.fcmp(cg.B, ir.RealUNE, v.im, z));
 }
 
-/// x == y (both complex: both parts equal, 6.5.9p4), as an i1; ne: x != y.
-pub fn equal(x: Pair, y: Pair, ne: bool) *mut ir.Value {
+/// x == y (both of complex type t: both parts equal, 6.5.9p4), as an i1; ne: x != y.
+pub fn equal(t: *cty.CType, x: Pair, y: Pair, ne: bool) *mut ir.Value {
     if wide(x) {
+        let el = t.unq.elem;
         if ne {
-            return ir.or_(cg.B, gld.compare(ct.P_NE, x.re, y.re), gld.compare(ct.P_NE, x.im, y.im));
+            return ir.or_(cg.B, gld.compare(ct.P_NE, x.re, y.re, el), gld.compare(ct.P_NE, x.im, y.im, el));
         }
-        return ir.and_(cg.B, gld.compare(ct.P_EQ, x.re, y.re), gld.compare(ct.P_EQ, x.im, y.im));
+        return ir.and_(cg.B, gld.compare(ct.P_EQ, x.re, y.re, el), gld.compare(ct.P_EQ, x.im, y.im, el));
     }
     if ne {
         return ir.or_(cg.B, ir.fcmp(cg.B, ir.RealUNE, x.re, y.re), ir.fcmp(cg.B, ir.RealUNE, x.im, y.im));
@@ -138,18 +169,19 @@ pub fn equal(x: Pair, y: Pair, ne: bool) *mut ir.Value {
     return ir.and_(cg.B, ir.fcmp(cg.B, ir.RealOEQ, x.re, y.re), ir.fcmp(cg.B, ir.RealOEQ, x.im, y.im));
 }
 
-/// -v.
-pub fn negate(v: Pair) Pair {
+/// -v (of complex type t).
+pub fn negate(t: *cty.CType, v: Pair) Pair {
     if wide(v) {
-        return Pair.{ re: gld.negate(v.re), im: gld.negate(v.im) };
+        let el = t.unq.elem;
+        return Pair.{ re: gld.negate(v.re, el), im: gld.negate(v.im, el) };
     }
     return Pair.{ re: ir.fneg(cg.B, v.re), im: ir.fneg(cg.B, v.im) };
 }
 
-/// The conjugate of v.
-pub fn conj(v: Pair) Pair {
+/// The conjugate of v (of complex type t).
+pub fn conj(t: *cty.CType, v: Pair) Pair {
     if wide(v) {
-        return Pair.{ re: v.re, im: gld.negate(v.im) };
+        return Pair.{ re: v.re, im: gld.negate(v.im, t.unq.elem) };
     }
     return Pair.{ re: v.re, im: ir.fneg(cg.B, v.im) };
 }
@@ -166,9 +198,10 @@ pub const OP_DIV: i32 = 4;
 
 /// x op y in complex type t (op: OP_ADD ... OP_DIV), either operand maybe
 /// real (G.5).
-pub fn arith(op: i32, t: *mut cty.CType, x: Pair, y: Pair) Pair {
+pub fn arith(op: i32, t0: *mut cty.CType, x: Pair, y: Pair) Pair {
+    let t = compute_type(t0);
     if wide(x) {
-        return arith_wide(op, x, y);
+        return arith_wide(op, x, y, t.unq.elem);
     }
     let xr = u.isnil(x.im);
     let yr = u.isnil(y.im);
@@ -212,7 +245,7 @@ pub fn arith(op: i32, t: *mut cty.CType, x: Pair, y: Pair) Pair {
 // arith where the parts are wide long doubles: the same operations, in
 // cgen_ld.ax's arithmetic; a complex product or quotient by ldouble.ax's
 // cmul and cdiv (ccomplex.ax's algorithms).
-fn arith_wide(op: i32, x: Pair, y: Pair) Pair {
+fn arith_wide(op: i32, x: Pair, y: Pair, el: *cty.CType) Pair {
     let xr = u.isnil(x.im);
     let yr = u.isnil(y.im);
     let mut cop = ct.P_PLUS;
@@ -224,36 +257,36 @@ fn arith_wide(op: i32, x: Pair, y: Pair) Pair {
         cop = ct.P_SLASH;
     }
     if (op == OP_ADD) or (op == OP_SUB) {
-        let re = gld.arith(cop, x.re, y.re);
+        let re = gld.arith(cop, x.re, y.re, el);
         if xr {
             if op == OP_SUB {
-                return Pair.{ re: re, im: gld.negate(y.im) };
+                return Pair.{ re: re, im: gld.negate(y.im, el) };
             }
             return Pair.{ re: re, im: y.im };
         }
         if yr {
             return Pair.{ re: re, im: x.im };
         }
-        return Pair.{ re: re, im: gld.arith(cop, x.im, y.im) };
+        return Pair.{ re: re, im: gld.arith(cop, x.im, y.im, el) };
     }
     if op == OP_MUL {
         if xr {
-            return Pair.{ re: gld.arith(cop, x.re, y.re), im: gld.arith(cop, x.re, y.im) };
+            return Pair.{ re: gld.arith(cop, x.re, y.re, el), im: gld.arith(cop, x.re, y.im, el) };
         }
         if yr {
-            return Pair.{ re: gld.arith(cop, x.re, y.re), im: gld.arith(cop, x.im, y.re) };
+            return Pair.{ re: gld.arith(cop, x.re, y.re, el), im: gld.arith(cop, x.im, y.re, el) };
         }
-        let r = gld.complex_call("cmul", x.re, x.im, y.re, y.im);
+        let r = gld.complex_call("cmul", x.re, x.im, y.re, y.im, el);
         return Pair.{ re: r[0], im: r[1] };
     }
     if yr {
-        return Pair.{ re: gld.arith(cop, x.re, y.re), im: gld.arith(cop, x.im, y.re) };
+        return Pair.{ re: gld.arith(cop, x.re, y.re, el), im: gld.arith(cop, x.im, y.re, el) };
     }
     let mut xi = x.im;
     if xr {
         xi = gld.constant(cl.zero());  // (x / (u + iv) as (x + i0) / (u + iv))
     }
-    let r = gld.complex_call("cdiv", x.re, xi, y.re, y.im);
+    let r = gld.complex_call("cdiv", x.re, xi, y.re, y.im, el);
     return Pair.{ re: r[0], im: r[1] };
 }
 

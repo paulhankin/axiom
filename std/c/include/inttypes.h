@@ -316,20 +316,20 @@ typedef struct {
     intmax_t rem;
 } imaxdiv_t;
 
-#define __AXIOM_WANT_WCHAR_T
+/* (wchar_t's type: 7.8 declares no wchar_t) */
 #include <axc/types.h>
 
-intmax_t imaxabs(intmax_t j);
-imaxdiv_t imaxdiv(intmax_t numer, intmax_t denom);
-intmax_t strtoimax(const char *restrict nptr, char **restrict endptr, int base);
-uintmax_t strtoumax(const char *restrict nptr, char **restrict endptr, int base);
-intmax_t wcstoimax(const wchar_t *restrict nptr, wchar_t **restrict endptr, int base);
-uintmax_t wcstoumax(const wchar_t *restrict nptr, wchar_t **restrict endptr, int base);
+intmax_t imaxabs(intmax_t __j);
+imaxdiv_t imaxdiv(intmax_t __numer, intmax_t __denom);
+intmax_t strtoimax(const char *restrict __nptr, char **restrict __endptr, int __base);
+uintmax_t strtoumax(const char *restrict __nptr, char **restrict __endptr, int __base);
+intmax_t wcstoimax(const __AXC_WCHAR *restrict __nptr, __AXC_WCHAR **restrict __endptr, int __base);
+uintmax_t wcstoumax(const __AXC_WCHAR *restrict __nptr, __AXC_WCHAR **restrict __endptr, int __base);
 /* C23's: the binary prefixes too (the names C23 mode maps them to) */
 intmax_t __axc_strtoimax_c23(const char *restrict, char **restrict, int);
 uintmax_t __axc_strtoumax_c23(const char *restrict, char **restrict, int);
-intmax_t __axc_wcstoimax_c23(const wchar_t *restrict, wchar_t **restrict, int);
-uintmax_t __axc_wcstoumax_c23(const wchar_t *restrict, wchar_t **restrict, int);
+intmax_t __axc_wcstoimax_c23(const __AXC_WCHAR *restrict, __AXC_WCHAR **restrict, int);
+uintmax_t __axc_wcstoumax_c23(const __AXC_WCHAR *restrict, __AXC_WCHAR **restrict, int);
 #if __STDC_VERSION__ >= 202311L
 #define strtoimax(nptr, endptr, base) __axc_strtoimax_c23(nptr, endptr, base)
 #define strtoumax(nptr, endptr, base) __axc_strtoumax_c23(nptr, endptr, base)

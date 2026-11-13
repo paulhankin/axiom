@@ -1315,8 +1315,27 @@ static void parse_top(Parser *P) {
     }
     if (t->kind == KW_EXPORT) {
         advance(P);
+        if (pk(P) == KW_LET) {
+            // an object C code may use, under its name (spec section 14.5.6)
+            advance(P);
+            Decl *d = new_decl(P, D_GLOBAL, start);
+            d->is_export = true;
+            d->mut = accept(P, KW_MUT);
+            d->name = expect_ident(P, &d->name_span);
+            if (!accept(P, TK_COLON)) {
+                syntax_error(P, "':' (global variables need an explicit type)");
+            } else {
+                d->te = parse_type(P);
+            }
+            expect(P, TK_EQ);
+            d->init = parse_expr(P);
+            expect(P, TK_SEMI);
+            d->span = sp_from(P, start);
+            vec_push(P->mod->decls, d);
+            return;
+        }
         if (pk(P) != KW_FN && !at_inline(P)) {
-            syntax_error(P, "'fn' after 'export'");
+            syntax_error(P, "'fn' or 'let' after 'export'");
             sync_stmt(P);
             return;
         }
@@ -1329,7 +1348,8 @@ static void parse_top(Parser *P) {
         return;
     }
     if (pk(P) == KW_EXTERN) {
-        // ExternDecl ::= "pub"? "extern" STRING_LIT STRING_LIT? "{" ExternFn* "}"
+        // ExternDecl ::= "pub"? "extern" STRING_LIT STRING_LIT? "{" ( ExternFn | ExternData )* "}"
+        // ExternData ::= "let" "mut"? IDENT ":" Type ";"   (an object C defines: spec section 14.5.6)
         advance(P);
         Token *abi = expect(P, TK_STRING);
         Sym abi_s = abi->kind == TK_STRING ? intern(abi->str.bytes, abi->str.len) : intern_cstr("C");
@@ -1339,7 +1359,32 @@ static void parse_top(Parser *P) {
             lib = intern(l->str.bytes, l->str.len);
         }
         expect(P, TK_LBRACE);
-        while (pk(P) == KW_FN) {
+        while (pk(P) == KW_FN || pk(P) == KW_LET) {
+            if (pk(P) == KW_LET) {
+                Span ls = advance(P)->span;
+                Decl *d = new_decl(P, D_GLOBAL, ls);
+                d->extern_c = true;
+                d->is_pub = is_pub;
+                d->abi = abi_s;
+                d->abi_span = abi->span;
+                d->link_lib = lib;
+                d->mut = accept(P, KW_MUT);
+                d->name = expect_ident(P, &d->name_span);
+                if (!accept(P, TK_COLON)) {
+                    syntax_error(P, "':' (a C object's declaration needs its type)");
+                } else {
+                    d->te = parse_type(P);
+                }
+                if (pk(P) == TK_EQ) {
+                    syntax_error(P, "';' (C defines the object: it has no initializer here)");
+                    sync_stmt(P);
+                } else {
+                    expect(P, TK_SEMI);
+                }
+                d->span = sp_from(P, ls);
+                vec_push(P->mod->decls, d);
+                continue;
+            }
             Span fs = advance(P)->span;
             Decl *d = new_decl(P, D_HOST_FN, fs);
             d->extern_c = true;

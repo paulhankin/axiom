@@ -529,7 +529,9 @@ await section('', byFile(cFilesIn(path.join(root, 'cmd/axiom/internal/tests/c/pr
 // expect-stderr: <text> (with expect-error: the compiler's stderr has it),
 // expect-status: <n> (the exit status; default 0), flags:, uses: <files>,
 // wasm-only, native-only, linux-only (natively, Linux only), windows-only
-// (AXIOM_NATIVE_TARGET=x86_64-windows), x86-64-only (not for an AArch64 target). Programs run in
+// (AXIOM_NATIVE_TARGET=x86_64-windows), x86-64-only (not for an AArch64 target),
+// axiom-test and axiom-profile (the program is run with that command, whose
+// report must have the expect-report: lines). Programs run in
 // a process of their own (on WebAssembly with the node host): they may exit.
 const cMixDir = path.join(root, 'cmd/axiom/internal/tests/c/mix');
 const cMixDirs = fs.existsSync(cMixDir) ? fs.readdirSync(cMixDir).filter((n) => fs.statSync(path.join(cMixDir, n)).isDirectory()).sort().map((n) => path.join(cMixDir, n)) : [];
@@ -553,6 +555,17 @@ const cMixTest = async (dir) => {
   const errors = dv('expect-error'), want = dv('expect').join('\n');
   const status = has('expect-status') ? Number(dv('expect-status')[0]) : 0;
   const out = path.join(tmp, `mix-${path.basename(dir)}${native ? '' : '.wasm'}`);
+  if (has('axiom-test') || has('axiom-profile')) {
+    // (axiom test or axiom profile of the program: its report must have
+    // the expect-report: lines)
+    if (buildOnly) return { skip: true, reason: 'runs the program' };
+    const cmd = has('axiom-test') ? ['test', '--show-output'] : ['profile'];
+    const targs = [...cmd, main, ...others, ...uses, ...flags, ...(native ? [nativeTarget] : [])];
+    const c = await spawnAsync(compiler, targs, { encoding: 'utf8', timeout: compileTimeout + runTimeout, cwd: tmp });
+    if (c.status !== 0) return `axiom ${cmd[0]} failed (status ${c.status}):\n${c.stdout}${c.stderr}`;
+    for (const t of dv('expect-report')) if (!(c.stdout + c.stderr).includes(t)) return `no '${t}' in the report:\n${c.stdout}${c.stderr}`;
+    return null;
+  }
   const args = ['build', main, ...others, ...uses, '--format=agent-json', '-o', out, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
   if (native) args.push(nativeTarget);
   else if (process.env.AXIOM_C_TARGET) args.push(`--target=${process.env.AXIOM_C_TARGET}`);
@@ -578,6 +591,147 @@ const cMixTest = async (dir) => {
   return { problem: want === got.join('\n') ? null : `output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
 };
 await section('', byFile(cMixDirs, '[c-mix]', cMixTest), { parallel: true, buildOnly: true, note: buildNote });
+
+// Linking with the objects, archives and shared libraries of the platform's
+// toolchain, and with the compiler's own objects (docs/c.md, "Objects and
+// libraries"): each directory of cmd/axiom/internal/tests/c/link/ is a
+// test, natively on Linux (x86-64, or AArch64 with AXIOM_NATIVE_TARGET=
+// aarch64) where the system's C compiler for the target is installed. Its
+// files: main.c or main.ax, built by the compiler with the others; sys_*.c
+// (and sys_*.cpp: the system's C++ compiler, -fno-exceptions -fno-rtti),
+// compiled by the system's compiler into objects given to the build;
+// arch_*.c into the archive libarch.a, so_*.c into the shared library
+// libso.so (-fPIC -shared), both named with -L and -l (the program runs
+// with LD_LIBRARY_PATH); ours_*.c compiled by this compiler (--emit=obj,
+// with ours-flags:) into objects given to the build, ourlib_*.c into the
+// archive libours.a (--emit=lib, -lours); cc_main.c, if there is one,
+// compiled and linked by the system's C compiler with the ours_ objects and
+// libours.a into a second program, which must print the cc-expect: lines.
+// Directives of the main file, in // or /* */ comments: expect:,
+// expect-error: (E or C codes), expect-stderr:, expect-status:, flags:
+// (--link=x paths are the directory's), cc-variants: flags | flags | ...
+// (the sys_, arch_ and so_ files are compiled with each, the test run
+// once per variant; -x86_64 and -aarch64 suffixes on the directive give a
+// target's own), needs: c++.
+const cLinkDir = path.join(root, 'cmd/axiom/internal/tests/c/link');
+const cLinkDirs = fs.existsSync(cLinkDir) ? fs.readdirSync(cLinkDir).filter((n) => fs.statSync(path.join(cLinkDir, n)).isDirectory()).sort().map((n) => path.join(cLinkDir, n)) : [];
+const linkArch = (process.env.AXIOM_NATIVE_TARGET || process.arch === 'arm64' && 'aarch64' || 'x86_64').replace(/^native$/, process.arch === 'arm64' ? 'aarch64' : 'x86_64');
+const hostArch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+const sysTool = (cxx) => {
+  const names = linkArch === hostArch ? (cxx ? ['g++', 'c++', 'clang++'] : ['cc', 'gcc', 'clang']) : [`${linkArch}-linux-gnu-${cxx ? 'g++' : 'gcc'}`];
+  for (const n of names) if (spawnSync('sh', ['-c', `command -v ${n}`]).status === 0) return n;
+  return null;
+};
+const cLinkTest = async (dir) => {
+  if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+  if (!native || noC || process.platform !== 'linux' || !/^(x86_64|aarch64)$/.test(linkArch)) return { skip: true, reason: 'Linux natively' };
+  const cc = sysTool(false);
+  if (!cc) return { skip: true, reason: 'no system C compiler for the target' };
+  const axMain = fs.existsSync(path.join(dir, 'main.ax'));
+  const main = path.join(dir, axMain ? 'main.ax' : 'main.c');
+  const src = fs.readFileSync(main, 'utf8');
+  const dv = (name) => [...src.matchAll(new RegExp(`(?:// |/\\* )${name}: ?(.*?)(?: \\*/)?$`, 'gm'))].map((m) => m[1]);
+  const names = fs.readdirSync(dir).sort();
+  const pick = (re) => names.filter((n) => re.test(n)).map((n) => path.join(dir, n));
+  const needsCxx = dv('needs').some((x) => /c\+\+/.test(x));
+  const cxx = needsCxx ? sysTool(true) : null;
+  if (needsCxx && !cxx) return { skip: true, reason: 'no system C++ compiler' };
+  const variantsOf = (d) => dv(d).flatMap((x) => x.split('|')).map((x) => x.trim());
+  let variants = [...variantsOf('cc-variants'), ...variantsOf(`cc-variants-${linkArch}`)];
+  if (!variants.length) variants = ['-O2'];
+  const errors = dv('expect-error'), want = dv('expect').join('\n');
+  const status = dv('expect-status').length ? Number(dv('expect-status')[0]) : 0;
+  const work = path.join(tmp, `link-${path.basename(dir)}`);
+  fs.mkdirSync(work, { recursive: true });
+  const run = async (cmd, args, what) => {
+    const r = await spawnAsync(cmd, args, { encoding: 'utf8', timeout: compileTimeout, cwd: work });
+    return r.status === 0 ? null : `${what} failed:\n${r.stdout}${r.stderr}`;
+  };
+  // this compiler's objects and archive (the same for every variant)
+  const target = `--target=${linkArch}`;
+  const oursFlags = dv('ours-flags').flatMap((x) => x.trim().split(/\s+/)).filter((x) => x);
+  const ours = [];
+  for (const f of pick(/^ours_.*\.c$/)) {
+    const o = path.join(work, path.basename(f, '.c') + '.o');
+    const p = await run(compiler, ['build', f, '--emit=obj', target, ...oursFlags, '-o', o], `compiling ${path.basename(f)} (--emit=obj)`);
+    if (p) return p;
+    ours.push(o);
+  }
+  const ourlib = pick(/^ourlib_.*\.c$/);
+  if (ourlib.length) {
+    const p = await run(compiler, ['build', ...ourlib, '--emit=lib', target, ...oursFlags, '-o', path.join(work, 'libours.a')], 'compiling the ourlib_ files (--emit=lib)');
+    if (p) return p;
+  }
+  for (const v of variants) {
+    const vf = v.split(/\s+/).filter((x) => x);
+    const objs = [];
+    for (const f of pick(/^sys_.*\.(c|cpp)$/)) {
+      const o = path.join(work, path.basename(f).replace(/\.\w+$/, '.o'));
+      const isCxx = f.endsWith('.cpp');
+      const p = await run(isCxx ? cxx : cc, ['-c', ...vf, ...(isCxx ? ['-fno-exceptions', '-fno-rtti'] : []), f, '-o', o], `${isCxx ? cxx : cc} ${v} ${path.basename(f)}`);
+      if (p) return p;
+      objs.push(o);
+    }
+    const libFlags = [];
+    const arch = pick(/^arch_.*\.c$/);
+    if (arch.length) {
+      const aos = [];
+      for (const f of arch) {
+        const o = path.join(work, path.basename(f, '.c') + '.o');
+        const p = await run(cc, ['-c', ...vf, f, '-o', o], `${cc} ${path.basename(f)}`);
+        if (p) return p;
+        aos.push(o);
+      }
+      fs.rmSync(path.join(work, 'libarch.a'), { force: true });
+      const p = await run('ar', ['rcs', path.join(work, 'libarch.a'), ...aos], 'ar');
+      if (p) return p;
+      libFlags.push('-larch');
+    }
+    const so = pick(/^so_.*\.c$/);
+    if (so.length) {
+      const p = await run(cc, ['-shared', '-fPIC', '-O2', ...so, '-o', path.join(work, 'libso.so')], `${cc} -shared`);
+      if (p) return p;
+      libFlags.push('-lso');
+    }
+    if (ourlib.length) libFlags.push('-lours');
+    const flags = dv('flags').flatMap((x) => x.trim().split(/\s+/)).filter((x) => x).map((x) => x.startsWith('--link=') ? `--link=${path.resolve(dir, x.slice(7))}` : x);
+    const others = names.filter((n) => n !== path.basename(main) && /\.c$/.test(n) && !/^(sys|arch|so|ours|ourlib|cc)_/.test(n)).map((n) => path.join(dir, n));
+    const out = path.join(work, 'prog');
+    const args = ['build', main, ...others, ...objs, ...ours, `-L${work}`, ...libFlags, '--format=agent-json', '-o', out, target, ...flags, ...extraFlags.filter((a) => !a.startsWith('--units='))];
+    const c = await spawnAsync(compiler, args, { encoding: 'utf8', timeout: compileTimeout });
+    if (errors.length) {
+      let codes = [];
+      try { codes = JSON.parse(c.stdout).diagnostics.filter((x) => x.severity === 'error').map((x) => x.code); } catch { codes = []; }
+      if (c.status === 0) return `[${v}] expected errors ${errors.join(', ')}, but the build succeeded`;
+      for (const e of errors) if (!codes.includes(e)) return `[${v}] expected ${e}, got [${codes.join(', ')}]:\n${c.stdout}${c.stderr}`;
+      for (const t of dv('expect-stderr')) if (!c.stderr.includes(t)) return `[${v}] no '${t}' in the compiler's stderr:\n${c.stderr}`;
+      continue;
+    }
+    if (c.status !== 0) return `[${v}] compilation failed:\n${c.stdout}${c.stderr}`;
+    const env = { ...process.env, LD_LIBRARY_PATH: work };
+    const r = await spawnExeAsync(out, [], { encoding: 'utf8', timeout: runTimeout, env });
+    if (r.error && r.error.code === 'ETIMEDOUT') return `[${v}] timed out after ${runTimeout / 1000} s`;
+    const got = r.stdout.split('\n');
+    if (got[got.length - 1] === '') got.pop();
+    if (r.status !== status) return { problem: `[${v}] exit status ${r.status} (signal ${r.signal}), expected ${status}; output:\n${got.join('\n')}`, stderr: r.stderr };
+    if (want !== got.join('\n')) return { problem: `[${v}] output mismatch\n--- expected\n${want}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
+    for (const t of dv('expect-stderr')) if (!r.stderr.includes(t)) return `[${v}] no '${t}' in the program's stderr:\n${r.stderr}`;
+  }
+  // the compiler's objects linked by the system's toolchain
+  const ccMain = path.join(dir, 'cc_main.c');
+  if (fs.existsSync(ccMain)) {
+    const out2 = path.join(work, 'cc-prog');
+    const p = await run(cc, [ccMain, ...ours, ...(ourlib.length ? [`-L${work}`, '-lours'] : []), '-o', out2], `${cc} (linking the compiler's objects)`);
+    if (p) return p;
+    const r = await spawnExeAsync(out2, [], { encoding: 'utf8', timeout: runTimeout });
+    const got = r.stdout.split('\n');
+    if (got[got.length - 1] === '') got.pop();
+    const want2 = dv('cc-expect').join('\n');
+    if (r.status !== 0 || want2 !== got.join('\n')) return { problem: `the system toolchain's program: exit status ${r.status}\n--- expected\n${want2}\n--- got\n${got.join('\n')}`, stderr: r.stderr };
+  }
+  return null;
+};
+await section('', byFile(cLinkDirs, '[c-link]', cLinkTest), { parallel: true, buildOnly: true, note: buildNote });
 
 // The hosted C library (docs/c.md, "The C library"): each
 // cmd/axiom/internal/tests/c/lib/<part>/*.c is a hosted C program, built
@@ -696,6 +850,30 @@ await section('', {
     if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
     const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/internal/tools/gen_c_lib_index.mjs'), '--check'],
       { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: compileTimeout });
+    return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
+  },
+  // (every header in every --c-std declares and defines only its
+  // standard's names and those reserved to it, and all the names its
+  // standard requires: tools/c_header_names.mjs, c/headers/names.txt)
+  'C library: the headers\' names are their standards\'': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/axiom/internal/tests/tools/c_header_names.mjs')],
+      { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: compileTimeout });
+    return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
+  },
+  // (every Constraints paragraph of clause 6 violated, and diagnosed:
+  // tools/c_constraints.mjs over c/constraints.txt; docs/c-conformance.md)
+  'C conformance: every constraint is diagnosed': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/axiom/internal/tests/tools/c_constraints.mjs')],
+      { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: 4 * compileTimeout });
+    return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
+  },
+  // (every translation limit of 5.2.4.1 reached, and exceeded: tools/c_limits.mjs)
+  'C conformance: the translation limits': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const r = await spawnAsync(process.execPath, [path.join(root, 'cmd/axiom/internal/tests/tools/c_limits.mjs')],
+      { encoding: 'utf8', env: { ...process.env, AXIOM: compiler }, timeout: 10 * compileTimeout });
     return r.status === 0 ? null : `${r.stdout}${r.stderr}`;
   },
 });
@@ -888,7 +1066,8 @@ function cDriverCases() {
       if (c.status !== 0) return `check m.ax f.c: ${c.stdout}${c.stderr}`;
       c = await ax(['check', 'm.ax', 'f.c']);
       if (c.status !== 1 || !/#error/.test(c.stderr)) return `check without -DK: ${c.stdout}${c.stderr}`;
-      p = await fatal(['test', 'm.ax', 'f.c', '-DK=2'], /axiom test does not take C sources/);
+      // (axiom test takes C units: c/mix/test_with_c; axiom ide does not)
+      p = await fatal(['ide', 'm.ax', 'f.c', '-DK=2'], /axiom ide does not take C sources/);
       if (!p) p = await fatal(['build', 'm.ax', 'f.c', '--emit=c-pp'], /takes one C source, and no Axiom source/);
       if (!p) p = await fatal(['build', 'm.ax', 'f.c', '--units=module'], /--units is an option for Axiom code/);
       if (!p) p = await fatal(['build', 'm.ax', 'g.ax'], /unexpected argument 'g.ax'/);
@@ -1095,6 +1274,35 @@ await section('C programs', {
     c = await spawnAsync(compiler, ['build', f, inc, '--emit=obj', '-o', obj, ...targetFlags], { encoding: 'utf8' });
     if (c.status !== 0) return `--emit=obj failed:\n${c.stdout}${c.stderr}`;
     return fs.statSync(obj).size > 0 ? null : 'an empty object';
+  },
+  // (C's attribute visibility in the ELF object's symbols: hidden and
+  // internal are STV_HIDDEN, protected and default STV_DEFAULT)
+  'visibility in --emit=obj': async () => {
+    if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
+    const f = path.join(tmp, 'c-vis.c'), obj = path.join(tmp, 'c-vis.o');
+    fs.writeFileSync(f, '__attribute__((visibility("hidden"))) int vis_h(void) { return 1; }\n' +
+      '__attribute__((visibility("internal"))) int vis_i(void) { return 2; }\n' +
+      '__attribute__((visibility("protected"))) int vis_p(void) { return 3; }\n' +
+      'int vis_d(void) { return 4; }\n__attribute__((visibility("hidden"))) int vis_hd = 5;\nint vis_dd = 6;\n' +
+      '#pragma GCC visibility push(hidden)\nint vis_ph(void) { return 7; }\n#pragma GCC visibility pop\n');
+    const c = await spawnAsync(compiler, ['build', f, '--c-std=gnu17', '--emit=obj', '-o', obj, '--target=x86_64'], { encoding: 'utf8' });
+    if (c.status !== 0) return `--emit=obj failed:\n${c.stdout}${c.stderr}`;
+    const b = fs.readFileSync(obj);
+    const shoff = Number(b.readBigUInt64LE(0x28)), shentsize = b.readUInt16LE(0x3a), shnum = b.readUInt16LE(0x3c);
+    const sh = (k) => { const o = shoff + k * shentsize; return { type: b.readUInt32LE(o + 4), off: Number(b.readBigUInt64LE(o + 0x18)), size: Number(b.readBigUInt64LE(o + 0x20)), link: b.readUInt32LE(o + 0x28) }; };
+    const other = new Map();
+    for (let k = 0; k < shnum; k++) {
+      const s = sh(k);
+      if (s.type !== 2) continue;  // SHT_SYMTAB
+      const str = sh(s.link);
+      for (let o = s.off; o < s.off + s.size; o += 24) {
+        const n = b.readUInt32LE(o), e = b.indexOf(0, str.off + n);
+        other.set(b.toString('latin1', str.off + n, e), b[o + 5] & 3);
+      }
+    }
+    const want = { vis_h: 2, vis_i: 2, vis_p: 0, vis_d: 0, vis_hd: 2, vis_dd: 0, vis_ph: 2 };
+    for (const [n, v] of Object.entries(want)) if (other.get(n) !== v) return `${n}: visibility ${other.get(n)}, not ${v}`;
+    return null;
   },
   'diagnostics at #line positions': async () => {
     if (bootstrapCompiler()) return { skip: true, reason: 'the C front end is the compiler\'s' };
@@ -1567,14 +1775,16 @@ await section('spec §16.3', {
         '    return mid(start);', '}', ''].join('\n'));
       const env = { ...process.env, AXIOM_PARTS: '3' };
       const outs = [];
-      for (const n of ['parts1', 'parts2']) {
-        const o = path.join(dir, n);
+      // (to one path: a Windows executable names its PDB by its path, and
+      // its PDB's GUID is a hash of the image)
+      const o = path.join(dir, 'parts1');
+      for (let k = 0; k < 2; k++) {
         const c = spawnSync(compiler, ['build', f, '-O2', '-o', o, nativeTarget], { encoding: 'utf8', env });
         if (c.status) return c.stderr;
         outs.push(fs.readFileSync(o));
       }
       if (!outs[0].equals(outs[1])) return 'two builds differ';
-      const r = hostRun(path.join(dir, 'parts1'));
+      const r = hostRun(o);
       return r.status !== 0 && /parts ok/.test(r.stdout) && /at deep/.test(r.stderr) && /at main/.test(r.stderr)
         ? null : `status ${r.status}:\n${r.stdout}${r.stderr}`;
     },
@@ -2505,6 +2715,28 @@ if (!skipPlatform) {
       if (p || !wine) return p;
       const r = run('c', ['x']);
       return r.status === 3 && r.stdout === 'x 42 2.50\r\nbye\r\n' ? null : `status ${r.status}: ${JSON.stringify(r.stdout)}${r.stderr}`;
+    },
+    // --c-lib=system: the system's C library is the program's (its headers
+    // are not here: a directory of declarations stands in for them). Its
+    // functions are msvcrt.dll's, by name; main's return ends the program
+    // through its exit, which runs the atexit functions and flushes its
+    // streams.
+    '--c-lib=system: the names msvcrt.dll\'s, main ending through its exit': () => {
+      const inc = path.join(tmp, 'windows-sysinc');
+      fs.mkdirSync(inc, { recursive: true });
+      fs.writeFileSync(path.join(inc, 'stdio.h'), 'int printf(const char *, ...);\nint puts(const char *);\n');
+      fs.writeFileSync(path.join(inc, 'stdlib.h'), 'int atexit(void (*)(void));\nint abs(int);\n');
+      const src = path.join(tmp, 'windows-syslib.c');
+      fs.writeFileSync(src, '#include <stdio.h>\n#include <stdlib.h>\nstatic void bye(void) { printf("bye\\n"); }\n' +
+        'int main(void) {\n    atexit(bye);\n    printf("%d\\n", abs(-42));\n    return 3;\n}\n');
+      const c = build(src, 'syslib', ['--c-lib=system', `--c-system-include=${inc}`, '--c-long=32']);
+      if (c.status !== 0) return `build failed:\n${c.stdout}${c.stderr}`;
+      const r0 = checkPEFile(out('syslib'), {});
+      if (r0.errs.length) return r0.errs.join('\n');
+      for (const f of ['printf', 'atexit', 'abs', 'exit']) if (!r0.imports.includes(`msvcrt.dll:${f}`)) return `no import msvcrt.dll:${f}: ${r0.imports.join(' ')}`;
+      if (!wine) return null;
+      const r = run('syslib');
+      return r.status === 3 && r.stdout.replace(/\r/g, '') === '42\nbye\n' ? null : `status ${r.status}: ${JSON.stringify(r.stdout)}${r.stderr}`;
     },
     // The function table (.pdata): entries sorted, apart, each in .text with
     // its unwind information, not overlapping the TLS directory; under Wine a

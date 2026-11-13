@@ -4,6 +4,8 @@
    the names past the standard's three are those other parts of the library
    report (names beginning with E and an upper-case letter are reserved for
    this header in every standard, 7.31.3). */
+/* (Annex K: whether its names are asked for, K.3.1.1) */
+#include <axc/ext1.h>
 #ifndef __AXIOM_ERRNO_H
 #define __AXIOM_ERRNO_H
 
@@ -11,6 +13,12 @@
    (std/c/lib/core/__axc_errno.c), so that it becomes per-thread there */
 int *__axc_errno(void);
 #define errno (*__axc_errno())
+
+#if __AXC_EXT1
+/* errno_t (K.3.2) */
+#define __AXIOM_WANT_ERRNO_T
+#include <axc/types.h>
+#endif
 
 #define EDOM 33
 #define ERANGE 34

@@ -68,6 +68,9 @@ typedef struct {
 } femode_t;
 extern const femode_t __axc_fe_dfl_mode;
 #define FE_DFL_MODE (&__axc_fe_dfl_mode)
+/* (C23 7.6: the operand of #pragma STDC FENV_ROUND that names the dynamic
+   mode, which fegetround gives; not a rounding direction fesetround takes) */
+#define FE_DYNAMIC 0x1000
 int fegetmode(femode_t *__m);
 int fesetmode(const femode_t *__m);
 int fesetexcept(int __e);

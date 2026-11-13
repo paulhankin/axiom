@@ -306,6 +306,7 @@ struct Decl {
     Module *imported;
     Sym host_module;   // D_HOST_FN from `import host "mod"`; NULL for extern "C"
     bool extern_c;     // declared in an extern "C" block
+    bool cabi;         // a C function (extern "C" or export) with a structure by value (spec section 14.5.3)
     bool variadic;     // C varargs: `...` after the fixed parameters
     Sym link_lib;      // extern "C" "lib": library to link
     Sym abi;

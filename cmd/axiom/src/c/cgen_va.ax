@@ -146,6 +146,17 @@ fn narrow(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     return v;
 }
 
+// A _Float16 (its bits, an i16) as the ABIs pass it: an f32 whose low 16
+// bits are them (cgen_abi.scalar_ty).
+fn half_out(v: *mut ir.Value) *mut ir.Value {
+    return ir.bitcast(B(), ir.zext(B(), v, i32t()), ir.t_float(32));
+}
+
+// A _Float16 received as half_out makes it: its bits.
+fn half_in(x: *mut ir.Value) *mut ir.Value {
+    return ir.trunc(B(), ir.bitcast(B(), x, i32t()), ir.t_int(16));
+}
+
 // The IR type of scalar C type t.
 fn sty(t: *mut cty.CType) *mut ir.Ty {
     return cg.lty(t);
@@ -171,6 +182,9 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
         } else if w == abi.SL_VABUF {
             vb = buffer(p.vabuf_size + 8, 16);
             args[k] = vb;
+        } else if w == abi.SL_CHAIN {
+            args[k] = cg.next_chain;  // (a nested function's: cgen_nest.ax)
+            cg.next_chain = ir.vnil();
         } else if w != abi.SL_ARG {
             args[k] = ir.czero(t);  // (a filler)
         }
@@ -180,7 +194,9 @@ pub fn emit_call(p: *mut abi.Plan, fty: *mut ir.Ty, callee: *mut ir.Value, vs: [
         let v = vs[i];
         if a.kind == abi.A_SCALAR {
             let mut x = v;
-            if a.as_int {
+            if cty.is_half(a.ty) and not a.as_int {
+                x = half_out(v);
+            } else if a.as_int {
                 // (its bits, in the low part of the integer register)
                 if v.ty.size < 8 {
                     x = ir.zext(B(), ir.bitcast(B(), v, ir.t_int(@truncate(i32, v.ty.size * 8))), i64t());
@@ -300,6 +316,9 @@ fn call_result(p: *mut abi.Plan, r: *mut ir.Value, res: *mut ir.Value) *mut ir.V
     if cty.is_decimal(p.rty) {
         return fit(r, cg.lty(p.rty));  // (its bits: cgen_dec.ax)
     }
+    if cty.is_half(p.rty) {
+        return half_in(r);
+    }
     // (a _BitInt result as a parameter: see enter_function)
     return cbi.norm(r, p.rty);
 }
@@ -393,7 +412,19 @@ pub fn enter_function(p: *mut abi.Plan, f: *mut ir.Func, ps: []*mut cast.CSym, v
             // promoted: cgen_stmt converts it)
             // (a _BitInt's bits beyond its width are unspecified in the
             // ABIs: the value is brought to this implementation's form)
-            if a.as_int {
+            if cty.is_half(a.ty) {
+                // (its bits: in the low 16 bits of the register, a floating
+                // one's or, Windows ARM64's variadic, an integer one's)
+                let mut x = f.params[@int_cast(usize, a.slot[0])];
+                if a.as_int {
+                    x = ir.trunc(B(), x, ir.t_int(16));
+                } else {
+                    x = half_in(x);
+                }
+                if a.ty == cty.unqual(s.ty) {
+                    st(x, o, 2);
+                }
+            } else if a.as_int {
                 // (Windows ARM64: a floating-point parameter of a variadic
                 // function arrives as its bits in an integer register)
                 let ft = a.pieces[0].ty;
@@ -489,6 +520,10 @@ pub fn ret_value(p: *mut abi.Plan, res: *mut ir.Value, v: *mut ir.Value) void {
     if p.ret == abi.R_SCALAR {
         if cty.is_decimal(p.rty) {
             ir.ret(B(), fit(v, p.rpieces[0].ty));
+            return;
+        }
+        if cty.is_half(p.rty) {
+            ir.ret(B(), half_out(v));
             return;
         }
         ir.ret(B(), v);
@@ -673,7 +708,7 @@ fn slot_va_arg(ap: *mut ir.Value, t: *mut cty.CType, ab: i32) *mut ir.Value {
 // System V: from the register save area while the registers the argument
 // needs are left, else from the overflow area.
 fn sysv_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
-    let a = one_arg(t, false);
+    let a = one_arg(t, true);
     let size = cty.size_of(t);
     let mut g: u64 = 0;
     let mut f: u64 = 0;
@@ -810,8 +845,10 @@ fn a64_va_arg(ap: *mut ir.Value, t: *mut cty.CType) *mut ir.Value {
         // (an HFA's members are each in a 16-byte register slot)
         let buf = buffer(64, 16);
         for k in 0..n {
+            // (at the member's offset: a _Float16's f32 piece overlaps the
+            // next member, which is stored after it)
             let ft = a.pieces[0].ty;
-            st(ld(ft, at(base, k * 16), es), at(buf, k * es), es);
+            st(ld(ft, at(base, k * 16), es), at(buf, a.pieces[@truncate(usize, k)].off), 1);
         }
         addr = buf;
     }

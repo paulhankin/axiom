@@ -121,7 +121,7 @@ pub fn initializer(t: *mut cty.CType, it: *mut cast.Init, is_static: bool, const
     }
     F.list.zero = true;
     F.c89_list = (cs.std() < co.C99) and not cty.is_scalar(t) and not cs.opts().gnu;
-    if not cty.is_scalar(t) and not cty.is_record(t) and (t.kind != cty.TK_ARRAY) {
+    if not cty.is_scalar(t) and not cty.is_record(t) and (t.kind != cty.TK_ARRAY) and not cty.is_vector(t) {
         cs.err(it.span, "C3033", u.f1("an initializer for an object of type %s", cs.tq(t)));
         return Result.{ list: F.list, ty: ty };
     }
@@ -326,7 +326,7 @@ fn expr_item(F: *mut Filler, s: Sub, e: *mut cast.Expr) void {
                "an initializer list for an aggregate or union has an item that is not a constant (allowed from C99)");
         F.errors = true;
     }
-    if cty.is_record(t) {
+    if cty.is_record(t) or cty.is_vector(t) {
         drop_inside(F, s.off, cty.size_of(t));
     }
     push(F, cast.InitItem.{ off: s.off, ty: t, e: x, bits: s.bits });
@@ -433,8 +433,10 @@ fn constexpr_value(e: *mut cast.Expr, x: *mut cast.Expr, t: *mut cty.CType) bool
             }
         } else if cty.is_wide(t) or cty.is_wide(e.ty) {
             // (compared as wide long doubles, which hold every value of the others)
-            let c = cl.cmp(cc.wide_value(x), cc.wide_value(e), cc.ld_fmt());
-            exact = (c == 0) or ((c == 2) and cl.is_nan(cc.wide_value(e), cc.ld_fmt()));
+            // (in binary128, which holds every value of the others, the x87's included)
+            let q = cl.fmt_of(128);
+            let c = cl.cmp(cc.wide_value_in(x, q), cc.wide_value_in(e, q), q);
+            exact = (c == 0) or ((c == 2) and cl.is_nan(cc.wide_value_in(e, q), q));
         } else if cty.is_floating(e.ty) {
             exact = (x.fcval == e.fcval) or (e.fcval != e.fcval);
         } else if cty.is_wint(e.ty) {
@@ -466,6 +468,11 @@ fn subobject(lv: *Level) Sub {
     let t = lv.t;
     if t.kind == cty.TK_ARRAY {
         return Sub.{ t: t.elem, off: lv.off + lv.idx * cty.size_of(t.elem), bits: no_bits() };
+    }
+    if t.kind == cty.TK_VECTOR {
+        // (a GNU dialect's vector: its lanes, as an array's elements)
+        return Sub.{ t: cty.qualify(t.unq.elem, t.quals), off: lv.off + lv.idx * cty.size_of(t.unq.elem),
+                     bits: no_bits() };
     }
     let m = t.unq.tag.members.get(@truncate(usize, lv.idx));
     let mut bits = no_bits();
@@ -501,6 +508,9 @@ fn valid_in(F: *Filler, lv: *mut Level) bool {
     let t = lv.t;
     if t.kind == cty.TK_ARRAY {
         return not t.has_len or (lv.idx < t.len);
+    }
+    if t.kind == cty.TK_VECTOR {
+        return lv.idx < t.unq.len;
     }
     let ms = t.unq.tag.members.items();
     while (lv.idx < @as(u64, ms.len)) and not takes_part(ms[@truncate(usize, lv.idx)]) {
@@ -668,6 +678,11 @@ fn designate(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init, ri: 
         let lv = st.at(st.len - 1);
         let t = lv.t;
         if (d.kind == cast.DesigKind.INDEX) or (d.kind == cast.DesigKind.RANGE) {
+            if t.kind == cty.TK_VECTOR {
+                cs.err(d.span, "C3072",
+                       u.f1("an array designator for a vector (of type %s): its lanes are given in order", cs.tq(t)));
+                return false;
+            }
             if t.kind != cty.TK_ARRAY {
                 cs.err(d.span, "C3072", u.f1("an array designator for an object of type %s, not an array", cs.tq(t)));
                 return false;
@@ -911,7 +926,7 @@ fn place(F: *mut Filler, st: *mut u.List.[Level], item: *mut cast.Init) void {
                 step(lv);
                 return;
             }
-            if cty.is_record(s.t) and cty.compatible_unq(s.t, x.ty) {
+            if (cty.is_record(s.t) or cty.is_vector(s.t)) and cty.compatible_unq(s.t, x.ty) {
                 expr_item(F, s, x);
                 step(lv);
                 return;

@@ -12,20 +12,28 @@
    bias 16383. Where long double is double, these are the double
    functions. */
 #if __STDC_VERSION__ >= 199901L
-#if __AXIOM_LDBL_WIDTH__ != 64
+/* (the long double instance; m_f128.c defines LDT and the others first
+   for its _Float128 one) */
+#if !defined(LDT) && __AXIOM_LDBL_WIDTH__ != 64
+#define LDT long double
+#define FN(name) name##l
+#define K(c) c##L
+#define X87 (__AXIOM_LDBL_WIDTH__ == 80)
+#define P LDBL_MANT_DIG /* 64 or 113 */
+#define LD_NEXTTOWARD 1
+#endif
+#ifdef LDT
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
 
-#define X87 (__AXIOM_LDBL_WIDTH__ == 80)
-#define P LDBL_MANT_DIG /* 64 or 113 */
 #define BIAS 16383
 
 void __axc_math_err(int e, unsigned int flags);
 double sqrt(double);
 
 typedef union {
-    long double v;
+    LDT v;
     unsigned char b[16];
 } LD;
 
@@ -56,7 +64,7 @@ static void put64(unsigned char *p, unsigned long long v)
     }
 }
 
-static Parts parts(long double x)
+static Parts parts(LDT x)
 {
     LD u;
     Parts r;
@@ -77,7 +85,7 @@ static Parts parts(long double x)
     return r;
 }
 
-static long double make(Parts r)
+static LDT make(Parts r)
 {
     LD u;
     unsigned se = ((unsigned)r.neg << 15) | (unsigned)r.e;
@@ -94,12 +102,12 @@ static long double make(Parts r)
     return u.v;
 }
 
-static int is_nan(long double x)
+static int is_nan(LDT x)
 {
     return x != x;
 }
 
-static long double inf_l(void)
+static LDT inf_l(void)
 {
     Parts r;
     r.neg = 0;
@@ -110,7 +118,7 @@ static long double inf_l(void)
 }
 
 /* 2^n, for -16382 <= n <= 16383 */
-static long double pow2l(int n)
+static LDT pow2l(int n)
 {
     Parts r;
     r.neg = 0;
@@ -120,14 +128,14 @@ static long double pow2l(int n)
     return make(r);
 }
 
-long double fabsl(long double x)
+LDT FN(fabs)(LDT x)
 {
     Parts r = parts(x);
     r.neg = 0;
     return make(r);
 }
 
-long double copysignl(long double x, long double y)
+LDT FN(copysign)(LDT x, LDT y)
 {
     Parts r = parts(x);
     r.neg = parts(y).neg;
@@ -135,7 +143,7 @@ long double copysignl(long double x, long double y)
 }
 
 /* x with its fraction bits below the units cleared (|x| >= 1, finite) */
-static long double trunc_bits(long double x)
+static LDT trunc_bits(LDT x)
 {
     Parts r = parts(x);
     int k = r.e - BIAS;          /* the units bit is k bits below the leading one */
@@ -151,7 +159,7 @@ static long double trunc_bits(long double x)
     return make(r);
 }
 
-long double truncl(long double x)
+LDT FN(trunc)(LDT x)
 {
     Parts r = parts(x);
     if (r.e == 0x7fff)
@@ -159,36 +167,36 @@ long double truncl(long double x)
     if (r.e >= BIAS + P - 1)
         return x; /* integers */
     if (r.e < BIAS)
-        return copysignl(0.0L, x); /* |x| < 1 */
+        return FN(copysign)(K(0.0), x); /* |x| < 1 */
     return trunc_bits(x);
 }
 
-long double floorl(long double x)
+LDT FN(floor)(LDT x)
 {
-    long double t = truncl(x);
+    LDT t = FN(trunc)(x);
     if (x < t)
-        return t - 1.0L;
+        return t - K(1.0);
     return t;
 }
 
-long double ceill(long double x)
+LDT FN(ceil)(LDT x)
 {
-    long double t = truncl(x);
+    LDT t = FN(trunc)(x);
     if (x > t)
-        return t + 1.0L;
+        return t + K(1.0);
     return t;
 }
 
-long double roundl(long double x)
+LDT FN(round)(LDT x)
 {
-    long double t = truncl(x);
-    if (fabsl(x - t) >= 0.5L)
-        return t + copysignl(1.0L, x);
+    LDT t = FN(trunc)(x);
+    if (FN(fabs)(x - t) >= K(0.5))
+        return t + FN(copysign)(K(1.0), x);
     return t;
 }
 
 /* t (an integer) is odd */
-static int odd(long double t)
+static int odd(LDT t)
 {
     Parts r = parts(t);
     int k = r.e - BIAS, drop = (P - 1) - k;
@@ -199,75 +207,75 @@ static int odd(long double t)
     return (int)((r.lo >> drop) & 1);
 }
 
-/* the arithmetic rounds to nearest: so do rintl and nearbyintl */
-long double rintl(long double x)
+/* the arithmetic rounds to nearest: so do FN(rint) and FN(nearbyint) */
+LDT FN(rint)(LDT x)
 {
-    long double t = truncl(x), d;
+    LDT t = FN(trunc)(x), d;
     if (is_nan(x))
         return x + x;
-    d = fabsl(x - t);
-    if (d > 0.5L || (d == 0.5L && odd(t)))
-        return t + copysignl(1.0L, x);
+    d = FN(fabs)(x - t);
+    if (d > K(0.5) || (d == K(0.5) && odd(t)))
+        return t + FN(copysign)(K(1.0), x);
     return t;
 }
 
-long double nearbyintl(long double x)
+LDT FN(nearbyint)(LDT x)
 {
-    return rintl(x);
+    return FN(rint)(x);
 }
 
-long double roundevenl(long double x)
+LDT FN(roundeven)(LDT x)
 {
-    return rintl(x);
+    return FN(rint)(x);
 }
 
-static long long to_ll(long double r)
+static long long to_ll(LDT r)
 {
-    if (r >= -0x1p63L && r < 0x1p63L)
+    if (r >= -K(0x1p63) && r < K(0x1p63))
         return (long long)r;
     __axc_math_err(EDOM, 0x01);
     return LLONG_MIN;
 }
 
-static long to_l(long double r)
+static long to_l(LDT r)
 {
-    if (r >= (long double)LONG_MIN && r < -(long double)LONG_MIN)
+    if (r >= (LDT)LONG_MIN && r < -(LDT)LONG_MIN)
         return (long)r;
     __axc_math_err(EDOM, 0x01);
     return LONG_MIN;
 }
 
-long lrintl(long double x)
+long FN(lrint)(LDT x)
 {
-    return to_l(rintl(x));
+    return to_l(FN(rint)(x));
 }
 
-long long llrintl(long double x)
+long long FN(llrint)(LDT x)
 {
-    return to_ll(rintl(x));
+    return to_ll(FN(rint)(x));
 }
 
-long lroundl(long double x)
+long FN(lround)(LDT x)
 {
-    return to_l(roundl(x));
+    return to_l(FN(round)(x));
 }
 
-long long llroundl(long double x)
+long long FN(llround)(LDT x)
 {
-    return to_ll(roundl(x));
+    return to_ll(FN(round)(x));
 }
 
-long double modfl(long double x, long double *ip)
+LDT FN(modf)(LDT x, LDT *ip)
 {
-    long double t = truncl(x);
+    LDT t = FN(trunc)(x);
     *ip = t;
     if (parts(x).e == 0x7fff && !is_nan(x))
-        return copysignl(0.0L, x);
-    return copysignl(x - t, x);
+        return FN(copysign)(K(0.0), x);
+    return FN(copysign)(x - t, x);
 }
 
 /* x 2^n, rounded once (in steps that are exact while the result is normal) */
-static long double scale(long double x, long n)
+static LDT scale(LDT x, long n)
 {
     if (n > 16383) {
         x *= pow2l(16383);
@@ -291,9 +299,9 @@ static long double scale(long double x, long n)
     return x * pow2l((int)n);
 }
 
-long double scalblnl(long double x, long n)
+LDT FN(scalbln)(LDT x, long n)
 {
-    long double r;
+    LDT r;
     if (parts(x).e == 0x7fff)
         return x + x;
     if (x == 0 || n == 0)
@@ -304,17 +312,17 @@ long double scalblnl(long double x, long n)
     return r;
 }
 
-long double scalbnl(long double x, int n)
+LDT FN(scalbn)(LDT x, int n)
 {
-    return scalblnl(x, (long)n);
+    return FN(scalbln)(x, (long)n);
 }
 
-long double ldexpl(long double x, int n)
+LDT FN(ldexp)(LDT x, int n)
 {
-    return scalblnl(x, (long)n);
+    return FN(scalbln)(x, (long)n);
 }
 
-long double frexpl(long double x, int *ep)
+LDT FN(frexp)(LDT x, int *ep)
 {
     Parts r = parts(x);
     int adj = 0;
@@ -332,7 +340,7 @@ long double frexpl(long double x, int *ep)
     return make(r);
 }
 
-int ilogbl(long double x)
+int FN(ilogb)(LDT x)
 {
     Parts r = parts(x);
     if (x == 0 || r.e == 0x7fff) {
@@ -346,27 +354,27 @@ int ilogbl(long double x)
     return r.e - BIAS;
 }
 
-long double logbl(long double x)
+LDT FN(logb)(LDT x)
 {
     Parts r = parts(x);
     if (x == 0) {
-        volatile long double z = 0.0L;
+        volatile LDT z = K(0.0);
         __axc_math_err(ERANGE, 0x04);
-        return -1.0L / z;
+        return -K(1.0) / z;
     }
     if (r.e == 0x7fff)
         return x * x;
-    return (long double)ilogbl(x);
+    return (LDT)FN(ilogb)(x);
 }
 
 /* |x| mod |y| by subtracting |y| 2^k (exactly: Sterbenz's lemma), from the
    largest k down; the quotient's low bits in *q */
-static long double mod_core(long double ax, long double ay, unsigned *q)
+static LDT mod_core(LDT ax, LDT ay, unsigned *q)
 {
-    int k = ilogbl(ax) - ilogbl(ay);
+    int k = FN(ilogb)(ax) - FN(ilogb)(ay);
     unsigned qq = 0;
     while (k >= 0) {
-        long double t = scale(ay, k);
+        LDT t = scale(ay, k);
         qq <<= 1;
         if (ax >= t) {
             ax -= t;
@@ -378,33 +386,33 @@ static long double mod_core(long double ax, long double ay, unsigned *q)
     return ax;
 }
 
-long double fmodl(long double x, long double y)
+LDT FN(fmod)(LDT x, LDT y)
 {
     unsigned q;
-    long double r;
+    LDT r;
     if (is_nan(x) || is_nan(y))
         return x + y;
     if (parts(x).e == 0x7fff || y == 0) {
-        volatile long double z = 0.0L;
+        volatile LDT z = K(0.0);
         __axc_math_err(EDOM, 0x01);
         return z / z;
     }
-    if (fabsl(x) < fabsl(y))
+    if (FN(fabs)(x) < FN(fabs)(y))
         return x;
-    r = mod_core(fabsl(x), fabsl(y), &q);
-    return copysignl(r, x);
+    r = mod_core(FN(fabs)(x), FN(fabs)(y), &q);
+    return FN(copysign)(r, x);
 }
 
-long double remquol(long double x, long double y, int *quo)
+LDT FN(remquo)(LDT x, LDT y, int *quo)
 {
     unsigned q = 0;
-    long double ax = fabsl(x), ay = fabsl(y), r;
+    LDT ax = FN(fabs)(x), ay = FN(fabs)(y), r;
     int neg = parts(x).neg ^ parts(y).neg;
     *quo = 0;
     if (is_nan(x) || is_nan(y))
         return x + y;
     if (parts(x).e == 0x7fff || y == 0) {
-        volatile long double z = 0.0L;
+        volatile LDT z = K(0.0);
         __axc_math_err(EDOM, 0x01);
         return z / z;
     }
@@ -421,14 +429,14 @@ long double remquol(long double x, long double y, int *quo)
     return parts(x).neg ? -r : r;
 }
 
-long double remainderl(long double x, long double y)
+LDT FN(remainder)(LDT x, LDT y)
 {
     int q;
-    return remquol(x, y, &q);
+    return FN(remquo)(x, y, &q);
 }
 
 /* the next value of |x| up (dir > 0) or down, by the significand's bits */
-static long double step(long double x, int up)
+static LDT step(LDT x, int up)
 {
     Parts r = parts(x);
     if (X87) {
@@ -476,9 +484,9 @@ static long double step(long double x, int up)
     return make(r);
 }
 
-long double nextafterl(long double x, long double y)
+LDT FN(nextafter)(LDT x, LDT y)
 {
-    long double r;
+    LDT r;
     if (is_nan(x) || is_nan(y))
         return x + y;
     if (x == y)
@@ -501,26 +509,28 @@ long double nextafterl(long double x, long double y)
     return r;
 }
 
-long double nexttowardl(long double x, long double y)
+#if LD_NEXTTOWARD
+LDT FN(nexttoward)(LDT x, LDT y)
 {
-    return nextafterl(x, y);
+    return FN(nextafter)(x, y);
 }
+#endif
 
-long double nextupl(long double x)
+LDT FN(nextup)(LDT x)
 {
     if (is_nan(x) || x == inf_l())
         return x + x;
-    return nextafterl(x, inf_l());
+    return FN(nextafter)(x, inf_l());
 }
 
-long double nextdownl(long double x)
+LDT FN(nextdown)(LDT x)
 {
     if (is_nan(x) || x == -inf_l())
         return x + x;
-    return nextafterl(x, -inf_l());
+    return FN(nextafter)(x, -inf_l());
 }
 
-long double fmaxl(long double x, long double y)
+LDT FN(fmax)(LDT x, LDT y)
 {
     if (is_nan(x))
         return y;
@@ -531,7 +541,7 @@ long double fmaxl(long double x, long double y)
     return x > y ? x : y;
 }
 
-long double fminl(long double x, long double y)
+LDT FN(fmin)(LDT x, LDT y)
 {
     if (is_nan(x))
         return y;
@@ -542,114 +552,114 @@ long double fminl(long double x, long double y)
     return x < y ? x : y;
 }
 
-long double fdiml(long double x, long double y)
+LDT FN(fdim)(LDT x, LDT y)
 {
     if (is_nan(x) || is_nan(y))
         return x + y;
-    return x > y ? x - y : 0.0L;
+    return x > y ? x - y : K(0.0);
 }
 
 /* a = h + l, each with at most half the significand's bits (Veltkamp) */
-static void split(long double a, long double *h, long double *l)
+static void split(LDT a, LDT *h, LDT *l)
 {
-    const long double c = X87 ? 4294967297.0L : 144115188075855873.0L; /* 2^32 + 1, 2^57 + 1 */
-    long double t = c * a;
+    const LDT c = X87 ? K(4294967297.0) : K(144115188075855873.0); /* 2^32 + 1, 2^57 + 1 */
+    LDT t = c * a;
     *h = t - (t - a);
     *l = a - *h;
 }
 
 /* x - y^2, exactly enough for its sign and size (Dekker's product) */
-static long double residual(long double x, long double y)
+static LDT residual(LDT x, LDT y)
 {
-    long double yh, yl, p = y * y, e;
+    LDT yh, yl, p = y * y, e;
     split(y, &yh, &yl);
-    e = ((yh * yh - p) + 2.0L * yh * yl) + yl * yl;
+    e = ((yh * yh - p) + K(2.0) * yh * yl) + yl * yl;
     return (x - p) - e;
 }
 
 /* The square root, correctly rounded: an estimate from double's, Newton's
-   steps in long double, then the neighbour whose interval holds sqrt(x):
+   steps in LDT, then the neighbour whose interval holds sqrt(x):
    x against the squares of the midpoints, through the exact residual. */
-long double sqrtl(long double x)
+LDT FN(sqrt)(LDT x)
 {
-    long double y, d, u;
+    LDT y, d, u;
     int k;
     if (is_nan(x) || x == 0 || x == inf_l())
         return x + x;
     if (x < 0) {
-        volatile long double z = 0.0L;
+        volatile LDT z = K(0.0);
         __axc_math_err(EDOM, 0x01);
         return z / z;
     }
     /* x = m 4^k, m in [1, 4) */
-    k = ilogbl(x) >> 1;
+    k = FN(ilogb)(x) >> 1;
     {
-        long double m = scale(x, -2L * k);
-        y = (long double)sqrt((double)m);
-        y = 0.5L * (y + m / y);
-        y = 0.5L * (y + m / y);
-        y = 0.5L * (y + m / y);
+        LDT m = scale(x, -2L * k);
+        y = (LDT)sqrt((double)m);
+        y = K(0.5) * (y + m / y);
+        y = K(0.5) * (y + m / y);
+        y = K(0.5) * (y + m / y);
         /* the nearer of y and its neighbours: sqrt(m) >= y + u/2 when
            m - y^2 >= y u + u^2/4 */
         d = residual(m, y);
         u = step(y, 1) - y;
-        if (d - y * u >= 0.25L * u * u)
+        if (d - y * u >= K(0.25) * u * u)
             y = step(y, 1);
         else {
             u = y - step(y, 0);
-            if (d + y * u < 0.25L * u * u)
+            if (d + y * u < K(0.25) * u * u)
                 y = step(y, 0);
         }
         return scale(y, k);
     }
 }
 /* C23's maximum and minimum (IEEE 754-2019's) */
-long double fmaximuml(long double x, long double y)
+LDT FN(fmaximum)(LDT x, LDT y)
 {
-    return is_nan(x) || is_nan(y) ? x + y : fmaxl(x, y);
+    return is_nan(x) || is_nan(y) ? x + y : FN(fmax)(x, y);
 }
 
-long double fminimuml(long double x, long double y)
+LDT FN(fminimum)(LDT x, LDT y)
 {
-    return is_nan(x) || is_nan(y) ? x + y : fminl(x, y);
+    return is_nan(x) || is_nan(y) ? x + y : FN(fmin)(x, y);
 }
 
-long double fmaximum_magl(long double x, long double y)
+LDT FN(fmaximum_mag)(LDT x, LDT y)
 {
     if (is_nan(x) || is_nan(y))
         return x + y;
-    if (fabsl(x) != fabsl(y))
-        return fabsl(x) > fabsl(y) ? x : y;
-    return fmaxl(x, y);
+    if (FN(fabs)(x) != FN(fabs)(y))
+        return FN(fabs)(x) > FN(fabs)(y) ? x : y;
+    return FN(fmax)(x, y);
 }
 
-long double fminimum_magl(long double x, long double y)
+LDT FN(fminimum_mag)(LDT x, LDT y)
 {
     if (is_nan(x) || is_nan(y))
         return x + y;
-    if (fabsl(x) != fabsl(y))
-        return fabsl(x) < fabsl(y) ? x : y;
-    return fminl(x, y);
+    if (FN(fabs)(x) != FN(fabs)(y))
+        return FN(fabs)(x) < FN(fabs)(y) ? x : y;
+    return FN(fmin)(x, y);
 }
 
-long double fmaximum_numl(long double x, long double y)
+LDT FN(fmaximum_num)(LDT x, LDT y)
 {
-    return fmaxl(x, y);
+    return FN(fmax)(x, y);
 }
 
-long double fminimum_numl(long double x, long double y)
+LDT FN(fminimum_num)(LDT x, LDT y)
 {
-    return fminl(x, y);
+    return FN(fmin)(x, y);
 }
 
-long double fmaximum_mag_numl(long double x, long double y)
+LDT FN(fmaximum_mag_num)(LDT x, LDT y)
 {
-    return is_nan(x) ? y : is_nan(y) ? x : fmaximum_magl(x, y);
+    return is_nan(x) ? y : is_nan(y) ? x : FN(fmaximum_mag)(x, y);
 }
 
-long double fminimum_mag_numl(long double x, long double y)
+LDT FN(fminimum_mag_num)(LDT x, LDT y)
 {
-    return is_nan(x) ? y : is_nan(y) ? x : fminimum_magl(x, y);
+    return is_nan(x) ? y : is_nan(y) ? x : FN(fminimum_mag)(x, y);
 }
 #else
 /* where long double is double: the double functions (the same names in

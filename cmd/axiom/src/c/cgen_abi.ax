@@ -146,6 +146,7 @@ pub const SL_PAD_GP: i32 = 2;  // a variadic definition's integer register
 pub const SL_PAD_FP: i32 = 3;  // a variadic definition's floating-point register
 pub const SL_RET: i32 = 4;     // the result's address (R_SRET)
 pub const SL_VABUF: i32 = 5;   // the variadic arguments' buffer (WebAssembly)
+pub const SL_CHAIN: i32 = 6;   // a nested function's frame record of its enclosing function (cgen_nest.ax)
 
 /// A scalar of a structure or union: its IR type and offset.
 pub struct Piece {
@@ -183,6 +184,7 @@ pub struct Plan {
     vabuf: i32,     // the IR parameter of the variadic buffer, or -1
     vabuf_size: u64,
     stack_align: u64,  // a call's stack arguments need the stack aligned to this (more than 16; or 0)
+    chain: i32,        // the IR parameter of a nested function's chain (SL_CHAIN), or -1
     // a variadic definition: what the named parameters use (va_start)
     va_gp: u64,             // integer registers
     va_fp: u64,             // floating-point (vector) registers
@@ -198,16 +200,20 @@ pub fn quad_ty() *mut ir.Ty {
     return ir.t_vec(ir.t_int(64), 2);
 }
 
-// The IR type of a scalar C type.
+// The IR type of a scalar C type: a _Float16 an f32 whose low 16 bits are
+// its bits (the ABIs pass it in the low 16 bits of a floating-point or
+// vector register: x86-64 System V's and Windows' xmm, AAPCS64's h; and so
+// here on WebAssembly, whose C ABI has no binary16).
 fn scalar_ty(t0: *cty.CType) *mut ir.Ty {
     let t = t0.unq;
     if cty.is_integer(t) {
         return ir.t_int(cty.storage_bits(t));
     }
-    if t.kind == cty.TK_FLOAT {
-        return ir.t_float(32);
-    }
-    if (t.kind == cty.TK_DOUBLE) or (t.kind == cty.TK_LDOUBLE) {
+    if cty.is_floating(t) or cty.is_imaginary(t) {
+        let w = cty.ffmt(t);
+        if w <= 32 {
+            return ir.t_float(32);
+        }
         return ir.t_float(64);
     }
     if (t.kind == cty.TK_DEC32) or (t.kind == cty.TK_DEC64) {
@@ -250,7 +256,8 @@ fn int_piece(n: u64) *mut ir.Ty {
 /// Does a value of type t travel as an aggregate (its memory: a structure,
 /// a union, a complex type, or a wide long double)?
 pub fn aggregate(t: *cty.CType) bool {
-    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t) or cty.is_wint(t) or cty.is_dec128(t);
+    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t) or cty.is_wint(t) or cty.is_dec128(t) or
+           cty.is_vector(t);
 }
 
 // -----------------------------------------------------------------------------
@@ -265,6 +272,7 @@ struct Leaf {
     fp: bool,
     x87: bool,  // the x87's long double (its 16 bytes)
     dec: bool,  // a decimal floating type (fp too: AAPCS64 does not mix it with the binary ones)
+    vec: bool,  // a vector of 8 bytes or more, whole (a short vector of AAPCS64, __m64 ... of System V)
 }
 
 const MAX_LEAVES: usize = 64;
@@ -302,13 +310,27 @@ fn add_leaves(t0: *cty.CType, off: u64, l: *mut Leaves) void {
         add_leaves(t.elem, off + cty.size_of(t.elem), l);
         return;
     }
+    let size = cty.size_of(t);
+    if (t.kind == cty.TK_VECTOR) and (size < 8) {
+        // (a vector of fewer than 8 bytes: its elements, as an array's: the
+        // System V psABI and AAPCS64 have no class of their own for one)
+        let es = cty.size_of(t.elem);
+        for i in 0..t.len {
+            add_leaves(t.elem, off + (i * es), l);
+        }
+        return;
+    }
     if l.n >= MAX_LEAVES {
         l.ok = false;
         return;
     }
+    // (a vector of 8 bytes or more is one leaf: SSE, or SSE and SSEUP, on
+    // System V whatever its elements, as __m64 and __m128 are; a short vector
+    // on AAPCS64, a member of a homogeneous aggregate of short vectors)
+    let vec = t.kind == cty.TK_VECTOR;
     let dec = cty.is_decimal(t) and (abi() != ABI_WIN);
-    l.xs[l.n] = Leaf.{ off: off, size: cty.size_of(t), fp: cty.is_floating(t) or dec, x87: cty.is_wide(t) and
-                       (cty.ld_bits() == 80), dec: dec };
+    l.xs[l.n] = Leaf.{ off: off, size: size, fp: cty.is_floating(t) or cty.is_imaginary(t) or vec or
+                       dec, x87: cty.ffmt(t) == 80, dec: dec, vec: vec };
     l.n += 1;
 }
 
@@ -319,10 +341,15 @@ fn leaves_of(t: *cty.CType, l: *mut Leaves) void {
 }
 
 // The IR type of an HFA's members: a float, a double, or a binary128 (a
-// quad-precision register: a 128-bit vector).
+// quad-precision register: a 128-bit vector); a _Float16 an f32 with its
+// bits low (an h register is the low 16 bits of the v register); the
+// short vectors of an HVA a double (8 bytes) or a 128-bit vector.
 fn hfa_elem(h: Hfa) *mut ir.Ty {
     if h.es == 16 {
         return quad_ty();
+    }
+    if h.es == 2 {
+        return ir.t_float(32);
     }
     return ir.t_float(@truncate(i32, @bit_cast(i64, h.es * 8)));
 }
@@ -347,9 +374,13 @@ fn hfa_of(t: *cty.CType) Hfa {
         return none;
     }
     let es = l.xs[0].size;
+    let vec = l.xs[0].vec;
+    if vec and (es != 8) and (es != 16) {
+        return none;  // (AAPCS64's short vectors are 8 and 16 bytes; others are composites)
+    }
     for i in 0..l.n {
         let x = l.xs[i];
-        if not x.fp or (x.size != es) or ((x.off % es) != 0) or (x.dec != l.xs[0].dec) {
+        if not x.fp or (x.size != es) or ((x.off % es) != 0) or (x.vec != vec) or (x.dec != l.xs[0].dec) {
             return none;
         }
     }
@@ -510,11 +541,50 @@ fn wasm_quad(t: *cty.CType) bool {
     }
     for i in 0..l.n {
         let x = l.xs[i];
-        if (x.off != 0) or (x.size != 16) or not x.fp {
+        if (x.off != 0) or (x.size != 16) or not x.fp or x.vec {
             return false;
         }
     }
     return true;
+}
+
+// WebAssembly with simd128: is t a 16-byte vector, or a structure or union
+// that is one (a single-element structure), passed as a v128?
+fn wasm_v128(t: *cty.CType) bool {
+    if (cty.size_of(t) != 16) or not cty.vec_ir() {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    return l.ok and (l.n == 1) and l.xs[0].vec;
+}
+
+// x86-64 System V: is t a vector of 32 or 64 bytes, or a structure or union
+// that is one, which the AVX registers hold (with AVX, or AVX-512F for 64
+// bytes: COptions.vec_reg)? The psABI (3.2.3) passes it in one ymm or zmm
+// register then, its classes SSE and SSEUP; without the extension it is
+// MEMORY. The backends pass no value in a ymm or zmm register at calls
+// (Axiom's own convention passes such vectors in memory, spec 13.3), so it
+// is MEMORY here whatever the extensions (AVX_REGS): as the psABI has it
+// without AVX, and as the platform's compiler does by default.
+const AVX_REGS: bool = false;
+
+fn sysv_wide_vec(t: *cty.CType) bool {
+    if not AVX_REGS {
+        return false;
+    }
+    let size = cty.size_of(t);
+    if ((size != 32) and (size != 64)) or (size > cty.vec_reg()) {
+        return false;
+    }
+    let l = u.new.[Leaves]();
+    leaves_of(t, l);
+    return l.ok and (l.n == 1) and l.xs[0].vec and (l.xs[0].off == 0);
+}
+
+/// The IR type of a vector register's piece of `size` bytes (16, 32 or 64).
+pub fn vreg_ty(size: u64) *mut ir.Ty {
+    return ir.t_vec(ir.t_int(64), @truncate(u32, size / 8));
 }
 
 // Is t an integer of 16 bytes (wider than 64 bits), or a structure or union
@@ -557,7 +627,7 @@ fn single_scalar(t: *cty.CType) *mut ir.Ty {
             return u.nil.[ir.Ty]();
         }
     }
-    if (x.off != 0) or (x.size != cty.size_of(t)) or (x.size > 8) {
+    if (x.off != 0) or (x.size != cty.size_of(t)) or (x.size > 8) or x.vec {
         return u.nil.[ir.Ty]();
     }
     // (a union of a float and an int of one size is not one scalar)
@@ -570,8 +640,11 @@ fn single_scalar(t: *cty.CType) *mut ir.Ty {
     if fp_and_int {
         return u.nil.[ir.Ty]();
     }
+    if x.fp and (x.size <= 4) {
+        return ir.t_float(32);  // (a _Float16's in its low 16 bits)
+    }
     if x.fp {
-        return ir.t_float(@truncate(i32, @bit_cast(i64, x.size * 8)));
+        return ir.t_float(64);
     }
     return int_piece(x.size);
 }
@@ -620,7 +693,21 @@ fn new_plan(ret: *mut cty.CType, n: usize) *mut Plan {
     p.pads_gp = u.List.[i32].empty();
     p.pads_fp = u.List.[i32].empty();
     p.vabuf = -1;
+    p.chain = -1;
     return p;
+}
+
+/// Plan p (a nested function's, not variadic) with the frame record of the
+/// enclosing function as a last IR parameter (a pointer, after the C
+/// arguments, so that they travel as the C function's would: cgen_nest.ax).
+pub fn add_chain(p: *mut Plan) void {
+    p.chain = @int_cast(i32, p.tys.len);
+    p.tys.push(ir.t_ptr());
+    p.exts.push(0);
+    p.what.push(SL_CHAIN);
+    p.nfixed = p.tys.len;
+    let all = p.tys.items();
+    p.fty = ir.t_fn(p.fty.ret, all[0..p.nfixed], p.vararg);
 }
 
 // The pieces of type t in eightbytes (x86-64 SSE ones as their floating
@@ -729,10 +816,21 @@ fn fill(b: *mut Builder, fp: bool, n: u64) void {
     }
 }
 
-// x86-64 System V: argument i.
-fn sysv_arg(b: *mut Builder, i: usize) void {
+// x86-64 System V: argument i (va: a variadic one).
+fn sysv_arg(b: *mut Builder, i: usize, va: bool) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
+    if not va and sysv_wide_vec(t) and (b.nf < 8) {
+        // (a vector of 32 or 64 bytes with AVX or AVX-512F: one ymm or zmm
+        // register; a variadic one is MEMORY, as va_arg reads it)
+        a.kind = A_PIECES;
+        set_n(a, 1);
+        a.pieces[0] = Piece.{ ty: vreg_ty(cty.size_of(t)), off: 0 };
+        a.span = cty.size_of(t);
+        b.nf += 1;
+        push_pieces(b, i, false);
+        return;
+    }
     if not aggregate(t) {
         set_scalar(a, t);
         let fp = is_fp_ty(a.pieces[0].ty);
@@ -982,6 +1080,22 @@ fn stack_bytes(b: *mut Builder, size: u64, packed: bool) void {
 fn wasm_arg(b: *mut Builder, i: usize, in_buffer: bool) void {
     let a = &mut b.p.args[i];
     let t = a.ty;
+    if wasm_v128(t) {
+        // (a 16-byte vector with simd128: a v128; in the variadic buffer, 16 bytes aligned to 16)
+        a.kind = A_PIECES;
+        set_n(a, 1);
+        a.pieces[0] = Piece.{ ty: quad_ty(), off: 0 };
+        a.span = 16;
+        if in_buffer {
+            let off = cty.round_up(b.soff, 16);
+            a.va_off = off;
+            a.slot[0] = -1;
+            b.soff = off + 16;
+            return;
+        }
+        push_pieces(b, i, false);
+        return;
+    }
     if wasm_quad(t) or wasm_wint(t) {
         // binary128 or a 128-bit integer (alone, or all of a structure): two i64s
         a.kind = A_PIECES;
@@ -1047,7 +1161,15 @@ fn set_result(b: *mut Builder) void {
     let a = u.new.[ArgPlan]();
     a.ty = t;
     if ab == ABI_SYSV {
-        if cty.is_complex(t) and cty.is_wide(t.unq.elem) and (cty.ld_bits() == 80) {
+        if sysv_wide_vec(t) {
+            // (a vector of 32 or 64 bytes with AVX or AVX-512F: in ymm0 or zmm0)
+            set_n(a, 1);
+            a.pieces[0] = Piece.{ ty: vreg_ty(size), off: 0 };
+            a.span = size;
+            set_pieces_result(b, a);
+            return;
+        }
+        if cty.is_complex(t) and cty.is_wide(t.unq.elem) and (cty.ffmt(t) == 80) {
             // (COMPLEX_X87: the real part in st(0), the imaginary part in
             // st(1); as an argument, MEMORY, as classify_sysv finds)
             p.ret = R_X87;
@@ -1073,8 +1195,10 @@ fn set_result(b: *mut Builder) void {
     }
     if ab == ABI_WIN {
         let k = t.unq.kind;
-        if (k == cty.TK_INT128) or (k == cty.TK_UINT128) {
-            // (__int128's result is in xmm0 on Windows x64)
+        let quad = cty.is_wide(t) or (cty.is_vector(t) and (size == 16));
+        if (k == cty.TK_INT128) or (k == cty.TK_UINT128) or quad {
+            // (__int128's result is in xmm0 on Windows x64, and so are a
+            // 16-byte vector's (as __m128's) and _Float128's)
             set_n(a, 1);
             a.pieces[0] = Piece.{ ty: quad_ty(), off: 0 };
             a.span = 16;
@@ -1115,6 +1239,13 @@ fn set_result(b: *mut Builder) void {
             return;
         }
         sret(b, ir.EXT_X8SRET);  // (in x8: no x register used)
+        return;
+    }
+    if wasm_v128(t) {
+        set_n(a, 1);
+        a.pieces[0] = Piece.{ ty: quad_ty(), off: 0 };
+        a.span = 16;
+        set_pieces_result(b, a);
         return;
     }
     let st = single_scalar(t);
@@ -1183,7 +1314,7 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
             b.voff = cty.round_up(b.soff, 8);
         }
         if ab == ABI_SYSV {
-            sysv_arg(b, i);
+            sysv_arg(b, i, va);
         } else if ab == ABI_WIN {
             win_arg(b, i, va);
         } else if (ab == ABI_A64) or (ab == ABI_DARWIN) {
@@ -1290,11 +1421,13 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
 fn pads(b: *mut Builder, fp: bool, n: u64) void {
     for k in 0..n {
         _ = k;
-        if fp {
+        if fp and (b.p.abi != ABI_WIN) and (b.p.abi != ABI_WINA64) {
             // (the whole register: a variadic argument may be 16 bytes of
-            // one, a binary128 long double or a _Decimal128, which a
+            // one, a binary128 or vector argument or a _Decimal128, which a
             // function of any unit may read: printf's %DDf)
             b.regs.push(item(quad_ty(), 0, SL_PAD_FP, -1, 0));
+        } else if fp {
+            b.regs.push(item(ir.t_float(64), 0, SL_PAD_FP, -1, 0));
         } else {
             b.regs.push(item(ir.t_int(64), 0, SL_PAD_GP, -1, 0));
         }

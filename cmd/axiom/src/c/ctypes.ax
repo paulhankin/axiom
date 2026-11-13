@@ -68,12 +68,27 @@ pub const TK_NULLPTR: i32 = 24;  // nullptr_t (C23): a scalar type whose one val
 pub const TK_COMPLEX: i32 = 25;  // float/double/long double _Complex (C99 6.2.5p11): `elem` is the real type
 pub const TK_INT128: i32 = 26;   // __int128 (a GNU dialect): an extended integer type of 128 bits
 pub const TK_UINT128: i32 = 27;  // unsigned __int128
+// The interchange and extended floating types (C23 Annex H; TS 18661-3 before
+// C23): real floating types, each distinct from the standard ones and from one
+// another (ffmt gives each one's format)
+pub const TK_FLOAT16: i32 = 28;   // _Float16: binary16
+pub const TK_FLOAT32: i32 = 29;   // _Float32: binary32
+pub const TK_FLOAT64: i32 = 30;   // _Float64: binary64
+pub const TK_FLOAT32X: i32 = 31;  // _Float32x: binary64
+pub const TK_FLOAT64X: i32 = 32;  // _Float64x: long double's format where it is wider than double, else binary128
+pub const TK_FLOAT128: i32 = 33;  // _Float128 (and __float128 in a GNU dialect): binary128
+// A vector type (a GNU dialect: the attribute vector_size): `len` lanes of
+// the arithmetic type `elem`; its size is the attribute's (csema_vec.ax)
+pub const TK_VECTOR: i32 = 34;
+// An imaginary type (C99 Annex G.2): float, double or long double _Imaginary,
+// `elem` its corresponding real type; laid out as that type (G.2p2)
+pub const TK_IMAGINARY: i32 = 35;
 // the decimal floating types (C23 6.2.5p13): real floating types, in the
 // IEEE 754 decimal formats of 32, 64 and 128 bits (BID, as the C ABIs of
 // the targets say), computed in software (std/c/rt/decimal.ax: cgen_dec.ax)
-pub const TK_DEC32: i32 = 28;   // _Decimal32
-pub const TK_DEC64: i32 = 29;   // _Decimal64
-pub const TK_DEC128: i32 = 30;  // _Decimal128
+pub const TK_DEC32: i32 = 36;   // _Decimal32
+pub const TK_DEC64: i32 = 37;   // _Decimal64
+pub const TK_DEC128: i32 = 38;  // _Decimal128
 
 /// The largest N of _BitInt(N) (<limits.h>'s BITINT_MAXWIDTH).
 pub const BITINT_MAXWIDTH: i32 = 65535;
@@ -165,6 +180,12 @@ pub struct CType {
     qv: [16]*mut CType,
     backend: *mut void,  // IR generation's type for it (unqualified types only)
     id: i32,
+    // a real floating type: its complex and imaginary types (made once: complex_of, imaginary_of)
+    cplx: *mut CType,
+    imag: *mut CType,
+    // a GNU dialect's typedef with the attribute aligned: the alignment it
+    // gives the type (0: the type's own); `unq` is the type without it
+    xalign: u64,
 }
 
 let mut g_opts: *co.COptions = @ptr_from_int(*co.COptions, 0);
@@ -199,6 +220,19 @@ pub let mut t_nullptr: *mut CType = @ptr_from_int(*mut CType, 0);  // nullptr_t 
 pub let mut t_cfloat: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_cdouble: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_cldouble: *mut CType = @ptr_from_int(*mut CType, 0);
+// the interchange and extended floating types (Annex H)
+pub let mut t_float16: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_float32: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_float64: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_float32x: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_float64x: *mut CType = @ptr_from_int(*mut CType, 0);
+pub let mut t_float128: *mut CType = @ptr_from_int(*mut CType, 0);
+/// Whether the unit has used a floating type that std/c/rt/ldouble.ax
+/// computes (_Float16, or a binary128 or x87 one other than long double).
+pub let mut g_used_xfloat: bool = false;
+// the vector types made so far (vector_of)
+let mut g_vectors: u.List.[*mut CType] = u.List.[*mut CType].{ data: @ptr_from_int(*mut *mut CType, 0), len: 0,
+                                                               cap: 0 };
 // __int128, unsigned __int128 (a GNU dialect)
 pub let mut t_int128: *mut CType = @ptr_from_int(*mut CType, 0);
 pub let mut t_uint128: *mut CType = @ptr_from_int(*mut CType, 0);
@@ -281,6 +315,19 @@ pub fn init(o: *co.COptions) void {
     t_double.bits = 64;
     t_ldouble = new_type(TK_LDOUBLE);
     t_ldouble.bits = o.ld_bits;
+    t_float16 = new_type(TK_FLOAT16);
+    t_float16.bits = 16;
+    t_float32 = new_type(TK_FLOAT32);
+    t_float32.bits = 32;
+    t_float64 = new_type(TK_FLOAT64);
+    t_float64.bits = 64;
+    t_float32x = new_type(TK_FLOAT32X);
+    t_float32x.bits = 64;
+    t_float64x = new_type(TK_FLOAT64X);
+    t_float64x.bits = x64_bits(o);
+    t_float128 = new_type(TK_FLOAT128);
+    t_float128.bits = 128;
+    g_vectors = u.List.[*mut CType].empty();
     t_nullptr = new_type(TK_NULLPTR);
     t_nullptr.bits = o.ptr_bits;
     t_cfloat = complex_type(t_float);
@@ -346,26 +393,179 @@ fn complex_type(r: *mut CType) *mut CType {
     let t = new_type(TK_COMPLEX);
     t.elem = r;
     t.bits = r.bits;
+    r.cplx = t;
     return t;
 }
 
+// _Float64x's format: long double's where that is wider than double (the
+// x87's on x86-64 Linux and macOS, binary128 on AArch64 Linux and
+// WebAssembly: the type those platforms' C ABIs give it), else binary128
+// (Annex H.2.3: an extended format wider than binary64).
+fn x64_bits(o: *co.COptions) i32 {
+    if o.ld_bits > 64 {
+        return o.ld_bits;
+    }
+    return 128;
+}
+
 /// The complex type whose corresponding real type is the real floating
-/// type r (6.2.5p11).
+/// type r (6.2.5p11; Annex H.2.4 for the interchange and extended types).
 pub fn complex_of(r: *mut CType) *mut CType {
-    let k = r.unq.kind;
-    if k == TK_FLOAT {
-        return t_cfloat;
+    let b = r.unq;
+    if u.isnil(b.cplx) {
+        _ = complex_type(b);
+    }
+    return b.cplx;
+}
+
+/// The imaginary type whose corresponding real type is the real floating
+/// type r (Annex G.2: float, double, long double _Imaginary).
+pub fn imaginary_of(r: *mut CType) *mut CType {
+    let b = r.unq;
+    if u.isnil(b.imag) {
+        let t = new_type(TK_IMAGINARY);
+        t.elem = b;
+        t.bits = b.bits;
+        b.imag = t;
+    }
+    return b.imag;
+}
+
+/// An imaginary type (Annex G.2).
+pub fn is_imaginary(t: *CType) bool {
+    return t.kind == TK_IMAGINARY;
+}
+
+/// The format of a real floating type's values, as a width in bits: 16
+/// (binary16), 32 (binary32), 64 (binary64), 80 (the x87's extended format)
+/// or 128 (binary128); 0 for other types. A complex or imaginary type has its
+/// real type's.
+pub fn ffmt(t: *CType) i32 {
+    let b = t.unq;
+    let k = b.kind;
+    if (k == TK_COMPLEX) or (k == TK_IMAGINARY) {
+        return ffmt(b.elem);
+    }
+    if (k == TK_FLOAT) or (k == TK_FLOAT32) {
+        return 32;
+    }
+    if (k == TK_DOUBLE) or (k == TK_FLOAT64) or (k == TK_FLOAT32X) {
+        return 64;
     }
     if k == TK_LDOUBLE {
-        return t_cldouble;
+        return g_opts.ld_bits;
     }
-    return t_cdouble;
+    if k == TK_FLOAT64X {
+        return x64_bits(g_opts);
+    }
+    if k == TK_FLOAT128 {
+        return 128;
+    }
+    if k == TK_FLOAT16 {
+        return 16;
+    }
+    return 0;
+}
+
+/// Is t (a real floating type) binary16 (_Float16)? Its values are their
+/// 16 bits, computed in float and rounded (cgen_half.ax).
+pub fn is_half(t: *CType) bool {
+    return t.unq.kind == TK_FLOAT16;
+}
+
+/// The floating-point conversion rank (C23 6.3.1.3, H.4.2) of a real
+/// floating type: by its set of values (binary16 < binary32 < binary64 <
+/// the x87's < binary128), and for types of one set of values an
+/// interchange type's above a standard type's, above an extended type's (as
+/// _Float32 + float is _Float32, double + _Float32x double, long double +
+/// _Float64x long double).
+pub fn float_rank(t: *CType) i32 {
+    let f = ffmt(t);
+    let mut level: i32 = 0;
+    if f == 16 {
+        level = 1;
+    } else if f == 32 {
+        level = 2;
+    } else if f == 64 {
+        level = 3;
+    } else if f == 80 {
+        level = 4;
+    } else if f == 128 {
+        level = 5;
+    }
+    let k = t.unq.kind;
+    // (of one value set: an interchange type, then the standard ones, long
+    // double over double where they have one format, then an extended one)
+    let mut tie: i32 = 1;  // a standard type
+    if k == TK_LDOUBLE {
+        tie = 2;
+    } else if (k == TK_FLOAT32X) or (k == TK_FLOAT64X) {
+        tie = 0;
+    } else if (k == TK_FLOAT16) or (k == TK_FLOAT32) or (k == TK_FLOAT64) or (k == TK_FLOAT128) {
+        tie = 3;
+    }
+    return (level * 4) + tie;
+}
+
+/// The vector type of `size` bytes whose lanes have the arithmetic type e
+/// (unqualified), made once for each element type and size (a GNU dialect:
+/// csema_vec.ax checks the size). Two vector types are the same type when
+/// their element types and sizes are.
+pub fn vector_of(e0: *mut CType, size: u64) *mut CType {
+    let e = e0.unq;
+    for v in g_vectors.items() {
+        if (v.elem == e) and (v.len * size_of(e) == size) {
+            return v;
+        }
+    }
+    let v = new_type(TK_VECTOR);
+    v.elem = e;
+    v.len = size / size_of(e);
+    v.has_len = true;
+    v.bits = @truncate(i32, @bit_cast(i64, size * 8));
+    g_vectors.push(v);
+    if is_wint(e) {
+        g_used_wint = true;
+    }
+    if is_xfloat(e) {
+        g_used_xfloat = true;
+    }
+    return v;
+}
+
+/// A vector type (a GNU dialect).
+pub fn is_vector(t: *CType) bool {
+    return t.kind == TK_VECTOR;
+}
+
+/// Is t a floating type whose arithmetic is std/c/rt/ldouble.ax's but not
+/// long double (_Float16; _Float128, _Float64x)? (Sets g_used_xfloat.)
+pub fn is_xfloat(t: *CType) bool {
+    let k = t.unq.kind;
+    return (k == TK_FLOAT16) or (k == TK_FLOAT128) or (k == TK_FLOAT64X);
+}
+
+/// Notes that the unit uses floating type t (std/c/rt/ldouble.ax is then
+/// loaded for _Float16, _Float128 and _Float64x).
+pub fn note_float_use(t: *CType) void {
+    if is_xfloat(real_of_any(t)) {
+        g_used_xfloat = true;
+    }
+}
+
+// The real type of a complex or imaginary type, a vector's element type, t's own otherwise.
+fn real_of_any(t: *CType) *CType {
+    let k = t.unq.kind;
+    if (k == TK_COMPLEX) or (k == TK_IMAGINARY) or (k == TK_VECTOR) {
+        return t.unq.elem;
+    }
+    return t.unq;
 }
 
 /// The corresponding real type (6.2.5p11, 6.3.1.8) of an arithmetic type:
 /// a complex type's element type, a real type itself (unqualified).
 pub fn real_of(t: *mut CType) *mut CType {
-    if t.unq.kind == TK_COMPLEX {
+    if (t.unq.kind == TK_COMPLEX) or (t.unq.kind == TK_IMAGINARY) {
         return t.unq.elem;
     }
     return t.unq;
@@ -450,7 +650,8 @@ pub fn storage_bits(t: *CType) i32 {
 /// 64)? Its values are 64-bit limbs in memory (cgen_wint.ax).
 pub fn is_wint(t: *CType) bool {
     let k = t.unq.kind;
-    return (k == TK_INT128) or (k == TK_UINT128) or ((k == TK_BITINT) and (t.unq.bits > 64));
+    // (an enumeration whose underlying type is __int128 or unsigned __int128 too)
+    return (k == TK_INT128) or (k == TK_UINT128) or (((k == TK_BITINT) or (k == TK_ENUM)) and (t.unq.bits > 64));
 }
 
 /// The 64-bit limbs of a value of an integer type wider than 64 bits.
@@ -498,10 +699,34 @@ pub fn qualify(t: *mut CType, q: i32) *mut CType {
     return qualified(t, q);
 }
 
+/// Type t aligned to a (a GNU dialect's typedef with the attribute
+/// aligned): the same type but for its alignment, compatible with t.
+pub fn aligned_variant(t: *mut CType, a: u64) *mut CType {
+    let n = u.new.[CType]();
+    n.* = t.*;
+    n.xalign = a;
+    n.ptr = u.nil.[CType]();
+    for j in @as(usize, 0)..16 {
+        n.qv[j] = u.nil.[CType]();
+    }
+    g_next_id += 1;
+    n.id = g_next_id;
+    return n;
+}
+
 // `t` with the qualifiers `q` added (made once for each combination).
 fn qualified(t: *mut CType, q: i32) *mut CType {
     if q == 0 {
         return t;
+    }
+    if t.xalign != 0 {
+        // (an aligned typedef's type, qualified: it keeps its alignment)
+        if (t.quals | q) == t.quals {
+            return t;
+        }
+        let n = aligned_variant(t, t.xalign);
+        n.quals = t.quals | q;
+        return n;
     }
     let all = t.quals | q;
     if all == t.quals {
@@ -697,7 +922,7 @@ pub fn is_nullptr(t: *CType) bool {
 /// A real floating type: float, double, long double (not a complex type,
 /// although C calls those floating too: 6.2.5p11).
 pub fn is_floating(t: *CType) bool {
-    return (t.kind >= TK_FLOAT) and (t.kind <= TK_LDOUBLE);
+    return ((t.kind >= TK_FLOAT) and (t.kind <= TK_LDOUBLE)) or ((t.kind >= TK_FLOAT16) and (t.kind <= TK_FLOAT128));
 }
 
 /// A decimal floating type: _Decimal32, _Decimal64, _Decimal128 (C23).
@@ -741,12 +966,26 @@ pub fn note_dec() void {
 /// 128: cldbl.ax)? Its values are then computed in software, and cgen
 /// keeps them in memory, as it does structures.
 pub fn is_wide(t: *CType) bool {
-    return (t.unq.kind == TK_LDOUBLE) and (g_opts.ld_bits != 64);
+    let k = t.unq.kind;
+    if k == TK_IMAGINARY {
+        return is_wide(t.unq.elem);  // (its value is its coefficient, of the real type)
+    }
+    return ((k == TK_LDOUBLE) or (k == TK_FLOAT64X) or (k == TK_FLOAT128)) and (ffmt(t) > 64);
 }
 
 /// long double's width in bits: 64 (double's format), 80 (x87) or 128.
 pub fn ld_bits() i32 {
     return g_opts.ld_bits;
+}
+
+/// Can vector values be the IR's vector types (copts.COptions.vec_ir)?
+pub fn vec_ir() bool {
+    return g_opts.vec_ir;
+}
+
+/// The widest vector, in bytes, that the target's vector registers hold (16; 32 or 64 with AVX, AVX-512F).
+pub fn vec_reg() u64 {
+    return @as(u64, @bit_cast(u32, g_opts.vec_reg));
 }
 
 /// A complex type (float, double or long double _Complex).
@@ -756,19 +995,18 @@ pub fn is_complex(t: *CType) bool {
 
 /// A real type (6.2.5p18): an integer or real floating type.
 pub fn is_real(t: *CType) bool {
-    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT) or (t.kind >= TK_INT128);
+    return is_integer(t) or is_floating(t) or is_decimal(t);
 }
 
-/// An arithmetic type: integer or floating (real or complex).
+/// An arithmetic type: integer or floating (real, complex, or imaginary:
+/// Annex G.2p1).
 pub fn is_arith(t: *CType) bool {
-    return ((t.kind >= TK_BOOL) and (t.kind <= TK_LDOUBLE)) or (t.kind == TK_BITINT) or (t.kind == TK_COMPLEX) or
-           (t.kind >= TK_INT128);
+    return is_integer(t) or is_floating(t) or is_decimal(t) or (t.kind == TK_COMPLEX) or (t.kind == TK_IMAGINARY);
 }
 
 /// A scalar type: arithmetic, pointer or nullptr_t.
 pub fn is_scalar(t: *CType) bool {
-    return ((t.kind >= TK_BOOL) and (t.kind <= TK_POINTER)) or (t.kind == TK_BITINT) or (t.kind == TK_NULLPTR) or
-           (t.kind == TK_COMPLEX) or (t.kind >= TK_INT128);
+    return is_arith(t) or (t.kind == TK_POINTER) or (t.kind == TK_NULLPTR);
 }
 
 pub fn is_pointer(t: *CType) bool {
@@ -837,7 +1075,7 @@ pub fn size_of(t: *CType) u64 {
     if is_integer(t) or (k == TK_POINTER) or (k == TK_NULLPTR) {
         return @as(u64, @bit_cast(u32, storage_bits(t) / 8));
     }
-    if (k == TK_FLOAT) or (k == TK_DEC32) {
+    if k == TK_DEC32 {
         return 4;
     }
     if k == TK_DEC64 {
@@ -846,14 +1084,21 @@ pub fn size_of(t: *CType) u64 {
     if k == TK_DEC128 {
         return 16;
     }
-    if (k == TK_LDOUBLE) and (g_opts.ld_bits != 64) {
-        return 16;  // (the x87 format's 10 bytes and 6 of padding, or binary128)
-    }
-    if (k == TK_DOUBLE) or (k == TK_LDOUBLE) {
-        return 8;
+    if is_floating(t) {
+        let f = ffmt(t);
+        if f > 64 {
+            return 16;  // (the x87 format's 10 bytes and 6 of padding, or binary128)
+        }
+        return @as(u64, @bit_cast(u32, f / 8));
     }
     if k == TK_COMPLEX {
         return 2 * size_of(t.elem);  // (6.2.5p13: an array of two of the real type)
+    }
+    if k == TK_IMAGINARY {
+        return size_of(t.elem);  // (G.2p2: as its real type)
+    }
+    if k == TK_VECTOR {
+        return t.len * size_of(t.elem);
     }
     if k == TK_ARRAY {
         if not t.has_len {
@@ -869,6 +1114,9 @@ pub fn size_of(t: *CType) u64 {
 
 /// The alignment of an object type (1 for others).
 pub fn align_of(t: *CType) u64 {
+    if t.xalign != 0 {
+        return t.xalign;
+    }
     let k = t.kind;
     if k == TK_ARRAY {
         return align_of(t.elem);
@@ -882,8 +1130,10 @@ pub fn align_of(t: *CType) u64 {
         // (8 bytes on x86-64 and Windows, whose psABIs make it an array of
         // 8-byte chunks, and on WebAssembly; 16 on AArch64: AAPCS64)
         a = @as(u64, @bit_cast(u32, g_opts.bitint_align));
-    } else if k == TK_COMPLEX {
+    } else if (k == TK_COMPLEX) or (k == TK_IMAGINARY) {
         a = align_of(t.elem);
+    } else if k == TK_VECTOR {
+        a = vector_align(a);
     } else if a == 0 {
         return 1;
     }
@@ -891,6 +1141,18 @@ pub fn align_of(t: *CType) u64 {
         return atomic_align(t, a);
     }
     return a;
+}
+
+// The alignment of a vector type of `size` bytes: its size, at most the
+// platform's limit (COptions.vec_align: x86-64 Linux and macOS 16, 32 with
+// AVX, 64 with AVX-512F, as the system's compilers align them; AArch64 16;
+// none on Windows and WebAssembly).
+fn vector_align(size: u64) u64 {
+    let cap = @as(u64, @bit_cast(u32, g_opts.vec_align));
+    if (cap != 0) and (size > cap) {
+        return cap;
+    }
+    return size;
 }
 
 // The alignment of atomic type t, whose non-atomic version is aligned to a
@@ -1083,7 +1345,7 @@ pub fn common_type(a0: *mut CType, b0: *mut CType) *mut CType {
     if (a0.unq.kind == TK_COMPLEX) or (b0.unq.kind == TK_COMPLEX) {
         return complex_of(common_real(real_of(a0), real_of(b0)));
     }
-    return common_real(a0, b0);
+    return common_real(real_of(a0), real_of(b0));
 }
 
 /// The type an operand of type t is converted to by the usual arithmetic
@@ -1112,14 +1374,19 @@ fn common_real(a0: *mut CType, b0: *mut CType) *mut CType {
         }
         return decimal(32 << @bit_cast(u32, k - TK_DEC32));
     }
-    if (a.kind == TK_LDOUBLE) or (b.kind == TK_LDOUBLE) {
-        return t_ldouble;
-    }
-    if (a.kind == TK_DOUBLE) or (b.kind == TK_DOUBLE) {
-        return t_double;
-    }
-    if (a.kind == TK_FLOAT) or (b.kind == TK_FLOAT) {
-        return t_float;
+    if is_floating(a) or is_floating(b) {
+        // (C23 6.3.1.8: the type of greater floating-point conversion rank,
+        // and an integer operand converted to the floating one)
+        if not is_floating(b) {
+            return a;
+        }
+        if not is_floating(a) {
+            return b;
+        }
+        if float_rank(b) > float_rank(a) {
+            return b;
+        }
+        return a;
     }
     if a == b {
         return a;
@@ -1437,6 +1704,16 @@ fn base_name(t: *CType) []u8 {
     }
     if k == TK_COMPLEX {
         return u.cat2(base_name(t.elem), " _Complex");
+    }
+    if k == TK_IMAGINARY {
+        return u.cat2(base_name(t.elem), " _Imaginary");
+    }
+    if k == TK_VECTOR {
+        return u.f2("%s __attribute__((vector_size(%s)))", base_name(t.elem), u.udec(size_of(t)));
+    }
+    if (k >= TK_FLOAT16) and (k <= TK_FLOAT128) {
+        let xs = ["_Float16", "_Float32", "_Float64", "_Float32x", "_Float64x", "_Float128"];
+        return xs[@int_cast(usize, k - TK_FLOAT16)];
     }
     if (k == TK_STRUCT) or (k == TK_UNION) or (k == TK_ENUM) {
         let kw = u.pick(k == TK_STRUCT, "struct", u.pick(k == TK_UNION, "union", "enum"));

@@ -26,13 +26,35 @@
 //
 // Only executables our own linkers link are stripped whole: an object, or a
 // program linked with other code (--link, -l), keeps every definition of
-// the program's own units, which that code may refer to; the C library's
+// external linkage of the program's own units, which that code may refer
+// to, and what those reach (strip_kept); the C library's
 // units are stripped there too (codegen.ax), the other code having the
 // system's C library.
 // =============================================================================
 import "../asm/inline.ax" as ai;
 import "../ir.ax" as ir;
 import "../util.ax" as u;
+
+/// Further roots, by name: what the objects and libraries the program is
+/// linked with refer to (linkin.ax), which the program's units or the C
+/// library may define.
+pub let mut g_roots: u.SymMap.[u8] = u.SymMap.[u8].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut u8, 0), cap: 0, len: 0 };
+
+pub let mut g_root_list: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+
+/// Adds a root by name (g_roots).
+pub fn add_root(n: []u8) void {
+    let k = u.intern(n);
+    if g_roots.get(k) == 0 {
+        g_roots.put(k, 1);
+        g_root_list.push(k);
+    }
+}
+
+fn root_name(n: []u8) bool {
+    return (g_roots.len != 0) and (g_roots.get(u.intern(n)) != 0);
+}
 
 // Functions code generation may call by name (a structure copy, ...): kept
 // when C defines them.
@@ -53,18 +75,31 @@ struct Strip {
 /// definition (an Axiom library module's export: codegen.ax, define_lazy);
 /// what that adds to the module is reached.
 pub fn strip(m: *mut ir.Module, f0: usize, f1: usize, g0: usize, g1: usize, define: fn(*mut ir.Func) bool) void {
+    strip_kept(m, f0, f1, g0, g1, f0, g0, define);
+}
+
+/// As strip, and the functions m.funcs[f0..fx) and globals m.globals[g0..gx)
+/// of external linkage are roots too: an object's (or a program's linked by
+/// another linker) own units keep what other code may refer to, and leave
+/// out only their internal definitions that nothing reaches (a header's
+/// static helper functions, say, which may refer to this C library's
+/// internals that the other code's C library has not).
+pub fn strip_kept(m: *mut ir.Module, f0: usize, f1: usize, g0: usize, g1: usize, fx: usize, gx: usize,
+                  define: fn(*mut ir.Func) bool) void {
     let mut S = Strip.{ m: m, fmark: u.List.[bool].empty(), gmark: u.List.[bool].empty(),
                         work: u.List.[*mut ir.Value].empty(), define: define };
     grow(&mut S);
     for i in 0..m.funcs.len {
         let f = m.funcs.get(i);
-        if (i < f0) or (i >= f1) or by_name(f.name) {
+        let ext = (i < fx) and not ir.is_decl(f) and (f.linkage != ir.LINK_INTERNAL);
+        if (i < f0) or (i >= f1) or ext or by_name(f.name) or root_name(f.name) {
             reach(&mut S, f.val);
         }
     }
     for i in 0..m.globals.len {
         let g = m.globals.get(i);
-        if (i < g0) or (i >= g1) or kept(g) {
+        let ext = (i < gx) and u.notnil(g.init) and (g.linkage != ir.LINK_INTERNAL);
+        if (i < g0) or (i >= g1) or ext or kept(g) or root_name(g.name) {
             reach(&mut S, g.val);
         }
     }

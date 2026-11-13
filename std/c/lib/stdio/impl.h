@@ -29,6 +29,13 @@
 #include <wchar.h>
 #include <stdint.h>
 
+/* (the library's own definitions of the functions <stdio.h>'s macros
+   stand for) */
+#undef getc
+#undef putc
+#undef getchar
+#undef putchar
+
 /* __flags */
 #define F_READ 0x1u       /* opened for reading */
 #define F_WRITE 0x2u      /* opened for writing */
@@ -47,6 +54,9 @@
 #define F_NOSEEK 0x4000u  /* the file cannot be positioned (a pipe or terminal) */
 #define F_CLOSED 0x8000u  /* a stream that fclose closed (freopen's failure) */
 #define F_SETBUF 0x10000u /* setvbuf was called: the first use keeps its buffering */
+#define F_FDREAD 0x20000u   /* the file was opened for reading (freopen(NULL, ...) may read) */
+#define F_FDWRITE 0x40000u  /* the file was opened for writing */
+#define F_FDAPPEND 0x80000u /* the system appends every write (else F_APPEND seeks to the end) */
 
 /* __orient (7.21.2p4) */
 #define O_NONE 0
@@ -78,6 +88,12 @@ void *__axc_sys_alloc(uint64_t n);
 void __axc_sys_free(void *p, uint64_t n);
 void __axc_sys_exit(int64_t status);
 void __axc_sys_copy(void *dst, const void *src, uint64_t n);
+
+/* fgets's copy: src[0..n) up to and including the first new-line to dst,
+   16 bytes at a time; the count, its top bit set if a new-line ended it */
+uint64_t __axc_sys_line(unsigned char *dst, const unsigned char *src, uint64_t n);
+/* The index of the first byte c in p[0..n), or n (16 bytes at a time) */
+uint64_t __axc_sys_find(const unsigned char *p, uint64_t c, uint64_t n);
 
 /* The first c in p[0..n), or NULL (a word at a time) */
 const unsigned char *__axc_find_byte(const unsigned char *p, int c, size_t n);
@@ -119,6 +135,9 @@ void __axc_stdio_exit(void);
    program without them has no flushing at exit linked in. */
 extern void (*__axc_at_exit_flush)(void);
 int __axc_close_u(FILE *f, int free_it);
+/* Annex K's fopen_s and freopen_s (open.c): the mode may begin with u */
+FILE *__axc_fopen_ext1(const char *filename, const char *mode);
+FILE *__axc_freopen_ext1(const char *filename, const char *mode, FILE *stream);
 void __axc_link(FILE *f);
 void __axc_unlink(FILE *f);
 FILE *__axc_new_file(void);
@@ -139,11 +158,61 @@ struct __axc_out {
     FILE *f;           /* a stream's */
     unsigned char *s;  /* a string's: the next character */
     size_t room;       /* a string's: characters that fit, not counting the null */
+    const char **viol; /* Annex K's functions (fprintf_s ...): where a
+                          runtime-constraint violation is described (K.3.5.3.1:
+                          %n, a null pointer for %s), else NULL */
 };
 
 int __axc_vprintf_core(struct __axc_out *o, const char *fmt, va_list ap);
 int __axc_vwprintf_core(struct __axc_out *o, const wchar_t *fmt, va_list ap);
 int __axc_vfprintf_u(FILE *f, const char *fmt, va_list ap);
+/* The engines' entries for Annex K's functions (std/c/lib/ext1/): viol
+   non-null makes them check the runtime-constraints of K.3.5.3 (K.3.9.1)
+   and describe a violation there (a negative result, or EOF for input).
+   vsnprintf_x and vswprintf_x truncate as vsnprintf does and return the
+   length of the whole output. */
+int __axc_vfprintf_x(FILE *f, const char *fmt, va_list ap, const char **viol);
+int __axc_vsnprintf_x(char *s, size_t n, const char *fmt, va_list ap, const char **viol);
+int __axc_vfwprintf_x(FILE *f, const wchar_t *fmt, va_list ap, const char **viol);
+int __axc_vswprintf_x(wchar_t *s, size_t n, const wchar_t *fmt, va_list ap, const char **viol);
+int __axc_vfscanf_x(FILE *f, const char *fmt, va_list ap, int c23, const char **viol);
+int __axc_vsscanf_x(const char *s, const char *fmt, va_list ap, int c23, const char **viol);
+int __axc_vfwscanf_x(FILE *f, const wchar_t *fmt, va_list ap, int c23, const char **viol);
+int __axc_vswscanf_x(const wchar_t *s, const wchar_t *fmt, va_list ap, int c23, const char **viol);
+
+/* The current rounding direction (<fenv.h>'s, the mathematics part's:
+   std/c/lib/math/fe_raw.c) for the conversions of a value of sign neg
+   (F.5: they honor it): 0 to nearest, 1 away from zero (the magnitude
+   rounds up), -1 toward zero */
+int __axc_fe_round(void);
+static inline int __axc_round_dir(int neg) {
+    int m = __axc_fe_round();
+    if (m == 0)
+        return 0;
+    if (m == 0x800) /* (FE_UPWARD) */
+        return neg ? -1 : 1;
+    if (m == 0x400) /* (FE_DOWNWARD) */
+        return neg ? 1 : -1;
+    return -1; /* (FE_TOWARDZERO) */
+}
+
+/* The decimal rounding direction (<fenv.h>'s fe_dec_getround: std/c/rt/
+   dfp_env.ax) for the conversions of a decimal floating value of sign neg,
+   as __axc_round_dir's, and 2: to nearest, the halfway case away from
+   zero (FE_DEC_TONEARESTFROMZERO) */
+unsigned __axiom_int64 __axc_dec_round_get(void);
+static inline int __axc_dec_round_dir(int neg) {
+    int m = (int)__axc_dec_round_get();
+    if (m == 0)
+        return 0;
+    if (m == 4)
+        return 2;
+    if (m == 2) /* (FE_DEC_UPWARD) */
+        return neg ? -1 : 1;
+    if (m == 1) /* (FE_DEC_DOWNWARD) */
+        return neg ? 1 : -1;
+    return -1; /* (FE_DEC_TOWARDZERO) */
+}
 
 /* Floating-point formatting (fmtfloat.c): the conversion of a value of a
    format (binary64, x87 80-bit, binary128) given by its bits */
@@ -161,6 +230,7 @@ void __axc_fp_long_double(struct __axc_fp *v, long double x);
 /* a decimal floating value's (_Decimal32, _Decimal64, _Decimal128: bytes
    4, 8 or 16 of BID at p) */
 void __axc_fp_dec(struct __axc_fp *v, const void *p, int bytes);
+void __axc_fp_bits(struct __axc_fp *v, const unsigned char *s, int which);
 /* Writes the conversion (spec 'f','e','g','a' and upper case) of v with the
    flags into buf (cap bytes), returning the length; *big, if the result
    needs more than cap, is a buffer of the library's (to be freed with
@@ -179,6 +249,9 @@ struct __axc_in {
     int eof;                /* the source has ended */
     int error;              /* a read error (a stream's) */
     int c23;                /* C23's rules (the call's: the header maps C23 mode's names) */
+    const char **viol;      /* Annex K's functions (fscanf_s ...): c, s and [ take a
+                               size, null pointers are runtime-constraint violations,
+                               described here (K.3.5.3.2); else NULL */
 };
 int __axc_vscanf_core(struct __axc_in *in, const char *fmt, va_list ap);
 int __axc_vwscanf_core(struct __axc_in *in, const wchar_t *fmt, va_list ap);
@@ -199,6 +272,8 @@ struct __axc_num {
 int __axc_scan_num(struct __axc_in *in, long width, struct __axc_num *n, size_t *taken, size_t *valid);
 int __axc_num_digits(int ld);
 long double __axc_strtold(const char *s, char **end, int *range);
+void __axc_strtobits(const char *s, char **end, int *range, int which, unsigned char *out);
+void __axc_num_bits(struct __axc_num *n, int *range, int which, unsigned char *out);
 double __axc_num_double(struct __axc_num *n, int *range);
 float __axc_num_float(struct __axc_num *n, int *range);
 long double __axc_num_long_double(struct __axc_num *n, int *range);

@@ -10,26 +10,26 @@
    m * 5^-e, which is computed in base 10^9 (the classic exact method of
    multiple-precision arithmetic; D. E. Knuth, The Art of Computer
    Programming, vol. 2, 4.4, "Radix conversion"), then rounded to the digits
-   asked for, the halfway case to even (IEC 60559's round to nearest, the
-   default rounding direction: rounding modes are not followed).
+   asked for in the current rounding direction (F.5; <fenv.h>): to nearest
+   with the halfway case to even, toward zero, upward or downward.
+
 
    A decimal floating value (C23 _Decimal32, _Decimal64, _Decimal128:
    __axc_fp_dec, from its BID encoding) is its coefficient * 10^q: N is the
-   coefficient, and e, f and g round its digits as for a binary value. Its
+   coefficient, and e, f and g round its digits as for a binary value, in
+   the decimal rounding direction (<fenv.h>'s fe_dec_setround, which also
+   has to nearest with the halfway case away from zero). Its
    a conversion (C23 7.23.6.1p8) shows the coefficient's digits and the
    quantum exponent as they are: in the style of f with -q digits after the
    point when -(n + 5) <= q <= 0 (n the coefficient's digits, 1 for zero),
    else of e with n - 1 digits after the point; a precision P below n
-   first rounds the coefficient to P digits (half to even). */
+   first rounds the coefficient to P digits (in that direction too). */
 #include "impl.h"
 
 /* Limbs of N for the widest format: m * 5^16494 for binary128 (11564
-   digits), 5^16445 * 2^64 for x87, 2^1024 * ... for binary64 */
-#if LDBL_MANT_DIG > 53
+   digits; _Float128's strfromf128 uses it whatever long double is),
+   5^16445 * 2^64 for x87 */
 #define LIMBS 1320
-#else
-#define LIMBS 96
-#endif
 #define BASE 1000000000UL
 
 /* (limbs of at least 32 bits, valid with every --c-int) */
@@ -170,20 +170,33 @@ static int make_n(struct big *b, const struct __axc_fp *v) {
 /* The digits of N rounded to keep digits (keep may be 0 or less: the value
    rounds to a unit in the last place kept or to 0): written to out
    (room for keep + 1), the count of digits returned; *dp is adjusted when
-   the rounding carries into a new leading digit. Round half to even. */
-static int round_digits(const struct digits *d, int keep, char *out, int *dp) {
+   the rounding carries into a new leading digit. dir: the direction
+   (__axc_round_dir, __axc_dec_round_dir): 0 half to even, 1 away from
+   zero, -1 toward zero, 2 half away from zero. */
+static int round_digits(const struct digits *d, int keep, char *out, int *dp, int dir) {
     int i, up, last;
     if (keep >= d->total) {
         for (i = 0; i < d->total; i++)
             out[i] = (char)('0' + digit_at(d, i));
         return d->total;
     }
-    if (keep < 0)
-        return 0;
+    if (keep < 0) {
+        /* (below a unit's tenth: 0, or away from zero one unit, 10^(dp - keep)) */
+        if (dir != 1 || d->total == 0)
+            return 0;
+        out[0] = '1';
+        *dp = *dp - keep + 1;
+        return 1;
+    }
     {
         int first = digit_at(d, keep);
         last = keep > 0 ? digit_at(d, keep - 1) : 0;
-        up = first > 5 || (first == 5 && (rest_nonzero(d, keep + 1) || (last & 1)));
+        if (dir == 0)
+            up = first > 5 || (first == 5 && (rest_nonzero(d, keep + 1) || (last & 1)));
+        else if (dir == 2)
+            up = first >= 5;
+        else
+            up = dir > 0 && (first != 0 || rest_nonzero(d, keep + 1));
     }
     for (i = 0; i < keep; i++)
         out[i] = (char)('0' + digit_at(d, i));
@@ -278,11 +291,14 @@ static size_t fmt_hex(const struct __axc_fp *v, int prec, int alt, int upper, ch
             dg[i] = 0;
     }
     if (prec >= 0 && prec < nd) {
-        /* round to prec digits, half to even */
-        int up, rest = 0;
+        /* round to prec digits in the current direction (half to even) */
+        int up, rest = 0, dir = __axc_round_dir(v->neg);
         for (i = prec + 1; i < nd; i++)
             rest |= dg[i];
-        up = dg[prec] > 8 || (dg[prec] == 8 && (rest || ((prec > 0 ? dg[prec - 1] : (unsigned char)lead) & 1)));
+        if (dir == 0)
+            up = dg[prec] > 8 || (dg[prec] == 8 && (rest || ((prec > 0 ? dg[prec - 1] : (unsigned char)lead) & 1)));
+        else
+            up = dir > 0 && (dg[prec] != 0 || rest);
         nd = prec;
         if (up) {
             for (i = nd - 1; i >= 0; i--) {
@@ -346,7 +362,7 @@ static size_t fmt_dec_a(const struct __axc_fp *v, int prec, int alt, int upper, 
         if (prec >= 0) {
             int pk = prec == 0 ? 1 : prec;
             if (pk < n) {
-                int nk = round_digits(&d, pk, dig, &dp);
+                int nk = round_digits(&d, pk, dig, &dp, __axc_dec_round_dir(v->neg));
                 q += n - pk;
                 if (nk > pk)
                     q++; /* (carried into a new digit: 10...0, one zero fewer) */
@@ -431,7 +447,7 @@ size_t __axc_fmt_fp(const struct __axc_fp *v, int spec, int prec, int alt, char 
     if (v->kind == 0) {
         nk = 0;
     } else {
-        nk = round_digits(&d, nk, dig, &dp);
+        nk = round_digits(&d, nk, dig, &dp, v->dec ? __axc_dec_round_dir(v->neg) : __axc_round_dir(v->neg));
     }
     if (nk == 0)
         dp = spec == 'f' ? dp : 1; /* (zero: e and g print 0 with exponent 0) */
@@ -576,6 +592,47 @@ void __axc_fp_long_double(struct __axc_fp *v, long double x) {
     v->kind = w0 != 0;
     v->exp = (e == 0 ? 1 : e) - 16383 - 63;
 #else
+    (void)e;
+    (void)w0;
+    (void)w1;
+    __axc_fp_bits(v, s, 1);
+#endif
+#endif
+}
+
+/* binary16's (which 0: 2 bytes) or binary128's (which 1: 16 bytes) bits at
+   s, little-endian */
+void __axc_fp_bits(struct __axc_fp *v, const unsigned char *s, int which) {
+    unsigned __axiom_int64 w0 = 0, w1 = 0;
+    int k, e;
+    v->dec = 0; /* (a binary value) */
+    if (which == 0) {
+        unsigned int h = (unsigned int)s[0] | ((unsigned int)s[1] << 8);
+        e = (int)((h >> 10) & 0x1f);
+        v->neg = (int)(h >> 15);
+        v->mant_bits = 11;
+        v->min_exp = -14;
+        v->hi = 0;
+        v->lo = h & 0x3ffu;
+        if (e == 0x1f) {
+            v->kind = v->lo != 0 ? 3 : 2;
+            v->exp = 0;
+            return;
+        }
+        if (e == 0) {
+            v->kind = v->lo != 0;
+            v->exp = -24;
+            return;
+        }
+        v->kind = 1;
+        v->lo |= 0x400u;
+        v->exp = e - 25;
+        return;
+    }
+    for (k = 7; k >= 0; k--)
+        w0 = (w0 << 8) | s[k];
+    for (k = 15; k >= 8; k--)
+        w1 = (w1 << 8) | s[k];
     e = (int)((w1 >> 48) & 0x7fff);
     v->neg = (int)(w1 >> 63);
     v->mant_bits = 113;
@@ -595,8 +652,6 @@ void __axc_fp_long_double(struct __axc_fp *v, long double x) {
     v->kind = 1;
     v->hi |= 1ULL << 48;
     v->exp = e - 16383 - 112;
-#endif
-#endif
 }
 
 /* A decimal floating value of bytes 4, 8 or 16 (BID, IEEE 754-2019 3.5.2):

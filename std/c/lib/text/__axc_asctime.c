@@ -3,7 +3,8 @@
    %.2d:%.2d:%.2d %d\n", "Sun Sep 16 01:03:52 1973\n". Its result is a
    static buffer large enough for any int values of the fields (where the
    standard's 26 bytes overflow, undefined behavior): a name out of range
-   is "???". */
+   is "???". __axc_asctime_to writes it into a buffer of the caller's
+   (Annex K's asctime_s). */
 #include <axc/text.h>
 #include <time.h>
 
@@ -34,8 +35,8 @@ static char *put_number(char *p, int v, int width, char pad) {
     return p;
 }
 
-char *__axc_asctime(const struct tm *timeptr) {
-    static char result[64];
+/* Writes the conversion into result (64 bytes are enough); returns result */
+char *__axc_asctime_to(char *result, const struct tm *timeptr) {
     char *p = result;
     p = put_name(p, "SunMonTueWedThuFriSat", timeptr->tm_wday, 7);
     *p++ = ' ';
@@ -66,4 +67,9 @@ char *__axc_asctime(const struct tm *timeptr) {
     *p++ = '\n';
     *p = 0;
     return result;
+}
+
+char *__axc_asctime(const struct tm *timeptr) {
+    static char result[64];
+    return __axc_asctime_to(result, timeptr);
 }

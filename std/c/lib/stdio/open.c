@@ -3,9 +3,11 @@
    setvbuf, setbuf. */
 #include "impl.h"
 
-/* Opens path with the mode's flags into f (a new stream, or freopen's);
-   0, or -1 with errno set. */
-static int open_into(FILE *f, const char *path, const char *mode) {
+/* Opens path with the mode's flags into f (a new stream, or freopen's),
+   and the system's flags extra (__axc_sys_open: 16 a new file's
+   permissions keep other users out, 32 exclusive access); 0, or -1 with
+   errno set. */
+static int open_into(FILE *f, const char *path, const char *mode, unsigned int extra) {
     unsigned int flags, oflags;
     int fd;
     if (__axc_parse_mode(mode, &flags, &oflags) != 0) {
@@ -14,13 +16,31 @@ static int open_into(FILE *f, const char *path, const char *mode) {
 #endif
         return -1;
     }
-    fd = __axc_sys_open(path, oflags);
+    fd = __axc_sys_open(path, oflags | extra);
     if (fd < 0) {
         SET_ERRNO(__axc_errno_of(fd));
         return -1;
     }
     f->__fd = fd;
     f->__flags = (f->__flags & F_STATIC) | flags;
+    /* (what the file was opened for, which freopen(NULL, ...) keeps) */
+    switch (oflags & 7) {
+    case 0:
+        f->__flags |= F_FDREAD;
+        break;
+    case 1:
+        f->__flags |= F_FDWRITE;
+        break;
+    case 2:
+        f->__flags |= F_FDWRITE | F_FDAPPEND;
+        break;
+    case 5:
+        f->__flags |= F_FDREAD | F_FDWRITE | F_FDAPPEND;
+        break;
+    default:
+        f->__flags |= F_FDREAD | F_FDWRITE;
+        break;
+    }
     f->__buf = NULL;
     f->__size = 0;
     f->__orient = O_NONE;
@@ -31,11 +51,11 @@ static int open_into(FILE *f, const char *path, const char *mode) {
     return 0;
 }
 
-FILE *fopen(const char *__AXC_RESTRICT filename, const char *__AXC_RESTRICT mode) {
+static FILE *fopen_with(const char *filename, const char *mode, unsigned int extra) {
     FILE *f = __axc_new_file();
     if (f == NULL)
         return NULL;
-    if (open_into(f, filename, mode) != 0) {
+    if (open_into(f, filename, mode, extra) != 0) {
         __axc_free_file(f);
         return NULL;
     }
@@ -43,15 +63,56 @@ FILE *fopen(const char *__AXC_RESTRICT filename, const char *__AXC_RESTRICT mode
     return f;
 }
 
+FILE *fopen(const char *__AXC_RESTRICT filename, const char *__AXC_RESTRICT mode) {
+    return fopen_with(filename, mode, 0);
+}
+
+/* The system's flags of Annex K's fopen_s and freopen_s (K.3.5.2.1p4-p7),
+   whose mode may begin with u, which it skips: a file opened for writing
+   has exclusive (non-shared) access where the system has it (Windows); one
+   created gets permissions that keep other users out unless the mode
+   began with u (owner-only on Linux and macOS, an access control list of
+   the owner's on Windows; the system's default with u). */
+static unsigned int ext1_flags(const char **mode) {
+    const char *m = *mode;
+    unsigned int extra = 16;
+    if (*m == 'u') {
+        extra = 0;
+        *mode = ++m;
+    }
+    if (*m == 'w' || *m == 'a') {
+        extra |= 32;
+    } else if (*m == 'r') {
+        for (m++; *m == 'b' || *m == '+' || *m == 'x'; m++)
+            if (*m == '+')
+                extra |= 32;
+    }
+    return extra;
+}
+
+FILE *__axc_fopen_ext1(const char *filename, const char *mode) {
+    unsigned int extra = ext1_flags(&mode);
+    return fopen_with(filename, mode, extra);
+}
+
 /* 7.21.5.4: the stream's file is closed (a failure ignored), and the file
-   opened into it. With a null filename the mode of the same file changes:
-   a mode that needs what the file was not opened for fails; text and
-   binary may change. */
-FILE *freopen(const char *__AXC_RESTRICT filename, const char *__AXC_RESTRICT mode, FILE *__AXC_RESTRICT stream) {
+   opened into it. With a null filename the mode of the same file changes
+   (7.21.5.4p3, which mode changes are permitted is implementation-defined):
+   any mode whose reading and writing the file was opened for (by fopen or
+   freopen; the standard streams: what they are), text and binary, and
+   appending, which then seeks to the end before each write if the system
+   does not append; the stream's position, buffer and pushed back bytes
+   are those after an fflush. Another mode fails, and the stream is
+   closed. */
+static FILE *freopen_with(const char *filename, const char *mode, FILE *stream, unsigned int extra) {
     int r;
     LOCK(stream);
     if (filename == NULL) {
         unsigned int flags, oflags, have = stream->__flags & (F_READ | F_WRITE);
+        if (stream->__flags & F_FDREAD)
+            have |= F_READ;
+        if (stream->__flags & F_FDWRITE)
+            have |= F_WRITE;
         if (stream->__flags & F_UNSET)
             __axc_setup(stream);
         if (__axc_parse_mode(mode, &flags, &oflags) != 0 || (oflags & 8) ||
@@ -70,7 +131,7 @@ FILE *freopen(const char *__AXC_RESTRICT filename, const char *__AXC_RESTRICT mo
         return stream;
     }
     __axc_close_u(stream, 0);
-    r = open_into(stream, filename, mode);
+    r = open_into(stream, filename, mode, extra);
     UNLOCK(stream);
     if (r != 0)
         return NULL;
@@ -78,6 +139,15 @@ FILE *freopen(const char *__AXC_RESTRICT filename, const char *__AXC_RESTRICT mo
     if (stream->__prev == NULL && __axc_files != stream)
         __axc_link(stream);
     return stream;
+}
+
+FILE *freopen(const char *__AXC_RESTRICT filename, const char *__AXC_RESTRICT mode, FILE *__AXC_RESTRICT stream) {
+    return freopen_with(filename, mode, stream, 0);
+}
+
+FILE *__axc_freopen_ext1(const char *filename, const char *mode, FILE *stream) {
+    unsigned int extra = ext1_flags(&mode);
+    return freopen_with(filename, mode, stream, extra);
 }
 
 int fclose(FILE *stream) {
@@ -190,8 +260,12 @@ static int temp_name(char *buf) {
     return 0;
 }
 
-/* 7.21.4.4: a name that is not the name of an existing file (one that
-   cannot be opened for reading, then). */
+/* 7.21.4.4: a name that is not the name of an existing file: one that
+   opening for reading finds no file of (a file that exists but cannot be
+   read is one). The names are random (12 letters and digits, about 62
+   bits from the system's random source), so that another program cannot
+   guess the next; a file of the name may still be created between the
+   call and its use, which tmpfile (and fopen's x) excludes. */
 char *tmpnam(char *s) {
     static char name[L_tmpnam];
     char *buf = s != NULL ? s : name;
@@ -201,17 +275,21 @@ char *tmpnam(char *s) {
         if (temp_name(buf) != 0)
             return NULL;
         fd = __axc_sys_open(buf, 0);
-        if (fd < 0)
+        if (fd == -2)
             return buf;
-        __axc_sys_close(fd);
+        if (fd >= 0)
+            __axc_sys_close(fd);
     }
     return NULL;
 }
 
 /* 7.21.4.3: a new file, opened "wb+", removed when it is closed or when
-   the program ends normally. Elsewhere than on Windows it is removed at
-   once (the open file stays); on Windows it is removed when closed (and by
-   __axc_stdio_exit). */
+   the program ends normally. It is created exclusively (no file of its
+   random name may exist: another is tried), with permissions that keep
+   other users out and, on Windows, exclusive access (K.3.5.1.1p4's
+   properties, for tmpfile_s and tmpfile alike). Elsewhere than on Windows
+   it is removed at once (the open file stays); on Windows it is removed
+   when closed (and by __axc_stdio_exit). */
 FILE *tmpfile(void) {
     char name[L_tmpnam];
     int tries, fd = -1;
@@ -219,7 +297,7 @@ FILE *tmpfile(void) {
     for (tries = 0; tries < 100 && fd < 0; tries++) {
         if (temp_name(name) != 0)
             break;
-        fd = __axc_sys_open(name, 4 | 8);
+        fd = __axc_sys_open(name, 4 | 8 | 16 | 32);
         if (fd < 0 && fd != -17) {
             SET_ERRNO(__axc_errno_of(fd));
             return NULL;
@@ -238,7 +316,7 @@ FILE *tmpfile(void) {
         return NULL;
     }
     f->__fd = fd;
-    f->__flags = F_READ | F_WRITE;
+    f->__flags = F_READ | F_WRITE | F_FDREAD | F_FDWRITE;
     if (__axc_is_windows()) {
         size_t n, k;
         for (n = 0; name[n] != 0; n++)

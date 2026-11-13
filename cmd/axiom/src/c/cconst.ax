@@ -118,10 +118,16 @@ fn set_float(e: *mut cast.Expr, f: f64) void {
     e.fcval = round_to(e.ty, f);
 }
 
-// f rounded to the (corresponding real) type of t.
+// f rounded to the (corresponding real) type of t (an operation's result
+// computed in double, then rounded: the same as computing in the narrower
+// format, double having more than twice its precision and two bits more).
 fn round_to(t: *cty.CType, f: f64) f64 {
-    if (t.kind == cty.TK_FLOAT) or ((t.kind == cty.TK_COMPLEX) and (t.elem.kind == cty.TK_FLOAT)) {
+    let w = cty.ffmt(t);
+    if w == 32 {
         return @as(f64, @float_cast(f32, f));
+    }
+    if w == 16 {
+        return cl.round_half(f);
     }
     return f;
 }
@@ -147,20 +153,26 @@ pub fn ld_fmt() u32 {
     return cl.fmt_of(cty.ld_bits());
 }
 
-// Sets e (of a wide long double type) to w.
+/// The format (ldouble.ax's FMT_) of a wide floating type t (cty.is_wide:
+/// long double, _Float64x or _Float128; or a complex type of one).
+pub fn fmt_t(t: *cty.CType) u32 {
+    return cl.fmt_of(cty.ffmt(t));
+}
+
+// Sets e (of a wide floating type) to w.
 fn set_wide(e: *mut cast.Expr, w: ld.W) void {
     e.is_const = true;
     e.xv = w;
-    e.fcval = cl.to_f64(w, ld_fmt());
+    e.fcval = cl.to_f64(w, fmt_t(e.ty));
 }
 
-// Sets e (of a complex type whose parts are wide long doubles) to re + i im.
+// Sets e (of a complex type whose parts are wide floating values) to re + i im.
 fn set_cwide(e: *mut cast.Expr, re: ld.W, im: ld.W) void {
     e.is_const = true;
     e.xv = re;
     e.xvim = im;
-    e.fcval = cl.to_f64(re, ld_fmt());
-    e.fcimag = cl.to_f64(im, ld_fmt());
+    e.fcval = cl.to_f64(re, fmt_t(e.ty));
+    e.fcimag = cl.to_f64(im, fmt_t(e.ty));
 }
 
 /// Is t a complex type whose parts are wide long doubles?
@@ -172,9 +184,15 @@ pub fn is_cwide(t: *cty.CType) bool {
 /// exact, from an integer, a float or a double (a complex value's real
 /// part).
 pub fn wide_value(x: *cast.Expr) ld.W {
-    let f = ld_fmt();
+    return wide_value_in(x, ld_fmt());
+}
+
+/// The value of constant x (of arithmetic type) in wide format f: exact from
+/// an integer of at most 64 bits, a binary16, float or double (a complex
+/// value's real part), or from the x87's format to binary128; else rounded.
+pub fn wide_value_in(x: *cast.Expr, f: u32) ld.W {
     if cty.is_wide(x.ty) or is_cwide(x.ty) {
-        return x.xv;
+        return cl.convert(x.xv, fmt_t(x.ty), f);
     }
     if cty.is_floating(x.ty) or cty.is_complex(x.ty) {
         return cl.of_f64(x.fcval, f);
@@ -194,14 +212,17 @@ pub fn truth(x: *cast.Expr) bool {
     if cty.is_decimal(x.ty) {
         return cdec.truth(x);
     }
+    if cty.is_imaginary(x.ty) {
+        return truth(as_real(x, cty.real_of(x.ty)));
+    }
     if cty.is_complex(x.ty) and cty.is_wide(x.ty.elem) {
-        return cl.nonzero(x.xv, ld_fmt()) or cl.nonzero(x.xvim, ld_fmt());
+        return cl.nonzero(x.xv, fmt_t(x.ty)) or cl.nonzero(x.xvim, fmt_t(x.ty));
     }
     if cty.is_complex(x.ty) {
         return (x.fcval != 0.0) or (x.fcimag != 0.0);
     }
     if cty.is_wide(x.ty) {
-        return cl.nonzero(x.xv, ld_fmt());
+        return cl.nonzero(x.xv, fmt_t(x.ty));
     }
     if cty.is_floating(x.ty) {
         return x.fcval != 0.0;
@@ -227,23 +248,230 @@ fn as_float(x: *cast.Expr) f64 {
 }
 
 // The imaginary part of constant x (a complex value, or 0 for a real one)
-// as a wide long double.
-fn wide_imag(x: *cast.Expr) ld.W {
+// in wide format f.
+fn wide_imag(x: *cast.Expr, f: u32) ld.W {
     if is_cwide(x.ty) {
-        return x.xvim;
+        return cl.convert(x.xvim, fmt_t(x.ty), f);
     }
     if cty.is_complex(x.ty) {
-        return cl.of_f64(x.fcimag, ld_fmt());
+        return cl.of_f64(x.fcimag, f);
     }
     return cl.zero();
 }
 
-// Wide long double w as a value of real floating type t (rounded once).
-fn narrow_wide(w: ld.W, t: *cty.CType) f64 {
-    if t.kind == cty.TK_FLOAT {
-        return @as(f64, cl.to_f32(w, ld_fmt()));
+// Wide value w of format f as a value of real floating type t (not wide:
+// rounded once).
+fn narrow_wide(w: ld.W, f: u32, t: *cty.CType) f64 {
+    let b = cty.ffmt(t);
+    if b == 32 {
+        return @as(f64, cl.to_f32(w, f));
     }
-    return cl.to_f64(w, ld_fmt());
+    if b == 16 {
+        return cl.half_value(cl.to_half(w, f));
+    }
+    return cl.to_f64(w, f);
+}
+
+// -----------------------------------------------------------------------------
+// Imaginary constants (Annex G): a value of an imaginary type is its
+// coefficient, held as a value of the corresponding real type (fcval, xv)
+// -----------------------------------------------------------------------------
+
+// A constant of real type t holding x's value (fcval, cval, xv): a copy that
+// the real conversions and operations take.
+fn as_real(x: *cast.Expr, t: *mut cty.CType) *mut cast.Expr {
+    let r = cast.new_expr(cast.ExprKind.FLOAT, x.span);
+    r.ty = t;
+    r.is_const = true;
+    r.cval = x.cval;
+    r.fcval = x.fcval;
+    r.xv = x.xv;
+    return r;
+}
+
+// The imaginary part of constant x (of any arithmetic type) as a constant of
+// its real type (0 for a real one); the real part (0 for an imaginary one).
+fn imag_part(x: *cast.Expr) *mut cast.Expr {
+    let rt = cty.real_of(x.ty);
+    if cty.is_imaginary(x.ty) {
+        return as_real(x, rt);
+    }
+    let r = as_real(x, rt);
+    if cty.is_complex(x.ty) {
+        r.fcval = x.fcimag;
+        r.xv = x.xvim;
+        return r;
+    }
+    return zero_of(r, rt);
+}
+
+fn real_part(x: *cast.Expr) *mut cast.Expr {
+    let rt = cty.real_of(x.ty);
+    let r = as_real(x, rt);
+    if cty.is_imaginary(x.ty) {
+        return zero_of(r, rt);
+    }
+    return r;
+}
+
+// r (a constant of real type t) made +0.
+fn zero_of(r: *mut cast.Expr, t: *mut cty.CType) *mut cast.Expr {
+    r.ty = t;
+    r.cval = 0;
+    r.fcval = 0.0;
+    r.xv = cl.zero();
+    return r;
+}
+
+// The constant x (real) converted to real type t.
+fn real_to(x: *cast.Expr, t: *mut cty.CType) *mut cast.Expr {
+    let r = cast.new_expr(cast.ExprKind.CAST, x.span);
+    r.op = cast.CV_VALUE;
+    r.ty = t;
+    convert(r, x);
+    return r;
+}
+
+// e (of imaginary type t's real type, or complex) set from constant parts re
+// and im (of t's real type); re nil for an imaginary result.
+fn set_parts(e: *mut cast.Expr, re: *cast.Expr, im: *cast.Expr) void {
+    e.is_const = re.is_const and im.is_const;
+    if cty.is_imaginary(e.ty) {
+        e.fcval = im.fcval;
+        e.xv = im.xv;
+        e.cval = 0;
+        return;
+    }
+    if cty.is_complex(e.ty) {
+        e.fcval = re.fcval;
+        e.xv = re.xv;
+        e.fcimag = im.fcval;
+        e.xvim = im.xv;
+        return;
+    }
+    e.cval = re.cval;
+    e.fcval = re.fcval;
+    e.xv = re.xv;
+}
+
+// e (a conversion from or to an imaginary type) of constant x (G.4: a
+// real value to an imaginary type, or an imaginary one to a real type, is
+// +0; to and from a complex type, the imaginary part).
+fn convert_imag(e: *mut cast.Expr, x: *cast.Expr) void {
+    let to = e.ty;
+    let rt = cty.real_of(to);
+    if to.kind == cty.TK_BOOL {
+        set_int(e, selu(truth(x), 1, 0));
+        return;
+    }
+    if cty.is_imaginary(to) {
+        let v = real_to(imag_part(x), rt);
+        set_parts(e, v, v);
+        return;
+    }
+    if cty.is_complex(to) {
+        let re = real_to(real_part(x), rt);
+        let im = real_to(imag_part(x), rt);
+        set_parts(e, re, im);
+        return;
+    }
+    // (to a real type: the real part, +0)
+    let z = real_to(zero_of(as_real(x, cty.real_of(x.ty)), cty.real_of(x.ty)), to);
+    e.is_const = true;
+    e.cval = z.cval;
+    e.fcval = z.fcval;
+    e.xv = z.xv;
+}
+
+// The real operation x op y (both of real floating type t), folded.
+fn real_op(op: i32, t: *mut cty.CType, x: *cast.Expr, y: *cast.Expr) *mut cast.Expr {
+    let r = cast.new_expr(cast.ExprKind.BINARY, x.span);
+    r.op = op;
+    r.ty = t;
+    r.a = as_real(x, t);
+    r.b = as_real(y, t);
+    binary(r);
+    return r;
+}
+
+fn real_neg(t: *mut cty.CType, x: *cast.Expr) *mut cast.Expr {
+    let r = cast.new_expr(cast.ExprKind.UNARY, x.span);
+    r.op = ct.P_MINUS;
+    r.ty = t;
+    r.a = as_real(x, t);
+    unary(r);
+    return r;
+}
+
+// e = a op b (+ - * /) with an imaginary operand, the operands in their own
+// domains of real type T (csema_expr.imag_arith): Annex G.5.1 and G.5.2.
+fn imag_binary(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
+    let t = cty.real_of(e.ty);
+    let ka = cty.is_imaginary(a.ty);
+    let kb = cty.is_imaginary(b.ty);
+    let x = real_part(a);
+    let y = imag_part(a);
+    let u_ = real_part(b);
+    let v = imag_part(b);
+    let ca = cty.is_complex(a.ty);
+    let cb = cty.is_complex(b.ty);
+    if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
+        // (each part on its own; a part one operand has not is not added)
+        let mut re = x;
+        if not ka {
+            re = x;
+        }
+        if not kb {
+            if ka {
+                re = u_;
+                if op == ct.P_MINUS {
+                    re = real_neg(t, u_);
+                }
+            } else {
+                re = real_op(op, t, x, u_);
+            }
+        }
+        let mut im = y;
+        if ka or ca {
+            if kb or cb {
+                im = real_op(op, t, y, v);
+            }
+        } else {
+            im = v;
+            if op == ct.P_MINUS {
+                im = real_neg(t, v);
+            }
+        }
+        set_parts(e, re, im);
+        return;
+    }
+    if op == ct.P_STAR {
+        if ka and kb {
+            set_parts(e, real_neg(t, real_op(op, t, y, v)), y);  // (iy * iv = -yv)
+        } else if ka and cb {
+            set_parts(e, real_neg(t, real_op(op, t, y, v)), real_op(op, t, y, u_));  // (-yv + i yu)
+        } else if ca and kb {
+            set_parts(e, real_neg(t, real_op(op, t, y, v)), real_op(op, t, x, v));  // (-yv + i xv)
+        } else if ka {
+            set_parts(e, x, real_op(op, t, y, u_));  // (iy * u = i yu)
+        } else {
+            set_parts(e, x, real_op(op, t, x, v));  // (x * iv = i xv)
+        }
+        return;
+    }
+    // division
+    if ka and kb {
+        set_parts(e, real_op(op, t, y, v), y);  // (iy / iv = y/v)
+    } else if ka and not cb {
+        set_parts(e, x, real_op(op, t, y, u_));  // (iy / u = i y/u)
+    } else if not ka and kb and not ca {
+        set_parts(e, x, real_neg(t, real_op(op, t, x, v)));  // (x / iv = i (-x/v))
+    } else if ca and kb {
+        set_parts(e, real_op(op, t, y, v), real_neg(t, real_op(op, t, x, v)));  // (y/v + i (-x/v))
+    } else {
+        // (iy / (u + iv): the complex quotient of 0 + iy)
+        e.is_const = false;
+    }
 }
 
 /// e (a conversion to an arithmetic type) of constant x: 6.3.1.
@@ -254,12 +482,16 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
         cdec.convert(e, x, ld_fmt());
         return;
     }
+    if cty.is_imaginary(to) or cty.is_imaginary(from) {
+        convert_imag(e, x);
+        return;
+    }
     if cty.is_wint(to) {
         // (from a floating value: only when it fits, 6.3.1.4p1)
         if cty.is_integer(from) {
             cw.convert_int(e, x);
         } else if cty.is_wide(from) or is_cwide(from) {
-            cw.convert_ld(e, x.xv, ld_fmt());
+            cw.convert_ld(e, x.xv, fmt_t(from));
         } else {
             cw.convert_f64(e, x.fcval);
         }
@@ -276,11 +508,12 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
     }
     // (the parts of complex values as real ones, where a wide long double is one)
     if is_cwide(to) {
-        set_cwide(e, wide_value(x), wide_imag(x));
+        set_cwide(e, wide_value_in(x, fmt_t(to)), wide_imag(x, fmt_t(to)));
         return;
     }
     if cty.is_complex(to) and (is_cwide(from) or cty.is_wide(from)) {
-        set_complex(e, narrow_wide(wide_value(x), to.elem), narrow_wide(wide_imag(x), to.elem));
+        let f = fmt_t(from);
+        set_complex(e, narrow_wide(wide_value_in(x, f), f, to.elem), narrow_wide(wide_imag(x, f), f, to.elem));
         return;
     }
     if is_cwide(from) {
@@ -300,7 +533,7 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
         }
         let mut re = x.fcval;
         if cty.is_integer(from) {
-            if to.elem.kind == cty.TK_FLOAT {
+            if cty.ffmt(to.elem) == 32 {
                 // (rounded once, from the integer)
                 re = int_to_f32(x);
             } else {
@@ -348,12 +581,14 @@ fn convert(e: *mut cast.Expr, x: *cast.Expr) void {
         set_float(e, x.fcval);
         return;
     }
-    if to.kind == cty.TK_FLOAT {
+    if cty.ffmt(to) == 32 {
         // (rounded once, from the integer)
         e.is_const = true;
         e.fcval = int_to_f32(x);
         return;
     }
+    // (to binary16 from double: exact for every integer that does not
+    // overflow it)
     set_float(e, as_float(x));
 }
 
@@ -372,11 +607,11 @@ fn int_to_f32(x: *cast.Expr) f64 {
 // once, not through double); to an integer only when the value fits.
 fn convert_wide(e: *mut cast.Expr, x: *cast.Expr) void {
     let to = e.ty;
-    let f = ld_fmt();
     if cty.is_wide(to) {
-        set_wide(e, wide_value(x));
+        set_wide(e, wide_value_in(x, fmt_t(to)));
         return;
     }
+    let f = fmt_t(x.ty);
     let w = x.xv;
     if to.kind == cty.TK_BOOL {
         set_int(e, selu(cl.nonzero(w, f), 1, 0));
@@ -394,11 +629,7 @@ fn convert_wide(e: *mut cast.Expr, x: *cast.Expr) void {
         return;
     }
     e.is_const = true;
-    if to.kind == cty.TK_FLOAT {
-        e.fcval = @as(f64, cl.to_f32(w, f));
-    } else {
-        e.fcval = cl.to_f64(w, f);
-    }
+    e.fcval = narrow_wide(w, f, to);
 }
 
 fn trunc_f(f: f64) f64 {
@@ -429,8 +660,18 @@ fn unary(e: *mut cast.Expr) void {
         cdec.fold_unary(e, x);
         return;
     }
+    if cty.is_imaginary(e.ty) {
+        let t = cty.real_of(e.ty);
+        if op == ct.P_MINUS {
+            let v = real_neg(t, as_real(x, t));
+            set_parts(e, v, v);
+        } else if op == ct.P_PLUS {
+            set_parts(e, x, x);
+        }
+        return;
+    }
     if is_cwide(e.ty) {
-        let f = ld_fmt();
+        let f = fmt_t(e.ty);
         if op == ct.P_MINUS {
             set_cwide(e, cl.negate(x.xv, f), cl.negate(x.xvim, f));
         } else if op == ct.P_PLUS {
@@ -452,7 +693,7 @@ fn unary(e: *mut cast.Expr) void {
     }
     if cty.is_wide(e.ty) {
         if op == ct.P_MINUS {
-            set_wide(e, cl.negate(x.xv, ld_fmt()));
+            set_wide(e, cl.negate(x.xv, fmt_t(e.ty)));
         } else if op == ct.P_PLUS {
             set_wide(e, x.xv);
         }
@@ -506,6 +747,18 @@ fn binary(e: *mut cast.Expr) void {
         return;
     }
     e.ovf = a.ovf or b.ovf;
+    if is_compare(op) and cty.is_imaginary(a.ty) {
+        // (== and != of two imaginary values: their coefficients)
+        let t = cty.real_of(a.ty);
+        let r = cast.new_expr(cast.ExprKind.BINARY, e.span);
+        r.op = op;
+        r.ty = cty.t_int;
+        r.a = as_real(a, t);
+        r.b = as_real(b, t);
+        binary(r);
+        set_int(e, r.cval);
+        return;
+    }
     if is_compare(op) {
         set_int(e, selu(compare(op, a, b), 1, 0));
         return;
@@ -514,12 +767,16 @@ fn binary(e: *mut cast.Expr) void {
         cdec.fold_binary(e, a, b);
         return;
     }
+    if cty.is_imaginary(a.ty) or cty.is_imaginary(b.ty) {
+        imag_binary(e, op, a, b);
+        return;
+    }
     if cty.is_complex(e.ty) {
         complex_op(e, op, a, b);
         return;
     }
     if cty.is_wide(e.ty) {
-        let f = ld_fmt();
+        let f = fmt_t(e.ty);
         if op == ct.P_PLUS {
             set_wide(e, cl.add(a.xv, b.xv, f));
         } else if op == ct.P_MINUS {
@@ -626,8 +883,9 @@ fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
         return order_is(op, cdec.compare(a, b));
     }
     if is_cwide(t) {
-        let f = ld_fmt();
-        let same = (cl.cmp(wide_value(a), wide_value(b), f) == 0) and (cl.cmp(wide_imag(a), wide_imag(b), f) == 0);
+        let f = fmt_t(t);
+        let same = (cl.cmp(wide_value_in(a, f), wide_value_in(b, f), f) == 0) and
+                   (cl.cmp(wide_imag(a, f), wide_imag(b, f), f) == 0);
         return same == (op == ct.P_EQ);
     }
     if cty.is_complex(t) {
@@ -636,7 +894,7 @@ fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
         return same == (op == ct.P_EQ);
     }
     if cty.is_wide(t) {
-        let c = cl.cmp(a.xv, b.xv, ld_fmt());  // (2: unordered, a NaN)
+        let c = cl.cmp(a.xv, b.xv, fmt_t(t));  // (2: unordered, a NaN)
         if op == ct.P_LT {
             return c == -1;
         }
@@ -722,13 +980,13 @@ fn compare(op: i32, a: *cast.Expr, b: *cast.Expr) bool {
 // complex_op where the parts are wide long doubles: the same operations
 // (G.5: a real operand stays real), in that arithmetic.
 fn complex_wide_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
-    let f = ld_fmt();
+    let f = fmt_t(e.ty);
     let acx = cty.is_complex(a.ty);
     let bcx = cty.is_complex(b.ty);
-    let x = wide_value(a);
-    let y = wide_value(b);
-    let xi = wide_imag(a);
-    let yi = wide_imag(b);
+    let x = wide_value_in(a, f);
+    let y = wide_value_in(b, f);
+    let xi = wide_imag(a, f);
+    let yi = wide_imag(b, f);
     if (op == ct.P_PLUS) or (op == ct.P_MINUS) {
         let is_add = op == ct.P_PLUS;
         let mut re = cl.sub(x, y, f);
@@ -776,7 +1034,7 @@ fn complex_op(e: *mut cast.Expr, op: i32, a: *cast.Expr, b: *cast.Expr) void {
         complex_wide_op(e, op, a, b);
         return;
     }
-    let s = e.ty.elem.kind == cty.TK_FLOAT;
+    let s = cty.ffmt(e.ty) == 32;
     let acx = cty.is_complex(a.ty);
     let bcx = cty.is_complex(b.ty);
     let x = a.fcval;

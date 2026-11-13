@@ -1,12 +1,13 @@
 /* __axc_wclass - the classes of a wide character in the current locale
    (axc/text.h): ASCII's as <ctype.h> has them in the "C" locale (C17
    7.4.1, 7.30.2.1), and in a UTF-8 locale Unicode's beyond ASCII
-   (std/c/rt/text.ax). WEOF, and every other value, has none. */
+   (__axc_wctab.c's tables: two loads). WEOF, and every other value, has
+   none. */
 #include <axc/text.h>
 
 unsigned int __axc_wclass(unsigned long c) {
     if (c >= 0x80)
-        return __axc_mb_utf8() ? (unsigned int)__axc_wclass_unicode(c) : 0;
+        return c <= 0x10ffff && __axc_mb_utf8() ? __AXC_WCT_CLASS(c) : 0;
     if (c < 0x20 || c == 0x7f) {
         if (c == '\t')
             return __AXC_W_CNTRL | __AXC_W_SPACE | __AXC_W_BLANK;

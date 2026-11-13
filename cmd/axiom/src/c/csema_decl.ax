@@ -84,12 +84,15 @@ struct Counts {
     bool_: i32,
     int64: i32,
     valist: i32,
-    complex_: i32,  // _Complex
-    bitint: i32,    // _BitInt(width)
-    int128: i32,    // __int128 (a GNU dialect)
-    dec: i32,       // _Decimal32, _Decimal64, _Decimal128 (C23)
-    dec_bits: i32,  // the last one's width
-    width: i32,     // its width (0: in error, reported)
+    complex_: i32,   // _Complex
+    bitint: i32,     // _BitInt(width)
+    int128: i32,     // __int128 (a GNU dialect)
+    dec: i32,        // _Decimal32, _Decimal64, _Decimal128 (C23)
+    dec_bits: i32,   // the last one's width
+    xfloat: i32,     // _Float16 ... _Float64x, __float128 (Annex H)
+    xfloat_kw: i32,  // which (the last seen)
+    imag: i32,       // _Imaginary (Annex G)
+    width: i32,      // its width (0: in error, reported)
     width_sp: u.Span,
     other: i32,  // a tag, typedef name or other type specifier
 }
@@ -101,7 +104,7 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
     let mut scs: i32 = 0;
     let mut c = Counts.{ void_: 0, char_: 0, short_: 0, int_: 0, long_: 0, float_: 0, double_: 0, signed_: 0,
                          unsigned_: 0, bool_: 0, int64: 0, valist: 0, complex_: 0, bitint: 0, int128: 0, dec: 0,
-                         dec_bits: 0, width: 0, width_sp: ds.span, other: 0 };
+                         dec_bits: 0, xfloat: 0, xfloat_kw: 0, imag: 0, width: 0, width_sp: ds.span, other: 0 };
     let mut other = cty.t_error;
     let mut td_seen = false;  // a typedef name, at td_span
     let mut td_span = ds.span;
@@ -152,10 +155,7 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
             } else if kw == ct.K_COMPLEX {
                 c.complex_ += 1;
             } else if kw == ct.K_IMAGINARY {
-                // (the imaginary types are optional: Annex G, which this
-                // implementation does not claim)
-                cs.not_supported(s.span, "'_Imaginary' (the imaginary types)");
-                bad = true;
+                c.imag += 1;  // (the imaginary types: Annex G.2)
             } else if kw == ct.K_AUTO_TYPE {
                 auto_type = true;  // (a GNU dialect: the type of the initializer)
             } else if kw == ct.K_INT128 {
@@ -168,9 +168,9 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
                 } else if kw == ct.K_DECIMAL64 {
                     c.dec_bits = 64;
                 }
-            } else if kw == ct.K_EXT_FLOAT {
-                cs.not_supported(s.span, "the floating types _FloatN, _FloatNx and __float128");
-                bad = true;
+            } else if (kw >= ct.K_FLOAT128) and (kw <= ct.K_FLOAT64X) {
+                c.xfloat += 1;
+                c.xfloat_kw = kw;
             } else {
                 cs.not_supported(s.span, u.f1("'%s'", cast.kw_text(kw)));
                 bad = true;
@@ -255,7 +255,7 @@ fn specifiers(ds: *mut cast.DeclSpec, ctx: i32, lone: bool) Specs {
     r.infer = st.infer;
     if auto_type {
         let kws = c.void_ + c.char_ + c.short_ + c.int_ + c.long_ + c.float_ + c.double_ + c.signed_ + c.unsigned_ +
-                  c.bool_ + c.int64 + c.valist + c.bitint + c.other + c.int128 + c.complex_ + c.dec;
+                  c.bool_ + c.int64 + c.valist + c.bitint + c.other + c.int128 + c.complex_ + c.dec + c.xfloat + c.imag;
         if kws > 0 {
             cs.err(ds.span, "C3005", "'__auto_type' with another type specifier");
             r.ty = cty.t_error;
@@ -357,17 +357,73 @@ fn qual_bit(kw: i32) i32 {
     return cty.Q_ATOMIC;
 }
 
+// The type the specifiers name that have an interchange or extended floating
+// type (_Float32 ... : Annex H.5.1, with _Complex too) or _Imaginary (Annex
+// G.2: float, double, long double _Imaginary; and of those of Annex H).
+fn float_type(c: *Counts, sp: u.Span) *mut cty.CType {
+    let rest = c.void_ + c.char_ + c.short_ + c.int_ + c.signed_ + c.unsigned_ + c.bool_ + c.int64 + c.valist +
+               c.other + c.bitint + c.int128 + c.dec;
+    if (rest > 0) or (c.xfloat > 1) or (c.imag > 1) or (c.complex_ > 1) or ((c.imag > 0) and (c.complex_ > 0)) {
+        return bad_combination(sp);
+    }
+    let mut r = cty.t_error;
+    if c.xfloat == 1 {
+        if c.float_ + c.double_ + c.long_ > 0 {
+            return bad_combination(sp);
+        }
+        let k = c.xfloat_kw;
+        if k == ct.K_FLOAT16 {
+            r = cty.t_float16;
+        } else if k == ct.K_FLOAT32 {
+            r = cty.t_float32;
+        } else if k == ct.K_FLOAT64 {
+            r = cty.t_float64;
+        } else if k == ct.K_FLOAT32X {
+            r = cty.t_float32x;
+        } else if k == ct.K_FLOAT64X {
+            r = cty.t_float64x;
+        } else {
+            r = cty.t_float128;
+        }
+        cty.note_float_use(r);
+    } else {
+        if (c.float_ + c.double_ != 1) or (c.long_ > c.double_) {
+            if c.float_ + c.double_ + c.long_ == 0 {
+                cs.err(sp, "C3005", "'_Imaginary' needs a real floating type: float, double or long double _Imaginary");
+                return cty.t_error;
+            }
+            return bad_combination(sp);
+        }
+        r = cty.t_double;
+        if c.float_ == 1 {
+            r = cty.t_float;
+        } else if c.long_ == 1 {
+            r = cty.t_ldouble;
+        }
+    }
+    if c.complex_ == 1 {
+        return cty.complex_of(r);
+    }
+    if c.imag == 1 {
+        return cty.imaginary_of(r);
+    }
+    return r;
+}
+
 // The type the type specifiers name (6.7.2p2), or the error type (reported).
 fn base_type(c: *Counts, other: *mut cty.CType, sp: u.Span) *mut cty.CType {
     if c.dec > 0 {
         // _Decimal32, _Decimal64, _Decimal128: alone (6.7.2p2; no complex
         // decimal types)
         let rest = c.void_ + c.char_ + c.short_ + c.int_ + c.long_ + c.float_ + c.double_ + c.signed_ + c.unsigned_ +
-                   c.bool_ + c.int64 + c.valist + c.other + c.bitint + c.int128 + c.complex_;
+                   c.bool_ + c.int64 + c.valist + c.other + c.bitint + c.int128 + c.complex_ + c.xfloat + c.imag;
         if (c.dec > 1) or (rest > 0) {
             return bad_combination(sp);
         }
         return cty.decimal(c.dec_bits);
+    }
+    if (c.imag > 0) or (c.xfloat > 0) {
+        return float_type(c, sp);
     }
     if c.complex_ > 0 {
         // float _Complex, double _Complex, long double _Complex, in any
@@ -863,6 +919,13 @@ fn array_deriv(t: *mut cty.CType, dv: *mut cast.Deriv, outer_param: bool, in_par
     if cty.is_record(t) and t.tag.has_flex {
         cs.err(dv.span, "C3008", "an array of structures with a flexible array member");
     }
+    if (cty.size_of(t) % cty.align_of(t)) != 0 {
+        // (a GNU dialect's typedef aligned beyond its type's size: the
+        // elements after the first would not be aligned)
+        cs.err(dv.span, "C3008", u.f2("an array of elements of type %s, aligned to %s, more than their size", cs.tq(t),
+                                      u.udec(cty.align_of(t))));
+        return cty.t_error;
+    }
     if ((dv.quals != 0) or dv.is_static) and not outer_param {
         cs.err(dv.span, "C3008",
                "'static' or a type qualifier in an array declarator that is not a parameter's outermost one");
@@ -1044,6 +1107,8 @@ pub fn external(d: *mut cast.Decl) void {
 pub fn block_decl(d: *mut cast.Decl) void {
     if d.kind == cast.DeclKind.DECL {
         declaration(d, CTX_BLOCK);
+    } else if d.kind == cast.DeclKind.FUNC_DEF {
+        nested_def(d);
     } else if d.kind == cast.DeclKind.STATIC_ASSERT {
         static_assert(d);
     } else if d.kind == cast.DeclKind.ATTR {
@@ -1194,10 +1259,13 @@ fn mark_decl(d: *mut cast.Decl, dcl: *mut cast.Declarator) void {
     catr.mark_sym(dcl.sym, &d.attrs);
     catr.mark_sym(dcl.sym, &dcl.attrs);
     catr.mark_sym(dcl.sym, &d.specs.gattrs);
+    // (the GNU dialects' attributes, and in every mode those of the
+    // compiler's headers, __axiom_attribute__: csema_gnu.is_gnu)
+    cgn.mark_sym(dcl.sym, &d.attrs);
+    cgn.mark_sym(dcl.sym, &dcl.attrs);
+    cgn.mark_sym(dcl.sym, &d.specs.gattrs);
+    cgn.pragma_visibility(dcl.sym, dcl.vis);
     if cs.opts().gnu {
-        cgn.mark_sym(dcl.sym, &d.attrs);
-        cgn.mark_sym(dcl.sym, &dcl.attrs);
-        cgn.mark_sym(dcl.sym, &d.specs.gattrs);
         cgn.entity(dcl.sym, dcl);
     }
 }
@@ -1270,6 +1338,22 @@ fn func_decl(sp: *Specs, dcl: *mut cast.Declarator, t: *mut cty.CType, ctx: i32,
         if (sc != 0) and (sc != cast.SC_EXTERN) and (sc != cast.SC_STATIC) {
             cs.err(dcl.name_span, "C3006", u.f1("the function '%s' has an invalid storage class", dcl.name));
         }
+    } else if (sc == cast.SC_AUTO) and cs.opts().gnu {
+        // (a GNU dialect: the declaration of a nested function defined later in the block)
+        let prior = cs.lookup_here(dcl.name);
+        if u.notnil(prior) and (prior.kind == cast.SK_FUNC) and u.notnil(prior.nest_parent) {
+            dcl.sym = prior;
+            return;
+        }
+        let s = cs.new_sym(cast.SK_FUNC, dcl.name, dcl.name_span, t);
+        s.linkage = cast.LK_NONE;
+        s.nest_parent = cs.cur_fn();
+        if u.notnil(s.nest_parent) {
+            s.nest_parent.has_nested = true;
+        }
+        cs.declare(dcl.name, s);
+        dcl.sym = s;
+        return;
     } else if (sc != 0) and (sc != cast.SC_EXTERN) {
         cs.err(dcl.name_span, "C3006", u.f1("the function '%s', declared in a block, can only be extern", dcl.name));
     }
@@ -1362,6 +1446,7 @@ fn object_decl(sp: *Specs, dcl: *mut cast.Declarator, t0: *mut cty.CType, ctx: i
         cs.err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", name), prior.span, "declared before here");
     }
     let s = cs.new_sym(cast.SK_OBJECT, name, dcl.name_span, t);
+    s.owner = cs.cur_fn();  // (a nested function may use it: csema_nest.ax)
     if (sc == cast.SC_STATIC) or sp.thread {
         s.duration = cast.SD_STATIC;
     }
@@ -1437,6 +1522,72 @@ fn init_object(s: *mut cast.CSym, it: *mut cast.Init, is_static: bool) void {
 // -----------------------------------------------------------------------------
 // Function definitions (6.9.1)
 // -----------------------------------------------------------------------------
+
+// The definition of a nested function (a GNU dialect: csema_nest.ax), in a
+// block of the function being analyzed: no linkage, no storage class but
+// auto; its body is analyzed in the scope of its block, so that it sees
+// the enclosing function's objects.
+fn nested_def(d: *mut cast.Decl) void {
+    let parent = cs.cur_fn();
+    let sp = specifiers(d.specs, CTX_BLOCK, false);
+    let dcl = d.decls.get(0);
+    g_params = u.List.[*mut cast.CSym].empty();
+    g_kr_ids = false;
+    g_defining = true;
+    let mut t = derive(sp.ty, dcl, CTX_BLOCK);
+    g_defining = false;
+    let params = g_params;
+    if cty.is_error(t) or not cty.is_func(t) or u.isnil(parent) {
+        return;
+    }
+    if g_kr_ids {
+        t = kr_params(t, d, &params);
+    }
+    if (sp.sc != 0) and (sp.sc != cast.SC_AUTO) {
+        cs.err(dcl.name_span, "C3006", u.f1("the nested function '%s' can only be declared auto", dcl.name));
+    }
+    if t.variadic {
+        cs.not_supported(dcl.name_span, u.f1("the variadic nested function '%s'", dcl.name));
+        return;
+    }
+    let prior = cs.lookup_here(dcl.name);
+    let mut s = u.nil.[cast.CSym]();
+    if u.notnil(prior) and (prior.kind == cast.SK_FUNC) and (prior.nest_parent == parent) and not prior.defined {
+        // (declared auto before in the block: compatible types)
+        if not cty.compatible(prior.ty, t) {
+            cs.err_note(dcl.name_span, "C3003", u.f1("conflicting types for '%s'", dcl.name), prior.span,
+                        "declared before here");
+        }
+        s = prior;
+        s.ty = t;
+    } else {
+        if u.notnil(prior) {
+            cs.err_note(dcl.name_span, "C3002", u.f1("redefinition of '%s'", dcl.name), prior.span,
+                        "declared before here");
+        }
+        s = cs.new_sym(cast.SK_FUNC, dcl.name, dcl.name_span, t);
+        s.linkage = cast.LK_NONE;
+        s.nest_parent = parent;
+        cs.declare(dcl.name, s);
+    }
+    parent.has_nested = true;
+    dcl.sym = s;
+    dcl.ty = t;
+    dsp.attrs(&d.attrs, dsp.AP_FUNC);
+    dsp.attrs(&d.specs.gattrs, dsp.AP_FUNC);
+    dsp.attrs(&dcl.attrs, dsp.AP_FUNC);
+    mark_decl(d, dcl);
+    for p in params.items() {
+        if not cty.is_complete(p.ty) and not cty.is_error(p.ty) {
+            cs.err(p.span, "C3007", u.f2("the parameter '%s' has incomplete type %s", p.name, cs.tq(p.ty)));
+        }
+    }
+    s.defined = true;
+    s.def = d;
+    s.params = params;
+    cs.add_function(s);
+    cs.hooks.body(s, d);
+}
 
 fn function_def(d: *mut cast.Decl) void {
     let sp = specifiers(d.specs, CTX_FILE, false);

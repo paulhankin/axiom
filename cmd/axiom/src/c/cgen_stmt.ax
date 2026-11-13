@@ -22,8 +22,10 @@ import "cgen_debug.ax" as cdbg;
 import "cgen_expr.ax" as gx;
 import "cgen_flow.ax" as flow;
 import "cgen_ld.ax" as gld;
+import "cgen_nest.ax" as gnest;
 import "cgen_sjlj.ax" as sj;
 import "cgen_va.ax" as gva;
+import "cgen_vec.ax" as gvec;
 import "cgen_vla.ax" as gv;
 import "cgen_wint.ax" as cgw;
 import "cpragma.ax" as cpg;
@@ -32,6 +34,7 @@ import "csema_attr.ax" as catr;
 import "csema_gnu.ax" as cgn;
 import "csema_stmt.ax" as css;
 import "csema_vla.ax" as svla;
+import "ctok.ax" as ct;
 import "ctypes.ax" as cty;
 import "cwide.ax" as cw;
 
@@ -56,7 +59,9 @@ pub fn generate(m: *mut ir.Module, cu: *mut cs.CUnit, wasm: bool) bool {
     cg.hooks.body = function_body;
     cg.hooks.local_init = init_local;
     cg.hooks.stmt_expr = stmt_expr;
+    cg.hooks.trampolines = trampolines;
     gv.gen_expr = gx.rv;
+    gvec.install();
     cdbg.vla_len_slot = gv.len_slot;
     let ok = cg.generate(m, cu, wasm);
     // (after the unit's functions and objects: the names of internal linkage file-scope asm names are theirs)
@@ -111,6 +116,7 @@ fn function_body(s: *mut cast.CSym) void {
             gx.store(cty.unqual(p.ty), gx.convert(pv, pts[j], p.ty), @ptr_cast(*mut ir.Value, p.ir));
         }
     }
+    gnest.enter(s);  // (a nested function's chain, the record of a function with them)
     param_lengths(d);
     // floating point under FENV_ACCESS ON or FENV_ROUND anywhere in it:
     // strict for the whole function (the passes consult ir.Func's strict_fp)
@@ -125,6 +131,7 @@ fn function_body(s: *mut cast.CSym) void {
         if gv.has_cleanups() {
             gv.release_to(0);
         }
+        gnest.leave(s);
         if not cg.terminated() {
             gva.ret_default(F.sig.plan, F.sret);
         }
@@ -307,7 +314,8 @@ fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
         let x = xs[i];
         if (i + 1 == xs.len) and u.notnil(css.value_stmt(x)) and not cty.is_void(e.ty) {
             v = last_value(x);
-            if cty.is_record(e.ty) and (gv.depth() > d) {
+            if (cty.is_record(e.ty) or cty.is_vector(e.ty) or cty.is_wide(e.ty) or cty.is_wint(e.ty)) and
+               (gv.depth() > d) {
                 let tmp = cg.alloca(e.ty, "stmtexpr");
                 gx.copy(e.ty, tmp, v);
                 v = tmp;
@@ -321,7 +329,7 @@ fn stmt_expr(e: *mut cast.Expr) *mut ir.Value {
     cg.continue_after();
     if u.isnil(v) and not cty.is_void(e.ty) {
         // (the block ended in a jump: the value is never used)
-        if cty.is_record(e.ty) {
+        if cty.is_record(e.ty) or cty.is_vector(e.ty) or cty.is_wide(e.ty) or cty.is_wint(e.ty) {
             return cg.alloca(e.ty, "stmtexpr");
         }
         return ir.czero(cg.lty(e.ty));
@@ -453,6 +461,8 @@ fn init_local(s: *mut cast.CSym, p: *mut ir.Value) void {
             cgw.copy(t, at, gx.full(it.e), (vol != 0) or ((t.quals & cty.Q_VOLATILE) != 0));
         } else if cty.is_record(t) {
             gx.copy(t, at, gx.full(it.e));
+        } else if cty.is_vector(t) {
+            gx.vec_copy(cty.qualify(t, vol), at, gx.full(it.e));
         } else if u.notnil(it.bits) {
             _ = cgb.store(it.bits, cty.qualify(t, vol), gx.full(it.e), at);
         } else {
@@ -620,8 +630,8 @@ fn switch_stmt(s: *mut cast.Stmt) void {
 
 // A switch on a value v wider than 64 bits (its address): for each value of
 // the limbs above the first that some case has, a comparison of those, then
-// a switch on the first limb among those cases (csema_stmt.wide_case: no
-// ranges).
+// a switch on the first limb among those cases; before them, a test of
+// each case range.
 fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
     let t = s.e.ty;
     let n = cty.limbs(t);
@@ -641,10 +651,22 @@ fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
             vals[i] = cw.value(c.e, n);
         }
     }
+    // the case ranges first: lo <= v and v <= hi
+    for i in 0..nc {
+        let c = s.cases.get(i);
+        if (c.kind != cast.StmtKind.CASE) or u.isnil(c.hi) {
+            continue;
+        }
+        let ge = cgw.compare(ct.P_GE, t, v, cgw.constant(t, vals[i]));
+        let le = cgw.compare(ct.P_LE, t, v, cgw.constant(t, cw.value(c.hi, n)));
+        let next = cg.new_block("wrange");
+        ir.condbr(cg.B, ir.and_(cg.B, ge, le), blocks[i], next);
+        cg.at_end(next);
+    }
     let lo = cgw.limb(v, 0);
     let mut seen = u.List.[usize].empty();  // (a case of each group: its first)
     for i in 0..nc {
-        if s.cases.get(i).kind != cast.StmtKind.CASE {
+        if (s.cases.get(i).kind != cast.StmtKind.CASE) or u.notnil(s.cases.get(i).hi) {
             continue;
         }
         let mut grouped = false;
@@ -669,7 +691,8 @@ fn wide_switch(s: *mut cast.Stmt, v: *mut ir.Value) void {
         let mut vs = u.List.[u64].empty();
         let mut bs = u.List.[*mut ir.Block].empty();
         for k in i..nc {
-            if (s.cases.get(k).kind == cast.StmtKind.CASE) and same_upper(vals[k], vals[i], n) {
+            if (s.cases.get(k).kind == cast.StmtKind.CASE) and u.isnil(s.cases.get(k).hi) and
+               same_upper(vals[k], vals[i], n) {
                 vs.push(vals[k][0]);
                 bs.push(blocks[k]);
             }
@@ -710,7 +733,8 @@ fn return_stmt(s: *mut cast.Stmt) void {
         ir.ret_void(cg.B);
         return;
     }
-    if gv.has_cleanups() and (cty.is_record(F.ret) or cty.is_wint(F.ret)) {
+    if gv.has_cleanups() and
+       (cty.is_record(F.ret) or cty.is_wint(F.ret) or cty.is_vector(F.ret) or cty.is_wide(F.ret)) {
         // (the value copied before the cleanups run)
         let tmp = cg.alloca(F.ret, "retval");
         gx.copy(F.ret, tmp, v);
@@ -720,10 +744,76 @@ fn return_stmt(s: *mut cast.Stmt) void {
     gva.ret_value(F.sig.plan, F.sret, v);
 }
 
-// Before a return: the calls of the cleanups in scope (a GNU dialect).
+// Before a return: the calls of the cleanups in scope (a GNU dialect), and
+// the trampolines of nested functions the call holds given back.
 fn cleanups() void {
     if gv.has_cleanups() {
         gv.release_to(0);
         cg.continue_after();
     }
+    if u.notnil(cg.F.sym) {
+        gnest.leave(cg.F.sym);
+    }
+}
+
+// The trampolines of function s's nested functions whose addresses are
+// taken (cgen_nest.ax): the function that gives one, and each one: a
+// function of the nested function's C type that calls it with the chain its
+// slot holds, its arguments as they arrive (cgen_va.ax: the C ABI's both
+// ways).
+fn trampolines(s: *mut cast.CSym) void {
+    let saved = cg.F;
+    for g in s.tramps.items() {
+        gnest.define_get(g);
+        let p = gnest.pool_of(g);
+        let pts = cg.param_types(g);
+        for i in 0..p.thunks.len {
+            let f = p.thunks[i];
+            let st = u.new.[cg.FnState]();
+            st.f = f;
+            st.ret = g.ty.ret;
+            st.sig = cg.sig_of(g.ty.ret, pts, pts.len, false, true);
+            cg.F = st;
+            st.entry = cg.new_block("entry");
+            let start = cg.new_block("start");
+            cg.at_end(start);
+            let fakes = u.newn.[*mut cast.CSym](pts.len + 1);
+            for j in 0..pts.len {
+                let x = u.new.[cast.CSym]();
+                x.kind = cast.SK_OBJECT;
+                x.name = "";
+                x.ty = pts[j];
+                x.duration = cast.SD_AUTO;
+                fakes[j] = x;
+            }
+            st.sret = gva.enter_function(st.sig.plan, f, fakes[0..pts.len], false);
+            let vs = u.newn.[*mut ir.Value](pts.len + 1);
+            for j in 0..pts.len {
+                let at = @ptr_cast(*mut ir.Value, fakes[j].ir);
+                if abi.aggregate(pts[j]) {
+                    vs[j] = at;
+                } else {
+                    vs[j] = gx.load(pts[j], at);
+                }
+            }
+            let ch = ir.ptradd(cg.B, p.chains, cg.usz(@as(u64, i) * cty.ptr_bytes));
+            let chain = ir.load(cg.B, cg.T_ptr, ch);
+            chain.flags = chain.flags | ir.F_VOLATILE;
+            let gs = cg.func_sig(g);
+            cg.next_chain = chain;
+            let r = gva.emit_call(gs.plan, gs.ty, cg.func_of(g, gs).val, vs[0..pts.len]);
+            if cty.is_void(g.ty.ret) {
+                gva.ret_value(st.sig.plan, st.sret, ir.vnil());
+            } else {
+                gva.ret_value(st.sig.plan, st.sret, r);
+            }
+            cg.at_end(st.entry);
+            ir.br(cg.B, start);
+            ir.remove_unreachable(f);
+            if cg.is_wasm {
+                flow.make_reducible(f);
+            }
+        }
+    }
+    cg.F = saved;
 }

@@ -17,9 +17,23 @@
 // Thread-local .tdata/.tbss form the PT_TLS template (local-exec model). A
 // static program's main thread uses a copy of it placed after it (with its
 // thread control block), which _start points the thread pointer at.
+//
+// Besides the compiler's own objects, the link takes relocatable objects
+// and static archives of the platform's toolchain (g_members: the members
+// of archives, taken when they define what is undefined: ar.select) and
+// shared libraries by path (g_shlibs) or by name (-l: lib<name>.so, else
+// lib<name>.a, in the -L directories, g_search_dirs, then the system's;
+// a linker script naming others, as the system's libc.so is, is read for
+// its INPUT and GROUP). Every relocation the x86-64 and AArch64 psABIs give
+// relocatable objects of an executable is applied; the general- and
+// local-dynamic and descriptor TLS models are relaxed to local-exec (the
+// executable has all of its TLS), the initial-exec one reads a GOT slot. A
+// non-PIC reference to data of a shared library gets a copy relocation.
 // =============================================================================
+import "ar.ax" as ar;
 import "bin.ax" as bn;
 import "elf.ax" as elf;
+import "jstub.ax" as jstub;
 import "lstub.ax" as lstub;
 import "nlink.ax" as nl;
 import "util.ax" as u;
@@ -30,7 +44,8 @@ const PAGE: u64 = 0x10000;
 // A shared library: its SONAME and defined dynamic symbols.
 struct Lib {
     soname: []u8,
-    syms: u.SymMap.[u8],    // name -> 1 function/other, 2 data object
+    syms: u.SymMap.[u8],    // name -> 1 function/other, 2 data object, 3 thread-local
+    sizes: u.SymMap.[u64],  // name -> its size (data objects, for copy relocations)
     vers: u.SymMap.[[]u8],  // name -> its default version (if versioned)
     used: bool,
     known: bool,  // its symbols were read
@@ -48,6 +63,22 @@ let mut tls_align: u64 = 1;
 let mut got_addr: u64 = 0;
 let mut static_link: bool = false;
 let mut plt_addr: u64 = 0;
+
+/// The link's further inputs (set before link): archive members that may
+/// be taken (each an object whose name says where it is from), shared
+/// libraries by path, and the directories -l looks in first (-L).
+pub let mut g_members: u.List.[*mut elf.Obj] = u.List.[*mut elf.Obj].{ data: @ptr_from_int(*mut *mut elf.Obj, 0),
+                                                                       len: 0, cap: 0 };
+pub let mut g_shlibs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+pub let mut g_search_dirs: u.List.[[]u8] = u.List.[[]u8].{ data: @ptr_from_int(*mut []u8, 0), len: 0, cap: 0 };
+/// --c-lib=axiom (the default): the compiler's C library is the program's;
+/// a foreign object's reference to the system C library's own names (those
+/// reserved to the implementation that its headers expand to) is an error
+/// (check_foreign_refs).
+pub let mut g_c_lib_axiom: bool = true;
+
+// The copy relocations: per copied symbol its global, in .bss.
+let mut copies: u.List.[u32] = u.List.[u32].{ data: @ptr_from_int(*mut u32, 0), len: 0, cap: 0 };
 
 fn is_x64() bool {
     return M == elf.EM_X86_64;
@@ -85,7 +116,12 @@ fn class_of(s: *elf.Sec) i32 {
 // Shared libraries
 // -----------------------------------------------------------------------------
 fn lib_dirs() [][]u8 {
-    if is_x64() {
+    return lib_dirs_of(M);
+}
+
+/// The system's library directories for machine m (elf.EM_*).
+pub fn lib_dirs_of(m: u32) [][]u8 {
+    if m == elf.EM_X86_64 {
         let d = u.newn.[[]u8](5);
         d[0] = "/lib/x86_64-linux-gnu";
         d[1] = "/usr/lib/x86_64-linux-gnu";
@@ -117,6 +153,9 @@ fn find_file(name: []u8) []u8 {
 // is not an ELF shared object of this machine (a linker script, say).
 fn read_lib(l: *mut Lib, path: []u8) bool {
     let d = u.read_file(path);
+    if u.isnos(l.soname) or (l.soname.len == 0) {
+        l.soname = u.basename(path);  // (DT_SONAME, if it has one, replaces it)
+    }
     if u.isnos(d) or (d.len < 64) or not u.str_eq(d[0..4], "\x7fELF") or (d[4] != 2) {
         return false;
     }
@@ -192,6 +231,12 @@ fn read_lib(l: *mut Lib, path: []u8) bool {
             let mut kind: u8 = 1;
             if (d[e + 4] & 15) == elf.T_OBJECT {
                 kind = 2;
+                l.sizes.put(name, bn.rd64(d, e + 16));
+            } else if (d[e + 4] & 15) == elf.T_TLS {
+                kind = 3;
+            }
+            if (bind == elf.B_WEAK) and (l.syms.get(name) != 0) {
+                continue;  // (a strong definition of the name is there too)
             }
             l.syms.put(name, kind);
             let vi = @truncate(usize, vs & 0x7fff);
@@ -228,6 +273,16 @@ fn is_foreign_lib(name: []u8) bool {
     return nl.is_windows_dll(name) or nl.is_apple_lib(name);
 }
 
+// The name of a symbol in its shared library: the runtime reaches some of
+// the system C library's functions as __axiom_libc_<name>, which only the
+// library defines (never the program, whose own <name> it may be).
+fn lib_name(n: []u8) []u8 {
+    if u.starts(n, "__axiom_libc_") {
+        return u.intern(n[13..]);
+    }
+    return n;
+}
+
 fn collect_symbols() void {
     nl.define_globals();
     nl.use_unavailable();
@@ -244,15 +299,17 @@ fn collect_symbols() void {
             continue;
         }
         let mut found = false;
+        let ln = lib_name(g.name);
         for i in 0..libs.len {
             let l = libs.get(i);
-            let k = l.syms.get(g.name);
+            let k = l.syms.get(ln);
             if k != 0 {
                 l.used = true;
                 found = true;
                 g.is_data = k == 2;
+                g.is_tls = k == 3;
                 g.lib = @int_cast(i32, i);
-                g.ver = l.vers.get(g.name);
+                g.ver = l.vers.get(ln);
                 break;
             }
         }
@@ -270,7 +327,7 @@ fn collect_symbols() void {
 
 fn is_dynamic(oi: usize, si: u32) bool {
     let gi = nl.global_of(oi, si);
-    return (gi >= 0) and nl.gsyms.at(@int_cast(usize, gi)).dynamic;
+    return (gi >= 0) and nl.gsyms.at(@int_cast(usize, gi)).dynamic and not nl.gsyms.at(@int_cast(usize, gi)).copy;
 }
 
 fn is_abs64(ty: u32) bool {
@@ -289,39 +346,193 @@ fn plt_stub(gi: u32) i32 {
     return g.stub;
 }
 
-// Which GOT slots, PLT stubs and dynamic relocations the relocations need.
+// Thread-local references through a GOT slot holding the thread-pointer
+// offset: the initial-exec model's, and the general-dynamic and descriptor
+// ones of a shared library's variable (relaxed to initial-exec).
+fn is_tls_got(ty: u32, dynamic: bool) bool {
+    if is_x64() {
+        return (ty == elf.R_X86_64_GOTTPOFF) or
+               (dynamic and ((ty == elf.R_X86_64_TLSGD) or (ty == elf.R_X86_64_GOTPC32_TLSDESC)));
+    }
+    return (ty == elf.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21) or (ty == elf.R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC) or
+           (dynamic and
+            ((ty == elf.R_AARCH64_TLSDESC_ADR_PAGE21) or (ty == elf.R_AARCH64_TLSDESC_LD64_LO12) or
+             (ty == elf.R_AARCH64_TLSGD_ADR_PAGE21) or (ty == elf.R_AARCH64_TLSGD_ADD_LO12_NC)));
+}
+
+// The parts of a TLS descriptor sequence that are rewritten whatever the
+// variable (the call, and AArch64's add).
+fn is_tls_aux(ty: u32) bool {
+    if is_x64() {
+        return ty == elf.R_X86_64_TLSDESC_CALL;
+    }
+    return (ty == elf.R_AARCH64_TLSDESC_ADD_LO12) or (ty == elf.R_AARCH64_TLSDESC_CALL);
+}
+
+// Thread-local references that need the variable in the executable (the
+// local-exec model, and those relaxed to it).
+fn is_tls_local(ty: u32) bool {
+    if is_x64() {
+        return (ty == elf.R_X86_64_TPOFF32) or (ty == elf.R_X86_64_TPOFF64) or (ty == elf.R_X86_64_TLSLD) or
+               (ty == elf.R_X86_64_DTPOFF32);
+    }
+    return ((ty >= elf.R_AARCH64_TLSLE_MOVW_TPREL_G2) and (ty <= elf.R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC)) or
+           (ty == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12) or (ty == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC);
+}
+
+// The calls to __tls_get_addr of the general- and local-dynamic sequences
+// (x86-64), which relaxation replaces: made R_X86_64_NONE, and the symbol a
+// weak reference (nothing calls it then). The sequences are the psABI's:
+// GD `.byte 0x66; lea x@tlsgd(%rip), %rdi; .word 0x6666; rex64; call
+// __tls_get_addr@plt` (16 bytes), LD `lea x@tlsld(%rip), %rdi; call
+// __tls_get_addr@plt` (12 bytes).
+// AArch64's traditional general-dynamic sequence likewise: `adrp x0,
+// :tlsgd:x; add x0, x0, :tlsgd_lo12:x; bl __tls_get_addr; nop`.
+fn prepare_tls(o: *mut elf.Obj) void {
+    if o.machine == elf.EM_AARCH64 {
+        for k in 0..o.secs.len {
+            let rs = o.secs.get(k).relocs.items();
+            for i in 0..rs.len {
+                if (rs[i].ty != elf.R_AARCH64_TLSGD_ADD_LO12_NC) or (i + 1 >= rs.len) {
+                    continue;
+                }
+                let n = rs[i + 1];
+                if (n.off == rs[i].off + 4) and (n.ty == elf.R_AARCH64_CALL26) and
+                   u.str_eq(o.syms.get(@as(usize, n.sym)).name, "__tls_get_addr") {
+                    rs[i + 1].ty = elf.R_AARCH64_NONE;
+                    o.syms.at(@as(usize, n.sym)).bind = elf.B_WEAK;
+                }
+            }
+        }
+        return;
+    }
+    if o.machine != elf.EM_X86_64 {
+        return;
+    }
+    for k in 0..o.secs.len {
+        let s = o.secs.get(k);
+        let rs = s.relocs.items();
+        for i in 0..rs.len {
+            let t = rs[i].ty;
+            if ((t != elf.R_X86_64_TLSGD) and (t != elf.R_X86_64_TLSLD)) or (i + 1 >= rs.len) {
+                continue;
+            }
+            let mut call_at = rs[i].off + 8;
+            if t == elf.R_X86_64_TLSLD {
+                call_at = rs[i].off + 5;
+            }
+            let n = rs[i + 1];
+            if (n.off == call_at) and
+               ((n.ty == elf.R_X86_64_PLT32) or (n.ty == elf.R_X86_64_PC32) or (n.ty == elf.R_X86_64_GOTPCRELX) or
+                (n.ty == elf.R_X86_64_REX_GOTPCRELX)) {
+                let sy = o.syms.at(@as(usize, n.sym));
+                if u.str_eq(sy.name, "__tls_get_addr") {
+                    rs[i + 1].ty = elf.R_X86_64_NONE;
+                    sy.bind = elf.B_WEAK;
+                }
+            }
+        }
+    }
+}
+
+fn is_none(ty: u32) bool {
+    return ty == 0;  // (R_X86_64_NONE, R_AARCH64_NONE)
+}
+
+// Does relocation type ty of a reference to a shared library's data object
+// need the object in the executable (a copy relocation)? Those that are
+// not through the GOT and not an absolute address in writable data.
+fn needs_copy(ty: u32) bool {
+    if is_x64() {
+        return (ty == elf.R_X86_64_PC32) or (ty == elf.R_X86_64_32) or (ty == elf.R_X86_64_32S) or
+               (ty == elf.R_X86_64_PC64);
+    }
+    return (ty == elf.R_AARCH64_ADR_PREL_PG_HI21) or (ty == elf.R_AARCH64_ADR_PREL_PG_HI21_NC) or
+           (ty == elf.R_AARCH64_ADD_ABS_LO12_NC) or
+           ((ty >= elf.R_AARCH64_LDST8_ABS_LO12_NC) and (ty <= elf.R_AARCH64_LDST128_ABS_LO12_NC)) or
+           (ty == elf.R_AARCH64_PREL32) or (ty == elf.R_AARCH64_PREL64) or (ty == elf.R_AARCH64_ABS32) or
+           (ty == elf.R_AARCH64_LD_PREL_LO19) or (ty == elf.R_AARCH64_ADR_PREL_LO21) or
+           ((ty >= elf.R_AARCH64_MOVW_UABS_G0) and (ty <= elf.R_AARCH64_MOVW_UABS_G3));
+}
+
+// A shared library's data object copied into the executable's .bss (in
+// lnk's copy section): the executable defines it, so the program and the
+// libraries use that copy (the library's initial value is copied there
+// when the program starts: the R_*_COPY relocation).
+fn copy_object(gi: u32) void {
+    let g = nl.gsyms.at(@as(usize, gi));
+    if g.copy {
+        return;
+    }
+    let l = libs.get(@int_cast(usize, g.lib));
+    let size = l.sizes.get(g.name);
+    let cs = nl.lnk.secs.get(@int_cast(usize, nl.copy_sec));
+    let mut al: u64 = 16;
+    while (al > 1) and ((size % al) != 0) {
+        al = al / 2;
+    }
+    cs.size = nl.align_up(cs.size, al);
+    let si = elf.add_sym(nl.lnk, elf.Sym.{ name: u.cat2("axiom.copy.", g.name), sec: nl.copy_sec, value: cs.size,
+                                           size: size, bind: elf.B_LOCAL, ty: elf.T_OBJECT, hidden: true });
+    cs.size += size;
+    g.copy = true;
+    g.obj = @int_cast(i32, nl.lnk_index());
+    g.sym = si;
+    copies.push(gi);
+}
+
+// Which GOT slots, PLT stubs, copies and dynamic relocations the
+// relocations need.
 fn scan_relocs() void {
     for oi in 0..nl.objs.len {
         let o = nl.objs.get(oi);
         for k in 0..o.secs.len {
             let s = o.secs.get(k);
-            if nl.sec_cls.get(oi)[k] == nl.C_DEBUG {
-                continue;  // (nl.debug_sections)
+            let cls = nl.sec_cls.get(oi)[k];
+            if (cls == nl.C_DEBUG) or (cls < 0) {
+                continue;  // (nl.debug_sections; dropped sections)
             }
             for r in s.relocs.items() {
-                if nl.is_got_reloc(is_x64(), r.ty) {
+                if is_none(r.ty) or nl.sym_dropped(oi, r.sym) {
+                    continue;
+                }
+                let dynamic = is_dynamic(oi, r.sym);
+                let gi = nl.global_of(oi, r.sym);
+                if is_tls_aux(r.ty) {
+                    continue;  // (the rest of a TLS sequence: rewritten in place)
+                }
+                if is_tls_got(r.ty, dynamic) {
+                    let mut di: u32 = 0;
+                    if dynamic {
+                        di = nl.gsyms.at(@int_cast(usize, gi)).dynidx;
+                    }
+                    _ = nl.got_slot_tls(oi, r.sym, di);
+                } else if dynamic and is_tls_local(r.ty) {
+                    nl.err(u.f2("'%s' is thread-local in a shared library; %s reaches it with the local-exec model",
+                                nl.gsyms.at(@int_cast(usize, gi)).name, nl.obj_name(oi)));
+                } else if nl.is_got_reloc(is_x64(), r.ty) {
                     _ = nl.got_slot(oi, r.sym);
-                } else if is_dynamic(oi, r.sym) {
-                    let gi = @bit_cast(u32, nl.global_of(oi, r.sym));
-                    if nl.is_call_reloc(is_x64(), r.ty) {
-                        let g = nl.gsyms.at(@as(usize, gi));
-                        if g.is_data {
-                            nl.err(u.f1("'%s' is data in a shared library; it cannot be referenced directly", g.name));
-                        }
+                } else if dynamic {
+                    let ug = @bit_cast(u32, gi);
+                    let g = nl.gsyms.at(@as(usize, ug));
+                    if nl.is_call_reloc(is_x64(), r.ty) and not g.is_data {
                         // a GOT slot for the stub to jump through
                         _ = nl.got_slot(oi, r.sym);
-                        _ = plt_stub(gi);
-                    } else if is_abs64(r.ty) {
-                        if nl.sec_cls.get(oi)[k] != nl.C_DATA {
-                            nl.err(
-                                u.f1("absolute reference to '%s' in read-only data", nl.gsyms.at(@as(usize, gi)).name));
-                        }
+                        _ = plt_stub(ug);
+                    } else if is_abs64(r.ty) and (cls == nl.C_DATA) {
                         n_abs_dyn += 1;
+                    } else if g.is_data and needs_copy(r.ty) {
+                        copy_object(ug);
+                    } else if not g.is_data and needs_copy(r.ty) {
+                        // a function's address in position-dependent code: its
+                        // PLT stub (the address the program sees)
+                        _ = nl.got_slot(oi, r.sym);
+                        _ = plt_stub(ug);
+                    } else if is_abs64(r.ty) {
+                        nl.err(u.f2("absolute reference to '%s' in read-only data (%s)", g.name, nl.obj_name(oi)));
                     } else {
-                        nl.err(
-                            u.f1(
-                                "unsupported reference to shared library symbol '%s'",
-                                nl.gsyms.at(@as(usize, gi)).name));
+                        nl.err(u.f3("unsupported reference (relocation type %s) to shared library symbol '%s' (%s)",
+                                    u.udec(@as(u64, r.ty)), g.name, nl.obj_name(oi)));
                     }
                 }
             }
@@ -365,6 +576,320 @@ struct DynRel {
     addend: i64,
 }
 
+// A symbol's size (SIZE32, SIZE64): its definition's, or its shared
+// library's.
+fn sym_size(oi: usize, si: u32) u64 {
+    let gi = nl.global_of(oi, si);
+    if gi < 0 {
+        return nl.objs.get(oi).syms.get(@as(usize, si)).size;
+    }
+    let g = nl.gsyms.at(@int_cast(usize, gi));
+    if g.obj >= 0 {
+        return nl.objs.get(@as(usize, @bit_cast(u32, g.obj))).syms.get(@as(usize, g.sym)).size;
+    }
+    if g.lib >= 0 {
+        return libs.get(@int_cast(usize, g.lib)).sizes.get(g.name);
+    }
+    return 0;
+}
+
+// The bytes at file offset fo are `want` (checks a code sequence before it
+// is rewritten).
+fn bytes_are(b: []u8, fo: u64, want: []u8) bool {
+    let f = @truncate(usize, fo);
+    if (f + want.len) > b.len {
+        return false;
+    }
+    return u.str_eq(b[f..f + want.len], want);
+}
+
+fn put_bytes(b: []mut u8, fo: u64, x: []u8) void {
+    bn.put_at(b, fo, x);
+}
+
+fn bad_sequence(oi: usize, what: []u8) void {
+    nl.err(u.f2("unsupported %s code sequence in %s", what, nl.obj_name(oi)));
+}
+
+fn check_u32(v: u64, what: []u8) void {
+    if v > 0xffff_ffff {
+        nl.err(u.f1("relocation out of range (%s)", what));
+    }
+}
+
+// x86-64 relocations (the psABI's, and its TLS relaxations to the
+// local-exec and initial-exec models). p: the place's address, fo: its
+// file offset, sa: S + A, ga: the GOT slot's address (TLS: its
+// thread-pointer offset slot).
+fn x64_apply(b: []mut u8, oi: usize, r: elf.Rel, p: u64, fo: u64, sa: u64, dynamic: bool,
+             rels: *mut u.List.[DynRel]) void {
+    let t = r.ty;
+    let a = r.addend;
+    if (t == elf.R_X86_64_PC32) or (t == elf.R_X86_64_PLT32) {
+        let v = @bit_cast(i64, sa) - @bit_cast(i64, p);
+        check32(v, "pc32");
+        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+    } else if t == elf.R_X86_64_TPOFF32 {
+        let v = tp_offset(sa);
+        check32(v, "tpoff32");
+        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+    } else if t == elf.R_X86_64_32 {
+        check_u32(sa, "32");
+        bn.w32(b, fo, sa & 0xFFFF_FFFF);
+    } else if t == elf.R_X86_64_32S {
+        check32(@bit_cast(i64, sa), "32s");
+        bn.w32(b, fo, sa & 0xFFFF_FFFF);
+    } else if t == elf.R_X86_64_PC64 {
+        bn.w64(b, fo, sa -% p);
+    } else if (t == elf.R_X86_64_16) or (t == elf.R_X86_64_PC16) {
+        let mut v = sa;
+        if t == elf.R_X86_64_PC16 {
+            v = sa -% p;
+        }
+        bn.w16(b, fo, v & 0xffff);
+    } else if (t == elf.R_X86_64_8) or (t == elf.R_X86_64_PC8) {
+        let mut v = sa;
+        if t == elf.R_X86_64_PC8 {
+            v = sa -% p;
+        }
+        b[@truncate(usize, fo)] = @truncate(u8, v);
+    } else if t == elf.R_X86_64_GOTOFF64 {
+        bn.w64(b, fo, sa -% got_addr);
+    } else if t == elf.R_X86_64_GOTPC32 {
+        let v = @bit_cast(i64, got_addr +% @bit_cast(u64, a)) - @bit_cast(i64, p);
+        check32(v, "gotpc32");
+        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+    } else if t == elf.R_X86_64_GOTPC64 {
+        bn.w64(b, fo, (got_addr +% @bit_cast(u64, a)) -% p);
+    } else if (t == elf.R_X86_64_SIZE32) or (t == elf.R_X86_64_SIZE64) {
+        let z = sym_size(oi, r.sym) +% @bit_cast(u64, a);
+        if t == elf.R_X86_64_SIZE32 {
+            bn.w32(b, fo, z & 0xFFFF_FFFF);
+        } else {
+            bn.w64(b, fo, z);
+        }
+    } else if t == elf.R_X86_64_TPOFF64 {
+        bn.w64(b, fo, @bit_cast(u64, tp_offset(sa)));
+    } else if t == elf.R_X86_64_DTPOFF32 {
+        // (after the local-dynamic sequence's relaxation the base is the
+        // thread pointer: the offset from it)
+        let v = tp_offset(sa);
+        check32(v, "dtpoff32");
+        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+    } else if t == elf.R_X86_64_DTPOFF64 {
+        bn.w64(b, fo, @bit_cast(u64, tp_offset(sa)));
+    } else if t == elf.R_X86_64_GOTTPOFF {
+        let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+        let v = @bit_cast(i64, ga +% @bit_cast(u64, a)) - @bit_cast(i64, p);
+        check32(v, "gottpoff");
+        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+    } else if t == elf.R_X86_64_TLSGD {
+        let seq = fo - 4;
+        if (fo < 4) or not bytes_are(b, seq, "\x66\x48\x8d\x3d") or not bytes_are(b, seq + 8, "\x66\x66\x48\xe8") {
+            bad_sequence(oi, "general-dynamic TLS");
+            return;
+        }
+        if dynamic {
+            // initial-exec: mov %fs:0, %rax; add x@gottpoff(%rip), %rax
+            put_bytes(b, seq, "\x64\x48\x8b\x04\x25\x00\x00\x00\x00\x48\x03\x05");
+            let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+            let v = @bit_cast(i64, ga) - @bit_cast(i64, p - 4 + 16);
+            check32(v, "gottpoff");
+            bn.w32(b, seq + 12, @bit_cast(u64, v) & 0xFFFF_FFFF);
+        } else {
+            // local-exec: mov %fs:0, %rax; lea x@tpoff(%rax), %rax
+            put_bytes(b, seq, "\x64\x48\x8b\x04\x25\x00\x00\x00\x00\x48\x8d\x80");
+            let v = tp_offset(sa -% @bit_cast(u64, a));  // (the addend is the pc-relative one)
+            check32(v, "tpoff32");
+            bn.w32(b, seq + 12, @bit_cast(u64, v) & 0xFFFF_FFFF);
+        }
+    } else if t == elf.R_X86_64_TLSLD {
+        let seq = fo - 3;
+        if (fo < 3) or not bytes_are(b, seq, "\x48\x8d\x3d") or not bytes_are(b, fo + 4, "\xe8") {
+            bad_sequence(oi, "local-dynamic TLS");
+            return;
+        }
+        // data16 data16 data16 mov %fs:0, %rax
+        put_bytes(b, seq, "\x66\x66\x66\x64\x48\x8b\x04\x25\x00\x00\x00\x00");
+    } else if t == elf.R_X86_64_GOTPC32_TLSDESC {
+        // lea x@tlsdesc(%rip), %reg
+        let rex = b[@truncate(usize, fo - 3)];
+        let modrm = b[@truncate(usize, fo - 1)];
+        if (fo < 3) or ((rex & 0xfb) != 0x48) or (b[@truncate(usize, fo - 2)] != 0x8d) or ((modrm & 0xc7) != 0x05) {
+            bad_sequence(oi, "TLS descriptor");
+            return;
+        }
+        if dynamic {
+            // initial-exec: mov x@gottpoff(%rip), %reg
+            b[@truncate(usize, fo - 2)] = 0x8b;
+            let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+            let v = @bit_cast(i64, ga +% @bit_cast(u64, a)) - @bit_cast(i64, p);
+            check32(v, "gottpoff");
+            bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+        } else {
+            // local-exec: mov $x@tpoff, %reg (REX.R becomes REX.B)
+            b[@truncate(usize, fo - 3)] = 0x48 | ((rex & 4) >> 2);
+            b[@truncate(usize, fo - 2)] = 0xc7;
+            b[@truncate(usize, fo - 1)] = 0xc0 | ((modrm >> 3) & 7);
+            let v = tp_offset(sa -% @bit_cast(u64, a));
+            check32(v, "tpoff32");
+            bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
+        }
+    } else if t == elf.R_X86_64_TLSDESC_CALL {
+        if not bytes_are(b, fo, "\xff\x10") {
+            bad_sequence(oi, "TLS descriptor call");
+            return;
+        }
+        put_bytes(b, fo, "\x66\x90");  // xchg %ax, %ax
+    } else {
+        nl.err(u.f2("unsupported relocation type %s (%s)", u.udec(@as(u64, t)), nl.obj_name(oi)));
+    }
+    _ = rels;
+}
+
+fn ins(b: []u8, fo: u64) u64 {
+    return bn.rd32(b, @truncate(usize, fo));
+}
+
+// AArch64 relocations beyond nl.a64_reloc's (AAPCS64's ELF supplement),
+// with its TLS relaxations to the local-exec and initial-exec models.
+fn a64_apply(b: []mut u8, oi: usize, r: elf.Rel, p: u64, fo: u64, sa: u64, dynamic: bool) void {
+    let t = r.ty;
+    if nl.a64_reloc(b, fo, p, t, sa) {
+        return;
+    }
+    if t == elf.R_AARCH64_ABS32 {
+        check_u32(sa, "abs32");  // (or a negative value that fits)
+        bn.w32(b, fo, sa & 0xFFFF_FFFF);
+    } else if t == elf.R_AARCH64_ABS16 {
+        bn.w16(b, fo, sa & 0xffff);
+    } else if t == elf.R_AARCH64_PREL64 {
+        bn.w64(b, fo, sa -% p);
+    } else if t == elf.R_AARCH64_PREL16 {
+        bn.w16(b, fo, (sa -% p) & 0xffff);
+    } else if (t >= elf.R_AARCH64_MOVW_UABS_G0) and (t <= elf.R_AARCH64_MOVW_UABS_G3) {
+        let g = (t - elf.R_AARCH64_MOVW_UABS_G0) / 2;  // G0, G0_NC: 0; G1, G1_NC: 1; ...
+        let imm = (sa >> (@as(u64, g) * 16)) & 0xffff;
+        bn.w32(b, fo, (ins(b, fo) & 0xffe0_001f) | (imm << 5));
+    } else if (t == elf.R_AARCH64_LD_PREL_LO19) or (t == elf.R_AARCH64_CONDBR19) {
+        let d = @bit_cast(i64, sa -% p);
+        if (d < -0x10_0000) or (d >= 0x10_0000) {
+            nl.err("relocation out of range (19-bit)");
+        }
+        bn.w32(b, fo, (ins(b, fo) & 0xff00_001f) | (((@bit_cast(u64, d) >> 2) & 0x7_ffff) << 5));
+    } else if t == elf.R_AARCH64_TSTBR14 {
+        let d = @bit_cast(i64, sa -% p);
+        if (d < -0x8000) or (d >= 0x8000) {
+            nl.err("relocation out of range (tstbr14)");
+        }
+        bn.w32(b, fo, (ins(b, fo) & 0xfff8_001f) | (((@bit_cast(u64, d) >> 2) & 0x3fff) << 5));
+    } else if t == elf.R_AARCH64_ADR_PREL_LO21 {
+        let d = @bit_cast(i64, sa -% p);
+        if (d < -0x10_0000) or (d >= 0x10_0000) {
+            nl.err("relocation out of range (adr)");
+        }
+        let v = @bit_cast(u64, d) & 0x1f_ffff;
+        bn.w32(b, fo, (ins(b, fo) & 0x9f00_001f) | ((v & 3) << 29) | ((v >> 2) << 5));
+    } else if t == elf.R_AARCH64_ADR_PREL_PG_HI21_NC {
+        let pages = (@bit_cast(i64, sa & ~@as(u64, 0xfff)) - @bit_cast(i64, p & ~@as(u64, 0xfff))) >> 12;
+        let v = @bit_cast(u64, pages) & 0x1f_ffff;
+        bn.w32(b, fo, (ins(b, fo) & 0x9f00_001f) | ((v & 3) << 29) | ((v >> 2) << 5));
+    } else if (t >= elf.R_AARCH64_TLSLE_MOVW_TPREL_G2) and (t <= elf.R_AARCH64_TLSLE_MOVW_TPREL_G0_NC) {
+        let v = @bit_cast(u64, tp_offset(sa));
+        let mut g: u64 = 0;
+        if t == elf.R_AARCH64_TLSLE_MOVW_TPREL_G2 {
+            g = 2;
+        } else if t <= elf.R_AARCH64_TLSLE_MOVW_TPREL_G1_NC {
+            g = 1;
+        }
+        bn.w32(b, fo, (ins(b, fo) & 0xffe0_001f) | (((v >> (g * 16)) & 0xffff) << 5));
+    } else if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12) {
+        let v = tp_offset(sa);
+        if (v < 0) or (v >= 0x100_0000) {
+            nl.err("TLS offset out of range");
+        }
+        nl.a64_imm12(b, fo, @bit_cast(u64, v) >> 12);
+    } else if (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12) or (t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC) {
+        nl.a64_imm12(b, fo, @bit_cast(u64, tp_offset(sa)) & 0xfff);
+    } else if ((t >= elf.R_AARCH64_TLSLE_LDST8_TPREL_LO12) and (t <= elf.R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC)) or
+              (t == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12) or (t == elf.R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC) {
+        let mut scale: u64 = 4;
+        if t <= elf.R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC {
+            scale = @as(u64, (t - elf.R_AARCH64_TLSLE_LDST8_TPREL_LO12) / 2);
+        }
+        nl.a64_imm12(b, fo, (@bit_cast(u64, tp_offset(sa)) & 0xfff) >> scale);
+    } else if (t == elf.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21) or (t == elf.R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC) {
+        let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+        if t == elf.R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 {
+            nl.a64_adrp(b, fo, p, ga);
+        } else {
+            nl.a64_imm12(b, fo, (ga & 0xfff) >> 3);
+        }
+    } else if (t == elf.R_AARCH64_TLSDESC_ADR_PAGE21) or (t == elf.R_AARCH64_TLSDESC_LD64_LO12) {
+        // the descriptor sequence: adrp x0; ldr x1, [x0]; add x0, x0; blr x1
+        if dynamic {
+            // initial-exec: adrp x0, slot; ldr x0, [x0, :lo12:slot]
+            let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+            if t == elf.R_AARCH64_TLSDESC_ADR_PAGE21 {
+                bn.w32(b, fo, 0x9000_0000);
+                nl.a64_adrp(b, fo, p, ga);
+            } else {
+                bn.w32(b, fo, 0xf940_0000 | (((ga & 0xfff) >> 3) << 10));
+            }
+            return;
+        }
+        // local-exec: movz x0, #:tprel_g1:x, lsl #16; movk x0, #:tprel_g0_nc:x
+        let v = tp_offset(sa);
+        if (v < 0) or (v > 0xffff_ffff) {
+            nl.err("TLS offset out of range");
+        }
+        let uv = @bit_cast(u64, v);
+        if t == elf.R_AARCH64_TLSDESC_ADR_PAGE21 {
+            bn.w32(b, fo, 0xd2a0_0000 | (((uv >> 16) & 0xffff) << 5));
+        } else {
+            bn.w32(b, fo, 0xf280_0000 | ((uv & 0xffff) << 5));
+        }
+    } else if (t == elf.R_AARCH64_TLSDESC_ADD_LO12) or (t == elf.R_AARCH64_TLSDESC_CALL) {
+        bn.w32(b, fo, 0xd503_201f);  // nop
+    } else if (t == elf.R_AARCH64_TLSGD_ADR_PAGE21) or (t == elf.R_AARCH64_TLSGD_ADD_LO12_NC) {
+        // the traditional general-dynamic sequence (prepare_tls): to
+        // local-exec `movz x0, #:tprel_g1:x, lsl #16; movk x0,
+        // #:tprel_g0_nc:x; mrs x1, tpidr_el0; add x0, x1, x0`, or for a
+        // shared library's variable initial-exec `adrp x0, slot; ldr x0,
+        // [x0, :lo12:slot]; mrs x1, tpidr_el0; add x0, x1, x0`
+        if t == elf.R_AARCH64_TLSGD_ADD_LO12_NC {
+            if ins(b, fo + 8) != 0xd503_201f {
+                bad_sequence(oi, "general-dynamic TLS");
+                return;
+            }
+            bn.w32(b, fo + 4, 0xd53b_d041);
+            bn.w32(b, fo + 8, 0x8b00_0020);
+        }
+        if dynamic {
+            let ga = got_addr + (@as(u64, @bit_cast(u32, nl.got_slot_tls(oi, r.sym, 0))) * 8);
+            if t == elf.R_AARCH64_TLSGD_ADR_PAGE21 {
+                bn.w32(b, fo, 0x9000_0000);
+                nl.a64_adrp(b, fo, p, ga);
+            } else {
+                bn.w32(b, fo, 0xf940_0000 | (((ga & 0xfff) >> 3) << 10));
+            }
+            return;
+        }
+        let v = tp_offset(sa);
+        if (v < 0) or (v > 0xffff_ffff) {
+            nl.err("TLS offset out of range");
+        }
+        let uv = @bit_cast(u64, v);
+        if t == elf.R_AARCH64_TLSGD_ADR_PAGE21 {
+            bn.w32(b, fo, 0xd2a0_0000 | (((uv >> 16) & 0xffff) << 5));
+        } else {
+            bn.w32(b, fo, 0xf280_0000 | ((uv & 0xffff) << 5));
+        }
+    } else {
+        nl.err(u.f2("unsupported relocation type %s (%s)", u.udec(@as(u64, t)), nl.obj_name(oi)));
+    }
+}
+
 fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
     for oi in 0..nl.objs.len {
         let o = nl.objs.get(oi);
@@ -372,20 +897,28 @@ fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
             let s = o.secs.get(k);
             let base = nl.sec_addr.get(oi)[k];
             let cls = nl.sec_cls.get(oi)[k];
-            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) {
+            if (cls == nl.C_BSS) or (cls == nl.C_TBSS) or (cls == nl.C_DEBUG) or (cls < 0) {
                 continue;
             }
             for r in s.relocs.items() {
+                if is_none(r.ty) or nl.sym_dropped(oi, r.sym) {
+                    continue;
+                }
                 let p = base + r.off;
                 let fo = file_of(p);
                 let dynamic = is_dynamic(oi, r.sym);
                 let mut sv = nl.sym_addr(oi, r.sym);
-                if dynamic and nl.is_call_reloc(is_x64(), r.ty) {
-                    let gi = @bit_cast(u32, nl.global_of(oi, r.sym));
-                    sv = plt_addr + (@as(u64, @bit_cast(u32, nl.gsyms.at(@as(usize, gi)).stub)) * 16);
+                let gi = nl.global_of(oi, r.sym);
+                if dynamic and (nl.gsyms.at(@int_cast(usize, gi)).stub >= 0) and
+                   (nl.is_call_reloc(is_x64(), r.ty) or needs_copy(r.ty)) {
+                    sv = plt_addr + (@as(u64, @bit_cast(u32, nl.gsyms.at(@int_cast(usize, gi)).stub)) * 16);
                 }
                 let a = r.addend;
                 let t = r.ty;
+                if is_tls_got(t, dynamic) and not is_x64() {
+                    a64_apply(b, oi, r, p, fo, sv +% @bit_cast(u64, a), dynamic);
+                    continue;
+                }
                 if nl.is_got_reloc(is_x64(), t) {
                     let slot = nl.got_slot(oi, r.sym);
                     let ga = got_addr + (@as(u64, @bit_cast(u32, slot)) * 8);
@@ -408,8 +941,7 @@ fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
                 let sa = sv +% @bit_cast(u64, a);
                 if is_abs64(t) {
                     if dynamic {
-                        let gi = @bit_cast(u32, nl.global_of(oi, r.sym));
-                        let di = @as(u64, nl.gsyms.at(@as(usize, gi)).dynidx);
+                        let di = @as(u64, nl.gsyms.at(@int_cast(usize, gi)).dynidx);
                         let mut rt = @as(u64, elf.R_AARCH64_ABS64);
                         if is_x64() {
                             rt = @as(u64, elf.R_X86_64_64);
@@ -422,34 +954,9 @@ fn apply_relocs(b: []mut u8, rels: *mut u.List.[DynRel]) void {
                     continue;
                 }
                 if is_x64() {
-                    if (t == elf.R_X86_64_PC32) or (t == elf.R_X86_64_PLT32) {
-                        let v = @bit_cast(i64, sa) - @bit_cast(i64, p);
-                        check32(v, "pc32");
-                        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
-                    } else if t == elf.R_X86_64_TPOFF32 {
-                        let v = tp_offset(sa);
-                        check32(v, "tpoff32");
-                        bn.w32(b, fo, @bit_cast(u64, v) & 0xFFFF_FFFF);
-                    } else if (t == elf.R_X86_64_32) or (t == elf.R_X86_64_32S) {
-                        bn.w32(b, fo, sa & 0xFFFF_FFFF);
-                    } else {
-                        nl.err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
-                    }
-                    continue;
-                }
-                if nl.a64_reloc(b, fo, p, t, sa) {
-                    continue;
-                }
-                if t == elf.R_AARCH64_TLSLE_ADD_TPREL_HI12 {
-                    let v = tp_offset(sa);
-                    if (v < 0) or (v >= 0x100_0000) {
-                        nl.err("TLS offset out of range");
-                    }
-                    nl.a64_imm12(b, fo, @bit_cast(u64, v) >> 12);
-                } else if t == elf.R_AARCH64_TLSLE_ADD_TPREL_LO12_NC {
-                    nl.a64_imm12(b, fo, @bit_cast(u64, tp_offset(sa)) & 0xfff);
+                    x64_apply(b, oi, r, p, fo, sa, dynamic, rels);
                 } else {
-                    nl.err(u.f1("unsupported relocation type %s", u.udec(@as(u64, t))));
+                    a64_apply(b, oi, r, p, fo, sa, dynamic);
                 }
             }
         }
@@ -584,7 +1091,7 @@ fn needs_nothing(lib_names: [][]u8) bool {
         let o = nl.objs.get(oi);
         for si in 0..o.syms.len {
             let sy = o.syms.get(si);
-            if (sy.sec >= 0) and (sy.bind != elf.B_LOCAL) and (sy.name.len > 0) {
+            if (sy.sec != -1) and (sy.bind != elf.B_LOCAL) and (sy.name.len > 0) {
                 defined.put(u.intern(sy.name), 1);
             }
         }
@@ -593,12 +1100,15 @@ fn needs_nothing(lib_names: [][]u8) bool {
         let o = nl.objs.get(oi);
         for si in 0..o.syms.len {
             let sy = o.syms.get(si);
-            if (sy.sec >= 0) or (sy.bind != elf.B_GLOBAL) or (sy.name.len == 0) {
+            if (sy.sec != -1) or (sy.bind != elf.B_GLOBAL) or (sy.name.len == 0) {
                 continue;
             }
             let k = u.intern(sy.name);
             if not defined.has(k) and not lstub.provides(k, M) and not lstub.libc_only(k) and
                not nl.is_foreign(sy.name) {
+                if not u.isnos(u.env("AXIOM_LINK_DEBUG")) {
+                    u.eprint(u.f2("dynamic: %s (%s)\n", k, nl.obj_name(oi)));
+                }
                 return false;
             }
         }
@@ -610,8 +1120,99 @@ fn needs_nothing(lib_names: [][]u8) bool {
 // links with the system toolchain.
 pub const LINK_FALLBACK: i32 = 2;
 
+/// Where -l<name> is: lib<name>.so (a shared object, or a linker script),
+/// else lib<name>.a, in the directories `dirs` (-L) and then the system's
+/// for machine m; "" if nowhere.
+pub fn find_library(name: []u8, dirs: [][]u8, m: u32) []u8 {
+    for pass in @as(i32, 0)..2 {
+        let mut ds = dirs;
+        if pass == 1 {
+            ds = lib_dirs_of(m);
+        }
+        for dir in ds {
+            for ext in [".so", ".a"] {
+                let p = u.f3("%s/lib%s%s", dir, name, ext);
+                if u.file_exists(p) {
+                    return p;
+                }
+            }
+        }
+    }
+    return "";
+}
+
+/// The files a linker script names (INPUT and GROUP, with AS_NEEDED's
+/// libraries among them; -l<name> entries found with find_library), or an
+/// empty list if d is not one. A script's other commands are not
+/// supported: they are an error (reported, *ok false).
+pub fn script_inputs(d: []u8, dirs: [][]u8, m: u32, ok: *mut bool) u.List.[[]u8] {
+    let mut out = u.List.[[]u8].empty();
+    ok.* = true;
+    let mut i: usize = 0;
+    let mut depth: i32 = 0;
+    let mut cmd: []u8 = "";
+    while i < d.len {
+        let c = d[i];
+        if (c == '/') and (i + 1 < d.len) and (d[i + 1] == '*') {
+            // a comment
+            i += 2;
+            while (i + 1 < d.len) and not ((d[i] == '*') and (d[i + 1] == '/')) {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == ' ') or (c == '\t') or (c == '\n') or (c == '\r') or (c == ',') {
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while (j < d.len) and (d[j] != ' ') and (d[j] != '\t') and (d[j] != '\n') and (d[j] != '\r') and
+              (d[j] != '(') and (d[j] != ')') and (d[j] != ',') {
+            j += 1;
+        }
+        let w = d[i..j];
+        i = j;
+        if depth == 0 {
+            cmd = w;
+            if not u.str_eq(w, "INPUT") and not u.str_eq(w, "GROUP") and not u.str_eq(w, "OUTPUT_FORMAT") {
+                nl.err(u.f1("unsupported linker script command '%s'", w));
+                ok.* = false;
+                return out;
+            }
+            continue;
+        }
+        if u.str_eq(cmd, "OUTPUT_FORMAT") or u.str_eq(w, "AS_NEEDED") {
+            continue;
+        }
+        if u.starts(w, "-l") {
+            let p = find_library(w[2..], dirs, m);
+            if u.isnos(p) or (p.len == 0) {
+                nl.err(u.f1("cannot find library '%s' (named by a linker script)", w[2..]));
+                ok.* = false;
+            } else {
+                out.push(p);
+            }
+            continue;
+        }
+        out.push(u.dup(w));
+    }
+    return out;
+}
+
 // The C library (unless the link is static), then the libraries the
-// program names. 0, 1 (errors) or LINK_FALLBACK, as link() returns.
+// program names, and the shared libraries given by path (g_shlibs). 0, 1
+// (errors) or LINK_FALLBACK, as link() returns.
 fn load_libs(lib_names: [][]u8) i32 {
     if not static_link {
         let libc = add_lib("libc.so.6", "libc.so.6");
@@ -621,35 +1222,229 @@ fn load_libs(lib_names: [][]u8) i32 {
             return 1;
         }
         libc.used = true;
+        // the dynamic linker's own (__tls_get_addr; on AArch64 the stack
+        // guard, __stack_chk_guard), needed only if used
+        let ld = u.pick(is_x64(), "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1");
+        if not u.isnos(find_file(ld)) {
+            _ = add_lib(ld, ld);
+        }
     }
     for name in lib_names {
         if is_libc_part(name) or is_foreign_lib(name) {
             continue;
         }
-        let file = u.f1("lib%s.so", name);
-        let p = find_file(file);
-        if u.isnos(p) {
+        let p = find_library(name, g_search_dirs.items(), M);
+        if u.isnos(p) or (p.len == 0) {
             nl.err(u.f1("cannot find library '%s'", name));
             continue;
         }
-        let l = u.new.[Lib]();
-        l.soname = file;
-        if not read_lib(l, p) {
-            return LINK_FALLBACK;
+        if u.ends(p, ".a") {
+            continue;  // (its members are in g_members: the driver read it)
         }
-        l.used = true;
-        libs.push(l);
+        let rc = load_shlib(p, 0);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    for p in g_shlibs.items() {
+        let rc = load_shlib(p, 0);
+        if rc != 0 {
+            return rc;
+        }
     }
     return 0;
 }
 
+// A shared library by path (a linker script's files in turn). The system's
+// C library is loaded already (libc.so.6, libm.so.6).
+fn load_shlib(p: []u8, depth: i32) i32 {
+    let base = u.basename(p);
+    if u.starts(base, "libc.so") or u.starts(base, "libm.so") or u.starts(base, "ld-linux") {
+        return 0;
+    }
+    for i in 0..libs.len {
+        if u.str_eq(libs.get(i).soname, base) {
+            return 0;
+        }
+    }
+    let l = u.new.[Lib]();
+    if read_lib(l, p) {
+        l.used = true;
+        libs.push(l);
+        return 0;
+    }
+    let d = u.read_file(p);
+    let mut ok = true;
+    let files = script_inputs(d, g_search_dirs.items(), M, &mut ok);
+    if not ok or (files.len == 0) or (depth > 4) {
+        nl.err(u.f1("'%s' is not a shared library of this machine", p));
+        return 1;
+    }
+    for f in files.items() {
+        if u.ends(f, ".a") {
+            continue;  // (the driver read the archives a script names)
+        }
+        let rc = load_shlib(f, depth + 1);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    return 0;
+}
+
+// The archive members (g_members) the link takes (ar.select), after `inputs`.
+fn with_members(inputs: []*mut elf.Obj) u.List.[*mut elf.Obj] {
+    let mut all = u.List.[*mut elf.Obj].empty();
+    for o in inputs {
+        all.push(o);
+    }
+    if g_members.len == 0 {
+        return all;
+    }
+    let mut undefined = u.List.[[]u8].empty();
+    let mut defined = u.List.[[]u8].empty();
+    for o in inputs {
+        object_names(o, &mut defined, &mut undefined);
+    }
+    let ms = u.newn.[ar.Syms](g_members.len + 1);
+    for i in 0..g_members.len {
+        let mut ds = u.List.[[]u8].empty();
+        let mut rs = u.List.[[]u8].empty();
+        object_names(g_members.get(i), &mut ds, &mut rs);
+        ms[i] = ar.Syms.{ defs: ds.items(), refs: rs.items() };
+    }
+    let take = ar.select(ms[0..g_members.len], undefined.items(), defined.items());
+    for i in 0..g_members.len {
+        if take[i] {
+            all.push(g_members.get(i));
+        }
+    }
+    return all;
+}
+
+/// The names object o defines (into *defs) and refers to strongly without
+/// defining (into *refs), for archive member selection.
+pub fn object_names(o: *elf.Obj, defs: *mut u.List.[[]u8], refs: *mut u.List.[[]u8]) void {
+    for si in 0..o.syms.len {
+        let sy = o.syms.get(si);
+        if (sy.bind == elf.B_LOCAL) or (sy.name.len == 0) {
+            continue;
+        }
+        if sy.sec != -1 {
+            if not u.starts(sy.name, ".bss.common.") {
+                defs.push(sy.name);
+            }
+        } else if sy.bind == elf.B_GLOBAL {
+            refs.push(sy.name);
+        }
+    }
+}
+
+// The reserved names (C 7.1.3: beginning with two underscores, or one and
+// an upper-case letter) a foreign object may take from the system's C
+// library when the compiler's is the program's (--c-lib=axiom): they have
+// nothing to do with its streams, errno or locale.
+let SYSTEM_OK: [8][]u8 = ["__libc_start_main", "__tls_get_addr", "__cxa_finalize", "__gmon_start__",
+                          "__libc_single_threaded", "__dso_handle", "_ITM_registerTMCloneTable",
+                          "_ITM_deregisterTMCloneTable"];
+
+// POSIX's stream functions (and the system library's extensions of them):
+// they take or give the system library's FILE, which is not the program's.
+let SYSTEM_STREAMS: [40][]u8 = ["fdopen", "fileno", "popen", "pclose", "getline", "getdelim", "open_memstream",
+                                "fmemopen", "flockfile", "funlockfile", "ftrylockfile", "getc_unlocked",
+                                "putc_unlocked", "getchar_unlocked", "putchar_unlocked", "fseeko", "ftello", "fseeko64",
+                                "ftello64", "fopen64", "freopen64", "tmpfile64", "fgetpos64", "fsetpos64", "setbuffer",
+                                "setlinebuf", "fputs_unlocked", "fwrite_unlocked", "fread_unlocked", "fflush_unlocked",
+                                "clearerr_unlocked", "feof_unlocked", "ferror_unlocked", "fileno_unlocked",
+                                "fgets_unlocked", "fputc_unlocked", "fgetc_unlocked", "fcloseall", "dprintf",
+                                "vdprintf"];
+
+// The standard's functions whose objects the system's headers lay out
+// smaller than this library does (fpos_t: 16 bytes there, 40 here;
+// mbstate_t: 8 there, 24 here): this library's would write past an object
+// that code compiled against those headers made.
+let SYSTEM_LAYOUTS: [16][]u8 = ["fgetpos", "fsetpos", "mbrlen", "mbrtowc", "wcrtomb", "mbsrtowcs", "wcsrtombs",
+                                "mbsinit", "mbrtoc16", "c16rtomb", "mbrtoc32", "c32rtomb", "mbrtoc8", "c8rtomb",
+                                "mbsnrtowcs", "wcsnrtombs"];
+
+fn in_list(name: []u8, xs: [][]u8) bool {
+    for x in xs {
+        if u.str_eq(x, name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// --c-lib=axiom: a foreign object's references that the system's C library
+// would satisfy, but that belong to its implementation of what the
+// compiler's library implements (its private names, which its headers'
+// macros and inline functions expand to, and its streams' POSIX functions):
+// linking them would give the program two C libraries. Each is an error
+// that names the object.
+fn check_foreign_refs() void {
+    if not g_c_lib_axiom {
+        return;
+    }
+    for oi in 0..nl.objs.len {
+        let o = nl.objs.get(oi);
+        if u.isnos(o.name) or (o.name.len == 0) or (o == nl.lnk) {
+            continue;  // (the compiler's own objects)
+        }
+        for si in 0..o.syms.len {
+            let sy = o.syms.get(si);
+            if (sy.sec != -1) or (sy.bind == elf.B_LOCAL) or (sy.name.len == 0) {
+                continue;
+            }
+            if in_list(sy.name, SYSTEM_LAYOUTS[..]) {
+                nl.err(u.f2("%s calls '%s', whose fpos_t or mbstate_t the system's headers lay out smaller than the program's C library (--c-lib=axiom): build with --c-lib=system",
+                            o.name, sy.name));
+                continue;
+            }
+            let gi = nl.global_of(oi, @int_cast(u32, si));
+            if gi < 0 {
+                continue;
+            }
+            let g = nl.gsyms.at(@int_cast(usize, gi));
+            if not g.dynamic or (g.lib < 0) or not is_system_c(libs.get(@int_cast(usize, g.lib)).soname) {
+                continue;
+            }
+            let n = g.name;
+            let reserved = u.starts(n, "__") or ((n.len > 1) and (n[0] == '_') and (n[1] >= 'A') and (n[1] <= 'Z'));
+            if reserved and not in_list(n, SYSTEM_OK[..]) {
+                nl.err(u.f2("%s refers to '%s', a name of the system's C library's own implementation (from its headers): with the compiler's C library (--c-lib=axiom) the program would have two; build with --c-lib=system, or compile that code without the header feature that uses it",
+                            o.name, n));
+            } else if in_list(n, SYSTEM_STREAMS[..]) {
+                nl.err(u.f2("%s calls '%s', which works on the system's C library's streams, not the program's (--c-lib=axiom): build with --c-lib=system",
+                            o.name, n));
+            }
+        }
+    }
+}
+
+fn is_system_c(soname: []u8) bool {
+    return u.starts(soname, "libc.so") or u.starts(soname, "libm.so");
+}
+
 // Links `inputs` into the executable `out`. `lib_names` are the libraries
-// the program names (-l). 0: done; 1: errors (reported); LINK_FALLBACK.
+// the program names (-l, extern blocks). 0: done; 1: errors (reported);
+// LINK_FALLBACK.
 pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) i32 {
     M = machine;
-    nl.begin(inputs);
+    libs = u.List.[*mut Lib].empty();
+    copies = u.List.[u32].empty();
+    let all = with_members(inputs);
+    for o in all.items() {
+        prepare_tls(o);
+    }
+    nl.begin(all.items());
+    _ = nl.lnk_sym("_GLOBAL_OFFSET_TABLE_");
+    _ = nl.lnk_sym("__dso_handle");
     _ = nl.extern_fns(is_foreign_lib);  // (the functions of other systems' libraries)
-    static_link = needs_nothing(lib_names);
+    if not g_c_lib_axiom {
+        jstub.g_system_jmp = true;  // (the system's setjmp and longjmp)
+    }
+    static_link = needs_nothing(lib_names) and (g_shlibs.len == 0);
     nl.objs.push(lstub.build(machine, static_link));
     nl.objs.push(elf.rets_bounds(machine));
     let loaded = load_libs(lib_names);
@@ -664,6 +1459,7 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     let mn = nl.gsym_index("main");
     nl.gsyms.at(@as(usize, mn)).weak = false;
     collect_symbols();
+    check_foreign_refs();
     if nl.gsyms.at(@as(usize, mn)).obj < 0 {
         nl.err("no 'main' function");
     }
@@ -678,6 +1474,8 @@ pub fn link(inputs: []*mut elf.Obj, machine: u32, lib_names: [][]u8, out: []u8) 
     }
     let ds = dynamic_strings();
     let ly = lay_out(&ds);
+    nl.set_abs("_GLOBAL_OFFSET_TABLE_", got_addr);
+    nl.set_abs("__dso_handle", BASE);
     let mut outb = bn.new_bytes();
     outb.zeros(@truncate(usize, segs[2].off + segs[2].filesz));
     let b = outb.view();
@@ -757,7 +1555,7 @@ fn dynamic_strings() DynStr {
     let sym_off = u.newn.[u64](dyn_syms.len + 1);
     for i in 0..dyn_syms.len {
         sym_off[i] = @as(u64, dynstr.len());
-        dynstr.put(nl.gsyms.at(@as(usize, dyn_syms.get(i))).name);
+        dynstr.put(lib_name(nl.gsyms.at(@as(usize, dyn_syms.get(i))).name));
         dynstr.u8_(0);
     }
     return DynStr.{ b: dynstr, needed: needed, lib_off: lib_off, sym_off: sym_off, vn_lib: vn_lib, vn_name: vn_name,
@@ -818,7 +1616,7 @@ fn lay_out(ds: *DynStr) Layout {
         phnum += 1;
     }
     let nsyms = @as(u64, dyn_syms.len) + 1;
-    let n_rela = @as(u64, n_abs_dyn);
+    let n_rela = @as(u64, n_abs_dyn) + @as(u64, copies.len);
     let mut n_got_dyn: u64 = 0;
     for i in 0..nl.got_dyn.len {
         if nl.got_dyn.get(i) != 0 {
@@ -873,10 +1671,12 @@ fn lay_out(ds: *DynStr) Layout {
     let mut main_tp: u64 = 0;
     if static_link {
         if is_x64() {
-            // variant II: the block ends at tp; the TCB (tp itself) follows
+            // variant II: the block ends at tp; the TCB (tp itself) follows,
+            // 64 bytes of it (code of other compilers reads the stack
+            // guard at %fs:0x28: zero, which stays as it is)
             main_tls = nl.align_up(file_end3, tls_align);
             main_tp = main_tls + nl.align_up(tls_memsz, tls_align);
-            file_end3 = main_tp + 16;
+            file_end3 = main_tp + 64;
         } else {
             // variant I: the 16-byte TCB at tp, then the block
             main_tp = nl.align_up(file_end3, @max(tls_align, 16));
@@ -926,17 +1726,34 @@ fn write_contents(b: []mut u8, ly: *Layout, lsm_got: u64) u.List.[DynRel] {
         }
     }
     let mut glob_dat = @as(u64, elf.R_AARCH64_GLOB_DAT);
+    let mut tpoff = @as(u64, elf.R_AARCH64_TLS_TPREL64);
+    let mut copy = @as(u64, elf.R_AARCH64_COPY);
     if is_x64() {
         glob_dat = @as(u64, elf.R_X86_64_GLOB_DAT);
+        tpoff = @as(u64, elf.R_X86_64_TPOFF64);
+        copy = @as(u64, elf.R_X86_64_COPY);
     }
     for i in 0..nl.got_dyn.len {
         let at = got_addr + (@as(u64, i) * 8);
         let d = nl.got_dyn.get(i);
-        if d != 0 {
+        let addr = nl.sym_addr(@as(usize, nl.got_obj.get(i)), nl.got_sym.get(i));
+        if nl.tls_got.get(i) {
+            // the variable's offset from the thread pointer
+            if d != 0 {
+                rels.push(DynRel.{ off: at, info: (@as(u64, d) << 32) | tpoff, addend: 0 });
+            } else {
+                bn.w64(b, file_of(at), @bit_cast(u64, tp_offset(addr)));
+            }
+        } else if d != 0 {
             rels.push(DynRel.{ off: at, info: (@as(u64, d) << 32) | glob_dat, addend: 0 });
         } else {
-            bn.w64(b, file_of(at), nl.sym_addr(@as(usize, nl.got_obj.get(i)), nl.got_sym.get(i)));
+            bn.w64(b, file_of(at), addr);
         }
+    }
+    for gi in copies.items() {
+        let g = nl.gsyms.at(@as(usize, gi));
+        let at = nl.sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym);
+        rels.push(DynRel.{ off: at, info: (@as(u64, g.dynidx) << 32) | copy, addend: 0 });
     }
     return rels;
 }
@@ -956,12 +1773,29 @@ fn write_dynamic_tables(b: []mut u8, ly: *Layout, ds: *DynStr, rels: *u.List.[Dy
         let mut t: u8 = elf.T_FUNC;
         if g.is_data {
             t = elf.T_OBJECT;
+        } else if g.is_tls {
+            t = elf.T_TLS;
         }
         b[@truncate(usize, e) + 4] = (bind << 4) | t;
+        if g.copy {
+            // defined here (in .bss: write_file's section 4), so that the
+            // libraries bind to the copy
+            bn.w16(b, e + 6, 4);
+            bn.w64(b, e + 8, nl.sym_addr_in(@as(usize, @bit_cast(u32, g.obj)), g.sym));
+            bn.w64(b, e + 16, libs.get(@int_cast(usize, g.lib)).sizes.get(g.name));
+        }
     }
     bn.put_at(b, ly.dynstr_off, ds.b.view());
     bn.w32(b, ly.hash_off, 1);             // nbucket
-    bn.w32(b, ly.hash_off + 4, ly.nsyms);  // nchain (the buckets and chains stay empty)
+    bn.w32(b, ly.hash_off + 4, ly.nsyms);  // nchain
+    // one bucket, whose chain is every symbol (the dynamic linker finds the
+    // copies of copy relocations there; it passes over undefined ones)
+    if ly.nsyms > 1 {
+        bn.w32(b, ly.hash_off + 8, 1);
+        for i in @as(u64, 1)..ly.nsyms - 1 {
+            bn.w32(b, ly.hash_off + 12 + (i * 4), i + 1);
+        }
+    }
     for i in 0..dyn_syms.len {
         bn.w16(b, ly.versym_off + ((@as(u64, i) + 1) * 2), @as(u64, nl.gsyms.at(@as(usize, dyn_syms.get(i))).vidx));
     }

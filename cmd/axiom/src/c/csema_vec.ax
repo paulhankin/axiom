@@ -1,0 +1,654 @@
+// =============================================================================
+// csema_vec.ax - the GNU dialects' vector types: the attribute vector_size
+// (and the vector modes of mode), the operators on vectors, their
+// conversions, subscripts and the vector builtins (__builtin_shuffle,
+// __builtin_shufflevector, __builtin_convertvector).
+//
+// A vector type (ctypes.TK_VECTOR) has `len` lanes of an arithmetic real type
+// (an integer type but _Bool and _BitInt, or a real floating type); its size
+// is the attribute's, which must be the element's size times a power of two.
+// Two vector types are one type when their element types and sizes are.
+//
+// The operators, as the GNU dialects define them:
+//   + - * /        lane by lane; % & | ^ only of integer vectors
+//   << >>          integer vectors, by a vector of as many lanes (of the same
+//                  element width) or by a scalar; a scalar shifted by a vector
+//   < > <= >= == != lane by lane, a lane -1 where it holds and 0 where not:
+//                  the result is the signed integer vector of the operands'
+//                  shape (ctypes.cmp_type)
+//   + - ~ (unary)  lane by lane (~ of integer vectors); ! is an error
+//   ?:             a vector condition chooses each lane (an extension of the
+//                  C dialect: the other compilers have it in C++ only)
+//   ++ -- = and the compound assignments
+//   v[i]           lane i, an lvalue when v is one
+// The operands of a binary operator are two vectors of one type (integer
+// ones may differ in signedness: the first operand's type is the result's),
+// or a vector and a scalar of a real type, which is converted to the
+// element type and given to every lane (CV_SPLAT) when that loses nothing:
+// a constant whose value the element type holds exactly (an integer one in
+// the element's width, as a signed or an unsigned value), or else a scalar
+// whose type's values the element type holds (an integer no wider than an
+// integer element, or no wider than a floating element's precision; a
+// floating type of lower rank). A floating scalar never goes to an integer
+// vector. && and || of vectors are errors.
+//
+// Casts: between vector types of one size, and between a vector type and
+// an integer type of its size, the bytes reinterpreted (CV_VBITS). A vector
+// is not a scalar: it is no controlling expression, and no operand of && ||.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "cconst.ax" as cc;
+import "cldbl.ax" as cl;
+import "csema.ax" as cs;
+import "csema_expr.ax" as cx;
+import "csema_gbuiltin.ax" as gb;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+
+/// The largest vector type, in bytes (C3077 for more).
+pub const MAX_VECTOR: u64 = 4096;
+
+/// Installs the vector operators in csema_expr.ax and the builtins in csema_gbuiltin.ax.
+pub fn install() void {
+    cx.vector_expr = vector_expr;
+    gb.vec_builtin = builtin;
+}
+
+fn bad(e: *mut cast.Expr) *mut cast.Expr {
+    e.ty = cty.t_error;
+    e.lvalue = false;
+    return e;
+}
+
+fn is_err(e: *cast.Expr) bool {
+    return u.isnil(e.ty) or cty.is_error(e.ty);
+}
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+
+/// Can a vector have elements of type t (an integer type but _Bool and
+/// _BitInt, an enumeration as its integer type, a real floating type)?
+pub fn element_ok(t: *cty.CType) bool {
+    let k = t.unq.kind;
+    if (k == cty.TK_BOOL) or (k == cty.TK_BITINT) {
+        return false;
+    }
+    return cty.is_integer(t) or cty.is_floating(t);
+}
+
+/// The vector type of `size` bytes with elements of type t (the base type a
+/// vector_size attribute or vector mode applies to: its qualifiers are the
+/// vector's), or the error type (reported at sp; what names the attribute).
+pub fn vector_type(t: *mut cty.CType, size: u64, sp: u.Span, what: []u8) *mut cty.CType {
+    if cty.is_error(t) {
+        return t;
+    }
+    let mut e = cty.unqual(t);
+    if e.kind == cty.TK_ENUM {
+        e = e.tag.base;
+    }
+    if not element_ok(e) {
+        cs.err(sp, "C3077", u.f2("%s on %s: a vector's elements are of an integer or real floating type", what,
+                                 cs.tq(t)));
+        return cty.t_error;
+    }
+    let es = cty.size_of(e);
+    if (size == 0) or ((size % es) != 0) or (((size / es) & ((size / es) - 1)) != 0) {
+        cs.err(sp, "C3077", u.f3("%s: %s bytes are not a power of two times the size of %s", what, u.udec(size),
+                                 cs.tq(e)));
+        return cty.t_error;
+    }
+    if size > MAX_VECTOR {
+        cs.err(sp, "C3077", u.f2("%s: a vector of %s bytes is too large (at most 4096)", what, u.udec(size)));
+        return cty.t_error;
+    }
+    return cty.qualify(cty.vector_of(e, size), t.quals);
+}
+
+/// The type of the result of comparing vectors of type t: the signed
+/// integer vector of its shape (as many lanes, each as wide as t's).
+pub fn cmp_type(t: *mut cty.CType) *mut cty.CType {
+    let el = t.unq.elem;
+    if cty.is_integer(el) and (el.kind != cty.TK_CHAR) {
+        // (an integer element's own signed type: long long's lanes stay long long)
+        return cty.vector_of(cty.to_signed(el), cty.size_of(t));
+    }
+    let w = cty.size_of(el) * 8;
+    let mut e = cty.t_int128;
+    let cands: [5]*mut cty.CType = [cty.t_schar, cty.t_short, cty.t_int, cty.t_long, cty.t_llong];
+    for c in cands {
+        if @as(u64, @bit_cast(u32, c.bits)) == w {
+            e = c;
+            break;
+        }
+    }
+    if (w == 128) and u.isnil(e) {
+        e = cty.int128(true);
+    }
+    return cty.vector_of(e, cty.size_of(t));
+}
+
+fn is_int_vec(t: *cty.CType) bool {
+    return cty.is_vector(t) and cty.is_integer(t.unq.elem);
+}
+
+// Are vector types a and b the operands of one operation: the same type, or
+// integer vectors of one shape that differ in signedness?
+fn same_shape(a: *cty.CType, b: *cty.CType) bool {
+    if a.unq == b.unq {
+        return true;
+    }
+    return is_int_vec(a) and is_int_vec(b) and (a.unq.len == b.unq.len) and
+           (cty.size_of(a.unq.elem) == cty.size_of(b.unq.elem));
+}
+
+// -----------------------------------------------------------------------------
+// Scalars with vectors
+// -----------------------------------------------------------------------------
+
+// Can scalar s (an rvalue of a real type) be given to every lane of a vector
+// with elements of type el without losing anything? The rule above.
+fn splat_safe(s: *cast.Expr, el: *cty.CType) bool {
+    let st = s.ty;
+    let ef = cty.is_floating(el);
+    if cty.is_floating(st) and not ef {
+        return false;
+    }
+    if s.is_const and not cty.is_wint(st) and not cty.is_wide(st) {
+        if cty.is_integer(st) {
+            let neg = st.is_signed and (@bit_cast(i64, s.cval) < 0);
+            if ef {
+                let f = cc_int_as_f64(s);
+                return exactly(f, el) and fits_f64(s);
+            }
+            let w = el.unq.bits;
+            if w >= 64 {
+                return true;
+            }
+            let v = s.cval;
+            if neg {
+                return @bit_cast(i64, v) >= (0 - (@as(i64, 1) << @bit_cast(u32, w - 1)));
+            }
+            return v < (@as(u64, 1) << @bit_cast(u32, w));
+        }
+        return exactly(s.fcval, el);
+    }
+    if cty.is_integer(st) {
+        let w = cty.promote(st).bits;
+        let sw = st.unq.bits;
+        let bits = @min(w, sw);
+        if ef {
+            return bits <= precision(el);
+        }
+        return @as(u64, @bit_cast(u32, bits)) <= (cty.size_of(el) * 8);
+    }
+    // two floating types: el's values must include st's
+    return cty.float_rank(st) <= cty.float_rank(el) or (cty.ffmt(st) <= cty.ffmt(el));
+}
+
+fn cc_int_as_f64(s: *cast.Expr) f64 {
+    if s.ty.is_signed {
+        return @float_from_int(f64, @bit_cast(i64, s.cval));
+    }
+    return @float_from_int(f64, s.cval);
+}
+
+// Is the integer constant s held exactly by a double (|s| < 2^53)?
+fn fits_f64(s: *cast.Expr) bool {
+    let lim: u64 = @as(u64, 1) << 53;
+    if s.ty.is_signed and (@bit_cast(i64, s.cval) < 0) {
+        return (0 -% s.cval) <= lim;
+    }
+    return s.cval <= lim;
+}
+
+// The bits of precision of real floating type t.
+fn precision(t: *cty.CType) i32 {
+    let f = cty.ffmt(t);
+    if f == 16 {
+        return 11;
+    }
+    if f == 32 {
+        return 24;
+    }
+    if f == 64 {
+        return 53;
+    }
+    if f == 80 {
+        return 64;
+    }
+    return 113;
+}
+
+// Does real floating type t hold the double f exactly?
+fn exactly(f: f64, t: *cty.CType) bool {
+    if f != f {
+        return true;  // (a NaN is a NaN in every format)
+    }
+    let w = cty.ffmt(t);
+    if w == 32 {
+        return @as(f64, @float_cast(f32, f)) == f;
+    }
+    if w == 16 {
+        return cl.round_half(f) == f;
+    }
+    return true;  // (binary64 and wider hold every double)
+}
+
+// Scalar operand s for a vector of type vt: converted to the element type
+// and given to every lane, or nil after an error (reported).
+fn splat(s: *mut cast.Expr, vt: *mut cty.CType, op_sp: u.Span) *mut cast.Expr {
+    let el = vt.unq.elem;
+    if not cty.is_integer(s.ty) and not cty.is_floating(s.ty) {
+        cs.err(op_sp, "C3020", u.f2("a vector operand (%s) with an operand of type %s", cs.tq(vt), cs.tq(s.ty)));
+        return u.nil.[cast.Expr]();
+    }
+    if cty.is_floating(s.ty) and not cty.is_floating(el) {
+        cs.err(s.span, "C3020", u.f2("a floating value (%s) cannot be converted to the integer vector %s", cs.tq(s.ty),
+                                     cs.tq(vt)));
+        return u.nil.[cast.Expr]();
+    }
+    if not splat_safe(s, el) {
+        cs.err(s.span, "C3020", u.f2("the conversion of a scalar of type %s to the vector %s would change its value",
+                                     cs.tq(s.ty), cs.tq(vt)));
+        return u.nil.[cast.Expr]();
+    }
+    return cx.conv(cx.convert(s, el), cast.CV_SPLAT, cty.unqual(vt));
+}
+
+// Vector operand x converted to vector type t of the same shape (its bytes,
+// when the signedness differs).
+fn to_vec(x: *mut cast.Expr, t: *mut cty.CType) *mut cast.Expr {
+    if x.ty.unq == t.unq {
+        return x;
+    }
+    return cx.conv(x, cast.CV_VBITS, cty.unqual(t));
+}
+
+// -----------------------------------------------------------------------------
+// The operators
+// -----------------------------------------------------------------------------
+
+fn vector_expr(e: *mut cast.Expr, what: i32) *mut cast.Expr {
+    if what == cx.VX_BINARY {
+        return binary(e, e.op, false);
+    }
+    if what == cx.VX_ASSIGN {
+        return compound(e);
+    }
+    if what == cx.VX_UNARY {
+        return unary(e);
+    }
+    if what == cx.VX_INCDEC {
+        e.opty = cty.unqual(e.a.ty);
+        e.ty = e.opty;
+        if not cty.is_vector(e.ty) {
+            return bad(e);
+        }
+        return e;
+    }
+    if what == cx.VX_COND {
+        return conditional(e);
+    }
+    if what == cx.VX_INDEX {
+        return index(e);
+    }
+    if what == cx.VX_CAST {
+        return explicit_cast(e);
+    }
+    return convertvector(e);
+}
+
+fn op_text(op: i32) []u8 {
+    return cast.punct_text(op);
+}
+
+fn bad_ops(e: *mut cast.Expr, op: i32, why: []u8) *mut cast.Expr {
+    cs.err(e.span, "C3020", u.f4("invalid operands to binary '%s' (%s and %s)%s", op_text(op), cs.tq(e.a.ty),
+                                 cs.tq(e.b.ty), why));
+    return bad(e);
+}
+
+fn is_shift(op: i32) bool {
+    return (op == ct.P_SHL) or (op == ct.P_SHR);
+}
+
+fn int_only(op: i32) bool {
+    return (op == ct.P_PERCENT) or (op == ct.P_AMP) or (op == ct.P_PIPE) or (op == ct.P_CARET) or is_shift(op);
+}
+
+// e.a op e.b (typed rvalues, one a vector; op a binary operator's, or a
+// compound assignment's: then e.a's type is the result's and only e.b is
+// converted, `assign`).
+fn binary(e: *mut cast.Expr, op: i32, assign: bool) *mut cast.Expr {
+    let a = e.a;
+    let b = e.b;
+    let ta = a.ty;
+    let tb = b.ty;
+    if (op == ct.P_ANDAND) or (op == ct.P_OROR) {
+        cs.err(e.span, "C3020", u.f1("a vector operand of '%s' (a vector is not a scalar)", op_text(op)));
+        return bad(e);
+    }
+    let va = cty.is_vector(ta);
+    let vb = cty.is_vector(tb);
+    let mut t = ta;
+    if not va {
+        t = tb;
+    }
+    if assign and not va {
+        cs.err(e.span, "C3020", u.f3("invalid operands to '%s' (%s and %s): a vector assigned to a scalar", op_text(op),
+                                     cs.tq(ta), cs.tq(tb)));
+        return bad(e);
+    }
+    let el = t.unq.elem;
+    if int_only(op) and not cty.is_integer(el) {
+        return bad_ops(e, op, u.f1(": '%s' takes integer vectors", op_text(op)));
+    }
+    if va and vb {
+        if is_shift(op) {
+            if not is_int_vec(tb) or (ta.unq.len != tb.unq.len) or (cty.size_of(el) != cty.size_of(tb.unq.elem)) {
+                return bad_ops(e, op, ": a vector is shifted by an integer vector of its shape");
+            }
+        } else if not same_shape(ta, tb) {
+            return bad_ops(e, op, ": vectors of different types");
+        }
+        e.b = to_vec(b, ta);
+    } else if is_shift(op) {
+        // (a vector shifted by a scalar, or a scalar by a vector)
+        if va {
+            if not cty.is_integer(tb) {
+                return bad_ops(e, op, "");
+            }
+            e.b = cx.conv(cx.convert(b, el), cast.CV_SPLAT, cty.unqual(t));
+        } else {
+            let s = splat(a, t, e.span);
+            if u.isnil(s) {
+                return bad(e);
+            }
+            e.a = s;
+        }
+    } else {
+        let s = splat(pick(va, b, a), t, e.span);
+        if u.isnil(s) {
+            return bad(e);
+        }
+        if va {
+            e.b = s;
+        } else {
+            e.a = s;
+        }
+    }
+    let rt = cty.unqual(t);
+    if assign {
+        e.opty = rt;
+        e.ty = cty.unqual(e.a.ty);
+        return e;
+    }
+    if cc.is_compare(op) {
+        e.ty = cmp_type(rt);
+    } else {
+        e.ty = rt;
+    }
+    return e;
+}
+
+fn pick(c: bool, a: *mut cast.Expr, b: *mut cast.Expr) *mut cast.Expr {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+// A compound assignment with a vector operand: the left operand must be the vector.
+fn compound(e: *mut cast.Expr) *mut cast.Expr {
+    let op = cast_op(e.op);
+    if op < 0 {
+        return bad(e);
+    }
+    return binary(e, op, true);
+}
+
+// The operator of compound assignment op ('+=' is '+'), or -1.
+fn cast_op(op: i32) i32 {
+    let ops: [10]i32 = [ct.P_MUL_EQ, ct.P_DIV_EQ, ct.P_MOD_EQ, ct.P_ADD_EQ, ct.P_SUB_EQ, ct.P_SHL_EQ, ct.P_SHR_EQ,
+                        ct.P_AND_EQ, ct.P_XOR_EQ, ct.P_OR_EQ];
+    let bs: [10]i32 = [ct.P_STAR, ct.P_SLASH, ct.P_PERCENT, ct.P_PLUS, ct.P_MINUS, ct.P_SHL, ct.P_SHR, ct.P_AMP,
+                       ct.P_CARET, ct.P_PIPE];
+    for k in 0..ops.len {
+        if ops[k] == op {
+            return bs[k];
+        }
+    }
+    return -1;
+}
+
+fn unary(e: *mut cast.Expr) *mut cast.Expr {
+    let t = e.a.ty;
+    let op = e.op;
+    if op == ct.P_BANG {
+        cs.err(e.span, "C3020", u.f1("the operand of '!' has type %s, a vector (not a scalar type)", cs.tq(t)));
+        return bad(e);
+    }
+    if (op == ct.P_TILDE) and not is_int_vec(t) {
+        cs.err(e.span, "C3020", u.f1("the operand of '~' has type %s, not an integer vector", cs.tq(t)));
+        return bad(e);
+    }
+    e.ty = cty.unqual(t);
+    return e;
+}
+
+// `a ? b : c` with a vector a: each lane of the result b's where a's lane
+// is nonzero, else c's. a is an integer vector; b and c vectors of one type
+// whose shape is a's (or scalars given to every lane of the other's).
+fn conditional(e: *mut cast.Expr) *mut cast.Expr {
+    let ta = e.a.ty;
+    if not is_int_vec(ta) {
+        cs.err(e.a.span, "C3020", u.f1("the condition of '?:' is a vector (%s) that is no integer vector", cs.tq(ta)));
+        return bad(e);
+    }
+    let vb = cty.is_vector(e.b.ty);
+    let vc = cty.is_vector(e.c.ty);
+    if not vb and not vc {
+        cs.err(e.span, "C3020", "a vector condition of '?:' with operands that are not vectors");
+        return bad(e);
+    }
+    let mut t = e.b.ty;
+    if not vb {
+        t = e.c.ty;
+    }
+    if vb and vc {
+        if e.b.ty.unq != e.c.ty.unq {
+            cs.err(e.span, "C3020", u.f2("the operands of '?:' are vectors of different types (%s and %s)",
+                                         cs.tq(e.b.ty), cs.tq(e.c.ty)));
+            return bad(e);
+        }
+    } else if vb {
+        e.c = splat(e.c, t, e.span);
+    } else {
+        e.b = splat(e.b, t, e.span);
+    }
+    if u.isnil(e.b) or u.isnil(e.c) {
+        e.b = u.nil.[cast.Expr]();
+        return bad(e);
+    }
+    if (t.unq.len != ta.unq.len) or (cty.size_of(t.unq.elem) != cty.size_of(ta.unq.elem)) {
+        cs.err(e.span, "C3020", u.f2("the vector condition of '?:' (%s) has not the shape of its operands (%s)",
+                                     cs.tq(ta), cs.tq(t)));
+        return bad(e);
+    }
+    e.ty = cty.unqual(t);
+    return e;
+}
+
+// v[i]: lane i of vector v (an lvalue when v is one), of v's element type
+// with v's qualifiers.
+fn index(e: *mut cast.Expr) *mut cast.Expr {
+    let v = e.a;
+    let i = cx.rv(e.b);
+    e.b = i;
+    if is_err(i) {
+        return bad(e);
+    }
+    if not cty.is_integer(i.ty) {
+        cs.err(e.span, "C3020", u.f2("subscript of %s by %s (an integer is needed)", cs.tq(v.ty), cs.tq(i.ty)));
+        return bad(e);
+    }
+    if cty.promote(i.ty).is_signed {
+        e.b = cx.convert(i, cty.t_ptrdiff);
+    } else {
+        e.b = cx.convert(i, cty.t_size);
+    }
+    e.ty = cty.qualify(v.ty.unq.elem, v.ty.quals);
+    e.lvalue = v.lvalue;
+    if not v.lvalue {
+        // (an rvalue's lane: its value, not an object)
+        e.ty = cty.unqual(e.ty);
+    }
+    return e;
+}
+
+// A cast (e.ty, from e.a) to or from a vector type.
+fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
+    let t = e.ty;
+    let s = e.a.ty;
+    let n = cty.size_of(t);
+    let ok = ((cty.is_vector(t) and (cty.is_vector(s) or cty.is_integer(s))) or
+              (cty.is_vector(s) and cty.is_integer(t))) and (n == cty.size_of(s)) and (t.kind != cty.TK_BOOL);
+    if not ok {
+        cs.err(e.span, "C3028",
+               u.f2("a cast from %s to %s (a vector converts only to a vector or an integer of its size)", cs.tq(s),
+                    cs.tq(t)));
+        return bad(e);
+    }
+    e.op = cast.CV_VBITS;
+    return e;
+}
+
+// __builtin_convertvector(v, T): each lane of v converted to the element
+// type of vector type T, which has as many lanes.
+fn convertvector(e: *mut cast.Expr) *mut cast.Expr {
+    let v = cx.rv(e.a);
+    e.a = v;
+    let t = cs.hooks.type_name(e.tname);
+    if is_err(v) or cty.is_error(t) {
+        return bad(e);
+    }
+    if not cty.is_vector(v.ty) or not cty.is_vector(t) or (v.ty.unq.len != t.unq.len) {
+        cs.err(e.span, "C3082", u.f2("__builtin_convertvector of %s to %s (vectors of as many elements)", cs.tq(v.ty),
+                                     cs.tq(t)));
+        return bad(e);
+    }
+    e.ty = cty.unqual(t);
+    return e;
+}
+
+// -----------------------------------------------------------------------------
+// The builtins
+// -----------------------------------------------------------------------------
+
+// __builtin_shuffle(a, mask) and (a, b, mask) (a GNU dialect): lane i of the
+// result is lane mask[i] of a (of a then b), the index taken modulo the
+// lanes there are (2n with b); mask an integer vector with as many lanes as a,
+// each as wide. __builtin_shufflevector(a, b, i...) (constant indices into a
+// then b, -1 for a lane of any value): a vector of as many lanes as indices,
+// a power of two, of a's element type. True if e named one (typed then).
+fn builtin(e: *mut cast.Expr, name: []u8) bool {
+    if u.str_eq(name, "__builtin_shuffle") {
+        shuffle(e);
+        return true;
+    }
+    if u.str_eq(name, "__builtin_shufflevector") {
+        shufflevector(e);
+        return true;
+    }
+    return false;
+}
+
+fn args(e: *mut cast.Expr) bool {
+    let mut ok = true;
+    for k in 0..e.args.len {
+        let x = cx.rv(e.args.get(k));
+        e.args.set(k, x);
+        if is_err(x) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+fn shuffle(e: *mut cast.Expr) void {
+    e.op = gb.GB_SHUFFLE;
+    e.ty = cty.t_error;
+    if not args(e) {
+        return;
+    }
+    let n = e.args.len;
+    if (n != 2) and (n != 3) {
+        cs.err(e.span, "C3082", "__builtin_shuffle takes (a, mask) or (a, b, mask)");
+        return;
+    }
+    let a = e.args.get(0);
+    let m = e.args.get(n - 1);
+    if not cty.is_vector(a.ty) or not is_int_vec(m.ty) or (a.ty.unq.len != m.ty.unq.len) or
+       (cty.size_of(a.ty.unq.elem) != cty.size_of(m.ty.unq.elem)) {
+        cs.err(e.span, "C3082", u.f2("__builtin_shuffle of %s by %s (a mask of integers, of the vector's shape)",
+                                     cs.tq(a.ty), cs.tq(m.ty)));
+        return;
+    }
+    if (n == 3) and (e.args.get(1).ty.unq != a.ty.unq) {
+        cs.err(e.span, "C3082", u.f2("__builtin_shuffle of vectors of different types (%s and %s)", cs.tq(a.ty),
+                                     cs.tq(e.args.get(1).ty)));
+        return;
+    }
+    e.ty = cty.unqual(a.ty);
+}
+
+fn shufflevector(e: *mut cast.Expr) void {
+    e.op = gb.GB_SHUFFLEVECTOR;
+    e.ty = cty.t_error;
+    let n = e.args.len;
+    if n < 3 {
+        cs.err(e.span, "C3082", "__builtin_shufflevector takes two vectors and the indices of the result's elements");
+        return;
+    }
+    for k in @as(usize, 0)..2 {
+        let x = cx.rv(e.args.get(k));
+        e.args.set(k, x);
+        if is_err(x) {
+            return;
+        }
+    }
+    let a = e.args.get(0);
+    let b = e.args.get(1);
+    if not cty.is_vector(a.ty) or (a.ty.unq != b.ty.unq) {
+        cs.err(e.span, "C3082", u.f2("__builtin_shufflevector of %s and %s (two vectors of one type)", cs.tq(a.ty),
+                                     cs.tq(b.ty)));
+        return;
+    }
+    let lanes = 2 * a.ty.unq.len;
+    let m = @as(u64, n - 2);
+    let mut ok = true;
+    for k in 2..n {
+        let r = cx.ice(e.args.get(k), "an index of __builtin_shufflevector");
+        e.args.set(k, r.e);
+        if not r.ok {
+            ok = false;
+        } else if (@bit_cast(i64, r.v) != -1) and (r.v >= lanes) {
+            cs.err(r.e.span, "C3082", u.f2("the index %s of __builtin_shufflevector is not one of the %s elements",
+                                           u.dec(@bit_cast(i64, r.v)), u.udec(lanes)));
+            ok = false;
+        }
+    }
+    if not ok {
+        return;
+    }
+    if (m & (m - 1)) != 0 {
+        cs.err(e.span, "C3082", u.f1("__builtin_shufflevector makes a vector of %s elements, not a power of two",
+                                     u.udec(m)));
+        return;
+    }
+    e.ty = cty.vector_of(a.ty.unq.elem, m * cty.size_of(a.ty.unq.elem));
+}

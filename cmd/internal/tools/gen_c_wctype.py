@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Generates std/c/lib/text/__axc_wctab.c, the two-stage tables of the C
+library's wide character classes and simple case mappings in a UTF-8 locale
+(docs/c-text.md, "Wide character classes"), from the standard library's
+Unicode data (std/unicode/tables.ax, which gen_unicode.py writes from the
+Unicode Character Database).
+
+    python3 cmd/internal/tools/gen_c_wctype.py
+
+A code point's classes are those std/c/rt/text.ax computes from its
+property record (general category, White_Space, Alphabetic, Uppercase,
+Lowercase), with digit and xdigit for the ASCII ones only. The tables:
+
+    __axc_wct_class[__axc_wct_cblk[c >> 7] * 128 + (c & 127)]   an index into
+    __axc_wct_cval, the class bits (axc/text.h's __AXC_W_*)
+    __axc_wct_case[__axc_wct_kblk[c >> 7] * 128 + (c & 127)]    an index into
+    __axc_wct_up and __axc_wct_lo, what towupper and towlower add to c
+
+for every code point up to U+10FFFF (blocks of 128 that are alike are kept
+once). The output is deterministic.
+"""
+import os
+import re
+
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..')
+SRC = os.path.join(ROOT, 'std', 'unicode', 'tables.ax')
+OUT = os.path.join(ROOT, 'std', 'c', 'lib', 'text', '__axc_wctab.c')
+N = 0x110000
+BLOCK = 128
+
+text = open(SRC, encoding='utf8').read()
+
+
+CONSTS = {m.group(1): int(m.group(2)) for m in re.finditer(r'pub const (\w+): u32 = (\d+);', text)}
+
+
+def const(name):
+    return CONSTS[name]
+
+
+def array(name):
+    m = re.search(r'pub let %s: \[\d+\]u\d+ = \[(.*?)\];' % name, text, re.S)
+    return [int(x) for x in re.findall(r'\d+', m.group(1))]
+
+
+RECORDS, LOW = array('RECORDS'), array('LOW')
+RUN_START, RUN_RECORD = array('RUN_START'), array('RUN_RECORD')
+LOW_LIMIT = const('LOW_LIMIT')
+
+# axc/text.h's class bits (as std/c/rt/text.ax has them)
+ALNUM, ALPHA, BLANK, CNTRL, DIGIT, GRAPH = 0x001, 0x002, 0x004, 0x008, 0x010, 0x020
+LOWER, PRINT, PUNCT, SPACE, UPPER, XDIGIT = 0x040, 0x080, 0x100, 0x200, 0x400, 0x800
+
+
+def field(r, name, width):
+    return (r >> const('F_' + name)) & ((1 << width) - 1)
+
+
+def record_classes(r):
+    gc = field(r, 'GC', const('W_GC'))
+    k = 0
+    if gc in (const('GC_CC'), const('GC_CF'), const('GC_ZL'), const('GC_ZP')):
+        k |= CNTRL
+    elif gc not in (const('GC_CN'), const('GC_CS'), const('GC_CO')):
+        k |= PRINT
+    if field(r, 'WHITE', 1):
+        k |= SPACE
+        if gc == const('GC_ZS'):
+            k |= BLANK
+    if k & (PRINT | SPACE) == PRINT:
+        k |= GRAPH
+        if field(r, 'UPPER', 1):
+            k |= UPPER
+        if field(r, 'LOWER', 1):
+            k |= LOWER
+        if k & (UPPER | LOWER) or field(r, 'ALPHA', 1):
+            k |= ALPHA | ALNUM
+        else:
+            k |= PUNCT
+    return k
+
+
+REC_CLASSES = None
+
+
+def classes_of(c):
+    if c < LOW_LIMIT:
+        i = LOW[c]
+    else:
+        lo, hi = 0, len(RUN_START)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if RUN_START[mid] <= c:
+                lo = mid
+            else:
+                hi = mid
+        i = RUN_RECORD[lo]
+    k = REC_CLASSES[i]
+    if c == 9:
+        k |= BLANK
+    if 0x30 <= c <= 0x39:
+        k = (k & ~PUNCT) | DIGIT | XDIGIT | ALNUM
+    elif 0x61 <= c <= 0x66 or 0x41 <= c <= 0x46:
+        k |= XDIGIT
+    return k
+
+
+def deltas(name_from, name_to):
+    d = [0] * N
+    for a, b in zip(array(name_from), array(name_to)):
+        d[a] = b - a
+    return d
+
+
+def two_stage(values):
+    """(the blocks' numbers, the blocks' entries) of a list of N small
+    indexes, alike blocks kept once"""
+    blocks, index = [], {}
+    first = []
+    for b in range(0, N, BLOCK):
+        key = tuple(values[b:b + BLOCK])
+        if key not in index:
+            index[key] = len(blocks)
+            blocks.append(key)
+        first.append(index[key])
+    return first, [v for blk in blocks for v in blk]
+
+
+REC_CLASSES = [record_classes(r) for r in RECORDS]
+cls = [classes_of(c) for c in range(N)]
+cval = sorted(set(cls))
+cidx = {v: i for i, v in enumerate(cval)}
+cfirst, csecond = two_stage([cidx[v] for v in cls])
+
+up, lo = deltas('UPPER_FROM', 'UPPER_TO'), deltas('LOWER_FROM', 'LOWER_TO')
+pairs = sorted(set(zip(up, lo)))
+pidx = {p: i for i, p in enumerate(pairs)}
+kfirst, ksecond = two_stage([pidx[p] for p in zip(up, lo)])
+assert len(cval) <= 256 and len(pairs) <= 256 and max(cfirst) < 65536 and max(kfirst) < 65536
+
+
+def c_array(ctype, name, values, per_line=16):
+    lines = ['const %s %s[%d] = {' % (ctype, name, len(values))]
+    for i in range(0, len(values), per_line):
+        lines.append('    ' + ', '.join(str(v) for v in values[i:i + per_line]) + ',')
+    lines.append('};')
+    return '\n'.join(lines)
+
+
+version = re.search(r'pub let VERSION: \[\]u8 = "([^"]+)"', text).group(1)
+out = ['''/* __axc_wctab - the wide character classes and simple case mappings of a
+   UTF-8 locale, in two-stage tables (Unicode %s), generated by
+   cmd/internal/tools/gen_c_wctype.py from std/unicode/tables.ax. Do not edit.
+   axc/text.h says how they are read (__axc_wclass, towupper, towlower). */
+#include <axc/text.h>
+''' % version]
+out.append(c_array('unsigned short', '__axc_wct_cval', cval))
+out.append(c_array('unsigned short' if max(cfirst) > 255 else 'unsigned char', '__axc_wct_cblk', cfirst))
+out.append(c_array('unsigned char', '__axc_wct_class', csecond, 32))
+out.append(c_array('int', '__axc_wct_up', [p[0] for p in pairs], 12))
+out.append(c_array('int', '__axc_wct_lo', [p[1] for p in pairs], 12))
+out.append(c_array('unsigned short' if max(kfirst) > 255 else 'unsigned char', '__axc_wct_kblk', kfirst))
+out.append(c_array('unsigned char', '__axc_wct_case', ksecond, 32))
+open(OUT, 'w', encoding='utf8').write('\n\n'.join(out) + '\n')
+print('%s: %d class sets, %d class blocks; %d case pairs, %d case blocks' %
+      (os.path.relpath(OUT, ROOT), len(cval), len(csecond) // BLOCK, len(pairs), len(ksecond) // BLOCK))
+print('cblk', 'u16' if max(cfirst) > 255 else 'u8', 'kblk', 'u16' if max(kfirst) > 255 else 'u8')

@@ -9,7 +9,14 @@
    character after it is the only one given back, so that a prefix that is
    not a whole matching sequence ("0x" for %x, "1e" for %f) is a matching
    failure. The result is the number of assignments, or EOF for an input
-   failure before the first conversion (7.21.6.2p16). */
+   failure before the first conversion (7.21.6.2p16).
+
+   For Annex K's functions (in->viol set, K.3.5.3.2, K.3.9.1.2): c, s and [
+   take the receiving array's number of elements after its pointer (an
+   rsize_t), and an input item that does not fit (with s's and ['s null
+   character) is a matching failure, after which the array's first element
+   is the null character; a null pointer to store through is a
+   runtime-constraint violation, described in *in->viol (EOF). */
 
 /* White space as isspace (iswspace) has it in the "C" locale */
 #define SF_SPACE(c) ((c) == ' ' || ((c) >= '\t' && (c) <= '\r'))
@@ -17,8 +24,25 @@
 int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
     const CH *p = fmt;
     int assigned = 0, convs = 0, c;
+#if SF_WIDE
 #define GET() (c = in->get(in), c >= 0 ? (in->count++, c) : c)
 #define UNGET() (c >= 0 ? (in->unget(in, c), in->count--) : 0)
+#else
+    /* (a byte stream's buffer, and a string, are read in line; the byte
+       given back to a stream's buffer is the one just read from it, so
+       stepping back over it is ungetc's effect) */
+    FILE *f = in->f;
+#define GET() \
+    (c = f != NULL && f->__rpos < f->__rend ? *f->__rpos++ \
+         : f == NULL && in->s != NULL ? (*in->s != 0 ? *in->s++ : (in->eof = 1, -1)) : in->get(in), \
+     c >= 0 ? (in->count++, c) : c)
+#define UNGET() \
+    (c >= 0 ? ((f != NULL && f->__rpos > (f->__flags & F_BACK ? f->__back : f->__buf) && f->__rpos[-1] == c) \
+                   ? (void)f->__rpos-- \
+                   : in->unget(in, c), \
+               in->count--) \
+            : 0)
+#endif
     while (*p != 0) {
         int suppress = 0, conv, lm = 0, bits = 0;
         long width = -1;
@@ -129,8 +153,13 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
         if (lm >= '1' && lm <= '3' && (conv | 0x20) != 'a' && (conv | 0x20) != 'e' && (conv | 0x20) != 'f' &&
             (conv | 0x20) != 'g')
             goto matching_failure; /* (H, D and DD take only the floating conversions) */
-        if (!suppress && conv != 'n')
+        if (!suppress && conv != 'n') {
             dst = va_arg(ap, void *);
+            if (dst == NULL && in->viol != NULL) {
+                *in->viol = "a null pointer to store converted input";
+                return EOF;
+            }
+        }
         if (conv != '[' && conv != 'c' && conv != 'n') {
             /* 7.21.6.2p8: input white space is skipped */
             while (GET() >= 0 && SF_SPACE(c))
@@ -144,6 +173,10 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
             /* the characters read so far; not an assignment (p12) */
             void *d = suppress ? NULL : va_arg(ap, void *);
             size_t v = in->count;
+            if (d == NULL && !suppress && in->viol != NULL) {
+                *in->viol = "a null pointer to store converted input";
+                return EOF;
+            }
             if (d == NULL)
                 break;
             switch (lm) {
@@ -196,7 +229,7 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
                output of %p (0x and hexadecimal digits) */
             int base = conv == 'd' || conv == 'u' ? 10 : conv == 'i' ? 0 : conv == 'o' ? 8 : conv == 'b' ? 2 : 16;
             int neg = 0, digits = 0, over = 0, sgn = conv == 'd' || conv == 'i';
-            unsigned __axiom_int64 v = 0;
+            unsigned __axiom_int64 v = 0, lim;
             long left = width;
 #define TAKE() (left < 0 || left-- > 0 ? GET() : (c = -1))
             TAKE();
@@ -226,6 +259,9 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
             } else if (base == 0) {
                 base = 10;
             }
+            /* (v * base + dv overflows only when v is past lim, or at it
+               with dv past the remainder) */
+            lim = ~(unsigned __axiom_int64)0 / (unsigned)base;
             for (;; TAKE()) {
                 int dv = c >= '0' && c <= '9' ? c - '0'
                        : c >= 'a' && c <= 'z' ? c - 'a' + 10
@@ -233,7 +269,7 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
                 if (c < 0 || dv >= base)
                     break;
                 digits = 1;
-                if (v > (~(unsigned __axiom_int64)0 - (unsigned)dv) / (unsigned)base)
+                if (v > lim || (v == lim && (unsigned)dv > ~(unsigned __axiom_int64)0 % (unsigned)base))
                     over = 1;
                 v = v * (unsigned)base + (unsigned)dv;
             }
@@ -354,7 +390,12 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
             long left = conv == 'c' && width < 0 ? 1 : width;
             char *out = (char *)dst;
             wchar_t *wout = (wchar_t *)dst;
+            /* the elements the array has (Annex K's functions), those stored,
+               and the null character that s and [ add */
+            size_t room = (size_t)-1, stored = 0, term = conv != 'c';
             mbstate_t st;
+            if (in->viol != NULL && !suppress)
+                room = va_arg(ap, size_t);
             {
                 unsigned char *z = (unsigned char *)&st;
                 size_t k;
@@ -433,8 +474,18 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
                     left--;
                 if (suppress)
                     continue;
+#define SF_ROOM(k) \
+    do { \
+        if (stored + (k) + term > room) { \
+            /* (does not fit: K.3.5.3.2p4) */ \
+            UNGET(); \
+            goto too_long; \
+        } \
+        stored += (k); \
+    } while (0)
 #if SF_WIDE
                 if (lm == 'l') {
+                    SF_ROOM(1);
                     *wout++ = (wchar_t)c;
                 } else {
                     /* a wide character to its multibyte bytes */
@@ -442,6 +493,7 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
                     size_t r = wcrtomb(mb, (wchar_t)c, &st), k;
                     if (r == (size_t)-1)
                         goto matching_failure;
+                    SF_ROOM(r);
                     for (k = 0; k < r; k++)
                         *out++ = mb[k];
                 }
@@ -453,16 +505,37 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
                     size_t r = mbrtowc(&w, &b, 1, &st);
                     if (r == (size_t)-1)
                         goto matching_failure;
-                    if (r != (size_t)-2)
+                    if (r != (size_t)-2) {
+                        /* (a 16-bit wchar_t: a character beyond U+FFFF is a
+                           surrogate pair, whose second half the next call
+                           gives, reading nothing: (size_t)-3) */
+                        int pair = !mbsinit(&st);
+                        SF_ROOM(pair ? 2 : 1);
                         *wout++ = w;
+                        if (pair && mbrtowc(&w, &b, 1, &st) == (size_t)-3)
+                            *wout++ = w;
+                    }
                 } else {
+                    SF_ROOM(1);
                     *out++ = (char)c;
                 }
 #endif
+#undef SF_ROOM
             }
             if (n == 0) {
                 if (c < 0)
                     goto input_failure;
+                goto matching_failure;
+            }
+            if (0) {
+            too_long:
+                /* (s and [: the array holds the empty string) */
+                if (term && room > 0) {
+                    if (lm == 'l')
+                        *(wchar_t *)dst = 0;
+                    else
+                        *(char *)dst = 0;
+                }
                 goto matching_failure;
             }
             if (conv == 'c' && left > 0) {

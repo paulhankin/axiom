@@ -36,7 +36,7 @@ void __axc_sig_ign(int);
 #define SIGSEGV 11
 #define SIGTERM 15
 
-void (*signal(int sig, void (*func)(int)))(int);
-int raise(int sig);
+void (*signal(int __sig, void (*__func)(int)))(int);
+int raise(int __sig);
 
 #endif

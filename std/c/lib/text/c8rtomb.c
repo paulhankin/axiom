@@ -7,7 +7,7 @@
 #include <uchar.h>
 
 size_t c8rtomb(char *restrict s, unsigned char c8, mbstate_t *restrict ps) {
-    static mbstate_t internal;
+    static _Thread_local mbstate_t internal; /* (each thread's: free of data races) */
     char buf[4];
     long c;
     int n;

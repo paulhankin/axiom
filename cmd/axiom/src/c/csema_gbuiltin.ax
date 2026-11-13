@@ -7,7 +7,11 @@
 //
 //   __builtin_constant_p(x)       1 if x is an arithmetic or address constant (not evaluated), else 0
 //   __builtin_choose_expr(c, a, b)  a if the integer constant c is nonzero, else b (the other unchecked)
-//   __builtin_object_size(p, t)   (size_t)-1 for t 0 and 1, 0 for 2 and 3: the size is never known
+//   __builtin_object_size(p, t)   the bytes from p to the end of the object it points into (t 0, 2), or
+//                                 of the closest member (t 1, 3), where p is the address of a declared
+//                                 object, a string literal or a compound literal (or its element or member)
+//                                 at a constant offset; otherwise unknown: (size_t)-1 for t 0 and 1, 0 for
+//                                 2 and 3. __builtin_dynamic_object_size is the same
 //   __builtin_inf..., huge_val..., nan...  constants
 //   __builtin_add_overflow(a, b, r) and the others   <stdckdint.h>'s ckd_ operations (csema_builtin.ax)
 //   __builtin_memcmp, strlen, sin, ... (LIBRARY)  calls of the C library's function of that name
@@ -18,8 +22,8 @@
 // sequentially consistent (a stronger order is a valid one).
 //
 // Diagnostics: C3023 (arguments), C3082 (an operand of the wrong type),
-// C3090 (a builtin used where it cannot be: frame_address of a level other
-// than 0, ...).
+// C3090 (a builtin used where it cannot be: frame_address of a level above
+// 65535, cpu_is on another architecture, ...).
 // =============================================================================
 import "../target.ax" as tg;
 import "../util.ax" as u;
@@ -61,6 +65,12 @@ pub const GB_FRAME_ADDR: i32 = 151;
 pub const GB_RETURN_ADDR: i32 = 152;
 pub const GB_PREFETCH: i32 = 153;
 pub const GB_ASSUME_ALIGNED: i32 = 154;
+pub const GB_CPU_HAS: i32 = 155;     // cval: the extensions' bits (std/os/cpu.ax)
+pub const GB_CPU_VENDOR: i32 = 156;  // cval: 1 Intel, 2 AMD
+pub const GB_SETJMP: i32 = 157;      // (buf)
+pub const GB_LONGJMP: i32 = 158;     // (buf, 1)
+pub const GB_PAUSE: i32 = 159;       // a spin-wait hint: nothing
+pub const GB_FENCE: i32 = 167;       // a full memory fence
 pub const GB_ISNAN: i32 = 160;
 pub const GB_ISINF: i32 = 161;
 pub const GB_ISFINITE: i32 = 162;
@@ -74,6 +84,18 @@ pub const GB_ISLESS: i32 = 172;
 pub const GB_ISLESSEQUAL: i32 = 173;
 pub const GB_ISLESSGREATER: i32 = 174;
 pub const GB_ISUNORDERED: i32 = 175;
+// The vector builtins (csema_vec.ax, cgen_vec.ax).
+pub const GB_SHUFFLE: i32 = 180;        // (a, mask) or (a, b, mask)
+pub const GB_SHUFFLEVECTOR: i32 = 181;  // (a, b, constant indices...)
+
+fn no_vec_builtin(e: *mut cast.Expr, name: []u8) bool {
+    _ = e;
+    _ = name;
+    return false;
+}
+
+/// Types a call of a vector builtin (true if `name` is one): set by csema_vec.ax.
+pub let mut vec_builtin: fn(*mut cast.Expr, []u8) bool = no_vec_builtin;
 // The atomics (cgen_gatomic.ax): A_ kind, the RMW operation in e.cval.
 pub const GB_ATOMIC: i32 = 200;  // + an A_ kind
 pub const A_FETCH_OP: i32 = 0;   // old value; op: RMW_ or OP_NAND
@@ -199,14 +221,16 @@ let MATH_N: [9]usize = [1, 1, 1, 1, 1, 1, 1, 2, 3];
 let CLASS: [7][]u8 = ["isnan", "isinf", "isfinite", "signbit", "isnormal", "isinf_sign", "fpclassify"];
 let CMPS: [6][]u8 = ["isgreater", "isgreaterequal", "isless", "islessequal", "islessgreater", "isunordered"];
 
-let OTHERS: [24][]u8 = ["__builtin_expect", "__builtin_expect_with_probability", "__builtin_trap",
-                        "__builtin_constant_p", "__builtin_choose_expr", "__builtin_types_compatible_p",
-                        "__builtin_object_size", "__builtin_dynamic_object_size", "__builtin_bswap16",
-                        "__builtin_bswap32", "__builtin_bswap64", "__builtin_add_overflow", "__builtin_sub_overflow",
-                        "__builtin_mul_overflow", "__builtin_add_overflow_p", "__builtin_sub_overflow_p",
-                        "__builtin_mul_overflow_p", "__builtin_alloca", "__builtin_alloca_with_align",
-                        "__builtin_frame_address", "__builtin_return_address", "__builtin_prefetch",
-                        "__builtin_assume_aligned", "__builtin_abs"];
+let OTHERS: [33][]u8 = ["__builtin_cpu_supports", "__builtin_cpu_is", "__builtin_cpu_init", "__builtin_setjmp",
+                        "__builtin_longjmp", "__builtin_ia32_pause", "__builtin_ia32_mfence", "__builtin_ia32_lfence",
+                        "__builtin_ia32_sfence", "__builtin_expect", "__builtin_expect_with_probability",
+                        "__builtin_trap", "__builtin_constant_p", "__builtin_choose_expr",
+                        "__builtin_types_compatible_p", "__builtin_object_size", "__builtin_dynamic_object_size",
+                        "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64", "__builtin_add_overflow",
+                        "__builtin_sub_overflow", "__builtin_mul_overflow", "__builtin_add_overflow_p",
+                        "__builtin_sub_overflow_p", "__builtin_mul_overflow_p", "__builtin_alloca",
+                        "__builtin_alloca_with_align", "__builtin_frame_address", "__builtin_return_address",
+                        "__builtin_prefetch", "__builtin_assume_aligned", "__builtin_abs"];
 
 let CONSTS: [12][]u8 = ["__builtin_inf", "__builtin_inff", "__builtin_infl", "__builtin_huge_val",
                         "__builtin_huge_valf", "__builtin_huge_vall", "__builtin_nan", "__builtin_nanf",
@@ -331,8 +355,29 @@ fn math_index(rest: []u8, suffix: *mut []u8) i32 {
             suffix.* = rest[m.len..];
             return @int_cast(i32, k);
         }
+        if u.starts(rest, m) and is_xsuffix(rest[m.len..]) {
+            // (the interchange and extended types' suffixes, and q for
+            // __float128: only fabs and copysign, which change the sign bit)
+            let id = MATH_IDS[k];
+            if (id == GB_FABS) or (id == GB_COPYSIGN) {
+                suffix.* = rest[m.len..];
+                return @int_cast(i32, k);
+            }
+        }
     }
     return -1;
+}
+
+// Is s the suffix of an interchange or extended floating type's builtin
+// (f16 ... f64x, and q: __float128)?
+fn is_xsuffix(s: []u8) bool {
+    let xs = ["f16", "f32", "f64", "f128", "f32x", "f64x", "q"];
+    for x in xs {
+        if u.str_eq(s, x) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The bit builtin name `rest` (without __builtin_): its index in BITS and
@@ -367,7 +412,15 @@ fn lib_index(name: []u8) i32 {
 
 /// Is `name` a GNU builtin this compiler implements (for __has_builtin)?
 pub fn known(name: []u8) bool {
-    if in_list(name, OTHERS[..]) or in_list(name, CONSTS[..]) or (atomic_of(name).kind >= 0) {
+    // (those a target cannot have: errors where used)
+    if (u.str_eq(name, "__builtin_setjmp") or u.str_eq(name, "__builtin_longjmp")) and tg.is_wasm() and
+       not tg.has(tg.W_EXCEPTION_HANDLING) {
+        return false;
+    }
+    if u.str_eq(name, "__builtin_cpu_is") and (tg.g_arch != tg.ARCH_X64) {
+        return false;
+    }
+    if in_list(name, OTHERS[..]) or is_float_const(name) or (atomic_of(name).kind >= 0) {
         return true;
     }
     if u.str_eq(name, "__atomic_always_lock_free") or u.str_eq(name, "__atomic_is_lock_free") {
@@ -375,6 +428,10 @@ pub fn known(name: []u8) bool {
     }
     if not u.starts(name, "__builtin_") {
         return false;
+    }
+    if u.str_eq(name, "__builtin_shuffle") or u.str_eq(name, "__builtin_shufflevector") or
+       u.str_eq(name, "__builtin_convertvector") {
+        return true;
     }
     let rest = name[10..];
     let mut sfx: []u8 = "";
@@ -419,7 +476,35 @@ fn float_by(sfx: []u8) *mut cty.CType {
     if u.str_eq(sfx, "l") {
         return cty.t_ldouble;
     }
+    let xs = ["f16", "f32", "f64", "f128", "f32x", "f64x", "q"];
+    let ts: [7]*mut cty.CType = [cty.t_float16, cty.t_float32, cty.t_float64, cty.t_float128, cty.t_float32x,
+                                 cty.t_float64x, cty.t_float128];
+    for k in 0..xs.len {
+        if u.str_eq(sfx, xs[k]) {
+            cty.note_float_use(ts[k]);
+            return ts[k];
+        }
+    }
     return cty.t_double;
+}
+
+// The suffix of a constant builtin's name (__builtin_inf ... and their f,
+// l, f16 ... f64x and q forms: "" for none), or nil if name is none.
+fn float_const_suffix(name: []u8) []u8 {
+    let bases = ["__builtin_inf", "__builtin_huge_val", "__builtin_nans", "__builtin_nan"];
+    for b in bases {
+        if u.starts(name, b) {
+            let sfx = name[b.len..];
+            if (sfx.len == 0) or u.str_eq(sfx, "f") or u.str_eq(sfx, "l") or is_xsuffix(sfx) {
+                return sfx;
+            }
+        }
+    }
+    return u.nil_slice.[u8]();
+}
+
+fn is_float_const(name: []u8) bool {
+    return not u.isnos(float_const_suffix(name));
 }
 
 /// Types call e of a GNU builtin (a GNU dialect), if its callee names one:
@@ -442,8 +527,11 @@ pub fn call(e: *mut cast.Expr) bool {
     if not u.starts(name, "__builtin_") {
         return false;
     }
-    if in_list(name, CONSTS[..]) {
+    if is_float_const(name) {
         float_const(e);
+        return true;
+    }
+    if vec_builtin(e, name) {
         return true;
     }
     let rest = name[10..];
@@ -502,10 +590,14 @@ pub fn call(e: *mut cast.Expr) bool {
             _ = bad(e);
             return true;
         }
-        // (the size is never known: (size_t)-1 for 0 and 1, 0 for 2 and 3)
+        // (unknown: (size_t)-1 for 0 and 1, 0 for 2 and 3)
         let mut v: u64 = 0;
         if r.v < 2 {
             v = cty.int_max(cty.t_size);
+        }
+        let mut x = Extent.{ known: false, size: 0, off: 0, sub_size: 0, sub_off: 0 };
+        if not is_err(e.args.get(0)) and pointer_extent(e.args.get(0), &mut x) {
+            v = remaining(&x, (r.v & 1) != 0);
         }
         if not is_err(e.args.get(0)) and not no_effects(e.args.get(0)) {
             return comma_fold(e, cty.t_size, v);
@@ -657,13 +749,49 @@ pub fn call(e: *mut cast.Expr) bool {
             _ = bad(e);
             return true;
         }
-        if r.v != 0 {
-            cs.err(e.span, "C3090", u.f1("'%s' of a level other than 0 is not supported", name));
+        if r.v > 0xffff {
+            cs.err(e.span, "C3090", u.f1("'%s' of a level greater than 65535 is not supported", name));
             _ = bad(e);
             return true;
         }
+        e.cval = r.v;
         e.op = pick_i(u.str_eq(rest, "frame_address"), GB_FRAME_ADDR, GB_RETURN_ADDR);
         e.ty = cty.pointer_to(cty.t_void);
+        return true;
+    }
+    if u.starts(rest, "cpu_") {
+        cpu_builtin(e, name, rest[4..]);
+        return true;
+    }
+    if u.str_eq(rest, "setjmp") or u.str_eq(rest, "longjmp") {
+        let lj = u.str_eq(rest, "longjmp");
+        if not arity(e, pick_n(lj, 2, 1), pick_n(lj, 2, 1)) or not arg_as(e, 0, cty.pointer_to(cty.t_void)) {
+            _ = bad(e);
+            return true;
+        }
+        if lj {
+            let r = cx.ice(e.args.get(1), "the second argument of '__builtin_longjmp'");
+            e.args.set(1, r.e);
+            if not r.ok or (r.v != 1) {
+                if r.ok {
+                    cs.err(e.args.get(1).span, "C3082", "the second argument of '__builtin_longjmp' must be 1");
+                }
+                _ = bad(e);
+                return true;
+            }
+        }
+        e.op = pick_i(lj, GB_LONGJMP, GB_SETJMP);
+        e.ty = pick_t(lj, cty.t_void, cty.t_int);
+        return true;
+    }
+    if u.str_eq(rest, "ia32_pause") or u.str_eq(rest, "ia32_mfence") or u.str_eq(rest, "ia32_lfence") or
+       u.str_eq(rest, "ia32_sfence") {
+        if not arity(e, 0, 0) {
+            _ = bad(e);
+            return true;
+        }
+        e.op = pick_i(u.str_eq(rest, "ia32_pause"), GB_PAUSE, GB_FENCE);
+        e.ty = cty.t_void;
         return true;
     }
     if u.str_eq(rest, "prefetch") {
@@ -700,6 +828,341 @@ fn unsigned_of(bits: i32) *mut cty.CType {
         }
     }
     return cty.t_ullong;
+}
+
+// -----------------------------------------------------------------------------
+// __builtin_object_size: where a pointer points, when that is visible in the
+// expression (no data flow is followed). The object is a declared object of a
+// complete non-VLA type, a string literal or a compound literal; the pointer
+// is its address, its decayed array, an element at a constant index, a member,
+// or such a pointer converted or offset by a constant. The answer is the
+// object's size less the offset (0 past its end or before its start): for
+// types 1 and 3 the closest enclosing member's, except a member array at the
+// end of its structure, which is taken to reach to the object's end (as a
+// flexible array member written the old way would). An object whose type has a
+// flexible array member is unknown (its static initializer may have given it
+// more). The answer is never smaller than the bytes there are, so a library
+// check made with it cannot fail a valid access.
+// -----------------------------------------------------------------------------
+struct Extent {
+    known: bool,
+    size: u64,      // the object's size
+    off: i64,       // the pointer's offset in it
+    sub_size: u64,  // the closest member's (the object itself for none)
+    sub_off: i64,   // that member's offset in the object
+}
+
+fn remaining(x: *Extent, sub: bool) u64 {
+    let mut size = x.size;
+    let mut off = x.off;
+    if sub {
+        size = x.sub_size;
+        off = x.off - x.sub_off;
+    }
+    if (off < 0) or (@bit_cast(u64, off) > size) {
+        return 0;
+    }
+    return size - @bit_cast(u64, off);
+}
+
+// The bytes of each element p points to, if known.
+fn step_of(p: *cty.CType, out: *mut u64) bool {
+    if not cty.is_pointer(p) or u.isnil(p.elem) or not cty.is_complete(p.elem) or cty.is_vla(p.elem) {
+        return false;
+    }
+    out.* = cty.size_of(p.elem);
+    return true;
+}
+
+fn const_int(e: *cast.Expr, out: *mut i64) bool {
+    if u.isnil(e) or not e.is_const or not cty.is_integer(e.ty) or (cty.size_of(e.ty) > 8) {
+        return false;
+    }
+    // (cval: the bits, sign- or zero-extended from the type's width)
+    out.* = @bit_cast(i64, e.cval);
+    return true;
+}
+
+// Where the value of pointer expression p points.
+fn pointer_extent(p: *cast.Expr, x: *mut Extent) bool {
+    if u.isnil(p) or not cty.is_pointer(p.ty) {
+        return false;
+    }
+    let k = p.kind;
+    if k == cast.ExprKind.CAST {
+        if p.op == cast.CV_ADECAY {
+            return lvalue_extent(p.a, x);
+        }
+        if (p.op == cast.CV_VALUE) and cty.is_pointer(p.a.ty) {
+            return pointer_extent(p.a, x);
+        }
+        return false;
+    }
+    if (k == cast.ExprKind.UNARY) and (p.op == ct.P_AMP) {
+        return lvalue_extent(p.a, x);
+    }
+    if (k == cast.ExprKind.BINARY) and ((p.op == ct.P_PLUS) or (p.op == ct.P_MINUS)) {
+        let mut ptr = p.a;
+        let mut n = p.b;
+        if not cty.is_pointer(ptr.ty) {
+            if p.op == ct.P_MINUS {
+                return false;
+            }
+            ptr = p.b;
+            n = p.a;
+        }
+        let mut step: u64 = 0;
+        let mut c: i64 = 0;
+        if not const_int(n, &mut c) or not step_of(ptr.ty, &mut step) or (step > 0x7fffffff) or (c > 0x7fffffff) or
+           (c < -0x7fffffff) {
+            return false;
+        }
+        if not pointer_extent(ptr, x) {
+            return false;
+        }
+        if p.op == ct.P_MINUS {
+            c = -c;
+        }
+        x.off = x.off + c * @bit_cast(i64, step);
+        return true;
+    }
+    if k == cast.ExprKind.COMMA {
+        return pointer_extent(p.b, x);
+    }
+    return false;
+}
+
+fn has_flexible(t: *cty.CType) bool {
+    if u.isnil(t) or ((t.kind != cty.TK_STRUCT) and (t.kind != cty.TK_UNION)) or u.isnil(t.tag) {
+        return false;
+    }
+    for m in t.tag.members.items() {
+        if (m.ty.kind == cty.TK_ARRAY) and not m.ty.has_len and not m.ty.vla {
+            return true;
+        }
+        if has_flexible(m.ty) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn whole(t: *cty.CType, x: *mut Extent) bool {
+    if u.isnil(t) or not cty.is_complete(t) or cty.is_vla(t) or has_flexible(t) or
+       ((t.kind == cty.TK_ARRAY) and has_flexible(t.elem)) {
+        return false;
+    }
+    x.known = true;
+    x.size = cty.size_of(t);
+    x.off = 0;
+    x.sub_size = x.size;
+    x.sub_off = 0;
+    return true;
+}
+
+// Where lvalue l is.
+fn lvalue_extent(l: *cast.Expr, x: *mut Extent) bool {
+    if u.isnil(l) {
+        return false;
+    }
+    let k = l.kind;
+    if k == cast.ExprKind.IDENT {
+        if u.isnil(l.sym) or (l.sym.kind != cast.SK_OBJECT) or l.sym.is_param {
+            return false;
+        }
+        return whole(l.ty, x);
+    }
+    if (k == cast.ExprKind.STRING) or (k == cast.ExprKind.COMPOUND) {
+        return whole(l.ty, x);
+    }
+    if (k == cast.ExprKind.UNARY) and (l.op == ct.P_STAR) {
+        return pointer_extent(l.a, x);
+    }
+    if k == cast.ExprKind.INDEX {
+        let mut ptr = l.a;
+        let mut n = l.b;
+        if not cty.is_pointer(ptr.ty) {
+            ptr = l.b;
+            n = l.a;
+        }
+        let mut step: u64 = 0;
+        let mut c: i64 = 0;
+        if not const_int(n, &mut c) or not step_of(ptr.ty, &mut step) or (step > 0x7fffffff) or (c > 0x7fffffff) or
+           (c < -0x7fffffff) or not pointer_extent(ptr, x) {
+            return false;
+        }
+        x.off = x.off + c * @bit_cast(i64, step);
+        return true;
+    }
+    if k == cast.ExprKind.MEMBER {
+        if u.isnil(l.mem) or l.mem.is_bitfield {
+            return false;
+        }
+        let mut st: *cty.CType = l.a.ty;
+        if l.op == ct.P_ARROW {
+            if not pointer_extent(l.a, x) {
+                return false;
+            }
+            st = l.a.ty.elem;
+        } else if not lvalue_extent(l.a, x) {
+            return false;
+        }
+        let mt = l.mem.ty;
+        if u.isnil(st) or not cty.is_complete(mt) or cty.is_vla(mt) {
+            return false;
+        }
+        x.off = x.off + @bit_cast(i64, l.cval);
+        let msize = cty.size_of(mt);
+        let end = l.cval + msize;
+        // (a member array at the end: to the object's end)
+        if (mt.kind == cty.TK_ARRAY) and (st.kind == cty.TK_STRUCT) and (cty.size_of(st) < end + cty.align_of(st)) {
+            return true;
+        }
+        x.sub_off = x.off;
+        x.sub_size = msize;
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// __builtin_cpu_supports("name"), __builtin_cpu_is("intel" or "amd"),
+// __builtin_cpu_init(): the running processor, as std/os/cpu.ax detects it
+// (lazily: init does nothing). The names are std/os/cpu.ax's for the target's
+// architecture, and on x86-64 also the baseline's ("cmov", "mmx", "sse",
+// "sse2", "x86-64": always 1) and the levels "x86-64-v2" .. "x86-64-v4";
+// another architecture's name is 0 (as @cpu_has answers). An
+// extension the build assumes is 1 without asking; on WebAssembly every
+// answer is the build's (there is no detection).
+// -----------------------------------------------------------------------------
+let X86_BASE: [5][]u8 = ["cmov", "mmx", "sse", "sse2", "x86-64"];
+let X86_LEVELS: [3][]u8 = ["x86-64-v2", "x86-64-v3", "x86-64-v4"];
+
+fn string_value(x: *cast.Expr) []u8 {
+    let mut s = x;
+    if (s.kind == cast.ExprKind.CAST) and u.notnil(s.a) {
+        s = s.a;
+    }
+    if (s.kind != cast.ExprKind.STRING) or u.isnil(s.tok) or (s.tok.prefix != 0) {
+        return u.nosym();
+    }
+    let mut b = u.Buf.init();
+    for c in s.tok.units {
+        if (c == 0) or (c > 0x7f) {
+            return u.nosym();
+        }
+        b.c(@truncate(u8, c));
+    }
+    return b.done();
+}
+
+fn x86_level(name: []u8) u64 {
+    let v2 = ["cx16", "popcnt", "sse3", "sse4.1", "sse4.2", "ssse3"];
+    let v3 = ["avx", "avx2", "bmi", "bmi2", "f16c", "fma", "lzcnt", "movbe"];
+    let v4 = ["avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"];
+    let mut bits: u64 = 0;
+    for k in @as(usize, 0)..3 {
+        if u.str_eq(name, X86_LEVELS[k]) {
+            for n in v2 {
+                bits = bits | tg.feature_bit(n);
+            }
+            if k >= 1 {
+                for n in v3 {
+                    bits = bits | tg.feature_bit(n);
+                }
+            }
+            if k >= 2 {
+                for n in v4 {
+                    bits = bits | tg.feature_bit(n);
+                }
+            }
+        }
+    }
+    return bits;
+}
+
+fn cpu_builtin(e: *mut cast.Expr, name: []u8, what: []u8) void {
+    if u.str_eq(what, "init") {
+        if not arity(e, 0, 0) {
+            _ = bad(e);
+            return;
+        }
+        // (detection is done when first asked)
+        e.op = GB_PAUSE;
+        e.ty = cty.t_void;
+        return;
+    }
+    let is = u.str_eq(what, "is");
+    if not is and not u.str_eq(what, "supports") {
+        cs.err(e.span, "C3090", u.f1("'%s' is not supported", name));
+        _ = bad(e);
+        return;
+    }
+    if not arity(e, 1, 1) or not args_ok(e) {
+        _ = bad(e);
+        return;
+    }
+    let s = string_value(e.args.get(0));
+    if u.isnos(s) {
+        cs.err(e.args.get(0).span, "C3082", u.f1("the argument of '%s' must be a string literal", name));
+        _ = bad(e);
+        return;
+    }
+    let x86 = tg.g_arch == tg.ARCH_X64;
+    if is {
+        let mut v: u64 = 0;
+        if u.str_eq(s, "intel") {
+            v = 1;
+        } else if u.str_eq(s, "amd") {
+            v = 2;
+        }
+        if not x86 or (v == 0) {
+            cs.err(e.args.get(0).span, "C3090",
+                   u.f1("'__builtin_cpu_is' of '%s' is not supported (only \"intel\" and \"amd\", on x86-64)", s));
+            _ = bad(e);
+            return;
+        }
+        e.op = GB_CPU_VENDOR;
+        e.cval = v;
+        e.ty = cty.t_int;
+        return;
+    }
+    let mut bits: u64 = 0;
+    let mut base = false;
+    if x86 {
+        for n in X86_BASE {
+            if u.str_eq(s, n) {
+                base = true;
+            }
+        }
+        bits = x86_level(s);
+    }
+    if not base and (bits == 0) {
+        bits = tg.feature_bit(s);
+    }
+    if not base and (bits == 0) and (tg.feature_known(s) or in_list(s, X86_LEVELS[..]) or in_list(s, X86_BASE[..])) {
+        // (another architecture's: absent, as @cpu_has says)
+        fold_int(e, cty.t_int, 0);
+        return;
+    }
+    if not base and (bits == 0) {
+        cs.err(e.args.get(0).span, "C3082",
+               u.f2("'%s' is not an extension that '__builtin_cpu_supports' knows (this architecture's: %s)", s,
+                    tg.feature_names()));
+        _ = bad(e);
+        return;
+    }
+    if base or tg.has(bits) {
+        fold_int(e, cty.t_int, 1);
+        return;
+    }
+    if tg.is_wasm() {
+        fold_int(e, cty.t_int, 0);
+        return;
+    }
+    e.op = GB_CPU_HAS;
+    e.cval = bits;
+    e.ty = cty.t_int;
 }
 
 // e is the integer constant v of type t.
@@ -789,18 +1252,13 @@ fn float_const(e: *mut cast.Expr) void {
         _ = bad(e);
         return;
     }
-    let mut t = cty.t_double;
-    if u.ends(name, "f") {
-        t = cty.t_float;
-    } else if u.ends(name, "l") and not u.ends(name, "_val") {
-        t = cty.t_ldouble;
-    }
+    let t = float_by(float_const_suffix(name));
     e.op = 0;
     e.ty = t;
     e.is_const = true;
     e.fcval = v;
     if cty.is_wide(t) {
-        e.xv = cl.of_f64(v, cc.ld_fmt());
+        e.xv = cl.of_f64(v, cc.fmt_t(t));
     }
 }
 

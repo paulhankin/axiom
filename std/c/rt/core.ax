@@ -195,11 +195,14 @@ export fn getenv(name: *u8) *mut u8 {
 
 /// system's part (std/c/lib/core/system.c): with a null string, whether
 /// there is a command processor
-/// (/bin/sh on Linux and macOS, cmd.exe on Windows, none under
-/// WebAssembly); else runs the command with it, waits, and returns its
-/// status: on Linux and macOS as POSIX encodes it (the exit status times
-/// 256, or the number of the signal that ended it), on Windows the exit
-/// status; -1 if it could not be run.
+/// (/bin/sh on Linux and macOS, %ComSpec% (else cmd.exe) on Windows, none
+/// under WebAssembly); else runs the command with it, waits, and returns
+/// its status: on Linux and macOS as POSIX encodes it (the exit status
+/// times 256, or the number of the signal that ended it), on Windows the
+/// exit status; -1 if it could not be run. The command is the shell's text
+/// as it is: sh -c's argument, and on Windows the command line
+/// `cmd.exe /s /c "command"` (/s: the processor takes the text between the
+/// first and the last quote verbatim, quotes inside it included).
 export fn __axc_system(string: *u8) i64 {
     let windows = @target_os("windows");
     if @target_os("none") {
@@ -211,14 +214,32 @@ export fn __axc_system(string: *u8) i64 {
         }
         return @as(i64, fs.exists("/bin/sh"));
     }
-    let mut shell = "/bin/sh";
-    let mut flag = "-c";
+    let mut shell: []u8 = "/bin/sh";
+    let mut flag: []u8 = "-c";
+    let mut cmd = cstr(string);
+    // (Windows: %ComSpec%'s value, and the argument of /s /c, ours to free)
+    let mut comspec: []mut u8 = mem.alloc.[u8](0) catch return -1;
+    defer mem.free(comspec);
+    let mut wrapped: []mut u8 = mem.alloc.[u8](cmd.len + 9) catch return -1;
+    defer mem.free(wrapped);
     if windows {
         shell = "cmd.exe";
-        flag = "/c";
+        let cs = os.getenv("ComSpec") catch comspec;
+        if cs.len > 0 {
+            mem.free(comspec);
+            comspec = cs;
+            shell = comspec;
+        }
+        // (byte 1: the host puts the argument into the command line as it
+        // is, std/internal/runtime/windows.ax)
+        let pre = "\x01/s /c \"";
+        @mem_copy(wrapped[0..pre.len], pre);
+        @mem_copy(wrapped[pre.len..pre.len + cmd.len], cmd);
+        wrapped[pre.len + cmd.len] = '"';
+        flag = wrapped[0..pre.len + cmd.len + 1];
+        cmd = "";
     }
     // the host's spawn takes argv\0...\0 env\0...\0 cwd (std/os/process)
-    let cmd = cstr(string);
     let mut env = os.environ() catch return -1;
     defer env.deinit();
     let mut n = shell.len + flag.len + cmd.len + 5;
@@ -230,6 +251,9 @@ export fn __axc_system(string: *u8) i64 {
     let mut k: usize = 0;
     let parts: [3][]u8 = [shell, flag, cmd];
     for a in parts {
+        if windows and (a.len == 0) {
+            continue;  // (the command is in flag's argument)
+        }
         @mem_copy(spec[k..k + a.len], a);
         k += a.len;
         spec[k] = 0;

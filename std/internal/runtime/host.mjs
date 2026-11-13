@@ -804,7 +804,8 @@ export function createHost(opts = {}) {
         // (flags 4 and 5: w+ and a+; flag 8: the file must not exist)
         const excl = (flags & 8) && [1, 4].includes(flags & 7);
         const mode = excl ? ((flags & 7) === 1 ? 'wx' : 'wx+') : (['r', 'w', 'a', 'r+', 'w+', 'a+'][flags & 7] || 'r');
-        const fd = F.openSync(str(p, n), mode);
+        // (flag 16: a file created can be read and written by its owner alone)
+        const fd = F.openSync(str(p, n), mode, (flags & 16) ? 0o600 : 0o644);
         pos.set(fd, (flags & 7) === 2 ? -1 : 0);  // appends go to the end
         return fd;
       } catch (e) {
@@ -1230,11 +1231,17 @@ export function createHost(opts = {}) {
       }
       return 0;
     },
-    // Nanoseconds on clock 0 (real time since 1970), 1 (monotonic) or 2 (the
-    // processor time of the process, in microseconds).
+    // Nanoseconds on clock 0 (real time since 1970), 1 (monotonic), 2 (the
+    // processor time of the process, in microseconds) or 3 (that of the
+    // calling thread where node has it, process.threadCpuUsage; else the
+    // process's).
     ax_clock_ns(clock) {
       if (clock === 1) return process.hrtime.bigint();
-      if (clock === 2) { const u = process.cpuUsage(); return BigInt(u.user + u.system) * 1000n; }
+      if (clock === 3 && typeof process.threadCpuUsage === 'function') {
+        const u = process.threadCpuUsage();
+        return BigInt(u.user + u.system) * 1000n;
+      }
+      if (clock === 2 || clock === 3) { const u = process.cpuUsage(); return BigInt(u.user + u.system) * 1000n; }
       return BigInt(Math.round((performance.timeOrigin + performance.now()) * 1000)) * 1000n;  // microseconds
     },
   };

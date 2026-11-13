@@ -10,6 +10,6 @@ typedef struct {
 } once_flag;
 #define ONCE_FLAG_INIT {0}
 
-void call_once(once_flag *flag, void (*func)(void));
+void call_once(once_flag *__flag, void (*__func)(void));
 
 #endif

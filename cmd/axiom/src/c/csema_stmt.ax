@@ -18,6 +18,8 @@ import "csema_dspec.ax" as dsp;
 import "csema_expr.ax" as cx;
 import "csema_gnu.ax" as cgn;
 import "csema_marks.ax" as csm;
+import "csema_nest.ax" as cnest;
+import "csema_vec.ax" as csv;
 import "csema_vla.ax" as vla;
 import "ctypes.ax" as cty;
 import "cwide.ax" as cw;
@@ -48,6 +50,25 @@ struct Body {
     breakable: i32,                        // loops and switches around it
     locals: u.List.[Local],                // the local labels in scope, innermost last
     addr_labels: u.List.[*mut cast.Stmt],  // the computed gotos (`goto *p`)
+    parent: *mut Body,                     // a nested function's: its enclosing function's body
+}
+
+// Does an enclosing function of the body b (a nested function's) have the
+// label `name`, a local label or one used or defined so far?
+fn outer_label(b: *Body, name: []u8) bool {
+    let mut p = b.parent;
+    while u.notnil(p) {
+        if u.notnil(p.labels.get(name)) {
+            return true;
+        }
+        for l in p.locals.items() {
+            if u.str_eq(l.name, name) {
+                return true;
+            }
+        }
+        p = p.parent;
+    }
+    return false;
 }
 
 let mut BD: *mut Body = @ptr_from_int(*mut Body, 0);
@@ -82,6 +103,7 @@ pub fn analyze(t: *mut cast.Unit, o: *co.COptions) *mut cs.CUnit {
     cs.hooks.body = function_body;
     csb.install();
     cgn.install();
+    csv.install();
     cs.hooks.compound = cdi.compound_literal;
     cs.hooks.stmt_expr = stmt_expr;
     cs.hooks.label_addr = label_addr;
@@ -99,11 +121,20 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
     b.ret = f.ty.ret;
     b.labels = u.SymMap.[*mut cast.CSym].{ keys: u.nil.[usize](), vals: u.nil.[*mut cast.CSym](), cap: 0, len: 0 };
     let saved = BD;
+    if u.notnil(f.nest_parent) {
+        b.parent = saved;
+    }
     BD = b;
+    // (a nested function's body is analyzed inside its enclosing one's: what
+    // describes that body is set aside, and taken up again after)
+    let saved_fn = cs.cur_fn();
+    let saved_vla = vla.save();
+    let saved_marks = csm.save_body();
     cs.set_cur_fn(f);
     vla.begin_body();
     cs.push_scope();
     for p in f.params.items() {
+        p.owner = f;
         if p.name.len > 0 {
             let prior = cs.lookup_here(p.name);
             if u.isnil(prior) {
@@ -122,7 +153,10 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
         csa.naked_body(f, d.body);
     }
     for l in b.label_list.items() {
-        if not l.defined {
+        if not l.defined and outer_label(b, l.name) {
+            cs.not_supported(l.span, u.f1("a jump from a nested function to the label '%s' of its enclosing function",
+                                          l.name));
+        } else if not l.defined {
             cs.err(l.span, "C3043", u.f1("the label '%s' is used but not defined", l.name));
         } else if not l.used and not catr.maybe_unused(l) {
             cs.warn(l.span, "C4040", u.f1("the label '%s' is defined but not used", l.name));
@@ -133,7 +167,12 @@ fn function_body(f: *mut cast.CSym, d: *mut cast.Decl) void {
         }
     }
     vla.end_body();
-    cs.set_cur_fn(u.nil.[cast.CSym]());
+    if f.has_nested {
+        cnest.finish(f, cs.unit().funcs.items());
+    }
+    cs.set_cur_fn(saved_fn);
+    vla.restore(saved_vla);
+    csm.restore_body(saved_marks);
     BD = saved;
 }
 
@@ -394,25 +433,64 @@ fn case_stmt(s: *mut cast.Stmt) void {
 
 // A case label of a switch whose controlling expression is wider than 64
 // bits: its value converted to that type is the constant s.e (cwide.ax),
-// which cgen_stmt compares with. A case range there is C3901.
+// which cgen_stmt compares with; a case range's last value is s.hi, likewise.
 fn wide_case(s: *mut cast.Stmt) void {
     let sw = BD.switches.last();
     let r = cx.ice_wide(s.e, "a case label");
     s.e = r.e;
+    let mut hi = r;
     if u.notnil(s.hi) {
-        cs.not_supported(s.span, u.f1("a case range in a switch on %s", cs.tq(sw.ty)));
-    } else if r.ok {
+        hi = cx.ice_wide(s.hi, "the end of a case range");
+        s.hi = hi.e;
+    }
+    if r.ok and hi.ok {
         s.e = cx.convert(r.e, sw.ty);
         s.cval = s.e.cval;
-        let key = u.intern(cw.text(s.e));
-        if sw.values.get(key) != 0 {
-            cs.err(s.e.span, "C3041", u.f1("a second case with the value %s", cw.text(s.e)));
+        if u.notnil(s.hi) {
+            s.hi = cx.convert(hi.e, sw.ty);
+            wide_range(sw, s);
+        } else {
+            let key = u.intern(cw.text(s.e));
+            let mut dup = sw.values.get(key) != 0;
+            for c in sw.ranges.items() {
+                if (cw.compare(sw.ty, c.e, s.e) <= 0) and (cw.compare(sw.ty, s.e, c.hi) <= 0) {
+                    dup = true;
+                }
+            }
+            if dup {
+                cs.err(s.e.span, "C3041", u.f1("a second case with the value %s", cw.text(s.e)));
+            }
+            sw.values.put(key, 1);
+            sw.s.cases.push(s);
         }
-        sw.values.put(key, 1);
-        sw.s.cases.push(s);
     }
     vla.case_label(s, sw.scope);
     stmt(s.body);
+}
+
+// A case range of a switch wider than 64 bits (as case_range).
+fn wide_range(sw: *mut Switch, s: *mut cast.Stmt) void {
+    let t = sw.ty;
+    if cw.compare(t, s.e, s.hi) > 0 {
+        cs.warn(s.span, "C4120", "an empty case range: its first value is greater than its last");
+        return;
+    }
+    for c in sw.ranges.items() {
+        if (cw.compare(t, c.e, s.hi) <= 0) and (cw.compare(t, s.e, c.hi) <= 0) {
+            cs.err_note(s.e.span, "C3041", "a case range that overlaps another", c.span, "the other");
+            return;
+        }
+    }
+    for c in sw.s.cases.items() {
+        if (c.kind == cast.StmtKind.CASE) and u.isnil(c.hi) and (cw.compare(t, s.e, c.e) <= 0) and
+           (cw.compare(t, c.e, s.hi) <= 0) {
+            cs.err_note(s.e.span, "C3041", u.f1("a case range that includes the value %s of another case",
+                                                cw.text(c.e)), c.span, "the other");
+            return;
+        }
+    }
+    sw.ranges.push(s);
+    sw.s.cases.push(s);
 }
 
 fn val_text(sw: *Switch, v: u64) []u8 {

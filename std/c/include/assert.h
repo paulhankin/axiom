@@ -11,10 +11,12 @@
    and calls abort (std/c/lib/core/__axc_assert_fail.c) */
 #ifndef __AXIOM_ASSERT_FAIL_DECLARED
 #define __AXIOM_ASSERT_FAIL_DECLARED
-#if __STDC_VERSION__ >= 201112L
+#if __STDC_VERSION__ >= 202311L
+[[__noreturn__]]
+#elif __STDC_VERSION__ >= 201112L
 _Noreturn
 #endif
-void __axc_assert_fail(const char *expr, const char *file, long line, const char *func);
+void __axc_assert_fail(const char *__expr, const char *__file, long __line, const char *__func);
 #endif
 
 #if __STDC_VERSION__ >= 199901L

@@ -1,0 +1,83 @@
+// =============================================================================
+// csema_nest.ax - the GNU dialects' nested functions: a function defined in a
+// block of another function. It sees the enclosing function's objects (and
+// its enclosing functions'), and is called directly or through a pointer to
+// it while the enclosing function's call that made the pointer is running.
+//
+// What semantic analysis records (cast.CSym), for IR generation (cgen_nest.ax):
+//   nest_parent  of a nested function, the function it is defined in
+//   rec          of a function with nested functions, the automatic objects
+//                its nested functions (and theirs) use of it or of its
+//                enclosing functions: its frame record holds their addresses
+//                (a use in a function nested k deep puts the object in the
+//                records of the k functions between its own and the use)
+//   tramps       of such a function, those of its nested functions whose
+//                addresses are taken: a trampoline each (cgen_nest.ax)
+// The objects of a variable length array type cannot be used from a nested
+// function (C3901), nor can a nested function be variadic, nor jump to a
+// label of its enclosing function (its labels are its own).
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "csema.ax" as cs;
+import "ctypes.ax" as cty;
+
+/// Notes that object s (an automatic object, or a parameter) is used at sp
+/// in the function being analyzed: if s is another function's, every
+/// function from this one up to s's own passes it on (rec).
+pub fn use_object(s: *mut cast.CSym, sp: u.Span) void {
+    let cur = cs.cur_fn();
+    let owner = s.owner;
+    if u.isnil(cur) or u.isnil(owner) or (owner == cur) or (s.duration != cast.SD_AUTO) {
+        return;
+    }
+    if cty.is_vla(s.ty) {
+        cs.not_supported(sp,
+                         u.f1("the use of '%s', a variable length array of the enclosing function, in a nested function",
+                              s.name));
+        return;
+    }
+    let mut f = cur;
+    while u.notnil(f) and (f != owner) and u.notnil(f.nest_parent) {
+        add_once(&mut f.nest_parent.rec, s);
+        f = f.nest_parent;
+    }
+}
+
+fn add_once(l: *mut u.List.[*mut cast.CSym], s: *mut cast.CSym) void {
+    for x in l.items() {
+        if x == s {
+            return;
+        }
+    }
+    l.push(s);
+}
+
+/// Notes that the address of function s is taken (dir: -1 when the use was
+/// a direct call's, which takes back the use the callee's conversion noted).
+pub fn use_address(s: *mut cast.CSym, dir: i32) void {
+    if u.notnil(s.nest_parent) {
+        s.tramp_refs += dir;
+    }
+}
+
+/// At the end of function f's body: the nested functions of f whose
+/// addresses are taken (tramps).
+pub fn finish(f: *mut cast.CSym, nested: []*mut cast.CSym) void {
+    for g in nested {
+        if (g.nest_parent == f) and (g.tramp_refs > 0) {
+            add_once(&mut f.tramps, g);
+        }
+    }
+}
+
+/// The index of object s in function p's frame record (after its first
+/// slot, the record of p's enclosing function), or -1.
+pub fn rec_index(p: *cast.CSym, s: *mut cast.CSym) i32 {
+    for k in 0..p.rec.len {
+        if p.rec.get(k) == s {
+            return @int_cast(i32, k);
+        }
+    }
+    return -1;
+}
