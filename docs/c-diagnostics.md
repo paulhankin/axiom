@@ -281,6 +281,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C4112` | A known pragma that is malformed (`#pragma pack(3)`, ...); it is ignored. |
 | `C4113` | A pragma that is not honoured: `#pragma STDC FENV_ROUND FE_TONEARESTFROMZERO` (no target has the direction for binary arithmetic; `FENV_DEC_ROUND`'s is honoured), and `FENV_ROUND` of a directed rounding on WebAssembly (which rounds to nearest only). |
 | `C4114` | `#pragma pack(show)`: the value in force. |
+| `C4115` | `#pragma GCC dependency "file"`: the file was modified after the current one. |
 | `C4120` | An empty case range (`case 5 ... 3:`); it matches nothing. |
 | `C4121` | A null pointer constant passed for a parameter declared `nonnull`. |
 | `C4123` | A call of a function declared with the attribute `warning("message")`. |

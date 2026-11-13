@@ -12,6 +12,8 @@ N
 #pragma STDC FENV_ACCESS OFF
 #pragma GCC visibility push(hidden)
 #pragma GCC visibility pop
+#pragma GCC reset_options
+#pragma GCC optimize(2)
 after
 end
 #pragma weak w

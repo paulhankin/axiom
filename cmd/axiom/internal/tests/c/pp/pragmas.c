@@ -2,7 +2,8 @@
 /* The pragmas, in every mode: once, push_macro and pop_macro, message,
    pack (its forms), weak, STDC (FENV_ROUND FE_TONEARESTFROMZERO is warned
    about: no target has that direction), GCC diagnostic, visibility, system_header (no effect in the
-   main file), and _Pragma; unknown ones are ignored. */
+   main file), GCC optimize (written as the options it leaves in force), and _Pragma; unknown ones
+   are ignored. */
 /* expect-warning: C4110 */
 /* expect-warning: C4113 */
 /* expect-warning: C4112 */

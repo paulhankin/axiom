@@ -520,7 +520,39 @@ fn partial_factor(f: *mut ir.Func, h: *mut ir.Block, n: i64, size: i64) i64 {
     return factor;
 }
 
+// What a loop the program asks to be unrolled by k (C's #pragma GCC
+// unroll: ir.Block's unroll_hint) may grow to: k at most HINT_MAX, the
+// unrolled code at most HINT_SIZE instructions (more is not done).
+const HINT_MAX: i64 = 64;
+const HINT_SIZE: i64 = 4096;
+
+// The factor for a loop of n trips and `size` instructions the program
+// asks to be unrolled by k (k < n): k, as far as HINT_MAX and HINT_SIZE
+// allow, if the loop runs that body twice (0: not unrolled).
+fn hinted_factor(f: *mut ir.Func, h: *mut ir.Block, n: i64, size: i64, k: i64) i64 {
+    if f != partial_f {
+        partial_f = f;
+        partial_done.clear();
+    }
+    for j in 0..partial_done.len {
+        if partial_done.get(j) == h {
+            return 0;
+        }
+    }
+    let mut factor = @min(k, HINT_MAX);
+    while (factor > 1) and (((size * factor) > HINT_SIZE) or (n < (2 * factor))) {
+        factor -= 1;
+    }
+    if factor < 2 {
+        return 0;
+    }
+    return factor;
+}
+
 fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mut ir.Block]) bool {
+    if h.unroll_hint == 1 {
+        return false;  // (the program asks for none)
+    }
     let mut stay = ir.bnil();
     let n = trip_count(h, tag, &mut stay);
     if n < 0 {
@@ -533,7 +565,15 @@ fn try_unroll(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*mu
     // fully, or else partially: the body `factor` times, after the
     // iterations left over (n % factor) peeled off in front
     let mut factor: i64 = 0;
-    if (n > UNROLL_TRIPS) or ((size * n) > UNROLL_SIZE) {
+    let hint = @as(i64, h.unroll_hint);
+    if (hint > 1) and (n <= hint) and ((size * n) <= HINT_SIZE) {
+        factor = 0;  // (asked for at least the trip count: fully)
+    } else if hint > 1 {
+        factor = hinted_factor(f, h, n, size, hint);
+        if factor == 0 {
+            return false;
+        }
+    } else if (n > UNROLL_TRIPS) or ((size * n) > UNROLL_SIZE) {
         factor = partial_factor(f, h, n, size);
         if factor == 0 {
             return false;
@@ -916,7 +956,14 @@ fn try_runtime(f: *mut ir.Func, h: *mut ir.Block, tag: i64, members: *u.List.[*m
         }
     }
     let size = loop_size(members);
-    if (size < 0) or (size > RUNTIME_SIZE) or has_side_exits(h, tag, members, false) or not uses_ok(h, tag, false) {
+    // (a loop the program asks not to unroll is not; one it asks to unroll
+    // is, by two, whatever its size, up to HINT_SIZE)
+    let mut max_size = RUNTIME_SIZE;
+    if h.unroll_hint > 1 {
+        max_size = HINT_SIZE / 2;
+    }
+    if (h.unroll_hint == 1) or (size < 0) or (size > max_size) or has_side_exits(h, tag, members, false) or
+       not uses_ok(h, tag, false) {
         return false;
     }
     let mut n = vnil();

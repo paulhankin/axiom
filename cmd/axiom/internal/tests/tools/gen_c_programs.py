@@ -2,7 +2,7 @@
 """Writes a random C program free of undefined behaviour, for differential
 testing of the C front end against another implementation:
 
-    gen_c_programs.py SEED [--no-long] [--loops] [--hosted] [--attrs]
+    gen_c_programs.py SEED [--no-long] [--loops] [--hosted] [--attrs] [--restrict]
 
 The program is freestanding (it prints through host.h's print_u64) and
 prints a checksum of its globals after each call from main. With --loops
@@ -29,6 +29,14 @@ then shows. With --attrs (for a GNU dialect of C23: --c-std=gnu23) the
 functions that write only their locals are declared with the attribute
 pure, or, when their parameters are all scalars, C23's [[reproducible]],
 for the optimizer to act on (they read globals; they always return).
+With --restrict (and --loops) some of the loops over the arrays go through
+restrict-qualified pointers, only in the uses C allows (6.7.3.1): block-scope
+restricted pointers into different arrays (one written, one read), or into one
+array only read, a block in a loop's body whose two restricted pointers
+reach different elements in each iteration (the next iteration's overlap the
+last's), a structure with restrict-qualified members into different arrays,
+and calls of static inline functions with restrict parameters, given
+different arrays.
 """
 import random
 import sys
@@ -105,6 +113,7 @@ def common(a, b):
 class Gen:
     def __init__(self, seed, no_long, loops=False):
         self.attrs = False
+        self.restrict = False
         self.r = random.Random(seed)
         self.no_long = no_long
         self.loops = loops
@@ -690,9 +699,45 @@ class Gen:
         dx, dy = self.r.randint(0, m), self.r.randint(0, m)
         T = spell(t)
         kind = self.r.randint(0, 9)
+        if self.restrict and self.chance(0.5):
+            kind = self.r.randint(10, 14)
         b = ['%s{' % ind, '%s    unsigned lo_ = %s, hi_ = %s, ii;' % (ind, lo, hi)]
         i2 = ind + '    '
-        if kind == 0:
+        # (the arithmetic of an element: unsigned for integers)
+        if is_float(t):
+            mix = lambda x, y: '%s * (%s)0.5 + %s' % (x, T, y)
+        else:
+            mix = lambda x, y: '(%s)((unsigned long long)%s * 3u + (unsigned long long)%s)' % (T, x, y)
+        if kind >= 10 and kind != 11 and kind != 12 and src == name:
+            kind = 11  # (one array: through restricted pointers only read, or apart each iteration)
+        if kind == 10:
+            # block-scope restricted pointers into two arrays
+            b.append('%s{ %s *restrict d_ = %s + %d; const %s *restrict s_ = %s + %d;' % (i2, T, name, dx, T, src, dy))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) d_[ii] = %s; }' % (i2, mix('s_[ii]', 'd_[ii]')))
+        elif kind == 11:
+            # two restricted pointers into one array, both only read
+            b.append('%s{ const %s *restrict p_ = %s + %d; const %s *restrict q_ = %s + %d; unsigned long long a_ = 0;'
+                     % (i2, T, name, dx, T, name, dy))
+            if is_float(t):
+                b.append('%s  for (ii = lo_; ii < hi_; ii++) a_ = a_ * 3u + (p_[ii] < q_[ii]); ck(a_); }' % i2)
+            else:
+                b.append('%s  for (ii = lo_; ii < hi_; ii++) a_ = a_ * 3u + (unsigned long long)p_[ii] * (unsigned long long)q_[ii]; ck(a_); }' % i2)
+        elif kind == 12:
+            # a block in the loop's body: its pointers reach two elements,
+            # the next iteration's the last one's
+            b.append('%sfor (ii = lo_; ii + 1 < hi_; ii++) {' % i2)
+            b.append('%s    %s *restrict a_ = %s + ii + 1; const %s *restrict b_ = %s + ii;' % (i2, T, name, T, name))
+            b.append('%s    a_[0] = %s;' % (i2, mix('b_[0]', 'a_[0]')))
+            b.append('%s}' % i2)
+        elif kind == 13:
+            # restrict-qualified members into two arrays
+            b.append('%s{ struct { %s *restrict d; const %s *restrict s; } r_ = { %s + %d, %s + %d };'
+                     % (i2, T, T, name, dx, src, dy))
+            b.append('%s  for (ii = lo_; ii < hi_; ii++) r_.d[ii] = %s; }' % (i2, mix('r_.s[ii]', 'r_.d[ii]')))
+        elif kind == 14:
+            # an inlined function's restrict parameters, two arrays
+            b.append('%sif (hi_ > lo_) rmix_%s(%s + lo_ + %d, %s + lo_ + %d, hi_ - lo_);' % (i2, t, name, dx, src, dy))
+        elif kind == 0:
             b.append('%sfor (ii = lo_; ii < hi_; ii++) %s[ii + %d] = %s[ii + %d];' % (i2, name, dx, src, dy))
         elif kind == 1:
             b.append('%sfor (ii = hi_; ii > lo_; ii--) %s[ii - 1 + %d] = %s[ii - 1 + %d];' % (i2, name, dx, src, dy))
@@ -979,6 +1024,17 @@ class Gen:
             o.append('    snprintf(b, sizeof b, "%llx", v);')
             o.append('    printf("%llu %d\\n", strtoull(b, NULL, 16), (int)strlen(b));')
             o.append('}')
+        if self.restrict:
+            # (for array_loop: functions with restrict parameters to inline)
+            for t in self.scalars:
+                T = spell(t)
+                if is_float(t):
+                    e = 's[i] * (%s)0.5 + d[i]' % T
+                else:
+                    e = '(%s)((unsigned long long)s[i] * 3u + (unsigned long long)d[i])' % T
+                o.append('static inline void rmix_%s(%s *restrict d, const %s *restrict s, unsigned n) {' % (t, T, T))
+                o.append('    for (unsigned i = 0; i < n; i++) d[i] = %s;' % e)
+                o.append('}')
         for i in range(self.r.randint(0, 4)):
             self.gen_struct(i)
         genv = {'vars': [], 'arrays': [], 'fields': [], 'ptrs': [], 'svars': [], 'struct_globals': {}, 'pure': [],
@@ -1022,6 +1078,7 @@ def main():
     g = Gen(seed, no_long, '--loops' in sys.argv)
     g.hosted = '--hosted' in sys.argv
     g.attrs = '--attrs' in sys.argv
+    g.restrict = '--restrict' in sys.argv
     sys.stdout.write(g.program())
 
 

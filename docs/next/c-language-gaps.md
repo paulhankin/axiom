@@ -19,3 +19,12 @@
   restrict-qualified members of one structure object, are apart: loads after stores are
   forwarded, loops vectorized without an overlap check), and a function's restrict
   parameters keep telling it once the function is inlined (the call becomes a scope).
+- `#pragma GCC optimize`, `target`, `push_options`, `pop_options` and `reset_options`
+  give the functions defined after them their optimization level and extensions (as the
+  attributes `optimize` and `target`); `#pragma GCC unroll n`, `ivdep` and `novector`
+  are honoured by the loop unroller and the vectorizer; `#pragma GCC dependency` warns
+  (C4115) when the named file is newer.
+- The GNU dialects have `#import` and, before C23, the decimal floating types and their
+  constants.
+- docs/c.md no longer says that signed overflow wraps: the optimizer takes signed `+`,
+  `-` and `*` as not overflowing (as it has since C's arithmetic was marked so).

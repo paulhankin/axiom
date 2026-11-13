@@ -116,6 +116,9 @@ struct PP {
     packs: u.List.[Pack],                // #pragma pack(push): the values saved
     pack: u64,                           // the #pragma pack value in force (0: none)
     vis: u.List.[u64],                   // #pragma GCC visibility push: the values saved
+    fnopts: u64,                         // #pragma GCC optimize and target: the options in force (cpragma.fn_options)
+    importing: bool,                     // a GNU dialect's #import is being read: its file is read once
+    fnopts_saved: u.List.[u64],          // #pragma GCC push_options: those saved
 }
 
 // The definitions #pragma push_macro saved for a name (nil: it was not defined).
@@ -1726,7 +1729,10 @@ fn do_include(P: *mut PP, line: []lx.PTok, sp: u.Span, next: bool) void {
         return;
     }
     if (P.once.len > 0) and (P.once.get(once_key(path)) != 0) {
-        return;  // (#pragma once)
+        return;  // (#pragma once, or #import)
+    }
+    if P.importing {
+        P.once.put(once_key(path), 1);
     }
     let sf = load(P, path);
     if u.isnil(sf) {
@@ -2251,8 +2257,10 @@ fn pragma_stdc(P: *PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
     return no_tok();
 }
 
-// #pragma GCC diagnostic, visibility, poison, system_header, warning, error;
-// the other `#pragma GCC` forms (optimization settings, loop hints) are ignored.
+// #pragma GCC diagnostic, visibility, poison, system_header, warning, error,
+// dependency; the functions' options (optimize, target, push_options,
+// pop_options, reset_options: an event, EV_FNOPTS); the loop hints (unroll,
+// ivdep, novector: an event at the loop, EV_LOOP).
 fn pragma_gcc(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
     let n = ts[0].name;
     if u.str_eq(n, "diagnostic") {
@@ -2336,25 +2344,190 @@ fn pragma_gcc(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
         }
         return no_tok();
     }
-    // (optimize, target and the option stacks are not applied to the
-    // functions after them: the attributes are, csema_gnu.ax)
-    let opts = ["push_options", "pop_options", "reset_options", "optimize", "target"];
-    for k in opts {
-        if u.str_eq(n, k) {
-            if P.o.warn_pragmas {
-                _ = dg.warning(sp, "C4111",
-                               u.f1("'#pragma GCC %s' has no effect (the attributes optimize and target do)", n));
+    // the options of the functions defined after them (as the attributes
+    // optimize and target: csema_gnu.pragma_options)
+    if u.str_eq(n, "push_options") or u.str_eq(n, "pop_options") or u.str_eq(n, "reset_options") {
+        if ts.len != 1 {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+        if u.str_eq(n, "push_options") {
+            P.fnopts_saved.push(P.fnopts);
+            return no_tok();
+        }
+        if u.str_eq(n, "pop_options") {
+            if P.fnopts_saved.len == 0 {
+                _ = dg.warning(sp, "C4112", "'#pragma GCC pop_options' without a 'push_options', ignored");
+                return no_tok();
             }
-            return no_tok();
+            P.fnopts = P.fnopts_saved.pop();
+        } else {
+            P.fnopts = 0;
         }
+        return pragma_tok(cp.EV_FNOPTS, P.fnopts, sp);
     }
-    let known = ["unroll", "ivdep", "novector", "dependency"];
-    for k in known {
-        if u.str_eq(n, k) {
-            return no_tok();
+    if u.str_eq(n, "optimize") or u.str_eq(n, "target") {
+        return pragma_fnopts(P, ts, sp);
+    }
+    // the loop pragmas: of the loop statement right after them
+    if u.str_eq(n, "unroll") {
+        let xs = expand_list(P, ts[1..]);
+        if (xs.len != 1) or (xs[0].kind != lx.PK_NUMBER) {
+            return malformed(sp, "GCC unroll");
         }
+        let v = number_value(xs[0].text);
+        if (v < 0) or (v > 65534) {
+            return malformed(sp, "GCC unroll");
+        }
+        return pragma_tok(cp.EV_LOOP, @as(u64, @bit_cast(u64, v)) + 1, sp);
+    }
+    if u.str_eq(n, "ivdep") or u.str_eq(n, "novector") {
+        if ts.len != 1 {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+        let mut v = cp.LH_IVDEP;
+        if u.str_eq(n, "novector") {
+            v = cp.LH_NOVECTOR;
+        }
+        return pragma_tok(cp.EV_LOOP, @as(u64, v), sp);
+    }
+    if u.str_eq(n, "dependency") {
+        return pragma_dependency(P, ts[1..], sp);
     }
     unknown_pragma(P, ts, sp);
+    return no_tok();
+}
+
+// The value of a decimal integer constant's spelling (no suffix), or -1.
+fn number_value(t: []u8) i64 {
+    if (t.len == 0) or (t.len > 9) {
+        return -1;
+    }
+    let mut v: i64 = 0;
+    for c in t {
+        if (c < '0') or (c > '9') {
+            return -1;
+        }
+        v = (v * 10) + @as(i64, c - '0');
+    }
+    return v;
+}
+
+// The optimizer's level an option of `#pragma GCC optimize` asks for (as
+// the attribute: "O0" ... "O3", "-O2", "Os" and "Oz" 2, "Og" and "O" 1, a
+// number 0 to 3), or -1 for another option (ignored).
+fn level_option(s0: []u8) i32 {
+    let mut s = s0;
+    if (s.len > 0) and (s[0] == '-') {
+        s = s[1..];
+    }
+    if (s.len == 1) and (s[0] >= '0') and (s[0] <= '3') {
+        return @as(i32, s[0] - '0');
+    }
+    if u.str_eq(s, "O") or u.str_eq(s, "Og") or u.str_eq(s, "O1") {
+        return 1;
+    }
+    if u.str_eq(s, "Os") or u.str_eq(s, "Oz") or u.str_eq(s, "O2") {
+        return 2;
+    }
+    if u.str_eq(s, "O0") {
+        return 0;
+    }
+    if u.str_eq(s, "O3") {
+        return 3;
+    }
+    return -1;
+}
+
+// `#pragma GCC optimize (options)` and `#pragma GCC target (extensions)`:
+// the options are strings (each a comma-separated list) or numbers, in
+// parentheses or not, separated by commas; the functions defined after it
+// get them, added to those in force.
+fn pragma_fnopts(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    let n = ts[0].name;
+    let mut xs = ts[1..];
+    if (xs.len >= 2) and lx.is_punct(&xs[0], ct.P_LPAREN) and lx.is_punct(&xs[xs.len - 1], ct.P_RPAREN) {
+        xs = xs[1..xs.len - 1];
+    }
+    let mut opts = u.List.[[]u8].empty();
+    for k in 0..xs.len {
+        if (k % 2) == 1 {
+            if not lx.is_punct(&xs[k], ct.P_COMMA) {
+                return malformed(sp, u.cat2("GCC ", n));
+            }
+            continue;
+        }
+        if (xs[k].kind == lx.PK_STRING) and (xs[k].id == ct.ENC_NONE) {
+            let parts = u.split(string_text(P, &xs[k]), ',', 1000);
+            for part in parts.items() {
+                if part.len > 0 {
+                    opts.push(part);
+                }
+            }
+        } else if (xs[k].kind == lx.PK_NUMBER) and u.str_eq(n, "optimize") {
+            opts.push(xs[k].text);
+        } else {
+            return malformed(sp, u.cat2("GCC ", n));
+        }
+    }
+    if (opts.len == 0) or ((xs.len % 2) == 0) {
+        return malformed(sp, u.cat2("GCC ", n));
+    }
+    let mut level = cp.fn_level(P.fnopts);
+    let mut target = cp.fn_target(P.fnopts);
+    for o in opts.items() {
+        if u.str_eq(n, "optimize") {
+            let l = level_option(o);
+            if l >= 0 {
+                level = l;
+            }
+            continue;
+        }
+        let r = tg.parse_features(o);
+        if not u.isnos(r.bad) {
+            _ = dg.warning(sp, "C4112",
+                           u.f1("'#pragma GCC target': the extension '%s' is not one this target has, and is ignored",
+                                r.bad));
+            continue;
+        }
+        if target.len > 0 {
+            target = u.cat3(target, ",", o);
+        } else {
+            target = o;
+        }
+    }
+    if (level == cp.fn_level(P.fnopts)) and u.str_eq(target, cp.fn_target(P.fnopts)) {
+        return no_tok();  // (nothing changes)
+    }
+    P.fnopts = cp.fn_options(level, target);
+    return pragma_tok(cp.EV_FNOPTS, P.fnopts, sp);
+}
+
+// `#pragma GCC dependency "file" [text]`: the warning C4115 (with the
+// text) if the file, looked for as `#include "file"` would be, was changed
+// after the current one.
+fn pragma_dependency(P: *mut PP, ts: []lx.PTok, sp: u.Span) lx.PTok {
+    if (ts.len == 0) or ((ts[0].kind != lx.PK_STRING) and (ts[0].kind != lx.PK_HEADER)) {
+        return malformed(sp, "GCC dependency");
+    }
+    let t = ts[0].text;
+    if t.len < 2 {
+        return malformed(sp, "GCC dependency");
+    }
+    let name = t[1..t.len - 1];
+    let path = find_file(P, name, t[0] == '"');
+    if u.isnos(path) {
+        _ = dg.warning(sp, "C4112", u.f1("'#pragma GCC dependency': cannot find '%s', ignored", name));
+        return no_tok();
+    }
+    let mine = u.file_mtime(cur_src(P).path);
+    let theirs = u.file_mtime(path);
+    if (mine >= 0) and (theirs > mine) {
+        let mut msg = u.f1("the current file is older than '%s'", name);
+        if ts.len > 1 {
+            msg = u.cat3(msg, ": ", spelling(ts[1..]));
+        }
+        _ = dg.warning(sp, "C4115", msg);
+    }
     return no_tok();
 }
 
@@ -2472,6 +2645,12 @@ fn directive(P: *mut PP, hash: lx.PTok) void {
         do_include(P, ts, sp, false);
     } else if u.str_eq(name, "include_next") and P.o.gnu {
         do_include(P, ts, sp, true);
+    } else if u.str_eq(name, "import") and P.o.gnu {
+        // (a GNU dialect's: #include of a file not read again after it, as
+        // with #pragma once in it)
+        P.importing = true;
+        do_include(P, ts, sp, false);
+        P.importing = false;
     } else if u.str_eq(name, "line") {
         do_line(P, ts, sp);
     } else if u.str_eq(name, "error") {
@@ -2752,8 +2931,8 @@ fn protect_all(P: *mut PP) void {
 // Is `name` a directive of the preprocessor (assembly: any other line
 // starting with `#` is a comment)?
 fn known_directive(name: []u8) bool {
-    let ds = ["define", "undef", "include", "include_next", "line", "error", "warning", "ident", "pragma", "embed",
-              "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif"];
+    let ds = ["define", "undef", "include", "include_next", "import", "line", "error", "warning", "ident", "pragma",
+              "embed", "if", "ifdef", "ifndef", "elif", "elifdef", "elifndef", "else", "endif"];
     for d in ds {
         if u.str_eq(name, d) {
             return true;

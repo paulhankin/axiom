@@ -34,6 +34,47 @@ pub const EV_VISIBILITY: i32 = 2;      // #pragma GCC visibility: a VIS_ value
 pub const EV_FENV_ACCESS: i32 = 3;     // #pragma STDC FENV_ACCESS: 1 ON, 0 OFF or DEFAULT
 pub const EV_FENV_ROUND: i32 = 4;      // #pragma STDC FENV_ROUND: an FPR_ value
 pub const EV_FENV_DEC_ROUND: i32 = 5;  // #pragma STDC FENV_DEC_ROUND: an FPD_ value
+pub const EV_FNOPTS: i32 = 6;          // #pragma GCC optimize, target, ..._options: fn_options' number (0: none)
+pub const EV_LOOP: i32 = 7;            // #pragma GCC unroll, ivdep, novector: LH_ bits, for the loop at its position
+
+/// What the loop pragmas say of the loop statement after them (cast.Stmt's
+/// hints): `GCC unroll n` as n + 1 in the low 16 bits (n at most 65534;
+/// 0 and 1 mean no unrolling), `GCC ivdep`, `GCC novector`.
+pub const LH_UNROLL_MASK: u32 = 0xFFFF;
+pub const LH_IVDEP: u32 = 0x10000;
+pub const LH_NOVECTOR: u32 = 0x20000;
+
+// The options `#pragma GCC optimize` and `target` give the functions
+// defined after them: the optimizer's level (-1: the program's), and the
+// extensions (a comma-separated list, empty for none).
+struct FnOpts {
+    level: i32,
+    target: []u8,
+}
+
+let mut g_fnopts: u.List.[FnOpts] = u.List.[FnOpts].{ data: @ptr_from_int(*mut FnOpts, 0), len: 0, cap: 0 };
+
+/// A set of function options; its number (from 1) for EV_FNOPTS.
+pub fn fn_options(level: i32, target: []u8) u64 {
+    g_fnopts.push(FnOpts.{ level: level, target: target });
+    return @as(u64, g_fnopts.len);
+}
+
+/// The level of function options number k (-1: none, or k is 0).
+pub fn fn_level(k: u64) i32 {
+    if (k == 0) or (k > @as(u64, g_fnopts.len)) {
+        return -1;
+    }
+    return g_fnopts.get(@truncate(usize, k - 1)).level;
+}
+
+/// The extensions of function options number k ("" if none).
+pub fn fn_target(k: u64) []u8 {
+    if (k == 0) or (k > @as(u64, g_fnopts.len)) {
+        return "";
+    }
+    return g_fnopts.get(@truncate(usize, k - 1)).target;
+}
 
 /// The state of the floating-point pragmas at a point (cast.Stmt's fp,
 /// cast.Decl's fp): FP_ACCESS if FENV_ACCESS is ON, the FENV_ROUND
@@ -134,6 +175,7 @@ let mut g_installed: bool = false;
 pub fn begin_unit() void {
     g_changes.clear();
     g_weak.clear();
+    g_fnopts.clear();
     if not g_installed {
         g_installed = true;
         dg.filter = filter;
@@ -181,6 +223,28 @@ pub fn pack_at(pos: usize) u64 {
     return value_at(EV_PACK, pos);
 }
 
+/// The function options (fn_options' number) in force at the token at
+/// index pos.
+pub fn fn_options_at(pos: usize) u64 {
+    return value_at(EV_FNOPTS, pos);
+}
+
+/// The loop pragmas (LH_ bits) for a statement that begins at the token at
+/// index pos: those placed there.
+pub fn loop_hints_at(pos: usize) u32 {
+    let mut h: u32 = 0;
+    for c in g_changes.items() {
+        if (c.kind == EV_LOOP) and c.placed and (c.pos == pos) {
+            let v = @truncate(u32, c.value);
+            if (v & LH_UNROLL_MASK) != 0 {
+                h = h & ~LH_UNROLL_MASK;
+            }
+            h = h | v;
+        }
+    }
+    return h;
+}
+
 /// The `#pragma GCC visibility` value at the token at index pos.
 pub fn visibility_at(pos: usize) u64 {
     return value_at(EV_VISIBILITY, pos);
@@ -206,10 +270,25 @@ pub struct Line {
     text: []u8,
 }
 
+// Adds a line at pos, after those at or before it (in order of position:
+// few of them).
+fn add_line(l: *mut u.List.[Line], pos: usize, t: []u8) void {
+    let mut k = l.len;
+    l.push(Line.{ pos: pos, text: t });
+    while (k > 0) and (l.get(k - 1).pos > pos) {
+        let x = l.get(k - 1);
+        l.set(k - 1, l.get(k));
+        l.set(k, x);
+        k -= 1;
+    }
+}
+
 /// The pragmas the phases after the preprocessor need, as lines for the
 /// preprocessed text, in the order of their positions: each change of the
 /// pack value as `pack(n)`, of the visibility as `GCC visibility push(v)`
-/// or `pop`, then the `weak` ones at the end (pos: max).
+/// or `pop`, of the functions' options as `GCC reset_options` and the
+/// `GCC optimize` and `target` that give them, the loop pragmas as they
+/// were, the floating-point ones, then the `weak` ones at the end (pos: max).
 pub fn lines() []Line {
     let mut l = u.List.[Line].empty();
     for c in g_changes.items() {
@@ -218,6 +297,31 @@ pub fn lines() []Line {
         }
         let mut t = "";
         let kind = @max(c.kind, -c.kind);
+        if kind == EV_FNOPTS {
+            // (the options as they are from here: none, then the level and
+            // the extensions)
+            add_line(&mut l, c.pos, "GCC reset_options");
+            if fn_level(c.value) >= 0 {
+                add_line(&mut l, c.pos, u.f1("GCC optimize(%s)", u.idec(fn_level(c.value))));
+            }
+            if fn_target(c.value).len > 0 {
+                add_line(&mut l, c.pos, u.f1("GCC target(\"%s\")", fn_target(c.value)));
+            }
+            continue;
+        }
+        if kind == EV_LOOP {
+            let v = @truncate(u32, c.value);
+            if (v & LH_UNROLL_MASK) != 0 {
+                add_line(&mut l, c.pos, u.f1("GCC unroll %s", u.udec(@as(u64, (v & LH_UNROLL_MASK) - 1))));
+            }
+            if (v & LH_IVDEP) != 0 {
+                add_line(&mut l, c.pos, "GCC ivdep");
+            }
+            if (v & LH_NOVECTOR) != 0 {
+                add_line(&mut l, c.pos, "GCC novector");
+            }
+            continue;
+        }
         if kind == EV_PACK {
             t = "pack()";
             if c.value != 0 {
@@ -242,15 +346,7 @@ pub fn lines() []Line {
                 t = u.f1("GCC visibility push(%s)", names[@truncate(usize, c.value & 3)]);
             }
         }
-        // (in order of position: few of them)
-        let mut k = l.len;
-        l.push(Line.{ pos: c.pos, text: t });
-        while (k > 0) and (l.get(k - 1).pos > c.pos) {
-            let x = l.get(k - 1);
-            l.set(k - 1, l.get(k));
-            l.set(k, x);
-            k -= 1;
-        }
+        add_line(&mut l, c.pos, t);
     }
     for w in g_weak.items() {
         let mut t = u.cat2("weak ", w.name);
