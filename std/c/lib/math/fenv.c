@@ -10,10 +10,13 @@
 unsigned long __axc_fe_flags(void);
 int __axc_fe_set_flags(unsigned long f, unsigned long mask);
 int __axc_fe_round(void);
+/* the decimal rounding direction (std/c/rt/dfp_env.ax) */
+unsigned __axiom_int64 __axc_dec_round_get(void);
+unsigned __axiom_int64 __axc_dec_round_set(unsigned __axiom_int64 m);
 
-/* the environment of program start-up: rounding to nearest, no flags, all
-   exceptions masked (MXCSR 0x1f80; FPCR 0) */
-const fenv_t __axc_fe_dfl_env = { 0, 0 };
+/* the environment of program start-up: rounding to nearest (binary and
+   decimal), no flags, all exceptions masked (MXCSR 0x1f80; FPCR 0) */
+const fenv_t __axc_fe_dfl_env = { 0, 0, 0 };
 
 static int valid(int e)
 {
@@ -93,6 +96,7 @@ static void get_env(fenv_t *env)
     else
         env->__axiom_control = (unsigned long)(v & 0xffffffff);
     env->__axiom_status = __axc_fe_flags();
+    env->__axiom_dec = (unsigned long)__axc_dec_round_get();
 }
 
 /* (the control part is stored relative to the default, so that
@@ -100,6 +104,8 @@ static void get_env(fenv_t *env)
 static int set_env(const fenv_t *env)
 {
     unsigned __axiom_int64 v;
+    if (__axc_dec_round_set(env->__axiom_dec) != 0)
+        return 1;
     if (KIND == 1) {
         v = __builtin_axiom_fenv_get();
         v = (v & ~(unsigned __axiom_int64)0xffc0) | ((env->__axiom_control ^ 0x1f80) & 0xffc0);
@@ -140,15 +146,19 @@ int feupdateenv(const fenv_t *env)
 
 /* C23's (the library's units are C17: the type is <fenv.h>'s C23 one) */
 #ifndef __STDC_VERSION_FENV_H__
-typedef unsigned long femode_t;
+typedef struct {
+    unsigned long __axiom_control;
+    unsigned long __axiom_dec;
+} femode_t;
 #endif
-const femode_t __axc_fe_dfl_mode = 0;
+const femode_t __axc_fe_dfl_mode = { 0, 0 };
 
 int fegetmode(femode_t *m)
 {
     fenv_t e;
     get_env(&e);
-    *m = e.__axiom_control;
+    m->__axiom_control = e.__axiom_control;
+    m->__axiom_dec = e.__axiom_dec;
     return 0;
 }
 
@@ -156,8 +166,22 @@ int fesetmode(const femode_t *m)
 {
     fenv_t e;
     get_env(&e);
-    e.__axiom_control = *m;
+    e.__axiom_control = m->__axiom_control;
+    e.__axiom_dec = m->__axiom_dec;
     return set_env(&e);
+}
+
+/* C23 7.6.7: the decimal rounding direction, on every target */
+int fe_dec_getround(void)
+{
+    return (int)__axc_dec_round_get();
+}
+
+int fe_dec_setround(int r)
+{
+    if (r < 0)
+        return 1;
+    return (int)__axc_dec_round_set((unsigned __axiom_int64)r);
 }
 
 int fesetexcept(int e)

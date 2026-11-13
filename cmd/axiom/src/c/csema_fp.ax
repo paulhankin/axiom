@@ -26,6 +26,10 @@
 //       (carg, cproj, creal, ...: 7.25p6). The call is then an ordinary
 //       call of that function (csema_expr.ax: call), its arguments
 //       converted to its parameters' types.
+//   __builtin_axiom_dec(w, hi, lo)  a constant of the decimal floating type
+//       of w bits (32, 64, 128) whose encoding (BID) is lo (and hi for 128):
+//       for the headers' infinities and NaNs (<float.h>, <math.h>), which
+//       no decimal floating constant spells
 //   __builtin_axiom_fenv_kind()  the target's floating-point environment,
 //       an integer constant: 0 none (WebAssembly), 1 x86-64 (MXCSR),
 //       2 AArch64 (FPCR, FPSR)
@@ -39,9 +43,12 @@
 import "../target.ax" as tg;
 import "../util.ax" as u;
 import "cast.ax" as cast;
+import "cdec.ax" as cdec;
 import "csema.ax" as cs;
 import "csema_expr.ax" as cx;
 import "ctypes.ax" as cty;
+import "std/c/rt/decimal" as dfp;
+import "std/c/rt/ldouble" as ld;
 
 // The builtins (a CALL node's op; 400 and up, apart from csema_builtin.ax's,
 // csema_atomic.ax's and the GNU dialects').
@@ -66,6 +73,7 @@ pub const BI_FENV_KIND: i32 = 420;
 pub const BI_FENV_GET: i32 = 421;
 pub const BI_FENV_SET: i32 = 422;
 pub const BI_TG: i32 = 430;
+pub const BI_DEC: i32 = 440;
 
 // <math.h>'s FP_ classification values
 pub const FP_NAN: u64 = 0;
@@ -74,10 +82,11 @@ pub const FP_ZERO: u64 = 2;
 pub const FP_SUBNORMAL: u64 = 3;
 pub const FP_NORMAL: u64 = 4;
 
-let names: [20][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
+let names: [21][]u8 = ["fpclassify", "isfinite", "isinf", "isnan", "isnormal", "signbit", "issubnormal", "iszero",
                        "issignaling", "iscanonical", "isgreater", "isgreaterequal", "isless", "islessequal",
-                       "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "tg"];
-let ids: [20]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422, 430];
+                       "islessgreater", "isunordered", "fenv_kind", "fenv_get", "fenv_set", "tg", "dec"];
+let ids: [21]i32 = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 420, 421, 422, 430,
+                    440];
 
 /// The BI_ number of __builtin_axiom_<rest>, or 0.
 pub fn builtin_id(rest: []u8) i32 {
@@ -114,6 +123,9 @@ pub fn call(e: *mut cast.Expr, id: i32) bool {
     e.op = id;
     if id == BI_TG {
         return tg_call(e);
+    }
+    if id == BI_DEC {
+        return dec_call(e);
     }
     if id >= BI_FENV_KIND {
         return fenv_call(e, id);
@@ -165,6 +177,18 @@ fn class_call(e: *mut cast.Expr, id: i32) bool {
     if cty.is_integer(x.ty) {
         x = cx.convert(x, cty.t_double);
     }
+    if cty.is_decimal(x.ty) {
+        // (a decimal floating value: its class from its encoding, C23 7.12.3)
+        e.args.set(0, x);
+        e.ty = cty.t_int;
+        if x.is_const {
+            e.is_const = true;
+            e.cval = @as(u64, dfp.classify(x.xv, cdec.fmt(x.ty), @bit_cast(u32, id - BI_FPCLASSIFY)));
+        } else {
+            cty.note_dec();
+        }
+        return true;
+    }
     if not cty.is_floating(x.ty) {
         cs.err(x.span, "C3082", u.f2("the operand of %s has type %s, not a real floating type", e.a.name, cs.tq(x.ty)));
         return bad(e);
@@ -215,6 +239,9 @@ fn compare_call(e: *mut cast.Expr, id: i32) bool {
                                      cs.tq(y.ty)));
         return bad(e);
     }
+    if cx.mixes_dec(e, x.ty, y.ty) {
+        return bad(e);
+    }
     let mut t = cty.common_type(cty.unqual(x.ty), cty.unqual(y.ty));
     if cty.is_integer(t) {
         t = cty.t_double;
@@ -224,6 +251,32 @@ fn compare_call(e: *mut cast.Expr, id: i32) bool {
     e.args.set(0, x);
     e.args.set(1, y);
     e.ty = cty.t_int;
+    if cty.is_decimal(t) {
+        // (quiet comparisons of decimal values: -1, 0, 1, 2 unordered)
+        if x.is_const and y.is_const {
+            let mut c = dfp.ctx(dfp.R_NEAREST);
+            let o = dfp.cmp(x.xv, y.xv, false, cdec.fmt(t), &mut c);
+            let mut r = false;
+            if id == BI_ISGREATER {
+                r = o == 1;
+            } else if id == BI_ISGREATEREQUAL {
+                r = (o == 1) or (o == 0);
+            } else if id == BI_ISLESS {
+                r = o == -1;
+            } else if id == BI_ISLESSEQUAL {
+                r = (o == -1) or (o == 0);
+            } else if id == BI_ISLESSGREATER {
+                r = (o == -1) or (o == 1);
+            } else {
+                r = o == 2;
+            }
+            e.is_const = true;
+            e.cval = bit(r);
+        } else {
+            cty.note_dec();
+        }
+        return true;
+    }
     if x.is_const and y.is_const and not cty.is_wide(t) {
         let a = x.fcval;
         let b = y.fcval;
@@ -244,6 +297,25 @@ fn compare_call(e: *mut cast.Expr, id: i32) bool {
         e.is_const = true;
         e.cval = bit(r);
     }
+    return true;
+}
+
+fn dec_call(e: *mut cast.Expr) bool {
+    if not arity(e, 3, 3) {
+        return bad(e);
+    }
+    let w = cx.ice(e.args.get(0), "the first argument of __builtin_axiom_dec");
+    let hi = cx.ice(e.args.get(1), "the second argument of __builtin_axiom_dec");
+    let lo = cx.ice(e.args.get(2), "the third argument of __builtin_axiom_dec");
+    if not w.ok or not hi.ok or not lo.ok {
+        return bad(e);
+    }
+    if (w.v != 32) and (w.v != 64) and (w.v != 128) {
+        cs.err(e.span, "C3082", "the width of __builtin_axiom_dec is 32, 64 or 128");
+        return bad(e);
+    }
+    e.ty = cty.decimal(@truncate(i32, @bit_cast(i64, w.v)));
+    cdec.set(e, ld.W.{ lo: lo.v, hi: hi.v });
     return true;
 }
 
@@ -303,6 +375,46 @@ fn tg_rank(t: *mut cty.CType) i32 {
     return 1;  // double, and the integer types
 }
 
+// A type-generic macro's call with decimal floating arguments (C23 7.27p3):
+// _Decimal128 if any is one; else _Decimal64 if any is one, or one is an
+// integer and another a _Decimal32; else _Decimal32. The function is the
+// double one's name with d32, d64 or d128 (expd64 for exp), if <math.h>
+// declares it. A standard floating or complex argument among decimal ones
+// has no common type (C3230).
+fn tg_decimal(e: *mut cast.Expr, drank0: i32, ints: bool, bin: bool) bool {
+    if bin {
+        cs.err(e.span, "C3230",
+               "a type-generic macro's arguments mix decimal floating and standard floating or complex types: they have no common type");
+        return bad(e);
+    }
+    let mut drank = drank0;
+    if (drank == 1) and ints {
+        drank = 2;
+    }
+    let base = e.args.get(2);
+    let suf = ["d32", "d64", "d128"];
+    let mut sym = u.nil.[cast.CSym]();
+    let mut name: []u8 = "";
+    if base.kind == cast.ExprKind.IDENT {
+        name = u.intern(u.cat2(base.name, suf[@as(usize, @bit_cast(u32, drank - 1))]));
+        sym = cs.lookup(name);
+    }
+    if u.isnil(sym) {
+        cs.err(e.span, "C3082", "this type-generic macro has no function for decimal floating arguments");
+        return bad(e);
+    }
+    let callee = cast.new_expr(cast.ExprKind.IDENT, base.span);
+    callee.name = name;
+    let mut args = u.List.[*mut cast.Expr].empty();
+    for i in @as(usize, 7)..e.args.len {
+        args.push(e.args.get(i));
+    }
+    e.a = callee;
+    e.args = args;
+    e.op = 0;
+    return false;
+}
+
 fn tg_call(e: *mut cast.Expr) bool {
     let n = e.args.len;
     if n < 8 {
@@ -319,6 +431,9 @@ fn tg_call(e: *mut cast.Expr) bool {
     let mut rank: i32 = 0;
     let mut cplx = false;
     let mut ok = true;
+    let mut drank: i32 = 0;  // the widest decimal argument's: 1, 2, 3 for _Decimal32, 64, 128
+    let mut ints = false;
+    let mut bin = false;  // a standard floating or complex argument
     let ngv = @as(usize, @truncate(u32, ng.v));
     for i in @as(usize, 7)..(7 + ngv) {
         let a = cx.rv(e.args.get(i));
@@ -329,13 +444,20 @@ fn tg_call(e: *mut cast.Expr) bool {
             cs.err(a.span, "C3082", u.f1("an argument of a type-generic macro has type %s, not an arithmetic type",
                                          cs.tq(a.ty)));
             ok = false;
+        } else if cty.is_decimal(a.ty) {
+            drank = @max(drank, (a.ty.unq.kind - cty.TK_DEC32) + 1);
         } else {
             rank = @max(rank, tg_rank(a.ty));
             cplx = cplx or cty.is_complex(a.ty);
+            ints = ints or cty.is_integer(a.ty);
+            bin = bin or not cty.is_integer(a.ty);
         }
     }
     if not ok {
         return bad(e);
+    }
+    if drank > 0 {
+        return tg_decimal(e, drank, ints, bin);
     }
     // the function: slot 1 + rank (real) or 4 + rank (complex)
     let real = e.args.get(1 + @as(usize, @bit_cast(u32, rank)));

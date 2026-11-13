@@ -91,6 +91,15 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
             lm = 'D';
             p++;
             break;
+        case 'H':
+            /* C23: _Decimal32, _Decimal64 (D), _Decimal128 (DD) */
+            lm = '1';
+            p++;
+            break;
+        case 'D':
+            lm = p[1] == 'D' ? '3' : '2';
+            p += lm == '3' ? 2 : 1;
+            break;
         case 'w': {
             /* C23: wN, wfN */
             int fast = p[1] == 'f', n = 0;
@@ -117,6 +126,9 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
         conv = *p++;
         if (conv == 0)
             goto matching_failure;
+        if (lm >= '1' && lm <= '3' && (conv | 0x20) != 'a' && (conv | 0x20) != 'e' && (conv | 0x20) != 'f' &&
+            (conv | 0x20) != 'g')
+            goto matching_failure; /* (H, D and DD take only the floating conversions) */
         if (!suppress && conv != 'n')
             dst = va_arg(ap, void *);
         if (conv != '[' && conv != 'c' && conv != 'n') {
@@ -303,6 +315,7 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
                 cap = sizeof small;
             }
             num.cap = (int)cap;
+            num.nohex = lm >= '1' && lm <= '3'; /* (strtod32's subject sequence: no hexadecimal form) */
             if (!__axc_scan_num(in, width, &num, &taken, &valid)) {
                 if (num.d != small)
                     __axc_sys_free(num.d, cap);
@@ -316,7 +329,9 @@ int SF_NAME(struct __axc_in *in, const CH *fmt, va_list ap) {
             }
             convs++;
             if (!suppress) {
-                if (lm == 'D')
+                if (lm >= '1' && lm <= '3')
+                    __axc_num_dec(&num, lm - '0', dst, &range);
+                else if (lm == 'D')
                     *(long double *)dst = __axc_num_long_double(&num, &range);
                 else if (lm == 'l')
                     *(double *)dst = __axc_num_double(&num, &range);

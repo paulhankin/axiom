@@ -85,6 +85,11 @@ unsigned long wcstoul(const wchar_t *__AXIOM_WR nptr, wchar_t **__AXIOM_WR endpt
 #if __STDC_VERSION__ >= 199901L
 float wcstof(const wchar_t *restrict nptr, wchar_t **restrict endptr);
 long double wcstold(const wchar_t *restrict nptr, wchar_t **restrict endptr);
+#ifdef __STDC_IEC_60559_DFP__
+_Decimal32 wcstod32(const wchar_t *restrict nptr, wchar_t **restrict endptr);
+_Decimal64 wcstod64(const wchar_t *restrict nptr, wchar_t **restrict endptr);
+_Decimal128 wcstod128(const wchar_t *restrict nptr, wchar_t **restrict endptr);
+#endif
 long long wcstoll(const wchar_t *restrict nptr, wchar_t **restrict endptr, int base);
 unsigned long long wcstoull(const wchar_t *restrict nptr, wchar_t **restrict endptr, int base);
 /* C23's: the binary prefixes too (the names C23 mode maps them to) */

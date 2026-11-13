@@ -379,6 +379,71 @@ exact (correctly rounded) in the format `long double` has: binary64, the x87 80-
 format or binary128 (`LDBL_MANT_DIG` 53, 64 or 113, "Floating types"), read from and
 written to the value's bits by the standard I/O's engines (`fmtfloat.c`, `scanfloat.c`).
 
+### Decimal floating types
+
+C23's `_Decimal32`, `_Decimal64` and `_Decimal128` (`__STDC_IEC_60559_DFP__` is
+`202311L` in C23 mode) are IEEE 754-2019's decimal32, decimal64 and decimal128 formats,
+encoded in BID (binary integer decimal), the encoding the C ABIs of x86-64 and AArch64
+specify: 4, 8 and 16 bytes, aligned to their sizes. Their arithmetic is software of the
+compiler's (`std/c/rt/decimal.ax`), the same on every target:
+
+- **Constants** (`1.20df`, `1.2E+3dd`, `5.dl`; C23 only, not hexadecimal: `C1019`) are
+  rounded once to the type (to nearest), with the quantum they are written with:
+  `1.20dd` has the coefficient 120 and the exponent -2. Constant expressions and static
+  initializers are folded exactly by the compiler, with the run time's operations.
+- **Operations** (`+ - * /`, the comparisons, `++`, `--`, compound assignment, the
+  conversions) are correctly rounded in the thread's decimal rounding direction
+  (`fe_dec_setround`, `<fenv.h>`), with IEEE 754's quanta: an exact result is the member
+  of its cohort with the operation's preferred exponent (the lesser of the operands'
+  for `+` and `-`, their sum for `*`, their difference for `/`), an inexact one has the
+  format's precision. Subnormal results, overflow (to infinity or the largest value, as
+  the direction says), NaN payloads and signaling NaNs are IEEE 754's; `<` `<=` `>` `>=`
+  are signaling ("invalid" for a quiet NaN), `==` and `!=` quiet. The exceptions are
+  raised in `<fenv.h>`'s flags where the target has flags (x86-64, AArch64): the
+  software keeps them per thread and `fetestexcept` and the other functions see them
+  with the hardware's.
+- **Conversions**: from an integer of any width (`__int128`, `_BitInt(N)` too) exact or
+  rounded, with exponent 0; to an integer truncated toward zero, saturated with
+  "invalid" out of range (undefined, C23 6.3.1.4); to and from `float`, `double` and
+  `long double` (every format: binary64, the x87's, binary128) correctly rounded both
+  ways (to a decimal type in the decimal rounding direction, the exact value's exponent
+  the one nearest 0; to a binary type to nearest), and between the decimal types. A
+  decimal operand does not mix with a standard floating or complex one in the usual
+  arithmetic conversions (`C3230`, C23 6.3.1.8p1); a cast or an assignment converts
+  between them (to a complex type: the real part). `_Generic`, `_Atomic` (lock-free for 4
+  and 8 bytes; `+=` and the others a compare-exchange loop), `constexpr` (the value
+  representable exactly) and bit-exact layout work as for the other types.
+- **The library**: `<math.h>`'s functions with the suffixes `d32`, `d64` and `d128`
+  (C23 7.12): every one C23 lists, among them the quantum functions (`quantized64`,
+  `samequantumd64`, `quantumd64`, `llquantexpd64`), the encodings (`encodedecd64` and
+  `decodedecd64`: densely packed decimal; `encodebind64`, `decodebind64`), total order,
+  payloads, `fromfp` and its kin, the narrowing operations (`d32addd64` ...),
+  `canonicalize`; `<tgmath.h>` chooses them for decimal arguments (C23 7.27p3); the
+  classification and comparison macros take them. The exact functions (rounding,
+  `fmod`, `remainder`, `fma`, `sqrt`, `scalbn`, `frexp`, `nextafter`, ...) are correctly
+  rounded; the elementary ones (`exp`, `log`, `pow`, `sin`, `atan2`, `erf`, `tgamma`, ...)
+  compute in decimal arithmetic of the format's precision and 12 more digits (and as
+  many as cancellation needs; trigonometric arguments reduced exactly, up to 10^6145)
+  and round once: within 1 ulp (measured against mpmath, a few hundred arguments of
+  every magnitude per function and format: the largest error 0.500 ulp). An exact result has the quantum C23 prefers (`sqrtd64(1.44dd)` is `1.2`,
+  `expd64(0)` is `1`, `powd64(2.0dd, 10)` is `1024.0000000000`); errors set `errno` as
+  for the binary functions (`math_errhandling`). `strtod32`, `strtod64`, `strtod128`
+  and the `wcstod` forms are correctly rounded in the decimal rounding direction, with
+  the quantum as written (`ERANGE` on overflow and underflow); `fprintf` and `fscanf`
+  take the length modifiers `H`, `D` and `DD` with `a e f g` and their upper case: `%Da`
+  writes the coefficient and the quantum exactly (`1.20`, `1.2e+03`: style f when
+  -(n + 5) <= q <= 0, else e; a precision rounds the coefficient), `e f g` round the
+  value's digits as for `double`; `strfromd32` ... format as `snprintf` does.
+  `<float.h>` has the `DEC32_` ... macros; `<fenv.h>` `FE_DEC_DOWNWARD`,
+  `FE_DEC_TONEAREST`, `FE_DEC_TONEARESTFROMZERO`, `FE_DEC_TOWARDZERO`, `FE_DEC_UPWARD`,
+  `fe_dec_getround` and `fe_dec_setround`, and `fenv_t` and `femode_t` hold the decimal
+  direction too.
+- **Speed** (x86-64, `-O2`): an operation is a call of the software, about 200 ns for a
+  `_Decimal64` multiplication or addition, 600 ns for a `_Decimal128` division; an
+  elementary function tens of microseconds (`expd64` about 50 us), a trigonometric one
+  of an argument beyond 10^17 milliseconds (the exact reduction). Speed was not this
+  implementation's aim.
+
 ### Standard input/output: `<stdio.h>`
 
 The library's `<stdio.h>` (`std/c/lib/stdio/`, over `std/c/rt/stdio.ax`) is all of
@@ -701,7 +766,7 @@ has it: `'long long' is a C99 feature`. The main differences:
 | C99 | `//` comments, `long long`, `_Bool`, `inline`, `restrict`, variable length arrays, flexible array members, designated initializers, compound literals, declarations after statements and in `for`, variadic macros and empty macro arguments, `_Pragma`, hexadecimal floating constants, universal character names, `__func__`, `<stdint.h>`, `<stdbool.h>`. No more implicit `int` or implicit function declarations (`C3060`). |
 | C11 | `_Generic`, `_Static_assert`, `_Noreturn`, `_Alignas`, `_Alignof`, `_Atomic`, `_Thread_local`, anonymous structures and unions, `u""`, `U""` and `u8""` literals and `u''` and `U''` constants, `<stdalign.h>`, `<stdatomic.h>`, `<stdnoreturn.h>`, the `__STDC_NO_...__` macros. |
 | C17 | The same language as C11. |
-| C23 | Attributes (`[[deprecated]]` and the other standard ones), `constexpr`, `auto` type inference, `typeof` and `typeof_unqual`, `nullptr`, `bool`, `true`, `false`, `alignas`, `alignof`, `static_assert` and `thread_local` as keywords, `_BitInt(N)` and the `wb` suffix, binary constants, digit separators, `#embed`, `__has_include`, `__has_embed`, `__has_c_attribute`, `#elifdef`, `#elifndef`, `#warning`, `__VA_OPT__`, `{}` initializers, enumerations with a fixed underlying type, labels before declarations, unnamed parameters in definitions, `u8''` constants, `static_assert` without a message, `<stdbit.h>`, `<stdckdint.h>`, `unreachable` and `nullptr_t` in `<stddef.h>`. No more trigraphs, K&R function definitions or `()` as an unprototyped declarator. |
+| C23 | The decimal floating types and constants (`_Decimal64`, `1.20dd`), attributes (`[[deprecated]]` and the other standard ones), `constexpr`, `auto` type inference, `typeof` and `typeof_unqual`, `nullptr`, `bool`, `true`, `false`, `alignas`, `alignof`, `static_assert` and `thread_local` as keywords, `_BitInt(N)` and the `wb` suffix, binary constants, digit separators, `#embed`, `__has_include`, `__has_embed`, `__has_c_attribute`, `#elifdef`, `#elifndef`, `#warning`, `__VA_OPT__`, `{}` initializers, enumerations with a fixed underlying type, labels before declarations, unnamed parameters in definitions, `u8''` constants, `static_assert` without a message, `<stdbit.h>`, `<stdckdint.h>`, `unreachable` and `nullptr_t` in `<stddef.h>`. No more trigraphs, K&R function definitions or `()` as an unprototyped declarator. |
 
 Attributes are checked where the standard says (a `[[nodiscard]]` on an object is an
 error). The standard ones, `deprecated`, `fallthrough`, `maybe_unused`, `nodiscard`,
@@ -722,7 +787,8 @@ the `SOURCE_DATE_EPOCH` environment variable's, in UTC), `__FILE__`, `__LINE__`.
 `__STDC_NO_THREADS__` are not defined: atomics, threads (see "Atomics and threads") and
 complex types are supported. In C23,
 `__STDC_EMBED_NOT_FOUND__`, `__STDC_EMBED_FOUND__` and `__STDC_EMBED_EMPTY__` are 0, 1
-and 2. `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__` and `__STDC_ISO_10646__` are not
+and 2, and `__STDC_IEC_60559_DFP__` is `202311L` (the decimal floating types, "Decimal
+floating types" below). `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__` and `__STDC_ISO_10646__` are not
 defined, nor is `__STDC_IEC_559_COMPLEX__` (see "Known deviations").
 
 The compiler's own macros say what the build chose:
@@ -854,7 +920,7 @@ library's are `C1081`.
 
 | Header | Modes | Notes |
 |---|---|---|
-| `<float.h>` | all | `FLT_`, `DBL_` and `LDBL_` macros (the `LDBL_` ones and `DECIMAL_DIG` of the format of `long double`). No `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`. |
+| `<float.h>` | all | `FLT_`, `DBL_` and `LDBL_` macros (the `LDBL_` ones and `DECIMAL_DIG` of the format of `long double`). No `FLT_SNAN`, `DBL_SNAN`, `LDBL_SNAN`. In C23 the `DEC32_`, `DEC64_` and `DEC128_` macros (`_SNAN` too: decimal signaling NaNs stay signaling) and `DEC_EVAL_METHOD` (0). |
 | `<limits.h>` | all | `LLONG_` from C99; `*_WIDTH`, `BOOL_MAX` and `BITINT_MAXWIDTH` (65535) in C23. |
 | `<stdarg.h>` | all | `va_list`, `va_start`, `va_arg`, `va_copy`, `va_end`. In C23 `va_start` needs no second argument. |
 | `<stddef.h>` | all | `size_t`, `ptrdiff_t`, `wchar_t`, `NULL`, `offsetof`; `max_align_t` from C11; `nullptr_t` and `unreachable` in C23. |
@@ -891,8 +957,7 @@ as the standard says.
 
 ## Not supported
 
-- `_Imaginary` (the imaginary types, which are optional), decimal floating types and
-  constants: each is `C3901` (a decimal constant is `C1019`).
+- `_Imaginary` (the imaginary types, which are optional): `C3901`.
 - Annex F and Annex G: `__STDC_IEC_559__`, `__STDC_IEC_60559_BFP__`,
   `__STDC_IEC_559_COMPLEX__` and `__STDC_IEC_60559_COMPLEX__` are not defined on any
   target. What keeps them off: a `long double` wider than `double` (x86-64 Linux, AArch64
@@ -1196,6 +1261,8 @@ Programs should not use them.
 | `__builtin_complex`, `__builtin_creal`, `__builtin_cimag`, `__builtin_conj` | `<complex.h>`: `__builtin_complex(x, y)` is `x + iy` for `x` and `y` of one real floating type. |
 | `__axiom_cmul_f32`, `__axiom_cdiv_f64`, ... | The compiler's own functions for complex multiplication and division (internal to the program). |
 | `__axiom_int64` | A keyword for a 64-bit integer type (`unsigned __axiom_int64` too) in every mode, for `size_t` in headers before C99 and for programs that need one in C89. |
+| `__axiom_decimal32`, `__axiom_decimal64`, `__axiom_decimal128` | Keywords for the decimal floating types in every mode (the C library's sources, which are C17). |
+| `__builtin_axiom_dec(w, hi, lo)` | A constant of the decimal floating type of w bits with that encoding (BID): `<math.h>`'s and `<float.h>`'s infinities and NaNs. |
 | `__AXIOM_...`, `__axiom_...` | Macros and members of the headers. |
 | `__axc_...`, `__AXC_...` | The C library's internal names (`__axc_setjmp`, `__axc_errno`, ...), and its private headers `axc/*.h`. |
 
@@ -1386,6 +1453,20 @@ x86-64 (Linux), both ways; wider ones only where that compiler agrees with the p
 lays out arrays of them with another stride), and on AArch64 the alignment of 16 follows
 AAPCS64, which that compiler does not. The Windows and WebAssembly signatures were compared
 with another compiler's for those targets.
+
+The decimal floating types (BID, as the ABIs of x86-64 and AArch64 say) travel as the
+binary floating types of their sizes do, as types of their own: x86-64 System V's class
+SSE for `_Decimal32` and `_Decimal64`, SSE and SSEUP (one `xmm` register) for
+`_Decimal128`, as the psABI specifies; AAPCS64's `s`, `d` and `q` registers, and
+homogeneous aggregates of one decimal type (a `_Decimal32` and a `float` are not one);
+variadic arguments as these (not promoted: `_Decimal32` stays itself). Windows x64,
+whose documentation names no decimal types, and the WebAssembly C ABI, which names
+none: this implementation follows the de facto convention of the platform's other
+compiler that has them on Windows (the integers of their sizes: `_Decimal32` and
+`_Decimal64` in integer registers, `_Decimal128` by reference and its result through
+the hidden pointer), and on WebAssembly passes them as `f32`, `f64` and binary128's two
+`i64`s. Checked against the system's C compiler on `x86_64` and `aarch64` Linux, both
+ways (`gen_c_abi.py --dec`, thousands of random shapes).
 
 A `long double` travels as the ABI says for its format: the x87's in memory (System V's
 classes X87 and X87UP; a structure or union holding one is classified with them), its
@@ -1595,7 +1676,13 @@ claims less than the standard allows. None is hidden: each is said above or here
   (no overflow forming the divisor's squared magnitude); it may differ in the last bit
   from other implementations' choices. `CX_LIMITED_RANGE` has no effect (the full
   algorithms are always used).
-- Decimal floating types are absent, as the feature macros say.
+- The decimal floating types: `#pragma STDC FENV_DEC_ROUND` with a direction other
+  than `FE_DEC_TONEAREST` and `FE_DEC_DYNAMIC` is `C4113` (operations round in the
+  dynamic direction, `fe_dec_setround`'s, which `FENV_ROUND` does not change; outside
+  `FENV_ACCESS ON` operations of constants are folded to nearest, as for the binary
+  types); `fprintf`'s decimal conversions round half to even, as its binary ones
+  do; on WebAssembly their exceptions are not recorded (no flags there, as for binary);
+  a NaN's n-char-sequence in `strtod64` and `fscanf` is read and ignored.
 - `restrict` has no effect on the generated code; `#pragma STDC FENV_ACCESS ON` is not
   honoured (C4113).
 - Signed overflow, which is undefined, wraps in the code the compiler generates today;

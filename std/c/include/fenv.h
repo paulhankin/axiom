@@ -27,6 +27,7 @@
 typedef struct {
     unsigned long __axiom_control;
     unsigned long __axiom_status;
+    unsigned long __axiom_dec; /* the decimal rounding direction (FE_DEC_TONEAREST ...) */
 } fenv_t;
 
 typedef unsigned short fexcept_t;
@@ -59,14 +60,30 @@ int fesetenv(const fenv_t *__env);
 int feupdateenv(const fenv_t *__env);
 
 #if __STDC_VERSION__ >= 202311L
-/* the dynamic control modes: the rounding mode (and the masks) */
-typedef unsigned long femode_t;
+/* the dynamic control modes: the rounding mode (and the masks), and the
+   decimal rounding direction */
+typedef struct {
+    unsigned long __axiom_control;
+    unsigned long __axiom_dec;
+} femode_t;
 extern const femode_t __axc_fe_dfl_mode;
 #define FE_DFL_MODE (&__axc_fe_dfl_mode)
 int fegetmode(femode_t *__m);
 int fesetmode(const femode_t *__m);
 int fesetexcept(int __e);
 int fetestexceptflag(const fexcept_t *__f, int __e);
+
+/* the decimal floating types' rounding direction (7.6.7), kept apart from
+   the binary one: the decimal arithmetic is the library's (in software, on
+   every target, WebAssembly too); its exceptions are raised in the flags
+   above where the target has them */
+#define FE_DEC_TONEAREST 0
+#define FE_DEC_DOWNWARD 1
+#define FE_DEC_UPWARD 2
+#define FE_DEC_TOWARDZERO 3
+#define FE_DEC_TONEARESTFROMZERO 4
+int fe_dec_getround(void);
+int fe_dec_setround(int __r);
 #endif
 
 #endif

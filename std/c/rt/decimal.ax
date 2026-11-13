@@ -1,0 +1,2993 @@
+// =============================================================================
+// std/c/rt/decimal.ax - C's decimal floating types (C23 _Decimal32,
+// _Decimal64, _Decimal128) in software, written from IEEE 754-2019's
+// decimal chapters (3.5 the formats, 5 the operations, 7 the exceptions)
+// and C23 (6.3.1.4, 6.3.1.5, 7.12, Annex? none: the rules are 7.12's).
+//
+// Formats (D32, D64, D128), each in the binary integer decimal (BID)
+// encoding of IEEE 754-2019 3.5.2, the one the C ABIs of our targets use:
+//
+//   format   p (digits)  emax   q range (quantum exponent)   storage
+//   D32       7           96    -101 .. 90                   32 bits
+//   D64      16          384    -398 .. 369                  64 bits
+//   D128     34         6144   -6176 .. 6111                 128 bits
+//
+// A finite value is (-1)^s * c * 10^q, c an integer coefficient below 10^p.
+// The values with the same value but different q are its cohort: the
+// operations keep the quantum IEEE 754 prefers for each (5.2: the exact
+// result's cohort member closest to the operation's preferred exponent;
+// an inexact result has p digits, or the least exponent the format
+// allows). A coefficient of 10^p or more (a non-canonical encoding) is 0
+// (3.5.2), a NaN payload of 10^(p - 1) or more is 0.
+//
+// A value is 16 bytes (ld.W, lo the first eight): D32 in lo's low 32 bits,
+// D64 in lo, D128 in both, little-endian. The front end (cmd/axiom/src/c/
+// cgen_dec.ax) calls the `dec_` functions for C's arithmetic, comparisons
+// and conversions (the narrow formats as integers, D128 through pointers),
+// which round in the thread's decimal rounding direction and raise their
+// exceptions in dec_env.ax; it folds constants with the same operations
+// (with a Ctx of its own: to nearest, ties to even, flags ignored).
+//
+// Rounding directions (R_): to nearest ties to even, toward -inf, toward
+// +inf, toward zero, to nearest ties away from zero (<fenv.h>'s FE_DEC_
+// values). Exceptions: invalid, division by zero, overflow, underflow (a
+// tiny inexact result, tininess detected before rounding as for every
+// decimal operation, 7.5), inexact. NaNs: a signaling operand makes the
+// operation invalid; the result is the first signaling NaN operand
+// quieted, else the first quiet one, with its payload and sign; an invalid
+// operation without NaN operands gives the positive quiet NaN with payload
+// 0. Comparisons: quiet ones (==, !=) are invalid for signaling NaNs only,
+// signaling ones (< <= > >=) for every NaN.
+//
+// Arithmetic is exact before the one rounding: coefficients are natural
+// numbers in base 10^9 (Nat, in buffers on the stack), with Knuth's
+// Algorithm D for division (The Art of Computer Programming, vol. 2,
+// 4.3.1) and Newton's iteration for square roots. Conversions between the
+// decimal and the binary formats (binary32, binary64, the x87's 80-bit
+// format, binary128) are exact before their one rounding too: a binary
+// value m * 2^e is m * 2^e or m * 5^-e * 10^e in decimal; a decimal value
+// c * 10^q is divided into its top binary digits with a remainder. To a
+// decimal format they round in the decimal rounding direction; to a binary
+// format, to nearest with ties to even (the compiler's binary arithmetic
+// assumes that direction).
+// =============================================================================
+import "dec_env.ax" as env;
+import "ldouble.ax" as ld;
+
+/// The formats.
+pub const D32: u32 = 0;
+pub const D64: u32 = 1;
+pub const D128: u32 = 2;
+
+/// The rounding directions (C23 <fenv.h> FE_DEC_TONEAREST, FE_DEC_DOWNWARD,
+/// FE_DEC_UPWARD, FE_DEC_TOWARDZERO, FE_DEC_TONEARESTFROMZERO).
+pub const R_NEAREST: u32 = 0;
+pub const R_DOWN: u32 = 1;
+pub const R_UP: u32 = 2;
+pub const R_ZERO: u32 = 3;
+pub const R_AWAY: u32 = 4;
+
+/// The exception flags (<fenv.h>'s FE_ values).
+pub const F_INVALID: u32 = 0x01;
+pub const F_DIVBYZERO: u32 = 0x04;
+pub const F_OVERFLOW: u32 = 0x08;
+pub const F_UNDERFLOW: u32 = 0x10;
+pub const F_INEXACT: u32 = 0x20;
+
+/// An operation's context: the rounding direction, and the flags it
+/// raises (added to `flags`).
+pub struct Ctx {
+    mode: u32,
+    flags: u32,
+}
+
+/// A context rounding in direction `mode`, with no flags yet.
+pub fn ctx(mode: u32) Ctx {
+    return Ctx.{ mode: mode, flags: 0 };
+}
+
+/// What a value is (Dec.cls).
+pub const K_FIN: u32 = 0;  // finite (zero included)
+pub const K_INF: u32 = 1;
+pub const K_QNAN: u32 = 2;
+pub const K_SNAN: u32 = 3;
+
+/// A 128-bit unsigned integer.
+pub struct U2 {
+    h: u64,
+    l: u64,
+}
+
+/// A value taken apart: finite, (-1)^neg * c * 10^q; a NaN's payload in c.
+pub struct Dec {
+    cls: u32,
+    neg: bool,
+    q: i32,
+    c: U2,
+}
+
+// -----------------------------------------------------------------------------
+// The formats
+// -----------------------------------------------------------------------------
+
+/// The precision of format f, in digits.
+pub fn prec(f: u32) i32 {
+    if f == D32 {
+        return 7;
+    }
+    if f == D64 {
+        return 16;
+    }
+    return 34;
+}
+
+/// The largest exponent of format f (of a value d.ddd... x 10^e).
+pub fn emax(f: u32) i32 {
+    if f == D32 {
+        return 96;
+    }
+    if f == D64 {
+        return 384;
+    }
+    return 6144;
+}
+
+/// The least quantum exponent of format f (1 - emax - (p - 1)).
+pub fn qmin(f: u32) i32 {
+    return (1 - emax(f)) - (prec(f) - 1);
+}
+
+/// The largest quantum exponent of format f (emax - (p - 1)).
+pub fn qmax(f: u32) i32 {
+    return emax(f) - (prec(f) - 1);
+}
+
+pub fn kbits(f: u32) u32 {
+    if f == D32 {
+        return 32;
+    }
+    if f == D64 {
+        return 64;
+    }
+    return 128;
+}
+
+// The width of the biased exponent (w + 2 in IEEE 754's terms).
+fn ebits(f: u32) u32 {
+    if f == D32 {
+        return 8;
+    }
+    if f == D64 {
+        return 10;
+    }
+    return 14;
+}
+
+// The coefficient's bits when the combination field does not begin with 11.
+pub fn cbits(f: u32) u32 {
+    return (kbits(f) - 1) - ebits(f);
+}
+
+pub fn bias(f: u32) i32 {
+    return -qmin(f);
+}
+
+// -----------------------------------------------------------------------------
+// 128-bit integers
+// -----------------------------------------------------------------------------
+
+pub fn u2(h: u64, l: u64) U2 {
+    return U2.{ h: h, l: l };
+}
+
+pub fn is0(a: U2) bool {
+    return (a.h | a.l) == 0;
+}
+
+pub fn shl2(a: U2, n: u32) U2 {
+    if n == 0 {
+        return a;
+    }
+    if n >= 128 {
+        return u2(0, 0);
+    }
+    if n >= 64 {
+        return u2(a.l << (n - 64), 0);
+    }
+    return u2((a.h << n) | (a.l >> (64 - n)), a.l << n);
+}
+
+pub fn shr2(a: U2, n: u32) U2 {
+    if n == 0 {
+        return a;
+    }
+    if n >= 128 {
+        return u2(0, 0);
+    }
+    if n >= 64 {
+        return u2(0, a.h >> (n - 64));
+    }
+    return u2(a.h >> n, (a.l >> n) | (a.h << (64 - n)));
+}
+
+// The low n bits of a.
+pub fn low2(a: U2, n: u32) U2 {
+    if n >= 128 {
+        return a;
+    }
+    let m = sub2(shl2(u2(0, 1), n), u2(0, 1));
+    return u2(a.h & m.h, a.l & m.l);
+}
+
+pub fn or2(a: U2, b: U2) U2 {
+    return u2(a.h | b.h, a.l | b.l);
+}
+
+pub fn add2(a: U2, b: U2) U2 {
+    let l = a.l +% b.l;
+    let mut c: u64 = 0;
+    if l < a.l {
+        c = 1;
+    }
+    return u2((a.h +% b.h) +% c, l);
+}
+
+pub fn sub2(a: U2, b: U2) U2 {
+    let l = a.l -% b.l;
+    let mut c: u64 = 0;
+    if a.l < b.l {
+        c = 1;
+    }
+    return u2((a.h -% b.h) -% c, l);
+}
+
+pub fn lt2(a: U2, b: U2) bool {
+    return (a.h < b.h) or ((a.h == b.h) and (a.l < b.l));
+}
+
+pub fn eq2(a: U2, b: U2) bool {
+    return (a.h == b.h) and (a.l == b.l);
+}
+
+// The number of significant bits of a.
+pub fn bitlen2(a: U2) i32 {
+    if a.h != 0 {
+        return 128 - @bit_cast(i32, @truncate(u32, @clz(a.h)));
+    }
+    if a.l != 0 {
+        return 64 - @bit_cast(i32, @truncate(u32, @clz(a.l)));
+    }
+    return 0;
+}
+
+// a * m + inc, m and inc below 2^32 (the product below 2^128).
+pub fn mulsm2(a: U2, m: u64, inc: u64) U2 {
+    let w: [4]u64 = [a.l & 0xFFFF_FFFF, a.l >> 32, a.h & 0xFFFF_FFFF, a.h >> 32];
+    let mut r: [4]u64 = [0, 0, 0, 0];
+    let mut c = inc;
+    for i in @as(usize, 0)..4 {
+        let t = (w[i] *% m) +% c;
+        r[i] = t & 0xFFFF_FFFF;
+        c = t >> 32;
+    }
+    return u2((r[3] << 32) | r[2], (r[1] << 32) | r[0]);
+}
+
+// a / m (m below 2^32), the remainder returned.
+pub fn divsm2(a: *mut U2, m: u64) u64 {
+    let w: [4]u64 = [a.h >> 32, a.h & 0xFFFF_FFFF, a.l >> 32, a.l & 0xFFFF_FFFF];
+    let mut q: [4]u64 = [0, 0, 0, 0];
+    let mut r: u64 = 0;
+    for i in @as(usize, 0)..4 {
+        let cur = (r << 32) | w[i];
+        q[i] = cur / m;
+        r = cur % m;
+    }
+    a.h = (q[0] << 32) | q[1];
+    a.l = (q[2] << 32) | q[3];
+    return r;
+}
+
+// 10^n as a 128-bit integer (n <= 38).
+pub fn p10u2(n: i32) U2 {
+    let mut x = u2(0, 1);
+    for i in 0..n {
+        _ = i;
+        x = mulsm2(x, 10, 0);
+    }
+    return x;
+}
+
+// -----------------------------------------------------------------------------
+// Natural numbers in base 10^9
+// -----------------------------------------------------------------------------
+
+const B9: u64 = 1000000000;
+let P10: [10]u32 = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000];
+
+/// A natural number: d[0] + d[1] * 10^9 + ... + d[n - 1] * 10^(9(n - 1)),
+/// d[n - 1] nonzero (n is 0 for zero); d is its buffer.
+pub struct Nat {
+    d: []mut u32,
+    n: usize,
+}
+
+/// A natural number (zero) in buffer b.
+pub fn nat(b: []mut u32) Nat {
+    return Nat.{ d: b, n: 0 };
+}
+
+fn trim(a: *mut Nat) void {
+    while (a.n > 0) and (a.d[a.n - 1] == 0) {
+        a.n -= 1;
+    }
+}
+
+pub fn nat_is0(a: *Nat) bool {
+    return a.n == 0;
+}
+
+pub fn nat_set_u64(a: *mut Nat, x: u64) void {
+    a.n = 0;
+    let mut v = x;
+    while v != 0 {
+        a.d[a.n] = @truncate(u32, v % B9);
+        v = v / B9;
+        a.n += 1;
+    }
+}
+
+pub fn nat_set_u2(a: *mut Nat, x: U2) void {
+    a.n = 0;
+    let mut v = x;
+    while not is0(v) {
+        a.d[a.n] = @truncate(u32, divsm2(&mut v, B9));
+        a.n += 1;
+    }
+}
+
+pub fn nat_copy(a: *mut Nat, b: *Nat) void {
+    for i in 0..b.n {
+        a.d[i] = b.d[i];
+    }
+    a.n = b.n;
+}
+
+/// a as a 128-bit integer (a below 2^128).
+pub fn nat_u2(a: *Nat) U2 {
+    let mut v = u2(0, 0);
+    let mut i = a.n;
+    while i > 0 {
+        i -= 1;
+        v = mulsm2(v, B9, @as(u64, a.d[i]));
+    }
+    return v;
+}
+
+/// a as a u64 (a below 2^64).
+pub fn nat_u64(a: *Nat) u64 {
+    let mut v: u64 = 0;
+    let mut i = a.n;
+    while i > 0 {
+        i -= 1;
+        v = (v *% B9) +% @as(u64, a.d[i]);
+    }
+    return v;
+}
+
+fn digits32(x: u32) i32 {
+    let mut n: i32 = 1;
+    while (n < 10) and (x >= P10[@int_cast(usize, n)]) {
+        n += 1;
+    }
+    return n;
+}
+
+/// The number of decimal digits of a (0 for zero).
+pub fn ndigits(a: *Nat) i32 {
+    if a.n == 0 {
+        return 0;
+    }
+    return (9 * @int_cast(i32, a.n - 1)) + digits32(a.d[a.n - 1]);
+}
+
+/// The number of trailing zero digits of a (nonzero).
+pub fn trailing_zeros(a: *Nat) i32 {
+    let mut k: i32 = 0;
+    let mut i: usize = 0;
+    while (i < a.n) and (a.d[i] == 0) {
+        k += 9;
+        i += 1;
+    }
+    if i == a.n {
+        return 0;
+    }
+    let mut x = a.d[i];
+    while (x % 10) == 0 {
+        x = x / 10;
+        k += 1;
+    }
+    return k;
+}
+
+/// The decimal digit of a at position k (10^k).
+pub fn digit_at(a: *Nat, k: i32) u32 {
+    if k < 0 {
+        return 0;
+    }
+    let i = @int_cast(usize, k / 9);
+    if i >= a.n {
+        return 0;
+    }
+    return (a.d[i] / P10[@int_cast(usize, k % 9)]) % 10;
+}
+
+/// a = a * m + inc (m, inc below 2^32).
+pub fn nat_mulsm(a: *mut Nat, m: u32, inc: u32) void {
+    let mut c = @as(u64, inc);
+    let m64 = @as(u64, m);
+    for i in 0..a.n {
+        let t = (@as(u64, a.d[i]) * m64) + c;
+        a.d[i] = @truncate(u32, t % B9);
+        c = t / B9;
+    }
+    while c != 0 {
+        a.d[a.n] = @truncate(u32, c % B9);
+        c = c / B9;
+        a.n += 1;
+    }
+    trim(a);
+}
+
+/// a = floor(a / m) (m nonzero, below 2^32); the remainder returned.
+pub fn nat_divsm(a: *mut Nat, m: u32) u32 {
+    let m64 = @as(u64, m);
+    let mut r: u64 = 0;
+    let mut i = a.n;
+    while i > 0 {
+        i -= 1;
+        let cur = (r * B9) + @as(u64, a.d[i]);
+        a.d[i] = @truncate(u32, cur / m64);
+        r = cur % m64;
+    }
+    trim(a);
+    return @truncate(u32, r);
+}
+
+/// a = a * 10^k (k >= 0).
+pub fn shl10(a: *mut Nat, k: i32) void {
+    if (a.n == 0) or (k <= 0) {
+        return;
+    }
+    let r = k % 9;
+    if r != 0 {
+        nat_mulsm(a, P10[@int_cast(usize, r)], 0);
+    }
+    let l = @int_cast(usize, k / 9);
+    if l == 0 {
+        return;
+    }
+    let mut i = a.n;
+    while i > 0 {
+        i -= 1;
+        a.d[i + l] = a.d[i];
+    }
+    for j in 0..l {
+        a.d[j] = 0;
+    }
+    a.n += l;
+}
+
+/// What digits dropped by a division by 10^k were: the first (most
+/// significant) of them, and whether any after it is nonzero.
+pub struct Drop {
+    d: u32,
+    rest: bool,
+}
+
+/// a = floor(a / 10^k) (k >= 0), and what it dropped.
+pub fn shr10(a: *mut Nat, k: i32) Drop {
+    if k <= 0 {
+        return Drop.{ d: 0, rest: false };
+    }
+    let nd = ndigits(a);
+    if k > nd {
+        let r = a.n != 0;
+        a.n = 0;
+        return Drop.{ d: 0, rest: r };
+    }
+    let first = digit_at(a, k - 1);
+    // (the digits below position k - 1)
+    let r0 = k - 1;
+    let full = @int_cast(usize, r0 / 9);
+    let mut rest = false;
+    for i in 0..full {
+        if a.d[i] != 0 {
+            rest = true;
+        }
+    }
+    if (a.d[full] % P10[@int_cast(usize, r0 % 9)]) != 0 {
+        rest = true;
+    }
+    let l = @int_cast(usize, k / 9);
+    if l > 0 {
+        for i in l..a.n {
+            a.d[i - l] = a.d[i];
+        }
+        a.n -= l;
+    }
+    let r = k % 9;
+    if r != 0 {
+        _ = nat_divsm(a, P10[@int_cast(usize, r)]);
+    }
+    trim(a);
+    return Drop.{ d: first, rest: rest };
+}
+
+/// -1, 0 or 1 as a < b, a = b, a > b.
+pub fn nat_cmp(a: *Nat, b: *Nat) i32 {
+    if a.n != b.n {
+        if a.n < b.n {
+            return -1;
+        }
+        return 1;
+    }
+    let mut i = a.n;
+    while i > 0 {
+        i -= 1;
+        if a.d[i] != b.d[i] {
+            if a.d[i] < b.d[i] {
+                return -1;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// r = a + b (r may be a or b).
+pub fn nat_add(r: *mut Nat, a: *Nat, b: *Nat) void {
+    let n = @max(a.n, b.n);
+    let mut c: u64 = 0;
+    for i in 0..n {
+        let mut s = c;
+        if i < a.n {
+            s += @as(u64, a.d[i]);
+        }
+        if i < b.n {
+            s += @as(u64, b.d[i]);
+        }
+        c = 0;
+        if s >= B9 {
+            s -= B9;
+            c = 1;
+        }
+        r.d[i] = @truncate(u32, s);
+    }
+    r.n = n;
+    if c != 0 {
+        r.d[n] = 1;
+        r.n = n + 1;
+    }
+}
+
+/// r = a - b, a >= b (r may be a or b).
+pub fn nat_sub(r: *mut Nat, a: *Nat, b: *Nat) void {
+    let mut br: i64 = 0;
+    for i in 0..a.n {
+        let mut s = @as(i64, a.d[i]) - br;
+        if i < b.n {
+            s -= @as(i64, b.d[i]);
+        }
+        br = 0;
+        if s < 0 {
+            s += @bit_cast(i64, B9);
+            br = 1;
+        }
+        r.d[i] = @truncate(u32, @bit_cast(u64, s));
+    }
+    r.n = a.n;
+    trim(r);
+}
+
+/// r = a * b (r neither a nor b).
+pub fn nat_mul(r: *mut Nat, a: *Nat, b: *Nat) void {
+    if (a.n == 0) or (b.n == 0) {
+        r.n = 0;
+        return;
+    }
+    let n = a.n + b.n;
+    for i in 0..n {
+        r.d[i] = 0;
+    }
+    for i in 0..a.n {
+        let x = @as(u64, a.d[i]);
+        if x == 0 {
+            continue;
+        }
+        let mut c: u64 = 0;
+        for j in 0..b.n {
+            let t = ((x * @as(u64, b.d[j])) + @as(u64, r.d[i + j])) + c;
+            r.d[i + j] = @truncate(u32, t % B9);
+            c = t / B9;
+        }
+        let mut k = i + b.n;
+        while c != 0 {
+            let t = @as(u64, r.d[k]) + c;
+            r.d[k] = @truncate(u32, t % B9);
+            c = t / B9;
+            k += 1;
+        }
+    }
+    r.n = n;
+    trim(r);
+}
+
+/// q = floor(a / b), m = a mod b (b nonzero; q, m, a, b distinct; u is
+/// scratch of a.n + 2 limbs, v of b.n + 1).
+pub fn nat_divmod(q: *mut Nat, m: *mut Nat, a: *Nat, b: *Nat, u: *mut Nat, v: *mut Nat) void {
+    if nat_cmp(a, b) < 0 {
+        q.n = 0;
+        nat_copy(m, a);
+        return;
+    }
+    if b.n == 1 {
+        nat_copy(q, a);
+        let r = nat_divsm(q, b.d[0]);
+        nat_set_u64(m, @as(u64, r));
+        return;
+    }
+    // (Algorithm D: normalized so that the divisor's top digit is at least
+    // half the base)
+    let n = b.n;
+    let f = @truncate(u32, B9 / (@as(u64, b.d[n - 1]) + 1));
+    nat_copy(u, a);
+    nat_copy(v, b);
+    // (u gets a digit more, which may be 0)
+    let un0 = u.n;
+    nat_mulsm(u, f, 0);
+    if u.n == un0 {
+        u.d[u.n] = 0;
+    }
+    let ul = un0 + 1;
+    nat_mulsm(v, f, 0);
+    let m_ = ul - n - 1;  // (the quotient's digits are m_ + 1)
+    let vt = @as(u64, v.d[n - 1]);
+    let vs = @as(u64, v.d[n - 2]);
+    for jj in 0..(m_ + 1) {
+        let j = m_ - jj;
+        let top = (@as(u64, u.d[j + n]) * B9) + @as(u64, u.d[j + n - 1]);
+        let mut qh = top / vt;
+        let mut rh = top % vt;
+        while (qh >= B9) or ((qh * vs) > ((rh * B9) + @as(u64, u.d[j + n - 2]))) {
+            qh -= 1;
+            rh += vt;
+            if rh >= B9 {
+                break;
+            }
+        }
+        // u[j .. j + n] -= qh * v
+        let mut carry: u64 = 0;
+        let mut borrow: i64 = 0;
+        for i in 0..n {
+            let p = (qh * @as(u64, v.d[i])) + carry;
+            carry = p / B9;
+            let mut t = (@as(i64, u.d[i + j]) - @bit_cast(i64, p % B9)) - borrow;
+            borrow = 0;
+            if t < 0 {
+                t += @bit_cast(i64, B9);
+                borrow = 1;
+            }
+            u.d[i + j] = @truncate(u32, @bit_cast(u64, t));
+        }
+        let t = (@as(i64, u.d[j + n]) - @bit_cast(i64, carry)) - borrow;
+        if t < 0 {
+            // (qh was one too large: add v back)
+            qh -= 1;
+            let mut c: u64 = 0;
+            for i in 0..n {
+                let mut s = (@as(u64, u.d[i + j]) + @as(u64, v.d[i])) + c;
+                c = 0;
+                if s >= B9 {
+                    s -= B9;
+                    c = 1;
+                }
+                u.d[i + j] = @truncate(u32, s);
+            }
+            u.d[j + n] = @truncate(u32, @bit_cast(u64, t + @bit_cast(i64, c)));
+        } else {
+            u.d[j + n] = @truncate(u32, @bit_cast(u64, t));
+        }
+        q.d[j] = @truncate(u32, qh);
+    }
+    q.n = m_ + 1;
+    trim(q);
+    for i in 0..n {
+        m.d[i] = u.d[i];
+    }
+    m.n = n;
+    trim(m);
+    _ = nat_divsm(m, f);
+}
+
+/// r = floor(sqrt(a)) (r, a distinct; t1 .. t4 scratch as large as a).
+pub fn nat_isqrt(r: *mut Nat, a: *Nat, t1: *mut Nat, t2: *mut Nat, t3: *mut Nat, t4: *mut Nat) void {
+    if a.n == 0 {
+        r.n = 0;
+        return;
+    }
+    // (from 10^ceil(digits / 2), at least the root, down by Newton's steps)
+    nat_set_u64(r, 1);
+    shl10(r, (ndigits(a) + 1) / 2);
+    loop {
+        // t1 = (r + a / r) / 2
+        nat_divmod(t1, t2, a, r, t3, t4);
+        nat_add(t1, t1, r);
+        _ = nat_divsm(t1, 2);
+        if nat_cmp(t1, r) >= 0 {
+            return;
+        }
+        nat_copy(r, t1);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Taking apart and putting together (BID, IEEE 754-2019 3.5.2)
+// -----------------------------------------------------------------------------
+
+pub fn bits_of(w: ld.W, f: u32) U2 {
+    if f == D128 {
+        return u2(w.hi, w.lo);
+    }
+    if f == D64 {
+        return u2(0, w.lo);
+    }
+    return u2(0, w.lo & 0xFFFF_FFFF);
+}
+
+pub fn w_of(x: U2, f: u32) ld.W {
+    if f == D128 {
+        return ld.W.{ lo: x.l, hi: x.h };
+    }
+    return ld.W.{ lo: x.l, hi: 0 };
+}
+
+fn bit2(x: U2, n: u32) bool {
+    return (shr2(x, n).l & 1) != 0;
+}
+
+/// The value w of format f, taken apart.
+pub fn unpack(w: ld.W, f: u32) Dec {
+    let x = bits_of(w, f);
+    let k = kbits(f);
+    let cb = cbits(f);
+    let neg = bit2(x, k - 1);
+    let g = shr2(x, k - 6).l & 31;
+    let em = (@as(u64, 1) << ebits(f)) - 1;
+    let mut e: u64 = 0;
+    let mut c = u2(0, 0);
+    if (g >> 3) != 3 {
+        e = shr2(x, cb).l & em;
+        c = low2(x, cb);
+    } else if (g >> 1) != 15 {
+        e = shr2(x, cb - 2).l & em;
+        c = or2(shl2(u2(0, 4), cb - 2), low2(x, cb - 2));
+    } else if g == 30 {
+        return Dec.{ cls: K_INF, neg: neg, q: 0, c: u2(0, 0) };
+    } else {
+        let mut cls = K_QNAN;
+        if bit2(x, k - 7) {
+            cls = K_SNAN;
+        }
+        let mut pl = low2(x, cb - 3);
+        if not lt2(pl, p10u2(prec(f) - 1)) {
+            pl = u2(0, 0);
+        }
+        return Dec.{ cls: cls, neg: neg, q: 0, c: pl };
+    }
+    if not lt2(c, p10u2(prec(f))) {
+        c = u2(0, 0);  // (non-canonical: zero)
+    }
+    return Dec.{ cls: K_FIN, neg: neg, q: @bit_cast(i32, @truncate(u32, e)) - bias(f), c: c };
+}
+
+fn sign_bit(neg: bool, f: u32) U2 {
+    if neg {
+        return shl2(u2(0, 1), kbits(f) - 1);
+    }
+    return u2(0, 0);
+}
+
+/// The finite value (-1)^neg * c * 10^q of format f (c below 10^p, q in
+/// range).
+pub fn pack(neg: bool, c: U2, q: i32, f: u32) ld.W {
+    let cb = cbits(f);
+    let e = u2(0, @as(u64, @bit_cast(u32, q + bias(f))));
+    let mut x = sign_bit(neg, f);
+    if lt2(c, shl2(u2(0, 1), cb)) {
+        x = or2(or2(x, shl2(e, cb)), c);
+    } else {
+        x = or2(or2(or2(x, shl2(u2(0, 3), kbits(f) - 3)), shl2(e, cb - 2)), low2(c, cb - 2));
+    }
+    return w_of(x, f);
+}
+
+/// Infinity of format f.
+pub fn inf(neg: bool, f: u32) ld.W {
+    return w_of(or2(sign_bit(neg, f), shl2(u2(0, 30), kbits(f) - 6)), f);
+}
+
+/// A NaN of format f with payload pl (below 10^(p - 1)).
+pub fn nan(neg: bool, sig: bool, pl: U2, f: u32) ld.W {
+    let k = kbits(f);
+    let mut x = or2(sign_bit(neg, f), shl2(u2(0, 31), k - 6));
+    if sig {
+        x = or2(x, shl2(u2(0, 1), k - 7));
+    }
+    return w_of(or2(x, pl), f);
+}
+
+/// The default NaN: positive, quiet, payload 0.
+pub fn qnan(f: u32) ld.W {
+    return nan(false, false, u2(0, 0), f);
+}
+
+/// The value d (of any class) in format f.
+pub fn repack(d: Dec, f: u32) ld.W {
+    if d.cls == K_FIN {
+        return pack(d.neg, d.c, d.q, f);
+    }
+    if d.cls == K_INF {
+        return inf(d.neg, f);
+    }
+    return nan(d.neg, d.cls == K_SNAN, d.c, f);
+}
+
+/// Zero with exponent q (put in range) and sign neg.
+pub fn zero(neg: bool, q: i32, f: u32) ld.W {
+    return pack(neg, u2(0, 0), clampq(q, f), f);
+}
+
+pub fn clampq(q: i32, f: u32) i32 {
+    return @max(qmin(f), @min(qmax(f), q));
+}
+
+/// The largest finite value of format f.
+pub fn max_finite(neg: bool, f: u32) ld.W {
+    return pack(neg, sub2(p10u2(prec(f)), u2(0, 1)), qmax(f), f);
+}
+
+pub fn is_nan(d: Dec) bool {
+    return d.cls >= K_QNAN;
+}
+
+/// Is d zero (finite with coefficient 0)?
+pub fn is_zero(d: Dec) bool {
+    return (d.cls == K_FIN) and is0(d.c);
+}
+
+/// The value of format f's bits flipped in its sign (negation, which is
+/// exact and keeps the encoding: IEEE 754-2019 5.5.1).
+pub fn negate(w: ld.W, f: u32) ld.W {
+    let x = bits_of(w, f);
+    let s = shl2(u2(0, 1), kbits(f) - 1);
+    return w_of(u2(x.h ^ s.h, x.l ^ s.l), f);
+}
+
+/// |w| (its sign bit cleared).
+pub fn abs(w: ld.W, f: u32) ld.W {
+    let x = bits_of(w, f);
+    return w_of(low2(x, kbits(f) - 1), f);
+}
+
+/// Whether w's sign bit is set.
+pub fn signbit(w: ld.W, f: u32) bool {
+    return bit2(bits_of(w, f), kbits(f) - 1);
+}
+
+// -----------------------------------------------------------------------------
+// Rounding
+// -----------------------------------------------------------------------------
+
+// Whether a value whose last kept digit is odd (odd) and whose dropped
+// part begins with digit d (followed by nonzero digits: rest) rounds away
+// from zero in direction mode (neg: the value is negative).
+pub fn rounds_up(mode: u32, neg: bool, odd: bool, d: u32, rest: bool) bool {
+    if (d == 0) and not rest {
+        return false;
+    }
+    if mode == R_NEAREST {
+        return (d > 5) or ((d == 5) and (rest or odd));
+    }
+    if mode == R_AWAY {
+        return d >= 5;
+    }
+    if mode == R_ZERO {
+        return false;
+    }
+    if mode == R_UP {
+        return not neg;
+    }
+    return neg;
+}
+
+/// The result of an overflow in format f (7.4): infinity or the largest
+/// finite value, as the rounding direction says.
+pub fn overflow(neg: bool, f: u32, c: *mut Ctx) ld.W {
+    c.flags = c.flags | (F_OVERFLOW | F_INEXACT);
+    let m = c.mode;
+    if (m == R_ZERO) or ((m == R_UP) and neg) or ((m == R_DOWN) and not neg) {
+        return max_finite(neg, f);
+    }
+    return inf(neg, f);
+}
+
+/// The exact value (-1)^neg * n * 10^q (plus less than one unit of 10^q
+/// more when sticky: then n has more than p digits) rounded to format f:
+/// exact, the cohort member whose exponent is closest to pref; else p
+/// digits (or the least exponent), rounded in c's direction. n is used up.
+pub fn finish(neg: bool, n: *mut Nat, q: i32, sticky: bool, pref: i32, f: u32, c: *mut Ctx) ld.W {
+    let p = prec(f);
+    let lo_q = qmin(f);
+    let hi_q = qmax(f);
+    if nat_is0(n) and not sticky {
+        return zero(neg, pref, f);
+    }
+    let nd = ndigits(n);
+    if not sticky {
+        // exact: the exponents that represent the value
+        let tz = trailing_zeros(n);
+        let elo = @max(q + (nd - p), lo_q);
+        let ehi = @min(q + tz, hi_q);
+        if elo <= ehi {
+            let e = @max(elo, @min(ehi, pref));
+            if e > q {
+                _ = shr10(n, e - q);
+            } else {
+                shl10(n, q - e);
+            }
+            return pack(neg, nat_u2(n), e, f);
+        }
+    }
+    let lo = q + (nd - p);
+    if lo > hi_q {
+        return overflow(neg, f, c);
+    }
+    let mut e = @max(lo, lo_q);
+    let mut dr = Drop.{ d: 0, rest: false };
+    if e > q {
+        dr = shr10(n, e - q);
+    } else if e < q {
+        shl10(n, q - e);
+    }
+    dr.rest = dr.rest or sticky;
+    let inexact = (dr.d != 0) or dr.rest;
+    let odd = (n.n > 0) and ((n.d[0] & 1) != 0);
+    if rounds_up(c.mode, neg, odd, dr.d, dr.rest) {
+        nat_mulsm(n, 1, 1);
+        if ndigits(n) > p {
+            _ = shr10(n, 1);
+            e += 1;
+        }
+    }
+    if e > hi_q {
+        return overflow(neg, f, c);
+    }
+    if inexact {
+        c.flags = c.flags | F_INEXACT;
+        if ((q + nd) - 1) < (1 - emax(f)) {
+            c.flags = c.flags | F_UNDERFLOW;
+        }
+    }
+    return pack(neg, nat_u2(n), e, f);
+}
+
+// -----------------------------------------------------------------------------
+// NaNs
+// -----------------------------------------------------------------------------
+
+/// The result of an invalid operation: the default NaN, "invalid".
+pub fn invalid(f: u32, c: *mut Ctx) ld.W {
+    c.flags = c.flags | F_INVALID;
+    return qnan(f);
+}
+
+/// A NaN quieted (its payload and sign kept: of a narrower format f, its
+/// low digits, as many as a payload of f has), "invalid" if it was
+/// signaling.
+pub fn quiet(d: Dec, f: u32, c: *mut Ctx) ld.W {
+    if d.cls == K_SNAN {
+        c.flags = c.flags | F_INVALID;
+    }
+    return nan(d.neg, false, fit_payload(d.c, f), f);
+}
+
+fn fit_payload(pl: U2, f: u32) U2 {
+    if lt2(pl, p10u2(prec(f) - 1)) {
+        return pl;
+    }
+    let mut v = pl;
+    let mut r = u2(0, 0);
+    let mut m = u2(0, 1);
+    for i in 0..(prec(f) - 1) {
+        _ = i;
+        let dgt = divsm2(&mut v, 10);
+        r = add2(r, mulsm2(m, dgt, 0));
+        m = mulsm2(m, 10, 0);
+    }
+    return r;
+}
+
+// The NaN result of an operation with a NaN operand among x and y (the
+// first signaling one, else the first quiet one).
+pub fn nan2(x: Dec, y: Dec, f: u32, c: *mut Ctx) ld.W {
+    if x.cls == K_SNAN {
+        if y.cls == K_SNAN {
+            c.flags = c.flags | F_INVALID;
+        }
+        return quiet(x, f, c);
+    }
+    if y.cls == K_SNAN {
+        return quiet(y, f, c);
+    }
+    if is_nan(x) {
+        return quiet(x, f, c);
+    }
+    return quiet(y, f, c);
+}
+
+fn nan3(x: Dec, y: Dec, z: Dec, f: u32, c: *mut Ctx) ld.W {
+    if (x.cls == K_SNAN) or ((y.cls != K_SNAN) and (z.cls != K_SNAN) and is_nan(x)) {
+        if (y.cls == K_SNAN) or (z.cls == K_SNAN) {
+            c.flags = c.flags | F_INVALID;
+        }
+        return quiet(x, f, c);
+    }
+    if (y.cls == K_SNAN) or ((z.cls != K_SNAN) and is_nan(y)) {
+        if z.cls == K_SNAN {
+            c.flags = c.flags | F_INVALID;
+        }
+        return quiet(y, f, c);
+    }
+    return quiet(z, f, c);
+}
+
+// -----------------------------------------------------------------------------
+// Arithmetic (IEEE 754-2019 5.4.1)
+// -----------------------------------------------------------------------------
+
+// Buffers of the basic operations: 16 limbs (144 digits) hold an fma's
+// operands aligned (3p + 4 digits at most).
+const NS: usize = 16;
+
+// (-1)^an * a * 10^qa + (-1)^bn * b * 10^qb, rounded (a and b used up).
+fn add_core(an: bool, a0: *mut Nat, qa0: i32, bn: bool, b0: *mut Nat, qb0: i32, f: u32, c: *mut Ctx) ld.W {
+    let pref = @min(qa0, qb0);
+    let p = prec(f);
+    let za = nat_is0(a0);
+    let zb = nat_is0(b0);
+    if za and zb {
+        let mut neg = an and bn;
+        if an != bn {
+            neg = c.mode == R_DOWN;
+        }
+        return zero(neg, pref, f);
+    }
+    if zb {
+        return finish(an, a0, qa0, false, pref, f, c);
+    }
+    if za {
+        return finish(bn, b0, qb0, false, pref, f, c);
+    }
+    // x: the one whose leading digit is higher
+    let mut x = a0;
+    let mut y = b0;
+    let mut qx = qa0;
+    let mut qy = qb0;
+    let mut xn = an;
+    let mut yn = bn;
+    if (qb0 + ndigits(b0)) > (qa0 + ndigits(a0)) {
+        x = b0;
+        y = a0;
+        qx = qb0;
+        qy = qa0;
+        xn = bn;
+        yn = an;
+    }
+    let tx = qx + ndigits(x);
+    if (qy + ndigits(y)) <= ((tx - p) - 2) {
+        // y is below half a unit of the result's last place, whatever the
+        // rounding: a unit below that rounds the same (and is inexact)
+        nat_set_u64(y, 1);
+        qy = (tx - p) - 3;
+    }
+    let m = @min(qx, qy);
+    shl10(x, qx - m);
+    shl10(y, qy - m);
+    if xn == yn {
+        nat_add(x, x, y);
+        return finish(xn, x, m, false, pref, f, c);
+    }
+    let k = nat_cmp(x, y);
+    if k == 0 {
+        return zero(c.mode == R_DOWN, pref, f);
+    }
+    if k > 0 {
+        nat_sub(x, x, y);
+        return finish(xn, x, m, false, pref, f, c);
+    }
+    nat_sub(y, y, x);
+    return finish(yn, y, m, false, pref, f, c);
+}
+
+/// x + y (sub: x - y).
+pub fn add(xw: ld.W, yw: ld.W, sub: bool, f: u32, c: *mut Ctx) ld.W {
+    return addf(xw, yw, sub, f, f, c);
+}
+
+/// x + y (sub: x - y) of format fi, rounded to format f.
+pub fn addf(xw: ld.W, yw: ld.W, sub: bool, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, fi);
+    let mut y = unpack(yw, fi);
+    if is_nan(x) or is_nan(y) {
+        return nan2(x, y, f, c);
+    }
+    if sub {
+        y.neg = not y.neg;
+    }
+    if x.cls == K_INF {
+        if (y.cls == K_INF) and (y.neg != x.neg) {
+            return invalid(f, c);
+        }
+        return inf(x.neg, f);
+    }
+    if y.cls == K_INF {
+        return inf(y.neg, f);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut bb: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let mut b = nat(bb[..]);
+    nat_set_u2(&mut a, x.c);
+    nat_set_u2(&mut b, y.c);
+    return add_core(x.neg, &mut a, x.q, y.neg, &mut b, y.q, f, c);
+}
+
+/// x * y.
+pub fn mul(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) ld.W {
+    return mulf(xw, yw, f, f, c);
+}
+
+/// x * y of format fi, rounded to format f.
+pub fn mulf(xw: ld.W, yw: ld.W, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, fi);
+    let y = unpack(yw, fi);
+    if is_nan(x) or is_nan(y) {
+        return nan2(x, y, f, c);
+    }
+    let neg = x.neg != y.neg;
+    if (x.cls == K_INF) or (y.cls == K_INF) {
+        if is_zero(x) or is_zero(y) {
+            return invalid(f, c);
+        }
+        return inf(neg, f);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut bb: [NS]u32 = undefined;
+    let mut br: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let mut b = nat(bb[..]);
+    let mut r = nat(br[..]);
+    nat_set_u2(&mut a, x.c);
+    nat_set_u2(&mut b, y.c);
+    nat_mul(&mut r, &a, &b);
+    return finish(neg, &mut r, x.q + y.q, false, x.q + y.q, f, c);
+}
+
+/// x / y.
+pub fn div(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) ld.W {
+    return divf(xw, yw, f, f, c);
+}
+
+/// x / y of format fi, rounded to format f.
+pub fn divf(xw: ld.W, yw: ld.W, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, fi);
+    let y = unpack(yw, fi);
+    if is_nan(x) or is_nan(y) {
+        return nan2(x, y, f, c);
+    }
+    let neg = x.neg != y.neg;
+    if x.cls == K_INF {
+        if y.cls == K_INF {
+            return invalid(f, c);
+        }
+        return inf(neg, f);
+    }
+    if y.cls == K_INF {
+        return zero(neg, qmin(f), f);  // (5.2: the least exponent)
+    }
+    let pref = x.q - y.q;
+    if is_zero(y) {
+        if is_zero(x) {
+            return invalid(f, c);
+        }
+        c.flags = c.flags | F_DIVBYZERO;
+        return inf(neg, f);
+    }
+    if is_zero(x) {
+        return zero(neg, pref, f);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut bb: [NS]u32 = undefined;
+    let mut bq: [NS]u32 = undefined;
+    let mut bm: [NS]u32 = undefined;
+    let mut bu: [NS]u32 = undefined;
+    let mut bv: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let mut b = nat(bb[..]);
+    let mut q = nat(bq[..]);
+    let mut m = nat(bm[..]);
+    let mut uu = nat(bu[..]);
+    let mut vv = nat(bv[..]);
+    nat_set_u2(&mut a, x.c);
+    nat_set_u2(&mut b, y.c);
+    // (a quotient of at least p + 1 digits)
+    let k = @max(1, ((prec(f) + 1) + ndigits(&b)) - ndigits(&a));
+    shl10(&mut a, k);
+    nat_divmod(&mut q, &mut m, &a, &b, &mut uu, &mut vv);
+    return finish(neg, &mut q, pref - k, not nat_is0(&m), pref, f, c);
+}
+
+/// x * y + z, rounded once.
+pub fn fma(xw: ld.W, yw: ld.W, zw: ld.W, f: u32, c: *mut Ctx) ld.W {
+    return fmaf(xw, yw, zw, f, f, c);
+}
+
+/// x * y + z of format fi, rounded once to format f.
+pub fn fmaf(xw: ld.W, yw: ld.W, zw: ld.W, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, fi);
+    let y = unpack(yw, fi);
+    let z = unpack(zw, fi);
+    if is_nan(x) or is_nan(y) {
+        return nan3(x, y, z, f, c);
+    }
+    let neg = x.neg != y.neg;
+    if (x.cls == K_INF) or (y.cls == K_INF) {
+        if is_zero(x) or is_zero(y) {
+            return invalid(f, c);  // (whatever z is)
+        }
+        if is_nan(z) {
+            return quiet(z, f, c);
+        }
+        if (z.cls == K_INF) and (z.neg != neg) {
+            return invalid(f, c);
+        }
+        return inf(neg, f);
+    }
+    if is_nan(z) {
+        return quiet(z, f, c);
+    }
+    if z.cls == K_INF {
+        return inf(z.neg, f);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut bb: [NS]u32 = undefined;
+    let mut br: [NS]u32 = undefined;
+    let mut bz: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let mut b = nat(bb[..]);
+    let mut r = nat(br[..]);
+    let mut zz = nat(bz[..]);
+    nat_set_u2(&mut a, x.c);
+    nat_set_u2(&mut b, y.c);
+    nat_mul(&mut r, &a, &b);
+    nat_set_u2(&mut zz, z.c);
+    return add_core(neg, &mut r, x.q + y.q, z.neg, &mut zz, z.q, f, c);
+}
+
+/// sqrt(x) (preferred exponent floor(q / 2)).
+pub fn sqrt(xw: ld.W, f: u32, c: *mut Ctx) ld.W {
+    return sqrtf(xw, f, f, c);
+}
+
+/// sqrt(x) of format fi, rounded to format f.
+pub fn sqrtf(xw: ld.W, fi: u32, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, fi);
+    if is_nan(x) {
+        return quiet(x, f, c);
+    }
+    let pref = x.q >> 1;
+    if is_zero(x) {
+        return zero(x.neg, pref, f);
+    }
+    if x.neg {
+        return invalid(f, c);
+    }
+    if x.cls == K_INF {
+        return inf(false, f);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut br: [NS]u32 = undefined;
+    let mut b1: [NS]u32 = undefined;
+    let mut b2: [NS]u32 = undefined;
+    let mut b3: [NS]u32 = undefined;
+    let mut b4: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let mut r = nat(br[..]);
+    let mut t1 = nat(b1[..]);
+    let mut t2 = nat(b2[..]);
+    let mut t3 = nat(b3[..]);
+    let mut t4 = nat(b4[..]);
+    nat_set_u2(&mut a, x.c);
+    let mut q = x.q;
+    if (q & 1) != 0 {
+        shl10(&mut a, 1);
+        q -= 1;
+    }
+    // (a root of at least p + 1 digits)
+    let k = @max(0, (((2 * prec(f)) + 3) - ndigits(&a)) / 2);
+    shl10(&mut a, 2 * k);
+    nat_isqrt(&mut r, &a, &mut t1, &mut t2, &mut t3, &mut t4);
+    nat_mul(&mut t1, &r, &r);
+    let exact = nat_cmp(&t1, &a) == 0;
+    return finish(false, &mut r, (q / 2) - k, not exact, pref, f, c);
+}
+
+// -----------------------------------------------------------------------------
+// Remainders (exact)
+// -----------------------------------------------------------------------------
+
+// r = (a * 10^k) mod b, the shift done in pieces of 9 digits (k may be
+// large); t, u, v, w scratch.
+fn mod_shifted(r: *mut Nat, a: *Nat, k: i32, b: *Nat, t: *mut Nat, u: *mut Nat, v: *mut Nat, w: *mut Nat) void {
+    nat_divmod(t, r, a, b, u, v);
+    let mut left = k;
+    while left > 0 {
+        let s = @min(left, 9);
+        left -= s;
+        shl10(r, s);
+        nat_copy(w, r);
+        nat_divmod(t, r, w, b, u, v);
+    }
+}
+
+/// x - n * y, n the integer x / y truncated (C's fmod; near: rounded to
+/// nearest, ties to even, IEEE 754's remainder). Exact; the preferred
+/// exponent is min(q(x), q(y)).
+pub fn rem(xw: ld.W, yw: ld.W, near: bool, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, f);
+    let y = unpack(yw, f);
+    if is_nan(x) or is_nan(y) {
+        return nan2(x, y, f, c);
+    }
+    if (x.cls == K_INF) or is_zero(y) {
+        return invalid(f, c);
+    }
+    if y.cls == K_INF {
+        return xw;
+    }
+    let pref = @min(x.q, y.q);
+    if is_zero(x) {
+        return zero(x.neg, pref, f);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut bb: [NS]u32 = undefined;
+    let mut br: [NS]u32 = undefined;
+    let mut bt: [NS]u32 = undefined;
+    let mut bu: [NS]u32 = undefined;
+    let mut bv: [NS]u32 = undefined;
+    let mut bw: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let mut b = nat(bb[..]);
+    let mut r = nat(br[..]);
+    let mut t = nat(bt[..]);
+    let mut u = nat(bu[..]);
+    let mut v = nat(bv[..]);
+    let mut w = nat(bw[..]);
+    nat_set_u2(&mut a, x.c);
+    nat_set_u2(&mut b, y.c);
+    let ta = x.q + ndigits(&a);
+    let tb = y.q + ndigits(&b);
+    if (x.q < y.q) and ((tb - 1) > (ta + 1)) {
+        // |y| > 10 |x|: x itself (also nearer than any other multiple)
+        return finish(x.neg, &mut a, x.q, false, pref, f, c);
+    }
+    let m = pref;
+    // (the divisor doubled to learn the quotient's parity for `near`)
+    if x.q >= y.q {
+        if near {
+            nat_mulsm(&mut b, 2, 0);
+        }
+        mod_shifted(&mut r, &a, x.q - y.q, &b, &mut t, &mut u, &mut v, &mut w);
+        if near {
+            _ = nat_divsm(&mut b, 2);
+        }
+    } else {
+        shl10(&mut b, y.q - x.q);
+        if near {
+            nat_mulsm(&mut b, 2, 0);
+        }
+        nat_divmod(&mut t, &mut r, &a, &b, &mut u, &mut v);
+        if near {
+            _ = nat_divsm(&mut b, 2);
+        }
+    }
+    let mut neg = x.neg;
+    if near {
+        let mut odd = false;
+        if nat_cmp(&r, &b) >= 0 {
+            nat_sub(&mut r, &r, &b);
+            odd = true;
+        }
+        // compare 2r with b
+        nat_copy(&mut t, &r);
+        nat_mulsm(&mut t, 2, 0);
+        let k = nat_cmp(&t, &b);
+        if (k > 0) or ((k == 0) and odd) {
+            nat_sub(&mut r, &b, &r);
+            neg = not neg;
+        }
+    }
+    if nat_is0(&r) {
+        return zero(x.neg, m, f);
+    }
+    return finish(neg, &mut r, m, false, pref, f, c);
+}
+
+// -----------------------------------------------------------------------------
+// Comparison
+// -----------------------------------------------------------------------------
+
+/// The order of two finite values: -1, 0 or 1.
+pub fn cmp_fin(x: Dec, y: Dec) i32 {
+    let zx = is0(x.c);
+    let zy = is0(y.c);
+    if zx and zy {
+        return 0;
+    }
+    if zx {
+        if y.neg {
+            return 1;
+        }
+        return -1;
+    }
+    if zy {
+        if x.neg {
+            return -1;
+        }
+        return 1;
+    }
+    if x.neg != y.neg {
+        if x.neg {
+            return -1;
+        }
+        return 1;
+    }
+    let m = cmp_mag(x, y);
+    if x.neg {
+        return -m;
+    }
+    return m;
+}
+
+// The order of |x| and |y| (finite, nonzero).
+pub fn cmp_mag(x: Dec, y: Dec) i32 {
+    let tx = x.q + digits2(x.c);
+    let ty = y.q + digits2(y.c);
+    if tx != ty {
+        if tx < ty {
+            return -1;
+        }
+        return 1;
+    }
+    // (the same leading position: aligned, both have at most p digits)
+    let mut a = x.c;
+    let mut b = y.c;
+    if x.q > y.q {
+        a = mul10s(a, x.q - y.q);
+    } else if y.q > x.q {
+        b = mul10s(b, y.q - x.q);
+    }
+    if eq2(a, b) {
+        return 0;
+    }
+    if lt2(a, b) {
+        return -1;
+    }
+    return 1;
+}
+
+pub fn digits2(x: U2) i32 {
+    let mut n: i32 = 0;
+    let mut v = x;
+    while not is0(v) {
+        _ = divsm2(&mut v, 10);
+        n += 1;
+    }
+    return n;
+}
+
+pub fn mul10s(x: U2, k: i32) U2 {
+    let mut v = x;
+    for i in 0..k {
+        _ = i;
+        v = mulsm2(v, 10, 0);
+    }
+    return v;
+}
+
+/// x compared with y: -1, 0, 1, or 2 when unordered (a NaN); signaling:
+/// "invalid" for a quiet NaN too (else for a signaling one only).
+pub fn cmp(xw: ld.W, yw: ld.W, signaling: bool, f: u32, c: *mut Ctx) i32 {
+    let x = unpack(xw, f);
+    let y = unpack(yw, f);
+    if is_nan(x) or is_nan(y) {
+        if signaling or (x.cls == K_SNAN) or (y.cls == K_SNAN) {
+            c.flags = c.flags | F_INVALID;
+        }
+        return 2;
+    }
+    if (x.cls == K_INF) or (y.cls == K_INF) {
+        let vx = inf_rank(x);
+        let vy = inf_rank(y);
+        if vx == vy {
+            return 0;
+        }
+        if vx < vy {
+            return -1;
+        }
+        return 1;
+    }
+    return cmp_fin(x, y);
+}
+
+// -1 for -inf, 1 for +inf, 0 for a finite value... used where one is
+// infinite: the other's sign decides against a finite value.
+pub fn inf_rank(x: Dec) i32 {
+    if x.cls == K_INF {
+        if x.neg {
+            return -2;
+        }
+        return 2;
+    }
+    if x.neg and not is0(x.c) {
+        return -1;
+    }
+    if is0(x.c) {
+        return 0;
+    }
+    return 1;
+}
+
+/// Is w nonzero (a NaN is)?
+pub fn truth(w: ld.W, f: u32) bool {
+    return not is_zero(unpack(w, f));
+}
+
+// -----------------------------------------------------------------------------
+// Quantum (IEEE 754-2019 5.3.2, 5.7.3; C23 7.12.15)
+// -----------------------------------------------------------------------------
+
+/// x with y's quantum exponent: rounded, or "invalid" when that needs more
+/// than p digits.
+pub fn quantize(xw: ld.W, yw: ld.W, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, f);
+    let y = unpack(yw, f);
+    if is_nan(x) or is_nan(y) {
+        return nan2(x, y, f, c);
+    }
+    if (x.cls == K_INF) or (y.cls == K_INF) {
+        if (x.cls == K_INF) and (y.cls == K_INF) {
+            return inf(x.neg, f);
+        }
+        return invalid(f, c);
+    }
+    return quantize_to(x, y.q, f, c);
+}
+
+// Finite x with exponent e.
+pub fn quantize_to(x: Dec, e: i32, f: u32, c: *mut Ctx) ld.W {
+    let p = prec(f);
+    if is0(x.c) {
+        return pack(x.neg, u2(0, 0), e, f);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    nat_set_u2(&mut a, x.c);
+    if x.q >= e {
+        if (ndigits(&a) + (x.q - e)) > p {
+            return invalid(f, c);
+        }
+        shl10(&mut a, x.q - e);
+        return pack(x.neg, nat_u2(&a), e, f);
+    }
+    let dr = shr10(&mut a, e - x.q);
+    let odd = (a.n > 0) and ((a.d[0] & 1) != 0);
+    if rounds_up(c.mode, x.neg, odd, dr.d, dr.rest) {
+        nat_mulsm(&mut a, 1, 1);
+        if ndigits(&a) > p {
+            return invalid(f, c);
+        }
+    }
+    if (dr.d != 0) or dr.rest {
+        c.flags = c.flags | F_INEXACT;
+    }
+    return pack(x.neg, nat_u2(&a), e, f);
+}
+
+/// Whether x and y have the same quantum exponent (both infinite, or both
+/// NaN, count as the same).
+pub fn samequantum(xw: ld.W, yw: ld.W, f: u32) bool {
+    let x = unpack(xw, f);
+    let y = unpack(yw, f);
+    if is_nan(x) or is_nan(y) {
+        return is_nan(x) and is_nan(y);
+    }
+    if (x.cls == K_INF) or (y.cls == K_INF) {
+        return x.cls == y.cls;
+    }
+    return x.q == y.q;
+}
+
+/// The quantum of x: 1 x 10^q(x) (an infinity: +inf; a NaN: itself).
+pub fn quantum(xw: ld.W, f: u32, c: *mut Ctx) ld.W {
+    let x = unpack(xw, f);
+    if is_nan(x) {
+        return quiet(x, f, c);
+    }
+    if x.cls == K_INF {
+        return inf(false, f);
+    }
+    return pack(false, u2(0, 1), x.q, f);
+}
+
+/// The quantum exponent of x, or `bad` (with "invalid") for an infinity or
+/// a NaN.
+pub fn quantexp(xw: ld.W, f: u32, bad: i64, c: *mut Ctx) i64 {
+    let x = unpack(xw, f);
+    if x.cls != K_FIN {
+        c.flags = c.flags | F_INVALID;
+        return bad;
+    }
+    return @as(i64, x.q);
+}
+
+// -----------------------------------------------------------------------------
+// Conversions between the decimal formats
+// -----------------------------------------------------------------------------
+
+/// w of format `from` in format `to` (exact when wider; narrower: rounded,
+/// its quantum kept when exact).
+pub fn convert(w: ld.W, from: u32, to: u32, c: *mut Ctx) ld.W {
+    let x = unpack(w, from);
+    if is_nan(x) {
+        return quiet(x, to, c);  // (a payload too long for the format: its low digits)
+    }
+    if x.cls == K_INF {
+        return inf(x.neg, to);
+    }
+    let mut ba: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    nat_set_u2(&mut a, x.c);
+    return finish(x.neg, &mut a, x.q, false, x.q, to, c);
+}
+
+// -----------------------------------------------------------------------------
+// Conversions with integers (preferred exponent 0)
+// -----------------------------------------------------------------------------
+
+/// The integer (-1)^neg * m (m below 2^128) in format f.
+pub fn from_u2(neg: bool, m: U2, f: u32, c: *mut Ctx) ld.W {
+    let mut ba: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    nat_set_u2(&mut a, m);
+    return finish(neg, &mut a, 0, false, 0, f, c);
+}
+
+pub fn from_i64(v: i64, f: u32, c: *mut Ctx) ld.W {
+    let neg = v < 0;
+    let mut m = @bit_cast(u64, v);
+    if neg {
+        m = 0 -% m;
+    }
+    return from_u2(neg, u2(0, m), f, c);
+}
+
+pub fn from_u64(v: u64, f: u32, c: *mut Ctx) ld.W {
+    return from_u2(false, u2(0, v), f, c);
+}
+
+/// The integer of n 64-bit limbs at p (two's complement when sg), in
+/// format f.
+pub fn from_limbs(p: *u64, n: usize, sg: bool, f: u32, c: *mut Ctx) ld.W {
+    let mut neg = false;
+    if sg {
+        neg = (@ptr_add(p, n - 1).* >> 63) != 0;
+    }
+    let mut ba: [2200]u32 = undefined;
+    let mut a = nat(ba[..]);
+    // (|value|, its 32-bit halves from the most significant, in Horner's way)
+    let mut i = n;
+    let mut borrow = neg;  // (two's complement negated on the way: ~x + 1, from the bottom)
+    // the magnitude's limbs, least significant first
+    let mut mag: [1100]u64 = undefined;
+    for j in 0..n {
+        let mut x = @ptr_add(p, j).*;
+        if neg {
+            x = ~x;
+            if borrow {
+                x = x +% 1;
+                borrow = x == 0;
+            }
+        }
+        mag[j] = x;
+    }
+    while i > 0 {
+        i -= 1;
+        let x = mag[i];
+        nat_mulsm(&mut a, 65536, @truncate(u32, x >> 48));
+        nat_mulsm(&mut a, 65536, @truncate(u32, (x >> 32) & 0xFFFF));
+        nat_mulsm(&mut a, 65536, @truncate(u32, (x >> 16) & 0xFFFF));
+        nat_mulsm(&mut a, 65536, @truncate(u32, x & 0xFFFF));
+    }
+    return finish(neg, &mut a, 0, false, 0, f, c);
+}
+
+/// The integer part of finite x (truncated toward zero), into a; whether
+/// it dropped a nonzero fraction.
+pub fn int_part(x: Dec, a: *mut Nat) bool {
+    nat_set_u2(a, x.c);
+    if x.q >= 0 {
+        shl10(a, x.q);
+        return false;
+    }
+    let dr = shr10(a, -x.q);
+    return (dr.d != 0) or dr.rest;
+}
+
+/// w truncated to an integer of `bits` bits (signed when sg), saturated:
+/// out of range and NaN are "invalid" (NaN gives 0), a dropped fraction
+/// "inexact" (C23 6.3.1.4: the C program's behaviour is undefined when the
+/// value does not fit). The result's bits, sign-extended (bits <= 64).
+pub fn to_int(w: ld.W, f: u32, bits: u32, sg: bool, c: *mut Ctx) u64 {
+    let x = unpack(w, f);
+    let mut hi: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    if bits < 64 {
+        hi = (@as(u64, 1) << bits) - 1;
+    }
+    let mut lo_mag: u64 = 0;  // the most negative value's magnitude
+    if sg {
+        hi = hi >> 1;
+        lo_mag = hi + 1;
+    }
+    if is_nan(x) {
+        c.flags = c.flags | F_INVALID;
+        return 0;
+    }
+    if x.cls == K_INF {
+        c.flags = c.flags | F_INVALID;
+        if x.neg {
+            return 0 -% lo_mag;
+        }
+        return hi;
+    }
+    let mut ba: [1300]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let frac = int_part(x, &mut a);
+    let mut over = ndigits(&a) > 20;
+    let mut m: u64 = 0;
+    if not over {
+        let v = nat_u2(&a);
+        over = v.h != 0;
+        m = v.l;
+    }
+    if x.neg and (over or (m != 0)) {
+        if over or (m > lo_mag) {
+            c.flags = c.flags | F_INVALID;
+            return 0 -% lo_mag;
+        }
+        if frac {
+            c.flags = c.flags | F_INEXACT;
+        }
+        return 0 -% m;
+    }
+    if over or (m > hi) {
+        c.flags = c.flags | F_INVALID;
+        return hi;
+    }
+    if frac {
+        c.flags = c.flags | F_INEXACT;
+    }
+    return m;
+}
+
+/// w truncated to an integer of n 64-bit limbs at r, `bits` bits wide
+/// (signed when sg), saturated as to_int does.
+pub fn to_limbs(r: *mut u64, n: usize, bits: u32, sg: bool, w: ld.W, f: u32, c: *mut Ctx) void {
+    let x = unpack(w, f);
+    for j in 0..n {
+        @ptr_add(r, j).* = 0;
+    }
+    if is_nan(x) {
+        c.flags = c.flags | F_INVALID;
+        return;
+    }
+    let mut ba: [1300]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let mut frac = false;
+    let mut over = x.cls == K_INF;
+    if not over {
+        frac = int_part(x, &mut a);
+        // (2^bits has fewer than bits * 0.302 + 1 digits)
+        over = ndigits(&a) > (@bit_cast(i32, bits) + 4);
+    }
+    // the magnitude's limbs, from 16-bit pieces
+    let mut k: usize = 0;
+    while (not over) and (a.n > 0) {
+        let piece = @as(u64, nat_divsm(&mut a, 65536));
+        let li = k / 4;
+        if li >= n {
+            over = true;
+            break;
+        }
+        let cur = @ptr_add(r, li).*;
+        @ptr_add(r, li).* = cur | (piece << @truncate(u32, (k % 4) * 16));
+        k += 1;
+    }
+    // does it fit? (the magnitude below 2^(bits - 1) when signed, or
+    // 2^(bits - 1) itself when negative; below 2^bits when unsigned)
+    let mut limit_bits = bits;
+    if sg {
+        limit_bits = bits - 1;
+    }
+    if not over {
+        let top = bitlen_limbs(r, n);
+        if top > limit_bits {
+            over = true;
+            if sg and x.neg and (top == bits) and is_pow2_limbs(r, n) {
+                over = false;
+            }
+        } else if (not sg) and x.neg and (top > 0) {
+            over = true;
+        }
+    }
+    if over {
+        c.flags = c.flags | F_INVALID;
+        // the type's extreme
+        for j in 0..n {
+            @ptr_add(r, j).* = 0;
+        }
+        if sg and x.neg {
+            set_bit_limbs(r, bits - 1);
+            negate_limbs(r, n);
+        } else if not x.neg {
+            for b in 0..limit_bits {
+                set_bit_limbs(r, b);
+            }
+        }
+        return;
+    }
+    if frac {
+        c.flags = c.flags | F_INEXACT;
+    }
+    if x.neg {
+        negate_limbs(r, n);
+    }
+}
+
+fn bitlen_limbs(r: *u64, n: usize) u32 {
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        let v = @ptr_add(r, i).*;
+        if v != 0 {
+            return (@truncate(u32, i) * 64) + (64 - @truncate(u32, @clz(v)));
+        }
+    }
+    return 0;
+}
+
+fn is_pow2_limbs(r: *u64, n: usize) bool {
+    let mut ones: u64 = 0;
+    for i in 0..n {
+        ones += @popcount(@ptr_add(r, i).*);
+    }
+    return ones == 1;
+}
+
+fn set_bit_limbs(r: *mut u64, b: u32) void {
+    let i = @as(usize, b / 64);
+    let cur = @ptr_add(r, i).*;
+    @ptr_add(r, i).* = cur | (@as(u64, 1) << (b % 64));
+}
+
+fn negate_limbs(r: *mut u64, n: usize) void {
+    let mut carry = true;
+    for i in 0..n {
+        let mut v = ~@ptr_add(r, i).*;
+        if carry {
+            v = v +% 1;
+            carry = v == 0;
+        }
+        @ptr_add(r, i).* = v;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Conversions with the binary formats
+// -----------------------------------------------------------------------------
+
+/// The binary formats (as ldouble.ax numbers its two, then float and double).
+pub const B_Q: u32 = 0;    // binary128
+pub const B_X: u32 = 1;    // the x87's 80-bit format
+pub const B_F32: u32 = 2;  // binary32
+pub const B_F64: u32 = 3;  // binary64
+
+// A binary value taken apart: (-1)^neg * m * 2^e when finite.
+struct Bin {
+    cls: u32,  // K_
+    neg: bool,
+    m: U2,
+    e: i32,
+}
+
+fn bprec(b: u32) i32 {
+    if b == B_F32 {
+        return 24;
+    }
+    if b == B_F64 {
+        return 53;
+    }
+    if b == B_X {
+        return 64;
+    }
+    return 113;
+}
+
+// The exponent of the least normal value (the leading bit's).
+fn bemin(b: u32) i32 {
+    if b == B_F32 {
+        return -126;
+    }
+    if b == B_F64 {
+        return -1022;
+    }
+    return -16382;
+}
+
+fn bemax(b: u32) i32 {
+    if b == B_F32 {
+        return 127;
+    }
+    if b == B_F64 {
+        return 1023;
+    }
+    return 16383;
+}
+
+fn bin_unpack(w: ld.W, b: u32) Bin {
+    if b == B_F32 {
+        let x = w.lo & 0xFFFF_FFFF;
+        let neg = (x >> 31) != 0;
+        let ef = @bit_cast(i32, @truncate(u32, (x >> 23) & 0xFF));
+        let fr = x & 0x7F_FFFF;
+        if ef == 0xFF {
+            return bin_special(neg, fr == 0, ((fr >> 22) & 1) == 0);
+        }
+        if ef == 0 {
+            return Bin.{ cls: K_FIN, neg: neg, m: u2(0, fr), e: -149 };
+        }
+        return Bin.{ cls: K_FIN, neg: neg, m: u2(0, fr | 0x80_0000), e: ef - 150 };
+    }
+    if b == B_F64 {
+        let x = w.lo;
+        let neg = (x >> 63) != 0;
+        let ef = @bit_cast(i32, @truncate(u32, (x >> 52) & 0x7FF));
+        let fr = x & 0xF_FFFF_FFFF_FFFF;
+        if ef == 0x7FF {
+            return bin_special(neg, fr == 0, ((fr >> 51) & 1) == 0);
+        }
+        if ef == 0 {
+            return Bin.{ cls: K_FIN, neg: neg, m: u2(0, fr), e: -1074 };
+        }
+        return Bin.{ cls: K_FIN, neg: neg, m: u2(0, fr | 0x10_0000_0000_0000), e: ef - 1075 };
+    }
+    if b == B_X {
+        let ef = @bit_cast(i32, @truncate(u32, w.hi & 0x7FFF));
+        let neg = (w.hi & 0x8000) != 0;
+        let m = w.lo;
+        let j = (m >> 63) != 0;
+        if ef == 0x7FFF {
+            if not j {
+                return bin_special(false, false, false);  // (pseudo-infinity or pseudo-NaN: invalid)
+            }
+            return bin_special(neg, (m << 1) == 0, ((m >> 62) & 1) == 0);
+        }
+        if ef == 0 {
+            return Bin.{ cls: K_FIN, neg: neg, m: u2(0, m), e: -16445 };
+        }
+        if not j {
+            return bin_special(false, false, false);  // (an unnormal: invalid)
+        }
+        return Bin.{ cls: K_FIN, neg: neg, m: u2(0, m), e: ef - 16446 };
+    }
+    let ef = @bit_cast(i32, @truncate(u32, (w.hi >> 48) & 0x7FFF));
+    let neg = (w.hi >> 63) != 0;
+    let fr = u2(w.hi & 0xFFFF_FFFF_FFFF, w.lo);
+    if ef == 0x7FFF {
+        return bin_special(neg, is0(fr), ((fr.h >> 47) & 1) == 0);
+    }
+    if ef == 0 {
+        return Bin.{ cls: K_FIN, neg: neg, m: fr, e: -16494 };
+    }
+    return Bin.{ cls: K_FIN, neg: neg, m: u2(fr.h | 0x1_0000_0000_0000, fr.l), e: ef - 16495 };
+}
+
+fn bin_special(neg: bool, is_inf: bool, sig: bool) Bin {
+    if is_inf {
+        return Bin.{ cls: K_INF, neg: neg, m: u2(0, 0), e: 0 };
+    }
+    let mut k = K_QNAN;
+    if sig {
+        k = K_SNAN;
+    }
+    return Bin.{ cls: k, neg: neg, m: u2(0, 0), e: 0 };
+}
+
+// Buffers of conversions with binary formats and wide integers: a
+// binary128 subnormal is 11,600 digits in decimal.
+const NB: usize = 1300;
+
+/// The binary value w of format b in decimal format f (rounded in c's
+/// direction; exact: the cohort member closest to exponent 0).
+pub fn from_bin(w: ld.W, b: u32, f: u32, c: *mut Ctx) ld.W {
+    let x = bin_unpack(w, b);
+    if x.cls == K_INF {
+        return inf(x.neg, f);
+    }
+    if x.cls >= K_QNAN {
+        if x.cls == K_SNAN {
+            c.flags = c.flags | F_INVALID;
+        }
+        return nan(x.neg, false, u2(0, 0), f);
+    }
+    if is0(x.m) {
+        return zero(x.neg, 0, f);
+    }
+    let mut ba: [NB]u32 = undefined;
+    let mut a = nat(ba[..]);
+    nat_set_u2(&mut a, x.m);
+    let mut q: i32 = 0;
+    if x.e >= 0 {
+        let mut k = x.e;
+        while k >= 29 {
+            nat_mulsm(&mut a, @as(u32, 1) << 29, 0);
+            k -= 29;
+        }
+        nat_mulsm(&mut a, @as(u32, 1) << @bit_cast(u32, k), 0);
+    } else {
+        // m * 2^e = m * 5^-e * 10^e
+        let mut k = -x.e;
+        while k >= 13 {
+            nat_mulsm(&mut a, 1220703125, 0);  // 5^13
+            k -= 13;
+        }
+        let mut p5: u32 = 1;
+        for i in 0..k {
+            _ = i;
+            p5 *= 5;
+        }
+        nat_mulsm(&mut a, p5, 0);
+        q = x.e;
+    }
+    return finish(x.neg, &mut a, q, false, 0, f, c);
+}
+
+// The binary value (-1)^neg * r * 2^e (r nonzero, plus less than a unit of
+// 2^e more when sticky) rounded to nearest (ties to even) in format b.
+fn bin_round(neg: bool, r: U2, e: i32, sticky: bool, b: u32, c: *mut Ctx) ld.W {
+    let p = bprec(b);
+    let l = bitlen2(r);
+    let top = (e + l) - 1;  // the leading bit's exponent
+    // the exponent of the result's last bit
+    let t = @max((top - p) + 1, (bemin(b) - p) + 1);
+    let mut m = r;
+    let mut inexact = sticky;
+    let mut tt = t;
+    if t > e {
+        let s = @bit_cast(u32, t - e);
+        let half = (s <= 128) and bit2(r, s - 1);
+        let mut rest = sticky;
+        if s >= 2 {
+            rest = rest or not is0(low2(r, s - 1));
+        }
+        m = shr2(r, s);
+        inexact = half or rest;
+        if half and (rest or ((m.l & 1) != 0)) {
+            m = add2(m, u2(0, 1));
+            if bitlen2(m) > p {
+                m = shr2(m, 1);
+                tt += 1;
+            }
+        }
+    } else if t < e {
+        m = shl2(r, @bit_cast(u32, e - t));
+    }
+    let tiny = top < bemin(b);
+    if inexact {
+        c.flags = c.flags | F_INEXACT;
+        if tiny {
+            c.flags = c.flags | F_UNDERFLOW;
+        }
+    }
+    let lead = (tt + p) - 1;  // the exponent of bit p - 1 of m
+    if (lead > bemax(b)) and (bitlen2(m) == p) {
+        c.flags = c.flags | (F_OVERFLOW | F_INEXACT);
+        return bin_inf(neg, b);
+    }
+    // the biased exponent: 0 for a subnormal (m below 2^(p - 1))
+    let mut ef: i32 = 0;
+    if bitlen2(m) == p {
+        ef = lead + bemax(b);
+    }
+    return bin_pack(neg, ef, m, b);
+}
+
+fn bin_inf(neg: bool, b: u32) ld.W {
+    if b == B_F32 {
+        return ld.W.{ lo: bsign(neg, 31) | 0x7F80_0000, hi: 0 };
+    }
+    if b == B_F64 {
+        return ld.W.{ lo: bsign(neg, 63) | 0x7FF0_0000_0000_0000, hi: 0 };
+    }
+    if b == B_X {
+        return ld.W.{ lo: 0x8000_0000_0000_0000, hi: bsign(neg, 15) | 0x7FFF };
+    }
+    return ld.W.{ lo: 0, hi: bsign(neg, 63) | 0x7FFF_0000_0000_0000 };
+}
+
+fn bin_nan(neg: bool, b: u32) ld.W {
+    if b == B_F32 {
+        return ld.W.{ lo: bsign(neg, 31) | 0x7FC0_0000, hi: 0 };
+    }
+    if b == B_F64 {
+        return ld.W.{ lo: bsign(neg, 63) | 0x7FF8_0000_0000_0000, hi: 0 };
+    }
+    if b == B_X {
+        return ld.W.{ lo: 0xC000_0000_0000_0000, hi: bsign(neg, 15) | 0x7FFF };
+    }
+    return ld.W.{ lo: 0, hi: bsign(neg, 63) | 0x7FFF_8000_0000_0000 };
+}
+
+fn bsign(neg: bool, bit: u32) u64 {
+    if neg {
+        return @as(u64, 1) << bit;
+    }
+    return 0;
+}
+
+fn bin_pack(neg: bool, ef: i32, m: U2, b: u32) ld.W {
+    let e = @as(u64, @bit_cast(u32, ef));
+    if b == B_F32 {
+        return ld.W.{ lo: (bsign(neg, 31) | (e << 23)) | (m.l & 0x7F_FFFF), hi: 0 };
+    }
+    if b == B_F64 {
+        return ld.W.{ lo: (bsign(neg, 63) | (e << 52)) | (m.l & 0xF_FFFF_FFFF_FFFF), hi: 0 };
+    }
+    if b == B_X {
+        return ld.W.{ lo: m.l, hi: bsign(neg, 15) | e };
+    }
+    return ld.W.{ lo: m.l, hi: (bsign(neg, 63) | (e << 48)) | (m.h & 0xFFFF_FFFF_FFFF) };
+}
+
+/// The decimal value w of format f in binary format b (to nearest, ties to
+/// even).
+pub fn to_bin(w: ld.W, f: u32, b: u32, c: *mut Ctx) ld.W {
+    let x = unpack(w, f);
+    if is_nan(x) {
+        if x.cls == K_SNAN {
+            c.flags = c.flags | F_INVALID;
+        }
+        return bin_nan(x.neg, b);
+    }
+    if x.cls == K_INF {
+        return bin_inf(x.neg, b);
+    }
+    if is0(x.c) {
+        return bin_pack(x.neg, 0, u2(0, 0), b);
+    }
+    let p = bprec(b);
+    let mut ba: [NB]u32 = undefined;
+    let mut a = nat(ba[..]);
+    nat_set_u2(&mut a, x.c);
+    let mut sticky = false;
+    let mut e2: i32 = 0;
+    if x.q >= 0 {
+        shl10(&mut a, x.q);
+        // (digits D: at least (D - 1) log2(10) + 1 bits, at most 4 more)
+        let lmin = @int_cast(i32, ((@as(i64, ndigits(&a) - 1) * 3321928) / 1000000) + 1);
+        let s = lmin - (p + 3);
+        if s > 0 {
+            sticky = shr2pow(&mut a, s);
+            e2 = s;
+        }
+    } else {
+        // floor(c * 2^s / 10^-q), s giving p + 7 bits or more
+        let qq = -x.q;
+        let s = ((p + 8) + @int_cast(i32, ((@as(i64, qq) * 3321929) + 999999) / 1000000)) - bitlen2(x.c);
+        if s > 0 {
+            let mut k = s;
+            while k >= 29 {
+                nat_mulsm(&mut a, @as(u32, 1) << 29, 0);
+                k -= 29;
+            }
+            nat_mulsm(&mut a, @as(u32, 1) << @bit_cast(u32, k), 0);
+        }
+        let dr = shr10(&mut a, qq);
+        sticky = (dr.d != 0) or dr.rest;
+        if s < 0 {
+            sticky = shr2pow(&mut a, -s) or sticky;
+        }
+        e2 = -s;
+    }
+    return bin_round(x.neg, nat_u2(&a), e2, sticky, b, c);
+}
+
+// a = floor(a / 2^s); whether it dropped a nonzero remainder.
+fn shr2pow(a: *mut Nat, s0: i32) bool {
+    let mut s = s0;
+    let mut st = false;
+    while s >= 29 {
+        st = (nat_divsm(a, @as(u32, 1) << 29) != 0) or st;
+        s -= 29;
+    }
+    if s > 0 {
+        st = (nat_divsm(a, @as(u32, 1) << @bit_cast(u32, s)) != 0) or st;
+    }
+    return st;
+}
+
+// -----------------------------------------------------------------------------
+// Decimal character sequences (C23 7.24.1.6 strtod32 ... ; IEEE 754-2019
+// 5.12: the quantum of a number as written)
+// -----------------------------------------------------------------------------
+
+/// What parse read: the value and how many bytes.
+pub struct Parsed {
+    w: ld.W,
+    len: usize,
+}
+
+fn lower(ch: u8) u8 {
+    if (ch >= 65) and (ch <= 90) {
+        return ch + 32;
+    }
+    return ch;
+}
+
+fn is_digit(ch: u8) bool {
+    return (ch >= 48) and (ch <= 57);
+}
+
+fn is_space(ch: u8) bool {
+    return (ch == 32) or ((ch >= 9) and (ch <= 13));
+}
+
+// Does s at i begin with the lower case word w (in any case)?
+fn word_at(s: []u8, i: usize, w: []u8) bool {
+    if (i + w.len) > s.len {
+        return false;
+    }
+    for k in 0..w.len {
+        if lower(s[i + k]) != w[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The longest initial part of s (after white space) that is a decimal
+/// floating number, an infinity or a NaN (with an optional n-char-sequence,
+/// a decimal payload), in format f: rounded in c's direction, with the
+/// quantum it is written with when exact (strtod32's subject sequence; no
+/// hexadecimal form). Nothing read: len 0.
+pub fn parse(s: []u8, f: u32, c: *mut Ctx) Parsed {
+    let mut i: usize = 0;
+    while (i < s.len) and is_space(s[i]) {
+        i += 1;
+    }
+    let mut neg = false;
+    if (i < s.len) and ((s[i] == 43) or (s[i] == 45)) {
+        neg = s[i] == 45;
+        i += 1;
+    }
+    if word_at(s, i, "inf") {
+        let mut n = i + 3;
+        if word_at(s, i, "infinity") {
+            n = i + 8;
+        }
+        return Parsed.{ w: inf(neg, f), len: n };
+    }
+    if word_at(s, i, "nan") {
+        let mut n = i + 3;
+        let mut pl = u2(0, 0);
+        if (n < s.len) and (s[n] == 40) {
+            // (n-char-sequence): digits, letters, underscores
+            let mut k = n + 1;
+            let mut all_digits = true;
+            let mut v = u2(0, 0);
+            let mut nd: i32 = 0;
+            while k < s.len {
+                let ch = s[k];
+                let alnum = is_digit(ch) or ((lower(ch) >= 97) and (lower(ch) <= 122)) or (ch == 95);
+                if not alnum {
+                    break;
+                }
+                if is_digit(ch) and (nd < 38) {
+                    v = mulsm2(v, 10, @as(u64, ch - 48));
+                    if not is0(v) {
+                        nd += 1;
+                    }
+                } else if not is_digit(ch) {
+                    all_digits = false;
+                }
+                if nd >= 38 {
+                    all_digits = false;
+                }
+                k += 1;
+            }
+            if (k < s.len) and (s[k] == 41) {
+                n = k + 1;
+                if all_digits and lt2(v, p10u2(prec(f) - 1)) {
+                    pl = v;
+                }
+            }
+        }
+        return Parsed.{ w: nan(neg, false, pl, f), len: n };
+    }
+    // digits [. digits] [e [sign] digits]
+    let p = prec(f);
+    let mut ba: [NS]u32 = undefined;
+    let mut a = nat(ba[..]);
+    let keep = p + 3;  // (significant digits kept; the rest only count)
+    let mut kept: i32 = 0;
+    let mut extra: i32 = 0;  // significant digits not kept (before the point: they raise the exponent)
+    let mut sticky = false;
+    let mut frac_digits: i32 = 0;
+    let mut any = false;
+    let mut point = false;
+    while i < s.len {
+        let ch = s[i];
+        if is_digit(ch) {
+            any = true;
+            if point {
+                frac_digits = @min(frac_digits + 1, 1000000);
+            }
+            if (kept == 0) and (ch == 48) {
+                // a leading zero
+            } else if kept < keep {
+                nat_mulsm(&mut a, 10, @as(u32, ch - 48));
+                kept += 1;
+            } else {
+                extra = @min(extra + 1, 1000000);
+                if ch != 48 {
+                    sticky = true;
+                }
+            }
+            i += 1;
+        } else if (ch == 46) and not point {
+            point = true;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if not any {
+        return Parsed.{ w: ld.W.{ lo: 0, hi: 0 }, len: 0 };
+    }
+    let mut ex: i32 = 0;
+    if (i < s.len) and (lower(s[i]) == 101) {
+        let mut k = i + 1;
+        let mut eneg = false;
+        if (k < s.len) and ((s[k] == 43) or (s[k] == 45)) {
+            eneg = s[k] == 45;
+            k += 1;
+        }
+        if (k < s.len) and is_digit(s[k]) {
+            while (k < s.len) and is_digit(s[k]) {
+                ex = @min((ex * 10) + @as(i32, s[k] - 48), 100000000);
+                k += 1;
+            }
+            if eneg {
+                ex = -ex;
+            }
+            i = k;
+        }
+    }
+    // the value is a * 10^(ex - frac_digits + extra) (plus sticky); as
+    // written, its quantum exponent is ex - frac_digits
+    let qw = @max(-200000000, @min(200000000, ex - frac_digits));
+    let q = qw + extra;
+    if sticky {
+        // (p + 3 digits kept: the rounding sees them)
+        let r = finish(neg, &mut a, q, true, qw, f, c);
+        return Parsed.{ w: r, len: i };
+    }
+    let r = finish(neg, &mut a, q, false, qw, f, c);
+    return Parsed.{ w: r, len: i };
+}
+
+/// The digits of finite w's coefficient (most significant first, "0" for
+/// zero) into out (40 bytes at least), their number returned; *q its
+/// quantum exponent.
+pub fn coef_digits(w: ld.W, f: u32, out: []mut u8, q: *mut i32) usize {
+    let x = unpack(w, f);
+    q.* = x.q;
+    let mut v = x.c;
+    let mut tmp: [40]u8 = [0; 40];
+    let mut n: usize = 0;
+    loop {
+        tmp[n] = @truncate(u8, divsm2(&mut v, 10)) + 48;
+        n += 1;
+        if is0(v) {
+            break;
+        }
+    }
+    for i in 0..n {
+        out[i] = tmp[n - 1 - i];
+    }
+    return n;
+}
+
+/// w as IEEE 754's to-scientific-string writes it (5.12.2; Python's
+/// decimal str()): plain when the quantum exponent is at most 0 and the
+/// adjusted exponent at least -6, else d.ddd followed by E and the
+/// exponent with its sign; "Infinity", "NaN", "sNaN" with a payload.
+/// For tests and diagnostics.
+pub fn to_sci(w: ld.W, f: u32, out: []mut u8) usize {
+    let x = unpack(w, f);
+    let mut n: usize = 0;
+    if x.neg {
+        out[n] = 45;
+        n += 1;
+    }
+    if x.cls == K_INF {
+        for ch in "Infinity" {
+            out[n] = ch;
+            n += 1;
+        }
+        return n;
+    }
+    if is_nan(x) {
+        if x.cls == K_SNAN {
+            out[n] = 115;
+            n += 1;
+        }
+        for ch in "NaN" {
+            out[n] = ch;
+            n += 1;
+        }
+        if not is0(x.c) {
+            let mut ds: [40]u8 = [0; 40];
+            let mut qq: i32 = 0;
+            let k = coef_digits(pack(false, x.c, 0, f), f, ds[..], &mut qq);
+            for i in 0..k {
+                out[n] = ds[i];
+                n += 1;
+            }
+        }
+        return n;
+    }
+    let mut ds: [40]u8 = [0; 40];
+    let mut q: i32 = 0;
+    let nd = coef_digits(w, f, ds[..], &mut q);
+    let ndi = @int_cast(i32, nd);
+    let adj = (q + ndi) - 1;
+    if (q <= 0) and (adj >= -6) {
+        if (ndi + q) <= 0 {
+            out[n] = 48;
+            out[n + 1] = 46;
+            n += 2;
+            for k in 0..(-(ndi + q)) {
+                _ = k;
+                out[n] = 48;
+                n += 1;
+            }
+            for i in 0..nd {
+                out[n] = ds[i];
+                n += 1;
+            }
+            return n;
+        }
+        let ip = @int_cast(usize, ndi + q);
+        for i in 0..nd {
+            if (i == ip) and (q < 0) {
+                out[n] = 46;
+                n += 1;
+            }
+            out[n] = ds[i];
+            n += 1;
+        }
+        return n;
+    }
+    out[n] = ds[0];
+    n += 1;
+    if nd > 1 {
+        out[n] = 46;
+        n += 1;
+        for i in 1..nd {
+            out[n] = ds[i];
+            n += 1;
+        }
+    }
+    out[n] = 69;
+    n += 1;
+    let mut e = adj;
+    if e < 0 {
+        out[n] = 45;
+        e = -e;
+    } else {
+        out[n] = 43;
+    }
+    n += 1;
+    let mut eb: [12]u8 = [0; 12];
+    let mut k: usize = 0;
+    loop {
+        eb[k] = @truncate(u8, @bit_cast(u32, e % 10)) + 48;
+        e = e / 10;
+        k += 1;
+        if e == 0 {
+            break;
+        }
+    }
+    while k > 0 {
+        k -= 1;
+        out[n] = eb[k];
+        n += 1;
+    }
+    return n;
+}
+
+// -----------------------------------------------------------------------------
+// The densely packed decimal encoding (IEEE 754-2019 3.5.2, Table 3.3 and
+// 3.4: three digits in a declet of ten bits)
+// -----------------------------------------------------------------------------
+
+/// The declet of three digits v (0 .. 999).
+pub fn dpd_encode3(v: u32) u32 {
+    let d1 = v / 100;
+    let d2 = (v / 10) % 10;
+    let d3 = v % 10;
+    let a = (d1 >> 3) & 1;
+    let e = (d2 >> 3) & 1;
+    let i = (d3 >> 3) & 1;
+    // (the digits' bits: b c d, f g h, j k m)
+    let b = (d1 >> 2) & 1;
+    let cc = (d1 >> 1) & 1;
+    let d = d1 & 1;
+    let ff = (d2 >> 2) & 1;
+    let g = (d2 >> 1) & 1;
+    let h = d2 & 1;
+    let j = (d3 >> 2) & 1;
+    let k = (d3 >> 1) & 1;
+    let m = d3 & 1;
+    let sel = (a << 2) | (e << 1) | i;
+    let mut r: [10]u32 = [0; 10];  // p q r s t u v w x y
+    if sel == 0 {
+        r = [b, cc, d, ff, g, h, 0, j, k, m];
+    } else if sel == 1 {
+        r = [b, cc, d, ff, g, h, 1, 0, 0, m];
+    } else if sel == 2 {
+        r = [b, cc, d, j, k, h, 1, 0, 1, m];
+    } else if sel == 4 {
+        r = [j, k, d, ff, g, h, 1, 1, 0, m];
+    } else if sel == 3 {
+        r = [b, cc, d, 1, 0, h, 1, 1, 1, m];
+    } else if sel == 5 {
+        r = [ff, g, d, 0, 1, h, 1, 1, 1, m];
+    } else if sel == 6 {
+        r = [j, k, d, 0, 0, h, 1, 1, 1, m];
+    } else {
+        r = [0, 0, d, 1, 1, h, 1, 1, 1, m];
+    }
+    let mut x: u32 = 0;
+    for t in @as(usize, 0)..10 {
+        x = (x << 1) | r[t];
+    }
+    return x;
+}
+
+/// The three digits (0 .. 999) of declet x (the 24 non-canonical declets
+/// too: Table 3.3).
+pub fn dpd_decode3(x: u32) u32 {
+    let p = (x >> 9) & 1;
+    let q = (x >> 8) & 1;
+    let r = (x >> 7) & 1;
+    let s = (x >> 6) & 1;
+    let t = (x >> 5) & 1;
+    let u = (x >> 4) & 1;
+    let v = (x >> 3) & 1;
+    let w = (x >> 2) & 1;
+    let xx = (x >> 1) & 1;
+    let y = x & 1;
+    let mut d1: u32 = 0;
+    let mut d2: u32 = 0;
+    let mut d3: u32 = 0;
+    if v == 0 {
+        d1 = (p << 2) | (q << 1) | r;
+        d2 = (s << 2) | (t << 1) | u;
+        d3 = (w << 2) | (xx << 1) | y;
+    } else if (w == 0) and (xx == 0) {
+        d1 = (p << 2) | (q << 1) | r;
+        d2 = (s << 2) | (t << 1) | u;
+        d3 = 8 | y;
+    } else if (w == 0) and (xx == 1) {
+        d1 = (p << 2) | (q << 1) | r;
+        d2 = 8 | u;
+        d3 = (s << 2) | (t << 1) | y;
+    } else if (w == 1) and (xx == 0) {
+        d1 = 8 | r;
+        d2 = (s << 2) | (t << 1) | u;
+        d3 = (p << 2) | (q << 1) | y;
+    } else if (s == 0) and (t == 0) {
+        d1 = 8 | r;
+        d2 = 8 | u;
+        d3 = (p << 2) | (q << 1) | y;
+    } else if (s == 0) and (t == 1) {
+        d1 = 8 | r;
+        d2 = (p << 2) | (q << 1) | u;
+        d3 = 8 | y;
+    } else if (s == 1) and (t == 0) {
+        d1 = (p << 2) | (q << 1) | r;
+        d2 = 8 | u;
+        d3 = 8 | y;
+    } else {
+        d1 = 8 | r;
+        d2 = 8 | u;
+        d3 = 8 | y;
+    }
+    return (d1 * 100) + (d2 * 10) + d3;
+}
+
+/// The value w (BID, format f) in the DPD encoding of the format (C23
+/// encodedecdN): the same value, canonical.
+pub fn to_dpd(w: ld.W, f: u32) ld.W {
+    let x = unpack(w, f);
+    let k = kbits(f);
+    let wc = ebits(f) - 2;        // the exponent continuation's bits
+    let nde = (prec(f) - 1) / 3;  // declets
+    let mut r = sign_bit(x.neg, f);
+    if x.cls == K_INF {
+        return w_of(or2(r, shl2(u2(0, 30), k - 6)), f);
+    }
+    let mut v = x.c;
+    // the trailing digits as declets
+    let mut t = u2(0, 0);
+    for i in 0..nde {
+        let g = @truncate(u32, divsm2(&mut v, 1000));
+        t = or2(t, shl2(u2(0, @as(u64, dpd_encode3(g))), @bit_cast(u32, i * 10)));
+    }
+    if is_nan(x) {
+        r = or2(r, shl2(u2(0, 31), k - 6));
+        if x.cls == K_SNAN {
+            r = or2(r, shl2(u2(0, 1), k - 7));
+        }
+        return w_of(or2(r, t), f);
+    }
+    let lead = v.l;  // (the leading digit: 0 .. 9)
+    let e = @as(u64, @bit_cast(u32, x.q + bias(f)));
+    let etop = e >> wc;
+    let mut comb: u64 = 0;
+    if lead <= 7 {
+        comb = (etop << 3) | lead;
+    } else {
+        comb = ((0x18 | (etop << 1)) | (lead & 1));
+    }
+    r = or2(r, shl2(u2(0, comb), k - 6));
+    r = or2(r, shl2(u2(0, e & ((@as(u64, 1) << wc) - 1)), k - 6 - wc));
+    return w_of(or2(r, t), f);
+}
+
+/// The value of DPD encoding w (format f) in BID (C23 decodedecdN).
+pub fn from_dpd(w: ld.W, f: u32) ld.W {
+    let x = bits_of(w, f);
+    let k = kbits(f);
+    let wc = ebits(f) - 2;
+    let p = prec(f);
+    let nde = (p - 1) / 3;
+    let neg = bit2(x, k - 1);
+    let g = shr2(x, k - 6).l & 31;
+    // the trailing digits
+    let mut tv = u2(0, 0);
+    let mut i = nde;
+    while i > 0 {
+        i -= 1;
+        let dl = @truncate(u32, shr2(x, @bit_cast(u32, i * 10)).l & 0x3FF);
+        tv = mulsm2(tv, 1000, @as(u64, dpd_decode3(dl)));
+    }
+    if g == 30 {
+        return inf(neg, f);
+    }
+    if g == 31 {
+        let sig = bit2(x, k - 7);
+        if not lt2(tv, p10u2(p - 1)) {
+            tv = u2(0, 0);
+        }
+        return nan(neg, sig, tv, f);
+    }
+    let mut lead: u64 = 0;
+    let mut etop: u64 = 0;
+    if (g >> 3) == 3 {
+        lead = 8 | (g & 1);
+        etop = (g >> 1) & 3;
+    } else {
+        lead = g & 7;
+        etop = g >> 3;
+    }
+    let econt = shr2(x, k - 6 - wc).l & ((@as(u64, 1) << wc) - 1);
+    let e = (etop << wc) | econt;
+    let c = add2(mulsm2(p10u2(p - 1), lead, 0), tv);
+    return pack(neg, c, @bit_cast(i32, @truncate(u32, e)) - bias(f), f);
+}
+
+// -----------------------------------------------------------------------------
+// The operations of C programs (cgen_dec.ax): in the thread's decimal
+// rounding direction, raising their exceptions (dec_env.ax). The narrow
+// formats' values are their bits in a u64; D128's through pointers.
+// -----------------------------------------------------------------------------
+
+fn envc() Ctx {
+    return Ctx.{ mode: env.g_round, flags: 0 };
+}
+
+fn done(c: *Ctx) void {
+    env.raise(c.flags);
+}
+
+fn nw(x: u64) ld.W {
+    return ld.W.{ lo: x, hi: 0 };
+}
+
+/// x op y in narrow format f (op: 0 +, 1 -, 2 *, 3 /).
+pub fn dec_arith_n(op: u32, x: u64, y: u64, f: u32) u64 {
+    let mut c = envc();
+    let r = arith(op, nw(x), nw(y), f, &mut c);
+    done(&c);
+    return r.lo;
+}
+
+/// *r = *x op *y in D128.
+pub fn dec_arith_w(op: u32, r: *mut ld.W, x: *ld.W, y: *ld.W) void {
+    let mut c = envc();
+    r.* = arith(op, x.*, y.*, D128, &mut c);
+    done(&c);
+}
+
+/// x op y (op: 0 +, 1 -, 2 *, 3 /) with context c.
+pub fn arith(op: u32, x: ld.W, y: ld.W, f: u32, c: *mut Ctx) ld.W {
+    if op == 0 {
+        return add(x, y, false, f, c);
+    }
+    if op == 1 {
+        return add(x, y, true, f, c);
+    }
+    if op == 2 {
+        return mul(x, y, f, c);
+    }
+    return div(x, y, f, c);
+}
+
+/// The comparison of x and y (cmp's result; sig: a relational operator).
+pub fn dec_cmp_n(x: u64, y: u64, f: u32, sig: u32) i32 {
+    let mut c = envc();
+    let r = cmp(nw(x), nw(y), sig != 0, f, &mut c);
+    done(&c);
+    return r;
+}
+
+pub fn dec_cmp_w(x: *ld.W, y: *ld.W, sig: u32) i32 {
+    let mut c = envc();
+    let r = cmp(x.*, y.*, sig != 0, D128, &mut c);
+    done(&c);
+    return r;
+}
+
+/// Is x nonzero (a NaN is)?
+pub fn dec_truth_n(x: u64, f: u32) u32 {
+    if truth(nw(x), f) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn dec_truth_w(x: *ld.W) u32 {
+    if truth(x.*, D128) {
+        return 1;
+    }
+    return 0;
+}
+
+/// x converted from format `from` to `to` (narrow both, or through r and
+/// p for D128: the value is at p when `from` is D128, written to r when
+/// `to` is; otherwise in and out as bits).
+pub fn dec_cvt(r: *mut ld.W, p: *ld.W, x: u64, from: u32, to: u32) u64 {
+    let mut c = envc();
+    let mut w = nw(x);
+    if from == D128 {
+        w = p.*;
+    }
+    let v = convert(w, from, to, &mut c);
+    done(&c);
+    if to == D128 {
+        r.* = v;
+    }
+    return v.lo;
+}
+
+/// An integer (v, its 64 bits, signed when sg) in format f (to D128:
+/// written to r).
+pub fn dec_from_int(r: *mut ld.W, v: u64, sg: u32, f: u32) u64 {
+    let mut c = envc();
+    let mut w = ld.W.{ lo: 0, hi: 0 };
+    if sg != 0 {
+        w = from_i64(@bit_cast(i64, v), f, &mut c);
+    } else {
+        w = from_u64(v, f, &mut c);
+    }
+    done(&c);
+    if f == D128 {
+        r.* = w;
+    }
+    return w.lo;
+}
+
+/// x (at p for D128) truncated to an integer of `bits` bits (sg: signed),
+/// saturated.
+pub fn dec_to_int(p: *ld.W, x: u64, f: u32, bits: u32, sg: u32) u64 {
+    let mut c = envc();
+    let mut w = nw(x);
+    if f == D128 {
+        w = p.*;
+    }
+    let v = to_int(w, f, bits, sg != 0, &mut c);
+    done(&c);
+    return v;
+}
+
+/// The integer of n limbs at a (wider than 64 bits) in format f.
+pub fn dec_from_wint(r: *mut ld.W, a: *u64, n: usize, sg: u32, f: u32) u64 {
+    let mut c = envc();
+    let w = from_limbs(a, n, sg != 0, f, &mut c);
+    done(&c);
+    if f == D128 {
+        r.* = w;
+    }
+    return w.lo;
+}
+
+/// x truncated to an integer of n limbs at out, `bits` bits wide.
+pub fn dec_to_wint(out: *mut u64, n: usize, bits: u32, sg: u32, p: *ld.W, x: u64, f: u32) void {
+    let mut c = envc();
+    let mut w = nw(x);
+    if f == D128 {
+        w = p.*;
+    }
+    to_limbs(out, n, bits, sg != 0, w, f, &mut c);
+    done(&c);
+}
+
+/// A binary value (float or double: its bits in v; the others at bp) in
+/// decimal format f.
+pub fn dec_from_bin(r: *mut ld.W, bp: *ld.W, v: u64, b: u32, f: u32) u64 {
+    let mut c = envc();
+    let mut w = nw(v);
+    if (b == B_Q) or (b == B_X) {
+        w = bp.*;
+    }
+    let d = from_bin(w, b, f, &mut c);
+    done(&c);
+    if f == D128 {
+        r.* = d;
+    }
+    return d.lo;
+}
+
+/// x (at p for D128) in binary format b: float's or double's bits
+/// returned, a wide long double's written to r.
+pub fn dec_to_bin(r: *mut ld.W, p: *ld.W, x: u64, f: u32, b: u32) u64 {
+    let mut c = envc();
+    let mut w = nw(x);
+    if f == D128 {
+        w = p.*;
+    }
+    let v = to_bin(w, f, b, &mut c);
+    done(&c);
+    if (b == B_Q) or (b == B_X) {
+        r.* = v;
+    }
+    return v.lo;
+}
+
+// -----------------------------------------------------------------------------
+// Classification (C23 7.12.3: the builtins of <math.h>'s macros)
+// -----------------------------------------------------------------------------
+
+/// Is w (format f) a canonical encoding (IEEE 754-2019 3.5.2): a finite
+/// value's coefficient below 10^p, an infinity's bits after the five of
+/// its combination field zero, a NaN's after the sixth zero but for a
+/// payload below 10^(p - 1)?
+pub fn canonical(w: ld.W, f: u32) bool {
+    let x = bits_of(w, f);
+    let k = kbits(f);
+    let g = shr2(x, k - 6).l & 31;
+    let d = unpack(w, f);
+    if d.cls == K_FIN {
+        let c2 = (g >> 3) == 3;
+        if c2 {
+            return false;  // (the second form's coefficient is at least 8 x 2^(cb - 2) >= 10^p)
+        }
+        return lt2(low2(x, cbits(f)), p10u2(prec(f)));
+    }
+    if d.cls == K_INF {
+        return is0(low2(x, k - 6));
+    }
+    // a NaN: the exponent continuation's bits zero, the payload canonical
+    let pl = low2(x, cbits(f) - 3);
+    let mid = shr2(low2(x, k - 7), cbits(f) - 3);
+    return is0(mid) and lt2(pl, p10u2(prec(f) - 1));
+}
+
+/// The classification builtin k of w: 0 fpclassify (FP_NAN 0, FP_INFINITE
+/// 1, FP_ZERO 2, FP_SUBNORMAL 3, FP_NORMAL 4), 1 isfinite, 2 isinf, 3
+/// isnan, 4 isnormal, 5 signbit, 6 issubnormal, 7 iszero, 8 issignaling,
+/// 9 iscanonical. A subnormal value is finite, nonzero and below 10^emin
+/// in magnitude (its adjusted exponent q + digits - 1 below 1 - emax).
+pub fn classify(w: ld.W, f: u32, k: u32) u32 {
+    let d = unpack(w, f);
+    let mut c: u32 = 4;
+    if is_nan(d) {
+        c = 0;
+    } else if d.cls == K_INF {
+        c = 1;
+    } else if is0(d.c) {
+        c = 2;
+    } else if ((d.q + digits2(d.c)) - 1) < (1 - emax(f)) {
+        c = 3;
+    }
+    if k == 0 {
+        return c;
+    }
+    let mut r = false;
+    if k == 1 {
+        r = c >= 2;
+    } else if k == 2 {
+        r = c == 1;
+    } else if k == 3 {
+        r = c == 0;
+    } else if k == 4 {
+        r = c == 4;
+    } else if k == 5 {
+        r = signbit(w, f);
+    } else if k == 6 {
+        r = c == 3;
+    } else if k == 7 {
+        r = c == 2;
+    } else if k == 8 {
+        r = d.cls == K_SNAN;
+    } else {
+        r = canonical(w, f);
+    }
+    if r {
+        return 1;
+    }
+    return 0;
+}
+
+/// classify for a C program: narrow formats' bits in x, D128's at p.
+pub fn dec_classify(p: *ld.W, x: u64, f: u32, k: u32) u32 {
+    let mut w = nw(x);
+    if f == D128 {
+        w = p.*;
+    }
+    return classify(w, f, k);
+}

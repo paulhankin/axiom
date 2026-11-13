@@ -62,9 +62,13 @@ lists the diagnostics.
   `__STDC_IEC_559_COMPLEX__` is not defined, though multiplication and division
   follow Annex G.5.1 (`ccomplex.ax` folds constants, `cgen_complex.ax` generates the
   same operations, with helper functions of the module for the slow paths).
-- **Not supported, and said so by the feature macros**: decimal floating
-  types. Annex F is not claimed (`__STDC_IEC_559__` and
-  `__STDC_IEC_60559_BFP__` are not defined): the floating types have IEC 60559's
+- **Decimal floating types** (C23: `_Decimal32`, `_Decimal64`, `_Decimal128`, `df`
+  `dd` `dl` constants; `__STDC_IEC_60559_DFP__`): IEEE 754-2019's decimal formats in
+  the BID encoding, computed in software (`std/c/rt/decimal.ax`, below), with the
+  decimal rounding direction of `fe_dec_setround` and the exceptions in `<fenv.h>`'s
+  flags; the library's decimal functions are `std/c/rt/dfp.ax` and `dfp_math.ax`.
+- **Not claimed**: Annex F for the binary types (`__STDC_IEC_559__` and
+  `__STDC_IEC_60559_BFP__` are not defined): the standard floating types have IEC 60559's
   formats (`FLT_IS_IEC_60559`); the library's `<fenv.h>` reads and sets the rounding
   modes and flags (through `__builtin_axiom_fenv_get`/`_set`: `csema_fp.ax`,
   `cgen_fp.ax`, the intrinsics `IN_FPENV_GET`/`SET`), but the optimizer assumes the
@@ -122,6 +126,7 @@ cmd/axiom/src/c/cparse.ax   parser
 cmd/axiom/src/c/ctypes.ax   C types, layout, conversions
 cmd/axiom/src/c/cconst.ax   constant expressions                        (+ ccomplex.ax)
 cmd/axiom/src/c/cldbl.ax    long double constants wider than double: read exactly, folded
+cmd/axiom/src/c/cdec.ax     decimal floating constants: read exactly (with their quanta), folded
 cmd/axiom/src/c/cwide.ax    integer constants wider than 64 bits, folded
 cmd/axiom/src/c/csema*.ax   semantic analysis: the typed tree (csema_atomic.ax: atomic types, <stdatomic.h>;
                             csema_fp.ax: the builtins of <math.h>, <tgmath.h> and <fenv.h>,
@@ -134,9 +139,13 @@ cmd/axiom/src/asm/          inline assembly: inline.ax (the IN_ASM description s
                             obj.ax (file-scope asm into the object)
 cmd/axiom/src/c/cgen*.ax    IR generation (ir.ax), the platforms' calling conventions
                             (cgen_complex.ax: complex arithmetic; cgen_ld.ax: long double
-                            wider than double; cgen_wint.ax: integers wider than 64 bits;
+                            wider than double; cgen_dec.ax: the decimal floating types;
+                            cgen_wint.ax: integers wider than 64 bits;
                             cgen_atomic.ax: atomic operations; cgen_tls.ax: thread storage)
 std/c/rt/ldouble.ax         that long double's arithmetic, in software (the compiler's too)
+std/c/rt/decimal.ax         the decimal floating arithmetic and conversions, in software (the compiler's too;
+                            dec_env.ax: the thread's decimal rounding direction and flags)
+std/c/rt/dfp.ax, dfp_math.ax, dfp_env.ax   the library's decimal functions (<math.h>, <fenv.h>)
 std/c/rt/wideint.ax         the integers wider than 64 bits: what is not inline (the compiler's too)
 cmd/axiom/src/c/cc.ax       the driver, and the link of the units (with Axiom's)
 cmd/axiom/src/c/cstrip.ax   leaves out of an executable what the units define and nothing reaches
@@ -177,6 +186,19 @@ cmd/axiom/internal/tests/c/ tests
   holds a binary128 (`v`, `xmm`), and, for an x87 result in `st(0)`, the intrinsics
   `IN_X87_LOAD` and `IN_X87_STORE` (`fld`, `fstp`: the x86-64 backend's only x87 code)
   just before the return and just after the call.
+- The decimal floating types (`cty.is_decimal`): a `_Decimal32` or `_Decimal64` value
+  is an integer of its width in the IR (its BID encoding: registers, no memory), a
+  `_Decimal128` 16 bytes of memory as a wide long double is (`cty.is_dec128`). Their
+  operations are calls of `std/c/rt/decimal.ax`'s `dec_` functions (`cgen_dec.ax`,
+  through `cg.ld_fn`; `main.ax` loads the module when a unit operates on them:
+  `cty.g_used_dec`), which round in the thread's decimal rounding direction and raise
+  their exceptions in `dec_env.ax`, which `<fenv.h>` merges into the hardware's flags.
+  Constants are their encodings (`Expr.xv`): decimal floating constants read exactly
+  (`cdec.ax`), folded with the same functions (rounding to nearest). The usual
+  arithmetic conversions do not mix them with the standard floating or complex types
+  (`C3230`). The ABIs pass them as the binary types of their sizes (cgen_abi.ax; the
+  narrow ones bit-cast to the floating-point piece at the boundary), as types of their
+  own in AAPCS64's homogeneous aggregates, as integers on Windows x64.
 - Integers wider than 64 bits (`cty.is_wint`: `__int128`, `_BitInt(N)` for N > 64):
   a value is its 64-bit limbs in memory, which cgen handles as it does a structure's (its
   address; scalar replacement makes the two limbs of a 128-bit value two SSA values
@@ -338,7 +360,10 @@ differential testing, and `tools/gen_c_abi.py` random tests of the calling conve
 (its `--host` output is `c/run/abi_gen_*.c`, with their callees in `c/run/abi/`;
 `--int128` and `--bitint` add the integers wider than 64 bits). `tools/gen_wint_tests.py`
 writes `c/run/wint_gen_*.c`: every operation on those integers at run time and folded,
-against Python's values.
+against Python's values. `tools/gen_dec_tests.py` writes `c/lib/math/dec_gen_*.c`: the
+decimal floating operations and conversions in every decimal rounding direction, at run
+time and folded, with the expected encodings and flags from Python's `decimal` module
+and exact arithmetic; `gen_c_abi.py --dec` adds the decimal types to the ABI tests.
 The hosted C library's tests are `c/lib/<part>/*.c` (`[c-lib]`: programs built with
 the library, which print through it, with directives for standard input, standard
 error and their order, `wasm-flags:` for a WebAssembly build's extensions and

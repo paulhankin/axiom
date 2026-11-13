@@ -1,0 +1,804 @@
+// =============================================================================
+// std/c/rt/dfp.ax - the exact decimal floating functions of the C library's
+// <math.h> (C23 7.12, the d32, d64 and d128 suffixes), which the C wrappers
+// std/c/lib/math/dfp_*.c call through __axc_dfn (axc/dfp.h): the rounding
+// functions, remainders, fma and sqrt, the manipulation, maximum and minimum
+// functions, the quantum functions (7.12.15), the encodings (7.12.11.7ff),
+// total order and payloads (F.10.12, F.10.13), and the narrowing operations
+// (7.12.14). Each is exact or correctly rounded, in the thread's decimal
+// rounding direction (dec_env.ax), with IEEE 754-2019's quantum rules (5.2,
+// 5.3: an exact result's quantum the preferred one, max(q, 0) for the
+// rounding functions); the elementary functions are dfp_math.ax's.
+//
+// Errors (7.12.1): math_errhandling's: a domain error ("invalid" from
+// operands that are not NaNs) sets errno to EDOM; a pole error, an overflow
+// and an underflow ERANGE; the exceptions are raised in the flags, where
+// the target has them (m_err.c: __axc_math_err).
+//
+// Operands and results are the formats' encodings in 16-byte buffers (the
+// narrow formats' in the low bytes); f is the format (decimal.ax D32 ...).
+// =============================================================================
+import "dec_env.ax" as env;
+import "decimal.ax" as d;
+import "ldouble.ax" as ld;
+
+extern "C" {
+    fn __axc_math_err(e: i32, flags: u32) void;
+}
+
+const EDOM: i32 = 33;
+const ERANGE: i32 = 34;
+
+// The operation numbers (the generator's order in dfp_x_*.c).
+const OP_SQRT: u64 = 1;
+const OP_CEIL: u64 = 2;
+const OP_FLOOR: u64 = 3;
+const OP_NEARBYINT: u64 = 4;
+const OP_RINT: u64 = 5;
+const OP_ROUND: u64 = 6;
+const OP_ROUNDEVEN: u64 = 7;
+const OP_TRUNC: u64 = 8;
+const OP_FABS: u64 = 9;
+const OP_NEXTUP: u64 = 10;
+const OP_NEXTDOWN: u64 = 11;
+const OP_QUANTUM: u64 = 12;
+const OP_LOGB: u64 = 13;
+const OP_FMOD: u64 = 14;
+const OP_REMAINDER: u64 = 15;
+const OP_COPYSIGN: u64 = 16;
+const OP_NEXTAFTER: u64 = 17;
+const OP_FDIM: u64 = 18;
+const OP_FMAX: u64 = 19;
+const OP_FMIN: u64 = 20;
+const OP_FMAXIMUM: u64 = 21;
+const OP_FMINIMUM_MAG_NUM: u64 = 28;
+const OP_QUANTIZE: u64 = 29;
+const OP_FMA: u64 = 30;
+const OP_LDEXP: u64 = 31;
+const OP_SCALBN: u64 = 32;
+const OP_SCALBLN: u64 = 33;
+const OP_ILOGB: u64 = 34;
+const OP_LLOGB: u64 = 35;
+const OP_LRINT: u64 = 36;
+const OP_LROUND: u64 = 37;
+const OP_LLRINT: u64 = 38;
+const OP_LLROUND: u64 = 39;
+const OP_LLQUANTEXP: u64 = 40;
+const OP_FREXP: u64 = 41;
+const OP_MODF: u64 = 42;
+const OP_NEXTTOWARD: u64 = 43;
+const OP_SAMEQUANTUM: u64 = 44;
+const OP_FROMFP: u64 = 46;
+const OP_UFROMFP: u64 = 47;
+const OP_FROMFPX: u64 = 48;
+const OP_UFROMFPX: u64 = 49;
+const OP_CANONICALIZE: u64 = 50;
+const OP_TOTALORDER: u64 = 51;
+const OP_TOTALORDERMAG: u64 = 52;
+const OP_GETPAYLOAD: u64 = 53;
+const OP_SETPAYLOAD: u64 = 54;
+const OP_SETPAYLOADSIG: u64 = 55;
+const OP_ENCODEDEC: u64 = 56;
+const OP_DECODEDEC: u64 = 57;
+const OP_ENCODEBIN: u64 = 58;
+const OP_DECODEBIN: u64 = 59;
+const OP_N_ADD: u64 = 100;  // ... sub, mul, div, fma, sqrt: 105
+
+/// Reports the flags of an operation whose operands are not NaNs (nan:
+/// one is; then "invalid" is no domain error): errno, and the exceptions.
+fn report(flags: u32, nan_operand: bool) void {
+    if flags == 0 {
+        return;
+    }
+    let mut e: i32 = 0;
+    if ((flags & d.F_INVALID) != 0) and not nan_operand {
+        e = EDOM;
+    } else if (flags & (d.F_DIVBYZERO | d.F_OVERFLOW | d.F_UNDERFLOW)) != 0 {
+        e = ERANGE;
+    }
+    __axc_math_err(e, flags);
+}
+
+fn ctxn() d.Ctx {
+    return d.ctx(env.g_round);
+}
+
+fn r_of(w: ld.W, f: u32) ld.W {
+    // (the narrow formats' encodings alone: the buffer's other bytes zero)
+    if f == d.D32 {
+        return ld.W.{ lo: w.lo & 0xFFFF_FFFF, hi: 0 };
+    }
+    if f == d.D64 {
+        return ld.W.{ lo: w.lo, hi: 0 };
+    }
+    return w;
+}
+
+// -----------------------------------------------------------------------------
+// Rounding to an integral value (IEEE 754-2019 5.3.1, 5.9)
+// -----------------------------------------------------------------------------
+
+/// x rounded to an integral value in direction mode: its quantum exponent
+/// max(q, 0); "inexact" when exact_flag and the value changed (rint).
+pub fn round_integral(w: ld.W, f: u32, mode: u32, exact_flag: bool, c: *mut d.Ctx) ld.W {
+    let x = d.unpack(w, f);
+    if d.is_nan(x) {
+        return d.quiet(x, f, c);
+    }
+    if (x.cls == d.K_INF) or (x.q >= 0) {
+        return d.repack(x, f);
+    }
+    let mut cc = d.ctx(mode);
+    let r = d.quantize_to(x, 0, f, &mut cc);
+    if exact_flag {
+        c.flags = c.flags | (cc.flags & d.F_INEXACT);
+    }
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// Neighbours (IEEE 754-2019 5.3.1 nextUp, nextDown)
+// -----------------------------------------------------------------------------
+
+/// The least value above x (up), or the greatest below it: with the
+/// format's precision (the least exponent the value has with p digits).
+pub fn next(w: ld.W, f: u32, up: bool, c: *mut d.Ctx) ld.W {
+    let x = d.unpack(w, f);
+    if d.is_nan(x) {
+        return d.quiet(x, f, c);
+    }
+    if x.cls == d.K_INF {
+        if x.neg == up {
+            return d.max_finite(x.neg, f);  // (-inf up, +inf down: the largest finite)
+        }
+        return d.repack(x, f);
+    }
+    if d.is_zero(x) {
+        return d.pack(not up, d.u2(0, 1), d.qmin(f), f);
+    }
+    // toward zero for a value of the other sign
+    if x.neg == up {
+        return step_down(x, f, x.neg);
+    }
+    return step_up(x, f, x.neg);
+}
+
+// The coefficient of x (nonzero, finite) with as many digits as the format
+// has (or the least exponent): c * 10^q.
+fn widen(x: d.Dec, f: u32, q: *mut i32) d.U2 {
+    let p = d.prec(f);
+    let nd = d.digits2(x.c);
+    let k = @min(p - nd, x.q - d.qmin(f));
+    q.* = x.q - k;
+    return d.mul10s(x.c, k);
+}
+
+// The next value away from zero of |x| (sign neg).
+fn step_up(x: d.Dec, f: u32, neg: bool) ld.W {
+    let mut q: i32 = 0;
+    let cw = d.add2(widen(x, f, &mut q), d.u2(0, 1));
+    if d.eq2(cw, d.p10u2(d.prec(f))) {
+        if q >= d.qmax(f) {
+            return d.inf(neg, f);
+        }
+        return d.pack(neg, d.p10u2(d.prec(f) - 1), q + 1, f);
+    }
+    return d.pack(neg, cw, q, f);
+}
+
+// The next value toward zero of |x| (sign neg).
+fn step_down(x: d.Dec, f: u32, neg: bool) ld.W {
+    let mut q: i32 = 0;
+    let w0 = widen(x, f, &mut q);
+    if d.eq2(w0, d.p10u2(d.prec(f) - 1)) and (q > d.qmin(f)) {
+        return d.pack(neg, d.sub2(d.p10u2(d.prec(f)), d.u2(0, 1)), q - 1, f);
+    }
+    return d.pack(neg, d.sub2(w0, d.u2(0, 1)), q, f);
+}
+
+// -----------------------------------------------------------------------------
+// Total order (IEEE 754-2019 5.10)
+// -----------------------------------------------------------------------------
+
+// The class's place in the order of positive values: finite, infinite,
+// signaling NaN, quiet NaN.
+fn rank(x: d.Dec) i32 {
+    if x.cls == d.K_FIN {
+        return 0;
+    }
+    if x.cls == d.K_INF {
+        return 1;
+    }
+    if x.cls == d.K_SNAN {
+        return 2;
+    }
+    return 3;
+}
+
+/// totalOrder(x, y): x before y or the same.
+pub fn total_order(xw: ld.W, yw: ld.W, f: u32) bool {
+    let x = d.unpack(xw, f);
+    let y = d.unpack(yw, f);
+    if x.neg != y.neg {
+        return x.neg;
+    }
+    let o = order_abs(x, y);
+    if x.neg {
+        return o >= 0;
+    }
+    return o <= 0;
+}
+
+// The order of |x| and |y| in the total order: -1, 0, 1.
+fn order_abs(x: d.Dec, y: d.Dec) i32 {
+    let rx = rank(x);
+    let ry = rank(y);
+    if rx != ry {
+        if rx < ry {
+            return -1;
+        }
+        return 1;
+    }
+    if rx == 1 {
+        return 0;
+    }
+    if rx >= 2 {
+        // (NaNs by payload)
+        if d.eq2(x.c, y.c) {
+            return 0;
+        }
+        if d.lt2(x.c, y.c) {
+            return -1;
+        }
+        return 1;
+    }
+    let ax = d.Dec.{ cls: d.K_FIN, neg: false, q: x.q, c: x.c };
+    let ay = d.Dec.{ cls: d.K_FIN, neg: false, q: y.q, c: y.c };
+    let v = d.cmp_fin(ax, ay);
+    if v != 0 {
+        return v;
+    }
+    // (equal values: the lesser exponent first)
+    if x.q < y.q {
+        return -1;
+    }
+    if x.q > y.q {
+        return 1;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Maximum and minimum (7.12.12; IEEE 754-2019 9.6)
+// -----------------------------------------------------------------------------
+
+// max (big) or min of x and y by value, |value| (mag), with or without NaN
+// propagation (num: a NaN operand gives the other operand, quiet NaNs only
+// for fmax and fmin: c99), equal values by the total order.
+fn extreme(xw: ld.W, yw: ld.W, f: u32, big: bool, mag: bool, num: bool, c99: bool, c: *mut d.Ctx) ld.W {
+    let x = d.unpack(xw, f);
+    let y = d.unpack(yw, f);
+    if d.is_nan(x) or d.is_nan(y) {
+        if num {
+            let xs = x.cls == d.K_SNAN;
+            let ys = y.cls == d.K_SNAN;
+            if xs or ys {
+                c.flags = c.flags | d.F_INVALID;
+                if c99 {
+                    return d.qnan(f);  // (fmax, fmin: a signaling NaN gives a NaN)
+                }
+            }
+            if not d.is_nan(x) {
+                return d.repack(x, f);
+            }
+            if not d.is_nan(y) {
+                return d.repack(y, f);
+            }
+        }
+        return d.nan2(x, y, f, c);
+    }
+    let mut o: i32 = 0;
+    if mag {
+        let ax = d.Dec.{ cls: x.cls, neg: false, q: x.q, c: x.c };
+        let ay = d.Dec.{ cls: y.cls, neg: false, q: y.q, c: y.c };
+        o = order_value(ax, ay);
+    }
+    if o == 0 {
+        o = order_value(x, y);
+    }
+    if o == 0 {
+        // (the same value: by the total order, -0 before +0, the lesser
+        // exponent of a positive value first)
+        if total_order(xw, yw, f) {
+            o = -1;
+        } else {
+            o = 1;
+        }
+    }
+    if (o > 0) == big {
+        return d.repack(x, f);
+    }
+    return d.repack(y, f);
+}
+
+// The order of two values (no NaNs): -1, 0, 1.
+fn order_value(x: d.Dec, y: d.Dec) i32 {
+    let mut c = d.ctx(0);
+    let v = d.cmp(d.repack(x, d.D128), d.repack(y, d.D128), false, d.D128, &mut c);
+    return v;
+}
+
+// -----------------------------------------------------------------------------
+// Payloads and canonical encodings (F.10.13, 7.12.11.7)
+// -----------------------------------------------------------------------------
+
+fn payload(xw: ld.W, f: u32) ld.W {
+    let x = d.unpack(xw, f);
+    if not d.is_nan(x) {
+        return d.pack(true, d.u2(0, 1), 0, f);  // (-1: not a NaN)
+    }
+    return d.pack(false, x.c, 0, f);
+}
+
+// The NaN (signaling: sig) whose payload pl's value is (an integer from 0
+// to 10^(p - 1) - 1), or none (+0, 1 returned).
+fn set_payload(r: *mut ld.W, plw: ld.W, f: u32, sig: bool) u64 {
+    let x = d.unpack(plw, f);
+    let zero = d.zero(false, 0, f);
+    if (x.cls != d.K_FIN) or x.neg {
+        if (x.cls == d.K_FIN) and d.is_zero(x) {
+            r.* = d.nan(false, sig, d.u2(0, 0), f);
+            return 0;
+        }
+        r.* = zero;
+        return 1;
+    }
+    let mut v = x.c;
+    let mut q = x.q;
+    // (an integer: trailing zeros of a negative exponent dropped)
+    while (q < 0) and not d.is0(v) {
+        let mut t = v;
+        if d.divsm2(&mut t, 10) != 0 {
+            r.* = zero;
+            return 1;
+        }
+        v = t;
+        q += 1;
+    }
+    if d.is0(v) {
+        r.* = d.nan(false, sig, v, f);
+        return 0;
+    }
+    if q < 0 {
+        r.* = zero;
+        return 1;
+    }
+    if (q > 0) and ((d.digits2(v) + q) > (d.prec(f) - 1)) {
+        r.* = zero;
+        return 1;
+    }
+    v = d.mul10s(v, q);
+    if not d.lt2(v, d.p10u2(d.prec(f) - 1)) {
+        r.* = zero;
+        return 1;
+    }
+    r.* = d.nan(false, sig, v, f);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// The C library's entry
+// -----------------------------------------------------------------------------
+
+fn sat_int(neg_min: bool, bits: u64) u64 {
+    _ = neg_min;
+    // (the type's minimum: the result where the value has none)
+    if bits >= 64 {
+        return 0x8000_0000_0000_0000;
+    }
+    return 0 -% (@as(u64, 1) << @truncate(u32, bits - 1));
+}
+
+// x rounded in direction mode to an integer of `bits` bits: its value
+// (sign-extended), or the type's minimum with "invalid" (lrint, lround).
+fn to_long(w: ld.W, f: u32, mode: u32, bits: u64, inexact: bool, c: *mut d.Ctx) u64 {
+    let x = d.unpack(w, f);
+    if x.cls != d.K_FIN {
+        c.flags = c.flags | d.F_INVALID;
+        return sat_int(true, bits);
+    }
+    let mut cc = d.ctx(mode);
+    let r = round_integral(w, f, mode, true, &mut cc);
+    let mut c2 = d.ctx(0);
+    let v = d.to_int(r, f, @truncate(u32, bits), true, &mut c2);
+    if (c2.flags & d.F_INVALID) != 0 {
+        c.flags = c.flags | d.F_INVALID;
+        return sat_int(true, bits);
+    }
+    if inexact {
+        c.flags = c.flags | (cc.flags & d.F_INEXACT);
+    }
+    return v;
+}
+
+// The rounding direction of fromfp's argument (FP_INT_UPWARD 0 ... :
+// <math.h>), or 9 for none.
+fn fp_int_mode(r: u64) u32 {
+    if r == 0 {
+        return d.R_UP;
+    }
+    if r == 1 {
+        return d.R_DOWN;
+    }
+    if r == 2 {
+        return d.R_ZERO;
+    }
+    if r == 3 {
+        return d.R_AWAY;
+    }
+    if r == 4 {
+        return d.R_NEAREST;
+    }
+    return 9;
+}
+
+// fromfp, ufromfp, fromfpx, ufromfpx (7.12.9.10): x rounded in direction
+// rnd to an integral value that a (signed, or unsigned) integer of `width`
+// bits holds (width up to 64), else a NaN with "invalid"; the x forms
+// "inexact" when the value changed.
+fn from_fp(w: ld.W, f: u32, rnd: u64, width0: u64, signed_: bool, x_form: bool, c: *mut d.Ctx) ld.W {
+    let x = d.unpack(w, f);
+    let mode = fp_int_mode(rnd);
+    let width = @min(width0, 64);
+    if (x.cls != d.K_FIN) or (mode == 9) or (signed_ and (width == 0)) {
+        c.flags = c.flags | d.F_INVALID;
+        return d.qnan(f);
+    }
+    let mut cc = d.ctx(mode);
+    let r = round_integral(w, f, mode, true, &mut cc);
+    let ri = d.unpack(r, f);
+    // the value's magnitude against the limit
+    let mut ok = true;
+    if not d.is_zero(ri) {
+        let mut ba: [40]u32 = undefined;
+        let mut a = d.nat(ba[..]);
+        _ = d.int_part(ri, &mut a);
+        let big = d.ndigits(&a) > 20;
+        let mag = d.nat_u2(&a);
+        let mut lim = d.u2(0, 0);  // (the largest magnitude allowed)
+        if signed_ {
+            lim = d.u2(0, (@as(u64, 1) << @truncate(u32, width - 1)) - 1);
+            if ri.neg {
+                lim = d.add2(lim, d.u2(0, 1));
+            }
+        } else if ri.neg {
+            ok = false;
+        } else if width == 64 {
+            lim = d.u2(0, 0xFFFF_FFFF_FFFF_FFFF);
+        } else {
+            lim = d.u2(0, (@as(u64, 1) << @truncate(u32, width)) - 1);
+        }
+        if big or d.lt2(lim, mag) {
+            ok = false;
+        }
+    }
+    if not ok {
+        c.flags = c.flags | d.F_INVALID;
+        return d.qnan(f);
+    }
+    if x_form {
+        c.flags = c.flags | (cc.flags & d.F_INEXACT);
+    }
+    return r;
+}
+
+/// The decimal functions of <math.h> that are exact or correctly rounded
+/// (op: the numbers above), of format f: x, y, z the operands (y the
+/// second result of modf, a _Decimal128 for nexttoward, the operands'
+/// format for the narrowing operations, which round to format n), n an
+/// integer operand (ldexp's exponent; an integer result's width in bits;
+/// fromfp's direction << 32 | width). The result into r; an integer
+/// result returned.
+export fn __axc_dfn(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    let f = @truncate(u32, f64_);
+    let mut c = ctxn();
+    let mut nan_in = false;
+    let mut res: u64 = 0;
+    if op < OP_N_ADD {
+        nan_in = d.is_nan(d.unpack(x.*, f));
+        if (op >= OP_FMOD) and (op <= OP_QUANTIZE) and (op != OP_NEXTTOWARD) {
+            nan_in = nan_in or d.is_nan(d.unpack(y.*, f));
+        }
+    }
+    if op == OP_SQRT {
+        r.* = d.sqrt(x.*, f, &mut c);
+    } else if op == OP_CEIL {
+        r.* = round_integral(x.*, f, d.R_UP, false, &mut c);
+    } else if op == OP_FLOOR {
+        r.* = round_integral(x.*, f, d.R_DOWN, false, &mut c);
+    } else if op == OP_NEARBYINT {
+        r.* = round_integral(x.*, f, env.g_round, false, &mut c);
+    } else if op == OP_RINT {
+        r.* = round_integral(x.*, f, env.g_round, true, &mut c);
+    } else if op == OP_ROUND {
+        r.* = round_integral(x.*, f, d.R_AWAY, false, &mut c);
+    } else if op == OP_ROUNDEVEN {
+        r.* = round_integral(x.*, f, d.R_NEAREST, false, &mut c);
+    } else if op == OP_TRUNC {
+        r.* = round_integral(x.*, f, d.R_ZERO, false, &mut c);
+    } else if op == OP_FABS {
+        r.* = d.abs(x.*, f);
+    } else if (op == OP_NEXTUP) or (op == OP_NEXTDOWN) {
+        r.* = next(x.*, f, op == OP_NEXTUP, &mut c);
+    } else if op == OP_QUANTUM {
+        r.* = d.quantum(x.*, f, &mut c);
+    } else if op == OP_LOGB {
+        r.* = logb(x.*, f, &mut c);
+    } else if (op == OP_FMOD) or (op == OP_REMAINDER) {
+        r.* = d.rem(x.*, y.*, op == OP_REMAINDER, f, &mut c);
+    } else if op == OP_COPYSIGN {
+        r.* = d.abs(x.*, f);
+        if d.signbit(y.*, f) {
+            r.* = d.negate(r.*, f);
+        }
+    } else if (op == OP_NEXTAFTER) or (op == OP_NEXTTOWARD) {
+        let mut fy = f;
+        if op == OP_NEXTTOWARD {
+            fy = d.D128;
+        }
+        r.* = next_after(x.*, y.*, f, fy, &mut c);
+    } else if op == OP_FDIM {
+        let xd = d.unpack(x.*, f);
+        let yd = d.unpack(y.*, f);
+        if d.is_nan(xd) or d.is_nan(yd) {
+            r.* = d.nan2(xd, yd, f, &mut c);
+        } else if d.cmp(x.*, y.*, false, f, &mut c) == 1 {
+            r.* = d.add(x.*, y.*, true, f, &mut c);
+        } else {
+            r.* = d.zero(false, @min(xd.q, yd.q), f);
+        }
+    } else if (op >= OP_FMAX) and (op <= OP_FMINIMUM_MAG_NUM) {
+        // fmax fmin fmaximum fminimum fmaximum_mag fminimum_mag
+        // fmaximum_num fminimum_num fmaximum_mag_num fminimum_mag_num
+        let k = op - OP_FMAX;
+        let big = (k % 2) == 0;
+        let mag = (k == 4) or (k == 5) or (k == 8) or (k == 9);
+        let num = (k <= 1) or (k >= 6);
+        r.* = extreme(x.*, y.*, f, big, mag, num, k <= 1, &mut c);
+    } else if op == OP_QUANTIZE {
+        r.* = d.quantize(x.*, y.*, f, &mut c);
+    } else if op == OP_FMA {
+        nan_in = nan_in or d.is_nan(d.unpack(y.*, f)) or d.is_nan(d.unpack(z.*, f));
+        r.* = d.fma(x.*, y.*, z.*, f, &mut c);
+    } else if (op >= OP_LDEXP) and (op <= OP_SCALBLN) {
+        r.* = scaleb(x.*, f, n, &mut c);
+    } else if (op == OP_ILOGB) or (op == OP_LLOGB) {
+        res = ilogb(x.*, f, @bit_cast(u64, n), &mut c);
+    } else if (op >= OP_LRINT) and (op <= OP_LLROUND) {
+        let mut mode = env.g_round;
+        if (op == OP_LROUND) or (op == OP_LLROUND) {
+            mode = d.R_AWAY;
+        }
+        res = to_long(x.*, f, mode, @bit_cast(u64, n), (op == OP_LRINT) or (op == OP_LLRINT), &mut c);
+    } else if op == OP_LLQUANTEXP {
+        res = @bit_cast(u64, d.quantexp(x.*, f, @bit_cast(i64, @as(u64, 0x8000_0000_0000_0000)), &mut c));
+    } else if op == OP_FREXP {
+        let xd = d.unpack(x.*, f);
+        r.* = d.repack(xd, f);
+        if d.is_nan(xd) {
+            r.* = d.quiet(xd, f, &mut c);
+        } else if (xd.cls == d.K_FIN) and not d.is_zero(xd) {
+            let e = xd.q + d.digits2(xd.c);
+            r.* = d.pack(xd.neg, xd.c, xd.q - e, f);
+            res = @bit_cast(u64, @as(i64, e));
+        }
+    } else if op == OP_MODF {
+        modf(x.*, f, r, @ptr_from_int(*mut ld.W, @int_from_ptr(y)), &mut c);  // (modf's second result)
+    } else if op == OP_SAMEQUANTUM {
+        if d.samequantum(x.*, y.*, f) {
+            res = 1;
+        }
+    } else if (op >= OP_FROMFP) and (op <= OP_UFROMFPX) {
+        let un = @bit_cast(u64, n);
+        r.* = from_fp(x.*, f, un >> 32, un & 0xFFFF_FFFF, (op == OP_FROMFP) or
+                      (op == OP_FROMFPX), op >= OP_FROMFPX, &mut c);
+    } else if op == OP_CANONICALIZE {
+        let xd = d.unpack(x.*, f);
+        if d.is_nan(xd) {
+            r.* = d.quiet(xd, f, &mut c);
+        } else {
+            r.* = d.repack(xd, f);
+        }
+    } else if (op == OP_TOTALORDER) or (op == OP_TOTALORDERMAG) {
+        let mut a = x.*;
+        let mut b = y.*;
+        if op == OP_TOTALORDERMAG {
+            a = d.abs(a, f);
+            b = d.abs(b, f);
+        }
+        if total_order(a, b, f) {
+            res = 1;
+        }
+    } else if op == OP_GETPAYLOAD {
+        r.* = payload(x.*, f);
+    } else if (op == OP_SETPAYLOAD) or (op == OP_SETPAYLOADSIG) {
+        res = set_payload(r, x.*, f, op == OP_SETPAYLOADSIG);
+    } else if op == OP_ENCODEDEC {
+        r.* = d.to_dpd(x.*, f);
+    } else if op == OP_DECODEDEC {
+        r.* = d.from_dpd(x.*, f);
+    } else if (op == OP_ENCODEBIN) or (op == OP_DECODEBIN) {
+        r.* = x.*;  // (the encoding is BID already)
+    } else if op >= OP_N_ADD {
+        // the narrowing operations: operands of format f, rounded to format n
+        let to = @truncate(u32, @bit_cast(u64, n));
+        let k = op - OP_N_ADD;
+        nan_in = d.is_nan(d.unpack(x.*, f));
+        if k <= 4 {
+            nan_in = nan_in or d.is_nan(d.unpack(y.*, f));
+        }
+        if k == 0 {
+            r.* = d.addf(x.*, y.*, false, f, to, &mut c);
+        } else if k == 1 {
+            r.* = d.addf(x.*, y.*, true, f, to, &mut c);
+        } else if k == 2 {
+            r.* = d.mulf(x.*, y.*, f, to, &mut c);
+        } else if k == 3 {
+            r.* = d.divf(x.*, y.*, f, to, &mut c);
+        } else if k == 4 {
+            nan_in = nan_in or d.is_nan(d.unpack(z.*, f));
+            r.* = d.fmaf(x.*, y.*, z.*, f, to, &mut c);
+        } else {
+            r.* = d.sqrtf(x.*, f, to, &mut c);
+        }
+        r.* = r_of(r.*, to);
+        report(c.flags, nan_in);
+        return 0;
+    }
+    r.* = r_of(r.*, f);
+    report(c.flags, nan_in);
+    return res;
+}
+
+// logb (7.12.6.17): the exponent of x's leading digit (q + digits - 1), as
+// a value of x's type (exponent 0); -inf with "divide-by-zero" for 0.
+fn logb(w: ld.W, f: u32, c: *mut d.Ctx) ld.W {
+    let x = d.unpack(w, f);
+    if d.is_nan(x) {
+        return d.quiet(x, f, c);
+    }
+    if x.cls == d.K_INF {
+        return d.inf(false, f);
+    }
+    if d.is_zero(x) {
+        c.flags = c.flags | d.F_DIVBYZERO;
+        return d.inf(true, f);
+    }
+    return d.from_i64(@as(i64, (x.q + d.digits2(x.c)) - 1), f, c);
+}
+
+// ilogb, llogb: as logb, an integer of `bits` bits; 0 gives its minimum (FP_ILOGB0),
+// an infinity and a NaN its maximum (FP_ILOGBNAN), with "invalid".
+fn ilogb(w: ld.W, f: u32, bits: u64, c: *mut d.Ctx) u64 {
+    let x = d.unpack(w, f);
+    let mut mx: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+    if bits < 64 {
+        mx = (@as(u64, 1) << @truncate(u32, bits - 1)) - 1;
+    }
+    if x.cls != d.K_FIN {
+        c.flags = c.flags | d.F_INVALID;
+        return mx;
+    }
+    if d.is_zero(x) {
+        c.flags = c.flags | d.F_INVALID;
+        return 0 -% (mx + 1);
+    }
+    return @bit_cast(u64, @as(i64, (x.q + d.digits2(x.c)) - 1));
+}
+
+// scalbn and its kin: x * 10^n, the quantum exponent q + n (rounded when
+// that is out of range).
+fn scaleb(w: ld.W, f: u32, n0: i64, c: *mut d.Ctx) ld.W {
+    let x = d.unpack(w, f);
+    if d.is_nan(x) {
+        return d.quiet(x, f, c);
+    }
+    if x.cls == d.K_INF {
+        return d.repack(x, f);
+    }
+    let n = @int_cast(i32, @max(-100000, @min(100000, n0)));
+    let mut ba: [24]u32 = undefined;
+    let mut a = d.nat(ba[..]);
+    d.nat_set_u2(&mut a, x.c);
+    return d.finish(x.neg, &mut a, x.q + n, false, x.q + n, f, c);
+}
+
+// modf (7.12.6.18): x's integral part (truncated, exponent max(q, 0)) into
+// ip, the fraction (x - ip, exponent min(q, 0), the sign of x) into r.
+fn modf(w: ld.W, f: u32, r: *mut ld.W, ip: *mut ld.W, c: *mut d.Ctx) void {
+    let x = d.unpack(w, f);
+    if d.is_nan(x) {
+        r.* = d.quiet(x, f, c);
+        ip.* = r.*;
+        return;
+    }
+    if x.cls == d.K_INF {
+        ip.* = d.repack(x, f);
+        r.* = d.zero(x.neg, 0, f);
+        return;
+    }
+    let mut cc = d.ctx(d.R_ZERO);
+    ip.* = r_of(round_integral(w, f, d.R_ZERO, false, &mut cc), f);
+    if x.q >= 0 {
+        r.* = d.zero(x.neg, 0, f);
+        return;
+    }
+    // the fraction: the low -q digits
+    let mut ba: [24]u32 = undefined;
+    let mut a = d.nat(ba[..]);
+    d.nat_set_u2(&mut a, x.c);
+    let mut bh: [24]u32 = undefined;
+    let mut h = d.nat(bh[..]);
+    d.nat_copy(&mut h, &a);
+    _ = d.shr10(&mut h, -x.q);
+    d.shl10(&mut h, -x.q);
+    d.nat_sub(&mut a, &a, &h);
+    r.* = d.pack(x.neg, d.nat_u2(&a), x.q, f);
+}
+
+// nextafter, nexttoward (7.12.11.3, 7.12.11.4): the next value of x's
+// format from x toward y (of format fy); y when they are equal (in x's
+// format); "overflow" for an infinite result of a finite x, "underflow"
+// for a subnormal or zero one (and "inexact").
+fn next_after(xw: ld.W, yw: ld.W, f: u32, fy: u32, c: *mut d.Ctx) ld.W {
+    let x = d.unpack(xw, f);
+    let y = d.unpack(yw, fy);
+    if d.is_nan(x) or d.is_nan(y) {
+        if d.is_nan(x) {
+            if y.cls == d.K_SNAN {
+                c.flags = c.flags | d.F_INVALID;
+            }
+            return d.quiet(x, f, c);
+        }
+        return d.quiet(y, f, c);
+    }
+    let xw128 = d.convert(xw, f, d.D128, c);
+    let yw128 = d.convert(yw, fy, d.D128, c);
+    let o = d.cmp(xw128, yw128, false, d.D128, c);
+    if o == 0 {
+        return d.convert(yw, fy, f, c);
+    }
+    let r = next(xw, f, o < 0, c);
+    let rd = d.unpack(r, f);
+    if (rd.cls == d.K_INF) and (x.cls != d.K_INF) {
+        c.flags = c.flags | (d.F_OVERFLOW | d.F_INEXACT);
+    } else if (d.classify(r, f, 0) == 3) or d.is_zero(rd) {
+        c.flags = c.flags | (d.F_UNDERFLOW | d.F_INEXACT);
+    }
+    return r;
+}
+
+/// nanN (7.12.11.2): the quiet NaN of format f whose payload is the
+/// decimal digits of tag (below 10^(p - 1); others: 0).
+export fn __axc_dnan(f64_: u64, r: *mut ld.W, tag: *u8) u64 {
+    let f = @truncate(u32, f64_);
+    let mut n: usize = 0;
+    while (n < 200) and (@ptr_add(tag, n).* != 0) {
+        n += 1;
+    }
+    let s = @slice_from_ptr(tag, n);
+    let mut v = d.u2(0, 0);
+    let mut ok = n > 0;
+    for ch in s {
+        if (ch < 48) or (ch > 57) or (d.digits2(v) > 36) {
+            ok = false;
+            break;
+        }
+        v = d.mulsm2(v, 10, @as(u64, ch - 48));
+    }
+    if not ok or not d.lt2(v, d.p10u2(d.prec(f) - 1)) {
+        v = d.u2(0, 0);
+    }
+    r.* = r_of(d.nan(false, false, v, f), f);
+    return 0;
+}

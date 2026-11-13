@@ -6,7 +6,7 @@ value, directly, through function pointers and as variadic arguments (read
 with va_arg, va_copy and a va_list passed on), with the callers in one
 translation unit and the callees in another:
 
-    gen_c_abi.py SEED COUNT DIR [--prefix=NAME] [--no-align] [--ld] [--atomic] [--int128] [--bitint] [--host]
+    gen_c_abi.py SEED COUNT DIR [--prefix=NAME] [--no-align] [--ld] [--atomic] [--int128] [--bitint] [--dec] [--host]
 
 writes DIR/NAME.h (the types and the functions that fill and check them),
 DIR/NAME_callee.c (the functions called) and DIR/NAME.c (main, the calls).
@@ -26,12 +26,15 @@ output, and the other two files go in DIR/abi/. The suite's tests are
     gen_c_abi.py 102 8 cmd/axiom/internal/tests/c/run --host
     gen_c_abi.py 103 8 cmd/axiom/internal/tests/c/run --host --no-align
     gen_c_abi.py 104 8 cmd/axiom/internal/tests/c/run --host --int128 --bitint
+    gen_c_abi.py 105 8 cmd/axiom/internal/tests/c/run --host --dec
 
 With --atomic they also have _Atomic members (scalars, and records set
 and read whole). With --int128 they have __int128 and unsigned __int128
 members and arguments (a GNU dialect: gnu11 or later), with --bitint
 _BitInt(N) ones for N of 65 to 256 (C23; --bitint=128: to 128), whose
-values use all their bits. With --ld the shapes also have long double and long double _Complex members
+values use all their bits. With --dec they have _Decimal32, _Decimal64 and
+_Decimal128 members and arguments (C23), homogeneous aggregates of them too.
+With --ld the shapes also have long double and long double _Complex members
 and arguments (C99; <complex.h>), with values that double cannot hold.
 
 The shapes stay within what the C standard defines and every target
@@ -78,7 +81,13 @@ BITINTS = {
     'b192': ('_BitInt(192)', 'w', 192, True),
     'ub256': ('unsigned _BitInt(256)', 'w', 256, False),
 }
-ALL = {**SCALARS, **LONG_DOUBLES, **INT128S, **BITINTS}
+# with --dec, the decimal floating types (C23)
+DECIMALS = {
+    'd32': ('_Decimal32', 'f', 32, True),
+    'd64': ('_Decimal64', 'f', 64, True),
+    'd128': ('_Decimal128', 'f', 128, True),
+}
+ALL = {**SCALARS, **LONG_DOUBLES, **INT128S, **BITINTS, **DECIMALS}
 # the promoted type of a variadic argument
 PROMOTE = {'c': 'i', 'uc': 'i', 's': 'i', 'us': 'i', 'b': 'i', 'f': 'd'}
 
@@ -123,12 +132,12 @@ class Record:
 
 
 class Gen:
-    def __init__(self, seed, align, ld=False, atomic=False, int128=False, bitint=False):
+    def __init__(self, seed, align, ld=False, atomic=False, int128=False, bitint=False, dec=False):
         self.r = random.Random(seed)
         self.align = align
         self.atomic = atomic
         self.kinds = list(SCALARS) + (list(LONG_DOUBLES) if ld else []) + (list(INT128S) if int128 else []) + \
-            (list(BITINTS) if bitint else [])
+            (list(BITINTS) if bitint else []) + (list(DECIMALS) * 2 if dec else [])
         self.records = []
 
     def scalar(self):
@@ -183,7 +192,8 @@ class Gen:
     def homogeneous(self):
         # members of one floating type (AArch64's homogeneous aggregates,
         # x86-64's SSE eightbytes), as scalars, arrays and nested records
-        k = self.r.choice(['f', 'd'] + (['ld'] if 'ld' in self.kinds else []))
+        k = self.r.choice(['f', 'd'] + (['ld'] if 'ld' in self.kinds else []) +
+                          (list(DECIMALS) if 'd32' in self.kinds else []))
         rec = Record('', False)
         total = self.r.randint(1, 5)
         j = 0
@@ -383,7 +393,7 @@ def main():
         for k in [k for k in BITINTS if BITINTS[k][2] > 128]:
             del BITINTS[k]
     bitint = '--bitint' in opts or '--bitint=128' in opts
-    g = Gen(seed, '--no-align' not in opts, ld, '--atomic' in opts, '--int128' in opts, bitint)
+    g = Gen(seed, '--no-align' not in opts, ld, '--atomic' in opts, '--int128' in opts, bitint, '--dec' in opts)
     host = '--host' in opts
     tests = []
     for k in range(count):
@@ -506,6 +516,8 @@ def main():
     if host:
         if '--int128' in opts or bitint:
             ma.append('/* flags: --c-std=gnu23 */')
+        elif '--dec' in opts:
+            ma.append('/* flags: --c-std=c23 */')
         ma.append(f'/* units: abi/{prefix}_callee.c */')
         ma.append('#include "host.h"')
         ma.append(f'#include "abi/{prefix}.h"')

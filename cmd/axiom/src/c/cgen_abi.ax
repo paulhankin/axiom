@@ -58,6 +58,20 @@
 // homogeneous aggregates too), and on WebAssembly as two i64s, its result
 // through the pointer, as that platform's C convention has it.
 //
+// The decimal floating types (C23; BID) travel as the binary floating
+// types of their sizes do, but as types of their own: x86-64 System V
+// classes _Decimal32 and _Decimal64 SSE (an xmm register) and _Decimal128
+// SSE and SSEUP (one xmm register), as the psABI says (3.2.3); AAPCS64
+// passes them in v registers, and makes homogeneous aggregates of them
+// (of one decimal type: a _Decimal32 and a float are not homogeneous); the
+// WebAssembly C ABI, which names none, as f32, f64 and binary128's two
+// i64s; Windows x64, whose documentation names none, as the integers (or
+// structures) of their sizes: _Decimal32 and _Decimal64 in integer
+// registers, _Decimal128 by reference and its result through the hidden
+// pointer (the other compiler of that platform that has decimal types
+// does so). In the IR a narrow decimal value is an integer (cgen_dec.ax):
+// cgen_va.ax bit-casts it to and from the floating-point piece.
+//
 // The backends pass scalar IR parameters as the C ABIs do (rdi, rsi, ...; in
 // order of each register class, then the stack), so a structure here is
 // split into scalar pieces loaded from its memory, and its place is chosen
@@ -196,6 +210,12 @@ fn scalar_ty(t0: *cty.CType) *mut ir.Ty {
     if (t.kind == cty.TK_DOUBLE) or (t.kind == cty.TK_LDOUBLE) {
         return ir.t_float(64);
     }
+    if (t.kind == cty.TK_DEC32) or (t.kind == cty.TK_DEC64) {
+        if abi() == ABI_WIN {
+            return ir.t_int(t.bits);
+        }
+        return ir.t_float(t.bits);
+    }
     return ir.t_ptr();
 }
 
@@ -230,7 +250,7 @@ fn int_piece(n: u64) *mut ir.Ty {
 /// Does a value of type t travel as an aggregate (its memory: a structure,
 /// a union, a complex type, or a wide long double)?
 pub fn aggregate(t: *cty.CType) bool {
-    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t) or cty.is_wint(t);
+    return cty.is_record(t) or cty.is_complex(t) or cty.is_wide(t) or cty.is_wint(t) or cty.is_dec128(t);
 }
 
 // -----------------------------------------------------------------------------
@@ -244,6 +264,7 @@ struct Leaf {
     size: u64,
     fp: bool,
     x87: bool,  // the x87's long double (its 16 bytes)
+    dec: bool,  // a decimal floating type (fp too: AAPCS64 does not mix it with the binary ones)
 }
 
 const MAX_LEAVES: usize = 64;
@@ -285,8 +306,9 @@ fn add_leaves(t0: *cty.CType, off: u64, l: *mut Leaves) void {
         l.ok = false;
         return;
     }
-    l.xs[l.n] = Leaf.{ off: off, size: cty.size_of(t), fp: cty.is_floating(t), x87: cty.is_wide(t) and
-                       (cty.ld_bits() == 80) };
+    let dec = cty.is_decimal(t) and (abi() != ABI_WIN);
+    l.xs[l.n] = Leaf.{ off: off, size: cty.size_of(t), fp: cty.is_floating(t) or dec, x87: cty.is_wide(t) and
+                       (cty.ld_bits() == 80), dec: dec };
     l.n += 1;
 }
 
@@ -327,7 +349,7 @@ fn hfa_of(t: *cty.CType) Hfa {
     let es = l.xs[0].size;
     for i in 0..l.n {
         let x = l.xs[i];
-        if not x.fp or (x.size != es) or ((x.off % es) != 0) {
+        if not x.fp or (x.size != es) or ((x.off % es) != 0) or (x.dec != l.xs[0].dec) {
             return none;
         }
     }
@@ -1268,11 +1290,11 @@ pub fn plan(ret: *mut cty.CType, ps: []mut *mut cty.CType, nnamed: usize, variad
 fn pads(b: *mut Builder, fp: bool, n: u64) void {
     for k in 0..n {
         _ = k;
-        if fp and (cty.ld_bits() == 128) {
-            // (a binary128 variadic argument fills the whole register)
+        if fp {
+            // (the whole register: a variadic argument may be 16 bytes of
+            // one, a binary128 long double or a _Decimal128, which a
+            // function of any unit may read: printf's %DDf)
             b.regs.push(item(quad_ty(), 0, SL_PAD_FP, -1, 0));
-        } else if fp {
-            b.regs.push(item(ir.t_float(64), 0, SL_PAD_FP, -1, 0));
         } else {
             b.regs.push(item(ir.t_int(64), 0, SL_PAD_GP, -1, 0));
         }

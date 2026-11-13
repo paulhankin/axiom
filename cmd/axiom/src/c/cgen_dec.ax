@@ -1,0 +1,341 @@
+// =============================================================================
+// cgen_dec.ax - IR generation for the decimal floating types (C23
+// _Decimal32, _Decimal64, _Decimal128: cty.is_decimal): their arithmetic,
+// comparisons and conversions as calls of std/c/rt/decimal.ax's `dec_`
+// functions, which codegen.ax generates into the module (cg.ld_fn), so that
+// only those a program uses are in it. Each rounds in the thread's decimal
+// rounding direction (fe_dec_setround) and raises its exceptions.
+//
+// A _Decimal32 or _Decimal64 value is an integer of 32 or 64 bits (its BID
+// encoding), kept in integer registers; the functions take and return the
+// narrow formats' bits in 64. A _Decimal128 value is 16 bytes of memory, as
+// a wide long double's is (cgen_ld.ax: rv gives its address, never written
+// through; each operation writes its result into a new temporary).
+// Negation is exact and changes the sign bit only (IEEE 754-2019 5.5.1).
+// =============================================================================
+import "../ir.ax" as ir;
+import "cconst.ax" as cc;
+import "cdec.ax" as cdec;
+import "cgen.ax" as cg;
+import "cgen_ld.ax" as gld;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+import "std/c/rt/decimal" as d;
+import "std/c/rt/ldouble" as ld;
+
+fn i32t() *mut ir.Ty {
+    return ir.t_int(32);
+}
+
+fn i64t() *mut ir.Ty {
+    return ir.t_int(64);
+}
+
+fn cu32(x: u32) *mut ir.Value {
+    return ir.cint(i32t(), @as(u64, x));
+}
+
+fn fmt_of(t: *cty.CType) u32 {
+    return cdec.fmt(t);
+}
+
+fn wide(t: *cty.CType) bool {
+    return cty.is_dec128(t);
+}
+
+// A null pointer, for the pointer parameters a narrow format does not use.
+fn noptr() *mut ir.Value {
+    return ir.czero(cg.T_ptr);
+}
+
+/// A new temporary for a _Decimal128 value.
+pub fn temp() *mut ir.Value {
+    return cg.alloca(cty.t_dec128, "dec");
+}
+
+// A call of decimal.ax's function `name` with arguments xs.
+fn call(name: []u8, xs: []mut *mut ir.Value) *mut ir.Value {
+    let f = cg.ld_fn(name);
+    let fty = ir.fnp_of(f).ty;
+    return ir.call(cg.B, fty, f, xs);
+}
+
+// A narrow value v (i32 or i64) as the i64 the functions take.
+fn to64(v: *mut ir.Value) *mut ir.Value {
+    if v.ty.bits < 64 {
+        return ir.zext(cg.B, v, i64t());
+    }
+    return v;
+}
+
+// A function's i64 result as a value of narrow type t.
+fn from64(r: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    if t.unq.kind == cty.TK_DEC32 {
+        return ir.trunc(cg.B, r, i32t());
+    }
+    return r;
+}
+
+/// The constant value w of decimal type t: its bits, or (_Decimal128) the
+/// address of the constant.
+pub fn constant_of(t: *cty.CType, w: ld.W) *mut ir.Value {
+    if wide(t) {
+        return gld.constant(w);
+    }
+    if t.unq.kind == cty.TK_DEC32 {
+        return ir.cint(i32t(), w.lo & 0xFFFF_FFFF);
+    }
+    return ir.cint(i64t(), w.lo);
+}
+
+/// The constant 1 of decimal type t (exponent 0), for ++ and --.
+pub fn one(t: *cty.CType) *mut ir.Value {
+    return constant_of(t, d.pack(false, d.u2(0, 1), 0, fmt_of(t)));
+}
+
+/// x op y (+ - * /) in decimal type t.
+pub fn arith(op: i32, t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    let mut k: u32 = 0;
+    if op == ct.P_MINUS {
+        k = 1;
+    } else if op == ct.P_STAR {
+        k = 2;
+    } else if op == ct.P_SLASH {
+        k = 3;
+    }
+    if wide(t) {
+        let r = temp();
+        let mut xs: [4]*mut ir.Value = [cu32(k), r, x, y];
+        _ = call("dec_arith_w", xs[..]);
+        return r;
+    }
+    let mut xs: [4]*mut ir.Value = [cu32(k), to64(x), to64(y), cu32(fmt_of(t))];
+    return from64(call("dec_arith_n", xs[..]), t);
+}
+
+/// -x: its sign bit changed.
+pub fn negate(t: *cty.CType, x: *mut ir.Value) *mut ir.Value {
+    if wide(t) {
+        let r = temp();
+        let lo = ir.load(cg.B, i64t(), x);
+        lo.align = 8;
+        let hi = ir.load(cg.B, i64t(), ir.ptradd(cg.B, x, cg.usz(8)));
+        hi.align = 8;
+        let s0 = ir.store(cg.B, lo, r);
+        s0.align = 8;
+        let s1 = ir.store(
+            cg.B, ir.xor(cg.B, hi, ir.cint(i64t(), 0x8000_0000_0000_0000)), ir.ptradd(cg.B, r, cg.usz(8)));
+        s1.align = 8;
+        return r;
+    }
+    if t.unq.kind == cty.TK_DEC32 {
+        return ir.xor(cg.B, x, ir.cint(i32t(), 0x8000_0000));
+    }
+    return ir.xor(cg.B, x, ir.cint(i64t(), 0x8000_0000_0000_0000));
+}
+
+/// x != 0, as an i1 (a NaN is not zero; nor is any value of a cohort of
+/// zero: every exponent's).
+pub fn truth(x: *mut ir.Value, t: *cty.CType) *mut ir.Value {
+    let mut r = ir.vnil();
+    if wide(t) {
+        let mut xs: [1]*mut ir.Value = [x];
+        r = call("dec_truth_w", xs[..]);
+    } else {
+        let mut xs: [2]*mut ir.Value = [to64(x), cu32(fmt_of(t))];
+        r = call("dec_truth_n", xs[..]);
+    }
+    return ir.icmp(cg.B, ir.IntNE, r, cu32(0));
+}
+
+/// x op y (< > <= >= == !=), as an i1: false when unordered, but for !=;
+/// the relational operators are signaling (an "invalid" exception for any
+/// NaN), == and != quiet (IEEE 754-2019 5.11, C23 F.9.3 for the decimal
+/// types too).
+pub fn compare(op: i32, t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    return compare_q(op, t, x, y, (op != ct.P_EQ) and (op != ct.P_NE));
+}
+
+// The order of x and y: -1, 0, 1, or 2 when unordered (signaling: "invalid"
+// for a quiet NaN too).
+fn order(t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value, signaling: bool) *mut ir.Value {
+    let sig = cu32(@as(u32, signaling));
+    if wide(t) {
+        let mut xs: [3]*mut ir.Value = [x, y, sig];
+        return call("dec_cmp_w", xs[..]);
+    }
+    let mut xs: [4]*mut ir.Value = [to64(x), to64(y), cu32(fmt_of(t)), sig];
+    return call("dec_cmp_n", xs[..]);
+}
+
+/// Is x or y a NaN (a quiet comparison: <math.h>'s isunordered)?
+pub fn unordered(t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value) *mut ir.Value {
+    return ir.icmp(cg.B, ir.IntEQ, order(t, x, y, false), cu32(2));
+}
+
+/// The class of x (classification builtin k, decimal.ax's classify), an i32.
+pub fn classify(k: i32, t: *cty.CType, x: *mut ir.Value) *mut ir.Value {
+    let mut p = noptr();
+    let mut v = ir.cint(i64t(), 0);
+    if wide(t) {
+        p = x;
+    } else {
+        v = to64(x);
+    }
+    let mut xs: [4]*mut ir.Value = [p, v, cu32(fmt_of(t)), cu32(@bit_cast(u32, k))];
+    return call("dec_classify", xs[..]);
+}
+
+/// x op y as compare does, quiet (signaling false) or signaling.
+pub fn compare_q(op: i32, t: *cty.CType, x: *mut ir.Value, y: *mut ir.Value, signaling: bool) *mut ir.Value {
+    let c = order(t, x, y, signaling);  // -1, 0, 1, or 2 (unordered)
+    let m1 = ir.cint(i32t(), 0xFFFF_FFFF);
+    let z = ir.cint(i32t(), 0);
+    let o = ir.cint(i32t(), 1);
+    if op == ct.P_LT {
+        return ir.icmp(cg.B, ir.IntEQ, c, m1);
+    }
+    if op == ct.P_GT {
+        return ir.icmp(cg.B, ir.IntEQ, c, o);
+    }
+    if op == ct.P_LE {
+        return ir.icmp(cg.B, ir.IntULE, ir.add(cg.B, c, o), o);
+    }
+    if op == ct.P_GE {
+        return ir.icmp(cg.B, ir.IntULE, c, o);
+    }
+    if op == ct.P_EQ {
+        return ir.icmp(cg.B, ir.IntEQ, c, z);
+    }
+    return ir.icmp(cg.B, ir.IntNE, c, z);
+}
+
+// The binary format of a standard floating type (decimal.ax's B_): float,
+// double (and long double where it is double), or a wide long double's.
+fn bin_of(t: *cty.CType) u32 {
+    if t.unq.kind == cty.TK_FLOAT {
+        return d.B_F32;
+    }
+    if cty.is_wide(t) {
+        return cc.ld_fmt();  // (ldouble.ax's FMT_Q and FMT_X are B_Q and B_X)
+    }
+    return d.B_F64;
+}
+
+/// Scalar value v of real type `from` converted to real type `to`, one of
+/// them decimal (C23 6.3.1.4, 6.3.1.5): rounded in the decimal rounding
+/// direction to a decimal type, to nearest to a binary one; to an integer
+/// truncated, saturated (undefined when the value does not fit).
+pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut ir.Value {
+    let f = from.unq;
+    let t = to.unq;
+    if cty.is_decimal(f) and cty.is_decimal(t) {
+        if f.kind == t.kind {
+            return v;
+        }
+        let mut r = noptr();
+        if wide(t) {
+            r = temp();
+        }
+        let mut p = noptr();
+        let mut x = ir.cint(i64t(), 0);
+        if wide(f) {
+            p = v;
+        } else {
+            x = to64(v);
+        }
+        let mut xs: [5]*mut ir.Value = [r, p, x, cu32(fmt_of(f)), cu32(fmt_of(t))];
+        let res = call("dec_cvt", xs[..]);
+        if wide(t) {
+            return r;
+        }
+        return from64(res, t);
+    }
+    if cty.is_decimal(t) {
+        let df = fmt_of(t);
+        let mut r = noptr();
+        if wide(t) {
+            r = temp();
+        }
+        let mut res = ir.vnil();
+        if cty.is_wint(f) {
+            let sg = f.is_signed;
+            let mut xs: [5]*mut ir.Value = [r, v, cg.usz(@as(u64, cty.limbs(f))), cu32(@as(u32, sg)), cu32(df)];
+            res = call("dec_from_wint", xs[..]);
+        } else if cty.is_integer(f) {
+            let sg = f.is_signed and (f.kind != cty.TK_BOOL);
+            let mut x = v;
+            if x.ty.bits < 64 {
+                if sg {
+                    x = ir.sext(cg.B, x, i64t());
+                } else {
+                    x = ir.zext(cg.B, x, i64t());
+                }
+            }
+            let mut xs: [4]*mut ir.Value = [r, x, cu32(@as(u32, sg)), cu32(df)];
+            res = call("dec_from_int", xs[..]);
+        } else {
+            // a standard floating value: float's or double's bits, or a wide
+            // long double's address
+            let b = bin_of(f);
+            let mut bp = noptr();
+            let mut x = ir.cint(i64t(), 0);
+            if cty.is_wide(f) {
+                bp = v;
+            } else if b == d.B_F32 {
+                x = ir.zext(cg.B, ir.bitcast(cg.B, v, i32t()), i64t());
+            } else {
+                x = ir.bitcast(cg.B, v, i64t());
+            }
+            let mut xs: [5]*mut ir.Value = [r, bp, x, cu32(b), cu32(df)];
+            res = call("dec_from_bin", xs[..]);
+        }
+        if wide(t) {
+            return r;
+        }
+        return from64(res, t);
+    }
+    // from a decimal value
+    let sf = fmt_of(f);
+    let mut p = noptr();
+    let mut x = ir.cint(i64t(), 0);
+    if wide(f) {
+        p = v;
+    } else {
+        x = to64(v);
+    }
+    let tt = cg.lty(t);
+    if t.kind == cty.TK_BOOL {
+        return ir.zext(cg.B, truth(v, f), tt);
+    }
+    if cty.is_wint(t) {
+        let r = cg.alloca(t, "wint");
+        let mut xs: [7]*mut ir.Value = [r, cg.usz(@as(u64, cty.limbs(t))), cu32(@bit_cast(u32, t.bits)),
+                                        cu32(@as(u32, t.is_signed)), p, x, cu32(sf)];
+        _ = call("dec_to_wint", xs[..]);
+        return r;
+    }
+    if cty.is_integer(t) {
+        let mut xs: [5]*mut ir.Value = [p, x, cu32(sf), cu32(@bit_cast(u32, t.bits)), cu32(@as(u32, t.is_signed))];
+        let r = call("dec_to_int", xs[..]);
+        if tt.bits < 64 {
+            return ir.trunc(cg.B, r, tt);
+        }
+        return r;
+    }
+    // to a standard floating type
+    let b = bin_of(t);
+    let mut r = noptr();
+    if cty.is_wide(t) {
+        r = gld.temp();
+    }
+    let mut xs: [5]*mut ir.Value = [r, p, x, cu32(sf), cu32(b)];
+    let res = call("dec_to_bin", xs[..]);
+    if cty.is_wide(t) {
+        return r;
+    }
+    if b == d.B_F32 {
+        return ir.bitcast(cg.B, ir.trunc(cg.B, res, i32t()), tt);
+    }
+    return ir.bitcast(cg.B, res, tt);
+}

@@ -16,6 +16,11 @@
 
 #define KIND (__builtin_axiom_fenv_kind())
 
+/* the flags decimal floating operations raised (std/c/rt/dfp_env.ax: kept
+   by the software arithmetic, merged here with the hardware's) */
+unsigned __axiom_int64 __axc_dec_flags(void);
+void __axc_dec_flags_clear(unsigned __axiom_int64 mask);
+
 /* the library's flags (FE_INVALID ...) as FPSR's bits, and back */
 static unsigned long to_fpsr(unsigned long f)
 {
@@ -32,9 +37,9 @@ unsigned long __axc_fe_flags(void)
 {
     unsigned __axiom_int64 v = __builtin_axiom_fenv_get();
     if (KIND == 1)
-        return (unsigned long)(v & 0x3d);
+        return (unsigned long)(v & 0x3d) | (unsigned long)(__axc_dec_flags() & 0x3d);
     if (KIND == 2)
-        return from_fpsr((unsigned long)(v >> 32));
+        return from_fpsr((unsigned long)(v >> 32)) | (unsigned long)(__axc_dec_flags() & 0x3d);
     return 0;
 }
 
@@ -43,6 +48,8 @@ int __axc_fe_set_flags(unsigned long f, unsigned long mask)
 {
     unsigned __axiom_int64 v = __builtin_axiom_fenv_get();
     f &= mask & 0x3d;
+    if (KIND != 0)
+        __axc_dec_flags_clear(mask & 0x3d); /* (the hardware's flags hold them now) */
     if (KIND == 1) {
         v = (v & ~(unsigned __axiom_int64)(mask & 0x3d)) | f;
         __builtin_axiom_fenv_set(v);

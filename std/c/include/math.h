@@ -429,4 +429,376 @@ float fsqrtl(long double __x);
 double dsqrtl(long double __x);
 #endif
 
+#ifdef __STDC_IEC_60559_DFP__
+/* The decimal floating types (C23 7.12, its functions of the d32, d64 and d128 suffixes):
+   the library's functions in software (std/c/rt/dfp.ax, dfp_math.ax; the
+   C wrappers std/c/lib/math/dfp_*.c). Each rounds in the decimal rounding
+   direction (fe_dec_setround) and raises its exceptions; the exact ones
+   (the rounding functions, fmod, remainder, fma, sqrt, quantize, scalbn,
+   frexp, nextafter, ...) are correctly rounded, the elementary ones within
+   1 ulp (computed in arbitrary precision, then rounded once: almost always
+   correctly rounded). An exact result has the quantum exponent C23 prefers
+   for the function (the operands' for most, max(q, 0) for the rounding
+   functions, floor(q / 2) for sqrt, floor(q / 3) for cbrt, 0 for the
+   exponential and logarithmic ones); an inexact one has the format's
+   precision. */
+typedef _Decimal32 _Decimal32_t;
+typedef _Decimal64 _Decimal64_t;
+
+#define HUGE_VAL_D32 __builtin_axiom_dec(32, 0, 0x78000000)
+#define HUGE_VAL_D64 __builtin_axiom_dec(64, 0, 0x7800000000000000)
+#define HUGE_VAL_D128 __builtin_axiom_dec(128, 0x7800000000000000, 0)
+#define DEC_INFINITY HUGE_VAL_D32
+#define DEC_NAN __builtin_axiom_dec(32, 0, 0x7c000000)
+
+/* the rounding directions of fromfp and its kin (7.12.9.10) */
+#ifndef FP_INT_UPWARD
+#define FP_INT_UPWARD 0
+#define FP_INT_DOWNWARD 1
+#define FP_INT_TOWARDZERO 2
+#define FP_INT_TONEARESTFROMZERO 3
+#define FP_INT_TONEAREST 4
+#endif
+
+/* iseqsig's (the type-generic macro's) */
+int __axc_iseqsigd32(_Decimal32 __x, _Decimal32 __y);
+int __axc_iseqsigd64(_Decimal64 __x, _Decimal64 __y);
+int __axc_iseqsigd128(_Decimal128 __x, _Decimal128 __y);
+
+/* _Decimal32 */
+_Decimal32 cosd32(_Decimal32 __x);
+_Decimal32 sind32(_Decimal32 __x);
+_Decimal32 tand32(_Decimal32 __x);
+_Decimal32 cospid32(_Decimal32 __x);
+_Decimal32 sinpid32(_Decimal32 __x);
+_Decimal32 tanpid32(_Decimal32 __x);
+_Decimal32 acosd32(_Decimal32 __x);
+_Decimal32 asind32(_Decimal32 __x);
+_Decimal32 atand32(_Decimal32 __x);
+_Decimal32 acospid32(_Decimal32 __x);
+_Decimal32 asinpid32(_Decimal32 __x);
+_Decimal32 atanpid32(_Decimal32 __x);
+_Decimal32 atan2d32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 atan2pid32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 coshd32(_Decimal32 __x);
+_Decimal32 sinhd32(_Decimal32 __x);
+_Decimal32 tanhd32(_Decimal32 __x);
+_Decimal32 acoshd32(_Decimal32 __x);
+_Decimal32 asinhd32(_Decimal32 __x);
+_Decimal32 atanhd32(_Decimal32 __x);
+_Decimal32 expd32(_Decimal32 __x);
+_Decimal32 exp10d32(_Decimal32 __x);
+_Decimal32 exp10m1d32(_Decimal32 __x);
+_Decimal32 exp2d32(_Decimal32 __x);
+_Decimal32 exp2m1d32(_Decimal32 __x);
+_Decimal32 expm1d32(_Decimal32 __x);
+_Decimal32 logd32(_Decimal32 __x);
+_Decimal32 log10d32(_Decimal32 __x);
+_Decimal32 log10p1d32(_Decimal32 __x);
+_Decimal32 log1pd32(_Decimal32 __x);
+_Decimal32 logp1d32(_Decimal32 __x);
+_Decimal32 log2d32(_Decimal32 __x);
+_Decimal32 log2p1d32(_Decimal32 __x);
+_Decimal32 cbrtd32(_Decimal32 __x);
+_Decimal32 rsqrtd32(_Decimal32 __x);
+_Decimal32 powd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 powrd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 hypotd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 pownd32(_Decimal32 __x, long long __n);
+_Decimal32 rootnd32(_Decimal32 __x, long long __n);
+_Decimal32 compoundnd32(_Decimal32 __x, long long __n);
+_Decimal32 erfd32(_Decimal32 __x);
+_Decimal32 erfcd32(_Decimal32 __x);
+_Decimal32 lgammad32(_Decimal32 __x);
+_Decimal32 tgammad32(_Decimal32 __x);
+_Decimal32 sqrtd32(_Decimal32 __x);
+_Decimal32 ceild32(_Decimal32 __x);
+_Decimal32 floord32(_Decimal32 __x);
+_Decimal32 nearbyintd32(_Decimal32 __x);
+_Decimal32 rintd32(_Decimal32 __x);
+_Decimal32 roundd32(_Decimal32 __x);
+_Decimal32 roundevend32(_Decimal32 __x);
+_Decimal32 truncd32(_Decimal32 __x);
+_Decimal32 fabsd32(_Decimal32 __x);
+_Decimal32 nextupd32(_Decimal32 __x);
+_Decimal32 nextdownd32(_Decimal32 __x);
+_Decimal32 quantumd32(_Decimal32 __x);
+_Decimal32 logbd32(_Decimal32 __x);
+_Decimal32 fmodd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 remainderd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 copysignd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 nextafterd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fdimd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fmaxd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fmind32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fmaximumd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fminimumd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fmaximum_magd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fminimum_magd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fmaximum_numd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fminimum_numd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fmaximum_mag_numd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fminimum_mag_numd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 quantized32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 fmad32(_Decimal32 __x, _Decimal32 __y, _Decimal32 __z);
+_Decimal32 ldexpd32(_Decimal32 __x, int __n);
+_Decimal32 scalbnd32(_Decimal32 __x, int __n);
+_Decimal32 scalblnd32(_Decimal32 __x, long __n);
+int ilogbd32(_Decimal32 __x);
+long llogbd32(_Decimal32 __x);
+long lrintd32(_Decimal32 __x);
+long lroundd32(_Decimal32 __x);
+long long llrintd32(_Decimal32 __x);
+long long llroundd32(_Decimal32 __x);
+long long llquantexpd32(_Decimal32 __x);
+_Decimal32 frexpd32(_Decimal32 __x, int *__e);
+_Decimal32 modfd32(_Decimal32 __x, _Decimal32 *__i);
+_Decimal32 nexttowardd32(_Decimal32 __x, _Decimal128 __y);
+bool samequantumd32(_Decimal32 __x, _Decimal32 __y);
+_Decimal32 nand32(const char *__tag);
+_Decimal32 fromfpd32(_Decimal32 __x, int __rnd, unsigned int __width);
+_Decimal32 ufromfpd32(_Decimal32 __x, int __rnd, unsigned int __width);
+_Decimal32 fromfpxd32(_Decimal32 __x, int __rnd, unsigned int __width);
+_Decimal32 ufromfpxd32(_Decimal32 __x, int __rnd, unsigned int __width);
+int canonicalized32(_Decimal32 *__cx, const _Decimal32 *__x);
+int totalorderd32(const _Decimal32 *__x, const _Decimal32 *__y);
+int totalordermagd32(const _Decimal32 *__x, const _Decimal32 *__y);
+_Decimal32 getpayloadd32(const _Decimal32 *__x);
+int setpayloadd32(_Decimal32 *__res, _Decimal32 __pl);
+int setpayloadsigd32(_Decimal32 *__res, _Decimal32 __pl);
+void encodedecd32(_Decimal32 *restrict __enc, const _Decimal32 *restrict __x);
+void decodedecd32(_Decimal32 *restrict __x, const _Decimal32 *restrict __enc);
+void encodebind32(_Decimal32 *restrict __enc, const _Decimal32 *restrict __x);
+void decodebind32(_Decimal32 *restrict __x, const _Decimal32 *restrict __enc);
+/* _Decimal64 */
+_Decimal64 cosd64(_Decimal64 __x);
+_Decimal64 sind64(_Decimal64 __x);
+_Decimal64 tand64(_Decimal64 __x);
+_Decimal64 cospid64(_Decimal64 __x);
+_Decimal64 sinpid64(_Decimal64 __x);
+_Decimal64 tanpid64(_Decimal64 __x);
+_Decimal64 acosd64(_Decimal64 __x);
+_Decimal64 asind64(_Decimal64 __x);
+_Decimal64 atand64(_Decimal64 __x);
+_Decimal64 acospid64(_Decimal64 __x);
+_Decimal64 asinpid64(_Decimal64 __x);
+_Decimal64 atanpid64(_Decimal64 __x);
+_Decimal64 atan2d64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 atan2pid64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 coshd64(_Decimal64 __x);
+_Decimal64 sinhd64(_Decimal64 __x);
+_Decimal64 tanhd64(_Decimal64 __x);
+_Decimal64 acoshd64(_Decimal64 __x);
+_Decimal64 asinhd64(_Decimal64 __x);
+_Decimal64 atanhd64(_Decimal64 __x);
+_Decimal64 expd64(_Decimal64 __x);
+_Decimal64 exp10d64(_Decimal64 __x);
+_Decimal64 exp10m1d64(_Decimal64 __x);
+_Decimal64 exp2d64(_Decimal64 __x);
+_Decimal64 exp2m1d64(_Decimal64 __x);
+_Decimal64 expm1d64(_Decimal64 __x);
+_Decimal64 logd64(_Decimal64 __x);
+_Decimal64 log10d64(_Decimal64 __x);
+_Decimal64 log10p1d64(_Decimal64 __x);
+_Decimal64 log1pd64(_Decimal64 __x);
+_Decimal64 logp1d64(_Decimal64 __x);
+_Decimal64 log2d64(_Decimal64 __x);
+_Decimal64 log2p1d64(_Decimal64 __x);
+_Decimal64 cbrtd64(_Decimal64 __x);
+_Decimal64 rsqrtd64(_Decimal64 __x);
+_Decimal64 powd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 powrd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 hypotd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 pownd64(_Decimal64 __x, long long __n);
+_Decimal64 rootnd64(_Decimal64 __x, long long __n);
+_Decimal64 compoundnd64(_Decimal64 __x, long long __n);
+_Decimal64 erfd64(_Decimal64 __x);
+_Decimal64 erfcd64(_Decimal64 __x);
+_Decimal64 lgammad64(_Decimal64 __x);
+_Decimal64 tgammad64(_Decimal64 __x);
+_Decimal64 sqrtd64(_Decimal64 __x);
+_Decimal64 ceild64(_Decimal64 __x);
+_Decimal64 floord64(_Decimal64 __x);
+_Decimal64 nearbyintd64(_Decimal64 __x);
+_Decimal64 rintd64(_Decimal64 __x);
+_Decimal64 roundd64(_Decimal64 __x);
+_Decimal64 roundevend64(_Decimal64 __x);
+_Decimal64 truncd64(_Decimal64 __x);
+_Decimal64 fabsd64(_Decimal64 __x);
+_Decimal64 nextupd64(_Decimal64 __x);
+_Decimal64 nextdownd64(_Decimal64 __x);
+_Decimal64 quantumd64(_Decimal64 __x);
+_Decimal64 logbd64(_Decimal64 __x);
+_Decimal64 fmodd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 remainderd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 copysignd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 nextafterd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fdimd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fmaxd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fmind64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fmaximumd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fminimumd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fmaximum_magd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fminimum_magd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fmaximum_numd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fminimum_numd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fmaximum_mag_numd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fminimum_mag_numd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 quantized64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 fmad64(_Decimal64 __x, _Decimal64 __y, _Decimal64 __z);
+_Decimal64 ldexpd64(_Decimal64 __x, int __n);
+_Decimal64 scalbnd64(_Decimal64 __x, int __n);
+_Decimal64 scalblnd64(_Decimal64 __x, long __n);
+int ilogbd64(_Decimal64 __x);
+long llogbd64(_Decimal64 __x);
+long lrintd64(_Decimal64 __x);
+long lroundd64(_Decimal64 __x);
+long long llrintd64(_Decimal64 __x);
+long long llroundd64(_Decimal64 __x);
+long long llquantexpd64(_Decimal64 __x);
+_Decimal64 frexpd64(_Decimal64 __x, int *__e);
+_Decimal64 modfd64(_Decimal64 __x, _Decimal64 *__i);
+_Decimal64 nexttowardd64(_Decimal64 __x, _Decimal128 __y);
+bool samequantumd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal64 nand64(const char *__tag);
+_Decimal64 fromfpd64(_Decimal64 __x, int __rnd, unsigned int __width);
+_Decimal64 ufromfpd64(_Decimal64 __x, int __rnd, unsigned int __width);
+_Decimal64 fromfpxd64(_Decimal64 __x, int __rnd, unsigned int __width);
+_Decimal64 ufromfpxd64(_Decimal64 __x, int __rnd, unsigned int __width);
+int canonicalized64(_Decimal64 *__cx, const _Decimal64 *__x);
+int totalorderd64(const _Decimal64 *__x, const _Decimal64 *__y);
+int totalordermagd64(const _Decimal64 *__x, const _Decimal64 *__y);
+_Decimal64 getpayloadd64(const _Decimal64 *__x);
+int setpayloadd64(_Decimal64 *__res, _Decimal64 __pl);
+int setpayloadsigd64(_Decimal64 *__res, _Decimal64 __pl);
+void encodedecd64(_Decimal64 *restrict __enc, const _Decimal64 *restrict __x);
+void decodedecd64(_Decimal64 *restrict __x, const _Decimal64 *restrict __enc);
+void encodebind64(_Decimal64 *restrict __enc, const _Decimal64 *restrict __x);
+void decodebind64(_Decimal64 *restrict __x, const _Decimal64 *restrict __enc);
+/* _Decimal128 */
+_Decimal128 cosd128(_Decimal128 __x);
+_Decimal128 sind128(_Decimal128 __x);
+_Decimal128 tand128(_Decimal128 __x);
+_Decimal128 cospid128(_Decimal128 __x);
+_Decimal128 sinpid128(_Decimal128 __x);
+_Decimal128 tanpid128(_Decimal128 __x);
+_Decimal128 acosd128(_Decimal128 __x);
+_Decimal128 asind128(_Decimal128 __x);
+_Decimal128 atand128(_Decimal128 __x);
+_Decimal128 acospid128(_Decimal128 __x);
+_Decimal128 asinpid128(_Decimal128 __x);
+_Decimal128 atanpid128(_Decimal128 __x);
+_Decimal128 atan2d128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 atan2pid128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 coshd128(_Decimal128 __x);
+_Decimal128 sinhd128(_Decimal128 __x);
+_Decimal128 tanhd128(_Decimal128 __x);
+_Decimal128 acoshd128(_Decimal128 __x);
+_Decimal128 asinhd128(_Decimal128 __x);
+_Decimal128 atanhd128(_Decimal128 __x);
+_Decimal128 expd128(_Decimal128 __x);
+_Decimal128 exp10d128(_Decimal128 __x);
+_Decimal128 exp10m1d128(_Decimal128 __x);
+_Decimal128 exp2d128(_Decimal128 __x);
+_Decimal128 exp2m1d128(_Decimal128 __x);
+_Decimal128 expm1d128(_Decimal128 __x);
+_Decimal128 logd128(_Decimal128 __x);
+_Decimal128 log10d128(_Decimal128 __x);
+_Decimal128 log10p1d128(_Decimal128 __x);
+_Decimal128 log1pd128(_Decimal128 __x);
+_Decimal128 logp1d128(_Decimal128 __x);
+_Decimal128 log2d128(_Decimal128 __x);
+_Decimal128 log2p1d128(_Decimal128 __x);
+_Decimal128 cbrtd128(_Decimal128 __x);
+_Decimal128 rsqrtd128(_Decimal128 __x);
+_Decimal128 powd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 powrd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 hypotd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 pownd128(_Decimal128 __x, long long __n);
+_Decimal128 rootnd128(_Decimal128 __x, long long __n);
+_Decimal128 compoundnd128(_Decimal128 __x, long long __n);
+_Decimal128 erfd128(_Decimal128 __x);
+_Decimal128 erfcd128(_Decimal128 __x);
+_Decimal128 lgammad128(_Decimal128 __x);
+_Decimal128 tgammad128(_Decimal128 __x);
+_Decimal128 sqrtd128(_Decimal128 __x);
+_Decimal128 ceild128(_Decimal128 __x);
+_Decimal128 floord128(_Decimal128 __x);
+_Decimal128 nearbyintd128(_Decimal128 __x);
+_Decimal128 rintd128(_Decimal128 __x);
+_Decimal128 roundd128(_Decimal128 __x);
+_Decimal128 roundevend128(_Decimal128 __x);
+_Decimal128 truncd128(_Decimal128 __x);
+_Decimal128 fabsd128(_Decimal128 __x);
+_Decimal128 nextupd128(_Decimal128 __x);
+_Decimal128 nextdownd128(_Decimal128 __x);
+_Decimal128 quantumd128(_Decimal128 __x);
+_Decimal128 logbd128(_Decimal128 __x);
+_Decimal128 fmodd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 remainderd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 copysignd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 nextafterd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fdimd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fmaxd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fmind128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fmaximumd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fminimumd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fmaximum_magd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fminimum_magd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fmaximum_numd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fminimum_numd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fmaximum_mag_numd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fminimum_mag_numd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 quantized128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 fmad128(_Decimal128 __x, _Decimal128 __y, _Decimal128 __z);
+_Decimal128 ldexpd128(_Decimal128 __x, int __n);
+_Decimal128 scalbnd128(_Decimal128 __x, int __n);
+_Decimal128 scalblnd128(_Decimal128 __x, long __n);
+int ilogbd128(_Decimal128 __x);
+long llogbd128(_Decimal128 __x);
+long lrintd128(_Decimal128 __x);
+long lroundd128(_Decimal128 __x);
+long long llrintd128(_Decimal128 __x);
+long long llroundd128(_Decimal128 __x);
+long long llquantexpd128(_Decimal128 __x);
+_Decimal128 frexpd128(_Decimal128 __x, int *__e);
+_Decimal128 modfd128(_Decimal128 __x, _Decimal128 *__i);
+_Decimal128 nexttowardd128(_Decimal128 __x, _Decimal128 __y);
+bool samequantumd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal128 nand128(const char *__tag);
+_Decimal128 fromfpd128(_Decimal128 __x, int __rnd, unsigned int __width);
+_Decimal128 ufromfpd128(_Decimal128 __x, int __rnd, unsigned int __width);
+_Decimal128 fromfpxd128(_Decimal128 __x, int __rnd, unsigned int __width);
+_Decimal128 ufromfpxd128(_Decimal128 __x, int __rnd, unsigned int __width);
+int canonicalized128(_Decimal128 *__cx, const _Decimal128 *__x);
+int totalorderd128(const _Decimal128 *__x, const _Decimal128 *__y);
+int totalordermagd128(const _Decimal128 *__x, const _Decimal128 *__y);
+_Decimal128 getpayloadd128(const _Decimal128 *__x);
+int setpayloadd128(_Decimal128 *__res, _Decimal128 __pl);
+int setpayloadsigd128(_Decimal128 *__res, _Decimal128 __pl);
+void encodedecd128(_Decimal128 *restrict __enc, const _Decimal128 *restrict __x);
+void decodedecd128(_Decimal128 *restrict __x, const _Decimal128 *restrict __enc);
+void encodebind128(_Decimal128 *restrict __enc, const _Decimal128 *restrict __x);
+void decodebind128(_Decimal128 *restrict __x, const _Decimal128 *restrict __enc);
+/* the narrowing operations (7.12.14): one rounding, to the narrower type */
+_Decimal32 d32addd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal32 d32subd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal32 d32muld64(_Decimal64 __x, _Decimal64 __y);
+_Decimal32 d32divd64(_Decimal64 __x, _Decimal64 __y);
+_Decimal32 d32fmad64(_Decimal64 __x, _Decimal64 __y, _Decimal64 __z);
+_Decimal32 d32sqrtd64(_Decimal64 __x);
+_Decimal32 d32addd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal32 d32subd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal32 d32muld128(_Decimal128 __x, _Decimal128 __y);
+_Decimal32 d32divd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal32 d32fmad128(_Decimal128 __x, _Decimal128 __y, _Decimal128 __z);
+_Decimal32 d32sqrtd128(_Decimal128 __x);
+_Decimal64 d64addd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal64 d64subd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal64 d64muld128(_Decimal128 __x, _Decimal128 __y);
+_Decimal64 d64divd128(_Decimal128 __x, _Decimal128 __y);
+_Decimal64 d64fmad128(_Decimal128 __x, _Decimal128 __y, _Decimal128 __z);
+_Decimal64 d64sqrtd128(_Decimal128 __x);
+#endif
+
 #endif

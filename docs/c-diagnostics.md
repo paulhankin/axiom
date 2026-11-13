@@ -44,7 +44,7 @@ accepted as if the mode allowed it (so that one use gives one message).
 | `C1016` | An integer constant too large for its type (in `#if`: for `intmax_t` and `uintmax_t`). |
 | `C1017` | A feature of a later standard in a constant or a directive: a binary constant, a `long long` constant or a hexadecimal floating constant before C99 or C23, `__has_include`, `__has_embed` or `__has_c_attribute` before C23. |
 | `C1018` | A floating constant out of range of its type. |
-| `C1019` | A decimal floating constant (`df`, `dd`, `dl` suffixes), which this implementation does not support. |
+| `C1019` | A decimal floating constant (`df`, `dd`, `dl` suffixes) before C23, or one that is hexadecimal (C23 6.4.4.2p2). |
 | `C1020` | String literals that cannot be concatenated: different encoding prefixes, or (before C99) a narrow one and a wide one. |
 | `C1021` | A stray character in the program (a character that is part of no token), or a `\` before `u` or `U` before C99. |
 | `C1022` | A `#` or `##` outside a preprocessing directive that is no operator there. |
@@ -190,6 +190,7 @@ names the feature and the standard that has it (or removed it).
 | `C3220` | `main` declared `inline` or `_Noreturn`. |
 | `C3221` | An inline definition that defines a modifiable object with static storage duration or refers to an identifier with internal linkage (6.7.4p3). |
 | `C3222` | The address of an object declared `register` taken, or a `register` array used as a pointer. |
+| `C3230` | A decimal floating operand (`_Decimal32`, `_Decimal64`, `_Decimal128`) with a standard floating or complex one in an operation that converts both to a common type (C23 6.3.1.8p1: the arithmetic, relational, equality and conditional operators, compound assignment, `<math.h>`'s comparison macros, `<tgmath.h>`'s macros). |
 
 ### Expressions and initializers
 
@@ -246,7 +247,7 @@ array checks and the builtin checks were numbered apart. The message says which.
 | `C3067` | On Windows, the address of an object that a DLL defines (an object declared and defined by no unit) in the initializer of an object with static storage duration: it is not an address constant, since the program finds it when it runs. Reported by `build`. |
 | `C3300` | A call of `setjmp` (`<setjmp.h>`) in a program for a WebAssembly target without its exception-handling extension (`--features=+exception-handling`), which it needs to return to a frame. Reported by `build`. |
 | `C3301` | The address of `setjmp`'s function (`__axc_setjmp`) taken: it can only be called, so that the compiler knows the function calling it. Reported by `build`. |
-| `C3901` | A feature that this implementation does not support: `_Imaginary` (the imaginary types), and (C23) the decimal floating types; in a GNU dialect inline assembly on WebAssembly targets, constraints it does not know (x87, MMX, mask registers), `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
+| `C3901` | A feature that this implementation does not support: `_Imaginary` (the imaginary types); in a GNU dialect inline assembly on WebAssembly targets, constraints it does not know (x87, MMX, mask registers), `__int128` (and `mode(TI)`), `_FloatN`, `_FloatNx` and `__float128`, vector types (`vector_size`), `aligned` on a typedef for another alignment than its type's, a packed bit-field no unit in its structure holds, a designator range whose value has effects, `goto *` or the address of a label in the scope of a variable length array or an object with a cleanup. |
 
 ### The GNU dialects
 

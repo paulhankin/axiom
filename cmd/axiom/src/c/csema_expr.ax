@@ -12,6 +12,7 @@
 import "../util.ax" as u;
 import "cast.ax" as cast;
 import "cconst.ax" as cc;
+import "cdec.ax" as cdec;
 import "cldbl.ax" as cl;
 import "copts.ax" as co;
 import "csema.ax" as cs;
@@ -56,6 +57,9 @@ pub fn conv(a: *mut cast.Expr, op: i32, t: *mut cty.CType) *mut cast.Expr {
     c.height = a.height + 1;
     if op == cast.CV_VALUE {
         cc.fold(c);
+        if not c.is_const and (cty.is_decimal(t) or (u.notnil(a.ty) and cty.is_decimal(a.ty))) {
+            cty.note_dec();
+        }
     }
     return c;
 }
@@ -133,8 +137,50 @@ pub fn full_expr(e: *mut cast.Expr) *mut cast.Expr {
 }
 
 /// Types the controlling expression of if, while, do, for or ?: (scalar).
+// e, an operation (typed); if it is one on decimal floating values that
+// is not folded, the unit needs their arithmetic (ctypes.note_dec).
+fn note_dec(e: *mut cast.Expr) *mut cast.Expr {
+    if e.is_const or is_err(e) {
+        return e;
+    }
+    if cty.is_decimal(e.ty) or (u.notnil(e.a) and u.notnil(e.a.ty) and cty.is_decimal(e.a.ty)) or
+       (u.notnil(e.b) and u.notnil(e.b.ty) and cty.is_decimal(e.b.ty)) {
+        cty.note_dec();
+    }
+    return e;
+}
+
+// Do types a and b mix a decimal floating type with a standard floating or
+// a complex one? Their usual arithmetic conversions are then a constraint
+// violation (C23 6.3.1.8p1): C3230, reported at e.
+pub fn mixes_dec(e: *mut cast.Expr, a: *cty.CType, b: *cty.CType) bool {
+    let da = cty.is_decimal(a);
+    let db = cty.is_decimal(b);
+    if da == db {
+        return false;
+    }
+    let o = pick_cty(da, b, a);
+    if not cty.is_floating(o) and not cty.is_complex(o) {
+        return false;
+    }
+    cs.err(e.span, "C3230",
+           u.f2("a decimal floating operand with a standard floating or complex one (%s and %s): they have no common type",
+                cs.tq(a), cs.tq(b)));
+    return true;
+}
+
+fn pick_cty(c: bool, a: *cty.CType, b: *cty.CType) *cty.CType {
+    if c {
+        return a;
+    }
+    return b;
+}
+
 pub fn cond_expr(e: *mut cast.Expr, what: []u8) *mut cast.Expr {
     let x = rv(e);
+    if not is_err(x) and cty.is_decimal(x.ty) and not x.is_const {
+        cty.note_dec();  // (its truth: cgen_dec.ax)
+    }
     if not is_err(x) and not cty.is_scalar(x.ty) {
         cs.err(x.span, "C3030", u.f2("the controlling expression of %s has type %s, not a scalar type", what,
                                      cs.tq(x.ty)));
@@ -508,6 +554,13 @@ pub fn check(e: *mut cast.Expr) *mut cast.Expr {
     }
     if k == cast.ExprKind.FLOAT {
         let ft = e.tok.fsuffix;
+        if ft >= 3 {
+            // a decimal floating constant (C23): read again, in its format
+            e.ty = cty.decimal(32 << @bit_cast(u32, ft - 3));
+            let mut dinf = false;
+            cdec.set(e, cdec.parse_literal(e.tok.text, cdec.fmt(e.ty), &mut dinf));
+            return e;
+        }
         if ft == 1 {
             e.ty = cty.t_float;
         } else if ft == 2 {
@@ -552,19 +605,19 @@ pub fn check(e: *mut cast.Expr) *mut cast.Expr {
         return e;
     }
     if k == cast.ExprKind.UNARY {
-        return unary(e);
+        return note_dec(unary(e));
     }
     if k == cast.ExprKind.POSTFIX {
-        return incdec(e);
+        return note_dec(incdec(e));
     }
     if k == cast.ExprKind.BINARY {
-        return binary(e);
+        return note_dec(binary(e));
     }
     if k == cast.ExprKind.ASSIGN {
-        return assign(e);
+        return note_dec(assign(e));
     }
     if k == cast.ExprKind.COND {
-        return conditional(e);
+        return note_dec(conditional(e));
     }
     if k == cast.ExprKind.COMMA {
         e.a = full_expr(e.a);
@@ -917,6 +970,9 @@ fn bad_operands(e: *mut cast.Expr) *mut cast.Expr {
 // is converted to the common real type only, and the operation is done on
 // it as such (G.5: x * (u + iv) is xu + ixv, without x's imaginary zero).
 fn arith(e: *mut cast.Expr) *mut cast.Expr {
+    if mixes_dec(e, e.a.ty, e.b.ty) {
+        return bad(e);
+    }
     let t = cty.common_type(e.a.ty, e.b.ty);
     e.a = convert(e.a, cty.domain_type(e.a.ty, t));
     e.b = convert(e.b, cty.domain_type(e.b.ty, t));
@@ -950,6 +1006,9 @@ fn compare(e: *mut cast.Expr) *mut cast.Expr {
         return bad(e);
     }
     if cty.is_arith(ta) and cty.is_arith(tb) {
+        if mixes_dec(e, ta, tb) {
+            return bad(e);
+        }
         let t = cty.common_type(ta, tb);
         e.a = convert(e.a, t);
         e.b = convert(e.b, t);
@@ -1061,6 +1120,9 @@ fn assign(e: *mut cast.Expr) *mut cast.Expr {
 // (with a complex opty, each operand in its own type domain, as arith says:
 // cgen converts the left one so too)
 fn compound_arith(e: *mut cast.Expr) *mut cast.Expr {
+    if mixes_dec(e, e.a.ty, e.b.ty) {
+        return bad(e);
+    }
     let t = cty.common_type(cb.promote_lvalue(e.a), e.b.ty);
     e.opty = t;
     e.b = convert(e.b, cty.domain_type(e.b.ty, t));
@@ -1103,6 +1165,9 @@ fn conditional_types(e: *mut cast.Expr) *mut cast.Expr {
     let tb = b.ty;
     let tc = c.ty;
     if cty.is_arith(tb) and cty.is_arith(tc) {
+        if mixes_dec(e, tb, tc) {
+            return bad(e);
+        }
         let t = cty.common_type(tb, tc);
         e.b = convert(b, t);
         e.c = convert(c, t);
@@ -1433,8 +1498,8 @@ fn explicit_cast(e: *mut cast.Expr) *mut cast.Expr {
         return bad(e);
     }
     // (6.5.4p4: and not to or from a complex type, which is floating too)
-    let tf = cty.is_floating(t) or cty.is_complex(t);
-    let sf = cty.is_floating(s) or cty.is_complex(s);
+    let tf = cty.is_real_floating(t) or cty.is_complex(t);
+    let sf = cty.is_real_floating(s) or cty.is_complex(s);
     if ((t.kind == cty.TK_POINTER) and sf) or ((s.kind == cty.TK_POINTER) and tf) {
         cs.err(e.span, "C3028", u.f2("a cast between a pointer and a floating type (%s to %s)", cs.tq(s), cs.tq(t)));
         return bad(e);

@@ -110,6 +110,17 @@ unsigned long long __axc_strtoull_c23(const char *restrict nptr, char **restrict
 int strfromd(char *restrict s, size_t n, const char *restrict format, double fp);
 int strfromf(char *restrict s, size_t n, const char *restrict format, float fp);
 int strfroml(char *restrict s, size_t n, const char *restrict format, long double fp);
+#ifdef __STDC_IEC_60559_DFP__
+/* the decimal floating types (7.24.1.4, 7.24.1.6): correctly rounded in the
+   decimal rounding direction, the quantum the number is written with (no
+   hexadecimal form); a NaN's n-char-sequence is read and ignored */
+int strfromd32(char *restrict s, size_t n, const char *restrict format, _Decimal32 fp);
+int strfromd64(char *restrict s, size_t n, const char *restrict format, _Decimal64 fp);
+int strfromd128(char *restrict s, size_t n, const char *restrict format, _Decimal128 fp);
+_Decimal32 strtod32(const char *restrict nptr, char **restrict endptr);
+_Decimal64 strtod64(const char *restrict nptr, char **restrict endptr);
+_Decimal128 strtod128(const char *restrict nptr, char **restrict endptr);
+#endif
 #define strtol(nptr, endptr, base) __axc_strtol_c23(nptr, endptr, base)
 #define strtoll(nptr, endptr, base) __axc_strtoll_c23(nptr, endptr, base)
 #define strtoul(nptr, endptr, base) __axc_strtoul_c23(nptr, endptr, base)

@@ -154,9 +154,13 @@ struct __axc_fp {
     int kind; /* 0 zero, 1 finite, 2 infinity, 3 NaN */
     int mant_bits; /* the precision (53, 64, 113) */
     int min_exp;   /* the exponent of the smallest normal's leading bit (-1022, -16382) */
+    int dec;       /* a decimal floating value (C23): value = significand * 10^exp, exp its quantum exponent */
 };
 void __axc_fp_double(struct __axc_fp *v, double x);
 void __axc_fp_long_double(struct __axc_fp *v, long double x);
+/* a decimal floating value's (_Decimal32, _Decimal64, _Decimal128: bytes
+   4, 8 or 16 of BID at p) */
+void __axc_fp_dec(struct __axc_fp *v, const void *p, int bytes);
 /* Writes the conversion (spec 'f','e','g','a' and upper case) of v with the
    flags into buf (cap bytes), returning the length; *big, if the result
    needs more than cap, is a buffer of the library's (to be freed with
@@ -190,6 +194,7 @@ struct __axc_num {
     long dexp;
     unsigned __axiom_int64 mhi, mlo; /* hexadecimal: up to 120 bits */
     long bexp;
+    int nohex; /* set by the caller: no hexadecimal form (the decimal floating types') */
 };
 int __axc_scan_num(struct __axc_in *in, long width, struct __axc_num *n, size_t *taken, size_t *valid);
 int __axc_num_digits(int ld);
@@ -197,6 +202,12 @@ long double __axc_strtold(const char *s, char **end, int *range);
 double __axc_num_double(struct __axc_num *n, int *range);
 float __axc_num_float(struct __axc_num *n, int *range);
 long double __axc_num_long_double(struct __axc_num *n, int *range);
+/* the value of n in decimal floating format dfmt (1 _Decimal32, 2
+   _Decimal64, 3 _Decimal128), at dst (4, 8 or 16 bytes of BID); *range
+   when it overflows or underflows */
+void __axc_num_dec(struct __axc_num *n, int dfmt, void *dst, int *range);
+/* strtod32, strtod64 and strtod128's work: as __axc_strtold for format dfmt */
+void __axc_strtodec(const char *s, char **end, int dfmt, void *dst, int *range);
 
 /* Pushing back (chario.c, wide.c), the lock held */
 int __axc_ungetc_u(int c, FILE *f);

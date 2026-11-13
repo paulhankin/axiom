@@ -520,7 +520,7 @@ int __axc_scan_num(struct __axc_in *in, long width, struct __axc_num *n, size_t 
         *valid = t;
         if (!NEXT())
             goto end;
-        if (lower(c) == 'x') {
+        if (lower(c) == 'x' && !n->nohex) {
             int hd = 0;
             n->kind = 1;
             for (;;) {
@@ -792,6 +792,7 @@ long double __axc_strtold(const char *s, char **end, int *range) {
     in.ws = NULL;
     in.eof = in.error = 0;
     in.c23 = 0;
+    n.nohex = 0;
     n.d = small;
     if (cap > sizeof small)
         n.d = __axc_sys_alloc(cap);
@@ -813,4 +814,222 @@ long double __axc_strtold(const char *s, char **end, int *range) {
     if (end != NULL)
         *end = (char *)p;
     return v;
+}
+
+/* -------------------------------------------------------------------------
+   The decimal floating types (C23): a scanned number's value in _Decimal32,
+   _Decimal64 or _Decimal128 (BID), rounded once in the decimal rounding
+   direction (fe_dec_getround) when it has more digits than the format, or
+   is out of its exponent range; exact, the quantum it was written with
+   (C23 7.24.1.6p?: "the quantum exponent of the result is the exponent
+   of the subject sequence's last digit"), or the nearest the format has.
+   The same rules as std/c/rt/decimal.ax's (finish), which the arithmetic
+   rounds with. */
+
+unsigned __axiom_int64 __axc_dec_round_get(void);
+
+struct decfmt {
+    int p, bytes;
+    long qmin, qmax, emin;
+};
+
+static void dec_store(const struct decfmt *f, int neg, unsigned __axiom_int64 hi, unsigned __axiom_int64 lo, long q,
+                      int kind, void *dst) {
+    /* kind 0 finite, 1 infinity, 2 NaN */
+    unsigned char *o = (unsigned char *)dst;
+    unsigned __axiom_int64 w0 = 0, w1 = 0, e = (unsigned __axiom_int64)(q - f->qmin);
+    int k, kb = f->bytes * 8, cb = f->bytes == 4 ? 23 : f->bytes == 8 ? 53 : 113;
+    if (f->bytes == 16) {
+        w1 = (unsigned __axiom_int64)neg << 63;
+        if (kind == 1)
+            w1 |= (unsigned __axiom_int64)30 << 58;
+        else if (kind == 2)
+            w1 |= (unsigned __axiom_int64)31 << 58;
+        else {
+            w1 |= (e << 49) | hi;
+            w0 = lo;
+        }
+    } else {
+        w0 = (unsigned __axiom_int64)neg << (kb - 1);
+        if (kind == 1)
+            w0 |= (unsigned __axiom_int64)30 << (kb - 6);
+        else if (kind == 2)
+            w0 |= (unsigned __axiom_int64)31 << (kb - 6);
+        else if (lo < ((unsigned __axiom_int64)1 << cb))
+            w0 |= (e << cb) | lo;
+        else
+            w0 |= ((unsigned __axiom_int64)3 << (kb - 3)) | (e << (cb - 2)) | (lo & (((unsigned __axiom_int64)1 << (cb - 2)) - 1));
+    }
+    for (k = 0; k < f->bytes && k < 8; k++)
+        o[k] = (unsigned char)(w0 >> (8 * k));
+    for (k = 8; k < f->bytes; k++)
+        o[k] = (unsigned char)(w1 >> (8 * (k - 8)));
+}
+
+/* the coefficient of digits d[0 .. n) as a 128-bit number */
+static void dec_coef(const char *d, int n, unsigned __axiom_int64 *hi, unsigned __axiom_int64 *lo) {
+    unsigned __axiom_int64 h = 0, l = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        /* (h:l) * 10 + d */
+        unsigned __axiom_int64 l8 = l << 3, l2 = l << 1, s, t;
+        unsigned __axiom_int64 h10 = (h << 3) + (h << 1) + (l >> 61) + (l >> 63);
+        s = l8 + l2;
+        if (s < l8)
+            h10++;
+        t = s + (unsigned __axiom_int64)d[i];
+        if (t < s)
+            h10++;
+        h = h10;
+        l = t;
+    }
+    *hi = h;
+    *lo = l;
+}
+
+void __axc_num_dec(struct __axc_num *n, int dfmt, void *dst, int *range) {
+    static const struct decfmt fmts[3] = {{7, 4, -101, 90, -95}, {16, 8, -398, 369, -383}, {34, 16, -6176, 6111, -6143}};
+    const struct decfmt *f = &fmts[dfmt - 1];
+    int nd = n->nd, tz = 0, keep, first, rest, up, i, mode, neg = n->neg;
+    long q, lo, e, hi_e;
+    char dig[40];
+    unsigned __axiom_int64 ch, cl;
+    *range = 0;
+    if (n->kind == 2 || n->kind == 3) {
+        dec_store(f, neg, 0, 0, 0, n->kind - 1, dst);
+        return;
+    }
+    q = n->dexp - nd;
+    if (q < -2000000000L)
+        q = -2000000000L;
+    while (tz < nd && n->d[nd - 1 - tz] == 0)
+        tz++;
+    if (nd == tz && !n->sticky) {
+        /* zero, with the written quantum (or the nearest the format has) */
+        e = q < f->qmin ? f->qmin : q > f->qmax ? f->qmax : q;
+        dec_store(f, neg, 0, 0, e, 0, dst);
+        return;
+    }
+    lo = q + nd - f->p;
+    if (!n->sticky) {
+        long elo = lo > f->qmin ? lo : f->qmin, ehi = q + tz < f->qmax ? q + tz : f->qmax;
+        if (elo <= ehi) {
+            e = q < elo ? elo : q > ehi ? ehi : q;
+            /* the digits down to 10^e: dropped zeros, or added ones */
+            keep = (int)(nd - (e - q));
+            for (i = 0; i < keep; i++)
+                dig[i] = i < nd ? n->d[i] : 0;
+            dec_coef(dig, keep, &ch, &cl);
+            dec_store(f, neg, ch, cl, e, 0, dst);
+            return;
+        }
+    }
+    mode = (int)__axc_dec_round_get();
+    if (lo > f->qmax)
+        goto overflow;
+    e = lo > f->qmin ? lo : f->qmin;
+    keep = (long)nd - (e - q) > 0 ? (int)(nd - (e - q)) : 0;
+    first = keep < nd && keep >= 0 && (long)nd - (e - q) >= 0 ? n->d[keep] : 0;
+    rest = n->sticky;
+    for (i = keep + ((long)nd - (e - q) >= 0 ? 1 : 0); i < nd; i++)
+        rest |= n->d[i] != 0;
+    for (i = 0; i < keep; i++)
+        dig[i] = n->d[i];
+    {
+        int odd = keep > 0 && (dig[keep - 1] & 1), inexact = first != 0 || rest;
+        if (!inexact)
+            up = 0;
+        else if (mode == 0)
+            up = first > 5 || (first == 5 && (rest || odd));
+        else if (mode == 4)
+            up = first >= 5;
+        else if (mode == 3)
+            up = 0;
+        else if (mode == 2)
+            up = !neg;
+        else
+            up = neg;
+        if (up) {
+            for (i = keep - 1; i >= 0; i--) {
+                if (dig[i] != 9) {
+                    dig[i]++;
+                    break;
+                }
+                dig[i] = 0;
+            }
+            if (i < 0) {
+                /* 0 or 99...9 rounded up: 1 followed by the zeros */
+                for (i = keep; i > 0; i--)
+                    dig[i] = dig[i - 1];
+                dig[0] = 1;
+                keep++;
+                if (keep > f->p) {
+                    keep--;
+                    e++;
+                }
+            }
+        }
+        if (e > f->qmax)
+            goto overflow;
+        if (inexact && q + nd - 1 < f->emin)
+            *range = 1; /* (underflow: a tiny inexact result) */
+    }
+    dec_coef(dig, keep, &ch, &cl);
+    dec_store(f, neg, ch, cl, e, 0, dst);
+    return;
+overflow:
+    /* infinity, or the largest value, as the rounding direction says */
+    *range = 1;
+    mode = (int)__axc_dec_round_get();
+    if (mode == 3 || (mode == 2 && neg) || (mode == 1 && !neg)) {
+        for (i = 0; i < f->p; i++)
+            dig[i] = 9;
+        dec_coef(dig, f->p, &ch, &cl);
+        dec_store(f, neg, ch, cl, f->qmax, 0, dst);
+    } else {
+        dec_store(f, neg, 0, 0, 0, 1, dst);
+    }
+    (void)hi_e;
+}
+
+void __axc_strtodec(const char *s, char **end, int dfmt, void *dst, int *range) {
+    struct __axc_in in;
+    struct __axc_num n;
+    size_t taken, valid;
+    const char *p = s;
+    char small[64];
+    unsigned char *o = (unsigned char *)dst;
+    int k;
+    *range = 0;
+    while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
+        p++;
+    in.get = text_get;
+    in.unget = text_unget;
+    in.count = 0;
+    in.f = NULL;
+    in.s = (const unsigned char *)p;
+    in.ws = NULL;
+    in.eof = in.error = 0;
+    in.c23 = 1;
+    n.nohex = 1;
+    n.d = small;
+    n.cap = (int)sizeof small; /* (more than any format's p + 3 digits) */
+    if (__axc_scan_num(&in, -1, &n, &taken, &valid) && valid > 0) {
+        __axc_num_dec(&n, dfmt, dst, range);
+        p += valid;
+    } else {
+        /* no subject sequence: +0 (exponent 0) */
+        for (k = 0; k < (dfmt == 1 ? 4 : dfmt == 2 ? 8 : 16); k++)
+            o[k] = 0;
+        o[dfmt == 1 ? 3 : dfmt == 2 ? 7 : 15] = dfmt == 1 ? 0x32 : dfmt == 2 ? 0x31 : 0x30;
+        if (dfmt == 1)
+            o[2] = 0x80;
+        else if (dfmt == 2)
+            o[6] = 0xc0;
+        else
+            o[14] = 0x40;
+        p = s;
+    }
+    if (end != NULL)
+        *end = (char *)p;
 }

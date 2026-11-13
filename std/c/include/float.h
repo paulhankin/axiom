@@ -2,7 +2,8 @@
    5.2.4.2.2, C11 7.7, C23 7.7), for the Axiom compiler's C front end:
    float is IEC 60559 binary32, double binary64, and long double the
    format __AXIOM_LDBL_WIDTH__ names (--c-long-double): 64, binary64; 80,
-   the x87's 80-bit extended format (64-bit significand); 128, binary128. */
+   the x87's 80-bit extended format (64-bit significand); 128, binary128.
+   In C23 also the decimal floating types' DEC_ macros. */
 #ifndef __AXIOM_FLOAT_H
 #define __AXIOM_FLOAT_H
 
@@ -105,6 +106,38 @@
 #define LDBL_IS_IEC_60559 1
 #define INFINITY __builtin_inff()
 #define NAN __builtin_nanf("")
+#endif
+
+#ifdef __STDC_IEC_60559_DFP__
+/* the decimal floating types (C23 5.2.5.3.4): IEC 60559's decimal32,
+   decimal64 and decimal128 formats, evaluated in their own range and
+   precision; their signaling NaNs stay signaling (the arithmetic is the
+   library's, in software) */
+#define DEC_EVAL_METHOD 0
+#define DEC32_MANT_DIG 7
+#define DEC64_MANT_DIG 16
+#define DEC128_MANT_DIG 34
+#define DEC32_MIN_EXP (-94)
+#define DEC64_MIN_EXP (-382)
+#define DEC128_MIN_EXP (-6142)
+#define DEC32_MAX_EXP 97
+#define DEC64_MAX_EXP 385
+#define DEC128_MAX_EXP 6145
+#define DEC32_MAX 9.999999E96DF
+#define DEC64_MAX 9.999999999999999E384DD
+#define DEC128_MAX 9.999999999999999999999999999999999E6144DL
+#define DEC32_EPSILON 1E-6DF
+#define DEC64_EPSILON 1E-15DD
+#define DEC128_EPSILON 1E-33DL
+#define DEC32_MIN 1E-95DF
+#define DEC64_MIN 1E-383DD
+#define DEC128_MIN 1E-6143DL
+#define DEC32_TRUE_MIN 0.000001E-95DF
+#define DEC64_TRUE_MIN 0.000000000000001E-383DD
+#define DEC128_TRUE_MIN 0.000000000000000000000000000000001E-6143DL
+#define DEC32_SNAN __builtin_axiom_dec(32, 0, 0x7e000000)
+#define DEC64_SNAN __builtin_axiom_dec(64, 0, 0x7e00000000000000)
+#define DEC128_SNAN __builtin_axiom_dec(128, 0x7e00000000000000, 0)
 #endif
 
 #endif

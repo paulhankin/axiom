@@ -22,6 +22,7 @@ import "cgen_bitint.ax" as cgbi;
 import "cgen_bits.ax" as cgb;
 import "cgen_complex.ax" as gcx;
 import "cgen_debug.ax" as cdbg;
+import "cgen_dec.ax" as gdec;
 import "cgen_fp.ax" as gfp;
 import "cgen_ld.ax" as gld;
 import "cgen_sjlj.ax" as sj;
@@ -122,6 +123,9 @@ pub fn const_value(e: *cast.Expr) *mut ir.Value {
     if cty.is_wide(e.ty) {
         return gld.constant(e.xv);
     }
+    if cty.is_decimal(e.ty) {
+        return gdec.constant_of(e.ty, e.xv);
+    }
     if cty.is_wint(e.ty) {
         return cgw.constant(e.ty, cw.value(e, cty.limbs(e.ty)));
     }
@@ -143,6 +147,9 @@ pub fn truth(v: *mut ir.Value, t: *cty.CType) *mut ir.Value {
     }
     if cty.is_wide(t) {
         return gld.truth(v);
+    }
+    if cty.is_decimal(t) {
+        return gdec.truth(v, t);
     }
     if cty.is_wint(t) {
         return cgw.truth(t, v);
@@ -209,6 +216,9 @@ pub fn convert(v: *mut ir.Value, from: *mut cty.CType, to: *mut cty.CType) *mut 
     }
     if cty.is_complex(t) or cty.is_complex(f) {
         return complex_convert(v, f, t);
+    }
+    if cty.is_decimal(f) or cty.is_decimal(t) {
+        return gdec.convert(v, f, t);
     }
     if cty.is_wint(f) or cty.is_wint(t) {
         return cgw.convert(v, f, t);
@@ -425,7 +435,7 @@ fn load_lv(e: *mut cast.Expr, p: *mut ir.Value) *mut ir.Value {
     if is_atomic(e.ty) {
         return cga.load(e.ty, p);
     }
-    if cty.is_wide(e.ty) {
+    if cty.is_wide(e.ty) or cty.is_dec128(e.ty) {
         return gld.snapshot(p, is_volatile(e.ty));
     }
     if cty.is_wint(e.ty) {
@@ -449,7 +459,7 @@ pub fn store_lv(e: *mut cast.Expr, t: *mut cty.CType, v: *mut ir.Value, p: *mut 
         cga.store(e.ty, v, p);
         return v;
     }
-    if cty.is_wide(t) {
+    if cty.is_wide(t) or cty.is_dec128(t) {
         gld.copy(p, v, is_volatile(e.ty));
         return v;
     }
@@ -513,8 +523,8 @@ let mut fp_slot: *mut ir.Value = @ptr_from_int(*mut ir.Value, 0);
 // static mode): is e an operation on floating values whose constant value
 // (folded by semantic analysis) is not used, the operation done at run time
 // instead, in the mode of that moment and raising its exceptions? (Not the
-// constants themselves, nor what is not of a floating type and has no
-// floating operand.)
+// constants themselves, nor what is not of a floating type, binary or
+// decimal, and has no floating operand.)
 fn fp_runtime(e: *cast.Expr) bool {
     if not cpg.fp_strict(fp_state) {
         return false;
@@ -524,10 +534,10 @@ fn fp_runtime(e: *cast.Expr) bool {
        (k != cast.ExprKind.COND) {
         return false;
     }
-    if cty.is_floating(e.ty) or (cty.is_complex(e.ty)) {
+    if cty.is_real_floating(e.ty) or (cty.is_complex(e.ty)) {
         return true;
     }
-    return u.notnil(e.a) and u.notnil(e.a.ty) and (cty.is_floating(e.a.ty) or cty.is_complex(e.a.ty));
+    return u.notnil(e.a) and u.notnil(e.a.ty) and (cty.is_real_floating(e.a.ty) or cty.is_complex(e.a.ty));
 }
 
 // The rounding-control bits of the environment's register (fenv_get's
@@ -700,7 +710,8 @@ pub fn rv(e: *mut cast.Expr) *mut ir.Value {
     if (k == cast.ExprKind.MEMBER) or (k == cast.ExprKind.INDEX) or (k == cast.ExprKind.IDENT) {
         // (the member of a structure value; lvalues are converted by CV_LOAD)
         let p = lv(e);
-        if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) or cty.is_wide(e.ty) or cty.is_wint(e.ty) {
+        if cty.is_record(e.ty) or (e.ty.kind == cty.TK_ARRAY) or cty.is_wide(e.ty) or cty.is_wint(e.ty) or
+           cty.is_dec128(e.ty) {
             return p;
         }
         return load_lv(e, p);
@@ -790,6 +801,9 @@ fn unary(e: *mut cast.Expr) *mut ir.Value {
         if cty.is_wide(e.ty) {
             return gld.negate(v);
         }
+        if cty.is_decimal(e.ty) {
+            return gdec.negate(e.ty, v);
+        }
         if cty.is_floating(e.ty) {
             return ir.fneg(cg.B, v);
         }
@@ -816,6 +830,9 @@ fn arith_op(op: i32, t: *mut cty.CType, x: *mut ir.Value, y0: *mut ir.Value, yt:
     }
     if cty.is_wide(t) {
         return gld.arith(op, x, y);
+    }
+    if cty.is_decimal(t) {
+        return gdec.arith(op, t, x, y);
     }
     if cty.is_floating(t) {
         let mut fo = ir.OP_FADD;
@@ -922,6 +939,9 @@ fn compare(e: *mut cast.Expr) *mut ir.Value {
     let mut y = rv(e.b);
     if cty.is_wide(t) {
         return i1_to(e.ty, gld.compare(op, x, y));
+    }
+    if cty.is_decimal(t) {
+        return i1_to(e.ty, gdec.compare(op, t, x, y));
     }
     if cty.is_wint(t) {
         return i1_to(e.ty, cgw.compare(op, t, x, y));
@@ -1078,7 +1098,7 @@ fn assign(e: *mut cast.Expr) *mut ir.Value {
             cga.store(lt, v, p);
             return v;
         }
-        if cty.is_wide(lt) {
+        if cty.is_wide(lt) or cty.is_dec128(lt) {
             gld.copy(p, v, is_volatile(lt));
             return p;
         }
@@ -1148,6 +1168,8 @@ fn incdec(e: *mut cast.Expr) *mut ir.Value {
         let mut one = ir.vnil();
         if cty.is_wide(ot) {
             one = gld.one_value();
+        } else if cty.is_decimal(ot) {
+            one = gdec.one(ot);
         } else if cty.is_wint(ot) {
             one = cgw.one_value(ot);
         } else if cty.is_floating(ot) {
@@ -1240,6 +1262,8 @@ fn atomic_compound(e: *mut cast.Expr) *mut ir.Value {
         let mut one = ir.vnil();
         if cty.is_wide(ot) {
             one = gld.one_value();
+        } else if cty.is_decimal(ot) {
+            one = gdec.one(ot);
         } else if cty.is_wint(ot) {
             one = cgw.one_value(ot);
         } else if cty.is_floating(ot) {
@@ -1310,7 +1334,7 @@ fn conditional(e: *mut cast.Expr) *mut ir.Value {
         return gcx.make(e.ty, gcx.Pair.{ re: pr, im: pi });
     }
     let mut pt = cg.T_ptr;
-    if cty.is_scalar(e.ty) and not cty.is_wide(e.ty) and not cty.is_wint(e.ty) {
+    if cty.is_scalar(e.ty) and not cty.is_wide(e.ty) and not cty.is_wint(e.ty) and not cty.is_dec128(e.ty) {
         pt = lty(e.ty);
     }
     let ph = ir.phi(cg.B, pt);

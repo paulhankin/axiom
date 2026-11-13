@@ -1,0 +1,262 @@
+// =============================================================================
+// cdec.ax - constants of the decimal floating types (C23 _Decimal32,
+// _Decimal64, _Decimal128): decimal floating constants read exactly (C23
+// 6.4.4.2: rounded to the type, with the quantum exponent they are written
+// with), and the folding of the operations on them (cconst.ax calls fold_*
+// here), with std/c/rt/decimal.ax's arithmetic, which the generated code
+// calls too, so that a constant expression and the same operation at run
+// time agree (translation time rounds to nearest, ties to even: the default
+// decimal rounding direction, C23 7.6.1a's FENV_DEC_ROUND being
+// FE_DEC_DYNAMIC; the flags raised are not kept, as for binary constants).
+//
+// A constant Expr of a decimal type has its value in xv (ld.W: _Decimal32's
+// bits in lo's low 32, _Decimal64's in lo, _Decimal128's in both), and an
+// approximation in fcval.
+// =============================================================================
+import "../util.ax" as u;
+import "cast.ax" as cast;
+import "ctok.ax" as ct;
+import "ctypes.ax" as cty;
+import "cwide.ax" as cw;
+import "std/c/rt/decimal" as d;
+import "std/c/rt/ldouble" as ld;
+
+/// The format of decimal type t.
+pub fn fmt(t: *cty.CType) u32 {
+    let k = t.unq.kind;
+    if k == cty.TK_DEC32 {
+        return d.D32;
+    }
+    if k == cty.TK_DEC64 {
+        return d.D64;
+    }
+    return d.D128;
+}
+
+fn cx() d.Ctx {
+    return d.ctx(d.R_NEAREST);
+}
+
+/// The value of the decimal floating constant `s` (its spelling, with its
+/// suffix and any digit separators) in format f, and whether it overflowed.
+pub fn parse_literal(s: []u8, f: u32, inf: *mut bool) ld.W {
+    let mut b = u.Buf.init();
+    defer b.b.deinit();
+    let mut n = s.len;
+    if n >= 2 {
+        n -= 2;  // (df, dd, dl, DF, DD, DL)
+    }
+    for i in 0..n {
+        if s[i] != '\'' {
+            b.c(s[i]);
+        }
+    }
+    let mut c = cx();
+    let r = d.parse(b.view(), f, &mut c);
+    inf.* = (c.flags & d.F_OVERFLOW) != 0;
+    return r.w;
+}
+
+/// An approximation of decimal value w (format f) as a double.
+pub fn approx(w: ld.W, f: u32) f64 {
+    let mut c = cx();
+    return @bit_cast(f64, d.to_bin(w, f, d.B_F64, &mut c).lo);
+}
+
+/// Sets e (of decimal type) to the value w.
+pub fn set(e: *mut cast.Expr, w: ld.W) void {
+    e.is_const = true;
+    e.xv = w;
+    e.fcval = approx(w, fmt(e.ty));
+}
+
+/// The value of constant x (of a real type: an integer, standard floating
+/// or decimal floating one) in decimal format f.
+pub fn value(x: *cast.Expr, f: u32, ld_fmt: u32) ld.W {
+    let t = x.ty;
+    let mut c = cx();
+    if cty.is_decimal(t) {
+        return d.convert(x.xv, fmt(t), f, &mut c);
+    }
+    if cty.is_wint(t) {
+        let n = cty.limbs(t);
+        let v = cw.value(x, n);
+        return d.from_limbs(v.ptr, n, t.is_signed, f, &mut c);
+    }
+    if cty.is_integer(t) {
+        if t.is_signed and (t.kind != cty.TK_BOOL) {
+            return d.from_i64(@bit_cast(i64, x.cval), f, &mut c);
+        }
+        return d.from_u64(x.cval, f, &mut c);
+    }
+    if cty.is_wide(t) or (cty.is_complex(t) and cty.is_wide(t.unq.elem)) {
+        return d.from_bin(x.xv, ld_fmt, f, &mut c);  // (of a complex value: its real part, 6.3.1.7)
+    }
+    if t.unq.kind == cty.TK_FLOAT {
+        let b = @as(u64, @bit_cast(u32, @float_cast(f32, x.fcval)));
+        return d.from_bin(ld.W.{ lo: b, hi: 0 }, d.B_F32, f, &mut c);
+    }
+    return d.from_bin(ld.W.{ lo: @bit_cast(u64, x.fcval), hi: 0 }, d.B_F64, f, &mut c);
+}
+
+/// Is constant x (decimal) nonzero (a NaN is)?
+pub fn truth(x: *cast.Expr) bool {
+    return d.truth(x.xv, fmt(x.ty));
+}
+
+/// e (a conversion to a real type) of constant x, one of them decimal:
+/// left to run time when the result would be undefined (a value out of an
+/// integer type's range, 6.3.1.4).
+pub fn convert(e: *mut cast.Expr, x: *cast.Expr, ld_fmt: u32) void {
+    let to = e.ty;
+    let from = x.ty;
+    if cty.is_decimal(to) {
+        set(e, value(x, fmt(to), ld_fmt));
+        return;
+    }
+    let f = fmt(from);
+    let mut c = cx();
+    if to.unq.kind == cty.TK_BOOL {
+        e.is_const = true;
+        e.cval = 0;
+        if truth(x) {
+            e.cval = 1;
+        }
+        return;
+    }
+    if cty.is_wint(to) {
+        let n = cty.limbs(to);
+        let v = cw.zeros(n);
+        d.to_limbs(v.ptr, n, @bit_cast(u32, to.unq.bits), to.is_signed, x.xv, f, &mut c);
+        if (c.flags & d.F_INVALID) == 0 {
+            cw.set(e, v);
+        }
+        return;
+    }
+    if cty.is_integer(to) {
+        let v = d.to_int(x.xv, f, @bit_cast(u32, to.unq.bits), to.is_signed, &mut c);
+        if (c.flags & d.F_INVALID) == 0 {
+            e.is_const = true;
+            e.cval = cty.wrap(to, v);
+        }
+        return;
+    }
+    if cty.is_complex(to) {
+        // (the real part, the imaginary part +0: 6.3.1.7)
+        let el = to.unq.elem;
+        e.is_const = true;
+        e.fcimag = 0.0;
+        e.xvim = ld.W.{ lo: 0, hi: 0 };
+        if cty.is_wide(el) {
+            e.xv = d.to_bin(x.xv, f, ld_fmt, &mut c);
+            e.fcval = approx(x.xv, f);
+        } else if el.kind == cty.TK_FLOAT {
+            e.fcval = @as(f64, @bit_cast(f32, @truncate(u32, d.to_bin(x.xv, f, d.B_F32, &mut c).lo)));
+        } else {
+            e.fcval = @bit_cast(f64, d.to_bin(x.xv, f, d.B_F64, &mut c).lo);
+        }
+        return;
+    }
+    if cty.is_wide(to) {
+        e.is_const = true;
+        e.xv = d.to_bin(x.xv, f, ld_fmt, &mut c);
+        e.fcval = approx(x.xv, f);
+        return;
+    }
+    if to.unq.kind == cty.TK_FLOAT {
+        e.is_const = true;
+        e.fcval = @as(f64, @bit_cast(f32, @truncate(u32, d.to_bin(x.xv, f, d.B_F32, &mut c).lo)));
+        return;
+    }
+    if cty.is_floating(to) {
+        e.is_const = true;
+        e.fcval = @bit_cast(f64, d.to_bin(x.xv, f, d.B_F64, &mut c).lo);
+    }
+}
+
+/// e (op x, of decimal type): - and + (the sign changed, or the value as it
+/// is: both exact, 6.5.3.3).
+pub fn fold_unary(e: *mut cast.Expr, x: *cast.Expr) void {
+    if e.op == ct.P_MINUS {
+        set(e, d.negate(x.xv, fmt(e.ty)));
+    } else if e.op == ct.P_PLUS {
+        set(e, x.xv);
+    }
+}
+
+/// e (a op b, of decimal type; + - * /), rounded to nearest.
+pub fn fold_binary(e: *mut cast.Expr, a: *cast.Expr, b: *cast.Expr) void {
+    let op = e.op;
+    let mut k: u32 = 0;
+    if op == ct.P_MINUS {
+        k = 1;
+    } else if op == ct.P_STAR {
+        k = 2;
+    } else if op == ct.P_SLASH {
+        k = 3;
+    } else if op != ct.P_PLUS {
+        return;
+    }
+    let mut c = cx();
+    set(e, d.arith(k, a.xv, b.xv, fmt(e.ty), &mut c));
+}
+
+/// The order of constants a and b (of one decimal type): -1, 0, 1, or 2
+/// when unordered.
+pub fn compare(a: *cast.Expr, b: *cast.Expr) i32 {
+    let mut c = cx();
+    return d.cmp(a.xv, b.xv, false, fmt(a.ty), &mut c);
+}
+
+/// The bytes of decimal constant e's value, as stored (little-endian).
+pub fn bytes(e: *cast.Expr) [16]u8 {
+    let mut r: [16]u8 = [0; 16];
+    for i in @as(usize, 0)..8 {
+        r[i] = @truncate(u8, e.xv.lo >> @truncate(u32, i * 8));
+        r[i + 8] = @truncate(u8, e.xv.hi >> @truncate(u32, i * 8));
+    }
+    return r;
+}
+
+/// Is constant e's value converted to real (or complex) type t exactly (no
+/// rounding; a NaN is: C23 6.7.1p6)?
+pub fn exact(e: *cast.Expr, t: *mut cty.CType, ld_fmt: u32) bool {
+    let mut c = cx();
+    if cty.is_decimal(t) {
+        let f = fmt(t);
+        let from = e.ty;
+        if cty.is_decimal(from) {
+            _ = d.convert(e.xv, fmt(from), f, &mut c);
+        } else if cty.is_wint(from) {
+            let n = cty.limbs(from);
+            _ = d.from_limbs(cw.value(e, n).ptr, n, from.is_signed, f, &mut c);
+        } else if cty.is_integer(from) {
+            if from.is_signed and (from.kind != cty.TK_BOOL) {
+                _ = d.from_i64(@bit_cast(i64, e.cval), f, &mut c);
+            } else {
+                _ = d.from_u64(e.cval, f, &mut c);
+            }
+        } else if cty.is_wide(from) {
+            _ = d.from_bin(e.xv, ld_fmt, f, &mut c);
+        } else if from.unq.kind == cty.TK_FLOAT {
+            let b = @as(u64, @bit_cast(u32, @float_cast(f32, e.fcval)));
+            _ = d.from_bin(ld.W.{ lo: b, hi: 0 }, d.B_F32, f, &mut c);
+        } else if cty.is_floating(from) {
+            _ = d.from_bin(ld.W.{ lo: @bit_cast(u64, e.fcval), hi: 0 }, d.B_F64, f, &mut c);
+        } else {
+            return false;  // (a complex value)
+        }
+        return (c.flags & d.F_INEXACT) == 0;
+    }
+    // to a standard floating or complex type, from a decimal value
+    let el = cty.real_of(t);
+    let f = fmt(e.ty);
+    if cty.is_wide(el) {
+        _ = d.to_bin(e.xv, f, ld_fmt, &mut c);
+    } else if el.kind == cty.TK_FLOAT {
+        _ = d.to_bin(e.xv, f, d.B_F32, &mut c);
+    } else {
+        _ = d.to_bin(e.xv, f, d.B_F64, &mut c);
+    }
+    return (c.flags & d.F_INEXACT) == 0;
+}

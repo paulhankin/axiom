@@ -5,7 +5,8 @@
 
    Everything of 7.21.6.1 and C23's additions: the flags - + space # 0, the
    field width and precision (or *), the length modifiers hh h l ll j z t L
-   and C23's wN and wfN, the conversions d i o u x X b B (C23) f F e E g G a
+   and C23's wN, wfN and H, D, DD (the decimal floating types, with a e f g
+   and their upper case: fmtfloat.c), the conversions d i o u x X b B (C23) f F e E g G a
    A c s p n %. Characters of the format that are not a conversion are
    copied a run at a time. */
 
@@ -85,7 +86,7 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
     const CH *p = fmt;
     for (;;) {
         const CH *q = p;
-        int left = 0, plus = 0, space = 0, alt = 0, zero = 0, width = 0, prec = -1, bits, conv, ldbl = 0;
+        int left = 0, plus = 0, space = 0, alt = 0, zero = 0, width = 0, prec = -1, bits, conv, ldbl = 0, dfmt = 0;
         int wide_char = 0, lm = 0; /* the modifier's letter (w: wN), for %n */
         while (*q != 0 && *q != '%')
             q++;
@@ -141,7 +142,17 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
         }
         /* the length modifier, as the width of the argument's type */
         bits = 0;
+        dfmt = 0;
         switch (*p) {
+        case 'H':
+            /* C23: _Decimal32, _Decimal64 (D), _Decimal128 (DD) */
+            dfmt = 1;
+            p++;
+            break;
+        case 'D':
+            dfmt = p[1] == 'D' ? 3 : 2;
+            p += dfmt == 3 ? 2 : 1;
+            break;
         case 'h':
             if (p[1] == 'h') {
                 bits = CHAR_BIT;
@@ -210,6 +221,8 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
         conv = *p;
         if (conv == 0)
             return -1; /* (the format ends inside a conversion) */
+        if (dfmt != 0 && (conv | 0x20) != 'a' && (conv | 0x20) != 'e' && (conv | 0x20) != 'f' && (conv | 0x20) != 'g')
+            return -1; /* (H, D and DD take only the floating conversions) */
         p++;
         switch (conv) {
         case 'd':
@@ -295,7 +308,16 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
             char buf[400], *big = NULL, prefix[2];
             size_t bigcap = 0, n, np = 0;
             int upper = conv >= 'A' && conv <= 'Z';
-            if (ldbl)
+            if (dfmt == 1) {
+                __axiom_decimal32 x = va_arg(ap, __axiom_decimal32);
+                __axc_fp_dec(&v, &x, 4);
+            } else if (dfmt == 2) {
+                __axiom_decimal64 x = va_arg(ap, __axiom_decimal64);
+                __axc_fp_dec(&v, &x, 8);
+            } else if (dfmt == 3) {
+                __axiom_decimal128 x = va_arg(ap, __axiom_decimal128);
+                __axc_fp_dec(&v, &x, 16);
+            } else if (ldbl)
                 __axc_fp_long_double(&v, va_arg(ap, long double));
             else
                 __axc_fp_double(&v, va_arg(ap, double));
@@ -321,7 +343,7 @@ int PF_NAME(struct __axc_out *o, const CH *fmt, va_list ap) {
             }
             {
                 const char *body = big != NULL ? big : buf;
-                if ((conv | 0x20) == 'a') {
+                if ((conv | 0x20) == 'a' && !v.dec) {
                     /* the zeros of the 0 flag go after 0x */
                     char pre[4];
                     size_t k;

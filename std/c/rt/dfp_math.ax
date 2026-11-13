@@ -1,0 +1,2559 @@
+// =============================================================================
+// std/c/rt/dfp_math.ax - the elementary decimal floating functions of the C
+// library's <math.h> (C23 7.12, the d32, d64 and d128 suffixes): the
+// trigonometric, hyperbolic, exponential, logarithmic and power functions,
+// erf, erfc, lgamma and tgamma, which the C wrappers std/c/lib/math/dfp_*.c
+// call (__axc_dm_trig ... __axc_dm_gamma, by family, so that a program has
+// only the families it calls).
+//
+// Each is computed in decimal floating arithmetic of a working precision
+// well above the format's (the format's digits and 12 more, and as many
+// more as the formula loses to cancellation), from exactly known operands,
+// then rounded once in the decimal rounding direction (decimal.ax's
+// finish): the error is below 0.5 ulp plus a small fraction of one (under
+// 10^-8 ulp), so within 1 ulp, and almost always correctly rounded. The
+// methods: exp by e^x = 10^k e^r (r = x - k ln 10), r halved ten times, a
+// Taylor series and squarings; log by the decimal exponent, square roots
+// to near 1 and the series of atanh ((y - 1) / (y + 1)); the constants
+// ln 2 = 2 atanh(1/3), ln 1.25 = 2 atanh(1/9), and pi by Machin's formula
+// (pi/4 = 4 atan(1/5) - atan(1/239)); the trigonometric arguments reduced
+// exactly against pi computed to as many digits as the argument's integer
+// part has, plus the working precision (up to 10^6145: a reduction in
+// natural numbers of thousands of digits); atan by halving the angle
+// (atan x = 2 atan(x / (1 + sqrt(1 + x^2)))) and its series; erf by its
+// Maclaurin series (computed with the digits the alternating terms cancel)
+// and erfc by its asymptotic series where that converges far enough;
+// lgamma by Stirling's series with Bernoulli numbers computed exactly
+// (Akiyama and Tanigawa's algorithm, in rationals), after shifting the
+// argument up, tgamma from it, and by the reflection formula below 1/2.
+//
+// Special values and errors follow C23 F.10 (as for the binary formats):
+// domain errors give a NaN with "invalid" (errno EDOM), poles an infinity
+// with "divide-by-zero", overflow and underflow their exceptions (ERANGE).
+// Exact results that C23 names have the preferred quantum exponent 0
+// (exp(0) = 1, log(1) = 0, ...), and some others are found exact: powers
+// with integer exponents, log10 of powers of 10, exp10 of integers, cbrt
+// and rootn of exact roots, hypot of exact square roots.
+// =============================================================================
+import "dec_env.ax" as env;
+import "decimal.ax" as d;
+import "ldouble.ax" as ld;
+
+extern "C" {
+    fn __axc_math_err(e: i32, flags: u32) void;
+}
+
+const EDOM: i32 = 33;
+const ERANGE: i32 = 34;
+
+// -----------------------------------------------------------------------------
+// Decimal floating values of a working precision
+// -----------------------------------------------------------------------------
+
+const WL: usize = 80;  // limbs (720 digits)
+
+/// (-1)^neg * (d[0] + d[1] 10^9 + ... + d[n - 1] 10^(9(n - 1))) * 10^e.
+pub struct F {
+    neg: bool,
+    e: i32,
+    n: usize,
+    d: [80]u32,
+}
+
+fn fzero() F {
+    let mut r: F = undefined;
+    r.neg = false;
+    r.e = 0;
+    r.n = 0;
+    return r;
+}
+
+fn view(a: *mut F) d.Nat {
+    return d.Nat.{ d: a.d[..], n: a.n };
+}
+
+fn iszero(a: *F) bool {
+    return a.n == 0;
+}
+
+fn fint(v: i64) F {
+    let mut r = fzero();
+    let mut m = @bit_cast(u64, v);
+    if v < 0 {
+        r.neg = true;
+        m = 0 -% m;
+    }
+    let mut x = view(&mut r);
+    d.nat_set_u64(&mut x, m);
+    r.n = x.n;
+    return r;
+}
+
+// The value of finite decimal x.
+fn fdec(x: d.Dec) F {
+    let mut r = fzero();
+    let mut v = view(&mut r);
+    d.nat_set_u2(&mut v, x.c);
+    r.n = v.n;
+    r.neg = x.neg;
+    r.e = x.q;
+    return r;
+}
+
+fn ndig(a: *F) i32 {
+    if a.n == 0 {
+        return 0;
+    }
+    let top = a.d[a.n - 1];
+    let mut k: i32 = 1;
+    let mut p: u32 = 10;
+    while (k < 9) and (top >= p) {
+        k += 1;
+        p *= 10;
+    }
+    return (9 * @int_cast(i32, a.n - 1)) + k;
+}
+
+// The exponent of a's leading digit (a nonzero): floor(log10 |a|).
+fn adj(a: *F) i32 {
+    return (a.e + ndig(a)) - 1;
+}
+
+// a rounded to at most wp digits (half to even).
+fn round(a: *mut F, wp: i32) void {
+    let nd = ndig(a);
+    if nd <= wp {
+        return;
+    }
+    let mut v = view(a);
+    let dr = d.shr10(&mut v, nd - wp);
+    a.e += nd - wp;
+    let odd = (v.n > 0) and ((v.d[0] & 1) != 0);
+    if (dr.d > 5) or ((dr.d == 5) and (dr.rest or odd)) {
+        d.nat_mulsm(&mut v, 1, 1);
+        if d.ndigits(&v) > wp {
+            _ = d.shr10(&mut v, 1);
+            a.e += 1;
+        }
+    }
+    a.n = v.n;
+}
+
+fn fneg(a: F) F {
+    let mut r = a;
+    if r.n > 0 {
+        r.neg = not r.neg;
+    }
+    return r;
+}
+
+fn fabs_(a: F) F {
+    let mut r = a;
+    r.neg = false;
+    return r;
+}
+
+// -1, 0, 1 as |a| <, =, > |b|.
+fn cmp_abs(a: *F, b: *F) i32 {
+    if iszero(a) or iszero(b) {
+        if iszero(a) and iszero(b) {
+            return 0;
+        }
+        if iszero(a) {
+            return -1;
+        }
+        return 1;
+    }
+    let ta = a.e + ndig(a);
+    let tb = b.e + ndig(b);
+    if ta != tb {
+        if ta < tb {
+            return -1;
+        }
+        return 1;
+    }
+    let mut x = a.*;
+    let mut y = b.*;
+    let m = @min(x.e, y.e);
+    let mut vx = view(&mut x);
+    let mut vy = view(&mut y);
+    d.shl10(&mut vx, x.e - m);
+    d.shl10(&mut vy, y.e - m);
+    return d.nat_cmp(&vx, &vy);
+}
+
+// -1, 0, 1 as a <, =, > b.
+fn cmp(a: *F, b: *F) i32 {
+    if iszero(a) and iszero(b) {
+        return 0;
+    }
+    let sa = sgn(a);
+    let sb = sgn(b);
+    if sa != sb {
+        if sa < sb {
+            return -1;
+        }
+        return 1;
+    }
+    let m = cmp_abs(a, b);
+    if sa < 0 {
+        return -m;
+    }
+    return m;
+}
+
+fn sgn(a: *F) i32 {
+    if iszero(a) {
+        return 0;
+    }
+    if a.neg {
+        return -1;
+    }
+    return 1;
+}
+
+/// a + b, to wp digits.
+fn add(a: F, b: F, wp: i32) F {
+    if iszero(&a) {
+        let mut r = b;
+        round(&mut r, wp);
+        return r;
+    }
+    if iszero(&b) {
+        let mut r = a;
+        round(&mut r, wp);
+        return r;
+    }
+    let mut x = a;
+    let mut y = b;
+    // y below the working precision's reach: x (with a unit far below for
+    // the rounding of the last digit; the working precision has guard digits)
+    let tx = x.e + ndig(&x);
+    let ty = y.e + ndig(&y);
+    if ty < ((tx - wp) - 3) {
+        round(&mut x, wp);
+        return x;
+    }
+    if tx < ((ty - wp) - 3) {
+        round(&mut y, wp);
+        return y;
+    }
+    let m = @min(x.e, y.e);
+    let mut vx = view(&mut x);
+    let mut vy = view(&mut y);
+    d.shl10(&mut vx, x.e - m);
+    d.shl10(&mut vy, y.e - m);
+    let mut r = fzero();
+    r.e = m;
+    let mut vr = view(&mut r);
+    if x.neg == y.neg {
+        d.nat_add(&mut vr, &vx, &vy);
+        r.neg = x.neg;
+    } else {
+        let k = d.nat_cmp(&vx, &vy);
+        if k == 0 {
+            return fzero();
+        }
+        if k > 0 {
+            d.nat_sub(&mut vr, &vx, &vy);
+            r.neg = x.neg;
+        } else {
+            d.nat_sub(&mut vr, &vy, &vx);
+            r.neg = y.neg;
+        }
+    }
+    r.n = vr.n;
+    round(&mut r, wp);
+    return r;
+}
+
+fn sub(a: F, b: F, wp: i32) F {
+    return add(a, fneg(b), wp);
+}
+
+/// a * b, to wp digits.
+fn mul(a: F, b: F, wp: i32) F {
+    if iszero(&a) or iszero(&b) {
+        return fzero();
+    }
+    let mut x = a;
+    let mut y = b;
+    round(&mut x, wp + 2);
+    round(&mut y, wp + 2);
+    let mut bt: [170]u32 = undefined;
+    let mut t = d.nat(bt[..]);
+    let vx = view(&mut x);
+    let vy = view(&mut y);
+    d.nat_mul(&mut t, &vx, &vy);
+    let mut e = x.e + y.e;
+    let nd = d.ndigits(&t);
+    if nd > wp {
+        // (rounded to wp digits, half to even)
+        let dr = d.shr10(&mut t, nd - wp);
+        e += nd - wp;
+        let odd = (t.n > 0) and ((t.d[0] & 1) != 0);
+        if (dr.d > 5) or ((dr.d == 5) and (dr.rest or odd)) {
+            d.nat_mulsm(&mut t, 1, 1);
+        }
+    }
+    let mut r = fzero();
+    for i in 0..t.n {
+        r.d[i] = t.d[i];
+    }
+    r.n = t.n;
+    r.e = e;
+    r.neg = x.neg != y.neg;
+    round(&mut r, wp);
+    return r;
+}
+
+/// a / b (b nonzero), to wp digits.
+fn div(a: F, b: F, wp: i32) F {
+    if iszero(&a) {
+        return fzero();
+    }
+    let mut x = a;
+    let mut y = b;
+    round(&mut y, wp + 2);
+    round(&mut x, wp + 2);
+    let k = @max(0, ((wp + 2) + ndig(&y)) - ndig(&x));
+    let mut bn: [170]u32 = undefined;
+    let mut num = d.nat(bn[..]);
+    let vx = view(&mut x);
+    d.nat_copy(&mut num, &vx);
+    d.shl10(&mut num, k);
+    let vy = view(&mut y);
+    let mut bq: [170]u32 = undefined;
+    let mut bm: [170]u32 = undefined;
+    let mut bu: [172]u32 = undefined;
+    let mut bv: [172]u32 = undefined;
+    let mut q = d.nat(bq[..]);
+    let mut m = d.nat(bm[..]);
+    let mut u = d.nat(bu[..]);
+    let mut v = d.nat(bv[..]);
+    d.nat_divmod(&mut q, &mut m, &num, &vy, &mut u, &mut v);
+    let mut r = fzero();
+    for i in 0..q.n {
+        r.d[i] = q.d[i];
+    }
+    r.n = q.n;
+    r.e = (x.e - y.e) - k;
+    r.neg = x.neg != y.neg;
+    round(&mut r, wp);
+    return r;
+}
+
+fn divi(a: F, k: i64, wp: i32) F {
+    return div(a, fint(k), wp);
+}
+
+fn muli(a: F, k: i64, wp: i32) F {
+    return mul(a, fint(k), wp);
+}
+
+/// sqrt(a) (a >= 0), to wp digits.
+fn sqrt(a: F, wp: i32) F {
+    if iszero(&a) {
+        return fzero();
+    }
+    let mut x = a;
+    round(&mut x, wp + 2);
+    let mut bn: [170]u32 = undefined;
+    let mut num = d.nat(bn[..]);
+    let vx = view(&mut x);
+    d.nat_copy(&mut num, &vx);
+    let mut e = x.e;
+    if (e & 1) != 0 {
+        d.shl10(&mut num, 1);
+        e -= 1;
+    }
+    let k = @max(0, (((2 * wp) + 4) - d.ndigits(&num)) / 2);
+    d.shl10(&mut num, 2 * k);
+    e -= 2 * k;
+    let mut br: [170]u32 = undefined;
+    let mut b1: [172]u32 = undefined;
+    let mut b2: [172]u32 = undefined;
+    let mut b3: [172]u32 = undefined;
+    let mut b4: [172]u32 = undefined;
+    let mut s = d.nat(br[..]);
+    let mut t1 = d.nat(b1[..]);
+    let mut t2 = d.nat(b2[..]);
+    let mut t3 = d.nat(b3[..]);
+    let mut t4 = d.nat(b4[..]);
+    d.nat_isqrt(&mut s, &num, &mut t1, &mut t2, &mut t3, &mut t4);
+    let mut r = fzero();
+    for i in 0..s.n {
+        r.d[i] = s.d[i];
+    }
+    r.n = s.n;
+    r.e = e / 2;
+    round(&mut r, wp);
+    return r;
+}
+
+// 10^k.
+fn pow10(k: i32) F {
+    let mut r = fint(1);
+    r.e = k;
+    return r;
+}
+
+// Is |a| below 10^-k (or zero)?
+fn tiny(a: *F, k: i32) bool {
+    return iszero(a) or (adj(a) < -k);
+}
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+// atanh(1/n) = sum 1 / ((2k + 1) n^(2k + 1)), to wp digits.
+fn atanh_inv(n: i64, wp: i32) F {
+    let w = wp + 5;
+    let mut t = divi(fint(1), n, w);  // 1 / n^(2k+1)
+    let mut s = t;
+    let n2 = n * n;
+    let mut k: i64 = 1;
+    loop {
+        t = divi(t, n2, w);
+        let term = divi(t, (2 * k) + 1, w);
+        if tiny(&term, w + 2) {
+            break;
+        }
+        s = add(s, term, w);
+        k += 1;
+    }
+    round(&mut s, wp);
+    return s;
+}
+
+// atan(1/n) = sum (-1)^k / ((2k + 1) n^(2k + 1)).
+fn atan_inv(n: i64, wp: i32) F {
+    let w = wp + 5;
+    let mut t = divi(fint(1), n, w);
+    let mut s = t;
+    let n2 = n * n;
+    let mut k: i64 = 1;
+    loop {
+        t = divi(t, n2, w);
+        let term = divi(t, (2 * k) + 1, w);
+        if tiny(&term, w + 2) {
+            break;
+        }
+        if (k & 1) != 0 {
+            s = sub(s, term, w);
+        } else {
+            s = add(s, term, w);
+        }
+        k += 1;
+    }
+    round(&mut s, wp);
+    return s;
+}
+
+fn ln2(wp: i32) F {
+    return muli(atanh_inv(3, wp + 2), 2, wp);
+}
+
+// ln 10 = 3 ln 2 + ln 1.25
+fn ln10(wp: i32) F {
+    let w = wp + 3;
+    let l2 = ln2(w);
+    let l125 = muli(atanh_inv(9, w), 2, w);
+    let mut r = add(muli(l2, 3, w), l125, w);
+    round(&mut r, wp);
+    return r;
+}
+
+// pi = 16 atan(1/5) - 4 atan(1/239)
+fn pi(wp: i32) F {
+    let w = wp + 3;
+    let mut r = sub(muli(atan_inv(5, w), 16, w), muli(atan_inv(239, w), 4, w), w);
+    round(&mut r, wp);
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// exp and log
+// -----------------------------------------------------------------------------
+
+/// e^x to wp digits (|x| below 10^7: larger arguments are the callers').
+fn exp(x: F, wp: i32) F {
+    if iszero(&x) {
+        return fint(1);
+    }
+    let w = wp + 8;
+    // x = k ln 10 + r, |r| <= ln 10 / 2
+    let mut k: i64 = 0;
+    let mut r = x;
+    if adj(&x) >= 0 {
+        let l10 = ln10(w + adj(&x) + 2);
+        let q = div(x, l10, 30);
+        k = nearest_int(&q);
+        r = sub(x, muli(l10, k, w + adj(&x) + 2), w);
+    }
+    // r / 2^10, the series, then ten squarings
+    let h = divi(r, 1024, w);
+    let mut s = fint(1);
+    let mut t = fint(1);
+    let mut n: i64 = 1;
+    loop {
+        t = divi(mul(t, h, w), n, w);
+        if tiny(&t, w + 2) {
+            break;
+        }
+        s = add(s, t, w);
+        n += 1;
+    }
+    for i in @as(i32, 0)..10 {
+        _ = i;
+        s = mul(s, s, w);
+    }
+    s.e += @int_cast(i32, k);
+    round(&mut s, wp);
+    return s;
+}
+
+// The integer nearest a (|a| below 2^62), halfway away from zero.
+fn nearest_int(a: *F) i64 {
+    if iszero(a) {
+        return 0;
+    }
+    let mut x = a.*;
+    let mut v = view(&mut x);
+    let mut r: i64 = 0;
+    if x.e >= 0 {
+        d.shl10(&mut v, x.e);
+        r = @bit_cast(i64, d.nat_u64(&v));
+    } else {
+        let dr = d.shr10(&mut v, -x.e);
+        r = @bit_cast(i64, d.nat_u64(&v));
+        if dr.d >= 5 {
+            r += 1;
+        }
+    }
+    if x.neg {
+        return -r;
+    }
+    return r;
+}
+
+/// ln x (x > 0) to wp digits.
+fn log(x: F, wp: i32) F {
+    let w = wp + 6;
+    // x = m 10^e10, m in [0.316, 3.16)
+    let mut m = x;
+    let mut e10 = adj(&x);
+    m.e -= e10;  // m in [1, 10)
+    if cmp(&m, &mf316()) >= 0 {
+        m.e -= 1;
+        e10 += 1;
+    }
+    let mut y = m;
+    let one = fint(1);
+    // square roots to near 1
+    let mut j: i32 = 0;
+    loop {
+        let dlt = sub(y, one, w);
+        if tiny(&dlt, 3) or (j >= 12) {
+            break;
+        }
+        y = sqrt(y, w);
+        j += 1;
+    }
+    // ln y = 2 atanh(z), z = (y - 1) / (y + 1)
+    let z = div(sub(y, one, w), add(y, one, w), w);
+    let z2 = mul(z, z, w);
+    let mut t = z;
+    let mut s = z;
+    let mut k: i64 = 1;
+    loop {
+        t = mul(t, z2, w);
+        let term = divi(t, (2 * k) + 1, w);
+        if tiny(&term, (w + 2) - adj_or(&s)) {
+            break;
+        }
+        s = add(s, term, w);
+        k += 1;
+    }
+    s = muli(s, @as(i64, 1) << @truncate(u32, @bit_cast(u32, j + 1)), w);
+    if e10 != 0 {
+        let wl = w + 6;
+        s = add(s, muli(ln10(wl), @as(i64, e10), wl), w);
+    }
+    round(&mut s, wp);
+    return s;
+}
+
+fn adj_or(a: *F) i32 {
+    if iszero(a) {
+        return 0;
+    }
+    return adj(a);
+}
+
+// 3.1622776601683793 (sqrt 10, rounded: the split of log's mantissa)
+fn mf316() F {
+    let mut r = fint(31622776601683793);
+    r.e = -16;
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// Results
+// -----------------------------------------------------------------------------
+
+// A function's result: the decimal value to round, or one already made.
+struct R {
+    kind: u32,  // 0: v (rounded with sticky), 1: w as it is, 2: v exact (pref)
+    v: F,
+    w: ld.W,
+    pref: i32,
+}
+
+fn rv(v: F) R {
+    return R.{ kind: 0, v: v, w: ld.W.{ lo: 0, hi: 0 }, pref: 0 };
+}
+
+fn rw(w: ld.W) R {
+    return R.{ kind: 1, v: fzero(), w: w, pref: 0 };
+}
+
+fn rexact(v: F, pref: i32) R {
+    return R.{ kind: 2, v: v, w: ld.W.{ lo: 0, hi: 0 }, pref: pref };
+}
+
+// The result r rounded to format f.
+fn finish(r: R, f: u32, c: *mut d.Ctx) ld.W {
+    if r.kind == 1 {
+        return r.w;
+    }
+    let mut v = r.v;
+    if iszero(&v) {
+        return d.zero(v.neg, r.pref, f);
+    }
+    let mut nat = view(&mut v);
+    return d.finish(v.neg, &mut nat, v.e, r.kind == 0, r.pref, f, c);
+}
+
+fn dom(f: u32, c: *mut d.Ctx) R {
+    return rw(d.invalid(f, c));
+}
+
+fn pole(neg: bool, f: u32, c: *mut d.Ctx) R {
+    c.flags = c.flags | d.F_DIVBYZERO;
+    return rw(d.inf(neg, f));
+}
+
+fn one_w(f: u32) ld.W {
+    return d.pack(false, d.u2(0, 1), 0, f);
+}
+
+// The working precision for format f: its digits and 12 more.
+fn wprec(f: u32) i32 {
+    return d.prec(f) + 12;
+}
+
+// |k| less a unit far below the working precision, with k's sign: a value
+// just inside +-1 or +-2 (tanh, erf of large arguments), so that the
+// rounding sees which side it is on.
+fn just_below(k: i64, wp: i32) F {
+    let mut r = sub(fint(@abs(k)), pow10(-(wp + 10)), wp + 15);
+    r.neg = k < 0;
+    return r;
+}
+
+// A value whose magnitude is too large for the format whatever its
+// digits: an overflow (rounded as the direction says).
+fn huge(neg: bool, f: u32) F {
+    let mut r = fint(1);
+    r.neg = neg;
+    r.e = d.emax(f) + 10;
+    return r;
+}
+
+fn tiny_v(neg: bool, f: u32) F {
+    let mut r = fint(1);
+    r.neg = neg;
+    r.e = d.qmin(f) - 10;
+    return r;
+}
+
+// -----------------------------------------------------------------------------
+// The exponential family
+// -----------------------------------------------------------------------------
+
+const E_EXP: u64 = 1;
+const E_EXP10: u64 = 2;
+const E_EXP10M1: u64 = 3;
+const E_EXP2: u64 = 4;
+const E_EXP2M1: u64 = 5;
+const E_EXPM1: u64 = 6;
+
+// e^(x b), b being e, 10 or 2 (base), minus 1 if m1.
+fn exp_base(x0: d.Dec, base: i32, m1: bool, f: u32) R {
+    let wp = wprec(f);
+    let x = fdec(x0);
+    if iszero(&x) {
+        if m1 {
+            return rexact(x, x0.q);  // (expm1(+-0) is +-0)
+        }
+        return rexact(fint(1), 0);
+    }
+    let a = adj(&x);
+    // beyond the range: e^x overflows or is 0 (or -1)
+    if a >= 6 {
+        if x.neg {
+            if m1 {
+                return rv(just_below(-1, wp));
+            }
+            return rv(tiny_v(false, f));
+        }
+        return rv(huge(false, f));
+    }
+    if (base == 10) and not m1 and (x0.q >= 0) {
+        // 10^n of an integer n: exact
+        let n = nearest_int(&x);
+        let mut r = fint(1);
+        r.e = @int_cast(i32, n);
+        return rexact(r, 0);
+    }
+    if (base == 2) and not m1 and (x0.q >= 0) and (a <= 3) {
+        // 2^n of an integer n: exact when it has few enough digits (else rounded)
+        let n = nearest_int(&x);
+        if (n >= 0) and (n < 400) {
+            let mut r = fint(1);
+            for i in 0..n {
+                _ = i;
+                r = muli(r, 2, 200);
+            }
+            if ndig(&r) <= 150 {
+                return rexact(r, 0);
+            }
+        }
+    }
+    // tiny arguments of the m1 forms: x ln b (and the next term)
+    let mut extra: i32 = 0;
+    if m1 and (a < 0) {
+        extra = -a;  // (digits cancelled by the - 1)
+    }
+    if m1 and (a < -(wp + 4)) {
+        let mut t = x;
+        if base == 10 {
+            t = mul(x, ln10(wp + 4), wp + 4);
+        } else if base == 2 {
+            t = mul(x, ln2(wp + 4), wp + 4);
+        }
+        // t + t^2/2, plenty at this size
+        return rv(add(t, divi(mul(t, t, wp + 4), 2, wp + 4), wp + 4));
+    }
+    let w = wp + extra + 4;
+    let mut t = x;
+    if base == 10 {
+        t = mul(x, ln10(w + a + 4), w + 2);
+    } else if base == 2 {
+        t = mul(x, ln2(w + a + 4), w + 2);
+    }
+    if adj(&t) >= 5 {
+        if t.neg {
+            if m1 {
+                return rv(just_below(-1, wp));
+            }
+            return rv(tiny_v(false, f));
+        }
+        return rv(huge(false, f));
+    }
+    let mut r = exp(t, w);
+    if m1 {
+        r = sub(r, fint(1), w);
+    }
+    return rv(r);
+}
+
+/// The exponential functions (exp, exp10, exp10m1, exp2, exp2m1, expm1).
+export fn __axc_dm_exp(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = y;
+    _ = z;
+    _ = n;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let m1 = (op == E_EXP10M1) or (op == E_EXP2M1) or (op == E_EXPM1);
+    let mut res = rw(ld.W.{ lo: 0, hi: 0 });
+    if d.is_nan(xd) {
+        res = rw(d.quiet(xd, f, &mut c));
+    } else if xd.cls == d.K_INF {
+        if xd.neg {
+            if m1 {
+                res = rw(d.pack(true, d.u2(0, 1), 0, f));
+            } else {
+                res = rw(d.zero(false, 0, f));
+            }
+        } else {
+            res = rw(d.inf(false, f));
+        }
+    } else {
+        let mut base: i32 = 0;
+        if (op == E_EXP10) or (op == E_EXP10M1) {
+            base = 10;
+        } else if (op == E_EXP2) or (op == E_EXP2M1) {
+            base = 2;
+        }
+        res = exp_base(xd, base, m1, f);
+    }
+    return done(r, res, f, &mut c, d.is_nan(xd));
+}
+
+// Rounds res to r, reports the errors (7.12.1) and raises the exceptions.
+fn done(r: *mut ld.W, res: R, f: u32, c: *mut d.Ctx, nan_in: bool) u64 {
+    let w = finish(res, f, c);
+    if f == d.D32 {
+        r.* = ld.W.{ lo: w.lo & 0xFFFF_FFFF, hi: 0 };
+    } else if f == d.D64 {
+        r.* = ld.W.{ lo: w.lo, hi: 0 };
+    } else {
+        r.* = w;
+    }
+    let fl = c.flags;
+    if fl != 0 {
+        let mut e: i32 = 0;
+        if ((fl & d.F_INVALID) != 0) and not nan_in {
+            e = EDOM;
+        } else if (fl & (d.F_DIVBYZERO | d.F_OVERFLOW | d.F_UNDERFLOW)) != 0 {
+            e = ERANGE;
+        }
+        __axc_math_err(e, fl);
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// The logarithms
+// -----------------------------------------------------------------------------
+
+const L_LOG: u64 = 1;
+const L_LOG10: u64 = 2;
+const L_LOG10P1: u64 = 3;
+const L_LOG1P: u64 = 4;
+const L_LOGP1: u64 = 5;
+const L_LOG2: u64 = 6;
+const L_LOG2P1: u64 = 7;
+
+// log_b(x) or log_b(1 + x) (p1), base 0 (e), 10 or 2.
+fn log_base(x0: d.Dec, base: i32, p1: bool, f: u32, c: *mut d.Ctx) R {
+    let wp = wprec(f);
+    let x = fdec(x0);
+    let mut y = x;
+    if p1 {
+        if iszero(&x) {
+            return rexact(x, x0.q);  // (log1p(+-0) is +-0)
+        }
+        let a = adj(&x);
+        if a < -(wp + 4) {
+            // log_b(1 + x) = x / ln b - ...: x / ln b, plenty at this size
+            let mut t = x;
+            if base == 10 {
+                t = div(x, ln10(wp + 4), wp + 4);
+            } else if base == 2 {
+                t = div(x, ln2(wp + 4), wp + 4);
+            }
+            return rv(sub(t, divi(mul(t, x, wp + 4), 2, wp + 4), wp + 4));
+        }
+        if a > (wp + 4) {
+            y = x;  // (1 + x is x, to the working precision)
+        } else {
+            y = add(fint(1), x, (wp + 8) + @max(0, -a) + @max(0, a));  // (exact)
+        }
+        let k = cmp(&y, &fzero());
+        if k < 0 {
+            return dom(f, c);
+        }
+        if k == 0 {
+            return pole(true, f, c);
+        }
+    } else {
+        if iszero(&x) {
+            return pole(true, f, c);
+        }
+        if x.neg {
+            return dom(f, c);
+        }
+    }
+    // exact: log(1) = 0; log10(10^n) = n; log2(2^n) = n
+    let one = fint(1);
+    if cmp(&y, &one) == 0 {
+        return rexact(fzero(), 0);
+    }
+    if base == 10 {
+        let mut t = y;
+        let mut vt = view(&mut t);
+        let tz = d.trailing_zeros(&vt);
+        _ = d.shr10(&mut vt, tz);
+        t.n = vt.n;
+        if (t.n == 1) and (t.d[0] == 1) {
+            return rexact(fint(@as(i64, t.e + tz)), 0);
+        }
+    }
+    if base == 2 {
+        let k = log2_exact(&y);
+        if k != 0x7FFF_FFFF {
+            return rexact(fint(@as(i64, k)), 0);
+        }
+    }
+    // the digits the result loses to its smallness near 1
+    let dl = sub(y, one, wp + 8);
+    let mut extra: i32 = 0;
+    if not iszero(&dl) and (adj(&dl) < 0) {
+        extra = -adj(&dl);
+    }
+    let w = wp + extra + 4;
+    let mut r = log(y, w);
+    if base == 10 {
+        r = div(r, ln10(w), w);
+    } else if base == 2 {
+        r = div(r, ln2(w), w);
+    }
+    return rv(r);
+}
+
+// k if y = 2^k exactly (|k| < 2^30), else 0x7FFFFFFF.
+fn log2_exact(y: *F) i32 {
+    let none: i32 = 0x7FFF_FFFF;
+    let mut t = y.*;
+    let mut vt = view(&mut t);
+    // y = c 10^e = c 5^e 2^e: c 5^e a power of two (e < 0: c divisible by 5^-e)
+    let mut k: i32 = t.e;
+    if t.e > 0 {
+        return none;  // (c 5^e has an odd factor)
+    }
+    if t.e < 0 {
+        let mut i = t.e;
+        while i < 0 {
+            if d.nat_divsm(&mut vt, 5) != 0 {
+                return none;
+            }
+            i += 1;
+        }
+    } else {
+        for i in 0..t.e {
+            _ = i;
+            d.nat_mulsm(&mut vt, 5, 0);
+        }
+    }
+    // vt a power of two?
+    while (vt.n > 1) or (vt.d[0] > 1) {
+        if (vt.d[0] & 1) != 0 {
+            return none;
+        }
+        _ = d.nat_divsm(&mut vt, 2);
+        k += 1;
+    }
+    if (vt.n == 1) and (vt.d[0] == 1) {
+        return k;
+    }
+    return none;
+}
+
+/// The logarithms (log, log10, log10p1, log1p, logp1, log2, log2p1).
+export fn __axc_dm_log(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = y;
+    _ = z;
+    _ = n;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let p1 = (op == L_LOG10P1) or (op == L_LOG1P) or (op == L_LOGP1) or (op == L_LOG2P1);
+    let mut base: i32 = 0;
+    if (op == L_LOG10) or (op == L_LOG10P1) {
+        base = 10;
+    } else if (op == L_LOG2) or (op == L_LOG2P1) {
+        base = 2;
+    }
+    let mut res = rw(ld.W.{ lo: 0, hi: 0 });
+    if d.is_nan(xd) {
+        res = rw(d.quiet(xd, f, &mut c));
+    } else if xd.cls == d.K_INF {
+        if xd.neg {
+            res = dom(f, &mut c);
+        } else {
+            res = rw(d.inf(false, f));
+        }
+    } else {
+        res = log_base(xd, base, p1, f, &mut c);
+    }
+    return done(r, res, f, &mut c, d.is_nan(xd));
+}
+
+// -----------------------------------------------------------------------------
+// Powers and roots
+// -----------------------------------------------------------------------------
+
+const P_CBRT: u64 = 1;
+const P_RSQRT: u64 = 2;
+const P_POW: u64 = 3;
+const P_POWR: u64 = 4;
+const P_HYPOT: u64 = 5;
+const P_POWN: u64 = 6;
+const P_ROOTN: u64 = 7;
+const P_COMPOUNDN: u64 = 8;
+
+// Is finite x an integer? Its parity in *odd.
+fn is_int(x: d.Dec, odd: *mut bool) bool {
+    odd.* = false;
+    if d.is_zero(x) {
+        return true;
+    }
+    if x.q >= 0 {
+        if x.q == 0 {
+            odd.* = (x.c.l & 1) != 0;
+        }
+        return true;
+    }
+    let mut ba: [8]u32 = undefined;
+    let mut a = d.nat(ba[..]);
+    d.nat_set_u2(&mut a, x.c);
+    let dr = d.shr10(&mut a, -x.q);
+    if (dr.d != 0) or dr.rest {
+        return false;
+    }
+    odd.* = (a.n > 0) and ((a.d[0] & 1) != 0);
+    return true;
+}
+
+// x^n exactly (n >= 0), when its coefficient has at most `lim` digits
+// (else false).
+fn pow_exact(x: F, n: i64, lim: i32, out: *mut F) bool {
+    let mut r = fint(1);
+    let mut b = x;
+    let mut k = n;
+    while k > 0 {
+        if (k & 1) != 0 {
+            if (ndig(&r) + ndig(&b)) > lim {
+                return false;
+            }
+            r = mul(r, b, 700);
+        }
+        k = k >> 1;
+        if k > 0 {
+            if (2 * ndig(&b)) > lim {
+                return false;
+            }
+            b = mul(b, b, 700);
+        }
+    }
+    out.* = r;
+    return true;
+}
+
+// |x|^y = e^(y ln |x|) (x nonzero finite, y finite), with the sign neg.
+fn pow_general(x: F, y: F, neg: bool, f: u32) R {
+    let wp = wprec(f);
+    let lx = log(fabs_(x), wp + 10);
+    let mut t = mul(y, lx, wp + 10);
+    if iszero(&t) {
+        let mut r = fint(1);
+        r.neg = neg;
+        return rv(add(r, tiny_v(false, f), wp + 30));
+    }
+    // the digits of t's integer part are the result's exponent's
+    let a = adj(&t);
+    if a >= 6 {
+        if t.neg {
+            return rv(tiny_v(neg, f));
+        }
+        return rv(huge(neg, f));
+    }
+    if a > 0 {
+        let w2 = wp + a + 4;
+        let lx2 = log(fabs_(x), w2 + 4);
+        t = mul(y, lx2, w2);
+    }
+    let mut r = exp(t, wp + 4);
+    r.neg = neg;
+    return rv(r);
+}
+
+// The exact power x^n (n an integer): a result with the preferred quantum
+// exponent floor(n q(x)), or nil (false) when not exact or too long.
+fn pow_int(x0: d.Dec, n: i64, f: u32, out: *mut R) bool {
+    if (n > 1000) or (n < -1000) {
+        return false;
+    }
+    let x = fdec(x0);
+    let mut p = fzero();
+    let an = @abs(n);
+    if not pow_exact(x, an, 300, &mut p) {
+        return false;
+    }
+    let pref = @int_cast(i32, @max(-1000000, @min(1000000, n * @as(i64, x0.q))));
+    if n >= 0 {
+        out.* = rexact(p, pref);
+        return true;
+    }
+    // 1 / x^|n|: exact when the division has no remainder
+    let wp = wprec(f) + 40;
+    let q = div(fint(1), p, wp);
+    let back = mul(q, p, wp + 50);
+    if cmp(&back, &fint(1)) == 0 {
+        out.* = rexact(q, pref);
+        return true;
+    }
+    out.* = rv(div(fint(1), p, wprec(f) + 4));
+    return true;
+}
+
+// pow (7.12.7.5; F.10.4.5 for the special values), and powr (pow_r:
+// 7.12.7.6, F.10.4.6: e^(y ln x), x >= 0).
+fn pow_fn(xd: d.Dec, yd: d.Dec, pow_r: bool, f: u32, c: *mut d.Ctx) R {
+    let one = rexact(fint(1), 0);
+    if pow_r {
+        // powr: x < 0, 0^0, inf^0, 1^inf and NaNs
+        if d.is_nan(xd) or d.is_nan(yd) {
+            return rw(d.nan2(xd, yd, f, c));
+        }
+        if xd.neg and not d.is_zero(xd) {
+            return dom(f, c);
+        }
+        let xz = d.is_zero(xd);
+        let xi = xd.cls == d.K_INF;
+        let yz = d.is_zero(yd);
+        let yi = yd.cls == d.K_INF;
+        let x1 = (xd.cls == d.K_FIN) and is_one(xd);
+        if (xz and yz) or (xi and yz) or (x1 and yi) {
+            return dom(f, c);
+        }
+        if xz {
+            if yd.neg {
+                if yi {
+                    return rw(d.inf(false, f));
+                }
+                return pole(false, f, c);
+            }
+            return rexact(fzero(), 0);
+        }
+        if x1 or yz {
+            return one;
+        }
+    }
+    let mut yodd = false;
+    let yint = (yd.cls == d.K_FIN) and is_int(yd, &mut yodd);
+    if (yd.cls == d.K_FIN) and d.is_zero(yd) {
+        return one;  // (pow(x, +-0) is 1, x a NaN too)
+    }
+    if (xd.cls == d.K_FIN) and is_one(xd) and not xd.neg {
+        return one;  // (pow(+1, y) is 1, y a NaN too)
+    }
+    if d.is_nan(xd) or d.is_nan(yd) {
+        return rw(d.nan2(xd, yd, f, c));
+    }
+    let neg_res = xd.neg and yint and yodd;
+    if d.is_zero(xd) {
+        if yd.neg {
+            if yd.cls == d.K_INF {
+                return rw(d.inf(false, f));
+            }
+            return pole(neg_res, f, c);
+        }
+        return rexact(zero_signed(neg_res), 0);
+    }
+    if xd.cls == d.K_INF {
+        if xd.neg {
+            if yd.neg {
+                return rexact(zero_signed(neg_res), 0);
+            }
+            return rw(d.inf(neg_res, f));
+        }
+        if yd.neg {
+            return rexact(fzero(), 0);
+        }
+        return rw(d.inf(false, f));
+    }
+    if yd.cls == d.K_INF {
+        let ax = fabs_(fdec(xd));
+        let k = cmp(&ax, &fint(1));
+        if k == 0 {
+            return one;  // (pow(-1, +-inf) is 1)
+        }
+        if (k < 0) == yd.neg {
+            return rw(d.inf(false, f));
+        }
+        return rexact(fzero(), 0);
+    }
+    if xd.neg and not yint {
+        return dom(f, c);
+    }
+    if yint {
+        let mut ve = fdec(yd);
+        if adj_or(&ve) < 4 {
+            let ny = nearest_int(&ve);
+            let mut res = one;
+            let mut xa = xd;
+            xa.neg = false;
+            if pow_int(xa, ny, f, &mut res) {
+                if neg_res {
+                    res.v.neg = true;
+                }
+                return res;
+            }
+        }
+        ve = fdec(yd);
+    }
+    return pow_general(fdec(xd), fdec(yd), neg_res, f);
+}
+
+fn zero_signed(neg: bool) F {
+    let mut z = fzero();
+    z.neg = neg;
+    return z;
+}
+
+fn is_one(x: d.Dec) bool {
+    let mut v = fdec(x);
+    v.neg = false;
+    return cmp(&v, &fint(1)) == 0;
+}
+
+// The n-th root of |x| exactly, if it has one with at most p digits (and
+// then its value), else an approximation.
+fn root_n(x: F, n: i64, f: u32, exact: *mut bool) F {
+    let wp = wprec(f) + 4;
+    // e^(ln |x| / n)
+    let lx = log(fabs_(x), wp + 4);
+    let r = exp(divi(lx, n, wp + 4), wp);
+    exact.* = false;
+    if (n > 0) and (n <= 64) {
+        // the approximation rounded to p digits (and its neighbours),
+        // raised to the n-th power: x?
+        let mut t = r;
+        round(&mut t, d.prec(f));
+        let mut tv = view(&mut t);
+        let tz = d.trailing_zeros(&tv);
+        _ = d.shr10(&mut tv, tz);
+        t.n = tv.n;
+        t.e += tz;
+        let mut p = fzero();
+        if pow_exact(t, n, 600, &mut p) and (cmp_abs(&p, &x) == 0) {
+            exact.* = true;
+            return t;
+        }
+    }
+    return r;
+}
+
+// hypot (7.12.7.4): sqrt(x^2 + y^2) of exact squares, correctly rounded.
+fn hypot(xd: d.Dec, yd: d.Dec, f: u32, c: *mut d.Ctx) R {
+    if (xd.cls == d.K_INF) or (yd.cls == d.K_INF) {
+        if (xd.cls == d.K_SNAN) or (yd.cls == d.K_SNAN) {
+            c.flags = c.flags | d.F_INVALID;
+        }
+        return rw(d.inf(false, f));
+    }
+    if d.is_nan(xd) or d.is_nan(yd) {
+        return rw(d.nan2(xd, yd, f, c));
+    }
+    let pref = @min(xd.q, yd.q);
+    let mut x = fdec(xd);
+    let mut y = fdec(yd);
+    x.neg = false;
+    y.neg = false;
+    if iszero(&x) {
+        return rexact(y, pref);
+    }
+    if iszero(&y) {
+        return rexact(x, pref);
+    }
+    // the squares exactly; one far below the other: the larger
+    let wp = wprec(f);
+    let s = add(mul(x, x, 300), mul(y, y, 300), 300);
+    let mut ex = false;
+    let r = sqrt_exact(s, wp, &mut ex);
+    if ex {
+        return rexact(r, pref);
+    }
+    return rv(r);
+}
+
+// sqrt(s) to wp digits, exact (and *ex) when s is a perfect square of at
+// most wp digits.
+fn sqrt_exact(s: F, wp: i32, ex: *mut bool) F {
+    let r = sqrt(s, wp + 4);
+    let mut t = r;
+    round(&mut t, wp);
+    let back = mul(t, t, 400);
+    ex.* = cmp(&back, &s) == 0;
+    if ex.* {
+        return t;
+    }
+    return r;
+}
+
+fn pow_family(op: u64, f: u32, xd: d.Dec, yd: d.Dec, n: i64, c: *mut d.Ctx) R {
+    let wp = wprec(f);
+    if op == P_POW {
+        return pow_fn(xd, yd, false, f, c);
+    }
+    if op == P_POWR {
+        return pow_fn(xd, yd, true, f, c);
+    }
+    if op == P_HYPOT {
+        return hypot(xd, yd, f, c);
+    }
+    if d.is_nan(xd) {
+        if (op == P_POWN) and (n == 0) {
+            return rexact(fint(1), 0);  // (pown(NaN, 0) is 1)
+        }
+        return rw(d.quiet(xd, f, c));
+    }
+    if op == P_CBRT {
+        if (xd.cls == d.K_INF) or d.is_zero(xd) {
+            return rw(d.repack(xd, f));
+        }
+        let x = fdec(xd);
+        let mut ex = false;
+        let mut r = root_n(x, 3, f, &mut ex);
+        r.neg = xd.neg;
+        if ex {
+            return rexact(r, floor_div(xd.q, 3));
+        }
+        return rv(r);
+    }
+    if op == P_RSQRT {
+        if xd.cls == d.K_INF {
+            if xd.neg {
+                return dom(f, c);
+            }
+            return rexact(fzero(), 0);
+        }
+        if d.is_zero(xd) {
+            return pole(xd.neg, f, c);
+        }
+        if xd.neg {
+            return dom(f, c);
+        }
+        let s = sqrt(fdec(xd), wp + 4);
+        return rv(div(fint(1), s, wp + 4));
+    }
+    if op == P_POWN {
+        if n == 0 {
+            return rexact(fint(1), 0);
+        }
+        let odd = (n & 1) != 0;
+        let neg = xd.neg and odd;
+        if d.is_zero(xd) {
+            if n < 0 {
+                return pole(neg, f, c);
+            }
+            return rexact(zero_signed(neg), 0);
+        }
+        if xd.cls == d.K_INF {
+            if n < 0 {
+                return rexact(zero_signed(neg), 0);
+            }
+            return rw(d.inf(neg, f));
+        }
+        let mut xa = xd;
+        xa.neg = false;
+        let mut res = rexact(fint(1), 0);
+        if pow_int(xa, n, f, &mut res) {
+            res.v.neg = neg;
+            return res;
+        }
+        return pow_general(fdec(xa), fint(n), neg, f);
+    }
+    if op == P_ROOTN {
+        if n == 0 {
+            return dom(f, c);
+        }
+        let odd = (n & 1) != 0;
+        if xd.neg and not odd and not d.is_zero(xd) {
+            return dom(f, c);
+        }
+        if d.is_zero(xd) {
+            if n < 0 {
+                return pole(xd.neg and odd, f, c);
+            }
+            return rexact(zero_signed(xd.neg and odd), 0);
+        }
+        if xd.cls == d.K_INF {
+            if n < 0 {
+                return rexact(zero_signed(xd.neg), 0);
+            }
+            return rw(d.inf(xd.neg, f));
+        }
+        let x = fdec(xd);
+        let an = @abs(n);
+        let mut ex = false;
+        let mut r = root_n(x, an, f, &mut ex);
+        r.neg = xd.neg;
+        if n < 0 {
+            r = div(fint(1), r, wp + 4);
+            return rv(r);
+        }
+        if ex {
+            return rexact(r, 0);
+        }
+        return rv(r);
+    }
+    // compoundn (7.12.7.2): (1 + x)^n, x >= -1
+    if xd.cls == d.K_INF {
+        if xd.neg {
+            return dom(f, c);
+        }
+        if n == 0 {
+            return rexact(fint(1), 0);
+        }
+        if n < 0 {
+            return rexact(fzero(), 0);
+        }
+        return rw(d.inf(false, f));
+    }
+    let x = fdec(xd);
+    let k = cmp(&x, &fint(-1));
+    if k < 0 {
+        return dom(f, c);
+    }
+    if n == 0 {
+        return rexact(fint(1), 0);
+    }
+    if k == 0 {
+        if n < 0 {
+            return pole(false, f, c);
+        }
+        return rexact(fzero(), 0);
+    }
+    if iszero(&x) {
+        return rexact(fint(1), 0);
+    }
+    // e^(n log1p(x)), the logarithm with the digits n's size needs
+    let a = adj(&x);
+    let mut digs_n: i32 = 1;
+    let mut nn = @abs(n);
+    while nn >= 10 {
+        nn = nn / 10;
+        digs_n += 1;
+    }
+    let w = wp + digs_n + 6 + @max(0, -a);
+    if a < -(w + 2) {
+        return rv(add(fint(1), muli(x, n, w), w));
+    }
+    let mut y = x;
+    if a <= (w + 4) {
+        y = add(fint(1), x, w + @max(0, -a) + @max(0, a) + 4);
+    }
+    let lg = log(y, w);
+    let t = muli(lg, n, w);
+    let at = adj_or(&t);
+    if at >= 6 {
+        if t.neg {
+            return rv(tiny_v(false, f));
+        }
+        return rv(huge(false, f));
+    }
+    return rv(exp(t, wp + 4));
+}
+
+fn floor_div(a: i32, b: i32) i32 {
+    let q = a / b;
+    if ((a % b) != 0) and (a < 0) {
+        return q - 1;
+    }
+    return q;
+}
+
+/// The powers and roots (cbrt, rsqrt, pow, powr, hypot, pown, rootn,
+/// compoundn).
+export fn __axc_dm_pow(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = z;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let mut yd = d.unpack(one_w(f), f);
+    let binary = (op == P_POW) or (op == P_POWR) or (op == P_HYPOT);
+    if binary {
+        yd = d.unpack(y.*, f);
+    }
+    let res = pow_family(op, f, xd, yd, n, &mut c);
+    return done(r, res, f, &mut c, d.is_nan(xd) or (binary and d.is_nan(yd)));
+}
+
+// -----------------------------------------------------------------------------
+// The trigonometric functions
+// -----------------------------------------------------------------------------
+
+const T_COS: u64 = 1;
+const T_SIN: u64 = 2;
+const T_TAN: u64 = 3;
+const T_COSPI: u64 = 4;
+const T_SINPI: u64 = 5;
+const T_TANPI: u64 = 6;
+
+// sin r and cos r (|r| <= pi/4 or so), to wp digits.
+fn sincos(r: F, wp: i32, s: *mut F, co: *mut F) void {
+    let w = wp + 4;
+    let r2 = mul(r, r, w);
+    // sin: r - r^3/3! + ...
+    let mut t = r;
+    let mut ss = r;
+    let mut k: i64 = 1;
+    loop {
+        t = divi(mul(t, r2, w), (2 * k) * ((2 * k) + 1), w);
+        if tiny(&t, (w + 2) - adj_or(&ss)) {
+            break;
+        }
+        if (k & 1) != 0 {
+            ss = sub(ss, t, w);
+        } else {
+            ss = add(ss, t, w);
+        }
+        k += 1;
+    }
+    let mut u = fint(1);
+    let mut cs = fint(1);
+    k = 1;
+    loop {
+        u = divi(mul(u, r2, w), ((2 * k) - 1) * (2 * k), w);
+        if tiny(&u, w + 2) {
+            break;
+        }
+        if (k & 1) != 0 {
+            cs = sub(cs, u, w);
+        } else {
+            cs = add(cs, u, w);
+        }
+        k += 1;
+    }
+    s.* = ss;
+    co.* = cs;
+}
+
+// x = k pi/2 + r, |r| <= pi/4: r to wp digits and k mod 4 (x finite).
+fn reduce_half_pi(x: F, wp: i32, r: *mut F, quad: *mut i64) void {
+    let a = adj_or(&x);
+    if a < 0 {
+        r.* = x;
+        quad.* = 0;
+        return;
+    }
+    if a > 16 {
+        // (a quotient beyond 64 bits: in natural numbers)
+        reduce_big(x, wp, r, quad);
+        return;
+    }
+    // pi with a's digits, the working ones and guards (more when the
+    // remainder cancels more)
+    let mut guard: i32 = 20;
+    loop {
+        let w = wp + a + guard;
+        let hp = divi(pi(w + 2), 2, w + 2);
+        let q = div(x, hp, a + 4);
+        let k = nearest_int(&q);
+        let rr = sub(x, muli(hp, k, w + 2), w);
+        let lost = a - adj_or(&rr);
+        if iszero(&rr) or ((lost + 10) < guard) or (guard >= 320) {
+            r.* = rr;
+            quad.* = k & 3;
+            round(r, wp);
+            return;
+        }
+        guard = guard * 2;
+    }
+}
+
+// The reduction of a large x (|x| >= 10^17): in natural numbers, with pi/2
+// to as many digits after the point as x's integer part has digits, plus
+// the working ones and guards: P = floor(pi/2 * 10^D); X = |x| 10^D; X mod P
+// and the quotient's last two bits.
+fn reduce_big(x: F, wp: i32, r: *mut F, quad: *mut i64) void {
+    let a = adj(&x);
+    let dd = (a + wp) + 60;
+    // pi/2 * 10^D by Machin's formula in fixed point
+    let mut bp: [1500]u32 = undefined;
+    let mut pp = d.nat(bp[..]);
+    machin_fixed(&mut pp, dd);
+    _ = d.nat_divsm(&mut pp, 2);
+    // X = c * 10^(q + D)
+    let mut bx: [1500]u32 = undefined;
+    let mut xx = d.nat(bx[..]);
+    let mut xv = x;
+    let vx = view(&mut xv);
+    d.nat_copy(&mut xx, &vx);
+    d.shl10(&mut xx, xv.e + dd);
+    let mut bq: [1500]u32 = undefined;
+    let mut bm: [1500]u32 = undefined;
+    let mut bu: [1502]u32 = undefined;
+    let mut bv: [1502]u32 = undefined;
+    let mut qq = d.nat(bq[..]);
+    let mut mm = d.nat(bm[..]);
+    let mut uu = d.nat(bu[..]);
+    let mut vv = d.nat(bv[..]);
+    d.nat_divmod(&mut qq, &mut mm, &xx, &pp, &mut uu, &mut vv);
+    let mut k = @as(i64, qq.d[0] & 3);
+    if qq.n == 0 {
+        k = 0;
+    }
+    // r = mm / 10^D, centered: if r > pi/4, r - pi/2 (k + 1)
+    let mut twice = d.nat(bu[..]);
+    d.nat_copy(&mut twice, &mm);
+    d.nat_mulsm(&mut twice, 2, 0);
+    let mut rr = fzero();
+    if d.nat_cmp(&twice, &pp) > 0 {
+        d.nat_sub(&mut mm, &pp, &mm);
+        rr.neg = true;
+        k = (k + 1) & 3;
+    }
+    // (its top digits, enough of them)
+    let nd = d.ndigits(&mm);
+    let keep = wp + 10;
+    let mut e = -dd;
+    if nd > keep {
+        _ = d.shr10(&mut mm, nd - keep);
+        e += nd - keep;
+    }
+    for i in 0..mm.n {
+        rr.d[i] = mm.d[i];
+    }
+    rr.n = mm.n;
+    rr.e = e;
+    if x.neg {
+        rr = fneg(rr);
+        k = (4 - k) & 3;
+    }
+    r.* = rr;
+    quad.* = k;
+}
+
+// p = floor(pi * 10^D) (Machin: 16 atan(1/5) - 4 atan(1/239)), in fixed point.
+fn machin_fixed(p: *mut d.Nat, dd: i32) void {
+    let mut ba: [1500]u32 = undefined;
+    let mut bb: [1500]u32 = undefined;
+    let mut a = d.nat(ba[..]);
+    let mut b = d.nat(bb[..]);
+    atan_fixed(&mut a, 5, dd + 8);
+    d.nat_mulsm(&mut a, 16, 0);
+    atan_fixed(&mut b, 239, dd + 8);
+    d.nat_mulsm(&mut b, 4, 0);
+    d.nat_sub(p, &a, &b);
+    _ = d.shr10(p, 8);
+}
+
+// s = atan(1/n) * 10^D (truncated terms; error a few units).
+fn atan_fixed(s: *mut d.Nat, n: u32, dd: i32) void {
+    let mut bt: [1500]u32 = undefined;
+    let mut bu: [1500]u32 = undefined;
+    let mut t = d.nat(bt[..]);
+    let mut u = d.nat(bu[..]);
+    // t = 10^D / n
+    d.nat_set_u64(&mut t, 1);
+    d.shl10(&mut t, dd);
+    _ = d.nat_divsm(&mut t, n);
+    d.nat_copy(s, &t);
+    let n2 = n * n;
+    let mut k: u32 = 1;
+    let mut bw: [1500]u32 = undefined;
+    let mut w = d.nat(bw[..]);
+    loop {
+        _ = d.nat_divsm(&mut t, n2);
+        if t.n == 0 {
+            break;
+        }
+        d.nat_copy(&mut u, &t);
+        _ = d.nat_divsm(&mut u, (2 * k) + 1);
+        if (k & 1) != 0 {
+            d.nat_sub(&mut w, s, &u);
+        } else {
+            d.nat_add(&mut w, s, &u);
+        }
+        d.nat_copy(s, &w);
+        k += 1;
+    }
+}
+
+// sin or cos (cos_: true) or tan (both) of finite x.
+fn trig(x: F, which: u64, f: u32) F {
+    let wp = wprec(f) + 4;
+    let mut r = fzero();
+    let mut k: i64 = 0;
+    reduce_half_pi(x, wp, &mut r, &mut k);
+    let mut s = fzero();
+    let mut co = fzero();
+    sincos(r, wp, &mut s, &mut co);
+    // sin(r + k pi/2): s, c, -s, -c; cos: c, -s, -c, s
+    let mut sv = s;
+    let mut cv = co;
+    if k == 1 {
+        sv = co;
+        cv = fneg(s);
+    } else if k == 2 {
+        sv = fneg(s);
+        cv = fneg(co);
+    } else if k == 3 {
+        sv = fneg(co);
+        cv = s;
+    }
+    if which == T_SIN {
+        return sv;
+    }
+    if which == T_COS {
+        return cv;
+    }
+    return div(sv, cv, wp);
+}
+
+// sinpi, cospi, tanpi (7.12.4.13ff): of x reduced exactly modulo 2.
+fn trig_pi(xd: d.Dec, which: u64, f: u32, c: *mut d.Ctx) R {
+    let wp = wprec(f) + 4;
+    let neg = xd.neg;
+    // |x| mod 2, exactly: x = c 10^q
+    let mut t = fdec(xd);
+    t.neg = false;
+    if xd.q >= 0 {
+        // an integer: sinpi(n) = +-0, cospi(n) = +-1, tanpi(n) = +-0
+        let mut odd = false;
+        _ = is_int(xd, &mut odd);
+        if which == T_COSPI {
+            return rexact(fint(u_pick(odd, -1, 1)), 0);
+        }
+        let mut z = fzero();
+        z.neg = neg != (odd and (which == T_TANPI));
+        return rexact(z, 0);
+    }
+    // the fraction modulo 2: c mod (2 10^-q)
+    let mut ba: [40]u32 = undefined;
+    let mut mm = d.nat(ba[..]);
+    let mut bb: [40]u32 = undefined;
+    let mut md = d.nat(bb[..]);
+    let mut bq: [40]u32 = undefined;
+    let mut qq = d.nat(bq[..]);
+    let mut bu: [42]u32 = undefined;
+    let mut bv: [42]u32 = undefined;
+    let mut uu = d.nat(bu[..]);
+    let mut vv = d.nat(bv[..]);
+    let vt = view(&mut t);
+    d.nat_set_u64(&mut md, 2);
+    if -xd.q > 300 {
+        // (a tiny argument: sin(pi x) ~ pi x)
+        let p = mul(pi(wp + 2), t, wp);
+        if which == T_COSPI {
+            return rv(sub(fint(1), divi(mul(p, p, wp), 2, wp), wp + 4));
+        }
+        let mut pv = p;
+        pv.neg = neg;
+        return rv(pv);
+    }
+    d.shl10(&mut md, -xd.q);
+    d.nat_divmod(&mut qq, &mut mm, &vt, &md, &mut uu, &mut vv);
+    let mut fr = fzero();
+    for i in 0..mm.n {
+        fr.d[i] = mm.d[i];
+    }
+    fr.n = mm.n;
+    fr.e = xd.q;
+    // fr in [0, 2): fold to [0, 1/2] with the signs of the quadrants
+    let one = fint(1);
+    let half = divi(one, 2, 4);
+    let mut sneg = neg;    // sin's sign
+    let mut cneg = false;  // cos's sign
+    if cmp(&fr, &one) >= 0 {
+        fr = sub(fr, one, wp);  // (sin(pi(1 + y)) = -sin(pi y), cos the same)
+        sneg = not sneg;
+        cneg = true;
+    }
+    let mut swapped = false;
+    if cmp(&fr, &half) > 0 {
+        fr = sub(one, fr, wp);  // (sin(pi(1 - y)) = sin(pi y), cos = -cos)
+        cneg = not cneg;
+    }
+    // y in [0, 1/2]: sin(pi y), cos(pi y); y = 1/2 exact
+    if cmp(&fr, &half) == 0 {
+        swapped = true;
+    }
+    if iszero(&fr) {
+        if which == T_COSPI {
+            return rexact(fint(u_pick(cneg, -1, 1)), 0);
+        }
+        let mut z = fzero();
+        z.neg = sneg != (cneg and (which == T_TANPI));
+        return rexact(z, 0);
+    }
+    if swapped {
+        // y = 1/2: sin = +-1, cos = 0, tan a pole
+        if which == T_SINPI {
+            return rexact(fint(u_pick(sneg, -1, 1)), 0);
+        }
+        if which == T_COSPI {
+            return rexact(fzero(), 0);
+        }
+        return pole(sneg, f, c);
+    }
+    let ang = mul(pi(wp + 2), fr, wp);
+    let mut s = fzero();
+    let mut co = fzero();
+    sincos(ang, wp, &mut s, &mut co);
+    s.neg = sneg;
+    co.neg = cneg;
+    if which == T_SINPI {
+        return rv(s);
+    }
+    if which == T_COSPI {
+        return rv(co);
+    }
+    return rv(div(s, co, wp));
+}
+
+fn u_pick(c: bool, a: i64, b: i64) i64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+/// The trigonometric functions (cos, sin, tan, cospi, sinpi, tanpi).
+export fn __axc_dm_trig(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = y;
+    _ = z;
+    _ = n;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let mut res = rw(ld.W.{ lo: 0, hi: 0 });
+    if d.is_nan(xd) {
+        res = rw(d.quiet(xd, f, &mut c));
+    } else if xd.cls == d.K_INF {
+        res = dom(f, &mut c);
+    } else if op >= T_COSPI {
+        res = trig_pi(xd, op, f, &mut c);
+    } else if d.is_zero(xd) {
+        if op == T_COS {
+            res = rexact(fint(1), 0);
+        } else {
+            res = rw(d.repack(xd, f));  // (sin and tan of +-0)
+        }
+    } else {
+        res = rv(trig(fdec(xd), op, f));
+    }
+    return done(r, res, f, &mut c, d.is_nan(xd));
+}
+
+// -----------------------------------------------------------------------------
+// The inverse trigonometric functions
+// -----------------------------------------------------------------------------
+
+const A_ACOS: u64 = 1;
+const A_ASIN: u64 = 2;
+const A_ATAN: u64 = 3;
+const A_ACOSPI: u64 = 4;
+const A_ASINPI: u64 = 5;
+const A_ATANPI: u64 = 6;
+const A_ATAN2: u64 = 7;
+const A_ATAN2PI: u64 = 8;
+
+// atan x to wp digits.
+fn atan(x: F, wp: i32) F {
+    if iszero(&x) {
+        return x;
+    }
+    let w = wp + 6;
+    let one = fint(1);
+    let mut y = x;
+    let mut inv = false;
+    if cmp_abs(&y, &one) > 0 {
+        y = div(one, y, w);
+        inv = true;
+    }
+    // halve the angle until it is small: y / (1 + sqrt(1 + y^2))
+    let mut j: i32 = 0;
+    while not tiny(&y, 2) and (j < 10) {
+        y = div(y, add(one, sqrt(add(one, mul(y, y, w), w), w), w), w);
+        j += 1;
+    }
+    let y2 = mul(y, y, w);
+    let mut t = y;
+    let mut s = y;
+    let mut k: i64 = 1;
+    loop {
+        t = mul(t, y2, w);
+        let term = divi(t, (2 * k) + 1, w);
+        if tiny(&term, (w + 2) - adj_or(&s)) {
+            break;
+        }
+        if (k & 1) != 0 {
+            s = sub(s, term, w);
+        } else {
+            s = add(s, term, w);
+        }
+        k += 1;
+    }
+    s = muli(s, @as(i64, 1) << @truncate(u32, @bit_cast(u32, j)), w);
+    if inv {
+        // atan x = +-pi/2 - atan(1/x)
+        let mut hp = divi(pi(w), 2, w);
+        hp.neg = x.neg;
+        s = sub(hp, s, w);
+    }
+    round(&mut s, wp);
+    return s;
+}
+
+// atan2(y, x) (finite, not both zero) to wp digits.
+fn atan2(y: F, x: F, wp: i32) F {
+    let w = wp + 4;
+    if iszero(&x) {
+        let mut hp = divi(pi(w), 2, w);
+        hp.neg = y.neg;
+        return hp;
+    }
+    if iszero(&y) {
+        if x.neg {
+            let mut p = pi(w);
+            p.neg = y.neg;
+            return p;
+        }
+        return y;
+    }
+    let a = atan(div(y, x, w + 2), w);
+    if not x.neg {
+        return a;
+    }
+    let mut p = pi(w);
+    p.neg = y.neg;
+    return add(a, p, w);
+}
+
+// The inverse trigonometric functions of xd (and yd for atan2).
+fn atrig(op: u64, xd: d.Dec, yd: d.Dec, f: u32, c: *mut d.Ctx) R {
+    let wp = wprec(f) + 4;
+    let by_pi = (op == A_ACOSPI) or (op == A_ASINPI) or (op == A_ATANPI) or (op == A_ATAN2PI);
+    if (op == A_ATAN2) or (op == A_ATAN2PI) {
+        // atan2(y, x): xd is y, yd is x (C's argument order)
+        let yy = xd;
+        let xx = yd;
+        if d.is_nan(yy) or d.is_nan(xx) {
+            return rw(d.nan2(yy, xx, f, c));
+        }
+        let yinf = yy.cls == d.K_INF;
+        let xinf = xx.cls == d.K_INF;
+        // (F.10.1.4: the special values, as quarter turns q/4 of pi)
+        let mut quarters: i64 = 99;
+        if yinf and xinf {
+            quarters = u_pick(xx.neg, 3, 1);
+        } else if yinf {
+            quarters = 2;
+        } else if xinf {
+            if xx.neg {
+                quarters = 4;
+            } else {
+                let mut z = fzero();
+                z.neg = yy.neg;
+                return rexact(z, 0);
+            }
+        } else if d.is_zero(yy) {
+            let xneg = xx.neg;
+            if xneg {
+                quarters = 4;
+            } else {
+                return rw(d.zero(yy.neg, 0, f));
+            }
+        } else if d.is_zero(xx) {
+            quarters = 2;
+        }
+        if quarters != 99 {
+            // quarters/4 of pi (or of 1 for atan2pi), the sign of y
+            if by_pi {
+                let mut v = divi(fint(quarters), 4, 30);
+                v.neg = yy.neg;
+                return rexact(v, 0);
+            }
+            let mut v = divi(muli(pi(wp), quarters, wp), 4, wp);
+            v.neg = yy.neg;
+            return rv(v);
+        }
+        let mut v = atan2(fdec(yy), fdec(xx), wp);
+        if by_pi {
+            v = div(v, pi(wp), wp);
+        }
+        return rv(v);
+    }
+    if d.is_nan(xd) {
+        return rw(d.quiet(xd, f, c));
+    }
+    if (op == A_ATAN) or (op == A_ATANPI) {
+        if xd.cls == d.K_INF {
+            if op == A_ATANPI {
+                let mut h = divi(fint(1), 2, 4);
+                h.neg = xd.neg;
+                return rexact(h, 0);
+            }
+            let mut hp = divi(pi(wp), 2, wp);
+            hp.neg = xd.neg;
+            return rv(hp);
+        }
+        if d.is_zero(xd) {
+            return rw(d.repack(xd, f));
+        }
+        let mut v = atan(fdec(xd), wp);
+        if op == A_ATANPI {
+            v = div(v, pi(wp), wp);
+        }
+        return rv(v);
+    }
+    // asin, acos: |x| <= 1
+    if xd.cls == d.K_INF {
+        return dom(f, c);
+    }
+    let x = fdec(xd);
+    let one = fint(1);
+    let k = cmp_abs(&x, &one);
+    if k > 0 {
+        return dom(f, c);
+    }
+    let is_asin = (op == A_ASIN) or (op == A_ASINPI);
+    if is_asin {
+        if d.is_zero(xd) {
+            return rw(d.repack(xd, f));
+        }
+        let mut v = fzero();
+        if k == 0 {
+            v = divi(pi(wp), 2, wp);
+            v.neg = xd.neg;
+            if by_pi {
+                let mut h = divi(one, 2, 4);
+                h.neg = xd.neg;
+                return rexact(h, 0);
+            }
+        } else {
+            // asin x = atan(x / sqrt(1 - x^2)), 1 - x^2 exact
+            let dd = sub(one, mul(x, x, 400), 400);
+            v = atan(div(x, sqrt(dd, wp + 4), wp + 4), wp);
+        }
+        if by_pi {
+            v = div(v, pi(wp), wp);
+        }
+        return rv(v);
+    }
+    // acos x = 2 atan(sqrt((1 - x) / (1 + x))): exact at 1 (0) and -1 (pi)
+    if k == 0 {
+        if not xd.neg {
+            return rexact(fzero(), 0);
+        }
+        if by_pi {
+            return rexact(fint(1), 0);
+        }
+        return rv(pi(wp));
+    }
+    let num = sub(one, x, 400);
+    let den = add(one, x, 400);
+    let mut v = muli(atan(sqrt(div(num, den, wp + 4), wp + 4), wp), 2, wp);
+    if by_pi {
+        v = div(v, pi(wp), wp);
+    }
+    return rv(v);
+}
+
+/// The inverse trigonometric functions (acos, asin, atan, acospi, asinpi,
+/// atanpi, atan2, atan2pi).
+export fn __axc_dm_atrig(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = z;
+    _ = n;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let mut yd = d.unpack(one_w(f), f);
+    let binary = op >= A_ATAN2;
+    if binary {
+        yd = d.unpack(y.*, f);
+    }
+    let res = atrig(op, xd, yd, f, &mut c);
+    return done(r, res, f, &mut c, d.is_nan(xd) or (binary and d.is_nan(yd)));
+}
+
+// -----------------------------------------------------------------------------
+// The hyperbolic functions
+// -----------------------------------------------------------------------------
+
+const H_COSH: u64 = 1;
+const H_SINH: u64 = 2;
+const H_TANH: u64 = 3;
+const H_ACOSH: u64 = 4;
+const H_ASINH: u64 = 5;
+const H_ATANH: u64 = 6;
+
+fn hyp(op: u64, xd: d.Dec, f: u32, c: *mut d.Ctx) R {
+    let wp = wprec(f) + 4;
+    if d.is_nan(xd) {
+        return rw(d.quiet(xd, f, c));
+    }
+    if xd.cls == d.K_INF {
+        if op == H_COSH {
+            return rw(d.inf(false, f));
+        }
+        if (op == H_SINH) or (op == H_ASINH) {
+            return rw(d.inf(xd.neg, f));
+        }
+        if op == H_TANH {
+            return rexact(fint(u_pick(xd.neg, -1, 1)), 0);
+        }
+        if op == H_ACOSH {
+            if xd.neg {
+                return dom(f, c);
+            }
+            return rw(d.inf(false, f));
+        }
+        return dom(f, c);  // (atanh)
+    }
+    let x = fdec(xd);
+    if iszero(&x) {
+        if op == H_COSH {
+            return rexact(fint(1), 0);
+        }
+        if op == H_ACOSH {
+            return dom(f, c);
+        }
+        return rw(d.repack(xd, f));
+    }
+    let a = adj(&x);
+    let one = fint(1);
+    if (op == H_COSH) or (op == H_SINH) or (op == H_TANH) {
+        if a >= 6 {
+            if op == H_TANH {
+                return rv(just_below(u_pick(x.neg, -1, 1), wp));
+            }
+            if op == H_COSH {
+                return rv(huge(false, f));
+            }
+            return rv(huge(x.neg, f));
+        }
+        let extra = @max(0, -a) + 2;
+        let w = wp + extra;
+        if (op == H_TANH) and (cmp_abs(&x, &fint(@as(i64, wp))) > 0) {
+            // (e^-2|x| below the precision: just inside +-1, rounded)
+            return rv(just_below(u_pick(x.neg, -1, 1), wp));
+        }
+        if a < -(wp + 2) {
+            if op == H_COSH {
+                return rv(add(one, tiny_v(false, f), wp + 30));
+            }
+            // sinh x ~ tanh x ~ x
+            let w2 = wp + 4;
+            let t = divi(mul(mul(x, x, w2), x, w2), 6, w2);
+            if op == H_SINH {
+                return rv(add(x, t, w2));
+            }
+            return rv(sub(x, t, w2));
+        }
+        let ex = exp(x, w);
+        let enx = div(one, ex, w);
+        if op == H_COSH {
+            return rv(divi(add(ex, enx, w), 2, w));
+        }
+        let s = divi(sub(ex, enx, w), 2, w);
+        if op == H_SINH {
+            return rv(s);
+        }
+        let ch = divi(add(ex, enx, w), 2, w);
+        return rv(div(s, ch, w));
+    }
+    if op == H_ACOSH {
+        let k = cmp(&x, &one);
+        if k < 0 {
+            return dom(f, c);
+        }
+        if k == 0 {
+            return rexact(fzero(), 0);
+        }
+        // ln(x + sqrt(x^2 - 1)), x^2 - 1 exact; near 1 more digits
+        let dd = sub(mul(x, x, 400), one, 400);
+        let mut extra: i32 = 0;
+        let dl = sub(x, one, 400);
+        if adj(&dl) < 0 {
+            extra = -adj(&dl);
+        }
+        let w = wp + extra + 4;
+        let s = add(x, sqrt(dd, w), w);
+        return rv(log(s, w));
+    }
+    if op == H_ASINH {
+        // sign * ln(|x| + sqrt(x^2 + 1))
+        let ax = fabs_(x);
+        let extra = @max(0, -a) + 2;
+        let w = wp + extra;
+        if a < -(wp + 2) {
+            let w2 = wp + 4;
+            return rv(sub(x, divi(mul(mul(x, x, w2), x, w2), 6, w2), w2));
+        }
+        let s = add(ax, sqrt(add(mul(ax, ax, 400), one, 400), w), w);
+        let mut v = log(s, w);
+        v.neg = x.neg;
+        return rv(v);
+    }
+    // atanh: |x| < 1, 0.5 ln((1 + x) / (1 - x)); +-1 poles
+    let k = cmp_abs(&x, &one);
+    if k > 0 {
+        return dom(f, c);
+    }
+    if k == 0 {
+        return pole(x.neg, f, c);
+    }
+    let extra = @max(0, -a) + 2;
+    let w = wp + extra;
+    if a < -(wp + 2) {
+        let w2 = wp + 4;
+        return rv(add(x, divi(mul(mul(x, x, w2), x, w2), 3, w2), w2));
+    }
+    let q = div(add(one, x, 400), sub(one, x, 400), w + 4);
+    let mut v = divi(log(q, w), 2, w);
+    v.neg = x.neg;
+    return rv(v);
+}
+
+/// The hyperbolic functions (cosh, sinh, tanh, acosh, asinh, atanh).
+export fn __axc_dm_hyp(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = y;
+    _ = z;
+    _ = n;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let res = hyp(op, xd, f, &mut c);
+    return done(r, res, f, &mut c, d.is_nan(xd));
+}
+
+// -----------------------------------------------------------------------------
+// erf and erfc
+// -----------------------------------------------------------------------------
+
+// erf x by its series 2/sqrt(pi) sum (-1)^k x^(2k+1) / (k! (2k + 1)), in the
+// digits its terms' growth (to about e^(x^2)) cancels; |x| < 16.
+fn erf_series(x: F, wp: i32) F {
+    // (the largest term is near x^2 terms in: about 0.4343 x^2 digits above the sum)
+    let x2 = mul(x, x, 60);
+    let lost = nearest_int(&mul(x2, divi(fint(4343), 10000, 10), 20));
+    let w = (wp + @int_cast(i32, lost)) + 8;
+    let xx = mul(x, x, w);
+    let mut t = x;  // x^(2k+1) / k!
+    let mut s = x;
+    let mut k: i64 = 1;
+    loop {
+        t = divi(mul(t, xx, w), k, w);
+        let term = divi(t, (2 * k) + 1, w);
+        if tiny(&term, (w + 2) - adj_or(&s)) and (k > 3) {
+            break;
+        }
+        if (k & 1) != 0 {
+            s = sub(s, term, w);
+        } else {
+            s = add(s, term, w);
+        }
+        k += 1;
+    }
+    let sp = sqrt(pi(w), w);
+    return div(muli(s, 2, w), sp, wp);
+}
+
+// erfc x for large positive x by its asymptotic series
+// e^(-x^2) / (x sqrt(pi)) (1 - 1/(2x^2) + 3/(2x^2)^2 - ...), to wp digits
+// (the series' terms fall below 10^-wp before they grow again).
+fn erfc_asym(x: F, wp: i32) F {
+    let w = wp + 6;
+    let x2 = mul(x, x, w);
+    let u = div(fint(1), muli(x2, 2, w), w);
+    let mut t = fint(1);
+    let mut s = fint(1);
+    let mut k: i64 = 1;
+    loop {
+        let nt = mul(muli(t, (2 * k) - 1, w), u, w);
+        if (cmp_abs(&nt, &t) >= 0) or tiny(&nt, w + 2) {
+            break;
+        }
+        t = nt;
+        if (k & 1) != 0 {
+            s = sub(s, t, w);
+        } else {
+            s = add(s, t, w);
+        }
+        k += 1;
+    }
+    let e = exp(fneg(x2), w);
+    let den = mul(x, sqrt(pi(w), w), w);
+    return div(mul(e, s, w), den, wp);
+}
+
+fn erf_fn(op: u64, xd: d.Dec, f: u32, c: *mut d.Ctx) R {
+    let wp = wprec(f) + 4;
+    if d.is_nan(xd) {
+        return rw(d.quiet(xd, f, c));
+    }
+    let is_erfc = op == 2;
+    if xd.cls == d.K_INF {
+        if is_erfc {
+            if xd.neg {
+                return rexact(fint(2), 0);
+            }
+            return rexact(fzero(), 0);
+        }
+        return rexact(fint(u_pick(xd.neg, -1, 1)), 0);
+    }
+    let x = fdec(xd);
+    if iszero(&x) {
+        if is_erfc {
+            return rexact(fint(1), 0);
+        }
+        return rw(d.repack(xd, f));
+    }
+    let ax = fabs_(x);
+    let a = adj(&x);
+    if not is_erfc {
+        if a < -(wp + 2) {
+            // 2x/sqrt(pi)
+            return rv(div(muli(x, 2, wp), sqrt(pi(wp), wp), wp));
+        }
+        if cmp(&ax, &fint(12)) > 0 {
+            // (erfc |x| below 10^-60: just inside +-1)
+            return rv(just_below(u_pick(x.neg, -1, 1), wp));
+        }
+        return rv(erf_series(x, wp));
+    }
+    // erfc x = 1 - erf x; for x > 0 large, the asymptotic series
+    if x.neg {
+        if cmp(&ax, &fint(12)) > 0 {
+            return rv(just_below(2, wp));
+        }
+        return rv(add(fint(1), erf_series(ax, wp + 2), wp));
+    }
+    // (erfc x < e^-x^2 below the format's least value)
+    let cut = fint(@as(i64, ((-d.qmin(f)) * 231) / 100 + 10));
+    if cmp(&mul(ax, ax, 20), &cut) > 0 {
+        return rv(tiny_v(false, f));
+    }
+    // the asymptotic series where its least term is below 10^-wp
+    let lim = fint(@as(i64, ((wp * 231) / 100) + 5));
+    if cmp(&mul(ax, ax, 20), &lim) > 0 {
+        return rv(erfc_asym(ax, wp));
+    }
+    // 1 - erf x, the digits erfc's smallness needs
+    let x2 = mul(ax, ax, 30);
+    let lost = nearest_int(&mul(x2, divi(fint(4343), 10000, 10), 20));
+    let w = wp + @int_cast(i32, lost) + 4;
+    return rv(sub(fint(1), erf_series(ax, w), w));
+}
+
+/// erf and erfc.
+export fn __axc_dm_erf(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = y;
+    _ = z;
+    _ = n;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let res = erf_fn(op, xd, f, &mut c);
+    return done(r, res, f, &mut c, d.is_nan(xd));
+}
+
+// -----------------------------------------------------------------------------
+// lgamma and tgamma
+// -----------------------------------------------------------------------------
+
+// The Bernoulli numbers B_2k (k = 1 .. 30) as decimal values to wp
+// digits, from the tangent numbers T_k (integers: R. P. Brent and P.
+// Zimmermann, Modern Computer Arithmetic, 4.7.2, "TangentNumbers"):
+// B_2k = (-1)^(k-1) 2k T_k / (2^(2k) (2^(2k) - 1)).
+fn bernoulli(wp: i32, bs: *mut [32]F) void {
+    let nn: usize = 30;
+    let mut t: [32]F = undefined;
+    t[1] = fint(1);
+    for k in @as(usize, 2)..(nn + 1) {
+        t[k] = muli(t[k - 1], @as(i64, @truncate(u32, k - 1)), 700);
+    }
+    for k in @as(usize, 2)..(nn + 1) {
+        for j in k..(nn + 1) {
+            let a = muli(t[j - 1], @as(i64, @truncate(u32, j - k)), 700);
+            let b = muli(t[j], @as(i64, @truncate(u32, (j - k) + 2)), 700);
+            t[j] = add(a, b, 700);
+        }
+    }
+    for k in @as(usize, 1)..(nn + 1) {
+        let kk = @as(i64, @truncate(u32, k));
+        let p4 = pow_int2(2 * kk);  // 2^(2k)
+        let den = mul(p4, sub(p4, fint(1), 700), 700);
+        let mut v = div(muli(t[k], 2 * kk, 700), den, wp);
+        v.neg = (k & 1) == 0;
+        bs.*[k] = v;
+    }
+}
+
+// 2^n (n <= 64), exactly.
+fn pow_int2(n: i64) F {
+    let mut r = fint(1);
+    for i in 0..n {
+        _ = i;
+        r = muli(r, 2, 700);
+    }
+    return r;
+}
+
+// ln Gamma(x) for x >= 1/2 (finite), to wp digits: x shifted up to x + s
+// >= M, Stirling's series there, less ln(x (x+1) ... (x+s-1)).
+fn lgamma_pos(x: F, wp: i32) F {
+    let w = wp + 8;
+    let mm: i64 = @as(i64, wp) + 20;  // the argument the series starts from
+    let mut z = x;
+    let mut prod = fint(1);
+    let mut shifted = false;
+    while cmp(&z, &fint(mm)) < 0 {
+        prod = mul(prod, z, w + 4);
+        z = add(z, fint(1), w + 20);
+        shifted = true;
+    }
+    // (z - 1/2) ln z - z + ln(2 pi)/2 + sum B_2k / (2k (2k - 1) z^(2k-1))
+    let lz = log(z, w);
+    let half = divi(fint(1), 2, 4);
+    let mut s = sub(mul(sub(z, half, w + 10), lz, w), z, w);
+    s = add(s, divi(log(muli(pi(w), 2, w), w), 2, w), w);
+    let mut bs: [32]F = undefined;
+    bernoulli(w, &mut bs);
+    let z2 = mul(z, z, w);
+    let mut zp = z;  // z^(2k-1)
+    let mut k: usize = 1;
+    while k <= 30 {
+        let kk = @as(i64, @truncate(u32, k));
+        let term = div(bs[k], mul(fint((2 * kk) * ((2 * kk) - 1)), zp, w), w);
+        if tiny(&term, (w + 2) - adj_or(&s)) {
+            break;
+        }
+        s = add(s, term, w);
+        zp = mul(zp, z2, w);
+        k += 1;
+    }
+    if shifted {
+        s = sub(s, log(prod, w), w);
+    }
+    round(&mut s, wp);
+    return s;
+}
+
+fn gamma_fn(op: u64, xd: d.Dec, f: u32, c: *mut d.Ctx) R {
+    let wp = wprec(f) + 4;
+    let is_t = op == 2;
+    if d.is_nan(xd) {
+        return rw(d.quiet(xd, f, c));
+    }
+    if xd.cls == d.K_INF {
+        if xd.neg {
+            if is_t {
+                return dom(f, c);
+            }
+            return rw(d.inf(false, f));
+        }
+        return rw(d.inf(false, f));
+    }
+    if d.is_zero(xd) {
+        if is_t {
+            return pole(xd.neg, f, c);
+        }
+        return pole(false, f, c);
+    }
+    let x = fdec(xd);
+    let mut odd = false;
+    let xint = is_int(xd, &mut odd);
+    if xd.neg and xint {
+        if is_t {
+            return dom(f, c);
+        }
+        return pole(false, f, c);
+    }
+    let a = adj(&x);
+    if xint and not xd.neg and (a < 4) {
+        // n - 1 factorial, exactly (Gamma(n)); lgamma(1) = lgamma(2) = 0
+        let nn = nearest_int(&x);
+        if not is_t and ((nn == 1) or (nn == 2)) {
+            return rexact(fzero(), 0);
+        }
+        if is_t {
+            let mut fact = fint(1);
+            let mut i: i64 = 2;
+            let mut ok = true;
+            while i < nn {
+                fact = mul(fact, fint(i), 700);
+                if ndig(&fact) > 600 {
+                    ok = false;
+                    break;
+                }
+                i += 1;
+            }
+            if ok {
+                return rexact(fact, 0);
+            }
+            // (longer than 600 digits: from lgamma, below)
+        }
+    }
+    // tiny x: Gamma(x) ~ 1/x, lgamma ~ -ln|x|
+    if a < -(wp + 2) {
+        if is_t {
+            return rv(div(fint(1), x, wp));
+        }
+        return rv(fneg(log(fabs_(x), wp)));
+    }
+    let half = divi(fint(1), 2, 4);
+    if cmp(&x, &half) >= 0 {
+        // (near 1 and 2, where lgamma is 0, its terms cancel: more digits)
+        let mut lg = lgamma_pos(x, wp + 4);
+        if not iszero(&lg) and (adj(&lg) < 0) {
+            lg = lgamma_pos(x, (wp + 8) - adj(&lg));
+        }
+        if is_t {
+            if adj_or(&lg) >= 6 {
+                return rv(huge(false, f));
+            }
+            return rv(exp(lg, wp));
+        }
+        return rv(lg);
+    }
+    // x < 1/2: Gamma(x) = pi / (sin(pi x) Gamma(1 - x))
+    if a >= 5 {
+        // (|x| large and negative: |Gamma| below every format's least value)
+        if is_t {
+            return rv(tiny_v(sin_pi_neg(xd), f));
+        }
+        let ax = fabs_(x);
+        let lx = log(ax, wp + 10);
+        return rv(fneg(mul(ax, sub(lx, fint(1), wp + 10), wp + 4)));
+    }
+    let one_mx = sub(fint(1), x, wp + 20 + @max(0, -a));
+    let lg1 = lgamma_pos(one_mx, wp + 4 + @max(0, a));
+    let mut cc = d.ctx(d.R_NEAREST);
+    let sp = trig_pi(xd, T_SINPI, f, &mut cc);
+    let s = sp.v;
+    let ls = log(fabs_(s), wp + 4);
+    let lpi = log(pi(wp + 4), wp + 4);
+    let lgv = sub(sub(lpi, ls, wp + 4), lg1, wp + 4);
+    if not is_t {
+        return rv(lgv);
+    }
+    if adj_or(&lgv) >= 6 {
+        if lgv.neg {
+            return rv(tiny_v(s.neg, f));
+        }
+        return rv(huge(s.neg, f));
+    }
+    let mut g = exp(lgv, wp);
+    g.neg = s.neg;
+    return rv(g);
+}
+
+// The sign of sin(pi x) (x negative, not an integer): Gamma's sign.
+fn sin_pi_neg(xd: d.Dec) bool {
+    let mut cc = d.ctx(d.R_NEAREST);
+    let sp = trig_pi(xd, T_SINPI, d.D128, &mut cc);
+    return sp.v.neg;
+}
+
+/// lgamma and tgamma.
+export fn __axc_dm_gamma(op: u64, f64_: u64, r: *mut ld.W, x: *ld.W, y: *ld.W, z: *ld.W, n: i64) u64 {
+    _ = y;
+    _ = z;
+    _ = n;
+    let f = @truncate(u32, f64_);
+    let mut c = d.ctx(env.g_round);
+    let xd = d.unpack(x.*, f);
+    let res = gamma_fn(op, xd, f, &mut c);
+    return done(r, res, f, &mut c, d.is_nan(xd));
+}

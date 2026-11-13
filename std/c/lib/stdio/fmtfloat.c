@@ -11,7 +11,16 @@
    multiple-precision arithmetic; D. E. Knuth, The Art of Computer
    Programming, vol. 2, 4.4, "Radix conversion"), then rounded to the digits
    asked for, the halfway case to even (IEC 60559's round to nearest, the
-   default rounding direction: rounding modes are not followed). */
+   default rounding direction: rounding modes are not followed).
+
+   A decimal floating value (C23 _Decimal32, _Decimal64, _Decimal128:
+   __axc_fp_dec, from its BID encoding) is its coefficient * 10^q: N is the
+   coefficient, and e, f and g round its digits as for a binary value. Its
+   a conversion (C23 7.23.6.1p8) shows the coefficient's digits and the
+   quantum exponent as they are: in the style of f with -q digits after the
+   point when -(n + 5) <= q <= 0 (n the coefficient's digits, 1 for zero),
+   else of e with n - 1 digits after the point; a precision P below n
+   first rounds the coefficient to P digits (half to even). */
 #include "impl.h"
 
 /* Limbs of N for the widest format: m * 5^16494 for binary128 (11564
@@ -118,6 +127,18 @@ static int make_n(struct big *b, const struct __axc_fp *v) {
     int e = v->exp, k;
     struct digits d;
     b->n = 0;
+    if (v->dec) {
+        /* the coefficient, 32 bits at a time; value = N * 10^q */
+        big_muladd(b, 1, (limb)(v->hi >> 32));
+        big_muladd(b, 0x10000UL, 0);
+        big_muladd(b, 0x10000UL, (limb)(v->hi & 0xffffffffUL));
+        big_muladd(b, 0x10000UL, 0);
+        big_muladd(b, 0x10000UL, (limb)(v->lo >> 32));
+        big_muladd(b, 0x10000UL, 0);
+        big_muladd(b, 0x10000UL, (limb)(v->lo & 0xffffffffUL));
+        digits_init(&d, b);
+        return d.total + e;
+    }
     /* the significand, 32 bits at a time from the top */
     big_muladd(b, 1, (limb)(v->hi >> 32));
     big_muladd(b, 0x10000UL, 0);
@@ -307,6 +328,64 @@ static size_t fmt_hex(const struct __axc_fp *v, int prec, int alt, int upper, ch
     return n;
 }
 
+/* %a of a decimal floating value (see the head of the file) */
+static size_t fmt_dec_a(const struct __axc_fp *v, int prec, int alt, int upper, char *buf, size_t cap, char **big,
+                        size_t *bigcap) {
+    struct big b;
+    struct digits d;
+    char dig[48], *p;
+    int n = 1, q = v->exp, i, dp, ip;
+    size_t need, k = 0;
+    dig[0] = '0';
+    if (v->kind != 0) {
+        dp = make_n(&b, v);
+        digits_init(&d, &b);
+        n = d.total;
+        for (i = 0; i < n; i++)
+            dig[i] = (char)('0' + digit_at(&d, i));
+        if (prec >= 0) {
+            int pk = prec == 0 ? 1 : prec;
+            if (pk < n) {
+                int nk = round_digits(&d, pk, dig, &dp);
+                q += n - pk;
+                if (nk > pk)
+                    q++; /* (carried into a new digit: 10...0, one zero fewer) */
+                n = pk;
+            }
+        }
+    }
+    need = (size_t)n + 16 + (size_t)(q < 0 ? -q : 0);
+    p = room_for(need, buf, cap, big, bigcap);
+    if (p == NULL)
+        return 0;
+    if (q <= 0 && q >= -(n + 5)) {
+        ip = n + q; /* the integer digits */
+        if (ip <= 0) {
+            p[k++] = '0';
+            p[k++] = '.';
+            for (i = 0; i < -ip; i++)
+                p[k++] = '0';
+            for (i = 0; i < n; i++)
+                p[k++] = dig[i];
+        } else {
+            for (i = 0; i < ip; i++)
+                p[k++] = dig[i];
+            if (q < 0 || alt)
+                p[k++] = '.';
+            for (i = ip; i < n; i++)
+                p[k++] = dig[i];
+        }
+        return k;
+    }
+    p[k++] = dig[0];
+    if (n > 1 || alt)
+        p[k++] = '.';
+    for (i = 1; i < n; i++)
+        p[k++] = dig[i];
+    k += put_exp10(p + k, q + n - 1, upper);
+    return k;
+}
+
 size_t __axc_fmt_fp(const struct __axc_fp *v, int spec, int prec, int alt, char *buf, size_t cap, char **big,
                     size_t *bigcap) {
     struct big b;
@@ -318,6 +397,8 @@ size_t __axc_fmt_fp(const struct __axc_fp *v, int spec, int prec, int alt, char 
     char *digbuf = small;
     size_t digcap = 0;
     spec |= 0x20;
+    if (spec == 'a' && v->dec)
+        return fmt_dec_a(v, prec, alt, upper, buf, cap, big, bigcap);
     if (spec == 'a')
         return fmt_hex(v, prec, alt, upper, buf, cap, big, bigcap);
     if (prec < 0)
@@ -441,6 +522,7 @@ void __axc_fp_double(struct __axc_fp *v, double x) {
     v->hi = 0;
     v->mant_bits = 53;
     v->min_exp = -1022;
+    v->dec = 0;
     if (e == 0x7ff) {
         v->kind = f != 0 ? 3 : 2;
         v->lo = f;
@@ -468,6 +550,7 @@ void __axc_fp_long_double(struct __axc_fp *v, long double x) {
     unsigned char *s = (unsigned char *)&x;
     unsigned __axiom_int64 w0 = 0, w1 = 0;
     int k, e;
+    v->dec = 0;
     for (k = 7; k >= 0; k--)
         w0 = (w0 << 8) | s[k];
     for (k = 15; k >= 8; k--)
@@ -514,4 +597,68 @@ void __axc_fp_long_double(struct __axc_fp *v, long double x) {
     v->exp = e - 16383 - 112;
 #endif
 #endif
+}
+
+/* A decimal floating value of bytes 4, 8 or 16 (BID, IEEE 754-2019 3.5.2):
+   the sign, the combination field's two forms of exponent and
+   coefficient, infinity and NaN; a non-canonical coefficient (10^p or
+   more) is 0 */
+void __axc_fp_dec(struct __axc_fp *v, const void *p, int bytes) {
+    const unsigned char *s = (const unsigned char *)p;
+    unsigned __axiom_int64 w0 = 0, w1 = 0, c0, c1, g, e;
+    int k, kb = bytes * 8, eb = bytes == 4 ? 8 : bytes == 8 ? 10 : 14, cb, bias;
+    for (k = (bytes < 8 ? bytes : 8) - 1; k >= 0; k--)
+        w0 = (w0 << 8) | s[k];
+    if (bytes == 16)
+        for (k = 15; k >= 8; k--)
+            w1 = (w1 << 8) | s[k];
+    cb = kb - 1 - eb;
+    bias = bytes == 4 ? 101 : bytes == 8 ? 398 : 6176;
+    v->dec = 1;
+    v->mant_bits = 0;
+    v->min_exp = 0;
+    /* (a 128-bit value as w1:w0; the narrow ones in w0) */
+    if (bytes == 16) {
+        v->neg = (int)(w1 >> 63);
+        g = (w1 >> 58) & 31;
+    } else {
+        v->neg = (int)((w0 >> (kb - 1)) & 1);
+        g = (w0 >> (kb - 6)) & 31;
+    }
+    v->hi = v->lo = 0;
+    v->exp = 0;
+    if ((g >> 1) == 15) {
+        v->kind = g == 30 ? 2 : 3;
+        return;
+    }
+    if ((g >> 3) == 3) {
+        /* the second form: 100 then cb - 2 bits; never canonical for 128 bits */
+        if (bytes == 16) {
+            e = (w1 >> 47) & 0x3fff;
+            c1 = c0 = 0;
+        } else {
+            e = (w0 >> (cb - 2)) & ((1u << eb) - 1);
+            c1 = 0;
+            c0 = ((unsigned __axiom_int64)4 << (cb - 2)) | (w0 & (((unsigned __axiom_int64)1 << (cb - 2)) - 1));
+        }
+    } else if (bytes == 16) {
+        e = (w1 >> 49) & 0x3fff;
+        c1 = w1 & 0x1ffffffffffffULL;
+        c0 = w0;
+    } else {
+        e = (w0 >> cb) & ((1u << eb) - 1);
+        c1 = 0;
+        c0 = w0 & (((unsigned __axiom_int64)1 << cb) - 1);
+    }
+    /* non-canonical: 10^7, 10^16 or 10^34 and more */
+    if (bytes == 4 && c0 >= 10000000)
+        c0 = 0;
+    if (bytes == 8 && c0 >= 10000000000000000ULL)
+        c0 = 0;
+    if (bytes == 16 && (c1 > 0x1ed09bead87c0ULL || (c1 == 0x1ed09bead87c0ULL && c0 >= 0x378d8e6400000000ULL)))
+        c1 = c0 = 0;
+    v->hi = c1;
+    v->lo = c0;
+    v->exp = (int)e - bias;
+    v->kind = (c1 | c0) != 0;
 }
