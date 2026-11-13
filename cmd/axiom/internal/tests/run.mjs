@@ -1277,6 +1277,21 @@ function cDriverCases() {
         const r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
         if (!/at divide\n\s+at middle \(crash3\.c:7:12\)\n\s+at main \(crash3\.c:10:12\)\n/.test(r.stderr)) return `the trace (${o}):\n${r.stderr}`;
       }
+      // after a longjmp, the records of the calls it left are gone
+      // (setjmp keeps the shadow stack's depth: c/cgen_sjlj.ax)
+      write({ 'crash4.c': '#include <setjmp.h>\nstatic jmp_buf env;\nstatic volatile int zero = 0;\n' +
+        'static void thrower(int n) {\n    if (n > 0) {\n        thrower(n - 1);\n    }\n    longjmp(env, 1);\n}\n' +
+        'static int divide(int k) {\n    return k / zero;\n}\nint main(void) {\n    if (setjmp(env) == 0) {\n' +
+        '        thrower(5);\n        return 1;\n    }\n    return divide(3) + 2;\n}\n' });
+      for (const o of ['-O0', '-O2']) {
+        const out = path.join(dir, `crash4${o}.wasm`);
+        const c = await ax(['build', 'crash4.c', o, '--target=wasm32', '--features=+exception-handling', '-o', out]);
+        if (c.status !== 0) return `build ${o}: ${c.stdout}${c.stderr}`;
+        const r = spawnSync(process.execPath, [path.join(root, 'std/internal/runtime/host.mjs'), out], { encoding: 'utf8' });
+        if (!/at divide\n\s+at main \(crash4\.c:18:12\)\n\s+at main \(std\/internal\/runtime\/c_start\.ax:\d+:\d+\)\n$/.test(r.stderr)) {
+          return `the trace after longjmp (${o}):\n${r.stderr}`;
+        }
+      }
       return null;
     },
     // With line tables (-g, --debug-info=lines) the innermost frame shows
@@ -2540,6 +2555,19 @@ if (!skipPlatform) {
     }
     return Buffer.alloc(0);
   };
+  // the size of an ELF executable's writable data (.data, .bss: the sizes in
+  // its section headers)
+  const elfData = (d) => {
+    const shoff = Number(d.readBigUInt64LE(40)), shnum = d.readUInt16LE(60), shstr = d.readUInt16LE(62);
+    const so = Number(d.readBigUInt64LE(shoff + 64 * shstr + 24));
+    let n = 0;
+    for (let k = 0; k < shnum; k++) {
+      const h = shoff + 64 * k;
+      const name = d.toString('latin1', so + d.readUInt32LE(h), d.indexOf(0, so + d.readUInt32LE(h)));
+      if (name === '.data' || name === '.bss') n += Number(d.readBigUInt64LE(h + 32));
+    }
+    return n;
+  };
   // the size of a Mach-O executable's __TEXT,__text section
   const machoText = (d) => {
     const ncmds = d.readUInt32LE(16);
@@ -2588,6 +2616,10 @@ if (!skipPlatform) {
               : objText(ea).length === objText(en).length && objText(ea).length > 0;
             void loaded;
             if (!same) return '-g changed the code';
+            // (the frame table's line tables are read-only data: ftab.ax)
+            if (!obj && !mac && !t.startsWith('wasm') && elfData(ea) !== elfData(en)) {
+              return `-g changed the writable data: ${elfData(ea)} bytes, ${elfData(en)} without`;
+            }
             if (mac && checkMachO(ea).errs.length) return `the executable: ${checkMachO(ea).errs.join('\n')}`;
             if (!t.startsWith('wasm') && !mac && !obj && n.length === a.length) return 'no debug information';
             const img = loadImage(a);
@@ -2843,6 +2875,55 @@ if (!skipPlatform) {
       const loop = lines.findIndex((l) => l.includes(t.startsWith('x86') ? 'addq (A0), %rax' : 'ldr x3, [x0], #8')) + 1;
       for (const n of [first, loop]) if (!addrsOfLine(dw, 'routines.S', n).length) return `no code for routines.S:${n}`;
       if (!addrsOfLine(dw, 'virtual.c', 42).length) return 'no code for virtual.c:42 (.loc)';
+      return null;
+    };
+  }
+  // two builds at different times are the same (the predefined macros'
+  // <built-in>, whose MD5 the line table has, holds no __DATE__ or __TIME__)
+  dcases['the same at another time'] = async () => {
+    const outs = [];
+    for (const [k, when] of ['0', '1000000000'].entries()) {
+      const o = path.join(tmp, `debug-when-${k}`, 'prog.o');
+      fs.mkdirSync(path.dirname(o), { recursive: true });
+      const env = { ...process.env, SOURCE_DATE_EPOCH: when, AXIOM_CACHE: path.join(tmp, `debug-cache-when-${k}`) };
+      const r = await spawnAsync(compiler, ['build', path.join(root, 'cmd/axiom/internal/tests/c/run/tail_calls.c'),
+        `-I${path.join(root, 'cmd/axiom/internal/tests/c')}`, '--c-std=gnu17', '-O2', '--target=x86_64', '-g', '--emit=obj', '-o', o],
+        { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+      if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+      outs.push(fs.readFileSync(o));
+    }
+    return outs[0].equals(outs[1]) ? null : 'the objects differ';
+  };
+  // enumerators of values a signed 64-bit one does not hold: unsigned
+  // 64-bit (DW_FORM_udata), 128-bit (DW_FORM_data16, the value in memory)
+  for (const t of ['x86_64', 'aarch64', 'wasm32']) {
+    dcases[`enumerators wider than 64 bits ${t}`] = async () => {
+      const src = path.join(tmp, 'debug-enum-wide.c');
+      fs.writeFileSync(src, 'typedef __int128 i128;\ntypedef unsigned __int128 u128;\n' +
+        'enum Fixed : i128 { F_BIG = (i128)1 << 100, F_NEG = -((i128)1 << 90), F_ONE = 1, F_M1 = -1 };\n' +
+        'enum UFixed : u128 { U_TOP = ~(u128)0, U_LOW = 3 };\nenum Past { P_ULL = 0xFFFFFFFFFFFFFFFFull, P_WIDE };\n' +
+        'enum Fixed fv = F_BIG;\nenum UFixed uv = U_TOP;\nenum Past pv = P_WIDE;\nint main(void) { return fv == F_ONE; }\n');
+      // (WebAssembly: the module, whose debug sections' references are resolved)
+      const wasm = t.startsWith('wasm');
+      const o = path.join(tmp, `debug-enum-wide-${t}`, wasm ? 'prog.wasm' : 'prog.o');
+      fs.mkdirSync(path.dirname(o), { recursive: true });
+      const env = { ...process.env, AXIOM_CACHE: path.join(tmp, `debug-cache-${t}`) };
+      const r = await spawnAsync(compiler, ['build', src, '--c-std=gnu23', `--target=${t}`, '-g', ...(wasm ? [] : ['--emit=obj']), '-o', o],
+        { encoding: 'utf8', cwd: root, env, timeout: compileTimeout });
+      if (r.status !== 0) return `build failed:\n${r.stdout}${r.stderr}`;
+      const dw = readDwarf(loadImage(fs.readFileSync(o)));
+      const got = new Map();
+      const walk = (d) => { if (d.tag === 0x28) got.set(d.attrs.get(0x03), d.attrs.get(0x1c)); d.children.forEach(walk); };
+      for (const u of dw.units) walk(u.die);
+      const val = (v) => BigInt.asIntN(128, v.reduce((a, b, k) => a | (BigInt(b) << BigInt(8 * k)), 0n));
+      const want = { F_BIG: 1n << 100n, F_NEG: -(1n << 90n), F_ONE: 1n, F_M1: -1n, U_TOP: -1n, U_LOW: 3n,
+                     P_ULL: (1n << 64n) - 1n, P_WIDE: 1n << 64n };
+      for (const [n, v] of Object.entries(want)) {
+        if (!got.has(n)) return `no enumerator ${n}`;
+        // (a udata or sdata is read as a Number: compared as one)
+        const g = got.get(n), ok = Buffer.isBuffer(g) ? val(g) === v : g === Number(v);
+        if (!ok) return `${n} is ${Buffer.isBuffer(g) ? val(g) : g}, not ${v}`;
+      }
       return null;
     };
   }

@@ -692,7 +692,7 @@ export function knownLocation(expr) {
       } else if (o === 0x06) { if (depth < 1) return false; }
       else if (o === 0x94) { r.u8(); if (depth < 1) return false; }
       else if (o === 0x23) { r.uleb(); if (depth < 1) return false; }
-      else if ([0x22, 0x1c, 0x1a, 0x21, 0x27, 0x24, 0x25, 0x26].includes(o)) { if (depth < 2) return false; depth--; }
+      else if ([0x22, 0x1c, 0x1e, 0x1a, 0x21, 0x27, 0x24, 0x25, 0x26].includes(o)) { if (depth < 2) return false; depth--; }
       else return false;
     }
     return false;

@@ -466,57 +466,57 @@ fn inlined_into(o: *mut Fmt, into: *Site) void {
     }
 }
 
-// The lines of the code a crash is in (line_chain_at's chain): each record
-// but the last is of a function inlined into the next one's, at the next
-// one's location; the last is the function's own (whose name the first call
-// record's callee also is). Their number.
-fn line_frames(o: *mut Fmt, chain: usize) u32 {
+// The lines of the code a crash is in (line_rec_at's record and those its
+// context refers to): each record but the last is of a function inlined
+// into the next one's, at the next one's location; the last is the
+// function's own (whose name the first call record's callee also is).
+// Their number.
+fn line_frames(o: *mut Fmt, rec: usize) u32 {
     let mut n: u32 = 0;
-    let mut c = chain;
-    while rd_usize(c) != 0 {
-        let x = rd_usize(c);
-        let site = untag(@ptr_from_int(*Site, x));
+    let mut r = rec;
+    while r != 0 {
         o.s("  at ");
-        o.s(cstr(site.fn_()));
-        if site.line != 0 {
+        o.s(cstr(lrec_fn(r)));
+        if lrec_line(r) != 0 {
             o.s(" (");
-            o.s(cstr(site.file()));
+            o.s(cstr(lrec_file(r)));
             o.c(':');
-            o.u(@as(u64, site.line));
+            o.u(@as(u64, lrec_line(r)));
             o.s(")");
         }
-        if ((x & 1) != 0) and (rd_usize(c + 8) != 0) {
-            inlined_into(o, untag(@ptr_from_int(*Site, rd_usize(c + 8))));
+        let next = lrec_next(r);
+        if next != 0 {
+            o.s(" (inlined into ");
+            o.s(cstr(lrec_fn(next)));
+            o.s(")");
         }
         o.s("\n");
         n += 1;
-        c += 8;
+        r = next;
     }
     return n;
 }
 
 // "stack trace" lines for a trap at `top` (0: location unknown).
 pub fn format_stack(o: *mut Fmt, top: *Site, ss: *ShadowStack) void {
-    format_stack_line(o, top, ss, @ptr_from_int(*Site, 0), 0);
+    format_stack_line(o, top, ss, 0, 0);
 }
 
 /// format_stack for a crash at pc, with the frame table tab: the innermost
 /// frame's line also shows the faulting instruction's file and line when
-/// the program has line tables (-g: line_at).
+/// the program has line tables (-g: line_rec_at).
 pub fn format_crash_stack(o: *mut Fmt, ss: *ShadowStack, tab: *usize, pc: usize) void {
-    let mut ch = line_chain_at(tab, pc);
-    let mut line = @ptr_from_int(*Site, 0);
-    if ch != 0 {
-        line = untag(@ptr_from_int(*Site, rd_usize(ch)));
-        if rd_usize(ch + 8) == 0 {
-            ch = 0;  // (not inlined: the line alone)
-        }
+    let line = line_rec_at(tab, pc);
+    let mut ch: usize = 0;
+    if (line != 0) and (lrec_next(line) != 0) {
+        ch = line;  // (inlined: the lines of each function)
     }
     format_stack_line(o, @ptr_from_int(*Site, 0), ss, line, ch);
 }
 
-// (`chain`: the lines of code inlined that a crash is in, line_frames; 0: none)
-fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site, chain: usize) void {
+// (`line`: the line record of the code a crash is in, 0: none; `chain`:
+// the same if that code was inlined, line_frames, else 0)
+fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: usize, chain: usize) void {
     let has_ss = not is_null(@ptr_cast(*void, ss));
     let mut depth: u32 = 0;
     if has_ss {
@@ -527,14 +527,14 @@ fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site, cha
         if chain != 0 {
             o.s("stack trace (innermost first):\n");
             _ = line_frames(o, chain);
-        } else if not is_null(@ptr_cast(*void, line)) {
+        } else if line != 0 {
             // (no call recorded: the faulting function's line alone)
             o.s("stack trace (innermost first):\n  at ");
-            o.s(cstr(line.fn_()));
+            o.s(cstr(lrec_fn(line)));
             o.s(" (");
-            o.s(cstr(line.file()));
+            o.s(cstr(lrec_file(line)));
             o.c(':');
-            o.u(@as(u64, line.line));
+            o.u(@as(u64, lrec_line(line)));
             o.s(")\n");
         }
         return;
@@ -549,16 +549,16 @@ fn format_stack_line(o: *mut Fmt, top: *Site, ss: *ShadowStack, line: *Site, cha
         o.s("  at ");
         if not is_null(@ptr_cast(*void, c)) and (cstr(c.callee()).len > 0) {
             o.s(cstr(c.callee()));
-        } else if not is_null(@ptr_cast(*void, line)) {
-            o.s(cstr(line.fn_()));
+        } else if line != 0 {
+            o.s(cstr(lrec_fn(line)));
         } else {
             o.s("<indirect call>");
         }
-        if not is_null(@ptr_cast(*void, line)) {
+        if line != 0 {
             o.s(" (");
-            o.s(cstr(line.file()));
+            o.s(cstr(lrec_file(line)));
             o.c(':');
-            o.u(@as(u64, line.line));
+            o.u(@as(u64, lrec_line(line)));
             o.s(")");
         }
         o.s("\n");
@@ -743,24 +743,13 @@ fn rets_frameless(a: usize, n: usize, pc: usize) bool {
     return (best != 0) and ((ent_flags(best) & RET_FRAMELESS) != 0);
 }
 
-/// The line of the code at pc, from the frame table's line rows (a program
-/// built with line tables: cmd/axiom/src/ftab.ax), as a record shaped as a
-/// call site's (its file, line and function; column 0); null without them
-/// or where the code has no line. The last row at or before pc: a marker
-/// whose chain holds the record (the other markers' chains are empty).
-pub fn line_at(tab: *usize, pc: usize) *Site {
-    let none = @ptr_from_int(*Site, 0);
-    let ch = line_chain_at(tab, pc);
-    if ch == 0 {
-        return none;
-    }
-    return untag(@ptr_from_int(*Site, rd_usize(ch)));
-}
-
-/// The chain of the records of the code at pc (line_at): its line's, then,
-/// in code inlined, those of the calls it was inlined at (innermost first,
-/// each but the last marked as inlined into the next); 0: none.
-pub fn line_chain_at(tab: *usize, pc: usize) usize {
+/// The line record of the code at pc, from the frame table's line tables
+/// (a program built with line tables: cmd/axiom/src/ftab.ax, whose header
+/// says their form); 0 without them or where the code has no line. The
+/// table of the function at or before pc: the last marker at or before pc
+/// that refers to one (the other markers' chains are empty); its last row
+/// at or before pc.
+pub fn line_rec_at(tab: *usize, pc: usize) usize {
     let mut n: usize = 0;
     let a = rets_table(tab, &mut n);
     if (a == 0) or (pc == 0) or not rets_sorted(a, n) {
@@ -770,18 +759,100 @@ pub fn line_chain_at(tab: *usize, pc: usize) usize {
     while i > 0 {
         i -= 1;
         let e = a + (8 * i);
-        if (ent_flags(e) & RET_MARKER) != 0 {
-            let s = rd_usize(ent_chain(e));
-            if s != 0 {
-                let site = untag(@ptr_from_int(*Site, s));
-                if site.line == 0 {
-                    return 0;
-                }
-                return ent_chain(e);
+        let f = rd_i32(e + 4);
+        if ((ent_flags(e) & RET_MARKER) != 0) and ((f & 4) == 0) {
+            let t = (e + 4) +% @bit_cast(usize, @as(isize, f & ~@as(i32, 7)));
+            let r = table_row(t, ent_ret(e), pc);
+            if (r == 0) or (lrec_line(r) == 0) {
+                return 0;
             }
+            return r;
         }
     }
     return 0;
+}
+
+// The line record of the last row at or before pc of line table t, whose
+// function starts at `start` (0: none).
+fn table_row(t: usize, start: usize, pc: usize) usize {
+    let mut p = t;
+    let n = rd_uleb(&mut p);
+    let mut at = start;
+    let mut r: isize = 0;
+    let mut best: usize = 0;
+    for _k in 0..n {
+        at += rd_uleb(&mut p);
+        r += rd_sleb(&mut p);
+        if at > pc {
+            break;
+        }
+        best = t +% @bit_cast(usize, r * 8);
+    }
+    return best;
+}
+
+fn rd_uleb(p: *mut usize) usize {
+    let mut x: usize = 0;
+    let mut sh: u32 = 0;
+    loop {
+        let b = @ptr_from_int(*u8, p.*).*;
+        p.* += 1;
+        if sh < 64 {
+            x = x | (@as(usize, b & 0x7f) << sh);
+        }
+        sh += 7;
+        if (b & 0x80) == 0 {
+            return x;
+        }
+    }
+}
+
+fn rd_sleb(p: *mut usize) isize {
+    let mut x: usize = 0;
+    let mut sh: u32 = 0;
+    loop {
+        let b = @ptr_from_int(*u8, p.*).*;
+        p.* += 1;
+        if sh < 64 {
+            x = x | (@as(usize, b & 0x7f) << sh);
+        }
+        sh += 7;
+        if (b & 0x80) == 0 {
+            if (sh < 64) and ((b & 0x40) != 0) {
+                x = x | (~@as(usize, 0) << sh);
+            }
+            return @bit_cast(isize, x);
+        }
+    }
+}
+
+// A line record's line, function, file and the record of the call its code
+// was inlined at (0: none); its context's fields are relative to themselves.
+fn lrec_line(r: usize) u32 {
+    return @ptr_from_int(*u32, r).*;
+}
+
+fn lrec_ctx(r: usize) usize {
+    return (r + 4) +% @bit_cast(usize, @as(isize, rd_i32(r + 4)));
+}
+
+fn lrec_file(r: usize) *u8 {
+    let c = lrec_ctx(r);
+    return @ptr_from_int(*u8, c +% @bit_cast(usize, @as(isize, rd_i32(c))));
+}
+
+fn lrec_fn(r: usize) *u8 {
+    let c = lrec_ctx(r) + 4;
+    return @ptr_from_int(*u8, c +% @bit_cast(usize, @as(isize, rd_i32(c))));
+}
+
+fn lrec_next(r: usize) usize {
+    let c = lrec_ctx(r) + 8;
+    let d = rd_i32(c);
+    if d == 0 {
+        return 0;
+    }
+    return c +% @bit_cast(usize, @as(isize, d));
 }
 
 // The frame table: its first entry and their number (0: there is none).

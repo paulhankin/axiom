@@ -39,6 +39,12 @@ const B_COUNTER: i32 = 10;          // __COUNTER__: 0, 1, 2 ... at each use
 const B_INCLUDE_LEVEL: i32 = 11;    // __INCLUDE_LEVEL__: how deep the current file is included (0: the source)
 const B_BASE_FILE: i32 = 12;        // __BASE_FILE__: the source file's name
 const B_TIMESTAMP: i32 = 13;        // __TIMESTAMP__: the time the current file was last modified
+// __DATE__ and __TIME__ (6.10.10.2), the time of the build (SOURCE_DATE_EPOCH
+// if set): replaced by the preprocessor, so that the text of the predefined
+// macros (the pseudo-file <built-in>, whose MD5 the line tables have) is
+// the same in every build
+const B_DATE: i32 = 14;
+const B_TIME: i32 = 15;
 
 const MAX_INCLUDE_DEPTH: usize = 200;
 const MAX_ARG_DEPTH: i32 = 400;        // macro invocations nested in arguments
@@ -926,6 +932,11 @@ fn builtin(P: *mut PP, m: *mut Macro, inv: *lx.PTok) bool {
             P.counter += 1;
         }
         let mut t = number_tok(v, inv.span);
+        t.space = inv.space;
+        t.bol = inv.bol;
+        l.push(t);
+    } else if (b == B_DATE) or (b == B_TIME) {
+        let mut t = string_tok(build_date_time(b == B_DATE), inv.span);
         t.space = inv.space;
         t.bol = inv.bol;
         l.push(t);
@@ -2735,21 +2746,31 @@ fn add_builtin(P: *mut PP, name: []u8, b: i32) void {
     P.macros.put(m.name, m);
 }
 
-// The text of the predefined macros' definitions.
+// The build's date (else time) for __DATE__ and __TIME__: taken once.
+let mut g_date: []u8 = "";
+let mut g_time: []u8 = "";
+
+fn build_date_time(date: bool) []u8 {
+    if g_date.len == 0 {
+        let mut secs = u.wall_ns() / 1000000000;
+        let sde = u.env("SOURCE_DATE_EPOCH");
+        if not u.isnos(sde) and all_digits(sde) {
+            secs = u.atol(sde);
+        }
+        date_time(secs, &mut g_date, &mut g_time);
+    }
+    if date {
+        return g_date;
+    }
+    return g_time;
+}
+
+// The text of the predefined macros' definitions (but __DATE__ and
+// __TIME__: B_DATE).
 fn predefined_text(P: *PP) []u8 {
     let o = P.o;
     let std = o.std;
     let mut b = u.Buf.init();
-    let mut secs = u.wall_ns() / 1000000000;
-    let sde = u.env("SOURCE_DATE_EPOCH");
-    if not u.isnos(sde) and all_digits(sde) {
-        secs = u.atol(sde);
-    }
-    let mut date = "";
-    let mut time = "";
-    date_time(secs, &mut date, &mut time);
-    b.s(u.f1("#define __DATE__ \"%s\"\n", date));
-    b.s(u.f1("#define __TIME__ \"%s\"\n", time));
     b.s("#define __STDC__ 1\n");
     b.s(o.target_macros);  // (--c-lib=system: the system's headers need them)
     if std >= co.C95 {
@@ -3054,6 +3075,8 @@ pub fn preprocess(path: []u8, o: *co.COptions) u.List.[ct.Token] {
         add_builtin(P, "__BASE_FILE__", B_BASE_FILE);
         add_builtin(P, "__TIMESTAMP__", B_TIMESTAMP);
     }
+    add_builtin(P, "__DATE__", B_DATE);
+    add_builtin(P, "__TIME__", B_TIME);
     // the predefined macros, then -D and -U
     push_file(P, text_file("<built-in>", predefined_text(P)), "<built-in>");
     run_file(P);

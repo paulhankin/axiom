@@ -11,6 +11,7 @@
 //   i32  the return address (the end of the call instruction)
 //   i32  the chain, with flags in its two low bits (the chain is 8-aligned
 //        and the field is at 4 mod 8, so its offset is 4 mod 8)
+// The table is 8-aligned (each entry too).
 // Entries are in code order within a section of code: each section of code
 // (isel.ax: func_section) has its own axiom_rets section, the first one's
 // plain and the others' (and then the first's too) SHF_LINK_ORDER ones
@@ -30,16 +31,32 @@
 //
 // With line tables (-g, --debug-info=lines), the table also maps code to
 // source lines, for the line of a crash's faulting instruction (runtime:
-// line_at): an entry with F_MARKER where the line changes (the rows of the
-// line tables, and one at each function's start), whose chain holds one
-// record shaped as a call site's (trap_format.ax's Site: the presumed file,
-// the line, column 0, the function's name; line 0 at a function's start
-// with no line), and F_FRAMELESS where the code runs without the frame. An
-// entry of another marker has the empty chain. Without line tables there
-// are none: the table is what it was. Code inlined has, after its own
-// record (its location, the inlined function's name), one for each call it
-// was inlined at, from the innermost (the call's location, the name of the
-// function the call is in).
+// line_rec_at): each function has an entry with F_MARKER at its start
+// (before its other entries there) whose second field refers to the
+// function's line table instead of a chain. A line table is 4 mod 8
+// aligned, so the field (the table's place relative to the field) is 0 mod
+// 8 where a chain's is 4 mod 8: bit 2 tells them apart. An entry of another
+// marker has the empty chain. Without line tables there are none: the
+// table is what it was. The line tables and what they refer to are in the
+// object's .rodata.axiom_lines, read-only and without relocations (each reference is
+// relative to its own place); the records and their contexts are made once
+// per object:
+//   a line table:             uleb the number of rows, then for each row
+//                             (where the line changes, in code order, the
+//                             first at the function's start): uleb its
+//                             code offset less the row before's, sleb its
+//                             line record's place less the row before's
+//                             (in 8 bytes from the table's start)
+//   a line record (8 bytes):  u32 the line (0: none), i32 its context
+//   a context (12 bytes):     i32 the presumed file's name, i32 the
+//                             function's name (NUL-terminated strings),
+//                             i32 the record of the call its code was
+//                             inlined at (0: not inlined)
+// so that code inlined has, after its own record (its location, the
+// inlined function's name), one for each call it was inlined at, from the
+// innermost (the call's location, the name of the function the call is
+// in), records of the same calls shared. Records and tables are 4 mod 8
+// aligned (their distances a multiple of 8).
 //
 // In a chain, a record whose function was inlined into the next one's (the
 // next record is that of the call it was inlined at) is referred to with
@@ -68,19 +85,27 @@ pub struct Tab {
     chains_sym: u32,
     text0: i32,  // the first section of code (.text): its rets
     rets0: i32,
-    cur_text: i32,              // the section of the function being done (select)
-    others: u.List.[u64],       // each other section of code << 32 | its axiom_rets
-    rel32: u32,                 // R_X86_64_PC32 / R_AARCH64_PREL32
-    abs64: u32,                 // R_X86_64_64 / R_AARCH64_ABS64
-    empty: u64,                 // the empty chain's offset in `chains`
-    lines: bool,                // line rows too (see the header)
-    line_recs: u.SymMap.[u64],  // their chains, by location and function: offset + 1
+    cur_text: i32,         // the section of the function being done (select)
+    others: u.List.[u64],  // each other section of code << 32 | its axiom_rets
+    rel32: u32,            // R_X86_64_PC32 / R_AARCH64_PREL32
+    abs64: u32,            // R_X86_64_64 / R_AARCH64_ABS64
+    empty: u64,            // the empty chain's offset in `chains`
+    lines: bool,           // line rows too (see the header)
+    ro: i32,               // where their tables and records go (.rodata.axiom_lines), and its symbol
+    ro_sym: u32,
+    rec_of: u.U64Map,      // a location << 32 | its scope -> its record's offset + 1 (in this function)
+    recs: u.U64Map,        // a line << 32 | a context -> the record's offset + 1
+    pairs: u.U64Map,       // a file's name's offset << 32 | a function's -> its number + 1
+    ctxs: u.U64Map,        // a pair's number << 32 | the next record + 1 -> the context's offset + 1
+    strs: u.SymMap.[u64],  // a name -> its offset + 1
 }
 
 pub fn off() Tab {
     return Tab.{ on: false, obj: u.nil.[elf.Obj](), rets: -1, chains: -1, text_sym: 0, chains_sym: 0, text0: -1,
                  rets0: -1, cur_text: -1, others: u.List.[u64].empty(), rel32: 0, abs64: 0, empty: 0, lines: false,
-                 line_recs: u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 } };
+                 ro: -1, ro_sym: 0, rec_of: u.U64Map.empty(), recs: u.U64Map.empty(), pairs: u.U64Map.empty(),
+                 ctxs: u.U64Map.empty(), strs: u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0,
+                                                                len: 0 } };
 }
 
 // The module's frame table, if it has one (m.frame_tables), and the chains
@@ -95,13 +120,19 @@ pub fn begin(o: *mut elf.Obj, m: *ir.Module, text: i32, chains: i32, gsym: *mut 
     t.on = true;
     t.lines = tg.g_debug != tg.DEBUG_NONE;
     t.obj = o;
-    t.rets = elf.add_sec(o, "axiom_rets", elf.S_RODATA, 4);
+    t.rets = elf.add_sec(o, "axiom_rets", elf.S_RODATA, 8);
     t.rets0 = t.rets;
     t.text0 = text;
     t.cur_text = text;
     t.chains = chains;
     t.text_sym = elf.sec_sym(o, text);
     t.chains_sym = elf.sec_sym(o, chains);
+    if t.lines {
+        // (a section of their own: the program's other read-only data is
+        // where it is without line tables)
+        t.ro = elf.add_sec(o, ".rodata.axiom_lines", elf.S_RODATA, 8);
+        t.ro_sym = elf.sec_sym(o, t.ro);
+    }
     t.rel32 = rel32;
     t.abs64 = abs64;
     let cs = o.secs.get(@int_cast(usize, chains));
@@ -168,13 +199,18 @@ pub fn call_aux(v: *ir.Value) i64 {
 }
 
 fn entry(t: *mut Tab, at: u64, chain: u64, flags: u64) void {
+    entry_to(t, at, t.chains_sym, chain, flags);
+}
+
+// An entry whose second field refers to `to` in the section of symbol `sym`.
+fn entry_to(t: *mut Tab, at: u64, sym: u32, to: u64, flags: u64) void {
     if t.rets < 0 {
         select_rets(t);
     }
     let s = t.obj.secs.get(@int_cast(usize, t.rets));
     let o = @as(u64, s.data.len());
     s.relocs.push(elf.Rel.{ off: o, ty: t.rel32, sym: t.text_sym, addend: @bit_cast(i64, at) });
-    s.relocs.push(elf.Rel.{ off: o + 4, ty: t.rel32, sym: t.chains_sym, addend: @bit_cast(i64, chain + flags) });
+    s.relocs.push(elf.Rel.{ off: o + 4, ty: t.rel32, sym: sym, addend: @bit_cast(i64, to + flags) });
     s.data.zeros(8);
 }
 
@@ -213,13 +249,9 @@ fn next_row(l: *mut Lines) u64 {
     return (l.rows[l.k] >> 32) & 0x7fff_ffff;
 }
 
-// Writes the next row of l at base + its offset (frameless: the code there
-// runs without the frame).
-fn put_row(t: *mut Tab, l: *mut Lines, base: u64, frameless: bool) void {
-    let mut fl = F_MARKER;
-    if frameless {
-        fl = fl | F_FRAMELESS;
-    }
+// The next row of l: its code offset << 32 | its line record's offset in
+// .rodata.axiom_lines.
+fn take_row(t: *mut Tab, l: *mut Lines) u64 {
     if not l.started {
         l.started = true;
         // (a row at the function's start: of its first row's line if that is there)
@@ -228,13 +260,40 @@ fn put_row(t: *mut Tab, l: *mut Lines, base: u64, frameless: bool) void {
             src = @truncate(u32, l.rows[0]);
             l.k = 1;
         }
-        entry(t, base, line_chain(t, src, scope_at(l, 0), l.name), fl);
-        return;
+        return line_record(t, src, scope_at(l, 0), l.name);
     }
     let r = l.rows[l.k];
     l.k += 1;
     let at = (r >> 32) & 0x7fff_ffff;
-    entry(t, base + at, line_chain(t, @truncate(u32, r), scope_at(l, at), l.name), fl);
+    return (at << 32) | line_record(t, @truncate(u32, r), scope_at(l, at), l.name);
+}
+
+// The line table of a function of `size` bytes of code whose rows l has
+// (see the header): its offset in .rodata.axiom_lines.
+fn line_table(t: *mut Tab, l: *mut Lines, size: u64) u64 {
+    let mut rs = u.List.[u64].empty();
+    while next_row(l) < size {
+        rs.push(take_row(t, l));
+    }
+    let cs = t.obj.secs.get(@int_cast(usize, t.ro));
+    cs.data.align(4);
+    if (cs.data.len() % 8) == 0 {
+        cs.data.zeros(4);
+    }
+    let tab = @as(u64, cs.data.len());
+    cs.data.uleb(@as(u64, rs.len));
+    let mut last: u64 = 0;
+    let mut r: i64 = 0;
+    for x in rs.items() {
+        let at = x >> 32;
+        let q = (@bit_cast(i64, x & 0xffff_ffff) - @bit_cast(i64, tab)) / 8;
+        cs.data.uleb(at - last);
+        cs.data.sleb(q - r);
+        last = at;
+        r = q;
+    }
+    rs.deinit();
+    return tab;
 }
 
 // The function of the code of scope sc for people: an inline instance's,
@@ -247,16 +306,19 @@ fn scope_func(sc: u32, name: []u8) []u8 {
     return dw.abs_name(dbi.scopes.get(@as(usize, r)).func);
 }
 
-// The chain of the records for source location src in scope sc of the
-// function named name (see the header), made once per object: the
-// location's, then those of the calls its code was inlined at (sc's inline
-// instances, from the innermost; but a call without a location, which the
-// compiler made: C's main is called by a function of the start-up's).
-fn line_chain(t: *mut Tab, src: u32, sc: u32, name: []u8) u64 {
-    let mut kb = u.Buf.init();
-    kb.s(u.dec(@as(i64, src)));
-    kb.s("/");
-    kb.s(scope_func(sc, name));
+// The line record (its offset in .rodata.axiom_lines) of source location src in scope
+// sc of the function named name (see the header), made once per object:
+// the location's, whose context refers to the record of the call its code
+// was inlined at (sc's innermost inline instance; but a call without a
+// location, which the compiler made: C's main is called by a function of
+// the start-up's, is passed over), and so on outward.
+fn line_record(t: *mut Tab, src: u32, sc: u32, name: []u8) u64 {
+    let key = (@as(u64, src) << 32) | @as(u64, sc);
+    let known = t.rec_of.get(key);
+    if known != 0 {
+        return known - 1;
+    }
+    let mut next: u64 = 0;
     let mut r = dbi.inline_root(sc);
     while r != 0 {
         let x = dbi.scopes.get(@as(usize, r));
@@ -264,54 +326,9 @@ fn line_chain(t: *mut Tab, src: u32, sc: u32, name: []u8) u64 {
             r = dbi.inline_root(x.parent);  // (a call the compiler made: its function is not shown)
             continue;
         }
-        kb.s("|");
-        kb.s(u.dec(@as(i64, x.call)));
-        kb.s("/");
-        kb.s(scope_func(x.parent, name));
-        r = dbi.inline_root(x.parent);
+        next = line_record(t, x.call, x.parent, name) + 1;
+        break;
     }
-    let key = u.intern(kb.done());
-    let at = t.line_recs.get(key);
-    if at != 0 {
-        return at - 1;
-    }
-    let mut recs = u.List.[u64].empty();
-    recs.push(line_rec(t, src, scope_func(sc, name)));
-    r = dbi.inline_root(sc);
-    while r != 0 {
-        let x = dbi.scopes.get(@as(usize, r));
-        if ir.src_line(x.call) == 0 {
-            r = dbi.inline_root(x.parent);
-            continue;
-        }
-        recs.push(line_rec(t, x.call, scope_func(x.parent, name)));
-        r = dbi.inline_root(x.parent);
-    }
-    // the chain: the records (each but the last inlined into the next), then null
-    let cs = t.obj.secs.get(@int_cast(usize, t.chains));
-    cs.data.align(8);
-    let ch = @as(u64, cs.data.len());
-    for j in 0..recs.len {
-        let mut inl: u64 = 0;
-        if (j + 1) < recs.len {
-            inl = 1;
-        }
-        cs.relocs.push(
-            elf.Rel.{
-                off: @as(u64, cs.data.len()), ty: t.abs64, sym: t.chains_sym,
-                addend: @bit_cast(i64, recs.get(j) + inl) });
-        cs.data.zeros(8);
-    }
-    cs.data.zeros(8);
-    recs.deinit();
-    t.line_recs.put(key, ch + 1);
-    return ch;
-}
-
-// A record (shaped as a call site's) of source location src in the
-// function named name: its offset in `chains`; a location without a file
-// or line has line 0.
-fn line_rec(t: *mut Tab, src: u32, name: []u8) u64 {
     let file = ir.src_file(src);
     let mut fname: []u8 = "";
     let mut line: u64 = 0;
@@ -322,30 +339,62 @@ fn line_rec(t: *mut Tab, src: u32, name: []u8) u64 {
             line = @bit_cast(u64, p.line);
         }
     }
-    let cs = t.obj.secs.get(@int_cast(usize, t.chains));
-    cs.data.align(8);
-    // the record: code, file_id, start, end, line, col, file_off, text_off,
-    // fn_off, callee_off (u32), then strs: "file\0name\0\0" after it
-    let rec = @as(u64, cs.data.len());
-    cs.data.u32_(0);
-    cs.data.u32_(0);
-    cs.data.u32_(0);
-    cs.data.u32_(0);
-    cs.data.u32_(line);
-    cs.data.u32_(0);
-    let nf = @as(u64, fname.len) + 1;
-    cs.data.u32_(0);
-    cs.data.u32_(nf + @as(u64, name.len) + 1);
-    cs.data.u32_(nf);
-    cs.data.u32_(nf + @as(u64, name.len) + 1);
-    cs.relocs.push(
-        elf.Rel.{ off: @as(u64, cs.data.len()), ty: t.abs64, sym: t.chains_sym, addend: @bit_cast(i64, rec + 48) });
-    cs.data.zeros(8);
-    cs.data.put(fname);
+    let pk = (ro_str(t, fname) << 32) | ro_str(t, scope_func(sc, name));
+    let mut pair = t.pairs.get(pk);
+    if pair == 0 {
+        pair = @as(u64, t.pairs.len) + 1;
+        t.pairs.put(pk, pair);
+    }
+    let cs = t.obj.secs.get(@int_cast(usize, t.ro));
+    let ck = (pair << 32) | next;
+    let mut ctx = t.ctxs.get(ck);
+    if ctx == 0 {
+        cs.data.align(4);
+        ctx = @as(u64, cs.data.len()) + 1;
+        let at = ctx - 1;
+        cs.data.u32_(rel(pk >> 32, at));
+        cs.data.u32_(rel(pk & 0xffff_ffff, at + 4));
+        if next == 0 {
+            cs.data.u32_(0);
+        } else {
+            cs.data.u32_(rel(next - 1, at + 8));
+        }
+        t.ctxs.put(ck, ctx);
+    }
+    let rk = (line << 32) | (ctx - 1);
+    let mut rec = t.recs.get(rk);
+    if rec == 0 {
+        cs.data.align(4);
+        if (cs.data.len() % 8) == 0 {
+            cs.data.zeros(4);
+        }
+        rec = @as(u64, cs.data.len()) + 1;
+        cs.data.u32_(line);
+        cs.data.u32_(rel(ctx - 1, rec + 3));
+        t.recs.put(rk, rec);
+    }
+    t.rec_of.put(key, rec);
+    return rec - 1;
+}
+
+// The 32 bits of a reference from `from` to `to` in .rodata.axiom_lines (to - from).
+fn rel(to: u64, from: u64) u64 {
+    return (to -% from) & 0xffff_ffff;
+}
+
+// The offset in .rodata.axiom_lines of string s (NUL-terminated), made once per object.
+fn ro_str(t: *mut Tab, s: []u8) u64 {
+    let k = u.intern(s);
+    let at = t.strs.get(k);
+    if at != 0 {
+        return at - 1;
+    }
+    let cs = t.obj.secs.get(@int_cast(usize, t.ro));
+    let o = @as(u64, cs.data.len());
+    cs.data.put(s);
     cs.data.u8_(0);
-    cs.data.put(name);
-    cs.data.zeros(2);
-    return rec;
+    t.strs.put(k, o + 1);
+    return o;
 }
 
 // Makes the entries that follow those of section `text`'s code (its
@@ -370,7 +419,7 @@ fn select_rets(t: *mut Tab) void {
     }
     // (a second section of code: the first's entries go with it too)
     t.obj.secs.get(@int_cast(usize, t.rets0)).link1 = t.text0 + 1;
-    t.rets = elf.add_sec(t.obj, "axiom_rets", elf.S_RODATA, 4);
+    t.rets = elf.add_sec(t.obj, "axiom_rets", elf.S_RODATA, 8);
     let r = t.obj.secs.get(@int_cast(usize, t.rets));
     r.link1 = text + 1;
     r.group = t.obj.secs.get(@int_cast(usize, text)).group;
@@ -395,6 +444,11 @@ pub fn func(t: *mut Tab, text: i32, base: u64, size: u64, frameless: bool, nofra
     let mut ls = Lines.{ rows: rows, k: 0, name: nm, started: not t.lines, scopes: scopes, sk: 0 };
     if not t.lines {
         ls.rows = rows[0..0];
+    } else if t.rec_of.len > 0 {
+        t.rec_of.deinit();  // (its records by location and scope are of the last function's: its name)
+    }
+    if t.lines and (size > 0) {
+        entry_to(t, base, t.ro_sym, line_table(t, &mut ls, size), F_MARKER);
     }
     let mut fl: u64 = 0;
     if frameless {
@@ -412,21 +466,6 @@ pub fn func(t: *mut Tab, text: i32, base: u64, size: u64, frameless: bool, nofra
         let mut at: u64 = 0;
         if more {
             at = calls[k] & ~CALL_FRAMELESS;
-        }
-        // (the rows before the next entry, which goes first at the same offset)
-        let mut next: u64 = 0xffff_ffff_ffff_ffff;
-        if more {
-            next = at;
-        }
-        if (end != 0) and (end < next) {
-            next = end;
-        }
-        if (end == 0) and ((n + 1) < noframe.len) and (noframe[n] < next) {
-            next = noframe[n];
-        }
-        if next_row(&mut ls) < next {
-            put_row(t, &mut ls, base, frameless or (end != 0));
-            continue;
         }
         if (end != 0) and (not more or (end < at)) {
             entry(t, base + end, t.empty, F_MARKER | F_FRAMELESS);
@@ -452,9 +491,6 @@ pub fn func(t: *mut Tab, text: i32, base: u64, size: u64, frameless: bool, nofra
             entry(t, base + at, chain, cf);
         }
         k += 2;
-    }
-    while next_row(&mut ls) < size {
-        put_row(t, &mut ls, base, frameless);
     }
     if frameless {
         entry(t, base + size, t.empty, F_MARKER | F_FRAMELESS);

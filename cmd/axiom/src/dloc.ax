@@ -123,6 +123,36 @@ pub fn calls() []CallSite {
     return CALLS.items();
 }
 
+// A location's expression's memory (an expression is made for one location
+// alone: where's, call_site's).
+fn drop_expr(x: []u8) void {
+    if x.len > 0 {
+        u.free(@ptr_from_int(*mut void, @int_from_ptr(x.ptr)));
+    }
+}
+
+/// Gives back what compute and calls returned for a function, once the
+/// debug information has it.
+pub fn release(vl: []VLoc, cs: []CallSite) void {
+    for x in vl {
+        drop_expr(x.expr);
+    }
+    if vl.len > 0 {
+        u.free(@ptr_from_int(*mut void, @int_from_ptr(vl.ptr)));
+    }
+    for c in cs {
+        for q in c.params {
+            drop_expr(q.expr);
+        }
+        if c.params.len > 0 {
+            u.free(@ptr_from_int(*mut void, @int_from_ptr(c.params.ptr)));
+        }
+    }
+    if cs.len > 0 {
+        u.free(@ptr_from_int(*mut void, @int_from_ptr(cs.ptr)));
+    }
+}
+
 // (in code order)
 pub let mut CALLS: u.List.[CallSite] = u.List.[CallSite].{ data: @ptr_from_int(*mut CallSite, 0), len: 0, cap: 0 };
 // each call's machine instruction -> its IR call (+ 0: the address)
@@ -492,10 +522,16 @@ fn expr_ops(v: *mut ir.Value, me: i32, depth: i32) void {
     if (bits == 0) or u.isnil(v.a) {
         return;
     }
-    // (not multiplications: a debugger's DW_OP_mul need not wrap around as
-    // the machine's does)
+    // (a multiplication of values of at most 32 bits only: a debugger's
+    // DW_OP_mul is right where the product of its operands is a signed
+    // 64-bit integer, and no further (a product past it comes out with the
+    // wrong sign; measured: randomly generated functions stepped in the
+    // system's debugger). expr_op sign-extends both operands from the
+    // value's width, which keeps the product within 2^62 and its low bits
+    // the machine's.)
     let two = (op == ir.OP_ADD) or (op == ir.OP_SUB) or (op == ir.OP_AND) or (op == ir.OP_OR) or (op == ir.OP_XOR) or
-              (op == ir.OP_SHL) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_PTRADD);
+              (op == ir.OP_SHL) or (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_PTRADD) or
+              ((op == ir.OP_MUL) and (bits <= 32));
     let one = (op == ir.OP_ZEXT) or (op == ir.OP_SEXT) or (op == ir.OP_TRUNC) or (op == ir.OP_PTRTOINT) or
               (op == ir.OP_INTTOPTR);
     if not two and not one {
@@ -527,6 +563,16 @@ fn expr_ops(v: *mut ir.Value, me: i32, depth: i32) void {
     x.abits = int_bits(ir.resolve(v.a));
 }
 
+// Gives back a map's memory.
+fn drop_map[V](m: *mut u.SymMap.[V]) void {
+    u.free(@ptr_cast(*mut void, m.keys));
+    u.free(@ptr_cast(*mut void, m.vals));
+    m.keys = u.nil.[usize]();
+    m.vals = u.nil.[V]();
+    m.cap = 0;
+    m.len = 0;
+}
+
 // the entities of parameters: at the entry, the parameter (VALS index)
 let mut PENTS: u.List.[[2]i32] = u.List.[[2]i32].{ data: @ptr_from_int(*mut [2]i32, 0), len: 0, cap: 0 };
 
@@ -542,11 +588,16 @@ pub fn begin(f: *mut ir.Func, on: bool) void {
     PENTS.clear();
     RCS.clear();
     mc.mk_next.clear();
+    // (the last function's maps given back)
+    drop_map.[i32](&mut by_val);
+    drop_map.[i32](&mut by_ent);
+    drop_map.[u64](&mut offs);
+    drop_map.[usize](&mut call_ir);
     by_val = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     by_ent = u.SymMap.[i32].{ keys: u.nil.[usize](), vals: u.nil.[i32](), cap: 0, len: 0 };
     offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
     call_ir = u.SymMap.[usize].{ keys: u.nil.[usize](), vals: u.nil.[usize](), cap: 0, len: 0 };
-    CALLS = u.List.[CallSite].empty();  // (a new one: the last function's stays with it)
+    CALLS = u.List.[CallSite].empty();  // (a new one: the last function's went with it: release)
     boffs.clear();
     mb_ir.clear();
     pend = 0;
@@ -755,7 +806,7 @@ pub fn block_at(bi: usize, off: u64, restart: bool) void {
     }
     if restart {
         boffs.clear();
-        offs = u.SymMap.[u64].{ keys: u.nil.[usize](), vals: u.nil.[u64](), cap: 0, len: 0 };
+        drop_map.[u64](&mut offs);
     }
     while boffs.len <= bi {
         boffs.push(0xffff_ffff_ffff_ffff);
@@ -853,11 +904,25 @@ struct State {
     c: []mut i32,
     d: []mut i32,
     a: []mut i64,
-    x: []mut bool,  // per value: made, and none of the values it is computed from (expr_of) made since
+    x: []mut u64,  // per value, a bit: made, and none of the values it is computed from (expr_of) made since
 }
 
-// (the number of values followed: State.x's)
+// (the number of values followed: State.x's bits, in NXW words)
 let mut NX: usize = 0;
+let mut NXW: usize = 0;
+
+fn x_has(s: *State, k: usize) bool {
+    return (s.x[k >> 6] & (@as(u64, 1) << @truncate(u32, k & 63))) != 0;
+}
+
+fn x_put(s: *mut State, k: usize, on: bool) void {
+    let m = @as(u64, 1) << @truncate(u32, k & 63);
+    if on {
+        s.x[k >> 6] = s.x[k >> 6] | m;
+    } else {
+        s.x[k >> 6] = s.x[k >> 6] & ~m;
+    }
+}
 
 // The analysis' tables for the function.
 struct An {
@@ -876,6 +941,8 @@ struct An {
     defi: []mut usize,  // and its index in ins
     tails: bool,
     preds: []mut u.List.[i32],  // each block's predecessors (from the successors)
+    rep: []mut i32,             // meet's tables, made once
+    at: []mut bool,
 }
 
 fn id_val(k: i32) i32 {
@@ -916,7 +983,7 @@ fn is_held(an: *An, c: i32, d: i32) bool {
 }
 
 fn st_new(ne: usize) State {
-    return State.{ c: u.newn.[i32](NL), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1), x: u.newn.[bool](NX + 1) };
+    return State.{ c: u.newn.[i32](NL), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1), x: u.newn.[u64](NXW + 1) };
 }
 
 fn st_copy(to: *mut State, from: *State, ne: usize) void {
@@ -927,7 +994,7 @@ fn st_copy(to: *mut State, from: *State, ne: usize) void {
         to.d[e] = from.d[e];
         to.a[e] = from.a[e];
     }
-    for k in 0..NX {
+    for k in 0..NXW {
         to.x[k] = from.x[k];
     }
 }
@@ -940,8 +1007,8 @@ fn st_clear(s: *mut State, ne: usize) void {
         s.d[e] = 0;
         s.a[e] = 0;
     }
-    for k in 0..NX {
-        s.x[k] = false;
+    for k in 0..NXW {
+        s.x[k] = 0;
     }
 }
 
@@ -956,7 +1023,7 @@ fn st_same(x: *State, y: *State, ne: usize) bool {
             return false;
         }
     }
-    for k in 0..NX {
+    for k in 0..NXW {
         if x.x[k] != y.x[k] {
             return false;
         }
@@ -971,6 +1038,88 @@ fn holds(s: *State, id: i32) bool {
         }
     }
     return false;
+}
+
+// The places of a state by what they hold, while emit_at looks at every
+// entity in it (PX_ON): for an identity, the registers that hold it (a
+// mask) and the first spill slot's place that does (-1: none). It answers
+// what where and expr_of would find by looking at every place.
+let mut PX_ON: bool = false;
+let mut PX_CAP: usize = 0;
+let mut PX_K: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+let mut PX_M: u.List.[u64] = u.List.[u64].{ data: @ptr_from_int(*mut u64, 0), len: 0, cap: 0 };
+let mut PX_S: u.List.[i32] = u.List.[i32].{ data: @ptr_from_int(*mut i32, 0), len: 0, cap: 0 };
+
+fn px_slot(id: i32) usize {
+    let mut j = @as(usize, @truncate(u32, @bit_cast(u32, id) *% 0x9e37_79b1)) & (PX_CAP - 1);
+    while (PX_K.get(j) != 0) and (PX_K.get(j) != id) {
+        j = (j + 1) & (PX_CAP - 1);
+    }
+    return j;
+}
+
+fn px_build(s: *State) void {
+    let mut cap: usize = 128;
+    while cap < (2 * NL) + 2 {
+        cap = cap * 2;
+    }
+    PX_CAP = cap;
+    while PX_K.len < cap {
+        PX_K.push(0);
+        PX_M.push(0);
+        PX_S.push(-1);
+    }
+    for j in 0..cap {
+        PX_K.set(j, 0);
+    }
+    for l in 0..NL {
+        let id = s.c[l];
+        if id == 0 {
+            continue;
+        }
+        let j = px_slot(id);
+        if PX_K.get(j) == 0 {
+            PX_K.set(j, id);
+            PX_M.set(j, 0);
+            PX_S.set(j, -1);
+        }
+        if l < 64 {
+            PX_M.set(j, PX_M.get(j) | (@as(u64, 1) << @truncate(u32, l)));
+        } else if PX_S.get(j) < 0 {
+            PX_S.set(j, @int_cast(i32, l));
+        }
+    }
+    PX_ON = true;
+}
+
+// The registers holding id (a mask) and the first place among the slots
+// from which to look for it (NL: none), from the index when it is on.
+fn px_regs(s: *State, id: i32) u64 {
+    if PX_ON {
+        let j = px_slot(id);
+        if PX_K.get(j) == 0 {
+            return 0;
+        }
+        return PX_M.get(j);
+    }
+    let mut m: u64 = 0;
+    for p in @as(usize, 0)..64 {
+        if s.c[p] == id {
+            m = m | (@as(u64, 1) << @truncate(u32, p));
+        }
+    }
+    return m;
+}
+
+fn px_first_slot(id: i32) usize {
+    if PX_ON {
+        let j = px_slot(id);
+        if (PX_K.get(j) == 0) or (PX_S.get(j) < 0) {
+            return NL;
+        }
+        return @int_cast(usize, PX_S.get(j));
+    }
+    return 64;
 }
 
 // Does block a dominate block b?
@@ -1152,7 +1301,7 @@ fn step(an: *An, s: *mut State, x: *Ins) void {
         }
         set_reg(an, s, x.defr, id);
         remade(s, x.defv);
-        s.x[@int_cast(usize, x.defv)] = true;
+        x_put(s, @int_cast(usize, x.defv), true);
     }
 }
 
@@ -1163,7 +1312,7 @@ fn remade(s: *mut State, k: i32) void {
         return;
     }
     for j in DEPS.get(@int_cast(usize, k)).items() {
-        s.x[@int_cast(usize, j)] = false;
+        x_put(s, @int_cast(usize, j), false);
     }
 }
 
@@ -1218,12 +1367,8 @@ fn syn(an: *An, b: usize, e: usize) i32 {
     return @truncate(i32, id);
 }
 
-fn is_syn_of(an: *An, id: i32, b: usize) bool {
-    let x = @as(i64, id) - an.syn0;
-    if (x < 0) or (an.ne == 0) {
-        return false;
-    }
-    return @as(usize, @int_cast(usize, x)) / an.ne == b;
+fn in_syn(id: i32, lo: i64, hi: i64) bool {
+    return (@as(i64, id) >= lo) and (@as(i64, id) < hi);
 }
 
 // The state at the start of block b, from the states at the ends of its
@@ -1250,19 +1395,22 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
     }
     let n = ps.len;
     let pss = ps.items();
+    // (the identities of block b's merges, syn's: [slo, shi))
+    let slo = an.syn0 + (@as(i64, @int_cast(i64, b)) * @as(i64, @int_cast(i64, an.ne)));
+    let shi = slo + @as(i64, @int_cast(i64, an.ne));
     // the entities
-    let rep = u.newn.[i32](an.ne + 1);      // a disagreeing entity's representative (-1: none)
+    let rep = an.rep;  // a disagreeing entity's representative (-1: none)
     let mut reps = u.List.[usize].empty();  // (the representatives, in order)
     for e in 0..an.ne {
         rep[e] = -1;
         let d0 = pss[0].d[e];
         let a0 = pss[0].a[e];
-        let mut same = not is_syn_of(an, d0, b);
+        let mut same = not in_syn(d0, slo, shi);
         let mut known = d0 != 0;
         let mut adds = true;
         for j in 1..n {
             let x = pss[j];
-            if (x.d[e] != d0) or is_syn_of(an, x.d[e], b) {
+            if (x.d[e] != d0) or in_syn(x.d[e], slo, shi) {
                 same = false;
             }
             if x.a[e] != a0 {
@@ -1303,7 +1451,7 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
     // the places
     for l in 0..NL {
         let c0 = pss[0].c[l];
-        let mut same = (c0 != 0) and not is_syn_of(an, c0, b);
+        let mut same = (c0 != 0) and not in_syn(c0, slo, shi);
         for j in 1..n {
             if pss[j].c[l] != c0 {
                 same = false;
@@ -1332,10 +1480,10 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
         }
     }
     // the values computed from others: so on every path
-    for k in 0..NX {
-        let mut all = true;
+    for k in 0..NXW {
+        let mut all: u64 = 0xffff_ffff_ffff_ffff;
         for j in 0..n {
-            all = all and pss[j].x[k];
+            all = all & pss[j].x[k];
         }
         s.x[k] = all;
     }
@@ -1345,7 +1493,7 @@ fn meet(an: *An, b: usize, outs: []State, seen: []bool, entry: *State, s: *mut S
         let x = VALS.at(k);
         let id = id_val(@int_cast(i32, k));
         let mut ok = u.notnil(ib) and (b != 0);
-        let mut at = u.newn.[bool](NL);
+        let at = an.at;
         for l in 0..NL {
             at[l] = ok;
         }
@@ -1576,6 +1724,7 @@ fn flatten(an: *mut An) void {
         }
     }
     an.bfirst[an.nb] = an.ins.len;
+    drop_map.[i32](&mut by_def);
 }
 
 /// The location pieces of the function's variables, from its machine code
@@ -1632,13 +1781,15 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
             x.phi_blk = ir_mb.get(key(@int_from_ptr(x.v.blk))) - 1;
         }
     }
+    drop_map.[i32](&mut ir_mb);
     let ne = ENTS.len;
     let nv = @int_cast(i32, VALS.len);
     let mut an = An.{ mf: mf, t: t, nb: nb, ne: ne, nv: nv,
                       syn0: (2 * @as(i64, nv)) + @as(i64, @int_cast(i64, CONSTS.len)) + 1, ins: u.List.[Ins].empty(),
                       bfirst: u.newn.[usize](nb + 1), idom: u.newn.[i32](nb + 1), rpo: u.newn.[i32](nb + 1),
                       rpon: u.newn.[i32](nb + 1), defb: u.newn.[i32](VALS.len + 1), defi: u.newn.[usize](VALS.len + 1),
-                      tails: false, preds: u.newn.[u.List.[i32]](nb + 1) };
+                      tails: false, preds: u.newn.[u.List.[i32]](nb + 1), rep: u.newn.[i32](ENTS.len + 1),
+                      at: u.nil_slice.[bool]() };
     for b in 0..nb {
         an.preds[b] = u.List.[i32].empty();
     }
@@ -1651,7 +1802,9 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     }
     dominators(&mut an);
     flatten(&mut an);
+    an.at = u.newn.[bool](NL + 1);  // (NL: flatten's)
     NX = VALS.len;
+    NXW = (NX + 63) / 64;
     find_deps();
     for k in 0..PHIS.len {
         PHIS.at(k).deinit();
@@ -1679,15 +1832,17 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
     for pe in PENTS.items() {
         entry.d[@int_cast(usize, pe[0])] = id_val(pe[1]);
     }
-    let ins_ = u.newn.[State](nb + 1);
+    // (each block's state at its start is the meet of its predecessors' at
+    // their ends: made again where it is needed, not kept; a block none of
+    // whose predecessors' changed since it was run gives what it gave)
     let outs = u.newn.[State](nb + 1);
     let seen = u.newn.[bool](nb + 1);
+    let dirty = u.newn.[bool](nb + 1);
     for b in 0..nb {
-        ins_[b] = st_new(ne);
         outs[b] = st_new(ne);
-        st_clear(&mut ins_[b], ne);
         st_clear(&mut outs[b], ne);
         seen[b] = false;
+        dirty[b] = true;
     }
     let mut cur = st_new(ne);
     let mut changed = true;
@@ -1701,13 +1856,21 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
                 break;
             }
             let bi = @int_cast(usize, b);
-            meet(&an, bi, outs, seen, &entry, &mut ins_[bi]);
-            st_copy(&mut cur, &ins_[bi], ne);
+            if not dirty[bi] {
+                continue;
+            }
+            dirty[bi] = false;
+            meet(&an, bi, outs, seen, &entry, &mut cur);
             run_block(&an, bi, &mut cur);
             if not seen[bi] or not st_same(&cur, &outs[bi], ne) {
                 st_copy(&mut outs[bi], &cur, ne);
                 seen[bi] = true;
                 changed = true;
+                for sc in mf.blocks.get(bi).succs.items() {
+                    if (sc >= 0) and (@int_cast(usize, sc) < nb) {
+                        dirty[@int_cast(usize, sc)] = true;
+                    }
+                }
             }
         }
     }
@@ -1715,7 +1878,7 @@ pub fn compute(mf: *mc.MFunc, t: *Tgt, size: u64) []VLoc {
         an.ins.deinit();
         return out.items();  // (did not settle: nothing said)
     }
-    ranges(&an, ins_, &entry, size, &mut out);
+    ranges(&an, outs, seen, &entry, size, &mut out);
     an.ins.deinit();
     for b in 0..nb {
         an.preds[b].deinit();
@@ -1796,11 +1959,14 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
     }
     // (the register it was in, if it still is: fewer pieces; else the lowest)
     let mut best: i32 = -1;
-    for p in @as(usize, 0)..64 {
-        if (s.c[p] == id) and ((minus & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) == 0) {
-            let dr = an.t.dw_reg(@int_cast(i32, p));
-            if (dr >= 0) and ((best < 0) or (dr == prefer)) {
-                best = dr;
+    let rm = px_regs(s, id) & ~minus;
+    if rm != 0 {
+        for p in @as(usize, 0)..64 {
+            if (rm & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
+                let dr = an.t.dw_reg(@int_cast(i32, p));
+                if (dr >= 0) and ((best < 0) or (dr == prefer)) {
+                    best = dr;
+                }
             }
         }
     }
@@ -1809,7 +1975,7 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
         r.reg = best;
         return r;
     }
-    for p in 64..NL {
+    for p in px_first_slot(id)..NL {
         if s.c[p] == id {
             let so = an.t.slot_off(place_slot(p));
             if so != NO_LOC {
@@ -1836,7 +2002,7 @@ fn where(an: *An, s: *State, e: usize, minus: u64, prefer: i32) VLoc {
             }
             return r;
         }
-        if (x.xop != 0) and s.x[@int_cast(usize, id - 1)] and not en.ind {
+        if (x.xop != 0) and x_has(s, @int_cast(usize, id - 1)) and not en.ind {
             let mut ex = u.List.[u8].empty();
             if expr_of(an, s, id - 1, minus, 0, &mut ex) {
                 r.kind = LK_EXPR;
@@ -2059,17 +2225,20 @@ fn expr_of(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.
         return false;
     }
     let nbytes = (ib + 7) / 8;
-    for p in @as(usize, 0)..64 {
-        if (s.c[p] == id) and ((minus & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) == 0) {
-            let dr = an.t.dw_reg(@int_cast(i32, p));
-            if (dr >= 0) and (dr < 32) {
-                out.push(OP_BREG0 + @truncate(u8, @as(u32, @bit_cast(u32, dr))));
-                put_sleb(out, 0);
-                return true;
+    let rm = px_regs(s, id) & ~minus;
+    if rm != 0 {
+        for p in @as(usize, 0)..64 {
+            if (rm & (@as(u64, 1) << @as(u32, @truncate(u32, p)))) != 0 {
+                let dr = an.t.dw_reg(@int_cast(i32, p));
+                if (dr >= 0) and (dr < 32) {
+                    out.push(OP_BREG0 + @truncate(u8, @as(u32, @bit_cast(u32, dr))));
+                    put_sleb(out, 0);
+                    return true;
+                }
             }
         }
     }
-    for p in 64..NL {
+    for p in px_first_slot(id)..NL {
         if s.c[p] == id {
             let so = an.t.slot_off(place_slot(p));
             if so != NO_LOC {
@@ -2100,7 +2269,7 @@ fn expr_of(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.
         }
         return entry_value(an, &x, out);
     }
-    if (x.xop == 0) or (depth >= 4) or not s.x[@int_cast(usize, k)] {
+    if (x.xop == 0) or (depth >= 4) or not x_has(s, @int_cast(usize, k)) {
         return false;
     }
     return expr_op(an, s, k, minus, depth, out);
@@ -2126,11 +2295,14 @@ fn expr_op(an: *An, s: *State, k: i32, minus: u64, depth: i32, out: *mut u.List.
     }
     if op == ir.OP_LSHR {
         put_ext(out, x.bits, false);
-    } else if op == ir.OP_ASHR {
+    } else if (op == ir.OP_ASHR) or (op == ir.OP_MUL) {
         put_ext(out, x.bits, true);
     }
     if not put_operand(an, s, x.xb, x.cb, minus, depth, out) {
         return false;
+    }
+    if op == ir.OP_MUL {
+        put_ext(out, x.bits, true);  // (both operands within 32 bits: see expr_ops)
     }
     if (op == ir.OP_LSHR) or (op == ir.OP_ASHR) or (op == ir.OP_SHL) {
         put_ext(out, x.bits, false);  // (the count: what the instruction read of it)
@@ -2166,10 +2338,123 @@ fn same_loc(a: *VLoc, b: *VLoc) bool {
 // in registers `minus`; none at all: `none`), each one a piece of out
 // when it differs from the one before (open: each entity's last piece in
 // out + 1, 0: none open).
-fn emit_at(an: *An, s: *State, minus: u64, none: bool, at: u64, open: []mut usize, out: *mut u.List.[VLoc]) void {
+//
+// An entity's location is found again (where) only where it may differ
+// from the one found last for it: where depends on the entity's identity
+// and constant, the places that hold the identity (the registers of those
+// that `minus` names), `none`, and for a value computed from others (or
+// waiting for its making) on the places of those: such an entity is
+// looked at each time. The others are looked at again when their identity
+// or constant changed, a place that held or holds the identity changed
+// since (EM: the emission at which each identity's places last changed),
+// or `minus` names other registers among those holding it.
+fn emit_at(an: *An, em: *mut Em, s: *State, minus: u64, none: bool, at: u64, open: []mut usize,
+           out: *mut u.List.[VLoc]) void {
+    em.n += 1;
+    for l in 0..NL {
+        let c = s.c[l];
+        if c != em.c[l] {
+            em_touch(em, em.c[l]);
+            em_touch(em, c);
+            em.c[l] = c;
+        }
+    }
+    emit_each(an, em, s, minus, none, at, open, out);
+    PX_ON = false;
+}
+
+// The incremental emission's tables (ranges makes them for a function).
+struct Em {
+    n: u64,          // the emissions so far
+    c: []mut i32,    // each place's identity as last seen
+    ids: u.U64Map,   // an identity -> the emission at which a place that holds it last changed (but:)
+    low: []mut u64,  // the same for the identities 1 .. lown (the values, made or waiting, and the constants)
+    lown: i32,
+    vol: []mut bool,  // per identity 1 .. lown: looked at each time (a value computed from others, or waiting)
+    at: []mut u64,    // per entity: the emission of its last where (0: none)
+    d: []mut i32,     // and that where's inputs
+    a: []mut i64,
+    minus: []mut u64,
+    none: []mut bool,
+}
+
+fn em_new(an: *An, ne: usize) Em {
+    let lown = @truncate(i32, an.syn0 - 1);
+    let n = @int_cast(usize, lown) + 1;
+    let mut em = Em.{ n: 0, c: u.newn.[i32](NL + 1), ids: u.U64Map.empty(), low: u.newn.[u64](n), lown: lown,
+                      vol: u.newn.[bool](n), at: u.newn.[u64](ne + 1), d: u.newn.[i32](ne + 1), a: u.newn.[i64](ne + 1),
+                      minus: u.newn.[u64](ne + 1), none: u.newn.[bool](ne + 1) };
+    let nv = an.nv;
+    for id in 0..n {
+        em.low[id] = 0;
+        let k = @int_cast(i32, id);
+        em.vol[id] = ((k > nv) and (k <= 2 * nv)) or ((k > 0) and (k <= nv) and (VALS.get(id - 1).xop != 0));
+    }
+    for l in 0..NL {
+        em.c[l] = 0;
+    }
+    for e in 0..ne {
+        em.at[e] = 0;
+    }
+    return em;
+}
+
+fn em_touch(em: *mut Em, id: i32) void {
+    if (id > 0) and (id <= em.lown) {
+        em.low[@int_cast(usize, id)] = em.n;
+    } else if id != 0 {
+        em.ids.put(@as(u64, @bit_cast(u32, id)), em.n);
+    }
+}
+
+// The registers of mask m that hold id in s.
+fn held_in(s: *State, m: u64, id: i32) u64 {
+    let mut r: u64 = 0;
+    let mut x = m;
+    while x != 0 {
+        let p = @truncate(u32, @ctz(x));
+        x = x & (x - 1);
+        if s.c[@as(usize, p)] == id {
+            r = r | (@as(u64, 1) << p);
+        }
+    }
+    return r;
+}
+
+// Is entity e's location the one found for it last (see emit_at)?
+fn em_same(an: *An, em: *mut Em, s: *State, e: usize, minus: u64, none: bool) bool {
+    let id = s.d[e];
+    if (em.at[e] == 0) or (em.d[e] != id) or (em.a[e] != s.a[e]) or (em.none[e] != none) {
+        return false;
+    }
+    if (id > 0) and (id <= em.lown) {
+        if em.vol[@int_cast(usize, id)] or (em.low[@int_cast(usize, id)] > em.at[e]) {
+            return false;
+        }
+    } else if em.ids.get(@as(u64, @bit_cast(u32, id))) > em.at[e] {
+        return false;
+    }
+    return held_in(s, minus, id) == held_in(s, em.minus[e], id);
+}
+
+// (emit_at's work)
+fn emit_each(an: *An, em: *mut Em, s: *State, minus: u64, none: bool, at: u64, open: []mut usize,
+             out: *mut u.List.[VLoc]) void {
     for e in 0..an.ne {
         if (s.d[e] <= 0) and (open[e] == 0) {
+            em.at[e] = 0;
             continue;  // (not known, and no piece open: none still)
+        }
+        if em_same(an, em, s, e, minus, none) {
+            continue;
+        }
+        em.at[e] = em.n;
+        em.d[e] = s.d[e];
+        em.a[e] = s.a[e];
+        em.minus[e] = minus;
+        em.none[e] = none;
+        if not PX_ON {
+            px_build(s);
         }
         let mut prefer: i32 = -1;
         if (open[e] != 0) and (out.at(open[e] - 1).kind == LK_REG) {
@@ -2183,6 +2468,7 @@ fn emit_at(an: *An, s: *State, minus: u64, none: bool, at: u64, open: []mut usiz
         if o != 0 {
             let p = out.at(o - 1);
             if (w.kind != 0xff) and same_loc(p, &w) {
+                drop_expr(w.expr);
                 continue;
             }
             p.end = at;
@@ -2193,6 +2479,8 @@ fn emit_at(an: *An, s: *State, minus: u64, none: bool, at: u64, open: []mut usiz
             w.end = at;
             out.push(w);
             open[e] = out.len;
+        } else {
+            drop_expr(w.expr);
         }
     }
 }
@@ -2200,9 +2488,10 @@ fn emit_at(an: *An, s: *State, minus: u64, none: bool, at: u64, open: []mut usiz
 // The pieces of the entities' locations over the encoded code: each block's
 // start (the state it is entered with) and each visited instruction's group
 // (the state before it, but what the group writes), in code order.
-fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VLoc]) void {
+fn ranges(an: *An, outs: []State, seen: []bool, entry: *State, size: u64, out: *mut u.List.[VLoc]) void {
     let nb = an.nb;
     let ne = an.ne;
+    let mut em = em_new(an, ne);
     let open = u.newn.[usize](ne + 1);
     for e in 0..ne {
         open[e] = 0;
@@ -2224,7 +2513,7 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
     let mut s = st_new(ne);
     // (the code before the first block's: the prologue, at the entry)
     CUR_B = -1;
-    emit_at(an, entry, 0, false, 0, open, out);
+    emit_at(an, &mut em, entry, 0, false, 0, open, out);
     let mut last: u64 = 0;
     for k in 0..nb {
         let b = order[k];
@@ -2232,8 +2521,12 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
         if bo == 0xffff_ffff_ffff_ffff {
             continue;
         }
-        st_copy(&mut s, &ins_[b], ne);
         let unreached = an.rpon[b] < 0;
+        if unreached {
+            st_clear(&mut s, ne);
+        } else {
+            meet(an, b, outs, seen, entry, &mut s);
+        }
         let lo = an.bfirst[b];
         let hi = an.bfirst[b + 1];
         // the first visited instruction's offset
@@ -2248,7 +2541,7 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
         CUR_B = @int_cast(i32, b);
         CUR_J = lo;
         if (bo >= last) and ((first == 0xffff_ffff_ffff_ffff) or (bo < first)) {
-            emit_at(an, &s, 0, unreached, bo, open, out);
+            emit_at(an, &mut em, &s, 0, unreached, bo, open, out);
             last = bo;
         }
         if DBGF {
@@ -2293,7 +2586,7 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
                 }
                 if o - 1 >= last {
                     CUR_J = j;
-                    emit_at(an, &s, minus, exit or unreached, o - 1, open, out);
+                    emit_at(an, &mut em, &s, minus, exit or unreached, o - 1, open, out);
                     last = o - 1;
                 }
                 if ((x.i.clobber != 0) or an.t.is_tail(x.i)) and not unreached {
@@ -2304,6 +2597,7 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
             j += 1;
         }
     }
+    em.ids.deinit();
     for e in 0..ne {
         if open[e] != 0 {
             out.at(open[e] - 1).end = size;
@@ -2316,6 +2610,8 @@ fn ranges(an: *An, ins_: []State, entry: *State, size: u64, out: *mut u.List.[VL
         if p.end > p.start {
             out.set(n, p);
             n += 1;
+        } else {
+            drop_expr(p.expr);
         }
     }
     out.len = n;

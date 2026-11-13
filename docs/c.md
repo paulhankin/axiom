@@ -2618,9 +2618,13 @@ records of the calls the crash is below: each line names the function that made 
 and where, and the first the function called (only as `<indirect call>` when it was
 called through a pointer). The faulting instruction itself has no record; with line
 tables (`-g`, `--debug-info=lines`) its line is shown all the same (`at deref
-(crash.c:2)`), from rows the frame table then holds (`cmd/axiom/src/ftab.ax`: no DWARF
-is read at run time), also where no call was recorded (all of a program inlined into
-`main`); without them the table and the code are as before.
+(crash.c:2)`), from a line table per function that the frame table then refers to
+(`cmd/axiom/src/ftab.ax`: no DWARF is read at run time), also where no call was
+recorded (all of a program inlined into `main`); without them the table and the code
+are as before. The line tables are read-only data without relocations, two or three
+bytes a row and a record of 8 bytes per line and function (with the records of the
+calls it was inlined at, shared); the compiler's own executable grows by about 7 MB
+with them (its DWARF is about 16 MB more), its writable data not at all.
 
 At `-O2` and `-O3` the trace is correct for the frames that exist, and the calls the
 optimizer inlined into them are in it too (an inlined call's record carries the calls
@@ -2658,27 +2662,31 @@ Axiom's run-time checks: no bounds or overflow checks, so a bad pointer is a cra
 is one at all. On WebAssembly C's calls write their call-site records on the shadow
 stack as Axiom's do (three stores and a load per call; `--stack-traces=off` leaves
 them out), and the optimizer's inlining keeps them: a trap (such as a division by
-zero) shows the C frames at every optimization level. A `longjmp` there leaves the
-records of the frames it leaves behind, so a later trace may show some of them.
+zero) shows the C frames at every optimization level. `setjmp` keeps the shadow
+stack's depth in the `jmp_buf` and the code after a `longjmp` puts it back, so a later
+trace shows none of the frames the jump left.
 
 ## Debugging
 
 `-g` (or `--debug-info=full`) writes DWARF 5 debug information, `--debug-info=lines`
 the line tables and frames only, and `--debug-info=none` (the default) nothing. It does
 not change the instructions generated, at any optimization level, and two builds are
-the same. With line tables the frame table also holds the line rows of crash traces
-("Stack traces"), which enlarge the program's loaded data: an object's code and its
-relocations are the same as without `-g` (the suite compares them), but in an
-executable what the rows push further on is at other addresses, and so are the
-addresses the instructions that refer to it hold (the code's size and its other bytes
-do not change). An executable is therefore not the same as without `-g` (on macOS
-either, where the debug information itself is in the `.dSYM`).
+the same. With line tables the frame table also refers to the line tables of crash
+traces ("Stack traces"), which enlarge the program's loaded read-only data: an
+object's code and its relocations are the same as without `-g` (the suite compares
+them), but in an executable what the tables push further on is at other addresses,
+and so are the addresses the instructions that refer to it hold (the code's size and
+its other bytes do not change; the writable data is the same). An executable is
+therefore not the same as without `-g` (on macOS either, where the debug information
+itself is in the `.dSYM`).
 
 - **Lines**: each function's code is mapped to the lines of the source, `#line`
   directives followed (the presumed file and line, as diagnostics show them); code the
   optimizer inlined or moved keeps the line it came from. Each file of a line table has
   the MD5 of its contents, unless one of the unit's files is a name `#line` gave
-  (then none has). The prologue ends, for a
+  (then none has); the predefined macros' `<built-in>` is the same in every build
+  (`__DATE__` and `__TIME__` are not defined in its text: the preprocessor replaces
+  them). The prologue ends, for a
   breakpoint on a function, past the stores of its parameters. Columns are not
   recorded.
 - **Frames**: call frame information for every instruction of every function
@@ -2686,7 +2694,9 @@ either, where the debug information itself is in the `.dSYM`).
   a debugger can unwind the stack wherever it stops.
 - **Types and variables** (`full`): the program's types (base types, `_BitInt` with its
   width in bits, pointers, qualifiers, arrays, structures and unions with their
-  bit-fields, enumerations and their constants, function types, typedefs); each
+  bit-fields, enumerations and their constants with their exact values, also those a
+  signed 64-bit integer does not hold: an unsigned one in `DW_FORM_udata`, a 128-bit one
+  in `DW_FORM_data16`, as in memory; function types, typedefs); each
   function's result type, parameters and local variables; objects of static storage
   duration, thread-local ones included (by their offset in the thread's TLS block; on
   macOS, where the thread's block is the value of a pthread key, through a descriptor
@@ -2751,8 +2761,10 @@ either, where the debug information itself is in the `.dSYM`).
     (`DW_OP_bregN`, `DW_OP_fbreg`, `DW_OP_entry_value` and the stack machine's
     operations, `DW_OP_stack_value`), as long as none of them was made again since;
     so is a value not made yet in its block whose operands are those it will be made
-    from; not multiplications (a debugger's `DW_OP_mul` need not wrap around as the
-    machine's does), divisions or floating-point arithmetic;
+    from; a multiplication of values of at most 32 bits too (its operands
+    sign-extended from the value's width: the system's debugger computes `DW_OP_mul`
+    right only where the product is a signed 64-bit integer, and gives a product past
+    it the wrong sign), not a wider one, divisions or floating-point arithmetic;
   - a register or spill slot holds a value until something writes it: an instruction
     that only reads a slot (a reload folded into an arithmetic instruction, a
     comparison with it) leaves it, and every slot the code spills to is followed;
@@ -2801,18 +2813,24 @@ either, where the debug information itself is in the `.dSYM`).
   the C library's own units, nor `__DATE__` and `__TIME__` (two builds are the
   same). `--debug-macros=off` leaves them out (a program including `<stdio.h>` gets
   about 4 KB of them).
-- **Cost**: `-g` at `-O2` compiles C programs about 40% slower, with about a third more
-  memory; the compiler itself (a large program) about 45% more processor time and
-  twice the memory, most of it the location analysis of large functions
-  (`dloc.ax`), the optimizer's records of the variables' assignments, and the
-  frame table's line rows and debug sections held while linking.
+- **Cost**: `-g` at `-O2` compiles C programs about a quarter slower (processor
+  time), with about a tenth more memory; the compiler itself (a large program, in
+  its parts: "Optimization") with about a third more processor time and a fifth more
+  memory (the most any one process needs). Most of the time is the location analysis
+  (`dloc.ax`: what each register and slot holds at each instruction, for every
+  variable of the function, so large functions with many variables cost most), then
+  the debug information written and the optimizer's records of the variables'
+  assignments; most of the memory those records, which every part of a program
+  compiled in parts starts with. The executable's debug sections are about the size
+  of its code; its frame table's line tables a third of the line tables' DWARF
+  ("Stack traces").
 Where it goes, per target:
 
 | Target | |
 |---|---|
 | `x86_64`, `aarch64` | The executable's (or object's) `.debug_*` sections: `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.debug_line_str`, `.debug_aranges`, `.debug_frame`, `.debug_names` (an index of the unit's subprograms, static variables, named types and enumerators), and when needed `.debug_rnglists` and `.debug_loclists`. |
 | `aarch64-macos`, `x86_64-macos` | The debug bundle `<out>.dSYM` beside the executable, which the platform's debugger finds by the executable's UUID; the executable's instructions are those without `-g`, but for the addresses of the data its frame table's line rows move. The DWARF of each object given to the link (this compiler's, or the platform's compilers' with DWARF 2 to 5) is carried in at its place: Mach-O objects refer from one debug section into another by offsets without relocations, which the linker moves by where each object's sections land (`cmd/axiom/src/dwrebase.ax`). The executable has unwind tables, with or without `-g` (`cmd/axiom/src/macunwind.ax`): `__unwind_info` gives every function a compact encoding (arm64: no frame, or the frame record with the callee-saved pairs below it, which the code lays out as the encoding has them; x86-64: no frame, or rbp's frame with up to five pushed registers), or one that names its entry in `__eh_frame` (DWARF's call frame information, exact at every instruction) where the encoding cannot say the frame (vector registers saved whole), where the stack pointer moves after the prologue, where a sibling call's jump is before the function's end, where code runs before the frame is set up, and for assembly procedures with `.cfi_` rules. Mach-O objects carry `__compact_unwind` and `__eh_frame` in the form the platform's assembler writes, and the linker merges those of the platform's compilers' objects too (a function an object gives no entry has an entry without information). `macho.mjs` decodes the tables of every macOS executable the suite builds; nothing here has run an unwinder over them. |
-| `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`, a module per object, every function's procedure and public symbol. With `-g` also, in CodeView form (`codeview.ax`, from the same description of the program as DWARF), the types (TPI, with its hash stream: a forward reference to a structure is found by its name), ids (IPI: the functions' ids, where each structure is defined), each function's type, frame, lexical blocks (a block in several pieces of code is a block per piece) and variables, and the static objects (`S_GDATA32`, `S_LDATA32`, thread-locals as `S_GTHREAD32` at their offset in the template, which starts `.data`) and typedefs and tags (`S_UDT`) at file and block scope. At `-O0` a local is at its offset from the frame pointer (`S_REGREL32`), a parameter an `S_LOCAL` located from the call frame's register at each instruction; in optimized code a variable is an `S_LOCAL` with the ranges where it is all in a register, in a frame slot or in memory at an address held in a register, or an `S_CONSTANT` where it is one constant throughout. Not described ("optimized out" there, never a wrong value): a structure taken apart into registers (the system's symbol handler reads CodeView's subfield ranges as the whole variable), a value computed from a register (a register plus a constant, an address of a frame object or a datum), the value at an address held in a frame slot (at `-O0`: a variable length array, a parameter passed by reference); a variable length array's bound. Typedefs are `S_UDT` names (what is declared with one has the type it names); `_Atomic T` is `T`; a base type CodeView has no primitive for (decimal floating types, a bit-precise integer narrower than its storage) is a structure of its name and size holding its bytes; an Axiom union a structure of its tag and each payload at its offset. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame), right at every instruction: a large frame's stack probe does not move `rsp`, and a function with sibling calls uses the frame-register form with an entry of its own for each jump (the code after it chained), so that the unwinder is right whether or not it takes a jump out of a function for the end of an epilogue. The suite decodes every unwind record as the system does before each Windows program runs (`pe.mjs`) and single-steps a walk through every kind of frame (`c/mix/win_walk`). |
+| `x86_64-windows` | The PDB (`--pdb=on`, the default) has every function's line table, with or without `-g`, a module per object, every function's procedure and public symbol. With `-g` also, in CodeView form (`codeview.ax`, from the same description of the program as DWARF), the types (TPI, with its hash stream: a forward reference to a structure is found by its name), ids (IPI: the functions' ids, where each structure is defined), each function's type, frame, lexical blocks (a block in several pieces of code is a block per piece) and variables, and the static objects (`S_GDATA32`, `S_LDATA32`, thread-locals as `S_GTHREAD32` at their offset in the template, which starts `.data`) and typedefs and tags (`S_UDT`) at file and block scope. At `-O0` a local is at its offset from the frame pointer (`S_REGREL32`), a parameter an `S_LOCAL` located from the call frame's register at each instruction; in optimized code a variable is an `S_LOCAL` with the ranges where it is all in a register, in a frame slot or in memory at an address held in a register, or an `S_CONSTANT` where it is one constant throughout. Not described ("optimized out" there, never a wrong value): a structure taken apart into registers (the system's symbol handler reads CodeView's subfield ranges as the whole variable), a value computed from a register (a register plus a constant, an address of a frame object or a datum), the value at an address held in a frame slot (at `-O0`: a variable length array, a parameter passed by reference); a variable length array's bound. Typedefs are `S_UDT` names (what is declared with one has the type it names); an enumerator's value that a signed 64-bit integer does not hold is `LF_UQUADWORD` when it is an unsigned 64-bit one, and a wider one is left out of its enumeration's field list (CodeView's 128-bit leaves, `LF_OCTWORD` and `LF_UOCTWORD`, make the tools that read the type records take them for corrupt); `_Atomic T` is `T`; a base type CodeView has no primitive for (decimal floating types, a bit-precise integer narrower than its storage) is a structure of its name and size holding its bytes; an Axiom union a structure of its tag and each payload at its offset. The function table (`.pdata`) describes every function with a frame (a function without one makes no call: every call on Windows reserves the shadow space, which gives the caller a frame), right at every instruction: a large frame's stack probe does not move `rsp`, and a function with sibling calls uses the frame-register form with an entry of its own for each jump (the code after it chained), so that the unwinder is right whether or not it takes a jump out of a function for the end of an epilogue. The suite decodes every unwind record as the system does before each Windows program runs (`pe.mjs`) and single-steps a walk through every kind of frame (`c/mix/win_walk`). |
 | `aarch64-windows` | As `x86_64-windows`; the function table's ARM64 records describe every function with a frame (on Windows every function that calls has one). |
 | `wasm32`, `wasm64` | Custom sections `.debug_info`, `.debug_line`, ... of the module, code addresses as offsets in its code section, a compilation unit per unit compiled (each object carries its own, which the linker merges; a function it did not keep is at the tombstone address -1). With `-g` the types and variables too: at `-O0` each variable in its frame slot (`DW_OP_fbreg`), the frame base being the local that holds the frame's address (`DW_OP_WASM_location 0`, or the stack pointer, global 0, without a frame); in optimized code a variable is in the function's local that holds its value (`DW_OP_WASM_location 0`: a parameter's, or the local a value was given while it holds that value: locals are shared by values not live at once), a constant, or a frame object's address, followed over the blocks as on native targets (not computed from other values, no entry values or call sites); a static object at its address, a thread-local none (each thread's instance is elsewhere). No call frame information, which WebAssembly has no use for. |
 
