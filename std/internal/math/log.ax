@@ -19,9 +19,9 @@
 // for c != 1, |log c| is at least 1.97 |r| over the table, and for k != 0
 // the first term is at least a third.)
 // log2 has its own table of log2 c (with a high part that k + it keeps
-// exact) and polynomial; it and log1p take the double-double logarithm only
-// when the fast sum's error bound does not decide the rounding (Ziv's
-// strategy).
+// exact) and polynomial; log2, log10 and log1p round their sums once, as
+// log does. The products and sums are the same bits with and without fused
+// multiply-adds (those compute only exact products' low parts here).
 // =============================================================================
 import "core.ax" as m;
 import "tables.ax" as t;
@@ -44,16 +44,25 @@ inline fn reduce(ix: u64) Red {
     let iz = ix -% (tmp & 0xfff0000000000000);
     let mm = m.from_bits(iz);
     let c = m.from_bits(t.LOG_C[i]);
-    // m = mh + ml with mh of 43 bits: mh c (53 bits) and ml c are exact, and
-    // so is mh c - 1 (mh c is within 2^-7 of 1); their sum rounds once, and
-    // fast_two_sum keeps its error (exact, or the sum is: see below)
-    let mh = m.from_bits(iz & 0xfffffffffffffc00);
-    let ml = mm - mh;
-    let a = (mh * c) - 1.0;
-    let b = ml * c;
-    // (if |a| < |b|, both are multiples of 2^-62 below 2^-40: the sum is
-    // exact, and fast_two_sum's error is 0)
-    let s = m.fast_two_sum(a, b);
+    let mut s = m.dd(0.0, 0.0);
+    if @target_has("fma") or @target_arch("aarch64") {
+        // m c = p + pl exactly (p the product rounded, pl by a fused
+        // multiply-add), p - 1 exact (p is within 2^-7 of 1), and |pl| <=
+        // ulp(p)/2 <= |p - 1| unless p = 1: fast_two_sum gives m c - 1
+        // rounded and its error, the same pair as the split below
+        let p = mm * c;
+        s = m.fast_two_sum(p - 1.0, @fma(mm, c, -p));
+    } else {
+        // m = mh + ml with mh of 43 bits: mh c (53 bits) and ml c are exact,
+        // and so is mh c - 1 (mh c is within 2^-7 of 1); their sum rounds
+        // once, and fast_two_sum keeps its error (exact, or the sum is: if
+        // |a| < |b|, both are multiples of 2^-62 below 2^-40, and the error
+        // is 0)
+        let mh = m.from_bits(iz & 0xfffffffffffffc00);
+        let a = (mh * c) - 1.0;
+        let b = (mm - mh) * c;
+        s = m.fast_two_sum(a, b);
+    }
     return Red.{ i: i, k: @float_from_int(f64, k), r: s.hi, rl: s.lo, l_hi: m.from_bits(t.LOG_L[2 * i]),
                  l_lo: m.from_bits(t.LOG_L[(2 * i) + 1]) };
 }
@@ -62,8 +71,12 @@ inline fn reduce(ix: u64) Red {
 /// power of two that was taken out (0 or 52).
 inline fn normal_bits(x: f64) u64 {
     let ix = m.bits(x);
+    // (x's significand alone scaled, so that the product, which the
+    // optimizer may compute whatever x is, never overflows: it is exact,
+    // and raises nothing)
+    let sc = m.bits(m.from_bits(ix & 0x000fffffffffffff) * 4503599627370496.0) -% (@as(u64, 52) << 52);  // 2^52
     if ix < 0x0010000000000000 {
-        return m.bits(x * 4503599627370496.0) -% (@as(u64, 52) << 52);  // 2^52
+        return sc;
     }
     return ix;
 }
@@ -114,10 +127,31 @@ pub inline fn log(x: f64, rep: m.Rep) f64 {
 /// rounding, within 2^-60 relative (log's sum: the inverse hyperbolic
 /// functions add a correction before rounding).
 pub inline fn log_fast(x: f64) m.DD {
-    let rd = reduce(normal_bits(x));
+    return log_fast_b(normal_bits(x));
+}
+
+/// log_fast of the positive normal double whose bits are ix (or of x as
+/// normal_bits gives it).
+pub inline fn log_fast_b(ix: u64) m.DD {
+    let rd = reduce(ix);
     let a = m.fast_two_sum(rd.k * t.LN2_HI, rd.l_hi);
     let b = m.fast_two_sum(a.hi, rd.r);
     return m.dd(b.hi, (((a.lo + b.lo) + (rd.k * t.LN2_LO)) + (rd.l_lo + rd.rl)) + poly(rd.r));
+}
+
+/// log_fast for x a positive normal double of at most 24 significant bits
+/// (a float's value, >= 2^-126): m c - 1 is exact in one product (24 and 10
+/// bits), so that the reduction needs no split, and the sum is log_fast's
+/// with its rl = 0: the same bits.
+pub inline fn log_fast_f(x: f64) m.DD {
+    let ix = m.bits(x);
+    let tmp = ix -% t.LOG_OFF;
+    let i = @as(usize, @truncate(u8, (tmp >> 45) & 127));
+    let k = @float_from_int(f64, @bit_cast(i64, tmp) >> 52);
+    let r = (m.from_bits(ix -% (tmp & 0xfff0000000000000)) * m.from_bits(t.LOG_C[i])) - 1.0;
+    let a = m.fast_two_sum(k * t.LN2_HI, m.from_bits(t.LOG_L[2 * i]));
+    let b = m.fast_two_sum(a.hi, r);
+    return m.dd(b.hi, (((a.lo + b.lo) + (k * t.LN2_LO)) + m.from_bits(t.LOG_L[(2 * i) + 1])) + poly(r));
 }
 
 /// log(1 + x) for x > -1 (finite), as hi + lo before its last rounding,
@@ -131,7 +165,7 @@ pub inline fn log1p_fast(x: f64) m.DD {
         return m.dd(x, z * p);
     }
     let s = m.two_sum(1.0, x);
-    let l = log_fast(s.hi);
+    let l = log_fast_b(m.bits(s.hi));  // (1 + x >= 2^-53)
     return m.dd(l.hi, l.lo + (s.lo / s.hi));
 }
 
@@ -143,7 +177,13 @@ pub fn log_dd(x: f64) m.DD @multiversion("fma") {
 
 /// log_dd, inline (pow).
 pub inline fn log_dd_k(x: f64) m.DD {
-    let rd = reduce(normal_bits(x));
+    return log_dd_b(normal_bits(x));
+}
+
+/// log_dd_k of the positive normal double whose bits are ix (or of x as
+/// normal_bits gives it).
+pub inline fn log_dd_b(ix: u64) m.DD {
+    let rd = reduce(ix);
     let r = rd.r;
     // log1p(r + rl) = r - r^2/2 + r^3 q(r) + rl (1 - r) + ...
     let s = m.two_sqr(r);
@@ -170,31 +210,49 @@ pub inline fn log_dd2(x: m.DD) m.DD {
 
 /// The base-2 logarithm.
 pub inline fn log2(x: f64, rep: m.Rep) f64 {
-    let mut ix = m.bits(x);
+    let ix = m.bits(x);
     if (ix -% 0x0010000000000000) >= 0x7fe0000000000000 {
         if (ix >= 0x7ff0000000000000) or ((ix << 1) == 0) {
             return special(x, ix, rep);
         }
-        ix = normal_bits(x);
+        return log2_k(normal_bits(x));
     }
-    let rd = reduce(ix);
-    // log2 x = k - log2 c + log2(1 + r + rl): k - log2 c's high part (42
-    // bits, LOG2_L) is exact, r/ln2 a double-double, and
-    // log2(1 + r) - r/ln2 = r^2 P(r) within 2^-61.2 |r| (LOG2_P); with the
-    // roundings of the low parts, the sum is within 2^-59 |r| + 2^-100 |x|
-    let l = m.from_bits(t.LOG2_L[2 * rd.i]) + rd.k;
-    let p = m.two_prod(rd.r, t.INVLN2_HI);
-    let a = m.fast_two_sum(l, p.hi);
-    let r = rd.r;
-    let z = r * r;
+    return log2_k(ix);
+}
+
+/// log2 of the positive normal double whose bits are ix: x = 2^k m (log's
+/// intervals of m and c's), log2 x = k - log2 c + log2(1 + r) with r = m c -
+/// 1 taken as u = r/ln 2 = m (c/ln 2) - 1/ln 2 directly: m CI_H (the double-
+/// double c/ln 2 of LOG2_CI) = p + pl exactly, p - INVLN2_HI exact (p is
+/// within 2^-7.6 of it), and ul = m CI_L - INVLN2_LO + the sum's error, up
+/// to 2^-52.3: u + ul is r/ln 2 within 2^-104 |u|, with no product by 1/ln
+/// 2 to keep exact. Then log2(1 + u ln2) = u + u^2 P(u) (LOG2U_P, within
+/// 2^-61.8), P at u and its first-order change 2 P0 u ul beside it (within
+/// 2^-60.6 |u| of the difference); k - log2 c's high part (42 bits, LOG2_L)
+/// plus u by fast_two_sum (|k - log2 c| is at least 1.97 |u| unless it is
+/// 0), the low parts summed: within 2^-59.8 |u| + 2^-100 |x|, so 0.5 + 2^-6
+/// ulp (|u| + log2 c is at least |u|); powers of two exactly (u = ul = 0).
+/// two_prod is exact with or without fused multiply-adds, the rest plain:
+/// the same bits on every target.
+inline fn log2_k(ix: u64) f64 {
+    let tmp = ix -% t.LOG_OFF;
+    let i = @as(usize, @truncate(u8, (tmp >> 45) & 127));
+    let k = @float_from_int(f64, @bit_cast(i64, tmp) >> 52);
+    let mm = m.from_bits(ix -% (tmp & 0xfff0000000000000));
+    let pr = m.two_prod(mm, m.from_bits(t.LOG2_CI[2 * i]));
+    let s = m.fast_two_sum(pr.hi - t.INVLN2_HI, pr.lo);
+    let u = s.hi;
+    let ul = s.lo + ((mm * m.from_bits(t.LOG2_CI[(2 * i) + 1])) - t.INVLN2_LO);
+    let a = m.fast_two_sum(m.from_bits(t.LOG2_L[2 * i]) + k, u);
+    let z = u * u;
     let w = z * z;
     let q = z *
-            (((t.LOG2_P0 + (r * t.LOG2_P1)) + (z * (t.LOG2_P2 + (r * t.LOG2_P3)))) +
-             (w * ((t.LOG2_P4 + (r * t.LOG2_P5)) + (z * t.LOG2_P6))));
-    let lo = ((a.lo + p.lo) + ((m.from_bits(t.LOG2_L[(2 * rd.i) + 1]) + (r * t.INVLN2_LO)) + (rd.rl * t.INVLN2_HI))) +
-             q;
-    // (within 0.5 + 2^-6 ulp: |r|/ln2 + log2 c is at least |r|)
-    return a.hi + lo;
+            (((t.LOG2U_P0 + (u * t.LOG2U_P1)) + (z * (t.LOG2U_P2 + (u * t.LOG2U_P3)))) +
+             (w * (t.LOG2U_P4 + (u * t.LOG2U_P5))));
+    // (ul is not below an ulp of u: the polynomial's change from u to u +
+    // ul, to first order)
+    let qc = ul * (u * (2.0 * t.LOG2U_P0));
+    return a.hi + ((a.lo + ul) + (m.from_bits(t.LOG2_L[(2 * i) + 1]) + (q + qc)));
 }
 
 /// The base-10 logarithm.

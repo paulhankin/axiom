@@ -489,9 +489,19 @@ for i in range(128):
     h = d(mp.nint(v * mp.mpf(2) ** 42) / mp.mpf(2) ** 42)  # (k + h is exact for |k| < 2^11)
     l2 += [bits(h), bits(d(v - mp.mpf(h)))]
 u64_array('LOG2_L', l2, '-log2(c_i) as pairs (hi, lo), hi a multiple of 2^-42')
-cs, err = fit('L2', lambda r: (mp.log1p(r) / mp.log(2) - r / mp.log(2)) / (r * r) if r != 0 else -1 / (2 * mp.log(2)),
-              range(7), -RM, RM, lambda r: r * r / mp.log1p(r) * mp.log(2) if r != 0 else 0)
-coeffs('LOG2_P', cs, err, 'log2(1 + r) = r/ln2 + r^2 (P0 + P1 r + ... + P6 r^6)')
+# log2's reduction to u = r/ln2 directly: c_i/ln 2 as a double-double, and
+# log2(1 + u ln2) in u
+ci = []
+for i in range(128):
+    c = mp.mpf(struct.unpack('<d', struct.pack('<Q', logc[i]))[0])
+    v = c / mp.log(2)
+    h = d(v)
+    ci += [bits(h), bits(d(v - mp.mpf(h)))]
+u64_array('LOG2_CI', ci, 'c_i/ln 2 as pairs (hi, lo), to 2^-106')
+UM = RM / mp.log(2)
+cs, err = fit('L2U', lambda u: (mp.log1p(u * mp.log(2)) / mp.log(2) - u) / (u * u) if u != 0 else -mp.log(2) / 2,
+              range(6), -UM, UM, lambda u: u * u / (mp.log1p(u * mp.log(2)) / mp.log(2)) if u != 0 else 0)
+coeffs('LOG2U_P', cs, err, 'log2(1 + u ln2) = u + u^2 (P0 + P1 u + ... + P5 u^5), |u| <= the bound of LOG_P / ln 2')
 # log10's: -log10 c with a high part that k log10(2)'s keeps exact
 L10_2 = mp.log10(2)
 l10h = split_hi(L10_2, 42)

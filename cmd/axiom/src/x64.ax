@@ -1692,8 +1692,9 @@ const F_SCALE: i32 = 4194304;  // an x << 1-3 that its only user (an add, or an 
 const F_BTX: i32 = 8388608;    // a 1 << k that its only user, an xor or or, computes as btc or bts
 const F_BTR: i32 = 16777216;   // a y >> k that its only user, an & 1 tested against 0, computes as bt y, k
 
-const F_CSKIP: i32 = 33554432;  // a p <u q, its zero-extension or a y +/- w that its only user computes (F_ADC)
-const F_ADC: i32 = 67108864;    // x + (p <u q) or x - (p <u q): cmp p, q; adc / sbb (mark_carry)
+const F_CSKIP: i32 = 33554432;   // a p <u q, its zero-extension or a y +/- w that its only user computes (F_ADC)
+const F_ADC: i32 = 67108864;     // x + (p <u q) or x - (p <u q): cmp p, q; adc / sbb (mark_carry)
+const F_FMNEG: i32 = 134217728;  // a negation that its only user, a scalar @fma, computes (vfmsub, vfnmadd)
 
 // Is s a 1 << k that v (an xor or or) computes as btc or bts: one it
 // computes alone (F_BTX), or one computed for other users too?
@@ -2831,8 +2832,24 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         // b, an embedded broadcast)
         let mut b = R(0);
         let mut bc = false;
-        let x0 = v.xs.get(0);
-        let x1 = v.xs.get(1);
+        let mut x0 = v.xs.get(0);
+        let mut x1 = v.xs.get(1);
+        let mut x2 = v.xs.get(2);
+        let mut neg_c = false;
+        let mut neg_p = false;
+        if fm_neg(x2) {
+            x2 = x2.a;  // a * b - c: vfmsub231
+            neg_c = true;
+        } else if fm_neg(x0) {
+            x0 = x0.a;  // c - a * b: vfnmadd231
+            neg_p = true;
+        } else if fm_neg(x1) {
+            x1 = x1.a;
+            neg_p = true;
+        }
+        if neg_c or neg_p {
+            a = reg(x0);
+        }
         if bcast_splat(x0) or bcast_splat(x1) {
             let s = pick_val(bcast_splat(x0), x0, x1);
             a = reg(pick_val(bcast_splat(x0), x1, x0));
@@ -2844,7 +2861,7 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
         } else {
             b = vsrc(x1);
         }
-        let c = reg(v.xs.get(2));
+        let c = reg(x2);
         copy(d, c, vclass());
         let mut op = xe.VFMADD231SD;
         if vec and single {
@@ -2853,6 +2870,17 @@ fn gen_float_intr(v: *mut ir.Value, id: i32) void {
             op = xe.VFMADD231PD;
         } else if single {
             op = xe.VFMADD231SS;
+        }
+        if neg_c {
+            op = xe.VFMSUB231SD;
+            if single {
+                op = xe.VFMSUB231SS;
+            }
+        } else if neg_p {
+            op = xe.VFNMADD231SD;
+            if single {
+                op = xe.VFNMADD231SS;
+            }
         }
         let i = vlz(sse4(op, 0, RW(d), b, R(a), NONE()));
         if bc {
@@ -7391,7 +7419,8 @@ fn gen_inst_at(v: *mut ir.Value) void {
         return;
     }
     if (v.flag &
-        ((((((((((16 | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | F_BTX) | F_BTR) | F_CSKIP)) != 0 {
+        (((((((((((16 | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | F_BTX) | F_BTR) | F_CSKIP) |
+         F_FMNEG)) != 0 {
         return;  // (part of its user: a blend, a compare into a mask register, a masked instruction)
     }
     if (v.flag & 64) != 0 {
@@ -7895,6 +7924,7 @@ fn prepare(f: *mut ir.Func) void {
         each_inst(f, mark_bmi);
     }
     each_inst(f, mark_btx);
+    each_inst(f, mark_fma_neg);
     each_inst(f, mark_vandn);
     each_inst(f, mark_lea);
     each_inst(f, mark_carry);
@@ -8052,6 +8082,39 @@ fn int_reg_op(i: *mut ir.Value) bool {
            not is.is_c(i.b) and two_regs(i);
 }
 
+// Is x a negation that scalar @fma i can compute itself (F_FMNEG): used
+// only there, in its block, and computed by nothing else?
+fn fma_neg(x: *mut ir.Value, i: *ir.Value) bool {
+    return ir.is_op(x, ir.OP_FNEG) and (x.uses == 1) and (x.blk == i.blk) and (x.flag == 0) and (x.ty == i.ty);
+}
+
+// @fma(a, b, -c) as vfmsub, @fma(-a, b, c) and @fma(a, -b, c) as vfnmadd
+// (scalar: the negation is the instruction's, not one of its own).
+fn mark_fma_neg(i: *mut ir.Value) void {
+    if not ir.is_op(i, ir.OP_INTR) or (@truncate(i32, @bit_cast(i64, i.cv)) != ir.IN_FMA) or
+       (i.ty.kind != ir.T_FLOAT) or (i.xs.len != 3) or ((i.flag & F_BCST) != 0) {
+        return;
+    }
+    let x0 = i.xs.get(0);
+    let x1 = i.xs.get(1);
+    let x2 = i.xs.get(2);
+    if (x0 == x1) or (x0 == x2) or (x1 == x2) {
+        return;
+    }
+    if fma_neg(x2, i) and not fma_neg(x0, i) and not fma_neg(x1, i) {
+        x2.flag = x2.flag | F_FMNEG;
+    } else if fma_neg(x0, i) and not fma_neg(x1, i) and not fma_neg(x2, i) {
+        x0.flag = x0.flag | F_FMNEG;
+    } else if fma_neg(x1, i) and not fma_neg(x0, i) and not fma_neg(x2, i) {
+        x1.flag = x1.flag | F_FMNEG;
+    }
+}
+
+// Is v a negation its scalar @fma computes (mark_fma_neg)?
+fn fm_neg(v: *ir.Value) bool {
+    return (v.kind == ir.V_INST) and ((v.flag & F_FMNEG) != 0);
+}
+
 // x & ~y as andn and x & (x - 1) and the like as BMI1 (F_ANDN, F_BLS),
 // the `not` or the other part used only there.
 fn mark_bmi(i: *mut ir.Value) void {
@@ -8161,7 +8224,7 @@ fn mark_carry(i: *mut ir.Value) void {
 // Is v a value its user reads from a register (not a load or an operation
 // that the user computes itself: folded, lea, bmi, bt)?
 fn plain_operand(v: *ir.Value) bool {
-    let m = ((((((((8 | 16) | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | (F_BTX | F_BTR);
+    let m = (((((((((8 | 16) | 32) | 256) | F_ANDN) | F_BLS) | F_BCST) | F_BT) | F_SCALE) | (F_BTX | F_BTR)) | F_FMNEG;
     return (v.kind != ir.V_INST) or ((v.flag & m) == 0);
 }
 
@@ -8655,6 +8718,15 @@ fn fold_remat(f: *mut mc.MFunc, i: *mut mc.MInst, r: i32, def: *mc.MInst) bool {
         }
         return true;
     }
+    if em.AVX and commutes_sse(i.cc) and (i.ops[2].kind == mc.K_REG) and (i.ops[2].reg == r) and
+       (i.ops[2].role == mc.RU) and (i.ops[1].kind == mc.K_REG) and (i.ops[1].reg != r) and
+       (i.ops[3].kind == mc.K_NONE) {
+        // r is the first operand of a commutative VEX instruction (in vvvv):
+        // the operands swapped, it can be the r/m one
+        let t = i.ops[1];
+        i.ops[1] = i.ops[2];
+        i.ops[2] = t;
+    }
     if (i.ops[1].kind != mc.K_REG) or (i.ops[1].reg != r) or (i.ops[1].role != mc.RU) {
         return false;
     }
@@ -8670,8 +8742,16 @@ fn fold_remat(f: *mut mc.MFunc, i: *mut mc.MInst, r: i32, def: *mc.MInst) bool {
         return false;
     }
     if not em.AVX {
-        // legacy SSE: memory operands of packed instructions must be 16-byte
-        // aligned, as the constant pool's 16-byte entries are
+        // legacy SSE: a scalar arithmetic instruction reads its 4 or 8
+        // bytes from memory at any alignment (addsd xmm, [m]), the low part
+        // of the constant's entry
+        let sb = scalar_rm_bytes(id);
+        if (sb != 0) and (info.bytes == sb) and (info.lb == 0) and (info.full.kind == mc.K_MEM) {
+            i.ops[1] = info.full;
+            return true;
+        }
+        // memory operands of packed instructions must be 16-byte aligned,
+        // as the constant pool's 16-byte entries are
         if (info.bytes != 16) or (i.sz > 16) {
             return false;
         }
@@ -8709,6 +8789,34 @@ fn fold_remat(f: *mut mc.MFunc, i: *mut mc.MInst, r: i32, def: *mc.MInst) bool {
     }
     i.ops[1] = info.full;
     return true;
+}
+
+// Instructions whose two sources may be swapped: additions and
+// multiplications, scalar and packed (as gen_fbin's vsrc_of swaps them).
+fn commutes_sse(id: i32) bool {
+    return ((id >= xe.ADDSS) and (id <= xe.ADDPD)) or ((id >= xe.MULSS) and (id <= xe.MULPD));
+}
+
+// The bytes a scalar SSE arithmetic instruction (add, mul, sub, min, div,
+// max, ucomis: ss or sd) reads from its r/m operand; 0 for the others.
+fn scalar_rm_bytes(id: i32) u8 {
+    if (id >= xe.ADDSS) and (id <= xe.MAXPD) {
+        let k = (id - xe.ADDSS) % 4;
+        if k == 0 {
+            return 4;
+        }
+        if k == 1 {
+            return 8;
+        }
+        return 0;
+    }
+    if id == xe.UCOMISS {
+        return 4;
+    }
+    if id == xe.UCOMISD {
+        return 8;
+    }
+    return 0;
 }
 
 // Is m a 16-byte entry of the constant pool (const_bytes: 16-byte aligned)?
@@ -9677,6 +9785,57 @@ fn debug_ra_suffix() []u8 {
     return debug_ra_name;
 }
 
+// A block that only returns the value of its phi (where the returns of
+// inlined callees meet) is copied into the predecessors that jump to it:
+// each of those paths returns by itself, so that shrink-wrapping can leave
+// the frame out of the paths that need none (a function's quick cases,
+// with its calls on the others). Not where nothing is shrink-wrapped.
+fn split_returns(f: *mut ir.Func) void {
+    if em.WIN or f.returns_twice {
+        return;
+    }
+    let mut any = false;
+    let mut rounds: i32 = 0;
+    while (rounds < 8) and split_returns_once(f) {
+        any = true;
+        rounds += 1;
+    }
+    if any {
+        ir.remove_unreachable(f);
+    }
+}
+
+// split_returns over the blocks of f once (a join copied into a block that
+// was itself a join of returns makes that one a return block too).
+fn split_returns_once(f: *mut ir.Func) bool {
+    let mut any = false;
+    let mut b = f.first;
+    while u.notnil(b) {
+        let p = b.first;
+        if (b != f.first) and u.notnil(p) and (p.op == ir.OP_PHI) and u.notnil(p.next) and (p.next.op == ir.OP_RET) and
+           (p.next.a == p) and (p.next.xs.len == 0) and u.isnil(p.next.next) and (p.xs.len <= 16) {
+            let r = p.next;
+            let mut k: usize = 0;
+            while k < p.xs.len {
+                let pb = ir.bs_of(p).get(k);
+                let t = ir.terminator(pb);
+                if u.notnil(t) and (t.op == ir.OP_BR) and (t.t1 == b) and (pb != b) {
+                    let y = ir.copy_inst(f, r);
+                    y.a = p.xs.get(k);
+                    ir.insert_before(t, y);
+                    ir.remove_inst(t);
+                    ir.remove_phi_input(b, pb);
+                    any = true;
+                } else {
+                    k += 1;
+                }
+            }
+        }
+        b = b.next;
+    }
+    return any;
+}
+
 fn compile_func(f: *mut ir.Func) void {
     em.F = f;
     nlocal = 0;
@@ -9684,6 +9843,7 @@ fn compile_func(f: *mut ir.Func) void {
     ccache.clear();
     em.out_area = 0;
     swl.lower(f);  // (jump tables, bit tests, a search: switches.ax)
+    split_returns(f);
     opt.split_critical_edges(f);
     opt.split_loop_exits(f);
     lower.scalarize(f, legal);

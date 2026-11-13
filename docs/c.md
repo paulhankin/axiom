@@ -1191,7 +1191,9 @@ functions are C (`std/c/lib/math/`).
   are measured against an arbitrary-precision reference on 200000 random and boundary
   arguments per function.
 - **Speed.** The kernels compute in plain double where the error bound allows
-  (`log2`, `log10` and `log1p` from log's table, `log10` with a table of its own, `asin`
+  (`log10` and `log1p` from log's table, `log10` with a table of its own, `log2` from
+  log's intervals with c/ln 2 as a double-double, which gives r/ln 2 without a product
+  to keep exact, `asin`
   and `acos` with their tails in double, `cbrt` from a table of 1/c and cbrt(c) and a
   polynomial without a division, `sinh` and `cosh` from the exponential's parts, the
   inverse hyperbolic functions from double-double arguments with one division, `erf`,
@@ -1202,13 +1204,20 @@ functions are C (`std/c/lib/math/`).
   kernel only when the test fails) in `atan`, `atan2` (reduced directly from y and x)
   and `powf` (whose float result is correctly rounded or computed by the double
   function); `tan` takes its odd form from a table of -cot c rather than a branch.
-  Against the x86-64 Linux system C library (`-O2`, one core, the time of a call on a
-  stream of arguments, measured on a loaded machine: CPU time, best of seven): most
-  functions take 0.5 to 1.5 times as long, `erf`, `erfc` and `exp10` about 1.15 to 1.3,
-  `lgamma`, `tan`, `asinh`, `pow` and `powf` 1.4 to 1.65, and `log2`, `acosh` 1.7 to 1.8.
+  The usual case of `pow`, `powf`, `log2` and `acosh` is a path with no call (the
+  special values and the results near overflow, underflow or a halfway point leave it
+  by one call), which needs no stack frame. Against the x86-64 Linux system C library
+  (`-O2`, one core, the time of a call on a stream of arguments, measured on a loaded
+  machine: CPU time, best of seven): most functions take 0.5 to 1.3 times as long,
+  `erf`, `erfc`, `exp10`, `lgamma`, `lgammaf`, `asinh` and `tan` about 1.15 to 1.3,
+  `acosh`, `atanh`, `pow` and `powf` 1.4 to 1.5, and `log2` 1.5 to 1.55 (its 0.5 +
+  2^-6 ulp needs the exact reduction and the double-double sum: the system library's,
+  within 0.53 ulp, has about two thirds of its floating-point operations).
   `std/math` has the same kernels: against its former functions, every one is as fast or
-  faster, or within 15% (`atan`, `atan2`, `tan`, `cbrt`, `lgamma`; their former versions
-  were less accurate: up to 2 ulps for `tan` and `sinh`).
+  faster, or within 10% (`atan`, `atan2`, `tan`, `cbrt`; their former versions were less
+  accurate: up to 2 ulps for `tan` and `sinh`). `atan2`'s 7% is the latency of its two
+  divisions in a row (the quotient picks the table row of the second): an estimate of
+  the quotient without a division, by Newton's iteration, made it slower.
 - **The complex functions** follow Annex G's special values (G.6) and Kahan's methods
   (`std/c/lib/math/complex_impl.h`, one text for every type), in the forms where nothing
   cancels: `ctanh` from `sinh x cosh x / (sinh^2 x + cos^2 y)` and `sin y cos y / (sinh^2 x
