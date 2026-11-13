@@ -7,6 +7,13 @@
   9, `erfl` 30, `lgammal` 10), the same bits; most now take 1.3 to 3.4 times the x87
   hardware's functions of the system library, the trigonometric ones, `powl` and
   `tgammal` less.
+- Then `logl`, `log2l`, `log10l`, `log1pl`, `asinl`, `acosl`, `asinhl`, `acoshl`,
+  `atanhl` and `lgammal` of a positive argument became 1.5 to 2.9 times faster again
+  (their double-double sums are no longer renormalized at each step of a recurrence,
+  which made them wait on the latency of that chain): `logl` now takes 1.25 times the
+  x87 hardware's function, `log1pl` 1.7, `asinl` 1.9, `lgammal` 1.25 to 1.35; the same
+  bits, and `logl(1)` (and `log2l`, `log10l`) no longer raises a spurious "inexact",
+  `lgammal`, `log1pl`, `acosl` of some huge or tiny arguments a spurious "underflow".
 - binary128's (and `_Float128`'s) `erf` and `erfc` are 5 to 6 times faster (Taylor
   polynomials of the scaled complementary error function by pieces).
 - `asinhl` and `acoshl` of arguments beyond about 2^512 were wrong (the square of the

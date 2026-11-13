@@ -1275,13 +1275,17 @@ functions are C (`std/c/lib/math/`).
   value fits 128 bits is computed exactly and rounded once (so `x * x`'s halfway cases
   round to even). For the x87 format these functions (and the four below) first take a
   double-double path (`std/c/rt/math_ldx.ax`: the same methods with fewer terms, the
-  `asin` and `acos` kernel from Taylor polynomials about j/32, within 2^-84 to 2^-98)
+  `asin` and `acos` kernel from Taylor polynomials about j/32, within 2^-84 to 2^-98;
+  the logarithms, `asinl`, `acosl`, the inverse hyperbolic functions and `lgammal` of a
+  positive argument within 2^-85 to 2^-90, with the sums of their recurrences left
+  unnormalized between the steps, so that the chain of dependences through the high
+  parts is one product and one addition a step: their time is that chain's latency)
   with Ziv's rounding test: where it cannot decide the 64-bit result (about once in
-  2^20 calls, and at exact halfway results) the triple-double path does, so the results
-  are the same bits. Speed (x86-64, `-O2`, against the x87 hardware's functions of the
-  system library): `sinl`, `cosl`, `tanl`, `powl`, `tgammal` 0.4 to 0.8 times their time,
-  most others 1.3 to 3.4 (`expl` 1.9, `logl` 3.4, `atanl` 2.2), `asinl` 4.5 and
-  `lgammal` 3.9; binary128's (triple-double only) take 0.2 to 1.2 times the system
+  2^18 to 2^30 calls, and at exact halfway results) the triple-double path does, so the
+  results are the same bits. Speed (x86-64, `-O2`, against the x87 hardware's functions
+  of the system library): `sinl`, `cosl`, `tanl`, `acosl`, `powl`, `tgammal` 0.45 to 0.8
+  times their time, the others 1.15 to 2.2 (`logl` 1.25, `log1pl` 1.7, `lgammal` 1.25 to
+  1.35, `expl` 1.8, `asinl` 1.9, `atanl` 2.0, `asinhl` 2.2); binary128's (triple-double only) take 0.2 to 1.2 times the system
   library's `_Float128` functions (most 0.3 to 0.7). The complex `l` functions are
   `complex_impl.h`'s on these (above). `erfl` and `erfcl` (Taylor's series below 1/2, by
   Horner's rule on a table of its coefficients; above, `erfc x = e^-x^2 erfcx(x)` with

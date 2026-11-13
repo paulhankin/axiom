@@ -11,7 +11,7 @@
 // evaluation of elementary mathematical functions with correctly rounded last
 // bit", ACM TOMS 17, 1991): when every value within the bound of the
 // approximation rounds to the same x87 number, that number is the correctly
-// rounded result; otherwise (about once in 2^20 to 2^30 calls, and at the
+// rounded result; otherwise (about once in 2^18 to 2^30 calls, and at the
 // exact halfway cases) the caller computes it again on its triple-double path,
 // which is correctly rounded (to within 2^-118). The results are thus the
 // same bits as the triple-double path's, faster. The fast paths take only
@@ -21,9 +21,11 @@
 //
 // The kernels are those of math_ld.ax with fewer terms and math_ld_tables.ax's
 // tables taken to two parts: Tang's table-driven exp and log, sin and cos
-// from those of j/64, atan from a table of atan c (and asin, acos and atan2
-// from one division of the reduction with the square root's or the
-// arguments' parts).
+// from those of j/64, atan from a table of atan c (and atan2 from one
+// division of the reduction with the arguments' parts), asin and acos from
+// Taylor polynomials about j/32; the logarithms, asin, acos, the inverse
+// hyperbolic functions and lgamma in the lean forms of "The lean paths"
+// below.
 // =============================================================================
 import "../../internal/math/core.ax" as m;
 import "../../internal/math/tables.ax" as t;
@@ -113,8 +115,8 @@ pub fn xin(a: *ld.W) XD {
     if (ef == 0) or (ef == 0x7FFF) or ((mm >> 63) == 0) {
         return XD.{ ok: false, neg: neg, e: 0, v: d0(0.0), mant: 0 };
     }
-    let h = @float_from_int(f64, mm >> 11) * 2.220446049250313e-16;     // 2^-52
-    let l = @float_from_int(f64, mm & 0x7FF) * 1.0842021724855044e-19;  // 2^-63
+    let h = m.from_bits((mm >> 11) +% 0x3FE0_0000_0000_0000);  // (bit 52 set: [1, 2))
+    let l = @float_from_int(f64, @bit_cast(i64, mm & 0x7FF)) * 1.0842021724855044e-19;  // 2^-63
     return XD.{ ok: true, neg: neg, e: ef - 16383, v: m.dd(h, l), mant: mm };
 }
 
@@ -136,7 +138,7 @@ inline fn val(x: XD) m.DD {
 /// on the bits below the result's 64: the fraction of a unit they make must
 /// not be within the bound of one half); false otherwise, r untouched.
 /// v normalized (|v.lo| <= ulp(v.hi)/2 or nearly), 2^-900 < |v| < 2^900.
-pub fn out(r: *mut ld.W, v: m.DD, k: i32, eb: i32) bool {
+pub inline fn out(r: *mut ld.W, v: m.DD, k: i32, eb: i32) bool {
     let hb = m.abits(v.hi);
     let ef = @bit_cast(i32, @truncate(u32, hb >> 52));
     if (ef < 124) or (ef > 1923) {
@@ -517,7 +519,8 @@ inline fn em1_dd(a: m.DD) m.DD {
     return dscale(em.v, p2(em.k));
 }
 
-/// r = op(x) for the x87 format, when the fast path applies (see above).
+/// r = op(x) for the x87 format, when the fast path applies (see above;
+/// the logarithms, asin and acos are fast_log's and fast_asin's).
 pub fn fast1(op: u64, r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
     let xd = xin(x);
     if not xd.ok {
@@ -562,26 +565,6 @@ pub fn fast1(op: u64, r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
         }
         let em = expm1_k(v);
         return out(r, em.v, em.k, 95);
-    }
-    if op <= OP_LOG1P {
-        if op == OP_LOG1P {
-            let v = val(xd);
-            if v.hi <= -1.0 {
-                return false;
-            }
-            return out(r, log1p_k(v), 0, 94);
-        }
-        if xd.neg {
-            return false;
-        }
-        let l = log_k(xd.v, e);
-        if op == OP_LOG {
-            return out(r, l, 0, 98);
-        }
-        if op == OP_LOG2 {
-            return out(r, m.dd_mul(l, m.dd(lt.INVLN2_H, lt.INVLN2_M)), 0, 97);
-        }
-        return out(r, m.dd_mul(l, m.dd(lt.INVLN10_H, lt.INVLN10_M)), 0, 97);
     }
     if op <= OP_TAN {
         let k = @truncate(u32, op - OP_SIN);
@@ -681,58 +664,6 @@ pub fn fast1(op: u64, r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
         }
         return out(r, y, q, 96);
     }
-    if op <= OP_ACOS {
-        if e >= 0 {
-            // |x| >= 1: asin(+-1) = +-pi/2, acos(-1) = pi; the rest the slow path's
-            if (xd.mant != 0x8000_0000_0000_0000) or (e != 0) {
-                return false;
-            }
-            if op == OP_ASIN {
-                let mut v = pio2();
-                if xd.neg {
-                    v = m.dd_neg(v);
-                }
-                return out(r, v, 0, 98);
-            }
-            if xd.neg {
-                return out(r, pi_dd(), 0, 98);
-            }
-            return false;
-        }
-        if (op == OP_ASIN) and (e < -33) {
-            return same(r, x);  // (x + x^3/6 rounds to x)
-        }
-        let y = mag(xd);
-        if y.hi < 0.75 {
-            // asin y from the piece of ASIN_T about the nearest j/32;
-            // acos = pi/2 -+ asin (asin |x| <= 0.85: no cancellation)
-            let v = asin_k(y);
-            if op == OP_ASIN {
-                if xd.neg {
-                    return out(r, m.dd_neg(v), 0, 94);
-                }
-                return out(r, v, 0, 94);
-            }
-            if xd.neg {
-                return out(r, fadd(pio2(), v), 0, 94);
-            }
-            return out(r, fadd(pio2(), m.dd_neg(v)), 0, 94);
-        }
-        // y >= 3/4: asin y = pi/2 - 2 asin s, acos y = 2 asin s, s =
-        // sqrt((1 - y)/2) <= 0.36 (1 - y exact)
-        let a = dscale(asin_k(m.dd_sqrt(dscale(m.dd_add_d(m.dd_neg(y), 1.0), 0.5))), 2.0);
-        if op == OP_ASIN {
-            let mut v = fadd(pio2(), m.dd_neg(a));
-            if xd.neg {
-                v = m.dd_neg(v);
-            }
-            return out(r, v, 0, 94);
-        }
-        if xd.neg {
-            return out(r, fadd(pi_dd(), m.dd_neg(a)), 0, 94);
-        }
-        return out(r, a, 0, 94);
-    }
     // asinh, acosh, atanh
     if op == OP_ACOSH {
         if xd.neg or (e < 0) or ((e == 0) and (xd.mant == 0x8000_0000_0000_0000)) {
@@ -741,12 +672,12 @@ pub fn fast1(op: u64, r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
         let a = mag(xd);
         if e >= 64 {
             // log 2a - 1/(4a^2)
-            let l = log_k(xd.v, e + 1);
-            return out(r, m.dd_add_d(l, -0.25 / (a.hi * a.hi)), 0, 96);
+            let l = log_l(xd.v, e + 1);
+            return out(r, m.dd_add_d(l, -0.25 / (a.hi * a.hi)), 0, 95);
         }
         // log1p(t + sqrt(t (t + 2))), t = a - 1
         let tt = m.dd_add_d(a, -1.0);
-        return out(r, log1p_k(m.dd_add(tt, m.dd_sqrt(m.dd_mul(tt, m.dd_add_d(tt, 2.0))))), 0, 94);
+        return out(r, log1p_v(m.dd_add(tt, m.dd_sqrt(m.dd_mul(tt, m.dd_add_d(tt, 2.0))))), 0, 83);
     }
     if e < -33 {
         return same(r, x);  // (x - x^3/6 and x + x^3/3 round to x)
@@ -755,23 +686,380 @@ pub fn fast1(op: u64, r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
     let mut l = d0(0.0);
     if op == OP_ASINH {
         if e >= 64 {
-            l = m.dd_add_d(log_k(xd.v, e + 1), 0.25 / (a.hi * a.hi));
+            l = m.dd_add_d(log_l(xd.v, e + 1), 0.25 / (a.hi * a.hi));
         } else {
             // log1p(a + a^2 / (1 + sqrt(1 + a^2)))
             let a2 = m.dd_mul(a, a);
-            l = log1p_k(m.dd_add(a, m.dd_div(a2, m.dd_add_d(m.dd_sqrt(m.dd_add_d(a2, 1.0)), 1.0))));
+            l = log1p_v(m.dd_add(a, m.dd_div(a2, m.dd_add_d(m.dd_sqrt(m.dd_add_d(a2, 1.0)), 1.0))));
         }
     } else {
         if e >= 0 {
             return false;  // (|x| >= 1: a pole or a domain error)
         }
         // log1p(2a / (1 - a)) / 2
-        l = dscale(log1p_k(m.dd_div(dscale(a, 2.0), m.dd_add_d(m.dd_neg(a), 1.0))), 0.5);
+        l = dscale(log1p_v(m.dd_div(dscale(a, 2.0), m.dd_add_d(m.dd_neg(a), 1.0))), 0.5);
     }
     if xd.neg {
         l = m.dd_neg(l);
     }
-    return out(r, l, 0, 94);
+    return out(r, l, 0, 83);
+}
+
+// -----------------------------------------------------------------------------
+// The lean paths: logl, log2l, log10l, log1pl, asinl, acosl and lgammal of a
+// positive argument
+// -----------------------------------------------------------------------------
+//
+// These functions take a larger error bound than the others (2^-84 to 2^-88
+// against 2^-92 to 2^-98): their rounding test then fails about once in 2^19
+// to 2^23 calls (and at the exact halfway cases), each such call costing the
+// triple-double path's 0.5 to 2 us, under 0.01 ns a call on average. And
+// they leave their sums unnormalized between the steps of a recurrence: a
+// pair hi + lo with |lo| a little above ulp(hi)/2 is as good an operand of a
+// product or a sum (the error bounds below count the larger lo), so that the
+// chain of dependences through the high parts is one product and one
+// addition a step rather than also the three additions of a renormalization.
+// A call of these functions is long enough for that chain's latency, rather
+// than the number of operations, to bound its time.
+
+/// b + u p, the sum's high parts by Fast2Sum (|b.hi| >= |u.hi p.hi| or b.hi
+/// = 0), left unnormalized: the high part is one product and one addition
+/// after p's, the low part within 2^-104 (|b| + |u p|) of the rest.
+inline fn lstep(b: m.DD, u: m.DD, p: m.DD) m.DD {
+    let pr = m.two_prod(u.hi, p.hi);
+    let s = m.fast_two_sum(b.hi, pr.hi);
+    return m.dd(s.hi, (s.lo + b.lo) + (pr.lo + m.mla(u.hi, p.lo, u.lo * p.hi)));
+}
+
+/// a b, unnormalized (within 2^-104 of a b, |lo| <= 2^-52 |hi| for operands
+/// so).
+inline fn lmul(a: m.DD, b: m.DD) m.DD {
+    let p = m.two_prod(a.hi, b.hi);
+    return m.dd(p.hi, p.lo + m.mla(a.hi, b.lo, a.lo * b.hi));
+}
+
+/// a normalized: |lo| <= ulp(hi)/2 (Fast2Sum: |a.lo| <= |a.hi|).
+inline fn norm(a: m.DD) m.DD {
+    return m.fast_two_sum(a.hi, a.lo);
+}
+
+/// sum b_n t^n, n = 0 .. 20, of a row of pairs (ASIN_T, LGK_T) for t = th +
+/// tl, |tl| < 2^-52 |th| or, where b_0 is not 0 (its terms are then relative
+/// to b_0, not to t), |tl| < 2^-52; |t| <= 1/16 and below the row's radius
+/// by 2^-2 or more, and |b_n| >= 2 |t| sum_k>n |b_k t^(k - n)| or b_n = 0
+/// for n <= 8 (on both tables: lstep's condition). b_0 .. b_8 by lstep in
+/// double-double, b_9 .. b_20 in double on x = th + tl rounded by Estrin's
+/// scheme, whose terms are below 2^-42 of the sum on these tables, so that
+/// their errors (the coefficients', the scheme's, x's and x^9's, about 18
+/// units of 2^-53 of them) are below 2^-91 of it; the terms from b_21 t^21
+/// are below 2^-92.4 of it, the double-double steps' errors below 2^-100:
+/// within 2^-90.4 (relative). Normalized.
+fn lpoly(a: []u64, row: usize, th: f64, tl: f64) m.DD @multiversion("fma") {
+    let pe = &a[row + 41];  // (the bounds checked once)
+    let c = @ptr_sub(pe, 41);
+    let tt = m.dd(th, tl);
+    let x = th + tl;
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let q0 = m.mla(x2, m.mla(x, cf(c, 12), cf(c, 11)), m.mla(x, cf(c, 10), cf(c, 9)));
+    let q1 = m.mla(x2, m.mla(x, cf(c, 16), cf(c, 15)), m.mla(x, cf(c, 14), cf(c, 13)));
+    let q2 = m.mla(x2, m.mla(x, cf(c, 20), cf(c, 19)), m.mla(x, cf(c, 18), cf(c, 17)));
+    let q = m.mla(x4, m.mla(x4, q2, q1), q0);
+    let x9 = (x4 * x4) * x;
+    let mut p = cfd(c, 8);
+    p = lstep(cfd(c, 7), tt, p);
+    p = lstep(cfd(c, 6), tt, p);
+    p = lstep(cfd(c, 5), tt, p);
+    p = lstep(cfd(c, 4), tt, p);
+    p = lstep(cfd(c, 3), tt, p);
+    p = lstep(cfd(c, 2), tt, p);
+    p = lstep(cfd(c, 1), tt, p);
+    p = lstep(cfd(c, 0), tt, p);
+    return m.fast_two_sum(p.hi, m.mla(x9, q, p.lo));
+}
+
+/// log1p(u + ul) for |u| <= 2^-7.71 (LOG_C's reduction), |ul| <= 2^-52 |u|:
+/// P(u) + ul/(1 + u) (the next term below 2^-104 |u|), P(u) = u - u^2/2 +
+/// u^3/3 - u^4/4 + u^5 q, q = 1/5 - u/6 + ... + u^6/11 in double by Estrin's
+/// scheme (within 2^-53.5 of its value: its error is 2^-84.3 (|u|/2^-7.71)^4
+/// of |u|), the rest by lstep; the terms from u^12/12 below 2^-88.3
+/// (|u|/2^-7.71)^11 of it, the double-double steps' errors 2^-100: within
+/// 2^-84.1 |u| (2^-84.3 (|u|/2^-7.71)^4 |u| + 2^-88.3 (|u|/2^-7.71)^11 |u|
+/// + 2^-100 |u|). Unnormalized (|lo| < 2^-51 |hi|).
+fn log1p_l(u: f64, ul: f64) m.DD @multiversion("fma") {
+    // (u^2 taken no smaller than 2^-300 in q, whose terms in it are then far
+    // below the bound: no underflow that the value does not have)
+    let u2 = @max(u * u, 4.909093465297727e-91);
+    let q0 = m.mla(u2, m.mla(u, -1.0 / 8.0, 1.0 / 7.0), m.mla(u, -1.0 / 6.0, 1.0 / 5.0));
+    let q1 = m.mla(u2, 1.0 / 11.0, m.mla(u, -1.0 / 10.0, 1.0 / 9.0));
+    let q = m.mla(u2 * u2, q1, q0);
+    let p4 = m.two_prod(u, q);
+    let s4 = m.fast_two_sum(-0.25, p4.hi);
+    let t3 = lstep(iv(3), d0(u), m.dd(s4.hi, s4.lo + p4.lo));
+    let t2 = lstep(d0(-0.5), d0(u), t3);
+    let z = m.two_sqr(u);
+    let pz = m.two_prod(z.hi, t2.hi);
+    let s = m.fast_two_sum(u, pz.hi);
+    return m.dd(s.hi, (s.lo + (pz.lo + m.mla(z.hi, t2.lo, z.lo * t2.hi))) + (ul / (1.0 + u)));
+}
+
+/// log(s 2^e) for a double-double s in [1, 2) with 0 <= s.lo < 2^-52 or
+/// |s.lo| <= 2^-53 (xin's parts, or normalized), |e| < 2^14: s = 2^k m, m in
+/// [0.709, 1.418), m c = 1 + r (LOG_C: c a multiple of 2^-9, 1 near 1; r =
+/// u + ul by TwoSum, exact when c = 1, else within 2^-103 absolute), log =
+/// (e + k) ln2 - log c + log1p(r) (LOG_L's triple-doubles, ln2 in parts of
+/// 36 bits whose products by e + k are exact), the high parts summed by
+/// TwoSum, the low parts' sum within 2^-101 of log: with log1p_l's bound,
+/// within 2^-85.4 of log over each interval of LOG_C (computed from that
+/// bound and the table: the worst near 1 + 2^-8, at the first interval
+/// whose c is not 1), and within 2^-84.1 2^-7.71 + 2^-101 |log| absolute.
+/// Normalized.
+fn log_l(s: m.DD, e0: i32) m.DD @multiversion("fma") {
+    let mut sh = s.hi;
+    let mut sl = s.lo;
+    let mut e = e0;
+    if (m.bits(sh) -% t.LOG_OFF) >= 0x0010000000000000 {
+        sh *= 0.5;
+        sl *= 0.5;
+        e += 1;
+    }
+    let i = @as(usize, @truncate(u8, ((m.bits(sh) -% t.LOG_OFF) >> 45) & 127));
+    let c = m.from_bits(t.LOG_C[i]);
+    let p0 = m.two_prod(sh, c);
+    let r = m.two_sum(p0.hi - 1.0, m.mla(sl, c, p0.lo));  // (p0.hi - 1 exact: Sterbenz)
+    let pl = log1p_l(r.hi, r.lo);
+    let ef = @float_from_int(f64, e);
+    let h1 = m.two_sum(ef * lt.LN2_S0, m.from_bits(lt.LOG_L[3 * i]));
+    let h2 = m.two_sum(h1.hi, pl.hi);
+    let lo0 = (h1.lo + m.mla(ef, lt.LN2_S1, m.from_bits(lt.LOG_L[(3 * i) + 1]))) + m.mla(
+        ef, lt.LN2_S2, m.from_bits(lt.LOG_L[(3 * i) + 2]));
+    return m.fast_two_sum(h2.hi, lo0 + (h2.lo + pl.lo));
+}
+
+/// log1p(v) for a double-double v > -1 (|v.lo| < ulp(v.hi)), 2^-900 < |v|
+/// < 2^1000: log1p_l's series below 0.0029 (within 2^-87.2), else log_l of
+/// 1 + v (within 2^-105 relative: 2^-96.6 of log1p v there): within 2^-85.3.
+fn log1p_v(v: m.DD) m.DD {
+    if @abs(v.hi) < 0.0029 {
+        return norm(log1p_l(v.hi, v.lo));
+    }
+    let s = m.dd_add_d(v, 1.0);
+    let es = @bit_cast(i32, @truncate(u32, m.bits(s.hi) >> 52)) - 1023;
+    return log_l(dscale(s, p2(-es)), es);
+}
+
+/// logl, log2l, log10l, log1pl (op 4 .. 7) for the x87 format, when the
+/// fast path applies: log_l's bound (2^-84 relative at worst, near 1),
+/// with that of the product by 1/ln2 or 1/ln10 (2^-103).
+pub fn fast_log(op: u64, r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
+    let xd = xin(x);
+    if not xd.ok {
+        return false;
+    }
+    if op == OP_LOG1P {
+        if (xd.e > 900) or (xd.e < -900) {
+            return false;
+        }
+        let v = val(xd);
+        if v.hi <= -1.0 {
+            return false;
+        }
+        return out(r, log1p_v(v), 0, 83);
+    }
+    if xd.neg {
+        return false;
+    }
+    let l = log_l(xd.v, xd.e);
+    if op == OP_LOG {
+        return out(r, l, 0, 82);
+    }
+    if op == OP_LOG2 {
+        return out(r, norm(lmul(l, m.dd(lt.INVLN2_H, lt.INVLN2_M))), 0, 82);
+    }
+    return out(r, norm(lmul(l, m.dd(lt.INVLN10_H, lt.INVLN10_M))), 0, 82);
+}
+
+/// asin y for a double-double 0 <= y < 0.766: the piece of ASIN_T about the
+/// nearest c = j/32 (y.hi - c exact: Sterbenz; the piece about 0 is odd, so
+/// the result keeps its relative precision near 0): lpoly's bound, 2^-90.4.
+inline fn asin_l(yh: f64, yl: f64) m.DD {
+    let j = @as(usize, @int_from_float(u32, (yh * 32.0) + 0.5));
+    return lpoly(lt.ASIN_T[..], j * 48, yh - (@float_from_int(f64, j) * 0.03125), yl);
+}
+
+/// asinl and acosl (op 16, 17) for the x87 format, when the fast path
+/// applies: asin_l's 2^-90.4 and the square root's 2^-104 (the sums with
+/// pi/2 or pi do not cancel beyond a factor 1.2): within 2^-90.
+pub fn fast_asin(op: u64, r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
+    let xd = xin(x);
+    if (not xd.ok) or (xd.e < -900) {
+        return false;
+    }
+    let e = xd.e;
+    if e >= 0 {
+        // |x| >= 1: asin(+-1) = +-pi/2, acos(-1) = pi; the rest the slow path's
+        if (xd.mant != 0x8000_0000_0000_0000) or (e != 0) {
+            return false;
+        }
+        if op == OP_ASIN {
+            let mut v = pio2();
+            if xd.neg {
+                v = m.dd_neg(v);
+            }
+            return out(r, v, 0, 98);
+        }
+        if xd.neg {
+            return out(r, pi_dd(), 0, 98);
+        }
+        return false;
+    }
+    if (op == OP_ASIN) and (e < -33) {
+        return same(r, x);  // (x + x^3/6 rounds to x)
+    }
+    let y = mag(xd);
+    if y.hi < 0.75 {
+        // acos = pi/2 -+ asin (asin |x| <= 0.85: no cancellation)
+        let v = asin_l(y.hi, y.lo);
+        if op == OP_ASIN {
+            if xd.neg {
+                return out(r, m.dd_neg(v), 0, 88);
+            }
+            return out(r, v, 0, 88);
+        }
+        if xd.neg {
+            return out(r, fadd(pio2(), v), 0, 88);
+        }
+        return out(r, fadd(pio2(), m.dd_neg(v)), 0, 88);
+    }
+    // y >= 3/4: asin y = pi/2 - 2 asin s, acos y = 2 asin s, s = sqrt((1 -
+    // y)/2) <= 0.36, (1 - y)/2 exact (1 - y.hi is a multiple of ulp(y.hi) >
+    // y.lo: Fast2Sum), s = sh + sl unnormalized (within 2^-104): sl is
+    // needed late, only by the low parts
+    let d = m.fast_two_sum((1.0 - y.hi) * 0.5, y.lo * -0.5);
+    let sh = @sqrt(d.hi);
+    let sq = m.two_sqr(sh);
+    let sl = (((d.hi - sq.hi) - sq.lo) + d.lo) / (2.0 * sh);
+    let a = dscale(asin_l(sh, sl), 2.0);
+    if op == OP_ASIN {
+        let mut v = fadd(pio2(), m.dd_neg(a));
+        if xd.neg {
+            v = m.dd_neg(v);
+        }
+        return out(r, v, 0, 88);
+    }
+    if xd.neg {
+        return out(r, fadd(pi_dd(), m.dd_neg(a)), 0, 88);
+    }
+    return out(r, a, 0, 88);
+}
+
+/// lgamma(w) for 1.4375 <= w < 2.5625, w = wh + wl (|wl| < ulp(wh)): the
+/// piece of LGK_T about the nearest c = 3/2 + j/8 (wh - c exact), lpoly's bound (2^-90.4; the
+/// piece about 2 is relative to w - 2, so near the zeros the bound holds
+/// relative to the value).
+inline fn lgk_l(wh: f64, wl: f64) m.DD {
+    let j = @as(usize, @int_from_float(u32, ((wh - 1.5) * 8.0) + 0.5));
+    // (wh - c, a multiple of ulp(wh) above |wl| or 0, and wl by Fast2Sum:
+    // normalized, as the piece about 2 needs)
+    let tt = m.fast_two_sum(wh - (1.5 + (@float_from_int(f64, j) * 0.125)), wl);
+    return lpoly(lt.LGK_T[..], j * 48, tt.hi, tt.lo);
+}
+
+/// Stirling's series for v >= 12 (normalized): (v - 1/2) log v - v + log(2
+/// pi)/2 + sum B_2k / (2k (2k - 1) v^(2k - 1)) (A&S 6.1.41) to k = 16 (the
+/// rest below 2^-93.8 of it), the terms from k = 4 in double by Estrin's
+/// scheme on w = 1/v^2 (below 2^-39.9 of the sum: their errors below 2^-91
+/// of it), the first three by lstep; log_l's error is below 2^-93.3 of log
+/// v (whose reduced part is below 2^-9 of it), 2^-92.6 of the result ((v -
+/// 1/2) log v is within a factor 1.63 of it): within 2^-90.
+fn stirling_l(v: m.DD) m.DD @multiversion("fma") {
+    let ev = @bit_cast(i32, @truncate(u32, m.bits(v.hi) >> 52)) - 1023;
+    let lv = log_l(dscale(v, p2(-ev)), ev);
+    // u = 1/v, w = u^2 (unnormalized)
+    let qv = 1.0 / v.hi;
+    let u = m.dd(qv, m.residual(1.0, qv, v.hi) * qv - (v.lo * (qv * qv)));
+    let z = m.two_sqr(u.hi);
+    let w = m.dd(z.hi, z.lo + (2.0 * (u.hi * u.lo)));
+    // (w taken no smaller than 2^-80 in the terms in double, which are then
+    // far below the bound: no underflow that the value does not have)
+    let wh = @max(w.hi, 8.271806125530277e-25);
+    let w2 = wh * wh;
+    let w4 = w2 * w2;
+    let sc = &lt.STIRLING_C[45];  // (the bounds checked once)
+    let c = @ptr_sub(sc, 45);
+    let g0 = m.mla(w2, m.mla(wh, cf3(c, 6), cf3(c, 5)), m.mla(wh, cf3(c, 4), cf3(c, 3)));
+    let g1 = m.mla(w2, m.mla(wh, cf3(c, 10), cf3(c, 9)), m.mla(wh, cf3(c, 8), cf3(c, 7)));
+    let g2 = m.mla(w2, m.mla(wh, cf3(c, 14), cf3(c, 13)), m.mla(wh, cf3(c, 12), cf3(c, 11)));
+    let g = m.mla(w4, m.mla(w4, m.mla(w4, cf3(c, 15), g2), g1), g0);
+    let mut sv = lstep(cfd3(c, 2), w, d0(g));
+    sv = lstep(cfd3(c, 1), w, sv);
+    sv = lstep(cfd3(c, 0), w, sv);
+    let us = lmul(u, sv);
+    // k = log(2 pi)/2 + u S (|u S| <= 0.007), then (v - 1/2) log v - v + k
+    let kk = m.fast_two_sum(lt.LN_SQRT2PI_H, us.hi);
+    // (v - 1/2 exactly: Fast2Sum, then its low part and v.lo, multiples of
+    // 2^-11 ulp(v.hi) whose sum is at most ulp(v.hi))
+    let vm = m.fast_two_sum(v.hi, -0.5);
+    let pm = lmul(m.dd(vm.hi, vm.lo + v.lo), lv);
+    let s1 = m.two_sum(pm.hi, -v.hi);
+    let s2 = m.fast_two_sum(s1.hi, kk.hi);  // (s1 >= 16.5)
+    let lo = ((s1.lo + s2.lo) + (pm.lo - v.lo)) + (kk.lo + (lt.LN_SQRT2PI_M + us.lo));
+    return m.fast_two_sum(s2.hi, lo);
+}
+
+/// The double nearest the triple-double k at p.
+inline fn cf3(p: *u64, k: usize) f64 {
+    return m.from_bits(@ptr_add(p, 3 * k).*);
+}
+
+/// The triple-double k at p as a double-double.
+inline fn cfd3(p: *u64, k: usize) m.DD {
+    return m.dd(m.from_bits(@ptr_add(p, 3 * k).*),
+                m.from_bits(@ptr_add(p, (3 * k) + 1).*) + m.from_bits(@ptr_add(p, (3 * k) + 2).*));
+}
+
+/// lgammal of a positive x for the x87 format, when the fast path applies
+/// (else fast_sf's): Stirling's series from 12 (2^-90), lgamma(v - n) +
+/// log((v - 1) ... (v - n)) from 2.5 (lgk_l's 2^-90.4 of |lgamma(v - n)| <=
+/// 0.29, log_l's 2^-92 absolute, the product's 2^-100, against lgamma v >=
+/// 0.28: 2^-89.3), LGK_T's piece itself in [1.5, 2.5) (2^-90.4), and below
+/// fast_sf's logarithms (log_v: 2^-101) with LGK_T's pieces (2^-90.4 of
+/// lgamma(v + 1) or lgamma(v + 2); the difference with the logarithm cancels
+/// by a factor 1.73 at most, near the zero at 1).
+pub fn fast_lgamma(r: *mut ld.W, x: *ld.W) bool @multiversion("fma") {
+    let xd = xin(x);
+    if (not xd.ok) or xd.neg or (xd.e > 900) or (xd.e < -900) {
+        return fast_sf(2, r, x);
+    }
+    let v = mag(xd);
+    if v.hi >= 12.0 {
+        return out(r, stirling_l(v), 0, 88);
+    }
+    if v.hi >= 2.5 {
+        // lgamma v = lgamma(v - n) + log((v - 1) ... (v - n)), v - n in [1.5,
+        // 2.5); v.hi - i is exact
+        let n = @int_from_float(i32, v.hi - 1.5);
+        let mut pr = m.dd(v.hi - 1.0, v.lo);
+        let mut i: i32 = 2;
+        while i <= n {
+            pr = lmul(pr, m.dd(v.hi - @float_from_int(f64, i), v.lo));
+            i += 1;
+        }
+        pr = norm(pr);
+        let ep = @bit_cast(i32, @truncate(u32, m.bits(pr.hi) >> 52)) - 1023;
+        let lg = lgk_l(v.hi - @float_from_int(f64, n), v.lo);
+        let lp = log_l(dscale(pr, p2(-ep)), ep);
+        return out(r, m.dd_add(lg, lp), 0, 87);
+    }
+    if v.hi >= 1.5 {
+        return out(r, lgk_l(v.hi, v.lo), 0, 88);
+    }
+    if v.hi >= 0.5 {
+        let w = m.two_sum(v.hi, 1.0);
+        return out(r, dsub(lgk_l(w.hi, w.lo + v.lo), log_v(v)), 0, 88);
+    }
+    let w = m.two_sum(v.hi, 2.0);
+    return out(r, dsub(lgk_l(w.hi, w.lo + v.lo), log_v(m.dd_mul(v, m.dd_add_d(v, 1.0)))), 0, 88);
 }
 
 // -----------------------------------------------------------------------------
@@ -888,7 +1176,7 @@ inline fn hstep(b: m.DD, u: m.DD, p: m.DD) m.DD {
     return m.fast_two_sum(s.hi, (s.lo + b.lo) + (pr.lo + ((u.hi * p.lo) + (u.lo * p.hi))));
 }
 
-/// sum b_n t^n, n = 0 .. 23, of a row of pairs (ERFCX_T, LGK_T, ASIN_T:
+/// sum b_n t^n, n = 0 .. 23, of a row of pairs (ERFCX_T, LGK_T:
 /// |b_n t^n| falls by 2^-4 a term or faster): the terms from n = 10 in
 /// double on t.hi by Estrin's scheme (those terms below 2^-39 of the sum, so
 /// their errors below 2^-92 of it), then Horner's rule in double-double:
@@ -915,14 +1203,6 @@ fn poly23(a: []u64, row: usize, tt: m.DD) m.DD @multiversion("fma") {
     p = hstep(cfd(c, 2), tt, p);
     p = hstep(cfd(c, 1), tt, p);
     return hstep(cfd(c, 0), tt, p);
-}
-
-/// asin y for 0 <= y < 0.766 (a double-double): the piece of ASIN_T about
-/// the nearest j/32 (|y - j/32| <= 1/64; the piece about 0 is odd, so the
-/// result keeps its relative precision near 0): within 2^-95.
-fn asin_k(y: m.DD) m.DD {
-    let j = @as(usize, @int_from_float(u32, (y.hi * 32.0) + 0.5));
-    return poly23(lt.ASIN_T[..], j * 48, m.dd_add_d(y, -(@float_from_int(f64, j) * 0.03125)));
 }
 
 /// erf a for |a| < 1/2: 2/sqrt(pi) a sum (-1)^n z^n / (n! (2n + 1)), z =
