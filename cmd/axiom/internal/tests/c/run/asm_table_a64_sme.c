@@ -12,6 +12,7 @@
 __asm__(".section .rodata.axiom_asm_table, \"a\"\n"
         ".globl axiom_asm_table\n"
         "axiom_asm_table:\n"
+        ".arch_extension sme2\n"
         "rdsvl x0, #1\n"
         "rdsvl x7, #-32\n"
         "addsvl x0, x1, #-3\n"

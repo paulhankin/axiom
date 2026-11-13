@@ -2028,7 +2028,7 @@ same result with or without one. Extensions have the names `--features` takes:
 | Architecture | Extensions |
 |---|---|
 | `x86_64` (SSE2 is the baseline) | `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `lzcnt`, `bmi`, `bmi2`, `avx`, `avx2`, `fma`, `cx16`, `aes`, `pclmul`, `sha`, `f16c`, `movbe`, `adx`, `avx512f`, `avx512cd`, `avx512bw`, `avx512dq`, `avx512vl`, `avx512ifma`, `avx512vbmi`, `avx512vbmi2`, `avx512vnni`, `avx512bitalg`, `avx512vpopcntdq`, `avx512bf16`, `avx512fp16`, `gfni`, `vaes`, `vpclmulqdq`, `avxvnni`, `sha512`, `sm3`, `sm4`, `avx10.1`, `prfchw` |
-| `aarch64` (FP and Advanced SIMD are the baseline) | `lse`, `rcpc`, `dotprod`, `cssc`, `aes` (with PMULL), `sha2` (SHA-1 and SHA-256), `sha3`, `sha512`, `sm4` (SM3 and SM4), `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme` |
+| `aarch64` (FP and Advanced SIMD are the baseline) | `lse`, `rcpc`, `dotprod`, `cssc`, `aes` (with PMULL), `sha2` (SHA-1 and SHA-256), `sha3`, `sha512`, `sm4` (SM3 and SM4), `crc`, `rdm`, `fp16`, `fhm`, `bf16`, `i8mm`, `sve`, `sve2`, `dit`, `sme`, `sme2`, `sme2p1`, `sve2p1`, `sme-f64f64`, `sme-i16i64`, `sme-f16f16`, `b16b16` |
 | `wasm32`, `wasm64` | `simd128`, `bulk-memory`, `nontrapping-fptoint`, `sign-ext`, `mutable-globals`, `atomics`, `multivalue`, `relaxed-simd`, `tail-call`, `exception-handling` |
 
 An extension implies those it builds on (`avx2` implies `avx`, which implies `sse4.2`, and

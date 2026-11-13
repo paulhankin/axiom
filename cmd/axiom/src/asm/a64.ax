@@ -35,6 +35,7 @@ import "a64sysreg.ax" as sr;
 import "a64tab.ax" as atab;
 import "core.ax" as cr;
 import "inline.ax" as ai;
+import "std/os/cpu" as cpu;
 
 // Operand kinds
 const AK_NONE: u8 = 0;
@@ -48,6 +49,11 @@ const AK_LIST: u8 = 7;   // {v0.16b, v1.16b}, and of SVE's {z0.s, z1.s}
 const AK_ZREG: u8 = 8;   // an SVE vector register z0-z31 (esize 0 if no element size is written)
 const AK_PREG: u8 = 9;   // an SVE predicate register p0-p15 (esize as for z; pq its /m or /z)
 const AK_FFR: u8 = 10;   // the first-fault register ffr
+// SME's ZA storage (see za_name): the array `za`, `za.T[Wv, off{:end}{, vgxN}]`
+// (view 'a'), a tile `zaN.T` ('t'), a tile slice `zaNh.T[Ws, off{:end}]` ('h' or 'v')
+const AK_ZA: u8 = 11;
+const AK_ZT: u8 = 12;     // SME2's lookup table zt0, maybe with an index (zt0[8])
+const AK_PNREG: u8 = 13;  // a predicate-as-counter register pn0-pn15 (esize, pq and index as for p)
 
 // shift and extend kinds (AOp.sh)
 const SH_LSL: u8 = 0;
@@ -70,26 +76,29 @@ struct AOp {
     v: cr.Val,   // AK_IMM: the value; AK_MEM: the offset; AK_EXPR: the target
     fp: bool,    // AK_IMM: a floating constant (f)
     f: f64,
-    base: i32,   // AK_MEM
-    off: bool,   // AK_MEM: an immediate offset is given
-    rm: i32,     // AK_MEM: a register offset, or -1
-    rmx: bool,   // its width (x)
-    sh: u8,      // AK_SHIFT; AK_MEM with rm: its extend
-    amt: i32,    // AK_SHIFT, AK_MEM: the amount, or -1 if not written
-    pre: bool,   // AK_MEM: [xn, #i]!
-    name: []u8,  // AK_EXPR: the text (a condition, option or register name)
-    nregs: u32,  // AK_LIST
-    text: []u8,  // the operand as written (a label may have a register's name)
-    pq: u8,      // AK_PREG: 'm' or 'z' for p0/m or p0/z, else 0
-    bz: u32,     // AK_MEM: the base is z<base> of these elements (an SVE vector base), else 0
-    rz: u32,     // AK_MEM: the offset is z<rm> of these elements, else 0
-    mvl: bool,   // AK_MEM: `[xn, #imm, mul vl]`
+    base: i32,    // AK_MEM
+    off: bool,    // AK_MEM: an immediate offset is given
+    rm: i32,      // AK_MEM: a register offset, or -1
+    rmx: bool,    // its width (x)
+    sh: u8,       // AK_SHIFT; AK_MEM with rm: its extend
+    amt: i32,     // AK_SHIFT, AK_MEM: the amount, or -1 if not written
+    pre: bool,    // AK_MEM: [xn, #i]!
+    name: []u8,   // AK_EXPR: the text (a condition, option or register name)
+    nregs: u32,   // AK_LIST
+    text: []u8,   // the operand as written (a label may have a register's name)
+    pq: u8,       // AK_PREG: 'm' or 'z' for p0/m or p0/z, else 0
+    bz: u32,      // AK_MEM: the base is z<base> of these elements (an SVE vector base), else 0
+    rz: u32,      // AK_MEM: the offset is z<rm> of these elements, else 0
+    mvl: bool,    // AK_MEM: `[xn, #imm, mul vl]`
+    stride: u32,  // AK_LIST: the distance between its registers (1, or SME2's strided lists 4 and 8)
+    brace: bool,  // AK_ZA, AK_ZT: written in braces ({za0h.b[w12, 0]}, {zt0})
+    mask: u32,    // AK_LIST of ZA tiles ({za0.d, za1.d}, {za}): the 64-bit tiles they cover
 }
 
 fn none_op() AOp {
     return AOp.{ kind: AK_NONE, reg: -1, x: false, sp: false, view: 0, esize: 0, lanes: 0, index: -1, v: cr.konst(0),
                  fp: false, f: 0.0, base: -1, off: false, rm: -1, rmx: false, sh: 0, amt: -1, pre: false, name: "",
-                 nregs: 0, text: "", pq: 0, bz: 0, rz: 0, mvl: false };
+                 nregs: 0, text: "", pq: 0, bz: 0, rz: 0, mvl: false, stride: 1, brace: false, mask: 0 };
 }
 
 fn zr(x: bool) AOp {
@@ -101,6 +110,13 @@ fn zr(x: bool) AOp {
 }
 
 fn pick_i64(c: bool, a: i64, b: i64) i64 {
+    if c {
+        return a;
+    }
+    return b;
+}
+
+fn pick_i32(c: bool, a: i32, b: i32) i32 {
     if c {
         return a;
     }
@@ -263,7 +279,9 @@ fn vreg_name(n: []u8, op: *mut AOp) bool {
 }
 
 // An SVE register: z0-z31 with an optional element size (.b .h .s .d .q) and
-// index (z0.s[1]), p0-p15 with an optional element size or a /m or /z, ffr.
+// index (z0.s[1], and SME2's unsized z0[1]), p0-p15 with an optional element
+// size or a /m or /z, an element p0.b[w12, 1] (psel's), the
+// predicate-as-counter pn0-pn15 (.T, /z, pn8[1]), ffr.
 fn sve_reg_name(n: []u8, op: *mut AOp) bool {
     if u.str_eq(n, "ffr") {
         op.kind = AK_FFR;
@@ -272,45 +290,208 @@ fn sve_reg_name(n: []u8, op: *mut AOp) bool {
     if (n.len < 2) or ((n[0] != 'z') and (n[0] != 'p')) {
         return false;
     }
-    let mut j: usize = 1;
+    let pn = (n[0] == 'p') and (n.len > 2) and (n[1] == 'n') and u.is_digit(n[2]);
+    let j0 = pick_us(pn, 2, 1);
+    let mut j: usize = j0;
     while (j < n.len) and u.is_digit(n[j]) {
         j += 1;
     }
-    let k = ai.num(n[1..j]);
+    let k = ai.num(n[j0..j]);
     let lim = pick_i64(n[0] == 'z', 31, 15);
-    if (j == 1) or (k < 0) or (k > lim) {
+    if (j == j0) or (k < 0) or (k > lim) {
         return false;
     }
-    op.kind = u8_pick(n[0] == 'z', AK_ZREG, AK_PREG);
+    op.kind = u8_pick(n[0] == 'z', AK_ZREG, u8_pick(pn, AK_PNREG, AK_PREG));
     op.reg = @int_cast(i32, k);
     if j == n.len {
         return true;
     }
-    let r = n[j..];
-    if (n[0] == 'p') and (r.len == 2) and (r[0] == '/') and ((r[1] == 'm') or (r[1] == 'z')) {
+    let mut r = n[j..];
+    let mut br: []u8 = "";
+    let lb = u.find(r, '[');
+    if lb >= 0 {
+        br = r[@int_cast(usize, lb)..];
+        r = cr.trim(r[0..@int_cast(usize, lb)]);
+        if (br.len < 3) or (br[br.len - 1] != ']') {
+            return false;
+        }
+    }
+    if (n[0] == 'p') and (r.len == 2) and (r[0] == '/') and ((r[1] == 'm') or (r[1] == 'z')) and (br.len == 0) {
         op.pq = r[1];
         return true;
     }
-    if (r.len < 2) or (r[0] != '.') {
-        return false;
+    if r.len > 0 {
+        if (r.len != 2) or (r[0] != '.') {
+            return false;
+        }
+        let e = u.find("bhsdq", r[1]);
+        if e < 0 {
+            return false;
+        }
+        op.esize = @as(u32, 8) << @truncate(u32, @bit_cast(u64, e));
     }
-    let e = u.find("bhsdq", r[1]);
-    if e < 0 {
-        return false;
+    if br.len == 0 {
+        return r.len > 0;
     }
-    op.esize = @as(u32, 8) << @truncate(u32, @bit_cast(u64, e));
-    if r.len == 2 {
+    let inner = cr.trim(br[1..br.len - 1]);
+    if (n[0] == 'p') and not pn {
+        // p<n>.T[w<v>, imm]: the element psel tests
+        let c = u.find(inner, ',');
+        if (op.esize == 0) or (c < 0) {
+            return false;
+        }
+        let wv = cr.trim(inner[0..@int_cast(usize, c)]);
+        let iv = lit_num(cr.trim(inner[@int_cast(usize, c) + 1..]));
+        if (wv.len < 2) or (wv[0] != 'w') or (ai.num(wv[1..]) < 0) or (ai.num(wv[1..]) > 31) or (iv < 0) {
+            return false;
+        }
+        op.base = @truncate(i32, ai.num(wv[1..]));
+        op.index = @truncate(i32, iv);
         return true;
     }
-    // an element index: z0.s[3]
-    if (n[0] != 'z') or (r.len < 5) or (r[2] != '[') or (r[r.len - 1] != ']') {
+    // an element index: z0.s[3], z0[3], pn8[1]
+    let iv = lit_num(inner);
+    if (iv < 0) or (pn and (op.esize != 0)) {
         return false;
     }
-    let iv = ai.num(cr.trim(r[3..r.len - 1]));
+    op.index = @truncate(i32, iv);
+    return true;
+}
+
+// A decimal or 0x-hexadecimal number (an index or offset written in an
+// operand), or -1.
+fn lit_num(s: []u8) i64 {
+    let t = cr.trim(s);
+    if (t.len > 2) and (t[0] == '0') and ((t[1] == 'x') or (t[1] == 'X')) {
+        if t.len > 10 {
+            return -1;
+        }
+        let mut v: i64 = 0;
+        for c in t[2..] {
+            let l = u8_pick((c >= 'A') and (c <= 'F'), c + 32, c);
+            let x = u.find("0123456789abcdef", l);
+            if x < 0 {
+                return -1;
+            }
+            v = (v * 16) + x;
+        }
+        return v;
+    }
+    if (t.len > 1) and (t[0] == '#') {
+        return lit_num(t[1..]);
+    }
+    if (t.len > 1) and (t[0] == '0') {
+        return ai.num(t[1..]);
+    }
+    return ai.num(t);
+}
+
+// SME's ZA (lower case n): `za`; the array's vectors `za.T[Wv, off{:end}{,
+// vgx2|vgx4}]` and `za[Wv, off]` (view 'a'; base the Wv register, index the
+// offset, amt the range's end or -1, nregs the vector group); a tile
+// `zaN.T` ('t', reg N); a tile's horizontal or vertical slices
+// `zaNh.T[Ws, off{:end}]` ('h', 'v').
+fn za_name(n: []u8, op: *mut AOp) bool {
+    if (n.len < 2) or (n[0] != 'z') or (n[1] != 'a') {
+        return false;
+    }
+    let mut j: usize = 2;
+    while (j < n.len) and u.is_digit(n[j]) {
+        j += 1;
+    }
+    let tile = j > 2;
+    let mut view: u8 = u8_pick(tile, 't', 'a');
+    if tile {
+        if (ai.num(n[2..j]) < 0) or (ai.num(n[2..j]) > 15) {
+            return false;
+        }
+        op.reg = @truncate(i32, ai.num(n[2..j]));
+        if (j < n.len) and ((n[j] == 'h') or (n[j] == 'v')) {
+            view = n[j];
+            j += 1;
+        }
+    }
+    if (j < n.len) and (n[j] == '.') {
+        if (j + 1) >= n.len {
+            return false;
+        }
+        let e = u.find("bhsdq", n[j + 1]);
+        if e < 0 {
+            return false;
+        }
+        op.esize = @as(u32, 8) << @truncate(u32, @bit_cast(u64, e));
+        j += 2;
+    }
+    let rest = cr.trim(n[j..]);
+    op.kind = AK_ZA;
+    op.view = view;
+    if rest.len == 0 {
+        // za alone, or a tile (which has an element size and no slice)
+        return (not tile and (op.esize == 0)) or ((view == 't') and (op.esize != 0));
+    }
+    if (rest[0] != '[') or (rest[rest.len - 1] != ']') or (view == 't') or (tile and (op.esize == 0)) {
+        return false;
+    }
+    let parts = cr.split_args(rest[1..rest.len - 1]);
+    if (parts.len < 2) or (parts.len > 3) {
+        return false;
+    }
+    let wv = parts[0];
+    if (wv.len < 2) or (wv[0] != 'w') or (ai.num(wv[1..]) < 0) or (ai.num(wv[1..]) > 31) {
+        return false;
+    }
+    op.base = @truncate(i32, ai.num(wv[1..]));
+    let off = parts[1];
+    let c = u.find(off, ':');
+    if c >= 0 {
+        let a = lit_num(off[0..@int_cast(usize, c)]);
+        let b = lit_num(off[@int_cast(usize, c) + 1..]);
+        if (a < 0) or (b < 0) {
+            return false;
+        }
+        op.index = @truncate(i32, a);
+        op.amt = @truncate(i32, b);
+    } else {
+        let a = lit_num(off);
+        if a < 0 {
+            return false;
+        }
+        op.index = @truncate(i32, a);
+    }
+    if parts.len == 3 {
+        if view != 'a' {
+            return false;
+        }
+        if u.str_eq(parts[2], "vgx2") {
+            op.nregs = 2;
+        } else if u.str_eq(parts[2], "vgx4") {
+            op.nregs = 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// SME2's lookup table: zt0, or an element of it zt0[i] (movt).
+fn zt_name(n: []u8, op: *mut AOp) bool {
+    if (n.len < 3) or not u.str_eq(n[0..3], "zt0") {
+        return false;
+    }
+    let r = cr.trim(n[3..]);
+    op.kind = AK_ZT;
+    op.reg = 0;
+    if r.len == 0 {
+        return true;
+    }
+    if (r.len < 3) or (r[0] != '[') or (r[r.len - 1] != ']') {
+        return false;
+    }
+    let iv = lit_num(r[1..r.len - 1]);
     if iv < 0 {
         return false;
     }
-    op.index = @int_cast(i32, iv);
+    op.index = @truncate(i32, iv);
     return true;
 }
 
@@ -578,9 +759,11 @@ fn parse_op1(A: *mut cr.Asm, s0: []u8) AOp {
         return imm_op(A, s);
     }
     let low = cr.lower(s);
-    if gpr_name(low, &mut op) or vreg_name(low, &mut op) or sve_reg_name(low, &mut op) {
+    if gpr_name(low, &mut op) or vreg_name(low, &mut op) or sve_reg_name(low, &mut op) or za_name(low, &mut op) or
+       zt_name(low, &mut op) {
         return op;
     }
+    op = none_op();
     // a register with writeback (the memory-copy instructions' `xn!`)
     if (low.len > 1) and (low[low.len - 1] == '!') and gpr_name(cr.trim(low[0..low.len - 1]), &mut op) {
         op.pre = true;
@@ -753,13 +936,43 @@ fn is_mul_vl(t: []u8) bool {
            u.str_eq(cr.trim(l[3..]), "vl");
 }
 
-// A list element: a vector register (v) or an SVE one (z).
+// A list element: a vector register (v), an SVE one (z), a sized predicate
+// (p, for SVE2.1's predicate pairs) or a ZA tile.
 fn list_reg(t: []u8, op: *mut AOp) bool {
     let l = cr.lower(cr.trim(t));
     if vreg_name(l, op) {
         return true;
     }
-    return sve_reg_name(l, op) and (op.kind == AK_ZREG) and (op.index < 0);
+    if sve_reg_name(l, op) {
+        return ((op.kind == AK_ZREG) and (op.index < 0)) or
+               ((op.kind == AK_PREG) and (op.esize != 0) and (op.pq == 0) and (op.index < 0));
+    }
+    let mut z = none_op();
+    if za_name(l, &mut z) and (z.view == 't') {
+        op.* = z;
+        return true;
+    }
+    return false;
+}
+
+// The 64-bit ZA tiles a tile covers: zaN.d is tile N; zaN.s the tiles N and
+// N+4, zaN.h N, N+2, N+4, N+6, za0.b all eight (the Arm ARM's ZERO mask).
+fn tile_mask(o: *AOp) u32 {
+    let es = o.esize;
+    let n = @bit_cast(u32, o.reg);
+    if (es == 64) and (n < 8) {
+        return @as(u32, 1) << n;
+    }
+    if (es == 32) and (n < 4) {
+        return @as(u32, 0x11) << n;
+    }
+    if (es == 16) and (n < 2) {
+        return @as(u32, 0x55) << n;
+    }
+    if (es == 8) and (n == 0) {
+        return 0xff;
+    }
+    return 0;
 }
 
 fn list_op(A: *mut cr.Asm, s: []u8) AOp {
@@ -772,19 +985,33 @@ fn list_op(A: *mut cr.Asm, s: []u8) AOp {
     }
     let after = cr.trim(s[@int_cast(usize, rb) + 1..]);
     let t = s[1..@int_cast(usize, rb)];
+    let lt = cr.lower(cr.trim(t));
+    // SME: {za} (every tile), {zt0}, a tile slice {za0h.b[w12, 0]}
+    if (after.len == 0) and u.str_eq(lt, "za") {
+        op.view = 't';
+        op.mask = 0xff;
+        op.nregs = 1;
+        return op;
+    }
+    let mut one = none_op();
+    if (after.len == 0) and (zt_name(lt, &mut one) or (za_name(lt, &mut one) and (one.view != 't'))) {
+        one.brace = true;
+        return one;
+    }
     let mut first = none_op();
     let mut n: u32 = 0;
+    let mut stride: i32 = 1;
     let dash = u.find(t, '-');
     if dash >= 0 {
         let a = cr.trim(t[0..@int_cast(usize, dash)]);
         let b = cr.trim(t[@int_cast(usize, dash) + 1..]);
         let mut x = none_op();
         if not list_reg(a, &mut first) or not list_reg(b, &mut x) or (first.kind != x.kind) or
-           (x.esize != first.esize) {
+           (x.esize != first.esize) or (first.kind == AK_ZA) {
             cr.fail(A, u.f1("'%s' is not a register list", s));
             return op;
         }
-        n = @bit_cast(u32, ((x.reg - first.reg) & 31) + 1);
+        n = @bit_cast(u32, ((x.reg - first.reg) & pick_i32(first.kind == AK_PREG, 15, 31)) + 1);
     } else {
         let xs = cr.split_args(t);
         for k in 0..xs.len {
@@ -793,16 +1020,45 @@ fn list_op(A: *mut cr.Asm, s: []u8) AOp {
                 cr.fail(A, u.f1("'%s' is not a register list", s));
                 return op;
             }
+            if x.kind == AK_ZA {
+                // ZA tiles (zero's list): the 64-bit tiles they cover
+                let tm = tile_mask(&x);
+                if tm == 0 {
+                    cr.fail(A, u.f1("'%s' is not a list of ZA tiles", s));
+                    return op;
+                }
+                op.mask = op.mask | tm;
+                first = x;
+                continue;
+            }
+            let lim = pick_i32(x.kind == AK_PREG, 15, 31);
             if k == 0 {
                 first = x;
-            } else if (x.reg != ((first.reg + @int_cast(i32, k)) & 31)) or (x.esize != first.esize) {
+            } else if k == 1 {
+                stride = (x.reg - first.reg) & lim;
+            }
+            if (k > 0) and (x.esize != first.esize) {
+                cr.fail(A, u.f1("the registers of '%s' are not consecutive", s));
+                return op;
+            }
+            // consecutive, or (SME2's strided lists of z registers) evenly spaced
+            if (x.reg != ((first.reg + (@int_cast(i32, k) * stride)) & lim)) or (stride == 0) or
+               ((stride != 1) and (x.kind != AK_ZREG)) {
                 cr.fail(A, u.f1("the registers of '%s' are not consecutive", s));
                 return op;
             }
         }
         n = @truncate(u32, xs.len);
+        if first.kind == AK_ZA {
+            if after.len > 0 {
+                cr.fail(A, u.f1("'%s' is not a register list", s));
+            }
+            op.view = 't';
+            op.nregs = n;
+            return op;
+        }
     }
-    if (n == 0) or (n > 4) or ((first.view != 'v') and (first.kind != AK_ZREG)) {
+    if (n == 0) or (n > 4) or ((first.view != 'v') and (first.kind != AK_ZREG) and (first.kind != AK_PREG)) {
         cr.fail(A, u.f1("'%s' is not a register list", s));
         return op;
     }
@@ -810,7 +1066,10 @@ fn list_op(A: *mut cr.Asm, s: []u8) AOp {
     op.esize = first.esize;
     op.lanes = first.lanes;
     op.nregs = n;
-    op.view = u8_pick(first.kind == AK_ZREG, 'z', 'v');
+    // (a strided list is view 's', which the SVE and Advanced SIMD forms do not take)
+    op.view = u8_pick(first.kind == AK_ZREG, u8_pick((stride != 1) and (n > 1), 's', 'z'),
+                      u8_pick(first.kind == AK_PREG, 'p', 'v'));
+    op.stride = @bit_cast(u32, stride);
     op.index = first.index;
     if after.len > 0 {
         if (after.len < 3) or (after[0] != '[') or (after[after.len - 1] != ']') {
@@ -949,7 +1208,8 @@ fn labelish(o: *AOp) bool {
     if (o.kind == AK_EXPR) or (o.kind == AK_IMM) {
         return true;
     }
-    if ((o.kind != AK_REG) and (o.kind != AK_VREG) and (o.kind != AK_SHIFT)) or (o.text.len == 0) or o.pre {
+    if ((o.kind != AK_REG) and (o.kind != AK_VREG) and (o.kind != AK_SHIFT) and (o.kind != AK_ZA) and
+        (o.kind != AK_ZT) and (o.kind != AK_PNREG)) or (o.text.len == 0) or o.pre {
         return false;
     }
     if u.is_digit(o.text[0]) {
@@ -1231,6 +1491,28 @@ fn directive(A: *mut cr.Asm, st: *mut cr.Stmt) bool {
         place_pool(A);
         return true;
     }
+    if u.str_eq(st.op, ".arch_extension") {
+        // .arch_extension name{, name}: the instructions of these extensions
+        // (the names of --features; `noname` takes one away again) from here to
+        // the end of the assembly, whatever the target's extensions are
+        for a in cr.split_args(st.args) {
+            let n = cr.lower(cr.trim(a));
+            let off = (n.len > 2) and (n[0] == 'n') and (n[1] == 'o') and (cpu.bit_of(cpu.ARCH_AARCH64, n) == 0);
+            let name = n[pick_us(off, 2, 0)..];
+            let b = cpu.bit_of(cpu.ARCH_AARCH64, name);
+            if b == 0 {
+                cr.fail(A, u.f1("'%s' is not an AArch64 extension", name));
+                return true;
+            }
+            ext_reset(A);
+            if off {
+                g_ext_bits = g_ext_bits & ~b;
+            } else {
+                g_ext_bits = g_ext_bits | cpu.closure(cpu.ARCH_AARCH64, b);
+            }
+        }
+        return true;
+    }
     if u.str_eq(st.op, ".inst") {
         for a in cr.split_args(st.args) {
             let x = cr.eval_const(A, a, "an instruction word");
@@ -1279,8 +1561,9 @@ fn insn(A: *mut cr.Asm, st: *mut cr.Stmt) void {
             return;
         }
     }
-    if vimm(A, m, ops) or table(A, m, ops) or base_rest(A, m, ops) or sve(A, m, ops) or integer(A, m, ops) or
-       branch(A, m, ops) or ldst(A, m, ops) or system(A, m, ops) or fp(A, m, ops) or simd(A, m, ops) {
+    if vimm(A, m, ops) or table(A, m, ops) or base_rest(A, m, ops) or sme(A, m, ops) or sve(A, m, ops) or
+       integer(A, m, ops) or branch(A, m, ops) or ldst(A, m, ops) or system(A, m, ops) or fp(A, m, ops) or
+       simd(A, m, ops) {
         return;
     }
     if not cr.failed(A) {
@@ -3867,11 +4150,16 @@ fn system(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
     }
     // smstart smstop {sm | za}: msr svcrsm/svcrza/svcrsmza, #1 or #0
     if u.str_eq(m, "smstart") or u.str_eq(m, "smstop") {
+        if not ext_has(A, tg.A_SME) {
+            need_ext(A, m, "sme");
+            return true;
+        }
         let mut crm: u64 = 6;
         if ops.len == 1 {
-            if u.str_eq(ops[0].name, "sm") {
+            let o = ops[0];
+            if (o.kind == AK_EXPR) and u.str_eq(o.name, "sm") {
                 crm = 2;
-            } else if u.str_eq(ops[0].name, "za") {
+            } else if (o.kind == AK_ZA) and (o.view == 'a') and (o.base < 0) and (o.esize == 0) {
                 crm = 4;
             } else {
                 bad(A, m);
@@ -5371,7 +5659,7 @@ fn table(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
     }
     // a vector form the table does not have (the encoders by hand have the
     // general-register and scalar forms of these mnemonics, not other vector ones)
-    if (ops.len > 0) and (((ops[0].kind == AK_VREG) and (ops[0].view == 'v')) or (ops[0].kind == AK_LIST)) {
+    if (ops.len > 0) and ((ops[0].kind == AK_VREG) or (ops[0].kind == AK_LIST)) and (ops[0].view == 'v') {
         bad(A, m);
         return true;
     }
@@ -6228,10 +6516,15 @@ fn sve(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
 
 fn has_sve_operand(ops: []AOp) bool {
     for o in ops {
-        if (o.kind == AK_ZREG) or (o.kind == AK_PREG) or (o.kind == AK_FFR) {
+        if (o.kind == AK_ZREG) or (o.kind == AK_PREG) or (o.kind == AK_FFR) or (o.kind == AK_ZT) or
+           (o.kind == AK_PNREG) {
             return true;
         }
-        if (o.kind == AK_LIST) and (o.view == 'z') {
+        // (a ZA operand; `za` alone is also smstart's and smstop's)
+        if (o.kind == AK_ZA) and ((o.view != 'a') or (o.base >= 0) or (o.esize != 0)) {
+            return true;
+        }
+        if (o.kind == AK_LIST) and (o.view != 'v') {
             return true;
         }
         if (o.kind == AK_MEM) and ((o.bz != 0) or (o.rz != 0) or o.mvl) {
@@ -7365,6 +7658,10 @@ fn sve_addvl(A: *mut cr.Asm, m: []u8, ops: []AOp, rd: bool) bool {
     // whose names hold "svl" or "spl") set bit 11, the plain ones (SVE:
     // addvl, addpl, rdvl) clear it
     let svl = u64_pick(u.contains(m, "svl") or u.contains(m, "spl"), @as(u64, 0x800), 0);
+    if (svl != 0) and not ext_has(A, tg.A_SME) {
+        need_ext(A, m, "sme");
+        return true;
+    }
     if rd {
         // rdvl / rdsvl: Xd not SP
         if d.sp {
@@ -7631,6 +7928,540 @@ fn sve_cpy_imm(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
     }
     w32(A, 0x05100000 | pg | u64_pick(ops[1].pq == 'm', 0x4000, 0) | @bit_cast(u64, f));
     return true;
+}
+
+// -----------------------------------------------------------------------------
+// SME, SME2 and SVE2.1's additions (asm/a64tab.ax's SMETAB, generated from the
+// Arm ARM's SME and SVE encodings). A line is `mnemonic operands base
+// extensions`. Each operand is a kind with its parameters, `:`-separated
+// (`A:s:1:2?` the ZA array's .s vectors, one at a time, in groups of two, the
+// `, vgx2` optional), then its fields, `/`-separated: `r5w4` a field at bit 5
+// of width 4 (values 0-15); `o=0.14.2.7.7` min.max.step.src.dst: the values
+// min..max in steps of step (negative: counted down from max), encoded as
+// that count, its bits src (hex) going in order to the word's bits dst (hex);
+// `i@0.o` a value that must equal operand 0's field o (encoded there). The
+// extensions are alternatives `|` of extensions that must all be there `+`.
+// The operand kinds (MK_*):
+//   Z:T z<n>.T            ZI:T z<n>.T[i]        ZU z<n>      ZUI z<n>[i]
+//   L:T:n:stride  a list of n z registers .T, consecutive or strided
+//   LP:T:n  a list of predicates        P p<n>  PM p<n>/m  PZ p<n>/z  PE:T p<n>.T
+//   PI:T p<n>.T[w<v>, i]   N pn<n>  NZ pn<n>/z  NE:T pn<n>.T  NI pn<n>[i]
+//   A:T:k:g  za.T[w<v>, o{:o+k-1}{, vgx<g>}] (T - for none, g 0 for no group)
+//   H:T:k:h|v  za<t>h.T[w<v>, o{:o+k-1}] (HL the same in braces)  T:T za<t>.T
+//   X:s|z  an X register (31: sp or xzr)  W  a W register   V:<arr> v<n>.<arr>
+//   F:T  a scalar register   I  #imm   VL  vlx2 or vlx4 (i 2 or 4)
+//   ZT zt0  ZTI zt0[i]  ZTL {zt0}
+//   MX:base [x<n>]  MX:mulvl [x<n>{, #i, mul vl}]  MX:reg:s [x<n>, x<m>{, lsl #s}]
+//   MZ:base:T [z<n>.T]  MZ:reg:T [z<n>.T, x<m>]
+// -----------------------------------------------------------------------------
+const MK_Z: u8 = 1;
+const MK_ZI: u8 = 2;
+const MK_ZU: u8 = 3;
+const MK_ZUI: u8 = 4;
+const MK_L: u8 = 5;
+const MK_LP: u8 = 6;
+const MK_P: u8 = 7;
+const MK_PM: u8 = 8;
+const MK_PZ: u8 = 9;
+const MK_PE: u8 = 10;
+const MK_PI: u8 = 11;
+const MK_N: u8 = 12;
+const MK_NZ: u8 = 13;
+const MK_NE: u8 = 14;
+const MK_NI: u8 = 15;
+const MK_A: u8 = 16;
+const MK_H: u8 = 17;
+const MK_HL: u8 = 18;
+const MK_T: u8 = 19;
+const MK_X: u8 = 20;
+const MK_W: u8 = 21;
+const MK_V: u8 = 22;
+const MK_F: u8 = 23;
+const MK_I: u8 = 24;
+const MK_VL: u8 = 25;
+const MK_ZT: u8 = 26;
+const MK_ZTI: u8 = 27;
+const MK_ZTL: u8 = 28;
+const MK_MX: u8 = 29;
+const MK_MZ: u8 = 30;
+
+let MK_NAMES: [30][]u8 = ["Z", "ZI", "ZU", "ZUI", "L", "LP", "P", "PM", "PZ", "PE", "PI", "N", "NZ", "NE", "NI", "A",
+                          "H", "HL", "T", "X", "W", "V", "F", "I", "VL", "ZT", "ZTI", "ZTL", "MX", "MZ"];
+
+struct MEField {
+    op: u8,
+    key: u8,  // r i v o t n m (see me_value)
+    lo: i64,
+    hi: i64,
+    step: i64,     // negative: the count is (hi - value) / -step
+    signed: bool,  // the count is value / step in two's complement (src's width)
+    src: u64,
+    dst: u64,
+    tie: i32,  // the operand whose field `tkey` this one equals (not encoded), or -1
+    tkey: u8,
+}
+
+struct MEForm {
+    name: []u8,
+    n: usize,
+    kind: [8]u8,
+    es: [8]u32,    // the element size in bits (0: none)
+    cnt: [8]u8,    // L, LP: the registers; A, H: the vectors of the range (k); V: the lanes
+    aux: [8]u8,    // L: the stride; A: the vector group (0, 2, 4); H: 'h' or 'v'; X: 's' or 'z'; MX/MZ: 'b' 'm' 'r'
+    sh: [8]u8,     // MX:reg: the lsl amount
+    opt: [8]bool,  // A: the vgx may be left out
+    f0: usize,     // its fields: g_mefields[f0..f0 + nf]
+    nf: usize,
+    base: u64,
+    feat: [3]u64,  // the alternatives of the extensions it needs (each: all of these bits)
+    nfeat: usize,
+    ftext: []u8,
+}
+
+let mut g_meforms: u.List.[MEForm] = u.List.[MEForm].{ data: @ptr_from_int(*mut MEForm, 0), len: 0, cap: 0 };
+let mut g_mefields: u.List.[MEField] = u.List.[MEField].{ data: @ptr_from_int(*mut MEField, 0), len: 0, cap: 0 };
+let mut g_menames: u.SymMap.[i32] = u.SymMap.[i32].{
+    keys: @ptr_from_int(*mut usize, 0), vals: @ptr_from_int(*mut i32, 0), cap: 0, len: 0 };
+let mut g_melists: u.List.[u.List.[i32]] = u.List.[u.List.[i32]].{ data: @ptr_from_int(*mut u.List.[i32], 0), len: 0,
+                                                                   cap: 0 };
+let mut g_mebuilt: bool = false;
+
+// The extension bit of a name in SMETAB's extensions column.
+fn me_ext(n: []u8) u64 {
+    let names = ["sve", "sve2", "sve2p1", "sme", "sme2", "sme2p1", "sme-f64f64", "sme-i16i64", "sme-f16f16", "b16b16",
+                 "bf16"];
+    let bits = [tg.A_SVE, tg.A_SVE2, tg.A_SVE2P1, tg.A_SME, tg.A_SME2, tg.A_SME2P1, tg.A_SME_F64F64, tg.A_SME_I16I64,
+                tg.A_SME_F16F16, tg.A_B16B16, tg.A_BF16];
+    for k in 0..names.len {
+        if u.str_eq(n, names[k]) {
+            return bits[k];
+        }
+    }
+    u.die(u.f1("asm/a64tab.ax: the extension '%s'", n));
+    return 0;
+}
+
+// The pieces of s between the separator c.
+fn me_split(s: []u8, c: u8) [][]u8 {
+    let mut out = u.List.[[]u8].empty();
+    let mut st: usize = 0;
+    for k in 0..s.len + 1 {
+        if (k == s.len) or (s[k] == c) {
+            out.push(s[st..k]);
+            st = k + 1;
+        }
+    }
+    return out.items();
+}
+
+fn me_es(c: u8) u32 {
+    let e = u.find("bhsdq", c);
+    if e < 0 {
+        return 0;
+    }
+    return @as(u32, 8) << @truncate(u32, @bit_cast(u64, e));
+}
+
+fn me_dec(s: []u8) i64 {
+    if (s.len > 0) and (s[0] == '-') {
+        return -ai.num(s[1..]);
+    }
+    return ai.num(s);
+}
+
+fn build_metable() void {
+    g_meforms = u.List.[MEForm].empty();
+    g_mefields = u.List.[MEField].empty();
+    g_melists = u.List.[u.List.[i32]].empty();
+    for line in atab.SMETAB {
+        let mut i: usize = 0;
+        let name = u.intern(tword(line, &mut i));
+        let ops = tword(line, &mut i);
+        let base = hexword(tword(line, &mut i));
+        let feat = tword(line, &mut i);
+        let mut f = MEForm.{ name: name, n: 0, kind: [0; 8], es: [0; 8], cnt: [0; 8], aux: [0; 8], sh: [0; 8],
+                             opt: [false; 8], f0: g_mefields.len, nf: 0, base: base, feat: [0; 3], nfeat: 0,
+                             ftext: feat };
+        if ops.len > 0 {
+            for o in me_split(ops, ',') {
+                let parts = me_split(o, '/');
+                let ps = me_split(parts[0], ':');
+                let mut kd: u8 = 0;
+                for k in 0..MK_NAMES.len {
+                    if u.str_eq(ps[0], MK_NAMES[k]) {
+                        kd = @truncate(u8, k + 1);
+                    }
+                }
+                if kd == 0 {
+                    u.die(u.f1("asm/a64tab.ax: the SME operand kind '%s'", ps[0]));
+                }
+                let j = f.n;
+                f.kind[j] = kd;
+                if (ps.len > 1) and (ps[1].len > 0) {
+                    f.es[j] = me_es(ps[1][0]);
+                }
+                if (kd == MK_L) or (kd == MK_LP) or (kd == MK_A) or (kd == MK_H) or (kd == MK_HL) {
+                    f.cnt[j] = @truncate(u8, @bit_cast(u64, ai.num(ps[2])));
+                }
+                if kd == MK_L {
+                    f.aux[j] = @truncate(u8, @bit_cast(u64, ai.num(ps[3])));
+                } else if kd == MK_A {
+                    let g = ps[3];
+                    f.opt[j] = g[g.len - 1] == '?';
+                    f.aux[j] = g[0] - '0';
+                } else if (kd == MK_H) or (kd == MK_HL) {
+                    f.aux[j] = ps[3][0];
+                } else if kd == MK_X {
+                    f.aux[j] = ps[1][0];
+                    f.es[j] = 0;
+                } else if kd == MK_V {
+                    // an arrangement: 16b 8h 4s 2d
+                    let a = ps[1];
+                    f.cnt[j] = @truncate(u8, @bit_cast(u64, ai.num(a[0..a.len - 1])));
+                    f.es[j] = me_es(a[a.len - 1]);
+                } else if (kd == MK_MX) or (kd == MK_MZ) {
+                    f.aux[j] = ps[1][0];
+                    f.es[j] = 0;
+                    if (kd == MK_MX) and (ps.len > 2) {
+                        f.sh[j] = @truncate(u8, @bit_cast(u64, ai.num(ps[2])));
+                    }
+                    if kd == MK_MZ {
+                        f.es[j] = me_es(ps[2][0]);
+                    }
+                }
+                for k in 1..parts.len {
+                    let fs = parts[k];
+                    let mut fd = MEField.{ op: @truncate(u8, j), key: fs[0], lo: 0, hi: 0, step: 1, signed: false,
+                                           src: 0, dst: 0, tie: -1, tkey: 0 };
+                    if fs[1] == '@' {
+                        let t = me_split(fs[2..], '.');
+                        fd.tie = @truncate(i32, ai.num(t[0]));
+                        fd.tkey = t[1][0];
+                    } else if fs[1] == '=' {
+                        let t = me_split(fs[2..], '.');
+                        fd.lo = me_dec(t[0]);
+                        fd.hi = me_dec(t[1]);
+                        fd.signed = t[2][0] == 's';
+                        fd.step = me_dec(t[2][pick_us(fd.signed, 1, 0)..]);
+                        fd.src = hexword(t[3]);
+                        fd.dst = hexword(t[4]);
+                    } else {
+                        // key<pos>w<width>: a plain field
+                        let w = u.find(fs, 'w');
+                        let pos = ai.num(fs[1..@int_cast(usize, w)]);
+                        let width = ai.num(fs[@int_cast(usize, w) + 1..]);
+                        fd.src = (@as(u64, 1) << @truncate(u32, @bit_cast(u64, width))) - 1;
+                        fd.hi = @bit_cast(i64, fd.src);
+                        fd.dst = fd.src << @truncate(u32, @bit_cast(u64, pos));
+                    }
+                    g_mefields.push(fd);
+                    f.nf += 1;
+                }
+                f.n += 1;
+            }
+        }
+        for alt in me_split(feat, '|') {
+            let mut b: u64 = 0;
+            for x in me_split(alt, '+') {
+                b = b | me_ext(x);
+            }
+            f.feat[f.nfeat] = b;
+            f.nfeat += 1;
+        }
+        g_meforms.push(f);
+        let mut li = g_menames.get(name);
+        if li == 0 {
+            g_melists.push(u.List.[i32].empty());
+            li = @int_cast(i32, g_melists.len);
+            g_menames.put(name, li);
+        }
+        g_melists.at(@int_cast(usize, li - 1)).push(@int_cast(i32, g_meforms.len - 1));
+    }
+}
+
+// Whether o has the range of k vectors a ZA operand's form wants: one
+// (`off`), or k (`off:off+k-1`).
+fn me_range(o: *AOp, k: u8) bool {
+    if k <= 1 {
+        return o.amt < 0;
+    }
+    return (o.amt >= 0) and (o.amt == (o.index + @as(i32, k) - 1));
+}
+
+// Whether operand o is of kind j of form f (its fields aside).
+fn me_kind_ok(A: *mut cr.Asm, f: *MEForm, j: usize, o: *AOp) bool {
+    let kd = f.kind[j];
+    let es = f.es[j];
+    if (kd == MK_Z) or (kd == MK_ZI) or (kd == MK_ZU) or (kd == MK_ZUI) {
+        let want_i = (kd == MK_ZI) or (kd == MK_ZUI);
+        return (o.kind == AK_ZREG) and (o.esize == es) and ((o.index >= 0) == want_i);
+    }
+    if kd == MK_L {
+        let st = @as(u32, f.aux[j]);
+        let strided = (st != 1) and (f.cnt[j] > 1);
+        return (o.kind == AK_LIST) and (o.view == u8_pick(strided, 's', 'z')) and (o.nregs == @as(u32, f.cnt[j])) and
+               (o.esize == es) and (o.index < 0) and (not strided or (o.stride == st));
+    }
+    if kd == MK_LP {
+        return (o.kind == AK_LIST) and (o.view == 'p') and (o.nregs == @as(u32, f.cnt[j])) and (o.esize == es) and
+               (o.index < 0);
+    }
+    if (kd == MK_P) or (kd == MK_PM) or (kd == MK_PZ) or (kd == MK_PE) or (kd == MK_PI) {
+        let q = u8_pick(kd == MK_PM, 'm', u8_pick(kd == MK_PZ, 'z', 0));
+        if (o.kind != AK_PREG) or (o.pq != q) or (o.esize != es) {
+            return false;
+        }
+        if kd == MK_PI {
+            return (o.base >= 0) and (o.index >= 0);
+        }
+        return o.index < 0;
+    }
+    if (kd == MK_N) or (kd == MK_NZ) or (kd == MK_NE) or (kd == MK_NI) {
+        let q = u8_pick(kd == MK_NZ, 'z', 0);
+        return (o.kind == AK_PNREG) and (o.pq == q) and (o.esize == es) and ((o.index >= 0) == (kd == MK_NI));
+    }
+    if kd == MK_A {
+        if (o.kind != AK_ZA) or (o.view != 'a') or (o.base < 0) or (o.esize != es) or o.brace or
+           not me_range(o, f.cnt[j]) {
+            return false;
+        }
+        return (o.nregs == @as(u32, f.aux[j])) or (f.opt[j] and (o.nregs == 0));
+    }
+    if (kd == MK_H) or (kd == MK_HL) {
+        return (o.kind == AK_ZA) and (o.view == f.aux[j]) and (o.base >= 0) and (o.esize == es) and
+               (o.brace == (kd == MK_HL)) and me_range(o, f.cnt[j]);
+    }
+    if kd == MK_T {
+        return (o.kind == AK_ZA) and (o.view == 't') and (o.esize == es) and not o.brace;
+    }
+    if kd == MK_X {
+        return (o.kind == AK_REG) and o.x and ((o.reg != 31) or (o.sp == (f.aux[j] == 's')));
+    }
+    if kd == MK_W {
+        return (o.kind == AK_REG) and not o.x and not o.sp;
+    }
+    if kd == MK_V {
+        return (o.kind == AK_VREG) and (o.view == 'v') and (o.esize == es) and (o.lanes == @as(u32, f.cnt[j])) and
+               (o.index < 0);
+    }
+    if kd == MK_F {
+        return scalar_bits(o) == es;
+    }
+    if kd == MK_I {
+        if (o.kind != AK_IMM) or o.fp {
+            return false;
+        }
+        return cr.is_const(cr.settle(A, o.v));
+    }
+    if kd == MK_VL {
+        return (o.kind == AK_EXPR) and (u.str_eq(o.name, "vlx2") or u.str_eq(o.name, "vlx4"));
+    }
+    if (kd == MK_ZT) or (kd == MK_ZTI) or (kd == MK_ZTL) {
+        return (o.kind == AK_ZT) and (o.brace == (kd == MK_ZTL)) and ((o.index >= 0) == (kd == MK_ZTI));
+    }
+    if kd == MK_MX {
+        if (o.kind != AK_MEM) or (o.bz != 0) or (o.rz != 0) or o.pre {
+            return false;
+        }
+        let m = f.aux[j];
+        if m == 'b' {
+            return not o.off and (o.rm < 0);
+        }
+        if m == 'm' {
+            return (o.rm < 0) and (o.mvl or not o.off);
+        }
+        let sh = @as(i32, f.sh[j]);
+        return (o.rm >= 0) and o.rmx and (o.sh == SH_LSL) and ((o.amt == sh) or ((sh == 0) and (o.amt <= 0)));
+    }
+    if kd == MK_MZ {
+        if (o.kind != AK_MEM) or (o.bz != es) or (o.rz != 0) or o.off or o.pre {
+            return false;
+        }
+        if f.aux[j] == 'b' {
+            return o.rm < 0;
+        }
+        return (o.rm >= 0) and o.rmx and (o.amt < 0);
+    }
+    return false;
+}
+
+// The value of field `key` of operand o (of kind kd).
+fn me_value(A: *mut cr.Asm, kd: u8, key: u8, o: *AOp) i64 {
+    if key == 'r' {
+        return @as(i64, o.reg);
+    }
+    if key == 'i' {
+        if kd == MK_I {
+            return cr.settle(A, o.v).k;
+        }
+        if kd == MK_VL {
+            return pick_i64(u.str_eq(o.name, "vlx4"), 4, 2);
+        }
+        if kd == MK_MX {
+            if not o.off {
+                return 0;
+            }
+            let v = cr.settle(A, o.v);
+            if not cr.is_const(v) {
+                return -100000;
+            }
+            return v.k;
+        }
+        return @as(i64, o.index);
+    }
+    if (key == 'v') or (key == 'n') {
+        return @as(i64, o.base);
+    }
+    if key == 'o' {
+        return @as(i64, o.index);
+    }
+    if key == 't' {
+        return @as(i64, o.reg);
+    }
+    if key == 'm' {
+        return @as(i64, o.rm);
+    }
+    return -100000;
+}
+
+// The word of form f for ops, or -1.
+fn try_meform(A: *mut cr.Asm, f: *MEForm, ops: []AOp) i64 {
+    if ops.len != f.n {
+        return -1;
+    }
+    for j in 0..f.n {
+        if not me_kind_ok(A, f, j, &ops[j]) {
+            return -1;
+        }
+    }
+    let mut w = f.base;
+    for k in f.f0..f.f0 + f.nf {
+        let fd = g_mefields.at(k);
+        let j = @as(usize, fd.op);
+        let v = me_value(A, f.kind[j], fd.key, &ops[j]);
+        if fd.tie >= 0 {
+            let tj = @int_cast(usize, fd.tie);
+            if v != me_value(A, f.kind[tj], fd.tkey, &ops[tj]) {
+                return -1;
+            }
+            continue;
+        }
+        if (v < fd.lo) or (v > fd.hi) {
+            return -1;
+        }
+        let d = pick_i64(fd.step > 0, v - fd.lo, fd.hi - v);
+        let st = pick_i64(fd.step > 0, fd.step, -fd.step);
+        if ((d % st) != 0) or (fd.signed and ((v % st) != 0)) {
+            return -1;
+        }
+        let mut e = @bit_cast(u64, d / st);
+        if fd.signed {
+            e = @bit_cast(u64, v / st) & fd.src;
+        }
+        if (e & ~fd.src) != 0 {
+            return -1;
+        }
+        // the count's bits (those of src, in order) go to dst's, in order
+        let mut sb: u32 = 0;
+        for b in @as(u32, 0)..32 {
+            if ((fd.dst >> @truncate(u32, b)) & 1) != 0 {
+                while (sb < 64) and (((fd.src >> sb) & 1) == 0) {
+                    sb += 1;
+                }
+                if ((e >> sb) & 1) != 0 {
+                    w = w | (@as(u64, 1) << @truncate(u32, b));
+                }
+                sb += 1;
+            }
+        }
+    }
+    return @bit_cast(i64, w);
+}
+
+// The extensions .arch_extension adds to the target's in the assembly being
+// assembled (and its pass: every pass starts from none again).
+let mut g_ext_bits: u64 = 0;
+let mut g_ext_asm: usize = 0;
+let mut g_ext_pass: i32 = -1;
+
+fn ext_reset(A: *mut cr.Asm) void {
+    if (g_ext_asm != @int_from_ptr(A)) or (g_ext_pass != A.pass) {
+        g_ext_asm = @int_from_ptr(A);
+        g_ext_pass = A.pass;
+        g_ext_bits = 0;
+    }
+}
+
+// Whether the target's extensions, with those of .arch_extension, have all of bits.
+fn ext_has(A: *mut cr.Asm, bits: u64) bool {
+    ext_reset(A);
+    return ((g_ext_bits | tg.g_features) & bits) == bits;
+}
+
+// Whether the target's extensions have one of f's alternatives.
+fn me_feat_ok(A: *mut cr.Asm, f: *MEForm) bool {
+    for k in 0..f.nfeat {
+        if ext_has(A, f.feat[k]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// An error for an instruction the target's extensions do not have: what
+// `--features` needs (ext: an extensions column, its first alternative).
+fn need_ext(A: *mut cr.Asm, m: []u8, ext: []u8) void {
+    let alt = me_split(ext, '|')[0];
+    let mut b = u.Buf.init();
+    for x in me_split(alt, '+') {
+        if b.len() > 0 {
+            b.s(",");
+        }
+        b.s("+");
+        b.s(x);
+    }
+    cr.fail(A, u.f3("'%s' needs the %s extension (--features=%s)", m, alt, b.done()));
+}
+
+// SME, SME2 and SVE2.1's forms (SMETAB), and `zero` of a list of ZA tiles.
+fn sme(A: *mut cr.Asm, m: []u8, ops: []AOp) bool {
+    if not g_mebuilt {
+        build_metable();
+        g_mebuilt = true;
+    }
+    if u.str_eq(m, "zero") and (ops.len == 1) and (ops[0].kind == AK_LIST) and (ops[0].view == 't') {
+        // ZERO {mask}: 1100 0000 0000 1000 0000 0000 imm8 (a bit for each 64-bit tile)
+        if not ext_has(A, tg.A_SME) {
+            need_ext(A, m, "sme");
+            return true;
+        }
+        w32(A, 0xc0080000 | @as(u64, ops[0].mask));
+        return true;
+    }
+    let li = g_menames.get(u.intern(m));
+    if li == 0 {
+        return false;
+    }
+    let mut miss: []u8 = "";
+    for fi in g_melists.at(@int_cast(usize, li - 1)).items() {
+        let f = g_meforms.at(@int_cast(usize, fi));
+        let w = try_meform(A, f, ops);
+        if w < 0 {
+            continue;
+        }
+        if me_feat_ok(A, f) {
+            w32(A, @bit_cast(u64, w));
+            return true;
+        }
+        if miss.len == 0 {
+            miss = f.ftext;
+        }
+    }
+    if miss.len > 0 {
+        need_ext(A, m, miss);
+        return true;
+    }
+    return false;
 }
 
 // -----------------------------------------------------------------------------

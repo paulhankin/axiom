@@ -10,7 +10,7 @@
 static long around(long x) {
     long r = x + 1;
 #ifdef __AXIOM_ASM_AARCH64__
-    __asm__ volatile("smstart za\n\tsmstop za" : : : "za", "zt0", "memory");
+    __asm__ volatile(".arch_extension sme\n\tsmstart za\n\tsmstop za" : : : "za", "zt0", "memory");
 #endif
     return r + 1;
 }
