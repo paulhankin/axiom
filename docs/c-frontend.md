@@ -361,6 +361,7 @@ comments, so that they are valid in every standard:
 /* check-only */            only checked (axiom check, with the flags' --target)
 /* units: abi/x.c */        more translation units, relative to the test
 /* linux-only */            natively, only where host_native.c is linked
+/* macos-only */            natively, only for a macOS target (AXIOM_NATIVE_TARGET=...-macos)
 /* wasm-flags: --features=+tail-call */  more flags for a WebAssembly build
 ```
 
